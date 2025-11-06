@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 
-use crate::web_ui::AppState;
+use crate::web_server::AppState;
 
 /// 数据库处理状态
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,7 +397,7 @@ pub async fn execute_batch_operation(
     state: State<AppState>,
     Json(request): Json<BatchOperationRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use crate::web_ui::models::{DatabaseConfig, TaskInfo, TaskStatus, TaskType};
+    use crate::web_server::models::{DatabaseConfig, TaskInfo, TaskStatus, TaskType};
     use uuid::Uuid;
 
     println!(

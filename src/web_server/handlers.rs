@@ -1,15 +1,17 @@
-use aios_core::{get_db_option, options::DbOption, RefnoEnum, RefU64};
+use aios_core::{get_db_option, options::DbOption, RefU64, RefnoEnum};
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{header, HeaderValue, StatusCode},
     response::{Html, Json, Response},
 };
 
 use chrono::{Local, Utc};
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::cmp::Ordering;
 use std::fs;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
@@ -19,16 +21,14 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::Semaphore;
 use tokio::process::Command as TokioCommand;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
-use dashmap::DashMap;
 
 use crate::fast_model::{
     export_model::{
-        GltfExporter, GlbExporter, XktExporter,
-        GltfExportConfig, GlbExportConfig, XktExportConfig,
-        CommonExportConfig, ExportStats
+        CommonExportConfig, ExportStats, GlbExportConfig, GlbExporter, GltfExportConfig,
+        GltfExporter, XktExportConfig, XktExporter,
     },
     unit_converter::UnitConverter,
 };
@@ -146,14 +146,14 @@ pub async fn kill_port_processes_api(
 }
 
 use super::{
-    AppState,
-    CreateTaskRequest,
-    TaskQuery,
-    UpdateConfigRequest,
     // templates::*,  // 暂时禁用
     batch_tasks_template,
     models::*,
     simple_templates::render_database_connection_page,
+    AppState,
+    CreateTaskRequest,
+    TaskQuery,
+    UpdateConfigRequest,
 };
 use crate::fast_model::session::{PdmsTimeExtractor, SESSION_STORE};
 #[cfg(feature = "sqlite-index")]
@@ -403,7 +403,11 @@ pub async fn api_get_projects(
                 "updated_at" => a.updated_at.cmp(&b.updated_at),
                 _ => a.updated_at.cmp(&b.updated_at),
             };
-            if desc { ord.reverse() } else { ord }
+            if desc {
+                ord.reverse()
+            } else {
+                ord
+            }
         });
 
         // 分页
@@ -1692,9 +1696,9 @@ pub async fn get_available_databases(
 /// SQLite 空间索引 – 页面
 pub async fn sqlite_spatial_page() -> Result<Html<String>, StatusCode> {
     // 复用已有静态模板，并包入统一布局
-    let html = std::fs::read_to_string("src/web_ui/templates/spatial_query.html")
+    let html = std::fs::read_to_string("src/web_server/templates/spatial_query.html")
         .unwrap_or_else(|_| "<h1>空间查询页面未找到</h1>".to_string());
-    let wrapped = crate::web_ui::layout::wrap_external_html_in_layout(
+    let wrapped = crate::web_server::layout::wrap_external_html_in_layout(
         "空间查询 - AIOS",
         Some("sqlite-spatial"),
         &html,
@@ -1822,7 +1826,7 @@ pub struct SqliteSpatialQuery {
 
 /// 提供空间查询页面
 pub async fn spatial_query_page() -> Html<String> {
-    let html = std::fs::read_to_string("src/web_ui/templates/spatial_query.html")
+    let html = std::fs::read_to_string("src/web_server/templates/spatial_query.html")
         .unwrap_or_else(|_| "<h1>Error loading spatial query page</h1>".to_string());
     Html(html)
 }
@@ -1953,9 +1957,9 @@ pub async fn api_sqlite_spatial_query(
 
 /// 提供增量更新检测页面
 pub async fn serve_incremental_update_page() -> Html<String> {
-    let html = std::fs::read_to_string("src/web_ui/templates/incremental_update.html")
+    let html = std::fs::read_to_string("src/web_server/templates/incremental_update.html")
         .unwrap_or_else(|_| "<h1>增量更新检测页面未找到</h1>".to_string());
-    let wrapped = crate::web_ui::layout::wrap_external_html_in_layout(
+    let wrapped = crate::web_server::layout::wrap_external_html_in_layout(
         "增量更新检测 - AIOS",
         Some("tasks"),
         &html,
@@ -1965,9 +1969,9 @@ pub async fn serve_incremental_update_page() -> Html<String> {
 
 /// 提供数据库状态管理页面
 pub async fn serve_database_status_page() -> Html<String> {
-    let html = std::fs::read_to_string("src/web_ui/templates/database_status.html")
+    let html = std::fs::read_to_string("src/web_server/templates/database_status.html")
         .unwrap_or_else(|_| "<h1>数据库状态管理页面未找到</h1>".to_string());
-    let wrapped = crate::web_ui::layout::wrap_external_html_in_layout(
+    let wrapped = crate::web_server::layout::wrap_external_html_in_layout(
         "数据库状态管理 - AIOS",
         Some("db-status"),
         &html,
@@ -2218,7 +2222,7 @@ pub async fn api_get_deployment_sites(
     );
 
     // 只从SQLite获取部署站点数据
-    let mut all_items = match crate::web_ui::wizard_handlers::load_deployment_sites_from_sqlite() {
+    let mut all_items = match crate::web_server::wizard_handlers::load_deployment_sites_from_sqlite() {
         Ok(sqlite_sites) => sqlite_sites,
         Err(e) => {
             eprintln!("Failed to load deployment sites from SQLite: {}", e);
@@ -2462,7 +2466,7 @@ pub async fn api_create_deployment_site(
     }
 
     // 检查名称唯一性（从SQLite检查）
-    if let Ok(sites) = crate::web_ui::wizard_handlers::load_deployment_sites_from_sqlite() {
+    if let Ok(sites) = crate::web_server::wizard_handlers::load_deployment_sites_from_sqlite() {
         if sites.iter().any(|s| {
             s.get("name")
                 .and_then(|n| n.as_str())
@@ -2518,11 +2522,11 @@ pub async fn api_create_deployment_site(
         last_health_check: None,
     };
 
-    match crate::web_ui::wizard_handlers::save_api_deployment_site(&site) {
+    match crate::web_server::wizard_handlers::save_api_deployment_site(&site) {
         Ok(site_id) => {
             eprintln!("成功保存站点到 SQLite，ID: {}", site_id);
 
-            match crate::web_ui::wizard_handlers::load_deployment_site_by_id_from_sqlite(&site_id) {
+            match crate::web_server::wizard_handlers::load_deployment_site_by_id_from_sqlite(&site_id) {
                 Ok(Some(site_value)) => {
                     eprintln!("成功从 SQLite 加载站点数据");
                     Ok(Json(json!({"status":"success","item": site_value})))
@@ -2558,7 +2562,7 @@ pub async fn api_get_deployment_site(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // 只从SQLite获取部署站点数据
-    match crate::web_ui::wizard_handlers::load_deployment_site_by_id_from_sqlite(&id) {
+    match crate::web_server::wizard_handlers::load_deployment_site_by_id_from_sqlite(&id) {
         Ok(Some(site)) => Ok(Json(site)),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
@@ -2649,7 +2653,7 @@ pub async fn api_delete_deployment_site(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // 先尝试从SQLite删除（向导创建的站点）
-    if let Ok(()) = crate::web_ui::wizard_handlers::delete_deployment_site_from_sqlite(&id) {
+    if let Ok(()) = crate::web_server::wizard_handlers::delete_deployment_site_from_sqlite(&id) {
         return Ok(Json(json!({"status":"success","source":"sqlite"})));
     }
 
@@ -2667,6 +2671,276 @@ pub async fn api_delete_deployment_site(
         }
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeploymentSiteBrowseQuery {
+    pub path: Option<String>,
+    #[serde(default)]
+    pub include_hidden: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeploymentSiteBreadcrumb {
+    name: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeploymentSiteFileEntry {
+    name: String,
+    #[serde(rename = "type")]
+    entry_type: String,
+    path: String,
+    size: Option<u64>,
+    modified_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeploymentSiteBrowseResponse {
+    root_path: String,
+    current_path: String,
+    relative_path: String,
+    breadcrumbs: Vec<DeploymentSiteBreadcrumb>,
+    entries: Vec<DeploymentSiteFileEntry>,
+}
+
+fn extract_site_root_directory(site: &serde_json::Value) -> Option<String> {
+    if let Some(root) = site
+        .get("root_directory")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(root.to_string());
+    }
+
+    if let Some(config) = site.get("config") {
+        if let Some(path) = config
+            .get("project_path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(path.to_string());
+        }
+    }
+
+    if let Some(projects) = site.get("e3d_projects") {
+        if let Some(array) = projects.as_array() {
+            if let Some(first) = array.first() {
+                if let Some(path) = first
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Some(parent) = StdPath::new(path).parent() {
+                        if let Some(parent_str) = parent.to_str() {
+                            return Some(parent_str.to_string());
+                        }
+                    }
+                    return Some(path.to_string());
+                } else if let Some(path) = first.as_str() {
+                    if let Some(parent) = StdPath::new(path).parent() {
+                        if let Some(parent_str) = parent.to_str() {
+                            return Some(parent_str.to_string());
+                        }
+                    }
+                    return Some(path.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn system_time_to_rfc3339(time: SystemTime) -> Option<String> {
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => {
+            let system_time = SystemTime::UNIX_EPOCH + duration;
+            Some(chrono::DateTime::<Utc>::from(system_time).to_rfc3339())
+        }
+        Err(_) => None,
+    }
+}
+
+pub async fn api_browse_deployment_site_directory(
+    Path(id): Path<String>,
+    Query(query): Query<DeploymentSiteBrowseQuery>,
+) -> Result<Json<DeploymentSiteBrowseResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let site_json =
+        match crate::web_server::wizard_handlers::load_deployment_site_by_id_from_sqlite(&id) {
+            Ok(Some(site)) => site,
+            Ok(None) => {
+                let sql = format!("SELECT * FROM type::record('{}')", id.replace('\'', "\\'"));
+                match SUL_DB.query(sql).await {
+                    Ok(mut resp) => {
+                        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+                        match rows.into_iter().next() {
+                            Some(site) => site,
+                            None => {
+                                return Err((
+                                    StatusCode::NOT_FOUND,
+                                    Json(json!({"error":"未找到部署站点"})),
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": format!("查询站点失败: {}", e)})),
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("读取站点失败: {}", e)})),
+                ));
+            }
+        };
+
+    let root_path_str = extract_site_root_directory(&site_json).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"该站点未配置根目录"})),
+        )
+    })?;
+
+    let root_path = StdPath::new(&root_path_str);
+    if !root_path.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"站点根目录不存在"})),
+        ));
+    }
+
+    let canonical_root = fs::canonicalize(root_path).map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"无法访问站点根目录"})),
+        )
+    })?;
+
+    let target_path = if let Some(requested_path) = query.path.as_deref() {
+        let requested = StdPath::new(requested_path);
+        let canonical_target = fs::canonicalize(requested).map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"指定路径不存在"})),
+            )
+        })?;
+
+        if !canonical_target.starts_with(&canonical_root) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error":"访问路径超出站点根目录范围"})),
+            ));
+        }
+        canonical_target
+    } else {
+        canonical_root.clone()
+    };
+
+    if !target_path.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"目标路径不是目录"})),
+        ));
+    }
+
+    let mut entries = Vec::new();
+    let include_hidden = query.include_hidden;
+    let read_dir = fs::read_dir(&target_path).map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"无法读取目录内容"})),
+        )
+    })?;
+
+    for entry_result in read_dir {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy().to_string();
+
+        if !include_hidden && name.starts_with('.') {
+            continue;
+        }
+
+        let entry_path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let is_dir = metadata.is_dir();
+        let modified_at = metadata.modified().ok().and_then(system_time_to_rfc3339);
+
+        entries.push(DeploymentSiteFileEntry {
+            name,
+            entry_type: if is_dir {
+                "directory".to_string()
+            } else {
+                "file".to_string()
+            },
+            path: entry_path.to_string_lossy().to_string(),
+            size: if is_dir { None } else { Some(metadata.len()) },
+            modified_at,
+        });
+    }
+
+    entries.sort_by(
+        |a, b| match (a.entry_type.as_str(), b.entry_type.as_str()) {
+            ("directory", "file") => Ordering::Less,
+            ("file", "directory") => Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        },
+    );
+
+    let relative_path = target_path
+        .strip_prefix(&canonical_root)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let mut breadcrumbs = Vec::new();
+    let root_display_name = canonical_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| canonical_root.to_string_lossy().to_string());
+    let root_display_path = canonical_root.to_string_lossy().to_string();
+    breadcrumbs.push(DeploymentSiteBreadcrumb {
+        name: root_display_name,
+        path: root_display_path.clone(),
+    });
+
+    if !relative_path.is_empty() {
+        let mut accumulator = canonical_root.clone();
+        for segment in StdPath::new(&relative_path).components() {
+            let segment_name = segment.as_os_str().to_string_lossy().to_string();
+            accumulator.push(&segment_name);
+            breadcrumbs.push(DeploymentSiteBreadcrumb {
+                name: segment_name,
+                path: accumulator.to_string_lossy().to_string(),
+            });
+        }
+    }
+
+    Ok(Json(DeploymentSiteBrowseResponse {
+        root_path: root_display_path,
+        current_path: target_path.to_string_lossy().to_string(),
+        relative_path,
+        breadcrumbs,
+        entries,
+    }))
 }
 
 /// 为部署站点创建任务
@@ -2734,7 +3008,7 @@ pub async fn api_healthcheck_deployment_site(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // 向导站点存储在 SQLite 中，优先处理
     if let Ok(Some(site_value)) =
-        crate::web_ui::wizard_handlers::load_deployment_site_by_id_from_sqlite(&id)
+        crate::web_server::wizard_handlers::load_deployment_site_by_id_from_sqlite(&id)
     {
         let site: DeploymentSite = serde_json::from_value(site_value.clone())
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -2754,12 +3028,12 @@ pub async fn api_healthcheck_deployment_site(
         let now = chrono::Utc::now().to_rfc3339();
 
         if let Err(e) =
-            crate::web_ui::wizard_handlers::update_deployment_site_health(&id, status_str, &now)
+            crate::web_server::wizard_handlers::update_deployment_site_health(&id, status_str, &now)
         {
             eprintln!("更新部署站点健康检查失败: {}", e);
         }
 
-        let updated = crate::web_ui::wizard_handlers::load_deployment_site_by_id_from_sqlite(&id)
+        let updated = crate::web_server::wizard_handlers::load_deployment_site_by_id_from_sqlite(&id)
             .ok()
             .flatten()
             .unwrap_or(site_value);
@@ -2795,7 +3069,7 @@ pub async fn api_export_deployment_site_config(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     if let Ok(Some(site_value)) =
-        crate::web_ui::wizard_handlers::load_deployment_site_by_id_from_sqlite(&id)
+        crate::web_server::wizard_handlers::load_deployment_site_by_id_from_sqlite(&id)
     {
         let name = site_value["name"].as_str().unwrap_or(&id).to_string();
         let config = site_value["config"].clone();
@@ -2826,7 +3100,7 @@ pub async fn api_export_deployment_site_config(
 
 // /// 部署站点管理页面路由处理 (暂时禁用)
 // pub async fn deployment_sites_page() -> Html<String> {
-//     Html(crate::web_ui::templates::render_deployment_sites_page())
+//     Html(crate::web_server::templates::render_deployment_sites_page())
 // }
 
 /// 获取系统状态
@@ -3324,7 +3598,7 @@ pub async fn test_tcp_connection(addr: &str) -> bool {
 
 /// 测试SurrealDB数据库功能连接
 pub async fn test_database_functionality() -> (bool, Option<String>) {
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{timeout, Duration};
 
     match timeout(Duration::from_secs(5), SUL_DB.query("SELECT 1 as test")).await {
         Ok(Ok(_)) => (true, None),
@@ -3433,7 +3707,7 @@ pub async fn get_surreal_status(
     _state: State<AppState>,
     Query(q): Query<SurrealStatusQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use aios_core::{SUL_DB, get_db_option};
+    use aios_core::{get_db_option, SUL_DB};
 
     let opt = get_db_option();
     let ip_raw = q.ip.unwrap_or(opt.v_ip.clone());
@@ -3478,7 +3752,7 @@ pub async fn test_surreal_connection(
     Json(request): Json<SurrealTestRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use aios_core::SUL_DB;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{timeout, Duration};
 
     let connection_url = format!("ws://{}:{}", request.ip, request.port);
 
@@ -3496,7 +3770,7 @@ pub async fn test_surreal_connection(
     println!("======================================");
 
     // 直接使用界面输入的配置进行测试
-    let test_result = crate::web_ui::db_connection::test_database_connection(
+    let test_result = crate::web_server::db_connection::test_database_connection(
         &request.ip,
         &request.port.to_string(),
         &request.user,
@@ -3734,7 +4008,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
 
     // 使用 WebUI 配置连接数据库
     // 使用 init_surreal_with_config 函数来使用用户指定的配置
-    let db_connection = match crate::web_ui::db_connection::init_surreal_with_config(&config).await
+    let db_connection = match crate::web_server::db_connection::init_surreal_with_config(&config).await
     {
         Ok(conn) => conn,
         Err(e) => {
@@ -3746,7 +4020,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
 
     // 将连接存储到全局连接池中
     let deployment_id = format!("{}:{}", config.db_ip, config.db_port);
-    crate::web_ui::db_connection::DEPLOYMENT_DB_CONNECTIONS
+    crate::web_server::db_connection::DEPLOYMENT_DB_CONNECTIONS
         .write()
         .await
         .insert(deployment_id.clone(), db_connection);
@@ -3789,7 +4063,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
         // 优先从向导任务存储中读取选中项目；否则回退到任务配置中的项目名称
         let included_projects = if matches!(task_type, TaskType::DataParsingWizard) {
             if let Some(cfg) =
-                crate::web_ui::wizard_handlers::load_wizard_config_by_task_id(&task_id)
+                crate::web_server::wizard_handlers::load_wizard_config_by_task_id(&task_id)
             {
                 if !cfg.selected_projects.is_empty() {
                     cfg.selected_projects
@@ -5047,9 +5321,9 @@ async fn check_single_file_version(db_info: serde_json::Value) -> Option<serde_j
 
 /// 数据库状态页面
 pub async fn db_status_page() -> Html<String> {
-    use crate::web_ui::db_status_template;
+    use crate::web_server::db_status_template;
     let html = db_status_template::db_status_page();
-    let wrapped = crate::web_ui::layout::wrap_external_html_in_layout(
+    let wrapped = crate::web_server::layout::wrap_external_html_in_layout(
         "系统状态 - AIOS",
         Some("db-status"),
         &html,
@@ -5060,20 +5334,20 @@ pub async fn db_status_page() -> Html<String> {
 /// 页面路由处理器
 pub async fn index_page() -> Html<String> {
     // 切换为更贴近截图的首页（简洁卡片 + 详情弹窗）
-    Html(crate::web_ui::simple_templates::render_index_with_sidebar())
+    Html(crate::web_server::simple_templates::render_index_with_sidebar())
 }
 
 pub async fn dashboard_page() -> Html<String> {
-    Html(crate::web_ui::simple_templates::render_dashboard_page_with_sidebar())
+    Html(crate::web_server::simple_templates::render_dashboard_page_with_sidebar())
 }
 
 pub async fn config_page() -> Html<String> {
-    Html(crate::web_ui::simple_templates::render_config_page_with_sidebar())
+    Html(crate::web_server::simple_templates::render_config_page_with_sidebar())
 }
 
 pub async fn tasks_page() -> Html<String> {
-    let html = crate::web_ui::simple_templates::render_advanced_tasks_page();
-    let wrapped = crate::web_ui::layout::wrap_external_html_in_layout(
+    let html = crate::web_server::simple_templates::render_advanced_tasks_page();
+    let wrapped = crate::web_server::layout::wrap_external_html_in_layout(
         "任务队列管理 - AIOS",
         Some("tasks"),
         &html,
@@ -5082,8 +5356,8 @@ pub async fn tasks_page() -> Html<String> {
 }
 
 pub async fn task_detail_page(Path(task_id): Path<String>) -> Html<String> {
-    let html = crate::web_ui::simple_templates::render_task_detail_page(task_id);
-    let wrapped = crate::web_ui::layout::wrap_external_html_in_layout(
+    let html = crate::web_server::simple_templates::render_task_detail_page(task_id);
+    let wrapped = crate::web_server::layout::wrap_external_html_in_layout(
         "任务详情 - AIOS",
         Some("tasks"),
         &html,
@@ -5092,8 +5366,8 @@ pub async fn task_detail_page(Path(task_id): Path<String>) -> Html<String> {
 }
 
 pub async fn task_logs_page(Path(task_id): Path<String>) -> Html<String> {
-    let html = crate::web_ui::simple_templates::render_task_logs_page(task_id);
-    let wrapped = crate::web_ui::layout::wrap_external_html_in_layout(
+    let html = crate::web_server::simple_templates::render_task_logs_page(task_id);
+    let wrapped = crate::web_server::layout::wrap_external_html_in_layout(
         "任务日志 - AIOS",
         Some("tasks"),
         &html,
@@ -5103,7 +5377,7 @@ pub async fn task_logs_page(Path(task_id): Path<String>) -> Html<String> {
 
 pub async fn batch_tasks_page() -> Html<String> {
     let html = batch_tasks_template::batch_tasks_page();
-    let wrapped = crate::web_ui::layout::wrap_external_html_in_layout(
+    let wrapped = crate::web_server::layout::wrap_external_html_in_layout(
         "批量任务 - AIOS",
         Some("batch"),
         &html,
@@ -5113,9 +5387,9 @@ pub async fn batch_tasks_page() -> Html<String> {
 
 /// XKT 模型测试页面
 pub async fn xkt_test_page() -> Html<String> {
-    let html = std::fs::read_to_string("src/web_ui/templates/xkt_test.html")
+    let html = std::fs::read_to_string("src/web_server/templates/xkt_test.html")
         .unwrap_or_else(|_| "<h1>XKT 测试页面未找到</h1>".to_string());
-    let wrapped = crate::web_ui::layout::wrap_external_html_in_layout(
+    let wrapped = crate::web_server::layout::wrap_external_html_in_layout(
         "XKT 模型测试 - AIOS",
         Some("xkt-test"),
         &html,
@@ -5125,12 +5399,12 @@ pub async fn xkt_test_page() -> Html<String> {
 
 /// 部署站点管理
 pub async fn deployment_sites_page() -> Html<String> {
-    let html = crate::web_ui::simple_templates::render_deployment_sites_page_with_sidebar();
+    let html = crate::web_server::simple_templates::render_deployment_sites_page_with_sidebar();
     Html(html)
 }
 
 pub async fn wizard_page() -> Html<String> {
-    use crate::web_ui::wizard_template;
+    use crate::web_server::wizard_template;
     Html(wizard_template::wizard_page_with_layout())
 }
 
@@ -5138,11 +5412,11 @@ pub async fn wizard_page() -> Html<String> {
 
 /// 空间计算页面
 pub async fn space_tools_page() -> Html<String> {
-    let html = crate::web_ui::simple_templates::render_simple_generic_page(
+    let html = crate::web_server::simple_templates::render_simple_generic_page(
         "空间计算工具",
         "空间计算工具功能正在开发中...",
     );
-    let wrapped = crate::web_ui::layout::wrap_external_html_in_layout(
+    let wrapped = crate::web_server::layout::wrap_external_html_in_layout(
         "空间计算工具 - AIOS",
         Some("sqlite-spatial"),
         &html,
@@ -5535,12 +5809,12 @@ pub async fn api_sctn_test_run(
 ) -> Json<serde_json::Value> {
     // 创建任务
     let task_name = format!("SCTN测试: {}", &req.target_refno);
-    let mut cfg = crate::web_ui::models::DatabaseConfig::default();
+    let mut cfg = crate::web_server::models::DatabaseConfig::default();
     cfg.manual_db_nums = vec![];
     let mut tm = state.task_manager.lock().await;
-    let task = crate::web_ui::models::TaskInfo::new(
+    let task = crate::web_server::models::TaskInfo::new(
         task_name,
-        crate::web_ui::models::TaskType::Custom("SctnTest".into()),
+        crate::web_server::models::TaskType::Custom("SctnTest".into()),
         cfg,
     );
     let task_id = task.id.clone();
@@ -5569,7 +5843,7 @@ async fn run_sctn_test_pipeline(state: AppState, task_id: String, req: SctnTestR
         tokio::spawn(async move {
             let mut tm = st.task_manager.lock().await;
             if let Some(task) = tm.active_tasks.get_mut(&id) {
-                if task.status != crate::web_ui::models::TaskStatus::Cancelled {
+                if task.status != crate::web_server::models::TaskStatus::Cancelled {
                     task.update_progress(m, step, total, pct);
                 }
             }
@@ -5759,7 +6033,7 @@ async fn run_sctn_test_pipeline(state: AppState, task_id: String, req: SctnTestR
     // 完成任务
     let mut tm = state.task_manager.lock().await;
     if let Some(task) = tm.active_tasks.get_mut(&task_id) {
-        task.status = crate::web_ui::models::TaskStatus::Completed;
+        task.status = crate::web_server::models::TaskStatus::Completed;
         task.progress.percentage = 100.0;
         task.progress.current_step = "完成".into();
         task.completed_at = Some(std::time::SystemTime::now());
@@ -5770,7 +6044,7 @@ async fn finish_fail(state: AppState, task_id: String, msg: String) {
     SCTN_TEST_RESULTS.insert(task_id.clone(), json!({"status":"failed","message": msg}));
     let mut tm = state.task_manager.lock().await;
     if let Some(task) = tm.active_tasks.get_mut(&task_id) {
-        task.status = crate::web_ui::models::TaskStatus::Failed;
+        task.status = crate::web_server::models::TaskStatus::Failed;
         task.error = Some(msg);
         task.completed_at = Some(std::time::SystemTime::now());
     }
@@ -6155,7 +6429,7 @@ async fn handle_database_connection_error(
 pub async fn run_database_diagnostics_api(
     State(_state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use crate::web_ui::database_diagnostics::run_database_diagnostics;
+    use crate::web_server::database_diagnostics::run_database_diagnostics;
 
     let diagnostic_result = run_database_diagnostics().await;
 
@@ -6171,7 +6445,7 @@ pub async fn run_database_diagnostics_api(
 /// 数据库连接管理页面
 pub async fn database_connection_page() -> Html<String> {
     let html = render_database_connection_page();
-    let wrapped = crate::web_ui::layout::wrap_external_html_in_layout(
+    let wrapped = crate::web_server::layout::wrap_external_html_in_layout(
         "数据库连接管理 - AIOS",
         Some("db-conn"),
         &html,
@@ -6182,7 +6456,7 @@ pub async fn database_connection_page() -> Html<String> {
 /// 空间查询可视化页面
 pub async fn spatial_visualization_page() -> Html<String> {
     let html = render_spatial_visualization_page();
-    let wrapped = crate::web_ui::layout::wrap_external_html_in_layout(
+    let wrapped = crate::web_server::layout::wrap_external_html_in_layout(
         "空间查询可视化 - AIOS",
         Some("spatial-viz"),
         &html,
@@ -6518,7 +6792,8 @@ pub async fn create_export_task(
     // 异步执行导出任务
     let task_id_clone = task_id.clone();
     let request_clone = request.clone();
-    let mesh_dir = request.mesh_dir
+    let mesh_dir = request
+        .mesh_dir
         .as_ref()
         .map(|s| StdPath::new(s).to_path_buf())
         .unwrap_or_else(|| StdPath::new("assets/meshes").to_path_buf());
@@ -6561,12 +6836,9 @@ async fn execute_export_task(
 
     // 生成输出文件路径
     let timestamp_str = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-    let file_name = request.file_name.unwrap_or_else(|| {
-        format!("export_{}_{}",
-            request.format.to_lowercase(),
-            timestamp_str
-        )
-    });
+    let file_name = request
+        .file_name
+        .unwrap_or_else(|| format!("export_{}_{}", request.format.to_lowercase(), timestamp_str));
 
     // 创建临时输出目录
     let output_dir = StdPath::new("exports").join(&timestamp_str);
@@ -6586,31 +6858,27 @@ async fn execute_export_task(
                 common: common_config,
             };
             let exporter = GltfExporter::new();
-            match exporter.export(
-                &refnos,
-                &mesh_dir,
-                output_path.to_str().unwrap(),
-                config
-            ).await {
-                Ok(stats: ExportStats) => Ok(stats),
-                Err(e: anyhow::Error) => Err(e.to_string())
+            match exporter
+                .export(&refnos, &mesh_dir, output_path.to_str().unwrap(), config)
+                .await
+            {
+                Ok(stats) => Ok(stats),
+                Err(e) => Err(e.to_string()),
             }
-        },
+        }
         "glb" => {
             let config = GlbExportConfig {
                 common: common_config,
             };
             let exporter = GlbExporter::new();
-            match exporter.export(
-                &refnos,
-                &mesh_dir,
-                output_path.to_str().unwrap(),
-                config
-            ).await {
-                Ok(stats: ExportStats) => Ok(stats),
-                Err(e: anyhow::Error) => Err(e.to_string())
+            match exporter
+                .export(&refnos, &mesh_dir, output_path.to_str().unwrap(), config)
+                .await
+            {
+                Ok(stats) => Ok(stats),
+                Err(e) => Err(e.to_string()),
             }
-        },
+        }
         "xkt" => {
             let config = XktExportConfig {
                 common: common_config,
@@ -6621,16 +6889,14 @@ async fn execute_export_task(
                 dbno: None,
             };
             let exporter = XktExporter::new();
-            match exporter.export(
-                &refnos,
-                &mesh_dir,
-                output_path.to_str().unwrap(),
-                config
-            ).await {
-                Ok(stats: ExportStats) => Ok(stats),
-                Err(e: anyhow::Error) => Err(e.to_string())
+            match exporter
+                .export(&refnos, &mesh_dir, output_path.to_str().unwrap(), config)
+                .await
+            {
+                Ok(stats) => Ok(stats),
+                Err(e) => Err(e.to_string()),
             }
-        },
+        }
         _ => Err("不支持的格式".to_string()),
     };
 
@@ -6647,7 +6913,7 @@ async fn execute_export_task(
 
             // 存储统计信息
             progress.export_stats = Some(stats_json);
-        },
+        }
         Err(e) => {
             let mut progress = EXPORT_TASKS.get_mut(&task_id).unwrap();
             progress.status = "failed".to_string();
@@ -6670,16 +6936,19 @@ pub async fn get_export_status(
                 progress: Some(progress.progress),
                 message: Some(progress.message),
                 result_url: progress.result_path.as_ref().and_then(|p| {
-                    p.to_str().map(|s| format!("/api/export/download/{}?path={}",
-                        progress.task_id,
-                        urlencoding::encode(s)
-                    ))
+                    p.to_str().map(|s| {
+                        format!(
+                            "/api/export/download/{}?path={}",
+                            progress.task_id,
+                            urlencoding::encode(s)
+                        )
+                    })
                 }),
                 error: progress.error,
             };
 
             Ok(Json(status_response))
-        },
+        }
         None => Err(StatusCode::NOT_FOUND),
     }
 }
@@ -6706,7 +6975,7 @@ pub async fn download_export(
             // URL解码
             let decoded = urlencoding::decode(p).map_err(|_| StatusCode::BAD_REQUEST)?;
             PathBuf::from(decoded.into_owned())
-        },
+        }
         None => {
             // 如果没有提供路径，尝试从结果路径获取
             progress.result_path.ok_or(StatusCode::BAD_REQUEST)?
@@ -6735,16 +7004,20 @@ pub async fn download_export(
     };
 
     // 构建响应
-    let headers = [
-        (header::CONTENT_TYPE, mime_type),
-        (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}\"",
-            file_path.file_name().and_then(|n| n.to_str()).unwrap_or("export"))),
-    ];
+    let disposition = format!(
+        "attachment; filename=\"{}\"",
+        file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("export")
+    );
 
-    Ok(Response::builder()
-        .status(StatusCode::200)
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime_type)
+        .header(header::CONTENT_DISPOSITION, disposition)
         .body(Body::from(bytes))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// 列出导出任务
@@ -6752,7 +7025,8 @@ pub async fn list_export_tasks(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let status_filter = params.get("status");
-    let limit = params.get("limit")
+    let limit = params
+        .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(50);
 

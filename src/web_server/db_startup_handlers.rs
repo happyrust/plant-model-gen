@@ -6,8 +6,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::web_ui::AppState;
-use crate::web_ui::db_startup_manager::{DB_STARTUP_MANAGER, start_database_with_progress};
+use crate::web_server::db_startup_manager::{start_database_with_progress, DB_STARTUP_MANAGER};
+use crate::web_server::AppState;
 
 /// 启动数据库请求
 #[derive(Debug, Deserialize)]
@@ -234,7 +234,7 @@ pub async fn get_startup_logs(
 
 /// 生成模拟日志
 fn generate_mock_logs(
-    info: &crate::web_ui::db_startup_manager::DbInstanceInfo,
+    info: &crate::web_server::db_startup_manager::DbInstanceInfo,
 ) -> Vec<serde_json::Value> {
     use chrono::Utc;
 
@@ -243,7 +243,7 @@ fn generate_mock_logs(
 
     // 根据状态生成相应的日志
     match &info.status {
-        crate::web_ui::db_startup_manager::DbStartupStatus::Starting => {
+        crate::web_server::db_startup_manager::DbStartupStatus::Starting => {
             logs.push(json!({
                 "timestamp": now.format("%H:%M:%S").to_string(),
                 "level": "info",
@@ -290,14 +290,14 @@ fn generate_mock_logs(
                 }));
             }
         }
-        crate::web_ui::db_startup_manager::DbStartupStatus::Running => {
+        crate::web_server::db_startup_manager::DbStartupStatus::Running => {
             logs.push(json!({
                 "timestamp": now.format("%H:%M:%S").to_string(),
                 "level": "success",
                 "message": "数据库启动成功，正在运行"
             }));
         }
-        crate::web_ui::db_startup_manager::DbStartupStatus::Failed(error) => {
+        crate::web_server::db_startup_manager::DbStartupStatus::Failed(error) => {
             logs.push(json!({
                 "timestamp": now.format("%H:%M:%S").to_string(),
                 "level": "error",

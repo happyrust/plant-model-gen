@@ -999,7 +999,7 @@ pub fn render_index_with_sidebar() -> String {
     <script src="/static/projects.js"></script>
     "#;
 
-    crate::web_ui::layout::render_layout_with_sidebar(
+    crate::web_server::layout::render_layout_with_sidebar(
         "AIOS 数据库管理平台",
         Some("home"),
         content,
@@ -3133,7 +3133,7 @@ pub fn render_dashboard_page_with_sidebar() -> String {
         </div>
     "#;
 
-    crate::web_ui::layout::render_layout_with_sidebar(
+    crate::web_server::layout::render_layout_with_sidebar(
         "仪表板 - AIOS 数据库管理平台",
         Some("dashboard"),
         content,
@@ -3209,7 +3209,7 @@ pub fn render_config_page_with_sidebar() -> String {
     "#,
     );
 
-    crate::web_ui::layout::render_layout_with_sidebar(
+    crate::web_server::layout::render_layout_with_sidebar(
         "配置管理 - AIOS 数据库管理平台",
         Some("config"),
         content,
@@ -3384,7 +3384,7 @@ pub fn render_deployment_sites_page_with_sidebar() -> String {
 
     let extra_scripts = r#"<script src="/static/projects.js"></script>"#;
 
-    crate::web_ui::layout::render_layout_with_sidebar(
+    crate::web_server::layout::render_layout_with_sidebar(
         "部署站点管理 - AIOS",
         Some("deploy-sites"),
         content,

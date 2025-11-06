@@ -1,13 +1,13 @@
 use aios_core::{
-    ConnectionConfig as CoreConnectionConfig, ConnectionHandle, connect_with_config,
-    test_database_connection as core_test_database_connection,
+    connect_with_config, test_database_connection as core_test_database_connection,
+    ConnectionConfig as CoreConnectionConfig, ConnectionHandle,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::web_ui::models::DatabaseConfig;
+use crate::web_server::models::DatabaseConfig;
 
 /// 全局数据库连接池，按部署站点ID存储
 pub static DEPLOYMENT_DB_CONNECTIONS: Lazy<

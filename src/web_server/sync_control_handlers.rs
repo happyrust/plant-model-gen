@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
 
-use crate::web_ui::{AppState, sync_control_center::*};
+use crate::web_server::{remote_sync_handlers, sync_control_center::*, AppState};
 
 // ========= 控制接口 =========
 
@@ -181,9 +181,9 @@ pub async fn get_sync_metrics(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let center = SYNC_CONTROL_CENTER.read().await;
 
-    // 获取系统性能指标
-    let cpu_usage = get_cpu_usage();
-    let memory_usage = get_memory_usage();
+    let (cpu_usage, memory_usage) = sample_system_metrics().await;
+    let (completed_files, completed_bytes, completed_records, failed_files_db) =
+        collect_sync_totals();
 
     Ok(Json(json!({
         "status": "success",
@@ -200,7 +200,11 @@ pub async fn get_sync_metrics(
             },
             "cpu_usage": cpu_usage,
             "memory_usage": memory_usage,
-            "uptime_seconds": center.state.uptime_seconds
+            "uptime_seconds": center.state.uptime_seconds,
+            "completed_files_total": completed_files,
+            "completed_bytes_total": completed_bytes,
+            "completed_records_total": completed_records,
+            "failed_files_total": failed_files_db
         }
     })))
 }
@@ -337,11 +341,19 @@ pub async fn add_sync_task(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let mut center = SYNC_CONTROL_CENTER.write().await;
 
-    let task_id = center.add_task(
-        request.file_path,
-        request.file_size,
-        request.priority.unwrap_or(5),
-    );
+    let task_id = center.add_task(NewSyncTaskParams {
+        file_path: request.file_path,
+        file_size: request.file_size,
+        priority: request.priority.unwrap_or(5),
+        file_name: request.file_name,
+        file_hash: request.file_hash,
+        record_count: request.record_count,
+        env_id: request.env_id,
+        source_env: request.source_env,
+        target_site: request.target_site,
+        direction: request.direction,
+        notes: request.notes,
+    });
 
     Ok(Json(json!({
         "status": "success",
@@ -358,12 +370,15 @@ pub async fn cancel_sync_task(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let mut center = SYNC_CONTROL_CENTER.write().await;
 
-    // 从队列中移除
-    center.task_queue.retain(|t| t.id != task_id);
+    // 从待处理队列移除
+    let cancelled_in_queue = center.cancel_pending_task(&task_id, "用户取消");
 
     // 从运行中任务移除
-    if center.running_tasks.remove(&task_id).is_some() {
+    if center.running_tasks.contains_key(&task_id) {
         center.complete_task(&task_id, false, Some("用户取消".to_string()));
+    } else if !cancelled_in_queue {
+        // 未找到任务
+        return Err(StatusCode::NOT_FOUND);
     }
 
     Ok(Json(json!({
@@ -377,8 +392,7 @@ pub async fn clear_sync_queue(
     _state: State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let mut center = SYNC_CONTROL_CENTER.write().await;
-    let count = center.task_queue.len();
-    center.clear_queue();
+    let count = center.clear_queue("队列清空");
 
     Ok(Json(json!({
         "status": "success",
@@ -481,6 +495,14 @@ pub struct AddTaskRequest {
     pub file_path: String,
     pub file_size: u64,
     pub priority: Option<u8>,
+    pub file_name: Option<String>,
+    pub file_hash: Option<String>,
+    pub record_count: Option<u64>,
+    pub env_id: Option<String>,
+    pub source_env: Option<String>,
+    pub target_site: Option<String>,
+    pub direction: Option<String>,
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -510,16 +532,84 @@ pub struct StartMqttRequest {
 
 // ========= 辅助函数 =========
 
-fn get_cpu_usage() -> f32 {
-    // TODO: 实现真实的CPU使用率获取
-    // 可以使用 sysinfo crate
-    0.0
+async fn sample_system_metrics() -> (f32, f32) {
+    match tokio::task::spawn_blocking(|| {
+        use std::thread;
+        use std::time::Duration as StdDuration;
+        use sysinfo::{CpuExt, CpuRefreshKind, RefreshKind, System, SystemExt};
+
+        let mut system = System::new();
+        system.refresh_specifics(
+            RefreshKind::new()
+                .with_cpu(CpuRefreshKind::everything())
+                .with_memory(),
+        );
+        thread::sleep(StdDuration::from_millis(100));
+        system.refresh_specifics(
+            RefreshKind::new()
+                .with_cpu(CpuRefreshKind::everything())
+                .with_memory(),
+        );
+
+        let cpu_usage = system.global_cpu_info().cpu_usage();
+        let total_memory = system.total_memory();
+        let used_memory = system.used_memory();
+        let memory_usage = if total_memory == 0 {
+            0.0
+        } else {
+            (used_memory as f64 / total_memory as f64 * 100.0) as f32
+        };
+
+        (cpu_usage, memory_usage)
+    })
+    .await
+    {
+        Ok(metrics) => metrics,
+        Err(_) => (0.0, 0.0),
+    }
 }
 
-fn get_memory_usage() -> f32 {
-    // TODO: 实现真实的内存使用率获取
-    // 可以使用 sysinfo crate
-    0.0
+fn collect_sync_totals() -> (u64, u64, u64, u64) {
+    let Ok(conn) = remote_sync_handlers::open_sqlite() else {
+        return (0, 0, 0, 0);
+    };
+
+    let completed = conn
+        .query_row(
+            "SELECT COUNT(*), SUM(COALESCE(file_size, 0)), SUM(COALESCE(record_count, 0)) \
+             FROM remote_sync_logs WHERE status = 'completed'",
+            [],
+            |row| {
+                let count: i64 = row.get(0)?;
+                let bytes: Option<i64> = row.get(1)?;
+                let records: Option<i64> = row.get(2)?;
+                Ok((count, bytes.unwrap_or(0), records.unwrap_or(0)))
+            },
+        )
+        .unwrap_or((0, 0, 0));
+
+    let failed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM remote_sync_logs WHERE status = 'failed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    (
+        clamp_u64(completed.0),
+        clamp_u64(completed.1),
+        clamp_u64(completed.2),
+        clamp_u64(failed),
+    )
+}
+
+fn clamp_u64(v: i64) -> u64 {
+    if v < 0 {
+        0
+    } else {
+        v as u64
+    }
 }
 
 // ========= 页面渲染 =========

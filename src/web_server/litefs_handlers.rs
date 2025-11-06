@@ -1,6 +1,6 @@
-use axum::{Json, http::StatusCode};
+use axum::{http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::env;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -45,7 +45,7 @@ pub async fn get_node_status() -> Result<Json<Value>, StatusCode> {
 }
 
 fn check_if_primary() -> bool {
-    use crate::web_ui::remote_sync_handlers::open_sqlite;
+    use crate::web_server::remote_sync_handlers::open_sqlite;
 
     match open_sqlite() {
         Ok(conn) => {
@@ -104,7 +104,7 @@ fn get_database_path() -> String {
 }
 
 pub async fn health_check() -> Result<Json<Value>, StatusCode> {
-    use crate::web_ui::remote_sync_handlers::open_sqlite;
+    use crate::web_server::remote_sync_handlers::open_sqlite;
 
     let db_status = match open_sqlite() {
         Ok(_) => "healthy",

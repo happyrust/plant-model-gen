@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 
-use crate::web_ui::AppState;
+use crate::web_server::AppState;
 
 /// 增量更新检测状态
 #[derive(Debug, Clone, Serialize, Deserialize)]

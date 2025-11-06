@@ -1,13 +1,24 @@
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::{Html, Json},
+    body::Body,
+    extract::{OriginalUri, Path, Query},
+    http::{Request, StatusCode, Uri},
+    response::{Html, Json, Response},
 };
+use rusqlite::{types::Value as SqlValue, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::net::TcpStream;
-use tokio::time::{Duration, timeout};
+use std::{
+    convert::TryFrom,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
+use tokio::time::{timeout, Duration};
+use tokio::{fs, net::TcpStream};
 use uuid::Uuid;
+
+use crate::web_server::site_metadata::{self, CachedMetadata, MetadataSource, SiteMetadataFile};
+use tower::ServiceExt;
+use tower_http::services::ServeDir;
 
 /// 远程增量环境
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,9 +54,60 @@ pub struct RemoteSyncSite {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSyncLogRecord {
+    pub id: String,
+    pub task_id: Option<String>,
+    pub env_id: Option<String>,
+    pub source_env: Option<String>,
+    pub target_site: Option<String>,
+    pub site_id: Option<String>,
+    pub direction: Option<String>,
+    pub file_path: Option<String>,
+    pub file_size: Option<u64>,
+    pub record_count: Option<u64>,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub notes: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct SiteInfo {
+    env_id: String,
+    env_name: Option<String>,
+    env_file_host: Option<String>,
+    site_id: String,
+    site_name: String,
+    site_host: Option<String>,
+}
+
+#[derive(Debug)]
+struct MetadataLoadContext {
+    info: SiteInfo,
+    metadata: SiteMetadataFile,
+    source: MetadataSource,
+    fetched_at: String,
+    cache_path: Option<PathBuf>,
+    warnings: Vec<String>,
+    http_base: Option<String>,
+    local_base: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MetadataQuery {
+    #[serde(default)]
+    pub refresh: bool,
+    #[serde(default)]
+    pub cache_only: bool,
+}
+
 /// 页面
 pub async fn remote_sync_page() -> Html<String> {
-    Html(crate::web_ui::remote_sync_template::render_remote_sync_page_with_sidebar())
+    Html(crate::web_server::remote_sync_template::render_remote_sync_page_with_sidebar())
 }
 
 /// 打开 SQLite（复用部署站点同一文件）
@@ -119,6 +181,37 @@ pub fn open_sqlite() -> Result<rusqlite::Connection, Box<dyn std::error::Error>>
             updated_at TEXT NOT NULL,
             FOREIGN KEY(env_id) REFERENCES remote_sync_envs(id) ON DELETE CASCADE
         )",
+        rusqlite::params![],
+    )?;
+    // 日志表
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS remote_sync_logs (
+            id TEXT PRIMARY KEY,
+            task_id TEXT,
+            env_id TEXT,
+            source_env TEXT,
+            target_site TEXT,
+            site_id TEXT,
+            direction TEXT,
+            file_path TEXT,
+            file_size INTEGER,
+            record_count INTEGER,
+            status TEXT,
+            error_message TEXT,
+            notes TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )",
+        rusqlite::params![],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_remote_sync_logs_env ON remote_sync_logs(env_id)",
+        rusqlite::params![],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_remote_sync_logs_status ON remote_sync_logs(status)",
         rusqlite::params![],
     )?;
     Ok(conn)
@@ -526,9 +619,9 @@ pub async fn activate_env(Path(id): Path<String>) -> Result<Json<serde_json::Val
     let _ = apply_env(Path(id.clone())).await?;
 
     // 停止当前运行态
-    crate::web_ui::remote_runtime::stop_runtime().await;
+    crate::web_server::remote_runtime::stop_runtime().await;
     // 启动新的运行态（使用最新 DbOption）
-    match crate::web_ui::remote_runtime::start_runtime(id.clone()).await {
+    match crate::web_server::remote_runtime::start_runtime(id.clone()).await {
         Ok(_) => Ok(Json(json!({
             "status":"success",
             "message":"已写入 DbOption.toml 并启动 watcher + MQTT 订阅。",
@@ -543,7 +636,7 @@ pub async fn activate_env(Path(id): Path<String>) -> Result<Json<serde_json::Val
 
 /// 停止运行时（终止 watcher + MQTT）
 pub async fn stop_runtime() -> Result<Json<serde_json::Value>, StatusCode> {
-    crate::web_ui::remote_runtime::stop_runtime().await;
+    crate::web_server::remote_runtime::stop_runtime().await;
     Ok(Json(
         json!({"status":"success","message":"已停止运行时 watcher + MQTT"}),
     ))
@@ -681,7 +774,7 @@ pub async fn test_http_site(
 /// 运行时状态查询
 pub async fn runtime_status() -> Result<Json<serde_json::Value>, StatusCode> {
     use crate::data_interface::db_model::MQTT_CONNECT_STATUS;
-    use crate::web_ui::remote_runtime::REMOTE_RUNTIME;
+    use crate::web_server::remote_runtime::REMOTE_RUNTIME;
     let guard = REMOTE_RUNTIME.read().await;
     let active = guard.is_some();
     let env_id = guard.as_ref().map(|s| s.env_id.clone());
@@ -745,4 +838,601 @@ pub async fn import_env_from_dboption() -> Result<Json<serde_json::Value>, Statu
         ],
     );
     Ok(Json(json!({"status":"success","id": id})))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LogQueryParams {
+    pub env_id: Option<String>,
+    pub target_site: Option<String>,
+    pub site_id: Option<String>,
+    pub status: Option<String>,
+    pub direction: Option<String>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub keyword: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+pub async fn list_logs(
+    Query(params): Query<LogQueryParams>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let conn = open_sqlite().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let limit = params.limit.unwrap_or(50).min(500);
+    let offset = params.offset.unwrap_or(0);
+
+    let mut conditions: Vec<String> = Vec::new();
+    let mut values: Vec<SqlValue> = Vec::new();
+
+    if let Some(env_id) = params.env_id.filter(|s| !s.is_empty()) {
+        conditions.push("env_id = ?".to_string());
+        values.push(SqlValue::Text(env_id));
+    }
+    if let Some(site_id) = params.site_id.filter(|s| !s.is_empty()) {
+        conditions.push("site_id = ?".to_string());
+        values.push(SqlValue::Text(site_id));
+    }
+    if let Some(target_site) = params.target_site.filter(|s| !s.is_empty()) {
+        conditions.push("target_site = ?".to_string());
+        values.push(SqlValue::Text(target_site));
+    }
+    if let Some(status) = params.status.filter(|s| !s.is_empty()) {
+        conditions.push("status = ?".to_string());
+        values.push(SqlValue::Text(status));
+    }
+    if let Some(direction) = params.direction.filter(|s| !s.is_empty()) {
+        conditions.push("direction = ?".to_string());
+        values.push(SqlValue::Text(direction));
+    }
+    if let Some(start) = params.start.filter(|s| !s.is_empty()) {
+        conditions.push("created_at >= ?".to_string());
+        values.push(SqlValue::Text(start));
+    }
+    if let Some(end) = params.end.filter(|s| !s.is_empty()) {
+        conditions.push("created_at <= ?".to_string());
+        values.push(SqlValue::Text(end));
+    }
+    if let Some(keyword) = params.keyword.filter(|s| !s.trim().is_empty()) {
+        let pattern = format!("%{}%", keyword.trim());
+        conditions.push("file_path LIKE ?".to_string());
+        values.push(SqlValue::Text(pattern));
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+
+    let count_sql = format!("SELECT COUNT(*) FROM remote_sync_logs{}", where_clause);
+    let total: i64 = conn
+        .prepare(&count_sql)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .query_row(
+            rusqlite::params_from_iter(values.clone().into_iter()),
+            |row| row.get(0),
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut list_params = values.clone();
+    list_params.push(SqlValue::Integer(limit as i64));
+    list_params.push(SqlValue::Integer(offset as i64));
+
+    let list_sql = format!(
+        "SELECT id, task_id, env_id, source_env, target_site, site_id, direction, file_path,
+                file_size, record_count, status, error_message, notes, started_at,
+                completed_at, created_at, updated_at
+         FROM remote_sync_logs{}
+         ORDER BY created_at DESC
+         LIMIT ? OFFSET ?",
+        where_clause
+    );
+
+    let mut stmt = conn
+        .prepare(&list_sql)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(list_params.into_iter()), |row| {
+            Ok(RemoteSyncLogRecord {
+                id: row.get(0)?,
+                task_id: row.get(1).ok(),
+                env_id: row.get(2).ok(),
+                source_env: row.get(3).ok(),
+                target_site: row.get(4).ok(),
+                site_id: row.get(5).ok(),
+                direction: row.get(6).ok(),
+                file_path: row.get(7).ok(),
+                file_size: row
+                    .get::<_, Option<i64>>(8)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| u64::try_from(v).ok()),
+                record_count: row
+                    .get::<_, Option<i64>>(9)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| u64::try_from(v).ok()),
+                status: row.get(10)?,
+                error_message: row.get(11).ok(),
+                notes: row.get(12).ok(),
+                started_at: row.get(13).ok(),
+                completed_at: row.get(14).ok(),
+                created_at: row.get(15)?,
+                updated_at: row.get(16)?,
+            })
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+    }
+
+    Ok(Json(json!({
+        "status": "success",
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DailyStatsQuery {
+    pub env_id: Option<String>,
+    pub target_site: Option<String>,
+    pub days: Option<u32>,
+}
+
+pub async fn daily_stats(
+    Query(params): Query<DailyStatsQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let conn = open_sqlite().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let days = params.days.unwrap_or(7).max(1).min(90);
+    let start_time = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+
+    let mut conditions: Vec<String> = vec!["created_at >= ?".to_string()];
+    let mut values: Vec<SqlValue> = vec![SqlValue::Text(start_time)];
+
+    if let Some(env_id) = params.env_id.filter(|s| !s.is_empty()) {
+        conditions.push("env_id = ?".to_string());
+        values.push(SqlValue::Text(env_id));
+    }
+    if let Some(target_site) = params.target_site.filter(|s| !s.is_empty()) {
+        conditions.push("target_site = ?".to_string());
+        values.push(SqlValue::Text(target_site));
+    }
+
+    let where_clause = format!(" WHERE {}", conditions.join(" AND "));
+
+    let sql = format!(
+        "SELECT substr(created_at, 1, 10) AS day,
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                SUM(COALESCE(record_count, 0)) AS record_count,
+                SUM(CASE WHEN status = 'completed' THEN COALESCE(file_size, 0) ELSE 0 END) AS total_bytes
+         FROM remote_sync_logs
+         {}
+         GROUP BY day
+         ORDER BY day DESC
+         LIMIT ?",
+        where_clause
+    );
+
+    values.push(SqlValue::Integer(days as i64));
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(values.into_iter()), |row| {
+            Ok(json!({
+                "day": row.get::<_, String>(0)?,
+                "total": row.get::<_, i64>(1).unwrap_or(0),
+                "completed": row.get::<_, i64>(2).unwrap_or(0),
+                "failed": row.get::<_, i64>(3).unwrap_or(0),
+                "record_count": row.get::<_, i64>(4).unwrap_or(0),
+                "total_bytes": row.get::<_, i64>(5).unwrap_or(0),
+            }))
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+    }
+
+    Ok(Json(json!({
+        "status": "success",
+        "items": items,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FlowStatsQuery {
+    pub env_id: Option<String>,
+    pub limit: Option<usize>,
+}
+
+pub async fn flow_stats(
+    Query(params): Query<FlowStatsQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let conn = open_sqlite().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let limit = params.limit.unwrap_or(20).max(1).min(200);
+
+    let mut conditions: Vec<String> = Vec::new();
+    let mut values: Vec<SqlValue> = Vec::new();
+
+    if let Some(env_id) = params.env_id.filter(|s| !s.is_empty()) {
+        conditions.push("env_id = ?".to_string());
+        values.push(SqlValue::Text(env_id));
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+
+    let sql = format!(
+        "SELECT COALESCE(env_id, '') AS env_id,
+                COALESCE(target_site, '') AS target_site,
+                COALESCE(direction, '') AS direction,
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                SUM(COALESCE(record_count, 0)) AS record_count,
+                SUM(CASE WHEN status = 'completed' THEN COALESCE(file_size, 0) ELSE 0 END) AS total_bytes
+         FROM remote_sync_logs
+         {}
+         GROUP BY env_id, target_site, direction
+         ORDER BY total_bytes DESC, total DESC
+         LIMIT ?",
+        where_clause
+    );
+
+    values.push(SqlValue::Integer(limit as i64));
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(values.into_iter()), |row| {
+            Ok(json!({
+                "env_id": row.get::<_, String>(0).unwrap_or_default(),
+                "target_site": row.get::<_, String>(1).unwrap_or_default(),
+                "direction": row.get::<_, String>(2).unwrap_or_default(),
+                "total": row.get::<_, i64>(3).unwrap_or(0),
+                "completed": row.get::<_, i64>(4).unwrap_or(0),
+                "failed": row.get::<_, i64>(5).unwrap_or(0),
+                "record_count": row.get::<_, i64>(6).unwrap_or(0),
+                "total_bytes": row.get::<_, i64>(7).unwrap_or(0),
+            }))
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+    }
+
+    Ok(Json(json!({
+        "status": "success",
+        "items": items,
+    })))
+}
+
+pub async fn get_site_metadata(
+    Path(site_id): Path<String>,
+    Query(query): Query<MetadataQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let context = load_site_metadata(&site_id, query.refresh, query.cache_only).await?;
+    let MetadataLoadContext {
+        info,
+        metadata,
+        source,
+        fetched_at,
+        cache_path,
+        warnings,
+        http_base,
+        local_base,
+    } = context;
+
+    let cache_path_str = cache_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+    let local_base_str = local_base
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+
+    Ok(Json(json!({
+        "status": "success",
+        "source": source.as_str(),
+        "fetched_at": fetched_at,
+        "entry_count": metadata.entries.len(),
+        "cache_path": cache_path_str,
+        "http_base": http_base,
+        "local_base": local_base_str,
+        "warnings": warnings,
+        "env": {
+            "id": info.env_id,
+            "name": info.env_name,
+            "file_host": info.env_file_host,
+        },
+        "site": {
+            "id": info.site_id,
+            "name": info.site_name,
+            "host": info.site_host,
+        },
+        "metadata": metadata,
+    })))
+}
+
+pub async fn serve_site_files(
+    Path((site_id, requested_path)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
+    req: Request<Body>,
+) -> Result<Response, StatusCode> {
+    serve_site_files_impl(site_id, requested_path, original_uri, req).await
+}
+
+pub async fn serve_site_files_root(
+    Path(site_id): Path<String>,
+    OriginalUri(original_uri): OriginalUri,
+    req: Request<Body>,
+) -> Result<Response, StatusCode> {
+    serve_site_files_impl(site_id, String::new(), original_uri, req).await
+}
+
+async fn serve_site_files_impl(
+    site_id: String,
+    requested_path: String,
+    original_uri: Uri,
+    mut req: Request<Body>,
+) -> Result<Response, StatusCode> {
+    let conn = open_sqlite().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let info = load_site_info(&conn, &site_id)?;
+    drop(conn);
+
+    let local_base = resolve_local_base(&info).ok_or(StatusCode::NOT_FOUND)?;
+
+    let mut service = ServeDir::new(local_base).show_files_listing();
+
+    let mut new_path = if requested_path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", requested_path)
+    };
+    if let Some(query) = original_uri.query() {
+        new_path.push('?');
+        new_path.push_str(query);
+    }
+    let new_uri: Uri = new_path
+        .parse()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    *req.uri_mut() = new_uri;
+
+    service
+        .oneshot(req)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn load_site_metadata(
+    site_id: &str,
+    refresh: bool,
+    cache_only: bool,
+) -> Result<MetadataLoadContext, StatusCode> {
+    let conn = open_sqlite().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let info = load_site_info(&conn, site_id)?;
+    drop(conn);
+
+    let local_base = resolve_local_base(&info);
+
+    let http_base = info
+        .site_host
+        .as_deref()
+        .filter(site_metadata::is_http_url)
+        .map(|s| s.to_string())
+        .or_else(|| {
+            info.env_file_host
+                .as_deref()
+                .filter(site_metadata::is_http_url)
+                .map(|s| s.to_string())
+        });
+
+    let mut warnings = Vec::new();
+    let mut source = MetadataSource::Unknown;
+    let mut fetched_at = site_metadata::timestamp_now();
+    let mut cache_path: Option<PathBuf> = None;
+    let mut metadata_opt: Option<SiteMetadataFile> = None;
+
+    let mut cached: Option<CachedMetadata> =
+        match site_metadata::read_cache(Some(info.env_id.as_str()), Some(info.site_id.as_str()))
+            .await
+        {
+            Ok(cache) => Some(cache),
+            Err(err) => {
+                let is_not_found = err
+                    .downcast_ref::<std::io::Error>()
+                    .map(|io_err| io_err.kind() == ErrorKind::NotFound)
+                    .unwrap_or(false);
+                if !is_not_found {
+                    warnings.push(format!("读取缓存失败: {}", err));
+                }
+                None
+            }
+        };
+
+    if let Some(base) = &local_base {
+        match site_metadata::read_local_metadata(base).await {
+            Ok(mut metadata) => {
+                fill_metadata_defaults(&mut metadata, &info);
+                fetched_at = site_metadata::timestamp_now();
+                source = MetadataSource::LocalPath;
+                match site_metadata::write_cache(
+                    metadata.env_id.as_deref(),
+                    metadata.site_id.as_deref(),
+                    &metadata,
+                )
+                .await
+                {
+                    Ok(path) => {
+                        cache_path = Some(path);
+                    }
+                    Err(err) => warnings.push(format!("写入本地缓存失败: {}", err)),
+                }
+                metadata_opt = Some(metadata);
+            }
+            Err(err) => {
+                warnings.push(format!("读取本地元数据失败: {}", err));
+            }
+        }
+    }
+
+    if metadata_opt.is_none() && !cache_only {
+        if let Some(http_base) = &http_base {
+            if refresh || cached.is_none() {
+                match site_metadata::fetch_remote_metadata(http_base).await {
+                    Ok(mut metadata) => {
+                        fill_metadata_defaults(&mut metadata, &info);
+                        fetched_at = site_metadata::timestamp_now();
+                        source = MetadataSource::RemoteHttp;
+                        match site_metadata::write_cache(
+                            metadata.env_id.as_deref(),
+                            metadata.site_id.as_deref(),
+                            &metadata,
+                        )
+                        .await
+                        {
+                            Ok(path) => {
+                                cache_path = Some(path);
+                            }
+                            Err(err) => warnings.push(format!("写入缓存失败: {}", err)),
+                        }
+                        metadata_opt = Some(metadata);
+                    }
+                    Err(err) => warnings.push(format!("拉取远程元数据失败: {}", err)),
+                }
+            }
+        }
+    }
+
+    if metadata_opt.is_none() {
+        if let Some(cache) = cached.take() {
+            fetched_at = cache.cached_at.clone();
+            source = MetadataSource::Cache;
+            cache_path = Some(site_metadata::metadata_cache_path(
+                Some(info.env_id.as_str()),
+                Some(info.site_id.as_str()),
+            ));
+            metadata_opt = Some(cache.metadata);
+        }
+    }
+
+    let metadata = metadata_opt
+        .map(|mut data| {
+            fill_metadata_defaults(&mut data, &info);
+            data
+        })
+        .unwrap_or_else(|| {
+            let mut data = SiteMetadataFile::default();
+            fill_metadata_defaults(&mut data, &info);
+            data
+        });
+
+    Ok(MetadataLoadContext {
+        info,
+        metadata,
+        source,
+        fetched_at,
+        cache_path,
+        warnings,
+        http_base,
+        local_base,
+    })
+}
+
+fn load_site_info(conn: &rusqlite::Connection, site_id: &str) -> Result<SiteInfo, StatusCode> {
+    let mut stmt_site = conn
+        .prepare("SELECT env_id, name, http_host FROM remote_sync_sites WHERE id = ?1 LIMIT 1")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let site_row = stmt_site
+        .query_row([site_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .optional()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (env_id, site_name, site_host) = match site_row {
+        Some(row) => row,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    let mut stmt_env = conn
+        .prepare("SELECT name, file_server_host FROM remote_sync_envs WHERE id = ?1 LIMIT 1")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let env_row = stmt_env
+        .query_row([env_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .optional()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (env_name, env_file_host) = match env_row {
+        Some((name, host)) => (Some(name), host),
+        None => (None, None),
+    };
+
+    Ok(SiteInfo {
+        env_id,
+        env_name,
+        env_file_host,
+        site_id: site_id.to_string(),
+        site_name,
+        site_host,
+    })
+}
+
+fn resolve_local_base(info: &SiteInfo) -> Option<PathBuf> {
+    info.site_host
+        .as_deref()
+        .filter(site_metadata::is_local_path_hint)
+        .map(site_metadata::normalize_local_base)
+        .or_else(|| {
+            info.env_file_host
+                .as_deref()
+                .filter(site_metadata::is_local_path_hint)
+                .map(site_metadata::normalize_local_base)
+        })
+}
+
+fn fill_metadata_defaults(metadata: &mut SiteMetadataFile, info: &SiteInfo) {
+    if metadata.env_id.is_none() {
+        metadata.env_id = Some(info.env_id.clone());
+    }
+    if metadata.env_name.is_none() {
+        metadata.env_name = info.env_name.clone();
+    }
+    if metadata.site_id.is_none() {
+        metadata.site_id = Some(info.site_id.clone());
+    }
+    if metadata.site_name.is_none() {
+        metadata.site_name = Some(info.site_name.clone());
+    }
+    if metadata.site_http_host.is_none() {
+        metadata.site_http_host = info
+            .site_host
+            .clone()
+            .or_else(|| info.env_file_host.clone());
+    }
+    if metadata.generated_at.is_empty() {
+        metadata.generated_at = site_metadata::timestamp_now();
+    }
 }

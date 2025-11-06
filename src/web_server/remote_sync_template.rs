@@ -231,7 +231,7 @@ pub fn render_remote_sync_page_with_sidebar() -> String {
     "#,
     );
     let extra_scripts = Some(REMOTE_SYNC_JS);
-    crate::web_ui::layout::render_layout_with_sidebar(
+    crate::web_server::layout::render_layout_with_sidebar(
         "异地增量环境配置",
         Some("remote-sync"),
         content,

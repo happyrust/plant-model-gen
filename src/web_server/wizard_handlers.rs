@@ -12,8 +12,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
-use crate::web_ui::AppState;
-use crate::web_ui::models::*;
+use crate::web_server::models::*;
+use crate::web_server::AppState;
 use rusqlite as _;
 
 /// 扫描指定目录中的项目
@@ -1014,8 +1014,8 @@ pub fn restore_tasks_from_sqlite() -> Vec<TaskInfo> {
 }
 
 /// 从SQLite加载所有部署站点（简化版本，返回JSON Value）
-pub fn load_deployment_sites_from_sqlite()
--> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+pub fn load_deployment_sites_from_sqlite(
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     let conn = open_deployment_sites_sqlite()?;
 
     let mut stmt = conn.prepare(
@@ -1032,6 +1032,7 @@ pub fn load_deployment_sites_from_sqlite()
         let name: String = row.get(1)?;
         let config_json: String = row.get(2)?;
         let selected_projects_json: String = row.get(3)?;
+        let root_directory: Option<String> = row.get(4).ok();
         let created_at: String = row.get(7)?;
         let updated_at: String = row.get(8)?;
         let status: String = row.get(9)?;
@@ -1064,6 +1065,7 @@ pub fn load_deployment_sites_from_sqlite()
             "url": null,
             "health_url": health_url,
             "last_health_check": last_health_check,
+            "root_directory": root_directory,
             "e3d_projects": e3d_projects,
             "config": config,
             "created_at": created_at,
@@ -1108,7 +1110,7 @@ pub fn load_deployment_site_by_id_from_sqlite(
         let name: String = row.get(1)?;
         let config_json: String = row.get(2)?;
         let selected_projects_json: String = row.get(3)?;
-        let _root_directory: Option<String> = row.get(4)?;
+        let root_directory: Option<String> = row.get(4).ok();
         let _parallel_processing: Option<bool> = row.get(5)?;
         let _max_concurrent: Option<i32> = row.get(6)?;
         let created_at: String = row.get(7)?;
@@ -1142,6 +1144,7 @@ pub fn load_deployment_site_by_id_from_sqlite(
             "url": null,
             "health_url": health_url,
             "last_health_check": last_health_check,
+            "root_directory": root_directory,
             "e3d_projects": e3d_projects,
             "config": config,
             "created_at": created_at,

@@ -1,9 +1,9 @@
 use axum::{
-    Router,
     extract::{Query, State},
-    http::{Method, StatusCode, header},
+    http::{header, Method, StatusCode},
     response::{Html, Json},
     routing::{delete, get, post, put},
+    Router,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -31,6 +31,7 @@ pub mod remote_runtime;
 pub mod remote_sync_handlers;
 pub mod remote_sync_template;
 pub mod simple_templates;
+pub mod site_metadata;
 pub mod sync_control_center;
 pub mod sync_control_handlers;
 pub mod task_creation_handlers;
@@ -38,7 +39,7 @@ pub mod wizard_handlers;
 pub mod wizard_template;
 pub mod xkt_test_handlers;
 
-use crate::web_api::{SpatialQueryApiState, create_spatial_query_routes};
+use crate::web_api::{create_spatial_query_routes, SpatialQueryApiState};
 use handlers::*;
 use models::*;
 
@@ -151,9 +152,9 @@ pub async fn start_web_server(port: u16) -> anyhow::Result<()> {
     }
 
     // 初始化 SurrealDB 中的 projects 表（若已存在忽略错误）
-    crate::web_ui::handlers::ensure_projects_schema().await;
+    crate::web_server::handlers::ensure_projects_schema().await;
     // 初始化 SurrealDB 中的 deployment_sites 表
-    crate::web_ui::handlers::ensure_deployment_sites_schema().await;
+    crate::web_server::handlers::ensure_deployment_sites_schema().await;
 
     // 初始化空间查询API
     let db_manager = crate::AiosDBManager::init_form_config().await?;
@@ -380,12 +381,36 @@ pub async fn start_web_server(port: u16) -> anyhow::Result<()> {
             post(remote_sync_handlers::import_env_from_dboption),
         )
         .route(
+            "/api/remote-sync/logs",
+            get(remote_sync_handlers::list_logs),
+        )
+        .route(
+            "/api/remote-sync/stats/daily",
+            get(remote_sync_handlers::daily_stats),
+        )
+        .route(
+            "/api/remote-sync/stats/flows",
+            get(remote_sync_handlers::flow_stats),
+        )
+        .route(
             "/api/remote-sync/envs/{id}/sites",
             get(remote_sync_handlers::list_sites).post(remote_sync_handlers::create_site),
         )
         .route(
             "/api/remote-sync/sites/{id}",
             put(remote_sync_handlers::update_site).delete(remote_sync_handlers::delete_site),
+        )
+        .route(
+            "/api/remote-sync/sites/{id}/metadata",
+            get(remote_sync_handlers::get_site_metadata),
+        )
+        .route(
+            "/api/remote-sync/sites/{id}/files/*path",
+            get(remote_sync_handlers::serve_site_files),
+        )
+        .route(
+            "/api/remote-sync/sites/{id}/files",
+            get(remote_sync_handlers::serve_site_files_root),
         )
         // LiteFS 节点状态和健康检查 API
         .route("/api/node-status", get(litefs_handlers::get_node_status))
@@ -496,6 +521,10 @@ pub async fn start_web_server(port: u16) -> anyhow::Result<()> {
                 .delete(handlers::api_delete_deployment_site),
         )
         .route(
+            "/api/deployment-sites/{id}/browse-directory",
+            get(handlers::api_browse_deployment_site_directory),
+        )
+        .route(
             "/api/deployment-sites/{id}/tasks",
             post(handlers::api_create_deployment_site_task),
         )
@@ -597,12 +626,18 @@ pub async fn start_web_server(port: u16) -> anyhow::Result<()> {
         .route("/api/export/gltf", post(handlers::create_export_task))
         .route("/api/export/glb", post(handlers::create_export_task))
         .route("/api/export/xkt", post(handlers::create_export_task))
-        .route("/api/export/status/{task_id}", get(handlers::get_export_status))
-        .route("/api/export/download/{task_id}", get(handlers::download_export))
+        .route(
+            "/api/export/status/{task_id}",
+            get(handlers::get_export_status),
+        )
+        .route(
+            "/api/export/download/{task_id}",
+            get(handlers::download_export),
+        )
         .route("/api/export/tasks", get(handlers::list_export_tasks))
         .route("/api/export/cleanup", post(handlers::cleanup_export_tasks))
         // 静态文件服务
-        .nest_service("/static", ServeDir::new("src/web_ui/static"))
+        .nest_service("/static", ServeDir::new("src/web_server/static"))
         .nest_service("/files/output", ServeDir::new("output"))
         // 主页面
         .route("/", get(index_page))
@@ -660,21 +695,21 @@ pub async fn start_web_server(port: u16) -> anyhow::Result<()> {
     // 后台自动更新扫描任务（基于 auto_update + sesno 比较）
     // 注释掉自动调度器，因为数据库服务由配置管理
     // 先确保 SurrealDB 的表结构字段齐备（在生产环境中便于统一管理）
-    // crate::web_ui::db_status_handlers::ensure_dbnum_info_schema().await;
+    // crate::web_server::db_status_handlers::ensure_dbnum_info_schema().await;
     // tokio::spawn(auto_update_scheduler(app_state.clone()));
 
     // 周期性项目健康检查（可通过 WEBUI_HEALTH_SCHED=0 关闭）
     // 也注释掉，避免启动时查询数据库
-    // tokio::spawn(crate::web_ui::handlers::projects_health_scheduler());
+    // tokio::spawn(crate::web_server::handlers::projects_health_scheduler());
 
     axum::serve(listener, app).await?;
     Ok(())
 }
 
 async fn auto_update_scheduler(state: AppState) {
-    use crate::web_ui::models::{IncrementalUpdateRequest, UpdateType};
+    use crate::web_server::models::{IncrementalUpdateRequest, UpdateType};
     use aios_core::SUL_DB;
-    use axum::{Json, extract::State as AxumState};
+    use axum::{extract::State as AxumState, Json};
     use std::time::Duration;
 
     loop {
@@ -719,7 +754,7 @@ async fn auto_update_scheduler(state: AppState) {
                     update_type,
                     target_sesno: None,
                 };
-                let _ = crate::web_ui::handlers::execute_incremental_update(
+                let _ = crate::web_server::handlers::execute_incremental_update(
                     AxumState(state.clone()),
                     Json(req),
                 )

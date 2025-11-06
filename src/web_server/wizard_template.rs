@@ -138,7 +138,7 @@ pub fn wizard_page_with_layout() -> String {
     let wizard_js = wizard_javascript();
     let extra_scripts = Some(wizard_js.as_str());
 
-    crate::web_ui::layout::render_layout_with_sidebar(
+    crate::web_server::layout::render_layout_with_sidebar(
         "部署站点创建向导 - AIOS 数据库管理平台",
         Some("wizard"),
         &content,

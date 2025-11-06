@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::web_ui::AppState;
+use crate::web_server::AppState;
 // 暂时注释掉 grpc_service 依赖，使用简化的实现
 // use crate::grpc_service::managers::task_manager::TaskManager;
 // use crate::grpc_service::types::{TaskRequest, TaskType, TaskStatus, TaskPriority};

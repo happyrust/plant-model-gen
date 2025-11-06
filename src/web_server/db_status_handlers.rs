@@ -6,19 +6,19 @@ use axum::{
 use serde_json::json;
 use std::time::SystemTime;
 
-use crate::web_ui::{
-    AppState,
+use crate::web_server::{
     models::{
         DbStatusInfo, DbStatusQuery, FileVersionInfo, IncrementalUpdateRequest, MeshStatus,
         ModelStatus, ParseStatus, UpdateType,
     },
+    AppState,
 };
 
 // 引入真实实现作为委托
 use crate::fast_model::session::{PdmsTimeExtractor, SESSION_STORE};
-use crate::web_ui::handlers as real_handlers;
-use aios_core::SUL_DB;
+use crate::web_server::handlers as real_handlers;
 use aios_core::get_db_option;
+use aios_core::SUL_DB;
 
 pub async fn get_db_status_list(
     State(_state): State<AppState>,

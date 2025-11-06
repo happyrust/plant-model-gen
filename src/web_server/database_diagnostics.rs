@@ -1,4 +1,4 @@
-use aios_core::{SUL_DB, get_db_option};
+use aios_core::{get_db_option, SUL_DB};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 use tokio::process::Command as TokioCommand;

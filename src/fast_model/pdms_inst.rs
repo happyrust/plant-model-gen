@@ -307,7 +307,6 @@ pub async fn save_instance_data_optimize(
     // - in: geo_relate ID (切割几何)
     // - out: 正实体 refno (被减实体)
     // - pe: 负实体 refno (负载体，原来的 in)
-    // 查询时：SELECT in.* FROM pe:正实体<-neg_relate 直接获取切割几何
     if !inst_mgr.neg_relate_map.is_empty() {
         println!("🔍 [DEBUG] 开始创建 neg_relate 关系 (新结构: in=geo_relate):");
         for (target, refnos) in &inst_mgr.neg_relate_map {
@@ -339,62 +338,7 @@ pub async fn save_instance_data_optimize(
                             neg_buffer.clear();
                         }
                     }
-                } else {
-                    // 当前 batch 中没有，尝试从数据库查询已存在的 geo_relate
-                    // 这种情况发生在负实体在不同 batch 中被处理时
-                    let sql = format!(
-                        "SELECT value id FROM geo_relate WHERE geom_refno = {} AND geo_type = 'Neg'",
-                        neg_refno.to_pe_key()
-                    );
-                    // 直接使用 query 获取原始响应
-                    match aios_core::SUL_DB.query(&sql).await {
-                        Ok(mut response) => {
-                            // 手动提取结果
-                            let raw_result: Result<Vec<aios_core::RecordId>, _> = response.take(0);
-                            match raw_result {
-                                Ok(db_geo_relate_ids) if !db_geo_relate_ids.is_empty() => {
-                                    for geo_relate_id in db_geo_relate_ids.iter() {
-                                        // 从 RecordId 提取 ID（格式为 "geo_relate:⟨xxx⟩"）
-                                        let id_str = format!("{:?}", geo_relate_id.key)
-                                            .trim_matches('"')
-                                            .trim_start_matches("String(\"")
-                                            .trim_end_matches("\")")
-                                            .to_string();
-                                        neg_buffer.push(format!(
-                                            "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', {2}], out: {2}, pe: {1} }}",
-                                            id_str,                // 切割几何
-                                            neg_refno.to_pe_key(), // 负载体
-                                            target.to_pe_key(),    // 正实体（被减实体）
-                                        ));
-
-                                        if neg_buffer.len() >= CHUNK_SIZE {
-                                            let statement = format!(
-                                                "INSERT RELATION INTO neg_relate [{}];",
-                                                neg_buffer.join(",")
-                                            );
-                                            neg_batcher.push(statement).await?;
-                                            neg_buffer.clear();
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    // 数据库中也没有找到或提取失败
-                                    println!(
-                                        "[WARN] neg_relate: 负实体 {} 没有找到 Neg 类型的 geo_relate",
-                                        neg_refno
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // 查询失败
-                            println!(
-                                "[WARN] neg_relate: 查询负实体 {} 的 geo_relate 失败: {}",
-                                neg_refno, e
-                            );
-                        }
-                    }
-                }
+                } 
             }
         }
 
@@ -415,7 +359,6 @@ pub async fn save_instance_data_optimize(
     // - out: 目标k (正实体)
     // - pe: ele_refno (负载体，原来的 in)
     // - ngmr: ngmr_geom_refno (NGMR 几何引用，保留用于调试)
-    // 查询时：SELECT in.* FROM pe:正实体<-ngmr_relate 直接获取切割几何
     if !inst_mgr.ngmr_neg_relate_map.is_empty() {
         println!("🔍 [DEBUG] 开始创建 ngmr_relate 关系 (新结构: in=geo_relate):");
         for (k, refnos) in &inst_mgr.ngmr_neg_relate_map {
@@ -452,13 +395,6 @@ pub async fn save_instance_data_optimize(
                             ngmr_buffer.clear();
                         }
                     }
-                } else {
-                    // 没有找到 geo_relate，记录警告但不创建关系
-                    debug_model_debug!(
-                        "[WARN] ngmr_relate: 负载体 {} + ngmr {} 没有找到 CataCrossNeg 类型的 geo_relate",
-                        ele_refno,
-                        ngmr_geom_refno
-                    );
                 }
             }
         }

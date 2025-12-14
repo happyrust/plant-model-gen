@@ -3,6 +3,7 @@
 ## 2025-12-15
 
 ### Changed
+
 - **BRAN 类型跳过布尔运算优化**
   - 修改位置：
     - `src/fast_model/manifold_bool.rs` - 在布尔运算入口过滤 BRAN 类型
@@ -17,6 +18,7 @@
 ## 2025-11-27
 
 ### Fixed
+
 - **修复 `has_tubi` 字段反序列化错误问题**
   - 问题：数据库中某些 `SPdmsElement` 记录的 `has_tubi` 字段为 null，而不是期望的 bool 类型，导致反序列化失败
   - 错误信息：`Failed to deserialize field 'has_tubi' on type 'SPdmsElement': Expected bool, got none`
@@ -29,6 +31,7 @@
   - 相关提交：gen-model@f41002f4, rs-core@2dd7c11
 
 ### Changed
+
 - **优化 tubi 关系查询逻辑**
   - 不再依赖 `has_tubi` 字段来判断是否有 tubi 关系
   - 直接使用 `tubi_relate` 表的 `in` 字段来判断，更加可靠和准确
@@ -38,6 +41,7 @@
 ## 2025-11-26
 
 ### Added
+
 - **为 `test_full_boolean_flow` 添加 OBJ 模型导出功能**
   - 功能：在布尔运算完成后自动导出布尔前后的 OBJ 模型用于可视化验证
   - 实现位置：`src/bin/test_full_boolean_flow.rs`
@@ -52,6 +56,7 @@
   - 依赖：`aios_database::fast_model::export_model::export_obj::export_obj_for_refnos`
 
 ### Changed
+
 - **更新完整布尔运算测试指南**
   - 文件：`llmdoc/guides/complete_boolean_test_guide.md`
   - 更新内容：

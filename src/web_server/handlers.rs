@@ -3906,7 +3906,7 @@ fn analyze_expression_error(error: &anyhow::Error, expression: &str) -> (String,
 
 async fn execute_real_task(state: AppState, task_id: String) {
     use crate::fast_model::aabb_tree::manual_update_aabbs;
-    use crate::fast_model::build_room_relations_v2 as build_room_relations;
+    use crate::fast_model::build_room_relations;
     use crate::fast_model::cal_model::{update_cal_bran_component, update_cal_equip};
     use crate::fast_model::gen_all_geos_data;
     use aios_core::options::DbOption;
@@ -6851,6 +6851,7 @@ async fn execute_export_task(
         verbose: true,
         unit_converter: UnitConverter::default(),
         use_basic_materials: request.use_basic_materials.unwrap_or(false),
+        include_negative: false,
     };
 
     // 生成输出文件路径
@@ -7379,9 +7380,7 @@ struct RoomUpdateResult {
 async fn update_room_relations_for_refnos_incremental(
     refnos: &[RefnoEnum],
 ) -> Result<RoomUpdateResult, anyhow::Error> {
-    use crate::fast_model::room_model_v2::{
-        build_room_relations_v2 as build_room_relations, update_room_relations_incremental,
-    };
+    use crate::fast_model::{build_room_relations, update_room_relations_incremental};
     use aios_core::get_db_option;
     use std::time::Instant;
 

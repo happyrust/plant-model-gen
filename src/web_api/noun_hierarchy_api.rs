@@ -3,6 +3,7 @@ use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
 use axum::{Router, extract::State, http::StatusCode, response::Json, routing::post};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use surrealdb::types::{self as surrealdb_types, SurrealValue};
 
 /// 名词层级查询 API 状态
 #[derive(Clone)]
@@ -92,6 +93,14 @@ pub struct NounTreeQueryResponse {
     pub tree: Option<NounTreeNode>,
     pub node_count: i32,
     pub error_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct PeRow {
+    pub refno: Option<u64>,
+    pub name: Option<String>,
+    pub noun: Option<String>,
+    pub owner: Option<u64>,
 }
 
 // === 处理函数 ===
@@ -193,26 +202,21 @@ async fn query_noun_tree(
     );
 
     match SUL_DB
-        .query_take::<Vec<serde_json::Value>>(&root_query, 0)
+        .query_take::<Vec<PeRow>>(&root_query, 0)
         .await
     {
         Ok(records) => {
             if let Some(record) = records.first() {
-                let refno = record
-                    .get("refno")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(request.root_refno);
+                let refno = record.refno.unwrap_or(request.root_refno);
                 let name = record
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown")
-                    .to_string();
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string());
                 let noun = record
-                    .get("noun")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("UNKNOWN")
-                    .to_string();
-                let owner = record.get("owner").and_then(|v| v.as_u64());
+                    .noun
+                    .clone()
+                    .unwrap_or_else(|| "UNKNOWN".to_string());
+                let owner = record.owner;
 
                 // 构建树形结构
                 match build_tree_recursive(
@@ -302,17 +306,17 @@ async fn build_tree_recursive(
         children_query.push_str(" LIMIT 100");
 
         match SUL_DB
-            .query_take::<Vec<serde_json::Value>>(&children_query, 0)
+            .query_take::<Vec<PeRow>>(&children_query, 0)
             .await
         {
             Ok(records) => {
                 for record in records {
                     if let (Some(child_refno), Some(child_name), Some(child_noun)) = (
-                        record.get("refno").and_then(|v| v.as_u64()),
-                        record.get("name").and_then(|v| v.as_str()),
-                        record.get("noun").and_then(|v| v.as_str()),
+                        record.refno,
+                        record.name.as_deref(),
+                        record.noun.as_deref(),
                     ) {
-                        let child_owner = record.get("owner").and_then(|v| v.as_u64());
+                        let child_owner = record.owner;
 
                         // 递归构建子树
                         match Box::pin(build_tree_recursive(

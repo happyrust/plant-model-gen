@@ -44,8 +44,9 @@ pub mod wizard_handlers;
 pub mod wizard_template;
 
 use crate::web_api::{
-    NounHierarchyApiState, SpatialQueryApiState, create_noun_hierarchy_routes,
-    create_spatial_query_routes,
+    E3dTreeApiState, NounHierarchyApiState, SpatialQueryApiState, create_e3d_tree_routes,
+    create_noun_hierarchy_routes, create_room_tree_routes, create_spatial_query_routes,
+    create_pdms_attr_routes,
 };
 use handlers::*;
 use models::*;
@@ -202,9 +203,20 @@ pub async fn start_web_server_with_config(
 
     // 初始化名词层级查询API
     let noun_hierarchy_state = NounHierarchyApiState {
-        db_manager: Arc::new(db_manager),
+        db_manager: Arc::new(db_manager.clone()),
     };
     let noun_hierarchy_routes = create_noun_hierarchy_routes(noun_hierarchy_state);
+
+    // 初始化 E3D 树 API
+    let e3d_tree_state = E3dTreeApiState {
+        db_manager: Arc::new(db_manager),
+    };
+    let e3d_tree_routes = create_e3d_tree_routes(e3d_tree_state);
+
+    // 初始化 Room 树 API（ARCH 房间分组树）
+    let room_tree_routes = create_room_tree_routes();
+
+    let pdms_attr_routes = create_pdms_attr_routes();
 
     // 初始化房间 API
     let room_api_state = room_api::RoomApiState {
@@ -745,16 +757,25 @@ pub async fn start_web_server_with_config(
         // WebSocket 路由
         .route("/ws/progress/{task_id}", get(ws::ws_progress_handler))
         .route("/ws/tasks", get(ws::ws_tasks_handler))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-                .allow_headers(Any),
-        )
         .with_state(app_state.clone())
         .merge(spatial_query_routes)
         .merge(noun_hierarchy_routes)
-        .merge(room_routes);
+        .merge(e3d_tree_routes)
+        .merge(room_tree_routes)
+        .merge(pdms_attr_routes)
+        .merge(room_routes)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers(Any),
+        );
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
     println!("🚀 Web UI服务器启动成功！");

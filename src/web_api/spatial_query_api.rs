@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use surrealdb::types::{self as surrealdb_types, SurrealValue};
 
 /// 空间查询API状态
 #[derive(Clone)]
@@ -55,6 +56,19 @@ pub struct NodeInfoResponse {
     pub error_message: Option<String>,
 }
 
+#[derive(Debug, Deserialize, SurrealValue)]
+struct PeRow {
+    pub refno: Option<u64>,
+    pub name: Option<String>,
+    pub noun: Option<String>,
+    pub owner: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct PeNounRow {
+    pub noun: Option<String>,
+}
+
 // === 处理函数 ===
 
 /// 查询空间节点及其子节点
@@ -82,7 +96,7 @@ async fn query_spatial_node(
     );
 
     match SUL_DB
-        .query_take::<Vec<serde_json::Value>>(&node_query, 0)
+        .query_take::<Vec<PeRow>>(&node_query, 0)
         .await
     {
         Ok(records) => {
@@ -97,15 +111,13 @@ async fn query_spatial_node(
 
             let record = &records[0];
             let name = record
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown")
-                .to_string();
+                .name
+                .clone()
+                .unwrap_or_else(|| "Unknown".to_string());
             let noun = record
-                .get("noun")
-                .and_then(|v| v.as_str())
-                .unwrap_or("UNKNOWN")
-                .to_string();
+                .noun
+                .clone()
+                .unwrap_or_else(|| "UNKNOWN".to_string());
 
             // 判断节点类型
             let node_type = determine_node_type(&noun);
@@ -153,12 +165,12 @@ async fn query_children_nodes(
     let parent_query = format!("SELECT noun FROM pe WHERE refno = {} LIMIT 1", refno);
 
     match SUL_DB
-        .query_take::<Vec<serde_json::Value>>(&parent_query, 0)
+        .query_take::<Vec<PeNounRow>>(&parent_query, 0)
         .await
     {
         Ok(records) => {
             if let Some(record) = records.first() {
-                if let Some(noun) = record.get("noun").and_then(|v| v.as_str()) {
+                if let Some(noun) = record.noun.as_deref() {
                     let children = query_children_by_type(noun, refno)
                         .await
                         .unwrap_or_default();
@@ -196,20 +208,18 @@ async fn get_node_info(
         refno
     );
 
-    match SUL_DB.query_take::<Vec<serde_json::Value>>(&query, 0).await {
+    match SUL_DB.query_take::<Vec<PeRow>>(&query, 0).await {
         Ok(records) => {
             if let Some(record) = records.first() {
                 let name = record
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown")
-                    .to_string();
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string());
                 let noun = record
-                    .get("noun")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("UNKNOWN")
-                    .to_string();
-                let owner = record.get("owner").and_then(|v| v.as_u64());
+                    .noun
+                    .clone()
+                    .unwrap_or_else(|| "UNKNOWN".to_string());
+                let owner = record.owner;
 
                 let node_type = determine_node_type(&noun);
                 Ok(Json(NodeInfoResponse {
@@ -289,22 +299,14 @@ async fn query_children_by_type(
         }
     };
 
-    let records: Vec<serde_json::Value> = SUL_DB.query_take(&query, 0).await?;
+    let records: Vec<PeRow> = SUL_DB.query_take(&query, 0).await?;
 
     let children = records
         .into_iter()
         .filter_map(|record| {
-            let refno = record.get("refno").and_then(|v| v.as_u64())?;
-            let name = record
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown")
-                .to_string();
-            let noun = record
-                .get("noun")
-                .and_then(|v| v.as_str())
-                .unwrap_or("UNKNOWN")
-                .to_string();
+            let refno = record.refno?;
+            let name = record.name.unwrap_or_else(|| "Unknown".to_string());
+            let noun = record.noun.unwrap_or_else(|| "UNKNOWN".to_string());
 
             Some(SpatialNode {
                 refno,

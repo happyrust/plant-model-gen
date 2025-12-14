@@ -189,6 +189,7 @@ async fn execute_export_task(
         verbose: true,
         unit_converter: UnitConverter::default(),
         use_basic_materials: request.use_basic_materials.unwrap_or(false),
+        include_negative: false,
     };
 
     // 生成输出文件路径

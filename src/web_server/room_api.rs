@@ -1259,7 +1259,7 @@ async fn execute_room_regenerate(
     request: crate::web_server::models::RoomRegenerateRequest,
 ) {
     use crate::fast_model::gen_model::gen_all_geos_data;
-    use crate::fast_model::room_model_v2::build_room_relations_v2 as build_room_relations;
+    use crate::fast_model::build_room_relations;
     use crate::options::get_db_option_ext;
 
     info!("📋 开始执行房间模型重新生成任务: {}", task_id);
@@ -1457,7 +1457,7 @@ pub async fn rebuild_room_relations_only(
     State(state): State<RoomApiState>,
     Json(request): Json<crate::web_server::models::RoomRelationsRebuildRequest>,
 ) -> Result<Json<crate::web_server::models::RoomComputeResponse>, StatusCode> {
-    use crate::fast_model::room_model_v2::rebuild_room_relations_for_rooms;
+    use crate::fast_model::rebuild_room_relations_for_rooms;
     use crate::options::get_db_option_ext;
 
     info!("🔄 收到房间关系重建请求");
@@ -1527,7 +1527,7 @@ async fn execute_rebuild_relations_only(
     task_id: String,
     request: crate::web_server::models::RoomRelationsRebuildRequest,
 ) {
-    use crate::fast_model::room_model_v2::rebuild_room_relations_for_rooms;
+    use crate::fast_model::rebuild_room_relations_for_rooms;
     use crate::options::get_db_option_ext;
 
     info!("📋 开始执行房间关系重建任务: {}", task_id);

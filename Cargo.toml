@@ -15,7 +15,7 @@ required-features = ["web_server"]
 [[bin]]
 name = "db_option_ui"
 path = "src/bin/db_option_ui/main.rs"
-required-features = ["web_server"]
+required-features = ["web_server", "eframe"]
 
 [[bin]]
 name = "test_dblist"

@@ -18,6 +18,19 @@ use glam::DMat4;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
+async fn filter_out_bran_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
+    if refnos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let refno_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
+    let refno_keys = refno_keys.join(",");
+    let sql = format!(
+        "SELECT value id FROM [{refno_keys}] WHERE noun != 'BRAN'"
+    );
+    SUL_DB.query_take(&sql, 0).await
+}
+
 /// 根据 mesh_id 和当前 LOD 配置构建完整的 mesh 文件路径
 ///
 /// # 参数
@@ -157,7 +170,16 @@ pub async fn apply_cata_neg_boolean_manifold(
     refnos: &[RefnoEnum],
     replace_exist: bool,
 ) -> anyhow::Result<()> {
-    let params = query_cata_neg_boolean_groups(refnos, replace_exist).await?;
+    if refnos.is_empty() {
+        return Ok(());
+    }
+
+    let filtered_refnos = filter_out_bran_refnos(refnos).await?;
+    if filtered_refnos.is_empty() {
+        return Ok(());
+    }
+
+    let params = query_cata_neg_boolean_groups(&filtered_refnos, replace_exist).await?;
     if params.is_empty() {
         return Ok(());
     }
@@ -394,8 +416,27 @@ pub async fn apply_insts_boolean_manifold(
         return Ok(());
     }
 
+    let filtered_refnos = filter_out_bran_refnos(refnos).await?;
+    if filtered_refnos.is_empty() {
+        return Ok(());
+    }
+
+    if filtered_refnos.len() != refnos.len() {
+        debug_model_debug!(
+            "实例布尔：跳过 BRAN 类型实体 {} 个（输入={} 过滤后={}）",
+            refnos.len().saturating_sub(filtered_refnos.len()),
+            refnos.len(),
+            filtered_refnos.len()
+        );
+    }
+
+    let refnos = filtered_refnos;
+    if refnos.is_empty() {
+        return Ok(());
+    }
+
     // 先用新的批量 API 筛选出存在负实体的实例
-    let neg_mapping = query_negative_entities_batch(refnos).await?;
+    let neg_mapping = query_negative_entities_batch(&refnos).await?;
     let targets: Vec<RefnoEnum> = neg_mapping
         .into_iter()
         .filter_map(|(pos, negs)| if negs.is_empty() { None } else { Some(pos) })

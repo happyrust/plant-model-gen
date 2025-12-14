@@ -1,5 +1,19 @@
 # Changelog
 
+## 2025-12-15
+
+### Changed
+- **BRAN 类型跳过布尔运算优化**
+  - 修改位置：
+    - `src/fast_model/manifold_bool.rs` - 在布尔运算入口过滤 BRAN 类型
+    - `src/fast_model/mesh_generate.rs` - 删除 `fix_missing_neg_relates` 函数，新增 `process_meshes_bran` 专用函数
+    - `src/fast_model/gen_model/models.rs` - BRAN 使用独立的网格处理流程
+  - 优化内容：
+    - BRAN 类型不再执行布尔运算和 neg_relate 检查
+    - BRAN 使用非 deep 遍历的网格生成，提高性能
+    - 减少了不必要的数据库查询和日志噪音
+  - 影响：BRAN/HANG 类型的模型生成速度提升，避免无意义的布尔运算警告
+
 ## 2025-11-27
 
 ### Fixed

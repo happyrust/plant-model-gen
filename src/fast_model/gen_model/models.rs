@@ -1,4 +1,4 @@
-use crate::fast_model::mesh_generate::process_meshes_update_db_deep;
+use crate::fast_model::mesh_generate::{process_meshes_update_db_deep, process_meshes_bran};
 use aios_core::geometry::ShapeInstancesData;
 use aios_core::{RefnoEnum, options::DbOption};
 use futures::stream::FuturesUnordered;
@@ -27,9 +27,16 @@ pub struct DbModelInstRefnos {
 impl DbModelInstRefnos {
     pub async fn execute_gen_inst_meshes(&self, db_option_arc: Option<Arc<DbOption>>) {
         if let Some(db_option) = db_option_arc {
-            let mut roots = Vec::new();
+            // BRAN 单独处理，不需要 deep 遍历和布尔运算
+            if !self.bran_hanger_refnos.is_empty() {
+                println!("[BRAN] 开始处理 BRAN/HANG 网格: {} 个", self.bran_hanger_refnos.len());
+                if let Err(e) = process_meshes_bran(Some(db_option.clone()), &self.bran_hanger_refnos).await {
+                    eprintln!("process_meshes_bran failed: {:?}", e);
+                }
+            }
 
-            roots.extend(self.bran_hanger_refnos.iter().copied());
+            // 其他类型使用 deep 遍历
+            let mut roots = Vec::new();
             roots.extend(self.use_cate_refnos.iter().copied());
             roots.extend(self.loop_owner_refnos.iter().copied());
             roots.extend(self.prim_refnos.iter().copied());

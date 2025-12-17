@@ -29,6 +29,7 @@ fn build_export_config(
     dbno: Option<u32>,
     split_by_site: bool,
     include_negative: bool,
+    export_svg: bool,
 ) -> ExportConfig {
     let run_all_dbnos = refnos_vec.is_empty() && dbno.is_none();
     ExportConfig {
@@ -45,6 +46,7 @@ fn build_export_config(
         run_all_dbnos,
         split_by_site,
         include_negative,
+        export_svg,
     }
 }
 
@@ -157,6 +159,12 @@ async fn main() -> anyhow::Result<()> {
             Arg::new("export-obj")
                 .long("export-obj")
                 .help("Export OBJ model when using --debug-model")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("export-svg")
+                .long("export-svg")
+                .help("Export profile SVG when using --debug-model")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -284,9 +292,21 @@ async fn main() -> anyhow::Result<()> {
                 .value_name("DIR"),
         )
         .arg(
+            Arg::new("export-refnos")
+                .long("export-refnos")
+                .help("Export only specified refnos (comma-separated, e.g., '24381_46959,24381_46960')")
+                .value_name("REFNOS"),
+        )
+        .arg(
             Arg::new("export-all-relates")
                 .long("export-all-relates")
-                .help("Export all inst_relate entities in Prepack LOD format (按 zone 分组)")
+                .help("Export all inst_relate entities in Prepack LOD format (按 zone 分组, 默认仅 L1)")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("export-all-lods")
+                .long("export-all-lods")
+                .help("Export all LOD levels (L1, L2, L3). Without this, only L1 is exported")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -495,6 +515,26 @@ async fn main() -> anyhow::Result<()> {
                 None,
                 split_by_site,
                 include_negative,
+                matches.get_flag("export-svg"),
+            );
+            return export_obj_mode(config, &db_option_ext).await;
+        }
+
+        if matches.get_flag("export-svg") {
+            println!("🎯 导出 SVG 截面 (调试模式): {:?}", refnos_vec);
+            let config = build_export_config(
+                refnos_vec.clone(),
+                output_path,
+                filter_nouns,
+                include_descendants,
+                source_unit,
+                target_unit,
+                verbose,
+                matches.get_flag("regen-model"),
+                None,
+                split_by_site,
+                include_negative,
+                true, // export_svg = true
             );
             return export_obj_mode(config, &db_option_ext).await;
         }
@@ -513,6 +553,7 @@ async fn main() -> anyhow::Result<()> {
                 None,
                 split_by_site,
                 include_negative,
+                matches.get_flag("export-svg"),
             );
             config.use_basic_materials = use_basic_materials;
             return export_glb_mode(config, &db_option_ext).await;
@@ -532,6 +573,7 @@ async fn main() -> anyhow::Result<()> {
                 None,
                 split_by_site,
                 include_negative,
+                matches.get_flag("export-svg"),
             );
             config.use_basic_materials = use_basic_materials;
             return export_gltf_mode(config, &db_option_ext).await;
@@ -555,6 +597,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(dbno),
                 split_by_site,
                 include_negative,
+                matches.get_flag("export-svg"),
             );
             return export_obj_mode(config, &db_option_ext).await;
         }
@@ -573,6 +616,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(dbno),
                 split_by_site,
                 include_negative,
+                matches.get_flag("export-svg"),
             );
             config.use_basic_materials = use_basic_materials;
             return export_glb_mode(config, &db_option_ext).await;
@@ -592,6 +636,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(dbno),
                 split_by_site,
                 include_negative,
+                matches.get_flag("export-svg"),
             );
             config.use_basic_materials = use_basic_materials;
             return export_gltf_mode(config, &db_option_ext).await;
@@ -617,6 +662,7 @@ async fn main() -> anyhow::Result<()> {
                 None,
                 split_by_site,
                 include_negative,
+                matches.get_flag("export-svg"),
             );
             return export_obj_mode(config, &db_option_ext).await;
         }
@@ -638,6 +684,7 @@ async fn main() -> anyhow::Result<()> {
                 None,
                 split_by_site,
                 include_negative,
+                matches.get_flag("export-svg"),
             );
             config.use_basic_materials = use_basic_materials;
             return export_glb_mode(config, &db_option_ext).await;
@@ -660,6 +707,7 @@ async fn main() -> anyhow::Result<()> {
                 None,
                 split_by_site,
                 include_negative,
+                matches.get_flag("export-svg"),
             );
             config.use_basic_materials = use_basic_materials;
             return export_gltf_mode(config, &db_option_ext).await;
@@ -682,6 +730,7 @@ async fn main() -> anyhow::Result<()> {
             use_basic_materials,
             split_by_site,
             include_negative,
+            matches.get_flag("export-svg"),
         );
         return export_gltf_mode(config, &db_option_ext).await;
     }
@@ -699,6 +748,7 @@ async fn main() -> anyhow::Result<()> {
             use_basic_materials,
             split_by_site,
             include_negative,
+            matches.get_flag("export-svg"),
         );
         return export_glb_mode(config, &db_option_ext).await;
     }
@@ -716,6 +766,7 @@ async fn main() -> anyhow::Result<()> {
             use_basic_materials,
             split_by_site,
             include_negative,
+            matches.get_flag("export-svg"),
         );
         return export_obj_mode(config, &db_option_ext).await;
     }
@@ -725,6 +776,8 @@ async fn main() -> anyhow::Result<()> {
 
         let dbno = matches.get_one::<u32>("dbno").copied();
         let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
+        let export_all_lods = matches.get_flag("export-all-lods");
+        let export_refnos = matches.get_one::<String>("export-refnos").cloned();
 
         // 解析 owner-types 参数（逗号分隔）
         let owner_types: Option<Vec<String>> = matches
@@ -734,8 +787,10 @@ async fn main() -> anyhow::Result<()> {
         // 获取名称配置文件路径
         let name_config_path = matches.get_one::<String>("name-config").map(PathBuf::from);
 
-        println!("🎯 导出所有 inst_relate 实体 (Prepack LOD 格式)");
-        if let Some(dbno) = dbno {
+        println!("🎯 导出 inst_relate 实体 (Prepack LOD 格式)");
+        if let Some(ref refnos) = export_refnos {
+            println!("   - 🎯 仅导出指定 refnos={}", refnos);
+        } else if let Some(dbno) = dbno {
             println!("   - 按 dbno={} 过滤", dbno);
         } else {
             println!("   - 全表扫描（所有 dbno）");
@@ -753,6 +808,8 @@ async fn main() -> anyhow::Result<()> {
             export_bundle_dir,
             owner_types,
             name_config_path,
+            export_all_lods,
+            export_refnos,
             &db_option_ext,
         )
         .await;

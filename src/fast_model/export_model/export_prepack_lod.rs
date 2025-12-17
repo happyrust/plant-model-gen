@@ -75,7 +75,15 @@ pub struct ComponentGroup {
     pub noun: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    pub instances: Vec<InstanceEntry>,
+    /// 公共字段（原来在每个 instance 中重复的）
+    pub color_index: usize,
+    pub name_index: usize,
+    pub lod_mask: u32,
+    pub spec_value: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uniforms: Option<serde_json::Value>,
+    /// 实例列表（只保留真正变化的字段）
+    pub instances: Vec<GeoEntry>,
 }
 
 /// 层级分组节点（BRAN/EQUI 作为组节点）
@@ -98,14 +106,12 @@ pub struct HierarchyGroup {
     pub tubings: Vec<TubingInstance>,
 }
 
-/// 实例条目
+/// 几何体实例条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InstanceEntry {
+pub struct GeoEntry {
     pub geo_hash: String,
     pub matrix: Vec<f32>,
     pub geo_index: usize,
-    pub color_index: usize,
-    pub name_index: usize,
 }
 
 /// 管道实例
@@ -143,6 +149,7 @@ pub struct GeometryEntry {
 ///
 /// # 参数
 /// - `name_config`: 可选名称配置，用于将三维模型节点名称转换为 PID 对象名称
+/// - `export_all_lods`: 是否导出所有 LOD 级别，为 false 时仅导出 L1
 pub async fn export_prepack_lod_for_refnos(
     refnos: &[RefnoEnum],
     mesh_dir: &Path,
@@ -152,10 +159,16 @@ pub async fn export_prepack_lod_for_refnos(
     filter_nouns: Option<Vec<String>>,
     verbose: bool,
     name_config: Option<&super::name_config::NameConfig>,
+    export_all_lods: bool,
 ) -> Result<()> {
     if verbose {
         println!("🚀 开始导出 Prepack LOD 格式...");
         println!("   - 输出目录: {}", output_dir.display());
+        if export_all_lods {
+            println!("   - 导出所有 LOD 级别: L1, L2, L3");
+        } else {
+            println!("   - 仅导出 LOD L1 (使用 --export-all-lods 导出所有级别)");
+        }
     }
 
     // 创建输出目录
@@ -171,6 +184,12 @@ pub async fn export_prepack_lod_for_refnos(
     .await
     .context("收集子孙节点失败")?;
 
+    let expanded_refnos_pe_keys_str = expanded_refnos
+        .iter()
+        .map(|r| r.to_pe_key())
+        .collect::<Vec<_>>()
+        .join(", ");
+
     // 🏗️ 添加 EQUI 的子组件到 expanded_refnos
     // 确保所有 EQUI 相关的组件都被包含在导出范围内
     let equi_children = {
@@ -179,9 +198,13 @@ pub async fn export_prepack_lod_for_refnos(
         }
 
         // 查询所有 EQUI 的子组件 refno
-        let sql = r#"
-            SELECT VALUE in.id FROM inst_relate WHERE owner_type = 'EQUI'
-        "#;
+        let sql = format!(
+            r#"
+            SELECT VALUE in.id FROM inst_relate
+            WHERE owner_type = 'EQUI' AND owner_refno IN [{}]
+        "#,
+            expanded_refnos_pe_keys_str
+        );
 
         let children: Vec<RefnoEnum> = aios_core::SUL_DB
             .query_take(sql, 0)
@@ -202,6 +225,12 @@ pub async fn export_prepack_lod_for_refnos(
             all_refnos.push(*child);
         }
     }
+
+    let all_refnos_pe_keys_str = all_refnos
+        .iter()
+        .map(|r| r.to_pe_key())
+        .collect::<Vec<_>>()
+        .join(", ");
 
     if verbose {
         println!(
@@ -248,7 +277,15 @@ pub async fn export_prepack_lod_for_refnos(
     let mut generated_assets: Vec<LodAssetSummary> = Vec::new();
     let filter_cache = filter_nouns.clone();
 
-    for level in LOD_LEVELS {
+    // 根据 export_all_lods 参数决定导出哪些 LOD 级别
+    let lod_levels_to_export = if export_all_lods {
+        LOD_LEVELS
+    } else {
+        // 仅导出 L1
+        &[LodLevel::L1]
+    };
+
+    for level in lod_levels_to_export {
         let level_tag = format!("{:?}", level);
         let Some(lod_dir) = resolve_lod_dir(&base_mesh_dir, &level_tag) else {
             println!(
@@ -326,9 +363,13 @@ pub async fn export_prepack_lod_for_refnos(
         }
 
         // 查询所有有子节点的 BRAN/HANG owner
-        let sql = r#"
-            SELECT VALUE owner_refno FROM inst_relate WHERE owner_type in ['BRAN', 'HANG']
-        "#;
+        let sql = format!(
+            r#"
+            SELECT VALUE owner_refno FROM inst_relate
+            WHERE owner_type in ['BRAN', 'HANG'] AND owner_refno IN [{}]
+        "#,
+            all_refnos_pe_keys_str
+        );
 
         let mut bran_hang_owners: Vec<RefnoEnum> = aios_core::SUL_DB
             .query_take(sql, 0)
@@ -356,9 +397,13 @@ pub async fn export_prepack_lod_for_refnos(
         }
 
         // 查询所有有子节点的 EQUI owner
-        let sql = r#"
-            SELECT VALUE owner_refno FROM inst_relate WHERE owner_type = 'EQUI'
-        "#;
+        let sql = format!(
+            r#"
+            SELECT VALUE owner_refno FROM inst_relate
+            WHERE owner_type = 'EQUI' AND owner_refno IN [{}]
+        "#,
+            all_refnos_pe_keys_str
+        );
 
         let mut equi_owner_list: Vec<RefnoEnum> = aios_core::SUL_DB
             .query_take(sql, 0)
@@ -390,23 +435,35 @@ pub async fn export_prepack_lod_for_refnos(
     .context("收集导出数据失败")?;
 
     // 为组件准备名称映射（使用 full name）
+    // 包括 all_refnos、bran_roots、equi_owners 和所有 component 的 owner_refno
     let mut refno_name_map: HashMap<RefnoEnum, String> = HashMap::new();
-    let mut debug_count = 0;
-    if !all_refnos.is_empty() {
-        for refno in &all_refnos {
-            if let Ok(full_name) = aios_core::get_default_full_name(*refno).await {
-                if !full_name.is_empty() {
-                    // 只去掉开头的斜线，保持其他字符原样
-                    let trimmed_name = full_name.trim().trim_start_matches('/').to_string();
-                    if !trimmed_name.is_empty() {
-                        // 如果有名称配置，使用配置转换名称；否则保持原样
-                        let final_name = if let Some(config) = name_config {
-                            config.convert_name(&trimmed_name)
-                        } else {
-                            trimmed_name
-                        };
-                        refno_name_map.insert(*refno, final_name);
-                    }
+    
+    // 收集所有需要查询 full name 的 refno
+    let mut all_name_refnos: Vec<RefnoEnum> = all_refnos.clone();
+    all_name_refnos.extend(bran_roots.iter().copied());
+    all_name_refnos.extend(equi_owners.iter().copied());
+    // 添加所有 component 的 owner_refno（确保 BRAN/EQUI owner 的 name 不为 null）
+    for component in &export_data.components {
+        if let Some(owner_refno) = component.owner_refno {
+            all_name_refnos.push(owner_refno);
+        }
+    }
+    all_name_refnos.sort();
+    all_name_refnos.dedup();
+    
+    for refno in &all_name_refnos {
+        if let Ok(full_name) = aios_core::get_default_full_name(*refno).await {
+            if !full_name.is_empty() {
+                // 只去掉开头的斜线，保持其他字符原样
+                let trimmed_name = full_name.trim().trim_start_matches('/').to_string();
+                if !trimmed_name.is_empty() {
+                    // 如果有名称配置，使用配置转换名称；否则保持原样
+                    let final_name = if let Some(config) = name_config {
+                        config.convert_name(&trimmed_name)
+                    } else {
+                        trimmed_name
+                    };
+                    refno_name_map.insert(*refno, final_name);
                 }
             }
         }
@@ -423,7 +480,17 @@ pub async fn export_prepack_lod_for_refnos(
 
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
 
-    let (geo_hashes, geo_index_map) = build_geo_index_map(&export_data);
+    // 使用 generated_assets 中的 mesh_map 构建 geo_index_map，而不是从空的 unique_geometries
+    let (geo_hashes, geo_index_map) = if !generated_assets.is_empty() {
+        // 使用第一个 LOD 的 mesh_map
+        let mesh_map = &generated_assets[0].mesh_map.0;
+        let mut hashes: Vec<String> = mesh_map.keys().cloned().collect();
+        hashes.sort();
+        let index_map: HashMap<String, usize> = hashes.iter().enumerate().map(|(i, h)| (h.clone(), i)).collect();
+        (hashes, index_map)
+    } else {
+        build_geo_index_map(&export_data)
+    };
     let geo_nouns = collect_geo_nouns(&export_data);
     let geometry_entries = build_geometry_entries(
         &geo_hashes,
@@ -776,8 +843,6 @@ fn build_instances_payload(
     equi_owners: &[RefnoEnum],
     verbose: bool,
 ) -> (serde_json::Value, usize) {
-    let mut name_table = NameTable::new();
-    let unknown_site_index = name_table.get_or_insert("site", "UNKNOWN_SITE");
     let mut color_palette = ColorPalette::new(material_library);
     let mut component_instance_count = 0usize;
 
@@ -844,58 +909,39 @@ fn build_instances_payload(
 
     for bran_refno in bran_owners_sorted {
         let bran_name = refno_name_map.get(&bran_refno).cloned();
-        let bran_label = bran_name.clone().unwrap_or_else(|| bran_refno.to_string());
-        let bran_name_index = name_table.get_or_insert("bran", &bran_label);
 
         // 构建子构件列表
         let mut children_entries: Vec<serde_json::Value> = Vec::new();
         if let Some(children) = bran_children_map.get(&bran_refno) {
             for component in children {
-                let component_label = component
-                    .name
-                    .as_ref()
-                    .filter(|name| !name.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| component.refno.to_string());
-                let name_index = name_table.get_or_insert("component", &component_label);
+                // 使用 refno_name_map 中的 full name
+                let component_name = refno_name_map.get(&component.refno).cloned();
                 let color_index = color_palette.index_for_noun(&component.noun);
-                let color_rgba = color_palette.color_at(color_index);
 
                 let mut instances = Vec::new();
                 for geom in &component.geometries {
                     if let Some(&geo_index) = geo_index_map.get(&geom.geo_hash) {
                         component_instance_count += 1;
-                        let lod_mask = compute_lod_mask(&geom.geo_hash, lod_assets);
-
-                        let mut uniforms = json!({
-                            "refno": component.refno.to_string(),
-                            "color_index": color_index,
-                            "owner_refno": bran_refno.to_string(),
-                            "owner_noun": component.owner_noun.clone().unwrap_or_else(|| "BRAN".to_string()),
-                        });
-                        if let Some(color) = color_rgba {
-                            uniforms["color"] = json!(color);
-                        }
-
+                        
                         instances.push(json!({
-                            "geo_hash": geom.geo_hash,
+                            "geo_hash": geom.geo_hash.clone(),
                             "geo_index": geo_index,
-                            "matrix": mat4_to_vec(&geom.transform, unit_converter, geom.unit_flag),
-                            "color_index": color_index,
-                            "name_index": name_index,
-                            "site_name_index": unknown_site_index,
-                            "lod_mask": lod_mask,
-                            "uniforms": uniforms,
+                            "geo_transform": mat4_to_vec(&geom.local_transform, unit_converter, geom.unit_flag),
                         }));
                     }
                 }
 
                 if !instances.is_empty() {
+                    let lod_mask = compute_lod_mask(&component.geometries[0].geo_hash, lod_assets);
+                    
                     children_entries.push(json!({
                         "refno": component.refno.to_string(),
                         "noun": component.noun,
-                        "name": component.name,
-                        "name_index": name_index,
+                        "name": component_name,
+                        "color_index": color_index,
+                        "lod_mask": lod_mask,
+                        "spec_value": component.spec_value,
+                        "refno_transform": mat4_to_vec(&component.world_transform, unit_converter, false),
                         "instances": instances,
                     }));
                 }
@@ -906,33 +952,24 @@ fn build_instances_payload(
         let mut tubi_entries: Vec<serde_json::Value> = Vec::new();
         if let Some(tubings) = bran_tubi_map.get(&bran_refno) {
             let color_index = color_palette.index_for_noun("TUBI");
-            let color_rgba = color_palette.color_at(color_index);
 
             for (tubi_order, tubing) in tubings.iter().enumerate() {
                 if let Some(&geo_index) = geo_index_map.get(&tubing.geo_hash) {
-                    let tubi_name_index = name_table.get_or_insert("tubi", &tubing.name);
+                    // 使用 refno_name_map 中的 full name
+                    let tubi_name = refno_name_map.get(&tubing.refno).cloned();
                     let lod_mask = compute_lod_mask(&tubing.geo_hash, lod_assets);
-
-                    let mut uniforms = json!({
-                        "refno": tubing.refno.to_string(),
-                        "color_index": color_index,
-                        "order": tubi_order,
-                    });
-                    if let Some(color) = color_rgba {
-                        uniforms["color"] = json!(color);
-                    }
 
                     tubi_entries.push(json!({
                         "refno": tubing.refno.to_string(),
                         "noun": "TUBI",
+                        "name": tubi_name,
                         "geo_hash": tubing.geo_hash,
                         "geo_index": geo_index,
                         "matrix": mat4_to_vec(&tubing.transform, unit_converter, !tubing.geo_hash.contains('_')),
                         "color_index": color_index,
-                        "name_index": tubi_name_index,
                         "order": tubi_order,
                         "lod_mask": lod_mask,
-                        "uniforms": uniforms,
+                        "spec_value": tubing.spec_value,
                     }));
                 }
             }
@@ -942,7 +979,6 @@ fn build_instances_payload(
             "refno": bran_refno.to_string(),
             "noun": "BRAN",
             "name": bran_name,
-            "name_index": bran_name_index,
             "children": children_entries,
             "tubings": tubi_entries,
         }));
@@ -1004,61 +1040,39 @@ fn build_instances_payload(
 
     for equi_refno in &equi_owners_sorted {
         let equi_name = refno_name_map.get(&equi_refno).cloned();
-        let equi_label = equi_name.clone().unwrap_or_else(|| equi_refno.to_string());
-        let equi_name_index = name_table.get_or_insert("equi", &equi_label);
 
         // 构建子构件列表
         let mut children_entries: Vec<serde_json::Value> = Vec::new();
         if let Some(children) = equi_children_map.get(&equi_refno) {
             for component in children {
-                let component_label = component
-                    .name
-                    .as_ref()
-                    .filter(|name| !name.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| component.refno.to_string());
-                let name_index = name_table.get_or_insert("component", &component_label);
+                // 使用 refno_name_map 中的 full name
+                let component_name = refno_name_map.get(&component.refno).cloned();
                 let color_index = color_palette.index_for_noun(&component.noun);
-                let color_rgba = color_palette.color_at(color_index);
 
                 let mut instances = Vec::new();
                 for geom in &component.geometries {
                     if let Some(&geo_index) = geo_index_map.get(&geom.geo_hash) {
                         component_instance_count += 1;
-                        let lod_mask = compute_lod_mask(&geom.geo_hash, lod_assets);
-
-                        let mut uniforms = json!({
-                            "refno": component.refno.to_string(),
-                            "color_index": color_index,
-                            "owner_refno": equi_refno.to_string(),
-                            "owner_noun": "EQUI",
-                        });
-                        if let Some(owner_type) = &component.owner_type {
-                            uniforms["owner_type"] = json!(owner_type);
-                        }
-                        if let Some(color) = color_rgba {
-                            uniforms["color"] = json!(color);
-                        }
-
+                        
                         instances.push(json!({
-                            "geo_hash": geom.geo_hash,
+                            "geo_hash": geom.geo_hash.clone(),
                             "geo_index": geo_index,
-                            "matrix": mat4_to_vec(&geom.transform, unit_converter, geom.unit_flag),
-                            "color_index": color_index,
-                            "name_index": name_index,
-                            "site_name_index": unknown_site_index,
-                            "lod_mask": lod_mask,
-                            "uniforms": uniforms,
+                            "geo_transform": mat4_to_vec(&geom.local_transform, unit_converter, geom.unit_flag),
                         }));
                     }
                 }
 
                 if !instances.is_empty() {
+                    let lod_mask = compute_lod_mask(&component.geometries[0].geo_hash, lod_assets);
+                    
                     children_entries.push(json!({
                         "refno": component.refno.to_string(),
                         "noun": component.noun,
-                        "name": component.name,
-                        "name_index": name_index,
+                        "name": component_name,
+                        "color_index": color_index,
+                        "lod_mask": lod_mask,
+                        "spec_value": component.spec_value,
+                        "refno_transform": mat4_to_vec(&component.world_transform, unit_converter, false),
                         "instances": instances,
                     }));
                 }
@@ -1069,7 +1083,6 @@ fn build_instances_payload(
             "refno": equi_refno.to_string(),
             "noun": "EQUI",
             "name": equi_name,
-            "name_index": equi_name_index,
             "children": children_entries,
         }));
     }
@@ -1102,55 +1115,34 @@ fn build_instances_payload(
             }
         }
 
-        let component_label = component
-            .name
-            .as_ref()
-            .filter(|name| !name.is_empty())
-            .cloned()
-            .unwrap_or_else(|| component.refno.to_string());
-        let name_index = name_table.get_or_insert("component", &component_label);
+        // 使用 refno_name_map 中的 full name
+        let component_name = refno_name_map.get(&component.refno).cloned();
         let color_index = color_palette.index_for_noun(&component.noun);
-        let color_rgba = color_palette.color_at(color_index);
 
         let mut instances = Vec::new();
         for geom in &component.geometries {
             if let Some(&geo_index) = geo_index_map.get(&geom.geo_hash) {
                 component_instance_count += 1;
-                let lod_mask = compute_lod_mask(&geom.geo_hash, lod_assets);
-
-                let mut uniforms = json!({
-                    "refno": component.refno.to_string(),
-                    "color_index": color_index,
-                });
-                if let Some(owner) = component.owner_refno {
-                    uniforms["owner_refno"] = json!(owner.to_string());
-                }
-                if let Some(owner_noun) = &component.owner_noun {
-                    uniforms["owner_noun"] = json!(owner_noun);
-                }
-                if let Some(color) = color_rgba {
-                    uniforms["color"] = json!(color);
-                }
-
+                
                 instances.push(json!({
-                    "geo_hash": geom.geo_hash,
+                    "geo_hash": geom.geo_hash.clone(),
                     "geo_index": geo_index,
-                    "matrix": mat4_to_vec(&geom.transform, unit_converter, geom.unit_flag),
-                    "color_index": color_index,
-                    "name_index": name_index,
-                    "site_name_index": unknown_site_index,
-                    "lod_mask": lod_mask,
-                    "uniforms": uniforms,
+                    "geo_transform": mat4_to_vec(&geom.local_transform, unit_converter, geom.unit_flag),
                 }));
             }
         }
 
         if !instances.is_empty() {
+            let lod_mask = compute_lod_mask(&component.geometries[0].geo_hash, lod_assets);
+            
             ungrouped_entries.push(json!({
                 "refno": component.refno.to_string(),
                 "noun": component.noun,
-                "name": component.name,
-                "name_index": name_index,
+                "name": component_name,
+                "color_index": color_index,
+                "lod_mask": lod_mask,
+                "spec_value": component.spec_value,
+                "refno_transform": mat4_to_vec(&component.world_transform, unit_converter, false),
                 "instances": instances,
             }));
         }
@@ -1160,7 +1152,6 @@ fn build_instances_payload(
         "version": 2,
         "generated_at": generated_at,
         "colors": color_palette.into_colors(),
-        "names": name_table.into_entries(),
         "bran_groups": bran_groups,
         "equi_groups": equi_groups,
         "ungrouped": ungrouped_entries,
@@ -1341,6 +1332,7 @@ fn default_material_for_level(level: u32) -> &'static str {
 /// # 参数
 /// - `owner_types`: 可选 owner_type 过滤（如 ["BRAN", "HANG"]），默认不过滤但仍排除 EQUI
 /// - `name_config`: 可选名称配置，用于将三维模型节点名称转换为 PID 对象名称
+/// - `export_all_lods`: 是否导出所有 LOD 级别，为 false 时仅导出 L1
 pub async fn export_all_relates_prepack_lod(
     dbno: Option<u32>,
     verbose: bool,
@@ -1348,11 +1340,65 @@ pub async fn export_all_relates_prepack_lod(
     owner_types: Option<Vec<String>>,
     name_config: Option<super::name_config::NameConfig>,
     db_option: Arc<DbOption>,
+    export_all_lods: bool,
+    export_refnos: Option<String>,
 ) -> Result<()> {
     use aios_core::rs_surreal::query_ext::SurrealQueryExt;
     use std::collections::HashSet;
 
     println!("\n🔍 查询 inst_relate 表...");
+
+    // 2.1 如果指定了 export_refnos，直接解析并导出
+    if let Some(ref refnos_str) = export_refnos {
+        let refnos: Vec<RefnoEnum> = refnos_str
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim();
+                if s.is_empty() {
+                    return None;
+                }
+                Some(RefnoEnum::from(s))
+            })
+            .collect();
+
+        if refnos.is_empty() {
+            println!("   ⚠️ 未指定有效的 refno");
+            return Ok(());
+        }
+
+        println!("   🎯 导出 {} 个指定 refnos", refnos.len());
+
+        // 确定输出目录
+        let output_dir = if let Some(custom) = output_override {
+            custom
+        } else {
+            PathBuf::from(format!("output/export_{}", refnos_str.replace(',', "_")))
+        };
+
+        println!("\n🔄 导出 Prepack LOD 格式:");
+        println!("   - 输出目录: {}", output_dir.display());
+        println!("   - 总实体数: {}", refnos.len());
+
+        // 获取 mesh 目录
+        let mesh_dir = if let Some(ref path) = db_option.meshes_path {
+            PathBuf::from(path)
+        } else {
+            PathBuf::from("assets/meshes")
+        };
+
+        return export_prepack_lod_for_refnos(
+            &refnos,
+            &mesh_dir,
+            &output_dir,
+            db_option,
+            true,  // include_descendants - 改为 true 以包含子实例
+            owner_types,  // filter_nouns
+            verbose,
+            name_config.as_ref(),
+            export_all_lods,
+        )
+        .await;
+    }
 
     // 2. 可选 owner_type 过滤
     let normalized_owner_types = owner_types
@@ -1481,9 +1527,9 @@ pub async fn export_all_relates_prepack_lod(
     let output_dir = if let Some(custom) = output_override {
         custom
     } else if let Some(dbno) = dbno {
-        PathBuf::from(format!("output/instanced-bundle/all_relates_dbno_{}", dbno))
+        PathBuf::from(format!("output/all_relates_dbno_{}", dbno))
     } else {
-        PathBuf::from("output/instanced-bundle/all_relates_all")
+        PathBuf::from("output/all_relates_all")
     };
 
     println!("\n🔄 导出 Prepack LOD 格式:");
@@ -1501,6 +1547,7 @@ pub async fn export_all_relates_prepack_lod(
         None,  // filter_nouns
         verbose,
         name_config.as_ref(),
+        export_all_lods,
     )
     .await?;
 

@@ -95,9 +95,9 @@ pub struct PrimitiveSegment {
 #[derive(Debug, Clone)]
 pub struct GeometryInstance {
     pub geo_hash: String,
-    pub transform: DMat4, // 世界变换矩阵
-    pub index: usize,     // 几何体索引
-    pub unit_flag: bool,  // 是否为单位 mesh（缩放已在 mesh 上，transform 保持单位矩阵）
+    pub local_transform: DMat4, // 几何体相对于 refno 的局部变换
+    pub index: usize,           // 几何体索引
+    pub unit_flag: bool,        // 是否为单位 mesh
 }
 
 /// 元件记录（包含多个几何体）
@@ -106,13 +106,16 @@ pub struct ComponentRecord {
     pub refno: RefnoEnum,
     pub noun: String,
     pub name: Option<String>,
+    pub world_transform: DMat4,  // refno 的世界变换
     pub geometries: Vec<GeometryInstance>,
     /// inst_relate 的 owner refno（例如设备 EQUI、结构 BRAN 等）
     pub owner_refno: Option<RefnoEnum>,
     /// owner 的 noun（EQUI/BRAN/HANG/...），大写
     pub owner_noun: Option<String>,
-    /// 设备类型（仅当 owner_noun = Some(\"EQUI\") 时有意义）
+    /// 设备类型（仅当 owner_noun = Some("EQUI") 时有意义）
     pub owner_type: Option<String>,
+    /// 规格值（来自 ZONE 的 owner.spec_value）
+    pub spec_value: Option<i64>,
 }
 
 /// TUBI 记录
@@ -125,6 +128,8 @@ pub struct TubiRecord {
     pub transform: DMat4,
     pub index: usize,
     pub name: String,
+    /// 规格值（来自 ZONE 的 owner.spec_value）
+    pub spec_value: Option<i64>,
 }
 
 /// 线程安全的几何体缓存
@@ -414,7 +419,8 @@ pub async fn collect_export_data(
                         aabb.d as world_aabb,
                         world_trans.d as world_trans,
                         record::id(geo) as geo_hash,
-                        id[0].dt as date
+                        id[0].dt as date,
+                        spec_value
                     FROM tubi_relate:[{}, 0]..[{}, ..]
                     WHERE aabb.d != NONE
                     "#,
@@ -630,9 +636,9 @@ pub async fn collect_export_data(
 
             geometries.push(GeometryInstance {
                 geo_hash: inst.geo_hash.clone(),
-                transform: world_matrix,
+                local_transform: inst.transform.to_matrix().as_dmat4(),  // 几何体局部变换
                 index: geo_index,
-                unit_flag: inst.unit_flag, // 使用独立的 unit_flag 字段
+                unit_flag: inst.unit_flag,
             });
         }
 
@@ -645,10 +651,12 @@ pub async fn collect_export_data(
                 refno: geom_inst.refno,
                 noun,
                 name,
+                world_transform: geom_inst.world_trans.to_matrix().as_dmat4(),  // refno 世界变换
                 geometries,
                 owner_refno,
                 owner_noun,
                 owner_type,
+                spec_value: geom_inst.spec_value,
             });
         }
     }
@@ -702,6 +710,7 @@ pub async fn collect_export_data(
             transform: world_matrix,
             index: *tubi_index - 1,
             name: tubi_name,
+            spec_value: tubi.spec_value,
         });
     }
 

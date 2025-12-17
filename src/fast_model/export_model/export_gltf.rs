@@ -411,7 +411,7 @@ fn export_mesh_to_gltf(
                 )
             };
 
-            let matrix_array = create_matrix_array(&geometry.transform);
+            let matrix_array = create_matrix_array(&geometry.local_transform);
 
             let geo_node = json!({
                 "name": geo_node_name,

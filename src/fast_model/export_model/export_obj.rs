@@ -77,7 +77,7 @@ fn merge_export_data_into_mesh(export_data: &ExportData) -> PlantMesh {
                 .append(true)
                 .open("/Volumes/DPC/work/plant-code/rs-plant3-d/.cursor/debug.log")
             {
-                let t = instance.transform;
+                let t = instance.local_transform;
                 let _ = writeln!(
                     f,
                     r#"{{"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"H7","location":"export_obj.rs:merge_export_data_into_mesh","message":"merge component inst","data":{{"geo_hash":"{}","transform":[[{},{},{},{}],[{},{},{},{}],[{},{},{},{}],[{},{},{},{}]]}},"timestamp":{}}}"#,
@@ -106,7 +106,7 @@ fn merge_export_data_into_mesh(export_data: &ExportData) -> PlantMesh {
                 &mut merged_mesh,
                 export_data,
                 &instance.geo_hash,
-                &instance.transform,
+                &instance.local_transform,
             );
         }
     }

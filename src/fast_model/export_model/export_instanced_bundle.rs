@@ -115,7 +115,7 @@ impl InstancedBundleExporter {
             for geom_inst in &component.geometries {
                 let instance = InstanceInfo {
                     refno: component.refno.to_string(),
-                    matrix: geom_inst.transform.to_cols_array(),
+                    matrix: geom_inst.local_transform.to_cols_array(),
                     color: None, // 可以后续添加颜色映射
                     name: component.name.clone(),
                 };

@@ -42,12 +42,14 @@ pub struct ExportConfig {
     pub dbno: Option<u32>,
     /// 是否使用基础颜色材质（非 PBR）
     pub use_basic_materials: bool,
-    /// 未指定 dbno 且未指定 refnos 时，是否默认跑全库
+    /// 是否运行所有 dbno（全库导出模式）
     pub run_all_dbnos: bool,
-    /// 是否按 SITE 拆分导出（默认 false，即合并导出）
+    /// 是否按 SITE 拆分导出
     pub split_by_site: bool,
     /// 是否包含负实体（Neg 类型几何体）
     pub include_negative: bool,
+    /// 是否导出 SVG 截面
+    pub export_svg: bool,
 }
 
 impl Default for ExportConfig {
@@ -66,6 +68,7 @@ impl Default for ExportConfig {
             run_all_dbnos: false,
             split_by_site: false,
             include_negative: false,
+            export_svg: false,
         }
     }
 }
@@ -75,6 +78,7 @@ impl ExportConfig {
     pub fn new(refnos_str: Vec<String>) -> Self {
         Self {
             refnos_str,
+            export_svg: false,
             ..Default::default()
         }
     }
@@ -146,6 +150,7 @@ impl ExportConfig {
         use_basic_materials: bool,
         split_by_site: bool,
         include_negative: bool,
+        export_svg: bool,
     ) -> Self {
         Self {
             refnos_str: vec![],
@@ -161,6 +166,7 @@ impl ExportConfig {
             run_all_dbnos: true, // 关键：全库导出
             split_by_site,
             include_negative,
+            export_svg,
         }
     }
 
@@ -193,6 +199,7 @@ impl ExportConfig {
             run_all_dbnos: true, // 关键：全库导出
             split_by_site,
             include_negative: false,
+            export_svg: false,
         }
     }
 
@@ -273,6 +280,18 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     println!("\n📡 连接数据库...");
     init_surreal().await?;
     println!("✅ 数据库连接成功");
+
+    // 如果需要导出 SVG，设置环境变量
+    if config.export_svg {
+        println!("🎨 启用 SVG 截面导出");
+        unsafe {
+            std::env::set_var("EXPORT_SVG", "true");
+        }
+    } else {
+        unsafe {
+            std::env::remove_var("EXPORT_SVG");
+        }
+    }
 
     // 获取 mesh 目录
     let mesh_dir = config.get_mesh_dir(db_option_ext);
@@ -1243,6 +1262,8 @@ pub async fn export_all_relates_mode(
     output_override: Option<PathBuf>,
     owner_types: Option<Vec<String>>,
     name_config_path: Option<PathBuf>,
+    export_all_lods: bool,
+    export_refnos: Option<String>,
     db_option_ext: &DbOptionExt,
 ) -> Result<()> {
     use aios_database::fast_model::export_model::NameConfig;
@@ -1273,6 +1294,8 @@ pub async fn export_all_relates_mode(
         owner_types,
         name_config,
         db_option,
+        export_all_lods,
+        export_refnos,
     )
     .await?;
 

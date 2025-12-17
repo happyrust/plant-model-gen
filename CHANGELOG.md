@@ -15,6 +15,13 @@
     - 减少了不必要的数据库查询和日志噪音
   - 影响：BRAN/HANG 类型的模型生成速度提升，避免无意义的布尔运算警告
 
+- **简化 neg_relate/ngmr_relate 关系创建逻辑**
+  - 修改位置：
+    - `src/fast_model/pdms_inst.rs` - `save_instance_data_optimize`
+  - 优化内容：
+    - 创建关系时仅依赖当前批次缓存的 `geo_relate_ids`，不再在 cache miss 时回退查询数据库
+    - 降低了跨批次关系补全的不确定性，并减少警告日志噪音
+
 ## 2025-11-27
 
 ### Fixed

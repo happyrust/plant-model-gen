@@ -166,12 +166,40 @@ fn export_unit_mesh_to_glb(
 
     let mut geo_buffer_info: HashMap<String, GeometryBufferInfo> = HashMap::new();
 
+    // 判断 geo_hash 是否为标准单位几何体（0, 1, 2, 3 等小数字）
+    let is_standard_unit_geometry = |geo_hash: &str| -> bool {
+        if let Ok(num) = geo_hash.parse::<u64>() {
+            num < 10
+        } else {
+            false
+        }
+    };
+
+    // 构建 geo_hash -> unit_flag 映射（从 components 和 tubings 中收集）
+    let mut geo_unit_flag_map: HashMap<&str, bool> = HashMap::new();
+    for component in &export_data.components {
+        for geom in &component.geometries {
+            // 对标准单位几何体强制 unit_flag=true
+            let effective_flag = if is_standard_unit_geometry(&geom.geo_hash) {
+                true
+            } else {
+                geom.unit_flag
+            };
+            geo_unit_flag_map.insert(&geom.geo_hash, effective_flag);
+        }
+    }
+    // TUBI 统一是 unit_mesh
+    for tubing in &export_data.tubings {
+        geo_unit_flag_map.insert(&tubing.geo_hash, true);
+    }
+
     // 为每个唯一几何体构建 buffer 数据
     for geo_hash in &sorted_geo_hashes {
         let mesh = export_data.unique_geometries.get(*geo_hash).unwrap();
-        // 约定：带下划线的 geo_hash 为非复用几何，直接在顶点上做单位换算；
-        // 其他复用几何保持原始单位，交由实例变换的缩放完成换算。
-        let convert_vertices = geo_hash.contains('_');
+        // unit_mesh：保持原始单位，由实例变换的缩放完成换算
+        // 非 unit_mesh：直接在顶点上做单位换算
+        let is_unit_mesh = geo_unit_flag_map.get(geo_hash.as_str()).copied().unwrap_or(false);
+        let convert_vertices = !is_unit_mesh;
 
         let vertex_count = mesh.vertices.len();
         let mut min_pos = Vec3::new(f32::MAX, f32::MAX, f32::MAX);

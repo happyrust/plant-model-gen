@@ -626,6 +626,22 @@ impl SqliteSpatialIndex {
         Ok(None)
     }
 
+    /// Get noun by refno
+    #[cfg(feature = "sqlite-index")]
+    pub fn get_noun(&self, refno: RefU64) -> Result<Option<String>> {
+        let conn = self.get_connection()?;
+        let mut stmt = conn.prepare_cached("SELECT noun FROM items WHERE id = ?1")?;
+        let noun: Option<String> = stmt
+            .query_row(params![refno.0 as i64], |row| row.get(0))
+            .optional()?;
+        Ok(noun)
+    }
+
+    #[cfg(not(feature = "sqlite-index"))]
+    pub fn get_noun(&self, _refno: RefU64) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Delete an AABB
     #[cfg(feature = "sqlite-index")]
     pub fn delete_aabb(&self, refno: RefU64) -> Result<()> {

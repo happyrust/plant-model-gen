@@ -150,6 +150,8 @@ pub struct GeometryEntry {
 /// # 参数
 /// - `name_config`: 可选名称配置，用于将三维模型节点名称转换为 PID 对象名称
 /// - `export_all_lods`: 是否导出所有 LOD 级别，为 false 时仅导出 L1
+/// - `source_length_unit`: 源单位
+/// - `target_length_unit`: 目标单位
 pub async fn export_prepack_lod_for_refnos(
     refnos: &[RefnoEnum],
     mesh_dir: &Path,
@@ -160,10 +162,13 @@ pub async fn export_prepack_lod_for_refnos(
     verbose: bool,
     name_config: Option<&super::name_config::NameConfig>,
     export_all_lods: bool,
+    source_length_unit: LengthUnit,
+    target_length_unit: LengthUnit,
 ) -> Result<()> {
     if verbose {
         println!("🚀 开始导出 Prepack LOD 格式...");
         println!("   - 输出目录: {}", output_dir.display());
+        println!("   - 单位转换: {} -> {}", source_length_unit.name(), target_length_unit.name());
         if export_all_lods {
             println!("   - 导出所有 LOD 级别: L1, L2, L3");
         } else {
@@ -250,10 +255,10 @@ pub async fn export_prepack_lod_for_refnos(
         total_instances: 0,
     };
 
-    // 导出为米 (m) 单位，前端可直接渲染
-    let unit_converter = UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Decimeter);
-    // manifest 记录采用最终单位（米）避免运行时重复缩放
-    let manifest_unit_converter = UnitConverter::new(LengthUnit::Meter, LengthUnit::Meter);
+    // 使用传入的单位转换参数
+    let unit_converter = UnitConverter::new(source_length_unit, target_length_unit);
+    // manifest 记录采用目标单位避免运行时重复缩放
+    let manifest_unit_converter = UnitConverter::new(target_length_unit, target_length_unit);
     let primary_mesh_dir = mesh_dir.to_path_buf();
     let mut base_mesh_dir = mesh_dir.to_path_buf();
     let default_lod_dir = format!("lod_{:?}", db_option.mesh_precision.default_lod);
@@ -306,13 +311,13 @@ pub async fn export_prepack_lod_for_refnos(
             println!("\n🎯 导出 LOD {} → {}", level_tag, asset_path.display());
         }
 
-        // GLB 中的几何体转换到米 (m)，实例矩阵仅做平移转换
+        // GLB 中的几何体转换到目标单位，实例矩阵仅做平移转换
         let mut common = CommonExportConfig::with_unit_conversion(
             include_descendants,
             filter_cache.clone(),
             verbose,
-            LengthUnit::Millimeter,
-            LengthUnit::Meter, // 统一转为米
+            source_length_unit,
+            target_length_unit,
         );
         common.use_basic_materials = true;
 
@@ -922,11 +927,17 @@ fn build_instances_payload(
                 for geom in &component.geometries {
                     if let Some(&geo_index) = geo_index_map.get(&geom.geo_hash) {
                         component_instance_count += 1;
-                        
+
+                        // 调试：输出 unit_flag 状态（仅纯数字 geo_hash）
+                        if verbose && !geom.geo_hash.contains('_') {
+                            let eff_flag = effective_unit_flag(&geom.geo_hash, geom.unit_flag);
+                            println!("   🔍 [BRAN] geo_hash={} unit_flag={} effective={}", geom.geo_hash, geom.unit_flag, eff_flag);
+                        }
+
                         instances.push(json!({
                             "geo_hash": geom.geo_hash.clone(),
                             "geo_index": geo_index,
-                            "geo_transform": mat4_to_vec(&geom.local_transform, unit_converter, geom.unit_flag),
+                            "geo_transform": mat4_to_vec(&geom.local_transform, unit_converter, effective_unit_flag(&geom.geo_hash, geom.unit_flag)),
                         }));
                     }
                 }
@@ -965,7 +976,7 @@ fn build_instances_payload(
                         "name": tubi_name,
                         "geo_hash": tubing.geo_hash,
                         "geo_index": geo_index,
-                        "matrix": mat4_to_vec(&tubing.transform, unit_converter, !tubing.geo_hash.contains('_')),
+                        "matrix": mat4_to_vec(&tubing.transform, unit_converter, true), // TUBI 统一是 unit_mesh
                         "color_index": color_index,
                         "order": tubi_order,
                         "lod_mask": lod_mask,
@@ -1057,7 +1068,7 @@ fn build_instances_payload(
                         instances.push(json!({
                             "geo_hash": geom.geo_hash.clone(),
                             "geo_index": geo_index,
-                            "geo_transform": mat4_to_vec(&geom.local_transform, unit_converter, geom.unit_flag),
+                            "geo_transform": mat4_to_vec(&geom.local_transform, unit_converter, effective_unit_flag(&geom.geo_hash, geom.unit_flag)),
                         }));
                     }
                 }
@@ -1127,7 +1138,7 @@ fn build_instances_payload(
                 instances.push(json!({
                     "geo_hash": geom.geo_hash.clone(),
                     "geo_index": geo_index,
-                    "geo_transform": mat4_to_vec(&geom.local_transform, unit_converter, geom.unit_flag),
+                    "geo_transform": mat4_to_vec(&geom.local_transform, unit_converter, effective_unit_flag(&geom.geo_hash, geom.unit_flag)),
                 }));
             }
         }
@@ -1184,6 +1195,26 @@ fn compute_lod_mask(geo_hash: &str, lod_assets: &[LodAssetSummary]) -> u32 {
     }
 
     mask
+}
+
+/// 判断 geo_hash 是否为标准单位几何体（0, 1, 2, 3 等小数字）
+/// 这些是预定义的单位网格，应该强制 unit_flag=true
+fn is_standard_unit_geometry(geo_hash: &str) -> bool {
+    // 尝试解析为数字，如果是 0-9 的小数字，则认为是标准单位几何体
+    if let Ok(num) = geo_hash.parse::<u64>() {
+        num < 10
+    } else {
+        false
+    }
+}
+
+/// 获取有效的 unit_flag，对标准单位几何体强制返回 true
+fn effective_unit_flag(geo_hash: &str, original_flag: bool) -> bool {
+    if is_standard_unit_geometry(geo_hash) {
+        true
+    } else {
+        original_flag
+    }
 }
 
 fn mat4_to_vec(matrix: &DMat4, unit_converter: &UnitConverter, unit_flag: bool) -> Vec<f32> {
@@ -1342,9 +1373,28 @@ pub async fn export_all_relates_prepack_lod(
     db_option: Arc<DbOption>,
     export_all_lods: bool,
     export_refnos: Option<String>,
+    source_unit: String,
+    target_unit: String,
 ) -> Result<()> {
     use aios_core::rs_surreal::query_ext::SurrealQueryExt;
     use std::collections::HashSet;
+
+    fn parse_length_unit(unit: &str) -> LengthUnit {
+        match unit.to_lowercase().as_str() {
+            "mm" => LengthUnit::Millimeter,
+            "cm" => LengthUnit::Centimeter,
+            "dm" => LengthUnit::Decimeter,
+            "m" => LengthUnit::Meter,
+            "in" => LengthUnit::Inch,
+            "ft" => LengthUnit::Foot,
+            "yd" => LengthUnit::Yard,
+            _ => LengthUnit::Millimeter,
+        }
+    }
+
+    // 解析单位参数
+    let source_length_unit = parse_length_unit(&source_unit);
+    let target_length_unit = parse_length_unit(&target_unit);
 
     println!("\n🔍 查询 inst_relate 表...");
 
@@ -1396,6 +1446,8 @@ pub async fn export_all_relates_prepack_lod(
             verbose,
             name_config.as_ref(),
             export_all_lods,
+            source_length_unit,
+            target_length_unit,
         )
         .await;
     }
@@ -1548,6 +1600,8 @@ pub async fn export_all_relates_prepack_lod(
         verbose,
         name_config.as_ref(),
         export_all_lods,
+        source_length_unit,
+        target_length_unit,
     )
     .await?;
 

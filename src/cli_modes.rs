@@ -1264,6 +1264,8 @@ pub async fn export_all_relates_mode(
     name_config_path: Option<PathBuf>,
     export_all_lods: bool,
     export_refnos: Option<String>,
+    source_unit: String,
+    target_unit: String,
     db_option_ext: &DbOptionExt,
 ) -> Result<()> {
     use aios_database::fast_model::export_model::NameConfig;
@@ -1296,6 +1298,8 @@ pub async fn export_all_relates_mode(
         db_option,
         export_all_lods,
         export_refnos,
+        source_unit,
+        target_unit,
     )
     .await?;
 

@@ -275,15 +275,31 @@ interface NameEntry {
 interface ComponentGroup {
   refno: string;                       // 构件参考号
   noun: string;                        // 构件类型（ELBO, PIPE 等）
-  name_index: number | null;           // 在 names 表中的位置
-  instances: InstanceEntry[];          // 实例列表
+  name?: string;                       // 构件名称（可选）
+  color_index: number;                 // 颜色索引（所有实例共享）
+  name_index: number;                  // 名称索引（所有实例共享）
+  lod_mask: number;                    // LOD 位掩码（所有实例共享）
+  spec_value: number;                  // 特殊值（所有实例共享）
+  uniforms?: Record<string, UniformValue>; // 扩展属性（所有实例共享）
+  instances: GeoEntry[];               // 几何体实例列表（仅包含变换信息）
 }
 
 interface TubingGroup {
   refno: string;                       // 管道参考号
   noun: string;                        // 管道类型
-  name_index: number | null;
-  instances: InstanceEntry[];
+  name?: string;                       // 管道名称（可选）
+  color_index: number;                 // 颜色索引
+  name_index: number;                  // 名称索引
+  lod_mask: number;                    // LOD 位掩码
+  spec_value: number;                  // 特殊值
+  unit_flag: boolean;                  // 是否为单位 mesh
+  instances: GeoEntry[];               // 几何体实例列表
+}
+
+interface GeoEntry {
+  geo_hash: string;                    // 几何体哈希值
+  geo_index: number;                   // 几何体索引
+  matrix: number[];                    // 4x4 变换矩阵（16个元素）
 }
 
 interface InstanceEntry {

@@ -101,6 +101,7 @@ DEFINE FIELD in ON TABLE inst_relate TYPE record<any>;
 DEFINE FIELD out ON TABLE inst_relate TYPE record<any>;
 DEFINE FIELD owner_type ON TABLE inst_relate TYPE string;
 DEFINE FIELD owner_refno ON TABLE inst_relate TYPE number;
+DEFINE FIELD spec_value ON TABLE inst_relate TYPE number DEFAULT 0;
 DEFINE FIELD created_at ON TABLE inst_relate TYPE datetime DEFAULT time::now();
 DEFINE FIELD updated_at ON TABLE inst_relate TYPE datetime DEFAULT time::now();
 
@@ -108,6 +109,7 @@ DEFINE FIELD updated_at ON TABLE inst_relate TYPE datetime DEFAULT time::now();
 DEFINE INDEX idx_owner_type ON TABLE inst_relate COLUMNS owner_type;
 DEFINE INDEX idx_owner_refno ON TABLE inst_relate COLUMNS owner_refno;
 DEFINE INDEX idx_owner_type_refno ON TABLE inst_relate COLUMNS owner_type, owner_refno;
+DEFINE INDEX idx_spec_value ON TABLE inst_relate COLUMNS spec_value;
 
 -- Functions for common queries
 

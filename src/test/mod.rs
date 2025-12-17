@@ -10,6 +10,7 @@ mod test_performance;
 // mod test_spatial_index_1112; // 暂时注释，需要修复
 mod test_room_integration; // 房间集成测试
 mod test_room_v2_verification;
+mod test_room_specific_refno; // 特定 refno 房间测试
 #[cfg(feature = "grpc")]
 mod test_sctn_contact;
 #[cfg(feature = "grpc")]

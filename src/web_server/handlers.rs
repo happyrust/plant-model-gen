@@ -1938,7 +1938,12 @@ pub async fn api_sqlite_spatial_query(
             });
 
             // 获取更多信息（如果可用）
-            let noun = "Unknown"; // TODO: 从数据库获取 noun
+            // let noun = "Unknown"; // TODO: 从数据库获取 noun
+            let noun = spatial_index
+                .get_noun(id)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "Unknown".to_string());
 
             results.push(json!({
                 "refno": id.0,

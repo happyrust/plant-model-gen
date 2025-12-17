@@ -3,6 +3,48 @@ use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 use regex::Regex;
 
+/// 表达式验证错误信息
+#[derive(Debug, Clone)]
+pub struct ExpressionValidationError {
+    /// 原始表达式
+    pub expression: String,
+    /// 属性名称（如 PRAD, PHEI 等）
+    pub attr_name: String,
+    /// 几何体 refno
+    pub gm_refno: String,
+    /// 几何体类型
+    pub gm_type: String,
+    /// 错误类型
+    pub error_type: ExpressionErrorType,
+    /// 详细错误信息
+    pub message: String,
+}
+
+/// 表达式错误类型
+#[derive(Debug, Clone)]
+pub enum ExpressionErrorType {
+    /// 括号不匹配
+    UnbalancedBrackets { left: usize, right: usize },
+    /// 空表达式
+    EmptyExpression,
+    /// 无效的 ATTRIB 格式
+    InvalidAttribFormat,
+    /// 未知变量
+    UnknownVariable(String),
+    /// 其他语法错误
+    SyntaxError(String),
+}
+
+impl std::fmt::Display for ExpressionValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[表达式错误] 几何体={} ({}), 属性={}, 表达式='{}', 错误: {}",
+            self.gm_refno, self.gm_type, self.attr_name, self.expression, self.message
+        )
+    }
+}
+
 /// 表达式修复器 - 专门处理ATTRIB关键字和相关表达式问题
 pub struct ExpressionFixer;
 
@@ -127,6 +169,93 @@ impl ExpressionFixer {
             is_tubi: false,
             ..Default::default()
         }
+    }
+
+    /// 验证表达式语法（括号配对等）
+    /// 返回 Ok(()) 如果表达式有效，否则返回错误信息
+    pub fn validate_expression_syntax(expr: &str) -> Result<(), ExpressionErrorType> {
+        if expr.trim().is_empty() || expr == "UNSET" {
+            return Ok(()); // 空表达式和 UNSET 是允许的
+        }
+
+        // 检查括号配对
+        let mut bracket_count = 0i32;
+        let mut square_bracket_count = 0i32;
+        
+        for ch in expr.chars() {
+            match ch {
+                '(' => bracket_count += 1,
+                ')' => {
+                    bracket_count -= 1;
+                    if bracket_count < 0 {
+                        return Err(ExpressionErrorType::UnbalancedBrackets {
+                            left: expr.matches('(').count(),
+                            right: expr.matches(')').count(),
+                        });
+                    }
+                }
+                '[' => square_bracket_count += 1,
+                ']' => {
+                    square_bracket_count -= 1;
+                    if square_bracket_count < 0 {
+                        return Err(ExpressionErrorType::SyntaxError(
+                            "方括号不匹配：多余的 ']'".to_string()
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if bracket_count != 0 {
+            return Err(ExpressionErrorType::UnbalancedBrackets {
+                left: expr.matches('(').count(),
+                right: expr.matches(')').count(),
+            });
+        }
+
+        if square_bracket_count != 0 {
+            return Err(ExpressionErrorType::SyntaxError(
+                "方括号不匹配".to_string()
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// 验证 GmParam 中的所有表达式
+    /// 返回所有发现的错误列表
+    pub fn validate_gm_param_expressions(
+        gm_refno: &str,
+        gm_type: &str,
+        expressions: &[(&str, &str)], // (属性名, 表达式)
+    ) -> Vec<ExpressionValidationError> {
+        let mut errors = Vec::new();
+
+        for (attr_name, expr) in expressions {
+            if let Err(error_type) = Self::validate_expression_syntax(expr) {
+                let message = match &error_type {
+                    ExpressionErrorType::UnbalancedBrackets { left, right } => {
+                        format!("括号不匹配：左括号 {} 个，右括号 {} 个", left, right)
+                    }
+                    ExpressionErrorType::EmptyExpression => "空表达式".to_string(),
+                    ExpressionErrorType::InvalidAttribFormat => "无效的 ATTRIB 格式".to_string(),
+                    ExpressionErrorType::UnknownVariable(var) => format!("未知变量: {}", var),
+                    ExpressionErrorType::SyntaxError(msg) => msg.clone(),
+                };
+
+                errors.push(ExpressionValidationError {
+                    expression: expr.to_string(),
+                    attr_name: attr_name.to_string(),
+                    gm_refno: gm_refno.to_string(),
+                    gm_type: gm_type.to_string(),
+                    error_type,
+                    message,
+                });
+            }
+        }
+
+        errors
     }
 }
 

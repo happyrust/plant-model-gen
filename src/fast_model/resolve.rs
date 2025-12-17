@@ -1,11 +1,12 @@
 use crate::fast_model::query_gm_params;
 use crate::fast_model::{debug_model, debug_model_debug, debug_model_trace};
+use crate::expression_fix::ExpressionFixer;
 use aios_core::SurrealQueryExt;
 use aios_core::consts::WORD_HASH;
 use aios_core::expression::query_cata::{query_axis_params, resolve_cata_comp};
 use aios_core::expression::resolve::{SCOM_INFO_MAP, resolve_axis_param};
 use aios_core::parsed_data::{CateAxisParam, CateGeomsInfo};
-use aios_core::pdms_data::{PlinParam, ScomInfo};
+use aios_core::pdms_data::{PlinParam, ScomInfo, GmParam};
 use aios_core::{CataContext, RefU64, RefnoEnum, SUL_DB};
 use anyhow::anyhow;
 use std::collections::{BTreeMap, HashMap};
@@ -309,6 +310,11 @@ pub async fn resolve_desi_comp(
     }
     // debug_model_debug!("=== END Context ===");
 
+    // 🔍 表达式预验证：在调用 resolve_cata_comp 前检查所有表达式的语法
+    // 这有助于快速定位元件库中的表达式错误
+    let scom_name = scom_info.attr_map.get_as_string("NAME").unwrap_or_else(|| "未知".to_string());
+    validate_scom_expressions(desi_refno, scom_ref, &scom_name, &scom_info);
+
     let geom_info = resolve_cata_comp(&desi_att, &scom_info, Some(context));
     debug_model_trace!("geom_info: {:?}", &geom_info);
 
@@ -330,4 +336,112 @@ pub async fn resolve_desi_comp(
             Err(anyhow!("resolve_cata_comp 表达式计算失败: {}", e))
         }
     }
+}
+
+/// 验证 SCOM（元件库）中所有几何体的表达式
+/// 在 resolve_cata_comp 调用前进行预验证，便于快速定位数据问题
+fn validate_scom_expressions(
+    desi_refno: RefnoEnum,
+    scom_refno: RefnoEnum,
+    scom_name: &str,
+    scom_info: &ScomInfo,
+) {
+    let mut all_errors = Vec::new();
+
+    // 验证正向几何体 (gm_params)
+    for gm in &scom_info.gm_params {
+        let errors = validate_gm_param_expressions(gm);
+        all_errors.extend(errors);
+    }
+
+    // 验证负向几何体 (ngm_params)
+    for gm in &scom_info.ngm_params {
+        let errors = validate_gm_param_expressions(gm);
+        all_errors.extend(errors);
+    }
+
+    // 如果有错误，记录详细的错误信息
+    if !all_errors.is_empty() {
+        use crate::fast_model::ModelErrorKind;
+        
+        for error in &all_errors {
+            crate::model_error!(
+                code = "E-EXPR-002",
+                kind = ModelErrorKind::InvalidGeometry,
+                stage = "expression_prevalidation",
+                refno = desi_refno,
+                desc = "元件库表达式语法错误",
+                "design_refno={}, scom_refno={}, scom_name='{}', gm_refno={}, gm_type={}, attr={}, expr='{}', error={}",
+                desi_refno,
+                scom_refno,
+                scom_name,
+                error.gm_refno,
+                error.gm_type,
+                error.attr_name,
+                error.expression,
+                error.message
+            );
+        }
+        
+        // 在控制台也打印警告（便于调试）
+        eprintln!(
+            "⚠️  [表达式预验证] design={}, scom={}({}): 发现 {} 个表达式错误",
+            desi_refno, scom_refno, scom_name, all_errors.len()
+        );
+        for error in &all_errors {
+            eprintln!("   - {}", error);
+        }
+    }
+}
+
+/// 验证单个 GmParam 中的所有表达式
+fn validate_gm_param_expressions(gm: &GmParam) -> Vec<crate::expression_fix::ExpressionValidationError> {
+    let gm_refno = gm.refno.to_string();
+    let gm_type = &gm.gm_type;
+
+    // 收集所有需要验证的表达式
+    let mut expressions: Vec<(&str, &str)> = vec![
+        ("prad", &gm.prad),
+        ("pang", &gm.pang),
+        ("pwid", &gm.pwid),
+        ("phei", &gm.phei),
+        ("offset", &gm.offset),
+        ("drad", &gm.drad),
+        ("dwid", &gm.dwid),
+    ];
+
+    // 添加数组类型的表达式
+    for (i, expr) in gm.diameters.iter().enumerate() {
+        // 使用临时 String 存储属性名，避免生命周期问题
+        expressions.push((Box::leak(format!("diameters[{}]", i).into_boxed_str()), expr.as_str()));
+    }
+    for (i, expr) in gm.distances.iter().enumerate() {
+        expressions.push((Box::leak(format!("distances[{}]", i).into_boxed_str()), expr.as_str()));
+    }
+    for (i, expr) in gm.shears.iter().enumerate() {
+        expressions.push((Box::leak(format!("shears[{}]", i).into_boxed_str()), expr.as_str()));
+    }
+    for (i, expr) in gm.lengths.iter().enumerate() {
+        expressions.push((Box::leak(format!("lengths[{}]", i).into_boxed_str()), expr.as_str()));
+    }
+    for (i, expr) in gm.xyz.iter().enumerate() {
+        expressions.push((Box::leak(format!("xyz[{}]", i).into_boxed_str()), expr.as_str()));
+    }
+    for (i, expr) in gm.frads.iter().enumerate() {
+        expressions.push((Box::leak(format!("frads[{}]", i).into_boxed_str()), expr.as_str()));
+    }
+    for (i, vert) in gm.verts.iter().enumerate() {
+        expressions.push((Box::leak(format!("verts[{}].x", i).into_boxed_str()), vert[0].as_str()));
+        expressions.push((Box::leak(format!("verts[{}].y", i).into_boxed_str()), vert[1].as_str()));
+        expressions.push((Box::leak(format!("verts[{}].z", i).into_boxed_str()), vert[2].as_str()));
+    }
+    for (i, dxy) in gm.dxy.iter().enumerate() {
+        expressions.push((Box::leak(format!("dxy[{}].x", i).into_boxed_str()), dxy[0].as_str()));
+        expressions.push((Box::leak(format!("dxy[{}].y", i).into_boxed_str()), dxy[1].as_str()));
+    }
+    for (i, axis) in gm.paxises.iter().enumerate() {
+        expressions.push((Box::leak(format!("paxises[{}]", i).into_boxed_str()), axis.as_str()));
+    }
+
+    ExpressionFixer::validate_gm_param_expressions(&gm_refno, gm_type, &expressions)
 }

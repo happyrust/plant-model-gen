@@ -810,6 +810,8 @@ async fn main() -> anyhow::Result<()> {
             name_config_path,
             export_all_lods,
             export_refnos,
+            source_unit.to_string(),
+            target_unit.to_string(),
             &db_option_ext,
         )
         .await;

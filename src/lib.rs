@@ -254,6 +254,20 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
             gen_all_geos_data(vec![], &db_option_ext, None, None).await?;
         }
 
+        // Full Noun 模式也支持房间计算
+        if db_option.gen_spatial_tree {
+            println!("🏠 启用房间计算功能");
+            println!("房间关键字为: {:?}", db_option.get_room_key_word());
+            println!("正在执行房间计算...");
+            println!("正在构建房间关系和空间索引...");
+            let time = Instant::now();
+            if let Err(e) = build_room_relations(&db_option).await {
+                eprintln!("❌ 房间计算失败: {}", e);
+                return Err(e);
+            }
+            println!("✅ 房间计算完成，耗时: {} ms", time.elapsed().as_millis());
+        }
+
         // Full Noun 模式下跳过后续的增量更新和其他处理
         return Ok(());
     }

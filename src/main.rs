@@ -16,6 +16,19 @@ use std::path::PathBuf;
 #[cfg(not(feature = "gui"))]
 mod cli_modes;
 
+#[cfg(not(feature = "gui"))]
+fn parse_lod_level(s: &str) -> Option<aios_core::mesh_precision::LodLevel> {
+    use aios_core::mesh_precision::LodLevel;
+    match s.trim().to_ascii_uppercase().as_str() {
+        "L0" => Some(LodLevel::L0),
+        "L1" => Some(LodLevel::L1),
+        "L2" => Some(LodLevel::L2),
+        "L3" => Some(LodLevel::L3),
+        "L4" => Some(LodLevel::L4),
+        _ => None,
+    }
+}
+
 /// 构建导出配置的辅助函数
 fn build_export_config(
     refnos_vec: Vec<String>,
@@ -90,6 +103,13 @@ async fn main() -> anyhow::Result<()> {
                 .help("Path to the configuration file (Without extension)")
                 .value_name("CONFIG_PATH")
                 .default_value("DbOption"),
+        )
+        .arg(
+            Arg::new("gen-lod")
+                .long("gen-lod")
+                .help("Override mesh generation LOD level for this run (L0-L4). Defaults to DbOption.toml")
+                .value_name("LOD")
+                .value_parser(["L0", "L1", "L2", "L3", "L4"]),
         )
         .arg(
             Arg::new("grpc-server")
@@ -304,6 +324,12 @@ async fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("export-all-parquet")
+                .long("export-all-parquet")
+                .help("Export all inst_relate entities in Prepack LOD format with additional Parquet manifests (instances.parquet + geometry_manifest.parquet)")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("export-all-lods")
                 .long("export-all-lods")
                 .help("Export all LOD levels (L1, L2, L3). Without this, only L1 is exported")
@@ -333,8 +359,30 @@ async fn main() -> anyhow::Result<()> {
         std::env::set_var("DB_OPTION_FILE", config_path);
     }
 
+    // 预先初始化 OnceCell，避免后续第一次 get_db_option() 时覆盖 active_precision
+    let _ = aios_core::get_db_option();
+
+    let export_all_lods = matches.get_flag("export-all-lods");
+    unsafe {
+        if export_all_lods {
+            std::env::set_var("EXPORT_ALL_LODS", "true");
+        } else {
+            std::env::remove_var("EXPORT_ALL_LODS");
+        }
+    }
+
     // 创建自定义的 DbOptionExt
     let mut db_option_ext = get_db_option_ext_from_path(config_path)?;
+
+    if let Some(lod_str) = matches.get_one::<String>("gen-lod").map(|s| s.as_str()) {
+        if let Some(lod) = parse_lod_level(lod_str) {
+            println!("🔧 CLI 覆盖 default_lod: {:?} -> {:?}", db_option_ext.inner.mesh_precision.default_lod, lod);
+            db_option_ext.inner.mesh_precision.default_lod = lod;
+        }
+    }
+
+    // 同步精度配置到 rs-core 全局 active_precision，保证布尔/导出等逻辑使用同一套 LOD
+    aios_core::mesh_precision::set_active_precision(db_option_ext.inner.mesh_precision.clone());
 
     // 调试：显示配置加载结果
     println!("🔧 配置加载完成:");
@@ -769,6 +817,48 @@ async fn main() -> anyhow::Result<()> {
             matches.get_flag("export-svg"),
         );
         return export_obj_mode(config, &db_option_ext).await;
+    }
+
+    if matches.get_flag("export-all-parquet") {
+        use crate::cli_modes::export_all_parquet_mode;
+
+        let dbno = matches.get_one::<u32>("dbno").copied();
+        let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
+        let export_all_lods = matches.get_flag("export-all-lods");
+        let export_refnos = matches.get_one::<String>("export-refnos").cloned();
+        let owner_types: Option<Vec<String>> = matches
+            .get_one::<String>("owner-types")
+            .map(|s| s.split(',').map(|t| t.trim().to_uppercase()).collect());
+        let name_config_path = matches.get_one::<String>("name-config").map(PathBuf::from);
+
+        println!("🎯 导出 inst_relate 实体 (Prepack LOD + Parquet)");
+        if let Some(ref refnos) = export_refnos {
+            println!("   - 🎯 仅导出指定 refnos={}", refnos);
+        } else if let Some(dbno) = dbno {
+            println!("   - 按 dbno={} 过滤", dbno);
+        } else {
+            println!("   - 全表扫描（所有 dbno）");
+        }
+        if let Some(ref types) = owner_types {
+            println!("   - 按 owner_type 过滤: {:?}", types);
+        }
+        if let Some(ref path) = name_config_path {
+            println!("   - 名称配置文件: {}", path.display());
+        }
+
+        return export_all_parquet_mode(
+            dbno,
+            verbose,
+            export_bundle_dir,
+            owner_types,
+            name_config_path,
+            export_all_lods,
+            export_refnos,
+            source_unit.to_string(),
+            target_unit.to_string(),
+            &db_option_ext,
+        )
+        .await;
     }
 
     if matches.get_flag("export-all-relates") {

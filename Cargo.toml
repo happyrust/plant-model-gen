@@ -42,6 +42,9 @@ approx = "0.5.1"
 #flate2 = "1.0.23"
 log = "0.4.17"
 env_logger = "0.11"
+parquet = "57.1.0"
+arrow-array = "57.1.0"
+arrow-schema = "57.1.0"
 
 # MQTT 服务器和客户端
 rumqttc = "0.25.0"

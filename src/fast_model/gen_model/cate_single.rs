@@ -5,7 +5,7 @@
 use crate::data_interface::structs::PlantAxisMap;
 use crate::fast_model::{debug_model, debug_model_debug, resolve_desi_comp};
 use aios_core::parsed_data::CateGeomsInfo;
-use aios_core::prim_geo::category::{CateCsgShape, convert_to_csg_shapes};
+use aios_core::prim_geo::category::{CateCsgShape, try_convert_cate_geo_to_csg_shape};
 use aios_core::prim_geo::profile::create_profile_geos;
 use aios_core::{NamedAttrMap, RefnoEnum};
 use dashmap::DashMap;
@@ -142,7 +142,7 @@ pub async fn gen_cata_single_geoms(
     let mut geo_count = 0;
     for (idx, geom) in geometries.iter().enumerate() {
         debug_model!("Processing geometry[{}]: {:?}", idx, geom);
-        match convert_to_csg_shapes(&geom) {
+        match try_convert_cate_geo_to_csg_shape(&geom) {
             Some(cate_shape) => {
                 debug_model!("Successfully converted geometry[{}] to csg shape", idx);
                 csg_shape_map
@@ -166,7 +166,7 @@ pub async fn gen_cata_single_geoms(
     let mut ngeo_count = 0;
     for (idx, geom) in n_geometries.iter().enumerate() {
         debug_model!("Processing n_geometry[{}]: {:?}", idx, geom);
-        match convert_to_csg_shapes(&geom) {
+        match try_convert_cate_geo_to_csg_shape(&geom) {
             Some(mut cate_shape) => {
                 debug_model!("Successfully converted n_geometry[{}] to csg shape", idx);
                 cate_shape.is_ngmr = true;
@@ -207,7 +207,7 @@ pub async fn gen_cata_single_geoms(
         crate::model_error!(
             code = "E-GEO-003",
             kind = ModelErrorKind::UnsupportedGeometry,
-            stage = "convert_to_csg_shapes",
+            stage = "try_convert_cate_geo_to_csg_shape",
             refno = design_refno,
             desc = "元件未生成任何几何",
             "design_refno={}, type_name={}, geometries_len={}, n_geometries_len={}",

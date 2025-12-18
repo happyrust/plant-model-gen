@@ -22,6 +22,11 @@ use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use glam::DMat4;
 use parry3d::bounding_volume::Aabb;
+use parquet::arrow::ArrowWriter;
+use arrow_array::{ArrayRef, Float32Array, RecordBatch, StringArray, UInt32Array};
+use arrow_array::builder::{FixedSizeListBuilder, PrimitiveBuilder};
+use arrow_array::types::Float32Type;
+use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -1309,22 +1314,80 @@ impl<'a> ColorPalette<'a> {
     }
 
     /// 严格依据 ColorSchemes.toml / 默认方案获取颜色；
-    /// 若配色表中不存在该类型，则回退到 UNKOWN，再不行才给固定灰色。
+    /// 若配色表中不存在该类型，则使用内置的完整颜色映射表。
     fn color_for_noun(&self, noun: &str) -> [f32; 4] {
+        // 首先尝试从 MaterialLibrary（ColorSchemeManager）获取
         if let Some(c) = self.material_library.get_normalized_color_for_noun(noun) {
             return c;
         }
 
-        // 回退到 UNKOWN 类型（注意拼写与 PdmsGenericType::UNKOWN 保持一致）
-        if let Some(c) = self
-            .material_library
-            .get_normalized_color_for_noun("UNKOWN")
-        {
-            return c;
-        }
+        // 内置的完整颜色映射表（与 rs-core/rs-plant3-d 保持一致）
+        // 颜色值为 RGBA [0-255]，转换为归一化 [0.0-1.0]
+        let color_u8: [u8; 4] = match noun.to_uppercase().as_str() {
+            // 标准 PDMS 类型
+            "UNKOWN" => [192, 192, 192, 255],
+            "CE" => [0, 100, 200, 180],
+            "EQUI" => [255, 190, 0, 255],
+            "PIPE" => [255, 255, 0, 255],
+            "HANG" => [255, 126, 0, 255],
+            "STRU" => [0, 150, 255, 255],
+            "SCTN" => [188, 141, 125, 255],
+            "GENSEC" => [188, 141, 125, 255],
+            "WALL" => [150, 150, 150, 255],
+            "STWALL" => [150, 150, 150, 255],
+            "CWALL" => [120, 120, 120, 255],
+            "GWALL" => [173, 216, 230, 128],
+            "FLOOR" => [210, 180, 140, 255],
+            "CFLOOR" => [160, 130, 100, 255],
+            "PANE" => [220, 220, 220, 255],
+            "ROOM" => [144, 238, 144, 100],
+            "AREADEF" => [221, 160, 221, 80],
+            "HVAC" => [175, 238, 238, 255],
+            "EXTR" => [147, 112, 219, 255],
+            "REVO" => [138, 43, 226, 255],
+            "HANDRA" => [255, 215, 0, 255],
+            "CWBRAN" => [255, 140, 0, 255],
+            "CTWALL" => [176, 196, 222, 150],
+            "DEMOPA" => [255, 69, 0, 255],
+            "INSURQ" => [255, 182, 193, 255],
+            "STRLNG" => [0, 255, 255, 255],
 
-        // 最终兜底颜色
-        [0.82, 0.83, 0.84, 1.0]
+            // 管道相关类型（继承 PIPE 颜色）
+            "BRAN" => [255, 255, 0, 255],      // 分支 - 黄色
+            "TUBI" => [255, 255, 0, 255],      // 管道段 - 黄色
+            "VALV" => [255, 100, 100, 255],    // 阀门 - 浅红色
+            "INST" => [100, 200, 255, 255],    // 仪表 - 浅蓝色
+            "ATTA" => [200, 200, 100, 255],    // 附件 - 黄绿色
+
+            // 变换/几何类型
+            "TRNS" => [192, 192, 192, 255],    // 变换 - 灰色
+            "TMPL" => [180, 180, 180, 255],    // 模板 - 灰色
+            "SUBE" => [255, 190, 0, 255],      // 子设备 - 橙黄色（同 EQUI）
+            "NOZZ" => [255, 160, 0, 255],      // 喷嘴 - 橙色
+
+            // 结构相关
+            "FRMW" => [0, 150, 255, 255],      // 框架 - 蓝色（同 STRU）
+            "SBFR" => [0, 150, 255, 255],      // 子框架 - 蓝色
+            "STSE" => [188, 141, 125, 255],    // 结构截面 - 棕色（同 SCTN）
+            "JOIN" => [100, 100, 200, 255],    // 连接件 - 紫蓝色
+            "SJOI" => [100, 100, 200, 255],    // 结构连接 - 紫蓝色
+            "PNOD" => [150, 150, 200, 255],    // 节点 - 浅紫色
+
+            // 电气/电缆
+            "CWAY" => [255, 165, 0, 255],      // 电缆桥架 - 橙色
+            "CTRAY" => [255, 165, 0, 255],     // 电缆托盘 - 橙色
+
+            // 默认颜色（灰色）
+            _ => [192, 192, 192, 255],
+        };
+
+        // 转换为归一化颜色
+        [
+            color_u8[0] as f32 / 255.0,
+            color_u8[1] as f32 / 255.0,
+            color_u8[2] as f32 / 255.0,
+            color_u8[3] as f32 / 255.0,
+        ]
     }
 }
 
@@ -1606,5 +1669,778 @@ pub async fn export_all_relates_prepack_lod(
     .await?;
 
     println!("\n🎉 Prepack LOD 导出完成！");
+    Ok(())
+}
+
+pub async fn export_all_relates_prepack_lod_parquet(
+    dbno: Option<u32>,
+    verbose: bool,
+    output_override: Option<PathBuf>,
+    owner_types: Option<Vec<String>>,
+    name_config: Option<super::name_config::NameConfig>,
+    db_option: Arc<DbOption>,
+    export_all_lods: bool,
+    export_refnos: Option<String>,
+    source_unit: String,
+    target_unit: String,
+) -> Result<()> {
+    use aios_core::rs_surreal::query_ext::SurrealQueryExt;
+    use std::collections::HashSet;
+
+    fn parse_length_unit(unit: &str) -> LengthUnit {
+        match unit.to_lowercase().as_str() {
+            "mm" => LengthUnit::Millimeter,
+            "cm" => LengthUnit::Centimeter,
+            "dm" => LengthUnit::Decimeter,
+            "m" => LengthUnit::Meter,
+            "in" => LengthUnit::Inch,
+            "ft" => LengthUnit::Foot,
+            "yd" => LengthUnit::Yard,
+            _ => LengthUnit::Millimeter,
+        }
+    }
+
+    let source_length_unit = parse_length_unit(&source_unit);
+    let target_length_unit = parse_length_unit(&target_unit);
+
+    println!("\n🔍 查询 inst_relate 表...");
+
+    if let Some(ref refnos_str) = export_refnos {
+        let refnos: Vec<RefnoEnum> = refnos_str
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim();
+                if s.is_empty() {
+                    return None;
+                }
+                Some(RefnoEnum::from(s))
+            })
+            .collect();
+
+        if refnos.is_empty() {
+            println!("   ⚠️ 未指定有效的 refno");
+            return Ok(());
+        }
+
+        println!("   🎯 导出 {} 个指定 refnos", refnos.len());
+
+        let output_dir = if let Some(custom) = output_override {
+            custom
+        } else {
+            PathBuf::from(format!("output/export_{}", refnos_str.replace(',', "_")))
+        };
+
+        println!("\n🔄 导出 Prepack LOD 格式:");
+        println!("   - 输出目录: {}", output_dir.display());
+        println!("   - 总实体数: {}", refnos.len());
+
+        let mesh_dir = if let Some(ref path) = db_option.meshes_path {
+            PathBuf::from(path)
+        } else {
+            PathBuf::from("assets/meshes")
+        };
+
+        export_prepack_lod_for_refnos(
+            &refnos,
+            &mesh_dir,
+            &output_dir,
+            db_option,
+            true,
+            owner_types,
+            verbose,
+            name_config.as_ref(),
+            export_all_lods,
+            source_length_unit,
+            target_length_unit,
+        )
+        .await?;
+
+        write_prepack_parquet_and_patch_manifest(&output_dir)?;
+        return Ok(());
+    }
+
+    let normalized_owner_types = owner_types
+        .as_ref()
+        .map(|types| types.iter().map(|t| t.to_uppercase()).collect::<Vec<_>>());
+
+    let noun_roots = {
+        if normalized_owner_types.is_some() {
+            Vec::new()
+        } else {
+            let nouns = ["BRAN", "EQUI"];
+            if let Some(dbno) = dbno {
+                query_provider::query_by_type(&nouns, dbno as i32, None)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                query_provider::query_by_noun_all_db(&nouns)
+                    .await
+                    .unwrap_or_default()
+            }
+        }
+    };
+
+    let mut refno_name_map: HashMap<RefnoEnum, String> = HashMap::new();
+    if !noun_roots.is_empty() {
+        for refno in &noun_roots {
+            if let Ok(full_name) = aios_core::get_default_full_name(*refno).await {
+                if !full_name.is_empty() {
+                    let trimmed_name = full_name.trim().trim_start_matches('/').to_string();
+                    if !trimmed_name.is_empty() {
+                        let final_name = if let Some(ref config) = name_config {
+                            config.convert_name(&trimmed_name)
+                        } else {
+                            trimmed_name
+                        };
+                        refno_name_map.insert(*refno, final_name);
+                    }
+                }
+            }
+        }
+    }
+
+    let db_filter = if let Some(dbno) = dbno {
+        println!("   - 模式: 按 dbno={} 过滤", dbno);
+        format!("in.dbno = {} ", dbno)
+    } else {
+        println!("   - 模式: 全表扫描（所有 dbno）");
+        "1=1 ".to_string()
+    };
+
+    let normalized_owner_types = owner_types
+        .as_ref()
+        .map(|types| types.iter().map(|t| t.to_uppercase()).collect::<Vec<_>>());
+    let owner_filter_clause =
+        if let Some(types) = normalized_owner_types.as_ref().filter(|v| !v.is_empty()) {
+            let list = types
+                .iter()
+                .map(|t| format!("'{}'", t))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("   - 按 owner_type 过滤 inst_relate: {:?}", types);
+            format!(" AND owner_type IN [{list}]")
+        } else {
+            println!("   - 未指定 owner_type 过滤（仅排除 EQUI）");
+            String::new()
+        };
+
+    let equi_sql = format!(
+        "SELECT value in.id FROM inst_relate WHERE {} AND owner_type = 'EQUI'",
+        db_filter
+    );
+    let equi_refnos: Vec<RefnoEnum> = aios_core::SUL_DB.query_take(&equi_sql, 0).await?;
+    println!(
+        "   - 找到 {} 条 owner_type = 'EQUI' 的 inst_relate 记录（用于设备分组）",
+        equi_refnos.len()
+    );
+    let equi_set: HashSet<RefnoEnum> = equi_refnos.into_iter().collect();
+
+    let sql_all = format!(
+        "SELECT value in.id FROM inst_relate WHERE {} AND aabb.d != none{}",
+        db_filter, owner_filter_clause
+    );
+    let mut all_refnos: Vec<RefnoEnum> = aios_core::SUL_DB.query_take(&sql_all, 0).await?;
+
+    if normalized_owner_types.is_none() {
+        all_refnos.extend(noun_roots.into_iter());
+    }
+
+    let mut unique_refnos = HashSet::new();
+    let mut refnos = Vec::new();
+    for r in all_refnos {
+        if equi_set.contains(&r) {
+            continue;
+        }
+        if unique_refnos.insert(r.clone()) {
+            refnos.push(r);
+        }
+    }
+
+    println!(
+        "      - 最终需要导出的 inst_relate 实体数: {} (已排除 EQUI 节点，含 Noun 入口)",
+        refnos.len()
+    );
+
+    if refnos.is_empty() {
+        println!("⚠️  未找到任何 inst_relate 实体");
+        return Ok(());
+    }
+
+    let output_dir = if let Some(custom) = output_override {
+        custom
+    } else if let Some(dbno) = dbno {
+        PathBuf::from(format!("output/all_relates_dbno_{}", dbno))
+    } else {
+        PathBuf::from("output/all_relates_all")
+    };
+
+    println!("\n🔄 导出 Prepack LOD 格式:");
+    println!("   - 输出目录: {}", output_dir.display());
+    println!("   - 总实体数: {}", refnos.len());
+
+    let mesh_dir = db_option.get_meshes_path();
+    export_prepack_lod_for_refnos(
+        &refnos,
+        &mesh_dir,
+        &output_dir,
+        db_option,
+        false,
+        None,
+        verbose,
+        name_config.as_ref(),
+        export_all_lods,
+        source_length_unit,
+        target_length_unit,
+    )
+    .await?;
+
+    write_prepack_parquet_and_patch_manifest(&output_dir)?;
+
+    println!("\n🎉 Prepack LOD 导出完成！");
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct PrepackInstancesV2 {
+    version: Option<u32>,
+    generated_at: String,
+    colors: Option<Vec<[f32; 4]>>,
+    bran_groups: Option<Vec<PrepackHierarchyGroup>>,
+    equi_groups: Option<Vec<PrepackHierarchyGroup>>,
+    ungrouped: Option<Vec<PrepackComponent>>,
+}
+
+#[derive(Deserialize)]
+struct PrepackHierarchyGroup {
+    refno: String,
+    noun: Option<String>,
+    name: Option<String>,
+    children: Option<Vec<PrepackComponent>>,
+    tubings: Option<Vec<PrepackTubing>>,
+}
+
+#[derive(Deserialize)]
+struct PrepackComponent {
+    refno: String,
+    noun: String,
+    name: Option<String>,
+    color_index: usize,
+    lod_mask: u32,
+    spec_value: Option<i64>,
+    refno_transform: Vec<f32>,
+    instances: Vec<PrepackGeoInstance>,
+}
+
+#[derive(Deserialize)]
+struct PrepackGeoInstance {
+    geo_hash: String,
+    geo_index: usize,
+    geo_transform: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct PrepackTubing {
+    refno: String,
+    noun: Option<String>,
+    name: Option<String>,
+    geo_hash: String,
+    geo_index: usize,
+    matrix: Vec<f32>,
+    color_index: usize,
+    lod_mask: u32,
+    spec_value: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct PrepackGeometryManifest {
+    generated_at: String,
+    geometries: Vec<PrepackGeometryEntry>,
+}
+
+#[derive(Deserialize)]
+struct PrepackGeometryEntry {
+    geo_hash: String,
+    geo_index: usize,
+    nouns: Vec<String>,
+    vertex_count: usize,
+    triangle_count: usize,
+    bounding_box: Option<PrepackBoundingBox>,
+    bounding_sphere: Option<PrepackBoundingSphere>,
+    lods: Vec<PrepackGeometryLod>,
+}
+
+#[derive(Deserialize)]
+struct PrepackBoundingBox {
+    min: [f32; 3],
+    max: [f32; 3],
+}
+
+#[derive(Deserialize)]
+struct PrepackBoundingSphere {
+    center: [f32; 3],
+    radius: f32,
+}
+
+#[derive(Deserialize)]
+struct PrepackGeometryLod {
+    level: u32,
+    asset_key: String,
+    mesh_index: usize,
+    node_index: usize,
+    triangle_count: usize,
+    error_metric: f32,
+}
+
+fn mat4_mul_col_major(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    let mut out = [0.0f32; 16];
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut sum = 0.0f32;
+            for k in 0..4 {
+                sum += a[k * 4 + i] * b[j * 4 + k];
+            }
+            out[j * 4 + i] = sum;
+        }
+    }
+    out
+}
+
+fn as_mat4_16(v: &[f32]) -> Result<[f32; 16]> {
+    let slice: [f32; 16] = v
+        .get(0..16)
+        .ok_or_else(|| anyhow::anyhow!("矩阵长度不足: {}", v.len()))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("矩阵转换失败"))?;
+    Ok(slice)
+}
+
+fn write_prepack_parquet_and_patch_manifest(output_dir: &Path) -> Result<()> {
+    let instances_path = output_dir.join("instances.json");
+    let geometry_manifest_path = output_dir.join("geometry_manifest.json");
+    let manifest_path = output_dir.join("manifest.json");
+
+    let instances: PrepackInstancesV2 = serde_json::from_slice(&fs::read(&instances_path)?)?;
+    let geom_manifest: PrepackGeometryManifest = serde_json::from_slice(&fs::read(&geometry_manifest_path)?)?;
+
+    let instances_parquet_name = "instances.parquet";
+    let geometry_manifest_parquet_name = "geometry_manifest.parquet";
+
+    write_instances_parquet(output_dir.join(instances_parquet_name), &instances)?;
+    write_geometry_manifest_parquet(output_dir.join(geometry_manifest_parquet_name), &geom_manifest)?;
+
+    let mut manifest_json: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let Some(files_obj) = manifest_json.get_mut("files") else {
+        return Ok(());
+    };
+    let Some(files_obj) = files_obj.as_object_mut() else {
+        return Ok(());
+    };
+
+    let instances_file = output_dir.join(instances_parquet_name);
+    let instances_meta = fs::metadata(&instances_file)?;
+    let instances_sha = sha256_for_file(&instances_file)?;
+    files_obj.insert(
+        "instances_parquet".to_string(),
+        json!({
+            "path": instances_parquet_name,
+            "bytes": instances_meta.len(),
+            "sha256": instances_sha,
+        }),
+    );
+
+    let geom_file = output_dir.join(geometry_manifest_parquet_name);
+    let geom_meta = fs::metadata(&geom_file)?;
+    let geom_sha = sha256_for_file(&geom_file)?;
+    files_obj.insert(
+        "geometry_manifest_parquet".to_string(),
+        json!({
+            "path": geometry_manifest_parquet_name,
+            "bytes": geom_meta.len(),
+            "sha256": geom_sha,
+        }),
+    );
+
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest_json)?)?;
+    Ok(())
+}
+
+fn write_instances_parquet(path: PathBuf, instances: &PrepackInstancesV2) -> Result<()> {
+    let colors = instances.colors.clone().unwrap_or_default();
+
+    let mut refnos: Vec<Option<String>> = Vec::new();
+    let mut owner_nouns: Vec<Option<String>> = Vec::new();
+    let mut owner_refnos: Vec<Option<String>> = Vec::new();
+    let mut nouns: Vec<Option<String>> = Vec::new();
+    let mut names: Vec<Option<String>> = Vec::new();
+    let mut spec_values: Vec<Option<u32>> = Vec::new();
+    let mut geo_hashes: Vec<Option<String>> = Vec::new();
+    let mut geo_indices: Vec<u32> = Vec::new();
+    let mut lod_masks: Vec<u32> = Vec::new();
+
+    let mut color_builder = FixedSizeListBuilder::new(PrimitiveBuilder::<Float32Type>::new(), 4)
+        .with_field(Arc::new(Field::new_list_field(DataType::Float32, false)));
+    let mut mat_builder = FixedSizeListBuilder::new(PrimitiveBuilder::<Float32Type>::new(), 16)
+        .with_field(Arc::new(Field::new_list_field(DataType::Float32, false)));
+
+    let mut push_row = |entity_refno: String,
+                        owner_noun: Option<String>,
+                        owner_refno: Option<String>,
+                        noun: Option<String>,
+                        name: Option<String>,
+                        spec_value: Option<i64>,
+                        geo_hash: String,
+                        geo_index: u32,
+                        lod_mask: u32,
+                        matrix: [f32; 16],
+                        color: [f32; 4]| {
+        refnos.push(Some(entity_refno));
+        owner_nouns.push(owner_noun);
+        owner_refnos.push(owner_refno);
+        nouns.push(noun);
+        names.push(name);
+        spec_values.push(spec_value.and_then(|v| u32::try_from(v).ok()));
+        geo_hashes.push(Some(geo_hash));
+        geo_indices.push(geo_index);
+        lod_masks.push(lod_mask);
+
+        for v in color {
+            color_builder.values().append_value(v);
+        }
+        color_builder.append(true);
+
+        for v in matrix {
+            mat_builder.values().append_value(v);
+        }
+        mat_builder.append(true);
+    };
+
+    if let Some(groups) = instances.bran_groups.as_ref() {
+        for group in groups {
+            let owner_refno = group.refno.clone();
+            if let Some(children) = group.children.as_ref() {
+                for component in children {
+                    let refno_mat = as_mat4_16(&component.refno_transform)?;
+                    for inst in &component.instances {
+                        let geo_mat = as_mat4_16(&inst.geo_transform)?;
+                        let matrix = mat4_mul_col_major(&refno_mat, &geo_mat);
+                        let color = *colors
+                            .get(component.color_index)
+                            .unwrap_or(&[1.0, 1.0, 1.0, 1.0]);
+                        push_row(
+                            component.refno.clone(),
+                            Some("BRAN".to_string()),
+                            Some(owner_refno.clone()),
+                            Some(component.noun.clone()),
+                            component.name.clone(),
+                            component.spec_value,
+                            inst.geo_hash.clone(),
+                            inst.geo_index as u32,
+                            component.lod_mask,
+                            matrix,
+                            color,
+                        );
+                    }
+                }
+            }
+
+            if let Some(tubings) = group.tubings.as_ref() {
+                for tubing in tubings {
+                    let matrix = as_mat4_16(&tubing.matrix)?;
+                    let color = *colors
+                        .get(tubing.color_index)
+                        .unwrap_or(&[1.0, 1.0, 1.0, 1.0]);
+                    push_row(
+                        tubing.refno.clone(),
+                        Some("BRAN".to_string()),
+                        Some(owner_refno.clone()),
+                        Some("TUBI".to_string()),
+                        tubing.name.clone(),
+                        tubing.spec_value,
+                        tubing.geo_hash.clone(),
+                        tubing.geo_index as u32,
+                        tubing.lod_mask,
+                        matrix,
+                        color,
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(groups) = instances.equi_groups.as_ref() {
+        for group in groups {
+            let owner_refno = group.refno.clone();
+            if let Some(children) = group.children.as_ref() {
+                for component in children {
+                    let refno_mat = as_mat4_16(&component.refno_transform)?;
+                    for inst in &component.instances {
+                        let geo_mat = as_mat4_16(&inst.geo_transform)?;
+                        let matrix = mat4_mul_col_major(&refno_mat, &geo_mat);
+                        let color = *colors
+                            .get(component.color_index)
+                            .unwrap_or(&[1.0, 1.0, 1.0, 1.0]);
+                        push_row(
+                            component.refno.clone(),
+                            Some("EQUI".to_string()),
+                            Some(owner_refno.clone()),
+                            Some(component.noun.clone()),
+                            component.name.clone(),
+                            component.spec_value,
+                            inst.geo_hash.clone(),
+                            inst.geo_index as u32,
+                            component.lod_mask,
+                            matrix,
+                            color,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(ungrouped) = instances.ungrouped.as_ref() {
+        for component in ungrouped {
+            let refno_mat = as_mat4_16(&component.refno_transform)?;
+            for inst in &component.instances {
+                let geo_mat = as_mat4_16(&inst.geo_transform)?;
+                let matrix = mat4_mul_col_major(&refno_mat, &geo_mat);
+                let color = *colors
+                    .get(component.color_index)
+                    .unwrap_or(&[1.0, 1.0, 1.0, 1.0]);
+                push_row(
+                    component.refno.clone(),
+                    None,
+                    None,
+                    Some(component.noun.clone()),
+                    component.name.clone(),
+                    component.spec_value,
+                    inst.geo_hash.clone(),
+                    inst.geo_index as u32,
+                    component.lod_mask,
+                    matrix,
+                    color,
+                );
+            }
+        }
+    }
+
+    let refno_refs: Vec<Option<&str>> = refnos.iter().map(|s| s.as_deref()).collect();
+    let owner_noun_refs: Vec<Option<&str>> = owner_nouns.iter().map(|s| s.as_deref()).collect();
+    let owner_refno_refs: Vec<Option<&str>> = owner_refnos.iter().map(|s| s.as_deref()).collect();
+    let noun_refs: Vec<Option<&str>> = nouns.iter().map(|s| s.as_deref()).collect();
+    let name_refs: Vec<Option<&str>> = names.iter().map(|s| s.as_deref()).collect();
+    let geo_hash_refs: Vec<Option<&str>> = geo_hashes.iter().map(|s| s.as_deref()).collect();
+
+    let refno_arr: ArrayRef = Arc::new(StringArray::from(refno_refs));
+    let owner_noun_arr: ArrayRef = Arc::new(StringArray::from(owner_noun_refs));
+    let owner_refno_arr: ArrayRef = Arc::new(StringArray::from(owner_refno_refs));
+    let noun_arr: ArrayRef = Arc::new(StringArray::from(noun_refs));
+    let name_arr: ArrayRef = Arc::new(StringArray::from(name_refs));
+    let spec_arr: ArrayRef = Arc::new(UInt32Array::from(spec_values));
+    let geo_hash_arr: ArrayRef = Arc::new(StringArray::from(geo_hash_refs));
+    let geo_index_arr: ArrayRef = Arc::new(UInt32Array::from(geo_indices));
+    let lod_mask_arr: ArrayRef = Arc::new(UInt32Array::from(lod_masks));
+    let color_arr: ArrayRef = Arc::new(color_builder.finish());
+    let mat_arr: ArrayRef = Arc::new(mat_builder.finish());
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("refno", DataType::Utf8, true),
+        Field::new("owner_noun", DataType::Utf8, true),
+        Field::new("owner_refno", DataType::Utf8, true),
+        Field::new("noun", DataType::Utf8, true),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("spec_value", DataType::UInt32, true),
+        Field::new("geo_hash", DataType::Utf8, true),
+        Field::new("geo_index", DataType::UInt32, false),
+        Field::new("lod_mask", DataType::UInt32, false),
+        Field::new(
+            "color_rgba",
+            DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Float32, false)), 4),
+            false,
+        ),
+        Field::new(
+            "matrix",
+            DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Float32, false)), 16),
+            false,
+        ),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            refno_arr,
+            owner_noun_arr,
+            owner_refno_arr,
+            noun_arr,
+            name_arr,
+            spec_arr,
+            geo_hash_arr,
+            geo_index_arr,
+            lod_mask_arr,
+            color_arr,
+            mat_arr,
+        ],
+    )?;
+
+    let mut file = File::create(path)?;
+    let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(())
+}
+
+fn write_geometry_manifest_parquet(path: PathBuf, manifest: &PrepackGeometryManifest) -> Result<()> {
+    let mut geo_hashes: Vec<Option<String>> = Vec::new();
+    let mut geo_indices: Vec<u32> = Vec::new();
+    let mut nouns_joined: Vec<Option<String>> = Vec::new();
+    let mut vertex_counts: Vec<u32> = Vec::new();
+    let mut tri_counts: Vec<u32> = Vec::new();
+    let mut lod_levels: Vec<u32> = Vec::new();
+    let mut asset_keys: Vec<Option<String>> = Vec::new();
+    let mut mesh_indices: Vec<u32> = Vec::new();
+    let mut node_indices: Vec<u32> = Vec::new();
+    let mut lod_tri_counts: Vec<u32> = Vec::new();
+    let mut error_metrics: Vec<f32> = Vec::new();
+    let mut sphere_radii: Vec<Option<f32>> = Vec::new();
+
+    let mut bbox_min_builder = FixedSizeListBuilder::new(PrimitiveBuilder::<Float32Type>::new(), 3)
+        .with_field(Arc::new(Field::new_list_field(DataType::Float32, false)));
+    let mut bbox_max_builder = FixedSizeListBuilder::new(PrimitiveBuilder::<Float32Type>::new(), 3)
+        .with_field(Arc::new(Field::new_list_field(DataType::Float32, false)));
+    let mut sphere_center_builder = FixedSizeListBuilder::new(PrimitiveBuilder::<Float32Type>::new(), 3)
+        .with_field(Arc::new(Field::new_list_field(DataType::Float32, false)));
+
+    for geo in &manifest.geometries {
+        let joined = if geo.nouns.is_empty() {
+            None
+        } else {
+            Some(geo.nouns.join(";"))
+        };
+
+        for lod in &geo.lods {
+            geo_hashes.push(Some(geo.geo_hash.clone()));
+            geo_indices.push(geo.geo_index as u32);
+            nouns_joined.push(joined.clone());
+            vertex_counts.push(geo.vertex_count as u32);
+            tri_counts.push(geo.triangle_count as u32);
+            lod_levels.push(lod.level);
+            asset_keys.push(Some(lod.asset_key.clone()));
+            mesh_indices.push(lod.mesh_index as u32);
+            node_indices.push(lod.node_index as u32);
+            lod_tri_counts.push(lod.triangle_count as u32);
+            error_metrics.push(lod.error_metric);
+
+            if let Some(b) = &geo.bounding_box {
+                for v in b.min {
+                    bbox_min_builder.values().append_value(v);
+                }
+                bbox_min_builder.append(true);
+
+                for v in b.max {
+                    bbox_max_builder.values().append_value(v);
+                }
+                bbox_max_builder.append(true);
+            } else {
+                bbox_min_builder.values().append_value(0.0);
+                bbox_min_builder.values().append_value(0.0);
+                bbox_min_builder.values().append_value(0.0);
+                bbox_min_builder.append(true);
+                bbox_max_builder.values().append_value(0.0);
+                bbox_max_builder.values().append_value(0.0);
+                bbox_max_builder.values().append_value(0.0);
+                bbox_max_builder.append(true);
+            }
+
+            if let Some(s) = &geo.bounding_sphere {
+                for v in s.center {
+                    sphere_center_builder.values().append_value(v);
+                }
+                sphere_center_builder.append(true);
+                sphere_radii.push(Some(s.radius));
+            } else {
+                sphere_center_builder.values().append_value(0.0);
+                sphere_center_builder.values().append_value(0.0);
+                sphere_center_builder.values().append_value(0.0);
+                sphere_center_builder.append(true);
+                sphere_radii.push(None);
+            }
+        }
+    }
+
+    let geo_hash_refs: Vec<Option<&str>> = geo_hashes.iter().map(|s| s.as_deref()).collect();
+    let nouns_refs: Vec<Option<&str>> = nouns_joined.iter().map(|s| s.as_deref()).collect();
+    let asset_refs: Vec<Option<&str>> = asset_keys.iter().map(|s| s.as_deref()).collect();
+
+    let geo_hash_arr: ArrayRef = Arc::new(StringArray::from(geo_hash_refs));
+    let geo_index_arr: ArrayRef = Arc::new(UInt32Array::from(geo_indices));
+    let nouns_arr: ArrayRef = Arc::new(StringArray::from(nouns_refs));
+    let vertex_arr: ArrayRef = Arc::new(UInt32Array::from(vertex_counts));
+    let tri_arr: ArrayRef = Arc::new(UInt32Array::from(tri_counts));
+    let lod_level_arr: ArrayRef = Arc::new(UInt32Array::from(lod_levels));
+    let asset_arr: ArrayRef = Arc::new(StringArray::from(asset_refs));
+    let mesh_arr: ArrayRef = Arc::new(UInt32Array::from(mesh_indices));
+    let node_arr: ArrayRef = Arc::new(UInt32Array::from(node_indices));
+    let lod_tri_arr: ArrayRef = Arc::new(UInt32Array::from(lod_tri_counts));
+    let err_arr: ArrayRef = Arc::new(Float32Array::from(error_metrics));
+    let bbox_min_arr: ArrayRef = Arc::new(bbox_min_builder.finish());
+    let bbox_max_arr: ArrayRef = Arc::new(bbox_max_builder.finish());
+    let sphere_center_arr: ArrayRef = Arc::new(sphere_center_builder.finish());
+    let sphere_radius_arr: ArrayRef = Arc::new(Float32Array::from(sphere_radii));
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("geo_hash", DataType::Utf8, true),
+        Field::new("geo_index", DataType::UInt32, false),
+        Field::new("nouns", DataType::Utf8, true),
+        Field::new("vertex_count", DataType::UInt32, false),
+        Field::new("triangle_count", DataType::UInt32, false),
+        Field::new("lod_level", DataType::UInt32, false),
+        Field::new("asset_key", DataType::Utf8, true),
+        Field::new("mesh_index", DataType::UInt32, false),
+        Field::new("node_index", DataType::UInt32, false),
+        Field::new("lod_triangle_count", DataType::UInt32, false),
+        Field::new("error_metric", DataType::Float32, false),
+        Field::new(
+            "bbox_min",
+            DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Float32, false)), 3),
+            false,
+        ),
+        Field::new(
+            "bbox_max",
+            DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Float32, false)), 3),
+            false,
+        ),
+        Field::new(
+            "sphere_center",
+            DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Float32, false)), 3),
+            false,
+        ),
+        Field::new("sphere_radius", DataType::Float32, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            geo_hash_arr,
+            geo_index_arr,
+            nouns_arr,
+            vertex_arr,
+            tri_arr,
+            lod_level_arr,
+            asset_arr,
+            mesh_arr,
+            node_arr,
+            lod_tri_arr,
+            err_arr,
+            bbox_min_arr,
+            bbox_max_arr,
+            sphere_center_arr,
+            sphere_radius_arr,
+        ],
+    )?;
+
+    let mut file = File::create(path)?;
+    let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None)?;
+    writer.write(&batch)?;
+    writer.close()?;
     Ok(())
 }

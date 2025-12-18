@@ -22,6 +22,7 @@ pub fn create_e3d_tree_routes(state: E3dTreeApiState) -> Router {
         .route("/api/e3d/children/{refno}", get(get_children))
         .route("/api/e3d/ancestors/{refno}", get(get_ancestors))
         .route("/api/e3d/subtree-refnos/{refno}", get(get_subtree_refnos))
+        .route("/api/e3d/visible-insts/{refno}", get(get_visible_insts))
         .route("/api/e3d/search", post(search_nodes))
         .with_state(state)
 }
@@ -63,6 +64,14 @@ pub struct SubtreeRefnosResponse {
     pub success: bool,
     pub refnos: Vec<RefnoEnum>,
     pub truncated: bool,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VisibleInstsResponse {
+    pub success: bool,
+    pub refno: RefnoEnum,
+    pub refnos: Vec<RefnoEnum>,
     pub error_message: Option<String>,
 }
 
@@ -278,6 +287,30 @@ async fn get_subtree_refnos(
         success: true,
         refnos: out,
         truncated,
+        error_message: None,
+    }))
+}
+
+async fn get_visible_insts(
+    Path(refno): Path<RefnoEnum>,
+    State(_state): State<E3dTreeApiState>,
+) -> Result<Json<VisibleInstsResponse>, StatusCode> {
+    let refnos = match aios_core::query_deep_visible_inst_refnos(refno).await {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(Json(VisibleInstsResponse {
+                success: false,
+                refno,
+                refnos: vec![],
+                error_message: Some(format!("query_deep_visible_inst_refnos failed: {e}")),
+            }));
+        }
+    };
+
+    Ok(Json(VisibleInstsResponse {
+        success: true,
+        refno,
+        refnos,
         error_message: None,
     }))
 }

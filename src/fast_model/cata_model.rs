@@ -15,7 +15,7 @@ use aios_core::parsed_data::{CateAxisParam, CateGeomsInfo, TubiInfoData};
 use aios_core::pdms_types::*;
 use aios_core::pe::SPdmsElement;
 use aios_core::prim_geo::basic::{BOXI_GEO_HASH, TUBI_GEO_HASH};
-use aios_core::prim_geo::category::{CateCsgShape, convert_to_csg_shapes};
+use aios_core::prim_geo::category::{CateCsgShape, try_convert_cate_geo_to_csg_shape};
 use aios_core::prim_geo::profile::create_profile_geos;
 use aios_core::prim_geo::*;
 use aios_core::prim_geo::{PdmsTubing, TubiEdge};
@@ -825,7 +825,7 @@ async fn gen_cata_geos_inner(
                             } else if !cata_neg_refnos.is_empty() {
                                 GeoBasicType::Compound
                             } else {
-                                // 初始正实体，布尔运算时会被改为 CataPos
+                                // 初始正实体，布尔运算时会被改为 CatePos
                                 GeoBasicType::Pos
                             };
                             let geo_param = csg_shape

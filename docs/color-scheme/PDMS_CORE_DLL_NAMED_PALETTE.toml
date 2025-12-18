@@ -1,0 +1,105 @@
+# 从 AVEVA PDMS/E3D core.dll 反推的默认“命名颜色表”（FWSCOL）
+# 该表可用于在项目侧复刻 PDMS 的默认色名→RGB 映射。
+#
+# 反推来源（IDA）：
+# - core.dll: /Volumes/DPC/reverse/core.dll (sha256 见下)
+# - FWSCOL@0x102A3458
+# - aGrey@0x10C72220（颜色名）
+# - RGB 表@0x10C73F00（256×RGB，double 0..1）
+# - 映射表@0x10C75700（61 个命名颜色 → palette_index；-1 表示无映射）
+
+[meta]
+core_dll_path = "/Volumes/DPC/reverse/core.dll"
+core_dll_sha256 = "ebe310af99d1d06071bec0f2c6dcf4a8357ccbf1259181eb34936235384596a9"
+image_base = "0x10000000"
+source_function = "FWSCOL"
+source_function_address = "0x102A3458"
+aGrey_address = "0x10C72220"
+rgb_table_address = "0x10C73F00"
+dict_map_address = "0x10C75700"
+
+base_colour_names_1_16 = [
+  "grey",
+  "red",
+  "orange",
+  "yellow",
+  "green",
+  "cyan",
+  "blue",
+  "violet",
+  "brown",
+  "white",
+  "pink",
+  "mauve",
+  "turquoise",
+  "indigo",
+  "black",
+  "magenta",
+]
+
+[special_colours]
+"296" = { name = "(unnamed_fixed)", rgba = [173, 129, 86, 255] }
+"298" = { name = "lightyellow" }
+"299" = { name = "white" }
+"300" = { name = "midnight" }
+"302" = { name = "lightyellow" }
+"303" = { name = "gold" }
+"304" = { name = "(reserved)" }
+
+# colour_no 范围 17..272，来自 256×RGB double 表；此处只列出“有名字的”子集。
+[name_to_colour_17_272]
+aquamarine = { colour_no = 137, rgba = [0, 255, 190, 255] }
+beige = { colour_no = 60, rgba = [188, 172, 125, 255] }
+black = { colour_no = 17, rgba = [0, 0, 0, 255] }
+blue = { colour_no = 22, rgba = [0, 0, 255, 255] }
+blueviolet = { colour_no = 207, rgba = [126, 0, 255, 255] }
+brightred = { colour_no = 18, rgba = [255, 0, 0, 255] }
+brown = { colour_no = 53, rgba = [104, 52, 0, 255] }
+chocolate = { colour_no = 55, rgba = [79, 39, 0, 255] }
+coralred = { colour_no = 39, rgba = [188, 45, 0, 255] }
+cyan = { colour_no = 21, rgba = [0, 255, 255, 255] }
+darkbrown = { colour_no = 65, rgba = [79, 58, 0, 255] }
+darkgreen = { colour_no = 125, rgba = [0, 79, 19, 255] }
+darkgrey = { colour_no = 268, rgba = [80, 80, 80, 255] }
+darkorchid = { colour_no = 219, rgba = [141, 0, 188, 255] }
+darkslate = { colour_no = 146, rgba = [53, 79, 72, 255] }
+deeppink = { colour_no = 247, rgba = [255, 0, 126, 255] }
+dimgrey = { colour_no = 269, rgba = [105, 105, 105, 255] }
+forestgreen = { colour_no = 101, rgba = [31, 129, 0, 255] }
+green = { colour_no = 109, rgba = [0, 188, 0, 255] }
+grey = { colour_no = 270, rgba = [130, 130, 130, 255] }
+indianred = { colour_no = 30, rgba = [188, 125, 125, 255] }
+indigo = { colour_no = 213, rgba = [52, 0, 104, 255] }
+ivory = { colour_no = 68, rgba = [255, 255, 170, 255] }
+khaki = { colour_no = 72, rgba = [129, 129, 85, 255] }
+lightblue = { colour_no = 168, rgba = [170, 211, 255, 255] }
+lightgold = { colour_no = 58, rgba = [255, 234, 170, 255] }
+lightgrey = { colour_no = 271, rgba = [189, 189, 189, 255] }
+limegreen = { colour_no = 97, rgba = [62, 255, 0, 255] }
+magenta = { colour_no = 23, rgba = [255, 0, 255, 255] }
+maroon = { colour_no = 243, rgba = [104, 0, 78, 255] }
+mauve = { colour_no = 221, rgba = [95, 0, 129, 255] }
+mediumaquamarine = { colour_no = 138, rgba = [170, 255, 234, 255] }
+midnight = { colour_no = 185, rgba = [0, 19, 79, 255] }
+navyblue = { colour_no = 193, rgba = [0, 0, 104, 255] }
+orange = { colour_no = 57, rgba = [255, 190, 0, 255] }
+orangered = { colour_no = 47, rgba = [255, 126, 0, 255] }
+pink = { colour_no = 260, rgba = [188, 125, 141, 255] }
+plum = { colour_no = 232, rgba = [129, 85, 129, 255] }
+powderblue = { colour_no = 158, rgba = [170, 234, 255, 255] }
+red = { colour_no = 29, rgba = [188, 0, 0, 255] }
+royalblue = { colour_no = 177, rgba = [0, 62, 255, 255] }
+salmon = { colour_no = 38, rgba = [255, 190, 170, 255] }
+sandybrown = { colour_no = 59, rgba = [188, 141, 0, 255] }
+sienna = { colour_no = 51, rgba = [129, 64, 0, 255] }
+springgreen = { colour_no = 127, rgba = [0, 255, 126, 255] }
+stateblue = { colour_no = 190, rgba = [125, 125, 188, 255] }
+steelblue = { colour_no = 160, rgba = [125, 172, 188, 255] }
+tan = { colour_no = 49, rgba = [188, 94, 0, 255] }
+tomato = { colour_no = 37, rgba = [255, 62, 0, 255] }
+turquoise = { colour_no = 149, rgba = [0, 188, 188, 255] }
+violet = { colour_no = 238, rgba = [255, 170, 234, 255] }
+wheat = { colour_no = 48, rgba = [255, 211, 170, 255] }
+white = { colour_no = 24, rgba = [255, 255, 255, 255] }
+yellow = { colour_no = 19, rgba = [255, 255, 0, 255] }
+yellowgreen = { colour_no = 79, rgba = [141, 188, 0, 255] }

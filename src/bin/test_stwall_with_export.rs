@@ -141,14 +141,13 @@ async fn query_negative_entities_wrapper(refno: RefnoEnum) -> Result<Vec<RefnoEn
 /// 检查布尔运算结果
 async fn check_boolean_result(refno: RefnoEnum) -> Result<()> {
     let inst_key = refno.to_inst_relate_key();
-    let inst_sql = format!("SELECT in, bad_bool, booled_id FROM {}", inst_key);
+    let inst_sql = format!("SELECT in, bool_status FROM {}", inst_key);
 
     #[derive(Debug, Deserialize, SurrealValue)]
     struct InstRelateRow {
         #[serde(rename = "in")]
         in_pe: Option<RefnoEnum>,
-        bad_bool: Option<bool>,
-        booled_id: Option<String>,
+        bool_status: Option<String>,
     }
 
     let rows: Vec<InstRelateRow> = SUL_DB.query_take(&inst_sql, 0).await?;
@@ -159,16 +158,18 @@ async fn check_boolean_result(refno: RefnoEnum) -> Result<()> {
     }
 
     for row in rows {
-        let bad_bool = row.bad_bool.unwrap_or(false);
-        let booled_id = row.booled_id.as_deref().unwrap_or("null");
+        let bool_status = row.bool_status.as_deref().unwrap_or("Pending");
 
-        if bad_bool {
-            println!("   ⚠️ 布尔运算标记为失败 (bad_bool=true)");
-        } else if booled_id != "null" {
-            println!("   ✅ 布尔运算成功");
-            println!("      booled_id: {}", booled_id);
-        } else {
-            println!("   ⚠️ 未执行布尔运算 (booled_id=null)");
+        match bool_status {
+            "Success" => {
+                println!("   ✅ 布尔运算成功");
+            }
+            "Failed" => {
+                println!("   ❌ 布尔运算失败 (bool_status=Failed)");
+            }
+            _ => {
+                println!("   ⏳ 布尔运算未执行 (bool_status={})", bool_status);
+            }
         }
     }
 

@@ -171,7 +171,7 @@ gen_history_model = false
 
 # 精度配置（LOD 分级：数字越大，几何更粗，用于远距渲染）
 [mesh_precision]
-default_lod = "L2"
+default_lod = "L1"
 
 # 可根据 noun 或几何类型覆盖 LOD
 # [mesh_precision.overrides.noun_lod]

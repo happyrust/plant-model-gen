@@ -158,7 +158,7 @@ async fn test_batch_query(refnos: &[RefnoEnum]) -> Result<()> {
 async fn inspect_inst_relate(refno: RefnoEnum) -> Result<()> {
     let pe_key = refno.to_pe_key();
     let inst_sql = format!(
-        "SELECT in, world_trans, aabb, bad_bool, booled_id FROM inst_relate:⟨{}⟩",
+        "SELECT in, world_trans, aabb, bool_status FROM inst_relate:⟨{}⟩",
         pe_key
     );
 
@@ -168,8 +168,7 @@ async fn inspect_inst_relate(refno: RefnoEnum) -> Result<()> {
         in_pe: Option<RefnoEnum>,
         world_trans: Option<PlantTransform>,
         aabb: Option<PlantAabb>,
-        bad_bool: Option<bool>,
-        booled_id: Option<String>,
+        bool_status: Option<String>,
     }
 
     let rows: Vec<InstRelateRow> = SUL_DB.query_take(&inst_sql, 0).await?;
@@ -187,12 +186,11 @@ async fn inspect_inst_relate(refno: RefnoEnum) -> Result<()> {
             .unwrap_or_else(|| "-".to_string());
         let wt_exists = row.world_trans.is_some();
         let aabb_exists = row.aabb.is_some();
-        let bad_bool = row.bad_bool.unwrap_or(false);
-        let booled_id = row.booled_id.as_deref().unwrap_or("null");
+        let bool_status = row.bool_status.unwrap_or_default();
 
         println!(
-            "  in={} world_trans={} aabb={} bad_bool={} booled_id={}",
-            in_val, wt_exists, aabb_exists, bad_bool, booled_id
+            "  in={} world_trans={} aabb={} bool_status={}",
+            in_val, wt_exists, aabb_exists, bool_status
         );
     }
 

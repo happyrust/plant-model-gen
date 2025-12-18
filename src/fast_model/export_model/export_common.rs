@@ -18,6 +18,8 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 use serde_json::Value as JsonValue;
 use std::io::Write;
+use aios_core::geometry::csg::{unit_box_mesh, unit_cylinder_mesh, unit_sphere_mesh};
+use aios_core::mesh_precision::LodMeshSettings;
 
 use crate::fast_model::query_provider;
 
@@ -116,6 +118,10 @@ pub struct ComponentRecord {
     pub owner_type: Option<String>,
     /// 规格值（来自 ZONE 的 owner.spec_value）
     pub spec_value: Option<i64>,
+    /// 是否使用布尔结果 mesh（booled_id 存在时为 true）
+    /// true: 几何体变换直接使用 world_transform（local_transform 已包含世界变换）
+    /// false: 使用 world_transform × local_transform
+    pub has_neg: bool,
 }
 
 /// TUBI 记录
@@ -145,6 +151,15 @@ impl GltfMeshCache {
             cache: DashMap::new(),
             hits: AtomicUsize::new(0),
             misses: AtomicUsize::new(0),
+        }
+    }
+
+    fn standard_unit_mesh(geo_hash: &str) -> Option<PlantMesh> {
+        match geo_hash {
+            "1" => Some(unit_box_mesh()),
+            "2" => Some(unit_cylinder_mesh(&LodMeshSettings::default(), false)),
+            "3" => Some(unit_sphere_mesh()),
+            _ => None,
         }
     }
 
@@ -192,6 +207,13 @@ impl GltfMeshCache {
         };
 
         if !mesh_path.exists() {
+            if let Some(mesh) = Self::standard_unit_mesh(actual_geo_hash) {
+                let arc_mesh = Arc::new(mesh);
+                self.cache.insert(geo_hash.to_string(), arc_mesh.clone());
+                self.misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(arc_mesh);
+            }
             return Err(anyhow!("Mesh 文件不存在: {}", mesh_path.display()));
         }
 
@@ -546,93 +568,12 @@ pub async fn collect_export_data(
                 }
             }
 
-            // #region agent log: record world_trans and local inst transform
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/Volumes/DPC/work/plant-code/rs-plant3-d/.cursor/debug.log")
-            {
-                let wt = geom_inst.world_trans.to_matrix();
-                let lt = inst.transform.to_matrix();
-                let _ = writeln!(
-                    f,
-                    r#"{{"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"H9","location":"export_common.rs:collect_export_data","message":"compose transform","data":{{"refno":"{}","geo_hash":"{}","world_trans":[[{},{},{},{}],[{},{},{},{}],[{},{},{},{}],[{},{},{},{}]],"local_trans":[[{},{},{},{}],[{},{},{},{}],[{},{},{},{}],[{},{},{},{}]]}},"timestamp":{}}}"#,
-                    geom_inst.refno.to_string(),
-                    inst.geo_hash,
-                    wt.row(0).x,
-                    wt.row(0).y,
-                    wt.row(0).z,
-                    wt.row(0).w,
-                    wt.row(1).x,
-                    wt.row(1).y,
-                    wt.row(1).z,
-                    wt.row(1).w,
-                    wt.row(2).x,
-                    wt.row(2).y,
-                    wt.row(2).z,
-                    wt.row(2).w,
-                    wt.row(3).x,
-                    wt.row(3).y,
-                    wt.row(3).z,
-                    wt.row(3).w,
-                    lt.row(0).x,
-                    lt.row(0).y,
-                    lt.row(0).z,
-                    lt.row(0).w,
-                    lt.row(1).x,
-                    lt.row(1).y,
-                    lt.row(1).z,
-                    lt.row(1).w,
-                    lt.row(2).x,
-                    lt.row(2).y,
-                    lt.row(2).z,
-                    lt.row(2).w,
-                    lt.row(3).x,
-                    lt.row(3).y,
-                    lt.row(3).z,
-                    lt.row(3).w,
-                    chrono::Utc::now().timestamp_millis()
-                );
-            }
-            // #endregion
 
             // 计算世界变换矩阵: world_trans * geo_trans
             // - Compound 类型（布尔后）: geo_trans = 单位变换（trans:⟨0⟩）
             // - Pos 类型（原始）: geo_trans = 几何体局部变换
             let world_matrix = geom_inst.world_trans.to_matrix().as_dmat4()
                 * inst.transform.to_matrix().as_dmat4();
-            // #region agent log
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/Volumes/DPC/work/plant-code/rs-plant3-d/.cursor/debug.log")
-            {
-                let wt = world_matrix;
-                let _ = writeln!(
-                    f,
-                    r#"{{"sessionId":"debug-session","runId":"post-fix","hypothesisId":"H13","location":"export_common.rs:collect_export_data","message":"world matrix","data":{{"refno":"{}","geo_hash":"{}","world_matrix":[[{}, {}, {}, {}],[{}, {}, {}, {}],[{}, {}, {}, {}],[{}, {}, {}, {}]]}},"timestamp":{}}}"#,
-                    geom_inst.refno.to_string(),
-                    inst.geo_hash,
-                    wt.row(0).x,
-                    wt.row(0).y,
-                    wt.row(0).z,
-                    wt.row(0).w,
-                    wt.row(1).x,
-                    wt.row(1).y,
-                    wt.row(1).z,
-                    wt.row(1).w,
-                    wt.row(2).x,
-                    wt.row(2).y,
-                    wt.row(2).z,
-                    wt.row(2).w,
-                    wt.row(3).x,
-                    wt.row(3).y,
-                    wt.row(3).z,
-                    wt.row(3).w,
-                    chrono::Utc::now().timestamp_millis()
-                );
-            }
-            // #endregion
 
             geometries.push(GeometryInstance {
                 geo_hash: inst.geo_hash.clone(),
@@ -657,6 +598,7 @@ pub async fn collect_export_data(
                 owner_noun,
                 owner_type,
                 spec_value: geom_inst.spec_value,
+                has_neg: geom_inst.has_neg,  // 是否使用布尔结果 mesh
             });
         }
     }

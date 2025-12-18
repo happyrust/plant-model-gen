@@ -1306,3 +1306,54 @@ pub async fn export_all_relates_mode(
     println!("\n🎉 导出完成！");
     Ok(())
 }
+
+pub async fn export_all_parquet_mode(
+    dbno: Option<u32>,
+    verbose: bool,
+    output_override: Option<PathBuf>,
+    owner_types: Option<Vec<String>>,
+    name_config_path: Option<PathBuf>,
+    export_all_lods: bool,
+    export_refnos: Option<String>,
+    source_unit: String,
+    target_unit: String,
+    db_option_ext: &DbOptionExt,
+) -> Result<()> {
+    use aios_database::fast_model::export_model::NameConfig;
+    use aios_database::fast_model::export_model::export_prepack_lod::export_all_relates_prepack_lod_parquet;
+    use std::sync::Arc;
+
+    println!("\n🎯 导出所有 inst_relate 实体模式 (Parquet)");
+    println!("============================");
+
+    // 连接数据库
+    println!("📡 连接数据库...");
+    init_surreal().await?;
+    println!("✅ 数据库连接成功");
+
+    // 加载名称配置（如果提供了路径）
+    let name_config = if let Some(path) = name_config_path {
+        Some(NameConfig::load_from_excel(&path)?)
+    } else {
+        None
+    };
+
+    // 调用导出函数（通过 Deref 访问内部的 DbOption）
+    let db_option = Arc::new((**db_option_ext).clone());
+    export_all_relates_prepack_lod_parquet(
+        dbno,
+        verbose,
+        output_override,
+        owner_types,
+        name_config,
+        db_option,
+        export_all_lods,
+        export_refnos,
+        source_unit,
+        target_unit,
+    )
+    .await?;
+
+    println!("\n🎉 导出完成！");
+    Ok(())
+}

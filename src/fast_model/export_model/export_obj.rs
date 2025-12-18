@@ -71,78 +71,26 @@ fn merge_export_data_into_mesh(export_data: &ExportData) -> PlantMesh {
 
     for component in &export_data.components {
         for instance in &component.geometries {
-            // #region agent log
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/Volumes/DPC/work/plant-code/rs-plant3-d/.cursor/debug.log")
-            {
-                let t = instance.local_transform;
-                let _ = writeln!(
-                    f,
-                    r#"{{"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"H7","location":"export_obj.rs:merge_export_data_into_mesh","message":"merge component inst","data":{{"geo_hash":"{}","transform":[[{},{},{},{}],[{},{},{},{}],[{},{},{},{}],[{},{},{},{}]]}},"timestamp":{}}}"#,
-                    instance.geo_hash,
-                    t.row(0).x,
-                    t.row(0).y,
-                    t.row(0).z,
-                    t.row(0).w,
-                    t.row(1).x,
-                    t.row(1).y,
-                    t.row(1).z,
-                    t.row(1).w,
-                    t.row(2).x,
-                    t.row(2).y,
-                    t.row(2).z,
-                    t.row(2).w,
-                    t.row(3).x,
-                    t.row(3).y,
-                    t.row(3).z,
-                    t.row(3).w,
-                    chrono::Utc::now().timestamp_millis()
-                );
-            }
-            // #endregion
+            // 根据 has_neg 决定变换方式：
+            // - has_neg=true（booled_id）: local_transform 已经包含世界变换(world_trans.d)，直接使用
+            // - has_neg=false（普通几何体）: 需要 world_transform × local_transform
+            let combined_transform = if component.has_neg {
+                // booled_id: 查询时 transform 已经是 world_trans.d
+                instance.local_transform
+            } else {
+                // 普通几何体: inst_transform × geo_transform
+                component.world_transform * instance.local_transform
+            };
             merge_instance_into_mesh(
                 &mut merged_mesh,
                 export_data,
                 &instance.geo_hash,
-                &instance.local_transform,
+                &combined_transform,
             );
         }
     }
 
     for tubing in &export_data.tubings {
-        // #region agent log
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/Volumes/DPC/work/plant-code/rs-plant3-d/.cursor/debug.log")
-        {
-            let t = tubing.transform;
-            let _ = writeln!(
-                f,
-                r#"{{"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"H7","location":"export_obj.rs:merge_export_data_into_mesh","message":"merge tubing inst","data":{{"geo_hash":"{}","transform":[[{},{},{},{}],[{},{},{},{}],[{},{},{},{}],[{},{},{},{}]]}},"timestamp":{}}}"#,
-                tubing.geo_hash,
-                t.row(0).x,
-                t.row(0).y,
-                t.row(0).z,
-                t.row(0).w,
-                t.row(1).x,
-                t.row(1).y,
-                t.row(1).z,
-                t.row(1).w,
-                t.row(2).x,
-                t.row(2).y,
-                t.row(2).z,
-                t.row(2).w,
-                t.row(3).x,
-                t.row(3).y,
-                t.row(3).z,
-                t.row(3).w,
-                chrono::Utc::now().timestamp_millis()
-            );
-        }
-        // #endregion
         merge_instance_into_mesh(
             &mut merged_mesh,
             export_data,

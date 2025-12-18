@@ -1,8 +1,4 @@
 #V2
--- 检查 pe_7997 的 refno 字段
-SELECT refno FROM pe_7997:`24381_36946`;
-USE NS `1516` DB AvevaMarineSample;
--- 查询 pe:24381_36946.refno 的完整内容
 SELECT * FROM pe:`24381_36946`.refno;
 USE NS `1516` DB AvevaMarineSample;
 -- 检查 pe:24381_36946 的结构
@@ -99,3 +95,7 @@ SELECT bool_status, aabb.d FROM inst_relate WHERE in = pe:24381_36945;
 SELECT refno.ANGL FROM pe:24381_36946;
 SELECT refno.ANGL, refno.RODI, refno.ROPT FROM pe:24381_36946;
 SELECT id, refno.POS FROM pe WHERE owner = pe:24381_36947;
+SELECT record::id(out) AS inst_geo_id, (SELECT record::id(out) AS geo_id, out.geo_type AS geo_type, out.unit_flag AS unit_flag, out.meshed AS meshed, visible AS visible, trans.d AS trans FROM out->geo_relate WHERE visible && trans.d != NONE) AS geos FROM inst_relate WHERE in = pe:24381_46955;
+SELECT record::id(out) AS inst_geo_id, (SELECT record::id(out) AS geo_id, out.geo_type AS geo_type, out.unit_flag AS unit_flag, out.meshed AS meshed, visible AS visible, trans.d AS trans FROM out->geo_relate) AS geos FROM inst_relate WHERE in = pe:24381_46955;
+SELECT (SELECT geo_type AS edge_geo_type, meshed AS edge_meshed, visible AS edge_visible, trans.d AS edge_trans, record::id(out) AS out_id, out.unit_flag AS out_unit_flag, out.meshed AS out_meshed, out.visible AS out_visible, out.geo_type AS out_geo_type FROM out->geo_relate) AS rows FROM inst_relate WHERE in = pe:24381_46955;
+SELECT (SELECT geo_type AS edge_geo_type, record::id(out) AS out_id, out.unit_flag AS out_unit_flag, out.meshed AS out_meshed FROM out->geo_relate) AS rows FROM inst_relate WHERE in = pe:24381_46955;

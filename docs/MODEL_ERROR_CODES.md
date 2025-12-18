@@ -79,7 +79,7 @@ cargo run -- --config DbOption --log-model-error --debug-model 14207/545
 
 #### E-GEO-003: 元件没有生成任何几何
 - **类型**: UnsupportedGeometry
-- **阶段**: convert_to_csg_shapes
+- **阶段**: try_convert_cate_geo_to_csg_shape
 - **说明**: 元件的所有几何都转换失败
 - **可能原因**:
   - 几何类型不支持
@@ -121,7 +121,7 @@ cargo run -- --config DbOption --log-model-error --debug-model 14207/545
 ```
 [MODEL_ERROR] code=E-REF-001 kind=InvalidReference stage=get_cat_refno refno=14207/545 desc="获取元件库引用失败" msg=ele_refno=14207/545, result=Ok(None)
 
-[MODEL_ERROR] code=E-GEO-003 kind=UnsupportedGeometry stage=convert_to_csg_shapes refno=21491/16521 desc="元件未生成任何几何" msg=design_refno=21491/16521, type_name=ELBO, geometries_len=2, n_geometries_len=0
+[MODEL_ERROR] code=E-GEO-003 kind=UnsupportedGeometry stage=try_convert_cate_geo_to_csg_shape refno=21491/16521 desc="元件未生成任何几何" msg=design_refno=21491/16521, type_name=ELBO, geometries_len=2, n_geometries_len=0
 
 [MODEL_ERROR] code=E-EXPR-001 kind=InvalidGeometry stage=resolve_cata_comp refno=14207/545 desc="表达式计算失败" msg=design_refno=14207/545, scom_ref=21491/16521, err=变量PARA5未定义
 ```

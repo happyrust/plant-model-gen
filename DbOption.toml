@@ -39,7 +39,7 @@ sqlite_index_path = "assets/aabb_index.sqlite"
 gen_model_batch_size = 16
 
 # Full Noun 模式配置
-full_noun_mode = true
+full_noun_mode = false
 full_noun_max_concurrent_nouns = 6
 full_noun_batch_size = 200
 

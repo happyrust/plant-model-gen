@@ -28,6 +28,7 @@ use parry3d::bounding_volume::Aabb;
 use parry3d::math::{Isometry, Vector};
 use parry3d::math::{Point, Real};
 use parry3d::query::PointQuery;
+use parry3d::query::{Ray, RayCast};
 use parry3d::shape::{TriMesh, TriMeshFlags};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use regex::Regex;
@@ -52,10 +53,12 @@ pub struct RoomBuildStats {
     pub memory_usage_mb: f32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct RoomComputeOptions {
     inside_tol: f32,
     concurrency: usize,
+    candidate_limit: Option<usize>,
+    candidate_concurrency: usize,
 }
 
 impl Default for RoomComputeOptions {
@@ -63,6 +66,8 @@ impl Default for RoomComputeOptions {
         Self {
             inside_tol: 0.1,
             concurrency: default_room_concurrency(),
+            candidate_limit: default_candidate_limit(),
+            candidate_concurrency: default_candidate_concurrency(),
         }
     }
 }
@@ -73,6 +78,21 @@ fn default_room_concurrency() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|c| *c > 0)
         .unwrap_or(4)
+}
+
+fn default_candidate_limit() -> Option<usize> {
+    std::env::var("ROOM_RELATION_CANDIDATE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|c| *c > 0)
+}
+
+fn default_candidate_concurrency() -> usize {
+    std::env::var("ROOM_RELATION_CANDIDATE_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|c| *c > 0)
+        .unwrap_or_else(default_room_concurrency)
 }
 
 #[derive(Default)]
@@ -252,10 +272,14 @@ async fn compute_room_relations(
 
 /// 构建房间面板查询 SQL（通过 OWNER 字段查询 FRMW -> SBFR -> PANE 层级）
 fn build_room_panel_query_sql(room_key_word: &[String]) -> String {
-    let filter = room_key_word
-        .iter()
-        .map(|x| format!("'{}' in NAME", x))
-        .join(" or ");
+    let filter = if room_key_word.is_empty() {
+        "true".to_string()
+    } else {
+        room_key_word
+            .iter()
+            .map(|x| format!("'{}' in NAME", x.replace('\'', "''")))
+            .join(" or ")
+    };
 
     #[cfg(feature = "project_hd")]
     {
@@ -416,7 +440,7 @@ async fn process_panel_for_room(
         mesh_dir,
         panel_refno,
         exclude_panel_refnos,
-        options.inside_tol,
+        options,
     )
     .await
     {
@@ -445,9 +469,10 @@ pub async fn cal_room_refnos(
     mesh_dir: &PathBuf,
     panel_refno: RefnoEnum,
     exclude_refnos: &HashSet<RefnoEnum>,
-    inside_tol: f32,
+    options: RoomComputeOptions,
 ) -> anyhow::Result<HashSet<RefnoEnum>> {
     let start_time = Instant::now();
+    let inside_tol = options.inside_tol;
 
     // 步骤 1：查询面板的几何实例
     let panel_geom_insts: Vec<GeomInstQuery> = aios_core::query_insts(&[panel_refno], true)
@@ -459,49 +484,75 @@ pub async fn cal_room_refnos(
         return Ok(Default::default());
     }
 
-    // 步骤 2：加载面板的 L0 TriMesh（用于点包含测试）
-    let panel_tri_mesh = {
-        let geom_inst = &panel_geom_insts[0];
-        let world_trans = geom_inst.world_trans;
-        
-        // 检查 insts 是否为空
+    // 步骤 2：加载面板 TriMesh（用于点包含测试），并合并面板 AABB
+    let mut panel_meshes: Vec<Arc<TriMesh>> = Vec::new();
+    let mut panel_aabb: Option<Aabb> = None;
+
+    for geom_inst in &panel_geom_insts {
+        let geom_aabb: Aabb = geom_inst.world_aabb.into();
+        panel_aabb = Some(match panel_aabb {
+            None => geom_aabb,
+            Some(acc) => merge_aabb(&acc, &geom_aabb),
+        });
+
         if geom_inst.insts.is_empty() {
             debug!("面板 {} 的 insts 数组为空", panel_refno);
-            return Ok(Default::default());
+            continue;
         }
-        let inst = &geom_inst.insts[0];
 
-        match load_geometry_with_enhanced_cache(mesh_dir, &inst.geo_hash, world_trans, inst).await {
-            Ok(mesh) => mesh,
-            Err(e) => {
-                warn!("加载面板几何文件失败: {}, error: {}", inst.geo_hash, e);
-                return Ok(Default::default());
+        for inst in &geom_inst.insts {
+            match load_geometry_with_enhanced_cache(mesh_dir, &inst.geo_hash, geom_inst.world_trans, inst).await {
+                Ok(mesh) => panel_meshes.push(mesh),
+                Err(e) => {
+                    warn!("加载面板几何文件失败: {}, error: {}", inst.geo_hash, e);
+                }
             }
+        }
+    }
+
+    let panel_aabb = match panel_aabb {
+        Some(aabb) => aabb,
+        None => {
+            debug!("面板 {} 没有可用 AABB", panel_refno);
+            return Ok(Default::default());
         }
     };
 
+    if panel_meshes.is_empty() {
+        debug!("面板 {} 无可用 TriMesh", panel_refno);
+        return Ok(Default::default());
+    }
+
     // 步骤 3：粗算 - 通过空间索引查询候选构件
     let coarse_start = Instant::now();
-    let panel_aabb: Aabb = panel_geom_insts[0].world_aabb.into();
 
     // 克隆排除列表以避免生命周期问题
     let exclude_list: Vec<RefU64> = exclude_refnos.iter().map(|r| r.refno()).collect();
+    let exclude_set: HashSet<RefU64> = exclude_list.iter().copied().collect();
+    let candidate_limit = options.candidate_limit;
 
     let candidates = tokio::task::spawn_blocking({
-        let panel_aabb = panel_aabb.clone();
-        let exclude_list = exclude_list.clone();
+        let panel_aabb = panel_aabb;
+        let exclude_list = exclude_list;
+        let exclude_set = exclude_set;
         let panel_refno = panel_refno.clone();
+        let candidate_limit = candidate_limit;
 
         move || -> anyhow::Result<Vec<RefnoEnum>> {
             use aios_core::spatial::sqlite;
             // 查询与面板 AABB 重叠的构件
-            let overlapping = sqlite::query_overlap(&panel_aabb, None, Some(1000), &exclude_list)?;
+            let overlapping = sqlite::query_overlap(&panel_aabb, None, candidate_limit, &exclude_list)?;
+            if let Some(limit) = candidate_limit {
+                if overlapping.len() >= limit {
+                    warn!("面板 {} 候选数达到上限 {}，可能存在截断", panel_refno, limit);
+                }
+            }
 
             // 转换为 RefnoEnum 并过滤（排除面板本身和其他面板）
             let refnos: Vec<RefnoEnum> = overlapping
                 .into_iter()
                 .map(|(refno, _, _)| RefnoEnum::Refno(refno))
-                .filter(|r| *r != panel_refno && !exclude_list.contains(&r.refno()))
+                .filter(|r| *r != panel_refno && !exclude_set.contains(&r.refno()))
                 .collect();
 
             Ok(refnos)
@@ -518,33 +569,47 @@ pub async fn cal_room_refnos(
 
     // 步骤 4：细算 - 对每个候选构件进行关键点检测
     let fine_start = Instant::now();
-    let mut within_refnos: HashSet<RefnoEnum> = HashSet::new();
+    let panel_meshes = Arc::new(panel_meshes);
 
-    for candidate_refno in &candidates {
-        // 查询候选构件的几何实例
-        let candidate_insts = match aios_core::query_insts(&[*candidate_refno], true).await {
-            Ok(insts) => insts,
-            Err(e) => {
-                warn!(
-                    "查询候选构件几何实例失败: {}, error: {}",
-                    candidate_refno, e
-                );
-                continue;
+    use futures::stream::{self, StreamExt};
+
+    let within_refnos: HashSet<RefnoEnum> = stream::iter(candidates)
+        .map(|candidate_refno| {
+            let panel_meshes = panel_meshes.clone();
+            async move {
+                // 查询候选构件的几何实例
+                let candidate_insts = match aios_core::query_insts(&[candidate_refno], true).await {
+                    Ok(insts) => insts,
+                    Err(e) => {
+                        warn!(
+                            "查询候选构件几何实例失败: {}, error: {}",
+                            candidate_refno, e
+                        );
+                        return None;
+                    }
+                };
+
+                if candidate_insts.is_empty() {
+                    return None;
+                }
+
+                // 提取候选构件的关键点
+                let key_points = extract_geom_key_points(&candidate_insts);
+
+                // 判断关键点是否在面板内
+                if is_geom_in_panel(&key_points, panel_meshes.as_ref(), inside_tol) {
+                    Some(candidate_refno)
+                } else {
+                    None
+                }
             }
-        };
-
-        if candidate_insts.is_empty() {
-            continue;
-        }
-
-        // 提取候选构件的关键点
-        let key_points = extract_geom_key_points(&candidate_insts);
-
-        // 判断关键点是否在面板内
-        if is_geom_in_panel(&key_points, &panel_tri_mesh, inside_tol) {
-            within_refnos.insert(*candidate_refno);
-        }
-    }
+        })
+        .buffer_unordered(options.candidate_concurrency.max(1))
+        .filter_map(|item| async move { item })
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect();
 
     debug!(
         "✅ 细算完成: 耗时 {:?}, 结果数 {}",
@@ -563,7 +628,7 @@ pub async fn cal_room_refnos(
     Ok(within_refnos)
 }
 
-/// 使用增强缓存加载几何文件（使用 L0 最低精度 LOD）
+/// 使用增强缓存加载几何文件（优先使用 L0，回退到 L1）
 async fn load_geometry_with_enhanced_cache(
     mesh_dir: &PathBuf,
     geo_hash: &str,
@@ -572,44 +637,63 @@ async fn load_geometry_with_enhanced_cache(
 ) -> anyhow::Result<Arc<TriMesh>> {
     let cache = get_enhanced_geometry_cache().await;
 
-    // 使用 L0 LOD 作为缓存键
-    let cache_key = format!("{}_L0", geo_hash);
+    // mesh_dir 已经指向带 LOD 的目录（如 assets/meshes/lod_L1）
+    // 需要获取基础目录（assets/meshes）来尝试不同的 LOD 级别
+    let base_mesh_dir = mesh_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| mesh_dir.clone());
 
-    // 检查缓存
-    if let Some(cached_mesh) = cache.get(&cache_key) {
-        // 从缓存的 PlantMesh 构建 TriMesh
-        if let Some(tri_mesh) = cached_mesh.get_tri_mesh_with_flag(
-            (world_trans * inst.transform).to_matrix(),
-            TriMeshFlags::ORIENTED | TriMeshFlags::MERGE_DUPLICATE_VERTICES,
-        ) {
-            CACHE_METRICS.record_plant_hit();
-            return Ok(Arc::new(tri_mesh));
+    // 尝试的 LOD 级别顺序：L0 -> L1 -> L2 -> L3
+    let lod_levels = ["L0", "L1", "L2", "L3"];
+
+    for lod_level in lod_levels.iter() {
+        let cache_key = format!("{}_{}", geo_hash, lod_level);
+        let lod_subdir = format!("lod_{}", lod_level);
+        let file_name = format!("{}_{}.mesh", geo_hash, lod_level);
+        let file_path = base_mesh_dir.join(&lod_subdir).join(&file_name);
+
+        // 检查缓存
+        if let Some(cached_mesh) = cache.get(&cache_key) {
+            // 从缓存的 PlantMesh 构建 TriMesh
+            if let Some(tri_mesh) = cached_mesh.get_tri_mesh_with_flag(
+                (world_trans * inst.transform).to_matrix(),
+                TriMeshFlags::ORIENTED | TriMeshFlags::MERGE_DUPLICATE_VERTICES,
+            ) {
+                CACHE_METRICS.record_plant_hit();
+                return Ok(Arc::new(tri_mesh));
+            }
+        }
+
+        if !file_path.exists() {
+            continue; // 尝试下一个 LOD 级别
+        }
+
+        let file_path_clone = file_path.clone();
+        match tokio::task::spawn_blocking(move || PlantMesh::des_mesh_file(&file_path_clone)).await {
+            Ok(Ok(mesh)) => {
+                // 构建 TriMesh
+                if let Some(tri_mesh) = mesh.get_tri_mesh_with_flag(
+                    (world_trans * inst.transform).to_matrix(),
+                    TriMeshFlags::ORIENTED | TriMeshFlags::MERGE_DUPLICATE_VERTICES,
+                ) {
+                    // 更新缓存
+                    cache.insert(cache_key, Arc::new(mesh));
+                    CACHE_METRICS.record_plant_miss();
+
+                    // 缓存管理
+                    if cache.len() > 2000 {
+                        cleanup_geometry_cache(&cache).await;
+                    }
+
+                    return Ok(Arc::new(tri_mesh));
+                }
+            }
+            _ => continue, // 加载失败，尝试下一个 LOD 级别
         }
     }
 
-    // 加载几何文件 - 使用 L0 最低精度 LOD
-    use aios_core::utils::lod_path_detector::build_mesh_path;
-    let file_path = mesh_dir.join(build_mesh_path(geo_hash, "L0"));
-    let mesh = tokio::task::spawn_blocking(move || PlantMesh::des_mesh_file(&file_path)).await??;
-
-    // 构建 TriMesh
-    let tri_mesh = mesh
-        .get_tri_mesh_with_flag(
-            (world_trans * inst.transform).to_matrix(),
-            TriMeshFlags::ORIENTED | TriMeshFlags::MERGE_DUPLICATE_VERTICES,
-        )
-        .ok_or_else(|| anyhow::anyhow!("无法构建 TriMesh"))?;
-
-    // 更新缓存 - 使用 L0 LOD 键
-    cache.insert(cache_key, Arc::new(mesh));
-    CACHE_METRICS.record_plant_miss();
-
-    // 缓存管理
-    if cache.len() > 2000 {
-        cleanup_geometry_cache(&cache).await;
-    }
-
-    Ok(Arc::new(tri_mesh))
+    anyhow::bail!("无法加载几何文件: {}", geo_hash)
 }
 
 /// 清理几何缓存
@@ -628,13 +712,28 @@ async fn cleanup_geometry_cache(cache: &DashMap<String, Arc<PlantMesh>>) {
     info!("几何缓存清理完成，当前大小: {}", cache.len());
 }
 
+fn merge_aabb(a: &Aabb, b: &Aabb) -> Aabb {
+    let mins = Point::new(
+        a.mins.x.min(b.mins.x),
+        a.mins.y.min(b.mins.y),
+        a.mins.z.min(b.mins.z),
+    );
+    let maxs = Point::new(
+        a.maxs.x.max(b.maxs.x),
+        a.maxs.y.max(b.maxs.y),
+        a.maxs.z.max(b.maxs.z),
+    );
+    Aabb::new(mins, maxs)
+}
+
 /// 从 AABB 提取增强关键点
 /// 包括：8个顶点 + 中心点 + 6个面中心 + 12条边中点
 fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
     let mut points = Vec::with_capacity(27);
 
     // 1. AABB 8个顶点
-    points.extend_from_slice(&aabb.vertices());
+    let vertices = aabb.vertices();
+    points.extend_from_slice(&vertices);
 
     // 2. 中心点
     points.push(aabb.center());
@@ -654,7 +753,6 @@ fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
     points.push(Point::new(cx, cy, maxs.z)); // 上面中心
 
     // 4. 12条边的中点
-    let vertices = aabb.vertices();
     // 底面4条边
     points.push(Point::from((vertices[0].coords + vertices[1].coords) / 2.0));
     points.push(Point::from((vertices[1].coords + vertices[3].coords) / 2.0));
@@ -676,7 +774,7 @@ fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
 
 /// 从几何体实例提取所有关键点
 fn extract_geom_key_points(geom_insts: &[GeomInstQuery]) -> Vec<Point<Real>> {
-    let mut all_points = Vec::new();
+    let mut all_points = Vec::with_capacity(geom_insts.len() * 27);
 
     for geom_inst in geom_insts {
         let aabb: Aabb = geom_inst.world_aabb.into();
@@ -689,27 +787,95 @@ fn extract_geom_key_points(geom_insts: &[GeomInstQuery]) -> Vec<Point<Real>> {
 
 /// 判断关键点是否在面板 TriMesh 内
 /// 使用投票策略：超过 50% 的关键点在面板内即判定为属于该房间
-fn is_geom_in_panel(key_points: &[Point<Real>], panel_tri_mesh: &TriMesh, tolerance: f32) -> bool {
-    if key_points.is_empty() {
+fn is_geom_in_panel(
+    key_points: &[Point<Real>],
+    panel_meshes: &[Arc<TriMesh>],
+    tolerance: f32,
+) -> bool {
+    if key_points.is_empty() || panel_meshes.is_empty() {
         return false;
     }
 
     let mut points_inside = 0;
     let total_points = key_points.len();
     let tolerance_sq = (tolerance as Real).powi(2);
+    let threshold = total_points / 2 + 1;
 
-    for point in key_points {
-        let projection = panel_tri_mesh.project_point(&Isometry::identity(), point, true);
-        let distance_sq = (projection.point - point).norm_squared();
-
-        if projection.is_inside || distance_sq <= tolerance_sq {
+    for (idx, point) in key_points.iter().enumerate() {
+        if is_point_inside_any_mesh(point, panel_meshes, tolerance_sq) {
             points_inside += 1;
+        }
+
+        let remaining = total_points - idx - 1;
+        if points_inside >= threshold {
+            return true;
+        }
+        if points_inside + remaining < threshold {
+            return false;
         }
     }
 
-    // 阈值策略：超过 50% 的关键点在面板内
-    let threshold = (total_points as f32 * 0.5) as usize;
-    points_inside >= threshold
+    false
+}
+
+fn is_point_inside_any_mesh(
+    point: &Point<Real>,
+    panel_meshes: &[Arc<TriMesh>],
+    tolerance_sq: Real,
+) -> bool {
+    for mesh in panel_meshes {
+        // 使用射线投射法判断点是否在网格内部
+        // parry3d 的 is_inside 对于某些封闭网格不可靠，射线投射法更准确
+        if is_point_inside_mesh_raycast(point, mesh) {
+            return true;
+        }
+
+        // 回退到距离检测：如果点非常接近表面，也认为在内部
+        let projection = mesh.project_point(&Isometry::identity(), point, true);
+        let distance_sq = (projection.point - point).norm_squared();
+        if distance_sq <= tolerance_sq {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// 使用射线投射法判断点是否在封闭网格内部
+/// 向多个方向发射射线，如果在相对的两个方向上都有交点，则认为点在内部
+fn is_point_inside_mesh_raycast(point: &Point<Real>, tri_mesh: &TriMesh) -> bool {
+    let identity = Isometry::identity();
+
+    // 向 +Z 和 -Z 方向发射射线
+    let ray_pos_z = Ray::new(*point, Vector::new(0.0, 0.0, 1.0));
+    let ray_neg_z = Ray::new(*point, Vector::new(0.0, 0.0, -1.0));
+
+    let hit_pos_z = tri_mesh.cast_ray(&identity, &ray_pos_z, Real::MAX, true);
+    let hit_neg_z = tri_mesh.cast_ray(&identity, &ray_neg_z, Real::MAX, true);
+
+    // 如果 Z 方向两边都有交点，点在网格内部
+    if hit_pos_z.is_some() && hit_neg_z.is_some() {
+        return true;
+    }
+
+    // 备用检测：向 +X/-X 或 +Y/-Y 方向检测
+    let ray_pos_x = Ray::new(*point, Vector::new(1.0, 0.0, 0.0));
+    let ray_neg_x = Ray::new(*point, Vector::new(-1.0, 0.0, 0.0));
+
+    let hit_pos_x = tri_mesh.cast_ray(&identity, &ray_pos_x, Real::MAX, true);
+    let hit_neg_x = tri_mesh.cast_ray(&identity, &ray_neg_x, Real::MAX, true);
+
+    if hit_pos_x.is_some() && hit_neg_x.is_some() {
+        return true;
+    }
+
+    let ray_pos_y = Ray::new(*point, Vector::new(0.0, 1.0, 0.0));
+    let ray_neg_y = Ray::new(*point, Vector::new(0.0, -1.0, 0.0));
+
+    let hit_pos_y = tri_mesh.cast_ray(&identity, &ray_pos_y, Real::MAX, true);
+    let hit_neg_y = tri_mesh.cast_ray(&identity, &ray_neg_y, Real::MAX, true);
+
+    hit_pos_y.is_some() && hit_neg_y.is_some()
 }
 
 /// 改进版本的房间关系保存
@@ -1143,7 +1309,7 @@ mod tests {
             Point::new(50.0, 100.0, 50.0), // 后面上
         ];
 
-        // 表面上的点距离为0，应该被容差接受
+        // 表面上的点距离为0，应该被接受
         let result = is_geom_in_panel(&key_points, &panel_mesh, 0.1);
         assert!(result, "表面上的点应该通过（距离为0，在容差内）");
     }
@@ -1321,7 +1487,7 @@ mod tests {
     }
 
     // ============================================================================
-    // 测试套件 7: RoomBuildStats 测试
+    // 测试套件 7: 房间关系统计测试
     // ============================================================================
 
     #[test]
@@ -1706,7 +1872,14 @@ pub async fn regenerate_room_models_by_keywords(
     info!("正在查询房间内构件...");
     for (_, _, panel_refnos) in &room_panel_map {
         for panel_refno in panel_refnos {
-            match cal_room_refnos(&mesh_dir, *panel_refno, &exclude_panel_refnos, 0.1).await {
+            match cal_room_refnos(
+                &mesh_dir,
+                *panel_refno,
+                &exclude_panel_refnos,
+                RoomComputeOptions::default(),
+            )
+            .await
+            {
                 Ok(refnos) => {
                     all_refnos.extend(refnos);
                 }

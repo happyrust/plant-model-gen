@@ -1,8 +1,4 @@
 #V2
--- 查看所有 geo_type='Neg' 的 geo_relate
-SELECT * FROM geo_relate WHERE geo_type = 'Neg';
--- 查看 geom_refno 包含 36946 的 geo_relate
-SELECT * FROM geo_relate WHERE string::contains(geom_refno.id(), '36946');
 USE NS `1516` DB AvevaMarineSample;
 -- 测试查询语句
 SELECT value id FROM geo_relate WHERE geom_refno = pe:`24381_36946` AND geo_type = 'Neg';
@@ -99,3 +95,7 @@ SELECT REFNO, noun, NAME FROM PANE LIMIT 5;
 SELECT REFNO, noun, NAME FROM pe WHERE noun = 'TEE' LIMIT 5;
 -- 查看 TEE 的完整信息
 SELECT id, REFNO, noun, NAME, OWNER FROM pe WHERE noun = 'TEE' LIMIT 10;
+-- 检查 room_relate 表的数据
+SELECT count() FROM room_relate GROUP ALL;
+-- 检查有哪些 FRMW 节点（房间）
+SELECT id, name FROM pe WHERE noun = 'FRMW' LIMIT 10;

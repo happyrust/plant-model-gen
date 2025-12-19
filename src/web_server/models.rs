@@ -70,6 +70,9 @@ pub struct TaskInfo {
     pub estimated_duration: Option<u32>,
     /// 实际执行时间（毫秒）
     pub actual_duration: Option<u64>,
+    /// 元数据（用于存储额外信息，如 bundle_url）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// 任务类型
@@ -101,6 +104,8 @@ pub enum TaskType {
     DataParsingWizard,
     /// 基于 Refno 的模型生成
     RefnoModelGeneration,
+    /// 模型导出
+    ModelExport,
     /// 自定义任务
     Custom(String),
 }
@@ -1155,6 +1160,7 @@ impl TaskInfo {
             dependencies: Vec::new(),
             estimated_duration: None,
             actual_duration: None,
+            metadata: None,
         }
     }
 

@@ -192,7 +192,7 @@ mem-kv-save = ["aios_core/mem-kv-save"]                              #额外保�
 project_hd = []
 project_hh = []
 profile = []                                                          #性能分析，包含tracing功能
-web_server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:sysinfo", "dep:axum-extra", "aios_core/web_server"]              #Web UI功能
+web_server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:sysinfo", "dep:axum-extra", "dep:tokio-util", "aios_core/web_server"]              #Web UI功能
 sqlite-index = ["dep:rusqlite", "aios_core/sqlite"]
 debug_e3d = []
 

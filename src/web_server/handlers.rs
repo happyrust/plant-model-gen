@@ -1504,6 +1504,7 @@ pub async fn restart_task(
             dependencies: Vec::new(),
             estimated_duration: old_task.estimated_duration,
             actual_duration: None,
+            metadata: None,
         };
 
         new_task.add_log(LogLevel::Info, format!("基于任务 {} 重新创建", id));
@@ -7276,65 +7277,123 @@ async fn execute_refno_model_generation(
     // 处理结果
     match result {
         Ok(_) => {
-            // 成功
-            let mut task_manager = state.task_manager.lock().await;
-            if let Some(mut task) = task_manager.active_tasks.remove(&task_id) {
-                task.status = TaskStatus::Completed;
-                task.completed_at = Some(SystemTime::now());
-                task.actual_duration = Some(duration.as_millis() as u64);
-                task.progress.percentage = 100.0;
-                task.progress.current_step = "完成".to_string();
-                task.add_log(
-                    LogLevel::Info,
-                    format!(
-                        "模型生成完成，耗时 {:.2}s，处理了 {} 个 refno",
-                        duration.as_secs_f32(),
-                        parsed_refnos.len()
-                    ),
-                );
+            // 成功 - 导出 bundle
+            let bundle_output_dir = PathBuf::from(format!("output/tasks/{}", task_id));
+            
+            // 更新进度：开始导出
+            {
+                let mut task_manager = state.task_manager.lock().await;
+                if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
+                    task.update_progress("导出模型包".to_string(), 2, 3, 75.0);
+                    task.add_log(
+                        LogLevel::Info,
+                        "开始导出模型包 (GLB + instances.json + manifest.json)".to_string(),
+                    );
+                }
+            }
 
-                // 新增: 触发房间关系更新
-                task.add_log(LogLevel::Info, "开始更新房间关系...".to_string());
+            // 导出 bundle
+            let bundle_result = crate::web_server::instance_export::export_model_bundle(
+                &parsed_refnos,
+                &task_id,
+                &bundle_output_dir,
+            )
+            .await;
 
-                // 异步调用房间计算 (不阻塞主任务完成)
-                let refnos_for_room = parsed_refnos.clone();
-                let state_for_room = state.clone();
-                let task_id_for_room = task_id.clone();
-                tokio::spawn(async move {
-                    match update_room_relations_for_refnos(&refnos_for_room).await {
-                        Ok(room_update_result) => {
-                            let mut task_manager = state_for_room.task_manager.lock().await;
-                            if let Some(task) = task_manager
-                                .task_history
-                                .iter_mut()
-                                .find(|t| t.id == task_id_for_room)
-                            {
-                                task.add_log(
-                                    LogLevel::Info,
-                                    format!(
-                                        "房间关系更新完成，影响 {} 个房间",
-                                        room_update_result.affected_rooms
-                                    ),
-                                );
+            match bundle_result {
+                Ok(bundle_path) => {
+                    let bundle_url = format!("/files/output/tasks/{}/", task_id);
+                    
+                    let mut task_manager = state.task_manager.lock().await;
+                    if let Some(mut task) = task_manager.active_tasks.remove(&task_id) {
+                        task.status = TaskStatus::Completed;
+                        task.completed_at = Some(SystemTime::now());
+                        task.actual_duration = Some(duration.as_millis() as u64);
+                        task.progress.percentage = 100.0;
+                        task.progress.current_step = "完成".to_string();
+                        task.add_log(
+                            LogLevel::Info,
+                            format!(
+                                "模型生成完成，耗时 {:.2}s，处理了 {} 个 refno",
+                                duration.as_secs_f32(),
+                                parsed_refnos.len()
+                            ),
+                        );
+                        task.add_log(
+                            LogLevel::Info,
+                            format!("Bundle 路径: {}", bundle_url),
+                        );
+
+                        // Store bundle_url in task metadata
+                        if task.metadata.is_none() {
+                            task.metadata = Some(serde_json::json!({}));
+                        }
+                        if let Some(metadata) = task.metadata.as_mut() {
+                            if let Some(obj) = metadata.as_object_mut() {
+                                obj.insert("bundle_url".to_string(), serde_json::json!(bundle_url));
                             }
                         }
-                        Err(e) => {
-                            let mut task_manager = state_for_room.task_manager.lock().await;
-                            if let Some(task) = task_manager
-                                .task_history
-                                .iter_mut()
-                                .find(|t| t.id == task_id_for_room)
-                            {
-                                task.add_log(
-                                    LogLevel::Warning,
-                                    format!("房间关系更新失败: {}，但模型已生成成功", e),
-                                );
+
+                        // 新增: 触发房间关系更新
+                        task.add_log(LogLevel::Info, "开始更新房间关系...".to_string());
+
+                        // 异步调用房间计算 (不阻塞主任务完成)
+                        let refnos_for_room = parsed_refnos.clone();
+                        let state_for_room = state.clone();
+                        let task_id_for_room = task_id.clone();
+                        tokio::spawn(async move {
+                            match update_room_relations_for_refnos(&refnos_for_room).await {
+                                Ok(room_update_result) => {
+                                    let mut task_manager = state_for_room.task_manager.lock().await;
+                                    if let Some(task) = task_manager
+                                        .task_history
+                                        .iter_mut()
+                                        .find(|t| t.id == task_id_for_room)
+                                    {
+                                        task.add_log(
+                                            LogLevel::Info,
+                                            format!(
+                                                "房间关系更新完成，影响 {} 个房间",
+                                                room_update_result.affected_rooms
+                                            ),
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    let mut task_manager = state_for_room.task_manager.lock().await;
+                                    if let Some(task) = task_manager
+                                        .task_history
+                                        .iter_mut()
+                                        .find(|t| t.id == task_id_for_room)
+                                    {
+                                        task.add_log(
+                                            LogLevel::Warning,
+                                            format!("房间关系更新失败: {}，但模型已生成成功", e),
+                                        );
+                                    }
+                                }
                             }
-                        }
+                        });
+
+                        task_manager.task_history.push(task);
                     }
-                });
-
-                task_manager.task_history.push(task);
+                }
+                Err(export_err) => {
+                    // Bundle 导出失败，但模型生成成功
+                    let mut task_manager = state.task_manager.lock().await;
+                    if let Some(mut task) = task_manager.active_tasks.remove(&task_id) {
+                        task.status = TaskStatus::Completed; // Still mark as completed
+                        task.completed_at = Some(SystemTime::now());
+                        task.actual_duration = Some(duration.as_millis() as u64);
+                        task.progress.percentage = 100.0;
+                        task.progress.current_step = "完成(Bundle导出失败)".to_string();
+                        task.add_log(
+                            LogLevel::Warning,
+                            format!("模型生成成功，但 Bundle 导出失败: {}", export_err),
+                        );
+                        task_manager.task_history.push(task);
+                    }
+                }
             }
         }
         Err(e) => {

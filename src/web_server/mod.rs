@@ -26,6 +26,7 @@ pub mod db_startup_manager;
 pub mod db_status_handlers;
 pub mod db_status_template;
 pub mod incremental_update_handlers;
+pub mod instance_export;
 pub mod layout;
 pub mod litefs_handlers;
 pub mod remote_runtime;
@@ -672,6 +673,10 @@ pub async fn start_web_server_with_config(
         .route(
             "/api/task-creation/preview",
             post(task_creation_handlers::preview_task_config),
+        )
+        .route(
+            "/api/tasks/{task_id}/download",
+            get(task_creation_handlers::download_task_export),
         )
         // SQLite 空间索引 API
         .route(

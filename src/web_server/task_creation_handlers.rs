@@ -20,6 +20,7 @@ pub enum TaskType {
     SpatialTreeGeneration,
     FullSync,
     IncrementalSync,
+    ModelExport,  // 新增：模型导出任务
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +90,8 @@ pub struct TaskParameters {
     pub apply_boolean_operation: Option<bool>,
     #[serde(rename = "meshTolRatio")]
     pub mesh_tol_ratio: Option<f64>,
+    #[serde(rename = "exportWebBundle")]
+    pub export_web_bundle: Option<bool>,  // 导出 Web 数据包
 
     // 同步任务参数
     #[serde(rename = "syncMode")]
@@ -101,6 +104,12 @@ pub struct TaskParameters {
     pub max_concurrent: Option<u32>,
     #[serde(rename = "parallelProcessing")]
     pub parallel_processing: Option<bool>,
+
+    // 导出任务参数
+    #[serde(rename = "regenModel")]
+    pub regen_model: Option<bool>,
+    #[serde(rename = "exportObj")]
+    pub export_obj: Option<bool>,
 }
 
 /// 任务创建响应
@@ -190,6 +199,7 @@ pub async fn create_task(
         "SpatialTreeGeneration" => TaskType::SpatialTreeGeneration,
         "FullSync" => TaskType::FullSync,
         "IncrementalSync" => TaskType::IncrementalSync,
+        "ModelExport" => TaskType::ModelExport,
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -224,6 +234,24 @@ pub async fn create_task(
     if let Err(e) = save_task_to_database(&task_id, &request, &task_type).await {
         eprintln!("保存任务到数据库失败: {}", e);
         // 继续执行，这不是致命错误
+    }
+
+    // 如果是 ModelExport 任务，启动后台执行
+    if matches!(task_type, TaskType::ModelExport) {
+        let task_id_clone = task_id.clone();
+        let refno = request.parameters.refno.clone();
+        let regen_model = request.parameters.regen_model.unwrap_or(false);
+        let export_obj = request.parameters.export_obj.unwrap_or(true);
+
+        tokio::spawn(async move {
+            if let Some(refno_str) = refno {
+                if let Err(e) = execute_model_export(&task_id_clone, &refno_str, regen_model, export_obj).await {
+                    eprintln!("导出任务 {} 执行失败: {}", task_id_clone, e);
+                }
+            } else {
+                eprintln!("导出任务 {} 缺少 refno 参数", task_id_clone);
+            }
+        });
     }
 
     Ok(Json(TaskCreationResponse {
@@ -383,4 +411,142 @@ async fn save_task_to_database(
     // 这里可以保存到SQLite或SurrealDB
     println!("保存任务到数据库: {} - {}", task_id, request.task_name);
     Ok(())
+}
+
+/// 执行模型导出任务
+async fn execute_model_export(
+    task_id: &str,
+    refno: &str,
+    regen_model: bool,
+    export_obj: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+    use std::path::PathBuf;
+
+    println!("🚀 开始执行导出任务 {}", task_id);
+    println!("   参数: refno={}, regen_model={}, export_obj={}", refno, regen_model, export_obj);
+
+    // 构建命令
+    let mut cmd = Command::new("cargo");
+    cmd.arg("run")
+        .arg("--bin")
+        .arg("aios-database")
+        .arg("--")
+        .arg("--debug-model")
+        .arg(refno);
+
+    if regen_model {
+        cmd.arg("--regen-model");
+    }
+
+    if export_obj {
+        cmd.arg("--export-obj");
+    }
+
+    // 执行命令
+    println!("📝 执行命令: {:?}", cmd);
+    let output = cmd.output()?;
+
+    if output.status.success() {
+        println!("✅ 导出任务 {} 执行成功", task_id);
+        
+        // 查找生成的文件
+        let output_dir = PathBuf::from("output");
+        if let Ok(entries) = std::fs::read_dir(&output_dir) {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let file_name_str = file_name.to_string_lossy();
+                
+                // 查找包含 refno 的 .obj 文件
+                if file_name_str.contains(&refno.replace('_', "/")) || file_name_str.contains(refno) {
+                    if file_name_str.ends_with(".obj") {
+                        println!("📁 找到导出文件: {}", file_name_str);
+                        // 将文件路径记录到任务信息中
+                        // TODO: 更新任务状态为完成，并记录输出文件路径
+                        break;
+                    }
+                }
+            }
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("❌ 导出任务 {} 执行失败: {}", task_id, stderr);
+        return Err(format!("命令执行失败: {}", stderr).into());
+    }
+
+    Ok(())
+}
+
+/// 下载导出任务的文件
+pub async fn download_task_export(
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use axum::http::{header, HeaderValue};
+    use axum::response::Response;
+    use std::path::PathBuf;
+    use tokio::fs::File;
+    use tokio_util::io::ReaderStream;
+
+    println!("📥 处理下载请求: task_id={}", task_id);
+
+    // 查找导出文件（简化实现：直接在 output 目录查找）
+    let output_dir = PathBuf::from("output");
+    
+    if !output_dir.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "输出目录不存在".to_string(),
+        ));
+    }
+
+    // 查找与 task_id 相关的 .obj 文件
+    // TODO: 应该从数据库中获取任务记录的文件路径
+    let mut found_file: Option<PathBuf> = None;
+    
+    if let Ok(entries) = std::fs::read_dir(&output_dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+            
+            // 临时实现：查找最新的 .obj 文件
+            // 更好的实现应该在任务记录中存储文件路径
+            if file_name_str.ends_with(".obj") {
+                found_file = Some(entry.path());
+                println!("🔍 找到导出文件: {}", file_name_str);
+                break;
+            }
+        }
+    }
+
+    let file_path = found_file.ok_or((
+        StatusCode::NOT_FOUND,
+        format!("未找到任务 {} 的导出文件", task_id),
+    ))?;
+
+    let file_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "无效的文件名".to_string()))?
+        .to_string(); // 转换为拥有的 String
+
+    println!("✅ 开始下载文件: {}", file_name);
+
+    // 打开文件
+    let file = File::open(&file_path)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("打开文件失败: {}", e)))?;
+
+    // 创建流式响应
+    let stream = ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
+
+    // 构建响应
+    let content_disposition = format!("attachment; filename=\"{}\"", file_name);
+    let response = Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_DISPOSITION, content_disposition)
+        .body(body)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("构建响应失败: {}", e)))?;
+
+    Ok(response)
 }

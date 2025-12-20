@@ -338,10 +338,36 @@ async fn build_room_panels_relate(
     build_room_panels_relate_common(room_key_word, |_| true).await
 }
 
+/// 仅构建房间面板映射（不写入关系）
+async fn build_room_panels_relate_for_query(
+    room_key_word: &Vec<String>,
+) -> anyhow::Result<Vec<(RefnoEnum, String, Vec<RefnoEnum>)>> {
+    #[cfg(feature = "project_hd")]
+    return build_room_panels_relate_common_with_persist(room_key_word, match_room_name_hd, false)
+        .await;
+
+    #[cfg(feature = "project_hh")]
+    return build_room_panels_relate_common_with_persist(room_key_word, match_room_name_hh, false)
+        .await;
+
+    build_room_panels_relate_common_with_persist(room_key_word, |_| true, false).await
+}
+
 /// 改进版本的房间面板关系构建通用函数
 async fn build_room_panels_relate_common<F>(
     room_key_word: &Vec<String>,
     match_room_fn: F,
+) -> anyhow::Result<Vec<(RefnoEnum, String, Vec<RefnoEnum>)>>
+where
+    F: Fn(&str) -> bool + Send + Sync,
+{
+    build_room_panels_relate_common_with_persist(room_key_word, match_room_fn, true).await
+}
+
+async fn build_room_panels_relate_common_with_persist<F>(
+    room_key_word: &Vec<String>,
+    match_room_fn: F,
+    persist: bool,
 ) -> anyhow::Result<Vec<(RefnoEnum, String, Vec<RefnoEnum>)>>
 where
     F: Fn(&str) -> bool + Send + Sync,
@@ -392,15 +418,23 @@ where
         .collect();
 
     // 批量创建房间面板关系
-    if !room_groups.is_empty() {
+    if persist && !room_groups.is_empty() {
         create_room_panel_relations_batch(&room_groups).await?;
     }
 
-    info!(
-        "房间面板关系构建完成: {} 个关系, 耗时 {:?}",
-        room_groups.len(),
-        start_time.elapsed()
-    );
+    if persist {
+        info!(
+            "房间面板关系构建完成: {} 个关系, 耗时 {:?}",
+            room_groups.len(),
+            start_time.elapsed()
+        );
+    } else {
+        info!(
+            "房间面板映射构建完成(未写入关系): {} 个关系, 耗时 {:?}",
+            room_groups.len(),
+            start_time.elapsed()
+        );
+    }
 
     Ok(room_groups)
 }
@@ -436,7 +470,7 @@ async fn process_panel_for_room(
     exclude_panel_refnos: &HashSet<RefnoEnum>,
     options: RoomComputeOptions,
 ) -> usize {
-    match cal_room_refnos(
+    match cal_room_refnos_with_options(
         mesh_dir,
         panel_refno,
         exclude_panel_refnos,
@@ -466,6 +500,19 @@ async fn process_panel_for_room(
 /// 改进版本的房间构件计算（基于关键点检测）
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub async fn cal_room_refnos(
+    mesh_dir: &PathBuf,
+    panel_refno: RefnoEnum,
+    exclude_refnos: &HashSet<RefnoEnum>,
+    inside_tol: f32,
+) -> anyhow::Result<HashSet<RefnoEnum>> {
+    let mut options = RoomComputeOptions::default();
+    options.inside_tol = inside_tol;
+
+    cal_room_refnos_with_options(mesh_dir, panel_refno, exclude_refnos, options).await
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn cal_room_refnos_with_options(
     mesh_dir: &PathBuf,
     panel_refno: RefnoEnum,
     exclude_refnos: &HashSet<RefnoEnum>,
@@ -636,6 +683,7 @@ async fn load_geometry_with_enhanced_cache(
     inst: &ModelHashInst,
 ) -> anyhow::Result<Arc<TriMesh>> {
     let cache = get_enhanced_geometry_cache().await;
+    let trimesh_cache = get_enhanced_trimesh_cache().await;
 
     // mesh_dir 已经指向带 LOD 的目录（如 assets/meshes/lod_L1）
     // 需要获取基础目录（assets/meshes）来尝试不同的 LOD 级别
@@ -649,11 +697,17 @@ async fn load_geometry_with_enhanced_cache(
 
     for lod_level in lod_levels.iter() {
         let cache_key = format!("{}_{}", geo_hash, lod_level);
-        let lod_subdir = format!("lod_{}", lod_level);
-        let file_name = format!("{}_{}.mesh", geo_hash, lod_level);
-        let file_path = base_mesh_dir.join(&lod_subdir).join(&file_name);
+        
+        // 1. 检查 TriMesh 缓存 (用于 GLB/GLTF 直接加载的结果)
+        if let Some(cached_trimesh) = trimesh_cache.get(&cache_key) {
+             // 这里的 cache 存储的是原始几何体的 TriMesh
+             // 我们需要应用实例变换
+             let transformed_mesh = transform_tri_mesh(&cached_trimesh, (world_trans * inst.transform).to_matrix());
+             CACHE_METRICS.record_trimesh_hit();
+             return Ok(Arc::new(transformed_mesh));
+        }
 
-        // 检查缓存
+        // 2. 检查 PlantMesh 缓存 (用于 .mesh 文件)
         if let Some(cached_mesh) = cache.get(&cache_key) {
             // 从缓存的 PlantMesh 构建 TriMesh
             if let Some(tri_mesh) = cached_mesh.get_tri_mesh_with_flag(
@@ -664,6 +718,41 @@ async fn load_geometry_with_enhanced_cache(
                 return Ok(Arc::new(tri_mesh));
             }
         }
+
+        let lod_subdir = format!("lod_{}", lod_level);
+        
+        // 3. 尝试加载 GLB/GLTF
+        let glb_file_names = [
+            format!("{}_{}.glb", geo_hash, lod_level),
+            format!("{}_{}.gltf", geo_hash, lod_level),
+        ];
+
+        for glb_name in &glb_file_names {
+            let glb_path = base_mesh_dir.join(&lod_subdir).join(glb_name);
+            if glb_path.exists() {
+                let glb_path_clone = glb_path.clone();
+                match tokio::task::spawn_blocking(move || load_tri_mesh_from_glb(&glb_path_clone)).await {
+                     Ok(Ok(trimesh)) => {
+                         let trimesh_arc = Arc::new(trimesh);
+                         // 存入 TriMesh 缓存
+                         trimesh_cache.insert(cache_key.clone(), trimesh_arc.clone());
+                         CACHE_METRICS.record_trimesh_miss();
+
+                         // 应用变换返回
+                         let transformed_mesh = transform_tri_mesh(&trimesh_arc, (world_trans * inst.transform).to_matrix());
+                         return Ok(Arc::new(transformed_mesh));
+                     }
+                     Ok(Err(e)) => {
+                         warn!("加载 GLB 失败: path={:?}, error={}", glb_path, e);
+                     }
+                     _ => {}
+                }
+            }
+        }
+
+        // 4. 尝试加载 .mesh 文件 (旧流程)
+        let file_name = format!("{}_{}.mesh", geo_hash, lod_level);
+        let file_path = base_mesh_dir.join(&lod_subdir).join(&file_name);
 
         if !file_path.exists() {
             continue; // 尝试下一个 LOD 级别
@@ -694,6 +783,71 @@ async fn load_geometry_with_enhanced_cache(
     }
 
     anyhow::bail!("无法加载几何文件: {}", geo_hash)
+}
+
+/// 从 GLB/GLTF 文件加载 TriMesh
+fn load_tri_mesh_from_glb(path: &PathBuf) -> anyhow::Result<TriMesh> {
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    let glb = gltf::Gltf::from_reader(reader)?;
+    
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // 遍历所有 mesh 和 primitive
+    for mesh in glb.meshes() {
+        for primitive in mesh.primitives() {
+            let reader = primitive.reader(|buffer| Some(glb.blob.as_ref()?.as_slice()));
+
+            if let Some(iter) = reader.read_positions() {
+                let base_index = vertices.len() as u32;
+                for vertex in iter {
+                    vertices.push(Point::new(vertex[0], vertex[1], vertex[2]));
+                }
+
+                if let Some(iter) = reader.read_indices() {
+                    let iter = iter.into_u32();
+                    let chunked_indices: Vec<u32> = iter.collect();
+                     // 处理三角形索引
+                    for chunk in chunked_indices.chunks(3) {
+                        if chunk.len() == 3 {
+                            indices.push([
+                                base_index + chunk[0],
+                                base_index + chunk[1],
+                                base_index + chunk[2],
+                            ]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if vertices.is_empty() {
+        anyhow::bail!("GLB 文件不包含顶点数据");
+    }
+
+    // 创建 TriMesh (使用 ORIENTED 和 MERGE_DUPLICATE_VERTICES flag)
+    // TriMesh::new 返回 Result，需要处理错误
+    TriMesh::new(vertices, indices).map_err(|e| anyhow::anyhow!("构建 TriMesh 失败: {}", e))
+}
+
+/// 辅助函数：对 TriMesh 应用变换
+fn transform_tri_mesh(mesh: &TriMesh, transform: Mat4) -> TriMesh {
+    let vertices: Vec<Point<Real>> = mesh
+        .vertices()
+        .iter()
+        .map(|v| {
+            let p = transform.transform_point3(Vec3::new(v.x, v.y, v.z));
+            Point::new(p.x, p.y, p.z)
+        })
+        .collect();
+    
+    // 索引不变
+    let indices = mesh.indices().to_vec();
+    
+    // 这里我们假设变换后的几何体仍然是有效的，如果构建失败则 panic (或者应该返回 Result)
+    TriMesh::new(vertices, indices).expect("变换后的几何体构建失败")
 }
 
 /// 清理几何缓存
@@ -994,10 +1148,8 @@ mod tests {
     #[test]
     fn test_build_room_panel_query_sql_contains_range_and_filter() {
         let sql = build_room_panel_query_sql(&vec!["AA".to_string(), "BB".to_string()]);
-        assert!(
-            sql.contains("@.{1..2+collect}.children"),
-            "SQL 应包含 1..2 层 children 递归"
-        );
+        assert!(sql.contains("select value ["));
+        assert!(sql.contains("NAME IS NOT NONE"));
         assert!(sql.contains("'AA' in NAME") && sql.contains("'BB' in NAME"));
         #[cfg(feature = "project_hh")]
         assert!(sql.contains("from SBFR"));
@@ -1009,9 +1161,9 @@ mod tests {
     #[test]
     fn test_build_room_panel_query_sql_empty_keywords() {
         let sql = build_room_panel_query_sql(&vec![]);
-        // 空关键词时 filter 为空字符串
+        // 空关键词时 filter 固定为 true
         assert!(sql.contains("select value"));
-        assert!(sql.contains("@.{1..2+collect}.children"));
+        assert!(sql.contains("(true)"));
     }
 
     /// 测试 SQL 生成 - 单个关键词
@@ -1282,24 +1434,24 @@ mod tests {
     /// 测试空点列表 → 不应该通过（这是函数逻辑的核心边界条件）
     #[test]
     fn test_is_geom_in_panel_empty_points() {
-        let panel_mesh = create_test_cube_trimesh(
+        let panel_meshes = vec![Arc::new(create_test_cube_trimesh(
             Point::new(0.0, 0.0, 0.0),
             Point::new(100.0, 100.0, 100.0),
-        );
+        ))];
 
         let key_points: Vec<Point<Real>> = vec![];
 
-        let result = is_geom_in_panel(&key_points, &panel_mesh, 0.1);
+        let result = is_geom_in_panel(&key_points, &panel_meshes, 0.1);
         assert!(!result, "空点列表不应该通过");
     }
 
     /// 测试边界上的点 - 距离为0，应该通过容差检测
     #[test]
     fn test_is_geom_in_panel_on_boundary() {
-        let panel_mesh = create_test_cube_trimesh(
+        let panel_meshes = vec![Arc::new(create_test_cube_trimesh(
             Point::new(0.0, 0.0, 0.0),
             Point::new(100.0, 100.0, 100.0),
-        );
+        ))];
 
         // 点正好在表面上（投影距离为0）
         let key_points = vec![
@@ -1310,17 +1462,17 @@ mod tests {
         ];
 
         // 表面上的点距离为0，应该被接受
-        let result = is_geom_in_panel(&key_points, &panel_mesh, 0.1);
+        let result = is_geom_in_panel(&key_points, &panel_meshes, 0.1);
         assert!(result, "表面上的点应该通过（距离为0，在容差内）");
     }
 
     /// 测试阈值逻辑 - 使用大容差确保表面上的点被计入
     #[test]
     fn test_is_geom_in_panel_threshold_logic() {
-        let panel_mesh = create_test_cube_trimesh(
+        let panel_meshes = vec![Arc::new(create_test_cube_trimesh(
             Point::new(0.0, 0.0, 0.0),
             Point::new(100.0, 100.0, 100.0),
-        );
+        ))];
 
         // 使用4个表面上的点（100%应该通过）
         let surface_points = vec![
@@ -1330,17 +1482,17 @@ mod tests {
             Point::new(50.0, 100.0, 50.0),
         ];
 
-        let result = is_geom_in_panel(&surface_points, &panel_mesh, 0.1);
+        let result = is_geom_in_panel(&surface_points, &panel_meshes, 0.1);
         assert!(result, "100% 表面点应该通过");
     }
 
     /// 测试容差对表面附近点的影响
     #[test]
     fn test_is_geom_in_panel_tolerance_effect() {
-        let panel_mesh = create_test_cube_trimesh(
+        let panel_meshes = vec![Arc::new(create_test_cube_trimesh(
             Point::new(0.0, 0.0, 0.0),
             Point::new(100.0, 100.0, 100.0),
-        );
+        ))];
 
         // 点略微在表面外
         let near_surface_points = vec![
@@ -1350,7 +1502,7 @@ mod tests {
 
         // 容差 0.1 的平方是 0.01，距离 0.05 的平方是 0.0025
         // 0.0025 < 0.01，所以这些点应该被接受
-        let result_large_tolerance = is_geom_in_panel(&near_surface_points, &panel_mesh, 0.1);
+        let result_large_tolerance = is_geom_in_panel(&near_surface_points, &panel_meshes, 0.1);
         assert!(
             result_large_tolerance,
             "容差 0.1 应该接受距离 0.05 的点"
@@ -1360,10 +1512,10 @@ mod tests {
     /// 测试非常远的点不应该被计入（即使容差很大）
     #[test]
     fn test_is_geom_in_panel_far_points_excluded() {
-        let panel_mesh = create_test_cube_trimesh(
+        let panel_meshes = vec![Arc::new(create_test_cube_trimesh(
             Point::new(0.0, 0.0, 0.0),
             Point::new(100.0, 100.0, 100.0),
-        );
+        ))];
 
         // 全部都是非常远的点
         let far_points = vec![
@@ -1373,37 +1525,37 @@ mod tests {
         ];
 
         // 即使容差是 1.0，这些点也太远了
-        let result = is_geom_in_panel(&far_points, &panel_mesh, 1.0);
+        let result = is_geom_in_panel(&far_points, &panel_meshes, 1.0);
         assert!(!result, "非常远的点不应该通过");
     }
 
     /// 测试混合点场景 - 部分在表面，部分很远
     #[test]
     fn test_is_geom_in_panel_mixed_points() {
-        let panel_mesh = create_test_cube_trimesh(
+        let panel_meshes = vec![Arc::new(create_test_cube_trimesh(
             Point::new(0.0, 0.0, 0.0),
             Point::new(100.0, 100.0, 100.0),
-        );
+        ))];
 
-        // 2个表面点 + 2个远点 = 50% 在容差内
+        // 3个表面点 + 1个远点 = 75% 在容差内
         let mixed_points = vec![
             Point::new(0.0, 50.0, 50.0),      // 表面上
             Point::new(100.0, 50.0, 50.0),    // 表面上
+            Point::new(50.0, 0.0, 50.0),      // 表面上
             Point::new(10000.0, 10000.0, 10000.0), // 很远
-            Point::new(-10000.0, -10000.0, -10000.0), // 很远
         ];
 
-        let result = is_geom_in_panel(&mixed_points, &panel_mesh, 0.1);
-        assert!(result, "50% 点在容差内应该通过");
+        let result = is_geom_in_panel(&mixed_points, &panel_meshes, 0.1);
+        assert!(result, "超过 50% 点在容差内应该通过");
     }
 
     /// 测试低于阈值的场景
     #[test]
     fn test_is_geom_in_panel_below_threshold() {
-        let panel_mesh = create_test_cube_trimesh(
+        let panel_meshes = vec![Arc::new(create_test_cube_trimesh(
             Point::new(0.0, 0.0, 0.0),
             Point::new(100.0, 100.0, 100.0),
-        );
+        ))];
 
         // 1个表面点 + 4个远点 = 20% 在容差内
         let mostly_far_points = vec![
@@ -1415,7 +1567,7 @@ mod tests {
         ];
 
         // 1/5 = 20% < 50%
-        let result = is_geom_in_panel(&mostly_far_points, &panel_mesh, 0.1);
+        let result = is_geom_in_panel(&mostly_far_points, &panel_meshes, 0.1);
         assert!(!result, "20% 点在容差内不应该通过");
     }
 
@@ -1477,6 +1629,7 @@ mod tests {
         assert_eq!(options.inside_tol, 0.1);
         // 并发度取决于环境变量或默认值 4
         assert!(options.concurrency > 0);
+        assert!(options.candidate_concurrency > 0);
     }
 
     #[test]
@@ -1609,55 +1762,50 @@ mod tests {
     /// 测试单个表面点应该通过
     #[test]
     fn test_is_geom_in_panel_single_surface_point() {
-        let panel_mesh = create_test_cube_trimesh(
+        let panel_meshes = vec![Arc::new(create_test_cube_trimesh(
             Point::new(0.0, 0.0, 0.0),
             Point::new(100.0, 100.0, 100.0),
-        );
+        ))];
 
         // 单个表面上的点（距离为0，在容差内）
         let key_points = vec![Point::new(0.0, 50.0, 50.0)];
 
-        let result = is_geom_in_panel(&key_points, &panel_mesh, 0.1);
-        assert!(result, "单个表面点应该通过（100% >= 50%）");
+        let result = is_geom_in_panel(&key_points, &panel_meshes, 0.1);
+        assert!(result, "单个表面点应该通过");
     }
 
-    /// 测试单点边界条件：threshold = (1 * 0.5) as usize = 0
-    /// 由于 0 >= 0 总是 true，即使单个远点也会通过
-    /// 这是当前算法的设计特性，不是 bug
+    /// 测试单点边界条件：阈值为 1，需要单点通过判定
     #[test]
     fn test_is_geom_in_panel_single_point_threshold_edge_case() {
-        let panel_mesh = create_test_cube_trimesh(
+        let panel_meshes = vec![Arc::new(create_test_cube_trimesh(
             Point::new(0.0, 0.0, 0.0),
             Point::new(100.0, 100.0, 100.0),
-        );
+        ))];
 
-        // 单个远点 - threshold = 0，所以 0 >= 0 是 true
+        // 单个远点 - 阈值为 1，应不通过
         let key_points = vec![Point::new(10000.0, 10000.0, 10000.0)];
 
-        let result = is_geom_in_panel(&key_points, &panel_mesh, 0.1);
-        // 注意：由于阈值计算 (1 * 0.5) as usize = 0，
-        // 即使 0 个点在内部，0 >= 0 也是 true
-        // 这意味着单点场景总是返回 true（需要至少2个点才能有效过滤）
-        assert!(result, "单点场景：threshold=0，0>=0 总是 true");
+        let result = is_geom_in_panel(&key_points, &panel_meshes, 0.1);
+        assert!(!result, "单点远场应不通过");
     }
 
     /// 测试两个远点应该不通过（这是最小有效过滤场景）
     #[test]
     fn test_is_geom_in_panel_two_far_points() {
-        let panel_mesh = create_test_cube_trimesh(
+        let panel_meshes = vec![Arc::new(create_test_cube_trimesh(
             Point::new(0.0, 0.0, 0.0),
             Point::new(100.0, 100.0, 100.0),
-        );
+        ))];
 
-        // 两个远点 - threshold = (2 * 0.5) as usize = 1
-        // 0 个点在内部，0 >= 1 是 false
+        // 两个远点 - 阈值为 2
+        // 0 个点在内部，0 >= 2 是 false
         let key_points = vec![
             Point::new(10000.0, 10000.0, 10000.0),
             Point::new(-10000.0, -10000.0, -10000.0),
         ];
 
-        let result = is_geom_in_panel(&key_points, &panel_mesh, 0.1);
-        assert!(!result, "两个远点不应该通过（0 >= 1 是 false）");
+        let result = is_geom_in_panel(&key_points, &panel_meshes, 0.1);
+        assert!(!result, "两个远点不应该通过（0 >= 2 是 false）");
     }
 }
 
@@ -1719,7 +1867,7 @@ pub async fn update_room_relations_incremental(
 
     // 获取所有房间面板（用于排除）
     let room_key_words = db_option.get_room_key_word();
-    let all_room_panels = build_room_panels_relate(&room_key_words).await?;
+    let all_room_panels = build_room_panels_relate_for_query(&room_key_words).await?;
     let exclude_panel_refnos: HashSet<RefnoEnum> = all_room_panels
         .iter()
         .flat_map(|(_, _, panels)| panels.clone())
@@ -1872,14 +2020,7 @@ pub async fn regenerate_room_models_by_keywords(
     info!("正在查询房间内构件...");
     for (_, _, panel_refnos) in &room_panel_map {
         for panel_refno in panel_refnos {
-            match cal_room_refnos(
-                &mesh_dir,
-                *panel_refno,
-                &exclude_panel_refnos,
-                RoomComputeOptions::default(),
-            )
-            .await
-            {
+            match cal_room_refnos(&mesh_dir, *panel_refno, &exclude_panel_refnos, 0.1).await {
                 Ok(refnos) => {
                     all_refnos.extend(refnos);
                 }

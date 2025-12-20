@@ -113,6 +113,7 @@ cavalier_contours = { git = "https://gitee.com/happydpc/cavalier_contours", feat
 image = { version = "0.24", default-features = false, features = ["png"] }
 imageproc = "0.23"
 rusttype = "0.9"
+gltf = "1.4"
 
 # 空间索引相关依赖
 rstar = { version = "0.12", optional = true }

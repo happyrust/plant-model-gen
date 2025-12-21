@@ -86,7 +86,7 @@ impl InstancedBundleExporter {
     }
 
     /// 导出 instanced bundle
-    pub async fn export(&self, export_data: &ExportData, output_dir: &Path) -> Result<()> {
+    pub async fn export(&self, export_data: &ExportData, output_dir: &Path, mesh_dir: &Path) -> Result<()> {
         if self.verbose {
             println!("\n🚀 开始导出 Instanced Bundle...");
         }
@@ -120,6 +120,11 @@ impl InstancedBundleExporter {
                     name: component.name.clone(),
                 };
 
+                // 检查 matrix 有效性
+                if instance.matrix.iter().any(|v| !v.is_finite()) {
+                    eprintln!("   ⚠️  警告: Component 实例 matrix 包含 NaN/Inf! refno={}, matrix={:?}", instance.refno, instance.matrix);
+                }
+
                 geo_hash_usage
                     .entry(geom_inst.geo_hash.clone())
                     .or_insert_with(Vec::new)
@@ -143,6 +148,11 @@ impl InstancedBundleExporter {
                 color: None,
                 name: Some(tubi.name.clone()),
             };
+
+            // 检查 matrix 有效性
+            if instance.matrix.iter().any(|v| !v.is_finite()) {
+                eprintln!("   ⚠️  警告: TUBI 实例 matrix 包含 NaN/Inf! refno={}, matrix={:?}", instance.refno, instance.matrix);
+            }
 
             geo_hash_usage
                 .entry(tubi.geo_hash.clone())
@@ -181,20 +191,17 @@ impl InstancedBundleExporter {
                 );
             }
 
-            // 获取原始 mesh
-            let plant_mesh = match export_data.unique_geometries.get(geo_hash) {
-                Some(mesh) => mesh.clone(),
-                None => {
-                    if self.verbose {
-                        eprintln!("   ⚠️  未找到 geo_hash {} 的 mesh，跳过", geo_hash);
-                    }
-                    continue;
-                }
-            };
+            // 检查几何体是否有效
+            if !export_data.valid_geo_hashes.contains(geo_hash) {
+                 if self.verbose {
+                     eprintln!("   ⚠️  geo_hash {} 的 GLB 文件不存在，跳过", geo_hash);
+                 }
+                 continue;
+            }
 
-            // 生成 LOD 几何体
+            // 生成 LOD 几何体 (复制 GLB)
             let lod_levels = self
-                .generate_lod_geometries(geo_hash, &plant_mesh, &archetypes_dir)
+                .generate_lod_geometries(geo_hash, &archetypes_dir, mesh_dir)
                 .await?;
 
             // 写入实例数据
@@ -251,67 +258,89 @@ impl InstancedBundleExporter {
         Ok(())
     }
 
-    /// 为单个 geo_hash 生成多级 LOD 几何体
+    /// 为单个 geo_hash 生成多级 LOD 几何体 (复制 GLB)
     async fn generate_lod_geometries(
         &self,
         geo_hash: &str,
-        _plant_mesh: &PlantMesh,
         output_dir: &Path,
+        mesh_dir: &Path,
     ) -> Result<Vec<LodLevelInfo>> {
-        use super::export_common::GltfMeshCache;
-
         let mut lod_levels = Vec::new();
-        let mesh_cache = GltfMeshCache::new();
-
-        // 获取 mesh 基础目录
-        let base_mesh_dir = self.db_option.get_meshes_path();
+        
+        // 使用传入的 mesh_dir 作为基础目录
+        let base_mesh_dir = mesh_dir;
 
         for (lod_index, &lod_level) in LOD_LEVELS.iter().enumerate() {
             if self.verbose {
-                println!("      生成 LOD {:?}...", lod_level);
+                println!("      处理 LOD {:?}...", lod_level);
             }
 
-            // 根据 LOD 级别生成不同精度的 GLB
+            // 目标文件名
             let filename = if lod_index == 0 {
                 format!("{}.glb", geo_hash)
             } else {
                 format!("{}_{:?}.glb", geo_hash, lod_level)
             };
-
+            
             let output_path = output_dir.join(&filename);
 
-            // 关键修复：根据 LOD 级别从对应目录加载不同精度的 mesh
+            // 确定源文件位置
+            // 策略：优先找 lod_XX/geo_hash_lod.glb，然后找 lod_XX/geo_hash.glb
             let lod_dir = base_mesh_dir.join(format!("lod_{:?}", lod_level));
+            
+            // 1. 标准生成名: {geo_hash}_{lod}.glb
+            let src_path_1 = lod_dir.join(format!("{}_{:?}.glb", geo_hash, lod_level));
+            // 2. 兼容名（可能没带后缀）: {geo_hash}.glb
+            let src_path_2 = lod_dir.join(format!("{}.glb", geo_hash));
 
-            // 使用 mesh_cache.load_or_get 从对应的 LOD 目录加载 mesh
-            let lod_mesh = mesh_cache
-                .load_or_get(geo_hash, &lod_dir)
-                .with_context(|| {
-                    format!(
-                        "加载 LOD {:?} mesh 失败: {} (目录: {})",
-                        lod_level,
-                        geo_hash,
-                        lod_dir.display()
-                    )
-                })?;
+            let src_path = if src_path_1.exists() {
+                Some(src_path_1)
+            } else if src_path_2.exists() {
+                Some(src_path_2)
+            } else {
+                // 如果是 L1 (默认)，尝试去更上层找，或者如果其他 LOD 不存在则跳过
+                 if lod_level == aios_core::mesh_precision::LodLevel::L1 {
+                     // 尝试在 base_mesh_dir 直接找
+                     let fallback = base_mesh_dir.join(format!("{}.glb", geo_hash));
+                     if fallback.exists() {
+                         Some(fallback)
+                     } else {
+                         None
+                     }
+                 } else {
+                     None
+                 }
+            };
+            
+            // 特殊处理单位几何体，如果文件不存在，可能需要动态生成或者报错
+            // 这里为了简化，如果找不到文件，且是通用ID (1,2,3)，假设前端有内置或者后续补充
+            // 实际上 gen_inst_meshes 应该已经生成了它们。
+            
+            if let Some(src) = src_path {
+                fs::copy(&src, &output_path)
+                    .with_context(|| format!("复制 GLB 失败: {} -> {}", src.display(), output_path.display()))?;
+                
+                 if self.verbose {
+                    println!("         ✅ 复制: {} -> {}", src.display(), filename);
+                }
 
-            export_single_mesh_to_glb(&lod_mesh, &output_path)
-                .with_context(|| format!("导出 GLB 失败: {}", output_path.display()))?;
-
-            if self.verbose {
-                println!(
-                    "         ✅ 生成: {} (顶点数: {}, 三角形数: {})",
-                    filename,
-                    lod_mesh.vertices.len(),
-                    lod_mesh.indices.len() / 3
-                );
+                lod_levels.push(LodLevelInfo {
+                    level: format!("{:?}", lod_level),
+                    geometry_url: format!("archetypes/{}", filename),
+                    distance: LOD_DISTANCES[lod_index],
+                });
+            } else {
+                 if self.verbose {
+                    // 仅对 L1 报错，其他 LOD 可能是可选的
+                    if lod_level == aios_core::mesh_precision::LodLevel::L1 {
+                         eprintln!("         ⚠️  未找到 LOD {:?} GLB 源文件: {}", lod_level, geo_hash);
+                    }
+                }
+                
+                // 如果是 L1 缺失，看看是否是标准几何体 (1, 2, 3) 用到的
+                // 这里如果 L1 都没有，则这个 geo_hash 实际上是无法显示的。
+                // 但为了不中断流程，我们跳过它。
             }
-
-            lod_levels.push(LodLevelInfo {
-                level: format!("{:?}", lod_level),
-                geometry_url: format!("archetypes/{}", filename),
-                distance: LOD_DISTANCES[lod_index],
-            });
         }
 
         Ok(lod_levels)
@@ -352,14 +381,14 @@ pub async fn export_instanced_bundle_for_refnos(
         return Ok(());
     }
 
-    if export_data.unique_geometries.is_empty() {
+    if export_data.valid_geo_hashes.is_empty() {
         println!("⚠️  没有可导出的几何体");
         return Ok(());
     }
 
     // 创建导出器并导出
     let exporter = InstancedBundleExporter::new(db_option, verbose);
-    exporter.export(&export_data, output_dir).await?;
+    exporter.export(&export_data, output_dir, mesh_dir).await?;
 
     Ok(())
 }

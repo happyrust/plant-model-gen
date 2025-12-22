@@ -368,10 +368,16 @@ async fn search_nodes(
             SELECT refno, name, noun, owner
             FROM pe
             WHERE refno != NONE
-              AND string::contains(
+              AND (
+                string::contains(
                     string::lowercase(name ?? ''),
                     string::lowercase($keyword)
-                  )
+                )
+                OR string::contains(
+                    string::lowercase(type::string(id)),
+                    string::lowercase($keyword)
+                )
+              )
             LIMIT $limit
         "#;
 

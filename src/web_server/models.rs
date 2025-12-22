@@ -1354,6 +1354,45 @@ pub struct RefnoModelGenerationResponse {
     pub refno_count: usize,
 }
 
+// ===== 按需显示模型（不创建任务） =====
+
+/// 按需显示模型请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShowByRefnoRequest {
+    /// 数据库编号（可选，后端会从 SPdmsElement 自动查询）
+    #[serde(default)]
+    pub db_num: Option<u32>,
+    /// Refno 列表 (字符串格式，支持 "123" 或 "1/456" 等)
+    pub refnos: Vec<String>,
+    /// 是否生成网格 (可选，默认为 true)
+    #[serde(default = "default_true")]
+    pub gen_mesh: bool,
+    /// 是否生成模型 (可选，默认为 true)
+    #[serde(default = "default_true")]
+    pub gen_model: bool,
+    /// 是否强制重新生成（删除旧数据重新生成，类似 CLI 的 --regen-model）
+    #[serde(default)]
+    pub regen_model: bool,
+}
+
+/// 按需显示模型响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShowByRefnoResponse {
+    /// 是否成功
+    pub success: bool,
+    /// Bundle URL (相对路径，如 "/files/output/temp/<uuid>/")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bundle_url: Option<String>,
+    /// 提示信息
+    pub message: String,
+    /// 元数据
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    /// Parquet 文件列表（增量模式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parquet_files: Option<Vec<String>>,
+}
+
 // ===== 房间模型重新生成 =====
 
 /// 房间模型重新生成请求

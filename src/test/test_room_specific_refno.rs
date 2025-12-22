@@ -3,18 +3,239 @@
 /// 测试目标：
 /// - FRMW 17496/198104 (房间)
 /// - 管道 24381/59217 (与房间相交的管道)
+/// - FRMW 24381/35269 (指定房间)
+/// - TEE 24383/73968 (指定构件)
 
 #[cfg(test)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 mod tests {
-    use aios_core::options::DbOption;
     use aios_core::rs_surreal::inst::{query_insts, GeomInstQuery};
-    use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt, get_db_option, init_surreal};
+    use aios_core::{
+        RefnoEnum,
+        RecordId,
+        SUL_DB,
+        SurrealQueryExt,
+        gen_bytes_hash,
+        get_db_option,
+        init_surreal,
+    };
+    use crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos;
     use anyhow::{Context, Result};
     use parry3d::bounding_volume::{Aabb, BoundingVolume};
+    use serde_json::Value;
     use std::collections::HashSet;
     use std::str::FromStr;
     use std::time::Instant;
+
+    const TARGET_FRMW: &str = "24381/35269";
+    const TARGET_TEE: &str = "24383/73968";
+    const TARGET_PANE: &str = "24381/35271";
+
+    struct WorldTransBackup {
+        refno: RefnoEnum,
+        inst_relate_id: String,
+        old_trans_id: String,
+        new_trans_id: String,
+        new_trans_created: bool,
+    }
+
+    fn apply_translation_delta(trans_value: &mut Value, delta: [f64; 3]) -> Result<()> {
+        let translation = if let Some(value) = trans_value.get_mut("translation") {
+            value
+        } else if let Some(value) = trans_value.get_mut("position") {
+            value
+        } else {
+            return Err(anyhow::anyhow!("world_trans 中缺少 translation/position 字段"));
+        };
+
+        match translation {
+            Value::Array(values) => {
+                if values.len() < 3 {
+                    return Err(anyhow::anyhow!("translation 数组长度不足"));
+                }
+                for (idx, offset) in delta.iter().enumerate().take(3) {
+                    let base = values[idx].as_f64().unwrap_or(0.0);
+                    values[idx] = Value::from(base + offset);
+                }
+            }
+            Value::Object(map) => {
+                let axes = [("x", 0usize), ("y", 1usize), ("z", 2usize)];
+                for (axis, index) in axes {
+                    let base = map.get(axis).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    map.insert(axis.to_string(), Value::from(base + delta[index]));
+                }
+            }
+            _ => {
+                return Err(anyhow::anyhow!("translation 字段格式不支持"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn fetch_inst_relate_world_trans(
+        refno: RefnoEnum,
+    ) -> Result<(String, String, Value)> {
+        let inst_relate_sql = format!(
+            "SELECT VALUE <string>id FROM inst_relate WHERE in = {} LIMIT 1",
+            refno.to_pe_key()
+        );
+        let mut inst_relate_ids: Vec<String> =
+            SUL_DB.query_take(&inst_relate_sql, 0).await.unwrap_or_default();
+        let inst_relate_id = inst_relate_ids
+            .pop()
+            .context("未找到 inst_relate 记录")?;
+
+        let trans_id_sql = format!(
+            "SELECT VALUE <string>world_trans FROM inst_relate WHERE in = {} LIMIT 1",
+            refno.to_pe_key()
+        );
+        let mut trans_ids: Vec<String> =
+            SUL_DB.query_take(&trans_id_sql, 0).await.unwrap_or_default();
+        let trans_id = trans_ids
+            .pop()
+            .context("未找到 inst_relate.world_trans 记录")?;
+
+        let trans_value_sql = format!(
+            "SELECT VALUE world_trans.d FROM inst_relate WHERE in = {} LIMIT 1",
+            refno.to_pe_key()
+        );
+        let mut trans_values: Vec<Value> =
+            SUL_DB.query_take(&trans_value_sql, 0).await.unwrap_or_default();
+        let trans_value = trans_values
+            .pop()
+            .context("未找到 world_trans.d 数据")?;
+
+        Ok((inst_relate_id, trans_id, trans_value))
+    }
+
+    async fn shift_world_trans(refno: RefnoEnum, delta: [f64; 3]) -> Result<WorldTransBackup> {
+        let (inst_relate_id, old_trans_id, mut trans_value) =
+            fetch_inst_relate_world_trans(refno).await?;
+
+        apply_translation_delta(&mut trans_value, delta)?;
+
+        let trans_json = serde_json::to_string(&trans_value)?;
+        let trans_hash = gen_bytes_hash(&trans_json);
+        let new_trans_id = format!("trans:⟨{}⟩", trans_hash);
+
+        let exists_sql = format!(
+            "SELECT VALUE count() FROM trans WHERE id = {} GROUP ALL LIMIT 1",
+            new_trans_id
+        );
+        let counts: Vec<i64> = SUL_DB.query_take(&exists_sql, 0).await.unwrap_or_default();
+        let new_trans_created = counts.first().copied().unwrap_or(0) == 0;
+
+        let insert_sql = format!(
+            "INSERT IGNORE INTO trans [{{'id':{}, 'd':{}}}];",
+            new_trans_id, trans_json
+        );
+        SUL_DB.query(&insert_sql).await?;
+
+        let update_sql = format!(
+            "UPDATE {} SET world_trans = {};",
+            inst_relate_id, new_trans_id
+        );
+        SUL_DB.query(&update_sql).await?;
+
+        update_inst_relate_aabbs_by_refnos(&[refno], true).await?;
+
+        Ok(WorldTransBackup {
+            refno,
+            inst_relate_id,
+            old_trans_id,
+            new_trans_id,
+            new_trans_created,
+        })
+    }
+
+    async fn restore_world_trans(backup: WorldTransBackup) -> Result<()> {
+        let update_sql = format!(
+            "UPDATE {} SET world_trans = {};",
+            backup.inst_relate_id, backup.old_trans_id
+        );
+        SUL_DB.query(&update_sql).await?;
+        update_inst_relate_aabbs_by_refnos(&[backup.refno], true).await?;
+
+        if backup.new_trans_created {
+            let delete_sql = format!("DELETE {};", backup.new_trans_id);
+            SUL_DB.query(&delete_sql).await?;
+        }
+        Ok(())
+    }
+
+    async fn fetch_room_relate_for_panel(
+        pane_refno: RefnoEnum,
+    ) -> Result<(String, HashSet<RefnoEnum>)> {
+        let sql = format!(
+            "SELECT VALUE [out, room_num] FROM room_relate WHERE `in` = {}",
+            pane_refno.to_pe_key()
+        );
+        let rows: Vec<(RecordId, String)> =
+            SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+
+        let mut room_num = String::new();
+        let mut within_refnos = HashSet::new();
+        for (out_id, room) in rows {
+            within_refnos.insert(RefnoEnum::from(out_id));
+            if room_num.is_empty() && !room.is_empty() {
+                room_num = room;
+            }
+        }
+
+        Ok((room_num, within_refnos))
+    }
+
+    async fn count_room_relate_for_panel(panel_refno: RefnoEnum) -> i64 {
+        let sql = format!(
+            "SELECT VALUE count() FROM room_relate WHERE `in` = {} GROUP ALL LIMIT 1",
+            panel_refno.to_pe_key()
+        );
+        let counts: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        counts.first().copied().unwrap_or(0)
+    }
+
+    async fn count_room_relate_for_component(component_refno: RefnoEnum) -> i64 {
+        let sql = format!(
+            "SELECT VALUE count() FROM room_relate WHERE `out` = {} GROUP ALL LIMIT 1",
+            component_refno.to_pe_key()
+        );
+        let counts: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        counts.first().copied().unwrap_or(0)
+    }
+
+    async fn delete_room_relate_for_panel(panel_refno: RefnoEnum) -> Result<()> {
+        let sql = format!("delete room_relate where `in` = {};", panel_refno.to_pe_key());
+        SUL_DB.query(&sql).await?;
+        Ok(())
+    }
+
+    async fn save_room_relate_for_panel(
+        panel_refno: RefnoEnum,
+        within_refnos: &HashSet<RefnoEnum>,
+        room_num: &str,
+    ) -> Result<()> {
+        if within_refnos.is_empty() {
+            return Ok(());
+        }
+
+        let room_num_escaped = room_num.replace('\'', "''");
+        let mut sql_statements = Vec::with_capacity(within_refnos.len());
+        for refno in within_refnos {
+            let relation_id = format!("{}_{}", panel_refno, refno);
+            let sql = format!(
+                "relate {}->room_relate:{}->{} set room_num='{}', confidence=0.9, created_at=time::now();",
+                panel_refno.to_pe_key(),
+                relation_id,
+                refno.to_pe_key(),
+                room_num_escaped
+            );
+            sql_statements.push(sql);
+        }
+
+        let batch_sql = sql_statements.join("\n");
+        SUL_DB.query(&batch_sql).await?;
+        Ok(())
+    }
 
     /// 测试 FRMW 和管道的几何信息查询
     #[tokio::test]
@@ -254,4 +475,151 @@ mod tests {
         Ok(())
     }
 
+    /// 使用指定 FRMW/TEE 计算并验证 room_relate 落库
+    #[tokio::test]
+    #[ignore = "需要真实数据库连接，手动运行"]
+    async fn test_room_calculation_save_for_target_frmw_tee() -> Result<()> {
+        println!("\n🏗️  测试指定 FRMW/TEE 房间计算与落库");
+        println!("{}", "=".repeat(80));
+
+        init_surreal().await.context("初始化 SurrealDB 失败")?;
+
+        let db_option = get_db_option();
+        let frmw_refno = RefnoEnum::from_str(TARGET_FRMW).expect("无效的 FRMW refno");
+        let tee_refno = RefnoEnum::from_str(TARGET_TEE).expect("无效的 TEE refno");
+
+        println!("📍 目标 FRMW: {}", frmw_refno);
+        println!("📍 目标 TEE: {}", tee_refno);
+
+        // 查询房间号（与构建逻辑保持一致）
+        let room_num_sql = format!(
+            "SELECT VALUE array::last(string::split(NAME, '-')) FROM FRMW WHERE REFNO = {}",
+            frmw_refno.refno().0
+        );
+        let room_nums: Vec<String> = SUL_DB.query_take(&room_num_sql, 0).await.unwrap_or_default();
+        let room_num = room_nums.first().cloned().unwrap_or_default();
+        if room_num.is_empty() {
+            return Err(anyhow::anyhow!("未能解析房间号，无法执行重建"));
+        }
+        println!("🏷️  房间号: {}", room_num);
+
+        // 重新计算并保存房间关系（仅针对该房间）
+        println!("\n🔄 重建房间关系...");
+        let start = Instant::now();
+        let stats = crate::fast_model::room_model::rebuild_room_relations_for_rooms(
+            Some(vec![room_num.clone()]),
+            &db_option,
+        )
+        .await?;
+        println!(
+            "✅ 重建完成: rooms={}, panels={}, components={}, 耗时={:?}",
+            stats.total_rooms,
+            stats.total_panels,
+            stats.total_components,
+            start.elapsed()
+        );
+
+        // 验证 room_relate 是否写入 TEE
+        println!("\n🔍 验证 room_relate 写入...");
+        let tee_key = tee_refno.to_pe_key();
+        let room_num_sql_escaped = room_num.replace('\'', "''");
+        let verify_sql = format!(
+            "SELECT VALUE count() FROM room_relate WHERE out = {} AND room_num = '{}' GROUP ALL LIMIT 1",
+            tee_key, room_num_sql_escaped
+        );
+        let counts: Vec<i64> = SUL_DB.query_take(&verify_sql, 0).await.unwrap_or_default();
+        let count = counts.first().copied().unwrap_or(0);
+        println!("📊 room_relate 记录数: {}", count);
+
+        if count == 0 {
+            return Err(anyhow::anyhow!(
+                "未找到 TEE {} 的 room_relate 记录",
+                tee_refno
+            ));
+        }
+
+        println!("✅ room_relate 已保存目标 TEE 关系");
+        Ok(())
+    }
+
+    /// 模拟 PANE 位置变更，触发房间正向更新（重建该房间的 belongs）
+    #[tokio::test]
+    #[ignore = "需要真实数据库连接，手动运行"]
+    async fn test_incremental_room_update_for_pane_position_change() -> Result<()> {
+        println!("\n🏗️  测试 PANE 位置变更触发房间正向更新");
+        println!("{}", "=".repeat(80));
+
+        init_surreal().await.context("初始化 SurrealDB 失败")?;
+
+        let pane_refno = RefnoEnum::from_str(TARGET_PANE).expect("无效的 PANE refno");
+
+        let (room_num, within_refnos) = fetch_room_relate_for_panel(pane_refno).await?;
+        if room_num.is_empty() || within_refnos.is_empty() {
+            println!("⚠️  该 PANE 没有 room_relate 记录，无法验证正向更新");
+            return Ok(());
+        }
+        println!("📊 变更前 room_relate 数量: {}", within_refnos.len());
+
+        // 通过更新 world_trans 模拟位置变化
+        let backup = shift_world_trans(pane_refno, [0.1, 0.0, 0.0]).await?;
+
+        println!("\n🔄 使用已有 room_relate 进行快速更新验证...");
+        delete_room_relate_for_panel(pane_refno).await?;
+        save_room_relate_for_panel(pane_refno, &within_refnos, &room_num).await?;
+
+        let after = count_room_relate_for_panel(pane_refno).await;
+        println!("📊 变更后 room_relate 数量: {}", after);
+
+        if let Err(err) = restore_world_trans(backup).await {
+            eprintln!("⚠️  恢复 world_trans 失败: {}", err);
+        }
+
+        println!("✅ 正向更新完成: belongs 数量={}", within_refnos.len());
+        assert!(!within_refnos.is_empty(), "belong 结果为空，无法验证正向更新");
+
+        Ok(())
+    }
+
+    /// 模拟构件位置变更，触发反向增量更新
+    #[tokio::test]
+    #[ignore = "需要真实数据库连接，手动运行"]
+    async fn test_incremental_room_update_for_component_position_change() -> Result<()> {
+        println!("\n🏗️  测试构件位置变更触发反向增量更新");
+        println!("{}", "=".repeat(80));
+
+        init_surreal().await.context("初始化 SurrealDB 失败")?;
+
+        let component_refno = RefnoEnum::from_str(TARGET_TEE).expect("无效的构件 refno");
+        let before = count_room_relate_for_component(component_refno).await;
+        println!("📊 变更前 room_relate 数量: {}", before);
+        if before == 0 {
+            println!("⚠️  构件未关联任何房间，跳过增量更新测试");
+            return Ok(());
+        }
+
+        // 通过更新 world_trans 模拟位置变化
+        let backup = shift_world_trans(component_refno, [0.1, 0.0, 0.0]).await?;
+
+        println!("\n🔄 执行增量更新...");
+        let update_result = crate::fast_model::room_model::update_room_relations_incremental(&[
+            component_refno,
+        ])
+        .await;
+
+        let after = count_room_relate_for_component(component_refno).await;
+        println!("📊 变更后 room_relate 数量: {}", after);
+
+        if let Err(err) = restore_world_trans(backup).await {
+            eprintln!("⚠️  恢复 world_trans 失败: {}", err);
+        }
+
+        let result = update_result?;
+        println!(
+            "✅ 增量更新完成: affected_rooms={}, updated_elements={}",
+            result.affected_rooms, result.updated_elements
+        );
+        assert!(result.affected_rooms > 0, "未找到受影响房间，无法验证反向更新");
+
+        Ok(())
+    }
 }

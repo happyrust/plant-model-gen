@@ -10,6 +10,7 @@ use crate::fast_model::{debug_model, debug_model_debug};
 use aios_core::consts::{CIVIL_TYPES, NGMR_OWN_TYPES};
 use aios_core::geometry::*;
 use aios_core::options::DbOption;
+use crate::options::DbOptionExt;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::parsed_data::{CateAxisParam, CateGeomsInfo, TubiInfoData};
 use aios_core::pdms_types::*;
@@ -158,7 +159,7 @@ pub struct GenOutcome {
 /// 动态修改tubi，还是要单独出来, 还是直接去修改整个bran？
 /// 先暂时整个重新生成？
 pub async fn gen_cata_geos(
-    db_option: Arc<DbOption>,
+    db_option: Arc<DbOptionExt>,
     target_cata_map: Arc<DashMap<String, CataHashRefnoKV>>,
     branch_map: Arc<DashMap<RefnoEnum, Vec<SPdmsElement>>>,
     sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
@@ -180,7 +181,7 @@ pub async fn gen_cata_geos(
 
 /// 仅处理普通 CATE 元件库几何体（不处理 BRAN/HANG tubing）
 pub async fn gen_cata_instances(
-    db_option: Arc<DbOption>,
+    db_option: Arc<DbOptionExt>,
     target_cata_map: Arc<DashMap<String, CataHashRefnoKV>>,
     sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
     sender: flume::Sender<ShapeInstancesData>,
@@ -203,7 +204,7 @@ pub async fn gen_cata_instances(
 
 /// 仅处理 BRAN/HANG tubing（不生成普通 CATE 几何体）
 pub async fn gen_branch_tubi(
-    db_option: Arc<DbOption>,
+    db_option: Arc<DbOptionExt>,
     branch_map: Arc<DashMap<RefnoEnum, Vec<SPdmsElement>>>,
     sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
     sender: flume::Sender<ShapeInstancesData>,
@@ -226,7 +227,7 @@ pub async fn gen_branch_tubi(
 
 #[instrument(skip(db_option, target_cata_map, branch_map, sjus_map_arc, sender))]
 async fn gen_cata_geos_inner(
-    db_option: Arc<DbOption>,
+    db_option: Arc<DbOptionExt>,
     target_cata_map: Arc<DashMap<String, CataHashRefnoKV>>,
     branch_map: Arc<DashMap<RefnoEnum, Vec<SPdmsElement>>>,
     sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
@@ -242,7 +243,7 @@ async fn gen_cata_geos_inner(
     let total_t = Instant::now();
     // let mut handles = FuturesUnordered::new();
     let mut tubi_relates = vec![];
-    let gen_mesh = db_option.gen_mesh;
+    let gen_mesh = db_option.inner.gen_mesh;
     let is_bran = branch_map.len() > 0;
     
     // tubi_info 收集容器: 组合键 "{cata_hash}_{arrive}_{leave}" -> TubiInfoData
@@ -1832,7 +1833,7 @@ pub async fn query_ngmr_owner(
 /// - `sjus_map_arc`: SJUS 调整 map
 /// - `sender`: 几何数据发送通道
 pub async fn gen_tubi_from_db(
-    db_option: Arc<DbOption>,
+    db_option: Arc<DbOptionExt>,
     branch_refnos: &[RefnoEnum],
     sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
     sender: flume::Sender<ShapeInstancesData>,

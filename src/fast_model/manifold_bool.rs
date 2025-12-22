@@ -95,14 +95,34 @@ fn mesh_base_dir() -> PathBuf {
 fn load_mesh(id: &str) -> anyhow::Result<PlantMesh> {
     let base_dir = mesh_base_dir();
     let mesh_path = build_lod_mesh_path(&base_dir, id);
-    let mesh = PlantMesh::des_mesh_file(&mesh_path)?;
-    debug_model_debug!(
-        "[布尔] 加载 mesh: {} (vertices={}, triangles={})",
-        mesh_path.display(),
-        mesh.vertices.len(),
-        mesh.indices.len() / 3
-    );
-    Ok(mesh)
+    
+    // 优先尝试 .mesh (兼容旧数据)
+    if mesh_path.exists() {
+         let mesh = PlantMesh::des_mesh_file(&mesh_path)?;
+         debug_model_debug!(
+            "[布尔] 加载 mesh (from .mesh): {} (vertices={}, triangles={})",
+            mesh_path.display(),
+            mesh.vertices.len(),
+            mesh.indices.len() / 3
+        );
+        return Ok(mesh);
+    }
+    
+    // 尝试 .glb
+    let glb_path = mesh_path.with_extension("glb");
+    if glb_path.exists() {
+        use crate::fast_model::export_model::import_glb::import_glb_to_mesh;
+        let mesh = import_glb_to_mesh(&glb_path)?;
+         debug_model_debug!(
+            "[布尔] 加载 mesh (from .glb): {} (vertices={}, triangles={})",
+            glb_path.display(),
+            mesh.vertices.len(),
+            mesh.indices.len() / 3
+        );
+        return Ok(mesh);
+    }
+
+    anyhow::bail!("Mesh file not found: {:?}", mesh_path);
 }
 
 /// 从文件加载流形数据
@@ -119,15 +139,7 @@ fn load_mesh(id: &str) -> anyhow::Result<PlantMesh> {
 /// 返回 `anyhow::Result<ManifoldRust>` 表示加载是否成功以及加载的流形数据
 #[inline]
 fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<ManifoldRust> {
-    let base_dir = mesh_base_dir();
-    let mesh_path = build_lod_mesh_path(&base_dir, id);
-    let mesh = PlantMesh::des_mesh_file(&mesh_path)?;
-    debug_model_debug!(
-        "[布尔] 加载 manifold 输入 mesh: {} (vertices={}, triangles={})",
-        mesh_path.display(),
-        mesh.vertices.len(),
-        mesh.indices.len() / 3
-    );
+    let mesh = load_mesh(id)?;
     let manifold = ManifoldRust::convert_to_manifold(mesh, mat, more_precision);
     Ok(manifold)
 }
@@ -189,12 +201,18 @@ async fn update_booled_result(
     Ok(())
 }
 
-fn boolean_mesh_path(mesh_id: &str) -> PathBuf {
-    build_lod_mesh_path(&mesh_base_dir(), mesh_id)
+// fn boolean_mesh_path(mesh_id: &str) -> PathBuf {
+//     build_lod_mesh_path(&mesh_base_dir(), mesh_id)
+// }
+
+fn boolean_glb_path(mesh_id: &str) -> PathBuf {
+    let mut path = build_lod_mesh_path(&mesh_base_dir(), mesh_id);
+    path.set_extension("glb");
+    path
 }
 
 fn boolean_obj_path(mesh_id: &str) -> PathBuf {
-    let mut path = boolean_mesh_path(mesh_id);
+    let mut path = build_lod_mesh_path(&mesh_base_dir(), mesh_id);
     path.set_extension("obj");
     path
 }
@@ -204,6 +222,8 @@ pub async fn apply_cata_neg_boolean_manifold(
     refnos: &[RefnoEnum],
     replace_exist: bool,
 ) -> anyhow::Result<()> {
+    use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
+
     if refnos.is_empty() {
         return Ok(());
     }
@@ -262,14 +282,16 @@ pub async fn apply_cata_neg_boolean_manifold(
             let new_id = g.refno.hash_with_another_refno(bg[0]);
             let final_manifold = pos_manifold.batch_boolean_subtract(&neg_manifolds);
             let mesh = PlantMesh::from(&final_manifold);
-            let target_path = boolean_mesh_path(&new_id.to_string());
+            // let target_path = boolean_mesh_path(&new_id.to_string());
+            let target_path = boolean_glb_path(&new_id.to_string());
             ensure_parent_dir(&target_path)?;
 
-            if mesh.ser_to_file(&target_path).is_ok() {
-                let obj_path = boolean_obj_path(&new_id.to_string());
-                if let Err(e) = mesh.export_obj(false, obj_path.to_string_lossy().as_ref()) {
-                    eprintln!("导出 OBJ 失败: refno={} err={}", g.refno, e);
-                }
+            // if mesh.ser_to_file(&target_path).is_ok() {
+            if export_single_mesh_to_glb(&mesh, &target_path).is_ok() {
+                // let obj_path = boolean_obj_path(&new_id.to_string());
+                // if let Err(e) = mesh.export_obj(false, obj_path.to_string_lossy().as_ref()) {
+                //     eprintln!("导出 OBJ 失败: refno={} err={}", g.refno, e);
+                // }
 
                 update_sql.push_str(&format!(
                     "create inst_geo:⟨{}⟩ set meshed = true, aabb = {};",
@@ -450,10 +472,12 @@ async fn apply_boolean_for_query(
     } else {
         format!("{}_{}", query.refno, query.sesno)
     };
-    let target_path = boolean_mesh_path(&mesh_id);
+    let target_path = boolean_glb_path(&mesh_id);
     ensure_parent_dir(&target_path)?;
 
-    if mesh.ser_to_file(&target_path).is_ok() {
+    use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
+    // if mesh.ser_to_file(&target_path).is_ok() {
+    if export_single_mesh_to_glb(&mesh, &target_path).is_ok() {
         update_booled_result(&inst_relate_id, &mesh_id, &mesh).await?;
         debug_model!("布尔运算完成: refno={} mesh={}", query.refno, mesh_id);
         return Ok(());

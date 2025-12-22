@@ -2,7 +2,7 @@
 //!
 //! 从 gen_model_old.rs 迁移的网格处理相关函数
 
-use aios_core::options::DbOption;
+use crate::options::DbOptionExt;
 use anyhow::Result;
 use std::time::Instant;
 
@@ -31,14 +31,14 @@ use crate::fast_model::query_provider::query_by_type;
 /// # 示例
 ///
 /// ```ignore
-/// use aios_core::options::DbOption;
+/// use crate::options::DbOptionExt;
 /// use gen_model::process_meshes_by_dbnos;
 ///
 /// let dbnos = vec![1, 2, 3];
-/// let db_option = DbOption::default();
+/// let db_option = DbOptionExt::default();
 /// process_meshes_by_dbnos(&dbnos, &db_option).await?;
 /// ```
-pub async fn process_meshes_by_dbnos(dbnos: &[u32], db_option: &DbOption) -> Result<()> {
+pub async fn process_meshes_by_dbnos(dbnos: &[u32], db_option: &DbOptionExt) -> Result<()> {
     let mut _time = Instant::now();
     let _include_history = db_option.is_gen_history_model();
 

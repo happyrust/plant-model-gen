@@ -507,7 +507,7 @@ pub async fn export_prepack_lod_for_refnos(
         &geo_index_map,
         &geo_nouns,
         &generated_assets,
-        &export_data.unique_geometries,
+        &std::collections::HashMap::new(),
         &unit_converter,
     );
 
@@ -695,7 +695,7 @@ fn resolve_lod_dir(base: &Path, level_tag: &str) -> Option<PathBuf> {
 
 fn build_geo_index_map(export_data: &ExportData) -> (Vec<String>, HashMap<String, usize>) {
     // 只包含成功加载的几何体，排除加载失败的 TUBI
-    let mut geo_hashes: Vec<String> = export_data.unique_geometries.keys().cloned().collect();
+    let mut geo_hashes: Vec<String> = export_data.valid_geo_hashes.iter().cloned().collect();
     geo_hashes.sort();
     let mut index_map = HashMap::new();
     for (idx, hash) in geo_hashes.iter().enumerate() {

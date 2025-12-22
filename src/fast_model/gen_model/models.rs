@@ -1,6 +1,7 @@
 use crate::fast_model::mesh_generate::{process_meshes_update_db_deep, process_meshes_bran};
 use aios_core::geometry::ShapeInstancesData;
-use aios_core::{RefnoEnum, options::DbOption};
+use crate::options::DbOptionExt;
+use aios_core::RefnoEnum;
 use futures::stream::FuturesUnordered;
 use std::sync::Arc;
 
@@ -25,7 +26,7 @@ pub struct DbModelInstRefnos {
 }
 
 impl DbModelInstRefnos {
-    pub async fn execute_gen_inst_meshes(&self, db_option_arc: Option<Arc<DbOption>>) {
+    pub async fn execute_gen_inst_meshes(&self, db_option_arc: Option<Arc<DbOptionExt>>) {
         if let Some(db_option) = db_option_arc {
             // BRAN 单独处理，不需要 deep 遍历和布尔运算
             if !self.bran_hanger_refnos.is_empty() {

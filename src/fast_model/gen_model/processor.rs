@@ -150,10 +150,15 @@ impl NounProcessor {
 mod tests {
     use super::*;
     use aios_core::options::DbOption;
+    use crate::options::DbOptionExt;
 
     #[tokio::test]
     async fn test_empty_nouns() {
-        let ctx = NounProcessContext::new(Arc::new(DbOption::default()), 100, 4);
+        let ctx = NounProcessContext::new(
+            Arc::new(DbOptionExt::from(DbOption::default())),
+            100,
+            4,
+        );
         let processor = NounProcessor::new(ctx, "test", None);
         let sink = Arc::new(RwLock::new(HashSet::new()));
 

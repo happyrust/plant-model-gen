@@ -6,6 +6,7 @@ use crate::{consts::*, e3d_dbg};
 use aios_core::RefU64;
 use aios_core::geometry::*;
 use aios_core::options::DbOption;
+use crate::options::DbOptionExt;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::pdms_types::*;
 use aios_core::prim_geo::polyhedron::Polygon;
@@ -23,12 +24,12 @@ use tokio::sync::{Mutex, RwLock};
 
 /// 生成基本体的几何数据
 pub async fn gen_prim_geos(
-    db_option: Arc<DbOption>,
+    db_option: Arc<DbOptionExt>,
     prim_refnos: &[RefnoEnum],
     sender: flume::Sender<ShapeInstancesData>,
 ) -> anyhow::Result<bool> {
     let t = Instant::now();
-    let batch_size = db_option.gen_model_batch_size;
+    let batch_size = db_option.inner.gen_model_batch_size;
     let prim_cnt = prim_refnos.len();
 
     e3d_dbg!("[gen_prim_geos] 开始生成基本体几何数据");

@@ -77,7 +77,7 @@ use aios_core::{DBType, init_surreal, query_mdb_db_nums};
 #[cfg(feature = "gui")]
 use aios_database::gui;
 #[cfg(not(feature = "gui"))]
-use aios_database::options::get_db_option_ext_from_path;
+use aios_database::options::{get_db_option_ext_from_path, MeshFormat};
 #[cfg(not(feature = "gui"))]
 use aios_database::run_app;
 #[cfg(not(feature = "gui"))]
@@ -347,6 +347,15 @@ async fn main() -> anyhow::Result<()> {
                 .help("Excel file for name mapping (三维模型节点 -> PID对象)")
                 .value_name("EXCEL_PATH"),
         )
+        .arg(
+            Arg::new("mesh-type")
+                .long("mesh-type")
+                .alias("mesh_type")
+                .help("Mesh format to generate (pdmsmesh, glb, obj). Multiple values allowed.")
+                .value_name("TYPE")
+                .value_delimiter(',')
+                .num_args(1..),
+        )
         .get_matches();
 
     // 获取配置文件路径
@@ -378,6 +387,22 @@ async fn main() -> anyhow::Result<()> {
         if let Some(lod) = parse_lod_level(lod_str) {
             println!("🔧 CLI 覆盖 default_lod: {:?} -> {:?}", db_option_ext.inner.mesh_precision.default_lod, lod);
             db_option_ext.inner.mesh_precision.default_lod = lod;
+        }
+    }
+
+    if let Some(mesh_types) = matches.get_many::<String>("mesh-type") {
+        let mut formats = Vec::new();
+        for mt in mesh_types {
+            match mt.to_lowercase().as_str() {
+                "pdmsmesh" | "mesh" => formats.push(MeshFormat::PdmsMesh),
+                "glb" => formats.push(MeshFormat::Glb),
+                "obj" => formats.push(MeshFormat::Obj),
+                _ => println!("⚠️ 忽略未知的网格格式: {}", mt),
+            }
+        }
+        if !formats.is_empty() {
+            println!("🔧 CLI 覆盖 mesh_formats: {:?} -> {:?}", db_option_ext.mesh_formats, formats);
+            db_option_ext.mesh_formats = formats;
         }
     }
 

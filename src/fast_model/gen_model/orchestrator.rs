@@ -6,9 +6,12 @@
 //! - 增量更新、手动 refno、调试模式的处理
 //! - 空间索引和截图捕获的触发
 
-use anyhow::Result;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+
+use crate::fast_model::export_model::export_prepack_lod::export_prepack_lod_for_refnos;
+use crate::fast_model::unit_converter::LengthUnit;
 
 use aios_core::RefnoEnum;
 
@@ -17,11 +20,12 @@ use crate::data_interface::sesno_increment::get_changes_at_sesno;
 use crate::fast_model::capture::capture_refnos_if_enabled;
 use crate::fast_model::mesh_generate::process_meshes_update_db_deep;
 use crate::fast_model::pdms_inst::save_instance_data_optimize;
-use crate::options::DbOptionExt;
+use crate::options::{DbOptionExt, MeshFormat};
 #[cfg(feature = "sqlite-index")]
 use crate::spatial_index::SqliteSpatialIndex;
 
 use super::config::FullNounConfig;
+use super::errors::{FullNounError, Result};
 use super::full_noun_mode::gen_full_noun_geos_optimized;
 use super::models::NounCategory;
 
@@ -63,7 +67,7 @@ pub async fn gen_all_geos_data(
                 }
                 Err(e) => {
                     eprintln!("获取 sesno {} 的变更失败: {}", sesno, e);
-                    return Err(e);
+                    return Err(FullNounError::Other(e));
                 }
             }
         }
@@ -155,7 +159,7 @@ async fn process_full_noun_mode(
     });
 
     let categorized =
-        gen_full_noun_geos_optimized(Arc::new(db_option.inner.clone()), &config, sender)
+        gen_full_noun_geos_optimized(Arc::new(db_option.clone()), &config, sender)
             .await
             .map_err(|e| anyhow::anyhow!("Full Noun 生成失败: {}", e))?;
 
@@ -181,7 +185,7 @@ async fn process_full_noun_mode(
         all_refnos.extend(prims);
 
         if !all_refnos.is_empty() {
-            if let Err(e) = process_meshes_update_db_deep(&db_option.inner, &all_refnos).await {
+            if let Err(e) = process_meshes_update_db_deep(db_option, &all_refnos).await {
                 eprintln!("[gen_model] 更新模型数据失败: {}", e);
             } else {
                 println!(
@@ -206,6 +210,40 @@ async fn process_full_noun_mode(
                 println!(
                     "[gen_model] Full Noun 模式布尔运算完成，用时 {} ms",
                     bool_start.elapsed().as_millis()
+                );
+            }
+        }
+
+        // 4️⃣ 生成 Web Bundle (GLB + JSON 数据包)
+        if db_option.mesh_formats.contains(&MeshFormat::Glb) {
+            let web_bundle_start = Instant::now();
+            println!("[gen_model] 开始生成 Web Bundle (GLB + JSON 数据包)...");
+
+        let mesh_dir = Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes"));
+        // 输出到与 meshes 同级的 web_bundle 目录
+        let output_dir = mesh_dir.parent().unwrap_or(mesh_dir).join("web_bundle");
+
+        if let Err(e) = export_prepack_lod_for_refnos(
+            &all_refnos,
+            &mesh_dir,
+            &output_dir,
+            Arc::new(db_option.inner.clone()),
+            true, // include_descendants
+            None, // filter_nouns
+            true, // verbose
+            None, // name_config
+            true, // export_all_lods
+            LengthUnit::Millimeter,
+            LengthUnit::Millimeter,
+        )
+        .await
+        {
+            eprintln!("[gen_model] 生成 Web Bundle 失败: {}", e);
+            } else {
+                println!(
+                    "[gen_model] Web Bundle 生成完成，输出目录: {}, 用时 {} ms",
+                    output_dir.display(),
+                    web_bundle_start.elapsed().as_millis()
                 );
             }
         }
@@ -276,7 +314,7 @@ async fn process_targeted_generation(
     let target_root_refnos = super::non_full_noun::gen_geos_data(
         None,
         manual_refnos.clone(),
-        &db_option.inner,
+        db_option,
         incr_updates.clone(),
         sender.clone(),
         target_sesno,
@@ -300,7 +338,7 @@ async fn process_targeted_generation(
             target_root_refnos.len()
         );
 
-        if let Err(e) = process_meshes_update_db_deep(&db_option.inner, &target_root_refnos).await {
+        if let Err(e) = process_meshes_update_db_deep(db_option, &target_root_refnos).await {
             eprintln!("[gen_model] 更新模型数据失败: {}", e);
         } else {
             println!(
@@ -354,7 +392,7 @@ async fn process_full_database_generation(
         dbnos.len()
     );
 
-    let db_option_arc = Arc::new(db_option.inner.clone());
+    let db_option_arc = Arc::new(db_option.clone());
     if dbnos.is_empty() {
         println!("[gen_model] 未找到需要生成的数据库，直接结束");
     }

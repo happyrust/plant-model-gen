@@ -28,7 +28,7 @@ use std::time::Duration as StdDuration;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::Semaphore;
-use tracing::info;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::fast_model::{
@@ -3168,6 +3168,127 @@ pub async fn get_system_status(
     Ok(Json(status))
 }
 
+#[derive(Deserialize)]
+pub struct GetInstancesRequest {
+    pub refnos: String, // Comma separated list of refnos
+}
+
+#[derive(Serialize)]
+pub struct ModelDataResponse {
+    pub archetypes: Vec<crate::fast_model::export_model::export_instanced_bundle::ArchetypeInfo>,
+    pub instances_data: Vec<crate::fast_model::export_model::export_instanced_bundle::InstancesData>,
+}
+
+pub async fn api_get_instances(
+    Query(req): Query<GetInstancesRequest>,
+) -> Result<Json<ModelDataResponse>, (StatusCode, String)> {
+    use crate::fast_model::export_model::export_instanced_bundle::{
+        ArchetypeInfo, InstancesData, InstanceInfo, LodLevelInfo
+    };
+    use aios_core::{RefnoEnum, RefU64, query_insts};
+    use crate::fast_model::export_model::ExportData;
+    use aios_core::mesh_precision::LodLevel;
+    
+    // Parse refnos locally
+    use std::str::FromStr;
+    let refno_strs: Vec<&str> = req.refnos.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let mut refnos = Vec::new();
+    for s in refno_strs {
+        if let Ok(r) = RefnoEnum::from_str(s) {
+            if !r.is_unset() {
+                refnos.push(r);
+            }
+        }
+    }
+
+    if refnos.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "No valid refnos provided".to_string()));
+    }
+
+    use crate::fast_model::export_model::collect_export_data;
+
+    let insts = query_insts(&refnos, false)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Query failed: {}", e)))?;
+    
+    let db_option = aios_core::get_db_option();
+    let mesh_dir = db_option.get_meshes_path();
+
+    let export_data: ExportData = collect_export_data(insts, &refnos, &mesh_dir, false, None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Collect data failed: {}", e)))?;
+
+     // Reconstruct Instances logic
+     let mut geo_hash_usage: std::collections::HashMap<String, Vec<InstanceInfo>> = std::collections::HashMap::new();
+     let mut geo_hash_noun_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+     
+     // Collect components
+     for component in &export_data.components {
+        for geom_inst in &component.geometries {
+            let instance = InstanceInfo {
+                refno: component.refno.to_string(),
+                matrix: geom_inst.local_transform.to_cols_array(),
+                color: None,
+                name: component.name.clone(),
+            };
+            geo_hash_usage.entry(geom_inst.geo_hash.clone())
+                .or_default()
+                .push(instance);
+            geo_hash_noun_map.entry(geom_inst.geo_hash.clone())
+                .or_insert_with(|| component.noun.clone());
+        }
+     }
+
+     // Collect TUBI
+     for tubi in &export_data.tubings {
+        let instance = InstanceInfo {
+            refno: tubi.refno.to_string(),
+            matrix: tubi.transform.to_cols_array(),
+            color: None,
+            name: Some(tubi.name.clone()),
+        };
+        geo_hash_usage.entry(tubi.geo_hash.clone())
+            .or_default()
+            .push(instance);
+        geo_hash_noun_map.entry(tubi.geo_hash.clone())
+            .or_insert_with(|| "TUBI".to_string());
+     }
+
+     let mut archetypes = Vec::new();
+     let mut all_instances_data = Vec::new();
+     
+     // Construct response
+     for (geo_hash, instances) in geo_hash_usage {
+        let noun = geo_hash_noun_map.get(&geo_hash).cloned().unwrap_or("UNKNOWN".to_string());
+        
+        let lod_levels = vec![
+             LodLevelInfo { level: "L1".to_string(), geometry_url: format!("{}_L1.glb", geo_hash), distance: 0.0 },
+             LodLevelInfo { level: "L2".to_string(), geometry_url: format!("{}_L2.glb", geo_hash), distance: 50.0 },
+             LodLevelInfo { level: "L3".to_string(), geometry_url: format!("{}_L3.glb", geo_hash), distance: 200.0 },
+        ];
+
+        let inst_data = InstancesData {
+            geo_hash: geo_hash.clone(),
+            instances: instances.clone(),
+        };
+        all_instances_data.push(inst_data);
+
+        archetypes.push(ArchetypeInfo {
+            id: geo_hash.clone(),
+            noun: noun,
+            material: "default".to_string(),
+            lod_levels,
+            instances_url: "".to_string(),
+            instance_count: instances.len(),
+        });
+     }
+
+     Ok(Json(ModelDataResponse {
+        archetypes,
+        instances_data: all_instances_data,
+     }))
+}
+
 /// 启动 SurrealDB 服务（根据 DbOption.toml 配置）
 pub async fn start_surreal_server(
     State(_state): State<AppState>,
@@ -4349,14 +4470,15 @@ async fn execute_real_task(state: AppState, task_id: String) {
                 task.completed_at = Some(SystemTime::now());
 
                 // 分析错误类型并提供具体的解决方案
-                let (error_code, solutions) = analyze_geometry_error(&e);
+                let anyhow_error = anyhow::Error::from(e);
+                let (error_code, solutions) = analyze_geometry_error(&anyhow_error);
 
                 let error_details = ErrorDetails {
                     error_type: "GeometryGenerationError".to_string(),
                     error_code: Some(error_code.clone()),
                     failed_step: "生成几何数据".to_string(),
-                    detailed_message: format!("几何数据生成过程中发生错误: {}", e),
-                    stack_trace: Some(format!("{:?}", e)),
+                    detailed_message: format!("几何数据生成过程中发生错误: {}", anyhow_error),
+                    stack_trace: Some(format!("{:?}", anyhow_error)),
                     suggested_solutions: solutions,
                     related_config: Some(serde_json::json!({
                         "manual_db_nums": config.manual_db_nums,
@@ -4370,9 +4492,9 @@ async fn execute_real_task(state: AppState, task_id: String) {
                 task.set_error_details(error_details);
                 task.add_log_with_details(
                     LogLevel::Error,
-                    format!("几何数据生成失败: {}", e),
+                    format!("几何数据生成失败: {}", anyhow_error),
                     Some(error_code),
-                    Some(format!("{:?}", e)),
+                    Some(format!("{:?}", anyhow_error)),
                 );
                 task_manager.task_history.push(task);
             }
@@ -7213,21 +7335,18 @@ async fn execute_refno_model_generation(
     }
 
     // 解析 refno 字符串到 RefnoEnum
+    use std::str::FromStr;
     let mut parsed_refnos = Vec::new();
     for refno_str in &config.manual_refnos {
-        match refno_str.parse::<u64>() {
-            Ok(num) => parsed_refnos.push(RefnoEnum::Refno(RefU64(num))),
+        match RefnoEnum::from_str(refno_str) {
+            Ok(r) => parsed_refnos.push(r),
             Err(_) => {
-                // 尝试解析复杂格式，如 "1/456" (dbnum/refno)
-                if refno_str.contains('/') {
-                    let parts: Vec<&str> = refno_str.split('/').collect();
-                    if parts.len() == 2 {
-                        if let Ok(num) = parts[1].parse::<u64>() {
-                            parsed_refnos.push(RefnoEnum::Refno(RefU64(num)));
-                            continue;
-                        }
-                    }
+                // 尝试手动解析纯数字 (fallback)
+                if let Ok(num) = refno_str.parse::<u64>() {
+                     parsed_refnos.push(RefnoEnum::Refno(RefU64(num)));
+                     continue;
                 }
+
                 // 解析失败，记录错误并跳过
                 let mut task_manager = state.task_manager.lock().await;
                 if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
@@ -7293,10 +7412,17 @@ async fn execute_refno_model_generation(
             }
 
             // 导出 bundle
+            let config_read = state.config_manager.read().await;
+            let mesh_path_str = config_read.current_config.meshes_path.clone()
+                .unwrap_or_else(|| "/Volumes/DPC/work/plant-code/rs-plant3-d/assets/meshes".to_string());
+            let mesh_dir = std::path::Path::new(&mesh_path_str);
+            drop(config_read); // Drop lock just in case
+
             let bundle_result = crate::web_server::instance_export::export_model_bundle(
                 &parsed_refnos,
                 &task_id,
                 &bundle_output_dir,
+                mesh_dir,
             )
             .await;
 
@@ -7544,3 +7670,215 @@ async fn update_room_relations_for_refnos(
 ) -> Result<RoomUpdateResult, anyhow::Error> {
     update_room_relations_for_refnos_incremental(refnos).await
 }
+
+// ===== 按需显示模型 API =====
+
+/// 按需显示模型 API（不创建任务，直接生成并返回结果）
+pub async fn api_show_by_refno(
+    State(state): State<AppState>,
+    Json(req): Json<ShowByRefnoRequest>,
+) -> Result<Json<ShowByRefnoResponse>, (StatusCode, String)> {
+    use crate::web_server::models::{ShowByRefnoRequest, ShowByRefnoResponse};
+    use std::str::FromStr;
+
+    // 1. 参数校验
+    if req.refnos.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "refnos 列表不能为空".to_string()));
+    }
+
+    // 2. 解析 refno
+    let mut parsed_refnos = Vec::new();
+    for refno_str in &req.refnos {
+        match RefnoEnum::from_str(refno_str) {
+            Ok(r) => parsed_refnos.push(r),
+            Err(_) => {
+                // 尝试手动解析纯数字
+                if let Ok(num) = refno_str.parse::<u64>() {
+                    parsed_refnos.push(RefnoEnum::Refno(RefU64(num)));
+                    continue;
+                }
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("无法解析 refno: {}", refno_str),
+                ));
+            }
+        }
+    }
+
+    if parsed_refnos.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "没有有效的 refno".to_string()));
+    }
+
+    // 3. 查询第一个 refno 的 SPdmsElement 获取 dbno 和 RefnoEnum 列表
+    let first_refno = parsed_refnos[0];
+    let dbno = match aios_core::get_pe(first_refno).await {
+        Ok(Some(pe)) => pe.dbnum as u32,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("找不到 refno {} 对应的元素", first_refno),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("查询元素失败: {}", e),
+            ));
+        }
+    };
+    
+    // 查询所有 refnos (包括 visible)
+    // 这里我们先使用前端传递的 refno 列表，实际上应该展开 visible
+    // 暂时保持逻辑，使用 parsed_refnos 作为目标
+    
+    // 3.1 如果 regen_model=true，删除旧数据并强制重新生成
+    let needed_refnos: Vec<RefnoEnum> = if req.regen_model {
+        info!("[ShowByRefno] regen_model=true, 删除旧的 inst_relate 数据并强制重新生成");
+        
+        // 删除旧的 inst_relate 记录
+        if let Err(e) = aios_core::rs_surreal::inst::delete_inst_relate_cascade(&parsed_refnos, 50).await {
+            warn!("[ShowByRefno] 删除旧的 inst_relate 失败: {}, 继续生成", e);
+        } else {
+            info!("[ShowByRefno] 已删除 {} 个 refno 的旧 inst_relate 数据", parsed_refnos.len());
+        }
+        
+        // 强制生成所有 refnos
+        parsed_refnos.clone()
+    } else {
+        // 3.2 检查是否存在（原逻辑）
+        let output_dir = std::env::current_dir().unwrap().join("output"); // 使用默认 output
+        let pm = crate::fast_model::export_model::parquet_writer::ParquetManager::new(&output_dir);
+        
+        let str_refnos: Vec<String> = parsed_refnos.iter().map(|r| r.to_string()).collect();
+        let existing = match pm.check_existence(dbno, &str_refnos) {
+            Ok(exist) => exist,
+            Err(e) => {
+                 return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("检查数据存在性失败: {}", e),
+                ));
+            }
+        };
+        
+        let needed: Vec<RefnoEnum> = parsed_refnos.iter()
+            .filter(|r| !existing.contains(&r.to_string()))
+            .cloned()
+            .collect();
+            
+        if needed.is_empty() {
+            info!("[ShowByRefno] 所有 {} 个 refno 已存在，跳过生成", parsed_refnos.len());
+            // 获取文件列表
+            let files = pm.list_parquet_files(dbno).unwrap_or_default();
+             return Ok(Json(ShowByRefnoResponse {
+                success: true,
+                bundle_url: None,
+                message: "所有模型已存在".to_string(),
+                metadata: Some(serde_json::json!({
+                    "refno_count": parsed_refnos.len(),
+                    "dbno": dbno
+                })),
+                parquet_files: Some(files),
+            }));
+        }
+        
+        needed
+    };
+
+    info!(
+        "[ShowByRefno] 查询到 dbno: {}, 需要生成 {} 个 refno (总请求 {})",
+        dbno,
+        needed_refnos.len(),
+        parsed_refnos.len()
+    );
+
+    // 4. 获取 DbOption
+    let db_option = aios_core::get_db_option();
+    let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
+
+    // 5. 调用生成函数 (针对 needed_refnos)
+    let result = crate::fast_model::gen_all_geos_data(
+        needed_refnos.clone(), // 只生成缺失的
+        &db_option_ext,
+        None,
+        None,
+    )
+    .await;
+
+    match result {
+        Ok(_) => {
+            info!("[ShowByRefno] 模型生成完成，开始导出增量 Parquet");
+
+            // 6. 导出 Parquet (增量)
+            let config = state.config_manager.read().await;
+            let mesh_path_str = config.current_config.meshes_path.clone()
+                .unwrap_or_else(|| "/Volumes/DPC/work/plant-code/rs-plant3-d/assets/meshes".to_string());
+            let mesh_dir = std::path::Path::new(&mesh_path_str);
+
+            let bundle_result = crate::web_server::instance_export::export_model_bundle_with_dbno(
+                &needed_refnos,
+                "", 
+                &std::path::PathBuf::from(""), 
+                mesh_dir,
+                Some(dbno),
+            )
+            .await;
+
+            match bundle_result {
+                Ok(_path) => {
+                    info!("[ShowByRefno] 增量 Parquet 导出成功，dbno: {}", dbno);
+                    
+                    // 获取最新文件列表
+                    let output_dir = std::env::current_dir().unwrap().join("output");
+                    let pm = crate::fast_model::export_model::parquet_writer::ParquetManager::new(&output_dir);
+                    let files = pm.list_parquet_files(dbno).unwrap_or_default();
+
+                    Ok(Json(ShowByRefnoResponse {
+                        success: true,
+                        bundle_url: None,
+                        message: format!("新增 {} 个模型生成成功", needed_refnos.len()),
+                        metadata: Some(serde_json::json!({
+                            "refno_count": parsed_refnos.len(),
+                            "generated_count": needed_refnos.len(),
+                            "dbno": dbno
+                        })),
+                        parquet_files: Some(files),
+                    }))
+                }
+                Err(e) => {
+                    error!("[ShowByRefno] Parquet 导出失败: {}", e);
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("模型生成成功但导出失败: {}", e),
+                    ))
+                }
+            }
+        }
+        Err(e) => {
+            error!("[ShowByRefno] 模型生成失败: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("模型生成失败: {}", e),
+            ))
+        }
+    }
+}
+
+// ===== Parquet 文件列表 API =====
+
+/// 获取指定 dbno 的 Parquet 文件列表
+pub async fn api_list_parquet_files(
+    Path(dbno): Path<u32>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    use crate::fast_model::export_model::parquet_writer::ParquetManager;
+
+    let manager = ParquetManager::new("output");
+    
+    match manager.list_parquet_files(dbno) {
+        Ok(files) => Ok(Json(files)),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("获取文件列表失败: {}", e),
+        )),
+    }
+}
+

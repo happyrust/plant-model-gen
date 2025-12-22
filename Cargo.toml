@@ -21,6 +21,11 @@ required-features = ["web_server", "eframe"]
 name = "test_dblist"
 path = "src/bin/test_dblist.rs"
 
+[[bin]]
+name = "check_collision"
+path = "src/bin/check_collision.rs"
+required-features = ["sqlite-index"]
+
 # [[bin]]
 # name = "gen_xkt_new"
 # path = "src/bin/gen_xkt_new.rs"
@@ -45,6 +50,7 @@ env_logger = "0.11"
 parquet = "57.1.0"
 arrow-array = "57.1.0"
 arrow-schema = "57.1.0"
+polars = { version = "0.46", default-features = false, features = ["lazy", "parquet", "dtype-struct"] }
 
 # MQTT 服务器和客户端
 rumqttc = "0.25.0"

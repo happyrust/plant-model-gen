@@ -15,9 +15,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
-
+use crate::options::DbOptionExt;
 use anyhow::Result;
+use std::time::Instant;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -50,7 +50,7 @@ use super::models::DbModelInstRefnos;
 /// 返回分类后的模型实例引用号集合
 pub async fn gen_geos_data_by_dbnum(
     dbno: u32,
-    db_option_arc: Arc<DbOption>,
+    db_option_arc: Arc<DbOptionExt>,
     sender: flume::Sender<ShapeInstancesData>,
     target_sesno: Option<u32>,
 ) -> Result<DbModelInstRefnos> {
@@ -264,7 +264,7 @@ pub async fn gen_geos_data_by_dbnum(
 /// * `sender` - 几何体数据发送通道
 async fn process_gen_geos_data_chunks(
     origin_root_refnos: &[RefnoEnum],
-    db_option_arc: Arc<DbOption>,
+    db_option_arc: Arc<DbOptionExt>,
     incr_updates: Option<IncrGeoUpdateLog>,
     is_incr_update: bool,
     has_manual_refnos: bool,
@@ -338,9 +338,23 @@ async fn process_gen_geos_data_chunks(
                 .cloned()
                 .collect()
         } else {
-            let r = query_multi_descendants(target_refnos, &["BRAN", "HANG"])
+            // 查找后代中的 BRAN/HANG
+            let mut r = query_multi_descendants(target_refnos, &["BRAN", "HANG"])
                 .await
                 .unwrap();
+            
+            // 🔧 修复：同时检查 target_refnos 本身是否为 BRAN/HANG 类型
+            // 这对于用户直接传入 BRAN refno 的场景是必需的
+            for refno in target_refnos {
+                if let Ok(Some(pe)) = aios_core::get_pe(*refno).await {
+                    let noun = pe.noun.to_uppercase();
+                    if (noun == "BRAN" || noun == "HANG") && !r.contains(refno) {
+                        debug_model_debug!("[BRAN_FIX] 添加 target_refno 本身作为 BRAN/HANG: {}", refno);
+                        r.push(*refno);
+                    }
+                }
+            }
+            
             r.into_iter().collect()
         };
         let target_bran_reuse_cata_map: DashMap<String, CataHashRefnoKV> = {
@@ -584,7 +598,7 @@ async fn process_gen_geos_data_chunks(
 pub async fn gen_geos_data(
     dbno: Option<u32>,
     manual_refnos: Vec<RefnoEnum>,
-    db_option: &DbOption,
+    db_option: &DbOptionExt,
     incr_updates: Option<IncrGeoUpdateLog>,
     sender: flume::Sender<ShapeInstancesData>,
     target_sesno: Option<u32>,

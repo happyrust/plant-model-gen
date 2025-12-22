@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aios_core::RefnoEnum;
+use aios_core::SurrealQueryExt;
 use aios_core::geometry::ShapeInstancesData;
 use aios_core::mesh_precision::{LodLevel, MeshPrecisionSettings, set_active_precision};
 use aios_core::options::DbOption;
@@ -348,13 +349,14 @@ impl InstancedBundleExporter {
 }
 
 /// 为指定 refnos 导出 instanced bundle（入口函数）
+/// 返回 ExportData 以便调用方进行进一步处理（如写入 Parquet）
 pub async fn export_instanced_bundle_for_refnos(
     refnos: &[RefnoEnum],
     mesh_dir: &Path,
     output_dir: &Path,
     db_option: Arc<DbOption>,
     verbose: bool,
-) -> Result<()> {
+) -> Result<super::export_common::ExportData> {
     use super::export_common::collect_export_data;
     use aios_core::query_insts;
 
@@ -373,22 +375,171 @@ pub async fn export_instanced_bundle_for_refnos(
         .await
         .context("查询 inst_relate 数据失败")?;
 
+    // --- 诊断代码：query_insts 返回后立即检查 ---
+    if verbose {
+        println!("   - query_insts 返回 {} 条记录", geom_insts.len());
+        if geom_insts.is_empty() && !refnos.is_empty() {
+            println!("🔍 [DEBUG] query_insts 返回空，直接查询数据库诊断...");
+            let pe_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
+            let pe_list = pe_keys.join(",");
+            
+            // 1. 检查记录是否存在（不带过滤条件）
+            let count_sql = format!("SELECT count() AS cnt FROM inst_relate WHERE in IN [{}];", pe_list);
+            match aios_core::SUL_DB.query_response(&count_sql).await {
+                Ok(mut resp) => {
+                    if let Ok(counts) = resp.take::<Vec<serde_json::Value>>(0) {
+                        println!("   - inst_relate 总记录数（无过滤）: {:?}", counts);
+                    }
+                }
+                Err(e) => println!("   - 查询失败: {}", e),
+            }
+            
+            // 2. 检查带过滤条件的记录数
+            let filter_sql = format!(
+                "SELECT count() AS cnt FROM inst_relate WHERE in IN [{}] AND aabb.d != NONE AND world_trans.d != NONE;", 
+                pe_list
+            );
+            match aios_core::SUL_DB.query_response(&filter_sql).await {
+                Ok(mut resp) => {
+                    if let Ok(counts) = resp.take::<Vec<serde_json::Value>>(0) {
+                        println!("   - inst_relate 记录数（带 aabb/trans 过滤）: {:?}", counts);
+                    }
+                }
+                Err(e) => println!("   - 过滤查询失败: {}", e),
+            }
+            
+            // 3. 检查记录的详细状态
+            let detail_sql = format!(
+                "SELECT in, aabb, world_trans FROM inst_relate WHERE in IN [{}] LIMIT 5;", 
+                pe_list
+            );
+            match aios_core::SUL_DB.query_response(&detail_sql).await {
+                Ok(mut resp) => {
+                    if let Ok(records) = resp.take::<Vec<serde_json::Value>>(0) {
+                        println!("   - 详细记录（前5条）:");
+                        for (i, rec) in records.iter().enumerate() {
+                            let has_aabb = rec.get("aabb").is_some() && rec.get("aabb") != Some(&serde_json::json!(null));
+                            let has_trans = rec.get("world_trans").is_some() && rec.get("world_trans") != Some(&serde_json::json!(null));
+                            println!(
+                                "     [{}] in={}, aabb={}, trans={}", 
+                                i,
+                                rec.get("in").unwrap_or(&serde_json::json!("?")),
+                                if has_aabb { format!("{:?}", rec.get("aabb")) } else { "NONE".to_string() },
+                                if has_trans { "有值" } else { "NONE" }
+                            );
+                        }
+                        if records.is_empty() {
+                            println!("     ⚠️ 没有找到任何 inst_relate 记录！数据可能未生成或未保存到数据库。");
+                        }
+                    }
+                }
+                Err(e) => println!("   - 详细查询失败: {}", e),
+            }
+        }
+    }
+    // --- 诊断代码结束 ---
+
+    // 筛选 BRAN/HANG 类型的 refnos 作为 bran_roots
+    // 这对于 TUBI 管道数据查询是必需的
+    let mut bran_roots: Vec<RefnoEnum> = Vec::new();
+    if !refnos.is_empty() {
+        use futures::StreamExt;
+        use futures::stream::FuturesUnordered;
+        
+        let mut type_tasks = FuturesUnordered::new();
+        for refno in refnos {
+            let refno = *refno;
+            type_tasks.push(async move {
+                if let Ok(Some(pe)) = crate::fast_model::query_provider::get_pe(refno).await {
+                    let noun = pe.noun.to_uppercase();
+                    if noun == "BRAN" || noun == "HANG" {
+                        return Some(refno);
+                    }
+                }
+                None
+            });
+        }
+        
+        while let Some(result) = type_tasks.next().await {
+            if let Some(refno) = result {
+                bran_roots.push(refno);
+            }
+        }
+        
+        if verbose && !bran_roots.is_empty() {
+            println!("   - 找到 {} 个 BRAN/HANG 节点用于 TUBI 查询", bran_roots.len());
+        }
+    }
+
     // 收集导出数据
-    let export_data = collect_export_data(geom_insts, refnos, mesh_dir, verbose, None).await?;
+    let bran_roots_ref: Option<&[RefnoEnum]> = if bran_roots.is_empty() {
+        None
+    } else {
+        Some(&bran_roots)
+    };
+    let export_data = collect_export_data(geom_insts, refnos, mesh_dir, verbose, bran_roots_ref).await?;
 
     if export_data.total_instances == 0 {
         println!("⚠️  未找到任何几何体数据");
-        return Ok(());
+        
+        // --- 诊断代码开始 ---
+        if verbose && !refnos.is_empty() {
+             println!("🔍 [DEBUG] 诊断：直接查询 inst_relate 状态...");
+             let pe_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
+             let pe_list = pe_keys.join(",");
+             
+             // 1. 检查记录是否存在
+             let count_sql = format!("SELECT count() AS cnt FROM inst_relate WHERE in IN [{}];", pe_list);
+             match aios_core::SUL_DB.query_response(&count_sql).await {
+                 Ok(mut resp) => {
+                      if let Ok(counts) = resp.take::<Vec<serde_json::Value>>(0) {
+                          println!("   - inst_relate 记录数: {:?}", counts);
+                      }
+                 }
+                 Err(e) => println!("   - 查询失败: {}", e),
+             }
+             
+             // 2. 检查关键字段 (aabb, world_trans)
+             let check_sql = format!(
+                 "SELECT in, aabb, world_trans, geo_type, visible, out.meshed as is_meshed FROM inst_relate WHERE in IN [{}];", 
+                 pe_list
+             );
+             match aios_core::SUL_DB.query_response(&check_sql).await {
+                 Ok(mut resp) => {
+                      if let Ok(records) = resp.take::<Vec<serde_json::Value>>(0) {
+                          println!("   - 详细记录检查 (前10条):");
+                          for (i, rec) in records.iter().enumerate().take(10) {
+                               let has_aabb = rec.get("aabb").and_then(|v| v.get("d")).is_some();
+                               let has_trans = rec.get("world_trans").and_then(|v| v.get("d")).is_some();
+                               println!(
+                                   "     [{}] in={}, aabb={}, trans={}, type={}, vis={}, mesh={}", 
+                                   i,
+                                   rec.get("in").unwrap_or(&serde_json::json!("?")),
+                                   if has_aabb { "OK" } else { "MISSING" },
+                                   if has_trans { "OK" } else { "MISSING" },
+                                   rec.get("geo_type").unwrap_or(&serde_json::json!("?")),
+                                   rec.get("visible").unwrap_or(&serde_json::json!("?")),
+                                   rec.get("is_meshed").unwrap_or(&serde_json::json!("?"))
+                               );
+                          }
+                      }
+                 }
+                 Err(e) => println!("   - 详细查询失败: {}", e),
+             }
+        }
+        // --- 诊断代码结束 ---
+
+        return Ok(export_data);
     }
 
     if export_data.valid_geo_hashes.is_empty() {
         println!("⚠️  没有可导出的几何体");
-        return Ok(());
+        return Ok(export_data);
     }
 
     // 创建导出器并导出
     let exporter = InstancedBundleExporter::new(db_option, verbose);
     exporter.export(&export_data, output_dir, mesh_dir).await?;
 
-    Ok(())
+    Ok(export_data)
 }

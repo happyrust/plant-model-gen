@@ -49,25 +49,25 @@ pub struct PreparedObjExport {
     pub stats: ExportStats,
 }
 
-fn merge_instance_into_mesh(
-    merged_mesh: &mut PlantMesh,
-    export_data: &ExportData,
-    geo_hash: &str,
-    transform: &glam::DMat4,
-) {
-    if let Some(geom) = export_data.unique_geometries.get(geo_hash) {
-        let transformed = geom.as_ref().transform_by(transform);
-        merged_mesh.merge(&transformed);
-    } else {
-        eprintln!(
-            "[export_obj] ⚠️ 未找到 geo_hash {} 对应的 PlantMesh，跳过实例",
-            geo_hash
-        );
-    }
-}
 
-fn merge_export_data_into_mesh(export_data: &ExportData) -> PlantMesh {
+
+fn merge_export_data_into_mesh(export_data: &ExportData, mesh_dir: &Path) -> PlantMesh {
+    use crate::fast_model::export_model::export_common::GltfMeshCache;
+    let mesh_cache = GltfMeshCache::new();
     let mut merged_mesh = PlantMesh::default();
+
+    // 辅助函数：合并单个实例
+    let mut merge_instance = |geo_hash: &str, transform: &glam::DMat4| {
+        if let Ok(arc_mesh) = mesh_cache.load_or_get(geo_hash, mesh_dir) {
+             let transformed = arc_mesh.as_ref().transform_by(transform);
+             merged_mesh.merge(&transformed);
+        } else {
+            eprintln!(
+                "[export_obj] ⚠️ 加载 mesh {} 失败，跳过实例",
+                geo_hash
+            );
+        }
+    };
 
     for component in &export_data.components {
         for instance in &component.geometries {
@@ -81,22 +81,13 @@ fn merge_export_data_into_mesh(export_data: &ExportData) -> PlantMesh {
                 // 普通几何体: inst_transform × geo_transform
                 component.world_transform * instance.local_transform
             };
-            merge_instance_into_mesh(
-                &mut merged_mesh,
-                export_data,
-                &instance.geo_hash,
-                &combined_transform,
-            );
+            
+            merge_instance(&instance.geo_hash, &combined_transform);
         }
     }
 
     for tubing in &export_data.tubings {
-        merge_instance_into_mesh(
-            &mut merged_mesh,
-            export_data,
-            &tubing.geo_hash,
-            &tubing.transform,
-        );
+        merge_instance(&tubing.geo_hash, &tubing.transform);
     }
 
     merged_mesh
@@ -160,7 +151,7 @@ pub async fn prepare_obj_export(
     stats.mesh_files_missing = export_data.failed_count;
     stats.geometry_count = export_data.total_instances;
 
-    let merged_mesh = merge_export_data_into_mesh(&export_data);
+    let merged_mesh = merge_export_data_into_mesh(&export_data, mesh_dir);
 
     Ok(PreparedObjExport {
         mesh: merged_mesh,

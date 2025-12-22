@@ -1,10 +1,10 @@
-use aios_core::options::DbOption;
+use crate::options::DbOptionExt;
 use std::sync::Arc;
 
 /// Noun 处理上下文，包含所有处理过程需要的配置信息
 #[derive(Clone)]
 pub struct NounProcessContext {
-    pub db_option: Arc<DbOption>,
+    pub db_option: Arc<DbOptionExt>,
     pub batch_size: usize,
     pub batch_concurrency: usize,
 }
@@ -16,7 +16,7 @@ impl NounProcessContext {
     /// * `db_option` - 数据库配置
     /// * `batch_size` - 每批次处理的数量
     /// * `batch_concurrency` - 批次处理的并发数（自动限制最小为1）
-    pub fn new(db_option: Arc<DbOption>, batch_size: usize, batch_concurrency: usize) -> Self {
+    pub fn new(db_option: Arc<DbOptionExt>, batch_size: usize, batch_concurrency: usize) -> Self {
         Self {
             db_option,
             batch_size,
@@ -54,11 +54,12 @@ impl NounProcessContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aios_core::options::DbOption;
 
     #[test]
     fn test_bounded_chunks() {
         let ctx = NounProcessContext {
-            db_option: Arc::new(DbOption::default()),
+            db_option: Arc::new(DbOptionExt::from(DbOption::default())),
             batch_size: 100,
             batch_concurrency: 4,
         };
@@ -76,7 +77,11 @@ mod tests {
 
     #[test]
     fn test_batch_concurrency_minimum() {
-        let ctx = NounProcessContext::new(Arc::new(DbOption::default()), 100, 0);
+        let ctx = NounProcessContext::new(
+            Arc::new(DbOptionExt::from(DbOption::default())),
+            100,
+            0,
+        );
         assert_eq!(ctx.batch_concurrency, 1); // 自动修正为最小值1
     }
 }

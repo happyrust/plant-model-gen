@@ -240,8 +240,8 @@ impl GltfMeshCache {
 
 /// 导出数据结果（新版：分离元件和 TUBI）
 pub struct ExportData {
-    /// 唯一几何体集合 (geo_hash -> 原始 PlantMesh)
-    pub unique_geometries: HashMap<String, Arc<PlantMesh>>,
+    /// 有效的几何体集合 (存在的 geo_hash)
+    pub valid_geo_hashes: std::collections::HashSet<String>,
     /// 元件记录（按 refno 分组）
     pub components: Vec<ComponentRecord>,
     /// TUBI 记录（扁平列表）
@@ -690,13 +690,12 @@ pub async fn collect_export_data(
         println!("   - 总实例数量: {}", total_instances);
     }
 
-    // 创建几何缓存
-    let mesh_cache = GltfMeshCache::new();
-    let mut unique_geometries: HashMap<String, Arc<PlantMesh>> = HashMap::new();
+    // 检查几何体文件存在性 (GLB)
+    let mut valid_geo_hashes = std::collections::HashSet::new();
     let mut loaded_count = 0;
     let mut failed_count = 0;
 
-    // 按使用次数排序，优先加载高频几何
+    // 按使用次数排序，优先检查高频几何
     let mut sorted_geo_hashes: Vec<_> = geo_hash_usage.iter().collect();
     sorted_geo_hashes.sort_by(|a, b| b.1.cmp(a.1));
 
@@ -711,49 +710,88 @@ pub async fn collect_export_data(
         pb.set_draw_target(ProgressDrawTarget::hidden());
     }
 
+    // 默认检查 L1 级别的 GLB
+    use aios_core::mesh_precision::set_active_precision;
+    use aios_core::mesh_precision::MeshPrecisionSettings;
+    // 获取默认精度设置 (通常是 L1)
+    let default_lod = aios_core::mesh_precision::LodLevel::L1;
+    
+    // 确定搜索目录：mesh_dir/lod_L1/
+    // 如果 mesh_dir 已经是 lod_XX，则直接使用，否则拼接
+    let search_dir = if let Some(dir_name) = mesh_dir.file_name() {
+        let dir_str = dir_name.to_string_lossy();
+        if dir_str.starts_with("lod_") {
+            mesh_dir.to_path_buf()
+        } else {
+            mesh_dir.join(format!("lod_{:?}", default_lod))
+        }
+    } else {
+        mesh_dir.join(format!("lod_{:?}", default_lod))
+    };
+
+    if verbose {
+        println!("   🔍 检查 GLB 文件 (目录: {})...", search_dir.display());
+    }
+
     for (geo_hash, usage_count) in &sorted_geo_hashes {
-        match mesh_cache.load_or_get(geo_hash, mesh_dir) {
-            Ok(mesh) => {
-                // 确保法线数据完整
-                let mut mesh_data = (*mesh).clone();
-                ensure_normals(&mut mesh_data);
+        // 构建文件名: {geo_hash}_{lod}.glb
+        // 注意：gen_inst_meshes 生成的文件名格式为 {geo_hash}_{lod}.glb
+        let filename = format!("{}_{:?}.glb", geo_hash, default_lod);
+        let file_path = search_dir.join(&filename);
+        
+        // 同时也尝试不仅带后缀的文件名 (兼容旧数据)
+        let fallback_filename = format!("{}.glb", geo_hash);
+        let fallback_path = search_dir.join(&fallback_filename);
 
-                unique_geometries.insert((*geo_hash).clone(), Arc::new(mesh_data));
-                loaded_count += 1;
-
-                if verbose && **usage_count > 1 {
-                    pb.set_message(format!("geo_hash: {} (复用 {} 次)", geo_hash, usage_count));
-                }
+        if file_path.exists() {
+            valid_geo_hashes.insert((*geo_hash).clone());
+            loaded_count += 1;
+            if verbose && **usage_count > 1 {
+                pb.set_message(format!("geo_hash: {} (复用 {} 次)", geo_hash, usage_count));
             }
-            Err(e) => {
-                if verbose {
-                    eprintln!("   ⚠️  加载 mesh 失败: {} - {}", geo_hash, e);
+        } else if fallback_path.exists() {
+            valid_geo_hashes.insert((*geo_hash).clone());
+            loaded_count += 1;
+            if verbose && **usage_count > 1 {
+                pb.set_message(format!("geo_hash: {} (复用 {} 次)", geo_hash, usage_count));
+            }
+        } else {
+            // 检查是否为标准单位几何体 (1, 2, 3)
+            match geo_hash.as_str() {
+                "1" | "2" | "3" => {
+                    // 单位几何体总是视为有效（后续导出时动态生成或使用内置资源）
+                    valid_geo_hashes.insert((*geo_hash).clone());
+                    loaded_count += 1;
                 }
-                failed_count += 1;
+                _ => {
+                    if verbose {
+                        // eprintln!("   ⚠️  GLB 文件不存在: {} 或 {}", file_path.display(), fallback_path.display());
+                    }
+                    failed_count += 1;
+                }
             }
         }
         pb.inc(1);
     }
 
     if verbose {
-        pb.finish_with_message("加载完成");
+        pb.finish_with_message("检查完成");
     } else {
         pb.finish_and_clear();
     }
 
-    // 获取缓存统计
-    let (cache_size, cache_hits, cache_misses) = mesh_cache.cache_stats();
+    // 获取缓存统计 (这里不再使用 GltfMeshCache，所以置 0)
+    let cache_hits = 0;
+    let cache_misses = 0;
 
     if verbose {
-        println!("\n✅ 几何体加载完成:");
-        println!("   - 唯一几何体数量: {}", loaded_count);
-        println!("   - 加载失败: {}", failed_count);
+        println!("\n✅ 几何体检查完成:");
+        println!("   - 有效几何体数量: {}", loaded_count);
+        println!("   - 缺失: {}", failed_count);
         println!("   - 元件数量: {}", components.len());
         println!("   - 元件几何体实例数: {}", total_component_instances);
         println!("   - TUBI 数量: {}", tubings.len());
         println!("   - 总实例数量: {}", total_instances);
-        println!("   - 缓存命中: {}", cache_hits);
-        println!("   - 缓存未命中: {}", cache_misses);
         if loaded_count > 0 {
             let reuse_rate = (total_instances as f32 / loaded_count as f32 - 1.0) * 100.0;
             println!("   - 几何复用率: {:.1}%", reuse_rate);
@@ -762,7 +800,7 @@ pub async fn collect_export_data(
 
     let tubi_count = tubings.len();
     Ok(ExportData {
-        unique_geometries,
+        valid_geo_hashes,
         components,
         tubings,
         loaded_count,

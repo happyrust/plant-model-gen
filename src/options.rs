@@ -2,6 +2,24 @@ use aios_core::options::DbOption;
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
+/// 生成的网格模型格式
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MeshFormat {
+    /// 原始二进制 PdmsMesh 格式 (.mesh)
+    PdmsMesh,
+    /// GLB 格式 (.glb)
+    Glb,
+    /// OBJ 格式 (.obj)
+    Obj,
+}
+
+impl Default for MeshFormat {
+    fn default() -> Self {
+        Self::PdmsMesh
+    }
+}
+
 /// 扩展DbOption，添加异地部署相关的配置
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DbOptionExt {
@@ -62,6 +80,11 @@ pub struct DbOptionExt {
     /// 用于快速测试和调试，避免处理全库数据
     #[serde(default)]
     pub debug_limit_per_noun: Option<usize>,
+
+    /// 生成的模型格式列表
+    /// 默认为 [PdmsMesh]
+    #[serde(default)]
+    pub mesh_formats: Vec<MeshFormat>,
 }
 
 impl Deref for DbOptionExt {
@@ -154,6 +177,7 @@ impl From<DbOption> for DbOptionExt {
             full_noun_enabled_categories: Vec::new(),
             full_noun_excluded_nouns: Vec::new(),
             debug_limit_per_noun: None,
+            mesh_formats: vec![MeshFormat::PdmsMesh],
         }
     }
 }
@@ -238,6 +262,24 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // 解析输出格式
+    let mesh_formats = toml_value
+        .get("mesh_formats")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    v.as_str().and_then(|s| match s.to_lowercase().as_str() {
+                        "pdmsmesh" | "mesh" => Some(MeshFormat::PdmsMesh),
+                        "glb" => Some(MeshFormat::Glb),
+                        "obj" => Some(MeshFormat::Obj),
+                        _ => None,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![MeshFormat::PdmsMesh]);
+
     // 构建 DbOptionExt
     let db_option_ext = DbOptionExt {
         inner: db_option,
@@ -253,6 +295,7 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         full_noun_enabled_categories,
         full_noun_excluded_nouns,
         debug_limit_per_noun,
+        mesh_formats,
     };
 
     // 打印加载的配置

@@ -9,6 +9,7 @@ pub mod import_glb;
 // pub mod export_xkt;
 pub mod model_exporter;
 pub mod name_config;
+pub mod parquet_writer;
 
 pub use export_common::*;
 pub use name_config::NameConfig;

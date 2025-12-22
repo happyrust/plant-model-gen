@@ -12,6 +12,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::fast_model::mesh_generate::gen_inst_meshes;
+    use crate::options::MeshFormat;
 
     const TARGET_REFNO: &str = "21491_18946";
 
@@ -68,7 +69,7 @@ mod tests {
 
         set_active_precision(precision.clone());
 
-        gen_inst_meshes(&[refno], true, lod_dir.clone(), Arc::new(precision.clone()))
+        gen_inst_meshes(&lod_dir, &precision, &[refno], true, &[MeshFormat::PdmsMesh])
             .await
             .context("生成 mesh 失败")?;
 

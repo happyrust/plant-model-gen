@@ -84,6 +84,7 @@ pub async fn export_gltf_for_refnos(
             &unit_converter,
             &material_library,
             false,
+            mesh_dir,
         )?;
         println!("✅ 导出完成: {}", output_path);
         println!("   - 节点数: {}, Mesh 数: {}", node_count, mesh_count);
@@ -111,6 +112,7 @@ pub async fn export_gltf_for_refnos(
         &unit_converter,
         &material_library,
         false,
+        mesh_dir,
     )?;
     println!("✅ 导出完成: {}", output_path);
     println!("   - 节点数: {}, Mesh 数: {}", node_count, mesh_count);
@@ -124,9 +126,10 @@ fn export_mesh_to_gltf(
     unit_converter: &UnitConverter,
     material_library: &MaterialLibrary,
     use_basic_materials: bool,
+    mesh_dir: &Path,
 ) -> Result<(usize, usize)> {
     // 返回 (node_count, mesh_count)
-    if export_data.unique_geometries.is_empty() {
+    if export_data.valid_geo_hashes.is_empty() {
         return Err(anyhow!("没有可导出的几何体"));
     }
 
@@ -145,8 +148,12 @@ fn export_mesh_to_gltf(
         .ok_or_else(|| anyhow!("无法解析 bin 文件名"))?;
 
     // 按 geo_hash 排序以确保输出稳定
-    let mut sorted_geo_hashes: Vec<_> = export_data.unique_geometries.keys().collect();
+    let mut sorted_geo_hashes: Vec<_> = export_data.valid_geo_hashes.iter().collect();
     sorted_geo_hashes.sort();
+
+    // 创建 Mesh Cache
+    use crate::fast_model::export_model::export_common::GltfMeshCache;
+    let mesh_cache = GltfMeshCache::new();
 
     // 构建 buffer 数据：为每个唯一几何体生成 positions/normals/indices
     let mut all_positions_bytes = Vec::new();
@@ -169,7 +176,8 @@ fn export_mesh_to_gltf(
 
     // 为每个唯一几何体构建 buffer 数据
     for geo_hash in &sorted_geo_hashes {
-        let mesh = export_data.unique_geometries.get(*geo_hash).unwrap();
+        let mesh = mesh_cache.load_or_get(geo_hash, mesh_dir)
+             .with_context(|| format!("Export GLTF: 加载 mesh {} 失败", geo_hash))?;
 
         let vertex_count = mesh.vertices.len();
         let mut min_pos = Vec3::new(f32::MAX, f32::MAX, f32::MAX);
@@ -525,7 +533,7 @@ fn export_mesh_to_gltf(
                 unit_converter.target_unit.name()),
             "totalComponents": export_data.components.len(),
             "totalTubings": export_data.tubings.len(),
-            "uniqueGeometries": export_data.unique_geometries.len(),
+            "uniqueGeometries": export_data.valid_geo_hashes.len(),
         }
     });
 
@@ -675,6 +683,7 @@ impl ModelExporter for GltfExporter {
             &config.common.unit_converter,
             &material_library,
             config.common.use_basic_materials,
+            mesh_dir,
         )?;
 
         stats.mesh_files_found = export_data.loaded_count;

@@ -6,11 +6,13 @@
 //! - 布尔运算处理
 //! - SQLite 空间索引优化支持
 
+use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
 use crate::fast_model::manifold_bool::{
     apply_cata_neg_boolean_manifold, apply_insts_boolean_manifold,
 };
 use crate::fast_model::{EXIST_MESH_GEO_HASHES, utils};
 use crate::fast_model::{debug_model, debug_model_debug, debug_model_warn};
+use crate::options::{DbOptionExt, MeshFormat};
 use crate::{batch_update_err, db_err, deser_err, log_err, query_err};
 use aios_core::accel_tree::acceleration_tree::RStarBoundingBox;
 use aios_core::error::{init_deserialize_error, init_query_error, init_save_database_error};
@@ -96,7 +98,7 @@ pub async fn gen_meshes_in_db(
     );
     for chunk in refnos.chunks(100) {
         // 生成模型文件
-        gen_inst_meshes(chunk, replace_exist, dir.clone(), precision.clone())
+        gen_inst_meshes(&dir, &precision, chunk, replace_exist, &[MeshFormat::PdmsMesh])
             .await
             .unwrap();
         // println!(
@@ -360,7 +362,7 @@ pub async fn process_meshes_update_db(
     );
     // dbg!(&target_refnos);
     // 生成模型文件
-    gen_inst_meshes(&refnos, replace_exist, dir.clone(), precision.clone())
+    gen_inst_meshes(&dir, &precision, &refnos, replace_exist, &[MeshFormat::PdmsMesh])
         .await
         .unwrap();
     println!(
@@ -392,7 +394,7 @@ pub async fn process_meshes_update_db(
 /// * `option` - 数据库选项
 /// * `refnos` - BRAN 类型的 refno 列表
 pub async fn process_meshes_bran(
-    option: Option<Arc<DbOption>>,
+    option: Option<Arc<DbOptionExt>>,
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<()> {
     if refnos.is_empty() {
@@ -405,19 +407,28 @@ pub async fn process_meshes_bran(
     let time = std::time::Instant::now();
     let dir = option
         .as_ref()
-        .map(|x| x.get_meshes_path())
-        .unwrap_or("assets/meshes".into());
-    let precision = Arc::new(
-        option
-            .as_ref()
-            .map(|opt| opt.mesh_precision().clone())
-            .unwrap_or_else(|| get_db_option().mesh_precision().clone()),
-    );
+        .map(|x| {
+            Path::new(x.inner.meshes_path.as_deref().unwrap_or("assets/meshes")).to_path_buf()
+        })
+        .unwrap_or_else(|| "assets/meshes".into());
+    let precision = option
+        .as_ref()
+        .map(|opt| opt.inner.mesh_precision.clone())
+        .unwrap_or_else(|| crate::options::get_db_option_ext().inner.mesh_precision.clone());
+    let mesh_formats = option
+        .as_ref()
+        .map(|opt| opt.mesh_formats.clone())
+        .unwrap_or_else(|| crate::options::get_db_option_ext().mesh_formats.clone());
     
     // 生成模型文件
-    gen_inst_meshes(&refnos, replace_exist, dir.clone(), precision.clone())
-        .await
-        .unwrap();
+    gen_inst_meshes(
+        &dir,
+        &precision,
+        &refnos,
+        replace_exist,
+        &mesh_formats,
+    )
+    .await?;
     println!(
         "[BRAN] gen_inst_meshes finished: {} ms",
         time.elapsed().as_millis()
@@ -446,7 +457,7 @@ pub async fn process_meshes_bran(
 ///
 /// 返回 `anyhow::Result<()>` 表示更新是否成功
 pub async fn process_meshes_update_db_deep_default(refnos: &[RefnoEnum]) -> anyhow::Result<()> {
-    let dboption = get_db_option();
+    let dboption = crate::options::get_db_option_ext();
     process_meshes_update_db_deep(&dboption, refnos).await
 }
 
@@ -461,13 +472,19 @@ pub async fn process_meshes_update_db_deep_default(refnos: &[RefnoEnum]) -> anyh
 ///
 /// 返回 `anyhow::Result<()>` 表示更新是否成功
 pub async fn process_meshes_update_db_deep(
-    dboption: &DbOption,
+    dboption: &DbOptionExt,
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<()> {
     if !refnos.is_empty() {
-        let dir = dboption.get_meshes_path();
+        // 确保 mesh根目录存在
+        let dir = Path::new(dboption.inner.meshes_path.as_deref().unwrap_or("assets/meshes")).to_path_buf();
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)?;
+        }
+
+        let precision = &dboption.inner.mesh_precision;
         let replace_exist = dboption.is_replace_mesh();
-        let precision = Arc::new(dboption.mesh_precision().clone());
+        let mesh_formats = &dboption.mesh_formats;
         println!("📊 更新模型结点数量: {}", refnos.len());
         let time = std::time::Instant::now();
 
@@ -506,10 +523,11 @@ pub async fn process_meshes_update_db_deep(
                     // 生成模型文件
                     let mesh_time = std::time::Instant::now();
                     gen_inst_meshes(
+                        &dir,
+                        precision,
                         &update_refnos,
                         replace_exist,
-                        dir.clone(),
-                        precision.clone(),
+                        mesh_formats,
                     )
                     .await
                     .map_err(|e| {
@@ -556,7 +574,10 @@ pub async fn process_meshes_update_db_deep(
                             let sql = format!(
                                 "SELECT value id FROM [{refno_keys}] WHERE noun != 'BRAN'"
                             );
-                            SUL_DB.query_take::<Vec<RefnoEnum>>(&sql, 0).await.unwrap_or_default()
+                            SUL_DB.query_take::<Vec<RefnoEnum>>(&sql, 0).await.unwrap_or_else(|e| {
+                                eprintln!("SQL error in CSG mesh boolean query: {}", e);
+                                Vec::new()
+                            })
                         }
                     };
                     
@@ -623,10 +644,11 @@ pub async fn process_meshes_update_db_deep(
 /// - 回写 SurrealDB: inst_geo.meshed/aabb/pts 字段，错误则标记 bad=true
 /// - 更新内存缓存 EXIST_MESH_GEO_HASHES；最后批量保存 aabb/pts 到 SurrealDB
 pub async fn gen_inst_meshes(
+    dir: &Path,
+    precision: &MeshPrecisionSettings,
     refnos: &[RefnoEnum],
     replace_exist: bool,
-    dir: PathBuf,
-    precision: Arc<MeshPrecisionSettings>,
+    mesh_formats: &[MeshFormat],
 ) -> anyhow::Result<()> {
     debug_model_debug!(
         "gen_inst_meshes start: refnos={}, replace_exist={}, dir={}",
@@ -644,7 +666,7 @@ pub async fn gen_inst_meshes(
         let dir_str = dir_name.to_string_lossy();
         // 如果目录名已经是 lod_XX 格式，直接使用
         if dir_str.starts_with("lod_") {
-            dir
+            dir.to_path_buf()
         } else {
             // 否则创建 LOD 子目录
             let lod_dir = dir.join(format!("lod_{:?}", precision.default_lod));
@@ -716,9 +738,10 @@ pub async fn gen_inst_meshes(
         let dir = dir.clone();
         let aabb_map = aabb_map.clone();
         let pts_json_map = pts_json_map.clone();
-        let precision = precision.clone();
+        let precision = Arc::new(precision.clone()); // Clone Arc<MeshPrecisionSettings>
         let inst_aabb_map = inst_aabb_map.clone();
         let chunk_refno_map = chunk_refno_map.clone();
+        let mesh_formats = mesh_formats.to_vec();
         // 每批一个异步任务：查询参数 -> CSG 网格化 -> 回写
         let task = tokio::spawn(async move {
             // 查询本批所有 inst_geo 的参数
@@ -765,6 +788,7 @@ pub async fn gen_inst_meshes(
                                     &pts_json_map,
                                     &inst_aabb_map,
                                     &mut update_sql,
+                                    &mesh_formats,
                                 )
                                 .await
                                 {
@@ -833,28 +857,46 @@ pub async fn gen_inst_meshes(
                                                 Some(lod_mesh) => {
                                                     // 文件名包含 LOD 后缀
                                                     let lod_filename = format!(
-                                                        "{}_{:?}.mesh",
+                                                        "{}_{:?}",
                                                         mesh_id, lod_level
                                                     );
-                                                    let lod_mesh_path =
+                                                    let lod_mesh_base_path =
                                                         lod_dir.join(&lod_filename);
-                                                    if let Err(e) = lod_mesh
-                                                        .mesh
-                                                        .ser_to_file(&lod_mesh_path)
-                                                    {
-                                                        debug_model_warn!(
-                                                            "   ⚠️  保存 LOD {:?} mesh 失败: {} - {}",
-                                                            lod_level,
-                                                            mesh_id,
-                                                            e
-                                                        );
-                                                    } else {
-                                                        debug_model_debug!(
-                                                            "   ✅ 生成 LOD {:?} mesh: {}",
-                                                            lod_level,
-                                                            lod_filename
-                                                        );
+
+                                                    // 强制生成 GLB，即使 mesh_formats 未显式包含
+                                                    // if mesh_formats.contains(&MeshFormat::Glb) {
+                                                        let glb_path = lod_mesh_base_path.with_extension("glb");
+                                                        if let Err(e) = export_single_mesh_to_glb(&lod_mesh.mesh, &glb_path) {
+                                                            debug_model_warn!(
+                                                                "   ⚠️  生成 LOD {:?} GLB 失败: {} - {}",
+                                                                lod_level,
+                                                                mesh_id,
+                                                                e
+                                                            );
+                                                        }
+                                                    // }
+
+                                                    if mesh_formats.contains(&MeshFormat::PdmsMesh) {
+                                                        let lod_mesh_path = lod_mesh_base_path.with_extension("mesh");
+                                                        if let Err(e) = lod_mesh
+                                                            .mesh
+                                                            .ser_to_file(&lod_mesh_path)
+                                                        {
+                                                            debug_model_warn!(
+                                                                "   ⚠️  保存 LOD {:?} mesh 失败: {} - {}",
+                                                                lod_level,
+                                                                mesh_id,
+                                                                e
+                                                            );
+                                                        }
                                                     }
+
+
+                                                    debug_model_debug!(
+                                                        "   ✅ 生成 LOD {:?} 相关格式: {}",
+                                                        lod_level,
+                                                        mesh_id
+                                                    );
                                                 }
                                                 None => {
                                                     debug_model_warn!(
@@ -952,6 +994,7 @@ async fn handle_csg_mesh(
     pts_json_map: &Arc<DashMap<u64, String>>,
     inst_aabb_map: &Arc<DashMap<String, Aabb>>,
     update_sql: &mut String,
+    mesh_formats: &[MeshFormat],
 ) -> anyhow::Result<()> {
     if generated.mesh.aabb.is_none() {
         generated.mesh.aabb = generated.aabb;
@@ -963,9 +1006,26 @@ async fn handle_csg_mesh(
 
     let pt_refs = derive_csg_points(&generated.mesh, pts_json_map);
 
-    generated
-        .mesh
-        .ser_to_file(&dir.join(format!("{}.mesh", mesh_id)))?;
+    let mesh_base_path = dir.join(mesh_id);
+    
+    // 根据配置保存不同格式
+    if mesh_formats.contains(&MeshFormat::PdmsMesh) {
+        let mesh_path = mesh_base_path.with_extension("mesh");
+        generated.mesh.ser_to_file(&mesh_path)?;
+    }
+    
+    // 强制生成 GLB
+    let glb_path = mesh_base_path.with_extension("glb");
+    if let Err(e) = export_single_mesh_to_glb(&generated.mesh, &glb_path) {
+        debug_model_warn!("   ⚠️ 生成 GLB 失败: {} - {}", mesh_id, e);
+    }
+
+    if mesh_formats.contains(&MeshFormat::Obj) {
+        let obj_path = mesh_base_path.with_extension("obj");
+        if let Err(e) = generated.mesh.export_obj(false, obj_path.to_str().unwrap()) {
+            debug_model_warn!("   ⚠️ 生成 OBJ 失败: {} - {}", mesh_id, e);
+        }
+    }
 
     let aabb_hash = gen_bytes_hash(&mesh_aabb);
     aabb_map.entry(aabb_hash.to_string()).or_insert(mesh_aabb);

@@ -95,6 +95,7 @@ pub async fn export_unit_mesh_glb_for_refnos(
             &unit_converter,
             &material_library,
             false,
+            mesh_dir,
         )?;
         println!("✅ 导出完成: {}", output_path);
         println!("   - 节点数: {}, Mesh 数: {}", node_count, mesh_count);
@@ -122,6 +123,7 @@ pub async fn export_unit_mesh_glb_for_refnos(
         &unit_converter,
         &material_library,
         false,
+        mesh_dir,
     )?;
     println!("✅ 导出完成: {}", output_path);
     println!("   - 节点数: {}, Mesh 数: {}", node_count, mesh_count);
@@ -135,14 +137,19 @@ fn export_unit_mesh_to_glb(
     unit_converter: &UnitConverter,
     material_library: &MaterialLibrary,
     use_basic_materials: bool,
+    mesh_dir: &Path,
 ) -> Result<(usize, usize, HashMap<String, usize>)> {
-    if export_data.unique_geometries.is_empty() {
+    if export_data.valid_geo_hashes.is_empty() {
         return Err(anyhow!("没有可导出的几何体"));
     }
 
     // 按 geo_hash 排序以确保输出稳定
-    let mut sorted_geo_hashes: Vec<_> = export_data.unique_geometries.keys().collect();
+    let mut sorted_geo_hashes: Vec<_> = export_data.valid_geo_hashes.iter().collect();
     sorted_geo_hashes.sort();
+
+    // 创建 Mesh Cache 用于动态加载
+    use crate::fast_model::export_model::export_common::GltfMeshCache;
+    let mesh_cache = GltfMeshCache::new();
 
     // 构建 buffer 数据：为每个唯一几何体生成 positions/normals/uvs/indices
     let mut all_positions_bytes = Vec::new();
@@ -195,7 +202,13 @@ fn export_unit_mesh_to_glb(
 
     // 为每个唯一几何体构建 buffer 数据
     for geo_hash in &sorted_geo_hashes {
-        let mesh = export_data.unique_geometries.get(*geo_hash).unwrap();
+        // 动态加载 mesh
+        // 尝试从目录下寻找合适的 LOD（这里暂时使用默认逻辑，或者 L1）
+        // mesh_dir 可能是 lod_L1，也可能是 base。
+        // GltfMeshCache::load_or_get 会尝试处理文件名。
+        let mesh = mesh_cache.load_or_get(geo_hash, mesh_dir)
+            .with_context(|| format!("Export Unit Mesh: 加载 mesh {} 失败", geo_hash))?;
+
         // unit_mesh：保持原始单位，由实例变换的缩放完成换算
         // 非 unit_mesh：直接在顶点上做单位换算
         let is_unit_mesh = geo_unit_flag_map.get(geo_hash.as_str()).copied().unwrap_or(false);
@@ -292,6 +305,9 @@ fn export_unit_mesh_to_glb(
     buffer_data.extend_from_slice(&all_normals_bytes);
     buffer_data.extend_from_slice(&all_uvs_bytes);
     buffer_data.extend_from_slice(&all_indices_bytes);
+    
+    // 预先进行 padding，确保 buffer_length 与 BIN chunk length 一致
+    pad_to_4(&mut buffer_data);
     let buffer_length = buffer_data.len();
 
     // 生成 BufferViews 和 Accessors
@@ -616,6 +632,7 @@ impl ModelExporter for UnitMeshGlbExporter {
             &config.common.unit_converter,
             &material_library,
             config.common.use_basic_materials,
+            mesh_dir,
         )?;
 
         stats.mesh_files_found = export_data.loaded_count;

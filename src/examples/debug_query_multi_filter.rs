@@ -78,7 +78,7 @@ async fn generate_mesh_for_lod(
             .into();
         refno_enums.push(refno);
 
-        gen_inst_meshes(&[refno], true, lod_dir.clone(), precision_arc.clone())
+        gen_inst_meshes(&lod_dir, &precision_arc, &[refno], true, &[MeshFormat::PdmsMesh])
             .await
             .with_context(|| format!("生成 mesh 失败: {}", refno_str))?;
     }

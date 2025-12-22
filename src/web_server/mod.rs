@@ -47,7 +47,7 @@ pub mod wizard_template;
 use crate::web_api::{
     E3dTreeApiState, NounHierarchyApiState, SpatialQueryApiState, create_e3d_tree_routes,
     create_noun_hierarchy_routes, create_room_tree_routes, create_spatial_query_routes,
-    create_pdms_attr_routes, create_ptset_routes,
+    create_pdms_attr_routes, create_ptset_routes, CollisionApiState, create_collision_routes,
 };
 use handlers::*;
 use models::*;
@@ -222,7 +222,6 @@ pub async fn start_web_server_with_config(
     // 初始化 Ptset API
     let ptset_routes = create_ptset_routes();
 
-    // 初始化房间 API
     let room_api_state = room_api::RoomApiState {
         task_manager: Arc::new(tokio::sync::RwLock::new(
             room_api::RoomTaskManager::default(),
@@ -230,6 +229,10 @@ pub async fn start_web_server_with_config(
         progress_hub: app_state.progress_hub.clone(),
     };
     let room_routes = room_api::create_room_api_routes().with_state(room_api_state);
+
+    // 初始化碰撞检测 API
+    let collision_state = CollisionApiState::default();
+    let collision_routes = create_collision_routes(collision_state);
 
     let app = Router::new()
         // API路由
@@ -247,10 +250,21 @@ pub async fn start_web_server_with_config(
         .route("/api/config/templates", get(get_config_templates))
         .route("/api/databases", get(get_available_databases))
         .route("/api/status", get(get_system_status))
+        .route("/api/instances", get(handlers::api_get_instances))
         // 基于 Refno 的模型生成 API
         .route(
             "/api/model/generate-by-refno",
             post(handlers::api_generate_by_refno),
+        )
+        // 按需显示模型（不创建任务）
+        .route(
+            "/api/model/show-by-refno",
+            post(handlers::api_show_by_refno),
+        )
+        // 获取指定 dbno 的 Parquet 文件列表
+        .route(
+            "/api/model/{dbno}/files",
+            get(handlers::api_list_parquet_files),
         )
         // SurrealDB 控制 (暂时注释掉有编译问题的路由)
         // .route("/api/surreal/start", post(handlers::start_surreal_server))
@@ -724,6 +738,16 @@ pub async fn start_web_server_with_config(
         // 静态文件服务
         .nest_service("/static", ServeDir::new("src/web_server/static"))
         .nest_service("/files/output", ServeDir::new("output"))
+        .nest_service("/files/meshes", {
+            let path = aios_core::get_db_option().get_meshes_path();
+            let serve_path = if path.file_name().and_then(|n| n.to_str()).map(|s| s.starts_with("lod_")).unwrap_or(false) {
+                path.parent().unwrap_or(&path).to_path_buf()
+            } else {
+                path
+            };
+            println!("💡 Serving meshes from: {:?}", serve_path);
+            ServeDir::new(serve_path)
+        })
         // CBA 文件分发服务 - 用于远程站点下载增量数据包
         .nest_service("/assets/archives", ServeDir::new("assets/archives"))
         // 主页面
@@ -773,6 +797,7 @@ pub async fn start_web_server_with_config(
         .merge(pdms_attr_routes)
         .merge(ptset_routes)
         .merge(room_routes)
+        .merge(collision_routes)
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

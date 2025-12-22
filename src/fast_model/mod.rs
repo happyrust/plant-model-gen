@@ -63,6 +63,11 @@ pub mod session;
 
 pub mod concurrency;
 
+#[cfg(feature = "sqlite-index")]
+pub mod collision_detect;
+#[cfg(feature = "sqlite-index")]
+pub use collision_detect::{CollisionConfig, CollisionDetector, CollisionEvent, CollisionStats};
+
 use aios_core::RefU64;
 use dashmap::{DashMap, DashSet};
 // 优先使用新的 gen_model 模块的 API

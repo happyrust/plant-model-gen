@@ -6,6 +6,7 @@ use crate::fast_model::{SEND_INST_SIZE, debug_model_warn, get_generic_type, shar
 use aios_core::RefU64;
 use aios_core::geometry::*;
 use aios_core::options::DbOption;
+use crate::options::DbOptionExt;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::pdms_types::*;
 use aios_core::prim_geo::{Extrusion, Revolution};
@@ -22,13 +23,13 @@ use tokio::sync::{Mutex, RwLock};
 
 ///处理带有loop的元件
 pub async fn gen_loop_geos(
-    db_option: Arc<DbOption>,
+    db_option: Arc<DbOptionExt>,
     loop_owner_refnos: &[RefnoEnum],
     sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
     sender: flume::Sender<ShapeInstancesData>,
 ) -> anyhow::Result<bool> {
     let t = Instant::now();
-    let batch_size = db_option.gen_model_batch_size;
+    let batch_size = db_option.inner.gen_model_batch_size;
     let loop_owner_cnt = loop_owner_refnos.len();
     if loop_owner_cnt == 0 {
         return Ok(true);

@@ -926,17 +926,78 @@ fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
     points
 }
 
-/// 从几何体实例提取所有关键点
+/// 从几何体实例提取增强关键点
+/// 
+/// 优先使用 GeomInstQuery 的 pts 字段（实际几何关键点），
+/// 如果 pts 为空则使用 AABB 增强关键点作为回退
 fn extract_geom_key_points(geom_insts: &[GeomInstQuery]) -> Vec<Point<Real>> {
-    let mut all_points = Vec::with_capacity(geom_insts.len() * 27);
+    let mut all_points = Vec::with_capacity(geom_insts.len() * 30);
 
     for geom_inst in geom_insts {
+        // 优先使用 pts 字段（来自几何体的实际关键点）
+        if let Some(ref pts) = geom_inst.pts {
+            if !pts.is_empty() {
+                // 使用实际几何关键点
+                for pt in pts {
+                    all_points.push(Point::new(pt.0.x, pt.0.y, pt.0.z));
+                }
+                // 同时添加 AABB 中心点以提高鲁棒性
+                let aabb: Aabb = geom_inst.world_aabb.into();
+                all_points.push(aabb.center());
+                continue;
+            }
+        }
+        
+        // 回退：使用 AABB 增强关键点
         let aabb: Aabb = geom_inst.world_aabb.into();
         let points = extract_aabb_key_points(&aabb);
         all_points.extend(points);
     }
 
     all_points
+}
+
+/// 从 TriMesh 顶点采样关键点
+/// 
+/// 策略：
+/// 1. 如果顶点数 <= max_samples，使用所有顶点
+/// 2. 否则均匀采样 max_samples 个顶点
+/// 3. 始终包含 mesh 的质心
+fn extract_key_points_from_mesh(mesh: &TriMesh, max_samples: usize) -> Vec<Point<Real>> {
+    let vertices = mesh.vertices();
+    let vertex_count = vertices.len();
+    
+    if vertex_count == 0 {
+        return vec![];
+    }
+    
+    let mut key_points = Vec::with_capacity(max_samples + 1);
+    
+    // 计算质心
+    let mut centroid = Point::new(0.0, 0.0, 0.0);
+    for v in vertices.iter() {
+        centroid.x += v.x;
+        centroid.y += v.y;
+        centroid.z += v.z;
+    }
+    let n = vertex_count as Real;
+    centroid = Point::new(centroid.x / n, centroid.y / n, centroid.z / n);
+    key_points.push(centroid);
+    
+    if vertex_count <= max_samples {
+        // 顶点数少，使用所有顶点
+        for v in vertices.iter() {
+            key_points.push(*v);
+        }
+    } else {
+        // 均匀采样
+        let step = vertex_count / max_samples;
+        for i in 0..max_samples {
+            key_points.push(vertices[i * step]);
+        }
+    }
+    
+    key_points
 }
 
 /// 判断关键点是否在面板 TriMesh 内
@@ -1932,12 +1993,13 @@ async fn query_panels_containing_refnos(
     let refno_list = refno_keys.join(",");
 
     // 查询包含这些 refnos 的房间面板关系
+    // 查询包含这些 refnos 的房间面板关系
     let sql = format!(
         r#"
-        select value [in, room_num] 
+        select value [`in`, room_num] 
         from room_relate 
-        where out in [{}]
-        group by in, room_num
+        where `out` in [{}]
+        group by `in`, room_num
         "#,
         refno_list
     );
@@ -1963,7 +2025,7 @@ async fn delete_room_relations_for_panels(panels: &[(RefnoEnum, String)]) -> any
     let panel_keys: Vec<String> = panels.iter().map(|(p, _)| p.to_pe_key()).collect();
     let panel_list = panel_keys.join(",");
 
-    let sql = format!("delete room_relate where in in [{}];", panel_list);
+    let sql = format!("delete room_relate where `in` in [{}];", panel_list);
 
     SUL_DB.query(sql).await?;
     debug!("已删除 {} 个面板的房间关系", panels.len());

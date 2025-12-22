@@ -1,6 +1,6 @@
 //! # 碰撞检测模块
 //!
-//! 基于 SQLite RTree (粗筛) + Parry3D (精算) 两阶段检测。
+//! 基于 DuckDB (粗筛) + Parry3D (精算) 两阶段检测。
 //!
 //! ## 使用
 //! ```rust
@@ -13,18 +13,17 @@
 use aios_core::shape::pdms_shape::PlantMesh;
 use aios_core::{GeomInstQuery, ModelHashInst, RefU64, RefnoEnum};
 use dashmap::DashMap;
-use parry3d::bounding_volume::Aabb;
+use parry3d::bounding_volume::{Aabb, BoundingVolume};
 use parry3d::math::{Isometry, Point, Real};
-use parry3d::query::{contact, PointQuery};
+use parry3d::query::contact;
 use parry3d::shape::{TriMesh, TriMeshFlags};
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::OnceCell;
-use tracing::{debug, error, info, warn};
+use std::time::Instant;
+use tracing::{info, warn};
+
+use crate::fast_model::export_model::duckdb_reader::DuckDBReader;
 
 // ============================================================================
 // 数据结构定义
@@ -50,8 +49,6 @@ pub struct CollisionConfig {
     pub tolerance: f32,
     /// 并发处理任务数
     pub concurrency: usize,
-    /// SQLite 数据库路径
-    pub db_path: PathBuf,
     /// 网格目录
     pub mesh_dir: PathBuf,
     /// 限制候选对数量 (None 表示无限制)
@@ -60,15 +57,13 @@ pub struct CollisionConfig {
 
 impl Default for CollisionConfig {
     fn default() -> Self {
-        // 尝试从全局配置获取 mesh 路径，否则使用默认值
         let mesh_dir = std::env::var("MESH_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("assets/meshes/lod_L0"));
-        
+
         Self {
             tolerance: 0.001, // 1mm
             concurrency: num_cpus::get().max(4),
-            db_path: PathBuf::from("aabb_cache.sqlite"),
             mesh_dir,
             limit: None,
         }
@@ -89,9 +84,11 @@ pub struct CollisionStats {
 // 碰撞检测器
 // ============================================================================
 
-/// 碰撞检测器
+/// 碰撞检测器（基于 DuckDB）
 pub struct CollisionDetector {
     config: CollisionConfig,
+    /// DuckDB 读取器
+    duckdb_reader: Arc<DuckDBReader>,
     /// TriMesh 缓存
     mesh_cache: Arc<DashMap<RefU64, Arc<TriMesh>>>,
 }
@@ -99,8 +96,10 @@ pub struct CollisionDetector {
 impl CollisionDetector {
     /// 创建碰撞检测器
     pub fn new(config: CollisionConfig) -> anyhow::Result<Self> {
+        let reader = DuckDBReader::open_latest()?;
         Ok(Self {
             config,
+            duckdb_reader: Arc::new(reader),
             mesh_cache: Arc::new(DashMap::new()),
         })
     }
@@ -111,118 +110,86 @@ impl CollisionDetector {
     }
 
     // ------------------------------------------------------------------------
-    // 粗筛阶段 (Broad Phase)
+    // 粗筛阶段 (Broad Phase) - 使用 DuckDB
     // ------------------------------------------------------------------------
 
-    /// 广筛：通过 SQLite RTree 查询所有潜在碰撞对
-    ///
-    /// 使用 Self-Join 方式：
-    /// ```sql
-    /// SELECT t1.id, t2.id FROM aabb_index AS t1, aabb_index AS t2
-    /// WHERE t1.id < t2.id AND ... (AABB overlap check)
-    /// ```
-    pub fn broad_phase(&self, noun_filter: Option<&str>) -> anyhow::Result<Vec<(RefU64, RefU64)>> {
-        let conn = Connection::open(&self.config.db_path)?;
-        Self::configure_connection(&conn)?;
+    /// 广筛：通过 DuckDB 查询所有潜在碰撞对
+    pub fn broad_phase(&self, _noun_filter: Option<&str>) -> anyhow::Result<Vec<(RefU64, RefU64)>> {
+        // 使用全局 AABB 范围查询所有 refnos
+        let all_refnos = self.duckdb_reader.query_by_bounding_box(
+            f64::MIN, f64::MIN, f64::MIN,
+            f64::MAX, f64::MAX, f64::MAX,
+        )?;
 
-        // 构建 SQL
-        // 如果需要 noun 过滤，需要 JOIN items 表
-        let sql = if let Some(noun) = noun_filter {
-            format!(
-                r#"
-                SELECT t1.id, t2.id
-                FROM aabb_index AS t1
-                JOIN items AS i1 ON i1.id = t1.id
-                JOIN aabb_index AS t2 ON t1.id < t2.id
-                JOIN items AS i2 ON i2.id = t2.id
-                WHERE t1.max_x >= t2.min_x AND t1.min_x <= t2.max_x
-                  AND t1.max_y >= t2.min_y AND t1.min_y <= t2.max_y
-                  AND t1.max_z >= t2.min_z AND t1.min_z <= t2.max_z
-                  AND i1.noun = '{noun}'
-                  AND i2.noun = '{noun}'
-                "#,
-                noun = noun.replace('\'', "''")
-            )
-        } else {
-            r#"
-                SELECT t1.id, t2.id
-                FROM aabb_index AS t1, aabb_index AS t2
-                WHERE t1.id < t2.id
-                  AND t1.max_x >= t2.min_x AND t1.min_x <= t2.max_x
-                  AND t1.max_y >= t2.min_y AND t1.min_y <= t2.max_y
-                  AND t1.max_z >= t2.min_z AND t1.min_z <= t2.max_z
-            "#
-            .to_string()
-        };
-
-        // 添加 LIMIT
-        let sql = if let Some(limit) = self.config.limit {
-            format!("{} LIMIT {}", sql, limit)
-        } else {
-            sql
-        };
-
-        let mut stmt = conn.prepare(&sql)?;
-        let pairs = stmt
-            .query_map([], |row| {
-                let a: i64 = row.get(0)?;
-                let b: i64 = row.get(1)?;
-                Ok((RefU64(a as u64), RefU64(b as u64)))
-            })?
-            .filter_map(|r| r.ok())
-            .collect::<Vec<_>>();
-
-        Ok(pairs)
-    }
-
-    /// 通过查询指定区域获取候选对
-    pub fn broad_phase_in_region(&self, region: &Aabb) -> anyhow::Result<Vec<(RefU64, RefU64)>> {
-        let conn = Connection::open(&self.config.db_path)?;
-        Self::configure_connection(&conn)?;
-
-        // 先查询在区域内的所有 ID
-        let sql = r#"
-            SELECT id FROM aabb_index
-            WHERE max_x >= ?1 AND min_x <= ?2
-              AND max_y >= ?3 AND min_y <= ?4
-              AND max_z >= ?5 AND min_z <= ?6
-        "#;
-
-        let mut stmt = conn.prepare(sql)?;
-        let ids: Vec<RefU64> = stmt
-            .query_map(
-                params![
-                    region.mins.x as f64,
-                    region.maxs.x as f64,
-                    region.mins.y as f64,
-                    region.maxs.y as f64,
-                    region.mins.z as f64,
-                    region.maxs.z as f64,
-                ],
-                |row| Ok(RefU64(row.get::<_, i64>(0)? as u64)),
-            )?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        // 在内存中生成所有配对 (需要获取 AABB 进行二次检查)
+        // 查询每个 refno 的 AABB，构建碰撞对
         let mut pairs = Vec::new();
-        for i in 0..ids.len() {
-            for j in (i + 1)..ids.len() {
-                pairs.push((ids[i], ids[j]));
+        let mut aabbs: Vec<(RefU64, Aabb)> = Vec::new();
+
+        for refno_str in all_refnos {
+            if let Some((min_x, min_y, min_z, max_x, max_y, max_z)) = self.duckdb_reader.query_aabb(&refno_str)? {
+                let parts: Vec<&str> = refno_str.split('_').collect();
+                if parts.len() >= 2 {
+                    if let (Ok(dbno), Ok(sesno)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                        let refno = RefU64::from_two_nums(dbno, sesno);
+                        let aabb = Aabb::new(
+                            [min_x as f32, min_y as f32, min_z as f32].into(),
+                            [max_x as f32, max_y as f32, max_z as f32].into(),
+                        );
+                        aabbs.push((refno, aabb));
+                    }
+                }
+            }
+        }
+
+        // 使用 AABB 检测碰撞对
+        for i in 0..aabbs.len() {
+            for j in (i + 1)..aabbs.len() {
+                let (refno_a, aabb_a) = &aabbs[i];
+                let (refno_b, aabb_b) = &aabbs[j];
+                if aabb_a.intersects(aabb_b) {
+                    pairs.push((*refno_a, *refno_b));
+                    if let Some(limit) = self.config.limit {
+                        if pairs.len() >= limit {
+                            return Ok(pairs);
+                        }
+                    }
+                }
             }
         }
 
         Ok(pairs)
     }
 
-    fn configure_connection(conn: &Connection) -> anyhow::Result<()> {
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             PRAGMA cache_size = 10000;
-             PRAGMA temp_store = MEMORY;",
+    /// 通过查询指定区域获取候选对
+    pub fn broad_phase_in_region(&self, region: &Aabb) -> anyhow::Result<Vec<(RefU64, RefU64)>> {
+        let refno_strs = self.duckdb_reader.query_by_bounding_box(
+            region.mins.x as f64,
+            region.mins.y as f64,
+            region.mins.z as f64,
+            region.maxs.x as f64,
+            region.maxs.y as f64,
+            region.maxs.z as f64,
         )?;
-        Ok(())
+
+        let mut refnos = Vec::new();
+        for refno_str in refno_strs {
+            let parts: Vec<&str> = refno_str.split('_').collect();
+            if parts.len() >= 2 {
+                if let (Ok(dbno), Ok(sesno)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                    refnos.push(RefU64::from_two_nums(dbno, sesno));
+                }
+            }
+        }
+
+        // 生成所有配对
+        let mut pairs = Vec::new();
+        for i in 0..refnos.len() {
+            for j in (i + 1)..refnos.len() {
+                pairs.push((refnos[i], refnos[j]));
+            }
+        }
+
+        Ok(pairs)
     }
 
     // ------------------------------------------------------------------------
@@ -243,17 +210,16 @@ impl CollisionDetector {
 
         // 2. 使用 Parry3D 进行精确接触检测
         let identity = Isometry::identity();
-        let prediction = tolerance as Real; // 预测距离
+        let prediction = tolerance as Real;
 
         let contact_result = contact(&identity, mesh_a.as_ref(), &identity, mesh_b.as_ref(), prediction)?;
 
         match contact_result {
             Some(c) => {
-                // 有接触或穿透
                 let event = CollisionEvent {
                     pair: (refno_a.min(refno_b), refno_a.max(refno_b)),
                     contact_point: Some([c.point1.x as f32, c.point1.y as f32, c.point1.z as f32]),
-                    penetration_depth: (-c.dist) as f32, // dist 为负表示穿透
+                    penetration_depth: (-c.dist) as f32,
                     normal: Some([c.normal1.x as f32, c.normal1.y as f32, c.normal1.z as f32]),
                 };
                 Ok(Some(event))
@@ -288,7 +254,7 @@ impl CollisionDetector {
         let inst_trans = model_inst.transform;
         let combined = world_trans * inst_trans;
 
-        // 加载 TriMesh (优先 L0)
+        // 加载 TriMesh
         let mesh = load_trimesh_for_collision(&self.config.mesh_dir, geo_hash, combined.to_matrix()).await?;
 
         let mesh_arc = Arc::new(mesh);
@@ -374,10 +340,11 @@ impl CollisionDetector {
         Ok((events, stats))
     }
 
-    /// 创建用于 async 的克隆 (共享 mesh_cache)
+    /// 创建用于 async 的克隆 (共享 mesh_cache 和 duckdb_reader)
     fn clone_for_async(&self) -> Self {
         Self {
             config: self.config.clone(),
+            duckdb_reader: self.duckdb_reader.clone(),
             mesh_cache: self.mesh_cache.clone(),
         }
     }
@@ -393,7 +360,6 @@ async fn load_trimesh_for_collision(
     geo_hash: &str,
     world_matrix: glam::Mat4,
 ) -> anyhow::Result<TriMesh> {
-    // 尝试多个 LOD 级别
     let lod_levels = ["L0", "L1", "L2"];
 
     let base_dir = mesh_dir
@@ -495,10 +461,6 @@ fn load_and_transform_mesh(path: &PathBuf, transform: glam::Mat4) -> anyhow::Res
     Ok(tri_mesh)
 }
 
-// ============================================================================
-// 测试
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,7 +473,6 @@ mod tests {
             penetration_depth: 0.0,
             normal: None,
         };
-        // 应该保证 pair.0 < pair.1
         assert!(event.pair.0 < event.pair.1 || event.pair.0 == RefU64(100));
     }
 }

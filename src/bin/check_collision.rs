@@ -2,9 +2,9 @@
 //!
 //! 用法:
 //! ```bash
-//! cargo run --bin check_collision --features sqlite-index -- --help
-//! cargo run --bin check_collision --features sqlite-index -- --limit 1000
-//! cargo run --bin check_collision --features sqlite-index -- --noun PIPE
+//! cargo run --bin check_collision --features duckdb-export -- --help
+//! cargo run --bin check_collision --features duckdb-export -- --limit 1000
+//! cargo run --bin check_collision --features duckdb-export -- --noun PIPE
 //! ```
 
 use aios_database::fast_model::{CollisionConfig, CollisionDetector};
@@ -13,12 +13,8 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "check_collision")]
-#[command(about = "基于 SQLite RTree + Parry3D 的碰撞检测工具")]
+#[command(about = "基于 DuckDB + Parry3D 的碰撞检测工具")]
 struct Args {
-    /// SQLite 数据库路径
-    #[arg(short, long, default_value = "aabb_cache.sqlite")]
-    db_path: PathBuf,
-
     /// 网格目录
     #[arg(short, long)]
     mesh_dir: Option<PathBuf>,
@@ -53,7 +49,6 @@ async fn main() -> anyhow::Result<()> {
 
     // 构建配置
     let mut config = CollisionConfig::default();
-    config.db_path = args.db_path;
     config.tolerance = args.tolerance;
     config.concurrency = args.concurrency;
     config.limit = args.limit;
@@ -62,8 +57,8 @@ async fn main() -> anyhow::Result<()> {
         config.mesh_dir = mesh_dir;
     }
 
-    println!("=== 碰撞检测工具 ===");
-    println!("数据库: {:?}", config.db_path);
+    println!("=== 碰撞检测工具 (DuckDB) ===");
+    println!("数据源: assets/web_duckdb/latest.json");
     println!("网格目录: {:?}", config.mesh_dir);
     println!("容差: {}m", config.tolerance);
     println!("并发: {}", config.concurrency);

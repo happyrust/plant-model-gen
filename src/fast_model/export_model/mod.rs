@@ -10,6 +10,16 @@ pub mod import_glb;
 pub mod model_exporter;
 pub mod name_config;
 pub mod parquet_writer;
+#[cfg(feature = "duckdb-export")]
+pub mod duckdb_writer;
+#[cfg(feature = "duckdb-export")]
+pub mod duckdb_exporter;
+#[cfg(feature = "duckdb-export")]
+pub mod duckdb_reader;
+pub mod simple_color_palette;
 
 pub use export_common::*;
 pub use name_config::NameConfig;
+#[cfg(feature = "duckdb-export")]
+pub use duckdb_reader::*;
+

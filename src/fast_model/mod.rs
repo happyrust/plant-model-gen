@@ -27,7 +27,7 @@ pub mod mesh_generate;
 pub mod room_model; // 改进版本的房间模型
 
 // Re-export room model functions
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
 pub use room_model::{
     IncrementalUpdateResult, RoomBuildStats, build_room_relations,
     rebuild_room_relations_for_rooms, regenerate_room_models_by_keywords,
@@ -56,16 +56,20 @@ pub mod aabb_tree;
 
 pub mod incremental;
 
-#[cfg(feature = "sqlite-index")]
-pub mod aabb_cache;
+// aabb_cache 已废弃，改用 DuckDB
+// #[cfg(feature = "sqlite-index")]
+// pub mod aabb_cache;
+
+// session 模块保留供 web_server handlers 使用
 #[cfg(feature = "sqlite-index")]
 pub mod session;
 
 pub mod concurrency;
 
-#[cfg(feature = "sqlite-index")]
+// 碰撞检测：改用 DuckDB 空间查询
+#[cfg(feature = "duckdb-export")]
 pub mod collision_detect;
-#[cfg(feature = "sqlite-index")]
+#[cfg(feature = "duckdb-export")]
 pub use collision_detect::{CollisionConfig, CollisionDetector, CollisionEvent, CollisionStats};
 
 use aios_core::RefU64;

@@ -163,6 +163,7 @@ use super::{
     models::*,
     simple_templates::render_database_connection_page,
 };
+#[cfg(feature = "sqlite-index")]
 use crate::fast_model::session::{PdmsTimeExtractor, SESSION_STORE};
 #[cfg(feature = "sqlite-index")]
 use crate::spatial_index::SqliteSpatialIndex;

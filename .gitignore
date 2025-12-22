@@ -135,4 +135,4 @@ aios-database
 # Lock files (optional - uncomment if you want to ignore them)
 # Cargo.lock
 # package-lock.json
-# pnpm-lock.yaml
+# pnpm-lock.yamlexport.sql

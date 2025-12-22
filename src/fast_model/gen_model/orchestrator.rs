@@ -21,8 +21,10 @@ use crate::fast_model::capture::capture_refnos_if_enabled;
 use crate::fast_model::mesh_generate::process_meshes_update_db_deep;
 use crate::fast_model::pdms_inst::save_instance_data_optimize;
 use crate::options::{DbOptionExt, MeshFormat};
-#[cfg(feature = "sqlite-index")]
+#[cfg(feature = "duckdb-export")]
 use crate::spatial_index::SqliteSpatialIndex;
+#[cfg(feature = "duckdb-export")]
+use crate::fast_model::export_model::duckdb_exporter::DuckDBStreamWriter;
 
 use super::config::FullNounConfig;
 use super::errors::{FullNounError, Result};
@@ -150,10 +152,34 @@ async fn process_full_noun_mode(
     let (sender, receiver) = flume::unbounded();
     let replace_exist = db_option.inner.is_replace_mesh();
 
+    // 初始化 DuckDB 写入器（如果启用 duckdb-export feature）
+    #[cfg(feature = "duckdb-export")]
+    let duckdb_writer = {
+        let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
+        let duckdb_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output")).join("duckdb");
+        match DuckDBStreamWriter::new(&duckdb_dir) {
+            Ok(writer) => Some(std::sync::Arc::new(writer)),
+            Err(e) => {
+                eprintln!("[DuckDB] 初始化写入器失败: {}, 跳过 DuckDB 导出", e);
+                None
+            }
+        }
+    };
+    #[cfg(feature = "duckdb-export")]
+    let duckdb_writer_clone = duckdb_writer.clone();
+
     let insert_handle = tokio::spawn(async move {
         while let Ok(shape_insts) = receiver.recv_async().await {
+            // 保存到 SurrealDB
             if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
                 eprintln!("保存实例数据失败: {}", e);
+            }
+            // 同时写入 DuckDB（如果启用）
+            #[cfg(feature = "duckdb-export")]
+            if let Some(ref writer) = duckdb_writer_clone {
+                if let Err(e) = writer.write_batch(&shape_insts) {
+                    eprintln!("[DuckDB] 写入批次失败: {}", e);
+                }
             }
         }
     });
@@ -164,6 +190,14 @@ async fn process_full_noun_mode(
             .map_err(|e| anyhow::anyhow!("Full Noun 生成失败: {}", e))?;
 
     let _ = insert_handle.await;
+
+    // 完成 DuckDB 写入并创建索引
+    #[cfg(feature = "duckdb-export")]
+    if let Some(ref writer) = duckdb_writer {
+        if let Err(e) = writer.finalize() {
+            eprintln!("[DuckDB] 创建索引失败: {}", e);
+        }
+    }
 
     println!(
         "[gen_model] Full Noun 模式 insts 入库完成，用时 {} ms",
@@ -303,10 +337,33 @@ async fn process_targeted_generation(
 
     let replace_exist = db_option.inner.is_replace_mesh();
 
+    // 初始化 DuckDB 写入器（如果启用 duckdb-export feature）
+    #[cfg(feature = "duckdb-export")]
+    let duckdb_writer = {
+        let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
+        let duckdb_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output")).join("duckdb");
+        match DuckDBStreamWriter::new(&duckdb_dir) {
+            Ok(writer) => Some(std::sync::Arc::new(writer)),
+            Err(e) => {
+                eprintln!("[DuckDB] 初始化写入器失败: {}, 跳过 DuckDB 导出", e);
+                None
+            }
+        }
+    };
+    #[cfg(feature = "duckdb-export")]
+    let duckdb_writer_clone = duckdb_writer.clone();
+
     let insert_task = tokio::task::spawn(async move {
         while let Ok(shape_insts) = receiver.recv_async().await {
             if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
                 eprintln!("保存实例数据失败: {}", e);
+            }
+            // 同时写入 DuckDB（如果启用）
+            #[cfg(feature = "duckdb-export")]
+            if let Some(ref writer) = duckdb_writer_clone {
+                if let Err(e) = writer.write_batch(&shape_insts) {
+                    eprintln!("[DuckDB] 写入批次失败: {}", e);
+                }
             }
         }
     });
@@ -324,6 +381,14 @@ async fn process_targeted_generation(
 
     drop(sender);
     let _ = insert_task.await;
+
+    // 完成 DuckDB 写入并创建索引
+    #[cfg(feature = "duckdb-export")]
+    if let Some(ref writer) = duckdb_writer {
+        if let Err(e) = writer.finalize() {
+            eprintln!("[DuckDB] 创建索引失败: {}", e);
+        }
+    }
 
     println!(
         "[gen_model] {}路径模型生成完成，共 {} 个根节点",
@@ -397,6 +462,20 @@ async fn process_full_database_generation(
         println!("[gen_model] 未找到需要生成的数据库，直接结束");
     }
 
+    // 初始化 DuckDB 写入器（如果启用 duckdb-export feature）
+    #[cfg(feature = "duckdb-export")]
+    let duckdb_writer = {
+        let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
+        let duckdb_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output")).join("duckdb");
+        match DuckDBStreamWriter::new(&duckdb_dir) {
+            Ok(writer) => Some(std::sync::Arc::new(writer)),
+            Err(e) => {
+                eprintln!("[DuckDB] 初始化写入器失败: {}, 跳过 DuckDB 导出", e);
+                None
+            }
+        }
+    };
+
     for dbno in dbnos.clone() {
         println!("[gen_model] -> 开始处理数据库 {}", dbno);
         let db_start = Instant::now();
@@ -404,10 +483,20 @@ async fn process_full_database_generation(
         let (sender, receiver) = flume::unbounded();
         let receiver: flume::Receiver<aios_core::geometry::ShapeInstancesData> = receiver.clone();
 
+        #[cfg(feature = "duckdb-export")]
+        let duckdb_writer_clone = duckdb_writer.clone();
+
         let insert_task = tokio::task::spawn(async move {
             while let Ok(shape_insts) = receiver.recv_async().await {
                 if let Err(e) = save_instance_data_optimize(&shape_insts, false).await {
                     eprintln!("保存实例数据失败: {}", e);
+                }
+                // 同时写入 DuckDB（如果启用）
+                #[cfg(feature = "duckdb-export")]
+                if let Some(ref writer) = duckdb_writer_clone {
+                    if let Err(e) = writer.write_batch(&shape_insts) {
+                        eprintln!("[DuckDB] 写入批次失败: {}", e);
+                    }
                 }
             }
         });
@@ -449,6 +538,14 @@ async fn process_full_database_generation(
             dbno,
             db_start.elapsed().as_millis()
         );
+    }
+
+    // 完成 DuckDB 写入并创建索引
+    #[cfg(feature = "duckdb-export")]
+    if let Some(ref writer) = duckdb_writer {
+        if let Err(e) = writer.finalize() {
+            eprintln!("[DuckDB] 创建索引失败: {}", e);
+        }
     }
 
     initialize_spatial_index();
@@ -522,7 +619,7 @@ async fn execute_manual_boolean_operations(
 }
 
 /// 初始化空间索引（如果启用）
-#[cfg(feature = "sqlite-index")]
+#[cfg(feature = "duckdb-export")]
 fn initialize_spatial_index() {
     if SqliteSpatialIndex::is_enabled() {
         match SqliteSpatialIndex::with_default_path() {
@@ -532,7 +629,7 @@ fn initialize_spatial_index() {
     }
 }
 
-#[cfg(not(feature = "sqlite-index"))]
+#[cfg(not(feature = "duckdb-export"))]
 fn initialize_spatial_index() {
     // No-op when feature is disabled
 }

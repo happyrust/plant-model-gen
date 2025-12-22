@@ -1086,13 +1086,13 @@ pub async fn update_inst_relate_aabbs_by_refnos(
     replace_exist: bool,
 ) -> anyhow::Result<()> {
     // 如果没有启用 SQLite 索引，直接使用 aios_core 的基础版本
-    // #[cfg(not(feature = "sqlite-index"))]
+    // #[cfg(not(feature = "duckdb-export"))]
     {
         return aios_core::update_inst_relate_aabbs_by_refnos(refnos, replace_exist).await;
     }
 
     // 启用了 SQLite 索引，使用优化版本
-    #[cfg(feature = "sqlite-index")]
+    #[cfg(feature = "duckdb-export")]
     {
         const CHUNK: usize = 100;
         let aabb_map = DashMap::new();

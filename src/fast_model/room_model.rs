@@ -7,7 +7,7 @@ use aios_core::{GeomInstQuery, GeomPtsQuery, ModelHashInst, RefU64, SUL_DB};
 use aios_core::{RefnoEnum, init_demo_test_surreal, init_test_surreal};
 
 // 使用改进的房间查询模块（暂时注释掉，因为这些模块可能不存在）
-// #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+// #[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
 // use aios_core::room::query_v2::{
 //     query_room_number_by_point_v2,
 //     batch_query_room_numbers,
@@ -16,7 +16,7 @@ use aios_core::{RefnoEnum, init_demo_test_surreal, init_test_surreal};
 //     preheat_geometry_cache,
 // };
 
-// #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+// #[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
 // use aios_core::spatial::hybrid_index::{get_hybrid_index, QueryOptions};
 
 use bevy_transform::TransformPoint;
@@ -176,7 +176,7 @@ async fn get_enhanced_trimesh_cache() -> &'static DashMap<String, Arc<TriMesh>> 
 /// 2. 优化几何缓存机制，减少重复加载
 /// 3. 添加详细的性能统计和监控
 /// 4. 支持并发处理和批量操作
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
 pub async fn build_room_relations(db_option: &DbOption) -> anyhow::Result<RoomBuildStats> {
     info!("开始构建房间关系 (改进版本)");
 
@@ -216,7 +216,7 @@ pub async fn build_room_relations(db_option: &DbOption) -> anyhow::Result<RoomBu
     Ok(stats)
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
 async fn compute_room_relations(
     mesh_dir: &PathBuf,
     room_panel_map: Vec<(RefnoEnum, String, Vec<RefnoEnum>)>,
@@ -462,7 +462,7 @@ async fn create_room_panel_relations_batch(
     Ok(())
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
 async fn process_panel_for_room(
     mesh_dir: &PathBuf,
     panel_refno: RefnoEnum,
@@ -498,7 +498,7 @@ async fn process_panel_for_room(
 }
 
 /// 改进版本的房间构件计算（基于关键点检测）
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
 pub async fn cal_room_refnos(
     mesh_dir: &PathBuf,
     panel_refno: RefnoEnum,
@@ -511,7 +511,7 @@ pub async fn cal_room_refnos(
     cal_room_refnos_with_options(mesh_dir, panel_refno, exclude_refnos, options).await
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
 async fn cal_room_refnos_with_options(
     mesh_dir: &PathBuf,
     panel_refno: RefnoEnum,
@@ -1153,14 +1153,14 @@ async fn collect_geometry_hashes(
 }
 
 /// 估算内存使用量
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
 async fn estimate_memory_usage() -> f32 {
     let cache = get_enhanced_geometry_cache().await;
     let cache_size = cache.len() as f32 * 0.5; // 假设每个缓存项平均 0.5MB
     cache_size
 }
 
-#[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "duckdb-export")))]
 async fn estimate_memory_usage() -> f32 {
     // 在不启用 sqlite-index 特性时，返回一个保守估计
     let cache = get_enhanced_geometry_cache().await;
@@ -1890,7 +1890,7 @@ pub struct IncrementalUpdateResult {
 ///
 /// # 返回值
 /// * `IncrementalUpdateResult` - 更新结果统计
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
 pub async fn update_room_relations_incremental(
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<IncrementalUpdateResult> {
@@ -1980,7 +1980,7 @@ pub async fn update_room_relations_incremental(
 }
 
 /// 查询包含指定 refnos 的房间面板
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
 async fn query_panels_containing_refnos(
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<Vec<(RefnoEnum, String)>> {
@@ -2016,7 +2016,7 @@ async fn query_panels_containing_refnos(
 }
 
 /// 删除指定面板的房间关系
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
 async fn delete_room_relations_for_panels(panels: &[(RefnoEnum, String)]) -> anyhow::Result<()> {
     if panels.is_empty() {
         return Ok(());
@@ -2044,7 +2044,7 @@ async fn delete_room_relations_for_panels(panels: &[(RefnoEnum, String)]) -> any
 ///
 /// # 返回值
 /// * `(房间数, 元素数, 耗时ms)` - 处理结果统计
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
 pub async fn regenerate_room_models_by_keywords(
     room_keywords: &Vec<String>,
     db_option: &DbOption,
@@ -2112,7 +2112,7 @@ pub async fn regenerate_room_models_by_keywords(
 ///
 /// # 返回值
 /// * `RoomBuildStats` - 构建统计信息
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
 pub async fn rebuild_room_relations_for_rooms(
     room_numbers: Option<Vec<String>>,
     db_option: &DbOption,

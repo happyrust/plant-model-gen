@@ -15,6 +15,7 @@ use crate::web_server::{
 };
 
 // 引入真实实现作为委托
+#[cfg(feature = "sqlite-index")]
 use crate::fast_model::session::{PdmsTimeExtractor, SESSION_STORE};
 use crate::web_server::handlers as real_handlers;
 use aios_core::SUL_DB;

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 use crate::fast_model::collision_detect::{
     CollisionConfig, CollisionDetector, CollisionEvent, CollisionStats,
 };
@@ -122,7 +122,7 @@ pub fn create_collision_routes(state: CollisionApiState) -> Router {
 // ============================================================================
 
 /// 执行碰撞检测
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 async fn detect_collisions(
     State(state): State<CollisionApiState>,
     Json(request): Json<CollisionDetectRequest>,
@@ -193,7 +193,7 @@ async fn detect_collisions(
     }
 }
 
-#[cfg(not(feature = "duckdb-export"))]
+#[cfg(not(feature = "duckdb-feature"))]
 async fn detect_collisions(
     State(_state): State<CollisionApiState>,
     Json(_request): Json<CollisionDetectRequest>,
@@ -202,12 +202,12 @@ async fn detect_collisions(
         success: false,
         stats: None,
         events: vec![],
-        error_message: Some("Collision detection requires duckdb-export feature".to_string()),
+        error_message: Some("Collision detection requires duckdb-feature feature".to_string()),
     }))
 }
 
 /// 获取服务状态
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 async fn get_status(
     State(state): State<CollisionApiState>,
 ) -> Result<Json<CollisionStatusResponse>, StatusCode> {
@@ -222,7 +222,7 @@ async fn get_status(
     }))
 }
 
-#[cfg(not(feature = "duckdb-export"))]
+#[cfg(not(feature = "duckdb-feature"))]
 async fn get_status(
     State(state): State<CollisionApiState>,
 ) -> Result<Json<CollisionStatusResponse>, StatusCode> {

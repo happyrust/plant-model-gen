@@ -96,7 +96,7 @@ pub struct CollisionDetector {
 impl CollisionDetector {
     /// 创建碰撞检测器
     pub fn new(config: CollisionConfig) -> anyhow::Result<Self> {
-        let reader = DuckDBReader::open_latest()?;
+        let reader = DuckDBReader::open_global_or_latest()?;
         Ok(Self {
             config,
             duckdb_reader: Arc::new(reader),

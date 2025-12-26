@@ -1,8 +1,4 @@
 #V2
-SELECT * FROM pe:24381_36948, pe:24381_36949, pe:24381_36950, pe:24381_36951;
-SELECT PPOS FROM pe:24381_36948, pe:24381_36949, pe:24381_36950, pe:24381_36951;
-SELECT * FROM loop WHERE owner = pe:24381_36946 OR owner = pe:24381_36947;
-SELECT * FROM loop WHERE string::contains(id, '24381_36946') LIMIT 5;
 SELECT count() FROM loop GROUP ALL; SELECT * FROM loop LIMIT 2;
 SELECT count() FROM ploop GROUP ALL; SELECT * FROM ploop LIMIT 2;
 INFO FOR DB;
@@ -99,3 +95,7 @@ USE NS `1516` DB `ams`; SELECT count() FROM type_node; SELECT count() FROM type_
 USE NS `1516` DB `AvevaMarineSample`; INFO FOR DB
 SELECT geo_hash FROM inst_relate WHERE refno = '24381/46958' LIMIT 5
 SELECT VALUE count() FROM room_relate GROUP ALL LIMIT 1;
+SELECT * FROM inst_relate WHERE in = pe:17496_106028;
+SELECT in.id, aabb, world_trans, generic FROM inst_relate LIMIT 5;
+SELECT in.id, generic, aabb FROM inst_relate WHERE aabb != NONE LIMIT 5;
+SELECT id FROM pe WHERE noun IN ['PIPE', 'ELBO', 'BRAN', 'EQUI'] LIMIT 5;

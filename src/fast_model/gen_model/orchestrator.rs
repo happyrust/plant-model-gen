@@ -18,13 +18,12 @@ use aios_core::RefnoEnum;
 use crate::data_interface::increment_record::IncrGeoUpdateLog;
 use crate::data_interface::sesno_increment::get_changes_at_sesno;
 use crate::fast_model::capture::capture_refnos_if_enabled;
-use crate::fast_model::mesh_generate::process_meshes_update_db_deep;
+use crate::fast_model::mesh_generate::run_mesh_worker;
 use crate::fast_model::pdms_inst::save_instance_data_optimize;
 use crate::options::{DbOptionExt, MeshFormat};
-#[cfg(feature = "duckdb-export")]
-use crate::spatial_index::SqliteSpatialIndex;
-#[cfg(feature = "duckdb-export")]
-use crate::fast_model::export_model::duckdb_exporter::DuckDBStreamWriter;
+use crate::fast_model::export_model::ParquetStreamWriter;
+#[cfg(feature = "duckdb-feature")]
+use crate::fast_model::export_model::{DuckDBStreamWriter, DuckDBWriteMode};
 
 use super::config::FullNounConfig;
 use super::errors::{FullNounError, Result};
@@ -152,12 +151,24 @@ async fn process_full_noun_mode(
     let (sender, receiver) = flume::unbounded();
     let replace_exist = db_option.inner.is_replace_mesh();
 
-    // 初始化 DuckDB 写入器（如果启用 duckdb-export feature）
-    #[cfg(feature = "duckdb-export")]
+    // 初始化 Parquet 写入器
+    let parquet_writer = {
+        let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
+        let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
+        match ParquetStreamWriter::new(&parquet_dir) {
+            Ok(writer) => Some(std::sync::Arc::new(writer)),
+            Err(e) => {
+                eprintln!("[Parquet] 初始化写入器失败: {}, 跳过 Parquet 导出", e);
+                None
+            }
+        }
+    };
+    #[cfg(feature = "duckdb-feature")]
     let duckdb_writer = {
         let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
-        let duckdb_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output")).join("duckdb");
-        match DuckDBStreamWriter::new(&duckdb_dir) {
+        let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
+        let duckdb_dir = parquet_dir.join("database_models/_global");
+        match DuckDBStreamWriter::new(&duckdb_dir, DuckDBWriteMode::Rebuild) {
             Ok(writer) => Some(std::sync::Arc::new(writer)),
             Err(e) => {
                 eprintln!("[DuckDB] 初始化写入器失败: {}, 跳过 DuckDB 导出", e);
@@ -165,7 +176,8 @@ async fn process_full_noun_mode(
             }
         }
     };
-    #[cfg(feature = "duckdb-export")]
+    let parquet_writer_clone = parquet_writer.clone();
+    #[cfg(feature = "duckdb-feature")]
     let duckdb_writer_clone = duckdb_writer.clone();
 
     let insert_handle = tokio::spawn(async move {
@@ -174,8 +186,13 @@ async fn process_full_noun_mode(
             if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
                 eprintln!("保存实例数据失败: {}", e);
             }
-            // 同时写入 DuckDB（如果启用）
-            #[cfg(feature = "duckdb-export")]
+            // 同时写入 Parquet（如果启用）
+            if let Some(ref writer) = parquet_writer_clone {
+                if let Err(e) = writer.write_batch(&shape_insts) {
+                    eprintln!("[Parquet] 写入批次失败: {}", e);
+                }
+            }
+            #[cfg(feature = "duckdb-feature")]
             if let Some(ref writer) = duckdb_writer_clone {
                 if let Err(e) = writer.write_batch(&shape_insts) {
                     eprintln!("[DuckDB] 写入批次失败: {}", e);
@@ -191,11 +208,16 @@ async fn process_full_noun_mode(
 
     let _ = insert_handle.await;
 
-    // 完成 DuckDB 写入并创建索引
-    #[cfg(feature = "duckdb-export")]
+    // 完成 Parquet 写入并合并文件
+    if let Some(ref writer) = parquet_writer {
+        if let Err(e) = writer.finalize() {
+            eprintln!("[Parquet] 合并文件失败: {}", e);
+        }
+    }
+    #[cfg(feature = "duckdb-feature")]
     if let Some(ref writer) = duckdb_writer {
         if let Err(e) = writer.finalize() {
-            eprintln!("[DuckDB] 创建索引失败: {}", e);
+            eprintln!("[DuckDB] finalize 失败: {}", e);
         }
     }
 
@@ -218,15 +240,14 @@ async fn process_full_noun_mode(
         all_refnos.extend(loops);
         all_refnos.extend(prims);
 
-        if !all_refnos.is_empty() {
-            if let Err(e) = process_meshes_update_db_deep(db_option, &all_refnos).await {
-                eprintln!("[gen_model] 更新模型数据失败: {}", e);
-            } else {
-                println!(
-                    "[gen_model] Full Noun 模式三角网格生成完成，用时 {} ms",
-                    mesh_start.elapsed().as_millis()
-                );
-            }
+        // 使用 mesh worker 后台扫描 inst_geo 表生成 mesh
+        if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
+            eprintln!("[gen_model] mesh worker 失败: {}", e);
+        } else {
+            println!(
+                "[gen_model] Full Noun 模式 mesh 生成完成，用时 {} ms",
+                mesh_start.elapsed().as_millis()
+            );
         }
 
         // 3️⃣ 可选执行布尔运算
@@ -337,12 +358,24 @@ async fn process_targeted_generation(
 
     let replace_exist = db_option.inner.is_replace_mesh();
 
-    // 初始化 DuckDB 写入器（如果启用 duckdb-export feature）
-    #[cfg(feature = "duckdb-export")]
+    // 初始化 Parquet 写入器
+    let parquet_writer = {
+        let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
+        let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
+        match ParquetStreamWriter::new(&parquet_dir) {
+            Ok(writer) => Some(std::sync::Arc::new(writer)),
+            Err(e) => {
+                eprintln!("[Parquet] 初始化写入器失败: {}, 跳过 Parquet 导出", e);
+                None
+            }
+        }
+    };
+    #[cfg(feature = "duckdb-feature")]
     let duckdb_writer = {
         let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
-        let duckdb_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output")).join("duckdb");
-        match DuckDBStreamWriter::new(&duckdb_dir) {
+        let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
+        let duckdb_dir = parquet_dir.join("database_models/_global");
+        match DuckDBStreamWriter::new(&duckdb_dir, DuckDBWriteMode::Append) {
             Ok(writer) => Some(std::sync::Arc::new(writer)),
             Err(e) => {
                 eprintln!("[DuckDB] 初始化写入器失败: {}, 跳过 DuckDB 导出", e);
@@ -350,7 +383,8 @@ async fn process_targeted_generation(
             }
         }
     };
-    #[cfg(feature = "duckdb-export")]
+    let parquet_writer_clone = parquet_writer.clone();
+    #[cfg(feature = "duckdb-feature")]
     let duckdb_writer_clone = duckdb_writer.clone();
 
     let insert_task = tokio::task::spawn(async move {
@@ -358,8 +392,13 @@ async fn process_targeted_generation(
             if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
                 eprintln!("保存实例数据失败: {}", e);
             }
-            // 同时写入 DuckDB（如果启用）
-            #[cfg(feature = "duckdb-export")]
+            // 同时写入 Parquet（如果启用）
+            if let Some(ref writer) = parquet_writer_clone {
+                if let Err(e) = writer.write_batch(&shape_insts) {
+                    eprintln!("[Parquet] 写入批次失败: {}", e);
+                }
+            }
+            #[cfg(feature = "duckdb-feature")]
             if let Some(ref writer) = duckdb_writer_clone {
                 if let Err(e) = writer.write_batch(&shape_insts) {
                     eprintln!("[DuckDB] 写入批次失败: {}", e);
@@ -382,16 +421,8 @@ async fn process_targeted_generation(
     drop(sender);
     let _ = insert_task.await;
 
-    // 完成 DuckDB 写入并创建索引
-    #[cfg(feature = "duckdb-export")]
-    if let Some(ref writer) = duckdb_writer {
-        if let Err(e) = writer.finalize() {
-            eprintln!("[DuckDB] 创建索引失败: {}", e);
-        }
-    }
-
     println!(
-        "[gen_model] {}路径模型生成完成，共 {} 个根节点",
+        "[gen_model] {}路径几何体生成完成，共 {} 个根节点",
         mode_label,
         target_root_refnos.len()
     );
@@ -399,28 +430,70 @@ async fn process_targeted_generation(
     if db_option.inner.gen_mesh {
         let mesh_start = Instant::now();
         println!(
-            "[gen_model] 开始更新 {} 个根节点的 mesh 数据（深度收集几何节点）",
-            target_root_refnos.len()
+            "[gen_model] 开始后台扫描 inst_geo 生成 mesh"
         );
 
-        if let Err(e) = process_meshes_update_db_deep(db_option, &target_root_refnos).await {
-            eprintln!("[gen_model] 更新模型数据失败: {}", e);
+        // 使用 mesh worker 后台扫描 inst_geo 表生成 mesh
+        if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
+            eprintln!("[gen_model] mesh worker 失败: {}", e);
         } else {
             println!(
-                "[gen_model] 完成 mesh 更新，用时 {} ms",
+                "[gen_model] 完成 mesh 生成，用时 {} ms",
                 mesh_start.elapsed().as_millis()
             );
         }
+        
+        // 更新 inst_relate 的 aabb（mesh worker 只更新了 inst_geo.aabb）
+        let aabb_start = Instant::now();
+        println!("[gen_model] 开始更新 inst_relate aabb");
+        if let Err(e) = crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
+            &target_root_refnos,
+            db_option.is_replace_mesh(),
+        ).await {
+            eprintln!("[gen_model] 更新 inst_relate aabb 失败: {}", e);
+        } else {
+            println!(
+                "[gen_model] 完成 inst_relate aabb 更新，用时 {} ms",
+                aabb_start.elapsed().as_millis()
+            );
+        }
 
-        // 注意：布尔运算已在 process_meshes_update_db_deep 内部执行
-        // 无需在此重复调用 execute_manual_boolean_operations
+        // 运行 boolean worker 处理布尔运算
+        let bool_start = Instant::now();
+        println!("[gen_model] 开始布尔运算 worker");
+        
+        if let Err(e) = crate::fast_model::mesh_generate::run_boolean_worker(
+            Arc::new(db_option.inner.clone()),
+            100
+        ).await {
+            eprintln!("[gen_model] boolean worker 失败: {}", e);
+        } else {
+            println!(
+                "[gen_model] 完成布尔运算，用时 {} ms",
+                bool_start.elapsed().as_millis()
+            );
+        }
+    }
+
+    // ✅ 等待所有 workers 完成后，再合并 Parquet 文件
+    if let Some(ref writer) = parquet_writer {
+        println!("[Parquet] 所有 workers 已完成，开始合并文件...");
+        if let Err(e) = writer.finalize() {
+            eprintln!("[Parquet] 合并文件失败: {}", e);
+        }
+    }
+    #[cfg(feature = "duckdb-feature")]
+    if let Some(ref writer) = duckdb_writer {
+        if let Err(e) = writer.finalize() {
+            eprintln!("[DuckDB] finalize 失败: {}", e);
+        }
     }
 
     if let Err(err) = capture_refnos_if_enabled(&target_root_refnos, &db_option.inner).await {
         eprintln!("[capture] 捕获截图失败: {}", err);
     }
 
-    initialize_spatial_index();
+    // initialize_spatial_index();
 
     println!(
         "[gen_model] gen_all_geos_data 完成，总耗时 {} ms",
@@ -462,12 +535,24 @@ async fn process_full_database_generation(
         println!("[gen_model] 未找到需要生成的数据库，直接结束");
     }
 
-    // 初始化 DuckDB 写入器（如果启用 duckdb-export feature）
-    #[cfg(feature = "duckdb-export")]
+    // 初始化 Parquet 写入器
+    let parquet_writer = {
+        let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
+        let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
+        match ParquetStreamWriter::new(&parquet_dir) {
+            Ok(writer) => Some(std::sync::Arc::new(writer)),
+            Err(e) => {
+                eprintln!("[Parquet] 初始化写入器失败: {}, 跳过 Parquet 导出", e);
+                None
+            }
+        }
+    };
+    #[cfg(feature = "duckdb-feature")]
     let duckdb_writer = {
         let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
-        let duckdb_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output")).join("duckdb");
-        match DuckDBStreamWriter::new(&duckdb_dir) {
+        let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
+        let duckdb_dir = parquet_dir.join("database_models/_global");
+        match DuckDBStreamWriter::new(&duckdb_dir, DuckDBWriteMode::Rebuild) {
             Ok(writer) => Some(std::sync::Arc::new(writer)),
             Err(e) => {
                 eprintln!("[DuckDB] 初始化写入器失败: {}, 跳过 DuckDB 导出", e);
@@ -483,7 +568,8 @@ async fn process_full_database_generation(
         let (sender, receiver) = flume::unbounded();
         let receiver: flume::Receiver<aios_core::geometry::ShapeInstancesData> = receiver.clone();
 
-        #[cfg(feature = "duckdb-export")]
+        let parquet_writer_clone = parquet_writer.clone();
+        #[cfg(feature = "duckdb-feature")]
         let duckdb_writer_clone = duckdb_writer.clone();
 
         let insert_task = tokio::task::spawn(async move {
@@ -491,8 +577,13 @@ async fn process_full_database_generation(
                 if let Err(e) = save_instance_data_optimize(&shape_insts, false).await {
                     eprintln!("保存实例数据失败: {}", e);
                 }
-                // 同时写入 DuckDB（如果启用）
-                #[cfg(feature = "duckdb-export")]
+                // 同时写入 Parquet（如果启用）
+                if let Some(ref writer) = parquet_writer_clone {
+                    if let Err(e) = writer.write_batch(&shape_insts) {
+                        eprintln!("[Parquet] 写入批次失败: {}", e);
+                    }
+                }
+                #[cfg(feature = "duckdb-feature")]
                 if let Some(ref writer) = duckdb_writer_clone {
                     if let Err(e) = writer.write_batch(&shape_insts) {
                         eprintln!("[DuckDB] 写入批次失败: {}", e);
@@ -540,15 +631,20 @@ async fn process_full_database_generation(
         );
     }
 
-    // 完成 DuckDB 写入并创建索引
-    #[cfg(feature = "duckdb-export")]
+    // 完成 Parquet 写入并合并文件
+    if let Some(ref writer) = parquet_writer {
+        if let Err(e) = writer.finalize() {
+            eprintln!("[Parquet] 合并文件失败: {}", e);
+        }
+    }
+    #[cfg(feature = "duckdb-feature")]
     if let Some(ref writer) = duckdb_writer {
         if let Err(e) = writer.finalize() {
-            eprintln!("[DuckDB] 创建索引失败: {}", e);
+            eprintln!("[DuckDB] finalize 失败: {}", e);
         }
     }
 
-    initialize_spatial_index();
+    // initialize_spatial_index();
 
     println!(
         "[gen_model] gen_all_geos_data 完成，总耗时 {} ms",
@@ -619,17 +715,17 @@ async fn execute_manual_boolean_operations(
 }
 
 /// 初始化空间索引（如果启用）
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 fn initialize_spatial_index() {
-    if SqliteSpatialIndex::is_enabled() {
-        match SqliteSpatialIndex::with_default_path() {
-            Ok(_index) => println!("SQLite spatial index initialized"),
-            Err(e) => eprintln!("Failed to initialize SQLite spatial index: {}", e),
-        }
-    }
+    // if SqliteSpatialIndex::is_enabled() {
+    //     match SqliteSpatialIndex::with_default_path() {
+    //         Ok(_index) => println!("SQLite spatial index initialized"),
+    //         Err(e) => eprintln!("Failed to initialize SQLite spatial index: {}", e),
+    //     }
+    // }
 }
 
-#[cfg(not(feature = "duckdb-export"))]
+#[cfg(not(feature = "duckdb-feature"))]
 fn initialize_spatial_index() {
     // No-op when feature is disabled
 }

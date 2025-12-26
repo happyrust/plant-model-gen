@@ -7,7 +7,7 @@ use aios_core::{GeomInstQuery, GeomPtsQuery, ModelHashInst, RefU64, SUL_DB};
 use aios_core::{RefnoEnum, init_demo_test_surreal, init_test_surreal};
 
 // 使用改进的房间查询模块（暂时注释掉，因为这些模块可能不存在）
-// #[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
+// #[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 // use aios_core::room::query_v2::{
 //     query_room_number_by_point_v2,
 //     batch_query_room_numbers,
@@ -16,7 +16,7 @@ use aios_core::{RefnoEnum, init_demo_test_surreal, init_test_surreal};
 //     preheat_geometry_cache,
 // };
 
-// #[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
+// #[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 // use aios_core::spatial::hybrid_index::{get_hybrid_index, QueryOptions};
 
 use bevy_transform::TransformPoint;
@@ -41,6 +41,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+
+#[cfg(feature = "duckdb-feature")]
+use crate::fast_model::export_model::get_or_init_duckdb_reader;
 
 /// 房间关系构建统计信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,7 +179,7 @@ async fn get_enhanced_trimesh_cache() -> &'static DashMap<String, Arc<TriMesh>> 
 /// 2. 优化几何缓存机制，减少重复加载
 /// 3. 添加详细的性能统计和监控
 /// 4. 支持并发处理和批量操作
-#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 pub async fn build_room_relations(db_option: &DbOption) -> anyhow::Result<RoomBuildStats> {
     info!("开始构建房间关系 (改进版本)");
 
@@ -216,7 +219,7 @@ pub async fn build_room_relations(db_option: &DbOption) -> anyhow::Result<RoomBu
     Ok(stats)
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 async fn compute_room_relations(
     mesh_dir: &PathBuf,
     room_panel_map: Vec<(RefnoEnum, String, Vec<RefnoEnum>)>,
@@ -462,7 +465,7 @@ async fn create_room_panel_relations_batch(
     Ok(())
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 async fn process_panel_for_room(
     mesh_dir: &PathBuf,
     panel_refno: RefnoEnum,
@@ -498,7 +501,7 @@ async fn process_panel_for_room(
 }
 
 /// 改进版本的房间构件计算（基于关键点检测）
-#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 pub async fn cal_room_refnos(
     mesh_dir: &PathBuf,
     panel_refno: RefnoEnum,
@@ -511,7 +514,7 @@ pub async fn cal_room_refnos(
     cal_room_refnos_with_options(mesh_dir, panel_refno, exclude_refnos, options).await
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 async fn cal_room_refnos_with_options(
     mesh_dir: &PathBuf,
     panel_refno: RefnoEnum,
@@ -574,35 +577,70 @@ async fn cal_room_refnos_with_options(
     let coarse_start = Instant::now();
 
     // 克隆排除列表以避免生命周期问题
-    let exclude_list: Vec<RefU64> = exclude_refnos.iter().map(|r| r.refno()).collect();
-    let exclude_set: HashSet<RefU64> = exclude_list.iter().copied().collect();
+    let exclude_set: HashSet<RefU64> = exclude_refnos.iter().map(|r| r.refno()).collect();
     let candidate_limit = options.candidate_limit;
 
     let candidates = tokio::task::spawn_blocking({
         let panel_aabb = panel_aabb;
-        let exclude_list = exclude_list;
         let exclude_set = exclude_set;
         let panel_refno = panel_refno.clone();
         let candidate_limit = candidate_limit;
 
         move || -> anyhow::Result<Vec<RefnoEnum>> {
-            use aios_core::spatial::sqlite;
-            // 查询与面板 AABB 重叠的构件
-            let overlapping = sqlite::query_overlap(&panel_aabb, None, candidate_limit, &exclude_list)?;
-            if let Some(limit) = candidate_limit {
-                if overlapping.len() >= limit {
-                    warn!("面板 {} 候选数达到上限 {}，可能存在截断", panel_refno, limit);
+            #[cfg(feature = "duckdb-feature")]
+            {
+                let reader = match get_or_init_duckdb_reader() {
+                    Ok(reader) => reader,
+                    Err(e) => {
+                        warn!("初始化 DuckDB 读取器失败: {}", e);
+                        return Ok(vec![]);
+                    }
+                };
+
+                let dbno = panel_refno.refno().get_0();
+                let refno_strs = match reader.query_by_bounding_box_in_dbno(
+                    dbno,
+                    panel_aabb.mins.x as f64,
+                    panel_aabb.mins.y as f64,
+                    panel_aabb.mins.z as f64,
+                    panel_aabb.maxs.x as f64,
+                    panel_aabb.maxs.y as f64,
+                    panel_aabb.maxs.z as f64,
+                ) {
+                    Ok(refnos) => refnos,
+                    Err(e) => {
+                        warn!("DuckDB 粗算查询失败: {}", e);
+                        return Ok(vec![]);
+                    }
+                };
+
+                let mut refnos = Vec::new();
+                for refno_str in refno_strs {
+                    let candidate = RefnoEnum::from(refno_str.as_str());
+                    if !candidate.is_valid() {
+                        continue;
+                    }
+                    if candidate == panel_refno {
+                        continue;
+                    }
+                    if exclude_set.contains(&candidate.refno()) {
+                        continue;
+                    }
+                    refnos.push(candidate);
+                    if let Some(limit) = candidate_limit {
+                        if refnos.len() >= limit {
+                            warn!("面板 {} 候选数达到上限 {}，可能存在截断", panel_refno, limit);
+                            break;
+                        }
+                    }
                 }
+
+                Ok(refnos)
             }
-
-            // 转换为 RefnoEnum 并过滤（排除面板本身和其他面板）
-            let refnos: Vec<RefnoEnum> = overlapping
-                .into_iter()
-                .map(|(refno, _, _)| RefnoEnum::Refno(refno))
-                .filter(|r| *r != panel_refno && !exclude_set.contains(&r.refno()))
-                .collect();
-
-            Ok(refnos)
+            #[cfg(not(feature = "duckdb-feature"))]
+            {
+                Ok(vec![])
+            }
         }
     })
     .await??;
@@ -1153,14 +1191,14 @@ async fn collect_geometry_hashes(
 }
 
 /// 估算内存使用量
-#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 async fn estimate_memory_usage() -> f32 {
     let cache = get_enhanced_geometry_cache().await;
     let cache_size = cache.len() as f32 * 0.5; // 假设每个缓存项平均 0.5MB
     cache_size
 }
 
-#[cfg(not(all(not(target_arch = "wasm32"), feature = "duckdb-export")))]
+#[cfg(not(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature"))))]
 async fn estimate_memory_usage() -> f32 {
     // 在不启用 sqlite-index 特性时，返回一个保守估计
     let cache = get_enhanced_geometry_cache().await;
@@ -1890,7 +1928,7 @@ pub struct IncrementalUpdateResult {
 ///
 /// # 返回值
 /// * `IncrementalUpdateResult` - 更新结果统计
-#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 pub async fn update_room_relations_incremental(
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<IncrementalUpdateResult> {
@@ -1980,7 +2018,7 @@ pub async fn update_room_relations_incremental(
 }
 
 /// 查询包含指定 refnos 的房间面板
-#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 async fn query_panels_containing_refnos(
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<Vec<(RefnoEnum, String)>> {
@@ -2016,7 +2054,7 @@ async fn query_panels_containing_refnos(
 }
 
 /// 删除指定面板的房间关系
-#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 async fn delete_room_relations_for_panels(panels: &[(RefnoEnum, String)]) -> anyhow::Result<()> {
     if panels.is_empty() {
         return Ok(());
@@ -2044,7 +2082,7 @@ async fn delete_room_relations_for_panels(panels: &[(RefnoEnum, String)]) -> any
 ///
 /// # 返回值
 /// * `(房间数, 元素数, 耗时ms)` - 处理结果统计
-#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 pub async fn regenerate_room_models_by_keywords(
     room_keywords: &Vec<String>,
     db_option: &DbOption,
@@ -2112,7 +2150,7 @@ pub async fn regenerate_room_models_by_keywords(
 ///
 /// # 返回值
 /// * `RoomBuildStats` - 构建统计信息
-#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 pub async fn rebuild_room_relations_for_rooms(
     room_numbers: Option<Vec<String>>,
     db_option: &DbOption,

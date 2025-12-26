@@ -26,6 +26,7 @@ pub async fn save_instance_data_optimize(
     inst_mgr: &ShapeInstancesData,
     replace_exist: bool,
 ) -> anyhow::Result<()> {
+
     debug_model_debug!(
         "save_instance_data_optimize start: inst_info={}, inst_geo_keys={}, tubi_keys={}, replace_exist={}",
         inst_mgr.inst_info_map.len(),
@@ -33,6 +34,7 @@ pub async fn save_instance_data_optimize(
         inst_mgr.inst_tubi_map.len(),
         replace_exist
     );
+
     const CHUNK_SIZE: usize = 300;
     const MAX_TX_STATEMENTS: usize = 4;
     const MAX_CONCURRENT_TX: usize = 6;

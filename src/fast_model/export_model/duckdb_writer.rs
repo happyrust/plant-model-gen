@@ -5,11 +5,11 @@
 //!
 //! Uses DuckDB's `Appender` for high-performance bulk inserts instead of individual SQL statements.
 
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 use anyhow::{Context, Result};
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 use duckdb::{params, Appender, Connection};
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 use std::path::Path;
 
 /// Model data writer using DuckDB storage format.
@@ -19,12 +19,12 @@ use std::path::Path;
 /// - aabb: Bounding boxes (hash -> bbox GEOMETRY, min_z, max_z)
 /// - instances: Model instances (refno -> trans_hash, aabb_hash, ...)
 /// - geos: Geometry references (refno -> geo_hash, geo_transform)
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 pub struct DuckDBWriter {
     conn: Connection,
 }
 
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 impl DuckDBWriter {
     /// Create a new DuckDB writer, creating or opening the database file.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -276,7 +276,7 @@ impl DuckDBWriter {
 // ==================== Row Types for Bulk Insert ====================
 
 /// Row data for trans table (与 SurrealDB trans 表保持一致)
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 pub struct TransRow<'a> {
     pub hash: &'a str,
     pub rotation: &'a [f32; 4],     // quaternion [x, y, z, w]
@@ -285,7 +285,7 @@ pub struct TransRow<'a> {
 }
 
 /// Row data for instance table
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 pub struct InstanceRow<'a> {
     pub refno: &'a str,
     pub noun: Option<&'a str>,
@@ -300,7 +300,7 @@ pub struct InstanceRow<'a> {
 
 /// Row data for geos table
 /// id = refno_number (e.g., "12345_67890_0")
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 pub struct GeoRow<'a> {
     pub refno: &'a str,
     pub number: usize,              // 该实例下的几何体序号 (0, 1, 2...)
@@ -309,7 +309,7 @@ pub struct GeoRow<'a> {
 }
 
 #[cfg(test)]
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 mod tests {
     use super::*;
     use std::fs;

@@ -1,8 +1,4 @@
 pub mod gen_model;
-// gen_model_old 已迁移到 gen_model/non_full_noun.rs
-// pub mod gen_model_refactored;
-// pub mod gen_model_impl;
-
 pub mod cata_model;
 
 pub mod prim_model;
@@ -27,7 +23,7 @@ pub mod mesh_generate;
 pub mod room_model; // 改进版本的房间模型
 
 // Re-export room model functions
-#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-export"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-feature"))]
 pub use room_model::{
     IncrementalUpdateResult, RoomBuildStats, build_room_relations,
     rebuild_room_relations_for_rooms, regenerate_room_models_by_keywords,
@@ -52,6 +48,8 @@ pub use export_model::{export_glb, export_gltf, export_instanced_bundle, model_e
 pub mod material_config;
 pub mod unit_converter;
 
+pub mod parquet_fast_model;
+
 pub mod aabb_tree;
 
 pub mod incremental;
@@ -67,9 +65,9 @@ pub mod session;
 pub mod concurrency;
 
 // 碰撞检测：改用 DuckDB 空间查询
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 pub mod collision_detect;
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 pub use collision_detect::{CollisionConfig, CollisionDetector, CollisionEvent, CollisionStats};
 
 use aios_core::RefU64;
@@ -85,6 +83,10 @@ pub use gen_model::*;
 // - ElementInfo 和 AiosDBManagerExt → 死代码，已移除
 use once_cell::sync::Lazy;
 use parry3d::bounding_volume::Aabb;
+
+/// 全局缓存：已存在的 mesh geo_hash 到 AABB 的映射
+pub static EXIST_MESH_GEO_HASHES: Lazy<DashMap<String, Aabb>> = Lazy::new(|| DashMap::new());
+
 // pub use gen_model_refactored::DbModelInstRefnos;
 pub use query::*;
 pub use resolve::*;
@@ -94,11 +96,10 @@ pub use mesh_generate::{
     booleans_meshes_in_db, gen_inst_meshes, gen_meshes_in_db, process_meshes_update_db,
     process_meshes_update_db_deep, process_meshes_update_db_deep_default,
     process_meshes_bran, update_inst_relate_aabbs_by_refnos,
+    run_mesh_worker,
 };
 
 pub const SEND_INST_SIZE: usize = 500;
-pub static EXIST_MESH_GEO_HASHES: Lazy<DashMap<String, Aabb>> = Lazy::new(DashMap::new);
-
 // Re-export debug macros from aios_core
 pub use aios_core::{debug_model, debug_model_debug, debug_model_trace, debug_model_warn};
 

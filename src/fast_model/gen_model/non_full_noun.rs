@@ -613,7 +613,7 @@ pub async fn gen_geos_data(
     // 排除增量更新的情况，如果 debug_model_refnos 为空，即没有模型需要生成
     let debug_model_refnos = db_option.get_all_debug_refnos().await;
     let has_debug = !debug_model_refnos.is_empty();
-    let skip_exist = !(db_option.is_replace_mesh() || has_manual_refnos || has_debug);
+    let skip_exist = !db_option.is_replace_mesh();
 
     println!("========== DEBUG: gen_geos_data ==========");
     println!(

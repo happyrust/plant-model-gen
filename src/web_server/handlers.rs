@@ -1715,7 +1715,7 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
     #[cfg(feature = "sqlite-index")]
     {
         use crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos;
-        use crate::spatial_index::SqliteSpatialIndex;
+        // use crate::spatial_index::SqliteSpatialIndex;
         use aios_core::{RefU64, RefnoEnum, SUL_DB};
 
         if !SqliteSpatialIndex::is_enabled() {
@@ -5235,18 +5235,18 @@ async fn set_update_finalize(dbnums: &[u32], result: &str) {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    // 同步写入会话映射（成功时）
-    if result == "Success" {
-        let now_secs = (ts / 1000) as u64;
-        for &db in dbnums {
-            if let Some(latest) =
-                get_latest_sesno_from_file(&aios_core::get_db_option().project_name, db)
-            {
-                let _ = crate::fast_model::session::SESSION_STORE
-                    .put_sesno_time_mapping(db, latest, now_secs);
-            }
-        }
-    }
+    // 同步写入会话映射（成功时）- SESSION_STORE removed
+    // if result == "Success" {
+    //     let now_secs = (ts / 1000) as u64;
+    //     for &db in dbnums {
+    //         if let Some(latest) =
+    //             get_latest_sesno_from_file(&aios_core::get_db_option().project_name, db)
+    //         {
+    //             let _ = crate::fast_model::session::SESSION_STORE
+    //                 .put_sesno_time_mapping(db, latest, now_secs);
+    //         }
+    //     }
+    // }
     let mut sql = String::new();
     for db in dbnums {
         sql.push_str(&format!(
@@ -5323,7 +5323,8 @@ async fn convert_to_db_status(db_info: serde_json::Value) -> Option<DbStatusInfo
     let mesh_status = check_mesh_status(dbnum).await;
 
     // 读取本地缓存与文件中的 sesno，基于 sesno 判断是否需要更新
-    let cached_sesno = SESSION_STORE.get_max_sesno_for_dbnum(dbnum).unwrap_or(0);
+    // SESSION_STORE removed - now using DuckDB
+    let cached_sesno = 0u32;  // TODO: Replace with DuckDB query
     let latest_file_sesno = get_latest_sesno_from_file(&project, dbnum).unwrap_or(sesno);
 
     // 文件版本信息（用于展示）
@@ -5443,7 +5444,8 @@ async fn check_single_file_version(db_info: serde_json::Value) -> Option<serde_j
     let sesno = db_info["sesno"].as_u64().unwrap_or(0) as u32;
     let project = db_info["project"].as_str().unwrap_or("");
 
-    let cached_sesno = SESSION_STORE.get_max_sesno_for_dbnum(dbnum).unwrap_or(0);
+    // SESSION_STORE removed - now using DuckDB
+    let cached_sesno = 0u32;  // TODO: Replace with DuckDB query
     let latest_file_sesno = get_latest_sesno_from_file(project, dbnum).unwrap_or(sesno);
     let needs_update = cached_sesno < latest_file_sesno;
 
@@ -5977,6 +5979,19 @@ pub async fn api_sctn_test_result(Path(id): Path<String>) -> Json<serde_json::Va
     Json(json!({"status":"pending","message":"尚无结果或任务不存在"}))
 }
 
+#[cfg(not(feature = "sqlite-index"))]
+async fn run_sctn_test_pipeline(state: AppState, task_id: String, _req: SctnTestRequest) {
+    // sqlite-index feature not enabled, just fail the task
+    let mut tm = state.task_manager.lock().await;
+    if let Some(task) = tm.active_tasks.get_mut(&task_id) {
+        task.status = crate::web_server::models::TaskStatus::Failed;
+        task.error = Some("sqlite-index feature not enabled".to_string());
+        task.completed_at = Some(std::time::SystemTime::now());
+    }
+    SCTN_TEST_RESULTS.insert(task_id, json!({"status":"failed","message":"sqlite-index feature not enabled"}));
+}
+
+#[cfg(feature = "sqlite-index")]
 async fn run_sctn_test_pipeline(state: AppState, task_id: String, req: SctnTestRequest) {
     // 工具函数：更新任务进度
     let update = |msg: &str, step: u32, total: u32, pct: f32| {
@@ -7769,7 +7784,7 @@ pub async fn api_show_by_refno(
         if needed.is_empty() {
             info!("[ShowByRefno] 所有 {} 个 refno 已存在，跳过生成", parsed_refnos.len());
             // 获取文件列表
-            let files = pm.list_parquet_files(dbno).unwrap_or_default();
+            let files = pm.list_parquet_files(dbno, None).unwrap_or_default();
              return Ok(Json(ShowByRefnoResponse {
                 success: true,
                 bundle_url: None,
@@ -7831,7 +7846,7 @@ pub async fn api_show_by_refno(
                     // 获取最新文件列表
                     let output_dir = std::env::current_dir().unwrap().join("output");
                     let pm = crate::fast_model::export_model::parquet_writer::ParquetManager::new(&output_dir);
-                    let files = pm.list_parquet_files(dbno).unwrap_or_default();
+                    let files = pm.list_parquet_files(dbno, None).unwrap_or_default();
 
                     Ok(Json(ShowByRefnoResponse {
                         success: true,
@@ -7867,14 +7882,21 @@ pub async fn api_show_by_refno(
 // ===== Parquet 文件列表 API =====
 
 /// 获取指定 dbno 的 Parquet 文件列表
+#[derive(Deserialize)]
+pub struct ListFilesQuery {
+    #[serde(rename = "type")]
+    pub file_type: Option<String>,
+}
+
 pub async fn api_list_parquet_files(
     Path(dbno): Path<u32>,
+    Query(query): Query<ListFilesQuery>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
     use crate::fast_model::export_model::parquet_writer::ParquetManager;
 
     let manager = ParquetManager::new("output");
     
-    match manager.list_parquet_files(dbno) {
+    match manager.list_parquet_files(dbno, query.file_type.as_deref()) {
         Ok(files) => Ok(Json(files)),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,

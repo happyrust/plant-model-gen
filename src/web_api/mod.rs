@@ -13,6 +13,15 @@ pub use room_tree_api::create_room_tree_routes;
 pub use pdms_attr_api::create_pdms_attr_routes;
 pub use ptset_api::create_ptset_routes;
 pub use collision_api::{CollisionApiState, create_collision_routes};
+pub mod review_integration;
+pub use review_integration::create_review_integration_routes;
+pub mod model_center_client;
+pub use model_center_client::create_model_center_routes;
+
+#[cfg(feature = "web_server")]
+pub mod jwt_auth;
+#[cfg(feature = "web_server")]
+pub use jwt_auth::create_jwt_auth_routes;
 
 #[cfg(test)]
 mod tests;

@@ -20,8 +20,6 @@ use aios_core::geometry::csg::GeneratedMesh;
 use aios_core::mesh_precision::MeshPrecisionSettings;
 use aios_core::options::DbOption;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
-
-use crate::spatial_index::SqliteSpatialIndex;
 use aios_core::SurrealQueryExt;
 use aios_core::shape::pdms_shape::{PlantMesh, RsVec3};
 use aios_core::tool::float_tool::{dvec4_round_3, f64_round};
@@ -211,6 +209,131 @@ LIMIT {remaining};"#,
     Ok(pending)
 }
 
+/// 查询需要生成 mesh 的 inst_geo 记录的 id
+/// 条件：meshed = false, param != NONE, bad != true
+/// 返回 inst_geo 的 id 列表（geo_hash）
+async fn query_pending_mesh_geo_ids(limit: usize, replace_exist: bool) -> anyhow::Result<Vec<RecordId>> {
+    let sql = if replace_exist {
+        format!(
+            "SELECT value id FROM inst_geo WHERE param != NONE AND bad != true LIMIT {}",
+            limit
+        )
+    } else {
+        format!(
+            "SELECT value id FROM inst_geo WHERE meshed != true AND param != NONE AND bad != true LIMIT {}",
+            limit
+        )
+    };
+    
+    let ids: Vec<RecordId> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+    Ok(ids)
+}
+
+/// 基于 inst_geo 状态的 Mesh 生成 Worker
+///
+/// 按批次扫描需要生成 mesh 的 inst_geo 记录，直接基于 geo_id 生成网格。
+pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> anyhow::Result<()> {
+    let batch_size = batch_size.max(1);
+    let replace_exist = db_option.is_replace_mesh();
+    let mut round = 0usize;
+    let mut total_processed = 0usize;
+    let mut stalled_rounds = 0usize;
+    let mut last_pending: Option<HashSet<String>> = None;
+    
+    // 获取 mesh 生成所需的配置
+    let mesh_dir = db_option.get_meshes_path();
+    if !mesh_dir.exists() {
+        std::fs::create_dir_all(&mesh_dir)?;
+    }
+    
+    let precision = aios_core::mesh_precision::MeshPrecisionSettings::default();
+    let mesh_formats = vec![MeshFormat::Glb];
+
+    loop {
+        let round_start = std::time::Instant::now();
+        let pending_geo_ids = query_pending_mesh_geo_ids(batch_size, replace_exist).await?;
+        
+        let pending: HashSet<_> = pending_geo_ids.iter().map(|id| id.to_raw()).collect();
+        
+        if pending.is_empty() {
+            println!("[mesh_worker] 没有待处理 mesh 任务，退出");
+            break;
+        }
+        
+        // 检测是否卡住（连续多轮处理相同的 geo_ids）
+        if let Some(prev) = &last_pending {
+            if *prev == pending {
+                stalled_rounds += 1;
+            } else {
+                stalled_rounds = 0;
+            }
+        }
+        last_pending = Some(pending.clone());
+        
+        round += 1;
+        println!(
+            "[mesh_worker] 轮次 {}: pending={} batch_size={} replace_exist={}",
+            round,
+            pending_geo_ids.len(),
+            batch_size,
+            replace_exist
+        );
+        
+        if !pending_geo_ids.is_empty() {
+            let t = std::time::Instant::now();
+            // 直接基于 geo_ids 生成 mesh
+            gen_inst_meshes_by_geo_ids(
+                &mesh_dir,
+                &precision,
+                &pending_geo_ids,
+                &mesh_formats,
+            ).await?;
+            
+            println!(
+                "[mesh_worker] 轮次 {} mesh 生成完成: {} 个，用时 {} ms",
+                round,
+                pending_geo_ids.len(),
+                t.elapsed().as_millis()
+            );
+        }
+        
+        total_processed += pending_geo_ids.len();
+        println!(
+            "[mesh_worker] 轮次 {} 结束: 本轮 {} 个，累计 {} 个，用时 {} ms",
+            round,
+            pending_geo_ids.len(),
+            total_processed,
+            round_start.elapsed().as_millis()
+        );
+        
+        // 如果连续3轮 pending 集合未变化，可能卡住了
+        if stalled_rounds >= 3 {
+            let sample: Vec<_> = pending.iter().take(5).cloned().collect();
+            if replace_exist {
+                // replace_exist=true 时 stall 是预期的（已处理的记录会再次被查询到）
+                println!(
+                    "[mesh_worker] replace_exist=true 模式下检测到 stall，已完成 {} 个，退出",
+                    total_processed
+                );
+                break;
+            } else {
+                return Err(anyhow!(
+                    "[mesh_worker] 连续 {} 轮 pending 集合未变化，疑似卡住；示例 geo_id: {:?}",
+                    stalled_rounds + 1,
+                    sample
+                ));
+            }
+        }
+    }
+    
+    println!(
+        "[mesh_worker] mesh 生成完成: 共 {} 轮，累计处理 {} 个实例",
+        round, total_processed
+    );
+    
+    Ok(())
+}
+
 /// 基于 inst_relate 状态的布尔运算 Worker
 ///
 /// 按批次扫描需要布尔运算的实例（catalog & 实例级），并复用现有
@@ -293,12 +416,20 @@ pub async fn run_boolean_worker(db_option: Arc<DbOption>, batch_size: usize) -> 
         );
 
         if stalled_rounds >= 3 {
-            let sample: Vec<_> = pending.iter().take(10).cloned().collect();
-            return Err(anyhow!(
-                "[boolean_worker] 连续 {} 轮 pending 集合未变化，疑似卡住；示例 refno: {:?}",
-                stalled_rounds + 1,
-                sample
-            ));
+            let sample: Vec<_> = pending.iter().take(5).cloned().collect();
+            if replace_exist {
+                println!(
+                    "[boolean_worker] replace_exist=true 模式下检测到 stall，已完成 {} 个，退出",
+                    total_processed
+                );
+                break;
+            } else {
+                return Err(anyhow!(
+                    "[boolean_worker] 连续 {} 轮 pending 集合未变化，疑似卡住；示例 refno: {:?}",
+                    stalled_rounds + 1,
+                    sample
+                ));
+            }
         }
     }
 
@@ -626,7 +757,114 @@ pub async fn process_meshes_update_db_deep(
     Ok(())
 }
 
-/// 生成实例的网格数据
+/// 直接基于 inst_geo id 列表生成网格数据
+///
+/// 与 `gen_inst_meshes` 不同，此函数直接接收 `inst_geo` 的 RecordId 列表，
+/// 无需通过 refno 查询 inst_relate -> geo_relate 链条。
+///
+/// # 参数
+///
+/// * `dir` - 模型文件目录路径
+/// * `precision` - 网格精度设置
+/// * `geo_ids` - inst_geo 的 RecordId 列表
+/// * `mesh_formats` - 输出的网格格式
+///
+/// # 返回值
+///
+/// 返回 `anyhow::Result<()>` 表示生成是否成功
+pub async fn gen_inst_meshes_by_geo_ids(
+    dir: &Path,
+    precision: &MeshPrecisionSettings,
+    geo_ids: &[RecordId],
+    mesh_formats: &[MeshFormat],
+) -> anyhow::Result<()> {
+    if geo_ids.is_empty() {
+        return Ok(());
+    }
+    
+    // 创建 LOD 子目录
+    let lod_dir = dir.join(format!("lod_{:?}", precision.default_lod));
+    if !lod_dir.exists() {
+        std::fs::create_dir_all(&lod_dir)?;
+    }
+    
+    // 构建查询的 id 列表
+    let ids_str = geo_ids.iter().map(|id| id.to_raw()).join(",");
+    
+    // 查询 inst_geo 的参数
+    let sql = format!(
+        "SELECT id, param, unit_flag ?? false as unit_flag FROM [{}] WHERE param != NONE",
+        ids_str
+    );
+    
+    let mut response = SUL_DB.query(&sql).await?;
+    let geo_params: Vec<QueryGeoParam> = response.take(0).unwrap_or_default();
+    
+    if geo_params.is_empty() {
+        debug_model_debug!("[gen_inst_meshes_by_geo_ids] 没有找到有效的几何参数");
+        return Ok(());
+    }
+    
+    let aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
+    let pts_json_map: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+    let inst_aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
+    let mut update_sql = String::new();
+    
+    for g in geo_params {
+        let geo_type_name = g.param.type_name();
+        let profile = precision.profile_for_geo(geo_type_name);
+        let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
+        let mesh_id = g.id.to_mesh_id();
+        
+        // 不需要 refno
+        match generate_csg_mesh(&g.param, &profile.csg_settings, non_scalable_geo, None) {
+            Some(csg_mesh) => {
+                let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
+                
+                if let Err(e) = handle_csg_mesh(
+                    &lod_dir,
+                    &mesh_id,
+                    &mesh_filename,
+                    csg_mesh,
+                    &aabb_map,
+                    &pts_json_map,
+                    &inst_aabb_map,
+                    &mut update_sql,
+                    mesh_formats,
+                )
+                .await
+                {
+                    debug_model_warn!("CSG mesh 生成失败 for {}: {}", mesh_id, e);
+                    // 设置 bad=true 和 meshed=true 避免重复处理
+                    update_sql.push_str(&format!("UPDATE inst_geo:⟨{}⟩ SET bad=true, meshed=true;", mesh_id));
+                }
+            }
+            None => {
+                debug_model_warn!("CSG mesh 返回 None for {}", mesh_id);
+                // 设置 bad=true 和 meshed=true 避免重复处理
+                update_sql.push_str(&format!("UPDATE inst_geo:⟨{}⟩ SET bad=true, meshed=true;", mesh_id));
+            }
+        }
+    }
+    
+    // 执行批量更新
+    if !update_sql.is_empty() {
+        println!("[gen_inst_meshes_by_geo_ids] 执行 update_sql ({} bytes)", update_sql.len());
+        match SUL_DB.query(&update_sql).await {
+            Ok(_) => println!("[gen_inst_meshes_by_geo_ids] update_sql 执行成功"),
+            Err(e) => eprintln!("[gen_inst_meshes_by_geo_ids] 更新数据库失败: {}", e),
+        }
+    } else {
+        println!("[gen_inst_meshes_by_geo_ids] update_sql 为空，没有需要更新的记录");
+    }
+    
+    // 保存 aabb 和 pts 数据
+    utils::save_pts_to_surreal(&pts_json_map).await;
+    utils::save_aabb_to_surreal(&aabb_map).await;
+    
+    Ok(())
+}
+
 ///
 /// # 参数
 ///
@@ -1085,216 +1323,7 @@ pub async fn update_inst_relate_aabbs_by_refnos(
     refnos: &[RefnoEnum],
     replace_exist: bool,
 ) -> anyhow::Result<()> {
-    // 如果没有启用 SQLite 索引，直接使用 aios_core 的基础版本
-    // #[cfg(not(feature = "duckdb-export"))]
-    {
-        return aios_core::update_inst_relate_aabbs_by_refnos(refnos, replace_exist).await;
-    }
-
-    // 启用了 SQLite 索引，使用优化版本
-    #[cfg(feature = "duckdb-export")]
-    {
-        const CHUNK: usize = 100;
-        let aabb_map = DashMap::new();
-
-        info!("🔍 [空间索引] 开始更新 AABB，共 {} 个 refno", refnos.len());
-
-        // 🔥 创建 channel 用于异步 SQLite 写入
-        let (sqlite_sender, sqlite_receiver) = flume::unbounded::<(RefU64, Aabb, String)>();
-
-        // 用于统计发送到 SQLite 的 AABB 数量
-        let sqlite_send_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-        // 🔥 启动异步 SQLite 批量写入任务
-        let sqlite_send_count_clone = sqlite_send_count.clone();
-        let sqlite_task = tokio::spawn(async move {
-            if !SqliteSpatialIndex::is_enabled() {
-                debug_model_warn!("SQLite 空间索引未启用，跳过插入");
-                return;
-            }
-
-            let spatial_index = match SqliteSpatialIndex::with_default_path() {
-                Ok(idx) => idx,
-                Err(e) => {
-                    debug_model_warn!("SQLite 空间索引打开失败: {}", e);
-                    return;
-                }
-            };
-
-            let mut total_inserted = 0usize;
-            let mut batch = Vec::with_capacity(100);
-            let mut batch_count = 0usize;
-
-            while let Ok((refno, aabb, noun)) = sqlite_receiver.recv() {
-                batch.push((refno, aabb, noun));
-
-                // 批量写入，减少 I/O 次数
-                if batch.len() >= 100 {
-                    batch_count += 1;
-                    let batch_size = batch.len();
-                    let batch_data: Vec<_> =
-                        batch.drain(..).map(|(r, a, n)| (r, a, Some(n))).collect();
-                    match spatial_index.insert_many(batch_data) {
-                        Ok(count) => {
-                            total_inserted += count;
-                            println!(
-                                "📦 [空间索引] 批量插入第 {} 批，{} 个 AABB，累计 {} 个",
-                                batch_count, batch_size, total_inserted
-                            );
-                        }
-                        Err(e) => {
-                            debug_model_warn!("批量插入 AABB 失败: {}", e);
-                        }
-                    }
-                }
-            }
-
-            // 处理剩余数据
-            if !batch.is_empty() {
-                batch_count += 1;
-                let batch_size = batch.len();
-                let batch_data: Vec<_> =
-                    batch.into_iter().map(|(r, a, n)| (r, a, Some(n))).collect();
-                match spatial_index.insert_many(batch_data) {
-                    Ok(count) => {
-                        total_inserted += count;
-                        println!(
-                            "📦 [空间索引] 批量插入最后一批，{} 个 AABB，累计 {} 个",
-                            batch_size, total_inserted
-                        );
-                    }
-                    Err(e) => {
-                        debug_model_warn!("批量插入剩余 AABB 失败: {}", e);
-                    }
-                }
-            }
-
-            info!(
-                "✅ [空间索引] SQLite 异步写入任务完成，共插入 {} 个 AABB（{} 批）",
-                total_inserted, batch_count
-            );
-        });
-
-        // 克隆用于在循环中使用
-        let sqlite_send_count_for_loop = sqlite_send_count.clone();
-
-        for chunk in refnos.chunks(CHUNK) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let inst_keys = get_inst_relate_keys(chunk);
-            println!("查询 AABB 参数，chunk 大小: {}", chunk.len());
-
-            // 查询 AABB 参数
-            let result = query_aabb_params(&inst_keys, replace_exist)
-                .await
-                .map_err(db_err!(
-                    "query_aabb_params 失败",
-                    chunk_size: chunk.len(),
-                    inst_keys: &inst_keys.chars().take(200).collect::<String>()
-                ))?;
-            println!("查询到 {} 条 AABB 结果", result.len());
-
-            let result_len = result.len();
-
-            let mut update_sql = String::new();
-            let mut computed_count = 0usize;
-            let mut cached_count = 0usize;
-            let mut sent_to_sqlite_count = 0usize;
-
-            for r in result {
-                // 优先尝试从 SQLite 空间索引读取
-                if SqliteSpatialIndex::is_enabled() {
-                    let spatial_index = SqliteSpatialIndex::with_default_path()
-                        .expect("Failed to open spatial index");
-                    if let Ok(Some(aabb)) = spatial_index.get_aabb(r.refno.refno()) {
-                        cached_count += 1;
-                        let aabb_hash = gen_bytes_hash(&aabb).to_string();
-                        aabb_map.entry(aabb_hash.clone()).or_insert(aabb);
-                        let sql = format!(
-                            "update {} set aabb = aabb:⟨{}⟩;",
-                            r.refno.to_inst_relate_key(),
-                            aabb_hash,
-                        );
-                        update_sql.push_str(&sql);
-                        continue;
-                    }
-                }
-
-                // 缓存未命中则计算并回填
-                computed_count += 1;
-                let mut aabb = Aabb::new_invalid();
-                for g in &r.geo_aabbs {
-                    let t = r.world_trans * g.trans;
-                    let tmp_aabb = g.aabb.scaled(&t.scale.into());
-                    let tmp_aabb = tmp_aabb.transform_by(&Isometry {
-                        rotation: t.rotation.into(),
-                        translation: t.translation.into(),
-                    });
-                    aabb.merge(&tmp_aabb);
-                }
-
-                if aabb.extents().magnitude().is_nan() || aabb.extents().magnitude().is_infinite() {
-                    debug_model_warn!("发现无效 AABB for refno: {:?}", r.refno);
-                    continue;
-                }
-
-                let aabb_hash = gen_bytes_hash(&aabb).to_string();
-                aabb_map.entry(aabb_hash.clone()).or_insert(aabb);
-                let bbox = RStarBoundingBox::new(aabb, r.refno, r.noun.clone());
-
-                // 🔥 异步发送到 SQLite 写入任务
-                if SqliteSpatialIndex::is_enabled() {
-                    if sqlite_sender
-                        .send((bbox.refno, bbox.aabb, bbox.noun))
-                        .is_ok()
-                    {
-                        sent_to_sqlite_count += 1;
-                        sqlite_send_count_for_loop
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-
-                let sql = format!(
-                    "update {} set aabb = aabb:⟨{}⟩;",
-                    r.refno.to_inst_relate_key(),
-                    aabb_hash,
-                );
-                update_sql.push_str(&sql);
-            }
-
-            if !update_sql.is_empty() {
-                println!("准备执行 AABB 更新 SQL，长度: {}", update_sql.len());
-                SUL_DB.query(&update_sql).await.map_err(batch_update_err!(
-                    "update_inst_relate_aabbs_by_refnos",
-                    update_sql
-                ))?;
-                println!("✅ AABB 批量更新成功");
-            }
-
-            println!(
-                "📊 [空间索引] Chunk 统计: 查询到 {} 条，缓存命中 {} 个，新计算 {} 个，发送到 SQLite {} 个",
-                result_len, cached_count, computed_count, sent_to_sqlite_count
-            );
-        }
-
-        // 🔥 关闭 sender，通知 SQLite 任务结束
-        let total_sent = sqlite_send_count.load(std::sync::atomic::Ordering::Relaxed);
-        drop(sqlite_sender);
-
-        // 🔥 等待 SQLite 写入任务完成
-        let _ = sqlite_task.await;
-
-        info!(
-            "📊 [空间索引] 更新完成统计: 共处理 {} 个 refno，发送到 SQLite {} 个 AABB，SurrealDB 更新 {} 个 AABB",
-            refnos.len(),
-            total_sent,
-            aabb_map.len()
-        );
-
-        utils::save_aabb_to_surreal(&aabb_map).await;
-        Ok(())
-    }
+    return aios_core::update_inst_relate_aabbs_by_refnos(refnos, replace_exist).await;
 }
 
 // Database query structures are now imported from aios_core::query_structs

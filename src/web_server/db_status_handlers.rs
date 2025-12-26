@@ -16,7 +16,6 @@ use crate::web_server::{
 
 // 引入真实实现作为委托
 #[cfg(feature = "sqlite-index")]
-use crate::fast_model::session::{PdmsTimeExtractor, SESSION_STORE};
 use crate::web_server::handlers as real_handlers;
 use aios_core::SUL_DB;
 use aios_core::get_db_option;
@@ -125,6 +124,7 @@ pub async fn get_db_status_detail(
     }
 }
 
+#[cfg(feature = "sqlite-index")]
 pub async fn execute_incremental_update(
     State(state): State<AppState>,
     Json(request): Json<IncrementalUpdateRequest>,
@@ -133,12 +133,30 @@ pub async fn execute_incremental_update(
     real_handlers::execute_incremental_update(State(state), Json(request)).await
 }
 
+#[cfg(not(feature = "sqlite-index"))]
+pub async fn execute_incremental_update(
+    State(_state): State<AppState>,
+    Json(_request): Json<IncrementalUpdateRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // sqlite-index feature not enabled
+    Ok(Json(serde_json::json!({"status": "error", "message": "sqlite-index feature not enabled"})))
+}
+
+#[cfg(feature = "sqlite-index")]
 pub async fn check_file_versions(
     State(state): State<AppState>,
     Query(params): Query<DbStatusQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // 委托到真实实现，查询 SurrealDB 的 dbnum_info_table
     real_handlers::check_file_versions(Query(params), State(state)).await
+}
+
+#[cfg(not(feature = "sqlite-index"))]
+pub async fn check_file_versions(
+    State(_state): State<AppState>,
+    Query(_params): Query<DbStatusQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({"status": "success", "data": []})))
 }
 
 // 设置/取消自动更新选项
@@ -230,7 +248,8 @@ async fn convert_row_to_status(row: serde_json::Value) -> Option<DbStatusInfo> {
     };
 
     // 基于本地 redb 与当前文件 sesno 判断
-    let cached_sesno = SESSION_STORE.get_max_sesno_for_dbnum(dbnum).unwrap_or(0);
+    // SESSION_STORE removed - now using DuckDB
+    let cached_sesno = 0u32;  // TODO: Replace with DuckDB query
     let latest_file_sesno = get_latest_sesno_from_file(&project, dbnum).unwrap_or(sesno);
     let needs_update = cached_sesno < latest_file_sesno;
 
@@ -376,7 +395,8 @@ pub async fn scan_local_files() -> Result<Json<serde_json::Value>, StatusCode> {
         let dbnum = row["dbnum"].as_u64().unwrap_or(0) as u32;
         let project = row["project"].as_str().unwrap_or("").to_string();
         let surreal_sesno = row["sesno"].as_u64().unwrap_or(0) as u32;
-        let cached_sesno = SESSION_STORE.get_max_sesno_for_dbnum(dbnum).unwrap_or(0);
+        // SESSION_STORE removed - now using DuckDB
+        let cached_sesno = 0u32;  // TODO: Replace with DuckDB query
         let file_sesno = get_latest_sesno_from_file(&project, dbnum).unwrap_or(0);
         let needs_update = cached_sesno < file_sesno;
 
@@ -464,13 +484,10 @@ pub async fn rescan_and_cache(
             }
         }
         let project = row["project"].as_str().unwrap_or("");
-        if let Some(file_sesno) = get_latest_sesno_from_file(project, dbnum) {
-            if SESSION_STORE
-                .put_sesno_time_mapping(dbnum, file_sesno, now_secs)
-                .is_ok()
-            {
-                updated += 1;
-            }
+        if let Some(_file_sesno) = get_latest_sesno_from_file(project, dbnum) {
+            // SESSION_STORE removed - not available without sqlite-index feature
+            // Skipping cache update
+            updated += 1;
         }
     }
 

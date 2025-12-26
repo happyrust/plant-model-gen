@@ -344,7 +344,7 @@ impl AiosDBManager {
                 let file_latest_sesno = PdmsIO::new(&project, path.to_path_buf(), true)
                     .get_latest_sesno()
                     .unwrap_or_default();
-                dbg!((db_no, file_latest_sesno));
+                // dbg!((db_no, file_latest_sesno));
 
                 if !CHECK_DB_TYPES.contains(&db_type.as_str()) {
                     continue;
@@ -354,7 +354,7 @@ impl AiosDBManager {
                     //先暂时跳过数据库里没有的文件，todo 考虑自动追加文件全新解析
                     continue;
                 };
-                dbg!((db_no, db_latest_sesno));
+                // dbg!((db_no, db_latest_sesno));
                 if db_latest_sesno == 0 {
                     continue;
                 }
@@ -419,17 +419,17 @@ impl AiosDBManager {
         if !params.is_empty() {
             dbg!(params.len());
         }
-        match self.execute_incr_update(params).await {
-            Ok(true) => {
-                println!("执行启动后的自动增量完成。")
-            }
-            Ok(false) => {
-                println!("没有发生增量更新。")
-            }
-            Err(e) => {
-                println!("Execute increment update error: {:?}", e);
-            }
-        }
+        // match self.execute_incr_update(params).await {
+        //     Ok(true) => {
+        //         println!("执行启动后的自动增量完成。")
+        //     }
+        //     Ok(false) => {
+        //         println!("没有发生增量更新。")
+        //     }
+        //     Err(e) => {
+        //         println!("Execute increment update error: {:?}", e);
+        //     }
+        // }
 
         println!("初始化增量更新耗时: {} s", time.elapsed().as_secs_f32());
 

@@ -2,9 +2,9 @@
 //!
 //! 用法:
 //! ```bash
-//! cargo run --bin check_collision --features duckdb-export -- --help
-//! cargo run --bin check_collision --features duckdb-export -- --limit 1000
-//! cargo run --bin check_collision --features duckdb-export -- --noun PIPE
+//! cargo run --bin check_collision --features duckdb-feature -- --help
+//! cargo run --bin check_collision --features duckdb-feature -- --limit 1000
+//! cargo run --bin check_collision --features duckdb-feature -- --noun PIPE
 //! ```
 
 use aios_database::fast_model::{CollisionConfig, CollisionDetector};

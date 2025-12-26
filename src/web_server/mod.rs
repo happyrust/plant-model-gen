@@ -43,11 +43,13 @@ pub mod task_creation_handlers;
 pub mod topology_handlers; // 拓扑配置处理器
 pub mod wizard_handlers;
 pub mod wizard_template;
+pub mod parquet_compact_worker;
 
 use crate::web_api::{
     E3dTreeApiState, NounHierarchyApiState, SpatialQueryApiState, create_e3d_tree_routes,
     create_noun_hierarchy_routes, create_room_tree_routes, create_spatial_query_routes,
     create_pdms_attr_routes, create_ptset_routes, CollisionApiState, create_collision_routes,
+    create_review_integration_routes, create_model_center_routes,
 };
 use handlers::*;
 use models::*;
@@ -194,6 +196,15 @@ pub async fn start_web_server_with_config(
     crate::web_server::handlers::ensure_projects_schema().await;
     // 初始化 SurrealDB 中的 deployment_sites 表
     crate::web_server::handlers::ensure_deployment_sites_schema().await;
+
+    // 启动 Parquet compact worker
+    let compact_worker_config = parquet_compact_worker::CompactWorkerConfig {
+        scan_interval_secs: 30,
+        min_incremental_count: 50,
+        output_dir: "output".to_string(),
+    };
+    let _compact_worker_handle = parquet_compact_worker::start_compact_worker(compact_worker_config);
+    println!("🔄 Parquet compact worker 已启动 (每 30 秒扫描一次)");
 
     // 初始化空间查询API
     let db_manager = crate::AiosDBManager::init_form_config().await?;
@@ -798,6 +809,8 @@ pub async fn start_web_server_with_config(
         .merge(ptset_routes)
         .merge(room_routes)
         .merge(collision_routes)
+        .merge(create_review_integration_routes()) // Register new routes
+        .merge(create_model_center_routes())
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -856,9 +869,8 @@ async fn auto_update_scheduler(state: AppState) {
             let updating = row["updating"].as_bool().unwrap_or(false);
 
             // 计算是否需要更新
-            let cached_sesno = crate::fast_model::session::SESSION_STORE
-                .get_max_sesno_for_dbnum(dbnum)
-                .unwrap_or(0);
+            // SESSION_STORE removed - now using DuckDB
+            let cached_sesno = 0u32;  // TODO: Replace with DuckDB query
             let latest_file_sesno = {
                 // TODO: Implement proper PDMS sesno extraction
                 // This requires creating PdmsIO from project directory

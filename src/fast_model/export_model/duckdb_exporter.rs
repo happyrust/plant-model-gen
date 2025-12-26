@@ -3,34 +3,50 @@
 //! 在模型生成过程中直接将 ShapeInstancesData 写入 DuckDB，
 //! 使用 Appender 实现高性能批量插入。
 
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 use anyhow::{Context, Result};
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 use duckdb::Connection;
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
+use std::collections::HashSet;
+#[cfg(feature = "duckdb-feature")]
 use std::path::{Path, PathBuf};
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 use std::sync::Mutex;
 
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 use aios_core::geometry::ShapeInstancesData;
+
+/// DuckDB 写入模式
+#[cfg(feature = "duckdb-feature")]
+#[derive(Debug, Clone, Copy)]
+pub enum DuckDBWriteMode {
+    /// 全量重建（删除旧文件）
+    Rebuild,
+    /// 追加写入（保留旧文件）
+    Append,
+}
 
 /// DuckDB 流式写入器
 /// 
 /// 在模型生成过程中直接将数据写入 DuckDB，使用 Appender 实现高性能批量插入。
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 pub struct DuckDBStreamWriter {
     conn: Mutex<Connection>,
     output_path: PathBuf,
+    spatial_enabled: bool,
+    aabb_has_bbox: bool,
+    aabb_has_dbno: bool,
 }
 
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 impl DuckDBStreamWriter {
     /// 创建新的流式写入器
     /// 
     /// # Arguments
     /// * `output_dir` - DuckDB 输出目录
-    pub fn new(output_dir: impl AsRef<Path>) -> Result<Self> {
+    /// * `mode` - 写入模式（重建或追加）
+    pub fn new(output_dir: impl AsRef<Path>, mode: DuckDBWriteMode) -> Result<Self> {
         let output_path = output_dir.as_ref().join("model.duckdb");
         
         // 确保目录存在
@@ -39,26 +55,53 @@ impl DuckDBStreamWriter {
         }
 
         // 删除旧文件（全量重建）
-        if output_path.exists() {
+        if matches!(mode, DuckDBWriteMode::Rebuild) && output_path.exists() {
             std::fs::remove_file(&output_path)?;
         }
 
         let conn = Connection::open(&output_path)
             .context("Failed to open DuckDB database")?;
 
-        // 初始化 Schema
-        Self::init_schema(&conn)?;
+        let spatial_enabled = Self::try_enable_spatial(&conn);
+        let (aabb_has_bbox, aabb_has_dbno) = Self::ensure_schema(&conn, spatial_enabled)?;
 
         println!("📦 [DuckDB] 创建流式写入器: {:?}", output_path);
 
         Ok(Self {
             conn: Mutex::new(conn),
             output_path,
+            spatial_enabled,
+            aabb_has_bbox,
+            aabb_has_dbno,
         })
     }
 
-    /// 初始化 Schema
-    fn init_schema(conn: &Connection) -> Result<()> {
+    fn try_enable_spatial(conn: &Connection) -> bool {
+        if conn.execute_batch("LOAD spatial;").is_ok() {
+            return true;
+        }
+
+        if conn.execute_batch("INSTALL spatial;").is_ok() {
+            return conn.execute_batch("LOAD spatial;").is_ok();
+        }
+
+        false
+    }
+
+    fn get_table_columns(conn: &Connection, table: &str) -> Result<HashSet<String>> {
+        let mut columns = HashSet::new();
+        let mut stmt = conn.prepare(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+        )?;
+        let rows = stmt.query_map([table], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            columns.insert(row?);
+        }
+        Ok(columns)
+    }
+
+    /// 初始化/迁移 Schema
+    fn ensure_schema(conn: &Connection, spatial_enabled: bool) -> Result<(bool, bool)> {
         // instance 表
         conn.execute_batch(
             r#"
@@ -84,22 +127,71 @@ impl DuckDBStreamWriter {
             "#,
         )?;
 
-        // aabb 表
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS aabb (
-                refno   VARCHAR PRIMARY KEY,
-                min_x   DOUBLE,
-                min_y   DOUBLE,
-                min_z   DOUBLE,
-                max_x   DOUBLE,
-                max_y   DOUBLE,
-                max_z   DOUBLE
-            );
-            "#,
-        )?;
+        let columns = Self::get_table_columns(conn, "aabb")?;
+        let mut aabb_has_bbox = columns.contains("bbox");
+        let mut aabb_has_dbno = columns.contains("dbno");
 
-        Ok(())
+        if columns.is_empty() {
+            if spatial_enabled {
+                conn.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS aabb (
+                        refno   VARCHAR PRIMARY KEY,
+                        dbno    INTEGER,
+                        min_x   DOUBLE,
+                        min_y   DOUBLE,
+                        min_z   DOUBLE,
+                        max_x   DOUBLE,
+                        max_y   DOUBLE,
+                        max_z   DOUBLE,
+                        bbox    GEOMETRY
+                    );
+                    "#,
+                )?;
+                aabb_has_bbox = true;
+                aabb_has_dbno = true;
+            } else {
+                conn.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS aabb (
+                        refno   VARCHAR PRIMARY KEY,
+                        dbno    INTEGER,
+                        min_x   DOUBLE,
+                        min_y   DOUBLE,
+                        min_z   DOUBLE,
+                        max_x   DOUBLE,
+                        max_y   DOUBLE,
+                        max_z   DOUBLE
+                    );
+                    "#,
+                )?;
+                aabb_has_dbno = true;
+            }
+        } else {
+            if !aabb_has_dbno {
+                conn.execute_batch("ALTER TABLE aabb ADD COLUMN dbno INTEGER;")?;
+                aabb_has_dbno = true;
+            }
+
+            if spatial_enabled && !aabb_has_bbox {
+                conn.execute_batch("ALTER TABLE aabb ADD COLUMN bbox GEOMETRY;")?;
+                aabb_has_bbox = true;
+            }
+
+            if aabb_has_dbno {
+                let _ = conn.execute_batch(
+                    "UPDATE aabb SET dbno = CAST(split_part(refno, '_', 1) AS INTEGER) WHERE dbno IS NULL;",
+                );
+            }
+
+            if spatial_enabled && aabb_has_bbox {
+                let _ = conn.execute_batch(
+                    "UPDATE aabb SET bbox = ST_MakeEnvelope(min_x, min_y, max_x, max_y) WHERE bbox IS NULL;",
+                );
+            }
+        }
+
+        Ok((aabb_has_bbox, aabb_has_dbno))
     }
 
     /// 写入一批 ShapeInstancesData
@@ -109,6 +201,8 @@ impl DuckDBStreamWriter {
         let mut instance_count = 0;
         let mut geo_count = 0;
         let mut aabb_count = 0;
+        let use_bbox = self.spatial_enabled && self.aabb_has_bbox;
+        let use_dbno = self.aabb_has_dbno;
 
         // 使用事务批量写入
         conn.execute_batch("BEGIN TRANSACTION")?;
@@ -116,6 +210,7 @@ impl DuckDBStreamWriter {
         // 1. 写入 instance 和 geo
         for (refno, info) in &data.inst_info_map {
             let refno_str = refno.to_string();
+            let dbno = refno.refno().get_0() as i32;
             let noun = info.generic_type.to_string();
             let owner_refno = if info.owner_refno != *refno {
                 Some(info.owner_refno.to_string())
@@ -127,7 +222,7 @@ impl DuckDBStreamWriter {
             conn.execute(
                 "INSERT OR REPLACE INTO instance (refno, noun, owner_refno, color_index, spec_value) VALUES (?1, ?2, ?3, ?4, ?5)",
                 duckdb::params![
-                    refno_str,
+                    &refno_str,
                     noun,
                     owner_refno,
                     0i32, // color_index
@@ -138,18 +233,78 @@ impl DuckDBStreamWriter {
 
             // 写入 aabb
             if let Some(aabb) = &info.aabb {
-                conn.execute(
-                    "INSERT OR REPLACE INTO aabb (refno, min_x, min_y, min_z, max_x, max_y, max_z) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    duckdb::params![
-                        refno_str,
-                        aabb.mins.x as f64,
-                        aabb.mins.y as f64,
-                        aabb.mins.z as f64,
-                        aabb.maxs.x as f64,
-                        aabb.maxs.y as f64,
-                        aabb.maxs.z as f64
-                    ],
-                )?;
+                let min_x = aabb.mins.x as f64;
+                let min_y = aabb.mins.y as f64;
+                let min_z = aabb.mins.z as f64;
+                let max_x = aabb.maxs.x as f64;
+                let max_y = aabb.maxs.y as f64;
+                let max_z = aabb.maxs.z as f64;
+
+                if use_bbox {
+                    if use_dbno {
+                        conn.execute(
+                            "INSERT OR REPLACE INTO aabb (refno, dbno, min_x, min_y, min_z, max_x, max_y, max_z, bbox) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ST_MakeEnvelope(?9, ?10, ?11, ?12))",
+                            duckdb::params![
+                                &refno_str,
+                                dbno,
+                                min_x,
+                                min_y,
+                                min_z,
+                                max_x,
+                                max_y,
+                                max_z,
+                                min_x,
+                                min_y,
+                                max_x,
+                                max_y
+                            ],
+                        )?;
+                    } else {
+                        conn.execute(
+                            "INSERT OR REPLACE INTO aabb (refno, min_x, min_y, min_z, max_x, max_y, max_z, bbox) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ST_MakeEnvelope(?8, ?9, ?10, ?11))",
+                            duckdb::params![
+                                &refno_str,
+                                min_x,
+                                min_y,
+                                min_z,
+                                max_x,
+                                max_y,
+                                max_z,
+                                min_x,
+                                min_y,
+                                max_x,
+                                max_y
+                            ],
+                        )?;
+                    }
+                } else if use_dbno {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO aabb (refno, dbno, min_x, min_y, min_z, max_x, max_y, max_z) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        duckdb::params![
+                            &refno_str,
+                            dbno,
+                            min_x,
+                            min_y,
+                            min_z,
+                            max_x,
+                            max_y,
+                            max_z
+                        ],
+                    )?;
+                } else {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO aabb (refno, min_x, min_y, min_z, max_x, max_y, max_z) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        duckdb::params![
+                            &refno_str,
+                            min_x,
+                            min_y,
+                            min_z,
+                            max_x,
+                            max_y,
+                            max_z
+                        ],
+                    )?;
+                }
                 aabb_count += 1;
             }
         }
@@ -181,6 +336,7 @@ impl DuckDBStreamWriter {
         // 3. 写入 tubi 数据
         for (refno, tubi_info) in &data.inst_tubi_map {
             let refno_str = refno.to_string();
+            let dbno = refno.refno().get_0() as i32;
             let noun = "TUBI";
             let owner_refno = if tubi_info.owner_refno != *refno {
                 Some(tubi_info.owner_refno.to_string())
@@ -190,9 +346,85 @@ impl DuckDBStreamWriter {
 
             conn.execute(
                 "INSERT OR REPLACE INTO instance (refno, noun, owner_refno, color_index, spec_value) VALUES (?1, ?2, ?3, ?4, ?5)",
-                duckdb::params![refno_str, noun, owner_refno, 0i32, Option::<i32>::None],
+                duckdb::params![&refno_str, noun, owner_refno, 0i32, Option::<i32>::None],
             )?;
             instance_count += 1;
+
+            if let Some(aabb) = &tubi_info.aabb {
+                let min_x = aabb.mins.x as f64;
+                let min_y = aabb.mins.y as f64;
+                let min_z = aabb.mins.z as f64;
+                let max_x = aabb.maxs.x as f64;
+                let max_y = aabb.maxs.y as f64;
+                let max_z = aabb.maxs.z as f64;
+
+                if use_bbox {
+                    if use_dbno {
+                        conn.execute(
+                            "INSERT OR REPLACE INTO aabb (refno, dbno, min_x, min_y, min_z, max_x, max_y, max_z, bbox) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ST_MakeEnvelope(?9, ?10, ?11, ?12))",
+                            duckdb::params![
+                                &refno_str,
+                                dbno,
+                                min_x,
+                                min_y,
+                                min_z,
+                                max_x,
+                                max_y,
+                                max_z,
+                                min_x,
+                                min_y,
+                                max_x,
+                                max_y
+                            ],
+                        )?;
+                    } else {
+                        conn.execute(
+                            "INSERT OR REPLACE INTO aabb (refno, min_x, min_y, min_z, max_x, max_y, max_z, bbox) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ST_MakeEnvelope(?8, ?9, ?10, ?11))",
+                            duckdb::params![
+                                &refno_str,
+                                min_x,
+                                min_y,
+                                min_z,
+                                max_x,
+                                max_y,
+                                max_z,
+                                min_x,
+                                min_y,
+                                max_x,
+                                max_y
+                            ],
+                        )?;
+                    }
+                } else if use_dbno {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO aabb (refno, dbno, min_x, min_y, min_z, max_x, max_y, max_z) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        duckdb::params![
+                            &refno_str,
+                            dbno,
+                            min_x,
+                            min_y,
+                            min_z,
+                            max_x,
+                            max_y,
+                            max_z
+                        ],
+                    )?;
+                } else {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO aabb (refno, min_x, min_y, min_z, max_x, max_y, max_z) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        duckdb::params![
+                            &refno_str,
+                            min_x,
+                            min_y,
+                            min_z,
+                            max_x,
+                            max_y,
+                            max_z
+                        ],
+                    )?;
+                }
+                aabb_count += 1;
+            }
         }
 
         conn.execute_batch("COMMIT")?;
@@ -213,6 +445,13 @@ impl DuckDBStreamWriter {
             CREATE INDEX IF NOT EXISTS idx_geo_hash ON geo(geo_hash);
             "#,
         )?;
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_aabb_z ON aabb(min_z, max_z);")?;
+        if self.aabb_has_dbno {
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_aabb_dbno ON aabb(dbno);")?;
+        }
+        if self.spatial_enabled && self.aabb_has_bbox {
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_aabb_rtree ON aabb USING RTREE (bbox);")?;
+        }
 
         // 获取统计信息
         let instance_count: i64 = conn.query_row("SELECT COUNT(*) FROM instance", [], |row| row.get(0))?;
@@ -226,6 +465,22 @@ impl DuckDBStreamWriter {
         let file_size = std::fs::metadata(&self.output_path)?.len();
 
         // 生成 duckdb_meta.json (本地元数据)
+        let mut aabb_schema = vec![
+            "refno",
+            "min_x",
+            "min_y",
+            "min_z",
+            "max_x",
+            "max_y",
+            "max_z",
+        ];
+        if self.aabb_has_dbno {
+            aabb_schema.insert(1, "dbno");
+        }
+        if self.aabb_has_bbox {
+            aabb_schema.push("bbox");
+        }
+
         let meta = serde_json::json!({
             "version": "1.0.0",
             "generated_at": chrono::Utc::now().to_rfc3339(),
@@ -241,7 +496,7 @@ impl DuckDBStreamWriter {
             "schema": {
                 "instance": ["refno", "noun", "owner_refno", "color_index", "spec_value"],
                 "geo": ["id", "refno", "geo_hash", "geo_transform"],
-                "aabb": ["refno", "min_x", "min_y", "min_z", "max_x", "max_y", "max_z"],
+                "aabb": aabb_schema,
             }
         });
 
@@ -340,7 +595,7 @@ impl DuckDBStreamWriter {
 }
 
 #[cfg(test)]
-#[cfg(feature = "duckdb-export")]
+#[cfg(feature = "duckdb-feature")]
 mod tests {
     use super::*;
     use std::fs;
@@ -350,7 +605,7 @@ mod tests {
         let temp_dir = std::env::temp_dir().join("duckdb_test");
         let _ = fs::remove_dir_all(&temp_dir);
         
-        let writer = DuckDBStreamWriter::new(&temp_dir).unwrap();
+        let writer = DuckDBStreamWriter::new(&temp_dir, DuckDBWriteMode::Rebuild).unwrap();
         assert!(writer.output_path().exists());
         
         writer.finalize().unwrap();

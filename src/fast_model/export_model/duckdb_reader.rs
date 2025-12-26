@@ -3,10 +3,11 @@
 //! 从 `assets/web_duckdb/` 目录读取最新的 DuckDB 文件，
 //! 提供空间查询功能替代 SQLite。
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use duckdb::Connection;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// 获取最新的 DuckDB 文件路径
 fn get_latest_duckdb_path() -> Result<PathBuf> {
@@ -36,6 +37,9 @@ fn get_latest_duckdb_path() -> Result<PathBuf> {
 pub struct DuckDBReader {
     conn: Mutex<Connection>,
     db_path: PathBuf,
+    spatial_enabled: bool,
+    aabb_has_bbox: bool,
+    aabb_has_dbno: bool,
 }
 
 impl DuckDBReader {
@@ -43,6 +47,22 @@ impl DuckDBReader {
     pub fn open_latest() -> Result<Self> {
         let db_path = get_latest_duckdb_path()?;
         Self::open(&db_path)
+    }
+
+    /// 打开全局 DuckDB（优先 output/database_models/_global），失败则回退到 latest.json
+    pub fn open_global_or_latest() -> Result<Self> {
+        let candidates = [
+            PathBuf::from("output/database_models/_global/model.duckdb"),
+            PathBuf::from("assets/database_models/_global/model.duckdb"),
+        ];
+
+        for path in candidates {
+            if path.exists() {
+                return Self::open(&path);
+            }
+        }
+
+        Self::open_latest()
     }
     
     /// 打开指定的 DuckDB 数据库
@@ -52,13 +72,51 @@ impl DuckDBReader {
             duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?,
         )
         .context("打开 DuckDB 数据库失败")?;
+
+        let spatial_enabled = Self::try_enable_spatial(&conn);
+        let (aabb_has_bbox, aabb_has_dbno) =
+            Self::detect_aabb_columns(&conn).unwrap_or((false, false));
         
         println!("📖 [DuckDB Reader] 已打开: {:?}", db_path);
         
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: db_path.to_path_buf(),
+            spatial_enabled,
+            aabb_has_bbox,
+            aabb_has_dbno,
         })
+    }
+
+    fn try_enable_spatial(conn: &Connection) -> bool {
+        if conn.execute_batch("LOAD spatial;").is_ok() {
+            return true;
+        }
+
+        if conn.execute_batch("INSTALL spatial;").is_ok() {
+            return conn.execute_batch("LOAD spatial;").is_ok();
+        }
+
+        false
+    }
+
+    fn get_table_columns(conn: &Connection, table: &str) -> Result<HashSet<String>> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info('{table}')"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut columns = HashSet::new();
+        for row in rows {
+            columns.insert(row?);
+        }
+        Ok(columns)
+    }
+
+    fn detect_aabb_columns(conn: &Connection) -> Result<(bool, bool)> {
+        let columns = Self::get_table_columns(conn, "aabb")?;
+        Ok((columns.contains("bbox"), columns.contains("dbno")))
+    }
+
+    fn use_spatial(&self) -> bool {
+        self.spatial_enabled && self.aabb_has_bbox
     }
     
     /// 获取数据库路径
@@ -76,25 +134,142 @@ impl DuckDBReader {
         max_y: f64,
         max_z: f64,
     ) -> Result<Vec<String>> {
+        self.query_by_bounding_box_internal(None, min_x, min_y, min_z, max_x, max_y, max_z)
+    }
+
+    /// 空间查询：按包围盒查询 refnos（限定 dbno）
+    pub fn query_by_bounding_box_in_dbno(
+        &self,
+        dbno: u32,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        max_x: f64,
+        max_y: f64,
+        max_z: f64,
+    ) -> Result<Vec<String>> {
+        self.query_by_bounding_box_internal(Some(dbno), min_x, min_y, min_z, max_x, max_y, max_z)
+    }
+
+    fn query_by_bounding_box_internal(
+        &self,
+        dbno: Option<u32>,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        max_x: f64,
+        max_y: f64,
+        max_z: f64,
+    ) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT refno FROM aabb
-            WHERE max_x >= ?1 AND min_x <= ?2
-              AND max_y >= ?3 AND min_y <= ?4
-              AND max_z >= ?5 AND min_z <= ?6
-            "#,
-        )?;
-        
-        let refnos: Vec<String> = stmt
-            .query_map(
-                duckdb::params![min_x, max_x, min_y, max_y, min_z, max_z],
-                |row| row.get(0),
-            )?
-            .filter_map(|r| r.ok())
-            .collect();
-        
+
+        let refnos: Vec<String> = if self.use_spatial() {
+            match dbno {
+                Some(dbno) if self.aabb_has_dbno => {
+                    let mut stmt = conn.prepare(
+                        r#"
+                        SELECT refno FROM aabb
+                        WHERE dbno = ?1
+                          AND ST_Intersects(bbox, ST_MakeEnvelope(?2, ?3, ?4, ?5))
+                          AND max_z >= ?6 AND min_z <= ?7
+                        "#,
+                    )?;
+                    stmt.query_map(
+                        duckdb::params![dbno as i64, min_x, min_y, max_x, max_y, min_z, max_z],
+                        |row| row.get(0),
+                    )?
+                    .filter_map(|r| r.ok())
+                    .collect()
+                }
+                Some(dbno) => {
+                    let pattern = format!("{}_%", dbno);
+                    let mut stmt = conn.prepare(
+                        r#"
+                        SELECT refno FROM aabb
+                        WHERE refno LIKE ?1
+                          AND ST_Intersects(bbox, ST_MakeEnvelope(?2, ?3, ?4, ?5))
+                          AND max_z >= ?6 AND min_z <= ?7
+                        "#,
+                    )?;
+                    stmt.query_map(
+                        duckdb::params![pattern, min_x, min_y, max_x, max_y, min_z, max_z],
+                        |row| row.get(0),
+                    )?
+                    .filter_map(|r| r.ok())
+                    .collect()
+                }
+                None => {
+                    let mut stmt = conn.prepare(
+                        r#"
+                        SELECT refno FROM aabb
+                        WHERE ST_Intersects(bbox, ST_MakeEnvelope(?1, ?2, ?3, ?4))
+                          AND max_z >= ?5 AND min_z <= ?6
+                        "#,
+                    )?;
+                    stmt.query_map(
+                        duckdb::params![min_x, min_y, max_x, max_y, min_z, max_z],
+                        |row| row.get(0),
+                    )?
+                    .filter_map(|r| r.ok())
+                    .collect()
+                }
+            }
+        } else {
+            match dbno {
+                Some(dbno) if self.aabb_has_dbno => {
+                    let mut stmt = conn.prepare(
+                        r#"
+                        SELECT refno FROM aabb
+                        WHERE dbno = ?1
+                          AND max_x >= ?2 AND min_x <= ?3
+                          AND max_y >= ?4 AND min_y <= ?5
+                          AND max_z >= ?6 AND min_z <= ?7
+                        "#,
+                    )?;
+                    stmt.query_map(
+                        duckdb::params![dbno as i64, min_x, max_x, min_y, max_y, min_z, max_z],
+                        |row| row.get(0),
+                    )?
+                    .filter_map(|r| r.ok())
+                    .collect()
+                }
+                Some(dbno) => {
+                    let pattern = format!("{}_%", dbno);
+                    let mut stmt = conn.prepare(
+                        r#"
+                        SELECT refno FROM aabb
+                        WHERE refno LIKE ?1
+                          AND max_x >= ?2 AND min_x <= ?3
+                          AND max_y >= ?4 AND min_y <= ?5
+                          AND max_z >= ?6 AND min_z <= ?7
+                        "#,
+                    )?;
+                    stmt.query_map(
+                        duckdb::params![pattern, min_x, max_x, min_y, max_y, min_z, max_z],
+                        |row| row.get(0),
+                    )?
+                    .filter_map(|r| r.ok())
+                    .collect()
+                }
+                None => {
+                    let mut stmt = conn.prepare(
+                        r#"
+                        SELECT refno FROM aabb
+                        WHERE max_x >= ?1 AND min_x <= ?2
+                          AND max_y >= ?3 AND min_y <= ?4
+                          AND max_z >= ?5 AND min_z <= ?6
+                        "#,
+                    )?;
+                    stmt.query_map(
+                        duckdb::params![min_x, max_x, min_y, max_y, min_z, max_z],
+                        |row| row.get(0),
+                    )?
+                    .filter_map(|r| r.ok())
+                    .collect()
+                }
+            }
+        };
+
         Ok(refnos)
     }
     
@@ -170,19 +345,29 @@ impl DuckDBReader {
 }
 
 /// 全局 DuckDB 读取器实例
-static DUCKDB_READER: once_cell::sync::Lazy<Mutex<Option<DuckDBReader>>> =
+static DUCKDB_READER: once_cell::sync::Lazy<Mutex<Option<Arc<DuckDBReader>>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
 
 /// 获取全局 DuckDB 读取器
-pub fn get_duckdb_reader() -> Result<std::sync::MutexGuard<'static, Option<DuckDBReader>>> {
-    Ok(DUCKDB_READER.lock().unwrap())
+pub fn get_duckdb_reader() -> Result<Option<Arc<DuckDBReader>>> {
+    Ok(DUCKDB_READER.lock().unwrap().clone())
+}
+
+/// 获取或初始化全局 DuckDB 读取器
+pub fn get_or_init_duckdb_reader() -> Result<Arc<DuckDBReader>> {
+    if let Some(reader) = get_duckdb_reader()? {
+        return Ok(reader);
+    }
+
+    init_duckdb_reader()?;
+    get_duckdb_reader()?.ok_or_else(|| anyhow!("DuckDB reader 初始化失败"))
 }
 
 /// 初始化全局 DuckDB 读取器
 pub fn init_duckdb_reader() -> Result<()> {
-    let reader = DuckDBReader::open_latest()?;
+    let reader = DuckDBReader::open_global_or_latest()?;
     let mut guard = DUCKDB_READER.lock().unwrap();
-    *guard = Some(reader);
+    *guard = Some(Arc::new(reader));
     Ok(())
 }
 
@@ -195,7 +380,7 @@ pub fn refresh_duckdb_reader() -> Result<()> {
 
 use aios_core::RefU64;
 use parry3d::bounding_volume::Aabb;
-use nalgebra::{Point3, Vector3};
+use nalgebra::Point3;
 
 /// 空间查询结果项（与 spatial_index.rs 中的 SpatialHit 一致）
 #[derive(Debug, Clone)]
@@ -208,41 +393,29 @@ pub struct DuckDBSpatialHit {
 impl DuckDBReader {
     /// 空间相交查询：返回与给定 AABB 相交的所有 refno
     pub fn query_intersect(&self, query_aabb: &Aabb) -> Result<Vec<RefU64>> {
-        let conn = self.conn.lock().unwrap();
-
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT refno FROM aabb
-            WHERE max_x >= ?1 AND min_x <= ?2
-              AND max_y >= ?3 AND min_y <= ?4
-              AND max_z >= ?5 AND min_z <= ?6
-            "#,
+        let refno_strs = self.query_by_bounding_box(
+            query_aabb.mins.x as f64,
+            query_aabb.mins.y as f64,
+            query_aabb.mins.z as f64,
+            query_aabb.maxs.x as f64,
+            query_aabb.maxs.y as f64,
+            query_aabb.maxs.z as f64,
         )?;
 
-        let refnos: Vec<RefU64> = stmt
-            .query_map(
-                duckdb::params![
-                    query_aabb.mins.x as f64, query_aabb.maxs.x as f64,
-                    query_aabb.mins.y as f64, query_aabb.maxs.y as f64,
-                    query_aabb.mins.z as f64, query_aabb.maxs.z as f64
-                ],
-                |row| {
-                    let refno_str: String = row.get(0)?;
-                    // 解析 refno 格式 "dbno_sesno"
-                    let parts: Vec<&str> = refno_str.split('_').collect();
-                    if parts.len() >= 2 {
-                        if let (Ok(dbno), Ok(sesno)) = (
-                            parts[0].parse::<u32>(),
-                            parts[1].parse::<u32>(),
-                        ) {
-                            return Ok(RefU64::from_two_nums(dbno, sesno));
-                        }
+        let refnos: Vec<RefU64> = refno_strs
+            .into_iter()
+            .filter_map(|refno_str| {
+                let parts: Vec<&str> = refno_str.split('_').collect();
+                if parts.len() >= 2 {
+                    if let (Ok(dbno), Ok(sesno)) = (
+                        parts[0].parse::<u32>(),
+                        parts[1].parse::<u32>(),
+                    ) {
+                        return Some(RefU64::from_two_nums(dbno, sesno));
                     }
-                    Ok(RefU64(0))
-                },
-            )?
-            .filter_map(|r| r.ok())
-            .filter(|r| r.0 != 0)
+                }
+                None
+            })
             .collect();
 
         Ok(refnos)
@@ -347,4 +520,3 @@ mod tests {
         }
     }
 }
-

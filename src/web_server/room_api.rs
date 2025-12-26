@@ -20,7 +20,7 @@ use aios_core::{
     room::{
         data_model::{RoomCode, RoomRelationType},
         monitoring::{RoomSystemMetrics, get_global_monitor},
-        query_room_panels_by_keywords,
+        // query_room_panels_by_keywords,  // Removed: not available in aios_core::room
         room_system_manager::{RoomSystemManager, SystemOperationResult, get_global_manager},
     },
 };
@@ -1291,14 +1291,13 @@ async fn execute_room_regenerate(
     info!("🔍 使用房间关键词: {:?}", room_keywords);
 
     // 查询房间和面板关系
-    let room_panel_map = match query_room_panels_by_keywords(&room_keywords).await {
-        Ok(map) => map,
-        Err(e) => {
-            error!("❌ 查询房间参考号失败: {}", e);
-            finalize_task_failed(&state, &task_id, format!("查询房间参考号失败: {}", e)).await;
-            return;
-        }
-    };
+    // query_room_panels_by_keywords was removed, use placeholder
+    let room_panel_map: Vec<(RefnoEnum, String, Vec<RefnoEnum>)> = vec![];
+    info!("⚠️ query_room_panels_by_keywords not available, returning empty");
+    if room_panel_map.is_empty() {
+        finalize_task_failed(&state, &task_id, "房间查询功能暂时不可用".to_string()).await;
+        return;
+    }
 
     let room_count = room_panel_map.len();
     info!("✅ 查询到 {} 个房间", room_count);

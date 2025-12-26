@@ -258,7 +258,7 @@ fn check_task_name_exists(task_name: &str) -> Result<bool, String> {
         .map_err(|e| format!("准备查询语句失败: {}", e))?;
 
     let count: i64 = stmt
-        .query_row([task_name], |row| row.get(0))
+        .query_row([task_name], |row: &rusqlite::Row| row.get(0))
         .map_err(|e| format!("查询任务名称失败: {}", e))?;
 
     Ok(count > 0)
@@ -938,8 +938,8 @@ pub fn load_wizard_config_by_task_id(task_id: &str) -> Option<DataParsingWizardC
     let mut stmt = conn
         .prepare("SELECT wizard_config_json FROM wizard_tasks WHERE id = ?1")
         .ok()?;
-    let cfg_json: Option<String> = stmt.query_row([task_id], |row| row.get(0)).ok().flatten();
-    cfg_json.and_then(|s| serde_json::from_str::<DataParsingWizardConfig>(&s).ok())
+    let cfg_json: Option<String> = stmt.query_row([task_id], |row: &rusqlite::Row| row.get(0)).ok().flatten();
+    cfg_json.and_then(|s: String| serde_json::from_str::<DataParsingWizardConfig>(&s).ok())
 }
 
 /// 从SQLite恢复任务信息
@@ -960,7 +960,7 @@ pub fn restore_tasks_from_sqlite() -> Vec<TaskInfo> {
         Err(_) => return tasks,
     };
 
-    let task_iter = match stmt.query_map(rusqlite::params![], |row| {
+    let task_iter = match stmt.query_map(rusqlite::params![], |row: &rusqlite::Row| {
         let id: String = row.get(0)?;
         let name: String = row.get(1)?;
         let _task_type_str: String = row.get(2)?;
@@ -1029,7 +1029,7 @@ pub fn load_deployment_sites_from_sqlite()
     ",
     )?;
 
-    let site_iter = stmt.query_map([], |row| {
+    let site_iter = stmt.query_map([], |row: &rusqlite::Row| {
         let id: String = row.get(0)?;
         let name: String = row.get(1)?;
         let config_json: String = row.get(2)?;
@@ -1107,7 +1107,7 @@ pub fn load_deployment_site_by_id_from_sqlite(
     ",
     )?;
 
-    let mut site_iter = stmt.query_map([site_id], |row| {
+    let mut site_iter = stmt.query_map([site_id], |row: &rusqlite::Row| {
         let id: String = row.get(0)?;
         let name: String = row.get(1)?;
         let config_json: String = row.get(2)?;

@@ -1421,6 +1421,60 @@ fn default_material_for_level(level: u32) -> &'static str {
     }
 }
 
+async fn collect_deep_visible_refnos(
+    refnos: &[RefnoEnum],
+    verbose: bool,
+    filter_nouns: Option<&[String]>,
+) -> Result<Vec<RefnoEnum>> {
+    let mut collected = HashSet::new();
+    for &refno in refnos {
+        match aios_core::query_deep_visible_inst_refnos(refno).await {
+            Ok(visible) => {
+                if visible.is_empty() {
+                    collected.insert(refno);
+                } else {
+                    collected.extend(visible);
+                }
+            }
+            Err(err) => {
+                if verbose {
+                    eprintln!("⚠️ 查询深度可见实例失败 (refno: {}): {}", refno, err);
+                }
+                collected.insert(refno);
+            }
+        }
+    }
+
+    let mut result: Vec<RefnoEnum> = collected.into_iter().collect();
+    result.sort();
+
+    if let Some(filter) = filter_nouns {
+        let filter_set: HashSet<String> =
+            filter.iter().map(|t| t.to_uppercase()).collect();
+        if !filter_set.is_empty() {
+            match query_provider::get_pes_batch(&result).await {
+                Ok(pes) => {
+                    let mut filtered = Vec::new();
+                    for pe in pes {
+                        if filter_set.contains(&pe.noun.to_uppercase()) {
+                            filtered.push(pe.refno);
+                        }
+                    }
+                    filtered.sort();
+                    return Ok(filtered);
+                }
+                Err(err) => {
+                    if verbose {
+                        eprintln!("⚠️ 过滤可见实例失败，已回退到未过滤列表: {}", err);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 /// 导出所有 inst_relate 实体（Prepack LOD 格式）
 ///
 /// # 参数
@@ -1724,6 +1778,14 @@ pub async fn export_all_relates_prepack_lod_parquet(
 
         println!("   🎯 导出 {} 个指定 refnos", refnos.len());
 
+        let mut visible_refnos =
+            collect_deep_visible_refnos(&refnos, verbose, owner_types.as_deref()).await?;
+        if visible_refnos.is_empty() {
+            println!("   ⚠️ 未找到深度可见实例，回退到输入 refnos");
+            visible_refnos = refnos.clone();
+        }
+        println!("   - 深度可见节点数: {}", visible_refnos.len());
+
         let output_dir = if let Some(custom) = output_override {
             custom
         } else {
@@ -1732,7 +1794,7 @@ pub async fn export_all_relates_prepack_lod_parquet(
 
         println!("\n🔄 导出 Prepack LOD 格式:");
         println!("   - 输出目录: {}", output_dir.display());
-        println!("   - 总实体数: {}", refnos.len());
+        println!("   - 总实体数: {}", visible_refnos.len());
 
         let mesh_dir = if let Some(ref path) = db_option.meshes_path {
             PathBuf::from(path)
@@ -1741,12 +1803,12 @@ pub async fn export_all_relates_prepack_lod_parquet(
         };
 
         export_prepack_lod_for_refnos(
-            &refnos,
+            &visible_refnos,
             &mesh_dir,
             &output_dir,
             db_option,
-            true,
-            owner_types,
+            false,
+            None,
             verbose,
             name_config.as_ref(),
             export_all_lods,

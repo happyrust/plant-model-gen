@@ -95,6 +95,7 @@ impl ParquetGlbExporter {
                     owner_type: None,
                     spec_value: None,
                     has_neg: false,  // 初期不支持布尔运算
+                    aabb: Default::default(),
                 };
                 components.push(component);
             }

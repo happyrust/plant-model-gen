@@ -382,7 +382,7 @@ pub async fn query_geometry_instances_ext(
     }
 
     const DEFAULT_QUERY_BATCH: usize = 50;
-    let geom_insts = aios_core::query_insts_ext(refnos, enable_holes, include_negative, Some(DEFAULT_QUERY_BATCH))
+    let geom_insts = aios_core::query_insts_with_batch(refnos, enable_holes, Some(DEFAULT_QUERY_BATCH))
         .await
         .context("查询 inst_relate 数据失败")?;
 

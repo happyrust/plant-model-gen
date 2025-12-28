@@ -1,5 +1,5 @@
 #同步文件配置
-total_sync = true
+total_sync = false
 incr_sync = false
 sync_history = false
 enable_log = false
@@ -151,7 +151,7 @@ room_keyword = "-RM" # 2016  K-R-K100   (-R-)
 gen_history_model = false
 # debug_model_refnos = ["17496/201375"]
 
-# debug_model_refnos = ["17496_195578"]
+debug_model_refnos = ["24383_73962"]
 
 
 # 精度配置（LOD 分级：数字越大，几何更粗，用于远距渲染）

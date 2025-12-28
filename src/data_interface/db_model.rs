@@ -516,7 +516,10 @@ impl AiosDBManager {
             rtree: None,
         };
         // 临时修复：手动初始化 watcher 以便监听文件变更
-        mgr.init_watcher().await?;
+        // 忽略错误，防止启动失败
+        if let Err(e) = mgr.init_watcher().await {
+            error!("Watcher initialization failed (ignored): {}", e);
+        }
         Ok(mgr)
     }
 

@@ -3212,12 +3212,17 @@ pub async fn api_get_instances(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Query failed: {}", e)))?;
     
+    println!("[DEBUG] api_get_instances: Parsed {} refnos: {:?}", refnos.len(), refnos);
+    println!("[DEBUG] api_get_instances: query_insts returned {} records", insts.len());
+    
     let db_option = aios_core::get_db_option();
     let mesh_dir = db_option.get_meshes_path();
 
     let export_data: ExportData = collect_export_data(insts, &refnos, &mesh_dir, false, None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Collect data failed: {}", e)))?;
+
+    println!("[DEBUG] api_get_instances: collect_export_data returned {} components, {} tubings", export_data.components.len(), export_data.tubings.len());
 
      // Reconstruct Instances logic
      let mut geo_hash_usage: std::collections::HashMap<String, Vec<InstanceInfo>> = std::collections::HashMap::new();
@@ -7339,6 +7344,7 @@ async fn execute_refno_model_generation(
     use crate::fast_model::gen_all_geos_data;
     use aios_core::{RefU64, RefnoEnum};
     use std::time::Instant;
+    use tracing::debug;
 
     // 更新任务状态为运行中
     {
@@ -7399,6 +7405,81 @@ async fn execute_refno_model_generation(
     // 调用 gen_all_geos_data
     let start_time = Instant::now();
     let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
+
+    // 🆕 检查数据是否存在于 pe 表中，如果不存在则先触发解析
+    let mut missing_parsing = false;
+    for refno in &parsed_refnos {
+        if let Ok(None) = aios_core::get_pe(*refno).await {
+            missing_parsing = true;
+            break;
+        }
+    }
+
+    if missing_parsing {
+         // 获取任务配置中的 dbno (通常 manual_db_nums 包含一个值)
+         if let Some(db_num) = config.manual_db_nums.first() {
+              info!("[RefnoModelGeneration] 检测到数据缺失，尝试解析 DB {}", db_num);
+             
+              // 更新进度：开始解析
+              {
+                    let mut task_manager = state.task_manager.lock().await;
+                    if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
+                        task.update_progress("自动解析缺失数据".to_string(), 0, 3, 10.0);
+                        task.add_log(
+                            LogLevel::Info,
+                            format!("检测到 refno 数据缺失，正在自动解析数据库 DB {}...", db_num),
+                        );
+                    }
+              }
+
+              // 构造解析配置
+              let mut parse_opt = aios_core::options::DbOption::default();
+              // 复用任务配置中的连接参数
+              parse_opt.included_projects = vec![config.project_name.clone()];
+              parse_opt.v_ip = config.db_ip.clone();
+              parse_opt.v_user = config.db_user.clone();
+              parse_opt.v_password = config.db_password.clone();
+              parse_opt.v_port = config.db_port.parse::<u16>().unwrap_or(8009);
+              parse_opt.manual_db_nums = Some(vec![*db_num]);
+              parse_opt.project_name = config.project_name.clone();
+              parse_opt.project_code = config.project_code.to_string();
+              parse_opt.project_path = config.project_path.clone();
+              parse_opt.total_sync = true; // 全量同步以确保数据完整
+
+              // 使用简单的回调函数 (仅打印日志)
+              let cb = |project_name: &str,
+                            _current_project: usize,
+                            _total_projects: usize,
+                            _current_file: usize,
+                            _total_files: usize,
+                            _current_chunk: usize,
+                            _total_chunks: usize| {
+                 debug!("Parsing project: {}", project_name);
+              };
+
+              // 执行解析
+              use crate::versioned_db::database::sync_pdms_with_callback;
+              match sync_pdms_with_callback(&parse_opt, Some(cb)).await {
+                   Ok(_) => {
+                       info!("[RefnoModelGeneration] 数据库解析成功");
+                       let mut task_manager = state.task_manager.lock().await;
+                        if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
+                            task.add_log(LogLevel::Info, "数据库自动解析完成".to_string());
+                        }
+                   },
+                   Err(e) => {
+                       error!("[RefnoModelGeneration] 数据库解析失败: {}", e);
+                       let mut task_manager = state.task_manager.lock().await;
+                        if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
+                            task.add_log(LogLevel::Error, format!("数据库解析失败: {}", e));
+                            // 解析失败可以选择返回或继续尝试（这里选择记录错误但继续尝试生成，虽然可能会失败）
+                        }
+                   }
+              }
+         }
+    }
+
+    // 重新获取 options (避免借用问题，虽然这里 clone 了)
     let result = gen_all_geos_data(
         parsed_refnos.clone(),
         &db_option_ext,
@@ -7434,11 +7515,25 @@ async fn execute_refno_model_generation(
             let mesh_dir = std::path::Path::new(&mesh_path_str);
             drop(config_read); // Drop lock just in case
 
-            let bundle_result = crate::web_server::instance_export::export_model_bundle(
+            let mut dbno = config.manual_db_nums.first().copied();
+            
+            // 如果未能从配置获取 dbno，则尝试从数据库查询
+            if dbno.is_none() {
+                for refno in &parsed_refnos {
+                    // 查询 PE 获取 dbnum
+                    if let Ok(Some(pe)) = aios_core::get_pe(*refno).await {
+                         dbno = Some(pe.dbnum as u32);
+                         debug!("从数据库查询到 refno {} 的 dbnum: {}", refno, pe.dbnum);
+                         break;
+                    }
+                }
+            }
+            let bundle_result = crate::web_server::instance_export::export_model_bundle_with_dbno(
                 &parsed_refnos,
                 &task_id,
                 &bundle_output_dir,
                 mesh_dir,
+                dbno,
             )
             .await;
 

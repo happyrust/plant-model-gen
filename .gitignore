@@ -136,3 +136,4 @@ aios-database
 # Cargo.lock
 # package-lock.json
 # pnpm-lock.yamlexport.sql
+.ace-tool/

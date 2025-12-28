@@ -16,7 +16,7 @@ use aios_core::options::DbOption;
 use aios_core::shape::pdms_shape::PlantMesh;
 use anyhow::{Context, Result};
 use glam::{DMat4, Vec3};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use super::export_common::{ComponentRecord, ExportData, TubiRecord};
 use super::export_glb::export_single_mesh_to_glb;
@@ -64,10 +64,24 @@ pub struct InstancesData {
     pub instances: Vec<InstanceInfo>,
 }
 
+fn serialize_matrix_limit_precision<S>(matrix: &[f64; 16], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::SerializeSeq;
+    let mut seq = serializer.serialize_seq(Some(16))?;
+    for &num in matrix {
+        let rounded = (num * 1000.0).round() / 1000.0;
+        seq.serialize_element(&rounded)?;
+    }
+    seq.end()
+}
+
 /// 单个实例信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceInfo {
     pub refno: String,
+    #[serde(serialize_with = "serialize_matrix_limit_precision")]
     pub matrix: [f64; 16],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<[f32; 3]>,
@@ -367,11 +381,34 @@ pub async fn export_instanced_bundle_for_refnos(
         println!("   - 输出目录: {}", output_dir.display());
     }
 
+    // 自动扩展层级：获取所有子孙节点
+    // 这确保了像 BRAN/ZONE 这样的容器节点能导出其下的所有组件
+    let mut all_refnos = refnos.to_vec();
+    if !refnos.is_empty() {
+        if verbose {
+            println!("   - 正在展开通过层级查询子孙节点...");
+        }
+        // 查询所有类型的子孙节点
+        let descendants = aios_core::collect_descendant_filter_ids(refnos, &[], None)
+            .await
+            .unwrap_or_default();
+            
+        if !descendants.is_empty() {
+            if verbose {
+                println!("   - 找到 {} 个子孙节点，合并导出列表", descendants.len());
+            }
+            all_refnos.extend(descendants);
+            // 去重
+            all_refnos.sort();
+            all_refnos.dedup();
+        }
+    }
+    
     // 查询几何体数据
     if verbose {
-        println!("\n📊 查询几何体数据...");
+        println!("\n📊 查询几何体数据 (共 {} 个节点)...", all_refnos.len());
     }
-    let geom_insts = query_insts(refnos, true)
+    let geom_insts = query_insts(&all_refnos, true)
         .await
         .context("查询 inst_relate 数据失败")?;
 
@@ -442,12 +479,12 @@ pub async fn export_instanced_bundle_for_refnos(
     // 筛选 BRAN/HANG 类型的 refnos 作为 bran_roots
     // 这对于 TUBI 管道数据查询是必需的
     let mut bran_roots: Vec<RefnoEnum> = Vec::new();
-    if !refnos.is_empty() {
+    if !all_refnos.is_empty() {
         use futures::StreamExt;
         use futures::stream::FuturesUnordered;
         
         let mut type_tasks = FuturesUnordered::new();
-        for refno in refnos {
+        for refno in &all_refnos {
             let refno = *refno;
             type_tasks.push(async move {
                 if let Ok(Some(pe)) = crate::fast_model::query_provider::get_pe(refno).await {
@@ -477,7 +514,10 @@ pub async fn export_instanced_bundle_for_refnos(
     } else {
         Some(&bran_roots)
     };
-    let export_data = collect_export_data(geom_insts, refnos, mesh_dir, verbose, bran_roots_ref).await?;
+    let export_data = collect_export_data(geom_insts, &all_refnos, mesh_dir, verbose, bran_roots_ref).await?;
+    
+    println!("🔍 [DEBUG] collect_export_data 完成: total_instances={}, components={}, tubings={}", 
+        export_data.total_instances, export_data.components.len(), export_data.tubings.len());
 
     if export_data.total_instances == 0 {
         println!("⚠️  未找到任何几何体数据");

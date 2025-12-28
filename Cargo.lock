@@ -8598,6 +8598,7 @@ dependencies = [
  "flume",
  "futures",
  "futures-util",
+ "glam 0.30.9",
  "indexmap 2.12.1",
  "iter_tools",
  "itertools 0.14.0",

@@ -354,18 +354,24 @@ pub async fn save_instance_data_optimize(
             entry.insert(serde_json::to_string(&info.world_transform)?);
         }
 
-        let relate_sql = format!(
-            "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, world_trans: trans:⟨{3}⟩, generic: '{4}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {5}, solid: {6}, owner_refno: {7}, owner_type: '{8}'}}",
-            key.to_inst_relate_key(),
-            key.to_pe_key(),
-            info.id_str(),
-            transform_hash,
-            info.generic_type.to_string(),
-            info.has_cata_neg,
-            info.is_solid,
-            info.owner_refno.to_pe_key(),
-            info.owner_type,
-        );
+            let aabb_hash = gen_bytes_hash(&info.aabb);
+            if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
+                entry.insert(serde_json::to_string(&info.aabb)?);
+            }
+
+            let relate_sql = format!(
+                "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, world_trans: trans:⟨{3}⟩, aabb: aabb:⟨{9}⟩, generic: '{4}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {5}, solid: {6}, owner_refno: {7}, owner_type: '{8}'}}",
+                key.to_inst_relate_key(),
+                key.to_pe_key(),
+                info.id_str(),
+                transform_hash,
+                info.generic_type.to_string(),
+                info.has_cata_neg,
+                info.is_solid,
+                info.owner_refno.to_pe_key(),
+                info.owner_type,
+                aabb_hash
+            );
 
         inst_relate_buffer.push(relate_sql);
         if inst_relate_buffer.len() >= CHUNK_SIZE {
@@ -414,9 +420,16 @@ pub async fn save_instance_data_optimize(
                 entry.insert(serde_json::to_string(&info.world_transform)?);
             }
 
+            let aabb_str = if let Some(aabb) = info.aabb {
+                let aabb_hash = gen_bytes_hash(&aabb);
+                format!("aabb: aabb:⟨{}⟩, ", aabb_hash)
+            } else {
+                "aabb: NONE, ".to_string()
+            };
+
             // 为 Tubing 创建 inst_relate 记录
             let relate_sql = format!(
-                "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, world_trans: trans:⟨{3}⟩, generic: '{4}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {5}, solid: {6}, owner_refno: {7}, owner_type: '{8}'}}",
+                "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, world_trans: trans:⟨{3}⟩, {9} generic: '{4}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {5}, solid: {6}, owner_refno: {7}, owner_type: '{8}'}}",
                 key.to_inst_relate_key(),
                 key.to_pe_key(),
                 info.id_str(),
@@ -426,6 +439,7 @@ pub async fn save_instance_data_optimize(
                 info.is_solid,
                 info.owner_refno.to_pe_key(),
                 info.owner_type,
+                aabb_str
             );
 
             tubi_relate_buffer.push(relate_sql);

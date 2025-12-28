@@ -539,7 +539,8 @@ async fn cal_room_refnos_with_options(
     let mut panel_aabb: Option<Aabb> = None;
 
     for geom_inst in &panel_geom_insts {
-        let geom_aabb: Aabb = geom_inst.world_aabb.into();
+        let Some(ref world_aabb) = geom_inst.world_aabb else { continue };
+        let geom_aabb: Aabb = world_aabb.clone().into();
         panel_aabb = Some(match panel_aabb {
             None => geom_aabb,
             Some(acc) => merge_aabb(&acc, &geom_aabb),
@@ -972,6 +973,9 @@ fn extract_geom_key_points(geom_insts: &[GeomInstQuery]) -> Vec<Point<Real>> {
     let mut all_points = Vec::with_capacity(geom_insts.len() * 30);
 
     for geom_inst in geom_insts {
+        // 跳过没有 world_aabb 的实例
+        let Some(ref world_aabb) = geom_inst.world_aabb else { continue };
+
         // 优先使用 pts 字段（来自几何体的实际关键点）
         if let Some(ref pts) = geom_inst.pts {
             if !pts.is_empty() {
@@ -980,14 +984,14 @@ fn extract_geom_key_points(geom_insts: &[GeomInstQuery]) -> Vec<Point<Real>> {
                     all_points.push(Point::new(pt.0.x, pt.0.y, pt.0.z));
                 }
                 // 同时添加 AABB 中心点以提高鲁棒性
-                let aabb: Aabb = geom_inst.world_aabb.into();
+                let aabb: Aabb = world_aabb.clone().into();
                 all_points.push(aabb.center());
                 continue;
             }
         }
-        
+
         // 回退：使用 AABB 增强关键点
-        let aabb: Aabb = geom_inst.world_aabb.into();
+        let aabb: Aabb = world_aabb.clone().into();
         let points = extract_aabb_key_points(&aabb);
         all_points.extend(points);
     }

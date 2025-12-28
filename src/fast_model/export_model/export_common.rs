@@ -122,6 +122,8 @@ pub struct ComponentRecord {
     /// true: 几何体变换直接使用 world_transform（local_transform 已包含世界变换）
     /// false: 使用 world_transform × local_transform
     pub has_neg: bool,
+    /// 世界坐标系下的包围盒（可能为空）
+    pub aabb: Option<aios_core::types::PlantAabb>,
 }
 
 /// TUBI 记录
@@ -136,6 +138,8 @@ pub struct TubiRecord {
     pub name: String,
     /// 规格值（来自 ZONE 的 owner.spec_value）
     pub spec_value: Option<i64>,
+    /// 世界坐标系下的包围盒（可能为空）
+    pub aabb: Option<aios_core::types::PlantAabb>,
 }
 
 /// 线程安全的几何体缓存
@@ -394,10 +398,22 @@ pub async fn collect_export_data(
         }
         roots.to_vec()
     } else {
+        // 如果外部未提供 bran_roots，尝试从输入的 refnos 中筛选 BRAN/HANG
+        let derived_roots: Vec<RefnoEnum> = refnos.iter()
+            .filter(|r| {
+                if let Some(noun) = refno_noun_map.get(r) {
+                    noun == "BRAN" || noun == "HANG"
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .collect();
+            
         if verbose {
-            println!("   ⚠️  bran_roots 参数未提供，跳过 TUBI 查询");
+            println!("   ⚠️  bran_roots 参数未提供，从 refnos 推导 BRAN/HANG: {} 个", derived_roots.len());
         }
-        Vec::new()
+        derived_roots
     };
 
     if verbose {
@@ -436,7 +452,6 @@ pub async fn collect_export_data(
                     SELECT
                         id[0] as refno,
                         in as leave,
-                        id[0].old_pe as old_refno,
                         id[0].owner.noun as generic,
                         aabb.d as world_aabb,
                         world_trans.d as world_trans,
@@ -444,7 +459,6 @@ pub async fn collect_export_data(
                         id[0].dt as date,
                         spec_value
                     FROM tubi_relate:[{}, 0]..[{}, ..]
-                    WHERE aabb.d != NONE
                     "#,
                     pe_key, pe_key
                 );
@@ -588,6 +602,9 @@ pub async fn collect_export_data(
             let owner_noun = owner_noun_map.get(&geom_inst.owner).cloned();
             let owner_type = owner_type_map.get(&geom_inst.owner).cloned();
 
+            if verbose {
+                println!("   - comp[{}] AABB: {:?}", components.len(), geom_inst.world_aabb);
+            }
             components.push(ComponentRecord {
                 refno: geom_inst.refno,
                 noun,
@@ -599,6 +616,7 @@ pub async fn collect_export_data(
                 owner_type,
                 spec_value: geom_inst.spec_value,
                 has_neg: geom_inst.has_neg,  // 是否使用布尔结果 mesh
+                aabb: geom_inst.world_aabb,
             });
         }
     }
@@ -645,6 +663,9 @@ pub async fn collect_export_data(
             tubi.leave
         };
 
+        if verbose {
+            println!("   - tubi[{}] AABB: {:?}", tubings.len(), tubi.world_aabb);
+        }
         tubings.push(TubiRecord {
             refno: tubi.refno,
             owner_refno,
@@ -653,6 +674,7 @@ pub async fn collect_export_data(
             index: *tubi_index - 1,
             name: tubi_name,
             spec_value: tubi.spec_value,
+            aabb: tubi.world_aabb,
         });
     }
 

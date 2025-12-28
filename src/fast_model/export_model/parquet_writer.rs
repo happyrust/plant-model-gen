@@ -38,6 +38,7 @@ struct InstanceRow {
     pub owner_refno: Option<String>,
     pub geo_items: Vec<GeoItem>,
     pub inst_trans_id: String,          // 实例世界变换 ID (e.g. {refno}_world)
+    pub aabb: [f32; 6],                 // 包围盒 [min_x, min_y, min_z, max_x, max_y, max_z]
 }
 
 /// Parquet 存储管理器
@@ -237,6 +238,10 @@ impl ParquetManager {
                 owner_refno: comp.owner_refno.map(|r| r.to_string()),
                 geo_items: Vec::new(),
                 inst_trans_id: world_trans_id.clone(),
+                aabb: comp.aabb.as_ref().map(|a| [
+                    a.mins().x as f32, a.mins().y as f32, a.mins().z as f32,
+                    a.maxs().x as f32, a.maxs().y as f32, a.maxs().z as f32,
+                ]).unwrap_or([0.0; 6]),
             });
             
             // 添加所有几何体（分离存储局部变换）
@@ -287,6 +292,10 @@ impl ParquetManager {
                 owner_refno: Some(tubi.owner_refno.to_string()),
                 geo_items: Vec::new(),
                 inst_trans_id: world_trans_id.clone(),
+                aabb: tubi.aabb.as_ref().map(|a| [
+                    a.mins().x as f32, a.mins().y as f32, a.mins().z as f32,
+                    a.maxs().x as f32, a.maxs().y as f32, a.maxs().z as f32,
+                ]).unwrap_or([0.0; 6]),
             });
             
             // TUBI 的几何体局部变换 ID（使用单位矩阵）
@@ -329,6 +338,13 @@ impl ParquetManager {
         let owners: Vec<Option<String>> = rows.iter().map(|r| r.owner_refno.clone()).collect();
         let inst_trans_ids: Vec<String> = rows.iter().map(|r| r.inst_trans_id.clone()).collect();
         
+        let min_xs: Vec<f32> = rows.iter().map(|r| r.aabb[0]).collect();
+        let min_ys: Vec<f32> = rows.iter().map(|r| r.aabb[1]).collect();
+        let min_zs: Vec<f32> = rows.iter().map(|r| r.aabb[2]).collect();
+        let max_xs: Vec<f32> = rows.iter().map(|r| r.aabb[3]).collect();
+        let max_ys: Vec<f32> = rows.iter().map(|r| r.aabb[4]).collect();
+        let max_zs: Vec<f32> = rows.iter().map(|r| r.aabb[5]).collect();
+
         let geo_items_series = self.build_geo_items_series(&rows)?
             .cast(&Self::geo_items_dtype())?;
         
@@ -340,6 +356,12 @@ impl ParquetManager {
             Column::from(Series::new("is_tubi".into(), is_tubis)),
             Column::from(Series::new("owner_refno".into(), owners)),
             Column::from(Series::new("inst_trans_id".into(), inst_trans_ids)),
+            Column::from(Series::new("min_x".into(), min_xs)),
+            Column::from(Series::new("min_y".into(), min_ys)),
+            Column::from(Series::new("min_z".into(), min_zs)),
+            Column::from(Series::new("max_x".into(), max_xs)),
+            Column::from(Series::new("max_y".into(), max_ys)),
+            Column::from(Series::new("max_z".into(), max_zs)),
             Column::from(geo_items_series),
         ])?;
 

@@ -1987,15 +1987,15 @@ pub async fn update_room_relations_incremental(
     use futures::stream::{self, StreamExt};
 
     let results = stream::iter(affected_panels)
-        .map(|(panel_refno, room_num)| {
+        .map(|pr| {
             let mesh_dir = mesh_dir.clone();
             let exclude_panel_refnos = exclude_panel_refnos.clone();
             let options = compute_options;
             async move {
                 process_panel_for_room(
                     &mesh_dir,
-                    panel_refno,
-                    &room_num,
+                    pr.panel,
+                    &pr.room_num,
                     exclude_panel_refnos.as_ref(),
                     options,
                 )
@@ -2021,11 +2021,19 @@ pub async fn update_room_relations_incremental(
     })
 }
 
+use surrealdb::types::{self as surrealdb_types, SurrealValue};
+
+#[derive(Debug, serde::Deserialize, SurrealValue)]
+struct PanelRoom {
+    panel: RefnoEnum,
+    room_num: String,
+}
+
 /// 查询包含指定 refnos 的房间面板
 #[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 async fn query_panels_containing_refnos(
     refnos: &[RefnoEnum],
-) -> anyhow::Result<Vec<(RefnoEnum, String)>> {
+) -> anyhow::Result<Vec<PanelRoom>> {
     if refnos.is_empty() {
         return Ok(Vec::new());
     }
@@ -2035,36 +2043,29 @@ async fn query_panels_containing_refnos(
     let refno_list = refno_keys.join(",");
 
     // 查询包含这些 refnos 的房间面板关系
-    // 查询包含这些 refnos 的房间面板关系
+    // 使用图遍历语法: refno <-room_relate 获取 in(panel) 和 room_num
     let sql = format!(
         r#"
-        select value [`in`, room_num] 
-        from room_relate 
-        where `out` in [{}]
-        group by `in`, room_num
+        SELECT VALUE {{ panel: in, room_num: room_num }}
+        FROM array::distinct([{}]<-room_relate)
         "#,
         refno_list
     );
 
-    let mut response = SUL_DB.query(sql).await?;
-    let raw_result: Vec<(RecordId, String)> = response.take(0)?;
-
-    let panels: Vec<(RefnoEnum, String)> = raw_result
-        .into_iter()
-        .map(|(panel_id, room_num)| (RefnoEnum::from(panel_id), room_num))
-        .collect();
+    let mut response = SUL_DB.query(&sql).await?;
+    let panels: Vec<PanelRoom> = response.take(0)?;
 
     Ok(panels)
 }
 
 /// 删除指定面板的房间关系
 #[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
-async fn delete_room_relations_for_panels(panels: &[(RefnoEnum, String)]) -> anyhow::Result<()> {
+async fn delete_room_relations_for_panels(panels: &[PanelRoom]) -> anyhow::Result<()> {
     if panels.is_empty() {
         return Ok(());
     }
 
-    let panel_keys: Vec<String> = panels.iter().map(|(p, _)| p.to_pe_key()).collect();
+    let panel_keys: Vec<String> = panels.iter().map(|p| p.panel.to_pe_key()).collect();
     let panel_list = panel_keys.join(",");
 
     let sql = format!("delete room_relate where `in` in [{}];", panel_list);
@@ -2194,9 +2195,14 @@ pub async fn rebuild_room_relations_for_rooms(
         .collect();
 
     // 3. 删除旧关系
-    let panels_to_delete: Vec<(RefnoEnum, String)> = room_panel_map
+    let panels_to_delete: Vec<PanelRoom> = room_panel_map
         .iter()
-        .flat_map(|(_, room_num, panels)| panels.iter().map(move |p| (*p, room_num.clone())))
+        .flat_map(|(_, room_num, panels)| {
+            panels.iter().map(move |p| PanelRoom {
+                panel: *p,
+                room_num: room_num.clone(),
+            })
+        })
         .collect();
     delete_room_relations_for_panels(&panels_to_delete).await?;
     info!("已删除 {} 个面板的旧关系", panels_to_delete.len());

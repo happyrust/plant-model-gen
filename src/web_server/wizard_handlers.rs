@@ -487,6 +487,8 @@ pub async fn get_wizard_templates(
             room_keyword: "-RM".to_string(),
             target_sesno: None,
             meshes_path: None,
+            export_json: false,
+            export_parquet: true,
         },
         allow_custom_config: true,
         estimated_duration: Some(1800), // 30分钟

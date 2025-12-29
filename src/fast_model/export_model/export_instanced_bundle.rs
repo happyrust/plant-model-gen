@@ -106,16 +106,17 @@ impl InstancedBundleExporter {
             println!("\n🚀 开始导出 Instanced Bundle...");
         }
 
-        // 创建输出目录结构
-        let archetypes_dir = output_dir.join("archetypes");
+        // 仅当启用 JSON 导出时创建 instances 目录
         let instances_dir = output_dir.join("instances");
-        fs::create_dir_all(&archetypes_dir).context("创建 archetypes 目录失败")?;
-        fs::create_dir_all(&instances_dir).context("创建 instances 目录失败")?;
+        if self.db_option.export_json {
+            fs::create_dir_all(&instances_dir).context("创建 instances 目录失败")?;
+        }
 
         if self.verbose {
             println!("   ✅ 创建目录结构完成");
-            println!("   - archetypes: {}", archetypes_dir.display());
-            println!("   - instances: {}", instances_dir.display());
+            if self.db_option.export_json {
+                println!("   - instances: {}", instances_dir.display());
+            }
         }
 
         // 收集所有唯一的 geo_hash
@@ -214,25 +215,27 @@ impl InstancedBundleExporter {
                  continue;
             }
 
-            // 生成 LOD 几何体 (复制 GLB)
+            // 生成 LOD 信息（不再复制文件）
             let lod_levels = self
-                .generate_lod_geometries(geo_hash, &archetypes_dir, mesh_dir)
+                .generate_lod_geometries(geo_hash, mesh_dir)
                 .await?;
 
             // 写入实例数据
-            let instances_data = InstancesData {
-                geo_hash: geo_hash.clone(),
-                instances: instances.clone(),
-            };
+            if self.db_option.export_json {
+                let instances_data = InstancesData {
+                    geo_hash: geo_hash.clone(),
+                    instances: instances.clone(),
+                };
 
-            let instances_file = instances_dir.join(format!("{}.json", geo_hash));
-            let instances_json =
-                serde_json::to_string_pretty(&instances_data).context("序列化实例数据失败")?;
-            fs::write(&instances_file, instances_json)
-                .with_context(|| format!("写入实例文件失败: {}", instances_file.display()))?;
+                let instances_file = instances_dir.join(format!("{}.json", geo_hash));
+                let instances_json =
+                    serde_json::to_string_pretty(&instances_data).context("序列化实例数据失败")?;
+                fs::write(&instances_file, instances_json)
+                    .with_context(|| format!("写入实例文件失败: {}", instances_file.display()))?;
 
-            if self.verbose {
-                println!("   ✅ 写入实例文件: {}", instances_file.display());
+                if self.verbose {
+                    println!("   ✅ 写入实例文件: {}", instances_file.display());
+                }
             }
 
             // 添加到 archetypes 列表
@@ -241,7 +244,11 @@ impl InstancedBundleExporter {
                 noun: noun.clone(),
                 material: "default".to_string(), // 可以后续添加材质映射
                 lod_levels,
-                instances_url: format!("instances/{}.json", geo_hash),
+                instances_url: if self.db_option.export_json {
+                    format!("instances/{}.json", geo_hash)
+                } else {
+                    "".to_string()
+                },
                 instance_count: instances.len(),
             });
         }
@@ -273,11 +280,10 @@ impl InstancedBundleExporter {
         Ok(())
     }
 
-    /// 为单个 geo_hash 生成多级 LOD 几何体 (复制 GLB)
+    /// 获取单个 geo_hash 的 LOD 几何体信息 (不再复制)
     async fn generate_lod_geometries(
         &self,
         geo_hash: &str,
-        output_dir: &Path,
         mesh_dir: &Path,
     ) -> Result<Vec<LodLevelInfo>> {
         let mut lod_levels = Vec::new();
@@ -290,14 +296,6 @@ impl InstancedBundleExporter {
                 println!("      处理 LOD {:?}...", lod_level);
             }
 
-            // 目标文件名
-            let filename = if lod_index == 0 {
-                format!("{}.glb", geo_hash)
-            } else {
-                format!("{}_{:?}.glb", geo_hash, lod_level)
-            };
-            
-            let output_path = output_dir.join(&filename);
 
             // 确定源文件位置
             // 策略：优先找 lod_XX/geo_hash_lod.glb，然后找 lod_XX/geo_hash.glb
@@ -332,16 +330,16 @@ impl InstancedBundleExporter {
             // 实际上 gen_inst_meshes 应该已经生成了它们。
             
             if let Some(src) = src_path {
-                fs::copy(&src, &output_path)
-                    .with_context(|| format!("复制 GLB 失败: {} -> {}", src.display(), output_path.display()))?;
+                // 不再复制文件，直接返回相对于 meshes 目录的 URL
+                // 假设前端知道如何映射这些资源（通常基础路径是 meshes_path）
                 
-                 if self.verbose {
-                    println!("         ✅ 复制: {} -> {}", src.display(), filename);
-                }
-
                 lod_levels.push(LodLevelInfo {
                     level: format!("{:?}", lod_level),
-                    geometry_url: format!("archetypes/{}", filename),
+                    geometry_url: if lod_index == 0 {
+                        format!("{}.glb", geo_hash)
+                    } else {
+                        format!("lod_{:?}/{}.glb", lod_level, geo_hash)
+                    },
                     distance: LOD_DISTANCES[lod_index],
                 });
             } else {

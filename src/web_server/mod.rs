@@ -749,6 +749,8 @@ pub async fn start_web_server_with_config(
         // 静态文件服务
         .nest_service("/static", ServeDir::new("src/web_server/static"))
         .nest_service("/files/output", ServeDir::new("output"))
+        .nest_service("/files/output/database_models", ServeDir::new("assets/database_models"))
+        .nest_service("/files/database_models", ServeDir::new("assets/database_models"))
         .nest_service("/files/meshes", {
             let path = aios_core::get_db_option().get_meshes_path();
             let serve_path = if path.file_name().and_then(|n| n.to_str()).map(|s| s.starts_with("lod_")).unwrap_or(false) {

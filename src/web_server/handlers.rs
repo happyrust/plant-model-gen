@@ -4077,6 +4077,10 @@ async fn execute_real_task(state: AppState, task_id: String) {
     db_option.project_path = config.project_path.clone();
     db_option.included_projects = vec![config.project_name.clone()];
     db_option.meshes_path = config.meshes_path.clone();
+    db_option.export_json = config.export_json;
+    db_option.export_json = config.export_json;
+    db_option.export_parquet = config.export_parquet;
+    println!("DEBUG: execute_real_task config.export_json={}, db_option.export_json={}", config.export_json, db_option.export_json);
 
     // 更新任务状态
     let mut update_progress =
@@ -7288,6 +7292,14 @@ pub async fn api_generate_by_refno(
     if let Some(meshes_path) = req.meshes_path {
         config.meshes_path = Some(meshes_path);
     }
+    if let Some(export_json) = req.export_json {
+        config.export_json = export_json;
+    }
+    if let Some(export_parquet) = req.export_parquet {
+        config.export_parquet = export_parquet;
+    }
+
+    println!("DEBUG: api_generate_by_refno req.export_json={:?}, config.export_json={}", req.export_json, config.export_json);
 
     // 3. 创建任务
     let task_name = format!(
@@ -7843,7 +7855,7 @@ pub async fn api_show_by_refno(
     // 暂时保持逻辑，使用 parsed_refnos 作为目标
     
     // 3.1 如果 regen_model=true，删除旧数据并强制重新生成
-    let needed_refnos: Vec<RefnoEnum> = if req.regen_model {
+    if req.regen_model {
         info!("[ShowByRefno] regen_model=true, 删除旧的 inst_relate 数据并强制重新生成");
         
         // 删除旧的 inst_relate 记录
@@ -7852,53 +7864,12 @@ pub async fn api_show_by_refno(
         } else {
             info!("[ShowByRefno] 已删除 {} 个 refno 的旧 inst_relate 数据", parsed_refnos.len());
         }
-        
-        // 强制生成所有 refnos
-        parsed_refnos.clone()
-    } else {
-        // 3.2 检查是否存在（原逻辑）
-        let output_dir = std::env::current_dir().unwrap().join("output"); // 使用默认 output
-        let pm = crate::fast_model::export_model::parquet_writer::ParquetManager::new(&output_dir);
-        
-        let str_refnos: Vec<String> = parsed_refnos.iter().map(|r| r.to_string()).collect();
-        let existing = match pm.check_existence(dbno, &str_refnos) {
-            Ok(exist) => exist,
-            Err(e) => {
-                 return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("检查数据存在性失败: {}", e),
-                ));
-            }
-        };
-        
-        let needed: Vec<RefnoEnum> = parsed_refnos.iter()
-            .filter(|r| !existing.contains(&r.to_string()))
-            .cloned()
-            .collect();
-            
-        if needed.is_empty() {
-            info!("[ShowByRefno] 所有 {} 个 refno 已存在，跳过生成", parsed_refnos.len());
-            // 获取文件列表
-            let files = pm.list_parquet_files(dbno, None).unwrap_or_default();
-             return Ok(Json(ShowByRefnoResponse {
-                success: true,
-                bundle_url: None,
-                message: "所有模型已存在".to_string(),
-                metadata: Some(serde_json::json!({
-                    "refno_count": parsed_refnos.len(),
-                    "dbno": dbno
-                })),
-                parquet_files: Some(files),
-            }));
-        }
-        
-        needed
-    };
+    }
 
+    // 直接使用所有 parsed_refnos 进行生成，生成逻辑内部会自动跳过已存在的数据
     info!(
-        "[ShowByRefno] 查询到 dbno: {}, 需要生成 {} 个 refno (总请求 {})",
+        "[ShowByRefno] 查询到 dbno: {}, 准备生成 {} 个 refno",
         dbno,
-        needed_refnos.len(),
         parsed_refnos.len()
     );
 
@@ -7906,9 +7877,9 @@ pub async fn api_show_by_refno(
     let db_option = aios_core::get_db_option();
     let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
 
-    // 5. 调用生成函数 (针对 needed_refnos)
+    // 5. 调用生成函数
     let result = crate::fast_model::gen_all_geos_data(
-        needed_refnos.clone(), // 只生成缺失的
+        parsed_refnos.clone(),
         &db_option_ext,
         None,
         None,
@@ -7926,7 +7897,7 @@ pub async fn api_show_by_refno(
             let mesh_dir = std::path::Path::new(&mesh_path_str);
 
             let bundle_result = crate::web_server::instance_export::export_model_bundle_with_dbno(
-                &needed_refnos,
+                &parsed_refnos,
                 "", 
                 &std::path::PathBuf::from(""), 
                 mesh_dir,
@@ -7939,17 +7910,15 @@ pub async fn api_show_by_refno(
                     info!("[ShowByRefno] 增量 Parquet 导出成功，dbno: {}", dbno);
                     
                     // 获取最新文件列表
-                    let output_dir = std::env::current_dir().unwrap().join("output");
-                    let pm = crate::fast_model::export_model::parquet_writer::ParquetManager::new(&output_dir);
+                    let pm = crate::fast_model::export_model::parquet_writer::ParquetManager::new("assets");
                     let files = pm.list_parquet_files(dbno, None).unwrap_or_default();
 
                     Ok(Json(ShowByRefnoResponse {
                         success: true,
                         bundle_url: None,
-                        message: format!("新增 {} 个模型生成成功", needed_refnos.len()),
+                        message: format!("{} 个模型生成成功", parsed_refnos.len()),
                         metadata: Some(serde_json::json!({
                             "refno_count": parsed_refnos.len(),
-                            "generated_count": needed_refnos.len(),
                             "dbno": dbno
                         })),
                         parquet_files: Some(files),
@@ -7989,7 +7958,7 @@ pub async fn api_list_parquet_files(
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
     use crate::fast_model::export_model::parquet_writer::ParquetManager;
 
-    let manager = ParquetManager::new("output");
+    let manager = ParquetManager::new("assets");
     
     match manager.list_parquet_files(dbno, query.file_type.as_deref()) {
         Ok(files) => Ok(Json(files)),

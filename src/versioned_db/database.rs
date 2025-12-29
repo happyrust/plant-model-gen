@@ -63,6 +63,8 @@ pub enum SenderJsonsData {
     DbnumInfoUpdate(Vec<String>),
     // 新增：用于按db_num分表保存简化的PE数据 (table_name, sql)
     PartitionedPEJson { table_name: String, sql: String },
+    // 新增：用于 PE Parquet 导出
+    PeParquetData { project_name: String, dbnum: u32, elements: Vec<aios_core::types::SPdmsElement> },
     // Kuzu 数据: Vec<(PE, NamedAttrMap)>
 }
 
@@ -796,6 +798,9 @@ where
                                     }
                                 }
                             }
+                        }
+                        SenderJsonsData::PeParquetData { .. } => {
+                            // TODO: 处理相关 Parquet 数据包
                         }
                     }
                 }

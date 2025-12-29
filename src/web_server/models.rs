@@ -240,6 +240,12 @@ pub struct DatabaseConfig {
     /// Mesh 文件输出目录（可选）
     #[serde(default)]
     pub meshes_path: Option<String>,
+    /// 是否导出 JSON 实例数据
+    #[serde(default)]
+    pub export_json: bool,
+    /// 是否导出 Parquet 数据
+    #[serde(default = "default_true")]
+    pub export_parquet: bool,
 }
 
 impl Default for DatabaseConfig {
@@ -267,6 +273,8 @@ impl Default for DatabaseConfig {
             room_keyword: "-RM".to_string(),
             target_sesno: None,
             meshes_path: None,
+            export_json: false,
+            export_parquet: true,
         }
     }
 }
@@ -311,6 +319,8 @@ impl DatabaseConfig {
             room_keyword,
             target_sesno: None,
             meshes_path: opt.meshes_path.clone(),
+            export_json: opt.export_json,
+            export_parquet: opt.export_parquet,
         }
     }
 }
@@ -1337,6 +1347,12 @@ pub struct RefnoModelGenerationRequest {
     /// 这确保前后端使用相同的 task_id 进行 WebSocket 订阅。
     #[serde(default)]
     pub task_id: Option<String>,
+    /// 是否导出 JSON 实例数据 (可选，默认由 DbOption 决定)
+    #[serde(default)]
+    pub export_json: Option<bool>,
+    /// 是否导出 Parquet 数据 (可选，默认由 DbOption 决定)
+    #[serde(default)]
+    pub export_parquet: Option<bool>,
 }
 
 /// 基于 Refno 的模型生成响应

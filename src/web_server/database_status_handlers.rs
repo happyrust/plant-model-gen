@@ -445,6 +445,8 @@ pub async fn execute_batch_operation(
             room_keyword: "-RM".to_string(),
             target_sesno: None,
             meshes_path: None,
+            export_json: false,
+            export_parquet: true,
         };
 
         // 创建任务

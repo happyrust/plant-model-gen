@@ -79,30 +79,7 @@ fn mesh_base_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("assets/meshes"))
 }
 
-/// 从文件加载网格数据
-///
-/// # 参数
-///
-/// * `id` - 网格文件的ID
-///
-/// # 返回值
-///
-/// 返回 `anyhow::Result<PlantMesh>` 表示加载是否成功以及加载的网格数据
-#[inline]
-fn load_mesh(id: &str) -> anyhow::Result<PlantMesh> {
-    let base_dir = mesh_base_dir();
-    let mesh_path = build_lod_mesh_path(&base_dir, id);
-    
-    use crate::fast_model::export_model::import_glb::import_glb_to_mesh;
-    let mesh = import_glb_to_mesh(&mesh_path)?;
-    debug_model_debug!(
-        "[布尔] 加载 mesh (from .glb): {} (vertices={}, triangles={})",
-        mesh_path.display(),
-        mesh.vertices.len(),
-        mesh.indices.len() / 3
-    );
-    Ok(mesh)
-}
+// 移除 load_mesh，改用 load_manifold
 
 /// 从文件加载流形数据
 ///
@@ -118,8 +95,9 @@ fn load_mesh(id: &str) -> anyhow::Result<PlantMesh> {
 /// 返回 `anyhow::Result<ManifoldRust>` 表示加载是否成功以及加载的流形数据
 #[inline]
 fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<ManifoldRust> {
-    let mesh = load_mesh(id)?;
-    let manifold = ManifoldRust::convert_to_manifold(mesh, mat, more_precision);
+    let base_dir = mesh_base_dir();
+    let mesh_path = build_lod_mesh_path(&base_dir, id);
+    let manifold = ManifoldRust::import_glb_to_manifold(&mesh_path, mat, more_precision)?;
     Ok(manifold)
 }
 
@@ -144,22 +122,24 @@ async fn mark_bool_failed(refno: RefnoEnum) -> anyhow::Result<()> {
 async fn update_booled_result(
     refno: RefnoEnum,
     mesh_id: &str,
-    mesh: &PlantMesh,
+    aabb: Option<parry3d::bounding_volume::Aabb>,
 ) -> anyhow::Result<()> {
     use aios_core::gen_bytes_hash;
     use dashmap::DashMap;
     
-    // 计算布尔后的 aabb
-    let aabb = mesh.cal_aabb();
-    
     if let Some(aabb) = aabb {
-        // 使用 hash 格式存储 AABB（与 mesh_generate.rs 中的模式一致）
-        let aabb_hash = gen_bytes_hash(&aabb);
+        // 使用 hash 格式存储 AABB
+        let aabb_array: [f64; 6] = [
+            aabb.mins.x as f64, aabb.mins.y as f64, aabb.mins.z as f64,
+            aabb.maxs.x as f64, aabb.maxs.y as f64, aabb.maxs.z as f64,
+        ];
+        let aabb_hash = gen_bytes_hash(&aabb_array);
         
         // 保存 AABB 记录到 SurrealDB
         let aabb_map = DashMap::new();
         aabb_map.insert(aabb_hash.to_string(), aabb);
         crate::fast_model::utils::save_aabb_to_surreal(&aabb_map).await;
+        
         let inst_aabb_map = DashMap::new();
         inst_aabb_map.insert(refno, aabb_hash.to_string());
         crate::fast_model::utils::save_inst_relate_aabb(&inst_aabb_map, "bool_mesh").await;
@@ -248,15 +228,12 @@ pub async fn apply_cata_neg_boolean_manifold(
             }
 
             // 即使没有负实体，也标记已处理，避免重复计算
-            let new_id = g.refno.hash_with_another_refno(bg[0]);
+            let mesh_id = g.refno.to_string(); // 使用 Refno 的 to_string() (下划线格式)
             let final_manifold = pos_manifold.batch_boolean_subtract(&neg_manifolds);
-            let mesh = PlantMesh::from(&final_manifold);
-            // let target_path = boolean_mesh_path(&new_id.to_string());
-            let target_path = boolean_glb_path(&new_id.to_string());
+            let target_path = boolean_glb_path(&mesh_id);
             ensure_parent_dir(&target_path)?;
 
-            // if mesh.ser_to_file(&target_path).is_ok() {
-            if export_single_mesh_to_glb(&mesh, &target_path).is_ok() {
+            if final_manifold.export_to_glb(&target_path).is_ok() {
                 // let obj_path = boolean_obj_path(&new_id.to_string());
                 // if let Err(e) = mesh.export_obj(false, obj_path.to_string_lossy().as_ref()) {
                 //     eprintln!("导出 OBJ 失败: refno={} err={}", g.refno, e);
@@ -264,13 +241,13 @@ pub async fn apply_cata_neg_boolean_manifold(
 
                 update_sql.push_str(&format!(
                     "create inst_geo:⟨{}⟩ set meshed = true, aabb = {};",
-                    new_id,
+                    mesh_id,
                     &pos.aabb_id.to_raw()
                 ));
                 let relate_sql = format!(
                     "relate {}->geo_relate->inst_geo:⟨{}⟩ set geom_refno=pe:⟨{}⟩, geo_type='Pos', trans=trans:⟨0⟩, visible = true;",
                     &g.inst_info_id.to_raw(),
-                    new_id,
+                    mesh_id,
                     format!("{}_b", bg[0]),
                 );
                 update_sql.push_str(relate_sql.as_str());
@@ -359,9 +336,8 @@ async fn apply_boolean_for_query(
     }
 
     // 调试：导出正实体 OBJ
-    let pos_mesh = PlantMesh::from(&pos_manifold);
     let pos_obj_path = format!("test_output/debug_{}_pos.obj", query.refno);
-    if let Err(e) = pos_mesh.export_obj(false, &pos_obj_path) {
+    if let Err(e) = pos_manifold.export_to_obj(&pos_obj_path) {
         eprintln!("导出正实体 OBJ 失败: {}", e);
     } else {
         println!("✅ 导出正实体 OBJ: {}", pos_obj_path);
@@ -419,20 +395,18 @@ async fn apply_boolean_for_query(
 
     // 调试：导出负实体 OBJ（合并所有负实体）
     let neg_union = ManifoldRust::batch_boolean(&neg_manifolds, aios_core::csg::manifold::ManifoldOpType::Union);
-    let neg_mesh = PlantMesh::from(&neg_union);
     let neg_obj_path = format!("test_output/debug_{}_neg.obj", query.refno);
-    if let Err(e) = neg_mesh.export_obj(false, &neg_obj_path) {
+    if let Err(e) = neg_union.export_to_obj(&neg_obj_path) {
         eprintln!("导出负实体 OBJ 失败: {}", e);
     } else {
         println!("✅ 导出负实体 OBJ: {}", neg_obj_path);
     }
 
     let final_manifold = pos_manifold.batch_boolean_subtract(&neg_manifolds);
-    let mesh = PlantMesh::from(&final_manifold);
-    
+
     // 调试：导出布尔运算结果 OBJ
     let result_obj_path = format!("test_output/debug_{}_result.obj", query.refno);
-    if let Err(e) = mesh.export_obj(false, &result_obj_path) {
+    if let Err(e) = final_manifold.export_to_obj(&result_obj_path) {
         eprintln!("导出布尔结果 OBJ 失败: {}", e);
     } else {
         println!("✅ 导出布尔结果 OBJ: {}", result_obj_path);
@@ -441,15 +415,15 @@ async fn apply_boolean_for_query(
     let mesh_id = if query.sesno == 0 {
         query.refno.to_string()
     } else {
-        format!("{}_{}", query.refno, query.sesno)
+        format!("{}__{}", query.refno, query.sesno) // 遵循数据库规范，使用下划线
     };
     let target_path = boolean_glb_path(&mesh_id);
     ensure_parent_dir(&target_path)?;
 
-    use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
-    // if mesh.ser_to_file(&target_path).is_ok() {
-    if export_single_mesh_to_glb(&mesh, &target_path).is_ok() {
-        update_booled_result(query.refno, &mesh_id, &mesh).await?;
+    if final_manifold.export_to_glb(&target_path).is_ok() {
+        let aabb = final_manifold.get_mesh().cal_aabb();
+                
+        update_booled_result(query.refno, &mesh_id, aabb).await?;
         debug_model!("布尔运算完成: refno={} mesh={}", query.refno, mesh_id);
         return Ok(());
     }

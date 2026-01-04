@@ -28,7 +28,7 @@ gen_model = true
 gen_mesh = true
 replace_mesh = true
 save_db = true
-apply_boolean_operation = true
+apply_boolean_operation = false
 mesh_tol_ratio = 3.0
 #是否启用房间计算
 gen_spatial_tree = true

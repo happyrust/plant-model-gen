@@ -28,12 +28,25 @@ use aios_core::{
 use crate::shared::{
     ProgressHub, ProgressMessage, ProgressMessageBuilder, TaskStatus as HubTaskStatus,
 };
+use crate::fast_model::{
+    RoomWorker, RoomWorkerConfig, RoomWorkerTask, RoomTaskType as WorkerRoomTaskType,
+    RoomWorkerTaskStatus,
+    room_model::build_room_panels_relate_for_query,
+};
 
 /// 房间计算 API 状态
 #[derive(Clone)]
 pub struct RoomApiState {
     pub task_manager: Arc<RwLock<RoomTaskManager>>,
     pub progress_hub: Arc<ProgressHub>,
+    pub room_worker: Arc<RoomWorker>,
+}
+
+/// 在 Web Server 启动时初始化 RoomWorker
+pub fn init_room_worker() -> Arc<RoomWorker> {
+    let config = RoomWorkerConfig::default(); // 默认并发 1
+    let (worker, _) = RoomWorker::start(config);
+    worker
 }
 
 /// 房间任务管理器
@@ -274,7 +287,7 @@ pub async fn create_room_task(
     let task_id = Uuid::new_v4().to_string();
     let task = RoomComputeTask {
         id: task_id.clone(),
-        task_type: request.task_type,
+        task_type: request.task_type.clone(),
         status: TaskStatus::Pending,
         progress: 0.0,
         message: "任务已创建".to_string(),
@@ -294,6 +307,16 @@ pub async fn create_room_task(
     state.progress_hub.register(task_id.clone());
     info!("📋 房间计算任务已注册到 ProgressHub: {}", task_id);
 
+    // 提交到 RoomWorker
+    let worker_task_type = match request.task_type.clone() {
+        RoomTaskType::RebuildRelations => WorkerRoomTaskType::RebuildAll,
+        _ => WorkerRoomTaskType::RebuildAll, // 默认回退，或者根据需要扩展
+    };
+
+    let db_option = aios_core::get_db_option();
+    let worker_task = RoomWorkerTask::new(task_id.clone(), worker_task_type, db_option.clone());
+    state.room_worker.submit_task(worker_task).await;
+
     // 发布初始进度消息
     let init_msg = ProgressMessageBuilder::new(&task_id)
         .status(HubTaskStatus::Pending)
@@ -303,12 +326,10 @@ pub async fn create_room_task(
         .build();
     let _ = state.progress_hub.publish(init_msg);
 
-    // 异步执行任务
-    let state_clone = state.clone();
-    let task_clone = task.clone();
-    tokio::spawn(async move {
-        execute_room_task(state_clone, task_clone).await;
-    });
+    // 异步执行逻辑已移至 RoomWorker
+    // tokio::spawn(async move {
+    //     execute_room_task(state_clone, task_clone).await;
+    // });
 
     Ok(Json(task))
 }
@@ -1234,13 +1255,14 @@ pub async fn regenerate_room_models(
             .insert(task_id.clone(), task.clone());
     }
 
-    // 异步执行任务
-    let state_clone = state.clone();
-    let request_clone = request.clone();
-    let task_id_clone = task_id.clone();
-    tokio::spawn(async move {
-        execute_room_regenerate(state_clone, task_id_clone, request_clone).await;
-    });
+    // 提交到 Worker
+    let db_option = aios_core::get_db_option();
+    let worker_task = RoomWorkerTask::new(
+        task_id.clone(),
+        WorkerRoomTaskType::RebuildAll,
+        db_option.clone(),
+    );
+    state.room_worker.submit_task(worker_task).await;
 
     Ok(Json(crate::web_server::models::RoomRegenerateResponse {
         success: true,
@@ -1291,13 +1313,13 @@ async fn execute_room_regenerate(
     info!("🔍 使用房间关键词: {:?}", room_keywords);
 
     // 查询房间和面板关系
-    // query_room_panels_by_keywords was removed, use placeholder
-    let room_panel_map: Vec<(RefnoEnum, String, Vec<RefnoEnum>)> = vec![];
-    info!("⚠️ query_room_panels_by_keywords not available, returning empty");
-    if room_panel_map.is_empty() {
-        finalize_task_failed(&state, &task_id, "房间查询功能暂时不可用".to_string()).await;
-        return;
-    }
+    let room_panel_map = match build_room_panels_relate_for_query(&room_keywords).await {
+        Ok(map) => map,
+        Err(e) => {
+            finalize_task_failed(&state, &task_id, format!("房间查询失败: {}", e)).await;
+            return;
+        }
+    };
 
     let room_count = room_panel_map.len();
     info!("✅ 查询到 {} 个房间", room_count);
@@ -1321,39 +1343,28 @@ async fn execute_room_regenerate(
         ),
     );
 
-    // 阶段 2: 强制重新生成模型
-    update_status(30.0, "正在强制重新生成模型...".to_string());
+    // 阶段 2: 生成模型（gen_all_geos_data 会自动跳过已生成的模型）
+    update_status(30.0, format!("正在生成 {} 个面板的模型...", element_count));
+    
+    if request.force_regenerate {
+        unsafe { std::env::set_var("FORCE_REPLACE_MESH", "true"); }
+    }
 
     let mut db_option_clone = db_option_ext.clone();
-    db_option_clone.replace_mesh = Some(true); // 强制重新生成
+    db_option_clone.replace_mesh = Some(request.force_regenerate);
     db_option_clone.gen_mesh = request.gen_mesh;
     db_option_clone.gen_model = true;
     db_option_clone.apply_boolean_operation = request.apply_boolean_operation;
     db_option_clone.manual_db_nums = Some(vec![request.db_num]);
 
-    info!(
-        "🔧 配置: replace_mesh=true, gen_mesh={}, apply_boolean={}",
-        request.gen_mesh, request.apply_boolean_operation
-    );
-
-    // 设置环境变量强制替换
-    unsafe {
-        std::env::set_var("FORCE_REPLACE_MESH", "true");
-    }
-
-    match gen_all_geos_data(all_refnos.clone(), &db_option_clone, None, None).await {
+    match gen_all_geos_data(all_refnos, &db_option_clone, None, None).await {
         Ok(_) => {
             info!("✅ 模型生成完成");
-            update_status(
-                70.0,
-                format!("模型生成完成，已处理 {} 个元素", element_count),
-            );
+            update_status(70.0, "模型生成完成".to_string());
         }
         Err(e) => {
             error!("❌ 模型生成失败: {}", e);
-            unsafe {
-                std::env::remove_var("FORCE_REPLACE_MESH");
-            }
+            unsafe { std::env::remove_var("FORCE_REPLACE_MESH"); }
             finalize_task_failed(&state, &task_id, format!("模型生成失败: {}", e)).await;
             return;
         }
@@ -1505,13 +1516,14 @@ pub async fn rebuild_room_relations_only(
             .insert(task_id.clone(), task.clone());
     }
 
-    // 异步执行任务
-    let state_clone = state.clone();
-    let request_clone = request.clone();
-    let task_id_clone = task_id.clone();
-    tokio::spawn(async move {
-        execute_rebuild_relations_only(state_clone, task_id_clone, request_clone).await;
-    });
+    // 提交到 Worker
+    let db_option = aios_core::get_db_option();
+    let worker_task = RoomWorkerTask::new(
+        task_id.clone(),
+        WorkerRoomTaskType::RebuildAll,
+        db_option.clone(),
+    );
+    state.room_worker.submit_task(worker_task).await;
 
     Ok(Json(crate::web_server::models::RoomComputeResponse {
         success: true,
@@ -1619,4 +1631,36 @@ pub fn create_room_api_routes() -> Router<RoomApiState> {
         // 系统管理
         .route("/api/room/status", get(get_room_system_status))
         .route("/api/room/snapshot", post(create_data_snapshot))
+        .route("/api/room/tasks/{id}/cancel", post(cancel_room_task))
+        .route("/api/room/worker/status", get(get_worker_status))
+}
+
+/// 取消房间计算任务
+pub async fn cancel_room_task(
+    State(state): State<RoomApiState>,
+    Path(task_id): Path<String>,
+) -> Result<Json<bool>, StatusCode> {
+    let success = state.room_worker.cancel_task(&task_id).await;
+    if success {
+        info!("🛑 任务已取消: {}", task_id);
+    } else {
+        warn!("⚠️ 无法取消任务: {}", task_id);
+    }
+    Ok(Json(success))
+}
+
+/// 获取 RoomWorker 运行状态
+pub async fn get_worker_status(
+    State(state): State<RoomApiState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use serde_json::json;
+    
+    let active_count = state.room_worker.active_count();
+    let queue_len = state.room_worker.queue_len().await;
+    
+    Ok(Json(json!({
+        "active_tasks": active_count,
+        "queue_len": queue_len,
+        "is_busy": active_count > 0,
+    })))
 }

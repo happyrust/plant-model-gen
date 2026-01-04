@@ -249,8 +249,8 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
         std::fs::create_dir_all(&mesh_dir)?;
     }
     
-    let precision = aios_core::mesh_precision::MeshPrecisionSettings::default();
-    let mesh_formats = vec![MeshFormat::Glb];
+    let precision = db_option.mesh_precision().clone();
+    let mesh_formats = crate::options::get_db_option_ext().mesh_formats.clone();
 
     loop {
         let round_start = std::time::Instant::now();
@@ -1043,112 +1043,6 @@ pub async fn gen_inst_meshes(
                                         "update inst_geo:⟨{}⟩ set bad=true;",
                                         mesh_id
                                     ));
-                                } else {
-                                    let export_all_lods = std::env::var("EXPORT_ALL_LODS")
-                                        .ok()
-                                        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-                                    if export_all_lods {
-                                        // 基础 mesh 生成成功，现在生成其他 LOD 级别的 mesh
-                                        use aios_core::mesh_precision::LodLevel;
-                                        const LOD_LEVELS: &[LodLevel] =
-                                            &[LodLevel::L1, LodLevel::L2, LodLevel::L3];
-
-                                        // 获取基础 mesh 目录的父目录
-                                        let base_mesh_dir = dir.parent().unwrap_or(&dir);
-
-                                        for &lod_level in LOD_LEVELS {
-                                            // 跳过已经生成的 default_lod
-                                            if lod_level == precision.default_lod {
-                                                continue;
-                                            }
-
-                                            // 获取 LOD 精度设置
-                                            let lod_settings = precision.lod_settings(lod_level);
-
-                                            // 确定 LOD 目录
-                                            let lod_dir = if let Some(subdir) =
-                                                precision.output_subdir(lod_level)
-                                            {
-                                                base_mesh_dir.join(subdir)
-                                            } else {
-                                                base_mesh_dir
-                                                    .join(format!("lod_{:?}", lod_level))
-                                            };
-
-                                            // 创建目录（如果不存在）
-                                            if !lod_dir.exists() {
-                                                if let Err(e) = std::fs::create_dir_all(&lod_dir)
-                                                {
-                                                    debug_model_warn!(
-                                                        "   ⚠️  创建 LOD {:?} 目录失败: {}",
-                                                        lod_level,
-                                                        e
-                                                    );
-                                                    continue;
-                                                }
-                                            }
-
-                                            // 生成 LOD mesh
-                                            match generate_csg_mesh(
-                                                &g.param,
-                                                &lod_settings,
-                                                non_scalable_geo,
-                                                refno_for_mesh,
-                                            ) {
-                                                Some(lod_mesh) => {
-                                                    // 文件名包含 LOD 后缀
-                                                    let lod_filename = format!(
-                                                        "{}_{:?}",
-                                                        mesh_id, lod_level
-                                                    );
-                                                    let lod_mesh_base_path =
-                                                        lod_dir.join(&lod_filename);
-
-                                                    // 强制生成 GLB，即使 mesh_formats 未显式包含
-                                                    // if mesh_formats.contains(&MeshFormat::Glb) {
-                                                        let glb_path = lod_mesh_base_path.with_extension("glb");
-                                                        if let Err(e) = export_single_mesh_to_glb(&lod_mesh.mesh, &glb_path) {
-                                                            debug_model_warn!(
-                                                                "   ⚠️  生成 LOD {:?} GLB 失败: {} - {}",
-                                                                lod_level,
-                                                                mesh_id,
-                                                                e
-                                                            );
-                                                        }
-                                                    // }
-
-                                                    if mesh_formats.contains(&MeshFormat::PdmsMesh) {
-                                                        let lod_mesh_path = lod_mesh_base_path.with_extension("mesh");
-                                                        if let Err(e) = lod_mesh
-                                                            .mesh
-                                                            .ser_to_file(&lod_mesh_path)
-                                                        {
-                                                            debug_model_warn!(
-                                                                "   ⚠️  保存 LOD {:?} mesh 失败: {} - {}",
-                                                                lod_level,
-                                                                mesh_id,
-                                                                e
-                                                            );
-                                                        }
-                                                    }
-
-
-                                                    debug_model_debug!(
-                                                        "   ✅ 生成 LOD {:?} 相关格式: {}",
-                                                        lod_level,
-                                                        mesh_id
-                                                    );
-                                                }
-                                                None => {
-                                                    debug_model_warn!(
-                                                        "   ⚠️  生成 LOD {:?} mesh 失败: {}",
-                                                        lod_level,
-                                                        mesh_id
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
                                 }
                             }
                             None => {

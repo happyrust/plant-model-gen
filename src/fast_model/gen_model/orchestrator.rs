@@ -328,7 +328,7 @@ async fn process_full_noun_mode(
             None, // filter_nouns
             true, // verbose
             None, // name_config
-            true, // export_all_lods
+            false, // export_all_lods: 改为 false，遵循 DbOption 中的默认设置
             LengthUnit::Millimeter,
             LengthUnit::Millimeter,
         )

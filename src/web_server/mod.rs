@@ -233,11 +233,13 @@ pub async fn start_web_server_with_config(
     // 初始化 Ptset API
     let ptset_routes = create_ptset_routes();
 
+    let room_worker = room_api::init_room_worker();
     let room_api_state = room_api::RoomApiState {
         task_manager: Arc::new(tokio::sync::RwLock::new(
             room_api::RoomTaskManager::default(),
         )),
         progress_hub: app_state.progress_hub.clone(),
+        room_worker,
     };
     let room_routes = room_api::create_room_api_routes().with_state(room_api_state);
 

@@ -250,7 +250,48 @@ async fn process_full_noun_mode(
             );
         }
 
-        // 3️⃣ 可选执行布尔运算
+        // 3️⃣ 写入 inst_relate_aabb 并导出 Parquet（供房间计算使用）
+        let aabb_start = Instant::now();
+        println!("[gen_model] Full Noun 模式开始写入 inst_relate_aabb");
+        // 使用实际 inst_relate 中的 refno，避免分类结果与 inst 列表不一致导致 0 写入
+        let aabb_refnos = match crate::fast_model::mesh_generate::fetch_inst_relate_refnos().await {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => {
+                eprintln!("[gen_model] inst_relate 中无可用 refno，跳过 AABB 写入");
+                Vec::new()
+            }
+            Err(e) => {
+                eprintln!("[gen_model] 获取 inst_relate refno 失败: {}", e);
+                Vec::new()
+            }
+        };
+
+        if aabb_refnos.is_empty() {
+            eprintln!("[gen_model] Full Noun 模式写入 inst_relate_aabb 被跳过：没有可用 refno");
+        } else {
+            if let Err(e) = crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
+                &aabb_refnos,
+                db_option.is_replace_mesh(),
+            )
+            .await
+            {
+                eprintln!("[gen_model] Full Noun 模式写入 inst_relate_aabb 失败: {}", e);
+            } else {
+                println!(
+                    "[gen_model] Full Noun 模式完成 inst_relate_aabb 写入，用时 {} ms",
+                    aabb_start.elapsed().as_millis()
+                );
+                if let Err(e) = crate::fast_model::export_model::export_parquet::export_inst_aabb_parquet(
+                    std::path::Path::new("assets/parquet/inst_aabb.parquet")
+                )
+                .await
+                {
+                    eprintln!("[gen_model] Full Noun 模式导出 inst_aabb Parquet 失败: {}", e);
+                }
+            }
+        }
+
+        // 4️⃣ 可选执行布尔运算
         if db_option.inner.apply_boolean_operation {
             let bool_start = Instant::now();
             println!("[gen_model] Full Noun 模式开始布尔运算（boolean worker）");
@@ -269,7 +310,7 @@ async fn process_full_noun_mode(
             }
         }
 
-        // 4️⃣ 生成 Web Bundle (GLB + JSON 数据包)
+        // 5️⃣ 生成 Web Bundle (GLB + JSON 数据包)
         if db_option.mesh_formats.contains(&MeshFormat::Glb) {
             let web_bundle_start = Instant::now();
             println!("[gen_model] 开始生成 Web Bundle (GLB + JSON 数据包)...");
@@ -443,19 +484,25 @@ async fn process_targeted_generation(
             );
         }
         
-        // 更新 inst_relate 的 aabb（mesh worker 只更新了 inst_geo.aabb）
+        // 写入实例 AABB（mesh worker 只更新了 inst_geo.aabb）
         let aabb_start = Instant::now();
-        println!("[gen_model] 开始更新 inst_relate aabb");
+        println!("[gen_model] 开始写入 inst_relate_aabb");
         if let Err(e) = crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
             &target_root_refnos,
             db_option.is_replace_mesh(),
         ).await {
-            eprintln!("[gen_model] 更新 inst_relate aabb 失败: {}", e);
+            eprintln!("[gen_model] 写入 inst_relate_aabb 失败: {}", e);
         } else {
             println!(
-                "[gen_model] 完成 inst_relate aabb 更新，用时 {} ms",
+                "[gen_model] 完成 inst_relate_aabb 写入，用时 {} ms",
                 aabb_start.elapsed().as_millis()
             );
+            // 生成 Parquet 供空间计算使用
+            if let Err(e) = crate::fast_model::export_model::export_parquet::export_inst_aabb_parquet(
+                std::path::Path::new("assets/parquet/inst_aabb.parquet")
+            ).await {
+                eprintln!("[gen_model] 导出 inst_aabb Parquet 失败: {}", e);
+            }
         }
 
         // 运行 boolean worker 处理布尔运算

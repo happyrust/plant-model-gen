@@ -77,8 +77,10 @@ pub async fn cal_equip_nearest_floor() -> anyhow::Result<()> {
 
         let sql = format!(
             r#"
-            (select value array::flatten([(select value aabb.d from <-pe_owner<-pe<-pe_owner<-pe->inst_relate),
-                (select value aabb.d from <-pe_owner<-pe->inst_relate)]) from {} where array::len(->nearest_relate)=0)[0]
+            (select value array::flatten([
+                (select value type::record('inst_relate_aabb', record::id(in)).aabb.d from <-pe_owner<-pe<-pe_owner<-pe->inst_relate),
+                (select value type::record('inst_relate_aabb', record::id(in)).aabb.d from <-pe_owner<-pe->inst_relate)
+            ]) from {} where array::len(->nearest_relate)=0)[0]
             "#,
             equip.to_pe_key()
         );

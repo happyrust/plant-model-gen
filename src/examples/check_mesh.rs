@@ -1,7 +1,8 @@
-use aios_core::shape::pdms_shape::PlantMesh;
+use aios_database::fast_model::export_model::import_glb::import_glb_to_mesh;
+use std::path::Path;
 
 fn main() {
-    let mesh = PlantMesh::des_mesh_file("assets/meshes/2.mesh").unwrap();
+    let mesh = import_glb_to_mesh(Path::new("assets/meshes/2.glb")).unwrap();
     println!("几何体 2:");
     println!("  vertices: {}", mesh.vertices.len());
     println!("  normals: {}", mesh.normals.len());
@@ -11,6 +12,4 @@ fn main() {
     }
     println!("  前10个索引: {:?}", &mesh.indices[..mesh.indices.len().min(10)]);
 }
-
-
 

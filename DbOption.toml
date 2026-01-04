@@ -35,11 +35,10 @@ gen_spatial_tree = true
 load_spatial_tree = false
 save_spatial_tree_to_db = false
 enable_sqlite_rtree = true
-sqlite_index_path = "assets/aabb_index.sqlite"
 gen_model_batch_size = 16
 
 # Full Noun 模式配置
-full_noun_mode = false
+full_noun_mode = true
 full_noun_max_concurrent_nouns = 6
 full_noun_batch_size = 200
 
@@ -59,7 +58,7 @@ debug_limit_per_noun = 10
 
 build_cate_relate = false
 
-meshes_path = "/Volumes/DPC/work/plant-code/rs-plant3-d/assets/meshes"
+meshes_path = "./assets/meshes"
 
 #生成补充类型的graph，方便查询直接生成语句
 gen_noun_graph = false
@@ -131,7 +130,7 @@ debug_refno_types = ["CATA", "LOOP", "PRIM"]
 included_db_files = ["ams1112_0001"]
 #included_db_files = ["zdj7600_0001"]
 #manual_db_nums = [7999, 7997, 8000, 1112]
-# manual_db_nums = [1112] # Full Noun 模式下此配置会被忽略
+manual_db_nums = [1112] # Full Noun 模式下此配置会被忽略
 # manual_db_nums = [1112, 25688, 7999, 8000, 7997]  # Full Noun 模式下此配置会被忽略
 # exclude_db_nums = [] #不参与生成模型的数据库编号
 plat_url = ""

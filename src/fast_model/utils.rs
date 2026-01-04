@@ -1,5 +1,5 @@
-use aios_core::SUL_DB;
 use aios_core::error::init_save_database_error;
+use aios_core::{RefnoEnum, SUL_DB};
 use dashmap::DashMap;
 use parry3d::bounding_volume::Aabb;
 use std::collections::HashMap;
@@ -28,6 +28,66 @@ pub async fn save_aabb_to_surreal(aabb_map: &DashMap<String, Aabb>) {
                     init_save_database_error(&sql, &std::panic::Location::caller().to_string());
                 }
             }
+        }
+    }
+}
+
+/// 保存布尔结果状态
+pub async fn save_inst_relate_bool(
+    refno: RefnoEnum,
+    mesh_id: Option<&str>,
+    status: &str,
+    source: &str,
+) {
+    let mesh_str = mesh_id
+        .map(|m| format!("'{}'", m))
+        .unwrap_or_else(|| "NONE".to_string());
+    let sql = format!(
+        "INSERT OR REPLACE INTO inst_relate_bool {{ id: {}, refno: {}, mesh_id: {}, status: '{}', source: '{}', updated_at: time::now() }};",
+        refno.to_table_key("inst_relate_bool"),
+        refno.to_pe_key(),
+        mesh_str,
+        status,
+        source,
+    );
+
+    if let Err(_) = SUL_DB.query(&sql).await {
+        init_save_database_error(&sql, &std::panic::Location::caller().to_string());
+    }
+}
+
+/// 批量保存实例 AABB 到独立表 inst_relate_aabb
+pub async fn save_inst_relate_aabb(
+    inst_aabb_map: &DashMap<RefnoEnum, String>,
+    source: &str,
+) {
+    if inst_aabb_map.is_empty() {
+        return;
+    }
+
+    let keys = inst_aabb_map
+        .iter()
+        .map(|kv| kv.key().clone())
+        .collect::<Vec<_>>();
+
+    for chunk in keys.chunks(200) {
+        let mut sql = String::new();
+        for refno in chunk {
+            let Some(aabb_hash) = inst_aabb_map.get(refno) else { continue };
+            sql.push_str(&format!(
+                "INSERT INTO inst_relate_aabb {{ id: {}, refno: {}, aabb: aabb:⟨{}⟩, source: '{}', updated_at: time::now() }} \
+                 ON DUPLICATE KEY UPDATE aabb = aabb:⟨{}⟩, source = '{}', updated_at = time::now();",
+                refno.to_table_key("inst_relate_aabb"),
+                refno.to_pe_key(),
+                aabb_hash.value(),
+                source,
+                aabb_hash.value(),
+                source,
+            ));
+        }
+
+        if let Err(_) = SUL_DB.query(&sql).await {
+            init_save_database_error(&sql, &std::panic::Location::caller().to_string());
         }
     }
 }

@@ -7891,16 +7891,17 @@ pub async fn api_show_by_refno(
             info!("[ShowByRefno] 模型生成完成，开始导出增量 Parquet");
 
             // 6. 导出 Parquet (增量)
-            let config = state.config_manager.read().await;
-            let mesh_path_str = config.current_config.meshes_path.clone()
-                .unwrap_or_else(|| "/Volumes/DPC/work/plant-code/rs-plant3-d/assets/meshes".to_string());
-            let mesh_dir = std::path::Path::new(&mesh_path_str);
+            let mesh_dir = aios_core::get_db_option().get_meshes_path();
+
+            // 生成临时任务 ID 用于导出路径隔离
+            let temp_task_id = format!("temp_{}", Uuid::new_v4().simple());
+            let bundle_output_dir = std::path::PathBuf::from(format!("output/temp-models/{}", temp_task_id));
 
             let bundle_result = crate::web_server::instance_export::export_model_bundle_with_dbno(
                 &parsed_refnos,
-                "", 
-                &std::path::PathBuf::from(""), 
-                mesh_dir,
+                &temp_task_id,
+                &bundle_output_dir,
+                &mesh_dir,
                 Some(dbno),
             )
             .await;
@@ -7915,11 +7916,12 @@ pub async fn api_show_by_refno(
 
                     Ok(Json(ShowByRefnoResponse {
                         success: true,
-                        bundle_url: None,
+                        bundle_url: Some(format!("/files/output/temp-models/{}/", temp_task_id)),
                         message: format!("{} 个模型生成成功", parsed_refnos.len()),
                         metadata: Some(serde_json::json!({
                             "refno_count": parsed_refnos.len(),
-                            "dbno": dbno
+                            "dbno": dbno,
+                            "temp_id": temp_task_id
                         })),
                         parquet_files: Some(files),
                     }))

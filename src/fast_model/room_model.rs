@@ -34,6 +34,7 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use polars::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -588,6 +589,61 @@ async fn cal_room_refnos_with_options(
         let candidate_limit = candidate_limit;
 
         move || -> anyhow::Result<Vec<RefnoEnum>> {
+            // 优先使用 Parquet 粗算
+            {
+                let use_parquet = std::env::var("ROOM_USE_PARQUET")
+                    .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+                    .unwrap_or(false);
+                let parquet_path = std::env::var("ROOM_PARQUET_PATH")
+                    .unwrap_or_else(|_| "assets/parquet/inst_aabb.parquet".to_string());
+
+                if use_parquet && std::path::Path::new(&parquet_path).exists() {
+                    let dbno = panel_refno.refno().get_0() as i64;
+                    let lf = LazyFrame::scan_parquet(parquet_path.clone(), Default::default())
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    let filtered = lf
+                        .filter(
+                            col("dbno")
+                                .eq(lit(dbno))
+                                .and(col("max_x").gt_eq(lit(panel_aabb.mins.x as f64)))
+                                .and(col("min_x").lt_eq(lit(panel_aabb.maxs.x as f64)))
+                                .and(col("max_y").gt_eq(lit(panel_aabb.mins.y as f64)))
+                                .and(col("min_y").lt_eq(lit(panel_aabb.maxs.y as f64)))
+                                .and(col("max_z").gt_eq(lit(panel_aabb.mins.z as f64)))
+                                .and(col("min_z").lt_eq(lit(panel_aabb.maxs.z as f64))),
+                        )
+                        .select([col("refno")])
+                        .collect()
+                        .map_err(|e| anyhow::anyhow!(e))?;
+
+                    let mut refnos = Vec::new();
+                    if let Ok(utf8) = filtered.column("refno")?.str() {
+                        for opt in utf8.into_iter() {
+                            if let Some(s) = opt {
+                                let candidate = RefnoEnum::from(s);
+                                if !candidate.is_valid() || candidate == panel_refno {
+                                    continue;
+                                }
+                                if exclude_set.contains(&candidate.refno()) {
+                                    continue;
+                                }
+                                refnos.push(candidate);
+                                if let Some(limit) = candidate_limit {
+                                    if refnos.len() >= limit {
+                                        warn!(
+                                            "面板 {} 候选数达到上限 {} (Parquet)，可能存在截断",
+                                            panel_refno, limit
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(refnos);
+                }
+            }
+
             #[cfg(feature = "duckdb-feature")]
             {
                 let reader = match get_or_init_duckdb_reader() {
@@ -746,7 +802,7 @@ async fn load_geometry_with_enhanced_cache(
              return Ok(Arc::new(transformed_mesh));
         }
 
-        // 2. 检查 PlantMesh 缓存 (用于 .mesh 文件)
+        // 2. 检查 PlantMesh 缓存
         if let Some(cached_mesh) = cache.get(&cache_key) {
             // 从缓存的 PlantMesh 构建 TriMesh
             if let Some(tri_mesh) = cached_mesh.get_tri_mesh_with_flag(
@@ -787,37 +843,6 @@ async fn load_geometry_with_enhanced_cache(
                      _ => {}
                 }
             }
-        }
-
-        // 4. 尝试加载 .mesh 文件 (旧流程)
-        let file_name = format!("{}_{}.mesh", geo_hash, lod_level);
-        let file_path = base_mesh_dir.join(&lod_subdir).join(&file_name);
-
-        if !file_path.exists() {
-            continue; // 尝试下一个 LOD 级别
-        }
-
-        let file_path_clone = file_path.clone();
-        match tokio::task::spawn_blocking(move || PlantMesh::des_mesh_file(&file_path_clone)).await {
-            Ok(Ok(mesh)) => {
-                // 构建 TriMesh
-                if let Some(tri_mesh) = mesh.get_tri_mesh_with_flag(
-                    (world_trans * inst.transform).to_matrix(),
-                    TriMeshFlags::ORIENTED | TriMeshFlags::MERGE_DUPLICATE_VERTICES,
-                ) {
-                    // 更新缓存
-                    cache.insert(cache_key, Arc::new(mesh));
-                    CACHE_METRICS.record_plant_miss();
-
-                    // 缓存管理
-                    if cache.len() > 2000 {
-                        cleanup_geometry_cache(&cache).await;
-                    }
-
-                    return Ok(Arc::new(tri_mesh));
-                }
-            }
-            _ => continue, // 加载失败，尝试下一个 LOD 级别
         }
     }
 

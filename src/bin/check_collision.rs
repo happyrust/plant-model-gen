@@ -98,8 +98,8 @@ async fn main() -> anyhow::Result<()> {
                 println!(
                     "  {}. {} <-> {} | 穿透: {:.4}m",
                     i + 1,
-                    event.pair.0 .0,
-                    event.pair.1 .0,
+                    event.pair.0.0,
+                    event.pair.1.0,
                     event.penetration_depth,
                 );
             }

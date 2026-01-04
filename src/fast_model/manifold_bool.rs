@@ -41,8 +41,8 @@ async fn filter_out_bran_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<Refn
 /// # 返回
 ///
 /// 完整的 mesh 文件路径，格式为：
-/// - `{base_dir}/lod_{LOD}/{mesh_id}_{LOD}.mesh`（启用 LOD 时）
-/// - `{base_dir}/{mesh_id}.mesh`（无 LOD 或旧格式）
+/// - `{base_dir}/lod_{LOD}/{mesh_id}_{LOD}.glb`（启用 LOD 时）
+/// - `{base_dir}/{mesh_id}.glb`（无 LOD）
 ///
 /// # 示例
 ///
@@ -55,23 +55,20 @@ fn build_lod_mesh_path(base_dir: &Path, mesh_id: &str) -> PathBuf {
 
     let default_lod = aios_core::mesh_precision::active_precision().default_lod;
 
-    // 检查 base_dir 是否已经是 LOD 子目录（如 "lod_L2"）
-    let is_already_lod_dir = base_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.starts_with("lod_"))
-        .unwrap_or(false);
-
-    let lod_filename = format!("{}_{:?}.mesh", mesh_id, default_lod);
-
-    if is_already_lod_dir {
-        // 已经在 LOD 目录下，直接拼接文件名
-        base_dir.join(lod_filename)
-    } else {
-        // 需要添加 LOD 子目录
-        let lod_dir = base_dir.join(format!("lod_{:?}", default_lod));
-        lod_dir.join(lod_filename)
+    // 先溯源到不含 lod_ 的基础目录
+    let mut clean_base = base_dir.to_path_buf();
+    while let Some(last_component) = clean_base.file_name().and_then(|n| n.to_str()) {
+        if last_component.starts_with("lod_") {
+            clean_base.pop();
+        } else {
+            break;
+        }
     }
+
+    let lod_dir_name = format!("lod_{:?}", default_lod);
+    let lod_filename = format!("{}_{:?}.glb", mesh_id, default_lod);
+
+    clean_base.join(lod_dir_name).join(lod_filename)
 }
 
 fn mesh_base_dir() -> PathBuf {
@@ -96,33 +93,15 @@ fn load_mesh(id: &str) -> anyhow::Result<PlantMesh> {
     let base_dir = mesh_base_dir();
     let mesh_path = build_lod_mesh_path(&base_dir, id);
     
-    // 优先尝试 .mesh (兼容旧数据)
-    if mesh_path.exists() {
-         let mesh = PlantMesh::des_mesh_file(&mesh_path)?;
-         debug_model_debug!(
-            "[布尔] 加载 mesh (from .mesh): {} (vertices={}, triangles={})",
-            mesh_path.display(),
-            mesh.vertices.len(),
-            mesh.indices.len() / 3
-        );
-        return Ok(mesh);
-    }
-    
-    // 尝试 .glb
-    let glb_path = mesh_path.with_extension("glb");
-    if glb_path.exists() {
-        use crate::fast_model::export_model::import_glb::import_glb_to_mesh;
-        let mesh = import_glb_to_mesh(&glb_path)?;
-         debug_model_debug!(
-            "[布尔] 加载 mesh (from .glb): {} (vertices={}, triangles={})",
-            glb_path.display(),
-            mesh.vertices.len(),
-            mesh.indices.len() / 3
-        );
-        return Ok(mesh);
-    }
-
-    anyhow::bail!("Mesh file not found: {:?}", mesh_path);
+    use crate::fast_model::export_model::import_glb::import_glb_to_mesh;
+    let mesh = import_glb_to_mesh(&mesh_path)?;
+    debug_model_debug!(
+        "[布尔] 加载 mesh (from .glb): {} (vertices={}, triangles={})",
+        mesh_path.display(),
+        mesh.vertices.len(),
+        mesh.indices.len() / 3
+    );
+    Ok(mesh)
 }
 
 /// 从文件加载流形数据
@@ -152,19 +131,18 @@ fn ensure_parent_dir(path: &Path) -> io::Result<()> {
 }
 
 /// 标记布尔运算失败
-/// 
-/// 设置 bool_status='Failed'
-async fn mark_bool_failed(inst_relate_id: &str) -> anyhow::Result<()> {
-    let sql = format!("update {} set bool_status='Failed';", inst_relate_id);
-    SUL_DB.query(sql).await?;
+///
+/// 写入 inst_relate_bool 状态为 Failed
+async fn mark_bool_failed(refno: RefnoEnum) -> anyhow::Result<()> {
+    crate::fast_model::utils::save_inst_relate_bool(refno, None, "Failed", "bool_mesh").await;
     Ok(())
 }
 
 /// 更新布尔运算结果到数据库
-/// 
-/// 设置 bool_status='Success', aabb（使用 hash 引用格式）, booled_id（存储为字符串）
+///
+/// 仅写入 inst_relate_bool（状态 + mesh_id），AABB 已写入 inst_relate_aabb
 async fn update_booled_result(
-    inst_relate_id: &str,
+    refno: RefnoEnum,
     mesh_id: &str,
     mesh: &PlantMesh,
 ) -> anyhow::Result<()> {
@@ -182,20 +160,15 @@ async fn update_booled_result(
         let aabb_map = DashMap::new();
         aabb_map.insert(aabb_hash.to_string(), aabb);
         crate::fast_model::utils::save_aabb_to_surreal(&aabb_map).await;
+        let inst_aabb_map = DashMap::new();
+        inst_aabb_map.insert(refno, aabb_hash.to_string());
+        crate::fast_model::utils::save_inst_relate_aabb(&inst_aabb_map, "bool_mesh").await;
         
-        // booled_id 存储为纯字符串（mesh_id），方便直接用于加载 mesh 文件
-        let sql = format!(
-            "UPDATE {} SET bool_status = 'Success', aabb = aabb:⟨{}⟩, booled_id = '{}';",
-            inst_relate_id, aabb_hash, mesh_id
-        );
-        SUL_DB.query(sql).await?;
+        crate::fast_model::utils::save_inst_relate_bool(refno, Some(mesh_id), "Success", "bool_mesh")
+            .await;
     } else {
-        // 如果无法计算 AABB，仍然更新 bool_status 和 booled_id
-        let sql = format!(
-            "UPDATE {} SET bool_status = 'Success', booled_id = '{}';",
-            inst_relate_id, mesh_id
-        );
-        SUL_DB.query(sql).await?;
+        crate::fast_model::utils::save_inst_relate_bool(refno, Some(mesh_id), "Success", "bool_mesh")
+            .await;
     }
     
     Ok(())
@@ -246,10 +219,8 @@ pub async fn apply_cata_neg_boolean_manifold(
         let mut update_sql = String::new();
         for bg in g.boolean_group {
             let Some(pos) = gms.iter().find(|x| x.geom_refno == bg[0]) else {
-                update_sql.push_str(&format!(
-                    "update {}<-inst_relate set bool_status='Failed';",
-                    &g.inst_info_id.to_raw(),
-                ));
+                crate::fast_model::utils::save_inst_relate_bool(g.refno, None, "Failed", "cata_bool")
+                    .await;
                 continue;
             };
 
@@ -260,10 +231,8 @@ pub async fn apply_cata_neg_boolean_manifold(
                 false,
             ) else {
                 println!("布尔运算失败: 无法加载正实体 manifold, refno: {}", &g.refno);
-                update_sql.push_str(&format!(
-                    "update {}<-inst_relate set bool_status='Failed';",
-                    &g.inst_info_id.to_raw(),
-                ));
+                crate::fast_model::utils::save_inst_relate_bool(g.refno, None, "Failed", "cata_bool")
+                    .await;
                 continue;
             };
 
@@ -315,10 +284,8 @@ pub async fn apply_cata_neg_boolean_manifold(
                 );
                 update_sql.push_str(&hide_original_sql);
             } else {
-                update_sql.push_str(&format!(
-                    "update {}<-inst_relate set bool_status='Failed';",
-                    &g.inst_info_id.to_raw(),
-                ));
+                crate::fast_model::utils::save_inst_relate_bool(g.refno, None, "Failed", "cata_bool")
+                    .await;
             }
         }
 
@@ -335,17 +302,21 @@ async fn apply_boolean_for_query(
     query: ManiGeoTransQuery,
     replace_exist: bool,
 ) -> anyhow::Result<()> {
-    let inst_relate_id = query.refno.to_table_key("inst_relate");
-
     // 非替换模式下，已有成功记录则跳过
     if !replace_exist {
-        let check_sql = format!("select value bool_status from {} limit 1", inst_relate_id);
+        let check_sql = format!(
+            "select value status from inst_relate_bool:{} limit 1",
+            query.refno.to_string()
+        );
         let existing_status: Vec<Option<String>> = SUL_DB.query_take(&check_sql, 0).await?;
-        if let Some(Some(status)) = existing_status.first() {
-            if status == "Success" {
-                debug_model!("跳过已存在的布尔结果: {}", query.refno);
-                return Ok(());
-            }
+        if matches!(
+            existing_status
+                .first()
+                .and_then(|s| s.as_deref()),
+            Some("Success")
+        ) {
+            debug_model!("跳过已存在的布尔结果: {}", query.refno);
+            return Ok(());
         }
     }
 
@@ -373,7 +344,7 @@ async fn apply_boolean_for_query(
             query.refno,
             query.pos_geos.len()
         );
-        mark_bool_failed(&inst_relate_id).await?;
+        mark_bool_failed(query.refno).await?;
         return Ok(());
     }
 
@@ -383,7 +354,7 @@ async fn apply_boolean_for_query(
             "布尔运算失败: 正实体 manifold 没有三角形, refno: {}",
             query.refno
         );
-        mark_bool_failed(&inst_relate_id).await?;
+        mark_bool_failed(query.refno).await?;
         return Ok(());
     }
 
@@ -442,7 +413,7 @@ async fn apply_boolean_for_query(
             query.refno,
             query.neg_ts.len()
         );
-        mark_bool_failed(&inst_relate_id).await?;
+        mark_bool_failed(query.refno).await?;
         return Ok(());
     }
 
@@ -478,13 +449,13 @@ async fn apply_boolean_for_query(
     use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
     // if mesh.ser_to_file(&target_path).is_ok() {
     if export_single_mesh_to_glb(&mesh, &target_path).is_ok() {
-        update_booled_result(&inst_relate_id, &mesh_id, &mesh).await?;
+        update_booled_result(query.refno, &mesh_id, &mesh).await?;
         debug_model!("布尔运算完成: refno={} mesh={}", query.refno, mesh_id);
         return Ok(());
     }
 
     println!("布尔运算失败: 无法保存结果 mesh, refno: {}", query.refno);
-    mark_bool_failed(&inst_relate_id).await
+    mark_bool_failed(query.refno).await
 }
 
 /// 对多个实例进行布尔运算（使用 Manifold，新查询流程）

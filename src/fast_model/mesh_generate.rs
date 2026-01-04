@@ -46,6 +46,8 @@ use parry3d::bounding_volume::*;
 use parry3d::math::Isometry;
 use parse_pdms_db::parse::round_f32;
 use serde_json::Value as JsonValue;
+use surrealdb::types as surrealdb_types;
+use surrealdb::types::SurrealValue;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -180,7 +182,7 @@ async fn query_pending_inst_boolean(
     let filter_booled = if replace_exist {
         String::new()
     } else {
-        "AND booled_id = NONE".to_string()
+        "AND (SELECT status FROM inst_relate_bool WHERE refno = inst_relate_aabb.refno AND status = 'Success' LIMIT 1) = NONE".to_string()
     };
 
     const CHUNK_SIZE: usize = 200;
@@ -192,16 +194,17 @@ async fn query_pending_inst_boolean(
         }
         let remaining = limit - pending.len();
         let sql = format!(
-            r#"SELECT VALUE in
-FROM inst_relate
-WHERE in IN [{}]
-  AND aabb.d != NONE
-  {filter_booled}
-LIMIT {remaining};"#,
-            chunk.join(",")
+            r#"
+SELECT VALUE refno FROM inst_relate_aabb
+WHERE refno IN [{}]
+{filter_booled}
+LIMIT {remaining};
+"#,
+            chunk.join(","),
+            filter_booled = filter_booled
         );
 
-        let mut refnos: Vec<RefnoEnum> = SUL_DB.query_take(&sql, 0).await?;
+        let mut refnos: Vec<RefnoEnum> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
         pending.append(&mut refnos);
     }
 
@@ -1246,12 +1249,6 @@ async fn handle_csg_mesh(
 
     let mesh_base_path = dir.join(mesh_id);
     
-    // 根据配置保存不同格式
-    if mesh_formats.contains(&MeshFormat::PdmsMesh) {
-        let mesh_path = mesh_base_path.with_extension("mesh");
-        generated.mesh.ser_to_file(&mesh_path)?;
-    }
-    
     // 强制生成 GLB
     let glb_path = mesh_base_path.with_extension("glb");
     if let Err(e) = export_single_mesh_to_glb(&generated.mesh, &glb_path) {
@@ -1323,7 +1320,182 @@ pub async fn update_inst_relate_aabbs_by_refnos(
     refnos: &[RefnoEnum],
     replace_exist: bool,
 ) -> anyhow::Result<()> {
-    return aios_core::update_inst_relate_aabbs_by_refnos(refnos, replace_exist).await;
+    const CHUNK: usize = 100;
+
+    #[derive(serde::Deserialize, SurrealValue)]
+    struct InstAabbRow {
+        refno: String,
+        aabb: String,
+    }
+
+    let aabb_map = DashMap::new();
+    let inst_aabb_map = DashMap::new();
+
+    for chunk in refnos.chunks(CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+
+        // 非替换模式下，跳过已经存在新表记录的 refno
+        let target_refnos = if replace_exist {
+            chunk.to_vec()
+        } else {
+            filter_missing_inst_aabb(chunk).await?
+        };
+
+        if target_refnos.is_empty() {
+            continue;
+        }
+
+        // inst_relate.aabb 不再作为过滤条件，因此查询时强制 replace_exist=true
+        let inst_keys = get_inst_relate_keys(&target_refnos);
+        let result = query_aabb_params(&inst_keys, true).await?;
+        println!(
+            "[aabb] 查询 inst_relate keys {} -> {} 个候选",
+            target_refnos.len(),
+            result.len()
+        );
+
+        for r in result {
+            // 计算合并后的 AABB
+            let mut aabb = Aabb::new_invalid();
+            for g in &r.geo_aabbs {
+                let t = r.world_trans * &g.trans;
+                let tmp_aabb = g.aabb.scaled(&t.scale.into());
+                let tmp_aabb = tmp_aabb.transform_by(&Isometry {
+                    rotation: t.rotation.into(),
+                    translation: t.translation.into(),
+                });
+                aabb.merge(&tmp_aabb);
+            }
+
+            // 过滤无效 AABB
+            let extent = aabb.extents().magnitude();
+            if extent.is_nan() || extent.is_infinite() {
+                continue;
+            }
+
+            let aabb_hash = gen_bytes_hash(&aabb).to_string();
+            aabb_map.entry(aabb_hash.clone()).or_insert(aabb);
+
+            let refno = r.refno();
+            inst_aabb_map.insert(refno.clone(), aabb_hash.clone());
+        }
+    }
+
+    // 批量保存 AABB 到 aabb 表
+    utils::save_aabb_to_surreal(&aabb_map).await;
+
+    if inst_aabb_map.is_empty() {
+        // 回退：直接使用 inst_relate 中已有的 aabb 字段写入新表，避免空写入
+        let pe_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
+        if !pe_keys.is_empty() {
+            let sql = format!(
+                "SELECT <string>in AS refno, <string>aabb AS aabb FROM inst_relate WHERE aabb != none AND world_trans.d != none AND in IN [{}]",
+                pe_keys.join(",")
+            );
+
+            match SUL_DB.query_take::<Vec<InstAabbRow>>(&sql, 0).await {
+                Ok(rows) if !rows.is_empty() => {
+                    for row in rows {
+                        let refno = RefnoEnum::from(row.refno.as_str());
+                        inst_aabb_map.insert(refno, row.aabb);
+                    }
+                    utils::save_inst_relate_aabb(&inst_aabb_map, "fallback_inst_relate").await;
+                    println!(
+                        "[aabb] 回退写入 inst_relate_aabb 完成 (来自 inst_relate.aabb)"
+                    );
+                }
+                Ok(_) => {
+                    eprintln!("[aabb] 回退写入时未找到 inst_relate.aabb 数据");
+                }
+                Err(e) => {
+                    init_query_error(
+                        &sql,
+                        &e.to_string(),
+                        &std::panic::Location::caller().to_string(),
+                    );
+                    eprintln!("[aabb] 回退写入 inst_relate_aabb 查询失败: {}", e);
+                }
+            }
+        }
+    } else {
+        // 将实例级 AABB 写入新表
+        utils::save_inst_relate_aabb(&inst_aabb_map, "gen_mesh").await;
+
+        println!(
+            "[aabb] inst_relate_aabb 写入 {} 条记录 (replace_exist={})",
+            inst_aabb_map.len(),
+            replace_exist
+        );
+    }
+
+    // 最终兜底：直接从 inst_relate.aabb 回填到 inst_relate_aabb，确保表不为空
+    if inst_aabb_map.is_empty() {
+        let fallback_query = r#"
+            SELECT <string>in AS refno, <string>aabb AS aabb
+            FROM inst_relate
+            WHERE aabb != none AND world_trans.d != none
+        "#;
+        match SUL_DB.query_take::<Vec<InstAabbRow>>(fallback_query, 0).await {
+            Ok(rows) if !rows.is_empty() => {
+                for row in rows {
+                    let refno = RefnoEnum::from(row.refno.as_str());
+                    inst_aabb_map.insert(refno, row.aabb.clone());
+                }
+                utils::save_inst_relate_aabb(&inst_aabb_map, "fallback_inst_relate").await;
+                println!("[aabb] 全局回填 inst_relate_aabb 完成 (来源: inst_relate.aabb)");
+            }
+            Ok(_) => {
+                eprintln!("[aabb] 回填 inst_relate_aabb 时未找到 inst_relate.aabb 数据");
+            }
+            Err(e) => {
+                init_query_error(
+                    fallback_query,
+                    &e.to_string(),
+                    &std::panic::Location::caller().to_string(),
+                );
+                eprintln!("[aabb] 回填 inst_relate_aabb 查询失败: {}", e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// 查询所有 inst_relate 的 refno（仅 world_trans 存在的实例）
+pub async fn fetch_inst_relate_refnos() -> anyhow::Result<Vec<RefnoEnum>> {
+    let sql = "SELECT value in.id FROM inst_relate WHERE world_trans.d != none";
+    let mut resp = SUL_DB.query(sql).await?;
+    let refnos: Vec<RefnoEnum> = resp.take(0)?;
+    Ok(refnos)
+}
+
+async fn filter_missing_inst_aabb(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
+    if refnos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let pe_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
+    if pe_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sql = format!(
+        "SELECT value refno FROM inst_relate_aabb WHERE refno IN [{}]",
+        pe_keys.join(",")
+    );
+
+    let existing: Vec<RefnoEnum> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+    let existing: HashSet<RefnoEnum> = existing.into_iter().collect();
+
+    let missing = refnos
+        .iter()
+        .cloned()
+        .filter(|r| !existing.contains(r))
+        .collect();
+
+    Ok(missing)
 }
 
 // Database query structures are now imported from aios_core::query_structs

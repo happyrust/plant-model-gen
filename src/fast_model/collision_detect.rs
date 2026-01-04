@@ -384,21 +384,6 @@ async fn load_trimesh_for_collision(
                 Err(e) => warn!("Failed to load GLB {:?}: {}", glb_path, e),
             }
         }
-
-        // 尝试 .mesh
-        let mesh_path = lod_dir.join(format!("{}_{}.mesh", geo_hash, lod));
-        if mesh_path.exists() {
-            let mesh_path_clone = mesh_path.clone();
-            let matrix = world_matrix;
-            match tokio::task::spawn_blocking(move || {
-                load_and_transform_mesh(&mesh_path_clone, matrix)
-            })
-            .await?
-            {
-                Ok(mesh) => return Ok(mesh),
-                Err(e) => warn!("Failed to load mesh {:?}: {}", mesh_path, e),
-            }
-        }
     }
 
     anyhow::bail!("Cannot load geometry: {}", geo_hash)
@@ -446,19 +431,6 @@ fn load_and_transform_glb(path: &PathBuf, transform: glam::Mat4) -> anyhow::Resu
     let tris: Vec<[u32; 3]> = indices.chunks(3).map(|c| [c[0], c[1], c[2]]).collect();
 
     Ok(TriMesh::new(vertices, tris)?)
-}
-
-fn load_and_transform_mesh(path: &PathBuf, transform: glam::Mat4) -> anyhow::Result<TriMesh> {
-    let plant_mesh = PlantMesh::des_mesh_file(path)?;
-
-    let tri_mesh = plant_mesh
-        .get_tri_mesh_with_flag(
-            transform,
-            TriMeshFlags::ORIENTED | TriMeshFlags::MERGE_DUPLICATE_VERTICES,
-        )
-        .ok_or_else(|| anyhow::anyhow!("Failed to build TriMesh"))?;
-
-    Ok(tri_mesh)
 }
 
 #[cfg(test)]

@@ -317,7 +317,9 @@ mod tests {
         println!("\n🔍 查询 FRMW inst_relate...");
         let frmw_inst_sql = format!(
             r#"
-            SELECT aabb.d as world_aabb, world_trans.d as world_trans 
+            SELECT 
+                type::record('inst_relate_aabb', record::id(in)).aabb.d as world_aabb, 
+                world_trans.d as world_trans 
             FROM inst_relate WHERE in = {}
             "#,
             frmw_refno.to_pe_key()
@@ -332,7 +334,9 @@ mod tests {
         println!("\n🔍 查询管道 inst_relate...");
         let pipe_inst_sql = format!(
             r#"
-            SELECT aabb.d as world_aabb, world_trans.d as world_trans 
+            SELECT 
+                type::record('inst_relate_aabb', record::id(in)).aabb.d as world_aabb, 
+                world_trans.d as world_trans 
             FROM inst_relate WHERE in = {}
             "#,
             pipe_refno.to_pe_key()

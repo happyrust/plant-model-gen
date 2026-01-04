@@ -194,20 +194,28 @@ impl GltfMeshCache {
                 }
             });
 
-        // 优先尝试带 LOD 后缀的文件名（新格式）
+        // 优先尝试带 LOD 后缀的 GLB（新格式）
         let mesh_path = if let Some(lod) = lod_suffix {
-            let path_with_suffix = mesh_dir.join(format!("{}_{}.mesh", actual_geo_hash, lod));
-            println!("[Mesh加载] 尝试加载: {} (exists={})", path_with_suffix.display(), path_with_suffix.exists());
+            let path_with_suffix = mesh_dir.join(format!("{}_{}.glb", actual_geo_hash, lod));
+            println!(
+                "[Mesh加载] 尝试加载 GLB: {} (exists={})",
+                path_with_suffix.display(),
+                path_with_suffix.exists()
+            );
             if path_with_suffix.exists() {
                 path_with_suffix
             } else {
                 // 回退到不带后缀的文件名（兼容旧格式）
-                let fallback = mesh_dir.join(format!("{}.mesh", actual_geo_hash));
-                println!("[Mesh加载] 回退到: {} (exists={})", fallback.display(), fallback.exists());
+                let fallback = mesh_dir.join(format!("{}.glb", actual_geo_hash));
+                println!(
+                    "[Mesh加载] 回退到 GLB: {} (exists={})",
+                    fallback.display(),
+                    fallback.exists()
+                );
                 fallback
             }
         } else {
-            mesh_dir.join(format!("{}.mesh", actual_geo_hash))
+            mesh_dir.join(format!("{}.glb", actual_geo_hash))
         };
 
         if !mesh_path.exists() {
@@ -221,8 +229,8 @@ impl GltfMeshCache {
             return Err(anyhow!("Mesh 文件不存在: {}", mesh_path.display()));
         }
 
-        let mesh = PlantMesh::des_mesh_file(&mesh_path)
-            .with_context(|| format!("加载 mesh 文件失败: {}", mesh_path.display()))?;
+        let mesh = crate::fast_model::export_model::import_glb::import_glb_to_mesh(&mesh_path)
+            .with_context(|| format!("加载 GLB 文件失败: {}", mesh_path.display()))?;
 
         let arc_mesh = Arc::new(mesh);
 

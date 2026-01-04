@@ -431,7 +431,10 @@ pub async fn export_instanced_bundle_for_refnos(
             
             // 2. 检查带过滤条件的记录数
             let filter_sql = format!(
-                "SELECT count() AS cnt FROM inst_relate WHERE in IN [{}] AND aabb.d != NONE AND world_trans.d != NONE;", 
+                r#"SELECT count() AS cnt FROM inst_relate 
+                   WHERE in IN [{}] 
+                     AND world_trans.d != NONE 
+                     AND record::exists(type::record('inst_relate_aabb', record::id(in)));"#, 
                 pe_list
             );
             match aios_core::SUL_DB.query_response(&filter_sql).await {

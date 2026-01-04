@@ -77,7 +77,7 @@ use aios_core::{DBType, init_surreal, query_mdb_db_nums};
 #[cfg(feature = "gui")]
 use aios_database::gui;
 #[cfg(not(feature = "gui"))]
-use aios_database::options::{get_db_option_ext_from_path, MeshFormat};
+use aios_database::options::{MeshFormat, get_db_option_ext_from_path};
 #[cfg(not(feature = "gui"))]
 use aios_database::run_app;
 #[cfg(not(feature = "gui"))]
@@ -385,7 +385,10 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(lod_str) = matches.get_one::<String>("gen-lod").map(|s| s.as_str()) {
         if let Some(lod) = parse_lod_level(lod_str) {
-            println!("🔧 CLI 覆盖 default_lod: {:?} -> {:?}", db_option_ext.inner.mesh_precision.default_lod, lod);
+            println!(
+                "🔧 CLI 覆盖 default_lod: {:?} -> {:?}",
+                db_option_ext.inner.mesh_precision.default_lod, lod
+            );
             db_option_ext.inner.mesh_precision.default_lod = lod;
         }
     }
@@ -401,7 +404,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         if !formats.is_empty() {
-            println!("🔧 CLI 覆盖 mesh_formats: {:?} -> {:?}", db_option_ext.mesh_formats, formats);
+            println!(
+                "🔧 CLI 覆盖 mesh_formats: {:?} -> {:?}",
+                db_option_ext.mesh_formats, formats
+            );
             db_option_ext.mesh_formats = formats;
         }
     }

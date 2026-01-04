@@ -1660,7 +1660,7 @@ pub async fn export_all_relates_prepack_lod(
 
     // 4. 再次扫描 inst_relate，收集需要导出的实体（不按 owner_type 过滤，仅排除 EQUI）
     let sql_all = format!(
-        "SELECT value in.id FROM inst_relate WHERE {} AND aabb.d != none{}",
+        "SELECT value in.id FROM inst_relate WHERE {}{} AND record::exists(type::record('inst_relate_aabb', record::id(in)))",
         db_filter, owner_filter_clause
     );
     let mut all_refnos: Vec<RefnoEnum> = aios_core::SUL_DB.query_take(&sql_all, 0).await?;
@@ -1898,7 +1898,7 @@ pub async fn export_all_relates_prepack_lod_parquet(
     let equi_set: HashSet<RefnoEnum> = equi_refnos.into_iter().collect();
 
     let sql_all = format!(
-        "SELECT value in.id FROM inst_relate WHERE {} AND aabb.d != none{}",
+        "SELECT value in.id FROM inst_relate WHERE {}{} AND record::exists(type::record('inst_relate_aabb', record::id(in)))",
         db_filter, owner_filter_clause
     );
     let mut all_refnos: Vec<RefnoEnum> = aios_core::SUL_DB.query_take(&sql_all, 0).await?;

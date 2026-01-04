@@ -111,6 +111,23 @@ DEFINE INDEX idx_owner_refno ON TABLE inst_relate COLUMNS owner_refno;
 DEFINE INDEX idx_owner_type_refno ON TABLE inst_relate COLUMNS owner_type, owner_refno;
 DEFINE INDEX idx_spec_value ON TABLE inst_relate COLUMNS spec_value;
 
+-- 实例包围盒表（与 inst_relate 解耦的 AABB 存储）
+DEFINE TABLE inst_relate_aabb SCHEMALESS;
+DEFINE FIELD refno ON TABLE inst_relate_aabb TYPE record<pe>;
+DEFINE FIELD aabb ON TABLE inst_relate_aabb TYPE record<aabb>;
+DEFINE FIELD source ON TABLE inst_relate_aabb TYPE option<string>;
+DEFINE FIELD updated_at ON TABLE inst_relate_aabb TYPE option<datetime> DEFAULT time::now();
+DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb COLUMNS refno UNIQUE;
+
+-- 布尔结果表（实例级布尔状态与结果 mesh）
+DEFINE TABLE inst_relate_bool SCHEMALESS;
+DEFINE FIELD refno ON TABLE inst_relate_bool TYPE record<pe>;
+DEFINE FIELD mesh_id ON TABLE inst_relate_bool TYPE option<string>;
+DEFINE FIELD status ON TABLE inst_relate_bool TYPE option<string>;
+DEFINE FIELD source ON TABLE inst_relate_bool TYPE option<string>;
+DEFINE FIELD updated_at ON TABLE inst_relate_bool TYPE option<datetime> DEFAULT time::now();
+DEFINE INDEX idx_inst_relate_bool_refno ON TABLE inst_relate_bool COLUMNS refno UNIQUE;
+
 -- Functions for common queries
 
 -- Get element with attributes

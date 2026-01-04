@@ -5,7 +5,7 @@
 ```mermaid
 flowchart TB
     Start([模型生成开始]) --> GenMesh[生成基础网格<br/>gen_inst_meshes]
-    GenMesh --> UpdateAABB[更新包围盒<br/>update_inst_relate_aabbs]
+    GenMesh --> UpdateAABB[写入实例包围盒<br/>update_inst_relate_aabbs -> inst_relate_aabb]
     UpdateAABB --> BoolDecision{需要布尔运算?}
     
     BoolDecision -->|是| CataBool[元件库负实体运算<br/>apply_cata_neg_boolean_manifold]

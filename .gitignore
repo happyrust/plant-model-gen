@@ -137,3 +137,4 @@ aios-database
 # package-lock.json
 # pnpm-lock.yamlexport.sql
 .ace-tool/
+deploy/

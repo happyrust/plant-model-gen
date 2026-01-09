@@ -44,6 +44,7 @@ pub mod topology_handlers; // 拓扑配置处理器
 pub mod wizard_handlers;
 pub mod wizard_template;
 pub mod parquet_compact_worker;
+pub mod stream_generate; // 流式模型生成模块
 
 use crate::web_api::{
     E3dTreeApiState, NounHierarchyApiState, SpatialQueryApiState, create_e3d_tree_routes,
@@ -274,6 +275,11 @@ pub async fn start_web_server_with_config(
         .route(
             "/api/model/show-by-refno",
             post(handlers::api_show_by_refno),
+        )
+        // 流式增量生成模型（SSE 推送进度）
+        .route(
+            "/api/model/stream-generate",
+            post(stream_generate::api_stream_generate),
         )
         // 获取指定 dbno 的 Parquet 文件列表
         .route(

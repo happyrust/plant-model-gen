@@ -1389,6 +1389,9 @@ pub struct ShowByRefnoRequest {
     /// 是否强制重新生成（删除旧数据重新生成，类似 CLI 的 --regen-model）
     #[serde(default)]
     pub regen_model: bool,
+    /// 是否导出 Parquet 文件 (可选，默认为 true)
+    #[serde(default = "default_true")]
+    pub gen_parquet: bool,
 }
 
 /// 按需显示模型响应

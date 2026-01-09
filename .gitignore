@@ -138,3 +138,7 @@ aios-database
 # pnpm-lock.yamlexport.sql
 .ace-tool/
 deploy/
+*.tar.gz
+*.zip
+*.7z
+*.rar

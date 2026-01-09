@@ -152,6 +152,8 @@ async fn process_full_noun_mode(
     let replace_exist = db_option.inner.is_replace_mesh();
 
     // 初始化 Parquet 写入器
+    let parquet_writer: Option<std::sync::Arc<ParquetStreamWriter>> = None;
+    /*
     let parquet_writer = {
         let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
         let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
@@ -163,6 +165,10 @@ async fn process_full_noun_mode(
             }
         }
     };
+    */
+    #[cfg(feature = "duckdb-feature")]
+    let duckdb_writer: Option<std::sync::Arc<DuckDBStreamWriter>> = None;
+    /*
     #[cfg(feature = "duckdb-feature")]
     let duckdb_writer = {
         let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
@@ -176,6 +182,7 @@ async fn process_full_noun_mode(
             }
         }
     };
+    */
     let parquet_writer_clone = parquet_writer.clone();
     #[cfg(feature = "duckdb-feature")]
     let duckdb_writer_clone = duckdb_writer.clone();
@@ -400,6 +407,8 @@ async fn process_targeted_generation(
     let replace_exist = db_option.inner.is_replace_mesh();
 
     // 初始化 Parquet 写入器
+    let parquet_writer: Option<std::sync::Arc<ParquetStreamWriter>> = None;
+    /*
     let parquet_writer = {
         let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
         let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
@@ -411,6 +420,10 @@ async fn process_targeted_generation(
             }
         }
     };
+    */
+    #[cfg(feature = "duckdb-feature")]
+    let duckdb_writer: Option<std::sync::Arc<DuckDBStreamWriter>> = None;
+    /*
     #[cfg(feature = "duckdb-feature")]
     let duckdb_writer = {
         let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
@@ -424,6 +437,7 @@ async fn process_targeted_generation(
             }
         }
     };
+    */
     let parquet_writer_clone = parquet_writer.clone();
     #[cfg(feature = "duckdb-feature")]
     let duckdb_writer_clone = duckdb_writer.clone();
@@ -583,6 +597,8 @@ async fn process_full_database_generation(
     }
 
     // 初始化 Parquet 写入器
+    let parquet_writer: Option<std::sync::Arc<ParquetStreamWriter>> = None;
+    /*
     let parquet_writer = {
         let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
         let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
@@ -594,6 +610,10 @@ async fn process_full_database_generation(
             }
         }
     };
+    */
+    #[cfg(feature = "duckdb-feature")]
+    let duckdb_writer: Option<std::sync::Arc<DuckDBStreamWriter>> = None;
+    /*
     #[cfg(feature = "duckdb-feature")]
     let duckdb_writer = {
         let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
@@ -607,6 +627,7 @@ async fn process_full_database_generation(
             }
         }
     };
+    */
 
     for dbno in dbnos.clone() {
         println!("[gen_model] -> 开始处理数据库 {}", dbno);

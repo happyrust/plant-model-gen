@@ -7888,6 +7888,21 @@ pub async fn api_show_by_refno(
 
     match result {
         Ok(_) => {
+            // 如果不需要生成 Parquet，直接返回成功 (SurrealDB 中数据已经生成)
+            if !req.gen_parquet {
+                info!("[ShowByRefno] 模型生成完成 (SurrealDB)，由于 gen_parquet=false, 跳过 Parquet 导出");
+                return Ok(Json(ShowByRefnoResponse {
+                    success: true,
+                    bundle_url: None,
+                    message: format!("{} 个模型已生成并同步到数据库", parsed_refnos.len()),
+                    metadata: Some(serde_json::json!({
+                        "refno_count": parsed_refnos.len(),
+                        "dbno": dbno,
+                    })),
+                    parquet_files: None,
+                }));
+            }
+
             info!("[ShowByRefno] 模型生成完成，开始导出增量 Parquet");
 
             // 6. 导出 Parquet (增量)

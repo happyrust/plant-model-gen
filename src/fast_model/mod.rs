@@ -21,10 +21,11 @@ pub mod manifold_bool;
 pub mod mesh_generate;
 
 pub mod room_model; // 改进版本的房间模型
+#[cfg(all(not(target_arch = "wasm32"), feature = "web_server", feature = "duckdb-feature"))]
 pub mod room_worker; // 后台房间计算 Worker
 
 // Re-export room model functions
-#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-feature"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "web_server", feature = "duckdb-feature"))]
 pub use room_model::{
     IncrementalUpdateResult, RoomBuildStats, build_room_relations,
     build_room_relations_with_cancel, rebuild_room_relations_for_rooms,
@@ -32,7 +33,7 @@ pub use room_model::{
     update_room_relations_incremental, update_room_relations_incremental_with_cancel,
 };
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "duckdb-feature"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "web_server", feature = "duckdb-feature"))]
 pub use room_worker::{
     RoomWorker, RoomWorkerConfig, RoomWorkerTask, RoomWorkerTaskStatus, RoomTaskType,
 };
@@ -93,6 +94,54 @@ use parry3d::bounding_volume::Aabb;
 
 /// 全局缓存：已存在的 mesh geo_hash 到 AABB 的映射
 pub static EXIST_MESH_GEO_HASHES: Lazy<DashMap<String, Aabb>> = Lazy::new(|| DashMap::new());
+
+/// 从数据库预加载已存在的几何网格信息到内存缓存
+/// 
+/// 该函数扫描 `inst_geo` 表中所有已网格化 (`meshed = true`) 且拥有包围盒的数据，
+/// 将其 `geo_hash` 和 `aabb` 载入 `EXIST_MESH_GEO_HASHES` 总，
+/// 以便在后续生成的过程中通过内存直接跳过已处理项目，提升性能。
+pub async fn preload_mesh_cache() -> anyhow::Result<()> {
+    use aios_core::SUL_DB;
+    use aios_core::types::PlantAabb;
+    use surrealdb::types::{self as surrealdb_types, SurrealValue};
+    
+    debug_model!("🚚 正在从数据库预加载几何缓存...");
+    let start = std::time::Instant::now();
+    
+    // 查询所有已网格化的几何及其 AABB
+    // 注意：geo_hash 在 SurrealDB 中是 inst_geo 的 ID
+    let sql = "SELECT id, aabb.d as aabb_data FROM inst_geo WHERE meshed = true AND aabb != NONE";
+    
+    #[derive(serde::Deserialize, SurrealValue)]
+    struct GeoCacheRow {
+        id: surrealdb::types::RecordId,
+        aabb_data: Option<PlantAabb>,
+    }
+    
+    let mut response = SUL_DB.query(sql).await?;
+    let rows: Vec<GeoCacheRow> = response.take(0)?;
+    
+    let count = rows.len();
+    for row in rows {
+        // 使用 RecordId 的 key 字段作为缓存键
+        let mesh_id = format!("{:?}", row.id.key);
+        if let Some(plant_aabb) = row.aabb_data {
+            // PlantAabb 是 tuple struct，使用 .0 获取内部 Aabb
+            EXIST_MESH_GEO_HASHES.insert(mesh_id, plant_aabb.0);
+        } else {
+            // 如果只有 meshed=true 但没 aabb，存一个空的，仅用于跳过生成
+            EXIST_MESH_GEO_HASHES.insert(mesh_id, Aabb::new_invalid());
+        }
+    }
+    
+    debug_model!(
+        "✅ 几何缓存预加载完成: 已载入 {} 个记录，耗时 {} ms",
+        count,
+        start.elapsed().as_millis()
+    );
+    
+    Ok(())
+}
 
 // pub use gen_model_refactored::DbModelInstRefnos;
 pub use query::*;

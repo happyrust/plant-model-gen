@@ -72,15 +72,17 @@ impl JwtConfig {
 /// 角色枚举
 /// - admin: 管理员
 /// - sj: 设计（编）
-/// - sh: 审核（审）
 /// - jd: 校对（校）
+/// - sh: 审核（审）
+/// - pz: 批准
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Admin,
     Sj,
-    Sh,
     Jd,
+    Sh,
+    Pz,
 }
 
 impl Role {
@@ -89,8 +91,9 @@ impl Role {
         match s.to_lowercase().as_str() {
             "admin" => Some(Role::Admin),
             "sj" => Some(Role::Sj),
-            "sh" => Some(Role::Sh),
             "jd" => Some(Role::Jd),
+            "sh" => Some(Role::Sh),
+            "pz" => Some(Role::Pz),
             _ => None,
         }
     }
@@ -100,8 +103,9 @@ impl Role {
         match self {
             Role::Admin => "admin",
             Role::Sj => "sj",
-            Role::Sh => "sh",
             Role::Jd => "jd",
+            Role::Sh => "sh",
+            Role::Pz => "pz",
         }
     }
     
@@ -110,14 +114,15 @@ impl Role {
         match self {
             Role::Admin => "管理员",
             Role::Sj => "设计（编）",
-            Role::Sh => "审核（审）",
             Role::Jd => "校对（校）",
+            Role::Sh => "审核（审）",
+            Role::Pz => "批准",
         }
     }
     
     /// 获取所有有效角色值
     pub fn valid_values() -> &'static [&'static str] {
-        &["admin", "sj", "sh", "jd"]
+        &["admin", "sj", "jd", "sh", "pz"]
     }
 }
 
@@ -426,13 +431,13 @@ mod tests {
     
     #[test]
     fn test_create_token_with_role() {
-        let (token, _exp) = create_token("testproject", "testuser", "FORM-TEST123", Some("admin")).unwrap();
+        let (token, _exp) = create_token("testproject", "testuser", "FORM-TEST123", Some("pz")).unwrap();
         assert!(!token.is_empty());
         
         let claims = verify_token(&token).unwrap();
         assert_eq!(claims.project_id, "testproject");
         assert_eq!(claims.user_id, "testuser");
-        assert_eq!(claims.role, Some("admin".to_string()));
+        assert_eq!(claims.role, Some("pz".to_string()));
     }
     
     #[test]

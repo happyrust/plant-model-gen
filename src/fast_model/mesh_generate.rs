@@ -252,6 +252,9 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
     let precision = db_option.mesh_precision().clone();
     let mesh_formats = crate::options::get_db_option_ext().mesh_formats.clone();
 
+    // 性能优化：启动前预加载数据库中已网格化的几何信息到内存，避免后续循环中重复查询。
+    crate::fast_model::preload_mesh_cache().await?;
+
     loop {
         let round_start = std::time::Instant::now();
         let pending_geo_ids = query_pending_mesh_geo_ids(batch_size, replace_exist).await?;

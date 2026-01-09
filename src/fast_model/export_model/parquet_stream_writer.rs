@@ -47,6 +47,8 @@ struct TransformRow {
 struct GeoItem {
     geo_hash: String,
     geo_trans_id: String,
+    /// GLB 文件相对路径 (e.g. "lod_L1/{hash}_L1.glb")
+    geo_url: String,
 }
 
 /// Parquet 流式写入器
@@ -181,8 +183,10 @@ impl ParquetStreamWriter {
             if let Some(geos_data) = data.inst_geos_map.get(&inst_key) {
                 for (idx, geo) in geos_data.insts.iter().enumerate() {
                     let trans_id = format!("{}_geo_{}", refno_str, idx);
+                    let geo_hash_str = geo.geo_hash.to_string();
                     geo_items.push(GeoItem {
-                        geo_hash: geo.geo_hash.to_string(),
+                        geo_url: format!("lod_L1/{}_L1.glb", &geo_hash_str),
+                        geo_hash: geo_hash_str,
                         geo_trans_id: trans_id.clone(),
                     });
                     
@@ -245,8 +249,10 @@ impl ParquetStreamWriter {
             if let Some(geos_data) = data.inst_geos_map.get(&inst_key) {
                 for (idx, geo) in geos_data.insts.iter().enumerate() {
                     let trans_id = format!("{}_geo_{}", refno_str, idx);
+                    let geo_hash_str = geo.geo_hash.to_string();
                     geo_items.push(GeoItem {
-                        geo_hash: geo.geo_hash.to_string(),
+                        geo_url: format!("lod_L1/{}_L1.glb", &geo_hash_str),
+                        geo_hash: geo_hash_str,
                         geo_trans_id: trans_id.clone(),
                     });
 
@@ -261,6 +267,7 @@ impl ParquetStreamWriter {
                     .clone()
                     .unwrap_or_else(|| TUBI_GEO_HASH.to_string());
                 geo_items.push(GeoItem {
+                    geo_url: format!("lod_L1/{}_L1.glb", &fallback_geo_hash),
                     geo_hash: fallback_geo_hash,
                     geo_trans_id: trans_id.clone(),
                 });
@@ -360,6 +367,7 @@ impl ParquetStreamWriter {
         DataType::List(Box::new(DataType::Struct(vec![
             Field::new("geo_hash".into(), DataType::String),
             Field::new("geo_trans_id".into(), DataType::String),
+            Field::new("geo_url".into(), DataType::String),
         ])))
     }
 
@@ -368,15 +376,18 @@ impl ParquetStreamWriter {
         for row in rows {
             let mut hashes = Vec::with_capacity(row.geo_items.len());
             let mut trans_ids = Vec::with_capacity(row.geo_items.len());
+            let mut urls = Vec::with_capacity(row.geo_items.len());
             for item in &row.geo_items {
                 hashes.push(item.geo_hash.clone());
                 trans_ids.push(item.geo_trans_id.clone());
+                urls.push(item.geo_url.clone());
             }
 
             let hash_series = Series::new("geo_hash".into(), hashes);
             let trans_series = Series::new("geo_trans_id".into(), trans_ids);
+            let url_series = Series::new("geo_url".into(), urls);
             let struct_len = hash_series.len();
-            let struct_fields = [hash_series, trans_series];
+            let struct_fields = [hash_series, trans_series, url_series];
             let struct_series =
                 StructChunked::from_series("geo_item".into(), struct_len, struct_fields.iter())?
                     .into_series();

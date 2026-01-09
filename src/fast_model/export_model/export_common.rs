@@ -763,23 +763,29 @@ pub async fn collect_export_data(
         println!("   🔍 检查 GLB 文件 (目录: {})...", search_dir.display());
     }
 
+    // 性能优化：预先一次性读取目录下的所有文件，避免在循环中进行密集的 exists() 调用
+    let existing_files: std::collections::HashSet<std::ffi::OsString> = if search_dir.exists() {
+        std::fs::read_dir(&search_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     for (geo_hash, usage_count) in &sorted_geo_hashes {
         // 构建文件名: {geo_hash}_{lod}.glb
         // 注意：gen_inst_meshes 生成的文件名格式为 {geo_hash}_{lod}.glb
         let filename = format!("{}_{:?}.glb", geo_hash, default_lod);
-        let file_path = search_dir.join(&filename);
         
         // 同时也尝试不仅带后缀的文件名 (兼容旧数据)
         let fallback_filename = format!("{}.glb", geo_hash);
-        let fallback_path = search_dir.join(&fallback_filename);
 
-        if file_path.exists() {
-            valid_geo_hashes.insert((*geo_hash).clone());
-            loaded_count += 1;
-            if verbose && **usage_count > 1 {
-                pb.set_message(format!("geo_hash: {} (复用 {} 次)", geo_hash, usage_count));
-            }
-        } else if fallback_path.exists() {
+        let file_exists = existing_files.contains(std::ffi::OsStr::new(&filename));
+        let fallback_exists = existing_files.contains(std::ffi::OsStr::new(&fallback_filename));
+
+        if file_exists || fallback_exists {
             valid_geo_hashes.insert((*geo_hash).clone());
             loaded_count += 1;
             if verbose && **usage_count > 1 {
@@ -794,9 +800,6 @@ pub async fn collect_export_data(
                     loaded_count += 1;
                 }
                 _ => {
-                    if verbose {
-                        // eprintln!("   ⚠️  GLB 文件不存在: {} 或 {}", file_path.display(), fallback_path.display());
-                    }
                     failed_count += 1;
                 }
             }

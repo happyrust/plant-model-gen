@@ -14,7 +14,14 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 #[cfg(feature = "web_server")]
+use aios_core::SUL_DB;
+
+#[cfg(feature = "web_server")]
+use surrealdb::types::{self as surrealdb_types, SurrealValue};
+
+#[cfg(feature = "web_server")]
 use super::jwt_auth::{create_token, generate_form_id};
+
 
 // ============================================================================
 // Configuration
@@ -100,6 +107,82 @@ pub struct CachePreloadResponse {
     pub task_id: Option<String>,
 }
 
+/// 校审流程同步请求
+#[derive(Debug, Deserialize)]
+pub struct SyncWorkflowRequest {
+    pub form_id: String,
+    pub token: String,
+    pub action: String,
+    pub actor: WorkflowActor,
+    pub next_step: Option<WorkflowNextStep>,
+    pub comments: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowActor {
+    pub id: String,
+    pub name: String,
+    pub roles: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowNextStep {
+    pub assignee_id: String,
+    pub name: String,
+    pub roles: String,
+}
+
+/// 校审流程同步响应
+#[derive(Debug, Serialize)]
+pub struct SyncWorkflowResponse {
+    pub code: i32,
+    pub message: String,
+    pub data: Option<SyncWorkflowData>,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct SyncWorkflowData {
+    /// 当前用户选择进行编校审的所有模型清单
+    pub models: Vec<String>,
+    /// 审批意见
+    pub opinions: Vec<WorkflowOpinion>,
+    /// 附件（云线、截图等）
+    pub attachments: Vec<WorkflowAttachment>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkflowOpinion {
+    /// 对应意见产生的模型 (refno 列表)
+    pub model: Vec<String>,
+    /// 审批节点类型: sj, jd, sh, pz
+    pub node: String,
+    /// 意见审批节点对应的顺序
+    pub order: i32,
+    /// 审批节点人员
+    pub author: String,
+    /// 总体意见文本
+    pub opinion: String,
+    /// 意见创建日期 (ISO8601)
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkflowAttachment {
+    /// 对应云线产生的模型 (refno 列表)
+    pub model: Vec<String>,
+    /// 文件 ID
+    pub id: String,
+    /// attachment 类型: markup (云线), file (文件)
+    pub r#type: String,
+    /// 对应下载地址
+    pub download_url: String,
+    /// 文件名称/描述
+    pub description: String,
+    /// 文件后缀
+    pub file_ext: String,
+}
+
 // ============================================================================
 // Axum Handlers
 // ============================================================================
@@ -113,8 +196,9 @@ pub fn create_model_center_routes() -> Router {
     Router::new()
         // 我们提供的接口 (外部调用我们)
         .route("/api/review/embed-url", post(get_embed_url))
+        .route("/api/review/workflow/sync", post(sync_workflow_handler))
         // 代理接口 (我们调用模型中心) - 用于触发模型中心的缓存
-        .route("/api/review/preload-cache", post(preload_cache))
+        .route("/api/review/cache/preload", post(preload_cache))
 }
 
 /// 获取嵌入地址 - 平台提供给外部的接口
@@ -141,7 +225,7 @@ async fn get_embed_url(
             
             // 4. 返回响应
             (StatusCode::OK, Json(EmbedUrlResponse {
-                code: 0,
+                code: 200,
                 message: "ok".to_string(),
                 data: Some(EmbedUrlData {
                     relative_path: PLATFORM_CONFIG.frontend_relative_path.clone(),
@@ -178,4 +262,153 @@ async fn preload_cache(
         message: "Cache preload request accepted".to_string(),
         task_id: Some(format!("cache_{}", request.project_id)),
     }))
+}
+
+/// 同步校审流程信息
+#[cfg(feature = "web_server")]
+async fn sync_workflow_handler(
+    Json(request): Json<SyncWorkflowRequest>,
+) -> impl IntoResponse {
+    info!(
+        "Sync workflow request: form_id={}, action={}, actor_id={}, actor_role={}", 
+        request.form_id, request.action, request.actor.id, request.actor.roles
+    );
+    
+    if let Some(ref next) = request.next_step {
+        info!(
+            "Next step: assignee={}, name={}, roles={}", 
+            next.assignee_id, next.name, next.roles
+        );
+    }
+    
+    // 查询该 form_id 关联的数据
+    let data = match query_workflow_data(&request.form_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("Failed to query workflow data for form_id={}: {}", request.form_id, e);
+            SyncWorkflowData::default()
+        }
+    };
+    
+    info!(
+        "Returning workflow data: models={}, opinions={}, attachments={}",
+        data.models.len(), data.opinions.len(), data.attachments.len()
+    );
+    
+    (StatusCode::OK, Json(SyncWorkflowResponse {
+        code: 200,
+        message: "success".to_string(),
+        data: Some(data),
+    }))
+}
+
+// ============================================================================
+// Database Query Functions
+// ============================================================================
+
+/// 查询表单关联的所有模型 refno
+#[cfg(feature = "web_server")]
+async fn query_workflow_models(form_id: &str) -> anyhow::Result<Vec<String>> {
+    let sql = r#"
+        SELECT model_refno FROM review_form_model 
+        WHERE form_id = $form_id
+    "#;
+    
+    let mut response = SUL_DB
+        .query(sql)
+        .bind(("form_id", form_id.to_string()))
+        .await?;
+    
+    #[derive(Debug, serde::Deserialize, SurrealValue)]
+    struct ModelRow {
+        model_refno: Option<String>,
+    }
+    
+    let rows: Vec<ModelRow> = response.take(0)?;
+    Ok(rows.into_iter().filter_map(|r| r.model_refno).collect())
+}
+
+/// 查询表单关联的所有审批意见
+#[cfg(feature = "web_server")]
+async fn query_workflow_opinions(form_id: &str) -> anyhow::Result<Vec<WorkflowOpinion>> {
+    let sql = r#"
+        SELECT model_refnos, node, seq_order, author, opinion, created_at 
+        FROM review_opinion 
+        WHERE form_id = $form_id
+        ORDER BY seq_order ASC
+    "#;
+    
+    let mut response = SUL_DB
+        .query(sql)
+        .bind(("form_id", form_id.to_string()))
+        .await?;
+    
+    #[derive(Debug, serde::Deserialize, SurrealValue)]
+    struct OpinionRow {
+        model_refnos: Option<Vec<String>>,
+        node: Option<String>,
+        seq_order: Option<i32>,
+        author: Option<String>,
+        opinion: Option<String>,
+        created_at: Option<String>,
+    }
+    
+    let rows: Vec<OpinionRow> = response.take(0)?;
+    Ok(rows.into_iter().map(|r| WorkflowOpinion {
+        model: r.model_refnos.unwrap_or_default(),
+        node: r.node.unwrap_or_default(),
+        order: r.seq_order.unwrap_or(0),
+        author: r.author.unwrap_or_default(),
+        opinion: r.opinion.unwrap_or_default(),
+        created_at: r.created_at.unwrap_or_default(),
+    }).collect())
+}
+
+/// 查询表单关联的所有附件
+#[cfg(feature = "web_server")]
+async fn query_workflow_attachments(form_id: &str) -> anyhow::Result<Vec<WorkflowAttachment>> {
+    let sql = r#"
+        SELECT model_refnos, file_id, file_type, download_url, description, file_ext 
+        FROM review_attachment 
+        WHERE form_id = $form_id
+    "#;
+    
+    let mut response = SUL_DB
+        .query(sql)
+        .bind(("form_id", form_id.to_string()))
+        .await?;
+    
+    #[derive(Debug, serde::Deserialize, SurrealValue)]
+    struct AttachmentRow {
+        model_refnos: Option<Vec<String>>,
+        file_id: Option<String>,
+        file_type: Option<String>,
+        download_url: Option<String>,
+        description: Option<String>,
+        file_ext: Option<String>,
+    }
+    
+    let rows: Vec<AttachmentRow> = response.take(0)?;
+    Ok(rows.into_iter().map(|r| WorkflowAttachment {
+        model: r.model_refnos.unwrap_or_default(),
+        id: r.file_id.unwrap_or_default(),
+        r#type: r.file_type.unwrap_or_default(),
+        download_url: r.download_url.unwrap_or_default(),
+        description: r.description.unwrap_or_default(),
+        file_ext: r.file_ext.unwrap_or_default(),
+    }).collect())
+}
+
+/// 汇总查询表单的所有校审数据
+#[cfg(feature = "web_server")]
+async fn query_workflow_data(form_id: &str) -> anyhow::Result<SyncWorkflowData> {
+    let models = query_workflow_models(form_id).await.unwrap_or_default();
+    let opinions = query_workflow_opinions(form_id).await.unwrap_or_default();
+    let attachments = query_workflow_attachments(form_id).await.unwrap_or_default();
+    
+    Ok(SyncWorkflowData {
+        models,
+        opinions,
+        attachments,
+    })
 }

@@ -7986,3 +7986,67 @@ pub async fn api_list_parquet_files(
     }
 }
 
+/// Scene Tree 文件响应
+#[derive(Serialize)]
+pub struct SceneTreeFileResponse {
+    pub success: bool,
+    pub dbno: u32,
+    pub filename: String,
+    pub url: String,
+    pub exists: bool,
+    pub node_count: Option<usize>,
+    pub message: String,
+}
+
+/// 获取指定 dbno 的 scene_tree Parquet 文件信息
+/// 
+/// GET /api/model/{dbno}/scene-tree
+pub async fn api_get_scene_tree_file(
+    Path(dbno): Path<u32>,
+) -> Json<SceneTreeFileResponse> {
+    let filename = format!("scene_tree_{}.parquet", dbno);
+    let file_path = format!("output/database_models/{}/{}", dbno, filename);
+    let url = format!("/files/output/database_models/{}/{}", dbno, filename);
+    
+    let exists = std::path::Path::new(&file_path).exists();
+    
+    if exists {
+        Json(SceneTreeFileResponse {
+            success: true,
+            dbno,
+            filename,
+            url,
+            exists: true,
+            node_count: None, // 可选：读取 Parquet 获取行数
+            message: "Scene tree file found".to_string(),
+        })
+    } else {
+        // 尝试导出
+        let output_dir = std::path::Path::new("output/database_models").join(dbno.to_string());
+        match crate::scene_tree::export_scene_tree_parquet(dbno, &output_dir).await {
+            Ok(count) => {
+                Json(SceneTreeFileResponse {
+                    success: true,
+                    dbno,
+                    filename,
+                    url,
+                    exists: true,
+                    node_count: Some(count),
+                    message: format!("Scene tree exported: {} nodes", count),
+                })
+            }
+            Err(e) => {
+                Json(SceneTreeFileResponse {
+                    success: false,
+                    dbno,
+                    filename,
+                    url,
+                    exists: false,
+                    node_count: None,
+                    message: format!("Export failed: {}", e),
+                })
+            }
+        }
+    }
+}
+

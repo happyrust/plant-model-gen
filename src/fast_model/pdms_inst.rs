@@ -223,6 +223,7 @@ pub async fn save_instance_data_optimize(
         let mut neg_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
 
         for (target, neg_refnos) in &inst_mgr.neg_relate_map {
+            let target_inst = format!("inst_relate:⟨{}⟩", target);
             for neg_refno in neg_refnos.iter() {
                 // 首先尝试从当前 batch 的 neg_geo_by_carrier 查找
                 if let Some(geo_relate_ids) = neg_geo_by_carrier.get(neg_refno) {
@@ -233,6 +234,14 @@ pub async fn save_instance_data_optimize(
                             geo_relate_id,         // 切割几何
                             neg_refno.to_pe_key(), // 负载体
                             target.to_pe_key(),    // 正实体（被减实体）
+                        ));
+                        // 兼容：同时写入 out=inst_relate:⟨refno⟩ 的关系，供旧布尔查询/worker 使用
+                        //（它们通常在 inst_relate 节点上做 `in<-neg_relate` / `in<-ngmr_relate` 判断）
+                        neg_buffer.push(format!(
+                            "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', {2}], out: {2}, pe: {1} }}",
+                            geo_relate_id,         // 切割几何
+                            neg_refno.to_pe_key(), // 负载体
+                            target_inst,           // 目标 inst_relate
                         ));
 
                         if neg_buffer.len() >= CHUNK_SIZE {
@@ -276,6 +285,7 @@ pub async fn save_instance_data_optimize(
 
         for (target_k, refnos) in &inst_mgr.ngmr_neg_relate_map {
             let target_pe = target_k.to_pe_key();
+            let target_inst = format!("inst_relate:⟨{}⟩", target_k);
             for (ele_refno, ngmr_geom_refno) in refnos {
                 // 查找该 (负载体, ngmr_geom_refno) 的 CataCrossNeg geo_relate
                 let key = (*ele_refno, *ngmr_geom_refno);
@@ -289,6 +299,14 @@ pub async fn save_instance_data_optimize(
                             geo_relate_id,  // 切割几何
                             ele_pe,         // 负载体
                             target_pe,      // 正实体（目标）
+                            ngmr_pe         // NGMR 几何引用
+                        ));
+                        // 兼容：同时写入 out=inst_relate:⟨refno⟩ 的关系，供旧布尔查询/worker 使用
+                        ngmr_buffer.push(format!(
+                            "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', {2}], out: {2}, pe: {1}, ngmr: {3} }}",
+                            geo_relate_id,  // 切割几何
+                            ele_pe,         // 负载体
+                            target_inst,    // 目标 inst_relate
                             ngmr_pe         // NGMR 几何引用
                         ));
 

@@ -1,4 +1,4 @@
-use aios_core::{RefnoEnum, SUL_DB};
+use aios_core::{RefnoEnum, RefU64, SUL_DB, SurrealQueryExt};
 use axum::{
     Router,
     extract::{Path, Query, State},
@@ -23,6 +23,7 @@ pub fn create_e3d_tree_routes(state: E3dTreeApiState) -> Router {
         .route("/api/e3d/ancestors/{refno}", get(get_ancestors))
         .route("/api/e3d/subtree-refnos/{refno}", get(get_subtree_refnos))
         .route("/api/e3d/visible-insts/{refno}", get(get_visible_insts))
+        .route("/api/e3d/site-nodes/{refno}", get(get_site_nodes))
         .route("/api/e3d/search", post(search_nodes))
         .with_state(state)
 }
@@ -86,6 +87,37 @@ pub struct SearchRequest {
 pub struct SearchResponse {
     pub success: bool,
     pub items: Vec<TreeNodeDto>,
+    pub error_message: Option<String>,
+}
+
+// ========================
+// Site Nodes API (xeokit Node 层级)
+// ========================
+
+/// AABB 包围盒
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct NodeAabb {
+    pub min: [f64; 3],
+    pub max: [f64; 3],
+}
+
+/// Site Node 数据（用于前端构建 xeokit Node 层级）
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SiteNodeDto {
+    pub refno: RefnoEnum,
+    pub parent: Option<RefnoEnum>,
+    pub noun: String,
+    pub name: Option<String>,
+    pub aabb: Option<NodeAabb>,
+    pub has_geo: bool,
+}
+
+/// Site Nodes API 响应
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SiteNodesResponse {
+    pub success: bool,
+    pub nodes: Vec<SiteNodeDto>,
+    pub total: usize,
     pub error_message: Option<String>,
 }
 
@@ -451,4 +483,131 @@ async fn get_type_name(refno: RefnoEnum) -> String {
     aios_core::get_type_name(refno)
         .await
         .unwrap_or_else(|_| "UNKNOWN".to_string())
+}
+
+// ========================
+// Site Nodes Handler
+// ========================
+
+/// 查询 scene_node 表的返回结构
+#[derive(Debug, Deserialize, SurrealValue)]
+struct SceneNodeRow {
+    pub id: i64,
+    pub parent: Option<i64>,
+    pub has_geo: bool,
+    pub is_leaf: bool,
+    pub aabb_min: Option<Vec<f64>>,
+    pub aabb_max: Option<Vec<f64>>,
+}
+
+/// 获取 SITE 的所有 Node 层级数据（用于前端构建 xeokit Node 层级）
+async fn get_site_nodes(
+    Path(site_refno): Path<RefnoEnum>,
+    State(_state): State<E3dTreeApiState>,
+) -> Result<Json<SiteNodesResponse>, StatusCode> {
+    // 1. 获取 SITE 的所有子孙节点（通过 BFS 遍历 contains 关系）
+    const MAX_DEPTH: usize = 20;
+    const MAX_NODES: usize = 10000;
+    const CHUNK_SIZE: usize = 500;
+
+    let site_id = site_refno.refno().0 as i64;
+    let mut all_ids: Vec<i64> = vec![site_id];
+    let mut frontier: Vec<i64> = vec![site_id];
+    let mut visited: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    visited.insert(site_id);
+
+    for _ in 0..MAX_DEPTH {
+        if frontier.is_empty() || all_ids.len() >= MAX_NODES {
+            break;
+        }
+
+        let mut next_frontier: Vec<i64> = Vec::new();
+        for chunk in frontier.chunks(CHUNK_SIZE) {
+            let in_list = chunk
+                .iter()
+                .map(|id| format!("scene_node:{}", id))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let sql = format!(
+                "SELECT VALUE meta::id(out) FROM contains WHERE in IN [{}]",
+                in_list
+            );
+            let children: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+
+            for child_id in children {
+                if all_ids.len() >= MAX_NODES {
+                    break;
+                }
+                if visited.insert(child_id) {
+                    all_ids.push(child_id);
+                    next_frontier.push(child_id);
+                }
+            }
+        }
+        frontier = next_frontier;
+    }
+
+    // 2. 批量查询 scene_node 详细信息（包括 aabb）
+    let mut nodes: Vec<SiteNodeDto> = Vec::with_capacity(all_ids.len());
+
+    for chunk in all_ids.chunks(500) {
+        let id_list = chunk
+            .iter()
+            .map(|id| format!("scene_node:{}", id))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // 查询 scene_node 表，同时关联 aabb 表获取包围盒
+        let sql = format!(
+            r#"SELECT 
+                meta::id(id) as id,
+                parent,
+                has_geo,
+                is_leaf,
+                aabb.min as aabb_min,
+                aabb.max as aabb_max
+            FROM [{}]"#,
+            id_list
+        );
+
+        let rows: Vec<SceneNodeRow> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+
+        for row in rows {
+            let refno = RefnoEnum::from(RefU64(row.id as u64));
+            let parent = row.parent.map(|p| RefnoEnum::from(RefU64(p as u64)));
+
+            // 获取 pe 表的 noun 和 name
+            let (noun, name) = match aios_core::get_pe(refno).await {
+                Ok(Some(pe)) => (pe.noun, Some(pe.name)),
+                _ => ("UNKNOWN".to_string(), None),
+            };
+
+            // 构建 AABB
+            let aabb = match (&row.aabb_min, &row.aabb_max) {
+                (Some(min), Some(max)) if min.len() >= 3 && max.len() >= 3 => Some(NodeAabb {
+                    min: [min[0], min[1], min[2]],
+                    max: [max[0], max[1], max[2]],
+                }),
+                _ => None,
+            };
+
+            nodes.push(SiteNodeDto {
+                refno,
+                parent,
+                noun,
+                name,
+                aabb,
+                has_geo: row.has_geo,
+            });
+        }
+    }
+
+    let total = nodes.len();
+    Ok(Json(SiteNodesResponse {
+        success: true,
+        nodes,
+        total,
+        error_message: None,
+    }))
 }

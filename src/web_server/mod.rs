@@ -51,7 +51,8 @@ use crate::web_api::{
     create_noun_hierarchy_routes, create_room_tree_routes, create_spatial_query_routes,
     create_pdms_attr_routes, create_ptset_routes, CollisionApiState, create_collision_routes,
     create_review_integration_routes, create_model_center_routes, create_pipeline_annotation_routes,
-    create_jwt_auth_routes, create_review_api_routes,
+    create_jwt_auth_routes, create_review_api_routes, create_scene_tree_routes,
+    create_export_api_routes,
 };
 use handlers::*;
 use models::*;
@@ -199,6 +200,16 @@ pub async fn start_web_server_with_config(
     // 初始化 SurrealDB 中的 deployment_sites 表
     crate::web_server::handlers::ensure_deployment_sites_schema().await;
 
+    // 确保 Scene Tree 已初始化
+    println!("🌳 检查 Scene Tree 初始化状态...");
+    match crate::scene_tree::ensure_initialized().await {
+        Ok(_) => println!("✅ Scene Tree 初始化检查完成"),
+        Err(e) => {
+            eprintln!("⚠️ Scene Tree 初始化失败: {}", e);
+            // 不阻塞启动，允许后续手动初始化
+        }
+    }
+
     // 启动 Parquet compact worker
     let compact_worker_config = parquet_compact_worker::CompactWorkerConfig {
         scan_interval_secs: 30,
@@ -285,6 +296,11 @@ pub async fn start_web_server_with_config(
         .route(
             "/api/model/{dbno}/files",
             get(handlers::api_list_parquet_files),
+        )
+        // 获取指定 dbno 的 scene_tree Parquet 文件
+        .route(
+            "/api/model/{dbno}/scene-tree",
+            get(handlers::api_get_scene_tree_file),
         )
         // SurrealDB 控制 (暂时注释掉有编译问题的路由)
         // .route("/api/surreal/start", post(handlers::start_surreal_server))
@@ -772,6 +788,8 @@ pub async fn start_web_server_with_config(
         })
         // CBA 文件分发服务 - 用于远程站点下载增量数据包
         .nest_service("/assets/archives", ServeDir::new("assets/archives"))
+        // 校审附件文件服务
+        .nest_service("/files/review_attachments", ServeDir::new("assets/review_attachments"))
         // 主页面
         .route("/", get(index_page))
         .route("/dashboard", get(dashboard_page))
@@ -820,10 +838,12 @@ pub async fn start_web_server_with_config(
         .merge(ptset_routes)
         .merge(room_routes)
         .merge(collision_routes)
+        .merge(create_export_api_routes())
         .merge(create_review_integration_routes())
         .merge(create_model_center_routes())
         .merge(create_jwt_auth_routes())
         .merge(create_review_api_routes())
+        .merge(create_scene_tree_routes())
         .nest("/api/pipeline", create_pipeline_annotation_routes())
         .layer(
             CorsLayer::new()

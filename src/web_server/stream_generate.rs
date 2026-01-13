@@ -2,7 +2,7 @@
 //!
 //! 实现增量模型生成 API，通过 SSE 推送生成进度。
 
-use aios_core::{RefU64, RefnoEnum};
+use aios_core::{RefU64, RefnoEnum, SUL_DB, SurrealQueryExt};
 use axum::{
     extract::{Json, State},
     response::sse::{Event, KeepAlive, Sse},
@@ -11,6 +11,7 @@ use futures::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
@@ -36,8 +37,15 @@ pub struct StreamGenerateRequest {
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     /// 最大展开深度（默认 10）
+    /// - `0` 表示不限深度（会一直向下遍历到叶子；内部仍有安全上限避免 OOM）
     #[serde(default = "default_max_depth")]
     pub max_depth: u32,
+    /// 是否执行布尔运算（孔洞/负实体结果）（默认 false）
+    ///
+    /// - 该开关只影响“是否尝试产出 inst_relate_bool 的结果网格”
+    /// - 不影响基础 inst_relate/geo_relate 的生成
+    #[serde(default)]
+    pub apply_boolean: bool,
 }
 
 fn default_true() -> bool {
@@ -49,12 +57,12 @@ fn default_batch_size() -> usize {
 }
 
 fn default_max_depth() -> u32 {
-    10
+    0
 }
 
 /// SSE 事件类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum StreamGenerateEvent {
     /// 开始处理
     Started {
@@ -71,12 +79,20 @@ pub enum StreamGenerateEvent {
     BatchComplete {
         batch_index: usize,
         batch_count: usize,
+        /// 本批次内实际触发“生成”的 refno（可能为空）
         generated_refnos: Vec<String>,
+        /// 本批次内已存在数据、无需生成的 refno（可能为空）
+        skipped_refnos: Vec<String>,
         progress: f32,
+        /// 可选警告（例如布尔运算失败时仍继续推进，以便前端至少能加载基础模型）
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
     },
     /// 批次生成失败
     BatchFailed {
         batch_index: usize,
+        /// 本批次内已存在数据、仍可加载的 refno（即使生成失败也可返回）
+        skipped_refnos: Vec<String>,
         error: String,
     },
     /// 全部完成
@@ -100,36 +116,124 @@ pub enum StreamGenerateEvent {
 /// 从根节点开始，递归查询所有可见的后代节点
 pub async fn query_visible_descendants(
     root_refnos: &[RefnoEnum],
-    _max_depth: u32,
+    max_depth: u32,
 ) -> anyhow::Result<Vec<RefnoEnum>> {
     if root_refnos.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut all_descendants = Vec::new();
+    const MAX_NODES: usize = 200_000;
+    const MAX_DEPTH_SAFETY: usize = 5_000;
 
-    for root_refno in root_refnos {
-        // 使用 aios_core 的现有函数获取子元素
-        match aios_core::get_children_refnos(*root_refno).await {
-            Ok(children) => {
-                all_descendants.extend(children);
+    let mut visited: std::collections::HashSet<RefnoEnum> = std::collections::HashSet::new();
+    let mut frontier: Vec<RefnoEnum> = root_refnos.to_vec();
+    for r in &frontier {
+        visited.insert(*r);
+    }
+
+    let mut out: Vec<RefnoEnum> = Vec::new();
+    let depth_limit: Option<usize> = if max_depth == 0 {
+        None
+    } else {
+        Some(max_depth as usize)
+    };
+    let mut depth: usize = 0;
+
+    loop {
+        if frontier.is_empty() {
+            break;
+        }
+        if let Some(limit) = depth_limit {
+            if depth >= limit {
+                break;
             }
-            Err(e) => {
-                warn!(
-                    "[StreamGenerate] 获取 {} 的子节点失败: {}",
-                    root_refno, e
-                );
+        }
+        if depth >= MAX_DEPTH_SAFETY {
+            anyhow::bail!(
+                "descendant traversal exceeded safety depth limit: {}",
+                MAX_DEPTH_SAFETY
+            );
+        }
+        if visited.len() >= MAX_NODES {
+            anyhow::bail!(
+                "descendant traversal exceeded safety node limit: {}",
+                MAX_NODES
+            );
+        }
+
+        let mut next: Vec<RefnoEnum> = Vec::new();
+        for node in &frontier {
+            match aios_core::get_children_refnos(*node).await {
+                Ok(children) => {
+                    for child in children {
+                        if visited.insert(child) {
+                            next.push(child);
+                            out.push(child);
+                            if visited.len() >= MAX_NODES {
+                                anyhow::bail!(
+                                    "descendant traversal exceeded safety node limit: {}",
+                                    MAX_NODES
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("[StreamGenerate] 获取 {} 的子节点失败: {}", node, e);
+                }
+            }
+        }
+        frontier = next;
+        depth += 1;
+    }
+
+    info!(
+        "[StreamGenerate] 展开 {} 个根节点 (max_depth={}) -> {} 个子孙节点",
+        root_refnos.len(),
+        max_depth,
+        out.len()
+    );
+
+    Ok(out)
+}
+
+async fn filter_geo_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
+    if refnos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 这里的“有几何体”定义与 scene_tree 一致：按 noun 分类判断 has_geo。
+    // 为了避免 N+1，这里批量从 pe 表查询 noun。
+    const CHUNK: usize = 500;
+    let mut out: Vec<RefnoEnum> = Vec::new();
+
+    for chunk in refnos.chunks(CHUNK) {
+        let id_list = chunk
+            .iter()
+            .map(|r| r.to_pe_key())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let sql = format!(
+            "SELECT VALUE {{ refno: meta::id(id), noun: noun }} FROM [{id_list}]"
+        );
+        let rows: Vec<serde_json::Value> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        for row in rows {
+            let refno_str = row.get("refno").and_then(|v| v.as_str()).unwrap_or("");
+            let noun = row.get("noun").and_then(|v| v.as_str()).unwrap_or("");
+            if refno_str.is_empty() || noun.is_empty() {
+                continue;
+            }
+            if !crate::scene_tree::is_geo_noun(noun) {
+                continue;
+            }
+            if let Ok(r) = RefnoEnum::from_str(refno_str) {
+                out.push(r);
             }
         }
     }
 
-    info!(
-        "[StreamGenerate] 展开 {} 个根节点 -> {} 个子节点",
-        root_refnos.len(),
-        all_descendants.len()
-    );
-
-    Ok(all_descendants)
+    Ok(out)
 }
 
 /// 检查哪些 refno 还没有生成模型
@@ -220,31 +324,94 @@ pub async fn api_stream_generate(
                                 descendants
                             }
                             Err(e) => {
-                                warn!("[StreamGenerate] 展开子节点失败: {}", e);
-                                parsed_refnos.clone()
+                                let event = StreamGenerateEvent::Error {
+                                    message: format!("展开子节点失败: {e}"),
+                                };
+                                return Some((event, (req, StreamGenerateState::Done)));
                             }
                         }
                     } else {
                         parsed_refnos.clone()
                     };
 
-                    // 3. 过滤已生成的
-                    let to_generate = if req.force_regenerate {
-                        expanded.clone()
-                    } else {
-                        filter_missing_inst_relate(&expanded)
-                            .await
-                            .unwrap_or_else(|_| expanded.clone())
+                    // 2.1 过滤出“有几何体”的节点（has_geo=true）
+                    let expanded_geo = match filter_geo_refnos(&expanded).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let event = StreamGenerateEvent::Error {
+                                message: format!("过滤几何节点失败: {e}"),
+                            };
+                            return Some((event, (req, StreamGenerateState::Done)));
+                        }
                     };
 
-                    let skipped_count = expanded.len().saturating_sub(to_generate.len());
+                    // 2.2 若启用布尔运算：提前生成“深度负实体”依赖，避免后续布尔阶段缺少切割体网格
+                    if req.apply_boolean {
+                        let mut neg_deps: Vec<RefnoEnum> = Vec::new();
+                        for &root in &parsed_refnos {
+                            match aios_core::query_deep_neg_inst_refnos(root).await {
+                                Ok(mut v) => neg_deps.append(&mut v),
+                                Err(e) => {
+                                    warn!(
+                                        "[StreamGenerate] 查询负实体依赖失败 root={} err={}",
+                                        root, e
+                                    );
+                                }
+                            }
+                        }
+                        neg_deps.sort();
+                        neg_deps.dedup();
+
+                        // 避免重复生成：剔除本就包含在 expanded_geo 内的项
+                        let expanded_geo_set: std::collections::HashSet<RefnoEnum> =
+                            expanded_geo.iter().copied().collect();
+                        neg_deps.retain(|r| !expanded_geo_set.contains(r));
+
+                        if !neg_deps.is_empty() {
+                            let neg_missing = if req.force_regenerate {
+                                neg_deps.clone()
+                            } else {
+                                filter_missing_inst_relate(&neg_deps)
+                                    .await
+                                    .unwrap_or_else(|_| neg_deps.clone())
+                            };
+
+                            if !neg_missing.is_empty() {
+                                let db_option = aios_core::get_db_option();
+                                let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
+                                if let Err(e) = crate::fast_model::gen_all_geos_data(
+                                    neg_missing,
+                                    &db_option_ext,
+                                    None,
+                                    None,
+                                )
+                                .await
+                                {
+                                    warn!("[StreamGenerate] 负实体依赖预生成失败: {}", e);
+                                }
+                            }
+                        }
+                    }
+
+                    // 3. 预过滤：计算“需要生成”的集合（用于后续按批次切分）
+                    let to_generate = if req.force_regenerate {
+                        expanded_geo.clone()
+                    } else {
+                        filter_missing_inst_relate(&expanded_geo)
+                            .await
+                            .unwrap_or_else(|_| expanded_geo.clone())
+                    };
+
+                    let skipped_count = expanded_geo.len().saturating_sub(to_generate.len());
                     let event = StreamGenerateEvent::ExpandComplete {
                         original_count: parsed_refnos.len(),
-                        expanded_count: expanded.len(),
+                        expanded_count: expanded_geo.len(),
                         skipped_count,
                     };
 
-                    if to_generate.is_empty() {
+                    // 不管是否需要生成，都进入按 expanded 进行批次处理：
+                    // - 这样 skipped 的 refno 也能“边加载”
+                    if expanded_geo.is_empty() {
                         // 全部已生成，直接完成
                         Some((
                             event,
@@ -252,18 +419,21 @@ pub async fn api_stream_generate(
                                 req.clone(),
                                 StreamGenerateState::Finishing {
                                     total_generated: 0,
-                                    total_skipped: expanded.len(),
+                                    total_skipped: 0,
                                     start_time: Instant::now(),
                                 },
                             ),
                         ))
                     } else {
+                        let missing_set: std::collections::HashSet<RefnoEnum> =
+                            to_generate.iter().cloned().collect();
                         Some((
                             event,
                             (
                                 req.clone(),
                                 StreamGenerateState::Generating {
-                                    to_generate,
+                                    expanded: expanded_geo,
+                                    missing_set,
                                     batch_index: 0,
                                     total_generated: 0,
                                     total_skipped: skipped_count,
@@ -275,7 +445,8 @@ pub async fn api_stream_generate(
                 }
 
                 StreamGenerateState::Generating {
-                    to_generate,
+                    expanded,
+                    missing_set,
                     batch_index,
                     total_generated,
                     total_skipped,
@@ -283,7 +454,7 @@ pub async fn api_stream_generate(
                 } => {
                     // 4. 分批生成
                     let batch_size = req.batch_size;
-                    let total_batches = (to_generate.len() + batch_size - 1) / batch_size;
+                    let total_batches = (expanded.len() + batch_size - 1) / batch_size;
 
                     if batch_index >= total_batches {
                         // 全部批次完成
@@ -297,65 +468,177 @@ pub async fn api_stream_generate(
                         ))
                     } else {
                         let start_idx = batch_index * batch_size;
-                        let end_idx = (start_idx + batch_size).min(to_generate.len());
-                        let batch = to_generate[start_idx..end_idx].to_vec();
-                        let batch_len = batch.len();
+                        let end_idx = (start_idx + batch_size).min(expanded.len());
+                        let batch_all = expanded[start_idx..end_idx].to_vec();
 
-                        // 调用模型生成
+                        let mut to_generate_in_batch: Vec<RefnoEnum> = Vec::new();
+                        let mut skipped_in_batch: Vec<RefnoEnum> = Vec::new();
+                        if req.force_regenerate {
+                            to_generate_in_batch = batch_all.clone();
+                        } else {
+                            for r in &batch_all {
+                                if missing_set.contains(r) {
+                                    to_generate_in_batch.push(*r);
+                                } else {
+                                    skipped_in_batch.push(*r);
+                                }
+                            }
+                        }
+
+                        // 调用模型生成（本批次可能为空：全部 skipped）
                         let db_option = aios_core::get_db_option();
                         let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
 
-                        match crate::fast_model::gen_all_geos_data(
-                            batch.clone(),
-                            &db_option_ext,
-                            None,
-                            None,
-                        )
-                        .await
-                        {
-                            Ok(_) => {
-                                let generated_refnos: Vec<String> =
-                                    batch.iter().map(|r| r.to_string()).collect();
-                                let progress =
-                                    ((batch_index + 1) as f32 / total_batches as f32) * 100.0;
+                        if to_generate_in_batch.is_empty() {
+                            let progress =
+                                ((batch_index + 1) as f32 / total_batches as f32) * 100.0;
+                            let skipped_refnos: Vec<String> =
+                                skipped_in_batch.iter().map(|r| r.to_string()).collect();
+                            Some((
+                                StreamGenerateEvent::BatchComplete {
+                                    batch_index,
+                                    batch_count: total_batches,
+                                    generated_refnos: Vec::new(),
+                                    skipped_refnos,
+                                    progress,
+                                    warning: None,
+                                },
+                                (
+                                    req.clone(),
+                                    StreamGenerateState::Generating {
+                                        expanded: expanded.clone(),
+                                        missing_set: missing_set.clone(),
+                                        batch_index: batch_index + 1,
+                                        total_generated,
+                                        total_skipped,
+                                        start_time,
+                                    },
+                                ),
+                            ))
+                        } else {
+                            match crate::fast_model::gen_all_geos_data(
+                                to_generate_in_batch.clone(),
+                                &db_option_ext,
+                                None,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    // 可选：执行布尔运算（在本批次生成完成之后、发 BatchComplete 之前）
+                                    // 目标选择：batch_all（包含 skipped），这样能为“已有 inst 但缺少 bool 结果”的节点补齐孔洞结果。
+                                    let mut warning: Option<String> = None;
+                                    if req.apply_boolean {
+                                        // 是否在配置层启用布尔运算（即使请求要求，也尊重 DbOption 开关）
+                                        let apply_by_config = db_option.apply_boolean_operation;
+                                        if apply_by_config {
+                                            // 布尔运算依赖：必须先有 inst_geo 的 mesh + aabb.d（否则 query_aabb_params 会返回空）
+                                            // 这里按需补齐 mesh，避免依赖 DbOption.gen_mesh（SSE 端点应“边生成边加载”）。
+                                            let replace_exist =
+                                                req.force_regenerate || db_option.is_replace_mesh();
+                                            let meshes_dir = db_option.get_meshes_path();
+                                            let precision =
+                                                Arc::new(db_option.mesh_precision().clone());
+                                            if let Err(e) =
+                                                crate::fast_model::mesh_generate::gen_inst_meshes(
+                                                    &meshes_dir,
+                                                    &precision,
+                                                    &batch_all,
+                                                    replace_exist,
+                                                    &[crate::options::MeshFormat::PdmsMesh],
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    "[StreamGenerate] 批次 {} 生成 mesh 失败(继续推进): {}",
+                                                    batch_index, e
+                                                );
+                                            }
 
-                                Some((
-                                    StreamGenerateEvent::BatchComplete {
-                                        batch_index,
-                                        batch_count: total_batches,
-                                        generated_refnos,
-                                        progress,
-                                    },
-                                    (
-                                        req.clone(),
-                                        StreamGenerateState::Generating {
-                                            to_generate: to_generate.clone(),
-                                            batch_index: batch_index + 1,
-                                            total_generated: total_generated + batch_len,
-                                            total_skipped,
-                                            start_time,
+                                            // 布尔查询/任务要求 inst_relate_aabb 存在（否则会被过滤为 0）
+                                            // 这里先补齐 AABB，再做布尔，保证能产出 inst_relate_bool
+                                            if let Err(e) = crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
+                                                &batch_all,
+                                                replace_exist,
+                                            )
+                                            .await
+                                            {
+                                                warn!(
+                                                    "[StreamGenerate] 批次 {} 更新 AABB 失败(继续推进): {}",
+                                                    batch_index, e
+                                                );
+                                            }
+
+                                            if let Err(e) =
+                                                crate::fast_model::mesh_generate::booleans_meshes_in_db(
+                                                    Some(std::sync::Arc::new(db_option.clone())),
+                                                    &batch_all,
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    "[StreamGenerate] 批次 {} 布尔运算失败(继续推进): {}",
+                                                    batch_index, e
+                                                );
+                                                warning = Some(format!("布尔运算失败(本批次仍继续): {e:#}"));
+                                            }
+                                        }
+                                    }
+
+                                    let generated_refnos: Vec<String> = to_generate_in_batch
+                                        .iter()
+                                        .map(|r| r.to_string())
+                                        .collect();
+                                    let skipped_refnos: Vec<String> =
+                                        skipped_in_batch.iter().map(|r| r.to_string()).collect();
+                                    let progress =
+                                        ((batch_index + 1) as f32 / total_batches as f32) * 100.0;
+
+                                    Some((
+                                        StreamGenerateEvent::BatchComplete {
+                                            batch_index,
+                                            batch_count: total_batches,
+                                            generated_refnos,
+                                            skipped_refnos,
+                                            progress,
+                                            warning,
                                         },
-                                    ),
-                                ))
-                            }
-                            Err(e) => {
-                                error!("[StreamGenerate] 批次 {} 生成失败: {}", batch_index, e);
-                                Some((
-                                    StreamGenerateEvent::BatchFailed {
-                                        batch_index,
-                                        error: e.to_string(),
-                                    },
-                                    (
-                                        req.clone(),
-                                        StreamGenerateState::Generating {
-                                            to_generate: to_generate.clone(),
-                                            batch_index: batch_index + 1,
-                                            total_generated,
-                                            total_skipped,
-                                            start_time,
+                                        (
+                                            req.clone(),
+                                            StreamGenerateState::Generating {
+                                                expanded: expanded.clone(),
+                                                missing_set: missing_set.clone(),
+                                                batch_index: batch_index + 1,
+                                                total_generated: total_generated + to_generate_in_batch.len(),
+                                                total_skipped,
+                                                start_time,
+                                            },
+                                        ),
+                                    ))
+                                }
+                                Err(e) => {
+                                    error!("[StreamGenerate] 批次 {} 生成失败: {}", batch_index, e);
+                                    let skipped_refnos: Vec<String> =
+                                        skipped_in_batch.iter().map(|r| r.to_string()).collect();
+                                    Some((
+                                        StreamGenerateEvent::BatchFailed {
+                                            batch_index,
+                                            skipped_refnos,
+                                            error: e.to_string(),
                                         },
-                                    ),
-                                ))
+                                        (
+                                            req.clone(),
+                                            StreamGenerateState::Generating {
+                                                expanded: expanded.clone(),
+                                                missing_set: missing_set.clone(),
+                                                batch_index: batch_index + 1,
+                                                total_generated,
+                                                total_skipped,
+                                                start_time,
+                                            },
+                                        ),
+                                    ))
+                                }
                             }
                         }
                     }
@@ -393,7 +676,8 @@ enum StreamGenerateState {
         parsed_refnos: Vec<RefnoEnum>,
     },
     Generating {
-        to_generate: Vec<RefnoEnum>,
+        expanded: Vec<RefnoEnum>,
+        missing_set: std::collections::HashSet<RefnoEnum>,
         batch_index: usize,
         total_generated: usize,
         total_skipped: usize,

@@ -6,10 +6,12 @@ use axum::{
     Router,
     extract::{Json, Query},
     http::{StatusCode, HeaderMap},
-    routing::post,
+    routing::{post, get},
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+
+use aios_core::SUL_DB;
 
 // ============================================================================
 // Request/Response Structs
@@ -110,6 +112,7 @@ impl Default for ReviewIntegrationState {
 pub fn create_review_integration_routes() -> Router {
     Router::new()
         .route("/api/review/aux-data", post(get_aux_data))
+        .route("/api/review/collision-data", get(get_collision_data))
 }
 
 // ============================================================================
@@ -148,4 +151,97 @@ async fn get_aux_data(
     };
 
     Ok(Json(response))
+}
+
+// ============================================================================
+// Collision Data Query
+// ============================================================================
+
+/// 碰撞数据查询参数
+#[derive(Debug, Deserialize)]
+pub struct CollisionQueryParams {
+    pub project_id: Option<String>,
+    pub refno: Option<String>,
+    pub limit: Option<i32>,
+    pub offset: Option<i32>,
+}
+
+/// 碰撞数据响应
+#[derive(Debug, Serialize)]
+pub struct CollisionDataResponse {
+    pub success: bool,
+    pub data: Vec<CollisionItem>,
+    pub total: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// GET /api/review/collision-data - 查询碰撞数据
+async fn get_collision_data(
+    Query(params): Query<CollisionQueryParams>,
+) -> impl axum::response::IntoResponse {
+    info!("Querying collision data: project={:?}, refno={:?}",
+          params.project_id, params.refno);
+
+    let limit = params.limit.unwrap_or(100);
+    let offset = params.offset.unwrap_or(0);
+
+    // 构建查询 SQL
+    let sql = if let Some(ref refno) = params.refno {
+        format!(
+            "SELECT * FROM collision_events WHERE object_one = $refno OR object_two = $refno LIMIT {} START {}",
+            limit, offset
+        )
+    } else {
+        format!(
+            "SELECT * FROM collision_events LIMIT {} START {}",
+            limit, offset
+        )
+    };
+
+    // 查询碰撞数据
+    let mut query = SUL_DB.query(&sql);
+    if let Some(ref refno) = params.refno {
+        query = query.bind(("refno", refno.clone()));
+    }
+
+    match query.await {
+        Ok(mut resp) => {
+            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+            let items: Vec<CollisionItem> = rows.iter().map(|row| {
+                CollisionItem {
+                    object_one_loc: row["object_one_loc"].as_str().unwrap_or("").to_string(),
+                    object_one: row["object_one"].as_str().unwrap_or("").to_string(),
+                    object_two_loc: row["object_two_loc"].as_str().unwrap_or("").to_string(),
+                    object_two: row["object_two"].as_str().unwrap_or("").to_string(),
+                    error_msg: row["error_msg"].as_str().unwrap_or("碰撞").to_string(),
+                    object_one_major: row["object_one_major"].as_str().unwrap_or("").to_string(),
+                    object_two_major: row["object_two_major"].as_str().unwrap_or("").to_string(),
+                    check_usr: row["check_usr"].as_str().unwrap_or("system").to_string(),
+                    check_date: row["check_date"].as_str().unwrap_or("").to_string(),
+                    up_usr: row["up_usr"].as_str().unwrap_or("").to_string(),
+                    up_time: row["up_time"].as_str().unwrap_or("").to_string(),
+                    error_status: row["error_status"].as_str().unwrap_or("pending").to_string(),
+                }
+            }).collect();
+
+            let total = items.len() as i32;
+
+            (axum::http::StatusCode::OK, axum::Json(CollisionDataResponse {
+                success: true,
+                data: items,
+                total,
+                error_message: None,
+            }))
+        }
+        Err(e) => {
+            warn!("Failed to query collision data: {}", e);
+            (axum::http::StatusCode::OK, axum::Json(CollisionDataResponse {
+                success: true,
+                data: vec![],
+                total: 0,
+                error_message: None,
+            }))
+        }
+    }
 }

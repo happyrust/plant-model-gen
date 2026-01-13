@@ -97,8 +97,39 @@ fn mesh_base_dir() -> PathBuf {
 fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<ManifoldRust> {
     let base_dir = mesh_base_dir();
     let mesh_path = build_lod_mesh_path(&base_dir, id);
-    let manifold = ManifoldRust::import_glb_to_manifold(&mesh_path, mat, more_precision)?;
+
+    let mut manifold = ManifoldRust::import_glb_to_manifold(&mesh_path, mat, more_precision)?;
+    if manifold.get_mesh().indices.is_empty() {
+        // 经验：部分 mesh 在默认精度下会“焊接过度”导致 Manifold 转换后变成空几何；
+        // 此时尝试提升精度重试一次，仍为空则视为加载失败，让上层走 bad_bool/失败路径。
+        if !more_precision {
+            eprintln!(
+                "[Manifold] ⚠️ import_glb_to_manifold 结果为空，尝试 more_precision=true 重试: id={} path={}",
+                id,
+                mesh_path.display()
+            );
+            manifold = ManifoldRust::import_glb_to_manifold(&mesh_path, mat, true)?;
+        }
+    }
+
+    if manifold.get_mesh().indices.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Manifold mesh 为空：id={} path={} (more_precision={})",
+            id,
+            mesh_path.display(),
+            more_precision
+        ));
+    }
+
     Ok(manifold)
+}
+
+#[inline]
+fn log_load_manifold_failed(scene: &str, refno: RefnoEnum, mesh_id: &str, err: &anyhow::Error) {
+    eprintln!(
+        "[bool][{}] load_manifold 失败: refno={} mesh_id={} err={}",
+        scene, refno, mesh_id, err
+    );
 }
 
 fn ensure_parent_dir(path: &Path) -> io::Result<()> {
@@ -205,15 +236,19 @@ pub async fn apply_cata_neg_boolean_manifold(
             };
 
             debug_model_debug!("加载 catalog 正实体 mesh: {}", pos.id.to_mesh_id());
-            let Ok(mut pos_manifold) = load_manifold(
+            let mut pos_manifold = match load_manifold(
                 &pos.id.to_mesh_id(),
                 pos.trans.0.to_matrix().as_dmat4(),
                 false,
-            ) else {
-                println!("布尔运算失败: 无法加载正实体 manifold, refno: {}", &g.refno);
-                crate::fast_model::utils::save_inst_relate_bool(g.refno, None, "Failed", "cata_bool")
-                    .await;
-                continue;
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    log_load_manifold_failed("cata_pos", g.refno, &pos.id.to_mesh_id(), &e);
+                    println!("布尔运算失败: 无法加载正实体 manifold, refno: {}", &g.refno);
+                    crate::fast_model::utils::save_inst_relate_bool(g.refno, None, "Failed", "cata_bool")
+                        .await;
+                    continue;
+                }
             };
 
             let mut neg_manifolds = Vec::new();
@@ -222,8 +257,9 @@ pub async fn apply_cata_neg_boolean_manifold(
                     continue;
                 };
                 let m = neg_geo.trans.0.to_matrix().as_dmat4();
-                if let Ok(manifold) = load_manifold(&neg_geo.id.to_mesh_id(), m, true) {
-                    neg_manifolds.push(manifold);
+                match load_manifold(&neg_geo.id.to_mesh_id(), m, true) {
+                    Ok(manifold) => neg_manifolds.push(manifold),
+                    Err(e) => log_load_manifold_failed("cata_neg", g.refno, &neg_geo.id.to_mesh_id(), &e),
                 }
             }
 
@@ -301,6 +337,12 @@ async fn apply_boolean_for_query(
     // 正实体在基准坐标系中，使用单位矩阵（相对于自身的坐标系）
     let pos_world_mat = query.inst_world_trans.0.to_matrix().as_dmat4();
 
+    // 没有任何负实体关系：不需要产出 bool 结果，也不应写入 Failed（否则会污染 inst_relate_bool）
+    if query.neg_ts.is_empty() {
+        debug_model_debug!("跳过布尔：无负实体关系 refno={}", query.refno);
+        return Ok(());
+    }
+
     let mut pos_manifolds = Vec::new();
     for (pos_id, pos_t) in query.pos_geos.iter() {
         let pos_mesh_id = pos_id.to_mesh_id();
@@ -310,8 +352,9 @@ async fn apply_boolean_for_query(
             "加载正实体 mesh: {} (应用局部变换)",
             pos_mesh_id
         );
-        if let Ok(manifold) = load_manifold(&pos_mesh_id, pos_local_mat, false) {
-            pos_manifolds.push(manifold);
+        match load_manifold(&pos_mesh_id, pos_local_mat, false) {
+            Ok(manifold) => pos_manifolds.push(manifold),
+            Err(e) => log_load_manifold_failed("inst_pos", query.refno, &pos_mesh_id, &e),
         }
     }
 
@@ -346,6 +389,7 @@ async fn apply_boolean_for_query(
     // 计算正实体世界坐标系的逆矩阵，用于将负实体转换到正实体的相对坐标系
     let inverse_pos_world = pos_world_mat.inverse();
     let mut neg_manifolds = Vec::new();
+    let mut neg_load_fail_logged = 0usize;
     for (_, _carrier_wt, neg_infos) in query.neg_ts.iter() {
         for NegInfo {
             id, geo_local_trans, aabb, carrier_world_trans, ..
@@ -377,8 +421,15 @@ async fn apply_boolean_for_query(
 
             debug_model_debug!("加载负实体 mesh: {} (相对于正实体坐标系)", id.to_mesh_id());
 
-            if let Ok(manifold) = load_manifold(&id.to_mesh_id(), relative_mat, true) {
-                neg_manifolds.push(manifold);
+            match load_manifold(&id.to_mesh_id(), relative_mat, true) {
+                Ok(manifold) => neg_manifolds.push(manifold),
+                Err(e) => {
+                    // 负实体可能数量很大，简单限流，避免刷屏
+                    if neg_load_fail_logged < 10 {
+                        log_load_manifold_failed("inst_neg", query.refno, &id.to_mesh_id(), &e);
+                        neg_load_fail_logged += 1;
+                    }
+                }
             }
         }
     }

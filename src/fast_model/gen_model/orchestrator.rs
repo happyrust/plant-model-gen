@@ -288,12 +288,14 @@ async fn process_full_noun_mode(
                     "[gen_model] Full Noun 模式完成 inst_relate_aabb 写入，用时 {} ms",
                     aabb_start.elapsed().as_millis()
                 );
-                if let Err(e) = crate::fast_model::export_model::export_parquet::export_inst_aabb_parquet(
-                    std::path::Path::new("assets/parquet/inst_aabb.parquet")
-                )
-                .await
-                {
-                    eprintln!("[gen_model] Full Noun 模式导出 inst_aabb Parquet 失败: {}", e);
+
+                // 导出前端模型数据 (db_models_{dbnum}.parquet)
+                let export_path = std::path::Path::new("assets/database_models");
+                if let Err(e) = crate::fast_model::export_model::export_parquet::export_db_models_parquet(
+                    export_path,
+                    None, // 导出所有已生成的 dbnums
+                ).await {
+                    eprintln!("[gen_model] Full Noun 模式导出前端模型 Parquet 失败: {}", e);
                 }
             }
         }
@@ -511,12 +513,6 @@ async fn process_targeted_generation(
                 "[gen_model] 完成 inst_relate_aabb 写入，用时 {} ms",
                 aabb_start.elapsed().as_millis()
             );
-            // 生成 Parquet 供空间计算使用
-            if let Err(e) = crate::fast_model::export_model::export_parquet::export_inst_aabb_parquet(
-                std::path::Path::new("assets/parquet/inst_aabb.parquet")
-            ).await {
-                eprintln!("[gen_model] 导出 inst_aabb Parquet 失败: {}", e);
-            }
         }
 
         // 运行 boolean worker 处理布尔运算

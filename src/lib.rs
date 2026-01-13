@@ -88,6 +88,9 @@ pub mod gui;
 #[cfg(feature = "gen_model")]
 pub mod fast_model;
 
+#[cfg(feature = "gen_model")]
+pub mod scene_tree;
+
 // #[cfg(feature = "gen_model")]
 // pub mod xeokit_xtk_generator; // 暂时注释掉，待实现
 

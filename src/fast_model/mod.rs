@@ -51,6 +51,9 @@ pub mod query_provider; // 新的统一查询提供者 // 查询兼容层
 pub mod utils;
 
 pub mod export_model;
+
+// 重新导出 scene_tree 模块（用于替代 inst_relate_aabb）
+pub use crate::scene_tree;
 pub use capture::*;
 pub use export_model::{export_glb, export_gltf, export_instanced_bundle, model_exporter};
 pub mod material_config;

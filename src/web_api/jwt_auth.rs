@@ -296,6 +296,125 @@ pub fn create_jwt_auth_routes() -> Router {
         .route("/api/auth/verify", post(verify_token_handler))
 }
 
+// ============================================================================
+// Axum Middleware
+// ============================================================================
+
+use axum::{
+    extract::Request,
+    middleware::Next,
+    response::Response,
+    http::header::AUTHORIZATION,
+};
+
+/// JWT 认证中间件
+/// 从 Authorization header 提取 Bearer token 并验证
+#[cfg(feature = "web_server")]
+pub async fn jwt_auth_middleware(
+    mut request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    // 从 Authorization header 提取 token
+    let auth_header = request.headers()
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok());
+
+    let token = match auth_header {
+        Some(h) if h.starts_with("Bearer ") => &h[7..],
+        _ => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error_message": "Missing or invalid Authorization header"
+                }))
+            ));
+        }
+    };
+
+    // 验证 token
+    match verify_token(token) {
+        Ok(claims) => {
+            // 将 claims 存入 request extensions
+            request.extensions_mut().insert(claims);
+            Ok(next.run(request).await)
+        }
+        Err(e) => {
+            warn!("JWT verification failed: {}", e);
+            Err((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error_message": format!("Invalid token: {}", e)
+                }))
+            ))
+        }
+    }
+}
+
+/// 可选的 JWT 认证中间件（不强制要求 token）
+#[cfg(feature = "web_server")]
+pub async fn jwt_auth_optional_middleware(
+    mut request: Request,
+    next: Next,
+) -> Response {
+    // 尝试从 Authorization header 提取 token
+    if let Some(auth_header) = request.headers()
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+    {
+        if auth_header.starts_with("Bearer ") {
+            let token = &auth_header[7..];
+            if let Ok(claims) = verify_token(token) {
+                request.extensions_mut().insert(claims);
+            }
+        }
+    }
+    next.run(request).await
+}
+
+/// 角色验证中间件工厂
+/// 检查用户是否具有指定角色之一
+#[cfg(feature = "web_server")]
+pub fn require_roles(allowed_roles: &'static [&'static str]) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, (StatusCode, Json<serde_json::Value>)>> + Send>> + Clone + Send {
+    move |request: Request, next: Next| {
+        Box::pin(async move {
+            // 从 extensions 获取 claims
+            let claims = request.extensions().get::<TokenClaims>();
+
+            match claims {
+                Some(c) => {
+                    // 检查角色
+                    let user_role = c.role.as_deref().unwrap_or("");
+                    if allowed_roles.contains(&user_role) || allowed_roles.contains(&"*") {
+                        Ok(next.run(request).await)
+                    } else {
+                        Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "success": false,
+                                "error_message": format!(
+                                    "Access denied. Required roles: {:?}, your role: {}",
+                                    allowed_roles, user_role
+                                )
+                            }))
+                        ))
+                    }
+                }
+                None => {
+                    Err((
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "error_message": "No authentication token found"
+                        }))
+                    ))
+                }
+            }
+        })
+    }
+}
+
 /// 获取 Token
 #[cfg(feature = "web_server")]
 async fn get_token(

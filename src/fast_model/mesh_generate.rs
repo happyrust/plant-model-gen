@@ -1288,7 +1288,7 @@ pub async fn update_inst_relate_aabbs_by_refnos(
         let pe_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
         if !pe_keys.is_empty() {
             let sql = format!(
-                "SELECT <string>in AS refno, <string>aabb AS aabb FROM inst_relate WHERE aabb != none AND world_trans.d != none AND in IN [{}]",
+                "SELECT <string>in AS refno, <string>aabb AS aabb FROM inst_relate WHERE aabb != none AND aabb.d != none AND world_trans.d != none AND in IN [{}]",
                 pe_keys.join(",")
             );
 
@@ -1332,7 +1332,7 @@ pub async fn update_inst_relate_aabbs_by_refnos(
         let fallback_query = r#"
             SELECT <string>in AS refno, <string>aabb AS aabb
             FROM inst_relate
-            WHERE aabb != none AND world_trans.d != none
+            WHERE aabb != none AND aabb.d != none AND world_trans.d != none
         "#;
         match SUL_DB.query_take::<Vec<InstAabbRow>>(fallback_query, 0).await {
             Ok(rows) if !rows.is_empty() => {
@@ -1396,3 +1396,97 @@ async fn filter_missing_inst_aabb(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<Re
 }
 
 // Database query structures are now imported from aios_core::query_structs
+
+// ========================
+// Scene Tree 集成（替代 inst_relate_aabb）
+// ========================
+
+/// 过滤未在 scene_tree 中标记为已生成的节点
+///
+/// 替代 `filter_missing_inst_aabb`，使用 scene_tree 的 `generated` 字段
+#[cfg(feature = "gen_model")]
+pub async fn filter_missing_scene_node(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
+    if refnos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 查询已生成的节点
+    let existing = crate::scene_tree::query_generated_refnos(refnos).await?;
+    let existing: HashSet<RefnoEnum> = existing.into_iter().collect();
+
+    // 返回未生成的节点
+    let missing = refnos
+        .iter()
+        .cloned()
+        .filter(|r| !existing.contains(r))
+        .collect();
+
+    Ok(missing)
+}
+
+/// 使用 scene_tree 更新 AABB 数据
+///
+/// 替代 `update_inst_relate_aabbs_by_refnos`，写入 scene_node 表
+#[cfg(feature = "gen_model")]
+pub async fn update_scene_node_aabbs_by_refnos(
+    refnos: &[RefnoEnum],
+    _replace_exist: bool,
+) -> anyhow::Result<()> {
+    if refnos.is_empty() {
+        return Ok(());
+    }
+
+    const CHUNK: usize = 100;
+
+    #[derive(serde::Deserialize)]
+    struct InstAabbRow {
+        #[serde(rename = "in")]
+        refno: String,
+        aabb: String,
+    }
+
+    let inst_aabb_map = DashMap::new();
+
+    for chunk in refnos.chunks(CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+
+        // 获取 inst_relate.aabb 数据
+        let inst_keys = get_inst_relate_keys(chunk);
+        let result = query_aabb_params(&inst_keys, true).await?;
+
+        for r in result {
+            // 计算合并后的 AABB
+            let mut aabb = Aabb::new_invalid();
+            for g in &r.geo_aabbs {
+                let t = r.world_trans * &g.trans;
+                let tmp_aabb = g.aabb.scaled(&t.scale.into());
+                let tmp_aabb = tmp_aabb.transform_by(&Isometry {
+                    rotation: t.rotation.into(),
+                    translation: t.translation.into(),
+                });
+                aabb.merge(&tmp_aabb);
+            }
+
+            // 过滤无效 AABB
+            let extent = aabb.extents().magnitude();
+            if extent.is_nan() || extent.is_infinite() {
+                continue;
+            }
+
+            let aabb_hash = gen_bytes_hash(&aabb);
+            inst_aabb_map.insert(r.refno, aabb_hash.to_string());
+        }
+    }
+
+    // 使用 scene_tree 模块更新
+    crate::scene_tree::update_scene_node_aabb(&inst_aabb_map).await?;
+
+    println!(
+        "[scene_tree] 更新 {} 个节点的 AABB",
+        inst_aabb_map.len()
+    );
+
+    Ok(())
+}

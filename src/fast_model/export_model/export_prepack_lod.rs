@@ -18,6 +18,7 @@ use aios_core::SurrealQueryExt;
 use aios_core::mesh_precision::LodLevel;
 use aios_core::options::DbOption;
 use aios_core::shape::pdms_shape::PlantMesh;
+use surrealdb::types::{self as surrealdb_types, SurrealValue};
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use glam::DMat4;
@@ -2053,6 +2054,494 @@ struct PrepackGeometryLod {
     error_metric: f32,
 }
 
+// ============================================================================
+// export_dbnum_instances_json 相关函数
+// ============================================================================
+
+/// 将 PlantAabb 转换为 JSON 格式 { "min": [x, y, z], "max": [x, y, z] }
+fn aabb_to_json(aabb: &aios_core::types::PlantAabb) -> serde_json::Value {
+    json!({
+        "min": [aabb.0.mins.x, aabb.0.mins.y, aabb.0.mins.z],
+        "max": [aabb.0.maxs.x, aabb.0.maxs.y, aabb.0.maxs.z],
+    })
+}
+
+/// 计算 BRAN/EQUI Owner 的 AABB（Union 所有 children 和 tubi 的 AABB）
+fn compute_owner_aabb(
+    children_aabbs: &[Option<aios_core::types::PlantAabb>],
+    tubings_aabbs: &[Option<aios_core::types::PlantAabb>],
+) -> Option<aios_core::types::PlantAabb> {
+    use parry3d::bounding_volume::Aabb;
+
+    let mut min_x = f64::MAX;
+    let mut min_y = f64::MAX;
+    let mut min_z = f64::MAX;
+    let mut max_x = f64::MIN;
+    let mut max_y = f64::MIN;
+    let mut max_z = f64::MIN;
+    let mut has_valid_aabb = false;
+
+    // 合并所有子组件的 AABB
+    for aabb in children_aabbs.iter().flatten() {
+        has_valid_aabb = true;
+        min_x = min_x.min(aabb.0.mins.x as f64);
+        min_y = min_y.min(aabb.0.mins.y as f64);
+        min_z = min_z.min(aabb.0.mins.z as f64);
+        max_x = max_x.max(aabb.0.maxs.x as f64);
+        max_y = max_y.max(aabb.0.maxs.y as f64);
+        max_z = max_z.max(aabb.0.maxs.z as f64);
+    }
+
+    // 合并所有 tubi 的 AABB
+    for aabb in tubings_aabbs.iter().flatten() {
+        has_valid_aabb = true;
+        min_x = min_x.min(aabb.0.mins.x as f64);
+        min_y = min_y.min(aabb.0.mins.y as f64);
+        min_z = min_z.min(aabb.0.mins.z as f64);
+        max_x = max_x.max(aabb.0.maxs.x as f64);
+        max_y = max_y.max(aabb.0.maxs.y as f64);
+        max_z = max_z.max(aabb.0.maxs.z as f64);
+    }
+
+    if !has_valid_aabb {
+        None
+    } else {
+        let combined_aabb = Aabb::new(
+            parry3d::math::Point::new(min_x as f32, min_y as f32, min_z as f32),
+            parry3d::math::Point::new(max_x as f32, max_y as f32, max_z as f32),
+        );
+        Some(aios_core::types::PlantAabb(combined_aabb))
+    }
+}
+
+/// inst_relate 查询结果结构体
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
+struct InstRelateQueryResult {
+    pub owner_refno: RefnoEnum,
+    pub owner_type: String,
+    pub in_refno: RefnoEnum,
+    pub spec_value: Option<i64>,
+}
+
+/// owner_refno 分组查询结果结构体（每个 owner_refno 一条）
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
+struct OwnerGroupQueryResult {
+    pub owner_refno: RefnoEnum,
+    pub owner_type: Option<String>,
+}
+
+/// pe 表查询结果结构体
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
+struct PeQueryResult {
+    pub id: RefnoEnum,
+    pub noun: Option<String>,
+    pub world_trans: Option<aios_core::PlantTransform>,
+}
+
+/// inst_relate_aabb 查询结果结构体
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
+struct AabbQueryResult {
+    pub in_refno: RefnoEnum,
+    pub aabb: Option<aios_core::types::PlantAabb>,
+}
+
+/// tubi_relate 查询结果结构体
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
+struct TubiQueryResult {
+    pub refno: RefnoEnum,
+    pub leave: RefnoEnum,
+    pub world_aabb: Option<aios_core::types::PlantAabb>,
+    pub world_trans: Option<aios_core::PlantTransform>,
+    pub geo_hash: Option<String>,
+    pub spec_value: Option<i64>,
+}
+
+fn plant_transform_to_dmat4(t: &aios_core::PlantTransform) -> DMat4 {
+    t.0.to_matrix().as_dmat4()
+}
+
+/// 导出指定 dbnum 的实例数据为简化 JSON 格式（含 AABB）
+///
+/// # 参数
+/// - `dbno`: 数据库编号
+/// - `output_dir`: 输出目录
+/// - `db_option`: 数据库选项
+/// - `verbose`: 是否输出详细日志
+///
+/// # 返回
+/// 导出统计信息
+pub async fn export_dbnum_instances_json(
+    dbno: u32,
+    output_dir: &Path,
+    db_option: std::sync::Arc<DbOption>,
+    verbose: bool,
+) -> Result<ExportStats> {
+    if verbose {
+        println!("🚀 开始导出 dbnum={} 的实例数据（含 AABB）", dbno);
+    }
+
+    // 确保输出目录存在
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
+
+    // 1. 先用 GROUP BY 收集 owner_refno 分组（BRAN/HANG/EQUI）
+    // 注意：SurrealDB GROUP BY 会将非聚合字段收集成数组，需要用 array::first() 取第一个值
+    let db_filter = format!("in.dbnum = {}", dbno);
+    let owner_sql = format!(
+        r#"
+        SELECT
+            owner_refno,
+            array::first(owner_type) as owner_type
+        FROM inst_relate
+        WHERE {} AND owner_type IN ['BRAN', 'HANG', 'EQUI']
+        GROUP BY owner_refno
+        "#,
+        db_filter
+    );
+
+    if verbose {
+        println!("🔍 执行查询: {}", owner_sql.trim());
+    }
+
+    let owner_rows: Vec<OwnerGroupQueryResult> =
+        aios_core::SUL_DB.query_take(&owner_sql, 0).await?;
+
+    // 2. 查询 inst_relate 获取 children 明细（不含 AABB / world_trans）
+    let children_sql = format!(
+        r#"
+        SELECT
+            owner_refno,
+            owner_type,
+            in.id as in_refno,
+            out.spec_value as spec_value
+        FROM inst_relate
+        WHERE {} AND owner_type IN ['BRAN', 'HANG', 'EQUI']
+        "#,
+        db_filter
+    );
+
+    let mut rows: Vec<(
+        RefnoEnum,
+        String,
+        RefnoEnum,
+        String,
+        Option<i64>,
+        Option<aios_core::PlantTransform>,
+        Option<aios_core::types::PlantAabb>,
+    )> = Vec::new();
+    let mut in_refnos: Vec<RefnoEnum> = Vec::new();
+
+    let inst_results: Vec<InstRelateQueryResult> =
+        aios_core::SUL_DB.query_take(&children_sql, 0).await?;
+
+    for result in inst_results {
+        rows.push((
+            result.owner_refno,
+            result.owner_type,
+            result.in_refno,
+            String::new(),
+            result.spec_value,
+            None,
+            None,
+        ));
+        in_refnos.push(result.in_refno);
+    }
+
+    // 2. 批量查询 pe 表获取 noun 和 world_trans
+    if !in_refnos.is_empty() {
+        for chunk in in_refnos.chunks(100) {
+            let refno_keys: Vec<String> = chunk.iter().map(|r| r.to_pe_key()).collect();
+            let pe_sql = format!(
+                "SELECT id, noun, world_trans.d as world_trans FROM [{}]",
+                refno_keys.join(",")
+            );
+
+            // 按项目规范：查询结果必须用结构体接收（禁止 serde_json::Value 手动解析）
+            if let Ok(pe_rows) = aios_core::SUL_DB.query_take::<Vec<PeQueryResult>>(&pe_sql, 0).await {
+                let pe_map: HashMap<RefnoEnum, (String, Option<aios_core::PlantTransform>)> = pe_rows
+                    .into_iter()
+                    .filter_map(|r| r.noun.map(|noun| (r.id, (noun, r.world_trans))))
+                    .collect();
+
+                for row in rows.iter_mut() {
+                    if let Some((noun, world_trans)) = pe_map.get(&row.2) {
+                        row.3 = noun.clone();
+                        row.5 = world_trans.clone();
+                    }
+                }
+            };
+        }
+    }
+
+    // 3. 单独查询所有 refno 的 AABB 数据（从 inst_relate_aabb 表）
+    let mut aabb_map: std::collections::HashMap<RefnoEnum, aios_core::types::PlantAabb> = std::collections::HashMap::new();
+    if !in_refnos.is_empty() {
+        // 批量查询 AABB（每批 100 个 refno）
+        // 使用 SurrealDB 惯用的 SELECT FROM [ids] 查询方式
+        for chunk in in_refnos.chunks(100) {
+            // inst_relate_aabb 表的 ID 格式是 inst_relate_aabb:`refno`
+            let aabb_ids: Vec<String> = chunk
+                .iter()
+                .map(|r| format!("inst_relate_aabb:`{}`", r))
+                .collect();
+            let aabb_sql = format!(
+                "SELECT in as in_refno, out.d as aabb FROM [{}] WHERE out.d != NULL",
+                aabb_ids.join(",")
+            );
+
+            if verbose {
+                println!("🔍 AABB 查询 SQL: {}", aabb_sql);
+            }
+
+            // 按项目规范：查询结果必须用结构体接收
+            match aios_core::SUL_DB.query_take::<Vec<AabbQueryResult>>(&aabb_sql, 0).await {
+                Ok(aabb_rows) => {
+                    if verbose {
+                        println!("📊 AABB 查询返回 {} 条记录", aabb_rows.len());
+                    }
+                    for aabb_row in aabb_rows {
+                        if let Some(aabb) = aabb_row.aabb {
+                            aabb_map.insert(aabb_row.in_refno, aabb);
+                        }
+                    }
+                }
+                Err(e) => {
+                    if verbose {
+                        println!("❌ AABB 查询失败: {:?}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    // 将 AABB 数据合并到 rows 中
+    for row in rows.iter_mut() {
+        if let Some(aabb) = aabb_map.get(&row.2) {
+            row.6 = Some(aabb.clone());
+        }
+    }
+
+    if verbose {
+        println!("✅ 查询到 {} 条 inst_relate 记录，其中 {} 条有 AABB", rows.len(), aabb_map.len());
+    }
+
+    // 4. 按 owner_refno 分组（用 owner_rows 做兜底，保证分组 key 稳定）
+    let mut owner_groups: HashMap<
+        RefnoEnum,
+        Vec<(
+            RefnoEnum,
+            String,
+            RefnoEnum,
+            String,
+            Option<i64>,
+            Option<aios_core::PlantTransform>,
+            Option<aios_core::types::PlantAabb>,
+        )>,
+    > = HashMap::new();
+
+    for owner in &owner_rows {
+        owner_groups.entry(owner.owner_refno).or_default();
+    }
+    for row in rows {
+        owner_groups.entry(row.0).or_default().push(row);
+    }
+
+    // 5. 查询 tubi_relate 数据（仅 BRAN/HANG owner）
+    let owner_refnos: Vec<RefnoEnum> = owner_rows
+        .iter()
+        .filter(|r| matches!(r.owner_type.as_deref(), Some("BRAN") | Some("HANG")))
+        .map(|r| r.owner_refno)
+        .collect();
+    let mut tubings_map: HashMap<RefnoEnum, Vec<TubiRecord>> = HashMap::new();
+
+    if !owner_refnos.is_empty() {
+        // 将多个 owner 的 ranges 查询打包成多语句一次执行（分批，避免 SQL 过长）
+        for owners_chunk in owner_refnos.chunks(50) {
+            let mut sql_batch = String::new();
+            for owner_refno in owners_chunk {
+                let pe_key = owner_refno.to_pe_key();
+                sql_batch.push_str(&format!(
+                    r#"
+                    SELECT
+                        id[0] as refno,
+                        in as leave,
+                        id[0].owner.noun as generic,
+                        aabb.d as world_aabb,
+                        world_trans.d as world_trans,
+                        record::id(geo) as geo_hash,
+                        id[0].dt as date,
+                        spec_value
+                    FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
+                    "#,
+                ));
+            }
+
+            let mut resp = aios_core::SUL_DB.query_response(&sql_batch).await?;
+            for (stmt_idx, owner_refno) in owners_chunk.iter().enumerate() {
+                let raw_tubi_rows: Vec<TubiQueryResult> = resp.take(stmt_idx)?;
+                for raw_tubi_row in raw_tubi_rows {
+                    let Some(geo_hash) = raw_tubi_row.geo_hash else {
+                        continue;
+                    };
+
+                    let transform = raw_tubi_row
+                        .world_trans
+                        .as_ref()
+                        .map(plant_transform_to_dmat4)
+                        .unwrap_or(DMat4::IDENTITY);
+
+                    let tubi_record = TubiRecord {
+                        refno: raw_tubi_row.refno,
+                        owner_refno: raw_tubi_row.leave,
+                        geo_hash,
+                        transform,
+                        index: 0,
+                        name: format!("TUBI-{}", raw_tubi_row.refno.to_string()),
+                        spec_value: raw_tubi_row.spec_value,
+                        aabb: raw_tubi_row.world_aabb,
+                    };
+
+                    tubings_map.entry(*owner_refno).or_default().push(tubi_record);
+                }
+            }
+        }
+    }
+
+    if verbose {
+        let total_tubis: usize = tubings_map.values().map(|v| v.len()).sum();
+        println!("✅ 查询到 {} 条 tubi_relate 记录", total_tubis);
+    }
+
+    // 4. 构建简化的 JSON 结构
+    let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let mut groups = Vec::new();
+
+    for (owner_refno, children_rows) in owner_groups.iter() {
+        let owner_type = children_rows.first().map(|r| r.1.as_str()).unwrap_or("BRAN");
+        let owner_name = format!("{}-{}", owner_type, owner_refno.to_string());
+
+        // 收集 children 的 AABB
+        let children_aabbs: Vec<Option<aios_core::types::PlantAabb>> =
+            children_rows.iter().map(|r| r.6.clone()).collect();
+
+        // 收集 tubi 的 AABB
+        let tubings_aabbs: Vec<Option<aios_core::types::PlantAabb>> = tubings_map
+            .get(owner_refno)
+            .map(|tubis| tubis.iter().map(|t| t.aabb.clone()).collect())
+            .unwrap_or_default();
+
+        // 计算 owner 的 AABB
+        let owner_aabb = compute_owner_aabb(&children_aabbs, &tubings_aabbs);
+
+        // 构建 children 数组
+        let mut children = Vec::new();
+        for child_row in children_rows {
+            let child_aabb = child_row.6.as_ref().map(aabb_to_json);
+
+            // 获取几何体实例数据（暂时使用空数组，因为需要额外查询）
+            let instances: Vec<serde_json::Value> = Vec::new();
+
+            let world_transform = child_row
+                .5
+                .as_ref()
+                .map(plant_transform_to_dmat4)
+                .map(|mat| {
+                    mat4_to_vec_dmat4(
+                        &mat,
+                        &UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Millimeter),
+                        false,
+                    )
+                })
+                .unwrap_or_else(|| vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+
+            children.push(json!({
+                "refno": child_row.2.to_string(),
+                "noun": child_row.3,
+                "name": format!("{}-{}", child_row.3, child_row.2.to_string()),
+                "aabb": child_aabb,
+                "lod_mask": 1u32, // 默认 LOD 掩码
+                "spec_value": child_row.4.unwrap_or(0),
+                "refno_transform": world_transform,
+                "instances": instances,
+            }));
+        }
+
+        // 构建 tubings 数组
+        let mut tubings = Vec::new();
+        if let Some(tubi_records) = tubings_map.get(owner_refno) {
+            for tubi in tubi_records {
+                let tubi_aabb = tubi.aabb.as_ref().map(aabb_to_json);
+                let matrix = mat4_to_vec_dmat4(&tubi.transform, &UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Millimeter), true);
+
+                tubings.push(json!({
+                    "refno": tubi.refno.to_string(),
+                    "noun": "TUBI",
+                    "name": tubi.name,
+                    "aabb": tubi_aabb,
+                    "geo_hash": tubi.geo_hash,
+                    "matrix": matrix,
+                    "order": tubi.index,
+                    "lod_mask": 1u32,
+                    "spec_value": tubi.spec_value.unwrap_or(0),
+                }));
+            }
+        }
+
+        let owner_aabb_json = owner_aabb.as_ref().map(aabb_to_json);
+
+        groups.push(json!({
+            "owner_refno": owner_refno.to_string(),
+            "owner_noun": owner_type,
+            "owner_name": owner_name,
+            "owner_aabb": owner_aabb_json,
+            "children": children,
+            "tubings": tubings,
+        }));
+    }
+
+    // 5. 构建最终的 JSON
+    let instances_json = json!({
+        "version": 2,
+        "generated_at": generated_at,
+        "groups": groups,
+    });
+
+    // 6. 写入文件
+    let output_path = output_dir.join(format!("instances_{}.json", dbno));
+    let json_str = serde_json::to_string_pretty(&instances_json)?;
+    fs::write(&output_path, json_str)?;
+
+    if verbose {
+        println!("✅ JSON 文件已写入: {}", output_path.display());
+    }
+
+    // 返回统计信息
+    let start_time = std::time::Instant::now();
+    let stats = ExportStats {
+        refno_count: owner_groups.len(),
+        descendant_count: owner_groups.values().map(|v| v.len()).sum(),
+        geometry_count: 0,
+        mesh_files_found: 0,
+        mesh_files_missing: 0,
+        output_file_size: {
+            fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0)
+        },
+        elapsed_time: start_time.elapsed(),
+        node_count: 0,
+        mesh_count: 0,
+    };
+
+    Ok(stats)
+}
+
+/// 将 DMat4 转换为 f32 数组（列主序）
+fn mat4_to_vec_dmat4(mat: &DMat4, _unit_converter: &UnitConverter, _is_unit_mesh: bool) -> Vec<f32> {
+    mat.to_cols_array()
+        .iter()
+        .map(|&v| v as f32)
+        .collect()
+}
+
 fn mat4_mul_col_major(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
     let mut out = [0.0f32; 16];
     for i in 0..4 {
@@ -2505,4 +2994,66 @@ fn write_geometry_manifest_parquet(path: PathBuf, manifest: &PrepackGeometryMani
     writer.write(&batch)?;
     writer.close()?;
     Ok(())
+}
+
+// ============================================================================
+// 占位符函数：修复预先缺失的函数
+// ============================================================================
+
+/// 导出指定 dbnos 的 instances.json（按 dbno 分组）
+///
+/// 这是一个占位符函数，用于修复预先缺失的函数定义。
+/// 内部调用 export_dbnum_instances_json 为每个 dbno 导出。
+pub async fn export_instances_json_for_dbnos(
+    dbnos: &[u32],
+    _mesh_dir: &Path,
+    output_dir: &Path,
+    db_option: Arc<DbOption>,
+    _verbose: bool,
+) -> anyhow::Result<()> {
+    for &dbno in dbnos {
+        export_dbnum_instances_json(dbno, output_dir, db_option.clone(), false).await?;
+    }
+    Ok(())
+}
+
+/// 导出指定 refnos 的 instances.json（按 dbno 分组）
+///
+/// 这是一个占位符函数，用于修复预先缺失的函数定义。
+/// 内部调用 export_dbnum_instances_json 为每个 dbno 导出。
+pub async fn export_instances_json_for_refnos_grouped_by_dbno(
+    refnos: &[RefnoEnum],
+    _mesh_dir: &Path,
+    output_dir: &Path,
+    db_option: Arc<DbOption>,
+    _verbose: bool,
+) -> anyhow::Result<()> {
+    // 从 refnos 中提取所有唯一的 dbno
+    use std::collections::HashSet;
+    let mut dbnos: HashSet<u32> = HashSet::new();
+    for refno in refnos {
+        if let Some(dbno) = refno.to_string().split_once('_').and_then(|(db, _)| db.parse::<u32>().ok()) {
+            dbnos.insert(dbno);
+        }
+    }
+
+    // 为每个 dbno 导出
+    for dbno in dbnos {
+        export_dbnum_instances_json(dbno, output_dir, db_option.clone(), false).await?;
+    }
+    Ok(())
+}
+
+/// 导出指定 refnos 的 instances.json（按 dbno 分组，合并追加模式）
+///
+/// 这是一个占位符函数，用于修复预先缺失的函数定义。
+/// 目前与 export_instances_json_for_refnos_grouped_by_dbno 行为相同。
+pub async fn export_instances_json_for_refnos_grouped_by_dbno_merge(
+    refnos: &[RefnoEnum],
+    mesh_dir: &Path,
+    output_dir: &Path,
+    db_option: Arc<DbOption>,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    export_instances_json_for_refnos_grouped_by_dbno(refnos, mesh_dir, output_dir, db_option, verbose).await
 }

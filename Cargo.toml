@@ -22,6 +22,11 @@ name = "test_dblist"
 path = "src/bin/test_dblist.rs"
 
 [[bin]]
+name = "debug_query_insts"
+path = "src/bin/debug_query_insts.rs"
+required-features = ["web_server"]
+
+[[bin]]
 name = "check_collision"
 path = "src/bin/check_collision.rs"
 required-features = ["duckdb-feature"]

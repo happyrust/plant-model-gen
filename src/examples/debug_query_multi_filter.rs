@@ -8,6 +8,7 @@ use aios_core::runtime::init_surreal_with_retry;
 use aios_core::{RefU64, RefnoEnum, get_db_option};
 use aios_database::fast_model::export_model::export_gltf::export_gltf_for_refnos;
 use aios_database::fast_model::mesh_generate::gen_inst_meshes;
+use aios_database::options::MeshFormat;
 use anyhow::{Context, Result, anyhow};
 
 const TARGET_REFNOS: &[&str] = &["21491_18962"];
@@ -62,7 +63,7 @@ async fn generate_mesh_for_lod(
     let profile = precision
         .lod_profiles
         .get(&lod)
-        .copied()
+        .cloned()
         .unwrap_or_else(MeshPrecisionProfile::default);
     precision.lod_profiles.insert(lod, profile);
     precision.default_lod = lod;

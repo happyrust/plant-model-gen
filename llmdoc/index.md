@@ -15,6 +15,7 @@
 ### 📚 指南 (Guides)
 - [模型生成使用指南](guides/model-generation-guide.md) - 配置、API 使用、调试技巧
 - [模型导出指南](guides/export-model-guide.md) - GLB/GLTF/OBJ 等格式导出
+- [房间计算指南](guides/room-compute-guide.md) - CLI 命令与 API 使用
 
 ### 📋 参考 (Reference)
 - [编码约定](reference/coding-conventions.md) - Rust 代码规范、模块组织

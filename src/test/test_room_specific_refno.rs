@@ -19,6 +19,7 @@ mod tests {
         get_db_option,
         init_surreal,
     };
+    use crate::options::DbOptionExt;
     use crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos;
     use anyhow::{Context, Result};
     use parry3d::bounding_volume::{Aabb, BoundingVolume};
@@ -30,6 +31,10 @@ mod tests {
     const TARGET_FRMW: &str = "24381/35269";
     const TARGET_TEE: &str = "24383/73968";
     const TARGET_PANE: &str = "24381/35271";
+
+    // 本次需求：房间/管道
+    const TARGET_ROOM_FRMW_25688_71821: &str = "25688/71821";
+    const TARGET_PIPE_24383_73962: &str = "24383/73962";
 
     struct WorldTransBackup {
         refno: RefnoEnum,
@@ -203,6 +208,75 @@ mod tests {
         counts.first().copied().unwrap_or(0)
     }
 
+    async fn count_room_relate_for_component_in_room(
+        component_refno: RefnoEnum,
+        room_num: &str,
+    ) -> i64 {
+        let room_num_escaped = room_num.replace('\'', "''");
+        let sql = format!(
+            "SELECT VALUE count() FROM room_relate WHERE `out` = {} AND room_num = '{}' GROUP ALL LIMIT 1",
+            component_refno.to_pe_key(),
+            room_num_escaped
+        );
+        let counts: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        counts.first().copied().unwrap_or(0)
+    }
+
+    async fn count_inst_relate_for_refno(refno: RefnoEnum) -> i64 {
+        let sql = format!(
+            "SELECT VALUE count() FROM inst_relate WHERE `in` = {} GROUP ALL LIMIT 1",
+            refno.to_pe_key()
+        );
+        let counts: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        counts.first().copied().unwrap_or(0)
+    }
+
+    async fn fetch_room_num_for_frmw(frmw_refno: RefnoEnum) -> Result<String> {
+        // 与既有测试保持一致：从 NAME 的最后一段解析 room_num
+        let sql = format!(
+            "SELECT VALUE array::last(string::split(NAME, '-')) FROM FRMW WHERE REFNO = {}",
+            frmw_refno.refno().0
+        );
+        let room_nums: Vec<String> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let room_num = room_nums.first().cloned().unwrap_or_default();
+        if room_num.is_empty() {
+            return Err(anyhow::anyhow!("未能从 FRMW.NAME 解析房间号: {}", frmw_refno));
+        }
+        Ok(room_num)
+    }
+
+    async fn gen_models_by_debug_refnos(refnos: &[&str]) -> Result<()> {
+        init_surreal().await.context("初始化 SurrealDB 失败")?;
+
+        // 复用 main.rs 的思路：启用 debug_model，并通过 debug_model_refnos 限定生成范围。
+        aios_core::set_debug_model_enabled(true);
+
+        let base = get_db_option().clone();
+        aios_core::mesh_precision::set_active_precision(base.mesh_precision.clone());
+
+        let mut db_option_ext = DbOptionExt::from(base);
+        db_option_ext.inner.gen_model = true;
+        db_option_ext.inner.gen_mesh = true;
+        // 只生成少量目标 refno 时，强制重新生成更符合“自动生成”预期。
+        db_option_ext.inner.replace_mesh = Some(true);
+        db_option_ext.inner.debug_model_refnos =
+            Some(refnos.iter().map(|s| s.to_string()).collect());
+
+        crate::fast_model::gen_all_geos_data(vec![], &db_option_ext, None, None)
+            .await
+            .context("debug_refno 模式生成模型失败")?;
+
+        // 最小兜底校验：目标 refno 至少应生成 inst_relate。
+        for refno in refnos {
+            let r = RefnoEnum::from_str(refno)
+                .map_err(|_| anyhow::anyhow!("无效的 refno: {}", refno))?;
+            let cnt = count_inst_relate_for_refno(r).await;
+            anyhow::ensure!(cnt > 0, "模型生成后未找到 inst_relate: {}", r);
+        }
+
+        Ok(())
+    }
+
     async fn delete_room_relate_for_panel(panel_refno: RefnoEnum) -> Result<()> {
         let sql = format!("delete room_relate where `in` = {};", panel_refno.to_pe_key());
         SUL_DB.query(&sql).await?;
@@ -358,8 +432,17 @@ mod tests {
 
         // 检查 AABB 相交
         if !frmw_geom_insts.is_empty() && !pipe_geom_insts.is_empty() {
-            let frmw_aabb: Aabb = frmw_geom_insts[0].world_aabb.into();
-            let pipe_aabb: Aabb = pipe_geom_insts[0].world_aabb.into();
+            let Some(frmw_world_aabb) = frmw_geom_insts[0].world_aabb.clone() else {
+                println!("⚠️  FRMW world_aabb 为空，跳过 AABB 相交测试");
+                return Ok(());
+            };
+            let Some(pipe_world_aabb) = pipe_geom_insts[0].world_aabb.clone() else {
+                println!("⚠️  管道 world_aabb 为空，跳过 AABB 相交测试");
+                return Ok(());
+            };
+
+            let frmw_aabb: Aabb = frmw_world_aabb.into();
+            let pipe_aabb: Aabb = pipe_world_aabb.into();
 
             println!("\n📊 AABB 信息:");
             println!("   FRMW AABB: mins={:?}, maxs={:?}", frmw_aabb.mins, frmw_aabb.maxs);
@@ -425,13 +508,21 @@ mod tests {
             return Ok(());
         }
 
-        let panel_aabb: Aabb = panel_insts[0].world_aabb.into();
+        let Some(panel_world_aabb) = panel_insts[0].world_aabb.clone() else {
+            println!("⚠️  面板 world_aabb 为空，无法进行 AABB 相交测试");
+            return Ok(());
+        };
+        let panel_aabb: Aabb = panel_world_aabb.into();
         println!("   面板 AABB: mins={:?}, maxs={:?}", panel_aabb.mins, panel_aabb.maxs);
 
         // 查询管道几何
         let pipe_insts: Vec<GeomInstQuery> = query_insts(&[pipe_refno], true).await.unwrap_or_default();
         if !pipe_insts.is_empty() {
-            let pipe_aabb: Aabb = pipe_insts[0].world_aabb.into();
+            let Some(pipe_world_aabb) = pipe_insts[0].world_aabb.clone() else {
+                println!("⚠️  管道 world_aabb 为空，跳过 AABB 相交测试");
+                return Ok(());
+            };
+            let pipe_aabb: Aabb = pipe_world_aabb.into();
             println!("   管道 AABB: mins={:?}, maxs={:?}", pipe_aabb.mins, pipe_aabb.maxs);
 
             // 检查相交
@@ -623,6 +714,60 @@ mod tests {
             result.affected_rooms, result.updated_elements
         );
         assert!(result.affected_rooms > 0, "未找到受影响房间，无法验证反向更新");
+
+        Ok(())
+    }
+
+    /// 需求：
+    /// 1) 通过 debug_refno 自动生成房间/管道模型（25688/71821, 24383/73962）
+    /// 2) 执行房间计算后，验证管道能拿到所属房间号（room_relate 落库）
+    #[tokio::test]
+    #[ignore = "需要真实数据库连接，手动运行"]
+    async fn test_room_pipe_belongs_after_room_calculation_25688_71821_24383_73962() -> Result<()> {
+        println!("\n🏗️  测试房间/管道模型生成 + 房间计算所属关系验证");
+        println!("{}", "=".repeat(80));
+
+        // Step 1: 自动生成两个目标模型（通过 debug_refno 传递）
+        println!("\n⚙️  Step 1: debug_refno 生成模型...");
+        gen_models_by_debug_refnos(&[TARGET_ROOM_FRMW_25688_71821, TARGET_PIPE_24383_73962])
+            .await?;
+
+        // Step 2: 执行房间计算（按房间号重建）
+        println!("\n🏠 Step 2: 执行房间计算（重建该房间关系）...");
+        let db_option = get_db_option();
+        let frmw_refno = RefnoEnum::from_str(TARGET_ROOM_FRMW_25688_71821)
+            .expect("无效的 FRMW refno");
+        let room_num = fetch_room_num_for_frmw(frmw_refno).await?;
+        println!("🏷️  目标房间号: {}", room_num);
+
+        let start = Instant::now();
+        let stats = crate::fast_model::room_model::rebuild_room_relations_for_rooms(
+            Some(vec![room_num.clone()]),
+            &db_option,
+        )
+        .await
+        .context("房间计算失败")?;
+        println!(
+            "✅ 房间计算完成: rooms={}, panels={}, components={}, 耗时={:?}",
+            stats.total_rooms,
+            stats.total_panels,
+            stats.total_components,
+            start.elapsed()
+        );
+        anyhow::ensure!(stats.total_panels > 0, "该房间未查询到面板，无法验证 belongs");
+
+        // Step 3: 验证管道所属房间（room_relate 落库）
+        println!("\n🔍 Step 3: 验证管道所属房间号...");
+        let pipe_refno = RefnoEnum::from_str(TARGET_PIPE_24383_73962)
+            .expect("无效的管道 refno");
+        let belongs_cnt = count_room_relate_for_component_in_room(pipe_refno, &room_num).await;
+        println!("📊 管道 room_relate(该房间) 记录数: {}", belongs_cnt);
+        anyhow::ensure!(
+            belongs_cnt > 0,
+            "未找到管道 {} 在房间 {} 的 room_relate 记录",
+            pipe_refno,
+            room_num
+        );
 
         Ok(())
     }

@@ -24,7 +24,7 @@ pub struct ExportResponse {
 /// 创建导出模块路由
 pub fn create_export_api_routes() -> Router {
     Router::new()
-        .route("/api/export/parquet", post(handle_export_parquet))
+        // .route("/api/export/parquet", post(handle_export_parquet))
 }
 
 /// 处理 Parquet 导出请求

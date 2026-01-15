@@ -1357,3 +1357,249 @@ pub async fn export_all_parquet_mode(
     println!("\n🎉 导出完成！");
     Ok(())
 }
+
+/// 导出指定 dbnum 的实例数据为简化 JSON 格式（含 AABB）
+pub async fn export_dbnum_instances_json_mode(
+    dbno: u32,
+    verbose: bool,
+    output_override: Option<PathBuf>,
+    db_option_ext: &DbOptionExt,
+) -> Result<()> {
+    use aios_database::fast_model::export_model::export_prepack_lod::export_dbnum_instances_json;
+    use std::sync::Arc;
+
+    println!("\n🎯 导出 dbnum 实例数据为 JSON（含 AABB）");
+    println!("====================================");
+
+    // 连接数据库
+    println!("📡 连接数据库...");
+    init_surreal().await?;
+    println!("✅ 数据库连接成功");
+
+    // 设置输出目录
+    let output_dir = output_override.unwrap_or_else(|| PathBuf::from("output/instances"));
+
+    // 调用导出函数
+    let db_option = Arc::new((**db_option_ext).clone());
+    let stats = export_dbnum_instances_json(
+        dbno,
+        &output_dir,
+        db_option,
+        verbose,
+        None, // 使用默认毫米单位
+    )
+    .await?;
+
+    println!("\n🎉 导出完成！");
+    println!("📊 统计信息:");
+    println!("   - refno_count: {}", stats.refno_count);
+    println!("   - descendant_count: {}", stats.descendant_count);
+    println!("   - output_file_size: {} bytes", stats.output_file_size);
+    println!("   - elapsed_time: {:?}", stats.elapsed_time);
+    Ok(())
+}
+
+/// 导入 instances.json 到 SQLite 空间索引
+#[cfg(feature = "sqlite-index")]
+pub fn import_spatial_index_mode(
+    json_path: &Path,
+    sqlite_path: &Path,
+    verbose: bool,
+) -> Result<()> {
+    use aios_database::sqlite_index::{ImportConfig, SqliteAabbIndex, i64_to_refno_str};
+
+    println!("\n🗃️ 导入 instances.json 到 SQLite 空间索引");
+    println!("==========================================");
+    println!("   - 输入文件: {}", json_path.display());
+    println!("   - 输出文件: {}", sqlite_path.display());
+
+    // 检查输入文件是否存在
+    if !json_path.exists() {
+        return Err(anyhow!("输入文件不存在: {}", json_path.display()));
+    }
+
+    // 确保输出目录存在
+    if let Some(parent) = sqlite_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // 如果 SQLite 文件已存在，先删除
+    if sqlite_path.exists() {
+        if verbose {
+            println!("   ⚠️ 删除已存在的 SQLite 文件");
+        }
+        std::fs::remove_file(sqlite_path)?;
+    }
+
+    // 创建 SQLite 索引
+    let idx = SqliteAabbIndex::open(sqlite_path)?;
+    idx.init_schema()?;
+    println!("   ✅ SQLite 索引创建成功");
+
+    // 导入配置：EQUI 粗粒度，BRAN/HANG 细粒度
+    let config = ImportConfig::default();
+    if verbose {
+        println!("   配置: EQUI 粗粒度={}, BRAN/HANG 细粒度={}",
+                 config.equi_coarse, config.bran_fine);
+    }
+
+    // 执行导入
+    let stats = idx.import_from_instances_json(json_path, &config)?;
+
+    println!("\n🎉 导入完成！");
+    println!("📊 统计信息:");
+    println!("   - EQUI (粗粒度): {}", stats.equi_count);
+    println!("   - Children (细粒度): {}", stats.children_count);
+    println!("   - Tubings (细粒度): {}", stats.tubings_count);
+    println!("   - 总计遍历: {}", stats.total_inserted);
+    println!("   - 去重后唯一记录: {}", stats.unique_count);
+
+    // 验证查询
+    if verbose {
+        let all_aabbs = idx.query_all_aabbs()?;
+        println!("\n🔍 验证查询:");
+        println!("   查询到 {} 条 AABB 记录", all_aabbs.len());
+        if let Some((id, minx, maxx, miny, maxy, minz, maxz)) = all_aabbs.first() {
+            let refno = i64_to_refno_str(*id);
+            println!("   示例: refno={}, AABB=[{:.1},{:.1}]x[{:.1},{:.1}]x[{:.1},{:.1}]",
+                     refno, minx, maxx, miny, maxy, minz, maxz);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(feature = "sqlite-index"))]
+pub fn import_spatial_index_mode(
+    _json_path: &Path,
+    _sqlite_path: &Path,
+    _verbose: bool,
+) -> Result<()> {
+    Err(anyhow!("sqlite-index 特性未启用，请使用 --features sqlite-index 编译"))
+}
+
+// ============ 房间计算 CLI 模式 ============
+
+/// 房间计算配置
+#[derive(Debug, Clone)]
+pub struct RoomComputeCliConfig {
+    /// 房间关键词（可选，为空则使用配置文件中的默认值）
+    pub room_keywords: Option<Vec<String>>,
+    /// 数据库编号列表（可选，为空则处理所有）
+    pub db_nums: Option<Vec<u32>>,
+    /// 是否强制重建
+    pub force_rebuild: bool,
+    /// 是否详细输出
+    pub verbose: bool,
+}
+
+/// 房间计算 CLI 模式
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+pub async fn room_compute_mode(
+    room_keywords: Option<Vec<String>>,
+    db_nums: Option<Vec<u32>>,
+    force_rebuild: bool,
+    verbose: bool,
+    db_option_ext: &DbOptionExt,
+) -> Result<()> {
+    use aios_database::fast_model::{build_room_relations, RoomBuildStats};
+    use std::time::Instant;
+
+    println!("\n🏠 房间计算模式");
+    println!("==========================================");
+
+    let start_time = Instant::now();
+
+    // 获取房间关键词
+    let keywords = room_keywords.unwrap_or_else(|| {
+        db_option_ext.get_room_key_word()
+    });
+    println!("   - 房间关键词: {:?}", keywords);
+
+    if let Some(ref nums) = db_nums {
+        println!("   - 数据库编号: {:?}", nums);
+    } else {
+        println!("   - 数据库编号: 全部");
+    }
+    println!("   - 强制重建: {}", force_rebuild);
+
+    // 初始化数据库连接
+    println!("\n📡 初始化数据库连接...");
+    init_surreal().await?;
+
+    // 执行房间关系构建
+    println!("\n🔄 开始构建房间关系...");
+
+    let stats = build_room_relations(&db_option_ext.inner).await?;
+
+    let duration = start_time.elapsed();
+
+    // 输出结果
+    println!("\n🎉 房间计算完成！");
+    println!("==========================================");
+    println!("📊 统计信息:");
+    println!("   - 处理房间数: {}", stats.total_rooms);
+    println!("   - 处理面板数: {}", stats.total_panels);
+    println!("   - 处理构件数: {}", stats.total_components);
+    println!("   - 构建耗时: {}ms", stats.build_time_ms);
+    println!("   - 缓存命中率: {:.2}%", stats.cache_hit_rate * 100.0);
+    println!("   - 内存使用: {:.2}MB", stats.memory_usage_mb);
+    println!("   - 总耗时: {:.2}s", duration.as_secs_f64());
+
+    Ok(())
+}
+
+/// 房间计算 CLI 模式（无 sqlite-index 特性时的占位实现）
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
+pub async fn room_compute_mode(
+    _room_keywords: Option<Vec<String>>,
+    _db_nums: Option<Vec<u32>>,
+    _force_rebuild: bool,
+    _verbose: bool,
+    _db_option_ext: &DbOptionExt,
+) -> Result<()> {
+    Err(anyhow!(
+        "房间计算需要 sqlite-index 特性，请使用 --features sqlite-index 编译"
+    ))
+}
+
+/// 导出房间实例数据 CLI 模式
+///
+/// 导出房间计算结果为 JSON 格式：
+/// - `room_relations.json`: 房间号 → 构件列表的简单映射
+/// - `room_geometries.json`: 房间 AABB + 面板几何实例
+pub async fn export_room_instances_mode(
+    output_dir: Option<PathBuf>,
+    verbose: bool,
+) -> Result<()> {
+    use aios_database::fast_model::export_model::export_room_instances::export_room_instances;
+
+    println!("\n🏠 导出房间实例数据");
+    println!("====================================");
+
+    // 连接数据库
+    println!("📡 连接数据库...");
+    init_surreal().await?;
+    println!("✅ 数据库连接成功");
+
+    // 设置输出目录
+    let output_path = output_dir.unwrap_or_else(|| PathBuf::from("output/room_instances"));
+
+    println!("📁 输出目录: {}", output_path.display());
+
+    // 调用导出函数
+    let (relations_stats, geometries_stats) = export_room_instances(&output_path, verbose).await?;
+
+    println!("\n🎉 导出完成！");
+    println!("📊 统计信息:");
+    println!("   - room_relations.json:");
+    println!("     - 房间数: {}", relations_stats.total_rooms);
+    println!("     - 构件数: {}", relations_stats.total_components);
+    println!("     - 耗时: {} ms", relations_stats.export_time_ms);
+    println!("   - room_geometries.json:");
+    println!("     - 房间数: {}", geometries_stats.total_rooms);
+    println!("     - 面板数: {}", geometries_stats.total_panels);
+    println!("     - 耗时: {} ms", geometries_stats.export_time_ms);
+
+    Ok(())
+}

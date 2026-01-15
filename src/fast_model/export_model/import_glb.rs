@@ -7,58 +7,9 @@ pub fn import_glb_to_mesh(path: &Path) -> Result<PlantMesh> {
     let (document, buffers, _) = gltf::import(path)
         .with_context(|| format!("Failed to import GLB from {:?}", path))?;
 
-    let mut vertices = Vec::new();
-    let mut normals = Vec::new();
-    let mut indices = Vec::new();
-    // 目前暂不处理 UV，如需要可添加
-    let mut uv = Vec::new();
+    use gltf::Semantic;
 
-    for mesh in document.meshes() {
-        for primitive in mesh.primitives() {
-            let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
-
-            if let Some(iter) = reader.read_positions() {
-                for v in iter {
-                    vertices.push(Vec3::new(v[0], v[1], v[2]));
-                }
-            }
-
-            if let Some(iter) = reader.read_normals() {
-                for v in iter {
-                    normals.push(Vec3::new(v[0], v[1], v[2]));
-                }
-            }
-
-            if let Some(iter) = reader.read_indices() {
-                indices.extend(iter.into_u32());
-            }
-            
-             // 简单的 UV 读取逻辑（如果存在）
-            if let Some(iter) = reader.read_tex_coords(0) {
-                 for v in iter.into_f32() {
-                    uv.push(Vec2::new(v[0], v[1]));
-                }
-            }
-            
-            // 注意：如果多个 primitive，需要处理 vertices 偏移，这里 simplified 假设单个 mesh/primitive 或者直接合并
-            // 如果 glTF indices 是相对于 primitive 0 的，则 merge 时需要 offset indices。
-            // reader.read_indices() return indices relative to current primitive vertices context?
-            // "The indices are relative to the vertices of the current primitive."
-            // So if we merge vertices directly, we MUST update indices by `vertices.len()` offset BEFORE pushing new vertices.
-            // BUT here we interpret one GLB as one PlantMesh.
-            // Our generator produces one primitive per GLB usually. 
-            // If complex GLB, we need careful merging.
-            // Assuming simplified case: 1 primitive or simple appends.
-            // Wait, if I iterate primitives:
-            // P1: V[0..10], I[0..5]
-            // P2: V[0..10], I[0..5]
-            // Output V needs to append P2's V. Output I needs to offset P2's I by P1's V count.
-            
-            // Re-implement correctly:
-        }
-    }
-    
-    // Correct implementation treating multiple primitives
+    // 正确实现：支持多个 primitive，且提前检查 accessor count，避免 gltf crate 在 count=0 时 panic。
     let mut all_vertices = Vec::new();
     let mut all_normals = Vec::new();
     let mut all_indices = Vec::new();
@@ -66,6 +17,20 @@ pub fn import_glb_to_mesh(path: &Path) -> Result<PlantMesh> {
     
     for mesh in document.meshes() {
         for primitive in mesh.primitives() {
+            let Some(pos_accessor) = primitive.get(&Semantic::Positions) else {
+                return Err(anyhow!("GLB 缺少 POSITION accessor: {:?}", path));
+            };
+            if pos_accessor.count() == 0 {
+                return Err(anyhow!("GLB POSITION accessor 为空(count=0): {:?}", path));
+            }
+            if let Some(idx_accessor) = primitive.indices() {
+                if idx_accessor.count() == 0 {
+                    return Err(anyhow!("GLB INDICES accessor 为空(count=0): {:?}", path));
+                }
+            } else {
+                return Err(anyhow!("GLB 缺少 INDICES accessor: {:?}", path));
+            }
+
             let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
             
             let vertex_offset = all_vertices.len() as u32;
@@ -94,6 +59,15 @@ pub fn import_glb_to_mesh(path: &Path) -> Result<PlantMesh> {
                 }
             }
         }
+    }
+
+    if all_vertices.is_empty() || all_indices.is_empty() {
+        return Err(anyhow!(
+            "GLB 解析结果为空：vertices={} indices={} path={:?}",
+            all_vertices.len(),
+            all_indices.len(),
+            path
+        ));
     }
 
     Ok(PlantMesh {

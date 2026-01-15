@@ -2,6 +2,10 @@ use aios_core::options::DbOption;
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
+fn default_true() -> bool {
+    true
+}
+
 /// 生成的网格模型格式
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -25,6 +29,10 @@ impl Default for MeshFormat {
 pub struct DbOptionExt {
     #[serde(flatten)]
     pub inner: DbOption,
+
+    /// 模型生成完成后，是否导出 instances_{dbno}.json（输出到 output/instances/instances_{dbno}.json）
+    #[serde(default = "default_true")]
+    pub export_instances: bool,
 
     /// 预烘 TriMesh(L0) 输出目录（默认 meshes/trimesh_L0）
     #[serde(default)]
@@ -165,6 +173,7 @@ impl From<DbOption> for DbOptionExt {
     fn from(option: DbOption) -> Self {
         Self {
             inner: option,
+            export_instances: true,
             trimesh_l0_dir: None,
             mqtt_server: None,
             mqtt_port: None,
@@ -262,6 +271,13 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // 是否在模型生成完毕后导出 instances.json
+    // 默认 true（不开关也会导出，除非显式设为 false）
+    let export_instances = toml_value
+        .get("export_instances")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
     // 解析输出格式
     let mesh_formats = toml_value
         .get("mesh_formats")
@@ -283,6 +299,7 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
     // 构建 DbOptionExt
     let db_option_ext = DbOptionExt {
         inner: db_option,
+        export_instances,
         trimesh_l0_dir,
         mqtt_server: None,
         mqtt_port: None,

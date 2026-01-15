@@ -7,6 +7,8 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::fs;
 use std::sync::Arc;
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 
@@ -327,7 +329,8 @@ async fn get_visible_insts(
     Path(refno): Path<RefnoEnum>,
     State(_state): State<E3dTreeApiState>,
 ) -> Result<Json<VisibleInstsResponse>, StatusCode> {
-    let refnos = match aios_core::query_deep_visible_inst_refnos(refno).await {
+    // 1) 先拿“深度可见实例”（可能包含无几何的组节点）
+    let mut candidates = match aios_core::query_deep_visible_inst_refnos(refno).await {
         Ok(v) => v,
         Err(e) => {
             return Ok(Json(VisibleInstsResponse {
@@ -336,6 +339,111 @@ async fn get_visible_insts(
                 refnos: vec![],
                 error_message: Some(format!("query_deep_visible_inst_refnos failed: {e}")),
             }));
+        }
+    };
+
+    // 兼容：如果没有子孙可见节点，至少包含自己
+    if candidates.is_empty() {
+        candidates.push(refno);
+    }
+
+    // 2) 优先用 instances_{dbno}.json 做“可加载几何”过滤：与前端实际加载数据保持一致。
+    //    - 这可以避免 query_deep_visible_inst_refnos 返回“组节点/无几何节点”，导致前端 instances 缺失。
+    //    - 若文件不存在，再回退到 inst_relate 的几何实例查询做过滤。
+    fn parse_dbno(r: RefnoEnum) -> Option<u32> {
+        let s = r.to_string();
+        let (dbno, _) = s.split_once('_')?;
+        dbno.parse::<u32>().ok()
+    }
+
+    fn collect_component_refnos(v: &serde_json::Value, out: &mut HashSet<String>) {
+        let Some(obj) = v.as_object() else { return };
+
+        // ungrouped: [{ refno, instances: [...] }, ...]
+        if let Some(arr) = obj.get("ungrouped").and_then(|x| x.as_array()) {
+            for item in arr {
+                if let Some(r) = item.get("refno").and_then(|x| x.as_str()) {
+                    out.insert(r.to_string());
+                }
+            }
+        }
+
+        // bran_groups / equi_groups: [{ refno, children: [{refno,...}, ...], tubings: [{refno,...}, ...] }, ...]
+        for key in ["bran_groups", "equi_groups"] {
+            let Some(arr) = obj.get(key).and_then(|x| x.as_array()) else { continue };
+            for g in arr {
+                if let Some(r) = g.get("refno").and_then(|x| x.as_str()) {
+                    out.insert(r.to_string());
+                }
+                if let Some(children) = g.get("children").and_then(|x| x.as_array()) {
+                    for c in children {
+                        if let Some(r) = c.get("refno").and_then(|x| x.as_str()) {
+                            out.insert(r.to_string());
+                        }
+                    }
+                }
+                if let Some(tubings) = g.get("tubings").and_then(|x| x.as_array()) {
+                    for t in tubings {
+                        if let Some(r) = t.get("refno").and_then(|x| x.as_str()) {
+                            out.insert(r.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let refnos = if let Some(dbno) = parse_dbno(refno) {
+        let instances_path =
+            std::path::Path::new("output").join("instances").join(format!("instances_{dbno}.json"));
+        if let Ok(bytes) = fs::read(&instances_path) {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                let mut available = HashSet::<String>::new();
+                collect_component_refnos(&json, &mut available);
+                let mut out = candidates
+                    .iter()
+                    .copied()
+                    .filter(|r| available.contains(&r.to_string()))
+                    .collect::<Vec<_>>();
+                out.sort();
+                out.dedup();
+                out
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // 如果文件过滤成功拿到结果（或文件存在但无匹配），直接返回；
+    // 如果文件缺失/解析失败导致 refnos 为空，则回退到 inst_relate 几何实例过滤。
+    let refnos = if !refnos.is_empty() {
+        refnos
+    } else {
+        match crate::fast_model::export_model::model_exporter::query_geometry_instances(
+            &candidates,
+            true,  // enable_holes：这里只用于过滤是否存在几何实例
+            false, // verbose
+        )
+        .await
+        {
+            Ok(v) => {
+                let mut out = v.into_iter().map(|q| q.refno).collect::<Vec<_>>();
+                out.sort();
+                out.dedup();
+                out
+            }
+            Err(e) => {
+                return Ok(Json(VisibleInstsResponse {
+                    success: false,
+                    refno,
+                    refnos: vec![],
+                    error_message: Some(format!("query_geometry_instances failed: {e}")),
+                }));
+            }
         }
     };
 

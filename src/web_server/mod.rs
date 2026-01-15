@@ -292,6 +292,11 @@ pub async fn start_web_server_with_config(
             "/api/model/stream-generate",
             post(stream_generate::api_stream_generate),
         )
+        // 流式增量生成模型（GET 版本，便于 EventSource）
+        .route(
+            "/api/model/stream-generate-by-root/{refno}",
+            get(stream_generate::api_stream_generate_by_root),
+        )
         // 获取指定 dbno 的 Parquet 文件列表
         .route(
             "/api/model/{dbno}/files",

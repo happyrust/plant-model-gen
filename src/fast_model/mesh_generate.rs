@@ -125,15 +125,17 @@ async fn query_pending_cata_boolean(
     let filter_booled = if replace_exist {
         String::new()
     } else {
-        String::new()
+        // 非覆盖模式下：跳过已成功写入 inst_relate_cata_bool 的实例，避免重复计算
+        "AND (SELECT status FROM inst_relate_cata_bool WHERE refno = in AND status = 'Success' LIMIT 1) = NONE"
+            .to_string()
     };
 
     let sql = format!(
         r#"SELECT VALUE in
-FROM inst_relate
-WHERE has_cata_neg = true
-  {filter_booled}
-LIMIT {limit};"#,
+	FROM inst_relate
+	WHERE has_cata_neg = true
+	  {filter_booled}
+	LIMIT {limit};"#,
     );
 
     let refnos: Vec<RefnoEnum> = SUL_DB.query_take(&sql, 0).await?;
@@ -195,8 +197,8 @@ async fn query_pending_inst_boolean(
         let remaining = limit - pending.len();
         let sql = format!(
             r#"
-SELECT VALUE refno FROM inst_relate_aabb
-WHERE refno IN [{}]
+SELECT VALUE in FROM inst_relate_aabb
+WHERE in IN [{}]
 {filter_booled}
 LIMIT {remaining};
 "#,
@@ -1219,12 +1221,6 @@ pub async fn update_inst_relate_aabbs_by_refnos(
 ) -> anyhow::Result<()> {
     const CHUNK: usize = 100;
 
-    #[derive(serde::Deserialize, SurrealValue)]
-    struct InstAabbRow {
-        refno: String,
-        aabb: String,
-    }
-
     let aabb_map = DashMap::new();
     let inst_aabb_map = DashMap::new();
 
@@ -1284,78 +1280,21 @@ pub async fn update_inst_relate_aabbs_by_refnos(
     utils::save_aabb_to_surreal(&aabb_map).await;
 
     if inst_aabb_map.is_empty() {
-        // 回退：直接使用 inst_relate 中已有的 aabb 字段写入新表，避免空写入
-        let pe_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
-        if !pe_keys.is_empty() {
-            let sql = format!(
-                "SELECT <string>in AS refno, <string>aabb AS aabb FROM inst_relate WHERE aabb != none AND aabb.d != none AND world_trans.d != none AND in IN [{}]",
-                pe_keys.join(",")
-            );
-
-            match SUL_DB.query_take::<Vec<InstAabbRow>>(&sql, 0).await {
-                Ok(rows) if !rows.is_empty() => {
-                    for row in rows {
-                        let refno = RefnoEnum::from(row.refno.as_str());
-                        inst_aabb_map.insert(refno, row.aabb);
-                    }
-                    utils::save_inst_relate_aabb(&inst_aabb_map, "fallback_inst_relate").await;
-                    println!(
-                        "[aabb] 回退写入 inst_relate_aabb 完成 (来自 inst_relate.aabb)"
-                    );
-                }
-                Ok(_) => {
-                    eprintln!("[aabb] 回退写入时未找到 inst_relate.aabb 数据");
-                }
-                Err(e) => {
-                    init_query_error(
-                        &sql,
-                        &e.to_string(),
-                        &std::panic::Location::caller().to_string(),
-                    );
-                    eprintln!("[aabb] 回退写入 inst_relate_aabb 查询失败: {}", e);
-                }
-            }
-        }
-    } else {
-        // 将实例级 AABB 写入新表
-        utils::save_inst_relate_aabb(&inst_aabb_map, "gen_mesh").await;
-
         println!(
-            "[aabb] inst_relate_aabb 写入 {} 条记录 (replace_exist={})",
-            inst_aabb_map.len(),
+            "[aabb] 未生成任何实例级 AABB（refnos={}，replace_exist={}），跳过 inst_relate_aabb 写入",
+            refnos.len(),
             replace_exist
         );
+        return Ok(());
     }
 
-    // 最终兜底：直接从 inst_relate.aabb 回填到 inst_relate_aabb，确保表不为空
-    if inst_aabb_map.is_empty() {
-        let fallback_query = r#"
-            SELECT <string>in AS refno, <string>aabb AS aabb
-            FROM inst_relate
-            WHERE aabb != none AND aabb.d != none AND world_trans.d != none
-        "#;
-        match SUL_DB.query_take::<Vec<InstAabbRow>>(fallback_query, 0).await {
-            Ok(rows) if !rows.is_empty() => {
-                for row in rows {
-                    let refno = RefnoEnum::from(row.refno.as_str());
-                    inst_aabb_map.insert(refno, row.aabb.clone());
-                }
-                utils::save_inst_relate_aabb(&inst_aabb_map, "fallback_inst_relate").await;
-                println!("[aabb] 全局回填 inst_relate_aabb 完成 (来源: inst_relate.aabb)");
-            }
-            Ok(_) => {
-                eprintln!("[aabb] 回填 inst_relate_aabb 时未找到 inst_relate.aabb 数据");
-            }
-            Err(e) => {
-                init_query_error(
-                    fallback_query,
-                    &e.to_string(),
-                    &std::panic::Location::caller().to_string(),
-                );
-                eprintln!("[aabb] 回填 inst_relate_aabb 查询失败: {}", e);
-            }
-        }
-    }
+    // 将实例级 AABB 写入关系表 inst_relate_aabb（in=pe, out=aabb）
+    utils::save_inst_relate_aabb(&inst_aabb_map, "gen_mesh").await;
+    println!(
+        "[aabb] inst_relate_aabb 写入 {} 条记录 (replace_exist={})",
+        inst_aabb_map.len(),
+        replace_exist
+    );
 
     Ok(())
 }
@@ -1379,7 +1318,7 @@ async fn filter_missing_inst_aabb(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<Re
     }
 
     let sql = format!(
-        "SELECT value refno FROM inst_relate_aabb WHERE refno IN [{}]",
+        "SELECT value in FROM inst_relate_aabb WHERE in IN [{}]",
         pe_keys.join(",")
     );
 

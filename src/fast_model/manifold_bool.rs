@@ -6,7 +6,9 @@
 use crate::fast_model::{debug_model, debug_model_debug};
 use aios_core::SurrealQueryExt;
 use aios_core::csg::manifold::ManifoldRust;
+use aios_core::geometry::csg::{unit_box_mesh, unit_cylinder_mesh, unit_sphere_mesh};
 use aios_core::get_db_option;
+use aios_core::mesh_precision::LodMeshSettings;
 use aios_core::rs_surreal::boolean_query_optimized::query_manifold_boolean_operations_batch_optimized;
 use aios_core::shape::pdms_shape::PlantMesh;
 use aios_core::{
@@ -95,6 +97,36 @@ fn mesh_base_dir() -> PathBuf {
 /// 返回 `anyhow::Result<ManifoldRust>` 表示加载是否成功以及加载的流形数据
 #[inline]
 fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<ManifoldRust> {
+    // 对标准单位几何体（1/2/3）强制使用内置几何生成，避免磁盘上被误写/污染的同名 GLB 影响布尔结果。
+    if matches!(id, "1" | "2" | "3") {
+        debug_model_debug!("load_manifold: 使用内置 unit mesh: id={}", id);
+        let mesh: PlantMesh = match id {
+            "1" => unit_box_mesh(),
+            "2" => unit_cylinder_mesh(&LodMeshSettings::default(), false),
+            "3" => unit_sphere_mesh(),
+            _ => unreachable!(),
+        };
+        let manifold = ManifoldRust::convert_to_manifold(mesh, mat, more_precision);
+        // 复用下面的“空/哨兵”校验逻辑
+        let mesh = manifold.get_mesh();
+        if mesh.indices.is_empty() {
+            return Err(anyhow::anyhow!("单位 Manifold mesh 为空：id={}", id));
+        }
+        if let Some(aabb) = mesh.cal_aabb() {
+            let ext_mag = aabb.extents().magnitude();
+            if ext_mag.is_finite() && ext_mag < 1e-6 {
+                return Err(anyhow::anyhow!(
+                    "单位 Manifold mesh 可能为空（哨兵 cube）：id={} ext_mag={:.3e}",
+                    id,
+                    ext_mag
+                ));
+            }
+        } else {
+            return Err(anyhow::anyhow!("单位 Manifold mesh AABB 无效：id={}", id));
+        }
+        return Ok(manifold);
+    }
+
     let base_dir = mesh_base_dir();
     let mesh_path = build_lod_mesh_path(&base_dir, id);
 
@@ -118,6 +150,27 @@ fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<M
             id,
             mesh_path.display(),
             more_precision
+        ));
+    }
+
+    // 兼容：aios_core 里用一个极小 cube 充当“空 manifold”，这里将其视为加载失败，
+    // 避免后续布尔运算被这个哨兵几何体污染。
+    let mesh = manifold.get_mesh();
+    if let Some(aabb) = mesh.cal_aabb() {
+        let ext_mag = aabb.extents().magnitude();
+        if ext_mag.is_finite() && ext_mag < 1e-6 {
+            return Err(anyhow::anyhow!(
+                "Manifold mesh 可能为空（哨兵 cube）：id={} path={} ext_mag={:.3e}",
+                id,
+                mesh_path.display(),
+                ext_mag
+            ));
+        }
+    } else {
+        return Err(anyhow::anyhow!(
+            "Manifold mesh AABB 无效：id={} path={}",
+            id,
+            mesh_path.display()
         ));
     }
 
@@ -230,23 +283,34 @@ pub async fn apply_cata_neg_boolean_manifold(
         let mut update_sql = String::new();
         for bg in g.boolean_group {
             let Some(pos) = gms.iter().find(|x| x.geom_refno == bg[0]) else {
-                crate::fast_model::utils::save_inst_relate_bool(g.refno, None, "Failed", "cata_bool")
-                    .await;
+                crate::fast_model::utils::save_inst_relate_cata_bool(
+                    g.refno,
+                    None,
+                    "Failed",
+                    "cata_bool",
+                )
+                .await;
                 continue;
             };
 
             debug_model_debug!("加载 catalog 正实体 mesh: {}", pos.id.to_mesh_id());
-            let mut pos_manifold = match load_manifold(
-                &pos.id.to_mesh_id(),
-                pos.trans.0.to_matrix().as_dmat4(),
-                false,
-            ) {
+            let pos_mesh_id = pos.id.to_mesh_id();
+            let mut pos_tf = pos.trans.0.clone();
+            if matches!(pos_mesh_id.as_str(), "1" | "2" | "3") {
+                pos_tf.scale /= aios_core::geometry::csg::UNIT_MESH_SCALE;
+            }
+            let mut pos_manifold = match load_manifold(&pos_mesh_id, pos_tf.to_matrix().as_dmat4(), false) {
                 Ok(m) => m,
                 Err(e) => {
-                    log_load_manifold_failed("cata_pos", g.refno, &pos.id.to_mesh_id(), &e);
+                    log_load_manifold_failed("cata_pos", g.refno, &pos_mesh_id, &e);
                     println!("布尔运算失败: 无法加载正实体 manifold, refno: {}", &g.refno);
-                    crate::fast_model::utils::save_inst_relate_bool(g.refno, None, "Failed", "cata_bool")
-                        .await;
+                    crate::fast_model::utils::save_inst_relate_cata_bool(
+                        g.refno,
+                        None,
+                        "Failed",
+                        "cata_bool",
+                    )
+                    .await;
                     continue;
                 }
             };
@@ -256,16 +320,35 @@ pub async fn apply_cata_neg_boolean_manifold(
                 let Some(neg_geo) = gms.iter().find(|x| x.geom_refno == neg) else {
                     continue;
                 };
-                let m = neg_geo.trans.0.to_matrix().as_dmat4();
-                match load_manifold(&neg_geo.id.to_mesh_id(), m, true) {
+                let neg_mesh_id = neg_geo.id.to_mesh_id();
+                let mut neg_tf = neg_geo.trans.0.clone();
+                if matches!(neg_mesh_id.as_str(), "1" | "2" | "3") {
+                    neg_tf.scale /= aios_core::geometry::csg::UNIT_MESH_SCALE;
+                }
+                match load_manifold(&neg_mesh_id, neg_tf.to_matrix().as_dmat4(), true) {
                     Ok(manifold) => neg_manifolds.push(manifold),
-                    Err(e) => log_load_manifold_failed("cata_neg", g.refno, &neg_geo.id.to_mesh_id(), &e),
+                    Err(e) => log_load_manifold_failed("cata_neg", g.refno, &neg_mesh_id, &e),
                 }
             }
 
             // 即使没有负实体，也标记已处理，避免重复计算
             let mesh_id = g.refno.to_string(); // 使用 Refno 的 to_string() (下划线格式)
-            let final_manifold = pos_manifold.batch_boolean_subtract(&neg_manifolds);
+            let mut final_manifold = pos_manifold.batch_boolean_subtract(&neg_manifolds);
+
+            // 经验：某些模型在默认精度下布尔结果可能退化为 0 三角形，尝试提升精度重算一次。
+            if !neg_manifolds.is_empty() && final_manifold.get_mesh().indices.is_empty() {
+                eprintln!(
+                    "[bool][cata] ⚠️ 布尔结果为空，尝试 more_precision=true 重算: refno={}",
+                    g.refno
+                );
+                if let Ok(pos_hi) = load_manifold(
+                    &pos.id.to_mesh_id(),
+                    pos.trans.0.to_matrix().as_dmat4(),
+                    true,
+                ) {
+                    final_manifold = pos_hi.batch_boolean_subtract(&neg_manifolds);
+                }
+            }
             let target_path = boolean_glb_path(&mesh_id);
             ensure_parent_dir(&target_path)?;
 
@@ -296,9 +379,23 @@ pub async fn apply_cata_neg_boolean_manifold(
                     bg[0],
                 );
                 update_sql.push_str(&hide_original_sql);
+
+                // 写入 catalog 布尔状态（用于 worker 去重与排查）
+                crate::fast_model::utils::save_inst_relate_cata_bool(
+                    g.refno,
+                    Some(&mesh_id),
+                    "Success",
+                    "cata_bool",
+                )
+                .await;
             } else {
-                crate::fast_model::utils::save_inst_relate_bool(g.refno, None, "Failed", "cata_bool")
-                    .await;
+                crate::fast_model::utils::save_inst_relate_cata_bool(
+                    g.refno,
+                    None,
+                    "Failed",
+                    "cata_bool",
+                )
+                .await;
             }
         }
 
@@ -315,6 +412,24 @@ async fn apply_boolean_for_query(
     query: ManiGeoTransQuery,
     replace_exist: bool,
 ) -> anyhow::Result<()> {
+    fn aabb_contains(outer: &parry3d::bounding_volume::Aabb, inner: &parry3d::bounding_volume::Aabb) -> bool {
+        outer.mins.x <= inner.mins.x
+            && outer.mins.y <= inner.mins.y
+            && outer.mins.z <= inner.mins.z
+            && outer.maxs.x >= inner.maxs.x
+            && outer.maxs.y >= inner.maxs.y
+            && outer.maxs.z >= inner.maxs.z
+    }
+
+    fn aabb_intersects(a: &parry3d::bounding_volume::Aabb, b: &parry3d::bounding_volume::Aabb) -> bool {
+        !(a.maxs.x < b.mins.x
+            || a.mins.x > b.maxs.x
+            || a.maxs.y < b.mins.y
+            || a.mins.y > b.maxs.y
+            || a.maxs.z < b.mins.z
+            || a.mins.z > b.maxs.z)
+    }
+
     // 非替换模式下，已有成功记录则跳过
     if !replace_exist {
         let check_sql = format!(
@@ -399,6 +514,9 @@ async fn apply_boolean_for_query(
                 continue;
             }
 
+            let neg_mesh_id = id.to_mesh_id();
+            let is_unit_mesh = matches!(neg_mesh_id.as_str(), "1" | "2" | "3");
+
             // 使用 NegInfo 中的 carrier_world_trans（每个负实体自己的载体世界变换）
             // 而不是 neg_ts 中的 carrier_wt（可能是虚拟的单位矩阵）
             let carrier_world_mat = carrier_world_trans
@@ -409,24 +527,43 @@ async fn apply_boolean_for_query(
             // 计算负实体相对于正实体坐标系的变换矩阵
             // 相对变换 = inverse(正实体世界坐标) × 负实体世界坐标
             // 负实体世界坐标 = carrier_world_mat × geo_local_trans
-            let neg_world_mat = carrier_world_mat * geo_local_trans.0.to_matrix().as_dmat4();
+            // 注意：单位几何体（geo_hash=1/2/3）在当前数据中，scale 字段往往是“实际尺寸(mm)”而非“归一化比例”，
+            // 而 unit_*_mesh 本身的尺寸为 UNIT_MESH_SCALE(=100)。因此需要把 scale 再除以 UNIT_MESH_SCALE 才能得到正确尺寸。
+            let mut geo_tf = geo_local_trans.0;
+            if is_unit_mesh {
+                geo_tf.scale /= aios_core::geometry::csg::UNIT_MESH_SCALE;
+            }
+            let neg_world_mat = carrier_world_mat * geo_tf.to_matrix().as_dmat4();
             let relative_mat = inverse_pos_world * neg_world_mat;
             
             // 调试：打印变换矩阵信息
-            println!("[变换调试] neg_id={}", id.to_mesh_id());
+            println!("[变换调试] neg_id={}", neg_mesh_id);
             println!("  pos_world_trans: {:?}", pos_world_mat.col(3));
             println!("  carrier_world: {:?}", carrier_world_mat.col(3));
             println!("  geo_local: {:?}", geo_local_trans.0.to_matrix().as_dmat4().col(3));
+            println!("  geo_scale: {:?}", geo_local_trans.0.scale);
+            if is_unit_mesh {
+                println!("  geo_scale_eff(unit/100): {:?}", geo_tf.scale);
+            }
+            if let Some(t) = carrier_world_trans.as_ref() {
+                println!("  carrier_scale: {:?}", t.0.scale);
+            }
             println!("  relative: {:?}", relative_mat.col(3));
+            println!(
+                "  relative_basis_len: x={:.6} y={:.6} z={:.6}",
+                relative_mat.col(0).truncate().length(),
+                relative_mat.col(1).truncate().length(),
+                relative_mat.col(2).truncate().length(),
+            );
 
-            debug_model_debug!("加载负实体 mesh: {} (相对于正实体坐标系)", id.to_mesh_id());
+            debug_model_debug!("加载负实体 mesh: {} (相对于正实体坐标系)", neg_mesh_id);
 
-            match load_manifold(&id.to_mesh_id(), relative_mat, true) {
+            match load_manifold(&neg_mesh_id, relative_mat, true) {
                 Ok(manifold) => neg_manifolds.push(manifold),
                 Err(e) => {
                     // 负实体可能数量很大，简单限流，避免刷屏
                     if neg_load_fail_logged < 10 {
-                        log_load_manifold_failed("inst_neg", query.refno, &id.to_mesh_id(), &e);
+                        log_load_manifold_failed("inst_neg", query.refno, &neg_mesh_id, &e);
                         neg_load_fail_logged += 1;
                     }
                 }
@@ -453,7 +590,182 @@ async fn apply_boolean_for_query(
         println!("✅ 导出负实体 OBJ: {}", neg_obj_path);
     }
 
-    let final_manifold = pos_manifold.batch_boolean_subtract(&neg_manifolds);
+    // 逐个减去负实体，并在出现“异常清空”时尽量避免把结果整个抹掉：
+    // - 如果 neg 的 AABB 不与当前结果相交，差集不应改变；若却得到空结果，认为是数值/拓扑异常，跳过该 neg。
+    // - 如果 neg 的 AABB 未包含当前结果 AABB，但差集得到空结果，也认为高度可疑，跳过该 neg。
+    let mut final_manifold = pos_manifold.clone();
+    for (i, neg) in neg_manifolds.iter().enumerate() {
+        let before = final_manifold.clone();
+        let before_aabb = before.get_mesh().cal_aabb();
+        let neg_aabb = neg.get_mesh().cal_aabb();
+
+        // 如果当前结果已经是空的，就没必要继续差集了
+        if before.get_mesh().indices.is_empty() {
+            break;
+        }
+
+        let mut after = before.clone();
+        after.inner = after.inner.difference(&neg.inner);
+
+        if after.get_mesh().indices.is_empty() {
+            match (&before_aabb, &neg_aabb) {
+                (Some(before_aabb), Some(neg_aabb)) => {
+                    let intersects = aabb_intersects(before_aabb, neg_aabb);
+                    let contains = aabb_contains(neg_aabb, before_aabb);
+
+                    // 差集把结果清空只有在 neg 真实覆盖/包含正实体时才合理；否则认为异常并跳过该 neg。
+                    if !intersects || !contains {
+                        eprintln!(
+                            "[bool][inst] ⚠️ 差集结果被异常清空，跳过该负实体: refno={} neg_idx={} intersects={} contains={}",
+                            query.refno, i, intersects, contains
+                        );
+                        final_manifold = before;
+                        continue;
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "[bool][inst] ⚠️ 差集结果被清空且无法计算 AABB，跳过该负实体: refno={} neg_idx={}",
+                        query.refno, i
+                    );
+                    final_manifold = before;
+                    continue;
+                }
+            };
+        }
+
+        final_manifold = after;
+    }
+
+    // 额外兜底：如果逐个 subtract 仍退化为空，尝试先 union 再一次 difference，
+    // 避免多次 difference 引入的数值/拓扑退化。
+    if final_manifold.get_mesh().indices.is_empty() {
+        let pos_aabb = pos_manifold.get_mesh().cal_aabb();
+        let neg_union = ManifoldRust::batch_boolean(
+            &neg_manifolds,
+            aios_core::csg::manifold::ManifoldOpType::Union,
+        );
+        let union_aabb = neg_union.get_mesh().cal_aabb();
+
+        let mut union_diff = pos_manifold.clone();
+        union_diff.inner = union_diff.inner.difference(&neg_union.inner);
+
+        if union_diff.get_mesh().indices.is_empty() {
+            match (&pos_aabb, &union_aabb) {
+                (Some(pos_aabb), Some(union_aabb)) => {
+                    if aabb_contains(union_aabb, pos_aabb) {
+                        final_manifold = union_diff;
+                    } else {
+                        eprintln!(
+                            "[bool][inst] ⚠️ union-diff 清空但 AABB 未包含正体，疑似退化: refno={}",
+                            query.refno
+                        );
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "[bool][inst] ⚠️ union-diff 清空且无法计算 AABB，保留逐个 subtract 的结果: refno={}",
+                        query.refno
+                    );
+                }
+            }
+        } else {
+            final_manifold = union_diff;
+        }
+    }
+
+    // 经验：当差集退化为空时，通常是精度/焊接导致的数值问题；尝试提升正实体加载精度重算一次。
+    if final_manifold.get_mesh().indices.is_empty() {
+        eprintln!(
+            "[bool][inst] ⚠️ 布尔结果为空，尝试 more_precision=true 重算: refno={}",
+            query.refno
+        );
+
+        let mut pos_hi_manifolds = Vec::new();
+        for (pos_id, pos_t) in query.pos_geos.iter() {
+            let pos_mesh_id = pos_id.to_mesh_id();
+            let pos_local_mat = pos_t.0.to_matrix().as_dmat4();
+            if let Ok(m) = load_manifold(&pos_mesh_id, pos_local_mat, true) {
+                pos_hi_manifolds.push(m);
+            }
+        }
+
+        if !pos_hi_manifolds.is_empty() {
+            let pos_hi = ManifoldRust::batch_boolean(
+                &pos_hi_manifolds,
+                aios_core::csg::manifold::ManifoldOpType::Union,
+            );
+            if !pos_hi.get_mesh().indices.is_empty() {
+                // 复用“逐个 subtract + 退化保护 + union-diff 兜底”的逻辑，避免高精度重算时再次退化。
+                let mut hi_final = pos_hi.clone();
+                for (i, neg) in neg_manifolds.iter().enumerate() {
+                    let before = hi_final.clone();
+                    let before_aabb = before.get_mesh().cal_aabb();
+                    let neg_aabb = neg.get_mesh().cal_aabb();
+
+                    if before.get_mesh().indices.is_empty() {
+                        break;
+                    }
+
+                    let mut after = before.clone();
+                    after.inner = after.inner.difference(&neg.inner);
+
+                    if after.get_mesh().indices.is_empty() {
+                        match (&before_aabb, &neg_aabb) {
+                            (Some(before_aabb), Some(neg_aabb)) => {
+                                let intersects = aabb_intersects(before_aabb, neg_aabb);
+                                let contains = aabb_contains(neg_aabb, before_aabb);
+
+                                if !intersects || !contains {
+                                    eprintln!(
+                                        "[bool][inst] ⚠️(hi) 差集结果被异常清空，跳过该负实体: refno={} neg_idx={} intersects={} contains={}",
+                                        query.refno, i, intersects, contains
+                                    );
+                                    hi_final = before;
+                                    continue;
+                                }
+                            }
+                            _ => {
+                                eprintln!(
+                                    "[bool][inst] ⚠️(hi) 差集结果被清空且无法计算 AABB，跳过该负实体: refno={} neg_idx={}",
+                                    query.refno, i
+                                );
+                                hi_final = before;
+                                continue;
+                            }
+                        };
+                    }
+
+                    hi_final = after;
+                }
+
+                if hi_final.get_mesh().indices.is_empty() {
+                    let neg_union = ManifoldRust::batch_boolean(
+                        &neg_manifolds,
+                        aios_core::csg::manifold::ManifoldOpType::Union,
+                    );
+                    let mut union_diff = pos_hi.clone();
+                    union_diff.inner = union_diff.inner.difference(&neg_union.inner);
+                    if !union_diff.get_mesh().indices.is_empty() {
+                        hi_final = union_diff;
+                    }
+                }
+
+                final_manifold = hi_final;
+            }
+        }
+    }
+
+    if final_manifold.get_mesh().indices.is_empty() {
+        println!(
+            "布尔运算失败: 结果为空（三角形=0）, refno: {} (pos_geos={}, neg_geos={})",
+            query.refno,
+            query.pos_geos.len(),
+            neg_manifolds.len()
+        );
+        mark_bool_failed(query.refno).await?;
+        return Ok(());
+    }
 
     // 调试：导出布尔运算结果 OBJ
     let result_obj_path = format!("test_output/debug_{}_result.obj", query.refno);

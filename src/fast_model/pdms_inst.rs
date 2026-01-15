@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::debug_model_debug;
+use crate::fast_model::utils;
 // use crate::fast_model::EXIST_MESH_GEOS;
 
 /// 保存 instance 数据到数据库（事务化批处理版本）
@@ -35,9 +36,14 @@ pub async fn save_instance_data_optimize(
         replace_exist
     );
 
-    const CHUNK_SIZE: usize = 300;
-    const MAX_TX_STATEMENTS: usize = 4;
-    const MAX_CONCURRENT_TX: usize = 6;
+    // 单条 INSERT 里拼接的记录数，过大容易触发 SurrealDB 事务取消/超时；取小一点更稳。
+    const CHUNK_SIZE: usize = 100;
+    // SurrealDB 在高并发/大事务时容易出现 session 丢失、匿名访问等错误；这里优先保证稳定性。
+    const MAX_TX_STATEMENTS: usize = 1;
+    const MAX_CONCURRENT_TX: usize = 1;
+
+    // 统一迁移/修复 inst_relate_aabb 的历史 schema（refno/aabb -> in/out），避免写入时触发类型强制失败
+    utils::ensure_inst_relate_aabb_relation_schema().await;
 
     let mut aabb_map: HashMap<u64, String> = HashMap::new();
     let mut transform_map: HashMap<u64, String> = HashMap::new();
@@ -54,7 +60,12 @@ pub async fn save_instance_data_optimize(
     let mut neg_geo_by_carrier: HashMap<RefnoEnum, Vec<u64>> = HashMap::new();
     let mut cata_cross_neg_geo_map: HashMap<(RefnoEnum, RefnoEnum), Vec<u64>> = HashMap::new();
     if replace_exist {
-        let refnos: Vec<RefnoEnum> = inst_mgr.inst_info_map.keys().copied().collect();
+        // replace 模式下需要确保 inst_info_map + inst_tubi_map 对应的 inst_relate 都被级联删除，
+        // 否则会出现同一 inst_relate ID 已存在但 out 指向不同 inst_info 的冲突（SurrealDB 的 in/out 不可变）。
+        let mut refnos_set: HashSet<RefnoEnum> = HashSet::new();
+        refnos_set.extend(inst_mgr.inst_info_map.keys().copied());
+        refnos_set.extend(inst_mgr.inst_tubi_map.keys().copied());
+        let refnos: Vec<RefnoEnum> = refnos_set.into_iter().collect();
         debug_model_debug!(
             "save_instance_data_optimize deleting existing inst_relate for {} refnos",
             refnos.len()
@@ -344,6 +355,9 @@ pub async fn save_instance_data_optimize(
     let mut inst_info_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
     let mut inst_relate_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
     let mut inst_relate_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+    let mut inst_relate_aabb_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+    let mut inst_relate_aabb_ins: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+    let mut inst_relate_aabb_chunks: Vec<(Vec<String>, Vec<String>)> = Vec::new();
 
     for (key, info) in &inst_mgr.inst_info_map {
         inst_keys.push(*key);
@@ -378,7 +392,7 @@ pub async fn save_instance_data_optimize(
             }
 
             let relate_sql = format!(
-                "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, world_trans: trans:⟨{3}⟩, aabb: aabb:⟨{9}⟩, generic: '{4}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {5}, solid: {6}, owner_refno: {7}, owner_type: '{8}'}}",
+                "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, world_trans: trans:⟨{3}⟩, generic: '{4}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {5}, solid: {6}, owner_refno: {7}, owner_type: '{8}'}}",
                 key.to_inst_relate_key(),
                 key.to_pe_key(),
                 info.id_str(),
@@ -387,9 +401,19 @@ pub async fn save_instance_data_optimize(
                 info.has_cata_neg,
                 info.is_solid,
                 info.owner_refno.to_pe_key(),
-                info.owner_type,
+                info.owner_type
+            );
+
+            // inst_relate_aabb 为关系表：in=pe, out=aabb（只存关系，不存其他字段）
+            // 使用批量 DELETE + INSERT RELATION 做幂等更新
+            let aabb_row_sql = format!(
+                "{{id: {0}, in: {1}, out: aabb:⟨{2}⟩}}",
+                key.to_table_key("inst_relate_aabb"),
+                key.to_pe_key(),
                 aabb_hash
             );
+            inst_relate_aabb_buffer.push(aabb_row_sql);
+            inst_relate_aabb_ins.push(key.to_pe_key());
 
         inst_relate_buffer.push(relate_sql);
         if inst_relate_buffer.len() >= CHUNK_SIZE {
@@ -399,6 +423,14 @@ pub async fn save_instance_data_optimize(
             );
             inst_relate_batcher.push(statement).await?;
             inst_relate_buffer.clear();
+
+            // 延后处理 inst_relate_aabb（必须在 aabb UPSERT 之后写关系，避免 out 侧空记录 d=NONE）
+            if !inst_relate_aabb_buffer.is_empty() {
+                inst_relate_aabb_chunks.push((
+                    std::mem::take(&mut inst_relate_aabb_buffer),
+                    std::mem::take(&mut inst_relate_aabb_ins),
+                ));
+            }
         }
     }
 
@@ -414,6 +446,10 @@ pub async fn save_instance_data_optimize(
         );
     }
 
+    // 注意：inst_relate_aabb(out) 指向 aabb 表的记录。
+    // 若先写关系再写 aabb 内容，SurrealDB 可能会“隐式创建”空的 aabb 记录（d = NONE）。
+    // 这里把 inst_relate_aabb 的写入延后到 aabb UPSERT 之后，保证 out 侧不会出现空记录。
+
     // 为 inst_tubi_map 也创建 inst_relate 记录（BRAN/HANG Tubing 几何体）
     if !inst_mgr.inst_tubi_map.is_empty() {
         debug_model_debug!(
@@ -422,6 +458,8 @@ pub async fn save_instance_data_optimize(
         );
 
         let mut tubi_relate_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+        let mut tubi_aabb_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+        let mut tubi_aabb_ins: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
 
         for (key, info) in &inst_mgr.inst_tubi_map {
             inst_keys.push(*key);
@@ -438,16 +476,9 @@ pub async fn save_instance_data_optimize(
                 entry.insert(serde_json::to_string(&info.world_transform)?);
             }
 
-            let aabb_str = if let Some(aabb) = info.aabb {
-                let aabb_hash = gen_bytes_hash(&aabb);
-                format!("aabb: aabb:⟨{}⟩, ", aabb_hash)
-            } else {
-                "aabb: NONE, ".to_string()
-            };
-
-            // 为 Tubing 创建 inst_relate 记录
+            // 为 Tubing 创建 inst_relate 记录（删除 aabb 字段）
             let relate_sql = format!(
-                "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, world_trans: trans:⟨{3}⟩, {9} generic: '{4}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {5}, solid: {6}, owner_refno: {7}, owner_type: '{8}'}}",
+                "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, world_trans: trans:⟨{3}⟩, generic: '{4}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {5}, solid: {6}, owner_refno: {7}, owner_type: '{8}'}}",
                 key.to_inst_relate_key(),
                 key.to_pe_key(),
                 info.id_str(),
@@ -456,11 +487,27 @@ pub async fn save_instance_data_optimize(
                 info.has_cata_neg,
                 info.is_solid,
                 info.owner_refno.to_pe_key(),
-                info.owner_type,
-                aabb_str
+                info.owner_type
             );
 
             tubi_relate_buffer.push(relate_sql);
+
+                // 如果有 AABB，写入 inst_relate_aabb（普通表：refno/aabb）
+                if let Some(aabb) = info.aabb {
+                    let aabb_hash = gen_bytes_hash(&aabb);
+                    if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
+                        entry.insert(serde_json::to_string(&aabb)?);
+                    }
+                    let aabb_row_sql = format!(
+                        "{{id: {0}, in: {1}, out: aabb:⟨{2}⟩}}",
+                        key.to_table_key("inst_relate_aabb"),
+                        key.to_pe_key(),
+                        aabb_hash
+                    );
+                    tubi_aabb_buffer.push(aabb_row_sql);
+                    tubi_aabb_ins.push(key.to_pe_key());
+            }
+
             if tubi_relate_buffer.len() >= CHUNK_SIZE {
                 let statement = format!(
                     "INSERT RELATION INTO inst_relate [{}];",
@@ -468,6 +515,12 @@ pub async fn save_instance_data_optimize(
                 );
                 inst_relate_batcher.push(statement).await?;
                 tubi_relate_buffer.clear();
+
+                // 延后处理 tubi_aabb（见上方说明：必须在 aabb UPSERT 之后写关系）
+                if !tubi_aabb_buffer.is_empty() {
+                    inst_relate_aabb_buffer.append(&mut tubi_aabb_buffer);
+                    inst_relate_aabb_ins.append(&mut tubi_aabb_ins);
+                }
             }
         }
 
@@ -480,6 +533,16 @@ pub async fn save_instance_data_optimize(
             debug_model_debug!(
                 "save_instance_data_optimize flushing inst_relate from inst_tubi_map: {}",
                 tubi_relate_buffer.len()
+            );
+        }
+
+        // 延后处理剩余的 tubi_aabb（见上方说明：必须在 aabb UPSERT 之后写关系）
+        if !tubi_aabb_buffer.is_empty() {
+            inst_relate_aabb_buffer.append(&mut tubi_aabb_buffer);
+            inst_relate_aabb_ins.append(&mut tubi_aabb_ins);
+            debug_model_debug!(
+                "save_instance_data_optimize queued inst_relate_aabb from inst_tubi_map: {}",
+                inst_relate_aabb_ins.len()
             );
         }
     }
@@ -540,23 +603,66 @@ pub async fn save_instance_data_optimize(
     // aabb
     if !aabb_map.is_empty() {
         let mut aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
-        let mut json_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+        let mut sql_buffer = String::new();
+        let mut buffered = 0usize;
 
         for (&hash, value) in &aabb_map {
-            json_buffer.push(format!("{{'id':aabb:⟨{}⟩, 'd':{}}}", hash, value));
-            if json_buffer.len() >= CHUNK_SIZE {
-                let statement = format!("INSERT IGNORE INTO aabb [{}];", json_buffer.join(","));
-                aabb_batcher.push(statement).await?;
-                json_buffer.clear();
+            // 注意：aabb 记录可能先被 inst_relate_aabb(out) 侧“隐式创建”为一个空记录（d = NONE）。
+            // 这里必须用 UPSERT 覆盖/补齐 d，不能用 INSERT IGNORE。
+            sql_buffer.push_str(&format!("UPSERT aabb:⟨{}⟩ SET d = {};", hash, value));
+            buffered += 1;
+            if buffered >= CHUNK_SIZE {
+                aabb_batcher.push(std::mem::take(&mut sql_buffer)).await?;
+                buffered = 0;
             }
         }
 
-        if !json_buffer.is_empty() {
-            let statement = format!("INSERT IGNORE INTO aabb [{}];", json_buffer.join(","));
-            aabb_batcher.push(statement).await?;
+        if !sql_buffer.is_empty() {
+            aabb_batcher.push(sql_buffer).await?;
         }
 
         aabb_batcher.finish().await?;
+    }
+
+    // inst_relate_aabb（关系表：in=pe, out=aabb），必须在 aabb UPSERT 之后写入，避免 out 侧空记录（d = NONE）
+    if !inst_relate_aabb_chunks.is_empty() || !inst_relate_aabb_buffer.is_empty() {
+        let mut inst_aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
+
+        // 统一把积累的 chunks + 剩余 buffer 一次性落库
+        let mut total = 0usize;
+        macro_rules! flush_pairs {
+            ($rows:expr, $ins:expr) => {{
+                let n = ($ins).len().min(($rows).len());
+                if n > 0 {
+                    for idx in (0..n).step_by(CHUNK_SIZE) {
+                        let end = (idx + CHUNK_SIZE).min(n);
+                        let delete_stmt = format!(
+                            "DELETE inst_relate_aabb WHERE in IN [{}];",
+                            ($ins)[idx..end].join(",")
+                        );
+                        let insert_stmt = format!(
+                            "INSERT RELATION INTO inst_relate_aabb [{}];",
+                            ($rows)[idx..end].join(",")
+                        );
+                        inst_aabb_batcher.push(delete_stmt).await?;
+                        inst_aabb_batcher.push(insert_stmt).await?;
+                    }
+                    total += n;
+                }
+                anyhow::Result::<()>::Ok(())
+            }};
+        }
+
+        for (rows, ins) in &inst_relate_aabb_chunks {
+            flush_pairs!(rows, ins)?;
+        }
+        flush_pairs!(&inst_relate_aabb_buffer, &inst_relate_aabb_ins)?;
+
+        debug_model_debug!(
+            "save_instance_data_optimize flushing inst_relate_aabb after aabb upsert: {}",
+            total
+        );
+        inst_aabb_batcher.finish().await?;
     }
 
     // transform
@@ -652,23 +758,88 @@ impl TransactionBatcher {
         }
 
         let statements = std::mem::take(&mut self.pending);
+        let statements_len = statements.len();
         let query = build_transaction_block(&statements);
         let db = SUL_DB.clone();
         let debug_query = query.clone();
-        // debug_model_debug!(
-        //     "🔍 [DEBUG] TransactionBatcher flushing {} statements:\n{}",
-        //     statements.len(),
-        //     debug_query
-        // );
 
         self.tasks.push(tokio::spawn(async move {
-            match db.query(query).await {
-                Ok(resp) => {
-                    // debug_model_debug!("✅ [DEBUG] TransactionBatcher query executed successfully: {:?}", resp);
-                    Ok(())
+            macro_rules! take_all_results_or_err {
+                ($resp:ident) => {{
+                    // surrealdb::Response 可能在某些语句失败时仍然返回 Ok(resp)，错误会延迟到 take() 时才暴露；
+                    // 这里对每个 statement 做一次 take 以确保事务块里的错误不会被吞掉。
+                    let mut errors: Vec<(usize, String)> = Vec::new();
+                    for idx in 0..(statements_len + 2) {
+                        match $resp.take::<surrealdb::types::Value>(idx) {
+                            Ok(_) => {}
+                            Err(e) => errors.push((idx, e.to_string())),
+                        }
+                    }
+                    if errors.is_empty() {
+                        Ok(())
+                    } else {
+                        let mut msg = String::new();
+                        for (idx, e) in &errors {
+                            msg.push_str(&format!("[{}] {}\n", idx, e));
+                        }
+                        Err(anyhow::anyhow!("transaction block statement errors:\n{msg}"))
+                    }
+                }};
+            }
+
+            match db.query(query.clone()).await {
+                Ok(mut resp) => {
+                    if let Err(e) = take_all_results_or_err!(resp) {
+                        // 某些情况下 inst_relate_aabb 的唯一索引可能“脏”了（表里查不到记录但索引仍占用值），
+                        // 这会导致所有 INSERT 失败并连带回滚同一事务块（inst_relate 也写不进去）。
+                        let es = e.to_string();
+                        let is_inst_relate_aabb_unique_conflict =
+                            es.contains("idx_inst_relate_aabb_refno") && es.contains("already contains");
+
+                        if is_inst_relate_aabb_unique_conflict {
+                            debug_model_debug!(
+                                "⚠️ [DEBUG] 检测到 inst_relate_aabb 唯一索引冲突，尝试重建索引并重试一次..."
+                            );
+                            let repair_sql = "REMOVE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb; \
+DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS in UNIQUE;";
+                            let _ = db.query(repair_sql).await;
+
+                            match db.query(query).await {
+                                Ok(mut resp2) => take_all_results_or_err!(resp2).map_err(|e2| {
+                                    debug_model_debug!(
+                                        "❌ [DEBUG] TransactionBatcher retry failed: {}\n--- transaction block ---\n{}",
+                                        e2,
+                                        debug_query
+                                    );
+                                    e2
+                                }),
+                                Err(err2) => {
+                                    debug_model_debug!(
+                                        "❌ [DEBUG] TransactionBatcher retry query error: {}\n--- transaction block ---\n{}",
+                                        err2,
+                                        debug_query
+                                    );
+                                    Err(anyhow::Error::from(err2))
+                                }
+                            }
+                        } else {
+                            debug_model_debug!(
+                                "❌ [DEBUG] TransactionBatcher statement error: {}\n--- transaction block ---\n{}",
+                                e,
+                                debug_query
+                            );
+                            Err(e)
+                        }
+                    } else {
+                        Ok(())
+                    }
                 }
                 Err(err) => {
-                    debug_model_debug!("❌ [DEBUG] TransactionBatcher query error: {}", err);
+                    debug_model_debug!(
+                        "❌ [DEBUG] TransactionBatcher query error: {}\n--- transaction block ---\n{}",
+                        err,
+                        debug_query
+                    );
                     Err(anyhow::Error::from(err))
                 }
             }

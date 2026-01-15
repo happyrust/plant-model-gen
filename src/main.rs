@@ -11,7 +11,7 @@ extern crate nom;
 
 extern crate strum;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(not(feature = "gui"))]
 mod cli_modes;
@@ -330,6 +330,30 @@ async fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("export-dbnum-instances-json")
+                .long("export-dbnum-instances-json")
+                .help("Export dbnum instances as simplified JSON with AABB data")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("export-room-instances")
+                .long("export-room-instances")
+                .help("Export room calculation results as JSON (room_relations.json + room_geometries.json)")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("import-spatial-index")
+                .long("import-spatial-index")
+                .help("Import instances.json to SQLite spatial index")
+                .value_name("JSON_PATH"),
+        )
+        .arg(
+            Arg::new("spatial-index-output")
+                .long("spatial-index-output")
+                .help("Output path for SQLite spatial index (default: output/spatial_index.sqlite)")
+                .value_name("SQLITE_PATH"),
+        )
+        .arg(
             Arg::new("export-all-lods")
                 .long("export-all-lods")
                 .help("Export all LOD levels (L1, L2, L3). Without this, only L1 is exported")
@@ -353,6 +377,35 @@ async fn main() -> anyhow::Result<()> {
                 .alias("mesh_type")
                 .help("Mesh format to generate (pdmsmesh, glb, obj). Multiple values allowed.")
                 .value_name("TYPE")
+                .value_delimiter(',')
+                .num_args(1..),
+        )
+        // ========== 房间计算命令 ==========
+        .arg(
+            Arg::new("room-compute")
+                .long("room-compute")
+                .help("Run room relation computation (build spatial relationships between rooms and components)")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("room-keywords")
+                .long("room-keywords")
+                .help("Room keywords for filtering (comma-separated, e.g., '-RM,-ROOM')")
+                .value_name("KEYWORDS")
+                .value_delimiter(',')
+                .num_args(1..),
+        )
+        .arg(
+            Arg::new("room-force-rebuild")
+                .long("room-force-rebuild")
+                .help("Force rebuild all room relations (ignore existing data)")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("room-db-nums")
+                .long("room-db-nums")
+                .help("Database numbers to process (comma-separated, e.g., '1112,1113')")
+                .value_name("DB_NUMS")
                 .value_delimiter(',')
                 .num_args(1..),
         )
@@ -892,6 +945,62 @@ async fn main() -> anyhow::Result<()> {
         .await;
     }
 
+    if matches.get_flag("export-dbnum-instances-json") {
+        use crate::cli_modes::export_dbnum_instances_json_mode;
+
+        let dbno = matches.get_one::<u32>("dbno").copied();
+        let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
+
+        // 必须提供 dbno 参数
+        let dbno = match dbno {
+            Some(n) => n,
+            None => {
+                eprintln!("❌ 错误: --export-dbnum-instances-json 需要提供 --dbno 参数");
+                eprintln!("   例如: cargo run -- --export-dbnum-instances-json --dbno 1112");
+                std::process::exit(1);
+            }
+        };
+
+        println!("🎯 导出 dbnum 实例数据为 JSON（含 AABB）");
+        println!("   - 按 dbno={} 过滤", dbno);
+        if let Some(ref dir) = export_bundle_dir {
+            println!("   - 输出目录: {}", dir.display());
+        }
+
+        return export_dbnum_instances_json_mode(
+            dbno,
+            verbose,
+            export_bundle_dir,
+            &db_option_ext,
+        )
+        .await;
+    }
+
+    // 导出房间实例数据
+    if matches.get_flag("export-room-instances") {
+        use crate::cli_modes::export_room_instances_mode;
+
+        let output_dir = matches.get_one::<String>("output").map(PathBuf::from);
+
+        return export_room_instances_mode(output_dir, verbose).await;
+    }
+
+    // 导入 instances.json 到 SQLite 空间索引
+    if let Some(json_path) = matches.get_one::<String>("import-spatial-index") {
+        use crate::cli_modes::import_spatial_index_mode;
+
+        let sqlite_path = matches
+            .get_one::<String>("spatial-index-output")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("output/spatial_index.sqlite"));
+
+        return import_spatial_index_mode(
+            Path::new(json_path),
+            &sqlite_path,
+            verbose,
+        );
+    }
+
     if matches.get_flag("export-all-relates") {
         use crate::cli_modes::export_all_relates_mode;
 
@@ -933,6 +1042,41 @@ async fn main() -> anyhow::Result<()> {
             export_refnos,
             source_unit.to_string(),
             target_unit.to_string(),
+            &db_option_ext,
+        )
+        .await;
+    }
+
+    // ========== 处理 --room-compute 房间计算命令 ==========
+    if matches.get_flag("room-compute") {
+        use crate::cli_modes::room_compute_mode;
+
+        let room_keywords: Option<Vec<String>> = matches
+            .get_many::<String>("room-keywords")
+            .map(|kws| kws.map(|s| s.to_string()).collect());
+
+        let force_rebuild = matches.get_flag("room-force-rebuild");
+
+        let db_nums: Option<Vec<u32>> = matches
+            .get_many::<String>("room-db-nums")
+            .map(|nums| {
+                nums.filter_map(|s| s.parse::<u32>().ok()).collect()
+            });
+
+        println!("🏠 启动房间计算模式");
+        if let Some(ref kws) = room_keywords {
+            println!("   - 房间关键词: {:?}", kws);
+        }
+        if let Some(ref nums) = db_nums {
+            println!("   - 数据库编号: {:?}", nums);
+        }
+        println!("   - 强制重建: {}", force_rebuild);
+
+        return room_compute_mode(
+            room_keywords,
+            db_nums,
+            force_rebuild,
+            verbose,
             &db_option_ext,
         )
         .await;

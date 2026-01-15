@@ -75,20 +75,38 @@ pub async fn cal_equip_nearest_floor() -> anyhow::Result<()> {
     for equip in equips {
         println!("[cal_equip] 处理设备 {}", equip.to_normal_str());
 
-        let sql = format!(
-            r#"
-            (select value array::flatten([
-                (select value type::record('inst_relate_aabb', record::id(in)).aabb.d from <-pe_owner<-pe<-pe_owner<-pe->inst_relate),
-                (select value type::record('inst_relate_aabb', record::id(in)).aabb.d from <-pe_owner<-pe->inst_relate)
-            ]) from {} where array::len(->nearest_relate)=0)[0]
-            "#,
+        // 已经计算过 nearest_relate 的设备直接跳过
+        let has_nearest_sql = format!(
+            "SELECT VALUE array::len(->nearest_relate) FROM {} LIMIT 1",
             equip.to_pe_key()
         );
-        // dbg!(&sql);
-        let mut response = SUL_DB.query(sql).await?;
-        let Ok(raw_values) = response.take::<Vec<JsonValue>>(0) else {
+        let has_nearest: Vec<i64> = SUL_DB.query_take(&has_nearest_sql, 0).await.unwrap_or_default();
+        if has_nearest.first().copied().unwrap_or(0) != 0 {
             continue;
-        };
+        }
+
+        // 使用 children(record link) 的递归查询获取子孙节点（保持与旧实现一致：只取 1..2 层）
+        let mut target_refnos =
+            aios_core::collect_descendant_filter_ids(&[equip], &[], Some("1..2"))
+                .await
+                .unwrap_or_default();
+        target_refnos.retain(|r| *r != equip);
+        if target_refnos.is_empty() {
+            continue;
+        }
+
+        // 批量从 inst_relate 中取对应的 inst_relate_aabb(out) 的 AABB 数据
+        let pe_keys = target_refnos
+            .iter()
+            .map(|r| r.to_pe_key())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT VALUE out.d \
+             FROM inst_relate_aabb \
+             WHERE in IN [{pe_keys}] AND out.d != none"
+        );
+        let raw_values: Vec<JsonValue> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
         let Ok(aabbs) = raw_values
             .into_iter()
             .map(serde_json::from_value)

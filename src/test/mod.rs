@@ -7,6 +7,7 @@
 // mod test_spatial;
 mod test_gen_model;
 mod test_performance;
+mod test_export;
 // mod test_spatial_index_1112; // 暂时注释,需要修复
 // mod test_room_integration; // Removed: uses unavailable aios_core modules
 // mod test_room_v2_verification; // Removed: uses unavailable aios_core modules

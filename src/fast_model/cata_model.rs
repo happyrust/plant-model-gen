@@ -1279,6 +1279,34 @@ async fn gen_cata_geos_inner(
                 refus.len(),
                 exist_refnos.len()
             );
+
+            // 🚀 批量预取所有子元素的 world_transform（并发优化）
+            let t_prefetch = Instant::now();
+            let child_refnos: Vec<RefnoEnum> = children.iter().map(|x| x.refno).collect();
+            let prefetch_transforms: HashMap<RefnoEnum, Transform> = {
+                let mut futures = FuturesUnordered::new();
+                for &refno in &child_refnos {
+                    futures.push(async move {
+                        let trans = aios_core::get_world_transform(refno)
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        (refno, trans)
+                    });
+                }
+                let mut result = HashMap::new();
+                while let Some((refno, trans)) = futures.next().await {
+                    result.insert(refno, trans);
+                }
+                result
+            };
+            debug_model!(
+                "[BRAN_TUBI] 批量预取 world_transform: count={}, elapsed={}ms",
+                prefetch_transforms.len(),
+                t_prefetch.elapsed().as_millis()
+            );
+
             let mut leave_type = "BRAN".to_string();
             let branch_tubi_before: i32 = tubi_count;
             for (index, ele) in children.into_iter().enumerate() {
@@ -1293,8 +1321,10 @@ async fn gen_cata_geos_inner(
                     exclude
                 );
                 {
-                    let world_trans = aios_core::get_world_transform(refno)
-                        .await?
+                    // 从预取缓存中获取 world_transform（无需 await）
+                    let world_trans = prefetch_transforms
+                        .get(&refno)
+                        .cloned()
                         .unwrap_or_default();
                     let raw_axis = exist_al_map.get(&refno).or(local_al_map.get(&refno));
                     if raw_axis.is_none() {

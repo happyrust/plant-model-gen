@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
 use aios_core::shape::pdms_shape::PlantMesh;
-use aios_core::{RefnoEnum, query_insts};
+use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt, query_insts};
 use anyhow::{Context, Result, anyhow};
 use glam::Vec3;
 use serde_json::{Value, json};
@@ -17,6 +18,36 @@ use super::export_common::{ExportData, collect_export_data};
 use super::model_exporter::{
     ExportStats, GlbExportConfig, ModelExporter, collect_export_refnos, query_geometry_instances,
 };
+
+async fn filter_refnos_with_inst_relate_aabb(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
+    if refnos.is_empty() {
+        return Vec::new();
+    }
+
+    // 按约定：inst_relate_aabb 的 id = inst_relate_aabb:⟨refno⟩，因此可以直接用 FROM [ids] 批量取值，
+    // 避免写 `WHERE ... IN [...]` 的过滤查询。
+    let ids = refnos
+        .iter()
+        .map(|r| format!("inst_relate_aabb:⟨{}⟩", r))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // inst_relate_aabb 是关系表：in=pe, out=aabb。这里只取存在记录的 in.id，
+    // 避免后续 query_insts 反序列化 world_aabb = null。
+    let sql = format!("SELECT VALUE in.id FROM [{ids}]");
+
+    let existing: Vec<RefnoEnum> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+    if existing.is_empty() {
+        return Vec::new();
+    }
+
+    let existing_set: HashSet<RefnoEnum> = existing.into_iter().collect();
+    refnos
+        .iter()
+        .copied()
+        .filter(|r| existing_set.contains(r))
+        .collect()
+}
 
 /// 导出指定 refno 的整体 GLB 模型
 pub async fn export_glb_for_refnos(
@@ -92,11 +123,25 @@ pub async fn export_glb_for_refnos(
         return Ok(());
     }
 
-    let geom_insts = query_insts(&all_refnos, true)
+    let filtered_refnos = filter_refnos_with_inst_relate_aabb(&all_refnos).await;
+    let query_refnos = if filtered_refnos.is_empty() {
+        all_refnos.clone()
+    } else {
+        if filtered_refnos.len() != all_refnos.len() {
+            println!(
+                "⚠️  inst_relate_aabb 缺失: {}/{}，将跳过缺失 AABB 的节点以避免导出失败",
+                all_refnos.len() - filtered_refnos.len(),
+                all_refnos.len()
+            );
+        }
+        filtered_refnos
+    };
+
+    let geom_insts = query_insts(&query_refnos, true)
         .await
         .context("查询 inst_relate 数据失败")?;
 
-    let export_data = collect_export_data(geom_insts, &all_refnos, mesh_dir, true, None).await?;
+    let export_data = collect_export_data(geom_insts, &query_refnos, mesh_dir, true, None).await?;
     if export_data.total_instances == 0 {
         println!("⚠️  未找到任何几何体数据");
         return Ok(());

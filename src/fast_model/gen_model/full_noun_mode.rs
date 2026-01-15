@@ -7,11 +7,13 @@ use aios_core::pdms_types::{
 };
 use aios_core::pe::SPdmsElement;
 use aios_core::{DBType, query_mdb_db_nums};
+use aios_core::{RecordId, SUL_DB, SurrealQueryExt};
 use dashmap::DashMap;
 use glam::Vec3;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use super::cate_processor::process_cate_refno_page;
@@ -170,17 +172,31 @@ pub async fn gen_full_noun_geos_optimized(
     for entry in &entry_nouns {
         let noun_upper = entry.to_uppercase();
         let noun_str = noun_upper.as_str();
-        let nouns_slice = [noun_str];
 
-        // 🔥 使用 manual_db_nums 过滤（如果配置了）
-        let mut refnos = aios_core::mdb::query_type_refnos_by_dbnums(&nouns_slice, &dbnums)
-            .await
-            .map_err(|e| {
-                FullNounError::DatabaseError(format!(
-                    "query_type_refnos_by_dbnums({}, dbnums={:?}) failed: {}",
-                    noun_str, dbnums, e
-                ))
-            })?;
+        // 🔥 入口 Noun 查询：直接从 noun 表取 id，并用 meta::id(id) 拆分 dbnum 做过滤。
+        // 说明：SurrealDB 的 record id 形如 BRAN:`24383_73962`，不能用 id[0] 获取 dbnum。
+        let db_filter = if dbnums.is_empty() {
+            "true".to_string()
+        } else {
+            let nums = dbnums
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "type::int(string::split(meta::id(id), '_')[0]) IN [{}]",
+                nums
+            )
+        };
+        let sql = format!("SELECT VALUE id FROM {} WHERE {}", noun_str, db_filter);
+        let record_ids: Vec<RecordId> = SUL_DB.query_take(&sql, 0).await.map_err(|e| {
+            FullNounError::DatabaseError(format!("query noun={} failed: {}", noun_str, e))
+        })?;
+        let mut refnos: Vec<RefnoEnum> = record_ids
+            .into_iter()
+            .map(RefnoEnum::from)
+            .filter(|r| r.is_valid())
+            .collect();
 
         if let Some(limit) = config.debug_limit_per_noun {
             if refnos.len() > limit {
@@ -678,8 +694,26 @@ pub async fn gen_full_noun_geos(
     let (sender, receiver) = flume::unbounded();
     let replace_exist = db_option.inner.is_replace_mesh();
 
+    // Full Noun 生成过程中，部分子任务可能会持有 sender 的 clone，导致 channel 不会自然断开；
+    // 这里用一个 “done + idle timeout” 机制兜底，避免在 insert_handle.await 处永久挂起。
+    let done = Arc::new(AtomicBool::new(false));
+    let done_rx = done.clone();
     let insert_handle = tokio::spawn(async move {
-        while let Ok(shape_insts) = receiver.recv_async().await {
+        loop {
+            let next = if done_rx.load(Ordering::Relaxed) {
+                match tokio::time::timeout(Duration::from_millis(800), receiver.recv_async()).await {
+                    Ok(Ok(v)) => Some(v),
+                    Ok(Err(_)) => return, // channel 断开
+                    Err(_) => None,       // idle timeout：认为发送端已结束但 channel 未断开
+                }
+            } else {
+                match receiver.recv_async().await {
+                    Ok(v) => Some(v),
+                    Err(_) => return,
+                }
+            };
+
+            let Some(shape_insts) = next else { break };
             if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
                 eprintln!("保存实例数据失败: {}", e);
             }
@@ -691,6 +725,7 @@ pub async fn gen_full_noun_geos(
             .await
             .map_err(|e| anyhow::anyhow!("Full Noun 生成失败: {}", e))?;
 
+    done.store(true, Ordering::Relaxed);
     let _ = insert_handle.await;
 
     let cate = categorized.get_by_category(super::models::NounCategory::Cate);

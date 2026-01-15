@@ -111,10 +111,12 @@ DEFINE INDEX idx_owner_refno ON TABLE inst_relate COLUMNS owner_refno;
 DEFINE INDEX idx_owner_type_refno ON TABLE inst_relate COLUMNS owner_type, owner_refno;
 DEFINE INDEX idx_spec_value ON TABLE inst_relate COLUMNS spec_value;
 
--- 实例包围盒表（与 inst_relate 解耦的 AABB 存储）
-DEFINE TABLE inst_relate_aabb SCHEMALESS;
-DEFINE FIELD refno ON TABLE inst_relate_aabb TYPE record<pe>;
-DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb COLUMNS refno UNIQUE;
+-- 实例包围盒关系表（与 inst_relate 解耦的 AABB 存储）
+DEFINE TABLE inst_relate_aabb TYPE RELATION;
+-- 关系表：in = pe, out = aabb（pe 只能对应一条 AABB）
+DEFINE FIELD in ON TABLE inst_relate_aabb TYPE record<pe>;
+DEFINE FIELD out ON TABLE inst_relate_aabb TYPE record<aabb>;
+DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS in UNIQUE;
 
 -- 布尔结果表（实例级布尔状态与结果 mesh）
 DEFINE TABLE inst_relate_bool SCHEMALESS;

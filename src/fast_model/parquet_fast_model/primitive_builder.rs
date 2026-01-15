@@ -129,7 +129,7 @@ impl PrimitiveBuilder {
                 AttributeValue::String(v) => {
                     // 尝试解析 JSON 格式的 Vec3
                     if v.starts_with('[') && v.ends_with(']') {
-                        if let Ok(vec3) = self.parse_vec3_from_json(v) {
+                        if let Ok(vec3) = Self::parse_vec3_from_json(v) {
                             NamedAttrValue::Vec3Type(vec3)
                         } else {
                             NamedAttrValue::StringType(v.clone())
@@ -148,7 +148,7 @@ impl PrimitiveBuilder {
     }
     
     /// 从 JSON 字符串解析 Vec3
-    fn parse_vec3_from_json(&self, s: &str) -> Result<Vec3> {
+    fn parse_vec3_from_json(s: &str) -> Result<Vec3> {
         let json: serde_json::Value = serde_json::from_str(s)?;
         if let Some(arr) = json.as_array() {
             if arr.len() >= 3 {
@@ -191,14 +191,7 @@ mod tests {
     
     #[test]
     fn test_parse_vec3_from_json() {
-        let builder = PrimitiveBuilder {
-            data_source: Arc::new(ParquetDataSource {
-                pe_data: Default::default(),
-                attr_data: Default::default(),
-            })
-        };
-        
-        let vec3 = builder.parse_vec3_from_json("[1.0, 2.0, 3.0]").unwrap();
+        let vec3 = PrimitiveBuilder::parse_vec3_from_json("[1.0, 2.0, 3.0]").unwrap();
         assert_eq!(vec3, Vec3::new(1.0, 2.0, 3.0));
     }
 }

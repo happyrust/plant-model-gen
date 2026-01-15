@@ -26,6 +26,11 @@ name = "check_collision"
 path = "src/bin/check_collision.rs"
 required-features = ["duckdb-feature"]
 
+[[bin]]
+name = "debug_query_insts"
+path = "src/bin/debug_query_insts.rs"
+required-features = ["web_server"]
+
 # [[bin]]
 # name = "gen_xkt_new"
 # path = "src/bin/gen_xkt_new.rs"
@@ -227,6 +232,7 @@ web_server = [
     "dep:jsonwebtoken",
 ] #Web UI功能
 duckdb-feature = ["dep:duckdb"] # DuckDB 模型导出功能
+sqlite-index = ["dep:rusqlite", "dep:tokio-util"] # SQLite RTree 空间索引功能
 debug_e3d = []
 
 [build-dependencies]

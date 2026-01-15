@@ -21,11 +21,11 @@ pub mod manifold_bool;
 pub mod mesh_generate;
 
 pub mod room_model; // 改进版本的房间模型
-#[cfg(all(not(target_arch = "wasm32"), feature = "web_server", feature = "duckdb-feature"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub mod room_worker; // 后台房间计算 Worker
 
 // Re-export room model functions
-#[cfg(all(not(target_arch = "wasm32"), feature = "web_server", feature = "duckdb-feature"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub use room_model::{
     IncrementalUpdateResult, RoomBuildStats, build_room_relations,
     build_room_relations_with_cancel, rebuild_room_relations_for_rooms,
@@ -33,7 +33,7 @@ pub use room_model::{
     update_room_relations_incremental, update_room_relations_incremental_with_cancel,
 };
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "web_server", feature = "duckdb-feature"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub use room_worker::{
     RoomWorker, RoomWorkerConfig, RoomWorkerTask, RoomWorkerTaskStatus, RoomTaskType,
 };

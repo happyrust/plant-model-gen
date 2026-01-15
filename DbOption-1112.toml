@@ -1,7 +1,7 @@
 # 仅用于 dbno=1112 的本地验证配置（同步/导入 + SceneTree 测试）
 
 # 同步文件配置
-total_sync = true
+total_sync = false
 incr_sync = false
 sync_history = false
 enable_log = false

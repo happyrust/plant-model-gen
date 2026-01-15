@@ -4,7 +4,7 @@
 
 use aios_core::{RefU64, RefnoEnum, SUL_DB, SurrealQueryExt};
 use axum::{
-    extract::{Json, State},
+    extract::{Json, Path, Query, State},
     response::sse::{Event, KeepAlive, Sse},
 };
 use futures::stream::{self, Stream, StreamExt};
@@ -46,6 +46,18 @@ pub struct StreamGenerateRequest {
     /// - 不影响基础 inst_relate/geo_relate 的生成
     #[serde(default)]
     pub apply_boolean: bool,
+
+    /// 是否在生成完成后导出 instances_{dbno}.json（默认 false）
+    ///
+    /// - 用于前端按需加载：生成完 mesh 后把实例清单增量写入 output/instances
+    #[serde(default)]
+    pub export_instances: bool,
+
+    /// 导出 instances 时是否“合并追加”到既有 instances_{dbno}.json（默认 true）
+    ///
+    /// - 仅当 export_instances=true 时生效
+    #[serde(default = "default_true")]
+    pub merge_instances: bool,
 }
 
 fn default_true() -> bool {
@@ -84,6 +96,10 @@ pub enum StreamGenerateEvent {
         /// 本批次内已存在数据、无需生成的 refno（可能为空）
         skipped_refnos: Vec<String>,
         progress: f32,
+        completed_count: usize,
+        total_count: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current_refno: Option<String>,
         /// 可选警告（例如布尔运算失败时仍继续推进，以便前端至少能加载基础模型）
         #[serde(skip_serializing_if = "Option::is_none")]
         warning: Option<String>,
@@ -99,6 +115,15 @@ pub enum StreamGenerateEvent {
     Finished {
         total_generated: usize,
         total_skipped: usize,
+        duration_ms: u64,
+    },
+    /// 导出 instances 开始
+    ExportInstancesStarted {
+        message: String,
+    },
+    /// 导出 instances 完成
+    ExportInstancesFinished {
+        dbnos: Vec<u32>,
         duration_ms: u64,
     },
     /// 错误
@@ -432,6 +457,7 @@ pub async fn api_stream_generate(
                             (
                                 req.clone(),
                                 StreamGenerateState::Generating {
+                                    root_refnos: parsed_refnos.clone(),
                                     expanded: expanded_geo,
                                     missing_set,
                                     batch_index: 0,
@@ -445,6 +471,7 @@ pub async fn api_stream_generate(
                 }
 
                 StreamGenerateState::Generating {
+                    root_refnos,
                     expanded,
                     missing_set,
                     batch_index,
@@ -464,7 +491,16 @@ pub async fn api_stream_generate(
                                 total_skipped,
                                 duration_ms: start_time.elapsed().as_millis() as u64,
                             },
-                            (req.clone(), StreamGenerateState::Done),
+                            if req.export_instances {
+                                (
+                                    req.clone(),
+                                    StreamGenerateState::ExportingInstancesStart {
+                                        root_refnos: root_refnos.clone(),
+                                    },
+                                )
+                            } else {
+                                (req.clone(), StreamGenerateState::Done)
+                            },
                         ))
                     } else {
                         let start_idx = batch_index * batch_size;
@@ -501,11 +537,15 @@ pub async fn api_stream_generate(
                                     generated_refnos: Vec::new(),
                                     skipped_refnos,
                                     progress,
+                                    completed_count: end_idx,
+                                    total_count: expanded.len(),
+                                    current_refno: batch_all.last().map(|r| r.to_string()),
                                     warning: None,
                                 },
                                 (
                                     req.clone(),
                                     StreamGenerateState::Generating {
+                                        root_refnos: root_refnos.clone(),
                                         expanded: expanded.clone(),
                                         missing_set: missing_set.clone(),
                                         batch_index: batch_index + 1,
@@ -525,6 +565,25 @@ pub async fn api_stream_generate(
                             .await
                             {
                                 Ok(_) => {
+                                    // 生成 mesh（GLB 强制输出）——保证前端可直接拉取 /files/meshes/lod_L1/{geo_hash}_L1.glb
+                                    let replace_exist = req.force_regenerate || db_option.is_replace_mesh();
+                                    let meshes_dir = db_option.get_meshes_path();
+                                    let precision = Arc::new(db_option.mesh_precision().clone());
+                                    if let Err(e) = crate::fast_model::mesh_generate::gen_inst_meshes(
+                                        &meshes_dir,
+                                        &precision,
+                                        &batch_all,
+                                        replace_exist,
+                                        &[crate::options::MeshFormat::PdmsMesh],
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            "[StreamGenerate] 批次 {} 生成 mesh 失败(继续推进): {}",
+                                            batch_index, e
+                                        );
+                                    }
+
                                     // 可选：执行布尔运算（在本批次生成完成之后、发 BatchComplete 之前）
                                     // 目标选择：batch_all（包含 skipped），这样能为“已有 inst 但缺少 bool 结果”的节点补齐孔洞结果。
                                     let mut warning: Option<String> = None;
@@ -601,11 +660,15 @@ pub async fn api_stream_generate(
                                             generated_refnos,
                                             skipped_refnos,
                                             progress,
+                                            completed_count: end_idx,
+                                            total_count: expanded.len(),
+                                            current_refno: batch_all.last().map(|r| r.to_string()),
                                             warning,
                                         },
                                         (
                                             req.clone(),
                                             StreamGenerateState::Generating {
+                                                root_refnos: root_refnos.clone(),
                                                 expanded: expanded.clone(),
                                                 missing_set: missing_set.clone(),
                                                 batch_index: batch_index + 1,
@@ -629,6 +692,7 @@ pub async fn api_stream_generate(
                                         (
                                             req.clone(),
                                             StreamGenerateState::Generating {
+                                                root_refnos: root_refnos.clone(),
                                                 expanded: expanded.clone(),
                                                 missing_set: missing_set.clone(),
                                                 batch_index: batch_index + 1,
@@ -641,6 +705,72 @@ pub async fn api_stream_generate(
                                 }
                             }
                         }
+                    }
+                }
+
+                StreamGenerateState::ExportingInstancesStart { root_refnos } => {
+                    Some((
+                        StreamGenerateEvent::ExportInstancesStarted {
+                            message: "开始导出并合并 instances_{dbno}.json...".to_string(),
+                        },
+                        (
+                            req.clone(),
+                            StreamGenerateState::ExportingInstancesRun {
+                                root_refnos,
+                                export_start: Instant::now(),
+                            },
+                        ),
+                    ))
+                }
+
+                StreamGenerateState::ExportingInstancesRun {
+                    root_refnos,
+                    export_start,
+                } => {
+                    let db_option = aios_core::get_db_option();
+                    let mesh_dir = db_option.get_meshes_path();
+
+                    let mut dbnos: Vec<u32> = root_refnos
+                        .iter()
+                        .filter_map(|r| r.to_string().split_once('_').and_then(|(db, _)| db.parse::<u32>().ok()))
+                        .collect();
+                    dbnos.sort();
+                    dbnos.dedup();
+
+                    let export_result = if req.merge_instances {
+                        crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_refnos_grouped_by_dbno_merge(
+                            &root_refnos,
+                            &mesh_dir,
+                            std::path::Path::new("output"),
+                            Arc::new(db_option.clone()),
+                            false,
+                        )
+                        .await
+                    } else {
+                        crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_refnos_grouped_by_dbno(
+                            &root_refnos,
+                            &mesh_dir,
+                            std::path::Path::new("output"),
+                            Arc::new(db_option.clone()),
+                            false,
+                        )
+                        .await
+                    };
+
+                    match export_result {
+                        Ok(_) => Some((
+                            StreamGenerateEvent::ExportInstancesFinished {
+                                dbnos,
+                                duration_ms: export_start.elapsed().as_millis() as u64,
+                            },
+                            (req.clone(), StreamGenerateState::Done),
+                        )),
+                        Err(e) => Some((
+                            StreamGenerateEvent::Error {
+                                message: format!("导出 instances 失败: {e}"),
+                            },
+                            (req.clone(), StreamGenerateState::Done),
+                        )),
                     }
                 }
 
@@ -669,6 +799,46 @@ pub async fn api_stream_generate(
     Sse::new(event_stream).keep_alive(KeepAlive::default())
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamGenerateQuery {
+    #[serde(default = "default_true")]
+    pub expand_children: bool,
+    #[serde(default)]
+    pub force_regenerate: bool,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_max_depth")]
+    pub max_depth: u32,
+    #[serde(default)]
+    pub apply_boolean: bool,
+    #[serde(default)]
+    pub export_instances: bool,
+    #[serde(default = "default_true")]
+    pub merge_instances: bool,
+}
+
+/// GET /api/model/stream-generate-by-root/{refno}
+///
+/// 兼容浏览器 `EventSource`（GET-only），用于“选择某节点时按需生成其子孙并合并 instances_{dbno}.json”。
+pub async fn api_stream_generate_by_root(
+    State(state): State<AppState>,
+    Path(refno): Path<String>,
+    Query(q): Query<StreamGenerateQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let req = StreamGenerateRequest {
+        refnos: vec![refno],
+        expand_children: q.expand_children,
+        force_regenerate: q.force_regenerate,
+        batch_size: q.batch_size,
+        max_depth: q.max_depth,
+        apply_boolean: q.apply_boolean,
+        export_instances: q.export_instances,
+        merge_instances: q.merge_instances,
+    };
+    api_stream_generate(State(state), Json(req)).await
+}
+
 /// 流式生成状态机
 enum StreamGenerateState {
     Init,
@@ -676,12 +846,20 @@ enum StreamGenerateState {
         parsed_refnos: Vec<RefnoEnum>,
     },
     Generating {
+        root_refnos: Vec<RefnoEnum>,
         expanded: Vec<RefnoEnum>,
         missing_set: std::collections::HashSet<RefnoEnum>,
         batch_index: usize,
         total_generated: usize,
         total_skipped: usize,
         start_time: Instant,
+    },
+    ExportingInstancesStart {
+        root_refnos: Vec<RefnoEnum>,
+    },
+    ExportingInstancesRun {
+        root_refnos: Vec<RefnoEnum>,
+        export_start: Instant,
     },
     Finishing {
         total_generated: usize,

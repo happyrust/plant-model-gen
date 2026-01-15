@@ -150,7 +150,7 @@ room_keyword = "-RM" # 2016  K-R-K100   (-R-)
 gen_history_model = false
 # debug_model_refnos = ["17496/201375"]
 
-debug_model_refnos = ["24383_73962"]
+debug_model_refnos = ["17496_123113"]
 
 
 # 精度配置（LOD 分级：数字越大，几何更粗，用于远距渲染）

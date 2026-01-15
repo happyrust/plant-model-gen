@@ -167,3 +167,93 @@ let futures: Vec<_> = dbnos.iter().map(|dbno| {
 
 join_all(futures).await;
 ```
+
+## 房间实例导出
+
+房间计算完成后，可以导出房间关系和几何数据为 JSON 格式。
+
+### 命令行导出
+
+```bash
+# 导出房间实例数据（默认输出到 output/room_instances/）
+cargo run --release -- --export-room-instances
+
+# 指定输出目录
+cargo run --release -- --export-room-instances --output ./my_output
+
+# 详细输出
+cargo run --release -- --export-room-instances --verbose
+```
+
+### 输出文件
+
+| 文件 | 内容 |
+|------|------|
+| `room_relations.json` | 房间号 → 构件 refno 列表的简单映射 |
+| `room_geometries.json` | 房间 AABB + 面板几何实例 |
+
+### room_relations.json 格式
+
+```json
+{
+  "version": 1,
+  "generated_at": "2026-01-15T...",
+  "rooms": {
+    "A123": ["17496_170848", "17496_170849"],
+    "B456": ["17496_170850"]
+  }
+}
+```
+
+### room_geometries.json 格式
+
+```json
+{
+  "version": 1,
+  "generated_at": "2026-01-15T...",
+  "rooms": [
+    {
+      "room_num": "A123",
+      "room_refno": "17496_12345",
+      "aabb": { "min": [x, y, z], "max": [x, y, z] },
+      "panels": [
+        {
+          "refno": "17496_170847",
+          "aabb": { "min": [...], "max": [...] },
+          "instances": [
+            { "geo_hash": "...", "geo_transform": [...] }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### API 使用
+
+```rust
+use aios_database::fast_model::export_model::export_room_instances::{
+    export_room_instances,
+    export_room_relations,
+    export_room_geometries,
+};
+
+// 统一导出（同时生成两个文件）
+let (relations_stats, geometries_stats) = export_room_instances(
+    Path::new("output/room_instances"),
+    true, // verbose
+).await?;
+
+// 单独导出关系数据
+let stats = export_room_relations(
+    Path::new("output/room_relations.json"),
+    true,
+).await?;
+
+// 单独导出几何数据
+let stats = export_room_geometries(
+    Path::new("output/room_geometries.json"),
+    true,
+).await?;
+```

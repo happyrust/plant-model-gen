@@ -12,6 +12,10 @@ pub struct SqliteAabbIndex {
 
 #[cfg(feature = "sqlite-index")]
 impl SqliteAabbIndex {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let this = SqliteAabbIndex { path: path.as_ref().to_path_buf() };
         let conn = Connection::open(&this.path)?;
@@ -33,7 +37,8 @@ impl SqliteAabbIndex {
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS items (
-                id INTEGER PRIMARY KEY
+                id INTEGER PRIMARY KEY,
+                noun TEXT
             );
             -- 3D AABB RTree: id, [min_x, max_x], [min_y, max_y], [min_z, max_z]
             CREATE VIRTUAL TABLE IF NOT EXISTS aabb_index USING rtree(
@@ -41,6 +46,8 @@ impl SqliteAabbIndex {
             );
             "#,
         )?;
+        // 兼容旧数据库文件：如果 items 只有 id 列，这条语句会失败；忽略即可。
+        let _ = conn.execute("ALTER TABLE items ADD COLUMN noun TEXT", []);
         Ok(())
     }
 
@@ -49,21 +56,21 @@ impl SqliteAabbIndex {
     where
         I: IntoIterator<Item = (i64, f64, f64, f64, f64, f64, f64)>,
     {
-        let conn = Connection::open(&self.path)?;
+        let mut conn = Connection::open(&self.path)?;
         Self::configure(&conn)?;
         let tx = conn.transaction()?;
-        let mut stmt = tx.prepare(
-            "INSERT OR REPLACE INTO aabb_index \
-             (id, min_x, max_x, min_y, max_y, min_z, max_z) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?;
-        let mut count = 0usize;
-        for (id, minx, maxx, miny, maxy, minz, maxz) in iter {
-            stmt.execute(params![id, minx, maxx, miny, maxy, minz, maxz])?;
-            count += 1;
-        }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO aabb_index \
+                 (id, min_x, max_x, min_y, max_y, min_z, max_z) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for (id, minx, maxx, miny, maxy, minz, maxz) in iter {
+                stmt.execute(params![id, minx, maxx, miny, maxy, minz, maxz])?;
+            }
+        } // stmt 在这里被销毁，释放对 tx 的借用
         tx.commit()?;
-        Ok(count)
+        Ok(1)
     }
 
     // AABB intersection query: returns matching ids.
@@ -129,6 +136,313 @@ impl SqliteAabbIndex {
         }
         Ok(aabbs)
     }
+
+    /// 批量插入 items 表（id, noun）
+    pub fn insert_items<I>(&self, iter: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = (i64, String)>,
+    {
+        let mut conn = Connection::open(&self.path)?;
+        Self::configure(&conn)?;
+        let tx = conn.transaction()?;
+        let mut count = 0;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO items (id, noun) VALUES (?1, ?2)",
+            )?;
+            for (id, noun) in iter {
+                stmt.execute(params![id, noun])?;
+                count += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// 批量插入 AABB 和 items（合并事务）
+    pub fn insert_aabbs_with_items<I>(&self, iter: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = (i64, String, f64, f64, f64, f64, f64, f64)>,
+    {
+        let mut conn = Connection::open(&self.path)?;
+        Self::configure(&conn)?;
+        let tx = conn.transaction()?;
+        let mut count = 0;
+        {
+            let mut aabb_stmt = tx.prepare(
+                "INSERT OR REPLACE INTO aabb_index \
+                 (id, min_x, max_x, min_y, max_y, min_z, max_z) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            let mut item_stmt = tx.prepare(
+                "INSERT OR REPLACE INTO items (id, noun) VALUES (?1, ?2)",
+            )?;
+            for (id, noun, minx, maxx, miny, maxy, minz, maxz) in iter {
+                aabb_stmt.execute(params![id, minx, maxx, miny, maxy, minz, maxz])?;
+                item_stmt.execute(params![id, noun])?;
+                count += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+}
+
+// ============================================================================
+// instances.json 导入功能
+// ============================================================================
+
+/// 从 instances.json 导入空间索引的配置
+#[derive(Debug, Clone)]
+pub struct ImportConfig {
+    /// EQUI 使用粗粒度（Owner AABB）
+    pub equi_coarse: bool,
+    /// BRAN/HANG 使用细粒度（Children + Tubings AABB）
+    pub bran_fine: bool,
+}
+
+impl Default for ImportConfig {
+    fn default() -> Self {
+        Self {
+            equi_coarse: true,
+            bran_fine: true,
+        }
+    }
+}
+
+/// 将 refno 字符串（如 "17496_170764"）转换为 i64
+/// 格式：(dbnum << 32) + refno
+pub fn refno_str_to_i64(refno: &str) -> Option<i64> {
+    let parts: Vec<&str> = refno.split('_').collect();
+    if parts.len() == 2 {
+        let dbnum: u32 = parts[0].parse().ok()?;
+        let refno: u32 = parts[1].parse().ok()?;
+        Some(((dbnum as u64) << 32 | refno as u64) as i64)
+    } else {
+        None
+    }
+}
+
+/// 将 i64 转换回 refno 字符串
+pub fn i64_to_refno_str(id: i64) -> String {
+    let id = id as u64;
+    let dbnum = (id >> 32) as u32;
+    let refno = (id & 0xFFFFFFFF) as u32;
+    format!("{}_{}", dbnum, refno)
+}
+
+#[cfg(feature = "sqlite-index")]
+impl SqliteAabbIndex {
+    /// 从 instances.json 文件导入空间索引
+    pub fn import_from_instances_json(
+        &self,
+        json_path: &Path,
+        config: &ImportConfig,
+    ) -> anyhow::Result<ImportStats> {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        let file = File::open(json_path)
+            .map_err(|e| anyhow::anyhow!("打开文件失败: {}: {}", json_path.display(), e))?;
+        let reader = BufReader::new(file);
+        let json: serde_json::Value = serde_json::from_reader(reader)
+            .map_err(|e| anyhow::anyhow!("解析 JSON 失败: {}", e))?;
+
+        self.import_from_json_value(&json, config)
+    }
+
+    /// 从 JSON Value 导入空间索引
+    pub fn import_from_json_value(
+        &self,
+        json: &serde_json::Value,
+        config: &ImportConfig,
+    ) -> anyhow::Result<ImportStats> {
+        use std::collections::HashMap;
+
+        let mut stats = ImportStats::default();
+
+        let groups = json["groups"].as_array()
+            .ok_or_else(|| anyhow::anyhow!("JSON 缺少 groups 数组"))?;
+
+        // 使用 HashMap 合并同一 refno 的多个 AABB
+        let mut aabb_map: HashMap<i64, (String, f64, f64, f64, f64, f64, f64)> = HashMap::new();
+
+        for group in groups {
+            let owner_noun = group["owner_noun"].as_str().unwrap_or("");
+
+            match owner_noun {
+                "EQUI" if config.equi_coarse => {
+                    // EQUI: 导入 Owner AABB（粗粒度）
+                    if let Some(item) = Self::extract_owner_aabb(group) {
+                        Self::merge_aabb(&mut aabb_map, item);
+                        stats.equi_count += 1;
+                    }
+                }
+                "BRAN" | "HANG" if config.bran_fine => {
+                    // BRAN/HANG: 导入 Children + Tubings AABB（细粒度）
+                    Self::extract_children_aabbs_merged(group, &mut aabb_map, &mut stats);
+                    Self::extract_tubings_aabbs_merged(group, &mut aabb_map, &mut stats);
+                }
+                _ => {}
+            }
+        }
+
+        // 转换为插入格式
+        let aabb_items: Vec<_> = aabb_map.into_iter()
+            .map(|(id, (noun, minx, maxx, miny, maxy, minz, maxz))| {
+                (id, noun, minx, maxx, miny, maxy, minz, maxz)
+            })
+            .collect();
+
+        stats.unique_count = aabb_items.len();
+
+        // 批量插入
+        if !aabb_items.is_empty() {
+            self.insert_aabbs_with_items(aabb_items)?;
+        }
+
+        stats.total_inserted = stats.equi_count + stats.children_count + stats.tubings_count;
+        Ok(stats)
+    }
+
+    /// 合并 AABB 到 map（取并集）
+    fn merge_aabb(
+        map: &mut std::collections::HashMap<i64, (String, f64, f64, f64, f64, f64, f64)>,
+        item: (i64, String, f64, f64, f64, f64, f64, f64),
+    ) {
+        let (id, noun, minx, maxx, miny, maxy, minz, maxz) = item;
+        map.entry(id)
+            .and_modify(|e| {
+                e.1 = e.1.min(minx);  // min_x
+                e.2 = e.2.max(maxx);  // max_x
+                e.3 = e.3.min(miny);  // min_y
+                e.4 = e.4.max(maxy);  // max_y
+                e.5 = e.5.min(minz);  // min_z
+                e.6 = e.6.max(maxz);  // max_z
+            })
+            .or_insert((noun, minx, maxx, miny, maxy, minz, maxz));
+    }
+
+    fn extract_owner_aabb(group: &serde_json::Value) -> Option<(i64, String, f64, f64, f64, f64, f64, f64)> {
+        let refno = group["owner_refno"].as_str()?;
+        let id = refno_str_to_i64(refno)?;
+        let noun = group["owner_noun"].as_str().unwrap_or("").to_string();
+        let aabb = &group["owner_aabb"];
+
+        if aabb.is_null() {
+            return None;
+        }
+
+        let min = aabb["min"].as_array()?;
+        let max = aabb["max"].as_array()?;
+
+        Some((
+            id,
+            noun,
+            min[0].as_f64()?,
+            max[0].as_f64()?,
+            min[1].as_f64()?,
+            max[1].as_f64()?,
+            min[2].as_f64()?,
+            max[2].as_f64()?,
+        ))
+    }
+
+    fn extract_children_aabbs_merged(
+        group: &serde_json::Value,
+        map: &mut std::collections::HashMap<i64, (String, f64, f64, f64, f64, f64, f64)>,
+        stats: &mut ImportStats,
+    ) {
+        if let Some(children) = group["children"].as_array() {
+            for child in children {
+                if let Some(item) = Self::extract_element_aabb(child) {
+                    Self::merge_aabb(map, item);
+                    stats.children_count += 1;
+                }
+            }
+        }
+    }
+
+    fn extract_tubings_aabbs_merged(
+        group: &serde_json::Value,
+        map: &mut std::collections::HashMap<i64, (String, f64, f64, f64, f64, f64, f64)>,
+        stats: &mut ImportStats,
+    ) {
+        if let Some(tubings) = group["tubings"].as_array() {
+            for tubi in tubings {
+                if let Some(item) = Self::extract_element_aabb(tubi) {
+                    Self::merge_aabb(map, item);
+                    stats.tubings_count += 1;
+                }
+            }
+        }
+    }
+
+    fn extract_children_aabbs(
+        group: &serde_json::Value,
+        items: &mut Vec<(i64, String, f64, f64, f64, f64, f64, f64)>,
+        stats: &mut ImportStats,
+    ) {
+        if let Some(children) = group["children"].as_array() {
+            for child in children {
+                if let Some(item) = Self::extract_element_aabb(child) {
+                    items.push(item);
+                    stats.children_count += 1;
+                }
+            }
+        }
+    }
+
+    fn extract_tubings_aabbs(
+        group: &serde_json::Value,
+        items: &mut Vec<(i64, String, f64, f64, f64, f64, f64, f64)>,
+        stats: &mut ImportStats,
+    ) {
+        if let Some(tubings) = group["tubings"].as_array() {
+            for tubi in tubings {
+                if let Some(item) = Self::extract_element_aabb(tubi) {
+                    items.push(item);
+                    stats.tubings_count += 1;
+                }
+            }
+        }
+    }
+
+    fn extract_element_aabb(elem: &serde_json::Value) -> Option<(i64, String, f64, f64, f64, f64, f64, f64)> {
+        let refno = elem["refno"].as_str()?;
+        let id = refno_str_to_i64(refno)?;
+        let noun = elem["noun"].as_str().unwrap_or("").to_string();
+        let aabb = &elem["aabb"];
+
+        if aabb.is_null() {
+            return None;
+        }
+
+        let min = aabb["min"].as_array()?;
+        let max = aabb["max"].as_array()?;
+
+        Some((
+            id,
+            noun,
+            min[0].as_f64()?,
+            max[0].as_f64()?,
+            min[1].as_f64()?,
+            max[1].as_f64()?,
+            min[2].as_f64()?,
+            max[2].as_f64()?,
+        ))
+    }
+}
+
+/// 导入统计
+#[derive(Debug, Default)]
+pub struct ImportStats {
+    pub equi_count: usize,
+    pub children_count: usize,
+    pub tubings_count: usize,
+    pub total_inserted: usize,
+    /// 去重后的唯一记录数
+    pub unique_count: usize,
 }
 
 #[cfg(all(test, feature = "sqlite-index"))]

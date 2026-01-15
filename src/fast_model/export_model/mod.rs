@@ -4,6 +4,7 @@ pub mod export_gltf;
 pub mod export_instanced_bundle;
 pub mod export_obj;
 pub mod export_prepack_lod;
+pub mod export_room_instances;
 pub mod export_unit_mesh_glb;
 pub mod import_glb;
 // pub mod export_xkt;

@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::fast_model::export_model::export_prepack_lod::export_prepack_lod_for_refnos;
+use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_dbnos;
+use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_refnos_grouped_by_dbno;
 use crate::fast_model::unit_converter::LengthUnit;
 
 use aios_core::RefnoEnum;
@@ -29,6 +31,13 @@ use super::config::FullNounConfig;
 use super::errors::{FullNounError, Result};
 use super::full_noun_mode::gen_full_noun_geos_optimized;
 use super::models::NounCategory;
+
+fn parse_dbno_from_refno(refno: RefnoEnum) -> Option<u32> {
+    // RefnoEnum 的 to_string 在项目中通常是 "dbno_sesno" 或 "dbno/sesno"；
+    // 这里做最小兼容解析，只取 dbno。
+    let s = refno.to_string().replace('/', "_");
+    s.split('_').next()?.parse::<u32>().ok()
+}
 
 /// 主入口函数：生成所有几何体数据
 ///
@@ -290,13 +299,13 @@ async fn process_full_noun_mode(
                 );
 
                 // 导出前端模型数据 (db_models_{dbnum}.parquet)
-                let export_path = std::path::Path::new("assets/database_models");
-                if let Err(e) = crate::fast_model::export_model::export_parquet::export_db_models_parquet(
-                    export_path,
-                    None, // 导出所有已生成的 dbnums
-                ).await {
-                    eprintln!("[gen_model] Full Noun 模式导出前端模型 Parquet 失败: {}", e);
-                }
+                // let export_path = std::path::Path::new("assets/database_models");
+                // if let Err(e) = crate::fast_model::export_model::export_parquet::export_db_models_parquet(
+                //     export_path,
+                //     None, // 导出所有已生成的 dbnums
+                // ).await {
+                //     eprintln!("[gen_model] Full Noun 模式导出前端模型 Parquet 失败: {}", e);
+                // }
             }
         }
 
@@ -362,6 +371,33 @@ async fn process_full_noun_mode(
         "[gen_model] gen_all_geos_data 总耗时: {} ms",
         time.elapsed().as_millis()
     );
+
+    // ✅ 模型生成完毕后导出 instances.json（按 dbno）
+    if db_option.export_instances {
+        let mut dbnos: Vec<u32> = if let Some(nums) = db_option.inner.manual_db_nums.clone() {
+            nums
+        } else {
+            aios_core::query_mdb_db_nums(None, aios_core::DBType::DESI).await?
+        };
+        if let Some(exclude_nums) = &db_option.inner.exclude_db_nums {
+            use std::collections::HashSet;
+            let exclude: HashSet<u32> = exclude_nums.iter().copied().collect();
+            dbnos.retain(|dbno| !exclude.contains(dbno));
+        }
+        let mesh_dir =
+            Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes"));
+        if let Err(e) = export_instances_json_for_dbnos(
+            &dbnos,
+            mesh_dir,
+            Path::new("output"),
+            Arc::new(db_option.inner.clone()),
+            true,
+        )
+        .await
+        {
+            eprintln!("[instances] Full Noun 导出失败: {}", e);
+        }
+    }
 
     Ok(true)
 }
@@ -503,10 +539,27 @@ async fn process_targeted_generation(
         // 写入实例 AABB（mesh worker 只更新了 inst_geo.aabb）
         let aabb_start = Instant::now();
         println!("[gen_model] 开始写入 inst_relate_aabb");
+        // 注意：export-glb 等导出会查询“根 + 全部子孙”的 inst 列表；
+        // 仅写根节点会导致子孙节点缺少 inst_relate_aabb，从而 world_aabb 变 null 并反序列化失败。
+        let aabb_refnos = match aios_core::collect_descendant_filter_ids(&target_root_refnos, &[], None).await
+        {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => target_root_refnos.clone(),
+            Err(e) => {
+                eprintln!(
+                    "[gen_model] 查询子孙节点失败，回退仅写根节点 inst_relate_aabb: {}",
+                    e
+                );
+                target_root_refnos.clone()
+            }
+        };
+
         if let Err(e) = crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
-            &target_root_refnos,
+            &aabb_refnos,
             db_option.is_replace_mesh(),
-        ).await {
+        )
+        .await
+        {
             eprintln!("[gen_model] 写入 inst_relate_aabb 失败: {}", e);
         } else {
             println!(
@@ -557,6 +610,23 @@ async fn process_targeted_generation(
         time.elapsed().as_millis()
     );
 
+    // ✅ 模型生成完毕后导出 instances.json（仅导出本次涉及的 dbno）
+    if db_option.export_instances {
+        let mesh_dir =
+            Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes"));
+        if let Err(e) = export_instances_json_for_refnos_grouped_by_dbno(
+            &target_root_refnos,
+            mesh_dir,
+            Path::new("output"),
+            Arc::new(db_option.inner.clone()),
+            true,
+        )
+        .await
+        {
+            eprintln!("[instances] 目标生成导出失败: {}", e);
+        }
+    }
+
     Ok(true)
 }
 
@@ -566,21 +636,18 @@ async fn process_full_database_generation(
     target_sesno: Option<u32>,
     time: Instant,
 ) -> Result<bool> {
-    let dbnos = if db_option.inner.manual_db_nums.is_some() {
-        db_option.inner.manual_db_nums.clone().unwrap()
+    let mut dbnos: Vec<u32> = if let Some(nums) = db_option.inner.manual_db_nums.clone() {
+        nums
     } else {
         aios_core::query_mdb_db_nums(None, aios_core::DBType::DESI).await?
     };
 
     // 过滤掉 exclude_db_nums 中的数据库编号
-    let dbnos = if let Some(exclude_nums) = &db_option.inner.exclude_db_nums {
-        dbnos
-            .into_iter()
-            .filter(|dbno| !exclude_nums.contains(dbno))
-            .collect::<Vec<_>>()
-    } else {
-        dbnos
-    };
+    if let Some(exclude_nums) = &db_option.inner.exclude_db_nums {
+        use std::collections::HashSet;
+        let exclude: HashSet<u32> = exclude_nums.iter().copied().collect();
+        dbnos.retain(|dbno| !exclude.contains(dbno));
+    }
 
     println!(
         "[gen_model] 进入全量生成路径，共 {} 个数据库待处理",
@@ -714,6 +781,23 @@ async fn process_full_database_generation(
         "[gen_model] gen_all_geos_data 完成，总耗时 {} ms",
         time.elapsed().as_millis()
     );
+
+    // ✅ 模型生成完毕后导出 instances.json（按 dbno）
+    if db_option.export_instances {
+        let mesh_dir =
+            Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes"));
+        if let Err(e) = export_instances_json_for_dbnos(
+            &dbnos,
+            mesh_dir,
+            Path::new("output"),
+            Arc::new(db_option.inner.clone()),
+            true,
+        )
+        .await
+        {
+            eprintln!("[instances] 全量生成导出失败: {}", e);
+        }
+    }
 
     Ok(true)
 }

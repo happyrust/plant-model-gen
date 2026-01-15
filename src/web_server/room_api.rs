@@ -1628,6 +1628,8 @@ pub fn create_room_api_routes() -> Router<RoomApiState> {
             "/api/room/rebuild-relations",
             post(rebuild_room_relations_only),
         )
+        // 同步房间计算（直接执行，等待完成）
+        .route("/api/room/compute", post(compute_room_relations_sync))
         // 系统管理
         .route("/api/room/status", get(get_room_system_status))
         .route("/api/room/snapshot", post(create_data_snapshot))
@@ -1663,4 +1665,86 @@ pub async fn get_worker_status(
         "queue_len": queue_len,
         "is_busy": active_count > 0,
     })))
+}
+
+/// 同步执行房间计算（直接执行，等待完成后返回结果）
+///
+/// POST /api/room/compute
+///
+/// 请求体:
+/// ```json
+/// {
+///   "room_keywords": ["-RM", "-ROOM"],  // 可选
+///   "db_nums": [1112, 1113],            // 可选
+///   "force_rebuild": false              // 可选，默认 false
+/// }
+/// ```
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+pub async fn compute_room_relations_sync(
+    Json(request): Json<crate::web_server::models::RoomComputeSyncRequest>,
+) -> Result<Json<crate::web_server::models::RoomComputeSyncResponse>, StatusCode> {
+    use crate::fast_model::build_room_relations;
+
+    info!("🏠 收到同步房间计算请求");
+    if let Some(ref kws) = request.room_keywords {
+        info!("   - 房间关键词: {:?}", kws);
+    }
+    if let Some(ref nums) = request.db_nums {
+        info!("   - 数据库编号: {:?}", nums);
+    }
+    info!("   - 强制重建: {}", request.force_rebuild);
+
+    let db_option = aios_core::get_db_option();
+
+    // 执行房间关系构建
+    match build_room_relations(&db_option).await {
+        Ok(stats) => {
+            info!(
+                "✅ 房间计算完成: {} 房间, {} 面板, {} 构件, 耗时 {}ms",
+                stats.total_rooms, stats.total_panels,
+                stats.total_components, stats.build_time_ms
+            );
+
+            Ok(Json(crate::web_server::models::RoomComputeSyncResponse {
+                success: true,
+                message: format!(
+                    "房间计算完成，处理了 {} 个房间",
+                    stats.total_rooms
+                ),
+                total_rooms: stats.total_rooms,
+                total_panels: stats.total_panels,
+                total_components: stats.total_components,
+                build_time_ms: stats.build_time_ms,
+                cache_hit_rate: stats.cache_hit_rate,
+            }))
+        }
+        Err(e) => {
+            error!("❌ 房间计算失败: {}", e);
+            Ok(Json(crate::web_server::models::RoomComputeSyncResponse {
+                success: false,
+                message: format!("房间计算失败: {}", e),
+                total_rooms: 0,
+                total_panels: 0,
+                total_components: 0,
+                build_time_ms: 0,
+                cache_hit_rate: 0.0,
+            }))
+        }
+    }
+}
+
+/// 同步执行房间计算（无 sqlite-index 特性时的占位实现）
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
+pub async fn compute_room_relations_sync(
+    Json(_request): Json<crate::web_server::models::RoomComputeSyncRequest>,
+) -> Result<Json<crate::web_server::models::RoomComputeSyncResponse>, StatusCode> {
+    Ok(Json(crate::web_server::models::RoomComputeSyncResponse {
+        success: false,
+        message: "房间计算需要 sqlite-index 特性支持".to_string(),
+        total_rooms: 0,
+        total_panels: 0,
+        total_components: 0,
+        build_time_ms: 0,
+        cache_hit_rate: 0.0,
+    }))
 }

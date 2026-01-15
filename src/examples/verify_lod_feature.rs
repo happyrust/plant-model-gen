@@ -16,10 +16,13 @@ fn main() -> anyhow::Result<()> {
     // 直接解析 precision 部分
     let toml_value: toml::Value = toml::from_str(&config_content)?;
     let precision: MeshPrecisionSettings =
-        if let Some(precision_table) = toml_value.get("precision") {
+        if let Some(precision_table) = toml_value
+            .get("mesh_precision")
+            .or_else(|| toml_value.get("precision"))
+        {
             toml::from_str(&toml::to_string(precision_table)?)?
         } else {
-            println!("❌ 配置文件中未找到 [precision] 部分");
+            println!("❌ 配置文件中未找到 [mesh_precision]（或旧版 [precision]）部分");
             return Ok(());
         };
 
@@ -34,17 +37,8 @@ fn main() -> anyhow::Result<()> {
     for lod in &lod_levels {
         if let Some(profile) = precision.lod_profiles.get(lod) {
             println!("✅ LOD {:?} 配置:", lod);
-            println!("   - occ_linear_coeff: {}", profile.occ_linear_coeff);
-            println!("   - occ_linear_min: {}", profile.occ_linear_min);
-            println!("   - occ_linear_max: {}", profile.occ_linear_max);
-            println!("   - neg_multiplier: {}", profile.neg_multiplier);
-            println!("   - sweep_multiplier: {}", profile.sweep_multiplier);
-            if let Some(tol) = profile.polyhedron_fixed_tol {
-                println!("   - polyhedron_fixed_tol: {}", tol);
-            }
-            println!("   - sphere_subdiv: {}", profile.sphere_subdiv);
-            println!("   - radial_segments: {}", profile.radial_segments);
-            println!("   - mesh_tol_ratio: {}", profile.mesh_tol_ratio);
+            println!("   - output_subdir: {:?}", profile.output_subdir);
+            println!("   - csg_settings: {:?}", profile.csg_settings);
             println!();
         } else {
             println!("❌ LOD {:?} 未配置", lod);
@@ -60,41 +54,13 @@ fn main() -> anyhow::Result<()> {
     let l3_profile = precision.lod_profiles.get(&LodLevel::L3);
 
     if let (Some(l1), Some(l2), Some(l3)) = (l1_profile, l2_profile, l3_profile) {
-        // 容差系数应该递减（精度递增）
-        let coeff_ok =
-            l1.occ_linear_coeff > l2.occ_linear_coeff && l2.occ_linear_coeff > l3.occ_linear_coeff;
+        // 当前精度配置已演进为以 csg_settings 为主，示例程序仅做存在性/可读性验证。
+        let ok = !format!("{:?}", l1.csg_settings).is_empty()
+            && !format!("{:?}", l2.csg_settings).is_empty()
+            && !format!("{:?}", l3.csg_settings).is_empty();
         println!(
-            "   容差系数递减 (L1 > L2 > L3): {} ({} > {} > {})",
-            if coeff_ok { "✅" } else { "❌" },
-            l1.occ_linear_coeff,
-            l2.occ_linear_coeff,
-            l3.occ_linear_coeff
-        );
-
-        // 球体细分应该递增
-        let s1 = l1.sphere_subdiv;
-        let s2 = l2.sphere_subdiv;
-        let s3 = l3.sphere_subdiv;
-        let subdiv_ok = s1 < s2 && s2 < s3;
-        println!(
-            "   球体细分递增 (L1 < L2 < L3): {} ({} < {} < {})",
-            if subdiv_ok { "✅" } else { "❌" },
-            s1,
-            s2,
-            s3
-        );
-
-        // 径向分段应该递增
-        let r1 = l1.radial_segments;
-        let r2 = l2.radial_segments;
-        let r3 = l3.radial_segments;
-        let radial_ok = r1 < r2 && r2 < r3;
-        println!(
-            "   径向分段递增 (L1 < L2 < L3): {} ({} < {} < {})",
-            if radial_ok { "✅" } else { "❌" },
-            r1,
-            r2,
-            r3
+            "   csg_settings 已配置 (L1/L2/L3): {}",
+            if ok { "✅" } else { "❌" }
         );
     } else {
         println!("   ❌ 缺少必要的 LOD 配置");

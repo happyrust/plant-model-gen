@@ -1526,3 +1526,36 @@ pub struct RoomComputeResponse {
     /// 提示信息
     pub message: String,
 }
+
+/// 同步房间计算请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomComputeSyncRequest {
+    /// 房间关键词（可选，为空则使用配置文件默认值）
+    #[serde(default)]
+    pub room_keywords: Option<Vec<String>>,
+    /// 数据库编号列表（可选，为空则处理所有）
+    #[serde(default)]
+    pub db_nums: Option<Vec<u32>>,
+    /// 是否强制重建（默认 false）
+    #[serde(default)]
+    pub force_rebuild: bool,
+}
+
+/// 同步房间计算响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomComputeSyncResponse {
+    /// 是否成功
+    pub success: bool,
+    /// 提示信息
+    pub message: String,
+    /// 处理房间数
+    pub total_rooms: usize,
+    /// 处理面板数
+    pub total_panels: usize,
+    /// 处理构件数
+    pub total_components: usize,
+    /// 构建耗时（毫秒）
+    pub build_time_ms: u64,
+    /// 缓存命中率
+    pub cache_hit_rate: f32,
+}

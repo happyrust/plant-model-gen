@@ -13,14 +13,14 @@ use crate::fast_model::cal_model::{update_cal_bran_component, update_cal_equip};
 #[cfg(feature = "gen_model")]
 use crate::fast_model::gen_all_geos_data;
 
-// build_room_relations 支持 sqlite-index 特性
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+// build_room_relations 支持 web_server + (sqlite-index 或 duckdb-feature)
+#[cfg(all(not(target_arch = "wasm32"), feature = "web_server", any(feature = "sqlite-index", feature = "duckdb-feature")))]
 use crate::fast_model::room_model::build_room_relations;
 
 // 当条件不满足时提供 stub
-#[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "web_server", any(feature = "sqlite-index", feature = "duckdb-feature"))))]
 pub async fn build_room_relations(_db_option: &aios_core::options::DbOption) -> anyhow::Result<()> {
-    println!("⚠️ build_room_relations 功能需要 sqlite-index 特性");
+    log::info!("⚠️ build_room_relations 功能需要 web_server + (sqlite-index 或 duckdb-feature) 特性");
     Ok(())
 }
 use crate::fast_model::{
@@ -104,8 +104,6 @@ pub mod shared; // 共享模块（进度广播中心等）
 // #[cfg(feature = "grpc")]
 // pub mod grpc_service;
 #[cfg(feature = "sqlite-index")]
-pub mod sqlite_index;
-#[cfg(feature = "sqlite-index")]
 pub mod spatial_index;
 
 
@@ -157,17 +155,17 @@ extern crate nom;
 //         || db_option.only_sync_sys
 //         || db_option.is_sync_history()
 //     {
-//         // println!("开始同步解析数据。");
+//         // log::info!("开始同步解析数据。");
 //         // tokio::spawn(async move {
 //         if let Err(e) = sync_pdms(&db_option).await {
-//             eprintln!("同步PDMS数据失败: {}", e);
+//             log::error!("同步PDMS数据失败: {}", e);
 //         }
 //         //记录进度
 //         progress_sender.send(50.0).await?;
 //     }
 
 //     if db_option.build_cate_relate() {
-//         println!("初始化创建Cate relate关系");
+//         log::info!("初始化创建Cate relate关系");
 //         build_cate_relate(false).await?;
 //     }
 //     Ok(())
@@ -178,46 +176,20 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
     // 为了兼容性，创建对 inner 的引用
     let db_option = &db_option_ext.inner;
 
-    // 如果启用了日志功能
-    if db_option.enable_log {
-        let now = Local::now();
-        let filename = format!(
-            "{}-{}-{}-{}-{}-{}_dblog.txt",
-            now.year(),
-            now.month(),
-            now.day(),
-            now.hour(),
-            now.minute(),
-            now.second()
-        );
-
-        // 创建日志文件
-        let file = File::create(filename).unwrap();
-
-        CombinedLogger::init(vec![
-            TermLogger::new(
-                LevelFilter::Warn,
-                Config::default(),
-                TerminalMode::Mixed,
-                ColorChoice::Auto,
-            ),
-            WriteLogger::new(LevelFilter::Info, Config::default(), file),
-        ])
-        .unwrap();
-    }
+    // 注意：日志初始化已移至 run_app_internal，避免重复初始化
 
     // 解析完成后重新定义EVENT
     // 注意：define_common_functions 已经在 initialize_databases 中调用
-    println!("正在重新定义dbnum_event...");
+    log::info!("正在重新定义dbnum_event...");
     match define_dbnum_event().await {
-        Ok(_) => println!("成功重新定义update_dbnum_event"),
-        Err(e) => println!("重新定义update_dbnum_event失败: {:?}", e),
+        Ok(_) => log::info!("成功重新定义update_dbnum_event"),
+        Err(e) => log::warn!("重新定义update_dbnum_event失败: {:?}", e),
     }
-    println!("预加载方法完成。");
+    log::info!("预加载方法完成。");
 
     // 初始化数据库索引
     if let Err(e) = init_inst_relate_indices().await {
-        eprintln!("初始化inst_relate索引失败: {}", e);
+        log::error!("初始化inst_relate索引失败: {}", e);
     }
 
     let sync_live = db_option.sync_live.unwrap_or(false);
@@ -231,15 +203,15 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
         || db_option.only_sync_sys
         || db_option.is_sync_history()
     {
-        // println!("开始同步解析数据。");
+        // log::info!("开始同步解析数据。");
         // tokio::spawn(async move {
         if let Err(e) = sync_pdms(&db_option).await {
-            eprintln!("同步PDMS数据失败: {}", e);
+            log::error!("同步PDMS数据失败: {}", e);
         }
         //记录进度
         // progress_sender.send(90)?;
         if db_option.build_cate_relate() {
-            println!("初始化创建Cate relate关系");
+            log::info!("初始化创建Cate relate关系");
             build_cate_relate(false).await?;
         }
         // progress_sender.send(100)?;
@@ -252,10 +224,10 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
         .unwrap_or(false);
 
     if full_noun_mode {
-        println!("[run_cli] 检测到 Full Noun 模式，跳过增量更新检测");
+        log::info!("[run_cli] 检测到 Full Noun 模式，跳过增量更新检测");
 
         if db_option.is_gen_mesh_or_model() {
-            println!("正在生成模型（Full Noun 模式）");
+            log::info!("正在生成模型（Full Noun 模式）");
             let mut time = Instant::now();
             fs::create_dir_all("assets/meshes")?;
             gen_all_geos_data(vec![], &db_option_ext, None, None).await?;
@@ -263,16 +235,16 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 
         // Full Noun 模式也支持房间计算
         if db_option.gen_spatial_tree {
-            println!("🏠 启用房间计算功能");
-            println!("房间关键字为: {:?}", db_option.get_room_key_word());
-            println!("正在执行房间计算...");
-            println!("正在构建房间关系和空间索引...");
+            log::info!("🏠 启用房间计算功能");
+            log::info!("房间关键字为: {:?}", db_option.get_room_key_word());
+            log::info!("正在执行房间计算...");
+            log::info!("正在构建房间关系和空间索引...");
             let time = Instant::now();
             if let Err(e) = build_room_relations(&db_option).await {
-                eprintln!("❌ 房间计算失败: {}", e);
+                log::error!("❌ 房间计算失败: {}", e);
                 return Err(e);
             }
-            println!("✅ 房间计算完成，耗时: {} ms", time.elapsed().as_millis());
+            log::info!("✅ 房间计算完成，耗时: {} ms", time.elapsed().as_millis());
         }
 
         // Full Noun 模式下跳过后续的增量更新和其他处理
@@ -290,7 +262,7 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
     //todo 还有个问题，可能需要通过队列来排队任务
     //如果没有生成完，需要等待
     if db_option.is_gen_mesh_or_model() {
-        println!("正在生成模型");
+        log::info!("正在生成模型");
         let mut time = Instant::now();
         fs::create_dir_all("assets/meshes")?;
         //统计一下assets mesh 目录下有多少个mesh，直接忽略去生成
@@ -299,21 +271,21 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
     }
 
     if db_option.gen_spatial_tree {
-        println!("🏠 启用房间计算功能");
-        println!("房间关键字为: {:?}", db_option.get_room_key_word());
-        println!("正在执行房间计算...");
-        println!("正在构建房间关系和空间索引...");
+        log::info!("🏠 启用房间计算功能");
+        log::info!("房间关键字为: {:?}", db_option.get_room_key_word());
+        log::info!("正在执行房间计算...");
+        log::info!("正在构建房间关系和空间索引...");
         // SQLite R*-tree will be used for spatial indexing
         let mut time = Instant::now();
         if let Err(e) = build_room_relations(&db_option).await {
-            eprintln!("❌ 房间计算失败: {}", e);
+            log::error!("❌ 房间计算失败: {}", e);
             return Err(e);
         }
-        println!("✅ 房间计算完成，耗时: {} ms", time.elapsed().as_millis());
+        log::info!("✅ 房间计算完成，耗时: {} ms", time.elapsed().as_millis());
         // 未来可以在这里添加更多房间计算相关功能
-        // println!("正在计算设备房间关系");
+        // log::info!("正在计算设备房间关系");
         // update_cal_equip().await?;
-        // println!("正在计算分支房间关系");
+        // log::info!("正在计算分支房间关系");
         // update_cal_bran_component().await?;
     }
 
@@ -325,10 +297,10 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
     }
     // sync TEAM_DATA数据
     if db_option.only_sync_sys {
-        println!("开始生成SYS DATA");
+        log::info!("开始生成SYS DATA");
         match sync_team_data().await {
             Ok(_) => {
-                println!("TEAM DATA生成完成");
+                log::info!("TEAM DATA生成完成");
             }
             Err(e) => {
                 dbg!(&e.to_string());
@@ -384,7 +356,7 @@ pub async fn run_app(option: Option<DbOptionExt>) -> anyhow::Result<()> {
         // 在后台启动GRPC服务器
         let grpc_handle = tokio::spawn(async {
             if let Err(e) = crate::grpc_service::start_grpc_server().await {
-                eprintln!("GRPC server error: {}", e);
+                log::error!("GRPC server error: {}", e);
             }
         });
 
@@ -406,6 +378,39 @@ pub async fn run_app(option: Option<DbOptionExt>) -> anyhow::Result<()> {
 /// 内部应用运行逻辑
 async fn run_app_internal(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> {
     use crate::fast_model::aabb_tree::manual_update_aabbs;
+
+    // 初始化日志系统（在所有操作之前）
+    if db_option_ext.inner.enable_log {
+        let now = Local::now();
+        let filename = format!(
+            "logs/{}-{:02}-{:02}_{:02}-{:02}-{:02}_parse.log",
+            now.year(),
+            now.month(),
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
+        );
+
+        // 确保 logs 目录存在
+        let _ = std::fs::create_dir_all("logs");
+
+        // 创建日志文件
+        if let Ok(file) = File::create(&filename) {
+            let _ = CombinedLogger::init(vec![
+                // 终端日志：显示 Info 级别
+                TermLogger::new(
+                    LevelFilter::Info,
+                    Config::default(),
+                    TerminalMode::Mixed,
+                    ColorChoice::Auto,
+                ),
+                // 文件日志：记录 Info 级别
+                WriteLogger::new(LevelFilter::Info, Config::default(), file),
+            ]);
+            log::info!("日志系统初始化成功，日志文件: {}", filename);
+        }
+    }
 
     // 使用 aios_core 统一的数据库初始化函数
     aios_core::initialize_databases(&db_option_ext.inner).await?;

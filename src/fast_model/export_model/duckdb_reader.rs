@@ -225,9 +225,9 @@ impl DuckDBReader {
                     )?;
                     stmt.query_map(
                         duckdb::params![dbno as i64, min_x, min_y, max_x, max_y, min_z, max_z],
-                        |row| row.get(0),
+                        |row: &duckdb::Row| row.get(0),
                     )?
-                    .filter_map(|r| r.ok())
+                    .filter_map(|r: Result<_, _>| r.ok())
                     .collect()
                 }
                 Some(dbno) => {
@@ -242,9 +242,9 @@ impl DuckDBReader {
                     )?;
                     stmt.query_map(
                         duckdb::params![pattern, min_x, min_y, max_x, max_y, min_z, max_z],
-                        |row| row.get(0),
+                        |row: &duckdb::Row| row.get(0),
                     )?
-                    .filter_map(|r| r.ok())
+                    .filter_map(|r: Result<_, _>| r.ok())
                     .collect()
                 }
                 None => {
@@ -257,9 +257,9 @@ impl DuckDBReader {
                     )?;
                     stmt.query_map(
                         duckdb::params![min_x, min_y, max_x, max_y, min_z, max_z],
-                        |row| row.get(0),
+                        |row: &duckdb::Row| row.get(0),
                     )?
-                    .filter_map(|r| r.ok())
+                    .filter_map(|r: Result<_, _>| r.ok())
                     .collect()
                 }
             }
@@ -277,9 +277,9 @@ impl DuckDBReader {
                     )?;
                     stmt.query_map(
                         duckdb::params![dbno as i64, min_x, max_x, min_y, max_y, min_z, max_z],
-                        |row| row.get(0),
+                        |row: &duckdb::Row| row.get(0),
                     )?
-                    .filter_map(|r| r.ok())
+                    .filter_map(|r: Result<_, _>| r.ok())
                     .collect()
                 }
                 Some(dbno) => {
@@ -295,9 +295,9 @@ impl DuckDBReader {
                     )?;
                     stmt.query_map(
                         duckdb::params![pattern, min_x, max_x, min_y, max_y, min_z, max_z],
-                        |row| row.get(0),
+                        |row: &duckdb::Row| row.get(0),
                     )?
-                    .filter_map(|r| r.ok())
+                    .filter_map(|r: Result<_, _>| r.ok())
                     .collect()
                 }
                 None => {
@@ -311,9 +311,9 @@ impl DuckDBReader {
                     )?;
                     stmt.query_map(
                         duckdb::params![min_x, max_x, min_y, max_y, min_z, max_z],
-                        |row| row.get(0),
+                        |row: &duckdb::Row| row.get(0),
                     )?
-                    .filter_map(|r| r.ok())
+                    .filter_map(|r: Result<_, _>| r.ok())
                     .collect()
                 }
             }
@@ -331,7 +331,7 @@ impl DuckDBReader {
         )?;
         
         let result: Option<(f64, f64, f64, f64, f64, f64)> = stmt
-            .query_row(duckdb::params![refno], |row| {
+            .query_row(duckdb::params![refno], |row: &duckdb::Row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -355,10 +355,10 @@ impl DuckDBReader {
         )?;
         
         let geos: Vec<(String, String, Option<String>)> = stmt
-            .query_map(duckdb::params![refno], |row| {
+            .query_map(duckdb::params![refno], |row: &duckdb::Row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r: Result<_, _>| r.ok())
             .collect();
         
         Ok(geos)
@@ -373,7 +373,7 @@ impl DuckDBReader {
         )?;
         
         let result: Option<(String, String, Option<String>)> = stmt
-            .query_row(duckdb::params![refno], |row| {
+            .query_row(duckdb::params![refno], |row: &duckdb::Row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .ok();
@@ -385,9 +385,9 @@ impl DuckDBReader {
     pub fn get_stats(&self) -> Result<(i64, i64, i64)> {
         let conn = self.conn.lock().unwrap();
         
-        let instance_count: i64 = conn.query_row("SELECT COUNT(*) FROM instance", [], |row| row.get(0))?;
-        let geo_count: i64 = conn.query_row("SELECT COUNT(*) FROM geo", [], |row| row.get(0))?;
-        let aabb_count: i64 = conn.query_row("SELECT COUNT(*) FROM aabb", [], |row| row.get(0))?;
+        let instance_count: i64 = conn.query_row("SELECT COUNT(*) FROM instance", [], |row: &duckdb::Row| row.get(0))?;
+        let geo_count: i64 = conn.query_row("SELECT COUNT(*) FROM geo", [], |row: &duckdb::Row| row.get(0))?;
+        let aabb_count: i64 = conn.query_row("SELECT COUNT(*) FROM aabb", [], |row: &duckdb::Row| row.get(0))?;
         
         Ok((instance_count, geo_count, aabb_count))
     }
@@ -545,9 +545,9 @@ impl DuckDBReader {
 
         let refnos: Vec<String> = stmt.query_map(
             duckdb::params![min_x, min_y, max_x, max_y, min_z, max_z],
-            |row| row.get(0),
+            |row: &duckdb::Row| row.get(0),
         )?
-        .filter_map(|r| r.ok())
+        .filter_map(|r: Result<_, _>| r.ok())
         .collect();
 
         Ok(refnos)

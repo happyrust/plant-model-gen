@@ -1,5 +1,6 @@
 #[cfg(feature = "surreal-save")]
 use aios_core::SUL_DB;
+use log::{info, warn, error, debug};
 
 // 内存KV数据库全局连接（从 aios_core 导入）
 #[cfg(feature = "mem-kv-save")]
@@ -167,17 +168,17 @@ where
     }
 
     // 开始同步pdms/E3D项目的数据
-    println!("开始同步pdms/E3D: {} 的数据", &db_option.project_name);
+    info!("开始同步pdms/E3D: {} 的数据", &db_option.project_name);
     let mut time = tokio::time::Instant::now();
 
     #[cfg(feature = "surreal-save")]
     {
         // 解析前移除EVENT，防止大量的event触发
-        println!("正在移除dbnum_event以提高解析性能...");
+        info!("正在移除dbnum_event以提高解析性能...");
         let remove_event_sql = "REMOVE EVENT update_dbnum_event ON pe;";
         match SUL_DB.query(remove_event_sql).await {
-            Ok(_) => println!("成功移除update_dbnum_event"),
-            Err(e) => println!("移除update_dbnum_event失败（可能不存在）: {:?}", e),
+            Ok(_) => info!("成功移除update_dbnum_event"),
+            Err(e) => info!("移除update_dbnum_event失败（可能不存在）: {:?}", e),
         }
     }
 
@@ -267,10 +268,10 @@ where
             .await
             {
                 Ok(_) => {
-                    println!("同步UDA和SYS数据成功。");
+                    info!("同步UDA和SYS数据成功。");
                 }
                 Err(e) => {
-                    println!("{}", e.to_string());
+                    info!("{}", e.to_string());
                 }
             }
         }
@@ -294,25 +295,25 @@ where
         .await
         {
             Ok(_) => {
-                println!("同步数据成功。");
+                info!("同步数据成功。");
             }
             Err(e) => {
-                println!("{}", e.to_string());
+                info!("{}", e.to_string());
             }
         }
     }
 
     // 解析完成后重新定义EVENT
-    println!("正在重新定义dbnum_event...");
+    info!("正在重新定义dbnum_event...");
     match aios_core::define_dbnum_event().await {
-        Ok(_) => println!("成功重新定义update_dbnum_event"),
-        Err(e) => println!("重新定义update_dbnum_event失败: {:?}", e),
+        Ok(_) => info!("成功重新定义update_dbnum_event"),
+        Err(e) => info!("重新定义update_dbnum_event失败: {:?}", e),
     }
 
     // 输出创建表所花费的时间
-    println!("创建表花费时间: {} ms", create_tables_elapse);
+    info!("创建表花费时间: {} ms", create_tables_elapse);
     // 输出初始化数据库所花费的时间
-    println!(
+    info!(
         "初始化数据库时间: {} ms",
         time.elapsed().as_millis() - create_tables_elapse
     );
@@ -327,18 +328,18 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("没有包含的项目"));
     }
     // 开始同步pdms/E3D项目的数据
-    println!("开始同步pdms/E3D: {} 的数据", &db_option.project_name);
+    info!("开始同步pdms/E3D: {} 的数据", &db_option.project_name);
     // 计时器开始
     let mut time = tokio::time::Instant::now();
 
     #[cfg(feature = "surreal-save")]
     {
         // 解析前移除EVENT，防止大量的event触发
-        println!("正在移除dbnum_event以提高解析性能...");
+        info!("正在移除dbnum_event以提高解析性能...");
         let remove_event_sql = "REMOVE EVENT update_dbnum_event ON pe;";
         match SUL_DB.query(remove_event_sql).await {
-            Ok(_) => println!("成功移除update_dbnum_event"),
-            Err(e) => println!("移除update_dbnum_event失败（可能不存在）: {:?}", e),
+            Ok(_) => info!("成功移除update_dbnum_event"),
+            Err(e) => info!("移除update_dbnum_event失败（可能不存在）: {:?}", e),
         }
     }
 
@@ -404,11 +405,11 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
             {
                 Ok(_) => {
                     // 同步数据成功
-                    println!("同步UDA和SYS数据成功。");
+                    info!("同步UDA和SYS数据成功。");
                 }
                 Err(e) => {
                     // 同步数据失败，打印错误信息
-                    println!("{}", e.to_string());
+                    info!("{}", e.to_string());
                 }
             }
         }
@@ -416,8 +417,8 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
         if db_option.only_sync_sys {
             continue;
         }
-        // let progress_sender = progress_sender.clone();
-        let cur_dbno_set = dbno_set.clone();
+        // 第二次调用使用新的 dbno_set，避免被第一次调用的 db_no 过滤
+        let cur_dbno_set = Arc::new(DashSet::new());
         match sync_total_async_threaded(
             &db_option,
             project,
@@ -430,26 +431,26 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
         {
             Ok(_) => {
                 // 同步数据成功
-                println!("同步数据成功。");
+                info!("同步DESI, CATA数据成功。");
             }
             Err(e) => {
                 // 同步数据失败，打印错误信息
-                println!("{}", e.to_string());
+                info!("{}", e.to_string());
             }
         }
     }
 
     // 解析完成后重新定义EVENT
-    println!("正在重新定义dbnum_event...");
+    info!("正在重新定义dbnum_event...");
     match aios_core::define_dbnum_event().await {
-        Ok(_) => println!("成功重新定义update_dbnum_event"),
-        Err(e) => println!("重新定义update_dbnum_event失败: {:?}", e),
+        Ok(_) => info!("成功重新定义update_dbnum_event"),
+        Err(e) => info!("重新定义update_dbnum_event失败: {:?}", e),
     }
 
     // 输出创建表所花费的时间
-    println!("创建表花费时间: {} ms", create_tables_elapse);
+    info!("创建表花费时间: {} ms", create_tables_elapse);
     // 输出初始化数据库所花费的时间
-    println!(
+    info!(
         "初始化数据库时间: {} ms",
         time.elapsed().as_millis() - create_tables_elapse
     );
@@ -546,11 +547,11 @@ pub async fn check_and_clear_db(db_no: u32) -> anyhow::Result<()> {
     use serde_json::Value as JsonValue;
     let records: Vec<JsonValue> = response.take(0).unwrap_or_default();
     if !records.is_empty() {
-        println!(
+        info!(
             "Database with dbnum {} already exists in pe table. Will override with new data.",
             db_no
         );
-        println!("开始删除已有的dbnum {db_no} 的数据");
+        info!("开始删除已有的dbnum {db_no} 的数据");
         let sql = format!("delete array::flatten(select value ->pe_owner from pe where dbnum = {db_no});
                                     delete array::flatten(select value [refno, id] from pe where dbnum = {db_no});
                                     ");
@@ -578,7 +579,7 @@ pub async fn sync_total_async_threaded_with_callback<F>(
 where
     F: FnMut(&str, usize, usize, usize, usize, usize, usize) + Send,
 {
-    println!("开始解析 {project} 的 {:?}", db_types);
+    info!("开始解析 {project} 的 {:?}", db_types);
     let db_option_arc = Arc::new(db_option.clone());
 
     let project_dir = db_option.get_project_path(&project).unwrap();
@@ -863,6 +864,8 @@ where
         file.read_exact(&mut buf).await.unwrap();
         let db_basic_info = parse_file_basic_info(&buf);
         let db_type = db_basic_info.db_type;
+        println!("db_type: {}", db_type);
+        continue;
         let db_no = db_basic_info.db_no;
 
         if is_replace {
@@ -959,7 +962,7 @@ where
         let project_name = project.as_str().to_string();
         let mut db_basic =
             parse_file_db_basic_data(&path, &file_name, project_name.as_str()).unwrap_or_default();
-        let all_refnos = db_basic.children_map.keys().cloned().collect::<Vec<_>>();
+        let all_refnos: Vec<_> = db_basic.refno_table_map.iter().map(|entry| *entry.key()).collect();
         let total_chunks = std::cmp::max(1, (all_refnos.len() + chunk_size - 1) / chunk_size);
 
         let db_basic = Arc::new(db_basic);
@@ -1089,7 +1092,7 @@ where
             }
         }
 
-        println!(
+        info!(
             "解析任务完成, 耗时: {} s, 总数量: {}",
             time.elapsed().as_secs_f32(),
             total_cnt
@@ -1127,7 +1130,7 @@ pub async fn sync_total_async_threaded(
     // progress_sender: Sender<i32>,
     proj_progress_chunk: usize,
 ) -> anyhow::Result<()> {
-    println!("开始解析 {project} 的 {:?}", db_types);
+    info!("开始解析 {project} 的 {:?}", db_types);
     let db_option_arc = Arc::new(db_option.clone()); // 创建一个Arc对象，表示数据库选项
 
     let project_dir = db_option.get_project_path(&project).unwrap(); // 创建一个Path对象，表示项目目录的路径
@@ -1173,10 +1176,6 @@ pub async fn sync_total_async_threaded(
 
     // 更新children_files只包含需要处理的文件
     children_files = file_map.into_values().collect();
-    // println!("需要处理的文件: {:?}", &children_files);
-    // dbg!(children_files.len());
-    // 先解析一遍uda
-    // 正式解析
 
     let project = Arc::new(project.to_string()); // 创建一个Arc对象，表示项目名称
     let mut is_replace = db_option_arc.replace_dbs; // 是否替换数据库的数据
@@ -1187,10 +1186,7 @@ pub async fn sync_total_async_threaded(
     if b_replace_types {
         is_replace = true;
     }
-    let chunk_size = db_option_arc.sync_chunk_size.unwrap_or(10_0000) as usize;
-    // let sync_tidb = db_option_arc.sync_tidb.unwrap_or(false);
-    // #[cfg(feature = "sql")]
-    // let pool = mgr.get_project_pools().await?;
+    let chunk_size = db_option_arc.sync_chunk_size.unwrap_or(1_0000) as usize;
 
     const CHUNK_SIZE: usize = 100;
     // let (sender, receiver) = flume::bounded(CHUNK_SIZE);
@@ -1362,7 +1358,7 @@ pub async fn sync_total_async_threaded(
                 }
             }
             // if cnt > 0 {
-            //     println!("thread {i} Imported records: {}", cnt);
+            //     info!("thread {i} Imported records: {}", cnt);
             // }
         });
         insert_handles.push(insert_handle);
@@ -1394,9 +1390,17 @@ pub async fn sync_total_async_threaded(
             }
             let dbno_set = cur_dbno_set.clone();
             let mut time = Instant::now();
-            // dbg!(&file_name);
+
+            // 检查过滤条件
+            let condition1 = is_parse_sys && is_total_sync;
+            let condition2 = db_option_arc.included_db_files.is_none();
+            let condition3 = db_option_arc.included_db_files.as_ref()
+                .map(|v| v.is_empty())
+                .unwrap_or(false);
+
             if (is_parse_sys && is_total_sync)
                 || db_option_arc.included_db_files.is_none()
+                || condition3
                 || db_option_arc
                     .included_db_files
                     .as_ref()
@@ -1412,6 +1416,7 @@ pub async fn sync_total_async_threaded(
                 file.read_exact(&mut buf).await.unwrap();
                 let db_basic_info = parse_file_basic_info(&buf);
                 let db_type = db_basic_info.db_type;
+              
                 let db_no = db_basic_info.db_no;
                 //需要检查pe里是否有这个dbno，如果有，则需要改成使用upsert
                 if is_replace {
@@ -1421,6 +1426,7 @@ pub async fn sync_total_async_threaded(
                 if !db_types_clone.contains(&db_type) {
                     continue;
                 }
+                println!("db_type is {db_type}");
                 //保证不重复加载相同dbno的数据
                 if dbno_set.contains(&db_no) {
                     continue;
@@ -1428,7 +1434,7 @@ pub async fn sync_total_async_threaded(
                 // dbg!(db_no);
                 dbno_set.insert(db_no);
                 // 如果需要解析的文件列表为空或包含当前文件名，则执行以下代码块
-                println!("path={:?}", &file_name); // 打印文件路径
+                info!("path={:?}", &file_name); // 打印文件路径
                 let mut ses_range_map = BTreeMap::new();
                 let mut sesno = 0;
                 // let mut dt = Local::now().naive_local();
@@ -1471,7 +1477,7 @@ pub async fn sync_total_async_threaded(
                 let mut db_basic =
                     parse_file_db_basic_data(&path, &file_name, project_name.clone().as_str())
                         .unwrap_or_default();
-                let all_refnos = db_basic.children_map.keys().cloned().collect::<Vec<_>>();
+                let all_refnos: Vec<_> = db_basic.refno_table_map.iter().map(|entry| *entry.key()).collect();
 
                 let db_basic = Arc::new(db_basic);
                 if is_save_db {
@@ -1519,7 +1525,7 @@ pub async fn sync_total_async_threaded(
                             let total_attr_map_arc = Arc::new(total_attr_map);
                             total_cnt += total_attr_map_arc.len();
                             //开始执行保存数据
-                            println!("开始保存pe数量: {}", total_attr_map_arc.len());
+                            info!("开始保存pe数量: {}", total_attr_map_arc.len());
                             let should_save = !is_debug && is_save_db;
                             if should_save {
                                 save_pes(
@@ -1612,7 +1618,7 @@ pub async fn sync_total_async_threaded(
                     }
                 }
 
-                println!(
+                info!(
                     "解析任务完成, 耗时: {} s, 总数量: {}",
                     time.elapsed().as_secs_f32(),
                     total_cnt

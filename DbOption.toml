@@ -1,21 +1,20 @@
-#同步文件配置
-total_sync = false
+total_sync = true
+replace_dbs = false
 incr_sync = false
 sync_history = false
-enable_log = false
-sync_graph_db = false
+enable_log = true
+sync_graph_db = true
 sync_versioned = false
 sync_tidb = false
 sync_live = false
-replace_dbs = false
 enable_index = false
 sync_chunk_size = 10_0000
 
 #项目设置
-# project_path = "D:/AVEVA/Projects/E3D2.1"
-project_path = "/Volumes/DPC/work/e3d_models"
-# included_projects = ["AvevaMarineSample", "AvevaCatalogue", "SCB", "ZDJ"]
+project_path = "D:/AVEVA/Projects/E3D2.1"
+# project_path = "/Volumes/DPC/work/e3d_models"
 included_projects = ["AvevaMarineSample", "AvevaCatalogue", "SCB", "ZDJ"]
+# included_projects = ["AvevaMarineSample"]
 #project_dirs = ["AvevaMarineSample"]
 
 mdb_name = "ALL"

@@ -142,3 +142,6 @@ deploy/
 *.zip
 *.7z
 *.rar
+
+
+ams-8020.db

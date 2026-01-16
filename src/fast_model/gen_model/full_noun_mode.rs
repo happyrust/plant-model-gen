@@ -88,14 +88,15 @@ fn track_refno_issues(refnos: &[RefnoEnum], context: &str, stage: RefnoErrorStag
 /// Full Noun 模式下生成所有几何体（优化版本）
 ///
 /// # 主要改进
-/// 1. ✅ 顺序执行：LOOP -> PRIM -> CATE（确保依赖关系正确）
-/// 2. ✅ 批量并发：每个类别内部使用批量并发处理
-/// 3. ✅ 内存优化：使用 CategorizedRefnos 替代三个 HashSet
-/// 4. ✅ 数据验证：检查 SJUS map 完整性
-/// 5. ✅ 类型安全：使用 FullNounConfig 和错误类型
+/// 1. ✅ BRAN/HANG 优先处理：先处理 BRAN/HANG 及其依赖，记录已生成的子节点
+/// 2. ✅ 顺序执行：LOOP -> PRIM -> CATE（确保依赖关系正确）
+/// 3. ✅ 批量并发：每个类别内部使用批量并发处理
+/// 4. ✅ 内存优化：使用 CategorizedRefnos 替代三个 HashSet
+/// 5. ✅ 数据验证：检查 SJUS map 完整性
+/// 6. ✅ 类型安全：使用 FullNounConfig 和错误类型
 ///
 /// # 执行顺序
-/// 必须按照 LOOP -> PRIM -> CATE 顺序执行，因为 CATE 依赖 LOOP 生成的 SJUS 数据
+/// BRAN/HANG 优先 -> LOOP -> PRIM -> CATE（跳过已生成的 refno）
 #[cfg_attr(feature = "profile", instrument(skip(db_option, config, sender)))]
 pub async fn gen_full_noun_geos_optimized(
     db_option: Arc<DbOptionExt>,
@@ -168,13 +169,13 @@ pub async fn gen_full_noun_geos_optimized(
     let mut cate_refnos: HashSet<RefnoEnum> = HashSet::new();
     // BRAN/HANG 根节点单独收集，避免混入普通 CATE 流程
     let mut bran_hanger_roots: HashSet<RefnoEnum> = HashSet::new();
+    // 🔥 记录 BRAN/HANG 处理过程中已生成的子节点 refno，后续处理时跳过
+    let mut bran_generated_refnos: HashSet<RefnoEnum> = HashSet::new();
 
     for entry in &entry_nouns {
         let noun_upper = entry.to_uppercase();
         let noun_str = noun_upper.as_str();
 
-        // 🔥 入口 Noun 查询：直接从 noun 表取 id，并用 meta::id(id) 拆分 dbnum 做过滤。
-        // 说明：SurrealDB 的 record id 形如 BRAN:`24383_73962`，不能用 id[0] 获取 dbnum。
         let db_filter = if dbnums.is_empty() {
             "true".to_string()
         } else {
@@ -184,7 +185,7 @@ pub async fn gen_full_noun_geos_optimized(
                 .collect::<Vec<_>>()
                 .join(",");
             format!(
-                "type::int(string::split(meta::id(id), '_')[0]) IN [{}]",
+                "dbnum IN [{}]",
                 nums
             )
         };
@@ -239,6 +240,37 @@ pub async fn gen_full_noun_geos_optimized(
         }
         if USE_CATE_NOUN_NAMES.contains(&noun_str) {
             cate_refnos.extend(refnos.iter().copied());
+        }
+    }
+
+    // 🔥 直接查询数据库中的 BRAN/HANG 表（不依赖入口 Noun）
+    for noun in &["BRAN", "HANG"] {
+        let db_filter = if dbnums.is_empty() {
+            "true".to_string()
+        } else {
+            let nums = dbnums
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("dbnum IN [{}]", nums)
+        };
+        let sql = format!("SELECT VALUE id FROM {} WHERE {}", noun, db_filter);
+        let record_ids: Vec<RecordId> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let refnos: Vec<RefnoEnum> = record_ids
+            .into_iter()
+            .map(RefnoEnum::from)
+            .filter(|r| r.is_valid())
+            .collect();
+        if !refnos.is_empty() {
+            println!(
+                "[gen_full_noun_geos] 直接查询 {} 表: {} 个实例",
+                noun,
+                refnos.len()
+            );
+            bran_hanger_roots.extend(refnos.iter().copied());
+            // 同时加入 all_roots，确保后续深度查询能覆盖
+            all_roots.extend(refnos.iter().copied());
         }
     }
 
@@ -307,10 +339,11 @@ pub async fn gen_full_noun_geos_optimized(
     cate_refnos.extend(cate_descendants);
 
     println!(
-        " 深度查询结果：Loop={}，Prim={}，Cate={}",
+        " 深度查询结果：Loop={}，Prim={}，Cate={}，BRAN/HANG={}",
         loop_refnos.len(),
         prim_refnos.len(),
-        cate_refnos.len()
+        cate_refnos.len(),
+        bran_hanger_roots.len()
     );
 
     let loop_sjus_map_arc = Arc::new(DashMap::new());
@@ -324,9 +357,149 @@ pub async fn gen_full_noun_geos_optimized(
 
     let mut categorized = CategorizedRefnos::new();
 
-    println!("📍 [1/3] 处理 LOOP Refno 集合...");
+    // ============================================================================
+    // 🔥 [0/4] BRAN/HANG 优先处理阶段
+    // ============================================================================
+    let mut bran_duration = std::time::Duration::ZERO;
+    let bran_roots: Vec<RefnoEnum> = bran_hanger_roots.iter().copied().collect();
+    if !bran_roots.is_empty() {
+        println!("📍 [0/4] 优先处理 BRAN/HANG 及其依赖 (count={})...", bran_roots.len());
+        let bran_start = Instant::now();
+
+        // 1. 收集 BRAN/HANG 相关的 LOOP refno（用于生成 SJUS 数据）
+        let bran_loop_descendants = aios_core::collect_descendant_filter_ids(
+            &bran_roots,
+            &GNERAL_LOOP_OWNER_NOUN_NAMES,
+            None,
+        )
+        .await
+        .unwrap_or_default();
+
+        if !bran_loop_descendants.is_empty() {
+            println!(
+                "[gen_full_noun_geos] BRAN/HANG 相关 LOOP: {} 个",
+                bran_loop_descendants.len()
+            );
+            // 处理 BRAN/HANG 相关的 LOOP
+            let ranges = ctx.bounded_chunks(bran_loop_descendants.len());
+            for (page_index, (start, end)) in ranges.into_iter().enumerate() {
+                let slice = &bran_loop_descendants[start..end];
+                println!(
+                    "[gen_full_noun_geos] bran-loop: 处理第 {} 页 ({} ~ {})",
+                    page_index + 1,
+                    start + 1,
+                    end
+                );
+                process_loop_refno_page(&ctx, loop_sjus_map_arc.clone(), sender.clone(), slice)
+                    .await
+                    .map_err(|e| {
+                        FullNounError::GeometryGenerationFailed("bran-loop".to_string(), e.to_string())
+                    })?;
+            }
+            // 记录已生成的 LOOP refno
+            bran_generated_refnos.extend(bran_loop_descendants.iter().copied());
+        }
+
+        // 2. 查询 BRAN/HANG 的子元素
+        let branch_refnos_map: DashMap<RefnoEnum, Vec<SPdmsElement>> = DashMap::new();
+        for &refno in &bran_roots {
+            match aios_core::collect_children_elements(refno, &[]).await {
+                Ok(children) => {
+                    if !children.is_empty() {
+                        // 记录子元素的 refno
+                        for child in &children {
+                            bran_generated_refnos.insert(child.refno);
+                        }
+                        branch_refnos_map.insert(refno, children);
+                    }
+                }
+                Err(e) => {
+                    println!(
+                        "[gen_full_noun_geos] 查询 BRAN/HANG 子元素失败 (refno={}): {}",
+                        refno, e
+                    );
+                }
+            }
+        }
+
+        // 3. 查询 BRAN/HANG 的元件库分组
+        let target_bran_reuse_cata_map = match aios_core::query_group_by_cata_hash(&bran_roots).await {
+            Ok(map) => map,
+            Err(e) => {
+                println!("[gen_full_noun_geos] 查询 BRAN/HANG 元件库分组失败: {}", e);
+                DashMap::new()
+            }
+        };
+
+        // 4. 生成 BRAN/HANG 相关的 CATE 几何
+        let cate_outcome = match cata_model::gen_cata_instances(
+            db_option.clone(),
+            Arc::new(target_bran_reuse_cata_map),
+            loop_sjus_map_arc.clone(),
+            sender.clone(),
+        )
+        .await
+        {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                println!("[gen_full_noun_geos] BRAN/HANG 关联 CATE 生成失败: {}", e);
+                None
+            }
+        };
+
+        // 5. 保存 tubi_info
+        if let Some(ref outcome) = cate_outcome {
+            println!(
+                "[gen_full_noun_geos] BRAN/HANG tubi_info_map: {}, local_al_map: {}",
+                outcome.tubi_info_map.len(),
+                outcome.local_al_map.len()
+            );
+            if let Err(e) = pdms_inst::save_tubi_info_batch(&outcome.tubi_info_map).await {
+                println!("[gen_full_noun_geos] 保存 tubi_info 失败: {}", e);
+            }
+        }
+
+        // 6. 生成 BRAN/HANG Tubing
+        let local_al_map = cate_outcome
+            .as_ref()
+            .map(|o| o.local_al_map.clone())
+            .unwrap_or_else(|| Arc::new(DashMap::new()));
+
+        if let Err(e) = cata_model::gen_branch_tubi(
+            db_option.clone(),
+            Arc::new(branch_refnos_map),
+            loop_sjus_map_arc.clone(),
+            sender.clone(),
+            local_al_map,
+        )
+        .await
+        {
+            println!("[gen_full_noun_geos] BRAN/HANG Tubing 生成失败: {}", e);
+        }
+
+        bran_duration = bran_start.elapsed();
+        println!(
+            "⏱️  BRAN/HANG 优先处理完成: {} ms, 已生成子节点: {} 个",
+            bran_duration.as_millis(),
+            bran_generated_refnos.len()
+        );
+    }
+
+    // ============================================================================
+    // [1/4] 处理剩余的 LOOP（跳过已生成的）
+    // ============================================================================
+    println!("📍 [1/4] 处理 LOOP Refno 集合（跳过已生成）...");
     let loop_start = Instant::now();
-    let loop_vec: Vec<RefnoEnum> = loop_refnos.iter().copied().collect();
+    // 过滤掉已生成的 refno
+    let loop_vec: Vec<RefnoEnum> = loop_refnos
+        .iter()
+        .copied()
+        .filter(|r| !bran_generated_refnos.contains(r))
+        .collect();
+    let loop_skipped = loop_refnos.len() - loop_vec.len();
+    if loop_skipped > 0 {
+        println!("[gen_full_noun_geos] LOOP 跳过已生成: {} 个", loop_skipped);
+    }
     {
         let ranges = ctx.bounded_chunks(loop_vec.len());
         for (page_index, (start, end)) in ranges.into_iter().enumerate() {
@@ -354,7 +527,7 @@ pub async fn gen_full_noun_geos_optimized(
         "LOOP Noun processing completed (entry-based)"
     );
 
-    println!("📍 [2/3] 处理 PRIM Refno 集合...");
+    println!("📍 [2/4] 处理 PRIM Refno 集合...");
     let prim_start = Instant::now();
     let prim_vec: Vec<RefnoEnum> = prim_refnos.iter().copied().collect();
     {
@@ -384,9 +557,18 @@ pub async fn gen_full_noun_geos_optimized(
         "PRIM Noun processing completed (entry-based)"
     );
 
-    println!("📍 [3/3] 处理 CATE Refno 集合 (不含 BRAN/HANG Tubing)...");
+    println!("📍 [3/4] 处理 CATE Refno 集合（跳过已生成）...");
     let cate_start = Instant::now();
-    let cate_vec: Vec<RefnoEnum> = cate_refnos.iter().copied().collect();
+    // 过滤掉已生成的 refno
+    let cate_vec: Vec<RefnoEnum> = cate_refnos
+        .iter()
+        .copied()
+        .filter(|r| !bran_generated_refnos.contains(r))
+        .collect();
+    let cate_skipped = cate_refnos.len() - cate_vec.len();
+    if cate_skipped > 0 {
+        println!("[gen_full_noun_geos] CATE 跳过已生成: {} 个", cate_skipped);
+    }
     {
         let ranges = ctx.bounded_chunks(cate_vec.len());
         for (page_index, (start, end)) in ranges.into_iter().enumerate() {
@@ -412,150 +594,6 @@ pub async fn gen_full_noun_geos_optimized(
         cate_count = cate_vec.len(),
         duration_ms = cate_duration.as_millis() as u64,
         "CATE Noun processing completed (entry-based)"
-    );
-
-    // 📍 [4/3] 专门处理 BRAN/HANG Tubing（需要 branch_map 支持）
-    let bran_start = Instant::now();
-    let bran_roots: Vec<RefnoEnum> = bran_hanger_roots.iter().copied().collect();
-    if !bran_roots.is_empty() {
-        println!(
-            "📍 [4/3] 处理 BRAN/HANG 根节点集合 (count={})...",
-            bran_roots.len()
-        );
-
-        // 参考旧版实现：每批处理少量 BRAN/HANG，避免单次 SQL 过大
-        let batch_size = 4usize;
-        let total_bran = bran_roots.len();
-        let chunks: Vec<&[RefnoEnum]> = bran_roots.chunks(batch_size).collect();
-        let total_batches = chunks.len();
-
-        for (batch_idx, chunk) in chunks.into_iter().enumerate() {
-            let batch_num = batch_idx + 1;
-            println!(
-                "[gen_full_noun_geos] 处理 BRAN/HANG 批次 {}/{} ({}~{} 个)",
-                batch_num,
-                total_batches,
-                batch_idx * batch_size + 1,
-                (batch_idx * batch_size + chunk.len()).min(total_bran)
-            );
-
-            // 1. 查询当前批次的子元素
-            let branch_refnos_map: DashMap<RefnoEnum, Vec<SPdmsElement>> = DashMap::new();
-
-            for &refno in chunk {
-                match aios_core::collect_children_elements(refno, &[]).await {
-                    Ok(children) => {
-                        if !children.is_empty() {
-                            branch_refnos_map.insert(refno, children);
-                        }
-                    }
-                    Err(e) => {
-                        println!(
-                            "[gen_full_noun_geos] 查询 BRAN/HANG 子元素失败 (refno={}): {}",
-                            refno, e
-                        );
-                    }
-                }
-            }
-
-            if branch_refnos_map.is_empty() {
-                println!(
-                    "[gen_full_noun_geos] 批次 {}: 未找到任何 BRAN/HANG 子元素，跳过 Tubing 生成",
-                    batch_num
-                );
-                continue;
-            }
-
-            // 2. 查询当前批次的元件库分组（按 cata_hash）
-            let target_bran_reuse_cata_map = match aios_core::query_group_by_cata_hash(chunk).await
-            {
-                Ok(map) => map,
-                Err(e) => {
-                    println!(
-                        "[gen_full_noun_geos] 批次 {}: 查询 BRAN/HANG 元件库分组失败: {}",
-                        batch_num, e
-                    );
-                    DashMap::new()
-                }
-            };
-
-            // 3. 先生成 BRAN/HANG 相关的 CATE 几何（不触发 tubing）
-            let cate_outcome = match cata_model::gen_cata_instances(
-                db_option.clone(),
-                Arc::new(target_bran_reuse_cata_map),
-                loop_sjus_map_arc.clone(),
-                sender.clone(),
-            )
-            .await
-            {
-                Ok(outcome) => Some(outcome),
-                Err(e) => {
-                    println!(
-                        "[gen_full_noun_geos] 批次 {}: BRAN/HANG 关联 CATE 生成失败: {}",
-                        batch_num, e
-                    );
-                    None
-                }
-            };
-
-            // 3.1 保存 tubi_info（增量写入）
-            if let Some(ref outcome) = cate_outcome {
-                println!(
-                    "[gen_full_noun_geos] 批次 {}: tubi_info_map 收集数量 = {}, local_al_map 数量 = {}",
-                    batch_num,
-                    outcome.tubi_info_map.len(),
-                    outcome.local_al_map.len()
-                );
-                
-                match pdms_inst::save_tubi_info_batch(&outcome.tubi_info_map).await {
-                    Ok(inserted) => {
-                        println!(
-                            "[gen_full_noun_geos] 批次 {}: 新增 {} 条 tubi_info 记录",
-                            batch_num, inserted
-                        );
-                    }
-                    Err(e) => {
-                        println!(
-                            "[gen_full_noun_geos] 批次 {}: 保存 tubi_info 失败: {}",
-                            batch_num, e
-                        );
-                    }
-                }
-            }
-
-            // 4. 单独生成 BRAN/HANG tubing
-            let local_al_map = cate_outcome
-                .as_ref()
-                .map(|o| o.local_al_map.clone())
-                .unwrap_or_else(|| Arc::new(DashMap::new()));
-
-            if let Err(e) = cata_model::gen_branch_tubi(
-                db_option.clone(),
-                Arc::new(branch_refnos_map),
-                loop_sjus_map_arc.clone(),
-                sender.clone(),
-                local_al_map,
-            )
-            .await
-            {
-                println!(
-                    "[gen_full_noun_geos] 批次 {}: BRAN/HANG Tubing 几何生成失败: {}",
-                    batch_num, e
-                );
-            } else {
-                println!(
-                    "[gen_full_noun_geos] 批次 {}/{} BRAN/HANG Tubing 生成完成",
-                    batch_num, total_batches
-                );
-            }
-        }
-    } else {
-        println!("[gen_full_noun_geos] BRAN/HANG 根节点集合为空，跳过 Tubing 生成");
-    }
-    let bran_duration = bran_start.elapsed();
-    println!(
-        "⏱️  BRAN/HANG Tubing processing took {} ms",
-        bran_duration.as_millis()
     );
 
     // 将 BRAN/HANG 根节点也归类为 Cate，便于后续 mesh 深度遍历

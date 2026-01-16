@@ -16,6 +16,7 @@ pub mod parquet_stream_writer;
 // pub mod duckdb_writer;
 #[cfg(feature = "duckdb-feature")]
 pub mod duckdb_exporter;
+#[cfg(feature = "duckdb-feature")]
 pub mod duckdb_reader;
 pub mod simple_color_palette;
 pub mod pe_parquet_writer;

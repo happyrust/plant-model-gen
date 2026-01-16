@@ -218,9 +218,13 @@ async fn process_full_noun_mode(
     });
 
     let categorized =
-        gen_full_noun_geos_optimized(Arc::new(db_option.clone()), &config, sender)
+        gen_full_noun_geos_optimized(Arc::new(db_option.clone()), &config, sender.clone())
             .await
             .map_err(|e| anyhow::anyhow!("Full Noun 生成失败: {}", e))?;
+
+    // 🔥 显式 drop sender，让 receiver 的循环能够正常结束
+    // 否则 insert_handle.await 会永久阻塞
+    drop(sender);
 
     let _ = insert_handle.await;
 

@@ -332,7 +332,9 @@ pub async fn apply_cata_neg_boolean_manifold(
             }
 
             // 即使没有负实体，也标记已处理，避免重复计算
-            let mesh_id = g.refno.to_string(); // 使用 Refno 的 to_string() (下划线格式)
+            // 统一使用 RefU64 格式（如 17496_106028），不管 sesno 是否为 0
+            let refu64: aios_core::RefU64 = g.refno.into();
+            let mesh_id = refu64.to_string();
             let mut final_manifold = pos_manifold.batch_boolean_subtract(&neg_manifolds);
 
             // 经验：某些模型在默认精度下布尔结果可能退化为 0 三角形，尝试提升精度重算一次。
@@ -775,11 +777,9 @@ async fn apply_boolean_for_query(
         println!("✅ 导出布尔结果 OBJ: {}", result_obj_path);
     }
     
-    let mesh_id = if query.sesno == 0 {
-        query.refno.to_string()
-    } else {
-        format!("{}__{}", query.refno, query.sesno) // 遵循数据库规范，使用下划线
-    };
+    // 统一使用 RefU64 格式（如 17496_106028），不管 sesno 是否为 0
+    let refu64: aios_core::RefU64 = query.refno.into();
+    let mesh_id = refu64.to_string();
     let target_path = boolean_glb_path(&mesh_id);
     ensure_parent_dir(&target_path)?;
 

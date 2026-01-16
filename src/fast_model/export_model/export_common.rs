@@ -872,6 +872,8 @@ fn ensure_normals(mesh: &mut PlantMesh) {
 
     // 重新计算法线
     let mut normals = vec![Vec3::ZERO; vertex_count];
+    let mut dot_sum = 0.0f32;
+    let mut dot_count = 0u32;
 
     for tri in mesh.indices.chunks(3) {
         if tri.len() < 3 {
@@ -892,21 +894,21 @@ fn ensure_normals(mesh: &mut PlantMesh) {
         // 计算三角形法向量
         let normal = (b - a).cross(c - a);
         if normal.length_squared() > f32::EPSILON {
-            let mut n = normal.normalize();
+            normals[a_idx] += normal;
+            normals[b_idx] += normal;
+            normals[c_idx] += normal;
 
-            // 检查法向量方向：确保指向外部
-            // 计算从中心点到三角形中心的向量
+            // 用整体趋势判断是否需要全局翻转法线方向
             let triangle_center = (a + b + c) / 3.0;
             let to_center = triangle_center - center;
+            dot_sum += normal.dot(to_center);
+            dot_count += 1;
+        }
+    }
 
-            // 如果法向量与到中心的向量方向相同（点积>0），说明法向量指向内部，需要反转
-            if n.dot(to_center) > 0.0 {
-                n = -n;
-            }
-
-            normals[a_idx] += n;
-            normals[b_idx] += n;
-            normals[c_idx] += n;
+    if dot_count > 0 && dot_sum < 0.0 {
+        for normal in normals.iter_mut() {
+            *normal = -*normal;
         }
     }
 

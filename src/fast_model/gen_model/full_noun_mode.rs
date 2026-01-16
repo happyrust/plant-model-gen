@@ -85,6 +85,175 @@ fn track_refno_issues(refnos: &[RefnoEnum], context: &str, stage: RefnoErrorStag
     }
 }
 
+/// NOUN 类型及其数量信息
+#[derive(Debug, Clone)]
+pub struct NounTypeInfo {
+    pub noun: &'static str,
+    pub count: usize,
+    pub refnos: Vec<RefnoEnum>,
+}
+
+/// 预查询所有 NOUN 类型的数量，过滤掉空类型
+///
+/// 返回按类别分组的非空 NOUN 类型列表
+pub async fn prequery_noun_counts(
+    nouns: &[&'static str],
+    dbnums: &[u32],
+) -> Result<Vec<NounTypeInfo>> {
+    let mut results = Vec::new();
+
+    let db_filter = if dbnums.is_empty() {
+        "true".to_string()
+    } else {
+        let nums = dbnums.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+        format!("dbnum IN [{}]", nums)
+    };
+
+    for &noun in nouns {
+        let sql = format!("SELECT VALUE id FROM {} WHERE {}", noun, db_filter);
+        let record_ids: Vec<RecordId> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+
+        let refnos: Vec<RefnoEnum> = record_ids
+            .into_iter()
+            .map(RefnoEnum::from)
+            .filter(|r| r.is_valid())
+            .collect();
+
+        if !refnos.is_empty() {
+            results.push(NounTypeInfo {
+                noun,
+                count: refnos.len(),
+                refnos,
+            });
+        }
+    }
+
+    Ok(results)
+}
+
+/// 处理类别枚举
+#[derive(Debug, Clone, Copy)]
+pub enum NounCategoryType {
+    Loop,
+    Prim,
+    Cate,
+}
+
+/// 按 NOUN 类型分组处理（每次 2 个类型并发）
+///
+/// # Arguments
+/// * `noun_infos` - NOUN 类型信息列表
+/// * `ctx` - 处理上下文
+/// * `category` - 处理类别（Loop/Prim/Cate）
+/// * `loop_sjus_map` - Loop SJUS 映射（仅 Loop 和 Cate 需要）
+/// * `sender` - 几何数据发送通道
+pub async fn process_nouns_by_type(
+    noun_infos: Vec<NounTypeInfo>,
+    ctx: &NounProcessContext,
+    category: NounCategoryType,
+    loop_sjus_map: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
+    sender: flume::Sender<ShapeInstancesData>,
+) -> Result<Vec<RefnoEnum>> {
+    if noun_infos.is_empty() {
+        println!("[{:?}] 无有效 NOUN 类型，跳过", category);
+        return Ok(vec![]);
+    }
+
+    let total_count: usize = noun_infos.iter().map(|n| n.count).sum();
+    println!(
+        "📍 [{:?}] 开始处理 {} 个 NOUN 类型（共 {} 个实例），每次 2 个类型并发",
+        category,
+        noun_infos.len(),
+        total_count
+    );
+
+    let mut all_processed_refnos = Vec::new();
+
+    // 每次处理 2 个 NOUN 类型
+    for (chunk_idx, chunk) in noun_infos.chunks(2).enumerate() {
+        let noun_names: Vec<_> = chunk.iter().map(|n| format!("{}({})", n.noun, n.count)).collect();
+        println!("[{:?}] 第 {} 批并发处理: {:?}", category, chunk_idx + 1, noun_names);
+
+        // 收集本批次的 refnos
+        for info in chunk {
+            all_processed_refnos.extend(info.refnos.iter().copied());
+        }
+
+        // 并发处理本批次的 NOUN 类型
+        let handles: Vec<_> = chunk
+            .iter()
+            .map(|info| {
+                let ctx = ctx.clone();
+                let sender = sender.clone();
+                let loop_sjus_map = loop_sjus_map.clone();
+                let refnos = info.refnos.clone();
+                let noun = info.noun;
+
+                tokio::spawn(async move {
+                    process_single_noun_type(&ctx, category, &refnos, loop_sjus_map, sender, noun).await
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.await.map_err(|e| {
+                FullNounError::GeometryGenerationFailed(format!("{:?}", category), e.to_string())
+            })??;
+        }
+    }
+
+    Ok(all_processed_refnos)
+}
+
+/// 处理单个 NOUN 类型的所有 refnos
+async fn process_single_noun_type(
+    ctx: &NounProcessContext,
+    category: NounCategoryType,
+    refnos: &[RefnoEnum],
+    loop_sjus_map: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
+    sender: flume::Sender<ShapeInstancesData>,
+    noun: &str,
+) -> Result<()> {
+    if refnos.is_empty() {
+        return Ok(());
+    }
+
+    let ranges = ctx.bounded_chunks(refnos.len());
+    for (page_idx, (start, end)) in ranges.into_iter().enumerate() {
+        let slice = &refnos[start..end];
+        println!(
+            "[{:?}:{}] 处理第 {} 页 ({} ~ {})",
+            category, noun, page_idx + 1, start + 1, end
+        );
+
+        match category {
+            NounCategoryType::Loop => {
+                process_loop_refno_page(ctx, loop_sjus_map.clone(), sender.clone(), slice)
+                    .await
+                    .map_err(|e| {
+                        FullNounError::GeometryGenerationFailed(format!("loop:{}", noun), e.to_string())
+                    })?;
+            }
+            NounCategoryType::Prim => {
+                process_prim_refno_page(ctx, sender.clone(), slice)
+                    .await
+                    .map_err(|e| {
+                        FullNounError::GeometryGenerationFailed(format!("prim:{}", noun), e.to_string())
+                    })?;
+            }
+            NounCategoryType::Cate => {
+                process_cate_refno_page(ctx, loop_sjus_map.clone(), sender.clone(), slice)
+                    .await
+                    .map_err(|e| {
+                        FullNounError::GeometryGenerationFailed(format!("cate:{}", noun), e.to_string())
+                    })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Full Noun 模式下生成所有几何体（优化版本）
 ///
 /// # 主要改进
@@ -486,37 +655,33 @@ pub async fn gen_full_noun_geos_optimized(
     }
 
     // ============================================================================
-    // [1/4] 处理剩余的 LOOP（跳过已生成的）
+    // [1/4] 处理剩余的 LOOP（按 NOUN 类型分组，每次 2 个并发）
     // ============================================================================
-    println!("📍 [1/4] 处理 LOOP Refno 集合（跳过已生成）...");
+    println!("📍 [1/4] 处理 LOOP Refno 集合（按 NOUN 类型分组）...");
     let loop_start = Instant::now();
+
+    // 预查询 LOOP 类型的数量，过滤空类型
+    let loop_noun_infos = prequery_noun_counts(&GNERAL_LOOP_OWNER_NOUN_NAMES, &dbnums).await?;
+
     // 过滤掉已生成的 refno
-    let loop_vec: Vec<RefnoEnum> = loop_refnos
-        .iter()
-        .copied()
-        .filter(|r| !bran_generated_refnos.contains(r))
+    let loop_noun_infos: Vec<NounTypeInfo> = loop_noun_infos
+        .into_iter()
+        .map(|mut info| {
+            info.refnos.retain(|r| !bran_generated_refnos.contains(r));
+            info.count = info.refnos.len();
+            info
+        })
+        .filter(|info| !info.refnos.is_empty())
         .collect();
-    let loop_skipped = loop_refnos.len() - loop_vec.len();
-    if loop_skipped > 0 {
-        println!("[gen_full_noun_geos] LOOP 跳过已生成: {} 个", loop_skipped);
-    }
-    {
-        let ranges = ctx.bounded_chunks(loop_vec.len());
-        for (page_index, (start, end)) in ranges.into_iter().enumerate() {
-            let slice = &loop_vec[start..end];
-            println!(
-                "[gen_full_noun_geos] loop: 处理第 {} 页 ({} ~ {})",
-                page_index + 1,
-                start + 1,
-                end
-            );
-            process_loop_refno_page(&ctx, loop_sjus_map_arc.clone(), sender.clone(), slice)
-                .await
-                .map_err(|e| {
-                    FullNounError::GeometryGenerationFailed("loop".to_string(), e.to_string())
-                })?;
-        }
-    }
+
+    let loop_vec = process_nouns_by_type(
+        loop_noun_infos,
+        &ctx,
+        NounCategoryType::Loop,
+        loop_sjus_map_arc.clone(),
+        sender.clone(),
+    ).await?;
+
     let loop_duration = loop_start.elapsed();
     println!("⏱️  LOOP processing took {} ms", loop_duration.as_millis());
 
@@ -527,26 +692,20 @@ pub async fn gen_full_noun_geos_optimized(
         "LOOP Noun processing completed (entry-based)"
     );
 
-    println!("📍 [2/4] 处理 PRIM Refno 集合...");
+    println!("📍 [2/4] 处理 PRIM Refno 集合（按 NOUN 类型分组）...");
     let prim_start = Instant::now();
-    let prim_vec: Vec<RefnoEnum> = prim_refnos.iter().copied().collect();
-    {
-        let ranges = ctx.bounded_chunks(prim_vec.len());
-        for (page_index, (start, end)) in ranges.into_iter().enumerate() {
-            let slice = &prim_vec[start..end];
-            println!(
-                "[gen_full_noun_geos] prim: 处理第 {} 页 ({} ~ {})",
-                page_index + 1,
-                start + 1,
-                end
-            );
-            process_prim_refno_page(&ctx, sender.clone(), slice)
-                .await
-                .map_err(|e| {
-                    FullNounError::GeometryGenerationFailed("prim".to_string(), e.to_string())
-                })?;
-        }
-    }
+
+    // 预查询 PRIM 类型的数量，过滤空类型
+    let prim_noun_infos = prequery_noun_counts(&GNERAL_PRIM_NOUN_NAMES, &dbnums).await?;
+
+    let prim_vec = process_nouns_by_type(
+        prim_noun_infos,
+        &ctx,
+        NounCategoryType::Prim,
+        loop_sjus_map_arc.clone(),
+        sender.clone(),
+    ).await?;
+
     let prim_duration = prim_start.elapsed();
     println!("⏱️  PRIM processing took {} ms", prim_duration.as_millis());
 
@@ -557,35 +716,31 @@ pub async fn gen_full_noun_geos_optimized(
         "PRIM Noun processing completed (entry-based)"
     );
 
-    println!("📍 [3/4] 处理 CATE Refno 集合（跳过已生成）...");
+    println!("📍 [3/4] 处理 CATE Refno 集合（按 NOUN 类型分组）...");
     let cate_start = Instant::now();
+
+    // 预查询 CATE 类型的数量，过滤空类型
+    let cate_noun_infos = prequery_noun_counts(&USE_CATE_NOUN_NAMES, &dbnums).await?;
+
     // 过滤掉已生成的 refno
-    let cate_vec: Vec<RefnoEnum> = cate_refnos
-        .iter()
-        .copied()
-        .filter(|r| !bran_generated_refnos.contains(r))
+    let cate_noun_infos: Vec<NounTypeInfo> = cate_noun_infos
+        .into_iter()
+        .map(|mut info| {
+            info.refnos.retain(|r| !bran_generated_refnos.contains(r));
+            info.count = info.refnos.len();
+            info
+        })
+        .filter(|info| !info.refnos.is_empty())
         .collect();
-    let cate_skipped = cate_refnos.len() - cate_vec.len();
-    if cate_skipped > 0 {
-        println!("[gen_full_noun_geos] CATE 跳过已生成: {} 个", cate_skipped);
-    }
-    {
-        let ranges = ctx.bounded_chunks(cate_vec.len());
-        for (page_index, (start, end)) in ranges.into_iter().enumerate() {
-            let slice = &cate_vec[start..end];
-            println!(
-                "[gen_full_noun_geos] cate: 处理第 {} 页 ({} ~ {})",
-                page_index + 1,
-                start + 1,
-                end
-            );
-            process_cate_refno_page(&ctx, loop_sjus_map_arc.clone(), sender.clone(), slice)
-                .await
-                .map_err(|e| {
-                    FullNounError::GeometryGenerationFailed("cate".to_string(), e.to_string())
-                })?;
-        }
-    }
+
+    let cate_vec = process_nouns_by_type(
+        cate_noun_infos,
+        &ctx,
+        NounCategoryType::Cate,
+        loop_sjus_map_arc.clone(),
+        sender.clone(),
+    ).await?;
+
     let cate_duration = cate_start.elapsed();
     println!("⏱️  CATE processing took {} ms", cate_duration.as_millis());
 

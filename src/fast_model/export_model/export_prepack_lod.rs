@@ -2518,7 +2518,7 @@ pub async fn export_dbnum_instances_json(
                 "lod_mask": 1u32, // 默认 LOD 掩码
                 "spec_value": spec_value.unwrap_or(0),
                 "refno_transform": world_transform_vec,
-                "instances": instances,
+                "geo_instances": instances,
             }));
         }
 
@@ -2641,28 +2641,36 @@ pub async fn export_dbnum_instances_json(
             .get(&row.refno)
             .copied()
             .unwrap_or(DMat4::IDENTITY);
+        
+        // refno_transform: refno 的世界变换矩阵
+        let refno_transform_vec: Vec<f32> = mat4_to_vec_dmat4(
+            &refno_world,
+            &UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Millimeter),
+            false,
+        );
+        
         let geo_instances: Vec<serde_json::Value> = instance_geom_map
             .get(&row.refno)
             .map(|insts| {
                 insts
                     .iter()
                     .map(|inst| {
-                        // transform 统一输出 world matrix（与 aabb(world) 同口径）。
-                        // 注意：实例级布尔（has_neg=true）时，aios-core 返回的 inst.transform 已经是 world_trans.d，
-                        // 这里不能再乘 refno_world，否则会把世界变换应用两次。
-                        let world_matrix = if has_neg {
-                            plant_transform_to_dmat4(&inst.transform)
+                        // geo_transform 输出局部变换（相对 refno 的变换）
+                        // 注意：实例级布尔（has_neg=true）时，aios-core 返回的 inst.transform 已经包含世界变换，
+                        // 此时 geo_transform 设为单位矩阵，refno_transform 设为实际世界变换。
+                        let geo_mat = if has_neg {
+                            DMat4::IDENTITY
                         } else {
-                            refno_world * plant_transform_to_dmat4(&inst.transform)
+                            plant_transform_to_dmat4(&inst.transform)
                         };
                         let geo_transform = mat4_to_vec_dmat4(
-                            &world_matrix,
+                            &geo_mat,
                             &UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Millimeter),
                             false,
                         );
                         json!({
                             "geo_hash": inst.geo_hash,
-                            "transform": geo_transform,
+                            "geo_transform": geo_transform,
                         })
                     })
                     .collect()
@@ -2678,6 +2686,7 @@ pub async fn export_dbnum_instances_json(
             "noun": row.noun.unwrap_or_default(),
             "name": row.name.unwrap_or_default(),
             "aabb": aabb_json,
+            "refno_transform": refno_transform_vec,
             "geo_instances": geo_instances,
         }));
     }

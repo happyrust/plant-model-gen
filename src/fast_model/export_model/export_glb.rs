@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
@@ -18,6 +19,64 @@ use super::export_common::{ExportData, collect_export_data};
 use super::model_exporter::{
     ExportStats, GlbExportConfig, ModelExporter, collect_export_refnos, query_geometry_instances,
 };
+
+fn compute_vertex_normals(mesh: &PlantMesh) -> Vec<Vec3> {
+    let vertex_count = mesh.vertices.len();
+    if vertex_count == 0 {
+        return Vec::new();
+    }
+
+    let mut center = Vec3::ZERO;
+    for &v in &mesh.vertices {
+        center += v;
+    }
+    center /= vertex_count as f32;
+
+    let mut normals = vec![Vec3::ZERO; vertex_count];
+    let mut dot_sum = 0.0f32;
+    let mut dot_count = 0u32;
+
+    for tri in mesh.indices.chunks(3) {
+        if tri.len() < 3 {
+            continue;
+        }
+        let a_idx = tri[0] as usize;
+        let b_idx = tri[1] as usize;
+        let c_idx = tri[2] as usize;
+        if a_idx >= vertex_count || b_idx >= vertex_count || c_idx >= vertex_count {
+            continue;
+        }
+
+        let a = mesh.vertices[a_idx];
+        let b = mesh.vertices[b_idx];
+        let c = mesh.vertices[c_idx];
+        let normal = (b - a).cross(c - a);
+        if normal.length_squared() > f32::EPSILON {
+            normals[a_idx] += normal;
+            normals[b_idx] += normal;
+            normals[c_idx] += normal;
+
+            let triangle_center = (a + b + c) / 3.0;
+            let to_center = triangle_center - center;
+            dot_sum += normal.dot(to_center);
+            dot_count += 1;
+        }
+    }
+
+    if dot_count > 0 && dot_sum < 0.0 {
+        for normal in normals.iter_mut() {
+            *normal = -*normal;
+        }
+    }
+
+    for normal in normals.iter_mut() {
+        if normal.length_squared() > f32::EPSILON {
+            *normal = normal.normalize();
+        }
+    }
+
+    normals
+}
 
 async fn filter_refnos_with_inst_relate_aabb(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
     if refnos.is_empty() {
@@ -210,6 +269,12 @@ fn export_mesh_to_glb(
              .with_context(|| format!("Export GLB: 加载 mesh {} 失败", geo_hash))?;
 
         let vertex_count = mesh.vertices.len();
+        let normals: Cow<[Vec3]> = if mesh.normals.len() == vertex_count && !mesh.normals.is_empty()
+        {
+            Cow::Borrowed(&mesh.normals)
+        } else {
+            Cow::Owned(compute_vertex_normals(mesh.as_ref()))
+        };
         let mut min_pos = Vec3::new(f32::MAX, f32::MAX, f32::MAX);
         let mut max_pos = Vec3::new(f32::MIN, f32::MIN, f32::MIN);
 
@@ -235,7 +300,7 @@ fn export_mesh_to_glb(
 
         // Normals
         let normals_offset = all_normals_bytes.len();
-        for normal in &mesh.normals {
+        for normal in normals.iter() {
             all_normals_bytes.extend_from_slice(&normal.x.to_le_bytes());
             all_normals_bytes.extend_from_slice(&normal.y.to_le_bytes());
             all_normals_bytes.extend_from_slice(&normal.z.to_le_bytes());
@@ -253,7 +318,7 @@ fn export_mesh_to_glb(
                 positions_offset,
                 positions_count: vertex_count,
                 normals_offset,
-                normals_count: mesh.normals.len(),
+                normals_count: normals.len(),
                 indices_offset,
                 indices_count: mesh.indices.len(),
                 min_pos,
@@ -386,6 +451,36 @@ fn export_mesh_to_glb(
     nodes.push(json!({"name": "root_placeholder"}));
     let mut current_node_index = 1;
 
+    // 辅助函数：创建变换矩阵数组（列主序）
+    let create_matrix_array = |matrix: &glam::DMat4| -> [f32; 16] {
+        let scale_factor = unit_converter.conversion_factor() as f64;
+        let translation = Vec3::new(
+            matrix.w_axis.x as f32,
+            matrix.w_axis.y as f32,
+            matrix.w_axis.z as f32,
+        );
+        let converted_translation = unit_converter.convert_vec3(&translation);
+
+        [
+            (matrix.x_axis.x * scale_factor) as f32,
+            (matrix.x_axis.y * scale_factor) as f32,
+            (matrix.x_axis.z * scale_factor) as f32,
+            matrix.x_axis.w as f32,
+            (matrix.y_axis.x * scale_factor) as f32,
+            (matrix.y_axis.y * scale_factor) as f32,
+            (matrix.y_axis.z * scale_factor) as f32,
+            matrix.y_axis.w as f32,
+            (matrix.z_axis.x * scale_factor) as f32,
+            (matrix.z_axis.y * scale_factor) as f32,
+            (matrix.z_axis.z * scale_factor) as f32,
+            matrix.z_axis.w as f32,
+            converted_translation.x,
+            converted_translation.y,
+            converted_translation.z,
+            matrix.w_axis.w as f32,
+        ]
+    };
+
     // 生成节点（两级层级结构）：元件父节点 -> 几何体子节点）
     let mut component_parent_indices = Vec::new();
 
@@ -419,10 +514,12 @@ fn export_mesh_to_glb(
                 )
             };
 
-            // 使用单位矩阵（无变换），确保 GLB 中的模型是原始的单位 mesh
-            let matrix_array = [
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-            ];
+            let combined_transform = if component.has_neg {
+                geometry.local_transform
+            } else {
+                component.world_transform * geometry.local_transform
+            };
+            let matrix_array = create_matrix_array(&combined_transform);
 
             let geo_node = json!({
                 "name": geo_node_name,
@@ -480,10 +577,7 @@ fn export_mesh_to_glb(
             }
         };
 
-        // 使用单位矩阵（无变换），确保 GLB 中的模型是原始的单位 mesh
-        let matrix_array = [
-            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-        ];
+        let matrix_array = create_matrix_array(&tubing.transform);
 
         let tubing_node = json!({
             "name": tubing.name,
@@ -766,11 +860,17 @@ pub fn export_single_mesh_to_glb(mesh: &PlantMesh, output_path: &Path) -> Result
     // 转换 Vec3 为 f32 数组
     let positions: Vec<f32> = mesh.vertices.iter().flat_map(|v| [v.x, v.y, v.z]).collect();
 
-    let normals: Vec<f32> = if !mesh.normals.is_empty() {
-        mesh.normals.iter().flat_map(|n| [n.x, n.y, n.z]).collect()
+    let normals_source: Cow<[Vec3]> = if mesh.normals.len() == mesh.vertices.len()
+        && !mesh.normals.is_empty()
+    {
+        Cow::Borrowed(&mesh.normals)
     } else {
-        Vec::new()
+        Cow::Owned(compute_vertex_normals(mesh))
     };
+    let normals: Vec<f32> = normals_source
+        .iter()
+        .flat_map(|n| [n.x, n.y, n.z])
+        .collect();
 
     // 构建 buffer 数据
     let mut buffer_data = Vec::new();
@@ -880,7 +980,7 @@ pub fn export_single_mesh_to_glb(mesh: &PlantMesh, output_path: &Path) -> Result
                 "bufferView": 1,
                 "byteOffset": 0,
                 "componentType": 5126,
-                "count": mesh.normals.len(),
+                "count": normals_source.len(),
                 "type": "VEC3"
             }),
         );

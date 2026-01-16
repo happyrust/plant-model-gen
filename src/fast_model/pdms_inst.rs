@@ -246,14 +246,6 @@ pub async fn save_instance_data_optimize(
                             neg_refno.to_pe_key(), // 负载体
                             target.to_pe_key(),    // 正实体（被减实体）
                         ));
-                        // 兼容：同时写入 out=inst_relate:⟨refno⟩ 的关系，供旧布尔查询/worker 使用
-                        //（它们通常在 inst_relate 节点上做 `in<-neg_relate` / `in<-ngmr_relate` 判断）
-                        neg_buffer.push(format!(
-                            "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', {2}], out: {2}, pe: {1} }}",
-                            geo_relate_id,         // 切割几何
-                            neg_refno.to_pe_key(), // 负载体
-                            target_inst,           // 目标 inst_relate
-                        ));
 
                         if neg_buffer.len() >= CHUNK_SIZE {
                             let statement = format!(
@@ -310,14 +302,6 @@ pub async fn save_instance_data_optimize(
                             geo_relate_id,  // 切割几何
                             ele_pe,         // 负载体
                             target_pe,      // 正实体（目标）
-                            ngmr_pe         // NGMR 几何引用
-                        ));
-                        // 兼容：同时写入 out=inst_relate:⟨refno⟩ 的关系，供旧布尔查询/worker 使用
-                        ngmr_buffer.push(format!(
-                            "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', {2}], out: {2}, pe: {1}, ngmr: {3} }}",
-                            geo_relate_id,  // 切割几何
-                            ele_pe,         // 负载体
-                            target_inst,    // 目标 inst_relate
                             ngmr_pe         // NGMR 几何引用
                         ));
 

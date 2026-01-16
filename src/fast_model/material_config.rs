@@ -10,6 +10,9 @@ use serde_json::{Value, json};
 
 const DEFAULT_LIBRARY_PATH: &str = "assets/material/plant_pipeline_materials.json";
 
+/// 默认灰色材质 (RGB: 144, 164, 174 -> #90a4ae)
+const DEFAULT_GRAY_COLOR: [f32; 4] = [0.565, 0.643, 0.682, 1.0];
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct MaterialLibraryFile {
     #[serde(default)]
@@ -64,8 +67,46 @@ pub struct MaterialLibrary {
 }
 
 impl MaterialLibrary {
+    /// 创建一个使用默认灰色材质的空材质库
+    pub fn with_default_gray() -> Self {
+        let default_material = MaterialDefinition {
+            name: "DefaultGray".to_string(),
+            description: Some("默认灰色材质".to_string()),
+            pbr_metallic_roughness: Some(PbrMetallicRoughness {
+                base_color_factor: Some(DEFAULT_GRAY_COLOR),
+                base_color_texture: None,
+                metallic_factor: Some(0.1),
+                roughness_factor: Some(0.5),
+                metallic_roughness_texture: None,
+            }),
+        };
+
+        let mut index_map = HashMap::new();
+        index_map.insert("DefaultGray".to_string(), 0);
+
+        let color_scheme_manager = ColorSchemeManager::load_from_file("ColorSchemes.toml")
+            .ok()
+            .or_else(|| Some(ColorSchemeManager::default_schemes()));
+
+        Self {
+            materials: vec![default_material],
+            noun_bindings: HashMap::new(),
+            index_map,
+            default_material: Some("DefaultGray".to_string()),
+            source_path: PathBuf::from("(内置默认)"),
+            color_scheme_manager,
+        }
+    }
+
+    /// 加载默认材质库，如果文件不存在则使用默认灰色材质
     pub fn load_default() -> Result<Self> {
-        Self::load_from_path(DEFAULT_LIBRARY_PATH)
+        match Self::load_from_path(DEFAULT_LIBRARY_PATH) {
+            Ok(lib) => Ok(lib),
+            Err(_) => {
+                eprintln!("[材质库] 未找到 {}, 使用默认灰色材质", DEFAULT_LIBRARY_PATH);
+                Ok(Self::with_default_gray())
+            }
+        }
     }
 
     pub fn load_from_path<P: AsRef<Path>>(path: P) -> Result<Self> {

@@ -234,6 +234,18 @@ async fn query_pending_mesh_geo_ids(limit: usize, replace_exist: bool) -> anyhow
     Ok(ids)
 }
 
+/// 查询待处理 mesh 的总数（不限制数量）
+async fn query_total_pending_mesh_count(replace_exist: bool) -> anyhow::Result<usize> {
+    let sql = if replace_exist {
+        "SELECT VALUE count() FROM inst_geo WHERE param != NONE AND bad != true GROUP ALL".to_string()
+    } else {
+        "SELECT VALUE count() FROM inst_geo WHERE meshed != true AND param != NONE AND bad != true GROUP ALL".to_string()
+    };
+    
+    let counts: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+    Ok(counts.first().copied().unwrap_or(0) as usize)
+}
+
 /// 基于 inst_geo 状态的 Mesh 生成 Worker
 ///
 /// 按批次扫描需要生成 mesh 的 inst_geo 记录，直接基于 geo_id 生成网格。
@@ -257,6 +269,26 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
     // 性能优化：启动前预加载数据库中已网格化的几何信息到内存，避免后续循环中重复查询。
     crate::fast_model::preload_mesh_cache().await?;
 
+    // 🔥 查询待处理的总数，用于显示进度
+    let total_count = query_total_pending_mesh_count(replace_exist).await?;
+    println!(
+        "╔════════════════════════════════════════╗\n\
+         ║  [mesh_worker] 开始处理 Mesh 生成      ║\n\
+         ╠════════════════════════════════════════╣\n\
+         ║  待处理总数: {:>8}                  ║\n\
+         ║  批次大小:   {:>8}                  ║\n\
+         ║  替换模式:   {:>8}                  ║\n\
+         ╚════════════════════════════════════════╝",
+        total_count, batch_size, replace_exist
+    );
+
+    if total_count == 0 {
+        println!("[mesh_worker] 没有待处理 mesh 任务，退出");
+        return Ok(());
+    }
+
+    let worker_start = std::time::Instant::now();
+
     loop {
         let round_start = std::time::Instant::now();
         let pending_geo_ids = query_pending_mesh_geo_ids(batch_size, replace_exist).await?;
@@ -279,12 +311,21 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
         last_pending = Some(pending.clone());
         
         round += 1;
+        
+        // 🔥 计算并显示进度
+        let progress_pct = if total_count > 0 {
+            (total_processed as f64 / total_count as f64 * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        
         println!(
-            "[mesh_worker] 轮次 {}: pending={} batch_size={} replace_exist={}",
+            "[mesh_worker] 📊 进度: [{}/{}] ({:.1}%) | 轮次 {} | 本批 {} 个",
+            total_processed,
+            total_count,
+            progress_pct,
             round,
-            pending_geo_ids.len(),
-            batch_size,
-            replace_exist
+            pending_geo_ids.len()
         );
         
         if !pending_geo_ids.is_empty() {
@@ -298,7 +339,7 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
             ).await?;
             
             println!(
-                "[mesh_worker] 轮次 {} mesh 生成完成: {} 个，用时 {} ms",
+                "[mesh_worker] ✅ 轮次 {} 完成: {} 个，用时 {} ms",
                 round,
                 pending_geo_ids.len(),
                 t.elapsed().as_millis()
@@ -306,13 +347,6 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
         }
         
         total_processed += pending_geo_ids.len();
-        println!(
-            "[mesh_worker] 轮次 {} 结束: 本轮 {} 个，累计 {} 个，用时 {} ms",
-            round,
-            pending_geo_ids.len(),
-            total_processed,
-            round_start.elapsed().as_millis()
-        );
         
         // 如果连续3轮 pending 集合未变化，可能卡住了
         if stalled_rounds >= 3 {
@@ -334,9 +368,26 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
         }
     }
     
+    let total_time = worker_start.elapsed();
+    let avg_speed = if total_time.as_secs() > 0 {
+        total_processed as f64 / total_time.as_secs_f64()
+    } else {
+        total_processed as f64
+    };
+    
     println!(
-        "[mesh_worker] mesh 生成完成: 共 {} 轮，累计处理 {} 个实例",
-        round, total_processed
+        "╔════════════════════════════════════════╗\n\
+         ║  [mesh_worker] Mesh 生成完成           ║\n\
+         ╠════════════════════════════════════════╣\n\
+         ║  处理总数:   {:>8}                  ║\n\
+         ║  总轮次:     {:>8}                  ║\n\
+         ║  总耗时:     {:>8} ms              ║\n\
+         ║  平均速度:   {:>8.1} 个/秒          ║\n\
+         ╚════════════════════════════════════════╝",
+        total_processed,
+        round,
+        total_time.as_millis(),
+        avg_speed
     );
     
     Ok(())

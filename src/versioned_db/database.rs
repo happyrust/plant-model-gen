@@ -864,8 +864,6 @@ where
         file.read_exact(&mut buf).await.unwrap();
         let db_basic_info = parse_file_basic_info(&buf);
         let db_type = db_basic_info.db_type;
-        println!("db_type: {}", db_type);
-        continue;
         let db_no = db_basic_info.db_no;
 
         if is_replace {

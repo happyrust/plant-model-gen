@@ -251,6 +251,10 @@ name = "debug_refno_21491_19209"
 path = "src/examples/debug_refno_21491_19209.rs"
 
 [[example]]
+name = "refresh_pe_transform"
+path = "examples/refresh_pe_transform.rs"
+
+[[example]]
 name = "room_calculation_demo"
 path = "examples/room_calculation_demo.rs"
 required-features = ["gen_model", "sqlite-index"]

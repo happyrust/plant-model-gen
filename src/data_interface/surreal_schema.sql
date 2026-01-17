@@ -74,6 +74,12 @@ DEFINE FIELD matrix ON TABLE world_transforms TYPE array;
 DEFINE FIELD updated_at ON TABLE world_transforms TYPE datetime DEFAULT time::now();
 DEFINE INDEX idx_transform_refno ON TABLE world_transforms COLUMNS refno UNIQUE;
 
+-- PE transforms cache (局部/世界变换缓存，使用 trans 引用)
+DEFINE TABLE pe_transform SCHEMAFULL;
+DEFINE FIELD local_trans ON TABLE pe_transform TYPE option<record<trans>>;
+DEFINE FIELD world_trans ON TABLE pe_transform TYPE option<record<trans>>;
+DEFINE FIELD updated_at ON TABLE pe_transform TYPE datetime DEFAULT time::now();
+
 -- MDB worlds (MDB世界节点)
 DEFINE TABLE mdb_worlds SCHEMAFULL;
 DEFINE FIELD project ON TABLE mdb_worlds TYPE string;

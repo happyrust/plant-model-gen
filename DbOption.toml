@@ -1,5 +1,5 @@
-total_sync = false
-replace_dbs = false
+total_sync = true
+replace_dbs = true
 incr_sync = false
 sync_history = false
 enable_log = true
@@ -65,7 +65,7 @@ gen_noun_graph = false
 #arangodb 配置
 arangodb_database = "ams"
 multi_threads = false
-only_sync_sys = false
+only_sync_sys = true
 arangodb_url = "http://127.0.0.1:8529"
 rebuild_ssc_tree = false
 arangodb_user = "root"

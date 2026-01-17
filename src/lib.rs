@@ -13,14 +13,14 @@ use crate::fast_model::cal_model::{update_cal_bran_component, update_cal_equip};
 #[cfg(feature = "gen_model")]
 use crate::fast_model::gen_all_geos_data;
 
-// build_room_relations 支持 web_server + (sqlite-index 或 duckdb-feature)
-#[cfg(all(not(target_arch = "wasm32"), feature = "web_server", any(feature = "sqlite-index", feature = "duckdb-feature")))]
+// build_room_relations 支持 CLI/web_server + (sqlite-index 或 duckdb-feature)
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 use crate::fast_model::room_model::build_room_relations;
 
 // 当条件不满足时提供 stub
-#[cfg(not(all(not(target_arch = "wasm32"), feature = "web_server", any(feature = "sqlite-index", feature = "duckdb-feature"))))]
+#[cfg(not(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature"))))]
 pub async fn build_room_relations(_db_option: &aios_core::options::DbOption) -> anyhow::Result<()> {
-    log::info!("⚠️ build_room_relations 功能需要 web_server + (sqlite-index 或 duckdb-feature) 特性");
+    log::info!("⚠️ build_room_relations 功能需要 (sqlite-index 或 duckdb-feature) 特性");
     Ok(())
 }
 use crate::fast_model::{
@@ -101,10 +101,14 @@ pub mod mqtt_service;
 pub mod options;
 pub mod shared; // 共享模块（进度广播中心等）
 
-// #[cfg(feature = "grpc")]
-// pub mod grpc_service;
+#[cfg(feature = "tonic")]
+pub mod grpc_service;
+#[cfg(feature = "sqlite-index")]
+pub mod sqlite_index;
 #[cfg(feature = "sqlite-index")]
 pub mod spatial_index;
+#[cfg(all(feature = "sqlite-index", feature = "tonic"))]
+pub mod test_spatial_query;
 
 
 // 添加options模块的重导出

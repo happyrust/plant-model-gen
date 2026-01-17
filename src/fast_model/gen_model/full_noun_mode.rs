@@ -274,36 +274,275 @@ pub async fn gen_full_noun_geos_optimized(
 ) -> Result<CategorizedRefnos> {
     let total_start = Instant::now();
 
-    println!("🚀 启动 Full Noun 模式（入口 Noun 深度查询版本）");
+    println!("🚀 启动 Full Noun 模式（统一流水线版）");
     config.print_info();
 
-    // 🔥 读取数据库过滤配置：优先 manual_db_nums，否则按当前 MDB 的 DB 列表，并应用 exclude_db_nums
+    // 1. 获取数据库过滤列表
+    let dbnums = get_filtered_dbnums(&db_option).await?;
+    if !dbnums.is_empty() {
+        println!("🗂️  数据库过滤: 仅查询 dbnum = {:?}", dbnums);
+    }
+
+    let loop_sjus_map_arc = Arc::new(DashMap::new());
+    validate_sjus_map(&loop_sjus_map_arc, config)?;
+
+    let mut categorized = CategorizedRefnos::new();
+    let mut bran_generated_refnos = HashSet::new();
+
+    // ============================================================================
+    // 🚩 [第一阶段] BRAN/HANG 核心逻辑（始终执行）
+    // ============================================================================
+    let mut bran_hanger_roots: HashSet<RefnoEnum> = HashSet::new();
+    for noun in &["BRAN", "HANG"] {
+        let refnos = query_noun_refnos(noun, &dbnums, config.debug_limit_per_noun).await?;
+        if !refnos.is_empty() {
+            println!("[Pipeline] 收集到 {} 根节点: {} 个", noun, refnos.len());
+            bran_hanger_roots.extend(refnos);
+        }
+    }
+
+    let bran_roots_vec: Vec<RefnoEnum> = bran_hanger_roots.into_iter().collect();
+    let mut bran_duration = Duration::ZERO;
+    if !bran_roots_vec.is_empty() {
+        let bran_start = Instant::now();
+        process_bran_hang_core_logic(
+            &db_option,
+            &bran_roots_vec,
+            loop_sjus_map_arc.clone(),
+            sender.clone(),
+            &mut bran_generated_refnos,
+        )
+        .await?;
+        bran_duration = bran_start.elapsed();
+
+        // 记录 BRAN/HANG 为 Cate 类别
+        for r in &bran_roots_vec {
+            categorized.insert(*r, super::models::NounCategory::Cate);
+        }
+    }
+
+    // ============================================================================
+    // 🚦 [判定点] 如果仅启用了 BRAN/HANG，此时可以结束
+    // ============================================================================
+    let only_bran_hang = config.enabled_categories.iter().all(|cat| {
+        let upper = cat.to_uppercase();
+        upper == "BRAN" || upper == "HANG"
+    });
+
+    if only_bran_hang {
+        println!("✅ [Optimization] 仅需处理 BRAN/HANG。已于流水线第一阶段完成退出。");
+        return Ok(categorized);
+    }
+
+    // ============================================================================
+    // 🔍 [第二阶段] 通用深度查询路径（处理 LOOP/PRIM/CATE）
+    // ============================================================================
+    println!("🔍 正在收集其余 Noun 的根节点并执行深度递归查询...");
+
+    let entry_nouns = get_entry_nouns(config);
+    if entry_nouns.is_empty() {
+        println!("[Pipeline] 加载到的其余入口 Noun 列表为空。");
+    } else {
+        println!("📌 补充入口 Noun 列表: {:?}", entry_nouns);
+
+        let mut all_roots = HashSet::new();
+        let mut loop_refnos = HashSet::new();
+        let mut prim_refnos = HashSet::new();
+        let mut cate_refnos = HashSet::new();
+
+        // 收集根节点
+        for entry in &entry_nouns {
+            let noun_upper = entry.to_uppercase();
+            let noun_str = noun_upper.as_str();
+            
+            // 跳过已处理的 BRAN/HANG
+            if noun_str == "BRAN" || noun_str == "HANG" { continue; }
+
+            let refnos = query_noun_refnos(noun_str, &dbnums, config.debug_limit_per_noun).await?;
+            if refnos.is_empty() { continue; }
+
+            track_refno_issues(&refnos, noun_str, RefnoErrorStage::InputParse);
+            all_roots.extend(refnos.iter().copied());
+
+            if GNERAL_LOOP_OWNER_NOUN_NAMES.contains(&noun_str) {
+                loop_refnos.extend(refnos.iter().copied());
+            }
+            if GNERAL_PRIM_NOUN_NAMES.contains(&noun_str) {
+                prim_refnos.extend(refnos.iter().copied());
+            }
+            if USE_CATE_NOUN_NAMES.contains(&noun_str) {
+                cate_refnos.extend(refnos.iter().copied());
+            }
+        }
+
+        if !all_roots.is_empty() {
+            println!("[Pipeline] 其余根节点总数 {}", all_roots.len());
+            let roots_vec: Vec<RefnoEnum> = all_roots.into_iter().collect();
+
+            // 递归收集子节点
+            collect_all_descendants(&roots_vec, &mut loop_refnos, &mut prim_refnos, &mut cate_refnos).await?;
+
+            let ctx = NounProcessContext::new(
+                db_option.clone(),
+                config.batch_size.get(),
+                config.concurrency.get(),
+            );
+
+            // [1-3/4] 处理 LOOP, PRIM, CATE
+            let (loop_vec, loop_dur) = process_loop_stage(&ctx, loop_refnos, &dbnums, &bran_generated_refnos, loop_sjus_map_arc.clone(), sender.clone()).await?;
+            let (prim_vec, prim_dur) = process_prim_stage(&ctx, prim_refnos, &dbnums, sender.clone()).await?;
+            let (cate_vec, cate_dur) = process_cate_stage(&ctx, cate_refnos, &dbnums, &bran_generated_refnos, loop_sjus_map_arc, sender).await?;
+
+            // 归类结果
+            for r in &cate_vec { categorized.insert(*r, super::models::NounCategory::Cate); }
+            for r in &loop_vec { categorized.insert(*r, super::models::NounCategory::LoopOwner); }
+            for r in &prim_vec { categorized.insert(*r, super::models::NounCategory::Prim); }
+
+            let total_duration = total_start.elapsed();
+            print_final_summary(total_duration, loop_dur, prim_dur, cate_dur, bran_duration);
+        }
+    }
+
+    categorized.print_statistics();
+    Ok(categorized)
+}
+
+/// 内部核心逻辑：处理 BRAN/HANG 相关的 CATE 生成及 Tubing
+async fn process_bran_hang_core_logic(
+    db_option: &Arc<DbOptionExt>,
+    bran_roots: &[RefnoEnum],
+    loop_sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
+    sender: flume::Sender<ShapeInstancesData>,
+    bran_generated_refnos: &mut HashSet<RefnoEnum>,
+) -> Result<()> {
+    if bran_roots.is_empty() { return Ok(()); }
+    println!("📍 优先处理 BRAN/HANG 及其依赖 (count={})...", bran_roots.len());
+
+    // 1. 查询子元素并记录已生成的 refno
+    let branch_refnos_map: DashMap<RefnoEnum, Vec<SPdmsElement>> = DashMap::new();
+    for &refno in bran_roots {
+        if let Ok(children) = aios_core::collect_children_elements(refno, &[]).await {
+            for child in &children { bran_generated_refnos.insert(child.refno); }
+            if !children.is_empty() { branch_refnos_map.insert(refno, children); }
+        }
+    }
+
+    // 2. 查询元件库分组
+    let target_bran_reuse_cata_map = aios_core::query_group_by_cata_hash(bran_roots).await
+        .unwrap_or_else(|_| DashMap::new());
+
+    // 3. 生成 CATE 几何
+    let cate_outcome = cata_model::gen_cata_instances(
+        db_option.clone(),
+        Arc::new(target_bran_reuse_cata_map),
+        loop_sjus_map_arc.clone(),
+        sender.clone(),
+    ).await.ok();
+
+    // 4. 保存 tubi_info
+    if let Some(ref outcome) = cate_outcome {
+        let _ = pdms_inst::save_tubi_info_batch(&outcome.tubi_info_map).await;
+    }
+
+    // 5. 生成 Tubing
+    let local_al_map = cate_outcome.map(|o| o.local_al_map).unwrap_or_else(|| Arc::new(DashMap::new()));
+    let _ = cata_model::gen_branch_tubi(
+        db_option.clone(),
+        Arc::new(branch_refnos_map),
+        loop_sjus_map_arc,
+        sender,
+        local_al_map,
+    ).await;
+
+    Ok(())
+}
+
+async fn process_loop_stage(
+    ctx: &NounProcessContext,
+    _loop_refnos: HashSet<RefnoEnum>, // 实际上是通过 prequery_noun_counts 重新确定的，这里参数暂留
+    dbnums: &[u32],
+    bran_generated_refnos: &HashSet<RefnoEnum>,
+    loop_sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
+    sender: flume::Sender<ShapeInstancesData>,
+) -> Result<(Vec<RefnoEnum>, Duration)> {
+    let start = Instant::now();
+    let mut loop_noun_infos = prequery_noun_counts(&GNERAL_LOOP_OWNER_NOUN_NAMES, dbnums).await?;
+    for info in &mut loop_noun_infos {
+        info.refnos.retain(|r| !bran_generated_refnos.contains(r));
+        info.count = info.refnos.len();
+    }
+    loop_noun_infos.retain(|info| info.count > 0);
+
+    let vec = process_nouns_by_type(loop_noun_infos, ctx, NounCategoryType::Loop, loop_sjus_map_arc, sender).await?;
+    Ok((vec, start.elapsed()))
+}
+
+async fn process_prim_stage(
+    ctx: &NounProcessContext,
+    _refnos: HashSet<RefnoEnum>,
+    dbnums: &[u32],
+    sender: flume::Sender<ShapeInstancesData>,
+) -> Result<(Vec<RefnoEnum>, Duration)> {
+    let start = Instant::now();
+    let prim_noun_infos = prequery_noun_counts(&GNERAL_PRIM_NOUN_NAMES, dbnums).await?;
+    let vec = process_nouns_by_type(prim_noun_infos, ctx, NounCategoryType::Prim, Arc::new(DashMap::new()), sender).await?;
+    Ok((vec, start.elapsed()))
+}
+
+async fn process_cate_stage(
+    ctx: &NounProcessContext,
+    _refnos: HashSet<RefnoEnum>,
+    dbnums: &[u32],
+    bran_generated_refnos: &HashSet<RefnoEnum>,
+    loop_sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
+    sender: flume::Sender<ShapeInstancesData>,
+) -> Result<(Vec<RefnoEnum>, Duration)> {
+    let start = Instant::now();
+    let mut cate_noun_infos = prequery_noun_counts(&USE_CATE_NOUN_NAMES, dbnums).await?;
+    for info in &mut cate_noun_infos {
+        info.refnos.retain(|r| !bran_generated_refnos.contains(r));
+        info.count = info.refnos.len();
+    }
+    cate_noun_infos.retain(|info| info.count > 0);
+
+    let vec = process_nouns_by_type(cate_noun_infos, ctx, NounCategoryType::Cate, loop_sjus_map_arc, sender).await?;
+    Ok((vec, start.elapsed()))
+}
+
+fn print_final_summary(total: Duration, l: Duration, p: Duration, c: Duration, b: Duration) {
+    println!("✅ Full Noun 处理完成 (GeneralPath)");
+    println!("⏱️  Total: {} ms [L: {}ms, P: {}ms, C: {}ms, B: {}ms]",
+        total.as_millis(), l.as_millis(), p.as_millis(), c.as_millis(), b.as_millis());
+}
+
+
+
+// --- Helper Functions ---
+
+// --- 以下是提取的辅助函数 ---
+
+async fn get_filtered_dbnums(db_option: &DbOptionExt) -> Result<Vec<u32>> {
     let mut dbnums: Vec<u32> = if let Some(manual) = db_option.manual_db_nums.clone() {
         manual
     } else {
-        // 从 MDB 获取当前项目允许的 DB 列表（DESI）
         query_mdb_db_nums(None, DBType::DESI).await.map_err(|e| {
             FullNounError::DatabaseError(format!("query_mdb_db_nums(None, DESI) failed: {}", e))
         })?
     };
 
-    // 应用排除列表
     if let Some(exclude) = &db_option.exclude_db_nums {
         dbnums.retain(|dbno| !exclude.contains(dbno));
     }
+    Ok(dbnums)
+}
 
-    if !dbnums.is_empty() {
-        println!("🗂️  数据库过滤: 仅查询 dbnum = {:?}", dbnums);
-    } else {
-        println!("🗂️  数据库过滤: 查询所有数据库（未设置 manual_db_nums），或过滤后为空");
-    }
-
+fn get_entry_nouns(config: &FullNounConfig) -> Vec<String> {
     let has_explicit_entry_nouns = config.enabled_categories.iter().any(|cat| {
         let lower = cat.to_lowercase();
         !matches!(lower.as_str(), "cate" | "loop" | "prim")
     });
 
-    let entry_nouns: Vec<String> = if has_explicit_entry_nouns {
+    if has_explicit_entry_nouns {
         config
             .enabled_categories
             .iter()
@@ -323,500 +562,59 @@ pub async fn gen_full_noun_geos_optimized(
             set.insert(noun.to_string());
         }
         set.into_iter().collect()
+    }
+}
+
+async fn query_noun_refnos(noun: &str, dbnums: &[u32], limit: Option<usize>) -> Result<Vec<RefnoEnum>> {
+    let db_filter = if dbnums.is_empty() {
+        "true".to_string()
+    } else {
+        let nums = dbnums.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+        format!("dbnum IN [{}]", nums)
     };
+    let sql = format!("SELECT VALUE id FROM {} WHERE {}", noun, db_filter);
+    let record_ids: Vec<RecordId> = SUL_DB.query_take(&sql, 0).await.map_err(|e| {
+        FullNounError::DatabaseError(format!("query noun={} failed: {}", noun, e))
+    })?;
+    let mut refnos: Vec<RefnoEnum> = record_ids
+        .into_iter()
+        .map(RefnoEnum::from)
+        .filter(|r| r.is_valid())
+        .collect();
 
-    if entry_nouns.is_empty() {
-        println!("[gen_full_noun_geos] 入口 Noun 列表为空，直接返回");
-        return Ok(CategorizedRefnos::new());
-    }
-
-    println!("📌 入口 Noun 列表: {:?}", entry_nouns);
-
-    let mut all_roots: HashSet<RefnoEnum> = HashSet::new();
-    let mut loop_refnos: HashSet<RefnoEnum> = HashSet::new();
-    let mut prim_refnos: HashSet<RefnoEnum> = HashSet::new();
-    let mut cate_refnos: HashSet<RefnoEnum> = HashSet::new();
-    // BRAN/HANG 根节点单独收集，避免混入普通 CATE 流程
-    let mut bran_hanger_roots: HashSet<RefnoEnum> = HashSet::new();
-    // 🔥 记录 BRAN/HANG 处理过程中已生成的子节点 refno，后续处理时跳过
-    let mut bran_generated_refnos: HashSet<RefnoEnum> = HashSet::new();
-
-    for entry in &entry_nouns {
-        let noun_upper = entry.to_uppercase();
-        let noun_str = noun_upper.as_str();
-
-        let db_filter = if dbnums.is_empty() {
-            "true".to_string()
-        } else {
-            let nums = dbnums
-                .iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            format!(
-                "dbnum IN [{}]",
-                nums
-            )
-        };
-        let sql = format!("SELECT VALUE id FROM {} WHERE {}", noun_str, db_filter);
-        let record_ids: Vec<RecordId> = SUL_DB.query_take(&sql, 0).await.map_err(|e| {
-            FullNounError::DatabaseError(format!("query noun={} failed: {}", noun_str, e))
-        })?;
-        let mut refnos: Vec<RefnoEnum> = record_ids
-            .into_iter()
-            .map(RefnoEnum::from)
-            .filter(|r| r.is_valid())
-            .collect();
-
-        if let Some(limit) = config.debug_limit_per_noun {
-            if refnos.len() > limit {
-                println!(
-                    "[gen_full_noun_geos] 入口 noun {}: 调试模式限制实例数量从 {} 到 {}",
-                    noun_str,
-                    refnos.len(),
-                    limit
-                );
-                refnos.truncate(limit);
-            }
-        }
-
-        track_refno_issues(&refnos, noun_str, RefnoErrorStage::InputParse);
-
-        if refnos.is_empty() {
-            println!(
-                "[gen_full_noun_geos] 入口 noun {}: 未找到实例，跳过",
-                noun_str
-            );
-            continue;
-        }
-
-        all_roots.extend(refnos.iter().copied());
-
-        // 🔥 BRAN/HANG 作为特殊类型单独处理（用于 Tubing 生成）
-        if noun_str == "BRAN" || noun_str == "HANG" {
-            bran_hanger_roots.extend(refnos.iter().copied());
-            println!(
-                "[gen_full_noun_geos] {} 作为 BRAN/HANG 特殊处理（Tubing）",
-                noun_str
-            );
-        }
-
-        if GNERAL_LOOP_OWNER_NOUN_NAMES.contains(&noun_str) {
-            loop_refnos.extend(refnos.iter().copied());
-        }
-        if GNERAL_PRIM_NOUN_NAMES.contains(&noun_str) {
-            prim_refnos.extend(refnos.iter().copied());
-        }
-        if USE_CATE_NOUN_NAMES.contains(&noun_str) {
-            cate_refnos.extend(refnos.iter().copied());
+    if let Some(l) = limit {
+        if refnos.len() > l {
+            refnos.truncate(l);
         }
     }
+    Ok(refnos)
+}
 
-    // 🔥 直接查询数据库中的 BRAN/HANG 表（不依赖入口 Noun）
-    for noun in &["BRAN", "HANG"] {
-        let db_filter = if dbnums.is_empty() {
-            "true".to_string()
-        } else {
-            let nums = dbnums
-                .iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("dbnum IN [{}]", nums)
-        };
-        let sql = format!("SELECT VALUE id FROM {} WHERE {}", noun, db_filter);
-        let record_ids: Vec<RecordId> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
-        let refnos: Vec<RefnoEnum> = record_ids
-            .into_iter()
-            .map(RefnoEnum::from)
-            .filter(|r| r.is_valid())
-            .collect();
-        if !refnos.is_empty() {
-            println!(
-                "[gen_full_noun_geos] 直接查询 {} 表: {} 个实例",
-                noun,
-                refnos.len()
-            );
-            bran_hanger_roots.extend(refnos.iter().copied());
-            // 同时加入 all_roots，确保后续深度查询能覆盖
-            all_roots.extend(refnos.iter().copied());
-        }
-    }
-
-    if all_roots.is_empty() {
-        println!(
-            "[gen_full_noun_geos] 入口 Noun {:?}: 未找到任何实例，直接返回",
-            entry_nouns
-        );
-        return Ok(CategorizedRefnos::new());
-    }
-
-    println!(
-        "[gen_full_noun_geos] 入口 Noun {:?}: 根节点总数 {}",
-        entry_nouns,
-        all_roots.len()
-    );
-
-    let roots_vec: Vec<RefnoEnum> = all_roots.iter().copied().collect();
-
-    let loop_descendants =
-        aios_core::collect_descendant_filter_ids(&roots_vec, &GNERAL_LOOP_OWNER_NOUN_NAMES, None)
-            .await
-            .map_err(|e| {
-                FullNounError::DatabaseError(format!(
-                    "collect_descendant_filter_ids(loop) failed: {}",
-                    e
-                ))
-            })?;
-    track_refno_issues(
-        &loop_descendants,
-        "loop_descendants",
-        RefnoErrorStage::Query,
-    );
+async fn collect_all_descendants(
+    roots: &[RefnoEnum],
+    loop_refnos: &mut HashSet<RefnoEnum>,
+    prim_refnos: &mut HashSet<RefnoEnum>,
+    cate_refnos: &mut HashSet<RefnoEnum>,
+) -> Result<()> {
+    let loop_descendants = aios_core::collect_descendant_filter_ids(roots, &GNERAL_LOOP_OWNER_NOUN_NAMES, None)
+        .await
+        .map_err(|e| FullNounError::DatabaseError(format!("collect_descendant_filter_ids(loop) failed: {}", e)))?;
+    track_refno_issues(&loop_descendants, "loop_descendants", RefnoErrorStage::Query);
     loop_refnos.extend(loop_descendants);
 
-    let prim_descendants =
-        aios_core::collect_descendant_filter_ids(&roots_vec, &GNERAL_PRIM_NOUN_NAMES, None)
-            .await
-            .map_err(|e| {
-                FullNounError::DatabaseError(format!(
-                    "collect_descendant_filter_ids(prim) failed: {}",
-                    e
-                ))
-            })?;
-    track_refno_issues(
-        &prim_descendants,
-        "prim_descendants",
-        RefnoErrorStage::Query,
-    );
+    let prim_descendants = aios_core::collect_descendant_filter_ids(roots, &GNERAL_PRIM_NOUN_NAMES, None)
+        .await
+        .map_err(|e| FullNounError::DatabaseError(format!("collect_descendant_filter_ids(prim) failed: {}", e)))?;
+    track_refno_issues(&prim_descendants, "prim_descendants", RefnoErrorStage::Query);
     prim_refnos.extend(prim_descendants);
 
-    let cate_descendants =
-        aios_core::collect_descendant_filter_ids(&roots_vec, &USE_CATE_NOUN_NAMES, None)
-            .await
-            .map_err(|e| {
-                FullNounError::DatabaseError(format!(
-                    "collect_descendant_filter_ids(cate) failed: {}",
-                    e
-                ))
-            })?;
-    track_refno_issues(
-        &cate_descendants,
-        "cate_descendants",
-        RefnoErrorStage::Query,
-    );
+    let cate_descendants = aios_core::collect_descendant_filter_ids(roots, &USE_CATE_NOUN_NAMES, None)
+        .await
+        .map_err(|e| FullNounError::DatabaseError(format!("collect_descendant_filter_ids(cate) failed: {}", e)))?;
+    track_refno_issues(&cate_descendants, "cate_descendants", RefnoErrorStage::Query);
     cate_refnos.extend(cate_descendants);
 
-    println!(
-        " 深度查询结果：Loop={}，Prim={}，Cate={}，BRAN/HANG={}",
-        loop_refnos.len(),
-        prim_refnos.len(),
-        cate_refnos.len(),
-        bran_hanger_roots.len()
-    );
-
-    let loop_sjus_map_arc = Arc::new(DashMap::new());
-    validate_sjus_map(&loop_sjus_map_arc, config)?;
-
-    let ctx = NounProcessContext::new(
-        db_option.clone(),
-        config.batch_size.get(),
-        config.concurrency.get(),
-    );
-
-    let mut categorized = CategorizedRefnos::new();
-
-    // ============================================================================
-    // 🔥 [0/4] BRAN/HANG 优先处理阶段
-    // ============================================================================
-    let mut bran_duration = std::time::Duration::ZERO;
-    let bran_roots: Vec<RefnoEnum> = bran_hanger_roots.iter().copied().collect();
-    if !bran_roots.is_empty() {
-        println!("📍 [0/4] 优先处理 BRAN/HANG 及其依赖 (count={})...", bran_roots.len());
-        let bran_start = Instant::now();
-
-        // 1. 收集 BRAN/HANG 相关的 LOOP refno（用于生成 SJUS 数据）
-        let bran_loop_descendants = aios_core::collect_descendant_filter_ids(
-            &bran_roots,
-            &GNERAL_LOOP_OWNER_NOUN_NAMES,
-            None,
-        )
-        .await
-        .unwrap_or_default();
-
-        if !bran_loop_descendants.is_empty() {
-            println!(
-                "[gen_full_noun_geos] BRAN/HANG 相关 LOOP: {} 个",
-                bran_loop_descendants.len()
-            );
-            // 处理 BRAN/HANG 相关的 LOOP
-            let ranges = ctx.bounded_chunks(bran_loop_descendants.len());
-            for (page_index, (start, end)) in ranges.into_iter().enumerate() {
-                let slice = &bran_loop_descendants[start..end];
-                println!(
-                    "[gen_full_noun_geos] bran-loop: 处理第 {} 页 ({} ~ {})",
-                    page_index + 1,
-                    start + 1,
-                    end
-                );
-                process_loop_refno_page(&ctx, loop_sjus_map_arc.clone(), sender.clone(), slice)
-                    .await
-                    .map_err(|e| {
-                        FullNounError::GeometryGenerationFailed("bran-loop".to_string(), e.to_string())
-                    })?;
-            }
-            // 记录已生成的 LOOP refno
-            bran_generated_refnos.extend(bran_loop_descendants.iter().copied());
-        }
-
-        // 2. 查询 BRAN/HANG 的子元素
-        let branch_refnos_map: DashMap<RefnoEnum, Vec<SPdmsElement>> = DashMap::new();
-        for &refno in &bran_roots {
-            match aios_core::collect_children_elements(refno, &[]).await {
-                Ok(children) => {
-                    if !children.is_empty() {
-                        // 记录子元素的 refno
-                        for child in &children {
-                            bran_generated_refnos.insert(child.refno);
-                        }
-                        branch_refnos_map.insert(refno, children);
-                    }
-                }
-                Err(e) => {
-                    println!(
-                        "[gen_full_noun_geos] 查询 BRAN/HANG 子元素失败 (refno={}): {}",
-                        refno, e
-                    );
-                }
-            }
-        }
-
-        // 3. 查询 BRAN/HANG 的元件库分组
-        let target_bran_reuse_cata_map = match aios_core::query_group_by_cata_hash(&bran_roots).await {
-            Ok(map) => map,
-            Err(e) => {
-                println!("[gen_full_noun_geos] 查询 BRAN/HANG 元件库分组失败: {}", e);
-                DashMap::new()
-            }
-        };
-
-        // 4. 生成 BRAN/HANG 相关的 CATE 几何
-        let cate_outcome = match cata_model::gen_cata_instances(
-            db_option.clone(),
-            Arc::new(target_bran_reuse_cata_map),
-            loop_sjus_map_arc.clone(),
-            sender.clone(),
-        )
-        .await
-        {
-            Ok(outcome) => Some(outcome),
-            Err(e) => {
-                println!("[gen_full_noun_geos] BRAN/HANG 关联 CATE 生成失败: {}", e);
-                None
-            }
-        };
-
-        // 5. 保存 tubi_info
-        if let Some(ref outcome) = cate_outcome {
-            println!(
-                "[gen_full_noun_geos] BRAN/HANG tubi_info_map: {}, local_al_map: {}",
-                outcome.tubi_info_map.len(),
-                outcome.local_al_map.len()
-            );
-            if let Err(e) = pdms_inst::save_tubi_info_batch(&outcome.tubi_info_map).await {
-                println!("[gen_full_noun_geos] 保存 tubi_info 失败: {}", e);
-            }
-        }
-
-        // 6. 生成 BRAN/HANG Tubing
-        let local_al_map = cate_outcome
-            .as_ref()
-            .map(|o| o.local_al_map.clone())
-            .unwrap_or_else(|| Arc::new(DashMap::new()));
-
-        if let Err(e) = cata_model::gen_branch_tubi(
-            db_option.clone(),
-            Arc::new(branch_refnos_map),
-            loop_sjus_map_arc.clone(),
-            sender.clone(),
-            local_al_map,
-        )
-        .await
-        {
-            println!("[gen_full_noun_geos] BRAN/HANG Tubing 生成失败: {}", e);
-        }
-
-        bran_duration = bran_start.elapsed();
-        println!(
-            "⏱️  BRAN/HANG 优先处理完成: {} ms, 已生成子节点: {} 个",
-            bran_duration.as_millis(),
-            bran_generated_refnos.len()
-        );
-    }
-
-    // ============================================================================
-    // [1/4] 处理剩余的 LOOP（按 NOUN 类型分组，每次 2 个并发）
-    // ============================================================================
-    println!("📍 [1/4] 处理 LOOP Refno 集合（按 NOUN 类型分组）...");
-    let loop_start = Instant::now();
-
-    // 预查询 LOOP 类型的数量，过滤空类型
-    let loop_noun_infos = prequery_noun_counts(&GNERAL_LOOP_OWNER_NOUN_NAMES, &dbnums).await?;
-
-    // 过滤掉已生成的 refno
-    let loop_noun_infos: Vec<NounTypeInfo> = loop_noun_infos
-        .into_iter()
-        .map(|mut info| {
-            info.refnos.retain(|r| !bran_generated_refnos.contains(r));
-            info.count = info.refnos.len();
-            info
-        })
-        .filter(|info| !info.refnos.is_empty())
-        .collect();
-
-    let loop_vec = process_nouns_by_type(
-        loop_noun_infos,
-        &ctx,
-        NounCategoryType::Loop,
-        loop_sjus_map_arc.clone(),
-        sender.clone(),
-    ).await?;
-
-    let loop_duration = loop_start.elapsed();
-    println!("⏱️  LOOP processing took {} ms", loop_duration.as_millis());
-
-    #[cfg(feature = "profile")]
-    info!(
-        loop_count = loop_vec.len(),
-        duration_ms = loop_duration.as_millis() as u64,
-        "LOOP Noun processing completed (entry-based)"
-    );
-
-    println!("📍 [2/4] 处理 PRIM Refno 集合（按 NOUN 类型分组）...");
-    let prim_start = Instant::now();
-
-    // 预查询 PRIM 类型的数量，过滤空类型
-    let prim_noun_infos = prequery_noun_counts(&GNERAL_PRIM_NOUN_NAMES, &dbnums).await?;
-
-    let prim_vec = process_nouns_by_type(
-        prim_noun_infos,
-        &ctx,
-        NounCategoryType::Prim,
-        loop_sjus_map_arc.clone(),
-        sender.clone(),
-    ).await?;
-
-    let prim_duration = prim_start.elapsed();
-    println!("⏱️  PRIM processing took {} ms", prim_duration.as_millis());
-
-    #[cfg(feature = "profile")]
-    info!(
-        prim_count = prim_vec.len(),
-        duration_ms = prim_duration.as_millis() as u64,
-        "PRIM Noun processing completed (entry-based)"
-    );
-
-    println!("📍 [3/4] 处理 CATE Refno 集合（按 NOUN 类型分组）...");
-    let cate_start = Instant::now();
-
-    // 预查询 CATE 类型的数量，过滤空类型
-    let cate_noun_infos = prequery_noun_counts(&USE_CATE_NOUN_NAMES, &dbnums).await?;
-
-    // 过滤掉已生成的 refno
-    let cate_noun_infos: Vec<NounTypeInfo> = cate_noun_infos
-        .into_iter()
-        .map(|mut info| {
-            info.refnos.retain(|r| !bran_generated_refnos.contains(r));
-            info.count = info.refnos.len();
-            info
-        })
-        .filter(|info| !info.refnos.is_empty())
-        .collect();
-
-    let cate_vec = process_nouns_by_type(
-        cate_noun_infos,
-        &ctx,
-        NounCategoryType::Cate,
-        loop_sjus_map_arc.clone(),
-        sender.clone(),
-    ).await?;
-
-    let cate_duration = cate_start.elapsed();
-    println!("⏱️  CATE processing took {} ms", cate_duration.as_millis());
-
-    #[cfg(feature = "profile")]
-    info!(
-        cate_count = cate_vec.len(),
-        duration_ms = cate_duration.as_millis() as u64,
-        "CATE Noun processing completed (entry-based)"
-    );
-
-    // 将 BRAN/HANG 根节点也归类为 Cate，便于后续 mesh 深度遍历
-    let bran_vec: Vec<RefnoEnum> = bran_hanger_roots.iter().copied().collect();
-
-    for r in &cate_vec {
-        categorized.insert(*r, super::models::NounCategory::Cate);
-    }
-    for r in &bran_vec {
-        categorized.insert(*r, super::models::NounCategory::Cate);
-    }
-    for r in &loop_vec {
-        categorized.insert(*r, super::models::NounCategory::LoopOwner);
-    }
-    for r in &prim_vec {
-        categorized.insert(*r, super::models::NounCategory::Prim);
-    }
-
-    let total_duration = total_start.elapsed();
-    println!("✅ Full Noun 处理完成（入口 Noun 深度查询版本）");
-    println!(
-        "⏱️  Total Full Noun processing: {} ms",
-        total_duration.as_millis()
-    );
-    println!(
-        "   ├─ LOOP: {} ms ({:.1}%)",
-        loop_duration.as_millis(),
-        loop_duration.as_secs_f64() / total_duration.as_secs_f64() * 100.0
-    );
-    println!(
-        "   ├─ PRIM: {} ms ({:.1}%)",
-        prim_duration.as_millis(),
-        prim_duration.as_secs_f64() / total_duration.as_secs_f64() * 100.0
-    );
-    println!(
-        "   ├─ CATE: {} ms ({:.1}%)",
-        cate_duration.as_millis(),
-        cate_duration.as_secs_f64() / total_duration.as_secs_f64() * 100.0
-    );
-    println!(
-        "   └─ BRAN/HANG Tubing: {} ms ({:.1}%)",
-        bran_duration.as_millis(),
-        bran_duration.as_secs_f64() / total_duration.as_secs_f64() * 100.0
-    );
-
-    categorized.print_statistics();
-
-    let error_summary = REFNO_ERROR_STORE.summary();
-    if error_summary.total > 0 {
-        println!("📊 RefNo 错误统计: 总计 {}", error_summary.total);
-        for (kind, count) in error_summary.by_kind.iter() {
-            println!("   - {:?}: {}", kind, count);
-        }
-        for (stage, count) in error_summary.by_stage.iter() {
-            println!("   - 阶段 {:?}: {}", stage, count);
-        }
-    }
-
-    #[cfg(feature = "profile")]
-    info!(
-        total_duration_ms = total_duration.as_millis() as u64,
-        loop_ms = loop_duration.as_millis() as u64,
-        prim_ms = prim_duration.as_millis() as u64,
-        cate_ms = cate_duration.as_millis() as u64,
-        "Full Noun generation completed with performance metrics (entry-based)"
-    );
-
-    Ok(categorized)
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
+use surrealdb::types::SurrealValue;
 use axum::{
     Router,
     extract::Path,
@@ -41,13 +42,13 @@ async fn get_transform(Path(refno): Path<RefnoEnum>) -> Result<Json<TransformRes
         inst_relate_key
     );
 
-    #[derive(Deserialize)]
+    #[derive(Deserialize, SurrealValue)]
     struct QueryResult {
         world_trans: Option<serde_json::Value>,
         owner: Option<String>,
     }
 
-    match SUL_DB.query_take::<QueryResult>(&sql, 0).await {
+    match SUL_DB.query_take::<Option<QueryResult>>(&sql, 0).await {
         Ok(Some(result)) => {
             // 解析变换矩阵
             let world_transform = parse_transform_matrix(result.world_trans);

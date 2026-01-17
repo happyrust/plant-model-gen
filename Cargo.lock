@@ -275,6 +275,7 @@ dependencies = [
  "strum 0.27.2",
  "strum_macros 0.27.2",
  "surrealdb",
+ "surrealdb-types",
  "sysinfo 0.37.2",
  "tempfile",
  "thiserror 1.0.69",

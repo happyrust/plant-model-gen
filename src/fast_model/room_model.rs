@@ -185,7 +185,7 @@ async fn get_enhanced_trimesh_cache() -> &'static DashMap<String, Arc<TriMesh>> 
 /// 2. 优化几何缓存机制，减少重复加载
 /// 3. 添加详细的性能统计和监控
 /// 4. 支持并发处理和批量操作
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 pub async fn build_room_relations(db_option: &DbOption) -> anyhow::Result<RoomBuildStats> {
     info!("开始构建房间关系 (改进版本)");
 
@@ -226,7 +226,7 @@ pub async fn build_room_relations(db_option: &DbOption) -> anyhow::Result<RoomBu
 }
 
 /// 支持取消和进度回调的房间关系构建
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 pub async fn build_room_relations_with_cancel(
     db_option: &DbOption,
     cancel_token: Option<CancellationToken>,
@@ -285,7 +285,7 @@ pub async fn build_room_relations_with_cancel(
     Ok(stats)
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 async fn compute_room_relations(
     mesh_dir: &PathBuf,
     room_panel_map: Vec<(RefnoEnum, String, Vec<RefnoEnum>)>,
@@ -311,7 +311,7 @@ async fn compute_room_relations(
     })
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 async fn compute_room_relations_with_cancel(
     mesh_dir: &PathBuf,
     room_panel_map: Vec<(RefnoEnum, String, Vec<RefnoEnum>)>,
@@ -585,7 +585,7 @@ async fn create_room_panel_relations_batch(
     Ok(())
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 async fn process_panel_for_room(
     mesh_dir: &PathBuf,
     panel_refno: RefnoEnum,

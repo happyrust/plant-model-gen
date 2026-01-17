@@ -12,30 +12,6 @@ name = "web_server"
 path = "src/bin/web_server.rs"
 required-features = ["web_server"]
 
-[[bin]]
-name = "db_option_ui"
-path = "src/bin/db_option_ui/main.rs"
-required-features = ["web_server", "eframe"]
-
-[[bin]]
-name = "test_dblist"
-path = "src/bin/test_dblist.rs"
-
-[[bin]]
-name = "debug_query_insts"
-path = "src/bin/debug_query_insts.rs"
-required-features = ["web_server"]
-
-[[bin]]
-name = "check_collision"
-path = "src/bin/check_collision.rs"
-required-features = ["duckdb-feature"]
-
-[[bin]]
-name = "debug_query_insts"
-path = "src/bin/debug_query_insts.rs"
-required-features = ["web_server"]
-
 # [[bin]]
 # name = "gen_xkt_new"
 # path = "src/bin/gen_xkt_new.rs"
@@ -94,6 +70,7 @@ surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "updated", 
     "protocol-ws",
     "kv-mem",
 ] }
+surrealdb-types = { git = "https://gitee.com/happydpc/surrealdb", branch = "updated" }
 
 
 bevy_transform = { git = "https://github.com/happyrust/bevy", package = "bevy_transform", features = [

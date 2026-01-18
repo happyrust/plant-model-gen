@@ -607,16 +607,31 @@ async fn gen_cata_geos_inner(
                             shapes.len()
                         );
                         let t_get_world_transform = Instant::now();
+                        // 使用惰性计算版本，如果缓存不存在会自动计算并写入数据库
                         let mut world_transform =
-                            match aios_core::get_world_transform(ele_refno).await {
-                                Ok(Some(trans)) => trans,
+                            match aios_core::get_world_mat4(ele_refno, false).await {
+                                Ok(Some(mat4)) => {
+                                    // DMat4 转换为 Transform
+                                    let (scale, rotation, translation) = mat4.to_scale_rotation_translation();
+                                    bevy_transform::prelude::Transform {
+                                        translation: translation.as_vec3(),
+                                        rotation: glam::Quat::from_xyzw(
+                                            rotation.x as f32,
+                                            rotation.y as f32,
+                                            rotation.z as f32,
+                                            rotation.w as f32,
+                                        ),
+                                        scale: scale.as_vec3(),
+                                    }
+                                }
                                 Ok(None) => {
+                                    debug_model!("[SKIP] ele_refno={} get_world_mat4 返回 None，跳过", ele_refno);
                                     record_refno_error(
                                         RefnoErrorKind::Missing,
                                         RefnoErrorStage::Query,
                                         "fast_model/cata_model.rs",
-                                        "get_world_transform",
-                                        "未获取到 world_transform",
+                                        "get_world_mat4",
+                                        "get_world_mat4 返回 None",
                                         Some(&ele_refno),
                                         None,
                                         &[],
@@ -629,8 +644,8 @@ async fn gen_cata_geos_inner(
                                         RefnoErrorKind::NotFound,
                                         RefnoErrorStage::Query,
                                         "fast_model/cata_model.rs",
-                                        "get_world_transform",
-                                        format!("查询 world_transform 失败: {}", e),
+                                        "get_world_mat4",
+                                        format!("惰性计算 world_mat4 失败: {}", e),
                                         Some(&ele_refno),
                                         None,
                                         &[],
@@ -668,7 +683,7 @@ async fn gen_cata_geos_inner(
                                 let off_z = cal_sjus_value(sjus, height);
 
                                 let t_get_world_transform2 = Instant::now();
-                                let parent_trans = aios_core::get_world_transform(parent)
+                                let parent_trans = aios_core::query_transform(parent, false)
                                     .await
                                     .unwrap_or_default()
                                     .unwrap_or_default();
@@ -937,7 +952,7 @@ async fn gen_cata_geos_inner(
                         .cloned()
                         .unwrap_or_default();
                     let Ok(Some(mut origin_trans)) =
-                        aios_core::get_world_transform(ele_refno).await
+                        aios_core::query_transform(ele_refno, false).await
                     else {
                         continue;
                     };
@@ -1114,15 +1129,15 @@ async fn gen_cata_geos_inner(
             db_time_get_branch_att += t_get_named_attmap.elapsed().as_millis();
 
             let t_get_world_transform = Instant::now();
-            let branch_transform = match aios_core::get_world_transform(branch_refno).await {
+            let branch_transform = match aios_core::query_transform(branch_refno, false).await {
                 Ok(Some(trans)) => trans,
                 Ok(None) => {
                     record_refno_error(
                         RefnoErrorKind::Missing,
                         RefnoErrorStage::Query,
                         "fast_model/cata_model.rs",
-                        "get_world_transform",
-                        "BRAN/HANG 缺少 world_transform",
+                        "query_transform",
+                        "BRAN/HANG pe_transform.world_trans 为空",
                         Some(&branch_refno),
                         None,
                         &[],
@@ -1135,8 +1150,8 @@ async fn gen_cata_geos_inner(
                         RefnoErrorKind::NotFound,
                         RefnoErrorStage::Query,
                         "fast_model/cata_model.rs",
-                        "get_world_transform",
-                        format!("BRAN/HANG world_transform 查询失败: {}", e),
+                        "query_transform",
+                        format!("BRAN/HANG pe_transform 查询失败: {}", e),
                         Some(&branch_refno),
                         None,
                         &[],
@@ -1306,7 +1321,7 @@ async fn gen_cata_geos_inner(
                 let mut futures = FuturesUnordered::new();
                 for &refno in &child_refnos {
                     futures.push(async move {
-                        let trans = aios_core::get_world_transform(refno)
+                        let trans = aios_core::query_transform(refno, false)
                             .await
                             .ok()
                             .flatten()

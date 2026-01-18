@@ -196,7 +196,7 @@ impl PdmsDataInterface for HelixDBManager {
         //     "MATCH (n:Element)
         //      WHERE n.project = '{}'
         //        AND n.type_name IN ['{}']
-        //        AND n.db_no IN [{}]
+        //        AND n.dbnum IN [{}]
         //      RETURN n.refno",
         //     project, types_str, dbnos_str
         // );
@@ -212,7 +212,7 @@ impl PdmsDataInterface for HelixDBManager {
     async fn get_db_world(
         &self,
         project: &str,
-        db_no: u32,
+        dbnum: u32,
     ) -> anyhow::Result<Option<(RefU64, String)>> {
         // TODO: 实现
         Ok(None)

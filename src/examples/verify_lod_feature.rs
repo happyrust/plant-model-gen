@@ -15,16 +15,15 @@ fn main() -> anyhow::Result<()> {
 
     // 直接解析 precision 部分
     let toml_value: toml::Value = toml::from_str(&config_content)?;
-    let precision: MeshPrecisionSettings =
-        if let Some(precision_table) = toml_value
-            .get("mesh_precision")
-            .or_else(|| toml_value.get("precision"))
-        {
-            toml::from_str(&toml::to_string(precision_table)?)?
-        } else {
-            println!("❌ 配置文件中未找到 [mesh_precision]（或旧版 [precision]）部分");
-            return Ok(());
-        };
+    let precision: MeshPrecisionSettings = if let Some(precision_table) = toml_value
+        .get("mesh_precision")
+        .or_else(|| toml_value.get("precision"))
+    {
+        toml::from_str(&toml::to_string(precision_table)?)?
+    } else {
+        println!("❌ 配置文件中未找到 [mesh_precision]（或旧版 [precision]）部分");
+        return Ok(());
+    };
 
     println!("📋 当前 LOD 配置:");
     println!("   默认 LOD 级别: {:?}", precision.default_lod);

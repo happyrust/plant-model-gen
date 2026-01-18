@@ -64,7 +64,7 @@ nalgebra = { version = "0.34.1", features = ["serde", "convert-glam030"] }
 parry3d = { version = "0.25.0", features = ["serde-serialize"] }
 parry2d = { version = "0.25.0", features = ["serde-serialize"] }
 # parse_pdms_db = { git = "https://github.com/happyrust/aios-parse-pdms" }
-parse_pdms_db = { path = "../aios-parse-pdms-fork" }
+parse_pdms_db = { path = "../aios-parse-pdms" }
 aios_core = { git = "https://github.com/happyrust/rs-core.git" }
 surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "updated", default-features = false, features = [
     "protocol-ws",
@@ -99,6 +99,7 @@ tokio = { version = "1.47.1", features = ["full"] }
 serde = { version = "1.0.137", features = ["derive"] }
 sha2 = "0.10"
 id_tree = { version = "1.8.0", features = ["serde_support"] }
+indextree = { path = "../indextree/indextree", features = ["rkyv"] }
 glam = { version = "0.30.8", features = ["serde", "rkyv"] }
 cached = "0.56.0"
 rkyv = { version = "0.8.12", features = ["hashbrown-0_15"] }
@@ -251,6 +252,10 @@ name = "debug_refno_21491_19209"
 path = "src/examples/debug_refno_21491_19209.rs"
 
 [[example]]
+name = "compare_visible_geo_descendants"
+path = "src/examples/compare_visible_geo_descendants.rs"
+
+[[example]]
 name = "refresh_pe_transform"
 path = "examples/refresh_pe_transform.rs"
 
@@ -258,6 +263,11 @@ path = "examples/refresh_pe_transform.rs"
 name = "room_calculation_demo"
 path = "examples/room_calculation_demo.rs"
 required-features = ["gen_model", "sqlite-index"]
+
+[[example]]
+name = "verify_inst_relate_fix"
+path = "src/examples/verify_inst_relate_fix.rs"
+required-features = ["gen_model"]
 
 eframe = { git = "https://github.com/emilk/egui.git", rev = "fa4cfec777c9ea21b8643f77b6a26561da44aad0", package = "eframe" }
 

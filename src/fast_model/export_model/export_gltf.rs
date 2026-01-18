@@ -11,6 +11,7 @@ use glam::Vec3;
 use serde_json::{Value, json};
 
 use crate::fast_model::material_config::MaterialLibrary;
+use crate::fast_model::query_provider;
 use crate::fast_model::unit_converter::UnitConverter;
 
 use super::export_common::{ExportData, collect_export_data};
@@ -37,23 +38,34 @@ pub async fn export_gltf_for_refnos(
 
     let all_refnos = if include_descendants {
         println!("\n📊 查询子孙节点...");
-        let mut descendants = if let Some(nouns) = filter_nouns {
+        let descendants = if let Some(nouns) = filter_nouns {
             let nouns_slice: Vec<&str> = nouns.iter().map(|s| s.as_str()).collect();
-            aios_core::collect_descendant_filter_ids(refnos, &nouns_slice, None)
+            query_provider::query_multi_descendants(refnos, &nouns_slice)
                 .await
                 .context("查询子孙节点失败")?
         } else {
-            aios_core::collect_descendant_filter_ids(refnos, &[], None)
+            query_provider::query_multi_descendants(refnos, &[])
                 .await
                 .context("查询子孙节点失败")?
         };
 
-        if descendants.is_empty() {
-            descendants = refnos.to_vec();
+        // 默认包含自身：roots 在前，后面拼接子孙；保持顺序去重。
+        let mut out: Vec<RefnoEnum> = Vec::with_capacity(refnos.len() + descendants.len());
+        let mut seen: std::collections::HashSet<RefnoEnum> =
+            std::collections::HashSet::with_capacity(refnos.len() + descendants.len());
+        for &r in refnos {
+            if seen.insert(r) {
+                out.push(r);
+            }
+        }
+        for r in descendants {
+            if seen.insert(r) {
+                out.push(r);
+            }
         }
 
-        println!("   - 找到 {} 个节点（包括自己）", descendants.len());
-        descendants
+        println!("   - 找到 {} 个节点（包括自己）", out.len());
+        out
     } else {
         println!("\n📊 仅导出指定节点（不包含子孙）");
         refnos.to_vec()

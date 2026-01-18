@@ -37,9 +37,9 @@ impl AiosDBManager {
     pub async fn get_gen_model_root_refnos(&self, db_nos: &[i32]) -> anyhow::Result<Vec<RefU64>> {
         let db_option = &self.db_option;
         let mut target_refnos = vec![];
-        for &db_no in db_nos {
+        for &dbnum in db_nos {
             let refnos: RefU64Vec = self
-                .get_refnos_by_types(db_option.project_name.as_str(), &["SITE"], &[db_no])
+                .get_refnos_by_types(db_option.project_name.as_str(), &["SITE"], &[dbnum])
                 .await?;
             target_refnos.extend_from_slice(&refnos);
         }

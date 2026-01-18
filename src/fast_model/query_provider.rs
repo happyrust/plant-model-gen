@@ -1,6 +1,6 @@
 //! 模型生成专用的查询提供者
 //!
-//! 使用 SurrealDB 作为层级查询的数据源。
+//! 使用 TreeIndex 作为层级查询的数据源（PE/属性仍委托 SurrealDB）。
 //!
 //! # 使用示例
 //!
@@ -18,8 +18,8 @@
 use aios_core::RefnoEnum;
 use aios_core::mdb;
 use aios_core::query_provider::*;
-use aios_core::rs_surreal;
 use aios_core::types::{NamedAttrMap as NamedAttMap, SPdmsElement as PE};
+use anyhow::Context;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
 
@@ -40,9 +40,20 @@ pub async fn get_model_query_provider() -> anyhow::Result<Arc<dyn QueryProvider>
 
 /// 初始化查询提供者
 async fn init_provider() -> anyhow::Result<Arc<dyn QueryProvider>> {
-    log::info!("使用 SurrealDB 查询提供者");
-    let router = QueryRouter::surreal_only()?;
-    Ok(Arc::new(router))
+    log::info!("使用 TreeIndex 查询提供者（层级查询走 indextree）");
+
+    // 在 Windows 上，加载/反序列化较大的 `.tree` 文件时可能触发主线程栈溢出；
+    // 这里用大栈线程执行初始化，避免 `STATUS_STACK_OVERFLOW` 直接杀进程。
+    let handle = std::thread::Builder::new()
+        .name("tree-index-loader".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| TreeIndexQueryProvider::from_tree_dir("output/scene_tree"))
+        .context("创建 tree-index-loader 线程失败")?;
+
+    let provider = handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("tree-index-loader 线程 panic（可能由栈溢出导致）"))??;
+    Ok(Arc::new(provider))
 }
 
 // ============================================================================
@@ -80,8 +91,11 @@ pub async fn get_descendants_by_types(
     nouns: &[&str],
     _max_depth: Option<usize>, // 参数保留以保持兼容性，但已忽略
 ) -> anyhow::Result<Vec<RefnoEnum>> {
-    // 将单个 refno 包装为数组
-    aios_core::collect_descendant_filter_ids(&[root], nouns, None).await
+    let provider = get_model_query_provider().await?;
+    provider
+        .get_descendants_filtered(root, nouns, None)
+        .await
+        .map_err(Into::into)
 }
 
 /// 批量获取子节点
@@ -101,8 +115,11 @@ pub async fn get_descendants_by_types(
     note = "使用 aios_core::collect_descendant_filter_ids(refnos, &[], None) 代替"
 )]
 pub async fn get_children_batch(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
-    // 传入空的 noun 过滤器表示查询所有类型的子节点
-    aios_core::collect_descendant_filter_ids(refnos, &[], None).await
+    let provider = get_model_query_provider().await?;
+    provider
+        .query_multi_descendants(refnos, &[])
+        .await
+        .map_err(Into::into)
 }
 
 /// 查询指定类型的节点
@@ -135,7 +152,7 @@ pub async fn query_by_type(
 
 /// 按 Noun 全库查询（Full Noun 模式专用）
 ///
-/// 直接按 Noun 类型查询全库范围内的所有实例，不加 dbno 或 refno 层级约束。
+/// 直接按 Noun 类型查询全库范围内的所有实例，不加 dbnum 或 refno 层级约束。
 ///
 /// # 参数
 /// - `nouns`: Noun 类型列表（如 ["EQUI", "FITT", "BOX"]）
@@ -290,8 +307,11 @@ pub async fn query_multi_descendants(
     refnos: &[RefnoEnum],
     nouns: &[&str],
 ) -> anyhow::Result<Vec<RefnoEnum>> {
-    // 直接调用 aios_core 的统一接口
-    aios_core::collect_descendant_filter_ids(refnos, nouns, None).await
+    let provider = get_model_query_provider().await?;
+    provider
+        .query_multi_descendants(refnos, nouns)
+        .await
+        .map_err(Into::into)
 }
 
 // ============================================================================

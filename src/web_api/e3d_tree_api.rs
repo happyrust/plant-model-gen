@@ -347,13 +347,13 @@ async fn get_visible_insts(
         candidates.push(refno);
     }
 
-    // 2) 优先用 instances_{dbno}.json 做“可加载几何”过滤：与前端实际加载数据保持一致。
+    // 2) 优先用 instances_{dbnum}.json 做“可加载几何”过滤：与前端实际加载数据保持一致。
     //    - 这可以避免 query_deep_visible_inst_refnos 返回“组节点/无几何节点”，导致前端 instances 缺失。
     //    - 若文件不存在，再回退到 inst_relate 的几何实例查询做过滤。
     fn parse_dbno(r: RefnoEnum) -> Option<u32> {
         let s = r.to_string();
-        let (dbno, _) = s.split_once('_')?;
-        dbno.parse::<u32>().ok()
+        let (dbnum, _) = s.split_once('_')?;
+        dbnum.parse::<u32>().ok()
     }
 
     fn collect_component_refnos(v: &serde_json::Value, out: &mut HashSet<String>) {
@@ -393,9 +393,9 @@ async fn get_visible_insts(
         }
     }
 
-    let refnos = if let Some(dbno) = parse_dbno(refno) {
+    let refnos = if let Some(dbnum) = parse_dbno(refno) {
         let instances_path =
-            std::path::Path::new("output").join("instances").join(format!("instances_{dbno}.json"));
+            std::path::Path::new("output").join("instances").join(format!("instances_{dbnum}.json"));
         if let Ok(bytes) = fs::read(&instances_path) {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 let mut available = HashSet::<String>::new();
@@ -638,7 +638,7 @@ async fn get_site_nodes(
                 .join(",");
 
             let sql = format!(
-                "SELECT VALUE meta::id(out) FROM contains WHERE in IN [{}]",
+                "SELECT VALUE record::id(out) FROM contains WHERE in IN [{}]",
                 in_list
             );
             let children: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
@@ -669,7 +669,7 @@ async fn get_site_nodes(
         // 查询 scene_node 表，同时关联 aabb 表获取包围盒
         let sql = format!(
             r#"SELECT 
-                meta::id(id) as id,
+                record::id(id) as id,
                 parent,
                 has_geo,
                 is_leaf,

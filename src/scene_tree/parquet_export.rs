@@ -19,7 +19,7 @@ struct SceneNodeRow {
     pub has_geo: bool,
     pub is_leaf: bool,
     pub generated: bool,
-    pub dbno: i32,
+    pub dbnum: i32,
     pub geo_type: Option<String>,
     pub name: String,
 }
@@ -27,40 +27,40 @@ struct SceneNodeRow {
 /// 导出 Scene Tree 到 Parquet 文件
 ///
 /// # Arguments
-/// * `dbno` - 数据库编号
+/// * `dbnum` - 数据库编号
 /// * `output_dir` - 输出目录
 ///
 /// # Returns
 /// * 导出的节点数量
-pub async fn export_scene_tree_parquet(dbno: u32, output_dir: &Path) -> Result<usize> {
-    // 1. 查询指定 dbno 的所有节点
+pub async fn export_scene_tree_parquet(dbnum: u32, output_dir: &Path) -> Result<usize> {
+    // 1. 查询指定 dbnum 的所有节点
     // 在 SurrealDB 中，scene_node.id 和 pe.id 的数字部分相同
     // 通过 record ID 直接构造关联查询
     let sql = format!(
         r#"SELECT
-            meta::id(id) as id,
+            record::id(id) as id,
             parent,
             has_geo,
             is_leaf,
             generated,
-            dbno,
+            dbnum,
             geo_type,
             (SELECT VALUE name FROM pe WHERE id = scene_node.id LIMIT 1)[0] ?? '' as name
         FROM scene_node
-        WHERE dbno = {}"#,
-        dbno
+        WHERE dbnum = {}"#,
+        dbnum
     );
 
     let rows: Vec<SceneNodeRow> = SUL_DB.query_take(&sql, 0).await?;
     if rows.is_empty() {
-        println!("[scene_tree_parquet] dbno={} 没有节点数据", dbno);
+        println!("[scene_tree_parquet] dbnum={} 没有节点数据", dbnum);
         return Ok(0);
     }
 
     let node_count = rows.len();
     println!(
-        "[scene_tree_parquet] 查询到 {} 个节点 (dbno={})",
-        node_count, dbno
+        "[scene_tree_parquet] 查询到 {} 个节点 (dbnum={})",
+        node_count, dbnum
     );
 
     // 2. 构建列数据
@@ -69,7 +69,7 @@ pub async fn export_scene_tree_parquet(dbno: u32, output_dir: &Path) -> Result<u
     let has_geos: Vec<bool> = rows.iter().map(|r| r.has_geo).collect();
     let is_leafs: Vec<bool> = rows.iter().map(|r| r.is_leaf).collect();
     let generateds: Vec<bool> = rows.iter().map(|r| r.generated).collect();
-    let dbnos: Vec<i32> = rows.iter().map(|r| r.dbno).collect();
+    let dbnos: Vec<i32> = rows.iter().map(|r| r.dbnum).collect();
     let geo_types: Vec<Option<&str>> = rows.iter().map(|r| r.geo_type.as_deref()).collect();
     let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
 
@@ -80,7 +80,7 @@ pub async fn export_scene_tree_parquet(dbno: u32, output_dir: &Path) -> Result<u
         "has_geo" => has_geos,
         "is_leaf" => is_leafs,
         "generated" => generateds,
-        "dbno" => dbnos,
+        "dbnum" => dbnos,
         "geo_type" => geo_types,
         "name" => names,
     ]?;
@@ -89,7 +89,7 @@ pub async fn export_scene_tree_parquet(dbno: u32, output_dir: &Path) -> Result<u
     fs::create_dir_all(output_dir)?;
 
     // 5. 写入 Parquet 文件
-    let file_name = format!("scene_tree_{}.parquet", dbno);
+    let file_name = format!("scene_tree_{}.parquet", dbnum);
     let file_path = output_dir.join(&file_name);
 
     let file = fs::File::create(&file_path)?;

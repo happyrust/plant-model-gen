@@ -62,7 +62,7 @@
 SELECT
     owner_refno,
     owner_type,
-    meta::id(in) as refno,
+    record::id(in) as refno,
     in.noun as noun,
     in.dbnum as dbnum,
     out.spec_value as spec_value,
@@ -226,7 +226,7 @@ DEFINE FIELD out ON TABLE inst_relate_aabb TYPE record<aabb>;
 **查询方式**: 使用 SurrealDB 图遍历
 ```sql
 SELECT
-    meta::id(in) as refno,
+    record::id(in) as refno,
     -- 子组件的 AABB（通过 in 查询）
     (SELECT out.d FROM in->inst_relate_aabb) as aabb
 FROM inst_relate

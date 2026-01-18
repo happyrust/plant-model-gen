@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use aios_core::SurrealQueryExt;
+use aios_core::{RecordId, SurrealQueryExt};
 use aios_core::rs_surreal::query_tubi_insts_by_brans;
 use aios_core::shape::pdms_shape::PlantMesh;
 use aios_core::{GeomInstQuery, RefnoEnum, SUL_DB, TubiInstQuery, get_named_attmap};
@@ -21,7 +21,9 @@ use std::io::Write;
 use aios_core::geometry::csg::{unit_box_mesh, unit_cylinder_mesh, unit_sphere_mesh};
 use aios_core::mesh_precision::LodMeshSettings;
 
+use crate::fast_model::mesh_generate::gen_inst_meshes_by_geo_ids;
 use crate::fast_model::query_provider;
+use crate::options::get_db_option_ext;
 
 /// 清洗节点名称，确保符合 glTF 规范
 ///
@@ -310,7 +312,9 @@ pub async fn collect_export_data(
                 let mut noun: Option<String> = None;
                 let mut owner_type: Option<String> = None;
 
-                if let Ok(Some(pe)) = query_provider::get_pe(owner_ref).await {
+                // 导出阶段只需要 PE 的基本信息（name/noun/owner），不应依赖 TreeIndex，
+                // 否则会触发加载巨大 .tree 索引并导致栈溢出/额外开销。
+                if let Ok(Some(pe)) = aios_core::get_pe(owner_ref).await {
                     if !pe.noun.is_empty() {
                         noun = Some(pe.noun.to_uppercase());
                     }
@@ -358,7 +362,8 @@ pub async fn collect_export_data(
                 let mut name = None;
                 let mut noun = None;
 
-                if let Ok(Some(pe)) = query_provider::get_pe(refno).await {
+                // 导出阶段直接走 SurrealDB 查询 PE，避免引入 TreeIndex 依赖
+                if let Ok(Some(pe)) = aios_core::get_pe(refno).await {
                     if !pe.name.is_empty() {
                         name = Some(pe.name);
                     }
@@ -571,7 +576,7 @@ pub async fn collect_export_data(
         let noun = refno_noun_map
             .get(&geom_inst.refno)
             .cloned()
-            .unwrap_or_else(|| geom_inst.generic.clone().to_uppercase());
+            .unwrap_or_else(|| "UNKNOWN".to_string());
 
         let name = refno_name_map.get(&geom_inst.refno).cloned();
 
@@ -622,8 +627,8 @@ pub async fn collect_export_data(
                 owner_refno,
                 owner_noun,
                 owner_type,
-                spec_value: geom_inst.spec_value,
-                has_neg: geom_inst.has_neg,  // 是否使用布尔结果 mesh
+                spec_value: None,  // TODO: 从其他来源获取
+                has_neg: false,  // 默认不使用布尔结果
                 aabb: geom_inst.world_aabb,
             });
         }
@@ -722,8 +727,9 @@ pub async fn collect_export_data(
 
     // 检查几何体文件存在性 (GLB)
     let mut valid_geo_hashes = std::collections::HashSet::new();
-    let mut loaded_count = 0;
-    let mut failed_count = 0;
+    let mut loaded_count: usize = 0;
+    let mut failed_count: usize = 0;
+    let mut missing_geo_hashes: Vec<String> = Vec::new();
 
     // 按使用次数排序，优先检查高频几何
     let mut sorted_geo_hashes: Vec<_> = geo_hash_usage.iter().collect();
@@ -741,8 +747,6 @@ pub async fn collect_export_data(
     }
 
     // 默认检查 L1 级别的 GLB
-    use aios_core::mesh_precision::set_active_precision;
-    use aios_core::mesh_precision::MeshPrecisionSettings;
     // 获取默认精度设置 (通常是 L1)
     let default_lod = aios_core::mesh_precision::LodLevel::L1;
     
@@ -801,6 +805,7 @@ pub async fn collect_export_data(
                 }
                 _ => {
                     failed_count += 1;
+                    missing_geo_hashes.push((*geo_hash).clone());
                 }
             }
         }
@@ -812,6 +817,103 @@ pub async fn collect_export_data(
     } else {
         pb.finish_and_clear();
     }
+
+    let regen_missing_mesh = aios_core::is_debug_model_enabled()
+        || std::env::var("FORCE_REPLACE_MESH")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+    if regen_missing_mesh && !missing_geo_hashes.is_empty() {
+        if verbose {
+            println!(
+                "🔄 检测到 {} 个缺失 mesh，尝试按 inst_geo 补生成",
+                missing_geo_hashes.len()
+            );
+        }
+
+        let regen_base_dir = if mesh_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.starts_with("lod_"))
+            .unwrap_or(false)
+        {
+            mesh_dir.parent().unwrap_or(mesh_dir).to_path_buf()
+        } else {
+            mesh_dir.to_path_buf()
+        };
+
+        let db_option_ext = get_db_option_ext();
+        let precision = db_option_ext.inner.mesh_precision.clone();
+        let mesh_formats = db_option_ext.mesh_formats.clone();
+        let mut geo_ids = Vec::new();
+
+        for geo_hash in &missing_geo_hashes {
+            geo_ids.push(RecordId::new("inst_geo", geo_hash.to_string()));
+        }
+
+        if !geo_ids.is_empty() {
+            if let Err(e) = gen_inst_meshes_by_geo_ids(
+                &regen_base_dir,
+                &precision,
+                &geo_ids,
+                &mesh_formats,
+            )
+            .await
+            {
+                eprintln!("⚠️  缺失 mesh 补生成失败: {}", e);
+            }
+        }
+
+        let existing_files_after: std::collections::HashSet<std::ffi::OsString> =
+            if search_dir.exists() {
+                std::fs::read_dir(&search_dir)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok().map(|e| e.file_name()))
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
+
+        let mut recovered = 0usize;
+        for geo_hash in &missing_geo_hashes {
+            let filename = format!("{}_{:?}.glb", geo_hash, default_lod);
+            let fallback_filename = format!("{}.glb", geo_hash);
+            let file_exists = existing_files_after.contains(std::ffi::OsStr::new(&filename));
+            let fallback_exists =
+                existing_files_after.contains(std::ffi::OsStr::new(&fallback_filename));
+            if file_exists || fallback_exists {
+                if valid_geo_hashes.insert(geo_hash.clone()) {
+                    recovered += 1;
+                }
+            }
+        }
+
+        if recovered > 0 {
+            loaded_count += recovered;
+            failed_count = failed_count.saturating_sub(recovered);
+        }
+
+        if verbose {
+            println!(
+                "   ✅ 补生成完成：成功 {} / {}",
+                recovered,
+                missing_geo_hashes.len()
+            );
+        }
+    }
+
+    // 过滤掉缺失 mesh 的几何体，避免导出阶段出现缺失警告
+    for component in &mut components {
+        component
+            .geometries
+            .retain(|g| valid_geo_hashes.contains(&g.geo_hash));
+    }
+    components.retain(|c| !c.geometries.is_empty());
+    tubings.retain(|t| valid_geo_hashes.contains(&t.geo_hash));
+
+    let total_component_instances: usize = components.iter().map(|c| c.geometries.len()).sum();
+    let total_instances = total_component_instances + tubings.len();
 
     // 获取缓存统计 (这里不再使用 GltfMeshCache，所以置 0)
     let cache_hits = 0;

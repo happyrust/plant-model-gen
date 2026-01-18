@@ -3,6 +3,7 @@ use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::gen_model::is_e3d_debug_enabled;
 use crate::fast_model::{SEND_INST_SIZE, get_generic_type, shared};
 use crate::{consts::*, e3d_dbg};
+use crate::fast_model::query_compat::query_filter_deep_children_atts;
 use aios_core::RefU64;
 use aios_core::geometry::*;
 use aios_core::options::DbOption;
@@ -213,7 +214,7 @@ pub async fn gen_prim_geos(
                             // verts_map.insert(v, i);
                         }
                         let index_loops =
-                            aios_core::query_filter_deep_children_atts(refno, &["LOOPTS"])
+                            query_filter_deep_children_atts(refno, &["LOOPTS"])
                                 .await
                                 .unwrap_or_default();
                         // dbg!(index_loops.len());
@@ -230,7 +231,7 @@ pub async fn gen_prim_geos(
                         });
                         // dbg!(index_map.len());
                         let loop_atts =
-                            aios_core::query_filter_deep_children_atts(refno, &["POLOOP"])
+                            query_filter_deep_children_atts(refno, &["POLOOP"])
                                 .await
                                 .unwrap_or_default();
                         // dbg!(loop_atts.len());

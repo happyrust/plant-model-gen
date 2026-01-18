@@ -129,7 +129,7 @@ impl DuckDBStreamWriter {
 
         let columns = Self::get_table_columns(conn, "aabb")?;
         let mut aabb_has_bbox = columns.contains("bbox");
-        let mut aabb_has_dbno = columns.contains("dbno");
+        let mut aabb_has_dbno = columns.contains("dbnum");
 
         if columns.is_empty() {
             if spatial_enabled {
@@ -137,7 +137,7 @@ impl DuckDBStreamWriter {
                     r#"
                     CREATE TABLE IF NOT EXISTS aabb (
                         refno   VARCHAR PRIMARY KEY,
-                        dbno    INTEGER,
+                        dbnum    INTEGER,
                         min_x   DOUBLE,
                         min_y   DOUBLE,
                         min_z   DOUBLE,
@@ -155,7 +155,7 @@ impl DuckDBStreamWriter {
                     r#"
                     CREATE TABLE IF NOT EXISTS aabb (
                         refno   VARCHAR PRIMARY KEY,
-                        dbno    INTEGER,
+                        dbnum    INTEGER,
                         min_x   DOUBLE,
                         min_y   DOUBLE,
                         min_z   DOUBLE,
@@ -169,7 +169,7 @@ impl DuckDBStreamWriter {
             }
         } else {
             if !aabb_has_dbno {
-                conn.execute_batch("ALTER TABLE aabb ADD COLUMN dbno INTEGER;")?;
+                conn.execute_batch("ALTER TABLE aabb ADD COLUMN dbnum INTEGER;")?;
                 aabb_has_dbno = true;
             }
 
@@ -180,7 +180,7 @@ impl DuckDBStreamWriter {
 
             if aabb_has_dbno {
                 let _ = conn.execute_batch(
-                    "UPDATE aabb SET dbno = CAST(split_part(refno, '_', 1) AS INTEGER) WHERE dbno IS NULL;",
+                    "UPDATE aabb SET dbnum = CAST(split_part(refno, '_', 1) AS INTEGER) WHERE dbnum IS NULL;",
                 );
             }
 
@@ -210,7 +210,7 @@ impl DuckDBStreamWriter {
         // 1. 写入 instance 和 geo
         for (refno, info) in &data.inst_info_map {
             let refno_str = refno.to_string();
-            let dbno = refno.refno().get_0() as i32;
+            let dbnum = refno.refno().get_0() as i32;
             let noun = info.generic_type.to_string();
             let owner_refno = if info.owner_refno != *refno {
                 Some(info.owner_refno.to_string())
@@ -243,10 +243,10 @@ impl DuckDBStreamWriter {
                 if use_bbox {
                     if use_dbno {
                         conn.execute(
-                            "INSERT OR REPLACE INTO aabb (refno, dbno, min_x, min_y, min_z, max_x, max_y, max_z, bbox) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ST_MakeEnvelope(?9, ?10, ?11, ?12))",
+                            "INSERT OR REPLACE INTO aabb (refno, dbnum, min_x, min_y, min_z, max_x, max_y, max_z, bbox) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ST_MakeEnvelope(?9, ?10, ?11, ?12))",
                             duckdb::params![
                                 &refno_str,
-                                dbno,
+                                dbnum,
                                 min_x,
                                 min_y,
                                 min_z,
@@ -279,10 +279,10 @@ impl DuckDBStreamWriter {
                     }
                 } else if use_dbno {
                     conn.execute(
-                        "INSERT OR REPLACE INTO aabb (refno, dbno, min_x, min_y, min_z, max_x, max_y, max_z) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        "INSERT OR REPLACE INTO aabb (refno, dbnum, min_x, min_y, min_z, max_x, max_y, max_z) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         duckdb::params![
                             &refno_str,
-                            dbno,
+                            dbnum,
                             min_x,
                             min_y,
                             min_z,
@@ -336,7 +336,7 @@ impl DuckDBStreamWriter {
         // 3. 写入 tubi 数据
         for (refno, tubi_info) in &data.inst_tubi_map {
             let refno_str = refno.to_string();
-            let dbno = refno.refno().get_0() as i32;
+            let dbnum = refno.refno().get_0() as i32;
             let noun = "TUBI";
             let owner_refno = if tubi_info.owner_refno != *refno {
                 Some(tubi_info.owner_refno.to_string())
@@ -361,10 +361,10 @@ impl DuckDBStreamWriter {
                 if use_bbox {
                     if use_dbno {
                         conn.execute(
-                            "INSERT OR REPLACE INTO aabb (refno, dbno, min_x, min_y, min_z, max_x, max_y, max_z, bbox) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ST_MakeEnvelope(?9, ?10, ?11, ?12))",
+                            "INSERT OR REPLACE INTO aabb (refno, dbnum, min_x, min_y, min_z, max_x, max_y, max_z, bbox) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ST_MakeEnvelope(?9, ?10, ?11, ?12))",
                             duckdb::params![
                                 &refno_str,
-                                dbno,
+                                dbnum,
                                 min_x,
                                 min_y,
                                 min_z,
@@ -397,10 +397,10 @@ impl DuckDBStreamWriter {
                     }
                 } else if use_dbno {
                     conn.execute(
-                        "INSERT OR REPLACE INTO aabb (refno, dbno, min_x, min_y, min_z, max_x, max_y, max_z) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        "INSERT OR REPLACE INTO aabb (refno, dbnum, min_x, min_y, min_z, max_x, max_y, max_z) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         duckdb::params![
                             &refno_str,
-                            dbno,
+                            dbnum,
                             min_x,
                             min_y,
                             min_z,
@@ -447,7 +447,7 @@ impl DuckDBStreamWriter {
         )?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_aabb_z ON aabb(min_z, max_z);")?;
         if self.aabb_has_dbno {
-            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_aabb_dbno ON aabb(dbno);")?;
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_aabb_dbno ON aabb(dbnum);")?;
         }
         if self.spatial_enabled && self.aabb_has_bbox {
             conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_aabb_rtree ON aabb USING RTREE (bbox);")?;
@@ -475,7 +475,7 @@ impl DuckDBStreamWriter {
             "max_z",
         ];
         if self.aabb_has_dbno {
-            aabb_schema.insert(1, "dbno");
+            aabb_schema.insert(1, "dbnum");
         }
         if self.aabb_has_bbox {
             aabb_schema.push("bbox");

@@ -16,6 +16,7 @@ use glam::Vec3;
 use serde_json::{Value, json};
 
 use crate::fast_model::material_config::MaterialLibrary;
+use crate::fast_model::query_provider;
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
 
 use super::export_common::{ExportData, collect_export_data};
@@ -50,11 +51,11 @@ pub async fn export_unit_mesh_glb_for_refnos(
         println!("\n📊 查询子孙节点...");
         let mut descendants = if let Some(nouns) = filter_nouns {
             let nouns_slice: Vec<&str> = nouns.iter().map(|s| s.as_str()).collect();
-            aios_core::collect_descendant_filter_ids(refnos, &nouns_slice, None)
+            query_provider::query_multi_descendants(refnos, &nouns_slice)
                 .await
                 .context("查询子孙节点失败")?
         } else {
-            aios_core::collect_descendant_filter_ids(refnos, &[], None)
+            query_provider::query_multi_descendants(refnos, &[])
                 .await
                 .context("查询子孙节点失败")?
         };

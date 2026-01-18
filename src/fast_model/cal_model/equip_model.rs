@@ -1,3 +1,4 @@
+use crate::fast_model::query_provider;
 use crate::fast_model::utils::save_transforms_to_surreal;
 use aios_core::{RefU64, RefnoEnum, SUL_DB, gen_bytes_hash};
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
@@ -85,11 +86,12 @@ pub async fn cal_equip_nearest_floor() -> anyhow::Result<()> {
             continue;
         }
 
-        // 使用 children(record link) 的递归查询获取子孙节点（保持与旧实现一致：只取 1..2 层）
-        let mut target_refnos =
-            aios_core::collect_descendant_filter_ids(&[equip], &[], Some("1..2"))
-                .await
-                .unwrap_or_default();
+        // 使用 TreeIndex 查询获取子孙节点（保持与旧实现一致：只取 1..2 层）
+        let provider = query_provider::get_model_query_provider().await?;
+        let mut target_refnos = provider
+            .get_descendants_filtered(equip, &[], Some(2))
+            .await
+            .unwrap_or_default();
         target_refnos.retain(|r| *r != equip);
         if target_refnos.is_empty() {
             continue;

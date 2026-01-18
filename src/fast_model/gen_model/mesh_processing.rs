@@ -46,15 +46,15 @@ pub async fn process_meshes_by_dbnos(dbnos: &[u32], db_option: &DbOptionExt) -> 
     let filtered_dbnos = if let Some(exclude_nums) = &db_option.exclude_db_nums {
         dbnos
             .iter()
-            .filter(|&&dbno| !exclude_nums.contains(&dbno))
+            .filter(|&&dbnum| !exclude_nums.contains(&dbnum))
             .copied()
             .collect::<Vec<_>>()
     } else {
         dbnos.to_vec()
     };
 
-    for &dbno in &filtered_dbnos {
-        let sites = query_by_type(&["SITE"], dbno as i32, None).await?;
+    for &dbnum in &filtered_dbnos {
+        let sites = query_by_type(&["SITE"], dbnum as i32, None).await?;
         process_meshes_update_db_deep(db_option, &sites)
             .await
             .expect("更新模型数据失败");

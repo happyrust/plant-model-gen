@@ -27,7 +27,7 @@ mod tests {
         // 1. 检查 FRMW 节点类型
         println!("\n📋 步骤 1: 检查 FRMW 节点类型");
         let sql1 = format!(
-            "SELECT type, NAME FROM type::thing('inst', {}) LIMIT 1",
+            "SELECT type, NAME FROM type::record('inst', {}) LIMIT 1",
             frmw_refno.refno().0
         );
         let result1: Vec<serde_json::Value> =
@@ -87,7 +87,7 @@ mod tests {
         // 5. 检查三通的位置和所属关系
         println!("\n📋 步骤 5: 检查三通的位置");
         let sql5 = format!(
-            "SELECT type, NAME, OWNER, OWNER.type, OWNER.NAME FROM type::thing('inst', {}) LIMIT 1",
+            "SELECT type, NAME, OWNER, OWNER.type, OWNER.NAME FROM type::record('inst', {}) LIMIT 1",
             tee_refno.refno().0
         );
         let result5: Vec<serde_json::Value> =
@@ -97,7 +97,7 @@ mod tests {
         // 6. 查询三通所在的管道或分支
         println!("\n📋 步骤 6: 查询三通所在的层级结构");
         let sql6 = format!(
-            "SELECT OWNER, OWNER.OWNER, OWNER.OWNER.OWNER, OWNER.OWNER.OWNER.OWNER FROM type::thing('inst', {}) LIMIT 1",
+            "SELECT OWNER, OWNER.OWNER, OWNER.OWNER.OWNER, OWNER.OWNER.OWNER.OWNER FROM type::record('inst', {}) LIMIT 1",
             tee_refno.refno().0
         );
         let result6: Vec<serde_json::Value> =

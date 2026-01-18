@@ -1,6 +1,6 @@
-//! Parquet Stream Writer - 按 dbno 流式写入 Parquet
+//! Parquet Stream Writer - 按 dbnum 流式写入 Parquet
 //!
-//! 在模型生成过程中直接将 ShapeInstancesData 按 dbno 写入 Parquet，
+//! 在模型生成过程中直接将 ShapeInstancesData 按 dbnum 写入 Parquet，
 //! 支持增量写入和自动合并。
 
 use anyhow::{Context, Result};
@@ -53,10 +53,10 @@ struct GeoItem {
 
 /// Parquet 流式写入器
 /// 
-/// 在模型生成过程中直接将数据按 dbno 写入 Parquet，使用增量文件机制实现高性能批量插入。
+/// 在模型生成过程中直接将数据按 dbnum 写入 Parquet，使用增量文件机制实现高性能批量插入。
 pub struct ParquetStreamWriter {
     base_dir: PathBuf,
-    /// 记录已处理的 dbno 集合
+    /// 记录已处理的 dbnum 集合
     processed_dbnos: Mutex<std::collections::HashSet<u32>>,
 }
 
@@ -83,8 +83,8 @@ impl ParquetStreamWriter {
     /// 
     /// 直接写入增量文件，返回：(instance_count, geo_count, transform_count)
     pub fn write_batch(&self, data: &ShapeInstancesData) -> Result<(usize, usize, usize)> {
-        // 从 inst_geos_map 中任意一个值提取 dbno（EleInstGeosData.refno）
-        let dbno = if let Some(geos_data) = data.inst_geos_map.values().next() {
+        // 从 inst_geos_map 中任意一个值提取 dbnum（EleInstGeosData.refno）
+        let dbnum = if let Some(geos_data) = data.inst_geos_map.values().next() {
             geos_data.refno.refno().get_0()
         } else if let Some((refno, _)) = data.inst_info_map.iter().next() {
             refno.refno().get_0()
@@ -93,10 +93,10 @@ impl ParquetStreamWriter {
             return Ok((0, 0, 0));
         };
         
-        // 记录已处理的 dbno
+        // 记录已处理的 dbnum
         {
             let mut processed = self.processed_dbnos.lock().unwrap();
-            processed.insert(dbno);
+            processed.insert(dbnum);
         }
         
         // 提取行数据
@@ -106,8 +106,8 @@ impl ParquetStreamWriter {
             return Ok((0, 0, 0));
         }
         
-        // 创建 dbno 目录
-        let dbno_dir = self.base_dir.join(dbno.to_string());
+        // 创建 dbnum 目录
+        let dbno_dir = self.base_dir.join(dbnum.to_string());
         std::fs::create_dir_all(&dbno_dir)?;
         
         // 生成增量文件
@@ -146,10 +146,10 @@ impl ParquetStreamWriter {
             return Ok(());
         }
         
-        println!("🔍 [Parquet] 开始合并 {} 个 dbno 的数据...", processed.len());
+        println!("🔍 [Parquet] 开始合并 {} 个 dbnum 的数据...", processed.len());
         
-        for dbno in processed.iter() {
-            self.compact_dbno(*dbno)?;
+        for dbnum in processed.iter() {
+            self.compact_dbno(*dbnum)?;
         }
         
         println!("✅ [Parquet] 全部完成");
@@ -494,25 +494,25 @@ impl ParquetStreamWriter {
         DataFrame::new(cols).map_err(Into::into)
     }
 
-    /// 合并指定 dbno 的增量文件到主文件
-    fn compact_dbno(&self, dbno: u32) -> Result<()> {
-        self.compact_table(dbno, "instance", "refno")?;
-        self.compact_table(dbno, "transform", "trans_id")?;
+    /// 合并指定 dbnum 的增量文件到主文件
+    fn compact_dbno(&self, dbnum: u32) -> Result<()> {
+        self.compact_table(dbnum, "instance", "refno")?;
+        self.compact_table(dbnum, "transform", "trans_id")?;
         Ok(())
     }
 
     /// 通用单表合并逻辑
-    fn compact_table(&self, dbno: u32, prefix: &str, key_col: &str) -> Result<()> {
-        let dbno_dir = self.base_dir.join(dbno.to_string());
+    fn compact_table(&self, dbnum: u32, prefix: &str, key_col: &str) -> Result<()> {
+        let dbno_dir = self.base_dir.join(dbnum.to_string());
         let main_file = dbno_dir.join(format!("{}.parquet", prefix));
         
         // 列出所有增量文件
-        let incremental_files = self.list_incremental_files(dbno, prefix)?;
+        let incremental_files = self.list_incremental_files(dbnum, prefix)?;
         if incremental_files.is_empty() {
             return Ok(());
         }
         
-        println!("🔄 [Parquet] dbno={} {} 合并 {} 个增量文件...", dbno, prefix, incremental_files.len());
+        println!("🔄 [Parquet] dbnum={} {} 合并 {} 个增量文件...", dbnum, prefix, incremental_files.len());
         
         let mut frames = Vec::new();
         
@@ -565,13 +565,13 @@ impl ParquetStreamWriter {
             let _ = std::fs::remove_file(path);
         }
         
-        println!("✅ [Parquet] dbno={} {} 合并完成: {} 条记录", dbno, prefix, unique_df.height());
+        println!("✅ [Parquet] dbnum={} {} 合并完成: {} 条记录", dbnum, prefix, unique_df.height());
         Ok(())
     }
 
-    /// 列出指定 dbno 和类型的增量文件
-    fn list_incremental_files(&self, dbno: u32, prefix: &str) -> Result<Vec<PathBuf>> {
-        let dbno_dir = self.base_dir.join(dbno.to_string());
+    /// 列出指定 dbnum 和类型的增量文件
+    fn list_incremental_files(&self, dbnum: u32, prefix: &str) -> Result<Vec<PathBuf>> {
+        let dbno_dir = self.base_dir.join(dbnum.to_string());
         if !dbno_dir.exists() {
             return Ok(Vec::new());
         }

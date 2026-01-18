@@ -41,6 +41,7 @@ use crate::fast_model::export_model::model_exporter::{
     query_geometry_instances,
 };
 use crate::fast_model::material_config::MaterialLibrary;
+use crate::fast_model::query_compat::query_deep_visible_inst_refnos;
 use crate::fast_model::query_provider;
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
 
@@ -1429,7 +1430,7 @@ async fn collect_deep_visible_refnos(
 ) -> Result<Vec<RefnoEnum>> {
     let mut collected = HashSet::new();
     for &refno in refnos {
-        match aios_core::query_deep_visible_inst_refnos(refno).await {
+        match query_deep_visible_inst_refnos(refno).await {
             Ok(visible) => {
                 if visible.is_empty() {
                     collected.insert(refno);
@@ -1483,7 +1484,7 @@ async fn collect_deep_visible_refnos(
 /// - `name_config`: 可选名称配置，用于将三维模型节点名称转换为 PID 对象名称
 /// - `export_all_lods`: 是否导出所有 LOD 级别，为 false 时仅导出 L1
 pub async fn export_all_relates_prepack_lod(
-    dbno: Option<u32>,
+    dbnum: Option<u32>,
     verbose: bool,
     output_override: Option<PathBuf>,
     owner_types: Option<Vec<String>>,
@@ -1583,8 +1584,8 @@ pub async fn export_all_relates_prepack_lod(
         } else {
             // 未指定 owner_types 时，才通过 Noun 获取 BRAN/EQUI 作为入口
             let nouns = ["BRAN", "EQUI"];
-            if let Some(dbno) = dbno {
-                query_provider::query_by_type(&nouns, dbno as i32, None)
+            if let Some(dbnum) = dbnum {
+                query_provider::query_by_type(&nouns, dbnum as i32, None)
                     .await
                     .unwrap_or_default()
             } else {
@@ -1618,13 +1619,13 @@ pub async fn export_all_relates_prepack_lod(
         }
     }
 
-    // 1. 可选按 dbno 限定 inst_relate 范围
-    //    如果提供了 dbno，只查询该 db 下的 inst_relate；否则全表扫描。
-    let db_filter = if let Some(dbno) = dbno {
-        println!("   - 模式: 按 dbno={} 过滤", dbno);
-        format!("in.dbno = {} ", dbno)
+    // 1. 可选按 dbnum 限定 inst_relate 范围
+    //    如果提供了 dbnum，只查询该 db 下的 inst_relate；否则全表扫描。
+    let db_filter = if let Some(dbnum) = dbnum {
+        println!("   - 模式: 按 dbnum={} 过滤", dbnum);
+        format!("in.dbnum = {} ", dbnum)
     } else {
-        println!("   - 模式: 全表扫描（所有 dbno）");
+        println!("   - 模式: 全表扫描（所有 dbnum）");
         "1=1 ".to_string()
     };
 
@@ -1696,8 +1697,8 @@ pub async fn export_all_relates_prepack_lod(
     // 确定输出目录
     let output_dir = if let Some(custom) = output_override {
         custom
-    } else if let Some(dbno) = dbno {
-        PathBuf::from(format!("output/all_relates_dbno_{}", dbno))
+    } else if let Some(dbnum) = dbnum {
+        PathBuf::from(format!("output/all_relates_dbno_{}", dbnum))
     } else {
         PathBuf::from("output/all_relates_all")
     };
@@ -1728,7 +1729,7 @@ pub async fn export_all_relates_prepack_lod(
 }
 
 pub async fn export_all_relates_prepack_lod_parquet(
-    dbno: Option<u32>,
+    dbnum: Option<u32>,
     verbose: bool,
     output_override: Option<PathBuf>,
     owner_types: Option<Vec<String>>,
@@ -1831,8 +1832,8 @@ pub async fn export_all_relates_prepack_lod_parquet(
             Vec::new()
         } else {
             let nouns = ["BRAN", "EQUI"];
-            if let Some(dbno) = dbno {
-                query_provider::query_by_type(&nouns, dbno as i32, None)
+            if let Some(dbnum) = dbnum {
+                query_provider::query_by_type(&nouns, dbnum as i32, None)
                     .await
                     .unwrap_or_default()
             } else {
@@ -1862,11 +1863,11 @@ pub async fn export_all_relates_prepack_lod_parquet(
         }
     }
 
-    let db_filter = if let Some(dbno) = dbno {
-        println!("   - 模式: 按 dbno={} 过滤", dbno);
-        format!("in.dbno = {} ", dbno)
+    let db_filter = if let Some(dbnum) = dbnum {
+        println!("   - 模式: 按 dbnum={} 过滤", dbnum);
+        format!("in.dbnum = {} ", dbnum)
     } else {
-        println!("   - 模式: 全表扫描（所有 dbno）");
+        println!("   - 模式: 全表扫描（所有 dbnum）");
         "1=1 ".to_string()
     };
 
@@ -1931,8 +1932,8 @@ pub async fn export_all_relates_prepack_lod_parquet(
 
     let output_dir = if let Some(custom) = output_override {
         custom
-    } else if let Some(dbno) = dbno {
-        PathBuf::from(format!("output/all_relates_dbno_{}", dbno))
+    } else if let Some(dbnum) = dbnum {
+        PathBuf::from(format!("output/all_relates_dbno_{}", dbnum))
     } else {
         PathBuf::from("output/all_relates_all")
     };
@@ -2183,7 +2184,7 @@ fn plant_transform_to_dmat4(t: &aios_core::PlantTransform) -> DMat4 {
 /// 导出指定 dbnum 的实例数据为简化 JSON 格式（含 AABB）
 ///
 /// # 参数
-/// - `dbno`: 数据库编号
+/// - `dbnum`: 数据库编号
 /// - `output_dir`: 输出目录
 /// - `db_option`: 数据库选项
 /// - `verbose`: 是否输出详细日志
@@ -2192,7 +2193,7 @@ fn plant_transform_to_dmat4(t: &aios_core::PlantTransform) -> DMat4 {
 /// # 返回
 /// 导出统计信息
 pub async fn export_dbnum_instances_json(
-    dbno: u32,
+    dbnum: u32,
     output_dir: &Path,
     db_option: std::sync::Arc<DbOption>,
     verbose: bool,
@@ -2205,7 +2206,7 @@ pub async fn export_dbnum_instances_json(
     let unit_converter = UnitConverter::new(LengthUnit::Millimeter, target);
 
     if verbose {
-        println!("🚀 开始导出 dbnum={} 的实例数据（含 AABB），目标单位: {:?}", dbno, target);
+        println!("🚀 开始导出 dbnum={} 的实例数据（含 AABB），目标单位: {:?}", dbnum, target);
     }
 
     // 确保输出目录存在
@@ -2213,7 +2214,7 @@ pub async fn export_dbnum_instances_json(
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
 
     // 1. 逐行查询 inst_relate（owner + child），由 Rust 负责分组，避免 GROUP BY 平行数组对齐隐患
-    let db_filter = format!("in.dbnum = {}", dbno);
+    let db_filter = format!("in.dbnum = {}", dbnum);
     let owner_sql = format!(
         r#"
         SELECT
@@ -2403,7 +2404,7 @@ pub async fn export_dbnum_instances_json(
                     // aios-core 0.2.3: GeomInstQuery.world_trans 为必填 PlantTransform（非 Option）
                     let refno_world = plant_transform_to_dmat4(&geom_inst.world_trans);
                     refno_world_trans_map.insert(geom_inst.refno, refno_world);
-                    refno_has_neg_map.insert(geom_inst.refno, geom_inst.has_neg);
+                    refno_has_neg_map.insert(geom_inst.refno, false);  // 默认不使用布尔结果
                     geom_inst_map.insert(geom_inst.refno, geom_inst.insts);
                 }
                 if verbose {
@@ -2570,7 +2571,7 @@ pub async fn export_dbnum_instances_json(
         FROM inst_relate
         WHERE in.dbnum = {} AND owner_type NOT IN ['BRAN', 'HANG', 'EQUI', 'HVAC', 'PIPE']
         "#,
-        dbno
+        dbnum
     );
 
     if verbose {
@@ -2616,7 +2617,7 @@ pub async fn export_dbnum_instances_json(
                 for geom_inst in geom_insts {
                     instance_geom_map.insert(geom_inst.refno, geom_inst.insts);
                     instance_aabb_map.insert(geom_inst.refno, geom_inst.world_aabb);
-                    instance_has_neg_map.insert(geom_inst.refno, geom_inst.has_neg);
+                    instance_has_neg_map.insert(geom_inst.refno, false);  // 默认不使用布尔结果
                     // aios-core 0.2.3: GeomInstQuery.world_trans 为必填 PlantTransform（非 Option）
                     let refno_world = plant_transform_to_dmat4(&geom_inst.world_trans);
                     instance_world_trans_map.insert(geom_inst.refno, refno_world);
@@ -2701,7 +2702,7 @@ pub async fn export_dbnum_instances_json(
     });
 
     // 6. 写入文件
-    let output_path = output_dir.join(format!("instances_{}.json", dbno));
+    let output_path = output_dir.join(format!("instances_{}.json", dbnum));
     let json_str = serde_json::to_string_pretty(&instances_json)?;
     fs::write(&output_path, json_str)?;
 
@@ -3193,10 +3194,10 @@ fn write_geometry_manifest_parquet(path: PathBuf, manifest: &PrepackGeometryMani
 // 占位符函数：修复预先缺失的函数
 // ============================================================================
 
-/// 导出指定 dbnos 的 instances.json（按 dbno 分组）
+/// 导出指定 dbnos 的 instances.json（按 dbnum 分组）
 ///
 /// 这是一个占位符函数，用于修复预先缺失的函数定义。
-/// 内部调用 export_dbnum_instances_json 为每个 dbno 导出。
+/// 内部调用 export_dbnum_instances_json 为每个 dbnum 导出。
 pub async fn export_instances_json_for_dbnos(
     dbnos: &[u32],
     _mesh_dir: &Path,
@@ -3204,16 +3205,16 @@ pub async fn export_instances_json_for_dbnos(
     db_option: Arc<DbOption>,
     _verbose: bool,
 ) -> anyhow::Result<()> {
-    for &dbno in dbnos {
-        export_dbnum_instances_json(dbno, output_dir, db_option.clone(), false, None).await?;
+    for &dbnum in dbnos {
+        export_dbnum_instances_json(dbnum, output_dir, db_option.clone(), false, None).await?;
     }
     Ok(())
 }
 
-/// 导出指定 refnos 的 instances.json（按 dbno 分组）
+/// 导出指定 refnos 的 instances.json（按 dbnum 分组）
 ///
 /// 这是一个占位符函数，用于修复预先缺失的函数定义。
-/// 内部调用 export_dbnum_instances_json 为每个 dbno 导出。
+/// 内部调用 export_dbnum_instances_json 为每个 dbnum 导出。
 pub async fn export_instances_json_for_refnos_grouped_by_dbno(
     refnos: &[RefnoEnum],
     _mesh_dir: &Path,
@@ -3221,23 +3222,23 @@ pub async fn export_instances_json_for_refnos_grouped_by_dbno(
     db_option: Arc<DbOption>,
     _verbose: bool,
 ) -> anyhow::Result<()> {
-    // 从 refnos 中提取所有唯一的 dbno
+    // 从 refnos 中提取所有唯一的 dbnum
     use std::collections::HashSet;
     let mut dbnos: HashSet<u32> = HashSet::new();
     for refno in refnos {
-        if let Some(dbno) = refno.to_string().split_once('_').and_then(|(db, _)| db.parse::<u32>().ok()) {
-            dbnos.insert(dbno);
+        if let Some(dbnum) = refno.to_string().split_once('_').and_then(|(db, _)| db.parse::<u32>().ok()) {
+            dbnos.insert(dbnum);
         }
     }
 
-    // 为每个 dbno 导出
-    for dbno in dbnos {
-        export_dbnum_instances_json(dbno, output_dir, db_option.clone(), false, None).await?;
+    // 为每个 dbnum 导出
+    for dbnum in dbnos {
+        export_dbnum_instances_json(dbnum, output_dir, db_option.clone(), false, None).await?;
     }
     Ok(())
 }
 
-/// 导出指定 refnos 的 instances.json（按 dbno 分组，合并追加模式）
+/// 导出指定 refnos 的 instances.json（按 dbnum 分组，合并追加模式）
 ///
 /// 这是一个占位符函数，用于修复预先缺失的函数定义。
 /// 目前与 export_instances_json_for_refnos_grouped_by_dbno 行为相同。

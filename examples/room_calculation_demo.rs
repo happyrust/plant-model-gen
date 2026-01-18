@@ -12,8 +12,8 @@ use anyhow::{Context, Result};
 #[tokio::main]
 async fn main() -> Result<()> {
     // 读取配置（默认 DbOption.toml）
-    let mut db_option_ext =
-        aios_database::options::get_db_option_ext_from_path("DbOption").context("加载 DbOption 失败")?;
+    let mut db_option_ext = aios_database::options::get_db_option_ext_from_path("DbOption")
+        .context("加载 DbOption 失败")?;
 
     // 初始化 SurrealDB 连接
     aios_core::init_surreal()
@@ -39,9 +39,14 @@ async fn main() -> Result<()> {
     db_option_ext.inner.gen_mesh = true;
 
     // 1) 生成模型（会自动走 debug_model_refnos 限定路径）
-    aios_database::fast_model::gen_all_geos_data(vec![], &db_option_ext, None, db_option_ext.target_sesno)
-        .await
-        .context("模型生成失败")?;
+    aios_database::fast_model::gen_all_geos_data(
+        vec![],
+        &db_option_ext,
+        None,
+        db_option_ext.target_sesno,
+    )
+    .await
+    .context("模型生成失败")?;
 
     // 2) 房间计算（落库 room_relate）
     let stats = aios_database::fast_model::build_room_relations(&db_option_ext.inner)
@@ -55,4 +60,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-

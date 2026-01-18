@@ -122,11 +122,11 @@ impl AiosDBManager {
 
             //还需要检查location dbnum，如果不一致，就需要clone
             //必须不是当前区域的db 才能clone, 只能clone别的区域的数据
-            if let Some(dbno) = watcher.get_dbno(&pb) {
-                dbg!(dbno);
+            if let Some(dbnum) = watcher.get_dbno(&pb) {
+                dbg!(dbnum);
                 //跳过当前区域的dbnos
                 if let Some(dbs) = loc_dbs {
-                    if dbs.contains(&dbno) {
+                    if dbs.contains(&dbnum) {
                         continue;
                     }
                 }

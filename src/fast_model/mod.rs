@@ -47,8 +47,10 @@ pub mod resolve;
 pub mod query;
 pub mod query_compat;
 pub mod query_provider; // 新的统一查询提供者 // 查询兼容层
+pub mod db_meta_cache;
 
 pub mod utils;
+pub mod precheck;
 
 pub mod export_model;
 

@@ -531,7 +531,7 @@ async fn get_filtered_dbnums(db_option: &DbOptionExt) -> Result<Vec<u32>> {
     };
 
     if let Some(exclude) = &db_option.exclude_db_nums {
-        dbnums.retain(|dbno| !exclude.contains(dbno));
+        dbnums.retain(|dbnum| !exclude.contains(dbnum));
     }
     Ok(dbnums)
 }
@@ -596,19 +596,19 @@ async fn collect_all_descendants(
     prim_refnos: &mut HashSet<RefnoEnum>,
     cate_refnos: &mut HashSet<RefnoEnum>,
 ) -> Result<()> {
-    let loop_descendants = aios_core::collect_descendant_filter_ids(roots, &GNERAL_LOOP_OWNER_NOUN_NAMES, None)
+    let loop_descendants = query_provider::query_multi_descendants(roots, &GNERAL_LOOP_OWNER_NOUN_NAMES)
         .await
         .map_err(|e| FullNounError::DatabaseError(format!("collect_descendant_filter_ids(loop) failed: {}", e)))?;
     track_refno_issues(&loop_descendants, "loop_descendants", RefnoErrorStage::Query);
     loop_refnos.extend(loop_descendants);
 
-    let prim_descendants = aios_core::collect_descendant_filter_ids(roots, &GNERAL_PRIM_NOUN_NAMES, None)
+    let prim_descendants = query_provider::query_multi_descendants(roots, &GNERAL_PRIM_NOUN_NAMES)
         .await
         .map_err(|e| FullNounError::DatabaseError(format!("collect_descendant_filter_ids(prim) failed: {}", e)))?;
     track_refno_issues(&prim_descendants, "prim_descendants", RefnoErrorStage::Query);
     prim_refnos.extend(prim_descendants);
 
-    let cate_descendants = aios_core::collect_descendant_filter_ids(roots, &USE_CATE_NOUN_NAMES, None)
+    let cate_descendants = query_provider::query_multi_descendants(roots, &USE_CATE_NOUN_NAMES)
         .await
         .map_err(|e| FullNounError::DatabaseError(format!("collect_descendant_filter_ids(cate) failed: {}", e)))?;
     track_refno_issues(&cate_descendants, "cate_descendants", RefnoErrorStage::Query);

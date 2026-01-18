@@ -8,7 +8,7 @@ pub const ATT_DIVCO: i32 = 688051937;
 /// 生成树结构的sql
 pub fn gen_pdms_element_insert_sql(
     att: &NamedAttrMap,
-    dbno: i32,
+    dbnum: i32,
     children_map: &HashMap<RefU64, Vec<RefU64>>,
 ) -> String {
     let Some(refno) = att.get_refno().map(|x| x.refno()) else {
@@ -32,7 +32,7 @@ pub fn gen_pdms_element_insert_sql(
         type_name,
         owner.0,
         name,
-        dbno,
+        dbnum,
         order,
         children_count
     ));

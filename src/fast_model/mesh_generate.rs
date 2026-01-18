@@ -25,8 +25,9 @@ use aios_core::shape::pdms_shape::{PlantMesh, RsVec3};
 use aios_core::tool::float_tool::{dvec4_round_3, f64_round};
 use aios_core::{
     RecordId, RefU64, RefnoEnum, SUL_DB, gen_bytes_hash, get_inst_relate_keys,
-    query_deep_neg_inst_refnos, query_deep_visible_inst_refnos, utils::RecordIdExt,
+    utils::RecordIdExt,
 };
+use crate::fast_model::query_compat::{query_deep_neg_inst_refnos, query_deep_visible_inst_refnos};
 use aios_core::{get_db_option, init_test_surreal};
 // 导入几何查询相关的结构体和方法
 use aios_core::{
@@ -38,6 +39,7 @@ use aios_core::query_db;
 use anyhow::anyhow;
 use bevy_transform::prelude::Transform;
 use chrono;
+use std::str::FromStr;
 use dashmap::DashMap;
 use glam::DMat4;
 use itertools::Itertools;
@@ -876,6 +878,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
         let mesh_id = g.id.to_mesh_id();
         
         // 不需要 refno
+        let geo_type_name = g.param.type_name();
         match generate_csg_mesh(&g.param, &profile.csg_settings, non_scalable_geo, None) {
             Some(csg_mesh) => {
                 let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
@@ -899,7 +902,11 @@ pub async fn gen_inst_meshes_by_geo_ids(
                 }
             }
             None => {
-                debug_model_warn!("CSG mesh 返回 None for {}", mesh_id);
+                debug_model_warn!(
+                    "CSG mesh 返回 None for {} (type={})",
+                    mesh_id,
+                    geo_type_name
+                );
                 // 设置 bad=true 和 meshed=true 避免重复处理
                 update_sql.push_str(&format!("UPDATE inst_geo:⟨{}⟩ SET bad=true, meshed=true;", mesh_id));
             }
@@ -1301,10 +1308,13 @@ pub async fn update_inst_relate_aabbs_by_refnos(
         );
 
         for r in result {
+            // 过滤 world_trans 为 None 的记录
+            let Some(world_trans) = r.world_trans else { continue };
+            
             // 计算合并后的 AABB
             let mut aabb = Aabb::new_invalid();
             for g in &r.geo_aabbs {
-                let t = r.world_trans * &g.trans;
+                let t = world_trans * &g.trans;
                 let tmp_aabb = g.aabb.scaled(&t.scale.into());
                 let tmp_aabb = tmp_aabb.transform_by(&Isometry {
                     rotation: t.rotation.into(),
@@ -1350,11 +1360,18 @@ pub async fn update_inst_relate_aabbs_by_refnos(
     Ok(())
 }
 
-/// 查询所有 inst_relate 的 refno（仅 world_trans 存在的实例）
+/// 查询所有 pe_transform 的 refno（仅 world_trans 存在的实例）
 pub async fn fetch_inst_relate_refnos() -> anyhow::Result<Vec<RefnoEnum>> {
-    let sql = "SELECT value in.id FROM inst_relate WHERE world_trans.d != none";
-    let mut resp = SUL_DB.query(sql).await?;
-    let refnos: Vec<RefnoEnum> = resp.take(0)?;
+    let sql = "SELECT VALUE record::id(id) FROM pe_transform WHERE world_trans != none";
+    let refno_strings: Vec<String> = SUL_DB.query_take(sql, 0).await?;
+    let refnos = refno_strings
+        .into_iter()
+        .filter_map(|refno| {
+            RefnoEnum::from_str(&refno)
+                .or_else(|_| RefnoEnum::from_str(&refno.replace('_', "/")))
+                .ok()
+        })
+        .collect();
     Ok(refnos)
 }
 
@@ -1447,10 +1464,13 @@ pub async fn update_scene_node_aabbs_by_refnos(
         let result = query_aabb_params(&inst_keys, true).await?;
 
         for r in result {
+            // 过滤 world_trans 为 None 的记录
+            let Some(world_trans) = r.world_trans else { continue };
+            
             // 计算合并后的 AABB
             let mut aabb = Aabb::new_invalid();
             for g in &r.geo_aabbs {
-                let t = r.world_trans * &g.trans;
+                let t = world_trans * &g.trans;
                 let tmp_aabb = g.aabb.scaled(&t.scale.into());
                 let tmp_aabb = tmp_aabb.transform_by(&Isometry {
                     rotation: t.rotation.into(),

@@ -138,10 +138,10 @@ mod tests {
         }
     }
 
-    /// 测试按 dbno 初始化 Scene Tree (dbno=1112)
+    /// 测试按 dbnum 初始化 Scene Tree (dbnum=1112)
     #[tokio::test]
     async fn test_init_scene_tree_by_dbno_1112() {
-        println!("=== 测试按 dbno 初始化 Scene Tree (dbno=1112) ===");
+        println!("=== 测试按 dbnum 初始化 Scene Tree (dbnum=1112) ===");
 
         // 先初始化数据库连接
         if let Err(e) = aios_core::init_surreal().await {
@@ -152,7 +152,7 @@ mod tests {
             }
         }
 
-        // 按 dbno 初始化（force_rebuild=true 强制重建）
+        // 按 dbnum 初始化（force_rebuild=true 强制重建）
         match scene_tree::init_scene_tree_by_dbno(TEST_DBNO as u32, true).await {
             Ok(result) => {
                 println!("✓ 初始化成功:");
@@ -166,10 +166,10 @@ mod tests {
         }
     }
 
-    /// 测试查询 geo_type 分布 (dbno=1112)
+    /// 测试查询 geo_type 分布 (dbnum=1112)
     #[tokio::test]
     async fn test_query_geo_type_distribution() {
-        println!("=== 测试查询 geo_type 分布 (dbno=1112) ===");
+        println!("=== 测试查询 geo_type 分布 (dbnum=1112) ===");
 
         // 先初始化数据库连接
         if let Err(e) = aios_core::init_surreal().await {
@@ -182,7 +182,7 @@ mod tests {
 
         // 查询 geo_type 分布
         let sql = format!(
-            "SELECT geo_type, count() as cnt FROM scene_node WHERE dbno = {} AND has_geo = true GROUP BY geo_type",
+            "SELECT geo_type, count() as cnt FROM scene_node WHERE dbnum = {} AND has_geo = true GROUP BY geo_type",
             TEST_DBNO
         );
 
@@ -206,10 +206,10 @@ mod tests {
         }
     }
 
-    /// 测试查询正负实体节点数量 (dbno=1112)
+    /// 测试查询正负实体节点数量 (dbnum=1112)
     #[tokio::test]
     async fn test_query_pos_neg_count() {
-        println!("=== 测试查询正负实体节点数量 (dbno=1112) ===");
+        println!("=== 测试查询正负实体节点数量 (dbnum=1112) ===");
 
         // 先初始化数据库连接
         if let Err(e) = aios_core::init_surreal().await {
@@ -222,12 +222,12 @@ mod tests {
 
         // 查询正实体数量
         let sql_pos = format!(
-            "SELECT count() FROM scene_node WHERE dbno = {} AND geo_type = 'Pos' GROUP ALL",
+            "SELECT count() FROM scene_node WHERE dbnum = {} AND geo_type = 'Pos' GROUP ALL",
             TEST_DBNO
         );
         // 查询负实体数量
         let sql_neg = format!(
-            "SELECT count() FROM scene_node WHERE dbno = {} AND geo_type IN ['Neg', 'CataNeg', 'CataCrossNeg'] GROUP ALL",
+            "SELECT count() FROM scene_node WHERE dbnum = {} AND geo_type IN ['Neg', 'CataNeg', 'CataCrossNeg'] GROUP ALL",
             TEST_DBNO
         );
 
@@ -239,7 +239,7 @@ mod tests {
             .map(|v: Vec<i64>| v.first().copied().unwrap_or(0))
             .unwrap_or(0);
 
-        println!("✓ 查询结果 (dbno={}):", TEST_DBNO);
+        println!("✓ 查询结果 (dbnum={}):", TEST_DBNO);
         println!("  - 正实体 (Pos): {}", pos_count);
         println!("  - 负实体 (Neg/CataNeg/CataCrossNeg): {}", neg_count);
     }

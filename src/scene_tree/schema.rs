@@ -27,7 +27,7 @@ DEFINE FIELD IF NOT EXISTS is_leaf ON TABLE scene_node TYPE bool DEFAULT false;
 DEFINE FIELD IF NOT EXISTS generated ON TABLE scene_node TYPE bool DEFAULT false;
 
 -- 数据库编号
-DEFINE FIELD IF NOT EXISTS dbno ON TABLE scene_node TYPE int;
+DEFINE FIELD IF NOT EXISTS dbnum ON TABLE scene_node TYPE int;
 
 -- 几何类型（用于区分正负实体）
 -- 可选值: Pos, Neg, CataNeg, CataCrossNeg, Compound, CatePos, DesiPos
@@ -37,7 +37,7 @@ DEFINE FIELD IF NOT EXISTS geo_type ON TABLE scene_node TYPE option<string>;
 DEFINE INDEX IF NOT EXISTS idx_parent ON TABLE scene_node COLUMNS parent;
 DEFINE INDEX IF NOT EXISTS idx_has_geo ON TABLE scene_node COLUMNS has_geo;
 DEFINE INDEX IF NOT EXISTS idx_is_leaf ON TABLE scene_node COLUMNS is_leaf;
-DEFINE INDEX IF NOT EXISTS idx_dbno ON TABLE scene_node COLUMNS dbno;
+DEFINE INDEX IF NOT EXISTS idx_dbno ON TABLE scene_node COLUMNS dbnum;
 DEFINE INDEX IF NOT EXISTS idx_generated ON TABLE scene_node COLUMNS generated;
 DEFINE INDEX IF NOT EXISTS idx_has_geo_generated ON TABLE scene_node COLUMNS has_geo, generated;
 DEFINE INDEX IF NOT EXISTS idx_geo_type ON TABLE scene_node COLUMNS geo_type;

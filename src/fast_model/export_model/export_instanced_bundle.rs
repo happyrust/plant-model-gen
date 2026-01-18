@@ -433,7 +433,11 @@ pub async fn export_instanced_bundle_for_refnos(
             let filter_sql = format!(
                 r#"SELECT count() AS cnt FROM inst_relate 
                    WHERE in IN [{}] 
-                     AND world_trans.d != NONE 
+                     AND (SELECT VALUE world_trans 
+                          FROM pe_transform 
+                          WHERE id = type::record('pe_transform', record::id(in)) 
+                          LIMIT 1
+                         )[0] != NONE 
                      AND record::exists(type::record('inst_relate_aabb', record::id(in)));"#, 
                 pe_list
             );
@@ -448,7 +452,22 @@ pub async fn export_instanced_bundle_for_refnos(
             
             // 3. 检查记录的详细状态
             let detail_sql = format!(
-                "SELECT in, aabb, world_trans FROM inst_relate WHERE in IN [{}] LIMIT 5;", 
+                r#"SELECT 
+                       in,
+                       (SELECT VALUE world_trans 
+                        FROM pe_transform 
+                        WHERE id = type::record('pe_transform', record::id(in)) 
+                        LIMIT 1
+                       )[0] as pe_transform_world_trans_id,
+                       (SELECT VALUE world_trans.d 
+                        FROM pe_transform 
+                        WHERE id = type::record('pe_transform', record::id(in)) 
+                        LIMIT 1
+                       )[0] as world_trans,
+                       record::exists(type::record('inst_relate_aabb', record::id(in))) as has_aabb
+                   FROM inst_relate 
+                   WHERE in IN [{}] 
+                   LIMIT 5;"#, 
                 pe_list
             );
             match aios_core::SUL_DB.query_response(&detail_sql).await {
@@ -456,13 +475,14 @@ pub async fn export_instanced_bundle_for_refnos(
                     if let Ok(records) = resp.take::<Vec<serde_json::Value>>(0) {
                         println!("   - 详细记录（前5条）:");
                         for (i, rec) in records.iter().enumerate() {
-                            let has_aabb = rec.get("aabb").is_some() && rec.get("aabb") != Some(&serde_json::json!(null));
-                            let has_trans = rec.get("world_trans").is_some() && rec.get("world_trans") != Some(&serde_json::json!(null));
+                            let has_aabb = rec.get("has_aabb").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let has_trans = rec.get("world_trans").is_some()
+                                && rec.get("world_trans") != Some(&serde_json::json!(null));
                             println!(
                                 "     [{}] in={}, aabb={}, trans={}", 
                                 i,
                                 rec.get("in").unwrap_or(&serde_json::json!("?")),
-                                if has_aabb { format!("{:?}", rec.get("aabb")) } else { "NONE".to_string() },
+                                if has_aabb { "有值".to_string() } else { "NONE".to_string() },
                                 if has_trans { "有值" } else { "NONE" }
                             );
                         }

@@ -1,5 +1,5 @@
-total_sync = true
-replace_dbs = true
+total_sync = false
+replace_dbs = false
 incr_sync = false
 sync_history = false
 enable_log = true
@@ -13,7 +13,7 @@ sync_chunk_size = 10_0000
 #项目设置
 project_path = "D:/AVEVA/Projects/E3D2.1"
 # project_path = "/Volumes/DPC/work/e3d_models"
-included_projects = ["AvevaMarineSample", "AvevaCatalogue", "SCB", "ZDJ"]
+included_projects = ["AvevaMarineSample"]
 # included_projects = ["AvevaMarineSample"]
 #project_dirs = ["AvevaMarineSample"]
 
@@ -26,7 +26,9 @@ module = "DESI"
 gen_model = true
 gen_mesh = true
 replace_mesh = true
-save_db = true
+save_db = false
+# 解析期只生成 scene tree 文件，跳过 PE/属性数据保存
+gen_tree_only = true
 apply_boolean_operation = false
 mesh_tol_ratio = 3.0
 #是否启用房间计算
@@ -65,7 +67,7 @@ gen_noun_graph = false
 #arangodb 配置
 arangodb_database = "ams"
 multi_threads = false
-only_sync_sys = true
+only_sync_sys = false
 arangodb_url = "http://127.0.0.1:8529"
 rebuild_ssc_tree = false
 arangodb_user = "root"
@@ -125,8 +127,8 @@ debug_print_world_transform = false
 only_rebuild_pdms_element = false
 
 debug_refno_types = ["CATA", "LOOP", "PRIM"]
-# included_db_files = ["ams1112_0001"]
-# manual_db_nums = [1112]
+included_db_files = ["ams1112_0001"]
+manual_db_nums = [1112]
 # manual_db_nums = [1112, 25688, 7999, 8000, 7997]  # Full Noun 模式下此配置会被忽略
 # exclude_db_nums = [] #不参与生成模型的数据库编号
 plat_url = ""

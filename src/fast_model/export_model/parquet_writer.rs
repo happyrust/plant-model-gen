@@ -59,29 +59,29 @@ impl ParquetManager {
         self.base_dir.join("database_models")
     }
 
-    /// 获取 dbno 目录路径
-    fn get_dbno_dir(&self, dbno: u32) -> PathBuf {
-        self.get_base_dir().join(dbno.to_string())
+    /// 获取 dbnum 目录路径
+    fn get_dbno_dir(&self, dbnum: u32) -> PathBuf {
+        self.get_base_dir().join(dbnum.to_string())
     }
 
     /// 获取 Instances 主文件路径
-    fn get_instances_main_path(&self, dbno: u32) -> PathBuf {
-        self.get_dbno_dir(dbno).join("instances.parquet")
+    fn get_instances_main_path(&self, dbnum: u32) -> PathBuf {
+        self.get_dbno_dir(dbnum).join("instances.parquet")
     }
 
     /// 获取 Transforms 主文件路径
-    fn get_transforms_main_path(&self, dbno: u32) -> PathBuf {
-        self.get_dbno_dir(dbno).join("transforms.parquet")
+    fn get_transforms_main_path(&self, dbnum: u32) -> PathBuf {
+        self.get_dbno_dir(dbnum).join("transforms.parquet")
     }
 
     /// 获取 Instances 增量文件路径
-    fn get_instances_incremental_path(&self, dbno: u32, timestamp: &str) -> PathBuf {
-        self.get_dbno_dir(dbno).join(format!("instances_{}.parquet", timestamp))
+    fn get_instances_incremental_path(&self, dbnum: u32, timestamp: &str) -> PathBuf {
+        self.get_dbno_dir(dbnum).join(format!("instances_{}.parquet", timestamp))
     }
 
     /// 获取 Transforms 增量文件路径
-    fn get_transforms_incremental_path(&self, dbno: u32, timestamp: &str) -> PathBuf {
-        self.get_dbno_dir(dbno).join(format!("transforms_{}.parquet", timestamp))
+    fn get_transforms_incremental_path(&self, dbnum: u32, timestamp: &str) -> PathBuf {
+        self.get_dbno_dir(dbnum).join(format!("transforms_{}.parquet", timestamp))
     }
 
     /// 生成当前时间戳
@@ -91,8 +91,8 @@ impl ParquetManager {
 
     /// 列出所有指定类型的文件（Instances 或 Transforms）
     /// prefix_type: "instances" 或 "transforms"
-    pub fn list_files(&self, dbno: u32, prefix_type: &str) -> Result<Vec<PathBuf>> {
-        let dbno_dir = self.get_dbno_dir(dbno);
+    pub fn list_files(&self, dbnum: u32, prefix_type: &str) -> Result<Vec<PathBuf>> {
+        let dbno_dir = self.get_dbno_dir(dbnum);
         if !dbno_dir.exists() {
             return Ok(Vec::new());
         }
@@ -128,9 +128,9 @@ impl ParquetManager {
     }
 
     /// 检查指定的 refnos 是否存在
-    pub fn check_existence(&self, dbno: u32, refnos: &[String]) -> Result<Vec<String>> {
+    pub fn check_existence(&self, dbnum: u32, refnos: &[String]) -> Result<Vec<String>> {
         // 只需检查 instances 表
-        let files = self.list_files(dbno, "instances")?;
+        let files = self.list_files(dbnum, "instances")?;
         if files.is_empty() {
             return Ok(Vec::new());
         }
@@ -160,7 +160,7 @@ impl ParquetManager {
     }
 
     /// 增量写入：同时生成 instances 和 transforms 文件
-    pub fn write_incremental(&self, data: &ExportData, dbno: u32) -> Result<(PathBuf, PathBuf)> {
+    pub fn write_incremental(&self, data: &ExportData, dbnum: u32) -> Result<(PathBuf, PathBuf)> {
         let (flat_rows, transform_rows) = self.export_to_rows(data);
         
         if flat_rows.is_empty() {
@@ -175,8 +175,8 @@ impl ParquetManager {
 
         // 3. 写入文件
         let timestamp = self.get_timestamp();
-        let inst_path = self.get_instances_incremental_path(dbno, &timestamp);
-        let trans_path = self.get_transforms_incremental_path(dbno, &timestamp);
+        let inst_path = self.get_instances_incremental_path(dbnum, &timestamp);
+        let trans_path = self.get_transforms_incremental_path(dbnum, &timestamp);
 
         // 确保目录存在
         if let Some(parent) = inst_path.parent() {
@@ -389,15 +389,15 @@ impl ParquetManager {
     }
 
     /// 双路合并
-    pub fn compact(&self, dbno: u32) -> Result<Option<(PathBuf, PathBuf)>> {
-        let res_instances = self.compact_table(dbno, "instances", "refno")?;
-        let res_transforms = self.compact_table(dbno, "transforms", "trans_id")?;
+    pub fn compact(&self, dbnum: u32) -> Result<Option<(PathBuf, PathBuf)>> {
+        let res_instances = self.compact_table(dbnum, "instances", "refno")?;
+        let res_transforms = self.compact_table(dbnum, "transforms", "trans_id")?;
         
         if res_instances.is_some() || res_transforms.is_some() {
              // 简单返回主文件路径，即使其中一个可能没变
              Ok(Some((
-                 self.get_instances_main_path(dbno),
-                 self.get_transforms_main_path(dbno)
+                 self.get_instances_main_path(dbnum),
+                 self.get_transforms_main_path(dbnum)
              )))
         } else {
             Ok(None)
@@ -405,8 +405,8 @@ impl ParquetManager {
     }
 
     /// 通用单表合并逻辑
-    fn compact_table(&self, dbno: u32, prefix: &str, key_col: &str) -> Result<Option<PathBuf>> {
-        let incremental_files = self.get_incremental_files_only(dbno, prefix)?;
+    fn compact_table(&self, dbnum: u32, prefix: &str, key_col: &str) -> Result<Option<PathBuf>> {
+        let incremental_files = self.get_incremental_files_only(dbnum, prefix)?;
         if incremental_files.is_empty() {
             return Ok(None);
         }
@@ -414,8 +414,8 @@ impl ParquetManager {
         println!("🔄 [{}] 开始合并 {} 个增量文件...", prefix, incremental_files.len());
 
         // 读取主文件
-        // 修改为: output/database_models/{dbno}/{prefix}.parquet
-        let main_file = self.get_dbno_dir(dbno).join(format!("{}.parquet", prefix));
+        // 修改为: output/database_models/{dbnum}/{prefix}.parquet
+        let main_file = self.get_dbno_dir(dbnum).join(format!("{}.parquet", prefix));
         let mut frames = Vec::new();
         
         if main_file.exists() {
@@ -450,7 +450,7 @@ impl ParquetManager {
 
         // 写入临时文件
         // 临时文件也放在同一目录下，避免跨设备移动
-        let temp_file = self.get_dbno_dir(dbno).join(format!("{}.parquet.tmp", prefix));
+        let temp_file = self.get_dbno_dir(dbnum).join(format!("{}.parquet.tmp", prefix));
         {
             let file = std::fs::File::create(&temp_file)?;
             ParquetWriter::new(file).finish(&mut unique_df.clone())?;
@@ -606,15 +606,15 @@ impl ParquetManager {
         Ok(Series::new("geo_items".into(), lists))
     }
 
-    fn get_incremental_files_only(&self, dbno: u32, prefix_type: &str) -> Result<Vec<PathBuf>> {
-        let files = self.list_files(dbno, prefix_type)?;
-        let main_file = self.get_dbno_dir(dbno).join(format!("{}.parquet", prefix_type));
+    fn get_incremental_files_only(&self, dbnum: u32, prefix_type: &str) -> Result<Vec<PathBuf>> {
+        let files = self.list_files(dbnum, prefix_type)?;
+        let main_file = self.get_dbno_dir(dbnum).join(format!("{}.parquet", prefix_type));
         
         Ok(files.into_iter().filter(|p| *p != main_file).collect())
     }
 
     pub fn scan_dbnos_with_incremental(&self) -> Result<Vec<u32>> {
-        // 扫描所有 dbno 子目录，检查是否有增量文件
+        // 扫描所有 dbnum 子目录，检查是否有增量文件
         let base_dir = self.get_base_dir();
         if !base_dir.exists() { return Ok(Vec::new()); }
         
@@ -623,10 +623,10 @@ impl ParquetManager {
             let entry = entry?;
             let path = entry.path();
             
-            // 检查是否是目录且可解析为 dbno
+            // 检查是否是目录且可解析为 dbnum
             if path.is_dir() {
                 if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                    if let Ok(dbno) = dir_name.parse::<u32>() {
+                    if let Ok(dbnum) = dir_name.parse::<u32>() {
                         // 检查是否有增量文件
                         let has_incremental = std::fs::read_dir(&path)?
                             .filter_map(|e| e.ok())
@@ -637,7 +637,7 @@ impl ParquetManager {
                             });
                         
                         if has_incremental {
-                            dbnos.insert(dbno);
+                            dbnos.insert(dbnum);
                         }
                     }
                 }
@@ -647,9 +647,9 @@ impl ParquetManager {
     }
     
     // 兼容接口：根据类型返回文件名列表
-    pub fn list_parquet_files(&self, dbno: u32, prefix_type: Option<&str>) -> Result<Vec<String>> {
+    pub fn list_parquet_files(&self, dbnum: u32, prefix_type: Option<&str>) -> Result<Vec<String>> {
         let type_key = prefix_type.unwrap_or("instances");
-        let files = self.list_files(dbno, type_key)?;
+        let files = self.list_files(dbnum, type_key)?;
         Ok(files.iter().filter_map(|p| p.file_name().map(|s| s.to_string_lossy().to_string())).collect())
     }
 }

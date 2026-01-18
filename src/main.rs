@@ -39,12 +39,12 @@ fn build_export_config(
     target_unit: &str,
     verbose: bool,
     regenerate_plant_mesh: bool,
-    dbno: Option<u32>,
+    dbnum: Option<u32>,
     split_by_site: bool,
     include_negative: bool,
     export_svg: bool,
 ) -> ExportConfig {
-    let run_all_dbnos = refnos_vec.is_empty() && dbno.is_none();
+    let run_all_dbnos = refnos_vec.is_empty() && dbnum.is_none();
     ExportConfig {
         refnos_str: refnos_vec,
         output_path,
@@ -54,7 +54,7 @@ fn build_export_config(
         target_unit: target_unit.to_string(),
         verbose,
         regenerate_plant_mesh,
-        dbno,
+        dbnum,
         use_basic_materials: false,
         run_all_dbnos,
         split_by_site,
@@ -266,8 +266,8 @@ async fn main() -> anyhow::Result<()> {
                 .default_value("obj"),
         )
         .arg(
-            Arg::new("dbno")
-                .long("dbno")
+            Arg::new("dbnum")
+                .long("dbnum")
                 .help("Database number for exporting all SITE models")
                 .value_name("DBNO")
                 .value_parser(clap::value_parser!(u32)),
@@ -302,7 +302,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("split-site")
                 .long("split-site")
-                .help("Split each SITE into separate files (default: merge all SITEs in the same dbno)")
+                .help("Split each SITE into separate files (default: merge all SITEs in the same dbnum)")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -405,6 +405,15 @@ async fn main() -> anyhow::Result<()> {
             Arg::new("room-db-nums")
                 .long("room-db-nums")
                 .help("Database numbers to process (comma-separated, e.g., '1112,1113')")
+                .value_name("DB_NUMS")
+                .value_delimiter(',')
+                .num_args(1..),
+        )
+        // ========== pe_transform 刷新命令 ==========
+        .arg(
+            Arg::new("refresh-transform")
+                .long("refresh-transform")
+                .help("Refresh pe_transform cache for specified dbnums (comma-separated, e.g., '1112,1113')")
                 .value_name("DB_NUMS")
                 .value_delimiter(',')
                 .num_args(1..),
@@ -534,8 +543,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap()
         .as_str();
 
-    // 获取 dbno 参数（用于按 SITE 导出）
-    let dbno = matches.get_one::<u32>("dbno").copied();
+    // 获取 dbnum 参数（用于按 SITE 导出）
+    let dbnum = matches.get_one::<u32>("dbnum").copied();
 
     // 获取 split-site 参数（默认合并，有此参数才拆分）
     let split_by_site = matches.get_flag("split-site");
@@ -632,6 +641,38 @@ async fn main() -> anyhow::Result<()> {
 
     // ========== 处理 --debug-model 与导出标志的组合 ==========
     if let Some(refnos_vec) = &debug_model_refnos {
+        // 如果用户开启了 --capture 但没有指定任何导出标志，则默认走 OBJ 导出流程：
+        // - export_obj_mode 内部会在需要时触发模型生成（配合 --regen-model 可强制重建）
+        // - gen_all_geos_data 末尾会调用 capture_refnos_if_enabled 生成截图
+        //
+        // 这样可以保证 `--debug-model ... --capture ...` 的行为稳定且符合“生成模型并截图”的预期。
+        if capture_dir.is_some()
+            && !matches.get_flag("export-obj")
+            && !matches.get_flag("export-svg")
+            && !matches.get_flag("export-glb")
+            && !matches.get_flag("export-gltf")
+        {
+            println!(
+                "📸 调试模式 + 截图模式：生成模型并截图（默认走 OBJ 导出流程）: {:?}",
+                refnos_vec
+            );
+            let config = build_export_config(
+                refnos_vec.clone(),
+                output_path,
+                filter_nouns,
+                capture_include_descendants,
+                source_unit,
+                target_unit,
+                verbose,
+                matches.get_flag("regen-model"),
+                None,
+                split_by_site,
+                include_negative,
+                matches.get_flag("export-svg"),
+            );
+            return export_obj_mode(config, &db_option_ext).await;
+        }
+
         // 检查是否有导出标志
         if matches.get_flag("export-obj") {
             println!("🎯 导出 OBJ 模型 (调试模式): {:?}", refnos_vec);
@@ -713,12 +754,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ========== 然后处理导出命令 ==========
-    // 首先处理带 dbno 的导出命令（查询所有 SITE 并分别导出）
-    if let Some(dbno) = dbno {
+    // 首先处理带 dbnum 的导出命令（查询所有 SITE 并分别导出）
+    if let Some(dbnum) = dbnum {
         if matches.get_flag("export-obj") {
-            println!("🎯 导出 OBJ 模型 (按 dbno={} 的所有 SITE):", dbno);
+            println!("🎯 导出 OBJ 模型 (按 dbnum={} 的所有 SITE):", dbnum);
             let config = build_export_config(
-                vec![], // 不传 refnos，由 dbno 自动查询 SITE
+                vec![], // 不传 refnos，由 dbnum 自动查询 SITE
                 output_path,
                 filter_nouns,
                 include_descendants,
@@ -726,7 +767,7 @@ async fn main() -> anyhow::Result<()> {
                 target_unit,
                 verbose,
                 matches.get_flag("regen-model"),
-                Some(dbno),
+                Some(dbnum),
                 split_by_site,
                 include_negative,
                 matches.get_flag("export-svg"),
@@ -735,7 +776,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if matches.get_flag("export-glb") {
-            println!("🎯 导出 GLB 模型 (按 dbno={} 的所有 SITE):", dbno);
+            println!("🎯 导出 GLB 模型 (按 dbnum={} 的所有 SITE):", dbnum);
             let mut config = build_export_config(
                 vec![],
                 output_path,
@@ -745,7 +786,7 @@ async fn main() -> anyhow::Result<()> {
                 target_unit,
                 verbose,
                 matches.get_flag("regen-model"),
-                Some(dbno),
+                Some(dbnum),
                 split_by_site,
                 include_negative,
                 matches.get_flag("export-svg"),
@@ -755,7 +796,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if matches.get_flag("export-gltf") {
-            println!("🎯 导出 glTF 模型 (按 dbno={} 的所有 SITE):", dbno);
+            println!("🎯 导出 glTF 模型 (按 dbnum={} 的所有 SITE):", dbnum);
             let mut config = build_export_config(
                 vec![],
                 output_path,
@@ -765,7 +806,7 @@ async fn main() -> anyhow::Result<()> {
                 target_unit,
                 verbose,
                 matches.get_flag("regen-model"),
-                Some(dbno),
+                Some(dbnum),
                 split_by_site,
                 include_negative,
                 matches.get_flag("export-svg"),
@@ -775,7 +816,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // no-dbno 情况的默认“全库导出”由各导出模式内部处理（config.run_all_dbnos）
+    // no-dbnum 情况的默认“全库导出”由各导出模式内部处理（config.run_all_dbnos）
 
     // 然后处理独立的导出命令（不启用调试模式）
     if let Some(refnos) = matches.get_many::<String>("export-obj-refnos") {
@@ -846,11 +887,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ========== 处理单独的导出标志（无 dbno、无 refnos 时默认全库导出） ==========
+    // ========== 处理单独的导出标志（无 dbnum、无 refnos 时默认全库导出） ==========
     // 这是兜底逻辑：如果前面的条件都没匹配，说明用户只设置了导出标志
 
     if matches.get_flag("export-gltf") {
-        println!("🎯 导出 glTF 模型 (全库模式 - MDB 所有 dbno)");
+        println!("🎯 导出 glTF 模型 (全库模式 - MDB 所有 dbnum)");
         let config = ExportConfig::build_for_all_dbnos(
             output_path,
             filter_nouns,
@@ -868,7 +909,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if matches.get_flag("export-glb") {
-        println!("🎯 导出 GLB 模型 (全库模式 - MDB 所有 dbno)");
+        println!("🎯 导出 GLB 模型 (全库模式 - MDB 所有 dbnum)");
         let config = ExportConfig::build_for_all_dbnos(
             output_path,
             filter_nouns,
@@ -886,7 +927,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if matches.get_flag("export-obj") {
-        println!("🎯 导出 OBJ 模型 (全库模式 - MDB 所有 dbno)");
+        println!("🎯 导出 OBJ 模型 (全库模式 - MDB 所有 dbnum)");
         let config = ExportConfig::build_for_all_dbnos(
             output_path,
             filter_nouns,
@@ -906,7 +947,7 @@ async fn main() -> anyhow::Result<()> {
     if matches.get_flag("export-all-parquet") {
         use crate::cli_modes::export_all_parquet_mode;
 
-        let dbno = matches.get_one::<u32>("dbno").copied();
+        let dbnum = matches.get_one::<u32>("dbnum").copied();
         let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
         let export_all_lods = matches.get_flag("export-all-lods");
         let export_refnos = matches.get_one::<String>("export-refnos").cloned();
@@ -918,10 +959,10 @@ async fn main() -> anyhow::Result<()> {
         println!("🎯 导出 inst_relate 实体 (Prepack LOD + Parquet)");
         if let Some(ref refnos) = export_refnos {
             println!("   - 🎯 仅导出指定 refnos={}", refnos);
-        } else if let Some(dbno) = dbno {
-            println!("   - 按 dbno={} 过滤", dbno);
+        } else if let Some(dbnum) = dbnum {
+            println!("   - 按 dbnum={} 过滤", dbnum);
         } else {
-            println!("   - 全表扫描（所有 dbno）");
+            println!("   - 全表扫描（所有 dbnum）");
         }
         if let Some(ref types) = owner_types {
             println!("   - 按 owner_type 过滤: {:?}", types);
@@ -931,7 +972,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         return export_all_parquet_mode(
-            dbno,
+            dbnum,
             verbose,
             export_bundle_dir,
             owner_types,
@@ -948,32 +989,27 @@ async fn main() -> anyhow::Result<()> {
     if matches.get_flag("export-dbnum-instances-json") {
         use crate::cli_modes::export_dbnum_instances_json_mode;
 
-        let dbno = matches.get_one::<u32>("dbno").copied();
+        let dbnum = matches.get_one::<u32>("dbnum").copied();
         let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
 
-        // 必须提供 dbno 参数
-        let dbno = match dbno {
+        // 必须提供 dbnum 参数
+        let dbnum = match dbnum {
             Some(n) => n,
             None => {
-                eprintln!("❌ 错误: --export-dbnum-instances-json 需要提供 --dbno 参数");
-                eprintln!("   例如: cargo run -- --export-dbnum-instances-json --dbno 1112");
+                eprintln!("❌ 错误: --export-dbnum-instances-json 需要提供 --dbnum 参数");
+                eprintln!("   例如: cargo run -- --export-dbnum-instances-json --dbnum 1112");
                 std::process::exit(1);
             }
         };
 
         println!("🎯 导出 dbnum 实例数据为 JSON（含 AABB）");
-        println!("   - 按 dbno={} 过滤", dbno);
+        println!("   - 按 dbnum={} 过滤", dbnum);
         if let Some(ref dir) = export_bundle_dir {
             println!("   - 输出目录: {}", dir.display());
         }
 
-        return export_dbnum_instances_json_mode(
-            dbno,
-            verbose,
-            export_bundle_dir,
-            &db_option_ext,
-        )
-        .await;
+        return export_dbnum_instances_json_mode(dbnum, verbose, export_bundle_dir, &db_option_ext)
+            .await;
     }
 
     // 导出房间实例数据
@@ -994,17 +1030,13 @@ async fn main() -> anyhow::Result<()> {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("output/spatial_index.sqlite"));
 
-        return import_spatial_index_mode(
-            Path::new(json_path),
-            &sqlite_path,
-            verbose,
-        );
+        return import_spatial_index_mode(Path::new(json_path), &sqlite_path, verbose);
     }
 
     if matches.get_flag("export-all-relates") {
         use crate::cli_modes::export_all_relates_mode;
 
-        let dbno = matches.get_one::<u32>("dbno").copied();
+        let dbnum = matches.get_one::<u32>("dbnum").copied();
         let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
         let export_all_lods = matches.get_flag("export-all-lods");
         let export_refnos = matches.get_one::<String>("export-refnos").cloned();
@@ -1020,10 +1052,10 @@ async fn main() -> anyhow::Result<()> {
         println!("🎯 导出 inst_relate 实体 (Prepack LOD 格式)");
         if let Some(ref refnos) = export_refnos {
             println!("   - 🎯 仅导出指定 refnos={}", refnos);
-        } else if let Some(dbno) = dbno {
-            println!("   - 按 dbno={} 过滤", dbno);
+        } else if let Some(dbnum) = dbnum {
+            println!("   - 按 dbnum={} 过滤", dbnum);
         } else {
-            println!("   - 全表扫描（所有 dbno）");
+            println!("   - 全表扫描（所有 dbnum）");
         }
         if let Some(ref types) = owner_types {
             println!("   - 按 owner_type 过滤: {:?}", types);
@@ -1033,7 +1065,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         return export_all_relates_mode(
-            dbno,
+            dbnum,
             verbose,
             export_bundle_dir,
             owner_types,
@@ -1059,9 +1091,7 @@ async fn main() -> anyhow::Result<()> {
 
         let db_nums: Option<Vec<u32>> = matches
             .get_many::<String>("room-db-nums")
-            .map(|nums| {
-                nums.filter_map(|s| s.parse::<u32>().ok()).collect()
-            });
+            .map(|nums| nums.filter_map(|s| s.parse::<u32>().ok()).collect());
 
         println!("🏠 启动房间计算模式");
         if let Some(ref kws) = room_keywords {
@@ -1080,6 +1110,18 @@ async fn main() -> anyhow::Result<()> {
             &db_option_ext,
         )
         .await;
+    }
+
+    // ========== 处理 --refresh-transform pe_transform 刷新命令 ==========
+    if let Some(db_nums) = matches.get_many::<String>("refresh-transform") {
+        let dbnums: Vec<u32> = db_nums.filter_map(|s| s.parse::<u32>().ok()).collect();
+        if !dbnums.is_empty() {
+            println!("🔄 刷新 pe_transform 缓存: dbnums={:?}", dbnums);
+            init_surreal().await?;
+            let count = aios_core::transform::refresh_pe_transform_for_dbnums(&dbnums).await?;
+            println!("✅ pe_transform 刷新完成，共处理 {} 个节点", count);
+            return Ok(());
+        }
     }
 
     // ========== 处理 --debug-model + --capture 但无导出标志的情况 ==========

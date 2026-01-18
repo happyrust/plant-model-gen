@@ -39,8 +39,8 @@ pub async fn save_instance_data_optimize(
     // 单条 INSERT 里拼接的记录数，过大容易触发 SurrealDB 事务取消/超时；取小一点更稳。
     const CHUNK_SIZE: usize = 100;
     // SurrealDB 在高并发/大事务时容易出现 session 丢失、匿名访问等错误；这里优先保证稳定性。
-    const MAX_TX_STATEMENTS: usize = 1;
-    const MAX_CONCURRENT_TX: usize = 1;
+    const MAX_TX_STATEMENTS: usize = 5;
+    const MAX_CONCURRENT_TX: usize = 5;
 
     // 统一迁移/修复 inst_relate_aabb 的历史 schema（refno/aabb -> in/out），避免写入时触发类型强制失败
     utils::ensure_inst_relate_aabb_relation_schema().await;
@@ -375,12 +375,12 @@ pub async fn save_instance_data_optimize(
                 entry.insert(serde_json::to_string(&info.aabb)?);
             }
 
+            // inst_relate 不再保存 world_trans；世界变换统一从 pe_transform 获取。
             let relate_sql = format!(
-                "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, world_trans: trans:⟨{3}⟩, generic: '{4}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {5}, solid: {6}, owner_refno: {7}, owner_type: '{8}'}}",
+                "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, generic: '{3}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {4}, solid: {5}, owner_refno: {6}, owner_type: '{7}'}}",
                 key.to_inst_relate_key(),
                 key.to_pe_key(),
                 info.id_str(),
-                transform_hash,
                 info.generic_type.to_string(),
                 info.has_cata_neg,
                 info.is_solid,
@@ -461,12 +461,12 @@ pub async fn save_instance_data_optimize(
             }
 
             // 为 Tubing 创建 inst_relate 记录（删除 aabb 字段）
+            // inst_relate 不再保存 world_trans；世界变换统一从 pe_transform 获取。
             let relate_sql = format!(
-                "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, world_trans: trans:⟨{3}⟩, generic: '{4}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {5}, solid: {6}, owner_refno: {7}, owner_type: '{8}'}}",
+                "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, generic: '{3}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {4}, solid: {5}, owner_refno: {6}, owner_type: '{7}'}}",
                 key.to_inst_relate_key(),
                 key.to_pe_key(),
                 info.id_str(),
-                transform_hash,
                 info.generic_type.to_string(),
                 info.has_cata_neg,
                 info.is_solid,
@@ -953,7 +953,7 @@ async fn query_existing_tubi_info_ids(ids: &[String]) -> anyhow::Result<HashSet<
             .join(",");
         
         let sql = format!(
-            "SELECT VALUE meta::id(id) FROM tubi_info WHERE id IN [{}];",
+            "SELECT VALUE record::id(id) FROM tubi_info WHERE id IN [{}];",
             id_list
         );
         

@@ -25,20 +25,28 @@ pub async fn export_db_models_parquet(
 
     // SQL 逻辑：
     // 1. 从 inst_relate 获取实例
-    // 2. 联合 trans 获取世界变换矩阵 (16位)
+    // 2. 通过 pe_transform 获取世界变换矩阵 (16位)
     // 3. 联合 geo_relate -> inst_geo 获取几何体哈希
     // 我们需要一个扁平化的结构，如果一个实例有多个几何体，会产生多行（前端 loader 已支持这种格式）
     let sql = format!(r#"
 SELECT
     <string>in as refno,
-    in.dbnum as dbno,
+    in.dbnum as dbnum,
     in.noun as noun,
-    world_trans.d.matrix as matrix,
+    (
+        SELECT VALUE world_trans.d.matrix
+        FROM pe_transform
+        WHERE id = type::record('pe_transform', record::id(in))
+        LIMIT 1
+    )[0] as matrix,
     out.out.id as geo_id,
     out.out.id as geo_hash,
     out.trans.d.matrix as geo_matrix
 FROM inst_relate
-WHERE world_trans != none 
+WHERE (SELECT VALUE world_trans FROM pe_transform
+       WHERE id = type::record('pe_transform', record::id(in))
+       LIMIT 1
+      )[0] != NONE
   AND in.dbnum != none
   {db_filter}
 "#);
@@ -61,12 +69,12 @@ WHERE world_trans != none
     // 按 dbnum 分组
     let mut db_groups: std::collections::HashMap<i64, Vec<ModelDataRow>> = std::collections::HashMap::new();
     for row in rows {
-        db_groups.entry(row.dbno).or_default().push(row);
+        db_groups.entry(row.dbnum).or_default().push(row);
     }
 
     fs::create_dir_all(target_path)?;
 
-    for (dbno, group) in db_groups {
+    for (dbnum, group) in db_groups {
         let mut refnos = Vec::with_capacity(group.len());
         let mut nouns = Vec::with_capacity(group.len());
         let mut geo_hashes = Vec::with_capacity(group.len());
@@ -128,7 +136,7 @@ WHERE world_trans != none
             "t12" => t12, "t13" => t13, "t14" => t14, "t15" => t15,
         ]?;
 
-        let file_name = format!("db_models_{}.parquet", dbno);
+        let file_name = format!("db_models_{}.parquet", dbnum);
         let file_path = target_path.join(&file_name);
         let file = fs::File::create(&file_path)?;
         ParquetWriter::new(file).finish(&mut df)?;
@@ -142,7 +150,7 @@ WHERE world_trans != none
 #[derive(Debug, Clone, serde::Deserialize, SurrealValue)]
 struct ModelDataRow {
     refno: String,
-    dbno: i64,
+    dbnum: i64,
     noun: Option<String>,
     matrix: Option<Vec<f64>>,
     geo_hash: String,

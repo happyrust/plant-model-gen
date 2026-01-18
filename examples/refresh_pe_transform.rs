@@ -1,24 +1,24 @@
-use anyhow::Result;
-use aios_core::{get_db_option, init_surreal, query_pe_transform, RefnoEnum};
 use aios_core::tool::math_tool::{dquat_to_pdms_ori_xyz_str, dvec3_to_xyz_str};
+use aios_core::{RefnoEnum, get_db_option, init_surreal, query_pe_transform};
+use anyhow::Result;
 
 /// # 使用方法
-/// 
+///
 /// 1. 刷新所有 MDB (默认行为):
 ///    ```
 ///    cargo run --example refresh_pe_transform
 ///    ```
-/// 
+///
 /// 2. 刷新指定 MDB:
 ///    ```
 ///    cargo run --example refresh_pe_transform ams1112_0001
 ///    ```
-/// 
+///
 /// 3. 刷新指定 dbnum (单个):
 ///    ```
 ///    cargo run --example refresh_pe_transform --dbnum 1112
 ///    ```
-/// 
+///
 /// 4. 刷新多个 dbnum (逗号分隔):
 ///    ```
 ///    cargo run --example refresh_pe_transform --dbnum 1112,7999,8000
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     init_surreal().await?;
 
     let args: Vec<String> = std::env::args().collect();
-    
+
     // 检查是否有 --dbnum 参数
     if let Some(dbnum_idx) = args.iter().position(|x| x == "--dbnum") {
         if let Some(dbnum_str) = args.get(dbnum_idx + 1) {
@@ -37,13 +37,13 @@ async fn main() -> Result<()> {
                 .split(',')
                 .filter_map(|s| s.trim().parse::<u32>().ok())
                 .collect();
-            
+
             if dbnums.is_empty() {
                 eprintln!("❌ 无效的 dbnum 参数: {}", dbnum_str);
                 eprintln!("用法: --dbnum 1112  或  --dbnum 1112,7999,8000");
                 return Ok(());
             }
-            
+
             println!("🔄 刷新指定数据库的 pe_transform: {:?}", dbnums);
             let count = aios_core::transform::refresh_pe_transform_for_dbnums(&dbnums).await?;
             println!("✅ 刷新完成，共处理 {} 个节点", count);

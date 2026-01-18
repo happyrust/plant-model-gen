@@ -750,6 +750,12 @@ async fn gen_cata_geos_inner(
                         };
 
                         let mut geo_insts = vec![];
+                        // 诊断：为什么最终 inst_cnt=0（通常是所有 shape 都在这里被跳过）
+                        let mut shape_total = 0usize;
+                        let mut shape_skip_invalid = 0usize;
+                        let mut shape_skip_invisible = 0usize;
+                        let mut shape_skip_nan = 0usize;
+                        let mut shape_added = 0usize;
                         let mut visible_set = HashSet::new();
                         for s in &shapes {
                             if s.visible {
@@ -764,6 +770,7 @@ async fn gen_cata_geos_inner(
                         );
 
                         for (shape_idx, shape) in shapes.into_iter().enumerate() {
+                            shape_total += 1;
                             debug_model!(
                                 "Processing shape[{}] for ele_refno={}",
                                 shape_idx,
@@ -785,10 +792,12 @@ async fn gen_cata_geos_inner(
                                     "shape[{}] csg_shape.check_valid() failed, skipping",
                                     shape_idx
                                 );
+                                shape_skip_invalid += 1;
                                 continue;
                             }
                             if !visible {
                                 debug_model!("shape[{}] not visible, skipping", shape_idx);
+                                shape_skip_invisible += 1;
                                 continue;
                             }
                             let mut shape_trans = csg_shape.get_trans();
@@ -811,6 +820,7 @@ async fn gen_cata_geos_inner(
                                     "shape[{}] transform contains NaN, skipping",
                                     shape_idx
                                 );
+                                shape_skip_nan += 1;
                                 continue;
                             }
                             let mut cata_neg_refnos =
@@ -861,20 +871,29 @@ async fn gen_cata_geos_inner(
                                 if let Ok(target_owners) =
                                     query_ngmr_owner(ele_refno, geom_refno).await
                                 {
-                                    shape_insts_data.insert_ngmr(
-                                        ele_refno,
-                                        target_owners,
-                                        geom_refno,
-                                    );
-                                }
+                                        shape_insts_data.insert_ngmr(
+                                            ele_refno,
+                                            target_owners,
+                                            geom_refno,
+                                        );
+                                    }
                             }
                             debug_model!("shape[{}] successfully added to geo_insts", shape_idx);
+                            shape_added += 1;
                             geo_insts.push(geom_inst);
                         }
                         {
                             debug_model!(
                                 "Finished processing shapes, geo_insts.len()={}",
                                 geo_insts.len()
+                            );
+                            debug_model!(
+                                "Shape stats: total={}, added={}, skip_invalid={}, skip_invisible={}, skip_nan={}",
+                                shape_total,
+                                shape_added,
+                                shape_skip_invalid,
+                                shape_skip_invisible,
+                                shape_skip_nan
                             );
                             let mut inst_key = geos_info.get_inst_key();
                             geos_info.is_solid = geo_insts.iter().any(|x| {

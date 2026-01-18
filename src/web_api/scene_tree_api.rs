@@ -88,7 +88,7 @@ pub struct AncestorsResponse {
 pub fn create_scene_tree_routes() -> Router {
     Router::new()
         .route("/api/scene-tree/init", post(init_scene_tree))
-        .route("/api/scene-tree/init/{dbno}", post(init_scene_tree_by_dbno))
+        .route("/api/scene-tree/init/{dbnum}", post(init_scene_tree_by_dbno))
         .route(
             "/api/scene-tree/init-by-root/{refno}",
             post(init_scene_tree_by_root),
@@ -127,13 +127,13 @@ async fn init_scene_tree(
     }
 }
 
-/// 初始化 Scene Tree（按 refno dbno 构造 WORLD=`${dbno}_0` 开始构建）
+/// 初始化 Scene Tree（按 refno dbnum 构造 WORLD=`${dbnum}_0` 开始构建）
 async fn init_scene_tree_by_dbno(
-    Path(dbno): Path<u32>,
+    Path(dbnum): Path<u32>,
     AxumJson(req): AxumJson<InitByDbnoRequest>,
 ) -> Result<Json<InitResponse>, StatusCode> {
     let force_rebuild = req.force_rebuild.unwrap_or(false);
-    match scene_tree::init_scene_tree_by_dbno(dbno, force_rebuild).await {
+    match scene_tree::init_scene_tree_by_dbno(dbnum, force_rebuild).await {
         Ok(result) => Ok(Json(InitResponse {
             success: true,
             node_count: result.node_count,
@@ -326,7 +326,7 @@ fn parse_refno_to_u64(refno: &str) -> Option<u64> {
     if parts.len() != 2 {
         return None;
     }
-    let dbno: u64 = parts[0].parse().ok()?;
+    let dbnum: u64 = parts[0].parse().ok()?;
     let ref_num: u64 = parts[1].parse().ok()?;
-    Some((dbno << 32) | ref_num)
+    Some((dbnum << 32) | ref_num)
 }

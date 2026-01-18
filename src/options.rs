@@ -30,7 +30,7 @@ pub struct DbOptionExt {
     #[serde(flatten)]
     pub inner: DbOption,
 
-    /// 模型生成完成后，是否导出 instances_{dbno}.json（输出到 output/instances/instances_{dbno}.json）
+    /// 模型生成完成后，是否导出 instances_{dbnum}.json（输出到 output/instances/instances_{dbnum}.json）
     #[serde(default = "default_true")]
     pub export_instances: bool,
 
@@ -58,7 +58,7 @@ pub struct DbOptionExt {
     #[serde(default)]
     pub target_sesno: Option<u32>,
 
-    /// 启用全库 Noun 扫描模式（不按 dbno/refno 层级过滤）
+    /// 启用全库 Noun 扫描模式（不按 dbnum/refno 层级过滤）
     #[serde(default)]
     pub full_noun_mode: bool,
 

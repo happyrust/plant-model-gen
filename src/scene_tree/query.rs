@@ -32,7 +32,7 @@ pub async fn query_generation_status(
         .join(",");
 
     let sql = format!(
-        "SELECT VALUE {{ id: meta::id(id), has_geo: has_geo, generated: generated }} FROM [{}]",
+        "SELECT VALUE {{ id: record::id(id), has_geo: has_geo, generated: generated }} FROM [{}]",
         id_list
     );
 
@@ -55,7 +55,7 @@ pub async fn filter_ungenerated_geo_nodes(
         .join(",");
 
     let sql = format!(
-        "SELECT VALUE meta::id(id) FROM [{}] WHERE has_geo = true AND generated = false",
+        "SELECT VALUE record::id(id) FROM [{}] WHERE has_geo = true AND generated = false",
         id_list
     );
 
@@ -105,7 +105,7 @@ pub async fn query_ungenerated_leaves(root_id: i64) -> Result<Vec<i64>> {
 
             // 关系表 contains 的 in/out 字段是 record<scene_node>
             let sql = format!(
-                "SELECT VALUE meta::id(out) FROM contains WHERE in IN [{}]",
+                "SELECT VALUE record::id(out) FROM contains WHERE in IN [{}]",
                 in_list
             );
             let children: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
@@ -135,7 +135,7 @@ pub async fn query_ungenerated_leaves(root_id: i64) -> Result<Vec<i64>> {
             .join(",");
 
         let sql = format!(
-            "SELECT VALUE meta::id(id) FROM [{}] WHERE has_geo = true AND is_leaf = true AND generated = false",
+            "SELECT VALUE record::id(id) FROM [{}] WHERE has_geo = true AND is_leaf = true AND generated = false",
             id_list
         );
         let mut part: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
@@ -149,7 +149,7 @@ pub async fn query_ungenerated_leaves(root_id: i64) -> Result<Vec<i64>> {
 pub async fn query_children_ids(parent_id: i64, limit: usize) -> Result<Vec<i64>> {
     let limit = limit.clamp(1, 20000);
     let sql = format!(
-        "SELECT VALUE meta::id(out) FROM contains WHERE in = scene_node:{parent_id} LIMIT {limit}"
+        "SELECT VALUE record::id(out) FROM contains WHERE in = scene_node:{parent_id} LIMIT {limit}"
     );
     let result: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
     Ok(result)
@@ -221,7 +221,7 @@ pub async fn query_generated_refnos(
         .join(",");
 
     let sql = format!(
-        "SELECT VALUE meta::id(id) FROM [{}] WHERE generated = true",
+        "SELECT VALUE record::id(id) FROM [{}] WHERE generated = true",
         id_list
     );
 

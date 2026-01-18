@@ -65,12 +65,35 @@ pub async fn capture_refnos(refnos: &[RefnoEnum], db_option: &DbOption) -> Resul
         None => return Ok(()),
     };
 
-    let mesh_dir = db_option.get_meshes_path();
-    for &refno in refnos {
-        if let Err(err) = capture_single(refno, &mesh_dir, &config).await {
-            eprintln!("[capture] 捕获参考号 {} 截图失败: {}", refno, err);
-        }
-    }
+    // Windows 下 main 线程默认栈较小，prepare_obj_export/collect_export_data
+    // 在某些情况下会触发 STATUS_STACK_OVERFLOW。
+    // 这里将截图流程放到一个更大栈的专用线程中执行，保证截图/对比链路可用。
+    let mesh_dir = db_option.get_meshes_path().to_path_buf();
+    let refnos_vec: Vec<RefnoEnum> = refnos.to_vec();
+    let handle = tokio::runtime::Handle::current();
+
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        std::thread::Builder::new()
+            .name("aios-capture".to_string())
+            // 64MB：足够覆盖导出/渲染阶段的较大栈帧
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                handle.block_on(async move {
+                    for refno in refnos_vec {
+                        if let Err(err) = capture_single(refno, &mesh_dir, &config).await {
+                            eprintln!("[capture] 捕获参考号 {} 截图失败: {}", refno, err);
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })
+            })
+            .context("创建截图专用线程失败")?
+            .join()
+            .map_err(|_| anyhow!("截图专用线程 panic"))??;
+
+        Ok(())
+    })
+    .await??;
 
     Ok(())
 }

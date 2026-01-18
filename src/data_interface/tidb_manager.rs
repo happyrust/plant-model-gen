@@ -303,11 +303,11 @@ impl PdmsDataInterface for AiosDBManager {
     async fn get_db_world(
         &self,
         project: &str,
-        db_no: u32,
+        dbnum: u32,
     ) -> anyhow::Result<Option<(RefU64, String)>> {
         // if let Some(project_pool) = self.project_map.get(project) {
         //     let r =
-        //         query_id_name_from_dbno_type(db_no as i32, "WORL", project_pool.value()).await?;
+        //         query_id_name_from_dbno_type(dbnum as i32, "WORL", project_pool.value()).await?;
         //     if let Some(mut r) = r {
         //         return Ok(Some(r.remove(0)));
         //     }

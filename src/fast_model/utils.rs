@@ -1,5 +1,5 @@
 use aios_core::error::init_save_database_error;
-use aios_core::{RefnoEnum, SUL_DB};
+use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
 use dashmap::DashMap;
 use parry3d::bounding_volume::Aabb;
 use std::collections::HashMap;
@@ -136,39 +136,16 @@ pub async fn save_inst_relate_aabb(
         return;
     }
 
-    ensure_inst_relate_aabb_relation_schema().await;
-
-    async fn exec_delete_insert(sql: &str) -> Result<(), String> {
-        match SUL_DB.query(sql).await {
-            Ok(mut resp) => {
-                // 这里是多语句（DELETE + INSERT RELATION），需要对每个结果做 take 才能暴露隐藏的执行错误。
-                for idx in 0..2 {
-                    if let Err(e) = resp.take::<surrealdb::types::Value>(idx) {
-                        return Err(e.to_string());
-                    }
-                }
-                Ok(())
-            }
-            Err(e) => Err(e.to_string()),
-        }
-    }
-
     let keys = inst_aabb_map
         .iter()
         .map(|kv| kv.key().clone())
         .collect::<Vec<_>>();
 
     for chunk in keys.chunks(200) {
-        let mut delete_refnos: Vec<String> = Vec::with_capacity(chunk.len());
-        let mut insert_pairs: Vec<String> = Vec::with_capacity(chunk.len());
+        let mut sql = String::new();
         for refno in chunk {
             let Some(aabb_hash) = inst_aabb_map.get(refno) else { continue };
-            // inst_relate_aabb 为关系表：in=pe, out=aabb（pe 只能对应一条 AABB）。
-            // 用“按 in 批量 DELETE + INSERT RELATION”来实现幂等更新，避免 UPDATE/UPSERT。
             let refno_key = refno.to_pe_key();
-            // 兼容两种输入：
-            // - 计算路径：aabb_hash 是纯 hash（如 "754..."）
-            // - 回退路径：aabb_hash 可能是完整 record 字符串（如 "aabb:⟨754...⟩"）
             let aabb_key = {
                 let v = aabb_hash.value();
                 if v.starts_with("aabb:") {
@@ -177,46 +154,21 @@ pub async fn save_inst_relate_aabb(
                     format!("aabb:⟨{}⟩", v)
                 }
             };
-            delete_refnos.push(refno_key.clone());
-            // 约定：inst_relate_aabb 的 id = inst_relate_aabb:⟨refno⟩，便于使用 FROM [ids] 批量取值。
-            insert_pairs.push(format!(
-                "{{ id: inst_relate_aabb:⟨{refno}⟩, in: {refno_key}, out: {aabb_key} }}"
+            // UPSERT 使用 id 作为主键，覆盖 in 和 out 字段
+            sql.push_str(&format!(
+                "UPSERT inst_relate_aabb:⟨{refno}⟩ SET in = {refno_key}, out = {aabb_key};"
             ));
         }
 
-        if insert_pairs.is_empty() {
+        if sql.is_empty() {
             continue;
         }
 
-        let sql = format!(
-            "DELETE inst_relate_aabb WHERE in IN [{0}]; INSERT RELATION INTO inst_relate_aabb [{1}];",
-            delete_refnos.join(","),
-            insert_pairs.join(",")
-        );
-
-        match exec_delete_insert(&sql).await {
-            Ok(_) => {}
-            Err(e) => {
-                // 某些环境里 inst_relate_aabb 的唯一索引可能存在脏数据（表内为空但索引占位），导致 INSERT 报错；
-                // 此时尝试重建索引并重试一次，避免 AABB 写入悄悄失败。
-                let es = e.to_string();
-                if es.contains("idx_inst_relate_aabb_refno") && es.contains("already contains") {
-                    let repair_sql = "REMOVE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb; \
-DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS in UNIQUE;";
-                    let _ = SUL_DB.query(repair_sql).await;
-                    if let Err(e2) = exec_delete_insert(&sql).await {
-                        init_save_database_error(
-                            &format!("{sql}\n-- err: {e2}"),
-                            &std::panic::Location::caller().to_string(),
-                        );
-                    }
-                } else {
-                    init_save_database_error(
-                        &format!("{sql}\n-- err: {e}"),
-                        &std::panic::Location::caller().to_string(),
-                    );
-                }
-            }
+        if let Err(e) = SUL_DB.query_take::<surrealdb::types::Value>(&sql, 0).await {
+            init_save_database_error(
+                &format!("{sql}\n-- err: {e}"),
+                &std::panic::Location::caller().to_string(),
+            );
         }
     }
 }

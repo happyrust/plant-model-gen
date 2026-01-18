@@ -51,20 +51,20 @@ pub fn get_required_attrs(noun: &str) -> &'static [&'static str] {
 /// DuckDB 数据源
 pub struct DuckDbDataSource {
     conn: Connection,
-    dbno: u32,
+    dbnum: u32,
     registered_nouns: Vec<String>,
 }
 
 impl DuckDbDataSource {
     /// 创建数据源并注册 parquet 文件为视图
-    pub fn new(dbno: u32, base_dir: &Path) -> Result<Self> {
-        println!("📂 Initializing DuckDB data source for dbno {}...", dbno);
+    pub fn new(dbnum: u32, base_dir: &Path) -> Result<Self> {
+        println!("📂 Initializing DuckDB data source for dbnum {}...", dbnum);
         
         // 创建内存数据库
         let conn = Connection::open_in_memory()
             .context("Failed to create DuckDB connection")?;
         
-        let dbno_dir = base_dir.join(format!("database_models/{}", dbno));
+        let dbno_dir = base_dir.join(format!("database_models/{}", dbnum));
         
         if !dbno_dir.exists() {
             return Err(anyhow!("Database directory not found: {}", dbno_dir.display()));
@@ -114,7 +114,7 @@ impl DuckDbDataSource {
         
         println!("   📊 Total views registered: {} nouns", registered_nouns.len());
         
-        Ok(Self { conn, dbno, registered_nouns })
+        Ok(Self { conn, dbnum, registered_nouns })
     }
     
     /// 查询单个 PE 数据

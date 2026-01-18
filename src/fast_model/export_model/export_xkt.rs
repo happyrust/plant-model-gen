@@ -471,7 +471,7 @@ impl XktExporter {
     async fn generate_mesh_files(
         &self,
         refnos: &[RefnoEnum],
-        dbno: Option<u32>,
+        dbnum: Option<u32>,
         db_config: Option<&str>,
         verbose: bool,
     ) -> Result<()> {
@@ -506,7 +506,7 @@ impl XktExporter {
 
         // 启动几何体生成
         let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
-        gen_geos_data(dbno, refnos.to_vec(), &db_option_ext, None, sender, None, false)
+        gen_geos_data(dbnum, refnos.to_vec(), &db_option_ext, None, sender, None, false)
             .await
             .context("生成几何体数据失败")?;
 
@@ -596,7 +596,7 @@ impl ModelExporter for XktExporter {
         if !config.skip_mesh {
             self.generate_mesh_files(
                 &all_refnos,
-                config.dbno,
+                config.dbnum,
                 config.db_config.as_deref(),
                 config.common.verbose,
             )

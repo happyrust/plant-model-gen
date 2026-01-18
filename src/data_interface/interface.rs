@@ -104,7 +104,7 @@ pub trait PdmsDataInterface: Send + Sync {
     async fn get_db_world(
         &self,
         project: &str,
-        db_no: u32,
+        dbnum: u32,
     ) -> anyhow::Result<Option<(RefU64, String)>>;
 
     ///获得refno的祖先参考号

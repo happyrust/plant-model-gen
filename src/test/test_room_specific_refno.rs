@@ -38,7 +38,7 @@ mod tests {
 
     struct WorldTransBackup {
         refno: RefnoEnum,
-        inst_relate_id: String,
+        pe_transform_id: String,
         old_trans_id: String,
         new_trans_id: String,
         new_trans_created: bool,
@@ -80,29 +80,23 @@ mod tests {
     async fn fetch_inst_relate_world_trans(
         refno: RefnoEnum,
     ) -> Result<(String, String, Value)> {
-        let inst_relate_sql = format!(
-            "SELECT VALUE <string>id FROM inst_relate WHERE in = {} LIMIT 1",
-            refno.to_pe_key()
-        );
-        let mut inst_relate_ids: Vec<String> =
-            SUL_DB.query_take(&inst_relate_sql, 0).await.unwrap_or_default();
-        let inst_relate_id = inst_relate_ids
-            .pop()
-            .context("未找到 inst_relate 记录")?;
+        let pe_transform_id = refno
+            .to_pe_key()
+            .replace("pe:", "pe_transform:");
 
         let trans_id_sql = format!(
-            "SELECT VALUE <string>world_trans FROM inst_relate WHERE in = {} LIMIT 1",
-            refno.to_pe_key()
+            "SELECT VALUE <string>world_trans FROM {} LIMIT 1",
+            pe_transform_id
         );
         let mut trans_ids: Vec<String> =
             SUL_DB.query_take(&trans_id_sql, 0).await.unwrap_or_default();
         let trans_id = trans_ids
             .pop()
-            .context("未找到 inst_relate.world_trans 记录")?;
+            .context("未找到 pe_transform.world_trans 记录")?;
 
         let trans_value_sql = format!(
-            "SELECT VALUE world_trans.d FROM inst_relate WHERE in = {} LIMIT 1",
-            refno.to_pe_key()
+            "SELECT VALUE world_trans.d FROM {} LIMIT 1",
+            pe_transform_id
         );
         let mut trans_values: Vec<Value> =
             SUL_DB.query_take(&trans_value_sql, 0).await.unwrap_or_default();
@@ -110,11 +104,11 @@ mod tests {
             .pop()
             .context("未找到 world_trans.d 数据")?;
 
-        Ok((inst_relate_id, trans_id, trans_value))
+        Ok((pe_transform_id, trans_id, trans_value))
     }
 
     async fn shift_world_trans(refno: RefnoEnum, delta: [f64; 3]) -> Result<WorldTransBackup> {
-        let (inst_relate_id, old_trans_id, mut trans_value) =
+        let (pe_transform_id, old_trans_id, mut trans_value) =
             fetch_inst_relate_world_trans(refno).await?;
 
         apply_translation_delta(&mut trans_value, delta)?;
@@ -138,7 +132,7 @@ mod tests {
 
         let update_sql = format!(
             "UPDATE {} SET world_trans = {};",
-            inst_relate_id, new_trans_id
+            pe_transform_id, new_trans_id
         );
         SUL_DB.query(&update_sql).await?;
 
@@ -146,7 +140,7 @@ mod tests {
 
         Ok(WorldTransBackup {
             refno,
-            inst_relate_id,
+            pe_transform_id,
             old_trans_id,
             new_trans_id,
             new_trans_created,
@@ -156,7 +150,7 @@ mod tests {
     async fn restore_world_trans(backup: WorldTransBackup) -> Result<()> {
         let update_sql = format!(
             "UPDATE {} SET world_trans = {};",
-            backup.inst_relate_id, backup.old_trans_id
+            backup.pe_transform_id, backup.old_trans_id
         );
         SUL_DB.query(&update_sql).await?;
         update_inst_relate_aabbs_by_refnos(&[backup.refno], true).await?;

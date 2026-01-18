@@ -72,7 +72,7 @@ impl ElementType {
 #[derive(Debug, Clone)]
 pub struct PdmsElement {
     pub element_type: ElementType,
-    pub refno: (u32, u32), // (dbno, elno)
+    pub refno: (u32, u32), // (dbnum, elno)
     pub attributes: HashMap<String, String>,
     pub children: Vec<PdmsElement>,
     pub position: Option<String>,
@@ -142,8 +142,8 @@ impl DblistParser {
             if let Some(dbno_str) = trimmed.split("FRMW_").nth(1) {
                 if let Some(dbno_part) = dbno_str.split('_').next() {
                     if let Some(dbno_part) = dbno_part.split_whitespace().next() {
-                        if let Ok(dbno) = dbno_part.parse::<u32>() {
-                            self.current_dbno = dbno;
+                        if let Ok(dbnum) = dbno_part.parse::<u32>() {
+                            self.current_dbno = dbnum;
                         }
                     }
                 }

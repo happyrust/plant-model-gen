@@ -15,7 +15,100 @@
 
 use crate::fast_model::query_provider;
 use aios_core::RefnoEnum;
+use aios_core::pdms_types::{TOTAL_NEG_NOUN_NAMES, VISBILE_GEO_NOUNS};
+use aios_core::tool::db_tool::db1_hash;
+use aios_core::tree_query::{
+    load_tree_index_from_dir, TreeIndex, TreeQuery, TreeQueryFilter, TreeQueryOptions,
+};
 use aios_core::types::{NamedAttrMap as NamedAttMap, SPdmsElement as PE};
+use once_cell::sync::Lazy;
+use std::sync::Arc;
+
+const TREE_DIR: &str = "output/scene_tree";
+
+static VISIBLE_GEO_NOUN_HASHES: Lazy<Vec<u32>> =
+    Lazy::new(|| VISBILE_GEO_NOUNS.iter().map(|&name| db1_hash(name)).collect());
+static NEG_GEO_NOUN_HASHES: Lazy<Vec<u32>> =
+    Lazy::new(|| TOTAL_NEG_NOUN_NAMES.iter().map(|&name| db1_hash(name)).collect());
+static BRAN_HASH: Lazy<u32> = Lazy::new(|| db1_hash("BRAN"));
+static HANG_HASH: Lazy<u32> = Lazy::new(|| db1_hash("HANG"));
+
+async fn load_tree_index_for_refno(refno: RefnoEnum) -> anyhow::Result<Arc<TreeIndex>> {
+    // 优先从解析期生成的 db_meta_info.json 推导 dbnum，避免依赖 PE（尤其在 save_db=false / gen_tree_only 场景）。
+    if let Some(dbnum) = crate::fast_model::db_meta_cache::get_dbnum_for_refno(refno) {
+        return load_tree_index_from_dir(dbnum, TREE_DIR);
+    }
+
+    // 必须先通过 PE 获取 dbnum，然后加载对应 dbnum 的 .tree 文件。
+    // TreeIndex 仅用于层级查询；PE/属性仍由 SurrealDB 提供（用于模型生成的后续数据获取）。
+    let Some(pe) = aios_core::get_pe(refno).await? else {
+        return Err(anyhow::anyhow!("refno {} 不存在，无法获取 dbnum", refno));
+    };
+    if pe.dbnum < 0 {
+        return Err(anyhow::anyhow!(
+            "refno {} 的 dbnum 非法: {}",
+            refno,
+            pe.dbnum
+        ));
+    }
+    load_tree_index_from_dir(pe.dbnum as u32, TREE_DIR)
+}
+
+fn build_noun_hashes(nouns: &[&str]) -> Option<Vec<u32>> {
+    if nouns.is_empty() {
+        None
+    } else {
+        Some(nouns.iter().map(|n| db1_hash(n)).collect())
+    }
+}
+
+fn parse_max_depth(range_str: Option<&str>) -> Option<usize> {
+    let range = range_str?;
+    if range.is_empty() || range == ".." {
+        return None;
+    }
+    if let Some((_, end)) = range.split_once("..") {
+        if end.is_empty() {
+            return None;
+        }
+        return end.parse::<usize>().ok();
+    }
+    range.parse::<usize>().ok()
+}
+
+async fn query_descendants_bfs(
+    refno: RefnoEnum,
+    noun_hashes: Option<Vec<u32>>,
+    include_self: bool,
+    range_str: Option<&str>,
+) -> anyhow::Result<Vec<RefnoEnum>> {
+    let index = load_tree_index_for_refno(refno).await?;
+    let options = TreeQueryOptions {
+        include_self,
+        max_depth: parse_max_depth(range_str),
+        filter: TreeQueryFilter {
+            noun_hashes,
+            ..Default::default()
+        },
+    };
+    let descendants = index
+        .query_descendants_bfs(refno.refno(), options)
+        .await?;
+    Ok(descendants.into_iter().map(RefnoEnum::from).collect())
+}
+
+async fn query_children_filtered(
+    refno: RefnoEnum,
+    noun_hashes: Option<Vec<u32>>,
+) -> anyhow::Result<Vec<RefnoEnum>> {
+    let index = load_tree_index_for_refno(refno).await?;
+    let filter = TreeQueryFilter {
+        noun_hashes,
+        ..Default::default()
+    };
+    let children = index.query_children(refno.refno(), filter).await?;
+    Ok(children.into_iter().map(RefnoEnum::from).collect())
+}
 
 /// 按类型查询 refno (兼容旧 API)
 ///
@@ -64,8 +157,7 @@ pub async fn query_type_refnos_by_dbnum(
     note = "使用 aios_core::collect_descendant_filter_ids(refnos, &[], None) 代替"
 )]
 pub async fn query_multi_children_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
-    // 调用 collect_descendant_filter_ids，传入空的 noun 过滤器表示查询所有子节点
-    aios_core::collect_descendant_filter_ids(refnos, &[], None).await
+    query_provider::query_multi_descendants(refnos, &[]).await
 }
 
 /// 查询使用特定 CATE 的 refno (兼容旧 API)
@@ -113,11 +205,68 @@ pub async fn get_children_refnos(refno: RefnoEnum) -> anyhow::Result<Vec<RefnoEn
     query_provider::get_children(refno).await
 }
 
+/// 查询可见几何子孙节点（模型生成路径：TreeIndex）
+pub async fn query_visible_geo_descendants(
+    refno: RefnoEnum,
+    include_self: bool,
+    range_str: Option<&str>,
+) -> anyhow::Result<Vec<RefnoEnum>> {
+    query_descendants_bfs(
+        refno,
+        Some(VISIBLE_GEO_NOUN_HASHES.clone()),
+        include_self,
+        range_str,
+    )
+    .await
+}
+
+/// 查询负实体几何子孙节点（模型生成路径：TreeIndex）
+pub async fn query_negative_geo_descendants(
+    refno: RefnoEnum,
+    include_self: bool,
+    range_str: Option<&str>,
+) -> anyhow::Result<Vec<RefnoEnum>> {
+    query_descendants_bfs(
+        refno,
+        Some(NEG_GEO_NOUN_HASHES.clone()),
+        include_self,
+        range_str,
+    )
+    .await
+}
+
+/// 查询深度可见实例（模型生成路径：TreeIndex）
+pub async fn query_deep_visible_inst_refnos(refno: RefnoEnum) -> anyhow::Result<Vec<RefnoEnum>> {
+    let index = load_tree_index_for_refno(refno).await?;
+    let Some(meta) = index.get_node_meta(refno.refno()).await? else {
+        return Ok(Vec::new());
+    };
+
+    let owner_hash = if meta.owner.is_unset() {
+        None
+    } else {
+        index.get_node_meta(meta.owner).await?.map(|m| m.noun)
+    };
+
+    if owner_hash == Some(*BRAN_HASH) || owner_hash == Some(*HANG_HASH) {
+        return Ok(vec![refno]);
+    }
+
+    if meta.noun == *BRAN_HASH || meta.noun == *HANG_HASH {
+        return query_children_filtered(refno, None).await;
+    }
+
+    query_visible_geo_descendants(refno, true, Some("..")).await
+}
+
+/// 查询深度负实例（模型生成路径：TreeIndex）
+pub async fn query_deep_neg_inst_refnos(refno: RefnoEnum) -> anyhow::Result<Vec<RefnoEnum>> {
+    query_filter_deep_children(refno, &TOTAL_NEG_NOUN_NAMES).await
+}
+
 /// 查询深层子孙节点 (兼容旧 API)
 pub async fn query_deep_children_refnos(refno: RefnoEnum) -> anyhow::Result<Vec<RefnoEnum>> {
-    // 使用 collect_descendant_ids_has_inst 获取有实例关系的子孙节点
-    // 限制深度为 12 层（与原 max_depth=12 对应）
-    aios_core::collect_descendant_ids_has_inst(&[refno], &[], false, Some("..")).await
+    query_descendants_bfs(refno, None, true, Some("..")).await
 }
 
 /// 查询过滤后的深层子孙 (兼容旧 API)
@@ -132,8 +281,7 @@ pub async fn query_filter_deep_children(
     refno: RefnoEnum,
     nouns: &[&str],
 ) -> anyhow::Result<Vec<RefnoEnum>> {
-    // 调用 collect_descendant_filter_ids，将单个 refno 包装为数组
-    aios_core::collect_descendant_filter_ids(&[refno], nouns, None).await
+    query_descendants_bfs(refno, build_noun_hashes(nouns), true, Some("..")).await
 }
 
 /// 查询祖先节点 (兼容旧 API)
@@ -146,7 +294,36 @@ pub async fn query_filter_ancestors(
     refno: RefnoEnum,
     nouns: &[&str],
 ) -> anyhow::Result<Vec<RefnoEnum>> {
-    query_provider::get_ancestors_of_type(refno, nouns).await
+    let index = load_tree_index_for_refno(refno).await?;
+    let options = TreeQueryOptions {
+        include_self: false,
+        max_depth: None,
+        filter: TreeQueryFilter {
+            noun_hashes: build_noun_hashes(nouns),
+            ..Default::default()
+        },
+    };
+    let ancestors = index
+        .query_ancestors_root_to_parent(refno.refno(), options)
+        .await?;
+    Ok(ancestors.into_iter().map(RefnoEnum::from).collect())
+}
+
+/// 查询过滤后的深层子孙属性（模型生成路径：TreeIndex -> SurrealDB）
+pub async fn query_filter_deep_children_atts(
+    refno: RefnoEnum,
+    nouns: &[&str],
+) -> anyhow::Result<Vec<NamedAttMap>> {
+    let refnos = query_filter_deep_children(refno, nouns).await?;
+    query_provider::get_attmaps_batch(&refnos).await
+}
+
+/// 查询直接子节点（带类型过滤，模型生成路径：TreeIndex）
+pub async fn collect_children_filter_ids(
+    refno: RefnoEnum,
+    nouns: &[&str],
+) -> anyhow::Result<Vec<RefnoEnum>> {
+    query_children_filtered(refno, build_noun_hashes(nouns)).await
 }
 
 // ============================================================================

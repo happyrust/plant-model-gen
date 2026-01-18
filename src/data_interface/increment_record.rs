@@ -85,11 +85,11 @@ impl IncrEleUpdateLog {
                 .or_insert_with(Vec::new)
                 .push(data);
         }
-        for (dbno, increment_data) in data_map {
-            let Ok(_r) = create_increment_table(dbno, pool).await else {
+        for (dbnum, increment_data) in data_map {
+            let Ok(_r) = create_increment_table(dbnum, pool).await else {
                 continue;
             };
-            let sql = gen_insert_increment_sql(dbno, increment_data, &session_name);
+            let sql = gen_insert_increment_sql(dbnum, increment_data, &session_name);
             let mut conn = pool;
             let result = conn.execute(sql.as_str()).await;
             match result {
@@ -106,12 +106,12 @@ impl IncrEleUpdateLog {
 
 #[cfg(feature = "sql")]
 fn gen_insert_increment_sql(
-    dbno: i32,
+    dbnum: i32,
     increment_datas: Vec<IncrEleUpdateLog>,
     session_name: &str,
 ) -> String {
     let mut sql = format!(
-        "INSERT IGNORE INTO {dbno}_{INCREMENT_DATA}(ID,REFNO,REFNO_STR,OWNER, OPERATE, VERSION,NUMBDB,TIME,CHILDREN,OLD_DATA,NEW_DATA,USER) VALUES"
+        "INSERT IGNORE INTO {dbnum}_{INCREMENT_DATA}(ID,REFNO,REFNO_STR,OWNER, OPERATE, VERSION,NUMBDB,TIME,CHILDREN,OLD_DATA,NEW_DATA,USER) VALUES"
     );
     for increment_data in increment_datas {
         // uuid 作为图数据库和 tidb 连接的主键
@@ -189,8 +189,8 @@ pub async fn query_key_data(
 
 /// 创建对应的增量记录表
 #[cfg(feature = "sql")]
-pub async fn create_increment_table(dbno: i32, pool: &Pool<MySql>) -> anyhow::Result<()> {
-    let sql = gen_create_increment_table_sql(dbno);
+pub async fn create_increment_table(dbnum: i32, pool: &Pool<MySql>) -> anyhow::Result<()> {
+    let sql = gen_create_increment_table_sql(dbnum);
     let mut conn = pool;
     let result = conn.execute(sql.as_str()).await;
     match result {
@@ -205,11 +205,11 @@ pub async fn create_increment_table(dbno: i32, pool: &Pool<MySql>) -> anyhow::Re
 
 /// 生成创建表的sql
 #[cfg(feature = "sql")]
-fn gen_create_increment_table_sql(dbno: i32) -> String {
+fn gen_create_increment_table_sql(dbnum: i32) -> String {
     let mut sql = String::new();
     sql.push_str(&format!(
         "CREATE TABLE IF NOT EXISTS {}_{INCREMENT_DATA} (",
-        dbno
+        dbnum
     ));
     sql.push_str(&format!("{} VARCHAR(50) PRIMARY KEY ,", "ID"));
     sql.push_str(&format!("{} BIGINT ,", "REFNO"));

@@ -55,14 +55,9 @@ pub async fn query_insts_with_batch(
                 SELECT
                     refno,
                     refno.owner ?? refno as owner,
-                    "" as generic,
                     refno.world_trans as world_trans,
                     refno.world_aabb as world_aabb,
-                    NONE as pts,
-                    [{{ "transform": refno.world_trans, "geo_hash": mesh_id, "is_tubi": false, "unit_flag": false }}] as insts,
-                    true as has_neg,
-                    NONE as date,
-                    refno.spec_value as spec_value
+                    [{{ "transform": refno.world_trans, "geo_hash": mesh_id, "is_tubi": false, "unit_flag": false }}] as insts
                 FROM [{bool_keys}]
                 WHERE status = 'Success'
                   AND refno.world_trans != NONE
@@ -96,18 +91,13 @@ pub async fn query_insts_with_batch(
                     SELECT
                         in.id as refno,
                         in.owner ?? in as owner,
-                        "" as generic,
                         in.world_trans as world_trans,
                         in.world_aabb as world_aabb,
-                        (SELECT value out.pts.*.d FROM out->geo_relate WHERE visible && out.meshed && (out.pts ?? NONE) != NONE LIMIT 1)[0] as pts,
                         (SELECT trans.d as transform, record::id(out) as geo_hash, false as is_tubi, out.unit_flag ?? false as unit_flag
                          FROM out->geo_relate
                          WHERE visible && (out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
                            && (trans.d ?? NONE) != NONE
-                           && geo_type IN ['Pos', 'Compound', 'DesiPos', 'CatePos']) as insts,
-                        false as has_neg,
-                        NONE as date,
-                        spec_value
+                           && geo_type IN ['Pos', 'Compound', 'DesiPos', 'CatePos']) as insts
                     FROM [{non_bool_keys}]
                     WHERE in.world_trans != NONE
                     "#,
@@ -128,30 +118,22 @@ pub async fn query_insts_with_batch(
 
             // 利用 pe 表的计算字段简化查询
             // 仍然需要检查 inst_relate_bool 来设置 has_neg 标志
-            let bool_check_expr = "type::record(\"inst_relate_bool\", record::id(in)).status = 'Success'";
-
             let sql = format!(
                 r#"
                 SELECT
                     in.id as refno,
                     in.owner ?? in as owner,
-                    "" as generic,
                     in.world_trans as world_trans,
                     in.world_aabb as world_aabb,
-                    (SELECT value out.pts.*.d FROM out->geo_relate WHERE visible && out.meshed && (out.pts ?? NONE) != NONE LIMIT 1)[0] as pts,
                     (SELECT trans.d as transform, record::id(out) as geo_hash, false as is_tubi, out.unit_flag ?? false as unit_flag
                      FROM out->geo_relate
-                     WHERE visible && (out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
+                     WHERE visible && out.meshed
                        && (trans.d ?? NONE) != NONE
-                       && geo_type IN ['Pos', 'DesiPos', 'CatePos']) as insts,
-                    ({bool_check} ?? false) as has_neg,
-                    NONE as date,
-                    spec_value
+                       && geo_type IN ['Pos', 'DesiPos', 'CatePos']) as insts
                 FROM [{inst_relate_keys}]
                 WHERE in.world_trans != NONE
                 "#,
-                inst_relate_keys = inst_relate_keys_str,
-                bool_check = bool_check_expr
+                inst_relate_keys = inst_relate_keys_str
             );
 
             let mut chunk_result: Vec<GeomInstQuery> = SUL_DB

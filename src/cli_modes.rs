@@ -39,10 +39,10 @@ pub struct ExportConfig {
     /// 是否重新生成 plant mesh
     pub regenerate_plant_mesh: bool,
     /// 数据库编号（用于按 SITE 导出）
-    pub dbno: Option<u32>,
+    pub dbnum: Option<u32>,
     /// 是否使用基础颜色材质（非 PBR）
     pub use_basic_materials: bool,
-    /// 是否运行所有 dbno（全库导出模式）
+    /// 是否运行所有 dbnum（全库导出模式）
     pub run_all_dbnos: bool,
     /// 是否按 SITE 拆分导出
     pub split_by_site: bool,
@@ -63,7 +63,7 @@ impl Default for ExportConfig {
             target_unit: "mm".to_string(),
             verbose: false,
             regenerate_plant_mesh: false,
-            dbno: None,
+            dbnum: None,
             use_basic_materials: false,
             run_all_dbnos: false,
             split_by_site: false,
@@ -127,8 +127,8 @@ impl ExportConfig {
     }
 
     /// 设置数据库编号
-    pub fn with_dbno(mut self, dbno: Option<u32>) -> Self {
-        self.dbno = dbno;
+    pub fn with_dbno(mut self, dbnum: Option<u32>) -> Self {
+        self.dbnum = dbnum;
         self
     }
 
@@ -161,7 +161,7 @@ impl ExportConfig {
             target_unit,
             verbose,
             regenerate_plant_mesh,
-            dbno: None,
+            dbnum: None,
             use_basic_materials,
             run_all_dbnos: true, // 关键：全库导出
             split_by_site,
@@ -194,7 +194,7 @@ impl ExportConfig {
             target_unit,
             verbose,
             regenerate_plant_mesh,
-            dbno: None,
+            dbnum: None,
             use_basic_materials: false,
             run_all_dbnos: true, // 关键：全库导出
             split_by_site,
@@ -299,27 +299,27 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     // 打印导出参数
     config.print_export_params(&mesh_dir);
 
-    // 如果未指定 dbno 且未提供 refnos，但要求全库导出，则在此处理
-    if config.run_all_dbnos && config.dbno.is_none() && config.refnos_str.is_empty() {
-        println!("\n🔁 进入全库 OBJ 导出模式 (MDB 所有 dbno)");
+    // 如果未指定 dbnum 且未提供 refnos，但要求全库导出，则在此处理
+    if config.run_all_dbnos && config.dbnum.is_none() && config.refnos_str.is_empty() {
+        println!("\n🔁 进入全库 OBJ 导出模式 (MDB 所有 dbnum)");
         let dbnos = query_mdb_db_nums(None, DBType::DESI).await?;
         if dbnos.is_empty() {
-            println!("⚠️ MDB 未返回任何 dbno，跳过导出");
+            println!("⚠️ MDB 未返回任何 dbnum，跳过导出");
             return Ok(());
         }
         for db in dbnos {
             let mut per_db_config = config.clone();
-            per_db_config.dbno = Some(db);
+            per_db_config.dbnum = Some(db);
             if let Err(e) = export_obj_mode_for_db(&per_db_config, db_option_ext).await {
-                println!("❌ 导出 dbno={} 失败: {}", db, e);
+                println!("❌ 导出 dbnum={} 失败: {}", db, e);
             }
         }
         println!("\n🎉 全库 OBJ 导出完成");
         return Ok(());
     }
 
-    // 检查是否指定了 dbno
-    if config.dbno.is_some() {
+    // 检查是否指定了 dbnum
+    if config.dbnum.is_some() {
         export_obj_mode_for_db(&config, db_option_ext).await?;
     } else {
         // 原有逻辑：按 refnos 导出
@@ -397,14 +397,14 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
 
 async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionExt) -> Result<()> {
     let mesh_dir = config.get_mesh_dir(db_option_ext);
-    let dbno = config
-        .dbno
-        .expect("dbno required in export_obj_mode_for_db");
-    println!("\n🔍 检测到 dbno 参数: {}", dbno);
+    let dbnum = config
+        .dbnum
+        .expect("dbnum required in export_obj_mode_for_db");
+    println!("\n🔍 检测到 dbnum 参数: {}", dbnum);
     println!("📊 查询该数据库下的所有 SITE...");
 
     use aios_database::fast_model::query_provider;
-    let sites = query_provider::query_by_type(&["SITE"], dbno as i32, None).await?;
+    let sites = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
     println!("   - 找到 {} 个 SITE", sites.len());
 
     if sites.is_empty() {
@@ -441,7 +441,7 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
         // 拆分模式：每个 SITE 单独导出
         println!("\n📂 拆分模式：每个 SITE 导出为独立文件");
         for (idx, site_refno) in sites.iter().enumerate() {
-            let site_name = get_site_name_for_export(*site_refno, dbno, "obj").await;
+            let site_name = get_site_name_for_export(*site_refno, dbnum, "obj").await;
             let output_file = format!("output/{}", site_name);
             println!(
                 "\n🔄 [{}/{}] 导出 SITE: {} -> {}",
@@ -478,7 +478,7 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
     } else {
         // 默认合并模式：将所有 SITE 合并到一个文件
         println!("\n🔀 合并模式：将所有 SITE 合并到一个文件（默认）");
-        let output_file = format!("output/dbno_{}.obj", dbno);
+        let output_file = format!("output/dbno_{}.obj", dbnum);
         println!(
             "🔄 导出合并文件: {} (包含 {} 个 SITE)",
             output_file,
@@ -525,27 +525,27 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     // 打印导出参数
     config.print_export_params(&mesh_dir);
 
-    // 全库导出（无 dbno 且无 refnos）
-    if config.run_all_dbnos && config.dbno.is_none() && config.refnos_str.is_empty() {
-        println!("\n🔁 进入全库 GLB 导出模式 (MDB 所有 dbno)");
+    // 全库导出（无 dbnum 且无 refnos）
+    if config.run_all_dbnos && config.dbnum.is_none() && config.refnos_str.is_empty() {
+        println!("\n🔁 进入全库 GLB 导出模式 (MDB 所有 dbnum)");
         let dbnos = query_mdb_db_nums(None, DBType::DESI).await?;
         if dbnos.is_empty() {
-            println!("⚠️ MDB 未返回任何 dbno，跳过导出");
+            println!("⚠️ MDB 未返回任何 dbnum，跳过导出");
             return Ok(());
         }
         for db in dbnos {
             let mut per_db_config = config.clone();
-            per_db_config.dbno = Some(db);
+            per_db_config.dbnum = Some(db);
             if let Err(e) = export_glb_mode_for_db(&per_db_config, db_option_ext).await {
-                println!("❌ 导出 dbno={} 失败: {}", db, e);
+                println!("❌ 导出 dbnum={} 失败: {}", db, e);
             }
         }
         println!("\n🎉 全库 GLB 导出完成");
         return Ok(());
     }
 
-    // 检查是否指定了 dbno
-    if config.dbno.is_some() {
+    // 检查是否指定了 dbnum
+    if config.dbnum.is_some() {
         export_glb_mode_for_db(&config, db_option_ext).await?;
     } else {
         // 原有逻辑：按 refnos 导出
@@ -621,14 +621,14 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
 
 async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionExt) -> Result<()> {
     let mesh_dir = config.get_mesh_dir(db_option_ext);
-    let dbno = config
-        .dbno
-        .expect("dbno required in export_glb_mode_for_db");
-    println!("\n🔍 检测到 dbno 参数: {}", dbno);
+    let dbnum = config
+        .dbnum
+        .expect("dbnum required in export_glb_mode_for_db");
+    println!("\n🔍 检测到 dbnum 参数: {}", dbnum);
     println!("📊 查询该数据库下的所有 SITE...");
 
     use aios_database::fast_model::query_provider;
-    let sites = query_provider::query_by_type(&["SITE"], dbno as i32, None).await?;
+    let sites = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
     println!("   - 找到 {} 个 SITE", sites.len());
 
     if sites.is_empty() {
@@ -665,7 +665,7 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
         // 拆分模式：每个 SITE 单独导出
         println!("\n📂 拆分模式：每个 SITE 导出为独立文件");
         for (idx, site_refno) in sites.iter().enumerate() {
-            let site_name = get_site_name_for_export(*site_refno, dbno, "glb").await;
+            let site_name = get_site_name_for_export(*site_refno, dbnum, "glb").await;
             let output_file = format!("output/{}", site_name);
             println!(
                 "\n🔄 [{}/{}] 导出 SITE: {} -> {}",
@@ -702,7 +702,7 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
     } else {
         // 默认合并模式：将所有 SITE 合并到一个文件
         println!("\n🔀 合并模式：将所有 SITE 合并到一个文件（默认）");
-        let output_file = format!("output/dbno_{}.glb", dbno);
+        let output_file = format!("output/dbno_{}.glb", dbnum);
         println!(
             "🔄 导出合并文件: {} (包含 {} 个 SITE)",
             output_file,
@@ -749,32 +749,32 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
     // 打印导出参数
     config.print_export_params(&mesh_dir);
 
-    // 全库导出（无 dbno 且无 refnos）
-    if config.run_all_dbnos && config.dbno.is_none() && config.refnos_str.is_empty() {
-        println!("\n🔁 进入全库 GLTF 导出模式 (MDB 所有 dbno)");
+    // 全库导出（无 dbnum 且无 refnos）
+    if config.run_all_dbnos && config.dbnum.is_none() && config.refnos_str.is_empty() {
+        println!("\n🔁 进入全库 GLTF 导出模式 (MDB 所有 dbnum)");
         let dbnos = query_mdb_db_nums(None, DBType::DESI).await?;
         if dbnos.is_empty() {
-            println!("⚠️ MDB 未返回任何 dbno，跳过导出");
+            println!("⚠️ MDB 未返回任何 dbnum，跳过导出");
             return Ok(());
         }
         for db in dbnos {
             let mut per_db_config = config.clone();
-            per_db_config.dbno = Some(db);
+            per_db_config.dbnum = Some(db);
             if let Err(e) = export_gltf_mode_for_db(&per_db_config, db_option_ext).await {
-                println!("❌ 导出 dbno={} 失败: {}", db, e);
+                println!("❌ 导出 dbnum={} 失败: {}", db, e);
             }
         }
         println!("\n🎉 全库 GLTF 导出完成");
         return Ok(());
     }
 
-    // 检查是否指定了 dbno
-    if let Some(dbno) = config.dbno {
-        println!("\n🔍 检测到 dbno 参数: {}", dbno);
+    // 检查是否指定了 dbnum
+    if let Some(dbnum) = config.dbnum {
+        println!("\n🔍 检测到 dbnum 参数: {}", dbnum);
         println!("📊 查询该数据库下的所有 SITE...");
 
         use aios_database::fast_model::query_provider;
-        let sites = query_provider::query_by_type(&["SITE"], dbno as i32, None).await?;
+        let sites = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
         println!("   - 找到 {} 个 SITE", sites.len());
 
         if sites.is_empty() {
@@ -814,7 +814,7 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
 
         let exporter = GltfExporter::new();
         for (idx, site_refno) in sites.iter().enumerate() {
-            let site_name = get_site_name_for_export(*site_refno, dbno, "gltf").await;
+            let site_name = get_site_name_for_export(*site_refno, dbnum, "gltf").await;
             let output_file = format!("output/{}", site_name);
 
             println!(
@@ -930,14 +930,14 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
 
 async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionExt) -> Result<()> {
     let mesh_dir = config.get_mesh_dir(db_option_ext);
-    let dbno = config
-        .dbno
-        .expect("dbno required in export_gltf_mode_for_db");
-    println!("\n🔍 检测到 dbno 参数: {}", dbno);
+    let dbnum = config
+        .dbnum
+        .expect("dbnum required in export_gltf_mode_for_db");
+    println!("\n🔍 检测到 dbnum 参数: {}", dbnum);
     println!("📊 查询该数据库下的所有 SITE...");
 
     use aios_database::fast_model::query_provider;
-    let sites = query_provider::query_by_type(&["SITE"], dbno as i32, None).await?;
+    let sites = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
     println!("   - 找到 {} 个 SITE", sites.len());
 
     if sites.is_empty() {
@@ -974,7 +974,7 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
         // 拆分模式：每个 SITE 单独导出
         println!("\n📂 拆分模式：每个 SITE 导出为独立文件");
         for (idx, site_refno) in sites.iter().enumerate() {
-            let site_name = get_site_name_for_export(*site_refno, dbno, "gltf").await;
+            let site_name = get_site_name_for_export(*site_refno, dbnum, "gltf").await;
             let output_file = format!("output/{}", site_name);
             println!(
                 "\n🔄 [{}/{}] 导出 SITE: {} -> {}",
@@ -1011,7 +1011,7 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
     } else {
         // 默认合并模式：将所有 SITE 合并到一个文件
         println!("\n🔀 合并模式：将所有 SITE 合并到一个文件（默认）");
-        let output_file = format!("output/dbno_{}.gltf", dbno);
+        let output_file = format!("output/dbno_{}.gltf", dbnum);
         println!(
             "🔄 导出合并文件: {} (包含 {} 个 SITE)",
             output_file,
@@ -1072,8 +1072,8 @@ pub async fn get_output_filename_for_refno(refno: RefnoEnum) -> String {
     format!("{}.obj", refno.to_string().replace('/', "_"))
 }
 
-/// 获取 SITE 名称用于导出（带 dbno 前缀）
-pub async fn get_site_name_for_export(refno: RefnoEnum, dbno: u32, extension: &str) -> String {
+/// 获取 SITE 名称用于导出（带 dbnum 前缀）
+pub async fn get_site_name_for_export(refno: RefnoEnum, dbnum: u32, extension: &str) -> String {
     use aios_database::fast_model::query_provider;
 
     // 1. 尝试获取 PE 的 name
@@ -1104,7 +1104,7 @@ pub async fn get_site_name_for_export(refno: RefnoEnum, dbno: u32, extension: &s
         refno.to_string().replace('/', "_")
     };
 
-    format!("{}_{}.{}", dbno, site_name, extension)
+    format!("{}_{}.{}", dbnum, site_name, extension)
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -1257,7 +1257,7 @@ pub async fn export_model_mode(
 
 /// 导出所有 inst_relate 实体（Prepack LOD 格式）
 pub async fn export_all_relates_mode(
-    dbno: Option<u32>,
+    dbnum: Option<u32>,
     verbose: bool,
     output_override: Option<PathBuf>,
     owner_types: Option<Vec<String>>,
@@ -1290,7 +1290,7 @@ pub async fn export_all_relates_mode(
     // 调用导出函数（通过 Deref 访问内部的 DbOption）
     let db_option = Arc::new((**db_option_ext).clone());
     export_all_relates_prepack_lod(
-        dbno,
+        dbnum,
         verbose,
         output_override,
         owner_types,
@@ -1308,7 +1308,7 @@ pub async fn export_all_relates_mode(
 }
 
 pub async fn export_all_parquet_mode(
-    dbno: Option<u32>,
+    dbnum: Option<u32>,
     verbose: bool,
     output_override: Option<PathBuf>,
     owner_types: Option<Vec<String>>,
@@ -1341,7 +1341,7 @@ pub async fn export_all_parquet_mode(
     // 调用导出函数（通过 Deref 访问内部的 DbOption）
     let db_option = Arc::new((**db_option_ext).clone());
     export_all_relates_prepack_lod_parquet(
-        dbno,
+        dbnum,
         verbose,
         output_override,
         owner_types,
@@ -1360,7 +1360,7 @@ pub async fn export_all_parquet_mode(
 
 /// 导出指定 dbnum 的实例数据为简化 JSON 格式（含 AABB）
 pub async fn export_dbnum_instances_json_mode(
-    dbno: u32,
+    dbnum: u32,
     verbose: bool,
     output_override: Option<PathBuf>,
     db_option_ext: &DbOptionExt,
@@ -1382,7 +1382,7 @@ pub async fn export_dbnum_instances_json_mode(
     // 调用导出函数
     let db_option = Arc::new((**db_option_ext).clone());
     let stats = export_dbnum_instances_json(
-        dbno,
+        dbnum,
         &output_dir,
         db_option,
         verbose,
@@ -1439,8 +1439,10 @@ pub fn import_spatial_index_mode(
     // 导入配置：EQUI 粗粒度，BRAN/HANG 细粒度
     let config = ImportConfig::default();
     if verbose {
-        println!("   配置: EQUI 粗粒度={}, BRAN/HANG 细粒度={}",
-                 config.equi_coarse, config.bran_fine);
+        println!(
+            "   配置: EQUI 粗粒度={}, BRAN/HANG 细粒度={}",
+            config.equi_coarse, config.bran_fine
+        );
     }
 
     // 执行导入
@@ -1461,8 +1463,10 @@ pub fn import_spatial_index_mode(
         println!("   查询到 {} 条 AABB 记录", all_aabbs.len());
         if let Some((id, minx, maxx, miny, maxy, minz, maxz)) = all_aabbs.first() {
             let refno = i64_to_refno_str(*id);
-            println!("   示例: refno={}, AABB=[{:.1},{:.1}]x[{:.1},{:.1}]x[{:.1},{:.1}]",
-                     refno, minx, maxx, miny, maxy, minz, maxz);
+            println!(
+                "   示例: refno={}, AABB=[{:.1},{:.1}]x[{:.1},{:.1}]x[{:.1},{:.1}]",
+                refno, minx, maxx, miny, maxy, minz, maxz
+            );
         }
     }
 
@@ -1475,7 +1479,9 @@ pub fn import_spatial_index_mode(
     _sqlite_path: &Path,
     _verbose: bool,
 ) -> Result<()> {
-    Err(anyhow!("sqlite-index 特性未启用，请使用 --features sqlite-index 编译"))
+    Err(anyhow!(
+        "sqlite-index 特性未启用，请使用 --features sqlite-index 编译"
+    ))
 }
 
 // ============ 房间计算 CLI 模式 ============
@@ -1502,7 +1508,7 @@ pub async fn room_compute_mode(
     verbose: bool,
     db_option_ext: &DbOptionExt,
 ) -> Result<()> {
-    use aios_database::fast_model::{build_room_relations, RoomBuildStats};
+    use aios_database::fast_model::{RoomBuildStats, build_room_relations};
     use std::time::Instant;
 
     println!("\n🏠 房间计算模式");
@@ -1511,9 +1517,7 @@ pub async fn room_compute_mode(
     let start_time = Instant::now();
 
     // 获取房间关键词
-    let keywords = room_keywords.unwrap_or_else(|| {
-        db_option_ext.get_room_key_word()
-    });
+    let keywords = room_keywords.unwrap_or_else(|| db_option_ext.get_room_key_word());
     println!("   - 房间关键词: {:?}", keywords);
 
     if let Some(ref nums) = db_nums {
@@ -1568,10 +1572,7 @@ pub async fn room_compute_mode(
 /// 导出房间计算结果为 JSON 格式：
 /// - `room_relations.json`: 房间号 → 构件列表的简单映射
 /// - `room_geometries.json`: 房间 AABB + 面板几何实例
-pub async fn export_room_instances_mode(
-    output_dir: Option<PathBuf>,
-    verbose: bool,
-) -> Result<()> {
+pub async fn export_room_instances_mode(output_dir: Option<PathBuf>, verbose: bool) -> Result<()> {
     use aios_database::fast_model::export_model::export_room_instances::export_room_instances;
 
     println!("\n🏠 导出房间实例数据");

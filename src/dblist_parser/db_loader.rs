@@ -85,7 +85,7 @@ impl DblistLoader {
             "id": element_id.clone(),
             "noun": noun,
             "name": element.attributes.get("DESC").unwrap_or(&String::new()).clone(),
-            "dbno": element.refno.0,
+            "dbnum": element.refno.0,
             "elno": element.refno.1,
         });
 

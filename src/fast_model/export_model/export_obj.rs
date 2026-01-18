@@ -58,14 +58,17 @@ fn merge_export_data_into_mesh(export_data: &ExportData, mesh_dir: &Path) -> Pla
 
     // 辅助函数：合并单个实例
     let mut merge_instance = |geo_hash: &str, transform: &glam::DMat4| {
-        if let Ok(arc_mesh) = mesh_cache.load_or_get(geo_hash, mesh_dir) {
-             let transformed = arc_mesh.as_ref().transform_by(transform);
-             merged_mesh.merge(&transformed);
-        } else {
-            eprintln!(
-                "[export_obj] ⚠️ 加载 mesh {} 失败，跳过实例",
-                geo_hash
-            );
+        match mesh_cache.load_or_get(geo_hash, mesh_dir) {
+            Ok(arc_mesh) => {
+                let transformed = arc_mesh.as_ref().transform_by(transform);
+                merged_mesh.merge(&transformed);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[export_obj] ⚠️ 加载 mesh {} 失败，跳过实例: {}",
+                    geo_hash, e
+                );
+            }
         }
     };
 
@@ -99,13 +102,21 @@ pub async fn prepare_obj_export(
     mesh_dir: &Path,
     config: &CommonExportConfig,
 ) -> Result<PreparedObjExport> {
+    // 统一 mesh_dir：很多调用方传的是 `assets/meshes`，但 GLB 实际存放在 `assets/meshes/lod_L1`。
+    // 导出阶段默认按 L1 读取，避免出现“检查存在但加载找不到文件”的不一致。
+    let default_lod = aios_core::mesh_precision::LodLevel::L1;
+    let effective_mesh_dir = match mesh_dir.file_name().and_then(|n| n.to_str()) {
+        Some(name) if name.starts_with("lod_") => mesh_dir.to_path_buf(),
+        _ => mesh_dir.join(format!("lod_{default_lod:?}")),
+    };
+
     let mut stats = ExportStats::new();
     stats.refno_count = refnos.len();
 
     if config.verbose {
         println!("🔄 开始准备 OBJ 导出数据...");
         println!("   - 参考号数量: {}", refnos.len());
-        println!("   - Mesh 目录: {}", mesh_dir.display());
+        println!("   - Mesh 目录: {}", effective_mesh_dir.display());
         if let Some(ref nouns) = config.filter_nouns {
             println!("   - 类型过滤: {:?}", nouns);
         }
@@ -132,10 +143,13 @@ pub async fn prepare_obj_export(
 
     stats.descendant_count = all_refnos.len().saturating_sub(refnos.len());
 
-    let geom_insts = query_geometry_instances_ext(&all_refnos, true, config.include_negative, config.verbose).await?;
+    let geom_insts =
+        query_geometry_instances_ext(&all_refnos, true, config.include_negative, config.verbose)
+            .await?;
 
     let export_data =
-        collect_export_data(geom_insts, &all_refnos, mesh_dir, config.verbose, None).await?;
+        collect_export_data(geom_insts, &all_refnos, &effective_mesh_dir, config.verbose, None)
+            .await?;
 
     if export_data.total_instances == 0 {
         if config.verbose {
@@ -151,7 +165,7 @@ pub async fn prepare_obj_export(
     stats.mesh_files_missing = export_data.failed_count;
     stats.geometry_count = export_data.total_instances;
 
-    let merged_mesh = merge_export_data_into_mesh(&export_data, mesh_dir);
+    let merged_mesh = merge_export_data_into_mesh(&export_data, &effective_mesh_dir);
 
     Ok(PreparedObjExport {
         mesh: merged_mesh,

@@ -25,7 +25,7 @@ pub struct AdminData {
     pub name: String,
     pub s_type: String,
     pub db_type: String,
-    pub db_no: i32,
+    pub dbnum: i32,
     pub claim: String,
     pub desc: String,
 }
@@ -77,7 +77,7 @@ pub async fn sync_system_db(mgr: &AiosDBManager) -> anyhow::Result<()> {
                 name: name[1..].to_string(),
                 s_type: stype,
                 db_type: "MASTER".to_string(),
-                db_no: numbdb,
+                dbnum: numbdb,
                 claim,
                 desc: desc.to_string(),
             })

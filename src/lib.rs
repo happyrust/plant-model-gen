@@ -28,7 +28,7 @@ use crate::fast_model::{
 };
 use crate::versioned_db::database::*;
 
-use aios_core::init_inst_relate_indices;
+use aios_core::init_model_tables;
 use aios_core::options::DbOption;
 use aios_core::pdms_data::AttInfoMap;
 use aios_core::pdms_types::*;
@@ -192,7 +192,7 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
     log::info!("预加载方法完成。");
 
     // 初始化数据库索引
-    if let Err(e) = init_inst_relate_indices().await {
+    if let Err(e) = init_model_tables().await {
         log::error!("初始化inst_relate索引失败: {}", e);
     }
 

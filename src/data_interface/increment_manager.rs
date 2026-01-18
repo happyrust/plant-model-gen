@@ -48,7 +48,7 @@ pub struct IncrementInfo {
     /// 元素的引用编号
     pub refno: RefU64,
     /// 数据库编号
-    pub db_no: i32,
+    pub dbnum: i32,
     /// 元素的属性映射
     pub attr: NamedAttrMap,
     /// 子元素的引用编号列表
@@ -330,31 +330,31 @@ impl AiosDBManager {
                 let DbBasicInfo {
                     db_type,
                     ses_pgno,
-                    db_no,
+                    dbnum: dbnum,
                 } = parse_db_basic_info(path.to_path_buf());
                 //是否调试里有筛选
-                if !manual_dbnums.is_empty() && !manual_dbnums.contains(&db_no) {
+                if !manual_dbnums.is_empty() && !manual_dbnums.contains(&dbnum) {
                     continue;
                 }
                 //过滤掉排除的数据库编号
-                if !exclude_dbnums.is_empty() && exclude_dbnums.contains(&db_no) {
+                if !exclude_dbnums.is_empty() && exclude_dbnums.contains(&dbnum) {
                     continue;
                 }
                 let project = get_db_option().project_name.clone();
                 let file_latest_sesno = PdmsIO::new(&project, path.to_path_buf(), true)
                     .get_latest_sesno()
                     .unwrap_or_default();
-                // dbg!((db_no, file_latest_sesno));
+                // dbg!((dbnum, file_latest_sesno));
 
                 if !CHECK_DB_TYPES.contains(&db_type.as_str()) {
                     continue;
                 }
                 //TODO 这种情况，需要全新的解析
-                let Ok(db_latest_sesno) = Self::query_latest_sesno_by_dbnum(db_no).await else {
+                let Ok(db_latest_sesno) = Self::query_latest_sesno_by_dbnum(dbnum).await else {
                     //先暂时跳过数据库里没有的文件，todo 考虑自动追加文件全新解析
                     continue;
                 };
-                // dbg!((db_no, db_latest_sesno));
+                // dbg!((dbnum, db_latest_sesno));
                 if db_latest_sesno == 0 {
                     continue;
                 }
@@ -381,7 +381,7 @@ impl AiosDBManager {
                 // if db_latest_sesno != 0
                 {
                     // #[cfg(feature = "debug_parse")]
-                    // dbg!((db_no, db_latest_sesno));
+                    // dbg!((dbnum, db_latest_sesno));
                     //暂时先跳过更新比较大的
                     //
                     {
@@ -530,11 +530,11 @@ impl AiosDBManager {
                                     }
                                 };
 
-                                let dbno = new_header.pdms_header.db_num as u32;
+                                let dbnum = new_header.pdms_header.db_num as u32;
 
                                 // 如果配置了 location_dbs，则只对本地区负责的 dbnum 发送通知
                                 if let Some(location_dbs) = &get_db_option().location_dbs {
-                                    if !location_dbs.contains(&dbno) {
+                                    if !location_dbs.contains(&dbnum) {
                                         continue;
                                     }
                                 }
@@ -608,7 +608,7 @@ impl AiosDBManager {
                                 //执行没问题了，再更新当前的版本记录，headers直接存本地json
                                 for (path, new_header) in new_headers {
                                     let file_name = path.file_stem().unwrap().to_str().unwrap();
-                                    let dbno = new_header.pdms_header.db_num as u32;
+                                    let dbnum = new_header.pdms_header.db_num as u32;
                                     if path.is_dir() {
                                         continue;
                                     }
@@ -667,7 +667,7 @@ impl AiosDBManager {
                                         //说明是所有地区都推送，跳过检查
                                         //必须要是地区对应的dbnos才能推送
                                         if let Some(location_dbs) = &get_db_option().location_dbs {
-                                            if !location_dbs.contains(&dbno) {
+                                            if !location_dbs.contains(&dbnum) {
                                                 continue;
                                             }
                                         }

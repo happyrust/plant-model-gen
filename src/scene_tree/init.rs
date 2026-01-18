@@ -25,7 +25,7 @@ struct SceneNodeData {
     parent: Option<i64>,
     has_geo: bool,
     is_leaf: bool,
-    dbno: i16,
+    dbnum: i16,
     geo_type: Option<String>,  // 几何类型：Pos, Neg, CataNeg, CataCrossNeg 等
 }
 
@@ -113,10 +113,10 @@ pub async fn init_scene_tree_from_root(
         root_refno, node_count, relation_count, duration_ms
     );
 
-    // 6. 导出 Parquet 文件（使用 root 的 dbno）
-    let dbno = root_refno.refno().get_0();
+    // 6. 导出 Parquet 文件（使用 root 的 dbnum）
+    let dbnum = root_refno.refno().get_0();
     let output_dir = std::path::Path::new("output/scene_tree");
-    if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbno, output_dir).await {
+    if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbnum, output_dir).await {
         eprintln!("[scene_tree] Parquet 导出失败: {}", e);
     }
 
@@ -127,22 +127,22 @@ pub async fn init_scene_tree_from_root(
     })
 }
 
-/// 初始化 Scene Tree（按 dbno，WORLD 固定为 `${dbno}_0`）
+/// 初始化 Scene Tree（按 dbnum，WORLD 固定为 `${dbnum}_0`）
 ///
 /// 适用场景：
-/// - 测试/工具按 dbno 初始化
-/// - 数据库里缺失 MDB name→dbno 映射时仍可构建
-pub async fn init_scene_tree_by_dbno(dbno: u32, force_rebuild: bool) -> Result<SceneTreeInitResult> {
+/// - 测试/工具按 dbnum 初始化
+/// - 数据库里缺失 MDB name→dbnum 映射时仍可构建
+pub async fn init_scene_tree_by_dbno(dbnum: u32, force_rebuild: bool) -> Result<SceneTreeInitResult> {
     let start = std::time::Instant::now();
 
     super::schema::init_schema().await?;
 
     if force_rebuild {
-        cleanup_scene_tree_by_dbno(dbno).await?;
+        cleanup_scene_tree_by_dbno(dbnum).await?;
     }
 
-    let world_refno = RefnoEnum::from(RefU64((dbno as u64) << 32));
-    println!("[scene_tree] 从 WORLD {} 开始构建 (dbno={})", world_refno, dbno);
+    let world_refno = RefnoEnum::from(RefU64((dbnum as u64) << 32));
+    println!("[scene_tree] 从 WORLD {} 开始构建 (dbnum={})", world_refno, dbnum);
 
     let (nodes, relations) = build_tree_from_world(world_refno).await?;
     let node_count = nodes.len();
@@ -153,13 +153,13 @@ pub async fn init_scene_tree_by_dbno(dbno: u32, force_rebuild: bool) -> Result<S
 
     let duration_ms = start.elapsed().as_millis();
     println!(
-        "[scene_tree] 初始化完成(dbno={}): {} 节点, {} 关系, {} ms",
-        dbno, node_count, relation_count, duration_ms
+        "[scene_tree] 初始化完成(dbnum={}): {} 节点, {} 关系, {} ms",
+        dbnum, node_count, relation_count, duration_ms
     );
 
     // 6. 导出 Parquet 文件
     let output_dir = std::path::Path::new("output/scene_tree");
-    if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbno, output_dir).await {
+    if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbnum, output_dir).await {
         eprintln!("[scene_tree] Parquet 导出失败: {}", e);
     }
 
@@ -181,16 +181,16 @@ DELETE scene_node;
     Ok(())
 }
 
-/// 仅清理指定 dbno 的 scene_tree 数据（用于按库重建/测试）
-async fn cleanup_scene_tree_by_dbno(dbno: u32) -> Result<()> {
+/// 仅清理指定 dbnum 的 scene_tree 数据（用于按库重建/测试）
+async fn cleanup_scene_tree_by_dbno(dbnum: u32) -> Result<()> {
     let sql = format!(
         r#"
-DELETE contains WHERE in.dbno = {dbno} OR out.dbno = {dbno};
-DELETE scene_node WHERE dbno = {dbno};
+DELETE contains WHERE in.dbnum = {dbnum} OR out.dbnum = {dbnum};
+DELETE scene_node WHERE dbnum = {dbnum};
 "#
     );
     SUL_DB.query_response(&sql).await?;
-    println!("[scene_tree] 已清理 dbno={} 的 scene_node/contains 数据", dbno);
+    println!("[scene_tree] 已清理 dbnum={} 的 scene_node/contains 数据", dbnum);
     Ok(())
 }
 
@@ -208,7 +208,7 @@ async fn build_tree_from_world(
         // 1. 获取节点信息
         let ele_nodes = aios_core::get_children_ele_nodes(refno).await?;
         let refno_i64 = refno.refno().0 as i64;
-        let dbno = refno.refno().get_0() as i16;
+        let dbnum = refno.refno().get_0() as i16;
 
         // 2. 获取当前节点的 noun
         let noun = get_noun_by_refno(refno).await.unwrap_or_default();
@@ -228,7 +228,7 @@ async fn build_tree_from_world(
             parent: parent_id,
             has_geo,
             is_leaf,
-            dbno,
+            dbnum,
             geo_type,
         });
 
@@ -282,8 +282,8 @@ async fn batch_insert_nodes(nodes: &[SceneNodeData]) -> Result<()> {
                 None => "NONE".to_string(),
             };
             sql.push_str(&format!(
-                "INSERT INTO scene_node {{ id: scene_node:{}, parent: {}, has_geo: {}, is_leaf: {}, generated: false, dbno: {}, geo_type: {} }};",
-                node.id, parent_str, node.has_geo, node.is_leaf, node.dbno, geo_type_str
+                "INSERT INTO scene_node {{ id: scene_node:{}, parent: {}, has_geo: {}, is_leaf: {}, generated: false, dbnum: {}, geo_type: {} }};",
+                node.id, parent_str, node.has_geo, node.is_leaf, node.dbnum, geo_type_str
             ));
         }
         if !sql.is_empty() {

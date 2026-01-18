@@ -1,7 +1,7 @@
 //! PE 数据 Parquet Writer
 //!
 //! 将 SPdmsElement 数据写入 Parquet 格式
-//! 文件组织结构：output/database_models/{dbno}/pe.parquet
+//! 文件组织结构：output/database_models/{dbnum}/pe.parquet
 
 use anyhow::Result;
 use chrono::Utc;
@@ -58,19 +58,19 @@ impl PeParquetManager {
         }
     }
 
-    /// 获取 dbno 的文件夹路径
-    fn get_dbno_dir(&self, dbno: u32) -> PathBuf {
-        self.base_dir.join("database_models").join(dbno.to_string())
+    /// 获取 dbnum 的文件夹路径
+    fn get_dbno_dir(&self, dbnum: u32) -> PathBuf {
+        self.base_dir.join("database_models").join(dbnum.to_string())
     }
 
     /// 获取 PE 主文件路径
-    fn get_pe_main_path(&self, dbno: u32) -> PathBuf {
-        self.get_dbno_dir(dbno).join("pe.parquet")
+    fn get_pe_main_path(&self, dbnum: u32) -> PathBuf {
+        self.get_dbno_dir(dbnum).join("pe.parquet")
     }
 
     /// 获取 PE 增量文件路径
-    fn get_pe_incremental_path(&self, dbno: u32, timestamp: &str) -> PathBuf {
-        self.get_dbno_dir(dbno).join(format!("pe_{}.parquet", timestamp))
+    fn get_pe_incremental_path(&self, dbnum: u32, timestamp: &str) -> PathBuf {
+        self.get_dbno_dir(dbnum).join(format!("pe_{}.parquet", timestamp))
     }
 
     /// 生成当前时间戳
@@ -79,7 +79,7 @@ impl PeParquetManager {
     }
 
     /// 写入增量 PE Parquet 文件
-    pub fn write_incremental(&self, pes: &[SPdmsElement], dbno: u32) -> Result<PathBuf> {
+    pub fn write_incremental(&self, pes: &[SPdmsElement], dbnum: u32) -> Result<PathBuf> {
         if pes.is_empty() {
             return Ok(PathBuf::new());
         }
@@ -88,7 +88,7 @@ impl PeParquetManager {
         let df = self.create_pe_dataframe(rows)?;
 
         let timestamp = self.get_timestamp();
-        let path = self.get_pe_incremental_path(dbno, &timestamp);
+        let path = self.get_pe_incremental_path(dbnum, &timestamp);
 
         // 确保目录存在
         if let Some(parent) = path.parent() {
@@ -136,21 +136,21 @@ impl PeParquetManager {
     }
 
     /// 合并增量文件到主文件
-    pub fn compact(&self, dbno: u32) -> Result<Option<PathBuf>> {
-        let dbno_dir = self.get_dbno_dir(dbno);
+    pub fn compact(&self, dbnum: u32) -> Result<Option<PathBuf>> {
+        let dbno_dir = self.get_dbno_dir(dbnum);
         if !dbno_dir.exists() {
             return Ok(None);
         }
 
         // 列出所有增量文件
-        let incremental_files = self.list_incremental_files(dbno)?;
+        let incremental_files = self.list_incremental_files(dbnum)?;
         if incremental_files.is_empty() {
             return Ok(None);
         }
 
         println!("🔄 [PE] 开始合并 {} 个增量文件...", incremental_files.len());
 
-        let main_file = self.get_pe_main_path(dbno);
+        let main_file = self.get_pe_main_path(dbnum);
         let mut frames = Vec::new();
 
         // 读取主文件（如果存在）
@@ -202,8 +202,8 @@ impl PeParquetManager {
     }
 
     /// 列出增量文件（不包括主文件）
-    fn list_incremental_files(&self, dbno: u32) -> Result<Vec<PathBuf>> {
-        let dbno_dir = self.get_dbno_dir(dbno);
+    fn list_incremental_files(&self, dbnum: u32) -> Result<Vec<PathBuf>> {
+        let dbno_dir = self.get_dbno_dir(dbnum);
         if !dbno_dir.exists() {
             return Ok(Vec::new());
         }

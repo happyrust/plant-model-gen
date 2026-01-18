@@ -202,7 +202,12 @@ async fn query_panel_geometries(panel_refnos: &[RefnoEnum]) -> Result<Vec<PanelG
         SELECT
             in as refno,
             out.insts[0].geo_hash as geo_hash,
-            out.world_trans.d as world_trans,
+            (
+                SELECT VALUE world_trans.d
+                FROM pe_transform
+                WHERE id = type::record('pe_transform', record::id(in))
+                LIMIT 1
+            )[0] as world_trans,
             (SELECT out.d FROM in->inst_relate_aabb)[0] as world_aabb
         FROM inst_relate
         WHERE in IN [{}]

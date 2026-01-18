@@ -28,36 +28,48 @@ pub struct TransformResponse {
 /// 查询元素的变换矩阵和 owner
 async fn get_transform(Path(refno): Path<RefnoEnum>) -> Result<Json<TransformResponse>, StatusCode> {
     let refno_str = refno.to_string();
-    let inst_relate_key = format!("inst_relate:⟨{}⟩", refno_str);
+    let pe_transform_key = refno.to_pe_key().replace("pe:", "pe_transform:");
 
-    // 查询 inst_relate 获取 world_trans 和 owner
+    // 查询 pe_transform 获取 world_trans
     let sql = format!(
         r#"
         SELECT 
-            world_trans.d as world_trans,
-            record::id(in.owner ?? in) as owner
+            world_trans.d as world_trans
         FROM {}
         WHERE world_trans != none
         "#,
-        inst_relate_key
+        pe_transform_key
     );
 
     #[derive(Deserialize, SurrealValue)]
-    struct QueryResult {
+    struct TransformQueryResult {
         world_trans: Option<serde_json::Value>,
-        owner: Option<String>,
     }
 
-    match SUL_DB.query_take::<Option<QueryResult>>(&sql, 0).await {
+    match SUL_DB.query_take::<Option<TransformQueryResult>>(&sql, 0).await {
         Ok(Some(result)) => {
             // 解析变换矩阵
             let world_transform = parse_transform_matrix(result.world_trans);
+            let owner_sql = format!(
+                "SELECT record::id(owner ?? id) as owner FROM {}",
+                refno.to_pe_key()
+            );
+
+            #[derive(Deserialize, SurrealValue)]
+            struct OwnerQueryResult {
+                owner: Option<String>,
+            }
+
+            let owner = match SUL_DB.query_take::<Option<OwnerQueryResult>>(&owner_sql, 0).await {
+                Ok(Some(result)) => result.owner,
+                _ => None,
+            };
 
             Ok(Json(TransformResponse {
                 success: true,
                 refno: refno_str,
                 world_transform,
-                owner: result.owner,
+                owner,
                 error_message: None,
             }))
         }

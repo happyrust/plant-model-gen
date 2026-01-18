@@ -41,7 +41,7 @@ use super::models::DbModelInstRefnos;
 /// 按数据库编号生成几何体数据
 ///
 /// # 参数
-/// * `dbno` - 数据库编号
+/// * `dbnum` - 数据库编号
 /// * `db_option_arc` - 数据库配置（Arc 包装）
 /// * `sender` - 几何体数据发送通道
 /// * `target_sesno` - 目标会话号（用于历史查询）
@@ -49,7 +49,7 @@ use super::models::DbModelInstRefnos;
 /// # 返回
 /// 返回分类后的模型实例引用号集合
 pub async fn gen_geos_data_by_dbnum(
-    dbno: u32,
+    dbnum: u32,
     db_option_arc: Arc<DbOptionExt>,
     sender: flume::Sender<ShapeInstancesData>,
     target_sesno: Option<u32>,
@@ -59,12 +59,12 @@ pub async fn gen_geos_data_by_dbnum(
     // 判断有空的层级，不用去生成
     let zones = if let Some(sesno) = target_sesno {
         // 使用历史查询
-        query_by_type(&["ZONE"], dbno as i32, Some(true))
+        query_by_type(&["ZONE"], dbnum as i32, Some(true))
             .await
             .unwrap_or_default()
     } else {
         // 使用当前数据查询
-        query_by_type(&["ZONE"], dbno as i32, Some(true))
+        query_by_type(&["ZONE"], dbnum as i32, Some(true))
             .await
             .unwrap_or_default()
     };
@@ -83,7 +83,7 @@ pub async fn gen_geos_data_by_dbnum(
     let loop_sjus_map = DashMap::new();
     {
         // 查找到子节点的所有 PLOO 类型
-        let target_ploo_refnos = query_by_type(&["PLOO"], dbno as i32, Some(true))
+        let target_ploo_refnos = query_by_type(&["PLOO"], dbnum as i32, Some(true))
             .await
             .unwrap_or_default();
         #[cfg(debug_assertions)]
@@ -114,7 +114,7 @@ pub async fn gen_geos_data_by_dbnum(
     // Step 2、按类目先逐个分好类的参考号集合
     // 2.1 管道或者支吊架的分类
     let target_bran_hanger_refnos =
-        Arc::new(query_by_type(&["BRAN", "HANG"], dbno as i32, None).await?);
+        Arc::new(query_by_type(&["BRAN", "HANG"], dbnum as i32, None).await?);
 
     // 打印管道/支吊架的使用数量
     if !target_bran_hanger_refnos.is_empty() && gen_cata_flag && gen_model {
@@ -167,7 +167,7 @@ pub async fn gen_geos_data_by_dbnum(
     }
     let mut use_cate_refnos = vec![];
     for cate_names in USE_CATE_NOUN_NAMES.chunks(4) {
-        let refnos = query_by_type(cate_names, dbno as i32, None).await?;
+        let refnos = query_by_type(cate_names, dbnum as i32, None).await?;
         if refnos.is_empty() {
             continue;
         }
@@ -205,7 +205,7 @@ pub async fn gen_geos_data_by_dbnum(
     }
 
     let target_loop_owner_refnos = Arc::new(
-        query_by_type(&GNERAL_LOOP_OWNER_NOUN_NAMES, dbno as i32, Some(true))
+        query_by_type(&GNERAL_LOOP_OWNER_NOUN_NAMES, dbnum as i32, Some(true))
             .await
             .unwrap_or_default(),
     );
@@ -225,7 +225,7 @@ pub async fn gen_geos_data_by_dbnum(
     }
 
     let target_prim_refnos = Arc::new(
-        query_by_type(&GNERAL_PRIM_NOUN_NAMES, dbno as i32, None)
+        query_by_type(&GNERAL_PRIM_NOUN_NAMES, dbnum as i32, None)
             .await
             .unwrap_or_default(),
     );
@@ -579,7 +579,7 @@ async fn process_gen_geos_data_chunks(
 /// 生成几何体数据（非 Full Noun 模式）
 ///
 /// # 参数
-/// * `dbno` - 可选的数据库编号
+/// * `dbnum` - 可选的数据库编号
 /// * `manual_refnos` - 手动指定的引用号列表
 /// * `db_option` - 数据库选项
 /// * `incr_updates` - 增量更新日志
@@ -594,9 +594,9 @@ async fn process_gen_geos_data_chunks(
 /// - 增量更新模式（`incr_updates` 不为空）
 /// - 手动 refno 模式（`manual_refnos` 不为空）
 /// - 调试模式（`db_option.debug_model_refnos` 有值）
-/// - 按数据库编号的全量生成（`dbno` 有值）
+/// - 按数据库编号的全量生成（`dbnum` 有值）
 pub async fn gen_geos_data(
-    dbno: Option<u32>,
+    dbnum: Option<u32>,
     manual_refnos: Vec<RefnoEnum>,
     db_option: &DbOptionExt,
     incr_updates: Option<IncrGeoUpdateLog>,
@@ -675,13 +675,6 @@ pub async fn gen_geos_data(
         for refno in &target_root_refnos {
             match aios_core::get_pe(*refno).await {
                 Ok(Some(pe)) => {
-                    debug_model_debug!("========== 目标节点详细信息 ==========");
-                    debug_model_debug!("refno: {}", refno);
-                    debug_model_debug!("noun: {}", pe.noun);
-                    debug_model_debug!("name: {}", pe.name);
-                    debug_model_debug!("cata_hash: {}", pe.cata_hash);
-                    debug_model_debug!("owner: {:?}", pe.owner);
-
                     // 查询元件库关系
                     match aios_core::get_named_attmap(*refno).await {
                         Ok(att_map) => {
@@ -758,20 +751,20 @@ pub async fn gen_geos_data(
                 }
             }
         }
-    } else if dbno.is_some() {
+    } else if dbnum.is_some() {
         // 检查是否需要进行历史查询
         if let Some(sesno) = target_sesno {
             println!(
                 "使用历史查询，目标会话号: {} (注意：当前使用当前数据替代)",
                 sesno
             );
-            target_root_refnos = query_by_type(&["SITE"], dbno.unwrap() as i32, Some(true))
+            target_root_refnos = query_by_type(&["SITE"], dbnum.unwrap() as i32, Some(true))
                 .await?
                 .into_iter()
                 .collect();
         } else {
             // 使用当前数据查询
-            target_root_refnos = query_by_type(&["SITE"], dbno.unwrap() as i32, Some(true))
+            target_root_refnos = query_by_type(&["SITE"], dbnum.unwrap() as i32, Some(true))
                 .await?
                 .into_iter()
                 .collect();
@@ -792,8 +785,8 @@ pub async fn gen_geos_data(
     )
     .await?;
 
-    if dbno.is_some() {
-        println!("数据库号： {} 生成instances完毕。", dbno.unwrap());
+    if dbnum.is_some() {
+        println!("数据库号： {} 生成instances完毕。", dbnum.unwrap());
     }
 
     Ok(target_root_refnos)

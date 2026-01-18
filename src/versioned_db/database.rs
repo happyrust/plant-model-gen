@@ -33,7 +33,7 @@ use sqlx::{Connection, MySql, MySqlPool, Pool};
 #[cfg(feature = "sql")]
 use sqlx::{Error, Executor};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
 use std::io::Read;
@@ -53,6 +53,8 @@ use crate::data_interface::tidb_manager::AiosDBManager;
 // use crate::graph_db::pdms_arango::*;
 use crate::tables::*;
 use crate::versioned_db::pe::*;
+use crate::versioned_db::db_meta_info;
+use crate::versioned_db::tree_export::{export_tree_file, is_geo_noun_hash, TreeNodeMeta};
 
 pub enum SenderJsonsData {
     PEJson(Vec<String>),
@@ -269,6 +271,10 @@ where
             {
                 Ok(_) => {
                     info!("同步UDA和SYS数据成功。");
+                    // SYST 解析完成后预加载 UDA 名称缓存
+                    if let Err(e) = parse_pdms_db::parse::preload_uda_name_cache().await {
+                        warn!("预加载 UDA 名称缓存失败: {}", e);
+                    }
                 }
                 Err(e) => {
                     info!("{}", e.to_string());
@@ -322,7 +328,6 @@ where
 }
 
 /// 初始化同步pdms数据到数据
-/// , progress_sender: Sender<i32>
 pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
     if db_option.included_projects.is_empty() {
         return Err(anyhow::anyhow!("没有包含的项目"));
@@ -406,6 +411,10 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
                 Ok(_) => {
                     // 同步数据成功
                     info!("同步UDA和SYS数据成功。");
+                    // SYST 解析完成后预加载 UDA 名称缓存
+                    if let Err(e) = parse_pdms_db::parse::preload_uda_name_cache().await {
+                        warn!("预加载 UDA 名称缓存失败: {}", e);
+                    }
                 }
                 Err(e) => {
                     // 同步数据失败，打印错误信息
@@ -417,7 +426,7 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
         if db_option.only_sync_sys {
             continue;
         }
-        // 第二次调用使用新的 dbno_set，避免被第一次调用的 db_no 过滤
+        // 第二次调用使用新的 dbno_set，避免被第一次调用的 dbnum 过滤
         let cur_dbno_set = Arc::new(DashSet::new());
         match sync_total_async_threaded(
             &db_option,
@@ -538,10 +547,10 @@ pub async fn execute_sql(conn: &Pool<MySql>, sql: &str) -> bool {
 }
 
 #[cfg(feature = "surreal-save")]
-pub async fn check_and_clear_db(db_no: u32) -> anyhow::Result<()> {
+pub async fn check_and_clear_db(dbnum: u32) -> anyhow::Result<()> {
     let sql = format!(
         "SELECT value id FROM only pe WHERE dbnum = {} limit 1",
-        db_no
+        dbnum
     );
     let mut response = SUL_DB.query(&sql).await.expect("check db exists failed");
     use serde_json::Value as JsonValue;
@@ -549,11 +558,11 @@ pub async fn check_and_clear_db(db_no: u32) -> anyhow::Result<()> {
     if !records.is_empty() {
         info!(
             "Database with dbnum {} already exists in pe table. Will override with new data.",
-            db_no
+            dbnum
         );
-        info!("开始删除已有的dbnum {db_no} 的数据");
-        let sql = format!("delete array::flatten(select value ->pe_owner from pe where dbnum = {db_no});
-                                    delete array::flatten(select value [refno, id] from pe where dbnum = {db_no});
+        info!("开始删除已有的dbnum {dbnum} 的数据");
+        let sql = format!("delete array::flatten(select value ->pe_owner from pe where dbnum = {dbnum});
+                                    delete array::flatten(select value [refno, id] from pe where dbnum = {dbnum});
                                     ");
         SUL_DB.query(&sql).await.expect("clear db failed");
     }
@@ -815,8 +824,12 @@ where
     // 与非回调版本保持一致的控制参数
     let db_types_clone = db_types.iter().map(|&x| x.to_string()).collect::<Vec<_>>();
     let is_parse_sys = db_types_clone.contains(&"SYST".to_string());
+    let gen_tree_only = db_option.gen_tree_only;
     #[cfg(feature = "surreal-save")]
-    let is_save_db = db_option.is_save_db();
+    let is_save_db = db_option.is_save_db()
+        // gen_tree_only 仅用于 total_sync 全量解析时“只生成 tree”的场景；
+        // 其它情况下（尤其是模型生成）不应影响写库。
+        && !(gen_tree_only && db_option.total_sync);
     #[cfg(not(feature = "surreal-save"))]
     let is_save_db = false;
     let is_sync_history = db_option.is_sync_history();
@@ -858,16 +871,16 @@ where
         let dbno_set = cur_dbno_set.clone();
         let mut time = Instant::now();
 
-        // 读取文件头，判定 db_type / db_no
+        // 读取文件头，判定 db_type / dbnum
         let mut file = File::open(&path).await.unwrap();
         let mut buf = vec![0u8; 60];
         file.read_exact(&mut buf).await.unwrap();
         let db_basic_info = parse_file_basic_info(&buf);
         let db_type = db_basic_info.db_type;
-        let db_no = db_basic_info.db_no;
+        let dbnum = db_basic_info.dbnum;
 
         if is_replace {
-            check_and_clear_db(db_no).await.unwrap();
+            check_and_clear_db(dbnum).await.unwrap();
         }
         // 类型过滤
         if !db_types_clone.contains(&db_type) {
@@ -886,7 +899,7 @@ where
             continue;
         }
         // 避免重复
-        if dbno_set.contains(&db_no) {
+        if dbno_set.contains(&dbnum) {
             if let Some(cb) = progress_callback.as_mut() {
                 cb(
                     project.as_str(),
@@ -900,7 +913,7 @@ where
             }
             continue;
         }
-        dbno_set.insert(db_no);
+        dbno_set.insert(dbnum);
 
         // 读取 sesno、存储 refno->sesno map
         let mut ses_range_map = BTreeMap::new();
@@ -977,6 +990,7 @@ where
             }
         }
         let debug_refnos = Arc::new(debug_refnos);
+        let mut tree_nodes: HashMap<RefU64, TreeNodeMeta> = HashMap::new();
 
         let mut total_cnt = 0;
         for (chunk_index, chunk) in all_refnos.chunks(chunk_size).enumerate() {
@@ -1002,17 +1016,31 @@ where
                 Ok(PdmsDbData {
                     total_attr_map,
                     type_ele_map,
-                    db_no,
+                    dbnum: dbnum,
                     ..
                 }) => {
                     let total_attr_map_arc = Arc::new(total_attr_map);
                     total_cnt += total_attr_map_arc.len();
+                    for entry in total_attr_map_arc.iter() {
+                        let refno = *entry.key();
+                        let att = entry.value();
+                        let noun = att.get_type_hash();
+                        let owner = att.get_owner().refno();
+                        let has_geo = is_geo_noun_hash(noun);
+                        tree_nodes.entry(refno).or_insert(TreeNodeMeta {
+                            refno,
+                            owner,
+                            noun,
+                            has_geo,
+                            is_leaf: false,
+                        });
+                    }
                     let should_save = !is_debug && is_save_db;
                     if should_save {
                         save_pes(
                             &db_basic_clone,
                             &total_attr_map_arc,
-                            db_no as i32,
+                            dbnum as i32,
                             &file_name_clone,
                             &db_type,
                             &db_option_clone,
@@ -1066,9 +1094,22 @@ where
                                             uda_json_vec,
                                         )))
                                         .expect("send attmap sql failed");
-                                }
-                            }
-                        }
+                }
+            }
+        }
+
+        for (refno, meta) in tree_nodes.iter_mut() {
+            let is_leaf = match db_basic.children_map.get(refno) {
+                Some(children) => children.is_empty(),
+                None => true,
+            };
+            meta.is_leaf = is_leaf;
+        }
+        if let Err(e) =
+            export_tree_file(dbnum, db_basic.as_ref(), &tree_nodes, Path::new("output/scene_tree"))
+        {
+            warn!("[tree_export] dbnum={} 导出失败: {}", dbnum, e);
+        }
                     }
                 }
                 Err(e) => {
@@ -1366,8 +1407,11 @@ pub async fn sync_total_async_threaded(
         .map(|&x| x.to_string())
         .collect::<Vec<_>>();
     let is_parse_sys = db_types_clone.contains(&"SYST".to_string());
+    let gen_tree_only = db_option.gen_tree_only;
     #[cfg(feature = "surreal-save")]
-    let is_save_db = db_option.is_save_db();
+    let is_save_db = db_option.is_save_db()
+        // 同上：只在 total_sync 场景下让 gen_tree_only 生效。
+        && !(gen_tree_only && db_option.total_sync);
     #[cfg(not(feature = "surreal-save"))]
     let is_save_db = false;
     let is_sync_history = db_option.is_sync_history();
@@ -1415,10 +1459,10 @@ pub async fn sync_total_async_threaded(
                 let db_basic_info = parse_file_basic_info(&buf);
                 let db_type = db_basic_info.db_type;
               
-                let db_no = db_basic_info.db_no;
+                let dbnum = db_basic_info.dbnum;
                 //需要检查pe里是否有这个dbno，如果有，则需要改成使用upsert
                 if is_replace {
-                    check_and_clear_db(db_no).await.unwrap();
+                    check_and_clear_db(dbnum).await.unwrap();
                 }
                 //如果不是全部解析，需要检查类型，全部解析一定要解析syst等配置文件数据库
                 if !db_types_clone.contains(&db_type) {
@@ -1426,15 +1470,16 @@ pub async fn sync_total_async_threaded(
                 }
                 println!("db_type is {db_type}");
                 //保证不重复加载相同dbno的数据
-                if dbno_set.contains(&db_no) {
+                if dbno_set.contains(&dbnum) {
                     continue;
                 }
-                // dbg!(db_no);
-                dbno_set.insert(db_no);
-                // 如果需要解析的文件列表为空或包含当前文件名，则执行以下代码块
+                // dbg!(dbnum);
+                dbno_set.insert(dbnum);
+                // 如果需要解析的文件列表为空或包含当前文件名,则执行以下代码块
                 info!("path={:?}", &file_name); // 打印文件路径
                 let mut ses_range_map = BTreeMap::new();
                 let mut sesno = 0;
+                let mut sesno_timestamp: Option<i64> = None;
                 // let mut dt = Local::now().naive_local();
                 {
                     let mut io = PdmsIO::new(&project, path.clone(), true);
@@ -1444,11 +1489,13 @@ pub async fn sync_total_async_threaded(
                         //获取最新sesno
                         sesno = io.get_latest_sesno().unwrap_or_default();
                         if sesno > 0 {
+                            // 获取 sesno 对应的时间戳
+                            sesno_timestamp = io.get_sesno_timestamp(sesno).ok();
                             // let sql = format!(
                             //     "
                             //     DELETE db_file_info:{0};
                             //     INSERT INTO db_file_info (id, db_type, sesno, dbnum, dt) VALUES ('{0}', '{1}', {2}, {3}, '{4}');",
-                            //     &file_name, db_type, sesno, db_no, dt.and_utc().to_rfc3339()
+                            //     &file_name, db_type, sesno, dbnum, dt.and_utc().to_rfc3339()
                             // );
                             // SUL_DB.query(&sql).await.expect("save db_info failed");
                             // if sync_versioned {
@@ -1492,6 +1539,7 @@ pub async fn sync_total_async_threaded(
                     }
                 }
                 let debug_refnos = Arc::new(debug_refnos);
+                let mut tree_nodes: HashMap<RefU64, TreeNodeMeta> = HashMap::new();
                 //按照SITE划分？
                 let mut total_cnt = 0;
                 for (chunk_index, chunk) in all_refnos.chunks(chunk_size).enumerate() {
@@ -1516,20 +1564,34 @@ pub async fn sync_total_async_threaded(
                         Ok(PdmsDbData {
                             total_attr_map,
                             type_ele_map,
-                            db_no,
+                            dbnum: dbnum,
                             ..
                         }) => {
                             //类型暂时不多线程
                             let total_attr_map_arc = Arc::new(total_attr_map);
                             total_cnt += total_attr_map_arc.len();
-                            //开始执行保存数据
-                            info!("开始保存pe数量: {}", total_attr_map_arc.len());
+                            for entry in total_attr_map_arc.iter() {
+                                let refno = *entry.key();
+                                let att = entry.value();
+                                let noun = att.get_type_hash();
+                                let owner = att.get_owner().refno();
+                                let has_geo = is_geo_noun_hash(noun);
+                                tree_nodes.entry(refno).or_insert(TreeNodeMeta {
+                                    refno,
+                                    owner,
+                                    noun,
+                                    has_geo,
+                                    is_leaf: false,
+                                });
+                            }
                             let should_save = !is_debug && is_save_db;
                             if should_save {
+                                //开始执行保存数据
+                                info!("开始保存pe数量: {}", total_attr_map_arc.len());
                                 save_pes(
                                     &db_basic_clone,
                                     &total_attr_map_arc,
-                                    db_no as i32,
+                                    dbnum as i32,
                                     &file_name_clone,
                                     &db_type,
                                     &db_option_clone,
@@ -1538,7 +1600,7 @@ pub async fn sync_total_async_threaded(
                                 .await
                                 .expect("save pes failed");
                             }
-                            if b_save_mysql {
+                            if b_save_mysql && !gen_tree_only {
                                 #[cfg(feature = "sql")]
                                 save_pes_mysql(
                                     &db_basic_clone,
@@ -1546,48 +1608,45 @@ pub async fn sync_total_async_threaded(
                                     &total_attr_map_arc,
                                     &pool,
                                     &db_option_clone,
-                                    db_no as i32,
+                                    dbnum as i32,
                                     &sender_clone,
                                 )
                                 .await;
                             }
-                            for kv in type_ele_map.iter() {
-                                let noun: i32 = *kv.key() as _;
-                                let type_name = db1_dehash(noun as _);
-                                if type_name.is_empty() {
-                                    continue;
-                                }
-                                //UDA 还是要单独存，不然数据很容易混乱
-                                for refnos in
-                                    &kv.value().iter().chunks(db_option_clone.att_chunk as _)
-                                {
-                                    let mut json_vec = vec![];
-                                    let mut uda_json_vec = vec![];
-                                    for refno in refnos {
-                                        let att = total_attr_map_arc.get(refno).unwrap();
-                                        //调试时，只解析这个单独的refno
-                                        if is_debug {
-                                            if debug_refnos
-                                                .contains(&att.get_refno_or_default().refno())
-                                            {
-                                                dbg!(att.value());
-                                            } else {
-                                                continue;
-                                            }
-                                        }
-                                        if !is_save_db {
-                                            continue;
-                                        }
-                                        let Some(json) = att.gen_sur_json() else {
-                                            continue;
-                                        };
-                                        json_vec.push(json);
-                                        let Some(json) = att.gen_sur_json_uda(&[]) else {
-                                            continue;
-                                        };
-                                        uda_json_vec.push(normalize_sql_string(&json));
+                            if is_save_db {
+                                for kv in type_ele_map.iter() {
+                                    let noun: i32 = *kv.key() as _;
+                                    let type_name = db1_dehash(noun as _);
+                                    if type_name.is_empty() {
+                                        continue;
                                     }
-                                    if is_save_db {
+                                    //UDA 还是要单独存，不然数据很容易混乱
+                                    for refnos in
+                                        &kv.value().iter().chunks(db_option_clone.att_chunk as _)
+                                    {
+                                        let mut json_vec = vec![];
+                                        let mut uda_json_vec = vec![];
+                                        for refno in refnos {
+                                            let att = total_attr_map_arc.get(refno).unwrap();
+                                            //调试时，只解析这个单独的refno
+                                            if is_debug {
+                                                if debug_refnos
+                                                    .contains(&att.get_refno_or_default().refno())
+                                                {
+                                                    dbg!(att.value());
+                                                } else {
+                                                    continue;
+                                                }
+                                            }
+                                            let Some(json) = att.gen_sur_json() else {
+                                                continue;
+                                            };
+                                            json_vec.push(json);
+                                            let Some(json) = att.gen_sur_json_uda(&[]) else {
+                                                continue;
+                                            };
+                                            uda_json_vec.push(normalize_sql_string(&json));
+                                        }
                                         if !json_vec.is_empty() {
                                             sender_clone
                                                 .send(SenderJsonsData::AttJson((
@@ -1614,6 +1673,65 @@ pub async fn sync_total_async_threaded(
                             dbg!(e.to_string());
                         }
                     }
+                }
+
+                for (refno, meta) in tree_nodes.iter_mut() {
+                    let is_leaf = match db_basic.children_map.get(refno) {
+                        Some(children) => children.is_empty(),
+                        None => true,
+                    };
+                    meta.is_leaf = is_leaf;
+                }
+
+                // 解析期：每处理完一个 db 文件就更新 db_meta_info.json（即使 save_db=false 且 gen_tree_only=true 也要生成）。
+                //
+                // 该文件用于：refno(ref_0) -> dbnum 的快速映射，以及记录 db 文件头的关键信息以便排查。
+                {
+                    let mut ref0s = BTreeSet::new();
+                    for refno in tree_nodes.keys() {
+                        // ref_0 为 RefU64 高 32 位（注意：ref_0 并非 dbnum）。
+                        let ref0 = ((refno.0 >> 32) & 0xFFFF_FFFF) as u32;
+                        ref0s.insert(ref0);
+                    }
+
+                    let header_hex_60 = (|| -> Option<String> {
+                        let mut f = std::fs::File::open(&path).ok()?;
+                        let mut buf = [0u8; 60];
+                        f.read_exact(&mut buf).ok()?;
+                        Some(hex::encode(buf))
+                    })();
+
+                    // parse_file_basic_info 的返回值在本函数里已被“部分 move”（db_type/dbnum 等），
+                    // 这里避免再引用它导致借用错误；用 header_hex_60 足以做 header 排查。
+                    let header_debug = None;
+
+                    if let Err(e) = db_meta_info::update_db_meta_info_json(
+                        Path::new(db_meta_info::DEFAULT_TREE_DIR),
+                        db_meta_info::DbFileMetaUpdate {
+                            dbnum,
+                            db_type: &db_type,
+                            file_name: &file_name,
+                            file_path: &path,
+                            header_hex_60,
+                            header_debug,
+                            latest_sesno: Some(sesno as u32),
+                            sesno_timestamp,
+                            ref0s,
+                        },
+                    ) {
+                        warn!(
+                            "[db_meta_info] 更新失败(dbnum={}, file={}): {}",
+                            dbnum, file_name, e
+                        );
+                    }
+                }
+                if let Err(e) = export_tree_file(
+                    dbnum,
+                    db_basic.as_ref(),
+                    &tree_nodes,
+                    Path::new("output/scene_tree"),
+                ) {
+                    warn!("[tree_export] dbnum={} 导出失败: {}", dbnum, e);
                 }
 
                 info!(
@@ -1701,7 +1819,7 @@ fn set_uda_attr(
     Ok(())
 }
 
-// pub fn gen_pdms_element_insert_sql(att: &WholeAttMap, name: &str, dbno: u32, order: usize, children_count: usize) -> String {
+// pub fn gen_pdms_element_insert_sql(att: &WholeAttMap, name: &str, dbnum: u32, order: usize, children_count: usize) -> String {
 //     let attmap = &att.att_map();
 //     let refno = attmap.get_refno().unwrap();
 //     let type_name = attmap.get_type();
@@ -1709,7 +1827,7 @@ fn set_uda_attr(
 //
 //     let mut sql = String::new();
 //     sql.push_str(&format!(r#"({}, '{}', '{}', {},'{}' , {} , {} , {} ,0 ) ,"#,
-//                           refno.0, refno.to_pdms_str(), type_name, owner.0, name, dbno, order, children_count));
+//                           refno.0, refno.to_pdms_str(), type_name, owner.0, name, dbnum, order, children_count));
 //     sql
 // }
 

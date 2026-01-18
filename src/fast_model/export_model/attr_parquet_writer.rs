@@ -1,7 +1,7 @@
 //! 属性数据 Parquet Writer
 //!
 //! 将 NamedAttrMap 数据按 noun 分表写入 Parquet 格式
-//! 文件组织结构：output/database_models/{dbno}/attr_{noun}.parquet
+//! 文件组织结构：output/database_models/{dbnum}/attr_{noun}.parquet
 //!
 //! 设计：
 //! - 常见 noun（EQUI、PIPE、ELBOW 等）有预定义 schema
@@ -45,19 +45,19 @@ impl AttrParquetManager {
         }
     }
 
-    /// 获取 dbno 的文件夹路径
-    fn get_dbno_dir(&self, dbno: u32) -> PathBuf {
-        self.base_dir.join("database_models").join(dbno.to_string())
+    /// 获取 dbnum 的文件夹路径
+    fn get_dbno_dir(&self, dbnum: u32) -> PathBuf {
+        self.base_dir.join("database_models").join(dbnum.to_string())
     }
 
     /// 获取指定 noun 的属性文件路径
-    fn get_attr_file_path(&self, dbno: u32, noun: &str) -> PathBuf {
-        self.get_dbno_dir(dbno).join(format!("attr_{}.parquet", noun))
+    fn get_attr_file_path(&self, dbnum: u32, noun: &str) -> PathBuf {
+        self.get_dbno_dir(dbnum).join(format!("attr_{}.parquet", noun))
     }
 
     /// 获取指定 noun 的增量文件路径
-    fn get_attr_incremental_path(&self, dbno: u32, noun: &str, timestamp: &str) -> PathBuf {
-        self.get_dbno_dir(dbno).join(format!("attr_{}_{}.parquet", noun, timestamp))
+    fn get_attr_incremental_path(&self, dbnum: u32, noun: &str, timestamp: &str) -> PathBuf {
+        self.get_dbno_dir(dbnum).join(format!("attr_{}_{}.parquet", noun, timestamp))
     }
 
     /// 生成当前时间戳
@@ -69,11 +69,11 @@ impl AttrParquetManager {
     /// 
     /// 参数：
     /// - data: refno -> (noun, NamedAttrMap) 的映射
-    /// - dbno: 数据库编号
+    /// - dbnum: 数据库编号
     pub fn write_incremental(
         &self,
         data: &HashMap<RefnoEnum, (String, NamedAttrMap)>,
-        dbno: u32
+        dbnum: u32
     ) -> Result<Vec<PathBuf>> {
         if data.is_empty() {
             return Ok(Vec::new());
@@ -92,7 +92,7 @@ impl AttrParquetManager {
 
         // 为每个 noun 生成对应的 parquet 文件
         for (noun, entries) in grouped {
-            let path = self.write_noun_incremental(&noun, &entries, dbno, &timestamp)?;
+            let path = self.write_noun_incremental(&noun, &entries, dbnum, &timestamp)?;
             written_files.push(path);
         }
 
@@ -104,7 +104,7 @@ impl AttrParquetManager {
         &self,
         noun: &str,
         entries: &[(RefnoEnum, &NamedAttrMap)],
-        dbno: u32,
+        dbnum: u32,
         timestamp: &str,
     ) -> Result<PathBuf> {
         // 收集所有属性 key
@@ -118,7 +118,7 @@ impl AttrParquetManager {
         let keys: Vec<String> = all_keys.into_iter().collect();
         let df = self.create_attr_dataframe(noun, entries, &keys)?;
 
-        let path = self.get_attr_incremental_path(dbno, noun, timestamp);
+        let path = self.get_attr_incremental_path(dbnum, noun, timestamp);
 
         // 确保目录存在
         if let Some(parent) = path.parent() {
@@ -283,20 +283,20 @@ impl AttrParquetManager {
     }
 
     /// 合并增量文件到主文件（按 noun）
-    pub fn compact(&self, dbno: u32, noun: &str) -> Result<Option<PathBuf>> {
-        let dbno_dir = self.get_dbno_dir(dbno);
+    pub fn compact(&self, dbnum: u32, noun: &str) -> Result<Option<PathBuf>> {
+        let dbno_dir = self.get_dbno_dir(dbnum);
         if !dbno_dir.exists() {
             return Ok(None);
         }
 
-        let incremental_files = self.list_incremental_files(dbno, noun)?;
+        let incremental_files = self.list_incremental_files(dbnum, noun)?;
         if incremental_files.is_empty() {
             return Ok(None);
         }
 
         println!("🔄 [attr_{}] 开始合并 {} 个增量文件...", noun, incremental_files.len());
 
-        let main_file = self.get_attr_file_path(dbno, noun);
+        let main_file = self.get_attr_file_path(dbnum, noun);
         let mut frames = Vec::new();
 
         // 读取主文件（如果存在）
@@ -348,8 +348,8 @@ impl AttrParquetManager {
     }
 
     /// 列出指定 noun 的增量文件
-    fn list_incremental_files(&self, dbno: u32, noun: &str) -> Result<Vec<PathBuf>> {
-        let dbno_dir = self.get_dbno_dir(dbno);
+    fn list_incremental_files(&self, dbnum: u32, noun: &str) -> Result<Vec<PathBuf>> {
+        let dbno_dir = self.get_dbno_dir(dbnum);
         if !dbno_dir.exists() {
             return Ok(Vec::new());
         }
@@ -378,8 +378,8 @@ impl AttrParquetManager {
     }
 
     /// 列出所有 noun（用于批量合并）
-    pub fn list_all_nouns(&self, dbno: u32) -> Result<Vec<String>> {
-        let dbno_dir = self.get_dbno_dir(dbno);
+    pub fn list_all_nouns(&self, dbnum: u32) -> Result<Vec<String>> {
+        let dbno_dir = self.get_dbno_dir(dbnum);
         if !dbno_dir.exists() {
             return Ok(Vec::new());
         }

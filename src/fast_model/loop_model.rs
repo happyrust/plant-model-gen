@@ -2,6 +2,7 @@ use crate::consts::*;
 use crate::data_interface::interface::PdmsDataInterface;
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::gen_model::is_e3d_debug_enabled;
+use crate::fast_model::query_provider;
 use crate::fast_model::{SEND_INST_SIZE, debug_model_warn, get_generic_type, shared};
 use aios_core::RefU64;
 use aios_core::geometry::*;
@@ -103,8 +104,8 @@ pub async fn gen_loop_geos(
                 }
 
                 if !target_att.is_neg() {
-                    let neg_refnos = aios_core::collect_descendant_filter_ids(
-                        &[target_refno],
+                    let neg_refnos = query_provider::get_descendants_by_types(
+                        target_refno,
                         &GENRAL_NEG_NOUN_NAMES,
                         None,
                     )
@@ -121,19 +122,22 @@ pub async fn gen_loop_geos(
 
                     shape_insts_data.insert_negs(target_refno, &neg_refnos);
                     //检查是否有CMPF
-                    let cmpf_refnos =
-                        aios_core::collect_descendant_filter_ids(&[target_refno], &["CMPF"], None)
-                            .await
-                            .unwrap_or_default();
+                    let cmpf_refnos = query_provider::get_descendants_by_types(
+                        target_refno,
+                        &["CMPF"],
+                        None,
+                    )
+                    .await
+                    .unwrap_or_default();
                     if !cmpf_refnos.is_empty() {
                         //查询cmpf里面的元素
-                        let cmpf_neg_refnos = aios_core::collect_descendant_filter_ids(
-                            &cmpf_refnos,
-                            &GENRAL_NEG_NOUN_NAMES,
-                            None,
-                        )
-                        .await
-                        .unwrap_or_default();
+                        let cmpf_neg_refnos =
+                            query_provider::query_multi_descendants(
+                                &cmpf_refnos,
+                                &GENRAL_NEG_NOUN_NAMES,
+                            )
+                            .await
+                            .unwrap_or_default();
                         // dbg!(&cmpf_neg_refnos);
                         shape_insts_data.insert_negs(
                             target_refno,

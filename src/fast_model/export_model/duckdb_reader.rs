@@ -133,7 +133,7 @@ impl DuckDBReader {
             r#"
             CREATE TABLE IF NOT EXISTS persistent_aabb (
                 refno VARCHAR PRIMARY KEY,
-                dbno BIGINT,
+                dbnum BIGINT,
                 noun VARCHAR,
                 min_x DOUBLE,
                 max_x DOUBLE,
@@ -161,7 +161,7 @@ impl DuckDBReader {
 
     fn detect_aabb_columns(conn: &Connection) -> Result<(bool, bool)> {
         let columns = Self::get_table_columns(conn, "aabb")?;
-        Ok((columns.contains("bbox"), columns.contains("dbno")))
+        Ok((columns.contains("bbox"), columns.contains("dbnum")))
     }
 
     fn use_spatial(&self) -> bool {
@@ -186,10 +186,10 @@ impl DuckDBReader {
         self.query_by_bounding_box_internal(None, min_x, min_y, min_z, max_x, max_y, max_z)
     }
 
-    /// 空间查询：按包围盒查询 refnos（限定 dbno）
+    /// 空间查询：按包围盒查询 refnos（限定 dbnum）
     pub fn query_by_bounding_box_in_dbno(
         &self,
-        dbno: u32,
+        dbnum: u32,
         min_x: f64,
         min_y: f64,
         min_z: f64,
@@ -197,12 +197,12 @@ impl DuckDBReader {
         max_y: f64,
         max_z: f64,
     ) -> Result<Vec<String>> {
-        self.query_by_bounding_box_internal(Some(dbno), min_x, min_y, min_z, max_x, max_y, max_z)
+        self.query_by_bounding_box_internal(Some(dbnum), min_x, min_y, min_z, max_x, max_y, max_z)
     }
 
     fn query_by_bounding_box_internal(
         &self,
-        dbno: Option<u32>,
+        dbnum: Option<u32>,
         min_x: f64,
         min_y: f64,
         min_z: f64,
@@ -213,25 +213,25 @@ impl DuckDBReader {
         let conn = self.conn.lock().unwrap();
 
         let refnos: Vec<String> = if self.use_spatial() {
-            match dbno {
-                Some(dbno) if self.aabb_has_dbno => {
+            match dbnum {
+                Some(dbnum) if self.aabb_has_dbno => {
                     let mut stmt = conn.prepare(
                         r#"
                         SELECT refno FROM aabb
-                        WHERE dbno = ?1
+                        WHERE dbnum = ?1
                           AND ST_Intersects(bbox, ST_MakeEnvelope(?2, ?3, ?4, ?5))
                           AND max_z >= ?6 AND min_z <= ?7
                         "#,
                     )?;
                     stmt.query_map(
-                        duckdb::params![dbno as i64, min_x, min_y, max_x, max_y, min_z, max_z],
+                        duckdb::params![dbnum as i64, min_x, min_y, max_x, max_y, min_z, max_z],
                         |row: &duckdb::Row| row.get(0),
                     )?
                     .filter_map(|r: Result<_, _>| r.ok())
                     .collect()
                 }
-                Some(dbno) => {
-                    let pattern = format!("{}_%", dbno);
+                Some(dbnum) => {
+                    let pattern = format!("{}_%", dbnum);
                     let mut stmt = conn.prepare(
                         r#"
                         SELECT refno FROM aabb
@@ -264,26 +264,26 @@ impl DuckDBReader {
                 }
             }
         } else {
-            match dbno {
-                Some(dbno) if self.aabb_has_dbno => {
+            match dbnum {
+                Some(dbnum) if self.aabb_has_dbno => {
                     let mut stmt = conn.prepare(
                         r#"
                         SELECT refno FROM aabb
-                        WHERE dbno = ?1
+                        WHERE dbnum = ?1
                           AND max_x >= ?2 AND min_x <= ?3
                           AND max_y >= ?4 AND min_y <= ?5
                           AND max_z >= ?6 AND min_z <= ?7
                         "#,
                     )?;
                     stmt.query_map(
-                        duckdb::params![dbno as i64, min_x, max_x, min_y, max_y, min_z, max_z],
+                        duckdb::params![dbnum as i64, min_x, max_x, min_y, max_y, min_z, max_z],
                         |row: &duckdb::Row| row.get(0),
                     )?
                     .filter_map(|r: Result<_, _>| r.ok())
                     .collect()
                 }
-                Some(dbno) => {
-                    let pattern = format!("{}_%", dbno);
+                Some(dbnum) => {
+                    let pattern = format!("{}_%", dbnum);
                     let mut stmt = conn.prepare(
                         r#"
                         SELECT refno FROM aabb
@@ -456,11 +456,11 @@ impl DuckDBReader {
             .filter_map(|refno_str| {
                 let parts: Vec<&str> = refno_str.split('_').collect();
                 if parts.len() >= 2 {
-                    if let (Ok(dbno), Ok(sesno)) = (
+                    if let (Ok(dbnum), Ok(sesno)) = (
                         parts[0].parse::<u32>(),
                         parts[1].parse::<u32>(),
                     ) {
-                        return Some(RefU64::from_two_nums(dbno, sesno));
+                        return Some(RefU64::from_two_nums(dbnum, sesno));
                     }
                 }
                 None
@@ -568,11 +568,11 @@ impl DuckDBReader {
                 r#"
                 INSERT INTO persistent_aabb 
                 SELECT 
-                    refno, dbno, noun, min_x, max_x, min_y, max_y, min_z, max_z,
+                    refno, dbnum, noun, min_x, max_x, min_y, max_y, min_z, max_z,
                     ST_MakeEnvelope(min_x, min_y, max_x, max_y) as bbox
                 FROM read_parquet('{}')
                 ON CONFLICT (refno) DO UPDATE SET
-                    dbno = excluded.dbno,
+                    dbnum = excluded.dbnum,
                     noun = excluded.noun,
                     min_x = excluded.min_x,
                     max_x = excluded.max_x,

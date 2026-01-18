@@ -2,6 +2,26 @@
 # 默认禁用 OCC 功能避免 glam 版本冲突
 rustflags = []
 
+# 增大主线程栈大小，避免 debug 模式下 async 函数状态机导致的栈溢出
+# 16MB 栈大小足以应对深度 async 调用链
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:16777216"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:16777216"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-args=-Wl,--stack,16777216"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-args=-Wl,-zstack-size=16777216"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-args=-Wl,-stack_size,0x1000000"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-args=-Wl,-stack_size,0x1000000"]
+
 [unstable]
 codegen-backend = true
 

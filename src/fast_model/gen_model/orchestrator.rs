@@ -13,6 +13,8 @@ use std::time::Instant;
 use crate::fast_model::export_model::export_prepack_lod::export_prepack_lod_for_refnos;
 use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_dbnos;
 use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_refnos_grouped_by_dbno;
+use crate::fast_model::query_provider;
+use crate::fast_model::query_compat::{query_deep_neg_inst_refnos, query_deep_visible_inst_refnos};
 use crate::fast_model::unit_converter::LengthUnit;
 
 use aios_core::RefnoEnum;
@@ -33,7 +35,7 @@ use super::full_noun_mode::gen_full_noun_geos_optimized;
 use super::models::NounCategory;
 
 fn parse_dbno_from_refno(refno: RefnoEnum) -> Option<u32> {
-    // RefnoEnum 的 to_string 在项目中通常是 "dbno_sesno" 或 "dbno/sesno"；
+    // RefnoEnum 的 to_string 在项目中通常是 "dbno_sesno" 或 "dbnum/sesno"；
     // 这里做最小兼容解析，只取 dbno。
     let s = refno.to_string().replace('/', "_");
     s.split('_').next()?.parse::<u32>().ok()
@@ -47,7 +49,7 @@ fn parse_dbno_from_refno(refno: RefnoEnum) -> Option<u32> {
 ///   - 增量更新模式（incr_updates 非空）
 ///   - 手动 refno 模式（manual_refnos 非空）
 ///   - 调试模式（debug_model_refnos 非空）
-///   - 全量生成模式（按 dbno 循环）
+///   - 全量生成模式（按 dbnum 循环）
 ///
 /// # Arguments
 /// * `manual_refnos` - 手动指定的 refno 列表
@@ -103,6 +105,13 @@ pub async fn gen_all_geos_data(
         db_option.get_full_noun_batch_size()
     );
 
+    // ✅ 核心修复：确保 inst_relate 表已定义（显式创建 RELATION 表及索引）
+    if let Err(e) = aios_core::rs_surreal::inst::init_model_tables().await {
+        eprintln!("[gen_model] ❌ 初始化 inst_relate 表结构失败: {}", e);
+        // 严重错误，建议直接中断，否则后续写入必挂
+        return Err(FullNounError::Other(e));
+    }
+
     // =========================
     // Full Noun 模式：新管线
     // =========================
@@ -128,7 +137,7 @@ pub async fn gen_all_geos_data(
         // Full Noun 模式：新管线
         process_full_noun_mode(db_option, final_incr_updates, time).await
     } else {
-        // 全量生成路径（按 dbno 循环）
+        // 全量生成路径（按 dbnum 循环）
         process_full_database_generation(db_option, target_sesno, time).await
     }
 }
@@ -277,11 +286,11 @@ async fn process_full_noun_mode(
         let aabb_refnos = match crate::fast_model::mesh_generate::fetch_inst_relate_refnos().await {
             Ok(v) if !v.is_empty() => v,
             Ok(_) => {
-                eprintln!("[gen_model] inst_relate 中无可用 refno，跳过 AABB 写入");
+                eprintln!("[gen_model] pe_transform 中无可用 refno，跳过 AABB 写入");
                 Vec::new()
             }
             Err(e) => {
-                eprintln!("[gen_model] 获取 inst_relate refno 失败: {}", e);
+                eprintln!("[gen_model] 获取 pe_transform refno 失败: {}", e);
                 Vec::new()
             }
         };
@@ -386,7 +395,7 @@ async fn process_full_noun_mode(
         if let Some(exclude_nums) = &db_option.inner.exclude_db_nums {
             use std::collections::HashSet;
             let exclude: HashSet<u32> = exclude_nums.iter().copied().collect();
-            dbnos.retain(|dbno| !exclude.contains(dbno));
+            dbnos.retain(|dbnum| !exclude.contains(dbnum));
         }
         let mesh_dir =
             Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes"));
@@ -425,6 +434,28 @@ async fn process_targeted_generation(
         "调试"
     };
 
+    // 生成前置预检查（通用）：确保 pe_transform(world_trans) 可用。
+    // inst_relate 不再保存 world_transform，因此这里必须确保 pe_transform 侧数据齐备。
+    let precheck_refnos: Vec<RefnoEnum> = if let Some(upd) = &incr_updates {
+        upd.get_all_visible_refnos().into_iter().collect()
+    } else if has_manual_refnos {
+        manual_refnos.clone()
+    } else {
+        db_option
+            .inner
+            .debug_model_refnos
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|s| s.parse::<RefnoEnum>().ok())
+            .collect()
+    };
+    if !precheck_refnos.is_empty() {
+        crate::fast_model::precheck::ensure_pe_transform_for_refnos(&precheck_refnos)
+            .await
+            .map_err(FullNounError::Other)?;
+    }
+
     let target_count = if is_incr_update {
         incr_updates.as_ref().map(|log| log.count()).unwrap_or(0)
     } else if has_manual_refnos {
@@ -448,58 +479,10 @@ async fn process_targeted_generation(
 
     let replace_exist = db_option.inner.is_replace_mesh();
 
-    // 初始化 Parquet 写入器
-    let parquet_writer: Option<std::sync::Arc<ParquetStreamWriter>> = None;
-    /*
-    let parquet_writer = {
-        let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
-        let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
-        match ParquetStreamWriter::new(&parquet_dir) {
-            Ok(writer) => Some(std::sync::Arc::new(writer)),
-            Err(e) => {
-                eprintln!("[Parquet] 初始化写入器失败: {}, 跳过 Parquet 导出", e);
-                None
-            }
-        }
-    };
-    */
-    #[cfg(feature = "duckdb-feature")]
-    let duckdb_writer: Option<std::sync::Arc<DuckDBStreamWriter>> = None;
-    /*
-    #[cfg(feature = "duckdb-feature")]
-    let duckdb_writer = {
-        let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
-        let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
-        let duckdb_dir = parquet_dir.join("database_models/_global");
-        match DuckDBStreamWriter::new(&duckdb_dir, DuckDBWriteMode::Append) {
-            Ok(writer) => Some(std::sync::Arc::new(writer)),
-            Err(e) => {
-                eprintln!("[DuckDB] 初始化写入器失败: {}, 跳过 DuckDB 导出", e);
-                None
-            }
-        }
-    };
-    */
-    let parquet_writer_clone = parquet_writer.clone();
-    #[cfg(feature = "duckdb-feature")]
-    let duckdb_writer_clone = duckdb_writer.clone();
-
     let insert_task = tokio::task::spawn(async move {
         while let Ok(shape_insts) = receiver.recv_async().await {
             if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
                 eprintln!("保存实例数据失败: {}", e);
-            }
-            // 同时写入 Parquet（如果启用）
-            if let Some(ref writer) = parquet_writer_clone {
-                if let Err(e) = writer.write_batch(&shape_insts) {
-                    eprintln!("[Parquet] 写入批次失败: {}", e);
-                }
-            }
-            #[cfg(feature = "duckdb-feature")]
-            if let Some(ref writer) = duckdb_writer_clone {
-                if let Err(e) = writer.write_batch(&shape_insts) {
-                    eprintln!("[DuckDB] 写入批次失败: {}", e);
-                }
             }
         }
     });
@@ -545,7 +528,7 @@ async fn process_targeted_generation(
         println!("[gen_model] 开始写入 inst_relate_aabb");
         // 注意：export-glb 等导出会查询“根 + 全部子孙”的 inst 列表；
         // 仅写根节点会导致子孙节点缺少 inst_relate_aabb，从而 world_aabb 变 null 并反序列化失败。
-        let aabb_refnos = match aios_core::collect_descendant_filter_ids(&target_root_refnos, &[], None).await
+        let aabb_refnos = match query_provider::query_multi_descendants(&target_root_refnos, &[]).await
         {
             Ok(v) if !v.is_empty() => v,
             Ok(_) => target_root_refnos.clone(),
@@ -589,20 +572,6 @@ async fn process_targeted_generation(
         }
     }
 
-    // ✅ 等待所有 workers 完成后，再合并 Parquet 文件
-    if let Some(ref writer) = parquet_writer {
-        println!("[Parquet] 所有 workers 已完成，开始合并文件...");
-        if let Err(e) = writer.finalize() {
-            eprintln!("[Parquet] 合并文件失败: {}", e);
-        }
-    }
-    #[cfg(feature = "duckdb-feature")]
-    if let Some(ref writer) = duckdb_writer {
-        if let Err(e) = writer.finalize() {
-            eprintln!("[DuckDB] finalize 失败: {}", e);
-        }
-    }
-
     if let Err(err) = capture_refnos_if_enabled(&target_root_refnos, &db_option.inner).await {
         eprintln!("[capture] 捕获截图失败: {}", err);
     }
@@ -614,27 +583,10 @@ async fn process_targeted_generation(
         time.elapsed().as_millis()
     );
 
-    // ✅ 模型生成完毕后导出 instances.json（仅导出本次涉及的 dbno）
-    if db_option.export_instances {
-        let mesh_dir =
-            Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes"));
-        if let Err(e) = export_instances_json_for_refnos_grouped_by_dbno(
-            &target_root_refnos,
-            mesh_dir,
-            Path::new("output"),
-            Arc::new(db_option.inner.clone()),
-            true,
-        )
-        .await
-        {
-            eprintln!("[instances] 目标生成导出失败: {}", e);
-        }
-    }
-
     Ok(true)
 }
 
-/// 处理全量数据库生成（按 dbno 循环）
+/// 处理全量数据库生成（按 dbnum 循环）
 async fn process_full_database_generation(
     db_option: &DbOptionExt,
     target_sesno: Option<u32>,
@@ -650,7 +602,7 @@ async fn process_full_database_generation(
     if let Some(exclude_nums) = &db_option.inner.exclude_db_nums {
         use std::collections::HashSet;
         let exclude: HashSet<u32> = exclude_nums.iter().copied().collect();
-        dbnos.retain(|dbno| !exclude.contains(dbno));
+        dbnos.retain(|dbnum| !exclude.contains(dbnum));
     }
 
     println!(
@@ -696,8 +648,8 @@ async fn process_full_database_generation(
     };
     */
 
-    for dbno in dbnos.clone() {
-        println!("[gen_model] -> 开始处理数据库 {}", dbno);
+    for dbnum in dbnos.clone() {
+        println!("[gen_model] -> 开始处理数据库 {}", dbnum);
         let db_start = Instant::now();
 
         let (sender, receiver) = flume::unbounded();
@@ -728,7 +680,7 @@ async fn process_full_database_generation(
         });
 
         let db_refnos = super::non_full_noun::gen_geos_data_by_dbnum(
-            dbno,
+            dbnum,
             db_option_arc.clone(),
             sender.clone(),
             target_sesno,
@@ -740,13 +692,13 @@ async fn process_full_database_generation(
 
         println!(
             "[gen_model] -> 数据库 {} insts 入库完成，用时 {} ms",
-            dbno,
+            dbnum,
             db_start.elapsed().as_millis()
         );
 
         if db_option_arc.gen_mesh {
             let mesh_start = Instant::now();
-            println!("[gen_model] -> 数据库 {} 开始生成三角网格", dbno);
+            println!("[gen_model] -> 数据库 {} 开始生成三角网格", dbnum);
 
             db_refnos
                 .execute_gen_inst_meshes(Some(db_option_arc.clone()))
@@ -754,14 +706,14 @@ async fn process_full_database_generation(
 
             println!(
                 "[gen_model] -> 数据库 {} 三角网格生成完成，用时 {} ms",
-                dbno,
+                dbnum,
                 mesh_start.elapsed().as_millis()
             );
         }
 
         println!(
             "[gen_model] -> 数据库 {} 处理完成，总耗时 {} ms",
-            dbno,
+            dbnum,
             db_start.elapsed().as_millis()
         );
     }
@@ -822,11 +774,11 @@ async fn execute_manual_boolean_operations(
     let mut boolean_refnos = vec![];
     for &root_refno in target_root_refnos {
         // 查询深度可见实例
-        if let Ok(visible_refnos) = aios_core::query_deep_visible_inst_refnos(root_refno).await {
+        if let Ok(visible_refnos) = query_deep_visible_inst_refnos(root_refno).await {
             boolean_refnos.extend(visible_refnos);
         }
         // 查询深度负实例
-        if let Ok(neg_refnos) = aios_core::query_deep_neg_inst_refnos(root_refno).await {
+        if let Ok(neg_refnos) = query_deep_neg_inst_refnos(root_refno).await {
             boolean_refnos.extend(neg_refnos);
         }
     }

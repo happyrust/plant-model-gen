@@ -129,8 +129,8 @@ impl CollisionDetector {
             if let Some((min_x, min_y, min_z, max_x, max_y, max_z)) = self.duckdb_reader.query_aabb(&refno_str)? {
                 let parts: Vec<&str> = refno_str.split('_').collect();
                 if parts.len() >= 2 {
-                    if let (Ok(dbno), Ok(sesno)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                        let refno = RefU64::from_two_nums(dbno, sesno);
+                    if let (Ok(dbnum), Ok(sesno)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                        let refno = RefU64::from_two_nums(dbnum, sesno);
                         let aabb = Aabb::new(
                             [min_x as f32, min_y as f32, min_z as f32].into(),
                             [max_x as f32, max_y as f32, max_z as f32].into(),
@@ -175,8 +175,8 @@ impl CollisionDetector {
         for refno_str in refno_strs {
             let parts: Vec<&str> = refno_str.split('_').collect();
             if parts.len() >= 2 {
-                if let (Ok(dbno), Ok(sesno)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                    refnos.push(RefU64::from_two_nums(dbno, sesno));
+                if let (Ok(dbnum), Ok(sesno)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                    refnos.push(RefU64::from_two_nums(dbnum, sesno));
                 }
             }
         }

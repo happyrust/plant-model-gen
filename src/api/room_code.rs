@@ -40,9 +40,9 @@ pub async fn query_room_code_with_refnos(refnos: Vec<RefU64>, pool: &Pool<MySql>
 }
 
 // 查找所有房间节点，暂时按 1516 命名格式过滤
-pub async fn query_room_nodes(dbno: &Vec<i32>, pool: &Pool<MySql>) -> anyhow::Result<Vec<PdmsElement>> {
+pub async fn query_room_nodes(dbnum: &Vec<i32>, pool: &Pool<MySql>) -> anyhow::Result<Vec<PdmsElement>> {
     let room_infos = query_all_need_compute_room_refno(
-        dbno,
+        dbnum,
         "FRMW",
         Some("-RM"),
         pool,

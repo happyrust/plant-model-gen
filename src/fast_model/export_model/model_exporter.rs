@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::time::Instant;
 
+use crate::fast_model::query_provider;
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
 use chrono;
 use std::io::Write;
@@ -189,7 +190,7 @@ pub struct XktExportConfig {
     pub db_config: Option<String>,
 
     /// 数据库编号（用于 mesh 生成）
-    pub dbno: Option<u32>,
+    pub dbnum: Option<u32>,
 }
 
 impl Default for XktExportConfig {
@@ -200,7 +201,7 @@ impl Default for XktExportConfig {
             validate: false,
             skip_mesh: false,
             db_config: None,
-            dbno: None,
+            dbnum: None,
         }
     }
 }
@@ -300,36 +301,38 @@ pub async fn collect_export_refnos(
     }
 
     // 如果有过滤条件，使用过滤查询；否则查询所有子孙节点
-    let mut descendants = if let Some(nouns) = filter_nouns {
+    let descendants = if let Some(nouns) = filter_nouns {
         let nouns_slice: Vec<&str> = nouns.iter().map(|s| s.as_str()).collect();
-        aios_core::collect_descendant_filter_ids(
-            input_refnos,
-            &nouns_slice,
-            None, // 不限制深度
-        )
-        .await
-        .context("查询子孙节点失败")?
+        query_provider::query_multi_descendants(input_refnos, &nouns_slice)
+            .await
+            .context("查询子孙节点失败")?
     } else {
         // 查询所有子孙节点（传入空数组表示不过滤类型）
-        aios_core::collect_descendant_filter_ids(
-            input_refnos,
-            &[],  // 空数组表示查询所有类型
-            None, // 不限制深度
-        )
-        .await
-        .context("查询子孙节点失败")?
+        query_provider::query_multi_descendants(input_refnos, &[])
+            .await
+            .context("查询子孙节点失败")?
     };
 
-    // 如果没有找到子孙节点，添加自己
-    if descendants.is_empty() {
-        descendants = input_refnos.to_vec();
+    // 默认包含自身：roots 在前，后面拼接子孙；并保持顺序去重（避免 query 返回包含 roots 时重复）。
+    let mut out: Vec<RefnoEnum> = Vec::with_capacity(input_refnos.len() + descendants.len());
+    let mut seen: std::collections::HashSet<RefnoEnum> =
+        std::collections::HashSet::with_capacity(input_refnos.len() + descendants.len());
+    for &r in input_refnos {
+        if seen.insert(r) {
+            out.push(r);
+        }
+    }
+    for r in descendants {
+        if seen.insert(r) {
+            out.push(r);
+        }
     }
 
     if verbose {
-        println!("   - 找到 {} 个节点（包括自己）", descendants.len());
+        println!("   - 找到 {} 个节点（包括自己）", out.len());
     }
 
-    Ok(descendants)
+    Ok(out)
 }
 
 /// 共享的辅助函数：查询几何体实例数据
@@ -408,8 +411,8 @@ pub async fn query_geometry_instances_ext(
 
     // Debug: 打印查询到的 geo_hash
     for geom_inst in &geom_insts {
-        println!("[导出调试] refno={}, has_neg={}, insts数量={}", 
-            geom_inst.refno, geom_inst.has_neg, geom_inst.insts.len());
+        println!("[导出调试] refno={}, insts数量={}", 
+            geom_inst.refno, geom_inst.insts.len());
         for inst in &geom_inst.insts {
             println!("  - geo_hash={}", inst.geo_hash);
         }

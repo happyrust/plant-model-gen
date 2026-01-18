@@ -15,7 +15,7 @@ pub struct SysDBData {
     pub name: String,
     pub s_type: String,
     pub db_type: String,
-    pub db_no: i32,
+    pub dbnum: i32,
     pub claim: String,
     pub desc: String,
 }
@@ -65,7 +65,7 @@ pub async fn sync_team_data() -> anyhow::Result<()> {
                     name: name[1..].to_string(),
                     s_type: stype,
                     db_type: "MASTER".to_string(),
-                    db_no: numbdb,
+                    dbnum: numbdb,
                     claim,
                     desc: desc.to_string(),
                 });
@@ -151,7 +151,7 @@ fn gen_save_team_data_sql(data: Vec<SysDBData>) -> String {
         sql.push_str(
             &format!(
                 "('{}','{}','{}','{}',{},'{}','{}'),",
-                d.team_name, d.name, d.s_type, d.db_type, d.db_no, d.claim, d.desc
+                d.team_name, d.name, d.s_type, d.db_type, d.dbnum, d.claim, d.desc
             )
             .as_str(),
         )

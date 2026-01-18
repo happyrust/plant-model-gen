@@ -6,6 +6,7 @@ use aios_core::consts::{CIVIL_TYPES, NGMR_OWN_TYPES};
 use aios_core::{NamedAttrMap, RefnoEnum};
 use anyhow::Result;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use crate::fast_model::query_compat::query_filter_ancestors;
 
 /// NGMR 移除类型枚举
 ///
@@ -70,7 +71,7 @@ pub async fn query_ngmr_owner(
     let owner = att.get_owner();
     let c_ref = att.get_foreign_refno("CREF");
 
-    let ance_result = aios_core::query_filter_ancestors(refno.clone(), &NGMR_OWN_TYPES).await?;
+    let ance_result = query_filter_ancestors(refno.clone(), &NGMR_OWN_TYPES).await?;
     let o_ref = ance_result.into_iter().next();
 
     let geo_att = aios_core::get_named_attmap(ngmr_geo_refno)

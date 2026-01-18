@@ -178,17 +178,24 @@ async fn query_relation_targets_combined() -> anyhow::Result<HashSet<RefnoEnum>>
 /// 直接从 neg_relate/ngmr_relate 的 out 字段获取目标，不依赖 inst_relate_aabb
 /// 因为某些元素（如 STWALL）没有自己的几何体但需要被切割
 /// 
-/// 始终检查 inst_relate_bool 状态，避免重复处理已完成的任务
+/// - replace_exist=true: 返回所有候选，忽略已处理状态（强制重新布尔）
+/// - replace_exist=false: 过滤掉已成功处理的，避免重复计算
 async fn query_pending_inst_boolean(
     limit: usize,
-    _replace_exist: bool,  // 不再使用，始终检查已处理状态
+    replace_exist: bool,
     candidates: &HashSet<RefnoEnum>,
 ) -> anyhow::Result<Vec<RefnoEnum>> {
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
 
-    // 始终过滤掉已成功处理的，避免重复布尔运算
+    // 覆盖模式：直接返回所有候选，忽略已处理状态
+    if replace_exist {
+        let pending: Vec<RefnoEnum> = candidates.iter().copied().take(limit).collect();
+        return Ok(pending);
+    }
+
+    // 非覆盖模式：过滤掉已成功处理的
     const CHUNK_SIZE: usize = 200;
     let candidate_keys: Vec<String> = candidates.iter().map(|r| r.to_pe_key()).collect();
     let mut pending: Vec<RefnoEnum> = Vec::new();

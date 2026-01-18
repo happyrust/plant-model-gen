@@ -173,22 +173,22 @@ async fn query_relation_targets_combined() -> anyhow::Result<HashSet<RefnoEnum>>
     Ok(candidates)
 }
 
-/// 查询需要执行实例级布尔运算的实例列表（仅限存在负关系的目标）
+/// 查询需要执行实例级布尔运算的实例列表
+/// 
+/// 直接从 neg_relate/ngmr_relate 的 out 字段获取目标，不依赖 inst_relate_aabb
+/// 因为某些元素（如 STWALL）没有自己的几何体但需要被切割
+/// 
+/// 始终检查 inst_relate_bool 状态，避免重复处理已完成的任务
 async fn query_pending_inst_boolean(
     limit: usize,
-    replace_exist: bool,
+    _replace_exist: bool,  // 不再使用，始终检查已处理状态
     candidates: &HashSet<RefnoEnum>,
 ) -> anyhow::Result<Vec<RefnoEnum>> {
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
 
-    let filter_booled = if replace_exist {
-        String::new()
-    } else {
-        "AND (SELECT status FROM inst_relate_bool WHERE refno = inst_relate_aabb.refno AND status = 'Success' LIMIT 1) = NONE".to_string()
-    };
-
+    // 始终过滤掉已成功处理的，避免重复布尔运算
     const CHUNK_SIZE: usize = 200;
     let candidate_keys: Vec<String> = candidates.iter().map(|r| r.to_pe_key()).collect();
     let mut pending: Vec<RefnoEnum> = Vec::new();
@@ -199,13 +199,11 @@ async fn query_pending_inst_boolean(
         let remaining = limit - pending.len();
         let sql = format!(
             r#"
-SELECT VALUE in FROM inst_relate_aabb
-WHERE in IN [{}]
-{filter_booled}
+SELECT VALUE id FROM [{}]
+WHERE (SELECT status FROM inst_relate_bool WHERE refno = $parent.id AND status = 'Success' LIMIT 1) = NONE
 LIMIT {remaining};
 "#,
-            chunk.join(","),
-            filter_booled = filter_booled
+            chunk.join(",")
         );
 
         let mut refnos: Vec<RefnoEnum> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
@@ -397,106 +395,59 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
 
 /// 基于 inst_relate 状态的布尔运算 Worker
 ///
-/// 按批次扫描需要布尔运算的实例（catalog & 实例级），并复用现有
-/// `booleans_meshes_in_db` 管道完成实际计算。
+/// 扫描需要布尔运算的实例（catalog & 实例级），只执行一次。
+/// 注意：此函数应在 mesh_worker 完成后调用，确保所有 mesh 已生成。
+/// 布尔运算查询会自动过滤掉 mesh 未生成的记录。
 pub async fn run_boolean_worker(db_option: Arc<DbOption>, batch_size: usize) -> anyhow::Result<()> {
     let batch_size = batch_size.max(1);
     let replace_exist = db_option.is_replace_mesh();
-    let mut round = 0usize;
-    let mut total_processed = 0usize;
-    let mut stalled_rounds = 0usize;
-    let mut last_pending: Option<HashSet<RefnoEnum>> = None;
     let relation_targets = query_relation_targets_combined().await?;
 
-    loop {
-        let round_start = std::time::Instant::now();
-        let cata_refnos = query_pending_cata_boolean(batch_size, replace_exist).await?;
-        let inst_refnos =
-            query_pending_inst_boolean(batch_size, replace_exist, &relation_targets).await?;
+    let start = std::time::Instant::now();
 
-        let pending: HashSet<_> = cata_refnos
-            .iter()
-            .copied()
-            .chain(inst_refnos.iter().copied())
-            .collect();
+    // 查询所有待处理的布尔任务
+    let cata_refnos = query_pending_cata_boolean(batch_size, replace_exist).await?;
+    let inst_refnos =
+        query_pending_inst_boolean(batch_size, replace_exist, &relation_targets).await?;
 
-        if pending.is_empty() {
-            println!("[boolean_worker] 没有待处理布尔任务，退出");
-            break;
-        }
-
-        if let Some(prev) = &last_pending {
-            if *prev == pending {
-                stalled_rounds += 1;
-            } else {
-                stalled_rounds = 0;
-            }
-        }
-        last_pending = Some(pending.clone());
-
-        round += 1;
-        println!(
-            "[boolean_worker] 轮次 {}: catalog={} inst={} batch_size={} replace_exist={}",
-            round,
-            cata_refnos.len(),
-            inst_refnos.len(),
-            batch_size,
-            replace_exist
-        );
-
-        if !cata_refnos.is_empty() {
-            let t = std::time::Instant::now();
-            booleans_meshes_in_db(Some(db_option.clone()), &cata_refnos).await?;
-            println!(
-                "[boolean_worker] 轮次 {} catalog 布尔完成: {} 个，用时 {} ms",
-                round,
-                cata_refnos.len(),
-                t.elapsed().as_millis()
-            );
-        }
-
-        if !inst_refnos.is_empty() {
-            let t = std::time::Instant::now();
-            booleans_meshes_in_db(Some(db_option.clone()), &inst_refnos).await?;
-            println!(
-                "[boolean_worker] 轮次 {} inst 布尔完成: {} 个，用时 {} ms",
-                round,
-                inst_refnos.len(),
-                t.elapsed().as_millis()
-            );
-        }
-
-        let round_processed = cata_refnos.len() + inst_refnos.len();
-        total_processed += round_processed;
-        println!(
-            "[boolean_worker] 轮次 {} 结束: 本轮 {} 个，累计 {} 个，用时 {} ms",
-            round,
-            round_processed,
-            total_processed,
-            round_start.elapsed().as_millis()
-        );
-
-        if stalled_rounds >= 3 {
-            let sample: Vec<_> = pending.iter().take(5).cloned().collect();
-            if replace_exist {
-                println!(
-                    "[boolean_worker] replace_exist=true 模式下检测到 stall，已完成 {} 个，退出",
-                    total_processed
-                );
-                break;
-            } else {
-                return Err(anyhow!(
-                    "[boolean_worker] 连续 {} 轮 pending 集合未变化，疑似卡住；示例 refno: {:?}",
-                    stalled_rounds + 1,
-                    sample
-                ));
-            }
-        }
+    if cata_refnos.is_empty() && inst_refnos.is_empty() {
+        println!("[boolean_worker] 没有待处理布尔任务");
+        return Ok(());
     }
 
     println!(
-        "[boolean_worker] 布尔运算完成: 共 {} 轮，累计处理 {} 个实例",
-        round, total_processed
+        "[boolean_worker] 待处理: catalog={} inst={}",
+        cata_refnos.len(),
+        inst_refnos.len()
+    );
+
+    // 执行 catalog 级布尔运算
+    if !cata_refnos.is_empty() {
+        let t = std::time::Instant::now();
+        booleans_meshes_in_db(Some(db_option.clone()), &cata_refnos).await?;
+        println!(
+            "[boolean_worker] catalog 布尔完成: {} 个，用时 {} ms",
+            cata_refnos.len(),
+            t.elapsed().as_millis()
+        );
+    }
+
+    // 执行实例级布尔运算
+    if !inst_refnos.is_empty() {
+        let t = std::time::Instant::now();
+        booleans_meshes_in_db(Some(db_option.clone()), &inst_refnos).await?;
+        println!(
+            "[boolean_worker] inst 布尔完成: {} 个，用时 {} ms",
+            inst_refnos.len(),
+            t.elapsed().as_millis()
+        );
+    }
+
+    let total = cata_refnos.len() + inst_refnos.len();
+    println!(
+        "[boolean_worker] 布尔运算完成: 共处理 {} 个，用时 {} ms",
+        total,
+        start.elapsed().as_millis()
     );
 
     Ok(())

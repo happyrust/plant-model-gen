@@ -528,16 +528,18 @@ async fn process_targeted_generation(
         println!("[gen_model] 开始写入 inst_relate_aabb");
         // 注意：export-glb 等导出会查询“根 + 全部子孙”的 inst 列表；
         // 仅写根节点会导致子孙节点缺少 inst_relate_aabb，从而 world_aabb 变 null 并反序列化失败。
-        let aabb_refnos = match query_provider::query_multi_descendants(&target_root_refnos, &[]).await
-        {
-            Ok(v) if !v.is_empty() => v,
-            Ok(_) => target_root_refnos.clone(),
+        // 重要：query_multi_descendants 只返回子孙节点，不包括根节点本身，需要手动添加根节点
+        let mut aabb_refnos = target_root_refnos.clone();
+        match query_provider::query_multi_descendants(&target_root_refnos, &[]).await {
+            Ok(descendants) if !descendants.is_empty() => {
+                aabb_refnos.extend(descendants);
+            }
+            Ok(_) => {}
             Err(e) => {
                 eprintln!(
-                    "[gen_model] 查询子孙节点失败，回退仅写根节点 inst_relate_aabb: {}",
+                    "[gen_model] 查询子孙节点失败，仅写根节点 inst_relate_aabb: {}",
                     e
                 );
-                target_root_refnos.clone()
             }
         };
 

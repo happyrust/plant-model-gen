@@ -208,16 +208,11 @@ async fn update_booled_result(
     mesh_id: &str,
     aabb: Option<parry3d::bounding_volume::Aabb>,
 ) -> anyhow::Result<()> {
-    use aios_core::gen_bytes_hash;
     use dashmap::DashMap;
     
     if let Some(aabb) = aabb {
-        // 使用 hash 格式存储 AABB
-        let aabb_array: [f64; 6] = [
-            aabb.mins.x as f64, aabb.mins.y as f64, aabb.mins.z as f64,
-            aabb.maxs.x as f64, aabb.maxs.y as f64, aabb.maxs.z as f64,
-        ];
-        let aabb_hash = gen_bytes_hash(&aabb_array);
+        // 使用 hash 格式存储 AABB（与 mesh_generate.rs 保持一致）
+        let aabb_hash = aios_core::gen_aabb_hash(&aabb);
         
         // 保存 AABB 记录到 SurrealDB
         let aabb_map = DashMap::new();

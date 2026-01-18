@@ -24,7 +24,7 @@ use aios_core::SurrealQueryExt;
 use aios_core::shape::pdms_shape::{PlantMesh, RsVec3};
 use aios_core::tool::float_tool::{dvec4_round_3, f64_round};
 use aios_core::{
-    RecordId, RefU64, RefnoEnum, SUL_DB, gen_bytes_hash, get_inst_relate_keys,
+    RecordId, RefU64, RefnoEnum, SUL_DB, gen_aabb_hash, get_inst_relate_keys,
     utils::RecordIdExt,
 };
 use crate::fast_model::query_compat::{query_deep_neg_inst_refnos, query_deep_visible_inst_refnos};
@@ -1219,7 +1219,7 @@ async fn handle_csg_mesh(
         }
     }
 
-    let aabb_hash = gen_bytes_hash(&mesh_aabb);
+    let aabb_hash = gen_aabb_hash(&mesh_aabb);
     aabb_map.entry(aabb_hash.to_string()).or_insert(mesh_aabb);
     if !EXIST_MESH_GEO_HASHES.contains_key(mesh_id) {
         EXIST_MESH_GEO_HASHES.insert(mesh_id.to_string(), mesh_aabb);
@@ -1329,7 +1329,7 @@ pub async fn update_inst_relate_aabbs_by_refnos(
                 continue;
             }
 
-            let aabb_hash = gen_bytes_hash(&aabb).to_string();
+            let aabb_hash = gen_aabb_hash(&aabb).to_string();
             aabb_map.entry(aabb_hash.clone()).or_insert(aabb);
 
             let refno = r.refno();
@@ -1485,7 +1485,7 @@ pub async fn update_scene_node_aabbs_by_refnos(
                 continue;
             }
 
-            let aabb_hash = gen_bytes_hash(&aabb);
+            let aabb_hash = gen_aabb_hash(&aabb);
             inst_aabb_map.insert(r.refno, aabb_hash.to_string());
         }
     }

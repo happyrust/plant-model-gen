@@ -683,9 +683,21 @@ async fn gen_cata_geos_inner(
                                 let off_z = cal_sjus_value(sjus, height);
 
                                 let t_get_world_transform2 = Instant::now();
-                                let parent_trans = aios_core::query_transform(parent, false)
+                                let parent_trans = aios_core::get_world_mat4(parent, false)
                                     .await
-                                    .unwrap_or_default()
+                                    .ok()
+                                    .flatten()
+                                    .map(|mat4| {
+                                        let (scale, rotation, translation) = mat4.to_scale_rotation_translation();
+                                        bevy_transform::prelude::Transform {
+                                            translation: translation.as_vec3(),
+                                            rotation: glam::Quat::from_xyzw(
+                                                rotation.x as f32, rotation.y as f32,
+                                                rotation.z as f32, rotation.w as f32,
+                                            ),
+                                            scale: scale.as_vec3(),
+                                        }
+                                    })
                                     .unwrap_or_default();
                                 db_time_get_world_transform +=
                                     t_get_world_transform2.elapsed().as_millis();
@@ -951,10 +963,22 @@ async fn gen_cata_geos_inner(
                         .or(target_cata.ptset.as_ref())
                         .cloned()
                         .unwrap_or_default();
-                    let Ok(Some(mut origin_trans)) =
-                        aios_core::query_transform(ele_refno, false).await
-                    else {
-                        continue;
+                    // 使用惰性计算版本，确保 pe_transform 缓存不存在时也能计算变换
+                    let mut origin_trans = match aios_core::get_world_mat4(ele_refno, false).await {
+                        Ok(Some(mat4)) => {
+                            let (scale, rotation, translation) = mat4.to_scale_rotation_translation();
+                            bevy_transform::prelude::Transform {
+                                translation: translation.as_vec3(),
+                                rotation: glam::Quat::from_xyzw(
+                                    rotation.x as f32,
+                                    rotation.y as f32,
+                                    rotation.z as f32,
+                                    rotation.w as f32,
+                                ),
+                                scale: scale.as_vec3(),
+                            }
+                        }
+                        _ => continue,
                     };
 
                     let ele_att = aios_core::get_named_attmap(ele_refno)
@@ -1129,15 +1153,25 @@ async fn gen_cata_geos_inner(
             db_time_get_branch_att += t_get_named_attmap.elapsed().as_millis();
 
             let t_get_world_transform = Instant::now();
-            let branch_transform = match aios_core::query_transform(branch_refno, false).await {
-                Ok(Some(trans)) => trans,
+            let branch_transform = match aios_core::get_world_mat4(branch_refno, false).await {
+                Ok(Some(mat4)) => {
+                    let (scale, rotation, translation) = mat4.to_scale_rotation_translation();
+                    bevy_transform::prelude::Transform {
+                        translation: translation.as_vec3(),
+                        rotation: glam::Quat::from_xyzw(
+                            rotation.x as f32, rotation.y as f32,
+                            rotation.z as f32, rotation.w as f32,
+                        ),
+                        scale: scale.as_vec3(),
+                    }
+                }
                 Ok(None) => {
                     record_refno_error(
                         RefnoErrorKind::Missing,
                         RefnoErrorStage::Query,
                         "fast_model/cata_model.rs",
-                        "query_transform",
-                        "BRAN/HANG pe_transform.world_trans 为空",
+                        "get_world_mat4",
+                        "BRAN/HANG world_mat4 为空",
                         Some(&branch_refno),
                         None,
                         &[],
@@ -1150,8 +1184,8 @@ async fn gen_cata_geos_inner(
                         RefnoErrorKind::NotFound,
                         RefnoErrorStage::Query,
                         "fast_model/cata_model.rs",
-                        "query_transform",
-                        format!("BRAN/HANG pe_transform 查询失败: {}", e),
+                        "get_world_mat4",
+                        format!("BRAN/HANG get_world_mat4 失败: {}", e),
                         Some(&branch_refno),
                         None,
                         &[],
@@ -1247,18 +1281,19 @@ async fn gen_cata_geos_inner(
                 });
                 if let Some(t) = transform {
                     let aabb = shared::aabb_apply_transform(&unit_cyli_aabb, &t);
-                    let (owner_refno, owner_type) =
-                        shared::get_owner_info_from_attr(&branch_att).await;
+                    // 对于 tubing，owner 应该是 BRAN/HANG 本身，而不是 BRAN 的 owner
+                    let owner_refno = branch_refno;
+                    let owner_type = branch_att.get_type_str().to_string();
                     tubi_shape_insts_data.insert_tubi(
-                        branch_refno,
+                        current_tubing.leave_refno,
                         EleGeosInfo {
-                            refno: branch_refno,
+                            refno: current_tubing.leave_refno,
                             sesno: branch_att.sesno(),
                             owner_refno,
                             owner_type,
                             cata_hash: Some(tubi_geo_hash.to_string()),
                             visible: true,
-                            generic_type: get_generic_type(branch_refno).await.unwrap_or_default(),
+                            generic_type: get_generic_type(current_tubing.leave_refno).await.unwrap_or_default(),
                             aabb: Some(aabb),
                             world_transform: t,
                             flow_pt_indexs: vec![],
@@ -1321,10 +1356,21 @@ async fn gen_cata_geos_inner(
                 let mut futures = FuturesUnordered::new();
                 for &refno in &child_refnos {
                     futures.push(async move {
-                        let trans = aios_core::query_transform(refno, false)
+                        let trans = aios_core::get_world_mat4(refno, false)
                             .await
                             .ok()
                             .flatten()
+                            .map(|mat4| {
+                                let (scale, rotation, translation) = mat4.to_scale_rotation_translation();
+                                bevy_transform::prelude::Transform {
+                                    translation: translation.as_vec3(),
+                                    rotation: glam::Quat::from_xyzw(
+                                        rotation.x as f32, rotation.y as f32,
+                                        rotation.z as f32, rotation.w as f32,
+                                    ),
+                                    scale: scale.as_vec3(),
+                                }
+                            })
                             .unwrap_or_default();
                         (refno, trans)
                     });
@@ -1465,8 +1511,9 @@ async fn gen_cata_geos_inner(
                             });
                                 if let Some(t) = transform {
                                     let aabb = shared::aabb_apply_transform(&unit_cyli_aabb, &t);
-                                    let (owner_refno, owner_type) =
-                                        shared::get_owner_info_from_attr(&branch_att).await;
+                                    // 对于 tubing，owner 应该是 BRAN/HANG 本身，而不是 BRAN 的 owner
+                                    let owner_refno = branch_refno;
+                                    let owner_type = branch_att.get_type_str().to_string();
                                     tubi_shape_insts_data.insert_tubi(
                                         current_tubing.leave_refno,
                                         EleGeosInfo {
@@ -1613,8 +1660,9 @@ async fn gen_cata_geos_inner(
                     });
                     if let Some(t) = transform {
                         let aabb = shared::aabb_apply_transform(&unit_cyli_aabb, &t);
-                        let (owner_refno, owner_type) =
-                            shared::get_owner_info_from_attr(&branch_att).await;
+                        // 对于 tubing，owner 应该是 BRAN/HANG 本身，而不是 BRAN 的 owner
+                        let owner_refno = branch_refno;
+                        let owner_type = branch_att.get_type_str().to_string();
                         tubi_shape_insts_data.insert_tubi(
                             current_tubing.leave_refno,
                             EleGeosInfo {

@@ -60,12 +60,10 @@ pub async fn save_instance_data_optimize(
     let mut neg_geo_by_carrier: HashMap<RefnoEnum, Vec<u64>> = HashMap::new();
     let mut cata_cross_neg_geo_map: HashMap<(RefnoEnum, RefnoEnum), Vec<u64>> = HashMap::new();
     if replace_exist {
-        // replace 模式下需要确保 inst_info_map + inst_tubi_map 对应的 inst_relate 都被级联删除，
+        // replace 模式下需要确保 inst_info_map 对应的 inst_relate 都被级联删除，
         // 否则会出现同一 inst_relate ID 已存在但 out 指向不同 inst_info 的冲突（SurrealDB 的 in/out 不可变）。
-        let mut refnos_set: HashSet<RefnoEnum> = HashSet::new();
-        refnos_set.extend(inst_mgr.inst_info_map.keys().copied());
-        refnos_set.extend(inst_mgr.inst_tubi_map.keys().copied());
-        let refnos: Vec<RefnoEnum> = refnos_set.into_iter().collect();
+        // 注意：inst_tubi_map 不再创建 inst_relate（tubing 使用 tubi_relate），所以不需要删除
+        let refnos: Vec<RefnoEnum> = inst_mgr.inst_info_map.keys().copied().collect();
         debug_model_debug!(
             "save_instance_data_optimize deleting existing inst_relate for {} refnos",
             refnos.len()
@@ -370,23 +368,11 @@ pub async fn save_instance_data_optimize(
             entry.insert(serde_json::to_string(&info.world_transform)?);
         }
 
-            let aabb_hash = gen_bytes_hash(&info.aabb);
+        if let Some(aabb) = info.aabb {
+            let aabb_hash = gen_bytes_hash(&aabb);
             if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
-                entry.insert(serde_json::to_string(&info.aabb)?);
+                entry.insert(serde_json::to_string(&aabb)?);
             }
-
-            // inst_relate 不再保存 world_trans；世界变换统一从 pe_transform 获取。
-            let relate_sql = format!(
-                "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, generic: '{3}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {4}, solid: {5}, owner_refno: {6}, owner_type: '{7}'}}",
-                key.to_inst_relate_key(),
-                key.to_pe_key(),
-                info.id_str(),
-                info.generic_type.to_string(),
-                info.has_cata_neg,
-                info.is_solid,
-                info.owner_refno.to_pe_key(),
-                info.owner_type
-            );
 
             // inst_relate_aabb 为关系表：in=pe, out=aabb（只存关系，不存其他字段）
             // 使用批量 DELETE + INSERT RELATION 做幂等更新
@@ -398,6 +384,20 @@ pub async fn save_instance_data_optimize(
             );
             inst_relate_aabb_buffer.push(aabb_row_sql);
             inst_relate_aabb_ins.push(key.to_pe_key());
+        }
+
+        // inst_relate 不再保存 world_trans；世界变换统一从 pe_transform 获取。
+        let relate_sql = format!(
+            "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, generic: '{3}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {4}, solid: {5}, owner_refno: {6}, owner_type: '{7}'}}",
+            key.to_inst_relate_key(),
+            key.to_pe_key(),
+            info.id_str(),
+            info.generic_type.to_string(),
+            info.has_cata_neg,
+            info.is_solid,
+            info.owner_refno.to_pe_key(),
+            info.owner_type
+        );
 
         inst_relate_buffer.push(relate_sql);
         if inst_relate_buffer.len() >= CHUNK_SIZE {
@@ -431,23 +431,18 @@ pub async fn save_instance_data_optimize(
     }
 
     // 注意：inst_relate_aabb(out) 指向 aabb 表的记录。
-    // 若先写关系再写 aabb 内容，SurrealDB 可能会“隐式创建”空的 aabb 记录（d = NONE）。
+    // 若先写关系再写 aabb 内容，SurrealDB 可能会"隐式创建"空的 aabb 记录（d = NONE）。
     // 这里把 inst_relate_aabb 的写入延后到 aabb UPSERT 之后，保证 out 侧不会出现空记录。
 
-    // 为 inst_tubi_map 也创建 inst_relate 记录（BRAN/HANG Tubing 几何体）
+    // inst_tubi_map 不再创建 inst_relate（tubing 使用专门的 tubi_relate 表）
+    // 只收集 transform 和 aabb 数据用于其他用途
     if !inst_mgr.inst_tubi_map.is_empty() {
         debug_model_debug!(
-            "save_instance_data_optimize processing inst_tubi_map: {} Tubing records",
+            "save_instance_data_optimize processing inst_tubi_map: {} Tubing records (不创建 inst_relate)",
             inst_mgr.inst_tubi_map.len()
         );
 
-        let mut tubi_relate_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
-        let mut tubi_aabb_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
-        let mut tubi_aabb_ins: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
-
-        for (key, info) in &inst_mgr.inst_tubi_map {
-            inst_keys.push(*key);
-
+        for (_key, info) in &inst_mgr.inst_tubi_map {
             if info.world_transform.translation.is_nan()
                 || info.world_transform.rotation.is_nan()
                 || info.world_transform.scale.is_nan()
@@ -460,74 +455,13 @@ pub async fn save_instance_data_optimize(
                 entry.insert(serde_json::to_string(&info.world_transform)?);
             }
 
-            // 为 Tubing 创建 inst_relate 记录（删除 aabb 字段）
-            // inst_relate 不再保存 world_trans；世界变换统一从 pe_transform 获取。
-            let relate_sql = format!(
-                "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, generic: '{3}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {4}, solid: {5}, owner_refno: {6}, owner_type: '{7}'}}",
-                key.to_inst_relate_key(),
-                key.to_pe_key(),
-                info.id_str(),
-                info.generic_type.to_string(),
-                info.has_cata_neg,
-                info.is_solid,
-                info.owner_refno.to_pe_key(),
-                info.owner_type
-            );
-
-            tubi_relate_buffer.push(relate_sql);
-
-                // 如果有 AABB，写入 inst_relate_aabb（普通表：refno/aabb）
-                if let Some(aabb) = info.aabb {
-                    let aabb_hash = gen_bytes_hash(&aabb);
-                    if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
-                        entry.insert(serde_json::to_string(&aabb)?);
-                    }
-                    let aabb_row_sql = format!(
-                        "{{id: {0}, in: {1}, out: aabb:⟨{2}⟩}}",
-                        key.to_table_key("inst_relate_aabb"),
-                        key.to_pe_key(),
-                        aabb_hash
-                    );
-                    tubi_aabb_buffer.push(aabb_row_sql);
-                    tubi_aabb_ins.push(key.to_pe_key());
-            }
-
-            if tubi_relate_buffer.len() >= CHUNK_SIZE {
-                let statement = format!(
-                    "INSERT RELATION INTO inst_relate [{}];",
-                    tubi_relate_buffer.join(",")
-                );
-                inst_relate_batcher.push(statement).await?;
-                tubi_relate_buffer.clear();
-
-                // 延后处理 tubi_aabb（见上方说明：必须在 aabb UPSERT 之后写关系）
-                if !tubi_aabb_buffer.is_empty() {
-                    inst_relate_aabb_buffer.append(&mut tubi_aabb_buffer);
-                    inst_relate_aabb_ins.append(&mut tubi_aabb_ins);
+            // 收集 aabb 数据（用于 tubi_relate）
+            if let Some(aabb) = info.aabb {
+                let aabb_hash = gen_bytes_hash(&aabb);
+                if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
+                    entry.insert(serde_json::to_string(&aabb)?);
                 }
             }
-        }
-
-        if !tubi_relate_buffer.is_empty() {
-            let statement = format!(
-                "INSERT RELATION INTO inst_relate [{}];",
-                tubi_relate_buffer.join(",")
-            );
-            inst_relate_batcher.push(statement).await?;
-            debug_model_debug!(
-                "save_instance_data_optimize flushing inst_relate from inst_tubi_map: {}",
-                tubi_relate_buffer.len()
-            );
-        }
-
-        // 延后处理剩余的 tubi_aabb（见上方说明：必须在 aabb UPSERT 之后写关系）
-        if !tubi_aabb_buffer.is_empty() {
-            inst_relate_aabb_buffer.append(&mut tubi_aabb_buffer);
-            inst_relate_aabb_ins.append(&mut tubi_aabb_ins);
-            debug_model_debug!(
-                "save_instance_data_optimize queued inst_relate_aabb from inst_tubi_map: {}",
-                inst_relate_aabb_ins.len()
-            );
         }
     }
 

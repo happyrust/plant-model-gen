@@ -196,11 +196,8 @@ pub async fn export_prepack_lod_for_refnos(
     .await
     .context("收集子孙节点失败")?;
 
-    let expanded_refnos_pe_keys_str = expanded_refnos
-        .iter()
-        .map(|r| r.to_pe_key())
-        .collect::<Vec<_>>()
-        .join(", ");
+    // P1 修复：SQL 拼接添加分批机制，避免超大数据量时 SQL 过长
+    const SQL_BATCH_SIZE: usize = 500;
 
     // 🏗️ 添加 EQUI 的子组件到 expanded_refnos
     // 确保所有 EQUI 相关的组件都被包含在导出范围内
@@ -209,19 +206,28 @@ pub async fn export_prepack_lod_for_refnos(
             println!("🔍 收集 EQUI 子组件...");
         }
 
-        // 查询所有 EQUI 的子组件 refno
-        let sql = format!(
-            r#"
-            SELECT VALUE in.id FROM inst_relate
-            WHERE owner_type = 'EQUI' AND owner_refno IN [{}]
-        "#,
-            expanded_refnos_pe_keys_str
-        );
+        // 分批查询所有 EQUI 的子组件 refno
+        let mut children: Vec<RefnoEnum> = Vec::new();
+        for chunk in expanded_refnos.chunks(SQL_BATCH_SIZE) {
+            let pe_keys_str = chunk
+                .iter()
+                .map(|r| r.to_pe_key())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                r#"
+                SELECT VALUE in.id FROM inst_relate
+                WHERE owner_type = 'EQUI' AND owner_refno IN [{}]
+            "#,
+                pe_keys_str
+            );
 
-        let children: Vec<RefnoEnum> = aios_core::SUL_DB
-            .query_take(sql, 0)
-            .await
-            .with_context(|| format!("查询 EQUI 子组件失败"))?;
+            let batch_children: Vec<RefnoEnum> = aios_core::SUL_DB
+                .query_take(sql, 0)
+                .await
+                .with_context(|| "查询 EQUI 子组件失败")?;
+            children.extend(batch_children);
+        }
 
         if verbose {
             println!("   ✅ 找到 {} 个 EQUI 子组件", children.len());
@@ -238,11 +244,7 @@ pub async fn export_prepack_lod_for_refnos(
         }
     }
 
-    let all_refnos_pe_keys_str = all_refnos
-        .iter()
-        .map(|r| r.to_pe_key())
-        .collect::<Vec<_>>()
-        .join(", ");
+    // P1 修复：移除 all_refnos_pe_keys_str，改用分批查询
 
     if verbose {
         println!(
@@ -368,25 +370,34 @@ pub async fn export_prepack_lod_for_refnos(
         .context("查询几何体实例失败")?;
 
     // 🏗️ 分层导出架构：从 inst_relate 查询真正有聚合的 BRAN/HANG owner
-    // 使用 DISTINCT owner_refno 确保只查询有实际子节点的分组节点
+    // P1 修复：使用分批查询替代单次大 SQL
     let bran_roots = {
         if verbose {
             println!("🔍 从 inst_relate 查询 BRAN/HANG owner...");
         }
 
-        // 查询所有有子节点的 BRAN/HANG owner
-        let sql = format!(
-            r#"
-            SELECT VALUE owner_refno FROM inst_relate
-            WHERE owner_type in ['BRAN', 'HANG'] AND owner_refno IN [{}]
-        "#,
-            all_refnos_pe_keys_str
-        );
+        // 分批查询所有有子节点的 BRAN/HANG owner
+        let mut bran_hang_owners: Vec<RefnoEnum> = Vec::new();
+        for chunk in all_refnos.chunks(SQL_BATCH_SIZE) {
+            let pe_keys_str = chunk
+                .iter()
+                .map(|r| r.to_pe_key())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                r#"
+                SELECT VALUE owner_refno FROM inst_relate
+                WHERE owner_type in ['BRAN', 'HANG'] AND owner_refno IN [{}]
+            "#,
+                pe_keys_str
+            );
 
-        let mut bran_hang_owners: Vec<RefnoEnum> = aios_core::SUL_DB
-            .query_take(sql, 0)
-            .await
-            .with_context(|| format!("查询 BRAN/HANG owner 失败"))?;
+            let batch_owners: Vec<RefnoEnum> = aios_core::SUL_DB
+                .query_take(sql, 0)
+                .await
+                .with_context(|| "查询 BRAN/HANG owner 失败")?;
+            bran_hang_owners.extend(batch_owners);
+        }
 
         // 在 Rust 中去重，避免 SurrealDB 复杂的数组操作
         bran_hang_owners.sort();
@@ -403,24 +414,34 @@ pub async fn export_prepack_lod_for_refnos(
     };
 
     // 🏗️ 从 inst_relate 查询真正有聚合的 EQUI owner
+    // P1 修复：使用分批查询替代单次大 SQL
     let equi_owners = {
         if verbose {
             println!("🔍 从 inst_relate 查询 EQUI owner...");
         }
 
-        // 查询所有有子节点的 EQUI owner
-        let sql = format!(
-            r#"
-            SELECT VALUE owner_refno FROM inst_relate
-            WHERE owner_type = 'EQUI' AND owner_refno IN [{}]
-        "#,
-            all_refnos_pe_keys_str
-        );
+        // 分批查询所有有子节点的 EQUI owner
+        let mut equi_owner_list: Vec<RefnoEnum> = Vec::new();
+        for chunk in all_refnos.chunks(SQL_BATCH_SIZE) {
+            let pe_keys_str = chunk
+                .iter()
+                .map(|r| r.to_pe_key())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                r#"
+                SELECT VALUE owner_refno FROM inst_relate
+                WHERE owner_type = 'EQUI' AND owner_refno IN [{}]
+            "#,
+                pe_keys_str
+            );
 
-        let mut equi_owner_list: Vec<RefnoEnum> = aios_core::SUL_DB
-            .query_take(sql, 0)
-            .await
-            .with_context(|| format!("查询 EQUI owner 失败"))?;
+            let batch_owners: Vec<RefnoEnum> = aios_core::SUL_DB
+                .query_take(sql, 0)
+                .await
+                .with_context(|| "查询 EQUI owner 失败")?;
+            equi_owner_list.extend(batch_owners);
+        }
 
         // 在 Rust 中去重
         equi_owner_list.sort();
@@ -463,19 +484,31 @@ pub async fn export_prepack_lod_for_refnos(
     all_name_refnos.sort();
     all_name_refnos.dedup();
     
-    for refno in &all_name_refnos {
-        if let Ok(full_name) = aios_core::get_default_full_name(*refno).await {
-            if !full_name.is_empty() {
-                // 只去掉开头的斜线，保持其他字符原样
-                let trimmed_name = full_name.trim().trim_start_matches('/').to_string();
-                if !trimmed_name.is_empty() {
-                    // 如果有名称配置，使用配置转换名称；否则保持原样
-                    let final_name = if let Some(config) = name_config {
-                        config.convert_name(&trimmed_name)
-                    } else {
-                        trimmed_name
-                    };
-                    refno_name_map.insert(*refno, final_name);
+    // P0 修复：使用批量查询替代循环单查，避免 N+1 查询问题
+    // 分批查询以避免 SQL 过长
+    const NAME_BATCH_SIZE: usize = 500;
+    for chunk in all_name_refnos.chunks(NAME_BATCH_SIZE) {
+        match aios_core::rs_surreal::query_full_names_map(chunk).await {
+            Ok(names_map) => {
+                for (refno, full_name) in names_map {
+                    if !full_name.is_empty() {
+                        // 只去掉开头的斜线，保持其他字符原样
+                        let trimmed_name = full_name.trim().trim_start_matches('/').to_string();
+                        if !trimmed_name.is_empty() {
+                            // 如果有名称配置，使用配置转换名称；否则保持原样
+                            let final_name = if let Some(config) = name_config {
+                                config.convert_name(&trimmed_name)
+                            } else {
+                                trimmed_name
+                            };
+                            refno_name_map.insert(refno, final_name);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if verbose {
+                    eprintln!("⚠️ 批量查询名称失败: {}", e);
                 }
             }
         }
@@ -1629,10 +1662,7 @@ pub async fn export_all_relates_prepack_lod(
         "1=1 ".to_string()
     };
 
-    // 2. 可选 owner_type 过滤
-    let normalized_owner_types = owner_types
-        .as_ref()
-        .map(|types| types.iter().map(|t| t.to_uppercase()).collect::<Vec<_>>());
+    // P2 修复：移除重复的 normalized_owner_types 声明，复用上面第 1608 行的变量
     let owner_filter_clause =
         if let Some(types) = normalized_owner_types.as_ref().filter(|v| !v.is_empty()) {
             let list = types
@@ -2129,42 +2159,6 @@ fn compute_owner_aabb(
     }
 }
 
-/// inst_relate 查询结果结构体
-#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
-struct InstRelateQueryResult {
-    pub owner_refno: RefnoEnum,
-    pub owner_type: String,
-    pub in_refno: RefnoEnum,
-    pub spec_value: Option<i64>,
-}
-
-/// inst_relate 逐行查询结果结构体（每条记录 = 一个 owner + 一个 child）
-#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
-struct OwnerGroupQueryResult {
-    pub owner_refno: RefnoEnum,
-    pub owner_type: String,
-    pub child_refno: RefnoEnum,
-    pub child_noun: Option<String>,
-    pub child_name: Option<String>,
-    pub child_aabb: serde_json::Value,
-    pub child_spec_value: Option<i64>,
-}
-
-/// pe 表查询结果结构体
-#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
-struct PeQueryResult {
-    pub id: RefnoEnum,
-    pub noun: Option<String>,
-    pub world_trans: Option<aios_core::PlantTransform>,
-}
-
-/// inst_relate_aabb 查询结果结构体
-#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
-struct AabbQueryResult {
-    pub in_refno: RefnoEnum,
-    pub aabb: Option<aios_core::types::PlantAabb>,
-}
-
 /// tubi_relate 查询结果结构体
 #[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
 struct TubiQueryResult {
@@ -2179,6 +2173,133 @@ struct TubiQueryResult {
 
 fn plant_transform_to_dmat4(t: &aios_core::PlantTransform) -> DMat4 {
     t.0.to_matrix().as_dmat4()
+}
+
+/// GROUP BY 聚合查询结果结构体
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
+struct GroupedOwnerResult {
+    pub owner_refno: RefnoEnum,
+    pub owner_type: String,
+    pub children: Vec<RefnoEnum>,
+    pub child_nouns: Vec<Option<String>>,
+    pub child_names: Vec<Option<String>>,
+    pub child_aabbs: Vec<serde_json::Value>,
+    pub child_spec_values: Vec<Option<i64>>,
+}
+
+/// 非聚合类型查询结果结构体
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
+struct UngroupedInstanceResult {
+    pub refno: RefnoEnum,
+    pub noun: Option<String>,
+    pub name: Option<String>,
+}
+
+/// GROUP BY 聚合查询结果结构体（带 dbnum 用于 Rust 端过滤）
+/// 注意：GROUP BY 后 owner_type 也会变成数组
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
+struct GroupedOwnerResultWithDbnum {
+    pub owner_refno: RefnoEnum,
+    pub owner_type: Vec<String>,
+    pub children: Vec<RefnoEnum>,
+    pub child_dbnums: Vec<Option<u32>>,
+    pub child_nouns: Vec<Option<String>>,
+    pub child_names: Vec<Option<String>>,
+    pub child_aabbs: Vec<serde_json::Value>,
+    pub child_spec_values: Vec<Option<i64>>,
+}
+
+/// 查询带 GROUP BY 聚合的 inst_relate 记录（BRAN, HANG, EQUI 等聚合类型）
+/// 注意：WHERE in.dbnum = X 在 SurrealDB 关系表中不工作，改为 Rust 端过滤
+async fn query_grouped_inst_relate(dbnum: u32) -> Result<Vec<GroupedOwnerResult>> {
+    // 参考工作的查询语句，使用 map 获取嵌套字段
+    let sql = r#"
+        SELECT
+            owner_refno,
+            owner_type,
+            in as children,
+            in.dbnum as child_dbnums,
+            in.noun as child_nouns,
+            in.map(|$x| fn::default_full_name($x?:pe:0_0)) as child_names,
+            in.map(|$x| $x->inst_relate_aabb[0].out.d) as child_aabbs,
+            spec_value as child_spec_values
+        FROM inst_relate
+        WHERE owner_type IN ['BRAN', 'HANG', 'EQUI']
+        GROUP BY owner_refno
+    "#;
+    
+    let all_results: Vec<GroupedOwnerResultWithDbnum> = aios_core::SUL_DB.query_take(sql, 0).await?;
+    
+    // Rust 端过滤：只保留 dbnum 匹配的 children
+    let results: Vec<GroupedOwnerResult> = all_results
+        .into_iter()
+        .filter_map(|group| {
+            // 过滤出 dbnum 匹配的 children 索引
+            let matching_indices: Vec<usize> = group.child_dbnums
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| **d == Some(dbnum))
+                .map(|(i, _)| i)
+                .collect();
+            
+            if matching_indices.is_empty() {
+                return None;
+            }
+            
+            // owner_type 取第一个值
+            let owner_type = group.owner_type.first().cloned().unwrap_or_default();
+            
+            Some(GroupedOwnerResult {
+                owner_refno: group.owner_refno,
+                owner_type,
+                children: matching_indices.iter().filter_map(|&i| group.children.get(i).copied()).collect(),
+                child_nouns: matching_indices.iter().filter_map(|&i| group.child_nouns.get(i).cloned()).collect(),
+                child_names: matching_indices.iter().filter_map(|&i| group.child_names.get(i).cloned()).collect(),
+                child_aabbs: matching_indices.iter().filter_map(|&i| group.child_aabbs.get(i).cloned()).collect(),
+                child_spec_values: matching_indices.iter().filter_map(|&i| group.child_spec_values.get(i).cloned()).collect(),
+            })
+        })
+        .collect();
+    
+    Ok(results)
+}
+
+/// 非聚合类型查询结果结构体（带 dbnum 用于 Rust 端过滤）
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
+struct UngroupedInstanceResultWithDbnum {
+    pub refno: RefnoEnum,
+    pub child_dbnum: Option<u32>,
+    pub noun: Option<String>,
+    pub name: Option<String>,
+}
+
+/// 查询不带 GROUP 的 inst_relate 记录（非聚合类型）
+/// 注意：WHERE in.dbnum = X 在 SurrealDB 关系表中不工作，改为 Rust 端过滤
+async fn query_ungrouped_inst_relate(dbnum: u32) -> Result<Vec<UngroupedInstanceResult>> {
+    let sql = r#"
+        SELECT
+            in.id as refno,
+            in.dbnum as child_dbnum,
+            in.noun as noun,
+            fn::default_full_name(in) as name
+        FROM inst_relate
+        WHERE owner_type NOT IN ['BRAN', 'HANG', 'EQUI']
+    "#;
+    
+    let all_results: Vec<UngroupedInstanceResultWithDbnum> = aios_core::SUL_DB.query_take(sql, 0).await?;
+    
+    // Rust 端过滤 dbnum
+    let results: Vec<UngroupedInstanceResult> = all_results
+        .into_iter()
+        .filter(|r| r.child_dbnum == Some(dbnum))
+        .map(|r| UngroupedInstanceResult {
+            refno: r.refno,
+            noun: r.noun,
+            name: r.name,
+        })
+        .collect();
+    
+    Ok(results)
 }
 
 /// 导出指定 dbnum 的实例数据为简化 JSON 格式（含 AABB）
@@ -2213,30 +2334,13 @@ pub async fn export_dbnum_instances_json(
     fs::create_dir_all(output_dir)
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
 
-    // 1. 逐行查询 inst_relate（owner + child），由 Rust 负责分组，避免 GROUP BY 平行数组对齐隐患
-    let db_filter = format!("in.dbnum = {}", dbnum);
-    let owner_sql = format!(
-        r#"
-        SELECT
-            owner_refno,
-            owner_type,
-            in as child_refno,
-            in.noun as child_noun,
-            fn::default_full_name(in) as child_name,
-            (SELECT VALUE d FROM in->inst_relate_aabb.out LIMIT 1)[0] as child_aabb,
-            spec_value as child_spec_value
-        FROM inst_relate
-        WHERE {} AND owner_type IN ['BRAN', 'HANG', 'EQUI', 'HVAC', 'PIPE']
-        "#,
-        db_filter
-    );
-
+    // 1. 查询带 GROUP BY 聚合的 inst_relate 记录（聚合类型）
     if verbose {
-        println!("🔍 执行查询: {}", owner_sql.trim());
+        println!("🔍 查询聚合类型 inst_relate（GROUP BY）...");
     }
-
-    let relate_rows: Vec<OwnerGroupQueryResult> = aios_core::SUL_DB.query_take(&owner_sql, 0).await?;
-
+    let grouped_results = query_grouped_inst_relate(dbnum).await?;
+    
+    // 转换为内部数据结构
     #[derive(Clone, Debug)]
     struct ChildRow {
         refno: RefnoEnum,
@@ -2255,30 +2359,26 @@ pub async fn export_dbnum_instances_json(
     let mut owner_groups: HashMap<RefnoEnum, OwnerGroup> = HashMap::new();
     let mut in_refnos: Vec<RefnoEnum> = Vec::new();
 
-    for row in relate_rows {
-        use std::collections::hash_map::Entry;
-
-        in_refnos.push(row.child_refno);
-
-        let child = ChildRow {
-            refno: row.child_refno,
-            noun: row.child_noun,
-            name: row.child_name,
-            aabb: row.child_aabb,
-            spec_value: row.child_spec_value,
-        };
-
-        match owner_groups.entry(row.owner_refno) {
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().children.push(child);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(OwnerGroup {
-                    owner_type: row.owner_type,
-                    children: vec![child],
-                });
-            }
-        }
+    for group in grouped_results {
+        let children: Vec<ChildRow> = group.children
+            .iter()
+            .enumerate()
+            .map(|(i, &refno)| {
+                in_refnos.push(refno);
+                ChildRow {
+                    refno,
+                    noun: group.child_nouns.get(i).cloned().flatten(),
+                    name: group.child_names.get(i).cloned().flatten(),
+                    aabb: group.child_aabbs.get(i).cloned().unwrap_or(serde_json::Value::Null),
+                    spec_value: group.child_spec_values.get(i).cloned().flatten(),
+                }
+            })
+            .collect();
+        
+        owner_groups.insert(group.owner_refno, OwnerGroup {
+            owner_type: group.owner_type,
+            children,
+        });
     }
 
     // owner 输出顺序稳定（便于 diff / cache）
@@ -2391,9 +2491,8 @@ pub async fn export_dbnum_instances_json(
         if let Err(e) =
             crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(&in_refnos, false).await
         {
-            if verbose {
-                println!("⚠️ 回填 inst_relate_aabb 失败（children）：{e:?}");
-            }
+            eprintln!("⚠️ 回填 inst_relate_aabb 失败（children, {} 个 refno）：{e:?}", in_refnos.len());
+            eprintln!("   导出的 JSON 中部分 aabb 字段可能为 null，前端无法做尺度一致性检查");
         }
         if verbose {
             println!("🔍 查询 {} 个 refno 的几何体实例数据...", in_refnos.len());
@@ -2561,31 +2660,10 @@ pub async fn export_dbnum_instances_json(
     }
 
     // 6. 查询非聚合类型的 refno（单独导出）
-    // 从 inst_relate 查询，确保只获取真正有几何实例的构件
-    let instance_sql = format!(
-        r#"
-        SELECT
-            in.id as refno,
-            in.noun as noun,
-            fn::default_full_name(in) as name
-        FROM inst_relate
-        WHERE in.dbnum = {} AND owner_type NOT IN ['BRAN', 'HANG', 'EQUI', 'HVAC', 'PIPE']
-        "#,
-        dbnum
-    );
-
     if verbose {
-        println!("🔍 查询非聚合类型实例: {}", instance_sql.trim());
+        println!("🔍 查询非聚合类型 inst_relate...");
     }
-
-    #[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
-    struct InstanceQueryResult {
-        pub refno: RefnoEnum,
-        pub noun: Option<String>,
-        pub name: Option<String>,
-    }
-
-    let instance_rows: Vec<InstanceQueryResult> = aios_core::SUL_DB.query_take(&instance_sql, 0).await?;
+    let instance_rows = query_ungrouped_inst_relate(dbnum).await?;
     
     if verbose {
         println!("✅ 查询到 {} 个非聚合类型实例", instance_rows.len());
@@ -2600,14 +2678,6 @@ pub async fn export_dbnum_instances_json(
     let mut instance_has_neg_map: HashMap<RefnoEnum, bool> = HashMap::new();
 
     if !instance_refnos.is_empty() {
-        // 同上：确保导出时能拿到 world_aabb
-        if let Err(e) =
-            crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(&instance_refnos, false).await
-        {
-            if verbose {
-                println!("⚠️ 回填 inst_relate_aabb 失败（instances）：{e:?}");
-            }
-        }
         // 查询几何实例
         if verbose {
             println!("🔍 查询 {} 个实例的几何数据...", instance_refnos.len());
@@ -2618,7 +2688,6 @@ pub async fn export_dbnum_instances_json(
                     instance_geom_map.insert(geom_inst.refno, geom_inst.insts);
                     instance_aabb_map.insert(geom_inst.refno, geom_inst.world_aabb);
                     instance_has_neg_map.insert(geom_inst.refno, false);  // 默认不使用布尔结果
-                    // aios-core 0.2.3: GeomInstQuery.world_trans 为必填 PlantTransform（非 Option）
                     let refno_world = plant_transform_to_dmat4(&geom_inst.world_trans);
                     instance_world_trans_map.insert(geom_inst.refno, refno_world);
                 }
@@ -2729,11 +2798,26 @@ pub async fn export_dbnum_instances_json(
 }
 
 /// 将 DMat4 转换为 f32 数组（列主序）
-fn mat4_to_vec_dmat4(mat: &DMat4, _unit_converter: &UnitConverter, _is_unit_mesh: bool) -> Vec<f32> {
-    mat.to_cols_array()
-        .iter()
-        .map(|&v| v as f32)
-        .collect()
+/// P1 修复：添加单位转换逻辑，与 mat4_to_vec 保持一致
+fn mat4_to_vec_dmat4(mat: &DMat4, unit_converter: &UnitConverter, is_unit_mesh: bool) -> Vec<f32> {
+    let mut cols = mat.to_cols_array();
+    if unit_converter.needs_conversion() {
+        let factor = unit_converter.conversion_factor() as f64;
+        // Unit mesh：缩放旋转/缩放部分；普通 mesh：不缩放旋转/缩放部分（已在顶点上）
+        if is_unit_mesh {
+            // 缩放旋转部分（前3列）
+            for i in 0..3 {
+                cols[i] *= factor; // 第一列
+                cols[4 + i] *= factor; // 第二列
+                cols[8 + i] *= factor; // 第三列
+            }
+        }
+        // 平移部分始终需要缩放（世界坐标必须单位转换）
+        cols[12] *= factor;
+        cols[13] *= factor;
+        cols[14] *= factor;
+    }
+    cols.iter().map(|&v| v as f32).collect()
 }
 
 fn mat4_mul_col_major(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {

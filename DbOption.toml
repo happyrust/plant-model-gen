@@ -13,7 +13,7 @@ sync_chunk_size = 10_0000
 #项目设置
 project_path = "D:/AVEVA/Projects/E3D2.1"
 # project_path = "/Volumes/DPC/work/e3d_models"
-included_projects = ["AvevaMarineSample"]
+included_projects = ["AvevaMarineSample", "AvevaCatalogue", "SCB", "ZDJ"]
 # included_projects = ["AvevaMarineSample"]
 #project_dirs = ["AvevaMarineSample"]
 
@@ -28,7 +28,7 @@ gen_mesh = true
 replace_mesh = true
 save_db = false
 # 解析期只生成 scene tree 文件，跳过 PE/属性数据保存
-gen_tree_only = true
+gen_tree_only = false
 apply_boolean_operation = false
 mesh_tol_ratio = 3.0
 #是否启用房间计算

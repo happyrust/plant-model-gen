@@ -33,6 +33,9 @@ pub async fn ensure_inst_relate_aabb_relation_schema() {
                 .query("REMOVE FIELD out ON TABLE inst_relate_aabb;")
                 .await;
             let _ = SUL_DB
+                .query("REMOVE FIELD refno ON TABLE inst_relate_aabb;")
+                .await;
+            let _ = SUL_DB
                 .query("DEFINE FIELD in ON TABLE inst_relate_aabb TYPE record<pe>;")
                 .await;
             let _ = SUL_DB
@@ -132,6 +135,8 @@ pub async fn save_inst_relate_aabb(
     inst_aabb_map: &DashMap<RefnoEnum, String>,
     _source: &str,
 ) {
+    ensure_inst_relate_aabb_relation_schema().await;
+
     if inst_aabb_map.is_empty() {
         return;
     }
@@ -143,9 +148,11 @@ pub async fn save_inst_relate_aabb(
 
     for chunk in keys.chunks(200) {
         let mut sql = String::new();
+        let mut in_keys = Vec::new();
         for refno in chunk {
             let Some(aabb_hash) = inst_aabb_map.get(refno) else { continue };
             let refno_key = refno.to_pe_key();
+            in_keys.push(refno_key.clone());
             let aabb_key = {
                 let v = aabb_hash.value();
                 if v.starts_with("aabb:") {
@@ -154,10 +161,19 @@ pub async fn save_inst_relate_aabb(
                     format!("aabb:⟨{}⟩", v)
                 }
             };
-            // UPSERT 使用 id 作为主键，覆盖 in 和 out 字段
             sql.push_str(&format!(
-                "UPSERT inst_relate_aabb:⟨{refno}⟩ SET in = {refno_key}, out = {aabb_key};"
+                "RELATE {refno_key}->inst_relate_aabb->{aabb_key};"
             ));
+        }
+
+        if !in_keys.is_empty() {
+            sql.insert_str(
+                0,
+                &format!(
+                    "DELETE FROM inst_relate_aabb WHERE in IN [{}];",
+                    in_keys.join(",")
+                ),
+            );
         }
 
         if sql.is_empty() {

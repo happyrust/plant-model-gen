@@ -427,9 +427,18 @@ async fn process_bran_hang_core_logic(
         }
     }
 
-    // 2. 查询元件库分组
-    let target_bran_reuse_cata_map = aios_core::query_group_by_cata_hash(bran_roots).await
-        .unwrap_or_else(|_| DashMap::new());
+    // 2. 查询 BRAN 下子元件（管件）的元件库分组
+    // 注意：应该查询子元件（TEE、ELBO等）的 cata_hash，而不是 BRAN 自身
+    let child_refnos: Vec<RefnoEnum> = branch_refnos_map
+        .iter()
+        .flat_map(|entry| entry.value().iter().map(|c| c.refno).collect::<Vec<_>>())
+        .collect();
+    let target_bran_reuse_cata_map = if child_refnos.is_empty() {
+        DashMap::new()
+    } else {
+        aios_core::query_group_by_cata_hash(&child_refnos).await
+            .unwrap_or_else(|_| DashMap::new())
+    };
 
     // 3. 生成 CATE 几何
     let cate_outcome = cata_model::gen_cata_instances(

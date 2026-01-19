@@ -34,6 +34,8 @@ use aios_core::{
     CataNegGroup, GeoAabbTrans, GeoParam, GmGeoData, ManiGeoTransQuery, NegInfo, ParamNegInfo,
     QueryAabbParam, QueryGeoParam, query_aabb_params, query_geo_params, query_inst_geo_ids,
 };
+// 重新导出 aios_core 中的 AABB 更新函数
+pub use aios_core::update_inst_relate_aabbs_by_refnos;
 // 使用 aios_core 中查询方法的宏
 use aios_core::query_db;
 use anyhow::anyhow;
@@ -1211,112 +1213,6 @@ fn derive_csg_points(mesh: &PlantMesh, pts_json_map: &Arc<DashMap<u64, String>>)
         .collect()
 }
 
-/// 更新实例关联的包围盒数据（带 SQLite 空间索引优化）
-///
-/// 这是 aios_core::update_inst_relate_aabbs_by_refnos 的增强版本，
-/// 集成了 SQLite 空间索引支持，用于读取和写入 AABB 缓存。
-///
-/// # 参数
-///
-/// * `refnos` - 参考号数组
-/// * `replace_exist` - 是否替换已存在的包围盒数据
-///
-/// # 返回值
-///
-/// 返回 `anyhow::Result<()>` 表示更新是否成功
-///
-/// # 优化说明
-///
-/// 如果启用了 `sqlite-index` feature：
-/// - 优先从 SQLite 空间索引读取已缓存的 AABB
-/// - 计算新的 AABB 后写入 SQLite 空间索引
-/// - 减少重复计算，提升性能
-pub async fn update_inst_relate_aabbs_by_refnos(
-    refnos: &[RefnoEnum],
-    replace_exist: bool,
-) -> anyhow::Result<()> {
-    const CHUNK: usize = 100;
-
-    let aabb_map = DashMap::new();
-    let inst_aabb_map = DashMap::new();
-
-    for chunk in refnos.chunks(CHUNK) {
-        if chunk.is_empty() {
-            continue;
-        }
-
-        // 非替换模式下，跳过已经存在新表记录的 refno
-        let target_refnos = if replace_exist {
-            chunk.to_vec()
-        } else {
-            filter_missing_inst_aabb(chunk).await?
-        };
-
-        if target_refnos.is_empty() {
-            continue;
-        }
-
-        // inst_relate.aabb 不再作为过滤条件，因此查询时强制 replace_exist=true
-        let inst_keys = get_inst_relate_keys(&target_refnos);
-        let result = query_aabb_params(&inst_keys, true).await?;
-        println!(
-            "[aabb] 查询 inst_relate keys {} -> {} 个候选",
-            target_refnos.len(),
-            result.len()
-        );
-
-        for r in result {
-            // 过滤 world_trans 为 None 的记录
-            let Some(world_trans) = r.world_trans else { continue };
-            
-            // 计算合并后的 AABB
-            let mut aabb = Aabb::new_invalid();
-            for g in &r.geo_aabbs {
-                let t = world_trans * &g.trans;
-                let tmp_aabb = g.aabb.scaled(&t.scale.into());
-                let tmp_aabb = tmp_aabb.transform_by(&Isometry {
-                    rotation: t.rotation.into(),
-                    translation: t.translation.into(),
-                });
-                aabb.merge(&tmp_aabb);
-            }
-
-            // 过滤无效 AABB
-            let extent = aabb.extents().magnitude();
-            if extent.is_nan() || extent.is_infinite() {
-                continue;
-            }
-
-            let aabb_hash = gen_aabb_hash(&aabb).to_string();
-            aabb_map.entry(aabb_hash.clone()).or_insert(aabb);
-
-            let refno = r.refno();
-            inst_aabb_map.insert(refno.clone(), aabb_hash.clone());
-        }
-    }
-
-    // 批量保存 AABB 到 aabb 表
-    utils::save_aabb_to_surreal(&aabb_map).await;
-
-    if inst_aabb_map.is_empty() {
-        println!(
-            "[aabb] 未生成任何实例级 AABB（refnos={}，replace_exist={}），跳过 inst_relate_aabb 写入",
-            refnos.len(),
-            replace_exist
-        );
-        return Ok(());
-    }
-
-    // 将实例级 AABB 写入关系表 inst_relate_aabb（in=pe, out=aabb）
-    utils::save_inst_relate_aabb(&inst_aabb_map, "gen_mesh").await;
-    println!(
-        "[aabb] inst_relate_aabb 写入 {} 条记录 (replace_exist={})",
-        inst_aabb_map.len(),
-        replace_exist
-    );
-
-    Ok(())
-}
 
 /// 查询所有 pe_transform 的 refno（仅 world_trans 存在的实例）
 pub async fn fetch_inst_relate_refnos() -> anyhow::Result<Vec<RefnoEnum>> {

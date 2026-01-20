@@ -351,8 +351,8 @@ pub async fn save_instance_data_optimize(
             continue;
         }
 
-        // 使用压缩格式存储 ptset（减少约 70-80% 存储空间）
-        inst_info_buffer.push(info.gen_sur_json_compact(false));
+        // 使用完整格式存储 ptset（不压缩，方便调试和人工可读）
+        inst_info_buffer.push(info.gen_sur_json_full());
         if inst_info_buffer.len() >= CHUNK_SIZE {
             let statement = format!(
                 "INSERT IGNORE INTO {} [{}];",

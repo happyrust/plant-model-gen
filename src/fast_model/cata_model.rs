@@ -23,7 +23,7 @@ use aios_core::prim_geo::{PdmsTubing, TubiEdge};
 use aios_core::shape::pdms_shape::{BrepShapeTrait, PlantMesh, VerifiedShape};
 use aios_core::tool::math_tool::to_pdms_vec_str;
 use aios_core::{
-    HASH_PSEUDO_ATT_MAPS, NamedAttrMap, NamedAttrValue, RefU64, RefnoEnum, SUL_DB, gen_bytes_hash,
+    HASH_PSEUDO_ATT_MAPS, NamedAttrMap, NamedAttrValue, RefU64, RefnoEnum, SUL_DB, gen_aabb_hash, gen_bevy_transform_hash,
 };
 use bevy_transform::components::Transform;
 use dashmap::DashMap;
@@ -1310,8 +1310,8 @@ async fn gen_cata_geos_inner(
                     branch_refno.to_pe_key(),
                     current_tubing.index,
                     current_tubing.arrive_refno.to_pe_key(),
-                    gen_bytes_hash(&aabb),
-                    gen_bytes_hash(&t),
+                    gen_aabb_hash(&aabb),
+                    gen_bevy_transform_hash(&t),
                     current_tubing.tubi_size.to_string(),
                     bad_flag,
                     owner_refno.to_pe_key(),
@@ -1552,8 +1552,8 @@ async fn gen_cata_geos_inner(
                                         branch_refno.to_pe_key(),
                                         current_tubing.index,
                                         current_tubing.arrive_refno.to_pe_key(),
-                                        gen_bytes_hash(&aabb),
-                                        gen_bytes_hash(&t),
+                                        gen_aabb_hash(&aabb),
+                                        gen_bevy_transform_hash(&t),
                                         current_tubing.tubi_size.to_string(),
                                         bad_flag,
                                         owner_refno.to_pe_key(),
@@ -1690,8 +1690,8 @@ async fn gen_cata_geos_inner(
                         branch_refno.to_pe_key(),
                         current_tubing.index,
                         current_tubing.arrive_refno.to_pe_key(),
-                        gen_bytes_hash(&aabb),
-                        gen_bytes_hash(&t),
+                        gen_aabb_hash(&aabb),
+                        gen_bevy_transform_hash(&t),
                         current_tubing.tubi_size.to_string(),
                         bad_flag,
                         owner_refno.to_pe_key(),

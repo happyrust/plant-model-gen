@@ -15,10 +15,11 @@ mod tests {
         RecordId,
         SUL_DB,
         SurrealQueryExt,
-        gen_bytes_hash,
         get_db_option,
         init_surreal,
     };
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     use crate::options::DbOptionExt;
     use crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos;
     use anyhow::{Context, Result};
@@ -114,7 +115,12 @@ mod tests {
         apply_translation_delta(&mut trans_value, delta)?;
 
         let trans_json = serde_json::to_string(&trans_value)?;
-        let trans_hash = gen_bytes_hash(&trans_json);
+        // 对 JSON 字符串计算 hash
+        let trans_hash = {
+            let mut hasher = DefaultHasher::new();
+            trans_json.hash(&mut hasher);
+            hasher.finish()
+        };
         let new_trans_id = format!("trans:⟨{}⟩", trans_hash);
 
         let exists_sql = format!(

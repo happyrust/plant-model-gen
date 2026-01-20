@@ -2461,8 +2461,6 @@ pub async fn export_dbnum_instances_json(
                         name: format!("TUBI-{}-{}", raw_tubi_row.refno.to_string(), index),
                         spec_value: raw_tubi_row.spec_value,
                         aabb: raw_tubi_row.world_aabb,
-                        aabb_hash: raw_tubi_row.world_aabb_hash,
-                        trans_hash: raw_tubi_row.world_trans_hash,
                     };
 
                     tubings_map.entry(*owner_refno).or_default().push(tubi_record);
@@ -2550,14 +2548,7 @@ pub async fn export_dbnum_instances_json(
             }
         }
 
-        // V3: 收集 tubi 的 aabb_hash
-        if let Some(tubi_records) = tubings_map.get(owner_refno) {
-            for tubi in tubi_records {
-                if let Some(ref hash) = tubi.aabb_hash {
-                    aabb_table.insert(hash.clone(), serde_json::Value::Null);
-                }
-            }
-        }
+        // V3: 收集 tubi 的 aabb（后面统一计算 hash）
 
         // 构建 children 数组 (V3: 使用 hash 引用)
         let mut children = Vec::new();
@@ -2594,7 +2585,7 @@ pub async fn export_dbnum_instances_json(
                                 false,
                             );
                             // V3: 生成 geo_transform 的 hash 并收集到 trans_table
-                            let geo_trans_hash = aios_core::gen_bytes_hash(&geo_transform_vec);
+                            let geo_trans_hash = aios_core::gen_f32_array_hash(&geo_transform_vec);
                             let geo_trans_hash_str = geo_trans_hash.to_string();
                             trans_table.entry(geo_trans_hash_str.clone()).or_insert(geo_transform_vec);
                             json!({
@@ -2616,7 +2607,7 @@ pub async fn export_dbnum_instances_json(
                 &UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Millimeter),
                 false,
             );
-            let refno_trans_hash = aios_core::gen_bytes_hash(&world_transform_vec);
+            let refno_trans_hash = aios_core::gen_f32_array_hash(&world_transform_vec);
             let refno_trans_hash_str = refno_trans_hash.to_string();
             trans_table.entry(refno_trans_hash_str.clone()).or_insert(world_transform_vec);
 
@@ -2638,36 +2629,21 @@ pub async fn export_dbnum_instances_json(
         let mut tubings = Vec::new();
         if let Some(tubi_records) = tubings_map.get(owner_refno) {
             for tubi in tubi_records {
-                // V3: 使用数据库返回的 hash，或者生成新的
-                let tubi_aabb_hash = tubi.aabb_hash.clone();
-                let tubi_trans_hash = tubi.trans_hash.clone();
-
-                // 收集 aabb 到 aabb_table
-                if let (Some(hash), Some(aabb)) = (&tubi_aabb_hash, &tubi.aabb) {
-                    if !aabb_table.contains_key(hash) {
-                        aabb_table.insert(hash.clone(), aabb_to_json(aabb, &unit_converter));
-                    }
-                }
-
-                // 收集 trans 到 trans_table
-                let final_trans_hash = if let Some(ref hash) = tubi_trans_hash {
-                    let matrix = mat4_to_vec_dmat4(
-                        &tubi.transform,
-                        &UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Millimeter),
-                        true,
-                    );
-                    trans_table.entry(hash.clone()).or_insert(matrix);
-                    hash.clone()
-                } else {
-                    let matrix = mat4_to_vec_dmat4(
-                        &tubi.transform,
-                        &UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Millimeter),
-                        true,
-                    );
-                    let hash = aios_core::gen_bytes_hash(&matrix).to_string();
-                    trans_table.entry(hash.clone()).or_insert(matrix);
+                // V3: 计算 aabb hash
+                let tubi_aabb_hash = tubi.aabb.as_ref().map(|aabb| {
+                    let hash = aios_core::gen_plant_aabb_hash(aabb).to_string();
+                    aabb_table.entry(hash.clone()).or_insert_with(|| aabb_to_json(aabb, &unit_converter));
                     hash
-                };
+                });
+
+                // 计算 trans hash
+                let matrix = mat4_to_vec_dmat4(
+                    &tubi.transform,
+                    &UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Millimeter),
+                    true,
+                );
+                let final_trans_hash = aios_core::gen_f32_array_hash(&matrix).to_string();
+                trans_table.entry(final_trans_hash.clone()).or_insert(matrix);
 
                 tubings.push(json!({
                     "refno": tubi.refno.to_string(),
@@ -2752,7 +2728,7 @@ pub async fn export_dbnum_instances_json(
             &UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Millimeter),
             false,
         );
-        let refno_trans_hash = aios_core::gen_bytes_hash(&refno_transform_vec).to_string();
+        let refno_trans_hash = aios_core::gen_f32_array_hash(&refno_transform_vec).to_string();
         trans_table.entry(refno_trans_hash.clone()).or_insert(refno_transform_vec);
         
         let geo_instances: Vec<serde_json::Value> = instance_geom_map
@@ -2772,7 +2748,7 @@ pub async fn export_dbnum_instances_json(
                             false,
                         );
                         // V3: geo_transform 使用 hash 引用
-                        let geo_trans_hash = aios_core::gen_bytes_hash(&geo_transform_vec).to_string();
+                        let geo_trans_hash = aios_core::gen_f32_array_hash(&geo_transform_vec).to_string();
                         trans_table.entry(geo_trans_hash.clone()).or_insert(geo_transform_vec);
                         json!({
                             "geo_hash": inst.geo_hash,
@@ -2788,7 +2764,7 @@ pub async fn export_dbnum_instances_json(
             .and_then(|a| a.as_ref())
             .map(|aabb| {
                 let aabb_json = aabb_to_json(aabb, &unit_converter);
-                let hash = aios_core::gen_bytes_hash(&aabb_json.to_string()).to_string();
+                let hash = aios_core::gen_plant_aabb_hash(aabb).to_string();
                 aabb_table.entry(hash.clone()).or_insert(aabb_json);
                 hash
             });

@@ -6,7 +6,7 @@ use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::pdms_types::*;
 use aios_core::rs_surreal::delete_inst_relate_cascade;
 use aios_core::types::*;
-use aios_core::{SUL_DB, SurrealQueryExt, get_db_option};
+use aios_core::{SUL_DB, SurrealQueryExt, get_db_option, gen_aabb_hash, gen_bevy_transform_hash, gen_string_hash};
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -90,7 +90,7 @@ pub async fn save_instance_data_optimize(
                 continue;
             }
 
-            let transform_hash = gen_bytes_hash(&inst.transform);
+            let transform_hash = gen_bevy_transform_hash(&inst.transform);
             if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
                 entry.insert(serde_json::to_string(&inst.transform)?);
             }
@@ -125,7 +125,7 @@ pub async fn save_instance_data_optimize(
                 inst.visible,
                 cat_negs_str
             );
-            let relate_id = gen_bytes_hash(&relate_json);
+            let relate_id = gen_string_hash(&relate_json);
             geo_relate_buffer.push(format!("{{ {relate_json}, id: '{relate_id}' }}"));
 
             // 收集 Neg 和 CataCrossNeg 类型的 geo_relate 映射
@@ -205,13 +205,13 @@ pub async fn save_instance_data_optimize(
     // tubi -> aabb & transform maps
     for tubi in inst_mgr.inst_tubi_map.values() {
         if let Some(aabb) = tubi.aabb {
-            let aabb_hash = gen_bytes_hash(&aabb);
+            let aabb_hash = gen_aabb_hash(&aabb);
             if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
                 entry.insert(serde_json::to_string(&aabb)?);
             }
         }
 
-        let transform_hash = gen_bytes_hash(&tubi.world_transform);
+        let transform_hash = gen_bevy_transform_hash(&tubi.world_transform);
         if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
             entry.insert(serde_json::to_string(&tubi.world_transform)?);
         }
@@ -363,13 +363,13 @@ pub async fn save_instance_data_optimize(
             inst_info_buffer.clear();
         }
 
-        let transform_hash = gen_bytes_hash(&info.world_transform);
+        let transform_hash = gen_bevy_transform_hash(&info.world_transform);
         if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
             entry.insert(serde_json::to_string(&info.world_transform)?);
         }
 
         if let Some(aabb) = info.aabb {
-            let aabb_hash = gen_bytes_hash(&aabb);
+            let aabb_hash = gen_aabb_hash(&aabb);
             if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
                 entry.insert(serde_json::to_string(&aabb)?);
             }
@@ -450,14 +450,14 @@ pub async fn save_instance_data_optimize(
                 continue;
             }
 
-            let transform_hash = gen_bytes_hash(&info.world_transform);
+            let transform_hash = gen_bevy_transform_hash(&info.world_transform);
             if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
                 entry.insert(serde_json::to_string(&info.world_transform)?);
             }
 
             // 收集 aabb 数据（用于 tubi_relate）
             if let Some(aabb) = info.aabb {
-                let aabb_hash = gen_bytes_hash(&aabb);
+                let aabb_hash = gen_aabb_hash(&aabb);
                 if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
                     entry.insert(serde_json::to_string(&aabb)?);
                 }

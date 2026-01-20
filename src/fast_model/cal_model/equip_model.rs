@@ -1,6 +1,6 @@
 use crate::fast_model::query_provider;
 use crate::fast_model::utils::save_transforms_to_surreal;
-use aios_core::{RefU64, RefnoEnum, SUL_DB, gen_bytes_hash};
+use aios_core::{RefU64, RefnoEnum, SUL_DB, gen_bevy_transform_hash};
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
 use aios_core::{query_neareast_along_axis, query_neareast_by_pos_dir};
 
@@ -47,7 +47,7 @@ pub async fn update_cal_equip_wtrans() -> anyhow::Result<()> {
                 return Err(e);
             }
         };
-        let transform_hash = gen_bytes_hash(&world_trans);
+        let transform_hash = gen_bevy_transform_hash(&world_trans);
         if !transform_map.contains_key(&transform_hash) {
             transform_map.insert(transform_hash, serde_json::to_string(&world_trans).unwrap());
         }

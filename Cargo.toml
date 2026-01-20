@@ -12,11 +12,6 @@ name = "web_server"
 path = "src/bin/web_server.rs"
 required-features = ["web_server"]
 
-# [[bin]]
-# name = "gen_xkt_new"
-# path = "src/bin/gen_xkt_new.rs"
-# required-features = ["gen_model"]
-
 
 [dependencies]
 config = "0.15.18"

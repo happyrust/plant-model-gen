@@ -1365,7 +1365,9 @@ pub async fn export_dbnum_instances_json_mode(
     output_override: Option<PathBuf>,
     db_option_ext: &DbOptionExt,
 ) -> Result<()> {
-    use aios_database::fast_model::export_model::export_prepack_lod::export_dbnum_instances_json;
+    use aios_database::fast_model::export_model::export_prepack_lod::{
+        export_dbnum_instances_json, export_global_trans_aabb_json,
+    };
     use std::sync::Arc;
 
     println!("\n🎯 导出 dbnum 实例数据为 JSON（含 AABB）");
@@ -1390,11 +1392,16 @@ pub async fn export_dbnum_instances_json_mode(
     )
     .await?;
 
+    // 导出全局 trans.json 和 aabb.json
+    let (trans_count, aabb_count) = export_global_trans_aabb_json(&output_dir, None, verbose).await?;
+
     println!("\n🎉 导出完成！");
     println!("📊 统计信息:");
     println!("   - refno_count: {}", stats.refno_count);
     println!("   - descendant_count: {}", stats.descendant_count);
     println!("   - output_file_size: {} bytes", stats.output_file_size);
+    println!("   - trans_count: {}", trans_count);
+    println!("   - aabb_count: {}", aabb_count);
     println!("   - elapsed_time: {:?}", stats.elapsed_time);
     Ok(())
 }

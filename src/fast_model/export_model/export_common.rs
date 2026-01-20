@@ -632,7 +632,7 @@ pub async fn collect_export_data(
                 owner_noun,
                 owner_type,
                 spec_value: None,  // TODO: 从其他来源获取
-                has_neg: false,  // 默认不使用布尔结果
+                has_neg: geom_inst.has_neg,  // 使用查询返回的布尔运算标识
                 aabb: geom_inst.world_aabb,
             });
         }

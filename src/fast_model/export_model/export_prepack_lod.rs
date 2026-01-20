@@ -2585,6 +2585,9 @@ pub async fn export_dbnum_instances_json(
 
             let noun = child.noun.as_deref().unwrap_or("");
 
+            // 获取布尔运算标识
+            let has_neg = export_inst.map(|e| e.has_neg).unwrap_or(false);
+
             children.push(json!({
                 "refno": child_refno.to_string(),
                 "noun": noun,
@@ -2593,6 +2596,7 @@ pub async fn export_dbnum_instances_json(
                 "lod_mask": 1u32,
                 "spec_value": spec_value.unwrap_or(0),
                 "trans_hash": refno_trans_hash_str,
+                "has_neg": has_neg,
                 "geo_instances": instances,
             }));
         }
@@ -2689,6 +2693,9 @@ pub async fn export_dbnum_instances_json(
 
         // 使用数据库中的 aabb_hash
         let inst_aabb_hash = export_inst.and_then(|e| e.world_aabb_hash.clone());
+        
+        // 获取布尔运算标识
+        let has_neg = export_inst.map(|e| e.has_neg).unwrap_or(false);
 
         instances.push(json!({
             "refno": row.refno.to_string(),
@@ -2696,6 +2703,7 @@ pub async fn export_dbnum_instances_json(
             "name": row.name.unwrap_or_default(),
             "aabb_hash": inst_aabb_hash,
             "trans_hash": refno_trans_hash,
+            "has_neg": has_neg,
             "geo_instances": geo_instances,
         }));
     }

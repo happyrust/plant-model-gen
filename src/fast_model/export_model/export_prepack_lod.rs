@@ -2576,7 +2576,7 @@ pub async fn export_dbnum_instances_json(
                         .map(|inst| {
                             json!({
                                 "geo_hash": inst.geo_hash,
-                                "local_trans_hash": inst.trans_hash.clone().unwrap_or_default(),
+                                "geo_trans_hash": inst.trans_hash.clone().unwrap_or_default(),
                             })
                         })
                         .collect()
@@ -2595,7 +2595,7 @@ pub async fn export_dbnum_instances_json(
                 "aabb_hash": child_aabb_hash,
                 "lod_mask": 1u32,
                 "spec_value": spec_value.unwrap_or(0),
-                "refno_trans_hash": refno_trans_hash_str,
+                "trans_hash": refno_trans_hash_str,
                 "has_neg": has_neg,
                 "geo_instances": instances,
             }));
@@ -2611,7 +2611,7 @@ pub async fn export_dbnum_instances_json(
                     "name": tubi.name,
                     "aabb_hash": tubi.world_aabb_hash,
                     "geo_hash": tubi.geo_hash,
-                    "refno_trans_hash": tubi.world_trans_hash.clone().unwrap_or_default(),
+                    "trans_hash": tubi.world_trans_hash.clone().unwrap_or_default(),
                     "order": tubi.index,
                     "lod_mask": 1u32,
                     "spec_value": tubi.spec_value.unwrap_or(0),
@@ -2684,7 +2684,7 @@ pub async fn export_dbnum_instances_json(
                     .map(|inst| {
                         json!({
                             "geo_hash": inst.geo_hash,
-                            "local_trans_hash": inst.trans_hash.clone().unwrap_or_default(),
+                            "geo_trans_hash": inst.trans_hash.clone().unwrap_or_default(),
                         })
                     })
                     .collect()
@@ -2702,7 +2702,7 @@ pub async fn export_dbnum_instances_json(
             "noun": row.noun.unwrap_or_default(),
             "name": row.name.unwrap_or_default(),
             "aabb_hash": inst_aabb_hash,
-            "refno_trans_hash": refno_trans_hash,
+            "trans_hash": refno_trans_hash,
             "has_neg": has_neg,
             "geo_instances": geo_instances,
         }));

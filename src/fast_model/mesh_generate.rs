@@ -839,7 +839,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
         
         // 不需要 refno
         let geo_type_name = g.param.type_name();
-        match generate_csg_mesh(&g.param, &profile.csg_settings, non_scalable_geo, None) {
+        match generate_csg_mesh(&g.param, &profile.csg_settings, non_scalable_geo, false, None) {
             Some(csg_mesh) => {
                 let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
                 
@@ -1036,6 +1036,7 @@ pub async fn gen_inst_meshes(
                             &g.param,
                             &profile.csg_settings,
                             non_scalable_geo,
+                            false,
                             refno_for_mesh,
                         ) {
                             Some(csg_mesh) => {

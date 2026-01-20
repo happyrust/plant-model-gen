@@ -2330,7 +2330,7 @@ pub async fn export_dbnum_instances_json(
     let unit_converter = UnitConverter::new(LengthUnit::Millimeter, target);
 
     if verbose {
-        println!("🚀 开始导出 dbnum={} 的实例数据（含 AABB），目标单位: {:?}", dbnum, target);
+        println!("🚀 开始导出 dbnum={} 的实例数据，目标单位: {:?}", dbnum, target);
     }
 
     // 确保输出目录存在
@@ -2393,7 +2393,7 @@ pub async fn export_dbnum_instances_json(
     owner_refnos.sort_by_key(|r| r.to_string());
 
     if verbose {
-        println!("✅ 查询到 {} 个 owner 分组，共 {} 个子节点", 
+        println!("✅ 查询到 {} 个分组（BRAN/HANG/EQUI），共 {} 个子节点", 
             owner_refnos.len(), in_refnos.len());
     }
 
@@ -2461,6 +2461,8 @@ pub async fn export_dbnum_instances_json(
                         name: format!("TUBI-{}-{}", raw_tubi_row.refno.to_string(), index),
                         spec_value: raw_tubi_row.spec_value,
                         aabb: raw_tubi_row.world_aabb,
+                        world_aabb_hash: raw_tubi_row.world_aabb_hash,
+                        world_trans_hash: raw_tubi_row.world_trans_hash,
                     };
 
                     tubings_map.entry(*owner_refno).or_default().push(tubi_record);
@@ -2479,18 +2481,12 @@ pub async fn export_dbnum_instances_json(
         println!("✅ 查询到 {} 条 tubi_relate 记录", total_tubis);
     }
 
-    // 4. 批量查询所有 children 的几何体实例数据
-    // query_insts 返回的是：
-    // - world_trans: 构件(refno)的世界变换
-    // - insts[].transform: 几何体相对构件(refno)的局部变换
-    // export_dbnum_instances_json 的 V2 输出需要同时写出 refno_transform 与 geo_transform，
-    // 前端再做 world = refno_transform * geo_transform。
-    let mut geom_inst_map: HashMap<RefnoEnum, Vec<aios_core::ModelHashInst>> = HashMap::new();
-    let mut refno_world_trans_map: HashMap<RefnoEnum, DMat4> = HashMap::new();
-    let mut refno_has_neg_map: HashMap<RefnoEnum, bool> = HashMap::new();
+    // 4. 批量查询所有 children 的几何体实例数据（只查询 hash 引用，不查询实际数据）
+    // 使用 query_insts_for_export 直接获取数据库中的 hash ID
+    let mut export_inst_map: HashMap<RefnoEnum, aios_core::ExportInstQuery> = HashMap::new();
     if !in_refnos.is_empty() {
         // world_aabb 来自 inst_relate_aabb（可能未回填，导致导出 aabb=null 且前端无法做尺度一致性检查）。
-        // 这里在导出前“按需回填缺失的 inst_relate_aabb”，保证 world_trans/world_aabb 口径一致。
+        // 这里在导出前"按需回填缺失的 inst_relate_aabb"，保证 world_trans/world_aabb 口径一致。
         if let Err(e) =
             crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(&in_refnos, false).await
         {
@@ -2498,19 +2494,15 @@ pub async fn export_dbnum_instances_json(
             eprintln!("   导出的 JSON 中部分 aabb 字段可能为 null，前端无法做尺度一致性检查");
         }
         if verbose {
-            println!("🔍 查询 {} 个 refno 的几何体实例数据...", in_refnos.len());
+            println!("🔍 查询 {} 个 refno 的几何体实例 hash...", in_refnos.len());
         }
-        match aios_core::query_insts(&in_refnos, true).await {
-            Ok(geom_insts) => {
-                for geom_inst in geom_insts {
-                    // aios-core 0.2.3: GeomInstQuery.world_trans 为必填 PlantTransform（非 Option）
-                    let refno_world = plant_transform_to_dmat4(&geom_inst.world_trans);
-                    refno_world_trans_map.insert(geom_inst.refno, refno_world);
-                    refno_has_neg_map.insert(geom_inst.refno, false);  // 默认不使用布尔结果
-                    geom_inst_map.insert(geom_inst.refno, geom_inst.insts);
+        match aios_core::query_insts_for_export(&in_refnos, true).await {
+            Ok(export_insts) => {
+                for inst in export_insts {
+                    export_inst_map.insert(inst.refno, inst);
                 }
                 if verbose {
-                    println!("✅ 查询到 {} 个 refno 有几何体实例", geom_inst_map.len());
+                    println!("✅ 查询到 {} 个 refno 有几何体实例", export_inst_map.len());
                 }
             }
             Err(e) => {
@@ -2550,7 +2542,7 @@ pub async fn export_dbnum_instances_json(
 
         // V3: 收集 tubi 的 aabb（后面统一计算 hash）
 
-        // 构建 children 数组 (V3: 使用 hash 引用)
+        // 构建 children 数组 (V3: 直接使用数据库 hash 引用)
         let mut children = Vec::new();
         for child in &owner_group.children {
             let child_refno = &child.refno;
@@ -2563,53 +2555,33 @@ pub async fn export_dbnum_instances_json(
                 .to_string();
             let spec_value = child.spec_value;
 
-            // V3: aabb_hash 已在上面收集
-            let child_aabb_hash = child.aabb_hash.clone();
+            // 从 export_inst_map 获取几何体实例的 hash 引用
+            let export_inst = export_inst_map.get(child_refno);
+            
+            // 使用数据库中的 aabb_hash（优先使用 export_inst 中的，否则使用 child 中的）
+            let child_aabb_hash = export_inst
+                .and_then(|e| e.world_aabb_hash.clone())
+                .or_else(|| child.aabb_hash.clone());
 
-            // 从 geom_inst_map 获取几何体实例数据
-            let has_neg = refno_has_neg_map.get(child_refno).copied().unwrap_or(false);
-            let instances: Vec<serde_json::Value> = geom_inst_map
-                .get(child_refno)
-                .map(|insts| {
-                    insts
+            // 使用数据库中的 trans_hash
+            let refno_trans_hash_str = export_inst
+                .and_then(|e| e.world_trans_hash.clone())
+                .unwrap_or_default();
+
+            // 构建 geo_instances（直接使用数据库 hash）
+            let instances: Vec<serde_json::Value> = export_inst
+                .map(|e| {
+                    e.insts
                         .iter()
                         .map(|inst| {
-                            let geo_mat = if has_neg {
-                                DMat4::IDENTITY
-                            } else {
-                                plant_transform_to_dmat4(&inst.transform)
-                            };
-                            let geo_transform_vec = mat4_to_vec_dmat4(
-                                &geo_mat,
-                                &UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Millimeter),
-                                false,
-                            );
-                            // V3: 生成 geo_transform 的 hash 并收集到 trans_table
-                            let geo_trans_hash = aios_core::gen_f32_array_hash(&geo_transform_vec);
-                            let geo_trans_hash_str = geo_trans_hash.to_string();
-                            trans_table.entry(geo_trans_hash_str.clone()).or_insert(geo_transform_vec);
                             json!({
                                 "geo_hash": inst.geo_hash,
-                                "trans_hash": geo_trans_hash_str,
+                                "trans_hash": inst.trans_hash.clone().unwrap_or_default(),
                             })
                         })
                         .collect()
                 })
                 .unwrap_or_default();
-
-            // V3: refno_transform 使用 hash 引用
-            let world_transform = refno_world_trans_map
-                .get(child_refno)
-                .copied()
-                .unwrap_or(DMat4::IDENTITY);
-            let world_transform_vec: Vec<f32> = mat4_to_vec_dmat4(
-                &world_transform,
-                &UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Millimeter),
-                false,
-            );
-            let refno_trans_hash = aios_core::gen_f32_array_hash(&world_transform_vec);
-            let refno_trans_hash_str = refno_trans_hash.to_string();
-            trans_table.entry(refno_trans_hash_str.clone()).or_insert(world_transform_vec);
 
             let noun = child.noun.as_deref().unwrap_or("");
 
@@ -2625,33 +2597,17 @@ pub async fn export_dbnum_instances_json(
             }));
         }
 
-        // 构建 tubings 数组 (V3: 使用 hash 引用)
+        // 构建 tubings 数组 (V3: 直接使用数据库 hash 引用)
         let mut tubings = Vec::new();
         if let Some(tubi_records) = tubings_map.get(owner_refno) {
             for tubi in tubi_records {
-                // V3: 计算 aabb hash
-                let tubi_aabb_hash = tubi.aabb.as_ref().map(|aabb| {
-                    let hash = aios_core::gen_plant_aabb_hash(aabb).to_string();
-                    aabb_table.entry(hash.clone()).or_insert_with(|| aabb_to_json(aabb, &unit_converter));
-                    hash
-                });
-
-                // 计算 trans hash
-                let matrix = mat4_to_vec_dmat4(
-                    &tubi.transform,
-                    &UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Millimeter),
-                    true,
-                );
-                let final_trans_hash = aios_core::gen_f32_array_hash(&matrix).to_string();
-                trans_table.entry(final_trans_hash.clone()).or_insert(matrix);
-
                 tubings.push(json!({
                     "refno": tubi.refno.to_string(),
                     "noun": "TUBI",
                     "name": tubi.name,
-                    "aabb_hash": tubi_aabb_hash,
+                    "aabb_hash": tubi.world_aabb_hash,
                     "geo_hash": tubi.geo_hash,
-                    "trans_hash": final_trans_hash,
+                    "trans_hash": tubi.world_trans_hash.clone().unwrap_or_default(),
                     "order": tubi.index,
                     "lod_mask": 1u32,
                     "spec_value": tubi.spec_value.unwrap_or(0),
@@ -2679,30 +2635,22 @@ pub async fn export_dbnum_instances_json(
         println!("✅ 查询到 {} 个非聚合类型实例", instance_rows.len());
     }
 
-    // 7. 查询这些 refno 的几何实例和 AABB
+    // 7. 查询这些 refno 的几何实例 hash（只查询 hash 引用，不查询实际数据）
     let instance_refnos: Vec<RefnoEnum> = instance_rows.iter().map(|r| r.refno).collect();
-    let mut instance_geom_map: HashMap<RefnoEnum, Vec<aios_core::ModelHashInst>> = HashMap::new();
-    let mut instance_aabb_map: HashMap<RefnoEnum, Option<aios_core::types::PlantAabb>> = HashMap::new();
-    let mut instance_world_trans_map: HashMap<RefnoEnum, DMat4> = HashMap::new();
-    // 同 refno_has_neg_map：用于避免实例级布尔结果的 world_transform 重复应用。
-    let mut instance_has_neg_map: HashMap<RefnoEnum, bool> = HashMap::new();
+    let mut instance_export_map: HashMap<RefnoEnum, aios_core::ExportInstQuery> = HashMap::new();
 
     if !instance_refnos.is_empty() {
-        // 查询几何实例
+        // 查询几何实例 hash
         if verbose {
-            println!("🔍 查询 {} 个实例的几何数据...", instance_refnos.len());
+            println!("🔍 查询 {} 个实例的几何 hash...", instance_refnos.len());
         }
-        match aios_core::query_insts(&instance_refnos, true).await {
-            Ok(geom_insts) => {
-                for geom_inst in geom_insts {
-                    instance_geom_map.insert(geom_inst.refno, geom_inst.insts);
-                    instance_aabb_map.insert(geom_inst.refno, geom_inst.world_aabb);
-                    instance_has_neg_map.insert(geom_inst.refno, geom_inst.has_neg);  // 直接使用查询返回的布尔运算标识
-                    let refno_world = plant_transform_to_dmat4(&geom_inst.world_trans);
-                    instance_world_trans_map.insert(geom_inst.refno, refno_world);
+        match aios_core::query_insts_for_export(&instance_refnos, true).await {
+            Ok(export_insts) => {
+                for inst in export_insts {
+                    instance_export_map.insert(inst.refno, inst);
                 }
                 if verbose {
-                    println!("✅ 查询到 {} 个实例有几何体数据", instance_geom_map.len());
+                    println!("✅ 查询到 {} 个实例有几何体数据", instance_export_map.len());
                 }
             }
             Err(e) => {
@@ -2713,61 +2661,34 @@ pub async fn export_dbnum_instances_json(
         }
     }
 
-    // 8. 构建 instances 数组 (V3: 使用 hash 引用)
+    // 8. 构建 instances 数组 (V3: 直接使用数据库 hash 引用)
     let mut instances = Vec::new();
     for row in instance_rows {
-        let has_neg = instance_has_neg_map.get(&row.refno).copied().unwrap_or(false);
-        let refno_world = instance_world_trans_map
-            .get(&row.refno)
-            .copied()
-            .unwrap_or(DMat4::IDENTITY);
+        // 从 instance_export_map 获取几何体实例的 hash 引用
+        let export_inst = instance_export_map.get(&row.refno);
         
-        // V3: refno_transform 使用 hash 引用
-        let refno_transform_vec: Vec<f32> = mat4_to_vec_dmat4(
-            &refno_world,
-            &UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Millimeter),
-            false,
-        );
-        let refno_trans_hash = aios_core::gen_f32_array_hash(&refno_transform_vec).to_string();
-        trans_table.entry(refno_trans_hash.clone()).or_insert(refno_transform_vec);
+        // 使用数据库中的 trans_hash
+        let refno_trans_hash = export_inst
+            .and_then(|e| e.world_trans_hash.clone())
+            .unwrap_or_default();
         
-        let geo_instances: Vec<serde_json::Value> = instance_geom_map
-            .get(&row.refno)
-            .map(|insts| {
-                insts
+        // 构建 geo_instances（直接使用数据库 hash）
+        let geo_instances: Vec<serde_json::Value> = export_inst
+            .map(|e| {
+                e.insts
                     .iter()
                     .map(|inst| {
-                        let geo_mat = if has_neg {
-                            DMat4::IDENTITY
-                        } else {
-                            plant_transform_to_dmat4(&inst.transform)
-                        };
-                        let geo_transform_vec = mat4_to_vec_dmat4(
-                            &geo_mat,
-                            &UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Millimeter),
-                            false,
-                        );
-                        // V3: geo_transform 使用 hash 引用
-                        let geo_trans_hash = aios_core::gen_f32_array_hash(&geo_transform_vec).to_string();
-                        trans_table.entry(geo_trans_hash.clone()).or_insert(geo_transform_vec);
                         json!({
                             "geo_hash": inst.geo_hash,
-                            "trans_hash": geo_trans_hash,
+                            "trans_hash": inst.trans_hash.clone().unwrap_or_default(),
                         })
                     })
                     .collect()
             })
             .unwrap_or_default();
 
-        // V3: aabb 使用 hash 引用
-        let inst_aabb_hash = instance_aabb_map.get(&row.refno)
-            .and_then(|a| a.as_ref())
-            .map(|aabb| {
-                let aabb_json = aabb_to_json(aabb, &unit_converter);
-                let hash = aios_core::gen_plant_aabb_hash(aabb).to_string();
-                aabb_table.entry(hash.clone()).or_insert(aabb_json);
-                hash
-            });
+        // 使用数据库中的 aabb_hash
+        let inst_aabb_hash = export_inst.and_then(|e| e.world_aabb_hash.clone());
 
         instances.push(json!({
             "refno": row.refno.to_string(),

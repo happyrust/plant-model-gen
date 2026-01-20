@@ -142,6 +142,10 @@ pub struct TubiRecord {
     pub spec_value: Option<i64>,
     /// 世界坐标系下的包围盒（可能为空）
     pub aabb: Option<aios_core::types::PlantAabb>,
+    /// 世界包围盒 hash（数据库 record ID）
+    pub world_aabb_hash: Option<String>,
+    /// 世界变换 hash（数据库 record ID）
+    pub world_trans_hash: Option<String>,
 }
 
 /// 线程安全的几何体缓存
@@ -688,6 +692,8 @@ pub async fn collect_export_data(
             name: tubi_name,
             spec_value: tubi.spec_value,
             aabb: tubi.world_aabb,
+            world_aabb_hash: None,
+            world_trans_hash: None,
         });
     }
 

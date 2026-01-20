@@ -1397,12 +1397,12 @@ pub async fn export_dbnum_instances_json_mode(
 
     println!("\n🎉 导出完成！");
     println!("📊 统计信息:");
-    println!("   - refno_count: {}", stats.refno_count);
-    println!("   - descendant_count: {}", stats.descendant_count);
-    println!("   - output_file_size: {} bytes", stats.output_file_size);
-    println!("   - trans_count: {}", trans_count);
-    println!("   - aabb_count: {}", aabb_count);
-    println!("   - elapsed_time: {:?}", stats.elapsed_time);
+    println!("   - BRAN/HANG/EQUI 分组数量: {}", stats.refno_count);
+    println!("   - 子节点数量: {}", stats.descendant_count);
+    println!("   - 输出文件大小: {} 字节", stats.output_file_size);
+    println!("   - 变换矩阵数量 (trans): {}", trans_count);
+    println!("   - 包围盒数量 (aabb): {}", aabb_count);
+    println!("   - 耗时: {:?}", stats.elapsed_time);
     Ok(())
 }
 

@@ -350,34 +350,37 @@ pub async fn apply_cata_neg_boolean_manifold(
             ensure_parent_dir(&target_path)?;
 
             if final_manifold.export_to_glb(&target_path).is_ok() {
-                // let obj_path = boolean_obj_path(&new_id.to_string());
-                // if let Err(e) = mesh.export_obj(false, obj_path.to_string_lossy().as_ref()) {
-                //     eprintln!("导出 OBJ 失败: refno={} err={}", g.refno, e);
-                // }
-
+                // ========== 步骤 1：创建布尔结果 mesh 记录 ==========
+                // 创建 inst_geo 记录，标记为已网格化
                 update_sql.push_str(&format!(
                     "create inst_geo:⟨{}⟩ set meshed = true, aabb = {};",
                     mesh_id,
                     &pos.aabb_id.to_raw()
                 ));
+
+                // ========== 步骤 2：创建 geo_relate 关联记录 ==========
+                // 建立 inst_info -> geo_relate -> inst_geo 的关系
+                // geo_type='CatePos' 表示这是布尔运算后的结果（应该导出）
                 let relate_sql = format!(
-                    "relate {}->geo_relate->inst_geo:⟨{}⟩ set geom_refno=pe:⟨{}⟩, geo_type='Pos', trans=trans:⟨0⟩, visible = true;",
+                    "relate {}->geo_relate->inst_geo:⟨{}⟩ set geom_refno=pe:⟨{}⟩, geo_type='CatePos', trans=trans:⟨0⟩, visible = true;",
                     &g.inst_info_id.to_raw(),
                     mesh_id,
-                    format!("{}_b", bg[0]),
+                    bg[0],
                 );
                 update_sql.push_str(relate_sql.as_str());
                 
-                // 将原正实体的 geo_type 从 Pos 更新为 CatePos（隐含的原始正实体）
+                // ========== 步骤 3：隐藏原始几何记录 ==========
+                // 将原正实体的 geo_type 从 Pos 更新为 Compound（不导出）
                 // 并设置 visible=false，使其在查询时被排除
                 let hide_original_sql = format!(
-                    "UPDATE {}->geo_relate SET geo_type = 'CatePos', visible = false WHERE geom_refno = pe:⟨{}⟩ AND geo_type = 'Pos';",
+                    "UPDATE {}->geo_relate SET geo_type = 'Compound', visible = false WHERE geom_refno = pe:⟨{}⟩ AND geo_type = 'Pos';",
                     &g.inst_info_id.to_raw(),
                     bg[0],
                 );
                 update_sql.push_str(&hide_original_sql);
 
-                // 写入 catalog 布尔状态（用于 worker 去重与排查）
+                // ========== 步骤 4：写入 catalog 布尔状态 ==========
+                // 用于 worker 去重与排查
                 crate::fast_model::utils::save_inst_relate_cata_bool(
                     g.refno,
                     Some(&mesh_id),

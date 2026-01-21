@@ -13,6 +13,8 @@ extern crate strum;
 
 use std::path::{Path, PathBuf};
 
+use chrono::{Datelike, Local, Timelike};
+
 #[cfg(not(feature = "gui"))]
 mod cli_modes;
 
@@ -624,6 +626,29 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    if debug_model_requested {
+        db_option_ext.inner.enable_log = true;
+        let now = Local::now();
+        let log_refno = debug_model_refnos
+            .as_ref()
+            .and_then(|refnos| refnos.first().map(|s| s.as_str()))
+            .unwrap_or("debug");
+        let log_filename = format!(
+            "logs/{}_{}-{:02}-{:02}_{:02}-{:02}-{:02}.log",
+            log_refno,
+            now.year(),
+            now.month(),
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
+        );
+        unsafe {
+            std::env::set_var("AIOS_LOG_FILE", log_filename);
+        }
+        aios_database::init_logging(true);
+    }
 
     // ========== 处理 --regen-model 参数（影响纯模型生成） ==========
     if matches.get_flag("regen-model") {

@@ -2,8 +2,9 @@
 //!
 //! 统一管理 `output/scene_tree/{dbnum}.tree` 文件的加载和查询
 
+use crate::versioned_db::db_meta_info::DEFAULT_TREE_DIR;
+use aios_core::tool::db_tool::{db1_dehash, db1_hash};
 use aios_core::tree_query::{load_tree_index_from_dir, TreeIndex, TreeQueryFilter, TreeQueryOptions};
-use aios_core::tool::db_tool::{db1_hash, db1_dehash};
 use aios_core::{RefnoEnum, RefU64};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,7 +33,7 @@ impl TreeIndexManager {
 
     /// 使用默认目录创建 Manager
     pub fn with_default_dir(dbnums: Vec<u32>) -> Self {
-        Self::new("output/scene_tree", dbnums)
+        Self::new(DEFAULT_TREE_DIR, dbnums)
     }
 
     /// 获取管理的 dbnum 列表
@@ -40,9 +41,39 @@ impl TreeIndexManager {
         &self.dbnums
     }
 
+    /// 获取 TreeIndex 目录
+    pub fn tree_dir(&self) -> &Path {
+        &self.tree_dir
+    }
+
     /// 加载指定 dbnum 的 TreeIndex
     pub fn load_index(&self, dbnum: u32) -> anyhow::Result<Arc<TreeIndex>> {
         load_tree_index_from_dir(dbnum, &self.tree_dir)
+    }
+
+    /// 通过 refno 解析 dbnum
+    pub async fn resolve_dbnum_for_refno(refno: RefnoEnum) -> anyhow::Result<u32> {
+        if let Some(dbnum) = crate::fast_model::db_meta_cache::get_dbnum_for_refno(refno) {
+            return Ok(dbnum);
+        }
+
+        let Some(pe) = aios_core::get_pe(refno).await? else {
+            return Err(anyhow::anyhow!("refno {} 不存在，无法获取 dbnum", refno));
+        };
+        if pe.dbnum < 0 {
+            return Err(anyhow::anyhow!(
+                "refno {} 的 dbnum 非法: {}",
+                refno,
+                pe.dbnum
+            ));
+        }
+        Ok(pe.dbnum as u32)
+    }
+
+    /// 通过 refno 加载对应 TreeIndex
+    pub async fn load_index_for_refno(&self, refno: RefnoEnum) -> anyhow::Result<Arc<TreeIndex>> {
+        let dbnum = Self::resolve_dbnum_for_refno(refno).await?;
+        self.load_index(dbnum)
     }
 
     /// 查询指定 noun 类型的所有 refnos

@@ -19,7 +19,6 @@ use crate::options::DbOptionExt;
 use anyhow::Result;
 use std::time::Instant;
 use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
 use futures::stream::{FuturesUnordered, StreamExt};
 use glam::Vec3;
 
@@ -34,7 +33,7 @@ use crate::data_interface::increment_record::IncrGeoUpdateLog;
 use crate::fast_model::query_provider::{query_by_type, query_multi_descendants};
 use crate::fast_model::{cata_model, debug_model_debug, debug_model_trace, loop_model, prim_model};
 
-use super::utilities::is_e3d_debug_enabled;
+use super::utilities::{build_cata_hash_map_from_tree, is_e3d_debug_enabled};
 
 use super::models::DbModelInstRefnos;
 
@@ -132,7 +131,7 @@ pub async fn gen_geos_data_by_dbnum(
         }
 
         let target_bran_reuse_cata_map: DashMap<String, CataHashRefnoKV> = {
-            let map = aios_core::query_group_by_cata_hash(target_bran_hanger_refnos.as_slice())
+            let map = build_cata_hash_map_from_tree(target_bran_hanger_refnos.as_slice())
                 .await
                 .unwrap_or_default();
             if let Some(t_refno) = test_refno {
@@ -177,7 +176,7 @@ pub async fn gen_geos_data_by_dbnum(
         // 查询单个使用元件库的数量
         let target_single_cata_map = {
             // 要过滤掉 owner 是 BRAN 和 HANG 的
-            let map = aios_core::query_group_by_cata_hash(cur_cate_refnos.as_slice())
+            let map = build_cata_hash_map_from_tree(cur_cate_refnos.as_slice())
                 .await
                 .unwrap_or_default();
             map
@@ -357,39 +356,56 @@ async fn process_gen_geos_data_chunks(
             
             r.into_iter().collect()
         };
-        let target_bran_reuse_cata_map: DashMap<String, CataHashRefnoKV> = {
-            let map = aios_core::query_group_by_cata_hash(&target_bran_hanger_refnos)
+        // 🔧 修复：先收集 BRAN 的子元件，再用子元件的 refno 查询 cata_hash
+        // 之前错误地使用 BRAN 本身的 refno，但 BRAN 不是元件库元素，其 cata_hash 为 "0"
+        let mut branch_refnos_map: DashMap<RefnoEnum, Vec<aios_core::pe::SPdmsElement>> = DashMap::new();
+        let mut bran_comp_eles: Vec<RefnoEnum> = vec![];
+        for &refno in &target_bran_hanger_refnos {
+            let children = aios_core::collect_children_elements(refno, &[])
                 .await
                 .unwrap_or_default();
+            bran_comp_eles.extend(children.iter().map(|x| x.refno));
+            branch_refnos_map.insert(refno, children);
+        }
+        debug_model_debug!(
+            "[BRAN_FIX] 收集 BRAN 子元件完成: bran_count={}, child_count={}",
+            target_bran_hanger_refnos.len(),
+            bran_comp_eles.len()
+        );
+
+        // 使用子元件的 refno 查询 cata_hash（而非 BRAN 本身）
+        let target_bran_reuse_cata_map: DashMap<String, CataHashRefnoKV> = if bran_comp_eles.is_empty() {
+            DashMap::new()
+        } else {
+            let map = build_cata_hash_map_from_tree(&bran_comp_eles)
+                .await
+                .unwrap_or_default();
+            debug_model_debug!(
+                "[BRAN_FIX] 子元件 cata_hash 分组完成: unique_cata_count={}",
+                map.len()
+            );
+            for kv in map.iter() {
+                debug_model_debug!(
+                    "  cata_hash: {}, group_refnos: {:?}",
+                    kv.key(),
+                    kv.value().group_refnos
+                );
+            }
             map
         };
         let mut use_cata_refnos = HashSet::new();
         // 查询单个使用元件库的数量
         let target_single_cata_map = if is_incr_update {
-            let cata_map: DashMap<String, CataHashRefnoKV> = DashMap::new();
             let cata_refnos = &incr_updates_log_arc.basic_cata_refnos;
-            // 直接使用 group 的办法，按 cata_hash 进行分组
-            for &r in cata_refnos {
-                if let Ok(Some(att)) = aios_core::get_pe(r).await {
-                    let cata_hash = att.cata_hash.clone();
-                    match cata_map.entry(cata_hash.clone()) {
-                        Entry::Occupied(mut entry) => {
-                            let value = entry.get_mut();
-                            if !value.group_refnos.contains(&r) {
-                                value.group_refnos.push(r);
-                            }
-                        }
-                        Entry::Vacant(entry) => {
-                            entry.insert(CataHashRefnoKV {
-                                cata_hash,
-                                group_refnos: vec![r],
-                                ..Default::default()
-                            });
-                        }
-                    }
-                }
+            if cata_refnos.is_empty() {
+                DashMap::new()
+            } else {
+                let cata_refnos_vec: Vec<RefnoEnum> =
+                    cata_refnos.iter().copied().collect();
+                build_cata_hash_map_from_tree(&cata_refnos_vec)
+                    .await
+                    .unwrap_or_default()
             }
-            cata_map
         } else {
             // 查询是否是单个使用元件库，父节点是 BRAN HANG
             let sql = format!(
@@ -434,18 +450,24 @@ async fn process_gen_geos_data_chunks(
             );
             debug_model_debug!("use_cata_refnos: {:?}", &use_cata_refnos);
 
-            use_cata_refnos.extend(bran_children_refnos);
+            // 🔧 修复：不再将 bran_children_refnos 添加到 use_cata_refnos
+            // BRAN 子元件已在 target_bran_reuse_cata_map 中处理，避免重复
+            // use_cata_refnos.extend(bran_children_refnos);
+            debug_model_debug!(
+                "[BRAN_FIX] 跳过 bran_children_refnos 扩展，避免与 target_bran_reuse_cata_map 重复"
+            );
 
             debug_model_debug!(
-                "扩展 bran_children_refnos 后 use_cata_refnos 数量: {}",
+                "use_cata_refnos 数量 (排除 BRAN 子元件): {}",
                 use_cata_refnos.len()
             );
 
-            let map = aios_core::query_group_by_cata_hash(&use_cata_refnos)
+            let use_cata_vec: Vec<RefnoEnum> = use_cata_refnos.iter().copied().collect();
+            let map = build_cata_hash_map_from_tree(&use_cata_vec)
                 .await
                 .unwrap_or_default();
 
-            debug_model_debug!("query_group_by_cata_hash 返回的 map 数量: {}", map.len());
+            debug_model_debug!("tree cata_hash 分组 map 数量: {}", map.len());
             for kv in map.iter() {
                 debug_model_debug!(
                     "  cata_hash: {}, group_refnos: {:?}",
@@ -455,23 +477,8 @@ async fn process_gen_geos_data_chunks(
             }
             map
         };
-        // 打印管道/支吊架的使用数量
+        // 元件库的模型计算（BRAN/HANG 子元件已在前面收集）
         if !target_bran_hanger_refnos.is_empty() && gen_cata_flag {
-            // 查询出 branch 和 branch 下的子节点
-            let mut branch_refnos_map = DashMap::new();
-            let mut bran_comp_eles = vec![];
-            for &refno in &target_bran_hanger_refnos {
-                // 使用新的泛型函数接口
-                let children = aios_core::collect_children_elements(refno, &[])
-                    .await
-                    .unwrap_or_default();
-                bran_comp_eles.extend(children.iter().map(|x| x.refno));
-                // 求出元件对应的 outside bore
-                branch_refnos_map.insert(refno, children);
-            }
-
-            // 元件库的模型计算
-            // bran，hanger 下需要重用的模型
             if !target_bran_reuse_cata_map.is_empty() || !branch_refnos_map.is_empty() {
                 let sjus_map_clone = loop_sjus_map_arc.clone();
                 let db_option = db_option_arc.clone();

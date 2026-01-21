@@ -23,6 +23,7 @@ use super::context::NounProcessContext;
 use super::errors::{FullNounError, Result};
 use super::loop_processor::process_loop_refno_page;
 use super::prim_processor::process_prim_refno_page;
+use super::utilities::build_cata_hash_map_from_tree;
 use crate::fast_model::refno_errors::{
     REFNO_ERROR_STORE, RefnoErrorKind, RefnoErrorStage, record_refno_error,
 };
@@ -436,8 +437,9 @@ async fn process_bran_hang_core_logic(
     let target_bran_reuse_cata_map = if child_refnos.is_empty() {
         DashMap::new()
     } else {
-        aios_core::query_group_by_cata_hash(&child_refnos).await
-            .unwrap_or_else(|_| DashMap::new())
+        build_cata_hash_map_from_tree(&child_refnos)
+            .await
+            .unwrap_or_default()
     };
 
     // 3. 生成 CATE 几何

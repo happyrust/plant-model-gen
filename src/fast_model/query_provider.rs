@@ -15,6 +15,7 @@
 //! ).await?;
 //! ```
 
+use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 use aios_core::RefnoEnum;
 use aios_core::mdb;
 use aios_core::query_provider::*;
@@ -44,10 +45,13 @@ async fn init_provider() -> anyhow::Result<Arc<dyn QueryProvider>> {
 
     // 在 Windows 上，加载/反序列化较大的 `.tree` 文件时可能触发主线程栈溢出；
     // 这里用大栈线程执行初始化，避免 `STATUS_STACK_OVERFLOW` 直接杀进程。
+    let tree_dir = TreeIndexManager::with_default_dir(Vec::new())
+        .tree_dir()
+        .to_path_buf();
     let handle = std::thread::Builder::new()
         .name("tree-index-loader".to_string())
         .stack_size(64 * 1024 * 1024)
-        .spawn(|| TreeIndexQueryProvider::from_tree_dir("output/scene_tree"))
+        .spawn(move || TreeIndexQueryProvider::from_tree_dir(tree_dir))
         .context("创建 tree-index-loader 线程失败")?;
 
     let provider = handle

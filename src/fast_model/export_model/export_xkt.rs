@@ -3,12 +3,9 @@
 //! 本模块实现了将 PDMS 模型导出为 XKT 格式的功能。
 //! XKT 是一种用于 Web 3D 可视化的高效格式。
 
-use crate::fast_model::gen_model::gen_geos_data;
-use crate::fast_model::pdms_inst::save_instance_data_optimize;
+// use crate::fast_model::gen_model::gen_geos_data;
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
 use aios_core::RefnoEnum;
-use aios_core::geometry::ShapeInstancesData;
-use aios_core::options::DbOption;
 use aios_core::shape::pdms_shape::PlantMesh;
 use anyhow::{Context, Result, anyhow};
 use glam::{DMat4, Vec3};
@@ -476,50 +473,14 @@ impl XktExporter {
         verbose: bool,
     ) -> Result<()> {
         if verbose {
-            println!("\n🔨 生成 Mesh 文件...");
+            println!("\n⚠️  gen_geos_data 已停用，需改用 Full Noun 入口（gen_all_geos_data）");
             println!("   - 参考号数量: {}", refnos.len());
-        }
-
-        let start_time = Instant::now();
-
-        // 加载数据库配置
-        let db_option = if let Some(config_path) = db_config {
-            let content = std::fs::read_to_string(config_path)
-                .with_context(|| format!("读取配置文件失败: {}", config_path))?;
-            toml::from_str::<DbOption>(&content)
-                .with_context(|| format!("解析配置文件失败: {}", config_path))?
+            println!("   - dbnum={:?}, db_config={:?}", dbnum, db_config);
         } else {
-            DbOption::default()
-        };
-
-        // 创建 flume channel 用于接收生成的数据
-        let (sender, receiver) = flume::unbounded::<ShapeInstancesData>();
-
-        // 启动数据保存任务
-        let save_task = tokio::spawn(async move {
-            while let Ok(data) = receiver.recv_async().await {
-                if let Err(e) = save_instance_data_optimize(&data, false).await {
-                    eprintln!("⚠️  保存 mesh 数据失败: {}", e);
-                }
-            }
-        });
-
-        // 启动几何体生成
-        let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
-        gen_geos_data(dbnum, refnos.to_vec(), &db_option_ext, None, sender, None, false)
-            .await
-            .context("生成几何体数据失败")?;
-
-        // 等待保存任务完成
-        save_task
-            .await
-            .map_err(|e| anyhow!("等待 mesh 保存任务结束失败: {}", e))?;
-
-        if verbose {
-            println!("   ✓ Mesh 生成完成，耗时: {:?}", start_time.elapsed());
+            let _ = (refnos, dbnum, db_config);
         }
 
-        Ok(())
+        Err(anyhow!("gen_geos_data 已停用，请改用 Full Noun 入口（gen_all_geos_data）"))
     }
 
     fn setup_metadata(&self, xkt_file: &mut XKTFile) {

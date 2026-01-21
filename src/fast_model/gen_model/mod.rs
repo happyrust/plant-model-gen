@@ -39,10 +39,11 @@ pub mod full_noun_mode;
 pub mod orchestrator;
 
 // 非 Full Noun 模式（增量更新、手动 refno、调试模式等）
-pub mod non_full_noun;
+mod non_full_noun;
 
 // 实用工具
 pub mod utilities;
+pub mod tree_index_manager;
 
 // Mesh 处理
 pub mod mesh_processing;
@@ -69,8 +70,8 @@ pub use prim_processor::process_prim_refno_page;
 // 编排器：主入口函数
 pub use orchestrator::gen_all_geos_data;
 
-// 非 Full Noun 模式导出
-pub use non_full_noun::{gen_geos_data, gen_geos_data_by_dbnum};
+// 非 Full Noun 入口已停用（仅保留 Full Noun 入口）
+// pub use non_full_noun::{gen_geos_data, gen_geos_data_by_dbnum};
 
 // 实用工具函数
 pub use utilities::{

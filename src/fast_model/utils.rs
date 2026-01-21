@@ -7,6 +7,7 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinSet;
 
 static INST_RELATE_AABB_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
+static INST_RELATE_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 
 /// 确保 inst_relate_aabb 以“关系表”方式工作：in=pe，out=aabb，且 `in` 唯一。
 ///
@@ -45,6 +46,37 @@ pub async fn ensure_inst_relate_aabb_relation_schema() {
                 .query(
                     "DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS in UNIQUE;",
                 )
+                .await;
+        })
+        .await;
+}
+
+/// 确保 inst_relate 以“关系表”方式工作：in=pe，out=inst_info。
+///
+/// 需要重建 inst_relate，保证旧的普通表结构不影响图查询与复用逻辑。
+pub async fn ensure_inst_relate_relation_schema() {
+    INST_RELATE_SCHEMA_INIT
+        .get_or_init(|| async {
+            let _ = SUL_DB.query("REMOVE TABLE inst_relate;").await;
+
+            let _ = SUL_DB
+                .query("DEFINE TABLE inst_relate TYPE RELATION;")
+                .await;
+
+            // TYPE RELATION 会隐式创建 in/out 字段，但默认 TYPE record；这里显式改为更严格的类型。
+            let _ = SUL_DB.query("REMOVE FIELD in ON TABLE inst_relate;").await;
+            let _ = SUL_DB.query("REMOVE FIELD out ON TABLE inst_relate;").await;
+            let _ = SUL_DB
+                .query("DEFINE FIELD in ON TABLE inst_relate TYPE record<pe>;")
+                .await;
+            let _ = SUL_DB
+                .query("DEFINE FIELD out ON TABLE inst_relate TYPE record<inst_info>;")
+                .await;
+            let _ = SUL_DB
+                .query("DEFINE INDEX idx_inst_relate_in ON TABLE inst_relate FIELDS in UNIQUE;")
+                .await;
+            let _ = SUL_DB
+                .query("DEFINE INDEX idx_inst_relate_out ON TABLE inst_relate FIELDS out;")
                 .await;
         })
         .await;

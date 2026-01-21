@@ -44,6 +44,7 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::fs::{File, create_dir_all};
 use tokio::io::AsyncReadExt;
+use tokio::sync::OnceCell;
 // use tokio::sync::mpsc::Sender;
 use std::sync::mpsc::Sender;
 use tokio::time::Instant;
@@ -54,11 +55,12 @@ use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::tables::*;
 use crate::versioned_db::pe::*;
 use crate::versioned_db::db_meta_info;
-use crate::versioned_db::tree_export::{export_tree_file, is_geo_noun_hash, TreeNodeMeta};
+use crate::versioned_db::tree_export::{export_tree_file, TreeNodeMeta};
 
 pub enum SenderJsonsData {
     PEJson(Vec<String>),
     PERelateJson(Vec<String>),
+    EleReuseRelateJson(Vec<String>),
     AttJson((String, Vec<String>)),
     // 项目名 , sql
     MysqlSql((String, String)),
@@ -69,6 +71,56 @@ pub enum SenderJsonsData {
     // 新增：用于 PE Parquet 导出
     PeParquetData { project_name: String, dbnum: u32, elements: Vec<aios_core::types::SPdmsElement> },
     // Kuzu 数据: Vec<(PE, NamedAttrMap)>
+}
+
+fn normalize_cata_hash(hash: String) -> Option<String> {
+    let trimmed = hash.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        None
+    } else if !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(feature = "surreal-save")]
+static ELE_REUSE_RELATE_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
+
+#[cfg(feature = "surreal-save")]
+async fn ensure_ele_reuse_relate_relation_schema() {
+    ELE_REUSE_RELATE_SCHEMA_INIT
+        .get_or_init(|| async {
+            let _ = SUL_DB.query("REMOVE TABLE ele_reuse_relate;").await;
+
+            let _ = SUL_DB
+                .query("DEFINE TABLE ele_reuse_relate TYPE RELATION;")
+                .await;
+
+            let _ = SUL_DB
+                .query("REMOVE FIELD in ON TABLE ele_reuse_relate;")
+                .await;
+            let _ = SUL_DB
+                .query("REMOVE FIELD out ON TABLE ele_reuse_relate;")
+                .await;
+            let _ = SUL_DB
+                .query("DEFINE FIELD in ON TABLE ele_reuse_relate TYPE record<pe>;")
+                .await;
+            let _ = SUL_DB
+                .query("DEFINE FIELD out ON TABLE ele_reuse_relate TYPE record<inst_info>;")
+                .await;
+            let _ = SUL_DB
+                .query(
+                    "DEFINE INDEX idx_ele_reuse_relate_in ON TABLE ele_reuse_relate FIELDS in UNIQUE;",
+                )
+                .await;
+            let _ = SUL_DB
+                .query(
+                    "DEFINE INDEX idx_ele_reuse_relate_out ON TABLE ele_reuse_relate FIELDS out;",
+                )
+                .await;
+        })
+        .await;
 }
 
 #[cfg(feature = "sql")]
@@ -729,6 +781,34 @@ where
                             let _ = relates;
                         }
                         #[cfg(feature = "surreal-save")]
+                        SenderJsonsData::EleReuseRelateJson(relates) => {
+                            if !relates.is_empty() {
+                                ensure_ele_reuse_relate_relation_schema().await;
+                                let sql = format!(
+                                    "INSERT RELATION INTO ele_reuse_relate [{}]",
+                                    relates.join(",")
+                                );
+
+                                // 保存到主数据库
+                                SUL_DB.query(&sql).await.expect("insert ele_reuse_relate failed");
+
+                                // 如果启用了 mem-kv-save，同时保存到备份数据库
+                                #[cfg(feature = "mem-kv-save")]
+                                {
+                                    match SUL_MEM_DB.query(&sql).await {
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            log::warn!("保存ele_reuse_relate到内存KV数据库失败: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "surreal-save"))]
+                        SenderJsonsData::EleReuseRelateJson(relates) => {
+                            let _ = relates;
+                        }
+                        #[cfg(feature = "surreal-save")]
                         SenderJsonsData::AttJson((type_name, jsons)) => {
                             if !jsons.is_empty() {
                                 let sql = format!(
@@ -1026,13 +1106,12 @@ where
                         let att = entry.value();
                         let noun = att.get_type_hash();
                         let owner = att.get_owner().refno();
-                        let has_geo = is_geo_noun_hash(noun);
+                        let cata_hash = normalize_cata_hash(att.cal_cata_hash());
                         tree_nodes.entry(refno).or_insert(TreeNodeMeta {
                             refno,
                             owner,
                             noun,
-                            has_geo,
-                            is_leaf: false,
+                            cata_hash,
                         });
                     }
                     let should_save = !is_debug && is_save_db;
@@ -1098,13 +1177,6 @@ where
             }
         }
 
-        for (refno, meta) in tree_nodes.iter_mut() {
-            let is_leaf = match db_basic.children_map.get(refno) {
-                Some(children) => children.is_empty(),
-                None => true,
-            };
-            meta.is_leaf = is_leaf;
-        }
         if let Err(e) =
             export_tree_file(dbnum, db_basic.as_ref(), &tree_nodes, Path::new("output/scene_tree"))
         {
@@ -1295,6 +1367,34 @@ pub async fn sync_total_async_threaded(
                         }
                         #[cfg(not(feature = "surreal-save"))]
                         SenderJsonsData::PERelateJson(relates) => {
+                            let _ = relates;
+                        }
+                        #[cfg(feature = "surreal-save")]
+                        SenderJsonsData::EleReuseRelateJson(relates) => {
+                            if !relates.is_empty() {
+                                ensure_ele_reuse_relate_relation_schema().await;
+                                let sql = format!(
+                                    "INSERT RELATION INTO ele_reuse_relate [{}]",
+                                    relates.join(",")
+                                );
+
+                                // 保存到主数据库
+                                SUL_DB.query(&sql).await.expect("insert ele_reuse_relate failed");
+
+                                // 如果启用了 mem-kv-save，同时保存到备份数据库
+                                #[cfg(feature = "mem-kv-save")]
+                                {
+                                    match SUL_MEM_DB.query(&sql).await {
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            log::warn!("保存ele_reuse_relate到内存KV数据库失败: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "surreal-save"))]
+                        SenderJsonsData::EleReuseRelateJson(relates) => {
                             let _ = relates;
                         }
                         #[cfg(feature = "surreal-save")]
@@ -1575,13 +1675,12 @@ pub async fn sync_total_async_threaded(
                                 let att = entry.value();
                                 let noun = att.get_type_hash();
                                 let owner = att.get_owner().refno();
-                                let has_geo = is_geo_noun_hash(noun);
+                                let cata_hash = normalize_cata_hash(att.cal_cata_hash());
                                 tree_nodes.entry(refno).or_insert(TreeNodeMeta {
                                     refno,
                                     owner,
                                     noun,
-                                    has_geo,
-                                    is_leaf: false,
+                                    cata_hash,
                                 });
                             }
                             let should_save = !is_debug && is_save_db;
@@ -1673,14 +1772,6 @@ pub async fn sync_total_async_threaded(
                             dbg!(e.to_string());
                         }
                     }
-                }
-
-                for (refno, meta) in tree_nodes.iter_mut() {
-                    let is_leaf = match db_basic.children_map.get(refno) {
-                        Some(children) => children.is_empty(),
-                        None => true,
-                    };
-                    meta.is_leaf = is_leaf;
                 }
 
                 // 解析期：每处理完一个 db 文件就更新 db_meta_info.json（即使 save_db=false 且 gen_tree_only=true 也要生成）。

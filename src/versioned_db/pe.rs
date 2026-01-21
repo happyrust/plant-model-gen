@@ -66,6 +66,17 @@ struct DbnumInfo {
     max_ref1: u64,
 }
 
+fn normalize_cata_hash(hash: String) -> Option<String> {
+    let trimmed = hash.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        None
+    } else if !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// 保存element数据到版本管理
 pub async fn save_pes(
     db_basic: &DbBasicData,
@@ -102,6 +113,8 @@ pub async fn save_pes(
     for chunk in keys.chunks(option.pe_chunk as _) {
         #[cfg(feature = "surreal-save")]
         let mut insert_jsons = Vec::new();
+        #[cfg(feature = "surreal-save")]
+        let mut ele_reuse_relates = Vec::new();
 
         for &refno in chunk {
             let att_map = total_attr_map.get(&refno).unwrap();
@@ -169,6 +182,15 @@ pub async fn save_pes(
                     .or_insert_with(Vec::new)
                     .push(simple_json);
 
+                if let Some(cata_hash) = normalize_cata_hash(att_map.cal_cata_hash()) {
+                    let pe_key = refno.to_pe_key();
+                    let inst_key = format!("inst_info:⟨{}⟩", cata_hash);
+                    let relate_json = format!(
+                        "{{ id: ele_reuse_relate:[{pe_key}, {inst_key}], in: {pe_key}, out: {inst_key} }}"
+                    );
+                    ele_reuse_relates.push(relate_json);
+                }
+
                 /// 将 RefU64 分解为 ref_0 (高32位) 和 ref_1 (低32位)
                 ///
                 /// RefU64 的结构:
@@ -223,6 +245,12 @@ pub async fn save_pes(
                 .send_async(SenderJsonsData::PEJson(insert_jsons))
                 .await
                 .expect("send pes error");
+            if !ele_reuse_relates.is_empty() {
+                output
+                    .send_async(SenderJsonsData::EleReuseRelateJson(ele_reuse_relates))
+                    .await
+                    .expect("send ele_reuse_relate error");
+            }
         }
 
         chunk_index += 1;

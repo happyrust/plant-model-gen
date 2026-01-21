@@ -59,6 +59,7 @@ use std::fs::{self, File};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use team_data::sync_team_data;
 // use tokio::sync::mpsc::Sender;
@@ -68,6 +69,8 @@ use versioned_db::database::{define_dbnum_event, sync_pdms};
 
 use log::{LevelFilter, error};
 use simplelog::*;
+
+static LOG_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 pub mod api;
 pub mod cata;
@@ -340,6 +343,61 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// 初始化日志系统（支持通过 AIOS_LOG_FILE 覆盖日志文件路径）
+pub fn init_logging(enable_log: bool) {
+    if !enable_log {
+        return;
+    }
+    if LOG_INITIALIZED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let now = Local::now();
+    let default_filename = format!(
+        "logs/{}-{:02}-{:02}_{:02}-{:02}-{:02}_parse.log",
+        now.year(),
+        now.month(),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    );
+    let filename = std::env::var("AIOS_LOG_FILE").unwrap_or(default_filename);
+    let filename = if filename.trim().is_empty() {
+        format!(
+            "logs/{}-{:02}-{:02}_{:02}-{:02}-{:02}_parse.log",
+            now.year(),
+            now.month(),
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
+        )
+    } else {
+        filename
+    };
+
+    let log_path = PathBuf::from(&filename);
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if let Ok(file) = File::create(&filename) {
+        let _ = CombinedLogger::init(vec![
+            // 终端日志：显示 Info 级别
+            TermLogger::new(
+                LevelFilter::Info,
+                Config::default(),
+                TerminalMode::Mixed,
+                ColorChoice::Auto,
+            ),
+            // 文件日志：记录 Info 级别
+            WriteLogger::new(LevelFilter::Info, Config::default(), file),
+        ]);
+        log::info!("日志系统初始化成功，日志文件: {}", filename);
+    }
+}
+
 /// 运行app
 pub async fn run_app(option: Option<DbOptionExt>) -> anyhow::Result<()> {
     use std::sync::mpsc;
@@ -384,37 +442,7 @@ async fn run_app_internal(db_option_ext: options::DbOptionExt) -> anyhow::Result
     use crate::fast_model::aabb_tree::manual_update_aabbs;
 
     // 初始化日志系统（在所有操作之前）
-    if db_option_ext.inner.enable_log {
-        let now = Local::now();
-        let filename = format!(
-            "logs/{}-{:02}-{:02}_{:02}-{:02}-{:02}_parse.log",
-            now.year(),
-            now.month(),
-            now.day(),
-            now.hour(),
-            now.minute(),
-            now.second()
-        );
-
-        // 确保 logs 目录存在
-        let _ = std::fs::create_dir_all("logs");
-
-        // 创建日志文件
-        if let Ok(file) = File::create(&filename) {
-            let _ = CombinedLogger::init(vec![
-                // 终端日志：显示 Info 级别
-                TermLogger::new(
-                    LevelFilter::Info,
-                    Config::default(),
-                    TerminalMode::Mixed,
-                    ColorChoice::Auto,
-                ),
-                // 文件日志：记录 Info 级别
-                WriteLogger::new(LevelFilter::Info, Config::default(), file),
-            ]);
-            log::info!("日志系统初始化成功，日志文件: {}", filename);
-        }
-    }
+    init_logging(db_option_ext.inner.enable_log);
 
     // 使用 aios_core 统一的数据库初始化函数
     aios_core::initialize_databases(&db_option_ext.inner).await?;

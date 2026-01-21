@@ -4,6 +4,7 @@ use crate::data_interface::interface::PdmsDataInterface;
 use crate::fast_model;
 use crate::fast_model::gen_model::cate_helpers::cal_sjus_value;
 use crate::fast_model::gen_model::cate_single::{CateCsgShapeMap, gen_cata_single_geoms};
+use crate::fast_model::gen_model::utilities::is_valid_cata_hash;
 use crate::fast_model::refno_errors::{RefnoErrorKind, RefnoErrorStage, record_refno_error};
 use crate::fast_model::{SEND_INST_SIZE, get_generic_type, resolve_desi_comp, shared};
 use crate::fast_model::{debug_model, debug_model_debug};
@@ -742,12 +743,17 @@ async fn gen_cata_geos_inner(
 
                         let (owner_refno, owner_type) =
                             shared::get_owner_info_from_attr(&ele_att).await;
+                        let cata_hash_for_info = if is_valid_cata_hash(&cata_hash) {
+                            Some(cata_hash.clone())
+                        } else {
+                            None
+                        };
                         let mut geos_info = EleGeosInfo {
                             refno: ele_refno,
                             sesno: ele_att.sesno(),
                             owner_refno,
                             owner_type,
-                            cata_hash: Some(cata_hash.clone()),
+                            cata_hash: cata_hash_for_info,
                             visible: true,
                             generic_type,
                             aabb: None,
@@ -964,7 +970,8 @@ async fn gen_cata_geos_inner(
                         .cloned()
                         .unwrap_or_default();
                     // 使用惰性计算版本，确保 pe_transform 缓存不存在时也能计算变换
-                    let mut origin_trans = match aios_core::get_world_mat4(ele_refno, false).await {
+                    let world_mat4_result = aios_core::get_world_mat4(ele_refno, false).await;
+                    let mut origin_trans = match world_mat4_result {
                         Ok(Some(mat4)) => {
                             let (scale, rotation, translation) = mat4.to_scale_rotation_translation();
                             bevy_transform::prelude::Transform {
@@ -978,7 +985,20 @@ async fn gen_cata_geos_inner(
                                 scale: scale.as_vec3(),
                             }
                         }
-                        _ => continue,
+                        Ok(None) => {
+                            debug_model_debug!(
+                                "[WARN] get_world_mat4 返回 None, ele_refno={}, cata_hash={}, 跳过该元件",
+                                ele_refno, cata_hash
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            debug_model_debug!(
+                                "[WARN] get_world_mat4 失败, ele_refno={}, cata_hash={}, error={}, 跳过该元件",
+                                ele_refno, cata_hash, e
+                            );
+                            continue;
+                        }
                     };
 
                     let ele_att = aios_core::get_named_attmap(ele_refno)
@@ -1014,12 +1034,17 @@ async fn gen_cata_geos_inner(
                     };
                     let (owner_refno, owner_type) =
                         shared::get_owner_info_from_attr(&ele_att).await;
+                    let cata_hash_for_info = if is_valid_cata_hash(&cata_hash) {
+                        Some(cata_hash.clone())
+                    } else {
+                        None
+                    };
                     let geos_info = EleGeosInfo {
                         refno: ele_refno,
                         sesno: ele_att.sesno(),
                         owner_refno,
                         owner_type,
-                        cata_hash: Some(cata_hash.clone()),
+                        cata_hash: cata_hash_for_info,
                         visible: true,
                         generic_type: get_generic_type(ele_refno).await.unwrap_or_default(),
                         world_transform: origin_trans,

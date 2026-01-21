@@ -1,5 +1,6 @@
 use super::cate_single;
 use super::context::NounProcessContext;
+use super::utilities::build_cata_hash_map_from_tree;
 use crate::fast_model::cata_model;
 use aios_core::RefnoEnum;
 use aios_core::geometry::ShapeInstancesData;
@@ -28,7 +29,7 @@ pub async fn process_cate_refno_page(
 
     // 查询 refnos 对应的 cata hash 分组
     let target_cata_map = Arc::new(
-        aios_core::query_group_by_cata_hash(refnos)
+        build_cata_hash_map_from_tree(refnos)
             .await
             .unwrap_or_default(),
     );

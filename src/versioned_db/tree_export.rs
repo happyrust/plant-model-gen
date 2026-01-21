@@ -13,13 +13,7 @@ pub struct TreeNodeMeta {
     pub refno: RefU64,
     pub owner: RefU64,
     pub noun: u32,
-    pub has_geo: bool,
-    pub is_leaf: bool,
-}
-
-/// 判断是否为几何类型的 noun
-pub fn is_geo_noun_hash(noun_hash: u32) -> bool {
-    aios_core::tree_query::is_geo_noun_hash(noun_hash)
+    pub cata_hash: Option<String>,
 }
 
 /// 导出树文件
@@ -46,8 +40,7 @@ pub fn export_tree_file(
             refno: *refno,
             owner: meta.owner,
             noun: meta.noun,
-            has_geo: meta.has_geo,
-            is_leaf: meta.is_leaf,
+            cata_hash: meta.cata_hash.clone(),
         };
         let node_id = arena.new_node(core_meta);
         id_map.insert(*refno, node_id);

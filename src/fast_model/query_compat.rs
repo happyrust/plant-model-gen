@@ -13,18 +13,15 @@
 //! use crate::fast_model::query_compat::{query_type_refnos_by_dbnum, query_multi_children_refnos};
 //! ```
 
+use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 use crate::fast_model::query_provider;
 use aios_core::RefnoEnum;
 use aios_core::pdms_types::{TOTAL_NEG_NOUN_NAMES, VISBILE_GEO_NOUNS};
 use aios_core::tool::db_tool::db1_hash;
-use aios_core::tree_query::{
-    load_tree_index_from_dir, TreeIndex, TreeQuery, TreeQueryFilter, TreeQueryOptions,
-};
+use aios_core::tree_query::{TreeIndex, TreeQuery, TreeQueryFilter, TreeQueryOptions};
 use aios_core::types::{NamedAttrMap as NamedAttMap, SPdmsElement as PE};
 use once_cell::sync::Lazy;
 use std::sync::Arc;
-
-const TREE_DIR: &str = "output/scene_tree";
 
 static VISIBLE_GEO_NOUN_HASHES: Lazy<Vec<u32>> =
     Lazy::new(|| VISBILE_GEO_NOUNS.iter().map(|&name| db1_hash(name)).collect());
@@ -34,24 +31,8 @@ static BRAN_HASH: Lazy<u32> = Lazy::new(|| db1_hash("BRAN"));
 static HANG_HASH: Lazy<u32> = Lazy::new(|| db1_hash("HANG"));
 
 async fn load_tree_index_for_refno(refno: RefnoEnum) -> anyhow::Result<Arc<TreeIndex>> {
-    // 优先从解析期生成的 db_meta_info.json 推导 dbnum，避免依赖 PE（尤其在 save_db=false / gen_tree_only 场景）。
-    if let Some(dbnum) = crate::fast_model::db_meta_cache::get_dbnum_for_refno(refno) {
-        return load_tree_index_from_dir(dbnum, TREE_DIR);
-    }
-
-    // 必须先通过 PE 获取 dbnum，然后加载对应 dbnum 的 .tree 文件。
-    // TreeIndex 仅用于层级查询；PE/属性仍由 SurrealDB 提供（用于模型生成的后续数据获取）。
-    let Some(pe) = aios_core::get_pe(refno).await? else {
-        return Err(anyhow::anyhow!("refno {} 不存在，无法获取 dbnum", refno));
-    };
-    if pe.dbnum < 0 {
-        return Err(anyhow::anyhow!(
-            "refno {} 的 dbnum 非法: {}",
-            refno,
-            pe.dbnum
-        ));
-    }
-    load_tree_index_from_dir(pe.dbnum as u32, TREE_DIR)
+    let manager = TreeIndexManager::with_default_dir(Vec::new());
+    manager.load_index_for_refno(refno).await
 }
 
 fn build_noun_hashes(nouns: &[&str]) -> Option<Vec<u32>> {

@@ -42,6 +42,8 @@ pub async fn save_instance_data_optimize(
     const MAX_TX_STATEMENTS: usize = 5;
     const MAX_CONCURRENT_TX: usize = 5;
 
+    // 统一迁移/修复 inst_relate 的历史 schema（普通表 -> RELATION），确保 pe -> inst_info 关系可复用
+    utils::ensure_inst_relate_relation_schema().await;
     // 统一迁移/修复 inst_relate_aabb 的历史 schema（refno/aabb -> in/out），避免写入时触发类型强制失败
     utils::ensure_inst_relate_aabb_relation_schema().await;
 

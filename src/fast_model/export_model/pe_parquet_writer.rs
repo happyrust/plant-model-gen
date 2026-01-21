@@ -20,7 +20,6 @@ pub struct PeRow {
     pub dbnum: i32,
     pub sesno: i32,
     pub status_code: String,
-    pub cata_hash: String,
     pub lock: bool,
     pub deleted: bool,
     pub typex: Option<i32>,
@@ -37,7 +36,6 @@ impl PeRow {
             dbnum: pe.dbnum,
             sesno: pe.sesno,
             status_code: pe.status_code.clone(),
-            cata_hash: pe.cata_hash.clone(),
             lock: pe.lock,
             deleted: pe.deleted,
             typex: pe.typex,
@@ -113,7 +111,6 @@ impl PeParquetManager {
         let dbnums: Vec<i32> = rows.iter().map(|r| r.dbnum).collect();
         let sesnos: Vec<i32> = rows.iter().map(|r| r.sesno).collect();
         let status_codes: Vec<String> = rows.iter().map(|r| r.status_code.clone()).collect();
-        let cata_hashes: Vec<String> = rows.iter().map(|r| r.cata_hash.clone()).collect();
         let locks: Vec<bool> = rows.iter().map(|r| r.lock).collect();
         let deleteds: Vec<bool> = rows.iter().map(|r| r.deleted).collect();
         let typexs: Vec<Option<i32>> = rows.iter().map(|r| r.typex).collect();
@@ -126,7 +123,6 @@ impl PeParquetManager {
             "dbnum" => dbnums,
             "sesno" => sesnos,
             "status_code" => status_codes,
-            "cata_hash" => cata_hashes,
             "lock" => locks,
             "deleted" => deleteds,
             "typex" => typexs,
@@ -250,7 +246,6 @@ mod tests {
                 dbnum: 1112,
                 sesno: 1,
                 status_code: "OK".to_string(),
-                cata_hash: "abc123".to_string(),
                 lock: false,
                 deleted: false,
                 typex: Some(10),

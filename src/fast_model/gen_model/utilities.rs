@@ -117,9 +117,7 @@ fn insert_cata_hash_refno(
     let fallback_key = build_refno_cata_key(&refno);
     let key = meta
         .cata_hash
-        .as_deref()
-        .map(str::trim)
-        .filter(|hash| is_valid_cata_hash(hash))
+        .filter(|&hash| hash != 0)
         .map(|hash| hash.to_string())
         .unwrap_or(fallback_key);
     let mut entry = map.entry(key.clone()).or_insert(CataHashRefnoKV {

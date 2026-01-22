@@ -73,17 +73,6 @@ pub enum SenderJsonsData {
     // Kuzu 数据: Vec<(PE, NamedAttrMap)>
 }
 
-fn normalize_cata_hash(hash: String) -> Option<String> {
-    let trimmed = hash.trim();
-    if trimmed.is_empty() || trimmed == "0" {
-        None
-    } else if !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
 #[cfg(feature = "surreal-save")]
 static ELE_REUSE_RELATE_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 
@@ -1106,7 +1095,7 @@ where
                         let att = entry.value();
                         let noun = att.get_type_hash();
                         let owner = att.get_owner().refno();
-                        let cata_hash = normalize_cata_hash(att.cal_cata_hash());
+                        let cata_hash = att.cal_cata_hash();
                         tree_nodes.entry(refno).or_insert(TreeNodeMeta {
                             refno,
                             owner,
@@ -1675,7 +1664,7 @@ pub async fn sync_total_async_threaded(
                                 let att = entry.value();
                                 let noun = att.get_type_hash();
                                 let owner = att.get_owner().refno();
-                                let cata_hash = normalize_cata_hash(att.cal_cata_hash());
+                                let cata_hash = att.cal_cata_hash();
                                 tree_nodes.entry(refno).or_insert(TreeNodeMeta {
                                     refno,
                                     owner,

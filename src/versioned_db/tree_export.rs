@@ -13,7 +13,7 @@ pub struct TreeNodeMeta {
     pub refno: RefU64,
     pub owner: RefU64,
     pub noun: u32,
-    pub cata_hash: Option<String>,
+    pub cata_hash: Option<u64>,
 }
 
 /// 导出树文件

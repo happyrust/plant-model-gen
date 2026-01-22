@@ -15,7 +15,8 @@ fn parse_refno(s: &str) -> anyhow::Result<RefnoEnum> {
     } else {
         s.to_string()
     };
-    Ok(RefnoEnum::from_str(&s)?)
+    RefnoEnum::from_str(&s)
+        .map_err(|e| anyhow::anyhow!("parse refno failed: {:?}", e))
 }
 
 #[tokio::main]
@@ -40,4 +41,3 @@ async fn main() -> anyhow::Result<()> {
     println!("refno={}: descendants={}", refno, descendants.len());
     Ok(())
 }
-

@@ -14,6 +14,85 @@ use super::model_exporter::{
     query_geometry_instances_ext,
 };
 
+fn mesh_has_invalid_normals(mesh: &PlantMesh) -> bool {
+    // glam::Vec3 implements is_finite; use component checks if upstream changes.
+    mesh.normals.iter().any(|n| {
+        !(n.x.is_finite() && n.y.is_finite() && n.z.is_finite())
+            || n.length_squared().is_nan()
+    })
+}
+
+/// OBJ 导出前：保证 normals 与 vertices 同步且为有限值，避免写出 `vn NaN NaN NaN`。
+fn ensure_normals_sane(mesh: &mut PlantMesh) {
+    use glam::Vec3;
+
+    let vertex_count = mesh.vertices.len();
+    if vertex_count == 0 {
+        mesh.normals.clear();
+        return;
+    }
+
+    // 若 normals 缺失或含 NaN/Inf，则重算（即便长度已对齐也要校验）。
+    if mesh.normals.len() == vertex_count && !mesh_has_invalid_normals(mesh) {
+        return;
+    }
+
+    // 计算几何体中心（用于法线整体翻转判定）
+    let mut center = Vec3::ZERO;
+    for &v in &mesh.vertices {
+        center += v;
+    }
+    center /= vertex_count as f32;
+
+    let mut normals = vec![Vec3::ZERO; vertex_count];
+    let mut dot_sum = 0.0f32;
+    let mut dot_count = 0u32;
+
+    for tri in mesh.indices.chunks(3) {
+        if tri.len() < 3 {
+            continue;
+        }
+        let a_idx = tri[0] as usize;
+        let b_idx = tri[1] as usize;
+        let c_idx = tri[2] as usize;
+        if a_idx >= vertex_count || b_idx >= vertex_count || c_idx >= vertex_count {
+            continue;
+        }
+
+        let a = mesh.vertices[a_idx];
+        let b = mesh.vertices[b_idx];
+        let c = mesh.vertices[c_idx];
+        let normal = (b - a).cross(c - a);
+        if normal.length_squared() > f32::EPSILON {
+            normals[a_idx] += normal;
+            normals[b_idx] += normal;
+            normals[c_idx] += normal;
+
+            let triangle_center = (a + b + c) / 3.0;
+            let to_center = triangle_center - center;
+            dot_sum += normal.dot(to_center);
+            dot_count += 1;
+        }
+    }
+
+    if dot_count > 0 && dot_sum < 0.0 {
+        for normal in normals.iter_mut() {
+            *normal = -*normal;
+        }
+    }
+
+    for normal in normals.iter_mut() {
+        if normal.length_squared() > f32::EPSILON {
+            *normal = normal.normalize();
+        } else {
+            // 保持 ZERO，确保导出稳定（不会产生 NaN）。
+            *normal = Vec3::ZERO;
+        }
+    }
+
+    mesh.normals = normals;
+}
+
 /// 带单位转换的 OBJ 导出函数
 pub(crate) fn export_mesh_to_obj_with_unit_conversion(
     mesh: &aios_core::shape::pdms_shape::PlantMesh,
@@ -29,12 +108,16 @@ pub(crate) fn export_mesh_to_obj_with_unit_conversion(
             *vertex = unit_converter.convert_vec3(vertex);
         }
 
+        ensure_normals_sane(&mut converted_mesh);
+
         // 导出转换后的 mesh
         converted_mesh
             .export_obj(false, output_path)
             .context("导出 OBJ 文件失败")?;
     } else {
-        // 不需要转换，直接导出
+        // 不需要转换，也先做法线校验，避免 OBJ 中出现 NaN 法线。
+        let mut mesh = mesh.clone();
+        ensure_normals_sane(&mut mesh);
         mesh.export_obj(false, output_path)
             .context("导出 OBJ 文件失败")?;
     }

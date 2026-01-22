@@ -55,7 +55,7 @@ use nom::combinator::map;
 use serde_json::from_str;
 use std::any::TypeId;
 use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -344,6 +344,9 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 }
 
 /// 初始化日志系统（支持通过 AIOS_LOG_FILE 覆盖日志文件路径）
+///
+/// 约定：默认仅写文件，不输出到控制台（避免模型生成时日志刷屏导致“看似死循环”）。
+/// 如需同时输出到控制台，可设置环境变量 `AIOS_LOG_TO_CONSOLE=1`。
 pub fn init_logging(enable_log: bool) {
     if !enable_log {
         return;
@@ -382,18 +385,29 @@ pub fn init_logging(enable_log: bool) {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    if let Ok(file) = File::create(&filename) {
-        let _ = CombinedLogger::init(vec![
-            // 终端日志：显示 Info 级别
-            TermLogger::new(
+    // 以追加方式打开，避免在重定向 stdout/stderr 后再次初始化 logger 时截断文件。
+    if let Ok(file) = OpenOptions::new().create(true).append(true).open(&filename) {
+        let redirected = std::env::var_os("AIOS_STDIO_REDIRECTED").is_some();
+        let log_to_console = std::env::var("AIOS_LOG_TO_CONSOLE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        let mut sinks: Vec<Box<dyn SharedLogger>> = Vec::new();
+        // 文件日志：记录 Info 级别
+        sinks.push(WriteLogger::new(LevelFilter::Info, Config::default(), file));
+
+        // 仅在明确要求且未重定向 stdout/stderr 时输出到控制台。
+        if log_to_console && !redirected {
+            sinks.push(TermLogger::new(
                 LevelFilter::Info,
                 Config::default(),
                 TerminalMode::Mixed,
                 ColorChoice::Auto,
-            ),
-            // 文件日志：记录 Info 级别
-            WriteLogger::new(LevelFilter::Info, Config::default(), file),
-        ]);
+            ));
+        }
+
+        let _ = CombinedLogger::init(sinks);
         log::info!("日志系统初始化成功，日志文件: {}", filename);
     }
 }

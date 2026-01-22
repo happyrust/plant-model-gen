@@ -84,6 +84,8 @@ use aios_database::options::{MeshFormat, get_db_option_ext_from_path};
 use aios_database::run_app;
 #[cfg(not(feature = "gui"))]
 use clap::{Arg, Command};
+#[cfg(not(feature = "gui"))]
+use std::process::{Command as StdCommand, Stdio};
 
 #[cfg(feature = "gui")]
 #[tokio::main]
@@ -95,6 +97,10 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(not(feature = "gui"))]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 默认把模型生成/导出过程的所有 stdout/stderr 写入日志文件，避免控制台刷屏导致“看似死循环”。
+    // 仅在显式 `--verbose` 或后台服务模式（如 --grpc-server）时保留控制台输出。
+    maybe_redirect_stdio_to_log_file();
+
     let matches = Command::new("aios-database")
         .version("0.1.3")
         .about("AIOS Database Processing Tool")
@@ -1182,4 +1188,106 @@ async fn main() -> anyhow::Result<()> {
 
     // 否则运行正常的应用程序
     run_app(Some(db_option_ext)).await
+}
+
+#[cfg(not(feature = "gui"))]
+fn maybe_redirect_stdio_to_log_file() {
+    use chrono::{Datelike, Local, Timelike};
+    use std::fs::File;
+
+    if std::env::var_os("AIOS_STDIO_REDIRECTED").is_some() {
+        return;
+    }
+
+    let args: Vec<String> = std::env::args().collect();
+    let has_flag = |flag: &str| args.iter().any(|a| a == flag);
+
+    // 显式 verbose / 服务模式：不重定向，便于交互调试/观察运行状态。
+    if has_flag("--verbose") || has_flag("--grpc-server") {
+        // 允许用户按需设置 AIOS_LOG_TO_CONSOLE=1，把 log::info 也打印到控制台。
+        return;
+    }
+
+    // 仅在“可能产生海量输出”的路径下默认重定向（debug-model/export/capture 等）。
+    let should_redirect = has_flag("--debug-model")
+        || has_flag("--export-obj")
+        || has_flag("--export-glb")
+        || has_flag("--export-gltf")
+        || has_flag("--export-obj-refnos")
+        || has_flag("--export-glb-refnos")
+        || has_flag("--export-gltf-refnos")
+        || has_flag("--capture")
+        || has_flag("--log-model-error");
+
+    if !should_redirect {
+        return;
+    }
+
+    // 简易提取一个“标识 refno”用于日志文件命名（仅取第一个）。
+    fn first_value_after_flag(args: &[String], flag: &str) -> Option<String> {
+        let mut it = args.iter().enumerate();
+        while let Some((i, a)) = it.next() {
+            if a == flag {
+                if let Some(v) = args.get(i + 1) {
+                    if !v.starts_with('-') && !v.trim().is_empty() {
+                        return Some(v.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    let ref_tag = first_value_after_flag(&args, "--debug-model")
+        .or_else(|| first_value_after_flag(&args, "--export-obj-refnos"))
+        .or_else(|| first_value_after_flag(&args, "--export-glb-refnos"))
+        .or_else(|| first_value_after_flag(&args, "--export-gltf-refnos"))
+        .unwrap_or_else(|| "run".to_string());
+
+    let now = Local::now();
+    let ts = format!(
+        "{}-{:02}-{:02}_{:02}-{:02}-{:02}",
+        now.year(),
+        now.month(),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    );
+    let log_filename = format!("logs/{}_{}.log", ref_tag.replace('/', "_"), ts);
+
+    // 预创建目录/文件；失败则回退到控制台模式。
+    if let Some(parent) = std::path::Path::new(&log_filename).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let Ok(out_file) = File::create(&log_filename) else {
+        return;
+    };
+    let Ok(err_file) = out_file.try_clone() else {
+        return;
+    };
+
+    // 重新执行自身：把 stdout/stderr 重定向到日志文件；父进程仅输出日志路径。
+    // 注意：避免递归重进（AIOS_STDIO_REDIRECTED 标记）。
+    let exe = &args[0];
+    let child_status = StdCommand::new(exe)
+        .args(&args[1..])
+        .env("AIOS_STDIO_REDIRECTED", "1")
+        .env("AIOS_LOG_FILE", &log_filename)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::from(err_file))
+        .status();
+
+    match child_status {
+        Ok(status) => {
+            // 仅打印一行提示，满足“默认不刷控制台”的诉求。
+            eprintln!("日志已写入: {}", log_filename);
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        Err(_) => {
+            // 启动失败则回退控制台输出
+        }
+    }
 }

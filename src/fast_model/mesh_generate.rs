@@ -227,19 +227,21 @@ LIMIT {remaining};
 /// 条件：meshed = false, param != NONE, bad != true
 /// 返回 inst_geo 的 id 列表（geo_hash）
 async fn query_pending_mesh_geo_ids(limit: usize, replace_exist: bool) -> anyhow::Result<Vec<RecordId>> {
+    // 注意：这里的查询用于“状态收敛式”的 worker（replace_exist=false）。
+    // replace_exist=true 会走“快照遍历”分支，避免反复扫描相同的前 N 条记录。
     let sql = if replace_exist {
         format!(
-            "SELECT value id FROM inst_geo WHERE param != NONE AND bad != true LIMIT {}",
+            "SELECT value id FROM inst_geo WHERE param != NONE AND bad != true ORDER BY id LIMIT {}",
             limit
         )
     } else {
         format!(
-            "SELECT value id FROM inst_geo WHERE meshed != true AND param != NONE AND bad != true LIMIT {}",
+            "SELECT value id FROM inst_geo WHERE meshed != true AND param != NONE AND bad != true ORDER BY id LIMIT {}",
             limit
         )
     };
-    
-    let ids: Vec<RecordId> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+
+    let ids: Vec<RecordId> = SUL_DB.query_take(&sql, 0).await?;
     Ok(ids)
 }
 
@@ -251,8 +253,32 @@ async fn query_total_pending_mesh_count(replace_exist: bool) -> anyhow::Result<u
         "SELECT VALUE count() FROM inst_geo WHERE meshed != true AND param != NONE AND bad != true GROUP ALL".to_string()
     };
     
-    let counts: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+    let counts: Vec<i64> = SUL_DB.query_take(&sql, 0).await?;
     Ok(counts.first().copied().unwrap_or(0) as usize)
+}
+
+/// replace_exist=true 时，先按分页“快照”收集需要处理的 inst_geo ids，避免循环中重复扫描同一批数据。
+async fn snapshot_mesh_geo_ids_for_replace(batch_size: usize) -> anyhow::Result<Vec<RecordId>> {
+    let mut all: Vec<RecordId> = Vec::new();
+    let mut start = 0usize;
+
+    loop {
+        // SurrealQL 分页：START + LIMIT，配合 ORDER BY 保证稳定性。
+        // 说明：此阶段只做“读取快照”，避免后续生成过程中 bad/meshed 更新影响分页结果。
+        let sql = format!(
+            "SELECT value id FROM inst_geo WHERE param != NONE AND bad != true ORDER BY id LIMIT {} START {}",
+            batch_size, start
+        );
+
+        let mut page: Vec<RecordId> = SUL_DB.query_take(&sql, 0).await?;
+        if page.is_empty() {
+            break;
+        }
+        start += page.len();
+        all.append(&mut page);
+    }
+
+    Ok(all)
 }
 
 /// 基于 inst_geo 状态的 Mesh 生成 Worker
@@ -297,6 +323,72 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
     }
 
     let worker_start = std::time::Instant::now();
+
+    // replace_exist=true：不能用“状态收敛式扫描”，否则会反复拿到相同的前 N 条记录，表现为“死循环”。
+    // 这里改为“快照遍历”：先收集一份 ids 列表，再分批处理一遍即可。
+    if replace_exist {
+        let all_geo_ids = snapshot_mesh_geo_ids_for_replace(batch_size).await?;
+        let total_count = all_geo_ids.len();
+
+        if total_count == 0 {
+            println!("[mesh_worker] 没有待处理 mesh 任务，退出");
+            return Ok(());
+        }
+
+        for chunk in all_geo_ids.chunks(batch_size) {
+            round += 1;
+
+            let progress_pct = if total_count > 0 {
+                (total_processed as f64 / total_count as f64 * 100.0).min(100.0)
+            } else {
+                0.0
+            };
+
+            println!(
+                "[mesh_worker] 📊 进度: [{}/{}] ({:.1}%) | 轮次 {} | 本批 {} 个 (replace snapshot)",
+                total_processed,
+                total_count,
+                progress_pct,
+                round,
+                chunk.len()
+            );
+
+            let t = std::time::Instant::now();
+            gen_inst_meshes_by_geo_ids(&mesh_dir, &precision, chunk, &mesh_formats).await?;
+            println!(
+                "[mesh_worker] ✅ 轮次 {} 完成: {} 个，用时 {} ms",
+                round,
+                chunk.len(),
+                t.elapsed().as_millis()
+            );
+
+            total_processed += chunk.len();
+        }
+
+        let total_time = worker_start.elapsed();
+        let avg_speed = if total_time.as_secs() > 0 {
+            total_processed as f64 / total_time.as_secs_f64()
+        } else {
+            total_processed as f64
+        };
+
+        println!(
+            "╔════════════════════════════════════════╗\n\
+             ║  [mesh_worker] Mesh 生成完成           ║\n\
+             ╠════════════════════════════════════════╣\n\
+             ║  处理总数:   {:>8}                  ║\n\
+             ║  总轮次:     {:>8}                  ║\n\
+             ║  总耗时:     {:>8} ms              ║\n\
+             ║  平均速度:   {:>8.1} 个/秒          ║\n\
+             ╚════════════════════════════════════════╝",
+            total_processed,
+            round,
+            total_time.as_millis(),
+            avg_speed
+        );
+
+        return Ok(());
+    }
 
     loop {
         let round_start = std::time::Instant::now();

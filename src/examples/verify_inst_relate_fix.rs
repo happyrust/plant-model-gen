@@ -1,12 +1,11 @@
 //! 验证 inst_relate 中 owner_refno 和 owner_type 修复
 
-use aios_database::test::test_query::init_test_surreal;
-use aios_core::{SUL_DB, SurrealQueryExt};
+use aios_core::{SUL_DB, SurrealQueryExt, init_surreal};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 初始化数据库连接
-    init_test_surreal().await;
+    init_surreal().await?;
     
     // 查询 BRAN 17496_171606 下管件 17496_171626 的 inst_relate 记录
     let sql = r#"

@@ -15,14 +15,15 @@
 //! ).await?;
 //! ```
 
+use crate::data_interface::db_meta;
 use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 use aios_core::RefnoEnum;
-use aios_core::mdb;
 use aios_core::query_provider::*;
 use aios_core::types::{NamedAttrMap as NamedAttMap, SPdmsElement as PE};
 use anyhow::Context;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
+use std::collections::HashSet;
 
 /// 全局查询提供者实例
 static GLOBAL_PROVIDER: OnceCell<Arc<dyn QueryProvider>> = OnceCell::new();
@@ -173,19 +174,35 @@ pub async fn query_by_type(
 ///
 /// # 实现说明
 ///
-/// 此函数使用 `rs_surreal::mdb::query_type_refnos_by_dbnums` 并传入空的 dbnums 列表，
-/// 这会触发"查询所有数据库"的逻辑（见 `query_type_refnos_by_dbnums` 实现中的 `if dbnums.is_empty()` 分支）。
+/// 此函数使用 TreeIndexManager 查询全库范围内的所有实例。
 pub async fn query_by_noun_all_db(nouns: &[&str]) -> anyhow::Result<Vec<RefnoEnum>> {
-    // 传入空的 dbnums 列表，触发全库查询
-    let empty_dbnums: Vec<u32> = vec![];
-    mdb::query_type_refnos_by_dbnums(nouns, &empty_dbnums)
-        .await
-        .map_err(Into::into)
+    if nouns.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dbnums = resolve_tree_dbnums()?;
+    let manager = TreeIndexManager::with_default_dir(dbnums);
+    let mut seen = HashSet::new();
+    let mut refnos = Vec::new();
+    for noun in nouns {
+        for refno in manager.query_noun_refnos(noun, None) {
+            if refno.is_valid() && seen.insert(refno) {
+                refnos.push(refno);
+            }
+        }
+    }
+    Ok(refnos)
 }
 
 /// 统计指定 noun 在全库范围内的实例数量（GROUP ALL + LIMIT 1）
 pub async fn count_noun_all_db(noun: &str) -> anyhow::Result<u64> {
-    mdb::count_refnos_by_noun(noun).await.map_err(Into::into)
+    if noun.is_empty() {
+        return Ok(0);
+    }
+    let dbnums = resolve_tree_dbnums()?;
+    let manager = TreeIndexManager::with_default_dir(dbnums);
+    let mut refnos = manager.query_noun_refnos(noun, None);
+    refnos.retain(|r| r.is_valid());
+    Ok(refnos.len() as u64)
 }
 
 /// 根据分页参数获取指定 noun 的 refno 列表
@@ -194,9 +211,28 @@ pub async fn query_noun_page_all_db(
     start: usize,
     limit: usize,
 ) -> anyhow::Result<Vec<RefnoEnum>> {
-    mdb::query_refnos_by_noun_page(noun, start, limit)
-        .await
-        .map_err(Into::into)
+    if noun.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let dbnums = resolve_tree_dbnums()?;
+    let manager = TreeIndexManager::with_default_dir(dbnums);
+    let mut refnos = manager.query_noun_refnos(noun, None);
+    refnos.retain(|r| r.is_valid());
+    if start >= refnos.len() {
+        return Ok(Vec::new());
+    }
+    let end = (start + limit).min(refnos.len());
+    Ok(refnos[start..end].to_vec())
+}
+
+fn resolve_tree_dbnums() -> anyhow::Result<Vec<u32>> {
+    db_meta().ensure_loaded()?;
+    let mut dbnums = db_meta().get_all_dbnums();
+    if dbnums.is_empty() {
+        anyhow::bail!("db_meta_info.json 中未找到可用 dbnum");
+    }
+    dbnums.sort_unstable();
+    Ok(dbnums)
 }
 
 /// 批量获取 PE 信息

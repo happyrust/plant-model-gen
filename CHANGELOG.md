@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-01-22
+
+### Changed
+
+- **refno 查询改用 TreeIndex**
+  - 按类型/分页/计数的 refno 查询切换到 TreeIndexManager
+  - Full Noun 根节点筛选走 TreeIndex，并新增 db_meta_info.json 解析兜底
+  - TreeIndexManager 增加全局缓存，避免重复加载 .tree
+
+- **移除 cata_hash 复用的 DB 探测**
+  - build_cata_hash_map_from_tree 不再访问 SurrealDB，避免依赖未初始化连接
+
 ## 2025-12-15
 
 ### Changed

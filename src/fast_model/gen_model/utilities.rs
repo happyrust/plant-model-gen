@@ -214,8 +214,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_tubi_size_none() {
-        let result =
-            query_tubi_size(RefnoEnum::RefU64(999999), RefnoEnum::RefU64(999999), false).await;
+        // RefnoEnum 没有 RefU64 变体，这里用 RefU64 -> RefnoEnum 的通用转换构造一个不存在的 refno，
+        // 期望查询失败时能兜底返回 TubiSize::None。
+        let dummy = RefnoEnum::from(RefU64::from_two_nums(999999, 0));
+        let result = query_tubi_size(dummy, dummy, false).await;
 
         assert!(result.is_ok());
         if let Ok(size) = result {

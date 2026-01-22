@@ -6,9 +6,14 @@ use crate::versioned_db::db_meta_info::DEFAULT_TREE_DIR;
 use aios_core::tool::db_tool::{db1_dehash, db1_hash};
 use aios_core::tree_query::{load_tree_index_from_dir, TreeIndex, TreeQueryFilter, TreeQueryOptions};
 use aios_core::{RefnoEnum, RefU64};
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+static TREE_INDEX_CACHE: Lazy<DashMap<(PathBuf, u32), Arc<TreeIndex>>> =
+    Lazy::new(DashMap::new);
 
 /// TreeIndex 管理器
 /// 
@@ -48,7 +53,13 @@ impl TreeIndexManager {
 
     /// 加载指定 dbnum 的 TreeIndex
     pub fn load_index(&self, dbnum: u32) -> anyhow::Result<Arc<TreeIndex>> {
-        load_tree_index_from_dir(dbnum, &self.tree_dir)
+        let key = (self.tree_dir.clone(), dbnum);
+        if let Some(entry) = TREE_INDEX_CACHE.get(&key) {
+            return Ok(entry.clone());
+        }
+        let index = load_tree_index_from_dir(dbnum, &self.tree_dir)?;
+        TREE_INDEX_CACHE.insert(key, index.clone());
+        Ok(index)
     }
 
     /// 通过 refno 解析 dbnum

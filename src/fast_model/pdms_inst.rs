@@ -4,7 +4,6 @@ use aios_core::geometry::ShapeInstancesData;
 use aios_core::parsed_data::TubiInfoData;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::pdms_types::*;
-use aios_core::rs_surreal::delete_inst_relate_cascade;
 use aios_core::types::*;
 use aios_core::{SUL_DB, SurrealQueryExt, get_db_option, gen_aabb_hash, gen_bevy_transform_hash, gen_string_hash};
 use dashmap::DashMap;
@@ -21,6 +20,20 @@ use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::debug_model_debug;
 use crate::fast_model::utils;
 // use crate::fast_model::EXIST_MESH_GEOS;
+
+/// replace_exist=true 时，仅删除 inst_relate（按 in=pe），避免级联误删 inst_info/inst_geo，
+/// 以支持“inst_relate 重建 + inst_info/ptset 复用”的工作流。
+async fn delete_inst_relate_by_in(refnos: &[RefnoEnum], chunk_size: usize) -> anyhow::Result<()> {
+    if refnos.is_empty() {
+        return Ok(());
+    }
+    for chunk in refnos.chunks(chunk_size.max(1)) {
+        let in_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM inst_relate WHERE in IN [{in_keys}];");
+        SUL_DB.query(sql).await?;
+    }
+    Ok(())
+}
 
 /// 保存 instance 数据到数据库（事务化批处理版本）
 pub async fn save_instance_data_optimize(
@@ -70,7 +83,7 @@ pub async fn save_instance_data_optimize(
             "save_instance_data_optimize deleting existing inst_relate for {} refnos",
             refnos.len()
         );
-        delete_inst_relate_cascade(&refnos, CHUNK_SIZE).await?;
+        delete_inst_relate_by_in(&refnos, CHUNK_SIZE).await?;
     }
 
     // inst_geo & geo_relate

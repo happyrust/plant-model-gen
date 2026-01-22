@@ -245,6 +245,9 @@ async fn gen_cata_geos_inner(
     // let mut handles = FuturesUnordered::new();
     let mut tubi_relates = vec![];
     let gen_mesh = db_option.inner.gen_mesh;
+    // replace_mesh/regen-model 的核心诉求是“重建关系/mesh”（比如 inst_relate、mesh 文件），
+    // 但 inst_info(ptset) 若已存在仍可复用，以避免重复的元件库几何生成。
+    let replace_exist = db_option.inner.is_replace_mesh();
     let is_bran = branch_map.len() > 0;
     
     // tubi_info 收集容器: 组合键 "{cata_hash}_{arrive}_{leave}" -> TubiInfoData
@@ -349,8 +352,112 @@ async fn gen_cata_geos_inner(
                     target_cata.group_refnos
                 );
 
-                //如果inst_info 已经存在了，可以直接跳过生成，直接指向过去就可以了
-                if gen_mesh || !target_cata.exist_inst {
+                // 复用路径：inst_info 已存在（且 ptset 已可解析），跳过昂贵的元件库几何生成。
+                // 注意：仍需为每个 pe 创建 inst_relate，并补齐 BRAN/HANG tubing 所需的 arrive/leave 点与伪属性缓存。
+                if process_cata && target_cata.exist_inst {
+                    debug_model_debug!(
+                        "[cata_hash={}] reuse existing inst_info (skip gen_cata_single_geoms)",
+                        cata_hash
+                    );
+
+                    let reuse_ptset_map = target_cata.ptset.clone().unwrap_or_default();
+
+                    // 伪属性缓存（用于 ATTRIB ... OF PREV 等表达式）；按 cata_hash 共享即可。
+                    if let Some(&sample_refno) = target_cata.group_refnos.first() {
+                        if let Ok(sample_att) = aios_core::get_named_attmap(sample_refno).await {
+                            if sample_att.contains_key("LEAV") {
+                                let arrive = sample_att.get_i32("ARRI").unwrap_or_default();
+                                let leave = sample_att.get_i32("LEAV").unwrap_or_default();
+                                if let (Some(a), Some(l)) =
+                                    (reuse_ptset_map.get(&arrive), reuse_ptset_map.get(&leave))
+                                {
+                                    let mut lock = HASH_PSEUDO_ATT_MAPS.write().await;
+                                    let psudo_map = lock
+                                        .entry(cata_hash.clone())
+                                        .or_insert(NamedAttrMap::default());
+                                    psudo_map.insert(
+                                        "ARRWID".into(),
+                                        NamedAttrValue::F32Type(a.pwidth),
+                                    );
+                                    psudo_map.insert(
+                                        "ARRHEI".into(),
+                                        NamedAttrValue::F32Type(a.pheight),
+                                    );
+                                    psudo_map.insert("ABOR".into(), NamedAttrValue::F32Type(a.pbore));
+                                    psudo_map.insert(
+                                        "LEAWID".into(),
+                                        NamedAttrValue::F32Type(l.pwidth),
+                                    );
+                                    psudo_map.insert(
+                                        "LEAHEI".into(),
+                                        NamedAttrValue::F32Type(l.pheight),
+                                    );
+                                    psudo_map.insert("LBOR".into(), NamedAttrValue::F32Type(l.pbore));
+                                }
+                            }
+                        }
+                    }
+
+                    for &ele_refno in target_cata.group_refnos.iter() {
+                        let ele_att = match aios_core::get_named_attmap(ele_refno).await {
+                            Ok(att) => att,
+                            Err(_) => continue,
+                        };
+
+                        let (owner_refno, owner_type) =
+                            shared::get_owner_info_from_attr(&ele_att).await;
+                        let generic_type = get_generic_type(ele_refno).await.unwrap_or_default();
+                        let cata_hash_for_info = if is_valid_cata_hash(&cata_hash) {
+                            Some(cata_hash.clone())
+                        } else {
+                            None
+                        };
+
+                        let mut geos_info = EleGeosInfo {
+                            refno: ele_refno,
+                            sesno: ele_att.sesno(),
+                            owner_refno,
+                            owner_type,
+                            cata_hash: cata_hash_for_info,
+                            visible: true,
+                            generic_type,
+                            ptset_map: reuse_ptset_map.clone(),
+                            is_solid: true,
+                            ..Default::default()
+                        };
+
+                        if ele_att.contains_key("ARRI") && !reuse_ptset_map.is_empty() {
+                            let arrive = ele_att.get_i32("ARRI").unwrap_or(-1);
+                            let leave = ele_att.get_i32("LEAV").unwrap_or(-1);
+                            if let (Some(a), Some(l)) =
+                                (reuse_ptset_map.get(&arrive), reuse_ptset_map.get(&leave))
+                            {
+                                local_al_map_clone.insert(ele_refno, [a.clone(), l.clone()]);
+
+                                // 仅对“有效 cata_hash”收集 tubi_info，避免 refno 兜底 key 进入数据库。
+                                if is_valid_cata_hash(&cata_hash) {
+                                    let tubi_info_id =
+                                        TubiInfoData::make_id(&cata_hash, arrive, leave);
+                                    tubi_info_map_clone
+                                        .entry(tubi_info_id.clone())
+                                        .or_insert_with(|| TubiInfoData::from_axis_params(&cata_hash, a, l));
+                                    geos_info.tubi_info_id = Some(tubi_info_id);
+                                }
+                            }
+                        }
+
+                        shape_insts_data.insert_info(ele_refno, geos_info);
+                        if shape_insts_data.inst_cnt() >= SEND_INST_SIZE {
+                            sender
+                                .send(std::mem::take(&mut shape_insts_data))
+                                .expect("send cate shape_insts_data error");
+                        }
+                    }
+                    continue;
+                }
+
+                // inst_info 不存在：需要生成元件库几何（并产出 inst_info/inst_geo/geo_relate 等）。
+                if !target_cata.exist_inst {
                     //如果没有已有的，需要生成
                     let ele_refno = target_cata.group_refnos[0];
                     process_refno = Some(ele_refno);
@@ -773,11 +880,13 @@ async fn gen_cata_geos_inner(
                                 local_al_map_clone.insert(ele_refno, [a.clone(), l.clone()]);
                                 
                                 // 收集 tubi_info（增量，自动去重）
-                                let tubi_info_id = TubiInfoData::make_id(&cata_hash, arrive, leave);
-                                tubi_info_map_clone.entry(tubi_info_id.clone()).or_insert_with(|| {
-                                    TubiInfoData::from_axis_params(&cata_hash, a, l)
-                                });
-                                geos_info.tubi_info_id = Some(tubi_info_id);
+                                if is_valid_cata_hash(&cata_hash) {
+                                    let tubi_info_id = TubiInfoData::make_id(&cata_hash, arrive, leave);
+                                    tubi_info_map_clone.entry(tubi_info_id.clone()).or_insert_with(|| {
+                                        TubiInfoData::from_axis_params(&cata_hash, a, l)
+                                    });
+                                    geos_info.tubi_info_id = Some(tubi_info_id);
+                                }
                             }
                             ptset_map = Some(cur_ptset_map);
                         };

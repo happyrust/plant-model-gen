@@ -236,7 +236,7 @@ pub async fn get_descendants_by_types(
 pub async fn get_children_batch(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
     let provider = get_model_query_provider().await?;
     provider
-        .query_multi_descendants(refnos, &[])
+        .query_multi_descendants(refnos, &[], false)
         .await
         .map_err(Into::into)
 }
@@ -461,9 +461,26 @@ pub async fn query_multi_descendants(
     refnos: &[RefnoEnum],
     nouns: &[&str],
 ) -> anyhow::Result<Vec<RefnoEnum>> {
+    query_multi_descendants_with_self(refnos, nouns, false).await
+}
+
+/// 多起点、多类型的深层子孙查询（支持 include_self 参数）
+///
+/// # 参数
+/// - `refnos`: 起点节点列表
+/// - `nouns`: 要过滤的类型列表
+/// - `include_self`: 是否包含起点节点本身（如果符合类型过滤条件）
+///
+/// # 返回
+/// 匹配条件的 refno 列表
+pub async fn query_multi_descendants_with_self(
+    refnos: &[RefnoEnum],
+    nouns: &[&str],
+    include_self: bool,
+) -> anyhow::Result<Vec<RefnoEnum>> {
     let provider = get_model_query_provider().await?;
     provider
-        .query_multi_descendants(refnos, nouns)
+        .query_multi_descendants(refnos, nouns, include_self)
         .await
         .map_err(Into::into)
 }

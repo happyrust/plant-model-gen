@@ -8,8 +8,14 @@
 //! 这些函数用于：
 //! - 增量更新模式
 //! - 手动 refno 模式
-//! - 调试模式
+//! - 调试模式（如 `--debug-model 25688_36110`）
 //! - 按数据库编号的全量生成
+//!
+//! ## 重要说明：dbnum 解析
+//!
+//! 本模块在处理 refno 时，使用 `TreeIndexManager::resolve_dbnum_for_refno()`
+//! 来正确解析 dbnum。这确保了像 `25688_36110` 这样的 refno 不会被错误地
+//! 解析为 dbnum=25688。
 //!
 //! 注意：Full Noun 模式已迁移到 full_noun_mode.rs
 
@@ -578,21 +584,17 @@ async fn process_gen_geos_data_chunks(
                 println!("\n========== 🔍 使用 TreeIndexManager 进行二次验证 ==========");
                 use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 
-                // 获取 dbnum
+                // 获取 dbnum - 使用 TreeIndexManager::resolve_dbnum_for_refno 正确解析
                 let dbnums = if let Some(first_refno) = target_refnos.first() {
-                    // RefnoEnum 格式：dbnum_elemno，提取 dbnum
-                    let refno_str = first_refno.to_string();
-                    let dbnum = if let Some(pos) = refno_str.find('_') {
-                        refno_str[..pos].parse::<u32>().unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    if dbnum > 0 {
-                        println!("📌 使用 dbnum: {}", dbnum);
-                        vec![dbnum]
-                    } else {
-                        println!("⚠️  无法从 refno 提取 dbnum: {}", refno_str);
-                        vec![]
+                    match TreeIndexManager::resolve_dbnum_for_refno(*first_refno).await {
+                        Ok(dbnum) => {
+                            println!("📌 使用 dbnum: {} (从 refno {} 解析)", dbnum, first_refno);
+                            vec![dbnum]
+                        }
+                        Err(e) => {
+                            println!("⚠️  无法从 refno {} 解析 dbnum: {}", first_refno, e);
+                            vec![]
+                        }
                     }
                 } else {
                     println!("⚠️  target_refnos 为空");

@@ -13,7 +13,9 @@
 //! use crate::fast_model::query_compat::{query_type_refnos_by_dbnum, query_multi_children_refnos};
 //! ```
 
-use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+use crate::fast_model::gen_model::tree_index_manager::{
+    ensure_tree_index_exists, load_index_with_large_stack, TreeIndexManager,
+};
 use crate::fast_model::query_provider;
 use aios_core::RefnoEnum;
 use aios_core::pdms_types::{TOTAL_NEG_NOUN_NAMES, VISBILE_GEO_NOUNS};
@@ -31,8 +33,16 @@ static BRAN_HASH: Lazy<u32> = Lazy::new(|| db1_hash("BRAN"));
 static HANG_HASH: Lazy<u32> = Lazy::new(|| db1_hash("HANG"));
 
 async fn load_tree_index_for_refno(refno: RefnoEnum) -> anyhow::Result<Arc<TreeIndex>> {
-    let manager = TreeIndexManager::with_default_dir(Vec::new());
-    manager.load_index_for_refno(refno).await
+    let tree_dir = TreeIndexManager::with_default_dir(Vec::new())
+        .tree_dir()
+        .to_path_buf();
+    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno).await?;
+
+    // 方案乙：按需生成缺失的 `{dbnum}.tree`（避免 tree 缺失导致查询直接失败/返回空）。
+    ensure_tree_index_exists(dbnum, &tree_dir).await?;
+
+    // 大栈线程加载，避免 Windows 反序列化大 `.tree` 文件时触发栈溢出。
+    load_index_with_large_stack(&tree_dir, dbnum)
 }
 
 fn build_noun_hashes(nouns: &[&str]) -> Option<Vec<u32>> {

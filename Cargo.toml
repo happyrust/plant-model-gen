@@ -61,7 +61,8 @@ parry2d = { version = "0.25.0", features = ["serde-serialize"] }
 # parse_pdms_db = { git = "https://github.com/happyrust/aios-parse-pdms" }
 # 统一使用 `pdms-io-fork` 内置版本，避免多份 crate 漂移。
 parse_pdms_db = { path = "../pdms-io-fork/crates/parse_pdms_db" }
-aios_core = { git = "https://github.com/happyrust/rs-core.git" }
+# 使用本地 rs-core，便于联调与修复（例如 to_pe_key 的 SurrealQL record id 拼接问题）。
+aios_core = { path = "../rs-core" }
 surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "updated", default-features = false, features = [
     "protocol-ws",
     "kv-mem",
@@ -272,8 +273,8 @@ required-features = ["gen_model"]
 
 eframe = { git = "https://github.com/emilk/egui.git", rev = "fa4cfec777c9ea21b8643f77b6a26561da44aad0", package = "eframe" }
 
-[patch."https://github.com/happyrust/rs-core.git"]
-aios_core = { path = "../rs-core" }
+# [patch."https://github.com/happyrust/rs-core.git"]
+# aios_core = { path = "../rs-core" }
 
 
 # [patch."https://gitee.com/happydpc/rust-ploop-processor.git"]   

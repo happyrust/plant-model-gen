@@ -1,6 +1,20 @@
 //! TreeIndex 管理器
 //!
 //! 统一管理 `output/scene_tree/{dbnum}.tree` 文件的加载和查询
+//!
+//! ## 重要说明：从 refno 获取 dbnum
+//!
+//! 本模块提供了标准的 `resolve_dbnum_for_refno()` 方法来从 refno 解析 dbnum。
+//!
+//! ⚠️ **不要使用以下错误方法**：
+//! - ❌ 字符串分割：`refno.to_string().split_once('_')` - 不可靠，会将 "25688_36110" 错误解析为 dbnum=25688
+//! - ❌ 直接取高位：`refno.refno().get_0()` - 依赖内部实现，不够健壮
+//!
+//! ✅ **正确用法**：
+//! ```rust
+//! use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+//! let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno).await?;
+//! ```
 
 use crate::versioned_db::db_meta_info::DEFAULT_TREE_DIR;
 use aios_core::tool::db_tool::{db1_dehash, db1_hash};
@@ -33,6 +47,38 @@ pub fn disable_auto_generate_tree() {
 /// 检查是否启用了自动生成
 pub fn is_auto_generate_tree_enabled() -> bool {
     AUTO_GENERATE_TREE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// 从全局缓存中尝试获取已加载的 TreeIndex（不会触发磁盘读取/反序列化）。
+pub fn try_get_cached_index(tree_dir: impl AsRef<Path>, dbnum: u32) -> Option<Arc<TreeIndex>> {
+    let key = (tree_dir.as_ref().to_path_buf(), dbnum);
+    TREE_INDEX_CACHE.get(&key).map(|v| v.clone())
+}
+
+/// 在大栈线程中加载 TreeIndex（避免 Windows 上反序列化大 `.tree` 文件时触发栈溢出）。
+///
+/// - 若缓存命中，直接返回缓存结果（不创建线程）。
+/// - 若缓存未命中，则在 64MB 栈线程中执行 `load_index` 并写入缓存。
+pub fn load_index_with_large_stack(
+    tree_dir: impl AsRef<Path>,
+    dbnum: u32,
+) -> anyhow::Result<Arc<TreeIndex>> {
+    if let Some(cached) = try_get_cached_index(tree_dir.as_ref(), dbnum) {
+        return Ok(cached);
+    }
+
+    let tree_dir = tree_dir.as_ref().to_path_buf();
+    let handle = std::thread::Builder::new()
+        .name(format!("tree-index-loader-{}", dbnum))
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let manager = TreeIndexManager::new(&tree_dir, vec![dbnum]);
+            manager.load_index(dbnum)
+        })?;
+
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("tree-index-loader 线程 panic（可能由栈溢出导致）"))?
 }
 
 /// Tree 索引缺失错误，包含友好的提示信息
@@ -189,7 +235,18 @@ impl TreeIndexManager {
 
     /// 通过 refno 解析 dbnum
     ///
-    /// 优先级：
+    /// **重要说明**：这是从 refno 获取 dbnum 的标准方法。
+    ///
+    /// ⚠️ **不要使用以下错误方法**：
+    /// - ❌ `refno.to_string().split_once('_')` - 字符串分割不可靠
+    /// - ❌ `refno.refno().get_0()` - 依赖内部实现细节，不够健壮
+    ///
+    /// ✅ **正确用法**：
+    /// ```rust
+    /// let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno).await?;
+    /// ```
+    ///
+    /// **查询优先级**：
     /// 1. DbMetaManager (db_meta_info.json) - 最快，纯内存查询
     /// 2. db_meta_cache - 内存缓存
     /// 3. SurrealDB 查询 - 最慢，作为兜底方案
@@ -696,6 +753,20 @@ pub async fn generate_tree_index_from_db(dbnum: u32, output_dir: &Path) -> anyho
     );
 
     Ok(())
+}
+
+/// 确保指定 dbnum 的 `{dbnum}.tree` 文件存在；若缺失则从 SurrealDB 生成。
+pub async fn ensure_tree_index_exists(dbnum: u32, output_dir: &Path) -> anyhow::Result<()> {
+    let tree_path = output_dir.join(format!("{}.tree", dbnum));
+    if tree_path.is_file() {
+        return Ok(());
+    }
+
+    log::info!(
+        "[tree_index] 缺失 tree 索引文件，开始按需生成: {}",
+        tree_path.display()
+    );
+    generate_tree_index_from_db(dbnum, output_dir).await
 }
 
 /// 批量生成多个 dbnum 的 tree 索引文件

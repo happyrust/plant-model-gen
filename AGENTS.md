@@ -1,7 +1,1 @@
-# Global Rules
-
-## Tool Usage
-- morph-mcp's warp-grep surfaces relevant context across files. Use it first when understanding code.
-
-## Language
-- 回答始终使用中文。
+生成模型的调试，你可以使用对生产的obj模型 进行截图的功能。

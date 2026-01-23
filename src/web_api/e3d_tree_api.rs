@@ -505,12 +505,16 @@ async fn search_nodes(
         }
     } else {
         let sql = r#"
-            SELECT refno, name, noun, owner
+            SELECT
+              refno,
+              fn::default_name(id) as name,
+              noun,
+              owner
             FROM pe
             WHERE refno != NONE
               AND (
                 string::contains(
-                    string::lowercase(name ?? ''),
+                    string::lowercase(fn::default_name(id) ?? ''),
                     string::lowercase($keyword)
                 )
                 OR string::contains(

@@ -248,7 +248,7 @@ mod tests {
             refno: child_refno,
             owner: root_refno,
             noun: db1_hash("EQUI"),
-            cata_hash: Some("123456".to_string()),
+            cata_hash: Some(123456),
         });
         root_id.append(child_id, &mut arena);
 

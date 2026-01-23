@@ -40,7 +40,9 @@ use crate::fast_model::export_model::model_exporter::{
     CommonExportConfig, ExportStats, GlbExportConfig, ModelExporter, collect_export_refnos,
     query_geometry_instances,
 };
-use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+use crate::fast_model::gen_model::tree_index_manager::{
+    ensure_tree_index_exists, load_index_with_large_stack, TreeIndexManager,
+};
 use crate::fast_model::material_config::MaterialLibrary;
 use crate::fast_model::query_compat::query_deep_visible_inst_refnos;
 use crate::fast_model::query_provider;
@@ -2307,15 +2309,16 @@ pub async fn export_dbnum_instances_json(
         println!("🔍 加载 TreeIndex...");
     }
     let tree_manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-    let tree_path = tree_manager.tree_dir().join(format!("{}.tree", dbnum));
-    if !tree_path.is_file() {
-        return Err(anyhow::anyhow!(
-            "TreeIndex 文件不存在: {}，请先生成 scene_tree",
-            tree_path.display()
-        ));
-    }
-    let tree_index = tree_manager
-        .load_index(dbnum)
+    let tree_dir = tree_manager.tree_dir().to_path_buf();
+    let tree_path = tree_dir.join(format!("{}.tree", dbnum));
+
+    // 方案乙：按需生成缺失的 `{dbnum}.tree`（无需全库预生成）。
+    ensure_tree_index_exists(dbnum, &tree_dir)
+        .await
+        .with_context(|| format!("按需生成 TreeIndex 失败: {}", tree_path.display()))?;
+
+    // 在大栈线程中加载，避免 Windows 上反序列化大 tree 文件触发栈溢出。
+    let tree_index = load_index_with_large_stack(&tree_dir, dbnum)
         .with_context(|| format!("加载 TreeIndex 失败: {}", tree_path.display()))?;
     let mut all_refnos: Vec<RefnoEnum> = tree_index
         .all_refnos()
@@ -3422,6 +3425,12 @@ pub async fn export_instances_json_for_dbnos(
 ///
 /// 这是一个占位符函数，用于修复预先缺失的函数定义。
 /// 内部调用 export_dbnum_instances_json 为每个 dbnum 导出。
+///
+/// ## 实现说明
+///
+/// 本函数使用 `TreeIndexManager::resolve_dbnum_for_refno()` 来正确解析每个 refno 的 dbnum。
+/// 这确保了像 `25688_36110` 这样的 refno 能够被正确解析到其所属的数据库编号，
+/// 而不是错误地将 "25688" 当作 dbnum。
 pub async fn export_instances_json_for_refnos_grouped_by_dbno(
     refnos: &[RefnoEnum],
     _mesh_dir: &Path,
@@ -3430,11 +3439,16 @@ pub async fn export_instances_json_for_refnos_grouped_by_dbno(
     _verbose: bool,
 ) -> anyhow::Result<()> {
     // 从 refnos 中提取所有唯一的 dbnum
+    // 使用 TreeIndexManager::resolve_dbnum_for_refno 正确解析 dbnum
     use std::collections::HashSet;
+    use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+
     let mut dbnos: HashSet<u32> = HashSet::new();
     for refno in refnos {
-        if let Some(dbnum) = refno.to_string().split_once('_').and_then(|(db, _)| db.parse::<u32>().ok()) {
+        if let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(*refno).await {
             dbnos.insert(dbnum);
+        } else {
+            log::warn!("无法解析 refno {} 的 dbnum，跳过", refno);
         }
     }
 

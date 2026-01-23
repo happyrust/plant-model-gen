@@ -359,15 +359,29 @@ pub async fn apply_cata_neg_boolean_manifold(
                 ));
 
                 // ========== 步骤 2：创建 geo_relate 关联记录 ==========
+                // 使用 INSERT RELATION 并指定唯一 ID，避免重复创建
+                // ID 格式：geo_relate:⟨inst_info_id⟩_⟨geom_refno⟩_CatePos
+                let geom_refno_str = bg[0].to_string();
+                let relation_id = format!(
+                    "geo_relate:⟨{}_{}_{}_CatePos⟩",
+                    g.inst_info_id.to_string().replace("inst_info:", ""),
+                    geom_refno_str.replace("/", "_"),
+                    mesh_id.replace("/", "_")
+                );
+
+                // 先删除旧记录（如果存在）
+                update_sql.push_str(&format!("DELETE [{}];", relation_id));
+
                 // 建立 inst_info -> geo_relate -> inst_geo 的关系
                 // geo_type='CatePos' 表示这是布尔运算后的结果（应该导出）
                 let relate_sql = format!(
-                    "relate {}->geo_relate->inst_geo:⟨{}⟩ set geom_refno=pe:⟨{}⟩, geo_type='CatePos', trans=trans:⟨0⟩, visible = true;",
+                    "INSERT RELATION {} CONTENT {{ in: {}, out: inst_geo:⟨{}⟩, geom_refno: pe:⟨{}⟩, geo_type: 'CatePos', trans: trans:⟨0⟩, visible: true }};",
+                    relation_id,
                     &g.inst_info_id.to_raw(),
                     mesh_id,
                     bg[0],
                 );
-                update_sql.push_str(relate_sql.as_str());
+                update_sql.push_str(&relate_sql);
                 
                 // ========== 步骤 3：隐藏原始几何记录 ==========
                 // 将原正实体的 geo_type 从 Pos 更新为 Compound（不导出）

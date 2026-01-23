@@ -108,7 +108,7 @@ pub async fn query_insts_with_batch(
                         in.world_aabb as world_aabb,
                         (SELECT trans.d as transform, record::id(out) as geo_hash, false as is_tubi, out.unit_flag ?? false as unit_flag
                          FROM out->geo_relate
-                         WHERE visible && (out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
+                         WHERE visible && out.meshed
                            && (trans.d ?? NONE) != NONE
                            && geo_type IN ['Pos', 'DesiPos', 'CatePos']) as insts
                     FROM [{non_bool_keys}]

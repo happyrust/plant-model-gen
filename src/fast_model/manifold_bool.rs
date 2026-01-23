@@ -364,7 +364,7 @@ pub async fn apply_cata_neg_boolean_manifold(
                 let relation_id = format!("geo_relate:⟨{}⟩", bg[0]);
 
                 // 先删除旧记录（如果存在）
-                update_sql.push_str(&format!("DELETE [];", relation_id));
+                update_sql.push_str(&format!("DELETE {};", relation_id));
 
                 // 建立 inst_info -> geo_relate -> inst_geo 的关系
                 // geo_type='CatePos' 表示这是布尔运算后的结果（应该导出）

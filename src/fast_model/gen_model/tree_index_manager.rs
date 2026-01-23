@@ -188,11 +188,24 @@ impl TreeIndexManager {
     }
 
     /// 通过 refno 解析 dbnum
+    ///
+    /// 优先级：
+    /// 1. DbMetaManager (db_meta_info.json) - 最快，纯内存查询
+    /// 2. db_meta_cache - 内存缓存
+    /// 3. SurrealDB 查询 - 最慢，作为兜底方案
     pub async fn resolve_dbnum_for_refno(refno: RefnoEnum) -> anyhow::Result<u32> {
+        // 优先使用 DbMetaManager 的快速查询（通过 db_meta_info.json）
+        use crate::data_interface::db_meta;
+        if let Some(dbnum) = db_meta().get_dbnum_by_refno(refno) {
+            return Ok(dbnum);
+        }
+
+        // 其次尝试从旧的缓存获取
         if let Some(dbnum) = crate::fast_model::db_meta_cache::get_dbnum_for_refno(refno) {
             return Ok(dbnum);
         }
 
+        // 最后查询数据库（兜底方案）
         let Some(pe) = aios_core::get_pe(refno).await? else {
             return Err(anyhow::anyhow!("refno {} 不存在，无法获取 dbnum", refno));
         };

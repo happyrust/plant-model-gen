@@ -2273,6 +2273,8 @@ pub async fn export_dbnum_instances_json(
 
     // 目标单位（默认毫米）
     let target = target_unit.unwrap_or(LengthUnit::Millimeter);
+    // 创建单位转换器（源单位：毫米，目标单位：用户指定或默认毫米）
+    let unit_converter = UnitConverter::new(LengthUnit::Millimeter, target);
     // 关键前置条件说明：instances_*.json 的 geo_instances 依赖 inst_relate/geo_relate/inst_geo 落库数据。
     // 若仅生成树（gen_tree_only=true）或不落库（save_db=false）/不生成 mesh（gen_mesh=false），
     // 则导出时通常只能拿到树结构与 pe_transform，geo_instances 很可能为空。
@@ -2772,7 +2774,7 @@ pub async fn export_global_trans_aabb_json(
     verbose: bool,
 ) -> Result<(usize, usize)> {
     use aios_core::SurrealQueryExt;
-    
+
     let target = target_unit.unwrap_or(LengthUnit::Millimeter);
     let unit_converter = UnitConverter::new(LengthUnit::Millimeter, target);
     const PAGE_SIZE: usize = 5000;

@@ -285,12 +285,25 @@ async fn process_gen_geos_data_chunks(
     let mut chunked_root_refnos = origin_root_refnos.chunks(chunk_size);
     let gen_model = db_option_arc.gen_model || is_incr_update || has_manual_refnos;
 
-    debug_model_debug!("========== gen_geos_data 配置检查 ==========");
-    debug_model_debug!("db_option_arc.gen_model: {}", db_option_arc.gen_model);
-    debug_model_debug!("is_incr_update: {}", is_incr_update);
-    debug_model_debug!("has_manual_refnos: {}", has_manual_refnos);
-    debug_model_debug!("gen_model (最终值): {}", gen_model);
-    debug_model_debug!("origin_root_refnos 数量: {}", origin_root_refnos.len());
+    println!("╔════════════════════════════════════════════════════════════════╗");
+    println!("║         gen_geos_data 模型生成配置检查                          ║");
+    println!("╠════════════════════════════════════════════════════════════════╣");
+    println!("║ db_option_arc.gen_model: {:<40} ║", db_option_arc.gen_model);
+    println!("║ is_incr_update: {:<48} ║", is_incr_update);
+    println!("║ has_manual_refnos: {:<45} ║", has_manual_refnos);
+    println!("║ gen_model (最终值): {:<44} ║", gen_model);
+    println!("╟────────────────────────────────────────────────────────────────╢");
+    println!("║ debug_refno_types: {:<44} ║", format!("{:?}", d_types));
+    println!("║ gen_cata_flag: {:<49} ║", gen_cata_flag);
+    println!("║ gen_loop_flag: {:<49} ║", gen_loop_flag);
+    println!("║ gen_prim_flag: {:<49} ║", gen_prim_flag);
+    println!("╟────────────────────────────────────────────────────────────────╢");
+    println!("║ origin_root_refnos 数量: {:<39} ║", origin_root_refnos.len());
+    if !origin_root_refnos.is_empty() {
+        println!("║ origin_root_refnos: {:<44} ║", format!("{:?}", origin_root_refnos.iter().take(3).collect::<Vec<_>>()));
+    }
+    println!("╚════════════════════════════════════════════════════════════════╝");
+
     debug_model_debug!("========== 开始遍历 root_refnos 小块 ==========");
     debug_model_debug!("准备进入 while 循环");
 
@@ -518,6 +531,9 @@ async fn process_gen_geos_data_chunks(
             all_handles.push(handle);
         }
 
+        // ============================================================
+        // 🔍 LOOP 节点查询 - 添加详细调试日志
+        // ============================================================
         let target_loop_owner_refnos: Vec<RefnoEnum> = if is_incr_update {
             incr_updates_log_arc
                 .loop_owner_refnos
@@ -525,13 +541,132 @@ async fn process_gen_geos_data_chunks(
                 .cloned()
                 .collect()
         } else {
-            let mut loop_owner_refnos =
+            println!("========== 🔍 开始查询 LOOP 节点 ==========");
+            println!("target_refnos 数量: {}", target_refnos.len());
+            println!("target_refnos: {:?}", target_refnos);
+            println!("查询的 LOOP 类型: {:?}", GNERAL_LOOP_OWNER_NOUN_NAMES);
+
+            // 🔧 修复：先检查 target_refnos 本身是否为 LOOP 类型
+            let mut loop_owner_refnos = Vec::new();
+            for refno in target_refnos {
+                if let Ok(Some(pe)) = aios_core::get_pe(*refno).await {
+                    let noun_upper = pe.noun.to_uppercase();
+                    if GNERAL_LOOP_OWNER_NOUN_NAMES.contains(&noun_upper.as_str()) {
+                        println!("✅ target_refno 本身是 LOOP 类型: {} (noun={})", refno, pe.noun);
+                        loop_owner_refnos.push(*refno);
+                    }
+                }
+            }
+
+            // 再查询子孙节点中的 LOOP 类型
+            let mut descendants_loop =
                 query_multi_descendants(target_refnos, &GNERAL_LOOP_OWNER_NOUN_NAMES)
                     .await
                     .unwrap_or_default();
-            loop_owner_refnos.into_iter().collect()
+
+            println!("✅ query_multi_descendants 查询结果: {} 个 LOOP 节点", descendants_loop.len());
+            loop_owner_refnos.append(&mut descendants_loop);
+
+            println!("✅ 总共找到 {} 个 LOOP 节点（包含 target_refnos 本身）", loop_owner_refnos.len());
+
+            if !loop_owner_refnos.is_empty() {
+                println!("   LOOP 节点列表（前10个）: {:?}", loop_owner_refnos.iter().take(10).collect::<Vec<_>>());
+            } else {
+                println!("   ⚠️  未找到任何 LOOP 节点");
+
+                // 🔧 使用 TreeIndexManager 进行二次验证
+                println!("\n========== 🔍 使用 TreeIndexManager 进行二次验证 ==========");
+                use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+
+                // 获取 dbnum
+                let dbnums = if let Some(first_refno) = target_refnos.first() {
+                    // RefnoEnum 格式：dbnum_elemno，提取 dbnum
+                    let refno_str = first_refno.to_string();
+                    let dbnum = if let Some(pos) = refno_str.find('_') {
+                        refno_str[..pos].parse::<u32>().unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if dbnum > 0 {
+                        println!("📌 使用 dbnum: {}", dbnum);
+                        vec![dbnum]
+                    } else {
+                        println!("⚠️  无法从 refno 提取 dbnum: {}", refno_str);
+                        vec![]
+                    }
+                } else {
+                    println!("⚠️  target_refnos 为空");
+                    vec![]
+                };
+
+                if !dbnums.is_empty() {
+                    let manager = TreeIndexManager::with_default_dir(dbnums.clone());
+                    println!("✅ TreeIndexManager 已创建，管理的 dbnum: {:?}", manager.dbnums());
+
+                    for refno in target_refnos {
+                        println!("\n🔍 检查节点: {}", refno);
+
+                        // 1. 检查节点本身的类型
+                        if let Ok(Some(pe)) = aios_core::get_pe(*refno).await {
+                            println!("   节点类型: noun={}, name={}", pe.noun, pe.name);
+                        }
+
+                        // 2. 使用 TreeIndexManager 查询子孙节点
+                        let descendants = manager.query_descendants_filtered(
+                            *refno,
+                            &GNERAL_LOOP_OWNER_NOUN_NAMES,
+                            None, // 无深度限制
+                        );
+
+                        println!("   TreeIndexManager 查询结果: {} 个 LOOP 节点", descendants.len());
+                        if !descendants.is_empty() {
+                            println!("   ✅ 找到的 LOOP 节点（前5个）:");
+                            for (i, desc) in descendants.iter().take(5).enumerate() {
+                                if let Ok(Some(pe)) = aios_core::get_pe(*desc).await {
+                                    println!("      {}. {} (noun={}, name={})", i+1, desc, pe.noun, pe.name);
+                                }
+                            }
+
+                            // 如果 TreeIndexManager 找到了但 query_multi_descendants 没找到
+                            println!("\n   ⚠️  警告: TreeIndexManager 找到了 {} 个 LOOP 节点，但 query_multi_descendants 未找到！", descendants.len());
+                            println!("   可能原因: tree_index 文件存在但 query_multi_descendants 使用了 SurrealDB 查询");
+                        } else {
+                            println!("   TreeIndexManager 也未找到 LOOP 节点");
+                        }
+
+                        // 3. 查询所有子孙节点类型分布
+                        let all_descendants = manager.query_descendants(*refno, None);
+                        println!("   总共 {} 个子孙节点", all_descendants.len());
+
+                        if !all_descendants.is_empty() {
+                            // 统计类型分布
+                            use std::collections::HashMap;
+                            let mut noun_counts: HashMap<String, usize> = HashMap::new();
+                            for desc in all_descendants.iter().take(100) { // 只统计前100个
+                                if let Ok(Some(pe)) = aios_core::get_pe(*desc).await {
+                                    *noun_counts.entry(pe.noun).or_insert(0) += 1;
+                                }
+                            }
+                            println!("   子孙节点类型分布（前10种，最多统计100个节点）:");
+                            let mut sorted: Vec<_> = noun_counts.iter().collect();
+                            sorted.sort_by(|a, b| b.1.cmp(a.1));
+                            for (noun, count) in sorted.iter().take(10) {
+                                println!("      {}: {}", noun, count);
+                            }
+                        }
+                    }
+                    println!("========== TreeIndexManager 验证完成 ==========\n");
+                } else {
+                    println!("⚠️  无法获取 dbnum，跳过 TreeIndexManager 验证");
+                }
+            }
+            println!("========== LOOP 节点查询完成 ==========\n");
+
+            loop_owner_refnos
         };
+
         if gen_loop_flag && !target_loop_owner_refnos.is_empty() {
+            println!("✅ 开始生成 {} 个 LOOP 模型", target_loop_owner_refnos.len());
             let sjus_map_clone = loop_sjus_map_arc.clone();
             let sender = sender.clone();
             let db_option = db_option_arc.clone();
@@ -546,21 +681,38 @@ async fn process_gen_geos_data_chunks(
                 .unwrap();
             });
             all_handles.push(handle);
+        } else if gen_loop_flag {
+            println!("⚠️  gen_loop_flag=true 但 target_loop_owner_refnos 为空，跳过 LOOP 生成");
+        } else {
+            println!("ℹ️  gen_loop_flag=false，跳过 LOOP 生成");
         }
 
+        // ============================================================
+        // 🔍 PRIM 节点查询 - 添加调试日志
+        // ============================================================
         let target_prim_refnos: Vec<RefnoEnum> = if is_incr_update {
             incr_updates_log_arc.prim_refnos.iter().cloned().collect()
         } else {
+            println!("========== 🔍 开始查询 PRIM 节点 ==========");
+            println!("查询的 PRIM 类型: {:?}", GNERAL_PRIM_NOUN_NAMES);
+
             let mut prim_refnos = query_multi_descendants(target_refnos, &GNERAL_PRIM_NOUN_NAMES)
                 .await
                 .unwrap_or_default();
+
+            println!("✅ query_multi_descendants 查询结果: {} 个 PRIM 节点", prim_refnos.len());
+            if !prim_refnos.is_empty() {
+                println!("   PRIM 节点列表（前10个）: {:?}", prim_refnos.iter().take(10).collect::<Vec<_>>());
+            }
             debug_model_trace!("prim_refnos: {:?}", &prim_refnos);
+            println!("========== PRIM 节点查询完成 ==========\n");
+
             prim_refnos.into_iter().collect()
         };
 
         // 基本元件的生成
         if gen_prim_flag && !target_prim_refnos.is_empty() {
-            println!("当前分段使用基本体数量: {}", target_prim_refnos.len());
+            println!("✅ 开始生成 {} 个 PRIM 模型", target_prim_refnos.len());
             // 基本体模型的生成
             let db_option = db_option_arc.clone();
             let sender = sender.clone();
@@ -570,6 +722,10 @@ async fn process_gen_geos_data_chunks(
                     .unwrap();
             });
             all_handles.push(handle);
+        } else if gen_prim_flag {
+            println!("⚠️  gen_prim_flag=true 但 target_prim_refnos 为空，跳过 PRIM 生成");
+        } else {
+            println!("ℹ️  gen_prim_flag=false，跳过 PRIM 生成");
         }
         if is_incr_update {
             break;

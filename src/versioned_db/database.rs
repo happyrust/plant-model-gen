@@ -37,6 +37,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
 use std::io::Read;
+use std::ops::Range;
 use std::mem::take;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -985,10 +986,10 @@ where
         dbno_set.insert(dbnum);
 
         // 读取 sesno、存储 refno->sesno map
-        let mut ses_range_map = BTreeMap::new();
+        let mut ses_range_map: BTreeMap<i32, Range<u32>> = BTreeMap::new();
         let mut sesno = 0;
         {
-            let mut io = PdmsIO::new(&project, path.clone(), true);
+            let mut io = PdmsIO::new(project.as_str(), path.clone(), true);
             if io.open().is_ok() {
                 sesno = io.get_latest_sesno().unwrap_or_default();
                 if sesno == 0 {
@@ -1022,7 +1023,16 @@ where
                 } else {
                     io.store_all_refno_sesno_map().await.unwrap();
                 }
-                ses_range_map = io.ses_range_map;
+                // pdms-io-fork 的 ses_range_map 使用 RangeInclusive；parse_pdms_db 仍期望 Range（右开区间）
+                ses_range_map = io
+                    .ses_range_map
+                    .into_iter()
+                    .map(|(k, r)| {
+                        let start = *r.start();
+                        let end_exclusive = r.end().saturating_add(1);
+                        (k, start..end_exclusive)
+                    })
+                    .collect();
             } else {
                 if let Some(cb) = progress_callback.as_mut() {
                     cb(
@@ -1566,12 +1576,12 @@ pub async fn sync_total_async_threaded(
                 dbno_set.insert(dbnum);
                 // 如果需要解析的文件列表为空或包含当前文件名,则执行以下代码块
                 info!("path={:?}", &file_name); // 打印文件路径
-                let mut ses_range_map = BTreeMap::new();
+                let mut ses_range_map: BTreeMap<i32, Range<u32>> = BTreeMap::new();
                 let mut sesno = 0;
                 let mut sesno_timestamp: Option<i64> = None;
                 // let mut dt = Local::now().naive_local();
                 {
-                    let mut io = PdmsIO::new(&project, path.clone(), true);
+                    let mut io = PdmsIO::new(project.as_str(), path.clone(), true);
 
                     //打开文件
                     if io.open().is_ok() {
@@ -1603,7 +1613,16 @@ pub async fn sync_total_async_threaded(
                             io.store_all_refno_sesno_map().await.unwrap();
                         }
                         //获取sesno range
-                        ses_range_map = io.ses_range_map;
+                        // pdms-io-fork 的 ses_range_map 使用 RangeInclusive；parse_pdms_db 仍期望 Range（右开区间）
+                        ses_range_map = io
+                            .ses_range_map
+                            .into_iter()
+                            .map(|(k, r)| {
+                                let start = *r.start();
+                                let end_exclusive = r.end().saturating_add(1);
+                                (k, start..end_exclusive)
+                            })
+                            .collect();
                     }
                 }
 

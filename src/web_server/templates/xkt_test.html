@@ -690,9 +690,29 @@
             const canvas = document.getElementById('xkt-viewer');
             viewer = new Viewer({
                 canvasId: 'xkt-viewer',
-                transparent: true
+                transparent: true,
+                // ========== Z-Fighting 解决方案 ==========
+                // 1. 启用对数深度缓冲 - 大幅提升深度精度
+                logarithmicDepthBufferEnabled: true
             });
             console.log('🧭 Viewer 初始化完成:', viewer);
+
+            // ========== Z-Fighting 解决方案 ==========
+            // 2. 调整相机近/远平面比例
+            // 增大近平面距离可提升深度精度（默认 0.1 太小）
+            // 场景坐标范围约 14000~43000，需要足够的远平面
+            viewer.camera.perspective.near = 1.0;    // 近平面：1米（原默认 0.1）
+            viewer.camera.perspective.far = 100000;  // 远平面：100km（覆盖大型工厂场景）
+
+            // 正交相机也需要设置
+            viewer.camera.ortho.near = 0.1;
+            viewer.camera.ortho.far = 100000;
+
+            console.log('📐 相机深度设置:', {
+                perspectiveNear: viewer.camera.perspective.near,
+                perspectiveFar: viewer.camera.perspective.far,
+                logarithmicDepthBuffer: true
+            });
 
             // 设置初始相机位置
             viewer.camera.eye = [-3.933, 2.855, 27.018];

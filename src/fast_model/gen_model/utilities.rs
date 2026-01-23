@@ -177,9 +177,19 @@ pub async fn build_cata_hash_map_from_tree(
     if refnos.is_empty() {
         return Ok(DashMap::new());
     }
+    // 关键：RefnoEnum 的 ref0（例如 17496）并不等同于 dbnum（例如 1112）。
+    // Full Noun 模式下若未提前加载 db_meta_info.json，直接用 ref0 当 dbnum 会导致找不到 tree 文件，
+    // 进而整批 refno 被跳过，最终 target_cata_map 为空。
+    //
+    // 因此这里优先用本仓的 db_meta_manager 做 refno->dbnum 映射，并尽力 ensure_loaded。
+    let db_meta = crate::data_interface::db_meta_manager::db_meta();
+    let _ = db_meta.ensure_loaded();
+
     let mut dbnum_groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
     for refno in refnos {
-        let dbnum = crate::fast_model::db_meta_cache::get_dbnum_for_refno(*refno)
+        let dbnum = db_meta
+            .get_dbnum_by_refno(*refno)
+            .or_else(|| crate::fast_model::db_meta_cache::get_dbnum_for_refno(*refno))
             .unwrap_or_else(|| refno.refno().get_0());
         dbnum_groups.entry(dbnum).or_default().push(*refno);
     }

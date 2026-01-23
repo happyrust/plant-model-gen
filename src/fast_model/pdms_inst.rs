@@ -15,6 +15,7 @@ use futures::stream::FuturesUnordered;
 use itertools::Itertools;
 use rkyv::vec;
 use tokio::task::JoinHandle;
+use std::time::Duration;
 
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::debug_model_debug;
@@ -53,7 +54,9 @@ pub async fn save_instance_data_optimize(
     const CHUNK_SIZE: usize = 100;
     // SurrealDB 在高并发/大事务时容易出现 session 丢失、匿名访问等错误；这里优先保证稳定性。
     const MAX_TX_STATEMENTS: usize = 5;
-    const MAX_CONCURRENT_TX: usize = 5;
+    // 本地 SurrealDB 在并发事务较高时更容易出现 “Transaction conflict: Resource busy”，
+    // 这里降低并发以提升整体成功率（结合 TransactionBatcher 内部重试）。
+    const MAX_CONCURRENT_TX: usize = 2;
 
     // 统一迁移/修复 inst_relate 的历史 schema（普通表 -> RELATION），确保 pe -> inst_info 关系可复用
     utils::ensure_inst_relate_relation_schema().await;
@@ -693,7 +696,6 @@ impl TransactionBatcher {
         let statements = std::mem::take(&mut self.pending);
         let statements_len = statements.len();
         let query = build_transaction_block(&statements);
-        let db = SUL_DB.clone();
         let debug_query = query.clone();
 
         self.tasks.push(tokio::spawn(async move {
@@ -720,60 +722,75 @@ impl TransactionBatcher {
                 }};
             }
 
-            match db.query(query.clone()).await {
-                Ok(mut resp) => {
-                    if let Err(e) = take_all_results_or_err!(resp) {
+            fn is_tx_conflict(msg: &str) -> bool {
+                msg.contains("Transaction conflict")
+                    || msg.contains("Resource busy")
+                    || msg.contains("This transaction can be retried")
+            }
+
+            // 注意：不要对 SUL_DB 做 clone 再 query。
+            // 在当前 surrealdb client 实现中，clone 后可能丢失已选定的 namespace/database，
+            // 从而随机触发 “Specify a namespace to use” 并导致整块事务回滚。
+            //
+            // 同时：SurrealDB 在高并发事务下可能返回 “Transaction conflict: Resource busy”，
+            // 官方提示该事务可重试。这里对整块事务做有限次重试 + 退避，尽量避免“部分批次直接丢数据”。
+            let mut repaired_inst_relate_aabb_index = false;
+            let mut attempt: usize = 0;
+            let max_retries: usize = 8;
+
+            loop {
+                attempt += 1;
+
+                let run_once = async {
+                    match SUL_DB.query(query.clone()).await {
+                        Ok(mut resp) => take_all_results_or_err!(resp),
+                        Err(err) => Err(anyhow::Error::from(err)),
+                    }
+                }
+                .await;
+
+                match run_once {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        let es = e.to_string();
+
                         // 某些情况下 inst_relate_aabb 的唯一索引可能“脏”了（表里查不到记录但索引仍占用值），
                         // 这会导致所有 INSERT 失败并连带回滚同一事务块（inst_relate 也写不进去）。
-                        let es = e.to_string();
-                        let is_inst_relate_aabb_unique_conflict =
-                            es.contains("idx_inst_relate_aabb_refno") && es.contains("already contains");
+                        let is_inst_relate_aabb_unique_conflict = es.contains("idx_inst_relate_aabb_refno")
+                            && es.contains("already contains");
 
-                        if is_inst_relate_aabb_unique_conflict {
+                        if is_inst_relate_aabb_unique_conflict && !repaired_inst_relate_aabb_index {
+                            repaired_inst_relate_aabb_index = true;
                             debug_model_debug!(
-                                "⚠️ [DEBUG] 检测到 inst_relate_aabb 唯一索引冲突，尝试重建索引并重试一次..."
+                                "⚠️ [DEBUG] 检测到 inst_relate_aabb 唯一索引冲突，尝试重建索引并重试..."
                             );
                             let repair_sql = "REMOVE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb; \
 DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS in UNIQUE;";
-                            let _ = db.query(repair_sql).await;
-
-                            match db.query(query).await {
-                                Ok(mut resp2) => take_all_results_or_err!(resp2).map_err(|e2| {
-                                    debug_model_debug!(
-                                        "❌ [DEBUG] TransactionBatcher retry failed: {}\n--- transaction block ---\n{}",
-                                        e2,
-                                        debug_query
-                                    );
-                                    e2
-                                }),
-                                Err(err2) => {
-                                    debug_model_debug!(
-                                        "❌ [DEBUG] TransactionBatcher retry query error: {}\n--- transaction block ---\n{}",
-                                        err2,
-                                        debug_query
-                                    );
-                                    Err(anyhow::Error::from(err2))
-                                }
-                            }
-                        } else {
-                            debug_model_debug!(
-                                "❌ [DEBUG] TransactionBatcher statement error: {}\n--- transaction block ---\n{}",
-                                e,
-                                debug_query
-                            );
-                            Err(e)
+                            let _ = SUL_DB.query(repair_sql).await;
+                            continue;
                         }
-                    } else {
-                        Ok(())
+
+                        let conflict = is_tx_conflict(&es);
+                        if conflict && attempt < max_retries {
+                            // 50ms,100ms,200ms,... up to 2s
+                            let backoff_ms = (50u64.saturating_mul(1u64 << (attempt - 1))).min(2000);
+                            debug_model_debug!(
+                                "⚠️ [DEBUG] Transaction conflict, retry {}/{} after {}ms",
+                                attempt,
+                                max_retries,
+                                backoff_ms
+                            );
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            continue;
+                        }
+
+                        debug_model_debug!(
+                            "❌ [DEBUG] TransactionBatcher failed: {}\n--- transaction block ---\n{}",
+                            e,
+                            debug_query
+                        );
+                        return Err(e);
                     }
-                }
-                Err(err) => {
-                    debug_model_debug!(
-                        "❌ [DEBUG] TransactionBatcher query error: {}\n--- transaction block ---\n{}",
-                        err,
-                        debug_query
-                    );
-                    Err(anyhow::Error::from(err))
                 }
             }
         }));

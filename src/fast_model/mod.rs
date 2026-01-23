@@ -45,6 +45,8 @@ pub mod pdms_inst;
 pub mod resolve;
 
 pub mod query;
+// inst_relate/geo_relate 查询（v2）：用于绕开旧 schema 字段，便于导出/诊断
+pub mod inst_query;
 pub mod query_compat;
 pub mod query_provider; // 新的统一查询提供者 // 查询兼容层
 pub mod db_meta_cache;

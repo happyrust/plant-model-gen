@@ -1,6 +1,7 @@
 use aios_core::{CataContext, eval_str_to_f64};
 use anyhow::{Result, anyhow};
 use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use regex::Regex;
 
 /// 表达式验证错误信息
@@ -49,6 +50,15 @@ impl std::fmt::Display for ExpressionValidationError {
 pub struct ExpressionFixer;
 
 impl ExpressionFixer {
+    /// 规整 `ATTRIB :NAME` 这种 UDA 写法（去掉冒号），避免下游解析器不识别 `:` 前缀。
+    ///
+    /// 例如：`ATTRIB :HXYS[1 ]` -> `ATTRIB HXYS[1 ]`
+    pub fn normalize_attrib_colon(expr: &str) -> String {
+        static ATTRIB_COLON_REGEX: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"ATTRIB\s+:\s*").expect("invalid ATTRIB_COLON_REGEX"));
+        ATTRIB_COLON_REGEX.replace_all(expr, "ATTRIB ").to_string()
+    }
+
     /// 预处理ATTRIB表达式，将ATTRIB关键字转换为可解析的变量名
     pub fn preprocess_attrib_expression(expr: &str) -> String {
         // 处理 ATTRIB PARA[数字] 格式，支持空格

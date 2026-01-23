@@ -38,7 +38,7 @@ use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::defines::CACHED_MDB_SITE_MAP;
 use crate::mqtt_service::{SyncE3dFileMsg, new_mqtt_inst};
 
-pub const TUBI_TOL: f32 = 0.1f32;
+pub const TUBI_TOL: f32 = 1.0f32;
 
 // project + mdb + module
 pub static GLOBAL_MDB_WORLD_MAP: Lazy<DashMap<String, PdmsElement>> = Lazy::new(DashMap::new);

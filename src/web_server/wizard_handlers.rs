@@ -646,7 +646,7 @@ fn parse_database_file(file_path: &Path, errors: &mut Vec<String>) -> Option<Dat
     let db_basic_info = parse_db_basic_info(file_path.to_path_buf());
 
     Some(DatabaseFileInfo {
-        db_num: db_basic_info.db_no as u32,
+        db_num: db_basic_info.dbnum as u32,
         file_name,
         file_path: file_path.to_string_lossy().to_string(),
         db_type: db_basic_info.db_type,

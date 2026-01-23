@@ -4,7 +4,7 @@ use aios_core::options::DbOption;
 use crate::options::DbOptionExt;
 
 use aios_core::pdms_types::{
-    GNERAL_LOOP_OWNER_NOUN_NAMES, GNERAL_PRIM_NOUN_NAMES, USE_CATE_NOUN_NAMES,
+    BRAN_COMPONENT_NOUN_NAMES, GNERAL_LOOP_OWNER_NOUN_NAMES, GNERAL_PRIM_NOUN_NAMES, USE_CATE_NOUN_NAMES,
 };
 use aios_core::pe::SPdmsElement;
 use aios_core::{DBType, query_mdb_db_nums};
@@ -293,45 +293,158 @@ pub async fn gen_full_noun_geos_optimized(
     // ============================================================================
     // 🚩 [第一阶段] BRAN/HANG 核心逻辑（始终执行）
     // ============================================================================
-    let mut bran_hanger_roots: HashSet<RefnoEnum> = HashSet::new();
-    for noun in &["BRAN", "HANG"] {
-        let refnos = query_noun_refnos(noun, &dbnums, config.debug_limit_per_noun).await?;
-        if !refnos.is_empty() {
-            println!("[Pipeline] 收集到 {} 根节点: {} 个", noun, refnos.len());
-            bran_hanger_roots.extend(refnos);
-        }
-    }
+    let need_bran_hang_stage = config.enabled_categories.is_empty()
+        || config.enabled_categories.iter().any(|cat| {
+            let upper = cat.to_uppercase();
+            upper == "BRAN" || upper == "HANG"
+        });
 
-    let bran_roots_vec: Vec<RefnoEnum> = bran_hanger_roots.into_iter().collect();
+    let mut bran_roots_vec: Vec<RefnoEnum> = Vec::new();
     let mut bran_duration = Duration::ZERO;
-    if !bran_roots_vec.is_empty() {
-        let bran_start = Instant::now();
-        process_bran_hang_core_logic(
-            &db_option,
-            &bran_roots_vec,
-            loop_sjus_map_arc.clone(),
-            sender.clone(),
-            &mut bran_generated_refnos,
-        )
-        .await?;
-        bran_duration = bran_start.elapsed();
-
-        // 记录 BRAN/HANG 为 Cate 类别
-        for r in &bran_roots_vec {
-            categorized.insert(*r, super::models::NounCategory::Cate);
+    if need_bran_hang_stage {
+        let mut bran_hanger_roots: HashSet<RefnoEnum> = HashSet::new();
+        for noun in &["BRAN", "HANG"] {
+            let refnos = query_noun_refnos(noun, &dbnums, config.debug_limit_per_noun).await?;
+            if !refnos.is_empty() {
+                println!("[Pipeline] 收集到 {} 根节点: {} 个", noun, refnos.len());
+                bran_hanger_roots.extend(refnos);
+            }
         }
+
+        bran_roots_vec = bran_hanger_roots.into_iter().collect();
+        if !bran_roots_vec.is_empty() {
+            let bran_start = Instant::now();
+            process_bran_hang_core_logic(
+                &db_option,
+                &bran_roots_vec,
+                loop_sjus_map_arc.clone(),
+                sender.clone(),
+                &mut bran_generated_refnos,
+            )
+            .await?;
+            bran_duration = bran_start.elapsed();
+
+            // 记录 BRAN/HANG 为 Cate 类别
+            for r in &bran_roots_vec {
+                categorized.insert(*r, super::models::NounCategory::Cate);
+            }
+        }
+    } else {
+        println!("[Pipeline] 未启用 BRAN/HANG：跳过 BRAN/HANG 优先阶段");
     }
 
     // ============================================================================
     // 🚦 [判定点] 如果仅启用了 BRAN/HANG，此时可以结束
     // ============================================================================
-    let only_bran_hang = config.enabled_categories.iter().all(|cat| {
-        let upper = cat.to_uppercase();
-        upper == "BRAN" || upper == "HANG"
-    });
+    // 注意：`enabled_categories = []` 的语义是“启用所有类别”，不能被误判为“仅 BRAN/HANG”。
+    // Rust 的 `Iterator::all` 在空迭代器上返回 true（空集恒真），因此这里必须显式要求非空。
+    let only_bran_hang = !config.enabled_categories.is_empty()
+        && config.enabled_categories.iter().all(|cat| {
+            let upper = cat.to_uppercase();
+            upper == "BRAN" || upper == "HANG"
+        });
 
     if only_bran_hang {
-        println!("✅ [Optimization] 仅需处理 BRAN/HANG。已于流水线第一阶段完成退出。");
+        // 重要语义说明：
+        // - BRAN/HANG 本身多为“容器/挂点”，可渲染几何往往来自其子孙（LOOP/PRIM/CATE 等）。
+        // - 因此当用户显式指定仅 BRAN/HANG 时，不应直接退出；而应仅以 BRAN/HANG 作为根，
+        //   深度收集其子孙并生成几何（同时严格按 dbnum 过滤，避免跨库污染）。
+        println!(
+            "✅ [Optimization] 仅启用 BRAN/HANG：以 BRAN/HANG 为根，生成其子孙中的 LOOP/PRIM/CATE 几何（dbnum 过滤生效）"
+        );
+
+        // BRAN/HANG 的层级关系以 children/tree 为准（owner 深度查询在此场景下可能为空）。
+        // 因此这里用 TreeIndex 进行子孙收集，并按 noun 类型过滤到 LOOP/PRIM/CATE 三类。
+        let tree_dbnums = resolve_tree_dbnums(&dbnums)?;
+        let manager = TreeIndexManager::with_default_dir(tree_dbnums);
+
+        let mut loop_refnos: HashSet<RefnoEnum> = HashSet::new();
+        let mut prim_refnos: HashSet<RefnoEnum> = HashSet::new();
+        let mut cate_refnos: HashSet<RefnoEnum> = HashSet::new();
+        for &root in &bran_roots_vec {
+            loop_refnos.extend(manager.query_descendants_filtered(root, &GNERAL_LOOP_OWNER_NOUN_NAMES, None));
+            prim_refnos.extend(manager.query_descendants_filtered(root, &GNERAL_PRIM_NOUN_NAMES, None));
+            cate_refnos.extend(manager.query_descendants_filtered(root, &USE_CATE_NOUN_NAMES, None));
+            // BRAN 下的管道组件（如 TUBI/ELBO/TEE...）常不在 USE_CATE_NOUN_NAMES 中，需要单独纳入。
+            cate_refnos.extend(manager.query_descendants_filtered(root, &BRAN_COMPONENT_NOUN_NAMES, None));
+        }
+
+        println!(
+            "[BRAN-only] 子孙收集结果: LOOP={}, PRIM={}, CATE={}",
+            loop_refnos.len(),
+            prim_refnos.len(),
+            cate_refnos.len()
+        );
+
+        let ctx = NounProcessContext::new(
+            db_option.clone(),
+            config.batch_size.get(),
+            config.concurrency.get(),
+        );
+
+        // LOOP
+        let mut loop_vec: Vec<RefnoEnum> = loop_refnos.into_iter().collect();
+        loop_vec.sort_by_key(|r| r.to_string());
+        for (i, chunk) in loop_vec.chunks(ctx.batch_size.max(1)).enumerate() {
+            println!(
+                "[BRAN-only][LOOP] 分页 {}/{} ({} ~ {})",
+                i + 1,
+                (loop_vec.len() + ctx.batch_size.max(1) - 1) / ctx.batch_size.max(1),
+                i * ctx.batch_size.max(1) + 1,
+                (i * ctx.batch_size.max(1) + chunk.len())
+            );
+            process_loop_refno_page(
+                &ctx,
+                loop_sjus_map_arc.clone(),
+                sender.clone(),
+                chunk,
+            )
+            .await?;
+        }
+        for r in &loop_vec {
+            categorized.insert(*r, super::models::NounCategory::LoopOwner);
+        }
+
+        // PRIM
+        let mut prim_vec: Vec<RefnoEnum> = prim_refnos.into_iter().collect();
+        prim_vec.sort_by_key(|r| r.to_string());
+        for (i, chunk) in prim_vec.chunks(ctx.batch_size.max(1)).enumerate() {
+            println!(
+                "[BRAN-only][PRIM] 分页 {}/{} ({} ~ {})",
+                i + 1,
+                (prim_vec.len() + ctx.batch_size.max(1) - 1) / ctx.batch_size.max(1),
+                i * ctx.batch_size.max(1) + 1,
+                (i * ctx.batch_size.max(1) + chunk.len())
+            );
+            process_prim_refno_page(&ctx, sender.clone(), chunk).await?;
+        }
+        for r in &prim_vec {
+            categorized.insert(*r, super::models::NounCategory::Prim);
+        }
+
+        // CATE
+        let mut cate_vec: Vec<RefnoEnum> = cate_refnos.into_iter().collect();
+        cate_vec.sort_by_key(|r| r.to_string());
+        for (i, chunk) in cate_vec.chunks(ctx.batch_size.max(1)).enumerate() {
+            println!(
+                "[BRAN-only][CATE] 分页 {}/{} ({} ~ {})",
+                i + 1,
+                (cate_vec.len() + ctx.batch_size.max(1) - 1) / ctx.batch_size.max(1),
+                i * ctx.batch_size.max(1) + 1,
+                (i * ctx.batch_size.max(1) + chunk.len())
+            );
+            process_cate_refno_page(
+                &ctx,
+                loop_sjus_map_arc.clone(),
+                sender.clone(),
+                chunk,
+            )
+            .await?;
+        }
+        for r in &cate_vec {
+            categorized.insert(*r, super::models::NounCategory::Cate);
+        }
+
         return Ok(categorized);
     }
 
@@ -398,17 +511,20 @@ pub async fn gen_full_noun_geos_optimized(
             let (loop_vec, loop_dur) = process_loop_stage(
                 &ctx,
                 loop_refnos,
+                config,
                 &dbnums,
                 &bran_generated_refnos,
                 loop_sjus_map_arc.clone(),
                 sender.clone(),
             )
             .await?;
-            let (prim_vec, prim_dur) = process_prim_stage(&ctx, prim_refnos, &dbnums, sender.clone())
+            let (prim_vec, prim_dur) =
+                process_prim_stage(&ctx, prim_refnos, config, &dbnums, sender.clone())
                 .await?;
             let (cate_vec, cate_dur) = process_cate_stage(
                 &ctx,
                 cate_refnos,
+                config,
                 &dbnums,
                 &bran_generated_refnos,
                 loop_sjus_map_arc,
@@ -477,14 +593,22 @@ async fn process_bran_hang_core_logic(
     };
 
     // 3. 生成 CATE 几何
-    let cate_outcome = cata_model::gen_cata_instances(
+    let cate_outcome = match cata_model::gen_cata_instances(
         db_option.clone(),
         Arc::new(target_bran_reuse_cata_map),
         loop_sjus_map_arc.clone(),
         sender.clone(),
     )
     .await
-    .ok();
+    {
+        Ok(outcome) => Some(outcome),
+        Err(e) => {
+            // 这里此前使用 `.ok()` 会吞掉错误，导致“看似成功但 CATE 数据缺失”。
+            // 为保持行为向后兼容，默认仅打印错误并继续；若未来需要严格模式，可在此处改为直接返回 Err。
+            eprintln!("[Pipeline] CATE 几何生成失败，将跳过 CATE：{e}");
+            None
+        }
+    };
 
     // 4. 保存 tubi_info
     if let Some(ref outcome) = cate_outcome {
@@ -510,6 +634,7 @@ async fn process_bran_hang_core_logic(
 async fn process_loop_stage(
     ctx: &NounProcessContext,
     _loop_refnos: HashSet<RefnoEnum>,
+    config: &FullNounConfig,
     dbnums: &[u32],
     bran_generated_refnos: &HashSet<RefnoEnum>,
     loop_sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
@@ -517,10 +642,8 @@ async fn process_loop_stage(
 ) -> Result<(Vec<RefnoEnum>, Duration)> {
     let start = Instant::now();
     let mut loop_noun_infos = prequery_noun_counts(&GNERAL_LOOP_OWNER_NOUN_NAMES, dbnums).await?;
-    for info in &mut loop_noun_infos {
-        info.refnos.retain(|r| !bran_generated_refnos.contains(r));
-        info.count = info.refnos.len();
-    }
+    // FullNounConfig.enabled_categories 的语义：空=全启用；否则按类别/具体 noun 精确过滤。
+    loop_noun_infos.retain(|info| config.should_process_noun(info.noun, "loop"));
     loop_noun_infos.retain(|info| info.count > 0);
 
     let vec =
@@ -532,11 +655,13 @@ async fn process_loop_stage(
 async fn process_prim_stage(
     ctx: &NounProcessContext,
     _refnos: HashSet<RefnoEnum>,
+    config: &FullNounConfig,
     dbnums: &[u32],
     sender: flume::Sender<ShapeInstancesData>,
 ) -> Result<(Vec<RefnoEnum>, Duration)> {
     let start = Instant::now();
-    let prim_noun_infos = prequery_noun_counts(&GNERAL_PRIM_NOUN_NAMES, dbnums).await?;
+    let mut prim_noun_infos = prequery_noun_counts(&GNERAL_PRIM_NOUN_NAMES, dbnums).await?;
+    prim_noun_infos.retain(|info| config.should_process_noun(info.noun, "prim"));
     let vec = process_nouns_by_type(
         prim_noun_infos,
         ctx,
@@ -551,6 +676,7 @@ async fn process_prim_stage(
 async fn process_cate_stage(
     ctx: &NounProcessContext,
     _refnos: HashSet<RefnoEnum>,
+    config: &FullNounConfig,
     dbnums: &[u32],
     bran_generated_refnos: &HashSet<RefnoEnum>,
     loop_sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
@@ -558,6 +684,7 @@ async fn process_cate_stage(
 ) -> Result<(Vec<RefnoEnum>, Duration)> {
     let start = Instant::now();
     let mut cate_noun_infos = prequery_noun_counts(&USE_CATE_NOUN_NAMES, dbnums).await?;
+    cate_noun_infos.retain(|info| config.should_process_noun(info.noun, "cate"));
     for info in &mut cate_noun_infos {
         info.refnos.retain(|r| !bran_generated_refnos.contains(r));
         info.count = info.refnos.len();

@@ -1414,51 +1414,49 @@ async fn gen_cata_geos_inner(
                     Some(fallback)
                 });
                 if let Some(t) = transform {
-                    let aabb = shared::aabb_apply_transform(&unit_cyli_aabb, &t);
-                    // 对于 tubing，owner 应该是 BRAN/HANG 本身，而不是 BRAN 的 owner
-                    let owner_refno = branch_refno;
-                    let owner_type = branch_att.get_type_str().to_string();
-                    tubi_shape_insts_data.insert_tubi(
-                        current_tubing.leave_refno,
-                        EleGeosInfo {
-                            refno: current_tubing.leave_refno,
-                            sesno: branch_att.sesno(),
-                            owner_refno,
-                            owner_type,
-                            cata_hash: Some(tubi_geo_hash.to_string()),
-                            visible: true,
-                            generic_type: get_generic_type(current_tubing.leave_refno).await.unwrap_or_default(),
-                            aabb: Some(aabb),
-                            world_transform: t,
-                            flow_pt_indexs: vec![],
-                            cata_refno: None,
-                            is_solid: true,
-                            ..Default::default()
-                        },
-                    );
-                    let bad_flag = if dir_ok && dist_ok { "false" } else { "true" };
-                    tubi_relates.push(format!(
-                    "relate {}->tubi_relate:[{}, {}]->{}  \
-                    set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{}⟩,world_trans=trans:⟨{}⟩, bore_size={}, bad={}, system={}, dt=fn::ses_date({});",
-                    current_tubing.leave_refno.to_pe_key(),
-                    branch_refno.to_pe_key(),
-                    current_tubing.index,
-                    current_tubing.arrive_refno.to_pe_key(),
-                    gen_aabb_hash(&aabb),
-                    gen_bevy_transform_hash(&t),
-                    current_tubing.tubi_size.to_string(),
-                    bad_flag,
-                    owner_refno.to_pe_key(),
-                    current_tubing.leave_refno.to_pe_key(),
-                ));
-                    current_tubing.index += 1;
-                    if dir_ok && dist_ok {
+                    if dist_ok {
+                        let aabb = shared::aabb_apply_transform(&unit_cyli_aabb, &t);
+                        // 对于 tubing，owner 应该是 BRAN/HANG 本身，而不是 BRAN 的 owner
+                        let owner_refno = branch_refno;
+                        let owner_type = branch_att.get_type_str().to_string();
+                        tubi_shape_insts_data.insert_tubi(
+                            current_tubing.leave_refno,
+                            EleGeosInfo {
+                                refno: current_tubing.leave_refno,
+                                sesno: branch_att.sesno(),
+                                owner_refno,
+                                owner_type,
+                                cata_hash: Some(tubi_geo_hash.to_string()),
+                                visible: true,
+                                generic_type: get_generic_type(current_tubing.leave_refno).await.unwrap_or_default(),
+                                aabb: Some(aabb),
+                                world_transform: t,
+                                flow_pt_indexs: vec![],
+                                cata_refno: None,
+                                is_solid: true,
+                                ..Default::default()
+                            },
+                        );
+                        tubi_relates.push(format!(
+                        "relate {}->tubi_relate:[{}, {}]->{}  \
+                        set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{}⟩,world_trans=trans:⟨{}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
+                        current_tubing.leave_refno.to_pe_key(),
+                        branch_refno.to_pe_key(),
+                        current_tubing.index,
+                        current_tubing.arrive_refno.to_pe_key(),
+                        gen_aabb_hash(&aabb),
+                        gen_bevy_transform_hash(&t),
+                        current_tubing.tubi_size.to_string(),
+                        owner_refno.to_pe_key(),
+                        current_tubing.leave_refno.to_pe_key(),
+                    ));
+                        current_tubing.index += 1;
                         tubi_count += 1;
                     } else {
                         debug_model!(
-                            "[BRAN_TUBI] 无子元素直段标记为 bad: dir_ok={}, dist={:.3}",
-                            dir_ok,
-                            dist
+                            "[BRAN_TUBI] 跳过无子元素直段（距离过短）: dist={:.3}, TUBI_TOL={}",
+                            dist,
+                            TUBI_TOL
                         );
                     }
                 }
@@ -1644,75 +1642,69 @@ async fn gen_cata_geos_inner(
                                 Some(fallback)
                             });
                                 if let Some(t) = transform {
-                                    let aabb = shared::aabb_apply_transform(&unit_cyli_aabb, &t);
-                                    // 对于 tubing，owner 应该是 BRAN/HANG 本身，而不是 BRAN 的 owner
-                                    let owner_refno = branch_refno;
-                                    let owner_type = branch_att.get_type_str().to_string();
-                                    tubi_shape_insts_data.insert_tubi(
-                                        current_tubing.leave_refno,
-                                        EleGeosInfo {
-                                            refno: current_tubing.leave_refno,
-                                            sesno: branch_att.sesno(),
-                                            owner_refno,
-                                            owner_type,
-                                            cata_hash: Some(tubi_geo_hash.to_string()),
-                                            visible: true,
-                                            generic_type: get_generic_type(
-                                                current_tubing.leave_refno,
-                                            )
-                                            .await
-                                            .unwrap_or_default(),
-                                            aabb: Some(aabb),
-                                            world_transform: t,
-                                            is_solid: true,
-                                            ..Default::default()
-                                        },
-                                    );
-                                    let good_segment = dist_ok && !same_dir_bad && dir_ok;
-                                    debug_model!(
-                                        "[BRAN_TUBI] 写入直段 {} -> {}, dist={:.3}, dist_ok={}, same_dir_bad={}, dir_ok={}",
-                                        current_tubing.leave_refno.to_e3d_id(),
-                                        current_tubing.arrive_refno.to_e3d_id(),
-                                        dist,
-                                        dist_ok,
-                                        same_dir_bad,
-                                        dir_ok
-                                    );
-                                    let bad_flag = if good_segment { "false" } else { "true" };
-                                    let sql = format!(
-                                        "relate {}->tubi_relate:[{}, {}]->{}  \
-                                    set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{}⟩,world_trans=trans:⟨{}⟩, bore_size={}, bad={}, system={}, dt=fn::ses_date({});",
-                                        current_tubing.leave_refno.to_pe_key(),
-                                        branch_refno.to_pe_key(),
-                                        current_tubing.index,
-                                        current_tubing.arrive_refno.to_pe_key(),
-                                        gen_aabb_hash(&aabb),
-                                        gen_bevy_transform_hash(&t),
-                                        current_tubing.tubi_size.to_string(),
-                                        bad_flag,
-                                        owner_refno.to_pe_key(),
-                                        current_tubing.leave_refno.to_pe_key(),
-                                    );
-                                    tubi_relates.push(sql);
-                                    current_tubing.index += 1;
-                                    if good_segment {
+                                    if dist_ok {
+                                        let aabb = shared::aabb_apply_transform(&unit_cyli_aabb, &t);
+                                        // 对于 tubing，owner 应该是 BRAN/HANG 本身，而不是 BRAN 的 owner
+                                        let owner_refno = branch_refno;
+                                        let owner_type = branch_att.get_type_str().to_string();
+                                        tubi_shape_insts_data.insert_tubi(
+                                            current_tubing.leave_refno,
+                                            EleGeosInfo {
+                                                refno: current_tubing.leave_refno,
+                                                sesno: branch_att.sesno(),
+                                                owner_refno,
+                                                owner_type,
+                                                cata_hash: Some(tubi_geo_hash.to_string()),
+                                                visible: true,
+                                                generic_type: get_generic_type(
+                                                    current_tubing.leave_refno,
+                                                )
+                                                .await
+                                                .unwrap_or_default(),
+                                                aabb: Some(aabb),
+                                                world_transform: t,
+                                                is_solid: true,
+                                                ..Default::default()
+                                            },
+                                        );
+                                        debug_model!(
+                                            "[BRAN_TUBI] 写入直段 {} -> {}, dist={:.3}, dir_ok={}, same_dir={}",
+                                            current_tubing.leave_refno.to_e3d_id(),
+                                            current_tubing.arrive_refno.to_e3d_id(),
+                                            dist,
+                                            dir_ok,
+                                            same_dir_bad
+                                        );
+                                        let sql = format!(
+                                            "relate {}->tubi_relate:[{}, {}]->{}  \
+                                        set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{}⟩,world_trans=trans:⟨{}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
+                                            current_tubing.leave_refno.to_pe_key(),
+                                            branch_refno.to_pe_key(),
+                                            current_tubing.index,
+                                            current_tubing.arrive_refno.to_pe_key(),
+                                            gen_aabb_hash(&aabb),
+                                            gen_bevy_transform_hash(&t),
+                                            current_tubing.tubi_size.to_string(),
+                                            owner_refno.to_pe_key(),
+                                            current_tubing.leave_refno.to_pe_key(),
+                                        );
+                                        tubi_relates.push(sql);
+                                        current_tubing.index += 1;
                                         tubi_count += 1;
+                                    } else {
+                                        debug_model!(
+                                            "[BRAN_TUBI] 跳过直段（距离过短）: {} -> {}, dist={:.3}, TUBI_TOL={}",
+                                            current_tubing.leave_refno.to_e3d_id(),
+                                            current_tubing.arrive_refno.to_e3d_id(),
+                                            dist,
+                                            TUBI_TOL
+                                        );
                                     }
                                 } else {
                                     debug_model!(
                                         "[BRAN_TUBI] 直段 {} -> {} 无法计算 transform，跳过几何插入",
                                         current_tubing.leave_refno.to_e3d_id(),
                                         current_tubing.arrive_refno.to_e3d_id()
-                                    );
-                                }
-
-                                if !(dist_ok && !same_dir_bad && dir_ok) {
-                                    debug_model!(
-                                        "current_tubing: {:?}, dist={:.3}, same_dir={}, dir_ok={} -> 标记为 bad tubi",
-                                        &current_tubing,
-                                        dist,
-                                        same_dir_bad,
-                                        dir_ok
                                     );
                                 }
                             }
@@ -1793,52 +1785,49 @@ async fn gen_cata_geos_inner(
                         Some(fallback)
                     });
                     if let Some(t) = transform {
-                        let aabb = shared::aabb_apply_transform(&unit_cyli_aabb, &t);
-                        // 对于 tubing，owner 应该是 BRAN/HANG 本身，而不是 BRAN 的 owner
-                        let owner_refno = branch_refno;
-                        let owner_type = branch_att.get_type_str().to_string();
-                        tubi_shape_insts_data.insert_tubi(
-                            current_tubing.leave_refno,
-                            EleGeosInfo {
-                                refno: current_tubing.leave_refno,
-                                sesno: branch_att.sesno(),
-                                owner_refno,
-                                owner_type,
-                                cata_hash: Some(tubi_geo_hash.to_string()),
-                                visible: true,
-                                generic_type: get_generic_type(current_tubing.leave_refno)
-                                    .await
-                                    .unwrap_or_default(),
-                                aabb: Some(aabb),
-                                world_transform: t,
-                                is_solid: true,
-                                ..Default::default()
-                            },
-                        );
-                        let good_segment = dir_ok && dist_ok;
-                        let bad_flag = if good_segment { "false" } else { "true" };
-                        tubi_relates.push(format!(
-                        "relate {}->tubi_relate:[{}, {}]->{}  \
-                        set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{}⟩,world_trans=trans:⟨{}⟩, bore_size={}, bad={}, system={}, dt=fn::ses_date({});",
-                        current_tubing.leave_refno.to_pe_key(),
-                        branch_refno.to_pe_key(),
-                        current_tubing.index,
-                        current_tubing.arrive_refno.to_pe_key(),
-                        gen_aabb_hash(&aabb),
-                        gen_bevy_transform_hash(&t),
-                        current_tubing.tubi_size.to_string(),
-                        bad_flag,
-                        owner_refno.to_pe_key(),
-                        current_tubing.leave_refno.to_pe_key(),
-                    ));
-                        current_tubing.index += 1;
-                        if good_segment {
+                        if dist_ok {
+                            let aabb = shared::aabb_apply_transform(&unit_cyli_aabb, &t);
+                            // 对于 tubing，owner 应该是 BRAN/HANG 本身，而不是 BRAN 的 owner
+                            let owner_refno = branch_refno;
+                            let owner_type = branch_att.get_type_str().to_string();
+                            tubi_shape_insts_data.insert_tubi(
+                                current_tubing.leave_refno,
+                                EleGeosInfo {
+                                    refno: current_tubing.leave_refno,
+                                    sesno: branch_att.sesno(),
+                                    owner_refno,
+                                    owner_type,
+                                    cata_hash: Some(tubi_geo_hash.to_string()),
+                                    visible: true,
+                                    generic_type: get_generic_type(current_tubing.leave_refno)
+                                        .await
+                                        .unwrap_or_default(),
+                                    aabb: Some(aabb),
+                                    world_transform: t,
+                                    is_solid: true,
+                                    ..Default::default()
+                                },
+                            );
+                            tubi_relates.push(format!(
+                            "relate {}->tubi_relate:[{}, {}]->{}  \
+                            set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{}⟩,world_trans=trans:⟨{}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
+                            current_tubing.leave_refno.to_pe_key(),
+                            branch_refno.to_pe_key(),
+                            current_tubing.index,
+                            current_tubing.arrive_refno.to_pe_key(),
+                            gen_aabb_hash(&aabb),
+                            gen_bevy_transform_hash(&t),
+                            current_tubing.tubi_size.to_string(),
+                            owner_refno.to_pe_key(),
+                            current_tubing.leave_refno.to_pe_key(),
+                        ));
+                            current_tubing.index += 1;
                             tubi_count += 1;
                         } else {
                             debug_model!(
-                                "desire_arrive_dir: {:?}, {} 的直段方向/距离异常(已标记为 bad tubi)",
-                                current_tubing.desire_arrive_dir,
-                                refno.to_string()
+                                "[BRAN_TUBI] 跳过最后一段（距离过短）: last_dist={:.3}, TUBI_TOL={}",
+                                last_dist,
+                                TUBI_TOL
                             );
                         }
                     }

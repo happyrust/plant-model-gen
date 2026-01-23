@@ -59,7 +59,8 @@ nalgebra = { version = "0.34.1", features = ["serde", "convert-glam030"] }
 parry3d = { version = "0.25.0", features = ["serde-serialize"] }
 parry2d = { version = "0.25.0", features = ["serde-serialize"] }
 # parse_pdms_db = { git = "https://github.com/happyrust/aios-parse-pdms" }
-parse_pdms_db = { path = "../aios-parse-pdms" }
+# 统一使用 `pdms-io-fork` 内置版本，避免多份 crate 漂移。
+parse_pdms_db = { path = "../pdms-io-fork/crates/parse_pdms_db" }
 aios_core = { git = "https://github.com/happyrust/rs-core.git" }
 surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "updated", default-features = false, features = [
     "protocol-ws",
@@ -73,7 +74,7 @@ bevy_transform = { git = "https://github.com/happyrust/bevy", package = "bevy_tr
 ] }
 bevy_reflect = { git = "https://github.com/happyrust/bevy", package = "bevy_reflect" }
 # pdms_io = { git = "https://github.com/happyrust/pdms-io.git" }
-pdms_io = { path = "../pdms-io" }
+pdms_io = { path = "../pdms-io-fork" }
 dpcsync = { git = "https://gitee.com/happydpc/dpc-sync.git" }
 # gen-xkt = { path = "../gen-xkt" }
 
@@ -262,6 +263,11 @@ required-features = ["gen_model", "sqlite-index"]
 [[example]]
 name = "verify_inst_relate_fix"
 path = "src/examples/verify_inst_relate_fix.rs"
+required-features = ["gen_model"]
+
+[[example]]
+name = "diagnose_export_instances"
+path = "src/examples/diagnose_export_instances.rs"
 required-features = ["gen_model"]
 
 eframe = { git = "https://github.com/emilk/egui.git", rev = "fa4cfec777c9ea21b8643f77b6a26561da44aad0", package = "eframe" }

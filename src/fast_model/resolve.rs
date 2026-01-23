@@ -11,6 +11,25 @@ use aios_core::{CataContext, RefU64, RefnoEnum, SUL_DB};
 use anyhow::anyhow;
 use std::collections::{BTreeMap, HashMap};
 
+fn normalize_gm_param_expressions_in_place(gm: &mut GmParam) {
+    // 仅做“去掉 ATTRIB :NAME 中的冒号”这种低风险规整，避免 aios_core 表达式解析器直接拒绝。
+    // 不做更激进的重写（例如移除 ATTRIB 或把 [n] 展平），以降低行为回归风险。
+    gm.prad = ExpressionFixer::normalize_attrib_colon(&gm.prad);
+    gm.pang = ExpressionFixer::normalize_attrib_colon(&gm.pang);
+    gm.pwid = ExpressionFixer::normalize_attrib_colon(&gm.pwid);
+    gm.phei = ExpressionFixer::normalize_attrib_colon(&gm.phei);
+    gm.offset = ExpressionFixer::normalize_attrib_colon(&gm.offset);
+    gm.drad = ExpressionFixer::normalize_attrib_colon(&gm.drad);
+    gm.dwid = ExpressionFixer::normalize_attrib_colon(&gm.dwid);
+
+    for expr in gm.diameters.iter_mut() {
+        *expr = ExpressionFixer::normalize_attrib_colon(expr);
+    }
+    for expr in gm.distances.iter_mut() {
+        *expr = ExpressionFixer::normalize_attrib_colon(expr);
+    }
+}
+
 /// 查询 DESI 元素的 IPARAM 数据
 /// 使用 SurrealDB 的 fn::get_ipara 函数
 async fn query_iparam_from_desi(desi_refno: RefnoEnum) -> anyhow::Result<Vec<f32>> {
@@ -50,11 +69,17 @@ pub async fn get_or_create_scom_info(cata_refno: RefnoEnum) -> anyhow::Result<Sc
                 .await
                 .map(|x| x.get_refno_or_default())?;
         debug_model_trace!("gmse_refno: {:?}", gmse_refno);
-        let gm_params = query_gm_params(gmse_refno).await?;
+        let mut gm_params = query_gm_params(gmse_refno).await?;
+        for gm in gm_params.iter_mut() {
+            normalize_gm_param_expressions_in_place(gm);
+        }
         let mut ngm_params = vec![];
         //-ve， 和design发生左右的负实体
         if let Some(gmse_refno) = attr_map.get_foreign_refno("NGMR") {
             ngm_params = query_gm_params(gmse_refno).await?;
+            for gm in ngm_params.iter_mut() {
+                normalize_gm_param_expressions_in_place(gm);
+            }
         }
 
         let mut plin_map = HashMap::new();

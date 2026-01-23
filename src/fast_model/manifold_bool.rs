@@ -359,18 +359,12 @@ pub async fn apply_cata_neg_boolean_manifold(
                 ));
 
                 // ========== 步骤 2：创建 geo_relate 关联记录 ==========
-                // 使用 INSERT RELATION 并指定唯一 ID，避免重复创建
-                // ID 格式：geo_relate:⟨inst_info_id⟩_⟨geom_refno⟩_CatePos
-                let geom_refno_str = bg[0].to_string();
-                let relation_id = format!(
-                    "geo_relate:⟨{}_{}_{}_CatePos⟩",
-                    g.inst_info_id.to_string().replace("inst_info:", ""),
-                    geom_refno_str.replace("/", "_"),
-                    mesh_id.replace("/", "_")
-                );
+                // 使用 INSERT RELATION 并指定唯一 ID（使用 geom_refno），避免重复创建
+                // 布尔运算后的结果只有一个几何体，所以 geom_refno 就足够作为唯一标识
+                let relation_id = format!("geo_relate:⟨{}⟩", bg[0]);
 
                 // 先删除旧记录（如果存在）
-                update_sql.push_str(&format!("DELETE [{}];", relation_id));
+                update_sql.push_str(&format!("DELETE [];", relation_id));
 
                 // 建立 inst_info -> geo_relate -> inst_geo 的关系
                 // geo_type='CatePos' 表示这是布尔运算后的结果（应该导出）

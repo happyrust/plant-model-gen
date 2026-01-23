@@ -179,12 +179,12 @@ pub async fn save_inst_relate_aabb(
         .collect::<Vec<_>>();
 
     for chunk in keys.chunks(200) {
-        let mut sql = String::new();
-        let mut in_keys = Vec::new();
+        let mut relation_ids = Vec::new();
+        let mut relation_records = Vec::new();
+
         for refno in chunk {
             let Some(aabb_hash) = inst_aabb_map.get(refno) else { continue };
             let refno_key = refno.to_pe_key();
-            in_keys.push(refno_key.clone());
             let aabb_key = {
                 let v = aabb_hash.value();
                 if v.starts_with("aabb:") {
@@ -193,24 +193,33 @@ pub async fn save_inst_relate_aabb(
                     format!("aabb:⟨{}⟩", v)
                 }
             };
-            sql.push_str(&format!(
-                "RELATE {refno_key}->inst_relate_aabb->{aabb_key};"
+
+            // 使用批量插入语法，指定 ID 为 refno，这样导出代码可以通过 inst_relate_aabb:refno 查询
+            let refno_str = refno.to_string();
+            let relation_id = format!("inst_relate_aabb:⟨{}⟩", refno_str);
+            relation_ids.push(relation_id.clone());
+            relation_records.push(format!(
+                "{{ id: {}, in: {}, out: {} }}",
+                relation_id, refno_key, aabb_key
             ));
         }
 
-        if !in_keys.is_empty() {
-            sql.insert_str(
-                0,
-                &format!(
-                    "DELETE FROM inst_relate_aabb WHERE in IN [{}];",
-                    in_keys.join(",")
-                ),
-            );
-        }
-
-        if sql.is_empty() {
+        if relation_records.is_empty() {
             continue;
         }
+
+        // 先删除旧记录（通过 ID），再批量插入新记录
+        let mut sql = String::new();
+        if !relation_ids.is_empty() {
+            sql.push_str(&format!(
+                "DELETE [{}];",
+                relation_ids.join(",")
+            ));
+        }
+        sql.push_str(&format!(
+            "INSERT RELATION INTO inst_relate_aabb [{}];",
+            relation_records.join(",")
+        ));
 
         if let Err(e) = SUL_DB.query_take::<surrealdb::types::Value>(&sql, 0).await {
             init_save_database_error(

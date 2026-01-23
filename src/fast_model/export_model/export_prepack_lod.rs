@@ -2213,30 +2213,33 @@ async fn query_inst_relate_rows_by_refnos(
     for (idx, chunk) in refnos.chunks(BATCH_SIZE).enumerate() {
         if verbose {
             println!(
-                "   - 查询 inst_relate 分批 {}/{} (批大小 {})",
+                "   - 查询 inst_relate_aabb 分批 {}/{} (批大小 {})",
                 idx + 1,
                 (refnos.len() + BATCH_SIZE - 1) / BATCH_SIZE,
                 chunk.len()
             );
         }
 
-        let pe_list = chunk
+        // 构建 inst_relate_aabb 的 ID 列表（使用尖括号格式，与保存时一致）
+        let aabb_ids = chunk
             .iter()
-            .map(|r| r.to_pe_key())
+            .map(|r| format!("inst_relate_aabb:⟨{}⟩", r.to_string()))
             .collect::<Vec<_>>()
             .join(", ");
+
+        // 从 inst_relate_aabb 开始查询，反向关联到 inst_relate
         let sql = format!(
             r#"
             SELECT
-                owner_refno,
-                owner_type,
+                in<-inst_relate[0].owner_refno as owner_refno,
+                in<-inst_relate[0].owner_type as owner_type,
                 in as refno,
                 in.noun as noun,
                 fn::default_full_name(in) as name,
-                (if in->inst_relate_aabb[0].out {{ record::id(in->inst_relate_aabb[0].out) }} else {{ None }}) as aabb_hash,
-                spec_value as spec_value
-            FROM inst_relate
-            WHERE in IN [{pe_list}]
+                record::id(out) as aabb_hash,
+                in<-inst_relate[0].spec_value as spec_value
+            FROM [{aabb_ids}]
+            WHERE out.d != NONE
             "#
         );
 
@@ -2526,6 +2529,27 @@ pub async fn export_dbnum_instances_json(
         let mut children = Vec::new();
         for child in &owner_group.children {
             let child_refno = &child.refno;
+
+            // 从 export_inst_map 获取几何体实例的 hash 引用
+            let export_inst = export_inst_map.get(child_refno);
+
+            // 过滤：只导出有几何体的实例
+            let Some(export_inst) = export_inst else {
+                continue;  // 没有几何体实例，跳过
+            };
+
+            if export_inst.insts.is_empty() {
+                continue;  // geo_instances 为空，跳过
+            }
+
+            // 由于 SQL 已过滤，这里的 aabb_hash 应该总是存在
+            // 但为了安全起见，仍然检查
+            let child_aabb_hash = export_inst.world_aabb_hash.clone()
+                .or_else(|| child.aabb_hash.clone());
+            if child_aabb_hash.is_none() {
+                continue;  // 双重保险：确保有 AABB
+            }
+
             let child_name = child
                 .name
                 .as_deref()
@@ -2535,38 +2559,24 @@ pub async fn export_dbnum_instances_json(
                 .to_string();
             let spec_value = child.spec_value;
 
-            // 从 export_inst_map 获取几何体实例的 hash 引用
-            let export_inst = export_inst_map.get(child_refno);
-            
-            // 使用数据库中的 aabb_hash（优先使用 export_inst 中的，否则使用 child 中的）
-            let child_aabb_hash = export_inst
-                .and_then(|e| e.world_aabb_hash.clone())
-                .or_else(|| child.aabb_hash.clone());
-
             // 使用数据库中的 trans_hash
-            let refno_trans_hash_str = export_inst
-                .and_then(|e| e.world_trans_hash.clone())
-                .unwrap_or_default();
+            let refno_trans_hash_str = export_inst.world_trans_hash.clone().unwrap_or_default();
 
             // 构建 geo_instances（直接使用数据库 hash）
-            let instances: Vec<serde_json::Value> = export_inst
-                .map(|e| {
-                    e.insts
-                        .iter()
-                        .map(|inst| {
-                            json!({
-                                "geo_hash": inst.geo_hash,
-                                "geo_trans_hash": inst.trans_hash.clone().unwrap_or_default(),
-                            })
-                        })
-                        .collect()
+            let instances: Vec<serde_json::Value> = export_inst.insts
+                .iter()
+                .map(|inst| {
+                    json!({
+                        "geo_hash": inst.geo_hash,
+                        "geo_trans_hash": inst.trans_hash.clone().unwrap_or_default(),
+                    })
                 })
-                .unwrap_or_default();
+                .collect();
 
             let noun = child.noun.as_deref().unwrap_or("");
 
             // 获取布尔运算标识
-            let has_neg = export_inst.map(|e| e.has_neg).unwrap_or(false);
+            let has_neg = export_inst.has_neg;
 
             children.push(json!({
                 "refno": child_refno.to_string(),
@@ -2585,6 +2595,11 @@ pub async fn export_dbnum_instances_json(
         let mut tubings = Vec::new();
         if let Some(tubi_records) = tubings_map.get(owner_refno) {
             for tubi in tubi_records {
+                // 过滤：只导出有 AABB 和 geo_hash 的 tubi
+                if tubi.world_aabb_hash.is_none() || tubi.geo_hash.is_empty() {
+                    continue;
+                }
+
                 tubings.push(json!({
                     "refno": tubi.refno.to_string(),
                     "noun": "TUBI",
@@ -2637,35 +2652,39 @@ pub async fn export_dbnum_instances_json(
 
     // 8. 构建 instances 数组 (V3: 直接使用数据库 hash 引用)
     let mut instances = Vec::new();
+    let total_instance_rows = instance_rows.len();  // 保存长度用于统计
     for row in instance_rows {
         // 从 instance_export_map 获取几何体实例的 hash 引用
         let export_inst = instance_export_map.get(&row.refno);
-        
+
+        // 过滤：只导出有几何体的实例
+        let Some(export_inst) = export_inst else {
+            continue;
+        };
+
+        if export_inst.insts.is_empty() || export_inst.world_aabb_hash.is_none() {
+            continue;
+        }
+
         // 使用数据库中的 trans_hash
-        let refno_trans_hash = export_inst
-            .and_then(|e| e.world_trans_hash.clone())
-            .unwrap_or_default();
-        
+        let refno_trans_hash = export_inst.world_trans_hash.clone().unwrap_or_default();
+
         // 构建 geo_instances（直接使用数据库 hash）
-        let geo_instances: Vec<serde_json::Value> = export_inst
-            .map(|e| {
-                e.insts
-                    .iter()
-                    .map(|inst| {
-                        json!({
-                            "geo_hash": inst.geo_hash,
-                            "geo_trans_hash": inst.trans_hash.clone().unwrap_or_default(),
-                        })
-                    })
-                    .collect()
+        let geo_instances: Vec<serde_json::Value> = export_inst.insts
+            .iter()
+            .map(|inst| {
+                json!({
+                    "geo_hash": inst.geo_hash,
+                    "geo_trans_hash": inst.trans_hash.clone().unwrap_or_default(),
+                })
             })
-            .unwrap_or_default();
+            .collect();
 
         // 使用数据库中的 aabb_hash
-        let inst_aabb_hash = export_inst.and_then(|e| e.world_aabb_hash.clone());
-        
+        let inst_aabb_hash = export_inst.world_aabb_hash.clone();
+
         // 获取布尔运算标识
-        let has_neg = export_inst.map(|e| e.has_neg).unwrap_or(false);
+        let has_neg = export_inst.has_neg;
 
         instances.push(json!({
             "refno": row.refno.to_string(),
@@ -2676,6 +2695,39 @@ pub async fn export_dbnum_instances_json(
             "has_neg": has_neg,
             "geo_instances": geo_instances,
         }));
+    }
+
+    // 计算过滤统计
+    let total_children: usize = owner_groups.values().map(|g| g.children.len()).sum();
+    let exported_children: usize = groups.iter()
+        .filter_map(|g| g.get("children").and_then(|v| v.as_array()))
+        .map(|a| a.len())
+        .sum();
+
+    let total_tubings: usize = tubings_map.values().map(|v| v.len()).sum();
+    let exported_tubings: usize = groups.iter()
+        .filter_map(|g| g.get("tubings").and_then(|v| v.as_array()))
+        .map(|a| a.len())
+        .sum();
+
+    let filtered_children = total_children.saturating_sub(exported_children);
+    let filtered_tubings = total_tubings.saturating_sub(exported_tubings);
+    let filtered_instances = total_instance_rows.saturating_sub(instances.len());
+
+    if verbose {
+        println!("\n📊 导出统计:");
+        println!("   - Groups: {}", groups.len());
+        println!("   - Children: {} 导出 / {} 总数 (过滤 {})",
+            exported_children, total_children, filtered_children);
+        println!("   - Tubings: {} 导出 / {} 总数 (过滤 {})",
+            exported_tubings, total_tubings, filtered_tubings);
+        println!("   - Instances: {} 导出 / {} 总数 (过滤 {})",
+            instances.len(), total_instance_rows, filtered_instances);
+
+        let total_filtered = filtered_children + filtered_tubings + filtered_instances;
+        if total_filtered > 0 {
+            println!("   - 总计过滤: {} 个无几何体的记录", total_filtered);
+        }
     }
 
     // 主 JSON（V3 格式，trans/aabb 通过全局文件加载）

@@ -2213,33 +2213,35 @@ async fn query_inst_relate_rows_by_refnos(
     for (idx, chunk) in refnos.chunks(BATCH_SIZE).enumerate() {
         if verbose {
             println!(
-                "   - 查询 inst_relate_aabb 分批 {}/{} (批大小 {})",
+                "   - 查询 inst_relate 分批 {}/{} (批大小 {})",
                 idx + 1,
                 (refnos.len() + BATCH_SIZE - 1) / BATCH_SIZE,
                 chunk.len()
             );
         }
 
-        // 构建 inst_relate_aabb 的 ID 列表（使用尖括号格式，与保存时一致）
-        let aabb_ids = chunk
+        // 构建 PE 列表
+        let pe_list = chunk
             .iter()
-            .map(|r| format!("inst_relate_aabb:⟨{}⟩", r.to_string()))
+            .map(|r| format!("pe:⟨{}⟩", r.to_string()))
             .collect::<Vec<_>>()
             .join(", ");
 
-        // 从 inst_relate_aabb 开始查询，反向关联到 inst_relate
+        // 从 inst_relate 表查询，正向关联到 inst_relate_aabb
         let sql = format!(
             r#"
             SELECT
-                in<-inst_relate[0].owner_refno as owner_refno,
-                in<-inst_relate[0].owner_type as owner_type,
+                owner_refno,
+                owner_type,
                 in as refno,
                 in.noun as noun,
                 fn::default_full_name(in) as name,
-                record::id(out) as aabb_hash,
-                in<-inst_relate[0].spec_value as spec_value
-            FROM [{aabb_ids}]
-            WHERE out.d != NONE
+                record::id(in->inst_relate_aabb[0].out) as aabb_hash,
+                spec_value as spec_value
+            FROM inst_relate
+            WHERE in IN [{pe_list}]
+                AND in->inst_relate_aabb[0].out != NONE
+                AND in->inst_relate_aabb[0].out.d != NONE
             "#
         );
 
@@ -2361,6 +2363,7 @@ pub async fn export_dbnum_instances_json(
             .as_deref()
             .unwrap_or_default()
             .to_ascii_uppercase();
+
         if matches!(owner_type.as_str(), "BRAN" | "HANG" | "EQUI") {
             let Some(owner_refno) = row.owner_refno else {
                 if verbose {
@@ -2402,7 +2405,7 @@ pub async fn export_dbnum_instances_json(
     owner_refnos.sort_by_key(|r| r.to_string());
 
     if verbose {
-        println!("✅ 查询到 {} 个分组（BRAN/HANG/EQUI），共 {} 个子节点", 
+        println!("✅ 查询到 {} 个分组（BRAN/HANG/EQUI），共 {} 个子节点",
             owner_refnos.len(), in_refnos.len());
         println!("✅ 非聚合类型实例数量: {}", instance_rows.len());
     }

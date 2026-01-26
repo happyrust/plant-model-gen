@@ -1144,20 +1144,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ========== 处理 --refresh-transform pe_transform 刷新命令 ==========
-    if let Some(ref0s) = matches.get_many::<String>("refresh-transform") {
-        let ref0s: Vec<u32> = ref0s.filter_map(|s| s.parse::<u32>().ok()).collect();
-        if !ref0s.is_empty() {
-            println!("🔄 刷新 pe_transform 缓存: ref0s={:?}", ref0s);
+    if let Some(dbnums) = matches.get_many::<String>("refresh-transform") {
+        let dbnums: Vec<u32> = dbnums.filter_map(|s| s.parse::<u32>().ok()).collect();
+        if !dbnums.is_empty() {
+            println!("🔄 刷新 pe_transform 缓存: dbnums={:?}", dbnums);
             init_surreal().await?;
-            
+
             // 使用 DbMetaManager 加载元信息
             use aios_database::data_interface::db_meta;
             if let Err(e) = db_meta().try_load_default() {
                 eprintln!("⚠️  {}", e);
                 return Ok(());
             }
-            
-            let count = aios_core::transform::refresh_pe_transform_for_dbnums(&ref0s).await?;
+
+            let count = aios_core::transform::refresh_pe_transform_for_dbnums(&dbnums).await?;
             println!("✅ pe_transform 刷新完成，共处理 {} 个节点", count);
             return Ok(());
         }

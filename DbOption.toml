@@ -11,8 +11,8 @@ enable_index = false
 sync_chunk_size = 10_0000
 
 #项目设置
-project_path = "D:/AVEVA/Projects/E3D2.1"
-# project_path = "/Volumes/DPC/work/e3d_models"
+# project_path = "D:/AVEVA/Projects/E3D2.1"
+project_path = "/Volumes/DPC/work/e3d_models"
 included_projects = ["AvevaMarineSample", "AvevaCatalogue", "SCB", "ZDJ"]
 # included_projects = ["AvevaMarineSample"]
 #project_dirs = ["AvevaMarineSample"]
@@ -25,10 +25,10 @@ module = "DESI"
 #是否生成模型数据
 gen_model = true
 gen_mesh = true
-replace_mesh = false
+replace_mesh = true
 save_db = false
 # 解析期只生成 scene tree 文件，跳过 PE/属性数据保存
-gen_tree_only = true
+gen_tree_only = false
 apply_boolean_operation = true
 mesh_tol_ratio = 3.0
 #是否启用房间计算
@@ -47,7 +47,7 @@ full_noun_batch_size = 200
 # 可选值: "cate", "loop", "prim" 或具体 noun 名称如 "BRAN", "PANE"
 # 空 vec 表示启用所有类别（默认行为）
 # 房间相关类型: FRMW(框架), SBFR(子框架), PANE(面板)
-full_noun_enabled_categories = ["BOX"]
+full_noun_enabled_categories = ["PANE", "BRAN", "HANG"]
 
 # 排除的 noun 列表
 # 即使类别启用，这里的 noun 也会被过滤掉

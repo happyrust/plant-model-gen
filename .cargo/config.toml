@@ -14,13 +14,13 @@ rustflags = ["-C", "link-args=/STACK:16777216"]
 rustflags = ["-C", "link-args=-Wl,--stack,16777216"]
 
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-args=-Wl,-zstack-size=16777216"]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 [target.x86_64-apple-darwin]
-rustflags = ["-C", "link-args=-Wl,-stack_size,0x1000000"]
+# rustflags = ["-C", "link-args=-Wl,-stack_size,0x1000000"]
 
 [target.aarch64-apple-darwin]
-rustflags = ["-C", "link-args=-Wl,-stack_size,0x1000000"]
+# rustflags = ["-C", "link-args=-Wl,-stack_size,0x1000000"]
 
 [unstable]
 codegen-backend = true

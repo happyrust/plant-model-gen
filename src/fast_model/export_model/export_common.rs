@@ -752,9 +752,9 @@ pub async fn collect_export_data(
         pb.set_draw_target(ProgressDrawTarget::hidden());
     }
 
-    // 默认检查 L1 级别的 GLB
-    // 获取默认精度设置 (通常是 L1)
-    let default_lod = aios_core::mesh_precision::LodLevel::L1;
+    // 默认检查 active_precision.default_lod 级别的 GLB（与本次 mesh 生成/布尔结果写盘保持一致）。
+    // 若这里硬编码 L1，会导致“导出/截图读到旧 L1 文件”，从而看起来模型仍不对。
+    let default_lod = aios_core::mesh_precision::active_precision().default_lod;
     
     // 确定搜索目录：mesh_dir/lod_L1/
     // 如果 mesh_dir 已经是 lod_XX，则直接使用，否则拼接

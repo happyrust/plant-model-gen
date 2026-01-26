@@ -1393,7 +1393,8 @@ pub async fn export_dbnum_instances_json_mode(
     .await?;
 
     // 导出全局 trans.json 和 aabb.json
-    let (trans_count, aabb_count) = export_global_trans_aabb_json(&output_dir, None, verbose).await?;
+    let (trans_count, aabb_count) =
+        export_global_trans_aabb_json(&output_dir, None, verbose).await?;
 
     println!("\n🎉 导出完成！");
     println!("📊 统计信息:");

@@ -36,6 +36,66 @@ async fn delete_inst_relate_by_in(refnos: &[RefnoEnum], chunk_size: usize) -> an
     Ok(())
 }
 
+/// replace_exist=true 时，删除指定 inst_info 的 geo_relate（关系表）记录，避免旧几何残留导致同一实例出现多份 Pos。
+async fn delete_geo_relate_by_inst_info_ids(inst_info_ids: &[String], chunk_size: usize) -> anyhow::Result<()> {
+    if inst_info_ids.is_empty() {
+        return Ok(());
+    }
+    for chunk in inst_info_ids.chunks(chunk_size.max(1)) {
+        let in_keys = chunk
+            .iter()
+            .map(|id| format!("inst_info:⟨{}⟩", id))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("DELETE geo_relate WHERE in IN [{in_keys}];");
+        SUL_DB.query(sql).await?;
+    }
+    Ok(())
+}
+
+/// replace_exist=true 时，按目标正实体(out=pe) 删除 neg_relate/ngmr_relate，避免悬挂旧 geo_relate id。
+async fn delete_boolean_relations_by_targets(target_refnos: &[RefnoEnum], chunk_size: usize) -> anyhow::Result<()> {
+    if target_refnos.is_empty() {
+        return Ok(());
+    }
+    for chunk in target_refnos.chunks(chunk_size.max(1)) {
+        let out_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
+        // out=目标正实体(pe key)
+        SUL_DB.query(format!("DELETE neg_relate WHERE out IN [{out_keys}];")).await?;
+        SUL_DB.query(format!("DELETE ngmr_relate WHERE out IN [{out_keys}];")).await?;
+    }
+    Ok(())
+}
+
+/// replace_exist=true 时，清理实例/元件库布尔结果表，避免导出链路误读“历史 booled mesh”。
+///
+/// 典型症状：
+/// - 当前轮生成/关系扫描显示 neg/ngmr=0（不会触发布尔 worker），
+/// - 但 `inst_relate_bool:⟨refno⟩` 仍残留 status=Success，导致导出优先使用旧的 booled mesh，
+///   表现为模型出现莫名缺口/截面不对。
+async fn delete_inst_relate_bool_records(refnos: &[RefnoEnum], chunk_size: usize) -> anyhow::Result<()> {
+    if refnos.is_empty() {
+        return Ok(());
+    }
+    for chunk in refnos.chunks(chunk_size.max(1)) {
+        let bool_ids = chunk
+            .iter()
+            .map(|r| format!("inst_relate_bool:⟨{}⟩", r))
+            .collect::<Vec<_>>()
+            .join(",");
+        let cata_bool_ids = chunk
+            .iter()
+            .map(|r| format!("inst_relate_cata_bool:⟨{}⟩", r))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // 使用 “DELETE [ids]” 点删，避免全表扫描。
+        SUL_DB.query(format!("DELETE [{bool_ids}];")).await?;
+        SUL_DB.query(format!("DELETE [{cata_bool_ids}];")).await?;
+    }
+    Ok(())
+}
+
 /// 保存 instance 数据到数据库（事务化批处理版本）
 pub async fn save_instance_data_optimize(
     inst_mgr: &ShapeInstancesData,
@@ -87,6 +147,25 @@ pub async fn save_instance_data_optimize(
             refnos.len()
         );
         delete_inst_relate_by_in(&refnos, CHUNK_SIZE).await?;
+
+        // 清理历史布尔结果表（否则导出/截图会优先命中旧 inst_relate_bool，误读 booled mesh）。
+        delete_inst_relate_bool_records(&refnos, CHUNK_SIZE).await?;
+
+        // 同步清理 geo_relate（以及依赖它的 neg/ngmr 关系），避免旧几何残留/重复 Pos。
+        // 注意：这里只删除“关系记录”，不删除 inst_info/inst_geo 本体，符合 replace 模式的复用目标。
+        let inst_info_ids: Vec<String> = inst_mgr
+            .inst_geos_map
+            .values()
+            .map(|x| x.id())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        debug_model_debug!(
+            "save_instance_data_optimize deleting existing geo_relate for {} inst_info ids",
+            inst_info_ids.len()
+        );
+        delete_geo_relate_by_inst_info_ids(&inst_info_ids, CHUNK_SIZE).await?;
+        delete_boolean_relations_by_targets(&refnos, CHUNK_SIZE).await?;
     }
 
     // inst_geo & geo_relate

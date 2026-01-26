@@ -17,6 +17,7 @@ use crate::{batch_update_err, db_err, deser_err, log_err, query_err};
 use aios_core::accel_tree::acceleration_tree::RStarBoundingBox;
 use aios_core::error::{init_deserialize_error, init_query_error, init_save_database_error};
 use aios_core::geometry::csg::GeneratedMesh;
+use aios_core::mesh_precision::LodMeshSettings;
 use aios_core::mesh_precision::MeshPrecisionSettings;
 use aios_core::options::DbOption;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
@@ -43,7 +44,7 @@ use bevy_transform::prelude::Transform;
 use chrono;
 use std::str::FromStr;
 use dashmap::DashMap;
-use glam::DMat4;
+use glam::{DMat4, Vec3};
 use itertools::Itertools;
 use log::info;
 use parry3d::bounding_volume::*;
@@ -58,6 +59,231 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aios_core::geometry::csg::generate_csg_mesh;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize, SurrealValue)]
+struct GeoRelateMaxScaleRow {
+    out: RecordId,
+    sx: f32,
+    sy: f32,
+    sz: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct MeshSignatureV1 {
+    /// 签名结构版本；当签名字段变化时递增，用于强制失效旧缓存。
+    version: u32,
+    lod: String,
+    geo_type: String,
+    non_scalable_geo: bool,
+    /// 动态精度的缩放因子（量化：*1000）
+    scale_factor_milli: i64,
+
+    radial_segments: u16,
+    height_segments: u16,
+    cap_segments: u16,
+
+    min_radial_segments: u16,
+    max_radial_segments: Option<u16>,
+    min_height_segments: u16,
+    max_height_segments: Option<u16>,
+
+    /// error_tolerance（量化：*1_000_000）
+    error_tolerance_u: i64,
+    /// target_segment_length（量化：*1_000_000）
+    target_segment_length_u: Option<i64>,
+    /// non_scalable_factor（量化：*1_000_000）
+    non_scalable_factor_u: i64,
+}
+
+impl MeshSignatureV1 {
+    // v2: sweep/loft 闭合路径 ring 拓扑修复（末尾重复 ring 丢弃 + 环向连接）
+    // v3: sweep frame 改为 rotation-minimizing（确保 rot.z 与 tangent 一致，修复 WALL 截面扭转/翻面）
+    // v4: 带 CURVE 的 SPINE 不再单位化（PrimLoft 直接使用真实圆弧/路径几何），网格应强制重建
+    // v5: `--regen-model` 强制重建 mesh（不走 mesh_sig skip），并验证闭环接缝缺口修复是否生效
+    const VERSION: u32 = 5;
+
+    fn quant(v: f32, scale: f32) -> i64 {
+        if !v.is_finite() {
+            return 0;
+        }
+        (v as f64 * scale as f64).round() as i64
+    }
+
+    fn from_settings(
+        lod: &str,
+        geo_type: &str,
+        non_scalable_geo: bool,
+        settings: &LodMeshSettings,
+        scale_factor: f32,
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            lod: lod.to_string(),
+            geo_type: geo_type.to_string(),
+            non_scalable_geo,
+            scale_factor_milli: Self::quant(scale_factor, 1000.0),
+
+            radial_segments: settings.radial_segments,
+            height_segments: settings.height_segments,
+            cap_segments: settings.cap_segments,
+
+            min_radial_segments: settings.min_radial_segments,
+            max_radial_segments: settings.max_radial_segments,
+            min_height_segments: settings.min_height_segments,
+            max_height_segments: settings.max_height_segments,
+
+            error_tolerance_u: Self::quant(settings.error_tolerance, 1_000_000.0),
+            target_segment_length_u: settings
+                .target_segment_length
+                .map(|v| Self::quant(v, 1_000_000.0)),
+            non_scalable_factor_u: Self::quant(settings.non_scalable_factor, 1_000_000.0),
+        }
+    }
+}
+
+fn mesh_signature_path(dir: &Path, mesh_filename: &str) -> PathBuf {
+    // e.g. 2_L1.mesh_sig.json；避免与 .glb/.obj 扩展冲突
+    dir.join(mesh_filename).with_extension("mesh_sig.json")
+}
+
+fn load_mesh_signature(path: &Path) -> Option<MeshSignatureV1> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn save_mesh_signature(path: &Path, sig: &MeshSignatureV1) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string(sig)?;
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+/// 对“单位网格 + geo_relate.trans 缩放”的几何，按实例缩放幅度动态提升细分精度。
+///
+/// 设计要点：
+/// - inst_geo 里存的是单位几何（如 LCylinder/SCylinder），真实尺寸在 geo_relate.trans.scale 里；
+/// - mesh_worker 只会为 inst_geo 生成一份 mesh，所以这里取“使用该 inst_geo 的所有实例里最大的 scale”。
+/// - 通过缩小 `target_segment_length`（除以 scale_factor）把“单位空间的细分”映射到“真实尺寸的细分”。
+fn scale_lod_settings_for_unit_mesh(
+    base: LodMeshSettings,
+    scale_factor: f32,
+    unit_circumference: Option<f32>,
+) -> LodMeshSettings {
+    if !scale_factor.is_finite() || scale_factor <= 1.0 {
+        return base;
+    }
+
+    let mut out = base;
+
+    if let Some(target) = out.target_segment_length {
+        // 下限防止除法导致极端小值引发过度细分或数值问题
+        let new_target = (target / scale_factor).max(0.001);
+        out.target_segment_length = Some(new_target);
+
+        // 针对“单位网格”的圆周类细分：必要时抬高 max_radial_segments，
+        // 否则会被配置里的上限（常见 60）卡住，依旧粗糙。
+        if let Some(c) = unit_circumference {
+            if c.is_finite() && c > 0.0 {
+                let ideal = (c / new_target).ceil().max(3.0) as u16;
+                let cur_max = out
+                    .max_radial_segments
+                    .unwrap_or(out.radial_segments)
+                    .max(out.min_radial_segments);
+                // 上限：优先遵从配置（csg_settings.max_radial_segments），并做 512 的硬保护
+                let cap = out.max_radial_segments.unwrap_or(512).min(512);
+                let boosted = cur_max.max(ideal).min(cap);
+                out.max_radial_segments = Some(boosted);
+            }
+        }
+    }
+
+    out
+}
+
+fn scale_lod_settings_for_unit_sphere(base: LodMeshSettings, scale_factor: f32) -> LodMeshSettings {
+    let mut out = scale_lod_settings_for_unit_mesh(
+        base,
+        scale_factor,
+        Some(std::f32::consts::TAU), // unit sphere: radius=1.0 => equator circumference=2π
+    );
+    if !scale_factor.is_finite() || scale_factor <= 1.0 {
+        return out;
+    }
+
+    // Sphere 的“粗糙感”同时来自经向/纬向细分；纬向细分同样需要随缩放提升。
+    // 这里复用 max_radial_segments 作为 sphere 的 height 上限（并强制硬上限 512）。
+    let cap = out
+        .max_radial_segments
+        .unwrap_or(512)
+        .max(out.min_radial_segments)
+        .min(512);
+
+    if let Some(target) = out.target_segment_length {
+        // unit sphere 的直径为 2.0，把段长映射到单位空间后，用直径估算纬向段数上限需求。
+        let ideal_h = (2.0 / target).ceil().max(1.0) as u16;
+        let cur_max_h = out
+            .max_height_segments
+            .unwrap_or(out.height_segments)
+            .max(out.min_height_segments);
+        out.max_height_segments = Some(cur_max_h.max(ideal_h).min(cap));
+    } else {
+        let cur_max_h = out
+            .max_height_segments
+            .unwrap_or(out.height_segments)
+            .max(out.min_height_segments);
+        out.max_height_segments = Some(cur_max_h.min(cap));
+    }
+
+    out
+}
+
+async fn query_geo_relate_max_scales_for_outs(
+    outs: &[RecordId],
+) -> anyhow::Result<HashMap<String, Vec3>> {
+    if outs.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // SurrealDB 3.0.0-beta 对「数字 id」的 record link 解析较严格：
+    // `inst_geo:\`2\`` / `inst_geo:2` 在 WHERE out=... / INSIDE[...] 场景可能匹配不到，
+    // 但 `inst_geo:⟨2⟩` 可稳定工作（见 history.txt 里的验证）。
+    fn to_angle_link(id: &RecordId) -> String {
+        let raw = id.to_raw();
+        let (tb, rid) = raw.split_once(':').unwrap_or((raw.as_str(), ""));
+        let rid = rid.trim();
+        let rid = rid
+            .strip_prefix('`')
+            .and_then(|s| s.strip_suffix('`'))
+            .unwrap_or(rid);
+        if rid.starts_with('⟨') && rid.ends_with('⟩') {
+            format!("{tb}:{rid}")
+        } else {
+            format!("{tb}:⟨{rid}⟩")
+        }
+    }
+
+    let outs_list = outs.iter().map(to_angle_link).join(",");
+    let sql = format!(
+        "SELECT out,\
+            math::max(trans.d.scale[0]) as sx,\
+            math::max(trans.d.scale[1]) as sy,\
+            math::max(trans.d.scale[2]) as sz \
+         FROM geo_relate \
+         WHERE out INSIDE [{outs_list}] \
+         GROUP BY out \
+         FETCH trans;"
+    );
+
+    let rows: Vec<GeoRelateMaxScaleRow> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+    let mut map: HashMap<String, Vec3> = HashMap::new();
+    for r in rows {
+        map.insert(r.out.to_raw(), Vec3::new(r.sx, r.sy, r.sz));
+    }
+    Ok(map)
+}
 
 /// 在数据库中生成网格模型并更新包围盒
 ///
@@ -918,6 +1144,8 @@ pub async fn gen_inst_meshes_by_geo_ids(
         return Ok(());
     }
     
+    let max_scales = query_geo_relate_max_scales_for_outs(geo_ids).await.unwrap_or_default();
+
     let aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
     let pts_json_map: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
     let inst_aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
@@ -928,13 +1156,86 @@ pub async fn gen_inst_meshes_by_geo_ids(
         let profile = precision.profile_for_geo(geo_type_name);
         let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
         let mesh_id = g.id.to_mesh_id();
+        let geo_raw = g.id.to_raw();
         
         // 不需要 refno
-        let geo_type_name = g.param.type_name();
-        match generate_csg_mesh(&g.param, &profile.csg_settings, non_scalable_geo, false, None) {
+        let mut lod_settings = profile.csg_settings;
+        let mut scale_factor_used = 1.0f32;
+
+        // 动态精度：单位几何（inst_geo）真实尺寸在 geo_relate.trans.scale 中，这里按最大缩放提升细分。
+        if !non_scalable_geo {
+            if let Some(scale) = max_scales.get(&geo_raw) {
+                match &g.param {
+                    PdmsGeoParam::PrimLCylinder(_) | PdmsGeoParam::PrimSCylinder(_) => {
+                        // 圆柱的“粗糙感”主要来自圆周方向折线化；这里以直径（X/Y 缩放）作为细分提升因子。
+                        let scale_factor = scale.x.max(scale.y).max(1.0);
+                        scale_factor_used = scale_factor;
+                        let old = lod_settings.target_segment_length;
+                        lod_settings = scale_lod_settings_for_unit_mesh(
+                            lod_settings,
+                            scale_factor,
+                            Some(std::f32::consts::PI), // unit cylinder: radius=0.5 => circumference=PI
+                        );
+                        debug_model_debug!(
+                            "[dyn_lod] geo_id={} scale_max={:.3} target_len {:?} -> {:?}",
+                            geo_raw,
+                            scale_factor,
+                            old,
+                            lod_settings.target_segment_length
+                        );
+                    }
+                    PdmsGeoParam::PrimSphere(_) => {
+                        let scale_factor = scale.x.max(scale.y).max(scale.z).max(1.0);
+                        scale_factor_used = scale_factor;
+                        let old = lod_settings.target_segment_length;
+                        lod_settings = scale_lod_settings_for_unit_sphere(lod_settings, scale_factor);
+                        debug_model_debug!(
+                            "[dyn_lod] geo_id={} scale_max={:.3} target_len {:?} -> {:?}",
+                            geo_raw,
+                            scale_factor,
+                            old,
+                            lod_settings.target_segment_length
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let lod_str = format!("{:?}", precision.default_lod);
+        let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
+        let glb_path = lod_dir.join(&mesh_filename).with_extension("glb");
+        let sig_path = mesh_signature_path(&lod_dir, &mesh_filename);
+        let sig = MeshSignatureV1::from_settings(
+            &lod_str,
+            geo_type_name,
+            non_scalable_geo,
+            &lod_settings,
+            scale_factor_used,
+        );
+
+        // 若签名一致，则跳过重建（避免 replace_exist=true 时全量重算带来性能开销）。
+        //
+        // 但当用户显式要求强制重建（例如 CLI `--regen-model`），应跳过缓存直接重算，
+        // 以便快速验证代码/配置变更对 mesh 的影响。
+        let force_regen = std::env::var("FORCE_REGEN_MESH")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !force_regen && glb_path.exists() {
+            if let Some(old_sig) = load_mesh_signature(&sig_path) {
+                if old_sig == sig {
+                    debug_model_debug!(
+                        "[mesh_sig] skip mesh_id={} (lod={})",
+                        mesh_id,
+                        lod_str
+                    );
+                    continue;
+                }
+            }
+        }
+
+        match generate_csg_mesh(&g.param, &lod_settings, non_scalable_geo, false, None) {
             Some(csg_mesh) => {
-                let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
-                
                 if let Err(e) = handle_csg_mesh(
                     &lod_dir,
                     &mesh_id,
@@ -951,6 +1252,12 @@ pub async fn gen_inst_meshes_by_geo_ids(
                     debug_model_warn!("CSG mesh 生成失败 for {}: {}", mesh_id, e);
                     // 设置 bad=true 和 meshed=true 避免重复处理
                     update_sql.push_str(&format!("UPDATE inst_geo:⟨{}⟩ SET bad=true, meshed=true;", mesh_id));
+                } else if let Err(e) = save_mesh_signature(&sig_path, &sig) {
+                    debug_model_warn!(
+                        "[mesh_sig] 写入签名失败: {} - {}",
+                        sig_path.display(),
+                        e
+                    );
                 }
             }
             None => {
@@ -1110,6 +1417,11 @@ pub async fn gen_inst_meshes(
                     let result: Vec<QueryGeoParam> = response.take(0).unwrap();
                     i += 1;
                     let mut update_sql = String::new();
+
+                    // 动态精度：预先查询每个 inst_geo 在 geo_relate 里的最大 scale（避免每个几何单独查）。
+                    let outs: Vec<RecordId> = result.iter().map(|g| g.id.clone()).collect();
+                    let max_scales =
+                        query_geo_relate_max_scales_for_outs(&outs).await.unwrap_or_default();
                     // 遍历每个几何参数并使用 CSG 生成网格
                     for g in result {
                         debug_model_debug!("gen mesh param: {:?}", &g.param);
@@ -1124,18 +1436,86 @@ pub async fn gen_inst_meshes(
                             .flatten();
 
                         // 统一使用 CSG 方式生成网格
+                        let mut lod_settings = profile.csg_settings;
+                        let mut scale_factor_used = 1.0f32;
+                        if !non_scalable_geo {
+                            if let Some(scale) = max_scales.get(&geo_raw) {
+                                match &g.param {
+                                    PdmsGeoParam::PrimLCylinder(_)
+                                    | PdmsGeoParam::PrimSCylinder(_) => {
+                                        // 圆柱的“粗糙感”主要来自圆周方向折线化；这里以直径（X/Y 缩放）作为细分提升因子。
+                                        let scale_factor = scale.x.max(scale.y).max(1.0);
+                                        scale_factor_used = scale_factor;
+                                        let old = lod_settings.target_segment_length;
+                                        lod_settings = scale_lod_settings_for_unit_mesh(
+                                            lod_settings,
+                                            scale_factor,
+                                            Some(std::f32::consts::PI), // unit cylinder: radius=0.5
+                                        );
+                                        debug_model_debug!(
+                                            "[dyn_lod] geo_id={} scale_max={:.3} target_len {:?} -> {:?}",
+                                            geo_raw,
+                                            scale_factor,
+                                            old,
+                                            lod_settings.target_segment_length
+                                        );
+                                    }
+                                    PdmsGeoParam::PrimSphere(_) => {
+                                        let scale_factor =
+                                            scale.x.max(scale.y).max(scale.z).max(1.0);
+                                        scale_factor_used = scale_factor;
+                                        let old = lod_settings.target_segment_length;
+                                        lod_settings =
+                                            scale_lod_settings_for_unit_sphere(lod_settings, scale_factor);
+                                        debug_model_debug!(
+                                            "[dyn_lod] geo_id={} scale_max={:.3} target_len {:?} -> {:?}",
+                                            geo_raw,
+                                            scale_factor,
+                                            old,
+                                            lod_settings.target_segment_length
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        let lod_str = format!("{:?}", precision.default_lod);
+                        let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
+                        let glb_path = dir.join(&mesh_filename).with_extension("glb");
+                        let sig_path = mesh_signature_path(&dir, &mesh_filename);
+                        let sig = MeshSignatureV1::from_settings(
+                            &lod_str,
+                            geo_type_name,
+                            non_scalable_geo,
+                            &lod_settings,
+                            scale_factor_used,
+                        );
+
+                        let force_regen = std::env::var("FORCE_REGEN_MESH")
+                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                            .unwrap_or(false);
+                        if !force_regen && glb_path.exists() {
+                            if let Some(old_sig) = load_mesh_signature(&sig_path) {
+                                if old_sig == sig {
+                                    debug_model_debug!(
+                                        "[mesh_sig] skip mesh_id={} (lod={})",
+                                        mesh_id,
+                                        lod_str
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
                         match generate_csg_mesh(
                             &g.param,
-                            &profile.csg_settings,
+                            &lod_settings,
                             non_scalable_geo,
                             false,
                             refno_for_mesh,
                         ) {
                             Some(csg_mesh) => {
-                                // 构造带 LOD 后缀的文件名，保持所有 LOD 级别命名一致
-                                let mesh_filename =
-                                    format!("{}_{:?}", mesh_id, precision.default_lod);
-
                                 if let Err(e) = handle_csg_mesh(
                                     &dir,
                                     &mesh_id,
@@ -1159,6 +1539,12 @@ pub async fn gen_inst_meshes(
                                         "update inst_geo:⟨{}⟩ set bad=true;",
                                         mesh_id
                                     ));
+                                } else if let Err(e) = save_mesh_signature(&sig_path, &sig) {
+                                    debug_model_warn!(
+                                        "[mesh_sig] 写入签名失败: {} - {}",
+                                        sig_path.display(),
+                                        e
+                                    );
                                 }
                             }
                             None => {
@@ -1274,10 +1660,12 @@ async fn handle_csg_mesh(
 
     let aabb_hash = gen_aabb_hash(&mesh_aabb);
     aabb_map.entry(aabb_hash.to_string()).or_insert(mesh_aabb);
-    if !EXIST_MESH_GEO_HASHES.contains_key(mesh_id) {
-        EXIST_MESH_GEO_HASHES.insert(mesh_id.to_string(), mesh_aabb);
+    // EXIST_MESH_GEO_HASHES/inst_aabb_map 的 key 统一使用 inst_geo id（不带 LOD 后缀），
+    // 与 preload_mesh_cache/query_inst_geo_ids 的使用保持一致。
+    if !EXIST_MESH_GEO_HASHES.contains_key(inst_key) {
+        EXIST_MESH_GEO_HASHES.insert(inst_key.to_string(), mesh_aabb);
     }
-    inst_aabb_map.insert(mesh_id.to_string(), mesh_aabb);
+    inst_aabb_map.insert(inst_key.to_string(), mesh_aabb);
 
     update_sql.push_str(&format!(
         "update inst_geo:⟨{}⟩ set meshed = true, aabb = aabb:⟨{}⟩, pts=[{}];",

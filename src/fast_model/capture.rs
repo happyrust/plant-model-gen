@@ -24,15 +24,33 @@ pub struct CaptureConfig {
     pub width: u32,
     pub height: u32,
     pub include_descendants: bool,
+    /// 额外视角数量（>=1）；1 表示仅生成默认视角 `{basename}.png`。
+    /// 用于调试“看起来像缺失/断开但其实是视角遮挡”的情况。
+    pub views: u8,
+    /// 期望截图（baseline）目录；文件名需与生成的 basename 对齐（或使用 refno_格式回退）。
+    pub baseline_dir: Option<PathBuf>,
+    /// diff 输出目录；若为 None 且 baseline_dir 存在，则默认 output_dir/diff。
+    pub diff_dir: Option<PathBuf>,
 }
 
 impl CaptureConfig {
-    pub fn new(output_dir: PathBuf, width: u32, height: u32, include_descendants: bool) -> Self {
+    pub fn new(
+        output_dir: PathBuf,
+        width: u32,
+        height: u32,
+        include_descendants: bool,
+        views: u8,
+        baseline_dir: Option<PathBuf>,
+        diff_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             output_dir,
             width,
             height,
             include_descendants,
+            views: views.max(1),
+            baseline_dir,
+            diff_dir,
         }
     }
 }
@@ -176,7 +194,148 @@ async fn capture_single(refno: RefnoEnum, mesh_dir: &Path, config: &CaptureConfi
 
     println!("📸 已生成截图: {}", png_path.display());
 
+    // 额外视角：用于人工确认“模型是否真缺失”。
+    // 文件命名采用 `{basename}_viewXX.png`，不影响现有 `{basename}.png` 的对齐与 diff 流程。
+    if config.views > 1 {
+        let views = config.views as usize;
+        for i in 1..views {
+            let view_png = config
+                .output_dir
+                .join(format!("{basename}_view{:02}.png", i));
+            render_mesh_to_png_with_camera(
+                &render_mesh,
+                config.width,
+                config.height,
+                &view_png,
+                &display_label,
+                45.0,
+                45.0 + (360.0 / views as f32) * (i as f32),
+            )?;
+        }
+    }
+
+    // 额外生成一个“稳定文件名”（refno）版本，便于基准图/脚本对齐；不影响现有 basename 逻辑。
+    if basename != refno_str {
+        let stable_png = config.output_dir.join(format!("{refno_str}.png"));
+        let _ = fs::copy(&png_path, &stable_png).await;
+    }
+
+    if let Some(baseline_dir) = &config.baseline_dir {
+        if let Err(e) = compare_with_baseline(&basename, &refno_str, &png_path, baseline_dir, config).await {
+            eprintln!(
+                "[capture][diff] 参考号 {} 对比 baseline 失败: {}",
+                refno, e
+            );
+        }
+    }
+
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiffStats {
+    mae: f32,
+    max_diff: u8,
+    changed_pixels: u32,
+    total_pixels: u32,
+}
+
+async fn compare_with_baseline(
+    basename: &str,
+    refno_str: &str,
+    actual_png: &Path,
+    baseline_dir: &Path,
+    config: &CaptureConfig,
+) -> Result<()> {
+    let expected_by_basename = baseline_dir.join(format!("{basename}.png"));
+    let expected_by_refno = baseline_dir.join(format!("{refno_str}.png"));
+    let expected = if expected_by_basename.exists() {
+        expected_by_basename
+    } else if expected_by_refno.exists() {
+        expected_by_refno
+    } else {
+        return Err(anyhow!(
+            "未找到 baseline：{} 或 {}",
+            expected_by_basename.display(),
+            expected_by_refno.display()
+        ));
+    };
+
+    let diff_dir = config
+        .diff_dir
+        .clone()
+        .unwrap_or_else(|| config.output_dir.join("diff"));
+    fs::create_dir_all(&diff_dir)
+        .await
+        .with_context(|| format!("创建 diff 目录失败: {}", diff_dir.display()))?;
+    let diff_path = diff_dir.join(format!("{basename}.diff.png"));
+
+    let stats = diff_png(&expected, actual_png, &diff_path)?;
+    println!(
+        "[capture][diff] {} mae={:.4} max={} changed={}/{} diff={}",
+        basename,
+        stats.mae,
+        stats.max_diff,
+        stats.changed_pixels,
+        stats.total_pixels,
+        diff_path.display()
+    );
+    Ok(())
+}
+
+fn diff_png(expected_path: &Path, actual_path: &Path, out_path: &Path) -> Result<DiffStats> {
+    let expected = image::open(expected_path)
+        .with_context(|| format!("读取 baseline 失败: {}", expected_path.display()))?
+        .to_rgba8();
+    let actual = image::open(actual_path)
+        .with_context(|| format!("读取当前截图失败: {}", actual_path.display()))?
+        .to_rgba8();
+
+    if expected.dimensions() != actual.dimensions() {
+        return Err(anyhow!(
+            "图片尺寸不一致：baseline={} current={}",
+            format!("{:?}", expected.dimensions()),
+            format!("{:?}", actual.dimensions())
+        ));
+    }
+
+    let (w, h) = expected.dimensions();
+    let mut diff = RgbaImage::new(w, h);
+
+    let mut sum_abs: u64 = 0;
+    let mut max_diff: u8 = 0;
+    let mut changed: u32 = 0;
+    let total = w.saturating_mul(h);
+
+    for y in 0..h {
+        for x in 0..w {
+            let e = expected.get_pixel(x, y).0;
+            let a = actual.get_pixel(x, y).0;
+            let dr = e[0].abs_diff(a[0]);
+            let dg = e[1].abs_diff(a[1]);
+            let db = e[2].abs_diff(a[2]);
+            let m = dr.max(dg).max(db);
+            if m > 0 {
+                changed += 1;
+            }
+            max_diff = max_diff.max(m);
+            sum_abs += dr as u64 + dg as u64 + db as u64;
+            diff.put_pixel(x, y, Rgba([dr, dg, db, 255]));
+        }
+    }
+
+    let denom = (total as f64).max(1.0) * 3.0;
+    let mae = (sum_abs as f64 / denom) as f32;
+
+    diff.save(out_path)
+        .with_context(|| format!("保存 diff 失败: {}", out_path.display()))?;
+
+    Ok(DiffStats {
+        mae,
+        max_diff,
+        changed_pixels: changed,
+        total_pixels: total,
+    })
 }
 
 async fn resolve_capture_basename(refno: RefnoEnum) -> String {
@@ -285,6 +444,18 @@ fn render_mesh_to_png(
     output_path: &Path,
     label: &str,
 ) -> Result<()> {
+    render_mesh_to_png_with_camera(mesh, width, height, output_path, label, 45.0, 45.0)
+}
+
+fn render_mesh_to_png_with_camera(
+    mesh: &PlantMesh,
+    width: u32,
+    height: u32,
+    output_path: &Path,
+    label: &str,
+    tilt_deg: f32,
+    side_deg: f32,
+) -> Result<()> {
     // 使用超采样抗锯齿：先渲染到高分辨率，然后下采样
     const SSAA_SCALE: u32 = 2; // 2x2 超采样
     let ssaa_width = width * SSAA_SCALE;
@@ -316,14 +487,14 @@ fn render_mesh_to_png(
     let camera_distance = max_extent * 1.8;
     // 前视图 + 俯视 45°：相机在前方（Y 轴负方向）并向上（Z 轴正方向）45 度俯视模型
     // 方向向量：(0, -cos(45°), sin(45°)) = (0, -1/√2, 1/√2)
-    let cos45 = 45.0f32.to_radians().cos();
-    let sin45 = 45.0f32.to_radians().sin();
+    let cos45 = tilt_deg.to_radians().cos();
+    let sin45 = tilt_deg.to_radians().sin();
     let mut camera_dir = Vec3::new(0.0, -cos45, sin45).normalize();
     if camera_dir.length_squared() < f32::EPSILON {
         camera_dir = Vec3::new(0.0, -1.0, 1.0).normalize();
     }
     // 添加 45 度侧向旋转：绕 Z 轴旋转相机方向
-    let side_rotation_angle = 45.0f32.to_radians();
+    let side_rotation_angle = side_deg.to_radians();
     let cos_side = side_rotation_angle.cos();
     let sin_side = side_rotation_angle.sin();
     // 绕 Z 轴旋转 camera_dir（保持 Z 分量不变，旋转 X-Y 平面分量）

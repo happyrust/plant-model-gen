@@ -110,7 +110,7 @@ pub static EXIST_MESH_GEO_HASHES: Lazy<DashMap<String, Aabb>> = Lazy::new(|| Das
 pub async fn preload_mesh_cache() -> anyhow::Result<()> {
     use aios_core::SUL_DB;
     use aios_core::types::PlantAabb;
-    use surrealdb::types::{self as surrealdb_types, SurrealValue};
+    use surrealdb::types::SurrealValue;
     
     debug_model!("🚚 正在从数据库预加载几何缓存...");
     let start = std::time::Instant::now();
@@ -122,7 +122,9 @@ pub async fn preload_mesh_cache() -> anyhow::Result<()> {
     #[derive(serde::Deserialize, SurrealValue)]
     struct GeoCacheRow {
         id: surrealdb::types::RecordId,
-        aabb_data: Option<PlantAabb>,
+        // 历史脏数据里可能出现 aabb.d 的内部字段为 null（如 mins/maxs 某一维为 null），
+        // 直接反序列化成 PlantAabb 会导致整个预加载失败，进而让 mesh worker 全面崩溃。
+        aabb_data: Option<serde_json::Value>,
     }
     
     let mut response = SUL_DB.query(sql).await?;
@@ -132,13 +134,27 @@ pub async fn preload_mesh_cache() -> anyhow::Result<()> {
     for row in rows {
         // 使用 RecordId 的 key 字段作为缓存键
         let mesh_id = format!("{:?}", row.id.key);
-        if let Some(plant_aabb) = row.aabb_data {
-            // PlantAabb 是 tuple struct，使用 .0 获取内部 Aabb
-            EXIST_MESH_GEO_HASHES.insert(mesh_id, plant_aabb.0);
-        } else {
-            // 如果只有 meshed=true 但没 aabb，存一个空的，仅用于跳过生成
-            EXIST_MESH_GEO_HASHES.insert(mesh_id, Aabb::new_invalid());
-        }
+        match row.aabb_data {
+            Some(v) => match serde_json::from_value::<PlantAabb>(v) {
+                Ok(plant_aabb) => {
+                    // PlantAabb 是 tuple struct，使用 .0 获取内部 Aabb
+                    EXIST_MESH_GEO_HASHES.insert(mesh_id, plant_aabb.0);
+                }
+                Err(e) => {
+                    debug_model_warn!(
+                        "⚠️ preload_mesh_cache: 跳过脏 aabb.d（mesh_id={}）: {}",
+                        mesh_id,
+                        e
+                    );
+                    // 仍写入 invalid，用于后续跳过重复 mesh 生成（避免无限重试）
+                    EXIST_MESH_GEO_HASHES.insert(mesh_id, Aabb::new_invalid());
+                }
+            },
+            None => {
+                // 如果只有 meshed=true 但没 aabb，存一个空的，仅用于跳过生成
+                EXIST_MESH_GEO_HASHES.insert(mesh_id, Aabb::new_invalid());
+            }
+        };
     }
     
     debug_model!(

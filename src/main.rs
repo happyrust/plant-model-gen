@@ -177,10 +177,32 @@ async fn main() -> anyhow::Result<()> {
                 .requires("capture"),
         )
         .arg(
+            Arg::new("capture-views")
+                .long("capture-views")
+                .help("Extra camera views to render (>=1). When >1, saves `{basename}_viewXX.png` alongside `{basename}.png`")
+                .value_name("N")
+                .value_parser(clap::value_parser!(u8))
+                .requires("capture"),
+        )
+        .arg(
             Arg::new("capture-include-descendants")
                 .long("capture-include-descendants")
                 .help("Include descendants when exporting OBJ for capture")
                 .action(clap::ArgAction::SetTrue)
+                .requires("capture"),
+        )
+        .arg(
+            Arg::new("capture-baseline")
+                .long("capture-baseline")
+                .help("Compare captured screenshots with baseline directory (expects same filename .png)")
+                .value_name("DIR")
+                .requires("capture"),
+        )
+        .arg(
+            Arg::new("capture-diff")
+                .long("capture-diff")
+                .help("Output directory for diff images (default: <capture-dir>/diff)")
+                .value_name("DIR")
                 .requires("capture"),
         )
         .arg(
@@ -569,19 +591,28 @@ async fn main() -> anyhow::Result<()> {
         .get_one::<u32>("capture-height")
         .copied()
         .unwrap_or(900);
+    let capture_views = matches
+        .get_one::<u8>("capture-views")
+        .copied()
+        .unwrap_or(1);
     let capture_include_descendants = matches.get_flag("capture-include-descendants");
+    let capture_baseline_dir = matches.get_one::<String>("capture-baseline").cloned();
+    let capture_diff_dir = matches.get_one::<String>("capture-diff").cloned();
 
     if let Some(ref dir) = capture_dir {
         let output_dir = PathBuf::from(dir.clone());
-        aios_database::fast_model::set_capture_config(Some(
-            aios_database::fast_model::CaptureConfig::new(
-                output_dir,
-                capture_width,
-                capture_height,
-                capture_include_descendants,
-            ),
-        ));
-    } else {
+            aios_database::fast_model::set_capture_config(Some(
+                aios_database::fast_model::CaptureConfig::new(
+                    output_dir,
+                    capture_width,
+                    capture_height,
+                    capture_include_descendants,
+                    capture_views,
+                    capture_baseline_dir.map(PathBuf::from),
+                    capture_diff_dir.map(PathBuf::from),
+                ),
+            ));
+        } else {
         aios_database::fast_model::set_capture_config(None);
     }
 
@@ -659,6 +690,10 @@ async fn main() -> anyhow::Result<()> {
     // ========== 处理 --regen-model 参数（影响纯模型生成） ==========
     if matches.get_flag("regen-model") {
         println!("🔄 检测到 --regen-model 参数，强制开启 replace_mesh 模式");
+        // 与 replace_mesh 配合：强制 mesh_worker 忽略 mesh_sig 缓存，确保本次能看到最新代码/配置效果。
+        unsafe {
+            std::env::set_var("FORCE_REGEN_MESH", "1");
+        }
         db_option_ext.inner.replace_mesh = Some(true);
     }
 

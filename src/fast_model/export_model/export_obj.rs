@@ -185,9 +185,9 @@ pub async fn prepare_obj_export(
     mesh_dir: &Path,
     config: &CommonExportConfig,
 ) -> Result<PreparedObjExport> {
-    // 统一 mesh_dir：很多调用方传的是 `assets/meshes`，但 GLB 实际存放在 `assets/meshes/lod_L1`。
-    // 导出阶段默认按 L1 读取，避免出现“检查存在但加载找不到文件”的不一致。
-    let default_lod = aios_core::mesh_precision::LodLevel::L1;
+    // 统一 mesh_dir：很多调用方传的是 `assets/meshes`，但 GLB 实际存放在 `assets/meshes/lod_L{N}`。
+    // 这里必须跟随当前 active_precision.default_lod，否则会误读旧的 LOD（常见表现：截图/OBJ 与最新 mesh 不一致）。 
+    let default_lod = aios_core::mesh_precision::active_precision().default_lod;
     let effective_mesh_dir = match mesh_dir.file_name().and_then(|n| n.to_str()) {
         Some(name) if name.starts_with("lod_") => mesh_dir.to_path_buf(),
         _ => mesh_dir.join(format!("lod_{default_lod:?}")),

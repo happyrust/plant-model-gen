@@ -1,5 +1,5 @@
-use aios_core::tree_query::{TreeQueryFilter, TreeQueryOptions};
 use aios_core::RefU64;
+use aios_core::tree_query::{TreeQueryFilter, TreeQueryOptions};
 use aios_database::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -125,7 +125,9 @@ fn test_tree_cata_hash_stats() {
             if duplicates == 0 {
                 println!("no duplicate cata_hash found (all counts == 1)");
             } else {
-                for (hash, count, first_refno) in rows.into_iter().filter(|(_, count, _)| *count > 1) {
+                for (hash, count, first_refno) in
+                    rows.into_iter().filter(|(_, count, _)| *count > 1)
+                {
                     println!("cata_hash={hash}, count={count}, first_refno={first_refno}");
                 }
             }

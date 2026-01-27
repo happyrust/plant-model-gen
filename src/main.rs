@@ -591,28 +591,25 @@ async fn main() -> anyhow::Result<()> {
         .get_one::<u32>("capture-height")
         .copied()
         .unwrap_or(900);
-    let capture_views = matches
-        .get_one::<u8>("capture-views")
-        .copied()
-        .unwrap_or(1);
+    let capture_views = matches.get_one::<u8>("capture-views").copied().unwrap_or(1);
     let capture_include_descendants = matches.get_flag("capture-include-descendants");
     let capture_baseline_dir = matches.get_one::<String>("capture-baseline").cloned();
     let capture_diff_dir = matches.get_one::<String>("capture-diff").cloned();
 
     if let Some(ref dir) = capture_dir {
         let output_dir = PathBuf::from(dir.clone());
-            aios_database::fast_model::set_capture_config(Some(
-                aios_database::fast_model::CaptureConfig::new(
-                    output_dir,
-                    capture_width,
-                    capture_height,
-                    capture_include_descendants,
-                    capture_views,
-                    capture_baseline_dir.map(PathBuf::from),
-                    capture_diff_dir.map(PathBuf::from),
-                ),
-            ));
-        } else {
+        aios_database::fast_model::set_capture_config(Some(
+            aios_database::fast_model::CaptureConfig::new(
+                output_dir,
+                capture_width,
+                capture_height,
+                capture_include_descendants,
+                capture_views,
+                capture_baseline_dir.map(PathBuf::from),
+                capture_diff_dir.map(PathBuf::from),
+            ),
+        ));
+    } else {
         aios_database::fast_model::set_capture_config(None);
     }
 

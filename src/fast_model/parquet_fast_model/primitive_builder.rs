@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use aios_core::RefnoEnum;
 use aios_core::types::{NamedAttrMap, NamedAttrValue};
 use aios_core::geometry::{EleInstGeo, EleInstGeosData, GeoBasicType};
+use aios_core::shape::pdms_shape::BrepShapeTrait;
 use glam::Vec3;
 
 use super::data_source::{DuckDbDataSource, AttributeValue};
@@ -78,6 +79,8 @@ impl PrimitiveBuilder {
         
         let unit_flag = match &geo_param {
             aios_core::parsed_data::geo_params_data::PdmsGeoParam::PrimSCylinder(s) => s.unit_flag,
+            // PrimLoft(SweepSolid) 仅在“单段直线且无倾斜”时可安全 unit 化复用
+            aios_core::parsed_data::geo_params_data::PdmsGeoParam::PrimLoft(s) => s.is_reuse_unit(),
             _ => false,
         };
         

@@ -44,7 +44,7 @@ use bevy_transform::prelude::Transform;
 use chrono;
 use std::str::FromStr;
 use dashmap::DashMap;
-use glam::{DMat4, Vec3};
+use glam::DMat4;
 use itertools::Itertools;
 use log::info;
 use parry3d::bounding_volume::*;
@@ -61,14 +61,6 @@ use std::sync::Arc;
 use aios_core::geometry::csg::generate_csg_mesh;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize, SurrealValue)]
-struct GeoRelateMaxScaleRow {
-    out: RecordId,
-    sx: f32,
-    sy: f32,
-    sz: f32,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct MeshSignatureV1 {
     /// 签名结构版本；当签名字段变化时递增，用于强制失效旧缓存。
@@ -76,8 +68,6 @@ struct MeshSignatureV1 {
     lod: String,
     geo_type: String,
     non_scalable_geo: bool,
-    /// 动态精度的缩放因子（量化：*1000）
-    scale_factor_milli: i64,
 
     radial_segments: u16,
     height_segments: u16,
@@ -101,7 +91,8 @@ impl MeshSignatureV1 {
     // v3: sweep frame 改为 rotation-minimizing（确保 rot.z 与 tangent 一致，修复 WALL 截面扭转/翻面）
     // v4: 带 CURVE 的 SPINE 不再单位化（PrimLoft 直接使用真实圆弧/路径几何），网格应强制重建
     // v5: `--regen-model` 强制重建 mesh（不走 mesh_sig skip），并验证闭环接缝缺口修复是否生效
-    const VERSION: u32 = 5;
+    // v6: 移除“单位几何动态精度（按实例缩放提升细分）”，回归静态 LOD 配置
+    const VERSION: u32 = 6;
 
     fn quant(v: f32, scale: f32) -> i64 {
         if !v.is_finite() {
@@ -115,14 +106,12 @@ impl MeshSignatureV1 {
         geo_type: &str,
         non_scalable_geo: bool,
         settings: &LodMeshSettings,
-        scale_factor: f32,
     ) -> Self {
         Self {
             version: Self::VERSION,
             lod: lod.to_string(),
             geo_type: geo_type.to_string(),
             non_scalable_geo,
-            scale_factor_milli: Self::quant(scale_factor, 1000.0),
 
             radial_segments: settings.radial_segments,
             height_segments: settings.height_segments,
@@ -159,130 +148,6 @@ fn save_mesh_signature(path: &Path, sig: &MeshSignatureV1) -> anyhow::Result<()>
     let text = serde_json::to_string(sig)?;
     std::fs::write(path, text)?;
     Ok(())
-}
-
-/// 对“单位网格 + geo_relate.trans 缩放”的几何，按实例缩放幅度动态提升细分精度。
-///
-/// 设计要点：
-/// - inst_geo 里存的是单位几何（如 LCylinder/SCylinder），真实尺寸在 geo_relate.trans.scale 里；
-/// - mesh_worker 只会为 inst_geo 生成一份 mesh，所以这里取“使用该 inst_geo 的所有实例里最大的 scale”。
-/// - 通过缩小 `target_segment_length`（除以 scale_factor）把“单位空间的细分”映射到“真实尺寸的细分”。
-fn scale_lod_settings_for_unit_mesh(
-    base: LodMeshSettings,
-    scale_factor: f32,
-    unit_circumference: Option<f32>,
-) -> LodMeshSettings {
-    if !scale_factor.is_finite() || scale_factor <= 1.0 {
-        return base;
-    }
-
-    let mut out = base;
-
-    if let Some(target) = out.target_segment_length {
-        // 下限防止除法导致极端小值引发过度细分或数值问题
-        let new_target = (target / scale_factor).max(0.001);
-        out.target_segment_length = Some(new_target);
-
-        // 针对“单位网格”的圆周类细分：必要时抬高 max_radial_segments，
-        // 否则会被配置里的上限（常见 60）卡住，依旧粗糙。
-        if let Some(c) = unit_circumference {
-            if c.is_finite() && c > 0.0 {
-                let ideal = (c / new_target).ceil().max(3.0) as u16;
-                let cur_max = out
-                    .max_radial_segments
-                    .unwrap_or(out.radial_segments)
-                    .max(out.min_radial_segments);
-                // 上限：优先遵从配置（csg_settings.max_radial_segments），并做 512 的硬保护
-                let cap = out.max_radial_segments.unwrap_or(512).min(512);
-                let boosted = cur_max.max(ideal).min(cap);
-                out.max_radial_segments = Some(boosted);
-            }
-        }
-    }
-
-    out
-}
-
-fn scale_lod_settings_for_unit_sphere(base: LodMeshSettings, scale_factor: f32) -> LodMeshSettings {
-    let mut out = scale_lod_settings_for_unit_mesh(
-        base,
-        scale_factor,
-        Some(std::f32::consts::TAU), // unit sphere: radius=1.0 => equator circumference=2π
-    );
-    if !scale_factor.is_finite() || scale_factor <= 1.0 {
-        return out;
-    }
-
-    // Sphere 的“粗糙感”同时来自经向/纬向细分；纬向细分同样需要随缩放提升。
-    // 这里复用 max_radial_segments 作为 sphere 的 height 上限（并强制硬上限 512）。
-    let cap = out
-        .max_radial_segments
-        .unwrap_or(512)
-        .max(out.min_radial_segments)
-        .min(512);
-
-    if let Some(target) = out.target_segment_length {
-        // unit sphere 的直径为 2.0，把段长映射到单位空间后，用直径估算纬向段数上限需求。
-        let ideal_h = (2.0 / target).ceil().max(1.0) as u16;
-        let cur_max_h = out
-            .max_height_segments
-            .unwrap_or(out.height_segments)
-            .max(out.min_height_segments);
-        out.max_height_segments = Some(cur_max_h.max(ideal_h).min(cap));
-    } else {
-        let cur_max_h = out
-            .max_height_segments
-            .unwrap_or(out.height_segments)
-            .max(out.min_height_segments);
-        out.max_height_segments = Some(cur_max_h.min(cap));
-    }
-
-    out
-}
-
-async fn query_geo_relate_max_scales_for_outs(
-    outs: &[RecordId],
-) -> anyhow::Result<HashMap<String, Vec3>> {
-    if outs.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    // SurrealDB 3.0.0-beta 对「数字 id」的 record link 解析较严格：
-    // `inst_geo:\`2\`` / `inst_geo:2` 在 WHERE out=... / INSIDE[...] 场景可能匹配不到，
-    // 但 `inst_geo:⟨2⟩` 可稳定工作（见 history.txt 里的验证）。
-    fn to_angle_link(id: &RecordId) -> String {
-        let raw = id.to_raw();
-        let (tb, rid) = raw.split_once(':').unwrap_or((raw.as_str(), ""));
-        let rid = rid.trim();
-        let rid = rid
-            .strip_prefix('`')
-            .and_then(|s| s.strip_suffix('`'))
-            .unwrap_or(rid);
-        if rid.starts_with('⟨') && rid.ends_with('⟩') {
-            format!("{tb}:{rid}")
-        } else {
-            format!("{tb}:⟨{rid}⟩")
-        }
-    }
-
-    let outs_list = outs.iter().map(to_angle_link).join(",");
-    let sql = format!(
-        "SELECT out,\
-            math::max(trans.d.scale[0]) as sx,\
-            math::max(trans.d.scale[1]) as sy,\
-            math::max(trans.d.scale[2]) as sz \
-         FROM geo_relate \
-         WHERE out INSIDE [{outs_list}] \
-         GROUP BY out \
-         FETCH trans;"
-    );
-
-    let rows: Vec<GeoRelateMaxScaleRow> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
-    let mut map: HashMap<String, Vec3> = HashMap::new();
-    for r in rows {
-        map.insert(r.out.to_raw(), Vec3::new(r.sx, r.sy, r.sz));
-    }
-    Ok(map)
 }
 
 /// 在数据库中生成网格模型并更新包围盒
@@ -1144,8 +1009,6 @@ pub async fn gen_inst_meshes_by_geo_ids(
         return Ok(());
     }
     
-    let max_scales = query_geo_relate_max_scales_for_outs(geo_ids).await.unwrap_or_default();
-
     let aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
     let pts_json_map: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
     let inst_aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
@@ -1156,51 +1019,9 @@ pub async fn gen_inst_meshes_by_geo_ids(
         let profile = precision.profile_for_geo(geo_type_name);
         let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
         let mesh_id = g.id.to_mesh_id();
-        let geo_raw = g.id.to_raw();
         
         // 不需要 refno
         let mut lod_settings = profile.csg_settings;
-        let mut scale_factor_used = 1.0f32;
-
-        // 动态精度：单位几何（inst_geo）真实尺寸在 geo_relate.trans.scale 中，这里按最大缩放提升细分。
-        if !non_scalable_geo {
-            if let Some(scale) = max_scales.get(&geo_raw) {
-                match &g.param {
-                    PdmsGeoParam::PrimLCylinder(_) | PdmsGeoParam::PrimSCylinder(_) => {
-                        // 圆柱的“粗糙感”主要来自圆周方向折线化；这里以直径（X/Y 缩放）作为细分提升因子。
-                        let scale_factor = scale.x.max(scale.y).max(1.0);
-                        scale_factor_used = scale_factor;
-                        let old = lod_settings.target_segment_length;
-                        lod_settings = scale_lod_settings_for_unit_mesh(
-                            lod_settings,
-                            scale_factor,
-                            Some(std::f32::consts::PI), // unit cylinder: radius=0.5 => circumference=PI
-                        );
-                        debug_model_debug!(
-                            "[dyn_lod] geo_id={} scale_max={:.3} target_len {:?} -> {:?}",
-                            geo_raw,
-                            scale_factor,
-                            old,
-                            lod_settings.target_segment_length
-                        );
-                    }
-                    PdmsGeoParam::PrimSphere(_) => {
-                        let scale_factor = scale.x.max(scale.y).max(scale.z).max(1.0);
-                        scale_factor_used = scale_factor;
-                        let old = lod_settings.target_segment_length;
-                        lod_settings = scale_lod_settings_for_unit_sphere(lod_settings, scale_factor);
-                        debug_model_debug!(
-                            "[dyn_lod] geo_id={} scale_max={:.3} target_len {:?} -> {:?}",
-                            geo_raw,
-                            scale_factor,
-                            old,
-                            lod_settings.target_segment_length
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        }
 
         let lod_str = format!("{:?}", precision.default_lod);
         let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
@@ -1211,7 +1032,6 @@ pub async fn gen_inst_meshes_by_geo_ids(
             geo_type_name,
             non_scalable_geo,
             &lod_settings,
-            scale_factor_used,
         );
 
         // 若签名一致，则跳过重建（避免 replace_exist=true 时全量重算带来性能开销）。
@@ -1418,10 +1238,6 @@ pub async fn gen_inst_meshes(
                     i += 1;
                     let mut update_sql = String::new();
 
-                    // 动态精度：预先查询每个 inst_geo 在 geo_relate 里的最大 scale（避免每个几何单独查）。
-                    let outs: Vec<RecordId> = result.iter().map(|g| g.id.clone()).collect();
-                    let max_scales =
-                        query_geo_relate_max_scales_for_outs(&outs).await.unwrap_or_default();
                     // 遍历每个几何参数并使用 CSG 生成网格
                     for g in result {
                         debug_model_debug!("gen mesh param: {:?}", &g.param);
@@ -1437,48 +1253,6 @@ pub async fn gen_inst_meshes(
 
                         // 统一使用 CSG 方式生成网格
                         let mut lod_settings = profile.csg_settings;
-                        let mut scale_factor_used = 1.0f32;
-                        if !non_scalable_geo {
-                            if let Some(scale) = max_scales.get(&geo_raw) {
-                                match &g.param {
-                                    PdmsGeoParam::PrimLCylinder(_)
-                                    | PdmsGeoParam::PrimSCylinder(_) => {
-                                        // 圆柱的“粗糙感”主要来自圆周方向折线化；这里以直径（X/Y 缩放）作为细分提升因子。
-                                        let scale_factor = scale.x.max(scale.y).max(1.0);
-                                        scale_factor_used = scale_factor;
-                                        let old = lod_settings.target_segment_length;
-                                        lod_settings = scale_lod_settings_for_unit_mesh(
-                                            lod_settings,
-                                            scale_factor,
-                                            Some(std::f32::consts::PI), // unit cylinder: radius=0.5
-                                        );
-                                        debug_model_debug!(
-                                            "[dyn_lod] geo_id={} scale_max={:.3} target_len {:?} -> {:?}",
-                                            geo_raw,
-                                            scale_factor,
-                                            old,
-                                            lod_settings.target_segment_length
-                                        );
-                                    }
-                                    PdmsGeoParam::PrimSphere(_) => {
-                                        let scale_factor =
-                                            scale.x.max(scale.y).max(scale.z).max(1.0);
-                                        scale_factor_used = scale_factor;
-                                        let old = lod_settings.target_segment_length;
-                                        lod_settings =
-                                            scale_lod_settings_for_unit_sphere(lod_settings, scale_factor);
-                                        debug_model_debug!(
-                                            "[dyn_lod] geo_id={} scale_max={:.3} target_len {:?} -> {:?}",
-                                            geo_raw,
-                                            scale_factor,
-                                            old,
-                                            lod_settings.target_segment_length
-                                        );
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
 
                         let lod_str = format!("{:?}", precision.default_lod);
                         let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
@@ -1489,7 +1263,6 @@ pub async fn gen_inst_meshes(
                             geo_type_name,
                             non_scalable_geo,
                             &lod_settings,
-                            scale_factor_used,
                         );
 
                         let force_regen = std::env::var("FORCE_REGEN_MESH")

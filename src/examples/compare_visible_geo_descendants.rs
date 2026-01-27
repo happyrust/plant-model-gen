@@ -15,8 +15,7 @@ fn parse_refno(s: &str) -> anyhow::Result<RefnoEnum> {
     } else {
         s.to_string()
     };
-    RefnoEnum::from_str(&s)
-        .map_err(|e| anyhow::anyhow!("parse refno failed: {:?}", e))
+    RefnoEnum::from_str(&s).map_err(|e| anyhow::anyhow!("parse refno failed: {:?}", e))
 }
 
 #[tokio::main]

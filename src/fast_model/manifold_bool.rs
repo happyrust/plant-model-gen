@@ -3,7 +3,7 @@
 //! 本模块提供基于 Manifold 库的几何体布尔运算功能。
 //! 所有布尔运算操作均使用 Manifold 库实现，不再依赖 OpenCASCADE。
 
-use crate::fast_model::{debug_model, debug_model_debug};
+use crate::fast_model::{debug_model, debug_model_debug, debug_model_warn};
 use aios_core::SurrealQueryExt;
 use aios_core::csg::manifold::ManifoldRust;
 use aios_core::geometry::csg::{unit_box_mesh, unit_cylinder_mesh, unit_sphere_mesh};
@@ -359,21 +359,25 @@ pub async fn apply_cata_neg_boolean_manifold(
                 ));
 
                 // ========== 步骤 2：创建 geo_relate 关联记录 ==========
-                // 使用 INSERT RELATION 并指定唯一 ID（使用 geom_refno），避免重复创建
-                // 布尔运算后的结果只有一个几何体，所以 geom_refno 就足够作为唯一标识
-                let relation_id = format!("geo_relate:⟨{}⟩", bg[0]);
+                //
+                // 关键点：SurrealQL 的 relation table 写入语法是 `INSERT RELATION INTO <table> { ... }`
+                // 或 `INSERT RELATION INTO <table> [ {...}, ... ]`（见官方 INSERT 文档的 Insert relation tables）。
+                // 这里不能写成 `INSERT RELATION <table:id> CONTENT {...}`，否则部分 SurrealDB 版本会报
+                // “Unexpected token `CONTENT`, expected Eof”。
+                //
+                // 目标：用 geom_refno 作为稳定的 relation id，保证幂等（同一 geom_refno 仅一条 booled geo_relate）。
+                let relation_id = bg[0].to_string();
 
                 // 先删除旧记录（如果存在）
-                update_sql.push_str(&format!("DELETE {};", relation_id));
+                update_sql.push_str(&format!("DELETE geo_relate:⟨{}⟩;", relation_id));
 
                 // 建立 inst_info -> geo_relate -> inst_geo 的关系
                 // geo_type='CatePos' 表示这是布尔运算后的结果（应该导出）
                 let relate_sql = format!(
-                    "INSERT RELATION {} CONTENT {{ in: {}, out: inst_geo:⟨{}⟩, geom_refno: pe:⟨{}⟩, geo_type: 'CatePos', trans: trans:⟨0⟩, visible: true }};",
-                    relation_id,
+                    "INSERT RELATION INTO geo_relate {{ in: {}, id: '{rel_id}', out: inst_geo:⟨{mesh_id}⟩, geom_refno: pe:⟨{rel_id}⟩, geo_type: 'CatePos', trans: trans:⟨0⟩, visible: true }};",
                     &g.inst_info_id.to_raw(),
-                    mesh_id,
-                    bg[0],
+                    rel_id = relation_id,
+                    mesh_id = mesh_id,
                 );
                 update_sql.push_str(&relate_sql);
                 
@@ -408,7 +412,33 @@ pub async fn apply_cata_neg_boolean_manifold(
         }
 
         if !update_sql.is_empty() {
-            SUL_DB.query(update_sql).await?;
+            // 仅在 debug_model 下打印 SQL，便于定位 SurrealQL 解析/兼容性问题。
+            if aios_core::is_debug_model_enabled() {
+                let preview = update_sql.chars().take(8000).collect::<String>();
+                if update_sql.chars().count() > 8000 {
+                    debug_model_debug!(
+                        "[boolean_worker] 将执行 update_sql (len={}):\n{}...\n[truncated]",
+                        update_sql.len(),
+                        preview
+                    );
+                } else {
+                    debug_model_debug!(
+                        "[boolean_worker] 将执行 update_sql (len={}):\n{}",
+                        update_sql.len(),
+                        preview
+                    );
+                }
+            }
+
+            if let Err(e) = SUL_DB.query(update_sql.clone()).await {
+                debug_model_warn!(
+                    "[boolean_worker] 执行 update_sql 失败: {}\nSQL(len={}):\n{}",
+                    e,
+                    update_sql.len(),
+                    update_sql
+                );
+                return Err(e.into());
+            }
         }
     }
 

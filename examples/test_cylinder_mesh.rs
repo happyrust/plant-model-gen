@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use aios_core::geometry::csg::{build_csg_mesh, unit_cylinder_mesh, unit_cylinder_mesh_standard};
 use aios_core::mesh_precision::LodMeshSettings;
-use aios_core::prim_geo::{SBox, Sphere};
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
+use aios_core::prim_geo::{SBox, Sphere};
 use aios_core::shape::pdms_shape::PlantMesh;
 use aios_core::types::RefnoEnum;
 use glam::Vec3;
@@ -33,12 +33,7 @@ fn main() {
     let standard_mesh = unit_cylinder_mesh_standard(&settings, false);
     let manifold_mesh = unit_cylinder_mesh(&settings, false);
 
-    export_and_compare(
-        &standard_mesh,
-        &manifold_mesh,
-        &output_dir,
-        "cylinder",
-    );
+    export_and_compare(&standard_mesh, &manifold_mesh, &output_dir, "cylinder");
 
     // ========== 2. 盒子 (Box) ==========
     println!("\n【2】盒子 (Box)");
@@ -67,8 +62,10 @@ fn main() {
     };
     let sphere_param = PdmsGeoParam::PrimSphere(sphere.clone());
 
-    let sphere_standard = build_csg_mesh(&sphere_param, &settings, false, false, RefnoEnum::default());
-    let sphere_manifold = build_csg_mesh(&sphere_param, &settings, false, true, RefnoEnum::default());
+    let sphere_standard =
+        build_csg_mesh(&sphere_param, &settings, false, false, RefnoEnum::default());
+    let sphere_manifold =
+        build_csg_mesh(&sphere_param, &settings, false, true, RefnoEnum::default());
 
     if let (Some(std), Some(mfd)) = (sphere_standard, sphere_manifold) {
         export_and_compare(&std.mesh, &mfd.mesh, &output_dir, "sphere");
@@ -109,15 +106,19 @@ fn export_and_compare(
     println!("  文件: {:?}", mfd_path);
 
     let reduction = if standard.vertices.len() > manifold.vertices.len() {
-        (standard.vertices.len() - manifold.vertices.len()) as f32
-            / standard.vertices.len() as f32
+        (standard.vertices.len() - manifold.vertices.len()) as f32 / standard.vertices.len() as f32
             * 100.0
     } else {
         0.0
     };
-    println!("顶点减少: {} ({:.1}%)", 
-        standard.vertices.len().saturating_sub(manifold.vertices.len()),
-        reduction);
+    println!(
+        "顶点减少: {} ({:.1}%)",
+        standard
+            .vertices
+            .len()
+            .saturating_sub(manifold.vertices.len()),
+        reduction
+    );
 }
 
 fn export_obj(mesh: &PlantMesh, path: &PathBuf) {

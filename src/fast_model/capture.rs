@@ -444,7 +444,8 @@ fn render_mesh_to_png(
     output_path: &Path,
     label: &str,
 ) -> Result<()> {
-    render_mesh_to_png_with_camera(mesh, width, height, output_path, label, 45.0, 45.0)
+    // 默认截图风格：正视 + 正交投影 + 灰底 + 边缘描线（贴近人工验收习惯）
+    render_mesh_to_png_with_camera(mesh, width, height, output_path, label, 0.0, 0.0)
 }
 
 fn render_mesh_to_png_with_camera(
@@ -463,7 +464,8 @@ fn render_mesh_to_png_with_camera(
     let mut ssaa_image = RgbaImage::from_pixel(ssaa_width, ssaa_height, Rgba([0, 0, 0, 0]));
 
     if mesh.vertices.is_empty() || mesh.indices.is_empty() {
-        let mut image = RgbaImage::from_pixel(width, height, Rgba([0, 0, 0, 0]));
+        // 与正常路径保持一致：灰底（而非透明），便于人工比对
+        let mut image = RgbaImage::from_pixel(width, height, Rgba([235, 235, 235, 255]));
         image
             .save(output_path)
             .with_context(|| format!("保存截图失败: {}", output_path.display()))?;
@@ -512,12 +514,47 @@ fn render_mesh_to_png_with_camera(
 
     let view = Mat4::look_at_rh(eye, center, up);
     let aspect = (ssaa_width as f32 / ssaa_height as f32).max(0.01);
-    let near = (radius * 0.05).max(0.01);
-    let far = (radius * 12.0).max(near + 10.0);
-    let proj = Mat4::perspective_rh_gl(45f32.to_radians(), aspect, near, far);
+    // 采用正交投影：用 view-space AABB 自适配裁剪面与可视范围（更像工程验收截图）
+    let mut vmin = Vec3::splat(f32::INFINITY);
+    let mut vmax = Vec3::splat(-f32::INFINITY);
+    for v in &mesh.vertices {
+        let p = (view * Vec4::new(v.x, v.y, v.z, 1.0)).truncate();
+        vmin = vmin.min(p);
+        vmax = vmax.max(p);
+    }
+    let mut view_w = (vmax.x - vmin.x).abs().max(1e-3);
+    let mut view_h = (vmax.y - vmin.y).abs().max(1e-3);
+    // 对齐目标画幅的宽高比，避免被拉伸或裁剪
+    let view_aspect = view_w / view_h;
+    if view_aspect > aspect {
+        view_h = (view_w / aspect).max(1e-3);
+    } else {
+        view_w = (view_h * aspect).max(1e-3);
+    }
+    // 留白，避免紧贴边缘
+    let pad = 1.08f32;
+    view_w *= pad;
+    view_h *= pad;
+    let cx = (vmin.x + vmax.x) * 0.5;
+    let cy = (vmin.y + vmax.y) * 0.5;
+    let left = cx - view_w * 0.5;
+    let right = cx + view_w * 0.5;
+    let bottom = cy - view_h * 0.5;
+    let top = cy + view_h * 0.5;
+    // view-space 中：相机前方通常为负 Z（look_at_rh）。near/far 需要正数距离。
+    let near = (-vmax.z).max((radius * 0.02).max(0.01));
+    let far = (-vmin.z).max((radius * 12.0).max(near + 1.0));
+    let rml = right - left;
+    let tmb = top - bottom;
+    let fmn = far - near;
+    let proj = Mat4::from_cols(
+        Vec4::new(2.0 / rml, 0.0, 0.0, 0.0),
+        Vec4::new(0.0, 2.0 / tmb, 0.0, 0.0),
+        Vec4::new(0.0, 0.0, -2.0 / fmn, 0.0),
+        Vec4::new(-(right + left) / rml, -(top + bottom) / tmb, -(far + near) / fmn, 1.0),
+    );
     let view_proj = proj * view;
 
-    let normals = ensure_vertex_normals(mesh);
     let mut ndc_positions = vec![Vec3::ZERO; mesh.vertices.len()];
     let mut screen_positions = vec![Vec3::ZERO; mesh.vertices.len()];
     let mut valid = vec![false; mesh.vertices.len()];
@@ -537,8 +574,13 @@ fn render_mesh_to_png_with_camera(
     }
 
     let mut depth_buffer = vec![f32::INFINITY; (ssaa_width as usize) * (ssaa_height as usize)];
-    let light_dir = Vec3::new(0.6, 0.8, 1.0).normalize();
-    let base_color = Vec3::new(0.42, 0.71, 0.96);
+    // 验收截图更偏“工程视图”：使用接近纯色的填充（避免因法线/光照导致颜色忽明忽暗）。
+    let base_color = Vec3::new(0.18, 0.52, 0.86);
+    let base_color_u8 = [
+        (base_color.x.clamp(0.0, 1.0) * 255.0) as u8,
+        (base_color.y.clamp(0.0, 1.0) * 255.0) as u8,
+        (base_color.z.clamp(0.0, 1.0) * 255.0) as u8,
+    ];
 
     for tri in mesh.indices.chunks(3) {
         if tri.len() < 3 {
@@ -604,23 +646,10 @@ fn render_mesh_to_png_with_camera(
                 }
                 depth_buffer[buffer_index] = depth;
 
-                let world_pos =
-                    mesh.vertices[i0] * w0 + mesh.vertices[i1] * w1 + mesh.vertices[i2] * w2;
-                let mut normal = normals[i0] * w0 + normals[i1] * w1 + normals[i2] * w2;
-                normal = normal.normalize_or_zero();
-
-                let view_dir = (eye - world_pos).normalize_or_zero();
-                let halfway = (light_dir + view_dir).normalize_or_zero();
-                let diffuse = normal.dot(light_dir).max(0.0);
-                let specular = normal.dot(halfway).max(0.0).powf(32.0);
-                let ambient = 0.25;
-                let intensity = (ambient + diffuse * 0.65 + specular * 0.1).clamp(0.0, 1.0);
-
-                let shaded = (base_color * intensity).clamp(Vec3::ZERO, Vec3::splat(1.0));
                 let color = Rgba([
-                    (shaded.x * 255.0) as u8,
-                    (shaded.y * 255.0) as u8,
-                    (shaded.z * 255.0) as u8,
+                    base_color_u8[0],
+                    base_color_u8[1],
+                    base_color_u8[2],
                     255, // 完全不透明
                 ]);
                 ssaa_image.put_pixel(x as u32, y as u32, color);
@@ -667,10 +696,59 @@ fn render_mesh_to_png_with_camera(
         }
     }
 
-    // 在图片底部中间绘制标签文字
-    draw_label_on_image(&mut image, label, width, height)?;
+    // 组合灰底，并按 alpha 做“边缘描线”（仅外轮廓），以贴近人工验收截图风格。
+    let bg = [235u8, 235u8, 235u8];
+    let edge = [60u8, 60u8, 60u8];
+    let mut out = RgbaImage::from_pixel(width, height, Rgba([bg[0], bg[1], bg[2], 255]));
 
-    image
+    // 先把模型按 alpha 贴到灰底上
+    for y in 0..height {
+        for x in 0..width {
+            let p = *image.get_pixel(x, y);
+            let a = (p[3] as f32) / 255.0;
+            if a <= 0.0 {
+                continue;
+            }
+            let inv = 1.0 - a;
+            let r = (bg[0] as f32 * inv + p[0] as f32 * a).round().clamp(0.0, 255.0) as u8;
+            let g = (bg[1] as f32 * inv + p[1] as f32 * a).round().clamp(0.0, 255.0) as u8;
+            let b = (bg[2] as f32 * inv + p[2] as f32 * a).round().clamp(0.0, 255.0) as u8;
+            out.put_pixel(x, y, Rgba([r, g, b, 255]));
+        }
+    }
+
+    // 再做 1px 外轮廓描边：alpha 边界 或 邻域从实到空的跳变
+    for y in 1..height.saturating_sub(1) {
+        for x in 1..width.saturating_sub(1) {
+            let a = image.get_pixel(x, y)[3];
+            if a == 0 {
+                continue;
+            }
+            let is_soft_edge = a < 250;
+            let neigh_empty = image.get_pixel(x - 1, y)[3] < 10
+                || image.get_pixel(x + 1, y)[3] < 10
+                || image.get_pixel(x, y - 1)[3] < 10
+                || image.get_pixel(x, y + 1)[3] < 10;
+            if !is_soft_edge && !neigh_empty {
+                continue;
+            }
+
+            // 对软边缘像素按 coverage 做轻量混合，减少“黑边断裂”
+            let t = (a as f32 / 255.0).clamp(0.0, 1.0);
+            let blend = if is_soft_edge { 0.85 * t } else { 0.85 };
+            let p = *out.get_pixel(x, y);
+            let inv = 1.0 - blend;
+            let r = (p[0] as f32 * inv + edge[0] as f32 * blend).round().clamp(0.0, 255.0) as u8;
+            let g = (p[1] as f32 * inv + edge[1] as f32 * blend).round().clamp(0.0, 255.0) as u8;
+            let b = (p[2] as f32 * inv + edge[2] as f32 * blend).round().clamp(0.0, 255.0) as u8;
+            out.put_pixel(x, y, Rgba([r, g, b, 255]));
+        }
+    }
+
+    // 保留 label 参数以兼容调用端，但默认不绘制（Windows 也无系统字体可依赖）。
+    let _ = label;
+
+    out
         .save(output_path)
         .with_context(|| format!("保存截图失败: {}", output_path.display()))?;
     Ok(())

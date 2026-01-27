@@ -986,6 +986,8 @@ async fn gen_cata_geos_inner(
                                 .unwrap_or(PdmsGeoParam::Unknown);
                             let unit_flag = match &geo_param {
                                 PdmsGeoParam::PrimSCylinder(s) => s.unit_flag,
+                                // PrimLoft(SweepSolid) 仅在“单段直线且无倾斜”时可安全 unit 化复用
+                                PdmsGeoParam::PrimLoft(s) => s.is_reuse_unit(),
                                 _ => false,
                             };
                             let geom_inst = EleInstGeo {

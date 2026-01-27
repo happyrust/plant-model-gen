@@ -249,6 +249,8 @@ pub async fn gen_loop_geos(
                 let tr: Transform = item_trans;
                 let unit_flag = match &geo_param {
                     PdmsGeoParam::PrimSCylinder(s) => s.unit_flag,
+                    // PrimLoft(SweepSolid) 仅在“单段直线且无倾斜”时可安全 unit 化复用
+                    PdmsGeoParam::PrimLoft(s) => s.is_reuse_unit(),
                     _ => false,
                 };
                 //需要判断多个PLOO、LOOP的情况，第二个开始都是负实体

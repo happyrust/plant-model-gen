@@ -96,6 +96,31 @@ async fn delete_inst_relate_bool_records(refnos: &[RefnoEnum], chunk_size: usize
     Ok(())
 }
 
+/// replace_exist=true 时，删除本次将要重建的 inst_geo 记录（按 geo_hash 点删）。
+///
+/// 说明：inst_geo 写入目前使用 `INSERT IGNORE`，若不先删除，则旧记录（含 unit_flag/param）会被保留，
+/// 导致“代码已修、--regen-model 已跑、但数据库仍是旧值”的假象。
+async fn delete_inst_geo_by_hashes(geo_hashes: &[u64], chunk_size: usize) -> anyhow::Result<()> {
+    if geo_hashes.is_empty() {
+        return Ok(());
+    }
+    for chunk in geo_hashes.chunks(chunk_size.max(1)) {
+        // 避免删掉内置 unit mesh（0..10），这些由程序内置加载并复用
+        let ids = chunk
+            .iter()
+            .copied()
+            .filter(|h| *h >= 10)
+            .map(|h| format!("inst_geo:{h}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        if ids.is_empty() {
+            continue;
+        }
+        SUL_DB.query(format!("DELETE [{ids}];")).await?;
+    }
+    Ok(())
+}
+
 /// 保存 instance 数据到数据库（事务化批处理版本）
 pub async fn save_instance_data_optimize(
     inst_mgr: &ShapeInstancesData,
@@ -150,6 +175,20 @@ pub async fn save_instance_data_optimize(
 
         // 清理历史布尔结果表（否则导出/截图会优先命中旧 inst_relate_bool，误读 booled mesh）。
         delete_inst_relate_bool_records(&refnos, CHUNK_SIZE).await?;
+
+        // 删除本轮将要重建的 inst_geo（否则 INSERT IGNORE 不会覆盖 unit_flag/param 等字段）。
+        let geo_hashes: Vec<u64> = inst_mgr
+            .inst_geos_map
+            .values()
+            .flat_map(|d| d.insts.iter().map(|g| g.geo_hash))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        debug_model_debug!(
+            "save_instance_data_optimize deleting existing inst_geo records: {}",
+            geo_hashes.len()
+        );
+        delete_inst_geo_by_hashes(&geo_hashes, CHUNK_SIZE).await?;
 
         // 同步清理 geo_relate（以及依赖它的 neg/ngmr 关系），避免旧几何残留/重复 Pos。
         // 注意：这里只删除“关系记录”，不删除 inst_info/inst_geo 本体，符合 replace 模式的复用目标。

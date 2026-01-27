@@ -320,6 +320,8 @@ pub async fn gen_prim_geos(
                 let geo_hash = csg_shape.hash_unit_mesh_params();
                 let unit_flag = match &geo_param {
                     PdmsGeoParam::PrimSCylinder(s) => s.unit_flag,
+                    // PrimLoft(SweepSolid) 仅在“单段直线且无倾斜”时可安全 unit 化复用
+                    PdmsGeoParam::PrimLoft(s) => s.is_reuse_unit(),
                     _ => false,
                 };
                 // dbg!(geo_hash);

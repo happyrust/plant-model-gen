@@ -332,6 +332,7 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             println!("   - 强制开启 replace_mesh 和 gen_mesh");
 
             use aios_database::fast_model::gen_all_geos_data;
+            use aios_database::fast_model::query_provider;
 
             unsafe {
                 std::env::set_var("FORCE_REPLACE_MESH", "true");
@@ -343,8 +344,33 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             db_option_clone.replace_mesh = Some(true);
             db_option_clone.gen_mesh = true;
 
-            let db_option_ext = DbOptionExt::from(db_option_clone.clone());
-            gen_all_geos_data(refnos.clone(), &db_option_ext, None, None).await?;
+            let mut db_option_ext_override = db_option_ext.clone();
+            db_option_ext_override.inner = db_option_clone.clone();
+            // 导出若包含子孙节点，regen 也必须覆盖同一范围，否则 replace 模式会清理旧 ngmr/neg 关系，
+            // 但本次未重建子孙几何，导致布尔缺失，导出回退到“未布尔”的正实体 mesh。
+            let regen_refnos = if config.include_descendants {
+                let descendants = query_provider::query_multi_descendants(&refnos, &[])
+                    .await
+                    .unwrap_or_default();
+                // 默认包含自身：roots 在前，后面拼接子孙；保持顺序去重。
+                let mut out = Vec::with_capacity(refnos.len() + descendants.len());
+                let mut seen =
+                    std::collections::HashSet::with_capacity(refnos.len() + descendants.len());
+                for &r in &refnos {
+                    if seen.insert(r) {
+                        out.push(r);
+                    }
+                }
+                for r in descendants {
+                    if seen.insert(r) {
+                        out.push(r);
+                    }
+                }
+                out
+            } else {
+                refnos.clone()
+            };
+            gen_all_geos_data(regen_refnos, &db_option_ext_override, None, None).await?;
 
             db_option_clone.replace_mesh = original_replace_mesh;
             db_option_clone.gen_mesh = original_gen_mesh;
@@ -424,8 +450,9 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
         let original_gen_mesh = db_option_clone.gen_mesh;
         db_option_clone.replace_mesh = Some(true);
         db_option_clone.gen_mesh = true;
-        let db_option_ext = DbOptionExt::from(db_option_clone.clone());
-        gen_all_geos_data(sites.clone(), &db_option_ext, None, None).await?;
+        let mut db_option_ext_override = db_option_ext.clone();
+        db_option_ext_override.inner = db_option_clone.clone();
+        gen_all_geos_data(sites.clone(), &db_option_ext_override, None, None).await?;
         db_option_clone.replace_mesh = original_replace_mesh;
         db_option_clone.gen_mesh = original_gen_mesh;
         unsafe {
@@ -648,8 +675,9 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
         let original_gen_mesh = db_option_clone.gen_mesh;
         db_option_clone.replace_mesh = Some(true);
         db_option_clone.gen_mesh = true;
-        let db_option_ext = DbOptionExt::from(db_option_clone.clone());
-        gen_all_geos_data(sites.clone(), &db_option_ext, None, None).await?;
+        let mut db_option_ext_override = db_option_ext.clone();
+        db_option_ext_override.inner = db_option_clone.clone();
+        gen_all_geos_data(sites.clone(), &db_option_ext_override, None, None).await?;
         db_option_clone.replace_mesh = original_replace_mesh;
         db_option_clone.gen_mesh = original_gen_mesh;
         unsafe {
@@ -799,8 +827,9 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
             db_option_clone.replace_mesh = Some(true);
             db_option_clone.gen_mesh = true;
 
-            let db_option_ext = DbOptionExt::from(db_option_clone.clone());
-            gen_all_geos_data(sites.clone(), &db_option_ext, None, None).await?;
+            let mut db_option_ext_override = db_option_ext.clone();
+            db_option_ext_override.inner = db_option_clone.clone();
+            gen_all_geos_data(sites.clone(), &db_option_ext_override, None, None).await?;
 
             db_option_clone.replace_mesh = original_replace_mesh;
             db_option_clone.gen_mesh = original_gen_mesh;

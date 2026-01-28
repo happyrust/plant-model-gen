@@ -22,7 +22,10 @@ use aios_core::RefnoEnum;
 use crate::data_interface::increment_record::IncrGeoUpdateLog;
 use crate::data_interface::sesno_increment::get_changes_at_sesno;
 use crate::fast_model::capture::capture_refnos_if_enabled;
-use crate::fast_model::mesh_generate::run_mesh_worker;
+use crate::data_interface::db_meta_manager::db_meta;
+// 缓存功能已禁用：移除 fallback_dbnum 和 guess dbnum 逻辑后，无法推断 dbnum
+// use crate::fast_model::instance_cache::InstanceCacheManager;
+use crate::fast_model::mesh_generate::{run_boolean_worker, run_mesh_worker};
 use crate::fast_model::pdms_inst::save_instance_data_optimize;
 use crate::options::{DbOptionExt, MeshFormat};
 use crate::fast_model::export_model::ParquetStreamWriter;
@@ -33,13 +36,7 @@ use super::config::FullNounConfig;
 use super::errors::{FullNounError, Result};
 use super::full_noun_mode::gen_full_noun_geos_optimized;
 use super::models::NounCategory;
-
-fn parse_dbno_from_refno(refno: RefnoEnum) -> Option<u32> {
-    // RefnoEnum 的 to_string 在项目中通常是 "dbno_sesno" 或 "dbnum/sesno"；
-    // 这里做最小兼容解析，只取 dbno。
-    let s = refno.to_string().replace('/', "_");
-    s.split('_').next()?.parse::<u32>().ok()
-}
+use std::str::FromStr;
 
 /// 主入口函数：生成所有几何体数据
 ///
@@ -166,6 +163,10 @@ async fn process_full_noun_mode(
 
     let (sender, receiver) = flume::unbounded();
     let replace_exist = db_option.inner.is_replace_mesh();
+    let use_surrealdb = db_option.use_surrealdb;
+    // 缓存功能已禁用
+    let use_cache = false;
+    let cache_manager: Option<Arc<()>> = None;
 
     // 初始化 Parquet 写入器
     let parquet_writer: Option<std::sync::Arc<ParquetStreamWriter>> = None;
@@ -206,8 +207,10 @@ async fn process_full_noun_mode(
     let insert_handle = tokio::spawn(async move {
         while let Ok(shape_insts) = receiver.recv_async().await {
             // 保存到 SurrealDB
-            if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
-                eprintln!("保存实例数据失败: {}", e);
+            if use_surrealdb {
+                if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
+                    eprintln!("保存实例数据失败: {}", e);
+                }
             }
             // 同时写入 Parquet（如果启用）
             if let Some(ref writer) = parquet_writer_clone {
@@ -267,10 +270,20 @@ async fn process_full_noun_mode(
         all_refnos.extend(loops);
         all_refnos.extend(prims);
 
-        // 使用 mesh worker 后台扫描 inst_geo 表生成 mesh
-        if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
-            eprintln!("[gen_model] mesh worker 失败: {}", e);
-        } else {
+        // 缓存功能已禁用，直接使用 SurrealDB 路径
+        let mut ran_primary = false;
+
+        if use_surrealdb {
+            if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
+                eprintln!("[gen_model] mesh worker 失败: {}", e);
+            } else {
+                ran_primary = true;
+            }
+        }
+
+        // 双路径功能已禁用（缓存相关）
+
+        if ran_primary {
             println!(
                 "[gen_model] Full Noun 模式 mesh 生成完成，用时 {} ms",
                 mesh_start.elapsed().as_millis()
@@ -278,6 +291,7 @@ async fn process_full_noun_mode(
         }
 
         // 3️⃣ 写入 inst_relate_aabb 并导出 Parquet（供房间计算使用）
+        if use_surrealdb {
         let aabb_start = Instant::now();
         println!("[gen_model] Full Noun 模式开始写入 inst_relate_aabb");
         // 使用实际 inst_relate 中的 refno，避免分类结果与 inst 列表不一致导致 0 写入
@@ -319,24 +333,23 @@ async fn process_full_noun_mode(
                 // }
             }
         }
+        }
 
         // 4️⃣ 可选执行布尔运算
         if db_option.inner.apply_boolean_operation {
             let bool_start = Instant::now();
             println!("[gen_model] Full Noun 模式开始布尔运算（boolean worker）");
-            if let Err(e) = crate::fast_model::mesh_generate::run_boolean_worker(
-                Arc::new(db_option.inner.clone()),
-                100,
-            )
-            .await
-            {
-                eprintln!("[gen_model] Full Noun 布尔运算失败: {}", e);
-            } else {
-                println!(
-                    "[gen_model] Full Noun 模式布尔运算完成，用时 {} ms",
-                    bool_start.elapsed().as_millis()
-                );
+            // 缓存功能已禁用，直接使用 SurrealDB 路径
+            if use_surrealdb {
+                if let Err(e) = run_boolean_worker(Arc::new(db_option.inner.clone()), 100).await {
+                    eprintln!("[gen_model] Full Noun 布尔运算失败: {}", e);
+                }
             }
+
+            println!(
+                "[gen_model] Full Noun 模式布尔运算完成，用时 {} ms",
+                bool_start.elapsed().as_millis()
+            );
         }
 
         // 5️⃣ 生成 Web Bundle (GLB + JSON 数据包)
@@ -471,16 +484,26 @@ async fn process_targeted_generation(
         "[gen_model] 进入{}生成路径，目标节点数: {}",
         mode_label, target_count
     );
+    println!(
+        "[gen_model] 缓存开关: use_cache={}, foyer_primary={}, dual_run={}",
+        db_option.use_cache,
+        db_option.foyer_primary,
+        db_option.dual_run_enabled
+    );
 
     let (sender, receiver) = flume::unbounded();
     let receiver: flume::Receiver<aios_core::geometry::ShapeInstancesData> = receiver.clone();
 
     let replace_exist = db_option.inner.is_replace_mesh();
+    let use_surrealdb = db_option.use_surrealdb;
+    // 缓存功能已禁用
 
     let insert_task = tokio::task::spawn(async move {
         while let Ok(shape_insts) = receiver.recv_async().await {
-            if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
-                eprintln!("保存实例数据失败: {}", e);
+            if use_surrealdb {
+                if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
+                    eprintln!("保存实例数据失败: {}", e);
+                }
             }
         }
     });
@@ -507,64 +530,68 @@ async fn process_targeted_generation(
 
     if db_option.inner.gen_mesh {
         let mesh_start = Instant::now();
-        println!(
-            "[gen_model] 开始后台扫描 inst_geo 生成 mesh"
-        );
+        println!("[gen_model] 开始 mesh 生成");
 
-        // 使用 mesh worker 后台扫描 inst_geo 表生成 mesh
-        if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
-            eprintln!("[gen_model] mesh worker 失败: {}", e);
-        } else {
+        let mut ran_primary = false;
+        // 缓存功能已禁用，直接使用 SurrealDB 路径
+        if use_surrealdb {
+            if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
+                eprintln!("[gen_model] mesh worker 失败: {}", e);
+            } else {
+                ran_primary = true;
+            }
+        }
+
+        if ran_primary {
             println!(
                 "[gen_model] 完成 mesh 生成，用时 {} ms",
                 mesh_start.elapsed().as_millis()
             );
         }
-        
-        // 写入实例 AABB（mesh worker 只更新了 inst_geo.aabb）
-        let aabb_start = Instant::now();
-        println!("[gen_model] 开始写入 inst_relate_aabb");
-        // 注意：export-glb 等导出会查询“根 + 全部子孙”的 inst 列表；
-        // 仅写根节点会导致子孙节点缺少 inst_relate_aabb，从而 world_aabb 变 null 并反序列化失败。
-        // 重要：query_multi_descendants 只返回子孙节点，不包括根节点本身，需要手动添加根节点
-        let mut aabb_refnos = target_root_refnos.clone();
-        match query_provider::query_multi_descendants(&target_root_refnos, &[]).await {
-            Ok(descendants) if !descendants.is_empty() => {
-                aabb_refnos.extend(descendants);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!(
-                    "[gen_model] 查询子孙节点失败，仅写根节点 inst_relate_aabb: {}",
-                    e
+
+        if use_surrealdb {
+            let aabb_start = Instant::now();
+            println!("[gen_model] 开始写入 inst_relate_aabb");
+            let mut aabb_refnos = target_root_refnos.clone();
+            match query_provider::query_multi_descendants(&target_root_refnos, &[]).await {
+                Ok(descendants) if !descendants.is_empty() => {
+                    aabb_refnos.extend(descendants);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "[gen_model] 查询子孙节点失败，仅写根节点 inst_relate_aabb: {}",
+                        e
+                    );
+                }
+            };
+
+            if let Err(e) = crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
+                &aabb_refnos,
+                db_option.is_replace_mesh(),
+            )
+            .await
+            {
+                eprintln!("[gen_model] 写入 inst_relate_aabb 失败: {}", e);
+            } else {
+                println!(
+                    "[gen_model] 完成 inst_relate_aabb 写入，用时 {} ms",
+                    aabb_start.elapsed().as_millis()
                 );
             }
-        };
-
-        if let Err(e) = crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
-            &aabb_refnos,
-            db_option.is_replace_mesh(),
-        )
-        .await
-        {
-            eprintln!("[gen_model] 写入 inst_relate_aabb 失败: {}", e);
-        } else {
-            println!(
-                "[gen_model] 完成 inst_relate_aabb 写入，用时 {} ms",
-                aabb_start.elapsed().as_millis()
-            );
         }
 
-        // 运行 boolean worker 处理布尔运算
-        let bool_start = Instant::now();
-        println!("[gen_model] 开始布尔运算 worker");
-        
-        if let Err(e) = crate::fast_model::mesh_generate::run_boolean_worker(
-            Arc::new(db_option.inner.clone()),
-            100
-        ).await {
-            eprintln!("[gen_model] boolean worker 失败: {}", e);
-        } else {
+        if db_option.inner.apply_boolean_operation {
+            let bool_start = Instant::now();
+            println!("[gen_model] 开始布尔运算 worker");
+
+            // 缓存功能已禁用，直接使用 SurrealDB 路径
+            if use_surrealdb {
+                if let Err(e) = run_boolean_worker(Arc::new(db_option.inner.clone()), 100).await {
+                    eprintln!("[gen_model] boolean worker 失败: {}", e);
+                }
+            }
+
             println!(
                 "[gen_model] 完成布尔运算，用时 {} ms",
                 bool_start.elapsed().as_millis()
@@ -611,6 +638,8 @@ async fn process_full_database_generation(
     );
 
     let db_option_arc = Arc::new(db_option.clone());
+    let use_surrealdb = db_option.use_surrealdb;
+    // 缓存功能已禁用
     if dbnos.is_empty() {
         println!("[gen_model] 未找到需要生成的数据库，直接结束");
     }
@@ -661,8 +690,10 @@ async fn process_full_database_generation(
 
         let insert_task = tokio::task::spawn(async move {
             while let Ok(shape_insts) = receiver.recv_async().await {
-                if let Err(e) = save_instance_data_optimize(&shape_insts, false).await {
-                    eprintln!("保存实例数据失败: {}", e);
+                if use_surrealdb {
+                    if let Err(e) = save_instance_data_optimize(&shape_insts, false).await {
+                        eprintln!("保存实例数据失败: {}", e);
+                    }
                 }
                 // 同时写入 Parquet（如果启用）
                 if let Some(ref writer) = parquet_writer_clone {
@@ -700,15 +731,22 @@ async fn process_full_database_generation(
             let mesh_start = Instant::now();
             println!("[gen_model] -> 数据库 {} 开始生成三角网格", dbnum);
 
-            db_refnos
-                .execute_gen_inst_meshes(Some(db_option_arc.clone()))
-                .await;
+            let mut ran_primary = false;
+            // 缓存功能已禁用，直接使用 SurrealDB 路径
+            if use_surrealdb {
+                db_refnos
+                    .execute_gen_inst_meshes(Some(db_option_arc.clone()))
+                    .await;
+                ran_primary = true;
+            }
 
-            println!(
-                "[gen_model] -> 数据库 {} 三角网格生成完成，用时 {} ms",
-                dbnum,
-                mesh_start.elapsed().as_millis()
-            );
+            if ran_primary {
+                println!(
+                    "[gen_model] -> 数据库 {} 三角网格生成完成，用时 {} ms",
+                    dbnum,
+                    mesh_start.elapsed().as_millis()
+                );
+            }
         }
 
         println!(

@@ -93,6 +93,34 @@ pub struct DbOptionExt {
     /// 默认为 [PdmsMesh]
     #[serde(default)]
     pub mesh_formats: Vec<MeshFormat>,
+
+    /// 是否启用 SurrealDB 写入/扫库路径
+    #[serde(default = "default_true")]
+    pub use_surrealdb: bool,
+
+    /// 是否启用 foyer 缓存路径
+    #[serde(default = "default_true")]
+    pub use_cache: bool,
+
+    /// 是否双路径对比（主路径 + 副路径）
+    #[serde(default)]
+    pub dual_run_enabled: bool,
+
+    /// 双路径下主路径是否为缓存
+    #[serde(default = "default_true")]
+    pub foyer_primary: bool,
+
+    /// 副路径是否允许写入 SurrealDB
+    #[serde(default = "default_true")]
+    pub secondary_db_write: bool,
+
+    /// foyer 缓存目录（默认 output/instance_cache）
+    #[serde(default)]
+    pub foyer_cache_dir: Option<String>,
+
+    /// 副路径 mesh 输出目录（默认 output/meshes_shadow）
+    #[serde(default)]
+    pub secondary_mesh_dir: Option<String>,
 }
 
 impl Deref for DbOptionExt {
@@ -167,6 +195,22 @@ impl DbOptionExt {
                 // 也检查类别名称
                 || self.is_noun_category_enabled(noun))
     }
+
+    /// 获取 foyer 缓存目录，默认为 output/instance_cache
+    pub fn get_foyer_cache_dir(&self) -> std::path::PathBuf {
+        self.foyer_cache_dir
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("output/instance_cache"))
+    }
+
+    /// 获取副路径 mesh 输出目录，默认为 output/meshes_shadow
+    pub fn get_secondary_mesh_dir(&self) -> std::path::PathBuf {
+        self.secondary_mesh_dir
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("output/meshes_shadow"))
+    }
 }
 
 impl From<DbOption> for DbOptionExt {
@@ -187,6 +231,13 @@ impl From<DbOption> for DbOptionExt {
             full_noun_excluded_nouns: Vec::new(),
             debug_limit_per_noun: None,
             mesh_formats: vec![MeshFormat::PdmsMesh],
+            use_surrealdb: true,
+            use_cache: true,
+            dual_run_enabled: false,
+            foyer_primary: true,
+            secondary_db_write: true,
+            foyer_cache_dir: None,
+            secondary_mesh_dir: None,
         }
     }
 }
@@ -296,6 +347,42 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         })
         .unwrap_or_else(|| vec![MeshFormat::PdmsMesh]);
 
+    // 解析缓存/双路径配置
+    let use_surrealdb = toml_value
+        .get("use_surrealdb")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let use_cache = toml_value
+        .get("use_cache")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let dual_run_enabled = toml_value
+        .get("dual_run_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let foyer_primary = toml_value
+        .get("foyer_primary")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let secondary_db_write = toml_value
+        .get("secondary_db_write")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let foyer_cache_dir = toml_value
+        .get("foyer_cache_dir")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let secondary_mesh_dir = toml_value
+        .get("secondary_mesh_dir")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     // 构建 DbOptionExt
     let db_option_ext = DbOptionExt {
         inner: db_option,
@@ -313,6 +400,13 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         full_noun_excluded_nouns,
         debug_limit_per_noun,
         mesh_formats,
+        use_surrealdb,
+        use_cache,
+        dual_run_enabled,
+        foyer_primary,
+        secondary_db_write,
+        foyer_cache_dir,
+        secondary_mesh_dir,
     };
 
     // 打印加载的配置

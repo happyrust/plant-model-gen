@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-01-28
+
+### Fixed
+
+- **修复 `--export-obj` + `--regen-model` 时包含子孙节点导致的布尔结果缺失**
+  - 问题：导出默认包含子孙节点；但 regen 仅重建根节点，`replace_mesh` 会清理旧 ngmr/neg 关系，导致导出阶段回退到“未布尔”的正实体 mesh
+  - 修复：当导出配置包含子孙节点时，regen 前先查询并合并子孙节点，确保“清理范围 == 重建范围”
+  - 修改位置：`src/cli_modes.rs`
+
 ## 2026-01-22
 
 ### Changed

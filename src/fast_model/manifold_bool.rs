@@ -16,7 +16,11 @@ use aios_core::{
     query_geom_mesh_data, query_negative_entities_batch,
 };
 use aios_core::{RefnoEnum, SUL_DB, utils::RecordIdExt};
+use aios_core::geometry::{EleGeosInfo, EleInstGeosData, GeoBasicType};
+use aios_core::geometry::csg::UNIT_MESH_SCALE;
+use crate::fast_model::instance_cache::InstanceCacheManager;
 use glam::DMat4;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
@@ -888,4 +892,319 @@ pub async fn apply_insts_boolean_manifold(
     }
 
     Ok(())
+}
+
+/// 基于 foyer 缓存的布尔运算（不访问 SurrealDB）
+pub async fn run_boolean_worker_from_cache_manager(
+    cache_manager: &InstanceCacheManager,
+) -> anyhow::Result<usize> {
+    fn aabb_contains(
+        outer: &parry3d::bounding_volume::Aabb,
+        inner: &parry3d::bounding_volume::Aabb,
+    ) -> bool {
+        outer.mins.x <= inner.mins.x
+            && outer.mins.y <= inner.mins.y
+            && outer.mins.z <= inner.mins.z
+            && outer.maxs.x >= inner.maxs.x
+            && outer.maxs.y >= inner.maxs.y
+            && outer.maxs.z >= inner.maxs.z
+    }
+
+    fn aabb_intersects(a: &parry3d::bounding_volume::Aabb, b: &parry3d::bounding_volume::Aabb) -> bool {
+        !(a.maxs.x < b.mins.x
+            || a.mins.x > b.maxs.x
+            || a.maxs.y < b.mins.y
+            || a.mins.y > b.maxs.y
+            || a.maxs.z < b.mins.z
+            || a.mins.z > b.maxs.z)
+    }
+
+    fn is_pos_geo_for_boolean(t: &GeoBasicType) -> bool {
+        // cache bool_worker 应对齐导出语义：正实体=可见的 Pos/Compound（以及可能出现的 DesiPos/CatePos）
+        matches!(
+            t,
+            &GeoBasicType::Pos
+                | &GeoBasicType::Compound
+                | &GeoBasicType::DesiPos
+                | &GeoBasicType::CatePos
+        )
+    }
+
+    fn local_mat_for_inst(inst: &aios_core::geometry::EleInstGeo) -> DMat4 {
+        // inst.transform 是 carrier 局部坐标；unit mesh 需按约定缩放修正。
+        let mut tf = inst.transform;
+        if inst.unit_flag {
+            tf.scale /= UNIT_MESH_SCALE;
+        }
+        tf.to_matrix().as_dmat4()
+    }
+
+    fn world_mat_for_info(info: &EleGeosInfo) -> DMat4 {
+        info.world_transform.to_matrix().as_dmat4()
+    }
+
+    fn diff_with_guards(
+        mut pos_union: ManifoldRust,
+        negs: &[ManifoldRust],
+        refno: RefnoEnum,
+        label: &str,
+    ) -> ManifoldRust {
+        if negs.is_empty() {
+            return pos_union;
+        }
+
+        for (i, neg) in negs.iter().enumerate() {
+            if pos_union.get_mesh().indices.is_empty() {
+                break;
+            }
+
+            let before = pos_union.clone();
+            let before_aabb = before.get_mesh().cal_aabb();
+            let neg_aabb = neg.get_mesh().cal_aabb();
+
+            let mut after = before.clone();
+            after.inner = after.inner.difference(&neg.inner);
+
+            if after.get_mesh().indices.is_empty() {
+                match (&before_aabb, &neg_aabb) {
+                    (Some(before_aabb), Some(neg_aabb)) => {
+                        let intersects = aabb_intersects(before_aabb, neg_aabb);
+                        let contains = aabb_contains(neg_aabb, before_aabb);
+                        // 经验：差集结果被异常清空时，跳过该负实体，避免“整块消失”。
+                        if !intersects || !contains {
+                            eprintln!(
+                                "[bool][cache] ⚠️({}) 差集结果被异常清空，跳过该负实体: refno={} neg_idx={} intersects={} contains={}",
+                                label, refno, i, intersects, contains
+                            );
+                            pos_union = before;
+                            continue;
+                        }
+                    }
+                    _ => {
+                        eprintln!(
+                            "[bool][cache] ⚠️({}) 差集结果被清空且无法计算 AABB，跳过该负实体: refno={} neg_idx={}",
+                            label, refno, i
+                        );
+                        pos_union = before;
+                        continue;
+                    }
+                }
+            }
+
+            pos_union = after;
+        }
+
+        // 兜底：若逐个 subtract 仍退化为空，尝试 union-neg 再做差（某些情况下更稳定）
+        if pos_union.get_mesh().indices.is_empty() {
+            let neg_union = ManifoldRust::batch_boolean(negs, aios_core::csg::manifold::ManifoldOpType::Union);
+            let mut union_diff = pos_union.clone();
+            union_diff.inner = union_diff.inner.difference(&neg_union.inner);
+            if !union_diff.get_mesh().indices.is_empty() {
+                return union_diff;
+            }
+        }
+
+        pos_union
+    }
+
+    let dbnums = cache_manager.list_dbnums();
+    if dbnums.is_empty() {
+        println!("[boolean_worker_cache] 缓存为空，跳过布尔运算");
+        return Ok(0);
+    }
+
+    let mut inst_info_map: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
+    let mut inst_geos_map: HashMap<String, EleInstGeosData> = HashMap::new();
+    let mut neg_relate_map: HashMap<RefnoEnum, Vec<RefnoEnum>> = HashMap::new();
+    let mut ngmr_relate_map: HashMap<RefnoEnum, Vec<(RefnoEnum, RefnoEnum)>> = HashMap::new();
+
+    for dbnum in dbnums {
+        let batch_ids = cache_manager.list_batches(dbnum);
+        for batch_id in batch_ids {
+            if let Some(batch) = cache_manager.get(dbnum, &batch_id).await {
+                for (k, v) in batch.inst_info_map {
+                    inst_info_map.insert(k, v);
+                }
+                for (k, v) in batch.inst_geos_map {
+                    inst_geos_map
+                        .entry(k)
+                        .and_modify(|existing| {
+                            existing.insts.extend(v.insts.clone());
+                            if existing.aabb.is_none() {
+                                existing.aabb = v.aabb.clone();
+                            }
+                            if existing.type_name.is_empty() {
+                                existing.type_name = v.type_name.clone();
+                            }
+                        })
+                        .or_insert(v);
+                }
+                for (k, v) in batch.neg_relate_map {
+                    neg_relate_map.entry(k).or_default().extend(v);
+                }
+                for (k, v) in batch.ngmr_neg_relate_map {
+                    ngmr_relate_map.entry(k).or_default().extend(v);
+                }
+            }
+        }
+    }
+
+    let mut processed = 0usize;
+    // 以关系表语义为准：仅对“被关系指向的目标正实体”执行布尔。
+    let mut targets: HashSet<RefnoEnum> = HashSet::new();
+    targets.extend(neg_relate_map.keys().copied());
+    targets.extend(ngmr_relate_map.keys().copied());
+
+    for refno in targets {
+        let Some(info) = inst_info_map.get(&refno) else {
+            continue;
+        };
+        let inst_key = info.get_inst_key();
+        let Some(inst_geos) = inst_geos_map.get(&inst_key) else {
+            continue;
+        };
+
+        let pos_world_mat = world_mat_for_info(info);
+        let inverse_pos_world = pos_world_mat.inverse();
+
+        // 正实体：使用局部变换（pos local space）加载
+        let mut pos_manifolds = Vec::new();
+        for inst in &inst_geos.insts {
+            if !is_pos_geo_for_boolean(&inst.geo_type) {
+                continue;
+            }
+            let mesh_id = inst.geo_hash.to_string();
+            let mat = local_mat_for_inst(inst);
+            match load_manifold(&mesh_id, mat, false) {
+                Ok(m) => pos_manifolds.push(m),
+                Err(e) => log_load_manifold_failed("cache_pos", refno, &mesh_id, &e),
+            }
+        }
+        if pos_manifolds.is_empty() {
+            continue;
+        }
+
+        // 负实体：通过关系表（neg_relate/ngmr_relate）定位切割几何，并转换到 pos local space
+        let mut neg_manifolds: Vec<ManifoldRust> = Vec::new();
+
+        if let Some(carriers) = neg_relate_map.get(&refno) {
+            let mut uniq_carriers: HashSet<RefnoEnum> = HashSet::new();
+            uniq_carriers.extend(carriers.iter().copied());
+            for carrier_refno in uniq_carriers {
+                let Some(carrier_info) = inst_info_map.get(&carrier_refno) else {
+                    continue;
+                };
+                let carrier_key = carrier_info.get_inst_key();
+                let Some(carrier_geos) = inst_geos_map.get(&carrier_key) else {
+                    continue;
+                };
+                let carrier_world_mat = world_mat_for_info(carrier_info);
+
+                for inst in &carrier_geos.insts {
+                    if inst.geo_type != GeoBasicType::Neg {
+                        continue;
+                    }
+                    let mesh_id = inst.geo_hash.to_string();
+                    let neg_world_mat = carrier_world_mat * local_mat_for_inst(inst);
+                    let relative_mat = inverse_pos_world * neg_world_mat;
+                    match load_manifold(&mesh_id, relative_mat, true) {
+                        Ok(m) => neg_manifolds.push(m),
+                        Err(e) => log_load_manifold_failed("cache_neg", refno, &mesh_id, &e),
+                    }
+                }
+            }
+        }
+
+        if let Some(pairs) = ngmr_relate_map.get(&refno) {
+            let mut uniq_pairs: HashSet<(RefnoEnum, RefnoEnum)> = HashSet::new();
+            uniq_pairs.extend(pairs.iter().copied());
+            for (carrier_refno, ngmr_geom_refno) in uniq_pairs {
+                let Some(carrier_info) = inst_info_map.get(&carrier_refno) else {
+                    continue;
+                };
+                let carrier_key = carrier_info.get_inst_key();
+                let Some(carrier_geos) = inst_geos_map.get(&carrier_key) else {
+                    continue;
+                };
+                let carrier_world_mat = world_mat_for_info(carrier_info);
+
+                for inst in &carrier_geos.insts {
+                    if inst.geo_type != GeoBasicType::CataCrossNeg {
+                        continue;
+                    }
+                    // CataCrossNeg 在缓存中按 geom_refno（即 ngmr_geom_refno）区分
+                    if inst.refno != ngmr_geom_refno {
+                        continue;
+                    }
+                    let mesh_id = inst.geo_hash.to_string();
+                    let neg_world_mat = carrier_world_mat * local_mat_for_inst(inst);
+                    let relative_mat = inverse_pos_world * neg_world_mat;
+                    match load_manifold(&mesh_id, relative_mat, true) {
+                        Ok(m) => neg_manifolds.push(m),
+                        Err(e) => log_load_manifold_failed("cache_ngmr", refno, &mesh_id, &e),
+                    }
+                }
+            }
+        }
+
+        if neg_manifolds.is_empty() {
+            continue;
+        }
+
+        let pos_union = ManifoldRust::batch_boolean(
+            &pos_manifolds,
+            aios_core::csg::manifold::ManifoldOpType::Union,
+        );
+        let mut final_manifold = diff_with_guards(pos_union, &neg_manifolds, refno, "lo");
+
+        // 经验：退化为空时尝试高精度重算一次
+        if final_manifold.get_mesh().indices.is_empty() {
+            let mut pos_hi = Vec::new();
+            for inst in &inst_geos.insts {
+                if !is_pos_geo_for_boolean(&inst.geo_type) {
+                    continue;
+                }
+                let mesh_id = inst.geo_hash.to_string();
+                let mat = local_mat_for_inst(inst);
+                match load_manifold(&mesh_id, mat, true) {
+                    Ok(m) => pos_hi.push(m),
+                    Err(e) => log_load_manifold_failed("cache_pos_hi", refno, &mesh_id, &e),
+                }
+            }
+            if !pos_hi.is_empty() {
+                let pos_union_hi = ManifoldRust::batch_boolean(
+                    &pos_hi,
+                    aios_core::csg::manifold::ManifoldOpType::Union,
+                );
+                final_manifold = diff_with_guards(pos_union_hi, &neg_manifolds, refno, "hi");
+            }
+        }
+
+        if final_manifold.get_mesh().indices.is_empty() {
+            eprintln!("[boolean_worker_cache] 结果为空，跳过输出: refno={}", refno);
+            continue;
+        }
+
+        let mesh_id = refno.to_string();
+        let target_path = boolean_glb_path(&mesh_id);
+        ensure_parent_dir(&target_path)?;
+        if let Err(e) = final_manifold.export_to_glb(&target_path) {
+            eprintln!(
+                "[boolean_worker_cache] 导出失败: refno={} err={}",
+                refno, e
+            );
+            continue;
+        }
+
+        processed += 1;
+    }
+
+    println!("[boolean_worker_cache] 布尔运算完成: {} 个", processed);
+    Ok(processed)
+}
+
+/// 基于 foyer 缓存的布尔运算（不访问 SurrealDB）
+pub async fn run_boolean_worker_from_cache(cache_dir: &Path) -> anyhow::Result<usize> {
+    let cache_manager = InstanceCacheManager::new(cache_dir).await?;
+    run_boolean_worker_from_cache_manager(&cache_manager).await
 }

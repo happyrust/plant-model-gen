@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-01-29
+
+### Fixed
+
+- **修复 foyer cache 布尔运算结果错误（漏切/错切/退化）**
+  - 问题：`run_boolean_worker_from_cache_manager` 仅按同一实例自身的 `GeoBasicType::Neg/CataNeg/CataCrossNeg` 做差集，未使用缓存中的 `neg_relate_map/ngmr_neg_relate_map` 关系语义，且在 world 坐标直接做布尔，导致结果不稳定/不符合预期
+  - 修复：以 `neg_relate_map/ngmr_neg_relate_map` 为真源构建切割目标；负实体按 `inverse(pos_world) * neg_world` 映射到正实体局部坐标系执行；加入逐个 subtract 的退化保护与高精度重算兜底
+  - 修改位置：`src/fast_model/manifold_bool.rs`
+
 ## 2026-01-28
 
 ### Fixed

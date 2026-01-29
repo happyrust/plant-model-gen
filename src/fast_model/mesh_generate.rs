@@ -17,7 +17,6 @@ use crate::{batch_update_err, db_err, deser_err, log_err, query_err};
 use aios_core::accel_tree::acceleration_tree::RStarBoundingBox;
 use aios_core::error::{init_deserialize_error, init_query_error, init_save_database_error};
 use aios_core::geometry::csg::GeneratedMesh;
-use aios_core::mesh_precision::LodMeshSettings;
 use aios_core::mesh_precision::MeshPrecisionSettings;
 use aios_core::options::DbOption;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
@@ -59,96 +58,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aios_core::geometry::csg::generate_csg_mesh;
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct MeshSignatureV1 {
-    /// 签名结构版本；当签名字段变化时递增，用于强制失效旧缓存。
-    version: u32,
-    lod: String,
-    geo_type: String,
-    non_scalable_geo: bool,
-
-    radial_segments: u16,
-    height_segments: u16,
-    cap_segments: u16,
-
-    min_radial_segments: u16,
-    max_radial_segments: Option<u16>,
-    min_height_segments: u16,
-    max_height_segments: Option<u16>,
-
-    /// error_tolerance（量化：*1_000_000）
-    error_tolerance_u: i64,
-    /// target_segment_length（量化：*1_000_000）
-    target_segment_length_u: Option<i64>,
-    /// non_scalable_factor（量化：*1_000_000）
-    non_scalable_factor_u: i64,
-}
-
-impl MeshSignatureV1 {
-    // v2: sweep/loft 闭合路径 ring 拓扑修复（末尾重复 ring 丢弃 + 环向连接）
-    // v3: sweep frame 改为 rotation-minimizing（确保 rot.z 与 tangent 一致，修复 WALL 截面扭转/翻面）
-    // v4: 带 CURVE 的 SPINE 不再单位化（PrimLoft 直接使用真实圆弧/路径几何），网格应强制重建
-    // v5: `--regen-model` 强制重建 mesh（不走 mesh_sig skip），并验证闭环接缝缺口修复是否生效
-    // v6: 移除“单位几何动态精度（按实例缩放提升细分）”，回归静态 LOD 配置
-    const VERSION: u32 = 6;
-
-    fn quant(v: f32, scale: f32) -> i64 {
-        if !v.is_finite() {
-            return 0;
-        }
-        (v as f64 * scale as f64).round() as i64
-    }
-
-    fn from_settings(
-        lod: &str,
-        geo_type: &str,
-        non_scalable_geo: bool,
-        settings: &LodMeshSettings,
-    ) -> Self {
-        Self {
-            version: Self::VERSION,
-            lod: lod.to_string(),
-            geo_type: geo_type.to_string(),
-            non_scalable_geo,
-
-            radial_segments: settings.radial_segments,
-            height_segments: settings.height_segments,
-            cap_segments: settings.cap_segments,
-
-            min_radial_segments: settings.min_radial_segments,
-            max_radial_segments: settings.max_radial_segments,
-            min_height_segments: settings.min_height_segments,
-            max_height_segments: settings.max_height_segments,
-
-            error_tolerance_u: Self::quant(settings.error_tolerance, 1_000_000.0),
-            target_segment_length_u: settings
-                .target_segment_length
-                .map(|v| Self::quant(v, 1_000_000.0)),
-            non_scalable_factor_u: Self::quant(settings.non_scalable_factor, 1_000_000.0),
-        }
-    }
-}
-
-fn mesh_signature_path(dir: &Path, mesh_filename: &str) -> PathBuf {
-    // e.g. 2_L1.mesh_sig.json；避免与 .glb/.obj 扩展冲突
-    dir.join(mesh_filename).with_extension("mesh_sig.json")
-}
-
-fn load_mesh_signature(path: &Path) -> Option<MeshSignatureV1> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-fn save_mesh_signature(path: &Path, sig: &MeshSignatureV1) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let text = serde_json::to_string(sig)?;
-    std::fs::write(path, text)?;
-    Ok(())
-}
 
 /// 在数据库中生成网格模型并更新包围盒
 ///
@@ -583,6 +493,128 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
     );
     
     Ok(())
+}
+
+/// 基于 foyer 缓存的 Mesh 生成 Worker（不访问 SurrealDB）
+pub async fn run_mesh_worker_from_cache_manager(
+    cache_manager: &crate::fast_model::instance_cache::InstanceCacheManager,
+    mesh_dir: &Path,
+    precision: &MeshPrecisionSettings,
+    mesh_formats: &[MeshFormat],
+) -> anyhow::Result<usize> {
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+
+    if !mesh_dir.exists() {
+        std::fs::create_dir_all(mesh_dir)?;
+    }
+
+    let dbnums = cache_manager.list_dbnums();
+    if dbnums.is_empty() {
+        println!("[mesh_worker_cache] 缓存为空，跳过 Mesh 生成");
+        return Ok(0);
+    }
+
+    let mut unique_geo: HashMap<u64, (PdmsGeoParam, bool)> = HashMap::new();
+
+    for dbnum in dbnums {
+        let batch_ids = cache_manager.list_batches(dbnum);
+        for batch_id in batch_ids {
+            if let Some(batch) = cache_manager.get(dbnum, &batch_id).await {
+                for geos_data in batch.inst_geos_map.values() {
+                    for inst in &geos_data.insts {
+                        unique_geo.entry(inst.geo_hash).or_insert_with(|| {
+                            (inst.geo_param.clone(), inst.unit_flag)
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if unique_geo.is_empty() {
+        println!("[mesh_worker_cache] 缓存中未找到几何参数，跳过 Mesh 生成");
+        return Ok(0);
+    }
+
+    let lod_dir = mesh_dir.join(format!("lod_{:?}", precision.default_lod));
+    if !lod_dir.exists() {
+        std::fs::create_dir_all(&lod_dir)?;
+    }
+
+    let mut processed = 0usize;
+    let mut seen: HashSet<u64> = HashSet::new();
+    for (geo_hash, (geo_param, unit_flag)) in unique_geo {
+        if !seen.insert(geo_hash) {
+            continue;
+        }
+        let mesh_id = geo_hash.to_string();
+        let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
+        let glb_path = lod_dir.join(&mesh_filename).with_extension("glb");
+        if glb_path.exists() {
+            continue;
+        }
+
+        let geo_type_name = geo_param.type_name();
+        let profile = precision.profile_for_geo(geo_type_name);
+        let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
+        let lod_settings = profile.csg_settings;
+
+        match generate_csg_mesh(&geo_param, &lod_settings, non_scalable_geo, false, None) {
+            Some(csg_mesh) => {
+                let mesh_base_path = lod_dir.join(&mesh_filename);
+                let glb_path = mesh_base_path.with_extension("glb");
+                if let Err(e) = export_single_mesh_to_glb(&csg_mesh.mesh, &glb_path) {
+                    debug_model_warn!(
+                        "[mesh_worker_cache] 生成 GLB 失败: {} - {}",
+                        mesh_id,
+                        e
+                    );
+                    continue;
+                }
+                if mesh_formats.contains(&MeshFormat::Obj) {
+                    let obj_path = mesh_base_path.with_extension("obj");
+                    if let Err(e) = csg_mesh.mesh.export_obj(false, obj_path.to_str().unwrap()) {
+                        debug_model_warn!(
+                            "[mesh_worker_cache] 生成 OBJ 失败: {} - {}",
+                            mesh_id,
+                            e
+                        );
+                    }
+                }
+                if unit_flag {
+                    // unit mesh 不影响几何生成，只记录日志便于排查
+                    debug_model_debug!("[mesh_worker_cache] unit mesh: {}", mesh_id);
+                }
+                processed += 1;
+            }
+            None => {
+                debug_model_warn!(
+                    "[mesh_worker_cache] CSG mesh 返回 None: {} ({})",
+                    mesh_id,
+                    geo_type_name
+                );
+            }
+        }
+    }
+
+    println!(
+        "[mesh_worker_cache] Mesh 生成完成: {} 个",
+        processed
+    );
+    Ok(processed)
+}
+
+/// 基于 foyer 缓存的 Mesh 生成 Worker（不访问 SurrealDB）
+pub async fn run_mesh_worker_from_cache(
+    cache_dir: &Path,
+    mesh_dir: &Path,
+    precision: &MeshPrecisionSettings,
+    mesh_formats: &[MeshFormat],
+) -> anyhow::Result<usize> {
+    use crate::fast_model::instance_cache::InstanceCacheManager;
+    let cache_manager = InstanceCacheManager::new(cache_dir).await?;
+    run_mesh_worker_from_cache_manager(&cache_manager, mesh_dir, precision, mesh_formats).await
 }
 
 /// 基于 inst_relate 状态的布尔运算 Worker
@@ -1023,36 +1055,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
         // 不需要 refno
         let mut lod_settings = profile.csg_settings;
 
-        let lod_str = format!("{:?}", precision.default_lod);
         let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
-        let glb_path = lod_dir.join(&mesh_filename).with_extension("glb");
-        let sig_path = mesh_signature_path(&lod_dir, &mesh_filename);
-        let sig = MeshSignatureV1::from_settings(
-            &lod_str,
-            geo_type_name,
-            non_scalable_geo,
-            &lod_settings,
-        );
-
-        // 若签名一致，则跳过重建（避免 replace_exist=true 时全量重算带来性能开销）。
-        //
-        // 但当用户显式要求强制重建（例如 CLI `--regen-model`），应跳过缓存直接重算，
-        // 以便快速验证代码/配置变更对 mesh 的影响。
-        let force_regen = std::env::var("FORCE_REGEN_MESH")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if !force_regen && glb_path.exists() {
-            if let Some(old_sig) = load_mesh_signature(&sig_path) {
-                if old_sig == sig {
-                    debug_model_debug!(
-                        "[mesh_sig] skip mesh_id={} (lod={})",
-                        mesh_id,
-                        lod_str
-                    );
-                    continue;
-                }
-            }
-        }
 
         match generate_csg_mesh(&g.param, &lod_settings, non_scalable_geo, false, None) {
             Some(csg_mesh) => {
@@ -1072,12 +1075,6 @@ pub async fn gen_inst_meshes_by_geo_ids(
                     debug_model_warn!("CSG mesh 生成失败 for {}: {}", mesh_id, e);
                     // 设置 bad=true 和 meshed=true 避免重复处理
                     update_sql.push_str(&format!("UPDATE inst_geo:⟨{}⟩ SET bad=true, meshed=true;", mesh_id));
-                } else if let Err(e) = save_mesh_signature(&sig_path, &sig) {
-                    debug_model_warn!(
-                        "[mesh_sig] 写入签名失败: {} - {}",
-                        sig_path.display(),
-                        e
-                    );
                 }
             }
             None => {
@@ -1254,32 +1251,7 @@ pub async fn gen_inst_meshes(
                         // 统一使用 CSG 方式生成网格
                         let mut lod_settings = profile.csg_settings;
 
-                        let lod_str = format!("{:?}", precision.default_lod);
                         let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
-                        let glb_path = dir.join(&mesh_filename).with_extension("glb");
-                        let sig_path = mesh_signature_path(&dir, &mesh_filename);
-                        let sig = MeshSignatureV1::from_settings(
-                            &lod_str,
-                            geo_type_name,
-                            non_scalable_geo,
-                            &lod_settings,
-                        );
-
-                        let force_regen = std::env::var("FORCE_REGEN_MESH")
-                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                            .unwrap_or(false);
-                        if !force_regen && glb_path.exists() {
-                            if let Some(old_sig) = load_mesh_signature(&sig_path) {
-                                if old_sig == sig {
-                                    debug_model_debug!(
-                                        "[mesh_sig] skip mesh_id={} (lod={})",
-                                        mesh_id,
-                                        lod_str
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
 
                         match generate_csg_mesh(
                             &g.param,
@@ -1312,12 +1284,6 @@ pub async fn gen_inst_meshes(
                                         "update inst_geo:⟨{}⟩ set bad=true;",
                                         mesh_id
                                     ));
-                                } else if let Err(e) = save_mesh_signature(&sig_path, &sig) {
-                                    debug_model_warn!(
-                                        "[mesh_sig] 写入签名失败: {} - {}",
-                                        sig_path.display(),
-                                        e
-                                    );
                                 }
                             }
                             None => {

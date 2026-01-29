@@ -9,6 +9,7 @@ pub mod collision_api;
 pub mod pipeline_annotation_api;
 pub mod scene_tree_api;
 pub mod export_api;
+pub mod search_api;
 
 pub use noun_hierarchy_api::{NounHierarchyApiState, create_noun_hierarchy_routes};
 pub use spatial_query_api::{SpatialQueryApiState, create_spatial_query_routes};
@@ -21,6 +22,7 @@ pub use collision_api::{CollisionApiState, create_collision_routes};
 pub use pipeline_annotation_api::create_pipeline_annotation_routes;
 pub use scene_tree_api::create_scene_tree_routes;
 pub use export_api::create_export_api_routes;
+pub use search_api::{SearchApiState, create_search_routes};
 pub mod review_integration;
 pub use review_integration::create_review_integration_routes;
 pub mod model_center_client;

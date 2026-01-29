@@ -11,7 +11,7 @@ use std::io::Write;
 use super::export_common::{ExportData, collect_export_data};
 use super::model_exporter::{
     CommonExportConfig, ExportStats, ModelExporter, ObjExportConfig, collect_export_refnos,
-    query_geometry_instances_ext,
+    query_geometry_instances_ext, query_geometry_instances_ext_from_cache,
 };
 
 fn mesh_has_invalid_normals(mesh: &PlantMesh) -> bool {
@@ -226,9 +226,23 @@ pub async fn prepare_obj_export(
 
     stats.descendant_count = all_refnos.len().saturating_sub(refnos.len());
 
-    let geom_insts =
+    let geom_insts = if config.allow_surrealdb {
         query_geometry_instances_ext(&all_refnos, true, config.include_negative, config.verbose)
-            .await?;
+            .await?
+    } else {
+        let cache_dir = config
+            .cache_dir
+            .as_ref()
+            .context("allow_surrealdb=false 时必须提供 CommonExportConfig.cache_dir")?;
+        query_geometry_instances_ext_from_cache(
+            &all_refnos,
+            cache_dir,
+            true,
+            config.include_negative,
+            config.verbose,
+        )
+        .await?
+    };
 
     let export_data =
         collect_export_data(geom_insts, &all_refnos, &effective_mesh_dir, config.verbose, None)
@@ -293,6 +307,8 @@ pub async fn export_obj_for_refnos(
         unit_converter: UnitConverter::default(),
         use_basic_materials: false,
         include_negative: false,
+        allow_surrealdb: true,
+        cache_dir: None,
     };
 
     let PreparedObjExport { mesh, mut stats } =

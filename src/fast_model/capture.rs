@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use aios_core::options::DbOption;
 use aios_core::shape::pdms_shape::PlantMesh;
 use aios_core::{NamedAttrValue, RefnoEnum, get_named_attmap};
 use anyhow::{Context, Result, anyhow};
@@ -17,6 +16,7 @@ use crate::fast_model::export_model::export_obj::{
 };
 use crate::fast_model::model_exporter::CommonExportConfig;
 use crate::fast_model::unit_converter::UnitConverter;
+use crate::options::DbOptionExt;
 
 #[derive(Debug, Clone)]
 pub struct CaptureConfig {
@@ -70,14 +70,14 @@ fn current_config() -> Option<CaptureConfig> {
     CAPTURE_CONFIG.lock().unwrap().clone()
 }
 
-pub async fn capture_refnos_if_enabled(refnos: &[RefnoEnum], db_option: &DbOption) -> Result<()> {
+pub async fn capture_refnos_if_enabled(refnos: &[RefnoEnum], db_option: &DbOptionExt) -> Result<()> {
     if !capture_enabled() || refnos.is_empty() {
         return Ok(());
     }
     capture_refnos(refnos, db_option).await
 }
 
-pub async fn capture_refnos(refnos: &[RefnoEnum], db_option: &DbOption) -> Result<()> {
+pub async fn capture_refnos(refnos: &[RefnoEnum], db_option: &DbOptionExt) -> Result<()> {
     let config = match current_config() {
         Some(cfg) => cfg,
         None => return Ok(()),
@@ -88,6 +88,20 @@ pub async fn capture_refnos(refnos: &[RefnoEnum], db_option: &DbOption) -> Resul
     // 这里将截图流程放到一个更大栈的专用线程中执行，保证截图/对比链路可用。
     let mesh_dir = db_option.get_meshes_path().to_path_buf();
     let refnos_vec: Vec<RefnoEnum> = refnos.to_vec();
+
+    // 截图链路复用 OBJ 导出数据源策略：默认 cache-only；如需 SurrealDB，需显式开关。
+    let allow_surrealdb = db_option.use_surrealdb;
+    let cache_dir: Option<PathBuf> = if allow_surrealdb {
+        None
+    } else if db_option.use_cache {
+        Some(db_option.get_foyer_cache_dir())
+    } else {
+        None
+    };
+    if !allow_surrealdb && cache_dir.is_none() {
+        return Err(anyhow!("截图/OBJ 导出默认关闭 SurrealDB，但当前配置未启用 use_cache"));
+    }
+
     let handle = tokio::runtime::Handle::current();
 
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -98,7 +112,9 @@ pub async fn capture_refnos(refnos: &[RefnoEnum], db_option: &DbOption) -> Resul
             .spawn(move || {
                 handle.block_on(async move {
                     for refno in refnos_vec {
-                        if let Err(err) = capture_single(refno, &mesh_dir, &config).await {
+                        if let Err(err) =
+                            capture_single(refno, &mesh_dir, &config, allow_surrealdb, cache_dir.clone()).await
+                        {
                             eprintln!("[capture] 捕获参考号 {} 截图失败: {}", refno, err);
                         }
                     }
@@ -116,7 +132,13 @@ pub async fn capture_refnos(refnos: &[RefnoEnum], db_option: &DbOption) -> Resul
     Ok(())
 }
 
-async fn capture_single(refno: RefnoEnum, mesh_dir: &Path, config: &CaptureConfig) -> Result<()> {
+async fn capture_single(
+    refno: RefnoEnum,
+    mesh_dir: &Path,
+    config: &CaptureConfig,
+    allow_surrealdb: bool,
+    cache_dir: Option<PathBuf>,
+) -> Result<()> {
     let refno_str = refno.to_string().replace('/', "_");
     let basename = resolve_capture_basename(refno).await;
 
@@ -138,6 +160,8 @@ async fn capture_single(refno: RefnoEnum, mesh_dir: &Path, config: &CaptureConfi
         unit_converter: UnitConverter::default(),
         use_basic_materials: false,
         include_negative: false,
+        allow_surrealdb,
+        cache_dir,
     };
 
     let mut prepared = prepare_obj_export(&[refno], mesh_dir, &common_config).await?;

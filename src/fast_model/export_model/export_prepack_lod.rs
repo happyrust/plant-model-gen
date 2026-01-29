@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -40,6 +40,7 @@ use crate::fast_model::export_model::model_exporter::{
     CommonExportConfig, ExportStats, GlbExportConfig, ModelExporter, collect_export_refnos,
     query_geometry_instances,
 };
+use crate::fast_model::instance_cache::InstanceCacheManager;
 use crate::fast_model::gen_model::tree_index_manager::{
     ensure_tree_index_exists, load_index_with_large_stack, TreeIndexManager,
 };
@@ -2771,6 +2772,602 @@ pub async fn export_dbnum_instances_json(
     };
 
     Ok(stats)
+}
+
+/// 导出指定 dbnum 的实例数据（基于 foyer 缓存）
+///
+/// 返回 (ExportStats, trans_count, aabb_count)
+pub async fn export_dbnum_instances_json_from_cache(
+    dbnum: u32,
+    output_dir: &Path,
+    cache_dir: &Path,
+    mesh_dir: Option<&Path>,
+    mesh_lod_tag: Option<&str>,
+    verbose: bool,
+    target_unit: Option<LengthUnit>,
+) -> Result<(ExportStats, usize, usize)> {
+    use aios_core::geometry::{EleGeosInfo, EleInstGeosData};
+    use aios_core::types::PlantAabb;
+    use bevy_transform::prelude::Transform;
+    use crate::fast_model::shared;
+    use parry3d::bounding_volume::BoundingVolume;
+    use parry3d::math::Point;
+
+    let start_time = std::time::Instant::now();
+    let target = target_unit.unwrap_or(LengthUnit::Millimeter);
+    let unit_converter = UnitConverter::new(LengthUnit::Millimeter, target);
+
+    if verbose {
+        println!(
+            "🚀 使用缓存导出 dbnum={} 的实例数据，目标单位: {:?}",
+            dbnum, target
+        );
+        println!("   - 缓存目录: {}", cache_dir.display());
+    }
+
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
+
+    let cache_manager = InstanceCacheManager::new(cache_dir).await?;
+    let batch_ids = cache_manager.list_batches(dbnum);
+    if batch_ids.is_empty() {
+        return Err(anyhow::anyhow!(
+            "缓存中未找到 dbnum={} 的批次数据（请先生成模型并写入缓存）",
+            dbnum
+        ));
+    }
+
+    let mut inst_info_map: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
+    let mut inst_tubi_map: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
+    let mut inst_geos_map: HashMap<String, EleInstGeosData> = HashMap::new();
+    let mut neg_relate_map: HashMap<RefnoEnum, Vec<RefnoEnum>> = HashMap::new();
+    let mut ngmr_neg_relate_map: HashMap<RefnoEnum, Vec<(RefnoEnum, RefnoEnum)>> =
+        HashMap::new();
+
+    let mut hit_batches = 0usize;
+    let mut miss_batches = 0usize;
+    for batch_id in batch_ids {
+        if let Some(batch) = cache_manager.get(dbnum, &batch_id).await {
+            hit_batches += 1;
+            for (k, v) in batch.inst_info_map {
+                inst_info_map.insert(k, v);
+            }
+            for (k, v) in batch.inst_tubi_map {
+                inst_tubi_map.insert(k, v);
+            }
+            for (k, v) in batch.inst_geos_map {
+                if let Some(existing) = inst_geos_map.get_mut(&k) {
+                    existing.insts.extend(v.insts);
+                    if existing.aabb.is_none() {
+                        existing.aabb = v.aabb;
+                    }
+                    if existing.type_name.is_empty() {
+                        existing.type_name = v.type_name;
+                    }
+                } else {
+                    inst_geos_map.insert(k, v);
+                }
+            }
+            for (k, v) in batch.neg_relate_map {
+                let entry = neg_relate_map.entry(k).or_default();
+                for neg in v {
+                    if !entry.contains(&neg) {
+                        entry.push(neg);
+                    }
+                }
+            }
+            for (k, v) in batch.ngmr_neg_relate_map {
+                let entry = ngmr_neg_relate_map.entry(k).or_default();
+                for item in v {
+                    if !entry.contains(&item) {
+                        entry.push(item);
+                    }
+                }
+            }
+        } else {
+            miss_batches += 1;
+        }
+    }
+
+    if verbose {
+        println!(
+            "✅ 合并缓存完成: inst_info={}, inst_geos={}, inst_tubi={}",
+            inst_info_map.len(),
+            inst_geos_map.len(),
+            inst_tubi_map.len()
+        );
+        println!(
+            "✅ 缓存批次命中情况: 命中={}, 丢失={}",
+            hit_batches, miss_batches
+        );
+        let total_inst_geos: usize = inst_geos_map.values().map(|v| v.insts.len()).sum();
+        let empty_inst_geos = inst_geos_map.values().filter(|v| v.insts.is_empty()).count();
+        println!(
+            "✅ inst_geos 统计: entries={}, total_insts={}, empty_entries={}",
+            inst_geos_map.len(),
+            total_inst_geos,
+            empty_inst_geos
+        );
+    } else if miss_batches > 0 {
+        println!(
+            "⚠️ 缓存批次未命中: 命中={}, 丢失={}",
+            hit_batches, miss_batches
+        );
+    }
+
+    fn hash_json_value(value: &serde_json::Value) -> String {
+        let mut hasher = Sha256::new();
+        let bytes = serde_json::to_vec(value).unwrap_or_default();
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
+    }
+
+    fn to_dmat4(t: &Transform) -> DMat4 {
+        let mat = t.to_matrix();
+        let cols = mat.to_cols_array();
+        let mut cols64 = [0f64; 16];
+        for i in 0..16 {
+            cols64[i] = cols[i] as f64;
+        }
+        DMat4::from_cols_array(&cols64)
+    }
+
+    fn insert_trans_hash(
+        trans_table: &mut HashMap<String, serde_json::Value>,
+        mat: &DMat4,
+        unit_converter: &UnitConverter,
+        is_unit_mesh: bool,
+    ) -> String {
+        let arr = mat4_to_vec_dmat4(mat, unit_converter, is_unit_mesh);
+        let value = json!(arr);
+        let hash = hash_json_value(&value);
+        trans_table.entry(hash.clone()).or_insert(value);
+        hash
+    }
+
+    fn insert_aabb_hash(
+        aabb_table: &mut HashMap<String, serde_json::Value>,
+        aabb: &Aabb,
+        unit_converter: &UnitConverter,
+    ) -> String {
+        let plant = PlantAabb::from(aabb.clone());
+        let value = aabb_to_json(&plant, unit_converter);
+        let hash = hash_json_value(&value);
+        aabb_table.entry(hash.clone()).or_insert(value);
+        hash
+    }
+
+    fn resolve_aabb(
+        info: &EleGeosInfo,
+        inst_geos: &EleInstGeosData,
+        mesh_dir: Option<&Path>,
+        mesh_lod_tag: Option<&str>,
+        mesh_aabb_cache: &mut HashMap<u64, Aabb>,
+    ) -> Option<Aabb> {
+        fn compute_inst_aabb(info: &EleGeosInfo, inst: &aios_core::geometry::EleInstGeo) -> Option<Aabb> {
+            let world_t = info.get_geo_world_transform(inst);
+            if let Some(local_aabb) = inst.aabb {
+                return Some(shared::aabb_apply_transform(&local_aabb, &world_t));
+            }
+            let points = inst.geo_param.key_points();
+            if points.is_empty() {
+                return None;
+            }
+            let mut aabb = Aabb::new_invalid();
+            for p in points {
+                let wp = world_t.transform_point(p.0);
+                aabb.take_point(Point::new(wp.x, wp.y, wp.z));
+            }
+            let ext = aabb.extents().magnitude();
+            if ext.is_nan() || ext.is_infinite() {
+                return None;
+            }
+            Some(aabb)
+        }
+
+        fn load_glb_aabb(path: &Path) -> anyhow::Result<Aabb> {
+            let file = File::open(path)?;
+            let reader = BufReader::new(file);
+            let glb = gltf::Gltf::from_reader(reader)?;
+            let mut aabb = Aabb::new_invalid();
+            let mut has = false;
+            for mesh in glb.meshes() {
+                for primitive in mesh.primitives() {
+                    let reader = primitive.reader(|_| glb.blob.as_ref().map(|b| b.as_slice()));
+                    if let Some(iter) = reader.read_positions() {
+                        for v in iter {
+                            aabb.take_point(Point::new(v[0], v[1], v[2]));
+                            has = true;
+                        }
+                    }
+                }
+            }
+            if !has {
+                anyhow::bail!("GLB 无顶点数据");
+            }
+            Ok(aabb)
+        }
+
+        fn load_geo_aabb_from_mesh(
+            geo_hash: u64,
+            mesh_dir: &Path,
+            lod_tag: &str,
+            mesh_aabb_cache: &mut HashMap<u64, Aabb>,
+        ) -> Option<Aabb> {
+            if let Some(aabb) = mesh_aabb_cache.get(&geo_hash) {
+                return Some(*aabb);
+            }
+            let base_dir = if mesh_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().starts_with("lod_"))
+                .unwrap_or(false)
+            {
+                mesh_dir.parent().unwrap_or(mesh_dir)
+            } else {
+                mesh_dir
+            };
+            let lod_dir = if mesh_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().starts_with("lod_"))
+                .unwrap_or(false)
+            {
+                mesh_dir.to_path_buf()
+            } else {
+                base_dir.join(format!("lod_{}", lod_tag))
+            };
+
+            let geo_hash_str = geo_hash.to_string();
+            let candidates = [
+                lod_dir.join(format!("{}_{}.glb", geo_hash_str, lod_tag)),
+                lod_dir.join(format!("{}.glb", geo_hash_str)),
+                base_dir.join(format!("{}.glb", geo_hash_str)),
+            ];
+            for path in candidates {
+                if path.exists() {
+                    if let Ok(aabb) = load_glb_aabb(&path) {
+                        mesh_aabb_cache.insert(geo_hash, aabb);
+                        return Some(aabb);
+                    }
+                }
+            }
+            None
+        }
+
+        if let Some(aabb) = info.aabb.clone() {
+            return Some(aabb);
+        }
+        if let Some(aabb) = inst_geos.aabb.clone() {
+            return Some(aabb);
+        }
+        let mut merged: Option<Aabb> = None;
+        for inst in &inst_geos.insts {
+            let Some(world_aabb) = compute_inst_aabb(info, inst) else {
+                if let (Some(mesh_dir), Some(lod_tag)) = (mesh_dir, mesh_lod_tag) {
+                    if let Some(local_aabb) =
+                        load_geo_aabb_from_mesh(inst.geo_hash, mesh_dir, lod_tag, mesh_aabb_cache)
+                    {
+                        let world_t = info.get_geo_world_transform(inst);
+                        let world_aabb = shared::aabb_apply_transform(&local_aabb, &world_t);
+                        merged = match merged {
+                            None => Some(world_aabb),
+                            Some(mut current) => {
+                                current.merge(&world_aabb);
+                                Some(current)
+                            }
+                        };
+                    }
+                }
+                continue;
+            };
+            merged = match merged {
+                None => Some(world_aabb),
+                Some(mut current) => {
+                    current.merge(&world_aabb);
+                    Some(current)
+                }
+            };
+        }
+        merged
+    }
+
+    #[derive(Clone, Debug)]
+    struct ChildInfo {
+        refno: RefnoEnum,
+    }
+
+    #[derive(Clone, Debug)]
+    struct OwnerGroup {
+        owner_type: String,
+        children: Vec<ChildInfo>,
+    }
+
+    let mut owner_groups: HashMap<RefnoEnum, OwnerGroup> = HashMap::new();
+    let mut instance_rows: Vec<RefnoEnum> = Vec::new();
+    let mut in_refnos: Vec<RefnoEnum> = Vec::new();
+
+    for (refno, info) in &inst_info_map {
+        let owner_type = info.owner_type.to_ascii_uppercase();
+        let owner_refno = info.owner_refno;
+        if matches!(owner_type.as_str(), "BRAN" | "HANG" | "EQUI")
+            && owner_refno != RefnoEnum::default()
+        {
+            let entry = owner_groups.entry(owner_refno).or_insert_with(|| OwnerGroup {
+                owner_type: owner_type.clone(),
+                children: Vec::new(),
+            });
+            entry.children.push(ChildInfo { refno: *refno });
+            in_refnos.push(*refno);
+        } else {
+            instance_rows.push(*refno);
+        }
+    }
+
+    let mut owner_refnos: Vec<RefnoEnum> = owner_groups.keys().copied().collect();
+    owner_refnos.sort_by_key(|r| r.to_string());
+    instance_rows.sort_by_key(|r| r.to_string());
+
+    let mut trans_table: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut aabb_table: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut mesh_aabb_cache: HashMap<u64, Aabb> = HashMap::new();
+
+    let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let mut groups = Vec::new();
+
+    for owner_refno in &owner_refnos {
+        let Some(owner_group) = owner_groups.get(owner_refno) else {
+            continue;
+        };
+
+        let owner_type = owner_group.owner_type.as_str();
+        let owner_name = format!("{}-{}", owner_type, owner_refno.to_string());
+
+        let mut children = Vec::new();
+        for child in &owner_group.children {
+            let Some(info) = inst_info_map.get(&child.refno) else {
+                continue;
+            };
+            let Some(inst_geos) = inst_geos_map.get(&info.get_inst_key()) else {
+                continue;
+            };
+            if inst_geos.insts.is_empty() {
+                continue;
+            }
+
+            let aabb = match resolve_aabb(
+                info,
+                inst_geos,
+                mesh_dir,
+                mesh_lod_tag,
+                &mut mesh_aabb_cache,
+            ) {
+                Some(aabb) => aabb,
+                None => continue,
+            };
+            let aabb_hash = insert_aabb_hash(&mut aabb_table, &aabb, &unit_converter);
+
+            let trans_hash = insert_trans_hash(
+                &mut trans_table,
+                &to_dmat4(&info.world_transform),
+                &unit_converter,
+                false,
+            );
+
+            let has_neg = inst_geos.has_neg()
+                || inst_geos.has_cata_neg()
+                || inst_geos.has_ngmr()
+                || neg_relate_map.contains_key(&child.refno)
+                || ngmr_neg_relate_map.contains_key(&child.refno);
+
+            let instances: Vec<serde_json::Value> = inst_geos
+                .insts
+                .iter()
+                .map(|inst| {
+                    let geo_trans_hash = insert_trans_hash(
+                        &mut trans_table,
+                        &to_dmat4(&inst.transform),
+                        &unit_converter,
+                        inst.unit_flag,
+                    );
+                    json!({
+                        "geo_hash": inst.geo_hash.to_string(),
+                        "geo_trans_hash": geo_trans_hash,
+                    })
+                })
+                .collect();
+
+            children.push(json!({
+                "refno": child.refno.to_string(),
+                "noun": "",
+                "name": "",
+                "aabb_hash": aabb_hash,
+                "lod_mask": 1u32,
+                "spec_value": 0,
+                "trans_hash": trans_hash,
+                "has_neg": has_neg,
+                "geo_instances": instances,
+            }));
+        }
+
+        let mut tubings = Vec::new();
+        let mut tubi_items: Vec<(&RefnoEnum, &EleGeosInfo)> = inst_tubi_map.iter().collect();
+        tubi_items.sort_by_key(|(r, _)| r.to_string());
+        let mut tubi_order = 0u32;
+
+        for (tubi_refno, info) in tubi_items {
+            if info.owner_refno != *owner_refno {
+                continue;
+            }
+            let Some(inst_geos) = inst_geos_map.get(&info.get_inst_key()) else {
+                continue;
+            };
+            let Some(first_inst) = inst_geos.insts.first() else {
+                continue;
+            };
+            let aabb = match info.aabb.clone() {
+                Some(aabb) => aabb,
+                None => continue,
+            };
+            let aabb_hash = insert_aabb_hash(&mut aabb_table, &aabb, &unit_converter);
+            let trans_hash = insert_trans_hash(
+                &mut trans_table,
+                &to_dmat4(&info.world_transform),
+                &unit_converter,
+                false,
+            );
+
+            tubings.push(json!({
+                "refno": tubi_refno.to_string(),
+                "noun": "TUBI",
+                "name": format!("TUBI-{}", tubi_refno.to_string()),
+                "aabb_hash": aabb_hash,
+                "geo_hash": first_inst.geo_hash.to_string(),
+                "trans_hash": trans_hash,
+                "order": tubi_order,
+                "lod_mask": 1u32,
+                "spec_value": 0,
+            }));
+            tubi_order += 1;
+        }
+
+        groups.push(json!({
+            "owner_refno": owner_refno.to_string(),
+            "owner_noun": owner_type,
+            "owner_name": owner_name,
+            "children": children,
+            "tubings": tubings,
+        }));
+    }
+
+    let mut instances = Vec::new();
+    let total_instance_rows = instance_rows.len();
+    let mut missing_inst_key = 0usize;
+    let mut missing_aabb = 0usize;
+    for refno in instance_rows {
+        let Some(info) = inst_info_map.get(&refno) else {
+            continue;
+        };
+        let Some(inst_geos) = inst_geos_map.get(&info.get_inst_key()) else {
+            missing_inst_key += 1;
+            continue;
+        };
+        if inst_geos.insts.is_empty() {
+            continue;
+        }
+        let aabb = match resolve_aabb(
+            info,
+            inst_geos,
+            mesh_dir,
+            mesh_lod_tag,
+            &mut mesh_aabb_cache,
+        ) {
+            Some(aabb) => aabb,
+            None => {
+                missing_aabb += 1;
+                continue;
+            }
+        };
+        let aabb_hash = insert_aabb_hash(&mut aabb_table, &aabb, &unit_converter);
+        let trans_hash = insert_trans_hash(
+            &mut trans_table,
+            &to_dmat4(&info.world_transform),
+            &unit_converter,
+            false,
+        );
+
+        let has_neg = inst_geos.has_neg()
+            || inst_geos.has_cata_neg()
+            || inst_geos.has_ngmr()
+            || neg_relate_map.contains_key(&refno)
+            || ngmr_neg_relate_map.contains_key(&refno);
+
+        let geo_instances: Vec<serde_json::Value> = inst_geos
+            .insts
+            .iter()
+            .map(|inst| {
+                let geo_trans_hash = insert_trans_hash(
+                    &mut trans_table,
+                    &to_dmat4(&inst.transform),
+                    &unit_converter,
+                    inst.unit_flag,
+                );
+                json!({
+                    "geo_hash": inst.geo_hash.to_string(),
+                    "geo_trans_hash": geo_trans_hash,
+                })
+            })
+            .collect();
+
+        instances.push(json!({
+            "refno": refno.to_string(),
+            "noun": "",
+            "name": "",
+            "aabb_hash": aabb_hash,
+            "trans_hash": trans_hash,
+            "has_neg": has_neg,
+            "geo_instances": geo_instances,
+        }));
+    }
+
+    let instances_json = json!({
+        "version": 3,
+        "generated_at": generated_at,
+        "groups": groups,
+        "instances": instances,
+    });
+
+    let output_path = output_dir.join(format!("instances_{}.json", dbnum));
+    let json_str = serde_json::to_string_pretty(&instances_json)?;
+    fs::write(&output_path, json_str)?;
+
+    let trans_path = output_dir.join("trans.json");
+    let aabb_path = output_dir.join("aabb.json");
+
+    let trans_json: serde_json::Value = trans_table.clone().into_iter().collect();
+    let aabb_json: serde_json::Value = aabb_table.clone().into_iter().collect();
+
+    fs::write(&trans_path, serde_json::to_string(&trans_json)?)?;
+    fs::write(&aabb_path, serde_json::to_string(&aabb_json)?)?;
+
+    if verbose {
+        println!("✅ 主 JSON 文件已写入: {}", output_path.display());
+        println!(
+            "✅ trans.json 已写入: {} ({} 条)",
+            trans_path.display(),
+            trans_table.len()
+        );
+        println!(
+            "✅ aabb.json 已写入: {} ({} 条)",
+            aabb_path.display(),
+            aabb_table.len()
+        );
+        if missing_inst_key > 0 || missing_aabb > 0 {
+            println!(
+                "⚠️ 过滤统计: missing_inst_key={}, missing_aabb={}",
+                missing_inst_key, missing_aabb
+            );
+        }
+    } else if !inst_info_map.is_empty() && groups.is_empty() && instances.is_empty() {
+        println!(
+            "⚠️ 缓存导出结果为空: inst_info={}, inst_geos={}, inst_tubi={}",
+            inst_info_map.len(),
+            inst_geos_map.len(),
+            inst_tubi_map.len()
+        );
+    }
+
+    let stats = ExportStats {
+        refno_count: owner_refnos.len(),
+        descendant_count: in_refnos.len(),
+        geometry_count: 0,
+        mesh_files_found: 0,
+        mesh_files_missing: 0,
+        output_file_size: fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0),
+        elapsed_time: start_time.elapsed(),
+        node_count: 0,
+        mesh_count: 0,
+    };
+
+    Ok((stats, trans_table.len(), aabb_table.len()))
 }
 
 /// 导出全局 trans.json 和 aabb.json（扫描整表）

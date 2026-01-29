@@ -23,9 +23,11 @@ use crate::data_interface::increment_record::IncrGeoUpdateLog;
 use crate::data_interface::sesno_increment::get_changes_at_sesno;
 use crate::fast_model::capture::capture_refnos_if_enabled;
 use crate::data_interface::db_meta_manager::db_meta;
-// 缓存功能已禁用：移除 fallback_dbnum 和 guess dbnum 逻辑后，无法推断 dbnum
-// use crate::fast_model::instance_cache::InstanceCacheManager;
-use crate::fast_model::mesh_generate::{run_boolean_worker, run_mesh_worker};
+use crate::fast_model::instance_cache::InstanceCacheManager;
+use crate::fast_model::mesh_generate::{
+    run_boolean_worker, run_mesh_worker, run_mesh_worker_from_cache_manager,
+};
+use crate::fast_model::manifold_bool::run_boolean_worker_from_cache_manager;
 use crate::fast_model::pdms_inst::save_instance_data_optimize;
 use crate::options::{DbOptionExt, MeshFormat};
 use crate::fast_model::export_model::ParquetStreamWriter;
@@ -37,6 +39,7 @@ use super::errors::{FullNounError, Result};
 use super::full_noun_mode::gen_full_noun_geos_optimized;
 use super::models::NounCategory;
 use std::str::FromStr;
+use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 
 /// 主入口函数：生成所有几何体数据
 ///
@@ -137,6 +140,28 @@ pub async fn gen_all_geos_data(
     }
 }
 
+async fn resolve_dbnum_from_shape(
+    shape_insts: &aios_core::geometry::ShapeInstancesData,
+) -> Option<u32> {
+    let refno = shape_insts
+        .inst_info_map
+        .keys()
+        .next()
+        .copied()
+        .or_else(|| shape_insts.inst_tubi_map.keys().next().copied());
+    match refno {
+        Some(r) => {
+            if db_meta().ensure_loaded().is_ok() {
+                if let Some(dbnum) = db_meta().get_dbnum_by_refno(r) {
+                    return Some(dbnum);
+                }
+            }
+            TreeIndexManager::resolve_dbnum_for_refno(r).await.ok()
+        }
+        None => None,
+    }
+}
+
 /// 处理 Full Noun 模式的生成流程
 async fn process_full_noun_mode(
     db_option: &DbOptionExt,
@@ -164,9 +189,6 @@ async fn process_full_noun_mode(
     let (sender, receiver) = flume::unbounded();
     let replace_exist = db_option.inner.is_replace_mesh();
     let use_surrealdb = db_option.use_surrealdb;
-    // 缓存功能已禁用
-    let use_cache = false;
-    let cache_manager: Option<Arc<()>> = None;
 
     // 初始化 Parquet 写入器
     let parquet_writer: Option<std::sync::Arc<ParquetStreamWriter>> = None;
@@ -204,12 +226,26 @@ async fn process_full_noun_mode(
     #[cfg(feature = "duckdb-feature")]
     let duckdb_writer_clone = duckdb_writer.clone();
 
+    let cache_manager = if db_option.use_cache {
+        Some(Arc::new(
+            InstanceCacheManager::new(&db_option.get_foyer_cache_dir()).await?,
+        ))
+    } else {
+        None
+    };
+    let cache_manager_for_insert = cache_manager.clone();
+
     let insert_handle = tokio::spawn(async move {
         while let Ok(shape_insts) = receiver.recv_async().await {
             // 保存到 SurrealDB
             if use_surrealdb {
                 if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
                     eprintln!("保存实例数据失败: {}", e);
+                }
+            }
+            if let Some(ref cache_manager) = cache_manager_for_insert {
+                if let Some(dbnum) = resolve_dbnum_from_shape(&shape_insts).await {
+                    cache_manager.insert_from_shape(dbnum, &shape_insts);
                 }
             }
             // 同时写入 Parquet（如果启用）
@@ -270,8 +306,23 @@ async fn process_full_noun_mode(
         all_refnos.extend(loops);
         all_refnos.extend(prims);
 
-        // 缓存功能已禁用，直接使用 SurrealDB 路径
         let mut ran_primary = false;
+
+        if let Some(ref cache_manager) = cache_manager {
+            let mesh_dir = db_option.inner.get_meshes_path();
+            if let Err(e) = run_mesh_worker_from_cache_manager(
+                cache_manager.as_ref(),
+                &mesh_dir,
+                &db_option.inner.mesh_precision,
+                &db_option.mesh_formats,
+            )
+            .await
+            {
+                eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
+            } else {
+                ran_primary = true;
+            }
+        }
 
         if use_surrealdb {
             if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
@@ -280,8 +331,6 @@ async fn process_full_noun_mode(
                 ran_primary = true;
             }
         }
-
-        // 双路径功能已禁用（缓存相关）
 
         if ran_primary {
             println!(
@@ -339,7 +388,12 @@ async fn process_full_noun_mode(
         if db_option.inner.apply_boolean_operation {
             let bool_start = Instant::now();
             println!("[gen_model] Full Noun 模式开始布尔运算（boolean worker）");
-            // 缓存功能已禁用，直接使用 SurrealDB 路径
+            if let Some(ref cache_manager) = cache_manager {
+                if let Err(e) = run_boolean_worker_from_cache_manager(cache_manager.as_ref()).await
+                {
+                    eprintln!("[gen_model] Full Noun 缓存布尔运算失败: {}", e);
+                }
+            }
             if use_surrealdb {
                 if let Err(e) = run_boolean_worker(Arc::new(db_option.inner.clone()), 100).await {
                     eprintln!("[gen_model] Full Noun 布尔运算失败: {}", e);
@@ -423,6 +477,12 @@ async fn process_full_noun_mode(
         }
     }
 
+    if let Some(ref cache_manager) = cache_manager {
+        if let Err(e) = cache_manager.close().await {
+            eprintln!("[cache] 关闭缓存失败: {}", e);
+        }
+    }
+
     Ok(true)
 }
 
@@ -496,13 +556,25 @@ async fn process_targeted_generation(
 
     let replace_exist = db_option.inner.is_replace_mesh();
     let use_surrealdb = db_option.use_surrealdb;
-    // 缓存功能已禁用
+    let cache_manager = if db_option.use_cache {
+        Some(Arc::new(
+            InstanceCacheManager::new(&db_option.get_foyer_cache_dir()).await?,
+        ))
+    } else {
+        None
+    };
+    let cache_manager_for_insert = cache_manager.clone();
 
     let insert_task = tokio::task::spawn(async move {
         while let Ok(shape_insts) = receiver.recv_async().await {
             if use_surrealdb {
                 if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
                     eprintln!("保存实例数据失败: {}", e);
+                }
+            }
+            if let Some(ref cache_manager) = cache_manager_for_insert {
+                if let Some(dbnum) = resolve_dbnum_from_shape(&shape_insts).await {
+                    cache_manager.insert_from_shape(dbnum, &shape_insts);
                 }
             }
         }
@@ -533,7 +605,21 @@ async fn process_targeted_generation(
         println!("[gen_model] 开始 mesh 生成");
 
         let mut ran_primary = false;
-        // 缓存功能已禁用，直接使用 SurrealDB 路径
+        if let Some(ref cache_manager) = cache_manager {
+            let mesh_dir = db_option.inner.get_meshes_path();
+            if let Err(e) = run_mesh_worker_from_cache_manager(
+                cache_manager.as_ref(),
+                &mesh_dir,
+                &db_option.inner.mesh_precision,
+                &db_option.mesh_formats,
+            )
+            .await
+            {
+                eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
+            } else {
+                ran_primary = true;
+            }
+        }
         if use_surrealdb {
             if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
                 eprintln!("[gen_model] mesh worker 失败: {}", e);
@@ -585,7 +671,12 @@ async fn process_targeted_generation(
             let bool_start = Instant::now();
             println!("[gen_model] 开始布尔运算 worker");
 
-            // 缓存功能已禁用，直接使用 SurrealDB 路径
+            if let Some(ref cache_manager) = cache_manager {
+                if let Err(e) = run_boolean_worker_from_cache_manager(cache_manager.as_ref()).await
+                {
+                    eprintln!("[gen_model] 缓存布尔运算失败: {}", e);
+                }
+            }
             if use_surrealdb {
                 if let Err(e) = run_boolean_worker(Arc::new(db_option.inner.clone()), 100).await {
                     eprintln!("[gen_model] boolean worker 失败: {}", e);
@@ -599,8 +690,14 @@ async fn process_targeted_generation(
         }
     }
 
-    if let Err(err) = capture_refnos_if_enabled(&target_root_refnos, &db_option.inner).await {
+    if let Err(err) = capture_refnos_if_enabled(&target_root_refnos, db_option).await {
         eprintln!("[capture] 捕获截图失败: {}", err);
+    }
+
+    if let Some(ref cache_manager) = cache_manager {
+        if let Err(e) = cache_manager.close().await {
+            eprintln!("[cache] 关闭缓存失败: {}", e);
+        }
     }
 
     // initialize_spatial_index();
@@ -688,12 +785,24 @@ async fn process_full_database_generation(
         #[cfg(feature = "duckdb-feature")]
         let duckdb_writer_clone = duckdb_writer.clone();
 
+        let cache_manager = if db_option_arc.use_cache {
+            Some(Arc::new(
+                InstanceCacheManager::new(&db_option_arc.get_foyer_cache_dir()).await?,
+            ))
+        } else {
+            None
+        };
+        let cache_manager_for_insert = cache_manager.clone();
+
         let insert_task = tokio::task::spawn(async move {
             while let Ok(shape_insts) = receiver.recv_async().await {
                 if use_surrealdb {
                     if let Err(e) = save_instance_data_optimize(&shape_insts, false).await {
                         eprintln!("保存实例数据失败: {}", e);
                     }
+                }
+                if let Some(ref cache_manager) = cache_manager_for_insert {
+                    cache_manager.insert_from_shape(dbnum, &shape_insts);
                 }
                 // 同时写入 Parquet（如果启用）
                 if let Some(ref writer) = parquet_writer_clone {
@@ -732,7 +841,21 @@ async fn process_full_database_generation(
             println!("[gen_model] -> 数据库 {} 开始生成三角网格", dbnum);
 
             let mut ran_primary = false;
-            // 缓存功能已禁用，直接使用 SurrealDB 路径
+            if let Some(ref cache_manager) = cache_manager {
+                let mesh_dir = db_option_arc.inner.get_meshes_path();
+                if let Err(e) = run_mesh_worker_from_cache_manager(
+                    cache_manager.as_ref(),
+                    &mesh_dir,
+                    &db_option_arc.inner.mesh_precision,
+                    &db_option_arc.mesh_formats,
+                )
+                .await
+                {
+                    eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
+                } else {
+                    ran_primary = true;
+                }
+            }
             if use_surrealdb {
                 db_refnos
                     .execute_gen_inst_meshes(Some(db_option_arc.clone()))

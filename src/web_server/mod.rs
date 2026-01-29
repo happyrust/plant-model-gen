@@ -53,6 +53,7 @@ use crate::web_api::{
     create_review_integration_routes, create_model_center_routes, create_pipeline_annotation_routes,
     create_jwt_auth_routes, create_review_api_routes, create_scene_tree_routes,
     create_export_api_routes,
+    SearchApiState, create_search_routes,
 };
 use handlers::*;
 use models::*;
@@ -259,6 +260,9 @@ pub async fn start_web_server_with_config(
     // 初始化碰撞检测 API
     let collision_state = CollisionApiState::default();
     let collision_routes = create_collision_routes(collision_state);
+
+    // 初始化检索 API（Meilisearch 可选；通过环境变量 MEILI_URL/MEILI_API_KEY/MEILI_PDMS_INDEX 配置）
+    let search_routes = create_search_routes(SearchApiState::from_env());
 
     let app = Router::new()
         // API路由
@@ -843,6 +847,7 @@ pub async fn start_web_server_with_config(
         .merge(ptset_routes)
         .merge(room_routes)
         .merge(collision_routes)
+        .merge(search_routes)
         .merge(create_export_api_routes())
         .merge(create_review_integration_routes())
         .merge(create_model_center_routes())

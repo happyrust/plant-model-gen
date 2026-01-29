@@ -267,6 +267,12 @@ async fn main() -> anyhow::Result<()> {
                 .value_name("OUTPUT_PATH"),
         )
         .arg(
+            Arg::new("use-surrealdb")
+                .long("use-surrealdb")
+                .help("Enable SurrealDB for OBJ export/debug flows (default: cache-only, no fallback)")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("include-negative")
                 .long("include-negative")
                 .help("Include negative entities (Neg type geometries) in export")
@@ -362,7 +368,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("export-dbnum-instances-json")
                 .long("export-dbnum-instances-json")
-                .help("Export dbnum instances as simplified JSON with AABB data")
+                .help("Export dbnum instances as simplified JSON with AABB data (use_cache=true 时仅走缓存，不回退 SurrealDB)")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -700,6 +706,32 @@ async fn main() -> anyhow::Result<()> {
             println!("🔄 调试模式启用 gen_mesh，默认开启 replace_mesh 以重新生成模型数据");
         }
         db_option_ext.inner.replace_mesh = Some(true);
+    }
+
+    // ========== OBJ 导出：默认走缓存，SurrealDB 需显式开关 ==========
+    //
+    // 约定：
+    // - 默认（不传 --use-surrealdb）时，OBJ 导出/截图相关路径不依赖 SurrealDB；
+    // - 若需走 SurrealDB（用于对照/迁移验证），必须显式添加 --use-surrealdb；
+    // - 这不是 fallback：cache 与 surrealdb 两条路径同时存在仅用于验证准确性。
+    let obj_export_flow = matches.get_flag("export-obj")
+        || matches.get_flag("export-svg")
+        || matches.contains_id("export-obj-refnos")
+        || (debug_model_requested && capture_dir.is_some());
+
+    if obj_export_flow {
+        let cli_use_surrealdb = matches.get_flag("use-surrealdb");
+        db_option_ext.use_surrealdb = cli_use_surrealdb;
+
+        if !db_option_ext.use_cache && !db_option_ext.use_surrealdb {
+            anyhow::bail!(
+                "OBJ 导出默认关闭 SurrealDB，但当前配置未启用 use_cache；请开启 use_cache 或添加 --use-surrealdb"
+            );
+        }
+
+        if !db_option_ext.use_surrealdb {
+            println!("📦 OBJ 导出默认使用缓存数据源（SurrealDB 已关闭）。如需启用 SurrealDB，请添加 --use-surrealdb。");
+        }
     }
 
     // ========== 处理 --debug-model 与导出标志的组合 ==========
@@ -1071,7 +1103,12 @@ async fn main() -> anyhow::Result<()> {
             println!("   - 输出目录: {}", dir.display());
         }
 
-        return export_dbnum_instances_json_mode(dbnum, verbose, export_bundle_dir, &db_option_ext)
+        return export_dbnum_instances_json_mode(
+            dbnum,
+            verbose,
+            export_bundle_dir,
+            &db_option_ext,
+        )
             .await;
     }
 

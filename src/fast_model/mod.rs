@@ -50,8 +50,7 @@ pub mod inst_query;
 pub mod query_compat;
 pub mod query_provider; // 新的统一查询提供者 // 查询兼容层
 pub mod db_meta_cache;
-// 缓存功能已禁用：需要 foyer crate 依赖，目前未配置
-// pub mod instance_cache;
+pub mod instance_cache;
 
 pub mod utils;
 pub mod precheck;

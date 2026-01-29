@@ -1,14 +1,18 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasherDefault;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::fs;
 
 use aios_core::geometry::{EleGeosInfo, EleInstGeosData, ShapeInstancesData};
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::RefnoEnum;
 use foyer::{DirectFsDeviceOptionsBuilder, HybridCache, HybridCacheBuilder};
 use serde::{Deserialize, Serialize};
+use twox_hash::XxHash64;
 use crate::data_interface::db_meta_manager::db_meta;
+use anyhow::Context;
 
 #[derive(Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstanceCacheKey {
@@ -18,7 +22,7 @@ pub struct InstanceCacheKey {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InstanceCacheValue {
-    pub data: CachedInstanceBatch,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -40,24 +44,29 @@ pub struct CachedGeoParam {
     pub unit_flag: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize, Clone)]
 struct CacheIndex {
     by_dbnum: HashMap<u32, Vec<String>>,
+    #[serde(default)]
     by_dbnum_set: HashMap<u32, HashSet<String>>,
 }
 
 pub struct InstanceCacheManager {
-    cache: HybridCache<InstanceCacheKey, InstanceCacheValue>,
+    cache: HybridCache<InstanceCacheKey, InstanceCacheValue, BuildHasherDefault<XxHash64>>,
     index: Mutex<CacheIndex>,
     counter: AtomicU64,
     cache_dir: PathBuf,
 }
 
 impl InstanceCacheManager {
+    const INDEX_FILE_NAME: &'static str = "instance_cache_index.json";
+
     pub async fn new(cache_dir: &Path) -> anyhow::Result<Self> {
         if !cache_dir.exists() {
             std::fs::create_dir_all(cache_dir)?;
         }
+
+        let (index, counter_start) = Self::load_index_with_counter(cache_dir);
 
         let device_config = DirectFsDeviceOptionsBuilder::new(cache_dir)
             .with_capacity(1024 * 1024 * 1024)
@@ -65,6 +74,7 @@ impl InstanceCacheManager {
 
         let cache = HybridCacheBuilder::new()
             .memory(128 * 1024 * 1024)
+            .with_hash_builder(BuildHasherDefault::<XxHash64>::default())
             .storage()
             .with_device_config(device_config)
             .build()
@@ -72,8 +82,8 @@ impl InstanceCacheManager {
 
         Ok(Self {
             cache,
-            index: Mutex::new(CacheIndex::default()),
-            counter: AtomicU64::new(0),
+            index: Mutex::new(index),
+            counter: AtomicU64::new(counter_start),
             cache_dir: cache_dir.to_path_buf(),
         })
     }
@@ -87,15 +97,38 @@ impl InstanceCacheManager {
             dbnum: batch.dbnum,
             batch_id: batch.batch_id.clone(),
         };
-        let value = InstanceCacheValue { data: batch };
+        let payload = match serde_json::to_vec(&batch) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "[cache] 序列化失败，跳过写入: dbnum={}, batch_id={}, err={}",
+                    batch.dbnum, batch.batch_id, e
+                );
+                return;
+            }
+        };
+        let value = InstanceCacheValue { payload };
+        let dbnum = batch.dbnum;
+        let batch_id = batch.batch_id.clone();
         self.cache.insert(key, value);
+        if let Err(e) = self.update_index(dbnum, &batch_id) {
+            eprintln!(
+                "[cache] 写入索引失败: dbnum={}, batch_id={}, err={}",
+                dbnum, batch_id, e
+            );
+        }
     }
 
     pub fn insert_from_shape(&self, dbnum: u32, shape_insts: &ShapeInstancesData) -> String {
         println!(
-            "[cache] insert_from_shape 调用: dbnum={}, inst_cnt={}",
+            "[cache] insert_from_shape 调用: dbnum={}, inst_cnt={}, inst_info={}, inst_geos={}, inst_tubi={}, neg={}, ngmr={}",
             dbnum,
-            shape_insts.inst_cnt()
+            shape_insts.inst_cnt(),
+            shape_insts.inst_info_map.len(),
+            shape_insts.inst_geos_map.len(),
+            shape_insts.inst_tubi_map.len(),
+            shape_insts.neg_relate_map.len(),
+            shape_insts.ngmr_neg_relate_map.len()
         );
         let batch_id = self.next_batch_id(dbnum);
         let batch = CachedInstanceBatch {
@@ -118,12 +151,34 @@ impl InstanceCacheManager {
             dbnum,
             batch_id: batch_id.to_string(),
         };
-        self.cache
-            .get(&key)
-            .await
-            .ok()
-            .flatten()
-            .map(|entry| entry.value().data.clone())
+        match self.cache.get(&key).await {
+            Ok(Some(entry)) => {
+                let payload = &entry.value().payload;
+                match serde_json::from_slice::<CachedInstanceBatch>(payload) {
+                    Ok(batch) => Some(batch),
+                    Err(e) => {
+                        eprintln!(
+                            "[cache] 反序列化失败: dbnum={}, batch_id={}, err={}",
+                            dbnum, batch_id, e
+                        );
+                        None
+                    }
+                }
+            }
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!(
+                    "[cache] 读取失败: dbnum={}, batch_id={}, err={}",
+                    dbnum, batch_id, e
+                );
+                None
+            }
+        }
+    }
+
+    pub async fn close(&self) -> anyhow::Result<()> {
+        self.cache.close().await?;
+        Ok(())
     }
 
     pub fn list_batches(&self, dbnum: u32) -> Vec<String> {
@@ -161,19 +216,62 @@ impl InstanceCacheManager {
 
     fn next_batch_id(&self, dbnum: u32) -> String {
         let seq = self.counter.fetch_add(1, Ordering::Relaxed);
-        let batch_id = format!("{}_{}", dbnum, seq);
+        format!("{}_{}", dbnum, seq)
+    }
 
+    fn index_path(cache_dir: &Path) -> PathBuf {
+        cache_dir.join(Self::INDEX_FILE_NAME)
+    }
+
+    fn load_index_with_counter(cache_dir: &Path) -> (CacheIndex, u64) {
+        let path = Self::index_path(cache_dir);
+        let text = fs::read_to_string(&path).ok();
+        if let Some(text) = text {
+            if let Ok(mut index) = serde_json::from_str::<CacheIndex>(&text) {
+                if index.by_dbnum_set.is_empty() && !index.by_dbnum.is_empty() {
+                    for (dbnum, batches) in &index.by_dbnum {
+                        let set = index.by_dbnum_set.entry(*dbnum).or_default();
+                        for batch_id in batches {
+                            set.insert(batch_id.clone());
+                        }
+                    }
+                }
+                let max_seq = index
+                    .by_dbnum
+                    .values()
+                    .flatten()
+                    .filter_map(|id| Self::parse_batch_seq(id))
+                    .max()
+                    .unwrap_or(0);
+                return (index, max_seq + 1);
+            }
+        }
+        (CacheIndex::default(), 0)
+    }
+
+    fn parse_batch_seq(batch_id: &str) -> Option<u64> {
+        batch_id.rsplit('_').next()?.parse().ok()
+    }
+
+    fn update_index(&self, dbnum: u32, batch_id: &str) -> anyhow::Result<()> {
         let mut index = self.index.lock().expect("cache index lock poisoned");
         let set = index.by_dbnum_set.entry(dbnum).or_default();
-        if set.insert(batch_id.clone()) {
+        if set.insert(batch_id.to_string()) {
             index
                 .by_dbnum
                 .entry(dbnum)
                 .or_default()
-                .push(batch_id.clone());
+                .push(batch_id.to_string());
+            self.save_index_locked(&index)?;
         }
+        Ok(())
+    }
 
-        batch_id
+    fn save_index_locked(&self, index: &CacheIndex) -> anyhow::Result<()> {
+        let path = Self::index_path(&self.cache_dir);
+        let json = serde_json::to_string(index).context("序列化缓存索引失败")?;
+        fs::write(&path, json)
+            .with_context(|| format!("写入缓存索引失败: {}", path.display()))?;
+        Ok(())
     }
 }
-

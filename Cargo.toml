@@ -12,6 +12,12 @@ name = "web_server"
 path = "src/bin/web_server.rs"
 required-features = ["web_server"]
 
+[[bin]]
+name = "meili_reindex"
+path = "src/bin/meili_reindex.rs"
+# 该工具依赖 DuckDB/MeiliSearch 相关能力，默认不参与构建主流程。
+required-features = ["duckdb-feature"]
+
 
 [dependencies]
 config = "0.15.18"
@@ -101,6 +107,7 @@ glam = { version = "0.30.8", features = ["serde", "rkyv"] }
 cached = "0.56.0"
 rkyv = { version = "0.8.12", features = ["hashbrown-0_15"] }
 rfd = { version = "0.15.4", features = ["async-std"], optional = true }
+meilisearch-sdk = "0.26.1"
 cavalier_contours = { git = "https://gitee.com/happydpc/cavalier_contours", features = [
     "serde",
 ] }
@@ -135,6 +142,8 @@ downcast-rs = "1.2.0"
 flume = "0.11.0"
 rand = "0.9.0"
 rust-embed = "8.2.0"
+foyer = "0.11"
+twox-hash = "1.6"
 
 gpui = { version = "0.2.2", optional = true }
 # story = { path = "../gpui-component/crates/story", optional = true }

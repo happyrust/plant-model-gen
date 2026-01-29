@@ -5,7 +5,7 @@
 
 use aios_core::{GeomInstQuery, RefnoEnum, query_insts_with_batch};
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::fast_model::query_provider;
@@ -72,6 +72,15 @@ pub struct CommonExportConfig {
     /// 是否包含负实体（Neg 类型几何体）
     /// 默认为 false，只导出正实体（Pos、Compound 等）
     pub include_negative: bool,
+
+    /// 是否允许使用 SurrealDB 进行导出期查询（名称/几何实例等）。
+    ///
+    /// - true: 使用 SurrealDB 查询（旧路径，用于对照/验证）
+    /// - false: 使用缓存数据源（不回退 SurrealDB）
+    pub allow_surrealdb: bool,
+
+    /// 当 `allow_surrealdb=false` 时使用的 foyer/instance_cache 目录。
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Default for CommonExportConfig {
@@ -83,6 +92,8 @@ impl Default for CommonExportConfig {
             unit_converter: UnitConverter::default(),
             use_basic_materials: false,
             include_negative: false,
+            allow_surrealdb: true,
+            cache_dir: None,
         }
     }
 }
@@ -103,6 +114,8 @@ impl CommonExportConfig {
             unit_converter: UnitConverter::new(source_unit, target_unit),
             use_basic_materials: false,
             include_negative: false,
+            allow_surrealdb: true,
+            cache_dir: None,
         }
     }
 
@@ -420,4 +433,175 @@ pub async fn query_geometry_instances_ext(
 
 
     Ok(geom_insts)
+}
+
+/// 缓存路径：从 foyer/instance_cache 读取几何实例数据，构造与 SurrealDB `query_insts` 等价的 GeomInstQuery。
+///
+/// 约定：该函数**不回退** SurrealDB；若缓存缺失则直接返回错误。
+pub async fn query_geometry_instances_ext_from_cache(
+    refnos: &[RefnoEnum],
+    cache_dir: &Path,
+    enable_holes: bool,
+    include_negative: bool,
+    verbose: bool,
+) -> Result<Vec<GeomInstQuery>> {
+    use crate::data_interface::db_meta_manager::db_meta;
+    use crate::fast_model::instance_cache::InstanceCacheManager;
+    use aios_core::geometry::GeoBasicType;
+    use aios_core::rs_surreal::geometry_query::PlantTransform;
+    use aios_core::rs_surreal::inst::ModelHashInst;
+    use std::collections::{HashMap, HashSet};
+
+    // 当前 cache 中已包含最终 geo_type/visible 等结果，enable_holes/include_negative 仅保留签名一致性。
+    let _ = (enable_holes, include_negative);
+
+    if refnos.is_empty() {
+        if verbose {
+            println!("⚠️  输入参考号为空，跳过缓存查询");
+        }
+        return Ok(Vec::new());
+    }
+
+    db_meta().ensure_loaded()?;
+
+    // 先按 dbnum 分组，避免跨库扫描 batch。
+    let mut by_dbnum: HashMap<u32, HashSet<RefnoEnum>> = HashMap::new();
+    let mut unresolved: Vec<RefnoEnum> = Vec::new();
+    for &r in refnos {
+        match db_meta().get_dbnum_by_refno(r) {
+            Some(dbnum) => {
+                by_dbnum.entry(dbnum).or_default().insert(r);
+            }
+            None => unresolved.push(r),
+        }
+    }
+    if !unresolved.is_empty() {
+        anyhow::bail!(
+            "无法从 db_meta_info.json 推导 dbnum（请先生成 output/scene_tree/db_meta_info.json）: {:?}",
+            unresolved
+        );
+    }
+
+    if verbose {
+        println!(
+            "📦 缓存查询几何体数据: refnos={}, dbnums={}",
+            refnos.len(),
+            by_dbnum.len()
+        );
+        println!("   - 缓存目录: {}", cache_dir.display());
+    }
+
+    let cache = InstanceCacheManager::new(cache_dir).await?;
+
+    #[derive(Default)]
+    struct Acc {
+        owner: RefnoEnum,
+        world_trans: PlantTransform,
+        has_neg: bool,
+        insts: Vec<ModelHashInst>,
+    }
+
+    let mut out: Vec<GeomInstQuery> = Vec::new();
+    let mut missing: Vec<RefnoEnum> = Vec::new();
+
+    for (dbnum, want_set) in by_dbnum {
+        let batch_ids = cache.list_batches(dbnum);
+        if batch_ids.is_empty() {
+            missing.extend(want_set.iter().copied());
+            continue;
+        }
+
+        let mut acc_map: HashMap<RefnoEnum, Acc> = HashMap::new();
+
+        for batch_id in batch_ids {
+            let Some(batch) = cache.get(dbnum, &batch_id).await else {
+                continue;
+            };
+
+            // 逐个 inst_key 扫描并按 refno 聚合；只处理本次需要的 refno 集合。
+            for geos_data in batch.inst_geos_map.values() {
+                let refno = geos_data.refno;
+                if !want_set.contains(&refno) {
+                    continue;
+                }
+
+                let entry = acc_map.entry(refno).or_insert_with(|| {
+                    if let Some(info) = batch.inst_info_map.get(&refno) {
+                        let owner = if info.owner_refno.is_valid() {
+                            info.owner_refno
+                        } else {
+                            refno
+                        };
+                        let has_neg = batch
+                            .neg_relate_map
+                            .get(&refno)
+                            .map(|v| !v.is_empty())
+                            .unwrap_or(false);
+                        Acc {
+                            owner,
+                            world_trans: PlantTransform::from(info.world_transform),
+                            has_neg,
+                            insts: Vec::new(),
+                        }
+                    } else {
+                        Acc {
+                            owner: refno,
+                            world_trans: PlantTransform::default(),
+                            has_neg: false,
+                            insts: Vec::new(),
+                        }
+                    }
+                });
+
+                for inst in &geos_data.insts {
+                    if !inst.visible {
+                        continue;
+                    }
+                    match inst.geo_type {
+                        GeoBasicType::Pos | GeoBasicType::DesiPos | GeoBasicType::CatePos => {}
+                        _ => continue,
+                    }
+
+                    entry.insts.push(ModelHashInst {
+                        geo_hash: inst.geo_hash.to_string(),
+                        transform: PlantTransform::from(inst.transform),
+                        is_tubi: inst.is_tubi,
+                        unit_flag: inst.unit_flag,
+                    });
+                }
+            }
+        }
+
+        for refno in want_set {
+            match acc_map.remove(&refno) {
+                Some(acc) if !acc.insts.is_empty() => {
+                    out.push(GeomInstQuery {
+                        refno,
+                        owner: acc.owner,
+                        world_aabb: None,
+                        world_trans: acc.world_trans,
+                        insts: acc.insts,
+                        has_neg: acc.has_neg,
+                    });
+                }
+                _ => missing.push(refno),
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        missing.sort();
+        missing.dedup();
+        if verbose {
+            println!(
+                "⚠️  缓存中未找到以下 refno 的几何实例数据（可能是无几何节点/仅 tubing/或尚未生成），将跳过：{:?}",
+                missing
+            );
+        }
+    }
+
+    if verbose {
+        println!("✅ 缓存查询几何体数据完成: {} 个几何体组", out.len());
+    }
+    Ok(out)
 }

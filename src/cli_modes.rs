@@ -277,9 +277,21 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     println!("\n🎯 OBJ 导出模式");
     println!("================");
 
-    println!("\n📡 连接数据库...");
-    init_surreal().await?;
-    println!("✅ 数据库连接成功");
+    // 注意：目前模型生成/层级查询仍可能依赖 SurrealDB 作为“读取侧”数据源。
+    // 这里的 use_surrealdb 主要控制“写入/导出期扫库”路径；OBJ 导出数据源是否走 DB 由
+    // CommonExportConfig.allow_surrealdb 决定（debug-model 默认 cache-only）。
+    let need_surreal_for_run = db_option_ext.use_surrealdb || config.regenerate_plant_mesh;
+    if need_surreal_for_run {
+        if db_option_ext.use_surrealdb {
+            println!("\n📡 连接数据库（SurrealDB 启用）...");
+        } else {
+            println!("\n📡 连接数据库（仅用于模型生成查询；OBJ 导出仍使用缓存数据源）...");
+        }
+        init_surreal().await?;
+        println!("✅ 数据库连接成功");
+    } else {
+        println!("\n📦 未启用 SurrealDB：OBJ 导出使用缓存数据源（不回退）");
+    }
 
     // 如果需要导出 SVG，设置环境变量
     if config.export_svg {
@@ -301,6 +313,11 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
 
     // 如果未指定 dbnum 且未提供 refnos，但要求全库导出，则在此处理
     if config.run_all_dbnos && config.dbnum.is_none() && config.refnos_str.is_empty() {
+        if !db_option_ext.use_surrealdb {
+            return Err(anyhow!(
+                "全库 OBJ 导出需要 SurrealDB（用于查询 MDB dbnum 列表）；请添加 --use-surrealdb"
+            ));
+        }
         println!("\n🔁 进入全库 OBJ 导出模式 (MDB 所有 dbnum)");
         let dbnos = query_mdb_db_nums(None, DBType::DESI).await?;
         if dbnos.is_empty() {
@@ -406,6 +423,13 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
                     ),
                     use_basic_materials: config.use_basic_materials,
                     include_negative: config.include_negative,
+                    // OBJ 导出：默认 cache-only；如需 SurrealDB 需显式 `--use-surrealdb`。
+                    allow_surrealdb: db_option_ext.use_surrealdb,
+                    cache_dir: if db_option_ext.use_surrealdb {
+                        None
+                    } else {
+                        Some(db_option_ext.get_foyer_cache_dir())
+                    },
                 },
             };
 
@@ -485,6 +509,9 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
                     unit_converter: UnitConverter::default(),
                     use_basic_materials: config.use_basic_materials,
                     include_negative: config.include_negative,
+                    // dbnum/SITE 导出：默认仍使用 SurrealDB（全库查询与命名依赖）。
+                    allow_surrealdb: true,
+                    cache_dir: None,
                 },
             };
             if let Err(e) = exporter
@@ -520,6 +547,8 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
                 unit_converter: UnitConverter::default(),
                 use_basic_materials: config.use_basic_materials,
                 include_negative: config.include_negative,
+                allow_surrealdb: true,
+                cache_dir: None,
             },
         };
 
@@ -596,8 +625,9 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             db_option_clone.replace_mesh = Some(true);
             db_option_clone.gen_mesh = true;
 
-            let db_option_ext = DbOptionExt::from(db_option_clone.clone());
-            gen_all_geos_data(refnos.clone(), &db_option_ext, None, None).await?;
+            let mut db_option_ext_override = db_option_ext.clone();
+            db_option_ext_override.inner = db_option_clone.clone();
+            gen_all_geos_data(refnos.clone(), &db_option_ext_override, None, None).await?;
 
             db_option_clone.replace_mesh = original_replace_mesh;
             db_option_clone.gen_mesh = original_gen_mesh;
@@ -632,6 +662,8 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
                     ),
                     use_basic_materials: config.use_basic_materials,
                     include_negative: config.include_negative,
+                    allow_surrealdb: true,
+                    cache_dir: None,
                 },
             };
             let _ = GlbExporter::new()
@@ -710,6 +742,8 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
                     unit_converter: UnitConverter::default(),
                     use_basic_materials: config.use_basic_materials,
                     include_negative: config.include_negative,
+                    allow_surrealdb: true,
+                    cache_dir: None,
                 },
             };
             if let Err(e) = exporter
@@ -745,6 +779,8 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
                 unit_converter: UnitConverter::default(),
                 use_basic_materials: config.use_basic_materials,
                 include_negative: config.include_negative,
+                allow_surrealdb: true,
+                cache_dir: None,
             },
         };
 
@@ -865,6 +901,8 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
                     ),
                     use_basic_materials: config.use_basic_materials,
                     include_negative: config.include_negative,
+                    allow_surrealdb: true,
+                    cache_dir: None,
                 },
             };
             match exporter
@@ -907,8 +945,9 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
             db_option_clone.replace_mesh = Some(true);
             db_option_clone.gen_mesh = true;
 
-            let db_option_ext = DbOptionExt::from(db_option_clone.clone());
-            gen_all_geos_data(refnos.clone(), &db_option_ext, None, None).await?;
+            let mut db_option_ext_override = db_option_ext.clone();
+            db_option_ext_override.inner = db_option_clone.clone();
+            gen_all_geos_data(refnos.clone(), &db_option_ext_override, None, None).await?;
 
             db_option_clone.replace_mesh = original_replace_mesh;
             db_option_clone.gen_mesh = original_gen_mesh;
@@ -943,6 +982,8 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
                     ),
                     use_basic_materials: config.use_basic_materials,
                     include_negative: config.include_negative,
+                    allow_surrealdb: true,
+                    cache_dir: None,
                 },
             };
             exporter
@@ -986,8 +1027,9 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
         let original_gen_mesh = db_option_clone.gen_mesh;
         db_option_clone.replace_mesh = Some(true);
         db_option_clone.gen_mesh = true;
-        let db_option_ext = DbOptionExt::from(db_option_clone.clone());
-        gen_all_geos_data(sites.clone(), &db_option_ext, None, None).await?;
+        let mut db_option_ext_override = db_option_ext.clone();
+        db_option_ext_override.inner = db_option_clone.clone();
+        gen_all_geos_data(sites.clone(), &db_option_ext_override, None, None).await?;
         db_option_clone.replace_mesh = original_replace_mesh;
         db_option_clone.gen_mesh = original_gen_mesh;
         unsafe {
@@ -1020,6 +1062,8 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
                     unit_converter: UnitConverter::default(),
                     use_basic_materials: config.use_basic_materials,
                     include_negative: config.include_negative,
+                    allow_surrealdb: true,
+                    cache_dir: None,
                 },
             };
             if let Err(e) = exporter
@@ -1055,6 +1099,8 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
                 unit_converter: UnitConverter::default(),
                 use_basic_materials: config.use_basic_materials,
                 include_negative: config.include_negative,
+                allow_surrealdb: true,
+                cache_dir: None,
             },
         };
 
@@ -1395,22 +1441,59 @@ pub async fn export_dbnum_instances_json_mode(
     db_option_ext: &DbOptionExt,
 ) -> Result<()> {
     use aios_database::fast_model::export_model::export_prepack_lod::{
-        export_dbnum_instances_json, export_global_trans_aabb_json,
+        export_dbnum_instances_json, export_dbnum_instances_json_from_cache,
+        export_global_trans_aabb_json,
     };
     use std::sync::Arc;
 
     println!("\n🎯 导出 dbnum 实例数据为 JSON（含 AABB）");
     println!("====================================");
 
+    // 设置输出目录
+    let output_dir = output_override.unwrap_or_else(|| PathBuf::from("output/instances"));
+
+    if db_option_ext.use_cache {
+        let cache_dir = db_option_ext.get_foyer_cache_dir();
+        let mesh_dir = ExportConfig::default().get_mesh_dir(db_option_ext);
+        let mesh_lod_tag = format!("{:?}", db_option_ext.inner.mesh_precision.default_lod);
+        let result = export_dbnum_instances_json_from_cache(
+            dbnum,
+            &output_dir,
+            &cache_dir,
+            Some(&mesh_dir),
+            Some(mesh_lod_tag.as_str()),
+            verbose,
+            None,
+        )
+        .await;
+        match result {
+            Ok((stats, trans_count, aabb_count)) => {
+                println!("\n🎉 导出完成！（缓存路径）");
+                println!("📊 统计信息:");
+                println!("   - BRAN/HANG/EQUI 分组数量: {}", stats.refno_count);
+                println!("   - 子节点数量: {}", stats.descendant_count);
+                println!("   - 输出文件大小: {} 字节", stats.output_file_size);
+                println!("   - 变换矩阵数量 (trans): {}", trans_count);
+                println!("   - 包围盒数量 (aabb): {}", aabb_count);
+                println!("   - 耗时: {:?}", stats.elapsed_time);
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+    }
+
+    if !db_option_ext.use_surrealdb {
+        return Err(anyhow!("未启用 SurrealDB 且缓存导出失败，无法继续导出"));
+    }
+
     // 连接数据库
     println!("📡 连接数据库...");
     init_surreal().await?;
     println!("✅ 数据库连接成功");
 
-    // 设置输出目录
-    let output_dir = output_override.unwrap_or_else(|| PathBuf::from("output/instances"));
-
-    // 调用导出函数
+    // 调用导出函数（SurrealDB 路径）
     let db_option = Arc::new((**db_option_ext).clone());
     let stats = export_dbnum_instances_json(
         dbnum,
@@ -1421,7 +1504,7 @@ pub async fn export_dbnum_instances_json_mode(
     )
     .await?;
 
-    // 导出全局 trans.json 和 aabb.json
+    // 导出全局 trans.json 和 aabb.json（SurrealDB）
     let (trans_count, aabb_count) =
         export_global_trans_aabb_json(&output_dir, None, verbose).await?;
 

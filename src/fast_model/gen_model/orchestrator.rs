@@ -1031,6 +1031,16 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
         return Ok(());
     }
     if !db_option.inner.enable_sqlite_rtree {
+        // 常见误区：已切换到 cache 生成，但忘了开 enable_sqlite_rtree，导致 spatial_index.sqlite 不会更新，
+        // 房间计算（SQLite RTree 粗筛）会退化/失效。
+        let idx_path = SqliteSpatialIndex::default_path();
+        if !idx_path.exists() {
+            eprintln!(
+                "[gen_model] 警告：use_cache=true 但 enable_sqlite_rtree=false，且未发现 {:?}；模型 AABB 不会落库到 SQLite。\
+                 若需房间计算粗筛/诊断，请在 DbOption.toml 开启 enable_sqlite_rtree=true 或使用 CLI 导入 instances.json。",
+                idx_path
+            );
+        }
         return Ok(());
     }
 

@@ -452,7 +452,7 @@ pub async fn query_geometry_instances_ext_from_cache(
     use aios_core::rs_surreal::inst::ModelHashInst;
     use aios_core::types::PlantAabb;
     use aios_core::RefU64;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     // cache-only：enable_holes=true 时，优先使用 instance_cache 中记录的 inst_relate_bool(Success)。
     // include_negative 暂仅保留签名一致性（缓存里仍会带 Neg/CateNeg 等记录，但导出默认不包含）。
@@ -509,11 +509,13 @@ pub async fn query_geometry_instances_ext_from_cache(
         world_trans: PlantTransform,
         world_aabb: Option<PlantAabb>,
         has_neg: bool,
+        has_cata_neg: bool,
         insts: Vec<ModelHashInst>,
     }
 
     let mut out: Vec<GeomInstQuery> = Vec::new();
     let mut missing: Vec<RefnoEnum> = Vec::new();
+    let mut missing_cata_bool: Vec<RefnoEnum> = Vec::new();
 
     for (dbnum, want_map) in by_dbnum {
         let batch_ids = cache.list_batches(dbnum);
@@ -542,11 +544,21 @@ pub async fn query_geometry_instances_ext_from_cache(
         }
 
         let mut acc_map: HashMap<RefU64, Acc> = HashMap::new();
+        // want_refno 中哪些是“元件库负实体（cata_neg）”目标：这类必须走布尔结果（CatePos）。
+        let mut want_has_cata_neg: HashSet<RefU64> = HashSet::new();
 
         for batch_id in batch_ids {
             let Some(batch) = cache.get(dbnum, &batch_id).await else {
                 continue;
             };
+
+            // 先从 inst_info_map 收集 has_cata_neg（即使某些 refno 暂时没有 inst_geos，也应能报出明确原因）。
+            for (refno, info) in batch.inst_info_map.iter() {
+                let k = refno.refno();
+                if want_map.contains_key(&k) && info.has_cata_neg {
+                    want_has_cata_neg.insert(k);
+                }
+            }
 
             // 逐个 inst_key 扫描并按 refno 聚合；只处理本次需要的 refno 集合。
             for geos_data in batch.inst_geos_map.values() {
@@ -585,6 +597,7 @@ pub async fn query_geometry_instances_ext_from_cache(
                             world_trans: PlantTransform::from(info.world_transform),
                             world_aabb,
                             has_neg,
+                            has_cata_neg: info.has_cata_neg,
                             insts: Vec::new(),
                         }
                     } else {
@@ -600,6 +613,7 @@ pub async fn query_geometry_instances_ext_from_cache(
                             world_trans: PlantTransform::default(),
                             world_aabb,
                             has_neg: false,
+                            has_cata_neg: false,
                             insts: Vec::new(),
                         }
                     }
@@ -647,6 +661,7 @@ pub async fn query_geometry_instances_ext_from_cache(
                         world_trans: PlantTransform::default(),
                         world_aabb: None,
                         has_neg: true,
+                        has_cata_neg: false,
                         insts: Vec::new(),
                     });
                     out.push(GeomInstQuery {
@@ -664,6 +679,14 @@ pub async fn query_geometry_instances_ext_from_cache(
                     });
                     continue;
                 }
+
+                // 元件库 cata_neg：必须导出布尔结果（CatePos）。缺失时给出明确错误（不要伪装成“缓存缺失/跳过”）。
+                if want_has_cata_neg.contains(&want_u64) {
+                    missing_cata_bool.push(want_refno);
+                    // 清理 acc_map 中的残留条目，避免后续误用/误报。
+                    let _ = acc_map.remove(&want_u64);
+                    continue;
+                }
             }
 
             match acc_map.remove(&want_u64) {
@@ -678,6 +701,19 @@ pub async fn query_geometry_instances_ext_from_cache(
                 _ => missing.push(want_refno),
             }
         }
+    }
+
+    if !missing_cata_bool.is_empty() {
+        missing_cata_bool.sort();
+        missing_cata_bool.dedup();
+        anyhow::bail!(
+            "以下 refno 存在元件库负实体(cata_neg)，但未找到布尔结果缓存(inst_relate_bool=Success)，无法导出 CatePos：{:?}\n\
+             处理建议：\n\
+             - 确认本次运行启用了布尔运算（apply_boolean_operation=true / 或命令行 --regen-model 已自动开启）\n\
+             - 确认缓存布尔 worker 已执行且成功写入 instance_cache 的 inst_relate_bool_map\n\
+             - 确认对应 LOD 目录下存在 booled GLB（例如 assets/meshes/lod_L1/<refno>_L1.glb）",
+            missing_cata_bool
+        );
     }
 
     if !missing.is_empty() {

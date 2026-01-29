@@ -66,6 +66,12 @@ async fn main() -> Result<()> {
     db_option_ext.inner.gen_model = false;
     db_option_ext.inner.gen_mesh = false;
 
+    // aios_core 的 init_surreal 使用 DB_OPTION_FILE 选择配置文件；
+    // 示例里 DBOPTION_PATH 仅用于加载 DbOptionExt，因此这里同步设置以避免“看似没用到配置”的困惑。
+    unsafe {
+        std::env::set_var("DB_OPTION_FILE", &dbopt_path);
+    }
+
     // 诊断用：输出房间计算内部 info 日志（默认只写文件；如需同时输出到控制台请设置 AIOS_LOG_TO_CONSOLE=1）。
     aios_database::init_logging(true);
 

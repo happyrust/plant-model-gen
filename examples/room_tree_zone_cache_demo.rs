@@ -27,6 +27,12 @@ async fn main() -> Result<()> {
     let mut db_option_ext = aios_database::options::get_db_option_ext_from_path(&dbopt_path)
         .with_context(|| format!("加载 DbOption 失败: {}", dbopt_path))?;
 
+    // aios_core 的 init_surreal 使用 DB_OPTION_FILE 选择配置文件；
+    // 示例里 DBOPTION_PATH 仅用于加载 DbOptionExt，因此这里同步设置以避免配置不一致。
+    unsafe {
+        std::env::set_var("DB_OPTION_FILE", &dbopt_path);
+    }
+
     // 2) 初始化 SurrealDB（房间计算与 room-tree 查询都需要访问 DB）
     aios_core::init_surreal()
         .await

@@ -6,6 +6,7 @@
 //! - 增量更新、手动 refno、调试模式的处理
 //! - 空间索引和截图捕获的触发
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -96,6 +97,10 @@ pub async fn gen_all_geos_data(
         incr_count,
         target_sesno,
     );
+
+    // TreeIndex 文件（output/scene_tree/{dbnum}.tree）在不少流程中是必需的（Full Noun/导出/层级查询）。
+    // 这里默认启用“缺失则从 SurrealDB 自动重建”，避免因缺文件导致生成结果为空。
+    crate::fast_model::gen_model::tree_index_manager::enable_auto_generate_tree();
 
     // 调试：打印 Full Noun 模式配置
     println!(
@@ -234,6 +239,9 @@ async fn process_full_noun_mode(
         None
     };
     let cache_manager_for_insert = cache_manager.clone();
+    let touched_dbnums: Arc<std::sync::Mutex<BTreeSet<u32>>> =
+        Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    let touched_dbnums_for_insert = touched_dbnums.clone();
 
     let insert_handle = tokio::spawn(async move {
         while let Ok(shape_insts) = receiver.recv_async().await {
@@ -246,6 +254,7 @@ async fn process_full_noun_mode(
             if let Some(ref cache_manager) = cache_manager_for_insert {
                 if let Some(dbnum) = resolve_dbnum_from_shape(&shape_insts).await {
                     cache_manager.insert_from_shape(dbnum, &shape_insts);
+                    let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(dbnum));
                 }
             }
             // 同时写入 Parquet（如果启用）
@@ -450,6 +459,15 @@ async fn process_full_noun_mode(
         time.elapsed().as_millis()
     );
 
+    // 4️⃣ 生成 SQLite 空间索引（从 foyer cache 批量落库）
+    let touched_dbnums_vec: Vec<u32> = touched_dbnums
+        .lock()
+        .map(|s| s.iter().copied().collect())
+        .unwrap_or_default();
+    if let Err(e) = update_sqlite_spatial_index_from_cache(db_option, &touched_dbnums_vec).await {
+        eprintln!("[gen_model] SQLite 空间索引生成失败: {}", e);
+    }
+
     // ✅ 模型生成完毕后导出 instances.json（按 dbno）
     if db_option.export_instances {
         let mut dbnos: Vec<u32> = if let Some(nums) = db_option.inner.manual_db_nums.clone() {
@@ -564,6 +582,9 @@ async fn process_targeted_generation(
         None
     };
     let cache_manager_for_insert = cache_manager.clone();
+    let touched_dbnums: Arc<std::sync::Mutex<BTreeSet<u32>>> =
+        Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    let touched_dbnums_for_insert = touched_dbnums.clone();
 
     let insert_task = tokio::task::spawn(async move {
         while let Ok(shape_insts) = receiver.recv_async().await {
@@ -575,6 +596,7 @@ async fn process_targeted_generation(
             if let Some(ref cache_manager) = cache_manager_for_insert {
                 if let Some(dbnum) = resolve_dbnum_from_shape(&shape_insts).await {
                     cache_manager.insert_from_shape(dbnum, &shape_insts);
+                    let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(dbnum));
                 }
             }
         }
@@ -700,7 +722,14 @@ async fn process_targeted_generation(
         }
     }
 
-    // initialize_spatial_index();
+    // 生成 SQLite 空间索引（从 foyer cache 批量落库）
+    let touched_dbnums_vec: Vec<u32> = touched_dbnums
+        .lock()
+        .map(|s| s.iter().copied().collect())
+        .unwrap_or_default();
+    if let Err(e) = update_sqlite_spatial_index_from_cache(db_option, &touched_dbnums_vec).await {
+        eprintln!("[gen_model] SQLite 空间索引生成失败: {}", e);
+    }
 
     println!(
         "[gen_model] gen_all_geos_data 完成，总耗时 {} ms",
@@ -892,7 +921,10 @@ async fn process_full_database_generation(
         }
     }
 
-    // initialize_spatial_index();
+    // 生成 SQLite 空间索引（从 foyer cache 批量落库）
+    if let Err(e) = update_sqlite_spatial_index_from_cache(db_option, &dbnos).await {
+        eprintln!("[gen_model] SQLite 空间索引生成失败: {}", e);
+    }
 
     println!(
         "[gen_model] gen_all_geos_data 完成，总耗时 {} ms",
@@ -977,6 +1009,81 @@ async fn execute_manual_boolean_operations(
     } else {
         println!("[gen_model] 手动布尔运算模式：没有需要布尔运算的实例");
     }
+}
+
+// ============================================================================
+// SQLite 空间索引：从 foyer cache 生成/增量更新 output/spatial_index.sqlite
+//
+// 目标：模型生成（写 cache）后，将 AABB 批量落库到 SQLite RTree，供房间计算等流程做粗筛。
+// ============================================================================
+
+#[cfg(feature = "sqlite-index")]
+async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums: &[u32]) -> Result<()> {
+    use crate::spatial_index::SqliteSpatialIndex;
+    use crate::sqlite_index::{ImportConfig, SqliteAabbIndex};
+    use std::fs;
+    use std::path::PathBuf;
+
+    if dbnums.is_empty() {
+        return Ok(());
+    }
+    if !db_option.use_cache {
+        return Ok(());
+    }
+    if !db_option.inner.enable_sqlite_rtree {
+        return Ok(());
+    }
+
+    // 打开/初始化索引（幂等）
+    let idx_path = SqliteSpatialIndex::default_path();
+    if let Some(parent) = idx_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    let idx = SqliteAabbIndex::open(&idx_path).map_err(|e| anyhow::anyhow!(e))?;
+    idx.init_schema().map_err(|e| anyhow::anyhow!(e))?;
+
+    // 为避免 aabb.json/trans.json（固定文件名）互相覆盖，每个 dbnum 独立输出目录。
+    let base_out = PathBuf::from("output/instances_cache_for_index");
+    fs::create_dir_all(&base_out).map_err(|e| anyhow::anyhow!(e))?;
+
+    // mesh_lod_tag 仅用于导出侧选择 mesh（用于补齐/计算 AABB）
+    let cache_dir = db_option.get_foyer_cache_dir();
+    let mesh_dir = db_option.inner.get_meshes_path();
+    let mesh_lod_tag = format!("{:?}", db_option.inner.mesh_precision.default_lod);
+
+    // 去重并保证顺序稳定（便于日志与排查）
+    let mut uniq: BTreeSet<u32> = BTreeSet::new();
+    uniq.extend(dbnums.iter().copied());
+
+    for dbnum in uniq {
+        let out_dir = base_out.join(format!("{}", dbnum));
+        fs::create_dir_all(&out_dir).map_err(|e| anyhow::anyhow!(e))?;
+
+        // 1) cache -> instances_{dbnum}.json + aabb.json + trans.json
+        let _ = crate::fast_model::export_model::export_prepack_lod::export_dbnum_instances_json_from_cache(
+            dbnum,
+            &out_dir,
+            &cache_dir,
+            Some(&mesh_dir),
+            Some(mesh_lod_tag.as_str()),
+            false,
+            None,
+        )
+        .await?;
+
+        // 2) instances_{dbnum}.json -> spatial_index.sqlite (RTree)
+        let instances_path = out_dir.join(format!("instances_{}.json", dbnum));
+        if instances_path.exists() {
+            let _ = idx.import_from_instances_json(&instances_path, &ImportConfig::default())?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(feature = "sqlite-index"))]
+async fn update_sqlite_spatial_index_from_cache(_db_option: &DbOptionExt, _dbnums: &[u32]) -> Result<()> {
+    Ok(())
 }
 
 /// 初始化空间索引（如果启用）

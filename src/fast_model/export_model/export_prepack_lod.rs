@@ -2951,7 +2951,70 @@ pub async fn export_dbnum_instances_json_from_cache(
             }
             let points = inst.geo_param.key_points();
             if points.is_empty() {
-                return None;
+                // 一些 geo_param（例如 PrimExtrusion）当前可能没有实现 key_points()。
+                // 为了让 cache->instances/aabb.json 与 SQLite 空间索引闭环可用，这里提供
+                // 一个保守的 fallback：从几何参数的控制点/尺寸推导局部包围盒，再做 world 变换。
+                use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
+                use glam::Vec3;
+
+                match &inst.geo_param {
+                    PdmsGeoParam::PrimExtrusion(e) => {
+                        // e.verts 可能是多段 polyline（外轮廓 + 内孔）；这里做 flatten。
+                        let mut min_x = f32::INFINITY;
+                        let mut min_y = f32::INFINITY;
+                        let mut min_z0 = f32::INFINITY;
+                        let mut max_x = f32::NEG_INFINITY;
+                        let mut max_y = f32::NEG_INFINITY;
+                        let mut max_z0 = f32::NEG_INFINITY;
+
+                        for poly in &e.verts {
+                            for v in poly {
+                                min_x = min_x.min(v.x);
+                                min_y = min_y.min(v.y);
+                                min_z0 = min_z0.min(v.z);
+                                max_x = max_x.max(v.x);
+                                max_y = max_y.max(v.y);
+                                max_z0 = max_z0.max(v.z);
+                            }
+                        }
+                        if !min_x.is_finite() || !min_y.is_finite() || !min_z0.is_finite() {
+                            return None;
+                        }
+
+                        let z_candidates = [min_z0, max_z0, min_z0 + e.height, max_z0 + e.height];
+                        let min_z = z_candidates
+                            .iter()
+                            .cloned()
+                            .fold(f32::INFINITY, f32::min);
+                        let max_z = z_candidates
+                            .iter()
+                            .cloned()
+                            .fold(f32::NEG_INFINITY, f32::max);
+
+                        let corners = [
+                            Vec3::new(min_x, min_y, min_z),
+                            Vec3::new(min_x, min_y, max_z),
+                            Vec3::new(min_x, max_y, min_z),
+                            Vec3::new(min_x, max_y, max_z),
+                            Vec3::new(max_x, min_y, min_z),
+                            Vec3::new(max_x, min_y, max_z),
+                            Vec3::new(max_x, max_y, min_z),
+                            Vec3::new(max_x, max_y, max_z),
+                        ];
+
+                        let mut aabb = Aabb::new_invalid();
+                        for c in corners {
+                            let wp = world_t.transform_point(c);
+                            aabb.take_point(Point::new(wp.x, wp.y, wp.z));
+                        }
+                        let ext = aabb.extents().magnitude();
+                        if ext.is_nan() || ext.is_infinite() {
+                            return None;
+                        }
+                        return Some(aabb);
+                    }
+                    _ => return None,
+                }
             }
             let mut aabb = Aabb::new_invalid();
             for p in points {

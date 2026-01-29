@@ -213,14 +213,21 @@ impl Default for ImportConfig {
 /// 将 refno 字符串（如 "17496_170764"）转换为 i64
 /// 格式：(dbnum << 32) + refno
 pub fn refno_str_to_i64(refno: &str) -> Option<i64> {
-    let parts: Vec<&str> = refno.split('_').collect();
-    if parts.len() == 2 {
-        let dbnum: u32 = parts[0].parse().ok()?;
-        let refno: u32 = parts[1].parse().ok()?;
-        Some(((dbnum as u64) << 32 | refno as u64) as i64)
+    // 兼容 "dbnum_refno" 与 "dbnum/refno" 两种格式
+    let sep = if refno.contains('_') {
+        '_'
+    } else if refno.contains('/') {
+        '/'
     } else {
-        None
+        return None;
+    };
+    let parts: Vec<&str> = refno.split(sep).collect();
+    if parts.len() != 2 {
+        return None;
     }
+    let dbnum: u32 = parts[0].parse().ok()?;
+    let refno: u32 = parts[1].parse().ok()?;
+    Some(((dbnum as u64) << 32 | refno as u64) as i64)
 }
 
 /// 将 i64 转换回 refno 字符串
@@ -248,7 +255,7 @@ impl SqliteAabbIndex {
         let json: serde_json::Value = serde_json::from_reader(reader)
             .map_err(|e| anyhow::anyhow!("解析 JSON 失败: {}", e))?;
 
-        self.import_from_json_value(&json, config)
+        self.import_from_json_value_with_path(&json, config, Some(json_path))
     }
 
     /// 从 JSON Value 导入空间索引
@@ -257,49 +264,276 @@ impl SqliteAabbIndex {
         json: &serde_json::Value,
         config: &ImportConfig,
     ) -> anyhow::Result<ImportStats> {
-        use std::collections::HashMap;
+        self.import_from_json_value_with_path(json, config, None)
+    }
+
+    fn import_from_json_value_with_path(
+        &self,
+        json: &serde_json::Value,
+        config: &ImportConfig,
+        json_path: Option<&Path>,
+    ) -> anyhow::Result<ImportStats> {
+        use std::collections::{HashMap, HashSet};
 
         let mut stats = ImportStats::default();
 
-        let groups = json["groups"].as_array()
+        let groups = json["groups"]
+            .as_array()
             .ok_or_else(|| anyhow::anyhow!("JSON 缺少 groups 数组"))?;
 
-        // 使用 HashMap 合并同一 refno 的多个 AABB
-        let mut aabb_map: HashMap<i64, (String, f64, f64, f64, f64, f64, f64)> = HashMap::new();
+        // 旧格式：group/child 上直接携带 aabb: {min,max}
+        let looks_like_inline_aabb = groups.iter().any(|g| g.get("owner_aabb").is_some())
+            || groups
+                .iter()
+                .flat_map(|g| g.get("children").and_then(|v| v.as_array()).into_iter().flatten())
+                .any(|c| c.get("aabb").is_some());
 
+        if looks_like_inline_aabb {
+            // ========================
+            // 旧格式导入逻辑（min/max 直写）
+            // ========================
+            let mut aabb_map: HashMap<i64, (String, f64, f64, f64, f64, f64, f64)> = HashMap::new();
+
+            for group in groups {
+                let owner_noun = group["owner_noun"].as_str().unwrap_or("");
+
+                match owner_noun {
+                    "EQUI" if config.equi_coarse => {
+                        if let Some(item) = Self::extract_owner_aabb(group) {
+                            Self::merge_aabb(&mut aabb_map, item);
+                            stats.equi_count += 1;
+                        }
+                    }
+                    "BRAN" | "HANG" if config.bran_fine => {
+                        Self::extract_children_aabbs_merged(group, &mut aabb_map, &mut stats);
+                        Self::extract_tubings_aabbs_merged(group, &mut aabb_map, &mut stats);
+                    }
+                    _ => {}
+                }
+            }
+
+            let aabb_items: Vec<_> = aabb_map
+                .into_iter()
+                .map(|(id, (noun, minx, maxx, miny, maxy, minz, maxz))| {
+                    (id, noun, minx, maxx, miny, maxy, minz, maxz)
+                })
+                .collect();
+            stats.unique_count = aabb_items.len();
+            if !aabb_items.is_empty() {
+                self.insert_aabbs_with_items(aabb_items)?;
+            }
+            stats.total_inserted = stats.equi_count + stats.children_count + stats.tubings_count;
+            return Ok(stats);
+        }
+
+        // ========================
+        // 新格式导入逻辑：AABB 去重表 aabb.json + aabb_hash 引用
+        // ========================
+        let aabb_table = {
+            let Some(json_path) = json_path else {
+                return Err(anyhow::anyhow!(
+                    "instances.json 使用 aabb_hash 格式，但未提供 json_path 上下文，无法定位 aabb.json"
+                ));
+            };
+            let base_dir = json_path.parent().ok_or_else(|| anyhow::anyhow!("无法获取 instances.json 所在目录"))?;
+            let aabb_path = base_dir.join("aabb.json");
+            if !aabb_path.exists() {
+                return Err(anyhow::anyhow!(
+                    "instances.json 使用 aabb_hash 格式，但未找到配套 aabb.json: {}",
+                    aabb_path.display()
+                ));
+            }
+            let bytes = std::fs::read(&aabb_path)
+                .map_err(|e| anyhow::anyhow!("读取 aabb.json 失败: {}: {}", aabb_path.display(), e))?;
+            let v: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| anyhow::anyhow!("解析 aabb.json 失败: {}: {}", aabb_path.display(), e))?;
+            v
+        };
+
+        fn aabb_hash_key(v: &serde_json::Value) -> Option<String> {
+            if let Some(s) = v.as_str() {
+                return Some(s.to_string());
+            }
+            if let Some(n) = v.as_u64() {
+                return Some(n.to_string());
+            }
+            if let Some(n) = v.as_i64() {
+                return Some(n.to_string());
+            }
+            None
+        }
+
+        fn aabb_from_table(
+            aabb_table: &serde_json::Value,
+            hash_value: &serde_json::Value,
+        ) -> Option<(f64, f64, f64, f64, f64, f64)> {
+            let key = aabb_hash_key(hash_value)?;
+            let entry = aabb_table.get(&key)?;
+            let min = entry.get("min")?.as_array()?;
+            let max = entry.get("max")?.as_array()?;
+            if min.len() < 3 || max.len() < 3 {
+                return None;
+            }
+            Some((
+                min[0].as_f64()?,
+                max[0].as_f64()?,
+                min[1].as_f64()?,
+                max[1].as_f64()?,
+                min[2].as_f64()?,
+                max[2].as_f64()?,
+            ))
+        }
+
+        fn merge_bounds(
+            acc: &mut Option<(f64, f64, f64, f64, f64, f64)>,
+            b: (f64, f64, f64, f64, f64, f64),
+        ) {
+            *acc = Some(match acc.take() {
+                None => b,
+                Some((minx, maxx, miny, maxy, minz, maxz)) => (
+                    minx.min(b.0),
+                    maxx.max(b.1),
+                    miny.min(b.2),
+                    maxy.max(b.3),
+                    minz.min(b.4),
+                    maxz.max(b.5),
+                ),
+            });
+        }
+
+        // 批量插入（避免一次性 Vec 过大）
+        const CHUNK: usize = 50_000;
+        let mut buf: Vec<(i64, String, f64, f64, f64, f64, f64, f64)> = Vec::with_capacity(CHUNK);
+        let mut seen: HashSet<i64> = HashSet::new();
+
+        let mut flush = |this: &SqliteAabbIndex, buf: &mut Vec<(i64, String, f64, f64, f64, f64, f64, f64)>| -> anyhow::Result<()> {
+            if buf.is_empty() {
+                return Ok(());
+            }
+            let items = std::mem::take(buf);
+            this.insert_aabbs_with_items(items)?;
+            Ok(())
+        };
+
+        // 1) groups：按配置导入
         for group in groups {
-            let owner_noun = group["owner_noun"].as_str().unwrap_or("");
+            let owner_noun = group.get("owner_noun").and_then(|v| v.as_str()).unwrap_or("");
+            let owner_refno = group.get("owner_refno").and_then(|v| v.as_str()).unwrap_or("");
 
-            match owner_noun {
-                "EQUI" if config.equi_coarse => {
-                    // EQUI: 导入 Owner AABB（粗粒度）
-                    if let Some(item) = Self::extract_owner_aabb(group) {
-                        Self::merge_aabb(&mut aabb_map, item);
+            // EQUI coarse：尝试用 children/tubings 的 AABB 合并近似 owner AABB
+            if owner_noun == "EQUI" && config.equi_coarse {
+                if let Some(id) = refno_str_to_i64(owner_refno) {
+                    let mut merged: Option<(f64, f64, f64, f64, f64, f64)> = None;
+                    if let Some(children) = group.get("children").and_then(|v| v.as_array()) {
+                        for child in children {
+                            if let Some(b) = child.get("aabb_hash").and_then(|h| aabb_from_table(&aabb_table, h)) {
+                                merge_bounds(&mut merged, b);
+                            }
+                        }
+                    }
+                    if let Some(tubings) = group.get("tubings").and_then(|v| v.as_array()) {
+                        for t in tubings {
+                            if let Some(b) = t.get("aabb_hash").and_then(|h| aabb_from_table(&aabb_table, h)) {
+                                merge_bounds(&mut merged, b);
+                            }
+                        }
+                    }
+                    if let Some((minx, maxx, miny, maxy, minz, maxz)) = merged {
+                        if seen.insert(id) {
+                            stats.unique_count += 1;
+                        }
                         stats.equi_count += 1;
+                        buf.push((id, owner_noun.to_string(), minx, maxx, miny, maxy, minz, maxz));
+                        if buf.len() >= CHUNK {
+                            flush(self, &mut buf)?;
+                        }
                     }
                 }
-                "BRAN" | "HANG" if config.bran_fine => {
-                    // BRAN/HANG: 导入 Children + Tubings AABB（细粒度）
-                    Self::extract_children_aabbs_merged(group, &mut aabb_map, &mut stats);
-                    Self::extract_tubings_aabbs_merged(group, &mut aabb_map, &mut stats);
+            }
+
+            // BRAN/HANG fine：children + tubings
+            if matches!(owner_noun, "BRAN" | "HANG") && config.bran_fine {
+                if let Some(children) = group.get("children").and_then(|v| v.as_array()) {
+                    for child in children {
+                        let r = child.get("refno").and_then(|v| v.as_str()).unwrap_or("");
+                        let id = match refno_str_to_i64(r) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let Some((minx, maxx, miny, maxy, minz, maxz)) = child
+                            .get("aabb_hash")
+                            .and_then(|h| aabb_from_table(&aabb_table, h))
+                        else {
+                            continue;
+                        };
+                        if seen.insert(id) {
+                            stats.unique_count += 1;
+                        }
+                        stats.children_count += 1;
+                        buf.push((id, owner_noun.to_string(), minx, maxx, miny, maxy, minz, maxz));
+                        if buf.len() >= CHUNK {
+                            flush(self, &mut buf)?;
+                        }
+                    }
                 }
-                _ => {}
+                if let Some(tubings) = group.get("tubings").and_then(|v| v.as_array()) {
+                    for t in tubings {
+                        let r = t.get("refno").and_then(|v| v.as_str()).unwrap_or("");
+                        let id = match refno_str_to_i64(r) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let Some((minx, maxx, miny, maxy, minz, maxz)) = t
+                            .get("aabb_hash")
+                            .and_then(|h| aabb_from_table(&aabb_table, h))
+                        else {
+                            continue;
+                        };
+                        if seen.insert(id) {
+                            stats.unique_count += 1;
+                        }
+                        stats.tubings_count += 1;
+                        buf.push((id, "TUBI".to_string(), minx, maxx, miny, maxy, minz, maxz));
+                        if buf.len() >= CHUNK {
+                            flush(self, &mut buf)?;
+                        }
+                    }
+                }
             }
         }
 
-        // 转换为插入格式
-        let aabb_items: Vec<_> = aabb_map.into_iter()
-            .map(|(id, (noun, minx, maxx, miny, maxy, minz, maxz))| {
-                (id, noun, minx, maxx, miny, maxy, minz, maxz)
-            })
-            .collect();
-
-        stats.unique_count = aabb_items.len();
-
-        // 批量插入
-        if !aabb_items.is_empty() {
-            self.insert_aabbs_with_items(aabb_items)?;
+        // 2) instances：尽量补全（避免漏掉不在 BRAN/HANG/EQUI 分组内的构件）
+        if let Some(instances) = json.get("instances").and_then(|v| v.as_array()) {
+            for inst in instances {
+                let r = inst.get("refno").and_then(|v| v.as_str()).unwrap_or("");
+                let id = match refno_str_to_i64(r) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let Some((minx, maxx, miny, maxy, minz, maxz)) = inst
+                    .get("aabb_hash")
+                    .and_then(|h| aabb_from_table(&aabb_table, h))
+                else {
+                    continue;
+                };
+                let noun = inst
+                    .get("noun")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("")
+                    .to_string();
+                if seen.insert(id) {
+                    stats.unique_count += 1;
+                }
+                // instances 不计入 total_inserted 的原三类统计，但对 room 计算很关键
+                buf.push((id, noun, minx, maxx, miny, maxy, minz, maxz));
+                if buf.len() >= CHUNK {
+                    flush(self, &mut buf)?;
+                }
+            }
         }
+
+        flush(self, &mut buf)?;
 
         stats.total_inserted = stats.equi_count + stats.children_count + stats.tubings_count;
         Ok(stats)

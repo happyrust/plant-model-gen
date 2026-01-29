@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use aios_core::RefnoEnum;
 use std::collections::BTreeMap;
 
+use anyhow::anyhow;
+
 #[derive(Clone, Debug)]
 struct RoomEntry {
     refno: RefnoEnum,
@@ -158,33 +160,16 @@ pub fn create_room_tree_routes() -> Router {
         .route("/api/room-tree/search", post(search_room_tree))
 }
 
-async fn get_room_tree_root() -> Result<Json<NodeResponse>, StatusCode> {
-    Ok(Json(NodeResponse {
-        success: true,
-        node: Some(room_root_node()),
-        error_message: None,
-    }))
-}
-
-async fn get_room_tree_children(
-    Path(id): Path<String>,
-    Query(query): Query<ChildrenQuery>,
-) -> Result<Json<ChildrenResponse>, StatusCode> {
-    let limit = query.limit.unwrap_or(2000).clamp(1, 20000) as usize;
+/// 不经 HTTP 层的核心逻辑：查询指定节点的子节点。
+///
+/// 目的：便于 example/集成脚本复用相同逻辑，不必依赖 axum Router 测试工具链。
+pub async fn room_tree_children_core(id: &str, limit: usize) -> anyhow::Result<ChildrenResponse> {
+    let limit = limit.clamp(1, 20000);
 
     if id == ROOM_ROOT_ID {
-        let map = match query_arch_room_groups().await {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(Json(ChildrenResponse {
-                    success: false,
-                    parent_id: RoomTreeNodeId::Str(id),
-                    children: vec![],
-                    truncated: false,
-                    error_message: Some(format!("query_arch_room_groups failed: {e}")),
-                }));
-            }
-        };
+        let map = query_arch_room_groups()
+            .await
+            .map_err(|e| anyhow!("query_arch_room_groups failed: {e}"))?;
 
         let mut children = map
             .iter()
@@ -202,28 +187,19 @@ async fn get_room_tree_children(
             children.truncate(limit);
         }
 
-        return Ok(Json(ChildrenResponse {
+        return Ok(ChildrenResponse {
             success: true,
             parent_id: RoomTreeNodeId::Str(ROOM_ROOT_ID.to_string()),
             children,
             truncated,
             error_message: None,
-        }));
+        });
     }
 
-    if let Some(group) = parse_group_name(&id) {
-        let map = match query_arch_room_groups().await {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(Json(ChildrenResponse {
-                    success: false,
-                    parent_id: RoomTreeNodeId::Str(id),
-                    children: vec![],
-                    truncated: false,
-                    error_message: Some(format!("query_arch_room_groups failed: {e}")),
-                }));
-            }
-        };
+    if let Some(group) = parse_group_name(id) {
+        let map = query_arch_room_groups()
+            .await
+            .map_err(|e| anyhow!("query_arch_room_groups failed: {e}"))?;
 
         let rooms = map.get(group).cloned().unwrap_or_default();
 
@@ -243,68 +219,52 @@ async fn get_room_tree_children(
             children.truncate(limit);
         }
 
-        return Ok(Json(ChildrenResponse {
+        return Ok(ChildrenResponse {
             success: true,
-            parent_id: RoomTreeNodeId::Str(id),
+            parent_id: RoomTreeNodeId::Str(id.to_string()),
             children,
             truncated,
             error_message: None,
-        }));
+        });
     }
 
-    Ok(Json(ChildrenResponse {
-        success: false,
-        parent_id: RoomTreeNodeId::Str(id.clone()),
-        children: vec![],
-        truncated: false,
-        error_message: Some(format!("unknown node id: {id}")),
-    }))
+    Err(anyhow!("unknown node id: {id}"))
 }
 
-async fn get_room_tree_ancestors(Path(id): Path<String>) -> Result<Json<AncestorsResponse>, StatusCode> {
+/// 不经 HTTP 层的核心逻辑：查询指定节点的祖先链。
+pub async fn room_tree_ancestors_core(id: &str) -> anyhow::Result<AncestorsResponse> {
     if id == ROOM_ROOT_ID {
-        return Ok(Json(AncestorsResponse {
+        return Ok(AncestorsResponse {
             success: true,
             ids: vec![RoomTreeNodeId::Str(ROOM_ROOT_ID.to_string())],
             error_message: None,
-        }));
+        });
     }
 
-    if parse_group_name(&id).is_some() {
-        return Ok(Json(AncestorsResponse {
+    if parse_group_name(id).is_some() {
+        return Ok(AncestorsResponse {
             success: true,
             ids: vec![
-                RoomTreeNodeId::Str(id),
+                RoomTreeNodeId::Str(id.to_string()),
                 RoomTreeNodeId::Str(ROOM_ROOT_ID.to_string()),
             ],
             error_message: None,
-        }));
+        });
     }
 
     // treat as room refno
-    let target = RefnoEnum::from(id.as_str());
+    let target = RefnoEnum::from(id);
     if !target.is_valid() {
-        return Ok(Json(AncestorsResponse {
-            success: false,
-            ids: vec![],
-            error_message: Some(format!("invalid refno: {id}")),
-        }));
+        return Err(anyhow!("invalid refno: {id}"));
     }
 
-    let map = match query_arch_room_groups().await {
-        Ok(v) => v,
-        Err(e) => {
-            return Ok(Json(AncestorsResponse {
-                success: false,
-                ids: vec![],
-                error_message: Some(format!("query_arch_room_groups failed: {e}")),
-            }));
-        }
-    };
+    let map = query_arch_room_groups()
+        .await
+        .map_err(|e| anyhow!("query_arch_room_groups failed: {e}"))?;
 
     for (group, rooms) in map {
         if rooms.iter().any(|r| r.refno == target) {
-            return Ok(Json(AncestorsResponse {
+            return Ok(AncestorsResponse {
                 success: true,
                 ids: vec![
                     RoomTreeNodeId::Refno(target),
@@ -312,40 +272,30 @@ async fn get_room_tree_ancestors(Path(id): Path<String>) -> Result<Json<Ancestor
                     RoomTreeNodeId::Str(ROOM_ROOT_ID.to_string()),
                 ],
                 error_message: None,
-            }));
+            });
         }
     }
 
-    Ok(Json(AncestorsResponse {
-        success: false,
-        ids: vec![],
-        error_message: Some("room not found in ARCH groups".to_string()),
-    }))
+    Err(anyhow!("room not found in ARCH groups"))
 }
 
-async fn search_room_tree(Json(request): Json<SearchRequest>) -> Result<Json<SearchResponse>, StatusCode> {
-    let keyword = request.keyword.trim();
+/// 不经 HTTP 层的核心逻辑：按 keyword 搜索房间树（仅返回 ROOM 节点）。
+pub async fn room_tree_search_core(keyword: &str, limit: usize) -> anyhow::Result<SearchResponse> {
+    let keyword = keyword.trim();
     if keyword.is_empty() {
-        return Ok(Json(SearchResponse {
+        return Ok(SearchResponse {
             success: true,
             items: vec![],
             error_message: None,
-        }));
+        });
     }
 
-    let limit = request.limit.unwrap_or(50).clamp(1, 200) as usize;
+    let limit = limit.clamp(1, 200) as usize;
     let q = keyword.to_lowercase();
 
-    let map = match query_arch_room_groups().await {
-        Ok(v) => v,
-        Err(e) => {
-            return Ok(Json(SearchResponse {
-                success: false,
-                items: vec![],
-                error_message: Some(format!("query_arch_room_groups failed: {e}")),
-            }));
-        }
-    };
+    let map = query_arch_room_groups()
+        .await
+        .map_err(|e| anyhow!("query_arch_room_groups failed: {e}"))?;
 
     let mut out: Vec<RoomTreeNodeDto> = Vec::new();
 
@@ -375,9 +325,60 @@ async fn search_room_tree(Json(request): Json<SearchRequest>) -> Result<Json<Sea
         }
     }
 
-    Ok(Json(SearchResponse {
+    Ok(SearchResponse {
         success: true,
         items: out,
         error_message: None,
+    })
+}
+
+async fn get_room_tree_root() -> Result<Json<NodeResponse>, StatusCode> {
+    Ok(Json(NodeResponse {
+        success: true,
+        node: Some(room_root_node()),
+        error_message: None,
     }))
+}
+
+async fn get_room_tree_children(
+    Path(id): Path<String>,
+    Query(query): Query<ChildrenQuery>,
+) -> Result<Json<ChildrenResponse>, StatusCode> {
+    let limit = query.limit.unwrap_or(2000).clamp(1, 20000) as usize;
+
+    match room_tree_children_core(&id, limit).await {
+        Ok(resp) => Ok(Json(resp)),
+        Err(e) => Ok(Json(ChildrenResponse {
+            success: false,
+            parent_id: RoomTreeNodeId::Str(id),
+            children: vec![],
+            truncated: false,
+            error_message: Some(e.to_string()),
+        })),
+    }
+}
+
+async fn get_room_tree_ancestors(Path(id): Path<String>) -> Result<Json<AncestorsResponse>, StatusCode> {
+    match room_tree_ancestors_core(&id).await {
+        Ok(resp) => Ok(Json(resp)),
+        Err(e) => Ok(Json(AncestorsResponse {
+            success: false,
+            ids: vec![],
+            error_message: Some(e.to_string()),
+        })),
+    }
+}
+
+async fn search_room_tree(Json(request): Json<SearchRequest>) -> Result<Json<SearchResponse>, StatusCode> {
+    let keyword = request.keyword;
+    let limit = request.limit.unwrap_or(50).clamp(1, 200) as usize;
+
+    match room_tree_search_core(&keyword, limit).await {
+        Ok(resp) => Ok(Json(resp)),
+        Err(e) => Ok(Json(SearchResponse {
+            success: false,
+            items: vec![],
+            error_message: Some(e.to_string()),
+        })),
+    }
 }

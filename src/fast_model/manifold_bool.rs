@@ -1087,6 +1087,23 @@ pub async fn run_boolean_worker_from_cache_manager(
         // 负实体：通过关系表（neg_relate/ngmr_relate）定位切割几何，并转换到 pos local space
         let mut neg_manifolds: Vec<ManifoldRust> = Vec::new();
 
+        // CATE 自身孔洞：只应使用 CataNeg。
+        // CataCrossNeg 属于 NGMR（跨对象负实体），其应用目标应由 ngmr_neg_relate_map 决定，
+        // 不能在这里无条件切到自身上，否则会出现错误布尔结果（常见表现：整段被削没/条纹退化）。
+        if info.has_cata_neg {
+            for inst in &inst_geos.insts {
+                if inst.geo_type != GeoBasicType::CataNeg {
+                    continue;
+                }
+                let mesh_id = inst.geo_hash.to_string();
+                let mat = local_mat_for_inst(inst);
+                match load_manifold(&mesh_id, mat, true) {
+                    Ok(m) => neg_manifolds.push(m),
+                    Err(e) => log_load_manifold_failed("cache_cata_neg", refno, &mesh_id, &e),
+                }
+            }
+        }
+
         if let Some(carriers) = neg_relate_map.get(&refno) {
             let mut uniq_carriers: HashSet<RefnoEnum> = HashSet::new();
             uniq_carriers.extend(carriers.iter().copied());

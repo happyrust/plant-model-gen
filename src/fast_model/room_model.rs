@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use polars::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -50,6 +51,40 @@ use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "duckdb-feature")]
 use crate::fast_model::export_model::get_or_init_duckdb_reader;
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn query_insts_for_room_calc(
+    refnos: &[RefnoEnum],
+    enable_holes: bool,
+) -> anyhow::Result<Vec<GeomInstQuery>> {
+    // 默认仍走 SurrealDB；仅当显式开启 cache 模式才切换（避免默认行为变化）。
+    let use_cache = env::var("AIOS_ROOM_USE_CACHE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if !use_cache {
+        return aios_core::query_insts(refnos, enable_holes).await;
+    }
+
+    let cache_dir = env::var("FOYER_CACHE_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("output/instance_cache"));
+
+    crate::fast_model::export_model::model_exporter::query_geometry_instances_ext_from_cache(
+        refnos,
+        &cache_dir,
+        enable_holes,
+        false,
+        env::var("AIOS_ROOM_QUERY_VERBOSE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+    )
+    .await
+}
 
 /// 房间关系构建统计信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -643,15 +678,39 @@ async fn cal_room_refnos_with_options(
 ) -> anyhow::Result<HashSet<RefnoEnum>> {
     let start_time = Instant::now();
     let inside_tol = options.inside_tol;
+    let debug_enabled = env::var("AIOS_ROOM_DEBUG")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let allow_aabb_fallback = env::var("ROOM_RELATION_ALLOW_AABB_FALLBACK")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     // 步骤 1：查询面板的几何实例
-    let panel_geom_insts: Vec<GeomInstQuery> = aios_core::query_insts(&[panel_refno], true)
-        .await
-        .unwrap_or_default();
+    let panel_geom_insts: Vec<GeomInstQuery> =
+        query_insts_for_room_calc(&[panel_refno], true).await.unwrap_or_default();
 
     if panel_geom_insts.is_empty() {
         debug!("面板 {} 没有几何实例", panel_refno);
         return Ok(Default::default());
+    }
+
+    if debug_enabled {
+        println!(
+            "[room_calc] panel={} geom_groups={}",
+            panel_refno,
+            panel_geom_insts.len()
+        );
+        let aabb_cnt = panel_geom_insts.iter().filter(|g| g.world_aabb.is_some()).count();
+        println!("[room_calc] panel={} world_aabb_groups={}", panel_refno, aabb_cnt);
+        if let Some(g) = panel_geom_insts.first() {
+            println!(
+                "[room_calc] panel sample: insts={} has_neg={}",
+                g.insts.len(),
+                g.has_neg
+            );
+        }
     }
 
     // 步骤 2：加载面板 TriMesh（用于点包含测试），并合并面板 AABB
@@ -689,9 +748,30 @@ async fn cal_room_refnos_with_options(
         }
     };
 
+    if debug_enabled {
+        println!(
+            "[room_calc] panel={} merged_aabb=({:.3},{:.3},{:.3})..({:.3},{:.3},{:.3})",
+            panel_refno,
+            panel_aabb.mins.x,
+            panel_aabb.mins.y,
+            panel_aabb.mins.z,
+            panel_aabb.maxs.x,
+            panel_aabb.maxs.y,
+            panel_aabb.maxs.z
+        );
+    }
+
     if panel_meshes.is_empty() {
         debug!("面板 {} 无可用 TriMesh", panel_refno);
-        return Ok(Default::default());
+        if !allow_aabb_fallback {
+            return Ok(Default::default());
+        }
+        if debug_enabled {
+            println!(
+                "[room_calc] panel={} trimesh=0 -> 使用 AABB fallback（粗略）",
+                panel_refno
+            );
+        }
     }
 
     // 步骤 3：粗算 - 通过空间索引查询候选构件
@@ -747,34 +827,95 @@ async fn cal_room_refnos_with_options(
         candidate_count
     );
 
+    if debug_enabled {
+        println!("[room_calc] panel={} candidates={}", panel_refno, candidate_count);
+        for (i, r) in candidates.iter().take(10).enumerate() {
+            println!("[room_calc] candidate[{}]={}", i, r);
+        }
+        if candidate_count > 10 {
+            println!("[room_calc] ... candidates remaining={}", candidate_count - 10);
+        }
+    }
+
+    // 若面板 TriMesh 不可用，则降级为 AABB 包含测试（精度较差，但可用于调试/兜底）。
+    if panel_meshes.is_empty() {
+        let panel_refno_dbg = panel_refno;
+        let tol = inside_tol;
+        let within_refnos =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<HashSet<RefnoEnum>> {
+            let idx = SqliteSpatialIndex::with_default_path()?;
+            let mut within = HashSet::<RefnoEnum>::new();
+            for candidate_refno in candidates {
+                let id: RefU64 = candidate_refno.into();
+                let Some(aabb) = idx.get_aabb(id).ok().flatten() else {
+                    continue;
+                };
+                let caabb: Aabb = aabb.into();
+                // 允许一定 tol：candidate 全包围盒需在 panel AABB 内
+                if caabb.mins.x + tol >= panel_aabb.mins.x
+                    && caabb.mins.y + tol >= panel_aabb.mins.y
+                    && caabb.mins.z + tol >= panel_aabb.mins.z
+                    && caabb.maxs.x - tol <= panel_aabb.maxs.x
+                    && caabb.maxs.y - tol <= panel_aabb.maxs.y
+                    && caabb.maxs.z - tol <= panel_aabb.maxs.z
+                {
+                    within.insert(candidate_refno);
+                }
+            }
+            Ok(within)
+        })
+            .await??;
+
+        info!(
+            "面板 {} 房间计算完成(AABB fallback): 总耗时 {:?}, 粗算 {} -> 细算 {}",
+            panel_refno_dbg,
+            start_time.elapsed(),
+            candidate_count,
+            within_refnos.len()
+        );
+        return Ok(within_refnos);
+    }
+
     // 步骤 4：细算 - 对每个候选构件进行关键点检测
     let fine_start = Instant::now();
     let panel_meshes = Arc::new(panel_meshes);
 
     use futures::stream::{self, StreamExt};
 
+    // 关键优化：候选构件的 inst 查询做“批量一次性”拉取，避免每个候选都扫一遍 cache/DB。
+    // 否则在 cache-only 模式下会出现 O(candidates * batches) 的灾难性开销。
+    let candidate_geom_groups = match query_insts_for_room_calc(&candidates, true).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("批量查询候选构件几何实例失败: error={}", e);
+            Vec::new()
+        }
+    };
+    let candidate_geom_map: HashMap<RefnoEnum, GeomInstQuery> = candidate_geom_groups
+        .into_iter()
+        .map(|g| (g.refno, g))
+        .collect();
+    let candidate_geom_map = Arc::new(candidate_geom_map);
+
+    if debug_enabled {
+        println!(
+            "[room_calc] panel={} candidate_geom_hit={}/{}",
+            panel_refno,
+            candidate_geom_map.len(),
+            candidate_count
+        );
+    }
+
     let within_refnos: HashSet<RefnoEnum> = stream::iter(candidates)
         .map(|candidate_refno| {
             let panel_meshes = panel_meshes.clone();
+            let candidate_geom_map = candidate_geom_map.clone();
             async move {
-                // 查询候选构件的几何实例
-                let candidate_insts = match aios_core::query_insts(&[candidate_refno], true).await {
-                    Ok(insts) => insts,
-                    Err(e) => {
-                        warn!(
-                            "查询候选构件几何实例失败: {}, error: {}",
-                            candidate_refno, e
-                        );
-                        return None;
-                    }
-                };
-
-                if candidate_insts.is_empty() {
+                let Some(geom) = candidate_geom_map.get(&candidate_refno) else {
                     return None;
-                }
-
+                };
                 // 提取候选构件的关键点
-                let key_points = extract_geom_key_points(&candidate_insts);
+                let key_points = extract_geom_key_points(std::slice::from_ref(geom));
 
                 // 判断关键点是否在面板内
                 if is_geom_in_panel(&key_points, panel_meshes.as_ref(), inside_tol) {
@@ -805,6 +946,15 @@ async fn cal_room_refnos_with_options(
         within_refnos.len()
     );
 
+    if debug_enabled {
+        println!(
+            "[room_calc] panel={} within_refnos={} total_time_ms={}",
+            panel_refno,
+            within_refnos.len(),
+            start_time.elapsed().as_millis()
+        );
+    }
+
     Ok(within_refnos)
 }
 
@@ -818,12 +968,16 @@ async fn load_geometry_with_enhanced_cache(
     let cache = get_enhanced_geometry_cache().await;
     let trimesh_cache = get_enhanced_trimesh_cache().await;
 
-    // mesh_dir 已经指向带 LOD 的目录（如 assets/meshes/lod_L1）
-    // 需要获取基础目录（assets/meshes）来尝试不同的 LOD 级别
-    let base_mesh_dir = mesh_dir
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| mesh_dir.clone());
+    // mesh_dir 可能是基础目录（assets/meshes）或 LOD 子目录（assets/meshes/lod_L1）。
+    // 这里统一溯源到不含 lod_ 的基础目录，避免拼错路径（例如误用 assets/lod_L1）。
+    let mut base_mesh_dir = mesh_dir.clone();
+    while let Some(last) = base_mesh_dir.file_name().and_then(|n| n.to_str()) {
+        if last.starts_with("lod_") {
+            base_mesh_dir.pop();
+        } else {
+            break;
+        }
+    }
 
     // 尝试的 LOD 级别顺序：L0 -> L1 -> L2 -> L3
     let lod_levels = ["L0", "L1", "L2", "L3"];

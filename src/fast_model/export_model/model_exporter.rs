@@ -450,10 +450,13 @@ pub async fn query_geometry_instances_ext_from_cache(
     use aios_core::geometry::GeoBasicType;
     use aios_core::rs_surreal::geometry_query::PlantTransform;
     use aios_core::rs_surreal::inst::ModelHashInst;
-    use std::collections::{HashMap, HashSet};
+    use aios_core::types::PlantAabb;
+    use aios_core::RefU64;
+    use std::collections::HashMap;
 
-    // 当前 cache 中已包含最终 geo_type/visible 等结果，enable_holes/include_negative 仅保留签名一致性。
-    let _ = (enable_holes, include_negative);
+    // cache-only：enable_holes=true 时，优先使用 instance_cache 中记录的 inst_relate_bool(Success)。
+    // include_negative 暂仅保留签名一致性（缓存里仍会带 Neg/CateNeg 等记录，但导出默认不包含）。
+    let _ = include_negative;
 
     if refnos.is_empty() {
         if verbose {
@@ -465,12 +468,15 @@ pub async fn query_geometry_instances_ext_from_cache(
     db_meta().ensure_loaded()?;
 
     // 先按 dbnum 分组，避免跨库扫描 batch。
-    let mut by_dbnum: HashMap<u32, HashSet<RefnoEnum>> = HashMap::new();
+    //
+    // 注意：缓存内的 key/refno 可能是 Refno 或 SesRef([refno,sesno]) 两种形式。
+    // 为了与上层（room_calc / export）常用的 Refno 输入兼容，这里按 RefU64 归一化匹配。
+    let mut by_dbnum: HashMap<u32, HashMap<RefU64, RefnoEnum>> = HashMap::new();
     let mut unresolved: Vec<RefnoEnum> = Vec::new();
     for &r in refnos {
         match db_meta().get_dbnum_by_refno(r) {
             Some(dbnum) => {
-                by_dbnum.entry(dbnum).or_default().insert(r);
+                by_dbnum.entry(dbnum).or_default().insert(r.refno(), r);
             }
             None => unresolved.push(r),
         }
@@ -493,10 +499,15 @@ pub async fn query_geometry_instances_ext_from_cache(
 
     let cache = InstanceCacheManager::new(cache_dir).await?;
 
+    // world_aabb：优先从 cache 的 inst_info_map 读取；若缺失则回退到 SQLite 空间索引（若启用）。
+    #[cfg(feature = "sqlite-index")]
+    let sqlite_idx = crate::spatial_index::SqliteSpatialIndex::with_default_path().ok();
+
     #[derive(Default)]
     struct Acc {
         owner: RefnoEnum,
         world_trans: PlantTransform,
+        world_aabb: Option<PlantAabb>,
         has_neg: bool,
         insts: Vec<ModelHashInst>,
     }
@@ -504,14 +515,33 @@ pub async fn query_geometry_instances_ext_from_cache(
     let mut out: Vec<GeomInstQuery> = Vec::new();
     let mut missing: Vec<RefnoEnum> = Vec::new();
 
-    for (dbnum, want_set) in by_dbnum {
+    for (dbnum, want_map) in by_dbnum {
         let batch_ids = cache.list_batches(dbnum);
         if batch_ids.is_empty() {
-            missing.extend(want_set.iter().copied());
+            missing.extend(want_map.values().copied());
             continue;
         }
 
-        let mut acc_map: HashMap<RefnoEnum, Acc> = HashMap::new();
+        // 先收集本 dbnum 下的 bool 成功结果（two-pass，保证 bool 覆盖原始 inst_geos）。
+        let mut bool_success: HashMap<RefU64, String> = HashMap::new();
+        if enable_holes {
+            for batch_id in &batch_ids {
+                let Some(batch) = cache.get(dbnum, batch_id).await else {
+                    continue;
+                };
+                for (r, b) in batch.inst_relate_bool_map {
+                    let k = r.refno();
+                    if !want_map.contains_key(&k) {
+                        continue;
+                    }
+                    if b.status == "Success" && !b.mesh_id.is_empty() {
+                        bool_success.entry(k).or_insert(b.mesh_id);
+                    }
+                }
+            }
+        }
+
+        let mut acc_map: HashMap<RefU64, Acc> = HashMap::new();
 
         for batch_id in batch_ids {
             let Some(batch) = cache.get(dbnum, &batch_id).await else {
@@ -521,17 +551,30 @@ pub async fn query_geometry_instances_ext_from_cache(
             // 逐个 inst_key 扫描并按 refno 聚合；只处理本次需要的 refno 集合。
             for geos_data in batch.inst_geos_map.values() {
                 let refno = geos_data.refno;
-                if !want_set.contains(&refno) {
+                let refno_u64 = refno.refno();
+                if !want_map.contains_key(&refno_u64) {
                     continue;
                 }
 
-                let entry = acc_map.entry(refno).or_insert_with(|| {
+                let entry = acc_map.entry(refno_u64).or_insert_with(|| {
                     if let Some(info) = batch.inst_info_map.get(&refno) {
                         let owner = if info.owner_refno.is_valid() {
                             info.owner_refno
                         } else {
                             refno
                         };
+                        let mut world_aabb: Option<PlantAabb> = info.aabb.map(Into::into);
+                        #[cfg(feature = "sqlite-index")]
+                        {
+                            if world_aabb.is_none() {
+                                if let Some(idx) = sqlite_idx.as_ref() {
+                                    let id: aios_core::RefU64 = refno.into();
+                                    if let Ok(Some(aabb)) = idx.get_aabb(id) {
+                                        world_aabb = Some(aabb.into());
+                                    }
+                                }
+                            }
+                        }
                         let has_neg = batch
                             .neg_relate_map
                             .get(&refno)
@@ -540,25 +583,42 @@ pub async fn query_geometry_instances_ext_from_cache(
                         Acc {
                             owner,
                             world_trans: PlantTransform::from(info.world_transform),
+                            world_aabb,
                             has_neg,
                             insts: Vec::new(),
                         }
                     } else {
+                        #[cfg(feature = "sqlite-index")]
+                        let world_aabb = sqlite_idx
+                            .as_ref()
+                            .and_then(|idx| idx.get_aabb(refno.into()).ok().flatten())
+                            .map(Into::into);
+                        #[cfg(not(feature = "sqlite-index"))]
+                        let world_aabb = None;
                         Acc {
                             owner: refno,
                             world_trans: PlantTransform::default(),
+                            world_aabb,
                             has_neg: false,
                             insts: Vec::new(),
                         }
                     }
                 });
 
+                // enable_holes=true 且已有 booled mesh：保留 owner/world_trans/has_neg，但不再收集原始 inst_geos。
+                if enable_holes && bool_success.contains_key(&refno_u64) {
+                    continue;
+                }
+
                 for inst in &geos_data.insts {
                     if !inst.visible {
                         continue;
                     }
                     match inst.geo_type {
-                        GeoBasicType::Pos | GeoBasicType::DesiPos | GeoBasicType::CatePos => {}
+                        GeoBasicType::Pos
+                        | GeoBasicType::DesiPos
+                        | GeoBasicType::CatePos
+                        | GeoBasicType::Compound => {}
                         _ => continue,
                     }
 
@@ -572,19 +632,50 @@ pub async fn query_geometry_instances_ext_from_cache(
             }
         }
 
-        for refno in want_set {
-            match acc_map.remove(&refno) {
-                Some(acc) if !acc.insts.is_empty() => {
-                    out.push(GeomInstQuery {
-                        refno,
-                        owner: acc.owner,
+        // 对每个想要的 refno（以 RefU64 归一化）组装输出；refno 字段使用调用方输入，避免泄露 SesRef 形式。
+        for (want_u64, want_refno) in want_map {
+            if enable_holes {
+                if let Some(mesh_id) = bool_success.get(&want_u64) {
+                    // bool mesh 在 cache bool_worker 中已写盘到 lod_{default}/ 目录；
+                    // 其坐标系约定为 refno local space。
+                    //
+                    // 注意：导出侧（export_obj 等）对 has_neg=true 的约定是：
+                    // inst.transform 已经是 world_trans.d（等价 SurrealDB booled_id 查询返回值）。
+                    // 若此处使用 identity，则导出时会丢失世界变换，常见表现为子节点（布尔结果 mesh）方位/位置不对。
+                    let acc = acc_map.remove(&want_u64).unwrap_or(Acc {
+                        owner: want_refno,
+                        world_trans: PlantTransform::default(),
                         world_aabb: None,
-                        world_trans: acc.world_trans,
-                        insts: acc.insts,
-                        has_neg: acc.has_neg,
+                        has_neg: true,
+                        insts: Vec::new(),
                     });
+                    out.push(GeomInstQuery {
+                        refno: want_refno,
+                        owner: acc.owner,
+                        world_aabb: acc.world_aabb,
+                        world_trans: acc.world_trans,
+                        insts: vec![ModelHashInst {
+                            geo_hash: mesh_id.clone(),
+                            transform: acc.world_trans,
+                            is_tubi: false,
+                            unit_flag: false,
+                        }],
+                        has_neg: true,
+                    });
+                    continue;
                 }
-                _ => missing.push(refno),
+            }
+
+            match acc_map.remove(&want_u64) {
+                Some(acc) if !acc.insts.is_empty() => out.push(GeomInstQuery {
+                    refno: want_refno,
+                    owner: acc.owner,
+                    world_aabb: acc.world_aabb,
+                    world_trans: acc.world_trans,
+                    insts: acc.insts,
+                    has_neg: acc.has_neg,
+                }),
+                _ => missing.push(want_refno),
             }
         }
     }

@@ -313,31 +313,94 @@ pub async fn collect_export_refnos(
         println!("🌳 收集子孙节点...");
     }
 
-    // 如果有过滤条件，使用过滤查询；否则查询所有子孙节点
-    let descendants = if let Some(nouns) = filter_nouns {
-        let nouns_slice: Vec<&str> = nouns.iter().map(|s| s.as_str()).collect();
-        query_provider::query_multi_descendants(input_refnos, &nouns_slice)
-            .await
-            .context("查询子孙节点失败")?
-    } else {
-        // 查询所有子孙节点（传入空数组表示不过滤类型）
-        query_provider::query_multi_descendants(input_refnos, &[])
-            .await
-            .context("查询子孙节点失败")?
+    // cache-only：层级查询严格走 TreeIndex（indextree），不允许导出阶段回退/自动生成/交互询问。
+    use crate::data_interface::db_meta_manager::db_meta;
+    use crate::fast_model::gen_model::tree_index_manager::{
+        TreeIndexManager, disable_auto_generate_tree, load_index_with_large_stack,
     };
+    use aios_core::tool::db_tool::db1_hash;
+    use aios_core::tree_query::{TreeQueryFilter, TreeQueryOptions};
+    use std::collections::{BTreeMap, HashSet};
+
+    db_meta().ensure_loaded()?;
+
+    // 强制关闭 “缺失则自动从 SurrealDB 生成 tree 文件” 的全局开关，保证导出语义确定。
+    disable_auto_generate_tree();
+
+    let tree_dir = TreeIndexManager::with_default_dir(Vec::new())
+        .tree_dir()
+        .to_path_buf();
+    if !tree_dir.exists() {
+        anyhow::bail!(
+            "TreeIndex 目录不存在: {}\n\
+             需要 cache-only 层级查询，请先生成 output/scene_tree/{{dbnum}}.tree 与 output/scene_tree/db_meta_info.json",
+            tree_dir.display()
+        );
+    }
+
+    let noun_hashes: Option<Vec<u32>> = filter_nouns
+        .filter(|n| !n.is_empty())
+        .map(|nouns| nouns.iter().map(|s| db1_hash(s.as_str())).collect());
+
+    // roots 先按 dbnum 分组，避免跨库读取 tree。
+    let mut by_dbnum: BTreeMap<u32, Vec<RefnoEnum>> = BTreeMap::new();
+    let mut unresolved: Vec<RefnoEnum> = Vec::new();
+    for &root in input_refnos {
+        match db_meta().get_dbnum_by_refno(root) {
+            Some(dbnum) => by_dbnum.entry(dbnum).or_default().push(root),
+            None => unresolved.push(root),
+        }
+    }
+    if !unresolved.is_empty() {
+        anyhow::bail!(
+            "无法从 db_meta_info.json 推导 dbnum（请先生成 output/scene_tree/db_meta_info.json）: {:?}",
+            unresolved
+        );
+    }
 
     // 默认包含自身：roots 在前，后面拼接子孙；并保持顺序去重（避免 query 返回包含 roots 时重复）。
-    let mut out: Vec<RefnoEnum> = Vec::with_capacity(input_refnos.len() + descendants.len());
-    let mut seen: std::collections::HashSet<RefnoEnum> =
-        std::collections::HashSet::with_capacity(input_refnos.len() + descendants.len());
+    let mut out: Vec<RefnoEnum> = Vec::with_capacity(input_refnos.len());
+    let mut seen: HashSet<RefnoEnum> = HashSet::with_capacity(input_refnos.len());
     for &r in input_refnos {
         if seen.insert(r) {
             out.push(r);
         }
     }
-    for r in descendants {
-        if seen.insert(r) {
-            out.push(r);
+
+    for (dbnum, roots) in by_dbnum {
+        let tree_path = tree_dir.join(format!("{dbnum}.tree"));
+        if !tree_path.exists() {
+            anyhow::bail!(
+                "缺少 TreeIndex 文件: {}\n\
+                 cache-only 导出不允许自动生成/回退到 SurrealDB；请先生成该 .tree 文件。",
+                tree_path.display()
+            );
+        }
+
+        // 大栈线程加载，避免 Windows 反序列化大 `.tree` 文件触发栈溢出。
+        let index = load_index_with_large_stack(&tree_dir, dbnum).with_context(|| {
+            format!(
+                "加载 TreeIndex 失败: {}",
+                tree_path.display()
+            )
+        })?;
+
+        let options = TreeQueryOptions {
+            include_self: false,
+            max_depth: None,
+            filter: TreeQueryFilter {
+                noun_hashes: noun_hashes.clone(),
+                ..Default::default()
+            },
+        };
+
+        for root in roots {
+            for r in index.collect_descendants_bfs(root.refno(), &options) {
+                let r = RefnoEnum::from(r);
+                if r.is_valid() && seen.insert(r) {
+                    out.push(r);
+                }
+            }
         }
     }
 
@@ -557,6 +620,56 @@ pub async fn query_geometry_instances_ext_from_cache(
                 let k = refno.refno();
                 if want_map.contains_key(&k) && info.has_cata_neg {
                     want_has_cata_neg.insert(k);
+                }
+            }
+
+            // tubing 节点在 cache 中以 inst_tubi_map(EleGeosInfo) 形式存在：
+            // - 通常不会出现在 inst_geos_map（否则会被当作普通构件几何）
+            // - 导出/房间计算期需要把它们拼成一条“带 is_tubi=true 的几何实例”
+            //
+            // 注意：这里用 world_trans + local(identity) 表达 tubing 的世界变换，
+            // 以复用导出侧统一的 world_trans * local_transform 逻辑。
+            {
+                use aios_core::prim_geo::basic::TUBI_GEO_HASH;
+                for (refno, info) in batch.inst_tubi_map.iter() {
+                    let k = refno.refno();
+                    if !want_map.contains_key(&k) {
+                        continue;
+                    }
+
+                    let entry = acc_map.entry(k).or_insert_with(|| Acc {
+                        owner: *refno,
+                        world_trans: PlantTransform::default(),
+                        world_aabb: None,
+                        has_neg: false,
+                        has_cata_neg: false,
+                        insts: Vec::new(),
+                    });
+
+                    entry.owner = if info.owner_refno.is_valid() {
+                        info.owner_refno
+                    } else {
+                        *refno
+                    };
+                    entry.world_trans = PlantTransform::from(info.world_transform);
+                    entry.world_aabb = info.aabb.map(Into::into);
+                    entry.has_neg = false;
+                    entry.has_cata_neg = false;
+
+                    // 避免跨 batch 重复追加同一 tubing 实例
+                    let already_has_tubi = entry.insts.iter().any(|x| x.is_tubi);
+                    if !already_has_tubi {
+                        let geo_hash = info
+                            .cata_hash
+                            .clone()
+                            .unwrap_or_else(|| TUBI_GEO_HASH.to_string());
+                        entry.insts.push(ModelHashInst {
+                            geo_hash,
+                            transform: PlantTransform::default(), // identity local
+                            is_tubi: true,
+                            unit_flag: false,
+                        });
+                    }
                 }
             }
 

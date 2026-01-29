@@ -21,7 +21,12 @@ use gen_xkt::xkt::XKTGeometryType;
 
 use super::export_common::{ExportData, collect_export_data};
 use super::model_exporter::{
-    ExportStats, ModelExporter, XktExportConfig, collect_export_refnos, query_geometry_instances,
+    ExportStats,
+    ModelExporter,
+    XktExportConfig,
+    collect_export_refnos,
+    query_geometry_instances_ext,
+    query_geometry_instances_ext_from_cache,
 };
 
 /// 几何体统计信息
@@ -564,7 +569,29 @@ impl ModelExporter for XktExporter {
             .await?;
         }
 
-        let geom_insts = query_geometry_instances(&all_refnos, true, config.common.verbose).await?;
+        let geom_insts = if config.common.allow_surrealdb {
+            query_geometry_instances_ext(
+                &all_refnos,
+                true,
+                config.common.include_negative,
+                config.common.verbose,
+            )
+            .await?
+        } else {
+            let cache_dir = config
+                .common
+                .cache_dir
+                .as_ref()
+                .context("allow_surrealdb=false 时必须提供 CommonExportConfig.cache_dir")?;
+            query_geometry_instances_ext_from_cache(
+                &all_refnos,
+                cache_dir,
+                true,
+                config.common.include_negative,
+                config.common.verbose,
+            )
+            .await?
+        };
 
         let export_data =
             collect_export_data(geom_insts, &all_refnos, mesh_dir, config.common.verbose, None)

@@ -16,7 +16,12 @@ use crate::fast_model::unit_converter::UnitConverter;
 
 use super::export_common::{ExportData, collect_export_data};
 use super::model_exporter::{
-    ExportStats, GltfExportConfig, ModelExporter, collect_export_refnos, query_geometry_instances,
+    ExportStats,
+    GltfExportConfig,
+    ModelExporter,
+    collect_export_refnos,
+    query_geometry_instances_ext,
+    query_geometry_instances_ext_from_cache,
 };
 
 /// 导出指定 refno 的整体 glTF 模型（JSON + BIN）
@@ -665,7 +670,29 @@ impl ModelExporter for GltfExporter {
 
         stats.descendant_count = all_refnos.len().saturating_sub(refnos.len());
 
-        let geom_insts = query_geometry_instances(&all_refnos, true, config.common.verbose).await?;
+        let geom_insts = if config.common.allow_surrealdb {
+            query_geometry_instances_ext(
+                &all_refnos,
+                true,
+                config.common.include_negative,
+                config.common.verbose,
+            )
+            .await?
+        } else {
+            let cache_dir = config
+                .common
+                .cache_dir
+                .as_ref()
+                .context("allow_surrealdb=false 时必须提供 CommonExportConfig.cache_dir")?;
+            query_geometry_instances_ext_from_cache(
+                &all_refnos,
+                cache_dir,
+                true,
+                config.common.include_negative,
+                config.common.verbose,
+            )
+            .await?
+        };
 
         let export_data = collect_export_data(
             geom_insts,

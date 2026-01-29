@@ -51,6 +51,7 @@ pub mod query_compat;
 pub mod query_provider; // 新的统一查询提供者 // 查询兼容层
 pub mod db_meta_cache;
 pub mod instance_cache;
+pub mod cache_flush;
 
 pub mod utils;
 pub mod precheck;

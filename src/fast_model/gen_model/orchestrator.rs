@@ -68,6 +68,12 @@ pub async fn gen_all_geos_data(
 
     // 如果指定了 target_sesno，获取该 sesno 的增量数据
     if let Some(sesno) = target_sesno {
+        if !db_option.use_surrealdb {
+            return Err(FullNounError::Other(anyhow::anyhow!(
+                "cache-only 模式下不支持 --target-sesno（需要从 SurrealDB 获取 element_changes）：sesno={}",
+                sesno
+            )));
+        }
         if final_incr_updates.is_none() {
             match get_changes_at_sesno(sesno).await {
                 Ok(sesno_changes) => {
@@ -99,8 +105,12 @@ pub async fn gen_all_geos_data(
     );
 
     // TreeIndex 文件（output/scene_tree/{dbnum}.tree）在不少流程中是必需的（Full Noun/导出/层级查询）。
-    // 这里默认启用“缺失则从 SurrealDB 自动重建”，避免因缺文件导致生成结果为空。
-    crate::fast_model::gen_model::tree_index_manager::enable_auto_generate_tree();
+    // cache-only：不允许自动生成/回退 SurrealDB；缺失即报错，避免“看似成功但数据为空”。
+    if db_option.use_surrealdb {
+        crate::fast_model::gen_model::tree_index_manager::enable_auto_generate_tree();
+    } else {
+        crate::fast_model::gen_model::tree_index_manager::disable_auto_generate_tree();
+    }
 
     // 调试：打印 Full Noun 模式配置
     println!(
@@ -110,11 +120,13 @@ pub async fn gen_all_geos_data(
         db_option.get_full_noun_batch_size()
     );
 
-    // ✅ 核心修复：确保 inst_relate 表已定义（显式创建 RELATION 表及索引）
-    if let Err(e) = aios_core::rs_surreal::inst::init_model_tables().await {
-        eprintln!("[gen_model] ❌ 初始化 inst_relate 表结构失败: {}", e);
-        // 严重错误，建议直接中断，否则后续写入必挂
-        return Err(FullNounError::Other(e));
+    // ✅ SurrealDB 写入侧初始化：仅在 use_surrealdb=true 时需要。
+    if db_option.use_surrealdb {
+        if let Err(e) = aios_core::rs_surreal::inst::init_model_tables().await {
+            eprintln!("[gen_model] ❌ 初始化 inst_relate 表结构失败: {}", e);
+            // 严重错误，建议直接中断，否则后续写入必挂
+            return Err(FullNounError::Other(e));
+        }
     }
 
     // =========================

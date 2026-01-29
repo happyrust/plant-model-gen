@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use aios_core::shape::pdms_shape::PlantMesh;
-use aios_core::{NamedAttrValue, RefnoEnum, get_named_attmap};
+use aios_core::RefnoEnum;
 use anyhow::{Context, Result, anyhow};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use image::{Rgba, RgbaImage};
@@ -363,41 +363,9 @@ fn diff_png(expected_path: &Path, actual_path: &Path, out_path: &Path) -> Result
 }
 
 async fn resolve_capture_basename(refno: RefnoEnum) -> String {
-    let fallback_raw = refno.to_string().replace('/', "_");
-    let fallback = sanitize_label(&fallback_raw);
-    if let Ok(attmap) = get_named_attmap(refno).await {
-        if let Some(name) = attmap.map.get("NAME").and_then(attr_to_string) {
-            let sanitized = sanitize_label(&name);
-            if !sanitized.is_empty() {
-                return sanitized;
-            }
-        }
-
-        let noun = attmap
-            .map
-            .get("TYPE")
-            .or_else(|| attmap.map.get("NOUN"))
-            .and_then(attr_to_string)
-            .unwrap_or_else(|| "OBJECT".to_string());
-        let combined = format!("{}_{}", noun, fallback_raw);
-        let sanitized = sanitize_label(&combined);
-        if !sanitized.is_empty() {
-            return sanitized;
-        }
-    }
-
-    fallback
-}
-
-fn attr_to_string(value: &NamedAttrValue) -> Option<String> {
-    match value {
-        NamedAttrValue::StringType(s)
-        | NamedAttrValue::WordType(s)
-        | NamedAttrValue::ElementType(s) => Some(s.clone()),
-        NamedAttrValue::RefU64Type(r) => Some(r.to_string()),
-        NamedAttrValue::RefnoEnumType(r) => Some(r.to_string()),
-        _ => None,
-    }
+    // cache-only：导出/截图阶段不查库补齐 NAME/TYPE，避免引入 SurrealDB 依赖。
+    let raw = refno.to_string().replace('/', "_");
+    sanitize_label(&raw)
 }
 
 fn sanitize_label(name: &str) -> String {
@@ -435,30 +403,8 @@ fn mesh_with_unit_conversion(mesh: &PlantMesh, unit_converter: &UnitConverter) -
 }
 
 async fn get_display_label(refno: RefnoEnum) -> String {
-    if let Ok(attmap) = get_named_attmap(refno).await {
-        // 优先使用 NAME 属性
-        if let Some(name) = attmap.map.get("NAME").and_then(attr_to_string) {
-            let trimmed = name.trim();
-            if !trimmed.is_empty() {
-                // 去掉开头的斜线
-                return trimmed.trim_start_matches('/').to_string();
-            }
-        }
-
-        // 如果没有 NAME，使用 NOUN 或 TYPE + 参考号
-        let noun = attmap
-            .map
-            .get("TYPE")
-            .or_else(|| attmap.map.get("NOUN"))
-            .and_then(attr_to_string)
-            .unwrap_or_else(|| "OBJECT".to_string());
-        let refno_str = refno.to_string().trim_start_matches('/').to_string();
-        return format!("{}_{}", noun, refno_str);
-    }
-
-    // 如果无法获取属性，使用参考号（去掉开头的斜线）
     let refno_str = refno.to_string().trim_start_matches('/').to_string();
-    format!("REFNO_{}", refno_str)
+    refno_str
 }
 
 fn render_mesh_to_png(

@@ -15,7 +15,7 @@ use aios_database::options::DbOptionExt;
 // use aios_database::fast_model::export_xkt::XktExporter;
 use aios_database::fast_model::model_exporter::{
     CommonExportConfig, GlbExportConfig, GltfExportConfig, ModelExporter, ObjExportConfig,
-    XktExportConfig,
+    XktExportConfig, collect_export_refnos,
 };
 use aios_database::fast_model::unit_converter::{LengthUnit, UnitConverter};
 
@@ -277,20 +277,13 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     println!("\n🎯 OBJ 导出模式");
     println!("================");
 
-    // 注意：目前模型生成/层级查询仍可能依赖 SurrealDB 作为“读取侧”数据源。
-    // 这里的 use_surrealdb 主要控制“写入/导出期扫库”路径；OBJ 导出数据源是否走 DB 由
-    // CommonExportConfig.allow_surrealdb 决定（debug-model 默认 cache-only）。
-    let need_surreal_for_run = db_option_ext.use_surrealdb || config.regenerate_plant_mesh;
-    if need_surreal_for_run {
-        if db_option_ext.use_surrealdb {
-            println!("\n📡 连接数据库（SurrealDB 启用）...");
-        } else {
-            println!("\n📡 连接数据库（仅用于模型生成查询；OBJ 导出仍使用缓存数据源）...");
-        }
+    // cache-only：OBJ 导出默认不连接 SurrealDB；如需对照/迁移验证，才显式开启 use_surrealdb。
+    if db_option_ext.use_surrealdb {
+        println!("\n📡 连接数据库（SurrealDB 启用）...");
         init_surreal().await?;
         println!("✅ 数据库连接成功");
     } else {
-        println!("\n📦 未启用 SurrealDB：OBJ 导出使用缓存数据源（不回退）");
+        println!("\n📦 cache-only：OBJ 导出使用 foyer 缓存数据源（不回退 SurrealDB）");
     }
 
     // 如果需要导出 SVG，设置环境变量
@@ -349,7 +342,6 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             println!("   - 强制开启 replace_mesh 和 gen_mesh");
 
             use aios_database::fast_model::gen_all_geos_data;
-            use aios_database::fast_model::query_provider;
 
             unsafe {
                 std::env::set_var("FORCE_REPLACE_MESH", "true");
@@ -363,30 +355,10 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
 
             let mut db_option_ext_override = db_option_ext.clone();
             db_option_ext_override.inner = db_option_clone.clone();
-            // 导出若包含子孙节点，regen 也必须覆盖同一范围，否则 replace 模式会清理旧 ngmr/neg 关系，
-            // 但本次未重建子孙几何，导致布尔缺失，导出回退到“未布尔”的正实体 mesh。
-            let regen_refnos = if config.include_descendants {
-                let descendants = query_provider::query_multi_descendants(&refnos, &[])
-                    .await
-                    .unwrap_or_default();
-                // 默认包含自身：roots 在前，后面拼接子孙；保持顺序去重。
-                let mut out = Vec::with_capacity(refnos.len() + descendants.len());
-                let mut seen =
-                    std::collections::HashSet::with_capacity(refnos.len() + descendants.len());
-                for &r in &refnos {
-                    if seen.insert(r) {
-                        out.push(r);
-                    }
-                }
-                for r in descendants {
-                    if seen.insert(r) {
-                        out.push(r);
-                    }
-                }
-                out
-            } else {
-                refnos.clone()
-            };
+            // 导出若包含子孙节点，regen 也必须覆盖同一范围；此处使用 TreeIndex(cache-only) 计算子孙集合。
+            let regen_refnos =
+                collect_export_refnos(&refnos, config.include_descendants, None, config.verbose)
+                    .await?;
             gen_all_geos_data(regen_refnos, &db_option_ext_override, None, None).await?;
 
             db_option_clone.replace_mesh = original_replace_mesh;
@@ -571,9 +543,20 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     println!("\n🎯 GLB 导出模式");
     println!("================");
 
-    println!("\n📡 连接数据库...");
-    init_surreal().await?;
-    println!("✅ 数据库连接成功");
+    // cache-only：仅当需要查询 MDB dbnum/SITE 列表等“扫库”能力时才连接 SurrealDB。
+    let need_db_scan = config.run_all_dbnos || config.dbnum.is_some();
+    if need_db_scan && !db_option_ext.use_surrealdb {
+        return Err(anyhow!(
+            "GLB 导出（run_all_dbnos/dbnum）需要 SurrealDB 读取侧；当前 use_surrealdb=false"
+        ));
+    }
+    if db_option_ext.use_surrealdb {
+        println!("\n📡 连接数据库（SurrealDB 启用）...");
+        init_surreal().await?;
+        println!("✅ 数据库连接成功");
+    } else {
+        println!("\n📦 cache-only：GLB 导出使用 foyer 缓存数据源（不回退 SurrealDB）");
+    }
 
     // 获取 mesh 目录
     let mesh_dir = config.get_mesh_dir(db_option_ext);
@@ -627,7 +610,10 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
 
             let mut db_option_ext_override = db_option_ext.clone();
             db_option_ext_override.inner = db_option_clone.clone();
-            gen_all_geos_data(refnos.clone(), &db_option_ext_override, None, None).await?;
+            let regen_refnos =
+                collect_export_refnos(&refnos, config.include_descendants, None, config.verbose)
+                    .await?;
+            gen_all_geos_data(regen_refnos, &db_option_ext_override, None, None).await?;
 
             db_option_clone.replace_mesh = original_replace_mesh;
             db_option_clone.gen_mesh = original_gen_mesh;
@@ -662,8 +648,12 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
                     ),
                     use_basic_materials: config.use_basic_materials,
                     include_negative: config.include_negative,
-                    allow_surrealdb: true,
-                    cache_dir: None,
+                    allow_surrealdb: db_option_ext.use_surrealdb,
+                    cache_dir: if db_option_ext.use_surrealdb {
+                        None
+                    } else {
+                        Some(db_option_ext.get_foyer_cache_dir())
+                    },
                 },
             };
             let _ = GlbExporter::new()
@@ -803,9 +793,20 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
     println!("\n🎯 glTF 导出模式");
     println!("================");
 
-    println!("\n📡 连接数据库...");
-    init_surreal().await?;
-    println!("✅ 数据库连接成功");
+    // cache-only：仅当需要查询 MDB dbnum/SITE 列表等“扫库”能力时才连接 SurrealDB。
+    let need_db_scan = config.run_all_dbnos || config.dbnum.is_some();
+    if need_db_scan && !db_option_ext.use_surrealdb {
+        return Err(anyhow!(
+            "glTF 导出（run_all_dbnos/dbnum）需要 SurrealDB 读取侧；当前 use_surrealdb=false"
+        ));
+    }
+    if db_option_ext.use_surrealdb {
+        println!("\n📡 连接数据库（SurrealDB 启用）...");
+        init_surreal().await?;
+        println!("✅ 数据库连接成功");
+    } else {
+        println!("\n📦 cache-only：glTF 导出使用 foyer 缓存数据源（不回退 SurrealDB）");
+    }
 
     // 获取 mesh 目录
     let mesh_dir = config.get_mesh_dir(db_option_ext);
@@ -838,7 +839,7 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
         println!("📊 查询该数据库下的所有 SITE...");
 
         use aios_database::fast_model::query_provider;
-        let sites = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
+        let sites: Vec<RefnoEnum> = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
         println!("   - 找到 {} 个 SITE", sites.len());
 
         if sites.is_empty() {
@@ -901,8 +902,12 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
                     ),
                     use_basic_materials: config.use_basic_materials,
                     include_negative: config.include_negative,
-                    allow_surrealdb: true,
-                    cache_dir: None,
+                    allow_surrealdb: db_option_ext.use_surrealdb,
+                    cache_dir: if db_option_ext.use_surrealdb {
+                        None
+                    } else {
+                        Some(db_option_ext.get_foyer_cache_dir())
+                    },
                 },
             };
             match exporter
@@ -947,7 +952,10 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
 
             let mut db_option_ext_override = db_option_ext.clone();
             db_option_ext_override.inner = db_option_clone.clone();
-            gen_all_geos_data(refnos.clone(), &db_option_ext_override, None, None).await?;
+            let regen_refnos =
+                collect_export_refnos(&refnos, config.include_descendants, None, config.verbose)
+                    .await?;
+            gen_all_geos_data(regen_refnos, &db_option_ext_override, None, None).await?;
 
             db_option_clone.replace_mesh = original_replace_mesh;
             db_option_clone.gen_mesh = original_gen_mesh;
@@ -1007,7 +1015,7 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
     println!("📊 查询该数据库下的所有 SITE...");
 
     use aios_database::fast_model::query_provider;
-    let sites = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
+    let sites: Vec<RefnoEnum> = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
     println!("   - 找到 {} 个 SITE", sites.len());
 
     if sites.is_empty() {

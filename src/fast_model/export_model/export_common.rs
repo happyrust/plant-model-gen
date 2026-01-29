@@ -3,10 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use aios_core::{RecordId, SurrealQueryExt};
-use aios_core::rs_surreal::query_tubi_insts_by_brans;
 use aios_core::shape::pdms_shape::PlantMesh;
-use aios_core::{GeomInstQuery, RefnoEnum, SUL_DB, TubiInstQuery, get_named_attmap};
+use aios_core::{GeomInstQuery, RefnoEnum};
 use anyhow::{Context, Result, anyhow};
 use bevy_transform::components::Transform;
 use chrono;
@@ -21,9 +19,7 @@ use std::io::Write;
 use aios_core::geometry::csg::{unit_box_mesh, unit_cylinder_mesh, unit_sphere_mesh};
 use aios_core::mesh_precision::LodMeshSettings;
 
-use crate::fast_model::mesh_generate::gen_inst_meshes_by_geo_ids;
-use crate::fast_model::query_provider;
-use crate::options::get_db_option_ext;
+
 
 /// 清洗节点名称，确保符合 glTF 规范
 ///
@@ -281,312 +277,62 @@ pub struct ExportData {
 /// 收集导出数据（分离元件和 TUBI）
 pub async fn collect_export_data(
     geom_insts: Vec<GeomInstQuery>,
-    refnos: &[RefnoEnum],
+    _refnos: &[RefnoEnum],
     mesh_dir: &Path,
     verbose: bool,
-    bran_roots: Option<&[RefnoEnum]>,
+    _bran_roots: Option<&[RefnoEnum]>,
 ) -> Result<ExportData> {
     if verbose {
         println!("   - 找到 {} 个几何体组", geom_insts.len());
-    }
-
-    let mut total_instances: usize = geom_insts.iter().map(|g| g.insts.len()).sum();
-    if verbose {
-        println!("   - 总几何体实例数: {}", total_instances);
     }
 
     if verbose {
         println!("\n🔨 收集实例信息...");
     }
 
-    // 记录 owner 的 noun / 设备类型（目前仅关心 EQUI）
-    let mut owner_noun_map: HashMap<RefnoEnum, String> = HashMap::new();
-    let mut owner_type_map: HashMap<RefnoEnum, String> = HashMap::new();
-
-    // 先准备 owner 集合，后续用来过滤 BRAN/HANG 查询 tubi
-    let mut owner_refnos: Vec<RefnoEnum> = geom_insts.iter().map(|g| g.owner).collect();
-    owner_refnos.sort();
-    owner_refnos.dedup();
-
-    if !owner_refnos.is_empty() {
-        let mut owner_tasks = FuturesUnordered::new();
-        for owner in &owner_refnos {
-            let owner_ref = *owner;
-            owner_tasks.push(async move {
-                let mut noun: Option<String> = None;
-                let mut owner_type: Option<String> = None;
-
-                // 导出阶段只需要 PE 的基本信息（name/noun/owner），不应依赖 TreeIndex，
-                // 否则会触发加载巨大 .tree 索引并导致栈溢出/额外开销。
-                if let Ok(Some(pe)) = aios_core::get_pe(owner_ref).await {
-                    if !pe.noun.is_empty() {
-                        noun = Some(pe.noun.to_uppercase());
-                    }
-                }
-
-                // 对于设备 EQUI，尝试从命名属性中获取类型信息
-                if matches!(noun.as_deref(), Some("EQUI")) {
-                    if let Ok(attmap) = get_named_attmap(owner_ref).await {
-                        // 根据现有命名习惯，尝试几个常见字段；若需要可以再细化
-                        let keys = ["EQUI_TYPE", "EQUIP_TYPE", "TYPE"];
-                        for key in keys {
-                            if let Some(t) = attmap.get_as_string(key) {
-                                if !t.is_empty() {
-                                    owner_type = Some(t);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                (owner_ref, noun, owner_type)
-            });
-        }
-
-        while let Some((owner_ref, noun, owner_type)) = owner_tasks.next().await {
-            if let Some(noun) = noun {
-                owner_noun_map.insert(owner_ref, noun);
-            }
-            if let Some(owner_type) = owner_type {
-                owner_type_map.insert(owner_ref, owner_type);
-            }
-        }
-    }
-
-    // 先为输入 refnos 预取名称/类型，便于判定 BRAN/HANG
-    let mut refno_name_map: HashMap<RefnoEnum, String> = HashMap::new();
-    let mut refno_noun_map: HashMap<RefnoEnum, String> = HashMap::new();
-
-    if !refnos.is_empty() {
-        let mut name_tasks = FuturesUnordered::new();
-        for refno in refnos {
-            let refno = *refno;
-            name_tasks.push(async move {
-                let mut name = None;
-                let mut noun = None;
-
-                // 导出阶段直接走 SurrealDB 查询 PE，避免引入 TreeIndex 依赖
-                if let Ok(Some(pe)) = aios_core::get_pe(refno).await {
-                    if !pe.name.is_empty() {
-                        name = Some(pe.name);
-                    }
-                    noun = Some(pe.noun);
-                }
-
-                if name.is_none() {
-                    if let Ok(attmap) = get_named_attmap(refno).await {
-                        if let Some(attr_name) = attmap.get_as_string("NAME") {
-                            if !attr_name.is_empty() {
-                                name = Some(attr_name);
-                            }
-                        }
-                        if noun.is_none() {
-                            noun = Some(attmap.get_type_str().to_string());
-                        }
-                    }
-                }
-
-                (refno, name, noun)
-            });
-        }
-
-        while let Some((refno, name, noun)) = name_tasks.next().await {
-            if let Some(name) = name {
-                let trimmed = trim_leading_slash(&name);
-                if !trimmed.is_empty() {
-                    refno_name_map.insert(refno, trimmed);
-                }
-            }
-            if let Some(noun) = noun {
-                refno_noun_map.insert(refno, noun.to_uppercase());
-            }
-        }
-    }
-
-    // 🏗️ 分层导出架构：使用从 inst_relate 查询的 BRAN/HANG owner
-    // bran_roots 已经包含真正有子节点的 BRAN/HANG，无需额外过滤
-    let bran_owners: Vec<RefnoEnum> = if let Some(roots) = bran_roots {
-        if verbose {
-            println!(
-                "   ✅ 使用 inst_relate 查询的 BRAN/HANG owner: {} 个",
-                roots.len()
-            );
-        }
-        roots.to_vec()
-    } else {
-        // 如果外部未提供 bran_roots，尝试从输入的 refnos 中筛选 BRAN/HANG
-        let derived_roots: Vec<RefnoEnum> = refnos.iter()
-            .filter(|r| {
-                if let Some(noun) = refno_noun_map.get(r) {
-                    noun == "BRAN" || noun == "HANG"
-                } else {
-                    false
-                }
-            })
-            .cloned()
-            .collect();
-            
-        if verbose {
-            println!("   ⚠️  bran_roots 参数未提供，从 refnos 推导 BRAN/HANG: {} 个", derived_roots.len());
-        }
-        derived_roots
-    };
-
-    if verbose {
-        println!("\n📊 查询 tubi 管道数据...");
-        println!("   - 查询的 refno 数量: {}", refnos.len());
-        for (i, refno) in refnos.iter().take(5).enumerate() {
-            println!("   - refno[{}]: {}", i, refno);
-        }
-        if refnos.len() > 5 {
-            println!("   - ... 还有 {} 个 refno", refnos.len() - 5);
-        }
-        println!("   🔍 BRAN/HANG owner 数量: {}", bran_owners.len());
-    }
-
-    // 🏗️ 分层导出架构：TUBI 查询 - 跟随 BRAN/HANG 有序生成
-    // 使用从 inst_relate 查询的真正有子节点的 BRAN/HANG，提高查询效率
-    let mut tubi_insts: Vec<TubiInstQuery> = Vec::new();
-    if !bran_owners.is_empty() {
-        const TUBI_QUERY_CHUNK: usize = 256;
-        for (idx, chunk) in bran_owners.chunks(TUBI_QUERY_CHUNK.max(1)).enumerate() {
-            if verbose {
-                println!(
-                    "   - 查询 tubi 分批 {}/{} (批大小 {})",
-                    idx + 1,
-                    (bran_owners.len() + TUBI_QUERY_CHUNK - 1) / TUBI_QUERY_CHUNK,
-                    chunk.len()
-                );
-            }
-
-            // 使用 SurrealDB ID ranges 查询 tubi_relate 表
-            let mut chunk_result = Vec::new();
-            for bran_refno in chunk {
-                let pe_key = bran_refno.to_pe_key();
-                let sql = format!(
-                    r#"
-                    SELECT
-                        id[0] as refno,
-                        in as leave,
-                        id[0].owner.noun as generic,
-                        aabb.d as world_aabb,
-                        world_trans.d as world_trans,
-                        record::id(geo) as geo_hash,
-                        id[0].dt as date,
-                        spec_value
-                    FROM tubi_relate:[{}, 0]..[{}, ..]
-                    "#,
-                    pe_key, pe_key
-                );
-
-                let mut result: Vec<TubiInstQuery> =
-                    SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
-                chunk_result.append(&mut result);
-            }
-
-            tubi_insts.extend(chunk_result);
-        }
-    }
-
-    let tubi_count = tubi_insts.len();
-    if verbose {
-        println!("   - 找到 {} 个 tubi 管道", tubi_count);
-        if tubi_count > 0 {
-            for (i, tubi) in tubi_insts.iter().take(3).enumerate() {
-                println!(
-                    "   - tubi[{}]: refno={}, geo_hash={}",
-                    i + 1,
-                    tubi.refno,
-                    tubi.geo_hash
-                );
-            }
-            if tubi_count > 3 {
-                println!("   - ... 还有 {} 个 tubi", tubi_count - 3);
-            }
-        } else {
-            println!("   ⚠️  未找到 tubi 管道数据");
-        }
-    }
-
-    total_instances += tubi_count;
-
-    // 查询所有构件的名称和 noun（包括普通构件和 TUBI）
-    // 收集所有需要查询的 refno（包含 TUBI 及其 owner）
-    let mut all_query_refnos: Vec<RefnoEnum> = geom_insts.iter().map(|g| g.refno).collect();
-    all_query_refnos.extend(tubi_insts.iter().map(|t| t.refno));
-    all_query_refnos.extend(tubi_insts.iter().map(|t| t.leave));
-    if let Some(roots) = bran_roots {
-        all_query_refnos.extend(roots.iter().copied());
-    }
-    all_query_refnos.sort();
-    all_query_refnos.dedup();
-
-    if !all_query_refnos.is_empty() {
-        let mut name_tasks = FuturesUnordered::new();
-        for refno in &all_query_refnos {
-            let refno = *refno;
-            // 已有的跳过
-            if refno_name_map.contains_key(&refno) && refno_noun_map.contains_key(&refno) {
-                continue;
-            }
-            name_tasks.push(async move {
-                // 优先从 PE 获取 name
-                let mut name = None;
-                let mut noun = None;
-
-                if let Ok(Some(pe)) = query_provider::get_pe(refno).await {
-                    if !pe.name.is_empty() {
-                        name = Some(pe.name);
-                    }
-                    noun = Some(pe.noun);
-                }
-
-                // 如果 PE.name 为空，尝试从 NamedAttrMap 获取 NAME 属性
-                if name.is_none() {
-                    if let Ok(attmap) = get_named_attmap(refno).await {
-                        if let Some(attr_name) = attmap.get_as_string("NAME") {
-                            if !attr_name.is_empty() {
-                                name = Some(attr_name);
-                            }
-                        }
-                        if noun.is_none() {
-                            noun = Some(attmap.get_type_str().to_string());
-                        }
-                    }
-                }
-
-                (refno, name, noun)
-            });
-        }
-
-        while let Some((refno, name, noun)) = name_tasks.next().await {
-            if let Some(name) = name {
-                let trimmed = trim_leading_slash(&name);
-                if !trimmed.is_empty() {
-                    refno_name_map.insert(refno, trimmed);
-                }
-            }
-            if let Some(noun) = noun {
-                refno_noun_map.insert(refno, noun.to_uppercase());
-            }
-        }
-    }
-
-    // 收集元件记录（按 refno 分组）
+    // cache-only：导出阶段不访问 SurrealDB；
+    // - tubing 从缓存几何实例里的 is_tubi 标记拆分
+    // - name 只用 refno（稳定可对齐）
     let mut components: Vec<ComponentRecord> = Vec::new();
+    let mut tubings: Vec<TubiRecord> = Vec::new();
+    let mut tubi_refno_counters: HashMap<RefnoEnum, usize> = HashMap::new();
 
     for geom_inst in &geom_insts {
-        let noun = refno_noun_map
-            .get(&geom_inst.refno)
-            .cloned()
-            .unwrap_or_else(|| "UNKNOWN".to_string());
+        let noun = "UNKNOWN".to_string();
+        let name = Some(geom_inst.refno.to_string());
 
-        let name = refno_name_map.get(&geom_inst.refno).cloned();
-
-        let mut geometries = Vec::new();
+        let mut geometries: Vec<GeometryInstance> = Vec::new();
 
         for (geo_index, inst) in geom_inst.insts.iter().enumerate() {
+            if inst.is_tubi {
+                let world_matrix = geom_inst.world_trans.to_matrix().as_dmat4()
+                    * inst.transform.to_matrix().as_dmat4();
+
+                let idx = tubi_refno_counters.entry(geom_inst.refno).or_insert(0);
+                let seg_index = *idx;
+                *idx += 1;
+
+                let tubi_name = if seg_index == 0 {
+                    format!("TUBI_{}", geom_inst.refno)
+                } else {
+                    format!("TUBI_{}_{}", geom_inst.refno, seg_index + 1)
+                };
+
+                tubings.push(TubiRecord {
+                    refno: geom_inst.refno,
+                    owner_refno: geom_inst.owner,
+                    geo_hash: inst.geo_hash.clone(),
+                    transform: world_matrix,
+                    index: seg_index,
+                    name: tubi_name,
+                    spec_value: None,
+                    aabb: geom_inst.world_aabb,
+                    world_aabb_hash: None,
+                    world_trans_hash: None,
+                });
+                continue;
+            }
+
             if verbose {
                 let max_scale = inst
                     .transform
@@ -599,26 +345,15 @@ pub async fn collect_export_data(
                 }
             }
 
-
-            // 计算世界变换矩阵: world_trans * geo_trans
-            // - Compound 类型（布尔后）: geo_trans = 单位变换（trans:⟨0⟩）
-            // - Pos 类型（原始）: geo_trans = 几何体局部变换
-            let world_matrix = geom_inst.world_trans.to_matrix().as_dmat4()
-                * inst.transform.to_matrix().as_dmat4();
-
             geometries.push(GeometryInstance {
                 geo_hash: inst.geo_hash.clone(),
-                local_transform: inst.transform.to_matrix().as_dmat4(),  // 几何体局部变换
+                local_transform: inst.transform.to_matrix().as_dmat4(),
                 index: geo_index,
                 unit_flag: inst.unit_flag,
             });
         }
 
         if !geometries.is_empty() {
-            let owner_refno = Some(geom_inst.owner);
-            let owner_noun = owner_noun_map.get(&geom_inst.owner).cloned();
-            let owner_type = owner_type_map.get(&geom_inst.owner).cloned();
-
             if verbose {
                 println!("   - comp[{}] AABB: {:?}", components.len(), geom_inst.world_aabb);
             }
@@ -626,75 +361,16 @@ pub async fn collect_export_data(
                 refno: geom_inst.refno,
                 noun,
                 name,
-                world_transform: geom_inst.world_trans.to_matrix().as_dmat4(),  // refno 世界变换
+                world_transform: geom_inst.world_trans.to_matrix().as_dmat4(),
                 geometries,
-                owner_refno,
-                owner_noun,
-                owner_type,
-                spec_value: None,  // TODO: 从其他来源获取
-                has_neg: geom_inst.has_neg,  // 使用查询返回的布尔运算标识
+                owner_refno: Some(geom_inst.owner),
+                owner_noun: None,
+                owner_type: None,
+                spec_value: None,
+                has_neg: geom_inst.has_neg,
                 aabb: geom_inst.world_aabb,
             });
         }
-    }
-
-    // 收集 TUBI 记录（扁平列表）
-    let mut tubings: Vec<TubiRecord> = Vec::new();
-    let mut tubi_refno_counters: HashMap<RefnoEnum, usize> = HashMap::new();
-
-    for tubi in &tubi_insts {
-        if verbose {
-            let max_scale = tubi
-                .world_trans
-                .scale
-                .x
-                .max(tubi.world_trans.scale.y)
-                .max(tubi.world_trans.scale.z);
-            if max_scale > 100000.0 {
-                println!("       ⚠️  警告:scale 异常大!");
-            }
-        }
-
-        let world_matrix = tubi.world_trans.to_matrix().as_dmat4();
-
-        let tubi_index = tubi_refno_counters.entry(tubi.refno).or_insert(0);
-        *tubi_index += 1;
-
-        // TUBI 命名格式: TUBI_refno_序号
-        let tubi_name = format!("TUBI_{}_{}", tubi.refno, tubi_index);
-
-        // 移除 t_ 前缀，与普通组件共享几何体索引
-        let tubi_geo_hash = if tubi.geo_hash.starts_with("t_") {
-            tubi.geo_hash[2..].to_string() // 移除 "t_" 前缀
-        } else {
-            tubi.geo_hash.clone()
-        };
-
-        // 使用 tubi.leave 作为 owner_refno，但如果是 TUBI 自身，则使用 BRAN/HANG owner
-        let owner_refno = if tubi.leave == tubi.refno {
-            // 如果 leave 指向自身，说明这是一个 TUBI 节点，需要查找真正的 BRAN/HANG owner
-            // 由于我们使用 SurrealDB ID ranges 查询，tubi.leave 应该指向正确的 BRAN/HANG owner
-            // 但如果仍然指向自身，则使用当前 BRAN/HANG 列表中的第一个作为 owner
-            bran_owners.first().copied().unwrap_or(tubi.refno)
-        } else {
-            tubi.leave
-        };
-
-        if verbose {
-            println!("   - tubi[{}] AABB: {:?}", tubings.len(), tubi.world_aabb);
-        }
-        tubings.push(TubiRecord {
-            refno: tubi.refno,
-            owner_refno,
-            geo_hash: tubi_geo_hash,
-            transform: world_matrix,
-            index: *tubi_index - 1,
-            name: tubi_name,
-            spec_value: tubi.spec_value,
-            aabb: tubi.world_aabb,
-            world_aabb_hash: None,
-            world_trans_hash: None,
-        });
     }
 
     // 统计每个 geo_hash 的使用次数
@@ -735,7 +411,6 @@ pub async fn collect_export_data(
     let mut valid_geo_hashes = std::collections::HashSet::new();
     let mut loaded_count: usize = 0;
     let mut failed_count: usize = 0;
-    let mut missing_geo_hashes: Vec<String> = Vec::new();
 
     // 按使用次数排序，优先检查高频几何
     let mut sorted_geo_hashes: Vec<_> = geo_hash_usage.iter().collect();
@@ -811,7 +486,6 @@ pub async fn collect_export_data(
                 }
                 _ => {
                     failed_count += 1;
-                    missing_geo_hashes.push((*geo_hash).clone());
                 }
             }
         }
@@ -824,90 +498,7 @@ pub async fn collect_export_data(
         pb.finish_and_clear();
     }
 
-    let regen_missing_mesh = aios_core::is_debug_model_enabled()
-        || std::env::var("FORCE_REPLACE_MESH")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
-
-    if regen_missing_mesh && !missing_geo_hashes.is_empty() {
-        if verbose {
-            println!(
-                "🔄 检测到 {} 个缺失 mesh，尝试按 inst_geo 补生成",
-                missing_geo_hashes.len()
-            );
-        }
-
-        let regen_base_dir = if mesh_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.starts_with("lod_"))
-            .unwrap_or(false)
-        {
-            mesh_dir.parent().unwrap_or(mesh_dir).to_path_buf()
-        } else {
-            mesh_dir.to_path_buf()
-        };
-
-        let db_option_ext = get_db_option_ext();
-        let precision = db_option_ext.inner.mesh_precision.clone();
-        let mesh_formats = db_option_ext.mesh_formats.clone();
-        let mut geo_ids = Vec::new();
-
-        for geo_hash in &missing_geo_hashes {
-            geo_ids.push(RecordId::new("inst_geo", geo_hash.to_string()));
-        }
-
-        if !geo_ids.is_empty() {
-            if let Err(e) = gen_inst_meshes_by_geo_ids(
-                &regen_base_dir,
-                &precision,
-                &geo_ids,
-                &mesh_formats,
-            )
-            .await
-            {
-                eprintln!("⚠️  缺失 mesh 补生成失败: {}", e);
-            }
-        }
-
-        let existing_files_after: std::collections::HashSet<std::ffi::OsString> =
-            if search_dir.exists() {
-                std::fs::read_dir(&search_dir)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|e| e.ok().map(|e| e.file_name()))
-                    .collect()
-            } else {
-                std::collections::HashSet::new()
-            };
-
-        let mut recovered = 0usize;
-        for geo_hash in &missing_geo_hashes {
-            let filename = format!("{}_{:?}.glb", geo_hash, default_lod);
-            let fallback_filename = format!("{}.glb", geo_hash);
-            let file_exists = existing_files_after.contains(std::ffi::OsStr::new(&filename));
-            let fallback_exists =
-                existing_files_after.contains(std::ffi::OsStr::new(&fallback_filename));
-            if file_exists || fallback_exists {
-                if valid_geo_hashes.insert(geo_hash.clone()) {
-                    recovered += 1;
-                }
-            }
-        }
-
-        if recovered > 0 {
-            loaded_count += recovered;
-            failed_count = failed_count.saturating_sub(recovered);
-        }
-
-        if verbose {
-            println!(
-                "   ✅ 补生成完成：成功 {} / {}",
-                recovered,
-                missing_geo_hashes.len()
-            );
-        }
-    }
+    // cache-only：导出阶段不做“缺失 mesh 自动补生成”。缺失即跳过（避免在导出期触发 DB/解析侧依赖）。
 
     // 过滤掉缺失 mesh 的几何体，避免导出阶段出现缺失警告
     for component in &mut components {

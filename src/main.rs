@@ -224,6 +224,29 @@ async fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("flush-cache-to-db")
+                .long("flush-cache-to-db")
+                .help("Flush foyer instance_cache to SurrealDB (backup). Requires SurrealDB config in DbOption")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("flush-cache-dbnums")
+                .long("flush-cache-dbnums")
+                .help("Only flush specified dbnums (comma-separated, e.g. 1112,1113). Default: all dbnums in cache")
+                .value_name("DBNUMS")
+                .value_delimiter(',')
+                .value_parser(clap::value_parser!(u32))
+                .num_args(1..)
+                .requires("flush-cache-to-db"),
+        )
+        .arg(
+            Arg::new("flush-cache-replace")
+                .long("flush-cache-replace")
+                .help("When flushing cache to SurrealDB, delete/replace existing instance records (危险：会覆盖 DB 侧数据)")
+                .action(clap::ArgAction::SetTrue)
+                .requires("flush-cache-to-db"),
+        )
+        .arg(
             Arg::new("export-glb")
                 .long("export-glb")
                 .help("Export GLB model when using --debug-model")
@@ -513,6 +536,34 @@ async fn main() -> anyhow::Result<()> {
     // 同步精度配置到 rs-core 全局 active_precision，保证布尔/导出等逻辑使用同一套 LOD
     aios_core::mesh_precision::set_active_precision(db_option_ext.inner.mesh_precision.clone());
 
+    // ========== cache -> SurrealDB：一键备份落库 ==========
+    if matches.get_flag("flush-cache-to-db") {
+        println!("\n🗄️  flush-cache-to-db: 将 foyer instance_cache 写入 SurrealDB（备份）");
+        init_surreal().await?;
+        println!("✅ 数据库连接成功");
+
+        let cache_dir = db_option_ext.get_foyer_cache_dir();
+        let dbnums: Option<Vec<u32>> = matches
+            .get_many::<u32>("flush-cache-dbnums")
+            .map(|v| v.copied().collect());
+        let replace_exist = matches.get_flag("flush-cache-replace");
+
+        let flushed = aios_database::fast_model::cache_flush::flush_latest_instance_cache_to_surreal(
+            &cache_dir,
+            dbnums.as_deref(),
+            replace_exist,
+            true,
+        )
+        .await?;
+
+        println!(
+            "✅ flush-cache-to-db 完成：cache_dir={} flushed_dbnums={}",
+            cache_dir.display(),
+            flushed
+        );
+        return Ok(());
+    }
+
     // 调试：显示配置加载结果
     println!("🔧 配置加载完成:");
     println!("   - 配置文件路径: {}", config_path);
@@ -532,7 +583,7 @@ async fn main() -> anyhow::Result<()> {
         }
         println!("✅ Full Noun 模式已启用");
     }
-    let config_debug_refnos = db_option_ext.inner.debug_model_refnos.clone();
+    let config_debug_refnos: Option<Vec<String>> = db_option_ext.inner.debug_model_refnos.clone();
     let log_model_error = matches.get_flag("log-model-error");
     let debug_model_requested = matches.contains_id("debug-model") || log_model_error;
     let debug_model_errors_only = matches.get_flag("debug-model-errors-only") || log_model_error;
@@ -620,7 +671,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ========== 首先处理 --debug-model 参数（必须在所有导出逻辑之前） ==========
-    let debug_model_refnos = if debug_model_requested {
+    let debug_model_refnos: Option<Vec<String>> = if debug_model_requested {
         aios_core::set_debug_model_enabled(true);
         clear_ploop_debug_cache(); // 清理PLOOP调试文件缓存，允许重新生成
         println!("✅ 已启用 debug_model 调试信息打印");
@@ -698,6 +749,11 @@ async fn main() -> anyhow::Result<()> {
             std::env::set_var("FORCE_REGEN_MESH", "1");
         }
         db_option_ext.inner.replace_mesh = Some(true);
+        // 元件库(cata_neg)/设计型负实体导出依赖布尔结果（CatePos），因此 regen-model 必须开启布尔运算。
+        if !db_option_ext.inner.apply_boolean_operation {
+            println!("🔄 --regen-model 自动开启 apply_boolean_operation（生成 CatePos 布尔结果）");
+            db_option_ext.inner.apply_boolean_operation = true;
+        }
     }
 
     // 调试模式下，如果配置开启了 gen_mesh，默认也应强制重新生成 mesh

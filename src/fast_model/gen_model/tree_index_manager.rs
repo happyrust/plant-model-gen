@@ -246,10 +246,11 @@ impl TreeIndexManager {
     /// let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno).await?;
     /// ```
     ///
-    /// **查询优先级**：
+    /// **查询优先级（cache-only）**：
     /// 1. DbMetaManager (db_meta_info.json) - 最快，纯内存查询
     /// 2. db_meta_cache - 内存缓存
-    /// 3. SurrealDB 查询 - 最慢，作为兜底方案
+    ///
+    /// 约定：不回退到 SurrealDB 查询（SurrealDB 仅作为“生成完成后的一键备份落库”目的地）。
     pub async fn resolve_dbnum_for_refno(refno: RefnoEnum) -> anyhow::Result<u32> {
         // 优先使用 DbMetaManager 的快速查询（通过 db_meta_info.json）
         use crate::data_interface::db_meta;
@@ -262,18 +263,13 @@ impl TreeIndexManager {
             return Ok(dbnum);
         }
 
-        // 最后查询数据库（兜底方案）
-        let Some(pe) = aios_core::get_pe(refno).await? else {
-            return Err(anyhow::anyhow!("refno {} 不存在，无法获取 dbnum", refno));
-        };
-        if pe.dbnum < 0 {
-            return Err(anyhow::anyhow!(
-                "refno {} 的 dbnum 非法: {}",
-                refno,
-                pe.dbnum
-            ));
-        }
-        Ok(pe.dbnum as u32)
+        anyhow::bail!(
+            "无法从缓存推导 refno 的 dbnum（cache-only 不回退 SurrealDB）：refno={}\n\
+             处理建议：\n\
+             - 先生成 output/scene_tree/db_meta_info.json（例如 parse-db/生成 tree 阶段会产出）\n\
+             - 或确认当前运行目录/配置指向了正确的输出目录",
+            refno
+        )
     }
 
     /// 通过 refno 加载对应 TreeIndex

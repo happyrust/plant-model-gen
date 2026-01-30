@@ -1,11 +1,13 @@
 use aios_core::RefnoEnum;
 use aios_core::shape::pdms_shape::PlantMesh;
 use anyhow::{Context, Result};
+use std::fs::File;
 use std::path::Path;
 use std::time::Instant;
 
 use crate::fast_model::unit_converter::UnitConverter;
 use chrono;
+use std::io::BufWriter;
 use std::io::Write;
 
 use super::export_common::{ExportData, collect_export_data};
@@ -122,6 +124,136 @@ pub(crate) fn export_mesh_to_obj_with_unit_conversion(
             .context("导出 OBJ 文件失败")?;
     }
 
+    Ok(())
+}
+
+fn sanitize_obj_group_name(name: &str) -> String {
+    // OBJ 的 group/object 名称以空格分隔；为保证各类查看器/工具链一致性，这里做最小清洗：
+    // - 用 '_' 替换 '/'（refno 常见形式为 24381/129928）
+    // - 将空白字符替换为 '_'（避免被拆成多个 token）
+    name.replace('/', "_")
+        .replace(['\t', '\r', '\n', ' '], "_")
+}
+
+fn export_export_data_to_obj_grouped(
+    export_data: &ExportData,
+    output_path: &str,
+    unit_converter: &UnitConverter,
+    mesh_dir: &Path,
+    verbose: bool,
+) -> Result<()> {
+    use crate::fast_model::export_model::export_common::GltfMeshCache;
+
+    if let Some(parent) = Path::new(output_path).parent() {
+        std::fs::create_dir_all(parent).context("创建输出目录失败")?;
+    }
+
+    let mut out = BufWriter::new(File::create(output_path).context("创建 OBJ 文件失败")?);
+    writeln!(out, "# OBJ file exported from AIOS (grouped by refno)")?;
+    writeln!(out, "# Components: {}", export_data.components.len())?;
+    writeln!(out, "# Tubings: {}", export_data.tubings.len())?;
+    writeln!(out, "# Total instances: {}", export_data.total_instances)?;
+    writeln!(out)?;
+
+    let mesh_cache = GltfMeshCache::new();
+    let mut vertex_base: usize = 1; // OBJ 使用 1-based index
+
+    fn write_mesh_instance<W: Write>(
+        out: &mut W,
+        export_data: &ExportData,
+        mesh_cache: &GltfMeshCache,
+        geo_hash: &str,
+        transform: &glam::DMat4,
+        unit_converter: &UnitConverter,
+        mesh_dir: &Path,
+        vertex_base: &mut usize,
+    ) -> Result<(usize, usize)> {
+        if !export_data.valid_geo_hashes.contains(geo_hash) {
+            return Ok((0, 0));
+        }
+
+        let arc_mesh = mesh_cache.load_or_get(geo_hash, mesh_dir)?;
+        let mut mesh = arc_mesh.as_ref().transform_by(transform);
+
+        if unit_converter.needs_conversion() {
+            for v in &mut mesh.vertices {
+                *v = unit_converter.convert_vec3(v);
+            }
+        }
+
+        // 仅用于 debug/定位：目前 OBJ 只输出 v/f（不输出 vn），避免写出 NaN normals。
+        for v in &mesh.vertices {
+            writeln!(out, "v {:.6} {:.6} {:.6}", v.x, v.y, v.z)?;
+        }
+
+        let mut face_cnt = 0usize;
+        for tri in mesh.indices.chunks(3) {
+            if tri.len() < 3 {
+                continue;
+            }
+            let a = *vertex_base + tri[0] as usize;
+            let b = *vertex_base + tri[1] as usize;
+            let c = *vertex_base + tri[2] as usize;
+            writeln!(out, "f {} {} {}", a, b, c)?;
+            face_cnt += 1;
+        }
+
+        let v_cnt = mesh.vertices.len();
+        *vertex_base = vertex_base.saturating_add(v_cnt);
+        Ok((v_cnt, face_cnt))
+    }
+
+    // components：按 refno 分组（便于在 DCC/查看器中按组定位）
+    for comp in &export_data.components {
+        let group = sanitize_obj_group_name(&comp.refno.to_string());
+        writeln!(out, "\ng {}", group)?;
+
+        let mut wrote_any = false;
+        for inst in &comp.geometries {
+            let combined_transform = if comp.has_neg {
+                inst.local_transform
+            } else {
+                comp.world_transform * inst.local_transform
+            };
+
+            let (v_cnt, f_cnt) = write_mesh_instance(
+                &mut out,
+                export_data,
+                &mesh_cache,
+                &inst.geo_hash,
+                &combined_transform,
+                unit_converter,
+                mesh_dir,
+                &mut vertex_base,
+            )?;
+            wrote_any |= v_cnt > 0 || f_cnt > 0;
+        }
+
+        if verbose && !wrote_any {
+            eprintln!(
+                "[export_obj] ⚠️  组内无可导出几何体（可能 mesh 缺失/被过滤）：refno={}",
+                comp.refno
+            );
+        }
+    }
+
+    // tubings：每段一个 group，名字自带 refno
+    for tubi in &export_data.tubings {
+        let group = sanitize_obj_group_name(&tubi.name);
+        writeln!(out, "\ng {}", group)?;
+        let _ = write_mesh_instance(
+            &mut out,
+            export_data,
+            &mesh_cache,
+            &tubi.geo_hash,
+            &tubi.transform,
+            unit_converter,
+            mesh_dir,
+            &mut vertex_base,
+        )?;
+    }
+
+    let _ = out.flush();
     Ok(())
 }
 
@@ -270,6 +402,101 @@ pub async fn prepare_obj_export(
     })
 }
 
+struct PreparedObjExportData {
+    export_data: ExportData,
+    effective_mesh_dir: std::path::PathBuf,
+    stats: ExportStats,
+}
+
+async fn prepare_obj_export_data(
+    refnos: &[RefnoEnum],
+    mesh_dir: &Path,
+    config: &CommonExportConfig,
+) -> Result<PreparedObjExportData> {
+    // 统一 mesh_dir：很多调用方传的是 `assets/meshes`，但 GLB 实际存放在 `assets/meshes/lod_L{N}`。
+    let default_lod = aios_core::mesh_precision::active_precision().default_lod;
+    let effective_mesh_dir = match mesh_dir.file_name().and_then(|n| n.to_str()) {
+        Some(name) if name.starts_with("lod_") => mesh_dir.to_path_buf(),
+        _ => mesh_dir.join(format!("lod_{default_lod:?}")),
+    };
+
+    let mut stats = ExportStats::new();
+    stats.refno_count = refnos.len();
+
+    if config.verbose {
+        println!("🔄 开始准备 OBJ 导出数据...");
+        println!("   - 参考号数量: {}", refnos.len());
+        println!("   - Mesh 目录: {}", effective_mesh_dir.display());
+        if let Some(ref nouns) = config.filter_nouns {
+            println!("   - 类型过滤: {:?}", nouns);
+        }
+        println!("   - 包含子孙节点: {}", config.include_descendants);
+    }
+
+    if refnos.is_empty() {
+        if config.verbose {
+            println!("⚠️  输入参考号为空，跳过导出");
+        }
+        return Ok(PreparedObjExportData {
+            export_data: ExportData {
+                valid_geo_hashes: Default::default(),
+                components: Vec::new(),
+                tubings: Vec::new(),
+                loaded_count: 0,
+                failed_count: 0,
+                total_instances: 0,
+                tubi_count: 0,
+                cache_hits: 0,
+                cache_misses: 0,
+            },
+            effective_mesh_dir,
+            stats,
+        });
+    }
+
+    let all_refnos = collect_export_refnos(
+        refnos,
+        config.include_descendants,
+        config.filter_nouns.as_deref(),
+        config.verbose,
+    )
+    .await?;
+
+    stats.descendant_count = all_refnos.len().saturating_sub(refnos.len());
+
+    let geom_insts = if config.allow_surrealdb {
+        query_geometry_instances_ext(&all_refnos, true, config.include_negative, config.verbose)
+            .await?
+    } else {
+        let cache_dir = config
+            .cache_dir
+            .as_ref()
+            .context("allow_surrealdb=false 时必须提供 CommonExportConfig.cache_dir")?;
+        query_geometry_instances_ext_from_cache(
+            &all_refnos,
+            cache_dir,
+            true,
+            config.include_negative,
+            config.verbose,
+        )
+        .await?
+    };
+
+    let export_data =
+        collect_export_data(geom_insts, &all_refnos, &effective_mesh_dir, config.verbose, None)
+            .await?;
+
+    stats.mesh_files_found = export_data.loaded_count;
+    stats.mesh_files_missing = export_data.failed_count;
+    stats.geometry_count = export_data.total_instances;
+
+    Ok(PreparedObjExportData {
+        export_data,
+        effective_mesh_dir,
+        stats,
+    })
+}
+
 /// 导出指定 refno 的整体 OBJ 模型
 ///
 /// # 参数
@@ -311,19 +538,24 @@ pub async fn export_obj_for_refnos(
         cache_dir: None,
     };
 
-    let PreparedObjExport { mesh, mut stats } =
-        prepare_obj_export(refnos, mesh_dir, &common_config).await?;
+    let PreparedObjExportData {
+        export_data,
+        effective_mesh_dir,
+        mut stats,
+    } = prepare_obj_export_data(refnos, mesh_dir, &common_config).await?;
 
-    if mesh.vertices.is_empty() {
+    if export_data.total_instances == 0 {
         println!("⚠️  未找到任何几何体数据");
         return Ok(());
     }
 
-    if let Some(parent) = Path::new(output_path).parent() {
-        std::fs::create_dir_all(parent).context("创建输出目录失败")?;
-    }
-
-    export_mesh_to_obj_with_unit_conversion(&mesh, output_path, &common_config.unit_converter)?;
+    export_export_data_to_obj_grouped(
+        &export_data,
+        output_path,
+        &common_config.unit_converter,
+        &effective_mesh_dir,
+        common_config.verbose,
+    )?;
 
     println!("✅ 导出完成: {}", output_path);
     if let Ok(metadata) = std::fs::metadata(output_path) {
@@ -365,10 +597,13 @@ impl ModelExporter for ObjExporter {
         config: Self::Config,
     ) -> Result<Self::Stats> {
         let start_time = Instant::now();
-        let PreparedObjExport { mesh, mut stats } =
-            prepare_obj_export(refnos, mesh_dir, &config.common).await?;
+        let PreparedObjExportData {
+            export_data,
+            effective_mesh_dir,
+            mut stats,
+        } = prepare_obj_export_data(refnos, mesh_dir, &config.common).await?;
 
-        if mesh.vertices.is_empty() {
+        if export_data.total_instances == 0 {
             if config.common.verbose {
                 println!("⚠️  未找到任何几何体数据");
             }
@@ -376,12 +611,13 @@ impl ModelExporter for ObjExporter {
             return Ok(stats);
         }
 
-        // 创建输出目录（如果不存在）
-        if let Some(parent) = Path::new(output_path).parent() {
-            std::fs::create_dir_all(parent).context("创建输出目录失败")?;
-        }
-
-        export_mesh_to_obj_with_unit_conversion(&mesh, output_path, &config.common.unit_converter)?;
+        export_export_data_to_obj_grouped(
+            &export_data,
+            output_path,
+            &config.common.unit_converter,
+            &effective_mesh_dir,
+            config.common.verbose,
+        )?;
 
         if let Ok(metadata) = std::fs::metadata(output_path) {
             stats.output_file_size = metadata.len();

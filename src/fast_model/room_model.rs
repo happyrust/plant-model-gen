@@ -686,6 +686,10 @@ async fn cal_room_refnos_with_options(
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let use_convex = env::var("ROOM_RELATION_USE_CONVEX")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     // 步骤 1：查询面板的几何实例
     let panel_geom_insts: Vec<GeomInstQuery> =
@@ -906,31 +910,119 @@ async fn cal_room_refnos_with_options(
         );
     }
 
-    let within_refnos: HashSet<RefnoEnum> = stream::iter(candidates)
-        .map(|candidate_refno| {
-            let panel_meshes = panel_meshes.clone();
-            let candidate_geom_map = candidate_geom_map.clone();
-            async move {
-                let Some(geom) = candidate_geom_map.get(&candidate_refno) else {
-                    return None;
-                };
-                // 提取候选构件的关键点
-                let key_points = extract_geom_key_points(std::slice::from_ref(geom));
+    let within_refnos: HashSet<RefnoEnum> = if use_convex {
+        #[cfg(feature = "convex-decomposition")]
+        {
+            stream::iter(candidates)
+                .map(|candidate_refno| {
+                    let panel_meshes = panel_meshes.clone();
+                    let candidate_geom_map = candidate_geom_map.clone();
+                    let mesh_dir = mesh_dir.clone();
+                    async move {
+                        let Some(geom) = candidate_geom_map.get(&candidate_refno) else {
+                            return None;
+                        };
 
-                // 判断关键点是否在面板内
-                if is_geom_in_panel(&key_points, panel_meshes.as_ref(), inside_tol) {
-                    Some(candidate_refno)
-                } else {
-                    None
+                        // 任意重叠判定：点在体内 OR 与边界相交。
+                        // 注意：inst.transform 可能包含缩放，不能用 Isometry 表达；
+                        // 这里直接使用 (world_trans * inst.transform).to_matrix() 把缩放烘进点/凸体。
+                        let mut had_convex_error = false;
+                        for inst in &geom.insts {
+                            let convex_rt = match crate::fast_model::convex_decomp::load_or_build_convex_runtime(
+                                mesh_dir.as_path(),
+                                &inst.geo_hash,
+                            )
+                            .await
+                            {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    had_convex_error = true;
+                                    continue;
+                                }
+                            };
+
+                            let comp_mat = (geom.world_trans * inst.transform).to_matrix();
+                            if crate::fast_model::convex_decomp::component_overlaps_room(
+                                panel_meshes.as_ref(),
+                                &panel_aabb,
+                                &comp_mat,
+                                convex_rt.as_ref(),
+                                inside_tol,
+                            ) {
+                                return Some(candidate_refno);
+                            }
+                        }
+
+                        // 兜底：当凸分解不可用（文件缺失/损坏/生成失败）且允许 fallback 时，回退旧逻辑。
+                        if had_convex_error && allow_aabb_fallback {
+                            let key_points = extract_geom_key_points(std::slice::from_ref(geom));
+                            if is_geom_in_panel(&key_points, panel_meshes.as_ref(), inside_tol) {
+                                return Some(candidate_refno);
+                            }
+                        }
+
+                        None
+                    }
+                })
+                .buffer_unordered(options.candidate_concurrency.max(1))
+                .filter_map(|item| async move { item })
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect()
+        }
+        #[cfg(not(feature = "convex-decomposition"))]
+        {
+            stream::iter(candidates)
+                .map(|candidate_refno| {
+                    let panel_meshes = panel_meshes.clone();
+                    let candidate_geom_map = candidate_geom_map.clone();
+                    async move {
+                        let Some(geom) = candidate_geom_map.get(&candidate_refno) else {
+                            return None;
+                        };
+                        let key_points = extract_geom_key_points(std::slice::from_ref(geom));
+                        if is_geom_in_panel(&key_points, panel_meshes.as_ref(), inside_tol) {
+                            Some(candidate_refno)
+                        } else {
+                            None
+                        }
+                    }
+                })
+                .buffer_unordered(options.candidate_concurrency.max(1))
+                .filter_map(|item| async move { item })
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect()
+        }
+    } else {
+        stream::iter(candidates)
+            .map(|candidate_refno| {
+                let panel_meshes = panel_meshes.clone();
+                let candidate_geom_map = candidate_geom_map.clone();
+                async move {
+                    let Some(geom) = candidate_geom_map.get(&candidate_refno) else {
+                        return None;
+                    };
+                    // 提取候选构件的关键点
+                    let key_points = extract_geom_key_points(std::slice::from_ref(geom));
+
+                    // 判断关键点是否在面板内
+                    if is_geom_in_panel(&key_points, panel_meshes.as_ref(), inside_tol) {
+                        Some(candidate_refno)
+                    } else {
+                        None
+                    }
                 }
-            }
-        })
-        .buffer_unordered(options.candidate_concurrency.max(1))
-        .filter_map(|item| async move { item })
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect();
+            })
+            .buffer_unordered(options.candidate_concurrency.max(1))
+            .filter_map(|item| async move { item })
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect()
+    };
 
     debug!(
         "✅ 细算完成: 耗时 {:?}, 结果数 {}",

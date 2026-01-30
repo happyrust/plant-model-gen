@@ -6,9 +6,13 @@ use aios_core::pdms_types::{
     BRAN_COMPONENT_NOUN_NAMES, GNERAL_LOOP_OWNER_NOUN_NAMES, GNERAL_PRIM_NOUN_NAMES,
     USE_CATE_NOUN_NAMES,
 };
+use aios_core::tool::db_tool::db1_dehash;
+use aios_core::tree_query::{TreeQuery, TreeQueryFilter};
 use aios_core::{RefnoEnum, RefU64, SUL_DB, SurrealQueryExt};
 use anyhow::Result;
 use std::collections::VecDeque;
+
+use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 
 /// 初始化结果
 #[derive(Debug)]
@@ -114,7 +118,7 @@ pub async fn init_scene_tree_from_root(
     );
 
     // 6. 导出 Parquet 文件（使用 root 的 dbnum）
-    let dbnum = root_refno.refno().get_0();
+    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(root_refno).await?;
     let output_dir = std::path::Path::new("output/scene_tree");
     if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbnum, output_dir).await {
         eprintln!("[scene_tree] Parquet 导出失败: {}", e);
@@ -202,18 +206,29 @@ async fn build_tree_from_world(
     let mut relations = Vec::new();
     let mut queue = VecDeque::new();
 
+    // 层级查询统一走 TreeIndex（indextree），避免依赖 SurrealDB 的 pe_owner 递归查询。
+    let dbnum_u32 = TreeIndexManager::resolve_dbnum_for_refno(world_refno).await?;
+    let manager = TreeIndexManager::with_default_dir(vec![dbnum_u32]);
+    let index = manager.load_index(dbnum_u32)?;
+
     queue.push_back((world_refno, None::<i64>));
 
     while let Some((refno, parent_id)) = queue.pop_front() {
         // 1. 获取节点信息
-        let ele_nodes = aios_core::get_children_ele_nodes(refno).await?;
+        let child_u64s = index
+            .query_children(refno.refno(), TreeQueryFilter::default())
+            .await
+            .unwrap_or_default();
         let refno_i64 = refno.refno().0 as i64;
-        let dbnum = refno.refno().get_0() as i16;
+        let dbnum = dbnum_u32 as i16;
 
         // 2. 获取当前节点的 noun
-        let noun = get_noun_by_refno(refno).await.unwrap_or_default();
+        let noun = index
+            .node_meta(refno.refno())
+            .map(|m| db1_dehash(m.noun))
+            .unwrap_or_default();
         let has_geo = is_geo_noun(&noun);
-        let is_leaf = ele_nodes.is_empty();
+        let is_leaf = child_u64s.is_empty();
 
         // 3. 获取几何类型（仅对几何节点查询）
         let geo_type = if has_geo {
@@ -238,22 +253,12 @@ async fn build_tree_from_world(
         }
 
         // 5. 将子节点加入队列
-        for child in ele_nodes {
-            queue.push_back((child.refno, Some(refno_i64)));
+        for child in child_u64s {
+            queue.push_back((RefnoEnum::from(child), Some(refno_i64)));
         }
     }
 
     Ok((nodes, relations))
-}
-
-/// 获取节点的 noun 类型
-async fn get_noun_by_refno(refno: RefnoEnum) -> Result<String> {
-    let sql = format!(
-        "SELECT VALUE noun FROM {}",
-        refno.to_pe_key()
-    );
-    let result: Vec<String> = SUL_DB.query_take(&sql, 0).await?;
-    Ok(result.into_iter().next().unwrap_or_default())
 }
 
 /// 获取节点的几何类型（从 geo_relate 表查询）

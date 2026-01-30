@@ -588,9 +588,16 @@ pub async fn query_geometry_instances_ext_from_cache(
         }
 
         // 先收集本 dbnum 下的 bool 成功结果（two-pass，保证 bool 覆盖原始 inst_geos）。
-        let mut bool_success: HashMap<RefU64, String> = HashMap::new();
+        //
+        // 注意：instance_cache 可能存在多个 batch（多次 --regen-model 会追加 batch），
+        // 若按旧到新遍历并“首次命中即使用”，会导致：
+        // - 选中旧的 bool mesh_id（磁盘上可能已不存在） -> 导出表现为“某些子孙节点没导出来”
+        // - 选中旧的 inst_geo transform（例如 RTOR scale 非 1）-> 尺寸被平方放大
+        //
+        // 因此这里按 created_at 选择“最新的 Success”。
+        let mut bool_success: HashMap<RefU64, (String, i64)> = HashMap::new();
         if enable_holes {
-            for batch_id in &batch_ids {
+            for batch_id in batch_ids.iter().rev() {
                 let Some(batch) = cache.get(dbnum, batch_id).await else {
                     continue;
                 };
@@ -599,8 +606,17 @@ pub async fn query_geometry_instances_ext_from_cache(
                     if !want_map.contains_key(&k) {
                         continue;
                     }
-                    if b.status == "Success" && !b.mesh_id.is_empty() {
-                        bool_success.entry(k).or_insert(b.mesh_id);
+                    if b.status != "Success" || b.mesh_id.is_empty() {
+                        continue;
+                    }
+                    match bool_success.get(&k) {
+                        None => {
+                            bool_success.insert(k, (b.mesh_id, b.created_at));
+                        }
+                        Some((_, ts)) if b.created_at > *ts => {
+                            bool_success.insert(k, (b.mesh_id, b.created_at));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -608,19 +624,66 @@ pub async fn query_geometry_instances_ext_from_cache(
 
         let mut acc_map: HashMap<RefU64, Acc> = HashMap::new();
         // want_refno 中哪些是“元件库负实体（cata_neg）”目标：这类必须走布尔结果（CatePos）。
+        // 取“最新 inst_info”给出的 has_cata_neg（避免旧 batch 的脏数据影响导出路径）。
         let mut want_has_cata_neg: HashSet<RefU64> = HashSet::new();
+        // 只取最新 batch 的 inst_info/inst_geos/inst_tubi，避免多 batch 合并导致重复/错误缩放。
+        let mut seen_meta: HashSet<RefU64> = HashSet::new();
+        let mut seen_geos: HashSet<RefU64> = HashSet::new();
+        let mut seen_tubi: HashSet<RefU64> = HashSet::new();
 
-        for batch_id in batch_ids {
-            let Some(batch) = cache.get(dbnum, &batch_id).await else {
+        for batch_id in batch_ids.iter().rev() {
+            let Some(batch) = cache.get(dbnum, batch_id).await else {
                 continue;
             };
 
-            // 先从 inst_info_map 收集 has_cata_neg（即使某些 refno 暂时没有 inst_geos，也应能报出明确原因）。
+            // 先从 inst_info_map 组装“最新元数据”（owner/world_trans/aabb/has_neg/has_cata_neg）。
+            // 这一步很关键：enable_holes=true 时，raw inst_geos 可能会被跳过，但导出 bool mesh 仍需要正确的世界变换。
             for (refno, info) in batch.inst_info_map.iter() {
                 let k = refno.refno();
-                if want_map.contains_key(&k) && info.has_cata_neg {
+                if !want_map.contains_key(&k) {
+                    continue;
+                }
+                if !seen_meta.insert(k) {
+                    continue;
+                }
+
+                if info.has_cata_neg {
                     want_has_cata_neg.insert(k);
                 }
+
+                let entry = acc_map.entry(k).or_insert_with(Acc::default);
+                let insts = std::mem::take(&mut entry.insts);
+
+                let owner = if info.owner_refno.is_valid() {
+                    info.owner_refno
+                } else {
+                    *refno
+                };
+                let mut world_aabb: Option<PlantAabb> = info.aabb.map(Into::into);
+                #[cfg(feature = "sqlite-index")]
+                {
+                    if world_aabb.is_none() {
+                        if let Some(idx) = sqlite_idx.as_ref() {
+                            let id: aios_core::RefU64 = (*refno).into();
+                            if let Ok(Some(aabb)) = idx.get_aabb(id) {
+                                world_aabb = Some(aabb.into());
+                            }
+                        }
+                    }
+                }
+                let has_neg = batch
+                    .neg_relate_map
+                    .get(refno)
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false);
+                *entry = Acc {
+                    owner,
+                    world_trans: PlantTransform::from(info.world_transform),
+                    world_aabb,
+                    has_neg,
+                    has_cata_neg: info.has_cata_neg,
+                    insts,
+                };
             }
 
             // tubing 节点在 cache 中以 inst_tubi_map(EleGeosInfo) 形式存在：
@@ -634,6 +697,9 @@ pub async fn query_geometry_instances_ext_from_cache(
                 for (refno, info) in batch.inst_tubi_map.iter() {
                     let k = refno.refno();
                     if !want_map.contains_key(&k) {
+                        continue;
+                    }
+                    if !seen_tubi.insert(k) {
                         continue;
                     }
 
@@ -651,10 +717,13 @@ pub async fn query_geometry_instances_ext_from_cache(
                     } else {
                         *refno
                     };
-                    entry.world_trans = PlantTransform::from(info.world_transform);
-                    entry.world_aabb = info.aabb.map(Into::into);
-                    entry.has_neg = false;
-                    entry.has_cata_neg = false;
+                    // tubing 的 EleGeosInfo 也带 world_transform/aabb，可作为 inst_info 缺失时的 fallback。
+                    // 若已命中 inst_info 的 meta，则不在此处覆写，避免把 has_neg/has_cata_neg 等信息误清零。
+                    if !seen_meta.contains(&k) {
+                        seen_meta.insert(k);
+                        entry.world_trans = PlantTransform::from(info.world_transform);
+                        entry.world_aabb = info.aabb.map(Into::into);
+                    }
 
                     // 避免跨 batch 重复追加同一 tubing 实例
                     let already_has_tubi = entry.insts.iter().any(|x| x.is_tubi);
@@ -734,6 +803,12 @@ pub async fn query_geometry_instances_ext_from_cache(
 
                 // enable_holes=true 且已有 booled mesh：保留 owner/world_trans/has_neg，但不再收集原始 inst_geos。
                 if enable_holes && bool_success.contains_key(&refno_u64) {
+                    // 有 bool mesh 时，不应再让旧 batch 的 raw inst_geos 混入（否则可能出现重复/错误缩放）。
+                    seen_geos.insert(refno_u64);
+                    continue;
+                }
+                // 只取最新 batch 的 raw inst_geos（避免多 batch 合并导致重复/旧数据污染）。
+                if !seen_geos.insert(refno_u64) {
                     continue;
                 }
 
@@ -762,7 +837,7 @@ pub async fn query_geometry_instances_ext_from_cache(
         // 对每个想要的 refno（以 RefU64 归一化）组装输出；refno 字段使用调用方输入，避免泄露 SesRef 形式。
         for (want_u64, want_refno) in want_map {
             if enable_holes {
-                if let Some(mesh_id) = bool_success.get(&want_u64) {
+                if let Some((mesh_id, _)) = bool_success.get(&want_u64) {
                     // bool mesh 在 cache bool_worker 中已写盘到 lod_{default}/ 目录；
                     // 其坐标系约定为 refno local space。
                     //

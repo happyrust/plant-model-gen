@@ -33,6 +33,8 @@ use aios_core::options::DbOption;
 use aios_core::pdms_types::{
     CataHashRefnoKV, GNERAL_LOOP_OWNER_NOUN_NAMES, GNERAL_PRIM_NOUN_NAMES, USE_CATE_NOUN_NAMES,
 };
+use aios_core::tool::db_tool::db1_hash;
+use aios_core::tree_query::{TreeQueryFilter, TreeQueryOptions};
 use aios_core::{RefnoEnum, SUL_DB};
 
 use crate::data_interface::increment_record::IncrGeoUpdateLog;
@@ -43,6 +45,111 @@ use super::tree_index_manager::TreeIndexManager;
 use super::utilities::{build_cata_hash_map_from_tree, is_e3d_debug_enabled};
 
 use super::models::DbModelInstRefnos;
+
+/// 从 TreeIndex 收集“独立使用元件库”的候选 refnos。
+///
+/// 约定：
+/// - 层级遍历仅使用 indextree（`.tree` 文件），不访问 SurrealDB。
+/// - BRAN/HANG 子树应被排除（BRAN/HANG 的子元件由上游 BRAN_FIX 单独处理）。
+/// - 判定“使用元件库”以 `cata_hash != None && cata_hash != 0` 为准（TreeIndex 元信息）。
+async fn collect_use_cata_refnos_from_tree(
+    roots: &[RefnoEnum],
+) -> anyhow::Result<HashSet<RefnoEnum>> {
+    if roots.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let bran_hash = db1_hash("BRAN");
+    let hang_hash = db1_hash("HANG");
+
+    let mut out: HashSet<RefnoEnum> = HashSet::new();
+
+    for &root in roots {
+        let dbnum = match TreeIndexManager::resolve_dbnum_for_refno(root).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+        let index = manager.load_index(dbnum)?;
+
+        let options = TreeQueryOptions {
+            include_self: true,
+            max_depth: None,
+            filter: TreeQueryFilter::default(),
+        };
+        let subtree_nodes = index.collect_descendants_bfs(root.refno(), &options);
+
+        // memo: 是否位于 BRAN/HANG 子树中（若 owner 链上出现 BRAN/HANG，则视为被屏蔽）
+        let mut blocked: HashMap<aios_core::RefU64, bool> = HashMap::new();
+
+        for &node in &subtree_nodes {
+            // 迭代式 owner 链回溯，避免递归。
+            let mut chain: Vec<aios_core::RefU64> = Vec::new();
+            let mut cur = node;
+
+            loop {
+                if let Some(&v) = blocked.get(&cur) {
+                    // 已有缓存：把链上所有节点一并写回同值
+                    for n in chain {
+                        blocked.insert(n, v);
+                    }
+                    break;
+                }
+
+                let Some(meta) = index.node_meta(cur) else {
+                    // 缺 meta 视为不屏蔽
+                    for n in chain {
+                        blocked.insert(n, false);
+                    }
+                    blocked.insert(cur, false);
+                    break;
+                };
+
+                // 当前节点本身是 BRAN/HANG：其自身和子树均视为屏蔽
+                if meta.noun == bran_hash || meta.noun == hang_hash {
+                    for n in chain {
+                        blocked.insert(n, true);
+                    }
+                    blocked.insert(cur, true);
+                    break;
+                }
+
+                // 到达 tree 根（owner==self）仍未遇到 BRAN/HANG：不屏蔽
+                if meta.owner == meta.refno {
+                    for n in chain {
+                        blocked.insert(n, false);
+                    }
+                    blocked.insert(cur, false);
+                    break;
+                }
+
+                chain.push(cur);
+                cur = meta.owner;
+            }
+
+            if blocked.get(&node).copied().unwrap_or(false) {
+                continue;
+            }
+
+            let Some(meta) = index.node_meta(node) else {
+                continue;
+            };
+
+            // 直接跳过 BRAN/HANG 自身（避免无意义候选）
+            if meta.noun == bran_hash || meta.noun == hang_hash {
+                continue;
+            }
+
+            if let Some(ch) = meta.cata_hash {
+                if ch != 0 {
+                    out.insert(RefnoEnum::from(meta.refno));
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
 
 /// 按数据库编号生成几何体数据
 ///
@@ -453,12 +560,12 @@ async fn process_gen_geos_data_chunks(
             debug_model_debug!("single_refnos: {:?}", &single_refnos);
             debug_model_debug!("single_refnos 数量: {}", single_refnos.len());
 
-            use_cata_refnos =
-                aios_core::query_deep_children_refnos_filter_spre(&single_refnos, skip_exist)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect::<HashSet<_>>();
+            // 层级查询统一走 TreeIndex（indextree）：
+            // - 这里要获取“独立使用元件库”的候选 refnos（用于后续按 cata_hash 分组）
+            // - 同时需要避免把 BRAN/HANG 的子树卷入（BRAN/HANG 子元件已在上方 BRAN_FIX 单独处理）
+            use_cata_refnos = collect_use_cata_refnos_from_tree(&single_refnos)
+                .await
+                .unwrap_or_default();
 
             debug_model_debug!(
                 "查询子孙节点后 use_cata_refnos 数量: {}",

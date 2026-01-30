@@ -1,5 +1,5 @@
 use aios_core::pdms_types::RefU64;
-use aios_core::{SUL_DB, SurrealQueryExt};
+use aios_core::{RefnoEnum, RefU64, SUL_DB, SurrealQueryExt};
 use axum::{
     Router,
     extract::{Path, State},
@@ -10,6 +10,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
+
+use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 
 /// 空间查询API状态
 #[derive(Clone)]
@@ -62,11 +64,6 @@ struct PeRow {
     pub name: Option<String>,
     pub noun: Option<String>,
     pub owner: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, SurrealValue)]
-struct PeNounRow {
-    pub noun: Option<String>,
 }
 
 // === 处理函数 ===
@@ -161,26 +158,25 @@ async fn query_children_nodes(
         Err(_) => return Err(StatusCode::BAD_REQUEST),
     };
 
-    // 查询父节点的noun
-    let parent_query = format!("SELECT noun FROM pe WHERE refno = {} LIMIT 1", refno);
-
-    match SUL_DB
-        .query_take::<Vec<PeNounRow>>(&parent_query, 0)
+    // 层级查询统一走 TreeIndex（indextree）：这里仅需要父节点 noun 做路由判断。
+    let parent_refno = RefnoEnum::from(RefU64(refno));
+    let parent_noun = TreeIndexManager::resolve_dbnum_for_refno(parent_refno)
         .await
-    {
-        Ok(records) => {
-            if let Some(record) = records.first() {
-                if let Some(noun) = record.noun.as_deref() {
-                    let children = query_children_by_type(noun, refno)
-                        .await
-                        .unwrap_or_default();
-                    return Ok(Json(children));
-                }
-            }
-            Ok(Json(vec![]))
-        }
-        Err(_) => Ok(Json(vec![])),
+        .ok()
+        .and_then(|dbnum| {
+            let mgr = TreeIndexManager::with_default_dir(vec![dbnum]);
+            mgr.get_noun(parent_refno)
+        })
+        .unwrap_or_default();
+
+    if parent_noun.is_empty() {
+        return Ok(Json(vec![]));
     }
+
+    let children = query_children_by_type(parent_noun.as_str(), refno)
+        .await
+        .unwrap_or_default();
+    Ok(Json(children))
 }
 
 /// 获取节点详细信息
@@ -271,7 +267,9 @@ async fn query_children_by_type(
     parent_noun: &str,
     parent_refno: u64,
 ) -> anyhow::Result<Vec<SpatialNode>> {
-    let query = match parent_noun {
+    let parent_noun = parent_noun.trim().to_uppercase();
+
+    let query = match parent_noun.as_str() {
         // Space -> Room (通过 room_panel_relate 关系)
         "FRMW" | "SBFR" => {
             format!(
@@ -290,11 +288,31 @@ async fn query_children_by_type(
                 parent_refno
             )
         }
-        // 其他类型 -> 直接子节点 (通过 pe_owner 关系)
+        // 其他类型 -> 直接子节点：pe_owner 层级关系改走 TreeIndex。
         _ => {
+            let parent_refno_enum = RefnoEnum::from(RefU64(parent_refno));
+            let dbnum = TreeIndexManager::resolve_dbnum_for_refno(parent_refno_enum)
+                .await
+                .ok();
+            let Some(dbnum) = dbnum else {
+                return Ok(Vec::new());
+            };
+            let mgr = TreeIndexManager::with_default_dir(vec![dbnum]);
+            let mut children = mgr.query_children(parent_refno_enum);
+            if children.len() > 100 {
+                children.truncate(100);
+            }
+            if children.is_empty() {
+                return Ok(Vec::new());
+            }
+            let ids = children
+                .iter()
+                .map(|r| r.refno().0.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             format!(
-                "SELECT refno, name, noun FROM pe WHERE owner = {} LIMIT 100",
-                parent_refno
+                "SELECT refno, name, noun FROM pe WHERE refno IN [{}] LIMIT 100",
+                ids
             )
         }
     };

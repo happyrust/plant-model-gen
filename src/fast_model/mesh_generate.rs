@@ -604,6 +604,32 @@ pub async fn run_mesh_worker_from_cache_manager(
                     );
                     continue;
                 }
+                // 可选：预计算并落盘凸分解（默认关闭）。
+                #[cfg(feature = "convex-decomposition")]
+                {
+                    let precompute = std::env::var("AIOS_PRECOMPUTE_CONVEX")
+                        .ok()
+                        .map(|v| {
+                            let v = v.trim();
+                            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+                        })
+                        .unwrap_or(false);
+
+                    if precompute {
+                        if let Err(e) = crate::fast_model::convex_decomp::build_and_save_convex_from_glb(
+                            mesh_dir,
+                            &mesh_id,
+                        )
+                        .await
+                        {
+                            debug_model_warn!(
+                                "[convex] 预计算失败(cache-only): geo_hash={}, error={}",
+                                mesh_id,
+                                e
+                            );
+                        }
+                    }
+                }
                 if mesh_formats.contains(&MeshFormat::Obj) {
                     let obj_path = mesh_base_path.with_extension("obj");
                     if let Err(e) = csg_mesh.mesh.export_obj(false, obj_path.to_str().unwrap()) {
@@ -1420,6 +1446,35 @@ async fn handle_csg_mesh(
     let glb_path = mesh_base_path.with_extension("glb");
     if let Err(e) = export_single_mesh_to_glb(&generated.mesh, &glb_path) {
         debug_model_warn!("   ⚠️ 生成 GLB 失败: {} - {}", mesh_id, e);
+    } else {
+        // 可选：预计算并落盘凸分解（默认关闭，避免拖慢主流程）。
+        #[cfg(feature = "convex-decomposition")]
+        {
+            let precompute = std::env::var("AIOS_PRECOMPUTE_CONVEX")
+                .ok()
+                .map(|v| {
+                    let v = v.trim();
+                    v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+                })
+                .unwrap_or(false);
+
+            // 1/2/3 为标准单位几何：geo_hash 全库复用，不能按实例尺寸落盘凸分解。
+            if precompute && !matches!(inst_key, "1" | "2" | "3") {
+                let base_mesh_dir = crate::fast_model::convex_decomp::normalize_base_mesh_dir(dir);
+                if let Err(e) = crate::fast_model::convex_decomp::build_and_save_convex_from_glb(
+                    &base_mesh_dir,
+                    inst_key,
+                )
+                .await
+                {
+                    debug_model_warn!(
+                        "[convex] 预计算失败: geo_hash={}, error={}",
+                        inst_key,
+                        e
+                    );
+                }
+            }
+        }
     }
 
     if mesh_formats.contains(&MeshFormat::Obj) {

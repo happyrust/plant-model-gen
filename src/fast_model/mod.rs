@@ -21,6 +21,8 @@ pub mod manifold_bool;
 pub mod mesh_generate;
 
 pub mod room_model; // 改进版本的房间模型
+#[cfg(feature = "convex-decomposition")]
+pub mod convex_decomp;
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub mod room_worker; // 后台房间计算 Worker
 

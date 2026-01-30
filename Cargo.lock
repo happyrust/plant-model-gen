@@ -225,6 +225,7 @@ dependencies = [
  "futures",
  "futures-util",
  "glam 0.30.10",
+ "glamx",
  "gltf",
  "gpui",
  "hex",
@@ -241,6 +242,7 @@ dependencies = [
  "log",
  "meilisearch-sdk",
  "memchr",
+ "miniacd",
  "nalgebra 0.34.1",
  "nom 7.1.3",
  "nom-derive",
@@ -620,6 +622,12 @@ dependencies = [
  "cpufeatures",
  "password-hash",
 ]
+
+[[package]]
+name = "array-init"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d62b7694a562cdf5a74227903507c56ab2cc8bdd1f781ed5cb4cf9c9f810bfc"
 
 [[package]]
 name = "array-init-cursor"
@@ -1549,6 +1557,12 @@ dependencies = [
  "tower-service",
  "tracing",
 ]
+
+[[package]]
+name = "az"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be5eb007b7cacc6c660343e96f650fedf4b5a77512399eb952ca6642cf8d13f7"
 
 [[package]]
 name = "base64"
@@ -2651,6 +2665,12 @@ checksum = "75443c44cd6b379beb8c5b45d85d0773baf31cce901fe7bb252f4eff3008ef7d"
 dependencies = [
  "cc",
 ]
+
+[[package]]
+name = "cmov"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d5ce5728ecb5285a5dd35f02a6a8e34e0828e0b38e8e632e249a3fe3f320211"
 
 [[package]]
 name = "cmsketch"
@@ -3757,6 +3777,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9c272297e804878a2a4b707cfcfc6d2328b5bb936944613b4fdf2b9269afdfd"
 
 [[package]]
+name = "divrem"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69dde51e8fef5e12c1d65e0929b03d66e4c0c18282bc30ed2ca050ad6f44dd82"
+
+[[package]]
 name = "dlib"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4491,6 +4517,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8591b0bcc8a98a64310a2fae1bb3e9b8564dd10e381e6e28010fde8e8e8568db"
 
 [[package]]
+name = "fixed"
+version = "1.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c566da967934c6c7ee0458a9773de9b2a685bd2ce26a3b28ddfc740e640182f5"
+dependencies = [
+ "az",
+ "bytemuck",
+ "half",
+ "num-traits",
+ "typenum",
+]
+
+[[package]]
 name = "fixedbitset"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4952,6 +4991,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "generator"
+version = "0.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52f04ae4152da20c76fe800fa48659201d5cf627c5149ca0b707b69d7eef6cf9"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "log",
+ "rustversion",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5234,10 +5288,24 @@ version = "0.30.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19fc433e8437a212d1b6f1e68c7824af3aed907da60afa994e7f542d18d12aa9"
 dependencies = [
+ "approx",
  "bytemuck",
+ "libm",
  "rand 0.9.2",
  "rkyv 0.8.14",
  "serde_core",
+]
+
+[[package]]
+name = "glamx"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "375b4fa374a343fef990a18a6e0413d54bd990c6d7b8c7ada2d3c884275edea3"
+dependencies = [
+ "approx",
+ "glam 0.30.10",
+ "num-traits",
+ "simba 0.9.1",
 ]
 
 [[package]]
@@ -6585,6 +6653,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "indoc"
+version = "2.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "inflections"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6898,6 +6975,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "kiddo"
+version = "5.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07ab03cc75e18eb1eec59f4037e2e17ce9d13920f0013b0719dea613d9414e4e"
+dependencies = [
+ "aligned-vec",
+ "array-init",
+ "az",
+ "cmov",
+ "divrem",
+ "fixed",
+ "generator",
+ "num-traits",
+ "ordered-float 5.1.0",
+ "sorted-vec",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kqueue"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7081,6 +7178,16 @@ name = "libm"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
+
+[[package]]
+name = "libmimalloc-sys"
+version = "0.1.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "667f4fec20f29dfc6bc7357c582d91796c169ad7e2fce709468aefeb2c099870"
+dependencies = [
+ "cc",
+ "libc",
+]
 
 [[package]]
 name = "libredox"
@@ -7529,6 +7636,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimalloc"
+version = "0.1.48"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1ee66a4b64c74f4ef288bcbb9192ad9c3feaad75193129ac8509af543894fd8"
+dependencies = [
+ "libmimalloc-sys",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7542,6 +7658,25 @@ checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
 dependencies = [
  "mime",
  "unicase",
+]
+
+[[package]]
+name = "miniacd"
+version = "0.1.3"
+dependencies = [
+ "ahash 0.8.12",
+ "glamx",
+ "indicatif",
+ "kiddo",
+ "mimalloc",
+ "parry3d-f64",
+ "pyo3",
+ "pyo3-build-config",
+ "rand 0.9.2",
+ "rand_chacha 0.9.0",
+ "rayon",
+ "spade",
+ "tobj",
 ]
 
 [[package]]
@@ -8807,6 +8942,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "parry3d-f64"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38558e45fda09a243836f590b9890f7f21dd2078dd7aafc876a9e8998d378d42"
+dependencies = [
+ "approx",
+ "arrayvec",
+ "bitflags 2.10.0",
+ "downcast-rs 2.0.2",
+ "either",
+ "ena",
+ "foldhash 0.2.0",
+ "glamx",
+ "hashbrown 0.16.1",
+ "log",
+ "num-derive",
+ "num-traits",
+ "ordered-float 5.1.0",
+ "rstar 0.12.2",
+ "simba 0.9.1",
+ "slab",
+ "smallvec",
+ "spade",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "parse_pdms_db"
 version = "3.0.0"
 dependencies = [
@@ -10032,6 +10194,67 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7186d3822593aa4393561d186d1393b3923e9d6163d3fbfd6e825e3e6cf3e6a8"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "pyo3"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab53c047fcd1a1d2a8820fe84f05d6be69e9526be40cb03b73f86b6b03e6d87d"
+dependencies = [
+ "indoc",
+ "libc",
+ "memoffset",
+ "once_cell",
+ "portable-atomic",
+ "pyo3-build-config",
+ "pyo3-ffi",
+ "pyo3-macros",
+ "unindent",
+]
+
+[[package]]
+name = "pyo3-build-config"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b455933107de8642b4487ed26d912c2d899dec6114884214a0b3bb3be9261ea6"
+dependencies = [
+ "target-lexicon",
+]
+
+[[package]]
+name = "pyo3-ffi"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c85c9cbfaddf651b1221594209aed57e9e5cff63c4d11d1feead529b872a089"
+dependencies = [
+ "libc",
+ "pyo3-build-config",
+]
+
+[[package]]
+name = "pyo3-macros"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a5b10c9bf9888125d917fb4d2ca2d25c8df94c7ab5a52e13313a07e050a3b02"
+dependencies = [
+ "proc-macro2",
+ "pyo3-macros-backend",
+ "quote",
+ "syn 2.0.114",
+]
+
+[[package]]
+name = "pyo3-macros-backend"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03b51720d314836e53327f5871d4c0cfb4fb37cc2c4a11cc71907a86342c40f9"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "pyo3-build-config",
+ "quote",
+ "syn 2.0.114",
 ]
 
 [[package]]
@@ -12067,6 +12290,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sorted-vec"
+version = "0.8.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19f58d7b0190c7f12df7e8be6b79767a0836059159811b869d5ab55721fe14d0"
+
+[[package]]
 name = "spade"
 version = "2.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12830,6 +13059,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "target-lexicon"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1dd07eb858a2067e2f3c7155d54e929265c264e6f37efe3ee7a8d1b5a1dd0ba"
+
+[[package]]
 name = "tempfile"
 version = "3.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13028,6 +13263,15 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "tobj"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04aca6092e5978e708ee784e8ab9b5cf3cdb598b28f99a2f257446e7081a7025"
+dependencies = [
+ "ahash 0.8.12",
+]
 
 [[package]]
 name = "tokio"
@@ -13732,6 +13976,12 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unindent"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7264e107f553ccae879d21fbea1d6724ac785e8c3bfc762137959b5802826ef3"
 
 [[package]]
 name = "unit-prefix"

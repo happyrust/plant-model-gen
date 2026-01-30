@@ -328,6 +328,13 @@ pub async fn gen_prim_geos(
                     PdmsGeoParam::PrimLoft(s) => s.is_reuse_unit(),
                     _ => false,
                 };
+
+                // RTOR（矩形环面体）在 aios_core 的 CSG 形状里会同时携带“几何参数 + scale”，
+                // 但本仓库的 mesh 生成使用的是 geo_param（已包含实际尺寸）。
+                // 若不清零 scale，导出阶段会再次把 scale 乘进去，表现为尺寸被平方放大（例如 160mm -> 25600mm）。
+                if matches!(&geo_param, PdmsGeoParam::PrimRTorus(_)) && !unit_flag {
+                    transform.scale = Vec3::ONE;
+                }
                 // dbg!(geo_hash);
                 let inst_geo = EleInstGeo {
                     geo_hash,

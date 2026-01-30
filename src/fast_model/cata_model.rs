@@ -2105,14 +2105,19 @@ pub async fn gen_tubi_from_db(
     // 3. 查询 branch 下的子元件
     let branch_map: DashMap<RefnoEnum, Vec<SPdmsElement>> = DashMap::new();
     for &branch_refno in branch_refnos {
-        match aios_core::collect_children_elements(branch_refno, &[]).await {
+        // 约定：BRAN/HANG 的层级/过滤查询统一走 indextree（TreeIndex），避免依赖 SurrealDB 的图查询。
+        match crate::fast_model::gen_model::tree_index_manager::TreeIndexManager::collect_children_elements_from_tree(branch_refno).await {
             Ok(children) => {
                 if !children.is_empty() {
                     branch_map.insert(branch_refno, children);
                 }
             }
             Err(e) => {
-                debug_model!("[gen_tubi_from_db] 查询子元件失败: {} - {}", branch_refno, e);
+                debug_model!(
+                    "[gen_tubi_from_db] TreeIndex 查询子元件失败: {} - {}",
+                    branch_refno,
+                    e
+                );
             }
         }
     }

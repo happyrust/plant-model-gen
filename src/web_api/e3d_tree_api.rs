@@ -211,38 +211,60 @@ async fn get_children(
 
     let parent_type = get_type_name(parent_refno).await;
 
-    let mut children_nodes = if parent_type == "WORL" {
+    let mut children: Vec<TreeNodeDto> = if parent_type == "WORL" {
         let db_option = aios_core::get_db_option();
         let mdb_name = db_option.mdb_name.clone();
 
         let mut eles = aios_core::get_mdb_world_site_ele_nodes(mdb_name, aios_core::DBType::DESI)
             .await
             .unwrap_or_default();
-        for ele in &mut eles {
-            ele.owner = parent_refno;
-        }
-        eles
+        eles.into_iter()
+            .map(|mut ele| {
+                ele.owner = parent_refno;
+                TreeNodeDto {
+                    refno: ele.refno,
+                    name: ele.name,
+                    noun: ele.noun,
+                    owner: Some(parent_refno),
+                    children_count: Some(i32::from(ele.children_count)),
+                }
+            })
+            .collect()
     } else {
-        aios_core::get_children_ele_nodes(parent_refno)
-            .await
-            .unwrap_or_default()
+        // 层级查询统一走 indextree（TreeIndex）；name 可从 SurrealDB（输入数据源）读取。
+        use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+
+        let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(parent_refno).await else {
+            Vec::new()
+        };
+        let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+        let child_refnos = manager.query_children(parent_refno);
+
+        let mut out: Vec<TreeNodeDto> = Vec::with_capacity(child_refnos.len());
+        for r in child_refnos {
+            let noun = manager.get_noun(r).unwrap_or_default();
+            let name = crate::fast_model::query_provider::get_pe(r)
+                .await
+                .ok()
+                .flatten()
+                .map(|pe| pe.name)
+                .unwrap_or_default();
+            let children_count = manager.query_children(r).len() as i32;
+            out.push(TreeNodeDto {
+                refno: r,
+                name,
+                noun,
+                owner: Some(parent_refno),
+                children_count: Some(children_count),
+            });
+        }
+        out
     };
 
-    let truncated = (children_nodes.len() as i32) > limit;
-    if children_nodes.len() > limit as usize {
-        children_nodes.truncate(limit as usize);
+    let truncated = (children.len() as i32) > limit;
+    if children.len() > limit as usize {
+        children.truncate(limit as usize);
     }
-
-    let children: Vec<TreeNodeDto> = children_nodes
-        .into_iter()
-        .map(|ele| TreeNodeDto {
-            refno: ele.refno,
-            name: ele.name,
-            noun: ele.noun,
-            owner: Some(parent_refno),
-            children_count: Some(i32::from(ele.children_count)),
-        })
-        .collect();
 
     Ok(Json(ChildrenResponse {
         success: true,
@@ -257,7 +279,8 @@ async fn get_ancestors(
     Path(refno): Path<RefnoEnum>,
     State(_state): State<E3dTreeApiState>,
 ) -> Result<Json<AncestorsResponse>, StatusCode> {
-    let ancestors = match aios_core::query_ancestor_refnos(refno).await {
+    // 层级查询统一走 indextree（TreeIndex）
+    let ancestors = match crate::fast_model::query_provider::get_ancestors(refno).await {
         Ok(v) => v,
         Err(e) => {
             return Ok(Json(AncestorsResponse {
@@ -284,28 +307,21 @@ async fn get_subtree_refnos(
     let max_depth = query.max_depth.unwrap_or(64).clamp(0, 256);
     let limit = query.limit.unwrap_or(50_000).clamp(1, 200_000) as usize;
 
-    let range_str = if max_depth <= 0 {
-        None
-    } else {
-        Some(format!("1..{}", max_depth))
-    };
-
+    // 层级查询统一走 indextree（TreeIndex）
+    use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
     let mut out: Vec<RefnoEnum> = if max_depth <= 0 {
         Vec::new()
     } else {
-        match aios_core::collect_descendant_filter_ids(&[root_refno], &[], range_str.as_deref())
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(Json(SubtreeRefnosResponse {
-                    success: false,
-                    refnos: vec![],
-                    truncated: false,
-                    error_message: Some(format!("collect_descendant_filter_ids failed: {e}")),
-                }));
-            }
-        }
+        let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(root_refno).await else {
+            return Ok(Json(SubtreeRefnosResponse {
+                success: false,
+                refnos: vec![],
+                truncated: false,
+                error_message: Some("resolve_dbnum_for_refno failed".to_string()),
+            }));
+        };
+        let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+        manager.query_descendants(root_refno, Some(max_depth as usize))
     };
 
     if include_self {
@@ -330,7 +346,8 @@ async fn get_visible_insts(
     State(_state): State<E3dTreeApiState>,
 ) -> Result<Json<VisibleInstsResponse>, StatusCode> {
     // 1) 先拿“深度可见实例”（可能包含无几何的组节点）
-    let mut candidates = match aios_core::query_deep_visible_inst_refnos(refno).await {
+    // 层级查询统一走 indextree（TreeIndex）
+    let mut candidates = match crate::fast_model::query_compat::query_deep_visible_inst_refnos(refno).await {
         Ok(v) => v,
         Err(e) => {
             return Ok(Json(VisibleInstsResponse {
@@ -350,10 +367,10 @@ async fn get_visible_insts(
     // 2) 优先用 instances_{dbnum}.json 做“可加载几何”过滤：与前端实际加载数据保持一致。
     //    - 这可以避免 query_deep_visible_inst_refnos 返回“组节点/无几何节点”，导致前端 instances 缺失。
     //    - 若文件不存在，再回退到 inst_relate 的几何实例查询做过滤。
-    fn parse_dbno(r: RefnoEnum) -> Option<u32> {
-        let s = r.to_string();
-        let (dbnum, _) = s.split_once('_')?;
-        dbnum.parse::<u32>().ok()
+    async fn parse_dbno(r: RefnoEnum) -> Option<u32> {
+        crate::fast_model::gen_model::tree_index_manager::TreeIndexManager::resolve_dbnum_for_refno(r)
+            .await
+            .ok()
     }
 
     fn collect_component_refnos(v: &serde_json::Value, out: &mut HashSet<String>) {
@@ -393,7 +410,7 @@ async fn get_visible_insts(
         }
     }
 
-    let refnos = if let Some(dbnum) = parse_dbno(refno) {
+    let refnos = if let Some(dbnum) = parse_dbno(refno).await {
         let instances_path =
             std::path::Path::new("output").join("instances").join(format!("instances_{dbnum}.json"));
         if let Ok(bytes) = fs::read(&instances_path) {

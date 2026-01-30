@@ -386,10 +386,14 @@ pub async fn export_instanced_bundle_for_refnos(
         if verbose {
             println!("   - 正在展开通过层级查询子孙节点...");
         }
-        // 查询所有类型的子孙节点
-        let descendants = aios_core::collect_descendant_filter_ids(refnos, &[], None)
-            .await
-            .unwrap_or_default();
+        // 查询所有类型的子孙节点（层级查询统一走 indextree/TreeIndex）
+        let descendants = crate::fast_model::query_provider::query_multi_descendants_with_self(
+            refnos,
+            &[],
+            false,
+        )
+        .await
+        .unwrap_or_default();
             
         if !descendants.is_empty() {
             if verbose {

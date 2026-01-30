@@ -181,7 +181,8 @@ pub async fn gen_prim_geos(
                 // dbg!((attr.get_type_str(), refno, neg_limit_size));
                 //多面体的处理
                 let csg_shape = if cur_type == "POHE" || cur_type == "POLYHE" {
-                    let pgo_refnos = aios_core::get_children_refnos(refno)
+                    // 层级查询统一走 indextree（TreeIndex）
+                    let pgo_refnos = crate::fast_model::query_provider::get_children(refno)
                         .await
                         .unwrap_or_default();
                     //需要检查第一个是不是POLPTL 类型
@@ -198,10 +199,11 @@ pub async fn gen_prim_geos(
                         is_polyhe = true;
                         // let mut plant_mesh = PlantMesh::default();
                         let mut verts_map = HashMap::new();
-                        let v_att = aios_core::collect_descendant_filter_ids(
+                        // 层级查询统一走 indextree（TreeIndex）
+                        let v_att = crate::fast_model::query_provider::query_multi_descendants_with_self(
                             &[pgo_refnos[0]],
                             &["POIN"],
-                            None,
+                            false,
                         )
                         .await
                         .unwrap_or_default();
@@ -346,10 +348,11 @@ pub async fn gen_prim_geos(
                 };
                 geo_insts.push(inst_geo);
                 if geo_insts.len() > 0 {
-                    let neg_refnos = aios_core::collect_descendant_filter_ids(
+                    // 层级查询统一走 indextree（TreeIndex）
+                    let neg_refnos = crate::fast_model::query_provider::query_multi_descendants_with_self(
                         &[refno],
                         &GENRAL_NEG_NOUN_NAMES,
-                        None,
+                        false,
                     )
                     .await
                     .unwrap_or_default();

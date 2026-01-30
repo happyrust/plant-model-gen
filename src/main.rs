@@ -747,6 +747,8 @@ async fn main() -> anyhow::Result<()> {
         // 与 replace_mesh 配合：强制 mesh_worker 忽略 mesh_sig 缓存，确保本次能看到最新代码/配置效果。
         unsafe {
             std::env::set_var("FORCE_REGEN_MESH", "1");
+            // 兼容 cache-only mesh_worker 的替换语义（run_mesh_worker_from_cache_manager 读取该变量）。
+            std::env::set_var("FORCE_REPLACE_MESH", "true");
         }
         db_option_ext.inner.replace_mesh = Some(true);
         // 元件库(cata_neg)/设计型负实体导出依赖布尔结果（CatePos），因此 regen-model 必须开启布尔运算。
@@ -787,7 +789,7 @@ async fn main() -> anyhow::Result<()> {
 
         if !db_option_ext.use_surrealdb {
             println!(
-                "📦 OBJ 导出默认使用 indextree + foyer 缓存数据源（不连接 SurrealDB）。如需从 SurrealDB 直接读取 instances/对照验证，请添加 --use-surrealdb。"
+                "📦 cache-only：OBJ 导出默认使用 indextree + foyer 缓存（instances 从缓存读，不写入 inst_*）。SurrealDB 仍作为输入数据源连接（PE/属性/世界矩阵等）。如需写入/对照验证，请添加 --use-surrealdb。"
             );
         }
     }

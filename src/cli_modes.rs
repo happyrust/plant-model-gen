@@ -274,8 +274,8 @@ fn parse_length_unit(unit: &str) -> LengthUnit {
 
 /// 连接 SurrealDB（用于读取 PDMS 输入数据或写入模型数据）。
 ///
-/// 注意：在“cache-only 导出/截图”路径下，我们约定不依赖 SurrealDB；
-/// 如需从 SurrealDB 读取/写入（对照验证、回写模型表等），必须显式启用 `DbOptionExt.use_surrealdb=true`。
+/// 约定（重要）：cache-only 也需要连接 SurrealDB 作为“输入数据源”（PE/属性/世界矩阵等）。
+/// cache-only 的区别仅在于：不写入 inst_* 等模型相关表，且导出期实例数据优先从 foyer cache 读取。
 async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
     if db_option_ext.use_surrealdb {
         println!("\n📡 连接数据库（SurrealDB 写入启用）...");
@@ -294,12 +294,10 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     println!("\n🎯 OBJ 导出模式");
     println!("================");
 
-    // 约定：OBJ 导出默认走 cache-only（indextree + foyer），不依赖 SurrealDB；
-    // 若需从 SurrealDB 读取/写入（对照验证），必须显式启用 use_surrealdb。
-    if db_option_ext.use_surrealdb {
-        ensure_surreal_connected(db_option_ext).await?;
-    } else {
-        println!("📦 cache-only：OBJ 导出仅使用 indextree + foyer（SurrealDB 不连接）");
+    // cache-only 也需要连接 SurrealDB（输入数据源）；区别仅在于 instances 的读取/写入策略。
+    ensure_surreal_connected(db_option_ext).await?;
+    if !db_option_ext.use_surrealdb {
+        println!("📦 cache-only：OBJ 实例数据从 foyer cache 读取（不从 SurrealDB 查询 inst_relate）");
     }
 
     // 如果需要导出 SVG，设置环境变量
@@ -356,58 +354,31 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
                 std::env::set_var("FORCE_REPLACE_MESH", "true");
             }
 
-            if db_option_ext.use_surrealdb {
-                // 写库/对照路径：走完整 gen_model（会读取输入数据并生成 instances + mesh + bool）
-                use aios_database::fast_model::gen_all_geos_data;
+            // 无论是否写库，--regen-model 都表示“重建模型数据”：
+            // - use_surrealdb=false：生成结果落地 foyer cache（SurrealDB 仅作为输入源，不写 inst_*）
+            // - use_surrealdb=true ：同时允许写入/对照验证
+            use aios_database::fast_model::gen_all_geos_data;
 
-                let mut db_option_clone = db_option_ext.inner.clone();
-                let original_replace_mesh = db_option_clone.replace_mesh;
-                let original_gen_mesh = db_option_clone.gen_mesh;
-                db_option_clone.replace_mesh = Some(true);
-                db_option_clone.gen_mesh = true;
+            let mut db_option_clone = db_option_ext.inner.clone();
+            let original_replace_mesh = db_option_clone.replace_mesh;
+            let original_gen_mesh = db_option_clone.gen_mesh;
+            db_option_clone.replace_mesh = Some(true);
+            db_option_clone.gen_mesh = true;
 
-                let mut db_option_ext_override = db_option_ext.clone();
-                db_option_ext_override.inner = db_option_clone.clone();
+            let mut db_option_ext_override = db_option_ext.clone();
+            db_option_ext_override.inner = db_option_clone.clone();
 
-                // 导出若包含子孙节点，regen 也必须覆盖同一范围；此处使用 TreeIndex 计算子孙集合。
-                let regen_refnos =
-                    collect_export_refnos(&refnos, config.include_descendants, None, config.verbose)
-                        .await?;
+            // 导出若包含子孙节点，regen 也必须覆盖同一范围；此处使用 TreeIndex 计算子孙集合。
+            let regen_refnos =
+                collect_export_refnos(&refnos, config.include_descendants, None, config.verbose)
+                    .await?;
 
-                ensure_surreal_connected(db_option_ext).await?;
-                gen_all_geos_data(regen_refnos, &db_option_ext_override, None, None).await?;
+            // 生成时需要读取输入数据（PE/属性/世界矩阵等），因此需连接 SurrealDB。
+            ensure_surreal_connected(db_option_ext).await?;
+            gen_all_geos_data(regen_refnos, &db_option_ext_override, None, None).await?;
 
-                db_option_clone.replace_mesh = original_replace_mesh;
-                db_option_clone.gen_mesh = original_gen_mesh;
-            } else {
-                // cache-only 路径：不生成/补齐 instances（它们必须已存在于 foyer cache），仅重算 mesh/boolean。
-                use aios_database::fast_model::manifold_bool::run_boolean_worker_from_cache;
-                use aios_database::fast_model::mesh_generate::run_mesh_worker_from_cache;
-
-                let cache_dir = db_option_ext.get_foyer_cache_dir();
-                let mesh_root_dir = db_option_ext.inner.get_meshes_path();
-
-                println!(
-                    "📦 cache-only：--regen-model 仅重算 mesh{}（instances 仍来自 foyer cache）",
-                    if db_option_ext.inner.apply_boolean_operation {
-                        " + boolean"
-                    } else {
-                        ""
-                    }
-                );
-
-                let _ = run_mesh_worker_from_cache(
-                    &cache_dir,
-                    &mesh_root_dir,
-                    &db_option_ext.inner.mesh_precision,
-                    &db_option_ext.mesh_formats,
-                )
-                .await?;
-
-                if db_option_ext.inner.apply_boolean_operation {
-                    let _ = run_boolean_worker_from_cache(&cache_dir).await?;
-                }
-            }
+            db_option_clone.replace_mesh = original_replace_mesh;
+            db_option_clone.gen_mesh = original_gen_mesh;
 
             unsafe {
                 std::env::remove_var("FORCE_REPLACE_MESH");
@@ -486,39 +457,19 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
             std::env::set_var("FORCE_REPLACE_MESH", "true");
         }
 
-        if db_option_ext.use_surrealdb {
-            use aios_database::fast_model::gen_all_geos_data;
-            ensure_surreal_connected(db_option_ext).await?;
+        use aios_database::fast_model::gen_all_geos_data;
+        ensure_surreal_connected(db_option_ext).await?;
 
-            let mut db_option_clone = db_option_ext.inner.clone();
-            let original_replace_mesh = db_option_clone.replace_mesh;
-            let original_gen_mesh = db_option_clone.gen_mesh;
-            db_option_clone.replace_mesh = Some(true);
-            db_option_clone.gen_mesh = true;
-            let mut db_option_ext_override = db_option_ext.clone();
-            db_option_ext_override.inner = db_option_clone.clone();
-            gen_all_geos_data(sites.clone(), &db_option_ext_override, None, None).await?;
-            db_option_clone.replace_mesh = original_replace_mesh;
-            db_option_clone.gen_mesh = original_gen_mesh;
-        } else {
-            use aios_database::fast_model::manifold_bool::run_boolean_worker_from_cache;
-            use aios_database::fast_model::mesh_generate::run_mesh_worker_from_cache;
-
-            let cache_dir = db_option_ext.get_foyer_cache_dir();
-            let mesh_root_dir = db_option_ext.inner.get_meshes_path();
-
-            let _ = run_mesh_worker_from_cache(
-                &cache_dir,
-                &mesh_root_dir,
-                &db_option_ext.inner.mesh_precision,
-                &db_option_ext.mesh_formats,
-            )
-            .await?;
-
-            if db_option_ext.inner.apply_boolean_operation {
-                let _ = run_boolean_worker_from_cache(&cache_dir).await?;
-            }
-        }
+        let mut db_option_clone = db_option_ext.inner.clone();
+        let original_replace_mesh = db_option_clone.replace_mesh;
+        let original_gen_mesh = db_option_clone.gen_mesh;
+        db_option_clone.replace_mesh = Some(true);
+        db_option_clone.gen_mesh = true;
+        let mut db_option_ext_override = db_option_ext.clone();
+        db_option_ext_override.inner = db_option_clone.clone();
+        gen_all_geos_data(sites.clone(), &db_option_ext_override, None, None).await?;
+        db_option_clone.replace_mesh = original_replace_mesh;
+        db_option_clone.gen_mesh = original_gen_mesh;
 
         unsafe {
             std::env::remove_var("FORCE_REPLACE_MESH");

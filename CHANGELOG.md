@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-01-30
+
+### Fixed
+
+- **cache-only 导出读取 instance_cache 选取最新 batch，避免旧数据污染**
+  - 修复：`query_geometry_instances_ext_from_cache` 按 `created_at` 选择最新的 `inst_relate_bool(Success)`，并且 inst_info/inst_geos/inst_tubi 仅取最新 batch
+  - 影响：解决 `--regen-model --export-obj` 场景下部分子孙节点（例如 BOX）看似“未导出”的问题（实为命中旧 bool mesh_id/旧 inst_geo）
+  - 修改位置：`src/fast_model/export_model/model_exporter.rs`
+
+- **修复 RTOR（矩形环面体）尺寸被平方放大**
+  - 原因：RTOR 的实际尺寸已由 `geo_param` 表达，若 `transform.scale` 仍携带尺寸会在导出阶段再次乘入，导致重复缩放（例如 160mm -> 25600mm）
+  - 修复：生成 inst_geo 时对 `PrimRTorus` 清零 scale（非 unit_flag）
+  - 修改位置：`src/fast_model/prim_model.rs`
+
+### Added
+
+- **新增 cache 排查示例**
+  - `examples/inspect_cache_geom_refno.rs`：按 refno 检查最新命中 batch 的 inst_info/inst_geos/geo_param/scale
+
+- **凸分解（可选）与调试工具补全**
+  - 新增 feature：`convex-decomposition`
+  - 新增：`src/fast_model/convex_decomp.rs`、Meili 导入 spool 工具 `src/bin/meili_import_spool.rs`、以及相关配置样例 `DbOption-*.toml`
+
 ## 2026-01-29
 
 ### Fixed

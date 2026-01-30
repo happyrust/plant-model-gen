@@ -17,18 +17,18 @@
 
 use crate::data_interface::db_meta;
 use crate::fast_model::gen_model::tree_index_manager::{
-    ensure_tree_index_exists, load_index_with_large_stack, TreeIndexManager, enable_auto_generate_tree,
+    load_index_with_large_stack, TreeIndexManager, enable_auto_generate_tree,
     is_auto_generate_tree_enabled,
 };
 use aios_core::RefnoEnum;
 use aios_core::query_provider::*;
 use aios_core::tool::db_tool::db1_hash;
-use aios_core::tree_query::{TreeQuery, TreeQueryFilter, TreeQueryOptions};
+use aios_core::tree_query::{TreeQueryFilter, TreeQueryOptions};
 use aios_core::types::{NamedAttrMap as NamedAttMap, SPdmsElement as PE};
 use anyhow::Context;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// 全局查询提供者实例
 static GLOBAL_PROVIDER: OnceCell<Arc<dyn QueryProvider>> = OnceCell::new();
@@ -485,21 +485,16 @@ pub async fn query_multi_descendants_with_self(
         return Ok(Vec::new());
     }
 
-    // 按需生成缺失的 `{dbnum}.tree`，避免因 tree 缺失导致层级查询直接返回空结果。
+    // cache-only 语义：这里不应触发 “缺失 tree 自动从 DB 生成” 的路径；
+    // 若 tree 文件缺失，直接报错提示用户先生成 tree 索引即可。
     let tree_dir = TreeIndexManager::with_default_dir(Vec::new())
         .tree_dir()
         .to_path_buf();
 
     let mut root_dbnums: Vec<(RefnoEnum, u32)> = Vec::with_capacity(refnos.len());
-    let mut unique_dbnums: HashSet<u32> = HashSet::new();
     for &root in refnos {
         let dbnum = TreeIndexManager::resolve_dbnum_for_refno(root).await?;
         root_dbnums.push((root, dbnum));
-        if unique_dbnums.insert(dbnum) {
-            ensure_tree_index_exists(dbnum, &tree_dir)
-                .await
-                .with_context(|| format!("按需生成 tree 索引失败: dbnum={}", dbnum))?;
-        }
     }
 
     // 这里直接用 TreeIndex 查询（并在大栈线程加载 `.tree`），避免依赖全局 Provider 的初始化时机。
@@ -511,10 +506,19 @@ pub async fn query_multi_descendants_with_self(
 
     let mut out: Vec<RefnoEnum> = Vec::new();
     let mut seen: HashSet<RefnoEnum> = HashSet::new();
+    let mut index_cache: HashMap<u32, Arc<aios_core::tree_query::TreeIndex>> = HashMap::new();
 
     for (root, dbnum) in root_dbnums {
-        let index = load_index_with_large_stack(&tree_dir, dbnum)
-            .with_context(|| format!("加载 TreeIndex 失败: {}/{}.tree", tree_dir.display(), dbnum))?;
+        let index = match index_cache.get(&dbnum) {
+            Some(idx) => idx.clone(),
+            None => {
+                let idx = load_index_with_large_stack(&tree_dir, dbnum).with_context(|| {
+                    format!("加载 TreeIndex 失败: {}/{}.tree", tree_dir.display(), dbnum)
+                })?;
+                index_cache.insert(dbnum, idx.clone());
+                idx
+            }
+        };
 
         let options = TreeQueryOptions {
             include_self,
@@ -525,12 +529,7 @@ pub async fn query_multi_descendants_with_self(
             },
         };
 
-        let descendants = index
-            .query_descendants_bfs(root.refno(), options)
-            .await
-            .with_context(|| format!("TreeIndex 查询子孙节点失败: root={}", root))?;
-
-        for r in descendants {
+        for r in index.collect_descendants_bfs(root.refno(), &options) {
             let r = RefnoEnum::from(r);
             if r.is_valid() && seen.insert(r) {
                 out.push(r);

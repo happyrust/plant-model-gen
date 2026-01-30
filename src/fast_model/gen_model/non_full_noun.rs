@@ -39,6 +39,7 @@ use crate::data_interface::increment_record::IncrGeoUpdateLog;
 use crate::fast_model::query_provider::{query_by_type, query_multi_descendants};
 use crate::fast_model::{cata_model, debug_model_debug, debug_model_trace, loop_model, prim_model};
 
+use super::tree_index_manager::TreeIndexManager;
 use super::utilities::{build_cata_hash_map_from_tree, is_e3d_debug_enabled};
 
 use super::models::DbModelInstRefnos;
@@ -364,12 +365,18 @@ async fn process_gen_geos_data_chunks(
             // 🔧 修复：同时检查 target_refnos 本身是否为 BRAN/HANG 类型
             // 这对于用户直接传入 BRAN refno 的场景是必需的
             for refno in target_refnos {
-                if let Ok(Some(pe)) = aios_core::get_pe(*refno).await {
-                    let noun = pe.noun.to_uppercase();
-                    if (noun == "BRAN" || noun == "HANG") && !r.contains(refno) {
-                        debug_model_debug!("[BRAN_FIX] 添加 target_refno 本身作为 BRAN/HANG: {}", refno);
-                        r.push(*refno);
-                    }
+                // cache-only：避免依赖 SurrealDB（SUL_DB 未初始化会报 ConnectionUninitialised）
+                let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(*refno).await else {
+                    continue;
+                };
+                let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+                let Some(noun) = manager.get_noun(*refno) else {
+                    continue;
+                };
+                let noun = noun.to_uppercase();
+                if (noun == "BRAN" || noun == "HANG") && !r.contains(refno) {
+                    debug_model_debug!("[BRAN_FIX] 添加 target_refno 本身作为 BRAN/HANG: {}", refno);
+                    r.push(*refno);
                 }
             }
             
@@ -426,21 +433,11 @@ async fn process_gen_geos_data_chunks(
                     .unwrap_or_default()
             }
         } else {
-            // 查询是否是单个使用元件库，父节点是 BRAN HANG
-            let sql = format!(
-                "select value refno from [{}] where owner.noun in ['BRAN', 'HANG']",
-                target_refnos
-                    .iter()
-                    .map(|x| x.to_pe_key())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            let mut response = SUL_DB.query(sql).await.unwrap();
-
-            let Ok(bran_children_refnos) = response.take::<Vec<RefnoEnum>>(0) else {
-                debug_model_debug!("[WARN] 查询BRAN, HANG出错");
-                continue;
-            };
+            // cache-only/可选 DB：这里原本通过 SurrealDB 判断 “父节点为 BRAN/HANG 的子元件”，
+            // 但该结果已不再参与 use_cata_refnos 扩展（见下方 BRAN_FIX 注释），保留这段查询只会：
+            // - 在 cache-only 且未 init_surreal 时触发 ConnectionUninitialised
+            // - 增加一次不必要的 DB 压力
+            // 因此直接移除该查询。
             let single_refnos = target_refnos
                 .iter()
                 .filter(|x| !target_bran_hanger_refnos.contains(x))
@@ -469,11 +466,9 @@ async fn process_gen_geos_data_chunks(
             );
             debug_model_debug!("use_cata_refnos: {:?}", &use_cata_refnos);
 
-            // 🔧 修复：不再将 bran_children_refnos 添加到 use_cata_refnos
-            // BRAN 子元件已在 target_bran_reuse_cata_map 中处理，避免重复
-            // use_cata_refnos.extend(bran_children_refnos);
+            // 🔧 修复：BRAN 子元件已在 target_bran_reuse_cata_map 中处理，避免重复扩展。
             debug_model_debug!(
-                "[BRAN_FIX] 跳过 bran_children_refnos 扩展，避免与 target_bran_reuse_cata_map 重复"
+                "[BRAN_FIX] 跳过 BRAN/HANG 子元件扩展，避免与 target_bran_reuse_cata_map 重复"
             );
 
             debug_model_debug!(
@@ -555,12 +550,18 @@ async fn process_gen_geos_data_chunks(
             // 🔧 修复：先检查 target_refnos 本身是否为 LOOP 类型
             let mut loop_owner_refnos = Vec::new();
             for refno in target_refnos {
-                if let Ok(Some(pe)) = aios_core::get_pe(*refno).await {
-                    let noun_upper = pe.noun.to_uppercase();
-                    if GNERAL_LOOP_OWNER_NOUN_NAMES.contains(&noun_upper.as_str()) {
-                        println!("✅ target_refno 本身是 LOOP 类型: {} (noun={})", refno, pe.noun);
-                        loop_owner_refnos.push(*refno);
-                    }
+                // cache-only：从 TreeIndex 读取 noun，避免依赖 SurrealDB。
+                let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(*refno).await else {
+                    continue;
+                };
+                let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+                let Some(noun) = manager.get_noun(*refno) else {
+                    continue;
+                };
+                let noun_upper = noun.to_uppercase();
+                if GNERAL_LOOP_OWNER_NOUN_NAMES.contains(&noun_upper.as_str()) {
+                    println!("✅ target_refno 本身是 LOOP 类型: {} (noun={})", refno, noun);
+                    loop_owner_refnos.push(*refno);
                 }
             }
 
@@ -698,9 +699,16 @@ async fn process_gen_geos_data_chunks(
             println!("========== 🔍 开始查询 PRIM 节点 ==========");
             println!("查询的 PRIM 类型: {:?}", GNERAL_PRIM_NOUN_NAMES);
 
-            let mut prim_refnos = query_multi_descendants(target_refnos, &GNERAL_PRIM_NOUN_NAMES)
-                .await
-                .unwrap_or_default();
+            // 关键：target_refnos 在“手动/调试(含子孙)”模式下往往已经是“全量节点集合”，
+            // 若只查 descendants（include_self=false），会把 PRIM 节点本身漏掉（常见表现：BOX/CYLI 等不生成）。
+            // 因此这里显式 include_self=true，确保 target_refnos 中的 PRIM 节点也会被纳入生成。
+            let mut prim_refnos = crate::fast_model::query_provider::query_multi_descendants_with_self(
+                target_refnos,
+                &GNERAL_PRIM_NOUN_NAMES,
+                true,
+            )
+            .await
+            .unwrap_or_default();
 
             println!("✅ query_multi_descendants 查询结果: {} 个 PRIM 节点", prim_refnos.len());
             if !prim_refnos.is_empty() {

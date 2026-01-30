@@ -10,7 +10,6 @@ use aios_core::geometry::csg::{unit_box_mesh, unit_cylinder_mesh, unit_sphere_me
 use aios_core::get_db_option;
 use aios_core::mesh_precision::LodMeshSettings;
 use aios_core::rs_surreal::boolean_query_optimized::query_manifold_boolean_operations_batch_optimized;
-use aios_core::shape::pdms_shape::PlantMesh;
 use aios_core::{
     CataNegGroup, GmGeoData, ManiGeoTransQuery, NegInfo, query_cata_neg_boolean_groups,
     query_geom_mesh_data, query_negative_entities_batch,
@@ -104,14 +103,18 @@ fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<M
     // 对标准单位几何体（1/2/3）强制使用内置几何生成，避免磁盘上被误写/污染的同名 GLB 影响布尔结果。
     if matches!(id, "1" | "2" | "3") {
         debug_model_debug!("load_manifold: 使用内置 unit mesh: id={}", id);
-        let mesh: PlantMesh = match id {
+        let unit_mesh = match id {
             "1" => unit_box_mesh(),
             "2" => unit_cylinder_mesh(&LodMeshSettings::default(), false),
             "3" => unit_sphere_mesh(),
             _ => unreachable!(),
         };
-        let manifold = ManifoldRust::convert_to_manifold(mesh, mat, more_precision);
-        // 复用下面的“空/哨兵”校验逻辑
+        // 将 Vec3 数组转换为 glam::Vec3 数组
+        let vertices: Vec<glam::Vec3> = unit_mesh.vertices.iter()
+            .map(|v| glam::Vec3::new(v[0], v[1], v[2]))
+            .collect();
+        let manifold = ManifoldRust::from_vertices_indices(&vertices, &unit_mesh.indices, mat, more_precision);
+        // 复用下面的"空/哨兵"校验逻辑
         let mesh = manifold.get_mesh();
         if mesh.indices.is_empty() {
             return Err(anyhow::anyhow!("单位 Manifold mesh 为空：id={}", id));
@@ -1017,15 +1020,41 @@ pub async fn run_boolean_worker_from_cache_manager(
     let mut inst_geos_map: HashMap<String, EleInstGeosData> = HashMap::new();
     let mut neg_relate_map: HashMap<RefnoEnum, Vec<RefnoEnum>> = HashMap::new();
     let mut ngmr_relate_map: HashMap<RefnoEnum, Vec<(RefnoEnum, RefnoEnum)>> = HashMap::new();
+    // 记录每个 target(refno) 属于哪个 (dbnum, batch_id)，用于回写 inst_relate_bool 到 instance_cache。
+    let mut target_locations: HashMap<RefnoEnum, (u32, String)> = HashMap::new();
+    // 元件库（CATE）布尔：以 inst_info.has_cata_neg 为准补齐 targets（CataNeg 不经 neg_relate_map 指向）。
+    let mut cata_targets: HashSet<RefnoEnum> = HashSet::new();
 
     for dbnum in dbnums {
         let batch_ids = cache_manager.list_batches(dbnum);
         for batch_id in batch_ids {
-            if let Some(batch) = cache_manager.get(dbnum, &batch_id).await {
-                for (k, v) in batch.inst_info_map {
+            if let Some(mut batch) = cache_manager.get(dbnum, &batch_id).await {
+                // 先扫描 inst_info_map，补齐 CATE 布尔 targets 的 batch 归属。
+                for (k, info) in batch.inst_info_map.iter() {
+                    if info.has_cata_neg {
+                        cata_targets.insert(*k);
+                        target_locations
+                            .entry(*k)
+                            .or_insert((dbnum, batch_id.clone()));
+                    }
+                }
+
+                // 先记录 target -> batch 归属（仅需要 keys；避免后续 batch move 导致借用冲突）
+                for k in batch.neg_relate_map.keys().copied().collect::<Vec<_>>() {
+                    target_locations
+                        .entry(k)
+                        .or_insert((dbnum, batch_id.clone()));
+                }
+                for k in batch.ngmr_neg_relate_map.keys().copied().collect::<Vec<_>>() {
+                    target_locations
+                        .entry(k)
+                        .or_insert((dbnum, batch_id.clone()));
+                }
+
+                for (k, v) in batch.inst_info_map.drain() {
                     inst_info_map.insert(k, v);
                 }
-                for (k, v) in batch.inst_geos_map {
+                for (k, v) in batch.inst_geos_map.drain() {
                     inst_geos_map
                         .entry(k)
                         .and_modify(|existing| {
@@ -1039,10 +1068,10 @@ pub async fn run_boolean_worker_from_cache_manager(
                         })
                         .or_insert(v);
                 }
-                for (k, v) in batch.neg_relate_map {
+                for (k, v) in batch.neg_relate_map.drain() {
                     neg_relate_map.entry(k).or_default().extend(v);
                 }
-                for (k, v) in batch.ngmr_neg_relate_map {
+                for (k, v) in batch.ngmr_neg_relate_map.drain() {
                     ngmr_relate_map.entry(k).or_default().extend(v);
                 }
             }
@@ -1050,10 +1079,24 @@ pub async fn run_boolean_worker_from_cache_manager(
     }
 
     let mut processed = 0usize;
-    // 以关系表语义为准：仅对“被关系指向的目标正实体”执行布尔。
+    // 目标集合：
+    // - 元件库（CATE）负实体：以 inst_info.has_cata_neg 为准；
+    // - 设计型负实体：以 neg_relate/ngmr_relate 的 key 为准；
+    // 同时过滤掉“看起来像 refno 但实际上是 geom_refno”的 key（即 inst_info_map 中不存在者）。
     let mut targets: HashSet<RefnoEnum> = HashSet::new();
-    targets.extend(neg_relate_map.keys().copied());
-    targets.extend(ngmr_relate_map.keys().copied());
+    targets.extend(cata_targets.iter().copied());
+    targets.extend(
+        neg_relate_map
+            .keys()
+            .copied()
+            .filter(|r| inst_info_map.contains_key(r)),
+    );
+    targets.extend(
+        ngmr_relate_map
+            .keys()
+            .copied()
+            .filter(|r| inst_info_map.contains_key(r)),
+    );
 
     for refno in targets {
         let Some(info) = inst_info_map.get(&refno) else {
@@ -1087,9 +1130,11 @@ pub async fn run_boolean_worker_from_cache_manager(
         // 负实体：通过关系表（neg_relate/ngmr_relate）定位切割几何，并转换到 pos local space
         let mut neg_manifolds: Vec<ManifoldRust> = Vec::new();
 
-        // CATE 自身孔洞：只应使用 CataNeg。
-        // CataCrossNeg 属于 NGMR（跨对象负实体），其应用目标应由 ngmr_neg_relate_map 决定，
-        // 不能在这里无条件切到自身上，否则会出现错误布尔结果（常见表现：整段被削没/条纹退化）。
+        // 元件库（CATE）“本体孔洞”负实体：只应包含 CataNeg。
+        //
+        // 注意：CataCrossNeg 属于 NGMR（跨对象负实体），其应用目标应由 ngmr_neg_relate_map 决定；
+        // 不能在这里无条件把 CataCrossNeg 当作本体负实体，否则会把“应切别的对象”的 NGMR
+        // 错误地切到自身上，导致布尔结果异常（典型表现：模型被整段削没/出现条纹退化）。
         if info.has_cata_neg {
             for inst in &inst_geos.insts {
                 if inst.geo_type != GeoBasicType::CataNeg {
@@ -1199,10 +1244,22 @@ pub async fn run_boolean_worker_from_cache_manager(
 
         if final_manifold.get_mesh().indices.is_empty() {
             eprintln!("[boolean_worker_cache] 结果为空，跳过输出: refno={}", refno);
+            if let Some((dbnum, batch_id)) = target_locations.get(&refno) {
+                let mesh_id = {
+                    let refu64: aios_core::RefU64 = refno.into();
+                    refu64.to_string()
+                };
+                let _ = cache_manager
+                    .upsert_inst_relate_bool(*dbnum, batch_id, refno, mesh_id, "Failed")
+                    .await;
+            }
             continue;
         }
 
-        let mesh_id = refno.to_string();
+        let mesh_id = {
+            let refu64: aios_core::RefU64 = refno.into();
+            refu64.to_string()
+        };
         let target_path = boolean_glb_path(&mesh_id);
         ensure_parent_dir(&target_path)?;
         if let Err(e) = final_manifold.export_to_glb(&target_path) {
@@ -1210,7 +1267,18 @@ pub async fn run_boolean_worker_from_cache_manager(
                 "[boolean_worker_cache] 导出失败: refno={} err={}",
                 refno, e
             );
+            if let Some((dbnum, batch_id)) = target_locations.get(&refno) {
+                let _ = cache_manager
+                    .upsert_inst_relate_bool(*dbnum, batch_id, refno, mesh_id.clone(), "Failed")
+                    .await;
+            }
             continue;
+        }
+
+        if let Some((dbnum, batch_id)) = target_locations.get(&refno) {
+            cache_manager
+                .upsert_inst_relate_bool(*dbnum, batch_id, refno, mesh_id, "Success")
+                .await?;
         }
 
         processed += 1;

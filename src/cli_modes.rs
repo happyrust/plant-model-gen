@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use aios_core::pdms_types::{RefU64, RefnoEnum};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
 use aios_core::init_surreal;
 use aios_core::{DBType, query_mdb_db_nums};
@@ -272,6 +272,26 @@ fn parse_length_unit(unit: &str) -> LengthUnit {
     }
 }
 
+/// `--regen-model` 当前仍需要读取 PDMS 元素属性/loops（底层依赖 SurrealDB 查询接口）。
+///
+/// 约定：
+/// - 是否写入 SurrealDB 仍由 `DbOptionExt.use_surrealdb` 控制；
+/// - 这里仅确保连接可用，避免 cache-only 导出时触发 `ConnectionUninitialised` 的 panic。
+async fn ensure_surreal_for_regen_model(db_option_ext: &DbOptionExt) -> Result<()> {
+    if db_option_ext.use_surrealdb {
+        // 已在 mode 入口处连接过 SurrealDB（或后续会连接）
+        return Ok(());
+    }
+
+    println!(
+        "\n⚠️  注意：--regen-model 当前仍依赖 SurrealDB 读取属性/loop 数据（只读，用于计算并写入 foyer 缓存；不会写入 SurrealDB）。"
+    );
+    init_surreal()
+        .await
+        .context("初始化 SurrealDB 失败（--regen-model 需要底层查询接口）")?;
+    Ok(())
+}
+
 /// 导出 OBJ 模型模式
 pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) -> Result<()> {
     println!("\n🎯 OBJ 导出模式");
@@ -359,7 +379,17 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             let regen_refnos =
                 collect_export_refnos(&refnos, config.include_descendants, None, config.verbose)
                     .await?;
-            gen_all_geos_data(regen_refnos, &db_option_ext_override, None, None).await?;
+
+             if db_option_ext.use_surrealdb {
+                 // SurrealDB 路径：按需重新生成 instances + mesh，并按配置决定是否落库。
+                 ensure_surreal_for_regen_model(db_option_ext).await?;
+                 gen_all_geos_data(regen_refnos, &db_option_ext_override, None, None).await?;
+             } else {
+                 // cache-only 语义：不写入 SurrealDB，但当前仍需要 SurrealDB 读取属性/loop/世界矩阵等输入数据，
+                 // 用于生成并写入 foyer instance_cache（后续导出再完全基于 cache）。
+                 ensure_surreal_for_regen_model(db_option_ext).await?;
+                 gen_all_geos_data(regen_refnos, &db_option_ext_override, None, None).await?;
+             }
 
             db_option_clone.replace_mesh = original_replace_mesh;
             db_option_clone.gen_mesh = original_gen_mesh;
@@ -377,7 +407,8 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             let final_output_path = if let Some(ref path) = config.output_path {
                 path.clone()
             } else {
-                let base_name = get_output_filename_for_refno(*refno).await;
+                let base_name =
+                    get_output_filename_for_refno(*refno, db_option_ext.use_surrealdb).await;
                 // 确保输出到 output 目录
                 format!("output/{}", base_name)
             };
@@ -438,6 +469,7 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
         println!("\n🔄 检测到 --regen-model 参数，开始重新生成几何体数据...");
         println!("   - 强制开启 replace_mesh 和 gen_mesh");
         use aios_database::fast_model::gen_all_geos_data;
+        ensure_surreal_for_regen_model(db_option_ext).await?;
         unsafe {
             std::env::set_var("FORCE_REPLACE_MESH", "true");
         }
@@ -597,6 +629,7 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             println!("   - 强制开启 replace_mesh 和 gen_mesh");
 
             use aios_database::fast_model::gen_all_geos_data;
+            ensure_surreal_for_regen_model(db_option_ext).await?;
 
             unsafe {
                 std::env::set_var("FORCE_REPLACE_MESH", "true");
@@ -630,7 +663,8 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             let final_output_path = if let Some(ref path) = config.output_path {
                 path.clone()
             } else {
-                let base_name = get_output_filename_for_refno(*refno).await;
+                let base_name =
+                    get_output_filename_for_refno(*refno, db_option_ext.use_surrealdb).await;
                 // 确保输出到 output 目录
                 format!("output/{}.glb", base_name.replace(".obj", ""))
             };
@@ -689,6 +723,7 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
         println!("\n🔄 检测到 --regen-model 参数，开始重新生成几何体数据...");
         println!("   - 强制开启 replace_mesh 和 gen_mesh");
         use aios_database::fast_model::gen_all_geos_data;
+        ensure_surreal_for_regen_model(db_option_ext).await?;
         unsafe {
             std::env::set_var("FORCE_REPLACE_MESH", "true");
         }
@@ -853,6 +888,7 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
             println!("   - 强制开启 replace_mesh 和 gen_mesh");
 
             use aios_database::fast_model::gen_all_geos_data;
+            ensure_surreal_for_regen_model(db_option_ext).await?;
 
             unsafe {
                 std::env::set_var("FORCE_REPLACE_MESH", "true");
@@ -972,7 +1008,8 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
             let final_output_path = if let Some(ref path) = config.output_path {
                 path.clone()
             } else {
-                let base_name = get_output_filename_for_refno(*refno).await;
+                let base_name =
+                    get_output_filename_for_refno(*refno, db_option_ext.use_surrealdb).await;
                 // 确保输出到 output 目录
                 format!("output/{}.gltf", base_name.replace(".obj", ""))
             };
@@ -1027,6 +1064,7 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
         println!("\n🔄 检测到 --regen-model 参数，开始重新生成几何体数据...");
         println!("   - 强制开启 replace_mesh 和 gen_mesh");
         use aios_database::fast_model::gen_all_geos_data;
+        ensure_surreal_for_regen_model(db_option_ext).await?;
         unsafe {
             std::env::set_var("FORCE_REPLACE_MESH", "true");
         }
@@ -1126,9 +1164,14 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
     Ok(())
 }
 
-/// 获取输出文件名（基于 PE 的 name）
-pub async fn get_output_filename_for_refno(refno: RefnoEnum) -> String {
+/// 获取输出文件名（优先基于 PE.name；cache-only 下直接回退为 refno）
+pub async fn get_output_filename_for_refno(refno: RefnoEnum, allow_surrealdb: bool) -> String {
     use aios_database::fast_model::query_provider;
+
+    // cache-only：不依赖 SurrealDB/属性查询，避免 Connection uninitialised 影响导出流程。
+    if !allow_surrealdb {
+        return format!("{}.obj", refno.to_string().replace('/', "_"));
+    }
 
     // 1. 尝试获取 PE 的 name
     if let Ok(Some(pe)) = query_provider::get_pe(refno).await {

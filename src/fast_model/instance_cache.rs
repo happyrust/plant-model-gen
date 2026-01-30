@@ -25,6 +25,14 @@ pub struct InstanceCacheValue {
     pub payload: Vec<u8>,
 }
 
+/// inst_relate_bool 的缓存条目（cache-only：用于 enable_holes=true 时选择 booled mesh）。
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct CachedInstRelateBool {
+    pub mesh_id: String,
+    pub status: String,
+    pub created_at: i64,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CachedInstanceBatch {
     pub dbnum: u32,
@@ -35,6 +43,9 @@ pub struct CachedInstanceBatch {
     pub inst_tubi_map: HashMap<RefnoEnum, EleGeosInfo>,
     pub neg_relate_map: HashMap<RefnoEnum, Vec<RefnoEnum>>,
     pub ngmr_neg_relate_map: HashMap<RefnoEnum, Vec<(RefnoEnum, RefnoEnum)>>,
+    /// refno -> bool 结果（serde default 以兼容旧缓存文件）。
+    #[serde(default)]
+    pub inst_relate_bool_map: HashMap<RefnoEnum, CachedInstRelateBool>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -140,6 +151,7 @@ impl InstanceCacheManager {
             inst_tubi_map: shape_insts.inst_tubi_map.clone(),
             neg_relate_map: shape_insts.neg_relate_map.clone(),
             ngmr_neg_relate_map: shape_insts.ngmr_neg_relate_map.clone(),
+            inst_relate_bool_map: HashMap::new(),
         };
 
         self.insert_batch(batch);
@@ -178,6 +190,37 @@ impl InstanceCacheManager {
 
     pub async fn close(&self) -> anyhow::Result<()> {
         self.cache.close().await?;
+        Ok(())
+    }
+
+    /// 回写 cache-only 布尔结果（以 batch 为最小回写单元）。
+    pub async fn upsert_inst_relate_bool(
+        &self,
+        dbnum: u32,
+        batch_id: &str,
+        refno: RefnoEnum,
+        mesh_id: String,
+        status: &str,
+    ) -> anyhow::Result<()> {
+        let Some(mut batch) = self.get(dbnum, batch_id).await else {
+            anyhow::bail!(
+                "instance_cache batch 不存在，无法写入 inst_relate_bool: dbnum={} batch_id={} refno={}",
+                dbnum,
+                batch_id,
+                refno
+            );
+        };
+
+        batch.inst_relate_bool_map.insert(
+            refno,
+            CachedInstRelateBool {
+                mesh_id,
+                status: status.to_string(),
+                created_at: chrono::Utc::now().timestamp_millis(),
+            },
+        );
+
+        self.insert_batch(batch);
         Ok(())
     }
 

@@ -26,14 +26,41 @@ struct MeiliState {
 
 impl SearchApiState {
     pub fn from_env() -> Self {
-        let url = std::env::var("MEILI_URL").ok().map(|v| v.trim().to_string());
-        let url = url.filter(|v| !v.is_empty());
-        let key = std::env::var("MEILI_API_KEY").ok().map(|v| v.trim().to_string());
-        let key = key.filter(|v| !v.is_empty());
+        // 先读环境变量，若未配置则回落到 DbOption.toml（由 DB_OPTION_FILE 指定）
+        let opt = aios_core::get_db_option();
+
+        let url = std::env::var("MEILI_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                opt.meili_url
+                    .as_ref()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            });
+
+        let key = std::env::var("MEILI_API_KEY")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                opt.meili_api_key
+                    .as_ref()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            });
+
         let index = std::env::var("MEILI_PDMS_INDEX")
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
+            .or_else(|| {
+                opt.meili_pdms_index
+                    .as_ref()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
             .unwrap_or_else(|| "pdms_nodes".to_string());
 
         let meili = match url {

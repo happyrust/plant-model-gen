@@ -542,17 +542,49 @@ pub async fn run_mesh_worker_from_cache_manager(
         std::fs::create_dir_all(&lod_dir)?;
     }
 
+    // cache-only 路径下也需要支持 `--regen-model` 的“替换”语义。
+    // 统一沿用 orchestrator/cli 的 FORCE_REPLACE_MESH 环境变量。
+    let force_replace = std::env::var("FORCE_REPLACE_MESH")
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false);
+
     let mut processed = 0usize;
     let mut seen: HashSet<u64> = HashSet::new();
     for (geo_hash, (geo_param, unit_flag)) in unique_geo {
         if !seen.insert(geo_hash) {
             continue;
         }
+
+        // 标准单位几何体（1/2/3）的 geo_hash 在全库范围内复用：
+        // - 若在 cache-only mesh_worker 中按 geo_param 生成并写盘，会导致“同一 geo_hash 的 GLB 被某一个实例的尺寸覆盖”，
+        //   进而导出/查看时出现 BOX/Sphere/Cylinder 尺寸严重不匹配。
+        // - 导出侧（export_common::GltfMeshCache）已对 1/2/3 强制使用内置 unit_*_mesh，
+        //   因此这里直接跳过写盘；如启用 FORCE_REPLACE_MESH，则顺便清理旧文件以避免误读。
+        if matches!(geo_hash, 1 | 2 | 3) {
+            if force_replace {
+                let mesh_id = geo_hash.to_string();
+                let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
+                let base = lod_dir.join(&mesh_filename);
+                let _ = std::fs::remove_file(base.with_extension("glb"));
+                let _ = std::fs::remove_file(base.with_extension("obj"));
+            }
+            continue;
+        }
+
         let mesh_id = geo_hash.to_string();
         let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
         let glb_path = lod_dir.join(&mesh_filename).with_extension("glb");
-        if glb_path.exists() {
+        if glb_path.exists() && !force_replace {
             continue;
+        }
+        if force_replace {
+            // 尽力清理旧文件；忽略失败（比如文件不存在/被占用）。
+            let _ = std::fs::remove_file(&glb_path);
+            let _ = std::fs::remove_file(lod_dir.join(&mesh_filename).with_extension("obj"));
         }
 
         let geo_type_name = geo_param.type_name();

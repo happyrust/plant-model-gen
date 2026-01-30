@@ -292,7 +292,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("use-surrealdb")
                 .long("use-surrealdb")
-                .help("Enable SurrealDB for OBJ export/debug flows (default: cache-only, no fallback)")
+                .help("Enable SurrealDB instances source / model-data writes for export/debug flows (default: cache-only instances, no fallback)")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -786,7 +786,9 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if !db_option_ext.use_surrealdb {
-            println!("📦 OBJ 导出默认使用缓存数据源（SurrealDB 已关闭）。如需启用 SurrealDB，请添加 --use-surrealdb。");
+            println!(
+                "📦 OBJ 导出默认使用 indextree + foyer 缓存数据源（不连接 SurrealDB）。如需从 SurrealDB 直接读取 instances/对照验证，请添加 --use-surrealdb。"
+            );
         }
     }
 

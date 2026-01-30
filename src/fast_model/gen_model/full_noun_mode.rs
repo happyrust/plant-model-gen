@@ -568,7 +568,7 @@ async fn process_bran_hang_core_logic(
     // 1. 查询子元素并记录已生成的 refno
     let branch_refnos_map: DashMap<RefnoEnum, Vec<SPdmsElement>> = DashMap::new();
     for &refno in bran_roots {
-        if let Ok(children) = aios_core::collect_children_elements(refno, &[]).await {
+        if let Ok(children) = TreeIndexManager::collect_children_elements_from_tree(refno).await {
             for child in &children {
                 bran_generated_refnos.insert(child.refno);
             }
@@ -795,19 +795,30 @@ async fn collect_all_descendants(
     prim_refnos: &mut HashSet<RefnoEnum>,
     cate_refnos: &mut HashSet<RefnoEnum>,
 ) -> Result<()> {
-    let loop_descendants = query_provider::query_multi_descendants(roots, &GNERAL_LOOP_OWNER_NOUN_NAMES)
+    let loop_descendants = query_provider::query_multi_descendants_with_self(
+        roots,
+        &GNERAL_LOOP_OWNER_NOUN_NAMES,
+        true,
+    )
         .await
         .map_err(|e| FullNounError::DatabaseError(format!("collect_descendant_filter_ids(loop) failed: {}", e)))?;
     track_refno_issues(&loop_descendants, "loop_descendants", RefnoErrorStage::Query);
     loop_refnos.extend(loop_descendants);
 
-    let prim_descendants = query_provider::query_multi_descendants(roots, &GNERAL_PRIM_NOUN_NAMES)
+    // roots 可能本身就是 LOOP/PRIM/CATE；此处必须 include_self=true，
+    // 否则会在 debug-model/手动指定节点场景下漏掉根节点自身的几何生成。
+    let prim_descendants = query_provider::query_multi_descendants_with_self(
+        roots,
+        &GNERAL_PRIM_NOUN_NAMES,
+        true,
+    )
         .await
         .map_err(|e| FullNounError::DatabaseError(format!("collect_descendant_filter_ids(prim) failed: {}", e)))?;
     track_refno_issues(&prim_descendants, "prim_descendants", RefnoErrorStage::Query);
     prim_refnos.extend(prim_descendants);
 
-    let cate_descendants = query_provider::query_multi_descendants(roots, &USE_CATE_NOUN_NAMES)
+    let cate_descendants =
+        query_provider::query_multi_descendants_with_self(roots, &USE_CATE_NOUN_NAMES, true)
         .await
         .map_err(|e| FullNounError::DatabaseError(format!("collect_descendant_filter_ids(cate) failed: {}", e)))?;
     track_refno_issues(&cate_descendants, "cate_descendants", RefnoErrorStage::Query);

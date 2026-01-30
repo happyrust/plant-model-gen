@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// 读取 `output/database_models/{dbnum}/pe.parquet`，抽取 `refno + noun + name + dbnum(site)` 写入 Meilisearch。
 ///
 /// 约定：
-/// - Meilisearch index primary key = `refno`
+/// - Meilisearch index primary key = `id`（id = "{dbnum}_{refno}"）
 /// - `site` 字段使用 dbnum（满足“按 SITE 分组”的需求；无需依赖 WORL/SITE 是否写入 pe 表）
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -45,6 +45,7 @@ struct Args {
 
 #[derive(Debug, Clone, Serialize)]
 struct PdmsNodeDoc {
+    id: String,
     refno: String,
     noun: String,
     name: String,
@@ -151,16 +152,19 @@ async fn main() -> anyhow::Result<()> {
                 let noun: String = row.get(1)?;
                 let name: String = row.get(2)?;
                 let dbnum_val: i32 = row.get(3)?;
+                let refno_clean = refno.trim_start_matches('/').to_string();
+                let site = dbnum_val.to_string();
                 buffer.push(PdmsNodeDoc {
-                    refno,
+                    id: format!("{}_{}", site, refno_clean),
+                    refno: refno_clean,
                     noun: noun.trim().to_uppercase(),
                     name,
-                    site: dbnum_val.to_string(),
+                    site,
                 });
 
                 if buffer.len() >= args.batch_size {
                     index
-                        .add_or_replace(&buffer, Some("refno"))
+                        .add_or_replace(&buffer, Some("id"))
                         .await?
                         .wait_for_completion(&client, None, None)
                         .await?;
@@ -177,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
 
         if !buffer.is_empty() {
             index
-                .add_or_replace(&buffer, Some("refno"))
+                .add_or_replace(&buffer, Some("id"))
                 .await?
                 .wait_for_completion(&client, None, None)
                 .await?;

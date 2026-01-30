@@ -985,6 +985,8 @@ async fn gen_cata_geos_inner(
                                 .convert_to_geo_param()
                                 .unwrap_or(PdmsGeoParam::Unknown);
                             let unit_flag = match &geo_param {
+                                // 标准单位几何体（BOX/SPHE）固定 geo_hash（1/3），需依赖实例 transform 还原尺寸。
+                                PdmsGeoParam::PrimBox(_) | PdmsGeoParam::PrimSphere(_) => true,
                                 PdmsGeoParam::PrimSCylinder(s) => s.unit_flag,
                                 // PrimLoft(SweepSolid) 仅在“单段直线且无倾斜”时可安全 unit 化复用
                                 PdmsGeoParam::PrimLoft(s) => s.is_reuse_unit(),

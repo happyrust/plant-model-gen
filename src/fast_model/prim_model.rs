@@ -319,6 +319,8 @@ pub async fn gen_prim_geos(
                     .unwrap_or(PdmsGeoParam::Unknown);
                 let geo_hash = csg_shape.hash_unit_mesh_params();
                 let unit_flag = match &geo_param {
+                    // 标准单位几何体（BOX/SPHE）在 aios_core 中使用固定 geo_hash（1/3），只能通过实例 transform 还原尺寸。
+                    PdmsGeoParam::PrimBox(_) | PdmsGeoParam::PrimSphere(_) => true,
                     PdmsGeoParam::PrimSCylinder(s) => s.unit_flag,
                     // PrimLoft(SweepSolid) 仅在“单段直线且无倾斜”时可安全 unit 化复用
                     PdmsGeoParam::PrimLoft(s) => s.is_reuse_unit(),

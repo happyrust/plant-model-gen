@@ -24,7 +24,6 @@ use futures::stream::FuturesUnordered;
 use itertools::Itertools;
 use parse_pdms_db::parse::*;
 use pdms_io::io::PdmsIO;
-use pe::SPdmsElement;
 use petgraph::prelude::DiGraph;
 #[cfg(feature = "sql")]
 use sea_orm::{ConnectionTrait, Schema, Statement};
@@ -991,8 +990,19 @@ where
         {
             let mut io = PdmsIO::new(project.as_str(), path.clone(), true);
             if io.open().is_ok() {
-                sesno = io.get_latest_sesno().unwrap_or_default();
-                if sesno == 0 {
+                sesno = match io.get_latest_sesno() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            "get_latest_sesno failed(file={}): {} (fallback sesno=0)",
+                            file_name, e
+                        );
+                        0
+                    }
+                };
+
+                if sesno == 0 && is_sync_history {
+                    // 同步历史需要有效 sesno；否则无法进行该流程。
                     if let Some(cb) = progress_callback.as_mut() {
                         cb(
                             project.as_str(),
@@ -1006,8 +1016,11 @@ where
                     }
                     continue;
                 }
+
                 if is_sync_history {
-                    io.sync_history().await.unwrap();
+                    if let Err(e) = io.sync_history().await {
+                        warn!("sync_history failed(file={}): {}", file_name, e);
+                    }
                     if let Some(cb) = progress_callback.as_mut() {
                         cb(
                             project.as_str(),
@@ -1020,32 +1033,27 @@ where
                         );
                     }
                     continue;
-                } else {
-                    io.store_all_refno_sesno_map().await.unwrap();
+                } else if sesno > 0 {
+                    if let Err(e) = io.store_all_refno_sesno_map().await {
+                        warn!(
+                            "store_all_refno_sesno_map failed(file={}): {} (continue parsing)",
+                            file_name, e
+                        );
+                    }
+                    // pdms-io-fork 的 ses_range_map 使用 RangeInclusive；parse_pdms_db 仍期望 Range（右开区间）
+                    ses_range_map = io
+                        .ses_range_map
+                        .into_iter()
+                        .map(|(k, r)| {
+                            let start = *r.start();
+                            let end_exclusive = r.end().saturating_add(1);
+                            (k, start..end_exclusive)
+                        })
+                        .collect();
                 }
-                // pdms-io-fork 的 ses_range_map 使用 RangeInclusive；parse_pdms_db 仍期望 Range（右开区间）
-                ses_range_map = io
-                    .ses_range_map
-                    .into_iter()
-                    .map(|(k, r)| {
-                        let start = *r.start();
-                        let end_exclusive = r.end().saturating_add(1);
-                        (k, start..end_exclusive)
-                    })
-                    .collect();
             } else {
-                if let Some(cb) = progress_callback.as_mut() {
-                    cb(
-                        project.as_str(),
-                        current_project,
-                        total_projects,
-                        file_idx + 1,
-                        total_files,
-                        0,
-                        0,
-                    );
-                }
-                continue;
+                // open 失败时仍允许继续解析（Meili/Tree 生成不依赖 session 信息）
+                warn!("PdmsIO::open failed(file={}): continue without ses range map", file_name);
             }
         }
 
@@ -1586,7 +1594,17 @@ pub async fn sync_total_async_threaded(
                     //打开文件
                     if io.open().is_ok() {
                         //获取最新sesno
-                        sesno = io.get_latest_sesno().unwrap_or_default();
+                        sesno = match io.get_latest_sesno() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                // 某些 DB 文件可能存在异常 session page，导致读取 sesno 失败；此时仍可继续解析元素数据。
+                                warn!(
+                                    "get_latest_sesno failed(file={}): {} (fallback sesno=0)",
+                                    file_name, e
+                                );
+                                0
+                            }
+                        };
                         if sesno > 0 {
                             // 获取 sesno 对应的时间戳
                             sesno_timestamp = io.get_sesno_timestamp(sesno).ok();
@@ -1600,37 +1618,74 @@ pub async fn sync_total_async_threaded(
                             // if sync_versioned {
                             //     continue;
                             // }
-                        } else {
+                        } else if is_sync_history {
+                            // 同步历史需要有效 sesno；否则无法进行该流程。
+                            warn!(
+                                "skip sync_history(file={}): latest sesno is 0 (session read failed?)",
+                                file_name
+                            );
                             continue;
                         }
+
                         if is_sync_history {
                             //同步历史纪录
-                            io.sync_history().await.unwrap();
+                            if let Err(e) = io.sync_history().await {
+                                warn!("sync_history failed(file={}): {}", file_name, e);
+                            }
                             //同步完历史纪录就返回
                             continue;
-                        } else {
-                            //存储所有refno sesno map
-                            io.store_all_refno_sesno_map().await.unwrap();
+                        } else if sesno > 0 {
+                            //存储所有refno sesno map（仅在 sesno 可用时执行；失败不阻塞解析）
+                            if let Err(e) = io.store_all_refno_sesno_map().await {
+                                warn!(
+                                    "store_all_refno_sesno_map failed(file={}): {} (continue parsing)",
+                                    file_name, e
+                                );
+                            }
+                            //获取sesno range
+                            // pdms-io-fork 的 ses_range_map 使用 RangeInclusive；parse_pdms_db 仍期望 Range（右开区间）
+                            ses_range_map = io
+                                .ses_range_map
+                                .into_iter()
+                                .map(|(k, r)| {
+                                    let start = *r.start();
+                                    let end_exclusive = r.end().saturating_add(1);
+                                    (k, start..end_exclusive)
+                                })
+                                .collect();
                         }
-                        //获取sesno range
-                        // pdms-io-fork 的 ses_range_map 使用 RangeInclusive；parse_pdms_db 仍期望 Range（右开区间）
-                        ses_range_map = io
-                            .ses_range_map
-                            .into_iter()
-                            .map(|(k, r)| {
-                                let start = *r.start();
-                                let end_exclusive = r.end().saturating_add(1);
-                                (k, start..end_exclusive)
-                            })
-                            .collect();
                     }
                 }
 
                 let project_name = project.as_str().to_string(); // 获取项目名称的字符串
-                let mut db_basic =
-                    parse_file_db_basic_data(&path, &file_name, project_name.clone().as_str())
-                        .unwrap_or_default();
-                let all_refnos: Vec<_> = db_basic.refno_table_map.iter().map(|entry| *entry.key()).collect();
+                let mut db_basic = match parse_file_db_basic_data(
+                    &path,
+                    &file_name,
+                    project_name.clone().as_str(),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // 之前这里用 unwrap_or_default 会导致“静默跳过解析”，很难排查为什么没产出数据。
+                        warn!(
+                            "parse_file_db_basic_data failed(file={}): {}",
+                            file_name, e
+                        );
+                        continue;
+                    }
+                };
+                let all_refnos: Vec<_> = db_basic
+                    .refno_table_map
+                    .iter()
+                    .map(|entry| *entry.key())
+                    .collect();
+                if all_refnos.is_empty() {
+                    // 这里为空会导致后续 parse_file_with_chunk 全部跳过，从而不会触发 save_pes / Meili 索引。
+                    println!(
+                        "[warn] empty refno_table_map(file={}): parse_file_db_basic_data returned no refnos",
+                        file_name
+                    );
+                    continue;
+                }
 
                 let db_basic = Arc::new(db_basic);
                 if is_save_db {
@@ -1647,6 +1702,12 @@ pub async fn sync_total_async_threaded(
                     }
                 }
                 let debug_refnos = Arc::new(debug_refnos);
+
+                // 解析期：把 refno/noun/name/site 收集到 JSONL（中间格式），并在本 db 文件解析完成后批量导入 Meilisearch。
+                // 该流程不依赖 surreal-save feature；未配置 meili_url 时自动跳过。
+                let meili_cfg =
+                    crate::meili::pdms_index::MeiliEnvConfig::from_db_option(db_option_arc.as_ref());
+                let mut meili_spool: Option<crate::meili::pdms_index::PdmsSpoolWriter> = None;
                 let mut tree_nodes: HashMap<RefU64, TreeNodeMeta> = HashMap::new();
                 //按照SITE划分？
                 let mut total_cnt = 0;
@@ -1677,6 +1738,49 @@ pub async fn sync_total_async_threaded(
                         }) => {
                             //类型暂时不多线程
                             let total_attr_map_arc = Arc::new(total_attr_map);
+
+                            // Meilisearch spool：每个 chunk 产出一批 total_attr_map，直接追加写入 JSONL。
+                            if meili_spool.is_none() {
+                                if let Some(cfg) = meili_cfg.as_ref() {
+                                    match crate::meili::pdms_index::PdmsSpoolWriter::create(
+                                        &cfg.spool_dir,
+                                        dbnum as i32,
+                                    ) {
+                                        Ok(w) => meili_spool = Some(w),
+                                        Err(e) => {
+                                            warn!("创建 Meili spool 失败(dbnum={}): {}", dbnum, e);
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(spool) = meili_spool.as_mut() {
+                                for entry in total_attr_map_arc.iter() {
+                                    let refno = *entry.key();
+                                    let att = entry.value();
+                                    let noun = att.get_type_str().to_string();
+                                    let name = crate::api::element::cal_default_name(
+                                        refno,
+                                        att,
+                                        &db_basic_clone.children_map,
+                                    );
+                                    let doc = crate::meili::pdms_index::PdmsNodeDoc {
+                                        id: format!("{}_{}", dbnum, refno),
+                                        refno: refno.to_string(),
+                                        noun,
+                                        name,
+                                        site: dbnum.to_string(),
+                                    };
+                                    if let Err(e) = spool.write_doc(&doc) {
+                                        // 失败后直接关闭 spool，避免一直刷日志/拖慢解析
+                                        warn!(
+                                            "写入 Meili spool 失败(dbnum={}, refno={}): {}",
+                                            dbnum, refno, e
+                                        );
+                                        meili_spool = None;
+                                        break;
+                                    }
+                                }
+                            }
                             total_cnt += total_attr_map_arc.len();
                             for entry in total_attr_map_arc.iter() {
                                 let refno = *entry.key();
@@ -1779,6 +1883,28 @@ pub async fn sync_total_async_threaded(
                         Err(e) => {
                             dbg!(e.to_string());
                         }
+                    }
+                }
+
+                // 本 db 文件解析完成：导入 Meilisearch（失败不阻塞解析主流程）
+                if let (Some(cfg), Some(mut spool)) = (meili_cfg.as_ref(), meili_spool) {
+                    if let Err(e) = spool.flush() {
+                        warn!("flush Meili spool 失败(dbnum={}): {}", dbnum, e);
+                    }
+                    let spool_path = spool.path().to_path_buf();
+                    match crate::meili::pdms_index::import_spool_file(cfg, &spool_path).await {
+                        Ok(n) => info!(
+                            "Meili 导入完成(dbnum={}): imported={}, spool={}",
+                            dbnum,
+                            n,
+                            spool_path.display()
+                        ),
+                        Err(e) => warn!(
+                            "Meili 导入失败(dbnum={}): {}, spool={}",
+                            dbnum,
+                            e,
+                            spool_path.display()
+                        ),
                     }
                 }
 

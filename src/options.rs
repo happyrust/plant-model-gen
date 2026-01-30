@@ -94,7 +94,12 @@ pub struct DbOptionExt {
     #[serde(default)]
     pub mesh_formats: Vec<MeshFormat>,
 
-    /// 是否启用 SurrealDB 写入/扫库路径
+    /// 是否启用 SurrealDB 模型数据写入/导出对照路径
+    ///
+    /// 约定：
+    /// - SurrealDB 始终作为“输入数据源”（属性/loop/世界矩阵等）读取；
+    /// - 当该值为 false 时：模型生成过程中不写入 inst_* 等模型相关表，导出时实例数据优先从 foyer cache 读取；
+    /// - 当该值为 true 时：允许写入模型数据到 SurrealDB，导出也可直接从 SurrealDB 查询 instances（用于对照/迁移验证）。
     #[serde(default = "default_true")]
     pub use_surrealdb: bool,
 

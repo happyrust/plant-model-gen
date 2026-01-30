@@ -184,6 +184,17 @@ impl GltfMeshCache {
             geo_hash
         };
 
+        // 标准单位几何体（1/2/3）不依赖磁盘文件：
+        // - cache-only 路径下，mesh_worker_cache 可能会错误地产生 `1_L?.glb` 这类“按 geo_hash 复用但尺寸不一致”的文件；
+        // - 为保证导出稳定性，这里对 1/2/3 一律使用内置 unit_*_mesh。
+        if let Some(mesh) = Self::standard_unit_mesh(actual_geo_hash) {
+            let arc_mesh = Arc::new(mesh);
+            self.cache.insert(geo_hash.to_string(), arc_mesh.clone());
+            self.misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(arc_mesh);
+        }
+
         // 尝试从目录名推断 LOD 级别
         let lod_suffix = mesh_dir
             .file_name()
@@ -221,13 +232,6 @@ impl GltfMeshCache {
         };
 
         if !mesh_path.exists() {
-            if let Some(mesh) = Self::standard_unit_mesh(actual_geo_hash) {
-                let arc_mesh = Arc::new(mesh);
-                self.cache.insert(geo_hash.to_string(), arc_mesh.clone());
-                self.misses
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(arc_mesh);
-            }
             return Err(anyhow!("Mesh 文件不存在: {}", mesh_path.display()));
         }
 

@@ -45,6 +45,7 @@ pub mod wizard_handlers;
 pub mod wizard_template;
 pub mod parquet_compact_worker;
 pub mod stream_generate; // 流式模型生成模块
+pub mod sqlite_spatial_api;
 
 use crate::web_api::{
     E3dTreeApiState, NounHierarchyApiState, SpatialQueryApiState, create_e3d_tree_routes,
@@ -767,6 +768,11 @@ pub async fn start_web_server_with_config(
             post(handlers::api_space_steel_relative),
         )
         .route("/api/space/tray-span", post(handlers::api_space_tray_span))
+        // SQLite RTree 空间索引：AABB 粗筛查询（供前端按需加载/最近点测量使用）
+        .route(
+            "/api/sqlite-spatial/query",
+            get(sqlite_spatial_api::api_sqlite_spatial_query),
+        )
         // 模型导出 API
         .route("/api/export/gltf", post(handlers::create_export_task))
         .route("/api/export/glb", post(handlers::create_export_task))

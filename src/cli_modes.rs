@@ -272,23 +272,20 @@ fn parse_length_unit(unit: &str) -> LengthUnit {
     }
 }
 
-/// `--regen-model` 当前仍需要读取 PDMS 元素属性/loops（底层依赖 SurrealDB 查询接口）。
+/// 连接 SurrealDB（用于读取 PDMS 输入数据或写入模型数据）。
 ///
-/// 约定：
-/// - 是否写入 SurrealDB 仍由 `DbOptionExt.use_surrealdb` 控制；
-/// - 这里仅确保连接可用，避免 cache-only 导出时触发 `ConnectionUninitialised` 的 panic。
-async fn ensure_surreal_for_regen_model(db_option_ext: &DbOptionExt) -> Result<()> {
+/// 注意：在“cache-only 导出/截图”路径下，我们约定不依赖 SurrealDB；
+/// 如需从 SurrealDB 读取/写入（对照验证、回写模型表等），必须显式启用 `DbOptionExt.use_surrealdb=true`。
+async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
     if db_option_ext.use_surrealdb {
-        // 已在 mode 入口处连接过 SurrealDB（或后续会连接）
-        return Ok(());
+        println!("\n📡 连接数据库（SurrealDB 写入启用）...");
+    } else {
+        println!("\n📡 连接数据库（SurrealDB 只读）...");
     }
-
-    println!(
-        "\n⚠️  注意：--regen-model 当前仍依赖 SurrealDB 读取属性/loop 数据（只读，用于计算并写入 foyer 缓存；不会写入 SurrealDB）。"
-    );
     init_surreal()
         .await
-        .context("初始化 SurrealDB 失败（--regen-model 需要底层查询接口）")?;
+        .context("初始化 SurrealDB 失败（需要读取 PDMS 输入数据）")?;
+    println!("✅ 数据库连接成功");
     Ok(())
 }
 
@@ -297,13 +294,12 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     println!("\n🎯 OBJ 导出模式");
     println!("================");
 
-    // cache-only：OBJ 导出默认不连接 SurrealDB；如需对照/迁移验证，才显式开启 use_surrealdb。
+    // 约定：OBJ 导出默认走 cache-only（indextree + foyer），不依赖 SurrealDB；
+    // 若需从 SurrealDB 读取/写入（对照验证），必须显式启用 use_surrealdb。
     if db_option_ext.use_surrealdb {
-        println!("\n📡 连接数据库（SurrealDB 启用）...");
-        init_surreal().await?;
-        println!("✅ 数据库连接成功");
+        ensure_surreal_connected(db_option_ext).await?;
     } else {
-        println!("\n📦 cache-only：OBJ 导出使用 foyer 缓存数据源（不回退 SurrealDB）");
+        println!("📦 cache-only：OBJ 导出仅使用 indextree + foyer（SurrealDB 不连接）");
     }
 
     // 如果需要导出 SVG，设置环境变量
@@ -326,11 +322,6 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
 
     // 如果未指定 dbnum 且未提供 refnos，但要求全库导出，则在此处理
     if config.run_all_dbnos && config.dbnum.is_none() && config.refnos_str.is_empty() {
-        if !db_option_ext.use_surrealdb {
-            return Err(anyhow!(
-                "全库 OBJ 导出需要 SurrealDB（用于查询 MDB dbnum 列表）；请添加 --use-surrealdb"
-            ));
-        }
         println!("\n🔁 进入全库 OBJ 导出模式 (MDB 所有 dbnum)");
         let dbnos = query_mdb_db_nums(None, DBType::DESI).await?;
         if dbnos.is_empty() {
@@ -361,38 +352,62 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             println!("\n🔄 检测到 --regen-model 参数，开始重新生成几何体数据...");
             println!("   - 强制开启 replace_mesh 和 gen_mesh");
 
-            use aios_database::fast_model::gen_all_geos_data;
-
             unsafe {
                 std::env::set_var("FORCE_REPLACE_MESH", "true");
             }
 
-            let mut db_option_clone = db_option_ext.inner.clone();
-            let original_replace_mesh = db_option_clone.replace_mesh;
-            let original_gen_mesh = db_option_clone.gen_mesh;
-            db_option_clone.replace_mesh = Some(true);
-            db_option_clone.gen_mesh = true;
+            if db_option_ext.use_surrealdb {
+                // 写库/对照路径：走完整 gen_model（会读取输入数据并生成 instances + mesh + bool）
+                use aios_database::fast_model::gen_all_geos_data;
 
-            let mut db_option_ext_override = db_option_ext.clone();
-            db_option_ext_override.inner = db_option_clone.clone();
-            // 导出若包含子孙节点，regen 也必须覆盖同一范围；此处使用 TreeIndex(cache-only) 计算子孙集合。
-            let regen_refnos =
-                collect_export_refnos(&refnos, config.include_descendants, None, config.verbose)
-                    .await?;
+                let mut db_option_clone = db_option_ext.inner.clone();
+                let original_replace_mesh = db_option_clone.replace_mesh;
+                let original_gen_mesh = db_option_clone.gen_mesh;
+                db_option_clone.replace_mesh = Some(true);
+                db_option_clone.gen_mesh = true;
 
-             if db_option_ext.use_surrealdb {
-                 // SurrealDB 路径：按需重新生成 instances + mesh，并按配置决定是否落库。
-                 ensure_surreal_for_regen_model(db_option_ext).await?;
-                 gen_all_geos_data(regen_refnos, &db_option_ext_override, None, None).await?;
-             } else {
-                 // cache-only 语义：不写入 SurrealDB，但当前仍需要 SurrealDB 读取属性/loop/世界矩阵等输入数据，
-                 // 用于生成并写入 foyer instance_cache（后续导出再完全基于 cache）。
-                 ensure_surreal_for_regen_model(db_option_ext).await?;
-                 gen_all_geos_data(regen_refnos, &db_option_ext_override, None, None).await?;
-             }
+                let mut db_option_ext_override = db_option_ext.clone();
+                db_option_ext_override.inner = db_option_clone.clone();
 
-            db_option_clone.replace_mesh = original_replace_mesh;
-            db_option_clone.gen_mesh = original_gen_mesh;
+                // 导出若包含子孙节点，regen 也必须覆盖同一范围；此处使用 TreeIndex 计算子孙集合。
+                let regen_refnos =
+                    collect_export_refnos(&refnos, config.include_descendants, None, config.verbose)
+                        .await?;
+
+                ensure_surreal_connected(db_option_ext).await?;
+                gen_all_geos_data(regen_refnos, &db_option_ext_override, None, None).await?;
+
+                db_option_clone.replace_mesh = original_replace_mesh;
+                db_option_clone.gen_mesh = original_gen_mesh;
+            } else {
+                // cache-only 路径：不生成/补齐 instances（它们必须已存在于 foyer cache），仅重算 mesh/boolean。
+                use aios_database::fast_model::manifold_bool::run_boolean_worker_from_cache;
+                use aios_database::fast_model::mesh_generate::run_mesh_worker_from_cache;
+
+                let cache_dir = db_option_ext.get_foyer_cache_dir();
+                let mesh_root_dir = db_option_ext.inner.get_meshes_path();
+
+                println!(
+                    "📦 cache-only：--regen-model 仅重算 mesh{}（instances 仍来自 foyer cache）",
+                    if db_option_ext.inner.apply_boolean_operation {
+                        " + boolean"
+                    } else {
+                        ""
+                    }
+                );
+
+                let _ = run_mesh_worker_from_cache(
+                    &cache_dir,
+                    &mesh_root_dir,
+                    &db_option_ext.inner.mesh_precision,
+                    &db_option_ext.mesh_formats,
+                )
+                .await?;
+
+                if db_option_ext.inner.apply_boolean_operation {
+                    let _ = run_boolean_worker_from_cache(&cache_dir).await?;
+                }
+            }
 
             unsafe {
                 std::env::remove_var("FORCE_REPLACE_MESH");
@@ -407,8 +422,7 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             let final_output_path = if let Some(ref path) = config.output_path {
                 path.clone()
             } else {
-                let base_name =
-                    get_output_filename_for_refno(*refno, db_option_ext.use_surrealdb).await;
+                let base_name = get_output_filename_for_refno(*refno).await;
                 // 确保输出到 output 目录
                 format!("output/{}", base_name)
             };
@@ -457,7 +471,7 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
     println!("📊 查询该数据库下的所有 SITE...");
 
     use aios_database::fast_model::query_provider;
-    let sites = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
+    let sites: Vec<RefnoEnum> = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
     println!("   - 找到 {} 个 SITE", sites.len());
 
     if sites.is_empty() {
@@ -468,21 +482,44 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
     if config.regenerate_plant_mesh {
         println!("\n🔄 检测到 --regen-model 参数，开始重新生成几何体数据...");
         println!("   - 强制开启 replace_mesh 和 gen_mesh");
-        use aios_database::fast_model::gen_all_geos_data;
-        ensure_surreal_for_regen_model(db_option_ext).await?;
         unsafe {
             std::env::set_var("FORCE_REPLACE_MESH", "true");
         }
-        let mut db_option_clone = db_option_ext.inner.clone();
-        let original_replace_mesh = db_option_clone.replace_mesh;
-        let original_gen_mesh = db_option_clone.gen_mesh;
-        db_option_clone.replace_mesh = Some(true);
-        db_option_clone.gen_mesh = true;
-        let mut db_option_ext_override = db_option_ext.clone();
-        db_option_ext_override.inner = db_option_clone.clone();
-        gen_all_geos_data(sites.clone(), &db_option_ext_override, None, None).await?;
-        db_option_clone.replace_mesh = original_replace_mesh;
-        db_option_clone.gen_mesh = original_gen_mesh;
+
+        if db_option_ext.use_surrealdb {
+            use aios_database::fast_model::gen_all_geos_data;
+            ensure_surreal_connected(db_option_ext).await?;
+
+            let mut db_option_clone = db_option_ext.inner.clone();
+            let original_replace_mesh = db_option_clone.replace_mesh;
+            let original_gen_mesh = db_option_clone.gen_mesh;
+            db_option_clone.replace_mesh = Some(true);
+            db_option_clone.gen_mesh = true;
+            let mut db_option_ext_override = db_option_ext.clone();
+            db_option_ext_override.inner = db_option_clone.clone();
+            gen_all_geos_data(sites.clone(), &db_option_ext_override, None, None).await?;
+            db_option_clone.replace_mesh = original_replace_mesh;
+            db_option_clone.gen_mesh = original_gen_mesh;
+        } else {
+            use aios_database::fast_model::manifold_bool::run_boolean_worker_from_cache;
+            use aios_database::fast_model::mesh_generate::run_mesh_worker_from_cache;
+
+            let cache_dir = db_option_ext.get_foyer_cache_dir();
+            let mesh_root_dir = db_option_ext.inner.get_meshes_path();
+
+            let _ = run_mesh_worker_from_cache(
+                &cache_dir,
+                &mesh_root_dir,
+                &db_option_ext.inner.mesh_precision,
+                &db_option_ext.mesh_formats,
+            )
+            .await?;
+
+            if db_option_ext.inner.apply_boolean_operation {
+                let _ = run_boolean_worker_from_cache(&cache_dir).await?;
+            }
+        }
+
         unsafe {
             std::env::remove_var("FORCE_REPLACE_MESH");
         }
@@ -575,19 +612,9 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     println!("\n🎯 GLB 导出模式");
     println!("================");
 
-    // cache-only：仅当需要查询 MDB dbnum/SITE 列表等“扫库”能力时才连接 SurrealDB。
-    let need_db_scan = config.run_all_dbnos || config.dbnum.is_some();
-    if need_db_scan && !db_option_ext.use_surrealdb {
-        return Err(anyhow!(
-            "GLB 导出（run_all_dbnos/dbnum）需要 SurrealDB 读取侧；当前 use_surrealdb=false"
-        ));
-    }
-    if db_option_ext.use_surrealdb {
-        println!("\n📡 连接数据库（SurrealDB 启用）...");
-        init_surreal().await?;
-        println!("✅ 数据库连接成功");
-    } else {
-        println!("\n📦 cache-only：GLB 导出使用 foyer 缓存数据源（不回退 SurrealDB）");
+    ensure_surreal_connected(db_option_ext).await?;
+    if !db_option_ext.use_surrealdb {
+        println!("📦 cache-only：GLB 实例数据从 foyer cache 读取（不从 SurrealDB 查询 inst_relate）");
     }
 
     // 获取 mesh 目录
@@ -599,7 +626,7 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     // 全库导出（无 dbnum 且无 refnos）
     if config.run_all_dbnos && config.dbnum.is_none() && config.refnos_str.is_empty() {
         println!("\n🔁 进入全库 GLB 导出模式 (MDB 所有 dbnum)");
-        let dbnos = query_mdb_db_nums(None, DBType::DESI).await?;
+        let dbnos: Vec<u32> = query_mdb_db_nums(None, DBType::DESI).await?;
         if dbnos.is_empty() {
             println!("⚠️ MDB 未返回任何 dbnum，跳过导出");
             return Ok(());
@@ -629,7 +656,7 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             println!("   - 强制开启 replace_mesh 和 gen_mesh");
 
             use aios_database::fast_model::gen_all_geos_data;
-            ensure_surreal_for_regen_model(db_option_ext).await?;
+        ensure_surreal_connected(db_option_ext).await?;
 
             unsafe {
                 std::env::set_var("FORCE_REPLACE_MESH", "true");
@@ -664,7 +691,7 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
                 path.clone()
             } else {
                 let base_name =
-                    get_output_filename_for_refno(*refno, db_option_ext.use_surrealdb).await;
+                    get_output_filename_for_refno(*refno).await;
                 // 确保输出到 output 目录
                 format!("output/{}.glb", base_name.replace(".obj", ""))
             };
@@ -711,7 +738,7 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
     println!("📊 查询该数据库下的所有 SITE...");
 
     use aios_database::fast_model::query_provider;
-    let sites = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
+    let sites: Vec<RefnoEnum> = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
     println!("   - 找到 {} 个 SITE", sites.len());
 
     if sites.is_empty() {
@@ -723,7 +750,7 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
         println!("\n🔄 检测到 --regen-model 参数，开始重新生成几何体数据...");
         println!("   - 强制开启 replace_mesh 和 gen_mesh");
         use aios_database::fast_model::gen_all_geos_data;
-        ensure_surreal_for_regen_model(db_option_ext).await?;
+        ensure_surreal_connected(db_option_ext).await?;
         unsafe {
             std::env::set_var("FORCE_REPLACE_MESH", "true");
         }
@@ -828,19 +855,9 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
     println!("\n🎯 glTF 导出模式");
     println!("================");
 
-    // cache-only：仅当需要查询 MDB dbnum/SITE 列表等“扫库”能力时才连接 SurrealDB。
-    let need_db_scan = config.run_all_dbnos || config.dbnum.is_some();
-    if need_db_scan && !db_option_ext.use_surrealdb {
-        return Err(anyhow!(
-            "glTF 导出（run_all_dbnos/dbnum）需要 SurrealDB 读取侧；当前 use_surrealdb=false"
-        ));
-    }
-    if db_option_ext.use_surrealdb {
-        println!("\n📡 连接数据库（SurrealDB 启用）...");
-        init_surreal().await?;
-        println!("✅ 数据库连接成功");
-    } else {
-        println!("\n📦 cache-only：glTF 导出使用 foyer 缓存数据源（不回退 SurrealDB）");
+    ensure_surreal_connected(db_option_ext).await?;
+    if !db_option_ext.use_surrealdb {
+        println!("📦 cache-only：glTF 实例数据从 foyer cache 读取（不从 SurrealDB 查询 inst_relate）");
     }
 
     // 获取 mesh 目录
@@ -852,7 +869,7 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
     // 全库导出（无 dbnum 且无 refnos）
     if config.run_all_dbnos && config.dbnum.is_none() && config.refnos_str.is_empty() {
         println!("\n🔁 进入全库 GLTF 导出模式 (MDB 所有 dbnum)");
-        let dbnos = query_mdb_db_nums(None, DBType::DESI).await?;
+        let dbnos: Vec<u32> = query_mdb_db_nums(None, DBType::DESI).await?;
         if dbnos.is_empty() {
             println!("⚠️ MDB 未返回任何 dbnum，跳过导出");
             return Ok(());
@@ -888,7 +905,7 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
             println!("   - 强制开启 replace_mesh 和 gen_mesh");
 
             use aios_database::fast_model::gen_all_geos_data;
-            ensure_surreal_for_regen_model(db_option_ext).await?;
+            ensure_surreal_connected(db_option_ext).await?;
 
             unsafe {
                 std::env::set_var("FORCE_REPLACE_MESH", "true");
@@ -1009,7 +1026,7 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
                 path.clone()
             } else {
                 let base_name =
-                    get_output_filename_for_refno(*refno, db_option_ext.use_surrealdb).await;
+                    get_output_filename_for_refno(*refno).await;
                 // 确保输出到 output 目录
                 format!("output/{}.gltf", base_name.replace(".obj", ""))
             };
@@ -1064,7 +1081,7 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
         println!("\n🔄 检测到 --regen-model 参数，开始重新生成几何体数据...");
         println!("   - 强制开启 replace_mesh 和 gen_mesh");
         use aios_database::fast_model::gen_all_geos_data;
-        ensure_surreal_for_regen_model(db_option_ext).await?;
+        ensure_surreal_connected(db_option_ext).await?;
         unsafe {
             std::env::set_var("FORCE_REPLACE_MESH", "true");
         }
@@ -1164,14 +1181,9 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
     Ok(())
 }
 
-/// 获取输出文件名（优先基于 PE.name；cache-only 下直接回退为 refno）
-pub async fn get_output_filename_for_refno(refno: RefnoEnum, allow_surrealdb: bool) -> String {
+/// 获取输出文件名（优先基于 PE.name；失败则回退为 refno）
+pub async fn get_output_filename_for_refno(refno: RefnoEnum) -> String {
     use aios_database::fast_model::query_provider;
-
-    // cache-only：不依赖 SurrealDB/属性查询，避免 Connection uninitialised 影响导出流程。
-    if !allow_surrealdb {
-        return format!("{}.obj", refno.to_string().replace('/', "_"));
-    }
 
     // 1. 尝试获取 PE 的 name
     if let Ok(Some(pe)) = query_provider::get_pe(refno).await {
@@ -1309,7 +1321,7 @@ async fn export_instanced_bundle_mode(
         config
             .refnos_str
             .iter()
-            .map(|s| RefU64::from_str(s).map(|r| r.into()))
+            .map(|s| RefU64::from_str(s).map(RefnoEnum::Refno))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow!("解析参考号失败: {}", e))?
     };

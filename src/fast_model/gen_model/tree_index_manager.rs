@@ -18,7 +18,8 @@
 
 use crate::versioned_db::db_meta_info::DEFAULT_TREE_DIR;
 use aios_core::tool::db_tool::{db1_dehash, db1_hash};
-use aios_core::tree_query::{load_tree_index_from_dir, TreeIndex, TreeQueryFilter, TreeQueryOptions};
+use aios_core::tree_query::{load_tree_index_from_dir, TreeIndex, TreeQuery, TreeQueryFilter, TreeQueryOptions};
+use aios_core::pe::SPdmsElement;
 use aios_core::{RefnoEnum, RefU64};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
@@ -654,6 +655,43 @@ impl TreeIndexManager {
     /// 获取节点的 noun 名称
     pub fn get_noun(&self, refno: RefnoEnum) -> Option<String> {
         self.get_node_meta(refno).map(|meta| db1_dehash(meta.noun))
+    }
+
+    /// 仅基于 TreeIndex 查询“直接子节点元素列表”（不访问 SurrealDB）。
+    ///
+    /// 用途：
+    /// - BRAN/HANG 生成路径中收集子元件（管件）集合
+    /// - cache-only 模式下的过滤/分组查询
+    ///
+    /// 注意：
+    /// - TreeIndex 不包含 name/status/lock 等运行期字段，这里仅构造满足生成流水线所需的最小 SPdmsElement：
+    ///   refno/owner/noun/dbnum/sesno（其余字段保持默认值）。
+    pub async fn collect_children_elements_from_tree(
+        parent: RefnoEnum,
+    ) -> anyhow::Result<Vec<SPdmsElement>> {
+        let dbnum = Self::resolve_dbnum_for_refno(parent).await?;
+        let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+        let index = manager.load_index(dbnum)?;
+
+        let parent_u64 = parent.refno();
+        let child_u64s = index.query_children(parent_u64, TreeQueryFilter::default()).await?;
+
+        let mut out: Vec<SPdmsElement> = Vec::with_capacity(child_u64s.len());
+        for child in child_u64s {
+            let Some(meta) = index.node_meta(child) else {
+                continue;
+            };
+            let mut ele = SPdmsElement::default();
+            ele.refno = RefnoEnum::from(meta.refno);
+            ele.owner = RefnoEnum::from(meta.owner);
+            ele.noun = db1_dehash(meta.noun);
+            ele.dbnum = dbnum as i32;
+            ele.sesno = 0;
+            // name/status_code/lock/deleted/... 保持默认值（空/false/None）
+            out.push(ele);
+        }
+
+        Ok(out)
     }
 
     /// 检查节点是否存在

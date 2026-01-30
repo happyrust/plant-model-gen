@@ -128,8 +128,8 @@ pub async fn gen_geos_data_by_dbnum(
         let mut branch_refnos_map = DashMap::new();
         let mut bran_comp_eles = HashSet::new();
         for &refno in target_bran_hanger_refnos.as_slice() {
-            // 使用新的泛型函数接口
-            let children = aios_core::collect_children_elements(refno, &[])
+            // 过滤/子节点收集统一走 indextree（TreeIndex），避免在 cache-only 下隐式依赖 SurrealDB。
+            let children = TreeIndexManager::collect_children_elements_from_tree(refno)
                 .await
                 .unwrap_or_default();
             bran_comp_eles.extend(children.iter().map(|x| x.refno));
@@ -387,7 +387,7 @@ async fn process_gen_geos_data_chunks(
         let mut branch_refnos_map: DashMap<RefnoEnum, Vec<aios_core::pe::SPdmsElement>> = DashMap::new();
         let mut bran_comp_eles: Vec<RefnoEnum> = vec![];
         for &refno in &target_bran_hanger_refnos {
-            let children = aios_core::collect_children_elements(refno, &[])
+            let children = TreeIndexManager::collect_children_elements_from_tree(refno)
                 .await
                 .unwrap_or_default();
             bran_comp_eles.extend(children.iter().map(|x| x.refno));

@@ -85,6 +85,7 @@ fn test_tree_cata_hash_stats() {
     for refno in bfs_refnos.iter().copied() {
         if let Some(meta) = index.node_meta(refno) {
             if let Some(hash) = meta.cata_hash {
+                let hash: u64 = hash;
                 let hash_str = hash.to_string();
                 cata_nodes += 1;
                 stats

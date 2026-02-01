@@ -104,6 +104,50 @@ pub async fn gen_all_geos_data(
         target_sesno,
     );
 
+    // 性能剖析：尽量在最上层启用 tracing，覆盖 precheck -> gen_model -> mesh -> room 计算全链路。
+    #[cfg(feature = "profile")]
+    let _ = crate::profiling::init_chrome_tracing_for_db_option(db_option, "full_flow_room");
+    #[cfg(feature = "profile")]
+    let _root_span = tracing::info_span!(
+        "gen_all_geos_data",
+        full_noun_mode = db_option.full_noun_mode,
+        use_surrealdb = db_option.use_surrealdb,
+        use_cache = db_option.use_cache,
+        manual_db_nums = ?db_option.manual_db_nums,
+        exclude_db_nums = ?db_option.exclude_db_nums
+    )
+    .entered();
+
+    // ✨ 执行预检查：确保 Tree 文件、pe_transform、db_meta_info 就绪
+    if db_option.use_surrealdb {
+        use crate::fast_model::gen_model::precheck_coordinator::{run_precheck, PrecheckConfig};
+
+        #[cfg(feature = "profile")]
+        let _precheck_span = tracing::info_span!("precheck").entered();
+
+        let precheck_config = PrecheckConfig {
+            enabled: true,
+            check_tree: true,
+            check_pe_transform: true,
+            check_db_meta: true,
+            tree_output_dir: "output/scene_tree".to_string(),
+        };
+
+        match run_precheck(db_option, Some(precheck_config)).await {
+            Ok(stats) => {
+                log::info!("[gen_model] 预检查完成: {:?}", stats);
+            }
+            Err(e) => {
+                log::warn!("[gen_model] 预检查部分失败: {}", e);
+                // 不阻断流程，继续执行
+            }
+        }
+    } else {
+        // cache-only 模式：仅检查 db_meta_info
+        use crate::data_interface::db_meta_manager::db_meta;
+        let _ = db_meta().ensure_loaded();
+    }
+
     // TreeIndex 文件（output/scene_tree/{dbnum}.tree）在不少流程中是必需的（Full Noun/导出/层级查询）。
     // cache-only：不允许自动生成/回退 SurrealDB；缺失即报错，避免“看似成功但数据为空”。
     if db_option.use_surrealdb {
@@ -243,6 +287,12 @@ async fn process_full_noun_mode(
     #[cfg(feature = "duckdb-feature")]
     let duckdb_writer_clone = duckdb_writer.clone();
 
+    // foyer transform_cache：模型生成阶段统一走 cache-first 获取 world_transform。
+    // 这里只做一次初始化（创建目录 + 初始化 HybridCache）。
+    if let Err(e) = crate::fast_model::transform_cache::init_global_transform_cache(db_option).await {
+        eprintln!("[gen_model] ⚠️  初始化 transform_cache 失败（将退化为按需计算）: {}", e);
+    }
+
     let cache_manager = if db_option.use_cache {
         Some(Arc::new(
             InstanceCacheManager::new(&db_option.get_foyer_cache_dir()).await?,
@@ -256,38 +306,79 @@ async fn process_full_noun_mode(
     let touched_dbnums_for_insert = touched_dbnums.clone();
 
     let insert_handle = tokio::spawn(async move {
-        while let Ok(shape_insts) = receiver.recv_async().await {
+        #[cfg(feature = "profile")]
+        let sink_span = tracing::info_span!("instance_sink");
+
+        let mut batch_cnt: u64 = 0;
+        let mut t_save_db = std::time::Duration::ZERO;
+        let mut t_cache = std::time::Duration::ZERO;
+        let mut t_parquet = std::time::Duration::ZERO;
+        #[cfg(feature = "duckdb-feature")]
+        let mut t_duckdb = std::time::Duration::ZERO;
+
+        loop {
+            let Ok(shape_insts) = receiver.recv_async().await else {
+                break;
+            };
+
+            #[cfg(feature = "profile")]
+            let _enter = sink_span.enter();
+
+            batch_cnt += 1;
+
             // 保存到 SurrealDB
             if use_surrealdb {
+                let t0 = Instant::now();
                 if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
                     eprintln!("保存实例数据失败: {}", e);
                 }
+                t_save_db += t0.elapsed();
             }
             if let Some(ref cache_manager) = cache_manager_for_insert {
                 if let Some(dbnum) = resolve_dbnum_from_shape(&shape_insts).await {
+                    let t0 = Instant::now();
                     cache_manager.insert_from_shape(dbnum, &shape_insts);
                     let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(dbnum));
+                    t_cache += t0.elapsed();
                 }
             }
             // 同时写入 Parquet（如果启用）
             if let Some(ref writer) = parquet_writer_clone {
+                let t0 = Instant::now();
                 if let Err(e) = writer.write_batch(&shape_insts) {
                     eprintln!("[Parquet] 写入批次失败: {}", e);
                 }
+                t_parquet += t0.elapsed();
             }
             #[cfg(feature = "duckdb-feature")]
             if let Some(ref writer) = duckdb_writer_clone {
+                let t0 = Instant::now();
                 if let Err(e) = writer.write_batch(&shape_insts) {
                     eprintln!("[DuckDB] 写入批次失败: {}", e);
                 }
+                t_duckdb += t0.elapsed();
             }
+        }
+
+        #[cfg(feature = "profile")]
+        {
+            tracing::info!(
+                batch_cnt,
+                save_db_ms = t_save_db.as_millis() as u64,
+                cache_ms = t_cache.as_millis() as u64,
+                parquet_ms = t_parquet.as_millis() as u64,
+                "instance_sink finished"
+            );
+            #[cfg(feature = "duckdb-feature")]
+            tracing::info!(duckdb_ms = t_duckdb.as_millis() as u64, "instance_sink duckdb finished");
         }
     });
 
-    let categorized =
-        gen_full_noun_geos_optimized(Arc::new(db_option.clone()), &config, sender.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("Full Noun 生成失败: {}", e))?;
+    #[cfg(feature = "profile")]
+    let _gen_span = tracing::info_span!("full_noun_pipeline").entered();
+    let categorized = gen_full_noun_geos_optimized(Arc::new(db_option.clone()), &config, sender.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("Full Noun 生成失败: {}", e))?;
 
     // 🔥 显式 drop sender，让 receiver 的循环能够正常结束
     // 否则 insert_handle.await 会永久阻塞
@@ -315,6 +406,8 @@ async fn process_full_noun_mode(
 
     // 2️⃣ 可选执行 mesh 生成
     if db_option.inner.gen_mesh {
+        #[cfg(feature = "profile")]
+        let _mesh_span = tracing::info_span!("mesh_worker").entered();
         let mesh_start = Instant::now();
         println!("[gen_model] Full Noun 模式开始生成三角网格（深度收集几何节点）");
 
@@ -331,6 +424,8 @@ async fn process_full_noun_mode(
 
         if let Some(ref cache_manager) = cache_manager {
             let mesh_dir = db_option.inner.get_meshes_path();
+            #[cfg(feature = "profile")]
+            let _cache_mesh = tracing::info_span!("mesh_worker_cache").entered();
             if let Err(e) = run_mesh_worker_from_cache_manager(
                 cache_manager.as_ref(),
                 &mesh_dir,
@@ -346,6 +441,8 @@ async fn process_full_noun_mode(
         }
 
         if use_surrealdb {
+            #[cfg(feature = "profile")]
+            let _db_mesh = tracing::info_span!("mesh_worker_surreal").entered();
             if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
                 eprintln!("[gen_model] mesh worker 失败: {}", e);
             } else {
@@ -362,6 +459,8 @@ async fn process_full_noun_mode(
 
         // 3️⃣ 写入 inst_relate_aabb 并导出 Parquet（供房间计算使用）
         if use_surrealdb {
+        #[cfg(feature = "profile")]
+        let _aabb_span = tracing::info_span!("inst_relate_aabb").entered();
         let aabb_start = Instant::now();
         println!("[gen_model] Full Noun 模式开始写入 inst_relate_aabb");
         // 使用实际 inst_relate 中的 refno，避免分类结果与 inst 列表不一致导致 0 写入
@@ -407,15 +506,21 @@ async fn process_full_noun_mode(
 
         // 4️⃣ 可选执行布尔运算
         if db_option.inner.apply_boolean_operation {
+            #[cfg(feature = "profile")]
+            let _bool_span = tracing::info_span!("boolean_worker").entered();
             let bool_start = Instant::now();
             println!("[gen_model] Full Noun 模式开始布尔运算（boolean worker）");
             if let Some(ref cache_manager) = cache_manager {
+                #[cfg(feature = "profile")]
+                let _cache_bool = tracing::info_span!("boolean_worker_cache").entered();
                 if let Err(e) = run_boolean_worker_from_cache_manager(cache_manager.as_ref()).await
                 {
                     eprintln!("[gen_model] Full Noun 缓存布尔运算失败: {}", e);
                 }
             }
             if use_surrealdb {
+                #[cfg(feature = "profile")]
+                let _db_bool = tracing::info_span!("boolean_worker_surreal").entered();
                 if let Err(e) = run_boolean_worker(Arc::new(db_option.inner.clone()), 100).await {
                     eprintln!("[gen_model] Full Noun 布尔运算失败: {}", e);
                 }
@@ -429,6 +534,8 @@ async fn process_full_noun_mode(
 
         // 5️⃣ 生成 Web Bundle (GLB + JSON 数据包)
         if db_option.mesh_formats.contains(&MeshFormat::Glb) {
+            #[cfg(feature = "profile")]
+            let _bundle_span = tracing::info_span!("web_bundle").entered();
             let web_bundle_start = Instant::now();
             println!("[gen_model] 开始生成 Web Bundle (GLB + JSON 数据包)...");
 
@@ -472,6 +579,8 @@ async fn process_full_noun_mode(
     );
 
     // 4️⃣ 生成 SQLite 空间索引（从 foyer cache 批量落库）
+    #[cfg(feature = "profile")]
+    let _sqlite_span = tracing::info_span!("sqlite_spatial_index").entered();
     let touched_dbnums_vec: Vec<u32> = touched_dbnums
         .lock()
         .map(|s| s.iter().copied().collect())
@@ -535,26 +644,13 @@ async fn process_targeted_generation(
         "调试"
     };
 
-    // 生成前置预检查（通用）：确保 pe_transform(world_trans) 可用。
-    // inst_relate 不再保存 world_transform，因此这里必须确保 pe_transform 侧数据齐备。
-    let precheck_refnos: Vec<RefnoEnum> = if let Some(upd) = &incr_updates {
-        upd.get_all_visible_refnos().into_iter().collect()
-    } else if has_manual_refnos {
-        manual_refnos.clone()
-    } else {
-        db_option
-            .inner
-            .debug_model_refnos
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|s| s.parse::<RefnoEnum>().ok())
-            .collect()
-    };
-    if !precheck_refnos.is_empty() {
-        crate::fast_model::precheck::ensure_pe_transform_for_refnos(&precheck_refnos)
-            .await
-            .map_err(FullNounError::Other)?;
+    // 生成前置预检查（通用）：只确保 foyer transform_cache 目录已就绪。
+    // 不做“全量刷新/全量命中”要求；miss 由 get_world_transform_cache_first 按需计算并回写。
+    if let Err(e) = crate::fast_model::transform_cache::init_global_transform_cache(db_option).await {
+        eprintln!(
+            "[gen_model] ⚠️  transform_cache 预初始化失败（将退化为按需计算）: {}",
+            e
+        );
     }
 
     let target_count = if is_incr_update {
@@ -1042,6 +1138,15 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
     if !db_option.use_cache {
         return Ok(());
     }
+
+    #[cfg(feature = "profile")]
+    let _span = tracing::info_span!(
+        "update_sqlite_spatial_index_from_cache",
+        dbnum_cnt = dbnums.len(),
+        enable_sqlite_rtree = db_option.inner.enable_sqlite_rtree
+    )
+    .entered();
+
     if !db_option.inner.enable_sqlite_rtree {
         // 常见误区：已切换到 cache 生成，但忘了开 enable_sqlite_rtree，导致 spatial_index.sqlite 不会更新，
         // 房间计算（SQLite RTree 粗筛）会退化/失效。
@@ -1078,10 +1183,15 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
     uniq.extend(dbnums.iter().copied());
 
     for dbnum in uniq {
+        #[cfg(feature = "profile")]
+        let _db_span = tracing::info_span!("sqlite_index_dbnum", dbnum).entered();
+
         let out_dir = base_out.join(format!("{}", dbnum));
         fs::create_dir_all(&out_dir).map_err(|e| anyhow::anyhow!(e))?;
 
         // 1) cache -> instances_{dbnum}.json + aabb.json + trans.json
+        #[cfg(feature = "profile")]
+        let _export_span = tracing::info_span!("cache_export_instances_json").entered();
         let _ = crate::fast_model::export_model::export_prepack_lod::export_dbnum_instances_json_from_cache(
             dbnum,
             &out_dir,
@@ -1096,6 +1206,8 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
         // 2) instances_{dbnum}.json -> spatial_index.sqlite (RTree)
         let instances_path = out_dir.join(format!("instances_{}.json", dbnum));
         if instances_path.exists() {
+            #[cfg(feature = "profile")]
+            let _import_span = tracing::info_span!("sqlite_import_instances_json").entered();
             let _ = idx.import_from_instances_json(&instances_path, &ImportConfig::default())?;
         }
     }

@@ -36,17 +36,19 @@ pub async fn update_cal_equip_wtrans() -> anyhow::Result<()> {
     transform_map.insert(0, serde_json::to_string(&Transform::IDENTITY).unwrap());
     let mut sql = String::new();
     for refno in equips {
-        let world_trans = match aios_core::get_world_transform(refno).await {
-            Ok(transform) => transform.unwrap_or_default(),
-            Err(e) => {
-                eprintln!(
-                    "[cal_equip] 获取 world_transform 失败, refno={} 错误: {}",
-                    refno.to_normal_str(),
-                    e
-                );
-                return Err(e);
-            }
-        };
+        let world_trans =
+            match crate::fast_model::transform_cache::get_world_transform_cache_first(None, refno).await
+            {
+                Ok(transform) => transform.unwrap_or_default(),
+                Err(e) => {
+                    eprintln!(
+                        "[cal_equip] 获取 world_transform 失败, refno={} 错误: {}",
+                        refno.to_normal_str(),
+                        e
+                    );
+                    return Err(e);
+                }
+            };
         let transform_hash = gen_bevy_transform_hash(&world_trans);
         if !transform_map.contains_key(&transform_hash) {
             transform_map.insert(transform_hash, serde_json::to_string(&world_trans).unwrap());

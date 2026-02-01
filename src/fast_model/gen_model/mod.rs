@@ -44,6 +44,7 @@ mod non_full_noun;
 // 实用工具
 pub mod utilities;
 pub mod tree_index_manager;
+pub mod precheck_coordinator; // 预检查协调器
 
 // Mesh 处理
 pub mod mesh_processing;
@@ -80,3 +81,6 @@ pub use utilities::{
 
 // Mesh 处理函数
 pub use mesh_processing::process_meshes_by_dbnos;
+
+// 预检查相关类型
+pub use precheck_coordinator::{run_precheck, PrecheckConfig, PrecheckStats};

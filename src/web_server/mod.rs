@@ -52,6 +52,7 @@ use crate::web_api::{
     create_noun_hierarchy_routes, create_room_tree_routes, create_spatial_query_routes,
     create_pdms_attr_routes, create_ptset_routes, CollisionApiState, create_collision_routes,
     create_review_integration_routes, create_model_center_routes, create_pipeline_annotation_routes,
+    create_mbd_pipe_routes,
     create_jwt_auth_routes, create_review_api_routes, create_scene_tree_routes,
     create_export_api_routes,
     SearchApiState, create_search_routes,
@@ -860,6 +861,7 @@ pub async fn start_web_server_with_config(
         .merge(create_jwt_auth_routes())
         .merge(create_review_api_routes())
         .merge(create_scene_tree_routes())
+        .merge(create_mbd_pipe_routes())
         .nest("/api/pipeline", create_pipeline_annotation_routes())
         .layer(
             CorsLayer::new()

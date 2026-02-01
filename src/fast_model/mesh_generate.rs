@@ -825,6 +825,9 @@ pub async fn process_meshes_bran(
     if refnos.is_empty() {
         return Ok(());
     }
+    #[cfg(feature = "profile")]
+    let _span = tracing::info_span!("process_meshes_bran", refno_cnt = refnos.len()).entered();
+
     let replace_exist = option
         .as_ref()
         .map(|x| x.is_replace_mesh())
@@ -846,6 +849,8 @@ pub async fn process_meshes_bran(
         .unwrap_or_else(|| crate::options::get_db_option_ext().mesh_formats.clone());
     
     // 生成模型文件
+    #[cfg(feature = "profile")]
+    let _gen_span = tracing::info_span!("gen_inst_meshes_bran").entered();
     gen_inst_meshes(
         &dir,
         &precision,
@@ -860,6 +865,8 @@ pub async fn process_meshes_bran(
     );
     
     let time = std::time::Instant::now();
+    #[cfg(feature = "profile")]
+    let _aabb_span = tracing::info_span!("update_inst_relate_aabbs_bran").entered();
     update_inst_relate_aabbs_by_refnos(&refnos, replace_exist)
         .await
         .unwrap();

@@ -189,8 +189,11 @@ pub async fn load_or_build_convex_runtime(mesh_dir: &Path, geo_hash: &str) -> Re
             }
         }
 
-        // 缺文件或读取失败：按需生成（可由 ROOM_RELATION_CONVEX_LAZY_BUILD 关闭）
-        let lazy_build = env_bool("ROOM_RELATION_CONVEX_LAZY_BUILD", true);
+        // 缺文件或读取失败：是否允许“按需生成”。
+        //
+        // 默认关闭：避免房间计算阶段出现突发的重计算卡顿；如需开启可显式设置
+        // ROOM_RELATION_CONVEX_LAZY_BUILD=1。
+        let lazy_build = env_bool("ROOM_RELATION_CONVEX_LAZY_BUILD", false);
         if !lazy_build {
             return Err(anyhow!(
                 "凸分解文件不存在或不可用且禁用按需生成: geo_hash={}",
@@ -198,8 +201,19 @@ pub async fn load_or_build_convex_runtime(mesh_dir: &Path, geo_hash: &str) -> Re
             ));
         }
 
-        let rt = build_and_save_convex_from_glb(&base, geo_hash).await?;
-        Ok(rt)
+        // 缺文件或读取失败时的按需生成需要 miniacd（convex-decomposition）。
+        #[cfg(feature = "convex-decomposition")]
+        {
+            let rt = build_and_save_convex_from_glb(&base, geo_hash).await?;
+            Ok(rt)
+        }
+        #[cfg(not(feature = "convex-decomposition"))]
+        {
+            Err(anyhow!(
+                "凸分解文件不存在或不可用且当前未启用 convex-decomposition（miniacd），无法按需生成: geo_hash={}",
+                geo_hash
+            ))
+        }
     })
     .await
     .map(|v| v.clone())
@@ -347,6 +361,9 @@ fn build_unit_runtime(geo_hash: &str) -> Result<ConvexRuntime> {
 }
 
 /// 从 base_mesh_dir 的 GLB 构建凸分解并落盘（{base}/convex/{geo_hash}_convex.rkyv）
+///
+/// 注意：该函数依赖 miniacd，仅在启用 `convex-decomposition` feature 时可用。
+#[cfg(feature = "convex-decomposition")]
 pub async fn build_and_save_convex_from_glb(base_mesh_dir: &Path, geo_hash: &str) -> Result<Arc<ConvexRuntime>> {
     let threshold = env_f64("CONVEX_DECOMP_THRESHOLD", 0.05);
     let mcts_iterations = env_u32("CONVEX_DECOMP_MCTS_ITERATIONS", 150);
@@ -403,6 +420,7 @@ fn find_any_glb_path(base_mesh_dir: &Path, geo_hash: &str) -> Result<PathBuf> {
     Err(anyhow!("未找到 geo_hash={} 的 GLB（L0..L3）", geo_hash))
 }
 
+#[cfg(feature = "convex-decomposition")]
 fn build_convex_from_plant_mesh(
     geo_hash: &str,
     threshold: f64,
@@ -684,8 +702,21 @@ mod tests {
         .expect("create_test_cube_trimesh")
     }
 
-    fn runtime_from_box(min: [f32; 3], max: [f32; 3]) -> ConvexRuntime {
-        let verts = vec![
+    fn cube_room(min: [f32; 3], max: [f32; 3]) -> (Vec<Arc<TriMesh>>, Aabb) {
+        let room = Arc::new(create_test_cube_trimesh(
+            Point::new(min[0], min[1], min[2]),
+            Point::new(max[0], max[1], max[2]),
+        ));
+        let panel_meshes = vec![room];
+        let panel_aabb = Aabb::new(
+            Point::new(min[0], min[1], min[2]),
+            Point::new(max[0], max[1], max[2]),
+        );
+        (panel_meshes, panel_aabb)
+    }
+
+    fn box_vertices(min: [f32; 3], max: [f32; 3]) -> Vec<[f32; 3]> {
+        vec![
             [min[0], min[1], min[2]],
             [max[0], min[1], min[2]],
             [max[0], max[1], min[2]],
@@ -694,7 +725,58 @@ mod tests {
             [max[0], min[1], max[2]],
             [max[0], max[1], max[2]],
             [min[0], max[1], max[2]],
-        ];
+        ]
+    }
+
+    fn only_corners_as_samples(verts: &[[f32; 3]]) -> Vec<Point<f32>> {
+        verts
+            .iter()
+            .map(|v| Point::new(v[0], v[1], v[2]))
+            .collect()
+    }
+
+    fn centroid_only_sample(verts: &[[f32; 3]]) -> Vec<Point<f32>> {
+        let mut c = Point::new(0.0f32, 0.0, 0.0);
+        for v in verts {
+            c.x += v[0];
+            c.y += v[1];
+            c.z += v[2];
+        }
+        let n = verts.len().max(1) as f32;
+        c.x /= n;
+        c.y /= n;
+        c.z /= n;
+        vec![c]
+    }
+
+    fn runtime_single_hull(
+        geo_hash: &str,
+        verts: Vec<[f32; 3]>,
+        sample_points_local: Vec<Point<f32>>,
+    ) -> ConvexRuntime {
+        let (aabb_min, aabb_max) = compute_aabb_from_vertices(&verts);
+        let local_aabb = Aabb::new(
+            Point::new(aabb_min[0], aabb_min[1], aabb_min[2]),
+            Point::new(aabb_max[0], aabb_max[1], aabb_max[2]),
+        );
+        ConvexRuntime {
+            geo_hash: geo_hash.to_string(),
+            hulls: vec![ConvexHullRuntime {
+                local_aabb,
+                vertices: verts,
+                sample_points_local,
+            }],
+        }
+    }
+
+    fn merge_aabb(a: &Aabb, b: &Aabb) -> Aabb {
+        let mins = Point::new(a.mins.x.min(b.mins.x), a.mins.y.min(b.mins.y), a.mins.z.min(b.mins.z));
+        let maxs = Point::new(a.maxs.x.max(b.maxs.x), a.maxs.y.max(b.maxs.y), a.maxs.z.max(b.maxs.z));
+        Aabb::new(mins, maxs)
+    }
+
+    fn runtime_from_box(min: [f32; 3], max: [f32; 3]) -> ConvexRuntime {
+        let verts = box_vertices(min, max);
         let local_aabb = Aabb::new(Point::new(min[0], min[1], min[2]), Point::new(max[0], max[1], max[2]));
         let sample_points_local = sample_points_from_vertices(&verts, 32);
         ConvexRuntime {
@@ -709,12 +791,7 @@ mod tests {
 
     #[test]
     fn overlap_true_when_fully_inside_without_surface_intersection() {
-        let room = Arc::new(create_test_cube_trimesh(
-            Point::new(0.0, 0.0, 0.0),
-            Point::new(10.0, 10.0, 10.0),
-        ));
-        let panel_meshes = vec![room];
-        let panel_aabb = Aabb::new(Point::new(0.0, 0.0, 0.0), Point::new(10.0, 10.0, 10.0));
+        let (panel_meshes, panel_aabb) = cube_room([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
 
         let comp = runtime_from_box([2.0, 2.0, 2.0], [3.0, 3.0, 3.0]);
         let mat = Mat4::IDENTITY;
@@ -731,16 +808,221 @@ mod tests {
 
     #[test]
     fn overlap_false_when_separated() {
-        let room = Arc::new(create_test_cube_trimesh(
-            Point::new(0.0, 0.0, 0.0),
-            Point::new(10.0, 10.0, 10.0),
-        ));
-        let panel_meshes = vec![room];
-        let panel_aabb = Aabb::new(Point::new(0.0, 0.0, 0.0), Point::new(10.0, 10.0, 10.0));
+        let (panel_meshes, panel_aabb) = cube_room([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
 
         let comp = runtime_from_box([20.0, 20.0, 20.0], [21.0, 21.0, 21.0]);
         let mat = Mat4::IDENTITY;
         assert!(!component_overlaps_room(
+            &panel_meshes,
+            &panel_aabb,
+            &mat,
+            &comp,
+            0.001
+        ));
+    }
+
+    #[test]
+    fn overlap_true_when_crossing_boundary_without_any_sample_point_inside() {
+        let (panel_meshes, panel_aabb) = cube_room([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+
+        // 该构件与房间体积相交（0..10 x 0..1 x 0..1），但所有“采样点”（此处刻意只取 8 个角点）都在房间外。
+        // 因此 A) 点在体内必为 false，必须依赖 B) 边界相交为 true。
+        let min = [-1.0, -1.0, -1.0];
+        let max = [11.0, 1.0, 1.0];
+        let verts = box_vertices(min, max);
+        let sample_points_local = only_corners_as_samples(&verts);
+        let comp = runtime_single_hull("test", verts, sample_points_local);
+
+        let mat = Mat4::IDENTITY;
+        assert!(component_overlaps_room(
+            &panel_meshes,
+            &panel_aabb,
+            &mat,
+            &comp,
+            0.001
+        ));
+    }
+
+    #[test]
+    fn overlap_true_under_non_uniform_scale_transform() {
+        let (panel_meshes, panel_aabb) = cube_room([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+
+        let comp = runtime_from_box([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        let mat = Mat4::from_scale_rotation_translation(
+            Vec3::new(2.0, 1.0, 0.5),
+            glam::Quat::IDENTITY,
+            Vec3::new(1.0, 1.0, 1.0),
+        );
+
+        // inst.transform 可能包含非均匀缩放，这里验证 Mat4 路径能正确把采样点/凸体变换到世界坐标。
+        assert!(component_overlaps_room(
+            &panel_meshes,
+            &panel_aabb,
+            &mat,
+            &comp,
+            0.001
+        ));
+    }
+
+    #[test]
+    fn overlap_true_when_inside_only_centroid_sample() {
+        let (panel_meshes, panel_aabb) = cube_room([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+
+        // Hull 完全位于房间内；采样点只给质心，强制依赖 A) 点在体内。
+        let verts = box_vertices([2.0, 2.0, 2.0], [3.0, 3.0, 3.0]);
+        let sample_points_local = centroid_only_sample(&verts);
+        let comp = runtime_single_hull("test", verts, sample_points_local);
+        let mat = Mat4::IDENTITY;
+
+        assert!(component_overlaps_room(
+            &panel_meshes,
+            &panel_aabb,
+            &mat,
+            &comp,
+            0.0
+        ));
+    }
+
+    #[test]
+    fn overlap_true_when_point_outside_but_within_tolerance_of_surface() {
+        let (panel_meshes, panel_aabb) = cube_room([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+
+        // Hull 本体放在房间内部，保证 AABB 预过滤通过且 B) 边界相交不成立。
+        let verts = box_vertices([2.0, 2.0, 2.0], [3.0, 3.0, 3.0]);
+
+        // 采样点刻意放在房间外侧，但离 x=0 面非常近；应被 project_point + tolerance 判定为“在内”。
+        let eps = 1.0e-3f32;
+        let sample_points_local = vec![Point::new(-eps, 5.0, 5.0)];
+        let comp = runtime_single_hull("test", verts, sample_points_local);
+        let mat = Mat4::IDENTITY;
+
+        assert!(component_overlaps_room(
+            &panel_meshes,
+            &panel_aabb,
+            &mat,
+            &comp,
+            eps * 1.1
+        ));
+    }
+
+    #[test]
+    fn overlap_false_when_aabb_prefilter_blocks_even_if_sample_points_inside() {
+        let (panel_meshes, panel_aabb) = cube_room([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+
+        // Hull 远离房间（AABB 不相交），但采样点故意放在房间内部；
+        // 预期仍为 false：AABB 预过滤应最先把它筛掉。
+        let verts = box_vertices([20.0, 20.0, 20.0], [21.0, 21.0, 21.0]);
+        let sample_points_local = vec![Point::new(5.0, 5.0, 5.0)];
+        let comp = runtime_single_hull("test", verts, sample_points_local);
+        let mat = Mat4::IDENTITY;
+
+        assert!(!component_overlaps_room(
+            &panel_meshes,
+            &panel_aabb,
+            &mat,
+            &comp,
+            0.1
+        ));
+    }
+
+    #[test]
+    fn overlap_true_when_any_hull_overlaps() {
+        let (panel_meshes, panel_aabb) = cube_room([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+
+        // hull1: far away -> false
+        let verts1 = box_vertices([20.0, 20.0, 20.0], [21.0, 21.0, 21.0]);
+        let (aabb1_min, aabb1_max) = compute_aabb_from_vertices(&verts1);
+        let hull1 = ConvexHullRuntime {
+            local_aabb: Aabb::new(
+                Point::new(aabb1_min[0], aabb1_min[1], aabb1_min[2]),
+                Point::new(aabb1_max[0], aabb1_max[1], aabb1_max[2]),
+            ),
+            vertices: verts1,
+            sample_points_local: vec![Point::new(20.5, 20.5, 20.5)],
+        };
+
+        // hull2: inside -> true (A path)
+        let verts2 = box_vertices([2.0, 2.0, 2.0], [3.0, 3.0, 3.0]);
+        let (aabb2_min, aabb2_max) = compute_aabb_from_vertices(&verts2);
+        let hull2 = ConvexHullRuntime {
+            local_aabb: Aabb::new(
+                Point::new(aabb2_min[0], aabb2_min[1], aabb2_min[2]),
+                Point::new(aabb2_max[0], aabb2_max[1], aabb2_max[2]),
+            ),
+            sample_points_local: vec![Point::new(2.5, 2.5, 2.5)],
+            vertices: verts2,
+        };
+
+        let comp = ConvexRuntime {
+            geo_hash: "test".to_string(),
+            hulls: vec![hull1, hull2],
+        };
+        let mat = Mat4::IDENTITY;
+        assert!(component_overlaps_room(
+            &panel_meshes,
+            &panel_aabb,
+            &mat,
+            &comp,
+            0.001
+        ));
+    }
+
+    #[test]
+    fn overlap_true_when_any_panel_contains_point() {
+        // 两个不相交房间：一个在原点，一个在远处。
+        let room1_min = [0.0, 0.0, 0.0];
+        let room1_max = [10.0, 10.0, 10.0];
+        let room2_min = [100.0, 100.0, 100.0];
+        let room2_max = [110.0, 110.0, 110.0];
+
+        let room1 = Arc::new(create_test_cube_trimesh(
+            Point::new(room1_min[0], room1_min[1], room1_min[2]),
+            Point::new(room1_max[0], room1_max[1], room1_max[2]),
+        ));
+        let room2 = Arc::new(create_test_cube_trimesh(
+            Point::new(room2_min[0], room2_min[1], room2_min[2]),
+            Point::new(room2_max[0], room2_max[1], room2_max[2]),
+        ));
+        let panel_meshes = vec![room1, room2];
+
+        // 注意：panel_world_aabb 在生产中是多个 panel 的合并，这里也需要合并，否则会被 AABB 预过滤误伤。
+        let aabb1 = Aabb::new(
+            Point::new(room1_min[0], room1_min[1], room1_min[2]),
+            Point::new(room1_max[0], room1_max[1], room1_max[2]),
+        );
+        let aabb2 = Aabb::new(
+            Point::new(room2_min[0], room2_min[1], room2_min[2]),
+            Point::new(room2_max[0], room2_max[1], room2_max[2]),
+        );
+        let panel_aabb = merge_aabb(&aabb1, &aabb2);
+
+        // Hull 本体无所谓，这里用一个小盒子；采样点放进 room2，要求 any(panel) 返回 true。
+        let verts = box_vertices([1.0, 1.0, 1.0], [2.0, 2.0, 2.0]);
+        let sample_points_local = vec![Point::new(105.0, 105.0, 105.0)];
+        let comp = runtime_single_hull("test", verts, sample_points_local);
+        let mat = Mat4::IDENTITY;
+
+        assert!(component_overlaps_room(
+            &panel_meshes,
+            &panel_aabb,
+            &mat,
+            &comp,
+            0.001
+        ));
+    }
+
+    #[test]
+    fn overlap_true_under_rotation_and_non_uniform_scale_transform() {
+        let (panel_meshes, panel_aabb) = cube_room([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+
+        let comp = runtime_from_box([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        let mat = Mat4::from_scale_rotation_translation(
+            Vec3::new(2.0, 1.0, 0.5),
+            glam::Quat::from_rotation_z(0.7),
+            Vec3::new(5.0, 5.0, 5.0),
+        );
+
+        assert!(component_overlaps_room(
             &panel_meshes,
             &panel_aabb,
             &mat,

@@ -55,6 +55,7 @@ pub async fn gen_loop_geos(
         let all_loop_owner_refnos = all_refnos.clone();
         let sjus_map_clone = sjus_map_arc.clone();
         let sender = sender.clone();
+        let db_option = db_option.clone();
         let handle = tokio::spawn(async move {
             let start_idx = i * batch_size;
             if start_idx >= loop_owner_cnt {
@@ -80,7 +81,12 @@ pub async fn gen_loop_geos(
                     .await
                     .unwrap_or_default();
                 let target_type = target_att.get_type_str();
-                let Ok(Some(mut trans_origin)) = aios_core::get_world_transform(target_refno).await
+                let Ok(Some(mut trans_origin)) =
+                    crate::fast_model::transform_cache::get_world_transform_cache_first(
+                        Some(db_option.as_ref()),
+                        target_refno,
+                    )
+                    .await
                 else {
                     continue;
                 };

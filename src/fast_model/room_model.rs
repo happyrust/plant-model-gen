@@ -221,6 +221,7 @@ async fn get_enhanced_trimesh_cache() -> &'static DashMap<String, Arc<TriMesh>> 
 /// 3. 添加详细的性能统计和监控
 /// 4. 支持并发处理和批量操作
 #[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+#[cfg_attr(feature = "profile", tracing::instrument(skip(db_option)))]
 pub async fn build_room_relations(db_option: &DbOption) -> anyhow::Result<RoomBuildStats> {
     info!("开始构建房间关系 (改进版本)");
 
@@ -911,7 +912,7 @@ async fn cal_room_refnos_with_options(
     }
 
     let within_refnos: HashSet<RefnoEnum> = if use_convex {
-        #[cfg(feature = "convex-decomposition")]
+        #[cfg(feature = "convex-runtime")]
         {
             stream::iter(candidates)
                 .map(|candidate_refno| {
@@ -971,7 +972,7 @@ async fn cal_room_refnos_with_options(
                 .into_iter()
                 .collect()
         }
-        #[cfg(not(feature = "convex-decomposition"))]
+        #[cfg(not(feature = "convex-runtime"))]
         {
             stream::iter(candidates)
                 .map(|candidate_refno| {

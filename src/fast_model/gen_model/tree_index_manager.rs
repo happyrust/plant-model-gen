@@ -184,13 +184,22 @@ impl TreeIndexManager {
             // 如果启用了自动生成，尝试生成
             if is_auto_generate_tree_enabled() {
                 log::info!("[TreeIndexManager] Tree 索引文件不存在，尝试从 SurrealDB 重建: dbnum={}", dbnum);
-                // 使用 tokio runtime 执行异步生成
+                // 使用 tokio runtime 执行异步生成。
+                //
+                // 注意：load_index 可能在非 tokio 线程里被调用（例如 tree-index-loader-* 线程），
+                // 这时 Handle::current() 会 panic。这里用 try_current + 兜底 runtime，保证稳定性。
                 let tree_dir = self.tree_dir.clone();
-                let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        generate_tree_index_from_db(dbnum, &tree_dir).await
-                    })
-                });
+                let result = match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => tokio::task::block_in_place(|| {
+                        handle.block_on(async { generate_tree_index_from_db(dbnum, &tree_dir).await })
+                    }),
+                    Err(_) => {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        rt.block_on(async { generate_tree_index_from_db(dbnum, &tree_dir).await })
+                    }
+                };
 
                 match result {
                     Ok(_) => {
@@ -253,8 +262,12 @@ impl TreeIndexManager {
     ///
     /// 约定：不回退到 SurrealDB 查询（SurrealDB 仅作为“生成完成后的一键备份落库”目的地）。
     pub async fn resolve_dbnum_for_refno(refno: RefnoEnum) -> anyhow::Result<u32> {
-        // 优先使用 DbMetaManager 的快速查询（通过 db_meta_info.json）
+        // 优先使用 DbMetaManager 的快速查询（通过 db_meta_info.json）。
+        //
+        // 注意：该映射需要先 ensure_loaded；否则 get_dbnum_by_refno 会因未加载而返回 None，
+        // 进而误报“无法从缓存推导 refno 的 dbnum”。
         use crate::data_interface::db_meta;
+        let _ = db_meta().ensure_loaded();
         if let Some(dbnum) = db_meta().get_dbnum_by_refno(refno) {
             return Ok(dbnum);
         }

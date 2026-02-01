@@ -66,6 +66,7 @@ pub async fn gen_prim_geos(
         let all_refnos = all_refnos.clone();
         let processed_cnt = processed_cnt.clone();
         let sender = sender.clone();
+        let db_option = db_option.clone();
         let handle = tokio::spawn(async move {
             let batch_start_time = Instant::now();
             let mut shape_insts_data = ShapeInstancesData::default();
@@ -114,7 +115,12 @@ pub async fn gen_prim_geos(
                     remaining
                 );
 
-                let trans_result = aios_core::get_world_transform(refno).await;
+                let trans_result =
+                    crate::fast_model::transform_cache::get_world_transform_cache_first(
+                        Some(db_option.as_ref()),
+                        refno,
+                    )
+                    .await;
                 let Ok(Some(mut trans_origin)) = trans_result else {
                     skipped_in_batch += 1;
                     match trans_result {

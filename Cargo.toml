@@ -221,7 +221,9 @@ web_server = [
 duckdb-feature = ["dep:duckdb"] # DuckDB 模型导出功能
 sqlite-index = ["dep:rusqlite", "dep:tokio-util"] # SQLite RTree 空间索引功能
 debug_e3d = []
-convex-decomposition = ["dep:miniacd", "dep:glamx"]
+# 凸分解：拆分为“运行时（无 miniacd）”与“生成（依赖 miniacd）”两层，避免仅做碰撞/单测时被 pyo3 依赖拖慢/阻塞。
+convex-runtime = []
+convex-decomposition = ["convex-runtime", "dep:miniacd", "dep:glamx"]
 
 [build-dependencies]
 cc = { version = "1.0", features = ["parallel"] }

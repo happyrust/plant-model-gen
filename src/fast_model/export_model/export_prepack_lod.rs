@@ -49,6 +49,31 @@ use crate::fast_model::query_compat::query_deep_visible_inst_refnos;
 use crate::fast_model::query_provider;
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
 
+/// instances 输出的元信息（供前端读取 batch_id，确保 ptset 与模型快照一致）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstancesMeta {
+    pub version: u32,
+    pub generated_at: String,
+    pub dbno: u32,
+    /// 对应 foyer instance_cache 的“快照版本”（语义：截至该 batch 的最新视图）。
+    /// - cache 导出：为 latest batch_id
+    /// - SurrealDB 导出：None
+    pub batch_id: Option<String>,
+}
+
+fn write_instances_meta(output_dir: &Path, dbnum: u32, generated_at: &str, batch_id: Option<String>) -> Result<()> {
+    let meta = InstancesMeta {
+        version: 1,
+        generated_at: generated_at.to_string(),
+        dbno: dbnum,
+        batch_id,
+    };
+    let path = output_dir.join(format!("meta_{}.json", dbnum));
+    let json = serde_json::to_string_pretty(&meta).context("序列化 meta_*.json 失败")?;
+    fs::write(&path, json).with_context(|| format!("写入 meta 文件失败: {}", path.display()))?;
+    Ok(())
+}
+
 /// LOD 配置
 const LOD_LEVELS: &[LodLevel] = &[LodLevel::L1, LodLevel::L2, LodLevel::L3];
 
@@ -2752,6 +2777,9 @@ pub async fn export_dbnum_instances_json(
     let json_str = serde_json::to_string_pretty(&instances_json)?;
     fs::write(&output_path, json_str)?;
 
+    // 写入元信息（SurrealDB 导出不携带 batch_id，前端可回退 latest 或不传）
+    write_instances_meta(output_dir, dbnum, &generated_at, None)?;
+
     if verbose {
         println!("✅ 主 JSON 文件已写入: {}", output_path.display());
     }
@@ -2816,6 +2844,8 @@ pub async fn export_dbnum_instances_json_from_cache(
             dbnum
         ));
     }
+    // 用于 meta_{dbno}.json：表示“截至该 batch 的最新快照”。
+    let latest_batch_id = batch_ids.last().cloned();
 
     let mut inst_info_map: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
     let mut inst_tubi_map: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
@@ -3390,6 +3420,9 @@ pub async fn export_dbnum_instances_json_from_cache(
 
     fs::write(&trans_path, serde_json::to_string(&trans_json)?)?;
     fs::write(&aabb_path, serde_json::to_string(&aabb_json)?)?;
+
+    // 写入元信息：前端读取 batch_id 后，请求 ptset 时带上以实现强一致（按需查询时仍可回退 latest）。
+    write_instances_meta(output_dir, dbnum, &generated_at, latest_batch_id)?;
 
     if verbose {
         println!("✅ 主 JSON 文件已写入: {}", output_path.display());
@@ -4075,8 +4108,12 @@ pub async fn export_instances_json_for_dbnos(
     db_option: Arc<DbOption>,
     _verbose: bool,
 ) -> anyhow::Result<()> {
+    // 约定：instances 输出固定落到 `${output_dir}/instances`，以匹配前端 `/files/output/instances/*`。
+    let instances_dir = output_dir.join("instances");
+    fs::create_dir_all(&instances_dir)
+        .with_context(|| format!("创建 instances 输出目录失败: {}", instances_dir.display()))?;
     for &dbnum in dbnos {
-        export_dbnum_instances_json(dbnum, output_dir, db_option.clone(), false, None).await?;
+        export_dbnum_instances_json(dbnum, &instances_dir, db_option.clone(), false, None).await?;
     }
     Ok(())
 }
@@ -4113,8 +4150,11 @@ pub async fn export_instances_json_for_refnos_grouped_by_dbno(
     }
 
     // 为每个 dbnum 导出
+    let instances_dir = output_dir.join("instances");
+    fs::create_dir_all(&instances_dir)
+        .with_context(|| format!("创建 instances 输出目录失败: {}", instances_dir.display()))?;
     for dbnum in dbnos {
-        export_dbnum_instances_json(dbnum, output_dir, db_option.clone(), false, None).await?;
+        export_dbnum_instances_json(dbnum, &instances_dir, db_option.clone(), false, None).await?;
     }
     Ok(())
 }

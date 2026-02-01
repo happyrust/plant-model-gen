@@ -44,74 +44,12 @@ use tokio::sync::{Mutex, RwLock};
 // #[cfg(feature = "profile")]
 use tracing::{Level, info_span, instrument};
 
-// For Chrome tracing
-use std::path::Path;
-#[cfg(feature = "profile")]
-use tracing_chrome::{ChromeLayerBuilder, FlushGuard};
-#[cfg(feature = "profile")]
-use tracing_subscriber::fmt;
-#[cfg(feature = "profile")]
-use tracing_subscriber::prelude::*;
-
-// Global variable to ensure tracing is initialized only once
-#[cfg(feature = "profile")]
-static TRACING_INITIALIZED: AtomicBool = AtomicBool::new(false);
-// Global tracing guard
-#[cfg(feature = "profile")]
-static mut TRACING_GUARD: Option<FlushGuard> = None;
-
-/// Initializes Chrome tracing for performance analysis
+// Chrome tracing（统一走 crate::profiling，避免重复 init）
 #[cfg(feature = "profile")]
 pub fn init_chrome_tracing() -> anyhow::Result<()> {
-    // Only initialize once
-    if TRACING_INITIALIZED
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return Ok(());
-    }
-
-    let trace_path = "chrome_trace_cata_model.json";
-
-    // Create a fresh trace file
-    create_fresh_trace_file(trace_path)?;
-
-    // Create a new builder with simplified options to reduce chances of JSON errors
-    let (chrome_layer, guard) = ChromeLayerBuilder::new()
-        .file(trace_path)
-        .include_args(false) // Disable including args which can cause JSON formatting issues
-        .include_locations(false) // Disable including locations to simplify JSON
-        .build();
-
-    // Store the guard so it doesn't get dropped
-    unsafe {
-        TRACING_GUARD = Some(guard);
-    }
-
-    // Only create the Chrome tracing layer without the console output layer
-    tracing_subscriber::registry().with(chrome_layer).init();
-
-    println!(
-        "Chrome tracing initialized. Output will be written to {}",
-        trace_path
-    );
-    Ok(())
-}
-
-/// Creates a fresh trace file, removing the existing one if present
-#[cfg(feature = "profile")]
-fn create_fresh_trace_file(path: &str) -> anyhow::Result<()> {
-    // Remove existing file if it exists
-    if std::fs::metadata(path).is_ok() {
-        std::fs::remove_file(path)?;
-    }
-
-    // Create an empty JSON array file to ensure valid JSON structure
-    let empty_trace =
-        r#"{"traceEvents":[],"displayTimeUnit":"ns","systemTraceEvents":"","otherData":{}}"#;
-    std::fs::write(path, empty_trace)?;
-
-    Ok(())
+    // 旧逻辑固定写到根目录；现在主要用于“兜底”。
+    // 正常情况下应由 gen_model/orchestrator 在更上层先初始化（带 dbnum/时间戳）。
+    crate::profiling::init_chrome_tracing("output/profile/chrome_trace_cata_model.json")
 }
 
 #[derive(Debug, Default, IntoPrimitive, Eq, PartialEq, TryFromPrimitive, Copy, Clone)]
@@ -715,53 +653,47 @@ async fn gen_cata_geos_inner(
                             shapes.len()
                         );
                         let t_get_world_transform = Instant::now();
-                        // 使用惰性计算版本，如果缓存不存在会自动计算并写入数据库
-                        let mut world_transform =
-                            match aios_core::get_world_mat4(ele_refno, false).await {
-                                Ok(Some(mat4)) => {
-                                    // DMat4 转换为 Transform
-                                    let (scale, rotation, translation) = mat4.to_scale_rotation_translation();
-                                    bevy_transform::prelude::Transform {
-                                        translation: translation.as_vec3(),
-                                        rotation: glam::Quat::from_xyzw(
-                                            rotation.x as f32,
-                                            rotation.y as f32,
-                                            rotation.z as f32,
-                                            rotation.w as f32,
-                                        ),
-                                        scale: scale.as_vec3(),
-                                    }
-                                }
-                                Ok(None) => {
-                                    debug_model!("[SKIP] ele_refno={} get_world_mat4 返回 None，跳过", ele_refno);
-                                    record_refno_error(
-                                        RefnoErrorKind::Missing,
-                                        RefnoErrorStage::Query,
-                                        "fast_model/cata_model.rs",
-                                        "get_world_mat4",
-                                        "get_world_mat4 返回 None",
-                                        Some(&ele_refno),
-                                        None,
-                                        &[],
-                                        None,
-                                    );
-                                    continue;
-                                }
-                                Err(e) => {
-                                    record_refno_error(
-                                        RefnoErrorKind::NotFound,
-                                        RefnoErrorStage::Query,
-                                        "fast_model/cata_model.rs",
-                                        "get_world_mat4",
-                                        format!("惰性计算 world_mat4 失败: {}", e),
-                                        Some(&ele_refno),
-                                        None,
-                                        &[],
-                                        None,
-                                    );
-                                    continue;
-                                }
-                            };
+                        // 统一走 foyer transform_cache（不要求全量命中）；miss 时按需计算并回写缓存。
+                        let mut world_transform = match crate::fast_model::transform_cache::get_world_transform_cache_first(
+                            Some(db_option.as_ref()),
+                            ele_refno,
+                        )
+                        .await
+                        {
+                            Ok(Some(t)) => t,
+                            Ok(None) => {
+                                debug_model!(
+                                    "[SKIP] ele_refno={} world_transform 为 None，跳过",
+                                    ele_refno
+                                );
+                                record_refno_error(
+                                    RefnoErrorKind::Missing,
+                                    RefnoErrorStage::Query,
+                                    "fast_model/cata_model.rs",
+                                    "get_world_transform_cache_first",
+                                    "world_transform 为 None",
+                                    Some(&ele_refno),
+                                    None,
+                                    &[],
+                                    None,
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                record_refno_error(
+                                    RefnoErrorKind::NotFound,
+                                    RefnoErrorStage::Query,
+                                    "fast_model/cata_model.rs",
+                                    "get_world_transform_cache_first",
+                                    format!("获取/计算 world_transform 失败: {}", e),
+                                    Some(&ele_refno),
+                                    None,
+                                    &[],
+                                    None,
+                                );
+                                continue;
+                            }
+                        };
                         db_time_get_world_transform += t_get_world_transform.elapsed().as_millis();
 
                         let t_get_named_attmap2 = Instant::now();
@@ -1082,37 +1014,33 @@ async fn gen_cata_geos_inner(
                         .or(target_cata.ptset.as_ref())
                         .cloned()
                         .unwrap_or_default();
-                    // 使用惰性计算版本，确保 pe_transform 缓存不存在时也能计算变换
-                    let world_mat4_result = aios_core::get_world_mat4(ele_refno, false).await;
-                    let mut origin_trans = match world_mat4_result {
-                        Ok(Some(mat4)) => {
-                            let (scale, rotation, translation) = mat4.to_scale_rotation_translation();
-                            bevy_transform::prelude::Transform {
-                                translation: translation.as_vec3(),
-                                rotation: glam::Quat::from_xyzw(
-                                    rotation.x as f32,
-                                    rotation.y as f32,
-                                    rotation.z as f32,
-                                    rotation.w as f32,
-                                ),
-                                scale: scale.as_vec3(),
+                    // 统一走 foyer transform_cache（不要求全量命中）；miss 时按需计算并回写缓存。
+                    let mut origin_trans =
+                        match crate::fast_model::transform_cache::get_world_transform_cache_first(
+                            Some(db_option.as_ref()),
+                            ele_refno,
+                        )
+                        .await
+                        {
+                            Ok(Some(t)) => t,
+                            Ok(None) => {
+                                debug_model_debug!(
+                                    "[WARN] world_transform 为 None, ele_refno={}, cata_hash={}, 跳过该元件",
+                                    ele_refno,
+                                    cata_hash
+                                );
+                                continue;
                             }
-                        }
-                        Ok(None) => {
-                            debug_model_debug!(
-                                "[WARN] get_world_mat4 返回 None, ele_refno={}, cata_hash={}, 跳过该元件",
-                                ele_refno, cata_hash
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            debug_model_debug!(
-                                "[WARN] get_world_mat4 失败, ele_refno={}, cata_hash={}, error={}, 跳过该元件",
-                                ele_refno, cata_hash, e
-                            );
-                            continue;
-                        }
-                    };
+                            Err(e) => {
+                                debug_model_debug!(
+                                    "[WARN] 获取/计算 world_transform 失败, ele_refno={}, cata_hash={}, error={}, 跳过该元件",
+                                    ele_refno,
+                                    cata_hash,
+                                    e
+                                );
+                                continue;
+                            }
+                        };
 
                     let ele_att = aios_core::get_named_attmap(ele_refno)
                         .await
@@ -1291,47 +1219,43 @@ async fn gen_cata_geos_inner(
             db_time_get_branch_att += t_get_named_attmap.elapsed().as_millis();
 
             let t_get_world_transform = Instant::now();
-            let branch_transform = match aios_core::get_world_mat4(branch_refno, false).await {
-                Ok(Some(mat4)) => {
-                    let (scale, rotation, translation) = mat4.to_scale_rotation_translation();
-                    bevy_transform::prelude::Transform {
-                        translation: translation.as_vec3(),
-                        rotation: glam::Quat::from_xyzw(
-                            rotation.x as f32, rotation.y as f32,
-                            rotation.z as f32, rotation.w as f32,
-                        ),
-                        scale: scale.as_vec3(),
+            let branch_transform =
+                match crate::fast_model::transform_cache::get_world_transform_cache_first(
+                    Some(db_option.as_ref()),
+                    branch_refno,
+                )
+                .await
+                {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        record_refno_error(
+                            RefnoErrorKind::Missing,
+                            RefnoErrorStage::Query,
+                            "fast_model/cata_model.rs",
+                            "get_world_transform_cache_first",
+                            "BRAN/HANG world_transform 为空",
+                            Some(&branch_refno),
+                            None,
+                            &[],
+                            None,
+                        );
+                        continue;
                     }
-                }
-                Ok(None) => {
-                    record_refno_error(
-                        RefnoErrorKind::Missing,
-                        RefnoErrorStage::Query,
-                        "fast_model/cata_model.rs",
-                        "get_world_mat4",
-                        "BRAN/HANG world_mat4 为空",
-                        Some(&branch_refno),
-                        None,
-                        &[],
-                        None,
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    record_refno_error(
-                        RefnoErrorKind::NotFound,
-                        RefnoErrorStage::Query,
-                        "fast_model/cata_model.rs",
-                        "get_world_mat4",
-                        format!("BRAN/HANG get_world_mat4 失败: {}", e),
-                        Some(&branch_refno),
-                        None,
-                        &[],
-                        None,
-                    );
-                    continue;
-                }
-            };
+                    Err(e) => {
+                        record_refno_error(
+                            RefnoErrorKind::NotFound,
+                            RefnoErrorStage::Query,
+                            "fast_model/cata_model.rs",
+                            "get_world_transform_cache_first",
+                            format!("BRAN/HANG 获取/计算 world_transform 失败: {}", e),
+                            Some(&branch_refno),
+                            None,
+                            &[],
+                            None,
+                        );
+                        continue;
+                    }
+                };
             db_time_get_branch_transform += t_get_world_transform.elapsed().as_millis();
 
             let Some(hpt) = branch_att.get_vec3("HPOS") else {
@@ -1492,22 +1416,14 @@ async fn gen_cata_geos_inner(
                 let mut futures = FuturesUnordered::new();
                 for &refno in &child_refnos {
                     futures.push(async move {
-                        let trans = aios_core::get_world_mat4(refno, false)
-                            .await
-                            .ok()
-                            .flatten()
-                            .map(|mat4| {
-                                let (scale, rotation, translation) = mat4.to_scale_rotation_translation();
-                                bevy_transform::prelude::Transform {
-                                    translation: translation.as_vec3(),
-                                    rotation: glam::Quat::from_xyzw(
-                                        rotation.x as f32, rotation.y as f32,
-                                        rotation.z as f32, rotation.w as f32,
-                                    ),
-                                    scale: scale.as_vec3(),
-                                }
-                            })
-                            .unwrap_or_default();
+                        let trans = crate::fast_model::transform_cache::get_world_transform_cache_first(
+                            None,
+                            refno,
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
                         (refno, trans)
                     });
                 }

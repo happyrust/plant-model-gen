@@ -1,0 +1,35 @@
+# Lsky-Pro 图床 Docker 部署配置
+#
+# 使用方法:
+# 1. 将此文件放到服务器上
+# 2. 运行: docker-compose up -d
+# 3. 访问: http://your-server:8089
+# 4. 完成初始化配置
+# 5. 在后台获取 API Token
+
+version: '3.8'
+
+services:
+  lsky-pro:
+    image: halcyonazure/lsky-pro-docker:latest
+    container_name: lsky-pro
+    restart: unless-stopped
+    ports:
+      - "8089:8089"
+    volumes:
+      - ./data:/var/www/html/storage
+    environment:
+      - TZ=Asia/Shanghai
+
+  # 可选: 使用 MySQL 替代 SQLite (生产环境推荐)
+  # mysql:
+  #   image: mysql:8.0
+  #   container_name: lsky-mysql
+  #   restart: unless-stopped
+  #   environment:
+  #     MYSQL_ROOT_PASSWORD: your_root_password
+  #     MYSQL_DATABASE: lsky
+  #     MYSQL_USER: lsky
+  #     MYSQL_PASSWORD: your_password
+  #   volumes:
+  #     - ./mysql:/var/lib/mysql

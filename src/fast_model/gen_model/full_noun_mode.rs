@@ -565,10 +565,17 @@ async fn process_bran_hang_core_logic(
     }
     println!("📍 优先处理 BRAN/HANG 及其依赖 (count={})...", bran_roots.len());
 
+    #[cfg(feature = "profile")]
+    let _bran_span = tracing::info_span!("bran_hang_core_logic", roots = bran_roots.len()).entered();
+
     // 1. 查询子元素并记录已生成的 refno
     let branch_refnos_map: DashMap<RefnoEnum, Vec<SPdmsElement>> = DashMap::new();
+    let mut total_children: usize = 0;
+    #[cfg(feature = "profile")]
+    let _children_span = tracing::info_span!("bran_collect_children_from_tree").entered();
     for &refno in bran_roots {
         if let Ok(children) = TreeIndexManager::collect_children_elements_from_tree(refno).await {
+            total_children += children.len();
             for child in &children {
                 bran_generated_refnos.insert(child.refno);
             }
@@ -577,6 +584,8 @@ async fn process_bran_hang_core_logic(
             }
         }
     }
+    #[cfg(feature = "profile")]
+    tracing::info!(total_children, "bran_collect_children_from_tree done");
 
     // 2. 查询 BRAN 下子元件（管件）的元件库分组
     // 注意：应该查询子元件（TEE、ELBO等）的 cata_hash，而不是 BRAN 自身
@@ -584,6 +593,9 @@ async fn process_bran_hang_core_logic(
         .iter()
         .flat_map(|entry| entry.value().iter().map(|c| c.refno).collect::<Vec<_>>())
         .collect();
+    #[cfg(feature = "profile")]
+    let _cata_map_span =
+        tracing::info_span!("bran_build_cata_hash_map", child_cnt = child_refnos.len()).entered();
     let target_bran_reuse_cata_map = if child_refnos.is_empty() {
         DashMap::new()
     } else {
@@ -593,6 +605,8 @@ async fn process_bran_hang_core_logic(
     };
 
     // 3. 生成 CATE 几何
+    #[cfg(feature = "profile")]
+    let _cata_span = tracing::info_span!("bran_gen_cata_instances").entered();
     let cate_outcome = match cata_model::gen_cata_instances(
         db_option.clone(),
         Arc::new(target_bran_reuse_cata_map),
@@ -612,6 +626,12 @@ async fn process_bran_hang_core_logic(
 
     // 4. 保存 tubi_info
     if let Some(ref outcome) = cate_outcome {
+        #[cfg(feature = "profile")]
+        let _tubi_span = tracing::info_span!(
+            "bran_save_tubi_info_batch",
+            tubi_cnt = outcome.tubi_info_map.len()
+        )
+        .entered();
         let _ = pdms_inst::save_tubi_info_batch(&outcome.tubi_info_map).await;
     }
 
@@ -619,6 +639,8 @@ async fn process_bran_hang_core_logic(
     let local_al_map = cate_outcome
         .map(|o| o.local_al_map)
         .unwrap_or_else(|| Arc::new(DashMap::new()));
+    #[cfg(feature = "profile")]
+    let _tubi_gen_span = tracing::info_span!("bran_gen_branch_tubi").entered();
     let _ = cata_model::gen_branch_tubi(
         db_option.clone(),
         Arc::new(branch_refnos_map),
@@ -759,6 +781,8 @@ fn get_entry_nouns(config: &FullNounConfig) -> Vec<String> {
 }
 
 async fn query_noun_refnos(noun: &str, dbnums: &[u32], limit: Option<usize>) -> Result<Vec<RefnoEnum>> {
+    #[cfg(feature = "profile")]
+    let _span = tracing::info_span!("query_noun_refnos", noun, dbnums = ?dbnums, limit = ?limit).entered();
     let tree_dbnums = resolve_tree_dbnums(dbnums)?;
     let manager = TreeIndexManager::with_default_dir(tree_dbnums);
     let mut refnos = manager.query_noun_refnos(noun, limit);

@@ -234,31 +234,33 @@ async fn get_children(
         // 层级查询统一走 indextree（TreeIndex）；name 可从 SurrealDB（输入数据源）读取。
         use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 
-        let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(parent_refno).await else {
-            Vec::new()
-        };
-        let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-        let child_refnos = manager.query_children(parent_refno);
+        match TreeIndexManager::resolve_dbnum_for_refno(parent_refno).await {
+            Ok(dbnum) => {
+                let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+                let child_refnos = manager.query_children(parent_refno);
 
-        let mut out: Vec<TreeNodeDto> = Vec::with_capacity(child_refnos.len());
-        for r in child_refnos {
-            let noun = manager.get_noun(r).unwrap_or_default();
-            let name = crate::fast_model::query_provider::get_pe(r)
-                .await
-                .ok()
-                .flatten()
-                .map(|pe| pe.name)
-                .unwrap_or_default();
-            let children_count = manager.query_children(r).len() as i32;
-            out.push(TreeNodeDto {
-                refno: r,
-                name,
-                noun,
-                owner: Some(parent_refno),
-                children_count: Some(children_count),
-            });
+                let mut out: Vec<TreeNodeDto> = Vec::with_capacity(child_refnos.len());
+                for r in child_refnos {
+                    let noun = manager.get_noun(r).unwrap_or_default();
+                    let name = crate::fast_model::query_provider::get_pe(r)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|pe| pe.name)
+                        .unwrap_or_default();
+                    let children_count = manager.query_children(r).len() as i32;
+                    out.push(TreeNodeDto {
+                        refno: r,
+                        name,
+                        noun,
+                        owner: Some(parent_refno),
+                        children_count: Some(children_count),
+                    });
+                }
+                out
+            }
+            Err(_) => Vec::new(),
         }
-        out
     };
 
     let truncated = (children.len() as i32) > limit;

@@ -27,18 +27,20 @@ impl PrimitiveBuilder {
         let pe = self.data_source.query_pe(refno)?
             .ok_or_else(|| anyhow!("PE not found: {}", refno))?;
         
-        // 2. 获取 world_transform（使用 aios_core 提供的方法）
-        let world_transform = match aios_core::get_world_transform(refno).await {
-            Ok(Some(trans)) => trans,
-            Ok(None) => {
-                // 没有 world_transform，跳过
-                return Ok(None);
-            }
-            Err(e) => {
-                eprintln!("⚠️  Failed to get world_transform for {}: {}", refno, e);
-                return Ok(None);
-            }
-        };
+        // 2. 获取 world_transform（cache-first：优先从 foyer transform_cache 读取，miss 才按需计算并回写）
+        let world_transform =
+            match crate::fast_model::transform_cache::get_world_transform_cache_first(None, refno).await
+            {
+                Ok(Some(trans)) => trans,
+                Ok(None) => {
+                    // 没有 world_transform，跳过
+                    return Ok(None);
+                }
+                Err(e) => {
+                    eprintln!("⚠️  Failed to get world_transform for {}: {}", refno, e);
+                    return Ok(None);
+                }
+            };
         
         // 3. 获取属性数据
         let attr_map = if let Some(attr) = self.data_source.query_attr(refno, &pe.noun)? {

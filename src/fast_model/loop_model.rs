@@ -252,13 +252,19 @@ pub async fn gen_loop_geos(
                 {
                     continue;
                 }
-                let tr: Transform = item_trans;
-                let unit_flag = match &geo_param {
-                    PdmsGeoParam::PrimSCylinder(s) => s.unit_flag,
-                    // PrimLoft(SweepSolid) 仅在“单段直线且无倾斜”时可安全 unit 化复用
-                    PdmsGeoParam::PrimLoft(s) => s.is_reuse_unit(),
-                    _ => false,
-                };
+                let mut tr: Transform = item_trans;
+                let unit_flag = geo_param.is_reuse_unit();
+                // unit_flag=true 时，落库/入缓存的 geo_param 必须是"单位参数"，
+                // 否则同一 geo_hash 复用会被某个实例的绝对尺寸污染，且在保留 scale 时会重复缩放。
+                if unit_flag {
+                    geo_param = geo_param.to_unit_param();
+                }
+                // 统一处理 transform.scale 清零逻辑
+                crate::fast_model::reuse_unit::normalize_transform_scale(
+                    &mut tr,
+                    unit_flag,
+                    geo_hash,
+                );
                 //需要判断多个PLOO、LOOP的情况，第二个开始都是负实体
                 let geo_type = if target_att.is_neg() {
                     GeoBasicType::Neg
@@ -270,13 +276,12 @@ pub async fn gen_loop_geos(
                     refno: target_refno,
                     pts: Default::default(),
                     aabb: None,
-                    transform: tr,
+                    geo_transform: tr,
                     visible,
                     is_tubi: false,
                     geo_param: geo_param.clone(),
                     geo_type,
                     cata_neg_refnos: Default::default(),
-                    unit_flag,
                 };
                 geos_info.is_solid = geom_inst.geo_type == GeoBasicType::Pos;
                 let inst_key = geos_info.get_inst_key();

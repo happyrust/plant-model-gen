@@ -34,6 +34,42 @@
 
 use anyhow::Context;
 use aios_core::{GeomInstQuery, RefnoEnum, SUL_DB, SurrealQueryExt};
+use surrealdb::types::SurrealValue;
+use serde::{Deserialize, Serialize};
+use aios_core::prim_geo::basic::TUBI_GEO_HASH;
+use aios_core::shape::pdms_shape::RsVec3;
+use aios_core::rs_surreal::geometry_query::PlantTransform;
+use aios_core::types::PlantAabb;
+use aios_core::ModelHashInst;
+
+#[derive(Serialize, Deserialize, Debug, SurrealValue)]
+struct TubiQueryResult {
+    pub refno: RefnoEnum,
+    pub owner: RefnoEnum,
+    #[serde(default)]
+    pub world_trans: Option<PlantTransform>,
+    #[serde(default)]
+    pub world_aabb: Option<PlantAabb>,
+    #[serde(default)]
+    pub start_pt: Option<RsVec3>,
+    #[serde(default)]
+    pub end_pt: Option<RsVec3>,
+    #[serde(default)]
+    pub geo_hash: Option<String>,
+    #[serde(default)]
+    pub index: Option<i64>,
+}
+
+fn normalize_inst_geo_hash(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("inst_geo:`") {
+        return rest.trim_end_matches('`').to_string();
+    }
+    if let Some(rest) = trimmed.strip_prefix("inst_geo:") {
+        return rest.trim_matches('`').to_string();
+    }
+    trimmed.to_string()
+}
 
 /// 查询几何实例信息（带 batch）
 ///
@@ -70,7 +106,8 @@ pub async fn query_insts_with_batch(
                     refno.owner ?? refno as owner,
                     refno.world_trans as world_trans,
                     refno.world_aabb as world_aabb,
-                    [{{ "transform": refno.world_trans, "geo_hash": mesh_id, "is_tubi": false, "unit_flag": false }}] as insts
+                    [{{ "transform": refno.world_trans, "geo_hash": mesh_id, "is_tubi": false, "unit_flag": false }}] as insts,
+                    true as has_neg
                 FROM [{bool_keys}]
                 WHERE status = 'Success'
                   AND refno.world_trans != NONE
@@ -110,7 +147,8 @@ pub async fn query_insts_with_batch(
                          FROM out->geo_relate
                          WHERE visible && out.meshed
                            && (trans.d ?? NONE) != NONE
-                           && geo_type IN ['Pos', 'DesiPos', 'CatePos']) as insts
+                           && geo_type IN ['Pos', 'DesiPos', 'CatePos']) as insts,
+                        false as has_neg
                     FROM [{non_bool_keys}]
                     WHERE in.world_trans != NONE
                     "#,
@@ -142,7 +180,8 @@ pub async fn query_insts_with_batch(
                      FROM out->geo_relate
                      WHERE visible && out.meshed
                        && (trans.d ?? NONE) != NONE
-                       && geo_type IN ['Pos']) as insts
+                       && geo_type IN ['Pos']) as insts,
+                    false as has_neg
                 FROM [{inst_relate_keys}]
                 WHERE in.world_trans != NONE
                 "#,
@@ -154,6 +193,59 @@ pub async fn query_insts_with_batch(
                 .await
                 .with_context(|| format!("query_insts_with_batch SQL: {}", sql))?;
             results.append(&mut chunk_result);
+        }
+
+        // ========== TUBI 查询 ==========
+        // tubi_relate 使用复合 ID（pe, index）；这里为每个 refno 发起 range 查询并合并为 is_tubi 实例。
+        let mut tubi_sql_batch = String::new();
+        for r in chunk {
+            let pe_key = r.to_pe_key();
+            tubi_sql_batch.push_str(&format!(
+                r#"
+                SELECT
+                    id[0] as refno,
+                    in as owner,
+                    world_trans.d as world_trans,
+                    aabb.d as world_aabb,
+                    start_pt.d as start_pt,
+                    end_pt.d as end_pt,
+                    record::id(geo) as geo_hash,
+                    id[1] as index
+                FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
+                "#
+            ));
+        }
+
+        if !tubi_sql_batch.is_empty() {
+            let mut resp = SUL_DB
+                .query_response(&tubi_sql_batch)
+                .await
+                .with_context(|| format!("query_insts_with_batch tubi SQL: {}", tubi_sql_batch))?;
+
+            for (stmt_idx, _) in chunk.iter().enumerate() {
+                let raw_tubis: Vec<TubiQueryResult> = resp.take(stmt_idx)?;
+                for raw in raw_tubis {
+                    let geo_hash = raw
+                        .geo_hash
+                        .as_deref()
+                        .map(normalize_inst_geo_hash)
+                        .unwrap_or_else(|| TUBI_GEO_HASH.to_string());
+                    let wt = raw.world_trans.unwrap_or_default();
+                    results.push(GeomInstQuery {
+                        refno: raw.refno,
+                        owner: raw.owner,
+                        world_aabb: raw.world_aabb,
+                        world_trans: wt,
+                        insts: vec![ModelHashInst {
+                            geo_hash,
+                            geo_transform: PlantTransform::default(),
+                            is_tubi: true,
+                            unit_flag: false,
+                        }],
+                        has_neg: false,
+                    });
+                }
+            }
         }
     }
 

@@ -95,7 +95,7 @@ pub struct PrimitiveSegment {
 #[derive(Debug, Clone)]
 pub struct GeometryInstance {
     pub geo_hash: String,
-    pub local_transform: DMat4, // 几何体相对于 refno 的局部变换
+    pub geo_transform: DMat4, // 几何体相对于 refno 的局部变换
     pub index: usize,           // 几何体索引
     pub unit_flag: bool,        // 是否为单位 mesh
 }
@@ -117,8 +117,8 @@ pub struct ComponentRecord {
     /// 规格值（来自 ZONE 的 owner.spec_value）
     pub spec_value: Option<i64>,
     /// 是否使用布尔结果 mesh（booled_id 存在时为 true）
-    /// true: 几何体变换直接使用 world_transform（local_transform 已包含世界变换）
-    /// false: 使用 world_transform × local_transform
+    /// true: 几何体变换直接使用 world_transform（geo_transform 已包含世界变换）
+    /// false: 使用 world_transform × geo_transform
     pub has_neg: bool,
     /// 世界坐标系下的包围盒（可能为空）
     pub aabb: Option<aios_core::types::PlantAabb>,
@@ -285,6 +285,7 @@ pub async fn collect_export_data(
     mesh_dir: &Path,
     verbose: bool,
     _bran_roots: Option<&[RefnoEnum]>,
+    tubi_use_inst_world_only: bool,
 ) -> Result<ExportData> {
     if verbose {
         println!("   - 找到 {} 个几何体组", geom_insts.len());
@@ -294,9 +295,9 @@ pub async fn collect_export_data(
         println!("\n🔨 收集实例信息...");
     }
 
-    // cache-only：导出阶段不访问 SurrealDB；
-    // - tubing 从缓存几何实例里的 is_tubi 标记拆分
-    // - name 只用 refno（稳定可对齐）
+        // 导出阶段不访问 SurrealDB；
+        // - tubing 从几何实例里的 is_tubi 标记拆分
+        // - name 只用 refno（稳定可对齐）
     let mut components: Vec<ComponentRecord> = Vec::new();
     let mut tubings: Vec<TubiRecord> = Vec::new();
     let mut tubi_refno_counters: HashMap<RefnoEnum, usize> = HashMap::new();
@@ -309,8 +310,13 @@ pub async fn collect_export_data(
 
         for (geo_index, inst) in geom_inst.insts.iter().enumerate() {
             if inst.is_tubi {
-                let world_matrix = geom_inst.world_trans.to_matrix().as_dmat4()
-                    * inst.transform.to_matrix().as_dmat4();
+                let world_matrix = if tubi_use_inst_world_only {
+                    // SurrealDB-only：inst.geo_transform 已是 tubi 的世界矩阵，禁止与 refno world_trans 混用。
+                    inst.geo_transform.to_matrix().as_dmat4()
+                } else {
+                    geom_inst.world_trans.to_matrix().as_dmat4()
+                        * inst.geo_transform.to_matrix().as_dmat4()
+                };
 
                 let idx = tubi_refno_counters.entry(geom_inst.refno).or_insert(0);
                 let seg_index = *idx;
@@ -339,11 +345,11 @@ pub async fn collect_export_data(
 
             if verbose {
                 let max_scale = inst
-                    .transform
+                    .geo_transform
                     .scale
                     .x
-                    .max(inst.transform.scale.y)
-                    .max(inst.transform.scale.z);
+                    .max(inst.geo_transform.scale.y)
+                    .max(inst.geo_transform.scale.z);
                 if max_scale > 100000.0 {
                     println!("       ⚠️  警告:scale 异常大!");
                 }
@@ -351,7 +357,7 @@ pub async fn collect_export_data(
 
             geometries.push(GeometryInstance {
                 geo_hash: inst.geo_hash.clone(),
-                local_transform: inst.transform.to_matrix().as_dmat4(),
+                geo_transform: inst.geo_transform.to_matrix().as_dmat4(),
                 index: geo_index,
                 unit_flag: inst.unit_flag,
             });

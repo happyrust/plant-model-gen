@@ -84,6 +84,128 @@ fn compute_vertex_normals(mesh: &PlantMesh) -> Vec<Vec3> {
     normals
 }
 
+/// 直接从顶点与索引计算顶点法线（避免必须构造临时 PlantMesh）。
+///
+/// - 若整体法线趋势指向“几何中心”，则会整体翻转，尽量保证封闭体朝外。
+fn compute_vertex_normals_from(vertices: &[Vec3], indices: &[u32]) -> Vec<Vec3> {
+    let vertex_count = vertices.len();
+    if vertex_count == 0 {
+        return Vec::new();
+    }
+
+    let mut center = Vec3::ZERO;
+    for &v in vertices {
+        center += v;
+    }
+    center /= vertex_count as f32;
+
+    let mut normals = vec![Vec3::ZERO; vertex_count];
+    let mut dot_sum = 0.0f32;
+    let mut dot_count = 0u32;
+
+    for tri in indices.chunks(3) {
+        if tri.len() < 3 {
+            continue;
+        }
+        let a_idx = tri[0] as usize;
+        let b_idx = tri[1] as usize;
+        let c_idx = tri[2] as usize;
+        if a_idx >= vertex_count || b_idx >= vertex_count || c_idx >= vertex_count {
+            continue;
+        }
+
+        let a = vertices[a_idx];
+        let b = vertices[b_idx];
+        let c = vertices[c_idx];
+        let normal = (b - a).cross(c - a);
+        if normal.length_squared() > f32::EPSILON {
+            normals[a_idx] += normal;
+            normals[b_idx] += normal;
+            normals[c_idx] += normal;
+
+            let triangle_center = (a + b + c) / 3.0;
+            let to_center = triangle_center - center;
+            dot_sum += normal.dot(to_center);
+            dot_count += 1;
+        }
+    }
+
+    // dot_sum < 0：大多数面法线朝“内”，整体翻转
+    if dot_count > 0 && dot_sum < 0.0 {
+        for normal in normals.iter_mut() {
+            *normal = -*normal;
+        }
+    }
+
+    for normal in normals.iter_mut() {
+        if normal.length_squared() > f32::EPSILON {
+            *normal = normal.normalize();
+        } else {
+            *normal = Vec3::ZERO;
+        }
+    }
+
+    normals
+}
+
+/// 近似有符号体积*6（闭合体：负值通常意味着“绕序整体翻面”）。
+fn approx_signed_volume6(vertices: &[Vec3], indices: &[u32]) -> f64 {
+    let mut vol6 = 0.0f64;
+    for tri in indices.chunks(3) {
+        if tri.len() < 3 {
+            continue;
+        }
+        let i0 = tri[0] as usize;
+        let i1 = tri[1] as usize;
+        let i2 = tri[2] as usize;
+        if i0 >= vertices.len() || i1 >= vertices.len() || i2 >= vertices.len() {
+            continue;
+        }
+        let v0 = vertices[i0];
+        let v1 = vertices[i1];
+        let v2 = vertices[i2];
+        vol6 += (v0.dot(v1.cross(v2))) as f64;
+    }
+    vol6
+}
+
+/// 若检测到“整体翻面”的闭合体，则翻转三角形绕序（swap i1/i2）。
+///
+/// 返回：是否发生了翻面修复。
+fn maybe_fix_winding_outward(vertices: &[Vec3], indices: &mut [u32]) -> bool {
+    if vertices.is_empty() || indices.len() < 3 {
+        return false;
+    }
+
+    // 用 AABB 尺寸估一个“相对阈值”，避免对非闭合/近零体积网格误判。
+    let mut min = vertices[0];
+    let mut max = vertices[0];
+    for v in &vertices[1..] {
+        min.x = min.x.min(v.x);
+        min.y = min.y.min(v.y);
+        min.z = min.z.min(v.z);
+        max.x = max.x.max(v.x);
+        max.y = max.y.max(v.y);
+        max.z = max.z.max(v.z);
+    }
+    let ext = max - min;
+    let ext_mag = (ext.x as f64).hypot(ext.y as f64).hypot(ext.z as f64).max(1.0);
+    let vol_threshold = 1e-9 * ext_mag * ext_mag * ext_mag; // ~1e-9 * L^3
+
+    let vol6 = approx_signed_volume6(vertices, indices);
+    let vol = vol6 / 6.0;
+    if vol < 0.0 && vol.abs() > vol_threshold {
+        for tri in indices.chunks_mut(3) {
+            if tri.len() == 3 {
+                tri.swap(1, 2);
+            }
+        }
+        return true;
+    }
+
+    false
+}
+
 async fn filter_refnos_with_inst_relate_aabb(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
     if refnos.is_empty() {
         return Vec::new();
@@ -173,7 +295,8 @@ pub async fn export_glb_for_refnos(
             .await
             .context("查询 inst_relate 数据失败")?;
 
-        let export_data = collect_export_data(geom_insts, refnos, mesh_dir, true, None).await?;
+        let export_data =
+            collect_export_data(geom_insts, refnos, mesh_dir, true, None, true).await?;
         let total_instances: usize = export_data.total_instances;
         println!("   - 总几何体实例数: {}", total_instances);
 
@@ -217,7 +340,8 @@ pub async fn export_glb_for_refnos(
         .await
         .context("查询 inst_relate 数据失败")?;
 
-    let export_data = collect_export_data(geom_insts, &query_refnos, mesh_dir, true, None).await?;
+    let export_data =
+        collect_export_data(geom_insts, &query_refnos, mesh_dir, true, None, true).await?;
     if export_data.total_instances == 0 {
         println!("⚠️  未找到任何几何体数据");
         return Ok(());
@@ -532,9 +656,9 @@ fn export_mesh_to_glb(
             };
 
             let combined_transform = if component.has_neg {
-                geometry.local_transform
+                geometry.geo_transform
             } else {
-                component.world_transform * geometry.local_transform
+                component.world_transform * geometry.geo_transform
             };
             let matrix_array = create_matrix_array(&combined_transform);
 
@@ -835,6 +959,7 @@ impl ModelExporter for GlbExporter {
             &mesh_dir,
             config.common.verbose,
             None,
+            config.common.allow_surrealdb,
         )
         .await?;
 
@@ -896,20 +1021,17 @@ impl ModelExporter for GlbExporter {
 
 /// 导出单个 PlantMesh 到 GLB 文件（用于 LOD 生成）
 pub fn export_single_mesh_to_glb(mesh: &PlantMesh, output_path: &Path) -> Result<()> {
-    // 转换 Vec3 为 f32 数组
+    // 1) positions
     let positions: Vec<f32> = mesh.vertices.iter().flat_map(|v| [v.x, v.y, v.z]).collect();
 
-    let normals_source: Cow<[Vec3]> = if mesh.normals.len() == mesh.vertices.len()
-        && !mesh.normals.is_empty()
-    {
-        Cow::Borrowed(&mesh.normals)
-    } else {
-        Cow::Owned(compute_vertex_normals(mesh))
-    };
-    let normals: Vec<f32> = normals_source
-        .iter()
-        .flat_map(|n| [n.x, n.y, n.z])
-        .collect();
+    // 2) indices：对闭合体做一次“绕序外向”修正，避免出现 inside-out 导致的 Manifold 转换失败。
+    let mut indices = mesh.indices.clone();
+    let _flipped = maybe_fix_winding_outward(&mesh.vertices, &mut indices);
+
+    // 3) normals：基于（可能已翻面）的 indices 重新计算，确保与绕序一致。
+    let normals_source: Cow<[Vec3]> =
+        Cow::Owned(compute_vertex_normals_from(&mesh.vertices, &indices));
+    let normals: Vec<f32> = normals_source.iter().flat_map(|n| [n.x, n.y, n.z]).collect();
 
     // 构建 buffer 数据
     let mut buffer_data = Vec::new();
@@ -930,7 +1052,7 @@ pub fn export_single_mesh_to_glb(mesh: &PlantMesh, output_path: &Path) -> Result
     };
 
     // Indices buffer
-    let indices_bytes: Vec<u8> = mesh.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+    let indices_bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
     let indices_offset = buffer_data.len();
     buffer_data.extend_from_slice(&indices_bytes);
 
@@ -995,7 +1117,7 @@ pub fn export_single_mesh_to_glb(mesh: &PlantMesh, output_path: &Path) -> Result
                 "bufferView": 1,
                 "byteOffset": 0,
                 "componentType": 5125,
-                "count": mesh.indices.len(),
+                "count": indices.len(),
                 "type": "SCALAR"
             }
         ]

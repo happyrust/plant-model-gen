@@ -221,7 +221,7 @@ impl XktConverter {
                 let mesh_id = format!("mesh_{:05}", stats.meshes);
                 let mut mesh = XKTMesh::new(mesh_id.clone(), geometry_id);
 
-                let matrix = self.convert_matrix(&instance.transform);
+                let matrix = self.convert_matrix(&instance.geo_transform);
                 mesh.set_matrix(matrix);
 
                 let material_key = component.noun.clone();

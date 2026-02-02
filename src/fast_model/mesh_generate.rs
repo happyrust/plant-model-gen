@@ -524,7 +524,7 @@ pub async fn run_mesh_worker_from_cache_manager(
                 for geos_data in batch.inst_geos_map.values() {
                     for inst in &geos_data.insts {
                         unique_geo.entry(inst.geo_hash).or_insert_with(|| {
-                            (inst.geo_param.clone(), inst.unit_flag)
+                            (inst.geo_param.clone(), inst.geo_param.is_reuse_unit())
                         });
                     }
                 }
@@ -560,11 +560,11 @@ pub async fn run_mesh_worker_from_cache_manager(
         }
 
         // 标准单位几何体（1/2/3）的 geo_hash 在全库范围内复用：
-        // - 若在 cache-only mesh_worker 中按 geo_param 生成并写盘，会导致“同一 geo_hash 的 GLB 被某一个实例的尺寸覆盖”，
+        // - 若在 cache-only mesh_worker 中按 geo_param 生成并写盘，会导致"同一 geo_hash 的 GLB 被某一个实例的尺寸覆盖"，
         //   进而导出/查看时出现 BOX/Sphere/Cylinder 尺寸严重不匹配。
         // - 导出侧（export_common::GltfMeshCache）已对 1/2/3 强制使用内置 unit_*_mesh，
         //   因此这里直接跳过写盘；如启用 FORCE_REPLACE_MESH，则顺便清理旧文件以避免误读。
-        if matches!(geo_hash, 1 | 2 | 3) {
+        if crate::fast_model::reuse_unit::is_builtin_unit_geo_hash(geo_hash) {
             if force_replace {
                 let mesh_id = geo_hash.to_string();
                 let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
@@ -592,7 +592,14 @@ pub async fn run_mesh_worker_from_cache_manager(
         let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
         let lod_settings = profile.csg_settings;
 
-        match generate_csg_mesh(&geo_param, &lod_settings, non_scalable_geo, false, None) {
+        // unit_flag=true：按“单位参数”生成可复用 mesh；避免被某个实例的绝对尺寸污染。
+        let geo_param_for_mesh = if unit_flag {
+            geo_param.to_unit_param()
+        } else {
+            geo_param
+        };
+
+        match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
             Some(csg_mesh) => {
                 let mesh_base_path = lod_dir.join(&mesh_filename);
                 let glb_path = mesh_base_path.with_extension("glb");
@@ -1122,7 +1129,14 @@ pub async fn gen_inst_meshes_by_geo_ids(
 
         let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
 
-        match generate_csg_mesh(&g.param, &lod_settings, non_scalable_geo, false, None) {
+        // unit_flag=true：按"单位参数"生成可复用 mesh；兼容历史数据（DB 里 param 仍是绝对参数）的情况。
+        let geo_param_for_mesh = if g.param.is_reuse_unit() {
+            g.param.to_unit_param()
+        } else {
+            g.param.clone()
+        };
+
+        match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
             Some(csg_mesh) => {
                 if let Err(e) = handle_csg_mesh(
                     &lod_dir,

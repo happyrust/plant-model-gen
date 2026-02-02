@@ -214,9 +214,9 @@ pub async fn save_instance_data_optimize(
 
     for inst_geo_data in inst_mgr.inst_geos_map.values() {
         for inst in &inst_geo_data.insts {
-            if inst.transform.translation.is_nan()
-                || inst.transform.rotation.is_nan()
-                || inst.transform.scale.is_nan()
+            if inst.geo_transform.translation.is_nan()
+                || inst.geo_transform.rotation.is_nan()
+                || inst.geo_transform.scale.is_nan()
             {
                 debug_model_debug!(
                     "[WARN] skip inst geo due to NaN transform: refno={:?}, geo_hash={}",
@@ -226,9 +226,9 @@ pub async fn save_instance_data_optimize(
                 continue;
             }
 
-            let transform_hash = gen_bevy_transform_hash(&inst.transform);
+            let transform_hash = gen_bevy_transform_hash(&inst.geo_transform);
             if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
-                entry.insert(serde_json::to_string(&inst.transform)?);
+                entry.insert(serde_json::to_string(&inst.geo_transform)?);
             }
 
             let key_pts = inst.geo_param.key_points();

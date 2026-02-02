@@ -76,7 +76,7 @@ impl ParquetGlbExporter {
             for (idx, inst_geo) in geo_data.insts.iter().enumerate() {
                 let geo_instance = GeometryInstance {
                     geo_hash: inst_geo.geo_hash.to_string(),
-                    local_transform: inst_geo.transform.to_matrix().as_dmat4(),
+                    geo_transform: inst_geo.geo_transform.to_matrix().as_dmat4(),
                     index: idx,
                     unit_flag: inst_geo.unit_flag,
                 };

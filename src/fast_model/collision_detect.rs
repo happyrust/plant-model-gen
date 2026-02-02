@@ -251,7 +251,7 @@ impl CollisionDetector {
         let model_inst = &inst.insts[0];
         let geo_hash = &model_inst.geo_hash;
         let world_trans = inst.world_trans;
-        let inst_trans = model_inst.transform;
+        let inst_trans = model_inst.geo_transform;
         let combined = world_trans * inst_trans;
 
         // 加载 TriMesh

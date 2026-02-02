@@ -326,28 +326,31 @@ pub async fn gen_prim_geos(
                     .convert_to_geo_param()
                     .unwrap_or(PdmsGeoParam::Unknown);
                 let geo_hash = csg_shape.hash_unit_mesh_params();
-                let unit_flag = match &geo_param {
-                    // 标准单位几何体（BOX/SPHE）在 aios_core 中使用固定 geo_hash（1/3），只能通过实例 transform 还原尺寸。
-                    PdmsGeoParam::PrimBox(_) | PdmsGeoParam::PrimSphere(_) => true,
-                    PdmsGeoParam::PrimSCylinder(s) => s.unit_flag,
-                    // PrimLoft(SweepSolid) 仅在“单段直线且无倾斜”时可安全 unit 化复用
-                    PdmsGeoParam::PrimLoft(s) => s.is_reuse_unit(),
-                    _ => false,
-                };
+                let unit_flag = csg_shape.is_reuse_unit();
 
-                // RTOR（矩形环面体）在 aios_core 的 CSG 形状里会同时携带“几何参数 + scale”，
-                // 但本仓库的 mesh 生成使用的是 geo_param（已包含实际尺寸）。
-                // 若不清零 scale，导出阶段会再次把 scale 乘进去，表现为尺寸被平方放大（例如 160mm -> 25600mm）。
-                if matches!(&geo_param, PdmsGeoParam::PrimRTorus(_)) && !unit_flag {
-                    transform.scale = Vec3::ONE;
+                // unit_flag=true 时，必须把 geo_param 写成"单位参数"，确保：
+                // - 同一 geo_hash 复用到的 mesh 顶点始终一致（不会被某个实例的绝对尺寸污染）
+                // - 后续布尔/导出在保留 transform.scale 的情况下不会重复缩放
+                if unit_flag {
+                    geo_param = csg_shape
+                        .gen_unit_shape()
+                        .convert_to_geo_param()
+                        .unwrap_or(geo_param);
                 }
+
+                // 统一处理 transform.scale 清零逻辑
+                crate::fast_model::reuse_unit::normalize_transform_scale(
+                    &mut transform,
+                    unit_flag,
+                    geo_hash,
+                );
                 // dbg!(geo_hash);
                 let inst_geo = EleInstGeo {
                     geo_hash,
                     refno,
                     pts: Default::default(),
                     aabb: None,
-                    transform,
+                    geo_transform: transform,
                     geo_param,
                     visible,
                     is_tubi: false,
@@ -357,7 +360,6 @@ pub async fn gen_prim_geos(
                         GeoBasicType::Pos
                     },
                     cata_neg_refnos: vec![],
-                    unit_flag,
                 };
                 geo_insts.push(inst_geo);
                 if geo_insts.len() > 0 {

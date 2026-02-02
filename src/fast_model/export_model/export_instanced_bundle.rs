@@ -131,7 +131,7 @@ impl InstancedBundleExporter {
             for geom_inst in &component.geometries {
                 let instance = InstanceInfo {
                     refno: component.refno.to_string(),
-                    matrix: geom_inst.local_transform.to_cols_array(),
+                    matrix: geom_inst.geo_transform.to_cols_array(),
                     color: None, // 可以后续添加颜色映射
                     name: component.name.clone(),
                 };
@@ -537,7 +537,9 @@ pub async fn export_instanced_bundle_for_refnos(
     } else {
         Some(&bran_roots)
     };
-    let export_data = collect_export_data(geom_insts, &all_refnos, mesh_dir, verbose, bran_roots_ref).await?;
+    let export_data =
+        collect_export_data(geom_insts, &all_refnos, mesh_dir, verbose, bran_roots_ref, true)
+            .await?;
     
     println!("🔍 [DEBUG] collect_export_data 完成: total_instances={}, components={}, tubings={}", 
         export_data.total_instances, export_data.components.len(), export_data.tubings.len());

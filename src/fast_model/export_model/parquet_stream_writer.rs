@@ -191,7 +191,7 @@ impl ParquetStreamWriter {
                     });
                     
                     // 生成 transform row
-                    let transform_matrix = geo.transform.to_matrix();
+                    let transform_matrix = geo.geo_transform.to_matrix();
                     let t_cols = dmat4_to_f32_array(&transform_matrix.as_dmat4());
                     transform_rows.push(TransformRow { trans_id, t_cols });
                 }
@@ -256,7 +256,7 @@ impl ParquetStreamWriter {
                         geo_trans_id: trans_id.clone(),
                     });
 
-                    let transform_matrix = geo.transform.to_matrix();
+                    let transform_matrix = geo.geo_transform.to_matrix();
                     let t_cols = dmat4_to_f32_array(&transform_matrix.as_dmat4());
                     transform_rows.push(TransformRow { trans_id, t_cols });
                 }

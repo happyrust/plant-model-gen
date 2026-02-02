@@ -934,9 +934,9 @@ pub async fn run_boolean_worker_from_cache_manager(
     }
 
     fn local_mat_for_inst(inst: &aios_core::geometry::EleInstGeo) -> DMat4 {
-        // inst.transform 是 carrier 局部坐标；unit mesh 需按约定缩放修正。
-        let mut tf = inst.transform;
-        if inst.unit_flag {
+        // inst.geo_transform 是 carrier 局部坐标；unit mesh 需按约定缩放修正。
+        let mut tf = inst.geo_transform;
+        if inst.geo_param.is_reuse_unit() {
             tf.scale /= UNIT_MESH_SCALE;
         }
         tf.to_matrix().as_dmat4()
@@ -1027,8 +1027,21 @@ pub async fn run_boolean_worker_from_cache_manager(
 
     for dbnum in dbnums {
         let batch_ids = cache_manager.list_batches(dbnum);
+        // 重要：instance_cache 是“多 batch 追加”的结构；不同 batch 里可能包含同一 refno/inst_key 的旧数据。
+        // 若这里直接把 insts/relations 逐批 `extend` 合并，会把“旧 + 新”同时参与布尔，
+        // 典型表现：某些 primitive（如 SNOU）在旧版本里 transform 带 scale，后续修复后变为 scale=1，
+        // 但 bool_worker 仍会同时加载两份，从而把结果按 scale 误放大一倍甚至多倍。
+        //
+        // 因此这里按 created_at 从新到旧扫描：对每个 key 只取“最新命中”的那一份，旧的直接跳过。
+        let mut batches = Vec::new();
         for batch_id in batch_ids {
-            if let Some(mut batch) = cache_manager.get(dbnum, &batch_id).await {
+            if let Some(batch) = cache_manager.get(dbnum, &batch_id).await {
+                batches.push((batch.created_at, batch_id, batch));
+            }
+        }
+        batches.sort_by_key(|(ts, _, _)| *ts);
+
+        for (_ts, batch_id, mut batch) in batches.into_iter().rev() {
                 // 先扫描 inst_info_map，补齐 CATE 布尔 targets 的 batch 归属。
                 for (k, info) in batch.inst_info_map.iter() {
                     if info.has_cata_neg {
@@ -1052,29 +1065,17 @@ pub async fn run_boolean_worker_from_cache_manager(
                 }
 
                 for (k, v) in batch.inst_info_map.drain() {
-                    inst_info_map.insert(k, v);
+                    inst_info_map.entry(k).or_insert(v);
                 }
                 for (k, v) in batch.inst_geos_map.drain() {
-                    inst_geos_map
-                        .entry(k)
-                        .and_modify(|existing| {
-                            existing.insts.extend(v.insts.clone());
-                            if existing.aabb.is_none() {
-                                existing.aabb = v.aabb.clone();
-                            }
-                            if existing.type_name.is_empty() {
-                                existing.type_name = v.type_name.clone();
-                            }
-                        })
-                        .or_insert(v);
+                    inst_geos_map.entry(k).or_insert(v);
                 }
                 for (k, v) in batch.neg_relate_map.drain() {
-                    neg_relate_map.entry(k).or_default().extend(v);
+                    neg_relate_map.entry(k).or_insert(v);
                 }
                 for (k, v) in batch.ngmr_neg_relate_map.drain() {
-                    ngmr_relate_map.entry(k).or_default().extend(v);
+                    ngmr_relate_map.entry(k).or_insert(v);
                 }
-            }
         }
     }
 
@@ -1167,7 +1168,9 @@ pub async fn run_boolean_worker_from_cache_manager(
                         continue;
                     }
                     let mesh_id = inst.geo_hash.to_string();
-                    let neg_world_mat = carrier_world_mat * local_mat_for_inst(inst);
+
+                    let local_mat = local_mat_for_inst(inst);
+                    let neg_world_mat = carrier_world_mat * local_mat;
                     let relative_mat = inverse_pos_world * neg_world_mat;
                     match load_manifold(&mesh_id, relative_mat, true) {
                         Ok(m) => neg_manifolds.push(m),

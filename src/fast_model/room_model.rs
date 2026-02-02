@@ -925,8 +925,8 @@ async fn cal_room_refnos_with_options(
                         };
 
                         // 任意重叠判定：点在体内 OR 与边界相交。
-                        // 注意：inst.transform 可能包含缩放，不能用 Isometry 表达；
-                        // 这里直接使用 (world_trans * inst.transform).to_matrix() 把缩放烘进点/凸体。
+                        // 注意：inst.geo_transform 可能包含缩放，不能用 Isometry 表达；
+                        // 这里直接使用 (world_trans * inst.geo_transform).to_matrix() 把缩放烘进点/凸体。
                         let mut had_convex_error = false;
                         for inst in &geom.insts {
                             let convex_rt = match crate::fast_model::convex_decomp::load_or_build_convex_runtime(
@@ -942,7 +942,7 @@ async fn cal_room_refnos_with_options(
                                 }
                             };
 
-                            let comp_mat = (geom.world_trans * inst.transform).to_matrix();
+                            let comp_mat = (geom.world_trans * inst.geo_transform).to_matrix();
                             if crate::fast_model::convex_decomp::component_overlaps_room(
                                 panel_meshes.as_ref(),
                                 &panel_aabb,
@@ -1082,7 +1082,7 @@ async fn load_geometry_with_enhanced_cache(
         if let Some(cached_trimesh) = trimesh_cache.get(&cache_key) {
              // 这里的 cache 存储的是原始几何体的 TriMesh
              // 我们需要应用实例变换
-             let transformed_mesh = transform_tri_mesh(&cached_trimesh, (world_trans * inst.transform).to_matrix());
+             let transformed_mesh = transform_tri_mesh(&cached_trimesh, (world_trans * inst.geo_transform).to_matrix());
              CACHE_METRICS.record_trimesh_hit();
              return Ok(Arc::new(transformed_mesh));
         }
@@ -1091,7 +1091,7 @@ async fn load_geometry_with_enhanced_cache(
         if let Some(cached_mesh) = cache.get(&cache_key) {
             // 从缓存的 PlantMesh 构建 TriMesh
             if let Some(tri_mesh) = cached_mesh.get_tri_mesh_with_flag(
-                (world_trans * inst.transform).to_matrix(),
+                (world_trans * inst.geo_transform).to_matrix(),
                 TriMeshFlags::ORIENTED | TriMeshFlags::MERGE_DUPLICATE_VERTICES,
             ) {
                 CACHE_METRICS.record_plant_hit();
@@ -1119,7 +1119,7 @@ async fn load_geometry_with_enhanced_cache(
                          CACHE_METRICS.record_trimesh_miss();
 
                          // 应用变换返回
-                         let transformed_mesh = transform_tri_mesh(&trimesh_arc, (world_trans * inst.transform).to_matrix());
+                         let transformed_mesh = transform_tri_mesh(&trimesh_arc, (world_trans * inst.geo_transform).to_matrix());
                          return Ok(Arc::new(transformed_mesh));
                      }
                      Ok(Err(e)) => {

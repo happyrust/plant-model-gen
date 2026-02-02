@@ -318,7 +318,7 @@ impl DuckDBStreamWriter {
                 let geo_hash = &geo.geo_hash;
                 
                 // 序列化变换矩阵
-                let transform = geo.transform;
+                let transform = geo.geo_transform;
                 let transform_json = serde_json::json!({
                     "rotation": [transform.rotation.x, transform.rotation.y, transform.rotation.z, transform.rotation.w],
                     "scale": [transform.scale.x, transform.scale.y, transform.scale.z],

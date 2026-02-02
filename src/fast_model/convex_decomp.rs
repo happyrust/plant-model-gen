@@ -854,7 +854,7 @@ mod tests {
             Vec3::new(1.0, 1.0, 1.0),
         );
 
-        // inst.transform 可能包含非均匀缩放，这里验证 Mat4 路径能正确把采样点/凸体变换到世界坐标。
+        // inst.geo_transform 可能包含非均匀缩放，这里验证 Mat4 路径能正确把采样点/凸体变换到世界坐标。
         assert!(component_overlaps_room(
             &panel_meshes,
             &panel_aabb,

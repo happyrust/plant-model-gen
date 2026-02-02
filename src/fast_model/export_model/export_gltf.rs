@@ -83,7 +83,8 @@ pub async fn export_gltf_for_refnos(
             .await
             .context("查询 inst_relate 数据失败")?;
 
-        let export_data = collect_export_data(geom_insts, refnos, mesh_dir, true, None).await?;
+        let export_data =
+            collect_export_data(geom_insts, refnos, mesh_dir, true, None, true).await?;
 
         if export_data.total_instances == 0 {
             println!("⚠️  未找到任何几何体数据");
@@ -112,7 +113,8 @@ pub async fn export_gltf_for_refnos(
         .await
         .context("查询 inst_relate 数据失败")?;
 
-    let export_data = collect_export_data(geom_insts, &all_refnos, mesh_dir, true, None).await?;
+    let export_data =
+        collect_export_data(geom_insts, &all_refnos, mesh_dir, true, None, true).await?;
 
     if export_data.total_instances == 0 {
         println!("⚠️  未找到任何几何体数据");
@@ -436,7 +438,7 @@ fn export_mesh_to_gltf(
                 )
             };
 
-            let matrix_array = create_matrix_array(&geometry.local_transform);
+            let matrix_array = create_matrix_array(&geometry.geo_transform);
 
             let geo_node = json!({
                 "name": geo_node_name,
@@ -700,6 +702,7 @@ impl ModelExporter for GltfExporter {
             mesh_dir,
             config.common.verbose,
             None,
+            config.common.allow_surrealdb,
         )
         .await?;
 

@@ -492,6 +492,7 @@ pub async fn export_prepack_lod_for_refnos(
         &primary_mesh_dir,
         verbose,
         Some(&bran_roots),
+        true,
     )
     .await
     .context("收集导出数据失败")?;
@@ -1006,7 +1007,7 @@ fn build_instances_payload(
                         instances.push(json!({
                             "geo_hash": geom.geo_hash.clone(),
                             "geo_index": geo_index,
-                            "geo_transform": mat4_to_vec(&geom.local_transform, unit_converter, effective_unit_flag(&geom.geo_hash, geom.unit_flag)),
+                            "geo_transform": mat4_to_vec(&geom.geo_transform, unit_converter, effective_unit_flag(&geom.geo_hash, geom.unit_flag)),
                         }));
                     }
                 }
@@ -1137,7 +1138,7 @@ fn build_instances_payload(
                         instances.push(json!({
                             "geo_hash": geom.geo_hash.clone(),
                             "geo_index": geo_index,
-                            "geo_transform": mat4_to_vec(&geom.local_transform, unit_converter, effective_unit_flag(&geom.geo_hash, geom.unit_flag)),
+                            "geo_transform": mat4_to_vec(&geom.geo_transform, unit_converter, effective_unit_flag(&geom.geo_hash, geom.unit_flag)),
                         }));
                     }
                 }
@@ -1203,11 +1204,11 @@ fn build_instances_payload(
         for geom in &component.geometries {
             if let Some(&geo_index) = geo_index_map.get(&geom.geo_hash) {
                 component_instance_count += 1;
-                
+
                 instances.push(json!({
                     "geo_hash": geom.geo_hash.clone(),
                     "geo_index": geo_index,
-                    "geo_transform": mat4_to_vec(&geom.local_transform, unit_converter, effective_unit_flag(&geom.geo_hash, geom.unit_flag)),
+                    "geo_transform": mat4_to_vec(&geom.geo_transform, unit_converter, effective_unit_flag(&geom.geo_hash, geom.unit_flag)),
                 }));
             }
         }
@@ -3257,9 +3258,9 @@ pub async fn export_dbnum_instances_json_from_cache(
                 .map(|inst| {
                     let geo_trans_hash = insert_trans_hash(
                         &mut trans_table,
-                        &to_dmat4(&inst.transform),
+                        &to_dmat4(&inst.geo_transform),
                         &unit_converter,
-                        inst.unit_flag,
+                        inst.geo_param.is_reuse_unit(),
                     );
                     json!({
                         "geo_hash": inst.geo_hash.to_string(),
@@ -3379,9 +3380,9 @@ pub async fn export_dbnum_instances_json_from_cache(
             .map(|inst| {
                 let geo_trans_hash = insert_trans_hash(
                     &mut trans_table,
-                    &to_dmat4(&inst.transform),
+                    &to_dmat4(&inst.geo_transform),
                     &unit_converter,
-                    inst.unit_flag,
+                    inst.geo_param.is_reuse_unit(),
                 );
                 json!({
                     "geo_hash": inst.geo_hash.to_string(),

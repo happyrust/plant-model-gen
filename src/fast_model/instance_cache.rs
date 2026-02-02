@@ -7,6 +7,7 @@ use std::fs;
 
 use aios_core::geometry::{EleGeosInfo, EleInstGeosData, ShapeInstancesData};
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
+use aios_core::parsed_data::CateAxisParam;
 use aios_core::RefnoEnum;
 use foyer::{DirectFsDeviceOptionsBuilder, HybridCache, HybridCacheBuilder};
 use serde::{Deserialize, Serialize};
@@ -238,6 +239,83 @@ impl InstanceCacheManager {
         index.by_dbnum.keys().copied().collect()
     }
 
+    /// 批量获取指定 refno 列表的 ptset_map（ARRIVE/LEAVE 点）
+    /// 返回 HashMap<RefnoEnum, [CateAxisParam; 2]>，其中 [0]=ARRIVE(ptset[1]), [1]=LEAVE(ptset[2])
+    pub async fn get_ptset_maps_for_refnos(
+        &self,
+        dbnum: u32,
+        refnos: &[RefnoEnum],
+    ) -> HashMap<RefnoEnum, [CateAxisParam; 2]> {
+        let mut result = HashMap::new();
+        if refnos.is_empty() {
+            return result;
+        }
+
+        let want_set: HashSet<u64> = refnos.iter().map(|r| r.refno().0).collect();
+        let batch_ids = self.list_batches(dbnum);
+
+        // 倒序遍历，优先取最新 batch
+        for batch_id in batch_ids.iter().rev() {
+            let Some(batch) = self.get(dbnum, batch_id).await else {
+                continue;
+            };
+
+            for (k, info) in batch.inst_info_map.iter() {
+                let refno_u64 = k.refno().0;
+                if !want_set.contains(&refno_u64) {
+                    continue;
+                }
+                if result.contains_key(k) {
+                    continue; // 已找到，跳过
+                }
+
+                // ptset_map: [1]=ARRIVE, [2]=LEAVE
+                if let (Some(arrive), Some(leave)) = (info.ptset_map.get(&1), info.ptset_map.get(&2)) {
+                    result.insert(*k, [arrive.clone(), leave.clone()]);
+                }
+            }
+
+            // 如果已找到所有，提前退出
+            if result.len() >= refnos.len() {
+                break;
+            }
+        }
+
+        result
+    }
+
+    /// 获取单个 refno 的 ptset_map（ARRIVE/LEAVE 点）
+    /// 返回 Option<[CateAxisParam; 2]>，其中 [0]=ARRIVE(ptset[1]), [1]=LEAVE(ptset[2])
+    pub async fn get_ptset_for_refno(
+        &self,
+        dbnum: u32,
+        refno: RefnoEnum,
+    ) -> Option<[CateAxisParam; 2]> {
+        let batch_ids = self.list_batches(dbnum);
+        let want_u64 = refno.refno().0;
+
+        // 倒序遍历，优先取最新 batch
+        for batch_id in batch_ids.iter().rev() {
+            let Some(batch) = self.get(dbnum, batch_id).await else {
+                continue;
+            };
+
+            for (k, info) in batch.inst_info_map.iter() {
+                let k_u64 = k.refno().0;
+                if k_u64 != want_u64 {
+                    continue;
+                }
+
+                // ptset_map: [1]=ARRIVE, [2]=LEAVE
+                if let (Some(arrive), Some(leave)) = (info.ptset_map.get(&1), info.ptset_map.get(&2)) {
+                    return Some([arrive.clone(), leave.clone()]);
+                }
+            }
+        }
+
+        None
+    }
+
     pub fn collect_geo_params(batch: &CachedInstanceBatch) -> Vec<CachedGeoParam> {
         let mut seen = HashSet::new();
         let mut items = Vec::new();
@@ -248,7 +326,7 @@ impl InstanceCacheManager {
                     items.push(CachedGeoParam {
                         geo_hash: inst.geo_hash,
                         geo_param: inst.geo_param.clone(),
-                        unit_flag: inst.unit_flag,
+                        unit_flag: inst.geo_param.is_reuse_unit(),
                     });
                 }
             }

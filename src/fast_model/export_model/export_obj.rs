@@ -211,9 +211,9 @@ fn export_export_data_to_obj_grouped(
         let mut wrote_any = false;
         for inst in &comp.geometries {
             let combined_transform = if comp.has_neg {
-                inst.local_transform
+                inst.geo_transform
             } else {
-                comp.world_transform * inst.local_transform
+                comp.world_transform * inst.geo_transform
             };
 
             let (v_cnt, f_cnt) = write_mesh_instance(
@@ -290,16 +290,16 @@ fn merge_export_data_into_mesh(export_data: &ExportData, mesh_dir: &Path) -> Pla
     for component in &export_data.components {
         for instance in &component.geometries {
             // 根据 has_neg 决定变换方式：
-            // - has_neg=true（booled_id）: local_transform 已经包含世界变换(world_trans.d)，直接使用
-            // - has_neg=false（普通几何体）: 需要 world_transform × local_transform
+            // - has_neg=true（booled_id）: geo_transform 已经包含世界变换(world_trans.d)，直接使用
+            // - has_neg=false（普通几何体）: 需要 world_transform × geo_transform
             let combined_transform = if component.has_neg {
                 // booled_id: 查询时 transform 已经是 world_trans.d
-                instance.local_transform
+                instance.geo_transform
             } else {
                 // 普通几何体: inst_transform × geo_transform
-                component.world_transform * instance.local_transform
+                component.world_transform * instance.geo_transform
             };
-            
+
             merge_instance(&instance.geo_hash, &combined_transform);
         }
     }
@@ -376,9 +376,15 @@ pub async fn prepare_obj_export(
         .await?
     };
 
-    let export_data =
-        collect_export_data(geom_insts, &all_refnos, &effective_mesh_dir, config.verbose, None)
-            .await?;
+    let export_data = collect_export_data(
+        geom_insts,
+        &all_refnos,
+        &effective_mesh_dir,
+        config.verbose,
+        None,
+        config.allow_surrealdb,
+    )
+    .await?;
 
     if export_data.total_instances == 0 {
         if config.verbose {
@@ -482,9 +488,15 @@ async fn prepare_obj_export_data(
         .await?
     };
 
-    let export_data =
-        collect_export_data(geom_insts, &all_refnos, &effective_mesh_dir, config.verbose, None)
-            .await?;
+    let export_data = collect_export_data(
+        geom_insts,
+        &all_refnos,
+        &effective_mesh_dir,
+        config.verbose,
+        None,
+        config.allow_surrealdb,
+    )
+    .await?;
 
     stats.mesh_files_found = export_data.loaded_count;
     stats.mesh_files_missing = export_data.failed_count;

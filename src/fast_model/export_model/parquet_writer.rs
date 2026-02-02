@@ -250,7 +250,7 @@ impl ParquetManager {
                 let geo_trans_id = format!("{}_geo_{}", comp.refno, geo_index);
                 
                 // 存储局部变换（不再组合）
-                let geo_t_cols = dmat4_to_f32_array(&geo.local_transform);
+                let geo_t_cols = dmat4_to_f32_array(&geo.geo_transform);
 
                 instance.geo_items.push(GeoItem {
                     geo_hash: geo.geo_hash.clone(),

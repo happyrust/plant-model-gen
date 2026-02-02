@@ -3,7 +3,8 @@
 //! 本模块提供了统一的模型导出接口，支持多种格式（OBJ、XKT 等）。
 //! 通过实现 `ModelExporter` Trait，可以轻松扩展到其他导出格式。
 
-use aios_core::{GeomInstQuery, RefnoEnum, query_insts_with_batch};
+use aios_core::{GeomInstQuery, RefnoEnum};
+use crate::fast_model::inst_query::query_insts_with_batch;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -461,7 +462,7 @@ pub async fn query_geometry_instances_ext(
     }
 
     const DEFAULT_QUERY_BATCH: usize = 50;
-    let geom_insts = aios_core::query_insts_with_batch(refnos, enable_holes, Some(DEFAULT_QUERY_BATCH))
+    let geom_insts = query_insts_with_batch(refnos, enable_holes, Some(DEFAULT_QUERY_BATCH))
         .await
         .context("查询 inst_relate 数据失败")?;
 
@@ -630,6 +631,16 @@ pub async fn query_geometry_instances_ext_from_cache(
         let mut seen_meta: HashSet<RefU64> = HashSet::new();
         let mut seen_geos: HashSet<RefU64> = HashSet::new();
         let mut seen_tubi: HashSet<RefU64> = HashSet::new();
+        // 某些 dbnum 会出现“新 batch 只有 inst_info（world_transform）但没有 inst_geos”的情况。
+        // 若直接用最新 inst_info + 旧 inst_geos，会造成 world/local 不配套，典型表现为尺寸被平方放大。
+        // 因此：一旦某 refno 选择了某个 batch 的 inst_geos，则 meta(world_trans/aabb/has_neg/has_cata_neg)
+        // 必须优先对齐到同一 batch（若该 batch 有 inst_info）。
+        let mut meta_locked_by_geos: HashSet<RefU64> = HashSet::new();
+        // tubi 需要“每段自己的 world_transform(含长度 scale)”；它与同 refno 的 inst_info.world_transform
+        // 可能不同（例如 refno 同时包含弯头构件与直段 tubing），因此不能强行复用 acc.world_trans。
+        // 这里把 tubi 的 world_transform 作为“实例 transform”单独保存，导出侧用 identity world_trans 直接落地。
+        let mut tubi_world_insts: HashMap<RefU64, Vec<(RefnoEnum, PlantTransform, Option<PlantAabb>, String)>> =
+            HashMap::new();
 
         for batch_id in batch_ids.iter().rev() {
             let Some(batch) = cache.get(dbnum, batch_id).await else {
@@ -691,7 +702,7 @@ pub async fn query_geometry_instances_ext_from_cache(
             // - 导出/房间计算期需要把它们拼成一条“带 is_tubi=true 的几何实例”
             //
             // 注意：这里用 world_trans + local(identity) 表达 tubing 的世界变换，
-            // 以复用导出侧统一的 world_trans * local_transform 逻辑。
+            // 以复用导出侧统一的 world_trans * geo_transform 逻辑。
             {
                 use aios_core::prim_geo::basic::TUBI_GEO_HASH;
                 for (refno, info) in batch.inst_tubi_map.iter() {
@@ -702,6 +713,21 @@ pub async fn query_geometry_instances_ext_from_cache(
                     if !seen_tubi.insert(k) {
                         continue;
                     }
+
+                    // 记录该 tubi 段的独立 world_transform（通常包含沿轴向的长度 scale）。
+                    let owner = if info.owner_refno.is_valid() {
+                        info.owner_refno
+                    } else {
+                        *refno
+                    };
+                    let geo_hash = info
+                        .cata_hash
+                        .clone()
+                        .unwrap_or_else(|| TUBI_GEO_HASH.to_string());
+                    tubi_world_insts
+                        .entry(k)
+                        .or_default()
+                        .push((owner, PlantTransform::from(info.world_transform), info.aabb.map(Into::into), geo_hash));
 
                     let entry = acc_map.entry(k).or_insert_with(|| Acc {
                         owner: *refno,
@@ -719,85 +745,59 @@ pub async fn query_geometry_instances_ext_from_cache(
                     };
                     // tubing 的 EleGeosInfo 也带 world_transform/aabb，可作为 inst_info 缺失时的 fallback。
                     // 若已命中 inst_info 的 meta，则不在此处覆写，避免把 has_neg/has_cata_neg 等信息误清零。
-                    if !seen_meta.contains(&k) {
+                    if !meta_locked_by_geos.contains(&k) && !seen_meta.contains(&k) {
                         seen_meta.insert(k);
                         entry.world_trans = PlantTransform::from(info.world_transform);
                         entry.world_aabb = info.aabb.map(Into::into);
                     }
-
-                    // 避免跨 batch 重复追加同一 tubing 实例
-                    let already_has_tubi = entry.insts.iter().any(|x| x.is_tubi);
-                    if !already_has_tubi {
-                        let geo_hash = info
-                            .cata_hash
-                            .clone()
-                            .unwrap_or_else(|| TUBI_GEO_HASH.to_string());
-                        entry.insts.push(ModelHashInst {
-                            geo_hash,
-                            transform: PlantTransform::default(), // identity local
-                            is_tubi: true,
-                            unit_flag: false,
-                        });
-                    }
                 }
             }
 
-            // 逐个 inst_key 扫描并按 refno 聚合；只处理本次需要的 refno 集合。
-            for geos_data in batch.inst_geos_map.values() {
-                let refno = geos_data.refno;
+            // 遍历 inst_info_map，使用 get_inst_key() 查找对应的几何数据。
+            // 这样即使多个 refno 共享相同的 cata_hash，也能为每个 refno 获取几何数据。
+            for (refno, info) in batch.inst_info_map.iter() {
                 let refno_u64 = refno.refno();
                 if !want_map.contains_key(&refno_u64) {
                     continue;
                 }
 
+                // 使用 info.get_inst_key() 查找对应的几何数据
+                let inst_key = info.get_inst_key();
+                let geos_data = match batch.inst_geos_map.get(&inst_key) {
+                    Some(data) => data,
+                    None => continue, // 没有几何数据，跳过
+                };
+
                 let entry = acc_map.entry(refno_u64).or_insert_with(|| {
-                    if let Some(info) = batch.inst_info_map.get(&refno) {
-                        let owner = if info.owner_refno.is_valid() {
-                            info.owner_refno
-                        } else {
-                            refno
-                        };
-                        let mut world_aabb: Option<PlantAabb> = info.aabb.map(Into::into);
-                        #[cfg(feature = "sqlite-index")]
-                        {
-                            if world_aabb.is_none() {
-                                if let Some(idx) = sqlite_idx.as_ref() {
-                                    let id: aios_core::RefU64 = refno.into();
-                                    if let Ok(Some(aabb)) = idx.get_aabb(id) {
-                                        world_aabb = Some(aabb.into());
-                                    }
+                    let owner = if info.owner_refno.is_valid() {
+                        info.owner_refno
+                    } else {
+                        *refno
+                    };
+                    let mut world_aabb: Option<PlantAabb> = info.aabb.map(Into::into);
+                    #[cfg(feature = "sqlite-index")]
+                    {
+                        if world_aabb.is_none() {
+                            if let Some(idx) = sqlite_idx.as_ref() {
+                                let id: aios_core::RefU64 = (*refno).into();
+                                if let Ok(Some(aabb)) = idx.get_aabb(id) {
+                                    world_aabb = Some(aabb.into());
                                 }
                             }
                         }
-                        let has_neg = batch
-                            .neg_relate_map
-                            .get(&refno)
-                            .map(|v| !v.is_empty())
-                            .unwrap_or(false);
-                        Acc {
-                            owner,
-                            world_trans: PlantTransform::from(info.world_transform),
-                            world_aabb,
-                            has_neg,
-                            has_cata_neg: info.has_cata_neg,
-                            insts: Vec::new(),
-                        }
-                    } else {
-                        #[cfg(feature = "sqlite-index")]
-                        let world_aabb = sqlite_idx
-                            .as_ref()
-                            .and_then(|idx| idx.get_aabb(refno.into()).ok().flatten())
-                            .map(Into::into);
-                        #[cfg(not(feature = "sqlite-index"))]
-                        let world_aabb = None;
-                        Acc {
-                            owner: refno,
-                            world_trans: PlantTransform::default(),
-                            world_aabb,
-                            has_neg: false,
-                            has_cata_neg: false,
-                            insts: Vec::new(),
-                        }
+                    }
+                    let has_neg = batch
+                        .neg_relate_map
+                        .get(refno)
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false);
+                    Acc {
+                        owner,
+                        world_trans: PlantTransform::from(info.world_transform),
+                        world_aabb,
+                        has_neg,
+                        has_cata_neg: info.has_cata_neg,
+                        insts: Vec::new(),
                     }
                 });
 
@@ -811,6 +811,9 @@ pub async fn query_geometry_instances_ext_from_cache(
                 if !seen_geos.insert(refno_u64) {
                     continue;
                 }
+
+                // 标记本 refno 的几何数据已锁定到当前 batch
+                meta_locked_by_geos.insert(refno_u64);
 
                 for inst in &geos_data.insts {
                     if !inst.visible {
@@ -826,9 +829,9 @@ pub async fn query_geometry_instances_ext_from_cache(
 
                     entry.insts.push(ModelHashInst {
                         geo_hash: inst.geo_hash.to_string(),
-                        transform: PlantTransform::from(inst.transform),
+                        geo_transform: PlantTransform::from(inst.geo_transform),
                         is_tubi: inst.is_tubi,
-                        unit_flag: inst.unit_flag,
+                        unit_flag: inst.geo_param.is_reuse_unit(),
                     });
                 }
             }
@@ -842,7 +845,7 @@ pub async fn query_geometry_instances_ext_from_cache(
                     // 其坐标系约定为 refno local space。
                     //
                     // 注意：导出侧（export_obj 等）对 has_neg=true 的约定是：
-                    // inst.transform 已经是 world_trans.d（等价 SurrealDB booled_id 查询返回值）。
+                    // inst.geo_transform 已经是 world_trans.d（等价 SurrealDB booled_id 查询返回值）。
                     // 若此处使用 identity，则导出时会丢失世界变换，常见表现为子节点（布尔结果 mesh）方位/位置不对。
                     let acc = acc_map.remove(&want_u64).unwrap_or(Acc {
                         owner: want_refno,
@@ -859,7 +862,7 @@ pub async fn query_geometry_instances_ext_from_cache(
                         world_trans: acc.world_trans,
                         insts: vec![ModelHashInst {
                             geo_hash: mesh_id.clone(),
-                            transform: acc.world_trans,
+                            geo_transform: acc.world_trans,
                             is_tubi: false,
                             unit_flag: false,
                         }],
@@ -887,6 +890,25 @@ pub async fn query_geometry_instances_ext_from_cache(
                     has_neg: acc.has_neg,
                 }),
                 _ => missing.push(want_refno),
+            }
+
+            // 追加 tubing world 实例：用 identity world_trans，使导出端 world_trans * inst.geo_transform == inst.geo_transform。
+            if let Some(items) = tubi_world_insts.remove(&want_u64) {
+                for (owner, wt, aabb, geo_hash) in items {
+                    out.push(GeomInstQuery {
+                        refno: want_refno,
+                        owner,
+                        world_aabb: aabb,
+                        world_trans: PlantTransform::default(),
+                        insts: vec![ModelHashInst {
+                            geo_hash,
+                            geo_transform: wt,
+                            is_tubi: true,
+                            unit_flag: false,
+                        }],
+                        has_neg: false,
+                    });
+                }
             }
         }
     }

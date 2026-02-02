@@ -1185,7 +1185,7 @@ where
         }
 
         if let Err(e) =
-            export_tree_file(dbnum, db_basic.as_ref(), &tree_nodes, Path::new("output/scene_tree"))
+            export_tree_file(dbnum, db_basic.as_ref(), &tree_nodes, &db_basic.children_map, Path::new("output/scene_tree"))
         {
             warn!("[tree_export] dbnum={} 导出失败: {}", dbnum, e);
         }
@@ -1954,6 +1954,7 @@ pub async fn sync_total_async_threaded(
                     dbnum,
                     db_basic.as_ref(),
                     &tree_nodes,
+                    &db_basic.children_map,
                     Path::new("output/scene_tree"),
                 ) {
                     warn!("[tree_export] dbnum={} 导出失败: {}", dbnum, e);

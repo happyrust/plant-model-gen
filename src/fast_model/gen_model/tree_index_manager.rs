@@ -789,8 +789,12 @@ pub async fn generate_tree_index_from_db(dbnum: u32, output_dir: &Path) -> anyho
     // 确保输出目录存在
     std::fs::create_dir_all(output_dir)?;
 
+    // 从 SurrealDB 构建时没有 children_map，使用空 map（顺序不保证）
+    // 注意：正确的 tree 应该从 PDMS 解析时生成，这里仅作为 fallback
+    let children_map: HashMap<RefU64, Vec<RefU64>> = HashMap::new();
+
     // 导出 tree 文件
-    export_tree_file(dbnum, &db_basic, &tree_nodes, output_dir)?;
+    export_tree_file(dbnum, &db_basic, &tree_nodes, &children_map, output_dir)?;
 
     log::info!(
         "[generate_tree_index] 成功生成 tree 索引文件: {}/{}.tree ({} 节点)",

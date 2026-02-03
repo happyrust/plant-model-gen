@@ -72,6 +72,12 @@ impl ExpressionFixer {
         let attrib_regex = Regex::new(r"(?i)ATTRIB\s+([A-Za-z][A-Za-z0-9_]*)").unwrap();
         processed = attrib_regex.replace_all(&processed, "$1").to_string();
 
+        // 简化无法求值的字符串函数（基于 IDA 分析：TRIM/LOWCASE 等是字符串函数，tiny_expr 不支持）
+        // TRIM(数值) → 数值（TRIM 对数值无意义，直接提取内部表达式）
+        // LOWCASE(TRUE) → 1, LOWCASE(FALSE) → 0
+        // UPCASE(TRUE) → 1, UPCASE(FALSE) → 0
+        processed = Self::simplify_string_functions(&processed);
+
         // 将已知的数学函数名转换为小写（tiny_expr 只识别小写函数名）
         // 包括：SQRT, POW, SIN, COS, TAN, ASIN, ACOS, ATAN, ATAN2, LOG, EXP, ABS,
         //       MIN, MAX, CEIL, FLOOR, ROUND, INT, LN, LOG10, SINH, COSH, TANH
@@ -88,6 +94,53 @@ impl ExpressionFixer {
             .to_string();
 
         processed
+    }
+
+    /// 简化无法被 tiny_expr 求值的字符串函数
+    ///
+    /// 基于 IDA 对 core.dll 的分析：
+    /// - TRIM, LOWCASE, UPCASE, LENGTH, SUBSTRING 等是字符串函数
+    /// - PDMS 会将参数自动转换为字符串，但 tiny_expr 不支持这些函数
+    /// - 当这些函数应用于数值/布尔值时，需要简化处理
+    fn simplify_string_functions(expr: &str) -> String {
+        let mut result = expr.to_string();
+
+        // TRIM(数值表达式) → 数值表达式
+        // TRIM 对数值没有意义（没有空格可去），直接提取内部表达式
+        let trim_regex = Regex::new(r"(?i)TRIM\s*\(\s*([^()]+|\([^()]*\))\s*\)").unwrap();
+        result = trim_regex.replace_all(&result, "$1").to_string();
+
+        // LOWCASE(TRUE) → 1, LOWCASE(FALSE) → 0
+        let lowcase_true = Regex::new(r"(?i)LOWCASE\s*\(\s*TRUE\s*\)").unwrap();
+        result = lowcase_true.replace_all(&result, "1").to_string();
+        let lowcase_false = Regex::new(r"(?i)LOWCASE\s*\(\s*FALSE\s*\)").unwrap();
+        result = lowcase_false.replace_all(&result, "0").to_string();
+
+        // LOWCASE(数值表达式) → 数值表达式（对数值无意义）
+        let lowcase_num = Regex::new(r"(?i)LOWCASE\s*\(\s*([^()]+|\([^()]*\))\s*\)").unwrap();
+        result = lowcase_num.replace_all(&result, "$1").to_string();
+
+        // UPCASE(TRUE) → 1, UPCASE(FALSE) → 0
+        let upcase_true = Regex::new(r"(?i)UPCASE\s*\(\s*TRUE\s*\)").unwrap();
+        result = upcase_true.replace_all(&result, "1").to_string();
+        let upcase_false = Regex::new(r"(?i)UPCASE\s*\(\s*FALSE\s*\)").unwrap();
+        result = upcase_false.replace_all(&result, "0").to_string();
+
+        // UPCASE(数值表达式) → 数值表达式
+        let upcase_num = Regex::new(r"(?i)UPCASE\s*\(\s*([^()]+|\([^()]*\))\s*\)").unwrap();
+        result = upcase_num.replace_all(&result, "$1").to_string();
+
+        // STR(数值表达式) → 数值表达式（STR 是转字符串，对数值计算无意义）
+        let str_regex = Regex::new(r"(?i)\bSTR\s*\(\s*([^()]+|\([^()]*\))\s*\)").unwrap();
+        result = str_regex.replace_all(&result, "$1").to_string();
+
+        // LENGTH('字符串') 或 LEN('字符串') → 字符串长度（如果是常量字符串）
+        let len_str_regex = Regex::new(r"(?i)(?:LENGTH|LEN)\s*\(\s*'([^']*)'\s*\)").unwrap();
+        result = len_str_regex.replace_all(&result, |caps: &regex::Captures| {
+            caps[1].len().to_string()
+        }).to_string();
+
+        result
     }
 
     /// 将已知的数学函数名转换为小写
@@ -497,5 +550,55 @@ mod tests {
         let result_tan = ExpressionFixer::eval_expression_with_attrib_support(expr_tan, &context, "DIST");
         assert!(result_tan.is_ok(), "TAN(45) failed: {:?}", result_tan);
         assert!((result_tan.unwrap() - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_simplify_string_functions() {
+        // 测试 TRIM(数值) → 数值
+        let expr1 = "TRIM(0.001)";
+        let result1 = ExpressionFixer::simplify_string_functions(expr1);
+        assert_eq!(result1, "0.001", "TRIM(0.001) should simplify to 0.001");
+
+        // 测试 LOWCASE(TRUE) → 1
+        let expr2 = "LOWCASE(TRUE)";
+        let result2 = ExpressionFixer::simplify_string_functions(expr2);
+        assert_eq!(result2, "1", "LOWCASE(TRUE) should simplify to 1");
+
+        // 测试 LOWCASE(FALSE) → 0
+        let expr3 = "LOWCASE(FALSE)";
+        let result3 = ExpressionFixer::simplify_string_functions(expr3);
+        assert_eq!(result3, "0", "LOWCASE(FALSE) should simplify to 0");
+
+        // 测试问题表达式: (TRIM(0.001)*LOWCASE(TRUE))
+        let expr4 = "(TRIM(0.001)*LOWCASE(TRUE))";
+        let result4 = ExpressionFixer::simplify_string_functions(expr4);
+        assert_eq!(result4, "(0.001*1)", "Complex expression should simplify correctly");
+
+        // 测试 STR(数值) → 数值
+        let expr5 = "STR(123.45)";
+        let result5 = ExpressionFixer::simplify_string_functions(expr5);
+        assert_eq!(result5, "123.45", "STR(123.45) should simplify to 123.45");
+
+        // 测试 UPCASE(TRUE) → 1
+        let expr6 = "UPCASE(TRUE)";
+        let result6 = ExpressionFixer::simplify_string_functions(expr6);
+        assert_eq!(result6, "1", "UPCASE(TRUE) should simplify to 1");
+
+        // 测试 LENGTH('hello') → 5
+        let expr7 = "LENGTH('hello')";
+        let result7 = ExpressionFixer::simplify_string_functions(expr7);
+        assert_eq!(result7, "5", "LENGTH('hello') should simplify to 5");
+    }
+
+    #[test]
+    fn test_eval_simplified_problem_expression() {
+        let context = ExpressionFixer::create_test_context();
+
+        // 测试原始问题表达式: (TRIM(0.001)*LOWCASE(TRUE))
+        // 简化后应该变成: (0.001*1) = 0.001
+        let expr = "(TRIM(0.001)*LOWCASE(TRUE))";
+        let result = ExpressionFixer::eval_expression_with_attrib_support(expr, &context, "DIST");
+        assert!(result.is_ok(), "Problem expression should now evaluate: {:?}", result);
+        assert!((result.unwrap() - 0.001).abs() < 1e-6, "Result should be 0.001");
     }
 }

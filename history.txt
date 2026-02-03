@@ -67,3 +67,14 @@ SELECT id FROM $trans;
 -- 看看 aabb/trans 的一条样例结构
 SELECT * FROM aabb LIMIT 1;
 SELECT * FROM trans LIMIT 1;
+SELECT id, noun, name, owner FROM pe WHERE id = pe:24381_37115
+INFO FOR NS
+SELECT id, noun, name, owner FROM pe WHERE id = pe:24381_37115
+SELECT * FROM geo_relate WHERE refno = '24381_37115'
+SELECT count() FROM geo_relate WHERE noun = 'STWALL' GROUP ALL
+SELECT id, noun FROM pe WHERE owner = pe:24381_37115
+SELECT POSS, POSE FROM att WHERE refno = '24381_37115'
+SELECT POSS, POSE FROM att_STWALL WHERE refno = '24381_37115'
+INFO FOR DB
+SELECT * FROM pe WHERE id = pe:24381_37115
+SELECT * FROM noun_STWALL WHERE id = noun_STWALL:24381_37115

@@ -3402,6 +3402,72 @@ pub async fn export_dbnum_instances_json_from_cache(
         }));
     }
 
+    // 如果没有 owner 分组但有独立的 tubi 数据，创建虚拟分组导出
+    if groups.is_empty() && instances.is_empty() && !inst_tubi_map.is_empty() {
+        println!(
+            "📦 检测到独立 tubi 数据 (无 owner 分组): inst_tubi={}，创建虚拟分组导出...",
+            inst_tubi_map.len()
+        );
+
+        let mut tubi_items: Vec<(&RefnoEnum, &EleGeosInfo)> = inst_tubi_map.iter().collect();
+        tubi_items.sort_by_key(|(r, _)| r.to_string());
+
+        let mut tubings = Vec::new();
+        let mut tubi_order = 0u32;
+
+        for (tubi_refno, info) in tubi_items {
+            // TUBI 数据可能没有对应的 inst_geos_map，直接使用 EleGeosInfo 中的信息
+            let aabb = match info.aabb.clone() {
+                Some(aabb) => aabb,
+                None => continue,
+            };
+            let aabb_hash = insert_aabb_hash(&mut aabb_table, &aabb, &unit_converter);
+            let trans_hash = insert_trans_hash(
+                &mut trans_table,
+                &to_dmat4(&info.world_transform),
+                &unit_converter,
+                false,
+            );
+
+            // 尝试从 inst_geos_map 获取 geo_hash，如果没有则使用 tubi_info_id 或 refno
+            let geo_hash = if let Some(inst_geos) = inst_geos_map.get(&info.get_inst_key()) {
+                inst_geos.insts.first().map(|i| i.geo_hash.to_string())
+            } else {
+                // 使用 tubi_info_id 作为备选，或者使用 refno
+                info.tubi_info_id.clone().or_else(|| Some(format!("tubi_{}", tubi_refno)))
+            };
+
+            let Some(geo_hash) = geo_hash else {
+                continue;
+            };
+
+            tubings.push(json!({
+                "refno": tubi_refno.to_string(),
+                "noun": "TUBI",
+                "name": format!("TUBI-{}", tubi_refno.to_string()),
+                "aabb_hash": aabb_hash,
+                "geo_hash": geo_hash,
+                "trans_hash": trans_hash,
+                "order": tubi_order,
+                "lod_mask": 1u32,
+                "spec_value": 0,
+            }));
+            tubi_order += 1;
+        }
+
+        if !tubings.is_empty() {
+            // 创建一个虚拟的 PIPE 分组包含所有 tubi
+            groups.push(json!({
+                "owner_refno": format!("virtual_pipe_{}", dbnum),
+                "owner_noun": "PIPE",
+                "owner_name": format!("PIPE-dbnum-{}", dbnum),
+                "children": [],
+                "tubings": tubings,
+            }));
+            println!("✅ 创建虚拟 PIPE 分组，包含 {} 个 TUBI", tubi_order);
+        }
+    }
+
     let instances_json = json!({
         "version": 3,
         "generated_at": generated_at,

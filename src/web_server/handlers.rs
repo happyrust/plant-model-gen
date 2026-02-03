@@ -3218,7 +3218,7 @@ pub async fn api_get_instances(
     let db_option = aios_core::get_db_option();
     let mesh_dir = db_option.get_meshes_path();
 
-    let export_data: ExportData = collect_export_data(insts, &refnos, &mesh_dir, false, None)
+    let export_data: ExportData = collect_export_data(insts, &refnos, &mesh_dir, false, None, false)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Collect data failed: {}", e)))?;
 
@@ -3233,7 +3233,7 @@ pub async fn api_get_instances(
         for geom_inst in &component.geometries {
             let instance = InstanceInfo {
                 refno: component.refno.to_string(),
-                matrix: geom_inst.local_transform.to_cols_array(),
+                matrix: geom_inst.geo_transform.to_cols_array(),
                 color: None,
                 name: component.name.clone(),
             };

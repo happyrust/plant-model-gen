@@ -1183,6 +1183,7 @@ async fn main() -> anyhow::Result<()> {
             verbose,
             export_bundle_dir,
             &db_option_ext,
+            true, // autorun=true
         )
             .await;
     }

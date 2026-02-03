@@ -17,6 +17,8 @@ use aios_core::{
 use aios_core::{RefnoEnum, SUL_DB, utils::RecordIdExt};
 use aios_core::geometry::{EleGeosInfo, EleInstGeosData, GeoBasicType};
 use aios_core::geometry::csg::UNIT_MESH_SCALE;
+use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
+use aios_core::shape::pdms_shape::BrepShapeTrait;
 use crate::fast_model::instance_cache::InstanceCacheManager;
 use glam::DMat4;
 use std::collections::{HashMap, HashSet};
@@ -184,6 +186,102 @@ fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<M
     Ok(manifold)
 }
 
+/// 直接从几何参数生成 Manifold 模型
+///
+/// 此函数避免了从 glb 文件加载转换的问题：
+/// - 不依赖 glb 文件存在
+/// - 避免 glb → Manifold 转换时的精度丢失
+///
+/// # 参数
+///
+/// * `geo_param` - 几何参数
+/// * `geo_hash` - 几何哈希值
+/// * `mat` - 变换矩阵
+/// * `more_precision` - 是否需要更高精度
+///
+/// # 返回值
+///
+/// 返回 `anyhow::Result<ManifoldRust>` 表示生成是否成功
+#[inline]
+fn load_manifold_from_geo_param(
+    geo_param: &PdmsGeoParam,
+    geo_hash: u64,
+    mat: DMat4,
+    more_precision: bool,
+) -> anyhow::Result<ManifoldRust> {
+    // 对标准单位几何体（1/2/3）使用内置几何生成
+    if matches!(geo_hash, 1 | 2 | 3) {
+        debug_model_debug!("load_manifold_from_geo_param: 使用内置 unit mesh: geo_hash={}", geo_hash);
+        let unit_mesh = match geo_hash {
+            1 => unit_box_mesh(),
+            2 => unit_cylinder_mesh(&LodMeshSettings::default(), false),
+            3 => unit_sphere_mesh(),
+            _ => unreachable!(),
+        };
+        let manifold = ManifoldRust::from_vertices_indices(&unit_mesh.vertices, &unit_mesh.indices, mat, more_precision);
+        return validate_manifold_result(manifold, &geo_hash.to_string());
+    }
+
+    // 尝试从 geo_param 直接生成 mesh
+    let plant_mesh = match geo_param {
+        PdmsGeoParam::Unknown | PdmsGeoParam::CompoundShape => {
+            // 对于 Unknown 和 CompoundShape，回退到从 glb 加载
+            debug_model_debug!(
+                "load_manifold_from_geo_param: geo_param 不支持直接生成，回退到 glb 加载: geo_hash={}",
+                geo_hash
+            );
+            return load_manifold(&geo_hash.to_string(), mat, more_precision);
+        }
+        _ => {
+            // 尝试使用 gen_csg_shape 生成
+            match geo_param.gen_csg_shape_compat() {
+                Ok(csg_mesh) => (*csg_mesh.0).clone(),
+                Err(e) => {
+                    debug_model_debug!(
+                        "load_manifold_from_geo_param: gen_csg_shape 失败 ({}), 尝试回退到 glb 加载: geo_hash={}",
+                        e,
+                        geo_hash
+                    );
+                    return load_manifold(&geo_hash.to_string(), mat, more_precision);
+                }
+            }
+        }
+    };
+
+    if plant_mesh.vertices.is_empty() || plant_mesh.indices.is_empty() {
+        return Err(anyhow::anyhow!(
+            "从 geo_param 生成的 mesh 为空: geo_hash={} type={}",
+            geo_hash,
+            geo_param.type_name()
+        ));
+    }
+
+    let manifold = ManifoldRust::from_vertices_indices(&plant_mesh.vertices, &plant_mesh.indices, mat, more_precision);
+    validate_manifold_result(manifold, &geo_hash.to_string())
+}
+
+/// 校验 Manifold 结果是否有效
+#[inline]
+fn validate_manifold_result(manifold: ManifoldRust, id: &str) -> anyhow::Result<ManifoldRust> {
+    let mesh = manifold.get_mesh();
+    if mesh.indices.is_empty() {
+        return Err(anyhow::anyhow!("Manifold mesh 为空: id={}", id));
+    }
+    if let Some(aabb) = mesh.cal_aabb() {
+        let ext_mag = aabb.extents().magnitude();
+        if ext_mag.is_finite() && ext_mag < 1e-6 {
+            return Err(anyhow::anyhow!(
+                "Manifold mesh 可能为空（哨兵 cube）: id={} ext_mag={:.3e}",
+                id,
+                ext_mag
+            ));
+        }
+    } else {
+        return Err(anyhow::anyhow!("Manifold mesh AABB 无效: id={}", id));
+    }
+    Ok(manifold)
+}
+
 #[inline]
 fn log_load_manifold_failed(scene: &str, refno: RefnoEnum, mesh_id: &str, err: &anyhow::Error) {
     eprintln!(
@@ -295,13 +393,14 @@ pub async fn apply_cata_neg_boolean_manifold(
                 continue;
             };
 
-            debug_model_debug!("加载 catalog 正实体 mesh: {}", pos.id.to_mesh_id());
             let pos_mesh_id = pos.id.to_mesh_id();
+            let pos_geo_hash: u64 = pos_mesh_id.parse().unwrap_or(0);
+            debug_model_debug!("加载 catalog 正实体 mesh: geo_hash={}", pos_geo_hash);
             let mut pos_tf = pos.trans.0.clone();
-            if matches!(pos_mesh_id.as_str(), "1" | "2" | "3") {
+            if matches!(pos_geo_hash, 1 | 2 | 3) {
                 pos_tf.scale /= aios_core::geometry::csg::UNIT_MESH_SCALE;
             }
-            let mut pos_manifold = match load_manifold(&pos_mesh_id, pos_tf.to_matrix().as_dmat4(), false) {
+            let mut pos_manifold = match load_manifold_from_geo_param(&pos.param, pos_geo_hash, pos_tf.to_matrix().as_dmat4(), false) {
                 Ok(m) => m,
                 Err(e) => {
                     log_load_manifold_failed("cata_pos", g.refno, &pos_mesh_id, &e);
@@ -323,11 +422,12 @@ pub async fn apply_cata_neg_boolean_manifold(
                     continue;
                 };
                 let neg_mesh_id = neg_geo.id.to_mesh_id();
+                let neg_geo_hash: u64 = neg_mesh_id.parse().unwrap_or(0);
                 let mut neg_tf = neg_geo.trans.0.clone();
-                if matches!(neg_mesh_id.as_str(), "1" | "2" | "3") {
+                if matches!(neg_geo_hash, 1 | 2 | 3) {
                     neg_tf.scale /= aios_core::geometry::csg::UNIT_MESH_SCALE;
                 }
-                match load_manifold(&neg_mesh_id, neg_tf.to_matrix().as_dmat4(), true) {
+                match load_manifold_from_geo_param(&neg_geo.param, neg_geo_hash, neg_tf.to_matrix().as_dmat4(), true) {
                     Ok(manifold) => neg_manifolds.push(manifold),
                     Err(e) => log_load_manifold_failed("cata_neg", g.refno, &neg_mesh_id, &e),
                 }
@@ -345,8 +445,9 @@ pub async fn apply_cata_neg_boolean_manifold(
                     "[bool][cata] ⚠️ 布尔结果为空，尝试 more_precision=true 重算: refno={}",
                     g.refno
                 );
-                if let Ok(pos_hi) = load_manifold(
-                    &pos.id.to_mesh_id(),
+                if let Ok(pos_hi) = load_manifold_from_geo_param(
+                    &pos.param,
+                    pos_geo_hash,
                     pos.trans.0.to_matrix().as_dmat4(),
                     true,
                 ) {
@@ -898,8 +999,13 @@ pub async fn apply_insts_boolean_manifold(
 }
 
 /// 基于 foyer 缓存的布尔运算（不访问 SurrealDB）
+/// 
+/// # 参数
+/// - `cache_manager`: 实例缓存管理器
+/// - `filter_refnos`: 可选的 refno 过滤集合，仅处理该集合内的 refno（用于 debug_model 模式）
 pub async fn run_boolean_worker_from_cache_manager(
     cache_manager: &InstanceCacheManager,
+    filter_refnos: Option<&HashSet<RefnoEnum>>,
 ) -> anyhow::Result<usize> {
     fn aabb_contains(
         outer: &parry3d::bounding_volume::Aabb,
@@ -1099,6 +1205,19 @@ pub async fn run_boolean_worker_from_cache_manager(
             .filter(|r| inst_info_map.contains_key(r)),
     );
 
+    // 如果指定了过滤集合，只处理该集合内的 refno（用于 debug_model 模式）
+    if let Some(filter_set) = filter_refnos {
+        let before_count = targets.len();
+        targets.retain(|r| filter_set.contains(r));
+        if before_count != targets.len() {
+            println!(
+                "[boolean_worker_cache] debug_model 过滤: {} -> {} 个目标",
+                before_count,
+                targets.len()
+            );
+        }
+    }
+
     for refno in targets {
         let Some(info) = inst_info_map.get(&refno) else {
             continue;
@@ -1117,11 +1236,10 @@ pub async fn run_boolean_worker_from_cache_manager(
             if !is_pos_geo_for_boolean(&inst.geo_type) {
                 continue;
             }
-            let mesh_id = inst.geo_hash.to_string();
             let mat = local_mat_for_inst(inst);
-            match load_manifold(&mesh_id, mat, false) {
+            match load_manifold_from_geo_param(&inst.geo_param, inst.geo_hash, mat, false) {
                 Ok(m) => pos_manifolds.push(m),
-                Err(e) => log_load_manifold_failed("cache_pos", refno, &mesh_id, &e),
+                Err(e) => log_load_manifold_failed("cache_pos", refno, &inst.geo_hash.to_string(), &e),
             }
         }
         if pos_manifolds.is_empty() {
@@ -1141,11 +1259,10 @@ pub async fn run_boolean_worker_from_cache_manager(
                 if inst.geo_type != GeoBasicType::CataNeg {
                     continue;
                 }
-                let mesh_id = inst.geo_hash.to_string();
                 let mat = local_mat_for_inst(inst);
-                match load_manifold(&mesh_id, mat, true) {
+                match load_manifold_from_geo_param(&inst.geo_param, inst.geo_hash, mat, true) {
                     Ok(m) => neg_manifolds.push(m),
-                    Err(e) => log_load_manifold_failed("cache_cata_neg", refno, &mesh_id, &e),
+                    Err(e) => log_load_manifold_failed("cache_cata_neg", refno, &inst.geo_hash.to_string(), &e),
                 }
             }
         }
@@ -1167,14 +1284,13 @@ pub async fn run_boolean_worker_from_cache_manager(
                     if inst.geo_type != GeoBasicType::Neg {
                         continue;
                     }
-                    let mesh_id = inst.geo_hash.to_string();
 
                     let local_mat = local_mat_for_inst(inst);
                     let neg_world_mat = carrier_world_mat * local_mat;
                     let relative_mat = inverse_pos_world * neg_world_mat;
-                    match load_manifold(&mesh_id, relative_mat, true) {
+                    match load_manifold_from_geo_param(&inst.geo_param, inst.geo_hash, relative_mat, true) {
                         Ok(m) => neg_manifolds.push(m),
-                        Err(e) => log_load_manifold_failed("cache_neg", refno, &mesh_id, &e),
+                        Err(e) => log_load_manifold_failed("cache_neg", refno, &inst.geo_hash.to_string(), &e),
                     }
                 }
             }
@@ -1201,12 +1317,11 @@ pub async fn run_boolean_worker_from_cache_manager(
                     if inst.refno != ngmr_geom_refno {
                         continue;
                     }
-                    let mesh_id = inst.geo_hash.to_string();
                     let neg_world_mat = carrier_world_mat * local_mat_for_inst(inst);
                     let relative_mat = inverse_pos_world * neg_world_mat;
-                    match load_manifold(&mesh_id, relative_mat, true) {
+                    match load_manifold_from_geo_param(&inst.geo_param, inst.geo_hash, relative_mat, true) {
                         Ok(m) => neg_manifolds.push(m),
-                        Err(e) => log_load_manifold_failed("cache_ngmr", refno, &mesh_id, &e),
+                        Err(e) => log_load_manifold_failed("cache_ngmr", refno, &inst.geo_hash.to_string(), &e),
                     }
                 }
             }
@@ -1229,11 +1344,10 @@ pub async fn run_boolean_worker_from_cache_manager(
                 if !is_pos_geo_for_boolean(&inst.geo_type) {
                     continue;
                 }
-                let mesh_id = inst.geo_hash.to_string();
                 let mat = local_mat_for_inst(inst);
-                match load_manifold(&mesh_id, mat, true) {
+                match load_manifold_from_geo_param(&inst.geo_param, inst.geo_hash, mat, true) {
                     Ok(m) => pos_hi.push(m),
-                    Err(e) => log_load_manifold_failed("cache_pos_hi", refno, &mesh_id, &e),
+                    Err(e) => log_load_manifold_failed("cache_pos_hi", refno, &inst.geo_hash.to_string(), &e),
                 }
             }
             if !pos_hi.is_empty() {

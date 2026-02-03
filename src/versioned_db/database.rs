@@ -587,34 +587,6 @@ pub async fn execute_sql(conn: &Pool<MySql>, sql: &str) -> bool {
     };
 }
 
-#[cfg(feature = "surreal-save")]
-pub async fn check_and_clear_db(dbnum: u32) -> anyhow::Result<()> {
-    let sql = format!(
-        "SELECT value id FROM only pe WHERE dbnum = {} limit 1",
-        dbnum
-    );
-    let mut response = SUL_DB.query(&sql).await.expect("check db exists failed");
-    use serde_json::Value as JsonValue;
-    let records: Vec<JsonValue> = response.take(0).unwrap_or_default();
-    if !records.is_empty() {
-        info!(
-            "Database with dbnum {} already exists in pe table. Will override with new data.",
-            dbnum
-        );
-        info!("开始删除已有的dbnum {dbnum} 的数据");
-        let sql = format!("delete array::flatten(select value ->pe_owner from pe where dbnum = {dbnum});
-                                    delete array::flatten(select value [refno, id] from pe where dbnum = {dbnum});
-                                    ");
-        SUL_DB.query(&sql).await.expect("clear db failed");
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "surreal-save"))]
-pub async fn check_and_clear_db(_db_no: u32) -> anyhow::Result<()> {
-    Ok(())
-}
-
 /// 带进度回调的多线程同步数据
 pub async fn sync_total_async_threaded_with_callback<F>(
     db_option: &DbOption,
@@ -948,9 +920,6 @@ where
         let db_type = db_basic_info.db_type;
         let dbnum = db_basic_info.dbnum;
 
-        if is_replace {
-            check_and_clear_db(dbnum).await.unwrap();
-        }
         // 类型过滤
         if !db_types_clone.contains(&db_type) {
             // 依然汇报一次该文件完成
@@ -1567,10 +1536,6 @@ pub async fn sync_total_async_threaded(
                 let db_type = db_basic_info.db_type;
               
                 let dbnum = db_basic_info.dbnum;
-                //需要检查pe里是否有这个dbno，如果有，则需要改成使用upsert
-                if is_replace {
-                    check_and_clear_db(dbnum).await.unwrap();
-                }
                 //如果不是全部解析，需要检查类型，全部解析一定要解析syst等配置文件数据库
                 if !db_types_clone.contains(&db_type) {
                     continue;

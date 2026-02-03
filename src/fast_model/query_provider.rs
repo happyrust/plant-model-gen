@@ -17,8 +17,7 @@
 
 use crate::data_interface::db_meta;
 use crate::fast_model::gen_model::tree_index_manager::{
-    load_index_with_large_stack, TreeIndexManager, enable_auto_generate_tree,
-    is_auto_generate_tree_enabled,
+    load_index_with_large_stack, TreeIndexManager,
 };
 use aios_core::RefnoEnum;
 use aios_core::query_provider::*;
@@ -53,27 +52,30 @@ async fn init_provider() -> anyhow::Result<Arc<dyn QueryProvider>> {
         .tree_dir()
         .to_path_buf();
 
-    // 检查 tree 目录是否存在
-    if !tree_dir.exists() {
-        // tree 目录不存在，提示用户
+    // 检查 tree 目录是否存在且包含 .tree 文件
+    let tree_files_exist = tree_dir.exists() && has_tree_files(&tree_dir);
+    
+    if !tree_files_exist {
+        // tree 目录不存在或为空，自动运行解析生成
         print_tree_index_missing_help(&tree_dir);
-
-        // 尝试询问用户是否自动生成
-        if should_auto_generate_tree_index() {
-            enable_auto_generate_tree();
-            log::info!("[init_provider] 用户选择自动生成 tree 索引文件");
-
-            // 尝试从 SurrealDB 生成 tree 索引
-            if let Err(e) = generate_all_tree_indices(&tree_dir).await {
-                log::warn!("[init_provider] 自动生成 tree 索引失败: {}", e);
-                anyhow::bail!("Tree 索引文件不存在且自动生成失败: {}", e);
-            }
-        } else {
+        println!("🔄 Tree 索引缺失，正在自动解析 PDMS 数据库生成...");
+        
+        if let Err(e) = auto_generate_tree_index_by_parse(&tree_dir).await {
             anyhow::bail!(
-                "Tree 索引目录不存在: {}\n请先运行数据库解析命令生成 tree 索引文件",
-                tree_dir.display()
+                "Tree 索引自动生成失败: {}\n\
+                 请检查 DbOption.toml 配置是否正确，PDMS 数据库文件是否存在",
+                e
             );
         }
+        
+        // 再次检查是否生成成功
+        if !has_tree_files(&tree_dir) {
+            anyhow::bail!(
+                "Tree 索引生成后仍无 .tree 文件，请检查解析日志"
+            );
+        }
+        
+        println!("✅ Tree 索引生成完成");
     }
 
     // 在 Windows 上，加载/反序列化较大的 `.tree` 文件时可能触发主线程栈溢出；
@@ -91,6 +93,20 @@ async fn init_provider() -> anyhow::Result<Arc<dyn QueryProvider>> {
     Ok(Arc::new(provider))
 }
 
+/// 检查目录中是否有 .tree 文件
+fn has_tree_files(tree_dir: &std::path::Path) -> bool {
+    if let Ok(entries) = std::fs::read_dir(tree_dir) {
+        for entry in entries.flatten() {
+            if let Some(ext) = entry.path().extension() {
+                if ext == "tree" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// 打印 tree 索引缺失的帮助信息
 fn print_tree_index_missing_help(tree_dir: &std::path::Path) {
     eprintln!(
@@ -103,79 +119,55 @@ fn print_tree_index_missing_help(tree_dir: &std::path::Path) {
 ║  Tree 索引文件用于快速查询节点的层级关系（父子、祖先、子孙）。                    ║
 ║  该文件在解析 PDMS 数据库时自动生成。                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  解决方案:                                                                     ║
+║  解决方案: 运行数据库解析命令                                                   ║
 ║                                                                               ║
-║  方案1: 重新解析数据库（推荐）                                                  ║
-║    cargo run --bin aios-database -- --parse-db                               ║
+║    cargo run --bin aios-database -- -c DbOption                              ║
 ║                                                                               ║
-║  方案2: 从 SurrealDB 重建 tree 索引                                            ║
-║    cargo run --bin aios-database -- --rebuild-tree-index                     ║
+║  该命令会解析 PDMS 数据库文件并自动生成 tree 索引。                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 "#,
         tree_dir.display()
     );
 }
 
-/// 检查是否应该自动生成 tree 索引
-///
-/// 在交互式终端中询问用户，非交互式环境返回 false
-fn should_auto_generate_tree_index() -> bool {
-    use std::io::{self, Write};
-
-    // 如果已经启用了自动生成，直接返回 true
-    if is_auto_generate_tree_enabled() {
-        return true;
-    }
-
-    // 检查环境变量是否禁用交互
-    if std::env::var("CI").is_ok() || std::env::var("AIOS_NON_INTERACTIVE").is_ok() {
-        log::info!("[init_provider] 非交互式环境，跳过用户确认");
-        return false;
-    }
-
-    print!("\n是否从 SurrealDB 自动生成 tree 索引文件? [y/N]: ");
-    io::stdout().flush().ok();
-
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_ok() {
-        let input = input.trim().to_lowercase();
-        if input == "y" || input == "yes" {
-            return true;
-        }
-    }
-
-    false
+/// 自动通过解析 PDMS 数据库生成 Tree 索引
+async fn auto_generate_tree_index_by_parse(tree_dir: &std::path::Path) -> anyhow::Result<()> {
+    use crate::versioned_db::database::sync_pdms;
+    
+    // 从 DbOption.toml 加载配置
+    let db_option = load_db_option_for_parse()?;
+    
+    println!("📂 解析项目: {}", db_option.project_name);
+    println!("📁 输出目录: {}", tree_dir.display());
+    
+    // 确保输出目录存在
+    std::fs::create_dir_all(tree_dir)?;
+    
+    // 运行解析
+    sync_pdms(&db_option).await?;
+    
+    Ok(())
 }
 
-/// 从 SurrealDB 生成所有 tree 索引
-async fn generate_all_tree_indices(output_dir: &std::path::Path) -> anyhow::Result<()> {
-    use crate::fast_model::gen_model::tree_index_manager::{
-        get_available_dbnums_from_db, generate_tree_indices_from_db,
-    };
-
-    println!("🔄 正在从 SurrealDB 获取可用的 dbnum 列表...");
-
-    let dbnums = get_available_dbnums_from_db().await?;
-    if dbnums.is_empty() {
-        anyhow::bail!("SurrealDB 中没有找到任何可用的 dbnum");
+/// 加载用于解析的 DbOption 配置
+fn load_db_option_for_parse() -> anyhow::Result<aios_core::options::DbOption> {
+    use aios_core::options::DbOption;
+    
+    // 尝试从 DbOption.toml 加载
+    let config_path = "DbOption.toml";
+    if std::path::Path::new(config_path).exists() {
+        let content = std::fs::read_to_string(config_path)?;
+        let mut db_option: DbOption = toml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("解析 DbOption.toml 失败: {}", e))?;
+        
+        // 设置解析模式参数
+        db_option.save_db = Some(false); // 不写入 SurrealDB，仅生成本地文件
+        db_option.total_sync = true;     // 全量解析
+        
+        Ok(db_option)
+    } else {
+        anyhow::bail!("未找到配置文件 DbOption.toml")
     }
-
-    println!("📋 找到 {} 个 dbnum: {:?}", dbnums.len(), dbnums);
-    println!("🔧 开始生成 tree 索引文件...");
-
-    let success_count = generate_tree_indices_from_db(&dbnums, output_dir).await?;
-
-    println!(
-        "✅ Tree 索引生成完成: 成功 {}/{} 个",
-        success_count,
-        dbnums.len()
-    );
-
-    if success_count == 0 {
-        anyhow::bail!("没有成功生成任何 tree 索引文件");
-    }
-
-    Ok(())
 }
 
 // ============================================================================

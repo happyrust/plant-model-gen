@@ -4,7 +4,13 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+/// 旧版默认目录（兼容）
 pub const DEFAULT_TREE_DIR: &str = "output/scene_tree";
+
+/// 获取基于项目名称的 scene_tree 目录
+pub fn get_project_tree_dir(project_name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from("output").join(project_name).join("scene_tree")
+}
 
 /// 数据库文件元信息更新参数
 pub struct DbFileMetaUpdate<'a> {

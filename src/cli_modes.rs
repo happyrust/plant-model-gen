@@ -1451,12 +1451,14 @@ pub async fn export_all_parquet_mode(
 ///
 /// # 参数
 /// - `autorun`: 若为 `true`（默认），缓存缺失时自动生成模型数据；若为 `false`，则询问用户确认
+/// - `root_refno`: 若提供，则仅导出该 refno 下的 visible 子孙节点；否则导出整个 dbnum
 pub async fn export_dbnum_instances_json_mode(
     dbnum: u32,
     verbose: bool,
     output_override: Option<PathBuf>,
     db_option_ext: &DbOptionExt,
     autorun: bool,
+    root_refno: Option<RefnoEnum>,
 ) -> Result<()> {
     use aios_database::fast_model::export_model::export_prepack_lod::{
         export_dbnum_instances_json, export_dbnum_instances_json_from_cache,
@@ -1648,6 +1650,7 @@ pub async fn export_dbnum_instances_json_mode(
         db_option,
         verbose,
         None, // 使用默认毫米单位
+        root_refno,
     )
     .await?;
 

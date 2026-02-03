@@ -14,6 +14,20 @@ use std::collections::VecDeque;
 
 use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 
+/// 从 DbOption.toml 读取 project_name
+fn get_project_name_from_config() -> String {
+    let content = std::fs::read_to_string("DbOption.toml").unwrap_or_default();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with("project_name") {
+            if let Some(value) = line.split('=').nth(1) {
+                return value.trim().trim_matches('"').trim_matches('\'').to_string();
+            }
+        }
+    }
+    panic!("DbOption.toml 中未找到 project_name 配置");
+}
+
 /// 初始化结果
 #[derive(Debug)]
 pub struct SceneTreeInitResult {
@@ -119,8 +133,8 @@ pub async fn init_scene_tree_from_root(
 
     // 6. 导出 Parquet 文件（使用 root 的 dbnum）
     let dbnum = TreeIndexManager::resolve_dbnum_for_refno(root_refno).await?;
-    let output_dir = std::path::Path::new("output/scene_tree");
-    if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbnum, output_dir).await {
+    let output_dir = crate::versioned_db::db_meta_info::get_project_tree_dir(&get_project_name_from_config());
+    if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbnum, &output_dir).await {
         eprintln!("[scene_tree] Parquet 导出失败: {}", e);
     }
 
@@ -162,8 +176,8 @@ pub async fn init_scene_tree_by_dbno(dbnum: u32, force_rebuild: bool) -> Result<
     );
 
     // 6. 导出 Parquet 文件
-    let output_dir = std::path::Path::new("output/scene_tree");
-    if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbnum, output_dir).await {
+    let output_dir = crate::versioned_db::db_meta_info::get_project_tree_dir(&get_project_name_from_config());
+    if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbnum, &output_dir).await {
         eprintln!("[scene_tree] Parquet 导出失败: {}", e);
     }
 

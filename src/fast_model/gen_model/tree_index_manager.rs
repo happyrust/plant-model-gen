@@ -50,6 +50,25 @@ pub fn is_auto_generate_tree_enabled() -> bool {
     AUTO_GENERATE_TREE_ENABLED.load(Ordering::Relaxed)
 }
 
+/// 从 DbOption.toml 读取 project_name，返回 output/{project}/scene_tree 路径
+fn get_project_tree_dir() -> Option<PathBuf> {
+    let content = std::fs::read_to_string("DbOption.toml").ok()?;
+    
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with("project_name") {
+            if let Some(value) = line.split('=').nth(1) {
+                let name = value.trim().trim_matches('"').trim_matches('\'');
+                if !name.is_empty() {
+                    return Some(PathBuf::from("output").join(name).join("scene_tree"));
+                }
+            }
+        }
+    }
+    
+    None
+}
+
 /// 从全局缓存中尝试获取已加载的 TreeIndex（不会触发磁盘读取/反序列化）。
 pub fn try_get_cached_index(tree_dir: impl AsRef<Path>, dbnum: u32) -> Option<Arc<TreeIndex>> {
     let key = (tree_dir.as_ref().to_path_buf(), dbnum);
@@ -146,8 +165,12 @@ impl TreeIndexManager {
     }
 
     /// 使用默认目录创建 Manager
+    /// 
+    /// 优先从 DbOption.toml 读取 project_name，使用 output/{project}/scene_tree
+    /// 如果读取失败，回退到旧路径 output/scene_tree
     pub fn with_default_dir(dbnums: Vec<u32>) -> Self {
-        Self::new(DEFAULT_TREE_DIR, dbnums)
+        let tree_dir = get_project_tree_dir().unwrap_or_else(|| DEFAULT_TREE_DIR.into());
+        Self::new(tree_dir, dbnums)
     }
 
     /// 获取管理的 dbnum 列表

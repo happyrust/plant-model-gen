@@ -232,6 +232,16 @@ impl DbOptionExt {
         }
         self.get_project_output_dir().join("meshes_shadow")
     }
+
+    /// 获取 scene_tree 目录，默认为 output/{project_name}/scene_tree
+    pub fn get_scene_tree_dir(&self) -> std::path::PathBuf {
+        self.get_project_output_dir().join("scene_tree")
+    }
+
+    /// 获取 db_meta_info.json 路径
+    pub fn get_db_meta_info_path(&self) -> std::path::PathBuf {
+        self.get_scene_tree_dir().join("db_meta_info.json")
+    }
 }
 
 impl From<DbOption> for DbOptionExt {

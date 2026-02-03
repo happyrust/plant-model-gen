@@ -2290,6 +2290,7 @@ async fn query_inst_relate_rows_by_refnos(
 /// - `db_option`: 数据库选项
 /// - `verbose`: 是否输出详细日志
 /// - `target_unit`: 目标单位（可选，默认为毫米）
+/// - `root_refno`: 若提供，则仅导出该 refno 下的 visible 子孙节点；否则导出整个 dbnum
 ///
 /// # 返回
 /// 导出统计信息
@@ -2299,6 +2300,7 @@ pub async fn export_dbnum_instances_json(
     db_option: std::sync::Arc<DbOption>,
     verbose: bool,
     target_unit: Option<LengthUnit>,
+    root_refno: Option<RefnoEnum>,
 ) -> Result<ExportStats> {
     let start_time = std::time::Instant::now();
 
@@ -2331,7 +2333,7 @@ pub async fn export_dbnum_instances_json(
     fs::create_dir_all(output_dir)
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
 
-    // 1. 使用 TreeIndex 获取 dbnum 下的所有 refno
+    // 1. 使用 TreeIndex 获取 dbnum 下的所有 refno（或指定 root_refno 的 visible 子孙）
     if verbose {
         println!("🔍 加载 TreeIndex...");
     }
@@ -2347,11 +2349,23 @@ pub async fn export_dbnum_instances_json(
     // 在大栈线程中加载，避免 Windows 上反序列化大 tree 文件触发栈溢出。
     let tree_index = load_index_with_large_stack(&tree_dir, dbnum)
         .with_context(|| format!("加载 TreeIndex 失败: {}", tree_path.display()))?;
-    let mut all_refnos: Vec<RefnoEnum> = tree_index
-        .all_refnos()
-        .into_iter()
-        .map(RefnoEnum::from)
-        .collect();
+    
+    // 获取待导出的 refno 列表
+    let mut all_refnos: Vec<RefnoEnum> = if let Some(root) = root_refno {
+        // 使用 query_compat 中基于 TreeIndex 的可见子孙查询
+        use crate::fast_model::query_compat::query_visible_geo_descendants;
+        if verbose {
+            println!("🔍 查询 {} 的 visible 子孙节点...", root);
+        }
+        query_visible_geo_descendants(root, true, Some("..")).await?
+    } else {
+        // 原有逻辑：加载整个 dbnum 的 TreeIndex
+        tree_index
+            .all_refnos()
+            .into_iter()
+            .map(RefnoEnum::from)
+            .collect()
+    };
     all_refnos.sort_by_key(|r| r.to_string());
     if verbose {
         println!("✅ TreeIndex 加载完成，refno 数量: {}", all_refnos.len());
@@ -4180,7 +4194,7 @@ pub async fn export_instances_json_for_dbnos(
     fs::create_dir_all(&instances_dir)
         .with_context(|| format!("创建 instances 输出目录失败: {}", instances_dir.display()))?;
     for &dbnum in dbnos {
-        export_dbnum_instances_json(dbnum, &instances_dir, db_option.clone(), false, None).await?;
+        export_dbnum_instances_json(dbnum, &instances_dir, db_option.clone(), false, None, None).await?;
     }
     Ok(())
 }
@@ -4221,7 +4235,7 @@ pub async fn export_instances_json_for_refnos_grouped_by_dbno(
     fs::create_dir_all(&instances_dir)
         .with_context(|| format!("创建 instances 输出目录失败: {}", instances_dir.display()))?;
     for dbnum in dbnos {
-        export_dbnum_instances_json(dbnum, &instances_dir, db_option.clone(), false, None).await?;
+        export_dbnum_instances_json(dbnum, &instances_dir, db_option.clone(), false, None, None).await?;
     }
     Ok(())
 }

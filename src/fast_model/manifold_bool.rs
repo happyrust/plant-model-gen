@@ -1049,7 +1049,55 @@ pub async fn run_boolean_worker_from_cache_manager(
     }
 
     fn world_mat_for_info(info: &EleGeosInfo) -> DMat4 {
-        info.world_transform.to_matrix().as_dmat4()
+        // 统一走 EleGeosInfo 的封装：避免部分 cache-only 数据里 `world_transform` 字段
+        // 不是“最终世界变换”（例如需要补齐 owner 链/策略计算/transform_cache 命中）时，
+        // NGMR/NEG 的相对变换计算错位，导致差集无效（典型：孔洞没有被切出来）。
+        info.get_ele_world_transform().to_matrix().as_dmat4()
+    }
+
+    fn pos_world_mat_for_boolean(
+        refno: RefnoEnum,
+        info: &EleGeosInfo,
+        inst_geos: &EleInstGeosData,
+    ) -> DMat4 {
+        // 经验：部分几何（尤其是 PrimLoft/SweepSolid）在写入 instance_cache 时，
+        // 其 geo_param 内部已经携带 segment_transform.rotation（相当于“世界朝向”），
+        // 而 inst_info.world_transform.rotation 也同时存在。
+        //
+        // cache-only boolean 的正实体加载使用的是 inst.geo_transform（pos local），
+        // 因此若再用 inst_info 的 rotation 去做 world<->local 变换，会把负实体“旋转到错误轴”，
+        // 典型表现：ngmr 关系存在，但差集完全不生效（负实体被映射到 pos_local 的数千毫米之外）。
+        //
+        // 这里做一个“仅对 loft 类几何”的修正：当 segment_transform.rotation 与 inst_info.rotation
+        // 基本一致时，认为 rotation 已被 bake 到 geo_param 侧，boolean 仅使用平移作为 world 基准。
+        let mut t = info.get_ele_world_transform();
+
+        let loft_rot = inst_geos
+            .insts
+            .iter()
+            .find(|x| matches!(x.geo_type, GeoBasicType::Pos | GeoBasicType::Compound | GeoBasicType::DesiPos | GeoBasicType::CatePos))
+            .and_then(|inst| match &inst.geo_param {
+                PdmsGeoParam::PrimLoft(s) => s
+                    .segment_transforms
+                    .first()
+                    .map(|seg| seg.rotation),
+                _ => None,
+            });
+
+        if let Some(r) = loft_rot {
+            // dot 近似 1 或 -1 都认为“方向一致”（四元数符号等价）。
+            let dot = t.rotation.dot(r).abs();
+            if dot > 0.999 {
+                t.rotation = glam::Quat::IDENTITY;
+                debug_model_debug!(
+                    "[boolean_worker_cache] pos_world_mat_for_boolean: strip rotation for refno={} (dot={:.6})",
+                    refno,
+                    dot
+                );
+            }
+        }
+
+        t.to_matrix().as_dmat4()
     }
 
     fn diff_with_guards(
@@ -1239,8 +1287,42 @@ pub async fn run_boolean_worker_from_cache_manager(
             continue;
         };
 
-        let pos_world_mat = world_mat_for_info(info);
-        let inverse_pos_world = pos_world_mat.inverse();
+        let pos_world_mat = pos_world_mat_for_boolean(refno, info, inst_geos);
+        let mut inverse_pos_world = pos_world_mat.inverse();
+
+        // PrimLoft(SweepSolid) 的 profile.x 往往对应 mesh local 的 -Z（典型：STWALL 截面宽度 1300 -> z∈[-1300..0]），
+        // 而负实体的 world/local 推导通常落在 z∈[0..1300]。
+        // 这里把“profile.x_max”作为一个常用的局部坐标偏移量补偿：world->mesh 时额外平移 (0,0,-x_max)，
+        // 使 cutter 能落入 pos mesh 的实际局部包围盒范围内。
+        //
+        // 公式：world = pos_world * (mesh - offset)  ⇒  mesh = offset * inv(pos_world) * world
+        if let Some(offset) = inst_geos
+            .insts
+            .iter()
+            .find(|x| matches!(x.geo_type, GeoBasicType::Pos | GeoBasicType::Compound | GeoBasicType::DesiPos | GeoBasicType::CatePos))
+            .and_then(|inst| match &inst.geo_param {
+                PdmsGeoParam::PrimLoft(s) => {
+                    // CateProfileParam 在 rs-core 中提供 get_bbox()，可覆盖 SPRO/SREC/SANN 等 profile 形式。
+                    // 这里取 bbox.maxs.x 作为“profile.x_max”的近似。
+                    s.profile.get_bbox().and_then(|bbox| {
+                        let max_x = bbox.maxs.x as f64;
+                        if max_x.is_finite() && max_x.abs() > 1e-6 {
+                            Some(glam::DVec3::new(0.0, 0.0, -max_x))
+                        } else {
+                            None
+                        }
+                    })
+                }
+                _ => None,
+            })
+        {
+            inverse_pos_world = DMat4::from_translation(offset) * inverse_pos_world;
+            debug_model_debug!(
+                "[boolean_worker_cache] apply loft offset for refno={} offset={:?}",
+                refno,
+                offset
+            );
+        }
 
         // 正实体：使用局部变换（pos local space）加载
         let mut pos_manifolds = Vec::new();

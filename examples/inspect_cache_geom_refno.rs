@@ -10,6 +10,7 @@
 
 use anyhow::{Context, Result};
 use aios_core::RefnoEnum;
+use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
 
@@ -51,15 +52,34 @@ async fn main() -> Result<()> {
     let mut best: Option<(String, i64, aios_database::fast_model::instance_cache::CachedInstanceBatch)> =
         None;
 
+    // 汇总所有 batch 中的关系（便于确认“关系缺失” vs “仅最新 batch 丢失/覆盖”）
+    let mut all_neg_carriers: HashSet<RefnoEnum> = HashSet::new();
+    let mut all_ngmr_pairs: HashSet<(RefnoEnum, RefnoEnum)> = HashSet::new();
+
     for batch_id in batch_ids {
         let Some(batch) = cache.get(dbnum, &batch_id).await else {
             continue;
         };
 
-        let hit = batch
-            .inst_geos_map
-            .values()
-            .any(|g| g.refno.refno() == want_u64 && !g.insts.is_empty());
+        if let Some(v) = batch.neg_relate_map.get(&refno) {
+            for &c in v {
+                all_neg_carriers.insert(c);
+            }
+        }
+        if let Some(v) = batch.ngmr_neg_relate_map.get(&refno) {
+            for &p in v {
+                all_ngmr_pairs.insert(p);
+            }
+        }
+
+        // 命中条件：
+        // - inst_geos 命中（可直接查看几何）
+        // - 或仅 inst_info 命中（用于排查 owner/世界变换，但该 refno 本身可能无几何）
+        let hit = batch.inst_info_map.keys().any(|k| k.refno() == want_u64)
+            || batch
+                .inst_geos_map
+                .values()
+                .any(|g| g.refno.refno() == want_u64 && !g.insts.is_empty());
         if !hit {
             continue;
         }
@@ -71,7 +91,7 @@ async fn main() -> Result<()> {
     }
 
     let Some((batch_id, _ts, batch)) = best else {
-        println!("⚠️ 未在 cache 中找到该 refno 的 inst_geos（可能未生成或已被清理）");
+        println!("⚠️ 未在 cache 中找到该 refno 的 inst_info/inst_geos（可能未生成或已被清理）");
         return Ok(());
     };
 
@@ -88,6 +108,19 @@ async fn main() -> Result<()> {
         .find(|g| g.refno.refno() == want_u64 && !g.insts.is_empty());
 
     println!("\n== latest hit batch_id={} created_at={} ==", batch_id, batch.created_at);
+    println!(
+        "== all batches relation summary ==\n  - neg carriers: {}\n  - ngmr pairs: {}",
+        all_neg_carriers.len(),
+        all_ngmr_pairs.len()
+    );
+    if !all_ngmr_pairs.is_empty() {
+        let mut pairs: Vec<(RefnoEnum, RefnoEnum)> = all_ngmr_pairs.iter().copied().collect();
+        pairs.sort_by_key(|(c, g)| (c.refno().0, g.refno().0));
+        println!("  - ngmr pairs (carrier, geom_refno) sample:");
+        for (i, (c, g)) in pairs.iter().take(20).enumerate() {
+            println!("    [{}] carrier={} geom_refno={}", i, c, g);
+        }
+    }
     // 关系映射（用于排查“负实体已生成但未被应用到目标”的情况）
     match batch.neg_relate_map.get(&refno) {
         Some(v) => {
@@ -150,7 +183,11 @@ async fn main() -> Result<()> {
             "inst_info: refno={} sesno={} visible={} owner={:?}/{:?}",
             info.refno, info.sesno, info.visible, info.owner_refno, info.owner_type
         );
-        println!("inst_info.world_transform: {:?}", info.world_transform);
+        println!("inst_info.world_transform(raw): {:?}", info.world_transform);
+        println!(
+            "inst_info.world_transform(effective): {:?}",
+            info.get_ele_world_transform()
+        );
     }
 
     if let Some(geos) = geos {

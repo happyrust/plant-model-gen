@@ -95,19 +95,142 @@ impl DbMetaManager {
     }
 
     /// 尝试从默认路径加载
+    ///
+    /// 只使用项目目录 output/{project_name}/scene_tree/db_meta_info.json
+    /// 若不存在，自动触发解析生成
     pub fn try_load_default(&self) -> Result<()> {
-        let default_paths = [
-            "output/scene_tree/db_meta_info.json",
-            "../output/scene_tree/db_meta_info.json",
-        ];
-        
-        for path in &default_paths {
+        // 尝试从 DbOption 获取 project_name
+        let project_paths = self.get_project_based_paths();
+
+        // 尝试项目目录
+        for path in &project_paths {
             if Path::new(path).exists() {
                 return self.load(path);
             }
         }
+
+        // 文件不存在时，自动触发解析生成（不再兼容旧目录结构 output/scene_tree）
+        println!("📂 检测到 indextree 文件缺失，正在自动生成...");
+        self.auto_generate_indextree()?;
+
+        // 重新尝试加载
+        for path in &project_paths {
+            if Path::new(path).exists() {
+                return self.load(path);
+            }
+        }
+
+        anyhow::bail!("自动生成后仍未找到 db_meta_info.json，尝试路径: {:?}", project_paths)
+    }
+
+    /// 获取基于项目名称的路径列表
+    /// 
+    /// 从 DbOption.toml 读取 project_name，构建 output/{project_name}/scene_tree/ 路径
+    fn get_project_based_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
         
-        anyhow::bail!("未找到 db_meta_info.json，尝试路径: {:?}", default_paths)
+        // 从 DbOption.toml 读取 project_name
+        if let Ok(content) = std::fs::read_to_string("DbOption.toml") {
+            // 简单解析 project_name = "xxx"
+            for line in content.lines() {
+                let line = line.trim();
+                if line.starts_with("project_name") {
+                    if let Some(value) = line.split('=').nth(1) {
+                        let name = value.trim().trim_matches('"').trim_matches('\'');
+                        if !name.is_empty() {
+                            let path = format!("output/{}/scene_tree/db_meta_info.json", name);
+                            paths.push(path);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        paths
+    }
+
+    /// 自动生成 indextree 文件（使用解析方式，只处理 DESI 类型）
+    fn auto_generate_indextree(&self) -> Result<()> {
+        use crate::versioned_db::database::sync_total_async_threaded;
+        use aios_core::options::DbOption;
+        use dashmap::DashSet;
+        use std::sync::Arc;
+
+        // 从 DbOption.toml 读取配置
+        let config_path = "DbOption.toml";
+        if !std::path::Path::new(config_path).exists() {
+            anyhow::bail!("未找到配置文件 DbOption.toml");
+        }
+
+        let content = std::fs::read_to_string(config_path)?;
+        let mut db_option: DbOption = toml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("解析 DbOption.toml 失败: {}", e))?;
+
+        // 设置为仅生成树结构模式
+        db_option.gen_tree_only = true;
+        db_option.total_sync = true;
+        db_option.save_db = Some(false);
+
+        // 只生成 project_name 对应的 indextree
+        let project_name = db_option.project_name.clone();
+
+        println!("🔄 正在通过 PDMS 解析生成 indextree (gen_tree_only 模式, 项目: {}, 类型: DESI)...", project_name);
+
+        // 使用 tokio runtime 执行异步生成
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let cur_dbno_set = Arc::new(DashSet::new());
+                        // 【关键】只处理 DESI 类型的 db 文件
+                        sync_total_async_threaded(
+                            &db_option,
+                            &project_name,
+                            cur_dbno_set,
+                            &["DESI"],
+                            100,
+                        ).await
+                    })
+                })
+            }
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async {
+                    let cur_dbno_set = Arc::new(DashSet::new());
+                    // 【关键】只处理 DESI 类型的 db 文件
+                    sync_total_async_threaded(
+                        &db_option,
+                        &project_name,
+                        cur_dbno_set,
+                        &["DESI"],
+                        100,
+                    ).await
+                })
+            }
+        };
+
+        match result {
+            Ok(_) => {
+                println!("✅ indextree 生成完成");
+                Ok(())
+            }
+            Err(e) => {
+                anyhow::bail!("indextree 生成失败: {}", e)
+            }
+        }
+    }
+
+    /// 从指定项目目录加载
+    pub fn load_from_project(&self, project_name: &str) -> Result<()> {
+        let path = format!("output/{}/scene_tree/db_meta_info.json", project_name);
+        if Path::new(&path).exists() {
+            self.load(&path)
+        } else {
+            anyhow::bail!("项目 {} 的 db_meta_info.json 不存在: {}", project_name, path)
+        }
     }
 
     /// 确保已加载（如未加载则尝试从默认路径加载）
@@ -171,4 +294,142 @@ pub fn get_dbnum(ref0: u32) -> Option<u32> {
 /// 便捷函数：将 ref0 列表转换为 dbnum 列表
 pub fn ref0s_to_dbnums(ref0s: &[u32]) -> Vec<u32> {
     db_meta().ref0s_to_dbnums(ref0s)
+}
+
+/// 生成所有 DESI 类型的 indextree 文件
+pub fn generate_desi_indextree() -> anyhow::Result<()> {
+    use crate::versioned_db::database::sync_total_async_threaded;
+    use aios_core::options::DbOption;
+    use dashmap::DashSet;
+    use std::sync::Arc;
+
+    // 从 DbOption.toml 读取配置
+    let config_path = "DbOption.toml";
+    if !std::path::Path::new(config_path).exists() {
+        anyhow::bail!("未找到配置文件 DbOption.toml");
+    }
+
+    let content = std::fs::read_to_string(config_path)?;
+    let mut db_option: DbOption = toml::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("解析 DbOption.toml 失败: {}", e))?;
+
+    // 设置为仅生成树结构模式
+    db_option.gen_tree_only = true;
+    db_option.total_sync = true;
+    db_option.save_db = Some(false);
+
+    let project_name = db_option.project_name.clone();
+    println!("🔄 正在生成 DESI 类型 indextree (项目: {})...", project_name);
+
+    // 使用 tokio runtime 执行异步生成
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    let cur_dbno_set = Arc::new(DashSet::new());
+                    sync_total_async_threaded(
+                        &db_option,
+                        &project_name,
+                        cur_dbno_set,
+                        &["DESI"],
+                        100,
+                    ).await
+                })
+            })
+        }
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async {
+                let cur_dbno_set = Arc::new(DashSet::new());
+                sync_total_async_threaded(
+                    &db_option,
+                    &project_name,
+                    cur_dbno_set,
+                    &["DESI"],
+                    100,
+                ).await
+            })
+        }
+    };
+
+    result.map_err(|e| anyhow::anyhow!("indextree 生成失败: {}", e))
+}
+
+/// 生成指定 dbnum 的 indextree 文件
+pub fn generate_single_indextree(target_dbnum: u32) -> anyhow::Result<()> {
+    use aios_core::options::DbOption;
+    use parse_pdms_db::parse::parse_file_basic_info;
+    use std::fs;
+    use std::io::Read;
+
+    // 从 DbOption.toml 读取配置
+    let config_path = "DbOption.toml";
+    if !std::path::Path::new(config_path).exists() {
+        anyhow::bail!("未找到配置文件 DbOption.toml");
+    }
+
+    let content = fs::read_to_string(config_path)?;
+    let db_option: DbOption = toml::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("解析 DbOption.toml 失败: {}", e))?;
+
+    let project_name = db_option.project_name.clone();
+    let project_dir = db_option.get_project_path(&project_name)
+        .ok_or_else(|| anyhow::anyhow!("无法获取项目路径"))?;
+
+    println!("🔍 扫描项目目录: {}", project_dir.display());
+
+    // 扫描项目目录下的所有文件，找到匹配的 dbnum
+    let mut found_file: Option<String> = None;
+
+    if let Ok(entries) = fs::read_dir(&project_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(mut file) = fs::File::open(&path) {
+                    let mut buf = [0u8; 60];
+                    if file.read_exact(&mut buf).is_ok() {
+                        let db_info = parse_file_basic_info(&buf);
+                        if db_info.dbnum == target_dbnum {
+                            found_file = Some(path.to_string_lossy().to_string());
+                            println!("✅ 找到 dbnum={} 的文件: {}", target_dbnum, path.display());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let file_path = found_file.ok_or_else(|| {
+        anyhow::anyhow!("未找到 dbnum={} 对应的 db 文件", target_dbnum)
+    })?;
+
+    println!("🔄 正在生成 dbnum={} 的 indextree...", target_dbnum);
+
+    // 调用单文件解析函数
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    crate::versioned_db::database::parse_single_db_file(
+                        &db_option, &project_name, &file_path, target_dbnum,
+                    ).await
+                })
+            })
+        }
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async {
+                crate::versioned_db::database::parse_single_db_file(
+                    &db_option, &project_name, &file_path, target_dbnum,
+                ).await
+            })
+        }
+    };
+
+    result.map_err(|e| anyhow::anyhow!("indextree 生成失败: {}", e))
 }

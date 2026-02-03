@@ -1185,7 +1185,7 @@ where
         }
 
         if let Err(e) =
-            export_tree_file(dbnum, db_basic.as_ref(), &tree_nodes, &db_basic.children_map, Path::new("output/scene_tree"))
+            export_tree_file(dbnum, db_basic.as_ref(), &tree_nodes, &db_basic.children_map, &db_meta_info::get_project_tree_dir(&project_name))
         {
             warn!("[tree_export] dbnum={} 导出失败: {}", dbnum, e);
         }
@@ -1931,7 +1931,7 @@ pub async fn sync_total_async_threaded(
                     let header_debug = None;
 
                     if let Err(e) = db_meta_info::update_db_meta_info_json(
-                        Path::new(db_meta_info::DEFAULT_TREE_DIR),
+                        &db_meta_info::get_project_tree_dir(&project_name),
                         db_meta_info::DbFileMetaUpdate {
                             dbnum,
                             db_type: &db_type,
@@ -1955,7 +1955,7 @@ pub async fn sync_total_async_threaded(
                     db_basic.as_ref(),
                     &tree_nodes,
                     &db_basic.children_map,
-                    Path::new("output/scene_tree"),
+                    &db_meta_info::get_project_tree_dir(&project_name),
                 ) {
                     warn!("[tree_export] dbnum={} 导出失败: {}", dbnum, e);
                 }
@@ -2073,4 +2073,157 @@ async fn test_threads() {
     for v in Arc::try_unwrap(map).unwrap() {
         dbg!(v);
     }
+}
+
+/// 解析单个 db 文件并生成 indextree
+pub async fn parse_single_db_file(
+    db_option: &DbOption,
+    project_name: &str,
+    file_path: &str,
+    target_dbnum: u32,
+) -> anyhow::Result<()> {
+    let time = Instant::now();
+    let chunk_size = db_option.att_chunk as usize;
+    let path = PathBuf::from(file_path);
+    let file_name = path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    println!("🔄 开始解析文件: {} (dbnum={})", file_name, target_dbnum);
+
+    // 读取文件头获取 db_type
+    let db_type = {
+        let mut file = std::fs::File::open(&path)?;
+        let mut buf = [0u8; 60];
+        file.read(&mut buf)?;
+        parse_file_basic_info(&buf).db_type
+    };
+
+    // 解析基本数据
+    let db_basic = match parse_file_db_basic_data(&path, &file_name, project_name) {
+        Ok(data) => data,
+        Err(e) => {
+            anyhow::bail!("parse_file_db_basic_data 失败: {}", e);
+        }
+    };
+
+    let all_refnos: Vec<_> = db_basic.refno_table_map.iter().map(|entry| *entry.key()).collect();
+    if all_refnos.is_empty() {
+        anyhow::bail!("文件 {} 中没有找到任何 refno", file_name);
+    }
+
+    println!("📊 找到 {} 个 refno，开始解析...", all_refnos.len());
+
+    let db_basic = Arc::new(db_basic);
+    let mut tree_nodes: HashMap<RefU64, TreeNodeMeta> = HashMap::new();
+    let ses_range_map: BTreeMap<i32, Range<u32>> = BTreeMap::new();
+
+    // 分块解析
+    for chunk in all_refnos.chunks(chunk_size) {
+        let chunk_refnos = chunk.to_vec();
+
+        match parse_file_with_chunk(
+            db_basic.clone(),
+            &file_name,
+            project_name,
+            &chunk_refnos,
+            &ses_range_map,
+            true, // ignore_world_refno
+        )
+        .await
+        {
+            Ok(PdmsDbData {
+                total_attr_map,
+                dbnum,
+                ..
+            }) => {
+                for entry in total_attr_map.iter() {
+                    let refno = *entry.key();
+                    let att = entry.value();
+                    let noun = att.get_type_hash();
+                    let owner = att.get_owner().refno();
+                    let cata_hash = att.cal_cata_hash();
+                    tree_nodes.entry(refno).or_insert(TreeNodeMeta {
+                        refno,
+                        owner,
+                        noun,
+                        cata_hash,
+                    });
+                }
+            }
+            Err(e) => {
+                warn!("parse_file_with_chunk 失败: {}", e);
+            }
+        }
+    }
+
+    // 导出 tree 文件
+    let output_dir = db_meta_info::get_project_tree_dir(project_name);
+    if let Err(e) = export_tree_file(
+        target_dbnum,
+        db_basic.as_ref(),
+        &tree_nodes,
+        &db_basic.children_map,
+        &output_dir,
+    ) {
+        anyhow::bail!("export_tree_file 失败: {}", e);
+    }
+
+    // 收集 ref0s 并更新 db_meta_info.json
+    let ref0s: std::collections::BTreeSet<u32> = tree_nodes
+        .keys()
+        .map(|r| r.get_0())
+        .collect();
+
+    let file_path_buf = PathBuf::from(file_path);
+
+    // 读取文件头 60 字节转 hex
+    let header_hex_60 = (|| -> Option<String> {
+        let mut f = std::fs::File::open(&path).ok()?;
+        let mut buf = [0u8; 60];
+        f.read_exact(&mut buf).ok()?;
+        Some(hex::encode(buf))
+    })();
+
+    // 获取 latest_sesno (通过 PdmsIO)
+    let latest_sesno = {
+        let mut io = PdmsIO::new(project_name, path.clone(), true);
+        if io.open().is_ok() {
+            match io.get_latest_sesno() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    warn!("get_latest_sesno failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Err(e) = db_meta_info::update_db_meta_info_json(
+        &output_dir,
+        db_meta_info::DbFileMetaUpdate {
+            dbnum: target_dbnum,
+            db_type: &db_type,
+            file_name: &file_name,
+            file_path: &file_path_buf,
+            header_hex_60,
+            header_debug: None,
+            latest_sesno,
+            sesno_timestamp: None,
+            ref0s,
+        },
+    ) {
+        warn!("update_db_meta_info_json 失败: {}", e);
+    }
+
+    println!(
+        "✅ 解析完成，耗时: {:.2}s，生成 {} 个节点",
+        time.elapsed().as_secs_f32(),
+        tree_nodes.len()
+    );
+
+    Ok(())
 }

@@ -153,6 +153,13 @@ async fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("gen-indextree")
+                .long("gen-indextree")
+                .help("生成 indextree 文件。可选指定 dbnum，不指定则生成所有 DESI 类型")
+                .value_name("DBNUM")
+                .num_args(0..=1),
+        )
+        .arg(
             Arg::new("capture")
                 .long("capture")
                 .help("After model generation, export OBJ and capture screenshots (optionally provide output directory)")
@@ -752,6 +759,23 @@ async fn main() -> anyhow::Result<()> {
         aios_database::init_logging(true);
     }
 
+    // ========== 处理 --gen-indextree 参数 ==========
+    if matches.contains_id("gen-indextree") {
+        let dbnum: Option<u32> = matches
+            .get_one::<String>("gen-indextree")
+            .and_then(|s| s.parse().ok());
+
+        if let Some(dbnum) = dbnum {
+            println!("🔄 生成指定 dbnum={} 的 indextree...", dbnum);
+            aios_database::data_interface::db_meta_manager::generate_single_indextree(dbnum)?;
+        } else {
+            println!("🔄 生成所有 DESI 类型的 indextree...");
+            aios_database::data_interface::db_meta_manager::generate_desi_indextree()?;
+        }
+        println!("✅ indextree 生成完成");
+        return Ok(());
+    }
+
     // ========== 处理 --regen-model 参数（影响纯模型生成） ==========
     if matches.get_flag("regen-model") {
         println!("🔄 检测到 --regen-model 参数，强制开启 replace_mesh 模式");
@@ -1158,9 +1182,20 @@ async fn main() -> anyhow::Result<()> {
 
     if matches.get_flag("export-dbnum-instances-json") {
         use crate::cli_modes::export_dbnum_instances_json_mode;
+        use aios_core::pdms_types::RefnoEnum;
+        use std::str::FromStr;
 
         let dbnum = matches.get_one::<u32>("dbnum").copied();
         let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
+
+        // 解析 --debug-model 参数作为 root_refno
+        let root_refno: Option<RefnoEnum> = matches
+            .get_many::<String>("debug-model")
+            .and_then(|values| values.into_iter().next())
+            .and_then(|s| {
+                let refno_str = s.replace('_', "/");
+                RefnoEnum::from_str(&refno_str).ok()
+            });
 
         // 必须提供 dbnum 参数
         let dbnum = match dbnum {
@@ -1174,6 +1209,9 @@ async fn main() -> anyhow::Result<()> {
 
         println!("🎯 导出 dbnum 实例数据为 JSON（含 AABB）");
         println!("   - 按 dbnum={} 过滤", dbnum);
+        if let Some(ref refno) = root_refno {
+            println!("   - 仅导出 {} 的 visible 子孙", refno);
+        }
         if let Some(ref dir) = export_bundle_dir {
             println!("   - 输出目录: {}", dir.display());
         }
@@ -1184,6 +1222,7 @@ async fn main() -> anyhow::Result<()> {
             export_bundle_dir,
             &db_option_ext,
             true, // autorun=true
+            root_refno,
         )
             .await;
     }

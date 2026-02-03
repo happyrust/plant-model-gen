@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
 
         println!("✅ hit batch_id={}", batch_id);
         println!("   - inst_key={}", inst_key);
+        println!("   - geos.type_name={}", geos.type_name);
         println!("   - owner_type={} owner_refno={}", info.owner_type, info.owner_refno);
         println!("   - has_cata_neg={} is_solid={}", info.has_cata_neg, info.is_solid);
         println!(
@@ -108,6 +109,14 @@ async fn main() -> Result<()> {
                 inst.transform.scale.x,
                 inst.transform.scale.y,
                 inst.transform.scale.z
+            );
+            // rotation 也会影响“底对齐”补偿方向（例如局部 z 轴翻转会导致 +0.5 变成向下移动）。
+            println!(
+                "          rot: ({:.6},{:.6},{:.6},{:.6})",
+                inst.transform.rotation.x,
+                inst.transform.rotation.y,
+                inst.transform.rotation.z,
+                inst.transform.rotation.w
             );
         }
 

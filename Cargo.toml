@@ -288,6 +288,11 @@ name = "diagnose_export_instances"
 path = "src/examples/diagnose_export_instances.rs"
 required-features = ["gen_model"]
 
+[[example]]
+name = "query_tubi_world_trans"
+path = "src/examples/query_tubi_world_trans.rs"
+required-features = ["gen_model"]
+
 eframe = { git = "https://github.com/emilk/egui.git", rev = "fa4cfec777c9ea21b8643f77b6a26561da44aad0", package = "eframe" }
 
 # [patch."https://github.com/happyrust/rs-core.git"]

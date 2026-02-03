@@ -174,17 +174,22 @@ pub async fn get_world_transform_cache_first(
     refno: RefnoEnum,
 ) -> anyhow::Result<Option<Transform>> {
     let dbnum = resolve_dbnum(refno);
+    let use_cache = db_option.map(|x| x.use_cache).unwrap_or(true);
 
-    if let Some(cache) = get_global_cache(db_option).await? {
-        if let Some(hit) = cache.get_world_transform(dbnum, refno).await {
-            return Ok(Some(hit));
+    if use_cache {
+        if let Some(cache) = get_global_cache(db_option).await? {
+            if let Some(hit) = cache.get_world_transform(dbnum, refno).await {
+                return Ok(Some(hit));
+            }
         }
     }
 
     // miss：先用“直接读 pe.world_trans”的轻量路径（不依赖 pe_transform 预热）。
     if let Ok(Some(world)) = aios_core::rs_surreal::query_pe_world_trans(refno).await {
-        if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
-            cache.insert_world_transform(dbnum, refno, world.clone());
+        if use_cache {
+            if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
+                cache.insert_world_transform(dbnum, refno, world.clone());
+            }
         }
         return Ok(Some(world));
     }
@@ -192,8 +197,10 @@ pub async fn get_world_transform_cache_first(
     // 再兜底走旧计算路径（策略/惰性计算）。
     let computed = aios_core::get_world_transform(refno).await?;
     if let Some(world) = computed.clone() {
-        if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
-            cache.insert_world_transform(dbnum, refno, world);
+        if use_cache {
+            if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
+                cache.insert_world_transform(dbnum, refno, world);
+            }
         }
     }
     Ok(computed)

@@ -1293,6 +1293,5 @@ pub async fn run_boolean_worker_from_cache_manager(
 
 /// 基于 foyer 缓存的布尔运算（不访问 SurrealDB）
 pub async fn run_boolean_worker_from_cache(cache_dir: &Path) -> anyhow::Result<usize> {
-    let cache_manager = InstanceCacheManager::new(cache_dir).await?;
-    run_boolean_worker_from_cache_manager(&cache_manager).await
+    crate::fast_model::foyer_cache::boolean::run_boolean_worker_from_cache_dir(cache_dir).await
 }

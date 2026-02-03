@@ -187,8 +187,14 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("capture-include-descendants")
                 .long("capture-include-descendants")
-                .help("Include descendants when exporting OBJ for capture")
-                .action(clap::ArgAction::SetTrue)
+                .help("Include descendants when exporting OBJ for capture (default: true). You can pass `--capture-include-descendants=false` to disable.")
+                // 兼容两种写法：
+                // - 旧：`--capture-include-descendants`（无值）=> true
+                // - 新：`--capture-include-descendants=true/false`
+                .num_args(0..=1)
+                .default_missing_value("true")
+                .default_value("true")
+                .value_parser(clap::value_parser!(bool))
                 .requires("capture"),
         )
         .arg(
@@ -649,7 +655,12 @@ async fn main() -> anyhow::Result<()> {
         .copied()
         .unwrap_or(900);
     let capture_views = matches.get_one::<u8>("capture-views").copied().unwrap_or(1);
-    let capture_include_descendants = matches.get_flag("capture-include-descendants");
+    // 截图链路默认包含子孙节点（与导出默认语义一致），否则像 BRAN/HANG 这类“几何主要在子孙节点/关联表”时
+    // 会只截到一小段 TUBI，从而误判“导出管道不对”。
+    let capture_include_descendants = matches
+        .get_one::<bool>("capture-include-descendants")
+        .copied()
+        .unwrap_or(true);
     let capture_baseline_dir = matches.get_one::<String>("capture-baseline").cloned();
     let capture_diff_dir = matches.get_one::<String>("capture-diff").cloned();
 
@@ -780,6 +791,10 @@ async fn main() -> anyhow::Result<()> {
     if obj_export_flow {
         let cli_use_surrealdb = matches.get_flag("use-surrealdb");
         db_option_ext.use_surrealdb = cli_use_surrealdb;
+        if cli_use_surrealdb {
+            // SurrealDB-only：用于对照验证，避免与 cache 混用
+            db_option_ext.use_cache = false;
+        }
 
         if !db_option_ext.use_cache && !db_option_ext.use_surrealdb {
             anyhow::bail!(

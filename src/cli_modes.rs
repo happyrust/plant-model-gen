@@ -1320,15 +1320,15 @@ pub async fn export_model_mode(
 ) -> Result<()> {
     match format.to_lowercase().as_str() {
         "obj" => {
-            let obj_config = config.with_unit_conversion("mm", "dm");
+            let obj_config = config.with_unit_conversion("mm", "mm");
             export_obj_mode(obj_config, db_option_ext).await
         }
         "glb" => {
-            let glb_config = config.with_unit_conversion("mm", "dm");
+            let glb_config = config.with_unit_conversion("mm", "mm");
             export_glb_mode(glb_config, db_option_ext).await
         }
         "gltf" => {
-            let gltf_config = config.with_unit_conversion("mm", "dm");
+            let gltf_config = config.with_unit_conversion("mm", "mm");
             export_gltf_mode(gltf_config, db_option_ext).await
         }
         "xkt" => {

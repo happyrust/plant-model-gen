@@ -284,6 +284,42 @@ impl InstanceCacheManager {
         result
     }
 
+    pub async fn get_ptset_maps_for_refnos_auto(
+        &self,
+        refnos: &[RefnoEnum],
+    ) -> HashMap<RefnoEnum, [CateAxisParam; 2]> {
+        let mut result = HashMap::new();
+        if refnos.is_empty() {
+            return result;
+        }
+
+        if let Err(e) = db_meta().ensure_loaded() {
+            log::warn!(
+                "[cache] db_meta 未加载，无法自动分组 dbnum 读取 ptset_map，将返回空结果: {}",
+                e
+            );
+            return result;
+        }
+
+        let mut groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
+        for &refno in refnos {
+            let Some(dbnum) = db_meta().get_dbnum_by_refno(refno) else {
+                continue;
+            };
+            if dbnum == 0 {
+                continue;
+            }
+            groups.entry(dbnum).or_default().push(refno);
+        }
+
+        for (dbnum, group) in groups {
+            let hm = self.get_ptset_maps_for_refnos(dbnum, &group).await;
+            result.extend(hm);
+        }
+
+        result
+    }
+
     /// 获取单个 refno 的 ptset_map（ARRIVE/LEAVE 点）
     /// 返回 Option<[CateAxisParam; 2]>，其中 [0]=ARRIVE(ptset[1]), [1]=LEAVE(ptset[2])
     pub async fn get_ptset_for_refno(

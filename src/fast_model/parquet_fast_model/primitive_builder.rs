@@ -65,7 +65,7 @@ impl PrimitiveBuilder {
         }
         
         // 6. 生成几何实例
-        let transform = csg_shape.get_trans();
+        let mut transform = csg_shape.get_trans();
         
         // 检查 NaN
         if transform.translation.is_nan() 
@@ -75,16 +75,27 @@ impl PrimitiveBuilder {
             return Ok(None);
         }
         
-        let geo_param = csg_shape.convert_to_geo_param()
+        let mut geo_param = csg_shape.convert_to_geo_param()
             .unwrap_or(aios_core::parsed_data::geo_params_data::PdmsGeoParam::Unknown);
         let geo_hash = csg_shape.hash_unit_mesh_params();
-        
-        let unit_flag = match &geo_param {
-            aios_core::parsed_data::geo_params_data::PdmsGeoParam::PrimSCylinder(s) => s.unit_flag,
-            // PrimLoft(SweepSolid) 仅在“单段直线且无倾斜”时可安全 unit 化复用
-            aios_core::parsed_data::geo_params_data::PdmsGeoParam::PrimLoft(s) => s.is_reuse_unit(),
-            _ => false,
-        };
+
+        let unit_flag = csg_shape.is_reuse_unit();
+
+        // unit_flag=true 时，必须把 geo_param 写成"单位参数"，避免同一 geo_hash 复用时 mesh 被绝对尺寸污染，
+        // 同时确保保留 transform.scale 时不会重复缩放。
+        if unit_flag {
+            geo_param = csg_shape
+                .gen_unit_shape()
+                .convert_to_geo_param()
+                .unwrap_or(geo_param);
+        }
+
+        // 统一处理 transform.scale 清零逻辑
+        crate::fast_model::reuse_unit::normalize_transform_scale(
+            &mut transform,
+            unit_flag,
+            geo_hash,
+        );
         
         let inst_geo = EleInstGeo {
             geo_hash,

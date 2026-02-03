@@ -1,4 +1,4 @@
-//! 检查 foyer instance_cache 中某个 refno 的 inst_geos 细节（geo_hash / geo_param / transform）。
+//! 检查 foyer instance_cache 中某个 refno 的 inst_geos 细节（geo_hash / geo_param / geo_transform）。
 //!
 //! 用途：
 //! - 排查“导出尺寸不对/缩放被重复应用”的问题（例如 RTOR 160mm 被放大到 25600mm）。
@@ -106,13 +106,24 @@ async fn main() -> Result<()> {
         for (i, inst) in geos.insts.iter().enumerate() {
             println!(
                 "  - inst[{}] geo_hash={} unit_flag={} geo_type={:?}",
-                i, inst.geo_hash, inst.unit_flag, inst.geo_type
+                i,
+                inst.geo_hash,
+                inst.geo_param.is_reuse_unit(),
+                inst.geo_type
             );
             println!("    geo_param: {:?}", inst.geo_param);
-            println!("    transform: {:?}", inst.transform);
+            println!("    geo_transform: {:?}", inst.geo_transform);
             println!(
                 "    scale: [{:.6}, {:.6}, {:.6}]",
-                inst.transform.scale.x, inst.transform.scale.y, inst.transform.scale.z
+                inst.geo_transform.scale.x,
+                inst.geo_transform.scale.y,
+                inst.geo_transform.scale.z
+            );
+            println!(
+                "    translation: [{:.3}, {:.3}, {:.3}]",
+                inst.geo_transform.translation.x,
+                inst.geo_transform.translation.y,
+                inst.geo_transform.translation.z
             );
         }
     }

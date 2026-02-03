@@ -24,11 +24,9 @@ use crate::data_interface::increment_record::IncrGeoUpdateLog;
 use crate::data_interface::sesno_increment::get_changes_at_sesno;
 use crate::fast_model::capture::capture_refnos_if_enabled;
 use crate::data_interface::db_meta_manager::db_meta;
-use crate::fast_model::instance_cache::InstanceCacheManager;
 use crate::fast_model::mesh_generate::{
-    run_boolean_worker, run_mesh_worker, run_mesh_worker_from_cache_manager,
+    run_boolean_worker, run_mesh_worker,
 };
-use crate::fast_model::manifold_bool::run_boolean_worker_from_cache_manager;
 use crate::fast_model::pdms_inst::save_instance_data_optimize;
 use crate::options::{DbOptionExt, MeshFormat};
 use crate::fast_model::export_model::ParquetStreamWriter;
@@ -287,20 +285,9 @@ async fn process_full_noun_mode(
     #[cfg(feature = "duckdb-feature")]
     let duckdb_writer_clone = duckdb_writer.clone();
 
-    // foyer transform_cache：模型生成阶段统一走 cache-first 获取 world_transform。
-    // 这里只做一次初始化（创建目录 + 初始化 HybridCache）。
-    if let Err(e) = crate::fast_model::transform_cache::init_global_transform_cache(db_option).await {
-        eprintln!("[gen_model] ⚠️  初始化 transform_cache 失败（将退化为按需计算）: {}", e);
-    }
-
-    let cache_manager = if db_option.use_cache {
-        Some(Arc::new(
-            InstanceCacheManager::new(&db_option.get_foyer_cache_dir()).await?,
-        ))
-    } else {
-        None
-    };
-    let cache_manager_for_insert = cache_manager.clone();
+    // foyer cache-only 上下文：统一管理 cache_dir 与 InstanceCacheManager（并尽力预初始化 transform_cache）。
+    let foyer_cache_ctx = crate::fast_model::foyer_cache::FoyerCacheContext::try_from_db_option(db_option).await?;
+    let cache_manager_for_insert = foyer_cache_ctx.as_ref().map(|c| c.cache_arc());
     let touched_dbnums: Arc<std::sync::Mutex<BTreeSet<u32>>> =
         Arc::new(std::sync::Mutex::new(BTreeSet::new()));
     let touched_dbnums_for_insert = touched_dbnums.clone();
@@ -422,12 +409,12 @@ async fn process_full_noun_mode(
 
         let mut ran_primary = false;
 
-        if let Some(ref cache_manager) = cache_manager {
+        if let Some(ref ctx) = foyer_cache_ctx {
             let mesh_dir = db_option.inner.get_meshes_path();
             #[cfg(feature = "profile")]
             let _cache_mesh = tracing::info_span!("mesh_worker_cache").entered();
-            if let Err(e) = run_mesh_worker_from_cache_manager(
-                cache_manager.as_ref(),
+            if let Err(e) = crate::fast_model::foyer_cache::mesh::run_mesh_worker(
+                ctx,
                 &mesh_dir,
                 &db_option.inner.mesh_precision,
                 &db_option.mesh_formats,
@@ -510,10 +497,10 @@ async fn process_full_noun_mode(
             let _bool_span = tracing::info_span!("boolean_worker").entered();
             let bool_start = Instant::now();
             println!("[gen_model] Full Noun 模式开始布尔运算（boolean worker）");
-            if let Some(ref cache_manager) = cache_manager {
+            if let Some(ref ctx) = foyer_cache_ctx {
                 #[cfg(feature = "profile")]
                 let _cache_bool = tracing::info_span!("boolean_worker_cache").entered();
-                if let Err(e) = run_boolean_worker_from_cache_manager(cache_manager.as_ref()).await
+                if let Err(e) = crate::fast_model::foyer_cache::boolean::run_boolean_worker(ctx).await
                 {
                     eprintln!("[gen_model] Full Noun 缓存布尔运算失败: {}", e);
                 }
@@ -616,8 +603,8 @@ async fn process_full_noun_mode(
         }
     }
 
-    if let Some(ref cache_manager) = cache_manager {
-        if let Err(e) = cache_manager.close().await {
+    if let Some(ref ctx) = foyer_cache_ctx {
+        if let Err(e) = ctx.cache().close().await {
             eprintln!("[cache] 关闭缓存失败: {}", e);
         }
     }
@@ -644,14 +631,8 @@ async fn process_targeted_generation(
         "调试"
     };
 
-    // 生成前置预检查（通用）：只确保 foyer transform_cache 目录已就绪。
-    // 不做“全量刷新/全量命中”要求；miss 由 get_world_transform_cache_first 按需计算并回写。
-    if let Err(e) = crate::fast_model::transform_cache::init_global_transform_cache(db_option).await {
-        eprintln!(
-            "[gen_model] ⚠️  transform_cache 预初始化失败（将退化为按需计算）: {}",
-            e
-        );
-    }
+    // foyer cache-only 上下文：统一管理 cache_dir 与 InstanceCacheManager（并尽力预初始化 transform_cache）。
+    let foyer_cache_ctx = crate::fast_model::foyer_cache::FoyerCacheContext::try_from_db_option(db_option).await?;
 
     let target_count = if is_incr_update {
         incr_updates.as_ref().map(|log| log.count()).unwrap_or(0)
@@ -682,14 +663,7 @@ async fn process_targeted_generation(
 
     let replace_exist = db_option.inner.is_replace_mesh();
     let use_surrealdb = db_option.use_surrealdb;
-    let cache_manager = if db_option.use_cache {
-        Some(Arc::new(
-            InstanceCacheManager::new(&db_option.get_foyer_cache_dir()).await?,
-        ))
-    } else {
-        None
-    };
-    let cache_manager_for_insert = cache_manager.clone();
+    let cache_manager_for_insert = foyer_cache_ctx.as_ref().map(|c| c.cache_arc());
     let touched_dbnums: Arc<std::sync::Mutex<BTreeSet<u32>>> =
         Arc::new(std::sync::Mutex::new(BTreeSet::new()));
     let touched_dbnums_for_insert = touched_dbnums.clone();
@@ -735,10 +709,10 @@ async fn process_targeted_generation(
         println!("[gen_model] 开始 mesh 生成");
 
         let mut ran_primary = false;
-        if let Some(ref cache_manager) = cache_manager {
+        if let Some(ref ctx) = foyer_cache_ctx {
             let mesh_dir = db_option.inner.get_meshes_path();
-            if let Err(e) = run_mesh_worker_from_cache_manager(
-                cache_manager.as_ref(),
+            if let Err(e) = crate::fast_model::foyer_cache::mesh::run_mesh_worker(
+                ctx,
                 &mesh_dir,
                 &db_option.inner.mesh_precision,
                 &db_option.mesh_formats,
@@ -801,9 +775,8 @@ async fn process_targeted_generation(
             let bool_start = Instant::now();
             println!("[gen_model] 开始布尔运算 worker");
 
-            if let Some(ref cache_manager) = cache_manager {
-                if let Err(e) = run_boolean_worker_from_cache_manager(cache_manager.as_ref()).await
-                {
+            if let Some(ref ctx) = foyer_cache_ctx {
+                if let Err(e) = crate::fast_model::foyer_cache::boolean::run_boolean_worker(ctx).await {
                     eprintln!("[gen_model] 缓存布尔运算失败: {}", e);
                 }
             }
@@ -824,8 +797,8 @@ async fn process_targeted_generation(
         eprintln!("[capture] 捕获截图失败: {}", err);
     }
 
-    if let Some(ref cache_manager) = cache_manager {
-        if let Err(e) = cache_manager.close().await {
+    if let Some(ref ctx) = foyer_cache_ctx {
+        if let Err(e) = ctx.cache().close().await {
             eprintln!("[cache] 关闭缓存失败: {}", e);
         }
     }
@@ -878,6 +851,9 @@ async fn process_full_database_generation(
         println!("[gen_model] 未找到需要生成的数据库，直接结束");
     }
 
+    // foyer cache-only 上下文：全量模式下也只初始化一次并在各 dbnum 间复用。
+    let foyer_cache_ctx = crate::fast_model::foyer_cache::FoyerCacheContext::try_from_db_option(db_option).await?;
+
     // 初始化 Parquet 写入器
     let parquet_writer: Option<std::sync::Arc<ParquetStreamWriter>> = None;
     /*
@@ -922,14 +898,7 @@ async fn process_full_database_generation(
         #[cfg(feature = "duckdb-feature")]
         let duckdb_writer_clone = duckdb_writer.clone();
 
-        let cache_manager = if db_option_arc.use_cache {
-            Some(Arc::new(
-                InstanceCacheManager::new(&db_option_arc.get_foyer_cache_dir()).await?,
-            ))
-        } else {
-            None
-        };
-        let cache_manager_for_insert = cache_manager.clone();
+        let cache_manager_for_insert = foyer_cache_ctx.as_ref().map(|c| c.cache_arc());
 
         let insert_task = tokio::task::spawn(async move {
             while let Ok(shape_insts) = receiver.recv_async().await {
@@ -973,15 +942,15 @@ async fn process_full_database_generation(
             db_start.elapsed().as_millis()
         );
 
-        if db_option_arc.gen_mesh {
-            let mesh_start = Instant::now();
-            println!("[gen_model] -> 数据库 {} 开始生成三角网格", dbnum);
+            if db_option_arc.gen_mesh {
+                let mesh_start = Instant::now();
+                println!("[gen_model] -> 数据库 {} 开始生成三角网格", dbnum);
 
-            let mut ran_primary = false;
-            if let Some(ref cache_manager) = cache_manager {
+                let mut ran_primary = false;
+            if let Some(ref ctx) = foyer_cache_ctx {
                 let mesh_dir = db_option_arc.inner.get_meshes_path();
-                if let Err(e) = run_mesh_worker_from_cache_manager(
-                    cache_manager.as_ref(),
+                if let Err(e) = crate::fast_model::foyer_cache::mesh::run_mesh_worker(
+                    ctx,
                     &mesh_dir,
                     &db_option_arc.inner.mesh_precision,
                     &db_option_arc.mesh_formats,
@@ -1014,6 +983,12 @@ async fn process_full_database_generation(
             dbnum,
             db_start.elapsed().as_millis()
         );
+    }
+
+    if let Some(ref ctx) = foyer_cache_ctx {
+        if let Err(e) = ctx.cache().close().await {
+            eprintln!("[cache] 关闭缓存失败: {}", e);
+        }
     }
 
     // 完成 Parquet 写入并合并文件

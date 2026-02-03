@@ -16,6 +16,24 @@ fn main() {
     }
     println!("  前10个索引: {:?}", &mesh.indices[..mesh.indices.len().min(10)]);
 
+    // 顶点范围（快速判断是否出现“尺寸被意外放大/缩小”）
+    if !mesh.vertices.is_empty() {
+        let mut min = mesh.vertices[0];
+        let mut max = mesh.vertices[0];
+        for v in &mesh.vertices[1..] {
+            min.x = min.x.min(v.x);
+            min.y = min.y.min(v.y);
+            min.z = min.z.min(v.z);
+            max.x = max.x.max(v.x);
+            max.y = max.y.max(v.y);
+            max.z = max.z.max(v.z);
+        }
+        println!(
+            "  aabb(min/max): ({:.6},{:.6},{:.6}) / ({:.6},{:.6},{:.6})",
+            min.x, min.y, min.z, max.x, max.y, max.z
+        );
+    }
+
     // GLB 常见“法线不对”原因有两类：
     // 1) normals 自身无效（0/NaN/未归一），或与面法线整体反向；
     // 2) 绕序整体翻面（体积符号为负），此时 normals 可能“自洽”但整体朝内，渲染会发黑/背面。

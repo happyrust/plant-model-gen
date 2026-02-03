@@ -1,5 +1,7 @@
 pub mod gen_model;
 pub mod cata_model;
+pub mod cata_cache_gen;
+pub mod reuse_unit;
 
 pub mod prim_model;
 
@@ -54,6 +56,7 @@ pub mod query_provider; // 新的统一查询提供者 // 查询兼容层
 pub mod db_meta_cache;
 pub mod instance_cache;
 pub mod transform_cache;
+pub mod foyer_cache;
 pub mod cache_flush;
 
 pub mod utils;

@@ -394,8 +394,8 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
                 path.clone()
             } else {
                 let base_name = get_output_filename_for_refno(*refno).await;
-                // 确保输出到 output 目录
-                format!("output/{}", base_name)
+                // 确保输出到 output/{project_name} 目录
+                format!("{}/{}", db_option_ext.get_project_output_dir().display(), base_name)
             };
 
             println!("\n🔄 导出 {} -> {} ...", refno, final_output_path);
@@ -485,7 +485,7 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
         println!("\n📂 拆分模式：每个 SITE 导出为独立文件");
         for (idx, site_refno) in sites.iter().enumerate() {
             let site_name = get_site_name_for_export(*site_refno, dbnum, "obj").await;
-            let output_file = format!("output/{}", site_name);
+            let output_file = format!("{}/{}", db_option_ext.get_project_output_dir().display(), site_name);
             println!(
                 "\n🔄 [{}/{}] 导出 SITE: {} -> {}",
                 idx + 1,
@@ -524,7 +524,7 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
     } else {
         // 默认合并模式：将所有 SITE 合并到一个文件
         println!("\n🔀 合并模式：将所有 SITE 合并到一个文件（默认）");
-        let output_file = format!("output/dbno_{}.obj", dbnum);
+        let output_file = format!("{}/dbno_{}.obj", db_option_ext.get_project_output_dir().display(), dbnum);
         println!(
             "🔄 导出合并文件: {} (包含 {} 个 SITE)",
             output_file,
@@ -643,8 +643,8 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             } else {
                 let base_name =
                     get_output_filename_for_refno(*refno).await;
-                // 确保输出到 output 目录
-                format!("output/{}.glb", base_name.replace(".obj", ""))
+                // 确保输出到 output/{project_name} 目录
+                format!("{}/{}.glb", db_option_ext.get_project_output_dir().display(), base_name.replace(".obj", ""))
             };
 
             println!("\n🔄 导出 {} -> {} ...", refno, final_output_path);
@@ -729,7 +729,7 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
         println!("\n📂 拆分模式：每个 SITE 导出为独立文件");
         for (idx, site_refno) in sites.iter().enumerate() {
             let site_name = get_site_name_for_export(*site_refno, dbnum, "glb").await;
-            let output_file = format!("output/{}", site_name);
+            let output_file = format!("{}/{}", db_option_ext.get_project_output_dir().display(), site_name);
             println!(
                 "\n🔄 [{}/{}] 导出 SITE: {} -> {}",
                 idx + 1,
@@ -767,7 +767,7 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
     } else {
         // 默认合并模式：将所有 SITE 合并到一个文件
         println!("\n🔀 合并模式：将所有 SITE 合并到一个文件（默认）");
-        let output_file = format!("output/dbno_{}.glb", dbnum);
+        let output_file = format!("{}/dbno_{}.glb", db_option_ext.get_project_output_dir().display(), dbnum);
         println!(
             "🔄 导出合并文件: {} (包含 {} 个 SITE)",
             output_file,
@@ -885,7 +885,7 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
         let exporter = GltfExporter::new();
         for (idx, site_refno) in sites.iter().enumerate() {
             let site_name = get_site_name_for_export(*site_refno, dbnum, "gltf").await;
-            let output_file = format!("output/{}", site_name);
+            let output_file = format!("{}/{}", db_option_ext.get_project_output_dir().display(), site_name);
 
             println!(
                 "\n🔄 [{}/{}] 导出 SITE: {} -> {}",
@@ -978,8 +978,8 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
             } else {
                 let base_name =
                     get_output_filename_for_refno(*refno).await;
-                // 确保输出到 output 目录
-                format!("output/{}.gltf", base_name.replace(".obj", ""))
+                // 确保输出到 output/{project_name} 目录
+                format!("{}/{}.gltf", db_option_ext.get_project_output_dir().display(), base_name.replace(".obj", ""))
             };
 
             println!("\n🔄 导出 {} -> {} ...", refno, final_output_path);
@@ -1060,7 +1060,7 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
         println!("\n📂 拆分模式：每个 SITE 导出为独立文件");
         for (idx, site_refno) in sites.iter().enumerate() {
             let site_name = get_site_name_for_export(*site_refno, dbnum, "gltf").await;
-            let output_file = format!("output/{}", site_name);
+            let output_file = format!("{}/{}", db_option_ext.get_project_output_dir().display(), site_name);
             println!(
                 "\n🔄 [{}/{}] 导出 SITE: {} -> {}",
                 idx + 1,
@@ -1098,7 +1098,7 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
     } else {
         // 默认合并模式：将所有 SITE 合并到一个文件
         println!("\n🔀 合并模式：将所有 SITE 合并到一个文件（默认）");
-        let output_file = format!("output/dbno_{}.gltf", dbnum);
+        let output_file = format!("{}/dbno_{}.gltf", db_option_ext.get_project_output_dir().display(), dbnum);
         println!(
             "🔄 导出合并文件: {} (包含 {} 个 SITE)",
             output_file,
@@ -1287,7 +1287,7 @@ async fn export_instanced_bundle_mode(
     // 确定输出目录
     let output_dir = config.output_path.clone().unwrap_or_else(|| {
         let first_refno = refnos[0].to_string().replace('/', "_");
-        format!("output/instanced-bundle/{}", first_refno)
+        format!("{}/instanced-bundle/{}", db_option_ext.get_project_output_dir().display(), first_refno)
     });
 
     println!("   - 输出目录: {}", output_dir);
@@ -1448,11 +1448,15 @@ pub async fn export_all_parquet_mode(
 }
 
 /// 导出指定 dbnum 的实例数据为简化 JSON 格式（含 AABB）
+///
+/// # 参数
+/// - `autorun`: 若为 `true`（默认），缓存缺失时自动生成模型数据；若为 `false`，则询问用户确认
 pub async fn export_dbnum_instances_json_mode(
     dbnum: u32,
     verbose: bool,
     output_override: Option<PathBuf>,
     db_option_ext: &DbOptionExt,
+    autorun: bool,
 ) -> Result<()> {
     use aios_database::fast_model::export_model::export_prepack_lod::{
         export_dbnum_instances_json, export_dbnum_instances_json_from_cache,
@@ -1464,7 +1468,7 @@ pub async fn export_dbnum_instances_json_mode(
     println!("====================================");
 
     // 设置输出目录
-    let output_dir = output_override.unwrap_or_else(|| PathBuf::from("output/instances"));
+    let output_dir = output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("instances"));
 
     if db_option_ext.use_cache {
         let cache_dir = db_option_ext.get_foyer_cache_dir();
@@ -1493,6 +1497,135 @@ pub async fn export_dbnum_instances_json_mode(
                 return Ok(());
             }
             Err(e) => {
+                // 检测是否是缓存缺失错误，提供自动/交互式生成选项
+                let err_msg = e.to_string();
+                if err_msg.contains("缓存中未找到") || err_msg.contains("批次数据") {
+                    println!("\n⚠️  dbnum={} 尚未生成模型数据（缓存为空）", dbnum);
+
+                    // autorun 模式：自动开始生成；否则询问用户
+                    let should_generate = if autorun {
+                        println!("🔄 autorun 模式已开启，自动开始生成模型数据...");
+                        true
+                    } else {
+                        println!();
+                        print!("是否现在开始生成模型数据？(y/n): ");
+                        use std::io::{self, Write};
+                        io::stdout().flush().ok();
+
+                        let mut input = String::new();
+                        if io::stdin().read_line(&mut input).is_ok() {
+                            let answer = input.trim().to_lowercase();
+                            answer == "y" || answer == "yes"
+                        } else {
+                            false
+                        }
+                    };
+
+                    if should_generate {
+                        println!("\n🚀 开始生成 dbnum={} 的模型数据...", dbnum);
+
+                        // 调用模型生成逻辑
+                        use aios_database::fast_model::gen_all_geos_data;
+                        use aios_database::versioned_db::database::sync_pdms;
+
+                        // 连接数据库（生成需要从 SurrealDB 读取输入数据）
+                        ensure_surreal_connected(db_option_ext).await?;
+
+                        // Step 1: 检测 TreeIndex 是否存在，若缺失则通过 gen_tree_only 解析生成
+                        let tree_path = db_option_ext.get_project_output_dir().join("scene_tree").join(format!("{}.tree", dbnum));
+                        if !tree_path.exists() {
+                            println!("📂 检测到 TreeIndex 缺失: {}", tree_path.display());
+                            println!("🔄 正在通过 PDMS 解析生成 TreeIndex (gen_tree_only 模式)...");
+
+                            let mut parse_option = db_option_ext.inner.clone();
+                            parse_option.gen_tree_only = true;
+                            parse_option.total_sync = true;
+                            parse_option.manual_db_nums = Some(vec![dbnum]);
+                            parse_option.save_db = Some(false); // 不写入 SurrealDB
+
+                            if let Err(e) = sync_pdms(&parse_option).await {
+                                println!("⚠️  TreeIndex 生成失败: {}", e);
+                                println!("   请确保 PDMS 数据库文件存在且可访问");
+                                return Err(anyhow!("TreeIndex 生成失败: {}", e));
+                            }
+
+                            println!("✅ TreeIndex 生成完成");
+                        }
+
+                        // Step 2: 构建生成配置
+                        let mut db_option_clone = db_option_ext.inner.clone();
+                        db_option_clone.manual_db_nums = Some(vec![dbnum]);
+                        db_option_clone.gen_mesh = true;
+                        db_option_clone.replace_mesh = Some(true);
+
+                        let mut db_option_ext_override = db_option_ext.clone();
+                        db_option_ext_override.inner = db_option_clone;
+                        db_option_ext_override.use_cache = true; // 确保缓存写入
+                        db_option_ext_override.use_surrealdb = true; // 需要从 SurrealDB 读取输入数据
+                        db_option_ext_override.inner.save_db = Some(false); // 不写回 SurrealDB
+                        db_option_ext_override.export_instances = false; // 禁用自动导出，由我们的代码单独处理
+                        // 禁用 Full Noun 模式，使用全库生成以确保所有类型节点都被处理
+                        db_option_ext_override.full_noun_mode = false;
+
+                        unsafe {
+                            std::env::set_var("FORCE_REPLACE_MESH", "true");
+                        }
+
+                        // Step 3: 生成模型（仅写入 foyer cache）
+                        // 捕获错误但继续尝试导出（缓存可能已有部分数据）
+                        match gen_all_geos_data(vec![], &db_option_ext_override, None, None).await {
+                            Ok(_) => {
+                                println!("✅ 模型生成完成");
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️  模型生成过程中出现错误: {}", e);
+                                eprintln!("   尝试继续导出已生成的缓存数据...");
+                            }
+                        }
+
+                        unsafe {
+                            std::env::remove_var("FORCE_REPLACE_MESH");
+                        }
+                        println!("\n🔄 重新尝试导出...");
+
+                        // 重新尝试导出
+                        let retry_result = export_dbnum_instances_json_from_cache(
+                            dbnum,
+                            &output_dir,
+                            &cache_dir,
+                            Some(&mesh_dir),
+                            Some(mesh_lod_tag.as_str()),
+                            verbose,
+                            None,
+                        )
+                        .await;
+
+                        match retry_result {
+                            Ok((stats, trans_count, aabb_count)) => {
+                                println!("\n🎉 导出完成！（缓存路径）");
+                                println!("📊 统计信息:");
+                                println!("   - BRAN/HANG/EQUI 分组数量: {}", stats.refno_count);
+                                println!("   - 子节点数量: {}", stats.descendant_count);
+                                println!("   - 输出文件大小: {} 字节", stats.output_file_size);
+                                println!("   - 变换矩阵数量 (trans): {}", trans_count);
+                                println!("   - 包围盒数量 (aabb): {}", aabb_count);
+                                println!("   - 耗时: {:?}", stats.elapsed_time);
+                                return Ok(());
+                            }
+                            Err(retry_e) => {
+                                return Err(retry_e);
+                            }
+                        }
+                    }
+
+                    // 用户拒绝或 autorun=false 时无效输入，给出手动命令建议
+                    println!("\n💡 建议：请手动运行以下命令生成模型数据：");
+                    println!("   cargo run --bin aios-database -- --debug-model --dbnum {} --regen-model", dbnum);
+                    return Err(anyhow!(
+                        "dbnum={} 尚未生成模型数据，请先生成后再导出",
+                        dbnum
+                    ));
+                }
                 return Err(e);
             }
         }

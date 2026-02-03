@@ -201,20 +201,36 @@ impl DbOptionExt {
                 || self.is_noun_category_enabled(noun))
     }
 
-    /// 获取 foyer 缓存目录，默认为 output/instance_cache
-    pub fn get_foyer_cache_dir(&self) -> std::path::PathBuf {
-        self.foyer_cache_dir
-            .as_ref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("output/instance_cache"))
+    /// 获取带 project_name 前缀的 output 基础目录
+    ///
+    /// - 如果 project_name 非空，返回 `output/{project_name}`
+    /// - 如果 project_name 为空，panic 报错
+    pub fn get_project_output_dir(&self) -> std::path::PathBuf {
+        let project_name = &self.inner.project_name;
+        if project_name.is_empty() {
+            panic!("project_name 不能为空，请在配置文件中设置 project_name");
+        }
+        std::path::PathBuf::from("output").join(project_name)
     }
 
-    /// 获取副路径 mesh 输出目录，默认为 output/meshes_shadow
+    /// 获取 foyer 缓存目录，默认为 output/{project_name}/instance_cache
+    ///
+    /// 注意：如果用户已自定义 foyer_cache_dir，则直接使用用户配置
+    pub fn get_foyer_cache_dir(&self) -> std::path::PathBuf {
+        if let Some(ref custom_dir) = self.foyer_cache_dir {
+            return std::path::PathBuf::from(custom_dir);
+        }
+        self.get_project_output_dir().join("instance_cache")
+    }
+
+    /// 获取副路径 mesh 输出目录，默认为 output/{project_name}/meshes_shadow
+    ///
+    /// 注意：如果用户已自定义 secondary_mesh_dir，则直接使用用户配置
     pub fn get_secondary_mesh_dir(&self) -> std::path::PathBuf {
-        self.secondary_mesh_dir
-            .as_ref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("output/meshes_shadow"))
+        if let Some(ref custom_dir) = self.secondary_mesh_dir {
+            return std::path::PathBuf::from(custom_dir);
+        }
+        self.get_project_output_dir().join("meshes_shadow")
     }
 }
 

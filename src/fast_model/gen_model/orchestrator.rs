@@ -128,7 +128,7 @@ pub async fn gen_all_geos_data(
             check_tree: true,
             check_pe_transform: true,
             check_db_meta: true,
-            tree_output_dir: "output/scene_tree".to_string(),
+            tree_output_dir: db_option.get_project_output_dir().join("scene_tree").to_string_lossy().to_string(),
         };
 
         match run_precheck(db_option, Some(precheck_config)).await {
@@ -292,6 +292,11 @@ async fn process_full_noun_mode(
         Arc::new(std::sync::Mutex::new(BTreeSet::new()));
     let touched_dbnums_for_insert = touched_dbnums.clone();
 
+    // 当 manual_db_nums 只有一个值时，直接使用该 dbnum，无需从 refno 反推
+    let known_dbnum: Option<u32> = db_option.inner.manual_db_nums.as_ref()
+        .filter(|nums| nums.len() == 1)
+        .and_then(|nums| nums.first().copied());
+
     let insert_handle = tokio::spawn(async move {
         #[cfg(feature = "profile")]
         let sink_span = tracing::info_span!("instance_sink");
@@ -322,7 +327,13 @@ async fn process_full_noun_mode(
                 t_save_db += t0.elapsed();
             }
             if let Some(ref cache_manager) = cache_manager_for_insert {
-                if let Some(dbnum) = resolve_dbnum_from_shape(&shape_insts).await {
+                // 优先使用已知的 dbnum（来自 manual_db_nums），避免依赖 db_meta_info.json 或 TreeIndex
+                let dbnum = if let Some(known) = known_dbnum {
+                    Some(known)
+                } else {
+                    resolve_dbnum_from_shape(&shape_insts).await
+                };
+                if let Some(dbnum) = dbnum {
                     let t0 = Instant::now();
                     cache_manager.insert_from_shape(dbnum, &shape_insts);
                     let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(dbnum));
@@ -593,7 +604,7 @@ async fn process_full_noun_mode(
         if let Err(e) = export_instances_json_for_dbnos(
             &dbnos,
             mesh_dir,
-            Path::new("output"),
+            &db_option.get_project_output_dir(),
             Arc::new(db_option.inner.clone()),
             true,
         )
@@ -668,6 +679,11 @@ async fn process_targeted_generation(
         Arc::new(std::sync::Mutex::new(BTreeSet::new()));
     let touched_dbnums_for_insert = touched_dbnums.clone();
 
+    // 当 manual_db_nums 只有一个值时，直接使用该 dbnum，无需从 refno 反推
+    let known_dbnum: Option<u32> = db_option.inner.manual_db_nums.as_ref()
+        .filter(|nums| nums.len() == 1)
+        .and_then(|nums| nums.first().copied());
+
     let insert_task = tokio::task::spawn(async move {
         while let Ok(shape_insts) = receiver.recv_async().await {
             if use_surrealdb {
@@ -676,7 +692,13 @@ async fn process_targeted_generation(
                 }
             }
             if let Some(ref cache_manager) = cache_manager_for_insert {
-                if let Some(dbnum) = resolve_dbnum_from_shape(&shape_insts).await {
+                // 优先使用已知的 dbnum（来自 manual_db_nums），避免依赖 db_meta_info.json 或 TreeIndex
+                let dbnum = if let Some(known) = known_dbnum {
+                    Some(known)
+                } else {
+                    resolve_dbnum_from_shape(&shape_insts).await
+                };
+                if let Some(dbnum) = dbnum {
                     cache_manager.insert_from_shape(dbnum, &shape_insts);
                     let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(dbnum));
                 }
@@ -775,8 +797,21 @@ async fn process_targeted_generation(
             let bool_start = Instant::now();
             println!("[gen_model] 开始布尔运算 worker");
 
+            // 构建 debug_model 过滤集合（用于调试模式只处理指定 refno）
+            let filter_refnos: Option<std::collections::HashSet<aios_core::RefnoEnum>> = {
+                let debug_refnos = db_option.inner.get_all_debug_refnos().await;
+                if debug_refnos.is_empty() {
+                    None
+                } else {
+                    Some(debug_refnos.into_iter().collect())
+                }
+            };
+
             if let Some(ref ctx) = foyer_cache_ctx {
-                if let Err(e) = crate::fast_model::foyer_cache::boolean::run_boolean_worker(ctx).await {
+                if let Err(e) = crate::fast_model::foyer_cache::boolean::run_boolean_worker_with_filter(
+                    ctx,
+                    filter_refnos.as_ref(),
+                ).await {
                     eprintln!("[gen_model] 缓存布尔运算失败: {}", e);
                 }
             }
@@ -1021,7 +1056,7 @@ async fn process_full_database_generation(
         if let Err(e) = export_instances_json_for_dbnos(
             &dbnos,
             mesh_dir,
-            Path::new("output"),
+            &db_option.get_project_output_dir(),
             Arc::new(db_option.inner.clone()),
             true,
         )
@@ -1145,7 +1180,7 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
     idx.init_schema().map_err(|e| anyhow::anyhow!(e))?;
 
     // 为避免 aabb.json/trans.json（固定文件名）互相覆盖，每个 dbnum 独立输出目录。
-    let base_out = PathBuf::from("output/instances_cache_for_index");
+    let base_out = db_option.get_project_output_dir().join("instances_cache_for_index");
     fs::create_dir_all(&base_out).map_err(|e| anyhow::anyhow!(e))?;
 
     // mesh_lod_tag 仅用于导出侧选择 mesh（用于补齐/计算 AABB）

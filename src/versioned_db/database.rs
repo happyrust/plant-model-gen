@@ -1003,11 +1003,14 @@ where
                     }
                     continue;
                 } else if sesno > 0 {
-                    if let Err(e) = io.store_all_refno_sesno_map().await {
-                        warn!(
-                            "store_all_refno_sesno_map failed(file={}): {} (continue parsing)",
-                            file_name, e
-                        );
+                    // 仅在需要保存数据库时才存储 refno sesno map
+                    if is_save_db {
+                        if let Err(e) = io.store_all_refno_sesno_map().await {
+                            warn!(
+                                "store_all_refno_sesno_map failed(file={}): {} (continue parsing)",
+                                file_name, e
+                            );
+                        }
                     }
                     // pdms-io-fork 的 ses_range_map 使用 RangeInclusive；parse_pdms_db 仍期望 Range（右开区间）
                     ses_range_map = io
@@ -1601,11 +1604,13 @@ pub async fn sync_total_async_threaded(
                             continue;
                         } else if sesno > 0 {
                             //存储所有refno sesno map（仅在 sesno 可用时执行；失败不阻塞解析）
-                            if let Err(e) = io.store_all_refno_sesno_map().await {
-                                warn!(
-                                    "store_all_refno_sesno_map failed(file={}): {} (continue parsing)",
-                                    file_name, e
-                                );
+                            if is_save_db {
+                                if let Err(e) = io.store_all_refno_sesno_map().await {
+                                    warn!(
+                                        "store_all_refno_sesno_map failed(file={}): {} (continue parsing)",
+                                        file_name, e
+                                    );
+                                }
                             }
                             //获取sesno range
                             // pdms-io-fork 的 ses_range_map 使用 RangeInclusive；parse_pdms_db 仍期望 Range（右开区间）

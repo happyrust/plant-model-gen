@@ -1177,10 +1177,22 @@ pub async fn run_boolean_worker_from_cache_manager(
                     inst_geos_map.entry(k).or_insert(v);
                 }
                 for (k, v) in batch.neg_relate_map.drain() {
-                    neg_relate_map.entry(k).or_insert(v);
+                    // 关系数据会被“按 carrier 分批写入”到不同 batch：
+                    // 同一个 target 可能在多个 batch 里各自贡献一部分负载体，
+                    // 如果仅取“最新命中”的整段 Vec，会导致切割不完整（典型：同一 STWALL 被多个 FITT 的 CataCrossNeg cut）。
+                    //
+                    // 这里需要做“跨 batch 合并 + 去重”，同时仍然保持 created_at 新到旧的扫描顺序，
+                    // 以便当同一 carrier 的关系在新 batch 中被更新时优先使用新数据。
+                    let entry = neg_relate_map.entry(k).or_insert_with(Vec::new);
+                    entry.extend(v);
+                    let mut seen: HashSet<RefnoEnum> = HashSet::new();
+                    entry.retain(|x| seen.insert(*x));
                 }
                 for (k, v) in batch.ngmr_neg_relate_map.drain() {
-                    ngmr_relate_map.entry(k).or_insert(v);
+                    let entry = ngmr_relate_map.entry(k).or_insert_with(Vec::new);
+                    entry.extend(v);
+                    let mut seen: HashSet<(RefnoEnum, RefnoEnum)> = HashSet::new();
+                    entry.retain(|x| seen.insert(*x));
                 }
         }
     }

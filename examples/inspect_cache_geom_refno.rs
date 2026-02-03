@@ -88,6 +88,63 @@ async fn main() -> Result<()> {
         .find(|g| g.refno.refno() == want_u64 && !g.insts.is_empty());
 
     println!("\n== latest hit batch_id={} created_at={} ==", batch_id, batch.created_at);
+    // 关系映射（用于排查“负实体已生成但未被应用到目标”的情况）
+    match batch.neg_relate_map.get(&refno) {
+        Some(v) => {
+            println!("neg_relate_map[target={}] carriers={}", refno, v.len());
+            for (i, c) in v.iter().enumerate() {
+                println!("  - neg_carrier[{}]={}", i, c);
+            }
+        }
+        None => println!("neg_relate_map[target={}] carriers=<none>", refno),
+    }
+    match batch.ngmr_neg_relate_map.get(&refno) {
+        Some(v) => {
+            println!("ngmr_neg_relate_map[target={}] pairs={}", refno, v.len());
+            for (i, (carrier, geom_refno)) in v.iter().enumerate() {
+                println!("  - ngmr_pair[{}] carrier={} geom_refno={}", i, carrier, geom_refno);
+            }
+        }
+        None => println!("ngmr_neg_relate_map[target={}] pairs=<none>", refno),
+    }
+
+    // 反向查询：当前 refno 作为“负载体”会切哪些目标（便于定位 target 计算是否跑偏到 owner/attached）
+    let mut as_neg_carrier: Vec<RefnoEnum> = Vec::new();
+    for (target, carriers) in &batch.neg_relate_map {
+        if carriers.iter().any(|c| *c == refno) {
+            as_neg_carrier.push(*target);
+        }
+    }
+    if !as_neg_carrier.is_empty() {
+        println!(
+            "neg_relate_map[carrier={}] targets={}",
+            refno,
+            as_neg_carrier.len()
+        );
+        for t in as_neg_carrier {
+            println!("  - target={}", t);
+        }
+    }
+
+    let mut as_ngmr_carrier: Vec<(RefnoEnum, RefnoEnum)> = Vec::new();
+    for (target, pairs) in &batch.ngmr_neg_relate_map {
+        for (carrier, geom_refno) in pairs {
+            if *carrier == refno {
+                as_ngmr_carrier.push((*target, *geom_refno));
+            }
+        }
+    }
+    if !as_ngmr_carrier.is_empty() {
+        println!(
+            "ngmr_neg_relate_map[carrier={}] targets={}",
+            refno,
+            as_ngmr_carrier.len()
+        );
+        for (t, g) in as_ngmr_carrier {
+            println!("  - target={} geom_refno={}", t, g);
+        }
+    }
+
     if let Some(info) = info {
         println!(
             "inst_info: refno={} sesno={} visible={} owner={:?}/{:?}",
@@ -105,8 +162,9 @@ async fn main() -> Result<()> {
         );
         for (i, inst) in geos.insts.iter().enumerate() {
             println!(
-                "  - inst[{}] geo_hash={} unit_flag={} geo_type={:?}",
+                "  - inst[{}] geom_refno={} geo_hash={} unit_flag={} geo_type={:?}",
                 i,
+                inst.refno,
                 inst.geo_hash,
                 inst.geo_param.is_reuse_unit(),
                 inst.geo_type

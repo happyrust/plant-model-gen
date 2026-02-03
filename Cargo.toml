@@ -274,6 +274,11 @@ name = "refresh_pe_transform"
 path = "examples/refresh_pe_transform.rs"
 
 [[example]]
+name = "room_calc_by_panel_demo"
+path = "examples/room_calc_by_panel_demo.rs"
+required-features = ["gen_model", "sqlite-index"]
+
+[[example]]
 name = "room_calculation_demo"
 path = "examples/room_calculation_demo.rs"
 required-features = ["gen_model", "sqlite-index"]

@@ -1,3 +1,4 @@
+use aios_core::DbOptionSurrealExt;
 use axum::{
     Router,
     extract::{Query, State},
@@ -172,29 +173,32 @@ pub async fn start_web_server_with_config(
         println!("⚙️  使用配置文件: {}.toml", config_path);
     }
 
-    // 🔧 修复：初始化数据库连接
+    // 🔧 修复：初始化数据库连接 - 使用统一的 initialize_databases 函数
     println!("🔄 正在初始化数据库连接...");
     println!("📂 当前工作目录: {:?}", std::env::current_dir()?);
 
     let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "DbOption".to_string());
     println!("📄 尝试读取 {}.toml 配置文件...", config_name);
 
-    match aios_core::init_surreal().await {
+    // 预先初始化 OnceCell，确保配置已加载
+    let _ = aios_core::get_db_option();
+    
+    // 获取配置并初始化数据库（包括 SurrealDB）
+    let db_option = aios_core::get_db_option();
+    match aios_core::initialize_databases(db_option).await {
         Ok(_) => {
             println!("✅ 数据库连接初始化成功");
         }
         Err(e) => {
             let error_msg = e.to_string();
-            if error_msg.contains("Already connected") {
-                println!("⚠️ 数据库已经连接，跳过重复初始化");
-            } else {
-                eprintln!("❌ 数据库初始化失败: {}", error_msg);
-                eprintln!("💡 请确保:");
-                eprintln!("   1. DbOption.toml 文件在当前目录");
-                eprintln!("   2. SurrealDB 服务运行在配置的端口 (默认 8020)");
-                eprintln!("   3. 配置文件中的连接信息正确");
-                return Err(anyhow::anyhow!("数据库连接初始化失败: {}", error_msg));
-            }
+            eprintln!("❌ 数据库初始化失败: {}", error_msg);
+            eprintln!("💡 请确保:");
+            eprintln!("   1. {}.toml 文件在当前目录", config_name);
+            eprintln!("   2. SurrealDB 服务运行在配置的端口 (默认 8020)");
+            eprintln!("   3. 配置文件中的连接信息正确");
+            eprintln!("   配置信息: {}", db_option.connection_summary());
+            // 不直接返回错误，允许 web-server 继续启动（某些功能可能不需要数据库）
+            eprintln!("⚠️ 警告: 数据库连接失败，某些功能可能不可用");
         }
     }
 
@@ -743,10 +747,6 @@ pub async fn start_web_server_with_config(
         .route(
             "/api/sqlite-spatial/rebuild",
             post(handlers::api_sqlite_spatial_rebuild),
-        )
-        .route(
-            "/api/sqlite-spatial/query",
-            get(handlers::api_sqlite_spatial_query),
         )
         // 空间查询页面
         .route("/spatial-query", get(handlers::spatial_query_page))

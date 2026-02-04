@@ -3,10 +3,10 @@
 //! 目标：为 plant3d-web 提供“管道 MBD 标注”所需的结构化数据（段/尺寸/焊缝/坡度）。
 //! 说明：本接口采用“后端提供语义点位 + 前端做屏幕布局/避让”的分层方式，便于渐进式对齐 MBD(PML)。
 
-use aios_core::{
-    NamedAttrMap, NamedAttrValue, RefnoEnum, get_named_attmap, query_filter_ancestors,
-    rs_surreal::pipeline::PipelineQueryService,
-};
+use std::collections::HashMap;
+use std::path::{Path as FsPath, PathBuf};
+
+use aios_core::RefnoEnum;
 use axum::{
     Router,
     extract::{Path, Query},
@@ -14,11 +14,16 @@ use axum::{
     routing::get,
     Json,
 };
+use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MbdPipeQuery {
+    /// dbno（可选；若不传则尝试从 output/scene_tree/db_meta_info.json 推导）
+    pub dbno: Option<u32>,
+    /// foyer instance_cache 的 batch_id（可选；若不传则默认按 latest）
+    pub batch_id: Option<String>,
     /// 最小坡度（0.001 对齐 MBD 默认）
     pub min_slope: f32,
     /// 最大坡度（0.1 对齐 MBD 默认）
@@ -35,6 +40,8 @@ pub struct MbdPipeQuery {
 impl Default for MbdPipeQuery {
     fn default() -> Self {
         Self {
+            dbno: None,
+            batch_id: None,
             min_slope: 0.001,
             max_slope: 0.1,
             dim_min_length: 1.0,
@@ -149,6 +156,21 @@ pub fn create_mbd_pipe_routes() -> Router {
     Router::new().route("/api/mbd/pipe/{refno}", get(get_mbd_pipe))
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct CacheTubiSeg {
+    /// tubi 段 refno（约定：使用 leave_refno 作为段标识）
+    refno: RefnoEnum,
+    /// tubi_relate 的 out（到达元件 refno）
+    arrive_refno: Option<RefnoEnum>,
+    /// 连通顺序（tubi_relate 的 id[1] / PdmsTubing.index）
+    order: Option<u32>,
+    /// 段起点（与 cache 一致：tubi_start_pt）
+    start: Vec3,
+    /// 段终点（与 cache 一致：tubi_end_pt）
+    end: Vec3,
+}
+
 async fn get_mbd_pipe(
     Path(refno): Path<String>,
     Query(query): Query<MbdPipeQuery>,
@@ -164,69 +186,44 @@ async fn get_mbd_pipe(
         }
     };
 
-    let branch_refno = match resolve_branch_refno(input_refno_enum.clone()).await {
+    // cache-only 约定：当前接口以“输入即 BRAN/HANG refno”为前提，不回退 SurrealDB 做祖先解析。
+    // plant3d-web 的测试路由与面板逻辑也是以分支 refno 为输入。
+    let branch_refno = input_refno_enum.clone();
+
+    let segments = match fetch_tubi_segments_from_cache(
+        branch_refno.clone(),
+        query.dbno,
+        query.batch_id.as_deref(),
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => {
             return Json(MbdPipeResponse {
                 success: false,
-                error_message: Some(e.to_string()),
+                error_message: Some(format!("从 foyer cache 读取分支管段失败: {e}")),
                 data: None,
             });
         }
     };
 
-    let branch_att = match get_named_attmap(branch_refno.clone()).await {
-        Ok(v) => v,
-        Err(e) => {
-            return Json(MbdPipeResponse {
-                success: false,
-                error_message: Some(format!("读取分支属性失败: {e}")),
-                data: None,
-            });
-        }
-    };
-    let branch_name = attr_string(&branch_att, "NAME").unwrap_or_else(|| branch_refno.to_string());
-    let branch_attrs = BranchAttrsDto {
-        duty: attr_string(&branch_att, "DUTY"),
-        pspec: attr_string(&branch_att, "PSPEC"),
-        rccm: attr_string(&branch_att, "RCCM"),
-        clean: attr_string(&branch_att, "CLEAN"),
-        temp: attr_string(&branch_att, "TEMP"),
-        pressure: attr_f32(&branch_att, "PRESS"),
-        ispec: attr_string(&branch_att, "ISPEC"),
-        insuthick: attr_f32(&branch_att, "INSUTHICK"),
-        tspec: attr_string(&branch_att, "TSPEC"),
-        swgd: attr_string(&branch_att, "SWGD"),
-        drawnum: attr_string(&branch_att, "DRAWNUM"),
-        rev: attr_string(&branch_att, "REV"),
-        status: attr_string(&branch_att, "STATUS").or_else(|| attr_string(&branch_att, "status")),
-        fluid: attr_string(&branch_att, "FLUID"),
-    };
-
-    let segments = match PipelineQueryService::fetch_branch_segments(branch_refno.clone()).await {
-        Ok(v) => v,
-        Err(e) => {
-            return Json(MbdPipeResponse {
-                success: false,
-                error_message: Some(format!("查询分支管段失败: {e}")),
-                data: None,
-            });
-        }
-    };
+    let branch_name = branch_refno.to_string();
+    let branch_attrs = BranchAttrsDto::default();
 
     let mut out_segments: Vec<MbdPipeSegmentDto> = Vec::with_capacity(segments.len());
     for (i, seg) in segments.iter().enumerate() {
         out_segments.push(MbdPipeSegmentDto {
             id: format!("seg:{}:{i}", seg.refno),
             refno: seg.refno.to_string(),
-            noun: seg.noun_raw.clone().unwrap_or_else(|| seg.noun.to_string()),
-            name: seg.name.clone(),
-            arrive: seg.arrive.map(|p| [p.world_pos.x, p.world_pos.y, p.world_pos.z]),
-            leave: seg.leave.map(|p| [p.world_pos.x, p.world_pos.y, p.world_pos.z]),
-            length: seg.length,
-            straight_length: seg.straight_length,
-            outside_diameter: seg.outside_diameter,
-            bore: seg.bore,
+            // cache-only：目前仅能稳定提供 tubi 段的几何与连通顺序；noun/规格等语义字段后续再补齐
+            noun: "TUBI".to_string(),
+            name: None,
+            arrive: Some([seg.start.x, seg.start.y, seg.start.z]),
+            leave: Some([seg.end.x, seg.end.y, seg.end.z]),
+            length: seg.start.distance(seg.end),
+            straight_length: seg.start.distance(seg.end),
+            outside_diameter: None,
+            bore: None,
         });
     }
 
@@ -234,16 +231,16 @@ async fn get_mbd_pipe(
     let mut dims: Vec<MbdDimDto> = Vec::new();
     if query.include_dims {
         for (i, seg) in segments.iter().enumerate() {
-            let Some(span) = seg.main_span() else { continue };
-            if span.length < query.dim_min_length {
+            let length = seg.start.distance(seg.end);
+            if length < query.dim_min_length {
                 continue;
             }
             dims.push(MbdDimDto {
                 id: format!("dim:{}:{i}", seg.refno),
-                start: [span.start.world_pos.x, span.start.world_pos.y, span.start.world_pos.z],
-                end: [span.end.world_pos.x, span.end.world_pos.y, span.end.world_pos.z],
-                length: span.length,
-                text: format!("{:.0}", span.length),
+                start: [seg.start.x, seg.start.y, seg.start.z],
+                end: [seg.end.x, seg.end.y, seg.end.z],
+                length,
+                text: format!("{:.0}", length),
             });
         }
     }
@@ -256,18 +253,15 @@ async fn get_mbd_pipe(
         for i in 0..segments.len().saturating_sub(1) {
             let seg1 = &segments[i];
             let seg2 = &segments[i + 1];
-            let (Some(leave1), Some(arrive2)) = (seg1.leave, seg2.arrive) else { continue };
-            if leave1.world_pos.distance(arrive2.world_pos) >= query.weld_merge_threshold {
+            if seg1.end.distance(seg2.start) >= query.weld_merge_threshold {
                 continue;
             }
 
-            let weld_type =
-                determine_weld_type(seg1.noun_raw.as_deref(), seg2.noun_raw.as_deref());
+            let weld_type = determine_weld_type(Some("TUBI"), Some("TUBI"));
 
             // 首期：简单近似 MBD shop/field 规则：分支两端优先现场焊；中间按“常见预制件”判断是否车间焊。
             let at_ends = i == 0 || (i + 1) == (segments.len().saturating_sub(1));
-            let shop_candidate = is_shop_candidate(seg1.noun_raw.as_deref())
-                || is_shop_candidate(seg2.noun_raw.as_deref());
+            let shop_candidate = false;
             let is_shop = !at_ends && shop_candidate;
 
             let label = if is_shop {
@@ -280,7 +274,7 @@ async fn get_mbd_pipe(
 
             welds.push(MbdWeldDto {
                 id: format!("weld:{}:{i}", branch_refno),
-                position: [leave1.world_pos.x, leave1.world_pos.y, leave1.world_pos.z],
+                position: [seg1.end.x, seg1.end.y, seg1.end.z],
                 weld_type,
                 is_shop,
                 label,
@@ -293,10 +287,9 @@ async fn get_mbd_pipe(
     let mut slopes: Vec<MbdSlopeDto> = Vec::new();
     if query.include_slopes {
         for (i, seg) in segments.iter().enumerate() {
-            let (Some(a), Some(b)) = (seg.arrive, seg.leave) else { continue };
-            let dx = b.world_pos.x - a.world_pos.x;
-            let dy = b.world_pos.y - a.world_pos.y;
-            let dz = b.world_pos.z - a.world_pos.z;
+            let dx = seg.end.x - seg.start.x;
+            let dy = seg.end.y - seg.start.y;
+            let dz = seg.end.z - seg.start.z;
             let horizontal = (dx * dx + dy * dy).sqrt();
             if horizontal <= 1e-3 {
                 continue;
@@ -310,8 +303,8 @@ async fn get_mbd_pipe(
             let text = format!("slope {:.1}%", abs_slope * 100.0);
             slopes.push(MbdSlopeDto {
                 id: format!("slope:{}:{i}", seg.refno),
-                start: [a.world_pos.x, a.world_pos.y, a.world_pos.z],
-                end: [b.world_pos.x, b.world_pos.y, b.world_pos.z],
+                start: [seg.start.x, seg.start.y, seg.start.z],
+                end: [seg.end.x, seg.end.y, seg.end.z],
                 slope,
                 text,
             });
@@ -342,45 +335,142 @@ async fn get_mbd_pipe(
     })
 }
 
-async fn resolve_branch_refno(input: RefnoEnum) -> anyhow::Result<RefnoEnum> {
-    let att = get_named_attmap(input.clone()).await.unwrap_or_default();
-    let ty = att.get_type_str();
-    if ty == "BRAN" || ty == "HANG" {
-        return Ok(input);
+async fn fetch_tubi_segments_from_cache(
+    branch_refno: RefnoEnum,
+    dbno: Option<u32>,
+    batch_id: Option<&str>,
+) -> anyhow::Result<Vec<CacheTubiSeg>> {
+    use crate::data_interface::db_meta_manager::db_meta;
+    use crate::fast_model::instance_cache::InstanceCacheManager;
+
+    let dbnum = if let Some(dbno) = dbno {
+        dbno
+    } else {
+        db_meta().ensure_loaded()?;
+        db_meta().get_dbnum_by_refno(branch_refno).unwrap_or(0)
+    };
+    if dbnum == 0 {
+        anyhow::bail!("无法推导 dbno（请传 dbno 或先生成 output/scene_tree/db_meta_info.json）");
     }
 
-    // aios_core::query_filter_ancestors 返回 root->parent 顺序（TreeIndex 路径）。
-    // 我们取最后一个（最靠近 input 的祖先）。
-    let ancestors = query_filter_ancestors(input, &["BRAN", "HANG"]).await?;
-    ancestors
-        .last()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("该 refno 不在 BRAN/HANG 分支下，无法生成管道标注"))
-}
+    // 运行时约定：
+    // - 若 FOYER_CACHE_DIR 指定，则优先使用
+    // - 否则优先尝试项目内默认输出目录（AvevaMarineSample），再回退到 output/instance_cache
+    let cache_dir = std::env::var("FOYER_CACHE_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let p1 = PathBuf::from("output/AvevaMarineSample/instance_cache");
+            if FsPath::new(&p1).exists() {
+                return p1;
+            }
+            PathBuf::from("output/instance_cache")
+        });
 
-fn attr_value<'a>(attrs: &'a NamedAttrMap, key: &str) -> Option<&'a NamedAttrValue> {
-    attrs.get(key).or_else(|| {
-        let alt = format!(":{key}");
-        attrs.get(alt.as_str())
-    })
-}
+    let cache = InstanceCacheManager::new(&cache_dir).await?;
+    let branch_u64 = branch_refno.refno();
+    let mut active_dbnum = dbnum;
+    let mut batch_ids = cache.list_batches(active_dbnum);
+    if batch_ids.is_empty() {
+        // 兼容：前端传入的 dbno 可能是“db_meta 的 dbnum”（例如 7997），
+        // 但 instance_cache 的 key 可能是“本次解析/缓存生成的 db 文件编号”（例如 1112）。
+        // 因此当指定 dbno 无批次时，尝试回退到 cache 里实际存在的 dbnum。
+        let candidates = cache.list_dbnums();
+        if candidates.len() == 1 {
+            active_dbnum = candidates[0];
+            batch_ids = cache.list_batches(active_dbnum);
+        } else {
+            'outer: for cand in candidates {
+                let ids = cache.list_batches(cand);
+                if ids.is_empty() {
+                    continue;
+                }
+                // 仅探测最新少量 batch，避免全量扫描
+                for id in ids.iter().rev().take(3) {
+                    let Some(batch) = cache.get(cand, id).await else { continue };
+                    if batch
+                        .inst_tubi_map
+                        .values()
+                        .any(|info| info.owner_refno.refno() == branch_u64)
+                    {
+                        active_dbnum = cand;
+                        batch_ids = ids;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    if batch_ids.is_empty() {
+        anyhow::bail!(
+            "instance_cache 无批次数据：dbno={} dir={}（且回退失败）",
+            dbnum,
+            cache_dir.display()
+        );
+    }
 
-fn attr_string(attrs: &NamedAttrMap, key: &str) -> Option<String> {
-    attr_value(attrs, key).and_then(|v| match v {
-        NamedAttrValue::StringType(s)
-        | NamedAttrValue::WordType(s)
-        | NamedAttrValue::ElementType(s) => Some(s.clone()),
-        _ => None,
-    })
-}
+    fn parse_seq(id: &str) -> Option<u64> {
+        id.rsplit('_').next()?.parse().ok()
+    }
 
-fn attr_f32(attrs: &NamedAttrMap, key: &str) -> Option<f32> {
-    attr_value(attrs, key).and_then(|v| match v {
-        NamedAttrValue::F32Type(x) => Some(*x),
-        NamedAttrValue::IntegerType(x) => Some(*x as f32),
-        NamedAttrValue::LongType(x) => Some(*x as f32),
-        _ => None,
-    })
+    // 以“截至 batch_id 的快照”语义读取（与 ptset_api 一致）
+    let target_seq = batch_id.and_then(parse_seq);
+    let mut ids_with_seq: Vec<(u64, String)> = batch_ids
+        .drain(..)
+        .filter_map(|id| Some((parse_seq(&id)?, id)))
+        .collect();
+    ids_with_seq.sort_by_key(|(seq, _)| *seq);
+    if let Some(t) = target_seq {
+        ids_with_seq.retain(|(seq, _)| *seq <= t);
+    }
+    if ids_with_seq.is_empty() {
+        anyhow::bail!("未找到可用 batch（dbno={} batch_id={:?}）", dbnum, batch_id);
+    }
+
+    // 合并快照：后来的 batch 覆盖较早的段
+    let mut merged: HashMap<RefnoEnum, CacheTubiSeg> = HashMap::new();
+    for (_, id) in ids_with_seq {
+        let Some(batch) = cache.get(active_dbnum, &id).await else { continue };
+        for (leave_refno, info) in &batch.inst_tubi_map {
+            if info.owner_refno.refno() != branch_u64 {
+                continue;
+            }
+            // cache 里 tubi_start_pt/tubi_end_pt 可能未写入（或被裁剪），此时用 tubi 的 world_transform
+            // 将 unit cylinder 的端点 (0,0,0)-(0,0,1) 变换到世界坐标，作为稳定兜底。
+            let (start, end) = match (info.tubi_start_pt, info.tubi_end_pt) {
+                (Some(s), Some(e)) => (s, e),
+                _ => {
+                    let wt = info.get_ele_world_transform();
+                    let m = wt.to_matrix();
+                    (
+                        info.tubi_start_pt
+                            .unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 0.0))),
+                        info.tubi_end_pt
+                            .unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 1.0))),
+                    )
+                }
+            };
+            merged.insert(
+                *leave_refno,
+                CacheTubiSeg {
+                    refno: *leave_refno,
+                    arrive_refno: info.tubi_arrive_refno,
+                    order: info.tubi_index,
+                    start,
+                    end,
+                },
+            );
+        }
+    }
+
+    let mut segs: Vec<CacheTubiSeg> = merged.into_values().collect();
+    segs.sort_by(|a, b| {
+        let ao = a.order.unwrap_or(u32::MAX);
+        let bo = b.order.unwrap_or(u32::MAX);
+        ao.cmp(&bo).then_with(|| a.refno.to_string().cmp(&b.refno.to_string()))
+    });
+    Ok(segs)
 }
 
 fn determine_weld_type(noun1: Option<&str>, noun2: Option<&str>) -> MbdWeldType {
@@ -395,16 +485,5 @@ fn determine_weld_type(noun1: Option<&str>, noun2: Option<&str>) -> MbdWeldType 
         return MbdWeldType::Fillet;
     }
     MbdWeldType::Butt
-}
-
-fn is_shop_candidate(noun: Option<&str>) -> bool {
-    let n = noun.unwrap_or("");
-    // 与 MBD（PML）首期近似：中间段的常见预制件倾向车间焊
-    n.contains("ELBO")
-        || n.contains("TEE")
-        || n.contains("REDU")
-        || n.contains("CROS")
-        || n.contains("FLAN")
-        || n.contains("FBLI")
 }
 

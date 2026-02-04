@@ -1,4 +1,4 @@
-//! foyer cache 专用的布尔运算 Worker（不访问 SurrealDB）
+//! foyer cache 专用的布尔运算 Worker（不写入 SurrealDB；必要时读取 pe_transform/local_trans）
 //!
 //! 布尔运算的核心实现目前仍位于 `fast_model::manifold_bool`（包含 DB 路径与 cache-only 路径的共享能力）。
 //! 本模块提供清晰的 cache-only 入口，并与 `FoyerCacheContext` 对接，便于 orchestrator 统一编排。

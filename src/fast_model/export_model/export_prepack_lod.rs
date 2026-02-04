@@ -2215,6 +2215,288 @@ struct UngroupedInstanceResult {
     pub name: Option<String>,
 }
 
+// =============================================================================
+// 增量合并导出 trans/aabb 相关结构和函数
+// =============================================================================
+
+/// Hash 收集器：在构建 JSON 过程中收集引用的 trans/aabb hash
+#[derive(Debug, Default)]
+struct HashCollector {
+    pub trans_hashes: HashSet<String>,
+    pub aabb_hashes: HashSet<String>,
+}
+
+impl HashCollector {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn add_trans(&mut self, hash: &str) {
+        if !hash.is_empty() {
+            self.trans_hashes.insert(hash.to_string());
+        }
+    }
+
+    fn add_aabb(&mut self, hash: &str) {
+        if !hash.is_empty() {
+            self.aabb_hashes.insert(hash.to_string());
+        }
+    }
+
+    fn add_trans_opt(&mut self, hash: &Option<String>) {
+        if let Some(h) = hash {
+            self.add_trans(h);
+        }
+    }
+
+    fn add_aabb_opt(&mut self, hash: &Option<String>) {
+        if let Some(h) = hash {
+            self.add_aabb(h);
+        }
+    }
+}
+
+/// 读取 JSON map 文件，不存在则返回空 map
+fn load_json_map_or_empty(path: &Path) -> Result<HashMap<String, serde_json::Value>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("读取文件失败: {}", path.display()))?;
+    if content.trim().is_empty() {
+        return Ok(HashMap::new());
+    }
+    let map: HashMap<String, serde_json::Value> = serde_json::from_str(&content)
+        .with_context(|| format!("解析 JSON 失败: {}", path.display()))?;
+    Ok(map)
+}
+
+/// trans 表查询结果
+#[derive(Debug, Deserialize, SurrealValue)]
+struct TransQueryRow {
+    hash: String,
+    d: serde_json::Value,
+}
+
+/// aabb 表查询结果
+#[derive(Debug, Deserialize, SurrealValue)]
+struct AabbQueryRow {
+    hash: String,
+    d: Option<aios_core::types::PlantAabb>,
+}
+
+/// 批量查询 trans 表（按 hash 列表）
+async fn query_trans_by_hashes(
+    hashes: &HashSet<String>,
+    unit_converter: &UnitConverter,
+    verbose: bool,
+) -> Result<HashMap<String, serde_json::Value>> {
+    use aios_core::SUL_DB;
+
+    let mut result = HashMap::new();
+    if hashes.is_empty() {
+        return Ok(result);
+    }
+
+    let hashes_vec: Vec<&String> = hashes.iter().collect();
+    for chunk in hashes_vec.chunks(500) {
+        // SurrealDB 语法：SELECT * FROM [trans:⟨h1⟩, trans:⟨h2⟩, ...]
+        let keys: Vec<String> = chunk.iter()
+            .map(|h| format!("trans:⟨{}⟩", h))
+            .collect();
+        let sql = format!(
+            "SELECT record::id(id) as hash, d FROM [{}]",
+            keys.join(", ")
+        );
+
+        if verbose {
+            println!("   查询 trans: {} 个", chunk.len());
+        }
+
+        let rows: Vec<TransQueryRow> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        for row in rows {
+            // d 是 bevy Transform: { translation: [x,y,z], rotation: [x,y,z,w], scale: [x,y,z] }
+            if let Some(obj) = row.d.as_object() {
+                let translation = obj.get("translation")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        let x = arr.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let y = arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let z = arr.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        glam::DVec3::new(x, y, z)
+                    })
+                    .unwrap_or(glam::DVec3::ZERO);
+
+                let rotation = obj.get("rotation")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        let x = arr.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let y = arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let z = arr.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let w = arr.get(3).and_then(|v| v.as_f64()).unwrap_or(1.0);
+                        glam::DQuat::from_xyzw(x, y, z, w)
+                    })
+                    .unwrap_or(glam::DQuat::IDENTITY);
+
+                let scale = obj.get("scale")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        let x = arr.get(0).and_then(|v| v.as_f64()).unwrap_or(1.0);
+                        let y = arr.get(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
+                        let z = arr.get(2).and_then(|v| v.as_f64()).unwrap_or(1.0);
+                        glam::DVec3::new(x, y, z)
+                    })
+                    .unwrap_or(glam::DVec3::ONE);
+
+                // 构建 DMat4 并转换为列主序数组
+                let mat = glam::DMat4::from_scale_rotation_translation(scale, rotation, translation);
+                let arr = mat4_to_vec_dmat4(&mat, unit_converter, false);
+                result.insert(row.hash, json!(arr));
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// 批量查询 aabb 表（按 hash 列表）
+async fn query_aabb_by_hashes(
+    hashes: &HashSet<String>,
+    unit_converter: &UnitConverter,
+    verbose: bool,
+) -> Result<HashMap<String, serde_json::Value>> {
+    use aios_core::SUL_DB;
+
+    let mut result = HashMap::new();
+    if hashes.is_empty() {
+        return Ok(result);
+    }
+
+    let hashes_vec: Vec<&String> = hashes.iter().collect();
+    for chunk in hashes_vec.chunks(500) {
+        let keys: Vec<String> = chunk.iter()
+            .map(|h| format!("aabb:⟨{}⟩", h))
+            .collect();
+        let sql = format!(
+            "SELECT record::id(id) as hash, d FROM [{}]",
+            keys.join(", ")
+        );
+
+        if verbose {
+            println!("   查询 aabb: {} 个", chunk.len());
+        }
+
+        let rows: Vec<AabbQueryRow> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        for row in rows {
+            if let Some(aabb) = row.d {
+                result.insert(row.hash, aabb_to_json(&aabb, unit_converter));
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// 按需查询 trans/aabb 并增量合并到全局表
+///
+/// # 流程
+/// 1. 读取现有全局表（如果存在）
+/// 2. 过滤出"全局表中不存在"的 hash
+/// 3. 仅查询缺失的 hash
+/// 4. 合并写回全局表
+///
+/// # 返回
+/// (trans 总数, aabb 总数, 新增 trans 数, 新增 aabb 数)
+pub async fn export_trans_aabb_incremental(
+    output_dir: &Path,
+    needed_trans_hashes: &HashSet<String>,
+    needed_aabb_hashes: &HashSet<String>,
+    unit_converter: &UnitConverter,
+    verbose: bool,
+) -> Result<(usize, usize, usize, usize)> {
+    let trans_path = output_dir.join("trans.json");
+    let aabb_path = output_dir.join("aabb.json");
+
+    // 1. 读取现有全局表
+    let mut global_trans = load_json_map_or_empty(&trans_path)?;
+    let mut global_aabb = load_json_map_or_empty(&aabb_path)?;
+
+    // 2. 过滤出缺失的 hash（避免重复查询）
+    let missing_trans: HashSet<String> = needed_trans_hashes
+        .iter()
+        .filter(|h| !h.is_empty() && !global_trans.contains_key(*h))
+        .cloned()
+        .collect();
+    let missing_aabb: HashSet<String> = needed_aabb_hashes
+        .iter()
+        .filter(|h| !h.is_empty() && !global_aabb.contains_key(*h))
+        .cloned()
+        .collect();
+
+    if verbose {
+        println!("📊 trans: 需要 {} 个，已有 {}，缺失 {}",
+            needed_trans_hashes.len(), global_trans.len(), missing_trans.len());
+        println!("📊 aabb: 需要 {} 个，已有 {}，缺失 {}",
+            needed_aabb_hashes.len(), global_aabb.len(), missing_aabb.len());
+    }
+
+    let trans_added = missing_trans.len();
+    let aabb_added = missing_aabb.len();
+
+    // 3. 仅查询缺失的 hash
+    if !missing_trans.is_empty() {
+        let new_trans = query_trans_by_hashes(&missing_trans, unit_converter, verbose).await?;
+        if verbose && new_trans.len() < missing_trans.len() {
+            println!("   ⚠️ trans 查询返回 {} 条，期望 {} 条", new_trans.len(), missing_trans.len());
+        }
+        global_trans.extend(new_trans);
+    }
+    if !missing_aabb.is_empty() {
+        let new_aabb = query_aabb_by_hashes(&missing_aabb, unit_converter, verbose).await?;
+        if verbose && new_aabb.len() < missing_aabb.len() {
+            println!("   ⚠️ aabb 查询返回 {} 条，期望 {} 条", new_aabb.len(), missing_aabb.len());
+        }
+        global_aabb.extend(new_aabb);
+    }
+
+    // 4. 写回全局表
+    fs::write(&trans_path, serde_json::to_string(&global_trans)?)?;
+    fs::write(&aabb_path, serde_json::to_string(&global_aabb)?)?;
+
+    if verbose {
+        println!("✅ trans.json: {} 条 (+{})", global_trans.len(), trans_added);
+        println!("✅ aabb.json: {} 条 (+{})", global_aabb.len(), aabb_added);
+    }
+
+    Ok((global_trans.len(), global_aabb.len(), trans_added, aabb_added))
+}
+
+/// 合并并写入共享表（用于 cache 导出路径）
+///
+/// # 返回
+/// (总数, 新增数)
+fn merge_and_write_shared_table(
+    path: &Path,
+    new_entries: &HashMap<String, serde_json::Value>,
+) -> Result<(usize, usize)> {
+    // 读取现有表
+    let mut existing = load_json_map_or_empty(path)?;
+
+    // 统计新增数量
+    let added = new_entries
+        .iter()
+        .filter(|(k, _)| !existing.contains_key(*k))
+        .count();
+
+    // 合并（新数据覆盖旧数据）
+    existing.extend(new_entries.clone());
+
+    // 写回
+    fs::write(path, serde_json::to_string(&existing)?)?;
+
+    Ok((existing.len(), added))
+}
+
 /// TreeIndex 驱动的 inst_relate 查询结果结构体
 #[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
 struct InstRelateRow {
@@ -2510,12 +2792,14 @@ pub async fn export_dbnum_instances_json(
                         .unwrap_or(DMat4::IDENTITY);
 
                     let tubi_record = TubiRecord {
-                        refno: raw_tubi_row.refno,
-                        owner_refno: raw_tubi_row.leave,
+                        // 约定：TUBI 的 refno 使用 leave（tubi_relate 的 in），owner_refno 使用 BRAN/HANG（tubi_relate 的 id[0]）。
+                        // 与 foyer cache（insert_tubi(leave_refno, EleGeosInfo{ owner_refno=bran })）保持一致。
+                        refno: raw_tubi_row.leave,
+                        owner_refno: raw_tubi_row.refno,
                         geo_hash,
                         transform,
                         index,
-                        name: format!("TUBI-{}-{}", raw_tubi_row.refno.to_string(), index),
+                        name: format!("TUBI-{}-{}", raw_tubi_row.leave.to_string(), index),
                         spec_value: raw_tubi_row.spec_value,
                         aabb: raw_tubi_row.world_aabb,
                         world_aabb_hash: raw_tubi_row.world_aabb_hash,
@@ -2562,9 +2846,10 @@ pub async fn export_dbnum_instances_json(
         }
     }
 
-    // 5. 构建简化的 JSON 结构
+    // 5. 构建简化的 JSON 结构，同时收集 hash
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let mut groups = Vec::new();
+    let mut hash_collector = HashCollector::new();  // 新增：收集 trans/aabb hash
 
     for owner_refno in &owner_refnos {
         let Some(owner_group) = owner_groups.get(owner_refno) else {
@@ -2597,6 +2882,13 @@ pub async fn export_dbnum_instances_json(
                 .or_else(|| child.aabb_hash.clone());
             if child_aabb_hash.is_none() {
                 continue;  // 双重保险：确保有 AABB
+            }
+
+            // 收集 hash
+            hash_collector.add_aabb_opt(&child_aabb_hash);
+            hash_collector.add_trans_opt(&export_inst.world_trans_hash);
+            for inst in &export_inst.insts {
+                hash_collector.add_trans_opt(&inst.trans_hash);
             }
 
             let child_name = child
@@ -2648,6 +2940,10 @@ pub async fn export_dbnum_instances_json(
                 if tubi.world_aabb_hash.is_none() || tubi.geo_hash.is_empty() {
                     continue;
                 }
+
+                // 收集 hash
+                hash_collector.add_aabb_opt(&tubi.world_aabb_hash);
+                hash_collector.add_trans_opt(&tubi.world_trans_hash);
 
                 tubings.push(json!({
                     "refno": tubi.refno.to_string(),
@@ -2713,6 +3009,13 @@ pub async fn export_dbnum_instances_json(
 
         if export_inst.insts.is_empty() || export_inst.world_aabb_hash.is_none() {
             continue;
+        }
+
+        // 收集 hash
+        hash_collector.add_aabb_opt(&export_inst.world_aabb_hash);
+        hash_collector.add_trans_opt(&export_inst.world_trans_hash);
+        for inst in &export_inst.insts {
+            hash_collector.add_trans_opt(&inst.trans_hash);
         }
 
         // 使用数据库中的 trans_hash
@@ -2792,26 +3095,38 @@ pub async fn export_dbnum_instances_json(
     let json_str = serde_json::to_string_pretty(&instances_json)?;
     fs::write(&output_path, json_str)?;
 
-    // 写入元信息（SurrealDB 导出不携带 batch_id，前端可回退 latest 或不传）
-    write_instances_meta(output_dir, dbnum, &generated_at, None)?;
-
     if verbose {
         println!("✅ 主 JSON 文件已写入: {}", output_path.display());
     }
+
+    // 增量合并导出 trans/aabb（替代全表扫描）
+    if verbose {
+        println!("\n🔍 增量导出 trans/aabb...");
+    }
+    let (trans_total, aabb_total, trans_added, aabb_added) = export_trans_aabb_incremental(
+        output_dir,
+        &hash_collector.trans_hashes,
+        &hash_collector.aabb_hashes,
+        &unit_converter,
+        verbose,
+    ).await?;
+
+    // 写入元信息（SurrealDB 导出不携带 batch_id，前端可回退 latest 或不传）
+    write_instances_meta(output_dir, dbnum, &generated_at, None)?;
 
     // 返回统计信息
     let stats = ExportStats {
         refno_count: owner_refnos.len(),
         descendant_count: in_refnos.len(),
-        geometry_count: 0,
-        mesh_files_found: 0,
-        mesh_files_missing: 0,
+        geometry_count: hash_collector.trans_hashes.len(),  // 更新：使用实际统计
+        mesh_files_found: trans_total,  // 复用字段：trans 总数
+        mesh_files_missing: aabb_total,  // 复用字段：aabb 总数
         output_file_size: {
             fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0)
         },
         elapsed_time: start_time.elapsed(),
-        node_count: 0,
-        mesh_count: 0,
+        node_count: trans_added,  // 复用字段：新增 trans 数
+        mesh_count: aabb_added,  // 复用字段：新增 aabb 数
     };
 
     Ok(stats)
@@ -3229,9 +3544,39 @@ pub async fn export_dbnum_instances_json_from_cache(
         let owner_type = owner_group.owner_type.as_str();
         let owner_name = format!("{}-{}", owner_type, owner_refno.to_string());
 
+        // children/tubi 的“连通顺序”优先使用 TreeIndex（与 export-obj 的 collect_export_refnos 语义对齐）：
+        // - BRAN/HANG: TreeIndex 的 children 顺序即“沿管线递增”的顺序
+        // - 其他类型：至少保证输出稳定（fallback 到按 refno 排序）
+        let child_set: HashSet<RefnoEnum> = owner_group.children.iter().map(|c| c.refno).collect();
+        let mut ordered_child_refnos: Vec<RefnoEnum> = match collect_export_refnos(
+            &[*owner_refno],
+            true,
+            None,
+            false,
+        )
+        .await
+        {
+            Ok(list) => list.into_iter().filter(|r| child_set.contains(r)).collect(),
+            Err(_) => {
+                let mut v: Vec<RefnoEnum> = child_set.iter().copied().collect();
+                v.sort_by_key(|r| r.to_string());
+                v
+            }
+        };
+        // 追加 tree 中未覆盖的 child（避免丢）
+        if ordered_child_refnos.len() != child_set.len() {
+            let mut rest: Vec<RefnoEnum> = child_set
+                .iter()
+                .copied()
+                .filter(|r| !ordered_child_refnos.contains(r))
+                .collect();
+            rest.sort_by_key(|r| r.to_string());
+            ordered_child_refnos.extend(rest);
+        }
+
         let mut children = Vec::new();
-        for child in &owner_group.children {
-            let Some(info) = inst_info_map.get(&child.refno) else {
+        for child_refno in &ordered_child_refnos {
+            let Some(info) = inst_info_map.get(child_refno) else {
                 continue;
             };
             let Some(inst_geos) = inst_geos_map.get(&info.get_inst_key()) else {
@@ -3263,8 +3608,8 @@ pub async fn export_dbnum_instances_json_from_cache(
             let has_neg = inst_geos.has_neg()
                 || inst_geos.has_cata_neg()
                 || inst_geos.has_ngmr()
-                || neg_relate_map.contains_key(&child.refno)
-                || ngmr_neg_relate_map.contains_key(&child.refno);
+                || neg_relate_map.contains_key(child_refno)
+                || ngmr_neg_relate_map.contains_key(child_refno);
 
             let instances: Vec<serde_json::Value> = inst_geos
                 .insts
@@ -3284,7 +3629,7 @@ pub async fn export_dbnum_instances_json_from_cache(
                 .collect();
 
             children.push(json!({
-                "refno": child.refno.to_string(),
+                "refno": child_refno.to_string(),
                 "noun": "",
                 "name": "",
                 "aabb_hash": aabb_hash,
@@ -3297,14 +3642,58 @@ pub async fn export_dbnum_instances_json_from_cache(
         }
 
         let mut tubings = Vec::new();
-        let mut tubi_items: Vec<(&RefnoEnum, &EleGeosInfo)> = inst_tubi_map.iter().collect();
-        tubi_items.sort_by_key(|(r, _)| r.to_string());
+        // tubi 输出顺序：优先使用 cache 中的 tubi_index（对应 tubi_relate 的 index），缺失时退回旧顺序
+        let mut ordered_tubis: Vec<RefnoEnum> = Vec::new();
+        let mut tubi_items: Vec<(RefnoEnum, Option<u32>)> = inst_tubi_map
+            .iter()
+            .filter_map(|(tubi_refno, info)| {
+                if info.owner_refno == *owner_refno {
+                    Some((*tubi_refno, info.tubi_index))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if tubi_items.iter().any(|(_, idx)| idx.is_some()) {
+            tubi_items.sort_by(|(ra, ia), (rb, ib)| {
+                ia.unwrap_or(u32::MAX)
+                    .cmp(&ib.unwrap_or(u32::MAX))
+                    .then_with(|| ra.to_string().cmp(&rb.to_string()))
+            });
+            ordered_tubis.extend(tubi_items.iter().map(|(r, _)| *r));
+        } else {
+            // fallback：复用 children 的顺序（TreeIndex BFS / 与 export-obj 的 cache 查询顺序一致）
+            let mut seen_tubi: HashSet<RefnoEnum> = HashSet::new();
+            for r in &ordered_child_refnos {
+                let Some(info) = inst_tubi_map.get(r) else {
+                    continue;
+                };
+                if info.owner_refno != *owner_refno {
+                    continue;
+                }
+                ordered_tubis.push(*r);
+                seen_tubi.insert(*r);
+            }
+            // tree 未覆盖/或不在 children 的 tubi：稳定追加
+            let mut extras: Vec<RefnoEnum> = inst_tubi_map
+                .iter()
+                .filter_map(|(tubi_refno, info)| {
+                    if info.owner_refno == *owner_refno && !seen_tubi.contains(tubi_refno) {
+                        Some(*tubi_refno)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            extras.sort_by_key(|r| r.to_string());
+            ordered_tubis.extend(extras);
+        }
         let mut tubi_order = 0u32;
 
-        for (tubi_refno, info) in tubi_items {
-            if info.owner_refno != *owner_refno {
+        for tubi_refno in ordered_tubis {
+            let Some(info) = inst_tubi_map.get(&tubi_refno) else {
                 continue;
-            }
+            };
             let Some(inst_geos) = inst_geos_map.get(&info.get_inst_key()) else {
                 continue;
             };
@@ -3318,23 +3707,24 @@ pub async fn export_dbnum_instances_json_from_cache(
             let aabb_hash = insert_aabb_hash(&mut aabb_table, &aabb, &unit_converter);
             let trans_hash = insert_trans_hash(
                 &mut trans_table,
-                &to_dmat4(&info.world_transform),
+                &to_dmat4(&info.get_ele_world_transform()),
                 &unit_converter,
                 false,
             );
 
-            tubings.push(json!({
-                "refno": tubi_refno.to_string(),
-                "noun": "TUBI",
-                "name": format!("TUBI-{}", tubi_refno.to_string()),
-                "aabb_hash": aabb_hash,
-                "geo_hash": first_inst.geo_hash.to_string(),
-                "trans_hash": trans_hash,
-                "order": tubi_order,
-                "lod_mask": 1u32,
-                "spec_value": 0,
-            }));
-            tubi_order += 1;
+                let order = info.tubi_index.unwrap_or(tubi_order);
+                tubings.push(json!({
+                    "refno": tubi_refno.to_string(),
+                    "noun": "TUBI",
+                    "name": format!("TUBI-{}", tubi_refno.to_string()),
+                    "aabb_hash": aabb_hash,
+                    "geo_hash": first_inst.geo_hash.to_string(),
+                    "trans_hash": trans_hash,
+                    "order": order,
+                    "lod_mask": 1u32,
+                    "spec_value": 0,
+                }));
+                tubi_order += 1;
         }
 
         groups.push(json!({
@@ -3424,7 +3814,12 @@ pub async fn export_dbnum_instances_json_from_cache(
         );
 
         let mut tubi_items: Vec<(&RefnoEnum, &EleGeosInfo)> = inst_tubi_map.iter().collect();
-        tubi_items.sort_by_key(|(r, _)| r.to_string());
+        tubi_items.sort_by(|(ra, ia), (rb, ib)| {
+            ia.tubi_index
+                .unwrap_or(u32::MAX)
+                .cmp(&ib.tubi_index.unwrap_or(u32::MAX))
+                .then_with(|| ra.to_string().cmp(&rb.to_string()))
+        });
 
         let mut tubings = Vec::new();
         let mut tubi_order = 0u32;
@@ -3455,6 +3850,7 @@ pub async fn export_dbnum_instances_json_from_cache(
                 continue;
             };
 
+            let order = info.tubi_index.unwrap_or(tubi_order);
             tubings.push(json!({
                 "refno": tubi_refno.to_string(),
                 "noun": "TUBI",
@@ -3462,7 +3858,7 @@ pub async fn export_dbnum_instances_json_from_cache(
                 "aabb_hash": aabb_hash,
                 "geo_hash": geo_hash,
                 "trans_hash": trans_hash,
-                "order": tubi_order,
+                "order": order,
                 "lod_mask": 1u32,
                 "spec_value": 0,
             }));
@@ -3496,11 +3892,9 @@ pub async fn export_dbnum_instances_json_from_cache(
     let trans_path = output_dir.join("trans.json");
     let aabb_path = output_dir.join("aabb.json");
 
-    let trans_json: serde_json::Value = trans_table.clone().into_iter().collect();
-    let aabb_json: serde_json::Value = aabb_table.clone().into_iter().collect();
-
-    fs::write(&trans_path, serde_json::to_string(&trans_json)?)?;
-    fs::write(&aabb_path, serde_json::to_string(&aabb_json)?)?;
+    // 增量合并写入 trans.json 和 aabb.json（替代直接覆盖）
+    let (trans_total, trans_added) = merge_and_write_shared_table(&trans_path, &trans_table)?;
+    let (aabb_total, aabb_added) = merge_and_write_shared_table(&aabb_path, &aabb_table)?;
 
     // 写入元信息：前端读取 batch_id 后，请求 ptset 时带上以实现强一致（按需查询时仍可回退 latest）。
     write_instances_meta(output_dir, dbnum, &generated_at, latest_batch_id)?;
@@ -3508,14 +3902,16 @@ pub async fn export_dbnum_instances_json_from_cache(
     if verbose {
         println!("✅ 主 JSON 文件已写入: {}", output_path.display());
         println!(
-            "✅ trans.json 已写入: {} ({} 条)",
+            "✅ trans.json 已写入: {} ({} 条, +{})",
             trans_path.display(),
-            trans_table.len()
+            trans_total,
+            trans_added
         );
         println!(
-            "✅ aabb.json 已写入: {} ({} 条)",
+            "✅ aabb.json 已写入: {} ({} 条, +{})",
             aabb_path.display(),
-            aabb_table.len()
+            aabb_total,
+            aabb_added
         );
         if missing_inst_key > 0 || missing_aabb > 0 {
             println!(
@@ -3535,16 +3931,16 @@ pub async fn export_dbnum_instances_json_from_cache(
     let stats = ExportStats {
         refno_count: owner_refnos.len(),
         descendant_count: in_refnos.len(),
-        geometry_count: 0,
-        mesh_files_found: 0,
-        mesh_files_missing: 0,
+        geometry_count: trans_table.len(),
+        mesh_files_found: trans_total,
+        mesh_files_missing: aabb_total,
         output_file_size: fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0),
         elapsed_time: start_time.elapsed(),
-        node_count: 0,
-        mesh_count: 0,
+        node_count: trans_added,
+        mesh_count: aabb_added,
     };
 
-    Ok((stats, trans_table.len(), aabb_table.len()))
+    Ok((stats, trans_total, aabb_total))
 }
 
 /// 导出全局 trans.json 和 aabb.json（扫描整表）

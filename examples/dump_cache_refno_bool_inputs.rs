@@ -8,7 +8,7 @@
 //! Notes:
 //! - Requires output/scene_tree/db_meta_info.json to map refno -> dbnum.
 //! - Prints enough info to verify boolean worker inputs:
-//!   - inst_geos.insts geo_type / geo_hash / unit_flag / transform scale+translation
+//!   - inst_geos.insts geo_type / geo_hash / reuse_unit_flag / geo_transform scale+translation
 //!   - neg_relate_map keys for this refno
 //!   - ngmr_neg_relate_map keys for this refno
 
@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let refno_str = env::var("REFNO").unwrap_or_else(|_| "17496/142306".to_string());
+    let refno_str = env::var("REFNO").unwrap_or_else(|_| "17496/106064".to_string());
     let refno = RefnoEnum::from(refno_str.as_str());
     anyhow::ensure!(refno.is_valid(), "无效 REFNO: {}", refno_str);
 
@@ -91,32 +91,33 @@ async fn main() -> Result<()> {
         println!("   - inst_geos.insts: {}", geos.insts.len());
         for (i, inst) in geos.insts.iter().enumerate() {
             // Keep output compact but sufficient for scale/placement debugging.
+            let unit_flag = inst.geo_param.is_reuse_unit();
             println!(
                 "     [{:02}] geo_type={:?} geom_refno={} geo_hash={} unit_flag={} vis={} cata_neg_cnt={}",
                 i,
                 inst.geo_type,
                 inst.refno,
                 inst.geo_hash,
-                inst.unit_flag,
+                unit_flag,
                 inst.visible,
                 inst.cata_neg_refnos.len()
             );
             println!(
                 "          local: t=({:.3},{:.3},{:.3}) s=({:.3},{:.3},{:.3})",
-                inst.transform.translation.x,
-                inst.transform.translation.y,
-                inst.transform.translation.z,
-                inst.transform.scale.x,
-                inst.transform.scale.y,
-                inst.transform.scale.z
+                inst.geo_transform.translation.x,
+                inst.geo_transform.translation.y,
+                inst.geo_transform.translation.z,
+                inst.geo_transform.scale.x,
+                inst.geo_transform.scale.y,
+                inst.geo_transform.scale.z
             );
             // rotation 也会影响“底对齐”补偿方向（例如局部 z 轴翻转会导致 +0.5 变成向下移动）。
             println!(
                 "          rot: ({:.6},{:.6},{:.6},{:.6})",
-                inst.transform.rotation.x,
-                inst.transform.rotation.y,
-                inst.transform.rotation.z,
-                inst.transform.rotation.w
+                inst.geo_transform.rotation.x,
+                inst.geo_transform.rotation.y,
+                inst.geo_transform.rotation.z,
+                inst.geo_transform.rotation.w
             );
         }
 

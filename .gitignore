@@ -82,6 +82,8 @@ debug_*.log
 tmp/
 temp/
 .cache/
+.worktrees/
+worktrees/
 
 # Binary files and build artifacts
 *.exe
@@ -147,3 +149,4 @@ deploy/
 ams-8020.db
 target-web-server-check
 nul
+test_output

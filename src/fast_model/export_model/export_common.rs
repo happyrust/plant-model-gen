@@ -128,7 +128,7 @@ pub struct ComponentRecord {
 #[derive(Debug, Clone)]
 pub struct TubiRecord {
     pub refno: RefnoEnum,
-    /// BRAN/HANG 所在的 owner（tubi_relate 的 leave）
+    /// TUBI 所属的 BRAN/HANG（owner_refno）
     pub owner_refno: RefnoEnum,
     pub geo_hash: String,
     pub transform: DMat4,

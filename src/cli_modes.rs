@@ -1462,7 +1462,6 @@ pub async fn export_dbnum_instances_json_mode(
 ) -> Result<()> {
     use aios_database::fast_model::export_model::export_prepack_lod::{
         export_dbnum_instances_json, export_dbnum_instances_json_from_cache,
-        export_global_trans_aabb_json,
     };
     use std::sync::Arc;
 
@@ -1473,9 +1472,156 @@ pub async fn export_dbnum_instances_json_mode(
     let output_dir = output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("instances"));
 
     if db_option_ext.use_cache {
+        async fn cache_has_any_tubi(cache_dir: &std::path::Path, dbnum: u32) -> anyhow::Result<bool> {
+            let cache = aios_database::fast_model::instance_cache::InstanceCacheManager::new(cache_dir).await?;
+            let batch_ids = cache.list_batches(dbnum);
+            for bid in batch_ids.iter().rev() {
+                let Some(batch) = cache.get(dbnum, bid).await else {
+                    continue;
+                };
+                if !batch.inst_tubi_map.is_empty() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        async fn gen_tubi_into_cache(
+            dbnum: u32,
+            db_option_ext: &DbOptionExt,
+            root_refno: Option<RefnoEnum>,
+        ) -> anyhow::Result<()> {
+            use aios_database::fast_model::foyer_cache::FoyerCacheContext;
+            use aios_database::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+            use aios_core::geometry::EleGeosInfo;
+            use aios_core::shape::pdms_shape::RsVec3;
+            use aios_core::types::PlantAabb;
+            use aios_core::{SUL_DB, SurrealQueryExt};
+            use serde::{Deserialize, Serialize};
+            use surrealdb::types::SurrealValue;
+            use aios_core::rs_surreal::geometry_query::PlantTransform;
+
+            // 方案 B：tubi 导出以 tubi_relate 为准。
+            // 这里“只读 SurrealDB + 写 foyer cache”，把 tubi_relate 的最小必要信息落到 cache：
+            // owner_refno, leave_refno, arrive_refno, index/order, world_trans/aabb, start/end。
+            ensure_surreal_connected(db_option_ext).await?;
+
+            let Some(ctx) = FoyerCacheContext::try_from_db_option(db_option_ext).await? else {
+                anyhow::bail!("use_cache=false，无法写入 foyer cache");
+            };
+
+            let branch_refnos: Vec<RefnoEnum> = if let Some(r) = root_refno.filter(|r| r.is_valid()) {
+                let is_branch = TreeIndexManager::with_default_dir(vec![dbnum])
+                    .load_index(dbnum)
+                    .ok()
+                    .and_then(|idx| idx.node_meta(r.refno()))
+                    .is_some_and(|m| {
+                        let bran = aios_core::tool::db_tool::db1_hash("BRAN");
+                        let hang = aios_core::tool::db_tool::db1_hash("HANG");
+                        m.noun == bran || m.noun == hang
+                    });
+                if is_branch {
+                    vec![r]
+                } else {
+                    // 显式指定了 root_refno 但它不是 BRAN/HANG，则不做“全库补齐”，避免意外长耗时。
+                    return Ok(());
+                }
+            } else {
+                let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+                let mut v = manager.query_noun_refnos("BRAN", None);
+                v.extend(manager.query_noun_refnos("HANG", None));
+                v
+            };
+
+            if branch_refnos.is_empty() {
+                return Ok(());
+            }
+
+            #[derive(Serialize, Deserialize, Debug, SurrealValue)]
+            struct TubiRelateRow {
+                pub owner_refno: RefnoEnum,
+                pub leave_refno: RefnoEnum,
+                pub arrive_refno: RefnoEnum,
+                #[serde(default)]
+                pub world_trans: Option<PlantTransform>,
+                #[serde(default)]
+                pub world_aabb: Option<PlantAabb>,
+                #[serde(default)]
+                pub start_pt: Option<RsVec3>,
+                #[serde(default)]
+                pub end_pt: Option<RsVec3>,
+                #[serde(default)]
+                pub index: Option<i64>,
+            }
+
+            let cache_manager = ctx.cache_arc();
+            for owner in &branch_refnos {
+                let owner_att = aios_core::get_named_attmap(*owner).await.unwrap_or_default();
+                let owner_type = owner_att.get_type_str().to_string();
+
+                // 注意：tubi_relate 的复合 ID 为 [owner_refno, index]；
+                // in/out 对应 leave/arrive；refno 导出侧以 leave_refno 为主键。
+                let pe_key = owner.to_pe_key();
+                let sql = format!(
+                    r#"
+                    SELECT
+                        id[0] as owner_refno,
+                        in as leave_refno,
+                        out as arrive_refno,
+                        world_trans.d as world_trans,
+                        aabb.d as world_aabb,
+                        start_pt.d as start_pt,
+                        end_pt.d as end_pt,
+                        id[1] as index
+                    FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
+                    "#
+                );
+                let rows: Vec<TubiRelateRow> = SUL_DB.query_take(&sql, 0).await?;
+                if rows.is_empty() {
+                    continue;
+                }
+
+                let mut shape_insts = aios_core::geometry::ShapeInstancesData::default();
+                for row in rows {
+                    let info = EleGeosInfo {
+                        refno: row.leave_refno,
+                        sesno: owner_att.sesno(),
+                        owner_refno: row.owner_refno,
+                        owner_type: owner_type.clone(),
+                        cata_hash: Some(aios_core::prim_geo::basic::TUBI_GEO_HASH.to_string()),
+                        visible: true,
+                        aabb: row.world_aabb.map(|a| a.0),
+                        world_transform: row.world_trans.unwrap_or_default().0,
+                        tubi_start_pt: row.start_pt.map(|p| p.0),
+                        tubi_end_pt: row.end_pt.map(|p| p.0),
+                        tubi_arrive_refno: Some(row.arrive_refno),
+                        tubi_index: row.index.and_then(|i| u32::try_from(i).ok()),
+                        is_solid: true,
+                        ..Default::default()
+                    };
+                    shape_insts.insert_tubi(row.leave_refno, info);
+                }
+
+                cache_manager.insert_from_shape(dbnum, &shape_insts);
+            }
+
+            let _ = ctx.cache().close().await;
+            Ok(())
+        }
+
         let cache_dir = db_option_ext.get_foyer_cache_dir();
         let mesh_dir = ExportConfig::default().get_mesh_dir(db_option_ext);
         let mesh_lod_tag = format!("{:?}", db_option_ext.inner.mesh_precision.default_lod);
+
+        // 若显式指定了 root_refno（通过 --debug-model），则优先对该 BRAN/HANG 做一次 tubi 刷新，
+        // 以便“已有 cache 但 tubi 缺失/不完整”的情况下也能得到正确导出。
+        if root_refno.is_some() {
+            println!("\n🔄 检测到 root_refno：尝试刷新该 BRAN/HANG 的 tubi...");
+            if let Err(e) = gen_tubi_into_cache(dbnum, db_option_ext, root_refno).await {
+                eprintln!("⚠️  tubi 刷新失败（将继续直接导出）: {}", e);
+            }
+        }
+
         let result = export_dbnum_instances_json_from_cache(
             dbnum,
             &output_dir,
@@ -1488,6 +1634,35 @@ pub async fn export_dbnum_instances_json_mode(
         .await;
         match result {
             Ok((stats, trans_count, aabb_count)) => {
+                // 若 tubi 为空，则对现有 cache 做一次“tubi-only 补齐”，再重试导出。
+                if !cache_has_any_tubi(&cache_dir, dbnum).await.unwrap_or(false) {
+                    println!("\n⚠️  检测到 cache.inst_tubi_map 为空：将尝试补齐 BRAN/HANG tubi 并重新导出...");
+                    if let Err(e) = gen_tubi_into_cache(dbnum, db_option_ext, root_refno).await {
+                        eprintln!("⚠️  tubi 补齐失败（将继续输出当前导出结果）: {}", e);
+                    } else {
+                        println!("✅ tubi 补齐完成，重新导出...");
+                        if let Ok((stats, trans_count, aabb_count)) = export_dbnum_instances_json_from_cache(
+                            dbnum,
+                            &output_dir,
+                            &cache_dir,
+                            Some(&mesh_dir),
+                            Some(mesh_lod_tag.as_str()),
+                            verbose,
+                            None,
+                        ).await {
+                            println!("\n🎉 导出完成！（缓存路径）");
+                            println!("📊 统计信息:");
+                            println!("   - BRAN/HANG/EQUI 分组数量: {}", stats.refno_count);
+                            println!("   - 子节点数量: {}", stats.descendant_count);
+                            println!("   - 输出文件大小: {} 字节", stats.output_file_size);
+                            println!("   - 变换矩阵数量 (trans): {}", trans_count);
+                            println!("   - 包围盒数量 (aabb): {}", aabb_count);
+                            println!("   - 耗时: {:?}", stats.elapsed_time);
+                            return Ok(());
+                        }
+                    }
+                }
+
                 println!("\n🎉 导出完成！（缓存路径）");
                 println!("📊 统计信息:");
                 println!("   - BRAN/HANG/EQUI 分组数量: {}", stats.refno_count);
@@ -1604,6 +1779,35 @@ pub async fn export_dbnum_instances_json_mode(
 
                         match retry_result {
                             Ok((stats, trans_count, aabb_count)) => {
+                                // 与首次导出一致：若 tubi 为空，则尝试补齐后再导出一次。
+                                if !cache_has_any_tubi(&cache_dir, dbnum).await.unwrap_or(false) {
+                                    println!("\n⚠️  检测到 cache.inst_tubi_map 为空：将尝试补齐 BRAN/HANG tubi 并重新导出...");
+                                    if let Err(e) = gen_tubi_into_cache(dbnum, &db_option_ext_override, root_refno).await {
+                                        eprintln!("⚠️  tubi 补齐失败（将继续输出当前导出结果）: {}", e);
+                                    } else {
+                                        println!("✅ tubi 补齐完成，重新导出...");
+                                        if let Ok((stats, trans_count, aabb_count)) = export_dbnum_instances_json_from_cache(
+                                            dbnum,
+                                            &output_dir,
+                                            &cache_dir,
+                                            Some(&mesh_dir),
+                                            Some(mesh_lod_tag.as_str()),
+                                            verbose,
+                                            None,
+                                        ).await {
+                                            println!("\n🎉 导出完成！（缓存路径）");
+                                            println!("📊 统计信息:");
+                                            println!("   - BRAN/HANG/EQUI 分组数量: {}", stats.refno_count);
+                                            println!("   - 子节点数量: {}", stats.descendant_count);
+                                            println!("   - 输出文件大小: {} 字节", stats.output_file_size);
+                                            println!("   - 变换矩阵数量 (trans): {}", trans_count);
+                                            println!("   - 包围盒数量 (aabb): {}", aabb_count);
+                                            println!("   - 耗时: {:?}", stats.elapsed_time);
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+
                                 println!("\n🎉 导出完成！（缓存路径）");
                                 println!("📊 统计信息:");
                                 println!("   - BRAN/HANG/EQUI 分组数量: {}", stats.refno_count);
@@ -1642,7 +1846,7 @@ pub async fn export_dbnum_instances_json_mode(
     init_surreal().await?;
     println!("✅ 数据库连接成功");
 
-    // 调用导出函数（SurrealDB 路径）
+    // 调用导出函数（SurrealDB 路径，内部已包含增量合并 trans/aabb）
     let db_option = Arc::new((**db_option_ext).clone());
     let stats = export_dbnum_instances_json(
         dbnum,
@@ -1654,17 +1858,18 @@ pub async fn export_dbnum_instances_json_mode(
     )
     .await?;
 
-    // 导出全局 trans.json 和 aabb.json（SurrealDB）
-    let (trans_count, aabb_count) =
-        export_global_trans_aabb_json(&output_dir, None, verbose).await?;
+    // 注：trans/aabb 已在 export_dbnum_instances_json 内部增量合并导出
+    // stats.mesh_files_found = trans 总数, stats.mesh_files_missing = aabb 总数
+    // stats.node_count = 新增 trans 数, stats.mesh_count = 新增 aabb 数
 
     println!("\n🎉 导出完成！");
     println!("📊 统计信息:");
     println!("   - BRAN/HANG/EQUI 分组数量: {}", stats.refno_count);
     println!("   - 子节点数量: {}", stats.descendant_count);
+    println!("   - 几何引用数量: {}", stats.geometry_count);
     println!("   - 输出文件大小: {} 字节", stats.output_file_size);
-    println!("   - 变换矩阵数量 (trans): {}", trans_count);
-    println!("   - 包围盒数量 (aabb): {}", aabb_count);
+    println!("   - 变换矩阵数量 (trans): {} (+{})", stats.mesh_files_found, stats.node_count);
+    println!("   - 包围盒数量 (aabb): {} (+{})", stats.mesh_files_missing, stats.mesh_count);
     println!("   - 耗时: {:?}", stats.elapsed_time);
     Ok(())
 }

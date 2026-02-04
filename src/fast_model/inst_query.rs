@@ -232,13 +232,17 @@ pub async fn query_insts_with_batch(
                         .unwrap_or_else(|| TUBI_GEO_HASH.to_string());
                     let wt = raw.world_trans.unwrap_or_default();
                     results.push(GeomInstQuery {
-                        refno: raw.refno,
-                        owner: raw.owner,
+                        // 约定：TUBI 的 refno 使用 leave（tubi_relate 的 in），owner 使用 BRAN/HANG（tubi_relate 的 id[0]）。
+                        // 这样与 foyer cache（insert_tubi(leave_refno, EleGeosInfo{ owner_refno=bran })）保持一致，
+                        // 也能让导出侧（collect_export_data）生成稳定、可追溯的 tubi 名称/分组。
+                        refno: raw.owner,
+                        owner: raw.refno,
                         world_aabb: raw.world_aabb,
-                        world_trans: wt,
+                        // TUBI world_trans 直接放到 inst.geo_transform（视为世界矩阵），避免与 refno 的 world_trans 混乘。
+                        world_trans: PlantTransform::default(),
                         insts: vec![ModelHashInst {
                             geo_hash,
-                            geo_transform: PlantTransform::default(),
+                            geo_transform: wt,
                             is_tubi: true,
                             unit_flag: false,
                         }],

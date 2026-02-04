@@ -39,6 +39,8 @@ use super::full_noun_mode::gen_full_noun_geos_optimized;
 use super::models::NounCategory;
 use std::str::FromStr;
 use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+use aios_core::tool::db_tool::db1_hash;
+use dashmap::DashMap;
 
 /// 主入口函数：生成所有几何体数据
 ///
@@ -219,6 +221,34 @@ async fn resolve_dbnum_from_shape(
         }
         None => None,
     }
+}
+
+async fn filter_bran_hang_refnos(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
+    let bran_hash = db1_hash("BRAN");
+    let hang_hash = db1_hash("HANG");
+    let mut out = Vec::new();
+
+    for &r in refnos {
+        if !r.is_valid() {
+            continue;
+        }
+        let dbnum = match TreeIndexManager::resolve_dbnum_for_refno(r).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+        let Ok(index) = manager.load_index(dbnum) else {
+            continue;
+        };
+        let Some(meta) = index.node_meta(r.refno()) else {
+            continue;
+        };
+        if meta.noun == bran_hash || meta.noun == hang_hash {
+            out.push(r);
+        }
+    }
+
+    out
 }
 
 /// 处理 Full Noun 模式的生成流程
@@ -720,6 +750,58 @@ async fn process_targeted_generation(
     drop(sender);
     let _ = insert_task.await;
 
+    // 方案 B：补齐 BRAN/HANG 的 tubi（从 SurrealDB 的 tubi_relate 读取最小必要信息），
+    // 并写入 foyer cache，确保后续 export-dbnum-instances-json / mbd_pipe_api 能从 cache 拿到 inst_tubi_map 数据。
+    if let Some(ref ctx) = foyer_cache_ctx {
+        let branch_refnos = filter_bran_hang_refnos(&target_root_refnos).await;
+        if !branch_refnos.is_empty() {
+            println!(
+                "[gen_model] cache-only: 开始写入 BRAN/HANG tubi_relate 到 cache（count={}）",
+                branch_refnos.len()
+            );
+            use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+            use std::collections::HashMap;
+
+            // 定向生成可能跨 dbnum：按 owner_refno 分组写 cache。
+            let mut groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
+            for &owner in &branch_refnos {
+                let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(owner).await else {
+                    continue;
+                };
+                if dbnum == 0 {
+                    continue;
+                }
+                groups.entry(dbnum).or_default().push(owner);
+            }
+
+            for (dbnum, owners) in groups {
+                match crate::fast_model::foyer_cache::geos::write_tubi_relate_into_cache_with_ctx(
+                    ctx,
+                    dbnum,
+                    &owners,
+                )
+                .await
+                {
+                    Ok(cnt) => {
+                        if cnt > 0 {
+                            let _ = touched_dbnums.lock().map(|mut s| s.insert(dbnum));
+                        }
+                        println!(
+                            "[gen_model] cache-only: dbnum={} 写入 tubi_relate -> cache 完成（tubi_cnt={}）",
+                            dbnum, cnt
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[gen_model] cache-only: dbnum={} 写入 tubi_relate -> cache 失败: {}",
+                            dbnum, e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     println!(
         "[gen_model] {}路径几何体生成完成，共 {} 个根节点",
         mode_label,
@@ -976,6 +1058,37 @@ async fn process_full_database_generation(
             dbnum,
             db_start.elapsed().as_millis()
         );
+
+        // 方案 B：补齐 BRAN/HANG 的 tubi（从 SurrealDB 的 tubi_relate 读取最小必要信息），
+        // 并写入 foyer cache，确保 export-dbnum-instances-json 等流程能拿到 inst_tubi_map。
+        if let Some(ref ctx) = foyer_cache_ctx {
+            let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+            let mut branch_refnos = manager.query_noun_refnos("BRAN", None);
+            branch_refnos.extend(manager.query_noun_refnos("HANG", None));
+            if !branch_refnos.is_empty() {
+                println!(
+                    "[gen_model] cache-only: dbnum={} 开始写入 BRAN/HANG tubi_relate 到 cache（count={}）",
+                    dbnum,
+                    branch_refnos.len()
+                );
+                match crate::fast_model::foyer_cache::geos::write_tubi_relate_into_cache_with_ctx(
+                    ctx,
+                    dbnum,
+                    &branch_refnos,
+                )
+                .await
+                {
+                    Ok(cnt) => println!(
+                        "[gen_model] cache-only: dbnum={} 写入 tubi_relate -> cache 完成（tubi_cnt={}）",
+                        dbnum, cnt
+                    ),
+                    Err(e) => eprintln!(
+                        "[gen_model] cache-only: dbnum={} 写入 tubi_relate -> cache 失败: {}",
+                        dbnum, e
+                    ),
+                }
+            }
+        }
 
             if db_option_arc.gen_mesh {
                 let mesh_start = Instant::now();

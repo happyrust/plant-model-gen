@@ -251,6 +251,23 @@ impl InstanceCacheManager {
             return result;
         }
 
+        // arrive/leave 点编号来自元件属性 ARRI/LEAV；不同元件并非固定为 1/2。
+        // cache-only：若无法读取属性（例如未初始化 SurrealDB），则回退到旧假设 (1,2)。
+        let mut al_numbers: HashMap<u64, (i32, i32)> = HashMap::new();
+        for &r in refnos {
+            let mut arrive = 1i32;
+            let mut leave = 2i32;
+            if let Ok(att) = aios_core::get_named_attmap(r).await {
+                let a = att.get_i32("ARRI").unwrap_or(0);
+                let l = att.get_i32("LEAV").unwrap_or(0);
+                if a > 0 && l > 0 {
+                    arrive = a;
+                    leave = l;
+                }
+            }
+            al_numbers.insert(r.refno().0, (arrive, leave));
+        }
+
         let want_set: HashSet<u64> = refnos.iter().map(|r| r.refno().0).collect();
         let batch_ids = self.list_batches(dbnum);
 
@@ -269,9 +286,11 @@ impl InstanceCacheManager {
                     continue; // 已找到，跳过
                 }
 
-                // ptset_map: [1]=ARRIVE, [2]=LEAVE
-                if let (Some(arrive), Some(leave)) = (info.ptset_map.get(&1), info.ptset_map.get(&2)) {
-                    result.insert(*k, [arrive.clone(), leave.clone()]);
+                let (arrive_no, leave_no) = al_numbers.get(&refno_u64).copied().unwrap_or((1, 2));
+                let arrive = info.ptset_map.values().find(|p| p.number == arrive_no).cloned();
+                let leave = info.ptset_map.values().find(|p| p.number == leave_no).cloned();
+                if let (Some(arrive), Some(leave)) = (arrive, leave) {
+                    result.insert(*k, [arrive, leave]);
                 }
             }
 

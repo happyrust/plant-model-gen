@@ -1057,6 +1057,10 @@ async fn gen_cata_geos_inner(
                                 if let Ok(target_owners) =
                                     query_ngmr_owner(ele_refno, geom_refno).await
                                 {
+                                        debug_model!(
+                                            "[NGMR_DBG] ele_refno={}, geom_refno={}, target_owners={:?}",
+                                            ele_refno, geom_refno, target_owners
+                                        );
                                         shape_insts_data.insert_ngmr(
                                             ele_refno,
                                             target_owners,
@@ -1540,6 +1544,8 @@ async fn gen_cata_geos_inner(
                                 world_transform: t,
                                 tubi_start_pt: Some(current_tubing.start_pt),
                                 tubi_end_pt: Some(current_tubing.end_pt),
+                                tubi_arrive_refno: Some(current_tubing.arrive_refno),
+                                tubi_index: Some(current_tubing.index as u32),
                                 // 无子元素直段：leave=htube_pt, arrive=bran_ttube_pt
                                 arrive_axis_pt: Some(bran_ttube_pt.to_array()),
                                 leave_axis_pt: Some(htube_pt.to_array()),
@@ -1894,6 +1900,8 @@ async fn gen_cata_geos_inner(
                                                 world_transform: t,
                                                 tubi_start_pt: Some(current_tubing.start_pt),
                                                 tubi_end_pt: Some(current_tubing.end_pt),
+                                                tubi_arrive_refno: Some(current_tubing.arrive_refno),
+                                                tubi_index: Some(current_tubing.index as u32),
                                                 arrive_axis_pt: Some(arrive_axis_pt),
                                                 leave_axis_pt: Some(leave_axis_pt),
                                                 is_solid: true,
@@ -2133,6 +2141,8 @@ async fn gen_cata_geos_inner(
                                     world_transform: t,
                                     tubi_start_pt: Some(current_tubing.start_pt),
                                     tubi_end_pt: Some(current_tubing.end_pt),
+                                    tubi_arrive_refno: Some(current_tubing.arrive_refno),
+                                    tubi_index: Some(current_tubing.index as u32),
                                     arrive_axis_pt: Some(arrive_axis_pt),
                                     leave_axis_pt: Some(leave_axis_pt),
                                     is_solid: true,

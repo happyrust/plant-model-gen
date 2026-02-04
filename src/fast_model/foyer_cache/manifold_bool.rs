@@ -1,4 +1,4 @@
-//! foyer cache 专用的 Manifold 布尔运算实现（不访问 SurrealDB）
+//! foyer cache 专用的 Manifold 布尔运算实现（不写入 SurrealDB；必要时读取 pe_transform/local_trans）
 //!
 //! 语义：
 //! - 布尔输入优先来自当前 `mesh_precision.default_lod` 对应的常规 GLB；
@@ -22,6 +22,54 @@ use glam::{DMat4, Vec3};
 use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
 use crate::fast_model::{debug_model_debug, debug_model_warn};
 use crate::fast_model::instance_cache::InstanceCacheManager;
+
+fn env_bool(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheBoolFrame {
+    /// 在正实体自身 local space 做布尔（当前默认实现）
+    PosLocal,
+    /// 在 world space 做布尔（用于排查/规避坐标系不一致）
+    World,
+}
+
+fn cache_bool_frame() -> CacheBoolFrame {
+    match std::env::var("CACHE_BOOL_FRAME")
+        .ok()
+        .unwrap_or_else(|| "pos_local".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "world" => CacheBoolFrame::World,
+        _ => CacheBoolFrame::PosLocal,
+    }
+}
+
+fn debug_cache_bool_refno() -> Option<RefnoEnum> {
+    let s = std::env::var("DEBUG_CACHE_BOOL_REFNO").ok()?;
+    let r = RefnoEnum::from(s.as_str());
+    if r.is_valid() {
+        Some(r)
+    } else {
+        None
+    }
+}
+
+fn fmt_aabb(aabb: &parry3d::bounding_volume::Aabb) -> String {
+    format!(
+        "min=({:.3},{:.3},{:.3}) max=({:.3},{:.3},{:.3})",
+        aabb.mins.x, aabb.mins.y, aabb.mins.z, aabb.maxs.x, aabb.maxs.y, aabb.maxs.z
+    )
+}
 
 fn mesh_base_dir() -> PathBuf {
     get_db_option()
@@ -560,6 +608,11 @@ pub async fn run_boolean_worker_from_cache_manager(
             continue;
         };
 
+        let debug_refno = debug_cache_bool_refno();
+        let debug_this = debug_refno.is_some_and(|r| r == refno);
+        let debug_dump = debug_this && env_bool("DEBUG_CACHE_BOOL_DUMP");
+        let frame = cache_bool_frame();
+
         let pos_world_mat = world_mat_for_info(info);
         let inverse_pos_world = pos_world_mat.inverse();
 
@@ -569,7 +622,12 @@ pub async fn run_boolean_worker_from_cache_manager(
             if !is_pos_geo_for_boolean(&inst.geo_type) {
                 continue;
             }
-            let mat = local_mat_for_inst(inst);
+            let mat_local = local_mat_for_inst(inst);
+            let mat = if frame == CacheBoolFrame::World {
+                pos_world_mat * mat_local
+            } else {
+                mat_local
+            };
             match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, mat, false) {
                 Ok(m) => pos_manifolds.push(m),
                 Err(e) => log_load_manifold_failed("cache_pos", refno, &inst.geo_hash.to_string(), &e),
@@ -577,6 +635,19 @@ pub async fn run_boolean_worker_from_cache_manager(
         }
         if pos_manifolds.is_empty() {
             continue;
+        }
+
+        if debug_this {
+            eprintln!(
+                "[bool][cache][dbg] target={} type={} owner={} world.t=({:.3},{:.3},{:.3})",
+                refno,
+                inst_geos.type_name,
+                info.owner_refno,
+                info.world_transform.translation.x,
+                info.world_transform.translation.y,
+                info.world_transform.translation.z
+            );
+            eprintln!("[bool][cache][dbg] frame={:?}", frame);
         }
 
         // 负实体：通过关系表（neg_relate/ngmr_relate）定位切割几何，并转换到 pos local space
@@ -588,7 +659,12 @@ pub async fn run_boolean_worker_from_cache_manager(
                 if inst.geo_type != GeoBasicType::CataNeg {
                     continue;
                 }
-                let mat = local_mat_for_inst(inst);
+                let mat_local = local_mat_for_inst(inst);
+                let mat = if frame == CacheBoolFrame::World {
+                    pos_world_mat * mat_local
+                } else {
+                    mat_local
+                };
                 match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, mat, true) {
                     Ok(m) => neg_manifolds.push(m),
                     Err(e) => log_load_manifold_failed("cache_cata_neg", refno, &inst.geo_hash.to_string(), &e),
@@ -614,10 +690,16 @@ pub async fn run_boolean_worker_from_cache_manager(
                         continue;
                     }
 
-                    let local_mat = local_mat_for_inst(inst);
-                    let neg_world_mat = carrier_world_mat * local_mat;
-                    let relative_mat = inverse_pos_world * neg_world_mat;
-                    match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, relative_mat, true) {
+                    let geo_local_mat = local_mat_for_inst(inst);
+
+                    // 直接使用 world_transform 计算相对变换
+                    let neg_world_mat = carrier_world_mat * geo_local_mat;
+                    let mat = if frame == CacheBoolFrame::World {
+                        neg_world_mat
+                    } else {
+                        inverse_pos_world * neg_world_mat
+                    };
+                    match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, mat, true) {
                         Ok(m) => neg_manifolds.push(m),
                         Err(e) => log_load_manifold_failed("cache_neg", refno, &inst.geo_hash.to_string(), &e),
                     }
@@ -646,10 +728,72 @@ pub async fn run_boolean_worker_from_cache_manager(
                     if inst.refno != ngmr_geom_refno {
                         continue;
                     }
-                    let neg_world_mat = carrier_world_mat * local_mat_for_inst(inst);
-                    let relative_mat = inverse_pos_world * neg_world_mat;
-                    match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, relative_mat, true) {
-                        Ok(m) => neg_manifolds.push(m),
+                    let geo_local_mat = local_mat_for_inst(inst);
+
+                    // 直接使用 world_transform 计算相对变换：
+                    // neg_world = carrier_world * geo_local
+                    // mat = inverse_pos_world * neg_world
+                    let neg_world_mat = carrier_world_mat * geo_local_mat;
+                    let mat = if frame == CacheBoolFrame::World {
+                        neg_world_mat
+                    } else {
+                        inverse_pos_world * neg_world_mat
+                    };
+                    // 临时调试：打印 NGMR 变换信息
+                    debug_model_debug!(
+                        "[NGMR_BOOL_DBG] target={} carrier={} geo_local.t=({:.3},{:.3},{:.3}) mat.t=({:.3},{:.3},{:.3})",
+                        refno, carrier_refno,
+                        geo_local_mat.w_axis.x, geo_local_mat.w_axis.y, geo_local_mat.w_axis.z,
+                        mat.w_axis.x, mat.w_axis.y, mat.w_axis.z
+                    );
+                    // 打印 pos_world 和 carrier_world 信息
+                    debug_model_debug!(
+                        "[NGMR_BOOL_DBG] pos_world.t=({:.3},{:.3},{:.3}) carrier_world.t=({:.3},{:.3},{:.3})",
+                        pos_world_mat.w_axis.x, pos_world_mat.w_axis.y, pos_world_mat.w_axis.z,
+                        carrier_world_mat.w_axis.x, carrier_world_mat.w_axis.y, carrier_world_mat.w_axis.z
+                    );
+                    if debug_this {
+                        eprintln!(
+                            "[bool][cache][dbg]  ngmr carrier={} carrier.type={} carrier.world.t=({:.3},{:.3},{:.3}) geom_refno={} geo_hash={} inst.local.t=({:.3},{:.3},{:.3}) rel.t=({:.3},{:.3},{:.3})",
+                            carrier_refno,
+                            carrier_geos.type_name,
+                            carrier_info.world_transform.translation.x,
+                            carrier_info.world_transform.translation.y,
+                            carrier_info.world_transform.translation.z,
+                            ngmr_geom_refno,
+                            inst.geo_hash,
+                            inst.geo_transform.translation.x,
+                            inst.geo_transform.translation.y,
+                            inst.geo_transform.translation.z,
+                            mat.w_axis.x,
+                            mat.w_axis.y,
+                            mat.w_axis.z
+                        );
+                    }
+                    match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, mat, true) {
+                        Ok(m) => {
+                            if debug_this {
+                                if let Some(aabb) = m.get_mesh().cal_aabb() {
+                                    eprintln!(
+                                        "[bool][cache][dbg]   ngmr manifold_aabb: {}",
+                                        fmt_aabb(&aabb)
+                                    );
+                                }
+                            }
+                            if debug_dump {
+                                let mut path = PathBuf::from("test_output/cache_bool_debug");
+                                let _ = fs::create_dir_all(&path);
+                                path.push(format!(
+                                    "{}_ngmr_{}_{}.glb",
+                                    refno.to_string(),
+                                    carrier_refno.to_string(),
+                                    inst.refno.to_string()
+                                ));
+                                let mesh = manifold_to_normal_mesh(m.get_mesh());
+                                let _ = export_single_mesh_to_glb(&mesh, &path);
+                            }
+                            neg_manifolds.push(m)
+                        }
                         Err(e) => log_load_manifold_failed("cache_ngmr", refno, &inst.geo_hash.to_string(), &e),
                     }
                 }
@@ -664,6 +808,23 @@ pub async fn run_boolean_worker_from_cache_manager(
             &pos_manifolds,
             aios_core::csg::manifold::ManifoldOpType::Union,
         );
+
+        if debug_this {
+            if let Some(aabb) = pos_union.get_mesh().cal_aabb() {
+                eprintln!("[bool][cache][dbg] pos_union_aabb: {}", fmt_aabb(&aabb));
+            }
+            eprintln!(
+                "[bool][cache][dbg] neg_count={} (includes cata_neg/neg/ngmr)",
+                neg_manifolds.len()
+            );
+            if debug_dump {
+                let mut path = PathBuf::from("test_output/cache_bool_debug");
+                let _ = fs::create_dir_all(&path);
+                path.push(format!("{}_pos_union.glb", refno.to_string()));
+                let mesh = manifold_to_normal_mesh(pos_union.get_mesh());
+                let _ = export_single_mesh_to_glb(&mesh, &path);
+            }
+        }
         let mut final_manifold = diff_with_guards(pos_union, &neg_manifolds, refno, "lo");
 
         // 经验：退化为空时尝试高精度重算一次
@@ -688,6 +849,14 @@ pub async fn run_boolean_worker_from_cache_manager(
             }
         }
 
+        if debug_dump {
+            let mut path = PathBuf::from("test_output/cache_bool_debug");
+            let _ = fs::create_dir_all(&path);
+            path.push(format!("{}_final.glb", refno.to_string()));
+            let mesh = manifold_to_normal_mesh(final_manifold.get_mesh());
+            let _ = export_single_mesh_to_glb(&mesh, &path);
+        }
+
         if final_manifold.get_mesh().indices.is_empty() {
             eprintln!("[boolean_worker_cache] 结果为空，跳过输出: refno={}", refno);
             if let Some((dbnum, batch_id)) = target_locations.get(&refno) {
@@ -708,6 +877,12 @@ pub async fn run_boolean_worker_from_cache_manager(
         };
         let target_path = boolean_glb_path(&mesh_id);
         ensure_parent_dir(&target_path)?;
+
+        if debug_this {
+            if let Some(aabb) = final_manifold.get_mesh().cal_aabb() {
+                eprintln!("[bool][cache][dbg] final_aabb: {}", fmt_aabb(&aabb));
+            }
+        }
 
         // cache-only：布尔结果先保持 Manifold 拓扑计算的正确性，再转换回“重复顶点”的 PlantMesh，
         // 以匹配渲染/导出侧对硬表面（flat shading）与非共享顶点的默认语义。
@@ -734,4 +909,3 @@ pub async fn run_boolean_worker_from_cache_manager(
     println!("[boolean_worker_cache] 布尔运算完成: {} 个", processed);
     Ok(processed)
 }
-

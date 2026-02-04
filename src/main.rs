@@ -65,6 +65,39 @@ fn build_export_config(
     }
 }
 
+/// 模型生成完成后同步缓存数据到 SurrealDB 的辅助函数
+#[cfg(not(feature = "gui"))]
+async fn sync_cache_to_db_if_enabled(
+    sync_enabled: bool,
+    db_option_ext: &aios_database::options::DbOptionExt,
+) -> anyhow::Result<()> {
+    if !sync_enabled {
+        return Ok(());
+    }
+
+    println!("\n🗄️  --sync-to-db: 模型生成完成，开始同步缓存数据到 SurrealDB...");
+
+    // 确保数据库已连接
+    init_surreal().await?;
+
+    let cache_dir = db_option_ext.get_foyer_cache_dir();
+    let flushed = aios_database::fast_model::cache_flush::flush_latest_instance_cache_to_surreal(
+        &cache_dir,
+        None,  // 同步所有 dbnums
+        true,  // replace_exist = true，覆盖已有数据
+        true,  // verbose
+    )
+    .await?;
+
+    println!(
+        "✅ 数据同步完成：cache_dir={} flushed_dbnums={}",
+        cache_dir.display(),
+        flushed
+    );
+
+    Ok(())
+}
+
 #[cfg(all(not(feature = "gui"), feature = "grpc"))]
 use crate::cli_modes::start_grpc_server_mode;
 #[cfg(not(feature = "gui"))]
@@ -258,6 +291,12 @@ async fn main() -> anyhow::Result<()> {
                 .help("When flushing cache to SurrealDB, delete/replace existing instance records (危险：会覆盖 DB 侧数据)")
                 .action(clap::ArgAction::SetTrue)
                 .requires("flush-cache-to-db"),
+        )
+        .arg(
+            Arg::new("sync-to-db")
+                .long("sync-to-db")
+                .help("After model generation, sync cache data to SurrealDB (模型生成完成后同步数据到数据库)")
+                .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("export-glb")
@@ -864,7 +903,9 @@ async fn main() -> anyhow::Result<()> {
                 include_negative,
                 matches.get_flag("export-svg"),
             );
-            return export_obj_mode(config, &db_option_ext).await;
+            let result = export_obj_mode(config, &db_option_ext).await;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            return result;
         }
 
         // 检查是否有导出标志
@@ -884,7 +925,9 @@ async fn main() -> anyhow::Result<()> {
                 include_negative,
                 matches.get_flag("export-svg"),
             );
-            return export_obj_mode(config, &db_option_ext).await;
+            let result = export_obj_mode(config, &db_option_ext).await;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            return result;
         }
 
         if matches.get_flag("export-svg") {
@@ -903,7 +946,9 @@ async fn main() -> anyhow::Result<()> {
                 include_negative,
                 true, // export_svg = true
             );
-            return export_obj_mode(config, &db_option_ext).await;
+            let result = export_obj_mode(config, &db_option_ext).await;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            return result;
         }
 
         if matches.get_flag("export-glb") {
@@ -923,7 +968,9 @@ async fn main() -> anyhow::Result<()> {
                 matches.get_flag("export-svg"),
             );
             config.use_basic_materials = use_basic_materials;
-            return export_glb_mode(config, &db_option_ext).await;
+            let result = export_glb_mode(config, &db_option_ext).await;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            return result;
         }
 
         if matches.get_flag("export-gltf") {
@@ -943,7 +990,9 @@ async fn main() -> anyhow::Result<()> {
                 matches.get_flag("export-svg"),
             );
             config.use_basic_materials = use_basic_materials;
-            return export_gltf_mode(config, &db_option_ext).await;
+            let result = export_gltf_mode(config, &db_option_ext).await;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            return result;
         }
     }
 
@@ -966,7 +1015,9 @@ async fn main() -> anyhow::Result<()> {
                 include_negative,
                 matches.get_flag("export-svg"),
             );
-            return export_obj_mode(config, &db_option_ext).await;
+            let result = export_obj_mode(config, &db_option_ext).await;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            return result;
         }
 
         if matches.get_flag("export-glb") {
@@ -986,7 +1037,9 @@ async fn main() -> anyhow::Result<()> {
                 matches.get_flag("export-svg"),
             );
             config.use_basic_materials = use_basic_materials;
-            return export_glb_mode(config, &db_option_ext).await;
+            let result = export_glb_mode(config, &db_option_ext).await;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            return result;
         }
 
         if matches.get_flag("export-gltf") {
@@ -1006,11 +1059,13 @@ async fn main() -> anyhow::Result<()> {
                 matches.get_flag("export-svg"),
             );
             config.use_basic_materials = use_basic_materials;
-            return export_gltf_mode(config, &db_option_ext).await;
+            let result = export_gltf_mode(config, &db_option_ext).await;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            return result;
         }
     }
 
-    // no-dbnum 情况的默认“全库导出”由各导出模式内部处理（config.run_all_dbnos）
+    // no-dbnum 情况的默认"全库导出"由各导出模式内部处理（config.run_all_dbnos）
 
     // 然后处理独立的导出命令（不启用调试模式）
     if let Some(refnos) = matches.get_many::<String>("export-obj-refnos") {
@@ -1031,7 +1086,9 @@ async fn main() -> anyhow::Result<()> {
                 include_negative,
                 matches.get_flag("export-svg"),
             );
-            return export_obj_mode(config, &db_option_ext).await;
+            let result = export_obj_mode(config, &db_option_ext).await;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            return result;
         }
     }
 
@@ -1054,7 +1111,9 @@ async fn main() -> anyhow::Result<()> {
                 matches.get_flag("export-svg"),
             );
             config.use_basic_materials = use_basic_materials;
-            return export_glb_mode(config, &db_option_ext).await;
+            let result = export_glb_mode(config, &db_option_ext).await;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            return result;
         }
     }
 
@@ -1077,7 +1136,9 @@ async fn main() -> anyhow::Result<()> {
                 matches.get_flag("export-svg"),
             );
             config.use_basic_materials = use_basic_materials;
-            return export_gltf_mode(config, &db_option_ext).await;
+            let result = export_gltf_mode(config, &db_option_ext).await;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            return result;
         }
     }
 
@@ -1099,7 +1160,9 @@ async fn main() -> anyhow::Result<()> {
             include_negative,
             matches.get_flag("export-svg"),
         );
-        return export_gltf_mode(config, &db_option_ext).await;
+        let result = export_gltf_mode(config, &db_option_ext).await;
+        sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+        return result;
     }
 
     if matches.get_flag("export-glb") {
@@ -1117,7 +1180,9 @@ async fn main() -> anyhow::Result<()> {
             include_negative,
             matches.get_flag("export-svg"),
         );
-        return export_glb_mode(config, &db_option_ext).await;
+        let result = export_glb_mode(config, &db_option_ext).await;
+        sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+        return result;
     }
 
     if matches.get_flag("export-obj") {
@@ -1135,7 +1200,9 @@ async fn main() -> anyhow::Result<()> {
             include_negative,
             matches.get_flag("export-svg"),
         );
-        return export_obj_mode(config, &db_option_ext).await;
+        let result = export_obj_mode(config, &db_option_ext).await;
+        sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+        return result;
     }
 
     if matches.get_flag("export-all-parquet") {

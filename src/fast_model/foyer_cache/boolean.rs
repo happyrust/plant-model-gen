@@ -19,7 +19,11 @@ pub async fn run_boolean_worker_with_filter(
     ctx: &FoyerCacheContext,
     filter_refnos: Option<&HashSet<RefnoEnum>>,
 ) -> anyhow::Result<usize> {
-    crate::fast_model::manifold_bool::run_boolean_worker_from_cache_manager(ctx.cache(), filter_refnos).await
+    crate::fast_model::foyer_cache::manifold_bool::run_boolean_worker_from_cache_manager(
+        ctx.cache(),
+        filter_refnos,
+    )
+    .await
 }
 
 /// 基于 foyer 缓存的布尔运算（不访问 SurrealDB，无过滤）
@@ -32,4 +36,3 @@ pub async fn run_boolean_worker_from_cache_dir(cache_dir: &Path) -> anyhow::Resu
     let ctx = FoyerCacheContext::from_cache_dir(cache_dir).await?;
     run_boolean_worker(&ctx).await
 }
-

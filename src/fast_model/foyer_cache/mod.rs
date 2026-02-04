@@ -12,6 +12,7 @@ pub mod context;
 pub mod geos;
 pub mod mesh;
 pub mod boolean;
+pub mod manifold_bool;
 pub mod query;
 pub mod ptset;
 

@@ -5,7 +5,7 @@
 
 use crate::fast_model::{debug_model, debug_model_debug, debug_model_warn};
 use aios_core::SurrealQueryExt;
-use aios_core::csg::manifold::ManifoldRust;
+use aios_core::csg::manifold::{ManifoldMeshRust, ManifoldRust};
 use aios_core::geometry::csg::{unit_box_mesh, unit_cylinder_mesh, unit_sphere_mesh};
 use aios_core::get_db_option;
 use aios_core::mesh_precision::LodMeshSettings;
@@ -19,8 +19,10 @@ use aios_core::geometry::{EleGeosInfo, EleInstGeosData, GeoBasicType};
 use aios_core::geometry::csg::UNIT_MESH_SCALE;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::shape::pdms_shape::BrepShapeTrait;
+use aios_core::shape::pdms_shape::PlantMesh;
 use crate::fast_model::instance_cache::InstanceCacheManager;
-use glam::DMat4;
+use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
+use glam::{DMat4, Vec3};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
@@ -348,10 +350,233 @@ fn boolean_glb_path(mesh_id: &str) -> PathBuf {
     path
 }
 
+/// 构建 cache-only 布尔专用的 manifold mesh GLB 路径（带 `_m.glb` 后缀）。
+///
+/// 注意：按用户约定（方案 B），不带 LOD，格式为：`{base_dir}/{geo_hash}_m.glb`。
+/// 但其内容语义绑定 `mesh_precision.default_lod` 对应的“常规 GLB”（用于判断是否需要重建）。
+fn manifold_glb_path(geo_hash: &str) -> PathBuf {
+    let base_dir = mesh_base_dir();
+
+    // 溯源到不含 lod_ 的基础目录
+    let mut clean_base = base_dir.clone();
+    while let Some(last_component) = clean_base.file_name().and_then(|n| n.to_str()) {
+        if last_component.starts_with("lod_") {
+            clean_base.pop();
+        } else {
+            break;
+        }
+    }
+
+    clean_base.join(format!("{geo_hash}_m.glb"))
+}
+
 fn boolean_obj_path(mesh_id: &str) -> PathBuf {
     let mut path = build_lod_mesh_path(&mesh_base_dir(), mesh_id);
     path.set_extension("obj");
     path
+}
+
+/// 加载或生成 manifold mesh 的 GLB 文件
+///
+/// 按需生成：如果 `_m.glb` 文件已存在且未过期则直接加载，否则从当前 `mesh_precision.default_lod`
+/// 对应的“常规 GLB”转换并保存；若源 GLB 缺失再兜底回退到 `geo_param`。
+///
+/// # 参数
+/// - `geo_param`: 几何参数
+/// - `geo_hash`: 几何哈希值
+/// - `mat`: 变换矩阵
+/// - `more_precision`: 是否需要更高精度
+///
+/// # 返回
+/// 返回加载或生成的 ManifoldRust 对象
+fn load_or_generate_manifold_glb(
+    geo_param: &PdmsGeoParam,
+    geo_hash: u64,
+    mat: DMat4,
+    more_precision: bool,
+) -> anyhow::Result<ManifoldRust> {
+    // 标准单位几何体（1/2/3）始终使用内置生成，不缓存
+    if matches!(geo_hash, 1 | 2 | 3) {
+        return load_manifold_from_geo_param(geo_param, geo_hash, mat, more_precision);
+    }
+
+    let manifold_path = manifold_glb_path(&geo_hash.to_string());
+
+    // cache-only 与 SurrealDB 做法对齐：布尔输入优先来自“常规 GLB（default_lod）”，
+    // 再按需转成共享顶点拓扑的 `_m.glb` 复用；避免从 geo_param 直接生成导致的坐标语义分裂。
+    let src_glb = {
+        let mut p = build_lod_mesh_path(&mesh_base_dir(), &geo_hash.to_string());
+        p.set_extension("glb");
+        p
+    };
+
+    let force_replace = std::env::var("FORCE_REPLACE_MESH")
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false);
+
+    let need_rebuild = || -> bool {
+        if force_replace {
+            return true;
+        }
+        if !manifold_path.exists() {
+            return true;
+        }
+        let Ok(m_meta) = fs::metadata(&manifold_path) else {
+            return true;
+        };
+        let Ok(m_time) = m_meta.modified() else {
+            return true;
+        };
+        // 绑定 default_lod 的“常规 GLB”：若源文件更新，则 _m 需重建。
+        if let Ok(src_meta) = fs::metadata(&src_glb) {
+            if let Ok(src_time) = src_meta.modified() {
+                return m_time < src_time;
+            }
+        }
+        false
+    };
+
+    if !need_rebuild() {
+        debug_model_debug!(
+            "load_or_generate_manifold_glb: 复用已有 _m.glb: geo_hash={} path={}",
+            geo_hash,
+            manifold_path.display()
+        );
+        return ManifoldRust::import_glb_to_manifold(&manifold_path, mat, more_precision);
+    }
+
+    debug_model_debug!(
+        "load_or_generate_manifold_glb: 重建 _m.glb: geo_hash={} src={} dst={}",
+        geo_hash,
+        src_glb.display(),
+        manifold_path.display()
+    );
+
+    // 1) 优先从常规 GLB 导入成 Manifold（单位矩阵），再写成共享顶点 `_m.glb`
+    let mut manifold_identity = if src_glb.exists() {
+        match ManifoldRust::import_glb_to_manifold(&src_glb, DMat4::IDENTITY, false)
+            .and_then(|m| validate_manifold_result(m, &geo_hash.to_string()))
+        {
+            Ok(m) => m,
+            Err(e) => {
+                debug_model_warn!(
+                    "load_or_generate_manifold_glb: 从常规 GLB 导入失败，回退 geo_param: geo_hash={} err={}",
+                    geo_hash,
+                    e
+                );
+                load_manifold_from_geo_param(geo_param, geo_hash, DMat4::IDENTITY, false)?
+            }
+        }
+    } else {
+        // 源 GLB 缺失时兜底从 geo_param 生成（仅用于不阻断布尔流程）。
+        load_manifold_from_geo_param(geo_param, geo_hash, DMat4::IDENTITY, false)?
+    };
+
+    // 2) 若生成出来退化为空，再尝试 more_precision=true 重建一次
+    if manifold_identity.get_mesh().indices.is_empty() {
+        manifold_identity = if src_glb.exists() {
+            ManifoldRust::import_glb_to_manifold(&src_glb, DMat4::IDENTITY, true)
+                .and_then(|m| validate_manifold_result(m, &geo_hash.to_string()))?
+        } else {
+            load_manifold_from_geo_param(geo_param, geo_hash, DMat4::IDENTITY, true)?
+        };
+    }
+
+    ensure_parent_dir(&manifold_path)?;
+    if let Err(e) = export_manifold_mesh_to_glb(&manifold_identity, &manifold_path) {
+        debug_model_warn!(
+            "load_or_generate_manifold_glb: 保存 _m.glb 失败，直接返回内存 manifold: geo_hash={} err={}",
+            geo_hash,
+            e
+        );
+        // 兜底：不写盘也不阻断，这里用 “mesh + mat” 重建一次（应用变换矩阵）。
+        let mesh = manifold_identity.get_mesh();
+        let verts3: Vec<Vec3> = mesh
+            .vertices
+            .chunks(3)
+            .map(|v| Vec3::new(v[0], v[1], v[2]))
+            .collect();
+        let m = ManifoldRust::from_vertices_indices(&verts3, &mesh.indices, mat, more_precision);
+        return validate_manifold_result(m, &geo_hash.to_string());
+    }
+
+    ManifoldRust::import_glb_to_manifold(&manifold_path, mat, more_precision)
+}
+
+/// 将 Manifold 的共享顶点 mesh 转为“重复顶点”的 PlantMesh（flat shading 语义）。
+///
+/// - ManifoldMeshRust: vertices 为 [x,y,z,...] 扁平数组，indices 为三角形索引
+/// - 输出 PlantMesh：每个三角形 3 个独立顶点（不共享），indices 顺序递增
+fn manifold_to_normal_mesh(mesh: ManifoldMeshRust) -> PlantMesh {
+    let tri_count = mesh.indices.len() / 3;
+
+    let mut out = PlantMesh::default();
+    out.vertices.reserve(tri_count * 3);
+    out.normals.reserve(tri_count * 3);
+    out.uvs.reserve(tri_count * 3);
+    out.indices.reserve(tri_count * 3);
+
+    let get_v = |idx: u32| -> Vec3 {
+        let base = idx as usize * 3;
+        if base + 2 >= mesh.vertices.len() {
+            return Vec3::ZERO;
+        }
+        Vec3::new(mesh.vertices[base], mesh.vertices[base + 1], mesh.vertices[base + 2])
+    };
+
+    for tri in mesh.indices.chunks(3) {
+        if tri.len() != 3 {
+            break;
+        }
+        let v0 = get_v(tri[0]);
+        let v1 = get_v(tri[1]);
+        let v2 = get_v(tri[2]);
+
+        let face_n = (v1 - v0).cross(v2 - v0);
+        let n = if face_n.length_squared() > 1e-10 {
+            face_n.normalize()
+        } else {
+            Vec3::Y
+        };
+
+        let base = out.vertices.len() as u32;
+        out.vertices.extend_from_slice(&[v0, v1, v2]);
+        out.normals.extend_from_slice(&[n, n, n]);
+        out.uvs.extend_from_slice(&[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]);
+        out.indices.extend_from_slice(&[base, base + 1, base + 2]);
+    }
+
+    out
+}
+
+/// 导出 ManifoldRust 为 manifold 格式的 GLB（共享顶点，无法线）
+///
+/// 与 `ManifoldRust::export_to_glb` 不同，此函数保留共享顶点拓扑，
+/// 便于后续布尔运算时直接加载使用
+fn export_manifold_mesh_to_glb(manifold: &ManifoldRust, path: &Path) -> anyhow::Result<()> {
+    let mesh = manifold.get_mesh();
+    if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+        return Err(anyhow::anyhow!("Manifold mesh 为空，无法导出"));
+    }
+
+    // 确保父目录存在
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // 使用共享顶点格式导出（不展开为 per-triangle 顶点）
+    aios_core::fast_model::export_model::export_glb::export_raw_buffers_to_glb(
+        &mesh.vertices,
+        &[], // 不包含法线，后续加载时会重新计算
+        &mesh.indices,
+        path,
+    )?;
+
+    Ok(())
 }
 
 /// 处理元件库负实体布尔（catalog 级别）
@@ -1055,51 +1280,6 @@ pub async fn run_boolean_worker_from_cache_manager(
         info.get_ele_world_transform().to_matrix().as_dmat4()
     }
 
-    fn pos_world_mat_for_boolean(
-        refno: RefnoEnum,
-        info: &EleGeosInfo,
-        inst_geos: &EleInstGeosData,
-    ) -> DMat4 {
-        // 经验：部分几何（尤其是 PrimLoft/SweepSolid）在写入 instance_cache 时，
-        // 其 geo_param 内部已经携带 segment_transform.rotation（相当于“世界朝向”），
-        // 而 inst_info.world_transform.rotation 也同时存在。
-        //
-        // cache-only boolean 的正实体加载使用的是 inst.geo_transform（pos local），
-        // 因此若再用 inst_info 的 rotation 去做 world<->local 变换，会把负实体“旋转到错误轴”，
-        // 典型表现：ngmr 关系存在，但差集完全不生效（负实体被映射到 pos_local 的数千毫米之外）。
-        //
-        // 这里做一个“仅对 loft 类几何”的修正：当 segment_transform.rotation 与 inst_info.rotation
-        // 基本一致时，认为 rotation 已被 bake 到 geo_param 侧，boolean 仅使用平移作为 world 基准。
-        let mut t = info.get_ele_world_transform();
-
-        let loft_rot = inst_geos
-            .insts
-            .iter()
-            .find(|x| matches!(x.geo_type, GeoBasicType::Pos | GeoBasicType::Compound | GeoBasicType::DesiPos | GeoBasicType::CatePos))
-            .and_then(|inst| match &inst.geo_param {
-                PdmsGeoParam::PrimLoft(s) => s
-                    .segment_transforms
-                    .first()
-                    .map(|seg| seg.rotation),
-                _ => None,
-            });
-
-        if let Some(r) = loft_rot {
-            // dot 近似 1 或 -1 都认为“方向一致”（四元数符号等价）。
-            let dot = t.rotation.dot(r).abs();
-            if dot > 0.999 {
-                t.rotation = glam::Quat::IDENTITY;
-                debug_model_debug!(
-                    "[boolean_worker_cache] pos_world_mat_for_boolean: strip rotation for refno={} (dot={:.6})",
-                    refno,
-                    dot
-                );
-            }
-        }
-
-        t.to_matrix().as_dmat4()
-    }
-
     fn diff_with_guards(
         mut pos_union: ManifoldRust,
         negs: &[ManifoldRust],
@@ -1287,51 +1467,17 @@ pub async fn run_boolean_worker_from_cache_manager(
             continue;
         };
 
-        let pos_world_mat = pos_world_mat_for_boolean(refno, info, inst_geos);
-        let mut inverse_pos_world = pos_world_mat.inverse();
+        let pos_world_mat = world_mat_for_info(info);
+        let inverse_pos_world = pos_world_mat.inverse();
 
-        // PrimLoft(SweepSolid) 的 profile.x 往往对应 mesh local 的 -Z（典型：STWALL 截面宽度 1300 -> z∈[-1300..0]），
-        // 而负实体的 world/local 推导通常落在 z∈[0..1300]。
-        // 这里把“profile.x_max”作为一个常用的局部坐标偏移量补偿：world->mesh 时额外平移 (0,0,-x_max)，
-        // 使 cutter 能落入 pos mesh 的实际局部包围盒范围内。
-        //
-        // 公式：world = pos_world * (mesh - offset)  ⇒  mesh = offset * inv(pos_world) * world
-        if let Some(offset) = inst_geos
-            .insts
-            .iter()
-            .find(|x| matches!(x.geo_type, GeoBasicType::Pos | GeoBasicType::Compound | GeoBasicType::DesiPos | GeoBasicType::CatePos))
-            .and_then(|inst| match &inst.geo_param {
-                PdmsGeoParam::PrimLoft(s) => {
-                    // CateProfileParam 在 rs-core 中提供 get_bbox()，可覆盖 SPRO/SREC/SANN 等 profile 形式。
-                    // 这里取 bbox.maxs.x 作为“profile.x_max”的近似。
-                    s.profile.get_bbox().and_then(|bbox| {
-                        let max_x = bbox.maxs.x as f64;
-                        if max_x.is_finite() && max_x.abs() > 1e-6 {
-                            Some(glam::DVec3::new(0.0, 0.0, -max_x))
-                        } else {
-                            None
-                        }
-                    })
-                }
-                _ => None,
-            })
-        {
-            inverse_pos_world = DMat4::from_translation(offset) * inverse_pos_world;
-            debug_model_debug!(
-                "[boolean_worker_cache] apply loft offset for refno={} offset={:?}",
-                refno,
-                offset
-            );
-        }
-
-        // 正实体：使用局部变换（pos local space）加载
+        // 正实体：使用局部变换（pos local space）加载，优先复用 _m.glb 缓存
         let mut pos_manifolds = Vec::new();
         for inst in &inst_geos.insts {
             if !is_pos_geo_for_boolean(&inst.geo_type) {
                 continue;
             }
             let mat = local_mat_for_inst(inst);
-            match load_manifold_from_geo_param(&inst.geo_param, inst.geo_hash, mat, false) {
+            match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, mat, false) {
                 Ok(m) => pos_manifolds.push(m),
                 Err(e) => log_load_manifold_failed("cache_pos", refno, &inst.geo_hash.to_string(), &e),
             }
@@ -1354,7 +1500,7 @@ pub async fn run_boolean_worker_from_cache_manager(
                     continue;
                 }
                 let mat = local_mat_for_inst(inst);
-                match load_manifold_from_geo_param(&inst.geo_param, inst.geo_hash, mat, true) {
+                match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, mat, true) {
                     Ok(m) => neg_manifolds.push(m),
                     Err(e) => log_load_manifold_failed("cache_cata_neg", refno, &inst.geo_hash.to_string(), &e),
                 }
@@ -1382,7 +1528,7 @@ pub async fn run_boolean_worker_from_cache_manager(
                     let local_mat = local_mat_for_inst(inst);
                     let neg_world_mat = carrier_world_mat * local_mat;
                     let relative_mat = inverse_pos_world * neg_world_mat;
-                    match load_manifold_from_geo_param(&inst.geo_param, inst.geo_hash, relative_mat, true) {
+                    match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, relative_mat, true) {
                         Ok(m) => neg_manifolds.push(m),
                         Err(e) => log_load_manifold_failed("cache_neg", refno, &inst.geo_hash.to_string(), &e),
                     }
@@ -1413,7 +1559,7 @@ pub async fn run_boolean_worker_from_cache_manager(
                     }
                     let neg_world_mat = carrier_world_mat * local_mat_for_inst(inst);
                     let relative_mat = inverse_pos_world * neg_world_mat;
-                    match load_manifold_from_geo_param(&inst.geo_param, inst.geo_hash, relative_mat, true) {
+                    match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, relative_mat, true) {
                         Ok(m) => neg_manifolds.push(m),
                         Err(e) => log_load_manifold_failed("cache_ngmr", refno, &inst.geo_hash.to_string(), &e),
                     }
@@ -1439,7 +1585,7 @@ pub async fn run_boolean_worker_from_cache_manager(
                     continue;
                 }
                 let mat = local_mat_for_inst(inst);
-                match load_manifold_from_geo_param(&inst.geo_param, inst.geo_hash, mat, true) {
+                match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, mat, true) {
                     Ok(m) => pos_hi.push(m),
                     Err(e) => log_load_manifold_failed("cache_pos_hi", refno, &inst.geo_hash.to_string(), &e),
                 }
@@ -1473,7 +1619,11 @@ pub async fn run_boolean_worker_from_cache_manager(
         };
         let target_path = boolean_glb_path(&mesh_id);
         ensure_parent_dir(&target_path)?;
-        if let Err(e) = final_manifold.export_to_glb(&target_path) {
+
+        // cache-only：布尔结果先保持 Manifold 拓扑计算的正确性，再转换回“重复顶点”的 PlantMesh，
+        // 以匹配渲染/导出侧对硬表面（flat shading）与非共享顶点的默认语义。
+        let normal_mesh = manifold_to_normal_mesh(final_manifold.get_mesh());
+        if let Err(e) = export_single_mesh_to_glb(&normal_mesh, &target_path) {
             eprintln!(
                 "[boolean_worker_cache] 导出失败: refno={} err={}",
                 refno, e

@@ -17,13 +17,32 @@ use axum::{
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MbdPipeSource {
+    Db,
+    Cache,
+}
+
+impl Default for MbdPipeSource {
+    fn default() -> Self {
+        Self::Db
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MbdPipeQuery {
+    /// 数据来源：db=SurrealDB（默认），cache=foyer cache
+    pub source: MbdPipeSource,
     /// dbno（可选；若不传则尝试从 output/scene_tree/db_meta_info.json 推导）
     pub dbno: Option<u32>,
     /// foyer instance_cache 的 batch_id（可选；若不传则默认按 latest）
     pub batch_id: Option<String>,
+    /// 调试开关：返回 debug_info（包含实际使用的 cache/dbnum/batch 等）
+    pub debug: bool,
+    /// 严格 dbno：若传入 dbno 但该 dbno 无 batch，则不进行跨库回退探测
+    pub strict_dbno: bool,
     /// 最小坡度（0.001 对齐 MBD 默认）
     pub min_slope: f32,
     /// 最大坡度（0.1 对齐 MBD 默认）
@@ -35,13 +54,20 @@ pub struct MbdPipeQuery {
     pub include_dims: bool,
     pub include_welds: bool,
     pub include_slopes: bool,
+    /// 是否尝试填充分支属性（失败则忽略，不影响 success）
+    pub include_branch_attrs: bool,
+    /// 是否尝试用 TreeIndex 的 noun 辅助推断 weld_type（默认关闭，避免额外依赖/误判）
+    pub include_weld_nouns: bool,
 }
 
 impl Default for MbdPipeQuery {
     fn default() -> Self {
         Self {
+            source: MbdPipeSource::Db,
             dbno: None,
             batch_id: None,
+            debug: false,
+            strict_dbno: false,
             min_slope: 0.001,
             max_slope: 0.1,
             dim_min_length: 1.0,
@@ -49,6 +75,8 @@ impl Default for MbdPipeQuery {
             include_dims: true,
             include_welds: true,
             include_slopes: true,
+            include_branch_attrs: true,
+            include_weld_nouns: false,
         }
     }
 }
@@ -71,6 +99,8 @@ pub struct MbdPipeData {
     pub welds: Vec<MbdWeldDto>,
     pub slopes: Vec<MbdSlopeDto>,
     pub stats: MbdPipeStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_info: Option<MbdPipeDebugInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -152,6 +182,20 @@ pub struct MbdSlopeDto {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct MbdPipeDebugInfo {
+    pub cache_dir: Option<String>,
+    pub requested_dbno: Option<u32>,
+    pub inferred_dbnum: Option<u32>,
+    pub active_dbnum: Option<u32>,
+    pub requested_batch_id: Option<String>,
+    pub batches_all: Vec<String>,
+    pub batches_used: Vec<String>,
+    pub fallback_used: bool,
+    pub fallback_reason: Option<String>,
+    pub notes: Vec<String>,
+}
+
 pub fn create_mbd_pipe_routes() -> Router {
     Router::new().route("/api/mbd/pipe/{refno}", get(get_mbd_pipe))
 }
@@ -190,25 +234,58 @@ async fn get_mbd_pipe(
     // plant3d-web 的测试路由与面板逻辑也是以分支 refno 为输入。
     let branch_refno = input_refno_enum.clone();
 
-    let segments = match fetch_tubi_segments_from_cache(
-        branch_refno.clone(),
-        query.dbno,
-        query.batch_id.as_deref(),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            return Json(MbdPipeResponse {
-                success: false,
-                error_message: Some(format!("从 foyer cache 读取分支管段失败: {e}")),
-                data: None,
-            });
-        }
+    let (segments, mut debug_info) = match query.source {
+        MbdPipeSource::Db => match fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Json(MbdPipeResponse {
+                    success: false,
+                    error_message: Some(format!(
+                        "从 SurrealDB 读取分支管段失败: {e}（可尝试 ?source=cache 走 foyer cache）"
+                    )),
+                    data: None,
+                });
+            }
+        },
+        MbdPipeSource::Cache => match fetch_tubi_segments_from_cache_with_debug(
+            branch_refno.clone(),
+            query.dbno,
+            query.batch_id.as_deref(),
+            query.strict_dbno,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Json(MbdPipeResponse {
+                    success: false,
+                    error_message: Some(format!("从 foyer cache 读取分支管段失败: {e}")),
+                    data: None,
+                });
+            }
+        },
     };
 
-    let branch_name = branch_refno.to_string();
-    let branch_attrs = BranchAttrsDto::default();
+    if matches!(query.source, MbdPipeSource::Db) {
+        if query.dbno.is_some() || query.batch_id.is_some() || query.strict_dbno {
+            debug_info.notes.push(format!(
+                "db 模式已忽略 dbno={:?} batch_id={:?} strict_dbno={}",
+                query.dbno, query.batch_id, query.strict_dbno
+            ));
+        }
+    }
+
+    let (branch_name, branch_attrs) = if query.include_branch_attrs {
+        match try_fill_branch_name_and_attrs(branch_refno).await {
+            Ok(v) => v,
+            Err(e) => {
+                debug_info.notes.push(format!("分支属性填充失败（已忽略）: {e}"));
+                (branch_refno.to_string(), BranchAttrsDto::default())
+            }
+        }
+    } else {
+        (branch_refno.to_string(), BranchAttrsDto::default())
+    };
 
     let mut out_segments: Vec<MbdPipeSegmentDto> = Vec::with_capacity(segments.len());
     for (i, seg) in segments.iter().enumerate() {
@@ -250,14 +327,51 @@ async fn get_mbd_pipe(
         let mut shop_idx = 0usize;
         let mut field_idx = 0usize;
 
+        // 可选：用 TreeIndex 查询 noun，辅助推断焊缝类型（默认关闭）
+        let noun_lookup = if query.include_weld_nouns {
+            match try_build_tree_index_for_refno(branch_refno).await {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    debug_info
+                        .notes
+                        .push(format!("TreeIndex 初始化失败（weld_nouns 已忽略）: {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         for i in 0..segments.len().saturating_sub(1) {
             let seg1 = &segments[i];
             let seg2 = &segments[i + 1];
-            if seg1.end.distance(seg2.start) >= query.weld_merge_threshold {
+
+            let (p1, p2, dist) = closest_endpoints(seg1.start, seg1.end, seg2.start, seg2.end);
+            if dist >= query.weld_merge_threshold {
                 continue;
             }
 
-            let weld_type = determine_weld_type(Some("TUBI"), Some("TUBI"));
+            let mut noun1: Option<&str> = Some("TUBI");
+            let mut noun2: Option<&str> = Some("TUBI");
+            let mut _noun_s1_owned: Option<String> = None;
+            let mut _noun_s2_owned: Option<String> = None;
+            if let Some(lookup) = noun_lookup.as_ref() {
+                // 说明：instance_cache 仅稳定提供 tubi_arrive_refno（段起点关联元件）。
+                // 此处仅做渐进式增强：若能查到 arrive_refno 的 noun，则用于辅助分类（可能不完全准确）。
+                if let Some(r1) = seg1.arrive_refno {
+                    if let Some(n) = lookup.get_noun(r1) {
+                        _noun_s1_owned = Some(n);
+                        noun1 = _noun_s1_owned.as_deref();
+                    }
+                }
+                if let Some(r2) = seg2.arrive_refno {
+                    if let Some(n) = lookup.get_noun(r2) {
+                        _noun_s2_owned = Some(n);
+                        noun2 = _noun_s2_owned.as_deref();
+                    }
+                }
+            }
+            let weld_type = determine_weld_type(noun1, noun2);
 
             // 首期：简单近似 MBD shop/field 规则：分支两端优先现场焊；中间按“常见预制件”判断是否车间焊。
             let at_ends = i == 0 || (i + 1) == (segments.len().saturating_sub(1));
@@ -274,7 +388,7 @@ async fn get_mbd_pipe(
 
             welds.push(MbdWeldDto {
                 id: format!("weld:{}:{i}", branch_refno),
-                position: [seg1.end.x, seg1.end.y, seg1.end.z],
+                position: midpoint(p1, p2).to_array(),
                 weld_type,
                 is_shop,
                 label,
@@ -318,6 +432,16 @@ async fn get_mbd_pipe(
         slopes_count: slopes.len(),
     };
 
+    if query.debug {
+        debug_info.inferred_dbnum = debug_info.inferred_dbnum.or(query.dbno);
+        debug_info.requested_dbno = query.dbno;
+        debug_info.requested_batch_id = query.batch_id.clone();
+        debug_info.notes.push(format!(
+            "stats: segs={} dims={} welds={} slopes={}",
+            stats.segments_count, stats.dims_count, stats.welds_count, stats.slopes_count
+        ));
+    }
+
     Json(MbdPipeResponse {
         success: true,
         error_message: None,
@@ -331,6 +455,7 @@ async fn get_mbd_pipe(
             welds,
             slopes,
             stats,
+            debug_info: query.debug.then_some(debug_info),
         }),
     })
 }
@@ -339,19 +464,45 @@ async fn fetch_tubi_segments_from_cache(
     branch_refno: RefnoEnum,
     dbno: Option<u32>,
     batch_id: Option<&str>,
+    strict_dbno: bool,
 ) -> anyhow::Result<Vec<CacheTubiSeg>> {
     use crate::data_interface::db_meta_manager::db_meta;
     use crate::fast_model::instance_cache::InstanceCacheManager;
 
-    let dbnum = if let Some(dbno) = dbno {
+    let (segs, _debug) = fetch_tubi_segments_from_cache_with_debug(
+        branch_refno,
+        dbno,
+        batch_id,
+        strict_dbno,
+    )
+    .await?;
+    Ok(segs)
+}
+
+async fn fetch_tubi_segments_from_cache_with_debug(
+    branch_refno: RefnoEnum,
+    dbno: Option<u32>,
+    batch_id: Option<&str>,
+    strict_dbno: bool,
+) -> anyhow::Result<(Vec<CacheTubiSeg>, MbdPipeDebugInfo)> {
+    use crate::data_interface::db_meta_manager::db_meta;
+    use crate::fast_model::instance_cache::InstanceCacheManager;
+
+    let mut debug = MbdPipeDebugInfo::default();
+    debug.notes.push("source=cache".to_string());
+    debug.requested_dbno = dbno;
+    debug.requested_batch_id = batch_id.map(|s| s.to_string());
+
+    let inferred_dbnum = if let Some(dbno) = dbno {
         dbno
     } else {
         db_meta().ensure_loaded()?;
         db_meta().get_dbnum_by_refno(branch_refno).unwrap_or(0)
     };
-    if dbnum == 0 {
+    if inferred_dbnum == 0 {
         anyhow::bail!("无法推导 dbno（请传 dbno 或先生成 output/scene_tree/db_meta_info.json）");
     }
+    debug.inferred_dbnum = Some(inferred_dbnum);
 
     // 运行时约定：
     // - 若 FOYER_CACHE_DIR 指定，则优先使用
@@ -367,19 +518,29 @@ async fn fetch_tubi_segments_from_cache(
             }
             PathBuf::from("output/instance_cache")
         });
+    debug.cache_dir = Some(cache_dir.display().to_string());
 
     let cache = InstanceCacheManager::new(&cache_dir).await?;
     let branch_u64 = branch_refno.refno();
-    let mut active_dbnum = dbnum;
+    let mut active_dbnum = inferred_dbnum;
     let mut batch_ids = cache.list_batches(active_dbnum);
     if batch_ids.is_empty() {
         // 兼容：前端传入的 dbno 可能是“db_meta 的 dbnum”（例如 7997），
         // 但 instance_cache 的 key 可能是“本次解析/缓存生成的 db 文件编号”（例如 1112）。
         // 因此当指定 dbno 无批次时，尝试回退到 cache 里实际存在的 dbnum。
+        if strict_dbno && dbno.is_some() {
+            anyhow::bail!(
+                "instance_cache 无批次数据：dbno={} dir={}（strict_dbno=true，已禁止回退）",
+                inferred_dbnum,
+                cache_dir.display()
+            );
+        }
         let candidates = cache.list_dbnums();
         if candidates.len() == 1 {
             active_dbnum = candidates[0];
             batch_ids = cache.list_batches(active_dbnum);
+            debug.fallback_used = true;
+            debug.fallback_reason = Some("指定 dbno 无 batch；cache 仅有 1 个 dbnum，已自动回退".to_string());
         } else {
             'outer: for cand in candidates {
                 let ids = cache.list_batches(cand);
@@ -396,6 +557,11 @@ async fn fetch_tubi_segments_from_cache(
                     {
                         active_dbnum = cand;
                         batch_ids = ids;
+                        debug.fallback_used = true;
+                        debug.fallback_reason = Some(format!(
+                            "指定 dbno 无 batch；已在候选 dbnum 中探测到分支数据，回退到 {}",
+                            cand
+                        ));
                         break 'outer;
                     }
                 }
@@ -405,10 +571,12 @@ async fn fetch_tubi_segments_from_cache(
     if batch_ids.is_empty() {
         anyhow::bail!(
             "instance_cache 无批次数据：dbno={} dir={}（且回退失败）",
-            dbnum,
+            inferred_dbnum,
             cache_dir.display()
         );
     }
+    debug.active_dbnum = Some(active_dbnum);
+    debug.batches_all = batch_ids.clone();
 
     fn parse_seq(id: &str) -> Option<u64> {
         id.rsplit('_').next()?.parse().ok()
@@ -425,11 +593,17 @@ async fn fetch_tubi_segments_from_cache(
         ids_with_seq.retain(|(seq, _)| *seq <= t);
     }
     if ids_with_seq.is_empty() {
-        anyhow::bail!("未找到可用 batch（dbno={} batch_id={:?}）", dbnum, batch_id);
+        anyhow::bail!(
+            "未找到可用 batch（dbno={} active_dbnum={} batch_id={:?}）",
+            inferred_dbnum,
+            active_dbnum,
+            batch_id
+        );
     }
 
     // 合并快照：后来的 batch 覆盖较早的段
     let mut merged: HashMap<RefnoEnum, CacheTubiSeg> = HashMap::new();
+    debug.batches_used = ids_with_seq.iter().map(|(_, id)| id.clone()).collect();
     for (_, id) in ids_with_seq {
         let Some(batch) = cache.get(active_dbnum, &id).await else { continue };
         for (leave_refno, info) in &batch.inst_tubi_map {
@@ -470,7 +644,89 @@ async fn fetch_tubi_segments_from_cache(
         let bo = b.order.unwrap_or(u32::MAX);
         ao.cmp(&bo).then_with(|| a.refno.to_string().cmp(&b.refno.to_string()))
     });
-    Ok(segs)
+    Ok((segs, debug))
+}
+
+async fn fetch_tubi_segments_from_surreal_with_debug(
+    branch_refno: RefnoEnum,
+) -> anyhow::Result<(Vec<CacheTubiSeg>, MbdPipeDebugInfo)> {
+    use aios_core::rs_surreal::geometry_query::PlantTransform;
+    use aios_core::shape::pdms_shape::RsVec3;
+    use aios_core::{SUL_DB, SurrealQueryExt};
+    use serde::{Deserialize, Serialize};
+    use surrealdb::types::SurrealValue;
+
+    aios_core::init_surreal().await?;
+
+    #[derive(Serialize, Deserialize, Debug, SurrealValue)]
+    struct TubiRelateRow {
+        pub owner_refno: RefnoEnum,
+        pub leave_refno: RefnoEnum,
+        pub arrive_refno: RefnoEnum,
+        #[serde(default)]
+        pub world_trans: Option<PlantTransform>,
+        #[serde(default)]
+        pub start_pt: Option<RsVec3>,
+        #[serde(default)]
+        pub end_pt: Option<RsVec3>,
+        #[serde(default)]
+        pub index: Option<i64>,
+    }
+
+    let mut debug = MbdPipeDebugInfo::default();
+    debug.notes.push("source=db".to_string());
+
+    let pe_key = branch_refno.to_pe_key();
+    let sql = format!(
+        r#"
+        SELECT
+            id[0] as owner_refno,
+            in as leave_refno,
+            out as arrive_refno,
+            world_trans.d as world_trans,
+            start_pt.d as start_pt,
+            end_pt.d as end_pt,
+            id[1] as index
+        FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
+        "#
+    );
+
+    let rows: Vec<TubiRelateRow> = SUL_DB.query_take(&sql, 0).await?;
+    if rows.is_empty() {
+        anyhow::bail!("tubi_relate 无结果（branch_refno={} pe_key={}）", branch_refno, pe_key);
+    }
+
+    let mut segs: Vec<CacheTubiSeg> = Vec::with_capacity(rows.len());
+    for row in rows {
+        // DB 里 start/end 可能未写入（或被裁剪），此时用 world_trans 将 unit cylinder 的端点
+        // (0,0,0)-(0,0,1) 变换到世界坐标，作为稳定兜底。
+        let wt = row.world_trans.unwrap_or_default();
+        let m = wt.to_matrix();
+        let start = row
+            .start_pt
+            .map(|p| p.0)
+            .unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 0.0)));
+        let end = row
+            .end_pt
+            .map(|p| p.0)
+            .unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 1.0)));
+
+        segs.push(CacheTubiSeg {
+            refno: row.leave_refno,
+            arrive_refno: Some(row.arrive_refno),
+            order: row.index.and_then(|i| u32::try_from(i).ok()),
+            start,
+            end,
+        });
+    }
+
+    segs.sort_by(|a, b| {
+        let ao = a.order.unwrap_or(u32::MAX);
+        let bo = b.order.unwrap_or(u32::MAX);
+        ao.cmp(&bo).then_with(|| a.refno.to_string().cmp(&b.refno.to_string()))
+    });
+
+    Ok((segs, debug))
 }
 
 fn determine_weld_type(noun1: Option<&str>, noun2: Option<&str>) -> MbdWeldType {
@@ -485,5 +741,92 @@ fn determine_weld_type(noun1: Option<&str>, noun2: Option<&str>) -> MbdWeldType 
         return MbdWeldType::Fillet;
     }
     MbdWeldType::Butt
+}
+
+async fn try_fill_branch_name_and_attrs(
+    branch_refno: RefnoEnum,
+) -> anyhow::Result<(String, BranchAttrsDto)> {
+    let att = aios_core::get_named_attmap(branch_refno).await?;
+
+    let mut attrs = BranchAttrsDto::default();
+
+    // 说明：字段键名按常见 PDMS 属性名直取；若不存在则保持 None。
+    // 这些键名以 markpipe/branAttlist.txt 的语义为准，后续若需映射/单位换算，可在此集中处理。
+    attrs.duty = att.get_as_string("DUTY");
+    attrs.pspec = att.get_as_string("PSPEC");
+    attrs.rccm = att.get_as_string("RCCM");
+    attrs.clean = att.get_as_string("CLEAN");
+    attrs.temp = att.get_as_string("TEMP");
+    attrs.pressure = att.get_f64("PRESSURE").map(|v| v as f32);
+    attrs.ispec = att.get_as_string("ISPEC");
+    attrs.insuthick = att.get_f64("INSUTHICK").map(|v| v as f32);
+    attrs.tspec = att.get_as_string("TSPEC");
+    attrs.swgd = att.get_as_string("SWGD");
+    attrs.drawnum = att.get_as_string("DRAWNUM");
+    attrs.rev = att.get_as_string("REV");
+    attrs.status = att.get_as_string("STATUS");
+    attrs.fluid = att.get_as_string("FLUID");
+
+    Ok((att.get_name_or_default(), attrs))
+}
+
+async fn try_build_tree_index_for_refno(
+    refno: RefnoEnum,
+) -> anyhow::Result<crate::fast_model::gen_model::tree_index_manager::TreeIndexManager> {
+    use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno).await?;
+    Ok(TreeIndexManager::with_default_dir(vec![dbnum]))
+}
+
+#[inline]
+fn midpoint(a: Vec3, b: Vec3) -> Vec3 {
+    (a + b) * 0.5
+}
+
+/// 计算两条线段的“最近端点对”（仅端点，不做线段到线段距离）。
+///
+/// 目的：容忍段方向反转（start/end 颠倒）导致的焊缝漏检。
+#[inline]
+fn closest_endpoints(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> (Vec3, Vec3, f32) {
+    let pairs = [
+        (a0, b0),
+        (a0, b1),
+        (a1, b0),
+        (a1, b1),
+    ];
+    let mut best = (pairs[0].0, pairs[0].1, pairs[0].0.distance(pairs[0].1));
+    for (pa, pb) in pairs.into_iter().skip(1) {
+        let d = pa.distance(pb);
+        if d < best.2 {
+            best = (pa, pb, d);
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_closest_endpoints_direction_flip() {
+        let seg1_start = Vec3::new(0.0, 0.0, 0.0);
+        let seg1_end = Vec3::new(1.0, 0.0, 0.0);
+
+        // seg2 方向反转：本应与 seg1_end 相连
+        let seg2_start = Vec3::new(2.0, 0.0, 0.0);
+        let seg2_end = Vec3::new(1.0, 0.0, 0.0);
+
+        let (_p1, _p2, dist) = closest_endpoints(seg1_start, seg1_end, seg2_start, seg2_end);
+        assert!((dist - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_midpoint() {
+        let a = Vec3::new(0.0, 0.0, 0.0);
+        let b = Vec3::new(2.0, 0.0, 0.0);
+        let m = midpoint(a, b);
+        assert_eq!(m.to_array(), [1.0, 0.0, 0.0]);
+    }
 }
 

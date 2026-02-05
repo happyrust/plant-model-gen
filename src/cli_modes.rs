@@ -1452,6 +1452,8 @@ pub async fn export_all_parquet_mode(
 /// # 参数
 /// - `autorun`: 若为 `true`（默认），缓存缺失时自动生成模型数据；若为 `false`，则询问用户确认
 /// - `root_refno`: 若提供，则仅导出该 refno 下的 visible 子孙节点；否则导出整个 dbnum
+/// - `from_cache`: 若为 `true`，使用 foyer cache 导出；若为 `false`（默认），使用 SurrealDB 导出
+/// - `detailed`: 若为 `true`，使用详细格式（version 3）；若为 `false`（默认），使用精简格式（version 4）
 pub async fn export_dbnum_instances_json_mode(
     dbnum: u32,
     verbose: bool,
@@ -1459,6 +1461,8 @@ pub async fn export_dbnum_instances_json_mode(
     db_option_ext: &DbOptionExt,
     autorun: bool,
     root_refno: Option<RefnoEnum>,
+    from_cache: bool,
+    detailed: bool,
 ) -> Result<()> {
     use aios_database::fast_model::export_model::export_prepack_lod::{
         export_dbnum_instances_json, export_dbnum_instances_json_from_cache,
@@ -1471,7 +1475,7 @@ pub async fn export_dbnum_instances_json_mode(
     // 设置输出目录
     let output_dir = output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("instances"));
 
-    if db_option_ext.use_cache {
+    if from_cache {
         async fn cache_has_any_tubi(cache_dir: &std::path::Path, dbnum: u32) -> anyhow::Result<bool> {
             let cache = aios_database::fast_model::instance_cache::InstanceCacheManager::new(cache_dir).await?;
             let batch_ids = cache.list_batches(dbnum);
@@ -1638,6 +1642,7 @@ pub async fn export_dbnum_instances_json_mode(
             Some(mesh_lod_tag.as_str()),
             verbose,
             None,
+            detailed,
         )
         .await;
         match result {
@@ -1657,6 +1662,7 @@ pub async fn export_dbnum_instances_json_mode(
                             Some(mesh_lod_tag.as_str()),
                             verbose,
                             None,
+                            detailed,
                         ).await {
                             println!("\n🎉 导出完成！（缓存路径）");
                             println!("📊 统计信息:");
@@ -1782,6 +1788,7 @@ pub async fn export_dbnum_instances_json_mode(
                             Some(mesh_lod_tag.as_str()),
                             verbose,
                             None,
+                            detailed,
                         )
                         .await;
 
@@ -1802,6 +1809,7 @@ pub async fn export_dbnum_instances_json_mode(
                                             Some(mesh_lod_tag.as_str()),
                                             verbose,
                                             None,
+                                            detailed,
                                         ).await {
                                             println!("\n🎉 导出完成！（缓存路径）");
                                             println!("📊 统计信息:");
@@ -1863,6 +1871,7 @@ pub async fn export_dbnum_instances_json_mode(
         verbose,
         None, // 使用默认毫米单位
         root_refno,
+        detailed,
     )
     .await?;
 

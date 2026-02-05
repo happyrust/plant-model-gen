@@ -443,8 +443,22 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("export-dbnum-instances-json")
                 .long("export-dbnum-instances-json")
-                .help("Export dbnum instances as simplified JSON with AABB data (use_cache=true 时仅走缓存，不回退 SurrealDB)")
+                .help("Export dbnum instances as JSON (default: SurrealDB + compact format)")
                 .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("from-cache")
+                .long("from-cache")
+                .help("Use foyer cache instead of SurrealDB for export")
+                .action(clap::ArgAction::SetTrue)
+                .requires("export-dbnum-instances-json"),
+        )
+        .arg(
+            Arg::new("detailed")
+                .long("detailed")
+                .help("Export detailed JSON format with all fields (default: compact)")
+                .action(clap::ArgAction::SetTrue)
+                .requires("export-dbnum-instances-json"),
         )
         .arg(
             Arg::new("export-room-instances")
@@ -1361,8 +1375,13 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+        let from_cache = matches.get_flag("from-cache");
+        let detailed = matches.get_flag("detailed");
+
         println!("🎯 导出 dbnum 实例数据为 JSON（含 AABB）");
         println!("   - 按 dbnum={} 过滤", dbnum);
+        println!("   - 数据源: {}", if from_cache { "foyer cache" } else { "SurrealDB" });
+        println!("   - 格式: {}", if detailed { "详细模式 (version 3)" } else { "精简模式 (version 4)" });
         if let Some(ref refno) = root_refno {
             println!("   - 仅导出 {} 的 visible 子孙", refno);
         }
@@ -1377,6 +1396,8 @@ async fn main() -> anyhow::Result<()> {
             &db_option_ext,
             true, // autorun=true
             root_refno,
+            from_cache,
+            detailed,
         )
             .await;
     }

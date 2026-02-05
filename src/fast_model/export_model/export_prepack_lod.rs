@@ -2203,6 +2203,60 @@ struct TubiQueryResult {
     pub spec_value: Option<i64>,
 }
 
+// =============================================================================
+// 精简模式（Compact Mode）结构体定义 - Version 4
+// =============================================================================
+
+/// 精简模式的几何实例引用
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactGeoInstance {
+    pub geo_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geo_trans_hash: Option<String>,
+}
+
+/// 精简模式的子节点/实例数据
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactEntry {
+    pub refno: String,
+    pub noun: String,
+    pub spec_value: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aabb_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trans_hash: Option<String>,
+    pub geo_hash: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub geo_instances: Vec<CompactGeoInstance>,
+}
+
+/// 精简模式的分组数据
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactGroup {
+    pub refno: String,
+    pub noun: String,
+    pub owner_noun: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub children: Vec<CompactEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub tubings: Vec<CompactEntry>,
+}
+
+/// 构建精简模式的 JSON 输出
+fn build_compact_instances_json(
+    groups: &[CompactGroup],
+    instances: &[CompactEntry],
+    generated_at: &str,
+) -> serde_json::Value {
+    json!({
+        "version": 4,
+        "format": "compact",
+        "generated_at": generated_at,
+        "groups": groups,
+        "instances": instances,
+    })
+}
+
 fn plant_transform_to_dmat4(t: &aios_core::PlantTransform) -> DMat4 {
     t.0.to_matrix().as_dmat4()
 }
@@ -2573,6 +2627,7 @@ async fn query_inst_relate_rows_by_refnos(
 /// - `verbose`: 是否输出详细日志
 /// - `target_unit`: 目标单位（可选，默认为毫米）
 /// - `root_refno`: 若提供，则仅导出该 refno 下的 visible 子孙节点；否则导出整个 dbnum
+/// - `detailed`: 若为 `true`，使用详细格式（version 3）；若为 `false`，使用精简格式（version 4）
 ///
 /// # 返回
 /// 导出统计信息
@@ -2583,6 +2638,7 @@ pub async fn export_dbnum_instances_json(
     verbose: bool,
     target_unit: Option<LengthUnit>,
     root_refno: Option<RefnoEnum>,
+    detailed: bool,
 ) -> Result<ExportStats> {
     let start_time = std::time::Instant::now();
 
@@ -2849,6 +2905,7 @@ pub async fn export_dbnum_instances_json(
     // 5. 构建简化的 JSON 结构，同时收集 hash
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let mut groups = Vec::new();
+    let mut compact_groups: Vec<CompactGroup> = Vec::new();  // 精简模式
     let mut hash_collector = HashCollector::new();  // 新增：收集 trans/aabb hash
 
     for owner_refno in &owner_refnos {
@@ -2861,6 +2918,7 @@ pub async fn export_dbnum_instances_json(
 
         // 构建 children 数组 (V3: 直接使用数据库 hash 引用)
         let mut children = Vec::new();
+        let mut compact_children: Vec<CompactEntry> = Vec::new();  // 精简模式
         for child in &owner_group.children {
             let child_refno = &child.refno;
 
@@ -2930,10 +2988,32 @@ pub async fn export_dbnum_instances_json(
                 "has_neg": has_neg,
                 "geo_instances": instances,
             }));
+
+            // 精简模式：保留核心字段和 geo_instances
+            let first_geo_hash = export_inst.insts.first()
+                .map(|i| i.geo_hash.clone())
+                .unwrap_or_default();
+            let compact_geo_instances: Vec<CompactGeoInstance> = export_inst.insts
+                .iter()
+                .map(|inst| CompactGeoInstance {
+                    geo_hash: inst.geo_hash.clone(),
+                    geo_trans_hash: inst.trans_hash.clone(),
+                })
+                .collect();
+            compact_children.push(CompactEntry {
+                refno: child_refno.to_string(),
+                noun: noun.to_string(),
+                spec_value: spec_value.unwrap_or(0) as u32,
+                aabb_hash: child_aabb_hash.clone(),
+                trans_hash: Some(refno_trans_hash_str.clone()),
+                geo_hash: first_geo_hash,
+                geo_instances: compact_geo_instances,
+            });
         }
 
         // 构建 tubings 数组 (V3: 直接使用数据库 hash 引用)
         let mut tubings = Vec::new();
+        let mut compact_tubings: Vec<CompactEntry> = Vec::new();  // 精简模式
         if let Some(tubi_records) = tubings_map.get(owner_refno) {
             for tubi in tubi_records {
                 // 过滤：只导出有 AABB 和 geo_hash 的 tubi
@@ -2956,6 +3036,17 @@ pub async fn export_dbnum_instances_json(
                     "lod_mask": 1u32,
                     "spec_value": tubi.spec_value.unwrap_or(0),
                 }));
+
+                // 精简模式（TUBI 没有 geo_instances，只有单个 geo_hash）
+                compact_tubings.push(CompactEntry {
+                    refno: tubi.refno.to_string(),
+                    noun: "TUBI".to_string(),
+                    spec_value: tubi.spec_value.unwrap_or(0) as u32,
+                    aabb_hash: tubi.world_aabb_hash.clone(),
+                    trans_hash: tubi.world_trans_hash.clone(),
+                    geo_hash: tubi.geo_hash.clone(),
+                    geo_instances: Vec::new(),
+                });
             }
         }
 
@@ -2967,6 +3058,15 @@ pub async fn export_dbnum_instances_json(
             "children": children,
             "tubings": tubings,
         }));
+
+        // 精简模式分组（需要查询 owner 的 owner_noun，这里暂用空字符串，后续可从 pe 表获取）
+        compact_groups.push(CompactGroup {
+            refno: owner_refno.to_string(),
+            noun: owner_type.to_string(),
+            owner_noun: String::new(),  // TODO: 从 pe 表查询 owner 的 owner_type
+            children: compact_children,
+            tubings: compact_tubings,
+        });
     }
 
     // 6. 查询这些 refno 的几何实例 hash（只查询 hash 引用，不查询实际数据）
@@ -2997,6 +3097,7 @@ pub async fn export_dbnum_instances_json(
 
     // 8. 构建 instances 数组 (V3: 直接使用数据库 hash 引用)
     let mut instances = Vec::new();
+    let mut compact_instances: Vec<CompactEntry> = Vec::new();  // 精简模式
     let total_instance_rows = instance_rows.len();  // 保存长度用于统计
     for row in instance_rows {
         // 从 instance_export_map 获取几何体实例的 hash 引用
@@ -3038,15 +3139,39 @@ pub async fn export_dbnum_instances_json(
         // 获取布尔运算标识
         let has_neg = export_inst.has_neg;
 
+        // 先保存 noun 用于精简模式
+        let row_noun = row.noun.clone().unwrap_or_default();
+
         instances.push(json!({
             "refno": row.refno.to_string(),
-            "noun": row.noun.unwrap_or_default(),
+            "noun": row_noun,
             "name": row.name.unwrap_or_default(),
             "aabb_hash": inst_aabb_hash,
             "trans_hash": refno_trans_hash,
             "has_neg": has_neg,
             "geo_instances": geo_instances,
         }));
+
+        // 精简模式
+        let first_geo_hash = export_inst.insts.first()
+            .map(|i| i.geo_hash.clone())
+            .unwrap_or_default();
+        let compact_geo_instances: Vec<CompactGeoInstance> = export_inst.insts
+            .iter()
+            .map(|inst| CompactGeoInstance {
+                geo_hash: inst.geo_hash.clone(),
+                geo_trans_hash: inst.trans_hash.clone(),
+            })
+            .collect();
+        compact_instances.push(CompactEntry {
+            refno: row.refno.to_string(),
+            noun: row_noun.clone(),
+            spec_value: 0,
+            aabb_hash: inst_aabb_hash.clone(),
+            trans_hash: Some(refno_trans_hash.clone()),
+            geo_hash: first_geo_hash,
+            geo_instances: compact_geo_instances,
+        });
     }
 
     // 计算过滤统计
@@ -3082,13 +3207,19 @@ pub async fn export_dbnum_instances_json(
         }
     }
 
-    // 主 JSON（V3 格式，trans/aabb 通过全局文件加载）
-    let instances_json = json!({
-        "version": 3,
-        "generated_at": generated_at,
-        "groups": groups,
-        "instances": instances,
-    });
+    // 根据 detailed 参数选择输出格式
+    let instances_json = if detailed {
+        // 详细模式（V3 格式，trans/aabb 通过全局文件加载）
+        json!({
+            "version": 3,
+            "generated_at": generated_at,
+            "groups": groups,
+            "instances": instances,
+        })
+    } else {
+        // 精简模式（V4 格式）
+        build_compact_instances_json(&compact_groups, &compact_instances, &generated_at)
+    };
 
     // 写入主文件
     let output_path = output_dir.join(format!("instances_{}.json", dbnum));
@@ -3134,6 +3265,9 @@ pub async fn export_dbnum_instances_json(
 
 /// 导出指定 dbnum 的实例数据（基于 foyer 缓存）
 ///
+/// # 参数
+/// - `detailed`: 若为 `true`，使用详细格式（version 3）；若为 `false`，使用精简格式（version 4）
+///
 /// 返回 (ExportStats, trans_count, aabb_count)
 pub async fn export_dbnum_instances_json_from_cache(
     dbnum: u32,
@@ -3143,6 +3277,7 @@ pub async fn export_dbnum_instances_json_from_cache(
     mesh_lod_tag: Option<&str>,
     verbose: bool,
     target_unit: Option<LengthUnit>,
+    detailed: bool,
 ) -> Result<(ExportStats, usize, usize)> {
     use aios_core::geometry::{EleGeosInfo, EleInstGeosData};
     use aios_core::types::PlantAabb;
@@ -3535,6 +3670,7 @@ pub async fn export_dbnum_instances_json_from_cache(
 
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let mut groups = Vec::new();
+    let mut compact_groups: Vec<CompactGroup> = Vec::new();  // 精简模式
 
     for owner_refno in &owner_refnos {
         let Some(owner_group) = owner_groups.get(owner_refno) else {
@@ -3575,6 +3711,7 @@ pub async fn export_dbnum_instances_json_from_cache(
         }
 
         let mut children = Vec::new();
+        let mut compact_children: Vec<CompactEntry> = Vec::new();  // 精简模式
         for child_refno in &ordered_child_refnos {
             let Some(info) = inst_info_map.get(child_refno) else {
                 continue;
@@ -3639,9 +3776,36 @@ pub async fn export_dbnum_instances_json_from_cache(
                 "has_neg": has_neg,
                 "geo_instances": instances,
             }));
+
+            // 精简模式
+            let first_geo_hash = inst_geos.insts.first()
+                .map(|i| i.geo_hash.to_string())
+                .unwrap_or_default();
+            let compact_geo_instances: Vec<CompactGeoInstance> = inst_geos.insts
+                .iter()
+                .map(|inst| CompactGeoInstance {
+                    geo_hash: inst.geo_hash.to_string(),
+                    geo_trans_hash: Some(insert_trans_hash(
+                        &mut trans_table,
+                        &to_dmat4(&inst.geo_transform),
+                        &unit_converter,
+                        inst.geo_param.is_reuse_unit(),
+                    )),
+                })
+                .collect();
+            compact_children.push(CompactEntry {
+                refno: child_refno.to_string(),
+                noun: String::new(),
+                spec_value: 0,
+                aabb_hash: Some(aabb_hash.clone()),
+                trans_hash: Some(trans_hash.clone()),
+                geo_hash: first_geo_hash,
+                geo_instances: compact_geo_instances,
+            });
         }
 
         let mut tubings = Vec::new();
+        let mut compact_tubings: Vec<CompactEntry> = Vec::new();  // 精简模式
         // tubi 输出顺序：优先使用 cache 中的 tubi_index（对应 tubi_relate 的 index），缺失时退回旧顺序
         let mut ordered_tubis: Vec<RefnoEnum> = Vec::new();
         let mut tubi_items: Vec<(RefnoEnum, Option<u32>)> = inst_tubi_map
@@ -3724,6 +3888,17 @@ pub async fn export_dbnum_instances_json_from_cache(
                     "lod_mask": 1u32,
                     "spec_value": 0,
                 }));
+
+                // 精简模式（TUBI 没有 geo_instances）
+                compact_tubings.push(CompactEntry {
+                    refno: tubi_refno.to_string(),
+                    noun: "TUBI".to_string(),
+                    spec_value: 0,
+                    aabb_hash: Some(aabb_hash.clone()),
+                    trans_hash: Some(trans_hash.clone()),
+                    geo_hash: first_inst.geo_hash.to_string(),
+                    geo_instances: Vec::new(),
+                });
                 tubi_order += 1;
         }
 
@@ -3734,9 +3909,19 @@ pub async fn export_dbnum_instances_json_from_cache(
             "children": children,
             "tubings": tubings,
         }));
+
+        // 精简模式分组
+        compact_groups.push(CompactGroup {
+            refno: owner_refno.to_string(),
+            noun: owner_type.to_string(),
+            owner_noun: String::new(),  // TODO: 从 cache 中获取 owner 的 owner_type
+            children: compact_children,
+            tubings: compact_tubings,
+        });
     }
 
     let mut instances = Vec::new();
+    let mut compact_instances: Vec<CompactEntry> = Vec::new();  // 精简模式
     let total_instance_rows = instance_rows.len();
     let mut missing_inst_key = 0usize;
     let mut missing_aabb = 0usize;
@@ -3804,6 +3989,32 @@ pub async fn export_dbnum_instances_json_from_cache(
             "has_neg": has_neg,
             "geo_instances": geo_instances,
         }));
+
+        // 精简模式
+        let first_geo_hash = inst_geos.insts.first()
+            .map(|i| i.geo_hash.to_string())
+            .unwrap_or_default();
+        let compact_geo_instances: Vec<CompactGeoInstance> = inst_geos.insts
+            .iter()
+            .map(|inst| CompactGeoInstance {
+                geo_hash: inst.geo_hash.to_string(),
+                geo_trans_hash: Some(insert_trans_hash(
+                    &mut trans_table,
+                    &to_dmat4(&inst.geo_transform),
+                    &unit_converter,
+                    inst.geo_param.is_reuse_unit(),
+                )),
+            })
+            .collect();
+        compact_instances.push(CompactEntry {
+            refno: refno.to_string(),
+            noun: String::new(),
+            spec_value: 0,
+            aabb_hash: Some(aabb_hash.clone()),
+            trans_hash: Some(trans_hash.clone()),
+            geo_hash: first_geo_hash,
+            geo_instances: compact_geo_instances,
+        });
     }
 
     // 如果没有 owner 分组但有独立的 tubi 数据，创建虚拟分组导出
@@ -3822,6 +4033,7 @@ pub async fn export_dbnum_instances_json_from_cache(
         });
 
         let mut tubings = Vec::new();
+        let mut virtual_compact_tubings: Vec<CompactEntry> = Vec::new();  // 精简模式
         let mut tubi_order = 0u32;
 
         for (tubi_refno, info) in tubi_items {
@@ -3862,6 +4074,17 @@ pub async fn export_dbnum_instances_json_from_cache(
                 "lod_mask": 1u32,
                 "spec_value": 0,
             }));
+
+            // 精简模式（TUBI 没有 geo_instances）
+            virtual_compact_tubings.push(CompactEntry {
+                refno: tubi_refno.to_string(),
+                noun: "TUBI".to_string(),
+                spec_value: 0,
+                aabb_hash: Some(aabb_hash.clone()),
+                trans_hash: Some(trans_hash.clone()),
+                geo_hash: geo_hash.clone(),
+                geo_instances: Vec::new(),
+            });
             tubi_order += 1;
         }
 
@@ -3874,16 +4097,32 @@ pub async fn export_dbnum_instances_json_from_cache(
                 "children": [],
                 "tubings": tubings,
             }));
+
+            // 精简模式
+            compact_groups.push(CompactGroup {
+                refno: format!("virtual_pipe_{}", dbnum),
+                noun: "PIPE".to_string(),
+                owner_noun: String::new(),
+                children: Vec::new(),
+                tubings: virtual_compact_tubings,
+            });
             println!("✅ 创建虚拟 PIPE 分组，包含 {} 个 TUBI", tubi_order);
         }
     }
 
-    let instances_json = json!({
-        "version": 3,
-        "generated_at": generated_at,
-        "groups": groups,
-        "instances": instances,
-    });
+    // 根据 detailed 参数选择输出格式
+    let instances_json = if detailed {
+        // 详细模式（V3 格式）
+        json!({
+            "version": 3,
+            "generated_at": generated_at,
+            "groups": groups,
+            "instances": instances,
+        })
+    } else {
+        // 精简模式（V4 格式）
+        build_compact_instances_json(&compact_groups, &compact_instances, &generated_at)
+    };
 
     let output_path = output_dir.join(format!("instances_{}.json", dbnum));
     let json_str = serde_json::to_string_pretty(&instances_json)?;
@@ -4590,7 +4829,7 @@ pub async fn export_instances_json_for_dbnos(
     fs::create_dir_all(&instances_dir)
         .with_context(|| format!("创建 instances 输出目录失败: {}", instances_dir.display()))?;
     for &dbnum in dbnos {
-        export_dbnum_instances_json(dbnum, &instances_dir, db_option.clone(), false, None, None).await?;
+        export_dbnum_instances_json(dbnum, &instances_dir, db_option.clone(), false, None, None, true).await?;
     }
     Ok(())
 }
@@ -4631,7 +4870,7 @@ pub async fn export_instances_json_for_refnos_grouped_by_dbno(
     fs::create_dir_all(&instances_dir)
         .with_context(|| format!("创建 instances 输出目录失败: {}", instances_dir.display()))?;
     for dbnum in dbnos {
-        export_dbnum_instances_json(dbnum, &instances_dir, db_option.clone(), false, None, None).await?;
+        export_dbnum_instances_json(dbnum, &instances_dir, db_option.clone(), false, None, None, true).await?;
     }
     Ok(())
 }

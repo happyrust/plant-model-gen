@@ -19,7 +19,11 @@ use crate::fast_model::room_model::build_room_relations;
 
 // 当条件不满足时提供 stub
 #[cfg(not(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature"))))]
-pub async fn build_room_relations(_db_option: &aios_core::options::DbOption) -> anyhow::Result<()> {
+pub async fn build_room_relations(
+    _db_option: &aios_core::options::DbOption,
+    _db_nums: Option<&[u32]>,
+    _refno_root: Option<aios_core::RefnoEnum>,
+) -> anyhow::Result<()> {
     log::info!("⚠️ build_room_relations 功能需要 (sqlite-index 或 duckdb-feature) 特性");
     Ok(())
 }
@@ -249,7 +253,7 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
             log::info!("正在执行房间计算...");
             log::info!("正在构建房间关系和空间索引...");
             let time = Instant::now();
-            if let Err(e) = build_room_relations(&db_option).await {
+            if let Err(e) = build_room_relations(&db_option, None, None).await {
                 log::error!("❌ 房间计算失败: {}", e);
                 return Err(e);
             }
@@ -286,7 +290,7 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
         log::info!("正在构建房间关系和空间索引...");
         // SQLite R*-tree will be used for spatial indexing
         let mut time = Instant::now();
-        if let Err(e) = build_room_relations(&db_option).await {
+        if let Err(e) = build_room_relations(&db_option, None, None).await {
             log::error!("❌ 房间计算失败: {}", e);
             return Err(e);
         }

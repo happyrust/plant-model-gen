@@ -354,6 +354,8 @@ impl RoomWorker {
             RoomTaskType::RebuildAll => {
                 build_room_relations_with_cancel(
                     &task.db_option,
+                    None,
+                    None,
                     Some(cancel_token.clone()),
                     Some(progress_callback),
                 ).await

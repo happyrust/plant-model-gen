@@ -1613,6 +1613,14 @@ pub async fn export_dbnum_instances_json_mode(
         let mesh_dir = ExportConfig::default().get_mesh_dir(db_option_ext);
         let mesh_lod_tag = format!("{:?}", db_option_ext.inner.mesh_precision.default_lod);
 
+        // 缓存导出也需要查询数据库获取 noun/name，所以需要初始化 SurrealDB 连接
+        println!("🔌 初始化数据库连接...");
+        if let Err(e) = ensure_surreal_connected(db_option_ext).await {
+            eprintln!("⚠️  数据库连接失败: {}，将继续但 noun/name 可能为空", e);
+        } else if verbose {
+            println!("✅ 数据库连接成功");
+        }
+
         // 若显式指定了 root_refno（通过 --debug-model），则优先对该 BRAN/HANG 做一次 tubi 刷新，
         // 以便“已有 cache 但 tubi 缺失/不完整”的情况下也能得到正确导出。
         if root_refno.is_some() {
@@ -1979,6 +1987,7 @@ pub struct RoomComputeCliConfig {
 pub async fn room_compute_mode(
     room_keywords: Option<Vec<String>>,
     db_nums: Option<Vec<u32>>,
+    refno_root: Option<RefnoEnum>,
     force_rebuild: bool,
     verbose: bool,
     db_option_ext: &DbOptionExt,
@@ -2000,6 +2009,9 @@ pub async fn room_compute_mode(
     } else {
         println!("   - 数据库编号: 全部");
     }
+    if let Some(ref root) = refno_root {
+        println!("   - refno 子树根: {}", root);
+    }
     println!("   - 强制重建: {}", force_rebuild);
 
     // 初始化数据库连接
@@ -2009,7 +2021,11 @@ pub async fn room_compute_mode(
     // 执行房间关系构建
     println!("\n🔄 开始构建房间关系...");
 
-    let stats = build_room_relations(&db_option_ext.inner).await?;
+    let stats = build_room_relations(
+        &db_option_ext.inner,
+        db_nums.as_deref(),
+        refno_root,
+    ).await?;
 
     let duration = start_time.elapsed();
 
@@ -2033,6 +2049,7 @@ pub async fn room_compute_mode(
 pub async fn room_compute_mode(
     _room_keywords: Option<Vec<String>>,
     _db_nums: Option<Vec<u32>>,
+    _refno_root: Option<RefnoEnum>,
     _force_rebuild: bool,
     _verbose: bool,
     _db_option_ext: &DbOptionExt,

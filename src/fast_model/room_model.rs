@@ -511,9 +511,14 @@ async fn get_enhanced_trimesh_cache() -> &'static DashMap<String, Arc<TriMesh>> 
 /// 2. 优化几何缓存机制，减少重复加载
 /// 3. 添加详细的性能统计和监控
 /// 4. 支持并发处理和批量操作
+/// 5. 支持 dbnum 和 refno 子树范围限制
 #[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 #[cfg_attr(feature = "profile", tracing::instrument(skip(db_option)))]
-pub async fn build_room_relations(db_option: &DbOption) -> anyhow::Result<RoomBuildStats> {
+pub async fn build_room_relations(
+    db_option: &DbOption,
+    db_nums: Option<&[u32]>,
+    refno_root: Option<RefnoEnum>,
+) -> anyhow::Result<RoomBuildStats> {
     info!("开始构建房间关系 (改进版本)");
 
     let mesh_dir = db_option.get_meshes_path();
@@ -527,7 +532,39 @@ pub async fn build_room_relations(db_option: &DbOption) -> anyhow::Result<RoomBu
     ensure_room_calc_cache_env(db_option);
 
     // 1. 构建房间面板映射关系
-    let room_panel_map = build_room_panels_relate(&room_key_words).await?;
+    let mut room_panel_map = build_room_panels_relate(&room_key_words).await?;
+    info!("查询到 {} 个房间面板映射关系", room_panel_map.len());
+
+    // 2. 应用 dbnum 过滤
+    if let Some(db_nums) = db_nums {
+        let db_num_set: HashSet<u32> = db_nums.iter().copied().collect();
+        room_panel_map.retain(|(refno, _, _)| {
+            let ref0 = match refno {
+                RefnoEnum::Refno(r) => r.get_0(),
+                RefnoEnum::SesRef(r) => r.refno.get_0(),
+            };
+            db_num_set.contains(&ref0)
+        });
+        info!("dbnum 过滤后剩余 {} 个房间", room_panel_map.len());
+    }
+
+    // 3. 应用 refno 子树过滤
+    if let Some(root) = refno_root {
+        use crate::fast_model::query_compat::query_visible_geo_descendants;
+        let visible_refnos: HashSet<RefnoEnum> =
+            query_visible_geo_descendants(root, true, None)
+                .await?
+                .into_iter()
+                .collect();
+
+        room_panel_map.retain(|(room_refno, _, panel_refnos)| {
+            // 房间本身在子树内，或者有面板在子树内
+            visible_refnos.contains(room_refno)
+                || panel_refnos.iter().any(|p| visible_refnos.contains(p))
+        });
+        info!("refno 子树过滤后剩余 {} 个房间", room_panel_map.len());
+    }
+
     let exclude_panel_refnos = room_panel_map
         .iter()
         .map(|(_, _, panel_refnos)| panel_refnos.clone())
@@ -536,7 +573,7 @@ pub async fn build_room_relations(db_option: &DbOption) -> anyhow::Result<RoomBu
 
     info!("找到 {} 个房间面板映射关系", room_panel_map.len());
 
-    // 2. panel 模型缺失时：复用 foyer cache 定向生成流程补齐（仅写 cache，不写 inst_* 表）。
+    // 4. panel 模型缺失时：复用 foyer cache 定向生成流程补齐（仅写 cache，不写 inst_* 表）。
     #[cfg(all(
         not(target_arch = "wasm32"),
         feature = "sqlite-index",
@@ -568,6 +605,8 @@ pub async fn build_room_relations(db_option: &DbOption) -> anyhow::Result<RoomBu
 #[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 pub async fn build_room_relations_with_cancel(
     db_option: &DbOption,
+    db_nums: Option<&[u32]>,
+    refno_root: Option<RefnoEnum>,
     cancel_token: Option<CancellationToken>,
     progress_callback: Option<Box<dyn Fn(f32, &str) + Send + Sync>>,
 ) -> anyhow::Result<RoomBuildStats> {
@@ -590,7 +629,39 @@ pub async fn build_room_relations_with_cancel(
     if let Some(ref cb) = progress_callback {
         cb(0.05, "正在查询房间面板映射关系");
     }
-    let room_panel_map = build_room_panels_relate(&room_key_words).await?;
+    let mut room_panel_map = build_room_panels_relate(&room_key_words).await?;
+    info!("查询到 {} 个房间面板映射关系", room_panel_map.len());
+
+    // 2. 应用 dbnum 过滤
+    if let Some(db_nums) = db_nums {
+        let db_num_set: HashSet<u32> = db_nums.iter().copied().collect();
+        room_panel_map.retain(|(refno, _, _)| {
+            let ref0 = match refno {
+                RefnoEnum::Refno(r) => r.get_0(),
+                RefnoEnum::SesRef(r) => r.refno.get_0(),
+            };
+            db_num_set.contains(&ref0)
+        });
+        info!("dbnum 过滤后剩余 {} 个房间", room_panel_map.len());
+    }
+
+    // 3. 应用 refno 子树过滤
+    if let Some(root) = refno_root {
+        use crate::fast_model::query_compat::query_visible_geo_descendants;
+        let visible_refnos: HashSet<RefnoEnum> =
+            query_visible_geo_descendants(root, true, None)
+                .await?
+                .into_iter()
+                .collect();
+
+        room_panel_map.retain(|(room_refno, _, panel_refnos)| {
+            // 房间本身在子树内，或者有面板在子树内
+            visible_refnos.contains(room_refno)
+                || panel_refnos.iter().any(|p| visible_refnos.contains(p))
+        });
+        info!("refno 子树过滤后剩余 {} 个房间", room_panel_map.len());
+    }
+
     let exclude_panel_refnos = room_panel_map
         .iter()
         .map(|(_, _, panel_refnos)| panel_refnos.clone())
@@ -2586,7 +2657,7 @@ pub async fn update_room_relations_incremental_with_cancel(
     // 逻辑：增量更新实际上是找到受影响的房间并重新计算
     // 为了简单起见，这里重用重建逻辑，但只针对受影响的房间（如果能找到的话）
     // 或者直接调用 build_room_relations_with_cancel 作为一个安全的回退
-    build_room_relations_with_cancel(db_option, cancel_token, progress_callback).await
+    build_room_relations_with_cancel(db_option, None, None, cancel_token, progress_callback).await
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]

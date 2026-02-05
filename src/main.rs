@@ -520,6 +520,13 @@ async fn main() -> anyhow::Result<()> {
                 .value_delimiter(',')
                 .num_args(1..),
         )
+        .arg(
+            Arg::new("room-refno-root")
+                .long("room-refno-root")
+                .help("Root refno for room calculation scope (e.g., '21491_10000'). Only rooms under this subtree will be processed.")
+                .value_name("REFNO")
+                .action(clap::ArgAction::Set),
+        )
         // ========== 缓存清理命令 ==========
         .arg(
             Arg::new("clean-cache")
@@ -1443,7 +1450,9 @@ async fn main() -> anyhow::Result<()> {
 
     // ========== 处理 --room-compute 房间计算命令 ==========
     if matches.get_flag("room-compute") {
+        use aios_core::RefnoEnum;
         use crate::cli_modes::room_compute_mode;
+        use std::str::FromStr;
 
         let room_keywords: Option<Vec<String>> = matches
             .get_many::<String>("room-keywords")
@@ -1455,6 +1464,13 @@ async fn main() -> anyhow::Result<()> {
             .get_many::<String>("room-db-nums")
             .map(|nums| nums.filter_map(|s| s.parse::<u32>().ok()).collect());
 
+        let refno_root: Option<RefnoEnum> = matches
+            .get_one::<String>("room-refno-root")
+            .and_then(|s| {
+                let refno_str = s.replace('_', "/");
+                RefnoEnum::from_str(&refno_str).ok()
+            });
+
         println!("🏠 启动房间计算模式");
         if let Some(ref kws) = room_keywords {
             println!("   - 房间关键词: {:?}", kws);
@@ -1462,11 +1478,15 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref nums) = db_nums {
             println!("   - 数据库编号: {:?}", nums);
         }
+        if let Some(ref root) = refno_root {
+            println!("   - refno 子树根: {}", root);
+        }
         println!("   - 强制重建: {}", force_rebuild);
 
         return room_compute_mode(
             room_keywords,
             db_nums,
+            refno_root,
             force_rebuild,
             verbose,
             &db_option_ext,

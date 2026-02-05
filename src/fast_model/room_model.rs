@@ -3,7 +3,7 @@ use aios_core::accel_tree::acceleration_tree::RStarBoundingBox;
 use aios_core::options::DbOption;
 use aios_core::room::algorithm::*;
 use aios_core::shape::pdms_shape::PlantMesh;
-use aios_core::{GeomInstQuery, GeomPtsQuery, ModelHashInst, RefU64, SUL_DB};
+use aios_core::{GeomInstQuery, ModelHashInst, RefU64, SUL_DB};
 use aios_core::{RefnoEnum, init_demo_test_surreal, init_test_surreal};
 
 // 使用改进的房间查询模块（暂时注释掉，因为这些模块可能不存在）
@@ -48,6 +48,7 @@ use tokio::sync::RwLock;
 #[cfg(feature = "sqlite-index")]
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use indicatif::{ProgressBar, ProgressStyle};
 
 #[cfg(feature = "duckdb-feature")]
 use crate::fast_model::export_model::get_or_init_duckdb_reader;
@@ -57,11 +58,12 @@ async fn query_insts_for_room_calc(
     refnos: &[RefnoEnum],
     enable_holes: bool,
 ) -> anyhow::Result<Vec<GeomInstQuery>> {
-    // 默认仍走 SurrealDB；仅当显式开启 cache 模式才切换（避免默认行为变化）。
+    // 约定：房间计算的模型数据以 foyer cache 为准（默认启用 cache-only）。
+    // 如需回退到 SurrealDB(inst_relate 链路)，显式设置 AIOS_ROOM_USE_CACHE=0/false。
     let use_cache = env::var("AIOS_ROOM_USE_CACHE")
         .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| v.trim() == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(true);
 
     if !use_cache {
         return aios_core::query_insts(refnos, enable_holes).await;
@@ -97,23 +99,312 @@ pub struct RoomBuildStats {
     pub memory_usage_mb: f32,
 }
 
+fn parse_env_bool(name: &str, default_value: bool) -> bool {
+    env::var(name)
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(default_value)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn ensure_room_calc_cache_env(db_option: &DbOption) {
+    // 仅在未显式设置时注入默认值，避免覆盖调用侧的自定义 cache_dir。
+    if env::var("FOYER_CACHE_DIR").ok().filter(|s| !s.trim().is_empty()).is_none() {
+        let dir = PathBuf::from("output")
+            .join(db_option.project_name.as_str())
+            .join("instance_cache");
+        unsafe {
+            env::set_var("FOYER_CACHE_DIR", dir.to_string_lossy().to_string());
+        }
+    }
+
+    if env::var("AIOS_ROOM_USE_CACHE").is_err() {
+        unsafe {
+            env::set_var("AIOS_ROOM_USE_CACHE", "1");
+        }
+    }
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "sqlite-index",
+    feature = "gen_model"
+))]
+async fn pregen_room_panels_into_foyer_cache(
+    db_option: &DbOption,
+    room_panel_map: &[(RefnoEnum, String, Vec<RefnoEnum>)],
+) -> anyhow::Result<()> {
+    // 默认开启；需要禁用时可设置 AIOS_ROOM_PREGEN_PANELS=0。
+    if !parse_env_bool("AIOS_ROOM_PREGEN_PANELS", true) {
+        return Ok(());
+    }
+
+    use crate::data_interface::db_meta_manager::db_meta;
+    use crate::fast_model::instance_cache::InstanceCacheManager;
+    use crate::options::DbOptionExt;
+
+    let mut panels: HashSet<RefnoEnum> = HashSet::new();
+    for (_, _, ps) in room_panel_map {
+        for p in ps {
+            panels.insert(*p);
+        }
+    }
+    if panels.is_empty() {
+        return Ok(());
+    }
+
+    // 确保 db_meta 已加载，便于 ref0->cache_dbnum 推导。
+    db_meta().set_default_project_name(&db_option.project_name);
+    db_meta().ensure_loaded().map_err(|e| {
+        anyhow::anyhow!(
+            "房间计算无法加载 db_meta_info.json（需要 ref0->cache_dbnum 映射以写入 foyer cache）: {}",
+            e
+        )
+    })?;
+
+    let cache_dir = env::var("FOYER_CACHE_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("output").join(db_option.project_name.as_str()).join("instance_cache"));
+
+    let cache = InstanceCacheManager::new(&cache_dir).await?;
+
+    // 按 cache_dbnum 分组以减少 batch 扫描次数
+    let mut groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
+    for &p in &panels {
+        let Some(dbnum) = db_meta().get_dbnum_by_refno(p) else {
+            continue;
+        };
+        if dbnum == 0 {
+            continue;
+        }
+        groups.entry(dbnum).or_default().push(p);
+    }
+
+    let mut missing: Vec<RefnoEnum> = Vec::new();
+    for (dbnum, refnos) in groups {
+        let batch_ids = cache.list_batches(dbnum);
+        if batch_ids.is_empty() {
+            missing.extend(refnos);
+            continue;
+        }
+
+        let mut unresolved: HashSet<RefnoEnum> = refnos.into_iter().collect();
+
+        for bid in batch_ids.iter().rev() {
+            if unresolved.is_empty() {
+                break;
+            }
+            let Some(batch) = cache.get(dbnum, bid).await else {
+                continue;
+            };
+
+            let mut has_geos: HashSet<RefnoEnum> = HashSet::new();
+            for geos in batch.inst_geos_map.values() {
+                if !geos.insts.is_empty() {
+                    has_geos.insert(geos.refno);
+                }
+            }
+
+            let mut found_now = Vec::new();
+            for r in &unresolved {
+                if batch.inst_info_map.contains_key(r) && has_geos.contains(r) {
+                    found_now.push(*r);
+                }
+            }
+            for r in found_now {
+                unresolved.remove(&r);
+            }
+        }
+
+        if !unresolved.is_empty() {
+            missing.extend(unresolved.into_iter());
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    // 复用既有 foyer cache 定向生成流程（manual_refnos 路径）。
+    // 注意：这里“不把模型写回 SurrealDB(inst_*/geo_*)”，只写 foyer cache + mesh + sqlite 索引（若启用）。
+    let mut opt = DbOptionExt::from(db_option.clone());
+    opt.use_cache = true;
+    opt.use_surrealdb = false;
+    opt.export_instances = false;
+    opt.inner.gen_model = true;
+    opt.inner.gen_mesh = true;
+    opt.inner.enable_sqlite_rtree = true;
+    opt.inner.apply_boolean_operation = false;
+    opt.inner.replace_mesh = Some(false);
+    opt.inner.save_db = Some(false);
+
+    // 手动 refnos 可能跨 dbnum：确保 db_meta 路径与 cache_dir 一致。
+    opt.foyer_cache_dir = Some(cache_dir.to_string_lossy().to_string());
+
+    // 输入数据仍需从 SurrealDB 读取（属性/loops/world_transform 等）。
+    aios_core::init_surreal().await?;
+
+    info!(
+        "房间计算：检测到 {} 个 panel 缺失模型数据，开始定向补齐（写 foyer cache）",
+        missing.len()
+    );
+    crate::fast_model::gen_model::gen_all_geos_data(missing.clone(), &opt, None, opt.target_sesno)
+        .await
+        .map_err(|e| anyhow::anyhow!("定向补齐 panel 模型失败: {}", e))?;
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoomFineMethod {
+    /// 方案B：凸包/凸分解（任意重叠：点在体内 OR 与边界相交）
+    Convex,
+    /// 方案A：关键点投票（从真实几何 TriMesh 采样关键点）
+    KeyPoints,
+}
+
+impl RoomFineMethod {
+    fn parse(s: &str) -> Option<Self> {
+        let v = s.trim().to_ascii_lowercase();
+        match v.as_str() {
+            "convex" | "hull" | "hulls" => Some(Self::Convex),
+            "keypoints" | "key_points" | "key-point" | "key-point-vote" | "kp" => {
+                Some(Self::KeyPoints)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConvexFallback {
+    /// 当凸分解不可用时，回退到关键点投票（仍基于真实几何采样点）
+    KeyPoints,
+    /// 不回退（凸分解不可用则该候选不命中）
+    None,
+}
+
+impl ConvexFallback {
+    fn parse(s: &str) -> Option<Self> {
+        let v = s.trim().to_ascii_lowercase();
+        match v.as_str() {
+            "keypoints" | "key_points" | "kp" => Some(Self::KeyPoints),
+            "none" | "off" | "false" | "0" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RoomComputeOptions {
     inside_tol: f32,
+    /// 仅粗算：只基于 world AABB “完全包含”判定 belongs，跳过关键点/凸包精算
+    coarse_only: bool,
     concurrency: usize,
     candidate_limit: Option<usize>,
     candidate_concurrency: usize,
+    fine_method: RoomFineMethod,
+    convex_fallback: ConvexFallback,
+    keypoint_max_samples_per_mesh: usize,
+    keypoint_max_total_points: usize,
 }
 
 impl Default for RoomComputeOptions {
     fn default() -> Self {
         Self {
             inside_tol: 0.1,
+            coarse_only: default_room_coarse_only(),
             concurrency: default_room_concurrency(),
             candidate_limit: default_candidate_limit(),
             candidate_concurrency: default_candidate_concurrency(),
+            fine_method: default_room_fine_method(),
+            convex_fallback: default_convex_fallback(),
+            keypoint_max_samples_per_mesh: default_keypoint_max_samples_per_mesh(),
+            keypoint_max_total_points: default_keypoint_max_total_points(),
         }
     }
+}
+
+fn parse_bool(s: &str) -> Option<bool> {
+    let v = s.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Some(true),
+        "0" | "false" | "no" | "n" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn env_bool_opt(key: &str) -> Option<bool> {
+    env::var(key).ok().and_then(|v| parse_bool(&v))
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn default_room_fine_method() -> RoomFineMethod {
+    // 兼容旧开关：ROOM_RELATION_USE_CONVEX=1/0
+    if let Some(v) = env_bool_opt("ROOM_RELATION_USE_CONVEX") {
+        return if v {
+            RoomFineMethod::Convex
+        } else {
+            RoomFineMethod::KeyPoints
+        };
+    }
+
+    // 新开关：ROOM_RELATION_FINE_METHOD=convex|keypoints
+    if let Ok(v) = env::var("ROOM_RELATION_FINE_METHOD") {
+        if let Some(m) = RoomFineMethod::parse(&v) {
+            return m;
+        }
+    }
+
+    // 默认：凸包/凸分解
+    RoomFineMethod::Convex
+}
+
+fn default_convex_fallback() -> ConvexFallback {
+    // 兼容旧开关：ROOM_RELATION_ALLOW_AABB_FALLBACK（旧语义是允许“兜底”。现在不再允许 AABB，
+    // 但仍可用该开关来控制“凸包失败时是否回退到关键点投票”。）
+    if let Some(v) = env_bool_opt("ROOM_RELATION_ALLOW_AABB_FALLBACK") {
+        return if v {
+            ConvexFallback::KeyPoints
+        } else {
+            ConvexFallback::None
+        };
+    }
+
+    // 新开关：ROOM_RELATION_CONVEX_FALLBACK=keypoints|none
+    if let Ok(v) = env::var("ROOM_RELATION_CONVEX_FALLBACK") {
+        if let Some(m) = ConvexFallback::parse(&v) {
+            return m;
+        }
+    }
+
+    // 默认：回退关键点投票（避免凸分解文件缺失时全量空结果）
+    ConvexFallback::KeyPoints
+}
+
+fn default_keypoint_max_samples_per_mesh() -> usize {
+    env_usize("ROOM_RELATION_KEYPOINT_MAX_SAMPLES", 256).max(1)
+}
+
+fn default_keypoint_max_total_points() -> usize {
+    env_usize("ROOM_RELATION_KEYPOINT_MAX_TOTAL_POINTS", 4096).max(16)
+}
+
+fn default_room_coarse_only() -> bool {
+    // 默认启用仅粗算模式（只用 AABB 关键点），提升性能
+    // 可通过环境变量 ROOM_RELATION_COARSE_ONLY=false 启用精算（加载真实 TriMesh）
+    env_bool_opt("ROOM_RELATION_COARSE_ONLY").unwrap_or(true)
 }
 
 fn default_room_concurrency() -> usize {
@@ -231,6 +522,10 @@ pub async fn build_room_relations(db_option: &DbOption) -> anyhow::Result<RoomBu
 
     CACHE_METRICS.reset();
 
+    // 房间计算默认走 foyer cache；若调用侧未设置 FOYER_CACHE_DIR，这里按 project_name 兜底。
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    ensure_room_calc_cache_env(db_option);
+
     // 1. 构建房间面板映射关系
     let room_panel_map = build_room_panels_relate(&room_key_words).await?;
     let exclude_panel_refnos = room_panel_map
@@ -240,6 +535,14 @@ pub async fn build_room_relations(db_option: &DbOption) -> anyhow::Result<RoomBu
         .collect::<HashSet<_>>();
 
     info!("找到 {} 个房间面板映射关系", room_panel_map.len());
+
+    // 2. panel 模型缺失时：复用 foyer cache 定向生成流程补齐（仅写 cache，不写 inst_* 表）。
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        feature = "sqlite-index",
+        feature = "gen_model"
+    ))]
+    pregen_room_panels_into_foyer_cache(db_option, &room_panel_map).await?;
 
     let stats = compute_room_relations(
         &mesh_dir,
@@ -280,6 +583,9 @@ pub async fn build_room_relations_with_cancel(
 
     CACHE_METRICS.reset();
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    ensure_room_calc_cache_env(db_option);
+
     // 1. 构建房间面板映射关系
     if let Some(ref cb) = progress_callback {
         cb(0.05, "正在查询房间面板映射关系");
@@ -292,6 +598,13 @@ pub async fn build_room_relations_with_cancel(
         .collect::<HashSet<_>>();
 
     info!("找到 {} 个房间面板映射关系", room_panel_map.len());
+
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        feature = "sqlite-index",
+        feature = "gen_model"
+    ))]
+    pregen_room_panels_into_foyer_cache(db_option, &room_panel_map).await?;
 
     if let Some(ref token) = cancel_token {
         if token.is_cancelled() {
@@ -363,8 +676,16 @@ async fn compute_room_relations_with_cancel(
     use futures::stream::{self, StreamExt};
 
     let total_rooms = room_panel_map.len();
-    let mut current_room = 0;
-    
+
+    let pb = ProgressBar::new(total_rooms as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    pb.set_message("房间计算中...");
+
     let results = stream::iter(room_panel_map)
         .map(|(room_refno, room_num, panel_refnos)| {
             let mesh_dir = mesh_dir.clone();
@@ -399,11 +720,11 @@ async fn compute_room_relations_with_cancel(
         })
         .buffer_unordered(options.concurrency.max(1))
         .map(|res| {
-            // 进度反馈
-            current_room += 1;
+            pb.inc(1);
+            // 保留原有的 progress_callback 以支持 Web/GRPC
             if let Some(ref cb) = progress_callback {
-                let progress = 0.1 + (current_room as f32 / total_rooms as f32) * 0.85;
-                cb(progress, &format!("已处理 {}/{} 个房间", current_room, total_rooms));
+                let progress = 0.1 + (pb.position() as f32 / total_rooms as f32) * 0.85;
+                cb(progress, &format!("已处理 {}/{} 个房间", pb.position(), total_rooms));
             }
             res
         })
@@ -418,6 +739,8 @@ async fn compute_room_relations_with_cancel(
     let total_rooms = results.len();
     let total_components: usize = results.iter().map(|(_, count, _)| *count).sum();
     let build_time = start_time.elapsed();
+
+    pb.finish_with_message("房间计算完成");
 
     Ok(RoomBuildStats {
         total_rooms,
@@ -656,7 +979,7 @@ async fn process_panel_for_room(
     }
 }
 
-/// 改进版本的房间构件计算（基于关键点检测）
+/// 改进版本的房间构件计算（支持关键点/凸包两方案）
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub async fn cal_room_refnos(
     mesh_dir: &PathBuf,
@@ -679,22 +1002,52 @@ async fn cal_room_refnos_with_options(
 ) -> anyhow::Result<HashSet<RefnoEnum>> {
     let start_time = Instant::now();
     let inside_tol = options.inside_tol;
+    let coarse_only = options.coarse_only;
+    let fine_method = options.fine_method;
+    let convex_fallback = options.convex_fallback;
+    let keypoint_max_samples_per_mesh = options.keypoint_max_samples_per_mesh;
+    let keypoint_max_total_points = options.keypoint_max_total_points;
     let debug_enabled = env::var("AIOS_ROOM_DEBUG")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let allow_aabb_fallback = env::var("ROOM_RELATION_ALLOW_AABB_FALLBACK")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let use_convex = env::var("ROOM_RELATION_USE_CONVEX")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
 
-    // 步骤 1：查询面板的几何实例
-    let panel_geom_insts: Vec<GeomInstQuery> =
+    if debug_enabled {
+        println!(
+            "[room_calc] panel={} fine_method={:?} convex_fallback={:?} keypoint_samples_per_mesh={} keypoint_max_total={}",
+            panel_refno,
+            fine_method,
+            convex_fallback,
+            keypoint_max_samples_per_mesh,
+            keypoint_max_total_points
+        );
+    }
+
+    // 步骤 1：查询面板的几何实例（默认 cache-only）
+    let mut panel_geom_insts: Vec<GeomInstQuery> =
         query_insts_for_room_calc(&[panel_refno], true).await.unwrap_or_default();
+
+    // cache 缺失面板模型数据：在房间计算流程内按需补齐（复用 foyer cache 定向生成流程）。
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        feature = "sqlite-index",
+        feature = "gen_model"
+    ))]
+    {
+        let use_cache = parse_env_bool("AIOS_ROOM_USE_CACHE", true);
+        let autogen = parse_env_bool("AIOS_ROOM_AUTOGEN_PANEL", true);
+        if use_cache && autogen && panel_geom_insts.is_empty() {
+            let db_opt = aios_core::get_db_option();
+            ensure_room_calc_cache_env(&db_opt);
+            let tmp = vec![(RefnoEnum::default(), String::new(), vec![panel_refno])];
+            if let Err(e) = pregen_room_panels_into_foyer_cache(&db_opt, &tmp).await {
+                warn!("房间计算自动补齐 panel 模型失败: panel={}, err={}", panel_refno, e);
+            } else {
+                panel_geom_insts =
+                    query_insts_for_room_calc(&[panel_refno], true).await.unwrap_or_default();
+            }
+        }
+    }
 
     if panel_geom_insts.is_empty() {
         debug!("面板 {} 没有几何实例", panel_refno);
@@ -718,10 +1071,8 @@ async fn cal_room_refnos_with_options(
         }
     }
 
-    // 步骤 2：加载面板 TriMesh（用于点包含测试），并合并面板 AABB
-    let mut panel_meshes: Vec<Arc<TriMesh>> = Vec::new();
+    // 步骤 2：加载面板 TriMesh（用于点包含测试）；panel_aabb 优先用 inst_info.world_aabb，缺失则从 TriMesh 推导。
     let mut panel_aabb: Option<Aabb> = None;
-
     for geom_inst in &panel_geom_insts {
         let Some(ref world_aabb) = geom_inst.world_aabb else { continue };
         let geom_aabb: Aabb = world_aabb.clone().into();
@@ -729,14 +1080,26 @@ async fn cal_room_refnos_with_options(
             None => geom_aabb,
             Some(acc) => merge_aabb(&acc, &geom_aabb),
         });
+    }
 
+    // 房间判定基于 panel mesh 的“点在体内/靠近表面”语义，因此无论是否 coarse_only 都需要加载面板 TriMesh。
+    // coarse_only 仅意味着：候选构件不加载真实 TriMesh，不走关键点/凸包精算，仅用候选 world AABB 的关键点投票。
+    let mut panel_meshes: Vec<Arc<TriMesh>> = Vec::new();
+    for geom_inst in &panel_geom_insts {
         if geom_inst.insts.is_empty() {
             debug!("面板 {} 的 insts 数组为空", panel_refno);
             continue;
         }
 
         for inst in &geom_inst.insts {
-            match load_geometry_with_enhanced_cache(mesh_dir, &inst.geo_hash, geom_inst.world_trans, inst).await {
+            match load_geometry_with_enhanced_cache(
+                mesh_dir,
+                &inst.geo_hash,
+                geom_inst.world_trans,
+                inst,
+            )
+            .await
+            {
                 Ok(mesh) => panel_meshes.push(mesh),
                 Err(e) => {
                     warn!("加载面板几何文件失败: {}, error: {}", inst.geo_hash, e);
@@ -745,10 +1108,27 @@ async fn cal_room_refnos_with_options(
         }
     }
 
+    if panel_meshes.is_empty() {
+        // 面板 mesh 缺失时无法进行“点在体内 / 与边界相交”等基于 TriMesh 的判定，因此直接跳过。
+        warn!("面板 {} 无可用 TriMesh，跳过房间计算", panel_refno);
+        return Ok(Default::default());
+    }
+
+    // panel_aabb 缺失：用已加载的 TriMesh 反推（TriMesh 已应用 world_transform，local_aabb 即 world AABB）。
+    if panel_aabb.is_none() {
+        for m in &panel_meshes {
+            let aabb = m.local_aabb();
+            panel_aabb = Some(match panel_aabb {
+                None => aabb,
+                Some(acc) => merge_aabb(&acc, &aabb),
+            });
+        }
+    }
+
     let panel_aabb = match panel_aabb {
         Some(aabb) => aabb,
         None => {
-            debug!("面板 {} 没有可用 AABB", panel_refno);
+            warn!("面板 {} 无法获得 panel_aabb（world_aabb/mesh 均缺失），跳过房间计算", panel_refno);
             return Ok(Default::default());
         }
     };
@@ -764,19 +1144,6 @@ async fn cal_room_refnos_with_options(
             panel_aabb.maxs.y,
             panel_aabb.maxs.z
         );
-    }
-
-    if panel_meshes.is_empty() {
-        debug!("面板 {} 无可用 TriMesh", panel_refno);
-        if !allow_aabb_fallback {
-            return Ok(Default::default());
-        }
-        if debug_enabled {
-            println!(
-                "[room_calc] panel={} trimesh=0 -> 使用 AABB fallback（粗略）",
-                panel_refno
-            );
-        }
     }
 
     // 步骤 3：粗算 - 通过空间索引查询候选构件
@@ -842,46 +1209,57 @@ async fn cal_room_refnos_with_options(
         }
     }
 
-    // 若面板 TriMesh 不可用，则降级为 AABB 包含测试（精度较差，但可用于调试/兜底）。
-    if panel_meshes.is_empty() {
-        let panel_refno_dbg = panel_refno;
-        let tol = inside_tol;
-        let within_refnos =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<HashSet<RefnoEnum>> {
-            let idx = SqliteSpatialIndex::with_default_path()?;
-            let mut within = HashSet::<RefnoEnum>::new();
-            for candidate_refno in candidates {
-                let id: RefU64 = candidate_refno.into();
-                let Some(aabb) = idx.get_aabb(id).ok().flatten() else {
-                    continue;
-                };
-                let caabb: Aabb = aabb.into();
-                // 允许一定 tol：candidate 全包围盒需在 panel AABB 内
-                if caabb.mins.x + tol >= panel_aabb.mins.x
-                    && caabb.mins.y + tol >= panel_aabb.mins.y
-                    && caabb.mins.z + tol >= panel_aabb.mins.z
-                    && caabb.maxs.x - tol <= panel_aabb.maxs.x
-                    && caabb.maxs.y - tol <= panel_aabb.maxs.y
-                    && caabb.maxs.z - tol <= panel_aabb.maxs.z
-                {
-                    within.insert(candidate_refno);
-                }
-            }
-            Ok(within)
-        })
-            .await??;
+    // 仅粗算：不加载候选构件的真实 TriMesh，不走关键点/凸包精算；
+    // 仅用候选构件 world_aabb 的 27 个关键点在 panel mesh 内投票后直接返回。
+    if coarse_only {
+        let coarse_only_start = Instant::now();
 
-        info!(
-            "面板 {} 房间计算完成(AABB fallback): 总耗时 {:?}, 粗算 {} -> 细算 {}",
-            panel_refno_dbg,
-            start_time.elapsed(),
-            candidate_count,
-            within_refnos.len()
+        let candidate_geom_groups = match query_insts_for_room_calc(&candidates, true).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("批量查询候选构件几何实例失败(coarse-only): error={}", e);
+                Vec::new()
+            }
+        };
+
+        let candidate_geom_map: HashMap<RefnoEnum, GeomInstQuery> = candidate_geom_groups
+            .into_iter()
+            .map(|g| (g.refno, g))
+            .collect();
+
+        let mut within = HashSet::<RefnoEnum>::new();
+        for candidate_refno in &candidates {
+            let Some(geom) = candidate_geom_map.get(candidate_refno) else {
+                continue;
+            };
+            let Some(ref world_aabb) = geom.world_aabb else {
+                continue;
+            };
+            let cand_aabb: Aabb = world_aabb.clone().into();
+            let key_points = extract_aabb_key_points(&cand_aabb);
+            if is_geom_in_panel(&key_points, &panel_meshes, inside_tol) {
+                within.insert(*candidate_refno);
+            }
+        }
+
+        debug!(
+            "🧱 coarse-only 完成: 耗时 {:?}, 结果数 {}",
+            coarse_only_start.elapsed(),
+            within.len()
         );
-        return Ok(within_refnos);
+
+        if debug_enabled {
+            println!(
+                "[room_calc] panel={} coarse_only=true within={}",
+                panel_refno,
+                within.len()
+            );
+        }
+
+        return Ok(within);
     }
 
-    // 步骤 4：细算 - 对每个候选构件进行关键点检测
+    // 步骤 4：细算 - 对每个候选构件执行几何判定（关键点投票 / 凸包任意重叠）
     let fine_start = Instant::now();
     let panel_meshes = Arc::new(panel_meshes);
 
@@ -911,9 +1289,119 @@ async fn cal_room_refnos_with_options(
         );
     }
 
-    let within_refnos: HashSet<RefnoEnum> = if use_convex {
-        #[cfg(feature = "convex-runtime")]
-        {
+    let within_refnos: HashSet<RefnoEnum> = match fine_method {
+        RoomFineMethod::Convex => {
+            #[cfg(feature = "convex-runtime")]
+            {
+                stream::iter(candidates)
+                    .map(|candidate_refno| {
+                        let panel_meshes = panel_meshes.clone();
+                        let candidate_geom_map = candidate_geom_map.clone();
+                        let mesh_dir = mesh_dir.clone();
+                        async move {
+                            let Some(geom) = candidate_geom_map.get(&candidate_refno) else {
+                                return None;
+                            };
+
+                            // 任意重叠判定：点在体内 OR 与边界相交。
+                            // 注意：inst.geo_transform 可能包含缩放，不能用 Isometry 表达；
+                            // 这里直接使用 (world_trans * inst.geo_transform).to_matrix() 把缩放烘进点/凸体。
+                            let mut had_convex_error = false;
+                            for inst in &geom.insts {
+                                let convex_rt = match crate::fast_model::convex_decomp::load_or_build_convex_runtime(
+                                    mesh_dir.as_path(),
+                                    &inst.geo_hash,
+                                )
+                                .await
+                                {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        had_convex_error = true;
+                                        if debug_enabled {
+                                            warn!(
+                                                "[room_calc] candidate={} 凸分解不可用: geo_hash={}, error={}",
+                                                candidate_refno, inst.geo_hash, e
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                };
+
+                                let comp_mat = (geom.world_trans * inst.geo_transform).to_matrix();
+                                if crate::fast_model::convex_decomp::component_overlaps_room(
+                                    panel_meshes.as_ref(),
+                                    &panel_aabb,
+                                    &comp_mat,
+                                    convex_rt.as_ref(),
+                                    inside_tol,
+                                ) {
+                                    return Some(candidate_refno);
+                                }
+                            }
+
+                            // 凸分解缺失/损坏/生成失败时，按配置回退到“关键点投票”。
+                            if had_convex_error && convex_fallback == ConvexFallback::KeyPoints {
+                                let key_points = extract_candidate_key_points_from_geom(
+                                    &mesh_dir,
+                                    candidate_refno,
+                                    geom,
+                                    keypoint_max_samples_per_mesh,
+                                    keypoint_max_total_points,
+                                    debug_enabled,
+                                )
+                                .await;
+                                if is_geom_in_panel(&key_points, panel_meshes.as_ref(), inside_tol) {
+                                    return Some(candidate_refno);
+                                }
+                            }
+
+                            None
+                        }
+                    })
+                    .buffer_unordered(options.candidate_concurrency.max(1))
+                    .filter_map(|item| async move { item })
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect()
+            }
+            #[cfg(not(feature = "convex-runtime"))]
+            {
+                // 未启用 convex-runtime 时，自动降级到关键点投票（从真实 TriMesh 采样）
+                stream::iter(candidates)
+                    .map(|candidate_refno| {
+                        let panel_meshes = panel_meshes.clone();
+                        let candidate_geom_map = candidate_geom_map.clone();
+                        let mesh_dir = mesh_dir.clone();
+                        async move {
+                            let Some(geom) = candidate_geom_map.get(&candidate_refno) else {
+                                return None;
+                            };
+                            let key_points = extract_candidate_key_points_from_geom(
+                                &mesh_dir,
+                                candidate_refno,
+                                geom,
+                                keypoint_max_samples_per_mesh,
+                                keypoint_max_total_points,
+                                debug_enabled,
+                            )
+                            .await;
+                            if is_geom_in_panel(&key_points, panel_meshes.as_ref(), inside_tol) {
+                                Some(candidate_refno)
+                            } else {
+                                None
+                            }
+                        }
+                    })
+                    .buffer_unordered(options.candidate_concurrency.max(1))
+                    .filter_map(|item| async move { item })
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect()
+            }
+        }
+        RoomFineMethod::KeyPoints => {
             stream::iter(candidates)
                 .map(|candidate_refno| {
                     let panel_meshes = panel_meshes.clone();
@@ -924,65 +1412,16 @@ async fn cal_room_refnos_with_options(
                             return None;
                         };
 
-                        // 任意重叠判定：点在体内 OR 与边界相交。
-                        // 注意：inst.geo_transform 可能包含缩放，不能用 Isometry 表达；
-                        // 这里直接使用 (world_trans * inst.geo_transform).to_matrix() 把缩放烘进点/凸体。
-                        let mut had_convex_error = false;
-                        for inst in &geom.insts {
-                            let convex_rt = match crate::fast_model::convex_decomp::load_or_build_convex_runtime(
-                                mesh_dir.as_path(),
-                                &inst.geo_hash,
-                            )
-                            .await
-                            {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    had_convex_error = true;
-                                    continue;
-                                }
-                            };
+                        let key_points = extract_candidate_key_points_from_geom(
+                            &mesh_dir,
+                            candidate_refno,
+                            geom,
+                            keypoint_max_samples_per_mesh,
+                            keypoint_max_total_points,
+                            debug_enabled,
+                        )
+                        .await;
 
-                            let comp_mat = (geom.world_trans * inst.geo_transform).to_matrix();
-                            if crate::fast_model::convex_decomp::component_overlaps_room(
-                                panel_meshes.as_ref(),
-                                &panel_aabb,
-                                &comp_mat,
-                                convex_rt.as_ref(),
-                                inside_tol,
-                            ) {
-                                return Some(candidate_refno);
-                            }
-                        }
-
-                        // 兜底：当凸分解不可用（文件缺失/损坏/生成失败）且允许 fallback 时，回退旧逻辑。
-                        if had_convex_error && allow_aabb_fallback {
-                            let key_points = extract_geom_key_points(std::slice::from_ref(geom));
-                            if is_geom_in_panel(&key_points, panel_meshes.as_ref(), inside_tol) {
-                                return Some(candidate_refno);
-                            }
-                        }
-
-                        None
-                    }
-                })
-                .buffer_unordered(options.candidate_concurrency.max(1))
-                .filter_map(|item| async move { item })
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .collect()
-        }
-        #[cfg(not(feature = "convex-runtime"))]
-        {
-            stream::iter(candidates)
-                .map(|candidate_refno| {
-                    let panel_meshes = panel_meshes.clone();
-                    let candidate_geom_map = candidate_geom_map.clone();
-                    async move {
-                        let Some(geom) = candidate_geom_map.get(&candidate_refno) else {
-                            return None;
-                        };
-                        let key_points = extract_geom_key_points(std::slice::from_ref(geom));
                         if is_geom_in_panel(&key_points, panel_meshes.as_ref(), inside_tol) {
                             Some(candidate_refno)
                         } else {
@@ -997,32 +1436,6 @@ async fn cal_room_refnos_with_options(
                 .into_iter()
                 .collect()
         }
-    } else {
-        stream::iter(candidates)
-            .map(|candidate_refno| {
-                let panel_meshes = panel_meshes.clone();
-                let candidate_geom_map = candidate_geom_map.clone();
-                async move {
-                    let Some(geom) = candidate_geom_map.get(&candidate_refno) else {
-                        return None;
-                    };
-                    // 提取候选构件的关键点
-                    let key_points = extract_geom_key_points(std::slice::from_ref(geom));
-
-                    // 判断关键点是否在面板内
-                    if is_geom_in_panel(&key_points, panel_meshes.as_ref(), inside_tol) {
-                        Some(candidate_refno)
-                    } else {
-                        None
-                    }
-                }
-            })
-            .buffer_unordered(options.candidate_concurrency.max(1))
-            .filter_map(|item| async move { item })
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect()
     };
 
     debug!(
@@ -1229,70 +1642,67 @@ fn merge_aabb(a: &Aabb, b: &Aabb) -> Aabb {
     Aabb::new(mins, maxs)
 }
 
-/// 从 AABB 提取增强关键点
-/// 包括：8个顶点 + 中心点 + 6个面中心 + 12条边中点
-fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
-    let mut points = Vec::with_capacity(27);
+fn aabb_contains_aabb_with_tol(panel: &Aabb, cand: &Aabb, tol: f32) -> bool {
+    let tol = if tol.is_finite() && tol > 0.0 { tol as Real } else { 0.0 };
 
-    // 1. AABB 8个顶点
-    let vertices = aabb.vertices();
-    points.extend_from_slice(&vertices);
-
-    // 2. 中心点
-    points.push(aabb.center());
-
-    // 3. 6个面的中心点
-    let mins = &aabb.mins;
-    let maxs = &aabb.maxs;
-    let cx = (mins.x + maxs.x) / 2.0;
-    let cy = (mins.y + maxs.y) / 2.0;
-    let cz = (mins.z + maxs.z) / 2.0;
-
-    points.push(Point::new(mins.x, cy, cz)); // 左面中心
-    points.push(Point::new(maxs.x, cy, cz)); // 右面中心
-    points.push(Point::new(cx, mins.y, cz)); // 前面中心
-    points.push(Point::new(cx, maxs.y, cz)); // 后面中心
-    points.push(Point::new(cx, cy, mins.z)); // 下面中心
-    points.push(Point::new(cx, cy, maxs.z)); // 上面中心
-
-    // 4. 12条边的中点
-    // 底面4条边
-    points.push(Point::from((vertices[0].coords + vertices[1].coords) / 2.0));
-    points.push(Point::from((vertices[1].coords + vertices[3].coords) / 2.0));
-    points.push(Point::from((vertices[3].coords + vertices[2].coords) / 2.0));
-    points.push(Point::from((vertices[2].coords + vertices[0].coords) / 2.0));
-    // 顶面4条边
-    points.push(Point::from((vertices[4].coords + vertices[5].coords) / 2.0));
-    points.push(Point::from((vertices[5].coords + vertices[7].coords) / 2.0));
-    points.push(Point::from((vertices[7].coords + vertices[6].coords) / 2.0));
-    points.push(Point::from((vertices[6].coords + vertices[4].coords) / 2.0));
-    // 竖直4条边
-    points.push(Point::from((vertices[0].coords + vertices[4].coords) / 2.0));
-    points.push(Point::from((vertices[1].coords + vertices[5].coords) / 2.0));
-    points.push(Point::from((vertices[2].coords + vertices[6].coords) / 2.0));
-    points.push(Point::from((vertices[3].coords + vertices[7].coords) / 2.0));
-
-    points
+    cand.mins.x >= panel.mins.x - tol
+        && cand.mins.y >= panel.mins.y - tol
+        && cand.mins.z >= panel.mins.z - tol
+        && cand.maxs.x <= panel.maxs.x + tol
+        && cand.maxs.y <= panel.maxs.y + tol
+        && cand.maxs.z <= panel.maxs.z + tol
 }
 
-/// 从几何体实例提取增强关键点
-/// 
-/// 优先使用 GeomInstQuery 的 pts 字段（实际几何关键点），
-/// 如果 pts 为空则使用 AABB 增强关键点作为回退
-fn extract_geom_key_points(geom_insts: &[GeomInstQuery]) -> Vec<Point<Real>> {
-    let mut all_points = Vec::with_capacity(geom_insts.len() * 30);
+/// 从 AABB 提取 27 个关键点：8 顶点 + 1 中心 + 6 面中心 + 12 边中点。
+fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
+    let min = aabb.mins;
+    let max = aabb.maxs;
+    let cx = (min.x + max.x) * 0.5;
+    let cy = (min.y + max.y) * 0.5;
+    let cz = (min.z + max.z) * 0.5;
 
-    for geom_inst in geom_insts {
-        // 跳过没有 world_aabb 的实例
-        let Some(ref world_aabb) = geom_inst.world_aabb else { continue };
+    let mut pts = Vec::with_capacity(27);
 
-        // 使用 AABB 增强关键点
-        let aabb: Aabb = world_aabb.clone().into();
-        let points = extract_aabb_key_points(&aabb);
-        all_points.extend(points);
-    }
+    // 8 corners
+    pts.push(Point::new(min.x, min.y, min.z));
+    pts.push(Point::new(max.x, min.y, min.z));
+    pts.push(Point::new(max.x, max.y, min.z));
+    pts.push(Point::new(min.x, max.y, min.z));
+    pts.push(Point::new(min.x, min.y, max.z));
+    pts.push(Point::new(max.x, min.y, max.z));
+    pts.push(Point::new(max.x, max.y, max.z));
+    pts.push(Point::new(min.x, max.y, max.z));
 
-    all_points
+    // center
+    pts.push(Point::new(cx, cy, cz));
+
+    // 6 face centers
+    pts.push(Point::new(cx, cy, min.z));
+    pts.push(Point::new(cx, cy, max.z));
+    pts.push(Point::new(cx, min.y, cz));
+    pts.push(Point::new(cx, max.y, cz));
+    pts.push(Point::new(min.x, cy, cz));
+    pts.push(Point::new(max.x, cy, cz));
+
+    // 12 edge midpoints
+    // edges along X
+    pts.push(Point::new(cx, min.y, min.z));
+    pts.push(Point::new(cx, max.y, min.z));
+    pts.push(Point::new(cx, min.y, max.z));
+    pts.push(Point::new(cx, max.y, max.z));
+    // edges along Y
+    pts.push(Point::new(min.x, cy, min.z));
+    pts.push(Point::new(max.x, cy, min.z));
+    pts.push(Point::new(min.x, cy, max.z));
+    pts.push(Point::new(max.x, cy, max.z));
+    // edges along Z
+    pts.push(Point::new(min.x, min.y, cz));
+    pts.push(Point::new(min.x, max.y, cz));
+    pts.push(Point::new(max.x, min.y, cz));
+    pts.push(Point::new(max.x, max.y, cz));
+
+    debug_assert_eq!(pts.len(), 27);
+    pts
 }
 
 /// 从 TriMesh 顶点采样关键点
@@ -1336,6 +1746,61 @@ fn extract_key_points_from_mesh(mesh: &TriMesh, max_samples: usize) -> Vec<Point
     }
     
     key_points
+}
+
+/// 方案A：从候选构件的真实几何 TriMesh 采样关键点（用于点包含投票）
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn extract_candidate_key_points_from_geom(
+    mesh_dir: &PathBuf,
+    element_refno: RefnoEnum,
+    geom: &GeomInstQuery,
+    max_samples_per_mesh: usize,
+    max_total_points: usize,
+    debug_enabled: bool,
+) -> Vec<Point<Real>> {
+    if geom.insts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::<Point<Real>>::new();
+    for inst in &geom.insts {
+        if out.len() >= max_total_points {
+            break;
+        }
+
+        let mesh = match load_geometry_with_enhanced_cache(
+            mesh_dir,
+            &inst.geo_hash,
+            geom.world_trans,
+            inst,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                if debug_enabled {
+                    warn!(
+                        "[room_calc] candidate={} 加载几何失败: geo_hash={}, error={}",
+                        element_refno, inst.geo_hash, e
+                    );
+                }
+                continue;
+            }
+        };
+
+        let mut pts = extract_key_points_from_mesh(mesh.as_ref(), max_samples_per_mesh.max(1));
+        if pts.is_empty() {
+            continue;
+        }
+
+        let remain = max_total_points.saturating_sub(out.len());
+        if pts.len() > remain {
+            pts.truncate(remain);
+        }
+        out.extend(pts);
+    }
+
+    out
 }
 
 /// 判断关键点是否在面板 TriMesh 内
@@ -1639,159 +2104,52 @@ mod tests {
     // 测试套件 3: 关键点提取测试
     // ============================================================================
 
-    /// 验证 AABB 关键点数量为 27
-    #[test]
-    fn test_extract_aabb_key_points_count() {
-        let aabb = Aabb::new(
-            Point::new(0.0, 0.0, 0.0),
-            Point::new(10.0, 10.0, 10.0),
-        );
-        let points = extract_aabb_key_points(&aabb);
-        
-        // 27 = 8顶点 + 1中心 + 6面中心 + 12边中点
-        assert_eq!(points.len(), 27, "应该生成 27 个关键点");
+    fn assert_close(a: Real, b: Real, eps: Real) {
+        assert!((a - b).abs() <= eps, "assert_close failed: a={} b={} eps={}", a, b, eps);
     }
 
-    /// 验证 8 个顶点坐标正确
+    /// 验证 TriMesh 关键点采样：小 mesh 时包含所有顶点 + 质心
     #[test]
-    fn test_extract_aabb_key_points_vertices() {
-        let aabb = Aabb::new(
-            Point::new(0.0, 0.0, 0.0),
-            Point::new(10.0, 20.0, 30.0),
-        );
-        let points = extract_aabb_key_points(&aabb);
-        
-        // 前 8 个是顶点
-        let vertices: Vec<_> = points.iter().take(8).collect();
-        
-        // 验证所有顶点坐标在边界上
-        for v in &vertices {
-            assert!(
-                (v.x == 0.0 || v.x == 10.0) &&
-                (v.y == 0.0 || v.y == 20.0) &&
-                (v.z == 0.0 || v.z == 30.0),
-                "顶点 {:?} 应在 AABB 边界上", v
-            );
+    fn test_extract_key_points_from_mesh_small_mesh_all_vertices() {
+        let mesh = create_test_cube_trimesh(Point::new(0.0, 0.0, 0.0), Point::new(10.0, 10.0, 10.0));
+        let points = extract_key_points_from_mesh(&mesh, 256);
+
+        // 1 个质心 + 8 个顶点
+        assert_eq!(points.len(), 9);
+        let c = points[0];
+        assert_close(c.x, 5.0, 1e-6);
+        assert_close(c.y, 5.0, 1e-6);
+        assert_close(c.z, 5.0, 1e-6);
+    }
+
+    /// 验证 TriMesh 关键点采样：大 mesh 时遵守 max_samples
+    #[test]
+    fn test_extract_key_points_from_mesh_large_mesh_respects_max_samples() {
+        let mut vertices = Vec::<Point<Real>>::with_capacity(300);
+        for i in 0..300usize {
+            vertices.push(Point::new(i as Real, 0.0, 0.0));
         }
-    }
 
-    /// 验证中心点坐标正确
-    #[test]
-    fn test_extract_aabb_key_points_center() {
-        let aabb = Aabb::new(
-            Point::new(0.0, 0.0, 0.0),
-            Point::new(10.0, 20.0, 30.0),
-        );
-        let points = extract_aabb_key_points(&aabb);
-        
-        // 第 9 个点是中心点 (索引 8)
-        let center = &points[8];
-        assert_eq!(center.x, 5.0, "中心点 X 坐标应为 5.0");
-        assert_eq!(center.y, 10.0, "中心点 Y 坐标应为 10.0");
-        assert_eq!(center.z, 15.0, "中心点 Z 坐标应为 15.0");
-    }
-
-    /// 验证 6 个面中心坐标正确
-    #[test]
-    fn test_extract_aabb_key_points_face_centers() {
-        let aabb = Aabb::new(
-            Point::new(0.0, 0.0, 0.0),
-            Point::new(10.0, 20.0, 30.0),
-        );
-        let points = extract_aabb_key_points(&aabb);
-        
-        // 面中心点从索引 9 开始，共 6 个
-        let face_centers: Vec<_> = points.iter().skip(9).take(6).collect();
-        
-        // 左面中心 (x=0)
-        assert_eq!(face_centers[0].x, 0.0);
-        assert_eq!(face_centers[0].y, 10.0);
-        assert_eq!(face_centers[0].z, 15.0);
-        
-        // 右面中心 (x=10)
-        assert_eq!(face_centers[1].x, 10.0);
-        assert_eq!(face_centers[1].y, 10.0);
-        assert_eq!(face_centers[1].z, 15.0);
-        
-        // 前面中心 (y=0)
-        assert_eq!(face_centers[2].x, 5.0);
-        assert_eq!(face_centers[2].y, 0.0);
-        assert_eq!(face_centers[2].z, 15.0);
-        
-        // 后面中心 (y=20)
-        assert_eq!(face_centers[3].x, 5.0);
-        assert_eq!(face_centers[3].y, 20.0);
-        assert_eq!(face_centers[3].z, 15.0);
-        
-        // 下面中心 (z=0)
-        assert_eq!(face_centers[4].x, 5.0);
-        assert_eq!(face_centers[4].y, 10.0);
-        assert_eq!(face_centers[4].z, 0.0);
-        
-        // 上面中心 (z=30)
-        assert_eq!(face_centers[5].x, 5.0);
-        assert_eq!(face_centers[5].y, 10.0);
-        assert_eq!(face_centers[5].z, 30.0);
-    }
-
-    /// 验证 12 条边中点坐标正确
-    #[test]
-    fn test_extract_aabb_key_points_edge_midpoints() {
-        let aabb = Aabb::new(
-            Point::new(0.0, 0.0, 0.0),
-            Point::new(10.0, 10.0, 10.0),
-        );
-        let points = extract_aabb_key_points(&aabb);
-        
-        // 边中点从索引 15 开始，共 12 个
-        let edge_midpoints: Vec<_> = points.iter().skip(15).take(12).collect();
-        
-        assert_eq!(edge_midpoints.len(), 12, "应该有 12 个边中点");
-        
-        // 验证所有边中点都是有效坐标
-        for (i, mp) in edge_midpoints.iter().enumerate() {
-            assert!(
-                mp.x >= 0.0 && mp.x <= 10.0 &&
-                mp.y >= 0.0 && mp.y <= 10.0 &&
-                mp.z >= 0.0 && mp.z <= 10.0,
-                "边中点 {} {:?} 应在 AABB 范围内", i, mp
-            );
+        let mut indices = Vec::<[u32; 3]>::new();
+        for i in (0..297u32).step_by(3) {
+            indices.push([i, i + 1, i + 2]);
         }
-    }
 
-    /// 测试零尺寸 AABB 的关键点提取
-    #[test]
-    fn test_extract_aabb_key_points_zero_size() {
-        let aabb = Aabb::new(
-            Point::new(5.0, 5.0, 5.0),
-            Point::new(5.0, 5.0, 5.0),
-        );
-        let points = extract_aabb_key_points(&aabb);
-        
-        // 所有点都应该在同一位置
-        for point in &points {
-            assert_eq!(point.x, 5.0);
-            assert_eq!(point.y, 5.0);
-            assert_eq!(point.z, 5.0);
-        }
-    }
+        let mesh = TriMesh::with_flags(
+            vertices,
+            indices,
+            TriMeshFlags::ORIENTED | TriMeshFlags::MERGE_DUPLICATE_VERTICES,
+        )
+        .unwrap();
 
-    /// 测试负坐标 AABB 的关键点提取
-    #[test]
-    fn test_extract_aabb_key_points_negative_coords() {
-        let aabb = Aabb::new(
-            Point::new(-10.0, -20.0, -30.0),
-            Point::new(10.0, 20.0, 30.0),
-        );
-        let points = extract_aabb_key_points(&aabb);
-        
-        assert_eq!(points.len(), 27);
-        
-        // 中心点应在原点
-        let center = &points[8];
-        assert_eq!(center.x, 0.0);
-        assert_eq!(center.y, 0.0);
-        assert_eq!(center.z, 0.0);
+        let points = extract_key_points_from_mesh(&mesh, 32);
+        assert_eq!(points.len(), 33, "应为 1 个质心 + 32 个采样点");
+
+        // 质心 x 应约为 (0..299) 的均值 = 149.5
+        let c = points[0];
+        assert_close(c.x, 149.5, 1e-4);
+        assert_close(c.y, 0.0, 1e-6);
+        assert_close(c.z, 0.0, 1e-6);
     }
 
     // ============================================================================
@@ -2032,6 +2390,47 @@ mod tests {
     }
 
     #[test]
+    fn test_aabb_contains_aabb_with_tol() {
+        let panel = Aabb::new(Point::new(0.0, 0.0, 0.0), Point::new(10.0, 10.0, 10.0));
+
+        // 严格包含：true
+        let inside = Aabb::new(Point::new(1.0, 1.0, 1.0), Point::new(9.0, 9.0, 9.0));
+        assert!(aabb_contains_aabb_with_tol(&panel, &inside, 0.0));
+
+        // 边界略超出：无 tol -> false；有 tol -> true
+        let slight_out = Aabb::new(Point::new(1.0, 1.0, 1.0), Point::new(10.05, 9.0, 9.0));
+        assert!(!aabb_contains_aabb_with_tol(&panel, &slight_out, 0.0));
+        assert!(aabb_contains_aabb_with_tol(&panel, &slight_out, 0.1));
+
+        // 明显超出：有 tol 也应 false
+        let far_out = Aabb::new(Point::new(1.0, 1.0, 1.0), Point::new(10.2, 9.0, 9.0));
+        assert!(!aabb_contains_aabb_with_tol(&panel, &far_out, 0.1));
+
+        // 非法 tol（负数/NaN）按 0 处理：不应误判为 true
+        assert!(!aabb_contains_aabb_with_tol(&panel, &slight_out, -1.0));
+        assert!(!aabb_contains_aabb_with_tol(&panel, &slight_out, f32::NAN));
+    }
+
+    #[test]
+    fn test_extract_aabb_key_points_count_and_basic_positions() {
+        let aabb = Aabb::new(Point::new(0.0, 0.0, 0.0), Point::new(10.0, 20.0, 30.0));
+        let pts = extract_aabb_key_points(&aabb);
+        assert_eq!(pts.len(), 27);
+
+        // corners
+        assert!(pts.contains(&Point::new(0.0, 0.0, 0.0)));
+        assert!(pts.contains(&Point::new(10.0, 20.0, 30.0)));
+
+        // center
+        assert!(pts.contains(&Point::new(5.0, 10.0, 15.0)));
+
+        // a face center sample
+        assert!(pts.contains(&Point::new(5.0, 10.0, 0.0)));
+        assert!(pts.contains(&Point::new(5.0, 0.0, 15.0)));
+        assert!(pts.contains(&Point::new(0.0, 10.0, 15.0)));
+    }
+
+    #[test]
     fn test_default_room_concurrency() {
         let concurrency = default_room_concurrency();
         // 默认值应该是 4（如果没有设置环境变量）
@@ -2087,76 +2486,8 @@ mod tests {
     }
 
     // ============================================================================
-    // 测试套件 9: 几何实例关键点提取测试
-    // ============================================================================
-
-    /// 测试多个几何实例的关键点合并
-    #[test]
-    fn test_extract_geom_key_points_multiple_instances() {
-        // 创建模拟的 GeomInstQuery 数据比较复杂，这里用 AABB 测试逻辑
-        let aabb1 = Aabb::new(
-            Point::new(0.0, 0.0, 0.0),
-            Point::new(10.0, 10.0, 10.0),
-        );
-        let aabb2 = Aabb::new(
-            Point::new(20.0, 20.0, 20.0),
-            Point::new(30.0, 30.0, 30.0),
-        );
-        
-        let points1 = extract_aabb_key_points(&aabb1);
-        let points2 = extract_aabb_key_points(&aabb2);
-        
-        // 两个 AABB 应该各有 27 个点
-        assert_eq!(points1.len(), 27);
-        assert_eq!(points2.len(), 27);
-        
-        // 合并后应该有 54 个点
-        let mut all_points = Vec::new();
-        all_points.extend(points1);
-        all_points.extend(points2);
-        assert_eq!(all_points.len(), 54);
-    }
-
-    // ============================================================================
     // 测试套件 10: 边界条件和异常情况测试
     // ============================================================================
-
-    /// 测试非常大的 AABB
-    #[test]
-    fn test_extract_aabb_key_points_large_aabb() {
-        let aabb = Aabb::new(
-            Point::new(-1e6, -1e6, -1e6),
-            Point::new(1e6, 1e6, 1e6),
-        );
-        let points = extract_aabb_key_points(&aabb);
-        
-        assert_eq!(points.len(), 27);
-        
-        // 中心应该在原点
-        let center = &points[8];
-        assert!((center.x - 0.0).abs() < 1e-6);
-        assert!((center.y - 0.0).abs() < 1e-6);
-        assert!((center.z - 0.0).abs() < 1e-6);
-    }
-
-    /// 测试非常小的 AABB
-    #[test]
-    fn test_extract_aabb_key_points_tiny_aabb() {
-        let aabb = Aabb::new(
-            Point::new(0.0, 0.0, 0.0),
-            Point::new(1e-6, 1e-6, 1e-6),
-        );
-        let points = extract_aabb_key_points(&aabb);
-        
-        assert_eq!(points.len(), 27);
-        
-        // 所有点应该非常接近
-        for point in &points {
-            assert!(point.x >= 0.0 && point.x <= 1e-6);
-            assert!(point.y >= 0.0 && point.y <= 1e-6);
-            assert!(point.z >= 0.0 && point.z <= 1e-6);
-        }
-    }
 
     /// 测试单个表面点应该通过
     #[test]
@@ -2276,6 +2607,8 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
     let room_key_words = db_option.get_room_key_word();
     let compute_options = RoomComputeOptions::default();
 
+    ensure_room_calc_cache_env(db_option);
+
     // 1. 查询房间面板关系
     if let Some(ref cb) = progress_callback {
         cb(0.05, "查询所有房间面板映射关系");
@@ -2308,6 +2641,13 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
         .iter()
         .flat_map(|(_, _, panels)| panels.clone())
         .collect();
+
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        feature = "sqlite-index",
+        feature = "gen_model"
+    ))]
+    pregen_room_panels_into_foyer_cache(db_option, &room_panel_map).await?;
 
     let stats = compute_room_relations_with_cancel(
         &mesh_dir,
@@ -2358,6 +2698,7 @@ pub async fn update_room_relations_incremental_original(
     // 3. 重新计算并保存新关系
     let db_option = aios_core::get_db_option();
     let mesh_dir = db_option.get_meshes_path();
+    ensure_room_calc_cache_env(&db_option);
 
     // 获取所有房间面板（用于排除）
     let room_key_words = db_option.get_room_key_word();
@@ -2558,6 +2899,8 @@ pub async fn rebuild_room_relations_for_rooms(
     let room_key_words = db_option.get_room_key_word();
     let compute_options = RoomComputeOptions::default();
 
+    ensure_room_calc_cache_env(db_option);
+
     // 1. 查询房间面板关系
     let mut room_panel_map = build_room_panels_relate(&room_key_words).await?;
 
@@ -2599,6 +2942,13 @@ pub async fn rebuild_room_relations_for_rooms(
     info!("已删除 {} 个面板的旧关系", panels_to_delete.len());
 
     CACHE_METRICS.reset();
+
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        feature = "sqlite-index",
+        feature = "gen_model"
+    ))]
+    pregen_room_panels_into_foyer_cache(db_option, &room_panel_map).await?;
 
     let stats = compute_room_relations(
         &mesh_dir,

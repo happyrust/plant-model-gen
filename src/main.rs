@@ -520,6 +520,37 @@ async fn main() -> anyhow::Result<()> {
                 .value_delimiter(',')
                 .num_args(1..),
         )
+        // ========== 缓存清理命令 ==========
+        .arg(
+            Arg::new("clean-cache")
+                .long("clean-cache")
+                .help("清理 foyer instance_cache 缓存数据")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("clean-cache-dbnums")
+                .long("clean-cache-dbnums")
+                .help("指定要清理的 dbnum 列表（逗号分隔）")
+                .value_delimiter(',')
+                .value_parser(clap::value_parser!(u32))
+                .requires("clean-cache"),
+        )
+        .arg(
+            Arg::new("clean-cache-refnos")
+                .long("clean-cache-refnos")
+                .help("指定要清理的 refno 列表（逗号分隔）")
+                .value_delimiter(',')
+                .value_parser(clap::value_parser!(u64))
+                .requires("clean-cache")
+                .conflicts_with("clean-cache-dbnums"),
+        )
+        .arg(
+            Arg::new("clean-cache-all")
+                .long("clean-cache-all")
+                .help("清理所有缓存数据")
+                .action(clap::ArgAction::SetTrue)
+                .requires("clean-cache"),
+        )
         // ========== pe_transform 刷新命令 ==========
         .arg(
             Arg::new("refresh-transform")
@@ -612,6 +643,55 @@ async fn main() -> anyhow::Result<()> {
             "✅ flush-cache-to-db 完成：cache_dir={} flushed_dbnums={}",
             cache_dir.display(),
             flushed
+        );
+        return Ok(());
+    }
+
+    // ========== 缓存清理命令 ==========
+    if matches.get_flag("clean-cache") {
+        let cache_dir = db_option_ext.get_foyer_cache_dir();
+        let verbose = matches.get_flag("verbose");
+
+        println!("\n🧹 clean-cache: 清理 foyer instance_cache 缓存数据");
+        println!("   缓存目录: {}", cache_dir.display());
+
+        let stats = if matches.get_flag("clean-cache-all") {
+            // 清理所有缓存
+            println!("   模式: 清理所有缓存");
+            aios_database::fast_model::cache_clean::clean_all_cache(&cache_dir, verbose).await?
+        } else if let Some(dbnums) = matches.get_many::<u32>("clean-cache-dbnums") {
+            // 按 dbnum 清理
+            let dbnums: Vec<u32> = dbnums.copied().collect();
+            println!("   模式: 按 dbnum 清理，目标: {:?}", dbnums);
+            aios_database::fast_model::cache_clean::clean_cache_by_dbnum(
+                &cache_dir, &dbnums, verbose,
+            ).await?
+        } else if let Some(refnos) = matches.get_many::<u64>("clean-cache-refnos") {
+            // 按 refno 清理（需要初始化 db_meta）
+            let refnos: Vec<aios_core::RefnoEnum> = refnos
+                .map(|&r| aios_core::RefnoEnum::from(aios_core::RefU64(r)))
+                .collect();
+            println!("   模式: 按 refno 清理，目标: {:?}", refnos);
+
+            // 初始化 db_meta 以解析 refno -> dbnum
+            init_surreal().await?;
+            aios_database::fast_model::cache_clean::clean_cache_by_refno(
+                &cache_dir, &refnos, verbose,
+            ).await?
+        } else {
+            // 未指定清理目标，提示用户
+            println!("⚠️ 请指定清理目标：");
+            println!("   --clean-cache-all          清理所有缓存");
+            println!("   --clean-cache-dbnums 1,2   按 dbnum 清理");
+            println!("   --clean-cache-refnos 123   按 refno 清理");
+            return Ok(());
+        };
+
+        println!(
+            "✅ 缓存清理完成：移除 {} 个 batch，影响 {} 个 dbnum: {:?}",
+            stats.instance_batches_removed,
+            stats.dbnums_affected.len(),
+            stats.dbnums_affected
         );
         return Ok(());
     }

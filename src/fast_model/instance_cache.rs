@@ -239,6 +239,34 @@ impl InstanceCacheManager {
         index.by_dbnum.keys().copied().collect()
     }
 
+    /// 删除指定 dbnum 下的所有 batch 数据
+    pub fn remove_dbnum(&self, dbnum: u32) -> usize {
+        let batch_ids = self.list_batches(dbnum);
+        let count = batch_ids.len();
+
+        for batch_id in &batch_ids {
+            let key = InstanceCacheKey {
+                dbnum,
+                batch_id: batch_id.clone(),
+            };
+            self.cache.remove(&key);
+        }
+
+        // 从索引中移除整个 dbnum
+        if let Err(e) = self.remove_dbnum_from_index(dbnum) {
+            eprintln!("[cache] 更新索引失败: dbnum={}, err={}", dbnum, e);
+        }
+
+        count
+    }
+
+    fn remove_dbnum_from_index(&self, dbnum: u32) -> anyhow::Result<()> {
+        let mut index = self.index.lock().expect("cache index lock poisoned");
+        index.by_dbnum.remove(&dbnum);
+        index.by_dbnum_set.remove(&dbnum);
+        self.save_index_locked(&index)
+    }
+
     /// 批量获取指定 refno 列表的 ptset_map（ARRIVE/LEAVE 点）
     /// 返回 HashMap<RefnoEnum, [CateAxisParam; 2]>，其中 [0]=ARRIVE(ptset[1]), [1]=LEAVE(ptset[2])
     pub async fn get_ptset_maps_for_refnos(

@@ -83,6 +83,12 @@ impl TransformCacheManager {
         }
     }
 
+    /// 删除指定 key 的 transform 缓存
+    pub fn remove(&self, dbnum: u32, refno: RefnoEnum) {
+        let key = TransformCacheKey { dbnum, refno };
+        self.cache.remove(&key);
+    }
+
     pub fn insert_world_transform(&self, dbnum: u32, refno: RefnoEnum, world: Transform) {
         let key = TransformCacheKey { dbnum, refno };
         let item = CachedWorldTransform {

@@ -58,6 +58,7 @@ pub mod instance_cache;
 pub mod transform_cache;
 pub mod foyer_cache;
 pub mod cache_flush;
+pub mod cache_clean;
 
 pub mod utils;
 pub mod precheck;

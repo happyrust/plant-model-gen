@@ -2474,6 +2474,188 @@ mod tests {
         let result = is_geom_in_panel(&key_points, &panel_meshes, 0.1, &test_floor_2d_config());
         assert!(!result, "两个远点不应该通过（0 >= 2 是 false）");
     }
+
+    // ============================================================================
+    // 测试套件: 射线投射法 (is_point_inside_mesh_raycast)
+    // ============================================================================
+
+    #[test]
+    fn test_raycast_point_inside_closed_box() {
+        let mesh = create_test_cube_trimesh(
+            Point::new(0.0, 0.0, 0.0),
+            Point::new(10.0, 10.0, 10.0),
+        );
+        // 中心点 → 应在内部
+        assert!(is_point_inside_mesh_raycast(&Point::new(5.0, 5.0, 5.0), &mesh));
+        // 偏移但仍在内部
+        assert!(is_point_inside_mesh_raycast(&Point::new(1.0, 1.0, 1.0), &mesh));
+        assert!(is_point_inside_mesh_raycast(&Point::new(9.0, 9.0, 9.0), &mesh));
+    }
+
+    #[test]
+    fn test_raycast_point_outside_closed_box() {
+        let mesh = create_test_cube_trimesh(
+            Point::new(0.0, 0.0, 0.0),
+            Point::new(10.0, 10.0, 10.0),
+        );
+        // 明显在外部的点
+        assert!(!is_point_inside_mesh_raycast(&Point::new(20.0, 5.0, 5.0), &mesh));
+        assert!(!is_point_inside_mesh_raycast(&Point::new(-5.0, 5.0, 5.0), &mesh));
+        assert!(!is_point_inside_mesh_raycast(&Point::new(5.0, 5.0, 20.0), &mesh));
+    }
+
+    // ============================================================================
+    // 测试套件: 距离回退 (is_point_inside_any_mesh 方法B)
+    // ============================================================================
+
+    #[test]
+    fn test_distance_fallback_near_surface() {
+        let mesh = Arc::new(create_test_cube_trimesh(
+            Point::new(0.0, 0.0, 0.0),
+            Point::new(10.0, 10.0, 10.0),
+        ));
+        let panel_meshes = vec![mesh];
+        let floor_2d = test_floor_2d_config();
+        let tol = 0.1_f32;
+        let tol_sq = (tol as Real).powi(2);
+
+        // 点紧贴表面外侧（距离 < tolerance）→ 应通过距离回退
+        let near_point = Point::new(10.05, 5.0, 5.0);
+        assert!(is_point_inside_any_mesh(&near_point, &panel_meshes, tol_sq, &floor_2d));
+    }
+
+    #[test]
+    fn test_distance_fallback_far_from_surface() {
+        let mesh = Arc::new(create_test_cube_trimesh(
+            Point::new(0.0, 0.0, 0.0),
+            Point::new(10.0, 10.0, 10.0),
+        ));
+        let panel_meshes = vec![mesh];
+        let floor_2d = test_floor_2d_config();
+        let tol = 0.1_f32;
+        let tol_sq = (tol as Real).powi(2);
+
+        // 点远离表面（距离 >> tolerance）→ 不应通过
+        let far_point = Point::new(20.0, 5.0, 5.0);
+        assert!(!is_point_inside_any_mesh(&far_point, &panel_meshes, tol_sq, &floor_2d));
+    }
+
+    // ============================================================================
+    // 测试套件: 地板 2D 回退 (is_point_inside_floor_panel_2d)
+    // ============================================================================
+
+    /// 创建一个 Z 方向极薄的面板（模拟地板）
+    fn create_thin_floor_trimesh(x_min: f32, x_max: f32, y_min: f32, y_max: f32, z: f32) -> TriMesh {
+        // Z 方向厚度 0.01，远小于 0.2 阈值
+        create_test_cube_trimesh(
+            Point::new(x_min, y_min, z),
+            Point::new(x_max, y_max, z + 0.01),
+        )
+    }
+
+    #[test]
+    fn test_floor_2d_thin_panel_point_above() {
+        let mesh = create_thin_floor_trimesh(0.0, 10.0, 0.0, 10.0, 0.0);
+        let floor_2d = test_floor_2d_config();
+        let tol = 0.1;
+
+        // XY 在面板内，Z 在面板上方（外延范围内）→ 应通过
+        let point = Point::new(5.0, 5.0, 3.0);
+        assert!(is_point_inside_floor_panel_2d(&point, &mesh, tol, &floor_2d));
+    }
+
+    #[test]
+    fn test_floor_2d_thin_panel_point_outside_xy() {
+        let mesh = create_thin_floor_trimesh(0.0, 10.0, 0.0, 10.0, 0.0);
+        let floor_2d = test_floor_2d_config();
+        let tol = 0.1;
+
+        // XY 在面板外 → 不应通过
+        let point = Point::new(20.0, 5.0, 3.0);
+        assert!(!is_point_inside_floor_panel_2d(&point, &mesh, tol, &floor_2d));
+    }
+
+    #[test]
+    fn test_floor_2d_thick_panel_skipped() {
+        // Z 厚度 > 0.2 的厚面板 → 不走 2D 回退
+        let mesh = create_test_cube_trimesh(
+            Point::new(0.0, 0.0, 0.0),
+            Point::new(10.0, 10.0, 5.0), // Z 厚度 = 5.0 >> 0.2
+        );
+        let floor_2d = test_floor_2d_config();
+        let tol = 0.1;
+
+        // 即使 XY 在面板内，厚面板也不走 2D 回退
+        let point = Point::new(5.0, 5.0, 8.0);
+        assert!(!is_point_inside_floor_panel_2d(&point, &mesh, tol, &floor_2d));
+    }
+
+    #[test]
+    fn test_floor_2d_point_far_below() {
+        let mesh = create_thin_floor_trimesh(0.0, 10.0, 0.0, 10.0, 0.0);
+        let floor_2d = test_floor_2d_config();
+        let tol = 0.1;
+
+        // Z 远低于地板 → 不应通过
+        let point = Point::new(5.0, 5.0, -5.0);
+        assert!(!is_point_inside_floor_panel_2d(&point, &mesh, tol, &floor_2d));
+    }
+
+    // ============================================================================
+    // 测试套件: 投票逻辑边界 (is_geom_in_panel 阈值)
+    // ============================================================================
+
+    #[test]
+    fn test_voting_exact_threshold_27_points() {
+        // 构造 27 个点，恰好 14 个在内 → 应通过（14 >= 14）
+        let panel_meshes = vec![Arc::new(create_test_cube_trimesh(
+            Point::new(0.0, 0.0, 0.0),
+            Point::new(100.0, 100.0, 100.0),
+        ))];
+        let floor_2d = test_floor_2d_config();
+
+        let mut points = Vec::with_capacity(27);
+        // 14 个在内部
+        for i in 0..14 {
+            let v = 10.0 + i as f32 * 5.0;
+            points.push(Point::new(v, v, v));
+        }
+        // 13 个在外部
+        for i in 0..13 {
+            let v = 200.0 + i as f32 * 10.0;
+            points.push(Point::new(v, v, v));
+        }
+        assert_eq!(points.len(), 27);
+
+        let result = is_geom_in_panel(&points, &panel_meshes, 0.1, &floor_2d);
+        assert!(result, "恰好 14/27 在内应通过");
+    }
+
+    #[test]
+    fn test_voting_below_threshold_27_points() {
+        // 构造 27 个点，只有 13 个在内 → 不应通过（13 < 14）
+        let panel_meshes = vec![Arc::new(create_test_cube_trimesh(
+            Point::new(0.0, 0.0, 0.0),
+            Point::new(100.0, 100.0, 100.0),
+        ))];
+        let floor_2d = test_floor_2d_config();
+
+        let mut points = Vec::with_capacity(27);
+        // 13 个在内部
+        for i in 0..13 {
+            let v = 10.0 + i as f32 * 5.0;
+            points.push(Point::new(v, v, v));
+        }
+        // 14 个在外部
+        for i in 0..14 {
+            let v = 200.0 + i as f32 * 10.0;
+            points.push(Point::new(v, v, v));
+        }
+        assert_eq!(points.len(), 27);
+
+        let result = is_geom_in_panel(&points, &panel_meshes, 0.1, &floor_2d);
+        assert!(!result, "只有 13/27 在内不应通过");
+    }
 }
 
 /// 增量更新结果

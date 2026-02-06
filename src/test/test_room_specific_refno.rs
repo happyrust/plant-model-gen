@@ -311,6 +311,243 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[ignore = "需要真实数据库连接 + 本地 meshes（用于加载 panel/candidate TriMesh），手动运行"]
+    async fn test_room_calc_panel_24381_35798_contains_elbow_24381_145019() -> Result<()> {
+        use std::env;
+        use std::fs;
+        use std::path::PathBuf;
+
+        println!("\n🏠 验证 panel 计算能包含指定弯头");
+        println!("{}", "=".repeat(80));
+
+        init_surreal().await.context("初始化 SurrealDB 失败")?;
+
+        let panel_refno_anchor = RefnoEnum::from_str("24381/35798")
+            .map_err(|_| anyhow::anyhow!("无效的 panel refno: 24381/35798"))?;
+        let elbow_refno = RefnoEnum::from_str("24381/145019")
+            .map_err(|_| anyhow::anyhow!("无效的弯头 refno: 24381/145019"))?;
+
+        // 说明：该回归用例旨在验证“房间判定逻辑”对指定 (panel, elbow) 的结论为 true，
+        // 不依赖 SQLite 空间索引的候选枚举（避免 spatial_index.sqlite 不完整导致不稳定）。
+        struct EnvGuard {
+            key: &'static str,
+            old: Option<String>,
+        }
+        impl EnvGuard {
+            fn set_if_missing(key: &'static str, value: String) -> Self {
+                let old = env::var(key).ok();
+                let need_set = old
+                    .as_deref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true);
+                if need_set {
+                    unsafe { env::set_var(key, value) };
+                }
+                Self { key, old }
+            }
+
+            fn set_force(key: &'static str, value: String) -> Self {
+                let old = env::var(key).ok();
+                unsafe { env::set_var(key, &value) };
+                Self {
+                    key,
+                    old,
+                }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.old {
+                        Some(v) => env::set_var(self.key, v),
+                        None => env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+
+        let db_option = get_db_option();
+        // 强制走 DB(inst_relate) 拉取 world_aabb/world_trans，避免依赖本地 foyer cache。
+        let _g_use_cache = EnvGuard::set_force("AIOS_ROOM_USE_CACHE", "0".to_string());
+        // 开启“薄面板→2D 投影”兜底（默认即为 true；此处显式设置以便在现场跑用例时更可控）。
+        let _g_floor_2d =
+            EnvGuard::set_force("ROOM_RELATION_FLOOR_2D_FALLBACK", "1".to_string());
+        // 将空间索引指向“本用例专用”的最小 SQLite 文件，避免依赖全量导入。
+        let tmp_index_path = PathBuf::from("output").join("test_spatial_index_24381_35798.sqlite");
+        if let Some(parent) = tmp_index_path.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        let _g_idx = EnvGuard::set_force(
+            "AIOS_SPATIAL_INDEX_SQLITE",
+            tmp_index_path.to_string_lossy().to_string(),
+        );
+        // 限制候选数，避免误配置导致全量索引时的意外慢。
+        let _g_limit =
+            EnvGuard::set_force("ROOM_RELATION_CANDIDATE_LIMIT", "2000".to_string());
+
+        // 1) 查出锚定 panel 对应的房间号（room_num）。
+        //    优先从 room_panel_relate 反查；若缺失则回退到 “FRMW->SBFR->PANE” 查询。
+        let mut room_num = String::new();
+        {
+            let sql = format!(
+                "SELECT VALUE room_num FROM {}<-room_panel_relate LIMIT 1;",
+                panel_refno_anchor.to_pe_key()
+            );
+            let rows: Vec<String> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+            if let Some(v) = rows.first() {
+                room_num = v.clone();
+            }
+        }
+
+        if room_num.trim().is_empty() {
+            let room_key_words = db_option.get_room_key_word();
+            let room_panel_map =
+                crate::fast_model::room_model::build_room_panels_relate_for_query(&room_key_words)
+                    .await
+                    .context("查询房间面板映射关系失败")?;
+            if let Some((_, rn, _)) = room_panel_map
+                .into_iter()
+                .find(|(_, _, panels)| panels.iter().any(|p| *p == panel_refno_anchor))
+            {
+                room_num = rn;
+            }
+        }
+
+        anyhow::ensure!(!room_num.trim().is_empty(), "无法获取该 panel 的 room_num：panel={}", panel_refno_anchor);
+        println!("🏷️  room_num={}", room_num);
+
+        // 2) 准备最小空间索引：将该弯头的 world_aabb 写入 SQLite RTree，保证粗算候选枚举能“看见”它。
+        //    （实际房间计算依赖 spatial_index.sqlite 做粗筛；若索引不全，会导致候选缺失。）
+        {
+            use crate::sqlite_index::SqliteAabbIndex;
+
+            let elbow_groups = query_insts(&[elbow_refno], true)
+                .await
+                .context("查询 elbow inst 失败（需要 inst_relate/world_aabb）")?;
+            anyhow::ensure!(!elbow_groups.is_empty(), "elbow 未返回几何实例: {}", elbow_refno);
+
+            let mut elbow_aabb: Option<Aabb> = None;
+            for g in &elbow_groups {
+                let Some(ref world_aabb) = g.world_aabb else { continue };
+                let a: Aabb = world_aabb.clone().into();
+                elbow_aabb = Some(match elbow_aabb {
+                    None => a,
+                    Some(acc) => acc.merged(&a),
+                });
+            }
+            let elbow_aabb = elbow_aabb.context("elbow world_aabb 为空，无法写入空间索引")?;
+
+            let idx = SqliteAabbIndex::open(&tmp_index_path)
+                .context("打开/创建临时空间索引 sqlite 失败")?;
+            idx.init_schema().context("初始化临时空间索引 schema 失败")?;
+            idx.insert_many([(
+                elbow_refno.refno().0 as i64,
+                elbow_aabb.mins.x as f64,
+                elbow_aabb.maxs.x as f64,
+                elbow_aabb.mins.y as f64,
+                elbow_aabb.maxs.y as f64,
+                elbow_aabb.mins.z as f64,
+                elbow_aabb.maxs.z as f64,
+            )])
+            .context("写入 elbow AABB 到临时空间索引失败")?;
+        }
+
+        // 3) 断言：通过“生产路径（粗筛 + AABB投票）”能算出 elbow 属于该 panel（也即属于该房间）。
+        //    - 粗筛：SQLite RTree（已写入 elbow）
+        //    - 细算：候选 world_aabb 的 27 点投票（点包含内部会走薄面板 2D 兜底）
+        let mesh_dir = db_option.get_meshes_path();
+        anyhow::ensure!(
+            mesh_dir.exists(),
+            "meshes_path 不存在：{:?}（请先生成/同步对应 meshes）",
+            mesh_dir
+        );
+
+        let inside_tol = 0.1_f32;
+        let exclude = HashSet::<RefnoEnum>::new();
+        let within = crate::fast_model::room_model::cal_room_refnos(
+            &mesh_dir,
+            panel_refno_anchor,
+            &exclude,
+            inside_tol,
+        )
+        .await
+        .context("cal_room_refnos 失败")?;
+
+        let ok = within.contains(&elbow_refno);
+
+        if !ok {
+            let ok_aabb8 = crate::fast_model::room_model::is_refno_in_panel_by_aabb8(
+                &mesh_dir,
+                panel_refno_anchor,
+                elbow_refno,
+                inside_tol,
+            )
+            .await
+            .unwrap_or(false);
+            let ok_vote = crate::fast_model::room_model::is_refno_in_panel_by_aabb_vote(
+                &mesh_dir,
+                panel_refno_anchor,
+                elbow_refno,
+                inside_tol,
+            )
+            .await
+            .unwrap_or(false);
+
+            anyhow::bail!(
+                "房间判定失败：panel={} elbow={} room_num={} aabb_vote={} aabb8_all_in={} aabb27_vote={}（可设置 AIOS_ROOM_DEBUG=1 打印更多细节）",
+                panel_refno_anchor,
+                elbow_refno,
+                room_num,
+                ok,
+                ok_aabb8,
+                ok_vote
+            );
+        }
+
+        // 4) 可选：写入 room_relate（默认不写，避免误污染库；显式设置 AIOS_ROOM_TEST_WRITE_DB=1 才写）。
+        let want_write = env::var("AIOS_ROOM_TEST_WRITE_DB")
+            .ok()
+            .map(|v| v.trim() == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+            .unwrap_or(false);
+        if want_write {
+            let room_num_escaped = room_num.replace('\'', "''");
+            let delete_sql = format!(
+                "DELETE room_relate WHERE `in` = {} AND out = {};",
+                panel_refno_anchor.to_pe_key(),
+                elbow_refno.to_pe_key()
+            );
+            SUL_DB.query(&delete_sql).await?;
+
+            let relation_id = format!("{}_{}", panel_refno_anchor, elbow_refno);
+            let relate_sql = format!(
+                "relate {}->room_relate:{}->{} set room_num='{}', confidence=0.99, created_at=time::now();",
+                panel_refno_anchor.to_pe_key(),
+                relation_id,
+                elbow_refno.to_pe_key(),
+                room_num_escaped
+            );
+            SUL_DB.query(&relate_sql).await?;
+
+            let check_sql = format!(
+                "SELECT VALUE room_num FROM room_relate WHERE `in` = {} AND out = {} LIMIT 1;",
+                panel_refno_anchor.to_pe_key(),
+                elbow_refno.to_pe_key()
+            );
+            let rows: Vec<String> = SUL_DB.query_take(&check_sql, 0).await.unwrap_or_default();
+            anyhow::ensure!(
+                rows.first().map(|s| s.as_str()) == Some(room_num.as_str()),
+                "写库校验失败：room_relate 未找到或 room_num 不匹配：panel={} elbow={} expect_room_num={} got={:?}",
+                panel_refno_anchor,
+                elbow_refno,
+                room_num,
+                rows
+            );
+        }
+
+        Ok(())
+    }
+
     /// 测试 FRMW 和管道的几何信息查询
     #[tokio::test]
     #[ignore = "需要真实数据库连接，手动运行"]

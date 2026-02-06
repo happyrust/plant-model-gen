@@ -30,6 +30,13 @@ impl SqliteSpatialIndex {
     }
 
     pub fn default_path() -> PathBuf {
+        // 允许通过环境变量覆盖默认索引路径，便于测试/现场诊断使用最小索引文件。
+        if let Ok(p) = std::env::var("AIOS_SPATIAL_INDEX_SQLITE") {
+            let p = p.trim();
+            if !p.is_empty() {
+                return PathBuf::from(p);
+            }
+        }
         // 保持相对路径：运行目录通常是仓库根目录
         PathBuf::from("output").join("spatial_index.sqlite")
     }

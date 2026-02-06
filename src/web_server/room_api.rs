@@ -1378,7 +1378,7 @@ async fn execute_room_regenerate(
     update_status(80.0, "正在更新房间关系...".to_string());
 
     let start_time = std::time::Instant::now();
-    match build_room_relations(&db_option_ext).await {
+    match build_room_relations(&db_option_ext, None, None).await {
         Ok(_) => {
             let duration = start_time.elapsed();
             info!("✅ 房间关系更新完成，耗时 {:?}", duration);
@@ -1697,7 +1697,7 @@ pub async fn compute_room_relations_sync(
     let db_option = aios_core::get_db_option();
 
     // 执行房间关系构建
-    match build_room_relations(&db_option).await {
+    match build_room_relations(&db_option, request.db_nums.as_deref(), None).await {
         Ok(stats) => {
             info!(
                 "✅ 房间计算完成: {} 房间, {} 面板, {} 构件, 耗时 {}ms",

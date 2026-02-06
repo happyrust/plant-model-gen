@@ -47,6 +47,7 @@ pub mod wizard_template;
 pub mod parquet_compact_worker;
 pub mod stream_generate; // 流式模型生成模块
 pub mod sqlite_spatial_api;
+pub mod output_instances_files;
 
 use crate::web_api::{
     E3dTreeApiState, NounHierarchyApiState, SpatialQueryApiState, create_e3d_tree_routes,
@@ -54,6 +55,7 @@ use crate::web_api::{
     create_pdms_attr_routes, create_ptset_routes, CollisionApiState, create_collision_routes,
     create_review_integration_routes, create_model_center_routes, create_pipeline_annotation_routes,
     create_mbd_pipe_routes,
+    create_pdms_model_query_routes,
     create_jwt_auth_routes, create_review_api_routes, create_scene_tree_routes,
     create_export_api_routes,
     SearchApiState, create_search_routes,
@@ -252,6 +254,9 @@ pub async fn start_web_server_with_config(
 
     // 初始化 Ptset API
     let ptset_routes = create_ptset_routes();
+
+    // PDMS 模型查询辅助 API（type-info / children），用于前端在无 SurrealDB WS 连接时仍能应用 BRAN/HANG 规则
+    let pdms_model_query_routes = create_pdms_model_query_routes();
 
     let room_worker = room_api::init_room_worker();
     let room_api_state = room_api::RoomApiState {
@@ -789,7 +794,24 @@ pub async fn start_web_server_with_config(
         .route("/api/export/cleanup", post(handlers::cleanup_export_tasks))
         // 静态文件服务
         .nest_service("/static", ServeDir::new("src/web_server/static"))
-        .nest_service("/files/output", ServeDir::new("output"))
+        // /files/output 下的静态文件服务（带 instances 兜底）
+        //
+        // 说明：不能在同一 Router 上同时注册 `/files/output` 的 nest_service 与其子路由，
+        // 否则 axum 会在路由树插入阶段报冲突。因此把“兜底路由 + ServeDir”一起 nest 进去。
+        .nest(
+            "/files/output",
+            Router::new()
+                // instances 文件兜底：兼容 instances_cache_for_index 的落盘结构
+                .route(
+                    "/{project}/instances/{file}",
+                    get(output_instances_files::get_project_instances_file),
+                )
+                .route(
+                    "/instances/{file}",
+                    get(output_instances_files::get_root_instances_file),
+                )
+                .fallback_service(ServeDir::new("output")),
+        )
         .nest_service("/files/output/database_models", ServeDir::new("assets/database_models"))
         .nest_service("/files/database_models", ServeDir::new("assets/database_models"))
         .nest_service("/files/meshes", {
@@ -852,6 +874,7 @@ pub async fn start_web_server_with_config(
         .merge(room_tree_routes)
         .merge(pdms_attr_routes)
         .merge(ptset_routes)
+        .merge(pdms_model_query_routes)
         .merge(room_routes)
         .merge(collision_routes)
         .merge(search_routes)

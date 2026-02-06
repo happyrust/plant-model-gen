@@ -301,7 +301,7 @@ fn ensure_parent_dir(path: &Path) -> io::Result<()> {
 ///
 /// 写入 inst_relate_bool 状态为 Failed
 async fn mark_bool_failed(refno: RefnoEnum) -> anyhow::Result<()> {
-    crate::fast_model::utils::save_inst_relate_bool(refno, None, "Failed", "bool_mesh").await;
+    crate::fast_model::utils::save_inst_relate_bool(refno, None, "Failed", "bool_mesh").await?;
     Ok(())
 }
 
@@ -329,10 +329,10 @@ async fn update_booled_result(
         crate::fast_model::utils::save_inst_relate_aabb(&inst_aabb_map, "bool_mesh").await;
         
         crate::fast_model::utils::save_inst_relate_bool(refno, Some(mesh_id), "Success", "bool_mesh")
-            .await;
+            .await?;
     } else {
         crate::fast_model::utils::save_inst_relate_bool(refno, Some(mesh_id), "Success", "bool_mesh")
-            .await;
+            .await?;
     }
     
     Ok(())

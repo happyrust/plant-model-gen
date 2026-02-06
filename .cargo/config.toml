@@ -30,3 +30,11 @@ codegen-backend = "cranelift"
 
 [profile.dev.package."*"]
 codegen-backend = "llvm"
+
+[profile.test]
+# 单测/集成测试在 Windows + cranelift 下更易触发内存/链接异常；
+# 统一改用 llvm，换稳定与可诊断性。
+codegen-backend = "llvm"
+
+[profile.test.package."*"]
+codegen-backend = "llvm"

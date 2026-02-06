@@ -10,7 +10,8 @@ use aios_core::RefnoEnum;
 use axum::{
     Router,
     extract::{Path, Query},
-    response::IntoResponse,
+    http::{HeaderValue, header::CONTENT_TYPE},
+    response::{IntoResponse, Response},
     routing::get,
     Json,
 };
@@ -49,6 +50,12 @@ pub struct MbdPipeQuery {
     pub max_slope: f32,
     /// 最小尺寸长度（mm）
     pub dim_min_length: f32,
+    /// 是否额外输出“焊口链式尺寸”（包含两端）到 dims 数组（kind=chain）
+    pub include_chain_dims: bool,
+    /// 是否额外输出“总长尺寸”（kind=overall）到 dims 数组
+    pub include_overall_dim: bool,
+    /// 是否额外输出“端口间距尺寸”（优先用 arrive_axis_pt/leave_axis_pt；kind=port）到 dims 数组
+    pub include_port_dims: bool,
     /// 焊缝合并阈值（mm）：相邻段端口距离小于该值则认为是焊缝
     pub weld_merge_threshold: f32,
     pub include_dims: bool,
@@ -71,6 +78,9 @@ impl Default for MbdPipeQuery {
             min_slope: 0.001,
             max_slope: 0.1,
             dim_min_length: 1.0,
+            include_chain_dims: false,
+            include_overall_dim: false,
+            include_port_dims: false,
             weld_merge_threshold: 1.0,
             include_dims: true,
             include_welds: true,
@@ -144,9 +154,27 @@ pub struct MbdPipeSegmentDto {
     pub bore: Option<f32>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MbdDimKind {
+    /// 每段长度（tubi 段 start/end）
+    Segment,
+    /// 焊口链式尺寸（包含两端）
+    Chain,
+    /// 总长（累计长度）
+    Overall,
+    /// 端口间距（优先轴线点 arrive_axis/leave_axis）
+    Port,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MbdDimDto {
     pub id: String,
+    pub kind: MbdDimKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u32>,
     pub start: [f32; 3],
     pub end: [f32; 3],
     pub length: f32,
@@ -200,6 +228,52 @@ pub fn create_mbd_pipe_routes() -> Router {
     Router::new().route("/api/mbd/pipe/{refno}", get(get_mbd_pipe))
 }
 
+fn json_utf8<T: Serialize>(value: T) -> Response {
+    let mut res = Json(value).into_response();
+    res.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    res
+}
+
+/// 尝试修复“UTF-8 被当作 Latin1 解码后又按 UTF-8 输出”的常见乱码（如：`æ°` → `新`）。
+///
+/// 说明：此问题通常源于上游数据采集/入库链路。这里做“只读修复”，便于前端调试与对齐。
+fn fix_mojibake_utf8_latin1(s: String) -> String {
+    if s.is_empty() {
+        return s;
+    }
+    // 只有当字符串完全落在 0x00..=0xFF 时，才可能是这类 mojibake（例如 "æ°"）。
+    if !s.chars().all(|c| (c as u32) <= 0xFF) {
+        return s;
+    }
+
+    let high_cnt = s
+        .chars()
+        .filter(|c| {
+            let u = *c as u32;
+            (0x80..=0xFF).contains(&u)
+        })
+        .count();
+    if high_cnt < 2 {
+        return s;
+    }
+
+    let bytes: Vec<u8> = s.chars().map(|c| c as u8).collect();
+    match String::from_utf8(bytes) {
+        Ok(fixed) => {
+            let has_cjk = fixed.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c));
+            if has_cjk {
+                fixed
+            } else {
+                s
+            }
+        }
+        Err(_) => s,
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct CacheTubiSeg {
@@ -213,6 +287,32 @@ struct CacheTubiSeg {
     start: Vec3,
     /// 段终点（与 cache 一致：tubi_end_pt）
     end: Vec3,
+    /// arrive 端口轴线点（可选；来自 EleGeosInfo.arrive_axis_pt）
+    arrive_axis: Option<Vec3>,
+    /// leave 端口轴线点（可选；来自 EleGeosInfo.leave_axis_pt）
+    leave_axis: Option<Vec3>,
+}
+
+#[inline]
+fn segment_port_points(seg: &CacheTubiSeg) -> (Vec3, Vec3) {
+    // 口径对齐既有 cache 实现：
+    // - leave_axis 对应 seg.start 一侧
+    // - arrive_axis 对应 seg.end 一侧
+    let start = seg.leave_axis.unwrap_or(seg.start);
+    let end = seg.arrive_axis.unwrap_or(seg.end);
+    (start, end)
+}
+
+#[inline]
+fn format_dim_length_text_mm(length: f32) -> String {
+    // 约定：后端输出稳定的“纯数字”文本；单位/语义由前端按 kind 展示。
+    // - 避免 NaN/inf 传播到前端
+    // - 避免 "-0"（浮点格式化的边界情况）
+    if !length.is_finite() {
+        return "0".to_string();
+    }
+    let s = format!("{:.0}", length);
+    if s == "-0" { "0".to_string() } else { s }
 }
 
 async fn get_mbd_pipe(
@@ -222,7 +322,7 @@ async fn get_mbd_pipe(
     let input_refno_enum = match refno.parse::<RefnoEnum>() {
         Ok(v) => v,
         Err(e) => {
-            return Json(MbdPipeResponse {
+            return json_utf8(MbdPipeResponse {
                 success: false,
                 error_message: Some(format!("无效的 refno: {e}")),
                 data: None,
@@ -238,7 +338,7 @@ async fn get_mbd_pipe(
         MbdPipeSource::Db => match fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await {
             Ok(v) => v,
             Err(e) => {
-                return Json(MbdPipeResponse {
+                return json_utf8(MbdPipeResponse {
                     success: false,
                     error_message: Some(format!(
                         "从 SurrealDB 读取分支管段失败: {e}（可尝试 ?source=cache 走 foyer cache）"
@@ -257,7 +357,7 @@ async fn get_mbd_pipe(
         {
             Ok(v) => v,
             Err(e) => {
-                return Json(MbdPipeResponse {
+                return json_utf8(MbdPipeResponse {
                     success: false,
                     error_message: Some(format!("从 foyer cache 读取分支管段失败: {e}")),
                     data: None,
@@ -314,21 +414,46 @@ async fn get_mbd_pipe(
             }
             dims.push(MbdDimDto {
                 id: format!("dim:{}:{i}", seg.refno),
+                kind: MbdDimKind::Segment,
+                group_id: None,
+                seq: Some(i as u32),
                 start: [seg.start.x, seg.start.y, seg.start.z],
                 end: [seg.end.x, seg.end.y, seg.end.z],
                 length,
-                text: format!("{:.0}", length),
+                text: format_dim_length_text_mm(length),
+            });
+        }
+    }
+
+    if query.include_port_dims {
+        for (i, seg) in segments.iter().enumerate() {
+            let (start, end) = segment_port_points(seg);
+            let length = start.distance(end);
+            if length < query.dim_min_length {
+                continue;
+            }
+            dims.push(MbdDimDto {
+                id: format!("dim:port:{}:{i}", seg.refno),
+                kind: MbdDimKind::Port,
+                group_id: None,
+                seq: Some(i as u32),
+                start: [start.x, start.y, start.z],
+                end: [end.x, end.y, end.z],
+                length,
+                text: format_dim_length_text_mm(length),
             });
         }
     }
 
     let mut welds: Vec<MbdWeldDto> = Vec::new();
-    if query.include_welds {
+    let mut weld_joints: Vec<WeldJoint> = Vec::new();
+
+    if query.include_welds || query.include_chain_dims || query.include_overall_dim {
         let mut shop_idx = 0usize;
         let mut field_idx = 0usize;
 
-        // 可选：用 TreeIndex 查询 noun，辅助推断焊缝类型（默认关闭）
-        let noun_lookup = if query.include_weld_nouns {
+        // 可选：用 TreeIndex 查询 noun，辅助推断 weld_type（仅当输出 welds 时才有意义）。
+        let noun_lookup = if query.include_welds && query.include_weld_nouns {
             match try_build_tree_index_for_refno(branch_refno).await {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -348,6 +473,16 @@ async fn get_mbd_pipe(
 
             let (p1, p2, dist) = closest_endpoints(seg1.start, seg1.end, seg2.start, seg2.end);
             if dist >= query.weld_merge_threshold {
+                continue;
+            }
+
+            weld_joints.push(WeldJoint {
+                left_endpoint: p1,
+                right_endpoint: p2,
+                mid: midpoint(p1, p2),
+            });
+
+            if !query.include_welds {
                 continue;
             }
 
@@ -398,6 +533,63 @@ async fn get_mbd_pipe(
         }
     }
 
+    if query.include_chain_dims {
+        let ends: Vec<(Vec3, Vec3)> = segments.iter().map(|s| (s.start, s.end)).collect();
+        let chain_pts = build_chain_points_from_ends(&ends, &weld_joints);
+
+        let group_id = Some(format!("chain:{}", branch_refno));
+        for i in 0..chain_pts.len().saturating_sub(1) {
+            let a = chain_pts[i];
+            let b = chain_pts[i + 1];
+            let length = a.distance(b);
+            if length < query.dim_min_length {
+                continue;
+            }
+            dims.push(MbdDimDto {
+                id: format!("dim:chain:{}:{i}", branch_refno),
+                kind: MbdDimKind::Chain,
+                group_id: group_id.clone(),
+                seq: Some(i as u32),
+                start: [a.x, a.y, a.z],
+                end: [b.x, b.y, b.z],
+                length,
+                text: format_dim_length_text_mm(length),
+            });
+        }
+    }
+
+    if query.include_overall_dim {
+        let mut total = 0.0f32;
+        for seg in &segments {
+            total += seg.start.distance(seg.end);
+        }
+
+        if !segments.is_empty() {
+            // 挂点：用链式端点选择逻辑（若无 weld_joints，则退化为首段 start/end）。
+            let ends: Vec<(Vec3, Vec3)> = segments.iter().map(|s| (s.start, s.end)).collect();
+            let chain_pts = build_chain_points_from_ends(&ends, &weld_joints);
+            let (a, b) = if chain_pts.len() >= 2 {
+                (chain_pts[0], chain_pts[chain_pts.len() - 1])
+            } else {
+                (segments[0].start, segments[0].end)
+            };
+
+            if total >= query.dim_min_length {
+                dims.push(MbdDimDto {
+                    id: format!("dim:overall:{}", branch_refno),
+                    kind: MbdDimKind::Overall,
+                    group_id: Some(format!("overall:{}", branch_refno)),
+                    seq: None,
+                    start: [a.x, a.y, a.z],
+                    end: [b.x, b.y, b.z],
+                    length: total,
+                    // overall 需要显式语义，避免与 segment/chain 的“纯数字”混淆（3D label 侧更明显）。
+                    text: format!("TOTAL {}", format_dim_length_text_mm(total)),
+                });
+            }
+        }
+    }
+
     let mut slopes: Vec<MbdSlopeDto> = Vec::new();
     if query.include_slopes {
         for (i, seg) in segments.iter().enumerate() {
@@ -442,7 +634,7 @@ async fn get_mbd_pipe(
         ));
     }
 
-    Json(MbdPipeResponse {
+    json_utf8(MbdPipeResponse {
         success: true,
         error_message: None,
         data: Some(MbdPipeData {
@@ -633,6 +825,8 @@ async fn fetch_tubi_segments_from_cache_with_debug(
                     order: info.tubi_index,
                     start,
                     end,
+                    arrive_axis: info.arrive_axis_pt.map(Vec3::from),
+                    leave_axis: info.leave_axis_pt.map(Vec3::from),
                 },
             );
         }
@@ -669,6 +863,11 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
         pub start_pt: Option<RsVec3>,
         #[serde(default)]
         pub end_pt: Option<RsVec3>,
+        /// 端口轴线点（可选；由 cache_flush 写入到 tubi_relate.arrive_axis/leave_axis -> vec3）
+        #[serde(default)]
+        pub arrive_axis: Option<RsVec3>,
+        #[serde(default)]
+        pub leave_axis: Option<RsVec3>,
         #[serde(default)]
         pub index: Option<i64>,
     }
@@ -686,6 +885,8 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
             world_trans.d as world_trans,
             start_pt.d as start_pt,
             end_pt.d as end_pt,
+            arrive_axis.d as arrive_axis,
+            leave_axis.d as leave_axis,
             id[1] as index
         FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
         "#
@@ -717,6 +918,8 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
             order: row.index.and_then(|i| u32::try_from(i).ok()),
             start,
             end,
+            arrive_axis: row.arrive_axis.map(|p| p.0),
+            leave_axis: row.leave_axis.map(|p| p.0),
         });
     }
 
@@ -752,22 +955,22 @@ async fn try_fill_branch_name_and_attrs(
 
     // 说明：字段键名按常见 PDMS 属性名直取；若不存在则保持 None。
     // 这些键名以 markpipe/branAttlist.txt 的语义为准，后续若需映射/单位换算，可在此集中处理。
-    attrs.duty = att.get_as_string("DUTY");
-    attrs.pspec = att.get_as_string("PSPEC");
-    attrs.rccm = att.get_as_string("RCCM");
-    attrs.clean = att.get_as_string("CLEAN");
-    attrs.temp = att.get_as_string("TEMP");
+    attrs.duty = att.get_as_string("DUTY").map(fix_mojibake_utf8_latin1);
+    attrs.pspec = att.get_as_string("PSPEC").map(fix_mojibake_utf8_latin1);
+    attrs.rccm = att.get_as_string("RCCM").map(fix_mojibake_utf8_latin1);
+    attrs.clean = att.get_as_string("CLEAN").map(fix_mojibake_utf8_latin1);
+    attrs.temp = att.get_as_string("TEMP").map(fix_mojibake_utf8_latin1);
     attrs.pressure = att.get_f64("PRESSURE").map(|v| v as f32);
-    attrs.ispec = att.get_as_string("ISPEC");
+    attrs.ispec = att.get_as_string("ISPEC").map(fix_mojibake_utf8_latin1);
     attrs.insuthick = att.get_f64("INSUTHICK").map(|v| v as f32);
-    attrs.tspec = att.get_as_string("TSPEC");
-    attrs.swgd = att.get_as_string("SWGD");
-    attrs.drawnum = att.get_as_string("DRAWNUM");
-    attrs.rev = att.get_as_string("REV");
-    attrs.status = att.get_as_string("STATUS");
-    attrs.fluid = att.get_as_string("FLUID");
+    attrs.tspec = att.get_as_string("TSPEC").map(fix_mojibake_utf8_latin1);
+    attrs.swgd = att.get_as_string("SWGD").map(fix_mojibake_utf8_latin1);
+    attrs.drawnum = att.get_as_string("DRAWNUM").map(fix_mojibake_utf8_latin1);
+    attrs.rev = att.get_as_string("REV").map(fix_mojibake_utf8_latin1);
+    attrs.status = att.get_as_string("STATUS").map(fix_mojibake_utf8_latin1);
+    attrs.fluid = att.get_as_string("FLUID").map(fix_mojibake_utf8_latin1);
 
-    Ok((att.get_name_or_default(), attrs))
+    Ok((fix_mojibake_utf8_latin1(att.get_name_or_default()), attrs))
 }
 
 async fn try_build_tree_index_for_refno(
@@ -776,6 +979,58 @@ async fn try_build_tree_index_for_refno(
     use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
     let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno).await?;
     Ok(TreeIndexManager::with_default_dir(vec![dbnum]))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WeldJoint {
+    left_endpoint: Vec3,
+    right_endpoint: Vec3,
+    mid: Vec3,
+}
+
+#[inline]
+fn other_endpoint(a: Vec3, b: Vec3, used: Vec3) -> Vec3 {
+    // closest_endpoints 选出来的端点必然等于 a 或 b（拷贝值），此处用极小阈值判断。
+    const EPS: f32 = 1e-4;
+    if a.distance(used) < EPS {
+        b
+    } else if b.distance(used) < EPS {
+        a
+    } else {
+        // 兜底：若 used 不是端点（理论上不应发生），则取离 used 更远的端点作为“外侧端点”。
+        if a.distance(used) > b.distance(used) { a } else { b }
+    }
+}
+
+/// 生成“焊口链式尺寸”的点序列：左端点 -> (各焊口中点) -> 右端点。
+///
+/// - weld_joints 按段序（i, i+1）顺序输入
+/// - 若 weld_joints 为空，则退化为 `[first.start, first.end]`
+fn build_chain_points_from_ends(ends: &[(Vec3, Vec3)], weld_joints: &[WeldJoint]) -> Vec<Vec3> {
+    let mut out: Vec<Vec3> = Vec::new();
+    if ends.is_empty() {
+        return out;
+    }
+
+    if weld_joints.is_empty() {
+        out.push(ends[0].0);
+        out.push(ends[0].1);
+        return out;
+    }
+
+    let left_end = other_endpoint(ends[0].0, ends[0].1, weld_joints[0].left_endpoint);
+    let right_end = other_endpoint(
+        ends[ends.len() - 1].0,
+        ends[ends.len() - 1].1,
+        weld_joints[weld_joints.len() - 1].right_endpoint,
+    );
+
+    out.push(left_end);
+    for j in weld_joints {
+        out.push(j.mid);
+    }
+    out.push(right_end);
+    out
 }
 
 #[inline]
@@ -827,6 +1082,68 @@ mod tests {
         let b = Vec3::new(2.0, 0.0, 0.0);
         let m = midpoint(a, b);
         assert_eq!(m.to_array(), [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_other_endpoint() {
+        let a = Vec3::new(0.0, 0.0, 0.0);
+        let b = Vec3::new(1.0, 0.0, 0.0);
+        assert_eq!(other_endpoint(a, b, a).to_array(), b.to_array());
+        assert_eq!(other_endpoint(a, b, b).to_array(), a.to_array());
+    }
+
+    #[test]
+    fn test_build_chain_points_from_ends_two_segments() {
+        // 两段直线：seg0: 0->1, seg1: 1->2
+        let ends = vec![
+            (Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)),
+            (Vec3::new(1.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 0.0)),
+        ];
+        let joints = vec![WeldJoint {
+            left_endpoint: Vec3::new(1.0, 0.0, 0.0),
+            right_endpoint: Vec3::new(1.0, 0.0, 0.0),
+            mid: Vec3::new(1.0, 0.0, 0.0),
+        }];
+
+        let pts = build_chain_points_from_ends(&ends, &joints);
+        assert_eq!(pts.len(), 3);
+        assert_eq!(pts[0].to_array(), [0.0, 0.0, 0.0]);
+        assert_eq!(pts[1].to_array(), [1.0, 0.0, 0.0]);
+        assert_eq!(pts[2].to_array(), [2.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_segment_port_points_use_axis_when_present() {
+        let seg = CacheTubiSeg {
+            refno: RefnoEnum::from("1_1"),
+            arrive_refno: None,
+            order: None,
+            start: Vec3::new(0.0, 0.0, 0.0),
+            end: Vec3::new(10.0, 0.0, 0.0),
+            arrive_axis: Some(Vec3::new(9.0, 0.0, 0.0)),
+            leave_axis: Some(Vec3::new(1.0, 0.0, 0.0)),
+        };
+
+        let (a, b) = segment_port_points(&seg);
+        assert_eq!(a.to_array(), [1.0, 0.0, 0.0]);
+        assert_eq!(b.to_array(), [9.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_segment_port_points_fallback_to_start_end() {
+        let seg = CacheTubiSeg {
+            refno: RefnoEnum::from("1_1"),
+            arrive_refno: None,
+            order: None,
+            start: Vec3::new(2.0, 0.0, 0.0),
+            end: Vec3::new(5.0, 0.0, 0.0),
+            arrive_axis: None,
+            leave_axis: None,
+        };
+
+        let (a, b) = segment_port_points(&seg);
+        assert_eq!(a.to_array(), [2.0, 0.0, 0.0]);
+        assert_eq!(b.to_array(), [5.0, 0.0, 0.0]);
     }
 }
 

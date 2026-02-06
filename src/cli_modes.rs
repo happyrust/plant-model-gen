@@ -1541,6 +1541,8 @@ pub async fn export_dbnum_instances_json_mode(
                 return Ok(());
             }
 
+            use surrealdb::types as surrealdb_types;
+
             #[derive(Serialize, Deserialize, Debug, SurrealValue)]
             struct TubiRelateRow {
                 pub owner_refno: RefnoEnum,

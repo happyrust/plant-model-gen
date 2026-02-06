@@ -125,12 +125,16 @@ impl DbMetaManager {
 
     /// 获取基于项目名称的路径列表
     /// 
-    /// 从 DbOption.toml 读取 project_name，构建 output/{project_name}/scene_tree/ 路径
+    /// 从配置文件读取 project_name，构建 output/{project_name}/scene_tree/ 路径
+    /// 优先使用 DB_OPTION_FILE 环境变量指定的配置文件
     fn get_project_based_paths(&self) -> Vec<String> {
         let mut paths = Vec::new();
         
-        // 从 DbOption.toml 读取 project_name
-        if let Ok(content) = std::fs::read_to_string("DbOption.toml") {
+        // 优先使用环境变量指定的配置文件，否则回退到默认
+        let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "DbOption".to_string());
+        let config_file = format!("{}.toml", config_name);
+        
+        if let Ok(content) = std::fs::read_to_string(&config_file) {
             // 简单解析 project_name = "xxx"
             for line in content.lines() {
                 let line = line.trim();
@@ -303,13 +307,14 @@ pub fn generate_desi_indextree() -> anyhow::Result<()> {
     use dashmap::DashSet;
     use std::sync::Arc;
 
-    // 从 DbOption.toml 读取配置
-    let config_path = "DbOption.toml";
-    if !std::path::Path::new(config_path).exists() {
-        anyhow::bail!("未找到配置文件 DbOption.toml");
+    // 优先使用环境变量指定的配置文件，否则回退到默认
+    let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "DbOption".to_string());
+    let config_path = format!("{}.toml", config_name);
+    if !std::path::Path::new(&config_path).exists() {
+        anyhow::bail!("未找到配置文件 {}", config_path);
     }
 
-    let content = std::fs::read_to_string(config_path)?;
+    let content = std::fs::read_to_string(&config_path)?;
     let mut db_option: DbOption = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("解析 DbOption.toml 失败: {}", e))?;
 

@@ -379,9 +379,17 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("dbnum")
                 .long("dbnum")
-                .help("Database number for exporting all SITE models")
+                .help("Database number for export / model generation. When running gen_model, overrides manual_db_nums")
                 .value_name("DBNO")
                 .value_parser(clap::value_parser!(u32)),
+        )
+        .arg(
+            Arg::new("gen-nouns")
+                .long("gen-nouns")
+                .help("Only generate specified noun types (comma-separated, e.g. BRAN,PANE). Overrides full_noun_enabled_categories in DbOption")
+                .value_name("NOUNS")
+                .value_delimiter(',')
+                .num_args(1..),
         )
         .arg(
             Arg::new("verbose")
@@ -634,6 +642,22 @@ async fn main() -> anyhow::Result<()> {
                 db_option_ext.mesh_formats, formats
             );
             db_option_ext.mesh_formats = formats;
+        }
+    }
+
+    // CLI 覆盖：模型生成的 dbnum / noun 类型（无需修改 DbOption.toml）
+    if let Some(dbnum) = matches.get_one::<u32>("dbnum").copied() {
+        db_option_ext.inner.manual_db_nums = Some(vec![dbnum]);
+        println!("🔧 CLI 覆盖 manual_db_nums -> [{}]", dbnum);
+    }
+    if let Some(nouns) = matches.get_many::<String>("gen-nouns") {
+        let v: Vec<String> = nouns.map(|s| s.to_uppercase()).collect();
+        if !v.is_empty() {
+            println!(
+                "🔧 CLI 覆盖 full_noun_enabled_categories: {:?} -> {:?}",
+                db_option_ext.full_noun_enabled_categories, v
+            );
+            db_option_ext.full_noun_enabled_categories = v;
         }
     }
 

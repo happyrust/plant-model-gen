@@ -21,6 +21,8 @@ async fn test_export_dbnum_instances_json_1112() {
             db_option,
             false, // verbose
             None,  // 使用默认毫米单位
+            None,  // root_refno: 导出整个 dbnum
+            false, // detailed: 使用精简格式
         )
         .await;
 
@@ -96,6 +98,8 @@ async fn test_export_dbnum_instances_json_aabb_format() {
             db_option,
             false,
             None, // 使用默认毫米单位
+            None,  // root_refno: 导出整个 dbnum
+            false, // detailed: 使用精简格式
         )
         .await
         .unwrap();

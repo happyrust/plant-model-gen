@@ -22,6 +22,7 @@ pub use pdms_transform_api::create_pdms_transform_routes;
 pub use collision_api::{CollisionApiState, create_collision_routes};
 pub use pipeline_annotation_api::create_pipeline_annotation_routes;
 pub use mbd_pipe_api::create_mbd_pipe_routes;
+pub use pdms_model_query_api::create_pdms_model_query_routes;
 pub use scene_tree_api::create_scene_tree_routes;
 pub use export_api::create_export_api_routes;
 pub use search_api::{SearchApiState, create_search_routes};
@@ -29,6 +30,8 @@ pub mod review_integration;
 pub use review_integration::create_review_integration_routes;
 pub mod model_center_client;
 pub use model_center_client::create_model_center_routes;
+
+pub mod pdms_model_query_api;
 
 #[cfg(feature = "web_server")]
 pub mod review_api;

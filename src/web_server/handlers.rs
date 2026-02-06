@@ -4652,7 +4652,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
         };
 
         let start_time = Instant::now();
-        if let Err(e) = build_room_relations(&db_option).await {
+        if let Err(e) = build_room_relations(&db_option, None, None).await {
             let mut task_manager = state.task_manager.lock().await;
             if let Some(mut task) = task_manager.active_tasks.remove(&task_id) {
                 task.status = TaskStatus::Failed;
@@ -7728,7 +7728,7 @@ async fn update_room_relations_for_refnos_incremental(
 
     // 全量更新逻辑（元素数量较多或增量更新失败时使用）
     let db_option = get_db_option();
-    match build_room_relations(&db_option).await {
+    match build_room_relations(&db_option, None, None).await {
         Ok(_) => {
             let duration = start_time.elapsed();
             let fallback_result = RoomUpdateResult {

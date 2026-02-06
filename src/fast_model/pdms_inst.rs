@@ -22,6 +22,43 @@ use crate::fast_model::debug_model_debug;
 use crate::fast_model::utils;
 // use crate::fast_model::EXIST_MESH_GEOS;
 
+/// 将 tubi_info 数据写入数据库（可选覆盖）。
+///
+pub async fn save_tubi_info_batch_with_replace(
+    tubi_info_map: &dashmap::DashMap<String, TubiInfoData>,
+    _replace_exist: bool,
+) -> anyhow::Result<usize> {
+    use anyhow::Context;
+
+    if tubi_info_map.is_empty() {
+        return Ok(0);
+    }
+
+    const CHUNK_SIZE: usize = 200;
+    let ids = tubi_info_map.iter().map(|e| e.key().clone()).collect::<Vec<_>>();
+    let mut written = 0usize;
+
+    for chunk in ids.chunks(CHUNK_SIZE) {
+        let mut rows: Vec<String> = Vec::with_capacity(chunk.len());
+        for id in chunk {
+            let Some(v) = tubi_info_map.get(id) else {
+                continue;
+            };
+            rows.push(v.value().to_surreal_json());
+            written += 1;
+        }
+        if !rows.is_empty() {
+            let sql = format!("INSERT IGNORE INTO tubi_info [{}];", rows.join(","));
+            SUL_DB
+                .query(&sql)
+                .await
+                .with_context(|| format!("写入 tubi_info 失败 (insert ignore): {}", written))?;
+        }
+    }
+
+    Ok(written)
+}
+
 /// replace_exist=true 时，仅删除 inst_relate（按 in=pe），避免级联误删 inst_info/inst_geo，
 /// 以支持“inst_relate 重建 + inst_info/ptset 复用”的工作流。
 async fn delete_inst_relate_by_in(refnos: &[RefnoEnum], chunk_size: usize) -> anyhow::Result<()> {
@@ -77,23 +114,44 @@ async fn delete_inst_relate_bool_records(refnos: &[RefnoEnum], chunk_size: usize
     if refnos.is_empty() {
         return Ok(());
     }
+
+    for sql in build_delete_inst_relate_bool_records_sql(refnos, chunk_size) {
+        SUL_DB.query(sql).await?;
+    }
+    Ok(())
+}
+
+fn build_delete_inst_relate_bool_records_sql(refnos: &[RefnoEnum], chunk_size: usize) -> Vec<String> {
+    if refnos.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
     for chunk in refnos.chunks(chunk_size.max(1)) {
         let bool_ids = chunk
             .iter()
             .map(|r| format!("inst_relate_bool:⟨{}⟩", r))
             .collect::<Vec<_>>()
             .join(",");
-        let cata_bool_ids = chunk
-            .iter()
-            .map(|r| format!("inst_relate_cata_bool:⟨{}⟩", r))
-            .collect::<Vec<_>>()
-            .join(",");
 
         // 使用 “DELETE [ids]” 点删，避免全表扫描。
-        SUL_DB.query(format!("DELETE [{bool_ids}];")).await?;
-        SUL_DB.query(format!("DELETE [{cata_bool_ids}];")).await?;
+        out.push(format!("DELETE [{bool_ids}];"));
     }
-    Ok(())
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn build_delete_inst_relate_bool_records_sql_should_not_delete_cata_bool() {
+        let refnos = vec![RefnoEnum::from_str("24381/1").unwrap()];
+        let sqls = build_delete_inst_relate_bool_records_sql(&refnos, 100);
+        assert!(!sqls.is_empty());
+        assert!(sqls.iter().all(|s| !s.contains("inst_relate_cata_bool")));
+    }
 }
 
 /// replace_exist=true 时，删除本次将要重建的 inst_geo 记录（按 geo_hash 点删）。
@@ -163,6 +221,11 @@ pub async fn save_instance_data_optimize(
     let mut neg_geo_by_carrier: HashMap<RefnoEnum, Vec<u64>> = HashMap::new();
     let mut cata_cross_neg_geo_map: HashMap<(RefnoEnum, RefnoEnum), Vec<u64>> = HashMap::new();
     if replace_exist {
+        // ⚠️ 已知风险(RUS-178)：replace_exist 的"先删后写"不是原子操作。
+        // 如果在 DELETE 之后、INSERT 之前发生崩溃/断电，会导致数据丢失。
+        // 当前缓解措施：foyer cache 仍保留完整数据，可通过 --flush-cache-to-db 重新回写。
+        // 长期方案：考虑引入 WAL 或两阶段提交机制。
+        //
         // replace 模式下需要确保 inst_info_map 对应的 inst_relate 都被级联删除，
         // 否则会出现同一 inst_relate ID 已存在但 out 指向不同 inst_info 的冲突（SurrealDB 的 in/out 不可变）。
         // 注意：inst_tubi_map 不再创建 inst_relate（tubing 使用 tubi_relate），所以不需要删除
@@ -204,7 +267,14 @@ pub async fn save_instance_data_optimize(
             inst_info_ids.len()
         );
         delete_geo_relate_by_inst_info_ids(&inst_info_ids, CHUNK_SIZE).await?;
-        delete_boolean_relations_by_targets(&refnos, CHUNK_SIZE).await?;
+        // neg_relate.out / ngmr_relate.out 是 target refno（被切割的正实体），
+        // 不一定在 inst_info_map.keys() 中，需要额外收集 neg_relate_map/ngmr_neg_relate_map 的 key。
+        let mut bool_targets: Vec<RefnoEnum> = refnos.clone();
+        bool_targets.extend(inst_mgr.neg_relate_map.keys().copied());
+        bool_targets.extend(inst_mgr.ngmr_neg_relate_map.keys().copied());
+        bool_targets.sort_unstable();
+        bool_targets.dedup();
+        delete_boolean_relations_by_targets(&bool_targets, CHUNK_SIZE).await?;
     }
 
     // inst_geo & geo_relate
@@ -359,9 +429,9 @@ pub async fn save_instance_data_optimize(
     // - out: 正实体 refno (被减实体)
     // - pe: 负实体 refno (负载体，原来的 in)
     if !inst_mgr.neg_relate_map.is_empty() {
-        println!("🔍 [DEBUG] 开始创建 neg_relate 关系 (新结构: in=geo_relate):");
+        debug_model_debug!("开始创建 neg_relate 关系 (新结构: in=geo_relate):");
         for (target, refnos) in &inst_mgr.neg_relate_map {
-            println!("  目标: {}, 负实体数量: {}", target, refnos.len());
+            debug_model_debug!("  目标: {}, 负实体数量: {}", target, refnos.len());
         }
 
         let mut neg_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
@@ -383,7 +453,7 @@ pub async fn save_instance_data_optimize(
 
                         if neg_buffer.len() >= CHUNK_SIZE {
                             let statement = format!(
-                                "INSERT RELATION INTO neg_relate [{}];",
+                                "INSERT RELATION IGNORE INTO neg_relate [{}];",
                                 neg_buffer.join(",")
                             );
                             neg_batcher.push(statement).await?;
@@ -396,7 +466,7 @@ pub async fn save_instance_data_optimize(
 
         if !neg_buffer.is_empty() {
             let statement = format!(
-                "INSERT RELATION INTO neg_relate [{}];",
+                "INSERT RELATION IGNORE INTO neg_relate [{}];",
                 neg_buffer.join(",")
             );
             neg_batcher.push(statement).await?;
@@ -412,9 +482,9 @@ pub async fn save_instance_data_optimize(
     // - pe: ele_refno (负载体，原来的 in)
     // - ngmr: ngmr_geom_refno (NGMR 几何引用，保留用于调试)
     if !inst_mgr.ngmr_neg_relate_map.is_empty() {
-        println!("🔍 [DEBUG] 开始创建 ngmr_relate 关系 (新结构: in=geo_relate):");
+        debug_model_debug!("开始创建 ngmr_relate 关系 (新结构: in=geo_relate):");
         for (k, refnos) in &inst_mgr.ngmr_neg_relate_map {
-            println!("  目标: {}, NGMR 数量: {}", k, refnos.len());
+            debug_model_debug!("  目标: {}, NGMR 数量: {}", k, refnos.len());
         }
 
         let mut ngmr_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
@@ -441,7 +511,7 @@ pub async fn save_instance_data_optimize(
 
                         if ngmr_buffer.len() >= CHUNK_SIZE {
                             let statement = format!(
-                                "INSERT RELATION INTO ngmr_relate [{}];",
+                                "INSERT RELATION IGNORE INTO ngmr_relate [{}];",
                                 ngmr_buffer.join(",")
                             );
                             ngmr_batcher.push(statement).await?;
@@ -454,7 +524,7 @@ pub async fn save_instance_data_optimize(
 
         if !ngmr_buffer.is_empty() {
             let statement = format!(
-                "INSERT RELATION INTO ngmr_relate [{}];",
+                "INSERT RELATION IGNORE INTO ngmr_relate [{}];",
                 ngmr_buffer.join(",")
             );
             ngmr_batcher.push(statement).await?;
@@ -657,28 +727,26 @@ pub async fn save_instance_data_optimize(
     // aabb
     if !aabb_map.is_empty() {
         let mut aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
-        let mut sql_buffer = String::new();
-        let mut buffered = 0usize;
+        let mut json_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
 
         for (&hash, value) in &aabb_map {
-            // 注意：aabb 记录可能先被 inst_relate_aabb(out) 侧“隐式创建”为一个空记录（d = NONE）。
-            // 这里必须用 UPSERT 覆盖/补齐 d，不能用 INSERT IGNORE。
-            sql_buffer.push_str(&format!("UPSERT aabb:⟨{}⟩ SET d = {};", hash, value));
-            buffered += 1;
-            if buffered >= CHUNK_SIZE {
-                aabb_batcher.push(std::mem::take(&mut sql_buffer)).await?;
-                buffered = 0;
+            json_buffer.push(format!("{{'id':aabb:⟨{}⟩, 'd':{}}}", hash, value));
+            if json_buffer.len() >= CHUNK_SIZE {
+                let statement = format!("INSERT IGNORE INTO aabb [{}];", json_buffer.join(","));
+                aabb_batcher.push(statement).await?;
+                json_buffer.clear();
             }
         }
 
-        if !sql_buffer.is_empty() {
-            aabb_batcher.push(sql_buffer).await?;
+        if !json_buffer.is_empty() {
+            let statement = format!("INSERT IGNORE INTO aabb [{}];", json_buffer.join(","));
+            aabb_batcher.push(statement).await?;
         }
 
         aabb_batcher.finish().await?;
     }
 
-    // inst_relate_aabb（关系表：in=pe, out=aabb），必须在 aabb UPSERT 之后写入，避免 out 侧空记录（d = NONE）
+    // inst_relate_aabb（关系表：in=pe, out=aabb），按历史约定延后到 aabb 写入之后执行
     if !inst_relate_aabb_chunks.is_empty() || !inst_relate_aabb_buffer.is_empty() {
         let mut inst_aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
 
@@ -713,7 +781,7 @@ pub async fn save_instance_data_optimize(
         flush_pairs!(&inst_relate_aabb_buffer, &inst_relate_aabb_ins)?;
 
         debug_model_debug!(
-            "save_instance_data_optimize flushing inst_relate_aabb after aabb upsert: {}",
+            "save_instance_data_optimize flushing inst_relate_aabb after aabb insert: {}",
             total
         );
         inst_aabb_batcher.finish().await?;

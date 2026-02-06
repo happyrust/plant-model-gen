@@ -9,24 +9,57 @@ use tokio::task::JoinSet;
 static INST_RELATE_AABB_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 static INST_RELATE_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 
-/// 确保 inst_relate_aabb 以“关系表”方式工作：in=pe，out=aabb，且 `in` 唯一。
+/// 确保 inst_relate_aabb 以"关系表"方式工作：in=pe，out=aabb，且 `in` 唯一。
 ///
 /// 历史遗留：某些数据库中 inst_relate_aabb 曾是普通表（refno/aabb），字段类型可能是必填 record，
-/// 仅写 in/out 会触发类型强制失败。这里会清理旧字段定义/索引，并清空旧数据，保证新结构稳定写入。
+/// 仅写 in/out 会触发类型强制失败。
+///
+/// 修复(RUS-179)：改为条件式迁移——先检查表是否已经是 RELATION 类型，
+/// 如果是则跳过，避免 REMOVE TABLE 清空其他 dbnum 的已有数据。
 pub async fn ensure_inst_relate_aabb_relation_schema() {
     INST_RELATE_AABB_SCHEMA_INIT
         .get_or_init(|| async {
-            // 目标：必须是 RELATION 表，否则 rs-core 的 `in->inst_relate_aabb` 图遍历拿不到 out.d，
-            // 导致 export-glb 等流程 world_aabb = null 并反序列化失败。
-            //
-            // 用户已确认允许清理旧数据，因此直接删除并重建为 RELATION 表（最稳）。
-            let _ = SUL_DB.query("REMOVE TABLE inst_relate_aabb;").await;
+            // 检查表是否已经是 RELATION 类型：尝试查询一条带 in/out 的记录。
+            // 如果 INFO FOR TABLE 返回的定义中包含 "RELATION"，说明已迁移过，跳过重建。
+            let already_relation = match SUL_DB
+                .query("INFO FOR TABLE inst_relate_aabb;")
+                .await
+            {
+                Ok(mut resp) => {
+                    // INFO FOR TABLE 返回一个 object，检查其中是否包含 RELATION 标记
+                    match resp.take::<Option<serde_json::Value>>(0) {
+                        Ok(Some(val)) => {
+                            let s = val.to_string();
+                            s.contains("RELATION")
+                        }
+                        _ => false,
+                    }
+                }
+                Err(_) => false,
+            };
 
+            if already_relation {
+                // 表已经是 RELATION 类型，只需确保字段和索引定义正确（DEFINE IF NOT EXISTS 语义）
+                let _ = SUL_DB
+                    .query("DEFINE FIELD in ON TABLE inst_relate_aabb TYPE record<pe>;")
+                    .await;
+                let _ = SUL_DB
+                    .query("DEFINE FIELD out ON TABLE inst_relate_aabb TYPE record<aabb>;")
+                    .await;
+                let _ = SUL_DB
+                    .query(
+                        "DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS in UNIQUE;",
+                    )
+                    .await;
+                return;
+            }
+
+            // 表不存在或不是 RELATION 类型，需要重建
+            let _ = SUL_DB.query("REMOVE TABLE inst_relate_aabb;").await;
             let _ = SUL_DB
                 .query("DEFINE TABLE inst_relate_aabb TYPE RELATION;")
                 .await;
 
-            // TYPE RELATION 会隐式创建 in/out 字段，但默认 TYPE record；这里显式改为更严格的类型。
             let _ = SUL_DB
                 .query("REMOVE FIELD in ON TABLE inst_relate_aabb;")
                 .await;
@@ -89,19 +122,18 @@ pub async fn save_aabb_to_surreal(aabb_map: &DashMap<String, Aabb>) {
             .map(|kv| kv.key().clone())
             .collect::<Vec<_>>();
         for chunk in keys.chunks(300) {
-            let mut sql = "".to_string();
+            let mut rows: Vec<String> = Vec::with_capacity(chunk.len());
             for k in chunk {
                 let v = aabb_map.get(k).unwrap();
-                // 注意：aabb 记录可能先被 RELATE out 侧“隐式创建”为一个空记录（d = NONE）。
-                // 这里必须用 UPSERT 覆盖/补齐 d，不能用 INSERT IGNORE。
                 let d = serde_json::to_string(v.value()).unwrap();
                 let id_key = if k.starts_with("aabb:") {
                     k.to_string()
                 } else {
                     format!("aabb:⟨{}⟩", k)
                 };
-                sql.push_str(&format!("UPSERT {id_key} SET d = {d};"));
+                rows.push(format!("{{'id':{id_key}, 'd':{d}}}"));
             }
+            let sql = format!("INSERT IGNORE INTO aabb [{}];", rows.join(","));
             match SUL_DB.query(&sql).await {
                 Ok(_) => {}
                 Err(_) => {
@@ -113,13 +145,15 @@ pub async fn save_aabb_to_surreal(aabb_map: &DashMap<String, Aabb>) {
 }
 
 /// 保存布尔结果状态
+///
+/// 修复(RUS-182)：改为返回 Result，让调用方能感知写入失败。
 pub async fn save_inst_relate_bool(
     refno: RefnoEnum,
     mesh_id: Option<&str>,
     status: &str,
     source: &str,
-) {
-    // SurrealQL：使用 UPSERT 保证幂等写入（SurrealDB 不支持 “INSERT OR REPLACE”）
+) -> anyhow::Result<()> {
+    // SurrealQL：使用 UPSERT 保证幂等写入（SurrealDB 不支持 "INSERT OR REPLACE"）
     let refno_str = refno.to_string();
     let id_key = format!("inst_relate_bool:⟨{}⟩", refno_str);
     // inst_relate_bool.refno 约定为 pe 记录引用（与 surreal_schema.sql 一致）
@@ -130,11 +164,14 @@ pub async fn save_inst_relate_bool(
     );
 
     if let Err(e) = SUL_DB.query(&sql).await {
+        let msg = format!("{sql}\n-- err: {e}");
         init_save_database_error(
-            &format!("{sql}\n-- err: {e}"),
+            &msg,
             &std::panic::Location::caller().to_string(),
         );
+        anyhow::bail!("save_inst_relate_bool 失败: refno={refno} err={e}");
     }
+    Ok(())
 }
 
 /// 保存 catalog 级布尔结果状态（与实例级布尔分表，避免互相覆盖）
@@ -234,12 +271,12 @@ pub async fn save_pts_to_surreal(vec3_map: &DashMap<u64, String>) {
     if !vec3_map.is_empty() {
         let keys = vec3_map.iter().map(|kv| *kv.key()).collect::<Vec<_>>();
         for chunk in keys.chunks(100) {
-            let mut sql = "".to_string();
+            let mut rows: Vec<String> = Vec::with_capacity(chunk.len());
             for &k in chunk {
                 let v = vec3_map.get(&k).unwrap();
-                let json = format!("{{'id':vec3:⟨{}⟩, 'd':{}}}", k, v.value());
-                sql.push_str(&format!("INSERT IGNORE INTO vec3 {};", json));
+                rows.push(format!("{{'id':vec3:⟨{}⟩, 'd':{}}}", k, v.value()));
             }
+            let sql = format!("INSERT IGNORE INTO vec3 [{}];", rows.join(","));
             match SUL_DB.query(&sql).await {
                 Ok(_) => {}
                 Err(_e) => {
@@ -251,17 +288,50 @@ pub async fn save_pts_to_surreal(vec3_map: &DashMap<u64, String>) {
 }
 
 pub async fn save_transforms_to_surreal(trans_map: &HashMap<u64, String>) -> anyhow::Result<()> {
+    use anyhow::Context;
+
     if !trans_map.is_empty() {
         let keys = trans_map.keys().collect::<Vec<_>>();
         for chunk in keys.chunks(100) {
-            let mut sql = "".to_string();
+            let mut part = HashMap::with_capacity(chunk.len());
             for &k in chunk {
-                let v = trans_map.get(&k).unwrap();
-                let json = format!("{{'id':trans:⟨{}⟩, 'd':{}}}", k, v);
-                sql.push_str(&format!("INSERT IGNORE INTO trans {};", json));
+                if let Some(v) = trans_map.get(&k) {
+                    part.insert(*k, v.clone());
+                }
             }
-            SUL_DB.query(sql).await.unwrap();
+            let sql = build_save_transforms_sql(&part);
+            SUL_DB
+                .query(&sql)
+                .await
+                .with_context(|| format!("写入 trans 失败: {sql}"))?;
         }
     }
     Ok(())
+}
+
+fn build_save_transforms_sql(trans_map: &HashMap<u64, String>) -> String {
+    if trans_map.is_empty() {
+        return String::new();
+    }
+
+    let mut rows: Vec<String> = Vec::with_capacity(trans_map.len());
+    for (k, v) in trans_map {
+        rows.push(format!("{{'id':trans:⟨{}⟩, 'd':{}}}", k, v));
+    }
+    format!("INSERT IGNORE INTO trans [{}];", rows.join(","))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_save_transforms_sql_should_use_insert_ignore() {
+        let mut trans_map = HashMap::new();
+        trans_map.insert(1u64, "{\"translation\":[0,0,0]}".to_string());
+
+        let sql = build_save_transforms_sql(&trans_map);
+        assert!(sql.contains("INSERT IGNORE INTO trans"));
+        assert!(!sql.contains("UPSERT trans:⟨1⟩"));
+    }
 }

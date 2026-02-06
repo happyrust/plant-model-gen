@@ -2,6 +2,7 @@
 name = "aios-database"
 version = "0.2.3"
 edition = "2024"
+default-run = "aios-database"
 
 [lib]
 name = "aios_database"
@@ -11,6 +12,12 @@ path = "src/lib.rs"
 name = "web_server"
 path = "src/bin/web_server.rs"
 required-features = ["web_server"]
+
+[[bin]]
+name = "aios-database"
+path = "src/main.rs"
+# `cargo test` 默认会为 bin 也构建 `--test` harness；该工程 bin 依赖重且在 Windows 下易引发链接/内存异常。
+test = false
 
 [[bin]]
 name = "meili_reindex"
@@ -296,6 +303,11 @@ required-features = ["gen_model"]
 [[example]]
 name = "query_tubi_world_trans"
 path = "src/examples/query_tubi_world_trans.rs"
+required-features = ["gen_model"]
+
+[[example]]
+name = "verify_sync_to_db_24381_145018"
+path = "examples/verify_sync_to_db_24381_145018.rs"
 required-features = ["gen_model"]
 
 eframe = { git = "https://github.com/emilk/egui.git", rev = "fa4cfec777c9ea21b8643f77b6a26561da44aad0", package = "eframe" }

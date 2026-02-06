@@ -1323,6 +1323,7 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
             Some(mesh_lod_tag.as_str()),
             false,
             None,
+            false,
         )
         .await?;
 

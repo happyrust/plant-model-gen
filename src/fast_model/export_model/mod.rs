@@ -22,6 +22,7 @@ pub mod simple_color_palette;
 pub mod pe_parquet_writer;
 pub mod attr_parquet_writer;
 pub mod export_parquet;
+pub mod export_dbnum_instances_parquet;
 
 pub use export_common::*;
 pub use name_config::NameConfig;

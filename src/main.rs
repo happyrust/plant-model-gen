@@ -15,6 +15,49 @@ use std::path::{Path, PathBuf};
 
 use chrono::{Datelike, Local, Timelike};
 
+// #region agent log
+// 轻量 NDJSON 记录器：用于 debug-mode 下确认“本次运行的二进制确实生效并能写日志”。
+// 注意：本仓库的其它模块也有各自的 agent_log；这里做一个最小实现，避免 main.rs 直接调用时报未定义。
+#[cfg(not(feature = "gui"))]
+fn agent_now_ms() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+#[cfg(not(feature = "gui"))]
+fn agent_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    if std::env::var_os("AIOS_AGENT_DEBUG").is_none()
+        && std::env::var_os("AIOS_AGENT_DEBUG_REFNO").is_none()
+        && std::env::var_os("AIOS_AGENT_DEBUG_GEOM_REFNO").is_none()
+        && std::env::var_os("AIOS_LOG_FILE").is_none()
+    {
+        return;
+    }
+
+    use serde_json::json;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let run_id = std::env::var("AIOS_AGENT_RUNID").unwrap_or_else(|_| "run1".to_string());
+    let payload = json!({
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": agent_now_ms(),
+    });
+
+    let path = r"d:\work\plant-code\gen_model-dev\.cursor\debug.log";
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", payload.to_string());
+    }
+}
+// #endregion
+
 #[cfg(not(feature = "gui"))]
 mod cli_modes;
 
@@ -133,6 +176,28 @@ async fn main() -> anyhow::Result<()> {
     // 默认把模型生成/导出过程的所有 stdout/stderr 写入日志文件，避免控制台刷屏导致“看似死循环”。
     // 仅在显式 `--verbose` 或后台服务模式（如 --grpc-server）时保留控制台输出。
     maybe_redirect_stdio_to_log_file();
+
+    // #region agent log
+    // 进程启动心跳：只要启用了 --debug-model（即 AIOS_LOG_FILE 存在）或显式 AIOS_AGENT_DEBUG，就写入 NDJSON，
+    // 用于确认本次运行确实“能写到 debug.log”，避免出现“日志文件不存在”的情况。
+    if std::env::var_os("AIOS_LOG_FILE").is_some()
+        || std::env::var_os("AIOS_AGENT_DEBUG").is_some()
+        || std::env::var_os("AIOS_AGENT_DEBUG_REFNO").is_some()
+        || std::env::var_os("AIOS_AGENT_DEBUG_GEOM_REFNO").is_some()
+    {
+        agent_log(
+            "H0",
+            "main.rs:main",
+            "startup",
+            serde_json::json!({
+                "AIOS_LOG_FILE": std::env::var("AIOS_LOG_FILE").ok(),
+                "AIOS_AGENT_RUNID": std::env::var("AIOS_AGENT_RUNID").ok(),
+                "AIOS_AGENT_DEBUG_REFNO": std::env::var("AIOS_AGENT_DEBUG_REFNO").ok(),
+                "AIOS_AGENT_DEBUG_GEOM_REFNO": std::env::var("AIOS_AGENT_DEBUG_GEOM_REFNO").ok(),
+            }),
+        );
+    }
+    // #endregion
 
     let matches = Command::new("aios-database")
         .version("0.1.3")
@@ -467,6 +532,18 @@ async fn main() -> anyhow::Result<()> {
                 .help("Export detailed JSON format with all fields (default: compact)")
                 .action(clap::ArgAction::SetTrue)
                 .requires("export-dbnum-instances-json"),
+        )
+        .arg(
+            Arg::new("export-dbnum-instances-parquet")
+                .long("export-dbnum-instances-parquet")
+                .help("Export dbnum instances as multi-table Parquet (instances/geo_instances/tubings/transforms/aabb) for DuckDB querying")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("export-dbnum-instances")
+                .long("export-dbnum-instances")
+                .help("Export dbnum instances (default: Parquet format; use --export-dbnum-instances-json for JSON)")
+                .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("export-room-instances")
@@ -1401,6 +1478,12 @@ async fn main() -> anyhow::Result<()> {
 
         let from_cache = matches.get_flag("from-cache");
         let detailed = matches.get_flag("detailed");
+        
+        // 处理 --use-surrealdb 参数
+        let cli_use_surrealdb = matches.get_flag("use-surrealdb");
+        if cli_use_surrealdb {
+            db_option_ext.use_surrealdb = true;
+        }
 
         println!("🎯 导出 dbnum 实例数据为 JSON（含 AABB）");
         println!("   - 按 dbnum={} 过滤", dbnum);
@@ -1424,6 +1507,55 @@ async fn main() -> anyhow::Result<()> {
             detailed,
         )
             .await;
+    }
+
+    // 导出 dbnum 实例数据为 Parquet（显式 --export-dbnum-instances-parquet）
+    // 或默认格式（--export-dbnum-instances，默认 Parquet）
+    if matches.get_flag("export-dbnum-instances-parquet")
+        || matches.get_flag("export-dbnum-instances")
+    {
+        use crate::cli_modes::export_dbnum_instances_parquet_mode;
+        use aios_core::pdms_types::RefnoEnum;
+        use std::str::FromStr;
+
+        let dbnum = matches.get_one::<u32>("dbnum").copied();
+        let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
+
+        // 解析 --debug-model 参数作为 root_refno
+        let root_refno: Option<RefnoEnum> = matches
+            .get_many::<String>("debug-model")
+            .and_then(|values| values.into_iter().next())
+            .and_then(|s| {
+                let refno_str = s.replace('_', "/");
+                RefnoEnum::from_str(&refno_str).ok()
+            });
+
+        let dbnum = match dbnum {
+            Some(n) => n,
+            None => {
+                eprintln!("❌ 错误: --export-dbnum-instances-parquet 需要提供 --dbnum 参数");
+                eprintln!("   例如: cargo run -- --export-dbnum-instances-parquet --dbnum 7997");
+                std::process::exit(1);
+            }
+        };
+
+        println!("🎯 导出 dbnum 实例数据为 Parquet（多表，供 DuckDB 查询）");
+        println!("   - 按 dbnum={} 过滤", dbnum);
+        if let Some(ref refno) = root_refno {
+            println!("   - 仅导出 {} 的 visible 子孙", refno);
+        }
+        if let Some(ref dir) = export_bundle_dir {
+            println!("   - 输出目录: {}", dir.display());
+        }
+
+        return export_dbnum_instances_parquet_mode(
+            dbnum,
+            verbose,
+            export_bundle_dir,
+            &db_option_ext,
+            root_refno,
+        )
+        .await;
     }
 
     // 导出房间实例数据

@@ -2242,19 +2242,30 @@ pub struct CompactGroup {
     pub tubings: Vec<CompactEntry>,
 }
 
-/// 构建精简模式的 JSON 输出
+/// 构建精简模式的 JSON 输出（返回 IndexMap 以保持字段顺序）
+fn build_compact_instances_json_map(
+    groups: &[CompactGroup],
+    instances: &[CompactEntry],
+    generated_at: &str,
+) -> indexmap::IndexMap<String, serde_json::Value> {
+    use indexmap::IndexMap;
+    let mut map: IndexMap<String, serde_json::Value> = IndexMap::new();
+    map.insert("version".to_string(), json!(4));
+    map.insert("format".to_string(), json!("compact"));
+    map.insert("generated_at".to_string(), json!(generated_at));
+    map.insert("groups".to_string(), serde_json::to_value(groups).unwrap());
+    map.insert("instances".to_string(), serde_json::to_value(instances).unwrap());
+    map
+}
+
+/// 构建精简模式的 JSON 输出（兼容旧接口）
 fn build_compact_instances_json(
     groups: &[CompactGroup],
     instances: &[CompactEntry],
     generated_at: &str,
 ) -> serde_json::Value {
-    json!({
-        "version": 4,
-        "format": "compact",
-        "generated_at": generated_at,
-        "groups": groups,
-        "instances": instances,
-    })
+    let map = build_compact_instances_json_map(groups, instances, generated_at);
+    serde_json::to_value(map).unwrap()
 }
 
 fn plant_transform_to_dmat4(t: &aios_core::PlantTransform) -> DMat4 {
@@ -3208,22 +3219,33 @@ pub async fn export_dbnum_instances_json(
     }
 
     // 根据 detailed 参数选择输出格式
-    let instances_json = if detailed {
+    let (instances_json_map, instances_json_value) = if detailed {
         // 详细模式（V3 格式，trans/aabb 通过全局文件加载）
-        json!({
-            "version": 3,
-            "generated_at": generated_at,
-            "groups": groups,
-            "instances": instances,
-        })
+        use indexmap::IndexMap;
+        let mut map: IndexMap<String, serde_json::Value> = IndexMap::new();
+        map.insert("version".to_string(), json!(3));
+        map.insert("format".to_string(), json!("detailed"));
+        map.insert("generated_at".to_string(), json!(generated_at));
+        map.insert("groups".to_string(), serde_json::to_value(&groups).unwrap());
+        map.insert("instances".to_string(), serde_json::to_value(&instances).unwrap());
+        let value = serde_json::to_value(&map).unwrap();
+        (Some(map), value)
     } else {
         // 精简模式（V4 格式）
-        build_compact_instances_json(&compact_groups, &compact_instances, &generated_at)
+        let map = build_compact_instances_json_map(&compact_groups, &compact_instances, &generated_at);
+        let value = serde_json::to_value(&map).unwrap();
+        (Some(map), value)
     };
 
-    // 写入主文件
+    // 写入主文件（使用 IndexMap 直接序列化以保持字段顺序）
     let output_path = output_dir.join(format!("instances_{}.json", dbnum));
-    let json_str = serde_json::to_string_pretty(&instances_json)?;
+    let json_str = if let Some(map) = instances_json_map {
+        // 直接序列化 IndexMap 以保持字段顺序
+        serde_json::to_string_pretty(&map)?
+    } else {
+        // 回退到 Value（不应该到达这里）
+        serde_json::to_string_pretty(&instances_json_value)?
+    };
     fs::write(&output_path, json_str)?;
 
     if verbose {
@@ -3758,8 +3780,23 @@ pub async fn export_dbnum_instances_json_from_cache(
                         &unit_converter,
                         inst.geo_param.is_reuse_unit(),
                     );
+                    // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
+                    let geo_hash = if inst.geo_hash < 10000 {
+                        // 从 geo_param 序列化计算 hash
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = DefaultHasher::new();
+                        if let Ok(bytes) = bincode::serialize(&inst.geo_param) {
+                            bytes.hash(&mut hasher);
+                            hasher.finish()
+                        } else {
+                            inst.geo_hash
+                        }
+                    } else {
+                        inst.geo_hash
+                    };
                     json!({
-                        "geo_hash": inst.geo_hash.to_string(),
+                        "geo_hash": geo_hash.to_string(),
                         "geo_trans_hash": geo_trans_hash,
                     })
                 })
@@ -3779,18 +3816,52 @@ pub async fn export_dbnum_instances_json_from_cache(
 
             // 精简模式
             let first_geo_hash = inst_geos.insts.first()
-                .map(|i| i.geo_hash.to_string())
+                .map(|i| {
+                    // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
+                    let geo_hash = if i.geo_hash < 10000 {
+                        // 从 geo_param 序列化计算 hash
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = DefaultHasher::new();
+                        if let Ok(bytes) = bincode::serialize(&i.geo_param) {
+                            bytes.hash(&mut hasher);
+                            hasher.finish()
+                        } else {
+                            i.geo_hash
+                        }
+                    } else {
+                        i.geo_hash
+                    };
+                    geo_hash.to_string()
+                })
                 .unwrap_or_default();
             let compact_geo_instances: Vec<CompactGeoInstance> = inst_geos.insts
                 .iter()
-                .map(|inst| CompactGeoInstance {
-                    geo_hash: inst.geo_hash.to_string(),
-                    geo_trans_hash: Some(insert_trans_hash(
-                        &mut trans_table,
-                        &to_dmat4(&inst.geo_transform),
-                        &unit_converter,
-                        inst.geo_param.is_reuse_unit(),
-                    )),
+                .map(|inst| {
+                    // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
+                    let geo_hash = if inst.geo_hash < 10000 {
+                        // 从 geo_param 序列化计算 hash
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = DefaultHasher::new();
+                        if let Ok(bytes) = bincode::serialize(&inst.geo_param) {
+                            bytes.hash(&mut hasher);
+                            hasher.finish()
+                        } else {
+                            inst.geo_hash
+                        }
+                    } else {
+                        inst.geo_hash
+                    };
+                    CompactGeoInstance {
+                        geo_hash: geo_hash.to_string(),
+                        geo_trans_hash: Some(insert_trans_hash(
+                            &mut trans_table,
+                            &to_dmat4(&inst.geo_transform),
+                            &unit_converter,
+                            inst.geo_param.is_reuse_unit(),
+                        )),
+                    }
                 })
                 .collect();
             compact_children.push(CompactEntry {
@@ -3876,13 +3947,28 @@ pub async fn export_dbnum_instances_json_from_cache(
                 false,
             );
 
+                // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
+                let geo_hash = if first_inst.geo_hash < 10000 {
+                    // 从 geo_param 序列化计算 hash
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    if let Ok(bytes) = bincode::serialize(&first_inst.geo_param) {
+                        bytes.hash(&mut hasher);
+                        hasher.finish()
+                    } else {
+                        first_inst.geo_hash
+                    }
+                } else {
+                    first_inst.geo_hash
+                };
                 let order = info.tubi_index.unwrap_or(tubi_order);
                 tubings.push(json!({
                     "refno": tubi_refno.to_string(),
                     "noun": "TUBI",
                     "name": format!("TUBI-{}", tubi_refno.to_string()),
                     "aabb_hash": aabb_hash,
-                    "geo_hash": first_inst.geo_hash.to_string(),
+                    "geo_hash": geo_hash.to_string(),
                     "trans_hash": trans_hash,
                     "order": order,
                     "lod_mask": 1u32,
@@ -3896,7 +3982,7 @@ pub async fn export_dbnum_instances_json_from_cache(
                     spec_value: 0,
                     aabb_hash: Some(aabb_hash.clone()),
                     trans_hash: Some(trans_hash.clone()),
-                    geo_hash: first_inst.geo_hash.to_string(),
+                    geo_hash: geo_hash.to_string(),
                     geo_instances: Vec::new(),
                 });
                 tubi_order += 1;
@@ -3973,8 +4059,23 @@ pub async fn export_dbnum_instances_json_from_cache(
                     &unit_converter,
                     inst.geo_param.is_reuse_unit(),
                 );
+                // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
+                let geo_hash = if inst.geo_hash < 10000 {
+                    // 从 geo_param 序列化计算 hash
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    if let Ok(bytes) = bincode::serialize(&inst.geo_param) {
+                        bytes.hash(&mut hasher);
+                        hasher.finish()
+                    } else {
+                        inst.geo_hash
+                    }
+                } else {
+                    inst.geo_hash
+                };
                 json!({
-                    "geo_hash": inst.geo_hash.to_string(),
+                    "geo_hash": geo_hash.to_string(),
                     "geo_trans_hash": geo_trans_hash,
                 })
             })
@@ -3992,18 +4093,52 @@ pub async fn export_dbnum_instances_json_from_cache(
 
         // 精简模式
         let first_geo_hash = inst_geos.insts.first()
-            .map(|i| i.geo_hash.to_string())
+            .map(|i| {
+                // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
+                let geo_hash = if i.geo_hash < 10000 {
+                    // 从 geo_param 序列化计算 hash
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    if let Ok(bytes) = bincode::serialize(&i.geo_param) {
+                        bytes.hash(&mut hasher);
+                        hasher.finish()
+                    } else {
+                        i.geo_hash
+                    }
+                } else {
+                    i.geo_hash
+                };
+                geo_hash.to_string()
+            })
             .unwrap_or_default();
         let compact_geo_instances: Vec<CompactGeoInstance> = inst_geos.insts
             .iter()
-            .map(|inst| CompactGeoInstance {
-                geo_hash: inst.geo_hash.to_string(),
-                geo_trans_hash: Some(insert_trans_hash(
-                    &mut trans_table,
-                    &to_dmat4(&inst.geo_transform),
-                    &unit_converter,
-                    inst.geo_param.is_reuse_unit(),
-                )),
+            .map(|inst| {
+                // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
+                let geo_hash = if inst.geo_hash < 10000 {
+                    // 从 geo_param 序列化计算 hash
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    if let Ok(bytes) = bincode::serialize(&inst.geo_param) {
+                        bytes.hash(&mut hasher);
+                        hasher.finish()
+                    } else {
+                        inst.geo_hash
+                    }
+                } else {
+                    inst.geo_hash
+                };
+                CompactGeoInstance {
+                    geo_hash: geo_hash.to_string(),
+                    geo_trans_hash: Some(insert_trans_hash(
+                        &mut trans_table,
+                        &to_dmat4(&inst.geo_transform),
+                        &unit_converter,
+                        inst.geo_param.is_reuse_unit(),
+                    )),
+                }
             })
             .collect();
         compact_instances.push(CompactEntry {
@@ -4052,7 +4187,24 @@ pub async fn export_dbnum_instances_json_from_cache(
 
             // 尝试从 inst_geos_map 获取 geo_hash，如果没有则使用 tubi_info_id 或 refno
             let geo_hash = if let Some(inst_geos) = inst_geos_map.get(&info.get_inst_key()) {
-                inst_geos.insts.first().map(|i| i.geo_hash.to_string())
+                inst_geos.insts.first().map(|i| {
+                    // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
+                    let geo_hash = if i.geo_hash < 10000 {
+                        // 从 geo_param 序列化计算 hash
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = DefaultHasher::new();
+                        if let Ok(bytes) = bincode::serialize(&i.geo_param) {
+                            bytes.hash(&mut hasher);
+                            hasher.finish()
+                        } else {
+                            i.geo_hash
+                        }
+                    } else {
+                        i.geo_hash
+                    };
+                    geo_hash.to_string()
+                })
             } else {
                 // 使用 tubi_info_id 作为备选，或者使用 refno
                 info.tubi_info_id.clone().or_else(|| Some(format!("tubi_{}", tubi_refno)))
@@ -4111,21 +4263,33 @@ pub async fn export_dbnum_instances_json_from_cache(
     }
 
     // 根据 detailed 参数选择输出格式
-    let instances_json = if detailed {
+    let (instances_json_map, instances_json_value) = if detailed {
         // 详细模式（V3 格式）
-        json!({
-            "version": 3,
-            "generated_at": generated_at,
-            "groups": groups,
-            "instances": instances,
-        })
+        use indexmap::IndexMap;
+        let mut map: IndexMap<String, serde_json::Value> = IndexMap::new();
+        map.insert("version".to_string(), json!(3));
+        map.insert("format".to_string(), json!("detailed"));
+        map.insert("generated_at".to_string(), json!(generated_at));
+        map.insert("groups".to_string(), serde_json::to_value(&groups).unwrap());
+        map.insert("instances".to_string(), serde_json::to_value(&instances).unwrap());
+        let value = serde_json::to_value(&map).unwrap();
+        (Some(map), value)
     } else {
         // 精简模式（V4 格式）
-        build_compact_instances_json(&compact_groups, &compact_instances, &generated_at)
+        let map = build_compact_instances_json_map(&compact_groups, &compact_instances, &generated_at);
+        let value = serde_json::to_value(&map).unwrap();
+        (Some(map), value)
     };
 
+    // 写入主文件（使用 IndexMap 直接序列化以保持字段顺序）
     let output_path = output_dir.join(format!("instances_{}.json", dbnum));
-    let json_str = serde_json::to_string_pretty(&instances_json)?;
+    let json_str = if let Some(map) = instances_json_map {
+        // 直接序列化 IndexMap 以保持字段顺序
+        serde_json::to_string_pretty(&map)?
+    } else {
+        // 回退到 Value（不应该到达这里）
+        serde_json::to_string_pretty(&instances_json_value)?
+    };
     fs::write(&output_path, json_str)?;
 
     let trans_path = output_dir.join("trans.json");

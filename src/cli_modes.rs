@@ -1893,6 +1893,66 @@ pub async fn export_dbnum_instances_json_mode(
     Ok(())
 }
 
+/// 导出指定 dbnum 的实例数据为多表 Parquet 格式
+///
+/// 输出文件：
+/// - `instances_{dbnum}.parquet`     — 一行一个实例 refno
+/// - `geo_instances_{dbnum}.parquet` — 一行一个几何引用 (refno × geo_index)
+/// - `tubings_{dbnum}.parquet`       — 一行一个 TUBI 段
+/// - `transforms.parquet`            — 共享表（去重的变换矩阵）
+/// - `aabb.parquet`                  — 共享表（去重的包围盒）
+/// - `manifest_{dbnum}.json`         — 导出元信息
+pub async fn export_dbnum_instances_parquet_mode(
+    dbnum: u32,
+    verbose: bool,
+    output_override: Option<PathBuf>,
+    db_option_ext: &DbOptionExt,
+    root_refno: Option<RefnoEnum>,
+) -> Result<()> {
+    use aios_database::fast_model::export_model::export_dbnum_instances_parquet::export_dbnum_instances_parquet;
+    use std::sync::Arc;
+
+    println!("\n🎯 导出 dbnum 实例数据为 Parquet（多表）");
+    println!("====================================");
+
+    // 设置输出目录
+    let output_dir = output_override.unwrap_or_else(|| {
+        db_option_ext
+            .get_project_output_dir()
+            .join("instances_parquet")
+    });
+
+    // 连接数据库
+    println!("📡 连接数据库...");
+    init_surreal().await?;
+    println!("✅ 数据库连接成功");
+
+    // 调用导出函数
+    let db_option = Arc::new((**db_option_ext).clone());
+    let stats = export_dbnum_instances_parquet(
+        dbnum,
+        &output_dir,
+        db_option,
+        verbose,
+        None, // 使用默认毫米单位
+        root_refno,
+    )
+    .await?;
+
+    println!("\n🎉 Parquet 导出完成！");
+    println!("📊 统计信息:");
+    println!("   - 实例数量 (instances): {}", stats.instance_count);
+    println!("   - 几何引用数量 (geo_instances): {}", stats.geo_instance_count);
+    println!("   - TUBI 数量 (tubings): {}", stats.tubing_count);
+    println!("   - 变换矩阵数量 (transforms): {}", stats.transform_count);
+    println!("   - 包围盒数量 (aabb): {}", stats.aabb_count);
+    println!("   - 总文件大小: {} 字节", stats.total_bytes);
+    println!("   - 耗时: {:?}", stats.elapsed);
+    println!("   - 输出目录: {}", output_dir.display());
+
+    Ok(())
+}
+
 /// 导入 instances.json 到 SQLite 空间索引
 #[cfg(feature = "sqlite-index")]
 pub fn import_spatial_index_mode(

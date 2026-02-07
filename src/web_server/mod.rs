@@ -779,6 +779,11 @@ pub async fn start_web_server_with_config(
             "/api/sqlite-spatial/query",
             get(sqlite_spatial_api::api_sqlite_spatial_query),
         )
+        // SQLite 空间索引：统计与健康检查（诊断索引是否构建正确）
+        .route(
+            "/api/sqlite-spatial/stats",
+            get(sqlite_spatial_api::api_sqlite_spatial_stats),
+        )
         // 模型导出 API
         .route("/api/export/gltf", post(handlers::create_export_task))
         .route("/api/export/glb", post(handlers::create_export_task))

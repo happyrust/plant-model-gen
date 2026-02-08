@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::sync::Arc;
-use surrealdb::types::{self as surrealdb_types, SurrealValue};
+use surrealdb::types::SurrealValue;
 
 #[derive(Clone)]
 pub struct E3dTreeApiState {
@@ -121,14 +121,6 @@ pub struct SiteNodesResponse {
     pub nodes: Vec<SiteNodeDto>,
     pub total: usize,
     pub error_message: Option<String>,
-}
-
-#[derive(Debug, Deserialize, SurrealValue)]
-struct PeRow {
-    pub refno: Option<RefnoEnum>,
-    pub name: Option<String>,
-    pub noun: Option<String>,
-    pub owner: Option<RefnoEnum>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -489,85 +481,28 @@ async fn search_nodes(
 
     let limit = request.limit.unwrap_or(50).clamp(1, 200) as usize;
 
+    // 不使用 pe 全表搜索，必须指定具体 noun 表查询
+    const DEFAULT_SEARCH_NOUNS: &[&str] = &[
+        "EQUI", "PIPE", "BRAN", "NOZZ", "VALV", "PUMP", "TANK", "INST",
+        "ZONE", "STRU", "SUBS", "FRMW", "SITE",
+    ];
+
+    let nouns: Vec<String> = match request.nouns.as_ref() {
+        Some(v) if !v.is_empty() => v.clone(),
+        _ => DEFAULT_SEARCH_NOUNS.iter().map(|s| s.to_string()).collect(),
+    };
+
     let mut items: Vec<TreeNodeDto> = Vec::new();
-    if let Some(nouns) = request.nouns.as_ref() && !nouns.is_empty() {
-        for noun in nouns {
-            if items.len() >= limit {
-                break;
-            }
-
-            let rows = match aios_core::query_noun_hierarchy(noun, Some(keyword), None).await {
-                Ok(v) => v,
-                Err(e) => {
-                    return Ok(Json(SearchResponse {
-                        success: false,
-                        items: vec![],
-                        error_message: Some(format!(
-                            "query_noun_hierarchy failed for noun={noun}: {e}"
-                        )),
-                    }));
-                }
-            };
-
-            for row in rows {
-                if items.len() >= limit {
-                    break;
-                }
-                items.push(TreeNodeDto {
-                    refno: row.id,
-                    name: row.name,
-                    noun: row.noun,
-                    owner: Some(row.owner),
-                    children_count: row.children_cnt,
-                });
-            }
+    for noun in &nouns {
+        if items.len() >= limit {
+            break;
         }
-    } else {
-        let sql = r#"
-            SELECT
-              refno,
-              fn::default_name(id) as name,
-              noun,
-              owner
-            FROM pe
-            WHERE refno != NONE
-              AND (
-                string::contains(
-                    string::lowercase(fn::default_name(id) ?? ''),
-                    string::lowercase($keyword)
-                )
-                OR string::contains(
-                    string::lowercase(type::string(id)),
-                    string::lowercase($keyword)
-                )
-              )
-            LIMIT $limit
-        "#;
 
-        let mut resp = match SUL_DB
-            .query(sql)
-            .bind(("keyword", keyword.to_string()))
-            .bind(("limit", limit as i32))
-            .await
-        {
+        let rows = match aios_core::query_noun_hierarchy(noun, Some(keyword), None).await {
             Ok(v) => v,
             Err(e) => {
-                return Ok(Json(SearchResponse {
-                    success: false,
-                    items: vec![],
-                    error_message: Some(format!("Database query error: {e}")),
-                }));
-            }
-        };
-
-        let rows: Vec<PeRow> = match resp.take(0) {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(Json(SearchResponse {
-                    success: false,
-                    items: vec![],
-                    error_message: Some(format!("Database decode error: {e}")),
-                }));
+                eprintln!("query_noun_hierarchy failed for noun={noun}: {e}");
+                continue;
             }
         };
 
@@ -575,15 +510,12 @@ async fn search_nodes(
             if items.len() >= limit {
                 break;
             }
-            let Some(refno) = row.refno else {
-                continue;
-            };
             items.push(TreeNodeDto {
-                refno,
-                name: row.name.unwrap_or_else(|| "UNKNOWN".to_string()),
-                noun: row.noun.unwrap_or_else(|| "UNKNOWN".to_string()),
-                owner: row.owner,
-                children_count: None,
+                refno: row.id,
+                name: row.name,
+                noun: row.noun,
+                owner: Some(row.owner),
+                children_count: row.children_cnt,
             });
         }
     }

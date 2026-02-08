@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use aios_core::RefnoEnum;
 use aios_core::SurrealQueryExt;
+use std::str::FromStr;
 use aios_core::mesh_precision::LodLevel;
 use aios_core::options::DbOption;
 use aios_core::shape::pdms_shape::PlantMesh;
@@ -2690,25 +2691,51 @@ pub async fn export_dbnum_instances_json(
     let tree_dir = tree_manager.tree_dir().to_path_buf();
     let tree_path = tree_dir.join(format!("{}.tree", dbnum));
 
-    // 方案乙：按需生成缺失的 `{dbnum}.tree`（无需全库预生成）。
-    ensure_tree_index_exists(dbnum, &tree_dir)
-        .await
-        .with_context(|| format!("按需生成 TreeIndex 失败: {}", tree_path.display()))?;
+    // 尝试加载 TreeIndex；若提供了 root_refno 且 TreeIndex 不可用，
+    // 可直接从 inst_relate 查询该 owner 的子节点（无需 pe 表数据）。
+    let tree_index_result = async {
+        ensure_tree_index_exists(dbnum, &tree_dir).await?;
+        load_index_with_large_stack(&tree_dir, dbnum)
+            .with_context(|| format!("加载 TreeIndex 失败: {}", tree_path.display()))
+    }.await;
 
-    // 在大栈线程中加载，避免 Windows 上反序列化大 tree 文件触发栈溢出。
-    let tree_index = load_index_with_large_stack(&tree_dir, dbnum)
-        .with_context(|| format!("加载 TreeIndex 失败: {}", tree_path.display()))?;
-    
     // 获取待导出的 refno 列表
     let mut all_refnos: Vec<RefnoEnum> = if let Some(root) = root_refno {
-        // 使用 query_compat 中基于 TreeIndex 的可见子孙查询
-        use crate::fast_model::query_compat::query_visible_geo_descendants;
-        if verbose {
-            println!("🔍 查询 {} 的 visible 子孙节点...", root);
+        if let Ok(ref _tree_index) = tree_index_result {
+            // TreeIndex 可用：使用 query_compat 中基于 TreeIndex 的可见子孙查询
+            use crate::fast_model::query_compat::query_visible_geo_descendants;
+            if verbose {
+                println!("🔍 查询 {} 的 visible 子孙节点（TreeIndex）...", root);
+            }
+            query_visible_geo_descendants(root, true, Some("..")).await?
+        } else {
+            // TreeIndex 不可用：直接从 inst_relate 查询该 owner 的子节点
+            if verbose {
+                println!("⚠️  TreeIndex 不可用，直接从 inst_relate 查询 {} 的子节点...", root);
+            }
+            let sql = format!(
+                "SELECT value record::id(id) FROM inst_relate WHERE owner_refno = pe:`{}`",
+                root
+            );
+            let refno_strs: Vec<String> = aios_core::SUL_DB.query_take(&sql, 0).await?;
+            if refno_strs.is_empty() {
+                anyhow::bail!("inst_relate 中未找到 owner_refno={} 的子节点", root);
+            }
+            if verbose {
+                println!("✅ 从 inst_relate 获取 {} 条子节点 refno", refno_strs.len());
+            }
+            refno_strs
+                .iter()
+                .filter_map(|s| {
+                    let normalized = s.replace('_', "/");
+                    RefnoEnum::from_str(&normalized).ok()
+                })
+                .collect()
         }
-        query_visible_geo_descendants(root, true, Some("..")).await?
     } else {
-        // 原有逻辑：加载整个 dbnum 的 TreeIndex
+        // 无 root_refno：必须有 TreeIndex
+        let tree_index = tree_index_result
+            .with_context(|| format!("按需生成 TreeIndex 失败: {}", tree_path.display()))?;
         tree_index
             .all_refnos()
             .into_iter()
@@ -2717,7 +2744,7 @@ pub async fn export_dbnum_instances_json(
     };
     all_refnos.sort_by_key(|r| r.to_string());
     if verbose {
-        println!("✅ TreeIndex 加载完成，refno 数量: {}", all_refnos.len());
+        println!("✅ refno 列表加载完成，数量: {}", all_refnos.len());
     }
 
     // 2. 分批查询 inst_relate 记录（避免全表扫描）

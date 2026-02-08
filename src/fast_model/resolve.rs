@@ -294,24 +294,31 @@ pub async fn resolve_desi_comp(
         context.insert(format!("CPAR{}", i + 1), value.to_string());
     }
 
-    // 添加 IPARAM 数据到 context 中
-    // 使用 SurrealDB 的 fn::get_ipara 函数查询
-    // 注意：表达式解析器会将 "IPARAM" 截断为 "IPARA"（去掉末尾的 "M"）
+    // IPARAM（保温层参数）：根据 context.with_insulation 开关决定是否代入实际值。
+    // - false（默认）：IPARAM 全部为 0，生成物理几何模型
+    // - true：IPARAM 使用实际保温层厚度（来自 ISPE→SPCO→CATR.PARA），生成含保温层的模型
     match query_iparam_from_desi(desi_refno).await {
         Ok(iparams) => {
-            debug_model_debug!("IPARAM query result: {:?}", iparams);
+            debug_model_debug!(
+                "IPARAM query result: {:?}, with_insulation={}",
+                iparams,
+                context.with_insulation
+            );
 
             for (i, value) in iparams.iter().enumerate() {
-                // IPARAM 使用空格分隔的键名，索引从 1 开始（根据注释中的 IPAR1, IPARM1）
-                // 添加所有可能的键名格式
-                context.insert(format!("IPARAM {}", i + 1), value.to_string());
-                context.insert(format!("IPARAM{}", i + 1), value.to_string());
-                context.insert(format!("IPARA {}", i + 1), value.to_string());
-                context.insert(format!("IPARA{}", i + 1), value.to_string());
-                context.insert(format!("IPAR {}", i + 1), value.to_string());
-                context.insert(format!("IPAR{}", i + 1), value.to_string());
-                context.insert(format!("IPARM {}", i + 1), value.to_string());
-                context.insert(format!("IPARM{}", i + 1), value.to_string());
+                let v = if context.with_insulation {
+                    value.to_string()
+                } else {
+                    "0".to_string()
+                };
+                context.insert(format!("IPARAM {}", i + 1), v.clone());
+                context.insert(format!("IPARAM{}", i + 1), v.clone());
+                context.insert(format!("IPARA {}", i + 1), v.clone());
+                context.insert(format!("IPARA{}", i + 1), v.clone());
+                context.insert(format!("IPAR {}", i + 1), v.clone());
+                context.insert(format!("IPAR{}", i + 1), v.clone());
+                context.insert(format!("IPARM {}", i + 1), v.clone());
+                context.insert(format!("IPARM{}", i + 1), v.clone());
             }
         }
         Err(e) => {

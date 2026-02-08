@@ -64,6 +64,8 @@ pub async fn gen_all_geos_data(
     target_sesno: Option<u32>,
 ) -> Result<bool> {
     let time = Instant::now();
+    let mut perf = crate::perf_timer::PerfTimer::new("gen_all_geos_data");
+    perf.mark("init");
     let mut final_incr_updates = incr_updates;
 
     // 如果指定了 target_sesno，获取该 sesno 的增量数据
@@ -118,6 +120,7 @@ pub async fn gen_all_geos_data(
     )
     .entered();
 
+    perf.mark("precheck");
     // ✨ 执行预检查：确保 Tree 文件、pe_transform、db_meta_info 就绪
     if db_option.use_surrealdb {
         use crate::fast_model::gen_model::precheck_coordinator::{run_precheck, PrecheckConfig};
@@ -185,7 +188,9 @@ pub async fn gen_all_geos_data(
         .as_ref()
         .map(|v| !v.is_empty())
         .unwrap_or(false);
-    if has_debug || has_manual_refnos || is_incr_update {
+    perf.mark("route_decision");
+    let result = if has_debug || has_manual_refnos || is_incr_update {
+        perf.mark("targeted_generation");
         process_targeted_generation(
             manual_refnos,
             db_option,
@@ -195,10 +200,15 @@ pub async fn gen_all_geos_data(
         )
         .await
     } else if db_option.full_noun_mode {
+        perf.mark("full_noun_pipeline");
         process_full_noun_mode(db_option, final_incr_updates, time).await
     } else {
+        perf.mark("full_database_generation");
         process_full_database_generation(db_option, target_sesno, time).await
-    }
+    };
+
+    perf.print_summary();
+    result
 }
 
 async fn resolve_dbnum_from_shape(
@@ -257,6 +267,9 @@ async fn process_full_noun_mode(
     incr_updates: Option<IncrGeoUpdateLog>,
     time: Instant,
 ) -> Result<bool> {
+    let mut perf = crate::perf_timer::PerfTimer::new("full_noun_mode");
+    perf.mark("init");
+
     println!("[gen_model] 进入 Full Noun 模式（新 gen_model 管线）");
 
     if db_option.manual_db_nums.is_some() || db_option.exclude_db_nums.is_some() {
@@ -270,6 +283,8 @@ async fn process_full_noun_mode(
     }
 
     let full_start = Instant::now();
+
+    perf.mark("categorize_and_inst_relate");
 
     // 1️⃣ 生成/更新 inst_relate，并获取分类后的根 refno
     let config = FullNounConfig::from_db_option_ext(db_option)
@@ -432,6 +447,8 @@ async fn process_full_noun_mode(
         full_start.elapsed().as_millis()
     );
 
+    perf.mark("mesh_generation");
+
     // 2️⃣ 可选执行 mesh 生成
     if db_option.inner.gen_mesh {
         #[cfg(feature = "profile")]
@@ -485,6 +502,8 @@ async fn process_full_noun_mode(
             );
         }
 
+        perf.mark("aabb_write");
+
         // 3️⃣ 写入 inst_relate_aabb 并导出 Parquet（供房间计算使用）
         if use_surrealdb {
         #[cfg(feature = "profile")]
@@ -532,6 +551,8 @@ async fn process_full_noun_mode(
         }
         }
 
+        perf.mark("boolean_operation");
+
         // 4️⃣ 可选执行布尔运算
         if db_option.inner.apply_boolean_operation {
             #[cfg(feature = "profile")]
@@ -559,6 +580,8 @@ async fn process_full_noun_mode(
                 bool_start.elapsed().as_millis()
             );
         }
+
+        perf.mark("web_bundle_export");
 
         // 5️⃣ 生成 Web Bundle (GLB + JSON 数据包)
         if db_option.mesh_formats.contains(&MeshFormat::Glb) {
@@ -597,6 +620,8 @@ async fn process_full_noun_mode(
         }
     }
 
+    perf.mark("sqlite_spatial_index");
+
     println!(
         "[gen_model] Full Noun 模式全部完成，总用时 {} ms",
         full_start.elapsed().as_millis()
@@ -616,6 +641,8 @@ async fn process_full_noun_mode(
     if let Err(e) = update_sqlite_spatial_index_from_cache(db_option, &touched_dbnums_vec).await {
         eprintln!("[gen_model] SQLite 空间索引生成失败: {}", e);
     }
+
+    perf.mark("instances_export");
 
     // ✅ 模型生成完毕后导出 instances.json（按 dbno）
     if db_option.export_instances {
@@ -650,6 +677,53 @@ async fn process_full_noun_mode(
         }
     }
 
+    perf.end_current();
+
+    // 输出性能摘要到控制台
+    perf.print_summary();
+
+    // 保存性能报告为 JSON 和 CSV
+    let project_name = if !db_option.inner.project_name.is_empty() {
+        db_option.inner.project_name.clone()
+    } else {
+        "default".to_string()
+    };
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let profile_dir = std::path::PathBuf::from("output")
+        .join(&project_name)
+        .join("profile");
+
+    // 收集配置元数据
+    let dbnum_tag = db_option.inner.manual_db_nums.as_ref()
+        .and_then(|nums| nums.first().copied())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "all".to_string());
+
+    let enabled_nouns = db_option.full_noun_enabled_categories.clone();
+
+    let metadata = serde_json::json!({
+        "mode": "full_noun",
+        "project_name": project_name,
+        "dbnum": dbnum_tag,
+        "enabled_nouns": enabled_nouns,
+        "use_surrealdb": db_option.use_surrealdb,
+        "use_cache": db_option.use_cache,
+        "apply_boolean": db_option.inner.apply_boolean_operation,
+        "gen_mesh": db_option.inner.gen_mesh,
+        "concurrency": db_option.get_full_noun_concurrency(),
+        "batch_size": db_option.get_full_noun_batch_size(),
+    });
+
+    let json_path = profile_dir.join(format!("perf_gen_model_full_noun_dbnum_{}_{}.json", dbnum_tag, timestamp));
+    let csv_path = profile_dir.join(format!("perf_gen_model_full_noun_dbnum_{}_{}.csv", dbnum_tag, timestamp));
+
+    if let Err(e) = perf.save_json(&json_path, metadata.clone()) {
+        eprintln!("[perf] 保存 JSON 报告失败: {}", e);
+    }
+    if let Err(e) = perf.save_csv(&csv_path, metadata) {
+        eprintln!("[perf] 保存 CSV 报告失败: {}", e);
+    }
+
     Ok(true)
 }
 
@@ -671,6 +745,14 @@ async fn process_targeted_generation(
     } else {
         "调试"
     };
+
+    #[cfg(feature = "profile")]
+    let _targeted_span = tracing::info_span!(
+        "targeted_generation",
+        mode = mode_label,
+        manual_cnt = manual_refnos.len(),
+        is_incr = is_incr_update,
+    ).entered();
 
     // foyer cache-only 上下文：统一管理 cache_dir 与 InstanceCacheManager（并尽力预初始化 transform_cache）。
     let foyer_cache_ctx = crate::fast_model::foyer_cache::FoyerCacheContext::try_from_db_option(db_option).await?;

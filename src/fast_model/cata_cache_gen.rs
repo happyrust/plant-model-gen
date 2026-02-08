@@ -239,6 +239,7 @@ pub async fn gen_cata_geos_for_cache(
 
             let mut geo_insts: Vec<EleInstGeo> = Vec::new();
             let mut has_solid = false;
+            let respect_tufl = std::env::var_os("AIOS_RESPECT_TUFL").is_some();
 
             for shape in shapes.into_iter() {
                 let CateCsgShape {
@@ -252,7 +253,7 @@ pub async fn gen_cata_geos_for_cache(
                     ..
                 } = shape;
 
-                if !csg_shape.check_valid() || !visible {
+                if !csg_shape.check_valid() || (respect_tufl && !visible) {
                     continue;
                 }
 

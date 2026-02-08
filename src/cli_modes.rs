@@ -1953,6 +1953,89 @@ pub async fn export_dbnum_instances_parquet_mode(
     Ok(())
 }
 
+/// 导出指定 dbnum 的 PDMS Tree（TreeIndex + name/noun/children_count）为 Parquet
+///
+/// 输出目录默认为：output/<project>/scene_tree_parquet/
+pub async fn export_pdms_tree_parquet_mode(
+    dbnum: u32,
+    verbose: bool,
+    output_override: Option<PathBuf>,
+    db_option_ext: &DbOptionExt,
+) -> Result<()> {
+    use aios_database::fast_model::export_model::export_pdms_tree_parquet::export_pdms_tree_parquet;
+
+    println!("\n🎯 导出 PDMS Tree 为 Parquet（供 DuckDB/duckdb-wasm 查询模型树）");
+    println!("==============================================");
+    println!("   - dbnum: {}", dbnum);
+
+    // 输出目录：默认 output/<project>/scene_tree_parquet
+    let output_dir = output_override.unwrap_or_else(|| {
+        db_option_ext
+            .get_project_output_dir()
+            .join("scene_tree_parquet")
+    });
+    println!("   - 输出目录: {}", output_dir.display());
+
+    println!("📡 连接数据库...");
+    if let Err(e) = init_surreal().await {
+        println!("⚠️  数据库连接失败，将回退到离线 name 兜底模式：{e}");
+    } else {
+        println!("✅ 数据库连接成功");
+    }
+
+    let stats = export_pdms_tree_parquet(dbnum, &output_dir, verbose).await?;
+
+    println!("\n🎉 PDMS Tree Parquet 导出完成！");
+    println!("📊 统计信息:");
+    println!("   - 节点数量: {}", stats.node_count);
+    println!("   - 输出文件: {}", output_dir.join(&stats.file_name).display());
+    println!("   - 文件大小: {} 字节", stats.total_bytes);
+    println!("   - generated_at: {}", stats.generated_at);
+
+    Ok(())
+}
+
+/// 导出 WORL -> SITE 节点列表为 Parquet（替代后端 e3d children 对 WORL 的特判）
+///
+/// 输出目录默认为：output/<project>/scene_tree_parquet/
+pub async fn export_world_sites_parquet_mode(
+    verbose: bool,
+    output_override: Option<PathBuf>,
+    db_option_ext: &DbOptionExt,
+) -> Result<()> {
+    use aios_database::fast_model::export_model::export_pdms_tree_parquet::export_world_sites_parquet;
+
+    println!("\n🎯 导出 WORL -> SITE 节点列表为 Parquet（供 DuckDB/duckdb-wasm 查询）");
+    println!("==========================================================");
+
+    // 输出目录：默认 output/<project>/scene_tree_parquet
+    let output_dir = output_override.unwrap_or_else(|| {
+        db_option_ext
+            .get_project_output_dir()
+            .join("scene_tree_parquet")
+    });
+    println!("   - 输出目录: {}", output_dir.display());
+
+    println!("📡 连接数据库...");
+    if let Err(e) = init_surreal().await {
+        println!("⚠️  数据库连接失败，将回退到离线 tree 扫描模式：{e}");
+    } else {
+        println!("✅ 数据库连接成功");
+    }
+
+    let stats = export_world_sites_parquet(&output_dir, verbose).await?;
+
+    println!("\n🎉 WORL->SITE Parquet 导出完成！");
+    println!("📊 统计信息:");
+    println!("   - world_refno: {}", stats.world_refno);
+    println!("   - SITE 数量: {}", stats.site_count);
+    println!("   - 输出文件: {}", output_dir.join(&stats.file_name).display());
+    println!("   - 文件大小: {} 字节", stats.total_bytes);
+    println!("   - generated_at: {}", stats.generated_at);
+
+    Ok(())
+}
+
 /// 导入 instances.json 到 SQLite 空间索引
 #[cfg(feature = "sqlite-index")]
 pub fn import_spatial_index_mode(

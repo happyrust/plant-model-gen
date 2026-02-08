@@ -26,6 +26,11 @@ pub async fn query_geometry_instances_ext_from_cache(
     include_negative: bool,
     verbose: bool,
 ) -> Result<Vec<GeomInstQuery>> {
+    let _span = crate::profile_span!(
+        "cache_query_geometry_instances",
+        refno_cnt = refnos.len(),
+        enable_holes = enable_holes
+    );
     use crate::data_interface::db_meta_manager::db_meta;
     use crate::fast_model::instance_cache::InstanceCacheManager;
     use aios_core::geometry::GeoBasicType;
@@ -356,7 +361,9 @@ pub async fn query_geometry_instances_ext_from_cache(
                         | GeoBasicType::DesiPos
                         | GeoBasicType::CatePos
                         | GeoBasicType::Compound => {}
-                        _ => continue,
+                        _ => {
+                            continue;
+                        }
                     }
 
                     entry.insts.push(ModelHashInst {

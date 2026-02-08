@@ -184,6 +184,13 @@ pub async fn save_instance_data_optimize(
     inst_mgr: &ShapeInstancesData,
     replace_exist: bool,
 ) -> anyhow::Result<()> {
+    let _save_span = crate::profile_span!(
+        "save_instance_data_optimize",
+        inst_info_cnt = inst_mgr.inst_info_map.len(),
+        inst_geos_cnt = inst_mgr.inst_geos_map.len(),
+        inst_tubi_cnt = inst_mgr.inst_tubi_map.len(),
+        replace_exist = replace_exist
+    );
 
     debug_model_debug!(
         "save_instance_data_optimize start: inst_info={}, inst_geo_keys={}, tubi_keys={}, replace_exist={}",

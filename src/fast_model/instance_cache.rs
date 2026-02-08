@@ -105,10 +105,17 @@ impl InstanceCacheManager {
     }
 
     pub fn insert_batch(&self, batch: CachedInstanceBatch) {
+        let _span = crate::profile_span!(
+            "cache_insert_batch",
+            dbnum = batch.dbnum,
+            inst_info_cnt = batch.inst_info_map.len(),
+            inst_geos_cnt = batch.inst_geos_map.len()
+        );
         let key = InstanceCacheKey {
             dbnum: batch.dbnum,
             batch_id: batch.batch_id.clone(),
         };
+        let ser_start = std::time::Instant::now();
         let payload = match serde_json::to_vec(&batch) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -119,6 +126,13 @@ impl InstanceCacheManager {
                 return;
             }
         };
+        let ser_ms = ser_start.elapsed().as_millis();
+        #[cfg(feature = "profile")]
+        tracing::info!(
+            payload_bytes = payload.len(),
+            serialize_ms = ser_ms as u64,
+            "cache_insert_batch serialized"
+        );
         let value = InstanceCacheValue { payload };
         let dbnum = batch.dbnum;
         let batch_id = batch.batch_id.clone();
@@ -160,6 +174,7 @@ impl InstanceCacheManager {
     }
 
     pub async fn get(&self, dbnum: u32, batch_id: &str) -> Option<CachedInstanceBatch> {
+        let _span = crate::profile_span!("cache_get_batch", dbnum = dbnum);
         let key = InstanceCacheKey {
             dbnum,
             batch_id: batch_id.to_string(),
@@ -167,8 +182,17 @@ impl InstanceCacheManager {
         match self.cache.get(&key).await {
             Ok(Some(entry)) => {
                 let payload = &entry.value().payload;
+                let deser_start = std::time::Instant::now();
                 match serde_json::from_slice::<CachedInstanceBatch>(payload) {
-                    Ok(batch) => Some(batch),
+                    Ok(batch) => {
+                        #[cfg(feature = "profile")]
+                        tracing::debug!(
+                            payload_bytes = payload.len(),
+                            deserialize_ms = deser_start.elapsed().as_millis() as u64,
+                            "cache_get_batch deserialized"
+                        );
+                        Some(batch)
+                    }
                     Err(e) => {
                         eprintln!(
                             "[cache] 反序列化失败: dbnum={}, batch_id={}, err={}",

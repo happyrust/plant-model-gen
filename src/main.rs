@@ -540,6 +540,18 @@ async fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("export-pdms-tree-parquet")
+                .long("export-pdms-tree-parquet")
+                .help("Export PDMS TreeIndex + pe.name as Parquet (pdms_tree_{dbnum}.parquet) for DuckDB-WASM model tree queries")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("export-world-sites-parquet")
+                .long("export-world-sites-parquet")
+                .help("Export WORL->SITE nodes as Parquet (world_sites.parquet) for DuckDB-WASM (Full Parquet Mode)")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("export-dbnum-instances")
                 .long("export-dbnum-instances")
                 .help("Export dbnum instances (default: Parquet format; use --export-dbnum-instances-json for JSON)")
@@ -1507,6 +1519,29 @@ async fn main() -> anyhow::Result<()> {
             detailed,
         )
             .await;
+    }
+
+    // 导出 WORL -> SITE 节点列表为 Parquet（Full Parquet Mode 的根节点 children 数据源）
+    if matches.get_flag("export-world-sites-parquet") {
+        use crate::cli_modes::export_world_sites_parquet_mode;
+        let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
+        return export_world_sites_parquet_mode(verbose, export_bundle_dir, &db_option_ext).await;
+    }
+
+    // 导出指定 dbnum 的 PDMS Tree 为 Parquet（TreeIndex + pe.name）
+    if matches.get_flag("export-pdms-tree-parquet") {
+        use crate::cli_modes::export_pdms_tree_parquet_mode;
+        let dbnum = matches.get_one::<u32>("dbnum").copied();
+        let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
+        let dbnum = match dbnum {
+            Some(n) => n,
+            None => {
+                eprintln!("❌ 错误: --export-pdms-tree-parquet 需要提供 --dbnum 参数");
+                eprintln!("   例如: cargo run -- --export-pdms-tree-parquet --dbnum 7997");
+                std::process::exit(1);
+            }
+        };
+        return export_pdms_tree_parquet_mode(dbnum, verbose, export_bundle_dir, &db_option_ext).await;
     }
 
     // 导出 dbnum 实例数据为 Parquet（显式 --export-dbnum-instances-parquet）

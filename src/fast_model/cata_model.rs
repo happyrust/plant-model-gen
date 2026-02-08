@@ -914,9 +914,10 @@ async fn gen_cata_geos_inner(
                         let mut shape_skip_invisible = 0usize;
                         let mut shape_skip_nan = 0usize;
                         let mut shape_added = 0usize;
+                        let respect_tufl = std::env::var_os("AIOS_RESPECT_TUFL").is_some();
                         let mut visible_set = HashSet::new();
                         for s in &shapes {
-                            if s.visible {
+                            if !respect_tufl || s.visible {
                                 visible_set.insert(s.refno);
                             }
                         }
@@ -953,7 +954,7 @@ async fn gen_cata_geos_inner(
                                 shape_skip_invalid += 1;
                                 continue;
                             }
-                            if !visible {
+                            if respect_tufl && !visible {
                                 debug_model!("shape[{}] not visible, skipping", shape_idx);
                                 shape_skip_invisible += 1;
                                 continue;

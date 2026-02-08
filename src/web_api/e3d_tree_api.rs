@@ -232,17 +232,21 @@ async fn get_children(
                 let child_refnos = manager.query_children(parent_refno);
 
                 let mut out: Vec<TreeNodeDto> = Vec::with_capacity(child_refnos.len());
-                for r in child_refnos {
-                    let noun = manager.get_noun(r).unwrap_or_default();
-                    let name = crate::fast_model::query_provider::get_pe(r)
+                for (idx, r) in child_refnos.iter().enumerate() {
+                    let noun = manager.get_noun(*r).unwrap_or_default();
+                    let mut name = crate::fast_model::query_provider::get_pe(*r)
                         .await
                         .ok()
                         .flatten()
                         .map(|pe| pe.name)
                         .unwrap_or_default();
-                    let children_count = manager.query_children(r).len() as i32;
+                    // 与 fn::default_name 一致：name 为空时生成 "{noun} {order+1}"
+                    if name.trim().is_empty() {
+                        name = format!("{} {}", noun, idx + 1);
+                    }
+                    let children_count = manager.query_children(*r).len() as i32;
                     out.push(TreeNodeDto {
-                        refno: r,
+                        refno: *r,
                         name,
                         noun,
                         owner: Some(parent_refno),
@@ -337,7 +341,7 @@ async fn get_subtree_refnos(
 
 async fn get_visible_insts(
     Path(refno): Path<RefnoEnum>,
-    State(_state): State<E3dTreeApiState>,
+    State(state): State<E3dTreeApiState>,
 ) -> Result<Json<VisibleInstsResponse>, StatusCode> {
     // 1) 先拿“深度可见实例”（可能包含无几何的组节点）
     // 层级查询统一走 indextree（TreeIndex）
@@ -368,70 +372,78 @@ async fn get_visible_insts(
     }
 
     fn collect_component_refnos(v: &serde_json::Value, out: &mut HashSet<String>) {
-        let Some(obj) = v.as_object() else { return };
-
-        // ungrouped: [{ refno, instances: [...] }, ...]
-        if let Some(arr) = obj.get("ungrouped").and_then(|x| x.as_array()) {
-            for item in arr {
-                if let Some(r) = item.get("refno").and_then(|x| x.as_str()) {
-                    out.insert(r.to_string());
-                }
-            }
-        }
-
-        // bran_groups / equi_groups: [{ refno, children: [{refno,...}, ...], tubings: [{refno,...}, ...] }, ...]
-        for key in ["bran_groups", "equi_groups"] {
-            let Some(arr) = obj.get(key).and_then(|x| x.as_array()) else { continue };
-            for g in arr {
-                if let Some(r) = g.get("refno").and_then(|x| x.as_str()) {
-                    out.insert(r.to_string());
-                }
-                if let Some(children) = g.get("children").and_then(|x| x.as_array()) {
-                    for c in children {
-                        if let Some(r) = c.get("refno").and_then(|x| x.as_str()) {
-                            out.insert(r.to_string());
+        // 兼容多种 compact JSON 格式：递归收集所有 key=="refno" 的字符串
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, val) in map {
+                    if k == "refno" {
+                        if let Some(s) = val.as_str() {
+                            out.insert(s.to_string());
                         }
                     }
-                }
-                if let Some(tubings) = g.get("tubings").and_then(|x| x.as_array()) {
-                    for t in tubings {
-                        if let Some(r) = t.get("refno").and_then(|x| x.as_str()) {
-                            out.insert(r.to_string());
-                        }
-                    }
+                    collect_component_refnos(val, out);
                 }
             }
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    collect_component_refnos(item, out);
+                }
+            }
+            _ => {}
         }
     }
 
-    let refnos = if let Some(dbnum) = parse_dbno(refno).await {
-        let instances_path =
+    // NOTE:
+    // - instances_{dbnum}.json 位于项目输出目录：output/<project_name>/instances/
+    // - 历史兼容：也支持旧路径 output/instances/
+    // - 文件读取/解析成功时：即使结果为空，也不回退 inst_relate（避免 inst_relate 缺失时接口直接报错）
+    let (refnos, file_ok) = if let Some(dbnum) = parse_dbno(refno).await {
+        let project_name = state.db_manager.db_option.project_name.clone();
+        let instances_path_new = std::path::Path::new("output")
+            .join(&project_name)
+            .join("instances")
+            .join(format!("instances_{dbnum}.json"));
+        let instances_path_old =
             std::path::Path::new("output").join("instances").join(format!("instances_{dbnum}.json"));
-        if let Ok(bytes) = fs::read(&instances_path) {
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                let mut available = HashSet::<String>::new();
-                collect_component_refnos(&json, &mut available);
-                let mut out = candidates
-                    .iter()
-                    .copied()
-                    .filter(|r| available.contains(&r.to_string()))
-                    .collect::<Vec<_>>();
-                out.sort();
-                out.dedup();
-                out
-            } else {
-                Vec::new()
+
+        let bytes = fs::read(&instances_path_new).or_else(|_| fs::read(&instances_path_old));
+        if let Ok(bytes) = bytes {
+            match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(json) => {
+                    let mut available = HashSet::<String>::new();
+                    collect_component_refnos(&json, &mut available);
+
+                    let mut out = Vec::new();
+                    for r in candidates.iter().copied() {
+                        let key = r.to_string();
+                        let matched = if available.contains(&key) {
+                            true
+                        } else if key.contains('/') {
+                            available.contains(&key.replace('/', "_"))
+                        } else {
+                            false
+                        };
+                        if matched {
+                            out.push(r);
+                        }
+                    }
+
+                    out.sort();
+                    out.dedup();
+                    (out, true)
+                }
+                Err(_) => (Vec::new(), false),
             }
         } else {
-            Vec::new()
+            (Vec::new(), false)
         }
     } else {
-        Vec::new()
+        (Vec::new(), false)
     };
 
-    // 如果文件过滤成功拿到结果（或文件存在但无匹配），直接返回；
-    // 如果文件缺失/解析失败导致 refnos 为空，则回退到 inst_relate 几何实例过滤。
-    let refnos = if !refnos.is_empty() {
+    // 文件读取/解析成功时：直接使用文件过滤结果（允许为空）
+    // 文件缺失/解析失败：回退到 inst_relate 几何实例过滤。
+    let refnos = if file_ok {
         refnos
     } else {
         match crate::fast_model::export_model::model_exporter::query_geometry_instances(
@@ -533,9 +545,24 @@ async fn query_node(refno: RefnoEnum) -> anyhow::Result<Option<TreeNodeDto>> {
         return Ok(None);
     };
 
+    let mut name = pe.name;
+    // 与 fn::default_name 一致：name 为空时生成 "{noun} {order+1}"
+    if name.trim().is_empty() {
+        use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+        let order = match TreeIndexManager::resolve_dbnum_for_refno(refno).await {
+            Ok(dbnum) => {
+                let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+                let siblings = manager.query_children(pe.owner);
+                siblings.iter().position(|r| *r == refno).unwrap_or(0)
+            }
+            Err(_) => 0,
+        };
+        name = format!("{} {}", pe.noun, order + 1);
+    }
+
     Ok(Some(TreeNodeDto {
         refno: pe.refno,
-        name: pe.name,
+        name,
         noun: pe.noun,
         owner: Some(pe.owner),
         children_count: None,

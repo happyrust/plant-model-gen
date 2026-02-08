@@ -1272,6 +1272,7 @@ pub async fn get_tasks(
     }
 
     Ok(Json(json!({
+        "success": true,
         "tasks": tasks,
         "total": tasks.len()
     })))
@@ -1281,15 +1282,21 @@ pub async fn get_tasks(
 pub async fn get_task(
     Path(id): Path<String>,
     State(state): State<AppState>,
-) -> Result<Json<TaskInfo>, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let task_manager = state.task_manager.lock().await;
 
     if let Some(task) = task_manager.active_tasks.get(&id) {
-        return Ok(Json(task.clone()));
+        return Ok(Json(json!({
+            "success": true,
+            "task": task
+        })));
     }
 
     if let Some(task) = task_manager.task_history.iter().find(|t| t.id == id) {
-        return Ok(Json(task.clone()));
+        return Ok(Json(json!({
+            "success": true,
+            "task": task
+        })));
     }
 
     Err(StatusCode::NOT_FOUND)
@@ -1390,7 +1397,7 @@ pub async fn get_task_logs(
 pub async fn create_task(
     State(state): State<AppState>,
     Json(request): Json<CreateTaskRequest>,
-) -> Result<Json<TaskInfo>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     // 验证请求数据
     if request.name.trim().is_empty() {
         return Err((
@@ -1404,12 +1411,20 @@ pub async fn create_task(
     // 允许 manual_db_nums 为空：表示“全部数据库”
     let mut task_manager = state.task_manager.lock().await;
 
-    let task = TaskInfo::new(request.name, request.task_type, request.config);
+    let mut task = TaskInfo::new(request.name, request.task_type, request.config);
+    // 附加可选元数据（batch_id 等）
+    if let Some(metadata) = request.metadata {
+        task.metadata = Some(metadata);
+    }
     let task_id = task.id.clone();
 
-    task_manager.active_tasks.insert(task_id, task.clone());
+    task_manager.active_tasks.insert(task_id.clone(), task.clone());
 
-    Ok(Json(task))
+    Ok(Json(json!({
+        "success": true,
+        "taskId": task_id,
+        "task": task
+    })))
 }
 
 /// 启动任务
@@ -1424,6 +1439,9 @@ pub async fn start_task(
             task.status = TaskStatus::Running;
             task.started_at = Some(SystemTime::now());
             task.add_log(LogLevel::Info, "任务开始执行".to_string());
+
+            // Register task in ProgressHub for WebSocket progress tracking
+            state.progress_hub.register(id.clone());
 
             // 启动真实的任务执行逻辑
             let state_cp = state.clone();
@@ -2124,6 +2142,8 @@ pub async fn create_batch_tasks(
 
     let mut created_tasks = Vec::new();
     let mut previous_task_id = None;
+    let batch_id = uuid::Uuid::new_v4().to_string();
+    let batch_total = request.batch_config.db_nums.len();
 
     for (i, db_num) in request.batch_config.db_nums.iter().enumerate() {
         let task_name = format!("{} - 数据库 {}", request.batch_config.name_prefix, db_num);
@@ -2134,6 +2154,14 @@ pub async fn create_batch_tasks(
 
         let mut task = TaskInfo::new(task_name, template.task_type.clone(), config);
         task.estimated_duration = template.estimated_duration;
+
+        // Add batch metadata
+        task.metadata = Some(serde_json::json!({
+            "batch_id": batch_id,
+            "batch_index": i + 1,
+            "batch_total": batch_total,
+            "db_num": db_num
+        }));
 
         // 如果不是并行执行，添加依赖关系
         if !request.batch_config.parallel_execution {
@@ -3126,6 +3154,12 @@ pub async fn get_system_status(
 
     let task_manager = state.task_manager.lock().await;
     let active_count = task_manager.active_tasks.len() as u32;
+    let queued_count = task_manager
+        .active_tasks
+        .values()
+        .filter(|t| t.status == TaskStatus::Pending)
+        .count() as u32;
+    drop(task_manager);
 
     // 获取真实的系统信息
     let mut sys = System::new_all();
@@ -3162,6 +3196,7 @@ pub async fn get_system_status(
         cpu_usage,
         memory_usage,
         active_tasks: active_count,
+        queued_task_count: queued_count,
         database_connected: surrealdb_connected,
         surrealdb_connected,
     };
@@ -4037,6 +4072,42 @@ fn analyze_expression_error(error: &anyhow::Error, expression: &str) -> (String,
     }
 }
 
+/// Try to start the next pending task in queue after a task completes.
+/// NOTE: This is a fire-and-forget spawn to break the async recursion cycle
+/// (execute_real_task -> try_start_next_pending -> execute_real_task).
+fn try_start_next_pending(state: AppState) {
+    tokio::spawn(async move {
+        let mut task_manager = state.task_manager.lock().await;
+        // Find first Pending task
+        let pending_id = task_manager
+            .active_tasks
+            .iter()
+            .find(|(_, t)| t.status == TaskStatus::Pending)
+            .map(|(id, _)| id.clone());
+
+        if let Some(id) = pending_id {
+            if let Some(task) = task_manager.active_tasks.get_mut(&id) {
+                task.status = TaskStatus::Running;
+                task.started_at = Some(SystemTime::now());
+                task.add_log(LogLevel::Info, "任务自动从队列启动".to_string());
+            }
+            // Register in ProgressHub
+            state.progress_hub.register(id.clone());
+            drop(task_manager);
+
+            let state_cp = state.clone();
+            tokio::spawn(async move {
+                let _permit = TASK_EXEC_SEMAPHORE
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore");
+                execute_real_task(state_cp, id).await;
+            });
+        }
+    });
+}
+
 async fn execute_real_task(state: AppState, task_id: String) {
     use crate::fast_model::aabb_tree::manual_update_aabbs;
     use crate::fast_model::build_room_relations;
@@ -4046,6 +4117,9 @@ async fn execute_real_task(state: AppState, task_id: String) {
 
     use aios_core::init_surreal;
     use std::time::Instant;
+
+    // Register task in ProgressHub for WebSocket progress tracking
+    state.progress_hub.register(task_id.clone());
 
     // 获取任务配置和类型
     let (config, task_type) = {
@@ -4102,6 +4176,22 @@ async fn execute_real_task(state: AppState, task_id: String) {
             });
         };
 
+    // Publish progress to ProgressHub for WebSocket subscribers
+    let publish_progress = {
+        let hub = state.progress_hub.clone();
+        let task_id_clone = task_id.clone();
+        move |step: &str, current: u32, total: u32, percentage: f32, message: &str, processed_items: u64, total_items: u64| {
+            let msg = crate::shared::ProgressMessageBuilder::new(task_id_clone.clone())
+                .status(crate::shared::TaskStatus::Running)
+                .percentage(percentage)
+                .step(step, current, total)
+                .items(processed_items, total_items)
+                .message(message)
+                .build();
+            let _ = hub.publish(msg);
+        }
+    };
+
     // 检查任务是否被取消
     let is_cancelled = {
         let state_clone = state.clone();
@@ -4157,7 +4247,13 @@ async fn execute_real_task(state: AppState, task_id: String) {
             Ok(conn) => conn,
             Err(e) => {
                 handle_database_connection_error(&state, &task_id, &config, e).await;
+                let fail_msg = crate::shared::ProgressMessageBuilder::new(task_id.clone())
+                    .status(crate::shared::TaskStatus::Failed)
+                    .message("数据库连接失败")
+                    .build();
+                let _ = state.progress_hub.publish(fail_msg);
                 set_update_finalize(&config.manual_db_nums, "Failed").await;
+                try_start_next_pending(state.clone());
                 return;
             }
         };
@@ -4174,6 +4270,14 @@ async fn execute_real_task(state: AppState, task_id: String) {
         total_steps,
         (current_step as f32 / total_steps as f32) * 100.0,
         &format!("数据库连接成功: {}:{}", config.db_ip, config.db_port),
+    );
+    publish_progress(
+        "初始化数据库连接",
+        current_step,
+        total_steps,
+        (current_step as f32 / total_steps as f32) * 100.0,
+        &format!("数据库连接成功: {}:{}", config.db_ip, config.db_port),
+        0, 0,
     );
 
     if is_cancelled().await {
@@ -4316,6 +4420,14 @@ async fn execute_real_task(state: AppState, task_id: String) {
                     (current_step as f32 / total_steps as f32) * 100.0,
                     "PDMS/E3D数据解析完成",
                 );
+                publish_progress(
+                    "解析PDMS/E3D数据",
+                    current_step,
+                    total_steps,
+                    (current_step as f32 / total_steps as f32) * 100.0,
+                    "PDMS/E3D数据解析完成",
+                    0, 0,
+                );
             }
             Err(e) => {
                 let mut task_manager = state.task_manager.lock().await;
@@ -4350,8 +4462,16 @@ async fn execute_real_task(state: AppState, task_id: String) {
                     );
                     task_manager.task_history.push(task);
                 }
+                // Publish failed status to ProgressHub
+                let fail_msg = crate::shared::ProgressMessageBuilder::new(task_id.clone())
+                    .status(crate::shared::TaskStatus::Failed)
+                    .percentage(0.0)
+                    .message(format!("PDMS数据解析失败: {}", e))
+                    .build();
+                let _ = state.progress_hub.publish(fail_msg);
                 // 标记更新失败
                 set_update_finalize(&config.manual_db_nums, "Failed").await;
+                try_start_next_pending(state.clone());
                 return;
             }
         }
@@ -4374,6 +4494,14 @@ async fn execute_real_task(state: AppState, task_id: String) {
                 }
                 task_manager.task_history.push(task);
             }
+            // Publish completed status to ProgressHub
+            let done_msg = crate::shared::ProgressMessageBuilder::new(task_id.clone())
+                .status(crate::shared::TaskStatus::Completed)
+                .percentage(100.0)
+                .message("解析任务已完成")
+                .build();
+            let _ = state.progress_hub.publish(done_msg);
+            try_start_next_pending(state.clone());
             return;
         }
     }
@@ -4406,6 +4534,14 @@ async fn execute_real_task(state: AppState, task_id: String) {
             total_steps,
             base_percentage,
             "开始生成几何模型数据...",
+        );
+        publish_progress(
+            "生成几何数据",
+            current_step,
+            total_steps,
+            base_percentage,
+            "开始生成几何模型数据...",
+            0, 0,
         );
 
         let start_time = Instant::now();
@@ -4508,7 +4644,15 @@ async fn execute_real_task(state: AppState, task_id: String) {
                 );
                 task_manager.task_history.push(task);
             }
+            // Publish failed status to ProgressHub
+            let fail_msg = crate::shared::ProgressMessageBuilder::new(task_id.clone())
+                .status(crate::shared::TaskStatus::Failed)
+                .percentage(0.0)
+                .message("几何数据生成失败".to_string())
+                .build();
+            let _ = state.progress_hub.publish(fail_msg);
             set_update_finalize(&config.manual_db_nums, "Failed").await;
+            try_start_next_pending(state.clone());
             return;
         }
 
@@ -4522,6 +4666,14 @@ async fn execute_real_task(state: AppState, task_id: String) {
             total_steps,
             (current_step as f32 / total_steps as f32) * 100.0,
             &format!("几何数据生成完成，耗时: {}ms", elapsed),
+        );
+        publish_progress(
+            "生成几何数据",
+            current_step,
+            total_steps,
+            (current_step as f32 / total_steps as f32) * 100.0,
+            &format!("几何数据生成完成，耗时: {}ms", elapsed),
+            0, 0,
         );
 
         if is_cancelled().await {
@@ -4573,6 +4725,13 @@ async fn execute_real_task(state: AppState, task_id: String) {
                 );
                 task_manager.task_history.push(task);
             }
+            drop(task_manager);
+            let fail_msg = crate::shared::ProgressMessageBuilder::new(task_id.clone())
+                .status(crate::shared::TaskStatus::Failed)
+                .message("SQLite空间索引未启用")
+                .build();
+            let _ = state.progress_hub.publish(fail_msg);
+            try_start_next_pending(state.clone());
             return;
         }
 
@@ -4653,14 +4812,22 @@ async fn execute_real_task(state: AppState, task_id: String) {
 
         let start_time = Instant::now();
         if let Err(e) = build_room_relations(&db_option, None, None).await {
+            let err_msg = format!("房间关系构建失败: {}", e);
             let mut task_manager = state.task_manager.lock().await;
             if let Some(mut task) = task_manager.active_tasks.remove(&task_id) {
                 task.status = TaskStatus::Failed;
-                task.error = Some(format!("房间关系构建失败: {}", e));
+                task.error = Some(err_msg.clone());
                 task.completed_at = Some(SystemTime::now());
-                task.add_log(LogLevel::Error, format!("房间关系构建失败: {}", e));
+                task.add_log(LogLevel::Error, err_msg.clone());
                 task_manager.task_history.push(task);
             }
+            drop(task_manager);
+            let fail_msg = crate::shared::ProgressMessageBuilder::new(task_id.clone())
+                .status(crate::shared::TaskStatus::Failed)
+                .message(&err_msg)
+                .build();
+            let _ = state.progress_hub.publish(fail_msg);
+            try_start_next_pending(state.clone());
             return;
         }
 
@@ -4691,14 +4858,22 @@ async fn execute_real_task(state: AppState, task_id: String) {
         );
 
         if let Err(e) = update_cal_equip().await {
+            let err_msg = format!("设备计算更新失败: {}", e);
             let mut task_manager = state.task_manager.lock().await;
             if let Some(mut task) = task_manager.active_tasks.remove(&task_id) {
                 task.status = TaskStatus::Failed;
-                task.error = Some(format!("设备计算更新失败: {}", e));
+                task.error = Some(err_msg.clone());
                 task.completed_at = Some(SystemTime::now());
-                task.add_log(LogLevel::Error, format!("设备计算更新失败: {}", e));
+                task.add_log(LogLevel::Error, err_msg.clone());
                 task_manager.task_history.push(task);
             }
+            drop(task_manager);
+            let fail_msg = crate::shared::ProgressMessageBuilder::new(task_id.clone())
+                .status(crate::shared::TaskStatus::Failed)
+                .message(&err_msg)
+                .build();
+            let _ = state.progress_hub.publish(fail_msg);
+            try_start_next_pending(state.clone());
             return;
         }
 
@@ -4717,14 +4892,22 @@ async fn execute_real_task(state: AppState, task_id: String) {
         );
 
         if let Err(e) = update_cal_bran_component().await {
+            let err_msg = format!("分支组件计算失败: {}", e);
             let mut task_manager = state.task_manager.lock().await;
             if let Some(mut task) = task_manager.active_tasks.remove(&task_id) {
                 task.status = TaskStatus::Failed;
-                task.error = Some(format!("分支组件计算失败: {}", e));
+                task.error = Some(err_msg.clone());
                 task.completed_at = Some(SystemTime::now());
-                task.add_log(LogLevel::Error, format!("分支组件计算失败: {}", e));
+                task.add_log(LogLevel::Error, err_msg.clone());
                 task_manager.task_history.push(task);
             }
+            drop(task_manager);
+            let fail_msg = crate::shared::ProgressMessageBuilder::new(task_id.clone())
+                .status(crate::shared::TaskStatus::Failed)
+                .message(&err_msg)
+                .build();
+            let _ = state.progress_hub.publish(fail_msg);
+            try_start_next_pending(state.clone());
             return;
         }
     }
@@ -4741,8 +4924,21 @@ async fn execute_real_task(state: AppState, task_id: String) {
         }
         task_manager.task_history.push(task);
     }
+    drop(task_manager);
+
+    // Publish completed status to ProgressHub
+    let done_msg = crate::shared::ProgressMessageBuilder::new(task_id.clone())
+        .status(crate::shared::TaskStatus::Completed)
+        .percentage(100.0)
+        .message("所有任务步骤执行完成！")
+        .build();
+    let _ = state.progress_hub.publish(done_msg);
+
     // 成功收尾：清理 updating 标记并记录结果
     set_update_finalize(&config.manual_db_nums, "Success").await;
+
+    // Try to start next pending task in queue
+    try_start_next_pending(state.clone());
 }
 
 /*

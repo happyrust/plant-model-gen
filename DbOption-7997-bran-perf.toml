@@ -1,0 +1,76 @@
+# 性能测试专用配置：7997 dbnum BRAN 模型生成
+total_sync = false
+incr_sync = false
+sync_history = false
+enable_log = false
+sync_graph_db = false
+replace_dbs = false
+enable_index = false
+
+# 项目设置
+project_path = "D:/AVEVA/Projects/E3D3.1"
+included_projects = ["YCYK-E3D"]
+project_dirs = ["YCYK-E3D"]
+
+mdb_name = "651YK"
+project_name = "YCYK-E3D"
+project_code = "1500"
+surreal_ns = "1500"
+module = "DESI"
+
+# 模型生成配置
+gen_model = true
+gen_mesh = true
+replace_mesh = true
+save_db = true
+use_surrealdb = true
+use_cache = true
+apply_boolean_operation = true
+mesh_tol_ratio = 3.0
+
+gen_spatial_tree = false
+load_spatial_tree = false
+save_spatial_tree_to_db = false
+gen_model_batch_size = 16
+
+# Full Noun 模式配置
+full_noun_mode = true
+full_noun_max_concurrent_nouns = 6
+full_noun_batch_size = 200
+
+# 只生成 BRAN 类型
+full_noun_enabled_categories = ["BRAN"]
+full_noun_excluded_nouns = []
+
+# 不限制数量，生成所有 BRAN
+debug_limit_per_noun = 0
+
+# 指定 dbnum = 7997
+manual_db_nums = [7997]
+
+build_cate_relate = false
+gen_noun_graph = false
+
+# 精度配置
+[mesh_precision]
+default_lod = "L2"
+
+[mesh_precision.lod_profiles.L2]
+neg_multiplier = 0.4
+sweep_multiplier = 0.15
+polyhedron_fixed_tol = 0.02
+sphere_subdiv = 18
+radial_segments = 24
+mesh_tol_ratio = 6.0
+
+[mesh_precision.lod_profiles.L2.csg_settings]
+radial_segments = 20
+height_segments = 2
+cap_segments = 1
+error_tolerance = 0.005
+min_radial_segments = 12
+max_radial_segments = 30
+min_height_segments = 1
+max_height_segments = 3
+target_segment_length = 140.0
+non_scalable_factor = 0.8

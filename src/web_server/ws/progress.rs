@@ -174,23 +174,20 @@ async fn handle_progress_socket(socket: WebSocket, task_id: String, hub: Arc<Pro
     debug!("WebSocket 连接已关闭: task_id={}", task_id);
 }
 
-/// 订阅多个任务进度的 WebSocket 端点（可选功能）
+/// 所有任务进度自动推送的 WebSocket 端点
 ///
 /// 路由: `/ws/tasks`
 ///
-/// 客户端可以通过发送消息来订阅/取消订阅任务：
-/// ```json
-/// { "action": "subscribe", "task_id": "task-123" }
-/// { "action": "unsubscribe", "task_id": "task-123" }
-/// { "action": "list" }
-/// ```
+/// 前端连接后自动接收所有活跃任务的进度更新（无需发送 subscribe 命令）。
+/// 也支持可选的客户端命令（list 等）。
 pub async fn ws_tasks_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     info!("WebSocket 多任务连接请求");
     let hub = state.progress_hub.clone();
-    ws.on_upgrade(move |socket| handle_tasks_socket(socket, hub))
+    let task_manager = state.task_manager.clone();
+    ws.on_upgrade(move |socket| handle_tasks_socket(socket, hub, task_manager))
 }
 
-/// 客户端命令
+/// 客户端命令（保留兼容）
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action")]
 enum ClientCommand {
@@ -202,15 +199,29 @@ enum ClientCommand {
     List,
 }
 
-/// 处理多任务订阅的 WebSocket 连接
-async fn handle_tasks_socket(socket: WebSocket, hub: Arc<ProgressHub>) {
+/// 将 ProgressMessage 包装成前端期望的 WebSocketMessage 格式
+fn wrap_progress_as_ws_message(msg: &ProgressMessage) -> serde_json::Value {
+    serde_json::json!({
+        "type": "task_progress",
+        "data": msg,
+        "timestamp": msg.timestamp.to_rfc3339()
+    })
+}
+
+/// 处理多任务自动推送的 WebSocket 连接
+async fn handle_tasks_socket(
+    socket: WebSocket,
+    hub: Arc<ProgressHub>,
+    task_manager: std::sync::Arc<tokio::sync::Mutex<crate::web_server::TaskManager>>,
+) {
     let (mut sender, mut receiver) = socket.split();
 
     // 发送握手消息
     let handshake = serde_json::json!({
         "type": "handshake",
-        "message": "多任务订阅连接成功",
-        "active_tasks": hub.active_tasks()
+        "message": "任务监控连接成功，自动推送所有任务进度",
+        "active_tasks": hub.active_tasks(),
+        "timestamp": chrono::Utc::now().to_rfc3339()
     });
 
     if let Ok(json) = serde_json::to_string(&handshake) {
@@ -220,59 +231,78 @@ async fn handle_tasks_socket(socket: WebSocket, hub: Arc<ProgressHub>) {
         }
     }
 
-    // 存储当前订阅的任务
+    // 自动订阅所有当前活跃任务
     let mut subscriptions: Vec<(String, broadcast::Receiver<ProgressMessage>)> = Vec::new();
+    let mut known_task_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 订阅所有已知任务
+    for task_id in hub.active_tasks() {
+        let rx = hub.subscribe(&task_id);
+        subscriptions.push((task_id.clone(), rx));
+        known_task_ids.insert(task_id);
+    }
+
+    // 发送所有活跃任务的当前状态快照
+    for state in hub.all_task_states() {
+        let envelope = wrap_progress_as_ws_message(&state);
+        if let Ok(json) = serde_json::to_string(&envelope) {
+            if sender.send(Message::Text(json.into())).await.is_err() {
+                warn!("发送初始状态快照失败");
+                return;
+            }
+        }
+    }
+
+    // 定期检查新任务的计时器
+    let mut discover_interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+    discover_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
-            // 处理客户端命令
+            // 处理来自客户端的消息
             msg = receiver.next() => {
                 match msg {
                     Some(Ok(Message::Close(_))) | None => {
-                        info!("客户端关闭多任务订阅连接");
+                        info!("客户端关闭任务监控连接");
                         break;
                     }
+                    Some(Ok(Message::Ping(data))) => {
+                        if sender.send(Message::Pong(data)).await.is_err() {
+                            break;
+                        }
+                    }
                     Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<ClientCommand>(&text) {
-                            Ok(ClientCommand::Subscribe { task_id }) => {
-                                info!("订阅任务: {}", task_id);
-                                let rx = hub.subscribe(&task_id);
-                                subscriptions.push((task_id.clone(), rx));
-
-                                let response = serde_json::json!({
-                                    "type": "subscribed",
-                                    "task_id": task_id
-                                });
-                                if let Ok(json) = serde_json::to_string(&response) {
-                                    let _ = sender.send(Message::Text(json.into())).await;
+                        // 兼容旧的 subscribe/list 命令
+                        if let Ok(cmd) = serde_json::from_str::<ClientCommand>(&text) {
+                            match cmd {
+                                ClientCommand::Subscribe { task_id } => {
+                                    if !known_task_ids.contains(&task_id) {
+                                        let rx = hub.subscribe(&task_id);
+                                        subscriptions.push((task_id.clone(), rx));
+                                        known_task_ids.insert(task_id);
+                                    }
                                 }
-                            }
-                            Ok(ClientCommand::Unsubscribe { task_id }) => {
-                                info!("取消订阅任务: {}", task_id);
-                                subscriptions.retain(|(id, _)| id != &task_id);
-
-                                let response = serde_json::json!({
-                                    "type": "unsubscribed",
-                                    "task_id": task_id
-                                });
-                                if let Ok(json) = serde_json::to_string(&response) {
-                                    let _ = sender.send(Message::Text(json.into())).await;
+                                ClientCommand::Unsubscribe { task_id } => {
+                                    subscriptions.retain(|(id, _)| id != &task_id);
+                                    known_task_ids.remove(&task_id);
                                 }
-                            }
-                            Ok(ClientCommand::List) => {
-                                let tasks = hub.all_task_states();
-                                let response = serde_json::json!({
-                                    "type": "task_list",
-                                    "tasks": tasks
-                                });
-                                if let Ok(json) = serde_json::to_string(&response) {
-                                    let _ = sender.send(Message::Text(json.into())).await;
+                                ClientCommand::List => {
+                                    let tasks = hub.all_task_states();
+                                    let response = serde_json::json!({
+                                        "type": "task_list",
+                                        "data": tasks,
+                                        "timestamp": chrono::Utc::now().to_rfc3339()
+                                    });
+                                    if let Ok(json) = serde_json::to_string(&response) {
+                                        let _ = sender.send(Message::Text(json.into())).await;
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                warn!("解析客户端命令失败: {}", e);
                             }
                         }
+                    }
+                    Some(Err(e)) => {
+                        error!("接收 WebSocket 消息出错: {}", e);
+                        break;
                     }
                     _ => {}
                 }
@@ -280,19 +310,54 @@ async fn handle_tasks_socket(socket: WebSocket, hub: Arc<ProgressHub>) {
 
             // 处理所有订阅的进度更新
             _ = async {
-                for (task_id, rx) in &mut subscriptions {
-                    if let Ok(msg) = rx.try_recv() {
-                        if let Ok(json) = serde_json::to_string(&msg) {
+                for (_task_id, rx) in &mut subscriptions {
+                    while let Ok(msg) = rx.try_recv() {
+                        let envelope = wrap_progress_as_ws_message(&msg);
+                        if let Ok(json) = serde_json::to_string(&envelope) {
                             if sender.send(Message::Text(json.into())).await.is_err() {
-                                warn!("发送任务 {} 的进度失败", task_id);
+                                return;
                             }
                         }
                     }
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             } => {}
+
+            // 定期发现新任务并自动订阅
+            _ = discover_interval.tick() => {
+                let current_tasks = hub.active_tasks();
+                for task_id in &current_tasks {
+                    if !known_task_ids.contains(task_id) {
+                        info!("自动订阅新任务: {}", task_id);
+                        let rx = hub.subscribe(task_id);
+                        subscriptions.push((task_id.clone(), rx));
+                        known_task_ids.insert(task_id.clone());
+
+                        // 推送新任务的当前状态
+                        if let Some(state) = hub.get_task_state(task_id) {
+                            let envelope = wrap_progress_as_ws_message(&state);
+                            if let Ok(json) = serde_json::to_string(&envelope) {
+                                let _ = sender.send(Message::Text(json.into())).await;
+                            }
+                        }
+                    }
+                }
+
+                // 清理已完成任务的订阅（减少内存）
+                subscriptions.retain(|(id, _)| {
+                    if let Some(state) = hub.get_task_state(id) {
+                        !matches!(state.status,
+                            crate::shared::TaskStatus::Completed |
+                            crate::shared::TaskStatus::Failed |
+                            crate::shared::TaskStatus::Cancelled
+                        )
+                    } else {
+                        false
+                    }
+                });
+            }
         }
     }
 
-    debug!("多任务订阅连接已关闭");
+    debug!("任务监控连接已关闭");
 }

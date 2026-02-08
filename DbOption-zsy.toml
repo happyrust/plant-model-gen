@@ -12,16 +12,15 @@ enable_index = false
 sync_chunk_size = 10_0000
 
 #项目设置
-#project_path = "D:/AVEVA/Projects/E3D2.1"
-project_path = "/Volumes/DPC/work/e3d_models"
-# included_projects = ["AvevaMarineSample", "AvevaCatalogue", "SCB", "ZDJ"]
+project_path = "D:/AVEVA/Projects/E3D3.1"
+# project_path = "/Volumes/DPC/work/e3d_models"
 included_projects = ["YCYK-E3D"]
 project_dirs = ["YCYK-E3D"]
 
 mdb_name = "651YK"
 project_name = "YCYK-E3D"
-project_code = 1500
-surreal_ns = 1500
+project_code = "1500"
+surreal_ns = "1500"
 module = "DESI"
 #是否生成模型数据
 gen_model = true
@@ -59,7 +58,6 @@ debug_limit_per_noun = 10
 
 build_cate_relate = false
 
-meshes_path = "/Volumes/DPC/work/plant-code/rs-plant3-d/assets/meshes"
 
 #生成补充类型的graph，方便查询直接生成语句
 gen_noun_graph = false

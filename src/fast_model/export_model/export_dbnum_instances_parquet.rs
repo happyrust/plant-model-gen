@@ -649,6 +649,7 @@ pub async fn export_dbnum_instances_parquet(
     target_unit: Option<LengthUnit>,
     root_refno: Option<RefnoEnum>,
 ) -> Result<ParquetExportStats> {
+    let _span = crate::profile_span!("export_dbnum_instances_parquet", dbnum = dbnum);
     let start_time = std::time::Instant::now();
 
     let target = target_unit.unwrap_or(LengthUnit::Millimeter);

@@ -106,6 +106,8 @@ pub mod versioned_db;
 pub mod mqtt_service;
 
 pub mod options;
+#[macro_use]
+pub mod perf_timer;
 pub mod profiling;
 pub mod shared; // 共享模块（进度广播中心等）
 pub mod meili;

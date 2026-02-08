@@ -996,6 +996,9 @@ pub struct CreateTaskRequest {
     pub name: String,
     pub task_type: TaskType,
     pub config: DatabaseConfig,
+    /// 可选的元数据（用于批量任务的 batch_id 等）
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// 更新配置请求

@@ -728,6 +728,9 @@ pub struct SystemStatus {
     pub memory_usage: f32,
     /// 活跃任务数
     pub active_tasks: u32,
+    /// 队列中等待的任务数
+    #[serde(default)]
+    pub queued_task_count: u32,
     /// 数据库连接状态
     pub database_connected: bool,
     /// SurrealDB连接状态

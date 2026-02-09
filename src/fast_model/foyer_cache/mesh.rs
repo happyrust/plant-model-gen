@@ -92,17 +92,31 @@ pub async fn run_mesh_worker_from_cache_manager(
             continue;
         }
 
-        // 标准单位几何体（1/2/3）的 geo_hash 在全库范围内复用：
-        // - 若在 cache-only mesh_worker 中按 geo_param 生成并写盘，会导致"同一 geo_hash 的 GLB 被某一个实例的尺寸覆盖"。
-        // - 导出侧已对 1/2/3 强制使用内置 unit_*_mesh。
-        // 因此这里直接跳过写盘；如启用 FORCE_REPLACE_MESH，则顺便清理旧文件以避免误读。
+        // 标准单位几何体（1/2/3）使用内置函数直接生成 GLB，
+        // 不依赖实例的 geo_param（避免不同实例尺寸覆盖）。
         if crate::fast_model::reuse_unit::is_builtin_unit_geo_hash(geo_hash) {
-            if force_replace {
-                let mesh_id = geo_hash.to_string();
-                let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
-                let base = lod_dir.join(&mesh_filename);
-                let _ = std::fs::remove_file(base.with_extension("glb"));
-                let _ = std::fs::remove_file(base.with_extension("obj"));
+            let mesh_id = geo_hash.to_string();
+            let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
+            let glb_path = lod_dir.join(&mesh_filename).with_extension("glb");
+            if glb_path.exists() && !force_replace {
+                continue;
+            }
+            use aios_core::geometry::csg::{unit_box_mesh, unit_cylinder_mesh, unit_sphere_mesh};
+            use aios_core::mesh_precision::LodMeshSettings;
+            let unit_mesh = match geo_hash {
+                1 => unit_box_mesh(),
+                2 => unit_cylinder_mesh(&LodMeshSettings::default(), false),
+                3 => unit_sphere_mesh(),
+                _ => unreachable!(),
+            };
+            if let Err(e) = export_single_mesh_to_glb(&unit_mesh, &glb_path) {
+                debug_model_warn!(
+                    "[mesh_worker_cache] 生成内置 unit mesh GLB 失败: {} - {}",
+                    mesh_id, e
+                );
+            } else {
+                debug_model_debug!("[mesh_worker_cache] 生成内置 unit mesh: {}", mesh_id);
+                processed += 1;
             }
             continue;
         }

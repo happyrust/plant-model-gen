@@ -23,18 +23,19 @@ use serde::{Deserialize, Serialize};
 pub enum MbdPipeSource {
     Db,
     Cache,
+    Parquet,
 }
 
 impl Default for MbdPipeSource {
     fn default() -> Self {
-        Self::Db
+        Self::Parquet
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MbdPipeQuery {
-    /// 数据来源：db=SurrealDB（默认），cache=foyer cache
+    /// 数据来源：parquet=Parquet 文件（默认），db=SurrealDB，cache=foyer cache
     pub source: MbdPipeSource,
     /// dbno（可选；若不传则尝试从 output/scene_tree/db_meta_info.json 推导）
     pub dbno: Option<u32>,
@@ -70,7 +71,7 @@ pub struct MbdPipeQuery {
 impl Default for MbdPipeQuery {
     fn default() -> Self {
         Self {
-            source: MbdPipeSource::Db,
+            source: MbdPipeSource::Parquet,
             dbno: None,
             batch_id: None,
             debug: false,
@@ -335,6 +336,23 @@ async fn get_mbd_pipe(
     let branch_refno = input_refno_enum.clone();
 
     let (segments, mut debug_info) = match query.source {
+        MbdPipeSource::Parquet => match fetch_tubi_segments_from_parquet_with_debug(
+            branch_refno.clone(),
+            query.dbno,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return json_utf8(MbdPipeResponse {
+                    success: false,
+                    error_message: Some(format!(
+                        "从 Parquet 读取分支管段失败: {e}（可尝试 ?source=cache 或 ?source=db）"
+                    )),
+                    data: None,
+                });
+            }
+        },
         MbdPipeSource::Db => match fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await {
             Ok(v) => v,
             Err(e) => {
@@ -371,6 +389,15 @@ async fn get_mbd_pipe(
             debug_info.notes.push(format!(
                 "db 模式已忽略 dbno={:?} batch_id={:?} strict_dbno={}",
                 query.dbno, query.batch_id, query.strict_dbno
+            ));
+        }
+    }
+
+    if matches!(query.source, MbdPipeSource::Parquet) {
+        if query.batch_id.is_some() || query.strict_dbno {
+            debug_info.notes.push(format!(
+                "parquet 模式已忽略 batch_id={:?} strict_dbno={}",
+                query.batch_id, query.strict_dbno
             ));
         }
     }
@@ -650,6 +677,142 @@ async fn get_mbd_pipe(
             debug_info: query.debug.then_some(debug_info),
         }),
     })
+}
+
+async fn fetch_tubi_segments_from_parquet_with_debug(
+    branch_refno: RefnoEnum,
+    dbno: Option<u32>,
+) -> anyhow::Result<(Vec<CacheTubiSeg>, MbdPipeDebugInfo)> {
+    use crate::data_interface::db_meta_manager::db_meta;
+    use polars::prelude::*;
+
+    let mut debug = MbdPipeDebugInfo::default();
+    debug.notes.push("source=parquet".to_string());
+    debug.requested_dbno = dbno;
+
+    let inferred_dbnum = if let Some(d) = dbno {
+        d
+    } else {
+        db_meta().ensure_loaded()?;
+        db_meta().get_dbnum_by_refno(branch_refno).unwrap_or(0)
+    };
+    if inferred_dbnum == 0 {
+        anyhow::bail!("无法推导 dbno（请传 dbno 或先生成 output/scene_tree/db_meta_info.json）");
+    }
+    debug.inferred_dbnum = Some(inferred_dbnum);
+
+    // 确定 parquet 输出目录：优先 output/{project}/instances，回退 output/{project}/parquet
+    let db_option = aios_core::get_db_option();
+    let project_name = &db_option.project_name;
+    let instances_dir = if project_name.is_empty() {
+        PathBuf::from("output/instances")
+    } else {
+        let d1 = PathBuf::from(format!("output/{project_name}/instances"));
+        if d1.exists() {
+            d1
+        } else {
+            let d2 = PathBuf::from(format!("output/{project_name}/parquet"));
+            if d2.exists() { d2 } else { d1 }
+        }
+    };
+    debug.cache_dir = Some(instances_dir.display().to_string());
+
+    let tubings_path = instances_dir.join(format!("tubings_{inferred_dbnum}.parquet"));
+    if !tubings_path.exists() {
+        anyhow::bail!(
+            "tubings parquet 文件不存在: {}",
+            tubings_path.display()
+        );
+    }
+    let transforms_path = instances_dir.join("transforms.parquet");
+
+    // 读取 tubings parquet，按 owner_refno_str 过滤
+    let owner_refno_str = branch_refno.to_string();
+    let tubings_df = LazyFrame::scan_parquet(&tubings_path, Default::default())?
+        .filter(col("owner_refno_str").eq(lit(owner_refno_str.clone())))
+        .sort(["order"], Default::default())
+        .collect()?;
+
+    if tubings_df.height() == 0 {
+        anyhow::bail!(
+            "tubings parquet 中无 owner_refno_str={} 的记录（file={}）",
+            owner_refno_str,
+            tubings_path.display()
+        );
+    }
+    debug.notes.push(format!("tubings rows={}", tubings_df.height()));
+
+    // 收集需要的 trans_hash 值
+    let trans_hashes: Vec<String> = tubings_df
+        .column("trans_hash")?
+        .str()?
+        .into_no_null_iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    // 读取 transforms parquet，按需过滤
+    let trans_map: HashMap<String, glam::Mat4> = if transforms_path.exists() {
+        let hash_series = Series::new("h".into(), &trans_hashes);
+        let trans_df = LazyFrame::scan_parquet(&transforms_path, Default::default())?
+            .filter(col("trans_hash").is_in(lit(hash_series)))
+            .collect()?;
+        let mut m: HashMap<String, glam::Mat4> = HashMap::new();
+        for i in 0..trans_df.height() {
+            let hash = trans_df.column("trans_hash")?.str()?.get(i).unwrap_or_default().to_string();
+            let get_f = |name: &str| -> f32 {
+                trans_df.column(name).ok()
+                    .and_then(|c| c.f64().ok())
+                    .and_then(|ca| ca.get(i))
+                    .unwrap_or(0.0) as f32
+            };
+            let mat = glam::Mat4::from_cols(
+                glam::Vec4::new(get_f("m00"), get_f("m10"), get_f("m20"), get_f("m30")),
+                glam::Vec4::new(get_f("m01"), get_f("m11"), get_f("m21"), get_f("m31")),
+                glam::Vec4::new(get_f("m02"), get_f("m12"), get_f("m22"), get_f("m32")),
+                glam::Vec4::new(get_f("m03"), get_f("m13"), get_f("m23"), get_f("m33")),
+            );
+            m.insert(hash, mat);
+        }
+        debug.notes.push(format!("transforms loaded={}", m.len()));
+        m
+    } else {
+        debug.notes.push("transforms.parquet 不存在，使用单位矩阵".to_string());
+        HashMap::new()
+    };
+
+    // 构建 CacheTubiSeg
+    let tubi_refno_col = tubings_df.column("tubi_refno_str")?.str()?;
+    let order_col = tubings_df.column("order")?.u32()?;
+    let trans_hash_col = tubings_df.column("trans_hash")?.str()?;
+
+    let mut segs: Vec<CacheTubiSeg> = Vec::with_capacity(tubings_df.height());
+    for i in 0..tubings_df.height() {
+        let tubi_refno_s = tubi_refno_col.get(i).unwrap_or_default();
+        let order = order_col.get(i);
+        let th = trans_hash_col.get(i).unwrap_or_default();
+
+        let mat = trans_map.get(th).copied().unwrap_or(glam::Mat4::IDENTITY);
+        let start = mat.transform_point3(Vec3::new(0.0, 0.0, 0.0));
+        let end = mat.transform_point3(Vec3::new(0.0, 0.0, 1.0));
+
+        segs.push(CacheTubiSeg {
+            refno: RefnoEnum::from(tubi_refno_s),
+            arrive_refno: None,
+            order,
+            start,
+            end,
+            arrive_axis: None,
+            leave_axis: None,
+        });
+    }
+
+    segs.sort_by(|a, b| {
+        let ao = a.order.unwrap_or(u32::MAX);
+        let bo = b.order.unwrap_or(u32::MAX);
+        ao.cmp(&bo).then_with(|| a.refno.to_string().cmp(&b.refno.to_string()))
+    });
+
+    Ok((segs, debug))
 }
 
 async fn fetch_tubi_segments_from_cache(

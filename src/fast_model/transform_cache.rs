@@ -1,10 +1,12 @@
+use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
 use std::path::{Path, PathBuf};
 
-use aios_core::RefnoEnum;
+use aios_core::{init_surreal, RefnoEnum, SUL_DB, SurrealQueryExt};
 use bevy_transform::prelude::Transform;
 use foyer::{DirectFsDeviceOptionsBuilder, HybridCache, HybridCacheBuilder};
 use serde::{Deserialize, Serialize};
+use surrealdb::types::SurrealValue;
 use tokio::sync::OnceCell;
 use twox_hash::XxHash64;
 
@@ -210,4 +212,176 @@ pub async fn get_world_transform_cache_first(
         }
     }
     Ok(computed)
+}
+
+fn transform_from_matrix_cols(cols: &[f64; 16]) -> Option<Transform> {
+    // SurrealDB 存储的矩阵为列主序（与 glam::DMat4::from_cols_array 对齐）。
+    let m = glam::DMat4::from_cols_array(cols);
+    let (scale, rot, trans) = m.to_scale_rotation_translation();
+    Some(Transform {
+        translation: glam::Vec3::new(trans.x as f32, trans.y as f32, trans.z as f32),
+        rotation: glam::Quat::from_xyzw(rot.x as f32, rot.y as f32, rot.z as f32, rot.w as f32),
+        scale: glam::Vec3::new(scale.x as f32, scale.y as f32, scale.z as f32),
+    })
+}
+
+/// 批量版 cache-first world_transform 获取：
+/// - 先读 foyer transform_cache；
+/// - miss 的 refno 再通过 SurrealDB pe_transform 批量查询 matrix；
+/// - 仍 miss 的少量 refno 兜底走旧计算路径（aios_core::get_world_transform）。
+///
+/// 说明：该接口用于“预取阶段”的批量提速；生成阶段仍应尽量 cache-only。
+pub async fn get_world_transforms_cache_first_batch(
+    db_option: Option<&DbOptionExt>,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<HashMap<RefnoEnum, Transform>> {
+    if refnos.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let use_cache = db_option.map(|x| x.use_cache).unwrap_or(true);
+    let mut out: HashMap<RefnoEnum, Transform> = HashMap::new();
+
+    // 记录每个 refno 的 dbnum（用于写回缓存）
+    let mut dbnum_map: HashMap<RefnoEnum, u32> = HashMap::new();
+    for &r in refnos {
+        dbnum_map.insert(r, resolve_dbnum(r));
+    }
+
+    // 1) cache hits
+    let mut misses: Vec<RefnoEnum> = Vec::new();
+    if use_cache {
+        if let Some(cache) = get_global_cache(db_option).await? {
+            // 这里不做过度并发：foyer HybridCache 本身有内存层，单次 get 较轻；且 refnos 通常为 batch_size 级别。
+            for &r in refnos {
+                let dbnum = *dbnum_map.get(&r).unwrap_or(&0);
+                if let Some(hit) = cache.get_world_transform(dbnum, r).await {
+                    out.insert(r, hit);
+                } else {
+                    misses.push(r);
+                }
+            }
+        } else {
+            misses.extend_from_slice(refnos);
+        }
+    } else {
+        misses.extend_from_slice(refnos);
+    }
+
+    if misses.is_empty() {
+        return Ok(out);
+    }
+
+    // 2) SurrealDB batch query pe_transform.world_trans.d.matrix
+    //    注意：只对 misses 进行查询，减少无谓传输。
+    init_surreal().await?;
+
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct PeWorldMatrixRow {
+        #[serde(default)]
+        refno: Option<RefnoEnum>,
+        #[serde(default)]
+        matrix: Option<Vec<f64>>,
+    }
+
+    // 避免 SQL 过大：按固定块查询
+    const CHUNK: usize = 200;
+    let mut still_missing: HashSet<RefnoEnum> = misses.iter().copied().collect();
+
+    for chunk in misses.chunks(CHUNK) {
+        let ids = chunk
+            .iter()
+            .map(|r| r.to_pe_key())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // 说明：
+        // - record::id(id) 取 pe 的 id 部分（如 24381_103385），RefnoEnum 可直接反序列化。
+        // - pe_transform 的主键形制：pe_transform:<pe_id>，用 type::record 构造。
+        let sql = format!(
+            r#"
+            SELECT
+                record::id(id) as refno,
+                (
+                    SELECT VALUE world_trans.d.matrix
+                    FROM pe_transform
+                    WHERE id = type::record('pe_transform', record::id(id))
+                    LIMIT 1
+                )[0] as matrix
+            FROM [{ids}];
+            "#
+        );
+
+        let rows: Vec<PeWorldMatrixRow> = SUL_DB.query_take(&sql, 0).await?;
+        for row in rows {
+            let Some(r) = row.refno else { continue };
+            let Some(m) = row.matrix else { continue };
+            if m.len() != 16 {
+                continue;
+            }
+            let mut cols = [0.0f64; 16];
+            cols.copy_from_slice(&m[..16]);
+            if let Some(t) = transform_from_matrix_cols(&cols) {
+                out.insert(r, t.clone());
+                still_missing.remove(&r);
+                if use_cache {
+                    if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
+                        let dbnum = *dbnum_map.get(&r).unwrap_or(&resolve_dbnum(r));
+                        cache.insert_world_transform(dbnum, r, t);
+                    }
+                }
+            }
+        }
+    }
+
+    if still_missing.is_empty() {
+        return Ok(out);
+    }
+
+    // 3) 兜底：少量 miss 走旧计算路径（并回写缓存）
+    //    说明：此分支理论上应该很少触发；若频繁触发，说明 pe_transform 不完整或查询口径需要调整。
+    for r in still_missing {
+        if let Ok(Some(t)) = aios_core::get_world_transform(r).await {
+            out.insert(r, t.clone());
+            if use_cache {
+                if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
+                    let dbnum = *dbnum_map.get(&r).unwrap_or(&resolve_dbnum(r));
+                    cache.insert_world_transform(dbnum, r, t);
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_transform_from_matrix_cols_roundtrip() {
+        let scale = glam::DVec3::new(2.0, 3.0, 4.0);
+        let rot = glam::DQuat::from_rotation_y(1.2345);
+        let trans = glam::DVec3::new(10.0, -20.0, 30.0);
+        let m = glam::DMat4::from_scale_rotation_translation(scale, rot, trans);
+        let cols = m.to_cols_array();
+
+        let t = transform_from_matrix_cols(&cols).expect("must decompose");
+        let eps = 1e-4;
+        assert!((t.translation.x - trans.x as f32).abs() < eps);
+        assert!((t.translation.y - trans.y as f32).abs() < eps);
+        assert!((t.translation.z - trans.z as f32).abs() < eps);
+        assert!((t.scale.x - scale.x as f32).abs() < eps);
+        assert!((t.scale.y - scale.y as f32).abs() < eps);
+        assert!((t.scale.z - scale.z as f32).abs() < eps);
+        // rotation 只做近似检查：q 与 -q 等价，这里用 dot 取绝对值。
+        let dot = t.rotation.dot(glam::Quat::from_xyzw(
+            rot.x as f32,
+            rot.y as f32,
+            rot.z as f32,
+            rot.w as f32,
+        ));
+        assert!(dot.abs() > 1.0 - 1e-3);
+    }
 }

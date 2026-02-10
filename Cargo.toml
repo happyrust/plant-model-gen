@@ -48,6 +48,7 @@ polars = { version = "0.46", default-features = false, features = [
     "lazy",
     "parquet",
     "dtype-struct",
+    "is_in",
 ] }
 
 # MQTT 服务器和客户端
@@ -316,5 +317,5 @@ eframe = { git = "https://github.com/emilk/egui.git", rev = "fa4cfec777c9ea21b86
 # aios_core = { path = "../rs-core" }
 
 
-# [patch."https://gitee.com/happydpc/rust-ploop-processor.git"]   
+# [patch."https://gitee.com/happydpc/rust-ploop-processor.git"]
 # ploop-rs = { path = "../rust-ploop-processor/ploop-rs" }

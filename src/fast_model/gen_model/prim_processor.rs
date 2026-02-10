@@ -49,7 +49,7 @@ pub async fn process_prim_refno_page(
             );
             return Ok(());
         }
-        if !prim_model::gen_prim_geos_from_cache(&filtered, sender).await? {
+        if !prim_model::gen_prim_geos_from_inputs(ctx.db_option.clone(), filtered, sender).await? {
             bail!("prim geos generation from cache failed");
         }
         return Ok(());

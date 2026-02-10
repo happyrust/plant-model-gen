@@ -9,6 +9,7 @@
 //! 注意：为保持兼容性，原有入口函数可能仍保留在旧模块中，但会转发到此处实现。
 
 pub mod context;
+pub mod geom_input_cache;
 pub mod geos;
 pub mod mesh;
 pub mod boolean;

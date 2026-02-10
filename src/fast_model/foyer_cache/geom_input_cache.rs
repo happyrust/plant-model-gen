@@ -724,6 +724,14 @@ pub fn is_geom_input_cache_only() -> bool {
         .unwrap_or(false)
 }
 
+/// 检查是否启用了输入缓存流水线模式（环境变量 `AIOS_GEN_INPUT_CACHE_PIPELINE=1`）。
+pub fn is_geom_input_cache_pipeline_enabled() -> bool {
+    std::env::var("AIOS_GEN_INPUT_CACHE_PIPELINE")
+        .ok()
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Orchestrator 入口：按 dbnum 分组预取 LOOP/PRIM 输入
 // ---------------------------------------------------------------------------

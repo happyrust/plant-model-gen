@@ -51,7 +51,7 @@ pub async fn process_loop_refno_page(
             );
             return Ok(());
         }
-        if !loop_model::gen_loop_geos_from_cache(&filtered, loop_sjus_map_arc, sender).await? {
+        if !loop_model::gen_loop_geos_from_inputs(ctx.db_option.clone(), filtered, loop_sjus_map_arc, sender).await? {
             bail!("loop geos generation from cache failed");
         }
         return Ok(());

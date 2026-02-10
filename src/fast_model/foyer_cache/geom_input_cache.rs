@@ -499,8 +499,12 @@ pub async fn try_build_prim_poly_extra(refno: RefnoEnum) -> anyhow::Result<Optio
         let poin_refnos = query_provider::query_multi_descendants_with_self(&[pgo_refnos[0]], &["POIN"], false)
             .await
             .unwrap_or_default();
-        for v in poin_refnos {
-            let v_attmap = aios_core::get_named_attmap(v).await.unwrap_or_default();
+        // POIN 顶点位置：批量拉取 attmaps，避免逐点查询。
+        let poin_atts = query_provider::get_attmaps_batch(&poin_refnos)
+            .await
+            .unwrap_or_default();
+        for v_attmap in poin_atts {
+            let v = v_attmap.get_refno_or_default();
             let pos = v_attmap.get_position().unwrap_or_default();
             verts_map.insert(v, pos);
         }

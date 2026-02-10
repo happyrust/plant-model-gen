@@ -24,12 +24,13 @@ save_instance_data_optimize flushing inst_relate from inst_info_map: 18
 - inst_tubi: 57 条（包含 24381_145018 的 11 条）
 - inst_relate: 18 条（但验证时显示的 refno 列表中没有 24381_145018）
 
-#### dbnum=24381 的缓存 flush
+#### 误将 ref0 当 dbnum（dbnum=24381）的缓存 flush（应为空）
 ```
 [cache_flush] dbnum=24381 batches=0/4 inst_info=0 inst_geos=0 inst_tubi=0 neg=0 ngmr=0 bool=0
 ```
 
 **说明**：dbnum=24381 的缓存为空，没有数据被 flush。
+这通常意味着你把 `ref0=24381` 误当成了 `dbnum`；对该数据集而言，真实 `dbnum` 为 `7997`。
 
 ### 3. 数据生成情况
 

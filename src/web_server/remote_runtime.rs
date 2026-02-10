@@ -61,9 +61,11 @@ pub async fn start_runtime(env_id: String) -> anyhow::Result<()> {
 fn query_backoff_ms(env_id: &str) -> Option<(u64, u64)> {
     // 复用 handlers 中的配置文件约定
     use config as cfg;
-    let db_path = if std::path::Path::new("DbOption.toml").exists() {
+    let cfg_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_file = format!("{}.toml", cfg_name);
+    let db_path = if std::path::Path::new(&cfg_file).exists() {
         cfg::Config::builder()
-            .add_source(cfg::File::with_name("DbOption"))
+            .add_source(cfg::File::with_name(&cfg_name))
             .build()
             .ok()
             .and_then(|b| b.get_string("deployment_sites_sqlite_path").ok())

@@ -53,7 +53,7 @@ pub fn is_auto_generate_tree_enabled() -> bool {
 /// 从 DbOption.toml 读取 project_name，返回 output/{project}/scene_tree 路径
 /// 优先使用 DB_OPTION_FILE 环境变量指定的配置文件
 fn get_project_tree_dir() -> Option<PathBuf> {
-    let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "DbOption".to_string());
+    let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let config_file = format!("{}.toml", config_name);
     let content = std::fs::read_to_string(&config_file).ok()?;
     

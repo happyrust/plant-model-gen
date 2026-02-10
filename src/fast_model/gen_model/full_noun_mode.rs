@@ -22,11 +22,13 @@ use super::categorized_refnos::CategorizedRefnos;
 use super::config::FullNounConfig;
 use super::context::NounProcessContext;
 use super::errors::{FullNounError, Result};
+use super::input_cache_pipeline;
 use super::loop_processor::process_loop_refno_page;
 use super::prim_processor::process_prim_refno_page;
 use super::tree_index_manager::TreeIndexManager;
 use super::utilities::build_cata_hash_map_from_tree;
 use crate::data_interface::db_meta;
+use crate::fast_model::foyer_cache::geom_input_cache;
 
 use crate::fast_model::refno_errors::{
     REFNO_ERROR_STORE, RefnoErrorKind, RefnoErrorStage, record_refno_error,
@@ -56,6 +58,15 @@ pub fn validate_sjus_map(
         }
     }
     Ok(())
+}
+
+fn should_use_geom_input_cache_pipeline() -> bool {
+    // 约定：
+    // - pipeline 仅在“启用输入缓存 + 启用 pipeline + 非 cache-only”时打开；
+    // - cache-only 模式下禁止访问 SurrealDB，因此此处直接返回 false（走既有 cache-only 流程）。
+    geom_input_cache::is_geom_input_cache_enabled()
+        && geom_input_cache::is_geom_input_cache_pipeline_enabled()
+        && !geom_input_cache::is_geom_input_cache_only()
 }
 
 fn track_refno_issues(refnos: &[RefnoEnum], context: &str, stage: RefnoErrorStage) {
@@ -229,18 +240,68 @@ async fn process_single_noun_type(
 
         match category {
             NounCategoryType::Loop => {
-                process_loop_refno_page(ctx, loop_sjus_map.clone(), sender.clone(), slice)
+                if should_use_geom_input_cache_pipeline() {
+                    if let Err(e) = input_cache_pipeline::run_loop_pipeline_from_refnos(
+                        ctx,
+                        loop_sjus_map.clone(),
+                        sender.clone(),
+                        slice,
+                    )
                     .await
-                    .map_err(|e| {
-                        FullNounError::GeometryGenerationFailed(format!("loop:{}", noun), e.to_string())
-                    })?;
+                    {
+                        eprintln!(
+                            "[loop:{}] geom_input_cache pipeline 失败，回退旧路径: {}",
+                            noun, e
+                        );
+                        process_loop_refno_page(ctx, loop_sjus_map.clone(), sender.clone(), slice)
+                            .await
+                            .map_err(|e| {
+                                FullNounError::GeometryGenerationFailed(
+                                    format!("loop:{}", noun),
+                                    e.to_string(),
+                                )
+                            })?;
+                    }
+                } else {
+                    process_loop_refno_page(ctx, loop_sjus_map.clone(), sender.clone(), slice)
+                        .await
+                        .map_err(|e| {
+                            FullNounError::GeometryGenerationFailed(
+                                format!("loop:{}", noun),
+                                e.to_string(),
+                            )
+                        })?;
+                }
             }
             NounCategoryType::Prim => {
-                process_prim_refno_page(ctx, sender.clone(), slice)
-                    .await
-                    .map_err(|e| {
-                        FullNounError::GeometryGenerationFailed(format!("prim:{}", noun), e.to_string())
-                    })?;
+                if should_use_geom_input_cache_pipeline() {
+                    if let Err(e) =
+                        input_cache_pipeline::run_prim_pipeline_from_refnos(ctx, sender.clone(), slice)
+                            .await
+                    {
+                        eprintln!(
+                            "[prim:{}] geom_input_cache pipeline 失败，回退旧路径: {}",
+                            noun, e
+                        );
+                        process_prim_refno_page(ctx, sender.clone(), slice)
+                            .await
+                            .map_err(|e| {
+                                FullNounError::GeometryGenerationFailed(
+                                    format!("prim:{}", noun),
+                                    e.to_string(),
+                                )
+                            })?;
+                    }
+                } else {
+                    process_prim_refno_page(ctx, sender.clone(), slice)
+                        .await
+                        .map_err(|e| {
+                            FullNounError::GeometryGenerationFailed(
+                                format!("prim:{}", noun),
+                                e.to_string(),
+                            )
+                        })?;
+                }
             }
             NounCategoryType::Cate => {
                 process_cate_refno_page(ctx, loop_sjus_map.clone(), sender.clone(), slice)
@@ -393,13 +454,26 @@ pub async fn gen_full_noun_geos_optimized(
                 i * ctx.batch_size.max(1) + 1,
                 (i * ctx.batch_size.max(1) + chunk.len())
             );
-            process_loop_refno_page(
-                &ctx,
-                loop_sjus_map_arc.clone(),
-                sender.clone(),
-                chunk,
-            )
-            .await?;
+            if should_use_geom_input_cache_pipeline() {
+                if let Err(e) = input_cache_pipeline::run_loop_pipeline_from_refnos(
+                    &ctx,
+                    loop_sjus_map_arc.clone(),
+                    sender.clone(),
+                    chunk,
+                )
+                .await
+                {
+                    eprintln!(
+                        "[BRAN-only][LOOP] geom_input_cache pipeline 失败，回退旧路径: {}",
+                        e
+                    );
+                    process_loop_refno_page(&ctx, loop_sjus_map_arc.clone(), sender.clone(), chunk)
+                        .await?;
+                }
+            } else {
+                process_loop_refno_page(&ctx, loop_sjus_map_arc.clone(), sender.clone(), chunk)
+                    .await?;
+            }
         }
         for r in &loop_vec {
             categorized.insert(*r, super::models::NounCategory::LoopOwner);
@@ -416,7 +490,20 @@ pub async fn gen_full_noun_geos_optimized(
                 i * ctx.batch_size.max(1) + 1,
                 (i * ctx.batch_size.max(1) + chunk.len())
             );
-            process_prim_refno_page(&ctx, sender.clone(), chunk).await?;
+            if should_use_geom_input_cache_pipeline() {
+                if let Err(e) =
+                    input_cache_pipeline::run_prim_pipeline_from_refnos(&ctx, sender.clone(), chunk)
+                        .await
+                {
+                    eprintln!(
+                        "[BRAN-only][PRIM] geom_input_cache pipeline 失败，回退旧路径: {}",
+                        e
+                    );
+                    process_prim_refno_page(&ctx, sender.clone(), chunk).await?;
+                }
+            } else {
+                process_prim_refno_page(&ctx, sender.clone(), chunk).await?;
+            }
         }
         for r in &prim_vec {
             categorized.insert(*r, super::models::NounCategory::Prim);
@@ -507,6 +594,33 @@ pub async fn gen_full_noun_geos_optimized(
                 config.concurrency.get(),
             );
 
+            // [预取] LOOP/PRIM 输入缓存（仅在 AIOS_GEN_INPUT_CACHE=1 时执行）
+            {
+                use crate::fast_model::foyer_cache::geom_input_cache;
+                if geom_input_cache::is_geom_input_cache_enabled()
+                    && !geom_input_cache::is_geom_input_cache_only()
+                {
+                    let loop_vec_for_prefetch: Vec<RefnoEnum> =
+                        loop_refnos.iter().copied().collect();
+                    let prim_vec_for_prefetch: Vec<RefnoEnum> =
+                        prim_refnos.iter().copied().collect();
+                    println!(
+                        "[Pipeline] 开始预取 LOOP/PRIM 输入: loop={}, prim={}",
+                        loop_vec_for_prefetch.len(),
+                        prim_vec_for_prefetch.len()
+                    );
+                    if let Err(e) = geom_input_cache::prefetch_all_geom_inputs(
+                        &db_option,
+                        &loop_vec_for_prefetch,
+                        &prim_vec_for_prefetch,
+                    )
+                    .await
+                    {
+                        eprintln!("[Pipeline] LOOP/PRIM 预取失败（将回退到正常流程）: {}", e);
+                    }
+                }
+            }
+
             // [1-3/4] 处理 LOOP, PRIM, CATE
             let (loop_vec, loop_dur) = process_loop_stage(
                 &ctx,
@@ -553,6 +667,7 @@ pub async fn gen_full_noun_geos_optimized(
 }
 
 /// 内部核心逻辑：处理 BRAN/HANG 相关的 CATE 生成及 Tubing
+#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "bran_hang_core_logic"))]
 async fn process_bran_hang_core_logic(
     db_option: &Arc<DbOptionExt>,
     bran_roots: &[RefnoEnum],
@@ -565,14 +680,9 @@ async fn process_bran_hang_core_logic(
     }
     println!("📍 优先处理 BRAN/HANG 及其依赖 (count={})...", bran_roots.len());
 
-    #[cfg(feature = "profile")]
-    let _bran_span = tracing::info_span!("bran_hang_core_logic", roots = bran_roots.len()).entered();
-
     // 1. 查询子元素并记录已生成的 refno
     let branch_refnos_map: DashMap<RefnoEnum, Vec<SPdmsElement>> = DashMap::new();
     let mut total_children: usize = 0;
-    #[cfg(feature = "profile")]
-    let _children_span = tracing::info_span!("bran_collect_children_from_tree").entered();
     for &refno in bran_roots {
         if let Ok(children) = TreeIndexManager::collect_children_elements_from_tree(refno).await {
             total_children += children.len();
@@ -593,9 +703,6 @@ async fn process_bran_hang_core_logic(
         .iter()
         .flat_map(|entry| entry.value().iter().map(|c| c.refno).collect::<Vec<_>>())
         .collect();
-    #[cfg(feature = "profile")]
-    let _cata_map_span =
-        tracing::info_span!("bran_build_cata_hash_map", child_cnt = child_refnos.len()).entered();
     let target_bran_reuse_cata_map = if child_refnos.is_empty() {
         DashMap::new()
     } else {
@@ -605,8 +712,6 @@ async fn process_bran_hang_core_logic(
     };
 
     // 3. 生成 CATE 几何
-    #[cfg(feature = "profile")]
-    let _cata_span = tracing::info_span!("bran_gen_cata_instances").entered();
     let cate_outcome = match cata_model::gen_cata_instances(
         db_option.clone(),
         Arc::new(target_bran_reuse_cata_map),
@@ -626,12 +731,6 @@ async fn process_bran_hang_core_logic(
 
     // 4. 保存 tubi_info
     if let Some(ref outcome) = cate_outcome {
-        #[cfg(feature = "profile")]
-        let _tubi_span = tracing::info_span!(
-            "bran_save_tubi_info_batch",
-            tubi_cnt = outcome.tubi_info_map.len()
-        )
-        .entered();
         let _ = pdms_inst::save_tubi_info_batch(&outcome.tubi_info_map).await;
     }
 
@@ -639,8 +738,6 @@ async fn process_bran_hang_core_logic(
     let local_al_map = cate_outcome
         .map(|o| o.local_al_map)
         .unwrap_or_else(|| Arc::new(DashMap::new()));
-    #[cfg(feature = "profile")]
-    let _tubi_gen_span = tracing::info_span!("bran_gen_branch_tubi").entered();
     let _ = cata_model::gen_branch_tubi(
         db_option.clone(),
         Arc::new(branch_refnos_map),
@@ -780,9 +877,8 @@ fn get_entry_nouns(config: &FullNounConfig) -> Vec<String> {
     }
 }
 
+#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "query_noun_refnos"))]
 async fn query_noun_refnos(noun: &str, dbnums: &[u32], limit: Option<usize>) -> Result<Vec<RefnoEnum>> {
-    #[cfg(feature = "profile")]
-    let _span = tracing::info_span!("query_noun_refnos", noun, dbnums = ?dbnums, limit = ?limit).entered();
     let tree_dbnums = resolve_tree_dbnums(dbnums)?;
     let manager = TreeIndexManager::with_default_dir(tree_dbnums);
     let mut refnos = manager.query_noun_refnos(noun, limit);

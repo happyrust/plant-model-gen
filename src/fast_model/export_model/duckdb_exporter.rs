@@ -179,9 +179,8 @@ impl DuckDBStreamWriter {
             }
 
             if aabb_has_dbno {
-                let _ = conn.execute_batch(
-                    "UPDATE aabb SET dbnum = CAST(split_part(refno, '_', 1) AS INTEGER) WHERE dbnum IS NULL;",
-                );
+                // 注意：refno 的左半边是 ref0，不是 dbnum。dbnum 必须由 ref0->dbnum 映射得到，
+                // 因此禁止用 split_part(refno,'_',1) 进行错误回填。
             }
 
             if spatial_enabled && aabb_has_bbox {
@@ -204,13 +203,19 @@ impl DuckDBStreamWriter {
         let use_bbox = self.spatial_enabled && self.aabb_has_bbox;
         let use_dbno = self.aabb_has_dbno;
 
+        let db_meta = crate::data_interface::db_meta_manager::db_meta();
+        let _ = db_meta.ensure_loaded();
+
         // 使用事务批量写入
         conn.execute_batch("BEGIN TRANSACTION")?;
 
         // 1. 写入 instance 和 geo
         for (refno, info) in &data.inst_info_map {
             let refno_str = refno.to_string();
-            let dbnum = refno.refno().get_0() as i32;
+            let dbnum = db_meta
+                .get_dbnum_by_refno(*refno)
+                .ok_or_else(|| anyhow::anyhow!("缺少 ref0->dbnum 映射，无法写入 DuckDB aabb.dbnum：refno={}", refno))?
+                as i32;
             let noun = info.generic_type.to_string();
             let owner_refno = if info.owner_refno != *refno {
                 Some(info.owner_refno.to_string())
@@ -336,7 +341,10 @@ impl DuckDBStreamWriter {
         // 3. 写入 tubi 数据
         for (refno, tubi_info) in &data.inst_tubi_map {
             let refno_str = refno.to_string();
-            let dbnum = refno.refno().get_0() as i32;
+            let dbnum = db_meta
+                .get_dbnum_by_refno(*refno)
+                .ok_or_else(|| anyhow::anyhow!("缺少 ref0->dbnum 映射，无法写入 DuckDB aabb.dbnum：refno={}", refno))?
+                as i32;
             let noun = "TUBI";
             let owner_refno = if tubi_info.owner_refno != *refno {
                 Some(tubi_info.owner_refno.to_string())

@@ -153,12 +153,13 @@ async fn auto_generate_tree_index_by_parse(tree_dir: &std::path::Path) -> anyhow
 fn load_db_option_for_parse() -> anyhow::Result<aios_core::options::DbOption> {
     use aios_core::options::DbOption;
     
-    // 尝试从 DbOption.toml 加载
-    let config_path = "DbOption.toml";
-    if std::path::Path::new(config_path).exists() {
-        let content = std::fs::read_to_string(config_path)?;
+    // 通过环境变量或默认路径加载配置
+    let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let config_path = format!("{}.toml", config_name);
+    if std::path::Path::new(&config_path).exists() {
+        let content = std::fs::read_to_string(&config_path)?;
         let mut db_option: DbOption = toml::from_str(&content)
-            .map_err(|e| anyhow::anyhow!("解析 DbOption.toml 失败: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("解析 {} 失败: {}", config_path, e))?;
         
         // 设置解析模式参数
         db_option.save_db = Some(false); // 不写入 SurrealDB，仅生成本地文件
@@ -166,7 +167,7 @@ fn load_db_option_for_parse() -> anyhow::Result<aios_core::options::DbOption> {
         
         Ok(db_option)
     } else {
-        anyhow::bail!("未找到配置文件 DbOption.toml")
+        anyhow::bail!("未找到配置文件 {}", config_path)
     }
 }
 

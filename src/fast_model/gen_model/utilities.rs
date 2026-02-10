@@ -182,16 +182,29 @@ pub async fn build_cata_hash_map_from_tree(
     // 进而整批 refno 被跳过，最终 target_cata_map 为空。
     //
     // 因此这里优先用本仓的 db_meta_manager 做 refno->dbnum 映射，并尽力 ensure_loaded。
+    // 若仍无法映射：直接报错（禁止回退用 ref0 当 dbnum），以免悄然跳过整批 refno。
     let db_meta = crate::data_interface::db_meta_manager::db_meta();
     let _ = db_meta.ensure_loaded();
 
     let mut dbnum_groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
+    let mut missing_ref0s: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for refno in refnos {
-        let dbnum = db_meta
+        let dbnum_opt = db_meta
             .get_dbnum_by_refno(*refno)
-            .or_else(|| crate::fast_model::db_meta_cache::get_dbnum_for_refno(*refno))
-            .unwrap_or_else(|| refno.refno().get_0());
-        dbnum_groups.entry(dbnum).or_default().push(*refno);
+            .or_else(|| crate::fast_model::db_meta_cache::get_dbnum_for_refno(*refno));
+
+        if let Some(dbnum) = dbnum_opt {
+            dbnum_groups.entry(dbnum).or_default().push(*refno);
+        } else {
+            missing_ref0s.insert(refno.refno().get_0());
+        }
+    }
+
+    if !missing_ref0s.is_empty() {
+        anyhow::bail!(
+            "缺少 ref0->dbnum 映射（ref0s={:?}）。请先生成/更新 output/<project>/scene_tree/db_meta_info.json 的 ref0_to_dbnum。",
+            missing_ref0s
+        );
     }
 
     let merged_map: DashMap<String, CataHashRefnoKV> = DashMap::new();

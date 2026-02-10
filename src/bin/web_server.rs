@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
                 .short('c')
                 .help("Path to the configuration file (Without extension)")
                 .value_name("CONFIG_PATH")
-                .default_value("DbOption"),
+                .default_value("db_options/DbOption"),
         )
         .get_matches();
 

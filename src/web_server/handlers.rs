@@ -622,8 +622,10 @@ fn try_load_projects_from_sqlite() -> Option<Vec<ProjectItem>> {
 fn open_sqlite_projects_table() -> Option<(rusqlite::Connection, String)> {
     use config as cfg;
     let mut builder = cfg::Config::builder();
-    if std::path::Path::new("DbOption.toml").exists() {
-        builder = builder.add_source(cfg::File::with_name("DbOption"));
+    let cfg_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_file = format!("{}.toml", cfg_name);
+    if std::path::Path::new(&cfg_file).exists() {
+        builder = builder.add_source(cfg::File::with_name(&cfg_name));
     }
     let built = builder.build().ok()?;
     let db_path: String = built.get_string("project_config_sqlite_path").ok()?;
@@ -2330,7 +2332,7 @@ pub async fn api_import_deployment_site_from_dboption(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("DbOption.toml"));
+        .unwrap_or_else(|| PathBuf::from("db_options/DbOption.toml"));
 
     if !path.exists() {
         return Err((

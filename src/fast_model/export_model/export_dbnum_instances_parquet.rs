@@ -105,8 +105,9 @@ struct AabbRow {
 
 fn refno_to_u64(r: &RefnoEnum) -> u64 {
     let s = r.to_string().replace('/', "_");
-    // 将 "dbnum_sesno" 格式转换为一个唯一的 u64
-    // 方法: dbnum * 1_000_000 + sesno
+    // 将 "ref0_sesno" 格式转换为一个唯一的 u64
+    // 方法: ref0 * 1_000_000 + sesno
+    // 注意：这里的 ref0 不是 dbnum，仅用于生成唯一 ID
     let parts: Vec<&str> = s.split('_').collect();
     if parts.len() == 2 {
         let db = parts[0].parse::<u64>().unwrap_or(0);
@@ -406,12 +407,10 @@ async fn query_inst_relate_rows(
                 in as refno,
                 in.noun as noun,
                 fn::default_full_name(in) as name,
-                record::id(in->inst_relate_aabb[0].out) as aabb_hash,
+                IF in->inst_relate_aabb[0].out != NONE THEN record::id(in->inst_relate_aabb[0].out) END as aabb_hash,
                 spec_value as spec_value
             FROM inst_relate
             WHERE in IN [{pe_list}]
-                AND in->inst_relate_aabb[0].out != NONE
-                AND in->inst_relate_aabb[0].out.d != NONE
             "#
         );
 
@@ -641,6 +640,7 @@ pub struct ParquetExportStats {
 ///
 /// # 返回
 /// 导出统计信息
+#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "export_dbnum_instances_parquet"))]
 pub async fn export_dbnum_instances_parquet(
     dbnum: u32,
     output_dir: &Path,
@@ -649,7 +649,6 @@ pub async fn export_dbnum_instances_parquet(
     target_unit: Option<LengthUnit>,
     root_refno: Option<RefnoEnum>,
 ) -> Result<ParquetExportStats> {
-    let _span = crate::profile_span!("export_dbnum_instances_parquet", dbnum = dbnum);
     let start_time = std::time::Instant::now();
 
     let target = target_unit.unwrap_or(LengthUnit::Millimeter);
@@ -681,11 +680,11 @@ pub async fn export_dbnum_instances_parquet(
         .with_context(|| format!("加载 TreeIndex 失败: {}", tree_path.display()))?;
 
     let mut all_refnos: Vec<RefnoEnum> = if let Some(root) = root_refno {
-        use crate::fast_model::query_compat::query_visible_geo_descendants;
+        use crate::fast_model::query_compat::query_deep_visible_inst_refnos;
         if verbose {
-            println!("🔍 查询 {} 的 visible 子孙节点...", root);
+            println!("🔍 查询 {} 的可见实例节点...", root);
         }
-        query_visible_geo_descendants(root, true, Some("..")).await?
+        query_deep_visible_inst_refnos(root).await?
     } else {
         tree_index
             .all_refnos()
@@ -820,7 +819,6 @@ pub async fn export_dbnum_instances_parquet(
             let child_aabb_hash = export_inst.world_aabb_hash.clone()
                 .or_else(|| child.aabb_hash.clone())
                 .unwrap_or_default();
-            if child_aabb_hash.is_empty() { continue }
 
             let trans_hash = export_inst.world_trans_hash.clone().unwrap_or_default();
 
@@ -901,7 +899,6 @@ pub async fn export_dbnum_instances_parquet(
         let child_aabb_hash = export_inst.world_aabb_hash.clone()
             .or_else(|| child.aabb_hash.clone())
             .unwrap_or_default();
-        if child_aabb_hash.is_empty() { continue }
 
         let trans_hash = export_inst.world_trans_hash.clone().unwrap_or_default();
 

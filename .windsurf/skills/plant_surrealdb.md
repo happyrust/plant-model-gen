@@ -23,13 +23,29 @@ description: 面向 plant/rs-core/aios-core/gen_model-dev 的 SurrealDB/SurrealQ
 - 要"数据库端函数/批量收集"
   - 直接调用 `fn::*`（见 references）
 
+## ⚠️ ref0 ≠ dbnum（严重易错点，必须牢记）
+
+refno 的第一部分（ref0，如 `24381/145018` 中的 `24381`）**不是** dbnum。
+ref0 到 dbnum 的映射存储在 `output/<project>/scene_tree/db_meta_info.json` 的 `ref0_to_dbnum` 字段中。
+
+| ref0 | dbnum | 说明 |
+|------|-------|------|
+| 24381 | 7997 | AvevaMarineSample 示例 |
+| 25688 | 1112 | AvevaMarineSample 示例 |
+| 9304 | 1112 | 同一 dbnum 可对应多个 ref0 |
+
+**查询方式**：
+- Rust 代码：`db_meta().get_dbnum_by_refno(refno)` 或 `db_meta().ref0_to_dbnum`
+- 手动：查看 `output/<project>/scene_tree/db_meta_info.json`
+- CLI：`--dbnum` 参数必须传入真正的 dbnum（如 7997），**绝不能**传 ref0（如 24381）
+
 ## SurrealQL 关键约定（少走弯路）
 
 - **Record ID 形制**（务必先确认 ID 形态再写查询）
-  - `pe:⟨ref0_ref1⟩`（ref0=RefU64 高32位；ref1=低32位；ref0 不是 dbnum）
+  - `pe:⟨ref0_ref1⟩`（ref0=RefU64 高32位；ref1=低32位；**ref0 不是 dbnum**，须通过 db_meta_info.json 映射）
   - `tubi_relate:[pe:⟨bran_refno⟩, index]`（复合 ID；其中 bran_refno 取值为 ref0_ref1，下划线连接；id[0] 为 BRAN/HANG 的 pe_key）
   - `scene_node:⟨refno_u64⟩`、`contains:[parent_u64, child_u64]`
-  - 若需 `dbnum`：须用 `DbMetaManager` 由 `ref0 -> dbnum` 映射取得（勿把 ref0 当 dbnum）
+  - 若需 `dbnum`：须用 `DbMetaManager` 由 `ref0 -> dbnum` 映射取得（**勿把 ref0 当 dbnum**）
 - **复合 ID 取值**：优先 `id[0]`/`id[1]`，少用 `record::id(id)`（额外解析开销）
 - **范围查询**：对 `tubi_relate` 一律用 `table:[start]..[end]` 的 ID Range
 - **只取值**：能用 `SELECT VALUE ...` 就别 `SELECT *`

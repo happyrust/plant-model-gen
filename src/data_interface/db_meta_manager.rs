@@ -131,7 +131,7 @@ impl DbMetaManager {
         let mut paths = Vec::new();
         
         // 优先使用环境变量指定的配置文件，否则回退到默认
-        let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "DbOption".to_string());
+        let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
         let config_file = format!("{}.toml", config_name);
         
         if let Ok(content) = std::fs::read_to_string(&config_file) {
@@ -161,15 +161,16 @@ impl DbMetaManager {
         use dashmap::DashSet;
         use std::sync::Arc;
 
-        // 从 DbOption.toml 读取配置
-        let config_path = "DbOption.toml";
-        if !std::path::Path::new(config_path).exists() {
-            anyhow::bail!("未找到配置文件 DbOption.toml");
+        // 从配置文件读取配置
+        let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+        let config_path = format!("{}.toml", config_name);
+        if !std::path::Path::new(&config_path).exists() {
+            anyhow::bail!("未找到配置文件 {}", config_path);
         }
 
-        let content = std::fs::read_to_string(config_path)?;
+        let content = std::fs::read_to_string(&config_path)?;
         let mut db_option: DbOption = toml::from_str(&content)
-            .map_err(|e| anyhow::anyhow!("解析 DbOption.toml 失败: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("解析 {} 失败: {}", config_path, e))?;
 
         // 设置为仅生成树结构模式
         db_option.gen_tree_only = true;
@@ -308,7 +309,7 @@ pub fn generate_desi_indextree() -> anyhow::Result<()> {
     use std::sync::Arc;
 
     // 优先使用环境变量指定的配置文件，否则回退到默认
-    let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "DbOption".to_string());
+    let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let config_path = format!("{}.toml", config_name);
     if !std::path::Path::new(&config_path).exists() {
         anyhow::bail!("未找到配置文件 {}", config_path);
@@ -316,7 +317,7 @@ pub fn generate_desi_indextree() -> anyhow::Result<()> {
 
     let content = std::fs::read_to_string(&config_path)?;
     let mut db_option: DbOption = toml::from_str(&content)
-        .map_err(|e| anyhow::anyhow!("解析 DbOption.toml 失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("解析 {} 失败: {}", config_path, e))?;
 
     // 设置为仅生成树结构模式
     db_option.gen_tree_only = true;

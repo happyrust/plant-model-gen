@@ -575,7 +575,7 @@ fn test_str_split() {
 async fn test_query_rvm_tubi_instances_aql() -> anyhow::Result<()> {
     use config::{Config, ConfigError, Environment, File};
     let s = Config::builder()
-        .add_source(File::with_name("DbOption"))
+        .add_source(File::with_name("db_options/DbOption"))
         .build()?;
     let db_option: DbOption = s.try_deserialize().unwrap();
     let database = get_arangodb_conn_from_db_option_for_test(&db_option).await?;
@@ -589,7 +589,7 @@ async fn test_query_rvm_tubi_instances_aql() -> anyhow::Result<()> {
 async fn test_query_rvm_geo_instance_aql() -> anyhow::Result<()> {
     use config::{Config, ConfigError, Environment, File};
     let s = Config::builder()
-        .add_source(File::with_name("DbOption"))
+        .add_source(File::with_name("db_options/DbOption"))
         .build()?;
     let db_option: DbOption = s.try_deserialize().unwrap();
     let database = get_arangodb_conn_from_db_option_for_test(&db_option).await?;

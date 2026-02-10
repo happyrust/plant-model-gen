@@ -235,8 +235,8 @@
   // 从 DbOption.toml 导入部署站点
   window.importDeploymentSiteFromDbOption = async function(){
     try {
-      const suggestion = 'DbOption.toml';
-      const input = prompt('请输入 DbOption.toml 路径（留空使用当前目录下的 '+suggestion+'）', '');
+      const suggestion = 'db_options/DbOption.toml';
+      const input = prompt('请输入 DbOption.toml 路径（留空使用 '+suggestion+'）', '');
       if (input === null) {
         return;
       }

@@ -23,6 +23,7 @@ pub mod context; // 处理上下文
 pub mod errors; // 错误类型 (Phase 2)
 pub mod models; // 数据模型定义
 pub mod noun_collection; // Noun 收集和分类 // 分类 Refno 存储 (Phase 3)
+pub mod input_cache_pipeline; // LOOP/PRIM 输入缓存流水线（key-driven）
 
 // 处理器模块
 pub mod cate_helpers; // Cate 工具函数

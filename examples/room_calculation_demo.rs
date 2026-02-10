@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 #[tokio::main]
 async fn main() -> Result<()> {
     // 读取配置（默认 DbOption.toml）
-    let mut db_option_ext = aios_database::options::get_db_option_ext_from_path("DbOption")
+    let mut db_option_ext = aios_database::options::get_db_option_ext_from_path("db_options/DbOption")
         .context("加载 DbOption 失败")?;
 
     // 初始化 SurrealDB 连接

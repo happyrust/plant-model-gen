@@ -96,7 +96,7 @@ async fn test_gen_implicit_attr_data() -> anyhow::Result<()> {
     let pool = AiosDBManager::get_db_pool(&url, "sample").await?;
     use config::{Config, ConfigError, Environment, File};
     let s = Config::builder()
-        .add_source(File::with_name("DbOption"))
+        .add_source(File::with_name("db_options/DbOption"))
         .build()
         .unwrap();
     let db_option: DbOption = s.try_deserialize().unwrap();

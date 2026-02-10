@@ -109,26 +109,71 @@ fn build_export_config(
 }
 
 /// 模型生成完成后同步缓存数据到 SurrealDB 的辅助函数
+///
+/// `debug_model_refnos`: 当指定时，仅同步这些 refno 的子孙节点数据（避免同步整个 cache）。
 #[cfg(not(feature = "gui"))]
 async fn sync_cache_to_db_if_enabled(
     sync_enabled: bool,
     db_option_ext: &aios_database::options::DbOptionExt,
+    debug_model_refnos: Option<&[String]>,
 ) -> anyhow::Result<()> {
     if !sync_enabled {
         return Ok(());
     }
 
-    println!("\n🗄️  --sync-to-db: 模型生成完成，开始同步缓存数据到 SurrealDB...");
-
     // 确保数据库已连接
     init_surreal().await?;
+
+    // 如果有 debug_model_refnos，收集子孙节点构建 refno_filter
+    let refno_filter = if let Some(refno_strs) = debug_model_refnos {
+        if !refno_strs.is_empty() {
+            use aios_core::pdms_types::RefnoEnum;
+            use std::str::FromStr;
+
+            let roots: Vec<RefnoEnum> = refno_strs
+                .iter()
+                .filter_map(|s| {
+                    let r = s.replace('_', "/");
+                    RefnoEnum::from_str(&r).ok()
+                })
+                .collect();
+
+            if !roots.is_empty() {
+                println!(
+                    "\n🗄️  --sync-to-db: 仅同步 debug-model 指定节点的子孙数据: {:?}",
+                    refno_strs
+                );
+                // 查询子孙节点（包含自身）
+                let descendants = aios_core::collect_descendant_filter_ids(&roots, &[], None).await?;
+                let mut filter: std::collections::HashSet<RefnoEnum> =
+                    descendants.into_iter().collect();
+                // 包含根节点自身
+                filter.extend(roots.iter().copied());
+                println!(
+                    "   收集到 {} 个子孙 refno（含根节点）",
+                    filter.len()
+                );
+                Some(filter)
+            } else {
+                println!("\n🗄️  --sync-to-db: 模型生成完成，开始同步缓存数据到 SurrealDB...");
+                None
+            }
+        } else {
+            println!("\n🗄️  --sync-to-db: 模型生成完成，开始同步缓存数据到 SurrealDB...");
+            None
+        }
+    } else {
+        println!("\n🗄️  --sync-to-db: 模型生成完成，开始同步缓存数据到 SurrealDB...");
+        None
+    };
 
     let cache_dir = db_option_ext.get_foyer_cache_dir();
     let flushed = aios_database::fast_model::cache_flush::flush_latest_instance_cache_to_surreal(
         &cache_dir,
-        None,  // 同步所有 dbnums
+        None,  // 同步所有 dbnums（refno_filter 会在 merge 后精确过滤）
         true,  // replace_exist = true，覆盖已有数据
         true,  // verbose
+        refno_filter.as_ref(),
     )
     .await?;
 
@@ -137,6 +182,96 @@ async fn sync_cache_to_db_if_enabled(
         cache_dir.display(),
         flushed
     );
+
+    Ok(())
+}
+
+/// debug-model 流程的后置步骤：sync-to-db + export-dbnum-instances（parquet/json）
+///
+/// 将 sync + 导出合并为一个调用，避免 debug-model 分支中重复编写。
+#[cfg(not(feature = "gui"))]
+async fn post_export_steps(
+    matches: &clap::ArgMatches,
+    db_option_ext: &aios_database::options::DbOptionExt,
+    debug_model_refnos: Option<&[String]>,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    // 1. sync-to-db
+    sync_cache_to_db_if_enabled(
+        matches.get_flag("sync-to-db"),
+        db_option_ext,
+        debug_model_refnos,
+    )
+    .await?;
+
+    // 2. export-dbnum-instances-parquet / export-dbnum-instances-json
+    let want_parquet = matches.get_flag("export-dbnum-instances-parquet")
+        || matches.get_flag("export-dbnum-instances");
+    let want_json = matches.get_flag("export-dbnum-instances-json");
+
+    if !want_parquet && !want_json {
+        return Ok(());
+    }
+
+    // 从 debug-model refno 推导 dbnum + root_refno
+    use aios_core::pdms_types::RefnoEnum;
+    use std::str::FromStr;
+
+    let first_refno_str = debug_model_refnos
+        .and_then(|v| v.first())
+        .map(|s| s.replace('_', "/"));
+    let root_refno: Option<RefnoEnum> = first_refno_str
+        .as_deref()
+        .and_then(|s| RefnoEnum::from_str(s).ok());
+
+    // 自动推导 dbnum：优先 CLI --dbnum，否则从 refno 推导
+    let dbnum = matches.get_one::<u32>("dbnum").copied().or_else(|| {
+        root_refno.and_then(|r| {
+            aios_database::data_interface::db_meta()
+                .get_dbnum_by_refno(r)
+        })
+    });
+
+    let Some(dbnum) = dbnum else {
+        eprintln!("⚠️  无法推导 dbnum，跳过 export-dbnum-instances");
+        return Ok(());
+    };
+
+    let output_override = matches
+        .get_one::<String>("output")
+        .map(std::path::PathBuf::from);
+
+    // 确保数据库已连接
+    init_surreal().await?;
+
+    if want_parquet {
+        println!("\n📦 后置步骤：导出 dbnum={} 实例数据为 Parquet", dbnum);
+        crate::cli_modes::export_dbnum_instances_parquet_mode(
+            dbnum,
+            verbose,
+            output_override.clone(),
+            db_option_ext,
+            root_refno,
+        )
+        .await?;
+    }
+
+    if want_json {
+        let from_cache = matches.get_flag("from-cache");
+        let detailed = matches.get_flag("detailed");
+        println!("\n📦 后置步骤：导出 dbnum={} 实例数据为 JSON", dbnum);
+        crate::cli_modes::export_dbnum_instances_json_mode(
+            dbnum,
+            verbose,
+            output_override,
+            db_option_ext,
+            true, // autorun
+            root_refno,
+            from_cache,
+            detailed,
+        )
+        .await?;
+    }
 
     Ok(())
 }
@@ -208,12 +343,12 @@ async fn main() -> anyhow::Result<()> {
                 .short('c')
                 .help("Path to the configuration file (Without extension)")
                 .value_name("CONFIG_PATH")
-                .default_value("DbOption"),
+                .default_value("db_options/DbOption"),
         )
         .arg(
             Arg::new("gen-lod")
                 .long("gen-lod")
-                .help("Override mesh generation LOD level for this run (L0-L4). Defaults to DbOption.toml")
+                .help("Override mesh generation LOD level for this run (L0-L4). Defaults to db_options/DbOption.toml")
                 .value_name("LOD")
                 .value_parser(["L0", "L1", "L2", "L3", "L4"]),
         )
@@ -770,6 +905,7 @@ async fn main() -> anyhow::Result<()> {
             dbnums.as_deref(),
             replace_exist,
             true,
+            None,  // 全量备份，不按 refno 过滤
         )
         .await?;
 
@@ -1118,7 +1254,7 @@ async fn main() -> anyhow::Result<()> {
                 matches.get_flag("export-svg"),
             );
             let result = export_obj_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            post_export_steps(&matches, &db_option_ext, debug_model_refnos.as_deref(), verbose).await?;
             return result;
         }
 
@@ -1140,7 +1276,7 @@ async fn main() -> anyhow::Result<()> {
                 matches.get_flag("export-svg"),
             );
             let result = export_obj_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            post_export_steps(&matches, &db_option_ext, debug_model_refnos.as_deref(), verbose).await?;
             return result;
         }
 
@@ -1161,7 +1297,7 @@ async fn main() -> anyhow::Result<()> {
                 true, // export_svg = true
             );
             let result = export_obj_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            post_export_steps(&matches, &db_option_ext, debug_model_refnos.as_deref(), verbose).await?;
             return result;
         }
 
@@ -1183,7 +1319,7 @@ async fn main() -> anyhow::Result<()> {
             );
             config.use_basic_materials = use_basic_materials;
             let result = export_glb_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            post_export_steps(&matches, &db_option_ext, debug_model_refnos.as_deref(), verbose).await?;
             return result;
         }
 
@@ -1205,7 +1341,7 @@ async fn main() -> anyhow::Result<()> {
             );
             config.use_basic_materials = use_basic_materials;
             let result = export_gltf_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            post_export_steps(&matches, &db_option_ext, debug_model_refnos.as_deref(), verbose).await?;
             return result;
         }
     }
@@ -1230,7 +1366,7 @@ async fn main() -> anyhow::Result<()> {
                 matches.get_flag("export-svg"),
             );
             let result = export_obj_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext, debug_model_refnos.as_deref()).await?;
             return result;
         }
 
@@ -1252,7 +1388,7 @@ async fn main() -> anyhow::Result<()> {
             );
             config.use_basic_materials = use_basic_materials;
             let result = export_glb_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext, debug_model_refnos.as_deref()).await?;
             return result;
         }
 
@@ -1274,7 +1410,7 @@ async fn main() -> anyhow::Result<()> {
             );
             config.use_basic_materials = use_basic_materials;
             let result = export_gltf_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext, debug_model_refnos.as_deref()).await?;
             return result;
         }
     }
@@ -1301,7 +1437,7 @@ async fn main() -> anyhow::Result<()> {
                 matches.get_flag("export-svg"),
             );
             let result = export_obj_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext, debug_model_refnos.as_deref()).await?;
             return result;
         }
     }
@@ -1326,7 +1462,7 @@ async fn main() -> anyhow::Result<()> {
             );
             config.use_basic_materials = use_basic_materials;
             let result = export_glb_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext, debug_model_refnos.as_deref()).await?;
             return result;
         }
     }
@@ -1351,7 +1487,7 @@ async fn main() -> anyhow::Result<()> {
             );
             config.use_basic_materials = use_basic_materials;
             let result = export_gltf_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+            sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext, debug_model_refnos.as_deref()).await?;
             return result;
         }
     }
@@ -1375,7 +1511,7 @@ async fn main() -> anyhow::Result<()> {
             matches.get_flag("export-svg"),
         );
         let result = export_gltf_mode(config, &db_option_ext).await;
-        sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+        sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext, debug_model_refnos.as_deref()).await?;
         return result;
     }
 
@@ -1395,7 +1531,7 @@ async fn main() -> anyhow::Result<()> {
             matches.get_flag("export-svg"),
         );
         let result = export_glb_mode(config, &db_option_ext).await;
-        sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+        sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext, debug_model_refnos.as_deref()).await?;
         return result;
     }
 
@@ -1415,7 +1551,7 @@ async fn main() -> anyhow::Result<()> {
             matches.get_flag("export-svg"),
         );
         let result = export_obj_mode(config, &db_option_ext).await;
-        sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext).await?;
+        sync_cache_to_db_if_enabled(matches.get_flag("sync-to-db"), &db_option_ext, debug_model_refnos.as_deref()).await?;
         return result;
     }
 

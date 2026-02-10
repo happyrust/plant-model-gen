@@ -1,0 +1,144 @@
+# 性能测试专用配置：7997 dbnum PANE 模型生成
+total_sync = false
+incr_sync = false
+sync_history = false
+enable_log = false
+sync_graph_db = false
+replace_dbs = false
+enable_index = false
+sync_versioned = false
+sync_tidb = false
+sync_live = false
+sync_chunk_size = 100000
+
+# 项目设置
+project_path = "/Volumes/DPC/work/e3d_models"
+included_projects = ["AvevaMarineSample"]
+mdb_name = "ALL"
+project_name = "AvevaMarineSample"
+project_code = "1516"
+surreal_ns = "1516"
+module = "DESI"
+
+# 模型生成配置
+gen_model = true
+gen_mesh = false
+replace_mesh = true
+save_db = false
+use_surrealdb = false
+use_cache = true
+gen_tree_only = false
+apply_boolean_operation = false
+mesh_tol_ratio = 3.0
+
+gen_spatial_tree = false
+load_spatial_tree = false
+save_spatial_tree_to_db = false
+enable_sqlite_rtree = false
+gen_model_batch_size = 16
+
+# Full Noun 模式配置
+full_noun_mode = true
+full_noun_max_concurrent_nouns = 6
+full_noun_batch_size = 200
+
+# 只生成 PANE 类型（走 LOOP 管线）
+full_noun_enabled_categories = ["PANE"]
+full_noun_excluded_nouns = []
+
+# 不限制数量，生成所有 PANE
+debug_limit_per_noun = 0
+
+# 指定 dbnum = 7997
+manual_db_nums = [7997]
+
+build_cate_relate = false
+gen_noun_graph = false
+meshes_path = "./assets/meshes"
+
+# arangodb 配置（不使用但必填）
+arangodb_database = "ams"
+multi_threads = false
+only_sync_sys = false
+arangodb_url = "http://127.0.0.1:8529"
+rebuild_ssc_tree = false
+arangodb_user = "root"
+arangodb_password = ""
+
+# tidb 配置（不使用但必填）
+ip = "127.0.0.1"
+user = "root"
+password = ""
+port = "3306"
+sql_threads_number = 10
+batch_insert_sql_cnt = 100
+
+# surrealdb 数据库配置
+v_ip = "localhost"
+v_port = 8020
+v_user = "root"
+v_password = "root"
+pe_chunk = 300
+att_chunk = 200
+
+kv_ip = "localhost"
+kv_port = "8010"
+
+# mqtt 配置
+mqtt_host = "127.0.0.1"
+mqtt_port = 1883
+
+location = "sjz"
+location_dbs = []
+
+server_release_ip = "127.0.0.1:9099"
+remote_file_server_hosts = []
+file_server_host = "http://localhost:8082/assets/archives"
+surreal_script_dir = "../rs-core/resource/surreal"
+
+# 调试选项
+save_model_mesh_to_graph_db = false
+need_sync_refno_basic = false
+reset_mdb_project = false
+only_update_dbinfo = false
+debug_print_world_transform = false
+only_rebuild_pdms_element = false
+debug_refno_types = []
+included_db_files = []
+plat_url = ""
+
+puhua_database_ip = ""
+puhua_database_user = ""
+puhua_database_password = ""
+
+room_keyword = "-RM"
+gen_history_model = false
+
+# 精度配置
+[mesh_precision]
+default_lod = "L2"
+
+[mesh_precision.lod_profiles.L2]
+neg_multiplier = 0.4
+sweep_multiplier = 0.15
+polyhedron_fixed_tol = 0.02
+sphere_subdiv = 18
+radial_segments = 24
+mesh_tol_ratio = 6.0
+
+[mesh_precision.lod_profiles.L2.csg_settings]
+radial_segments = 20
+height_segments = 2
+cap_segments = 1
+error_tolerance = 0.005
+min_radial_segments = 12
+max_radial_segments = 30
+min_height_segments = 1
+max_height_segments = 3
+target_segment_length = 140.0
+non_scalable_factor = 0.8
+
+[model_center]
+base_url = "http://localhost:3000"
+token_secret = "your-shared-secret-key"
+timeout_seconds = 30

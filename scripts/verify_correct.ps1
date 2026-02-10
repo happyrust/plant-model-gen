@@ -10,6 +10,29 @@ function Run-Query($sql, $label) {
     Write-Host "${label}: $($r | ConvertTo-Json -Compress -Depth 3)"
 }
 
+$ref0 = 24381
+$dbMetaPath = "output\\AvevaMarineSample\\scene_tree\\db_meta_info.json"
+$dbnum = $null
+if (Test-Path $dbMetaPath) {
+    try {
+        $m = (Get-Content $dbMetaPath -Raw | ConvertFrom-Json)
+        $mapped = $m.ref0_to_dbnum."$ref0"
+        if ($mapped) {
+            $dbnum = [int]$mapped
+        } else {
+            Write-Error "未在 db_meta_info.json 中找到 ref0=$ref0 的 dbnum 映射；请先生成/更新 db_meta_info.json，或手动指定正确 dbnum。"
+            exit 1
+        }
+    } catch {
+        Write-Error "解析 db_meta_info.json 失败；请先修复该文件或重新生成。"
+        exit 1
+    }
+} else {
+    Write-Error "未找到 $dbMetaPath；请先生成/同步 scene_tree 元数据（db_meta_info.json）。"
+    exit 1
+}
+Write-Host "✅ ref0=$ref0 -> dbnum=$dbnum"
+
 Write-Host "=== 1. Total Counts (GROUP ALL) ==="
 Run-Query "SELECT count() FROM inst_relate GROUP ALL;" "inst_relate total"
 Run-Query "SELECT count() FROM tubi_relate GROUP ALL;" "tubi_relate total"
@@ -37,7 +60,7 @@ Run-Query "SELECT count() FROM inst_relate WHERE in = pe:``24381_145025`` GROUP 
 Run-Query "SELECT count() FROM inst_relate WHERE in = pe:``24381_145032`` GROUP ALL;" "inst_relate in=145032"
 
 Write-Host "`n=== 4. Sample inst_relate for 24381_* ==="
-Run-Query "SELECT id, in, out FROM inst_relate WHERE in.dbnum = 24381 LIMIT 5;" "inst_relate dbnum=24381 sample"
+Run-Query "SELECT id, in, out FROM inst_relate WHERE in.dbnum = $dbnum LIMIT 5;" "inst_relate dbnum=$dbnum sample (ref0=$ref0)"
 
 Write-Host "`n=== 5. Sample tubi_relate ==="
 Run-Query "SELECT id, in, out, system FROM tubi_relate LIMIT 5;" "tubi_relate sample"

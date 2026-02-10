@@ -14,6 +14,7 @@
 //!   cargo run --example room_calc_by_panel_demo --features "gen_model,sqlite-index" -- `
 //!     --panel-refno 24381/35798 `
 //!     --expect-refnos 24381/145019 `
+//!     --dbnum 7997 `
 //!     --dboption-path DbOption `
 //!     --auto-gen-model true
 //!
@@ -27,8 +28,9 @@
 use anyhow::{Context, Result};
 use aios_core::{RecordId, RefnoEnum, SUL_DB, SurrealQueryExt, init_surreal};
 use clap::Parser;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -39,14 +41,25 @@ struct Args {
     panel_refno: String,
 
     /// DbOption 配置名/路径（不带 .toml 后缀亦可）
-    #[arg(long, default_value = "DbOption")]
+    #[arg(long, default_value = "db_options/DbOption")]
     dboption_path: String,
 
     /// 是否自动生成模型/mesh/空间索引（Foyer Cache）后再做房间计算
-    #[arg(long, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new())]
+    ///
+    /// - 建议默认关（false），避免一次跑触发全量 gen_model，耗时极长。
+    /// - 需要时再显式开启：`--auto-gen-model true`
+    #[arg(
+        long,
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::Set
+    )]
     auto_gen_model: bool,
 
-    /// 指定 dbnum（不传则从 panel_refno 自动推导，例如 24381/35798 -> 24381）
+    /// 指定 dbnum（注意：ref0 ≠ dbnum）。
+    ///
+    /// - 不传时：会尝试从 `output/<project>/scene_tree/db_meta_info.json` 的 `ref0_to_dbnum` 映射推导；
+    /// - 若映射缺失：将直接报错（不会回退使用 ref0），请显式传 `--dbnum`。
     #[arg(long)]
     dbnum: Option<u32>,
 
@@ -91,12 +104,19 @@ fn parse_refno_list(raw: &str) -> anyhow::Result<Vec<RefnoEnum>> {
     Ok(out)
 }
 
-fn parse_dbnum_from_refno_str(refno: &str) -> anyhow::Result<u32> {
-    let s = refno.trim();
-    let left = s.split('/').next().unwrap_or_default().trim();
-    anyhow::ensure!(!left.is_empty(), "无法从 refno 推导 dbnum：{}", refno);
-    left.parse::<u32>()
-        .with_context(|| format!("无法从 refno 推导 dbnum：{}", refno))
+fn try_map_dbnum_from_project_meta(
+    db_option_ext: &aios_database::options::DbOptionExt,
+    ref0: u32,
+) -> Option<u32> {
+    let meta_path = db_option_ext
+        .get_project_output_dir()
+        .join("scene_tree")
+        .join("db_meta_info.json");
+    let raw = fs::read_to_string(meta_path).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    let map = v.get("ref0_to_dbnum")?.as_object()?;
+    let dbnum = map.get(&ref0.to_string())?.as_u64()?;
+    u32::try_from(dbnum).ok()
 }
 
 async fn ensure_tree_index_by_parse(
@@ -139,6 +159,13 @@ async fn ensure_tree_index_by_parse(
 
     println!("✅ TreeIndex 生成完成: {}", tree_path.display());
     Ok(tree_path)
+}
+
+fn get_ref0_from_refno_enum(r: RefnoEnum) -> u32 {
+    match r {
+        RefnoEnum::Refno(x) => x.get_0(),
+        RefnoEnum::SesRef(x) => x.refno.get_0(),
+    }
 }
 
 // SurrealDB 里 pe 的 id 是字符串（形如 `17496_199296`），需要用反引号包裹，避免被解析为带下划线的数字字面量。
@@ -184,9 +211,6 @@ async fn main() -> Result<()> {
 
     // 额外参数
     let inside_tol = args.inside_tol;
-    let dbnum = args
-        .dbnum
-        .unwrap_or(parse_dbnum_from_refno_str(args.panel_refno.as_str())?);
 
     let mut room_num = args.room_num.unwrap_or_default();
     if room_num.trim().is_empty() {
@@ -211,6 +235,30 @@ async fn main() -> Result<()> {
         std::env::set_var("DB_OPTION_FILE", &dbopt_path);
     }
 
+    // 3) 推导 dbnum：优先用用户输入；否则从项目输出目录的 db_meta_info.json 做 ref0->dbnum 映射。
+    // 说明：形如 `24381/35798` 的左半边通常是 ref0（高 32 位），并非最终 dbnum。
+    // 约束：映射缺失时直接报错（不允许回退用 ref0 当 dbnum）。
+    let dbnum = if let Some(dbnum) = args.dbnum {
+        dbnum
+    } else {
+        let ref0 = get_ref0_from_refno_enum(panel_refno);
+        if let Some(dbnum) = try_map_dbnum_from_project_meta(&db_option_ext, ref0) {
+            dbnum
+        } else {
+            // 兜底：尽力用 DbMetaManager（若其加载路径与当前项目不一致，可能仍会失败）
+            let meta = aios_database::data_interface::db_meta();
+            meta.ensure_loaded().ok();
+            if let Some(dbnum) = meta.get_dbnum_by_ref0(ref0) {
+                dbnum
+            } else {
+                anyhow::bail!(
+                    "未能由 ref0={} 推导 dbnum（db_meta_info.json / DbMetaManager 均缺失）。请显式传 `--dbnum <真实dbnum>`。",
+                    ref0
+                );
+            }
+        }
+    };
+
     // 诊断用：输出房间计算内部 info 日志（默认只写文件；如需同时输出到控制台请设置 AIOS_LOG_TO_CONSOLE=1）。
     aios_database::init_logging(true);
 
@@ -227,7 +275,7 @@ async fn main() -> Result<()> {
     println!("   - inside_tol: {}", inside_tol);
     println!("   - foyer_cache_dir: {}", foyer_cache_dir);
 
-    // 3) 自动生成模型/mesh/空间索引（Foyer Cache）
+    // 4) 自动生成模型/mesh/空间索引（Foyer Cache）
     if args.auto_gen_model {
         println!("🔄 自动生成模型（Foyer Cache）: dbnum={}", dbnum);
 
@@ -264,14 +312,14 @@ async fn main() -> Result<()> {
         );
     }
 
-    // 4) 运行期：强制房间计算走 cache 查询 inst 信息（避免依赖 SurrealDB 的 inst_relate/inst_relate_aabb）。
+    // 5) 运行期：强制房间计算走 cache 查询 inst 信息（避免依赖 SurrealDB 的 inst_relate/inst_relate_aabb）。
     // 注意：room_model.rs 内部通过环境变量开关，这里用 CLI 参数控制其取值（不是测试输入）。
     unsafe {
         std::env::set_var("AIOS_ROOM_USE_CACHE", if args.room_use_cache { "1" } else { "0" });
         std::env::set_var("FOYER_CACHE_DIR", &foyer_cache_dir);
     }
 
-    // 5) 获取 room_num（仅写库需要）
+    // 6) 获取 room_num（仅写库需要）
     let mut sbfr_pe = String::new();
     let mut frmw_pe = String::new();
 
@@ -329,7 +377,7 @@ async fn main() -> Result<()> {
         println!("   - room_num(ARG): {}", room_num);
     }
 
-    // 6) 计算“该 panel”的房间构件集合
+    // 7) 计算“该 panel”的房间构件集合
     let mesh_dir = db_option_ext.inner.get_meshes_path();
     let exclude = HashSet::<RefnoEnum>::new();
     let within = aios_database::fast_model::room_model::cal_room_refnos(
@@ -378,7 +426,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // 7) 覆盖写入：先删旧的，再批量写入新的（与 room_model.rs 的 save_room_relate 保持一致）。
+    // 8) 覆盖写入：先删旧的，再批量写入新的（与 room_model.rs 的 save_room_relate 保持一致）。
     anyhow::ensure!(!room_num.is_empty(), "未提供 ROOM_NUM 且无法获取房间号（写库需要 room_num）");
 
     let delete_sql = format!("DELETE room_relate WHERE `in` = {};", panel_refno.to_pe_key());

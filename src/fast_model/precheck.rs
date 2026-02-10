@@ -11,16 +11,27 @@ pub async fn ensure_pe_transform_for_refnos(refnos: &[RefnoEnum]) -> anyhow::Res
         return Ok(());
     }
 
+    let db_meta = crate::data_interface::db_meta_manager::db_meta();
+    let _ = db_meta.ensure_loaded();
+
     // 提取 dbnum 列表
     let mut dbnums = HashSet::new();
     for refno in refnos {
-        let dbnum = crate::data_interface::db_meta_manager::db_meta()
-            .get_dbnum_by_refno(*refno)
-            .unwrap_or_else(|| refno.refno().get_0());
-        dbnums.insert(dbnum);
+        if let Some(dbnum) = db_meta.get_dbnum_by_refno(*refno) {
+            dbnums.insert(dbnum);
+        } else {
+            // 禁止回退用 ref0 当 dbnum；映射缺失时仅告警，不阻断流程。
+            log::warn!(
+                "[precheck] 缺少 ref0->dbnum 映射，跳过 pe_transform 刷新: refno={}",
+                refno
+            );
+        }
     }
 
     let dbnum_vec: Vec<u32> = dbnums.into_iter().collect();
+    if dbnum_vec.is_empty() {
+        return Ok(());
+    }
 
     log::info!("[precheck] 刷新 {} 个 refno 对应的 {} 个数据库的 pe_transform",
                refnos.len(), dbnum_vec.len());

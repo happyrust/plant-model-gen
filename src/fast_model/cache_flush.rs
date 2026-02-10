@@ -26,6 +26,19 @@ struct MergedCacheData {
     inst_relate_bool_map: HashMap<RefnoEnum, crate::fast_model::instance_cache::CachedInstRelateBool>,
 }
 
+impl MergedCacheData {
+    /// 按 refno 集合过滤：仅保留属于 filter 的条目。
+    fn filter_by_refnos(mut self, filter: &HashSet<RefnoEnum>) -> Self {
+        self.inst_info_map.retain(|k, _| filter.contains(k));
+        self.inst_geos_map.retain(|_, v| filter.contains(&v.refno));
+        self.inst_tubi_map.retain(|k, _| filter.contains(k));
+        self.neg_relate_map.retain(|k, _| filter.contains(k));
+        self.ngmr_neg_relate_map.retain(|k, _| filter.contains(k));
+        self.inst_relate_bool_map.retain(|k, _| filter.contains(k));
+        self
+    }
+}
+
 /// 合并多个 cache batch 为“最终态”数据（用于 DB flush）。
 ///
 /// 说明：该函数先实现为“旧语义”（inst_geos_map 对同 key 做 extend），以配合 TDD 的 RED；
@@ -123,11 +136,14 @@ fn collect_tubi_info_from_inst_info_map(_inst_info_map: &HashMap<RefnoEnum, EleG
 /// 约定：
 /// - 该函数只负责“缓存 -> DB”同步，不参与模型生成。
 /// - 需由调用方提前 `init_surreal()`。
+/// `refno_filter`: 可选的 refno 过滤集合。当指定时，仅同步属于该集合的实例数据
+/// （用于 --debug-model 场景，避免同步整个 cache）。
 pub async fn flush_latest_instance_cache_to_surreal(
     cache_dir: &Path,
     dbnums: Option<&[u32]>,
     replace_exist: bool,
     verbose: bool,
+    refno_filter: Option<&HashSet<RefnoEnum>>,
 ) -> Result<usize> {
     let cache = InstanceCacheManager::new(cache_dir)
         .await
@@ -172,6 +188,33 @@ pub async fn flush_latest_instance_cache_to_surreal(
         }
 
         let merged = merge_cached_batches_for_db_flush(batches);
+
+        // 按 refno 过滤（--debug-model / --sync-to-db 场景）
+        let merged = match refno_filter {
+            Some(filter) => {
+                let before = merged.inst_info_map.len();
+                let merged = merged.filter_by_refnos(filter);
+                if verbose {
+                    println!(
+                        "[cache_flush] dbnum={} refno_filter applied: {} -> {} inst_info",
+                        dbnum, before, merged.inst_info_map.len()
+                    );
+                }
+                merged
+            }
+            None => merged,
+        };
+
+        // 过滤后如果为空，跳过此 dbnum
+        if merged.inst_info_map.is_empty()
+            && merged.inst_geos_map.is_empty()
+            && merged.inst_tubi_map.is_empty()
+        {
+            if verbose {
+                println!("[cache_flush] dbnum={} 过滤后无数据，跳过", dbnum);
+            }
+            continue;
+        }
 
         if verbose {
             println!(

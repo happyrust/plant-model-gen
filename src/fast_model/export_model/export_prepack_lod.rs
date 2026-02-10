@@ -1687,7 +1687,7 @@ pub async fn export_all_relates_prepack_lod(
     //    如果提供了 dbnum，只查询该 db 下的 inst_relate；否则全表扫描。
     let db_filter = if let Some(dbnum) = dbnum {
         println!("   - 模式: 按 dbnum={} 过滤", dbnum);
-        format!("in.dbnum = {} ", dbnum)
+        format!("string::starts_with(record::id(in), '{}_') ", dbnum)
     } else {
         println!("   - 模式: 全表扫描（所有 dbnum）");
         "1=1 ".to_string()
@@ -1926,7 +1926,7 @@ pub async fn export_all_relates_prepack_lod_parquet(
 
     let db_filter = if let Some(dbnum) = dbnum {
         println!("   - 模式: 按 dbnum={} 过滤", dbnum);
-        format!("in.dbnum = {} ", dbnum)
+        format!("string::starts_with(record::id(in), '{}_') ", dbnum)
     } else {
         println!("   - 模式: 全表扫描（所有 dbnum）");
         "1=1 ".to_string()

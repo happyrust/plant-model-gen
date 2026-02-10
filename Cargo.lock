@@ -7663,6 +7663,7 @@ dependencies = [
 [[package]]
 name = "miniacd"
 version = "0.1.3"
+source = "git+https://github.com/happyrust/miniacd-fork.git?branch=main#89bc858829e77529772ad82a46f011a8f4f9d7fa"
 dependencies = [
  "ahash 0.8.12",
  "glamx",

@@ -6,8 +6,8 @@ use clap::Parser;
 /// 将解析期生成的 JSONL spool 文件导入 Meilisearch。
 #[derive(Debug, Parser)]
 struct Args {
-    /// 配置文件路径（不带 .toml 后缀），例如 DbOption-ams
-    #[arg(long, short = 'c', default_value = "DbOption")]
+    /// 配置文件路径（不带 .toml 后缀），例如 db_options/DbOption-ams
+    #[arg(long, short = 'c', default_value = "db_options/DbOption")]
     config: String,
 
     /// 数据库号（dbnum / site），用于推导默认 spool 文件名 `{dbnum}.jsonl`

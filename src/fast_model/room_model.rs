@@ -33,37 +33,103 @@ use indicatif::{ProgressBar, ProgressStyle};
 #[cfg(feature = "duckdb-feature")]
 use crate::fast_model::export_model::get_or_init_duckdb_reader;
 
+/// Room calc environment config (replaces runtime unsafe env::set_var).
+///
+/// Initialized once at `build_room_relations` entry via `init_room_calc_config`,
+/// then read via `get_room_calc_config()`.
+#[derive(Debug, Clone)]
+struct RoomCalcEnvConfig {
+    cache_dir: PathBuf,
+    use_cache: bool,
+    force_cache: bool,
+}
+
+static ROOM_CALC_CONFIG: std::sync::OnceLock<RoomCalcEnvConfig> = std::sync::OnceLock::new();
+
+/// Resolve room calc config from env vars (read-only) and DbOption defaults.
+///
+/// Does NOT modify any global env vars - safe for multi-thread/async use.
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-async fn query_insts_for_room_calc(
-    refnos: &[RefnoEnum],
-    enable_holes: bool,
-) -> anyhow::Result<Vec<GeomInstQuery>> {
-    // 约定：房间计算的模型数据以 foyer cache 为准（默认启用 cache-only）。
-    // 如需回退到 SurrealDB(inst_relate 链路)，显式设置 AIOS_ROOM_USE_CACHE=0/false。
-    let use_cache = env::var("AIOS_ROOM_USE_CACHE")
+fn resolve_room_calc_env_config(db_option: &DbOption) -> RoomCalcEnvConfig {
+    let cache_dir = env::var("FOYER_CACHE_DIR")
         .ok()
-        .map(|v| v.trim() == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from("output")
+                .join(db_option.project_name.as_str())
+                .join("instance_cache")
+        });
+
+    let force_cache = env::var("AIOS_ROOM_FORCE_CACHE")
+        .ok()
+        .and_then(|v| parse_bool(v.trim()))
         .unwrap_or(true);
 
-    if !use_cache {
-        return aios_core::query_insts(refnos, enable_holes).await;
-    }
+    let use_cache = force_cache
+        || env::var("AIOS_ROOM_USE_CACHE")
+            .ok()
+            .and_then(|v| parse_bool(v.trim()))
+            .unwrap_or(true);
 
+    RoomCalcEnvConfig {
+        cache_dir,
+        use_cache,
+        force_cache,
+    }
+}
+
+/// Initialize global room calc config (only first call takes effect).
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn init_room_calc_config(db_option: &DbOption) {
+    let _ = ROOM_CALC_CONFIG.set(resolve_room_calc_env_config(db_option));
+}
+
+/// Get room calc config. If not initialized (e.g. called from test/tool directly),
+/// returns fallback defaults based on env vars only.
+fn get_room_calc_config() -> RoomCalcEnvConfig {
+    if let Some(cfg) = ROOM_CALC_CONFIG.get() {
+        return cfg.clone();
+    }
+    // Fallback: if init_room_calc_config not called, derive reasonable defaults from env
     let cache_dir = env::var("FOYER_CACHE_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("output/instance_cache"));
+    let force_cache = env::var("AIOS_ROOM_FORCE_CACHE")
+        .ok()
+        .and_then(|v| parse_bool(v.trim()))
+        .unwrap_or(false);
+    let use_cache = force_cache
+        || env::var("AIOS_ROOM_USE_CACHE")
+            .ok()
+            .and_then(|v| parse_bool(v.trim()))
+            .unwrap_or(true);
+    RoomCalcEnvConfig {
+        cache_dir,
+        use_cache,
+        force_cache,
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn query_insts_for_room_calc(
+    refnos: &[RefnoEnum],
+    enable_holes: bool,
+) -> anyhow::Result<Vec<GeomInstQuery>> {
+    let config = get_room_calc_config();
+
+    if !config.use_cache {
+        return aios_core::query_insts(refnos, enable_holes).await;
+    }
 
     crate::fast_model::export_model::model_exporter::query_geometry_instances_ext_from_cache(
         refnos,
-        &cache_dir,
+        &config.cache_dir,
         enable_holes,
         false,
-        env::var("AIOS_ROOM_QUERY_VERBOSE")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false),
+        parse_env_bool("AIOS_ROOM_QUERY_VERBOSE", false),
     )
     .await
 }
@@ -77,6 +143,12 @@ pub struct RoomBuildStats {
     pub build_time_ms: u64,
     pub cache_hit_rate: f32,
     pub memory_usage_mb: f32,
+    /// 计算失败的面板数（几何查询/加载/保存失败）
+    #[serde(default)]
+    pub failed_panels: usize,
+    /// 候选构件缓存缺失数量
+    #[serde(default)]
+    pub missing_candidates: usize,
 }
 
 fn parse_env_bool(name: &str, default_value: bool) -> bool {
@@ -90,29 +162,58 @@ fn parse_env_bool(name: &str, default_value: bool) -> bool {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-fn ensure_room_calc_cache_env(db_option: &DbOption) {
-    // 仅在未显式设置时注入默认值，避免覆盖调用侧的自定义 cache_dir。
-    if env::var("FOYER_CACHE_DIR").ok().filter(|s| !s.trim().is_empty()).is_none() {
-        let dir = PathBuf::from("output")
-            .join(db_option.project_name.as_str())
-            .join("instance_cache");
-        unsafe {
-            env::set_var("FOYER_CACHE_DIR", dir.to_string_lossy().to_string());
-        }
+fn append_room_calc_missing_refnos(
+    panel_refno: RefnoEnum,
+    phase: &str,
+    missing: &[RefnoEnum],
+) -> anyhow::Result<()> {
+    if missing.is_empty() {
+        return Ok(());
     }
 
-    if env::var("AIOS_ROOM_USE_CACHE").is_err() {
-        unsafe {
-            env::set_var("AIOS_ROOM_USE_CACHE", "1");
+    // 仅当用户显式开启时才写文件；避免默认产生大量日志文件。
+    // - AIOS_ROOM_MISSING_LOG=1/true：写到默认路径 output/room_calc_missing_refnos.jsonl
+    // - AIOS_ROOM_MISSING_LOG=/path/to/file.jsonl：写到指定路径
+    let Some(raw) = env::var("AIOS_ROOM_MISSING_LOG").ok().filter(|s| !s.trim().is_empty()) else {
+        return Ok(());
+    };
+
+    let path = {
+        let v = raw.trim();
+        if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes") {
+            PathBuf::from("output").join("room_calc_missing_refnos.jsonl")
+        } else {
+            PathBuf::from(v)
         }
+    };
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
+
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let row = serde_json::json!({
+        "ts": ts,
+        "panel": panel_refno.to_string(),
+        "phase": phase,
+        "missing_refnos": missing.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+    });
+
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    writeln!(f, "{}", row.to_string())?;
+    Ok(())
 }
+
+// ensure_room_calc_cache_env removed — replaced by init_room_calc_config / get_room_calc_config
+// (no unsafe env::set_var needed; config is resolved once and stored in OnceLock)
 
 #[cfg(all(
     not(target_arch = "wasm32"),
     feature = "sqlite-index",
     feature = "gen_model"
 ))]
+#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "pregen_panels_cache"))]
 async fn pregen_room_panels_into_foyer_cache(
     db_option: &DbOption,
     room_panel_map: &[(RefnoEnum, String, Vec<RefnoEnum>)],
@@ -409,86 +510,7 @@ pub async fn build_room_relations(
     db_nums: Option<&[u32]>,
     refno_root: Option<RefnoEnum>,
 ) -> anyhow::Result<RoomBuildStats> {
-    info!("开始构建房间关系 (改进版本)");
-
-    let mesh_dir = db_option.get_meshes_path();
-    let room_key_words = db_option.get_room_key_word();
-    let compute_options = RoomComputeOptions::default();
-
-    CACHE_METRICS.reset();
-
-    // 房间计算默认走 foyer cache；若调用侧未设置 FOYER_CACHE_DIR，这里按 project_name 兜底。
-    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-    ensure_room_calc_cache_env(db_option);
-
-    // 1. 构建房间面板映射关系
-    let mut room_panel_map = build_room_panels_relate(&room_key_words).await?;
-    info!("查询到 {} 个房间面板映射关系", room_panel_map.len());
-
-    // 2. 应用 dbnum 过滤
-    if let Some(db_nums) = db_nums {
-        let db_num_set: HashSet<u32> = db_nums.iter().copied().collect();
-        room_panel_map.retain(|(refno, _, _)| {
-            let ref0 = match refno {
-                RefnoEnum::Refno(r) => r.get_0(),
-                RefnoEnum::SesRef(r) => r.refno.get_0(),
-            };
-            db_num_set.contains(&ref0)
-        });
-        info!("dbnum 过滤后剩余 {} 个房间", room_panel_map.len());
-    }
-
-    // 3. 应用 refno 子树过滤
-    if let Some(root) = refno_root {
-        use crate::fast_model::query_compat::query_visible_geo_descendants;
-        let visible_refnos: HashSet<RefnoEnum> =
-            query_visible_geo_descendants(root, true, None)
-                .await?
-                .into_iter()
-                .collect();
-
-        room_panel_map.retain(|(room_refno, _, panel_refnos)| {
-            // 房间本身在子树内，或者有面板在子树内
-            visible_refnos.contains(room_refno)
-                || panel_refnos.iter().any(|p| visible_refnos.contains(p))
-        });
-        info!("refno 子树过滤后剩余 {} 个房间", room_panel_map.len());
-    }
-
-    let exclude_panel_refnos = room_panel_map
-        .iter()
-        .map(|(_, _, panel_refnos)| panel_refnos.clone())
-        .flatten()
-        .collect::<HashSet<_>>();
-
-    info!("找到 {} 个房间面板映射关系", room_panel_map.len());
-
-    // 4. panel 模型缺失时：复用 foyer cache 定向生成流程补齐（仅写 cache，不写 inst_* 表）。
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        feature = "sqlite-index",
-        feature = "gen_model"
-    ))]
-    pregen_room_panels_into_foyer_cache(db_option, &room_panel_map).await?;
-
-    let stats = compute_room_relations(
-        &mesh_dir,
-        room_panel_map,
-        exclude_panel_refnos,
-        compute_options,
-    )
-    .await?;
-
-    info!(
-        "房间关系构建完成: 处理 {} 个房间, {} 个面板, {} 个构件, 耗时 {:?}, 缓存命中率 {:.2}%",
-        stats.total_rooms,
-        stats.total_panels,
-        stats.total_components,
-        Duration::from_millis(stats.build_time_ms),
-        stats.cache_hit_rate * 100.0
-    );
-
-    Ok(stats)
+    build_room_relations_with_cancel(db_option, db_nums, refno_root, None, None).await
 }
 
 /// 支持取消和进度回调的房间关系构建
@@ -513,7 +535,7 @@ pub async fn build_room_relations_with_cancel(
     CACHE_METRICS.reset();
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-    ensure_room_calc_cache_env(db_option);
+    init_room_calc_config(db_option);
 
     // 1. 构建房间面板映射关系
     if let Some(ref cb) = progress_callback {
@@ -524,13 +546,21 @@ pub async fn build_room_relations_with_cancel(
 
     // 2. 应用 dbnum 过滤
     if let Some(db_nums) = db_nums {
+        use crate::data_interface::db_meta;
+        let _ = db_meta().ensure_loaded();
         let db_num_set: HashSet<u32> = db_nums.iter().copied().collect();
         room_panel_map.retain(|(refno, _, _)| {
-            let ref0 = match refno {
-                RefnoEnum::Refno(r) => r.get_0(),
-                RefnoEnum::SesRef(r) => r.refno.get_0(),
-            };
-            db_num_set.contains(&ref0)
+            // ref0 != dbnum，必须通过 db_meta 映射
+            match db_meta().get_dbnum_by_refno(*refno) {
+                Some(dbnum) => db_num_set.contains(&dbnum),
+                None => {
+                    log::warn!(
+                        "[room_model] 缺少 ref0->dbnum 映射，跳过房间过滤: refno={}",
+                        refno
+                    );
+                    false
+                }
+            }
         });
         info!("dbnum 过滤后剩余 {} 个房间", room_panel_map.len());
     }
@@ -614,6 +644,7 @@ async fn compute_room_relations(
 }
 
 #[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "compute_room_relations"))]
 async fn compute_room_relations_with_cancel(
     mesh_dir: &PathBuf,
     room_panel_map: Vec<(RefnoEnum, String, Vec<RefnoEnum>)>,
@@ -707,6 +738,8 @@ async fn compute_room_relations_with_cancel(
         build_time_ms: build_time.as_millis() as u64,
         cache_hit_rate: CACHE_METRICS.hit_rate(),
         memory_usage_mb: estimate_memory_usage().await,
+        failed_panels: 0,
+        missing_candidates: 0,
     })
 }
 
@@ -804,6 +837,7 @@ where
     build_room_panels_relate_common_with_persist(room_key_word, match_room_fn, true).await
 }
 
+#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "build_room_panels_relate"))]
 async fn build_room_panels_relate_common_with_persist<F>(
     room_key_word: &Vec<String>,
     match_room_fn: F,
@@ -904,6 +938,7 @@ async fn create_room_panel_relations_batch(
 }
 
 #[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "process_panel_for_room"))]
 async fn process_panel_for_room(
     mesh_dir: &PathBuf,
     panel_refno: RefnoEnum,
@@ -1079,6 +1114,7 @@ pub(crate) async fn is_refno_in_panel_by_aabb_vote(
 /// 现在统一使用 `is_refno_in_panel_by_aabb_vote` 进行粗算判定。
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "cal_room_refnos_with_options"))]
 async fn cal_room_refnos_with_options(
     mesh_dir: &PathBuf,
     panel_refno: RefnoEnum,
@@ -1106,29 +1142,26 @@ async fn cal_room_refnos_with_options(
         query_insts_for_room_calc(&[panel_refno], true).await.unwrap_or_default();
 
     // cache 缺失面板模型数据：在房间计算流程内按需补齐（复用 foyer cache 定向生成流程）。
+    // 注意：内层自动补齐逻辑已移除——面板 cache 应在外层 pregen_room_panels_into_foyer_cache 统一预生成。
     #[cfg(all(
         not(target_arch = "wasm32"),
         feature = "sqlite-index",
         feature = "gen_model"
     ))]
-    {
-        let use_cache = parse_env_bool("AIOS_ROOM_USE_CACHE", true);
-        let autogen = parse_env_bool("AIOS_ROOM_AUTOGEN_PANEL", true);
-        if use_cache && autogen && panel_geom_insts.is_empty() {
-            let db_opt = aios_core::get_db_option();
-            ensure_room_calc_cache_env(&db_opt);
-            let tmp = vec![(RefnoEnum::default(), String::new(), vec![panel_refno])];
-            if let Err(e) = pregen_room_panels_into_foyer_cache(&db_opt, &tmp).await {
-                warn!("房间计算自动补齐 panel 模型失败: panel={}, err={}", panel_refno, e);
-            } else {
-                panel_geom_insts =
-                    query_insts_for_room_calc(&[panel_refno], true).await.unwrap_or_default();
-            }
+    if panel_geom_insts.is_empty() && parse_env_bool("AIOS_ROOM_AUTOGEN_PANEL", true) {
+        let db_opt = aios_core::get_db_option();
+        let tmp = vec![(RefnoEnum::default(), String::new(), vec![panel_refno])];
+        if let Err(e) = pregen_room_panels_into_foyer_cache(&db_opt, &tmp).await {
+            warn!("房间计算自动补齐 panel 模型失败: panel={}, err={}", panel_refno, e);
+        } else {
+            panel_geom_insts =
+                query_insts_for_room_calc(&[panel_refno], true).await.unwrap_or_default();
         }
     }
 
     if panel_geom_insts.is_empty() {
         debug!("面板 {} 没有几何实例", panel_refno);
+        let _ = append_room_calc_missing_refnos(panel_refno, "panel_geom_insts_empty", &[panel_refno]);
         return Ok(Default::default());
     }
 
@@ -1326,6 +1359,21 @@ async fn cal_room_refnos_with_options(
         .into_iter()
         .map(|g| (g.refno, g))
         .collect();
+
+    // 方案 2：cache 缺失则跳过，并记录缺失 refno 清单（不回退到 SurrealDB 模型数据）。
+    let missing_candidates: Vec<RefnoEnum> = candidates
+        .iter()
+        .copied()
+        .filter(|r| !candidate_geom_map.contains_key(r))
+        .collect();
+    if !missing_candidates.is_empty() {
+        warn!(
+            "房间计算候选构件缓存缺失: panel={}, missing_count={}",
+            panel_refno,
+            missing_candidates.len()
+        );
+        let _ = append_room_calc_missing_refnos(panel_refno, "candidate_geom_cache_missing", &missing_candidates);
+    }
 
     let mut within_refnos = HashSet::<RefnoEnum>::new();
     for candidate_refno in &candidates {
@@ -1694,7 +1742,7 @@ fn is_point_inside_any_mesh(
         }
 
         // 回退到距离检测：如果点非常接近表面，也认为在内部
-        let projection = mesh.project_point(&Isometry::identity(), point, true);
+        let projection = mesh.project_local_point(point, true);
         let distance_sq = (projection.point - point).norm_squared();
         if distance_sq <= tolerance_sq {
             return true;
@@ -1798,41 +1846,56 @@ fn is_point_in_trimesh_xy(point: &Point<Real>, tri_mesh: &TriMesh, tolerance: Re
     false
 }
 
-/// 使用射线投射法判断点是否在封闭网格内部
-/// 向多个方向发射射线，如果在相对的两个方向上都有交点，则认为点在内部
+/// 判断点是否在封闭网格内部
+///
+/// 使用 Möller–Trumbore 射线-三角形相交 + 奇偶计数法（ray-crossing parity），
+/// 对凸形和凹形网格均正确。射线方向采用微偏轴以减少恰好穿过边/顶点的退化情况。
 fn is_point_inside_mesh_raycast(point: &Point<Real>, tri_mesh: &TriMesh) -> bool {
-    let identity = Isometry::identity();
+    // 微偏轴方向：避免恰好与面对齐导致退化
+    let direction = Vector::new(1.0, 0.31415926, 0.27182818);
 
-    // 向 +Z 和 -Z 方向发射射线
-    let ray_pos_z = Ray::new(*point, Vector::new(0.0, 0.0, 1.0));
-    let ray_neg_z = Ray::new(*point, Vector::new(0.0, 0.0, -1.0));
+    let vertices = tri_mesh.vertices();
+    let indices = tri_mesh.indices();
+    let mut crossings = 0u32;
 
-    let hit_pos_z = tri_mesh.cast_ray(&identity, &ray_pos_z, Real::MAX, true);
-    let hit_neg_z = tri_mesh.cast_ray(&identity, &ray_neg_z, Real::MAX, true);
+    for tri in indices {
+        let ia = tri[0] as usize;
+        let ib = tri[1] as usize;
+        let ic = tri[2] as usize;
+        if ia >= vertices.len() || ib >= vertices.len() || ic >= vertices.len() {
+            continue;
+        }
 
-    // 如果 Z 方向两边都有交点，点在网格内部
-    if hit_pos_z.is_some() && hit_neg_z.is_some() {
-        return true;
+        let a = &vertices[ia];
+        let edge1 = vertices[ib] - a;
+        let edge2 = vertices[ic] - a;
+
+        let h = direction.cross(&edge2);
+        let det = edge1.dot(&h);
+        if det.abs() < 1e-10 {
+            continue; // 射线与三角面平行
+        }
+
+        let inv_det = 1.0 / det;
+        let s = point - a;
+        let u = inv_det * s.dot(&h);
+        if u < 0.0 || u > 1.0 {
+            continue;
+        }
+
+        let q = s.cross(&edge1);
+        let v = inv_det * direction.dot(&q);
+        if v < 0.0 || u + v > 1.0 {
+            continue;
+        }
+
+        let t = inv_det * edge2.dot(&q);
+        if t > 1e-10 {
+            crossings += 1;
+        }
     }
 
-    // 备用检测：向 +X/-X 或 +Y/-Y 方向检测
-    let ray_pos_x = Ray::new(*point, Vector::new(1.0, 0.0, 0.0));
-    let ray_neg_x = Ray::new(*point, Vector::new(-1.0, 0.0, 0.0));
-
-    let hit_pos_x = tri_mesh.cast_ray(&identity, &ray_pos_x, Real::MAX, true);
-    let hit_neg_x = tri_mesh.cast_ray(&identity, &ray_neg_x, Real::MAX, true);
-
-    if hit_pos_x.is_some() && hit_neg_x.is_some() {
-        return true;
-    }
-
-    let ray_pos_y = Ray::new(*point, Vector::new(0.0, 1.0, 0.0));
-    let ray_neg_y = Ray::new(*point, Vector::new(0.0, -1.0, 0.0));
-
-    let hit_pos_y = tri_mesh.cast_ray(&identity, &ray_pos_y, Real::MAX, true);
-    let hit_neg_y = tri_mesh.cast_ray(&identity, &ray_neg_y, Real::MAX, true);
-
-    hit_pos_y.is_some() && hit_neg_y.is_some()
+    crossings % 2 == 1
 }
 
 /// 改进版本的房间关系保存
@@ -1872,28 +1935,6 @@ async fn save_room_relate(
     Ok(())
 }
 
-/// 收集所有需要的几何哈希
-async fn collect_geometry_hashes(
-    room_panel_map: &[(RefnoEnum, String, Vec<RefnoEnum>)],
-) -> anyhow::Result<Vec<String>> {
-    let mut geo_hashes = HashSet::new();
-
-    for (_, _, panel_refnos) in room_panel_map {
-        for panel_refno in panel_refnos {
-            let geom_insts: Vec<GeomInstQuery> = aios_core::query_insts(&[*panel_refno], true)
-                .await
-                .unwrap_or_default();
-
-            for geom_inst in geom_insts {
-                for inst in geom_inst.insts {
-                    geo_hashes.insert(inst.geo_hash);
-                }
-            }
-        }
-    }
-
-    Ok(geo_hashes.into_iter().collect())
-}
 
 /// 估算内存使用量
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
@@ -2387,6 +2428,8 @@ mod tests {
             build_time_ms: 5000,
             cache_hit_rate: 0.85,
             memory_usage_mb: 128.5,
+            failed_panels: 0,
+            missing_candidates: 0,
         };
         
         // 测试序列化
@@ -2726,7 +2769,8 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
     let room_key_words = db_option.get_room_key_word();
     let compute_options = RoomComputeOptions::default();
 
-    ensure_room_calc_cache_env(db_option);
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    init_room_calc_config(db_option);
 
     // 1. 查询房间面板关系
     if let Some(ref cb) = progress_callback {
@@ -2747,6 +2791,8 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
             build_time_ms: 0,
             cache_hit_rate: 0.0,
             memory_usage_mb: 0.0,
+            failed_panels: 0,
+            missing_candidates: 0,
         });
     }
 
@@ -2817,7 +2863,8 @@ pub async fn update_room_relations_incremental_original(
     // 3. 重新计算并保存新关系
     let db_option = aios_core::get_db_option();
     let mesh_dir = db_option.get_meshes_path();
-    ensure_room_calc_cache_env(&db_option);
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    init_room_calc_config(&db_option);
 
     // 获取所有房间面板（用于排除）
     let room_key_words = db_option.get_room_key_word();
@@ -3018,7 +3065,8 @@ pub async fn rebuild_room_relations_for_rooms(
     let room_key_words = db_option.get_room_key_word();
     let compute_options = RoomComputeOptions::default();
 
-    ensure_room_calc_cache_env(db_option);
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    init_room_calc_config(db_option);
 
     // 1. 查询房间面板关系
     let mut room_panel_map = build_room_panels_relate(&room_key_words).await?;
@@ -3039,6 +3087,8 @@ pub async fn rebuild_room_relations_for_rooms(
             build_time_ms: 0,
             cache_hit_rate: 0.0,
             memory_usage_mb: 0.0,
+            failed_panels: 0,
+            missing_candidates: 0,
         });
     }
 

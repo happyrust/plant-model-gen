@@ -444,6 +444,8 @@ mod tests {
                 build_time_ms: 0,
                 cache_hit_rate: 0.0,
                 memory_usage_mb: 0.0,
+                failed_panels: 0,
+                missing_candidates: 0,
             }
         }.is_terminal());
         assert!(RoomWorkerTaskStatus::Failed {

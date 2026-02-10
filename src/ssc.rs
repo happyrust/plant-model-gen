@@ -1738,7 +1738,7 @@ async fn test_save_ssc_level_excel() -> anyhow::Result<()> {
     let url = env::var("DATABASE_URL")?;
     use config::{Config, ConfigError, Environment, File};
     let s = Config::builder()
-        .add_source(File::with_name("DbOption"))
+        .add_source(File::with_name("db_options/DbOption"))
         .build()?;
     let db_option: DbOption = s.try_deserialize().unwrap();
     // let pool = AiosDBManager::get_db_pool(&url, "AvevaMarineSample").await?;
@@ -1760,7 +1760,7 @@ fn test_parse_room_info_from_excel() -> anyhow::Result<()> {
 async fn test_get_room_info_from_excel_refactor() {
     use config::{Config, ConfigError, Environment, File};
     let s = Config::builder()
-        .add_source(File::with_name("DbOption"))
+        .add_source(File::with_name("db_options/DbOption"))
         .build()
         .unwrap();
     let db_option: DbOption = s.try_deserialize().unwrap();
@@ -1774,7 +1774,7 @@ async fn test_get_room_info_from_excel_refactor() {
 async fn test_insert_ssc_room_node_refactor() {
     use config::{Config, ConfigError, Environment, File};
     let s = Config::builder()
-        .add_source(File::with_name("DbOption"))
+        .add_source(File::with_name("db_options/DbOption"))
         .build()
         .unwrap();
     let db_option: DbOption = s.try_deserialize().unwrap();

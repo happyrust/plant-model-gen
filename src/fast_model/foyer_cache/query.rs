@@ -19,6 +19,7 @@ use crate::fast_model::foyer_cache::FoyerCacheContext;
 /// 缓存路径：从 foyer/instance_cache 读取几何实例数据，构造与 SurrealDB `query_insts` 等价的 `GeomInstQuery`。
 ///
 /// 约定：该函数**不回退** SurrealDB；若缓存缺失则直接返回错误。
+#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "cache_query_geometry_instances"))]
 pub async fn query_geometry_instances_ext_from_cache(
     refnos: &[RefnoEnum],
     cache_dir: &Path,
@@ -26,11 +27,6 @@ pub async fn query_geometry_instances_ext_from_cache(
     include_negative: bool,
     verbose: bool,
 ) -> Result<Vec<GeomInstQuery>> {
-    let _span = crate::profile_span!(
-        "cache_query_geometry_instances",
-        refno_cnt = refnos.len(),
-        enable_holes = enable_holes
-    );
     use crate::data_interface::db_meta_manager::db_meta;
     use crate::fast_model::instance_cache::InstanceCacheManager;
     use aios_core::geometry::GeoBasicType;

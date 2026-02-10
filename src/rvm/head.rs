@@ -50,7 +50,7 @@ fn create_project_info_data(project_name: &str, mdb: &str) -> Vec<u8> {
 fn test_create_head_data() -> anyhow::Result<()>{
     use config::{Config, ConfigError, Environment, File};
     let s = Config::builder()
-        .add_source(File::with_name("DbOption"))
+        .add_source(File::with_name("db_options/DbOption"))
         .build()?;
     let db_option: DbOption = s.try_deserialize().unwrap();
 

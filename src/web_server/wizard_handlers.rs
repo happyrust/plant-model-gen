@@ -213,7 +213,7 @@ fn get_relative_path_display(path: &Path) -> String {
 
 /// 从配置文件读取项目代码
 fn read_project_code_from_config(project_path: &Path) -> Option<u32> {
-    let config_path = project_path.join("DbOption.toml");
+    let config_path = project_path.join("db_options/DbOption.toml");
     if let Ok(content) = fs::read_to_string(config_path) {
         // 简单解析 project_code
         for line in content.lines() {
@@ -424,8 +424,10 @@ pub async fn create_wizard_task(
 fn open_sqlite_projects_table() -> Option<(rusqlite::Connection, String)> {
     use config as cfg;
     let mut builder = cfg::Config::builder();
-    if std::path::Path::new("DbOption.toml").exists() {
-        builder = builder.add_source(cfg::File::with_name("DbOption"));
+    let cfg_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_file = format!("{}.toml", cfg_name);
+    if std::path::Path::new(&cfg_file).exists() {
+        builder = builder.add_source(cfg::File::with_name(&cfg_name));
     }
     let built = builder.build().ok()?;
     let db_path: String = built.get_string("project_config_sqlite_path").ok()?;
@@ -694,9 +696,11 @@ fn open_deployment_sites_sqlite() -> Result<rusqlite::Connection, Box<dyn std::e
     use config as cfg;
 
     // 尝试从配置文件读取SQLite路径，否则使用默认路径
-    let db_path = if std::path::Path::new("DbOption.toml").exists() {
+    let cfg_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_file = format!("{}.toml", cfg_name);
+    let db_path = if std::path::Path::new(&cfg_file).exists() {
         let builder = cfg::Config::builder()
-            .add_source(cfg::File::with_name("DbOption"))
+            .add_source(cfg::File::with_name(&cfg_name))
             .build()?;
         builder
             .get_string("deployment_sites_sqlite_path")

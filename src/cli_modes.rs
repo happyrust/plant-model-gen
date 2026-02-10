@@ -1919,7 +1919,7 @@ pub async fn export_dbnum_instances_parquet_mode(
     let output_dir = output_override.unwrap_or_else(|| {
         db_option_ext
             .get_project_output_dir()
-            .join("instances_parquet")
+            .join("parquet")
     });
 
     // 连接数据库
@@ -2148,6 +2148,12 @@ pub async fn room_compute_mode(
 ) -> Result<()> {
     use aios_database::fast_model::{RoomBuildStats, build_room_relations};
     use std::time::Instant;
+
+    // 性能剖析：feature=profile 时启用 Chrome Trace
+    #[cfg(feature = "profile")]
+    let _trace_path = aios_database::profiling::init_chrome_tracing_for_db_option(db_option_ext, "room_compute");
+    #[cfg(feature = "profile")]
+    let _root_span = tracing::info_span!("room_compute_mode").entered();
 
     println!("\n🏠 房间计算模式");
     println!("==========================================");

@@ -110,9 +110,11 @@ pub async fn remote_sync_page() -> Html<String> {
 pub fn open_sqlite() -> Result<rusqlite::Connection, Box<dyn std::error::Error>> {
     use config as cfg;
 
-    let db_path = if std::path::Path::new("DbOption.toml").exists() {
+    let cfg_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_file = format!("{}.toml", cfg_name);
+    let db_path = if std::path::Path::new(&cfg_file).exists() {
         let builder = cfg::Config::builder()
-            .add_source(cfg::File::with_name("DbOption"))
+            .add_source(cfg::File::with_name(&cfg_name))
             .build()?;
         builder
             .get_string("deployment_sites_sqlite_path")
@@ -516,11 +518,13 @@ pub async fn apply_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>
     let location: Option<String> = row.get(4).ok();
     let location_dbs: Option<String> = row.get(5).ok();
 
-    let path = std::path::Path::new("DbOption.toml");
+    let cfg_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_file = format!("{}.toml", cfg_name);
+    let path = std::path::Path::new(&cfg_file);
     if !path.exists() {
         return Ok(Json(json!({
             "status":"warning",
-            "message":"DbOption.toml 不存在，已跳过写入。请手动创建或在工程配置页生成。",
+            "message":format!("{} 不存在，已跳过写入。请手动创建或在工程配置页生成。", cfg_file),
         })));
     }
 
@@ -604,7 +608,7 @@ pub async fn apply_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>
 
     Ok(Json(json!({
         "status":"success",
-        "message":"已写入 DbOption.toml。部分运行期组件需重启或重新加载配置后生效。",
+        "message":"已写入配置文件。部分运行期组件需重启或重新加载配置后生效。",
         "hint":"如需启用 watcher/MQTT，请在配置中打开 sync_live 或重启 CLI 任务。"
     })))
 }
@@ -620,7 +624,7 @@ pub async fn activate_env(Path(id): Path<String>) -> Result<Json<serde_json::Val
     match crate::web_server::remote_runtime::start_runtime(id.clone()).await {
         Ok(_) => Ok(Json(json!({
             "status":"success",
-            "message":"已写入 DbOption.toml 并启动 watcher + MQTT 订阅。",
+            "message":"已写入配置文件并启动 watcher + MQTT 订阅。",
             "env_id": id,
         }))),
         Err(e) => Ok(Json(json!({
@@ -803,7 +807,7 @@ pub async fn runtime_config() -> Result<Json<serde_json::Value>, StatusCode> {
     })))
 }
 
-/// 从 DbOption.toml 导入/生成一个环境
+/// 从配置文件导入/生成一个环境
 pub async fn import_env_from_dboption() -> Result<Json<serde_json::Value>, StatusCode> {
     let opt = aios_core::get_db_option();
     let conn = open_sqlite().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

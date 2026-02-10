@@ -83,15 +83,24 @@ impl ParquetStreamWriter {
     /// 
     /// 直接写入增量文件，返回：(instance_count, geo_count, transform_count)
     pub fn write_batch(&self, data: &ShapeInstancesData) -> Result<(usize, usize, usize)> {
-        // 从 inst_geos_map 中任意一个值提取 dbnum（EleInstGeosData.refno）
-        let dbnum = if let Some(geos_data) = data.inst_geos_map.values().next() {
-            geos_data.refno.refno().get_0()
+        // 从 batch 中任意一个 refno 通过 db_meta 映射得到 dbnum（ref0 != dbnum）
+        use crate::data_interface::db_meta;
+        let _ = db_meta().ensure_loaded();
+
+        let sample_refno = if let Some(geos_data) = data.inst_geos_map.values().next() {
+            geos_data.refno
         } else if let Some((refno, _)) = data.inst_info_map.iter().next() {
-            refno.refno().get_0()
+            *refno
         } else {
             // 没有数据，跳过
             return Ok((0, 0, 0));
         };
+
+        let dbnum = db_meta().get_dbnum_by_refno(sample_refno)
+            .ok_or_else(|| anyhow::anyhow!(
+                "[ParquetStreamWriter] 缺少 ref0->dbnum 映射: refno={}",
+                sample_refno
+            ))?;
         
         // 记录已处理的 dbnum
         {

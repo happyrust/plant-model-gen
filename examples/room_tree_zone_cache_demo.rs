@@ -23,7 +23,7 @@ const DEFAULT_ZONE_REFNO: &str = "24381/146882";
 #[tokio::main]
 async fn main() -> Result<()> {
     // 1) 配置加载
-    let dbopt_path = env::var("DBOPTION_PATH").unwrap_or_else(|_| "DbOption".to_string());
+    let dbopt_path = env::var("DBOPTION_PATH").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let mut db_option_ext = aios_database::options::get_db_option_ext_from_path(&dbopt_path)
         .with_context(|| format!("加载 DbOption 失败: {}", dbopt_path))?;
 

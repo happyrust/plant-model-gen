@@ -25,6 +25,10 @@ pub struct SqliteSpatialIndex {
 }
 
 impl SqliteSpatialIndex {
+    pub fn inner(&self) -> &SqliteAabbIndex {
+        &self.inner
+    }
+
     pub fn is_enabled() -> bool {
         true
     }

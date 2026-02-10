@@ -179,7 +179,7 @@ pub async fn start_web_server_with_config(
     println!("🔄 正在初始化数据库连接...");
     println!("📂 当前工作目录: {:?}", std::env::current_dir()?);
 
-    let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "DbOption".to_string());
+    let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     println!("📄 尝试读取 {}.toml 配置文件...", config_name);
 
     // 预先初始化 OnceCell，确保配置已加载

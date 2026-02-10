@@ -130,7 +130,7 @@ gltf = "1.4"
 rstar = { version = "0.12", optional = true }
 
 # 凸分解（可选，默认不启用）
-miniacd = { path = "../miniacd", optional = true }
+miniacd = { git = "https://github.com/happyrust/miniacd-fork.git", branch = "main", optional = true }
 
 #造型功能，先在database测试
 serde_with = { version = "3.14.1", features = ["macros"] }

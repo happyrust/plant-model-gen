@@ -10,7 +10,7 @@ async fn test_export_dbnum_instances_json_1112() {
 
     let dbnum = 1112;
     let output_dir = PathBuf::from("output/test/instances");
-    let db_option_ext = crate::options::get_db_option_ext_from_path("DbOption").unwrap();
+    let db_option_ext = crate::options::get_db_option_ext_from_path("db_options/DbOption").unwrap();
     let db_option = Arc::new(db_option_ext.inner.clone());
 
     // 调用导出函数
@@ -88,7 +88,7 @@ async fn test_export_dbnum_instances_json_aabb_format() {
 
     let dbnum = 1112;
     let output_dir = PathBuf::from("output/test/instances_aabb");
-    let db_option_ext = crate::options::get_db_option_ext_from_path("DbOption").unwrap();
+    let db_option_ext = crate::options::get_db_option_ext_from_path("db_options/DbOption").unwrap();
     let db_option = Arc::new(db_option_ext.inner.clone());
 
     let _stats: crate::fast_model::export_model::model_exporter::ExportStats =

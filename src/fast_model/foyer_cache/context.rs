@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::fast_model::instance_cache::InstanceCacheManager;
+use crate::fast_model::foyer_cache::geom_input_cache::GeomInputCacheManager;
 use crate::options::DbOptionExt;
 
 /// foyer cache-only 运行时上下文
@@ -19,6 +20,7 @@ use crate::options::DbOptionExt;
 pub struct FoyerCacheContext {
     cache_dir: PathBuf,
     cache: Arc<InstanceCacheManager>,
+    geom_input_cache: Option<Arc<GeomInputCacheManager>>,
 }
 
 impl FoyerCacheContext {
@@ -38,7 +40,20 @@ impl FoyerCacheContext {
 
         let cache_dir = db_option.get_foyer_cache_dir();
         let cache = Arc::new(InstanceCacheManager::new(&cache_dir).await?);
-        Ok(Self { cache_dir, cache })
+
+        // 初始化 geom_input_cache（LOOP/PRIM 输入缓存）
+        let geom_input_cache = match GeomInputCacheManager::new(&cache_dir.join("geom_input_cache")).await {
+            Ok(mgr) => Some(Arc::new(mgr)),
+            Err(e) => {
+                eprintln!(
+                    "[foyer_cache] ⚠️  初始化 geom_input_cache 失败（将退化为直接查询）: {}",
+                    e
+                );
+                None
+            }
+        };
+
+        Ok(Self { cache_dir, cache, geom_input_cache })
     }
 
     /// 尝试从 `DbOptionExt` 构造 cache-only 上下文。
@@ -56,7 +71,11 @@ impl FoyerCacheContext {
     pub async fn from_cache_dir(cache_dir: impl AsRef<Path>) -> anyhow::Result<Self> {
         let cache_dir = cache_dir.as_ref().to_path_buf();
         let cache = Arc::new(InstanceCacheManager::new(&cache_dir).await?);
-        Ok(Self { cache_dir, cache })
+        let geom_input_cache = GeomInputCacheManager::new(&cache_dir.join("geom_input_cache"))
+            .await
+            .ok()
+            .map(Arc::new);
+        Ok(Self { cache_dir, cache, geom_input_cache })
     }
 
     /// foyer cache 根目录
@@ -72,6 +91,16 @@ impl FoyerCacheContext {
     /// 获取 cache 管理器（Arc clone）
     pub fn cache_arc(&self) -> Arc<InstanceCacheManager> {
         self.cache.clone()
+    }
+
+    /// 获取 geom_input_cache 管理器（引用）
+    pub fn geom_input_cache(&self) -> Option<&GeomInputCacheManager> {
+        self.geom_input_cache.as_deref()
+    }
+
+    /// 获取 geom_input_cache 管理器（Arc clone）
+    pub fn geom_input_cache_arc(&self) -> Option<Arc<GeomInputCacheManager>> {
+        self.geom_input_cache.clone()
     }
 }
 

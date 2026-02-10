@@ -1,5 +1,6 @@
 use super::context::NounProcessContext;
 use crate::fast_model::loop_model;
+use crate::fast_model::foyer_cache::geom_input_cache;
 use aios_core::RefnoEnum;
 use aios_core::geometry::ShapeInstancesData;
 use anyhow::{Result, bail};
@@ -31,6 +32,28 @@ pub async fn process_loop_refno_page(
     refnos: &[RefnoEnum],
 ) -> Result<()> {
     if refnos.is_empty() {
+        return Ok(());
+    }
+
+    // cache-only 路由：当 AIOS_GEN_INPUT_CACHE_ONLY=1 时，从缓存读取预取数据
+    if geom_input_cache::is_geom_input_cache_only() {
+        let loop_inputs = geom_input_cache::load_all_loop_inputs_from_global().await;
+        // 仅保留当前 refnos 中的条目
+        let want: std::collections::HashSet<RefnoEnum> = refnos.iter().copied().collect();
+        let filtered: std::collections::HashMap<RefnoEnum, geom_input_cache::LoopInput> = loop_inputs
+            .into_iter()
+            .filter(|(k, _)| want.contains(k))
+            .collect();
+        if filtered.is_empty() {
+            println!(
+                "[loop_processor] cache-only: 缓存中未找到 {} 个 LOOP refno 的输入数据，跳过",
+                refnos.len()
+            );
+            return Ok(());
+        }
+        if !loop_model::gen_loop_geos_from_cache(&filtered, loop_sjus_map_arc, sender).await? {
+            bail!("loop geos generation from cache failed");
+        }
         return Ok(());
     }
 

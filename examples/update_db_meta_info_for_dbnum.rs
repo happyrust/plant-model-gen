@@ -35,7 +35,7 @@ fn parse_ref0_from_refno_str(s: &str) -> Option<u32> {
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
 
-    let mut config = "DbOption".to_string();
+    let mut config = "db_options/DbOption".to_string();
     let mut target_dbnum: Option<u32> = None;
     let mut target_refno: Option<String> = None;
 

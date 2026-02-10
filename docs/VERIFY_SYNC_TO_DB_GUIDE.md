@@ -9,7 +9,10 @@
 根据 plant-surrealdb skill，pe key 格式为：
 - **格式**: `pe:⟨ref0_ref1⟩`（使用反引号包裹）
 - **示例**: `pe:`24381_145018``
-- **注意**: ref0 不是 dbnum，需要通过 `DbMetaManager` 映射获取 dbnum
+- **注意**: ref0 不是 dbnum，需要通过映射获取真实 dbnum
+  - 映射文件：`output/<project>/scene_tree/db_meta_info.json` 的 `ref0_to_dbnum`
+  - 示例：`ref0=24381 -> dbnum=7997`
+  - 约束：任何涉及 `dbnum` 的参数/目录/索引文件（如 `{dbnum}.tree`、`--dbnum`）不得使用 ref0；映射缺失应先补齐元数据，而非回退 ref0。
 
 ### 2. 查询语法最佳实践
 
@@ -145,6 +148,15 @@ async fn main() -> anyhow::Result<()> {
    ```
 
 ### 6. 常见问题排查
+
+#### 问题：ref0 无法映射到 dbnum（或找不到 `{dbnum}.tree`）
+**现象**：
+- 日志出现 `TreeIndex 缺失: ...\\scene_tree\\<某数字>.tree`，且该数字实际上是 ref0；
+- 或运行时提示缺少 `ref0_to_dbnum` 映射。
+
+**处理**：
+- 先确认 `output/<project>/scene_tree/db_meta_info.json` 存在且包含 `ref0_to_dbnum`。
+- 若缺失：可运行示例程序补齐（按仓库实际提供的 example 为准）：`cargo run --example update_db_meta_info_for_dbnum -- --help`
 
 #### 问题：查询返回 0 但日志显示已写入
 **可能原因**：

@@ -8,6 +8,9 @@
    - 格式：`pe:`ref0_ref1``（使用反引号）
    - 示例：`pe:`24381_145018``
    - 注意：ref0 不是 dbnum
+   - ref0→dbnum 映射来源：`output/<project>/scene_tree/db_meta_info.json` 的 `ref0_to_dbnum`
+     - 示例：`ref0=24381 -> dbnum=7997`
+   - 约束：涉及 `dbnum` 的任何过滤/文件路径（如 `{dbnum}.tree`）**不得**直接使用 ref0，映射缺失应先补齐元数据，而非回退 ref0。
 
 2. **查询语法**
    - 计数：`SELECT VALUE count() FROM table WHERE ...`

@@ -173,8 +173,8 @@ impl InstanceCacheManager {
         batch_id
     }
 
+    #[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "cache_get_batch"))]
     pub async fn get(&self, dbnum: u32, batch_id: &str) -> Option<CachedInstanceBatch> {
-        let _span = crate::profile_span!("cache_get_batch", dbnum = dbnum);
         let key = InstanceCacheKey {
             dbnum,
             batch_id: batch_id.to_string(),
@@ -198,6 +198,8 @@ impl InstanceCacheManager {
                             "[cache] 反序列化失败: dbnum={}, batch_id={}, err={}",
                             dbnum, batch_id, e
                         );
+                        // 诊断：dump 原始 payload 并定位 null 字段
+                        Self::diagnose_null_fields(dbnum, batch_id, payload);
                         None
                     }
                 }
@@ -209,6 +211,64 @@ impl InstanceCacheManager {
                     dbnum, batch_id, e
                 );
                 None
+            }
+        }
+    }
+
+    /// 诊断 null 字段：只在第一次失败时执行，dump 原始 JSON 并定位 null 出现的位置。
+    fn diagnose_null_fields(dbnum: u32, batch_id: &str, payload: &[u8]) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DIAGNOSED: AtomicBool = AtomicBool::new(false);
+        if DIAGNOSED.swap(true, Ordering::SeqCst) {
+            return; // 只诊断一次
+        }
+
+        eprintln!("[cache-diag] payload 大小: {} bytes", payload.len());
+
+        // 1) dump 原始 JSON 到文件
+        let dump_path = format!("output/cache_dump_{}_{}.json", dbnum, batch_id);
+        if let Err(e) = std::fs::write(&dump_path, payload) {
+            eprintln!("[cache-diag] 写 dump 文件失败: {}", e);
+        } else {
+            eprintln!("[cache-diag] 已 dump 到: {}", dump_path);
+        }
+
+        // 2) 用 serde_json::Value 宽松解析
+        let Ok(val) = serde_json::from_slice::<serde_json::Value>(payload) else {
+            eprintln!("[cache-diag] 连 Value 也无法解析，可能不是合法 JSON");
+            return;
+        };
+
+        // 3) 在整个 JSON 树中搜索 null 值，报告路径
+        fn find_nulls(val: &serde_json::Value, path: &str, results: &mut Vec<String>, limit: usize) {
+            if results.len() >= limit { return; }
+            match val {
+                serde_json::Value::Null => {
+                    results.push(path.to_string());
+                }
+                serde_json::Value::Object(map) => {
+                    for (k, v) in map {
+                        find_nulls(v, &format!("{}.{}", path, k), results, limit);
+                    }
+                }
+                serde_json::Value::Array(arr) => {
+                    for (i, v) in arr.iter().enumerate() {
+                        find_nulls(v, &format!("{}[{}]", path, i), results, limit);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut null_paths = Vec::new();
+        find_nulls(&val, "$", &mut null_paths, 50);
+
+        if null_paths.is_empty() {
+            eprintln!("[cache-diag] 未发现 null 字段（可能是类型标签不匹配等其他原因）");
+        } else {
+            eprintln!("[cache-diag] 发现 {} 个 null 字段:", null_paths.len());
+            for p in &null_paths {
+                eprintln!("[cache-diag]   {}", p);
             }
         }
     }

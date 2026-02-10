@@ -15,7 +15,7 @@ use crate::test::test_helper::{get_test_ams_db_manager, get_test_ams_db_manager_
 async fn test_query_travel_children_filter_negative_sibl_nodes() -> anyhow::Result<()> {
     use config::{Config, ConfigError, Environment, File};
     let s = Config::builder()
-        .add_source(File::with_name("DbOption"))
+        .add_source(File::with_name("db_options/DbOption"))
         .build()?;
     let db_option: DbOption = s.try_deserialize().unwrap();
     let database = get_arangodb_conn_from_db_option_for_test(&db_option).await?;

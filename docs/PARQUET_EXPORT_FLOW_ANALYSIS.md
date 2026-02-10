@@ -701,7 +701,7 @@ message schema {
 | 数据集 | instances | geo_instances | transforms | aabb | 总计 |
 |--------|-----------|---------------|------------|------|------|
 | dbnum=7997 (小型) | 2.3 MB | 3.1 MB | 1.2 MB | 0.8 MB | 7.4 MB |
-| dbnum=24381 (大型) | 45 MB | 68 MB | 12 MB | 8 MB | 133 MB |
+| ref0=24381（映射 dbnum=7997，旧文误写为 dbnum=24381） | 45 MB | 68 MB | 12 MB | 8 MB | 133 MB |
 
 ### 13.3 查询性能参考
 
@@ -715,5 +715,4 @@ message schema {
 ---
 
 **文档结束**
-
 

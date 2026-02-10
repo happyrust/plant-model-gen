@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
     println!("=== 查询元件库 15194/4553 的几何体定义 ===\n");
     
     // 初始化数据库连接
-    let _db_option_ext = aios_database::options::get_db_option_ext_from_path("DbOption")
+    let _db_option_ext = aios_database::options::get_db_option_ext_from_path("db_options/DbOption")
         .context("加载 DbOption 失败")?;
     init_surreal().await.context("初始化 SurrealDB 失败")?;
     

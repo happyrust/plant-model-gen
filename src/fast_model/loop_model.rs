@@ -17,10 +17,13 @@ use dashmap::DashMap;
 use glam::Vec3;
 use parry3d::bounding_volume::*;
 use parry3d::math::Isometry;
+use std::collections::HashMap;
 use std::mem::take;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
+
+use crate::fast_model::foyer_cache::geom_input_cache::LoopInput;
 
 ///处理带有loop的元件
 pub async fn gen_loop_geos(
@@ -324,5 +327,172 @@ pub async fn gen_loop_geos(
             t.elapsed().as_millis()
         );
     }
+    Ok(true)
+}
+
+/// cache-only 版本：从预取的 LoopInput 生成几何数据，不访问 SurrealDB。
+pub async fn gen_loop_geos_from_cache(
+    loop_inputs: &HashMap<RefnoEnum, LoopInput>,
+    sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
+    sender: flume::Sender<ShapeInstancesData>,
+) -> anyhow::Result<bool> {
+    let t = Instant::now();
+    let total = loop_inputs.len();
+    if total == 0 {
+        return Ok(true);
+    }
+
+    let mut shape_insts_data = ShapeInstancesData::default();
+    let mut processed = 0usize;
+    let mut skipped = 0usize;
+
+    for (_, input) in loop_inputs {
+        let target_refno = input.refno;
+        let target_type = input.attmap.get_type_str();
+        let mut trans_origin = input.world_transform;
+
+        // SJUS 调整
+        if (target_type == "FLOOR" || target_type == "PANE" || target_type == "GWALL")
+            && let Some(sjus_adjust) = sjus_map_arc.get(&target_refno)
+        {
+            let offset = trans_origin.rotation.mul_vec3(sjus_adjust.value().0);
+            trans_origin.translation += offset;
+        }
+
+        // 负实体关系
+        if !input.attmap.is_neg() {
+            shape_insts_data.insert_negs(target_refno, &input.neg_refnos);
+            if !input.cmpf_neg_refnos.is_empty() {
+                shape_insts_data.insert_negs(target_refno, &input.cmpf_neg_refnos);
+            }
+        }
+
+        let mut geos_info = EleGeosInfo {
+            refno: target_refno,
+            sesno: input.attmap.sesno(),
+            owner_refno: input.owner_refno,
+            owner_type: input.owner_type.clone(),
+            cata_hash: None,
+            visible: input.visible,
+            world_transform: trans_origin,
+            generic_type: input.generic_type,
+            aabb: None,
+            flow_pt_indexs: vec![],
+            ..Default::default()
+        };
+        let mut geo_hash = 0;
+        let mut item_trans = Transform::IDENTITY;
+        let mut geo_param = PdmsGeoParam::Unknown;
+
+        let verts = input.loops.clone();
+        let height = input.height;
+
+        match target_type {
+            "NREV" | "REVO" => {
+                let angle = input.attmap.get_f32("ANGL").unwrap_or_default();
+                if angle.abs() >= f32::EPSILON {
+                    let revo = Box::new(Revolution {
+                        verts,
+                        angle,
+                        ..Default::default()
+                    });
+                    if revo.check_valid() {
+                        item_trans = revo.get_trans();
+                        geo_param = revo.convert_to_geo_param().unwrap_or(PdmsGeoParam::Unknown);
+                        geo_hash = revo.hash_unit_mesh_params();
+                    }
+                }
+            }
+            "AEXTR" | "NXTR" | "EXTR" | "PANE" | "FLOOR" | "SCREED" | "GWALL" => {
+                if height < f32::EPSILON {
+                    debug_model_warn!("{}： 的height太小为: {}", target_refno, height);
+                    skipped += 1;
+                    continue;
+                }
+                let extrusion = Box::new(Extrusion {
+                    verts,
+                    height,
+                    ..Default::default()
+                });
+                geo_param = extrusion
+                    .convert_to_geo_param()
+                    .unwrap_or(PdmsGeoParam::Unknown);
+                item_trans = extrusion.get_trans();
+                geo_hash = extrusion.hash_unit_mesh_params();
+            }
+            _ => {}
+        }
+
+        geos_info.visible = input.visible;
+        if item_trans.translation.is_nan()
+            || item_trans.rotation.is_nan()
+            || item_trans.scale.is_nan()
+        {
+            skipped += 1;
+            continue;
+        }
+        let mut tr: Transform = item_trans;
+        let unit_flag = geo_param.is_reuse_unit();
+        if unit_flag {
+            geo_param = geo_param.to_unit_param();
+        }
+        crate::fast_model::reuse_unit::normalize_transform_scale(
+            &mut tr,
+            unit_flag,
+            geo_hash,
+        );
+
+        let geo_type = if input.attmap.is_neg() {
+            GeoBasicType::Neg
+        } else {
+            GeoBasicType::Pos
+        };
+        let geom_inst = EleInstGeo {
+            geo_hash,
+            refno: target_refno,
+            pts: Default::default(),
+            aabb: None,
+            geo_transform: tr,
+            visible: input.visible,
+            is_tubi: false,
+            geo_param: geo_param.clone(),
+            geo_type,
+            cata_neg_refnos: Default::default(),
+        };
+        geos_info.is_solid = geom_inst.geo_type == GeoBasicType::Pos;
+        let inst_key = geos_info.get_inst_key();
+        shape_insts_data.insert_geos_data(
+            inst_key.clone(),
+            EleInstGeosData {
+                inst_key,
+                refno: target_refno,
+                insts: vec![geom_inst],
+                aabb: None,
+                type_name: target_type.to_string(),
+            },
+        );
+        shape_insts_data.insert_info(target_refno, geos_info);
+        processed += 1;
+
+        if shape_insts_data.inst_cnt() >= SEND_INST_SIZE {
+            sender
+                .send(std::mem::take(&mut shape_insts_data))
+                .expect("send loop cache shape_insts_data error");
+        }
+    }
+
+    if shape_insts_data.inst_cnt() > 0 {
+        sender
+            .send(shape_insts_data)
+            .expect("send loop cache shape_insts_data error");
+    }
+
+    println!(
+        "[gen_loop_geos_from_cache] total={}, processed={}, skipped={}, elapsed={} ms",
+        total,
+        processed,
+        skipped,
+        t.elapsed().as_millis()
+    );
     Ok(true)
 }

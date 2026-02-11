@@ -164,14 +164,18 @@ async fn get_global_cache(db_option: Option<&DbOptionExt>) -> anyhow::Result<Opt
     Ok(GLOBAL_TRANSFORM_CACHE.get())
 }
 
-fn resolve_dbnum(refno: RefnoEnum) -> u32 {
+fn resolve_dbnum(refno: RefnoEnum) -> Option<u32> {
     if db_meta().ensure_loaded().is_ok() {
         if let Some(dbnum) = db_meta().get_dbnum_by_refno(refno) {
-            return dbnum;
+            return Some(dbnum);
         }
     }
-    // 兜底：沿用旧逻辑（ref0）。
-    refno.refno().get_0()
+    // ref0 != dbnum，禁止回退用 ref0 当 dbnum。
+    log::warn!(
+        "[transform_cache] 缺少 ref0->dbnum 映射: refno={}",
+        refno
+    );
+    None
 }
 
 /// 模型生成专用：从 foyer transform cache 读取 world_transform；miss 时按需生成并回写缓存。
@@ -182,9 +186,10 @@ pub async fn get_world_transform_cache_first(
     refno: RefnoEnum,
 ) -> anyhow::Result<Option<Transform>> {
     let dbnum = resolve_dbnum(refno);
-    let use_cache = db_option.map(|x| x.use_cache).unwrap_or(true);
+    let use_cache = db_option.map(|x| x.use_cache).unwrap_or(true) && dbnum.is_some();
 
     if use_cache {
+        let dbnum = dbnum.unwrap();
         if let Some(cache) = get_global_cache(db_option).await? {
             if let Some(hit) = cache.get_world_transform(dbnum, refno).await {
                 return Ok(Some(hit));
@@ -192,9 +197,9 @@ pub async fn get_world_transform_cache_first(
         }
     }
 
-    // miss：先用“直接读 pe.world_trans”的轻量路径（不依赖 pe_transform 预热）。
+    // miss：先用"直接读 pe.world_trans"的轻量路径（不依赖 pe_transform 预热）。
     if let Ok(Some(world)) = aios_core::rs_surreal::query_pe_world_trans(refno).await {
-        if use_cache {
+        if let (true, Some(dbnum)) = (use_cache, dbnum) {
             if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
                 cache.insert_world_transform(dbnum, refno, world.clone());
             }
@@ -205,7 +210,7 @@ pub async fn get_world_transform_cache_first(
     // 再兜底走旧计算路径（策略/惰性计算）。
     let computed = aios_core::get_world_transform(refno).await?;
     if let Some(world) = computed.clone() {
-        if use_cache {
+        if let (true, Some(dbnum)) = (use_cache, dbnum) {
             if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
                 cache.insert_world_transform(dbnum, refno, world);
             }
@@ -242,10 +247,12 @@ pub async fn get_world_transforms_cache_first_batch(
     let use_cache = db_option.map(|x| x.use_cache).unwrap_or(true);
     let mut out: HashMap<RefnoEnum, Transform> = HashMap::new();
 
-    // 记录每个 refno 的 dbnum（用于写回缓存）
+    // 记录每个 refno 的 dbnum（用于写回缓存；ref0 != dbnum，必须通过 db_meta 映射）
     let mut dbnum_map: HashMap<RefnoEnum, u32> = HashMap::new();
     for &r in refnos {
-        dbnum_map.insert(r, resolve_dbnum(r));
+        if let Some(d) = resolve_dbnum(r) {
+            dbnum_map.insert(r, d);
+        }
     }
 
     // 1) cache hits
@@ -326,8 +333,9 @@ pub async fn get_world_transforms_cache_first_batch(
                 still_missing.remove(&r);
                 if use_cache {
                     if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
-                        let dbnum = *dbnum_map.get(&r).unwrap_or(&resolve_dbnum(r));
-                        cache.insert_world_transform(dbnum, r, t);
+                        if let Some(&dbnum) = dbnum_map.get(&r) {
+                            cache.insert_world_transform(dbnum, r, t);
+                        }
                     }
                 }
             }
@@ -345,8 +353,9 @@ pub async fn get_world_transforms_cache_first_batch(
             out.insert(r, t.clone());
             if use_cache {
                 if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
-                    let dbnum = *dbnum_map.get(&r).unwrap_or(&resolve_dbnum(r));
-                    cache.insert_world_transform(dbnum, r, t);
+                    if let Some(&dbnum) = dbnum_map.get(&r) {
+                        cache.insert_world_transform(dbnum, r, t);
+                    }
                 }
             }
         }

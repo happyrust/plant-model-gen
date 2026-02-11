@@ -145,6 +145,7 @@ deploy/
 *.7z
 *.rar
 
+db_options/_tmp/
 
 ams-8020.db
 target-web-server-check

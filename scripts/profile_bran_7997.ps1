@@ -3,6 +3,10 @@ param(
   [Parameter(Mandatory=$false)]
   [string]$BaseConfig = "db_options/DbOption",
 
+  # 使用 release 二进制（用于更接近真实吞吐的 profile；默认 false 以保持日常调试体验）
+  [Parameter(Mandatory=$false)]
+  [switch]$Release = $false,
+
   [Parameter(Mandatory=$false)]
   [int]$Dbnum = 7997,
 
@@ -123,16 +127,22 @@ function Run-One([string]$label, [string]$cfgNoExt, [string]$cacheDir, [string]$
   Write-Host ("cache  : {0}" -f $cacheDir)
   Write-Host ("meshes : {0}" -f $meshDir)
   Write-Host ("limit  : {0}" -f $Limit)
+  Write-Host ("mode   : {0}" -f ($(if ($Release) { "release" } else { "debug" })))
 
   if ($clearCache) {
     Ensure-EmptyDir $cacheDir
     Ensure-EmptyDir $meshDir
   }
 
-  $exe = "target/debug/aios-database.exe"
+  $exe = $(if ($Release) { "target/release/aios-database.exe" } else { "target/debug/aios-database.exe" })
   if (-not (Test-Path $exe)) {
-    Write-Host "[info] building aios-database (dev profile)..."
-    cargo build --bin aios-database | Out-Null
+    if ($Release) {
+      Write-Host "[info] building aios-database (release profile)..."
+      cargo build --release --bin aios-database | Out-Null
+    } else {
+      Write-Host "[info] building aios-database (dev profile)..."
+      cargo build --bin aios-database | Out-Null
+    }
   }
 
   $since = Get-Date

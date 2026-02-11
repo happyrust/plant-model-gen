@@ -3,8 +3,11 @@
 //! 目标：为 plant3d-web 提供“管道 MBD 标注”所需的结构化数据（段/尺寸/焊缝/坡度）。
 //! 说明：本接口采用“后端提供语义点位 + 前端做屏幕布局/避让”的分层方式，便于渐进式对齐 MBD(PML)。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::Mutex;
+
+use once_cell::sync::Lazy;
 
 use aios_core::RefnoEnum;
 use axum::{
@@ -343,14 +346,47 @@ async fn get_mbd_pipe(
         .await
         {
             Ok(v) => v,
-            Err(e) => {
-                return json_utf8(MbdPipeResponse {
-                    success: false,
-                    error_message: Some(format!(
-                        "从 Parquet 读取分支管段失败: {e}（可尝试 ?source=cache 或 ?source=db）"
-                    )),
-                    data: None,
-                });
+            Err(parquet_err) => {
+                // Parquet 失败 → 自动 fallback 到 SurrealDB
+                match fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await {
+                    Ok((segs, mut db_debug)) => {
+                        db_debug.fallback_used = true;
+                        db_debug.fallback_reason = Some(format!(
+                            "parquet 失败({parquet_err})，已自动回退到 SurrealDB"
+                        ));
+                        db_debug.notes.push("auto-fallback: parquet→db".into());
+
+                        // 后台异步导出 parquet（不阻塞当前请求）
+                        // DB 路径不会设置 inferred_dbnum，需要主动推导
+                        let dbno_for_export = query.dbno.or_else(|| {
+                            use crate::data_interface::db_meta_manager::db_meta;
+                            let _ = db_meta().ensure_loaded();
+                            let d = db_meta().get_dbnum_by_refno(branch_refno.clone()).unwrap_or(0);
+                            if d > 0 { Some(d) } else { None }
+                        });
+                        if let Some(dbnum) = dbno_for_export {
+                            tokio::spawn(async move {
+                                if let Err(e) = trigger_async_parquet_export(dbnum).await {
+                                    eprintln!("[mbd-pipe] 后台 parquet 导出失败: {e}");
+                                }
+                            });
+                            db_debug.notes.push(format!(
+                                "已触发后台 parquet 导出 dbnum={dbnum}"
+                            ));
+                        }
+
+                        (segs, db_debug)
+                    }
+                    Err(db_err) => {
+                        return json_utf8(MbdPipeResponse {
+                            success: false,
+                            error_message: Some(format!(
+                                "Parquet 失败({parquet_err})，SurrealDB 也失败({db_err})"
+                            )),
+                            data: None,
+                        });
+                    }
+                }
             }
         },
         MbdPipeSource::Db => match fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await {
@@ -677,6 +713,67 @@ async fn get_mbd_pipe(
             debug_info: query.debug.then_some(debug_info),
         }),
     })
+}
+
+/// 正在后台导出的 dbnum 集合（防重复并发触发）
+static EXPORTING_DBNUMS: Lazy<Mutex<HashSet<u32>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// 后台异步触发 parquet 导出（不阻塞当前请求）
+async fn trigger_async_parquet_export(dbnum: u32) -> anyhow::Result<()> {
+    use crate::fast_model::export_model::export_dbnum_instances_parquet::export_dbnum_instances_parquet;
+    use std::sync::Arc;
+
+    // 防重复：如果已在导出中则跳过
+    {
+        let mut set = EXPORTING_DBNUMS.lock().unwrap();
+        if set.contains(&dbnum) {
+            println!("[mbd-pipe] dbnum={dbnum} 已在后台导出中，跳过");
+            return Ok(());
+        }
+        set.insert(dbnum);
+    }
+
+    let result = async {
+        let db_option = Arc::new(aios_core::get_db_option().clone());
+        let project_name = &db_option.project_name;
+
+        let output_dir = if project_name.is_empty() {
+            PathBuf::from("output/instances")
+        } else {
+            PathBuf::from(format!("output/{project_name}/instances"))
+        };
+
+        println!(
+            "[mbd-pipe] 后台导出 parquet: dbnum={dbnum} → {}",
+            output_dir.display()
+        );
+
+        let stats = export_dbnum_instances_parquet(
+            dbnum,
+            &output_dir,
+            db_option,
+            false, // verbose
+            None,  // target_unit (默认 mm)
+            None,  // root_refno (全量)
+        )
+        .await?;
+
+        println!(
+            "[mbd-pipe] 后台导出完成: dbnum={dbnum} instances={} tubings={} ({} bytes, {:?})",
+            stats.instance_count, stats.tubing_count, stats.total_bytes, stats.elapsed
+        );
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    // 导出完成（无论成功失败），移除标记
+    {
+        let mut set = EXPORTING_DBNUMS.lock().unwrap();
+        set.remove(&dbnum);
+    }
+
+    result
 }
 
 async fn fetch_tubi_segments_from_parquet_with_debug(

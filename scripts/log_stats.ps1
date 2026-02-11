@@ -1,5 +1,6 @@
 param(
   [Parameter(Mandatory=$true, Position=0)]
+  [Alias("LogPath")]
   [string]$Path
 )
 

@@ -39,6 +39,18 @@ async fn query_iparam_from_desi(desi_refno: RefnoEnum) -> anyhow::Result<Vec<f32
     Ok(result)
 }
 
+fn insert_iparam_kv(context: &mut CataContext, idx1: usize, v: &str) {
+    // 历史表达式里 IPARAM/IPARA/IPAR/IPARM 的写法不统一，这里全量铺开，避免漏键导致表达式求值失败。
+    context.insert(format!("IPARAM {}", idx1), v.to_string());
+    context.insert(format!("IPARAM{}", idx1), v.to_string());
+    context.insert(format!("IPARA {}", idx1), v.to_string());
+    context.insert(format!("IPARA{}", idx1), v.to_string());
+    context.insert(format!("IPAR {}", idx1), v.to_string());
+    context.insert(format!("IPAR{}", idx1), v.to_string());
+    context.insert(format!("IPARM {}", idx1), v.to_string());
+    context.insert(format!("IPARM{}", idx1), v.to_string());
+}
+
 ///收集SCOM的信息, 暂时慎用缓存
 pub async fn get_or_create_scom_info(cata_refno: RefnoEnum) -> anyhow::Result<ScomInfo> {
     // ⚠️  调试模式下清除缓存，确保使用最新的参数
@@ -297,32 +309,36 @@ pub async fn resolve_desi_comp(
     // IPARAM（保温层参数）：根据 context.with_insulation 开关决定是否代入实际值。
     // - false（默认）：IPARAM 全部为 0，生成物理几何模型
     // - true：IPARAM 使用实际保温层厚度（来自 ISPE→SPCO→CATR.PARA），生成含保温层的模型
-    match query_iparam_from_desi(desi_refno).await {
-        Ok(iparams) => {
-            debug_model_debug!(
-                "IPARAM query result: {:?}, with_insulation={}",
-                iparams,
-                context.with_insulation
-            );
-
-            for (i, value) in iparams.iter().enumerate() {
-                let v = if context.with_insulation {
-                    value.to_string()
-                } else {
-                    "0".to_string()
-                };
-                context.insert(format!("IPARAM {}", i + 1), v.clone());
-                context.insert(format!("IPARAM{}", i + 1), v.clone());
-                context.insert(format!("IPARA {}", i + 1), v.clone());
-                context.insert(format!("IPARA{}", i + 1), v.clone());
-                context.insert(format!("IPAR {}", i + 1), v.clone());
-                context.insert(format!("IPAR{}", i + 1), v.clone());
-                context.insert(format!("IPARM {}", i + 1), v.clone());
-                context.insert(format!("IPARM{}", i + 1), v.clone());
-            }
+    const DEFAULT_IPARAM_COUNT: usize = 32;
+    if !context.with_insulation {
+        // 性能/稳定性：默认物理模型不需要从 DB 读取保温层参数。
+        // 同时也规避某些环境下 SurrealDB 自定义函数 fn::get_ipara 因缺失字段返回 NONE 导致的 array::filter 报错。
+        for idx1 in 1..=DEFAULT_IPARAM_COUNT {
+            insert_iparam_kv(&mut context, idx1, "0");
         }
-        Err(e) => {
-            crate::smart_debug_error!("Failed to query IPARAM: {}", e);
+    } else {
+        match query_iparam_from_desi(desi_refno).await {
+            Ok(mut iparams) => {
+                debug_model_debug!(
+                    "IPARAM query result: {:?}, with_insulation={}",
+                    iparams,
+                    context.with_insulation
+                );
+
+                if iparams.len() < DEFAULT_IPARAM_COUNT {
+                    iparams.resize(DEFAULT_IPARAM_COUNT, 0.0);
+                }
+                for (i, value) in iparams.iter().enumerate() {
+                    insert_iparam_kv(&mut context, i + 1, &value.to_string());
+                }
+            }
+            Err(e) => {
+                // 保温层场景下若 DB 查询失败，降级为 0，避免表达式缺键导致整体失败。
+                crate::smart_debug_error!("Failed to query IPARAM (fallback to 0): {}", e);
+                for idx1 in 1..=DEFAULT_IPARAM_COUNT {
+                    insert_iparam_kv(&mut context, idx1, "0");
+                }
+            }
         }
     }
 

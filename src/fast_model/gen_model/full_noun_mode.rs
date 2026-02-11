@@ -22,6 +22,7 @@ use super::categorized_refnos::CategorizedRefnos;
 use super::config::FullNounConfig;
 use super::context::NounProcessContext;
 use super::errors::{FullNounError, Result};
+use super::cata_resolve_cache_pipeline;
 use super::input_cache_pipeline;
 use super::loop_processor::process_loop_refno_page;
 use super::prim_processor::process_prim_refno_page;
@@ -710,11 +711,27 @@ async fn process_bran_hang_core_logic(
             .await
             .unwrap_or_default()
     };
+    let target_bran_reuse_cata_map = Arc::new(target_bran_reuse_cata_map);
+
+    // 方案 A：Full Noun 模式下也需要做 prefetch，否则会绕开 cate_processor 中的预热逻辑。
+    if cata_resolve_cache_pipeline::is_cata_resolve_cache_prefetch_enabled() {
+        if let Err(e) = cata_resolve_cache_pipeline::prefetch_cata_resolve_cache_for_target_map(
+            db_option.clone(),
+            target_bran_reuse_cata_map.clone(),
+        )
+        .await
+        {
+            eprintln!(
+                "[full_noun_mode] cata_resolve_cache prefetch 失败（将继续走正常生成流程）: {}",
+                e
+            );
+        }
+    }
 
     // 3. 生成 CATE 几何
     let cate_outcome = match cata_model::gen_cata_instances(
         db_option.clone(),
-        Arc::new(target_bran_reuse_cata_map),
+        target_bran_reuse_cata_map,
         loop_sjus_map_arc.clone(),
         sender.clone(),
     )

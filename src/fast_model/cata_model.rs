@@ -3,6 +3,9 @@ use crate::data_interface::db_meta_manager::db_meta;
 use crate::data_interface::db_model::TUBI_TOL;
 use crate::data_interface::interface::PdmsDataInterface;
 use crate::fast_model;
+use crate::fast_model::foyer_cache::cata_resolve_cache::{
+    CataResolveCacheManager, CataResolvedComp, PreparedInstGeo,
+};
 use crate::fast_model::gen_model::cate_helpers::cal_sjus_value;
 use crate::fast_model::gen_model::cate_single::{CateCsgShapeMap, gen_cata_single_geoms};
 use crate::fast_model::gen_model::utilities::is_valid_cata_hash;
@@ -29,6 +32,7 @@ use aios_core::{
     HASH_PSEUDO_ATT_MAPS, NamedAttrMap, NamedAttrValue, RefU64, RefnoEnum, SUL_DB, gen_aabb_hash, gen_bevy_transform_hash,
 };
 use bevy_transform::components::Transform;
+use chrono::Utc;
 use dashmap::DashMap;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -78,6 +82,91 @@ pub struct CateGenOutcome {
     pub time_stats: HashMap<String, u64>,
     pub unique_cata_cnt: usize,
     pub elapsed_ms: u128,
+}
+
+fn build_prepared_inst_geos_from_shapes_for_cache(
+    shapes: Vec<CateCsgShape>,
+) -> (Vec<PreparedInstGeo>, bool) {
+    let mut out: Vec<PreparedInstGeo> = Vec::new();
+    let mut has_solid = false;
+
+    for shape in shapes.into_iter() {
+        let CateCsgShape {
+            refno: geom_refno,
+            csg_shape,
+            transform: shape_transform,
+            visible: shape_visible,
+            is_tubi,
+            pts,
+            is_ngmr,
+            ..
+        } = shape;
+
+        // resolve_desi_comp 的缓存只保存“可生成”的条目；无效几何直接跳过。
+        if !csg_shape.check_valid() {
+            continue;
+        }
+
+        // 获取形状自身的变换（包含 scale）
+        let shape_trans = csg_shape.get_trans();
+        let geo_hash = csg_shape.hash_unit_mesh_params();
+        let unit_flag = csg_shape.is_reuse_unit();
+
+        // 合并变换：shape_transform 是元件变换，shape_trans 是形状自身变换
+        let translation = shape_transform.translation + shape_transform.rotation * shape_trans.translation;
+        let rotation = shape_transform.rotation;
+        let scale = shape_trans.scale;
+
+        let mut transform = Transform {
+            translation,
+            rotation,
+            scale,
+        };
+
+        if transform.translation.is_nan() || transform.rotation.is_nan() || transform.scale.is_nan() {
+            continue;
+        }
+
+        // 获取 geo_param
+        let mut geo_param = csg_shape
+            .convert_to_geo_param()
+            .unwrap_or(PdmsGeoParam::Unknown);
+
+        // unit_flag=true 时，写入"单位参数"，保留 transform.scale
+        if unit_flag {
+            geo_param = csg_shape
+                .gen_unit_shape()
+                .convert_to_geo_param()
+                .unwrap_or(geo_param);
+        }
+
+        // 统一处理 transform.scale
+        crate::fast_model::reuse_unit::normalize_transform_scale(&mut transform, unit_flag, geo_hash);
+
+        let geo_type = if is_ngmr {
+            GeoBasicType::CataCrossNeg
+        } else {
+            GeoBasicType::Pos
+        };
+
+        if geo_type == GeoBasicType::Pos {
+            has_solid = true;
+        }
+
+        out.push(PreparedInstGeo {
+            geo_hash,
+            geom_refno,
+            pts,
+            geo_transform: transform,
+            geo_param,
+            shape_visible,
+            is_tubi,
+            geo_type,
+            unit_flag,
+        });
+    }
+
+    (out, has_solid)
 }
 
 fn build_tubi_transform_from_segment(
@@ -224,6 +313,25 @@ async fn gen_cata_geos_inner(
 
     // 用于收集总耗时的互斥锁
     let total_time_stats = Arc::new(Mutex::new(HashMap::new()));
+
+    // resolve_desi_comp 产物缓存（按 cata_hash）。命中时跳过 gen_cata_single_geoms + shape->inst_geo 转换。
+    // 初始化失败则自动退化为旧路径（不影响正确性）。
+    let cata_resolve_cache: Option<Arc<CataResolveCacheManager>> = if process_cata {
+        let cache_dir = db_option.get_foyer_cache_dir().join("cata_resolve_cache");
+        match CataResolveCacheManager::new(&cache_dir).await {
+            Ok(mgr) => Some(Arc::new(mgr)),
+            Err(e) => {
+                tracing::warn!(
+                    "init cata_resolve_cache failed, fallback to non-cache path: dir={:?}, err={}",
+                    cache_dir,
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let db_time_fetch_keys = Instant::now();
     let all_unique_keys = Arc::new(
@@ -552,6 +660,351 @@ async fn gen_cata_geos_inner(
                         continue;
                     }
 
+                    // 优先走 foyer cache：缓存命中时，直接构造 inst_geo/inst_info 所需的数据并写入 sender。
+                    if let Some(cache_mgr) = cata_resolve_cache.as_ref() {
+                        if let Some(resolved_comp) = cache_mgr.get(&cata_hash).await {
+                            debug_model_debug!(
+                                "[cata_hash={}] resolve_desi_comp cache hit (foyer/rkyv)",
+                                cata_hash
+                            );
+
+                            // 负实体映射：同一 GMSE 内可复用（只做一次）。
+                            let t_query_refnos = Instant::now();
+                            let mut pos_neg_map: HashMap<RefnoEnum, Vec<RefnoEnum>> = if valid_gmse {
+                                if let Ok(gmse) = &gmse_refno {
+                                    aios_core::query_refnos_has_pos_neg_map(&[*gmse], Some(true))
+                                        .await
+                                        .unwrap_or_default()
+                                } else {
+                                    HashMap::new()
+                                }
+                            } else {
+                                HashMap::new()
+                            };
+                            db_time_query_refnos += t_query_refnos.elapsed().as_millis();
+
+                            let neg_own_pos_map: HashMap<RefnoEnum, RefnoEnum> = pos_neg_map
+                                .iter()
+                                .flat_map(|(k, negs)| negs.iter().map(|x| (*x, *k)))
+                                .collect();
+
+                            let cur_ptset_map = resolved_comp.ptset_map();
+
+                            // 伪属性缓存：按 cata_hash 共享（同 inst_info exist 分支保持一致）。
+                            if let Some(&sample_refno) = target_group_refnos.first() {
+                                if let Ok(sample_att) = aios_core::get_named_attmap(sample_refno).await {
+                                    if sample_att.contains_key("LEAV") {
+                                        let arrive = sample_att.get_i32("ARRI").unwrap_or_default();
+                                        let leave = sample_att.get_i32("LEAV").unwrap_or_default();
+                                        if let (Some(a), Some(l)) = (
+                                            cur_ptset_map.values().find(|x| x.number == arrive),
+                                            cur_ptset_map.values().find(|x| x.number == leave),
+                                        ) {
+                                            let t_lock = Instant::now();
+                                            let mut lock = HASH_PSEUDO_ATT_MAPS.write().await;
+                                            db_time_hash_lock += t_lock.elapsed().as_millis();
+
+                                            let psudo_map = lock
+                                                .entry(cata_hash.clone())
+                                                .or_insert(NamedAttrMap::default());
+                                            psudo_map.insert(
+                                                "ARRWID".into(),
+                                                NamedAttrValue::F32Type(a.pwidth),
+                                            );
+                                            psudo_map.insert(
+                                                "ARRHEI".into(),
+                                                NamedAttrValue::F32Type(a.pheight),
+                                            );
+                                            psudo_map.insert(
+                                                "ABOR".into(),
+                                                NamedAttrValue::F32Type(a.pbore),
+                                            );
+                                            psudo_map.insert(
+                                                "LEAWID".into(),
+                                                NamedAttrValue::F32Type(l.pwidth),
+                                            );
+                                            psudo_map.insert(
+                                                "LEAHEI".into(),
+                                                NamedAttrValue::F32Type(l.pheight),
+                                            );
+                                            psudo_map.insert(
+                                                "LBOR".into(),
+                                                NamedAttrValue::F32Type(l.pbore),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 将缓存里的 PreparedInstGeo 转换为 EleInstGeo（补齐 Neg/Compound/NGMR 关系）。
+                            let respect_tufl = std::env::var_os("AIOS_RESPECT_TUFL").is_some();
+                            let mut visible_set: HashSet<RefnoEnum> = HashSet::new();
+                            for g in resolved_comp.geos.iter() {
+                                if !respect_tufl || g.shape_visible {
+                                    visible_set.insert(g.geom_refno);
+                                }
+                            }
+
+                            let mut geo_insts_tpl: Vec<EleInstGeo> = Vec::new();
+                            let mut has_cata_neg = false;
+                            let mut has_solid = false;
+                            for g in resolved_comp.geos.iter() {
+                                if respect_tufl && !g.shape_visible {
+                                    continue;
+                                }
+
+                                let geom_refno = g.geom_refno;
+                                let is_ngmr = g.geo_type == GeoBasicType::CataCrossNeg;
+                                let is_neg = neg_own_pos_map.contains_key(&geom_refno);
+
+                                let mut cata_neg_refnos =
+                                    pos_neg_map.remove(&geom_refno).unwrap_or_default();
+                                cata_neg_refnos.retain(|x| visible_set.contains(x));
+                                if !cata_neg_refnos.is_empty() {
+                                    has_cata_neg = true;
+                                }
+
+                                let geo_type = if is_ngmr {
+                                    GeoBasicType::CataCrossNeg
+                                } else if is_neg {
+                                    GeoBasicType::CataNeg
+                                } else if !cata_neg_refnos.is_empty() {
+                                    GeoBasicType::Compound
+                                } else {
+                                    // 初始正实体，布尔运算时会被改为 CatePos
+                                    GeoBasicType::Pos
+                                };
+
+                                if geo_type == GeoBasicType::Pos || geo_type == GeoBasicType::Compound
+                                {
+                                    has_solid = true;
+                                }
+
+                                // 将 CATE 的负实体关系写入 neg_relate_map
+                                if !cata_neg_refnos.is_empty() {
+                                    shape_insts_data.insert_negs(geom_refno, &cata_neg_refnos);
+                                }
+
+                                geo_insts_tpl.push(EleInstGeo {
+                                    geo_hash: g.geo_hash,
+                                    refno: geom_refno,
+                                    pts: g.pts.clone(),
+                                    aabb: None,
+                                    geo_transform: g.geo_transform,
+                                    geo_param: g.geo_param.clone(),
+                                    visible: geo_type == GeoBasicType::Pos
+                                        || geo_type == GeoBasicType::Compound,
+                                    is_tubi: g.is_tubi,
+                                    geo_type,
+                                    cata_neg_refnos,
+                                });
+                            }
+
+                            // 逐个实例写入（每个 refno 都需要有 inst_info/inst_geo/geo_relate）
+                            for &ele_refno in target_group_refnos.iter() {
+                                if geo_insts_tpl.is_empty() {
+                                    continue;
+                                }
+
+                                let t_get_world_transform = Instant::now();
+                                // 统一走 foyer transform_cache（不要求全量命中）；miss 时按需计算并回写缓存。
+                                let mut world_transform = match crate::fast_model::transform_cache::get_world_transform_cache_first(
+                                    Some(db_option.as_ref()),
+                                    ele_refno,
+                                )
+                                .await
+                                {
+                                    Ok(Some(t)) => t,
+                                    Ok(None) => {
+                                        debug_model!(
+                                            "[SKIP] ele_refno={} world_transform 为 None，跳过",
+                                            ele_refno
+                                        );
+                                        record_refno_error(
+                                            RefnoErrorKind::Missing,
+                                            RefnoErrorStage::Query,
+                                            "fast_model/cata_model.rs",
+                                            "get_world_transform_cache_first",
+                                            "world_transform 为 None",
+                                            Some(&ele_refno),
+                                            None,
+                                            &[],
+                                            None,
+                                        );
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        record_refno_error(
+                                            RefnoErrorKind::NotFound,
+                                            RefnoErrorStage::Query,
+                                            "fast_model/cata_model.rs",
+                                            "get_world_transform_cache_first",
+                                            format!("获取/计算 world_transform 失败: {}", e),
+                                            Some(&ele_refno),
+                                            None,
+                                            &[],
+                                            None,
+                                        );
+                                        continue;
+                                    }
+                                };
+                                db_time_get_world_transform +=
+                                    t_get_world_transform.elapsed().as_millis();
+
+                                let t_get_named_attmap2 = Instant::now();
+                                let ele_att = match aios_core::get_named_attmap(ele_refno).await {
+                                    Ok(att) => att,
+                                    Err(e) => {
+                                        record_refno_error(
+                                            RefnoErrorKind::NotFound,
+                                            RefnoErrorStage::Query,
+                                            "fast_model/cata_model.rs",
+                                            "get_named_attmap",
+                                            format!("获取 named_attmap 失败: {}", e),
+                                            Some(&ele_refno),
+                                            None,
+                                            &[],
+                                            None,
+                                        );
+                                        continue;
+                                    }
+                                };
+                                db_time_get_named_attmap +=
+                                    t_get_named_attmap2.elapsed().as_millis();
+
+                                // SJUS 调整：保持与旧生成分支一致
+                                if let Some(sjus) = ele_att.get_str("SJUS") {
+                                    let parent = ele_att.get_owner();
+                                    if let Some(sjus_adjust) = sjus_map_clone.get(&parent) {
+                                        let height = sjus_adjust.value().1;
+                                        let off_z = cal_sjus_value(sjus, height);
+
+                                        let t_get_world_transform2 = Instant::now();
+                                        let parent_trans = aios_core::get_world_mat4(parent, false)
+                                            .await
+                                            .ok()
+                                            .flatten()
+                                            .map(|mat4| {
+                                                let (scale, rotation, translation) =
+                                                    mat4.to_scale_rotation_translation();
+                                                bevy_transform::prelude::Transform {
+                                                    translation: translation.as_vec3(),
+                                                    rotation: glam::Quat::from_xyzw(
+                                                        rotation.x as f32,
+                                                        rotation.y as f32,
+                                                        rotation.z as f32,
+                                                        rotation.w as f32,
+                                                    ),
+                                                    scale: scale.as_vec3(),
+                                                }
+                                            })
+                                            .unwrap_or_default();
+                                        db_time_get_world_transform +=
+                                            t_get_world_transform2.elapsed().as_millis();
+
+                                        world_transform.translation.z = parent_trans.translation.z;
+                                        world_transform.translation = world_transform.translation
+                                            + sjus_adjust.value().0
+                                            + Vec3::new(0.0, 0.0, off_z);
+                                    }
+                                }
+
+                                let t_get_generic_type = Instant::now();
+                                let generic_type = get_generic_type(ele_refno).await.unwrap_or_default();
+                                db_time_get_generic_type +=
+                                    t_get_generic_type.elapsed().as_millis();
+
+                                let (owner_refno, owner_type) =
+                                    shared::get_owner_info_from_attr(&ele_att).await;
+                                let cata_hash_for_info = if is_valid_cata_hash(&cata_hash) {
+                                    Some(cata_hash.clone())
+                                } else {
+                                    None
+                                };
+                                let cur_type = ele_att.get_type_str();
+
+                                let mut geos_info = EleGeosInfo {
+                                    refno: ele_refno,
+                                    sesno: ele_att.sesno(),
+                                    owner_refno,
+                                    owner_type,
+                                    cata_hash: cata_hash_for_info,
+                                    visible: true,
+                                    generic_type,
+                                    aabb: None,
+                                    world_transform,
+                                    cata_refno: Some(cata_refno),
+                                    ptset_map: cur_ptset_map.clone(),
+                                    is_solid: has_solid,
+                                    has_cata_neg,
+                                    ..Default::default()
+                                };
+
+                                if ele_att.contains_key("ARRI") && !cur_ptset_map.is_empty() {
+                                    let arrive = ele_att.get_i32("ARRI").unwrap_or(-1);
+                                    let leave = ele_att.get_i32("LEAV").unwrap_or(-1);
+                                    if let Some(a) = cur_ptset_map.values().find(|x| x.number == arrive)
+                                        && let Some(l) = cur_ptset_map.values().find(|x| x.number == leave)
+                                    {
+                                        local_al_map_clone.insert(ele_refno, [a.clone(), l.clone()]);
+
+                                        // 收集 tubi_info（增量，自动去重）
+                                        if is_valid_cata_hash(&cata_hash) {
+                                            let tubi_info_id =
+                                                TubiInfoData::make_id(&cata_hash, arrive, leave);
+                                            tubi_info_map_clone
+                                                .entry(tubi_info_id.clone())
+                                                .or_insert_with(|| TubiInfoData::from_axis_params(&cata_hash, a, l));
+                                            geos_info.tubi_info_id = Some(tubi_info_id);
+                                        }
+                                    }
+                                }
+
+                                // NGMR：按实例写入（owner 可能依赖 ele_refno）
+                                for inst in geo_insts_tpl.iter() {
+                                    if inst.geo_type != GeoBasicType::CataCrossNeg {
+                                        continue;
+                                    }
+                                    if let Ok(target_owners) =
+                                        query_ngmr_owner(ele_refno, inst.refno).await
+                                    {
+                                        shape_insts_data.insert_ngmr(
+                                            ele_refno,
+                                            target_owners,
+                                            inst.refno,
+                                        );
+                                    }
+                                }
+
+                                let inst_key = geos_info.get_inst_key();
+                                let geos_data = EleInstGeosData {
+                                    inst_key: inst_key.clone(),
+                                    refno: ele_refno,
+                                    insts: geo_insts_tpl.clone(),
+                                    aabb: None,
+                                    type_name: cur_type.to_string(),
+                                    ..Default::default()
+                                };
+
+                                shape_insts_data.insert_info(ele_refno, geos_info);
+                                shape_insts_data.insert_geos_data(inst_key, geos_data);
+                                if shape_insts_data.inst_cnt() >= SEND_INST_SIZE {
+                                    sender
+                                        .send(std::mem::take(&mut shape_insts_data))
+                                        .expect("send cate shape_insts_data error");
+                                }
+                            }
+
+                            // 完成当前 cata_hash 的写入，进入下一个 key（跳过 gen_cata_single_geoms/shape 处理链路）。
+                            continue;
+                        } else {
+                            debug_model_debug!(
+                                "[cata_hash={}] resolve_desi_comp cache miss (foyer/rkyv)",
+                                cata_hash
+                            );
+                        }
+                    }
+
                     let csg_shapes_map = CateCsgShapeMap::new();
                     debug_model!(
                         "Created new csg_shapes_map for ele_refno={}, cata_hash={}",
@@ -650,6 +1103,29 @@ async fn gen_cata_geos_inner(
                             continue;
                         }
                     };
+
+                    // 生成成功后，将 resolve_desi_comp 产物回灌到 foyer cache（按 cata_hash）。
+                    if let Some(cache_mgr) = cata_resolve_cache.as_ref() {
+                        let ptset_map_for_cache = design_axis_map
+                            .get(&ele_refno)
+                            .map(|v| v.clone())
+                            .unwrap_or_default();
+                        let shapes_for_cache = csg_shapes_map
+                            .get(&ele_refno)
+                            .map(|v| v.clone())
+                            .unwrap_or_default();
+                        if !shapes_for_cache.is_empty() || !ptset_map_for_cache.is_empty() {
+                            let (geos, has_solid) =
+                                build_prepared_inst_geos_from_shapes_for_cache(shapes_for_cache);
+                            let resolved_comp = CataResolvedComp {
+                                created_at: Utc::now().timestamp_millis(),
+                                ptset_items: ptset_map_for_cache.into_iter().collect(),
+                                geos,
+                                has_solid,
+                            };
+                            cache_mgr.insert(cata_hash.clone(), &resolved_comp);
+                        }
+                    }
 
                     // 同一 cata_hash 可能对应多个 design_refno（group_refnos）。
                     // gen_cata_single_geoms 只会把几何写入当前 design_refno 的 key。

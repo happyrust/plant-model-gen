@@ -332,6 +332,7 @@ async fn gen_cata_geos_inner(
     } else {
         None
     };
+    let cata_resolve_cache_only = std::env::var_os("AIOS_CATA_RESOLVE_CACHE_ONLY").is_some();
 
     let db_time_fetch_keys = Instant::now();
     let all_unique_keys = Arc::new(
@@ -802,10 +803,6 @@ async fn gen_cata_geos_inner(
 
                             // 逐个实例写入（每个 refno 都需要有 inst_info/inst_geo/geo_relate）
                             for &ele_refno in target_group_refnos.iter() {
-                                if geo_insts_tpl.is_empty() {
-                                    continue;
-                                }
-
                                 let t_get_world_transform = Instant::now();
                                 // 统一走 foyer transform_cache（不要求全量命中）；miss 时按需计算并回写缓存。
                                 let mut world_transform = match crate::fast_model::transform_cache::get_world_transform_cache_first(
@@ -960,6 +957,12 @@ async fn gen_cata_geos_inner(
                                     }
                                 }
 
+                                // 注意：即使本组缓存的 insts 为空，我们也应尽量收集 ARRIVE/LEAVE 点，
+                                // 以保证 BRAN tubing 第二阶段仍可工作；但不写入 inst_geo/inst_info。
+                                if geo_insts_tpl.is_empty() {
+                                    continue;
+                                }
+
                                 // NGMR：按实例写入（owner 可能依赖 ele_refno）
                                 for inst in geo_insts_tpl.iter() {
                                     if inst.geo_type != GeoBasicType::CataCrossNeg {
@@ -1002,6 +1005,14 @@ async fn gen_cata_geos_inner(
                                 "[cata_hash={}] resolve_desi_comp cache miss (foyer/rkyv)",
                                 cata_hash
                             );
+                            // cache-only：只允许从 foyer cache 读取；miss 时跳过该组，避免回查 DB/重复计算。
+                            if cata_resolve_cache_only {
+                                tracing::warn!(
+                                    "[cata_hash={}] cata_resolve_cache_only=1 and cache miss; skipping this group",
+                                    cata_hash
+                                );
+                                continue;
+                            }
                         }
                     }
 

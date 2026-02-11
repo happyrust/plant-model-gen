@@ -1,4 +1,5 @@
 use super::cate_single;
+use super::cata_resolve_cache_pipeline;
 use super::context::NounProcessContext;
 use super::utilities::build_cata_hash_map_from_tree;
 use crate::fast_model::cata_model;
@@ -36,6 +37,21 @@ pub async fn process_cate_refno_page(
 
     if target_cata_map.is_empty() {
         return Ok(());
+    }
+
+    // 方案 A：先预热 resolve_desi_comp 产物缓存（按 cata_hash），再进入正常生成流程。
+    if cata_resolve_cache_pipeline::is_cata_resolve_cache_prefetch_enabled() {
+        if let Err(e) = cata_resolve_cache_pipeline::prefetch_cata_resolve_cache_for_target_map(
+            ctx.db_option.clone(),
+            target_cata_map.clone(),
+        )
+        .await
+        {
+            eprintln!(
+                "[cate_processor] cata_resolve_cache prefetch 失败（将继续走正常生成流程）: {}",
+                e
+            );
+        }
     }
 
     // 生成 cata 几何体

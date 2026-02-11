@@ -188,7 +188,7 @@ dependencies = [
 name = "aios-database"
 version = "0.2.3"
 dependencies = [
- "aios_core",
+ "aios_core 0.2.3",
  "anyhow",
  "approx",
  "arrow-array 57.2.0",
@@ -207,7 +207,7 @@ dependencies = [
  "byteorder",
  "cached 0.56.0",
  "calamine 0.31.0",
- "cavalier_contours",
+ "cavalier_contours 0.4.0 (git+https://gitee.com/happydpc/cavalier_contours)",
  "cc",
  "chrono",
  "clap",
@@ -215,7 +215,7 @@ dependencies = [
  "dashmap 7.0.0-rc2",
  "derive_more 1.0.0",
  "downcast-rs 1.2.1",
- "dpcsync",
+ "dpcsync 0.1.0 (git+https://gitee.com/happydpc/dpc-sync.git)",
  "duckdb",
  "eframe",
  "env_logger",
@@ -233,7 +233,7 @@ dependencies = [
  "image 0.24.9",
  "imageproc",
  "indexmap 2.13.0",
- "indextree",
+ "indextree 4.7.4",
  "indicatif",
  "itertools 0.14.0",
  "jsonwebtoken",
@@ -279,8 +279,8 @@ dependencies = [
  "smol_str 0.3.5",
  "strum 0.27.2",
  "strum_macros 0.27.2",
- "surrealdb",
- "surrealdb-types",
+ "surrealdb 3.0.0-beta (git+https://gitee.com/happydpc/surrealdb?branch=updated)",
+ "surrealdb-types 3.0.0-beta (git+https://gitee.com/happydpc/surrealdb?branch=updated)",
  "sysinfo 0.37.2",
  "tempfile",
  "thiserror 1.0.69",
@@ -318,7 +318,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cached 0.56.0",
  "calamine 0.26.1",
- "cavalier_contours",
+ "cavalier_contours 0.4.0 (git+https://github.com/happyrust/cavalier_contours)",
  "chrono",
  "clap",
  "config 0.14.1",
@@ -336,9 +336,9 @@ dependencies = [
  "hash32 1.0.0",
  "hexasphere",
  "i_triangle",
- "id_tree 1.8.0 (git+https://gitee.com/happydpc/id_tree)",
+ "id_tree 1.8.0 (git+https://github.com/happyrust/id_tree)",
  "indexmap 2.13.0",
- "indextree",
+ "indextree 4.7.4 (git+https://github.com/happyrust/indextree?branch=main)",
  "itertools 0.14.0",
  "jsonxf",
  "lazy_static",
@@ -363,7 +363,7 @@ dependencies = [
  "pretty-hex",
  "regex",
  "rkyv 0.8.14",
- "rstar 0.11.0 (git+https://gitee.com/happydpc/rstar)",
+ "rstar 0.11.0 (git+https://github.com/happyrust/rstar)",
  "serde",
  "serde_derive",
  "serde_json",
@@ -375,8 +375,91 @@ dependencies = [
  "smol_str 0.3.5",
  "strum 0.27.2",
  "strum_macros 0.27.2",
- "surrealdb",
- "surrealdb-types",
+ "surrealdb 3.0.0-beta (git+https://github.com/happyrust/surrealdb?branch=updated)",
+ "surrealdb-types 3.0.0-beta (git+https://github.com/happyrust/surrealdb?branch=updated)",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "aios_core"
+version = "0.2.3"
+source = "git+https://github.com/happyrust/rs-core?branch=dev-3.1#3752b498e64b74ce7b69f8b5ed9d7bf8323a747b"
+dependencies = [
+ "anyhow",
+ "approx",
+ "async-recursion",
+ "async-trait",
+ "base64 0.22.1",
+ "bevy_ecs",
+ "bevy_math",
+ "bevy_transform",
+ "bincode 1.3.3",
+ "bitflags 2.10.0",
+ "cached 0.56.0",
+ "calamine 0.26.1",
+ "cavalier_contours 0.4.0 (git+https://github.com/happyrust/cavalier_contours)",
+ "chrono",
+ "clap",
+ "config 0.14.1",
+ "dashmap 7.0.0-rc2",
+ "deku",
+ "derivative",
+ "derive_more 1.0.0",
+ "downcast-rs 2.0.2",
+ "dyn-clone",
+ "evalexpr",
+ "flate2",
+ "futures",
+ "glam 0.30.10",
+ "gltf",
+ "hash32 1.0.0",
+ "hexasphere",
+ "i_triangle",
+ "id_tree 1.8.0 (git+https://github.com/happyrust/id_tree)",
+ "indexmap 2.13.0",
+ "indextree 4.7.4 (git+https://github.com/happyrust/indextree?branch=main)",
+ "itertools 0.14.0",
+ "jsonxf",
+ "lazy_static",
+ "log",
+ "lru",
+ "memchr",
+ "nalgebra 0.34.1",
+ "nom 8.0.0",
+ "num-traits",
+ "num_cpus",
+ "num_enum",
+ "once_cell",
+ "once_cell_serde",
+ "ordered-float 5.1.0",
+ "parking_lot",
+ "parry2d",
+ "parry3d",
+ "petgraph 0.8.3",
+ "phf 0.11.3",
+ "ploop-rs",
+ "pretty-hex",
+ "regex",
+ "rkyv 0.8.14",
+ "rstar 0.11.0 (git+https://github.com/happyrust/rstar)",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "serde_yaml",
+ "simplelog",
+ "smallvec",
+ "smol_str 0.3.5",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
+ "surrealdb 3.0.0-beta (git+https://github.com/happyrust/surrealdb?branch=updated)",
+ "surrealdb-types 3.0.0-beta (git+https://github.com/happyrust/surrealdb?branch=updated)",
  "thiserror 1.0.69",
  "tokio",
  "toml 0.8.23",
@@ -2348,7 +2431,7 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 [[package]]
 name = "calamine"
 version = "0.26.1"
-source = "git+https://gitee.com/happydpc/calamine#f35ae176fa9f763851b236f7166e38a884efc8d6"
+source = "git+https://github.com/happyrust/calamine#f35ae176fa9f763851b236f7166e38a884efc8d6"
 dependencies = [
  "atoi_simd",
  "byteorder",
@@ -2448,6 +2531,16 @@ dependencies = [
 name = "cavalier_contours"
 version = "0.4.0"
 source = "git+https://gitee.com/happydpc/cavalier_contours#d2d0db137836b672bf7493c047425a146aeb9266"
+dependencies = [
+ "num-traits",
+ "serde",
+ "static_aabb2d_index",
+]
+
+[[package]]
+name = "cavalier_contours"
+version = "0.4.0"
+source = "git+https://github.com/happyrust/cavalier_contours#d2d0db137836b672bf7493c047425a146aeb9266"
 dependencies = [
  "num-traits",
  "serde",
@@ -3852,6 +3945,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "dpcsync"
+version = "0.1.0"
+source = "git+https://github.com/happyrust/dpc-sync#1432df6b714b6ff1c4c51224cb5fc8d6ce3c8f5b"
+dependencies = [
+ "async-trait",
+ "blake2",
+ "brotli 3.5.0",
+ "brotli-decompressor 2.5.1",
+ "bytes",
+ "futures-util",
+ "log",
+ "num_cpus",
+ "prost 0.12.6",
+ "prost-build",
+ "reqwest 0.11.27",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "dpi"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3889,9 +4002,9 @@ checksum = "7454e41ff9012c00d53cf7f475c5e3afa3b91b7c90568495495e8d9bf47a1055"
 
 [[package]]
 name = "duckdb"
-version = "1.4.3"
+version = "1.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7eeb487dde618b9f6ab26a451775ad5fac3fabe1ca2b64cbbe90b105f264ccd"
+checksum = "8685352ce688883098b61a361e86e87df66fc8c444f4a2411e884c16d5243a65"
 dependencies = [
  "arrow",
  "cast",
@@ -5039,6 +5152,7 @@ version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f811f663912a69249fa620dcd2a005db7254529da2d8a0b23942e81f47084501"
 dependencies = [
+ "earcutr",
  "float_next_after",
  "geo-types",
  "geographiclib-rs",
@@ -5047,6 +5161,7 @@ dependencies = [
  "robust",
  "rstar 0.12.2",
  "serde",
+ "spade",
 ]
 
 [[package]]
@@ -6484,7 +6599,7 @@ dependencies = [
 [[package]]
 name = "id_tree"
 version = "1.8.0"
-source = "git+https://gitee.com/happydpc/id_tree#483f2ec03fc107b9195a8c2be6dec5532891b507"
+source = "git+https://github.com/happyrust/id_tree#483f2ec03fc107b9195a8c2be6dec5532891b507"
 dependencies = [
  "serde",
  "serde_derive",
@@ -6622,13 +6737,36 @@ dependencies = [
 name = "indextree"
 version = "4.7.4"
 dependencies = [
- "indextree-macros",
+ "indextree-macros 0.1.3",
+ "rkyv 0.8.14",
+]
+
+[[package]]
+name = "indextree"
+version = "4.7.4"
+source = "git+https://github.com/happyrust/indextree?branch=main#2416dca00df8f928a6fee492702cb5224482a4ba"
+dependencies = [
+ "indextree-macros 0.1.3 (git+https://github.com/happyrust/indextree?branch=main)",
  "rkyv 0.8.14",
 ]
 
 [[package]]
 name = "indextree-macros"
 version = "0.1.3"
+dependencies = [
+ "either",
+ "itertools 0.14.0",
+ "proc-macro2",
+ "quote",
+ "strum 0.27.2",
+ "syn 2.0.114",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "indextree-macros"
+version = "0.1.3"
+source = "git+https://github.com/happyrust/indextree?branch=main#2416dca00df8f928a6fee492702cb5224482a4ba"
 dependencies = [
  "either",
  "itertools 0.14.0",
@@ -7138,9 +7276,9 @@ checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 
 [[package]]
 name = "libduckdb-sys"
-version = "1.4.3"
+version = "1.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8c60c2d269e63ae5197e4fe9075efffed35dfda0095a5ac8b41f3c765b18456"
+checksum = "d78bacb8933586cee3b550c39b610d314f9b7a48701ac7a914a046165a4ad8da"
 dependencies = [
  "cc",
  "flate2",
@@ -7452,6 +7590,7 @@ dependencies = [
 [[package]]
 name = "manifold-rs"
 version = "0.6.1"
+source = "git+https://github.com/happyrust/manifold-rs?branch=master#703aef3852bef531a203abab5ad8699bc5ea9a93"
 dependencies = [
  "cmake",
  "cxx",
@@ -8973,7 +9112,7 @@ dependencies = [
 name = "parse_pdms_db"
 version = "3.0.0"
 dependencies = [
- "aios_core",
+ "aios_core 0.2.3 (git+https://github.com/happyrust/rs-core?branch=dev-3.1)",
  "anyhow",
  "approx",
  "async-trait",
@@ -9082,7 +9221,7 @@ dependencies = [
 name = "pdms_io"
 version = "0.1.0"
 dependencies = [
- "aios_core",
+ "aios_core 0.2.3 (git+https://github.com/happyrust/rs-core?branch=dev-3.1)",
  "anyhow",
  "atty",
  "blake2",
@@ -9090,7 +9229,7 @@ dependencies = [
  "dashmap 6.1.0",
  "deku",
  "derivative",
- "dpcsync",
+ "dpcsync 0.1.0 (git+https://github.com/happyrust/dpc-sync)",
  "fern",
  "flume",
  "futures",
@@ -9110,7 +9249,7 @@ dependencies = [
  "reqwest 0.11.27",
  "serde",
  "serde_json",
- "surrealdb",
+ "surrealdb 3.0.0-beta (git+https://github.com/happyrust/surrealdb?branch=updated)",
  "tempfile",
  "tokio",
  "url",
@@ -9344,7 +9483,7 @@ dependencies = [
 [[package]]
 name = "ploop-rs"
 version = "0.1.0"
-source = "git+https://gitee.com/happydpc/rust-ploop-processor.git?branch=1.0#33985df43dc86b7716b07942be86d65f17bcfa34"
+source = "git+https://github.com/happyrust/rust-ploop-processor?branch=1.0#33985df43dc86b7716b07942be86d65f17bcfa34"
 dependencies = [
  "anyhow",
  "glam 0.30.10",
@@ -11180,7 +11319,7 @@ dependencies = [
 [[package]]
 name = "rstar"
 version = "0.11.0"
-source = "git+https://gitee.com/happydpc/rstar#13be3c257c5f66eaf67753adbbd76209a6927a92"
+source = "git+https://github.com/happyrust/rstar#13be3c257c5f66eaf67753adbbd76209a6927a92"
 dependencies = [
  "heapless 0.8.0",
  "num-traits",
@@ -12579,8 +12718,42 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "surrealdb-core",
- "surrealdb-types",
+ "surrealdb-core 3.0.0-beta (git+https://gitee.com/happydpc/surrealdb?branch=updated)",
+ "surrealdb-types 3.0.0-beta (git+https://gitee.com/happydpc/surrealdb?branch=updated)",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "tokio-tungstenite-wasm",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasmtimer",
+ "web-sys",
+]
+
+[[package]]
+name = "surrealdb"
+version = "3.0.0-beta"
+source = "git+https://github.com/happyrust/surrealdb?branch=updated#7dd58dd3866fce4e3b919aca27794e0912625a0e"
+dependencies = [
+ "async-channel 2.5.0",
+ "boxcar",
+ "chrono",
+ "futures",
+ "getrandom 0.3.4",
+ "indexmap 2.13.0",
+ "js-sys",
+ "path-clean",
+ "ring",
+ "rustls-pki-types",
+ "semver",
+ "serde",
+ "serde_json",
+ "surrealdb-core 3.0.0-beta (git+https://github.com/happyrust/surrealdb?branch=updated)",
+ "surrealdb-types 3.0.0-beta (git+https://github.com/happyrust/surrealdb?branch=updated)",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite 0.28.0",
@@ -12667,8 +12840,99 @@ dependencies = [
  "storekey",
  "strsim 0.11.1",
  "subtle",
- "surrealdb-protocol",
- "surrealdb-types",
+ "surrealdb-protocol 0.7.0 (git+https://gitee.com/happydpc/surrealdb?branch=updated)",
+ "surrealdb-types 3.0.0-beta (git+https://gitee.com/happydpc/surrealdb?branch=updated)",
+ "surrealmx",
+ "sysinfo 0.33.1",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "trice",
+ "ulid",
+ "unicase",
+ "url",
+ "uuid",
+ "vart",
+ "wasm-bindgen-futures",
+ "wasmtimer",
+]
+
+[[package]]
+name = "surrealdb-core"
+version = "3.0.0-beta"
+source = "git+https://github.com/happyrust/surrealdb?branch=updated#7dd58dd3866fce4e3b919aca27794e0912625a0e"
+dependencies = [
+ "addr",
+ "affinitypool",
+ "ahash 0.8.12",
+ "ammonia",
+ "anyhow",
+ "argon2",
+ "async-channel 2.5.0",
+ "async-trait",
+ "base64 0.21.7",
+ "bcrypt",
+ "bincode 1.3.3",
+ "blake3",
+ "bytes",
+ "chrono",
+ "ciborium",
+ "dashmap 6.1.0",
+ "deunicode",
+ "dmp",
+ "ext-sort",
+ "fastnum",
+ "fst",
+ "futures",
+ "fuzzy-matcher",
+ "geo 0.28.0",
+ "geo-types",
+ "getrandom 0.3.4",
+ "headers",
+ "hex",
+ "http 1.4.0",
+ "humantime",
+ "ipnet",
+ "jsonwebtoken",
+ "lexicmp",
+ "linfa-linalg",
+ "md-5",
+ "mime",
+ "nanoid",
+ "ndarray",
+ "ndarray-stats",
+ "num-traits",
+ "num_cpus",
+ "object_store",
+ "parking_lot",
+ "path-clean",
+ "pbkdf2",
+ "phf 0.11.3",
+ "pin-project-lite",
+ "quick_cache",
+ "radix_trie",
+ "rand 0.8.5",
+ "rayon",
+ "reblessive",
+ "regex",
+ "revision",
+ "ring",
+ "roaring",
+ "rust-stemmers",
+ "rust_decimal",
+ "scrypt",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "storekey",
+ "strsim 0.11.1",
+ "subtle",
+ "surrealdb-protocol 0.7.0 (git+https://github.com/happyrust/surrealdb?branch=updated)",
+ "surrealdb-types 3.0.0-beta (git+https://github.com/happyrust/surrealdb?branch=updated)",
  "surrealmx",
  "sysinfo 0.33.1",
  "tempfile",
@@ -12711,6 +12975,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "surrealdb-protocol"
+version = "0.7.0"
+source = "git+https://github.com/happyrust/surrealdb?branch=updated#7dd58dd3866fce4e3b919aca27794e0912625a0e"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "flatbuffers",
+ "futures",
+ "geo 0.28.0",
+ "http-body-util",
+ "prost 0.14.3",
+ "prost-types 0.14.3",
+ "rust_decimal",
+ "semver",
+ "serde",
+ "serde_json",
+ "tonic",
+ "tonic-prost",
+ "uuid",
+]
+
+[[package]]
 name = "surrealdb-types"
 version = "3.0.0-beta"
 source = "git+https://gitee.com/happydpc/surrealdb?branch=updated#7dd58dd3866fce4e3b919aca27794e0912625a0e"
@@ -12729,8 +13017,33 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
- "surrealdb-protocol",
- "surrealdb-types-derive",
+ "surrealdb-protocol 0.7.0 (git+https://gitee.com/happydpc/surrealdb?branch=updated)",
+ "surrealdb-types-derive 3.0.0-beta (git+https://gitee.com/happydpc/surrealdb?branch=updated)",
+ "ulid",
+ "uuid",
+]
+
+[[package]]
+name = "surrealdb-types"
+version = "3.0.0-beta"
+source = "git+https://github.com/happyrust/surrealdb?branch=updated#7dd58dd3866fce4e3b919aca27794e0912625a0e"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "flatbuffers",
+ "geo 0.28.0",
+ "hex",
+ "http 1.4.0",
+ "nanoid",
+ "papaya",
+ "regex",
+ "rstest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "surrealdb-protocol 0.7.0 (git+https://github.com/happyrust/surrealdb?branch=updated)",
+ "surrealdb-types-derive 3.0.0-beta (git+https://github.com/happyrust/surrealdb?branch=updated)",
  "ulid",
  "uuid",
 ]
@@ -12739,6 +13052,16 @@ dependencies = [
 name = "surrealdb-types-derive"
 version = "3.0.0-beta"
 source = "git+https://gitee.com/happydpc/surrealdb?branch=updated#7dd58dd3866fce4e3b919aca27794e0912625a0e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
+]
+
+[[package]]
+name = "surrealdb-types-derive"
+version = "3.0.0-beta"
+source = "git+https://github.com/happyrust/surrealdb?branch=updated#7dd58dd3866fce4e3b919aca27794e0912625a0e"
 dependencies = [
  "proc-macro2",
  "quote",

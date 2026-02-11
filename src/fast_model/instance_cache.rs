@@ -313,16 +313,24 @@ impl InstanceCacheManager {
     }
 
     pub fn insert_from_shape(&self, dbnum: u32, shape_insts: &ShapeInstancesData) -> String {
-        println!(
-            "[cache] insert_from_shape 调用: dbnum={}, inst_cnt={}, inst_info={}, inst_geos={}, inst_tubi={}, neg={}, ngmr={}",
-            dbnum,
-            shape_insts.inst_cnt(),
-            shape_insts.inst_info_map.len(),
-            shape_insts.inst_geos_map.len(),
-            shape_insts.inst_tubi_map.len(),
-            shape_insts.neg_relate_map.len(),
-            shape_insts.ngmr_neg_relate_map.len()
-        );
+        // 高频路径：默认不打印到 stdout，避免 profile 场景下 IO 成为瓶颈。
+        // 需要时可设置环境变量 `AIOS_CACHE_INSERT_STDOUT=1|true` 打开。
+        let stdout_enabled = std::env::var("AIOS_CACHE_INSERT_STDOUT")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if stdout_enabled {
+            println!(
+                "[cache] insert_from_shape 调用: dbnum={}, inst_cnt={}, inst_info={}, inst_geos={}, inst_tubi={}, neg={}, ngmr={}",
+                dbnum,
+                shape_insts.inst_cnt(),
+                shape_insts.inst_info_map.len(),
+                shape_insts.inst_geos_map.len(),
+                shape_insts.inst_tubi_map.len(),
+                shape_insts.neg_relate_map.len(),
+                shape_insts.ngmr_neg_relate_map.len()
+            );
+        }
         let batch_id = self.next_batch_id(dbnum);
         let batch = CachedInstanceBatch {
             dbnum,

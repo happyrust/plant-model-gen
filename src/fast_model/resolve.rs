@@ -431,13 +431,59 @@ fn validate_scom_expressions(
             );
         }
         
-        // 在控制台也打印警告（便于调试）
-        eprintln!(
-            "⚠️  [表达式预验证] design={}, scom={}({}): 发现 {} 个表达式错误",
-            desi_refno, scom_refno, scom_name, all_errors.len()
-        );
-        for error in &all_errors {
-            eprintln!("   - {}", error);
+        // 这些表达式错误可能非常多，stdout/stderr 会显著拖慢 profile。
+        // 需要时可通过以下开关输出：
+        // - `--debug-model`（调试单个 refno）或
+        // - 环境变量 `AIOS_EXPR_PREVALIDATION_STDERR=1|true`
+        // 同时支持将详细错误写入 tracing 日志：
+        // - 环境变量 `AIOS_EXPR_PREVALIDATION_LOG=1|true`
+        let stderr_enabled = std::env::var("AIOS_EXPR_PREVALIDATION_STDERR")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let log_enabled = std::env::var("AIOS_EXPR_PREVALIDATION_LOG")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let debug_enabled = aios_core::is_debug_model_enabled();
+
+        if stderr_enabled || debug_enabled {
+            eprintln!(
+                "⚠️  [表达式预验证] design={}, scom={}({}): 发现 {} 个表达式错误",
+                desi_refno,
+                scom_refno,
+                scom_name,
+                all_errors.len()
+            );
+            for error in &all_errors {
+                eprintln!("   - {}", error);
+            }
+        }
+
+        if log_enabled || debug_enabled {
+            tracing::warn!(
+                design_refno = %desi_refno,
+                scom_refno = %scom_refno,
+                scom_name = scom_name,
+                error_cnt = all_errors.len(),
+                "expression prevalidation: invalid expressions found"
+            );
+            // 只有在明确打开开关时才逐条写日志（避免日志爆炸）。
+            if log_enabled {
+                for error in &all_errors {
+                    tracing::warn!(
+                        design_refno = %desi_refno,
+                        scom_refno = %scom_refno,
+                        scom_name = scom_name,
+                        gm_refno = error.gm_refno.as_str(),
+                        gm_type = error.gm_type.as_str(),
+                        attr = error.attr_name.as_str(),
+                        expr = error.expression.as_str(),
+                        msg = error.message.as_str(),
+                        "expression prevalidation error"
+                    );
+                }
+            }
         }
     }
 }

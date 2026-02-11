@@ -8,7 +8,8 @@
 核心要点：
 - 以 **Foyer Cache 作为中枢** 保存可复用的中间数据；阶段间 **只传 Key，不传 payload**。
 - **SurrealDB 查询与写入 Foyer Cache 并行**（跨 batch 重叠 + 同 batch 多查询并行 + 写入 spawn_blocking）。
-- CATE 阶段遵循 KISS：仅缓存“SurrealDB 查询得到的中间数据”，不缓存 `resolve_desi_comp` 的求解产物；M3a 允许 miss 回查 DB，且默认 writeback 回写 Cache。
+- **CATE 必须缓存 `resolve_desi_comp` 产物**，并以 `cata_hash` 为缓存粒度（同组 design_refno 共享）。Generator 专注从 Foyer 取数据，避免在生成阶段直查 SurrealDB。
+- **所有 foyer cache payload 统一迁移为 rkyv**；旧的 JSON payload 读到即视为 miss（方案1：不做兼容解码），由上游重建并 writeback。
 
 ## 1. 背景与问题
 参考既有方案文档 `C:\Users\Administrator\.windsurf\plans\pipeline-refactor-877355.md`，当前瓶颈主要为：
@@ -30,8 +31,8 @@
 
 ### 2.2 非目标（当前阶段不做）
 - N1：不追求 per-refno 细粒度事件流（避免调度复杂度）。
-- N2：CATE 不缓存 `resolve_desi_comp` 产物（CSG/ptset/已解表达式结果），只缓存查询中间数据。
-- N3：不强行一次到位把所有查询都改为批量 SQL；先跑通流水线，再分项替换。
+- N2：不强行一次到位把所有查询都改为批量 SQL；先跑通流水线，再分项替换。
+- N3：不提供旧 JSON cache 的向后兼容解码（读到即 miss），以减少迁移期复杂度。
 
 ## 3. 总体架构（方案B：Key 驱动 + Foyer 中枢）
 
@@ -110,17 +111,31 @@ pub struct ReadyBatchKey {
 - 其它轻量字段：visible、noun/type 等
 
 不包含：
-- `resolve_desi_comp` 的产物（CSG shapes、ptset_map、已解析表达式结果等）。
+- `resolve_desi_comp` 的产物（该产物将由单独的 `cata_resolve_cache` 管理，按 `cata_hash` 缓存）。
 
-### 4.4 CATE fallback + writeback（M3a 决策）
+### 4.4 CATE：新增 CataResolveCache（按 cata_hash 缓存 resolve 产物）
+新增：`src/fast_model/foyer_cache/cata_resolve_cache.rs`
+
+内容范围（`resolve_desi_comp` 的可复用产物，面向后续“实例生成/mesh 生成”）：
+- `ptset_map`（`axis_items`）：`BTreeMap<i32, CateAxisParam>` 等价结构
+- `prepared_shapes`：将 `resolve_desi_comp -> CateCsgShape -> EleInstGeo` 的“单位复用/scale 归一”逻辑固化为可缓存的 shape 列表：
+  - `geo_hash`、`unit_flag`、`geo_param`（unit 参数）、`local_transform`（t/r/s 数组）、`visible/is_tubi/is_ngmr`、`pts`
+- `has_solid`：该 `cata_hash` 是否包含 Pos 实体（用于 `EleGeosInfo.is_solid`）
+
+Key 设计：
+- key = `(dbnum, cata_hash)`
+- 说明：同一 `cata_hash` 可能对应多个 design_refno；只需选择一个“代表 refno”执行 `resolve_desi_comp`，其产物即可复用到同组其余元素。
+
+### 4.5 CATE fallback + writeback（M3a 决策）
 M3a 允许：
-- cache miss 时回查 SurrealDB
-- 默认 writeback：将回查得到的“查询中间数据”写回 `CateQueryCacheManager`
+- cache miss 时回查 SurrealDB（prefetch 阶段）
+- 默认 writeback：将回查得到的 `cate_query_cache` + `cata_resolve_cache` 写回 Foyer
 
 建议开关（命名可按项目习惯再对齐）：
 - `AIOS_CATE_QUERY_CACHE=1`
 - `AIOS_CATE_QUERY_CACHE_WRITEBACK=1`（默认开）
 - `AIOS_CATE_QUERY_CACHE_ONLY=1`（M3b 再默认开）
+ - `AIOS_CACHE_CODEC=rkyv`（默认 rkyv；读到非 rkyv payload 视为 miss）
 
 ## 5. 并行与限流设计
 
@@ -165,9 +180,9 @@ M2 开始按项替换为批量 SurrealQL：
 ### M4：模型 -> mesh 按 dbnum 流水触发
 - dbnum 完成即触发 mesh worker（cache-only 路径优先）
 
-### M3b（可选后续）：CATE 严格 cache-only（仍不缓存产物）
-- 将 `resolve_desi_comp` 依赖的 raw 数据也纳入可预取/可装载的 bundle
+### M3b（可选后续）：CATE 严格 cache-only（resolve 产物 + query 数据均必须命中）
 - 彻底关闭 DB fallback（`*_CACHE_ONLY=1`）
+- 生成阶段不再允许调用 `resolve_desi_comp`
 
 ## 8. Task List（按模块拆分）
 
@@ -208,7 +223,8 @@ M2 开始按项替换为批量 SurrealQL：
 - 回滚：保留旧路径开关（禁用 pipeline 或禁用 cache-only），快速切回稳定模式。
 
 ## 11. 已确认决策（冻结）
-- CATE：仅缓存“查询中间数据”，不缓存 `resolve_desi_comp` 产物。
-- M3a：允许 DB fallback。
+- CATE：必须缓存 `resolve_desi_comp` 产物，按 `cata_hash` 粒度保存到 `cata_resolve_cache`。
+- 所有 foyer cache payload：统一使用 rkyv；读到旧 JSON payload 一律视为 miss（方案1），由上游重建并 writeback。
+- M3a：允许 DB fallback（仅在 prefetch 阶段）。
 - M3a：默认 writeback（fallback 后写回 Foyer Cache）。
 

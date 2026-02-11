@@ -5,15 +5,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::fs;
 
-use aios_core::geometry::{EleGeosInfo, EleInstGeosData, ShapeInstancesData};
+use aios_core::geometry::{EleGeosInfo, EleInstGeo, EleInstGeosData, GeoBasicType, ShapeInstancesData};
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::parsed_data::CateAxisParam;
 use aios_core::RefnoEnum;
+use bevy_transform::components::Transform;
+use glam::Vec3;
 use foyer::{DirectFsDeviceOptionsBuilder, HybridCache, HybridCacheBuilder};
 use serde::{Deserialize, Serialize};
 use twox_hash::XxHash64;
 use crate::data_interface::db_meta_manager::db_meta;
 use anyhow::Context;
+
+use crate::fast_model::foyer_cache::rkyv_payload;
 
 #[derive(Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstanceCacheKey {
@@ -27,7 +31,7 @@ pub struct InstanceCacheValue {
 }
 
 /// inst_relate_bool 的缓存条目（cache-only：用于 enable_holes=true 时选择 booled mesh）。
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CachedInstRelateBool {
     pub mesh_id: String,
     pub status: String,
@@ -54,6 +58,88 @@ pub struct CachedGeoParam {
     pub geo_hash: u64,
     pub geo_param: PdmsGeoParam,
     pub unit_flag: bool,
+}
+
+// ---------------------------------------------------------------------------
+// rkyv payload（V1 schema）
+// ---------------------------------------------------------------------------
+
+const INSTANCE_CACHE_TYPE_TAG: u16 = 2001;
+const INSTANCE_CACHE_SCHEMA_V1: u16 = 1;
+
+#[derive(Clone, Copy, Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct TransformV1 {
+    t: [f32; 3],
+    r: [f32; 4], // x,y,z,w
+    s: [f32; 3],
+}
+
+impl From<Transform> for TransformV1 {
+    fn from(v: Transform) -> Self {
+        Self {
+            t: [v.translation.x, v.translation.y, v.translation.z],
+            r: [v.rotation.x, v.rotation.y, v.rotation.z, v.rotation.w],
+            s: [v.scale.x, v.scale.y, v.scale.z],
+        }
+    }
+}
+
+impl From<TransformV1> for Transform {
+    fn from(v: TransformV1) -> Self {
+        Transform {
+            translation: Vec3::new(v.t[0], v.t[1], v.t[2]),
+            rotation: glam::Quat::from_xyzw(v.r[0], v.r[1], v.r[2], v.r[3]),
+            scale: Vec3::new(v.s[0], v.s[1], v.s[2]),
+        }
+    }
+}
+
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct EleGeosInfoV1 {
+    refno: RefnoEnum,
+    sesno: i32,
+    owner_refno: RefnoEnum,
+    owner_type: String,
+    cata_hash: Option<String>,
+    visible: bool,
+    generic_type: aios_core::pdms_types::PdmsGenericType,
+    world_transform: TransformV1,
+    ptset_items: Vec<(i32, CateAxisParam)>,
+    is_solid: bool,
+}
+
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct EleInstGeoV1 {
+    geo_hash: u64,
+    refno: RefnoEnum,
+    pts: Vec<i32>,
+    geo_transform: TransformV1,
+    geo_param: PdmsGeoParam,
+    visible: bool,
+    is_tubi: bool,
+    geo_type: GeoBasicType,
+    cata_neg_refnos: Vec<RefnoEnum>,
+}
+
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct EleInstGeosDataV1 {
+    inst_key: String,
+    refno: RefnoEnum,
+    insts: Vec<EleInstGeoV1>,
+    type_name: String,
+}
+
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct CachedInstanceBatchV1 {
+    dbnum: u32,
+    batch_id: String,
+    created_at: i64,
+    inst_info_items: Vec<(RefnoEnum, EleGeosInfoV1)>,
+    inst_geos_items: Vec<(String, EleInstGeosDataV1)>,
+    inst_tubi_items: Vec<(RefnoEnum, EleGeosInfoV1)>,
+    neg_relate_items: Vec<(RefnoEnum, Vec<RefnoEnum>)>,
+    ngmr_neg_relate_items: Vec<(RefnoEnum, Vec<(RefnoEnum, RefnoEnum)>)>,
+    inst_relate_bool_items: Vec<(RefnoEnum, CachedInstRelateBool)>,
 }
 
 #[derive(Default, Serialize, Deserialize, Clone)]
@@ -115,27 +201,108 @@ impl InstanceCacheManager {
             dbnum: batch.dbnum,
             batch_id: batch.batch_id.clone(),
         };
+
+        // 迁移策略（方案1）：payload 统一写 rkyv；旧 JSON cache 读到即 miss，由上游重建。
         let ser_start = std::time::Instant::now();
-        let payload = match serde_json::to_vec(&batch) {
+        let v1 = CachedInstanceBatchV1 {
+            dbnum: batch.dbnum,
+            batch_id: batch.batch_id.clone(),
+            created_at: batch.created_at,
+            inst_info_items: batch
+                .inst_info_map
+                .into_iter()
+                .map(|(k, v)| {
+                    let ptset_items = v.ptset_map.into_iter().collect::<Vec<_>>();
+                    (
+                        k,
+                        EleGeosInfoV1 {
+                            refno: v.refno,
+                            sesno: v.sesno,
+                            owner_refno: v.owner_refno,
+                            owner_type: v.owner_type,
+                            cata_hash: v.cata_hash,
+                            visible: v.visible,
+                            generic_type: v.generic_type,
+                            world_transform: v.world_transform.into(),
+                            ptset_items,
+                            is_solid: v.is_solid,
+                        },
+                    )
+                })
+                .collect(),
+            inst_geos_items: batch
+                .inst_geos_map
+                .into_iter()
+                .map(|(k, v)| {
+                    let insts = v
+                        .insts
+                        .into_iter()
+                        .map(|g| EleInstGeoV1 {
+                            geo_hash: g.geo_hash,
+                            refno: g.refno,
+                            pts: g.pts,
+                            geo_transform: g.geo_transform.into(),
+                            geo_param: g.geo_param,
+                            visible: g.visible,
+                            is_tubi: g.is_tubi,
+                            geo_type: g.geo_type,
+                            cata_neg_refnos: g.cata_neg_refnos,
+                        })
+                        .collect();
+                    (
+                        k,
+                        EleInstGeosDataV1 {
+                            inst_key: v.inst_key,
+                            refno: v.refno,
+                            insts,
+                            type_name: v.type_name,
+                        },
+                    )
+                })
+                .collect(),
+            inst_tubi_items: batch
+                .inst_tubi_map
+                .into_iter()
+                .map(|(k, v)| {
+                    let ptset_items = v.ptset_map.into_iter().collect::<Vec<_>>();
+                    (
+                        k,
+                        EleGeosInfoV1 {
+                            refno: v.refno,
+                            sesno: v.sesno,
+                            owner_refno: v.owner_refno,
+                            owner_type: v.owner_type,
+                            cata_hash: v.cata_hash,
+                            visible: v.visible,
+                            generic_type: v.generic_type,
+                            world_transform: v.world_transform.into(),
+                            ptset_items,
+                            is_solid: v.is_solid,
+                        },
+                    )
+                })
+                .collect(),
+            neg_relate_items: batch.neg_relate_map.into_iter().collect(),
+            ngmr_neg_relate_items: batch.ngmr_neg_relate_map.into_iter().collect(),
+            inst_relate_bool_items: batch.inst_relate_bool_map.into_iter().collect(),
+        };
+
+        let payload = match rkyv_payload::encode(INSTANCE_CACHE_TYPE_TAG, INSTANCE_CACHE_SCHEMA_V1, &v1) {
             Ok(bytes) => bytes,
             Err(e) => {
                 eprintln!(
-                    "[cache] 序列化失败，跳过写入: dbnum={}, batch_id={}, err={}",
-                    batch.dbnum, batch.batch_id, e
+                    "[cache] rkyv 序列化失败，跳过写入: dbnum={}, batch_id={}, err={}",
+                    key.dbnum, key.batch_id, e
                 );
                 return;
             }
         };
         let ser_ms = ser_start.elapsed().as_millis();
         #[cfg(feature = "profile")]
-        tracing::info!(
-            payload_bytes = payload.len(),
-            serialize_ms = ser_ms as u64,
-            "cache_insert_batch serialized"
-        );
+        tracing::info!(payload_bytes = payload.len(), serialize_ms = ser_ms as u64, "cache_insert_batch rkyv serialized");
         let value = InstanceCacheValue { payload };
-        let dbnum = batch.dbnum;
-        let batch_id = batch.batch_id.clone();
+        let dbnum = key.dbnum;
+        let batch_id = key.batch_id.clone();
         self.cache.insert(key, value);
         if let Err(e) = self.update_index(dbnum, &batch_id) {
             eprintln!(
@@ -183,26 +350,120 @@ impl InstanceCacheManager {
             Ok(Some(entry)) => {
                 let payload = &entry.value().payload;
                 let deser_start = std::time::Instant::now();
-                match serde_json::from_slice::<CachedInstanceBatch>(payload) {
-                    Ok(batch) => {
-                        #[cfg(feature = "profile")]
-                        tracing::debug!(
-                            payload_bytes = payload.len(),
-                            deserialize_ms = deser_start.elapsed().as_millis() as u64,
-                            "cache_get_batch deserialized"
-                        );
-                        Some(batch)
-                    }
+                let v1 = match rkyv_payload::decode::<CachedInstanceBatchV1>(
+                    INSTANCE_CACHE_TYPE_TAG,
+                    INSTANCE_CACHE_SCHEMA_V1,
+                    payload,
+                ) {
+                    Ok(v) => v,
                     Err(e) => {
+                        // 迁移策略（方案1）：旧 JSON payload / schema 不匹配 一律视为 miss。
                         eprintln!(
-                            "[cache] 反序列化失败: dbnum={}, batch_id={}, err={}",
+                            "[cache] payload decode miss: dbnum={}, batch_id={}, err={}",
                             dbnum, batch_id, e
                         );
-                        // 诊断：dump 原始 payload 并定位 null 字段
-                        Self::diagnose_null_fields(dbnum, batch_id, payload);
-                        None
+                        return None;
                     }
+                };
+
+                let mut inst_info_map: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
+                for (k, info) in v1.inst_info_items {
+                    let mut ptset_map = std::collections::BTreeMap::new();
+                    for (n, p) in info.ptset_items {
+                        ptset_map.insert(n, p);
+                    }
+                    inst_info_map.insert(
+                        k,
+                        EleGeosInfo {
+                            refno: info.refno,
+                            sesno: info.sesno,
+                            owner_refno: info.owner_refno,
+                            owner_type: info.owner_type,
+                            cata_hash: info.cata_hash,
+                            visible: info.visible,
+                            generic_type: info.generic_type,
+                            world_transform: info.world_transform.into(),
+                            ptset_map,
+                            is_solid: info.is_solid,
+                            ..Default::default()
+                        },
+                    );
                 }
+
+                let mut inst_tubi_map: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
+                for (k, info) in v1.inst_tubi_items {
+                    let mut ptset_map = std::collections::BTreeMap::new();
+                    for (n, p) in info.ptset_items {
+                        ptset_map.insert(n, p);
+                    }
+                    inst_tubi_map.insert(
+                        k,
+                        EleGeosInfo {
+                            refno: info.refno,
+                            sesno: info.sesno,
+                            owner_refno: info.owner_refno,
+                            owner_type: info.owner_type,
+                            cata_hash: info.cata_hash,
+                            visible: info.visible,
+                            generic_type: info.generic_type,
+                            world_transform: info.world_transform.into(),
+                            ptset_map,
+                            is_solid: info.is_solid,
+                            ..Default::default()
+                        },
+                    );
+                }
+
+                let mut inst_geos_map: HashMap<String, EleInstGeosData> = HashMap::new();
+                for (k, gd) in v1.inst_geos_items {
+                    let insts = gd
+                        .insts
+                        .into_iter()
+                        .map(|g| EleInstGeo {
+                            geo_hash: g.geo_hash,
+                            refno: g.refno,
+                            pts: g.pts,
+                            aabb: None,
+                            geo_transform: g.geo_transform.into(),
+                            geo_param: g.geo_param,
+                            visible: g.visible,
+                            is_tubi: g.is_tubi,
+                            geo_type: g.geo_type,
+                            cata_neg_refnos: g.cata_neg_refnos,
+                        })
+                        .collect();
+
+                    inst_geos_map.insert(
+                        k,
+                        EleInstGeosData {
+                            inst_key: gd.inst_key,
+                            refno: gd.refno,
+                            insts,
+                            aabb: None,
+                            type_name: gd.type_name,
+                            ..Default::default()
+                        },
+                    );
+                }
+
+                #[cfg(feature = "profile")]
+                tracing::debug!(
+                    payload_bytes = payload.len(),
+                    deserialize_ms = deser_start.elapsed().as_millis() as u64,
+                    "cache_get_batch rkyv deserialized"
+                );
+
+                Some(CachedInstanceBatch {
+                    dbnum: v1.dbnum,
+                    batch_id: v1.batch_id,
+                    created_at: v1.created_at,
+                    inst_info_map,
+                    inst_geos_map,
+                    inst_tubi_map,
+                    neg_relate_map: v1.neg_relate_items.into_iter().collect(),
+                    ngmr_neg_relate_map: v1.ngmr_neg_relate_items.into_iter().collect(),
+                    inst_relate_bool_map: v1.inst_relate_bool_items.into_iter().collect(),
+                })
             }
             Ok(None) => None,
             Err(e) => {
@@ -211,64 +472,6 @@ impl InstanceCacheManager {
                     dbnum, batch_id, e
                 );
                 None
-            }
-        }
-    }
-
-    /// 诊断 null 字段：只在第一次失败时执行，dump 原始 JSON 并定位 null 出现的位置。
-    fn diagnose_null_fields(dbnum: u32, batch_id: &str, payload: &[u8]) {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static DIAGNOSED: AtomicBool = AtomicBool::new(false);
-        if DIAGNOSED.swap(true, Ordering::SeqCst) {
-            return; // 只诊断一次
-        }
-
-        eprintln!("[cache-diag] payload 大小: {} bytes", payload.len());
-
-        // 1) dump 原始 JSON 到文件
-        let dump_path = format!("output/cache_dump_{}_{}.json", dbnum, batch_id);
-        if let Err(e) = std::fs::write(&dump_path, payload) {
-            eprintln!("[cache-diag] 写 dump 文件失败: {}", e);
-        } else {
-            eprintln!("[cache-diag] 已 dump 到: {}", dump_path);
-        }
-
-        // 2) 用 serde_json::Value 宽松解析
-        let Ok(val) = serde_json::from_slice::<serde_json::Value>(payload) else {
-            eprintln!("[cache-diag] 连 Value 也无法解析，可能不是合法 JSON");
-            return;
-        };
-
-        // 3) 在整个 JSON 树中搜索 null 值，报告路径
-        fn find_nulls(val: &serde_json::Value, path: &str, results: &mut Vec<String>, limit: usize) {
-            if results.len() >= limit { return; }
-            match val {
-                serde_json::Value::Null => {
-                    results.push(path.to_string());
-                }
-                serde_json::Value::Object(map) => {
-                    for (k, v) in map {
-                        find_nulls(v, &format!("{}.{}", path, k), results, limit);
-                    }
-                }
-                serde_json::Value::Array(arr) => {
-                    for (i, v) in arr.iter().enumerate() {
-                        find_nulls(v, &format!("{}[{}]", path, i), results, limit);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let mut null_paths = Vec::new();
-        find_nulls(&val, "$", &mut null_paths, 50);
-
-        if null_paths.is_empty() {
-            eprintln!("[cache-diag] 未发现 null 字段（可能是类型标签不匹配等其他原因）");
-        } else {
-            eprintln!("[cache-diag] 发现 {} 个 null 字段:", null_paths.len());
-            for p in &null_paths {
-                eprintln!("[cache-diag]   {}", p);
             }
         }
     }

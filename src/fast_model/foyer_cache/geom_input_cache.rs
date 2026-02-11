@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 use twox_hash::XxHash64;
 
+use super::rkyv_payload;
+
 // ---------------------------------------------------------------------------
 // 数据结构
 // ---------------------------------------------------------------------------
@@ -93,6 +95,107 @@ pub struct GeomInputBatch {
     pub created_at: i64,
     pub loop_inputs: HashMap<RefnoEnum, LoopInput>,
     pub prim_inputs: HashMap<RefnoEnum, PrimInput>,
+}
+
+// ---------------------------------------------------------------------------
+// rkyv payload（V1 schema）
+// ---------------------------------------------------------------------------
+
+const GEOM_INPUT_TYPE_TAG: u16 = 1001;
+const GEOM_INPUT_SCHEMA_V1: u16 = 1;
+
+#[derive(Clone, Copy, Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct Vec3V1 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl From<Vec3> for Vec3V1 {
+    fn from(v: Vec3) -> Self {
+        Self { x: v.x, y: v.y, z: v.z }
+    }
+}
+
+impl From<Vec3V1> for Vec3 {
+    fn from(v: Vec3V1) -> Self {
+        Vec3::new(v.x, v.y, v.z)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct TransformV1 {
+    t: [f32; 3],
+    r: [f32; 4], // x,y,z,w
+    s: [f32; 3],
+}
+
+impl From<Transform> for TransformV1 {
+    fn from(v: Transform) -> Self {
+        Self {
+            t: [v.translation.x, v.translation.y, v.translation.z],
+            r: [v.rotation.x, v.rotation.y, v.rotation.z, v.rotation.w],
+            s: [v.scale.x, v.scale.y, v.scale.z],
+        }
+    }
+}
+
+impl From<TransformV1> for Transform {
+    fn from(v: TransformV1) -> Self {
+        Transform {
+            translation: Vec3::new(v.t[0], v.t[1], v.t[2]),
+            rotation: glam::Quat::from_xyzw(v.r[0], v.r[1], v.r[2], v.r[3]),
+            scale: Vec3::new(v.s[0], v.s[1], v.s[2]),
+        }
+    }
+}
+
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct LoopInputV1 {
+    refno: RefnoEnum,
+    attmap: NamedAttrMap,
+    world_transform: TransformV1,
+    loops: Vec<Vec<Vec3V1>>,
+    height: f32,
+    owner_refno: RefnoEnum,
+    owner_type: String,
+    visible: bool,
+    generic_type: PdmsGenericType,
+    neg_refnos: Vec<RefnoEnum>,
+    cmpf_neg_refnos: Vec<RefnoEnum>,
+}
+
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct PrimPolyPolygonV1 {
+    loops: Vec<Vec<Vec3V1>>,
+}
+
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct PrimPolyExtraV1 {
+    polygons: Vec<PrimPolyPolygonV1>,
+    is_polyhe: bool,
+}
+
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct PrimInputV1 {
+    refno: RefnoEnum,
+    attmap: NamedAttrMap,
+    world_transform: TransformV1,
+    owner_refno: RefnoEnum,
+    owner_type: String,
+    visible: bool,
+    generic_type: PdmsGenericType,
+    neg_refnos: Vec<RefnoEnum>,
+    poly_extra: Option<PrimPolyExtraV1>,
+}
+
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct GeomInputBatchV1 {
+    dbnum: u32,
+    batch_id: String,
+    created_at: i64,
+    loop_inputs: Vec<LoopInputV1>,
+    prim_inputs: Vec<PrimInputV1>,
 }
 
 // ---------------------------------------------------------------------------
@@ -166,11 +269,66 @@ impl GeomInputCacheManager {
             dbnum: batch.dbnum,
             batch_id: batch.batch_id.clone(),
         };
-        let payload = match serde_json::to_vec(&batch) {
+        let v1 = GeomInputBatchV1 {
+            dbnum: batch.dbnum,
+            batch_id: batch.batch_id.clone(),
+            created_at: batch.created_at,
+            loop_inputs: batch
+                .loop_inputs
+                .into_iter()
+                .map(|(refno, v)| LoopInputV1 {
+                    refno,
+                    attmap: v.attmap,
+                    world_transform: v.world_transform.into(),
+                    loops: v
+                        .loops
+                        .into_iter()
+                        .map(|lp| lp.into_iter().map(Vec3V1::from).collect())
+                        .collect(),
+                    height: v.height,
+                    owner_refno: v.owner_refno,
+                    owner_type: v.owner_type,
+                    visible: v.visible,
+                    generic_type: v.generic_type,
+                    neg_refnos: v.neg_refnos,
+                    cmpf_neg_refnos: v.cmpf_neg_refnos,
+                })
+                .collect(),
+            prim_inputs: batch
+                .prim_inputs
+                .into_iter()
+                .map(|(refno, v)| PrimInputV1 {
+                    refno,
+                    attmap: v.attmap,
+                    world_transform: v.world_transform.into(),
+                    owner_refno: v.owner_refno,
+                    owner_type: v.owner_type,
+                    visible: v.visible,
+                    generic_type: v.generic_type,
+                    neg_refnos: v.neg_refnos,
+                    poly_extra: v.poly_extra.map(|pe| PrimPolyExtraV1 {
+                        polygons: pe
+                            .polygons
+                            .into_iter()
+                            .map(|p| PrimPolyPolygonV1 {
+                                loops: p
+                                    .loops
+                                    .into_iter()
+                                    .map(|lp| lp.into_iter().map(Vec3V1::from).collect())
+                                    .collect(),
+                            })
+                            .collect(),
+                        is_polyhe: pe.is_polyhe,
+                    }),
+                })
+                .collect(),
+        };
+
+        let payload = match rkyv_payload::encode(GEOM_INPUT_TYPE_TAG, GEOM_INPUT_SCHEMA_V1, &v1) {
             Ok(bytes) => bytes,
             Err(e) => {
                 eprintln!(
-                    "[geom_input_cache] 序列化失败: dbnum={}, batch_id={}, err={}",
+                    "[geom_input_cache] rkyv 序列化失败: dbnum={}, batch_id={}, err={}",
                     batch.dbnum, batch.batch_id, e
                 );
                 return;
@@ -197,14 +355,86 @@ impl GeomInputCacheManager {
         match self.cache.get(&key).await {
             Ok(Some(entry)) => {
                 let payload = &entry.value().payload;
-                serde_json::from_slice::<GeomInputBatch>(payload)
-                    .map_err(|e| {
+                let v1 = match rkyv_payload::decode::<GeomInputBatchV1>(
+                    GEOM_INPUT_TYPE_TAG,
+                    GEOM_INPUT_SCHEMA_V1,
+                    payload,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // 迁移策略（方案1）：旧 JSON payload / schema 不匹配 一律视为 miss。
                         eprintln!(
-                            "[geom_input_cache] 反序列化失败: dbnum={}, batch_id={}, err={}",
+                            "[geom_input_cache] payload decode miss: dbnum={}, batch_id={}, err={}",
                             dbnum, batch_id, e
                         );
-                    })
-                    .ok()
+                        return None;
+                    }
+                };
+
+                let mut loop_inputs = HashMap::new();
+                for v in v1.loop_inputs {
+                    let refno: RefnoEnum = v.refno;
+                    loop_inputs.insert(
+                        refno,
+                        LoopInput {
+                            refno,
+                            attmap: v.attmap,
+                            world_transform: v.world_transform.into(),
+                            loops: v
+                                .loops
+                                .into_iter()
+                                .map(|lp| lp.into_iter().map(Vec3::from).collect())
+                                .collect(),
+                            height: v.height,
+                            owner_refno: v.owner_refno,
+                            owner_type: v.owner_type,
+                            visible: v.visible,
+                            generic_type: v.generic_type,
+                            neg_refnos: v.neg_refnos,
+                            cmpf_neg_refnos: v.cmpf_neg_refnos,
+                        },
+                    );
+                }
+
+                let mut prim_inputs = HashMap::new();
+                for v in v1.prim_inputs {
+                    let refno: RefnoEnum = v.refno;
+                    prim_inputs.insert(
+                        refno,
+                        PrimInput {
+                            refno,
+                            attmap: v.attmap,
+                            world_transform: v.world_transform.into(),
+                            owner_refno: v.owner_refno,
+                            owner_type: v.owner_type,
+                            visible: v.visible,
+                            generic_type: v.generic_type,
+                            neg_refnos: v.neg_refnos,
+                            poly_extra: v.poly_extra.map(|pe| PrimPolyExtra {
+                                polygons: pe
+                                    .polygons
+                                    .into_iter()
+                                    .map(|p| PrimPolyPolygon {
+                                        loops: p
+                                            .loops
+                                            .into_iter()
+                                            .map(|lp| lp.into_iter().map(Vec3::from).collect())
+                                            .collect(),
+                                    })
+                                    .collect(),
+                                is_polyhe: pe.is_polyhe,
+                            }),
+                        },
+                    );
+                }
+
+                Some(GeomInputBatch {
+                    dbnum: v1.dbnum,
+                    batch_id: v1.batch_id,
+                    created_at: v1.created_at,
+                    loop_inputs,
+                    prim_inputs,
+                })
             }
             Ok(None) => None,
             Err(e) => {

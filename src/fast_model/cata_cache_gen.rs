@@ -7,6 +7,7 @@
 
 use crate::fast_model::gen_model::cate_single::{CateCsgShapeMap, gen_cata_single_geoms};
 use crate::fast_model::gen_model::utilities::is_valid_cata_hash;
+use crate::fast_model::foyer_cache::cata_resolve_cache::{CataResolveCacheManager, CataResolvedComp, PreparedInstGeo};
 use crate::fast_model::instance_cache::InstanceCacheManager;
 use crate::fast_model::refno_errors::{RefnoErrorKind, RefnoErrorStage, record_refno_error};
 use crate::fast_model::{SEND_INST_SIZE, get_generic_type, shared};
@@ -20,6 +21,7 @@ use aios_core::geometry::{EleGeosInfo, EleInstGeo, EleInstGeosData, GeoBasicType
 use aios_core::RefnoEnum;
 use aios_core::prim_geo::category::CateCsgShape;
 use bevy_transform::components::Transform;
+use chrono::Utc;
 use dashmap::DashMap;
 use glam::Vec3;
 use std::collections::{BTreeMap, HashMap};
@@ -43,6 +45,91 @@ pub struct SimpleBranOutcome {
     pub time_stats: HashMap<String, u64>,
     pub bran_count: usize,
     pub elapsed_ms: u128,
+}
+
+fn build_prepared_inst_geos_from_shapes(shapes: Vec<CateCsgShape>) -> (Vec<PreparedInstGeo>, bool) {
+    let mut out: Vec<PreparedInstGeo> = Vec::new();
+    let mut has_solid = false;
+
+    for shape in shapes.into_iter() {
+        let CateCsgShape {
+            refno: geom_refno,
+            csg_shape,
+            transform: shape_transform,
+            visible: shape_visible,
+            is_tubi,
+            pts,
+            is_ngmr,
+            ..
+        } = shape;
+
+        // resolve_desi_comp 的缓存只保存“可生成”的条目；无效几何直接跳过。
+        if !csg_shape.check_valid() {
+            continue;
+        }
+
+        // 获取形状自身的变换（包含 scale）
+        let shape_trans = csg_shape.get_trans();
+        let geo_hash = csg_shape.hash_unit_mesh_params();
+        let unit_flag = csg_shape.is_reuse_unit();
+
+        // 合并变换：shape_transform 是元件变换，shape_trans 是形状自身变换
+        let translation =
+            shape_transform.translation + shape_transform.rotation * shape_trans.translation;
+        let rotation = shape_transform.rotation;
+        let scale = shape_trans.scale;
+
+        let mut transform = Transform {
+            translation,
+            rotation,
+            scale,
+        };
+
+        if transform.translation.is_nan() || transform.rotation.is_nan() || transform.scale.is_nan()
+        {
+            continue;
+        }
+
+        // 获取 geo_param
+        let mut geo_param = csg_shape
+            .convert_to_geo_param()
+            .unwrap_or(PdmsGeoParam::Unknown);
+
+        // unit_flag=true 时，写入"单位参数"，保留 transform.scale
+        if unit_flag {
+            geo_param = csg_shape
+                .gen_unit_shape()
+                .convert_to_geo_param()
+                .unwrap_or(geo_param);
+        }
+
+        // 统一处理 transform.scale
+        crate::fast_model::reuse_unit::normalize_transform_scale(&mut transform, unit_flag, geo_hash);
+
+        let geo_type = if is_ngmr {
+            GeoBasicType::CataCrossNeg
+        } else {
+            GeoBasicType::Pos
+        };
+
+        if geo_type == GeoBasicType::Pos {
+            has_solid = true;
+        }
+
+        out.push(PreparedInstGeo {
+            geo_hash,
+            geom_refno,
+            pts,
+            geo_transform: transform,
+            geo_param,
+            shape_visible,
+            is_tubi,
+            geo_type,
+            unit_flag,
+        });
+    }
+
+    (out, has_solid)
 }
 
 /// foyer cache 专用：仅生成 CATA 几何体，不收集 tubi 相关信息
@@ -78,6 +165,11 @@ pub async fn gen_cata_geos_for_cache(
             elapsed_ms: total_t.elapsed().as_millis(),
         });
     }
+
+    let cata_resolve_cache = Arc::new(
+        CataResolveCacheManager::new(&db_option.get_foyer_cache_dir().join("cata_resolve_cache"))
+            .await?,
+    );
 
     // 计算批次
     let mut batch_chunks_cnt = 4usize.min(unique_cata_cnt.max(1));
@@ -170,162 +262,126 @@ pub async fn gen_cata_geos_for_cache(
                 continue;
             }
 
-            // 需要生成元件库几何
-            let ele_refno = match target_group_refnos.first().copied() {
-                Some(r) => r,
-                None => continue,
-            };
-
-            let t_get_cat_refno = Instant::now();
-            let result = aios_core::get_cat_refno(ele_refno).await;
-            let cata_refno = match result {
-                Ok(Some(refno)) => refno,
-                _ => continue,
-            };
-            db_time_get_cat_refno += t_get_cat_refno.elapsed().as_millis();
-
-            let t_query_single = Instant::now();
-            let gmse_refno = aios_core::query_single_by_paths(
-                cata_refno,
-                &["->GMRE", "->GSTR"],
-                &["REFNO"],
-            )
-            .await
-            .map(|x| x.get_refno_or_default());
-            db_time_query_single += t_query_single.elapsed().as_millis();
-
-            let valid_gmse = gmse_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
-            if !valid_gmse {
-                let ngmr_refno =
-                    aios_core::query_single_by_paths(cata_refno, &["->NGMR"], &["REFNO"])
-                        .await
-                        .map(|x| x.get_refno_or_default());
-                let valid_ngmr = ngmr_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
-                if !valid_ngmr {
-                    continue;
+            // 需要生成元件库几何：优先从 foyer cache 读取 resolve_desi_comp 产物（按 cata_hash）
+            let resolved_comp: CataResolvedComp = match cata_resolve_cache.get(&cata_hash).await {
+                Some(v) => {
+                    debug_model_debug!(
+                        "[gen_cata_geos_for_cache][cata_hash={}] resolve_desi_comp cache hit",
+                        cata_hash
+                    );
+                    v
                 }
-            }
+                None => {
+                    debug_model_debug!(
+                        "[gen_cata_geos_for_cache][cata_hash={}] resolve_desi_comp cache miss (compute + writeback)",
+                        cata_hash
+                    );
+                    // miss：走旧链路计算一次，并回灌缓存
+                    let ele_refno = match target_group_refnos.first().copied() {
+                        Some(r) => r,
+                        None => continue,
+                    };
 
-            let csg_shapes_map = CateCsgShapeMap::new();
-            let design_axis_map = DashMap::new();
+                    let t_get_cat_refno = Instant::now();
+                    let result = aios_core::get_cat_refno(ele_refno).await;
+                    let cata_refno = match result {
+                        Ok(Some(refno)) => refno,
+                        _ => continue,
+                    };
+                    db_time_get_cat_refno += t_get_cat_refno.elapsed().as_millis();
 
-            let t_get_named_attmap = Instant::now();
-            let _desi_att = match aios_core::get_named_attmap(ele_refno).await {
-                Ok(att) => att,
-                Err(_) => continue,
+                    let t_query_single = Instant::now();
+                    let gmse_refno = aios_core::query_single_by_paths(
+                        cata_refno,
+                        &["->GMRE", "->GSTR"],
+                        &["REFNO"],
+                    )
+                    .await
+                    .map(|x| x.get_refno_or_default());
+                    db_time_query_single += t_query_single.elapsed().as_millis();
+
+                    let valid_gmse = gmse_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
+                    if !valid_gmse {
+                        let ngmr_refno =
+                            aios_core::query_single_by_paths(cata_refno, &["->NGMR"], &["REFNO"])
+                                .await
+                                .map(|x| x.get_refno_or_default());
+                        let valid_ngmr =
+                            ngmr_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
+                        if !valid_ngmr {
+                            continue;
+                        }
+                    }
+
+                    let csg_shapes_map = CateCsgShapeMap::new();
+                    let design_axis_map = DashMap::new();
+
+                    let t_get_named_attmap = Instant::now();
+                    let _desi_att = match aios_core::get_named_attmap(ele_refno).await {
+                        Ok(att) => att,
+                        Err(_) => continue,
+                    };
+                    db_time_get_named_attmap += t_get_named_attmap.elapsed().as_millis();
+
+                    let t_gen_single_geoms = Instant::now();
+                    let r =
+                        gen_cata_single_geoms(ele_refno, &csg_shapes_map, &design_axis_map).await;
+                    db_time_gen_single_geoms += t_gen_single_geoms.elapsed().as_millis();
+
+                    if r.is_err() {
+                        continue;
+                    }
+
+                    // 从 design_axis_map 获取 ptset_map
+                    let ptset_map: BTreeMap<i32, CateAxisParam> = design_axis_map
+                        .get(&ele_refno)
+                        .map(|v| v.clone())
+                        .unwrap_or_default();
+
+                    // 从 csg_shapes_map 获取当前元件的 shapes
+                    let shapes: Vec<CateCsgShape> = csg_shapes_map
+                        .get(&ele_refno)
+                        .map(|v| v.clone())
+                        .unwrap_or_default();
+
+                    let (geos, has_solid) = build_prepared_inst_geos_from_shapes(shapes);
+                    let resolved_comp = CataResolvedComp {
+                        created_at: Utc::now().timestamp_millis(),
+                        ptset_items: ptset_map.into_iter().collect(),
+                        geos,
+                        has_solid,
+                    };
+
+                    cata_resolve_cache.insert(cata_hash.clone(), &resolved_comp);
+                    resolved_comp
+                }
             };
-            db_time_get_named_attmap += t_get_named_attmap.elapsed().as_millis();
 
-            let t_gen_single_geoms = Instant::now();
-            let r = gen_cata_single_geoms(ele_refno, &csg_shapes_map, &design_axis_map).await;
-            db_time_gen_single_geoms += t_gen_single_geoms.elapsed().as_millis();
-
-            if r.is_err() {
-                continue;
-            }
-
-            // 从 design_axis_map 获取 ptset_map
-            let ptset_map: BTreeMap<i32, CateAxisParam> = design_axis_map
-                .get(&ele_refno)
-                .map(|v| v.clone())
-                .unwrap_or_default();
-
-            // ====== 关键修复：处理 csg_shapes_map 创建 EleInstGeo ======
-            // 从 csg_shapes_map 获取当前元件的 shapes
-            let shapes: Vec<CateCsgShape> = csg_shapes_map
-                .get(&ele_refno)
-                .map(|v| v.clone())
-                .unwrap_or_default();
-
-            let mut geo_insts: Vec<EleInstGeo> = Vec::new();
-            let mut has_solid = false;
+            // 运行期过滤：AIOS_RESPECT_TUFL=1 时丢弃 TUFL 不可见的 shape
             let respect_tufl = std::env::var_os("AIOS_RESPECT_TUFL").is_some();
-
-            for shape in shapes.into_iter() {
-                let CateCsgShape {
-                    refno: geom_refno,
-                    csg_shape,
-                    transform: shape_transform,
-                    visible,
-                    is_tubi,
-                    pts,
-                    is_ngmr,
-                    ..
-                } = shape;
-
-                if !csg_shape.check_valid() || (respect_tufl && !visible) {
+            let mut geo_insts: Vec<EleInstGeo> = Vec::new();
+            for g in resolved_comp.geos.iter() {
+                if respect_tufl && !g.shape_visible {
                     continue;
                 }
 
-                // 获取形状自身的变换（包含 scale）
-                let shape_trans = csg_shape.get_trans();
-                let geo_hash = csg_shape.hash_unit_mesh_params();
-                let unit_flag = csg_shape.is_reuse_unit();
-
-                // 合并变换：shape_transform 是元件变换，shape_trans 是形状自身变换
-                let translation = shape_transform.translation
-                    + shape_transform.rotation * shape_trans.translation;
-                let rotation = shape_transform.rotation;
-                let scale = shape_trans.scale;
-
-                let mut transform = Transform {
-                    translation,
-                    rotation,
-                    scale,
-                };
-
-                if transform.translation.is_nan()
-                    || transform.rotation.is_nan()
-                    || transform.scale.is_nan()
-                {
-                    continue;
-                }
-
-                // 获取 geo_param
-                let mut geo_param = csg_shape
-                    .convert_to_geo_param()
-                    .unwrap_or(PdmsGeoParam::Unknown);
-
-                // unit_flag=true 时，写入"单位参数"，保留 transform.scale
-                if unit_flag {
-                    geo_param = csg_shape
-                        .gen_unit_shape()
-                        .convert_to_geo_param()
-                        .unwrap_or(geo_param);
-                }
-
-                // 统一处理 transform.scale
-                crate::fast_model::reuse_unit::normalize_transform_scale(
-                    &mut transform,
-                    unit_flag,
-                    geo_hash,
-                );
-
-                let geo_type = if is_ngmr {
-                    GeoBasicType::CataCrossNeg
-                } else {
-                    GeoBasicType::Pos
-                };
-
-                if geo_type == GeoBasicType::Pos {
-                    has_solid = true;
-                }
-
-                let geom_inst = EleInstGeo {
-                    geo_hash,
-                    refno: geom_refno,
-                    pts,
+                let visible = g.geo_type == GeoBasicType::Pos;
+                geo_insts.push(EleInstGeo {
+                    geo_hash: g.geo_hash,
+                    refno: g.geom_refno,
+                    pts: g.pts.clone(),
                     aabb: None,
-                    geo_transform: transform,
-                    geo_param,
-                    visible: geo_type == GeoBasicType::Pos,
-                    is_tubi,
-                    geo_type,
+                    geo_transform: g.geo_transform,
+                    geo_param: g.geo_param.clone(),
+                    visible,
+                    is_tubi: g.is_tubi,
+                    geo_type: g.geo_type.clone(),
                     cata_neg_refnos: vec![],
-                };
-
-                geo_insts.push(geom_inst);
+                });
             }
+
+            let has_solid = resolved_comp.has_solid;
+            let ptset_map: BTreeMap<i32, CateAxisParam> = resolved_comp.ptset_map();
 
             // 处理 group_refnos 中的每个元件
             for &group_refno in target_group_refnos.iter() {

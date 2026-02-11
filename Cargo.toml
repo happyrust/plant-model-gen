@@ -632,6 +632,13 @@ eframe = { git = "https://github.com/emilk/egui.git", rev = "fa4cfec777c9ea21b86
 
 # aios_core = { path = "../rs-core" }
 
+[patch."https://github.com/happyrust/indextree"]
+indextree = { path = "../indextree/indextree" }
+
+[patch."https://github.com/happyrust/surrealdb"]
+surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "updated", default-features = false, features = ["protocol-ws", "kv-mem"] }
+surrealdb-types = { git = "https://gitee.com/happydpc/surrealdb", branch = "updated" }
+
 
 
 

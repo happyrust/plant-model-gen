@@ -3330,7 +3330,7 @@ pub async fn export_dbnum_instances_json_from_cache(
 ) -> Result<(ExportStats, usize, usize)> {
     use aios_core::geometry::{EleGeosInfo, EleInstGeosData};
     use aios_core::types::PlantAabb;
-    use bevy_transform::prelude::Transform;
+    use aios_core::Transform;
     use crate::fast_model::shared;
     use parry3d::bounding_volume::BoundingVolume;
     use parry3d::math::Point;
@@ -3910,7 +3910,7 @@ pub async fn export_dbnum_instances_json_from_cache(
             .iter()
             .filter_map(|(tubi_refno, info)| {
                 if info.owner_refno == *owner_refno {
-                    Some((*tubi_refno, info.tubi_index))
+                    Some((*tubi_refno, info.tubi.as_ref().and_then(|t| t.index)))
                 } else {
                     None
                 }
@@ -3989,7 +3989,11 @@ pub async fn export_dbnum_instances_json_from_cache(
                 } else {
                     first_inst.geo_hash
                 };
-                let order = info.tubi_index.unwrap_or(tubi_order);
+                let order = info
+                    .tubi
+                    .as_ref()
+                    .and_then(|t| t.index)
+                    .unwrap_or(tubi_order);
                 tubings.push(json!({
                     "refno": tubi_refno.to_string(),
                     "noun": "TUBI",
@@ -4188,9 +4192,11 @@ pub async fn export_dbnum_instances_json_from_cache(
 
         let mut tubi_items: Vec<(&RefnoEnum, &EleGeosInfo)> = inst_tubi_map.iter().collect();
         tubi_items.sort_by(|(ra, ia), (rb, ib)| {
-            ia.tubi_index
+            ia.tubi
+                .as_ref()
+                .and_then(|t| t.index)
                 .unwrap_or(u32::MAX)
-                .cmp(&ib.tubi_index.unwrap_or(u32::MAX))
+                .cmp(&ib.tubi.as_ref().and_then(|t| t.index).unwrap_or(u32::MAX))
                 .then_with(|| ra.to_string().cmp(&rb.to_string()))
         });
 
@@ -4234,14 +4240,21 @@ pub async fn export_dbnum_instances_json_from_cache(
                 })
             } else {
                 // 使用 tubi_info_id 作为备选，或者使用 refno
-                info.tubi_info_id.clone().or_else(|| Some(format!("tubi_{}", tubi_refno)))
+                info.tubi
+                    .as_ref()
+                    .and_then(|t| t.info_id.clone())
+                    .or_else(|| Some(format!("tubi_{}", tubi_refno)))
             };
 
             let Some(geo_hash) = geo_hash else {
                 continue;
             };
 
-            let order = info.tubi_index.unwrap_or(tubi_order);
+            let order = info
+                .tubi
+                .as_ref()
+                .and_then(|t| t.index)
+                .unwrap_or(tubi_order);
             tubings.push(json!({
                 "refno": tubi_refno.to_string(),
                 "noun": "TUBI",

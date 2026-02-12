@@ -6,7 +6,6 @@ use aios_core::pdms_types::*;
 use aios_core::prim_geo::spine::Spine3D;
 use aios_core::*;
 use aios_core::{AttrMap, RefU64Vec};
-use bevy_transform::prelude::*;
 use dashmap::mapref::one::Ref;
 use glam::Vec3;
 

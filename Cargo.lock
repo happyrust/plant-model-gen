@@ -311,9 +311,6 @@ dependencies = [
  "async-recursion",
  "async-trait",
  "base64 0.22.1",
- "bevy_ecs",
- "bevy_math",
- "bevy_transform",
  "bincode 1.3.3",
  "bitflags 2.10.0",
  "cached 0.56.0",
@@ -7481,8 +7478,9 @@ dependencies = [
 
 [[package]]
 name = "manifold-rs"
-version = "0.6.1"
-source = "git+https://github.com/happyrust/manifold-rs?branch=master#703aef3852bef531a203abab5ad8699bc5ea9a93"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "202c4342f13bc6195024a729681f1b959138812682e59ec9435436e46afc4cfd"
 dependencies = [
  "cmake",
  "cxx",

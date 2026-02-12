@@ -1113,6 +1113,7 @@ async fn gen_cata_geos_inner(
                             for &ele_refno in target_group_refnos.iter() {
                                 let t_get_world_transform = Instant::now();
                                 let mut world_transform = match crate::fast_model::transform_cache::get_world_transform_cache_first(
+                                    Some(db_option.as_ref()),
                                     ele_refno,
                                 )
                                 .await
@@ -1530,6 +1531,7 @@ async fn gen_cata_geos_inner(
                         }
                         let t_get_world_transform = Instant::now();
                         let mut world_transform = match crate::fast_model::transform_cache::get_world_transform_cache_first(
+                            Some(db_option.as_ref()),
                             ele_refno,
                         )
                         .await
@@ -1925,6 +1927,7 @@ async fn gen_cata_geos_inner(
                         .unwrap_or_default();
                     let mut origin_trans =
                         match crate::fast_model::transform_cache::get_world_transform_cache_first(
+                            Some(db_option.as_ref()),
                             ele_refno,
                         )
                         .await
@@ -2234,7 +2237,8 @@ async fn gen_cata_geos_inner(
         let t_prefetch = Instant::now();
         let all_child_refnos_vec: Vec<RefnoEnum> = all_child_refnos.iter().copied().collect();
         let prefetch_transforms_global: HashMap<RefnoEnum, Transform> =
-            crate::fast_model::transform_cache::get_world_transforms_batch(
+            crate::fast_model::transform_cache::get_world_transforms_cache_first_batch(
+                Some(db_option.as_ref()),
                 &all_child_refnos_vec,
             )
             .await
@@ -2276,6 +2280,7 @@ async fn gen_cata_geos_inner(
             let t_get_world_transform = Instant::now();
             let branch_transform =
                 match crate::fast_model::transform_cache::get_world_transform_cache_first(
+                    Some(db_option.as_ref()),
                     branch_refno,
                 )
                 .await

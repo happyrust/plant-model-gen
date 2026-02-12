@@ -3,7 +3,7 @@ use std::hash::BuildHasherDefault;
 use std::path::{Path, PathBuf};
 
 use aios_core::{init_surreal, RefnoEnum, SUL_DB, SurrealQueryExt};
-use bevy_transform::prelude::Transform;
+use aios_core::Transform;
 use foyer::{DirectFsDeviceOptionsBuilder, HybridCache, HybridCacheBuilder};
 use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;

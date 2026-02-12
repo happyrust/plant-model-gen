@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use aios_core::pdms_types::PdmsGenericType;
 use aios_core::types::NamedAttrMap;
 use aios_core::RefnoEnum;
-use bevy_transform::components::Transform;
+use aios_core::Transform;
 use foyer::{DirectFsDeviceOptionsBuilder, HybridCache, HybridCacheBuilder};
 use glam::Vec3;
 use serde::{Deserialize, Serialize};

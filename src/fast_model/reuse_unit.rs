@@ -3,7 +3,7 @@
 //! 本模块提供统一的单位几何体复用判断和 transform 处理逻辑，
 //! 消除 prim_model/loop_model/cata_model/primitive_builder 中的重复代码。
 
-use bevy_transform::prelude::Transform;
+use aios_core::Transform;
 use glam::Vec3;
 
 /// 判断 geo_hash 是否为内置单位几何体 (1/2/3)

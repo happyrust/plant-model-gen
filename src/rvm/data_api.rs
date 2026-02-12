@@ -11,7 +11,7 @@ use aios_core::prim_geo::extrusion::Extrusion;
 use aios_core::shape::pdms_shape::PlantMesh;
 use arangors_lite::AqlQuery;
 
-use bevy_transform::prelude::Transform;
+use aios_core::Transform;
 use glam::{Mat3, Mat3A, Quat, Vec3};
 use id_tree::{NodeId, Tree};
 use parry3d::bounding_volume::Aabb;

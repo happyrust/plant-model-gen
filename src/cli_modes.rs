@@ -1497,7 +1497,7 @@ pub async fn export_dbnum_instances_json_mode(
         ) -> anyhow::Result<()> {
             use aios_database::fast_model::foyer_cache::FoyerCacheContext;
             use aios_database::fast_model::gen_model::tree_index_manager::TreeIndexManager;
-            use aios_core::geometry::EleGeosInfo;
+            use aios_core::geometry::{EleGeosInfo, TubiData};
             use aios_core::shape::pdms_shape::RsVec3;
             use aios_core::types::PlantAabb;
             use aios_core::{SUL_DB, SurrealQueryExt};
@@ -1598,10 +1598,13 @@ pub async fn export_dbnum_instances_json_mode(
                         visible: true,
                         aabb: row.world_aabb.map(|a| a.0),
                         world_transform: row.world_trans.unwrap_or_default().0,
-                        tubi_start_pt: row.start_pt.map(|p| p.0),
-                        tubi_end_pt: row.end_pt.map(|p| p.0),
-                        tubi_arrive_refno: Some(row.arrive_refno),
-                        tubi_index: row.index.and_then(|i| u32::try_from(i).ok()),
+                        tubi: Some(TubiData {
+                            start_pt: row.start_pt.map(|p| p.0),
+                            end_pt: row.end_pt.map(|p| p.0),
+                            arrive_refno: Some(row.arrive_refno),
+                            index: row.index.and_then(|i| u32::try_from(i).ok()),
+                            ..Default::default()
+                        }),
                         is_solid: true,
                         ..Default::default()
                     };

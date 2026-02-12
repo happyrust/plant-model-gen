@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicUsize;
 use aios_core::shape::pdms_shape::PlantMesh;
 use aios_core::{GeomInstQuery, RefnoEnum};
 use anyhow::{Context, Result, anyhow};
-use bevy_transform::components::Transform;
+use aios_core::Transform;
 use chrono;
 use dashmap::DashMap;
 use futures::StreamExt;

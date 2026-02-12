@@ -39,7 +39,7 @@ pub use aios_core::update_inst_relate_aabbs_by_refnos;
 // 使用 aios_core 中查询方法的宏
 use aios_core::query_db;
 use anyhow::anyhow;
-use bevy_transform::prelude::Transform;
+use aios_core::Transform;
 use chrono;
 use std::str::FromStr;
 use dashmap::DashMap;

@@ -628,9 +628,11 @@ eframe = { git = "https://github.com/emilk/egui.git", rev = "fa4cfec777c9ea21b86
 
 
 
-# [patch."https://github.com/happyrust/rs-core.git"]
+[patch."https://github.com/happyrust/rs-core"]
+aios_core = { path = "../rs-core" }
 
-# aios_core = { path = "../rs-core" }
+[patch."https://github.com/happyrust/rs-core.git"]
+aios_core = { path = "../rs-core" }
 
 [patch."https://github.com/happyrust/indextree"]
 indextree = { path = "../indextree/indextree" }

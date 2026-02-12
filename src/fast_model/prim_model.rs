@@ -13,7 +13,7 @@ use aios_core::pdms_types::*;
 use aios_core::prim_geo::polyhedron::Polygon;
 use aios_core::prim_geo::*;
 use aios_core::shape::pdms_shape::{BrepShapeTrait, PlantMesh, VerifiedShape};
-use bevy_transform::components::Transform;
+use aios_core::Transform;
 use glam::Vec3;
 use parry3d::bounding_volume::Aabb;
 use parry3d::math::Isometry;

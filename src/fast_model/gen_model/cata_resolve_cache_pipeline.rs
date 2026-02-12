@@ -19,7 +19,7 @@ use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::pdms_types::CataHashRefnoKV;
 use aios_core::prim_geo::category::CateCsgShape;
 use aios_core::RefnoEnum;
-use bevy_transform::components::Transform;
+use aios_core::Transform;
 use dashmap::DashMap;
 use tokio::sync::Semaphore;
 

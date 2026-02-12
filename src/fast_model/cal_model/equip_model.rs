@@ -37,7 +37,11 @@ pub async fn update_cal_equip_wtrans() -> anyhow::Result<()> {
     let mut sql = String::new();
     for refno in equips {
         let world_trans =
-            match crate::fast_model::transform_cache::get_world_transform_cache_first(refno).await
+            match crate::fast_model::transform_cache::get_world_transform_cache_first(
+                None,
+                refno,
+            )
+            .await
             {
                 Ok(transform) => transform.unwrap_or_default(),
                 Err(e) => {

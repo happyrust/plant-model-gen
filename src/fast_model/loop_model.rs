@@ -12,7 +12,7 @@ use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::pdms_types::*;
 use aios_core::prim_geo::{Extrusion, Revolution};
 use aios_core::shape::pdms_shape::{BrepShapeTrait, VerifiedShape};
-use bevy_transform::components::Transform;
+use aios_core::Transform;
 use dashmap::DashMap;
 use glam::Vec3;
 use parry3d::bounding_volume::*;

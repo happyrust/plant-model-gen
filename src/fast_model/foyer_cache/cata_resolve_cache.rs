@@ -15,7 +15,7 @@ use aios_core::geometry::GeoBasicType;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::parsed_data::CateAxisParam;
 use aios_core::RefnoEnum;
-use bevy_transform::components::Transform;
+use aios_core::Transform;
 use glam::Vec3;
 use foyer::{DirectFsDeviceOptionsBuilder, HybridCache, HybridCacheBuilder};
 use serde::{Deserialize, Serialize};

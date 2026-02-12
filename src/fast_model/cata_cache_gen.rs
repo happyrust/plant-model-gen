@@ -20,7 +20,7 @@ use aios_core::pdms_types::CataHashRefnoKV;
 use aios_core::geometry::{EleGeosInfo, EleInstGeo, EleInstGeosData, GeoBasicType, ShapeInstancesData};
 use aios_core::RefnoEnum;
 use aios_core::prim_geo::category::CateCsgShape;
-use bevy_transform::components::Transform;
+use aios_core::Transform;
 use chrono::Utc;
 use dashmap::DashMap;
 use glam::Vec3;

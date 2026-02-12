@@ -93,7 +93,7 @@ async fn test_insert_and_get_single_batch_roundtrip() {
     let loop_input = LoopInput {
         refno,
         attmap: aios_core::NamedAttrMap::default(),
-        world_transform: bevy_transform::prelude::Transform::IDENTITY,
+        world_transform: aios_core::Transform::IDENTITY,
         loops: Vec::new(),
         height: 0.0,
         owner_refno: refno,

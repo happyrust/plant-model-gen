@@ -5,11 +5,11 @@ use aios_core::parsed_data::TubiInfoData;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::pdms_types::*;
 use aios_core::types::*;
-use aios_core::{SUL_DB, SurrealQueryExt, get_db_option, gen_aabb_hash, gen_bevy_transform_hash, gen_string_hash};
+use aios_core::{SUL_DB, SurrealQueryExt, get_db_option, gen_aabb_hash, gen_plant_transform_hash, gen_string_hash};
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use bevy_transform::prelude::Transform;
+use aios_core::Transform;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use itertools::Itertools;
@@ -296,7 +296,7 @@ pub async fn save_instance_data_optimize(
                 continue;
             }
 
-            let transform_hash = gen_bevy_transform_hash(&inst.geo_transform);
+            let transform_hash = gen_plant_transform_hash(&inst.geo_transform);
             if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
                 entry.insert(serde_json::to_string(&inst.geo_transform)?);
             }
@@ -417,7 +417,7 @@ pub async fn save_instance_data_optimize(
             }
         }
 
-        let transform_hash = gen_bevy_transform_hash(&tubi.world_transform);
+        let transform_hash = gen_plant_transform_hash(&tubi.world_transform);
         if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
             entry.insert(serde_json::to_string(&tubi.world_transform)?);
         }
@@ -573,7 +573,7 @@ pub async fn save_instance_data_optimize(
             inst_info_buffer.clear();
         }
 
-        let transform_hash = gen_bevy_transform_hash(&info.world_transform);
+        let transform_hash = gen_plant_transform_hash(&info.world_transform);
         if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
             entry.insert(serde_json::to_string(&info.world_transform)?);
         }
@@ -673,7 +673,7 @@ pub async fn save_instance_data_optimize(
                 continue;
             }
 
-            let transform_hash = gen_bevy_transform_hash(&info.world_transform);
+            let transform_hash = gen_plant_transform_hash(&info.world_transform);
             if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
                 entry.insert(serde_json::to_string(&info.world_transform)?);
             }

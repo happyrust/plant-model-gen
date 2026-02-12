@@ -49,7 +49,9 @@ async fn compute_world_from_parent(
     let (start_idx, start_world) = match cached_ancestor {
         Some((idx, ancestor_refno)) => {
             let cache = query_pe_transform(ancestor_refno).await?;
-            let world = cache.and_then(|c| c.world).map(|t| bevy_transform_to_dmat4(&t));
+            let world = cache
+                .and_then(|c| c.world)
+                .map(|t| t.to_matrix().as_dmat4());
             (idx + 1, world.unwrap_or(DMat4::IDENTITY))
         }
         None => (0, DMat4::IDENTITY),  // 从根节点开始

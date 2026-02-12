@@ -1,10 +1,10 @@
 use crate::fast_model::query_provider;
 use crate::fast_model::utils::save_transforms_to_surreal;
-use aios_core::{RefU64, RefnoEnum, SUL_DB, gen_bevy_transform_hash};
+use aios_core::{RefU64, RefnoEnum, SUL_DB, gen_plant_transform_hash};
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
 use aios_core::{query_neareast_along_axis, query_neareast_by_pos_dir};
 
-use bevy_transform::components::Transform;
+use aios_core::Transform;
 use glam::Vec3;
 use parry3d::bounding_volume::Aabb;
 use parry3d::bounding_volume::BoundingVolume;
@@ -37,7 +37,7 @@ pub async fn update_cal_equip_wtrans() -> anyhow::Result<()> {
     let mut sql = String::new();
     for refno in equips {
         let world_trans =
-            match crate::fast_model::transform_cache::get_world_transform_cache_first(None, refno).await
+            match crate::fast_model::transform_cache::get_world_transform_cache_first(refno).await
             {
                 Ok(transform) => transform.unwrap_or_default(),
                 Err(e) => {
@@ -49,7 +49,7 @@ pub async fn update_cal_equip_wtrans() -> anyhow::Result<()> {
                     return Err(e);
                 }
             };
-        let transform_hash = gen_bevy_transform_hash(&world_trans);
+        let transform_hash = gen_plant_transform_hash(&world_trans);
         if !transform_map.contains_key(&transform_hash) {
             transform_map.insert(transform_hash, serde_json::to_string(&world_trans).unwrap());
         }

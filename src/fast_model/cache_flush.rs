@@ -4,7 +4,7 @@ use std::path::Path;
 use aios_core::geometry::{EleGeosInfo, ShapeInstancesData};
 use aios_core::parsed_data::{CateAxisParam, TubiInfoData};
 use aios_core::shape::pdms_shape::RsVec3;
-use aios_core::types::hash::{gen_aabb_hash, gen_bevy_transform_hash};
+use aios_core::types::hash::{gen_aabb_hash, gen_plant_transform_hash};
 use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
 use anyhow::{Context, Result};
 use glam::Vec3;
@@ -101,8 +101,8 @@ fn collect_tubi_info_from_inst_info_map(_inst_info_map: &HashMap<RefnoEnum, EleG
     let mut skipped_ptset = 0usize;
 
     for info in _inst_info_map.values() {
-        let Some(id) = info.tubi_info_id.as_deref() else {
-            // tubi_info_id 为 None 是正常情况（非管件元件），不计入跳过
+        let Some(id) = info.tubi.as_ref().and_then(|t| t.info_id.as_deref()) else {
+            // tubi info_id 为 None 是正常情况（非管件元件），不计入跳过
             continue;
         };
         let Some((cata_hash, arrive, leave)) = parse_tubi_info_id(id) else {
@@ -353,15 +353,19 @@ async fn flush_tubi_relate_to_surreal(
     for info in inst_tubi_map.values() {
         let leave_refno = info.refno;
         let owner_refno = info.owner_refno;
-        let Some(arrive_refno) = info.tubi_arrive_refno else {
+        let tubi = match info.tubi.as_ref() {
+            Some(t) => t,
+            None => continue,
+        };
+        let Some(arrive_refno) = tubi.arrive_refno else {
             continue;
         };
-        let index = info.tubi_index.unwrap_or(0);
+        let index = tubi.index.unwrap_or(0);
 
         owner_refnos.insert(owner_refno);
 
         // transform
-        let trans_hash = gen_bevy_transform_hash(&info.world_transform);
+        let trans_hash = gen_plant_transform_hash(&info.world_transform);
         trans_map
             .entry(trans_hash)
             .or_insert_with(|| serde_json::to_string(&info.world_transform).unwrap_or_default());
@@ -376,7 +380,7 @@ async fn flush_tubi_relate_to_surreal(
         }
 
         // start_pt / end_pt
-        if let Some(pt) = info.tubi_start_pt {
+        if let Some(pt) = tubi.start_pt {
             let rv = RsVec3(pt);
             let h = rv.gen_hash();
             if seen_pts.insert(h) {
@@ -384,7 +388,7 @@ async fn flush_tubi_relate_to_surreal(
                 pts_rows.push(format!("{{'id':vec3:⟨{}⟩, 'd':{}}}", h, d));
             }
         }
-        if let Some(pt) = info.tubi_end_pt {
+        if let Some(pt) = tubi.end_pt {
             let rv = RsVec3(pt);
             let h = rv.gen_hash();
             if seen_pts.insert(h) {
@@ -394,22 +398,22 @@ async fn flush_tubi_relate_to_surreal(
         }
 
         // arrive_axis / leave_axis
-        let arrive_hash = info
+        let arrive_hash = tubi
             .arrive_axis_pt
             .map(|a| RsVec3(Vec3::from(a)).gen_hash())
             .unwrap_or(0);
-        if let Some(a) = info.arrive_axis_pt {
+        if let Some(a) = tubi.arrive_axis_pt {
             if seen_pts.insert(arrive_hash) {
                 let rv = RsVec3(Vec3::from(a));
                 let d = serde_json::to_string(&rv).unwrap_or_default();
                 pts_rows.push(format!("{{'id':vec3:⟨{}⟩, 'd':{}}}", arrive_hash, d));
             }
         }
-        let leave_hash = info
+        let leave_hash = tubi
             .leave_axis_pt
             .map(|a| RsVec3(Vec3::from(a)).gen_hash())
             .unwrap_or(0);
-        if let Some(a) = info.leave_axis_pt {
+        if let Some(a) = tubi.leave_axis_pt {
             if seen_pts.insert(leave_hash) {
                 let rv = RsVec3(Vec3::from(a));
                 let d = serde_json::to_string(&rv).unwrap_or_default();
@@ -425,8 +429,8 @@ async fn flush_tubi_relate_to_surreal(
             .unwrap_or(aios_core::prim_geo::basic::TUBI_GEO_HASH);
 
         // start/end hash
-        let start_hash = info.tubi_start_pt.map(|p| RsVec3(p).gen_hash()).unwrap_or(0);
-        let end_hash = info.tubi_end_pt.map(|p| RsVec3(p).gen_hash()).unwrap_or(0);
+        let start_hash = tubi.start_pt.map(|p| RsVec3(p).gen_hash()).unwrap_or(0);
+        let end_hash = tubi.end_pt.map(|p| RsVec3(p).gen_hash()).unwrap_or(0);
 
         // RELATE SQL
         relate_stmts.push(format!(
@@ -562,7 +566,10 @@ mod tests {
         let r1 = RefnoEnum::from_str("24381/145018").unwrap();
         let mut info = EleGeosInfo::default();
         info.refno = r1;
-        info.tubi_info_id = Some("123_1_2".to_string());
+        info.tubi = Some(aios_core::geometry::TubiData {
+            info_id: Some("123_1_2".to_string()),
+            ..Default::default()
+        });
         info.ptset_map.insert(
             1,
             CateAxisParam {

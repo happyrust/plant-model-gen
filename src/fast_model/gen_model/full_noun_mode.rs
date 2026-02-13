@@ -635,9 +635,13 @@ async fn process_bran_hang_core_logic(
     if bran_roots.is_empty() {
         return Ok(());
     }
+    let phase_total = Instant::now();
     println!("📍 优先处理 BRAN/HANG 及其依赖 (count={})...", bran_roots.len());
 
-    // 1. 查询子元素并记录已生成的 refno
+    // ── 阶段 1: 收集子元素 ──
+    let t1 = Instant::now();
+    #[cfg(feature = "profile")]
+    let _span1 = tracing::info_span!("bran_collect_children").entered();
     let branch_refnos_map: DashMap<RefnoEnum, Vec<SPdmsElement>> = DashMap::new();
     let mut total_children: usize = 0;
     for &refno in bran_roots {
@@ -652,10 +656,17 @@ async fn process_bran_hang_core_logic(
         }
     }
     #[cfg(feature = "profile")]
-    tracing::info!(total_children, "bran_collect_children_from_tree done");
+    drop(_span1);
+    let t1_ms = t1.elapsed().as_millis();
+    println!(
+        "  [BRAN perf] 阶段1 collect_children: {} ms (roots={}, children={})",
+        t1_ms, bran_roots.len(), total_children
+    );
 
-    // 2. 查询 BRAN 下子元件（管件）的元件库分组
-    // 注意：应该查询子元件（TEE、ELBO等）的 cata_hash，而不是 BRAN 自身
+    // ── 阶段 2: 构建 cata_hash_map ──
+    let t2 = Instant::now();
+    #[cfg(feature = "profile")]
+    let _span2 = tracing::info_span!("bran_build_cata_hash_map").entered();
     let child_refnos: Vec<RefnoEnum> = branch_refnos_map
         .iter()
         .flat_map(|entry| entry.value().iter().map(|c| c.refno).collect::<Vec<_>>())
@@ -667,9 +678,20 @@ async fn process_bran_hang_core_logic(
             .await
             .unwrap_or_default()
     };
+    let unique_cata_cnt = target_bran_reuse_cata_map.len();
     let target_bran_reuse_cata_map = Arc::new(target_bran_reuse_cata_map);
+    #[cfg(feature = "profile")]
+    drop(_span2);
+    let t2_ms = t2.elapsed().as_millis();
+    println!(
+        "  [BRAN perf] 阶段2 build_cata_hash_map: {} ms (child_refnos={}, unique_cata={})",
+        t2_ms, child_refnos.len(), unique_cata_cnt
+    );
 
-    // 方案 A：Full Noun 模式下也需要做 prefetch，否则会绕开 cate_processor 中的预热逻辑。
+    // ── 阶段 3: prefetch cata_resolve_cache ──
+    let t3 = Instant::now();
+    #[cfg(feature = "profile")]
+    let _span3 = tracing::info_span!("bran_prefetch_cata_resolve_cache").entered();
     if cata_resolve_cache_pipeline::is_cata_resolve_cache_prefetch_enabled() {
         if let Err(e) = cata_resolve_cache_pipeline::prefetch_cata_resolve_cache_for_target_map(
             db_option.clone(),
@@ -683,8 +705,15 @@ async fn process_bran_hang_core_logic(
             );
         }
     }
+    #[cfg(feature = "profile")]
+    drop(_span3);
+    let t3_ms = t3.elapsed().as_millis();
+    println!("  [BRAN perf] 阶段3 prefetch_cata_resolve_cache: {} ms", t3_ms);
 
-    // 3. 生成 CATE 几何
+    // ── 阶段 4: 生成 CATE 几何 ──
+    let t4 = Instant::now();
+    #[cfg(feature = "profile")]
+    let _span4 = tracing::info_span!("bran_gen_cata_instances").entered();
     let cate_outcome = match cata_model::gen_cata_instances(
         db_option.clone(),
         target_bran_reuse_cata_map,
@@ -695,23 +724,45 @@ async fn process_bran_hang_core_logic(
     {
         Ok(outcome) => Some(outcome),
         Err(e) => {
-            // 这里此前使用 `.ok()` 会吞掉错误，导致“看似成功但 CATE 数据缺失”。
-            // 为保持行为向后兼容，默认仅打印错误并继续；若未来需要严格模式，可在此处改为直接返回 Err。
             eprintln!("[Pipeline] CATE 几何生成失败，将跳过 CATE：{e}");
             None
         }
     };
+    #[cfg(feature = "profile")]
+    drop(_span4);
+    let t4_ms = t4.elapsed().as_millis();
+    if let Some(ref outcome) = cate_outcome {
+        println!(
+            "  [BRAN perf] 阶段4 gen_cata_instances: {} ms (unique_cata={}, elapsed_inner={} ms)",
+            t4_ms, outcome.unique_cata_cnt, outcome.elapsed_ms
+        );
+        for (k, v) in &outcome.time_stats {
+            println!("    [BRAN perf]   cata_time.{}: {} ms", k, v);
+        }
+    } else {
+        println!("  [BRAN perf] 阶段4 gen_cata_instances: {} ms (FAILED)", t4_ms);
+    }
 
-    // 4. 保存 tubi_info
+    // ── 阶段 5: 保存 tubi_info ──
+    let t5 = Instant::now();
+    #[cfg(feature = "profile")]
+    let _span5 = tracing::info_span!("bran_save_tubi_info").entered();
     if let Some(ref outcome) = cate_outcome {
         let _ = pdms_inst::save_tubi_info_batch(&outcome.tubi_info_map).await;
     }
+    #[cfg(feature = "profile")]
+    drop(_span5);
+    let t5_ms = t5.elapsed().as_millis();
+    println!("  [BRAN perf] 阶段5 save_tubi_info: {} ms", t5_ms);
 
-    // 5. 生成 Tubing
+    // ── 阶段 6: 生成 Tubing ──
+    let t6 = Instant::now();
+    #[cfg(feature = "profile")]
+    let _span6 = tracing::info_span!("bran_gen_branch_tubi").entered();
     let local_al_map = cate_outcome
         .map(|o| o.local_al_map)
         .unwrap_or_else(|| Arc::new(DashMap::new()));
-    let _ = cata_model::gen_branch_tubi(
+    let tubi_result = cata_model::gen_branch_tubi(
         db_option.clone(),
         Arc::new(branch_refnos_map),
         loop_sjus_map_arc,
@@ -719,6 +770,27 @@ async fn process_bran_hang_core_logic(
         local_al_map,
     )
     .await;
+    #[cfg(feature = "profile")]
+    drop(_span6);
+    let t6_ms = t6.elapsed().as_millis();
+    if let Ok(ref tubi_outcome) = tubi_result {
+        println!(
+            "  [BRAN perf] 阶段6 gen_branch_tubi: {} ms (tubi_count={}, elapsed_inner={} ms)",
+            t6_ms, tubi_outcome.tubi_count, tubi_outcome.elapsed_ms
+        );
+        for (k, v) in &tubi_outcome.time_stats {
+            println!("    [BRAN perf]   tubi_time.{}: {} ms", k, v);
+        }
+    } else {
+        println!("  [BRAN perf] 阶段6 gen_branch_tubi: {} ms (result={:?})", t6_ms, tubi_result.err());
+    }
+
+    // ── 汇总 ──
+    let total_ms = phase_total.elapsed().as_millis();
+    println!(
+        "  [BRAN perf] 总计: {} ms [collect={}ms, cata_hash={}ms, prefetch={}ms, cata_gen={}ms, tubi_info={}ms, tubi_gen={}ms]",
+        total_ms, t1_ms, t2_ms, t3_ms, t4_ms, t5_ms, t6_ms
+    );
 
     Ok(())
 }

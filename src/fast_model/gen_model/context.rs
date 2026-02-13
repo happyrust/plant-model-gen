@@ -1,3 +1,4 @@
+use crate::fast_model::foyer_cache::geom_input_cache::{self, CacheRunMode};
 use crate::options::DbOptionExt;
 use std::sync::Arc;
 
@@ -7,6 +8,7 @@ pub struct NounProcessContext {
     pub db_option: Arc<DbOptionExt>,
     pub batch_size: usize,
     pub batch_concurrency: usize,
+    pub cache_run_mode: CacheRunMode,
 }
 
 impl NounProcessContext {
@@ -21,6 +23,7 @@ impl NounProcessContext {
             db_option,
             batch_size,
             batch_concurrency: batch_concurrency.max(1),
+            cache_run_mode: geom_input_cache::resolve_cache_run_mode(),
         }
     }
 
@@ -62,6 +65,7 @@ mod tests {
             db_option: Arc::new(DbOptionExt::from(DbOption::default())),
             batch_size: 100,
             batch_concurrency: 4,
+            cache_run_mode: CacheRunMode::Direct,
         };
 
         // 测试正常情况

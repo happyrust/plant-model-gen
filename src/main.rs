@@ -245,13 +245,12 @@ async fn post_export_steps(
     init_surreal().await?;
 
     if want_parquet {
-        println!("\n📦 后置步骤：导出 dbnum={} 实例数据为 Parquet", dbnum);
-        crate::cli_modes::export_dbnum_instances_parquet_mode(
+        println!("\n📦 后置步骤：从 cache 导出 dbnum={} 实例数据为 Parquet", dbnum);
+        crate::cli_modes::export_dbnum_instances_parquet_from_cache_mode(
             dbnum,
             verbose,
             output_override.clone(),
             db_option_ext,
-            root_refno,
         )
         .await?;
     }
@@ -1261,6 +1260,24 @@ async fn main() -> anyhow::Result<()> {
         // 检查是否有导出标志
         if matches.get_flag("export-obj") {
             println!("🎯 导出 OBJ 模型 (调试模式): {:?}", refnos_vec);
+
+            // debug-model + export-obj 时自动启用截图（如果用户没有显式指定 --capture）
+            if capture_dir.is_none() {
+                let auto_capture_dir = db_option_ext.get_project_output_dir().join("screenshots");
+                println!("📸 自动启用截图: {}", auto_capture_dir.display());
+                aios_database::fast_model::set_capture_config(Some(
+                    aios_database::fast_model::CaptureConfig::new(
+                        auto_capture_dir,
+                        capture_width,
+                        capture_height,
+                        include_descendants,
+                        capture_views,
+                        None,
+                        None,
+                    ),
+                ));
+            }
+
             let config = build_export_config(
                 refnos_vec.clone(),
                 output_path,
@@ -1685,21 +1702,8 @@ async fn main() -> anyhow::Result<()> {
     if matches.get_flag("export-dbnum-instances-parquet")
         || matches.get_flag("export-dbnum-instances")
     {
-        use crate::cli_modes::export_dbnum_instances_parquet_mode;
-        use aios_core::pdms_types::RefnoEnum;
-        use std::str::FromStr;
-
         let dbnum = matches.get_one::<u32>("dbnum").copied();
         let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
-
-        // 解析 --debug-model 参数作为 root_refno
-        let root_refno: Option<RefnoEnum> = matches
-            .get_many::<String>("debug-model")
-            .and_then(|values| values.into_iter().next())
-            .and_then(|s| {
-                let refno_str = s.replace('_', "/");
-                RefnoEnum::from_str(&refno_str).ok()
-            });
 
         let dbnum = match dbnum {
             Some(n) => n,
@@ -1712,19 +1716,16 @@ async fn main() -> anyhow::Result<()> {
 
         println!("🎯 导出 dbnum 实例数据为 Parquet（多表，供 DuckDB 查询）");
         println!("   - 按 dbnum={} 过滤", dbnum);
-        if let Some(ref refno) = root_refno {
-            println!("   - 仅导出 {} 的 visible 子孙", refno);
-        }
+        println!("   - 数据源: foyer cache");
         if let Some(ref dir) = export_bundle_dir {
             println!("   - 输出目录: {}", dir.display());
         }
 
-        return export_dbnum_instances_parquet_mode(
+        return crate::cli_modes::export_dbnum_instances_parquet_from_cache_mode(
             dbnum,
             verbose,
             export_bundle_dir,
             &db_option_ext,
-            root_refno,
         )
         .await;
     }

@@ -5,12 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::fs;
 
-use aios_core::geometry::{EleGeosInfo, EleInstGeo, EleInstGeosData, GeoBasicType, ShapeInstancesData};
+use aios_core::geometry::{EleGeosInfo, EleInstGeosData, ShapeInstancesData};
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::parsed_data::CateAxisParam;
 use aios_core::RefnoEnum;
-use aios_core::Transform;
-use glam::Vec3;
 use foyer::{DirectFsDeviceOptionsBuilder, HybridCache, HybridCacheBuilder};
 use serde::{Deserialize, Serialize};
 use twox_hash::XxHash64;
@@ -61,82 +59,23 @@ pub struct CachedGeoParam {
 }
 
 // ---------------------------------------------------------------------------
-// rkyv payload（V1 schema）
+// rkyv payload — 直接使用 aios_core 原始类型，无需中间转换层
 // ---------------------------------------------------------------------------
 
 const INSTANCE_CACHE_TYPE_TAG: u16 = 2001;
-const INSTANCE_CACHE_SCHEMA_V1: u16 = 1;
+/// schema V3：消除 V1/V2 中间层，直接序列化 aios_core 原始类型。
+const INSTANCE_CACHE_SCHEMA_VERSION: u16 = 3;
 
-#[derive(Clone, Copy, Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct TransformV1 {
-    t: [f32; 3],
-    r: [f32; 4], // x,y,z,w
-    s: [f32; 3],
-}
-
-impl From<Transform> for TransformV1 {
-    fn from(v: Transform) -> Self {
-        Self {
-            t: [v.translation.x, v.translation.y, v.translation.z],
-            r: [v.rotation.x, v.rotation.y, v.rotation.z, v.rotation.w],
-            s: [v.scale.x, v.scale.y, v.scale.z],
-        }
-    }
-}
-
-impl From<TransformV1> for Transform {
-    fn from(v: TransformV1) -> Self {
-        Transform {
-            translation: Vec3::new(v.t[0], v.t[1], v.t[2]),
-            rotation: glam::Quat::from_xyzw(v.r[0], v.r[1], v.r[2], v.r[3]),
-            scale: Vec3::new(v.s[0], v.s[1], v.s[2]),
-        }
-    }
-}
-
+/// rkyv 序列化专用结构体，字段与 CachedInstanceBatch 一一对应。
+/// 使用 Vec<(K,V)> 代替 HashMap 以获得稳定的 rkyv 序列化布局。
 #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct EleGeosInfoV1 {
-    refno: RefnoEnum,
-    sesno: i32,
-    owner_refno: RefnoEnum,
-    owner_type: String,
-    cata_hash: Option<String>,
-    visible: bool,
-    generic_type: aios_core::pdms_types::PdmsGenericType,
-    world_transform: TransformV1,
-    ptset_items: Vec<(i32, CateAxisParam)>,
-    is_solid: bool,
-}
-
-#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct EleInstGeoV1 {
-    geo_hash: u64,
-    refno: RefnoEnum,
-    pts: Vec<i32>,
-    geo_transform: TransformV1,
-    geo_param: PdmsGeoParam,
-    visible: bool,
-    is_tubi: bool,
-    geo_type: GeoBasicType,
-    cata_neg_refnos: Vec<RefnoEnum>,
-}
-
-#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct EleInstGeosDataV1 {
-    inst_key: String,
-    refno: RefnoEnum,
-    insts: Vec<EleInstGeoV1>,
-    type_name: String,
-}
-
-#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct CachedInstanceBatchV1 {
+struct CachedInstanceBatchRkyv {
     dbnum: u32,
     batch_id: String,
     created_at: i64,
-    inst_info_items: Vec<(RefnoEnum, EleGeosInfoV1)>,
-    inst_geos_items: Vec<(String, EleInstGeosDataV1)>,
-    inst_tubi_items: Vec<(RefnoEnum, EleGeosInfoV1)>,
+    inst_info_items: Vec<(RefnoEnum, EleGeosInfo)>,
+    inst_geos_items: Vec<(String, EleInstGeosData)>,
+    inst_tubi_items: Vec<(RefnoEnum, EleGeosInfo)>,
     neg_relate_items: Vec<(RefnoEnum, Vec<RefnoEnum>)>,
     ngmr_neg_relate_items: Vec<(RefnoEnum, Vec<(RefnoEnum, RefnoEnum)>)>,
     inst_relate_bool_items: Vec<(RefnoEnum, CachedInstRelateBool)>,
@@ -202,92 +141,20 @@ impl InstanceCacheManager {
             batch_id: batch.batch_id.clone(),
         };
 
-        // 迁移策略（方案1）：payload 统一写 rkyv；旧 JSON cache 读到即 miss，由上游重建。
         let ser_start = std::time::Instant::now();
-        let v1 = CachedInstanceBatchV1 {
+        let rkyv_batch = CachedInstanceBatchRkyv {
             dbnum: batch.dbnum,
             batch_id: batch.batch_id.clone(),
             created_at: batch.created_at,
-            inst_info_items: batch
-                .inst_info_map
-                .into_iter()
-                .map(|(k, v)| {
-                    let ptset_items = v.ptset_map.into_iter().collect::<Vec<_>>();
-                    (
-                        k,
-                        EleGeosInfoV1 {
-                            refno: v.refno,
-                            sesno: v.sesno,
-                            owner_refno: v.owner_refno,
-                            owner_type: v.owner_type,
-                            cata_hash: v.cata_hash,
-                            visible: v.visible,
-                            generic_type: v.generic_type,
-                            world_transform: v.world_transform.into(),
-                            ptset_items,
-                            is_solid: v.is_solid,
-                        },
-                    )
-                })
-                .collect(),
-            inst_geos_items: batch
-                .inst_geos_map
-                .into_iter()
-                .map(|(k, v)| {
-                    let insts = v
-                        .insts
-                        .into_iter()
-                        .map(|g| EleInstGeoV1 {
-                            geo_hash: g.geo_hash,
-                            refno: g.refno,
-                            pts: g.pts,
-                            geo_transform: g.geo_transform.into(),
-                            geo_param: g.geo_param,
-                            visible: g.visible,
-                            is_tubi: g.is_tubi,
-                            geo_type: g.geo_type,
-                            cata_neg_refnos: g.cata_neg_refnos,
-                        })
-                        .collect();
-                    (
-                        k,
-                        EleInstGeosDataV1 {
-                            inst_key: v.inst_key,
-                            refno: v.refno,
-                            insts,
-                            type_name: v.type_name,
-                        },
-                    )
-                })
-                .collect(),
-            inst_tubi_items: batch
-                .inst_tubi_map
-                .into_iter()
-                .map(|(k, v)| {
-                    let ptset_items = v.ptset_map.into_iter().collect::<Vec<_>>();
-                    (
-                        k,
-                        EleGeosInfoV1 {
-                            refno: v.refno,
-                            sesno: v.sesno,
-                            owner_refno: v.owner_refno,
-                            owner_type: v.owner_type,
-                            cata_hash: v.cata_hash,
-                            visible: v.visible,
-                            generic_type: v.generic_type,
-                            world_transform: v.world_transform.into(),
-                            ptset_items,
-                            is_solid: v.is_solid,
-                        },
-                    )
-                })
-                .collect(),
+            inst_info_items: batch.inst_info_map.into_iter().collect(),
+            inst_geos_items: batch.inst_geos_map.into_iter().collect(),
+            inst_tubi_items: batch.inst_tubi_map.into_iter().collect(),
             neg_relate_items: batch.neg_relate_map.into_iter().collect(),
             ngmr_neg_relate_items: batch.ngmr_neg_relate_map.into_iter().collect(),
             inst_relate_bool_items: batch.inst_relate_bool_map.into_iter().collect(),
         };
 
-        let payload = match rkyv_payload::encode(INSTANCE_CACHE_TYPE_TAG, INSTANCE_CACHE_SCHEMA_V1, &v1) {
+        let payload = match rkyv_payload::encode(INSTANCE_CACHE_TYPE_TAG, INSTANCE_CACHE_SCHEMA_VERSION, &rkyv_batch) {
             Ok(bytes) => bytes,
             Err(e) => {
                 eprintln!(
@@ -297,9 +164,9 @@ impl InstanceCacheManager {
                 return;
             }
         };
-        let ser_ms = ser_start.elapsed().as_millis();
+        let _ser_ms = ser_start.elapsed().as_millis();
         #[cfg(feature = "profile")]
-        tracing::info!(payload_bytes = payload.len(), serialize_ms = ser_ms as u64, "cache_insert_batch rkyv serialized");
+        tracing::info!(payload_bytes = payload.len(), serialize_ms = _ser_ms as u64, "cache_insert_batch rkyv serialized");
         let value = InstanceCacheValue { payload };
         let dbnum = key.dbnum;
         let batch_id = key.batch_id.clone();
@@ -357,15 +224,15 @@ impl InstanceCacheManager {
         match self.cache.get(&key).await {
             Ok(Some(entry)) => {
                 let payload = &entry.value().payload;
-                let deser_start = std::time::Instant::now();
-                let v1 = match rkyv_payload::decode::<CachedInstanceBatchV1>(
+                let _deser_start = std::time::Instant::now();
+                let rkyv_batch = match rkyv_payload::decode::<CachedInstanceBatchRkyv>(
                     INSTANCE_CACHE_TYPE_TAG,
-                    INSTANCE_CACHE_SCHEMA_V1,
+                    INSTANCE_CACHE_SCHEMA_VERSION,
                     payload,
                 ) {
                     Ok(v) => v,
                     Err(e) => {
-                        // 迁移策略（方案1）：旧 JSON payload / schema 不匹配 一律视为 miss。
+                        // 旧 schema payload 一律视为 miss，由上游重建。
                         eprintln!(
                             "[cache] payload decode miss: dbnum={}, batch_id={}, err={}",
                             dbnum, batch_id, e
@@ -374,103 +241,23 @@ impl InstanceCacheManager {
                     }
                 };
 
-                let mut inst_info_map: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
-                for (k, info) in v1.inst_info_items {
-                    let mut ptset_map = std::collections::BTreeMap::new();
-                    for (n, p) in info.ptset_items {
-                        ptset_map.insert(n, p);
-                    }
-                    inst_info_map.insert(
-                        k,
-                        EleGeosInfo {
-                            refno: info.refno,
-                            sesno: info.sesno,
-                            owner_refno: info.owner_refno,
-                            owner_type: info.owner_type,
-                            cata_hash: info.cata_hash,
-                            visible: info.visible,
-                            generic_type: info.generic_type,
-                            world_transform: info.world_transform.into(),
-                            ptset_map,
-                            is_solid: info.is_solid,
-                            ..Default::default()
-                        },
-                    );
-                }
-
-                let mut inst_tubi_map: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
-                for (k, info) in v1.inst_tubi_items {
-                    let mut ptset_map = std::collections::BTreeMap::new();
-                    for (n, p) in info.ptset_items {
-                        ptset_map.insert(n, p);
-                    }
-                    inst_tubi_map.insert(
-                        k,
-                        EleGeosInfo {
-                            refno: info.refno,
-                            sesno: info.sesno,
-                            owner_refno: info.owner_refno,
-                            owner_type: info.owner_type,
-                            cata_hash: info.cata_hash,
-                            visible: info.visible,
-                            generic_type: info.generic_type,
-                            world_transform: info.world_transform.into(),
-                            ptset_map,
-                            is_solid: info.is_solid,
-                            ..Default::default()
-                        },
-                    );
-                }
-
-                let mut inst_geos_map: HashMap<String, EleInstGeosData> = HashMap::new();
-                for (k, gd) in v1.inst_geos_items {
-                    let insts = gd
-                        .insts
-                        .into_iter()
-                        .map(|g| EleInstGeo {
-                            geo_hash: g.geo_hash,
-                            refno: g.refno,
-                            pts: g.pts,
-                            aabb: None,
-                            geo_transform: g.geo_transform.into(),
-                            geo_param: g.geo_param,
-                            visible: g.visible,
-                            is_tubi: g.is_tubi,
-                            geo_type: g.geo_type,
-                            cata_neg_refnos: g.cata_neg_refnos,
-                        })
-                        .collect();
-
-                    inst_geos_map.insert(
-                        k,
-                        EleInstGeosData {
-                            inst_key: gd.inst_key,
-                            refno: gd.refno,
-                            insts,
-                            aabb: None,
-                            type_name: gd.type_name,
-                            ..Default::default()
-                        },
-                    );
-                }
-
                 #[cfg(feature = "profile")]
                 tracing::debug!(
                     payload_bytes = payload.len(),
-                    deserialize_ms = deser_start.elapsed().as_millis() as u64,
+                    deserialize_ms = _deser_start.elapsed().as_millis() as u64,
                     "cache_get_batch rkyv deserialized"
                 );
 
                 Some(CachedInstanceBatch {
-                    dbnum: v1.dbnum,
-                    batch_id: v1.batch_id,
-                    created_at: v1.created_at,
-                    inst_info_map,
-                    inst_geos_map,
-                    inst_tubi_map,
-                    neg_relate_map: v1.neg_relate_items.into_iter().collect(),
-                    ngmr_neg_relate_map: v1.ngmr_neg_relate_items.into_iter().collect(),
-                    inst_relate_bool_map: v1.inst_relate_bool_items.into_iter().collect(),
+                    dbnum: rkyv_batch.dbnum,
+                    batch_id: rkyv_batch.batch_id,
+                    created_at: rkyv_batch.created_at,
+                    inst_info_map: rkyv_batch.inst_info_items.into_iter().collect(),
+                    inst_geos_map: rkyv_batch.inst_geos_items.into_iter().collect(),
+                    inst_tubi_map: rkyv_batch.inst_tubi_items.into_iter().collect(),
+                    neg_relate_map: rkyv_batch.neg_relate_items.into_iter().collect(),
+                    ngmr_neg_relate_map: rkyv_batch.ngmr_neg_relate_items.into_iter().collect(),
+                    inst_relate_bool_map: rkyv_batch.inst_relate_bool_items.into_iter().collect(),
                 })
             }
             Ok(None) => None,

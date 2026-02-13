@@ -36,18 +36,21 @@ pub async fn process_prim_refno_page(
 
     // cache-only 路由：当 AIOS_GEN_INPUT_CACHE_ONLY=1 时，从缓存读取预取数据
     if geom_input_cache::is_geom_input_cache_only() {
-        let prim_inputs = geom_input_cache::load_all_prim_inputs_from_global().await;
-        let want: std::collections::HashSet<RefnoEnum> = refnos.iter().copied().collect();
-        let filtered: std::collections::HashMap<RefnoEnum, geom_input_cache::PrimInput> = prim_inputs
-            .into_iter()
-            .filter(|(k, _)| want.contains(k))
-            .collect();
-        if filtered.is_empty() {
-            println!(
-                "[prim_processor] cache-only: 缓存中未找到 {} 个 PRIM refno 的输入数据，跳过",
-                refnos.len()
+        let filtered = geom_input_cache::load_prim_inputs_for_refnos_from_global(refnos).await?;
+        if filtered.len() != refnos.len() {
+            let missing: Vec<String> = refnos
+                .iter()
+                .filter(|r| !filtered.contains_key(r))
+                .take(16)
+                .map(|r| r.to_string())
+                .collect();
+            bail!(
+                "[prim_processor] cache-only 严格模式命中失败: request={}, hit={}, miss={}, sample={:?}",
+                refnos.len(),
+                filtered.len(),
+                refnos.len() - filtered.len(),
+                missing
             );
-            return Ok(());
         }
         if !prim_model::gen_prim_geos_from_inputs(ctx.db_option.clone(), filtered, sender).await? {
             bail!("prim geos generation from cache failed");

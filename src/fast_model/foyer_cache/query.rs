@@ -116,10 +116,26 @@ pub async fn query_geometry_instances_ext_from_cache(
         // 因此这里按 created_at 选择“最新的 Success”。
         let mut bool_success: HashMap<RefU64, (String, i64)> = HashMap::new();
         if enable_holes {
+            println!(
+                "[cache_query] enable_holes=true, 扫描 {} 个 batch 查找 bool 结果 (dbnum={})",
+                batch_ids.len(), dbnum
+            );
             for batch_id in batch_ids.iter().rev() {
                 let Some(batch) = cache.get(dbnum, batch_id).await else {
                     continue;
                 };
+                if !batch.inst_relate_bool_map.is_empty() {
+                    println!(
+                        "[cache_query] batch_id={} 含 {} 条 inst_relate_bool 记录",
+                        batch_id, batch.inst_relate_bool_map.len()
+                    );
+                    for (r, b) in &batch.inst_relate_bool_map {
+                        println!(
+                            "[cache_query]   refno={} status={} mesh_id={} created_at={}",
+                            r, b.status, b.mesh_id, b.created_at
+                        );
+                    }
+                }
                 for (r, b) in batch.inst_relate_bool_map {
                     let k = r.refno();
                     if !want_map.contains_key(&k) {
@@ -138,6 +154,13 @@ pub async fn query_geometry_instances_ext_from_cache(
                         _ => {}
                     }
                 }
+            }
+            println!(
+                "[cache_query] bool_success 结果: {} 条",
+                bool_success.len()
+            );
+            for (k, (mesh_id, ts)) in &bool_success {
+                println!("[cache_query]   refno_u64={} mesh_id={} ts={}", k, mesh_id, ts);
             }
         }
 

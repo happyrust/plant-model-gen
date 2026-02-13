@@ -61,13 +61,11 @@ pub fn validate_sjus_map(
     Ok(())
 }
 
-fn should_use_geom_input_cache_pipeline() -> bool {
-    // 约定：
-    // - pipeline 仅在“启用输入缓存 + 启用 pipeline + 非 cache-only”时打开；
-    // - cache-only 模式下禁止访问 SurrealDB，因此此处直接返回 false（走既有 cache-only 流程）。
-    geom_input_cache::is_geom_input_cache_enabled()
-        && geom_input_cache::is_geom_input_cache_pipeline_enabled()
-        && !geom_input_cache::is_geom_input_cache_only()
+fn should_use_geom_input_cache_pipeline(ctx: &NounProcessContext) -> bool {
+    matches!(
+        ctx.cache_run_mode,
+        geom_input_cache::CacheRunMode::PrefetchThenGenerate
+    )
 }
 
 fn track_refno_issues(refnos: &[RefnoEnum], context: &str, stage: RefnoErrorStage) {
@@ -241,28 +239,20 @@ async fn process_single_noun_type(
 
         match category {
             NounCategoryType::Loop => {
-                if should_use_geom_input_cache_pipeline() {
-                    if let Err(e) = input_cache_pipeline::run_loop_pipeline_from_refnos(
+                if should_use_geom_input_cache_pipeline(ctx) {
+                    input_cache_pipeline::run_loop_pipeline_from_refnos(
                         ctx,
                         loop_sjus_map.clone(),
                         sender.clone(),
                         slice,
                     )
                     .await
-                    {
-                        eprintln!(
-                            "[loop:{}] geom_input_cache pipeline 失败，回退旧路径: {}",
-                            noun, e
-                        );
-                        process_loop_refno_page(ctx, loop_sjus_map.clone(), sender.clone(), slice)
-                            .await
-                            .map_err(|e| {
-                                FullNounError::GeometryGenerationFailed(
-                                    format!("loop:{}", noun),
-                                    e.to_string(),
-                                )
-                            })?;
-                    }
+                    .map_err(|e| {
+                        FullNounError::GeometryGenerationFailed(
+                            format!("loop:{} [cache-mode]", noun),
+                            e.to_string(),
+                        )
+                    })?;
                 } else {
                     process_loop_refno_page(ctx, loop_sjus_map.clone(), sender.clone(), slice)
                         .await
@@ -275,24 +265,15 @@ async fn process_single_noun_type(
                 }
             }
             NounCategoryType::Prim => {
-                if should_use_geom_input_cache_pipeline() {
-                    if let Err(e) =
-                        input_cache_pipeline::run_prim_pipeline_from_refnos(ctx, sender.clone(), slice)
-                            .await
-                    {
-                        eprintln!(
-                            "[prim:{}] geom_input_cache pipeline 失败，回退旧路径: {}",
-                            noun, e
-                        );
-                        process_prim_refno_page(ctx, sender.clone(), slice)
-                            .await
-                            .map_err(|e| {
-                                FullNounError::GeometryGenerationFailed(
-                                    format!("prim:{}", noun),
-                                    e.to_string(),
-                                )
-                            })?;
-                    }
+                if should_use_geom_input_cache_pipeline(ctx) {
+                    input_cache_pipeline::run_prim_pipeline_from_refnos(ctx, sender.clone(), slice)
+                        .await
+                        .map_err(|e| {
+                            FullNounError::GeometryGenerationFailed(
+                                format!("prim:{} [cache-mode]", noun),
+                                e.to_string(),
+                            )
+                        })?;
                 } else {
                     process_prim_refno_page(ctx, sender.clone(), slice)
                         .await
@@ -455,22 +436,20 @@ pub async fn gen_full_noun_geos_optimized(
                 i * ctx.batch_size.max(1) + 1,
                 (i * ctx.batch_size.max(1) + chunk.len())
             );
-            if should_use_geom_input_cache_pipeline() {
-                if let Err(e) = input_cache_pipeline::run_loop_pipeline_from_refnos(
+            if should_use_geom_input_cache_pipeline(&ctx) {
+                input_cache_pipeline::run_loop_pipeline_from_refnos(
                     &ctx,
                     loop_sjus_map_arc.clone(),
                     sender.clone(),
                     chunk,
                 )
                 .await
-                {
-                    eprintln!(
-                        "[BRAN-only][LOOP] geom_input_cache pipeline 失败，回退旧路径: {}",
-                        e
-                    );
-                    process_loop_refno_page(&ctx, loop_sjus_map_arc.clone(), sender.clone(), chunk)
-                        .await?;
-                }
+                .map_err(|e| {
+                    FullNounError::GeometryGenerationFailed(
+                        "BRAN-only LOOP [cache-mode]".to_string(),
+                        e.to_string(),
+                    )
+                })?;
             } else {
                 process_loop_refno_page(&ctx, loop_sjus_map_arc.clone(), sender.clone(), chunk)
                     .await?;
@@ -491,17 +470,15 @@ pub async fn gen_full_noun_geos_optimized(
                 i * ctx.batch_size.max(1) + 1,
                 (i * ctx.batch_size.max(1) + chunk.len())
             );
-            if should_use_geom_input_cache_pipeline() {
-                if let Err(e) =
-                    input_cache_pipeline::run_prim_pipeline_from_refnos(&ctx, sender.clone(), chunk)
-                        .await
-                {
-                    eprintln!(
-                        "[BRAN-only][PRIM] geom_input_cache pipeline 失败，回退旧路径: {}",
-                        e
-                    );
-                    process_prim_refno_page(&ctx, sender.clone(), chunk).await?;
-                }
+            if should_use_geom_input_cache_pipeline(&ctx) {
+                input_cache_pipeline::run_prim_pipeline_from_refnos(&ctx, sender.clone(), chunk)
+                    .await
+                    .map_err(|e| {
+                        FullNounError::GeometryGenerationFailed(
+                            "BRAN-only PRIM [cache-mode]".to_string(),
+                            e.to_string(),
+                        )
+                    })?;
             } else {
                 process_prim_refno_page(&ctx, sender.clone(), chunk).await?;
             }
@@ -595,31 +572,10 @@ pub async fn gen_full_noun_geos_optimized(
                 config.concurrency.get(),
             );
 
-            // [预取] LOOP/PRIM 输入缓存（仅在 AIOS_GEN_INPUT_CACHE=1 时执行）
-            {
-                use crate::fast_model::foyer_cache::geom_input_cache;
-                if geom_input_cache::is_geom_input_cache_enabled()
-                    && !geom_input_cache::is_geom_input_cache_only()
-                {
-                    let loop_vec_for_prefetch: Vec<RefnoEnum> =
-                        loop_refnos.iter().copied().collect();
-                    let prim_vec_for_prefetch: Vec<RefnoEnum> =
-                        prim_refnos.iter().copied().collect();
-                    println!(
-                        "[Pipeline] 开始预取 LOOP/PRIM 输入: loop={}, prim={}",
-                        loop_vec_for_prefetch.len(),
-                        prim_vec_for_prefetch.len()
-                    );
-                    if let Err(e) = geom_input_cache::prefetch_all_geom_inputs(
-                        &db_option,
-                        &loop_vec_for_prefetch,
-                        &prim_vec_for_prefetch,
-                    )
-                    .await
-                    {
-                        eprintln!("[Pipeline] LOOP/PRIM 预取失败（将回退到正常流程）: {}", e);
-                    }
-                }
+            if should_use_geom_input_cache_pipeline(&ctx) {
+                println!(
+                    "[Pipeline] 使用 cache pipeline：跳过 prefetch_all_geom_inputs，避免双重预取"
+                );
             }
 
             // [1-3/4] 处理 LOOP, PRIM, CATE

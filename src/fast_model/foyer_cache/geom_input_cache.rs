@@ -938,28 +938,65 @@ pub fn global_geom_input_cache() -> Option<&'static GeomInputCacheManager> {
     GLOBAL_GEOM_INPUT_CACHE.get()
 }
 
-/// 检查是否启用了输入缓存模式（环境变量 `AIOS_GEN_INPUT_CACHE=1`）。
-pub fn is_geom_input_cache_enabled() -> bool {
-    std::env::var("AIOS_GEN_INPUT_CACHE")
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheRunMode {
+    /// 不使用输入缓存，保持原实时查询路径。
+    Direct,
+    /// 先批量预取输入到 foyer cache，再由模型消费缓存生成。
+    PrefetchThenGenerate,
+    /// 严格只读缓存，不允许任何回查数据库。
+    CacheOnly,
+}
+
+impl CacheRunMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheRunMode::Direct => "direct",
+            CacheRunMode::PrefetchThenGenerate => "prefetch_then_generate",
+            CacheRunMode::CacheOnly => "cache_only",
+        }
+    }
+}
+
+fn read_bool_env(name: &str) -> bool {
+    std::env::var(name)
         .ok()
         .map(|v| v == "1" || v.to_lowercase() == "true")
         .unwrap_or(false)
+}
+
+/// 统一解析输入缓存运行模式。
+///
+/// 优先级：
+/// 1) `AIOS_GEN_INPUT_CACHE_ONLY=1` -> `CacheOnly`
+/// 2) `AIOS_GEN_INPUT_CACHE=1`      -> `PrefetchThenGenerate`
+/// 3) 其他                           -> `Direct`
+pub fn resolve_cache_run_mode() -> CacheRunMode {
+    if read_bool_env("AIOS_GEN_INPUT_CACHE_ONLY") {
+        return CacheRunMode::CacheOnly;
+    }
+    if read_bool_env("AIOS_GEN_INPUT_CACHE") {
+        return CacheRunMode::PrefetchThenGenerate;
+    }
+    CacheRunMode::Direct
+}
+
+/// 检查是否启用了输入缓存模式（环境变量 `AIOS_GEN_INPUT_CACHE=1`）。
+pub fn is_geom_input_cache_enabled() -> bool {
+    matches!(
+        resolve_cache_run_mode(),
+        CacheRunMode::PrefetchThenGenerate | CacheRunMode::CacheOnly
+    )
 }
 
 /// 检查是否要求仅从缓存读取（环境变量 `AIOS_GEN_INPUT_CACHE_ONLY=1`）。
 pub fn is_geom_input_cache_only() -> bool {
-    std::env::var("AIOS_GEN_INPUT_CACHE_ONLY")
-        .ok()
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false)
+    matches!(resolve_cache_run_mode(), CacheRunMode::CacheOnly)
 }
 
 /// 检查是否启用了输入缓存流水线模式（环境变量 `AIOS_GEN_INPUT_CACHE_PIPELINE=1`）。
 pub fn is_geom_input_cache_pipeline_enabled() -> bool {
-    std::env::var("AIOS_GEN_INPUT_CACHE_PIPELINE")
-        .ok()
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false)
+    read_bool_env("AIOS_GEN_INPUT_CACHE_PIPELINE")
 }
 
 // ---------------------------------------------------------------------------
@@ -986,18 +1023,18 @@ pub async fn prefetch_all_geom_inputs(
 
     let mut loop_groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
     for &r in loop_refnos {
-        let dbnum = db_meta.get_dbnum_by_refno(r).unwrap_or(0);
-        if dbnum > 0 {
-            loop_groups.entry(dbnum).or_default().push(r);
-        }
+        let dbnum = db_meta
+            .get_dbnum_by_refno(r)
+            .ok_or_else(|| anyhow::anyhow!("缺少 ref0->dbnum 映射: refno={}", r))?;
+        loop_groups.entry(dbnum).or_default().push(r);
     }
 
     let mut prim_groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
     for &r in prim_refnos {
-        let dbnum = db_meta.get_dbnum_by_refno(r).unwrap_or(0);
-        if dbnum > 0 {
-            prim_groups.entry(dbnum).or_default().push(r);
-        }
+        let dbnum = db_meta
+            .get_dbnum_by_refno(r)
+            .ok_or_else(|| anyhow::anyhow!("缺少 ref0->dbnum 映射: refno={}", r))?;
+        prim_groups.entry(dbnum).or_default().push(r);
     }
 
     let mut total_loop = 0usize;
@@ -1047,6 +1084,68 @@ pub async fn load_prim_inputs_from_global(dbnum: u32) -> HashMap<RefnoEnum, Prim
         Some(cache) => cache.get_all_prim_inputs(dbnum).await,
         None => HashMap::new(),
     }
+}
+
+pub fn group_refnos_by_dbnum_strict(
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<HashMap<u32, Vec<RefnoEnum>>> {
+    let db_meta = crate::data_interface::db_meta_manager::db_meta();
+    let _ = db_meta.ensure_loaded();
+
+    let mut groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
+    for &refno in refnos {
+        let dbnum = db_meta
+            .get_dbnum_by_refno(refno)
+            .ok_or_else(|| anyhow::anyhow!("缺少 ref0->dbnum 映射: refno={}", refno))?;
+        groups.entry(dbnum).or_default().push(refno);
+    }
+    Ok(groups)
+}
+
+/// 按 refno 集合加载 LOOP 输入（严格按 dbnum 分桶，不扫描全库）。
+pub async fn load_loop_inputs_for_refnos_from_global(
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<HashMap<RefnoEnum, LoopInput>> {
+    if refnos.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let cache = global_geom_input_cache()
+        .ok_or_else(|| anyhow::anyhow!("geom_input_cache 未初始化"))?;
+    let groups = group_refnos_by_dbnum_strict(refnos)?;
+
+    let mut result = HashMap::new();
+    for (dbnum, refs) in groups {
+        let mut db_inputs = cache.get_all_loop_inputs(dbnum).await;
+        for refno in refs {
+            if let Some(input) = db_inputs.remove(&refno) {
+                result.insert(refno, input);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// 按 refno 集合加载 PRIM 输入（严格按 dbnum 分桶，不扫描全库）。
+pub async fn load_prim_inputs_for_refnos_from_global(
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<HashMap<RefnoEnum, PrimInput>> {
+    if refnos.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let cache = global_geom_input_cache()
+        .ok_or_else(|| anyhow::anyhow!("geom_input_cache 未初始化"))?;
+    let groups = group_refnos_by_dbnum_strict(refnos)?;
+
+    let mut result = HashMap::new();
+    for (dbnum, refs) in groups {
+        let mut db_inputs = cache.get_all_prim_inputs(dbnum).await;
+        for refno in refs {
+            if let Some(input) = db_inputs.remove(&refno) {
+                result.insert(refno, input);
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// 从全局 geom_input_cache 加载所有 dbnum 的 LOOP 输入。

@@ -348,13 +348,13 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
         // 检查是否需要重新生成 plant mesh
         if config.regenerate_plant_mesh {
             println!("\n🔄 检测到 --regen-model 参数，开始重新生成几何体数据...");
-            println!("   - 强制开启 replace_mesh 和 gen_mesh");
+            println!("   - 强制开启 replace_mesh、gen_mesh 和 apply_boolean_operation");
 
             unsafe {
                 std::env::set_var("FORCE_REPLACE_MESH", "true");
             }
 
-            // 无论是否写库，--regen-model 都表示“重建模型数据”：
+            // 无论是否写库，--regen-model 都表示"重建模型数据"：
             // - use_surrealdb=false：生成结果落地 foyer cache（SurrealDB 仅作为输入源，不写 inst_*）
             // - use_surrealdb=true ：同时允许写入/对照验证
             use aios_database::fast_model::gen_all_geos_data;
@@ -364,6 +364,8 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             let original_gen_mesh = db_option_clone.gen_mesh;
             db_option_clone.replace_mesh = Some(true);
             db_option_clone.gen_mesh = true;
+            // regen-model 时强制开启布尔运算，否则导出的 OBJ 不会包含布尔减法结果
+            db_option_clone.apply_boolean_operation = true;
 
             let mut db_option_ext_override = db_option_ext.clone();
             db_option_ext_override.inner = db_option_clone.clone();
@@ -452,7 +454,7 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
 
     if config.regenerate_plant_mesh {
         println!("\n🔄 检测到 --regen-model 参数，开始重新生成几何体数据...");
-        println!("   - 强制开启 replace_mesh 和 gen_mesh");
+        println!("   - 强制开启 replace_mesh、gen_mesh 和 apply_boolean_operation");
         unsafe {
             std::env::set_var("FORCE_REPLACE_MESH", "true");
         }
@@ -465,6 +467,7 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
         let original_gen_mesh = db_option_clone.gen_mesh;
         db_option_clone.replace_mesh = Some(true);
         db_option_clone.gen_mesh = true;
+        db_option_clone.apply_boolean_operation = true;
         let mut db_option_ext_override = db_option_ext.clone();
         db_option_ext_override.inner = db_option_clone.clone();
         gen_all_geos_data(sites.clone(), &db_option_ext_override, None, None).await?;
@@ -604,7 +607,7 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
         // 检查是否需要重新生成 plant mesh
         if config.regenerate_plant_mesh {
             println!("\n🔄 检测到 --regen-model 参数，开始重新生成几何体数据...");
-            println!("   - 强制开启 replace_mesh 和 gen_mesh");
+            println!("   - 强制开启 replace_mesh、gen_mesh 和 apply_boolean_operation");
 
             use aios_database::fast_model::gen_all_geos_data;
         ensure_surreal_connected(db_option_ext).await?;
@@ -618,6 +621,7 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             let original_gen_mesh = db_option_clone.gen_mesh;
             db_option_clone.replace_mesh = Some(true);
             db_option_clone.gen_mesh = true;
+            db_option_clone.apply_boolean_operation = true;
 
             let mut db_option_ext_override = db_option_ext.clone();
             db_option_ext_override.inner = db_option_clone.clone();
@@ -699,7 +703,7 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
 
     if config.regenerate_plant_mesh {
         println!("\n🔄 检测到 --regen-model 参数，开始重新生成几何体数据...");
-        println!("   - 强制开启 replace_mesh 和 gen_mesh");
+        println!("   - 强制开启 replace_mesh、gen_mesh 和 apply_boolean_operation");
         use aios_database::fast_model::gen_all_geos_data;
         ensure_surreal_connected(db_option_ext).await?;
         unsafe {
@@ -710,6 +714,7 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
         let original_gen_mesh = db_option_clone.gen_mesh;
         db_option_clone.replace_mesh = Some(true);
         db_option_clone.gen_mesh = true;
+        db_option_clone.apply_boolean_operation = true;
         let mut db_option_ext_override = db_option_ext.clone();
         db_option_ext_override.inner = db_option_clone.clone();
         gen_all_geos_data(sites.clone(), &db_option_ext_override, None, None).await?;
@@ -853,7 +858,7 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
         // 检查是否需要重新生成 plant mesh
         if config.regenerate_plant_mesh {
             println!("\n🔄 检测到 --regen-model 参数，开始重新生成几何体数据...");
-            println!("   - 强制开启 replace_mesh 和 gen_mesh");
+            println!("   - 强制开启 replace_mesh、gen_mesh 和 apply_boolean_operation");
 
             use aios_database::fast_model::gen_all_geos_data;
             ensure_surreal_connected(db_option_ext).await?;
@@ -867,6 +872,7 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
             let original_gen_mesh = db_option_clone.gen_mesh;
             db_option_clone.replace_mesh = Some(true);
             db_option_clone.gen_mesh = true;
+            db_option_clone.apply_boolean_operation = true;
 
             let mut db_option_ext_override = db_option_ext.clone();
             db_option_ext_override.inner = db_option_clone.clone();
@@ -940,7 +946,7 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
         // 检查是否需要重新生成 plant mesh
         if config.regenerate_plant_mesh {
             println!("\n🔄 检测到 --regen-model 参数，开始重新生成几何体数据...");
-            println!("   - 强制开启 replace_mesh 和 gen_mesh");
+            println!("   - 强制开启 replace_mesh、gen_mesh 和 apply_boolean_operation");
 
             use aios_database::fast_model::gen_all_geos_data;
 
@@ -953,6 +959,7 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
             let original_gen_mesh = db_option_clone.gen_mesh;
             db_option_clone.replace_mesh = Some(true);
             db_option_clone.gen_mesh = true;
+            db_option_clone.apply_boolean_operation = true;
 
             let mut db_option_ext_override = db_option_ext.clone();
             db_option_ext_override.inner = db_option_clone.clone();
@@ -1030,7 +1037,7 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
 
     if config.regenerate_plant_mesh {
         println!("\n🔄 检测到 --regen-model 参数，开始重新生成几何体数据...");
-        println!("   - 强制开启 replace_mesh 和 gen_mesh");
+        println!("   - 强制开启 replace_mesh、gen_mesh 和 apply_boolean_operation");
         use aios_database::fast_model::gen_all_geos_data;
         ensure_surreal_connected(db_option_ext).await?;
         unsafe {
@@ -1041,6 +1048,7 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
         let original_gen_mesh = db_option_clone.gen_mesh;
         db_option_clone.replace_mesh = Some(true);
         db_option_clone.gen_mesh = true;
+        db_option_clone.apply_boolean_operation = true;
         let mut db_option_ext_override = db_option_ext.clone();
         db_option_ext_override.inner = db_option_clone.clone();
         gen_all_geos_data(sites.clone(), &db_option_ext_override, None, None).await?;
@@ -1943,6 +1951,57 @@ pub async fn export_dbnum_instances_parquet_mode(
     .await?;
 
     println!("\n🎉 Parquet 导出完成！");
+    println!("📊 统计信息:");
+    println!("   - 实例数量 (instances): {}", stats.instance_count);
+    println!("   - 几何引用数量 (geo_instances): {}", stats.geo_instance_count);
+    println!("   - TUBI 数量 (tubings): {}", stats.tubing_count);
+    println!("   - 变换矩阵数量 (transforms): {}", stats.transform_count);
+    println!("   - 包围盒数量 (aabb): {}", stats.aabb_count);
+    println!("   - 总文件大小: {} 字节", stats.total_bytes);
+    println!("   - 耗时: {:?}", stats.elapsed);
+    println!("   - 输出目录: {}", output_dir.display());
+
+    Ok(())
+}
+
+/// 从 foyer cache 导出指定 dbnum 的实例数据为多表 Parquet 格式
+///
+/// 与 `export_dbnum_instances_parquet_mode` 输出相同 schema，但数据源为 foyer cache
+/// 而非 SurrealDB，适用于 cache-only 模式 (`use_cache=true, use_surrealdb=false`)。
+pub async fn export_dbnum_instances_parquet_from_cache_mode(
+    dbnum: u32,
+    verbose: bool,
+    output_override: Option<PathBuf>,
+    db_option_ext: &DbOptionExt,
+) -> Result<()> {
+    use aios_database::fast_model::export_model::export_dbnum_instances_parquet::export_dbnum_instances_parquet_from_cache;
+
+    println!("\n🎯 从 foyer cache 导出 dbnum 实例数据为 Parquet（多表）");
+    println!("====================================");
+
+    // 设置输出目录
+    let output_dir = output_override.unwrap_or_else(|| {
+        db_option_ext
+            .get_project_output_dir()
+            .join("parquet")
+    });
+
+    let cache_dir = db_option_ext.get_foyer_cache_dir();
+    let mesh_dir = db_option_ext.inner.get_meshes_path();
+    let mesh_lod_tag = format!("{:?}", db_option_ext.inner.mesh_precision.default_lod);
+
+    let stats = export_dbnum_instances_parquet_from_cache(
+        dbnum,
+        &output_dir,
+        &cache_dir,
+        Some(&mesh_dir),
+        Some(&mesh_lod_tag),
+        verbose,
+        None, // 使用默认毫米单位
+    )
+    .await?;
+
+    println!("\n🎉 Parquet 导出完成！（缓存路径）");
     println!("📊 统计信息:");
     println!("   - 实例数量 (instances): {}", stats.instance_count);
     println!("   - 几何引用数量 (geo_instances): {}", stats.geo_instance_count);

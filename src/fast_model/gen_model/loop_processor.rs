@@ -37,19 +37,21 @@ pub async fn process_loop_refno_page(
 
     // cache-only 路由：当 AIOS_GEN_INPUT_CACHE_ONLY=1 时，从缓存读取预取数据
     if geom_input_cache::is_geom_input_cache_only() {
-        let loop_inputs = geom_input_cache::load_all_loop_inputs_from_global().await;
-        // 仅保留当前 refnos 中的条目
-        let want: std::collections::HashSet<RefnoEnum> = refnos.iter().copied().collect();
-        let filtered: std::collections::HashMap<RefnoEnum, geom_input_cache::LoopInput> = loop_inputs
-            .into_iter()
-            .filter(|(k, _)| want.contains(k))
-            .collect();
-        if filtered.is_empty() {
-            println!(
-                "[loop_processor] cache-only: 缓存中未找到 {} 个 LOOP refno 的输入数据，跳过",
-                refnos.len()
+        let filtered = geom_input_cache::load_loop_inputs_for_refnos_from_global(refnos).await?;
+        if filtered.len() != refnos.len() {
+            let missing: Vec<String> = refnos
+                .iter()
+                .filter(|r| !filtered.contains_key(r))
+                .take(16)
+                .map(|r| r.to_string())
+                .collect();
+            bail!(
+                "[loop_processor] cache-only 严格模式命中失败: request={}, hit={}, miss={}, sample={:?}",
+                refnos.len(),
+                filtered.len(),
+                refnos.len() - filtered.len(),
+                missing
             );
-            return Ok(());
         }
         if !loop_model::gen_loop_geos_from_inputs(ctx.db_option.clone(), filtered, loop_sjus_map_arc, sender).await? {
             bail!("loop geos generation from cache failed");

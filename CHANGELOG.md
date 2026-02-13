@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-02-13
+
+### Refactored
+
+- **instance_cache.rs: 消除冗余 V1 中间转换层，直接序列化 aios_core 原始类型**
+  - 删除 `TransformV1`、`TubiDataV1`、`EleGeosInfoV1`、`EleInstGeoV1`、`EleInstGeosDataV1`、`CachedInstanceBatchV1` 共 6 个中间结构体及其转换函数（净删 ~210 行）
+  - 新增 `CachedInstanceBatchRkyv`，直接引用 `aios_core` 已有 rkyv 派生的原始类型
+  - schema 版本 bump 到 V3，旧缓存自动 miss 重建
+  - 根因：V1/V2 中间层需要手动同步字段，遗漏 `tubi` 字段导致 tubi_relate 写入 0 条
+
+### Fixed
+
+- **修复 cache 模式下 tubi_relate 写入 0 条的问题**
+  - 原因：`EleGeosInfoV1` 缺少 `tubi` 字段，cache 序列化/反序列化丢失 tubi 数据
+  - 影响：BRAN 管道的 tubi 直段数据在 cache→SurrealDB flush 时全部丢失
+
+### Added
+
+- **cache-only 布尔运算增强：几何输入缓存与 STWALL 支持**
+  - 新增 `geom_input_cache.rs`：缓存布尔运算的几何输入数据，支持 neg 重投影到 pos AABB
+  - `manifold_bool.rs`：新增 `reproject_neg_to_pos_aabb` 修复 NGMR 负实体 Z 位置偏移
+  - `query.rs`：布尔成功结果查询增加 debug 日志
+
+- **模型生成流程优化**
+  - `input_cache_pipeline.rs` / `full_noun_mode.rs` / `loop_processor.rs` / `prim_processor.rs`：重构几何输入管线
+  - `orchestrator.rs`：优化编排逻辑
+  - `context.rs`：扩展生成上下文
+  - `cli_modes.rs` / `main.rs`：新增 CLI 选项
+  - `handlers.rs`：新增 web API handler
+  - `export_dbnum_instances_parquet.rs`：新增 Parquet 导出功能
+
 ## 2026-01-30
 
 ### Fixed

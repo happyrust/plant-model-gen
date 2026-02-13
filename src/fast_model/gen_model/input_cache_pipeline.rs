@@ -4,7 +4,7 @@
 //! - 以 batch 为单位：预取输入 -> 写入 `geom_input_cache` -> 发送 key -> consumer 按 key 取回并消费。
 //! - Smoke test 不依赖 SurrealDB：只验证“写入 -> 发 key -> 按 key 读回”的链路。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -29,14 +29,39 @@ pub struct ReadyBatchKey {
 #[derive(Clone, Debug)]
 struct ReadyBatchTask {
     key: ReadyBatchKey,
-    // M1：为保证功能正确性，consumer 仍以“原 refno 列表”调用旧路径的处理函数；
-    // cache.get 只用于验证链路/为后续“从 cache 驱动生成”预留扩展点。
+    // 用于指标统计与 missing 报错上下文。
     refnos: Vec<RefnoEnum>,
 }
 
 const DEFAULT_IN_FLIGHT_WRITES: usize = 4;
 
 static BATCH_ID_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Default)]
+struct PipelineStats {
+    prefetch_count: AtomicU64,
+    cache_hit_count: AtomicU64,
+    cache_miss_hard_fail: AtomicU64,
+    duplicate_prefetch_count: AtomicU64,
+}
+
+fn log_pipeline_stats(kind: &str, stats: &PipelineStats) {
+    let prefetch_count = stats.prefetch_count.load(Ordering::Relaxed);
+    let cache_hit_count = stats.cache_hit_count.load(Ordering::Relaxed);
+    let cache_miss_hard_fail = stats.cache_miss_hard_fail.load(Ordering::Relaxed);
+    let duplicate_prefetch_count = stats.duplicate_prefetch_count.load(Ordering::Relaxed);
+    let total = cache_hit_count + cache_miss_hard_fail;
+    let cache_hit_rate = if total == 0 {
+        0.0
+    } else {
+        (cache_hit_count as f64) * 100.0 / (total as f64)
+    };
+
+    println!(
+        "[input_cache_pipeline][{}] prefetch_count={}, cache_hit_rate={:.2}%, cache_miss_hard_fail={}, duplicate_prefetch_count={}",
+        kind, prefetch_count, cache_hit_rate, cache_miss_hard_fail, duplicate_prefetch_count
+    );
+}
 
 fn make_batch_id(dbnum: u32) -> String {
     // 约定：batch_id 末尾为纯数字，便于 geom_input_cache 的 index counter 解析 max_seq。
@@ -49,18 +74,8 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-fn group_refnos_by_dbnum(refnos: &[RefnoEnum]) -> HashMap<u32, Vec<RefnoEnum>> {
-    let _ = crate::data_interface::db_meta().ensure_loaded();
-    let mut groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
-    for &r in refnos {
-        let dbnum = crate::data_interface::db_meta()
-            .get_dbnum_by_refno(r)
-            .unwrap_or(0);
-        if dbnum > 0 {
-            groups.entry(dbnum).or_default().push(r);
-        }
-    }
-    groups
+fn group_refnos_by_dbnum(refnos: &[RefnoEnum]) -> anyhow::Result<HashMap<u32, Vec<RefnoEnum>>> {
+    geom_input_cache::group_refnos_by_dbnum_strict(refnos)
 }
 
 async fn fetch_loop_inputs_map(
@@ -582,11 +597,14 @@ async fn consume_batches_loop(
     rx: flume::Receiver<ReadyBatchTask>,
     loop_sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
     sender: flume::Sender<ShapeInstancesData>,
+    stats: Arc<PipelineStats>,
 ) -> anyhow::Result<()> {
     while let Ok(task) = rx.recv_async().await {
         let batch_opt = cache.get(task.key.dbnum, &task.key.batch_id).await;
         if let Some(batch) = batch_opt {
-            // cache-only：直接使用缓存输入生成（不得回查 DB）。
+            stats
+                .cache_hit_count
+                .fetch_add(batch.loop_inputs.len() as u64, Ordering::Relaxed);
             if !crate::fast_model::loop_model::gen_loop_geos_from_inputs(
                 ctx.db_option.clone(),
                 batch.loop_inputs,
@@ -598,17 +616,15 @@ async fn consume_batches_loop(
                 anyhow::bail!("gen_loop_geos_from_inputs failed");
             }
         } else {
-            eprintln!(
-                "[input_cache_pipeline] loop batch missing: dbnum={}, batch_id={}, fallback old path",
-                task.key.dbnum, task.key.batch_id
+            stats
+                .cache_miss_hard_fail
+                .fetch_add(task.refnos.len() as u64, Ordering::Relaxed);
+            anyhow::bail!(
+                "[input_cache_pipeline] loop batch missing (strict cache mode): dbnum={}, batch_id={}, refnos={}",
+                task.key.dbnum,
+                task.key.batch_id,
+                task.refnos.len()
             );
-            super::loop_processor::process_loop_refno_page(
-                &ctx,
-                loop_sjus_map_arc.clone(),
-                sender.clone(),
-                &task.refnos,
-            )
-            .await?;
         }
     }
     Ok(())
@@ -619,10 +635,14 @@ async fn consume_batches_prim(
     cache: &'static GeomInputCacheManager,
     rx: flume::Receiver<ReadyBatchTask>,
     sender: flume::Sender<ShapeInstancesData>,
+    stats: Arc<PipelineStats>,
 ) -> anyhow::Result<()> {
     while let Ok(task) = rx.recv_async().await {
         let batch_opt = cache.get(task.key.dbnum, &task.key.batch_id).await;
         if let Some(batch) = batch_opt {
+            stats
+                .cache_hit_count
+                .fetch_add(batch.prim_inputs.len() as u64, Ordering::Relaxed);
             if !crate::fast_model::prim_model::gen_prim_geos_from_inputs(
                 ctx.db_option.clone(),
                 batch.prim_inputs,
@@ -633,11 +653,15 @@ async fn consume_batches_prim(
                 anyhow::bail!("gen_prim_geos_from_inputs failed");
             }
         } else {
-            eprintln!(
-                "[input_cache_pipeline] prim batch missing: dbnum={}, batch_id={}, fallback old path",
-                task.key.dbnum, task.key.batch_id
+            stats
+                .cache_miss_hard_fail
+                .fetch_add(task.refnos.len() as u64, Ordering::Relaxed);
+            anyhow::bail!(
+                "[input_cache_pipeline] prim batch missing (strict cache mode): dbnum={}, batch_id={}, refnos={}",
+                task.key.dbnum,
+                task.key.batch_id,
+                task.refnos.len()
             );
-            super::prim_processor::process_prim_refno_page(&ctx, sender.clone(), &task.refnos).await?;
         }
     }
     Ok(())
@@ -662,26 +686,47 @@ pub async fn run_loop_pipeline_from_refnos(
     let consumer_ctx = ctx.clone();
     let consumer_loop_sjus_map = loop_sjus_map_arc.clone();
     let consumer_sender = sender.clone();
+    let stats = Arc::new(PipelineStats::default());
+    let consumer_stats = stats.clone();
     let consumer = tokio::spawn(async move {
-        consume_batches_loop(consumer_ctx, cache, rx, consumer_loop_sjus_map, consumer_sender).await
+        consume_batches_loop(
+            consumer_ctx,
+            cache,
+            rx,
+            consumer_loop_sjus_map,
+            consumer_sender,
+            consumer_stats,
+        )
+        .await
     });
 
     let sem = Arc::new(Semaphore::new(DEFAULT_IN_FLIGHT_WRITES));
     let mut join_set = tokio::task::JoinSet::<anyhow::Result<()>>::new();
 
     let chunk_size = ctx.batch_size.max(1);
-    let groups = group_refnos_by_dbnum(refnos);
+    let groups = group_refnos_by_dbnum(refnos)?;
     for (dbnum, refs) in groups {
         for chunk in refs.chunks(chunk_size) {
             let permit = sem.clone().acquire_owned().await?;
             let tx = tx.clone();
             let db_option = ctx.db_option.clone();
             let refnos_vec: Vec<RefnoEnum> = chunk.to_vec();
+            let stats = stats.clone();
 
             join_set.spawn(async move {
                 let _permit = permit;
+                let unique_count = refnos_vec.iter().copied().collect::<HashSet<_>>().len();
+                if unique_count < refnos_vec.len() {
+                    stats.duplicate_prefetch_count.fetch_add(
+                        (refnos_vec.len() - unique_count) as u64,
+                        Ordering::Relaxed,
+                    );
+                }
 
                 let inputs = fetch_loop_inputs_map(db_option.as_ref(), &refnos_vec).await?;
+                stats
+                    .prefetch_count
+                    .fetch_add(inputs.len() as u64, Ordering::Relaxed);
                 let batch_id = make_batch_id(dbnum);
                 cache.insert_batch(GeomInputBatch {
                     dbnum,
@@ -707,9 +752,11 @@ pub async fn run_loop_pipeline_from_refnos(
         res.map_err(|e| anyhow::anyhow!("prefetch/write task join failed: {}", e))??;
     }
 
-    consumer
+    let consumer_result = consumer
         .await
-        .map_err(|e| anyhow::anyhow!("consumer join failed: {}", e))??;
+        .map_err(|e| anyhow::anyhow!("consumer join failed: {}", e))?;
+    log_pipeline_stats("loop", &stats);
+    consumer_result?;
 
     Ok(())
 }
@@ -730,24 +777,39 @@ pub async fn run_prim_pipeline_from_refnos(
     let (tx, rx) = flume::unbounded::<ReadyBatchTask>();
     let consumer_ctx = ctx.clone();
     let consumer_sender = sender.clone();
-    let consumer = tokio::spawn(async move { consume_batches_prim(consumer_ctx, cache, rx, consumer_sender).await });
+    let stats = Arc::new(PipelineStats::default());
+    let consumer_stats = stats.clone();
+    let consumer = tokio::spawn(async move {
+        consume_batches_prim(consumer_ctx, cache, rx, consumer_sender, consumer_stats).await
+    });
 
     let sem = Arc::new(Semaphore::new(DEFAULT_IN_FLIGHT_WRITES));
     let mut join_set = tokio::task::JoinSet::<anyhow::Result<()>>::new();
 
     let chunk_size = ctx.batch_size.max(1);
-    let groups = group_refnos_by_dbnum(refnos);
+    let groups = group_refnos_by_dbnum(refnos)?;
     for (dbnum, refs) in groups {
         for chunk in refs.chunks(chunk_size) {
             let permit = sem.clone().acquire_owned().await?;
             let tx = tx.clone();
             let db_option = ctx.db_option.clone();
             let refnos_vec: Vec<RefnoEnum> = chunk.to_vec();
+            let stats = stats.clone();
 
             join_set.spawn(async move {
                 let _permit = permit;
+                let unique_count = refnos_vec.iter().copied().collect::<HashSet<_>>().len();
+                if unique_count < refnos_vec.len() {
+                    stats.duplicate_prefetch_count.fetch_add(
+                        (refnos_vec.len() - unique_count) as u64,
+                        Ordering::Relaxed,
+                    );
+                }
 
                 let inputs = fetch_prim_inputs_map(db_option.as_ref(), &refnos_vec).await?;
+                stats
+                    .prefetch_count
+                    .fetch_add(inputs.len() as u64, Ordering::Relaxed);
                 let batch_id = make_batch_id(dbnum);
                 cache.insert_batch(GeomInputBatch {
                     dbnum,
@@ -773,9 +835,11 @@ pub async fn run_prim_pipeline_from_refnos(
         res.map_err(|e| anyhow::anyhow!("prefetch/write task join failed: {}", e))??;
     }
 
-    consumer
+    let consumer_result = consumer
         .await
-        .map_err(|e| anyhow::anyhow!("consumer join failed: {}", e))??;
+        .map_err(|e| anyhow::anyhow!("consumer join failed: {}", e))?;
+    log_pipeline_stats("prim", &stats);
+    consumer_result?;
 
     Ok(())
 }

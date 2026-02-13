@@ -337,39 +337,24 @@ pub async fn gen_all_geos_data(
     // =========================
 
     {
-
         use crate::fast_model::foyer_cache::geom_input_cache;
 
-        if geom_input_cache::is_geom_input_cache_enabled()
+        let cache_run_mode = geom_input_cache::resolve_cache_run_mode();
+        println!(
+            "[gen_model] geom_input_cache 运行模式: {}",
+            cache_run_mode.as_str()
+        );
 
-            || geom_input_cache::is_geom_input_cache_only()
-
-        {
-
+        if !matches!(cache_run_mode, geom_input_cache::CacheRunMode::Direct) {
             if let Err(e) = geom_input_cache::init_global_geom_input_cache(db_option).await {
-
-                eprintln!(
-
-                    "[gen_model] ⚠️  初始化 geom_input_cache 失败: {}",
-
-                    e
-
-                );
-
+                eprintln!("[gen_model] ⚠️  初始化 geom_input_cache 失败: {}", e);
             } else {
-
                 println!(
-
-                    "[gen_model] geom_input_cache 已初始化 (cache_only={})",
-
-                    geom_input_cache::is_geom_input_cache_only()
-
+                    "[gen_model] geom_input_cache 已初始化 (mode={})",
+                    cache_run_mode.as_str()
                 );
-
             }
-
         }
-
     }
 
 
@@ -1950,16 +1935,10 @@ async fn process_targeted_generation(
 
     }
 
-
-
-    if let Err(err) = capture_refnos_if_enabled(&target_root_refnos, db_option).await {
-
-        eprintln!("[capture] 捕获截图失败: {}", err);
-
-    }
-
-
-
+    // ⚠️ 布尔运算完成后、capture 之前必须 close cache 强制刷盘。
+    // 原因：布尔 worker 通过 foyer_cache_ctx 的 InstanceCacheManager 写入 inst_relate_bool_map，
+    // 但 capture 内部会创建新的 InstanceCacheManager（query.rs），新实例只能从磁盘读取。
+    // 若不先 close，布尔结果可能还在内存层，capture 看不到 → 截图中没有布尔孔洞。
     if let Some(ref ctx) = foyer_cache_ctx {
 
         if let Err(e) = ctx.cache().close().await {
@@ -1967,6 +1946,14 @@ async fn process_targeted_generation(
             eprintln!("[cache] 关闭缓存失败: {}", e);
 
         }
+
+    }
+
+
+
+    if let Err(err) = capture_refnos_if_enabled(&target_root_refnos, db_option).await {
+
+        eprintln!("[capture] 捕获截图失败: {}", err);
 
     }
 

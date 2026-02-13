@@ -4135,6 +4135,14 @@ async fn execute_real_task(state: AppState, task_id: String) {
 
     // 创建数据库配置
     let mut db_option = DbOption::default();
+    // DbOption::default() 会将 pe_chunk/att_chunk 初始化为 0，
+    // 而下游 keys.chunks(0) 会 panic，这里补上合理默认值
+    if db_option.pe_chunk == 0 {
+        db_option.pe_chunk = 300;
+    }
+    if db_option.att_chunk == 0 {
+        db_option.att_chunk = 200;
+    }
     // 若未指定数据库编号，表示处理全部数据库（下游以 None 触发自动枚举）
     db_option.manual_db_nums = if config.manual_db_nums.is_empty() {
         None
@@ -4963,6 +4971,12 @@ async fn execute_parse_pdms_task<F, Fut>(
 
     // 创建数据库配置
     let mut db_option = DbOption::default();
+    if db_option.pe_chunk == 0 {
+        db_option.pe_chunk = 300;
+    }
+    if db_option.att_chunk == 0 {
+        db_option.att_chunk = 200;
+    }
     db_option.manual_db_nums = if config.manual_db_nums.is_empty() { None } else { Some(config.manual_db_nums.clone()) };
     db_option.project_name = config.project_name.clone();
     db_option.project_code = config.project_code.to_string();

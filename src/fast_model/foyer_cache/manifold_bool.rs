@@ -71,6 +71,89 @@ fn fmt_aabb(aabb: &parry3d::bounding_volume::Aabb) -> String {
     )
 }
 
+/// NGMR 负实体穿墙投影：当负实体 AABB 在某个轴上完全不与正实体 AABB 相交时，
+/// 将负实体沿该轴平移到正实体 AABB 中心，确保布尔差集能正确切出孔洞。
+///
+/// 背景：NGMR（跨元件负几何关系）中，carrier（如 FITT 管件）的世界坐标原点
+/// 通常在 target（如 STWALL 墙体）的穿墙方向上有偏移，导致负实体（切割圆柱）
+/// 在 pos local space 中的穿墙轴坐标超出墙体厚度范围，布尔差集无法生效。
+fn reproject_neg_to_pos_aabb(
+    neg: &ManifoldRust,
+    pos_aabb: &parry3d::bounding_volume::Aabb,
+    refno: RefnoEnum,
+    neg_idx: usize,
+) -> Option<ManifoldRust> {
+    let neg_mesh = neg.get_mesh();
+    let neg_aabb = neg_mesh.cal_aabb()?;
+
+    // 检查每个轴是否相交
+    let axes = [
+        (neg_aabb.mins.x, neg_aabb.maxs.x, pos_aabb.mins.x, pos_aabb.maxs.x, "X"),
+        (neg_aabb.mins.y, neg_aabb.maxs.y, pos_aabb.mins.y, pos_aabb.maxs.y, "Y"),
+        (neg_aabb.mins.z, neg_aabb.maxs.z, pos_aabb.mins.z, pos_aabb.maxs.z, "Z"),
+    ];
+
+    let mut dx = 0.0f32;
+    let mut dy = 0.0f32;
+    let mut dz = 0.0f32;
+    let mut need_reproject = false;
+
+    for (neg_min, neg_max, pos_min, pos_max, axis_name) in &axes {
+        let no_overlap = neg_max < pos_min || neg_min > pos_max;
+        if no_overlap {
+            // 将负实体中心对齐到正实体中心
+            let neg_center = (neg_min + neg_max) * 0.5;
+            let pos_center = (pos_min + pos_max) * 0.5;
+            let delta = pos_center - neg_center;
+            match *axis_name {
+                "X" => dx = delta,
+                "Y" => dy = delta,
+                "Z" => dz = delta,
+                _ => {}
+            }
+            need_reproject = true;
+            debug_model_debug!(
+                "[BOOL_REPROJECT] refno={} neg[{}] axis={} no_overlap: neg=[{:.1},{:.1}] pos=[{:.1},{:.1}] delta={:.1}",
+                refno, neg_idx, axis_name, neg_min, neg_max, pos_min, pos_max, delta
+            );
+        }
+    }
+
+    if !need_reproject {
+        return None;
+    }
+
+    // 提取顶点，平移，重建 ManifoldRust
+    let mut vertices = neg_mesh.vertices.clone();
+    for chunk in vertices.chunks_exact_mut(3) {
+        chunk[0] += dx;
+        chunk[1] += dy;
+        chunk[2] += dz;
+    }
+
+    let verts3: Vec<Vec3> = vertices
+        .chunks(3)
+        .map(|v| Vec3::new(v[0], v[1], v[2]))
+        .collect();
+
+    let m = ManifoldRust::from_vertices_indices(&verts3, &neg_mesh.indices, DMat4::IDENTITY, true);
+    if m.get_mesh().indices.is_empty() {
+        debug_model_debug!(
+            "[BOOL_REPROJECT] refno={} neg[{}] 投影后 manifold 为空，保留原始",
+            refno, neg_idx
+        );
+        return None;
+    }
+
+    debug_model_debug!(
+        "[BOOL_REPROJECT] refno={} neg[{}] 投影成功: dx={:.1} dy={:.1} dz={:.1} new_aabb={}",
+        refno, neg_idx, dx, dy, dz,
+        m.get_mesh().cal_aabb().map(|a| fmt_aabb(&a)).unwrap_or_else(|| "None".to_string())
+    );
+
+    Some(m)
+}
+
 fn mesh_base_dir() -> PathBuf {
     get_db_option()
         .meshes_path
@@ -616,18 +699,43 @@ pub async fn run_boolean_worker_from_cache_manager(
         let pos_world_mat = world_mat_for_info(info);
         let inverse_pos_world = pos_world_mat.inverse();
 
+        debug_model_debug!(
+            "[BOOL_WORLD] refno={} pos_world_mat:\n  col0=({:.3},{:.3},{:.3},{:.3})\n  col1=({:.3},{:.3},{:.3},{:.3})\n  col2=({:.3},{:.3},{:.3},{:.3})\n  col3=({:.3},{:.3},{:.3},{:.3})",
+            refno,
+            pos_world_mat.x_axis.x, pos_world_mat.x_axis.y, pos_world_mat.x_axis.z, pos_world_mat.x_axis.w,
+            pos_world_mat.y_axis.x, pos_world_mat.y_axis.y, pos_world_mat.y_axis.z, pos_world_mat.y_axis.w,
+            pos_world_mat.z_axis.x, pos_world_mat.z_axis.y, pos_world_mat.z_axis.z, pos_world_mat.z_axis.w,
+            pos_world_mat.w_axis.x, pos_world_mat.w_axis.y, pos_world_mat.w_axis.z, pos_world_mat.w_axis.w
+        );
+
         // 正实体：使用局部变换（pos local space）加载，优先复用 _m.glb 缓存
         let mut pos_manifolds = Vec::new();
+        // 记录第一个 Pos 几何体的 geo_local_mat，用于将负实体也映射到同一坐标空间。
+        // 背景：正实体 mesh 以 geo_transform 空间加载（含 unit mesh 缩放），
+        // 而负实体原先以 inverse(world_transform) 空间加载，两者不一致。
+        // 修正：负实体也需要经过 inverse(pos_geo_local_mat) 映射到 geo_transform 空间。
+        let mut pos_geo_local_mat: Option<DMat4> = None;
         for inst in &inst_geos.insts {
             if !is_pos_geo_for_boolean(&inst.geo_type) {
                 continue;
             }
             let mat_local = local_mat_for_inst(inst);
+            if pos_geo_local_mat.is_none() {
+                pos_geo_local_mat = Some(mat_local);
+            }
             let mat = if frame == CacheBoolFrame::World {
                 pos_world_mat * mat_local
             } else {
                 mat_local
             };
+            debug_model_debug!(
+                "[BOOL_POS_TF] refno={} geo_hash={} geo_type={:?} unit_flag={} geo_transform.t=({:.3},{:.3},{:.3}) geo_transform.s=({:.3},{:.3},{:.3}) mat_local.col3=({:.3},{:.3},{:.3}) mat_local.col0_len={:.3} mat_local.col1_len={:.3} mat_local.col2_len={:.3}",
+                refno, inst.geo_hash, inst.geo_type, inst.geo_param.is_reuse_unit(),
+                inst.geo_transform.translation.x, inst.geo_transform.translation.y, inst.geo_transform.translation.z,
+                inst.geo_transform.scale.x, inst.geo_transform.scale.y, inst.geo_transform.scale.z,
+                mat_local.w_axis.x, mat_local.w_axis.y, mat_local.w_axis.z,
+                mat_local.x_axis.length(), mat_local.y_axis.length(), mat_local.z_axis.length()
+            );
             match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, mat, false) {
                 Ok(m) => pos_manifolds.push(m),
                 Err(e) => log_load_manifold_failed("cache_pos", refno, &inst.geo_hash.to_string(), &e),
@@ -636,6 +744,13 @@ pub async fn run_boolean_worker_from_cache_manager(
         if pos_manifolds.is_empty() {
             continue;
         }
+
+        // 计算从 world_transform 局部空间到 geo_transform 空间的映射。
+        // 当 pos_geo_local_mat ≠ identity 时（如 unit mesh 缩放），
+        // 负实体需要额外经过 inverse(pos_geo_local_mat) 才能与正实体在同一空间。
+        let inverse_pos_geo_local = pos_geo_local_mat
+            .map(|m| m.inverse())
+            .unwrap_or(DMat4::IDENTITY);
 
         if debug_this {
             eprintln!(
@@ -692,12 +807,16 @@ pub async fn run_boolean_worker_from_cache_manager(
 
                     let geo_local_mat = local_mat_for_inst(inst);
 
-                    // 直接使用 world_transform 计算相对变换
+                    // 计算负实体在正实体 geo_transform 空间中的变换：
+                    // neg_world = carrier_world * geo_local
+                    // mat = inverse(pos_geo_local) * inverse(pos_world) * neg_world
+                    // 其中 inverse(pos_geo_local) 将 world_transform 局部空间映射到 geo_transform 空间，
+                    // 确保负实体与正实体在同一坐标空间（含 unit mesh 缩放）。
                     let neg_world_mat = carrier_world_mat * geo_local_mat;
                     let mat = if frame == CacheBoolFrame::World {
                         neg_world_mat
                     } else {
-                        inverse_pos_world * neg_world_mat
+                        inverse_pos_geo_local * inverse_pos_world * neg_world_mat
                     };
                     match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, mat, true) {
                         Ok(m) => neg_manifolds.push(m),
@@ -730,14 +849,14 @@ pub async fn run_boolean_worker_from_cache_manager(
                     }
                     let geo_local_mat = local_mat_for_inst(inst);
 
-                    // 直接使用 world_transform 计算相对变换：
+                    // 计算负实体在正实体 geo_transform 空间中的变换：
                     // neg_world = carrier_world * geo_local
-                    // mat = inverse_pos_world * neg_world
+                    // mat = inverse(pos_geo_local) * inverse(pos_world) * neg_world
                     let neg_world_mat = carrier_world_mat * geo_local_mat;
                     let mat = if frame == CacheBoolFrame::World {
                         neg_world_mat
                     } else {
-                        inverse_pos_world * neg_world_mat
+                        inverse_pos_geo_local * inverse_pos_world * neg_world_mat
                     };
                     // 临时调试：打印 NGMR 变换信息
                     debug_model_debug!(
@@ -751,6 +870,30 @@ pub async fn run_boolean_worker_from_cache_manager(
                         "[NGMR_BOOL_DBG] pos_world.t=({:.3},{:.3},{:.3}) carrier_world.t=({:.3},{:.3},{:.3})",
                         pos_world_mat.w_axis.x, pos_world_mat.w_axis.y, pos_world_mat.w_axis.z,
                         carrier_world_mat.w_axis.x, carrier_world_mat.w_axis.y, carrier_world_mat.w_axis.z
+                    );
+                    // 打印 carrier 完整世界矩阵（旋转+平移），用于精确推导坐标变换
+                    debug_model_debug!(
+                        "[NGMR_BOOL_DBG] carrier_world_mat:\n  col0=({:.3},{:.3},{:.3},{:.3})\n  col1=({:.3},{:.3},{:.3},{:.3})\n  col2=({:.3},{:.3},{:.3},{:.3})\n  col3=({:.3},{:.3},{:.3},{:.3})",
+                        carrier_world_mat.x_axis.x, carrier_world_mat.x_axis.y, carrier_world_mat.x_axis.z, carrier_world_mat.x_axis.w,
+                        carrier_world_mat.y_axis.x, carrier_world_mat.y_axis.y, carrier_world_mat.y_axis.z, carrier_world_mat.y_axis.w,
+                        carrier_world_mat.z_axis.x, carrier_world_mat.z_axis.y, carrier_world_mat.z_axis.z, carrier_world_mat.z_axis.w,
+                        carrier_world_mat.w_axis.x, carrier_world_mat.w_axis.y, carrier_world_mat.w_axis.z, carrier_world_mat.w_axis.w
+                    );
+                    // 打印 neg_world_mat 完整矩阵
+                    debug_model_debug!(
+                        "[NGMR_BOOL_DBG] neg_world_mat:\n  col0=({:.3},{:.3},{:.3},{:.3})\n  col1=({:.3},{:.3},{:.3},{:.3})\n  col2=({:.3},{:.3},{:.3},{:.3})\n  col3=({:.3},{:.3},{:.3},{:.3})",
+                        neg_world_mat.x_axis.x, neg_world_mat.x_axis.y, neg_world_mat.x_axis.z, neg_world_mat.x_axis.w,
+                        neg_world_mat.y_axis.x, neg_world_mat.y_axis.y, neg_world_mat.y_axis.z, neg_world_mat.y_axis.w,
+                        neg_world_mat.z_axis.x, neg_world_mat.z_axis.y, neg_world_mat.z_axis.z, neg_world_mat.z_axis.w,
+                        neg_world_mat.w_axis.x, neg_world_mat.w_axis.y, neg_world_mat.w_axis.z, neg_world_mat.w_axis.w
+                    );
+                    // 打印最终 mat 完整矩阵
+                    debug_model_debug!(
+                        "[NGMR_BOOL_DBG] final_mat:\n  col0=({:.3},{:.3},{:.3},{:.3})\n  col1=({:.3},{:.3},{:.3},{:.3})\n  col2=({:.3},{:.3},{:.3},{:.3})\n  col3=({:.3},{:.3},{:.3},{:.3})",
+                        mat.x_axis.x, mat.x_axis.y, mat.x_axis.z, mat.x_axis.w,
+                        mat.y_axis.x, mat.y_axis.y, mat.y_axis.z, mat.y_axis.w,
+                        mat.z_axis.x, mat.z_axis.y, mat.z_axis.z, mat.z_axis.w,
+                        mat.w_axis.x, mat.w_axis.y, mat.w_axis.z, mat.w_axis.w
                     );
                     if debug_this {
                         eprintln!(
@@ -809,6 +952,28 @@ pub async fn run_boolean_worker_from_cache_manager(
             aios_core::csg::manifold::ManifoldOpType::Union,
         );
 
+        // 始终打印 AABB 调试信息，用于排查布尔运算坐标空间问题
+        {
+            let pos_mesh = pos_union.get_mesh();
+            debug_model_debug!(
+                "[BOOL_AABB] refno={} pos_union: verts={} tris={} aabb={}",
+                refno,
+                pos_mesh.vertices.len() / 3,
+                pos_mesh.indices.len() / 3,
+                pos_mesh.cal_aabb().map(|a| fmt_aabb(&a)).unwrap_or_else(|| "None".to_string())
+            );
+            for (i, neg) in neg_manifolds.iter().enumerate() {
+                let neg_mesh = neg.get_mesh();
+                debug_model_debug!(
+                    "[BOOL_AABB] refno={} neg[{}]: verts={} tris={} aabb={}",
+                    refno, i,
+                    neg_mesh.vertices.len() / 3,
+                    neg_mesh.indices.len() / 3,
+                    neg_mesh.cal_aabb().map(|a| fmt_aabb(&a)).unwrap_or_else(|| "None".to_string())
+                );
+            }
+        }
+
         if debug_this {
             if let Some(aabb) = pos_union.get_mesh().cal_aabb() {
                 eprintln!("[bool][cache][dbg] pos_union_aabb: {}", fmt_aabb(&aabb));
@@ -825,6 +990,18 @@ pub async fn run_boolean_worker_from_cache_manager(
                 let _ = export_single_mesh_to_glb(&mesh, &path);
             }
         }
+
+        // NGMR 穿墙投影：检测不与正实体 AABB 相交的负实体，沿不相交轴平移到正实体中心。
+        // 典型场景：STWALL 墙体厚度 100mm（pos local Z=0..100），FITT 管件的 NGMR 负圆柱
+        // 因 carrier 世界坐标偏移导致 Z 远超 0..100 范围，布尔差集无法切出孔洞。
+        if let Some(pos_aabb) = pos_union.get_mesh().cal_aabb() {
+            for (i, neg) in neg_manifolds.iter_mut().enumerate() {
+                if let Some(reprojected) = reproject_neg_to_pos_aabb(neg, &pos_aabb, refno, i) {
+                    *neg = reprojected;
+                }
+            }
+        }
+
         let mut final_manifold = diff_with_guards(pos_union, &neg_manifolds, refno, "lo");
 
         // 经验：退化为空时尝试高精度重算一次
@@ -847,6 +1024,18 @@ pub async fn run_boolean_worker_from_cache_manager(
                 );
                 final_manifold = diff_with_guards(pos_union_hi, &neg_manifolds, refno, "hi");
             }
+        }
+
+        // 打印最终布尔结果的 AABB，用于对比是否真正发生了差集
+        {
+            let final_mesh = final_manifold.get_mesh();
+            debug_model_debug!(
+                "[BOOL_AABB] refno={} final: verts={} tris={} aabb={}",
+                refno,
+                final_mesh.vertices.len() / 3,
+                final_mesh.indices.len() / 3,
+                final_mesh.cal_aabb().map(|a| fmt_aabb(&a)).unwrap_or_else(|| "None".to_string())
+            );
         }
 
         if debug_dump {
@@ -898,9 +1087,18 @@ pub async fn run_boolean_worker_from_cache_manager(
         }
 
         if let Some((dbnum, batch_id)) = target_locations.get(&refno) {
+            println!(
+                "[boolean_worker_cache] 写入 bool Success: refno={} dbnum={} batch_id={} mesh_id={}",
+                refno, dbnum, batch_id, mesh_id
+            );
             cache_manager
                 .upsert_inst_relate_bool(*dbnum, batch_id, refno, mesh_id, "Success")
                 .await?;
+        } else {
+            eprintln!(
+                "[boolean_worker_cache] ⚠️ target_locations 中找不到 refno={}，无法写入 bool 结果！",
+                refno
+            );
         }
 
         processed += 1;

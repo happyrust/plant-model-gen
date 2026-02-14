@@ -674,6 +674,136 @@ async fn gen_cata_geos_inner(
     );
 
     if process_cata && !all_unique_keys.is_empty() {
+        // ════════════════════════════════════════════════════════════════════════════
+        // P3 优化：P0/P1 全局执行一次 + 4 个 batch 主循环并发
+        // ════════════════════════════════════════════════════════════════════════════
+        //
+        // 【优化原理】
+        // P0 预取和 P1 预执行只需全局执行一次（覆盖所有 unique_cata），
+        // 避免 4 个 batch 各自独立预取导致数据库并发请求爆炸。
+        // 预取/预执行完成后，4 个 batch 的主循环（纯 cache hit + per-element 处理）并发执行。
+        // ════════════════════════════════════════════════════════════════════════════
+
+        // ── P0 优化（全局）：批量并发预取 attmap / transform / generic_type ──
+        let t_prefetch_global = Instant::now();
+        {
+            let mut all_refnos: Vec<RefnoEnum> = Vec::new();
+            for j in 0..unique_cata_cnt {
+                let cata_hash = &all_unique_keys[j];
+                if cata_hash == "0" {
+                    continue;
+                }
+                if let Some(target_cata) = target_cata_map.get(cata_hash) {
+                    all_refnos.extend_from_slice(&target_cata.group_refnos);
+                }
+            }
+            all_refnos.sort_unstable();
+            all_refnos.dedup();
+
+            if !all_refnos.is_empty() {
+                let attmap_futs: Vec<_> = all_refnos
+                    .iter()
+                    .map(|&r| aios_core::get_named_attmap(r))
+                    .collect();
+                let generic_futs: Vec<_> = all_refnos
+                    .iter()
+                    .map(|&r| get_generic_type(r))
+                    .collect();
+                let transform_fut = crate::fast_model::transform_cache::get_world_transforms_cache_first_batch(
+                    Some(db_option.as_ref()),
+                    &all_refnos,
+                );
+
+                let (attmap_results, generic_results, _transform_result) = tokio::join!(
+                    futures::future::join_all(attmap_futs),
+                    futures::future::join_all(generic_futs),
+                    transform_fut,
+                );
+                let _ = attmap_results;
+                let _ = generic_results;
+
+                println!(
+                    "    [gen_cata_geos] P0 全局预取完成: refnos={}, elapsed={}ms",
+                    all_refnos.len(),
+                    t_prefetch_global.elapsed().as_millis()
+                );
+            }
+        }
+
+        // ── P1 优化（全局）：并发预执行 gen_cata_single_geoms ──
+        let force_regen_cata_flag = process_cata && replace_exist;
+        let pre_gen_results: Arc<DashMap<RefnoEnum, (Arc<CateCsgShapeMap>, Arc<DashMap<RefnoEnum, crate::data_interface::structs::PlantAxisMap>>)>> = Arc::new(DashMap::new());
+        {
+            let t_pre_gen = Instant::now();
+            let sem = Arc::new(Semaphore::new(6));
+            let mut pre_gen_handles = Vec::new();
+
+            for j in 0..unique_cata_cnt {
+                let cata_hash = &all_unique_keys[j];
+                if cata_hash == "0" {
+                    continue;
+                }
+                let target_cata = match target_cata_map.get(cata_hash) {
+                    Some(tc) => tc,
+                    None => continue,
+                };
+                let target_exist_inst = target_cata.exist_inst;
+                let target_group_refnos = target_cata.group_refnos.clone();
+                drop(target_cata);
+
+                let needs_generate = process_cata && (force_regen_cata_flag || !target_exist_inst);
+                if !needs_generate {
+                    continue;
+                }
+                let ele_refno = match target_group_refnos.first().copied() {
+                    Some(r) => r,
+                    None => continue,
+                };
+
+                let sem = sem.clone();
+                let pre_gen_results = pre_gen_results.clone();
+                let cata_resolve_cache = cata_resolve_cache.clone();
+                let cata_hash_owned = cata_hash.clone();
+
+                pre_gen_handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+
+                    if let Some(cache_mgr) = cata_resolve_cache.as_ref() {
+                        if cache_mgr.get(&cata_hash_owned).await.is_some() {
+                            return;
+                        }
+                    }
+
+                    let csg_shapes_map = Arc::new(CateCsgShapeMap::new());
+                    let design_axis_map = Arc::new(DashMap::new());
+                    match gen_cata_single_geoms(ele_refno, &csg_shapes_map, &design_axis_map).await {
+                        Ok(_) => {
+                            pre_gen_results.insert(ele_refno, (csg_shapes_map, design_axis_map));
+                        }
+                        Err(_) => {}
+                    }
+                }));
+            }
+
+            if !pre_gen_handles.is_empty() {
+                let handle_cnt = pre_gen_handles.len();
+                for h in pre_gen_handles {
+                    let _ = h.await;
+                }
+                println!(
+                    "    [gen_cata_geos] P1 全局并发预执行完成: cata_cnt={}, hit={}, elapsed={}ms",
+                    handle_cnt,
+                    pre_gen_results.len(),
+                    t_pre_gen.elapsed().as_millis()
+                );
+            }
+        }
+
+        // ── P2 优化（全局）：pos_neg_cache 共享 ──
+        let pos_neg_cache: Arc<DashMap<RefnoEnum, HashMap<RefnoEnum, Vec<RefnoEnum>>>> = Arc::new(DashMap::new());
+
+        // ── P3 优化：4 个 batch 主循环并发执行 ──
+        let mut batch_handles = Vec::new();
         for i in 0..batch_chunks_cnt {
             let all_unique_keys = all_unique_keys.clone();
             let target_cata_map = target_cata_map.clone();
@@ -682,27 +812,23 @@ async fn gen_cata_geos_inner(
             let tubi_info_map_clone = tubi_info_map.clone();
             let sender = sender.clone();
             let total_time_stats = total_time_stats.clone();
+            let db_option = db_option.clone();
+            let cata_resolve_cache = cata_resolve_cache.clone();
+            let pre_gen_results = pre_gen_results.clone();
+            let pos_neg_cache = pos_neg_cache.clone();
             let batch_id = i + 1;
-
-            #[cfg(feature = "profile")]
-            tracing::info!(batch_id, "Starting batch processing");
 
             let start_idx = i * batch_size;
             if start_idx >= unique_cata_cnt {
-                debug_model_debug!(
-                    "[gen_cata_geos] 批次 {} 起始索引 {} 超出总长度 {}, 跳过",
-                    batch_id,
-                    start_idx,
-                    unique_cata_cnt
-                );
                 continue;
             }
             let mut end_idx = start_idx + batch_size;
             if end_idx > unique_cata_cnt {
                 end_idx = unique_cata_cnt;
             }
-            #[cfg(feature = "profile")]
-            tracing::info!(start_idx, end_idx, "Processing batch range");
+
+            batch_handles.push(tokio::spawn(async move {
+
             let mut shape_insts_data = ShapeInstancesData::default();
             if is_bran {
                 shape_insts_data.fill_basic_shapes();
@@ -717,168 +843,7 @@ async fn gen_cata_geos_inner(
             let mut db_time_hash_lock = 0;
             let mut db_time_query_refnos = 0;
 
-            // ── P0 优化：批量并发预取 attmap / transform / generic_type ──
-            // 收集本 batch 所有 target_group_refnos，在进入逐 cata 循环前一次性并发预热缓存。
-            // 各底层函数自带 LRU 缓存（get_named_attmap 10000 条、get_ancestor_types 10000 条），
-            // 预取后循环内再调用时直接命中内存，消除 N+1 串行 DB 往返。
-            let t_prefetch_batch = Instant::now();
-            {
-                let mut batch_all_refnos: Vec<RefnoEnum> = Vec::new();
-                for j in start_idx..end_idx {
-                    let cata_hash = &all_unique_keys[j];
-                    if cata_hash == "0" {
-                        continue;
-                    }
-                    if let Some(target_cata) = target_cata_map.get(cata_hash) {
-                        batch_all_refnos.extend_from_slice(&target_cata.group_refnos);
-                    }
-                }
-                batch_all_refnos.sort_unstable();
-                batch_all_refnos.dedup();
-
-                if !batch_all_refnos.is_empty() {
-                    // 1) 并发预取 get_named_attmap（命中 #[cached] LRU）
-                    let attmap_futs: Vec<_> = batch_all_refnos
-                        .iter()
-                        .map(|&r| aios_core::get_named_attmap(r))
-                        .collect();
-                    // 2) 并发预取 get_generic_type（命中 get_ancestor_types 的 #[cached] LRU）
-                    let generic_futs: Vec<_> = batch_all_refnos
-                        .iter()
-                        .map(|&r| get_generic_type(r))
-                        .collect();
-                    // 3) 批量预取 world_transform（已有 batch 接口）
-                    let transform_fut = crate::fast_model::transform_cache::get_world_transforms_cache_first_batch(
-                        Some(db_option.as_ref()),
-                        &batch_all_refnos,
-                    );
-
-                    // 三路并发执行
-                    let (attmap_results, generic_results, _transform_result) = tokio::join!(
-                        futures::future::join_all(attmap_futs),
-                        futures::future::join_all(generic_futs),
-                        transform_fut,
-                    );
-                    let _ = attmap_results;   // 结果已写入各自 LRU 缓存
-                    let _ = generic_results;  // 结果已写入各自 LRU 缓存
-                    // transform_result 已写入 foyer cache
-
-                    println!(
-                        "    [gen_cata_geos] batch {} 预取完成: refnos={}, elapsed={}ms",
-                        batch_id,
-                        batch_all_refnos.len(),
-                        t_prefetch_batch.elapsed().as_millis()
-                    );
-                }
-            }
-
-            // ════════════════════════════════════════════════════════════════════════════
-            // P1 优化：并发预执行 gen_cata_single_geoms
-            // ════════════════════════════════════════════════════════════════════════════
-            //
-            // 【优化目标】
-            // 消除 gen_single_geoms 瓶颈（原占阶段4时间的 77%，约 80秒）
-            //
-            // 【优化原理】
-            // 1. 在主循环前，扫描本 batch 中需要走 generate 路径的 cata_hash
-            // 2. 使用 tokio::spawn + Semaphore(6) 并发执行 gen_cata_single_geoms
-            // 3. 将预执行结果存入 pre_gen_results DashMap
-            // 4. 主循环中优先检查 pre_gen_results，命中则跳过串行调用
-            //
-            // 【优化效果】
-            // - 阶段4 总时间：111秒 → 46.7秒（加速 2.4x）
-            // - gen_single_geoms：80秒 → 0秒（完全消除）
-            // - 并发度：6（Semaphore 限制）
-            // ════════════════════════════════════════════════════════════════════════════
-            let force_regen_cata_flag = process_cata && replace_exist;
-            let pre_gen_results: Arc<DashMap<RefnoEnum, (Arc<CateCsgShapeMap>, Arc<DashMap<RefnoEnum, crate::data_interface::structs::PlantAxisMap>>)>> = Arc::new(DashMap::new());
-            {
-                let t_pre_gen = Instant::now();
-                let sem = Arc::new(Semaphore::new(6));
-                let mut pre_gen_handles = Vec::new();
-
-                for j in start_idx..end_idx {
-                    let cata_hash = &all_unique_keys[j];
-                    if cata_hash == "0" {
-                        continue;
-                    }
-                    let target_cata = match target_cata_map.get(cata_hash) {
-                        Some(tc) => tc,
-                        None => continue,
-                    };
-                    let target_exist_inst = target_cata.exist_inst;
-                    let target_group_refnos = target_cata.group_refnos.clone();
-                    drop(target_cata);
-
-                    // 只对需要走 generate 路径的 cata_hash 预执行
-                    let needs_generate = process_cata && (force_regen_cata_flag || !target_exist_inst);
-                    if !needs_generate {
-                        continue;
-                    }
-                    let ele_refno = match target_group_refnos.first().copied() {
-                        Some(r) => r,
-                        None => continue,
-                    };
-
-                    let sem = sem.clone();
-                    let pre_gen_results = pre_gen_results.clone();
-                    let cata_resolve_cache = cata_resolve_cache.clone();
-                    let cata_hash_owned = cata_hash.clone();
-
-                    pre_gen_handles.push(tokio::spawn(async move {
-                        let _permit = sem.acquire().await.unwrap();
-
-                        // 如果 foyer cache 命中，跳过预执行（原循环会走 cache 路径）
-                        if let Some(cache_mgr) = cata_resolve_cache.as_ref() {
-                            if cache_mgr.get(&cata_hash_owned).await.is_some() {
-                                return;
-                            }
-                        }
-
-                        let csg_shapes_map = Arc::new(CateCsgShapeMap::new());
-                        let design_axis_map = Arc::new(DashMap::new());
-                        match gen_cata_single_geoms(ele_refno, &csg_shapes_map, &design_axis_map).await {
-                            Ok(_) => {
-                                pre_gen_results.insert(ele_refno, (csg_shapes_map, design_axis_map));
-                            }
-                            Err(_) => {
-                                // 预执行失败不影响原循环，原循环会重试或跳过
-                            }
-                        }
-                    }));
-                }
-
-                if !pre_gen_handles.is_empty() {
-                    let handle_cnt = pre_gen_handles.len();
-                    for h in pre_gen_handles {
-                        let _ = h.await;
-                    }
-                    println!(
-                        "    [gen_cata_geos] batch {} P1 并发预执行完成: cata_cnt={}, hit={}, elapsed={}ms",
-                        batch_id,
-                        handle_cnt,
-                        pre_gen_results.len(),
-                        t_pre_gen.elapsed().as_millis()
-                    );
-                }
-            }
-
-            // ════════════════════════════════════════════════════════════════════════════
-            // P2 优化：pos_neg_map 按 gmse_refno 缓存
-            // ════════════════════════════════════════════════════════════════════════════
-            //
-            // 【优化目标】
-            // 消除 query_refnos 瓶颈（原占阶段4时间的 15%，约 15秒）
-            //
-            // 【优化原理】
-            // query_refnos_has_pos_neg_map 按 gmse_refno 查询负实体映射，同一 gmse 会被多次查询。
-            // 使用 DashMap 缓存查询结果，避免重复 SQL 查询。
-            //
-            // 【优化效果】
-            // - query_refnos：15秒 → 0.3秒（加速 56x）
-            // ════════════════════════════════════════════════════════════════════════════
-            let pos_neg_cache: DashMap<RefnoEnum, HashMap<RefnoEnum, Vec<RefnoEnum>>> = DashMap::new();
-
+            // ── 主循环：处理本 batch 的 cata_hash ──
             for j in start_idx..end_idx {
                 #[cfg(feature = "profile")]
                 tracing::debug!(item_idx = j, "Processing item");
@@ -2285,6 +2250,22 @@ async fn gen_cata_geos_inner(
 
             #[cfg(feature = "profile")]
             tracing::info!(batch_id, "Batch processing complete");
+
+            })); // end tokio::spawn + batch_handles.push
+        }
+
+        // P3: 等待所有 batch 并发完成
+        if !batch_handles.is_empty() {
+            let batch_cnt = batch_handles.len();
+            let t_all_batches = Instant::now();
+            for h in batch_handles {
+                let _ = h.await;
+            }
+            println!(
+                "    [gen_cata_geos] P3 所有 {} 个 batch 并发完成, elapsed={}ms",
+                batch_cnt,
+                t_all_batches.elapsed().as_millis()
+            );
         }
     }
 

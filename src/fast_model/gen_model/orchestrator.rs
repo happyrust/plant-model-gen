@@ -14,7 +14,7 @@
 
 
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use std::path::Path;
 
@@ -83,6 +83,94 @@ use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 use aios_core::tool::db_tool::db1_hash;
 
 use dashmap::DashMap;
+
+async fn resolve_dbnum_for_refno(refno: RefnoEnum) -> Option<u32> {
+    if db_meta().ensure_loaded().is_ok() {
+        if let Some(dbnum) = db_meta().get_dbnum_by_refno(refno) {
+            return Some(dbnum);
+        }
+    }
+
+    // 兼容：db_meta_info.json 未就绪时，尽力从 tree_index 推导。
+    TreeIndexManager::resolve_dbnum_for_refno(refno).await.ok()
+}
+
+/// 按 dbnum 拆分一个 batch，保证写入 InstanceCache 时“一个 batch 只落到一个 dbnum 分桶”。
+///
+/// 说明：
+/// - 这里不尝试“从 ref0 推 dbnum”，必须通过 db_meta/tree_index 映射。
+/// - 若某个 refno 无法映射 dbnum：直接返回 Err（避免悄然写错桶）。
+async fn split_shape_instances_by_dbnum(
+    shape_insts: &aios_core::geometry::ShapeInstancesData,
+) -> anyhow::Result<HashMap<u32, aios_core::geometry::ShapeInstancesData>> {
+    use aios_core::geometry::ShapeInstancesData;
+
+    let mut out: HashMap<u32, ShapeInstancesData> = HashMap::new();
+    let mut cache: HashMap<RefnoEnum, u32> = HashMap::new();
+
+    async fn get_dbnum_cached(
+        refno: RefnoEnum,
+        cache: &mut HashMap<RefnoEnum, u32>,
+    ) -> anyhow::Result<u32> {
+        if let Some(v) = cache.get(&refno) {
+            return Ok(*v);
+        }
+        let dbnum = resolve_dbnum_for_refno(refno)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("缺少 ref0->dbnum 映射: refno={refno}"))?;
+        cache.insert(refno, dbnum);
+        Ok(dbnum)
+    }
+
+    // inst_info
+    for (refno, info) in shape_insts.inst_info_map.iter() {
+        let refno = *refno;
+        let dbnum = get_dbnum_cached(refno, &mut cache).await?;
+        out.entry(dbnum)
+            .or_insert_with(ShapeInstancesData::default)
+            .inst_info_map
+            .insert(refno, info.clone());
+    }
+
+    // inst_tubi
+    for (refno, tubi) in shape_insts.inst_tubi_map.iter() {
+        let refno = *refno;
+        let dbnum = get_dbnum_cached(refno, &mut cache).await?;
+        out.entry(dbnum)
+            .or_insert_with(ShapeInstancesData::default)
+            .inst_tubi_map
+            .insert(refno, tubi.clone());
+    }
+
+    // inst_geos：每条 geos_data 都绑定一个 refno（元素），直接按 geos_data.refno 分桶。
+    for (inst_key, geos_data) in shape_insts.inst_geos_map.iter() {
+        let inst_key = inst_key.clone();
+        let geos_data = geos_data.clone();
+        let dbnum = get_dbnum_cached(geos_data.refno, &mut cache).await?;
+        out.entry(dbnum)
+            .or_insert_with(ShapeInstancesData::default)
+            .inst_geos_map
+            .insert(inst_key, geos_data);
+    }
+
+    // neg_relate / ngmr_neg_relate：按 key(refno) 分桶
+    for (refno, v) in &shape_insts.neg_relate_map {
+        let dbnum = get_dbnum_cached(*refno, &mut cache).await?;
+        out.entry(dbnum)
+            .or_insert_with(ShapeInstancesData::default)
+            .neg_relate_map
+            .insert(*refno, v.clone());
+    }
+    for (refno, v) in &shape_insts.ngmr_neg_relate_map {
+        let dbnum = get_dbnum_cached(*refno, &mut cache).await?;
+        out.entry(dbnum)
+            .or_insert_with(ShapeInstancesData::default)
+            .ngmr_neg_relate_map
+            .insert(*refno, v.clone());
+    }
+
+    Ok(out)
+}
 
 
 
@@ -750,31 +838,45 @@ async fn process_full_noun_mode(
             }
 
             if let Some(ref cache_manager) = cache_manager_for_insert {
+                let t0 = Instant::now();
 
-                // 优先使用已知的 dbnum（来自 manual_db_nums），避免依赖 db_meta_info.json 或 TreeIndex
-
-                let dbnum = if let Some(known) = known_dbnum {
-
-                    Some(known)
-
-                } else {
-
-                    resolve_dbnum_from_shape(&shape_insts).await
-
+                let by_dbnum = match split_shape_instances_by_dbnum(&shape_insts).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[cache] batch 拆分 dbnum 失败，跳过写 cache: {}", e);
+                        continue;
+                    }
                 };
 
-                if let Some(dbnum) = dbnum {
-
-                    let t0 = Instant::now();
-
-                    cache_manager.insert_from_shape(dbnum, &shape_insts);
-
-                    let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(dbnum));
-
-                    t_cache += t0.elapsed();
-
+                if by_dbnum.len() > 1 {
+                    eprintln!(
+                        "[cache] ⚠️ batch 同时包含多个 dbnum，将按 dbnum 拆分写入: dbnums={:?}",
+                        by_dbnum.keys().collect::<Vec<_>>()
+                    );
                 }
 
+                if let Some(known) = known_dbnum {
+                    if let Some(sub) = by_dbnum.get(&known) {
+                        cache_manager.insert_from_shape(known, sub);
+                        let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(known));
+                    }
+                    // 其他 dbnum 的数据直接报警（manual_db_nums=单库时出现多库，属于上游 bug）
+                    for dbnum in by_dbnum.keys().copied() {
+                        if dbnum != known {
+                            eprintln!(
+                                "[cache] ⚠️ manual_db_nums 指定 dbnum={}，但 batch 内出现 dbnum={}，已忽略",
+                                known, dbnum
+                            );
+                        }
+                    }
+                } else {
+                    for (dbnum, sub) in by_dbnum {
+                        cache_manager.insert_from_shape(dbnum, &sub);
+                        let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(dbnum));
+                    }
+                }
+
+                t_cache += t0.elapsed();
             }
 
             // 同时写入 Parquet（如果启用）
@@ -1561,24 +1663,39 @@ async fn process_targeted_generation(
 
             if let Some(ref cache_manager) = cache_manager_for_insert {
 
-                // 优先使用已知的 dbnum（来自 manual_db_nums），避免依赖 db_meta_info.json 或 TreeIndex
-
-                let dbnum = if let Some(known) = known_dbnum {
-
-                    Some(known)
-
-                } else {
-
-                    resolve_dbnum_from_shape(&shape_insts).await
-
+                let by_dbnum = match split_shape_instances_by_dbnum(&shape_insts).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[cache] batch 拆分 dbnum 失败，跳过写 cache: {}", e);
+                        continue;
+                    }
                 };
 
-                if let Some(dbnum) = dbnum {
+                if by_dbnum.len() > 1 {
+                    eprintln!(
+                        "[cache] ⚠️ batch 同时包含多个 dbnum，将按 dbnum 拆分写入: dbnums={:?}",
+                        by_dbnum.keys().collect::<Vec<_>>()
+                    );
+                }
 
-                    cache_manager.insert_from_shape(dbnum, &shape_insts);
-
-                    let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(dbnum));
-
+                if let Some(known) = known_dbnum {
+                    if let Some(sub) = by_dbnum.get(&known) {
+                        cache_manager.insert_from_shape(known, sub);
+                        let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(known));
+                    }
+                    for dbnum in by_dbnum.keys().copied() {
+                        if dbnum != known {
+                            eprintln!(
+                                "[cache] ⚠️ manual_db_nums 指定 dbnum={}，但 batch 内出现 dbnum={}，已忽略",
+                                known, dbnum
+                            );
+                        }
+                    }
+                } else {
+                    for (dbnum, sub) in by_dbnum {
+                        cache_manager.insert_from_shape(dbnum, &sub);
+                        let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(dbnum));
+                    }
                 }
 
             }
@@ -2045,6 +2162,8 @@ async fn process_full_database_generation(
 
     let use_surrealdb = db_option.use_surrealdb;
 
+    let replace_exist = db_option.inner.is_replace_mesh();
+
     // 缓存功能已禁用
 
     if dbnos.is_empty() {
@@ -2159,7 +2278,7 @@ async fn process_full_database_generation(
 
                 if use_surrealdb {
 
-                    if let Err(e) = save_instance_data_optimize(&shape_insts, false).await {
+                    if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
 
                         eprintln!("保存实例数据失败: {}", e);
 
@@ -2169,7 +2288,23 @@ async fn process_full_database_generation(
 
                 if let Some(ref cache_manager) = cache_manager_for_insert {
 
-                    cache_manager.insert_from_shape(dbnum, &shape_insts);
+                    let by_dbnum = match split_shape_instances_by_dbnum(&shape_insts).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("[cache] batch 拆分 dbnum 失败，跳过写 cache: {}", e);
+                            continue;
+                        }
+                    };
+                    if by_dbnum.len() != 1 || !by_dbnum.contains_key(&dbnum) {
+                        eprintln!(
+                            "[cache] ⚠️ full-db 生成路径期望单库 dbnum={}，但 batch 出现 dbnums={:?}",
+                            dbnum,
+                            by_dbnum.keys().collect::<Vec<_>>()
+                        );
+                    }
+                    if let Some(sub) = by_dbnum.get(&dbnum) {
+                        cache_manager.insert_from_shape(dbnum, sub);
+                    }
 
                 }
 

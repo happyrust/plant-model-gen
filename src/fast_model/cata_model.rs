@@ -733,6 +733,8 @@ async fn gen_cata_geos_inner(
         // ── P1 优化（全局）：并发预执行 gen_cata_single_geoms ──
         let force_regen_cata_flag = process_cata && replace_exist;
         let pre_gen_results: Arc<DashMap<RefnoEnum, (Arc<CateCsgShapeMap>, Arc<DashMap<RefnoEnum, crate::data_interface::structs::PlantAxisMap>>)>> = Arc::new(DashMap::new());
+        let pre_gen_skip_cache = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let pre_gen_fail_cnt = Arc::new(std::sync::atomic::AtomicU32::new(0));
         {
             let t_pre_gen = Instant::now();
             let sem = Arc::new(Semaphore::new(6));
@@ -765,11 +767,15 @@ async fn gen_cata_geos_inner(
                 let cata_resolve_cache = cata_resolve_cache.clone();
                 let cata_hash_owned = cata_hash.clone();
 
+                let pre_gen_skip_cache = pre_gen_skip_cache.clone();
+                let pre_gen_fail_cnt = pre_gen_fail_cnt.clone();
+
                 pre_gen_handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
 
                     if let Some(cache_mgr) = cata_resolve_cache.as_ref() {
                         if cache_mgr.get(&cata_hash_owned).await.is_some() {
+                            pre_gen_skip_cache.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             return;
                         }
                     }
@@ -780,7 +786,9 @@ async fn gen_cata_geos_inner(
                         Ok(_) => {
                             pre_gen_results.insert(ele_refno, (csg_shapes_map, design_axis_map));
                         }
-                        Err(_) => {}
+                        Err(_) => {
+                            pre_gen_fail_cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }));
             }
@@ -791,9 +799,11 @@ async fn gen_cata_geos_inner(
                     let _ = h.await;
                 }
                 println!(
-                    "    [gen_cata_geos] P1 全局并发预执行完成: cata_cnt={}, hit={}, elapsed={}ms",
+                    "    [gen_cata_geos] P1 全局并发预执行完成: cata_cnt={}, hit={}, skip_cache={}, fail={}, elapsed={}ms",
                     handle_cnt,
                     pre_gen_results.len(),
+                    pre_gen_skip_cache.load(std::sync::atomic::Ordering::Relaxed),
+                    pre_gen_fail_cnt.load(std::sync::atomic::Ordering::Relaxed),
                     t_pre_gen.elapsed().as_millis()
                 );
             }

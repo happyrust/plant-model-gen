@@ -2493,40 +2493,80 @@ async fn gen_cata_geos_inner(
             let t_p4_prefetch = Instant::now();
             let cache = Arc::new(DashMap::new());
             let sem = Arc::new(Semaphore::new(12));
-            let mut handles = Vec::new();
 
-            // 使用 Semaphore 控制并发度，避免资源竞争
-            for &refno in all_child_refnos.iter() {
-                let sem = sem.clone();
-                let cache = cache.clone();
-                handles.push(tokio::spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
-                    // 1) 查询 LSTU→CATR 路径获取 cat_ref
-                    let lstube_cat_ref = aios_core::query_single_by_paths(
-                        refno,
-                        &["->LSTU->CATR"],
-                        &["REFNO"],
-                    )
-                    .await
-                    .map(|x| x.get_refno_or_default())
-                    .unwrap_or_default();
-                    // 2) 查询 tubi_size（is_hang=false 作为默认值）
-                    let tubi_size = fast_model::query_tubi_size(refno, lstube_cat_ref, false)
+            // P6 优化：分两阶段预取，先过滤无效元素再查询 tubi_size
+            // 原逻辑：对所有子元素都执行 query_single_by_paths + resolve_desi_comp
+            // 问题：全量数据中只有 ~37% 有 tubi_size，63% 的 resolve_desi_comp 调用完全无效
+            // 优化：阶段1 批量查 LSTU→CATR（轻量），阶段2 只对有效的调用 query_tubi_size（重量）
+
+            // 阶段 1：并发查询所有子元素的 LSTU→CATR 路径（轻量查询）
+            let cat_ref_cache: Arc<DashMap<RefnoEnum, RefnoEnum>> = Arc::new(DashMap::new());
+            {
+                let mut phase1_handles = Vec::new();
+                for &refno in all_child_refnos.iter() {
+                    let sem = sem.clone();
+                    let cat_ref_cache = cat_ref_cache.clone();
+                    phase1_handles.push(tokio::spawn(async move {
+                        let _permit = sem.acquire().await.unwrap();
+                        let lstube_cat_ref = aios_core::query_single_by_paths(
+                            refno,
+                            &["->LSTU->CATR"],
+                            &["REFNO"],
+                        )
                         .await
-                        .unwrap_or(TubiSize::None);
-                    if !matches!(tubi_size, TubiSize::None) {
-                        cache.insert(refno, tubi_size);
-                    }
-                }));
+                        .map(|x| x.get_refno_or_default())
+                        .unwrap_or_default();
+                        if lstube_cat_ref.is_valid() {
+                            cat_ref_cache.insert(refno, lstube_cat_ref);
+                        }
+                    }));
+                }
+                for h in phase1_handles {
+                    let _ = h.await;
+                }
             }
-            for h in handles {
-                let _ = h.await;
+            let p6_valid_count = cat_ref_cache.len();
+            let p6_skipped = all_child_refnos.len() - p6_valid_count;
+            println!(
+                "    [BRAN_TUBI] P6 LSTU→CATR 过滤: total={}, valid={}, skip={} ({:.0}%), elapsed={}ms",
+                all_child_refnos.len(),
+                p6_valid_count,
+                p6_skipped,
+                p6_skipped as f64 / all_child_refnos.len().max(1) as f64 * 100.0,
+                t_p4_prefetch.elapsed().as_millis()
+            );
+
+            // 阶段 2：只对有 LSTU→CATR 的子元素查询 tubi_size（重量查询）
+            let t_p4_phase2 = Instant::now();
+            {
+                let mut phase2_handles = Vec::new();
+                for item in cat_ref_cache.iter() {
+                    let refno = *item.key();
+                    let lstube_cat_ref = *item.value();
+                    let sem = sem.clone();
+                    let cache = cache.clone();
+                    phase2_handles.push(tokio::spawn(async move {
+                        let _permit = sem.acquire().await.unwrap();
+                        let tubi_size = fast_model::query_tubi_size(refno, lstube_cat_ref, false)
+                            .await
+                            .unwrap_or(TubiSize::None);
+                        if !matches!(tubi_size, TubiSize::None) {
+                            cache.insert(refno, tubi_size);
+                        }
+                    }));
+                }
+                for h in phase2_handles {
+                    let _ = h.await;
+                }
             }
             println!(
-                "    [BRAN_TUBI] P4 全局预取 tubi_size 完成: total={}, hit={}, elapsed={}ms",
+                "    [BRAN_TUBI] P4 全局预取 tubi_size 完成: total={}, queried={}, hit={}, skip={}, elapsed={}ms (phase2={}ms)",
                 all_child_refnos.len(),
+                p6_valid_count,
                 cache.len(),
-                t_p4_prefetch.elapsed().as_millis()
+                p6_skipped,
+                t_p4_prefetch.elapsed().as_millis(),
+                t_p4_phase2.elapsed().as_millis()
             );
             cache
         } else {

@@ -1,9 +1,8 @@
 use crate::fast_model::debug_model_trace;
 use aios_core::expression::query_cata::query_gm_param;
 use aios_core::pdms_data::GmParam;
-use aios_core::pdms_types::{PdmsGenericType, TOTAL_CATA_GEO_NOUN_NAMES};
-use aios_core::{RefU64, RefnoEnum};
-use std::str::FromStr;
+use aios_core::pdms_types::TOTAL_CATA_GEO_NOUN_NAMES;
+use aios_core::RefnoEnum;
 
 /// 查询几何参数
 ///
@@ -73,15 +72,4 @@ pub async fn query_gm_params(refno: RefnoEnum) -> anyhow::Result<Vec<GmParam>> {
         gms.push(geom);
     }
     Ok(gms)
-}
-
-#[inline]
-pub async fn get_generic_type(refno: RefnoEnum) -> anyhow::Result<PdmsGenericType> {
-    let types = aios_core::get_ancestor_types(refno).await?;
-    for t in types {
-        if let Ok(generic) = PdmsGenericType::from_str(&t) {
-            return Ok(generic);
-        }
-    }
-    Ok(PdmsGenericType::UNKOWN)
 }

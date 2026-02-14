@@ -146,12 +146,7 @@ async fn fetch_loop_inputs_map(
         // 5) visible
         let visible = attmap.is_visible_by_level(None).unwrap_or(true);
 
-        // 6) generic_type
-        let generic_type = crate::fast_model::get_generic_type(refno)
-            .await
-            .unwrap_or_default();
-
-        // 7) neg_refnos
+        // 6) neg_refnos
         let neg_refnos = query_provider::query_multi_descendants_with_self(
             &[refno],
             &GENRAL_NEG_NOUN_NAMES,
@@ -160,7 +155,7 @@ async fn fetch_loop_inputs_map(
         .await
         .unwrap_or_default();
 
-        // 8) cmpf_neg_refnos
+        // 7) cmpf_neg_refnos
         let cmpf_neg_refnos = if !attmap.is_neg() {
             let cmpf_refnos =
                 query_provider::get_descendants_by_types(refno, &["CMPF"], None)
@@ -188,7 +183,6 @@ async fn fetch_loop_inputs_map(
                 owner_refno,
                 owner_type,
                 visible,
-                generic_type,
                 neg_refnos,
                 cmpf_neg_refnos,
             },
@@ -295,9 +289,6 @@ async fn fetch_loop_inputs_map_batch(
 
         let (owner_refno, owner_type) = shared::get_owner_info_from_attr(&attmap).await;
         let visible = attmap.is_visible_by_level(None).unwrap_or(true);
-        let generic_type = crate::fast_model::get_generic_type(refno)
-            .await
-            .unwrap_or_default();
 
         let neg_refnos = neg_map.get(&refno).cloned().unwrap_or_default();
 
@@ -328,7 +319,6 @@ async fn fetch_loop_inputs_map_batch(
                 owner_refno,
                 owner_type,
                 visible,
-                generic_type,
                 neg_refnos,
                 cmpf_neg_refnos,
             },
@@ -406,12 +396,7 @@ async fn fetch_prim_inputs_map(
         // 4) visible
         let visible = attmap.is_visible_by_level(None).unwrap_or(true);
 
-        // 5) generic_type
-        let generic_type = crate::fast_model::get_generic_type(refno)
-            .await
-            .unwrap_or_default();
-
-        // 6) neg_refnos
+        // 5) neg_refnos
         let neg_refnos = query_provider::query_multi_descendants_with_self(
             &[refno],
             &GENRAL_NEG_NOUN_NAMES,
@@ -420,7 +405,7 @@ async fn fetch_prim_inputs_map(
         .await
         .unwrap_or_default();
 
-        // 7) poly_extra（仅 POHE/POLYHE）
+        // 6) poly_extra（仅 POHE/POLYHE）
         let poly_extra = match attmap.get_type_str() {
             "POHE" | "POLYHE" => match geom_input_cache::try_build_prim_poly_extra(refno).await {
                 Ok(v) => v,
@@ -444,7 +429,6 @@ async fn fetch_prim_inputs_map(
                 owner_refno,
                 owner_type,
                 visible,
-                generic_type,
                 neg_refnos,
                 poly_extra,
             },
@@ -556,9 +540,6 @@ async fn fetch_prim_inputs_map_batch(
 
         let (owner_refno, owner_type) = shared::get_owner_info_from_attr(&attmap).await;
         let visible = attmap.is_visible_by_level(None).unwrap_or(true);
-        let generic_type = crate::fast_model::get_generic_type(refno)
-            .await
-            .unwrap_or_default();
 
         let neg_refnos = neg_map.get(&refno).cloned().unwrap_or_default();
         let poly_extra = poly_map.get(&refno).cloned();
@@ -572,7 +553,6 @@ async fn fetch_prim_inputs_map_batch(
                 owner_refno,
                 owner_type,
                 visible,
-                generic_type,
                 neg_refnos,
                 poly_extra,
             },

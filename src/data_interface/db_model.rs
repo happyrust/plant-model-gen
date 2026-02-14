@@ -43,25 +43,6 @@ pub const TUBI_TOL: f32 = 1.0f32;
 // project + mdb + module
 pub static GLOBAL_MDB_WORLD_MAP: Lazy<DashMap<String, PdmsElement>> = Lazy::new(DashMap::new);
 
-static PDMS_GNERAL_TYPE_NAMES_MAP: Lazy<HashMap<&'static str, PdmsGenericType>> = Lazy::new(|| {
-    let mut m = HashMap::new();
-    m.insert("EQUI", PdmsGenericType::EQUI);
-    m.insert("PIPE", PdmsGenericType::PIPE);
-    m.insert("ROOM", PdmsGenericType::ROOM);
-    m.insert("STRU", PdmsGenericType::STRU);
-    m.insert("PANE", PdmsGenericType::PANE);
-    m.insert("HANG", PdmsGenericType::HANG);
-    m.insert("WALL", PdmsGenericType::WALL);
-    m.insert("GWALL", PdmsGenericType::WALL);
-    m.insert("CWALL", PdmsGenericType::WALL);
-    m.insert("STWALL", PdmsGenericType::WALL);
-    m.insert("CFLOOR", PdmsGenericType::CFLOOR);
-    m.insert("FLOOR", PdmsGenericType::FLOOR);
-    m.insert("EXTR", PdmsGenericType::EXTR);
-    m.insert("REVO", PdmsGenericType::REVO);
-    m
-});
-
 //创建一个监控mqtt是否连接的全局变量,使用Mutex<bool>
 pub static MQTT_CONNECT_STATUS: Lazy<Mutex<Option<bool>>> = Lazy::new(|| Mutex::new(None));
 

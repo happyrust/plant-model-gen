@@ -1,5 +1,5 @@
 use crate::fast_model::gen_model::is_e3d_debug_enabled;
-use crate::fast_model::{SEND_INST_SIZE, get_generic_type, shared};
+use crate::fast_model::{SEND_INST_SIZE, shared};
 use crate::{consts::*, e3d_dbg};
 use crate::fast_model::query_compat::query_filter_deep_children_atts;
 use aios_core::geometry::*;
@@ -365,7 +365,6 @@ pub async fn gen_prim_geos(
                     owner_refno,
                     owner_type,
                     visible,
-                    generic_type: get_generic_type(refno).await.unwrap_or_default(),
                     aabb: None,
                     world_transform: trans_origin,
                     ..Default::default()
@@ -522,7 +521,6 @@ pub async fn gen_prim_geos_from_inputs(
                     owner_refno: input.owner_refno,
                     owner_type: input.owner_type.clone(),
                     visible,
-                    generic_type: input.generic_type,
                     aabb: None,
                     world_transform: input.world_transform,
                     ..Default::default()

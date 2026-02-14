@@ -11,7 +11,7 @@ use crate::fast_model::gen_model::cate_single::{CateCsgShapeMap, gen_cata_single
 use crate::fast_model::gen_model::utilities::is_valid_cata_hash;
 use crate::fast_model::instance_cache::InstanceCacheManager;
 use crate::fast_model::refno_errors::{RefnoErrorKind, RefnoErrorStage, record_refno_error};
-use crate::fast_model::{SEND_INST_SIZE, get_generic_type, resolve_desi_comp, shared};
+use crate::fast_model::{SEND_INST_SIZE, resolve_desi_comp, shared};
 use crate::fast_model::{debug_model, debug_model_debug};
 use aios_core::consts::{CIVIL_TYPES, NGMR_OWN_TYPES};
 use aios_core::geometry::*;
@@ -705,22 +705,16 @@ async fn gen_cata_geos_inner(
                     .iter()
                     .map(|&r| aios_core::get_named_attmap(r))
                     .collect();
-                let generic_futs: Vec<_> = all_refnos
-                    .iter()
-                    .map(|&r| get_generic_type(r))
-                    .collect();
                 let transform_fut = crate::fast_model::transform_cache::get_world_transforms_cache_first_batch(
                     Some(db_option.as_ref()),
                     &all_refnos,
                 );
 
-                let (attmap_results, generic_results, _transform_result) = tokio::join!(
+                let (attmap_results, _transform_result) = tokio::join!(
                     futures::future::join_all(attmap_futs),
-                    futures::future::join_all(generic_futs),
                     transform_fut,
                 );
                 let _ = attmap_results;
-                let _ = generic_results;
 
                 println!(
                     "    [gen_cata_geos] P0 全局预取完成: refnos={}, elapsed={}ms",
@@ -849,7 +843,6 @@ async fn gen_cata_geos_inner(
             let mut db_time_get_cat_refno = 0;
             let mut db_time_query_single = 0;
             let mut db_time_gen_single_geoms = 0;
-            let mut db_time_get_generic_type = 0;
             let mut db_time_hash_lock = 0;
             let mut db_time_query_refnos = 0;
 
@@ -936,7 +929,6 @@ async fn gen_cata_geos_inner(
 
                         let (owner_refno, owner_type) =
                             shared::get_owner_info_from_attr(&ele_att).await;
-                        let generic_type = get_generic_type(ele_refno).await.unwrap_or_default();
                         let cata_hash_for_info = if is_valid_cata_hash(&cata_hash) {
                             Some(cata_hash.clone())
                         } else {
@@ -950,7 +942,6 @@ async fn gen_cata_geos_inner(
                             owner_type,
                             cata_hash: cata_hash_for_info,
                             visible: true,
-                            generic_type,
                             ptset_map: reuse_ptset_map.clone(),
                             is_solid: true,
                             ..Default::default()
@@ -1359,11 +1350,6 @@ async fn gen_cata_geos_inner(
                                     }
                                 }
 
-                                let t_get_generic_type = Instant::now();
-                                let generic_type = get_generic_type(ele_refno).await.unwrap_or_default();
-                                db_time_get_generic_type +=
-                                    t_get_generic_type.elapsed().as_millis();
-
                                 let (owner_refno, owner_type) =
                                     shared::get_owner_info_from_attr(&ele_att).await;
                                 let cata_hash_for_info = if is_valid_cata_hash(&cata_hash) {
@@ -1380,7 +1366,6 @@ async fn gen_cata_geos_inner(
                                     owner_type,
                                     cata_hash: cata_hash_for_info,
                                     visible: true,
-                                    generic_type,
                                     aabb: None,
                                     world_transform,
                                     cata_refno: Some(cata_refno),
@@ -1854,10 +1839,6 @@ async fn gen_cata_geos_inner(
                             .map(|x| x.1)
                             .unwrap_or_default();
 
-                        let t_get_generic_type = Instant::now();
-                        let generic_type = get_generic_type(ele_refno).await.unwrap_or_default();
-                        db_time_get_generic_type += t_get_generic_type.elapsed().as_millis();
-
                         let (owner_refno, owner_type) =
                             shared::get_owner_info_from_attr(&ele_att).await;
                         let cata_hash_for_info = if is_valid_cata_hash(&cata_hash) {
@@ -1872,7 +1853,6 @@ async fn gen_cata_geos_inner(
                             owner_type,
                             cata_hash: cata_hash_for_info,
                             visible: true,
-                            generic_type,
                             aabb: None,
                             world_transform,
                             cata_refno: Some(cata_refno),
@@ -2198,7 +2178,6 @@ async fn gen_cata_geos_inner(
                         owner_type,
                         cata_hash: cata_hash_for_info,
                         visible: true,
-                        generic_type: get_generic_type(ele_refno).await.unwrap_or_default(),
                         world_transform: origin_trans,
                         ptset_map: cur_ptset_map,
                         is_solid: true,
@@ -2239,8 +2218,6 @@ async fn gen_cata_geos_inner(
                     db_time_query_single as u64;
                 *stats.entry("gen_single_geoms".to_string()).or_insert(0) +=
                     db_time_gen_single_geoms as u64;
-                *stats.entry("get_generic_type".to_string()).or_insert(0) +=
-                    db_time_get_generic_type as u64;
                 *stats.entry("hash_lock".to_string()).or_insert(0) += db_time_hash_lock as u64;
                 *stats.entry("query_refnos".to_string()).or_insert(0) +=
                     db_time_query_refnos as u64;
@@ -2301,10 +2278,8 @@ async fn gen_cata_geos_inner(
     let mut p4_branch_meta_time: u128 = 0;   // get_named_attmap(h_ref) + query_tubi_size + get_type_name
     let mut p4_spkbrk_time: u128 = 0;        // get_named_attmap(refno) for SPKBRK check
     let mut p4_lstube_time: u128 = 0;         // query_single_by_paths(LSTU->CATR) + query_tubi_size
-    let mut p4_generic_type_time: u128 = 0;   // get_generic_type calls
     let mut p4_spkbrk_cnt: u32 = 0;
     let mut p4_lstube_cnt: u32 = 0;
-    let mut p4_generic_type_cnt: u32 = 0;
     let mut p4_branch_meta_cnt: u32 = 0;
 
     let mut tubi_refnos: Vec<String> = Vec::new();
@@ -3026,20 +3001,6 @@ async fn gen_cata_geos_inner(
                         // 对于 tubing，owner 应该是 BRAN/HANG 本身，而不是 BRAN 的 owner
                         let owner_refno = branch_refno;
                         let owner_type = branch_type_str.clone();
-                        let generic_type = if matches!(branch_mode, BranchTubiMode::CacheOnly) {
-                            cache_inst_info_map_global
-                                .get(&current_tubing.leave_refno)
-                                .map(|x| x.generic_type.clone())
-                                .unwrap_or_default()
-                        } else {
-                            let t_gt = Instant::now();
-                            let gt = get_generic_type(current_tubing.leave_refno)
-                                .await
-                                .unwrap_or_default();
-                            p4_generic_type_time += t_gt.elapsed().as_millis();
-                            p4_generic_type_cnt += 1;
-                            gt
-                        };
                         tubi_shape_insts_data.insert_tubi(
                             current_tubing.leave_refno,
                             EleGeosInfo {
@@ -3049,7 +3010,6 @@ async fn gen_cata_geos_inner(
                                 owner_type,
                                 cata_hash: Some(tubi_geo_hash.to_string()),
                                 visible: true,
-                                generic_type,
                                 aabb: Some(aabb),
                                 world_transform: t,
                                 tubi: Some(aios_core::geometry::TubiData {
@@ -3382,20 +3342,6 @@ async fn gen_cata_geos_inner(
                                         // 对于 tubing，owner 应该是 BRAN/HANG 本身，而不是 BRAN 的 owner
                                         let owner_refno = branch_refno;
                                         let owner_type = branch_type_str.clone();
-                                        let generic_type = if matches!(branch_mode, BranchTubiMode::CacheOnly) {
-                                            cache_inst_info_map_global
-                                                .get(&current_tubing.leave_refno)
-                                                .map(|x| x.generic_type.clone())
-                                                .unwrap_or_default()
-                                        } else {
-                                            let t_gt = Instant::now();
-                                            let gt = get_generic_type(current_tubing.leave_refno)
-                                                .await
-                                                .unwrap_or_default();
-                                            p4_generic_type_time += t_gt.elapsed().as_millis();
-                                            p4_generic_type_cnt += 1;
-                                            gt
-                                        };
                                         // 中间直段：axis_map[0]=ARRIVE, axis_map[1]=LEAVE
                                         let arrive_axis_pt = axis_map[0].pt.to_array();
                                         let leave_axis_pt = axis_map[1].pt.to_array();
@@ -3408,7 +3354,6 @@ async fn gen_cata_geos_inner(
                                                 owner_type,
                                                 cata_hash: Some(tubi_geo_hash.to_string()),
                                                 visible: true,
-                                                generic_type,
                                                 aabb: Some(aabb),
                                                 world_transform: t,
                                                 tubi: Some(aios_core::geometry::TubiData {
@@ -3679,20 +3624,6 @@ async fn gen_cata_geos_inner(
                             // 对于 tubing，owner 应该是 BRAN/HANG 本身，而不是 BRAN 的 owner
                             let owner_refno = branch_refno;
                             let owner_type = branch_type_str.clone();
-                            let generic_type = if matches!(branch_mode, BranchTubiMode::CacheOnly) {
-                                cache_inst_info_map_global
-                                    .get(&current_tubing.leave_refno)
-                                    .map(|x| x.generic_type.clone())
-                                    .unwrap_or_default()
-                            } else {
-                                let t_gt = Instant::now();
-                                let gt = get_generic_type(current_tubing.leave_refno)
-                                    .await
-                                    .unwrap_or_default();
-                                p4_generic_type_time += t_gt.elapsed().as_millis();
-                                p4_generic_type_cnt += 1;
-                                gt
-                            };
                             // 最后一段：leave=上一元件的LEAVE点, arrive=BRAN的TPOS
                             let arrive_axis_pt = bran_ttube_pt.to_array();
                             let leave_axis_pt = current_tubing.start_pt.to_array();
@@ -3705,7 +3636,6 @@ async fn gen_cata_geos_inner(
                                     owner_type,
                                     cata_hash: Some(tubi_geo_hash.to_string()),
                                     visible: true,
-                                    generic_type,
                                     aabb: Some(aabb),
                                     world_transform: t,
                                     tubi: Some(aios_core::geometry::TubiData {
@@ -3900,15 +3830,13 @@ async fn gen_cata_geos_inner(
         time_stats.insert("p4_branch_meta".to_string(), p4_branch_meta_time as u64);
         time_stats.insert("p4_spkbrk".to_string(), p4_spkbrk_time as u64);
         time_stats.insert("p4_lstube".to_string(), p4_lstube_time as u64);
-        time_stats.insert("p4_generic_type".to_string(), p4_generic_type_time as u64);
         println!(
-            "  [TUBI perf] P4详细计时: global_prepare={}ms, branch_meta={}ms(n={}), spkbrk={}ms(n={}), lstube={}ms(n={}), generic_type={}ms(n={})",
+            "  [TUBI perf] P4详细计时: global_prepare={}ms, branch_meta={}ms(n={}), spkbrk={}ms(n={}), lstube={}ms(n={})",
             p4_global_prepare_time, p4_branch_meta_time, p4_branch_meta_cnt,
-            p4_spkbrk_time, p4_spkbrk_cnt, p4_lstube_time, p4_lstube_cnt,
-            p4_generic_type_time, p4_generic_type_cnt
+            p4_spkbrk_time, p4_spkbrk_cnt, p4_lstube_time, p4_lstube_cnt
         );
         let p4_accounted = p4_global_prepare_time + p4_branch_meta_time + p4_spkbrk_time
-            + p4_lstube_time + p4_generic_type_time
+            + p4_lstube_time
             + db_time_get_branch_att + db_time_get_branch_transform
             + send_data_time + tubi_query_time;
         println!(

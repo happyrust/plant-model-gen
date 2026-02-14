@@ -598,7 +598,7 @@ pub async fn save_instance_data_optimize(
             #[cfg(feature = "sqlite-index")]
             {
                 let id = key.refno().0 as i64;
-                let noun = format!("{:?}", info.generic_type);
+                let noun = "UNKOWN".to_string();
                 spatial_entries.push((
                     id,
                     noun,
@@ -611,11 +611,10 @@ pub async fn save_instance_data_optimize(
 
         // inst_relate 不再保存 world_trans；世界变换统一从 pe_transform 获取。
         let relate_sql = format!(
-            "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, generic: '{3}', zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {4}, solid: {5}, owner_refno: {6}, owner_type: '{7}'}}",
+            "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {3}, solid: {4}, owner_refno: {5}, owner_type: '{6}'}}",
             key.to_inst_relate_key(),
             key.to_pe_key(),
             info.id_str(),
-            info.generic_type.to_string(),
             info.has_cata_neg,
             info.is_solid,
             info.owner_refno.to_pe_key(),

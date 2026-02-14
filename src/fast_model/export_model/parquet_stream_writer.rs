@@ -176,7 +176,12 @@ impl ParquetStreamWriter {
         // 遍历 inst_info_map 获取实例信息
         for (refno, info) in &data.inst_info_map {
             let inst_key = info.get_inst_key();
-            let color_index = palette.index_for_noun(&info.generic_type.to_string());
+            let noun_str = if info.owner_type.is_empty() {
+                "UNKOWN"
+            } else {
+                info.owner_type.as_str()
+            };
+            let color_index = palette.index_for_noun(noun_str);
             let refno_str = refno.to_string();
             let world_trans_id = format!("{}_world", refno_str);
 
@@ -222,7 +227,7 @@ impl ParquetStreamWriter {
             
             instance_rows.push(InstanceRow {
                 refno: refno_str.clone(),
-                noun: info.generic_type.to_string(),
+                noun: noun_str.to_string(),
                 owner_refno: if info.owner_refno != *refno {
                     Some(info.owner_refno.to_string())
                 } else {

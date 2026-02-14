@@ -1379,14 +1379,8 @@ impl<'a> ColorPalette<'a> {
         self.colors
     }
 
-    /// 严格依据 ColorSchemes.toml / 默认方案获取颜色；
-    /// 若配色表中不存在该类型，则使用内置的完整颜色映射表。
+    /// 获取颜色（仅使用内置映射表；不依赖 ColorSchemes/PDMS 类型枚举）。
     fn color_for_noun(&self, noun: &str) -> [f32; 4] {
-        // 首先尝试从 MaterialLibrary（ColorSchemeManager）获取
-        if let Some(c) = self.material_library.get_normalized_color_for_noun(noun) {
-            return c;
-        }
-
         // 内置的完整颜色映射表（与 rs-core/rs-plant3-d 保持一致）
         // 颜色值为 RGBA [0-255]，转换为归一化 [0.0-1.0]
         let color_u8: [u8; 4] = match noun.to_uppercase().as_str() {

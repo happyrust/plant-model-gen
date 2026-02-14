@@ -3,7 +3,7 @@ use crate::data_interface::interface::PdmsDataInterface;
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::gen_model::is_e3d_debug_enabled;
 use crate::fast_model::query_provider;
-use crate::fast_model::{SEND_INST_SIZE, debug_model_warn, get_generic_type, shared};
+use crate::fast_model::{SEND_INST_SIZE, debug_model_warn, shared};
 use aios_core::RefU64;
 use aios_core::geometry::*;
 use aios_core::options::DbOption;
@@ -161,7 +161,6 @@ pub async fn gen_loop_geos(
                     cata_hash: None,
                     visible: true,
                     world_transform: trans_origin,
-                    generic_type: get_generic_type(target_refno).await.unwrap_or_default(),
                     aabb: None,
                     flow_pt_indexs: vec![],
                     ..Default::default()
@@ -406,7 +405,6 @@ pub async fn gen_loop_geos_from_inputs(
                     cata_hash: None,
                     visible: input.visible,
                     world_transform: trans_origin,
-                    generic_type: input.generic_type,
                     aabb: None,
                     flow_pt_indexs: vec![],
                     ..Default::default()

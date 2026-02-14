@@ -10,7 +10,7 @@ use crate::fast_model::gen_model::utilities::is_valid_cata_hash;
 use crate::fast_model::foyer_cache::cata_resolve_cache::{CataResolveCacheManager, CataResolvedComp, PreparedInstGeo};
 use crate::fast_model::instance_cache::InstanceCacheManager;
 use crate::fast_model::refno_errors::{RefnoErrorKind, RefnoErrorStage, record_refno_error};
-use crate::fast_model::{SEND_INST_SIZE, get_generic_type, shared};
+use crate::fast_model::{SEND_INST_SIZE, shared};
 use crate::fast_model::{debug_model, debug_model_debug};
 use crate::options::DbOptionExt;
 use aios_core::parsed_data::CateAxisParam;
@@ -197,7 +197,6 @@ pub async fn gen_cata_geos_for_cache(
         let mut db_time_get_cat_refno: u128 = 0;
         let mut db_time_query_single: u128 = 0;
         let mut db_time_gen_single_geoms: u128 = 0;
-        let mut db_time_get_generic_type: u128 = 0;
 
         for j in start_idx..end_idx {
             let cata_hash = all_unique_keys[j].clone();
@@ -232,7 +231,6 @@ pub async fn gen_cata_geos_for_cache(
 
                     let (owner_refno, owner_type) =
                         shared::get_owner_info_from_attr(&ele_att).await;
-                    let generic_type = get_generic_type(ele_refno).await.unwrap_or_default();
                     let cata_hash_for_info = if is_valid_cata_hash(&cata_hash) {
                         Some(cata_hash.clone())
                     } else {
@@ -246,7 +244,6 @@ pub async fn gen_cata_geos_for_cache(
                         owner_type,
                         cata_hash: cata_hash_for_info,
                         visible: true,
-                        generic_type,
                         ptset_map: reuse_ptset_map.clone(),
                         is_solid: true,
                         ..Default::default()
@@ -385,14 +382,11 @@ pub async fn gen_cata_geos_for_cache(
 
             // 处理 group_refnos 中的每个元件
             for &group_refno in target_group_refnos.iter() {
-                let t_get_generic_type = Instant::now();
-                let generic_type = get_generic_type(group_refno).await.unwrap_or_default();
-                db_time_get_generic_type += t_get_generic_type.elapsed().as_millis();
-
                 let ele_att = match aios_core::get_named_attmap(group_refno).await {
                     Ok(att) => att,
                     Err(_) => continue,
                 };
+                let type_name = ele_att.get_type_str().to_string();
 
                 let (owner_refno, owner_type) =
                     shared::get_owner_info_from_attr(&ele_att).await;
@@ -409,7 +403,6 @@ pub async fn gen_cata_geos_for_cache(
                     owner_type,
                     cata_hash: cata_hash_for_info.clone(),
                     visible: true,
-                    generic_type: generic_type.clone(),
                     ptset_map: ptset_map.clone(),
                     is_solid: has_solid,
                     ..Default::default()
@@ -426,7 +419,7 @@ pub async fn gen_cata_geos_for_cache(
                         refno: group_refno,
                         insts: geo_insts.clone(),
                         aabb: None,
-                        type_name: generic_type.to_string(),
+                        type_name,
                         ..Default::default()
                     };
                     shape_insts_data.insert_geos_data(inst_key, geos_data);
@@ -451,8 +444,6 @@ pub async fn gen_cata_geos_for_cache(
                 db_time_query_single as u64;
             *stats.entry("gen_single_geoms".to_string()).or_insert(0) +=
                 db_time_gen_single_geoms as u64;
-            *stats.entry("get_generic_type".to_string()).or_insert(0) +=
-                db_time_get_generic_type as u64;
         }
 
         if shape_insts_data.inst_cnt() > 0 {
@@ -580,7 +571,6 @@ pub async fn gen_bran_geos_for_cache(
 
         // 处理 BRAN/HANG 本身的几何信息
         let (owner_refno, owner_type) = shared::get_owner_info_from_attr(&branch_att).await;
-        let generic_type = get_generic_type(branch_refno).await.unwrap_or_default();
 
         let bran_geos_info = EleGeosInfo {
             refno: branch_refno,
@@ -589,7 +579,6 @@ pub async fn gen_bran_geos_for_cache(
             owner_type,
             cata_hash: None,
             visible: true,
-            generic_type,
             is_solid: true,
             ..Default::default()
         };
@@ -609,7 +598,6 @@ pub async fn gen_bran_geos_for_cache(
 
             let (child_owner_refno, child_owner_type) =
                 shared::get_owner_info_from_attr(&child_att).await;
-            let child_generic_type = get_generic_type(child_refno).await.unwrap_or_default();
 
             let child_geos_info = EleGeosInfo {
                 refno: child_refno,
@@ -618,7 +606,6 @@ pub async fn gen_bran_geos_for_cache(
                 owner_type: child_owner_type,
                 cata_hash: None,
                 visible: true,
-                generic_type: child_generic_type,
                 is_solid: true,
                 ..Default::default()
             };

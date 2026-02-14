@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use aios_core::pdms_types::PdmsGenericType;
 use aios_core::types::NamedAttrMap;
 use aios_core::RefnoEnum;
 use aios_core::Transform;
@@ -47,7 +46,6 @@ pub struct LoopInput {
     pub owner_refno: RefnoEnum,
     pub owner_type: String,
     pub visible: bool,
-    pub generic_type: PdmsGenericType,
     /// 负实体 refno 列表
     pub neg_refnos: Vec<RefnoEnum>,
     /// CMPF 下的负实体 refno 列表
@@ -80,7 +78,6 @@ pub struct PrimInput {
     pub owner_refno: RefnoEnum,
     pub owner_type: String,
     pub visible: bool,
-    pub generic_type: PdmsGenericType,
     /// 负实体 refno 列表
     pub neg_refnos: Vec<RefnoEnum>,
     /// 多面体额外输入（仅 POHE/POLYHE 需要）
@@ -102,7 +99,7 @@ pub struct GeomInputBatch {
 // ---------------------------------------------------------------------------
 
 const GEOM_INPUT_TYPE_TAG: u16 = 1001;
-const GEOM_INPUT_SCHEMA_V1: u16 = 1;
+const GEOM_INPUT_SCHEMA_V2: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct Vec3V1 {
@@ -160,7 +157,6 @@ struct LoopInputV1 {
     owner_refno: RefnoEnum,
     owner_type: String,
     visible: bool,
-    generic_type: PdmsGenericType,
     neg_refnos: Vec<RefnoEnum>,
     cmpf_neg_refnos: Vec<RefnoEnum>,
 }
@@ -184,7 +180,6 @@ struct PrimInputV1 {
     owner_refno: RefnoEnum,
     owner_type: String,
     visible: bool,
-    generic_type: PdmsGenericType,
     neg_refnos: Vec<RefnoEnum>,
     poly_extra: Option<PrimPolyExtraV1>,
 }
@@ -289,7 +284,6 @@ impl GeomInputCacheManager {
                     owner_refno: v.owner_refno,
                     owner_type: v.owner_type,
                     visible: v.visible,
-                    generic_type: v.generic_type,
                     neg_refnos: v.neg_refnos,
                     cmpf_neg_refnos: v.cmpf_neg_refnos,
                 })
@@ -304,7 +298,6 @@ impl GeomInputCacheManager {
                     owner_refno: v.owner_refno,
                     owner_type: v.owner_type,
                     visible: v.visible,
-                    generic_type: v.generic_type,
                     neg_refnos: v.neg_refnos,
                     poly_extra: v.poly_extra.map(|pe| PrimPolyExtraV1 {
                         polygons: pe
@@ -324,7 +317,7 @@ impl GeomInputCacheManager {
                 .collect(),
         };
 
-        let payload = match rkyv_payload::encode(GEOM_INPUT_TYPE_TAG, GEOM_INPUT_SCHEMA_V1, &v1) {
+        let payload = match rkyv_payload::encode(GEOM_INPUT_TYPE_TAG, GEOM_INPUT_SCHEMA_V2, &v1) {
             Ok(bytes) => bytes,
             Err(e) => {
                 eprintln!(
@@ -357,7 +350,7 @@ impl GeomInputCacheManager {
                 let payload = &entry.value().payload;
                 let v1 = match rkyv_payload::decode::<GeomInputBatchV1>(
                     GEOM_INPUT_TYPE_TAG,
-                    GEOM_INPUT_SCHEMA_V1,
+                    GEOM_INPUT_SCHEMA_V2,
                     payload,
                 ) {
                     Ok(v) => v,
@@ -389,7 +382,6 @@ impl GeomInputCacheManager {
                             owner_refno: v.owner_refno,
                             owner_type: v.owner_type,
                             visible: v.visible,
-                            generic_type: v.generic_type,
                             neg_refnos: v.neg_refnos,
                             cmpf_neg_refnos: v.cmpf_neg_refnos,
                         },
@@ -408,7 +400,6 @@ impl GeomInputCacheManager {
                             owner_refno: v.owner_refno,
                             owner_type: v.owner_type,
                             visible: v.visible,
-                            generic_type: v.generic_type,
                             neg_refnos: v.neg_refnos,
                             poly_extra: v.poly_extra.map(|pe| PrimPolyExtra {
                                 polygons: pe
@@ -563,7 +554,6 @@ impl GeomInputCacheManager {
 /// - `get_world_transform_cache_first` → world_transform
 /// - `fetch_loops_and_height` → loops + height
 /// - `get_owner_info_from_attr` → owner_refno + owner_type
-/// - `get_generic_type` → generic_type
 /// - `get_descendants_by_types` → neg_refnos / cmpf_neg_refnos
 pub async fn prefetch_loop_inputs(
     cache: &GeomInputCacheManager,
@@ -622,12 +612,7 @@ pub async fn prefetch_loop_inputs(
         // 5) visible
         let visible = attmap.is_visible_by_level(None).unwrap_or(true);
 
-        // 6) generic_type
-        let generic_type = crate::fast_model::get_generic_type(refno)
-            .await
-            .unwrap_or_default();
-
-        // 7) neg_refnos
+        // 6) neg_refnos
         let neg_refnos = if !attmap.is_neg() {
             query_provider::get_descendants_by_types(refno, &GENRAL_NEG_NOUN_NAMES, None)
                 .await
@@ -636,7 +621,7 @@ pub async fn prefetch_loop_inputs(
             vec![]
         };
 
-        // 8) cmpf_neg_refnos
+        // 7) cmpf_neg_refnos
         let cmpf_neg_refnos = if !attmap.is_neg() {
             let cmpf_refnos =
                 query_provider::get_descendants_by_types(refno, &["CMPF"], None)
@@ -664,7 +649,6 @@ pub async fn prefetch_loop_inputs(
                 owner_refno,
                 owner_type,
                 visible,
-                generic_type,
                 neg_refnos,
                 cmpf_neg_refnos,
             },
@@ -845,12 +829,7 @@ pub async fn prefetch_prim_inputs(
         // 4) visible
         let visible = attmap.is_visible_by_level(None).unwrap_or(true);
 
-        // 5) generic_type
-        let generic_type = crate::fast_model::get_generic_type(refno)
-            .await
-            .unwrap_or_default();
-
-        // 6) neg_refnos
+        // 5) neg_refnos
         let neg_refnos = query_provider::query_multi_descendants_with_self(
             &[refno],
             &GENRAL_NEG_NOUN_NAMES,
@@ -859,7 +838,7 @@ pub async fn prefetch_prim_inputs(
         .await
         .unwrap_or_default();
 
-        // 7) poly_extra（仅 POHE/POLYHE）
+        // 6) poly_extra（仅 POHE/POLYHE）
         let poly_extra = match attmap.get_type_str() {
             "POHE" | "POLYHE" => match try_build_prim_poly_extra(refno).await {
                 Ok(v) => v,
@@ -883,7 +862,6 @@ pub async fn prefetch_prim_inputs(
                 owner_refno,
                 owner_type,
                 visible,
-                generic_type,
                 neg_refnos,
                 poly_extra,
             },

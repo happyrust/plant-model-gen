@@ -2296,6 +2296,16 @@ async fn gen_cata_geos_inner(
     let mut tubi_count = 0;
     let mut send_data_time: u128 = 0;
     let mut tubi_query_time: u128 = 0;
+    // P4 profiling: 详细计时器（定位 process_branch 中 99% 未统计时间）
+    let mut p4_global_prepare_time: u128 = 0;
+    let mut p4_branch_meta_time: u128 = 0;   // get_named_attmap(h_ref) + query_tubi_size + get_type_name
+    let mut p4_spkbrk_time: u128 = 0;        // get_named_attmap(refno) for SPKBRK check
+    let mut p4_lstube_time: u128 = 0;         // query_single_by_paths(LSTU->CATR) + query_tubi_size
+    let mut p4_generic_type_time: u128 = 0;   // get_generic_type calls
+    let mut p4_spkbrk_cnt: u32 = 0;
+    let mut p4_lstube_cnt: u32 = 0;
+    let mut p4_generic_type_cnt: u32 = 0;
+    let mut p4_branch_meta_cnt: u32 = 0;
 
     let mut tubi_refnos: Vec<String> = Vec::new();
     let mut tubi_pts_map: DashMap<u64, String> = DashMap::new();
@@ -2463,11 +2473,132 @@ async fn gen_cata_geos_inner(
         );
 
         debug_model!(
-            "[BRAN_TUBI] 全局准备完成: children_unique={}, axis_need={}, elapsed={}ms",
+            "[BRAN_TUBI] 全局准备完成(transform/axis): children_unique={}, axis_need={}, elapsed={}ms",
             all_child_refnos.len(),
             need_axis_refnos.len(),
             t_global_prepare.elapsed().as_millis()
         );
+
+        // ════════════════════════════════════════════════════════════════════════════
+        // P4 优化：全局批量并发预取 tubi_size 数据
+        // ════════════════════════════════════════════════════════════════════════════
+        //
+        // 【瓶颈分析】process_branch 循环中 79% 的时间花在串行查询：
+        //   query_single_by_paths(refno, &["->LSTU->CATR"]) + query_tubi_size(refno, cat_ref, is_hang)
+        //   每次 ~58ms × 481次 = 27.8s
+        //
+        // 【优化策略】在循环前批量并发预取所有子元素的 tubi_size，循环内直接查缓存。
+        // ════════════════════════════════════════════════════════════════════════════
+        let tubi_size_cache: Arc<DashMap<RefnoEnum, TubiSize>> = if !matches!(branch_mode, BranchTubiMode::CacheOnly) {
+            let t_p4_prefetch = Instant::now();
+            let cache = Arc::new(DashMap::new());
+            let sem = Arc::new(tokio::sync::Semaphore::new(12));
+            let mut handles = Vec::new();
+
+            for &refno in all_child_refnos.iter() {
+                let sem = sem.clone();
+                let cache = cache.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    // 1) 查询 LSTU→CATR 路径获取 cat_ref
+                    let lstube_cat_ref = aios_core::query_single_by_paths(
+                        refno,
+                        &["->LSTU->CATR"],
+                        &["REFNO"],
+                    )
+                    .await
+                    .map(|x| x.get_refno_or_default())
+                    .unwrap_or_default();
+                    // 2) 查询 tubi_size（is_hang=false 作为默认值）
+                    let tubi_size = fast_model::query_tubi_size(refno, lstube_cat_ref, false)
+                        .await
+                        .unwrap_or(TubiSize::None);
+                    if !matches!(tubi_size, TubiSize::None) {
+                        cache.insert(refno, tubi_size);
+                    }
+                }));
+            }
+
+            for h in handles {
+                let _ = h.await;
+            }
+            println!(
+                "    [BRAN_TUBI] P4 全局预取 tubi_size 完成: total={}, hit={}, elapsed={}ms",
+                all_child_refnos.len(),
+                cache.len(),
+                t_p4_prefetch.elapsed().as_millis()
+            );
+            cache
+        } else {
+            Arc::new(DashMap::new())
+        };
+
+        // P4 优化（第二部分）：全局批量并发预取 branch_meta 数据
+        // 瓶颈：每个 branch 串行查询 get_named_attmap(h_ref) + query_tubi_size + get_type_name = 3.5s
+        // 优化：并发预取 h_tubi_size 和 bran_owner_type，循环内直接查缓存
+        struct BranchMetaCached {
+            h_tubi_size: TubiSize,
+            bran_owner_type: String,
+        }
+        let branch_meta_cache: DashMap<RefnoEnum, BranchMetaCached> = if !matches!(branch_mode, BranchTubiMode::CacheOnly) {
+            let t_p4_bm = Instant::now();
+            let cache = Arc::new(DashMap::new());
+            let sem = Arc::new(tokio::sync::Semaphore::new(12));
+            let mut handles = Vec::new();
+
+            for bran_data in branch_map.iter() {
+                let branch_refno = *bran_data.key();
+                let sem = sem.clone();
+                let cache = cache.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    // 获取 branch 属性
+                    let Ok(branch_att) = aios_core::get_named_attmap(branch_refno).await else {
+                        return;
+                    };
+                    let is_hang = branch_att.get_type_str() == "HANG";
+                    let h_ref = branch_att
+                        .get_foreign_refno(if is_hang { "HREF" } else { "HSTU" })
+                        .unwrap_or_default();
+                    // 查询 h_ref 的 attmap + CATR + tubi_size
+                    let tubi_att = aios_core::get_named_attmap(h_ref).await.unwrap_or_default();
+                    let tubi_cat_ref = tubi_att.get_foreign_refno("CATR").unwrap_or_default();
+                    let h_tubi_size = fast_model::query_tubi_size(branch_refno, tubi_cat_ref, is_hang)
+                        .await
+                        .unwrap_or(TubiSize::None);
+                    // 查询 owner type
+                    let bran_owner_type = aios_core::get_type_name(branch_att.get_owner())
+                        .await
+                        .unwrap_or_default();
+                    cache.insert(branch_refno, BranchMetaCached { h_tubi_size, bran_owner_type });
+                }));
+            }
+            for h in handles {
+                let _ = h.await;
+            }
+            let cache = Arc::try_unwrap(cache).unwrap_or_else(|arc| {
+                let m = DashMap::new();
+                for item in arc.iter() {
+                    m.insert(*item.key(), BranchMetaCached {
+                        h_tubi_size: item.value().h_tubi_size,
+                        bran_owner_type: item.value().bran_owner_type.clone(),
+                    });
+                }
+                m
+            });
+            println!(
+                "    [BRAN_TUBI] P4 全局预取 branch_meta 完成: total={}, hit={}, elapsed={}ms",
+                branch_map.len(),
+                cache.len(),
+                t_p4_bm.elapsed().as_millis()
+            );
+            cache
+        } else {
+            DashMap::new()
+        };
+
+        // P4 全局准备（含预取）总耗时
+        p4_global_prepare_time = t_global_prepare.elapsed().as_millis();
 
         for bran_data in branch_map.iter() {
             let branch_refno = *bran_data.key();
@@ -2695,10 +2826,20 @@ async fn gen_cata_geos_inner(
                     .get_foreign_refno(if is_hang { "HREF" } else { "HSTU" })
                     .unwrap_or_default();
 
-                let tubi_att = aios_core::get_named_attmap(h_ref).await.unwrap_or_default();
-                let tubi_cat_ref = tubi_att.get_foreign_refno("CATR").unwrap_or_default();
-                h_tubi_size =
-                    fast_model::query_tubi_size(branch_refno, tubi_cat_ref, is_hang).await?;
+                let t_branch_meta = Instant::now();
+                // P4 优化：优先从全局预取缓存读取 h_tubi_size 和 bran_owner_type
+                if let Some(cached) = branch_meta_cache.get(&branch_refno) {
+                    h_tubi_size = cached.h_tubi_size;
+                    bran_owner_type = cached.bran_owner_type.clone();
+                } else {
+                    let tubi_att = aios_core::get_named_attmap(h_ref).await.unwrap_or_default();
+                    let tubi_cat_ref = tubi_att.get_foreign_refno("CATR").unwrap_or_default();
+                    h_tubi_size =
+                        fast_model::query_tubi_size(branch_refno, tubi_cat_ref, is_hang).await?;
+                    bran_owner_type = aios_core::get_type_name(branch_att.get_owner())
+                        .await
+                        .unwrap_or_default();
+                }
                 tref = branch_att
                     .get_foreign_refno(if is_hang { "TREF" } else { "LSTU" })
                     .unwrap_or_default();
@@ -2708,9 +2849,8 @@ async fn gen_cata_geos_inner(
                     .normalize_or_zero();
                 branch_sesno = branch_att.sesno();
                 branch_type_str = branch_att.get_type_str().to_string();
-                bran_owner_type = aios_core::get_type_name(branch_att.get_owner())
-                    .await
-                    .unwrap_or_default();
+                p4_branch_meta_time += t_branch_meta.elapsed().as_millis();
+                p4_branch_meta_cnt += 1;
             }
 
             if matches!(h_tubi_size, TubiSize::None) {
@@ -2851,9 +2991,13 @@ async fn gen_cata_geos_inner(
                                 .map(|x| x.generic_type.clone())
                                 .unwrap_or_default()
                         } else {
-                            get_generic_type(current_tubing.leave_refno)
+                            let t_gt = Instant::now();
+                            let gt = get_generic_type(current_tubing.leave_refno)
                                 .await
-                                .unwrap_or_default()
+                                .unwrap_or_default();
+                            p4_generic_type_time += t_gt.elapsed().as_millis();
+                            p4_generic_type_cnt += 1;
+                            gt
                         };
                         tubi_shape_insts_data.insert_tubi(
                             current_tubing.leave_refno,
@@ -3015,12 +3159,16 @@ async fn gen_cata_geos_inner(
                             }
                             false
                         } else {
-                            (arrive_type == "ATTA"
+                            let t_spkbrk = Instant::now();
+                            let spkbrk_result = (arrive_type == "ATTA"
                                 || arrive_type == "STIF"
                                 || arrive_type == "BRCO")
                                 && !aios_core::get_named_attmap(refno)
                                     .await?
-                                    .get_bool_or_default("SPKBRK")
+                                    .get_bool_or_default("SPKBRK");
+                            p4_spkbrk_time += t_spkbrk.elapsed().as_millis();
+                            p4_spkbrk_cnt += 1;
+                            spkbrk_result
                         };
                         if !skip {
                             let a_pos = &axis_map[0].pt;
@@ -3079,20 +3227,28 @@ async fn gen_cata_geos_inner(
                                             continue;
                                         }
                                     } else {
-                                        let lstube_cat_ref = aios_core::query_single_by_paths(
-                                            current_tubing.leave_refno,
-                                            &["->LSTU->CATR"],
-                                            &["REFNO"],
-                                        )
-                                        .await
-                                        .map(|x| x.get_refno_or_default())
-                                        .unwrap_or_default();
-                                        current_tubing.tubi_size = fast_model::query_tubi_size(
-                                            current_tubing.leave_refno,
-                                            lstube_cat_ref,
-                                            is_hang,
-                                        )
-                                        .await?;
+                                        let t_lstube = Instant::now();
+                                        // P4 优化：优先从全局预取缓存读取 tubi_size
+                                        if let Some(cached_size) = tubi_size_cache.get(&current_tubing.leave_refno) {
+                                            current_tubing.tubi_size = cached_size.clone();
+                                        } else {
+                                            let lstube_cat_ref = aios_core::query_single_by_paths(
+                                                current_tubing.leave_refno,
+                                                &["->LSTU->CATR"],
+                                                &["REFNO"],
+                                            )
+                                            .await
+                                            .map(|x| x.get_refno_or_default())
+                                            .unwrap_or_default();
+                                            current_tubing.tubi_size = fast_model::query_tubi_size(
+                                                current_tubing.leave_refno,
+                                                lstube_cat_ref,
+                                                is_hang,
+                                            )
+                                            .await?;
+                                        }
+                                        p4_lstube_time += t_lstube.elapsed().as_millis();
+                                        p4_lstube_cnt += 1;
                                     }
                                 }
                                 debug_model!(
@@ -3191,9 +3347,13 @@ async fn gen_cata_geos_inner(
                                                 .map(|x| x.generic_type.clone())
                                                 .unwrap_or_default()
                                         } else {
-                                            get_generic_type(current_tubing.leave_refno)
+                                            let t_gt = Instant::now();
+                                            let gt = get_generic_type(current_tubing.leave_refno)
                                                 .await
-                                                .unwrap_or_default()
+                                                .unwrap_or_default();
+                                            p4_generic_type_time += t_gt.elapsed().as_millis();
+                                            p4_generic_type_cnt += 1;
+                                            gt
                                         };
                                         // 中间直段：axis_map[0]=ARRIVE, axis_map[1]=LEAVE
                                         let arrive_axis_pt = axis_map[0].pt.to_array();
@@ -3377,20 +3537,28 @@ async fn gen_cata_geos_inner(
                                 continue;
                             }
                         } else {
-                            let lstube_cat_ref = aios_core::query_single_by_paths(
-                                current_tubing.leave_refno,
-                                &["->LSTU->CATR"],
-                                &["REFNO"],
-                            )
-                            .await
-                            .map(|x| x.get_refno_or_default())
-                            .unwrap_or_default();
-                            current_tubing.tubi_size = fast_model::query_tubi_size(
-                                current_tubing.leave_refno,
-                                lstube_cat_ref,
-                                is_hang,
-                            )
-                            .await?;
+                            let t_lstube = Instant::now();
+                            // P4 优化：优先从全局预取缓存读取 tubi_size
+                            if let Some(cached_size) = tubi_size_cache.get(&current_tubing.leave_refno) {
+                                current_tubing.tubi_size = cached_size.clone();
+                            } else {
+                                let lstube_cat_ref = aios_core::query_single_by_paths(
+                                    current_tubing.leave_refno,
+                                    &["->LSTU->CATR"],
+                                    &["REFNO"],
+                                )
+                                .await
+                                .map(|x| x.get_refno_or_default())
+                                .unwrap_or_default();
+                                current_tubing.tubi_size = fast_model::query_tubi_size(
+                                    current_tubing.leave_refno,
+                                    lstube_cat_ref,
+                                    is_hang,
+                                )
+                                .await?;
+                            }
+                            p4_lstube_time += t_lstube.elapsed().as_millis();
+                            p4_lstube_cnt += 1;
                         }
                     }
                     let transform = (if !dir_ok {
@@ -3476,9 +3644,13 @@ async fn gen_cata_geos_inner(
                                     .map(|x| x.generic_type.clone())
                                     .unwrap_or_default()
                             } else {
-                                get_generic_type(current_tubing.leave_refno)
+                                let t_gt = Instant::now();
+                                let gt = get_generic_type(current_tubing.leave_refno)
                                     .await
-                                    .unwrap_or_default()
+                                    .unwrap_or_default();
+                                p4_generic_type_time += t_gt.elapsed().as_millis();
+                                p4_generic_type_cnt += 1;
+                                gt
                             };
                             // 最后一段：leave=上一元件的LEAVE点, arrive=BRAN的TPOS
                             let arrive_axis_pt = bran_ttube_pt.to_array();
@@ -3682,6 +3854,27 @@ async fn gen_cata_geos_inner(
         );
         time_stats.insert("send_data".to_string(), send_data_time as u64);
         time_stats.insert("tubi_query".to_string(), tubi_query_time as u64);
+        // P4 profiling: 详细计时
+        time_stats.insert("p4_global_prepare".to_string(), p4_global_prepare_time as u64);
+        time_stats.insert("p4_branch_meta".to_string(), p4_branch_meta_time as u64);
+        time_stats.insert("p4_spkbrk".to_string(), p4_spkbrk_time as u64);
+        time_stats.insert("p4_lstube".to_string(), p4_lstube_time as u64);
+        time_stats.insert("p4_generic_type".to_string(), p4_generic_type_time as u64);
+        println!(
+            "  [TUBI perf] P4详细计时: global_prepare={}ms, branch_meta={}ms(n={}), spkbrk={}ms(n={}), lstube={}ms(n={}), generic_type={}ms(n={})",
+            p4_global_prepare_time, p4_branch_meta_time, p4_branch_meta_cnt,
+            p4_spkbrk_time, p4_spkbrk_cnt, p4_lstube_time, p4_lstube_cnt,
+            p4_generic_type_time, p4_generic_type_cnt
+        );
+        let p4_accounted = p4_global_prepare_time + p4_branch_meta_time + p4_spkbrk_time
+            + p4_lstube_time + p4_generic_type_time
+            + db_time_get_branch_att + db_time_get_branch_transform
+            + send_data_time + tubi_query_time;
+        println!(
+            "  [TUBI perf] 已统计={}ms, 总计={}ms, 未统计={}ms",
+            p4_accounted, process_branch_time,
+            process_branch_time.saturating_sub(p4_accounted)
+        );
         if matches!(branch_mode, BranchTubiMode::CacheOnly) {
             let axis_need_total = cache_only_axis_need_total as u64;
             let axis_cache_hit = cache_only_axis_hit_total as u64;

@@ -1,4 +1,4 @@
-# 性能测试专用配置：7997 dbnum BRAN 模型生成（限制 50 个/noun）
+# 性能测试专用配置：7997 dbnum BRAN 模型生成（限制 500 个/noun）
 total_sync = false
 replace_dbs = false
 incr_sync = false
@@ -47,7 +47,7 @@ full_noun_batch_size = 200
 full_noun_enabled_categories = ["BRAN"]
 full_noun_excluded_nouns = []
 
-# 限制每个 noun 类型最多 50 个
+# 限制每个 noun 类型最多 500 个
 debug_limit_per_noun = 50
 
 # 指定 dbnum = 7997

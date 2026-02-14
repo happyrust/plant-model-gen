@@ -99,9 +99,16 @@ where
         return Err(anyhow!("body hash 不匹配（疑似损坏）"));
     }
 
-    // SAFETY: body 由本进程 encode 产生，并在此校验了长度与 hash；若仍发生损坏/版本漂移，按 miss 处理。
-    // 之所以不用 checked(from_bytes) 是因为部分依赖类型（如 glam::Vec3）缺少 CheckBytes 实现。
-    unsafe { rkyv::from_bytes_unchecked::<T, rkyv::rancor::Error>(body) }
+    // body 来自普通 Vec<u8> 的子切片（偏移 HEADER_LEN），不保证满足 rkyv archived 类型的对齐要求。
+    // nightly Rust (1.93+) 对 slice::from_raw_parts 的对齐前置条件做了严格检查，
+    // 直接传入未对齐的 &[u8] 会触发 UB panic。
+    // 解决方案：拷贝到 AlignedVec 再反序列化，保证 16 字节对齐。
+    let mut aligned: rkyv::util::AlignedVec<16> = rkyv::util::AlignedVec::with_capacity(body.len());
+    aligned.extend_from_slice(body);
+
+    // SAFETY: aligned 内容与 body 完全一致（已校验 hash），且满足对齐要求。
+    // 不用 checked(from_bytes) 是因为部分依赖类型（如 glam::Vec3）缺少 CheckBytes 实现。
+    unsafe { rkyv::from_bytes_unchecked::<T, rkyv::rancor::Error>(&aligned) }
         .map_err(|e| anyhow!("rkyv 反序列化失败: {:?}", e))
 }
 

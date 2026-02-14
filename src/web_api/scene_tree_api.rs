@@ -320,13 +320,18 @@ async fn get_ancestors(
 // 辅助函数
 // ========================
 
-/// 解析 refno 字符串为 u64
+/// 解析 refno 字符串为 u64（RefU64 编码：ref0<<32 | ref1）
+///
+/// 注意：这里的高 32 位是 **ref0**，不是 dbnum。
+///
+/// 支持两种格式：
+/// - `ref0_ref1`（例如 `24381_145018`）
+/// - `ref0/ref1`（例如 `24381/145018`）
 fn parse_refno_to_u64(refno: &str) -> Option<u64> {
-    let parts: Vec<&str> = refno.split('_').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let dbnum: u64 = parts[0].parse().ok()?;
-    let ref_num: u64 = parts[1].parse().ok()?;
-    Some((dbnum << 32) | ref_num)
+    let (ref0_str, ref1_str) = refno
+        .split_once('_')
+        .or_else(|| refno.split_once('/'))?;
+    let ref0: u64 = ref0_str.parse().ok()?;
+    let ref1: u64 = ref1_str.parse().ok()?;
+    Some((ref0 << 32) | ref1)
 }

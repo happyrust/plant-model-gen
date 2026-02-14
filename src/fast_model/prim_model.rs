@@ -1,156 +1,365 @@
-use crate::data_interface::interface::PdmsDataInterface;
-use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::gen_model::is_e3d_debug_enabled;
 use crate::fast_model::{SEND_INST_SIZE, get_generic_type, shared};
 use crate::{consts::*, e3d_dbg};
 use crate::fast_model::query_compat::query_filter_deep_children_atts;
-use aios_core::RefU64;
 use aios_core::geometry::*;
-use aios_core::options::DbOption;
 use crate::options::DbOptionExt;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::pdms_types::*;
 use aios_core::prim_geo::polyhedron::Polygon;
 use aios_core::prim_geo::*;
-use aios_core::shape::pdms_shape::{BrepShapeTrait, PlantMesh, VerifiedShape};
+use aios_core::shape::pdms_shape::BrepShapeTrait;
 use aios_core::Transform;
 use glam::Vec3;
-use parry3d::bounding_volume::Aabb;
-use parry3d::math::Isometry;
 use std::collections::HashMap;
 use std::mem::take;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use crate::fast_model::foyer_cache::geom_input_cache::PrimInput;
 
-/// 生成基本体的几何数据
+// ---------------------------------------------------------------------------
+// 公共工具函数
+// ---------------------------------------------------------------------------
+
+/// 计算并发分块参数：返回 (batch_count, batch_size)
+fn calculate_batch_chunks(total: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    let mut batch_count = 8usize.min(total);
+    let mut batch_size = (total + batch_count - 1) / batch_count;
+    if batch_size == 0 {
+        batch_size = 1;
+    }
+    if batch_size == 1 {
+        batch_count = total;
+    } else {
+        batch_count = (total + batch_size - 1) / batch_size;
+    }
+    (batch_count, batch_size)
+}
+
+/// 从 CSG shape 构建 EleInstGeo（两个入口函数的核心公共逻辑）。
+///
+/// 返回 `Some((inst_geo, geo_insts_has_pos))` 或 `None`（表示跳过）。
+fn build_inst_geo_from_shape(
+    csg_shape: Box<dyn BrepShapeTrait>,
+    refno: RefnoEnum,
+    visible: bool,
+    is_neg: bool,
+) -> Option<EleInstGeo> {
+    if !csg_shape.check_valid() {
+        return None;
+    }
+
+    let mut transform = csg_shape.get_trans();
+    if transform.translation.is_nan()
+        || transform.rotation.is_nan()
+        || transform.scale.is_nan()
+    {
+        return None;
+    }
+
+    let mut geo_param = csg_shape
+        .convert_to_geo_param()
+        .unwrap_or(PdmsGeoParam::Unknown);
+    let geo_hash = csg_shape.hash_unit_mesh_params();
+    let unit_flag = csg_shape.is_reuse_unit();
+
+    if unit_flag {
+        geo_param = csg_shape
+            .gen_unit_shape()
+            .convert_to_geo_param()
+            .unwrap_or(geo_param);
+    }
+
+    crate::fast_model::reuse_unit::normalize_transform_scale(
+        &mut transform,
+        unit_flag,
+        geo_hash,
+    );
+
+    Some(EleInstGeo {
+        geo_hash,
+        refno,
+        pts: Default::default(),
+        aabb: None,
+        geo_transform: transform,
+        geo_param,
+        visible,
+        is_tubi: false,
+        geo_type: if is_neg {
+            GeoBasicType::Neg
+        } else {
+            GeoBasicType::Pos
+        },
+        cata_neg_refnos: vec![],
+    })
+}
+
+/// 从 DB 查询构建多面体 CSG shape（POHE/POLYHE）。
+async fn build_polyhedron_from_db(
+    refno: RefnoEnum,
+) -> Option<Box<dyn BrepShapeTrait>> {
+    let pgo_refnos = crate::fast_model::query_provider::get_children(refno)
+        .await
+        .unwrap_or_default();
+    if pgo_refnos.is_empty() {
+        return None;
+    }
+
+    let first_type = aios_core::get_type_name(pgo_refnos[0])
+        .await
+        .unwrap_or_default();
+
+    let mut polygons = vec![];
+    let mut is_polyhe = false;
+
+    if first_type == "POLPTL" {
+        is_polyhe = true;
+        let mut verts_map = HashMap::new();
+        let v_att =
+            crate::fast_model::query_provider::query_multi_descendants_with_self(
+                &[pgo_refnos[0]],
+                &["POIN"],
+                false,
+            )
+            .await
+            .unwrap_or_default();
+        for v in v_att.into_iter() {
+            let v_attmap = aios_core::get_named_attmap(v).await.unwrap_or_default();
+            let pos = v_attmap.get_position().unwrap_or_default();
+            verts_map.insert(v, pos);
+        }
+        let index_loops =
+            query_filter_deep_children_atts(refno, &["LOOPTS"])
+                .await
+                .unwrap_or_default();
+        let index_map = index_loops.iter().fold(HashMap::new(), |mut map, x| {
+            let owner = x.get_owner();
+            let vx_refnos = x.get_refno_vec("VXREF").unwrap_or_default();
+            map.entry(owner).or_insert_with(Vec::new).extend(vx_refnos);
+            map
+        });
+        let loop_atts =
+            query_filter_deep_children_atts(refno, &["POLOOP"])
+                .await
+                .unwrap_or_default();
+        let loops_map = loop_atts.iter().fold(HashMap::new(), |mut map, x| {
+            let owner = x.get_owner();
+            if let Some(index_refnos) = index_map.get(&x.get_refno_or_default()) {
+                map.entry(owner).or_insert_with(Vec::new).push(index_refnos);
+            }
+            map
+        });
+        for (_, v) in loops_map {
+            let mut loops = vec![];
+            for l in v {
+                let mut verts: Vec<Vec3> = vec![];
+                for index_refno in l {
+                    if let Some(vert) = verts_map.get(index_refno) {
+                        verts.push(*vert);
+                    }
+                }
+                loops.push(verts);
+            }
+            polygons.push(Polygon { loops });
+        }
+    } else {
+        for pgo_refno in pgo_refnos {
+            let mut verts = vec![];
+            let v_att = aios_core::collect_children_filter_attrs(pgo_refno, &[])
+                .await
+                .unwrap_or_default();
+            for v in v_att {
+                verts.push(v.get_position().unwrap_or_default());
+            }
+            polygons.push(Polygon { loops: vec![verts] });
+        }
+    }
+
+    let shape: Box<dyn BrepShapeTrait> = Box::new(Polyhedron {
+        polygons,
+        mesh: None,
+        is_polyhe,
+    });
+    Some(shape)
+}
+
+/// 从缓存的 PrimPolyExtra 构建多面体 CSG shape。
+fn build_polyhedron_from_cache(
+    extra: &crate::fast_model::foyer_cache::geom_input_cache::PrimPolyExtra,
+) -> Box<dyn BrepShapeTrait> {
+    let polygons = extra
+        .polygons
+        .iter()
+        .map(|p| Polygon { loops: p.loops.clone() })
+        .collect::<Vec<_>>();
+    Box::new(Polyhedron {
+        polygons,
+        mesh: None,
+        is_polyhe: extra.is_polyhe,
+    })
+}
+
+/// 将已构建的 inst_geo 插入 shape_insts_data，并处理负实体关系。
+fn insert_prim_result(
+    shape_insts_data: &mut ShapeInstancesData,
+    geos_info: EleGeosInfo,
+    inst_geo: EleInstGeo,
+    neg_refnos: &[RefnoEnum],
+    type_name: &str,
+) {
+    let refno = geos_info.refno;
+    let is_solid = inst_geo.geo_type == GeoBasicType::Pos;
+    let mut geos_info = geos_info;
+    geos_info.is_solid = is_solid;
+
+    if !neg_refnos.is_empty() {
+        shape_insts_data.insert_negs(refno, neg_refnos);
+    }
+
+    let inst_key = geos_info.get_inst_key();
+    shape_insts_data.insert_geos_data(
+        inst_key.clone(),
+        EleInstGeosData {
+            inst_key,
+            refno,
+            insts: vec![inst_geo],
+            aabb: None,
+            type_name: type_name.to_string(),
+        },
+    );
+    shape_insts_data.insert_info(refno, geos_info);
+}
+
+/// 如果 batch 达到阈值则发送，返回是否发送成功。
+fn flush_if_needed(
+    shape_insts_data: &mut ShapeInstancesData,
+    sender: &flume::Sender<ShapeInstancesData>,
+    batch_idx: usize,
+    sent_count: &mut usize,
+) -> anyhow::Result<()> {
+    if shape_insts_data.inst_cnt() >= SEND_INST_SIZE {
+        e3d_dbg!(
+            "[gen_prim_geos] 批次 {} 发送中间数据: {} 个实例",
+            batch_idx,
+            shape_insts_data.inst_cnt()
+        );
+        sender
+            .send(std::mem::take(shape_insts_data))
+            .map_err(|e| anyhow::anyhow!("send prim shape_insts_data error: {}", e))?;
+        *sent_count += 1;
+    }
+    Ok(())
+}
+
+/// 发送剩余数据。
+fn flush_remaining(
+    shape_insts_data: ShapeInstancesData,
+    sender: &flume::Sender<ShapeInstancesData>,
+    batch_idx: usize,
+    sent_count: &mut usize,
+) -> anyhow::Result<()> {
+    if shape_insts_data.inst_cnt() > 0 {
+        e3d_dbg!(
+            "[gen_prim_geos] 批次 {} 发送最后数据: {} 个实例",
+            batch_idx,
+            shape_insts_data.inst_cnt()
+        );
+        sender
+            .send(shape_insts_data)
+            .map_err(|e| anyhow::anyhow!("send last prim shape_insts_data error: {}", e))?;
+        *sent_count += 1;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 公开入口函数
+// ---------------------------------------------------------------------------
+
+/// 生成基本体的几何数据（从 SurrealDB 查询属性）
 pub async fn gen_prim_geos(
     db_option: Arc<DbOptionExt>,
     prim_refnos: &[RefnoEnum],
     sender: flume::Sender<ShapeInstancesData>,
 ) -> anyhow::Result<bool> {
     let t = Instant::now();
-    let batch_size = db_option.inner.gen_model_batch_size;
     let prim_cnt = prim_refnos.len();
 
-    e3d_dbg!("[gen_prim_geos] 开始生成基本体几何数据");
-    e3d_dbg!("[gen_prim_geos] 总数量: {}", prim_cnt);
-    e3d_dbg!("[gen_prim_geos] 配置批次大小: {}", batch_size);
+    e3d_dbg!("[gen_prim_geos] 开始生成基本体几何数据, 总数量: {}", prim_cnt);
 
     if prim_cnt == 0 {
-        e3d_dbg!("[gen_prim_geos] 警告: 基本体数量为0，直接返回");
         return Ok(true);
     }
-    let mut batch_chunks_cnt = 8usize.min(prim_cnt.max(1));
-    let mut batch_size = (prim_cnt + batch_chunks_cnt - 1) / batch_chunks_cnt;
-    if batch_size == 0 {
-        batch_size = 1;
-    }
-    //如果只有一个元件，就不分块了
-    if batch_size == 1 {
-        batch_chunks_cnt = prim_cnt;
-    } else {
-        batch_chunks_cnt = (prim_cnt + batch_size - 1) / batch_size;
-    }
 
+    let (batch_chunks_cnt, batch_size) = calculate_batch_chunks(prim_cnt);
     e3d_dbg!(
         "[gen_prim_geos] 分块策略: {} 个批次, 每批 {} 个元素",
         batch_chunks_cnt,
         batch_size
     );
 
-    let mut handles = vec![];
     let all_refnos = Arc::new(prim_refnos.to_vec());
     let processed_cnt = Arc::new(Mutex::new(prim_cnt));
+    let mut handles = vec![];
+
     for i in 0..batch_chunks_cnt {
         let all_refnos = all_refnos.clone();
         let processed_cnt = processed_cnt.clone();
         let sender = sender.clone();
         let db_option = db_option.clone();
+
         let handle = tokio::spawn(async move {
             let batch_start_time = Instant::now();
             let mut shape_insts_data = ShapeInstancesData::default();
             let start_idx = i * batch_size;
             if start_idx >= prim_cnt {
-                e3d_dbg!(
-                    "[gen_prim_geos] 批次 {} 起始索引 {} 超出总长度 {}, 直接跳过",
-                    i,
-                    start_idx,
-                    prim_cnt
-                );
                 return Ok::<_, anyhow::Error>(());
             }
-            let mut end_idx = start_idx + batch_size;
-            if end_idx > prim_cnt {
-                end_idx = prim_cnt;
-            }
+            let end_idx = (start_idx + batch_size).min(prim_cnt);
             let batch_item_count = end_idx - start_idx;
 
             e3d_dbg!(
                 "[gen_prim_geos] 批次 {} 开始: 索引范围 {} ~ {}, 共 {} 个元素",
-                i,
-                start_idx,
-                end_idx,
-                batch_item_count
+                i, start_idx, end_idx, batch_item_count
             );
 
-            e3d_dbg!("当前范围: {start_idx} ~ {end_idx}");
-            let mut processed_in_batch = 0;
-            let mut skipped_in_batch = 0;
-            let mut sent_count = 0;
+            let mut processed_in_batch = 0usize;
+            let mut skipped_in_batch = 0usize;
+            let mut sent_count = 0usize;
 
             for j in start_idx..end_idx {
                 let refno = all_refnos[j];
-                let remaining = {
+                {
                     let mut cnt = processed_cnt.lock().await;
                     *cnt -= 1;
-                    *cnt
-                };
+                }
 
-                e3d_dbg!(
-                    "批次 {} 处理索引 {}: refno={}, 剩余={}",
-                    i,
-                    j,
-                    refno.to_string(),
-                    remaining
-                );
-
+                // 1. 获取世界变换
                 let trans_result =
                     crate::fast_model::transform_cache::get_world_transform_cache_first(
                         Some(db_option.as_ref()),
                         refno,
                     )
                     .await;
-                let Ok(Some(mut trans_origin)) = trans_result else {
+                let Ok(Some(trans_origin)) = trans_result else {
                     skipped_in_batch += 1;
-                    match trans_result {
-                        Err(e) => {
-                            e3d_dbg!(
-                                "批次 {} 跳过 refno={}: 获取世界变换失败 - {:?}",
-                                i,
-                                refno.to_string(),
-                                e
-                            );
-                        }
-                        Ok(None) => {
-                            e3d_dbg!(
-                                "批次 {} 跳过 refno={}: 世界变换为 None",
-                                i,
-                                refno.to_string()
-                            );
-                        }
-                        _ => {}
+                    if let Err(e) = &trans_result {
+                        e3d_dbg!("批次 {} 跳过 refno={}: 获取世界变换失败 - {:?}", i, refno, e);
                     }
                     continue;
                 };
-                let mut geo_insts = vec![];
-                let mut transform = Transform::IDENTITY;
 
+                // 2. 获取属性
                 let attr = aios_core::get_named_attmap(refno).await.unwrap_or_default();
                 let visible = attr.is_visible_by_level(None).unwrap_or(true);
                 let (owner_refno, owner_type) = shared::get_owner_info_from_attr(&attr).await;
-                let mut geos_info = EleGeosInfo {
+                let cur_type = attr.get_type_str();
+
+                let geos_info = EleGeosInfo {
                     refno,
                     sesno: attr.sesno(),
                     owner_refno,
@@ -161,211 +370,36 @@ pub async fn gen_prim_geos(
                     world_transform: trans_origin,
                     ..Default::default()
                 };
-                let mut geo_param = PdmsGeoParam::Unknown;
-                let cur_type = attr.get_type_str();
 
-                e3d_dbg!(
-                    "批次 {} 处理 refno={}, type={}, visible={}",
-                    i,
-                    refno.to_string(),
-                    cur_type,
-                    visible
-                );
-
-                //需要限制负实体的大小，太大，导致负运算失败
+                // 3. 构建 CSG shape
                 let neg_limit_size: Option<f32> = if GENRAL_NEG_NOUN_NAMES.contains(&cur_type) {
-                    // if let Some(parent_inst) = shape_insts_data.inst_info_map.get(&attr.get_owner()) {
-                    //     parent_inst
-                    //         .aabb
-                    //         .map(|x| x.bounding_sphere().radius * 4.0)
-                    // } else {
-                    //负实体默认的最大大小，不能超过
                     Some(1000_000.0)
-                    // }
                 } else {
                     None
                 };
-                // dbg!((attr.get_type_str(), refno, neg_limit_size));
-                //多面体的处理
-                let csg_shape = if cur_type == "POHE" || cur_type == "POLYHE" {
-                    // 层级查询统一走 indextree（TreeIndex）
-                    let pgo_refnos = crate::fast_model::query_provider::get_children(refno)
-                        .await
-                        .unwrap_or_default();
-                    //需要检查第一个是不是POLPTL 类型
-                    if pgo_refnos.is_empty() {
-                        continue;
-                    }
-                    let first_type = aios_core::get_type_name(pgo_refnos[0])
-                        .await
-                        .unwrap_or_default();
-                    // dbg!(&first_type);
-                    let mut polygons = vec![];
-                    let mut is_polyhe = false;
-                    if first_type == "POLPTL" {
-                        is_polyhe = true;
-                        // let mut plant_mesh = PlantMesh::default();
-                        let mut verts_map = HashMap::new();
-                        // 层级查询统一走 indextree（TreeIndex）
-                        let v_att = crate::fast_model::query_provider::query_multi_descendants_with_self(
-                            &[pgo_refnos[0]],
-                            &["POIN"],
-                            false,
-                        )
-                        .await
-                        .unwrap_or_default();
-                        // dbg!(v_att.len());
-                        for (i, v) in v_att.into_iter().enumerate() {
-                            // dbg!(&v);
-                            let v_attmap = aios_core::get_named_attmap(v).await.unwrap_or_default();
-                            let pos = v_attmap.get_position().unwrap_or_default();
-                            verts_map.insert(v, pos);
-                            // verts_map.insert(v, i);
-                        }
-                        let index_loops =
-                            query_filter_deep_children_atts(refno, &["LOOPTS"])
-                                .await
-                                .unwrap_or_default();
-                        // dbg!(index_loops.len());
-                        // let tmp_refnos = index_loops.iter().map(|x| x.get_owner()).collect::<Vec<_>>();
-                        // dbg!(&tmp_refnos);
-                        // dbg!(tmp_refnos.len());
-                        //按照 owner 进行分组，生成hashmap
-                        let index_map = index_loops.iter().fold(HashMap::new(), |mut map, x| {
-                            let owner = x.get_owner();
-                            let vx_refnos = x.get_refno_vec("VXREF").unwrap_or_default();
-                            //同一个分组下的，直接融合就可以
-                            map.entry(owner).or_insert_with(Vec::new).extend(vx_refnos);
-                            map
-                        });
-                        // dbg!(index_map.len());
-                        let loop_atts =
-                            query_filter_deep_children_atts(refno, &["POLOOP"])
-                                .await
-                                .unwrap_or_default();
-                        // dbg!(loop_atts.len());
-                        let loops_map = loop_atts.iter().fold(HashMap::new(), |mut map, x| {
-                            let owner = x.get_owner();
-                            if let Some(index_refnos) = index_map.get(&x.get_refno_or_default()) {
-                                // dbg!(index_refnos.len());
-                                //同一个分组下的，直接融合就可以
-                                map.entry(owner).or_insert_with(Vec::new).push(index_refnos);
-                            }
-                            map
-                        });
-                        for (_, v) in loops_map {
-                            let mut loops = vec![];
-                            for l in v {
-                                let mut verts: Vec<Vec3> = vec![];
-                                for index_refno in l {
-                                    if let Some(vert) = verts_map.get(index_refno) {
-                                        verts.push(*vert);
-                                    }
-                                }
-                                loops.push(verts);
-                            }
-                            polygons.push(Polygon { loops });
-                        }
-                    } else {
-                        for pgo_refno in pgo_refnos {
-                            let mut verts = vec![];
-                            // 使用新的泛型函数接口
-                            let v_att = aios_core::collect_children_filter_attrs(pgo_refno, &[])
-                                .await
-                                .unwrap_or_default();
-                            for v in v_att {
-                                // dbg!(&v);
-                                verts.push(v.get_position().unwrap_or_default());
-                            }
-                            polygons.push(Polygon { loops: vec![verts] });
-                        }
-                    }
 
-                    // dbg!(&polygons);
-                    let shape: Box<dyn BrepShapeTrait> = Box::new(Polyhedron {
-                        polygons,
-                        mesh: None,
-                        is_polyhe,
-                    });
-                    Some(shape)
+                let csg_shape = if cur_type == "POHE" || cur_type == "POLYHE" {
+                    build_polyhedron_from_db(refno).await
                 } else {
                     attr.create_csg_shape(neg_limit_size)
                 };
+
                 let Some(csg_shape) = csg_shape else {
                     skipped_in_batch += 1;
-                    e3d_dbg!(
-                        "批次 {} 跳过 refno={}: 无法创建csg_shape",
-                        i,
-                        refno.to_string()
-                    );
                     continue;
                 };
-                if !csg_shape.check_valid() {
+
+                // 4. 构建 inst_geo
+                let Some(inst_geo) = build_inst_geo_from_shape(
+                    csg_shape, refno, visible, attr.is_neg(),
+                ) else {
                     skipped_in_batch += 1;
-                    e3d_dbg!(
-                        "批次 {} 跳过 refno={}: csg_shape验证失败",
-                        i,
-                        refno.to_string()
-                    );
                     continue;
-                }
-
-                transform = csg_shape.get_trans();
-                if transform.translation.is_nan()
-                    || transform.rotation.is_nan()
-                    || transform.scale.is_nan()
-                {
-                    skipped_in_batch += 1;
-                    e3d_dbg!(
-                        "批次 {} 跳过 refno={}: transform包含NaN值",
-                        i,
-                        refno.to_string()
-                    );
-                    continue;
-                }
-                geo_param = csg_shape
-                    .convert_to_geo_param()
-                    .unwrap_or(PdmsGeoParam::Unknown);
-                let geo_hash = csg_shape.hash_unit_mesh_params();
-                let unit_flag = csg_shape.is_reuse_unit();
-
-                // unit_flag=true 时，必须把 geo_param 写成"单位参数"，确保：
-                // - 同一 geo_hash 复用到的 mesh 顶点始终一致（不会被某个实例的绝对尺寸污染）
-                // - 后续布尔/导出在保留 transform.scale 的情况下不会重复缩放
-                if unit_flag {
-                    geo_param = csg_shape
-                        .gen_unit_shape()
-                        .convert_to_geo_param()
-                        .unwrap_or(geo_param);
-                }
-
-                // 统一处理 transform.scale 清零逻辑
-                crate::fast_model::reuse_unit::normalize_transform_scale(
-                    &mut transform,
-                    unit_flag,
-                    geo_hash,
-                );
-                // dbg!(geo_hash);
-                let inst_geo = EleInstGeo {
-                    geo_hash,
-                    refno,
-                    pts: Default::default(),
-                    aabb: None,
-                    geo_transform: transform,
-                    geo_param,
-                    visible,
-                    is_tubi: false,
-                    geo_type: if attr.is_neg() {
-                        GeoBasicType::Neg
-                    } else {
-                        GeoBasicType::Pos
-                    },
-                    cata_neg_refnos: vec![],
                 };
-                geo_insts.push(inst_geo);
-                if geo_insts.len() > 0 {
-                    // 层级查询统一走 indextree（TreeIndex）
-                    let neg_refnos = crate::fast_model::query_provider::query_multi_descendants_with_self(
+
+                // 5. 查询负实体
+                let neg_refnos =
+                    crate::fast_model::query_provider::query_multi_descendants_with_self(
                         &[refno],
                         &GENRAL_NEG_NOUN_NAMES,
                         false,
@@ -373,71 +407,26 @@ pub async fn gen_prim_geos(
                     .await
                     .unwrap_or_default();
 
-                    if !neg_refnos.is_empty() {
-                        e3d_dbg!(
-                            "批次 {} refno={} 找到 {} 个负实体",
-                            i,
-                            refno.to_string(),
-                            neg_refnos.len()
-                        );
-                    }
-
-                    shape_insts_data.insert_negs(refno, &neg_refnos);
-                    // dbg!(&neg_refnos);
-                    geos_info.is_solid = geo_insts.iter().any(|x| x.geo_type == GeoBasicType::Pos);
-                    let inst_key = geos_info.get_inst_key();
-                    shape_insts_data.insert_geos_data(
-                        inst_key.clone(),
-                        EleInstGeosData {
-                            inst_key,
-                            refno,
-                            insts: geo_insts,
-                            aabb: None,
-                            type_name: attr.get_type_str().to_string(),
-                        },
-                    );
-                    shape_insts_data.insert_info(refno, geos_info);
-                    processed_in_batch += 1;
-                }
-
-                if shape_insts_data.inst_cnt() >= SEND_INST_SIZE {
-                    let inst_cnt = shape_insts_data.inst_cnt();
-                    e3d_dbg!(
-                        "[gen_prim_geos] 批次 {} 发送中间数据: {} 个实例",
-                        i,
-                        inst_cnt
-                    );
-                    sender
-                        .send(std::mem::take(&mut shape_insts_data))
-                        .expect("send prim shape_insts_data error");
-                    sent_count += 1;
-                    // dbg!("Send prim insts data");
-                }
-            }
-
-            if shape_insts_data.inst_cnt() > 0 {
-                let inst_cnt = shape_insts_data.inst_cnt();
-                e3d_dbg!(
-                    "[gen_prim_geos] 批次 {} 发送最后数据: {} 个实例",
-                    i,
-                    inst_cnt
+                // 6. 插入结果
+                insert_prim_result(
+                    &mut shape_insts_data,
+                    geos_info,
+                    inst_geo,
+                    &neg_refnos,
+                    cur_type,
                 );
-                sender
-                    .send(shape_insts_data)
-                    .expect("send prim shape_insts_data error");
-                sent_count += 1;
-                // dbg!("Send last prim insts data");
+                processed_in_batch += 1;
+
+                // 7. 按阈值发送
+                flush_if_needed(&mut shape_insts_data, &sender, i, &mut sent_count)?;
             }
 
-            let batch_elapsed = batch_start_time.elapsed();
+            flush_remaining(shape_insts_data, &sender, i, &mut sent_count)?;
+
             e3d_dbg!(
                 "[gen_prim_geos] 批次 {} 完成: 处理 {}/{} 个, 跳过 {} 个, 发送 {} 次, 耗时 {} ms",
-                i,
-                processed_in_batch,
-                batch_item_count,
-                skipped_in_batch,
-                sent_count,
-                batch_elapsed.as_millis()
+                i, processed_in_batch, batch_item_count, skipped_in_batch, sent_count,
+                batch_start_time.elapsed().as_millis()
             );
 
             Ok::<_, anyhow::Error>(())
@@ -445,10 +434,8 @@ pub async fn gen_prim_geos(
 
         handles.push(handle);
     }
-    e3d_dbg!(
-        "[gen_prim_geos] 等待所有 {} 个批次任务完成...",
-        handles.len()
-    );
+
+    e3d_dbg!("[gen_prim_geos] 等待所有 {} 个批次任务完成...", handles.len());
     let results = futures::future::join_all(take(&mut handles)).await;
 
     let mut success_count = 0;
@@ -470,10 +457,7 @@ pub async fn gen_prim_geos(
     let total_elapsed = t.elapsed();
     e3d_dbg!(
         "[gen_prim_geos] 完成! 总数: {}, 成功批次: {}, 失败批次: {}, 总耗时: {} ms",
-        prim_cnt,
-        success_count,
-        error_count,
-        total_elapsed.as_millis()
+        prim_cnt, success_count, error_count, total_elapsed.as_millis()
     );
 
     if is_e3d_debug_enabled() {
@@ -499,23 +483,13 @@ pub async fn gen_prim_geos_from_inputs(
         return Ok(true);
     }
 
-    // 复用原先的“分块并发”形态；区别在于：所有输入都来自 cache。
-    let mut batch_chunks_cnt = 8usize.min(prim_cnt.max(1));
-    let mut batch_size = (prim_cnt + batch_chunks_cnt - 1) / batch_chunks_cnt;
-    if batch_size == 0 {
-        batch_size = 1;
-    }
-    if batch_size == 1 {
-        batch_chunks_cnt = prim_cnt;
-    }
-
+    let (batch_chunks_cnt, batch_size) = calculate_batch_chunks(prim_cnt);
     let all_inputs: Arc<Vec<PrimInput>> = Arc::new(prim_inputs.into_values().collect());
 
     let mut handles = vec![];
     for i in 0..batch_chunks_cnt {
         let all_inputs = all_inputs.clone();
         let sender = sender.clone();
-        let _db_option = db_option.clone();
 
         let handle = tokio::spawn(async move {
             let batch_start_time = Instant::now();
@@ -533,14 +507,16 @@ pub async fn gen_prim_geos_from_inputs(
             for j in start_idx..end_idx {
                 let input = &all_inputs[j];
                 let refno = input.refno;
-
-                let mut geo_insts = vec![];
-                let mut transform = Transform::IDENTITY;
-
                 let attr = &input.attmap;
                 let visible = input.visible;
+                let cur_type = attr.get_type_str();
 
-                let mut geos_info = EleGeosInfo {
+                if cur_type.is_empty() {
+                    skipped_in_batch += 1;
+                    continue;
+                }
+
+                let geos_info = EleGeosInfo {
                     refno,
                     sesno: attr.sesno(),
                     owner_refno: input.owner_refno,
@@ -552,139 +528,53 @@ pub async fn gen_prim_geos_from_inputs(
                     ..Default::default()
                 };
 
-                let mut geo_param = PdmsGeoParam::Unknown;
-                let cur_type = attr.get_type_str();
-                if cur_type.is_empty() {
-                    skipped_in_batch += 1;
-                    continue;
-                }
-
-                // 需要限制负实体的大小，太大导致负运算失败（复用旧逻辑）。
+                // 构建 CSG shape
                 let neg_limit_size: Option<f32> = if GENRAL_NEG_NOUN_NAMES.contains(&cur_type) {
                     Some(1000_000.0)
                 } else {
                     None
                 };
 
-                let csg_shape: Option<Box<dyn BrepShapeTrait>> = if cur_type == "POHE" || cur_type == "POLYHE" {
-                    let Some(extra) = input.poly_extra.as_ref() else {
-                        skipped_in_batch += 1;
-                        continue;
+                let csg_shape: Option<Box<dyn BrepShapeTrait>> =
+                    if cur_type == "POHE" || cur_type == "POLYHE" {
+                        input.poly_extra.as_ref().map(build_polyhedron_from_cache)
+                    } else {
+                        attr.create_csg_shape(neg_limit_size)
                     };
-                    let polygons = extra
-                        .polygons
-                        .iter()
-                        .map(|p| Polygon { loops: p.loops.clone() })
-                        .collect::<Vec<_>>();
-                    Some(Box::new(Polyhedron {
-                        polygons,
-                        mesh: None,
-                        is_polyhe: extra.is_polyhe,
-                    }))
-                } else {
-                    attr.create_csg_shape(neg_limit_size)
-                };
 
                 let Some(csg_shape) = csg_shape else {
                     skipped_in_batch += 1;
                     continue;
                 };
-                if !csg_shape.check_valid() {
+
+                // 构建 inst_geo（复用公共逻辑）
+                let Some(inst_geo) = build_inst_geo_from_shape(
+                    csg_shape, refno, visible, attr.is_neg(),
+                ) else {
                     skipped_in_batch += 1;
                     continue;
-                }
-
-                transform = csg_shape.get_trans();
-                if transform.translation.is_nan()
-                    || transform.rotation.is_nan()
-                    || transform.scale.is_nan()
-                {
-                    skipped_in_batch += 1;
-                    continue;
-                }
-
-                geo_param = csg_shape
-                    .convert_to_geo_param()
-                    .unwrap_or(PdmsGeoParam::Unknown);
-                let geo_hash = csg_shape.hash_unit_mesh_params();
-                let unit_flag = csg_shape.is_reuse_unit();
-
-                if unit_flag {
-                    geo_param = csg_shape
-                        .gen_unit_shape()
-                        .convert_to_geo_param()
-                        .unwrap_or(geo_param);
-                }
-
-                crate::fast_model::reuse_unit::normalize_transform_scale(&mut transform, unit_flag, geo_hash);
-
-                let inst_geo = EleInstGeo {
-                    geo_hash,
-                    refno,
-                    pts: Default::default(),
-                    aabb: None,
-                    geo_transform: transform,
-                    geo_param,
-                    visible,
-                    is_tubi: false,
-                    geo_type: if attr.is_neg() {
-                        GeoBasicType::Neg
-                    } else {
-                        GeoBasicType::Pos
-                    },
-                    cata_neg_refnos: vec![],
                 };
-                geo_insts.push(inst_geo);
 
-                if !geo_insts.is_empty() {
-                    if !input.neg_refnos.is_empty() {
-                        shape_insts_data.insert_negs(refno, &input.neg_refnos);
-                    }
-                    geos_info.is_solid = geo_insts.iter().any(|x| x.geo_type == GeoBasicType::Pos);
-                    let inst_key = geos_info.get_inst_key();
-                    shape_insts_data.insert_geos_data(
-                        inst_key.clone(),
-                        EleInstGeosData {
-                            inst_key,
-                            refno,
-                            insts: geo_insts,
-                            aabb: None,
-                            type_name: cur_type.to_string(),
-                        },
-                    );
-                    shape_insts_data.insert_info(refno, geos_info);
-                    processed_in_batch += 1;
-                } else {
-                    skipped_in_batch += 1;
-                }
-
-                if shape_insts_data.inst_cnt() >= SEND_INST_SIZE {
-                    sender
-                        .send(std::mem::take(&mut shape_insts_data))
-                        .expect("send prim shape_insts_data error");
-                    sent_count += 1;
-                }
-            }
-
-            if shape_insts_data.inst_cnt() > 0 {
-                sender
-                    .send(shape_insts_data)
-                    .expect("send last prim shape_insts_data error");
-                sent_count += 1;
-            }
-
-            let batch_elapsed = batch_start_time.elapsed();
-            if is_e3d_debug_enabled() {
-                println!(
-                    "[gen_prim_geos_from_inputs] 批次 {} 完成: processed={}, skipped={}, sent={}, elapsed={} ms (cfg_batch_size={})",
-                    i,
-                    processed_in_batch,
-                    skipped_in_batch,
-                    sent_count,
-                    batch_elapsed.as_millis(),
-                    batch_size_cfg
+                // 插入结果
+                insert_prim_result(
+                    &mut shape_insts_data,
+                    geos_info,
+                    inst_geo,
+                    &input.neg_refnos,
+                    cur_type,
                 );
+                processed_in_batch += 1;
+
+                flush_if_needed(&mut shape_insts_data, &sender, i, &mut sent_count)?;
             }
+
+            flush_remaining(shape_insts_data, &sender, i, &mut sent_count)?;
+
+            e3d_dbg!(
+                "[gen_prim_geos_from_inputs] 批次 {} 完成: processed={}, skipped={}, sent={}, elapsed={} ms (cfg_batch_size={})",
+                i, processed_in_batch, skipped_in_batch, sent_count,
+                batch_start_time.elapsed().as_millis(), batch_size_cfg
+            );
 
             Ok::<_, anyhow::Error>(())
         });

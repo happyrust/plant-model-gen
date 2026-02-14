@@ -84,21 +84,10 @@ use aios_core::tool::db_tool::db1_hash;
 
 use dashmap::DashMap;
 
-async fn resolve_dbnum_for_refno(refno: RefnoEnum) -> Option<u32> {
-    if db_meta().ensure_loaded().is_ok() {
-        if let Some(dbnum) = db_meta().get_dbnum_by_refno(refno) {
-            return Some(dbnum);
-        }
-    }
-
-    // 兼容：db_meta_info.json 未就绪时，尽力从 tree_index 推导。
-    TreeIndexManager::resolve_dbnum_for_refno(refno).await.ok()
-}
-
 /// 按 dbnum 拆分一个 batch，保证写入 InstanceCache 时“一个 batch 只落到一个 dbnum 分桶”。
 ///
 /// 说明：
-/// - 这里不尝试“从 ref0 推 dbnum”，必须通过 db_meta/tree_index 映射。
+/// - 这里不尝试“从 ref0 推 dbnum”，必须通过 TreeIndexManager 映射。
 /// - 若某个 refno 无法映射 dbnum：直接返回 Err（避免悄然写错桶）。
 async fn split_shape_instances_by_dbnum(
     shape_insts: &aios_core::geometry::ShapeInstancesData,
@@ -115,9 +104,9 @@ async fn split_shape_instances_by_dbnum(
         if let Some(v) = cache.get(&refno) {
             return Ok(*v);
         }
-        let dbnum = resolve_dbnum_for_refno(refno)
+        let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno)
             .await
-            .ok_or_else(|| anyhow::anyhow!("缺少 ref0->dbnum 映射: refno={refno}"))?;
+            .map_err(|e| anyhow::anyhow!("缺少 ref0->dbnum 映射: refno={refno}, err={e}"))?;
         cache.insert(refno, dbnum);
         Ok(dbnum)
     }
@@ -359,9 +348,6 @@ pub async fn gen_all_geos_data(
     } else {
 
         // cache-only 模式：仅检查 db_meta_info
-
-        use crate::data_interface::db_meta_manager::db_meta;
-
         let _ = db_meta().ensure_loaded();
 
     }
@@ -512,50 +498,6 @@ pub async fn gen_all_geos_data(
     perf.print_summary();
 
     result
-
-}
-
-
-
-async fn resolve_dbnum_from_shape(
-
-    shape_insts: &aios_core::geometry::ShapeInstancesData,
-
-) -> Option<u32> {
-
-    let refno = shape_insts
-
-        .inst_info_map
-
-        .keys()
-
-        .next()
-
-        .copied()
-
-        .or_else(|| shape_insts.inst_tubi_map.keys().next().copied());
-
-    match refno {
-
-        Some(r) => {
-
-            if db_meta().ensure_loaded().is_ok() {
-
-                if let Some(dbnum) = db_meta().get_dbnum_by_refno(r) {
-
-                    return Some(dbnum);
-
-                }
-
-            }
-
-            TreeIndexManager::resolve_dbnum_for_refno(r).await.ok()
-
-        }
-
-        None => None,
-
-    }
 
 }
 

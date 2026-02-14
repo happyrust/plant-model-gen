@@ -2492,9 +2492,10 @@ async fn gen_cata_geos_inner(
         let tubi_size_cache: Arc<DashMap<RefnoEnum, TubiSize>> = if !matches!(branch_mode, BranchTubiMode::CacheOnly) {
             let t_p4_prefetch = Instant::now();
             let cache = Arc::new(DashMap::new());
-            let sem = Arc::new(tokio::sync::Semaphore::new(12));
+            let sem = Arc::new(Semaphore::new(12));
             let mut handles = Vec::new();
 
+            // 使用 Semaphore 控制并发度，避免资源竞争
             for &refno in all_child_refnos.iter() {
                 let sem = sem.clone();
                 let cache = cache.clone();
@@ -2518,7 +2519,6 @@ async fn gen_cata_geos_inner(
                     }
                 }));
             }
-
             for h in handles {
                 let _ = h.await;
             }
@@ -2543,11 +2543,12 @@ async fn gen_cata_geos_inner(
         let branch_meta_cache: DashMap<RefnoEnum, BranchMetaCached> = if !matches!(branch_mode, BranchTubiMode::CacheOnly) {
             let t_p4_bm = Instant::now();
             let cache = Arc::new(DashMap::new());
-            let sem = Arc::new(tokio::sync::Semaphore::new(12));
+            let sem = Arc::new(Semaphore::new(12));
+            let branch_refnos: Vec<RefnoEnum> = branch_map.iter().map(|x| *x.key()).collect();
             let mut handles = Vec::new();
 
-            for bran_data in branch_map.iter() {
-                let branch_refno = *bran_data.key();
+            // 使用 Semaphore 控制并发度
+            for &branch_refno in branch_refnos.iter() {
                 let sem = sem.clone();
                 let cache = cache.clone();
                 handles.push(tokio::spawn(async move {
@@ -2588,7 +2589,7 @@ async fn gen_cata_geos_inner(
             });
             println!(
                 "    [BRAN_TUBI] P4 全局预取 branch_meta 完成: total={}, hit={}, elapsed={}ms",
-                branch_map.len(),
+                branch_refnos.len(),
                 cache.len(),
                 t_p4_bm.elapsed().as_millis()
             );

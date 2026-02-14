@@ -1510,6 +1510,7 @@ pub async fn export_dbnum_instances_json_mode(
             use aios_core::types::PlantAabb;
             use aios_core::{SUL_DB, SurrealQueryExt};
             use serde::{Deserialize, Serialize};
+            use surrealdb::types as surrealdb_types;
             use surrealdb::types::SurrealValue;
             use aios_core::rs_surreal::geometry_query::PlantTransform;
 
@@ -1548,8 +1549,6 @@ pub async fn export_dbnum_instances_json_mode(
             if branch_refnos.is_empty() {
                 return Ok(());
             }
-
-            use surrealdb::types as surrealdb_types;
 
             #[derive(Serialize, Deserialize, Debug, SurrealValue)]
             struct TubiRelateRow {

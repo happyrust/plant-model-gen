@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
+use crate::data_interface::db_meta_manager::db_meta;
+use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+
 use super::AppState;
 
 // ============================================================================
@@ -730,10 +733,22 @@ pub async fn api_stream_generate(
                     let db_option = aios_core::get_db_option();
                     let mesh_dir = db_option.get_meshes_path();
 
-                    let mut dbnos: Vec<u32> = root_refnos
-                        .iter()
-                        .filter_map(|r| r.to_string().split_once('_').and_then(|(db, _)| db.parse::<u32>().ok()))
-                        .collect();
+                    // 注意：refno 的第一段是 ref0，不是 dbno/dbnum；不能用字符串 split 推导。
+                    // 这里必须通过 db_meta 或 tree_index 映射得到 dbnum。
+                    let _ = db_meta().ensure_loaded();
+                    let mut dbnos: Vec<u32> = Vec::new();
+                    for r in &root_refnos {
+                        if let Some(dbnum) = db_meta().get_dbnum_by_refno(*r) {
+                            dbnos.push(dbnum);
+                            continue;
+                        }
+                        match TreeIndexManager::resolve_dbnum_for_refno(*r).await {
+                            Ok(dbnum) => dbnos.push(dbnum),
+                            Err(e) => {
+                                warn!("[StreamGenerate] 无法解析 dbnum: refno={}, err={}", r, e);
+                            }
+                        }
+                    }
                     dbnos.sort();
                     dbnos.dedup();
 

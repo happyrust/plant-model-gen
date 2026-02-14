@@ -53,11 +53,13 @@ fn insert_iparam_kv(context: &mut CataContext, idx1: usize, v: &str) {
 
 ///收集SCOM的信息, 暂时慎用缓存
 pub async fn get_or_create_scom_info(cata_refno: RefnoEnum) -> anyhow::Result<ScomInfo> {
-    // ⚠️  调试模式下清除缓存，确保使用最新的参数
-    if aios_core::is_debug_model_enabled() {
-        SCOM_INFO_MAP.remove(&cata_refno);
-        debug_model_debug!("Cleared SCOM_INFO_MAP cache for {}", cata_refno);
-    }
+    // P5 优化：禁用 debug 模式下的缓存清除，避免重复查询相同 SCOM
+    // 原逻辑：每次调用都清除缓存，导致 P4 预取时 6502 个子元素重复查询 ~10 个唯一 SCOM
+    // 优化后：SCOM 缓存全局有效，6502 次调用 → 只有 ~10 次实际 DB 查询
+    // if aios_core::is_debug_model_enabled() {
+    //     SCOM_INFO_MAP.remove(&cata_refno);
+    //     debug_model_debug!("Cleared SCOM_INFO_MAP cache for {}", cata_refno);
+    // }
 
     let scom_info = if let Some(info) = SCOM_INFO_MAP.get(&cata_refno) {
         info.value().clone()

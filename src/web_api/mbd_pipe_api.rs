@@ -1062,17 +1062,19 @@ async fn fetch_tubi_segments_from_cache_with_debug(
             if info.owner_refno.refno() != branch_u64 {
                 continue;
             }
-            // cache 里 tubi_start_pt/tubi_end_pt 可能未写入（或被裁剪），此时用 tubi 的 world_transform
+            // cache 里 tubi start_pt/end_pt 可能未写入（或被裁剪），此时用 tubi 的 world_transform
             // 将 unit cylinder 的端点 (0,0,0)-(0,0,1) 变换到世界坐标，作为稳定兜底。
-            let (start, end) = match (info.tubi_start_pt, info.tubi_end_pt) {
+            let tubi_start = info.tubi.as_ref().and_then(|t| t.start_pt);
+            let tubi_end = info.tubi.as_ref().and_then(|t| t.end_pt);
+            let (start, end) = match (tubi_start, tubi_end) {
                 (Some(s), Some(e)) => (s, e),
                 _ => {
                     let wt = info.get_ele_world_transform();
                     let m = wt.to_matrix();
                     (
-                        info.tubi_start_pt
+                        tubi_start
                             .unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 0.0))),
-                        info.tubi_end_pt
+                        tubi_end
                             .unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 1.0))),
                     )
                 }
@@ -1081,12 +1083,12 @@ async fn fetch_tubi_segments_from_cache_with_debug(
                 *leave_refno,
                 CacheTubiSeg {
                     refno: *leave_refno,
-                    arrive_refno: info.tubi_arrive_refno,
-                    order: info.tubi_index,
+                    arrive_refno: info.tubi.as_ref().and_then(|t| t.arrive_refno),
+                    order: info.tubi.as_ref().and_then(|t| t.index),
                     start,
                     end,
-                    arrive_axis: info.arrive_axis_pt.map(Vec3::from),
-                    leave_axis: info.leave_axis_pt.map(Vec3::from),
+                    arrive_axis: info.tubi.as_ref().and_then(|t| t.arrive_axis_pt).map(Vec3::from),
+                    leave_axis: info.tubi.as_ref().and_then(|t| t.leave_axis_pt).map(Vec3::from),
                 },
             );
         }

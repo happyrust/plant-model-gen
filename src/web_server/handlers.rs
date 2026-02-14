@@ -4323,6 +4323,12 @@ async fn execute_real_task(state: AppState, task_id: String) {
         use crate::versioned_db::database::sync_pdms_with_callback;
         // 基于 WebUI 任务配置构造解析配置（避免依赖 DbOption.toml 的连接参数）
         let mut parse_opt = aios_core::options::DbOption::default();
+        if parse_opt.pe_chunk == 0 {
+            parse_opt.pe_chunk = 300;
+        }
+        if parse_opt.att_chunk == 0 {
+            parse_opt.att_chunk = 200;
+        }
         // 优先从向导任务存储中读取选中项目；否则回退到任务配置中的项目名称
         let included_projects = if matches!(task_type, TaskType::DataParsingWizard) {
             if let Some(cfg) =

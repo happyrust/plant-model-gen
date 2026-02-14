@@ -51,6 +51,17 @@ manual_db_nums = [7997]
 build_cate_relate = false
 gen_noun_graph = false
 
+# SurrealDB 配置
+v_ip = "localhost"
+v_port = 8020
+v_user = "root"
+v_password = "root"
+pe_chunk = 300
+att_chunk = 200
+
+kv_ip = "localhost"
+kv_port = "8010"
+
 # 精度配置
 [mesh_precision]
 default_lod = "L2"

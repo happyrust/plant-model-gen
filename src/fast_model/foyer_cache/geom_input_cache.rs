@@ -98,11 +98,9 @@ pub struct CateInput {
     pub visible: bool,
 }
 
-
 // ---------------------------------------------------------------------------
 // rkyv payload（V1 schema）
 // ---------------------------------------------------------------------------
-
 
 #[derive(Clone, Copy, Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct Vec3V1 {
@@ -196,6 +194,7 @@ struct CateInputV1 {
     owner_type: String,
     visible: bool,
 }
+
 // ---------------------------------------------------------------------------
 // 缓存 Key / Value（per-refno 粒度）
 // ---------------------------------------------------------------------------
@@ -1426,7 +1425,7 @@ pub fn group_refnos_by_dbnum_strict(
     Ok(groups)
 }
 
-/// 按 refno 集合加载 LOOP 输入（严格按 dbnum 分桶，不扫描全库）。
+/// 按 refno 集合加载 LOOP 输入（逐 refno 精确读取，不扫描全库）。
 pub async fn load_loop_inputs_for_refnos_from_global(
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<HashMap<RefnoEnum, LoopInput>> {
@@ -1437,11 +1436,10 @@ pub async fn load_loop_inputs_for_refnos_from_global(
         .ok_or_else(|| anyhow::anyhow!("geom_input_cache 未初始化"))?;
     let groups = group_refnos_by_dbnum_strict(refnos)?;
 
-    let mut result = HashMap::new();
+    let mut result = HashMap::with_capacity(refnos.len());
     for (dbnum, refs) in groups {
-        let mut db_inputs = cache.get_all_loop_inputs(dbnum).await;
         for refno in refs {
-            if let Some(input) = db_inputs.remove(&refno) {
+            if let Some(input) = cache.get_loop_input(dbnum, refno).await {
                 result.insert(refno, input);
             }
         }
@@ -1449,7 +1447,7 @@ pub async fn load_loop_inputs_for_refnos_from_global(
     Ok(result)
 }
 
-/// 按 refno 集合加载 PRIM 输入（严格按 dbnum 分桶，不扫描全库）。
+/// 按 refno 集合加载 PRIM 输入（逐 refno 精确读取，不扫描全库）。
 pub async fn load_prim_inputs_for_refnos_from_global(
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<HashMap<RefnoEnum, PrimInput>> {
@@ -1460,11 +1458,10 @@ pub async fn load_prim_inputs_for_refnos_from_global(
         .ok_or_else(|| anyhow::anyhow!("geom_input_cache 未初始化"))?;
     let groups = group_refnos_by_dbnum_strict(refnos)?;
 
-    let mut result = HashMap::new();
+    let mut result = HashMap::with_capacity(refnos.len());
     for (dbnum, refs) in groups {
-        let mut db_inputs = cache.get_all_prim_inputs(dbnum).await;
         for refno in refs {
-            if let Some(input) = db_inputs.remove(&refno) {
+            if let Some(input) = cache.get_prim_input(dbnum, refno).await {
                 result.insert(refno, input);
             }
         }
@@ -1472,7 +1469,7 @@ pub async fn load_prim_inputs_for_refnos_from_global(
     Ok(result)
 }
 
-/// 按 refno 集合加载 CATE 输入（严格按 dbnum 分桶，不扫描全库）。
+/// 按 refno 集合加载 CATE 输入（逐 refno 精确读取，不扫描全库）。
 pub async fn load_cate_inputs_for_refnos_from_global(
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<HashMap<RefnoEnum, CateInput>> {
@@ -1483,11 +1480,10 @@ pub async fn load_cate_inputs_for_refnos_from_global(
         .ok_or_else(|| anyhow::anyhow!("geom_input_cache 未初始化"))?;
     let groups = group_refnos_by_dbnum_strict(refnos)?;
 
-    let mut result = HashMap::new();
+    let mut result = HashMap::with_capacity(refnos.len());
     for (dbnum, refs) in groups {
-        let mut db_inputs = cache.get_all_cate_inputs(dbnum).await;
         for refno in refs {
-            if let Some(input) = db_inputs.remove(&refno) {
+            if let Some(input) = cache.get_cate_input(dbnum, refno).await {
                 result.insert(refno, input);
             }
         }

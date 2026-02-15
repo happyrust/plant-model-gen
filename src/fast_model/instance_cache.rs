@@ -179,12 +179,30 @@ impl InstanceCacheManager {
         let now = chrono::Utc::now().timestamp_millis();
         let mut count = 0usize;
 
-        // 1) 写入 geos_cache（按 inst_key）
+        // 1) 写入 geos_cache（按 inst_key）— 仅写 foyer，索引稍后批量更新
         for (inst_key, geos_data) in &shape_insts.inst_geos_map {
-            self.insert_inst_geos(dbnum, inst_key.clone(), geos_data, now);
+            let key = InstGeosKey {
+                dbnum,
+                inst_key: inst_key.clone(),
+            };
+            let cached = CachedInstGeos {
+                geos_data: geos_data.clone(),
+                created_at: now,
+            };
+            let payload = match rkyv_payload::encode(INST_GEOS_TYPE_TAG, INST_GEOS_SCHEMA_V1, &cached) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!(
+                        "[instance_cache] rkyv 序列化 inst_geos 失败: dbnum={}, inst_key={}, err={}",
+                        dbnum, inst_key, e
+                    );
+                    continue;
+                }
+            };
+            self.geos_cache.insert(key, CachePayloadValue { payload });
         }
 
-        // 2) 写入 info_cache（按 refno）
+        // 2) 写入 info_cache（按 refno）— 仅写 foyer，索引稍后批量更新
         for (refno, info) in &shape_insts.inst_info_map {
             let inst_key = info.get_inst_key();
             let tubi = shape_insts.inst_tubi_map.get(refno).cloned();
@@ -209,8 +227,32 @@ impl InstanceCacheManager {
                 created_at: now,
             };
 
-            self.insert_inst_info(dbnum, *refno, &cached);
+            let key = InstInfoKey { dbnum, refno: *refno };
+            let payload = match rkyv_payload::encode(INST_INFO_TYPE_TAG, INST_INFO_SCHEMA_V1, &cached) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!(
+                        "[instance_cache] rkyv 序列化 inst_info 失败: dbnum={}, refno={}, err={}",
+                        dbnum, refno, e
+                    );
+                    continue;
+                }
+            };
+            self.info_cache.insert(key, CachePayloadValue { payload });
             count += 1;
+        }
+
+        // 3) 批量更新索引（一次磁盘 IO）
+        if let Ok(mut index) = self.index.lock() {
+            let refno_set = index.by_dbnum.entry(dbnum).or_default();
+            for refno in shape_insts.inst_info_map.keys() {
+                refno_set.insert(*refno);
+            }
+            let geos_set = index.geos_by_dbnum.entry(dbnum).or_default();
+            for inst_key in shape_insts.inst_geos_map.keys() {
+                geos_set.insert(inst_key.clone());
+            }
+            let _ = self.save_index_locked(&index);
         }
 
         count

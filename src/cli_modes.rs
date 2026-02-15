@@ -1486,13 +1486,12 @@ pub async fn export_dbnum_instances_json_mode(
     if from_cache {
         async fn cache_has_any_tubi(cache_dir: &std::path::Path, dbnum: u32) -> anyhow::Result<bool> {
             let cache = aios_database::fast_model::instance_cache::InstanceCacheManager::new(cache_dir).await?;
-            let batch_ids = cache.list_batches(dbnum);
-            for bid in batch_ids.iter().rev() {
-                let Some(batch) = cache.get(dbnum, bid).await else {
-                    continue;
-                };
-                if !batch.inst_tubi_map.is_empty() {
-                    return Ok(true);
+            let refnos = cache.list_refnos(dbnum);
+            for &refno in &refnos {
+                if let Some(info) = cache.get_inst_info(dbnum, refno).await {
+                    if info.tubi.is_some() {
+                        return Ok(true);
+                    }
                 }
             }
             Ok(false)

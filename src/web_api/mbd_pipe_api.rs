@@ -975,14 +975,14 @@ async fn fetch_tubi_segments_from_cache_with_debug(
     let cache = InstanceCacheManager::new(&cache_dir).await?;
     let branch_u64 = branch_refno.refno();
     let mut active_dbnum = inferred_dbnum;
-    let mut batch_ids = cache.list_batches(active_dbnum);
-    if batch_ids.is_empty() {
-        // 兼容：前端传入的 dbno 可能是“db_meta 的 dbnum”（例如 7997），
-        // 但 instance_cache 的 key 可能是“本次解析/缓存生成的 db 文件编号”（例如 1112）。
-        // 因此当指定 dbno 无批次时，尝试回退到 cache 里实际存在的 dbnum。
+    let mut cached_refnos = cache.list_refnos(active_dbnum);
+    if cached_refnos.is_empty() {
+        // 兼容：前端传入的 dbno 可能是"db_meta 的 dbnum"（例如 7997），
+        // 但 instance_cache 的 key 可能是"本次解析/缓存生成的 db 文件编号"（例如 1112）。
+        // 因此当指定 dbno 无数据时，尝试回退到 cache 里实际存在的 dbnum。
         if strict_dbno && dbno.is_some() {
             anyhow::bail!(
-                "instance_cache 无批次数据：dbno={} dir={}（strict_dbno=true，已禁止回退）",
+                "instance_cache 无数据：dbno={} dir={}（strict_dbno=true，已禁止回退）",
                 inferred_dbnum,
                 cache_dir.display()
             );
@@ -990,108 +990,84 @@ async fn fetch_tubi_segments_from_cache_with_debug(
         let candidates = cache.list_dbnums();
         if candidates.len() == 1 {
             active_dbnum = candidates[0];
-            batch_ids = cache.list_batches(active_dbnum);
+            cached_refnos = cache.list_refnos(active_dbnum);
             debug.fallback_used = true;
-            debug.fallback_reason = Some("指定 dbno 无 batch；cache 仅有 1 个 dbnum，已自动回退".to_string());
+            debug.fallback_reason = Some("指定 dbno 无数据；cache 仅有 1 个 dbnum，已自动回退".to_string());
         } else {
             'outer: for cand in candidates {
-                let ids = cache.list_batches(cand);
-                if ids.is_empty() {
+                let cand_refnos = cache.list_refnos(cand);
+                if cand_refnos.is_empty() {
                     continue;
                 }
-                // 仅探测最新少量 batch，避免全量扫描
-                for id in ids.iter().rev().take(3) {
-                    let Some(batch) = cache.get(cand, id).await else { continue };
-                    if batch
-                        .inst_tubi_map
-                        .values()
-                        .any(|info| info.owner_refno.refno() == branch_u64)
-                    {
-                        active_dbnum = cand;
-                        batch_ids = ids;
-                        debug.fallback_used = true;
-                        debug.fallback_reason = Some(format!(
-                            "指定 dbno 无 batch；已在候选 dbnum 中探测到分支数据，回退到 {}",
-                            cand
-                        ));
-                        break 'outer;
+                // 探测该 dbnum 下是否有属于目标 branch 的 tubi 数据
+                for &r in &cand_refnos {
+                    if let Some(info) = cache.get_inst_info(cand, r).await {
+                        if let Some(ref tubi) = info.tubi {
+                            if info.info.owner_refno.refno() == branch_u64 {
+                                active_dbnum = cand;
+                                cached_refnos = cand_refnos;
+                                debug.fallback_used = true;
+                                debug.fallback_reason = Some(format!(
+                                    "指定 dbno 无数据；已在候选 dbnum 中探测到分支数据，回退到 {}",
+                                    cand
+                                ));
+                                break 'outer;
+                            }
+                        }
                     }
                 }
             }
         }
     }
-    if batch_ids.is_empty() {
+    if cached_refnos.is_empty() {
         anyhow::bail!(
-            "instance_cache 无批次数据：dbno={} dir={}（且回退失败）",
+            "instance_cache 无数据：dbno={} dir={}（且回退失败）",
             inferred_dbnum,
             cache_dir.display()
         );
     }
     debug.active_dbnum = Some(active_dbnum);
-    debug.batches_all = batch_ids.clone();
+    debug.batches_all = vec!["per-refno".to_string()];
 
-    fn parse_seq(id: &str) -> Option<u64> {
-        id.rsplit('_').next()?.parse().ok()
-    }
-
-    // 以“截至 batch_id 的快照”语义读取（与 ptset_api 一致）
-    let target_seq = batch_id.and_then(parse_seq);
-    let mut ids_with_seq: Vec<(u64, String)> = batch_ids
-        .drain(..)
-        .filter_map(|id| Some((parse_seq(&id)?, id)))
-        .collect();
-    ids_with_seq.sort_by_key(|(seq, _)| *seq);
-    if let Some(t) = target_seq {
-        ids_with_seq.retain(|(seq, _)| *seq <= t);
-    }
-    if ids_with_seq.is_empty() {
-        anyhow::bail!(
-            "未找到可用 batch（dbno={} active_dbnum={} batch_id={:?}）",
-            inferred_dbnum,
-            active_dbnum,
-            batch_id
-        );
-    }
-
-    // 合并快照：后来的 batch 覆盖较早的段
+    // per-refno 存储：直接遍历 cached_refnos，读取 tubi 数据。
+    // batch_id 参数在 per-refno 模式下不再有意义（每个 refno 只有一条记录）。
     let mut merged: HashMap<RefnoEnum, CacheTubiSeg> = HashMap::new();
-    debug.batches_used = ids_with_seq.iter().map(|(_, id)| id.clone()).collect();
-    for (_, id) in ids_with_seq {
-        let Some(batch) = cache.get(active_dbnum, &id).await else { continue };
-        for (leave_refno, info) in &batch.inst_tubi_map {
-            if info.owner_refno.refno() != branch_u64 {
-                continue;
-            }
-            // cache 里 tubi start_pt/end_pt 可能未写入（或被裁剪），此时用 tubi 的 world_transform
-            // 将 unit cylinder 的端点 (0,0,0)-(0,0,1) 变换到世界坐标，作为稳定兜底。
-            let tubi_start = info.tubi.as_ref().and_then(|t| t.start_pt);
-            let tubi_end = info.tubi.as_ref().and_then(|t| t.end_pt);
-            let (start, end) = match (tubi_start, tubi_end) {
-                (Some(s), Some(e)) => (s, e),
-                _ => {
-                    let wt = info.get_ele_world_transform();
-                    let m = wt.to_matrix();
-                    (
-                        tubi_start
-                            .unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 0.0))),
-                        tubi_end
-                            .unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 1.0))),
-                    )
-                }
-            };
-            merged.insert(
-                *leave_refno,
-                CacheTubiSeg {
-                    refno: *leave_refno,
-                    arrive_refno: info.tubi.as_ref().and_then(|t| t.arrive_refno),
-                    order: info.tubi.as_ref().and_then(|t| t.index),
-                    start,
-                    end,
-                    arrive_axis: info.tubi.as_ref().and_then(|t| t.arrive_axis_pt).map(Vec3::from),
-                    leave_axis: info.tubi.as_ref().and_then(|t| t.leave_axis_pt).map(Vec3::from),
-                },
-            );
+    debug.batches_used = vec!["per-refno".to_string()];
+    for &leave_refno in &cached_refnos {
+        let Some(cached) = cache.get_inst_info(active_dbnum, leave_refno).await else { continue };
+        let Some(ref tubi_info) = cached.tubi else { continue };
+        if cached.info.owner_refno.refno() != branch_u64 {
+            continue;
         }
+        // cache 里 tubi start_pt/end_pt 可能未写入（或被裁剪），此时用 tubi 的 world_transform
+        // 将 unit cylinder 的端点 (0,0,0)-(0,0,1) 变换到世界坐标，作为稳定兜底。
+        let tubi_start = tubi_info.tubi.as_ref().and_then(|t| t.start_pt);
+        let tubi_end = tubi_info.tubi.as_ref().and_then(|t| t.end_pt);
+        let (start, end) = match (tubi_start, tubi_end) {
+            (Some(s), Some(e)) => (s, e),
+            _ => {
+                let wt = tubi_info.get_ele_world_transform();
+                let m = wt.to_matrix();
+                (
+                    tubi_start
+                        .unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 0.0))),
+                    tubi_end
+                        .unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 1.0))),
+                )
+            }
+        };
+        merged.insert(
+            leave_refno,
+            CacheTubiSeg {
+                refno: leave_refno,
+                arrive_refno: tubi_info.tubi.as_ref().and_then(|t| t.arrive_refno),
+                order: tubi_info.tubi.as_ref().and_then(|t| t.index),
+                start,
+                end,
+                arrive_axis: tubi_info.tubi.as_ref().and_then(|t| t.arrive_axis_pt).map(Vec3::from),
+                leave_axis: tubi_info.tubi.as_ref().and_then(|t| t.leave_axis_pt).map(Vec3::from),
+            },
+        );
     }
 
     let mut segs: Vec<CacheTubiSeg> = merged.into_values().collect();

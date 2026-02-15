@@ -586,65 +586,43 @@ pub async fn run_boolean_worker_from_cache_manager(
     let mut inst_geos_map: HashMap<String, EleInstGeosData> = HashMap::new();
     let mut neg_relate_map: HashMap<RefnoEnum, Vec<RefnoEnum>> = HashMap::new();
     let mut ngmr_relate_map: HashMap<RefnoEnum, Vec<(RefnoEnum, RefnoEnum)>> = HashMap::new();
-    // 记录每个 target(refno) 属于哪个 (dbnum, batch_id)，用于回写 inst_relate_bool 到 instance_cache。
-    let mut target_locations: HashMap<RefnoEnum, (u32, String)> = HashMap::new();
+    // 记录每个 target(refno) 属于哪个 dbnum，用于回写 inst_relate_bool 到 instance_cache。
+    let mut target_locations: HashMap<RefnoEnum, u32> = HashMap::new();
     // 元件库（CATE）布尔：以 inst_info.has_cata_neg 为准补齐 targets（CataNeg 不经 neg_relate_map 指向）。
     let mut cata_targets: HashSet<RefnoEnum> = HashSet::new();
 
     for dbnum in dbnums {
-        let batch_ids = cache_manager.list_batches(dbnum);
+        let refnos = cache_manager.list_refnos(dbnum);
+        for refno in refnos {
+            let Some(cached) = cache_manager.get_inst_info(dbnum, refno).await else {
+                continue;
+            };
 
-        // 重要：instance_cache 是“多 batch 追加”的结构；不同 batch 里可能包含同一 refno/inst_key 的旧数据。
-        // 因此这里按 created_at 从新到旧扫描：对每个 key 只取“最新命中”的那一份，旧的直接跳过。
-        let mut batches = Vec::new();
-        for batch_id in batch_ids {
-            if let Some(batch) = cache_manager.get(dbnum, &batch_id).await {
-                batches.push((batch.created_at, batch_id, batch));
+            if cached.info.has_cata_neg {
+                cata_targets.insert(refno);
+                target_locations.entry(refno).or_insert(dbnum);
             }
-        }
-        batches.sort_by_key(|(ts, _, _)| *ts);
+            if !cached.neg_relates.is_empty() {
+                target_locations.entry(refno).or_insert(dbnum);
+            }
+            if !cached.ngmr_neg_relates.is_empty() {
+                target_locations.entry(refno).or_insert(dbnum);
+            }
 
-        for (_ts, batch_id, mut batch) in batches.into_iter().rev() {
-            // 先扫描 inst_info_map，补齐 CATE 布尔 targets 的 batch 归属。
-            for (k, info) in batch.inst_info_map.iter() {
-                if info.has_cata_neg {
-                    cata_targets.insert(*k);
-                    target_locations
-                        .entry(*k)
-                        .or_insert((dbnum, batch_id.clone()));
+            inst_info_map.entry(refno).or_insert(cached.info);
+            if !cached.neg_relates.is_empty() {
+                neg_relate_map.entry(refno).or_insert(cached.neg_relates);
+            }
+            if !cached.ngmr_neg_relates.is_empty() {
+                ngmr_relate_map.entry(refno).or_insert(cached.ngmr_neg_relates);
+            }
+
+            // geos 按 inst_key 去重
+            let inst_key = cached.inst_key;
+            if !inst_geos_map.contains_key(&inst_key) {
+                if let Some(geos) = cache_manager.get_inst_geos(dbnum, &inst_key).await {
+                    inst_geos_map.insert(inst_key, geos.geos_data);
                 }
-            }
-
-            // 先记录 target -> batch 归属（仅需要 keys；避免后续 batch move 导致借用冲突）
-            for k in batch.neg_relate_map.keys().copied().collect::<Vec<_>>() {
-                target_locations
-                    .entry(k)
-                    .or_insert((dbnum, batch_id.clone()));
-            }
-            for k in batch.ngmr_neg_relate_map.keys().copied().collect::<Vec<_>>() {
-                target_locations
-                    .entry(k)
-                    .or_insert((dbnum, batch_id.clone()));
-            }
-
-            for (k, v) in batch.inst_info_map.drain() {
-                inst_info_map.entry(k).or_insert(v);
-            }
-            for (k, v) in batch.inst_geos_map.drain() {
-                inst_geos_map.entry(k).or_insert(v);
-            }
-            for (k, v) in batch.neg_relate_map.drain() {
-                // 关系数据会被“按 carrier 分批写入”到不同 batch，需要跨 batch 合并 + 去重。
-                let entry = neg_relate_map.entry(k).or_insert_with(Vec::new);
-                entry.extend(v);
-                let mut seen: HashSet<RefnoEnum> = HashSet::new();
-                entry.retain(|x| seen.insert(*x));
-            }
-            for (k, v) in batch.ngmr_neg_relate_map.drain() {
-                let entry = ngmr_relate_map.entry(k).or_insert_with(Vec::new);
-                entry.extend(v);
-                let mut seen: HashSet<(RefnoEnum, RefnoEnum)> = HashSet::new();
-                entry.retain(|x| seen.insert(*x));
             }
         }
     }
@@ -1048,13 +1026,13 @@ pub async fn run_boolean_worker_from_cache_manager(
 
         if final_manifold.get_mesh().indices.is_empty() {
             eprintln!("[boolean_worker_cache] 结果为空，跳过输出: refno={}", refno);
-            if let Some((dbnum, batch_id)) = target_locations.get(&refno) {
+            if let Some(&dbnum) = target_locations.get(&refno) {
                 let mesh_id = {
                     let refu64: aios_core::RefU64 = refno.into();
                     refu64.to_string()
                 };
                 let _ = cache_manager
-                    .upsert_inst_relate_bool(*dbnum, batch_id, refno, mesh_id, "Failed")
+                    .upsert_inst_relate_bool(dbnum, refno, mesh_id, "Failed")
                     .await;
             }
             continue;
@@ -1078,21 +1056,21 @@ pub async fn run_boolean_worker_from_cache_manager(
         let normal_mesh = manifold_to_normal_mesh(final_manifold.get_mesh());
         if let Err(e) = export_single_mesh_to_glb(&normal_mesh, &target_path) {
             eprintln!("[boolean_worker_cache] 导出失败: refno={} err={}", refno, e);
-            if let Some((dbnum, batch_id)) = target_locations.get(&refno) {
+            if let Some(&dbnum) = target_locations.get(&refno) {
                 let _ = cache_manager
-                    .upsert_inst_relate_bool(*dbnum, batch_id, refno, mesh_id.clone(), "Failed")
+                    .upsert_inst_relate_bool(dbnum, refno, mesh_id.clone(), "Failed")
                     .await;
             }
             continue;
         }
 
-        if let Some((dbnum, batch_id)) = target_locations.get(&refno) {
+        if let Some(&dbnum) = target_locations.get(&refno) {
             println!(
-                "[boolean_worker_cache] 写入 bool Success: refno={} dbnum={} batch_id={} mesh_id={}",
-                refno, dbnum, batch_id, mesh_id
+                "[boolean_worker_cache] 写入 bool Success: refno={} dbnum={} mesh_id={}",
+                refno, dbnum, mesh_id
             );
             cache_manager
-                .upsert_inst_relate_bool(*dbnum, batch_id, refno, mesh_id, "Success")
+                .upsert_inst_relate_bool(dbnum, refno, mesh_id, "Success")
                 .await?;
         } else {
             eprintln!(

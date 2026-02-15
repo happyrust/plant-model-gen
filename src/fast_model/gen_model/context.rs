@@ -2,6 +2,26 @@ use crate::fast_model::foyer_cache::geom_input_cache::{self, CacheRunMode};
 use crate::options::DbOptionExt;
 use std::sync::Arc;
 
+/// Full Noun / cache-first 运行的阶段标识。
+///
+/// 约定：
+/// - Prefetch 阶段：允许访问 SurrealDB 拉取输入并写入 foyer cache（仅 PrefetchThenGenerate 模式）
+/// - Generate 阶段：应尽量只读/写 foyer cache（cache-first / cache-only 离线生成）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenStage {
+    Prefetch,
+    Generate,
+}
+
+impl GenStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GenStage::Prefetch => "prefetch",
+            GenStage::Generate => "generate",
+        }
+    }
+}
+
 /// Noun 处理上下文，包含所有处理过程需要的配置信息
 #[derive(Clone)]
 pub struct NounProcessContext {
@@ -9,6 +29,7 @@ pub struct NounProcessContext {
     pub batch_size: usize,
     pub batch_concurrency: usize,
     pub cache_run_mode: CacheRunMode,
+    pub gen_stage: GenStage,
 }
 
 impl NounProcessContext {
@@ -24,7 +45,24 @@ impl NounProcessContext {
             batch_size,
             batch_concurrency: batch_concurrency.max(1),
             cache_run_mode: geom_input_cache::resolve_cache_run_mode(),
+            gen_stage: GenStage::Generate,
         }
+    }
+
+    pub fn with_stage(&self, stage: GenStage) -> Self {
+        let mut cloned = self.clone();
+        cloned.gen_stage = stage;
+        cloned
+    }
+
+    /// 是否处于“离线生成”阶段：Generate 阶段且非 Direct 模式。
+    ///
+    /// 该判断用于 LOOP/PRIM 的输入缓存消费逻辑：
+    /// - PrefetchThenGenerate: Prefetch 阶段走 DB 预取；Generate 阶段只读 cache
+    /// - CacheOnly: 全程只读 cache（通常直接进入 Generate 阶段）
+    pub fn is_offline_generate(&self) -> bool {
+        matches!(self.gen_stage, GenStage::Generate)
+            && !matches!(self.cache_run_mode, CacheRunMode::Direct)
     }
 
     /// 根据总数计算分批范围
@@ -66,6 +104,7 @@ mod tests {
             batch_size: 100,
             batch_concurrency: 4,
             cache_run_mode: CacheRunMode::Direct,
+            gen_stage: GenStage::Generate,
         };
 
         // 测试正常情况

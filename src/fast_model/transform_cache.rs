@@ -219,6 +219,84 @@ pub async fn get_world_transform_cache_first(
     Ok(computed)
 }
 
+/// 模型生成专用（strict cache-only）：只从 foyer transform_cache 读取 world_transform。
+///
+/// 语义：
+/// - **禁止**回源 SurrealDB（不查询 pe_transform / pe.world_trans）
+/// - **禁止**回退旧计算路径（aios_core::get_world_transform）
+/// - 任意 miss 直接返回 Err（离线 Generate 阶段 miss 代表 Prefetch 不完整）
+pub async fn get_world_transforms_cache_only_batch(
+    db_option: &DbOptionExt,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<HashMap<RefnoEnum, Transform>> {
+    if refnos.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // ref0 != dbnum：离线阶段必须已具备 ref0->dbnum 映射，否则无法按库分桶读缓存。
+    db_meta().ensure_loaded()?;
+    init_global_transform_cache(db_option).await?;
+
+    let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() else {
+        anyhow::bail!("global transform_cache 未初始化");
+    };
+
+    let mut out: HashMap<RefnoEnum, Transform> = HashMap::new();
+    let mut missing: Vec<RefnoEnum> = Vec::new();
+
+    for &r in refnos {
+        let Some(dbnum) = db_meta().get_dbnum_by_refno(r) else {
+            anyhow::bail!("缺少 ref0->dbnum 映射: refno={}", r);
+        };
+        if dbnum == 0 {
+            anyhow::bail!("无效 dbnum=0（缺少 ref0->dbnum 映射或元数据不完整）: refno={}", r);
+        }
+        if let Some(hit) = cache.get_world_transform(dbnum, r).await {
+            out.insert(r, hit);
+        } else {
+            missing.push(r);
+        }
+    }
+
+    if !missing.is_empty() {
+        missing.sort_by_key(|r| r.refno());
+        const SAMPLE_LIMIT: usize = 16;
+        let sample = missing
+            .iter()
+            .take(SAMPLE_LIMIT)
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "transform_cache miss（cache-only 不允许回源 DB）：missing={}, sample=[{}]",
+            missing.len(),
+            sample
+        );
+    }
+
+    Ok(out)
+}
+
+/// strict cache-only：读取单个 world_transform；miss 直接 Err。
+pub async fn get_world_transform_cache_only(
+    db_option: &DbOptionExt,
+    refno: RefnoEnum,
+) -> anyhow::Result<Transform> {
+    let hm = get_world_transforms_cache_only_batch(db_option, &[refno]).await?;
+    hm.get(&refno)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("transform_cache miss: refno={}", refno))
+}
+
+/// strict cache-only：确保给定 refnos 的 transform 均已存在于缓存；缺失直接 Err。
+pub async fn ensure_world_transforms_present(
+    db_option: &DbOptionExt,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<()> {
+    let _ = get_world_transforms_cache_only_batch(db_option, refnos).await?;
+    Ok(())
+}
+
 fn transform_from_matrix_cols(cols: &[f64; 16]) -> Option<Transform> {
     // SurrealDB 存储的矩阵为列主序（与 glam::DMat4::from_cols_array 对齐）。
     let m = glam::DMat4::from_cols_array(cols);

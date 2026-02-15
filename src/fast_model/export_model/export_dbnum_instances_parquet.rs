@@ -1115,14 +1115,14 @@ pub async fn export_dbnum_instances_parquet_from_cache(
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
 
     // =========================================================================
-    // 1. 加载并合并所有 cache batch
+    // 1. 从 per-refno 缓存加载数据
     // =========================================================================
     let cache_manager =
         crate::fast_model::instance_cache::InstanceCacheManager::new(cache_dir).await?;
-    let batch_ids = cache_manager.list_batches(dbnum);
-    if batch_ids.is_empty() {
+    let refnos = cache_manager.list_refnos(dbnum);
+    if refnos.is_empty() {
         return Err(anyhow::anyhow!(
-            "缓存中未找到 dbnum={} 的批次数据（请先生成模型并写入缓存）",
+            "缓存中未找到 dbnum={} 的实例数据（请先生成模型并写入缓存）",
             dbnum
         ));
     }
@@ -1132,41 +1132,33 @@ pub async fn export_dbnum_instances_parquet_from_cache(
     let mut inst_geos_map: HashMap<String, EleInstGeosData> = HashMap::new();
     let mut neg_relate_map: HashMap<RefnoEnum, Vec<RefnoEnum>> = HashMap::new();
 
-    let mut hit_batches = 0usize;
-    for batch_id in &batch_ids {
-        if let Some(batch) = cache_manager.get(dbnum, batch_id).await {
-            hit_batches += 1;
-            for (k, v) in batch.inst_info_map {
-                inst_info_map.insert(k, v);
-            }
-            for (k, v) in batch.inst_tubi_map {
-                inst_tubi_map.insert(k, v);
-            }
-            for (k, v) in batch.inst_geos_map {
-                if let Some(existing) = inst_geos_map.get_mut(&k) {
-                    existing.insts.extend(v.insts);
-                } else {
-                    inst_geos_map.insert(k, v);
-                }
-            }
-            for (k, v) in batch.neg_relate_map {
-                let entry = neg_relate_map.entry(k).or_default();
-                for neg in v {
-                    if !entry.contains(&neg) {
-                        entry.push(neg);
-                    }
-                }
+    let mut seen_inst_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for &refno in &refnos {
+        let Some(cached) = cache_manager.get_inst_info(dbnum, refno).await else {
+            continue;
+        };
+        inst_info_map.insert(refno, cached.info.clone());
+        if let Some(tubi) = cached.tubi.clone() {
+            inst_tubi_map.insert(refno, tubi);
+        }
+        if !cached.neg_relates.is_empty() {
+            neg_relate_map.insert(refno, cached.neg_relates.clone());
+        }
+        // inst_geos 按 inst_key 去重
+        if !cached.inst_key.is_empty() && seen_inst_keys.insert(cached.inst_key.clone()) {
+            if let Some(geos) = cache_manager.get_inst_geos(dbnum, &cached.inst_key).await {
+                inst_geos_map.insert(cached.inst_key.clone(), geos.geos_data);
             }
         }
     }
 
     if verbose {
         println!(
-            "✅ 合并缓存完成: inst_info={}, inst_geos={}, inst_tubi={}, batches_hit={}",
+            "✅ 缓存加载完成: inst_info={}, inst_geos={}, inst_tubi={}, refnos={}",
             inst_info_map.len(),
             inst_geos_map.len(),
             inst_tubi_map.len(),
-            hit_batches,
+            refnos.len(),
         );
     }
 

@@ -1,21 +1,20 @@
-//! LOOP/PRIM 输入缓存
+//! LOOP/PRIM/CATE 输入缓存
 //!
-//! 通过预取 LOOP/PRIM 所需的几何与属性数据到 foyer cache，
-//! 在实例生成阶段只读缓存，降低对 SurrealDB 的依赖。
+//! 通过预取 LOOP/PRIM/CATE 所需的几何与属性数据到 foyer cache，
+//! 在实例生成阶段只读缓存，降低对 SurrealDB 的依赖（尤其是 Full Noun 流水线）。
 //!
 //! 数据结构：
 //! - `LoopInput`：LOOP 类元素的预取输入（attmap、world_transform、loops、height 等）
 //! - `PrimInput`：PRIM 类元素的预取输入（attmap、world_transform 等）
-//! - `GeomInputBatch`：按 dbnum 分批存储的输入缓存条目
+//! - `CateInput`：CATE 类元素的预取输入（attmap、world_transform 等；几何解析走 cata_resolve_cache）
 //!
 //! 使用流程：
-//! 1. 预取阶段：`prefetch_loop_inputs` / `prefetch_prim_inputs` 从 SurrealDB 批量拉取并写入缓存
-//! 2. 生成阶段：`gen_loop_geos_from_cache` / `gen_prim_geos_from_cache` 仅从缓存读取
+//! 1. 预取阶段：`prefetch_*_inputs` 从 SurrealDB 批量拉取并写入缓存
+//! 2. 生成阶段：`*_from_inputs` 仅从缓存读取
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use aios_core::types::NamedAttrMap;
@@ -84,22 +83,26 @@ pub struct PrimInput {
     pub poly_extra: Option<PrimPolyExtra>,
 }
 
-/// 按 dbnum 分批存储的输入缓存条目
-#[derive(Clone, Serialize, Deserialize)]
-pub struct GeomInputBatch {
-    pub dbnum: u32,
-    pub batch_id: String,
-    pub created_at: i64,
-    pub loop_inputs: HashMap<RefnoEnum, LoopInput>,
-    pub prim_inputs: HashMap<RefnoEnum, PrimInput>,
+/// CATE 类元素的预取输入（实例级信息）。
+///
+/// 注意：
+/// - CATE 的“可复用几何准备结果”不在此缓存（见 `foyer_cache/cata_resolve_cache`，按 cata_hash 缓存）。
+/// - 这里主要缓存每个 refno 的 inst_info 相关字段，以便 Generate 阶段不回查 SurrealDB。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CateInput {
+    pub refno: RefnoEnum,
+    pub attmap: NamedAttrMap,
+    pub world_transform: Transform,
+    pub owner_refno: RefnoEnum,
+    pub owner_type: String,
+    pub visible: bool,
 }
+
 
 // ---------------------------------------------------------------------------
 // rkyv payload（V1 schema）
 // ---------------------------------------------------------------------------
 
-const GEOM_INPUT_TYPE_TAG: u16 = 1001;
-const GEOM_INPUT_SCHEMA_V2: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct Vec3V1 {
@@ -185,58 +188,72 @@ struct PrimInputV1 {
 }
 
 #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct GeomInputBatchV1 {
-    dbnum: u32,
-    batch_id: String,
-    created_at: i64,
-    loop_inputs: Vec<LoopInputV1>,
-    prim_inputs: Vec<PrimInputV1>,
+struct CateInputV1 {
+    refno: RefnoEnum,
+    attmap: NamedAttrMap,
+    world_transform: TransformV1,
+    owner_refno: RefnoEnum,
+    owner_type: String,
+    visible: bool,
 }
-
 // ---------------------------------------------------------------------------
-// 缓存 Key / Value
+// 缓存 Key / Value（per-refno 粒度）
 // ---------------------------------------------------------------------------
 
+/// per-refno 缓存 Key：(dbnum, refno, input_type)
+/// input_type: 0=Loop, 1=Prim, 2=Cate
 #[derive(Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GeomInputCacheKey {
     pub dbnum: u32,
-    pub batch_id: String,
+    pub refno: RefnoEnum,
+    pub input_type: u8,
 }
+
+const INPUT_TYPE_LOOP: u8 = 0;
+const INPUT_TYPE_PRIM: u8 = 1;
+const INPUT_TYPE_CATE: u8 = 2;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GeomInputCacheValue {
     pub payload: Vec<u8>,
 }
 
+// rkyv type_tag 常量（新 schema，旧 1001 自动 miss）
+const GEOM_LOOP_TYPE_TAG: u16 = 1010;
+const GEOM_PRIM_TYPE_TAG: u16 = 1011;
+const GEOM_CATE_TYPE_TAG: u16 = 1012;
+const GEOM_INPUT_V2_SCHEMA: u16 = 1;
+
 // ---------------------------------------------------------------------------
-// 索引
+// 索引：dbnum -> HashSet<(RefnoEnum, input_type)>
 // ---------------------------------------------------------------------------
 
 #[derive(Default, Serialize, Deserialize, Clone)]
-struct CacheIndex {
-    by_dbnum: HashMap<u32, Vec<String>>,
+struct GeomInputIndex {
+    /// dbnum -> 已缓存的 (refno, input_type) 集合
+    /// 为了 JSON 序列化兼容，用 Vec<(RefnoEnum, u8)> 存储
+    by_dbnum: HashMap<u32, Vec<(RefnoEnum, u8)>>,
 }
 
 // ---------------------------------------------------------------------------
-// GeomInputCacheManager
+// GeomInputCacheManager（per-refno 存储）
 // ---------------------------------------------------------------------------
 
 pub struct GeomInputCacheManager {
     cache: HybridCache<GeomInputCacheKey, GeomInputCacheValue, BuildHasherDefault<XxHash64>>,
-    index: Mutex<CacheIndex>,
-    counter: AtomicU64,
+    index: Mutex<GeomInputIndex>,
     cache_dir: PathBuf,
 }
 
 impl GeomInputCacheManager {
-    const INDEX_FILE_NAME: &'static str = "geom_input_cache_index.json";
+    const INDEX_FILE_NAME: &'static str = "geom_input_cache_v2_index.json";
 
     pub async fn new(cache_dir: &Path) -> anyhow::Result<Self> {
         if !cache_dir.exists() {
             std::fs::create_dir_all(cache_dir)?;
         }
 
-        let (index, counter_start) = Self::load_index_with_counter(cache_dir);
+        let index = Self::load_index(cache_dir);
 
         let device_config = DirectFsDeviceOptionsBuilder::new(cache_dir)
             .with_capacity(512 * 1024 * 1024)
@@ -253,200 +270,192 @@ impl GeomInputCacheManager {
         Ok(Self {
             cache,
             index: Mutex::new(index),
-            counter: AtomicU64::new(counter_start),
             cache_dir: cache_dir.to_path_buf(),
         })
     }
 
-    /// 写入一个 batch
-    pub fn insert_batch(&self, batch: GeomInputBatch) {
-        let key = GeomInputCacheKey {
-            dbnum: batch.dbnum,
-            batch_id: batch.batch_id.clone(),
+    /// 写入单个 LOOP 输入
+    pub fn insert_loop_input(&self, dbnum: u32, refno: RefnoEnum, input: &LoopInput) {
+        let v1 = LoopInputV1 {
+            refno: input.refno,
+            attmap: input.attmap.clone(),
+            world_transform: input.world_transform.into(),
+            loops: input.loops.iter().map(|lp| lp.iter().map(|&v| Vec3V1::from(v)).collect()).collect(),
+            height: input.height,
+            owner_refno: input.owner_refno,
+            owner_type: input.owner_type.clone(),
+            visible: input.visible,
+            neg_refnos: input.neg_refnos.clone(),
+            cmpf_neg_refnos: input.cmpf_neg_refnos.clone(),
         };
-        let v1 = GeomInputBatchV1 {
-            dbnum: batch.dbnum,
-            batch_id: batch.batch_id.clone(),
-            created_at: batch.created_at,
-            loop_inputs: batch
-                .loop_inputs
-                .into_iter()
-                .map(|(refno, v)| LoopInputV1 {
-                    refno,
-                    attmap: v.attmap,
-                    world_transform: v.world_transform.into(),
-                    loops: v
-                        .loops
-                        .into_iter()
-                        .map(|lp| lp.into_iter().map(Vec3V1::from).collect())
-                        .collect(),
-                    height: v.height,
-                    owner_refno: v.owner_refno,
-                    owner_type: v.owner_type,
-                    visible: v.visible,
-                    neg_refnos: v.neg_refnos,
-                    cmpf_neg_refnos: v.cmpf_neg_refnos,
-                })
-                .collect(),
-            prim_inputs: batch
-                .prim_inputs
-                .into_iter()
-                .map(|(refno, v)| PrimInputV1 {
-                    refno,
-                    attmap: v.attmap,
-                    world_transform: v.world_transform.into(),
-                    owner_refno: v.owner_refno,
-                    owner_type: v.owner_type,
-                    visible: v.visible,
-                    neg_refnos: v.neg_refnos,
-                    poly_extra: v.poly_extra.map(|pe| PrimPolyExtraV1 {
-                        polygons: pe
-                            .polygons
-                            .into_iter()
-                            .map(|p| PrimPolyPolygonV1 {
-                                loops: p
-                                    .loops
-                                    .into_iter()
-                                    .map(|lp| lp.into_iter().map(Vec3V1::from).collect())
-                                    .collect(),
-                            })
-                            .collect(),
-                        is_polyhe: pe.is_polyhe,
-                    }),
-                })
-                .collect(),
-        };
-
-        let payload = match rkyv_payload::encode(GEOM_INPUT_TYPE_TAG, GEOM_INPUT_SCHEMA_V2, &v1) {
+        let payload = match rkyv_payload::encode(GEOM_LOOP_TYPE_TAG, GEOM_INPUT_V2_SCHEMA, &v1) {
             Ok(bytes) => bytes,
             Err(e) => {
-                eprintln!(
-                    "[geom_input_cache] rkyv 序列化失败: dbnum={}, batch_id={}, err={}",
-                    batch.dbnum, batch.batch_id, e
-                );
+                eprintln!("[geom_input_cache] rkyv encode loop failed: dbnum={}, refno={}, err={}", dbnum, refno, e);
                 return;
             }
         };
-        let dbnum = batch.dbnum;
-        let batch_id = batch.batch_id.clone();
-        self.cache
-            .insert(key, GeomInputCacheValue { payload });
-        if let Err(e) = self.update_index(dbnum, &batch_id) {
-            eprintln!(
-                "[geom_input_cache] 写入索引失败: dbnum={}, batch_id={}, err={}",
-                dbnum, batch_id, e
-            );
-        }
+        let key = GeomInputCacheKey { dbnum, refno, input_type: INPUT_TYPE_LOOP };
+        self.cache.insert(key, GeomInputCacheValue { payload });
+        self.update_index(dbnum, refno, INPUT_TYPE_LOOP);
     }
 
-    /// 读取一个 batch
-    pub async fn get(&self, dbnum: u32, batch_id: &str) -> Option<GeomInputBatch> {
-        let key = GeomInputCacheKey {
-            dbnum,
-            batch_id: batch_id.to_string(),
+    /// 写入单个 PRIM 输入
+    pub fn insert_prim_input(&self, dbnum: u32, refno: RefnoEnum, input: &PrimInput) {
+        let v1 = PrimInputV1 {
+            refno: input.refno,
+            attmap: input.attmap.clone(),
+            world_transform: input.world_transform.into(),
+            owner_refno: input.owner_refno,
+            owner_type: input.owner_type.clone(),
+            visible: input.visible,
+            neg_refnos: input.neg_refnos.clone(),
+            poly_extra: input.poly_extra.as_ref().map(|pe| PrimPolyExtraV1 {
+                polygons: pe.polygons.iter().map(|p| PrimPolyPolygonV1 {
+                    loops: p.loops.iter().map(|lp| lp.iter().map(|&v| Vec3V1::from(v)).collect()).collect(),
+                }).collect(),
+                is_polyhe: pe.is_polyhe,
+            }),
         };
+        let payload = match rkyv_payload::encode(GEOM_PRIM_TYPE_TAG, GEOM_INPUT_V2_SCHEMA, &v1) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("[geom_input_cache] rkyv encode prim failed: dbnum={}, refno={}, err={}", dbnum, refno, e);
+                return;
+            }
+        };
+        let key = GeomInputCacheKey { dbnum, refno, input_type: INPUT_TYPE_PRIM };
+        self.cache.insert(key, GeomInputCacheValue { payload });
+        self.update_index(dbnum, refno, INPUT_TYPE_PRIM);
+    }
+
+    /// 写入单个 CATE 输入
+    pub fn insert_cate_input(&self, dbnum: u32, refno: RefnoEnum, input: &CateInput) {
+        let v1 = CateInputV1 {
+            refno: input.refno,
+            attmap: input.attmap.clone(),
+            world_transform: input.world_transform.into(),
+            owner_refno: input.owner_refno,
+            owner_type: input.owner_type.clone(),
+            visible: input.visible,
+        };
+        let payload = match rkyv_payload::encode(GEOM_CATE_TYPE_TAG, GEOM_INPUT_V2_SCHEMA, &v1) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("[geom_input_cache] rkyv encode cate failed: dbnum={}, refno={}, err={}", dbnum, refno, e);
+                return;
+            }
+        };
+        let key = GeomInputCacheKey { dbnum, refno, input_type: INPUT_TYPE_CATE };
+        self.cache.insert(key, GeomInputCacheValue { payload });
+        self.update_index(dbnum, refno, INPUT_TYPE_CATE);
+    }
+
+    // -----------------------------------------------------------------------
+    // 读取 API（per-refno）
+    // -----------------------------------------------------------------------
+
+    /// 读取单个 LOOP 输入
+    pub async fn get_loop_input(&self, dbnum: u32, refno: RefnoEnum) -> Option<LoopInput> {
+        let key = GeomInputCacheKey { dbnum, refno, input_type: INPUT_TYPE_LOOP };
         match self.cache.get(&key).await {
             Ok(Some(entry)) => {
-                let payload = &entry.value().payload;
-                let v1 = match rkyv_payload::decode::<GeomInputBatchV1>(
-                    GEOM_INPUT_TYPE_TAG,
-                    GEOM_INPUT_SCHEMA_V2,
-                    payload,
-                ) {
+                let v1 = match rkyv_payload::decode::<LoopInputV1>(GEOM_LOOP_TYPE_TAG, GEOM_INPUT_V2_SCHEMA, &entry.value().payload) {
                     Ok(v) => v,
                     Err(e) => {
-                        // 迁移策略（方案1）：旧 JSON payload / schema 不匹配 一律视为 miss。
-                        eprintln!(
-                            "[geom_input_cache] payload decode miss: dbnum={}, batch_id={}, err={}",
-                            dbnum, batch_id, e
-                        );
+                        eprintln!("[geom_input_cache] loop decode miss: dbnum={}, refno={}, err={}", dbnum, refno, e);
                         return None;
                     }
                 };
-
-                let mut loop_inputs = HashMap::new();
-                for v in v1.loop_inputs {
-                    let refno: RefnoEnum = v.refno;
-                    loop_inputs.insert(
-                        refno,
-                        LoopInput {
-                            refno,
-                            attmap: v.attmap,
-                            world_transform: v.world_transform.into(),
-                            loops: v
-                                .loops
-                                .into_iter()
-                                .map(|lp| lp.into_iter().map(Vec3::from).collect())
-                                .collect(),
-                            height: v.height,
-                            owner_refno: v.owner_refno,
-                            owner_type: v.owner_type,
-                            visible: v.visible,
-                            neg_refnos: v.neg_refnos,
-                            cmpf_neg_refnos: v.cmpf_neg_refnos,
-                        },
-                    );
-                }
-
-                let mut prim_inputs = HashMap::new();
-                for v in v1.prim_inputs {
-                    let refno: RefnoEnum = v.refno;
-                    prim_inputs.insert(
-                        refno,
-                        PrimInput {
-                            refno,
-                            attmap: v.attmap,
-                            world_transform: v.world_transform.into(),
-                            owner_refno: v.owner_refno,
-                            owner_type: v.owner_type,
-                            visible: v.visible,
-                            neg_refnos: v.neg_refnos,
-                            poly_extra: v.poly_extra.map(|pe| PrimPolyExtra {
-                                polygons: pe
-                                    .polygons
-                                    .into_iter()
-                                    .map(|p| PrimPolyPolygon {
-                                        loops: p
-                                            .loops
-                                            .into_iter()
-                                            .map(|lp| lp.into_iter().map(Vec3::from).collect())
-                                            .collect(),
-                                    })
-                                    .collect(),
-                                is_polyhe: pe.is_polyhe,
-                            }),
-                        },
-                    );
-                }
-
-                Some(GeomInputBatch {
-                    dbnum: v1.dbnum,
-                    batch_id: v1.batch_id,
-                    created_at: v1.created_at,
-                    loop_inputs,
-                    prim_inputs,
+                Some(LoopInput {
+                    refno: v1.refno,
+                    attmap: v1.attmap,
+                    world_transform: v1.world_transform.into(),
+                    loops: v1.loops.into_iter().map(|lp| lp.into_iter().map(Vec3::from).collect()).collect(),
+                    height: v1.height,
+                    owner_refno: v1.owner_refno,
+                    owner_type: v1.owner_type,
+                    visible: v1.visible,
+                    neg_refnos: v1.neg_refnos,
+                    cmpf_neg_refnos: v1.cmpf_neg_refnos,
                 })
             }
             Ok(None) => None,
             Err(e) => {
-                eprintln!(
-                    "[geom_input_cache] 读取失败: dbnum={}, batch_id={}, err={}",
-                    dbnum, batch_id, e
-                );
+                eprintln!("[geom_input_cache] loop read error: dbnum={}, refno={}, err={}", dbnum, refno, e);
                 None
             }
         }
     }
 
-    /// 列出指定 dbnum 下的所有 batch_id
-    pub fn list_batches(&self, dbnum: u32) -> Vec<String> {
-        let index = self.index.lock().expect("geom_input_cache index lock poisoned");
-        index
-            .by_dbnum
-            .get(&dbnum)
-            .cloned()
-            .unwrap_or_default()
+    /// 读取单个 PRIM 输入
+    pub async fn get_prim_input(&self, dbnum: u32, refno: RefnoEnum) -> Option<PrimInput> {
+        let key = GeomInputCacheKey { dbnum, refno, input_type: INPUT_TYPE_PRIM };
+        match self.cache.get(&key).await {
+            Ok(Some(entry)) => {
+                let v1 = match rkyv_payload::decode::<PrimInputV1>(GEOM_PRIM_TYPE_TAG, GEOM_INPUT_V2_SCHEMA, &entry.value().payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[geom_input_cache] prim decode miss: dbnum={}, refno={}, err={}", dbnum, refno, e);
+                        return None;
+                    }
+                };
+                Some(PrimInput {
+                    refno: v1.refno,
+                    attmap: v1.attmap,
+                    world_transform: v1.world_transform.into(),
+                    owner_refno: v1.owner_refno,
+                    owner_type: v1.owner_type,
+                    visible: v1.visible,
+                    neg_refnos: v1.neg_refnos,
+                    poly_extra: v1.poly_extra.map(|pe| PrimPolyExtra {
+                        polygons: pe.polygons.into_iter().map(|p| PrimPolyPolygon {
+                            loops: p.loops.into_iter().map(|lp| lp.into_iter().map(Vec3::from).collect()).collect(),
+                        }).collect(),
+                        is_polyhe: pe.is_polyhe,
+                    }),
+                })
+            }
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("[geom_input_cache] prim read error: dbnum={}, refno={}, err={}", dbnum, refno, e);
+                None
+            }
+        }
     }
+
+    /// 读取单个 CATE 输入
+    pub async fn get_cate_input(&self, dbnum: u32, refno: RefnoEnum) -> Option<CateInput> {
+        let key = GeomInputCacheKey { dbnum, refno, input_type: INPUT_TYPE_CATE };
+        match self.cache.get(&key).await {
+            Ok(Some(entry)) => {
+                let v1 = match rkyv_payload::decode::<CateInputV1>(GEOM_CATE_TYPE_TAG, GEOM_INPUT_V2_SCHEMA, &entry.value().payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[geom_input_cache] cate decode miss: dbnum={}, refno={}, err={}", dbnum, refno, e);
+                        return None;
+                    }
+                };
+                Some(CateInput {
+                    refno: v1.refno,
+                    attmap: v1.attmap,
+                    world_transform: v1.world_transform.into(),
+                    owner_refno: v1.owner_refno,
+                    owner_type: v1.owner_type,
+                    visible: v1.visible,
+                })
+            }
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("[geom_input_cache] cate read error: dbnum={}, refno={}, err={}", dbnum, refno, e);
+                None
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 索引查询 API
+    // -----------------------------------------------------------------------
 
     /// 列出所有已缓存的 dbnum
     pub fn list_dbnums(&self) -> Vec<u32> {
@@ -454,37 +463,75 @@ impl GeomInputCacheManager {
         index.by_dbnum.keys().copied().collect()
     }
 
-    /// 读取指定 dbnum 下所有 batch 的 loop inputs，合并为一个 HashMap
+    /// 列出指定 dbnum 下已缓存的指定类型的 refno 列表
+    fn list_refnos_by_type(&self, dbnum: u32, input_type: u8) -> Vec<RefnoEnum> {
+        let index = self.index.lock().expect("geom_input_cache index lock poisoned");
+        index
+            .by_dbnum
+            .get(&dbnum)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(_, t)| *t == input_type)
+                    .map(|(r, _)| *r)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------------
+    // 批量读取 API（兼容旧消费者签名）
+    // -----------------------------------------------------------------------
+
+    /// 读取指定 dbnum 下所有 loop inputs
     pub async fn get_all_loop_inputs(&self, dbnum: u32) -> HashMap<RefnoEnum, LoopInput> {
-        let mut result = HashMap::new();
-        for batch_id in self.list_batches(dbnum) {
-            if let Some(batch) = self.get(dbnum, &batch_id).await {
-                result.extend(batch.loop_inputs);
+        let refnos = self.list_refnos_by_type(dbnum, INPUT_TYPE_LOOP);
+        let mut result = HashMap::with_capacity(refnos.len());
+        for refno in refnos {
+            if let Some(input) = self.get_loop_input(dbnum, refno).await {
+                result.insert(refno, input);
             }
         }
         result
     }
 
-    /// 读取指定 dbnum 下所有 batch 的 prim inputs，合并为一个 HashMap
+    /// 读取指定 dbnum 下所有 prim inputs
     pub async fn get_all_prim_inputs(&self, dbnum: u32) -> HashMap<RefnoEnum, PrimInput> {
-        let mut result = HashMap::new();
-        for batch_id in self.list_batches(dbnum) {
-            if let Some(batch) = self.get(dbnum, &batch_id).await {
-                result.extend(batch.prim_inputs);
+        let refnos = self.list_refnos_by_type(dbnum, INPUT_TYPE_PRIM);
+        let mut result = HashMap::with_capacity(refnos.len());
+        for refno in refnos {
+            if let Some(input) = self.get_prim_input(dbnum, refno).await {
+                result.insert(refno, input);
             }
         }
         result
     }
 
-    /// 删除指定 dbnum 下的所有 batch 数据
+    /// 读取指定 dbnum 下所有 cate inputs
+    pub async fn get_all_cate_inputs(&self, dbnum: u32) -> HashMap<RefnoEnum, CateInput> {
+        let refnos = self.list_refnos_by_type(dbnum, INPUT_TYPE_CATE);
+        let mut result = HashMap::with_capacity(refnos.len());
+        for refno in refnos {
+            if let Some(input) = self.get_cate_input(dbnum, refno).await {
+                result.insert(refno, input);
+            }
+        }
+        result
+    }
+
+    // -----------------------------------------------------------------------
+    // 删除 / 关闭
+    // -----------------------------------------------------------------------
+
+    /// 删除指定 dbnum 下的所有缓存数据
     pub fn remove_dbnum(&self, dbnum: u32) -> usize {
-        let batch_ids = self.list_batches(dbnum);
-        let count = batch_ids.len();
-        for batch_id in &batch_ids {
-            let key = GeomInputCacheKey {
-                dbnum,
-                batch_id: batch_id.clone(),
-            };
+        let entries = {
+            let index = self.index.lock().expect("geom_input_cache index lock poisoned");
+            index.by_dbnum.get(&dbnum).cloned().unwrap_or_default()
+        };
+        let count = entries.len();
+        for (refno, input_type) in &entries {
+            let key = GeomInputCacheKey { dbnum, refno: *refno, input_type: *input_type };
             self.cache.remove(&key);
         }
         if let Ok(mut index) = self.index.lock() {
@@ -499,43 +546,36 @@ impl GeomInputCacheManager {
         Ok(())
     }
 
-    fn next_batch_id(&self, dbnum: u32) -> String {
-        let seq = self.counter.fetch_add(1, Ordering::Relaxed);
-        format!("gi_{}_{}", dbnum, seq)
-    }
+    // -----------------------------------------------------------------------
+    // 索引管理（内部）
+    // -----------------------------------------------------------------------
 
     fn index_path(cache_dir: &Path) -> PathBuf {
         cache_dir.join(Self::INDEX_FILE_NAME)
     }
 
-    fn load_index_with_counter(cache_dir: &Path) -> (CacheIndex, u64) {
+    fn load_index(cache_dir: &Path) -> GeomInputIndex {
         let path = Self::index_path(cache_dir);
         if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(index) = serde_json::from_str::<CacheIndex>(&text) {
-                let max_seq = index
-                    .by_dbnum
-                    .values()
-                    .flatten()
-                    .filter_map(|id| id.rsplit('_').next()?.parse::<u64>().ok())
-                    .max()
-                    .unwrap_or(0);
-                return (index, max_seq + 1);
+            if let Ok(index) = serde_json::from_str::<GeomInputIndex>(&text) {
+                return index;
             }
         }
-        (CacheIndex::default(), 0)
+        GeomInputIndex::default()
     }
 
-    fn update_index(&self, dbnum: u32, batch_id: &str) -> anyhow::Result<()> {
-        let mut index = self.index.lock().expect("geom_input_cache index lock poisoned");
-        let list = index.by_dbnum.entry(dbnum).or_default();
-        if !list.contains(&batch_id.to_string()) {
-            list.push(batch_id.to_string());
-            self.save_index_locked(&index)?;
+    fn update_index(&self, dbnum: u32, refno: RefnoEnum, input_type: u8) {
+        if let Ok(mut index) = self.index.lock() {
+            let list = index.by_dbnum.entry(dbnum).or_default();
+            let entry = (refno, input_type);
+            if !list.contains(&entry) {
+                list.push(entry);
+                let _ = self.save_index_locked(&index);
+            }
         }
-        Ok(())
     }
 
-    fn save_index_locked(&self, index: &CacheIndex) -> anyhow::Result<()> {
+    fn save_index_locked(&self, index: &GeomInputIndex) -> anyhow::Result<()> {
         let path = Self::index_path(&self.cache_dir);
         let json = serde_json::to_string(index)?;
         std::fs::write(&path, json)?;
@@ -563,7 +603,6 @@ pub async fn prefetch_loop_inputs(
 ) -> anyhow::Result<usize> {
     use aios_core::pdms_types::GENRAL_NEG_NOUN_NAMES;
     use crate::fast_model::query_provider;
-    use crate::fast_model::shared;
 
     if refnos.is_empty() {
         return Ok(0);
@@ -573,28 +612,79 @@ pub async fn prefetch_loop_inputs(
     let mut inputs: HashMap<RefnoEnum, LoopInput> = HashMap::new();
     let mut skipped = 0usize;
 
-    for &refno in refnos {
-        // 1) attmap
-        let attmap = match aios_core::get_named_attmap(refno).await {
-            Ok(a) => a,
-            Err(_) => {
-                skipped += 1;
-                continue;
+    // 1) attmap：批量拉取，避免逐 refno 查询
+    let mut attmap_map: HashMap<RefnoEnum, aios_core::NamedAttrMap> = HashMap::new();
+    match query_provider::get_attmaps_batch(refnos).await {
+        Ok(list) => {
+            for att in list {
+                let r = att.get_refno_or_default();
+                if r.is_valid() {
+                    attmap_map.insert(r, att);
+                }
             }
+        }
+        Err(e) => {
+            eprintln!(
+                "[geom_input_cache] prefetch_loop_inputs: dbnum={} 批量获取 attmaps 失败: {}",
+                dbnum, e
+            );
+        }
+    }
+
+    // 2) world_transform：批量 cache-first 获取（miss 批量查 pe_transform）
+    let world_map = match crate::fast_model::transform_cache::get_world_transforms_cache_first_batch(
+        Some(db_option),
+        refnos,
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "[geom_input_cache] prefetch_loop_inputs: dbnum={} 批量获取 world_transforms 失败: {}",
+                dbnum, e
+            );
+            HashMap::new()
+        }
+    };
+
+    // 3) owner_type：按 owner_refno 去重后批量取 PE（避免 shared::get_owner_info_from_attr 的逐个 get_pe）
+    let mut owner_set: std::collections::HashSet<RefnoEnum> = std::collections::HashSet::new();
+    for a in attmap_map.values() {
+        let o = a.get_owner();
+        if o != RefnoEnum::default() && o.is_valid() {
+            owner_set.insert(o);
+        }
+    }
+    let owner_vec: Vec<RefnoEnum> = owner_set.into_iter().collect();
+    let mut owner_type_map: HashMap<RefnoEnum, String> = HashMap::new();
+    if !owner_vec.is_empty() {
+        match query_provider::get_pes_batch(&owner_vec).await {
+            Ok(pes) => {
+                for pe in pes {
+                    owner_type_map.insert(pe.refno, pe.get_type_str().to_string());
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[geom_input_cache] prefetch_loop_inputs: dbnum={} 批量获取 owner PEs 失败: {}",
+                    dbnum, e
+                );
+            }
+        }
+    }
+
+    for &refno in refnos {
+        // 1) attmap（来自批量拉取）
+        let Some(attmap) = attmap_map.get(&refno).cloned() else {
+            skipped += 1;
+            continue;
         };
 
-        // 2) world_transform
-        let world_transform = match crate::fast_model::transform_cache::get_world_transform_cache_first(
-            Some(db_option),
-            refno,
-        )
-        .await
-        {
-            Ok(Some(t)) => t,
-            _ => {
-                skipped += 1;
-                continue;
-            }
+        // 2) world_transform（来自批量 cache-first）
+        let Some(world_transform) = world_map.get(&refno).copied() else {
+            skipped += 1;
+            continue;
         };
 
         // 3) loops + height
@@ -607,7 +697,11 @@ pub async fn prefetch_loop_inputs(
         };
 
         // 4) owner
-        let (owner_refno, owner_type) = shared::get_owner_info_from_attr(&attmap).await;
+        let owner_refno = attmap.get_owner();
+        let owner_type = owner_type_map
+            .get(&owner_refno)
+            .cloned()
+            .unwrap_or_default();
 
         // 5) visible
         let visible = attmap.is_visible_by_level(None).unwrap_or(true);
@@ -656,15 +750,8 @@ pub async fn prefetch_loop_inputs(
     }
 
     let count = inputs.len();
-    if count > 0 {
-        let batch_id = cache.next_batch_id(dbnum);
-        cache.insert_batch(GeomInputBatch {
-            dbnum,
-            batch_id,
-            created_at: chrono::Utc::now().timestamp_millis(),
-            loop_inputs: inputs,
-            prim_inputs: HashMap::new(),
-        });
+    for (refno, input) in &inputs {
+        cache.insert_loop_input(dbnum, *refno, input);
     }
 
     println!(
@@ -789,7 +876,6 @@ pub async fn prefetch_prim_inputs(
 ) -> anyhow::Result<usize> {
     use aios_core::pdms_types::GENRAL_NEG_NOUN_NAMES;
     use crate::fast_model::query_provider;
-    use crate::fast_model::shared;
 
     if refnos.is_empty() {
         return Ok(0);
@@ -799,32 +885,87 @@ pub async fn prefetch_prim_inputs(
     let mut inputs: HashMap<RefnoEnum, PrimInput> = HashMap::new();
     let mut skipped = 0usize;
 
-    for &refno in refnos {
-        // 1) attmap
-        let attmap = match aios_core::get_named_attmap(refno).await {
-            Ok(a) => a,
-            Err(_) => {
-                skipped += 1;
-                continue;
+    // 1) attmap：批量拉取，避免逐 refno 查询
+    let mut attmap_map: HashMap<RefnoEnum, aios_core::NamedAttrMap> = HashMap::new();
+    match query_provider::get_attmaps_batch(refnos).await {
+        Ok(list) => {
+            for att in list {
+                let r = att.get_refno_or_default();
+                if r.is_valid() {
+                    attmap_map.insert(r, att);
+                }
             }
+        }
+        Err(e) => {
+            eprintln!(
+                "[geom_input_cache] prefetch_prim_inputs: dbnum={} 批量获取 attmaps 失败: {}",
+                dbnum, e
+            );
+        }
+    }
+
+    // 2) world_transform：批量 cache-first 获取（miss 批量查 pe_transform）
+    let world_map = match crate::fast_model::transform_cache::get_world_transforms_cache_first_batch(
+        Some(db_option),
+        refnos,
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "[geom_input_cache] prefetch_prim_inputs: dbnum={} 批量获取 world_transforms 失败: {}",
+                dbnum, e
+            );
+            HashMap::new()
+        }
+    };
+
+    // 3) owner_type：按 owner_refno 去重后批量取 PE
+    let mut owner_set: std::collections::HashSet<RefnoEnum> = std::collections::HashSet::new();
+    for a in attmap_map.values() {
+        let o = a.get_owner();
+        if o != RefnoEnum::default() && o.is_valid() {
+            owner_set.insert(o);
+        }
+    }
+    let owner_vec: Vec<RefnoEnum> = owner_set.into_iter().collect();
+    let mut owner_type_map: HashMap<RefnoEnum, String> = HashMap::new();
+    if !owner_vec.is_empty() {
+        match query_provider::get_pes_batch(&owner_vec).await {
+            Ok(pes) => {
+                for pe in pes {
+                    owner_type_map.insert(pe.refno, pe.get_type_str().to_string());
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[geom_input_cache] prefetch_prim_inputs: dbnum={} 批量获取 owner PEs 失败: {}",
+                    dbnum, e
+                );
+            }
+        }
+    }
+
+    for &refno in refnos {
+        // 1) attmap（来自批量拉取）
+        let Some(attmap) = attmap_map.get(&refno).cloned() else {
+            skipped += 1;
+            continue;
         };
 
-        // 2) world_transform
-        let world_transform = match crate::fast_model::transform_cache::get_world_transform_cache_first(
-            Some(db_option),
-            refno,
-        )
-        .await
-        {
-            Ok(Some(t)) => t,
-            _ => {
-                skipped += 1;
-                continue;
-            }
+        // 2) world_transform（来自批量 cache-first）
+        let Some(world_transform) = world_map.get(&refno).copied() else {
+            skipped += 1;
+            continue;
         };
 
         // 3) owner
-        let (owner_refno, owner_type) = shared::get_owner_info_from_attr(&attmap).await;
+        let owner_refno = attmap.get_owner();
+        let owner_type = owner_type_map
+            .get(&owner_refno)
+            .cloned()
+            .unwrap_or_default();
 
         // 4) visible
         let visible = attmap.is_visible_by_level(None).unwrap_or(true);
@@ -869,19 +1010,142 @@ pub async fn prefetch_prim_inputs(
     }
 
     let count = inputs.len();
-    if count > 0 {
-        let batch_id = cache.next_batch_id(dbnum);
-        cache.insert_batch(GeomInputBatch {
-            dbnum,
-            batch_id,
-            created_at: chrono::Utc::now().timestamp_millis(),
-            loop_inputs: HashMap::new(),
-            prim_inputs: inputs,
-        });
+    for (refno, input) in &inputs {
+        cache.insert_prim_input(dbnum, *refno, input);
     }
 
     println!(
         "[geom_input_cache] prefetch_prim_inputs: dbnum={}, total={}, cached={}, skipped={}, elapsed={} ms",
+        dbnum,
+        refnos.len(),
+        count,
+        skipped,
+        t.elapsed().as_millis()
+    );
+
+    Ok(count)
+}
+
+/// 批量预取 CATE 输入数据并写入 geom_input_cache。
+///
+/// 说明：
+/// - CATE 的 prepared geos/ptset 不在此处缓存（见 `cata_resolve_cache`，按 cata_hash 缓存）。
+/// - 本函数仅缓存每个 refno 的 inst_info 级别字段（attmap/world_transform/owner/visible）。
+pub async fn prefetch_cate_inputs(
+    cache: &GeomInputCacheManager,
+    db_option: &crate::options::DbOptionExt,
+    dbnum: u32,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<usize> {
+    use crate::fast_model::query_provider;
+
+    if refnos.is_empty() {
+        return Ok(0);
+    }
+
+    let t = std::time::Instant::now();
+    let mut inputs: HashMap<RefnoEnum, CateInput> = HashMap::new();
+    let mut skipped = 0usize;
+
+    // 1) attmap：批量拉取
+    let mut attmap_map: HashMap<RefnoEnum, aios_core::NamedAttrMap> = HashMap::new();
+    match query_provider::get_attmaps_batch(refnos).await {
+        Ok(list) => {
+            for att in list {
+                let r = att.get_refno_or_default();
+                if r.is_valid() {
+                    attmap_map.insert(r, att);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[geom_input_cache] prefetch_cate_inputs: dbnum={} 批量获取 attmaps 失败: {}",
+                dbnum, e
+            );
+        }
+    }
+
+    // 2) world_transform：批量 cache-first 获取
+    let world_map = match crate::fast_model::transform_cache::get_world_transforms_cache_first_batch(
+        Some(db_option),
+        refnos,
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "[geom_input_cache] prefetch_cate_inputs: dbnum={} 批量获取 world_transforms 失败: {}",
+                dbnum, e
+            );
+            HashMap::new()
+        }
+    };
+
+    // 3) owner_type：按 owner_refno 去重后批量取 PE
+    let mut owner_set: std::collections::HashSet<RefnoEnum> = std::collections::HashSet::new();
+    for a in attmap_map.values() {
+        let o = a.get_owner();
+        if o != RefnoEnum::default() && o.is_valid() {
+            owner_set.insert(o);
+        }
+    }
+    let owner_vec: Vec<RefnoEnum> = owner_set.into_iter().collect();
+    let mut owner_type_map: HashMap<RefnoEnum, String> = HashMap::new();
+    if !owner_vec.is_empty() {
+        match query_provider::get_pes_batch(&owner_vec).await {
+            Ok(pes) => {
+                for pe in pes {
+                    owner_type_map.insert(pe.refno, pe.get_type_str().to_string());
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[geom_input_cache] prefetch_cate_inputs: dbnum={} 批量获取 owner PEs 失败: {}",
+                    dbnum, e
+                );
+            }
+        }
+    }
+
+    for &refno in refnos {
+        let Some(attmap) = attmap_map.get(&refno).cloned() else {
+            skipped += 1;
+            continue;
+        };
+        let Some(world_transform) = world_map.get(&refno).copied() else {
+            skipped += 1;
+            continue;
+        };
+
+        let owner_refno = attmap.get_owner();
+        let owner_type = owner_type_map
+            .get(&owner_refno)
+            .cloned()
+            .unwrap_or_default();
+        let visible = attmap.is_visible_by_level(None).unwrap_or(true);
+
+        inputs.insert(
+            refno,
+            CateInput {
+                refno,
+                attmap,
+                world_transform,
+                owner_refno,
+                owner_type,
+                visible,
+            },
+        );
+    }
+
+    let count = inputs.len();
+    for (refno, input) in &inputs {
+        cache.insert_cate_input(dbnum, *refno, input);
+    }
+
+    println!(
+        "[geom_input_cache] prefetch_cate_inputs: dbnum={}, total={}, cached={}, skipped={}, elapsed={} ms",
         dbnum,
         refnos.len(),
         count,
@@ -978,10 +1242,10 @@ pub fn is_geom_input_cache_pipeline_enabled() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Orchestrator 入口：按 dbnum 分组预取 LOOP/PRIM 输入
+// Orchestrator 入口：按 dbnum 分组预取 LOOP/PRIM/CATE 输入
 // ---------------------------------------------------------------------------
 
-/// 预取指定 refnos 的 LOOP/PRIM 输入数据到 geom_input_cache。
+/// 预取指定 refnos 的 LOOP/PRIM 输入数据到 geom_input_cache（兼容旧签名）。
 ///
 /// 按 dbnum 分组，分别调用 `prefetch_loop_inputs` / `prefetch_prim_inputs`。
 /// 需要先调用 `init_global_geom_input_cache` 初始化全局缓存。
@@ -990,62 +1254,136 @@ pub async fn prefetch_all_geom_inputs(
     loop_refnos: &[RefnoEnum],
     prim_refnos: &[RefnoEnum],
 ) -> anyhow::Result<(usize, usize)> {
+    let (loop_n, prim_n, _cate_n) =
+        prefetch_all_geom_inputs_v2(db_option, loop_refnos, prim_refnos, &[]).await?;
+    Ok((loop_n, prim_n))
+}
+
+/// 预取指定 refnos 的 LOOP/PRIM/CATE 输入数据到 geom_input_cache。
+///
+/// 按 dbnum 分组，分别调用 `prefetch_loop_inputs` / `prefetch_prim_inputs` / `prefetch_cate_inputs`。
+/// 需要先调用 `init_global_geom_input_cache` 初始化全局缓存。
+pub async fn prefetch_all_geom_inputs_v2(
+    db_option: &crate::options::DbOptionExt,
+    loop_refnos: &[RefnoEnum],
+    prim_refnos: &[RefnoEnum],
+    cate_refnos: &[RefnoEnum],
+) -> anyhow::Result<(usize, usize, usize)> {
     let cache = global_geom_input_cache()
         .ok_or_else(|| anyhow::anyhow!("geom_input_cache 未初始化"))?;
 
     let t = std::time::Instant::now();
 
-    // 按 dbnum 分组
-    let db_meta = crate::data_interface::db_meta_manager::db_meta();
-    let _ = db_meta.ensure_loaded();
-
-    let mut loop_groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
-    for &r in loop_refnos {
-        let dbnum = db_meta
-            .get_dbnum_by_refno(r)
-            .ok_or_else(|| anyhow::anyhow!("缺少 ref0->dbnum 映射: refno={}", r))?;
-        loop_groups.entry(dbnum).or_default().push(r);
-    }
-
-    let mut prim_groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
-    for &r in prim_refnos {
-        let dbnum = db_meta
-            .get_dbnum_by_refno(r)
-            .ok_or_else(|| anyhow::anyhow!("缺少 ref0->dbnum 映射: refno={}", r))?;
-        prim_groups.entry(dbnum).or_default().push(r);
-    }
+    let loop_groups = group_refnos_by_dbnum_strict(loop_refnos)?;
+    let prim_groups = group_refnos_by_dbnum_strict(prim_refnos)?;
+    let cate_groups = group_refnos_by_dbnum_strict(cate_refnos)?;
 
     let mut total_loop = 0usize;
     let mut total_prim = 0usize;
+    let mut total_cate = 0usize;
 
     for (dbnum, refs) in loop_groups {
-        match prefetch_loop_inputs(cache, db_option, dbnum, &refs).await {
-            Ok(n) => total_loop += n,
-            Err(e) => eprintln!(
-                "[geom_input_cache] prefetch_loop dbnum={} 失败: {}",
-                dbnum, e
-            ),
-        }
+        total_loop += prefetch_loop_inputs(cache, db_option, dbnum, &refs).await?;
     }
 
     for (dbnum, refs) in prim_groups {
-        match prefetch_prim_inputs(cache, db_option, dbnum, &refs).await {
-            Ok(n) => total_prim += n,
-            Err(e) => eprintln!(
-                "[geom_input_cache] prefetch_prim dbnum={} 失败: {}",
-                dbnum, e
-            ),
-        }
+        total_prim += prefetch_prim_inputs(cache, db_option, dbnum, &refs).await?;
+    }
+
+    for (dbnum, refs) in cate_groups {
+        total_cate += prefetch_cate_inputs(cache, db_option, dbnum, &refs).await?;
     }
 
     println!(
-        "[geom_input_cache] prefetch_all 完成: loop={}, prim={}, elapsed={} ms",
+        "[geom_input_cache] prefetch_all(v2) 完成: loop={}, prim={}, cate={}, elapsed={} ms",
         total_loop,
         total_prim,
+        total_cate,
         t.elapsed().as_millis()
     );
 
-    Ok((total_loop, total_prim))
+    Ok((total_loop, total_prim, total_cate))
+}
+
+/// 校验：指定 refnos 的 LOOP/PRIM/CATE 输入是否已完整落入全局 geom_input_cache。
+///
+/// 约定：用于 PrefetchThenGenerate 的“预取完成 -> 进入离线生成”前的完整性校验。
+/// - 若有缺失，直接返回错误（离线 Generate 阶段不允许回查 DB；miss 视为流程不正确）。
+/// - 调用方需保证已先 `init_global_geom_input_cache`。
+pub async fn ensure_geom_inputs_present_for_refnos_from_global(
+    loop_refnos: &[RefnoEnum],
+    prim_refnos: &[RefnoEnum],
+    cate_refnos: &[RefnoEnum],
+) -> anyhow::Result<()> {
+    fn sample_refnos(missing: &[RefnoEnum], limit: usize) -> String {
+        missing
+            .iter()
+            .take(limit)
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    const SAMPLE_LIMIT: usize = 32;
+
+    if !loop_refnos.is_empty() {
+        let got = load_loop_inputs_for_refnos_from_global(loop_refnos).await?;
+        if got.len() != loop_refnos.len() {
+            let mut missing: Vec<RefnoEnum> = loop_refnos
+                .iter()
+                .copied()
+                .filter(|r| !got.contains_key(r))
+                .collect();
+            missing.sort_by_key(|r| r.refno());
+            anyhow::bail!(
+                "geom_input_cache LOOP 输入不完整: request={}, hit={}, missing={}, sample=[{}]",
+                loop_refnos.len(),
+                got.len(),
+                missing.len(),
+                sample_refnos(&missing, SAMPLE_LIMIT)
+            );
+        }
+    }
+
+    if !prim_refnos.is_empty() {
+        let got = load_prim_inputs_for_refnos_from_global(prim_refnos).await?;
+        if got.len() != prim_refnos.len() {
+            let mut missing: Vec<RefnoEnum> = prim_refnos
+                .iter()
+                .copied()
+                .filter(|r| !got.contains_key(r))
+                .collect();
+            missing.sort_by_key(|r| r.refno());
+            anyhow::bail!(
+                "geom_input_cache PRIM 输入不完整: request={}, hit={}, missing={}, sample=[{}]",
+                prim_refnos.len(),
+                got.len(),
+                missing.len(),
+                sample_refnos(&missing, SAMPLE_LIMIT)
+            );
+        }
+    }
+
+    if !cate_refnos.is_empty() {
+        let got = load_cate_inputs_for_refnos_from_global(cate_refnos).await?;
+        if got.len() != cate_refnos.len() {
+            let mut missing: Vec<RefnoEnum> = cate_refnos
+                .iter()
+                .copied()
+                .filter(|r| !got.contains_key(r))
+                .collect();
+            missing.sort_by_key(|r| r.refno());
+            anyhow::bail!(
+                "geom_input_cache CATE 输入不完整: request={}, hit={}, missing={}, sample=[{}]",
+                cate_refnos.len(),
+                got.len(),
+                missing.len(),
+                sample_refnos(&missing, SAMPLE_LIMIT)
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// 从全局 geom_input_cache 加载指定 dbnum 的所有 LOOP 输入。
@@ -1060,6 +1398,14 @@ pub async fn load_loop_inputs_from_global(dbnum: u32) -> HashMap<RefnoEnum, Loop
 pub async fn load_prim_inputs_from_global(dbnum: u32) -> HashMap<RefnoEnum, PrimInput> {
     match global_geom_input_cache() {
         Some(cache) => cache.get_all_prim_inputs(dbnum).await,
+        None => HashMap::new(),
+    }
+}
+
+/// 从全局 geom_input_cache 加载指定 dbnum 的所有 CATE 输入。
+pub async fn load_cate_inputs_from_global(dbnum: u32) -> HashMap<RefnoEnum, CateInput> {
+    match global_geom_input_cache() {
+        Some(cache) => cache.get_all_cate_inputs(dbnum).await,
         None => HashMap::new(),
     }
 }
@@ -1126,6 +1472,29 @@ pub async fn load_prim_inputs_for_refnos_from_global(
     Ok(result)
 }
 
+/// 按 refno 集合加载 CATE 输入（严格按 dbnum 分桶，不扫描全库）。
+pub async fn load_cate_inputs_for_refnos_from_global(
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<HashMap<RefnoEnum, CateInput>> {
+    if refnos.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let cache = global_geom_input_cache()
+        .ok_or_else(|| anyhow::anyhow!("geom_input_cache 未初始化"))?;
+    let groups = group_refnos_by_dbnum_strict(refnos)?;
+
+    let mut result = HashMap::new();
+    for (dbnum, refs) in groups {
+        let mut db_inputs = cache.get_all_cate_inputs(dbnum).await;
+        for refno in refs {
+            if let Some(input) = db_inputs.remove(&refno) {
+                result.insert(refno, input);
+            }
+        }
+    }
+    Ok(result)
+}
+
 /// 从全局 geom_input_cache 加载所有 dbnum 的 LOOP 输入。
 pub async fn load_all_loop_inputs_from_global() -> HashMap<RefnoEnum, LoopInput> {
     let Some(cache) = global_geom_input_cache() else {
@@ -1148,4 +1517,51 @@ pub async fn load_all_prim_inputs_from_global() -> HashMap<RefnoEnum, PrimInput>
         result.extend(cache.get_all_prim_inputs(dbnum).await);
     }
     result
+}
+
+/// 从全局 geom_input_cache 加载所有 dbnum 的 CATE 输入。
+pub async fn load_all_cate_inputs_from_global() -> HashMap<RefnoEnum, CateInput> {
+    let Some(cache) = global_geom_input_cache() else {
+        return HashMap::new();
+    };
+    let mut result = HashMap::new();
+    for dbnum in cache.list_dbnums() {
+        result.extend(cache.get_all_cate_inputs(dbnum).await);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_geom_input_cache_cate_roundtrip_per_refno() {
+        let dir = tempdir().unwrap();
+        let mgr = GeomInputCacheManager::new(dir.path()).await.unwrap();
+
+        let refno: RefnoEnum = "24381/36716".into();
+
+        let cate_input = CateInput {
+            refno,
+            attmap: aios_core::NamedAttrMap::default(),
+            world_transform: aios_core::Transform::IDENTITY,
+            owner_refno: RefnoEnum::default(),
+            owner_type: String::new(),
+            visible: true,
+        };
+
+        mgr.insert_cate_input(1112, refno, &cate_input);
+
+        let got = mgr.get_cate_input(1112, refno).await.expect("cate input must exist");
+        assert_eq!(got.refno, refno);
+        assert!(got.visible);
+
+        // get_all_cate_inputs 也应该能读到
+        let all = mgr.get_all_cate_inputs(1112).await;
+        assert!(all.contains_key(&refno));
+
+        mgr.close().await.unwrap();
+    }
 }

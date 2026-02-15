@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::fs;
 
@@ -13,18 +12,30 @@ use foyer::{DirectFsDeviceOptionsBuilder, HybridCache, HybridCacheBuilder};
 use serde::{Deserialize, Serialize};
 use twox_hash::XxHash64;
 use crate::data_interface::db_meta_manager::db_meta;
-use anyhow::Context;
 
 use crate::fast_model::foyer_cache::rkyv_payload;
 
+// ---------------------------------------------------------------------------
+// Key / Value 类型
+// ---------------------------------------------------------------------------
+
+/// refno 级别的缓存 Key
 #[derive(Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
-pub struct InstanceCacheKey {
+pub struct InstInfoKey {
     pub dbnum: u32,
-    pub batch_id: String,
+    pub refno: RefnoEnum,
 }
 
+/// inst_key 级别的缓存 Key（多 refno 可共享同一 inst_key）
+#[derive(Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InstGeosKey {
+    pub dbnum: u32,
+    pub inst_key: String,
+}
+
+/// 通用 payload 包装
 #[derive(Clone, Serialize, Deserialize)]
-pub struct InstanceCacheValue {
+pub struct CachePayloadValue {
     pub payload: Vec<u8>,
 }
 
@@ -36,19 +47,23 @@ pub struct CachedInstRelateBool {
     pub created_at: i64,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct CachedInstanceBatch {
-    pub dbnum: u32,
-    pub batch_id: String,
+/// 单个 refno 的全部数据聚合
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct CachedInstInfo {
+    pub info: EleGeosInfo,
+    pub tubi: Option<EleGeosInfo>,
+    pub inst_key: String,
+    pub neg_relates: Vec<RefnoEnum>,
+    pub ngmr_neg_relates: Vec<(RefnoEnum, RefnoEnum)>,
+    pub relate_bool: Option<CachedInstRelateBool>,
     pub created_at: i64,
-    pub inst_info_map: HashMap<RefnoEnum, EleGeosInfo>,
-    pub inst_geos_map: HashMap<String, EleInstGeosData>,
-    pub inst_tubi_map: HashMap<RefnoEnum, EleGeosInfo>,
-    pub neg_relate_map: HashMap<RefnoEnum, Vec<RefnoEnum>>,
-    pub ngmr_neg_relate_map: HashMap<RefnoEnum, Vec<(RefnoEnum, RefnoEnum)>>,
-    /// refno -> bool 结果（serde default 以兼容旧缓存文件）。
-    #[serde(default)]
-    pub inst_relate_bool_map: HashMap<RefnoEnum, CachedInstRelateBool>,
+}
+
+/// 几何数据（按 inst_key 独立存储）
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct CachedInstGeos {
+    pub geos_data: EleInstGeosData,
+    pub created_at: i64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -59,68 +74,85 @@ pub struct CachedGeoParam {
 }
 
 // ---------------------------------------------------------------------------
-// rkyv payload — 直接使用 aios_core 原始类型，无需中间转换层
+// rkyv payload 常量（新 schema，旧 type_tag 2001 自动 miss）
 // ---------------------------------------------------------------------------
 
-const INSTANCE_CACHE_TYPE_TAG: u16 = 2001;
-/// schema V3：消除 V1/V2 中间层，直接序列化 aios_core 原始类型。
-const INSTANCE_CACHE_SCHEMA_VERSION: u16 = 3;
+const INST_INFO_TYPE_TAG: u16 = 2010;
+const INST_INFO_SCHEMA_V1: u16 = 1;
 
-/// rkyv 序列化专用结构体，字段与 CachedInstanceBatch 一一对应。
-/// 使用 Vec<(K,V)> 代替 HashMap 以获得稳定的 rkyv 序列化布局。
-#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct CachedInstanceBatchRkyv {
-    dbnum: u32,
-    batch_id: String,
-    created_at: i64,
-    inst_info_items: Vec<(RefnoEnum, EleGeosInfo)>,
-    inst_geos_items: Vec<(String, EleInstGeosData)>,
-    inst_tubi_items: Vec<(RefnoEnum, EleGeosInfo)>,
-    neg_relate_items: Vec<(RefnoEnum, Vec<RefnoEnum>)>,
-    ngmr_neg_relate_items: Vec<(RefnoEnum, Vec<(RefnoEnum, RefnoEnum)>)>,
-    inst_relate_bool_items: Vec<(RefnoEnum, CachedInstRelateBool)>,
-}
+const INST_GEOS_TYPE_TAG: u16 = 2011;
+const INST_GEOS_SCHEMA_V1: u16 = 1;
+
+// ---------------------------------------------------------------------------
+// 索引：dbnum -> HashSet<RefnoEnum> + dbnum -> HashSet<String>(inst_key)
+// ---------------------------------------------------------------------------
 
 #[derive(Default, Serialize, Deserialize, Clone)]
-struct CacheIndex {
-    by_dbnum: HashMap<u32, Vec<String>>,
+struct RefnoIndex {
+    /// dbnum -> 已缓存的 refno 集合
+    by_dbnum: HashMap<u32, HashSet<RefnoEnum>>,
+    /// dbnum -> 已缓存的 inst_key 集合
     #[serde(default)]
-    by_dbnum_set: HashMap<u32, HashSet<String>>,
+    geos_by_dbnum: HashMap<u32, HashSet<String>>,
 }
 
+// ---------------------------------------------------------------------------
+// InstanceCacheManager
+// ---------------------------------------------------------------------------
+
 pub struct InstanceCacheManager {
-    cache: HybridCache<InstanceCacheKey, InstanceCacheValue, BuildHasherDefault<XxHash64>>,
-    index: Mutex<CacheIndex>,
-    counter: AtomicU64,
+    info_cache: HybridCache<InstInfoKey, CachePayloadValue, BuildHasherDefault<XxHash64>>,
+    geos_cache: HybridCache<InstGeosKey, CachePayloadValue, BuildHasherDefault<XxHash64>>,
+    index: Mutex<RefnoIndex>,
     cache_dir: PathBuf,
 }
 
 impl InstanceCacheManager {
-    const INDEX_FILE_NAME: &'static str = "instance_cache_index.json";
+    const INDEX_FILE_NAME: &'static str = "instance_cache_refno_index.json";
 
     pub async fn new(cache_dir: &Path) -> anyhow::Result<Self> {
         if !cache_dir.exists() {
             std::fs::create_dir_all(cache_dir)?;
         }
 
-        let (index, counter_start) = Self::load_index_with_counter(cache_dir);
+        let index = Self::load_index(cache_dir);
 
-        let device_config = DirectFsDeviceOptionsBuilder::new(cache_dir)
-            .with_capacity(1024 * 1024 * 1024)
+        // info_cache：per-refno，条目多但单条小
+        let info_dir = cache_dir.join("info");
+        if !info_dir.exists() {
+            std::fs::create_dir_all(&info_dir)?;
+        }
+        let info_device = DirectFsDeviceOptionsBuilder::new(&info_dir)
+            .with_capacity(512 * 1024 * 1024)
             .build();
-
-        let cache = HybridCacheBuilder::new()
-            .memory(128 * 1024 * 1024)
+        let info_cache = HybridCacheBuilder::new()
+            .memory(64 * 1024 * 1024)
             .with_hash_builder(BuildHasherDefault::<XxHash64>::default())
             .storage()
-            .with_device_config(device_config)
+            .with_device_config(info_device)
+            .build()
+            .await?;
+
+        // geos_cache：per-inst_key，条目较少但单条较大
+        let geos_dir = cache_dir.join("geos");
+        if !geos_dir.exists() {
+            std::fs::create_dir_all(&geos_dir)?;
+        }
+        let geos_device = DirectFsDeviceOptionsBuilder::new(&geos_dir)
+            .with_capacity(512 * 1024 * 1024)
+            .build();
+        let geos_cache = HybridCacheBuilder::new()
+            .memory(64 * 1024 * 1024)
+            .with_hash_builder(BuildHasherDefault::<XxHash64>::default())
+            .storage()
+            .with_device_config(geos_device)
             .build()
             .await?;
 
         Ok(Self {
-            cache,
+            info_cache,
+            geos_cache,
             index: Mutex::new(index),
-            counter: AtomicU64::new(counter_start),
             cache_dir: cache_dir.to_path_buf(),
         })
     }
@@ -129,228 +161,240 @@ impl InstanceCacheManager {
         &self.cache_dir
     }
 
-    pub fn insert_batch(&self, batch: CachedInstanceBatch) {
+    // -----------------------------------------------------------------------
+    // 写入 API
+    // -----------------------------------------------------------------------
+
+    /// 从 ShapeInstancesData 写入缓存（签名不变，内部拆散为逐 refno 写入）。
+    ///
+    /// 返回写入的 refno 数量（用于日志）。
+    pub fn insert_from_shape(&self, dbnum: u32, shape_insts: &ShapeInstancesData) -> usize {
         let _span = crate::profile_span!(
-            "cache_insert_batch",
-            dbnum = batch.dbnum,
-            inst_info_cnt = batch.inst_info_map.len(),
-            inst_geos_cnt = batch.inst_geos_map.len()
+            "cache_insert_from_shape",
+            dbnum = dbnum,
+            inst_info_cnt = shape_insts.inst_info_map.len(),
+            inst_geos_cnt = shape_insts.inst_geos_map.len()
         );
-        let key = InstanceCacheKey {
-            dbnum: batch.dbnum,
-            batch_id: batch.batch_id.clone(),
-        };
 
-        let ser_start = std::time::Instant::now();
-        let rkyv_batch = CachedInstanceBatchRkyv {
-            dbnum: batch.dbnum,
-            batch_id: batch.batch_id.clone(),
-            created_at: batch.created_at,
-            inst_info_items: batch.inst_info_map.into_iter().collect(),
-            inst_geos_items: batch.inst_geos_map.into_iter().collect(),
-            inst_tubi_items: batch.inst_tubi_map.into_iter().collect(),
-            neg_relate_items: batch.neg_relate_map.into_iter().collect(),
-            ngmr_neg_relate_items: batch.ngmr_neg_relate_map.into_iter().collect(),
-            inst_relate_bool_items: batch.inst_relate_bool_map.into_iter().collect(),
-        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut count = 0usize;
 
-        let payload = match rkyv_payload::encode(INSTANCE_CACHE_TYPE_TAG, INSTANCE_CACHE_SCHEMA_VERSION, &rkyv_batch) {
+        // 1) 写入 geos_cache（按 inst_key）
+        for (inst_key, geos_data) in &shape_insts.inst_geos_map {
+            self.insert_inst_geos(dbnum, inst_key.clone(), geos_data, now);
+        }
+
+        // 2) 写入 info_cache（按 refno）
+        for (refno, info) in &shape_insts.inst_info_map {
+            let inst_key = info.get_inst_key();
+            let tubi = shape_insts.inst_tubi_map.get(refno).cloned();
+            let neg_relates = shape_insts
+                .neg_relate_map
+                .get(refno)
+                .cloned()
+                .unwrap_or_default();
+            let ngmr_neg_relates = shape_insts
+                .ngmr_neg_relate_map
+                .get(refno)
+                .cloned()
+                .unwrap_or_default();
+
+            let cached = CachedInstInfo {
+                info: info.clone(),
+                tubi,
+                inst_key,
+                neg_relates,
+                ngmr_neg_relates,
+                relate_bool: None,
+                created_at: now,
+            };
+
+            self.insert_inst_info(dbnum, *refno, &cached);
+            count += 1;
+        }
+
+        count
+    }
+
+    /// 写入单个 refno 的 inst_info
+    pub fn insert_inst_info(&self, dbnum: u32, refno: RefnoEnum, info: &CachedInstInfo) {
+        let key = InstInfoKey { dbnum, refno };
+        let payload = match rkyv_payload::encode(INST_INFO_TYPE_TAG, INST_INFO_SCHEMA_V1, info) {
             Ok(bytes) => bytes,
             Err(e) => {
                 eprintln!(
-                    "[cache] rkyv 序列化失败，跳过写入: dbnum={}, batch_id={}, err={}",
-                    key.dbnum, key.batch_id, e
+                    "[instance_cache] rkyv 序列化 inst_info 失败: dbnum={}, refno={}, err={}",
+                    dbnum, refno, e
                 );
                 return;
             }
         };
-        let _ser_ms = ser_start.elapsed().as_millis();
-        #[cfg(feature = "profile")]
-        tracing::info!(payload_bytes = payload.len(), serialize_ms = _ser_ms as u64, "cache_insert_batch rkyv serialized");
-        let value = InstanceCacheValue { payload };
-        let dbnum = key.dbnum;
-        let batch_id = key.batch_id.clone();
-        self.cache.insert(key, value);
-        if let Err(e) = self.update_index(dbnum, &batch_id) {
-            eprintln!(
-                "[cache] 写入索引失败: dbnum={}, batch_id={}, err={}",
-                dbnum, batch_id, e
-            );
-        }
+        self.info_cache
+            .insert(key, CachePayloadValue { payload });
+        self.update_refno_index(dbnum, refno);
     }
 
-    pub fn insert_from_shape(&self, dbnum: u32, shape_insts: &ShapeInstancesData) -> String {
-        // 高频路径：默认不打印到 stdout，避免 profile 场景下 IO 成为瓶颈。
-        // 需要时可设置环境变量 `AIOS_CACHE_INSERT_STDOUT=1|true` 打开。
-        let stdout_enabled = std::env::var("AIOS_CACHE_INSERT_STDOUT")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if stdout_enabled {
-            println!(
-                "[cache] insert_from_shape 调用: dbnum={}, inst_cnt={}, inst_info={}, inst_geos={}, inst_tubi={}, neg={}, ngmr={}",
+    /// 写入单个 inst_key 的 geos 数据
+    pub fn insert_inst_geos(
+        &self,
+        dbnum: u32,
+        inst_key: String,
+        geos_data: &EleInstGeosData,
+        created_at: i64,
+    ) {
+        let key = InstGeosKey {
+            dbnum,
+            inst_key: inst_key.clone(),
+        };
+        let cached = CachedInstGeos {
+            geos_data: geos_data.clone(),
+            created_at,
+        };
+        let payload = match rkyv_payload::encode(INST_GEOS_TYPE_TAG, INST_GEOS_SCHEMA_V1, &cached)
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "[instance_cache] rkyv 序列化 inst_geos 失败: dbnum={}, inst_key={}, err={}",
+                    dbnum, inst_key, e
+                );
+                return;
+            }
+        };
+        self.geos_cache
+            .insert(key, CachePayloadValue { payload });
+        self.update_geos_index(dbnum, &inst_key);
+    }
+
+    /// 更新布尔运算结果（直接读写单条 refno，无需反序列化整个 batch）。
+    pub async fn upsert_inst_relate_bool(
+        &self,
+        dbnum: u32,
+        refno: RefnoEnum,
+        mesh_id: String,
+        status: &str,
+    ) -> anyhow::Result<()> {
+        let mut info = self.get_inst_info(dbnum, refno).await.ok_or_else(|| {
+            anyhow::anyhow!(
+                "instance_cache inst_info 不存在，无法写入 relate_bool: dbnum={} refno={}",
                 dbnum,
-                shape_insts.inst_cnt(),
-                shape_insts.inst_info_map.len(),
-                shape_insts.inst_geos_map.len(),
-                shape_insts.inst_tubi_map.len(),
-                shape_insts.neg_relate_map.len(),
-                shape_insts.ngmr_neg_relate_map.len()
-            );
-        }
-        let batch_id = self.next_batch_id(dbnum);
-        let batch = CachedInstanceBatch {
-            dbnum,
-            batch_id: batch_id.clone(),
-            created_at: chrono::Utc::now().timestamp_millis(),
-            inst_info_map: shape_insts.inst_info_map.clone(),
-            inst_geos_map: shape_insts.inst_geos_map.clone(),
-            inst_tubi_map: shape_insts.inst_tubi_map.clone(),
-            neg_relate_map: shape_insts.neg_relate_map.clone(),
-            ngmr_neg_relate_map: shape_insts.ngmr_neg_relate_map.clone(),
-            inst_relate_bool_map: HashMap::new(),
-        };
+                refno
+            )
+        })?;
 
-        self.insert_batch(batch);
-        batch_id
+        info.relate_bool = Some(CachedInstRelateBool {
+            mesh_id,
+            status: status.to_string(),
+            created_at: chrono::Utc::now().timestamp_millis(),
+        });
+
+        self.insert_inst_info(dbnum, refno, &info);
+        Ok(())
     }
 
-    #[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "cache_get_batch"))]
-    pub async fn get(&self, dbnum: u32, batch_id: &str) -> Option<CachedInstanceBatch> {
-        let key = InstanceCacheKey {
-            dbnum,
-            batch_id: batch_id.to_string(),
-        };
-        match self.cache.get(&key).await {
+    // -----------------------------------------------------------------------
+    // 读取 API
+    // -----------------------------------------------------------------------
+
+    /// 读取单个 refno 的 inst_info
+    pub async fn get_inst_info(&self, dbnum: u32, refno: RefnoEnum) -> Option<CachedInstInfo> {
+        let key = InstInfoKey { dbnum, refno };
+        match self.info_cache.get(&key).await {
             Ok(Some(entry)) => {
                 let payload = &entry.value().payload;
-                let _deser_start = std::time::Instant::now();
-                let rkyv_batch = match rkyv_payload::decode::<CachedInstanceBatchRkyv>(
-                    INSTANCE_CACHE_TYPE_TAG,
-                    INSTANCE_CACHE_SCHEMA_VERSION,
+                match rkyv_payload::decode::<CachedInstInfo>(
+                    INST_INFO_TYPE_TAG,
+                    INST_INFO_SCHEMA_V1,
                     payload,
                 ) {
-                    Ok(v) => v,
+                    Ok(v) => Some(v),
                     Err(e) => {
-                        // 旧 schema payload 一律视为 miss，由上游重建。
                         eprintln!(
-                            "[cache] payload decode miss: dbnum={}, batch_id={}, err={}",
-                            dbnum, batch_id, e
+                            "[instance_cache] inst_info decode miss: dbnum={}, refno={}, err={}",
+                            dbnum, refno, e
                         );
-                        return None;
+                        None
                     }
-                };
-
-                #[cfg(feature = "profile")]
-                tracing::debug!(
-                    payload_bytes = payload.len(),
-                    deserialize_ms = _deser_start.elapsed().as_millis() as u64,
-                    "cache_get_batch rkyv deserialized"
-                );
-
-                Some(CachedInstanceBatch {
-                    dbnum: rkyv_batch.dbnum,
-                    batch_id: rkyv_batch.batch_id,
-                    created_at: rkyv_batch.created_at,
-                    inst_info_map: rkyv_batch.inst_info_items.into_iter().collect(),
-                    inst_geos_map: rkyv_batch.inst_geos_items.into_iter().collect(),
-                    inst_tubi_map: rkyv_batch.inst_tubi_items.into_iter().collect(),
-                    neg_relate_map: rkyv_batch.neg_relate_items.into_iter().collect(),
-                    ngmr_neg_relate_map: rkyv_batch.ngmr_neg_relate_items.into_iter().collect(),
-                    inst_relate_bool_map: rkyv_batch.inst_relate_bool_items.into_iter().collect(),
-                })
+                }
             }
             Ok(None) => None,
             Err(e) => {
                 eprintln!(
-                    "[cache] 读取失败: dbnum={}, batch_id={}, err={}",
-                    dbnum, batch_id, e
+                    "[instance_cache] inst_info 读取失败: dbnum={}, refno={}, err={}",
+                    dbnum, refno, e
                 );
                 None
             }
         }
     }
 
-    pub async fn close(&self) -> anyhow::Result<()> {
-        self.cache.close().await?;
-        Ok(())
-    }
-
-    /// 回写 cache-only 布尔结果（以 batch 为最小回写单元）。
-    pub async fn upsert_inst_relate_bool(
-        &self,
-        dbnum: u32,
-        batch_id: &str,
-        refno: RefnoEnum,
-        mesh_id: String,
-        status: &str,
-    ) -> anyhow::Result<()> {
-        let Some(mut batch) = self.get(dbnum, batch_id).await else {
-            anyhow::bail!(
-                "instance_cache batch 不存在，无法写入 inst_relate_bool: dbnum={} batch_id={} refno={}",
-                dbnum,
-                batch_id,
-                refno
-            );
+    /// 读取单个 inst_key 的 geos 数据
+    pub async fn get_inst_geos(&self, dbnum: u32, inst_key: &str) -> Option<CachedInstGeos> {
+        let key = InstGeosKey {
+            dbnum,
+            inst_key: inst_key.to_string(),
         };
-
-        batch.inst_relate_bool_map.insert(
-            refno,
-            CachedInstRelateBool {
-                mesh_id,
-                status: status.to_string(),
-                created_at: chrono::Utc::now().timestamp_millis(),
-            },
-        );
-
-        self.insert_batch(batch);
-        Ok(())
+        match self.geos_cache.get(&key).await {
+            Ok(Some(entry)) => {
+                let payload = &entry.value().payload;
+                match rkyv_payload::decode::<CachedInstGeos>(
+                    INST_GEOS_TYPE_TAG,
+                    INST_GEOS_SCHEMA_V1,
+                    payload,
+                ) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        eprintln!(
+                            "[instance_cache] inst_geos decode miss: dbnum={}, inst_key={}, err={}",
+                            dbnum, inst_key, e
+                        );
+                        None
+                    }
+                }
+            }
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!(
+                    "[instance_cache] inst_geos 读取失败: dbnum={}, inst_key={}, err={}",
+                    dbnum, inst_key, e
+                );
+                None
+            }
+        }
     }
 
-    pub fn list_batches(&self, dbnum: u32) -> Vec<String> {
-        let index = self.index.lock().expect("cache index lock poisoned");
+    /// 列出指定 dbnum 下所有已缓存的 refno
+    pub fn list_refnos(&self, dbnum: u32) -> Vec<RefnoEnum> {
+        let index = self.index.lock().expect("instance_cache index lock poisoned");
         index
             .by_dbnum
             .get(&dbnum)
-            .cloned()
+            .map(|s| s.iter().copied().collect())
             .unwrap_or_default()
     }
 
+    /// 列出所有已缓存的 dbnum
     pub fn list_dbnums(&self) -> Vec<u32> {
-        let index = self.index.lock().expect("cache index lock poisoned");
+        let index = self.index.lock().expect("instance_cache index lock poisoned");
         index.by_dbnum.keys().copied().collect()
     }
 
-    /// 删除指定 dbnum 下的所有 batch 数据
-    pub fn remove_dbnum(&self, dbnum: u32) -> usize {
-        let batch_ids = self.list_batches(dbnum);
-        let count = batch_ids.len();
-
-        for batch_id in &batch_ids {
-            let key = InstanceCacheKey {
-                dbnum,
-                batch_id: batch_id.clone(),
-            };
-            self.cache.remove(&key);
-        }
-
-        // 从索引中移除整个 dbnum
-        if let Err(e) = self.remove_dbnum_from_index(dbnum) {
-            eprintln!("[cache] 更新索引失败: dbnum={}, err={}", dbnum, e);
-        }
-
-        count
+    /// 列出指定 dbnum 下所有已缓存的 inst_key
+    pub fn list_inst_keys(&self, dbnum: u32) -> Vec<String> {
+        let index = self.index.lock().expect("instance_cache index lock poisoned");
+        index
+            .geos_by_dbnum
+            .get(&dbnum)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
-    fn remove_dbnum_from_index(&self, dbnum: u32) -> anyhow::Result<()> {
-        let mut index = self.index.lock().expect("cache index lock poisoned");
-        index.by_dbnum.remove(&dbnum);
-        index.by_dbnum_set.remove(&dbnum);
-        self.save_index_locked(&index)
-    }
+    // -----------------------------------------------------------------------
+    // 批量读取 API（兼容旧消费者）
+    // -----------------------------------------------------------------------
 
     /// 批量获取指定 refno 列表的 ptset_map（ARRIVE/LEAVE 点）
-    /// 返回 HashMap<RefnoEnum, [CateAxisParam; 2]>，其中 [0]=ARRIVE(ptset[1]), [1]=LEAVE(ptset[2])
+    /// 返回 HashMap<RefnoEnum, [CateAxisParam; 2]>，其中 [0]=ARRIVE, [1]=LEAVE
     pub async fn get_ptset_maps_for_refnos(
         &self,
         dbnum: u32,
@@ -361,8 +405,7 @@ impl InstanceCacheManager {
             return result;
         }
 
-        // arrive/leave 点编号来自元件属性 ARRI/LEAV；不同元件并非固定为 1/2。
-        // cache-only：若无法读取属性（例如未初始化 SurrealDB），则回退到旧假设 (1,2)。
+        // arrive/leave 点编号来自元件属性 ARRI/LEAV
         let mut al_numbers: HashMap<u64, (i32, i32)> = HashMap::new();
         for &r in refnos {
             let mut arrive = 1i32;
@@ -378,35 +421,28 @@ impl InstanceCacheManager {
             al_numbers.insert(r.refno().0, (arrive, leave));
         }
 
-        let want_set: HashSet<u64> = refnos.iter().map(|r| r.refno().0).collect();
-        let batch_ids = self.list_batches(dbnum);
-
-        // 倒序遍历，优先取最新 batch
-        for batch_id in batch_ids.iter().rev() {
-            let Some(batch) = self.get(dbnum, batch_id).await else {
+        for &refno in refnos {
+            let Some(info) = self.get_inst_info(dbnum, refno).await else {
                 continue;
             };
-
-            for (k, info) in batch.inst_info_map.iter() {
-                let refno_u64 = k.refno().0;
-                if !want_set.contains(&refno_u64) {
-                    continue;
-                }
-                if result.contains_key(k) {
-                    continue; // 已找到，跳过
-                }
-
-                let (arrive_no, leave_no) = al_numbers.get(&refno_u64).copied().unwrap_or((1, 2));
-                let arrive = info.ptset_map.values().find(|p| p.number == arrive_no).cloned();
-                let leave = info.ptset_map.values().find(|p| p.number == leave_no).cloned();
-                if let (Some(arrive), Some(leave)) = (arrive, leave) {
-                    result.insert(*k, [arrive, leave]);
-                }
-            }
-
-            // 如果已找到所有，提前退出
-            if result.len() >= refnos.len() {
-                break;
+            let (arrive_no, leave_no) = al_numbers
+                .get(&refno.refno().0)
+                .copied()
+                .unwrap_or((1, 2));
+            let arrive = info
+                .info
+                .ptset_map
+                .values()
+                .find(|p| p.number == arrive_no)
+                .cloned();
+            let leave = info
+                .info
+                .ptset_map
+                .values()
+                .find(|p| p.number == leave_no)
+                .cloned();
+            if let (Some(arrive), Some(leave)) = (arrive, leave) {
+                result.insert(refno, [arrive, leave]);
             }
         }
 
@@ -450,43 +486,27 @@ impl InstanceCacheManager {
     }
 
     /// 获取单个 refno 的 ptset_map（ARRIVE/LEAVE 点）
-    /// 返回 Option<[CateAxisParam; 2]>，其中 [0]=ARRIVE(ptset[1]), [1]=LEAVE(ptset[2])
     pub async fn get_ptset_for_refno(
         &self,
         dbnum: u32,
         refno: RefnoEnum,
     ) -> Option<[CateAxisParam; 2]> {
-        let batch_ids = self.list_batches(dbnum);
-        let want_u64 = refno.refno().0;
-
-        // 倒序遍历，优先取最新 batch
-        for batch_id in batch_ids.iter().rev() {
-            let Some(batch) = self.get(dbnum, batch_id).await else {
-                continue;
-            };
-
-            for (k, info) in batch.inst_info_map.iter() {
-                let k_u64 = k.refno().0;
-                if k_u64 != want_u64 {
-                    continue;
-                }
-
-                // ptset_map: [1]=ARRIVE, [2]=LEAVE
-                if let (Some(arrive), Some(leave)) = (info.ptset_map.get(&1), info.ptset_map.get(&2)) {
-                    return Some([arrive.clone(), leave.clone()]);
-                }
-            }
-        }
-
-        None
+        let info = self.get_inst_info(dbnum, refno).await?;
+        let arrive = info.info.ptset_map.get(&1)?;
+        let leave = info.info.ptset_map.get(&2)?;
+        Some([arrive.clone(), leave.clone()])
     }
 
-    pub fn collect_geo_params(batch: &CachedInstanceBatch) -> Vec<CachedGeoParam> {
+    /// 收集指定 dbnum 下所有 geo_params（用于 mesh 生成）
+    pub async fn collect_all_geo_params(&self, dbnum: u32) -> Vec<CachedGeoParam> {
         let mut seen = HashSet::new();
         let mut items = Vec::new();
 
-        for geos_data in batch.inst_geos_map.values() {
-            for inst in &geos_data.insts {
+        for inst_key in self.list_inst_keys(dbnum) {
+            let Some(cached) = self.get_inst_geos(dbnum, &inst_key).await else {
+                continue;
+            };
+            for inst in &cached.geos_data.insts {
                 if seen.insert(inst.geo_hash) {
                     items.push(CachedGeoParam {
                         geo_hash: inst.geo_hash,
@@ -500,64 +520,90 @@ impl InstanceCacheManager {
         items
     }
 
-    fn next_batch_id(&self, dbnum: u32) -> String {
-        let seq = self.counter.fetch_add(1, Ordering::Relaxed);
-        format!("{}_{}", dbnum, seq)
+    // -----------------------------------------------------------------------
+    // 删除 API
+    // -----------------------------------------------------------------------
+
+    /// 删除指定 dbnum 下的所有缓存数据
+    pub fn remove_dbnum(&self, dbnum: u32) -> usize {
+        let refnos = self.list_refnos(dbnum);
+        let inst_keys = self.list_inst_keys(dbnum);
+        let count = refnos.len();
+
+        for refno in &refnos {
+            let key = InstInfoKey {
+                dbnum,
+                refno: *refno,
+            };
+            self.info_cache.remove(&key);
+        }
+        for inst_key in &inst_keys {
+            let key = InstGeosKey {
+                dbnum,
+                inst_key: inst_key.clone(),
+            };
+            self.geos_cache.remove(&key);
+        }
+
+        if let Ok(mut index) = self.index.lock() {
+            index.by_dbnum.remove(&dbnum);
+            index.geos_by_dbnum.remove(&dbnum);
+            let _ = self.save_index_locked(&index);
+        }
+
+        count
     }
+
+    pub async fn close(&self) -> anyhow::Result<()> {
+        self.info_cache.close().await?;
+        self.geos_cache.close().await?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // 索引管理
+    // -----------------------------------------------------------------------
 
     fn index_path(cache_dir: &Path) -> PathBuf {
         cache_dir.join(Self::INDEX_FILE_NAME)
     }
 
-    fn load_index_with_counter(cache_dir: &Path) -> (CacheIndex, u64) {
+    fn load_index(cache_dir: &Path) -> RefnoIndex {
         let path = Self::index_path(cache_dir);
-        let text = fs::read_to_string(&path).ok();
-        if let Some(text) = text {
-            if let Ok(mut index) = serde_json::from_str::<CacheIndex>(&text) {
-                if index.by_dbnum_set.is_empty() && !index.by_dbnum.is_empty() {
-                    for (dbnum, batches) in &index.by_dbnum {
-                        let set = index.by_dbnum_set.entry(*dbnum).or_default();
-                        for batch_id in batches {
-                            set.insert(batch_id.clone());
-                        }
-                    }
-                }
-                let max_seq = index
-                    .by_dbnum
-                    .values()
-                    .flatten()
-                    .filter_map(|id| Self::parse_batch_seq(id))
-                    .max()
-                    .unwrap_or(0);
-                return (index, max_seq + 1);
+        if let Ok(text) = fs::read_to_string(&path) {
+            if let Ok(index) = serde_json::from_str::<RefnoIndex>(&text) {
+                return index;
             }
         }
-        (CacheIndex::default(), 0)
+        RefnoIndex::default()
     }
 
-    fn parse_batch_seq(batch_id: &str) -> Option<u64> {
-        batch_id.rsplit('_').next()?.parse().ok()
+    fn update_refno_index(&self, dbnum: u32, refno: RefnoEnum) {
+        if let Ok(mut index) = self.index.lock() {
+            if index.by_dbnum.entry(dbnum).or_default().insert(refno) {
+                let _ = self.save_index_locked(&index);
+            }
+        }
     }
 
-    fn update_index(&self, dbnum: u32, batch_id: &str) -> anyhow::Result<()> {
-        let mut index = self.index.lock().expect("cache index lock poisoned");
-        let set = index.by_dbnum_set.entry(dbnum).or_default();
-        if set.insert(batch_id.to_string()) {
-            index
-                .by_dbnum
+    fn update_geos_index(&self, dbnum: u32, inst_key: &str) {
+        if let Ok(mut index) = self.index.lock() {
+            if index
+                .geos_by_dbnum
                 .entry(dbnum)
                 .or_default()
-                .push(batch_id.to_string());
-            self.save_index_locked(&index)?;
+                .insert(inst_key.to_string())
+            {
+                let _ = self.save_index_locked(&index);
+            }
         }
+    }
+
+    fn save_index_locked(&self, index: &RefnoIndex) -> anyhow::Result<()> {
+        let path = Self::index_path(&self.cache_dir);
+        let json = serde_json::to_string(index)?;
+        fs::write(&path, json)?;
         Ok(())
     }
 
-    fn save_index_locked(&self, index: &CacheIndex) -> anyhow::Result<()> {
-        let path = Self::index_path(&self.cache_dir);
-        let json = serde_json::to_string(index).context("序列化缓存索引失败")?;
-        fs::write(&path, json)
-            .with_context(|| format!("写入缓存索引失败: {}", path.display()))?;
-        Ok(())
-    }
 }

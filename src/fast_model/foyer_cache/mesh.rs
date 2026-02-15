@@ -51,17 +51,11 @@ pub async fn run_mesh_worker_from_cache_manager(
     let mut unique_geo: HashMap<u64, (PdmsGeoParam, bool)> = HashMap::new();
 
     for dbnum in dbnums {
-        let batch_ids = cache_manager.list_batches(dbnum);
-        for batch_id in batch_ids {
-            if let Some(batch) = cache_manager.get(dbnum, &batch_id).await {
-                for geos_data in batch.inst_geos_map.values() {
-                    for inst in &geos_data.insts {
-                        unique_geo.entry(inst.geo_hash).or_insert_with(|| {
-                            (inst.geo_param.clone(), inst.geo_param.is_reuse_unit())
-                        });
-                    }
-                }
-            }
+        let params = cache_manager.collect_all_geo_params(dbnum).await;
+        for p in params {
+            unique_geo.entry(p.geo_hash).or_insert_with(|| {
+                (p.geo_param, p.unit_flag)
+            });
         }
     }
 

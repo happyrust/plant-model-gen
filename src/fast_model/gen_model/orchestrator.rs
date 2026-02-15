@@ -72,6 +72,8 @@ use super::config::FullNounConfig;
 
 use super::errors::{FullNounError, Result};
 
+use super::cache_miss_report;
+
 use super::full_noun_mode::gen_full_noun_geos_optimized;
 
 use super::models::NounCategory;
@@ -82,14 +84,14 @@ use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 
 use aios_core::tool::db_tool::db1_hash;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 
 /// 按 dbnum 拆分一个 batch，保证写入 InstanceCache 时“一个 batch 只落到一个 dbnum 分桶”。
 ///
 /// 说明：
 /// - 这里不尝试“从 ref0 推 dbnum”，必须通过 TreeIndexManager 映射。
 /// - 若某个 refno 无法映射 dbnum：直接返回 Err（避免悄然写错桶）。
-async fn split_shape_instances_by_dbnum(
+pub(crate) async fn split_shape_instances_by_dbnum(
     shape_insts: &aios_core::geometry::ShapeInstancesData,
 ) -> anyhow::Result<HashMap<u32, aios_core::geometry::ShapeInstancesData>> {
     use aios_core::geometry::ShapeInstancesData;
@@ -212,6 +214,10 @@ pub async fn gen_all_geos_data(
     let mut perf = crate::perf_timer::PerfTimer::new("gen_all_geos_data");
 
     perf.mark("init");
+
+    // cache-first 缺失报告：生成过程中按需补充记录，结束时输出到 output/<project>/cache_miss_report.json
+    let cache_run_mode = crate::fast_model::foyer_cache::geom_input_cache::resolve_cache_run_mode();
+    cache_miss_report::init_global_cache_miss_report(db_option, cache_run_mode.as_str());
 
     let mut final_incr_updates = incr_updates;
 
@@ -497,6 +503,24 @@ pub async fn gen_all_geos_data(
 
     perf.print_summary();
 
+    // 输出 cache miss 报告（覆盖写）。
+    if let Some(report) = cache_miss_report::snapshot_global_report() {
+        match report.write_to_default_path(db_option) {
+            Ok(path) => {
+                println!(
+                    "[gen_model] cache_miss_report 已写入: {} (mode={})",
+                    path.display(),
+                    report.mode
+                );
+            }
+            Err(e) => {
+                eprintln!("[gen_model] 写入 cache_miss_report 失败: {}", e);
+            }
+        }
+    } else {
+        eprintln!("[gen_model] cache_miss_report 未初始化，跳过写入");
+    }
+
     result
 
 }
@@ -709,6 +733,11 @@ async fn process_full_noun_mode(
 
     let touched_dbnums_for_insert = touched_dbnums.clone();
 
+    // Full Noun 下用于 inst_relate_aabb 写入的 refno 集合：只收集“本次生成触达”的实例，
+    // 避免通过 pe_transform 全库扫描导致卡死/耗时失真。
+    let touched_refnos: Arc<DashSet<RefnoEnum>> = Arc::new(DashSet::new());
+    let touched_refnos_for_insert = touched_refnos.clone();
+
 
 
     // 当 manual_db_nums 只有一个值时，直接使用该 dbnum，无需从 refno 反推
@@ -777,6 +806,14 @@ async fn process_full_noun_mode(
 
                 t_save_db += t0.elapsed();
 
+            }
+
+            // 记录本批次触达的实例 refno（用于后续 inst_relate_aabb 写入范围收敛）
+            for r in shape_insts.inst_info_map.keys() {
+                touched_refnos_for_insert.insert(*r);
+            }
+            for r in shape_insts.inst_tubi_map.keys() {
+                touched_refnos_for_insert.insert(*r);
             }
 
             if let Some(ref cache_manager) = cache_manager_for_insert {
@@ -1047,87 +1084,67 @@ async fn process_full_noun_mode(
 
         if use_surrealdb {
 
-        let aabb_start = Instant::now();
-
-        println!("[gen_model] Full Noun 模式开始写入 inst_relate_aabb");
-
-        // 使用实际 inst_relate 中的 refno，避免分类结果与 inst 列表不一致导致 0 写入
-
-        let aabb_refnos = match crate::fast_model::mesh_generate::fetch_inst_relate_refnos().await {
-
-            Ok(v) if !v.is_empty() => v,
-
-            Ok(_) => {
-
-                eprintln!("[gen_model] pe_transform 中无可用 refno，跳过 AABB 写入");
-
-                Vec::new()
-
-            }
-
-            Err(e) => {
-
-                eprintln!("[gen_model] 获取 pe_transform refno 失败: {}", e);
-
-                Vec::new()
-
-            }
-
-        };
-
-
-
-        if aabb_refnos.is_empty() {
-
-            eprintln!("[gen_model] Full Noun 模式写入 inst_relate_aabb 被跳过：没有可用 refno");
-
-        } else {
-
-            if let Err(e) = crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
-
-                &aabb_refnos,
-
-                db_option.is_replace_mesh(),
-
-            )
-
-            .await
-
-            {
-
-                eprintln!("[gen_model] Full Noun 模式写入 inst_relate_aabb 失败: {}", e);
-
-            } else {
-
+            // 性能实验：允许跳过 AABB 写入，便于先定位“生成/mesh/boolean”的主耗时。
+            let skip_aabb_write = std::env::var_os("AIOS_SKIP_INST_RELATE_AABB").is_some();
+            if skip_aabb_write {
                 println!(
-
-                    "[gen_model] Full Noun 模式完成 inst_relate_aabb 写入，用时 {} ms",
-
-                    aabb_start.elapsed().as_millis()
-
+                    "[gen_model] Full Noun 模式跳过 inst_relate_aabb 写入（AIOS_SKIP_INST_RELATE_AABB=1）"
                 );
+            } else {
+                let aabb_start = Instant::now();
 
+                println!("[gen_model] Full Noun 模式开始写入 inst_relate_aabb");
 
+                // 只写本次生成触达的 refno，避免 pe_transform 全库扫描导致卡死/耗时失真。
+                let mut aabb_refnos: Vec<RefnoEnum> =
+                    touched_refnos.iter().map(|r| *r.key()).collect();
 
-                // 导出前端模型数据 (db_models_{dbnum}.parquet)
+                // manual_db_nums=单库时，严格按 db_meta 映射过滤，避免混入其他 dbnum 的 refno。
+                if let Some(known) = known_dbnum {
+                    let _ = db_meta().ensure_loaded();
+                    let mut filtered = Vec::with_capacity(aabb_refnos.len());
+                    let mut missing = 0usize;
+                    for r in aabb_refnos.drain(..) {
+                        match db_meta().get_dbnum_by_refno(r) {
+                            Some(dbnum) if dbnum == known => filtered.push(r),
+                            Some(_) => {}
+                            None => missing += 1,
+                        }
+                    }
+                    if missing > 0 {
+                        eprintln!(
+                            "[gen_model] ⚠️ inst_relate_aabb refno 过滤时发现 {} 个 refno 缺少 ref0->dbnum 映射，已跳过（known_dbnum={}）",
+                            missing, known
+                        );
+                    }
+                    aabb_refnos = filtered;
+                }
 
-                // let export_path = std::path::Path::new("assets/database_models");
+                if aabb_refnos.is_empty() {
+                    eprintln!(
+                        "[gen_model] Full Noun 模式写入 inst_relate_aabb 被跳过：本次生成未收集到可用 refno"
+                    );
+                } else {
+                    println!(
+                        "[gen_model] Full Noun 模式 inst_relate_aabb 写入范围: refnos={}",
+                        aabb_refnos.len()
+                    );
 
-                // if let Err(e) = crate::fast_model::export_model::export_parquet::export_db_models_parquet(
-
-                //     export_path,
-
-                //     None, // 导出所有已生成的 dbnums
-
-                // ).await {
-
-                //     eprintln!("[gen_model] Full Noun 模式导出前端模型 Parquet 失败: {}", e);
-
-                // }
-
+                    if let Err(e) = crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
+                        &aabb_refnos,
+                        db_option.is_replace_mesh(),
+                    )
+                    .await
+                    {
+                        eprintln!("[gen_model] Full Noun 模式写入 inst_relate_aabb 失败: {}", e);
+                    } else {
+                        println!(
+                            "[gen_model] Full Noun 模式完成 inst_relate_aabb 写入，用时 {} ms",
+                            aabb_start.elapsed().as_millis()
+                        );
+                    }
+                }
             }
-
-        }
 
         }
 
@@ -1456,8 +1473,6 @@ async fn process_full_noun_mode(
         eprintln!("[perf] 保存 CSV 报告失败: {}", e);
 
     }
-
-
 
     Ok(true)
 

@@ -508,108 +508,35 @@ async fn pregen_room_panels_into_foyer_cache(
 
 
 
-    // 按 cache_dbnum 分组以减少 batch 扫描次数
-
+    // 按 dbnum 分组
     let mut groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
-
     for &p in &panels {
-
         let Some(dbnum) = db_meta().get_dbnum_by_refno(p) else {
-
             continue;
-
         };
-
         if dbnum == 0 {
-
             continue;
-
         }
-
         groups.entry(dbnum).or_default().push(p);
-
     }
 
-
-
     let mut missing: Vec<RefnoEnum> = Vec::new();
-
     for (dbnum, refnos) in groups {
-
-        let batch_ids = cache.list_batches(dbnum);
-
-        if batch_ids.is_empty() {
-
-            missing.extend(refnos);
-
-            continue;
-
-        }
-
-
-
-        let mut unresolved: HashSet<RefnoEnum> = refnos.into_iter().collect();
-
-
-
-        for bid in batch_ids.iter().rev() {
-
-            if unresolved.is_empty() {
-
-                break;
-
-            }
-
-            let Some(batch) = cache.get(dbnum, bid).await else {
-
+        for r in refnos {
+            let Some(info) = cache.get_inst_info(dbnum, r).await else {
+                missing.push(r);
                 continue;
-
             };
-
-
-
-            let mut has_geos: HashSet<RefnoEnum> = HashSet::new();
-
-            for geos in batch.inst_geos_map.values() {
-
-                if !geos.insts.is_empty() {
-
-                    has_geos.insert(geos.refno);
-
+            // 检查是否有非空几何数据
+            if !info.inst_key.is_empty() {
+                if let Some(geos) = cache.get_inst_geos(dbnum, &info.inst_key).await {
+                    if !geos.geos_data.insts.is_empty() {
+                        continue; // 已找到，不缺失
+                    }
                 }
-
             }
-
-
-
-            let mut found_now = Vec::new();
-
-            for r in &unresolved {
-
-                if batch.inst_info_map.contains_key(r) && has_geos.contains(r) {
-
-                    found_now.push(*r);
-
-                }
-
-            }
-
-            for r in found_now {
-
-                unresolved.remove(&r);
-
-            }
-
+            missing.push(r);
         }
-
-
-
-        if !unresolved.is_empty() {
-
-            missing.extend(unresolved.into_iter());
-
-        }
-
     }
 
 

@@ -3345,15 +3345,14 @@ pub async fn export_dbnum_instances_json_from_cache(
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
 
     let cache_manager = InstanceCacheManager::new(cache_dir).await?;
-    let batch_ids = cache_manager.list_batches(dbnum);
-    if batch_ids.is_empty() {
+    let cached_refnos = cache_manager.list_refnos(dbnum);
+    if cached_refnos.is_empty() {
         return Err(anyhow::anyhow!(
-            "缓存中未找到 dbnum={} 的批次数据（请先生成模型并写入缓存）",
+            "缓存中未找到 dbnum={} 的数据（请先生成模型并写入缓存）",
             dbnum
         ));
     }
-    // 用于 meta_{dbno}.json：表示“截至该 batch 的最新快照”。
-    let latest_batch_id = batch_ids.last().cloned();
+    let latest_batch_id: Option<String> = None;
 
     let mut inst_info_map: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
     let mut inst_tubi_map: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
@@ -3362,61 +3361,41 @@ pub async fn export_dbnum_instances_json_from_cache(
     let mut ngmr_neg_relate_map: HashMap<RefnoEnum, Vec<(RefnoEnum, RefnoEnum)>> =
         HashMap::new();
 
-    let mut hit_batches = 0usize;
-    let mut miss_batches = 0usize;
-    for batch_id in batch_ids {
-        if let Some(batch) = cache_manager.get(dbnum, &batch_id).await {
-            hit_batches += 1;
-            for (k, v) in batch.inst_info_map {
-                inst_info_map.insert(k, v);
+    // per-refno 读取：每个 refno 只有一条记录，无需多 batch 合并
+    for &refno in &cached_refnos {
+        let Some(info) = cache_manager.get_inst_info(dbnum, refno).await else {
+            continue;
+        };
+
+        inst_info_map.insert(refno, info.info.clone());
+        if let Some(tubi) = info.tubi.clone() {
+            inst_tubi_map.insert(refno, tubi);
+        }
+        if !info.neg_relates.is_empty() {
+            neg_relate_map.insert(refno, info.neg_relates.clone());
+        }
+        if !info.ngmr_neg_relates.is_empty() {
+            ngmr_neg_relate_map.insert(refno, info.ngmr_neg_relates.clone());
+        }
+
+        // inst_geos（按 inst_key 去重）
+        if !info.inst_key.is_empty() && !inst_geos_map.contains_key(&info.inst_key) {
+            if let Some(geos) = cache_manager.get_inst_geos(dbnum, &info.inst_key).await {
+                inst_geos_map.insert(info.inst_key.clone(), geos.geos_data);
             }
-            for (k, v) in batch.inst_tubi_map {
-                inst_tubi_map.insert(k, v);
-            }
-            for (k, v) in batch.inst_geos_map {
-                if let Some(existing) = inst_geos_map.get_mut(&k) {
-                    existing.insts.extend(v.insts);
-                    if existing.aabb.is_none() {
-                        existing.aabb = v.aabb;
-                    }
-                    if existing.type_name.is_empty() {
-                        existing.type_name = v.type_name;
-                    }
-                } else {
-                    inst_geos_map.insert(k, v);
-                }
-            }
-            for (k, v) in batch.neg_relate_map {
-                let entry = neg_relate_map.entry(k).or_default();
-                for neg in v {
-                    if !entry.contains(&neg) {
-                        entry.push(neg);
-                    }
-                }
-            }
-            for (k, v) in batch.ngmr_neg_relate_map {
-                let entry = ngmr_neg_relate_map.entry(k).or_default();
-                for item in v {
-                    if !entry.contains(&item) {
-                        entry.push(item);
-                    }
-                }
-            }
-        } else {
-            miss_batches += 1;
         }
     }
 
     if verbose {
         println!(
-            "✅ 合并缓存完成: inst_info={}, inst_geos={}, inst_tubi={}",
+            "✅ 缓存读取完成: inst_info={}, inst_geos={}, inst_tubi={}",
             inst_info_map.len(),
             inst_geos_map.len(),
             inst_tubi_map.len()
         );
         println!(
-            "✅ 缓存批次命中情况: 命中={}, 丢失={}",
-            hit_batches, miss_batches
+            "✅ 缓存 refno 数量: {}",
+            cached_refnos.len()
         );
         let total_inst_geos: usize = inst_geos_map.values().map(|v| v.insts.len()).sum();
         let empty_inst_geos = inst_geos_map.values().filter(|v| v.insts.is_empty()).count();
@@ -3425,11 +3404,6 @@ pub async fn export_dbnum_instances_json_from_cache(
             inst_geos_map.len(),
             total_inst_geos,
             empty_inst_geos
-        );
-    } else if miss_batches > 0 {
-        println!(
-            "⚠️ 缓存批次未命中: 命中={}, 丢失={}",
-            hit_batches, miss_batches
         );
     }
 

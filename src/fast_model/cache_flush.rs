@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use glam::Vec3;
 use dashmap::DashMap;
 
-use crate::fast_model::instance_cache::{CachedInstanceBatch, InstanceCacheManager};
+use crate::fast_model::instance_cache::InstanceCacheManager;
 use crate::fast_model::pdms_inst::save_instance_data_optimize;
 use crate::fast_model::utils::{save_inst_relate_bool, save_transforms_to_surreal};
 use crate::fast_model::pdms_inst::save_tubi_info_batch_with_replace;
@@ -37,39 +37,6 @@ impl MergedCacheData {
         self.inst_relate_bool_map.retain(|k, _| filter.contains(k));
         self
     }
-}
-
-/// 合并多个 cache batch 为“最终态”数据（用于 DB flush）。
-///
-/// 说明：该函数先实现为“旧语义”（inst_geos_map 对同 key 做 extend），以配合 TDD 的 RED；
-/// 后续会按测试要求改为 last-write-wins 替换。
-fn merge_cached_batches_for_db_flush(batches: Vec<CachedInstanceBatch>) -> MergedCacheData {
-    let mut merged = MergedCacheData::default();
-    for batch in batches {
-        for (k, v) in batch.inst_info_map {
-            merged.inst_info_map.insert(k, v);
-        }
-        for (k, v) in batch.inst_tubi_map {
-            merged.inst_tubi_map.insert(k, v);
-        }
-        for (k, v) in batch.inst_geos_map {
-            // last-write-wins：后批次覆盖前批次，避免多 batch 混入导致重复/旧数据污染。
-            merged.inst_geos_map.insert(k, v);
-        }
-        for (k, v) in batch.neg_relate_map {
-            // last-write-wins：与 inst_info_map/inst_geos_map 保持一致，
-            // 避免旧 batch 的已删除负实体残留（幽灵负实体）。
-            merged.neg_relate_map.insert(k, v);
-        }
-        for (k, v) in batch.ngmr_neg_relate_map {
-            // last-write-wins：同上。
-            merged.ngmr_neg_relate_map.insert(k, v);
-        }
-        for (k, v) in batch.inst_relate_bool_map {
-            merged.inst_relate_bool_map.insert(k, v);
-        }
-    }
-    merged
 }
 
 /// 从 `inst_info_map` 反推 tubi_info（组合键 id -> TubiInfoData）。
@@ -166,28 +133,43 @@ pub async fn flush_latest_instance_cache_to_surreal(
     let mut flushed = 0usize;
 
     for dbnum in targets {
-        let batch_ids = cache.list_batches(dbnum);
-        if batch_ids.is_empty() {
+        let refnos = cache.list_refnos(dbnum);
+        if refnos.is_empty() {
             if verbose {
-                println!("[cache_flush] dbnum={} 没有 batch，跳过", dbnum);
+                println!("[cache_flush] dbnum={} 没有缓存数据，跳过", dbnum);
             }
             continue;
         }
 
-        // 合并所有 batch（与 export_prepack_lod 的 cache 导出路径一致）
-        let mut hit = 0usize;
-        let mut miss = 0usize;
-        let mut batches: Vec<CachedInstanceBatch> = Vec::with_capacity(batch_ids.len());
-        for batch_id in &batch_ids {
-            let Some(batch) = cache.get(dbnum, batch_id).await else {
-                miss += 1;
+        // 从 per-refno cache 组装 MergedCacheData
+        let mut merged = MergedCacheData::default();
+        for &refno in &refnos {
+            let Some(info) = cache.get_inst_info(dbnum, refno).await else {
                 continue;
             };
-            hit += 1;
-            batches.push(batch);
-        }
 
-        let merged = merge_cached_batches_for_db_flush(batches);
+            merged.inst_info_map.insert(refno, info.info.clone());
+
+            if let Some(tubi) = info.tubi.clone() {
+                merged.inst_tubi_map.insert(refno, tubi);
+            }
+            if !info.neg_relates.is_empty() {
+                merged.neg_relate_map.insert(refno, info.neg_relates.clone());
+            }
+            if !info.ngmr_neg_relates.is_empty() {
+                merged.ngmr_neg_relate_map.insert(refno, info.ngmr_neg_relates.clone());
+            }
+            if let Some(rb) = info.relate_bool.clone() {
+                merged.inst_relate_bool_map.insert(refno, rb);
+            }
+
+            // inst_geos（按 inst_key 去重）
+            if !info.inst_key.is_empty() && !merged.inst_geos_map.contains_key(&info.inst_key) {
+                if let Some(geos) = cache.get_inst_geos(dbnum, &info.inst_key).await {
+                    merged.inst_geos_map.insert(info.inst_key.clone(), geos.geos_data);
+                }
+            }
+        }
 
         // 按 refno 过滤（--debug-model / --sync-to-db 场景）
         let merged = match refno_filter {
@@ -218,8 +200,8 @@ pub async fn flush_latest_instance_cache_to_surreal(
 
         if verbose {
             println!(
-                "[cache_flush] dbnum={} batches={}/{} inst_info={} inst_geos={} inst_tubi={} neg={} ngmr={} bool={}",
-                dbnum, hit, hit + miss,
+                "[cache_flush] dbnum={} refnos={} inst_info={} inst_geos={} inst_tubi={} neg={} ngmr={} bool={}",
+                dbnum, refnos.len(),
                 merged.inst_info_map.len(),
                 merged.inst_geos_map.len(),
                 merged.inst_tubi_map.len(),
@@ -511,55 +493,6 @@ async fn flush_tubi_relate_to_surreal(
 mod tests {
     use super::*;
     use std::str::FromStr;
-
-    #[test]
-    fn merge_inst_geos_should_be_last_write_wins() {
-        let r1 = RefnoEnum::from_str("24381/1").unwrap();
-
-        let g1 = aios_core::geometry::EleInstGeosData {
-            inst_key: "k".to_string(),
-            refno: r1,
-            insts: vec![],
-            aabb: None,
-            type_name: "A".to_string(),
-            ..Default::default()
-        };
-        let g2 = aios_core::geometry::EleInstGeosData {
-            inst_key: "k".to_string(),
-            refno: r1,
-            insts: vec![],
-            aabb: None,
-            type_name: "B".to_string(),
-            ..Default::default()
-        };
-
-        let b1 = CachedInstanceBatch {
-            dbnum: 1,
-            batch_id: "b1".to_string(),
-            created_at: 1,
-            inst_info_map: HashMap::new(),
-            inst_geos_map: HashMap::from([("k".to_string(), g1)]),
-            inst_tubi_map: HashMap::new(),
-            neg_relate_map: HashMap::new(),
-            ngmr_neg_relate_map: HashMap::new(),
-            inst_relate_bool_map: HashMap::new(),
-        };
-        let b2 = CachedInstanceBatch {
-            dbnum: 1,
-            batch_id: "b2".to_string(),
-            created_at: 2,
-            inst_info_map: HashMap::new(),
-            inst_geos_map: HashMap::from([("k".to_string(), g2)]),
-            inst_tubi_map: HashMap::new(),
-            neg_relate_map: HashMap::new(),
-            ngmr_neg_relate_map: HashMap::new(),
-            inst_relate_bool_map: HashMap::new(),
-        };
-
-        let merged = merge_cached_batches_for_db_flush(vec![b1, b2]);
-        let got = merged.inst_geos_map.get("k").unwrap();
-        assert_eq!(got.type_name, "B");
-    }
 
     #[test]
     fn collect_tubi_info_should_return_entries_when_tubi_info_id_present() {

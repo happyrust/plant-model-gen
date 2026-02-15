@@ -216,7 +216,7 @@ pub struct GenOutcome {
 enum BranchTubiMode {
     /// 兼容旧逻辑：cache miss 时允许回源 DB 补齐 arrive/leave。
     DbFallback,
-    /// 严格 cache-only：cache miss 仅记录，不回源 DB。
+    /// 严格 cache-only：只读 cache；任意 miss 直接失败，不回源 DB。
     CacheOnly,
 }
 
@@ -331,47 +331,53 @@ fn parse_branch_cache_meta(info: &EleGeosInfo) -> Option<BranchCacheMeta> {
 async fn load_cached_inst_info_for_refnos(
     cache_manager: &InstanceCacheManager,
     refnos: &[RefnoEnum],
-) -> HashMap<RefnoEnum, EleGeosInfo> {
+) -> anyhow::Result<HashMap<RefnoEnum, EleGeosInfo>> {
     let mut result: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
     if refnos.is_empty() {
-        return result;
+        return Ok(result);
     }
-    if db_meta().ensure_loaded().is_err() {
-        return result;
-    }
+
+    // cache-only：ref0 != dbnum，必须依赖 db_meta 映射来分桶读取；缺失视为致命错误。
+    db_meta().ensure_loaded()?;
+
     let mut groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
     for &refno in refnos {
         let Some(dbnum) = db_meta().get_dbnum_by_refno(refno) else {
-            continue;
+            anyhow::bail!("缺少 ref0->dbnum 映射: refno={}", refno);
         };
         if dbnum == 0 {
-            continue;
+            anyhow::bail!("无效 dbnum=0（ref0->dbnum 映射缺失）: refno={}", refno);
         }
         groups.entry(dbnum).or_default().push(refno);
     }
     for (dbnum, group_refnos) in groups.into_iter() {
-        let mut remain: HashSet<RefnoEnum> = group_refnos.into_iter().collect();
-        let batch_ids = cache_manager.list_batches(dbnum);
-        for batch_id in batch_ids.iter().rev() {
-            if remain.is_empty() {
-                break;
-            }
-            let Some(batch) = cache_manager.get(dbnum, batch_id).await else {
-                continue;
-            };
-            let mut found_refnos: Vec<RefnoEnum> = Vec::new();
-            for refno in remain.iter() {
-                if let Some(info) = batch.inst_info_map.get(refno) {
-                    result.insert(*refno, info.clone());
-                    found_refnos.push(*refno);
-                }
-            }
-            for refno in found_refnos {
-                remain.remove(&refno);
+        let mut missing_refnos: Vec<RefnoEnum> = Vec::new();
+        for refno in group_refnos {
+            if let Some(info) = cache_manager.get_inst_info(dbnum, refno).await {
+                result.insert(refno, info.info);
+            } else {
+                missing_refnos.push(refno);
             }
         }
+
+        if !missing_refnos.is_empty() {
+            missing_refnos.sort_by_key(|r| r.refno());
+            const SAMPLE_LIMIT: usize = 16;
+            let sample = missing_refnos
+                .iter()
+                .take(SAMPLE_LIMIT)
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "instance_cache miss（cache-only 不允许回源 DB）：missing={}, sample=[{}]",
+                missing_refnos.len(),
+                sample
+            );
+        }
     }
-    result
+
+    Ok(result)
 }
 
 fn write_branch_tubi_cache_miss_report(
@@ -562,7 +568,7 @@ pub async fn gen_branch_tubi_from_db(
 
 /// BRAN/HANG tubing（strict cache-only 模式）
 /// - 只使用 local/cache 数据
-/// - cache miss 仅记录，不回源 DB
+/// - cache miss 直接失败，不回源 DB
 pub async fn gen_branch_tubi_cache_only(
     db_option: Arc<DbOptionExt>,
     branch_map: Arc<DashMap<RefnoEnum, Vec<SPdmsElement>>>,
@@ -2335,20 +2341,25 @@ async fn gen_cata_geos_inner(
             match InstanceCacheManager::new(&cache_dir).await {
                 Ok(cache) => {
                     if matches!(branch_mode, BranchTubiMode::CacheOnly) {
-                        let mut cache_meta_refnos: Vec<RefnoEnum> = all_child_refnos.clone();
+                        // cache-only：仅加载“必须”的 inst_info：
+                        // - branch_refno：用于读取 BRAN/HANG meta（HPOS/TPOS/尺寸/类型）
+                        // - need_axis_refnos：local_al_map miss 的子元件，需要从 cache 的 ptset_map 推导 arrive/leave
+                        let mut cache_meta_refnos: Vec<RefnoEnum> = need_axis_refnos.clone();
                         cache_meta_refnos.extend(branch_map.iter().map(|x| *x.key()));
                         cache_meta_refnos.sort_by_key(|x| x.refno().0);
                         cache_meta_refnos.dedup_by_key(|x| x.refno().0);
                         cache_inst_info_map_global =
-                            load_cached_inst_info_for_refnos(&cache, &cache_meta_refnos).await;
+                            load_cached_inst_info_for_refnos(&cache, &cache_meta_refnos).await?;
                     }
                     if matches!(branch_mode, BranchTubiMode::CacheOnly) {
                         for refno in need_axis_refnos.iter().copied() {
-                            if let Some(info) = cache_inst_info_map_global.get(&refno)
-                                && let Some(axis) = select_axis_pair_from_ptset_map(&info.ptset_map)
-                            {
-                                cache_al_map_global.insert(refno, axis);
-                            }
+                            let info = cache_inst_info_map_global.get(&refno).ok_or_else(|| {
+                                anyhow::anyhow!("cache-only: 缺少子元件 inst_info: refno={}", refno)
+                            })?;
+                            let axis = select_axis_pair_from_ptset_map(&info.ptset_map).ok_or_else(|| {
+                                anyhow::anyhow!("cache-only: 缺少 arrive/leave 点（ptset_map 不足2个）: refno={}", refno)
+                            })?;
+                            cache_al_map_global.insert(refno, axis);
                         }
                     } else {
                         let hm = cache.get_ptset_maps_for_refnos_auto(&need_axis_refnos).await;
@@ -2359,15 +2370,10 @@ async fn gen_cata_geos_inner(
                 }
                 Err(e) => {
                     if matches!(branch_mode, BranchTubiMode::CacheOnly) {
-                        for refno in need_axis_refnos.iter().copied() {
-                            record_branch_cache_miss(
-                                &mut cache_only_miss_refnos_by_reason,
-                                "cache_manager_open_failed",
-                                refno,
-                            );
-                        }
-                        debug_model!(
-                            "[BRAN_TUBI][cache-only] InstanceCacheManager 打开失败: {}",
+                        // cache-only：打开 cache_manager 失败属于致命错误（不允许回源 DB）。
+                        anyhow::bail!(
+                            "[BRAN_TUBI][cache-only] InstanceCacheManager 打开失败: cache_dir={:?}, err={}",
+                            cache_dir,
                             e
                         );
                     } else {
@@ -2401,14 +2407,20 @@ async fn gen_cata_geos_inner(
                 Default::default()
             } else if matches!(branch_mode, BranchTubiMode::CacheOnly) {
                 axis_missing_refnos_for_cache_only = missing_refnos;
-                for refno in axis_missing_refnos_for_cache_only.iter().copied() {
-                    record_branch_cache_miss(
-                        &mut cache_only_miss_refnos_by_reason,
-                        "missing_axis_map",
-                        refno,
-                    );
-                }
-                Default::default()
+                // cache-only：不允许回源 DB；miss 即表示 Prefetch 不完整，直接失败。
+                axis_missing_refnos_for_cache_only.sort_by_key(|r| r.refno());
+                const SAMPLE_LIMIT: usize = 16;
+                let sample = axis_missing_refnos_for_cache_only
+                    .iter()
+                    .take(SAMPLE_LIMIT)
+                    .map(|r| r.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "[BRAN_TUBI][cache-only] arrive/leave 缺失（不回源 DB）：missing={}, sample=[{}]",
+                    axis_missing_refnos_for_cache_only.len(),
+                    sample
+                );
             } else {
                 let refus: Vec<RefU64> = missing_refnos.iter().map(|x| x.refno()).collect();
                 aios_core::query_arrive_leave_points_of_component(&refus[..])
@@ -2434,13 +2446,25 @@ async fn gen_cata_geos_inner(
         // 批量从 transform_cache 读取 world_transform（内存缓存 + pe_transform batch fallback）。
         let t_prefetch = Instant::now();
         let all_child_refnos_vec: Vec<RefnoEnum> = all_child_refnos.iter().copied().collect();
-        let prefetch_transforms_global: HashMap<RefnoEnum, Transform> =
+        // cache-only：只读 transform_cache；非 cache-only：可走 cache-first + DB fallback。
+        let mut prefetch_targets: Vec<RefnoEnum> = all_child_refnos_vec.clone();
+        prefetch_targets.extend(branch_map.iter().map(|x| *x.key()));
+        prefetch_targets.sort_by_key(|r| r.refno());
+        prefetch_targets.dedup();
+        let prefetch_transforms_global: HashMap<RefnoEnum, Transform> = if matches!(branch_mode, BranchTubiMode::CacheOnly) {
+            crate::fast_model::transform_cache::get_world_transforms_cache_only_batch(
+                db_option.as_ref(),
+                &prefetch_targets,
+            )
+            .await?
+        } else {
             crate::fast_model::transform_cache::get_world_transforms_cache_first_batch(
                 Some(db_option.as_ref()),
-                &all_child_refnos_vec,
+                &prefetch_targets,
             )
             .await
-            .unwrap_or_default();
+            .unwrap_or_default()
+        };
         debug_model!(
             "[BRAN_TUBI] 全局预取 world_transform: count={}, elapsed={}ms",
             prefetch_transforms_global.len(),
@@ -2638,7 +2662,15 @@ async fn gen_cata_geos_inner(
             db_time_get_children += t_get_children.elapsed().as_millis();
 
             let t_get_world_transform = Instant::now();
-            let branch_transform =
+            let branch_transform = if matches!(branch_mode, BranchTubiMode::CacheOnly) {
+                // cache-only：transform 必须已在 Prefetch 阶段写入 transform_cache
+                prefetch_transforms_global.get(&branch_refno).cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[BRAN_TUBI][cache-only] 缺少 branch world_transform（transform_cache miss）: refno={}",
+                        branch_refno
+                    )
+                })?
+            } else {
                 match crate::fast_model::transform_cache::get_world_transform_cache_first(
                     Some(db_option.as_ref()),
                     branch_refno,
@@ -2674,7 +2706,8 @@ async fn gen_cata_geos_inner(
                         );
                         continue;
                     }
-                };
+                }
+            };
             db_time_get_branch_transform += t_get_world_transform.elapsed().as_millis();
 
             let branch_sesno: i32;
@@ -2689,111 +2722,51 @@ async fn gen_cata_geos_inner(
             let mut h_tubi_size: TubiSize;
 
             if matches!(branch_mode, BranchTubiMode::CacheOnly) {
-                let branch_info = cache_inst_info_map_global.get(&branch_refno);
-                if branch_info.is_none() {
-                    record_branch_cache_miss(
-                        &mut cache_only_miss_refnos_by_reason,
-                        "missing_branch_info",
-                        branch_refno,
-                    );
-                }
-                branch_sesno = branch_info.map(|x| x.sesno).unwrap_or_default();
-                bran_owner_type = branch_info
-                    .map(|x| x.owner_type.clone())
-                    .unwrap_or_default();
+                let branch_info = cache_inst_info_map_global.get(&branch_refno).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[BRAN_TUBI][cache-only] 缺少 BRAN/HANG inst_info（需要 Prefetch 写入 meta）: refno={}",
+                        branch_refno
+                    )
+                })?;
+                branch_sesno = branch_info.sesno;
+                bran_owner_type = branch_info.owner_type.clone();
                 tref = branch_refno;
 
-                let mut first_axis_world: Option<[CateAxisParam; 2]> = None;
-                let mut last_axis_world: Option<[CateAxisParam; 2]> = None;
-                for ele in children.iter() {
-                    let refno = ele.refno;
-                    let world_trans = prefetch_transforms_global
-                        .get(&refno)
-                        .cloned()
-                        .unwrap_or_default();
-                    let raw_axis = exist_al_map_global
-                        .get(&refno)
-                        .or(local_al_map.get(&refno))
-                        .or(cache_al_map_global.get(&refno));
-                    if let Some(axis) = raw_axis.map(|x| {
-                        [
-                            x[0].transformed(&world_trans),
-                            x[1].transformed(&world_trans),
-                        ]
-                    }) {
-                        if first_axis_world.is_none() {
-                            first_axis_world = Some(axis.clone());
-                        }
-                        last_axis_world = Some(axis);
-                    }
-                }
+                let meta = parse_branch_cache_meta(branch_info).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[BRAN_TUBI][cache-only] 缺少 BRAN/HANG meta（需要 Prefetch 写入 ptset_map -9101..-9104）: refno={}",
+                        branch_refno
+                    )
+                })?;
 
-                let branch_meta_from_cache = branch_info.and_then(parse_branch_cache_meta);
-                if let Some(meta) = branch_meta_from_cache {
-                    let h_world = meta.h_axis.transformed(&branch_transform);
-                    let t_world = meta.t_axis.transformed(&branch_transform);
-                    htube_pt = Vec3::from(h_world.pt.to_array());
-                    bran_ttube_pt = Vec3::from(t_world.pt.to_array());
-                    hdir = h_world
-                        .dir
-                        .as_ref()
-                        .map(|x| Vec3::new(x.x, x.y, x.z))
-                        .unwrap_or_default()
-                        .normalize_or_zero();
-                    tdir = t_world
-                        .dir
-                        .as_ref()
-                        .map(|x| Vec3::new(x.x, x.y, x.z))
-                        .unwrap_or_default()
-                        .normalize_or_zero();
-                    is_hang = meta.is_hang;
-                    branch_type_str = if is_hang {
-                        "HANG".to_string()
-                    } else {
-                        "BRAN".to_string()
-                    };
-                    h_tubi_size = meta.h_tubi_size.unwrap_or(TubiSize::None);
+                let h_world = meta.h_axis.transformed(&branch_transform);
+                let t_world = meta.t_axis.transformed(&branch_transform);
+                htube_pt = Vec3::from(h_world.pt.to_array());
+                bran_ttube_pt = Vec3::from(t_world.pt.to_array());
+                hdir = h_world
+                    .dir
+                    .as_ref()
+                    .map(|x| Vec3::new(x.x, x.y, x.z))
+                    .unwrap_or_default()
+                    .normalize_or_zero();
+                tdir = t_world
+                    .dir
+                    .as_ref()
+                    .map(|x| Vec3::new(x.x, x.y, x.z))
+                    .unwrap_or_default()
+                    .normalize_or_zero();
+                is_hang = meta.is_hang;
+                branch_type_str = if is_hang {
+                    "HANG".to_string()
                 } else {
-                    let Some(first_axis) = first_axis_world else {
-                        record_branch_cache_miss(
-                            &mut cache_only_miss_refnos_by_reason,
-                            "missing_branch_axis_start",
-                            branch_refno,
-                        );
-                        continue;
-                    };
-                    let Some(last_axis) = last_axis_world else {
-                        record_branch_cache_miss(
-                            &mut cache_only_miss_refnos_by_reason,
-                            "missing_branch_axis_end",
-                            branch_refno,
-                        );
-                        continue;
-                    };
-                    htube_pt = Vec3::from(first_axis[0].pt.to_array());
-                    hdir = first_axis[0]
-                        .dir
-                        .as_ref()
-                        .map(|x| Vec3::new(x.x, x.y, x.z))
-                        .unwrap_or_else(|| {
-                            Vec3::from(first_axis[1].pt.to_array())
-                                - Vec3::from(first_axis[0].pt.to_array())
-                        })
-                        .normalize_or_zero();
-                    bran_ttube_pt = Vec3::from(last_axis[1].pt.to_array());
-                    tdir = last_axis[1]
-                        .dir
-                        .as_ref()
-                        .map(|x| Vec3::new(x.x, x.y, x.z))
-                        .unwrap_or_else(|| {
-                            Vec3::from(last_axis[1].pt.to_array())
-                                - Vec3::from(last_axis[0].pt.to_array())
-                        })
-                        .normalize_or_zero();
-                    h_tubi_size = derive_tubi_size_from_axis_pair(&first_axis).unwrap_or(TubiSize::None);
-                    is_hang = false;
-                    branch_type_str = "BRAN".to_string();
-                }
+                    "BRAN".to_string()
+                };
+                h_tubi_size = meta
+                    .h_tubi_size
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "[BRAN_TUBI][cache-only] 缺少 BRAN/HANG tubi_size（需要 Prefetch 写入 BRANCH_META_SIZE_NO=-9103）: refno={}",
+                        branch_refno
+                    ))?;
             } else {
                 let t_get_named_attmap = Instant::now();
                 let branch_att = match aios_core::get_named_attmap(branch_refno).await {
@@ -2870,6 +2843,12 @@ async fn gen_cata_geos_inner(
             }
 
             if matches!(h_tubi_size, TubiSize::None) {
+                if matches!(branch_mode, BranchTubiMode::CacheOnly) {
+                    anyhow::bail!(
+                        "[BRAN_TUBI][cache-only] BRAN/HANG tubi_size 为空（不允许 miss）: refno={}",
+                        branch_refno
+                    );
+                }
                 record_branch_cache_miss(
                     &mut cache_only_miss_refnos_by_reason,
                     "missing_branch_tubi_size",
@@ -2898,12 +2877,10 @@ async fn gen_cata_geos_inner(
                 if matches!(branch_mode, BranchTubiMode::CacheOnly)
                     && matches!(current_tubing.tubi_size, TubiSize::None)
                 {
-                    record_branch_cache_miss(
-                        &mut cache_only_miss_refnos_by_reason,
-                        "missing_tubi_size_no_children",
-                        branch_refno,
+                    anyhow::bail!(
+                        "[BRAN_TUBI][cache-only] 无子元素且缺少 tubi_size（不允许 miss）: refno={}",
+                        branch_refno
                     );
-                    continue;
                 }
                 let dist = bran_ttube_pt.distance(current_tubing.start_pt);
                 current_tubing.arrive_refno = tref;
@@ -3515,12 +3492,10 @@ async fn gen_cata_geos_inner(
                                     derive_tubi_size_from_axis_pair(&axis_pair).unwrap_or(TubiSize::None);
                             }
                             if matches!(current_tubing.tubi_size, TubiSize::None) {
-                                record_branch_cache_miss(
-                                    &mut cache_only_miss_refnos_by_reason,
-                                    "missing_tubi_size_last_segment",
-                                    current_tubing.leave_refno,
+                                anyhow::bail!(
+                                    "[BRAN_TUBI][cache-only] 最后一段缺少 tubi_size（不允许 miss）: refno={}",
+                                    current_tubing.leave_refno
                                 );
-                                continue;
                             }
                         } else {
                             let t_lstube = Instant::now();

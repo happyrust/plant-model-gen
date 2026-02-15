@@ -1,8 +1,6 @@
-//! LOOP/PRIM 输入缓存的 key-driven 流水线（prefetch -> write -> key -> consume）。
+//! LOOP/PRIM 输入缓存的 per-refno 流水线（prefetch -> write -> refnos -> consume）。
 //!
-//! 目标（M1）：
-//! - 以 batch 为单位：预取输入 -> 写入 `geom_input_cache` -> 发送 key -> consumer 按 key 取回并消费。
-//! - Smoke test 不依赖 SurrealDB：只验证“写入 -> 发 key -> 按 key 读回”的链路。
+//! 流程：预取输入 -> 逐 refno 写入 `geom_input_cache` -> 发送 refnos 列表 -> consumer 按 refno 读回并消费。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +15,7 @@ use tokio::sync::Semaphore;
 
 use super::context::NounProcessContext;
 use crate::fast_model::foyer_cache::geom_input_cache::{
-    self, GeomInputBatch, GeomInputCacheManager, LoopInput, PrimInput,
+    self, GeomInputCacheManager, LoopInput, PrimInput,
 };
 
 fn read_bool_env(name: &str) -> bool {
@@ -38,19 +36,16 @@ fn is_opt_cmpf_neg_enabled() -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReadyBatchKey {
     pub dbnum: u32,
-    pub batch_id: String,
 }
 
 #[derive(Clone, Debug)]
 struct ReadyBatchTask {
     key: ReadyBatchKey,
-    // 用于指标统计与 missing 报错上下文。
+    /// 本批次写入的 refnos（消费者按这些 refno 从 cache 逐条读取）。
     refnos: Vec<RefnoEnum>,
 }
 
 const DEFAULT_IN_FLIGHT_WRITES: usize = 4;
-
-static BATCH_ID_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct PipelineStats {
@@ -76,17 +71,6 @@ fn log_pipeline_stats(kind: &str, stats: &PipelineStats) {
         "[input_cache_pipeline][{}] prefetch_count={}, cache_hit_rate={:.2}%, cache_miss_hard_fail={}, duplicate_prefetch_count={}",
         kind, prefetch_count, cache_hit_rate, cache_miss_hard_fail, duplicate_prefetch_count
     );
-}
-
-fn make_batch_id(dbnum: u32) -> String {
-    // 约定：batch_id 末尾为纯数字，便于 geom_input_cache 的 index counter 解析 max_seq。
-    let t_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    let seq = BATCH_ID_SEQ.fetch_add(1, Ordering::Relaxed) % 1000;
-    format!("gi_{}_{}", dbnum, t_ms.saturating_mul(1000).saturating_add(seq))
-}
-
-fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
 }
 
 fn group_refnos_by_dbnum(refnos: &[RefnoEnum]) -> anyhow::Result<HashMap<u32, Vec<RefnoEnum>>> {
@@ -690,31 +674,41 @@ async fn consume_batches_loop(
     stats: Arc<PipelineStats>,
 ) -> anyhow::Result<()> {
     while let Ok(task) = rx.recv_async().await {
-        let batch_opt = cache.get(task.key.dbnum, &task.key.batch_id).await;
-        if let Some(batch) = batch_opt {
-            stats
-                .cache_hit_count
-                .fetch_add(batch.loop_inputs.len() as u64, Ordering::Relaxed);
-            if !crate::fast_model::loop_model::gen_loop_geos_from_inputs(
-                ctx.db_option.clone(),
-                batch.loop_inputs,
-                loop_sjus_map_arc.clone(),
-                sender.clone(),
-            )
-            .await?
-            {
-                anyhow::bail!("gen_loop_geos_from_inputs failed");
+        let dbnum = task.key.dbnum;
+        let mut loop_inputs: HashMap<RefnoEnum, LoopInput> = HashMap::new();
+        let mut miss_count = 0u64;
+        for &refno in &task.refnos {
+            if let Some(input) = cache.get_loop_input(dbnum, refno).await {
+                loop_inputs.insert(refno, input);
+            } else {
+                miss_count += 1;
             }
-        } else {
+        }
+        if loop_inputs.is_empty() && !task.refnos.is_empty() {
             stats
                 .cache_miss_hard_fail
                 .fetch_add(task.refnos.len() as u64, Ordering::Relaxed);
             anyhow::bail!(
-                "[input_cache_pipeline] loop batch missing (strict cache mode): dbnum={}, batch_id={}, refnos={}",
-                task.key.dbnum,
-                task.key.batch_id,
+                "[input_cache_pipeline] loop inputs all missing (strict cache mode): dbnum={}, refnos={}",
+                dbnum,
                 task.refnos.len()
             );
+        }
+        if miss_count > 0 {
+            stats.cache_miss_hard_fail.fetch_add(miss_count, Ordering::Relaxed);
+        }
+        stats
+            .cache_hit_count
+            .fetch_add(loop_inputs.len() as u64, Ordering::Relaxed);
+        if !crate::fast_model::loop_model::gen_loop_geos_from_inputs(
+            ctx.db_option.clone(),
+            loop_inputs,
+            loop_sjus_map_arc.clone(),
+            sender.clone(),
+        )
+        .await?
+        {
+            anyhow::bail!("gen_loop_geos_from_inputs failed");
         }
     }
     Ok(())
@@ -728,30 +722,40 @@ async fn consume_batches_prim(
     stats: Arc<PipelineStats>,
 ) -> anyhow::Result<()> {
     while let Ok(task) = rx.recv_async().await {
-        let batch_opt = cache.get(task.key.dbnum, &task.key.batch_id).await;
-        if let Some(batch) = batch_opt {
-            stats
-                .cache_hit_count
-                .fetch_add(batch.prim_inputs.len() as u64, Ordering::Relaxed);
-            if !crate::fast_model::prim_model::gen_prim_geos_from_inputs(
-                ctx.db_option.clone(),
-                batch.prim_inputs,
-                sender.clone(),
-            )
-            .await?
-            {
-                anyhow::bail!("gen_prim_geos_from_inputs failed");
+        let dbnum = task.key.dbnum;
+        let mut prim_inputs: HashMap<RefnoEnum, PrimInput> = HashMap::new();
+        let mut miss_count = 0u64;
+        for &refno in &task.refnos {
+            if let Some(input) = cache.get_prim_input(dbnum, refno).await {
+                prim_inputs.insert(refno, input);
+            } else {
+                miss_count += 1;
             }
-        } else {
+        }
+        if prim_inputs.is_empty() && !task.refnos.is_empty() {
             stats
                 .cache_miss_hard_fail
                 .fetch_add(task.refnos.len() as u64, Ordering::Relaxed);
             anyhow::bail!(
-                "[input_cache_pipeline] prim batch missing (strict cache mode): dbnum={}, batch_id={}, refnos={}",
-                task.key.dbnum,
-                task.key.batch_id,
+                "[input_cache_pipeline] prim inputs all missing (strict cache mode): dbnum={}, refnos={}",
+                dbnum,
                 task.refnos.len()
             );
+        }
+        if miss_count > 0 {
+            stats.cache_miss_hard_fail.fetch_add(miss_count, Ordering::Relaxed);
+        }
+        stats
+            .cache_hit_count
+            .fetch_add(prim_inputs.len() as u64, Ordering::Relaxed);
+        if !crate::fast_model::prim_model::gen_prim_geos_from_inputs(
+            ctx.db_option.clone(),
+            prim_inputs,
+            sender.clone(),
+        )
+        .await?
+        {
+            anyhow::bail!("gen_prim_geos_from_inputs failed");
         }
     }
     Ok(())
@@ -817,17 +821,13 @@ pub async fn run_loop_pipeline_from_refnos(
                 stats
                     .prefetch_count
                     .fetch_add(inputs.len() as u64, Ordering::Relaxed);
-                let batch_id = make_batch_id(dbnum);
-                cache.insert_batch(GeomInputBatch {
-                    dbnum,
-                    batch_id: batch_id.clone(),
-                    created_at: now_ms(),
-                    loop_inputs: inputs,
-                    prim_inputs: HashMap::new(),
-                });
+                // per-refno 写入
+                for (refno, input) in &inputs {
+                    cache.insert_loop_input(dbnum, *refno, input);
+                }
 
                 tx.send(ReadyBatchTask {
-                    key: ReadyBatchKey { dbnum, batch_id },
+                    key: ReadyBatchKey { dbnum },
                     refnos: refnos_vec,
                 })
                 .map_err(|e| anyhow::anyhow!("send ReadyBatchTask failed: {}", e))?;
@@ -900,17 +900,13 @@ pub async fn run_prim_pipeline_from_refnos(
                 stats
                     .prefetch_count
                     .fetch_add(inputs.len() as u64, Ordering::Relaxed);
-                let batch_id = make_batch_id(dbnum);
-                cache.insert_batch(GeomInputBatch {
-                    dbnum,
-                    batch_id: batch_id.clone(),
-                    created_at: now_ms(),
-                    loop_inputs: HashMap::new(),
-                    prim_inputs: inputs,
-                });
+                // per-refno 写入
+                for (refno, input) in &inputs {
+                    cache.insert_prim_input(dbnum, *refno, input);
+                }
 
                 tx.send(ReadyBatchTask {
-                    key: ReadyBatchKey { dbnum, batch_id },
+                    key: ReadyBatchKey { dbnum },
                     refnos: refnos_vec,
                 })
                 .map_err(|e| anyhow::anyhow!("send ReadyBatchTask failed: {}", e))?;
@@ -937,71 +933,52 @@ pub async fn run_prim_pipeline_from_refnos(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
-
-    async fn consume_keys_from_cache(
-        cache: &GeomInputCacheManager,
-        rx: flume::Receiver<ReadyBatchKey>,
-    ) -> anyhow::Result<Vec<GeomInputBatch>> {
-        let mut got = Vec::new();
-        while let Ok(key) = rx.recv_async().await {
-            let batch = cache
-                .get(key.dbnum, &key.batch_id)
-                .await
-                .ok_or_else(|| anyhow::anyhow!("batch missing: dbnum={}, batch_id={}", key.dbnum, key.batch_id))?;
-            got.push(batch);
-        }
-        Ok(got)
-    }
+    use geom_input_cache::CateInput;
 
     #[tokio::test]
-    async fn test_pipeline_key_driven_consume_smoke() {
-        // NOTE: 这里不调用真实 fetch_*；只验证“写入->发 key->按 key 读回”的链路。
-        // 期望：consumer 收到 2 个 key，并能从 cache get 到对应 batch。
+    async fn test_pipeline_per_refno_roundtrip_smoke() {
+        // 验证 per-refno 写入 -> ReadyBatchTask 传递 refnos -> per-refno 读回 的链路。
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
         let cache = GeomInputCacheManager::new(dir.path()).await.unwrap();
 
-        let (tx, rx) = flume::unbounded::<ReadyBatchKey>();
+        let r1: RefnoEnum = "100/200".into();
+        let r2: RefnoEnum = "100/201".into();
+        let dbnum = 1u32;
 
-        // 两个 batch：只要能 roundtrip 即可，不构造真实输入。
-        let b1_id = "gi_1_100".to_string();
-        cache.insert_batch(GeomInputBatch {
-            dbnum: 1,
-            batch_id: b1_id.clone(),
-            created_at: 1,
-            loop_inputs: HashMap::new(),
-            prim_inputs: HashMap::new(),
-        });
-        tx.send(ReadyBatchKey {
-            dbnum: 1,
-            batch_id: b1_id.clone(),
-        })
-        .unwrap();
+        // 写入两个 cate input（最轻量的类型，用于 smoke test）
+        let cate1 = CateInput {
+            refno: r1,
+            attmap: aios_core::NamedAttrMap::default(),
+            world_transform: Default::default(),
+            owner_refno: None,
+            owner_type: String::new(),
+            visible: true,
+            neg_refnos: vec![],
+            cmpf_neg_refnos: vec![],
+        };
+        let cate2 = CateInput {
+            refno: r2,
+            attmap: aios_core::NamedAttrMap::default(),
+            world_transform: Default::default(),
+            owner_refno: None,
+            owner_type: String::new(),
+            visible: true,
+            neg_refnos: vec![],
+            cmpf_neg_refnos: vec![],
+        };
+        cache.insert_cate_input(dbnum, r1, &cate1);
+        cache.insert_cate_input(dbnum, r2, &cate2);
 
-        let b2_id = "gi_1_101".to_string();
-        cache.insert_batch(GeomInputBatch {
-            dbnum: 1,
-            batch_id: b2_id.clone(),
-            created_at: 2,
-            loop_inputs: HashMap::new(),
-            prim_inputs: HashMap::new(),
-        });
-        tx.send(ReadyBatchKey {
-            dbnum: 1,
-            batch_id: b2_id.clone(),
-        })
-        .unwrap();
+        // 模拟 consumer 侧 per-refno 读回
+        let got1 = cache.get_cate_input(dbnum, r1).await;
+        let got2 = cache.get_cate_input(dbnum, r2).await;
+        assert!(got1.is_some(), "r1 must be present");
+        assert!(got2.is_some(), "r2 must be present");
+        assert_eq!(got1.unwrap().refno, r1);
+        assert_eq!(got2.unwrap().refno, r2);
 
-        drop(tx);
-
-        let got = consume_keys_from_cache(&cache, rx).await.unwrap();
         cache.close().await.unwrap();
-
-        assert_eq!(got.len(), 2);
-        let ids: HashSet<String> = got.into_iter().map(|b| b.batch_id).collect();
-        assert!(ids.contains(&b1_id));
-        assert!(ids.contains(&b2_id));
     }
 }

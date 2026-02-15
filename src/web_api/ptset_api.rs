@@ -228,41 +228,22 @@ async fn try_get_ptset_from_cache(
         .unwrap_or_else(|| PathBuf::from("output/instance_cache"));
 
     let cache = InstanceCacheManager::new(&cache_dir).await?;
-    let mut batch_ids = cache.list_batches(dbnum);
-    if batch_ids.is_empty() {
-        return Ok(None);
-    }
 
-    // snapshot 语义：截至该 batch 的最新视图
-    let snapshot_batch_id = if let Some(b) = batch_id {
-        b.to_string()
-    } else {
-        batch_ids
-            .last()
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string())
+    // per-refno 存储：直接按 refno 读取，无需 batch 遍历。
+    // batch_id 参数在 per-refno 模式下不再有意义（每个 refno 只有一条记录），保留签名兼容。
+    let snapshot_id = batch_id
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| "latest".to_string());
+
+    let Some(cached) = cache.get_inst_info(dbnum, refno).await else {
+        return Ok(None);
     };
 
-    // 若提供 batch_id，则仅扫描“<= batch_id”的批次；否则扫描全部。
-    if let Some(b) = batch_id {
-        if let Some(pos) = batch_ids.iter().position(|x| x == b) {
-            batch_ids.truncate(pos + 1);
-        }
-    }
+    let mut points: Vec<PtsetPoint> = cached.info.ptset_map.values().map(PtsetPoint::from).collect();
+    points.sort_by_key(|p| p.number);
 
-    // 反向扫描：以“最新覆盖旧”的方式命中（与 instances 导出 merge 行为一致）
-    for bid in batch_ids.iter().rev() {
-        let Some(batch) = cache.get(dbnum, bid).await else { continue };
-        let Some(info) = batch.inst_info_map.get(&refno) else { continue };
+    let m = cached.info.get_ele_world_transform().to_matrix().to_cols_array();
+    let world_transform: Vec<f64> = m.iter().map(|v| *v as f64).collect();
 
-        let mut points: Vec<PtsetPoint> = info.ptset_map.values().map(PtsetPoint::from).collect();
-        points.sort_by_key(|p| p.number);
-
-        let m = info.get_ele_world_transform().to_matrix().to_cols_array();
-        let world_transform: Vec<f64> = m.iter().map(|v| *v as f64).collect();
-
-        return Ok(Some((points, world_transform, snapshot_batch_id)));
-    }
-
-    Ok(None)
+    Ok(Some((points, world_transform, snapshot_id)))
 }

@@ -10,7 +10,7 @@ use aios_core::pe::SPdmsElement;
 use aios_core::{DBType, query_mdb_db_nums};
 use dashmap::DashMap;
 use glam::Vec3;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,21 +20,27 @@ use tokio::sync::RwLock;
 use super::cate_processor::process_cate_refno_page;
 use super::categorized_refnos::CategorizedRefnos;
 use super::config::FullNounConfig;
-use super::context::NounProcessContext;
+use super::context::{GenStage, NounProcessContext};
 use super::errors::{FullNounError, Result};
 use super::cata_resolve_cache_pipeline;
-use super::input_cache_pipeline;
 use super::loop_processor::process_loop_refno_page;
 use super::prim_processor::process_prim_refno_page;
 use super::tree_index_manager::TreeIndexManager;
 use super::utilities::build_cata_hash_map_from_tree;
 use crate::data_interface::db_meta;
 use crate::fast_model::foyer_cache::geom_input_cache;
+use crate::fast_model::foyer_cache::cata_resolve_cache;
+use crate::fast_model::instance_cache::InstanceCacheManager;
+use crate::fast_model::transform_cache;
 
 use crate::fast_model::refno_errors::{
     REFNO_ERROR_STORE, RefnoErrorKind, RefnoErrorStage, record_refno_error,
 };
 use crate::fast_model::{cata_model, pdms_inst, query_provider};
+use aios_core::geometry::EleGeosInfo;
+use aios_core::parsed_data::CateAxisParam;
+use aios_core::prim_geo::tubing::TubiSize;
+use aios_core::shape::pdms_shape::RsVec3;
 
 // Performance profiling support
 #[cfg(feature = "profile")]
@@ -59,13 +65,6 @@ pub fn validate_sjus_map(
         }
     }
     Ok(())
-}
-
-fn should_use_geom_input_cache_pipeline(ctx: &NounProcessContext) -> bool {
-    matches!(
-        ctx.cache_run_mode,
-        geom_input_cache::CacheRunMode::PrefetchThenGenerate
-    )
 }
 
 fn track_refno_issues(refnos: &[RefnoEnum], context: &str, stage: RefnoErrorStage) {
@@ -239,51 +238,18 @@ async fn process_single_noun_type(
 
         match category {
             NounCategoryType::Loop => {
-                if should_use_geom_input_cache_pipeline(ctx) {
-                    input_cache_pipeline::run_loop_pipeline_from_refnos(
-                        ctx,
-                        loop_sjus_map.clone(),
-                        sender.clone(),
-                        slice,
-                    )
+                process_loop_refno_page(ctx, loop_sjus_map.clone(), sender.clone(), slice)
                     .await
                     .map_err(|e| {
-                        FullNounError::GeometryGenerationFailed(
-                            format!("loop:{} [cache-mode]", noun),
-                            e.to_string(),
-                        )
+                        FullNounError::GeometryGenerationFailed(format!("loop:{}", noun), e.to_string())
                     })?;
-                } else {
-                    process_loop_refno_page(ctx, loop_sjus_map.clone(), sender.clone(), slice)
-                        .await
-                        .map_err(|e| {
-                            FullNounError::GeometryGenerationFailed(
-                                format!("loop:{}", noun),
-                                e.to_string(),
-                            )
-                        })?;
-                }
             }
             NounCategoryType::Prim => {
-                if should_use_geom_input_cache_pipeline(ctx) {
-                    input_cache_pipeline::run_prim_pipeline_from_refnos(ctx, sender.clone(), slice)
-                        .await
-                        .map_err(|e| {
-                            FullNounError::GeometryGenerationFailed(
-                                format!("prim:{} [cache-mode]", noun),
-                                e.to_string(),
-                            )
-                        })?;
-                } else {
-                    process_prim_refno_page(ctx, sender.clone(), slice)
-                        .await
-                        .map_err(|e| {
-                            FullNounError::GeometryGenerationFailed(
-                                format!("prim:{}", noun),
-                                e.to_string(),
-                            )
-                        })?;
-                }
+                process_prim_refno_page(ctx, sender.clone(), slice)
+                    .await
+                    .map_err(|e| {
+                        FullNounError::GeometryGenerationFailed(format!("prim:{}", noun), e.to_string())
+                    })?;
             }
             NounCategoryType::Cate => {
                 process_cate_refno_page(ctx, loop_sjus_map.clone(), sender.clone(), slice)
@@ -356,9 +322,21 @@ pub async fn gen_full_noun_geos_optimized(
 
         bran_roots_vec = bran_hanger_roots.into_iter().collect();
         if !bran_roots_vec.is_empty() {
+            // BRAN/HANG 阶段也遵循“两阶段（Prefetch -> Generate）”语义：
+            // - PrefetchThenGenerate：先填充缓存，再进入离线 Generate
+            // - CacheOnly：不预取，直接离线 Generate（若缓存不全应直接失败）
+            let ctx_bran_prefetch = NounProcessContext::new(
+                db_option.clone(),
+                config.batch_size.get(),
+                config.concurrency.get(),
+            )
+            .with_stage(GenStage::Prefetch);
+            let ctx_bran_generate = ctx_bran_prefetch.with_stage(GenStage::Generate);
+
             let bran_start = Instant::now();
             process_bran_hang_core_logic(
-                &db_option,
+                &ctx_bran_prefetch,
+                &ctx_bran_generate,
                 &bran_roots_vec,
                 loop_sjus_map_arc.clone(),
                 sender.clone(),
@@ -419,15 +397,39 @@ pub async fn gen_full_noun_geos_optimized(
             cate_refnos.len()
         );
 
-        let ctx = NounProcessContext::new(
+        let ctx_prefetch = NounProcessContext::new(
             db_option.clone(),
             config.batch_size.get(),
             config.concurrency.get(),
-        );
+        )
+        .with_stage(GenStage::Prefetch);
 
         // LOOP
         let mut loop_vec: Vec<RefnoEnum> = loop_refnos.into_iter().collect();
         loop_vec.sort_by_key(|r| r.to_string());
+
+        // PrefetchThenGenerate：先把 LOOP/PRIM 输入写入 geom_input_cache（BRAN-only 也适用）
+        if matches!(
+            ctx_prefetch.cache_run_mode,
+            geom_input_cache::CacheRunMode::PrefetchThenGenerate
+        ) {
+            let prim_refnos_for_prefetch: Vec<RefnoEnum> = prim_refnos.iter().copied().collect();
+            println!(
+                "[BRAN-only][Prefetch] 预取 LOOP/PRIM 输入到 geom_input_cache: loop_refnos={}, prim_refnos={}",
+                loop_vec.len(),
+                prim_refnos_for_prefetch.len()
+            );
+            geom_input_cache::init_global_geom_input_cache(ctx_prefetch.db_option.as_ref())
+                .await?;
+            let _ = geom_input_cache::prefetch_all_geom_inputs(
+                ctx_prefetch.db_option.as_ref(),
+                &loop_vec,
+                &prim_refnos_for_prefetch,
+            )
+            .await?;
+        }
+
+        let ctx = ctx_prefetch.with_stage(GenStage::Generate);
         for (i, chunk) in loop_vec.chunks(ctx.batch_size.max(1)).enumerate() {
             println!(
                 "[BRAN-only][LOOP] 分页 {}/{} ({} ~ {})",
@@ -436,24 +438,7 @@ pub async fn gen_full_noun_geos_optimized(
                 i * ctx.batch_size.max(1) + 1,
                 (i * ctx.batch_size.max(1) + chunk.len())
             );
-            if should_use_geom_input_cache_pipeline(&ctx) {
-                input_cache_pipeline::run_loop_pipeline_from_refnos(
-                    &ctx,
-                    loop_sjus_map_arc.clone(),
-                    sender.clone(),
-                    chunk,
-                )
-                .await
-                .map_err(|e| {
-                    FullNounError::GeometryGenerationFailed(
-                        "BRAN-only LOOP [cache-mode]".to_string(),
-                        e.to_string(),
-                    )
-                })?;
-            } else {
-                process_loop_refno_page(&ctx, loop_sjus_map_arc.clone(), sender.clone(), chunk)
-                    .await?;
-            }
+            process_loop_refno_page(&ctx, loop_sjus_map_arc.clone(), sender.clone(), chunk).await?;
         }
         for r in &loop_vec {
             categorized.insert(*r, super::models::NounCategory::LoopOwner);
@@ -470,18 +455,7 @@ pub async fn gen_full_noun_geos_optimized(
                 i * ctx.batch_size.max(1) + 1,
                 (i * ctx.batch_size.max(1) + chunk.len())
             );
-            if should_use_geom_input_cache_pipeline(&ctx) {
-                input_cache_pipeline::run_prim_pipeline_from_refnos(&ctx, sender.clone(), chunk)
-                    .await
-                    .map_err(|e| {
-                        FullNounError::GeometryGenerationFailed(
-                            "BRAN-only PRIM [cache-mode]".to_string(),
-                            e.to_string(),
-                        )
-                    })?;
-            } else {
-                process_prim_refno_page(&ctx, sender.clone(), chunk).await?;
-            }
+            process_prim_refno_page(&ctx, sender.clone(), chunk).await?;
         }
         for r in &prim_vec {
             categorized.insert(*r, super::models::NounCategory::Prim);
@@ -566,17 +540,117 @@ pub async fn gen_full_noun_geos_optimized(
             collect_all_descendants(&roots_vec, &mut loop_refnos, &mut prim_refnos, &mut cate_refnos)
                 .await?;
 
-            let ctx = NounProcessContext::new(
+            // 两阶段（Prefetch -> Generate）：
+            // - PrefetchThenGenerate：先把 LOOP/PRIM 输入预取到 geom_input_cache，再进入纯离线生成阶段消费缓存
+            // - CacheOnly：不做预取，直接进入离线生成阶段（只读 cache，miss 按策略跳过并记录）
+            let ctx_prefetch = NounProcessContext::new(
                 db_option.clone(),
                 config.batch_size.get(),
                 config.concurrency.get(),
-            );
+            )
+            .with_stage(GenStage::Prefetch);
 
-            if should_use_geom_input_cache_pipeline(&ctx) {
+            if matches!(
+                ctx_prefetch.cache_run_mode,
+                geom_input_cache::CacheRunMode::PrefetchThenGenerate
+            ) {
+                let loop_vec: Vec<RefnoEnum> = loop_refnos.iter().copied().collect();
+                let prim_vec: Vec<RefnoEnum> = prim_refnos.iter().copied().collect();
+                let cate_vec: Vec<RefnoEnum> = cate_refnos.iter().copied().collect();
                 println!(
-                    "[Pipeline] 使用 cache pipeline：跳过 prefetch_all_geom_inputs，避免双重预取"
+                    "[Pipeline] PrefetchThenGenerate: 开始预取 LOOP/PRIM/CATE 输入到 geom_input_cache (loop_refnos={}, prim_refnos={}, cate_refnos={})",
+                    loop_vec.len(),
+                    prim_vec.len(),
+                    cate_vec.len()
+                );
+
+                // 全局 geom_input_cache 已在 orchestrator 初始化；这里再 init 一次保证 Full Noun 直调也可用。
+                geom_input_cache::init_global_geom_input_cache(ctx_prefetch.db_option.as_ref())
+                    .await?;
+                let _ = geom_input_cache::prefetch_all_geom_inputs_v2(
+                    ctx_prefetch.db_option.as_ref(),
+                    &loop_vec,
+                    &prim_vec,
+                    &cate_vec,
+                )
+                .await?;
+
+                // CATE prepared geos/ptset：预热 cata_resolve_cache（按 cata_hash）
+                let mut target_cata_map_for_validate: Option<Arc<DashMap<String, aios_core::pdms_types::CataHashRefnoKV>>> = None;
+                if !cate_vec.is_empty() {
+                    println!(
+                        "[Pipeline] PrefetchThenGenerate: 开始预热 cata_resolve_cache (cate_refnos={})",
+                        cate_vec.len()
+                    );
+                    // PrefetchThenGenerate：此处必须严格成功。离线 Generate 不允许回查 DB；miss 视为流程不正确。
+                    let target_cata_map = Arc::new(build_cata_hash_map_from_tree(&cate_vec).await?);
+                    target_cata_map_for_validate = Some(target_cata_map.clone());
+                    if !target_cata_map.is_empty() {
+                        let outcome = cata_resolve_cache_pipeline::prefetch_cata_resolve_cache_for_target_map(
+                            ctx_prefetch.db_option.clone(),
+                            target_cata_map,
+                        )
+                        .await?;
+                        if outcome.failed > 0 {
+                            return Err(anyhow::anyhow!(
+                                "cata_resolve_cache 预热失败：failed_groups={}（离线生成不允许 miss）",
+                                outcome.failed
+                            )
+                            .into());
+                        }
+                    }
+                }
+
+                // PrefetchThenGenerate：预取完成后进行完整性校验；不通过则不进入离线生成阶段。
+                geom_input_cache::ensure_geom_inputs_present_for_refnos_from_global(
+                    &loop_vec,
+                    &prim_vec,
+                    &cate_vec,
+                )
+                .await
+                .map_err(FullNounError::from)?;
+
+                if let Some(target_cata_map) = target_cata_map_for_validate {
+                    if !target_cata_map.is_empty() {
+                        let cache_dir = ctx_prefetch.db_option.get_foyer_cache_dir().join("cata_resolve_cache");
+                        cata_resolve_cache::init_global_cata_resolve_cache(cache_dir).await?;
+                        let Some(resolve_cache) = cata_resolve_cache::global_cata_resolve_cache() else {
+                            return Err(anyhow::anyhow!("global_cata_resolve_cache 未初始化").into());
+                        };
+
+                        // 校验每个 cata_hash 是否已命中缓存；缺失直接失败（给出样例 key）。
+                        const SAMPLE_LIMIT: usize = 16;
+                        let mut missing_keys: Vec<String> = Vec::new();
+                        for kv in target_cata_map.iter() {
+                            let key = kv.key().clone();
+                            drop(kv);
+                            if resolve_cache.get(&key).await.is_none() {
+                                missing_keys.push(key);
+                            }
+                        }
+                        if !missing_keys.is_empty() {
+                            let sample = missing_keys
+                                .iter()
+                                .take(SAMPLE_LIMIT)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            return Err(anyhow::anyhow!(
+                                "cata_resolve_cache 不完整：missing_keys={}, sample=[{}]（请先完成 Prefetch 预热）",
+                                missing_keys.len(),
+                                sample
+                            )
+                            .into());
+                        }
+                    }
+                }
+                println!(
+                    "[Pipeline] PrefetchThenGenerate: 预取完成，进入离线生成阶段 (stage={})",
+                    GenStage::Generate.as_str()
                 );
             }
+
+            let ctx = ctx_prefetch.with_stage(GenStage::Generate);
 
             // [1-3/4] 处理 LOOP, PRIM, CATE
             let (loop_vec, loop_dur) = process_loop_stage(
@@ -626,7 +700,8 @@ pub async fn gen_full_noun_geos_optimized(
 /// 内部核心逻辑：处理 BRAN/HANG 相关的 CATE 生成及 Tubing
 #[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "bran_hang_core_logic"))]
 async fn process_bran_hang_core_logic(
-    db_option: &Arc<DbOptionExt>,
+    ctx_prefetch: &NounProcessContext,
+    ctx_generate: &NounProcessContext,
     bran_roots: &[RefnoEnum],
     loop_sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
     sender: flume::Sender<ShapeInstancesData>,
@@ -635,6 +710,7 @@ async fn process_bran_hang_core_logic(
     if bran_roots.is_empty() {
         return Ok(());
     }
+    let db_option = &ctx_prefetch.db_option;
     let phase_total = Instant::now();
     println!("📍 优先处理 BRAN/HANG 及其依赖 (count={})...", bran_roots.len());
 
@@ -674,9 +750,25 @@ async fn process_bran_hang_core_logic(
     let target_bran_reuse_cata_map = if child_refnos.is_empty() {
         DashMap::new()
     } else {
-        build_cata_hash_map_from_tree(&child_refnos)
-            .await
-            .unwrap_or_default()
+        match build_cata_hash_map_from_tree(&child_refnos).await {
+            Ok(m) => m,
+            Err(e) => {
+                // 离线 Generate 阶段不允许缺失 tree/db_meta（否则无法按 cata_hash 分组消费缓存）。
+                if ctx_generate.is_offline_generate()
+                    || matches!(
+                        ctx_prefetch.cache_run_mode,
+                        geom_input_cache::CacheRunMode::PrefetchThenGenerate
+                    )
+                {
+                    return Err(e.into());
+                }
+                eprintln!(
+                    "[BRAN/HANG] build_cata_hash_map_from_tree 失败（Direct 路径将跳过 CATE 生成）: {}",
+                    e
+                );
+                DashMap::new()
+            }
+        }
     };
     let unique_cata_cnt = target_bran_reuse_cata_map.len();
     let target_bran_reuse_cata_map = Arc::new(target_bran_reuse_cata_map);
@@ -688,46 +780,69 @@ async fn process_bran_hang_core_logic(
         t2_ms, child_refnos.len(), unique_cata_cnt
     );
 
-    // ── 阶段 3: prefetch cata_resolve_cache ──
+    // ── 阶段 3: Prefetch（仅 PrefetchThenGenerate） ──
     let t3 = Instant::now();
     #[cfg(feature = "profile")]
-    let _span3 = tracing::info_span!("bran_prefetch_cata_resolve_cache").entered();
-    if cata_resolve_cache_pipeline::is_cata_resolve_cache_prefetch_enabled() {
-        if let Err(e) = cata_resolve_cache_pipeline::prefetch_cata_resolve_cache_for_target_map(
-            db_option.clone(),
+    let _span3 = tracing::info_span!("bran_prefetch_offline_inputs").entered();
+    if matches!(
+        ctx_prefetch.cache_run_mode,
+        geom_input_cache::CacheRunMode::PrefetchThenGenerate
+    ) {
+        prefetch_bran_hang_inputs_for_offline_generate(
+            ctx_prefetch,
+            bran_roots,
+            &child_refnos,
             target_bran_reuse_cata_map.clone(),
         )
-        .await
-        {
-            eprintln!(
-                "[full_noun_mode] cata_resolve_cache prefetch 失败（将继续走正常生成流程）: {}",
-                e
-            );
-        }
+        .await?;
     }
     #[cfg(feature = "profile")]
     drop(_span3);
     let t3_ms = t3.elapsed().as_millis();
-    println!("  [BRAN perf] 阶段3 prefetch_cata_resolve_cache: {} ms", t3_ms);
+    println!("  [BRAN perf] 阶段3 prefetch_offline_inputs: {} ms", t3_ms);
 
-    // ── 阶段 4: 生成 CATE 几何 ──
+    // ── 阶段 4: 生成 CATE 几何（Generate 阶段；离线时只读缓存） ──
     let t4 = Instant::now();
     #[cfg(feature = "profile")]
-    let _span4 = tracing::info_span!("bran_gen_cata_instances").entered();
-    let cate_outcome = match cata_model::gen_cata_instances(
-        db_option.clone(),
-        target_bran_reuse_cata_map,
-        loop_sjus_map_arc.clone(),
-        sender.clone(),
-    )
-    .await
-    {
-        Ok(outcome) => Some(outcome),
-        Err(e) => {
-            eprintln!("[Pipeline] CATE 几何生成失败，将跳过 CATE：{e}");
-            None
+    let _span4 = tracing::info_span!("bran_generate_cate").entered();
+
+    let mut cate_outcome = None;
+    if !child_refnos.is_empty() {
+        if ctx_generate.is_offline_generate() {
+            // 离线 Generate：严格只读缓存（geom_input_cache + cata_resolve_cache）。
+            let ranges = ctx_generate.bounded_chunks(child_refnos.len());
+            for (i, (s, e)) in ranges.into_iter().enumerate() {
+                let slice = &child_refnos[s..e];
+                println!(
+                    "  [BRAN][CATE][offline] 分页 {}/{} ({} ~ {})",
+                    i + 1,
+                    (child_refnos.len() + ctx_generate.batch_size.max(1) - 1)
+                        / ctx_generate.batch_size.max(1),
+                    s + 1,
+                    e
+                );
+                process_cate_refno_page(
+                    ctx_generate,
+                    loop_sjus_map_arc.clone(),
+                    sender.clone(),
+                    slice,
+                )
+                .await?;
+            }
+        } else {
+            // Direct：复用旧逻辑（允许 DB 查询与 local_al_map/tubi_info 收集）
+            cate_outcome = Some(
+                cata_model::gen_cata_instances(
+                    db_option.clone(),
+                    target_bran_reuse_cata_map.clone(),
+                    loop_sjus_map_arc.clone(),
+                    sender.clone(),
+                )
+                .await?,
+            );
         }
-    };
+    }
+
     #[cfg(feature = "profile")]
     drop(_span4);
     let t4_ms = t4.elapsed().as_millis();
@@ -740,36 +855,51 @@ async fn process_bran_hang_core_logic(
             println!("    [BRAN perf]   cata_time.{}: {} ms", k, v);
         }
     } else {
-        println!("  [BRAN perf] 阶段4 gen_cata_instances: {} ms (FAILED)", t4_ms);
+        println!("  [BRAN perf] 阶段4 gen_cata_instances: {} ms (offline_or_skipped)", t4_ms);
     }
 
-    // ── 阶段 5: 保存 tubi_info ──
+    // ── 阶段 5: 保存 tubi_info（仅 Direct 且 use_surrealdb=true） ──
     let t5 = Instant::now();
     #[cfg(feature = "profile")]
     let _span5 = tracing::info_span!("bran_save_tubi_info").entered();
-    if let Some(ref outcome) = cate_outcome {
-        let _ = pdms_inst::save_tubi_info_batch(&outcome.tubi_info_map).await;
+    if db_option.use_surrealdb {
+        if let Some(ref outcome) = cate_outcome {
+            let _ = pdms_inst::save_tubi_info_batch(&outcome.tubi_info_map).await;
+        }
     }
     #[cfg(feature = "profile")]
     drop(_span5);
     let t5_ms = t5.elapsed().as_millis();
     println!("  [BRAN perf] 阶段5 save_tubi_info: {} ms", t5_ms);
 
-    // ── 阶段 6: 生成 Tubing ──
+    // ── 阶段 6: 生成 Tubing（Generate 阶段；离线时 cache-only） ──
     let t6 = Instant::now();
     #[cfg(feature = "profile")]
     let _span6 = tracing::info_span!("bran_gen_branch_tubi").entered();
     let local_al_map = cate_outcome
-        .map(|o| o.local_al_map)
+        .as_ref()
+        .map(|o| o.local_al_map.clone())
         .unwrap_or_else(|| Arc::new(DashMap::new()));
-    let tubi_result = cata_model::gen_branch_tubi(
-        db_option.clone(),
-        Arc::new(branch_refnos_map),
-        loop_sjus_map_arc,
-        sender,
-        local_al_map,
-    )
-    .await;
+
+    let tubi_result = if ctx_generate.is_offline_generate() {
+        cata_model::gen_branch_tubi_cache_only(
+            db_option.clone(),
+            Arc::new(branch_refnos_map),
+            loop_sjus_map_arc,
+            sender,
+            local_al_map,
+        )
+        .await
+    } else {
+        cata_model::gen_branch_tubi_from_db(
+            db_option.clone(),
+            Arc::new(branch_refnos_map),
+            loop_sjus_map_arc,
+            sender,
+            local_al_map,
+        )
+        .await
+    };
     #[cfg(feature = "profile")]
     drop(_span6);
     let t6_ms = t6.elapsed().as_millis();
@@ -782,7 +912,11 @@ async fn process_bran_hang_core_logic(
             println!("    [BRAN perf]   tubi_time.{}: {} ms", k, v);
         }
     } else {
-        println!("  [BRAN perf] 阶段6 gen_branch_tubi: {} ms (result={:?})", t6_ms, tubi_result.err());
+        println!(
+            "  [BRAN perf] 阶段6 gen_branch_tubi: {} ms (result={:?})",
+            t6_ms,
+            tubi_result.err()
+        );
     }
 
     // ── 汇总 ──
@@ -791,6 +925,411 @@ async fn process_bran_hang_core_logic(
         "  [BRAN perf] 总计: {} ms [collect={}ms, cata_hash={}ms, prefetch={}ms, cata_gen={}ms, tubi_info={}ms, tubi_gen={}ms]",
         total_ms, t1_ms, t2_ms, t3_ms, t4_ms, t5_ms, t6_ms
     );
+
+    Ok(())
+}
+
+fn make_meta_axis_param(
+    refno: RefnoEnum,
+    number: i32,
+    pt: Vec3,
+    dir: Option<Vec3>,
+    pbore: f32,
+    pwidth: f32,
+    pheight: f32,
+) -> CateAxisParam {
+    let dir_flag = if dir.is_some() { 1.0 } else { 0.0 };
+    CateAxisParam {
+        refno,
+        number,
+        pt: RsVec3(pt),
+        dir: dir.map(RsVec3),
+        dir_flag,
+        ref_dir: None,
+        pbore,
+        pwidth,
+        pheight,
+        pconnect: String::new(),
+    }
+}
+
+fn tubi_size_to_axis_fields(size: &TubiSize) -> (f32, f32, f32) {
+    match size {
+        TubiSize::BoreSize(b) => (*b, 0.0, 0.0),
+        TubiSize::BoxSize((h, w)) => (0.0, *w, *h),
+        _ => (0.0, 0.0, 0.0),
+    }
+}
+
+async fn insert_inst_info_into_instance_cache(
+    db_option: &DbOptionExt,
+    inst_infos: HashMap<RefnoEnum, EleGeosInfo>,
+) -> Result<()> {
+    if inst_infos.is_empty() {
+        return Ok(());
+    }
+
+    db_meta().ensure_loaded()?;
+    let cache_dir = db_option.get_foyer_cache_dir();
+    let cache_manager = InstanceCacheManager::new(&cache_dir).await?;
+
+    // 将 inst_info 按 dbnum 分桶写入 instance_cache（ref0 != dbnum）。
+    let mut per_db: HashMap<u32, ShapeInstancesData> = HashMap::new();
+    for (refno, info) in inst_infos {
+        let Some(dbnum) = db_meta().get_dbnum_by_refno(refno) else {
+            return Err(anyhow::anyhow!("缺少 ref0->dbnum 映射: refno={}", refno).into());
+        };
+        if dbnum == 0 {
+            return Err(anyhow::anyhow!("无效 dbnum=0（ref0->dbnum 映射缺失）: refno={}", refno).into());
+        }
+        per_db
+            .entry(dbnum)
+            .or_insert_with(ShapeInstancesData::default)
+            .insert_info(refno, info);
+    }
+
+    for (dbnum, shape) in per_db {
+        let _batch_id = cache_manager.insert_from_shape(dbnum, &shape);
+    }
+
+    Ok(())
+}
+
+/// 严格校验：指定 refnos 的 inst_info 必须已写入 instance_cache。
+///
+/// 语义：PrefetchThenGenerate 下，Generate 阶段不允许再回查 DB；因此 inst_info miss
+/// 必须在 Prefetch 阶段立刻失败，便于定位“哪个 refno 没被写进 cache”。
+async fn ensure_inst_info_present_in_instance_cache(
+    db_option: &DbOptionExt,
+    refnos: &[RefnoEnum],
+) -> Result<()> {
+    if refnos.is_empty() {
+        return Ok(());
+    }
+
+    db_meta().ensure_loaded()?;
+    let cache_dir = db_option.get_foyer_cache_dir();
+    let cache = InstanceCacheManager::new(&cache_dir).await?;
+
+    // 按 dbnum 分组；ref0 != dbnum，必须走 db_meta 映射。
+    let mut groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
+    for &r in refnos {
+        let Some(dbnum) = db_meta().get_dbnum_by_refno(r) else {
+            return Err(anyhow::anyhow!("缺少 ref0->dbnum 映射: refno={}", r).into());
+        };
+        if dbnum == 0 {
+            return Err(anyhow::anyhow!("无效 dbnum=0（ref0->dbnum 映射缺失）: refno={}", r).into());
+        }
+        groups.entry(dbnum).or_default().push(r);
+    }
+
+    for (dbnum, want) in groups {
+        let mut missing: Vec<RefnoEnum> = Vec::new();
+        for &r in &want {
+            if cache.get_inst_info(dbnum, r).await.is_none() {
+                missing.push(r);
+            }
+        }
+        if !missing.is_empty() {
+            missing.sort_by_key(|r| r.refno());
+            const SAMPLE_LIMIT: usize = 16;
+            let sample = missing
+                .iter()
+                .take(SAMPLE_LIMIT)
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(anyhow::anyhow!(
+                "instance_cache inst_info 不完整: dbnum={} missing={} sample=[{}] dir={}",
+                dbnum,
+                missing.len(),
+                sample,
+                cache_dir.display()
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+/// BRAN/HANG 离线 Generate 的 Prefetch 阶段：将生成热路径需要的输入填满到 foyer cache。
+///
+/// 目标：Generate 阶段严格只读 cache（geom_input_cache/cata_resolve_cache/transform_cache/instance_cache）。
+async fn prefetch_bran_hang_inputs_for_offline_generate(
+    ctx_prefetch: &NounProcessContext,
+    bran_roots: &[RefnoEnum],
+    child_refnos: &[RefnoEnum],
+    target_cata_map: Arc<DashMap<String, aios_core::pdms_types::CataHashRefnoKV>>,
+) -> Result<()> {
+    if bran_roots.is_empty() && child_refnos.is_empty() {
+        return Ok(());
+    }
+
+    // 0) 预取 transform（BRAN roots + 子元件）
+    let mut transform_targets: Vec<RefnoEnum> = Vec::new();
+    transform_targets.extend_from_slice(bran_roots);
+    transform_targets.extend_from_slice(child_refnos);
+    transform_targets.sort_by_key(|r| r.refno());
+    transform_targets.dedup();
+
+    if !transform_targets.is_empty() {
+        let _ = transform_cache::get_world_transforms_cache_first_batch(
+            Some(ctx_prefetch.db_option.as_ref()),
+            &transform_targets,
+        )
+        .await?;
+        // 严格校验：Generate cache-only 阶段不允许 miss
+        transform_cache::ensure_world_transforms_present(ctx_prefetch.db_option.as_ref(), &transform_targets)
+            .await?;
+    }
+
+    // 1) 预取 CATE inputs（child_refnos）
+    if !child_refnos.is_empty() {
+        geom_input_cache::init_global_geom_input_cache(ctx_prefetch.db_option.as_ref()).await?;
+        let empty: Vec<RefnoEnum> = Vec::new();
+        let _ = geom_input_cache::prefetch_all_geom_inputs_v2(
+            ctx_prefetch.db_option.as_ref(),
+            &empty,
+            &empty,
+            child_refnos,
+        )
+        .await?;
+        geom_input_cache::ensure_geom_inputs_present_for_refnos_from_global(&empty, &empty, child_refnos)
+            .await
+            .map_err(FullNounError::from)?;
+    }
+
+    // 2) 预热 cata_resolve_cache（按 cata_hash）
+    if !target_cata_map.is_empty() {
+        let outcome = cata_resolve_cache_pipeline::prefetch_cata_resolve_cache_for_target_map(
+            ctx_prefetch.db_option.clone(),
+            target_cata_map.clone(),
+        )
+        .await?;
+        if outcome.failed > 0 {
+            return Err(anyhow::anyhow!(
+                "cata_resolve_cache 预热失败：failed_groups={}（离线生成不允许 miss）",
+                outcome.failed
+            )
+            .into());
+        }
+
+        let cache_dir = ctx_prefetch.db_option.get_foyer_cache_dir().join("cata_resolve_cache");
+        cata_resolve_cache::init_global_cata_resolve_cache(cache_dir).await?;
+        let Some(resolve_cache) = cata_resolve_cache::global_cata_resolve_cache() else {
+            return Err(anyhow::anyhow!("global_cata_resolve_cache 未初始化").into());
+        };
+
+        // 校验每个 cata_hash 均已命中缓存。
+        const SAMPLE_LIMIT: usize = 16;
+        let mut missing_keys: Vec<String> = Vec::new();
+        for kv in target_cata_map.iter() {
+            let key = kv.key().clone();
+            drop(kv);
+            if resolve_cache.get(&key).await.is_none() {
+                missing_keys.push(key);
+            }
+        }
+        if !missing_keys.is_empty() {
+            let sample = missing_keys
+                .iter()
+                .take(SAMPLE_LIMIT)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(anyhow::anyhow!(
+                "cata_resolve_cache 不完整：missing_keys={}, sample=[{}]",
+                missing_keys.len(),
+                sample
+            )
+            .into());
+        }
+
+        // 3) 将 BRAN/HANG meta（HPOS/TPOS/尺寸/类型）写入 instance_cache.inst_info_map
+        //    以及将子元件 ptset_map 写入 instance_cache（用于 cache-only tubi 生成）。
+        db_meta().ensure_loaded()?;
+        geom_input_cache::init_global_geom_input_cache(ctx_prefetch.db_option.as_ref()).await?;
+        let cate_inputs = geom_input_cache::load_cate_inputs_for_refnos_from_global(child_refnos).await?;
+
+        let mut inst_infos: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
+
+        // 3.1) 子元件 inst_info（ptset_map 来自 cata_resolve_cache；owner/transform 来自 geom_input_cache）
+        for kv in target_cata_map.iter() {
+            let cata_hash = kv.key().clone();
+            let group_refnos = kv.value().group_refnos.clone();
+            drop(kv);
+
+            let Some(resolved_comp) = resolve_cache.get(&cata_hash).await else {
+                return Err(anyhow::anyhow!(
+                    "cata_resolve_cache miss（已校验仍缺失）：cata_hash={}",
+                    cata_hash
+                )
+                .into());
+            };
+
+            let ptset_map: BTreeMap<i32, CateAxisParam> = resolved_comp.ptset_map();
+            let has_solid = resolved_comp.has_solid;
+
+            for &r in &group_refnos {
+                let Some(input) = cate_inputs.get(&r) else {
+                    return Err(anyhow::anyhow!(
+                        "geom_input_cache miss（已 ensure 仍缺失）：refno={}, cata_hash={}",
+                        r,
+                        cata_hash
+                    )
+                    .into());
+                };
+                inst_infos.insert(
+                    r,
+                    EleGeosInfo {
+                        refno: r,
+                        sesno: input.attmap.sesno(),
+                        owner_refno: input.owner_refno,
+                        owner_type: input.owner_type.clone(),
+                        cata_hash: Some(cata_hash.clone()),
+                        visible: input.visible,
+                        ptset_map: ptset_map.clone(),
+                        is_solid: has_solid,
+                        world_transform: input.world_transform,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        // 3.2) BRAN/HANG meta inst_info
+        for &branch_refno in bran_roots {
+            let att = aios_core::get_named_attmap(branch_refno).await?;
+            let is_hang = att.get_type_str() == "HANG";
+
+            let hpos = att
+                .get_vec3("HPOS")
+                .ok_or_else(|| anyhow::anyhow!("BRAN/HANG 缺少 HPOS: refno={}", branch_refno))?;
+            let tpos = att
+                .get_vec3("TPOS")
+                .ok_or_else(|| anyhow::anyhow!("BRAN/HANG 缺少 TPOS: refno={}", branch_refno))?;
+            let hdir = att
+                .get_vec3("HDIR")
+                .ok_or_else(|| anyhow::anyhow!("BRAN/HANG 缺少 HDIR: refno={}", branch_refno))?;
+            let tdir = att
+                .get_vec3("TDIR")
+                .ok_or_else(|| anyhow::anyhow!("BRAN/HANG 缺少 TDIR: refno={}", branch_refno))?;
+
+            // BRAN/HANG world_transform 必须已在 transform_cache 中命中（上面已 ensure）
+            let world_transform =
+                transform_cache::get_world_transform_cache_only(ctx_prefetch.db_option.as_ref(), branch_refno)
+                    .await?;
+
+            let owner_refno = att.get_owner();
+            let owner_type = aios_core::get_type_name(owner_refno)
+                .await
+                .unwrap_or_default();
+
+            // tubi_size：沿用旧逻辑（HSTU/HREF -> CATR -> query_tubi_size）
+            let h_ref = att
+                .get_foreign_refno(if is_hang { "HREF" } else { "HSTU" })
+                .unwrap_or_default();
+            if !h_ref.is_valid() {
+                return Err(anyhow::anyhow!(
+                    "BRAN/HANG 缺少 HREF/HSTU（无法推导 tubi_size）: refno={}",
+                    branch_refno
+                )
+                .into());
+            }
+            let tubi_att = aios_core::get_named_attmap(h_ref).await?;
+            let catr = tubi_att.get_foreign_refno("CATR").unwrap_or_default();
+            if !catr.is_valid() {
+                return Err(anyhow::anyhow!(
+                    "BRAN/HANG 缺少 CATR（无法推导 tubi_size）: refno={}, h_ref={}",
+                    branch_refno,
+                    h_ref
+                )
+                .into());
+            }
+            let tubi_size = crate::fast_model::query_tubi_size(branch_refno, catr, is_hang).await?;
+            if matches!(tubi_size, TubiSize::None) {
+                return Err(anyhow::anyhow!(
+                    "BRAN/HANG tubi_size 为 None（离线生成不允许 miss）: refno={}",
+                    branch_refno
+                )
+                .into());
+            }
+
+            let mut ptset_map: BTreeMap<i32, CateAxisParam> = BTreeMap::new();
+            ptset_map.insert(
+                crate::fast_model::cata_model::BRANCH_META_HPOS_NO,
+                make_meta_axis_param(
+                    branch_refno,
+                    crate::fast_model::cata_model::BRANCH_META_HPOS_NO,
+                    hpos,
+                    Some(hdir),
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
+            );
+            ptset_map.insert(
+                crate::fast_model::cata_model::BRANCH_META_TPOS_NO,
+                make_meta_axis_param(
+                    branch_refno,
+                    crate::fast_model::cata_model::BRANCH_META_TPOS_NO,
+                    tpos,
+                    Some(tdir),
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
+            );
+            let (pbore, pwidth, pheight) = tubi_size_to_axis_fields(&tubi_size);
+            ptset_map.insert(
+                crate::fast_model::cata_model::BRANCH_META_SIZE_NO,
+                make_meta_axis_param(
+                    branch_refno,
+                    crate::fast_model::cata_model::BRANCH_META_SIZE_NO,
+                    Vec3::ZERO,
+                    None,
+                    pbore,
+                    pwidth,
+                    pheight,
+                ),
+            );
+            ptset_map.insert(
+                crate::fast_model::cata_model::BRANCH_META_KIND_NO,
+                make_meta_axis_param(
+                    branch_refno,
+                    crate::fast_model::cata_model::BRANCH_META_KIND_NO,
+                    Vec3::ZERO,
+                    None,
+                    if is_hang { 1.0 } else { 0.0 },
+                    0.0,
+                    0.0,
+                ),
+            );
+
+            inst_infos.insert(
+                branch_refno,
+                EleGeosInfo {
+                    refno: branch_refno,
+                    sesno: att.sesno(),
+                    owner_refno,
+                    owner_type,
+                    visible: true,
+                    ptset_map,
+                    world_transform,
+                    ..Default::default()
+                },
+            );
+        }
+
+        insert_inst_info_into_instance_cache(ctx_prefetch.db_option.as_ref(), inst_infos).await?;
+
+        // 写入后立即回读校验，保证后续 cache-only tubing/生成不出现 inst_info miss。
+        let mut to_check: Vec<RefnoEnum> = Vec::new();
+        to_check.extend_from_slice(bran_roots);
+        to_check.extend_from_slice(child_refnos);
+        ensure_inst_info_present_in_instance_cache(ctx_prefetch.db_option.as_ref(), &to_check).await?;
+    }
 
     Ok(())
 }
@@ -1039,6 +1578,8 @@ mod tests {
 // 兼容层函数（从 legacy.rs 迁移）
 // ============================================================================
 
+use super::orchestrator::split_shape_instances_by_dbnum;
+use crate::fast_model::foyer_cache::FoyerCacheContext;
 use crate::fast_model::pdms_inst::save_instance_data_optimize;
 // Duplicate import removed
 use anyhow::Result as AnyhowResult;
@@ -1059,6 +1600,15 @@ pub async fn gen_full_noun_geos(
 
     let (sender, receiver) = flume::unbounded();
     let replace_exist = db_option.inner.is_replace_mesh();
+    let use_surrealdb = db_option.use_surrealdb;
+
+    // 兼容层也遵守新语义：输出优先写 foyer cache；是否写 SurrealDB 由 use_surrealdb 控制。
+    // cache_dir 由 DbOptionExt.foyer_cache_dir 决定（默认为 output/<project>/instance_cache）。
+    let foyer_cache_ctx = FoyerCacheContext::try_from_db_option(db_option.as_ref()).await?;
+    let cache_manager_for_insert = foyer_cache_ctx.as_ref().map(|c| c.cache_arc());
+    let insert_err: Arc<tokio::sync::Mutex<Option<anyhow::Error>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let insert_err_for_task = insert_err.clone();
 
     // Full Noun 生成过程中，部分子任务可能会持有 sender 的 clone，导致 channel 不会自然断开；
     // 这里用一个 “done + idle timeout” 机制兜底，避免在 insert_handle.await 处永久挂起。
@@ -1080,19 +1630,47 @@ pub async fn gen_full_noun_geos(
             };
 
             let Some(shape_insts) = next else { break };
-            if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
-                eprintln!("保存实例数据失败: {}", e);
+            if use_surrealdb {
+                if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
+                    eprintln!("保存实例数据失败: {}", e);
+                }
+            }
+
+            if let Some(ref cache_manager) = cache_manager_for_insert {
+                // cache-only 语义：按 dbnum 严格分桶（ref0 != dbnum，必须走映射）。
+                match split_shape_instances_by_dbnum(&shape_insts).await {
+                    Ok(by_dbnum) => {
+                        for (dbnum, sub) in by_dbnum {
+                            cache_manager.insert_from_shape(dbnum, &sub);
+                        }
+                    }
+                    Err(e) => {
+                        // 兼容层下也不应“悄悄跳过写 cache”，否则后续离线阶段必然 cache miss。
+                        let mut g = insert_err_for_task.lock().await;
+                        if g.is_none() {
+                            *g = Some(e);
+                        }
+                        return;
+                    }
+                }
             }
         }
     });
 
-    let categorized =
-        gen_full_noun_geos_optimized(db_option.clone(), &config, sender)
-            .await
-            .map_err(|e| anyhow::anyhow!("Full Noun 生成失败: {}", e))?;
+    let categorized = match gen_full_noun_geos_optimized(db_option.clone(), &config, sender).await {
+        Ok(v) => v,
+        Err(e) => {
+            done.store(true, Ordering::Relaxed);
+            let _ = insert_handle.await;
+            return Err(anyhow::anyhow!("Full Noun 生成失败: {}", e));
+        }
+    };
 
     done.store(true, Ordering::Relaxed);
     let _ = insert_handle.await;
+    if let Some(e) = insert_err.lock().await.take() {
+        return Err(e);
+    }
 
     let cate = categorized.get_by_category(super::models::NounCategory::Cate);
     let loops = categorized.get_by_category(super::models::NounCategory::LoopOwner);

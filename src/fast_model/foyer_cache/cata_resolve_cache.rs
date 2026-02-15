@@ -19,6 +19,7 @@ use aios_core::Transform;
 use glam::Vec3;
 use foyer::{DirectFsDeviceOptionsBuilder, HybridCache, HybridCacheBuilder};
 use serde::{Deserialize, Serialize};
+use tokio::sync::OnceCell;
 use twox_hash::XxHash64;
 
 use super::rkyv_payload;
@@ -253,3 +254,21 @@ impl CataResolveCacheManager {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 全局缓存管理（只读命中路径用；避免每页重复 open）
+// ---------------------------------------------------------------------------
+
+static GLOBAL_CATA_RESOLVE_CACHE: OnceCell<CataResolveCacheManager> = OnceCell::const_new();
+
+/// 初始化全局 cata_resolve_cache（幂等，仅首次生效）。
+pub async fn init_global_cata_resolve_cache(cache_dir: PathBuf) -> anyhow::Result<()> {
+    let _ = GLOBAL_CATA_RESOLVE_CACHE
+        .get_or_try_init(|| async move { CataResolveCacheManager::new(&cache_dir).await })
+        .await?;
+    Ok(())
+}
+
+/// 获取全局 cata_resolve_cache 引用（未初始化返回 None）。
+pub fn global_cata_resolve_cache() -> Option<&'static CataResolveCacheManager> {
+    GLOBAL_CATA_RESOLVE_CACHE.get()
+}

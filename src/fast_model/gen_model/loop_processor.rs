@@ -1,3 +1,4 @@
+use super::cache_miss_report;
 use super::context::NounProcessContext;
 use crate::fast_model::loop_model;
 use crate::fast_model::foyer_cache::geom_input_cache;
@@ -35,25 +36,56 @@ pub async fn process_loop_refno_page(
         return Ok(());
     }
 
-    // cache-only 路由：当 AIOS_GEN_INPUT_CACHE_ONLY=1 时，从缓存读取预取数据
-    if geom_input_cache::is_geom_input_cache_only() {
-        let filtered = geom_input_cache::load_loop_inputs_for_refnos_from_global(refnos).await?;
-        if filtered.len() != refnos.len() {
-            let missing: Vec<String> = refnos
-                .iter()
-                .filter(|r| !filtered.contains_key(r))
-                .take(16)
-                .map(|r| r.to_string())
-                .collect();
-            bail!(
-                "[loop_processor] cache-only 严格模式命中失败: request={}, hit={}, miss={}, sample={:?}",
+    // 离线生成：Generate 阶段只读 geom_input_cache；miss 视为流程不正确（应由 Prefetch 填满）。
+    if ctx.is_offline_generate() {
+        let inputs = geom_input_cache::load_loop_inputs_for_refnos_from_global(refnos).await?;
+        if inputs.len() != refnos.len() {
+            let miss_cnt = refnos.len() - inputs.len();
+            // 逐 refno 记录，便于后续精确补齐 prefetch 缺口
+            let mut missing: Vec<RefnoEnum> = Vec::with_capacity(miss_cnt);
+            for &r in refnos.iter().filter(|r| !inputs.contains_key(r)) {
+                missing.push(r);
+                cache_miss_report::with_global_report(|rep| {
+                    rep.record_refno_miss(
+                        "generate",
+                        "loop_input",
+                        r,
+                        Some("geom_input_cache miss"),
+                    )
+                });
+            }
+            eprintln!(
+                "[loop_processor] offline-generate: geom_input_cache miss: request={}, hit={}, miss={}",
                 refnos.len(),
-                filtered.len(),
-                refnos.len() - filtered.len(),
+                inputs.len(),
+                miss_cnt
+            );
+            missing.sort_by_key(|r| r.refno());
+            bail!(
+                "离线生成禁止 LOOP 输入 miss：request={}, hit={}, missing={}, sample=[{}]",
+                refnos.len(),
+                inputs.len(),
+                missing.len(),
                 missing
+                    .iter()
+                    .take(32)
+                    .map(|r| r.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
-        if !loop_model::gen_loop_geos_from_inputs(ctx.db_option.clone(), filtered, loop_sjus_map_arc, sender).await? {
+
+        if inputs.is_empty() {
+            bail!("离线生成：LOOP 输入为空（应由 Prefetch 填充）");
+        }
+        if !loop_model::gen_loop_geos_from_inputs(
+            ctx.db_option.clone(),
+            inputs,
+            loop_sjus_map_arc,
+            sender,
+        )
+        .await?
+        {
             bail!("loop geos generation from cache failed");
         }
         return Ok(());

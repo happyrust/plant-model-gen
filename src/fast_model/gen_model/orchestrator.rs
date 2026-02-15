@@ -1018,7 +1018,7 @@ async fn process_full_noun_mode(
 
             let mesh_dir = db_option.inner.get_meshes_path();
 
-            if let Err(e) = crate::fast_model::foyer_cache::mesh::run_mesh_worker(
+            match crate::fast_model::foyer_cache::mesh::run_mesh_worker(
 
                 ctx,
 
@@ -1034,11 +1034,18 @@ async fn process_full_noun_mode(
 
             {
 
-                eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
+                Ok(n) if n > 0 => {
+                    println!("[gen_model] mesh worker 缓存路径完成: {} 个", n);
+                    ran_primary = true;
+                }
 
-            } else {
+                Ok(_) => {
+                    println!("[gen_model] mesh worker 缓存路径: 0 个 mesh，回退 SurrealDB");
+                }
 
-                ran_primary = true;
+                Err(e) => {
+                    eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
+                }
 
             }
 
@@ -1046,7 +1053,7 @@ async fn process_full_noun_mode(
 
 
 
-        if use_surrealdb {
+        if use_surrealdb && !ran_primary {
 
             if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
 
@@ -1821,7 +1828,7 @@ async fn process_targeted_generation(
 
             let mesh_dir = db_option.inner.get_meshes_path();
 
-            if let Err(e) = crate::fast_model::foyer_cache::mesh::run_mesh_worker(
+            match crate::fast_model::foyer_cache::mesh::run_mesh_worker(
 
                 ctx,
 
@@ -1837,17 +1844,24 @@ async fn process_targeted_generation(
 
             {
 
-                eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
+                Ok(n) if n > 0 => {
+                    println!("[gen_model] mesh worker 缓存路径完成: {} 个", n);
+                    ran_primary = true;
+                }
 
-            } else {
+                Ok(_) => {
+                    println!("[gen_model] mesh worker 缓存路径: 0 个 mesh，回退 SurrealDB");
+                }
 
-                ran_primary = true;
+                Err(e) => {
+                    eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
+                }
 
             }
 
         }
 
-        if use_surrealdb {
+        if use_surrealdb && !ran_primary {
 
             if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
 
@@ -2405,7 +2419,7 @@ async fn process_full_database_generation(
 
                 let mesh_dir = db_option_arc.inner.get_meshes_path();
 
-                if let Err(e) = crate::fast_model::foyer_cache::mesh::run_mesh_worker(
+                match crate::fast_model::foyer_cache::mesh::run_mesh_worker(
 
                     ctx,
 
@@ -2421,17 +2435,24 @@ async fn process_full_database_generation(
 
                 {
 
-                    eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
+                    Ok(n) if n > 0 => {
+                        println!("[gen_model] mesh worker 缓存路径完成: {} 个", n);
+                        ran_primary = true;
+                    }
 
-                } else {
+                    Ok(_) => {
+                        println!("[gen_model] mesh worker 缓存路径: 0 个 mesh，回退 SurrealDB");
+                    }
 
-                    ran_primary = true;
+                    Err(e) => {
+                        eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
+                    }
 
                 }
 
             }
 
-            if use_surrealdb {
+            if use_surrealdb && !ran_primary {
 
                 db_refnos
 

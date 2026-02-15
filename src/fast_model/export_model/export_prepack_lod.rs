@@ -45,10 +45,21 @@ use crate::fast_model::instance_cache::InstanceCacheManager;
 use crate::fast_model::gen_model::tree_index_manager::{
     ensure_tree_index_exists, load_index_with_large_stack, TreeIndexManager,
 };
+use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use crate::fast_model::material_config::MaterialLibrary;
 use crate::fast_model::query_compat::query_deep_visible_inst_refnos;
 use crate::fast_model::query_provider;
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
+
+/// 用 rkyv 序列化 geo_param 并计算 hash（替代 bincode::serialize）
+fn rkyv_geo_param_hash(geo_param: &PdmsGeoParam) -> Option<u64> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(geo_param).ok()?;
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
 
 /// instances 输出的元信息（供前端读取 batch_id，确保 ptset 与模型快照一致）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3775,18 +3786,8 @@ pub async fn export_dbnum_instances_json_from_cache(
                         &unit_converter,
                         inst.geo_param.is_reuse_unit(),
                     );
-                    // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
                     let geo_hash = if inst.geo_hash < 10000 {
-                        // 从 geo_param 序列化计算 hash
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = DefaultHasher::new();
-                        if let Ok(bytes) = bincode::serialize(&inst.geo_param) {
-                            bytes.hash(&mut hasher);
-                            hasher.finish()
-                        } else {
-                            inst.geo_hash
-                        }
+                        rkyv_geo_param_hash(&inst.geo_param).unwrap_or(inst.geo_hash)
                     } else {
                         inst.geo_hash
                     };
@@ -3812,18 +3813,8 @@ pub async fn export_dbnum_instances_json_from_cache(
             // 精简模式
             let first_geo_hash = inst_geos.insts.first()
                 .map(|i| {
-                    // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
                     let geo_hash = if i.geo_hash < 10000 {
-                        // 从 geo_param 序列化计算 hash
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = DefaultHasher::new();
-                        if let Ok(bytes) = bincode::serialize(&i.geo_param) {
-                            bytes.hash(&mut hasher);
-                            hasher.finish()
-                        } else {
-                            i.geo_hash
-                        }
+                        rkyv_geo_param_hash(&i.geo_param).unwrap_or(i.geo_hash)
                     } else {
                         i.geo_hash
                     };
@@ -3833,18 +3824,8 @@ pub async fn export_dbnum_instances_json_from_cache(
             let compact_geo_instances: Vec<CompactGeoInstance> = inst_geos.insts
                 .iter()
                 .map(|inst| {
-                    // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
                     let geo_hash = if inst.geo_hash < 10000 {
-                        // 从 geo_param 序列化计算 hash
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = DefaultHasher::new();
-                        if let Ok(bytes) = bincode::serialize(&inst.geo_param) {
-                            bytes.hash(&mut hasher);
-                            hasher.finish()
-                        } else {
-                            inst.geo_hash
-                        }
+                        rkyv_geo_param_hash(&inst.geo_param).unwrap_or(inst.geo_hash)
                     } else {
                         inst.geo_hash
                     };
@@ -3944,16 +3925,7 @@ pub async fn export_dbnum_instances_json_from_cache(
 
                 // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
                 let geo_hash = if first_inst.geo_hash < 10000 {
-                    // 从 geo_param 序列化计算 hash
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    if let Ok(bytes) = bincode::serialize(&first_inst.geo_param) {
-                        bytes.hash(&mut hasher);
-                        hasher.finish()
-                    } else {
-                        first_inst.geo_hash
-                    }
+                    rkyv_geo_param_hash(&first_inst.geo_param).unwrap_or(first_inst.geo_hash)
                 } else {
                     first_inst.geo_hash
                 };
@@ -4058,18 +4030,8 @@ pub async fn export_dbnum_instances_json_from_cache(
                     &unit_converter,
                     inst.geo_param.is_reuse_unit(),
                 );
-                // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
                 let geo_hash = if inst.geo_hash < 10000 {
-                    // 从 geo_param 序列化计算 hash
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    if let Ok(bytes) = bincode::serialize(&inst.geo_param) {
-                        bytes.hash(&mut hasher);
-                        hasher.finish()
-                    } else {
-                        inst.geo_hash
-                    }
+                    rkyv_geo_param_hash(&inst.geo_param).unwrap_or(inst.geo_hash)
                 } else {
                     inst.geo_hash
                 };
@@ -4093,18 +4055,8 @@ pub async fn export_dbnum_instances_json_from_cache(
         // 精简模式
         let first_geo_hash = inst_geos.insts.first()
             .map(|i| {
-                // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
                 let geo_hash = if i.geo_hash < 10000 {
-                    // 从 geo_param 序列化计算 hash
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    if let Ok(bytes) = bincode::serialize(&i.geo_param) {
-                        bytes.hash(&mut hasher);
-                        hasher.finish()
-                    } else {
-                        i.geo_hash
-                    }
+                    rkyv_geo_param_hash(&i.geo_param).unwrap_or(i.geo_hash)
                 } else {
                     i.geo_hash
                 };
@@ -4114,18 +4066,8 @@ pub async fn export_dbnum_instances_json_from_cache(
         let compact_geo_instances: Vec<CompactGeoInstance> = inst_geos.insts
             .iter()
             .map(|inst| {
-                // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
                 let geo_hash = if inst.geo_hash < 10000 {
-                    // 从 geo_param 序列化计算 hash
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    if let Ok(bytes) = bincode::serialize(&inst.geo_param) {
-                        bytes.hash(&mut hasher);
-                        hasher.finish()
-                    } else {
-                        inst.geo_hash
-                    }
+                    rkyv_geo_param_hash(&inst.geo_param).unwrap_or(inst.geo_hash)
                 } else {
                     inst.geo_hash
                 };
@@ -4189,18 +4131,8 @@ pub async fn export_dbnum_instances_json_from_cache(
             // 尝试从 inst_geos_map 获取 geo_hash，如果没有则使用 tubi_info_id 或 refno
             let geo_hash = if let Some(inst_geos) = inst_geos_map.get(&info.get_inst_key()) {
                 inst_geos.insts.first().map(|i| {
-                    // 如果 geo_hash 看起来像索引（小于 10000），则从 geo_param 重新计算真正的 u64 hash
                     let geo_hash = if i.geo_hash < 10000 {
-                        // 从 geo_param 序列化计算 hash
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = DefaultHasher::new();
-                        if let Ok(bytes) = bincode::serialize(&i.geo_param) {
-                            bytes.hash(&mut hasher);
-                            hasher.finish()
-                        } else {
-                            i.geo_hash
-                        }
+                        rkyv_geo_param_hash(&i.geo_param).unwrap_or(i.geo_hash)
                     } else {
                         i.geo_hash
                     };

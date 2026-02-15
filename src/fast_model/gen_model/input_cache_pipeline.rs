@@ -20,6 +20,21 @@ use crate::fast_model::foyer_cache::geom_input_cache::{
     self, GeomInputBatch, GeomInputCacheManager, LoopInput, PrimInput,
 };
 
+fn read_bool_env(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn is_stage_timing_enabled() -> bool {
+    read_bool_env("AIOS_GEN_INPUT_CACHE_STAGE_TIMING")
+}
+
+fn is_opt_cmpf_neg_enabled() -> bool {
+    read_bool_env("AIOS_OPT_CMPF_NEG")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReadyBatchKey {
     pub dbnum: u32,
@@ -219,6 +234,7 @@ async fn fetch_loop_inputs_map_batch(
     let tree_dir = db_option.get_scene_tree_dir();
 
     // 1) attmap：批量拉取
+    let t_att = std::time::Instant::now();
     let att_list = query_provider::get_attmaps_batch(refnos).await.unwrap_or_default();
     let mut attmap_map: HashMap<RefnoEnum, aios_core::NamedAttrMap> = HashMap::new();
     for att in att_list {
@@ -227,15 +243,19 @@ async fn fetch_loop_inputs_map_batch(
             attmap_map.insert(r, att);
         }
     }
+    let att_ms = t_att.elapsed().as_millis();
 
     // 2) world_transform：cache-first 批量（foyer hit + pe_transform miss batch）
+    let t_world = std::time::Instant::now();
     let world_map = crate::fast_model::transform_cache::get_world_transforms_cache_first_batch(
         Some(db_option),
         refnos,
     )
     .await?;
+    let world_ms = t_world.elapsed().as_millis();
 
     // 3) loops + height：并发 per-refno（过渡方案；后续可做深层批量）
+    let t_loops = std::time::Instant::now();
     const LOOP_CONCURRENCY: usize = 16;
     let loop_rows = stream::iter(refnos.iter().copied())
         .map(|r| async move {
@@ -253,11 +273,88 @@ async fn fetch_loop_inputs_map_batch(
             loop_map.insert(r, v);
         }
     }
+    let loops_ms = t_loops.elapsed().as_millis();
 
     // 4) neg_refnos：TreeIndex 路径（按 dbnum 分组，单次加载 index；返回 root -> Vec）
+    let t_neg = std::time::Instant::now();
     let neg_map: HashMap<RefnoEnum, Vec<RefnoEnum>> =
         neg_query::query_descendants_map_by_dbnum(&tree_dir, refnos, &GENRAL_NEG_NOUN_NAMES, false)
             .unwrap_or_default();
+    let neg_ms = t_neg.elapsed().as_millis();
+
+    // 5) cmpf_neg_refnos：可选优化（避免 per-refno 二段查询导致的重复固定开销）
+    let t_cmpf = std::time::Instant::now();
+    let cmpf_neg_map_opt: Option<HashMap<RefnoEnum, Vec<RefnoEnum>>> = if is_opt_cmpf_neg_enabled()
+    {
+        let roots_need_cmpf: Vec<RefnoEnum> = refnos
+            .iter()
+            .copied()
+            .filter(|r| {
+                attmap_map
+                    .get(r)
+                    .map(|a| !a.is_neg())
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        // root -> CMPF descendants
+        let cmpf_map: HashMap<RefnoEnum, Vec<RefnoEnum>> = neg_query::query_descendants_map_by_dbnum(
+            &tree_dir,
+            &roots_need_cmpf,
+            &["CMPF"],
+            false,
+        )
+        .unwrap_or_default();
+
+        // CMPF node -> neg descendants
+        let mut all_cmpf: Vec<RefnoEnum> = Vec::new();
+        let mut seen_cmpf: HashSet<RefnoEnum> = HashSet::new();
+        for rows in cmpf_map.values() {
+            for &r in rows {
+                if r.is_valid() && seen_cmpf.insert(r) {
+                    all_cmpf.push(r);
+                }
+            }
+        }
+
+        let cmpf_neg_node_map: HashMap<RefnoEnum, Vec<RefnoEnum>> =
+            if all_cmpf.is_empty() {
+                HashMap::new()
+            } else {
+                neg_query::query_descendants_map_by_dbnum(
+                    &tree_dir,
+                    &all_cmpf,
+                    &GENRAL_NEG_NOUN_NAMES,
+                    false,
+                )
+                .unwrap_or_default()
+            };
+
+        // root -> union(neg descendants under each CMPF)
+        let mut root_map: HashMap<RefnoEnum, Vec<RefnoEnum>> =
+            HashMap::with_capacity(roots_need_cmpf.len());
+        for &root in &roots_need_cmpf {
+            let mut out: Vec<RefnoEnum> = Vec::new();
+            let mut seen: HashSet<RefnoEnum> = HashSet::new();
+            if let Some(cmpf_nodes) = cmpf_map.get(&root) {
+                for &cmpf in cmpf_nodes {
+                    if let Some(negs) = cmpf_neg_node_map.get(&cmpf) {
+                        for &n in negs {
+                            if n.is_valid() && seen.insert(n) {
+                                out.push(n);
+                            }
+                        }
+                    }
+                }
+            }
+            root_map.insert(root, out);
+        }
+
+        Some(root_map)
+    } else {
+        None
+    };
+    let cmpf_ms = t_cmpf.elapsed().as_millis();
 
     let mut inputs: HashMap<RefnoEnum, LoopInput> = HashMap::new();
     let mut skipped = 0usize;
@@ -281,8 +378,12 @@ async fn fetch_loop_inputs_map_batch(
 
         let neg_refnos = neg_map.get(&refno).cloned().unwrap_or_default();
 
-        // cmpf_neg_refnos：先沿用旧逻辑（TreeIndex 很快；后续可再做批量）
-        let cmpf_neg_refnos = if !attmap.is_neg() {
+        let cmpf_neg_refnos = if attmap.is_neg() {
+            vec![]
+        } else if let Some(cmpf_neg_map) = cmpf_neg_map_opt.as_ref() {
+            cmpf_neg_map.get(&refno).cloned().unwrap_or_default()
+        } else {
+            // 兼容旧逻辑：逐 refno 两段查询（CMPF descendants -> neg descendants under CMPF）
             let cmpf_refnos = query_provider::get_descendants_by_types(refno, &["CMPF"], None)
                 .await
                 .unwrap_or_default();
@@ -293,8 +394,6 @@ async fn fetch_loop_inputs_map_batch(
             } else {
                 vec![]
             }
-        } else {
-            vec![]
         };
 
         inputs.insert(
@@ -320,6 +419,19 @@ async fn fetch_loop_inputs_map_batch(
             skipped,
             refnos.len(),
             t0.elapsed().as_millis()
+        );
+    }
+
+    if is_stage_timing_enabled() {
+        println!(
+            "[input_cache_pipeline] fetch_loop_inputs_map_batch timings(ms): att={}, world={}, loops={}, neg={}, cmpf_neg={}, total={}, refnos={}",
+            att_ms,
+            world_ms,
+            loops_ms,
+            neg_ms,
+            cmpf_ms,
+            t0.elapsed().as_millis(),
+            refnos.len()
         );
     }
 
@@ -452,6 +564,7 @@ async fn fetch_prim_inputs_map_batch(
     let tree_dir = db_option.get_scene_tree_dir();
 
     // 1) attmap：批量拉取
+    let t_att = std::time::Instant::now();
     let att_list = query_provider::get_attmaps_batch(refnos).await.unwrap_or_default();
     let mut attmap_map: HashMap<RefnoEnum, aios_core::NamedAttrMap> = HashMap::new();
     for att in att_list {
@@ -460,20 +573,26 @@ async fn fetch_prim_inputs_map_batch(
             attmap_map.insert(r, att);
         }
     }
+    let att_ms = t_att.elapsed().as_millis();
 
     // 2) world_transform：cache-first 批量（foyer hit + pe_transform miss batch）
+    let t_world = std::time::Instant::now();
     let world_map = crate::fast_model::transform_cache::get_world_transforms_cache_first_batch(
         Some(db_option),
         refnos,
     )
     .await?;
+    let world_ms = t_world.elapsed().as_millis();
 
     // 3) neg_refnos：TreeIndex 路径（按 dbnum 分组，单次加载 index；返回 root -> Vec）
+    let t_neg = std::time::Instant::now();
     let neg_map: HashMap<RefnoEnum, Vec<RefnoEnum>> =
         neg_query::query_descendants_map_by_dbnum(&tree_dir, refnos, &GENRAL_NEG_NOUN_NAMES, false)
             .unwrap_or_default();
+    let neg_ms = t_neg.elapsed().as_millis();
 
     // 4) poly_extra：仅 POHE/POLYHE，per-refno 并发（过渡方案）
+    let t_poly = std::time::Instant::now();
     let poly_targets: Vec<RefnoEnum> = refnos
         .iter()
         .copied()
@@ -502,6 +621,7 @@ async fn fetch_prim_inputs_map_batch(
         .into_iter()
         .filter_map(|(r, v)| v.map(|x| (r, x)))
         .collect();
+    let poly_ms = t_poly.elapsed().as_millis();
 
     let mut inputs: HashMap<RefnoEnum, PrimInput> = HashMap::new();
     let mut skipped = 0usize;
@@ -543,6 +663,18 @@ async fn fetch_prim_inputs_map_batch(
             skipped,
             refnos.len(),
             t0.elapsed().as_millis()
+        );
+    }
+
+    if is_stage_timing_enabled() {
+        println!(
+            "[input_cache_pipeline] fetch_prim_inputs_map_batch timings(ms): att={}, world={}, neg={}, poly={}, total={}, refnos={}",
+            att_ms,
+            world_ms,
+            neg_ms,
+            poly_ms,
+            t0.elapsed().as_millis(),
+            refnos.len()
         );
     }
 

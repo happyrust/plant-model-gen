@@ -209,12 +209,14 @@ async fn fetch_loop_inputs_map_batch(
     use aios_core::pdms_types::GENRAL_NEG_NOUN_NAMES;
     use crate::fast_model::query_provider;
     use crate::fast_model::shared;
+    use super::neg_query;
 
     if refnos.is_empty() {
         return Ok(HashMap::new());
     }
 
     let t0 = std::time::Instant::now();
+    let tree_dir = db_option.get_scene_tree_dir();
 
     // 1) attmap：批量拉取
     let att_list = query_provider::get_attmaps_batch(refnos).await.unwrap_or_default();
@@ -252,23 +254,10 @@ async fn fetch_loop_inputs_map_batch(
         }
     }
 
-    // 4) neg_refnos：TreeIndex 路径（小并发）
-    const NEG_CONCURRENCY: usize = 32;
-    let neg_rows = stream::iter(refnos.iter().copied())
-        .map(|r| async move {
-            let v = query_provider::query_multi_descendants_with_self(
-                &[r],
-                &GENRAL_NEG_NOUN_NAMES,
-                false,
-            )
-            .await
+    // 4) neg_refnos：TreeIndex 路径（按 dbnum 分组，单次加载 index；返回 root -> Vec）
+    let neg_map: HashMap<RefnoEnum, Vec<RefnoEnum>> =
+        neg_query::query_descendants_map_by_dbnum(&tree_dir, refnos, &GENRAL_NEG_NOUN_NAMES, false)
             .unwrap_or_default();
-            (r, v)
-        })
-        .buffer_unordered(NEG_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-    let neg_map: HashMap<RefnoEnum, Vec<RefnoEnum>> = neg_rows.into_iter().collect();
 
     let mut inputs: HashMap<RefnoEnum, LoopInput> = HashMap::new();
     let mut skipped = 0usize;
@@ -453,12 +442,14 @@ async fn fetch_prim_inputs_map_batch(
     use aios_core::pdms_types::GENRAL_NEG_NOUN_NAMES;
     use crate::fast_model::query_provider;
     use crate::fast_model::shared;
+    use super::neg_query;
 
     if refnos.is_empty() {
         return Ok(HashMap::new());
     }
 
     let t0 = std::time::Instant::now();
+    let tree_dir = db_option.get_scene_tree_dir();
 
     // 1) attmap：批量拉取
     let att_list = query_provider::get_attmaps_batch(refnos).await.unwrap_or_default();
@@ -477,23 +468,10 @@ async fn fetch_prim_inputs_map_batch(
     )
     .await?;
 
-    // 3) neg_refnos：TreeIndex 路径（小并发）
-    const NEG_CONCURRENCY: usize = 32;
-    let neg_rows = stream::iter(refnos.iter().copied())
-        .map(|r| async move {
-            let v = query_provider::query_multi_descendants_with_self(
-                &[r],
-                &GENRAL_NEG_NOUN_NAMES,
-                false,
-            )
-            .await
+    // 3) neg_refnos：TreeIndex 路径（按 dbnum 分组，单次加载 index；返回 root -> Vec）
+    let neg_map: HashMap<RefnoEnum, Vec<RefnoEnum>> =
+        neg_query::query_descendants_map_by_dbnum(&tree_dir, refnos, &GENRAL_NEG_NOUN_NAMES, false)
             .unwrap_or_default();
-            (r, v)
-        })
-        .buffer_unordered(NEG_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-    let neg_map: HashMap<RefnoEnum, Vec<RefnoEnum>> = neg_rows.into_iter().collect();
 
     // 4) poly_extra：仅 POHE/POLYHE，per-refno 并发（过渡方案）
     let poly_targets: Vec<RefnoEnum> = refnos

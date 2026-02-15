@@ -641,7 +641,7 @@ async fn process_full_noun_mode(
 
 
 
-    let (sender, receiver) = flume::unbounded();
+    let (sender, receiver) = flume::unbounded::<aios_core::geometry::ShapeInstancesData>();
 
     let replace_exist = db_option.inner.is_replace_mesh();
 
@@ -770,7 +770,8 @@ async fn process_full_noun_mode(
 
         let mut t_duckdb = std::time::Duration::ZERO;
 
-
+        // SurrealDB 写入后台任务句柄：不阻塞 cache 写入和后续 batch 接收
+        let mut db_write_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
         loop {
 
@@ -791,22 +792,6 @@ async fn process_full_noun_mode(
             batch_cnt += 1;
 
 
-
-            // 保存到 SurrealDB
-
-            if use_surrealdb {
-
-                let t0 = Instant::now();
-
-                if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
-
-                    eprintln!("保存实例数据失败: {}", e);
-
-                }
-
-                t_save_db += t0.elapsed();
-
-            }
 
             // 记录本批次触达的实例 refno（用于后续 inst_relate_aabb 写入范围收敛）
             for r in shape_insts.inst_info_map.keys() {
@@ -890,6 +875,33 @@ async fn process_full_noun_mode(
 
             }
 
+            // SurrealDB 写入放到后台，不阻塞 cache 写入和后续 batch 接收
+            if use_surrealdb {
+                let t0 = Instant::now();
+                db_write_handles.push(tokio::spawn(async move {
+                    if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
+                        eprintln!("保存实例数据失败: {}", e);
+                    }
+                }));
+                t_save_db += t0.elapsed();
+            }
+
+        }
+
+        // 等待所有 SurrealDB 后台写入完成
+        if !db_write_handles.is_empty() {
+            let t_wait = Instant::now();
+            let total = db_write_handles.len();
+            for h in db_write_handles {
+                let _ = h.await;
+            }
+            let wait_ms = t_wait.elapsed().as_millis();
+            if wait_ms > 100 {
+                println!(
+                    "[gen_model] SurrealDB 后台写入等待完成: {} 个任务, 额外等待 {} ms",
+                    total, wait_ms
+                );
+            }
         }
 
 

@@ -62,7 +62,7 @@ pub async fn process_cate_refno_page(
 
     // Generate 阶段（且非 Direct）：严格只读缓存，不回查 SurrealDB。
     if ctx.is_offline_generate() {
-        return gen_cate_instances_from_cache_only(ctx, &target_cata_map, sender, refnos).await;
+        return gen_cate_instances_from_cache_only(ctx, &target_cata_map, sender, refnos, false).await;
     }
 
     // 方案 A（Direct/非离线）：允许在 Prefetch 阶段预热 resolve_desi_comp 产物缓存（按 cata_hash）。
@@ -100,6 +100,7 @@ async fn gen_cate_instances_from_cache_only(
     target_cata_map: &Arc<DashMap<String, aios_core::pdms_types::CataHashRefnoKV>>,
     sender: flume::Sender<ShapeInstancesData>,
     refnos: &[RefnoEnum],
+    strict: bool,
 ) -> Result<()> {
     // 1) cate inst 输入：仅从 geom_input_cache 读取
     geom_input_cache::init_global_geom_input_cache(ctx.db_option.as_ref()).await?;
@@ -121,18 +122,26 @@ async fn gen_cate_instances_from_cache_only(
                 );
             }
         });
-        anyhow::bail!(
-            "离线生成禁止 CATE 输入 miss：request={}, hit={}, missing={}, sample=[{}]",
-            refnos.len(),
-            cate_inputs.len(),
-            missing.len(),
-            missing
-                .iter()
-                .take(32)
-                .map(|r| r.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        if strict {
+            anyhow::bail!(
+                "离线生成禁止 CATE 输入 miss：request={}, hit={}, missing={}, sample=[{}]",
+                refnos.len(),
+                cate_inputs.len(),
+                missing.len(),
+                missing
+                    .iter()
+                    .take(32)
+                    .map(|r| r.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        } else {
+            println!(
+                "[cate_processor] cache-only 容错: cate_input miss {}/{}, 跳过缺失 refno",
+                missing.len(),
+                refnos.len()
+            );
+        }
     }
 
     // 2) prepared geos/ptset：仅从 cata_resolve_cache 读取
@@ -169,11 +178,20 @@ async fn gen_cate_instances_from_cache_only(
                     );
                 }
             });
-            anyhow::bail!(
-                "离线生成禁止 cata_resolve_cache miss：cata_hash={}, group_refnos_sample={:?}",
-                cata_hash,
-                group_refnos.iter().take(8).collect::<Vec<_>>()
-            );
+            if strict {
+                anyhow::bail!(
+                    "离线生成禁止 cata_resolve_cache miss：cata_hash={}, group_refnos_sample={:?}",
+                    cata_hash,
+                    group_refnos.iter().take(8).collect::<Vec<_>>()
+                );
+            } else {
+                println!(
+                    "[cate_processor] cache-only 容错: cata_resolve_cache miss cata_hash={}, skip {} refnos",
+                    cata_hash,
+                    group_refnos.len()
+                );
+                continue;
+            }
         };
 
         // 3.1) 将 prepared geos 转为 inst_geo 列表（复用于组内每个实例）
@@ -202,19 +220,22 @@ async fn gen_cate_instances_from_cache_only(
 
         for &group_refno in group_refnos.iter() {
             let Some(input) = cate_inputs.get(&group_refno) else {
-                cache_miss_report::with_global_report(|r| {
-                    r.record_refno_miss(
-                        ctx.gen_stage.as_str(),
-                        "cate:cate_input_miss",
+                if strict {
+                    cache_miss_report::with_global_report(|r| {
+                        r.record_refno_miss(
+                            ctx.gen_stage.as_str(),
+                            "cate:cate_input_miss",
+                            group_refno,
+                            Some("missing cate input in geom_input_cache (need prefetch)"),
+                        )
+                    });
+                    anyhow::bail!(
+                        "离线生成禁止 CATE 输入 miss：refno={}, cata_hash={}",
                         group_refno,
-                        Some("missing cate input in geom_input_cache (need prefetch)"),
-                    )
-                });
-                anyhow::bail!(
-                    "离线生成禁止 CATE 输入 miss：refno={}, cata_hash={}",
-                    group_refno,
-                    cata_hash
-                );
+                        cata_hash
+                    );
+                }
+                continue;
             };
 
             let type_name = input.attmap.get_type_str().to_string();

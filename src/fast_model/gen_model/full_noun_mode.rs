@@ -461,19 +461,41 @@ pub async fn gen_full_noun_geos_optimized(
             categorized.insert(*r, super::models::NounCategory::Prim);
         }
 
-        // CATE
+        // CATE — 先 prefetch 到 geom_input_cache，再走 cache-only 路径，
+        // 避免分页处理时与后台 SurrealDB 写入任务竞争 WebSocket 连接。
         let mut cate_vec: Vec<RefnoEnum> = cate_refnos.into_iter().collect();
         cate_vec.sort_by_key(|r| r.to_string());
-        for (i, chunk) in cate_vec.chunks(ctx.batch_size.max(1)).enumerate() {
+
+        if !cate_vec.is_empty() {
+            let t_prefetch = Instant::now();
+            geom_input_cache::init_global_geom_input_cache(ctx.db_option.as_ref()).await?;
+            let (_, _, cate_n) = geom_input_cache::prefetch_all_geom_inputs_v2(
+                ctx.db_option.as_ref(),
+                &[],
+                &[],
+                &cate_vec,
+            )
+            .await?;
+            println!(
+                "[BRAN-only][CATE] prefetch 完成: {}/{} 个, elapsed={} ms",
+                cate_n,
+                cate_vec.len(),
+                t_prefetch.elapsed().as_millis()
+            );
+        }
+
+        // 使用 PrefetchThenGenerate + Generate 组合，让 process_cate_refno_page 走 cache-only 路径
+        let ctx_cate = ctx.with_cache_run_mode(geom_input_cache::CacheRunMode::PrefetchThenGenerate);
+        for (i, chunk) in cate_vec.chunks(ctx_cate.batch_size.max(1)).enumerate() {
             println!(
                 "[BRAN-only][CATE] 分页 {}/{} ({} ~ {})",
                 i + 1,
-                (cate_vec.len() + ctx.batch_size.max(1) - 1) / ctx.batch_size.max(1),
-                i * ctx.batch_size.max(1) + 1,
-                (i * ctx.batch_size.max(1) + chunk.len())
+                (cate_vec.len() + ctx_cate.batch_size.max(1) - 1) / ctx_cate.batch_size.max(1),
+                i * ctx_cate.batch_size.max(1) + 1,
+                (i * ctx_cate.batch_size.max(1) + chunk.len())
             );
             process_cate_refno_page(
-                &ctx,
+                &ctx_cate,
                 loop_sjus_map_arc.clone(),
                 sender.clone(),
                 chunk,
@@ -1600,7 +1622,8 @@ pub async fn gen_full_noun_geos(
 
     let (sender, receiver) = flume::unbounded();
     let replace_exist = db_option.inner.is_replace_mesh();
-    let use_surrealdb = db_option.use_surrealdb;
+    // 当 use_cache=true 时，严格 cache-only：不做任何 SurrealDB 兜底/回退，也不写入 inst_*。
+    let use_surrealdb = db_option.use_surrealdb && !db_option.use_cache;
 
     // 兼容层也遵守新语义：输出优先写 foyer cache；是否写 SurrealDB 由 use_surrealdb 控制。
     // cache_dir 由 DbOptionExt.foyer_cache_dir 决定（默认为 output/<project>/instance_cache）。

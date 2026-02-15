@@ -27,7 +27,9 @@ $ErrorActionPreference = "Stop"
 # ========== 配置 ==========
 $ConfigName   = "db_options/DbOption-7997-pane-perf"
 $BinaryName   = "aios-database"
-$ProjectName  = "YCYK-E3D"
+# 该脚本使用的配置文件项目名为 AvevaMarineSample，因此这里需与程序输出目录一致；
+# 否则会导致无法定位 perf JSON，进而生成空报告。
+$ProjectName  = "AvevaMarineSample"
 $ProfileDir   = "output/$ProjectName/profile"
 $CacheDir     = "output/$ProjectName/instance_cache"
 $ReportDir    = "output/$ProjectName/profile"

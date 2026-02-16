@@ -392,9 +392,18 @@ pub async fn gen_all_geos_data(
 
 
 
-    // ✅ SurrealDB 写入侧初始化：仅在 use_surrealdb=true 时需要。
+    // ✅ SurrealDB 写入侧初始化：仅在“允许写入 SurrealDB”时需要。
+    //
+    // 约定：当 use_cache=true 时，生成链路应严格 cache-only（不做任何 SurrealDB 兜底/回退，也不写入 inst_*）。
+    // SurrealDB 仍可能作为“输入数据源”连接（PE/属性/world_transform 等），但不作为模型输出落库。
+    let surreal_write_enabled = db_option.use_surrealdb && !db_option.use_cache;
+    if db_option.use_surrealdb && db_option.use_cache {
+        println!(
+            "[gen_model] ⚠️  检测到 use_cache=true 且 use_surrealdb=true：将禁用 SurrealDB 模型写入/兜底，仅使用缓存生成模型"
+        );
+    }
 
-    if db_option.use_surrealdb {
+    if surreal_write_enabled {
 
         if let Err(e) = aios_core::rs_surreal::inst::init_model_tables().await {
 
@@ -645,7 +654,8 @@ async fn process_full_noun_mode(
 
     let replace_exist = db_option.inner.is_replace_mesh();
 
-    let use_surrealdb = db_option.use_surrealdb;
+    // 当 use_cache=true 时，严格 cache-only：不做任何 SurrealDB 兜底/回退，也不写入 inst_*。
+    let use_surrealdb = db_option.use_surrealdb && !db_option.use_cache;
 
 
 
@@ -995,6 +1005,7 @@ async fn process_full_noun_mode(
 
 
     // 2️⃣ 可选执行 mesh 生成
+    let mut instances_export_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     if db_option.inner.gen_mesh {
 
@@ -1046,17 +1057,20 @@ async fn process_full_noun_mode(
 
             {
 
-                Ok(n) if n > 0 => {
-                    println!("[gen_model] mesh worker 缓存路径完成: {} 个", n);
+                Ok(n) => {
+                    println!(
+                        "[gen_model] mesh worker 缓存路径完成: 新生成 {} 个（use_cache=true，不回退 SurrealDB）",
+                        n
+                    );
                     ran_primary = true;
                 }
 
-                Ok(_) => {
-                    println!("[gen_model] mesh worker 缓存路径: 0 个 mesh，回退 SurrealDB");
-                }
-
                 Err(e) => {
-                    eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
+                    eprintln!(
+                        "[gen_model] mesh worker 缓存路径失败（use_cache=true，不回退 SurrealDB）: {}",
+                        e
+                    );
+                    return Err(FullNounError::Other(e));
                 }
 
             }
@@ -1065,7 +1079,8 @@ async fn process_full_noun_mode(
 
 
 
-        if use_surrealdb && !ran_primary {
+        // 当 use_cache=true 时，严格遵守 cache-only 语义：不回退 SurrealDB mesh worker。
+        if use_surrealdb && !ran_primary && !db_option.use_cache {
 
             if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
 
@@ -1171,7 +1186,42 @@ async fn process_full_noun_mode(
 
         perf.mark("boolean_operation");
 
-
+        // ── instances_export 提前 spawn，与 boolean_operation 并行 ──
+        if db_option.export_instances && instances_export_handle.is_none() {
+            let mut dbnos: Vec<u32> = if let Some(nums) = db_option.inner.manual_db_nums.clone() {
+                nums
+            } else {
+                aios_core::query_mdb_db_nums(None, aios_core::DBType::DESI).await?
+            };
+            if let Some(exclude_nums) = &db_option.inner.exclude_db_nums {
+                use std::collections::HashSet;
+                let exclude: HashSet<u32> = exclude_nums.iter().copied().collect();
+                dbnos.retain(|dbnum| !exclude.contains(dbnum));
+            }
+            let mesh_dir =
+                Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes")).to_path_buf();
+            let output_dir = db_option.get_project_output_dir();
+            let inner = Arc::new(db_option.inner.clone());
+            instances_export_handle = Some(tokio::spawn(async move {
+                let t = Instant::now();
+                if let Err(e) = export_instances_json_for_dbnos(
+                    &dbnos,
+                    &mesh_dir,
+                    &output_dir,
+                    inner,
+                    true,
+                )
+                .await
+                {
+                    eprintln!("[instances] Full Noun 导出失败: {}", e);
+                } else {
+                    println!(
+                        "[instances] Full Noun 导出完成，用时 {} ms",
+                        t.elapsed().as_millis()
+                    );
+                }
+            }));
+        }
 
         // 4️⃣ 可选执行布尔运算
 
@@ -1289,8 +1339,6 @@ async fn process_full_noun_mode(
 
     }
 
-
-
     perf.mark("sqlite_spatial_index");
 
 
@@ -1333,58 +1381,14 @@ async fn process_full_noun_mode(
 
     perf.mark("instances_export");
 
-
-
-    // ✅ 模型生成完毕后导出 instances.json（按 dbno）
-
-    if db_option.export_instances {
-
-        let mut dbnos: Vec<u32> = if let Some(nums) = db_option.inner.manual_db_nums.clone() {
-
-            nums
-
-        } else {
-
-            aios_core::query_mdb_db_nums(None, aios_core::DBType::DESI).await?
-
-        };
-
-        if let Some(exclude_nums) = &db_option.inner.exclude_db_nums {
-
-            use std::collections::HashSet;
-
-            let exclude: HashSet<u32> = exclude_nums.iter().copied().collect();
-
-            dbnos.retain(|dbnum| !exclude.contains(dbnum));
-
+    // ── 等待 instances_export 后台任务完成 ──
+    if let Some(handle) = instances_export_handle {
+        let t_wait = Instant::now();
+        let _ = handle.await;
+        let wait_ms = t_wait.elapsed().as_millis();
+        if wait_ms > 50 {
+            println!("[instances] 等待后台导出完成: {} ms", wait_ms);
         }
-
-        let mesh_dir =
-
-            Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes"));
-
-        if let Err(e) = export_instances_json_for_dbnos(
-
-            &dbnos,
-
-            mesh_dir,
-
-            &db_option.get_project_output_dir(),
-
-            Arc::new(db_option.inner.clone()),
-
-            true,
-
-        )
-
-        .await
-
-        {
-
-            eprintln!("[instances] Full Noun 导出失败: {}", e);
-
-        }
-
     }
 
 
@@ -1601,7 +1605,8 @@ async fn process_targeted_generation(
 
     let replace_exist = db_option.inner.is_replace_mesh();
 
-    let use_surrealdb = db_option.use_surrealdb;
+    // 当 use_cache=true 时，严格 cache-only：不做任何 SurrealDB 兜底/回退，也不写入 inst_*。
+    let use_surrealdb = db_option.use_surrealdb && !db_option.use_cache;
 
     let cache_manager_for_insert = foyer_cache_ctx.as_ref().map(|c| c.cache_arc());
 
@@ -1856,24 +1861,28 @@ async fn process_targeted_generation(
 
             {
 
-                Ok(n) if n > 0 => {
-                    println!("[gen_model] mesh worker 缓存路径完成: {} 个", n);
+                Ok(n) => {
+                    println!(
+                        "[gen_model] mesh worker 缓存路径完成: 新生成 {} 个（use_cache=true，不回退 SurrealDB）",
+                        n
+                    );
                     ran_primary = true;
                 }
 
-                Ok(_) => {
-                    println!("[gen_model] mesh worker 缓存路径: 0 个 mesh，回退 SurrealDB");
-                }
-
                 Err(e) => {
-                    eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
+                    eprintln!(
+                        "[gen_model] mesh worker 缓存路径失败（use_cache=true，不回退 SurrealDB）: {}",
+                        e
+                    );
+                    return Err(FullNounError::Other(e));
                 }
 
             }
 
         }
 
-        if use_surrealdb && !ran_primary {
+        // 当 use_cache=true 时，严格遵守 cache-only 语义：不回退 SurrealDB mesh worker。
+        if use_surrealdb && !ran_primary && !db_option.use_cache {
 
             if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
 
@@ -2143,7 +2152,8 @@ async fn process_full_database_generation(
 
     let db_option_arc = Arc::new(db_option.clone());
 
-    let use_surrealdb = db_option.use_surrealdb;
+    // 当 use_cache=true 时，严格 cache-only：不做任何 SurrealDB 兜底/回退，也不写入 inst_*。
+    let use_surrealdb = db_option.use_surrealdb && !db_option.use_cache;
 
     let replace_exist = db_option.inner.is_replace_mesh();
 
@@ -2447,24 +2457,28 @@ async fn process_full_database_generation(
 
                 {
 
-                    Ok(n) if n > 0 => {
-                        println!("[gen_model] mesh worker 缓存路径完成: {} 个", n);
+                    Ok(n) => {
+                        println!(
+                            "[gen_model] mesh worker 缓存路径完成: 新生成 {} 个（use_cache=true，不回退 SurrealDB）",
+                            n
+                        );
                         ran_primary = true;
                     }
 
-                    Ok(_) => {
-                        println!("[gen_model] mesh worker 缓存路径: 0 个 mesh，回退 SurrealDB");
-                    }
-
                     Err(e) => {
-                        eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
+                        eprintln!(
+                            "[gen_model] mesh worker 缓存路径失败（use_cache=true，不回退 SurrealDB）: {}",
+                            e
+                        );
+                        return Err(FullNounError::Other(e));
                     }
 
                 }
 
             }
 
-            if use_surrealdb && !ran_primary {
+            // 当 use_cache=true 时，严格遵守 cache-only 语义：不回退 SurrealDB mesh worker。
+            if use_surrealdb && !ran_primary && !db_option.use_cache {
 
                 db_refnos
 

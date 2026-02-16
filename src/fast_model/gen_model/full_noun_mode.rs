@@ -880,19 +880,22 @@ async fn process_bran_hang_core_logic(
         println!("  [BRAN perf] 阶段4 gen_cata_instances: {} ms (offline_or_skipped)", t4_ms);
     }
 
-    // ── 阶段 5: 保存 tubi_info（仅 Direct 且 use_surrealdb=true） ──
+    // ── 阶段 5: 保存 tubi_info（异步后台，不阻塞阶段6） ──
     let t5 = Instant::now();
-    #[cfg(feature = "profile")]
-    let _span5 = tracing::info_span!("bran_save_tubi_info").entered();
-    if db_option.use_surrealdb {
+    let tubi_info_bg_handle = if db_option.use_surrealdb {
         if let Some(ref outcome) = cate_outcome {
-            let _ = pdms_inst::save_tubi_info_batch(&outcome.tubi_info_map).await;
+            let tubi_map = outcome.tubi_info_map.clone();
+            Some(tokio::spawn(async move {
+                let _ = pdms_inst::save_tubi_info_batch(&tubi_map).await;
+            }))
+        } else {
+            None
         }
-    }
-    #[cfg(feature = "profile")]
-    drop(_span5);
+    } else {
+        None
+    };
     let t5_ms = t5.elapsed().as_millis();
-    println!("  [BRAN perf] 阶段5 save_tubi_info: {} ms", t5_ms);
+    println!("  [BRAN perf] 阶段5 save_tubi_info: {} ms (async spawned)", t5_ms);
 
     // ── 阶段 6: 生成 Tubing（Generate 阶段；离线时 cache-only） ──
     let t6 = Instant::now();
@@ -939,6 +942,16 @@ async fn process_bran_hang_core_logic(
             t6_ms,
             tubi_result.err()
         );
+    }
+
+    // ── 等待后台 tubi_info 写入完成 ──
+    if let Some(handle) = tubi_info_bg_handle {
+        let t_wait = Instant::now();
+        let _ = handle.await;
+        let wait_ms = t_wait.elapsed().as_millis();
+        if wait_ms > 50 {
+            println!("  [BRAN perf] 阶段5 save_tubi_info 后台等待: {} ms", wait_ms);
+        }
     }
 
     // ── 汇总 ──

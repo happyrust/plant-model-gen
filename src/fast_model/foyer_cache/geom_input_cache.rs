@@ -936,7 +936,7 @@ pub async fn prefetch_all_geom_inputs_v2(
 /// 约定：用于 PrefetchThenGenerate 的"预取完成 -> 进入离线生成"前的完整性校验。
 /// - 若有缺失，直接返回错误（离线 Generate 阶段不允许回查 DB；miss 视为流程不正确）。
 /// - 调用方需保证已先 `init_global_geom_input_cache`。
-pub async fn ensure_geom_inputs_present_for_refnos_from_global(
+pub fn ensure_geom_inputs_present_for_refnos_from_global(
     loop_refnos: &[RefnoEnum],
     prim_refnos: &[RefnoEnum],
     cate_refnos: &[RefnoEnum],

@@ -627,7 +627,6 @@ pub async fn gen_full_noun_geos_optimized(
                     &prim_vec,
                     &cate_vec,
                 )
-                .await
                 .map_err(FullNounError::from)?;
 
                 if let Some(target_cata_map) = target_cata_map_for_validate {
@@ -1157,7 +1156,6 @@ async fn prefetch_bran_hang_inputs_for_offline_generate(
         )
         .await?;
         geom_input_cache::ensure_geom_inputs_present_for_refnos_from_global(&empty, &empty, child_refnos)
-            .await
             .map_err(FullNounError::from)?;
     }
 

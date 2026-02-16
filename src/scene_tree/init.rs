@@ -132,7 +132,7 @@ pub async fn init_scene_tree_from_root(
     );
 
     // 6. 导出 Parquet 文件（使用 root 的 dbnum）
-    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(root_refno).await?;
+    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(root_refno)?;
     let output_dir = crate::versioned_db::db_meta_info::get_project_tree_dir(&get_project_name_from_config());
     if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbnum, &output_dir).await {
         eprintln!("[scene_tree] Parquet 导出失败: {}", e);
@@ -221,7 +221,7 @@ async fn build_tree_from_world(
     let mut queue = VecDeque::new();
 
     // 层级查询统一走 TreeIndex（indextree），避免依赖 SurrealDB 的 pe_owner 递归查询。
-    let dbnum_u32 = TreeIndexManager::resolve_dbnum_for_refno(world_refno).await?;
+    let dbnum_u32 = TreeIndexManager::resolve_dbnum_for_refno(world_refno)?;
     let manager = TreeIndexManager::with_default_dir(vec![dbnum_u32]);
     let index = manager.load_index(dbnum_u32)?;
 

@@ -140,7 +140,7 @@ async fn capture_single(
     cache_dir: Option<PathBuf>,
 ) -> Result<()> {
     let refno_str = refno.to_string().replace('/', "_");
-    let basename = resolve_capture_basename(refno).await;
+    let basename = resolve_capture_basename(refno);
 
     fs::create_dir_all(&config.output_dir)
         .await
@@ -207,7 +207,7 @@ async fn capture_single(
     export_mesh_to_obj_with_unit_conversion(&mesh, obj_path_str, &common_config.unit_converter)?;
 
     let render_mesh = mesh_with_unit_conversion(&mesh, &common_config.unit_converter);
-    let display_label = get_display_label(refno).await;
+    let display_label = get_display_label(refno);
     render_mesh_to_png(
         &render_mesh,
         config.width,
@@ -362,7 +362,7 @@ fn diff_png(expected_path: &Path, actual_path: &Path, out_path: &Path) -> Result
     })
 }
 
-async fn resolve_capture_basename(refno: RefnoEnum) -> String {
+fn resolve_capture_basename(refno: RefnoEnum) -> String {
     // cache-only：导出/截图阶段不查库补齐 NAME/TYPE，避免引入 SurrealDB 依赖。
     let raw = refno.to_string().replace('/', "_");
     sanitize_label(&raw)
@@ -402,7 +402,7 @@ fn mesh_with_unit_conversion(mesh: &PlantMesh, unit_converter: &UnitConverter) -
     converted
 }
 
-async fn get_display_label(refno: RefnoEnum) -> String {
+fn get_display_label(refno: RefnoEnum) -> String {
     let refno_str = refno.to_string().trim_start_matches('/').to_string();
     refno_str
 }

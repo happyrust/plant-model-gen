@@ -99,7 +99,7 @@ async fn collect_use_cata_refnos_from_tree(
     let mut out: HashSet<RefnoEnum> = HashSet::new();
 
     for &root in roots {
-        let dbnum = match TreeIndexManager::resolve_dbnum_for_refno(root).await {
+        let dbnum = match TreeIndexManager::resolve_dbnum_for_refno(root) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -817,7 +817,7 @@ async fn process_gen_geos_data_chunks(
             // 这对于用户直接传入 BRAN refno 的场景是必需的
             for refno in target_refnos {
                 // cache-only：避免依赖 SurrealDB（SUL_DB 未初始化会报 ConnectionUninitialised）
-                let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(*refno).await else {
+                let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(*refno) else {
                     continue;
                 };
                 let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
@@ -1139,7 +1139,7 @@ async fn process_gen_geos_data_chunks(
             let mut loop_owner_refnos = Vec::new();
             for refno in target_refnos {
                 // cache-only：从 TreeIndex 读取 noun，避免依赖 SurrealDB。
-                let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(*refno).await else {
+                let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(*refno) else {
                     continue;
                 };
                 let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
@@ -1198,7 +1198,7 @@ async fn process_gen_geos_data_chunks(
 
                 let dbnums = if let Some(first_refno) = target_refnos.first() {
 
-                    match TreeIndexManager::resolve_dbnum_for_refno(*first_refno).await {
+                    match TreeIndexManager::resolve_dbnum_for_refno(*first_refno) {
 
                         Ok(dbnum) => {
 

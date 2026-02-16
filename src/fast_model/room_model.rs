@@ -3057,38 +3057,6 @@ fn transform_tri_mesh(mesh: &TriMesh, transform: Mat4) -> TriMesh {
 
 
 
-/// 清理几何缓存
-
-async fn cleanup_geometry_cache(cache: &DashMap<String, Arc<PlantMesh>>) {
-
-    // 简单的清理策略：移除一半的条目
-
-    let keys_to_remove: Vec<String> = cache
-
-        .iter()
-
-        .take(cache.len() / 2)
-
-        .map(|entry| entry.key().clone())
-
-        .collect();
-
-
-
-    for key in keys_to_remove {
-
-        cache.remove(&key);
-
-    }
-
-
-
-    info!("几何缓存清理完成，当前大小: {}", cache.len());
-
-}
-
-
-
 fn merge_aabb(a: &Aabb, b: &Aabb) -> Aabb {
 
     let mins = Point::new(

@@ -107,7 +107,6 @@ pub(crate) async fn split_shape_instances_by_dbnum(
             return Ok(*v);
         }
         let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno)
-            .await
             .map_err(|e| anyhow::anyhow!("缺少 ref0->dbnum 映射: refno={refno}, err={e}"))?;
         cache.insert(refno, dbnum);
         Ok(dbnum)
@@ -550,7 +549,7 @@ async fn filter_bran_hang_refnos(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
 
         }
 
-        let dbnum = match TreeIndexManager::resolve_dbnum_for_refno(r).await {
+        let dbnum = match TreeIndexManager::resolve_dbnum_for_refno(r) {
 
             Ok(v) => v,
 
@@ -1741,7 +1740,7 @@ async fn process_targeted_generation(
 
             for &owner in &branch_refnos {
 
-                let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(owner).await else {
+                let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(owner) else {
 
                     continue;
 

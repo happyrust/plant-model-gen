@@ -313,7 +313,7 @@ pub async fn gen_full_noun_geos_optimized(
     if need_bran_hang_stage {
         let mut bran_hanger_roots: HashSet<RefnoEnum> = HashSet::new();
         for noun in &["BRAN", "HANG"] {
-            let refnos = query_noun_refnos(noun, &dbnums, config.debug_limit_per_noun).await?;
+            let refnos = query_noun_refnos(noun, &dbnums, config.debug_limit_per_noun)?;
             if !refnos.is_empty() {
                 println!("[Pipeline] 收集到 {} 根节点: {} 个", noun, refnos.len());
                 bran_hanger_roots.extend(refnos);
@@ -534,7 +534,7 @@ pub async fn gen_full_noun_geos_optimized(
                 continue;
             }
 
-            let refnos = query_noun_refnos(noun_str, &dbnums, config.debug_limit_per_noun).await?;
+            let refnos = query_noun_refnos(noun_str, &dbnums, config.debug_limit_per_noun)?;
             if refnos.is_empty() {
                 continue;
             }
@@ -1520,7 +1520,7 @@ fn get_entry_nouns(config: &FullNounConfig) -> Vec<String> {
 }
 
 #[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "query_noun_refnos"))]
-async fn query_noun_refnos(noun: &str, dbnums: &[u32], limit: Option<usize>) -> Result<Vec<RefnoEnum>> {
+fn query_noun_refnos(noun: &str, dbnums: &[u32], limit: Option<usize>) -> Result<Vec<RefnoEnum>> {
     let tree_dbnums = resolve_tree_dbnums(dbnums)?;
     let manager = TreeIndexManager::with_default_dir(tree_dbnums);
     let mut refnos = manager.query_noun_refnos(noun, limit);

@@ -1659,7 +1659,6 @@ pub async fn export_all_relates_prepack_lod(
                     .unwrap_or_default()
             } else {
                 query_provider::query_by_noun_all_db(&nouns)
-                    .await
                     .unwrap_or_default()
             }
         }
@@ -1904,7 +1903,6 @@ pub async fn export_all_relates_prepack_lod_parquet(
                     .unwrap_or_default()
             } else {
                 query_provider::query_by_noun_all_db(&nouns)
-                    .await
                     .unwrap_or_default()
             }
         }
@@ -4988,7 +4986,7 @@ async fn group_refnos_by_dbnum(
             grouped.entry(dbnum).or_default().push(refno);
             continue;
         }
-        match TreeIndexManager::resolve_dbnum_for_refno(refno).await {
+        match TreeIndexManager::resolve_dbnum_for_refno(refno) {
             Ok(dbnum) => {
                 grouped.entry(dbnum).or_default().push(refno);
             }
@@ -5199,7 +5197,7 @@ pub async fn export_instances_json_for_refnos_grouped_by_dbno_merge(
         let mut recovered = false;
 
         if let Some(root) = root_refno {
-            match TreeIndexManager::resolve_dbnum_for_refno(root).await {
+            match TreeIndexManager::resolve_dbnum_for_refno(root) {
                 Ok(tree_dbnum) if tree_dbnum != dbnum => {
                     if verbose {
                         eprintln!(

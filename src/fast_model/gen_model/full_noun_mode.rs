@@ -823,10 +823,21 @@ async fn process_bran_hang_core_logic(
     let t3_ms = t3.elapsed().as_millis();
     println!("  [BRAN perf] 阶段3 prefetch_offline_inputs: {} ms", t3_ms);
 
-    // ── 阶段 4: 生成 CATE 几何（Generate 阶段；离线时只读缓存） ──
+    // ── 阶段 4: 生成 CATE 几何 + 并行预取 tubi_size/branch_meta ──
     let t4 = Instant::now();
     #[cfg(feature = "profile")]
     let _span4 = tracing::info_span!("bran_generate_cate").entered();
+
+    // 在阶段4（CATE 生成）之前 spawn tubi_size/branch_meta 预取，与阶段4并行
+    let prefetch_handle = if !ctx_generate.is_offline_generate() && !branch_refnos_map.is_empty() {
+        let all_child: Vec<RefnoEnum> = child_refnos.clone();
+        let branch_roots: Vec<RefnoEnum> = branch_refnos_map.iter().map(|x| *x.key()).collect();
+        Some(tokio::spawn(async move {
+            cata_model::prefetch_tubi_size_and_branch_meta(&all_child, &branch_roots).await
+        }))
+    } else {
+        None
+    };
 
     let mut cate_outcome = None;
     if !child_refnos.is_empty() {
@@ -906,6 +917,23 @@ async fn process_bran_hang_core_logic(
         .map(|o| o.local_al_map.clone())
         .unwrap_or_else(|| Arc::new(DashMap::new()));
 
+    // 等待预取结果（与阶段4并行执行的 tubi_size/branch_meta）
+    let prefetch_result = if let Some(handle) = prefetch_handle {
+        match handle.await {
+            Ok(Ok(r)) => Some(r),
+            Ok(Err(e)) => {
+                eprintln!("  [BRAN perf] tubi_size/branch_meta 预取失败（将回退内部预取）: {}", e);
+                None
+            }
+            Err(e) => {
+                eprintln!("  [BRAN perf] tubi_size/branch_meta 预取 task panic: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let tubi_result = if ctx_generate.is_offline_generate() {
         cata_model::gen_branch_tubi_cache_only(
             db_option.clone(),
@@ -916,12 +944,13 @@ async fn process_bran_hang_core_logic(
         )
         .await
     } else {
-        cata_model::gen_branch_tubi_from_db(
+        cata_model::gen_branch_tubi_from_db_with_prefetch(
             db_option.clone(),
             Arc::new(branch_refnos_map),
             loop_sjus_map_arc,
             sender,
             local_al_map,
+            prefetch_result,
         )
         .await
     };

@@ -153,8 +153,7 @@ pub async fn prefetch_cata_resolve_cache_for_target_map(
 ) -> anyhow::Result<PrefetchOutcome> {
     let t0 = Instant::now();
 
-    let cache_dir = db_option.get_foyer_cache_dir().join("cata_resolve_cache");
-    let cache_mgr = Arc::new(CataResolveCacheManager::new(&cache_dir).await?);
+    let cache_mgr = Arc::new(CataResolveCacheManager::new());
 
     let replace_exist = db_option.inner.is_replace_mesh();
     let concurrency = cata_resolve_cache_prefetch_concurrency();
@@ -165,8 +164,8 @@ pub async fn prefetch_cata_resolve_cache_for_target_map(
     let total_groups = keys.len();
 
     println!(
-        "[cata_resolve_cache_pipeline] prefetch start: total_groups={}, concurrency={}, cache_dir={:?}, replace_exist={}",
-        total_groups, concurrency, cache_dir, replace_exist
+        "[cata_resolve_cache_pipeline] prefetch start: total_groups={}, concurrency={}, replace_exist={}",
+        total_groups, concurrency, replace_exist
     );
 
     let mut join_set = tokio::task::JoinSet::new();
@@ -195,7 +194,7 @@ pub async fn prefetch_cata_resolve_cache_for_target_map(
             let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
             let _permit = sem.acquire_owned().await.expect("semaphore closed");
 
-            if cache_mgr.get(&cata_hash).await.is_some() {
+            if cache_mgr.get(&cata_hash).is_some() {
                 return Ok::<_, anyhow::Error>((job_id, cata_hash, "hit".to_string()));
             }
 

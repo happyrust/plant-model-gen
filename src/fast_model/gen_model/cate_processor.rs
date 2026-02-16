@@ -103,8 +103,8 @@ async fn gen_cate_instances_from_cache_only(
     strict: bool,
 ) -> Result<()> {
     // 1) cate inst 输入：仅从 geom_input_cache 读取
-    geom_input_cache::init_global_geom_input_cache(ctx.db_option.as_ref()).await?;
-    let cate_inputs = geom_input_cache::load_cate_inputs_for_refnos_from_global(refnos).await?;
+    geom_input_cache::init_global_geom_input_cache();
+    let cate_inputs = geom_input_cache::load_cate_inputs_for_refnos_from_global(refnos)?;
     if cate_inputs.len() != refnos.len() {
         let mut missing: Vec<RefnoEnum> = refnos
             .iter()
@@ -145,8 +145,7 @@ async fn gen_cate_instances_from_cache_only(
     }
 
     // 2) prepared geos/ptset：仅从 cata_resolve_cache 读取
-    let cache_dir = ctx.db_option.get_foyer_cache_dir().join("cata_resolve_cache");
-    cata_resolve_cache::init_global_cata_resolve_cache(cache_dir).await?;
+    cata_resolve_cache::init_global_cata_resolve_cache();
     let Some(resolve_cache) = cata_resolve_cache::global_cata_resolve_cache() else {
         cache_miss_report::with_global_report(|r| {
             r.record_simple_miss(
@@ -167,7 +166,7 @@ async fn gen_cate_instances_from_cache_only(
         let group_refnos = kv.value().group_refnos.clone();
         drop(kv);
 
-        let Some(resolved_comp) = resolve_cache.get(&cata_hash).await else {
+        let Some(resolved_comp) = resolve_cache.get(&cata_hash) else {
             cache_miss_report::with_global_report(|r| {
                 for &rno in &group_refnos {
                     r.record_refno_miss(

@@ -13,6 +13,7 @@ use std::convert::Infallible;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
+use surrealdb::types::SurrealValue;
 use tracing::{error, info, warn};
 
 use crate::data_interface::db_meta_manager::db_meta;
@@ -242,26 +243,26 @@ async fn filter_geo_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum
             .collect::<Vec<_>>()
             .join(",");
 
-        let sql = format!(
-            "SELECT VALUE {{ refno: meta::id(id), noun: noun }} FROM [{id_list}]"
-        );
-        let rows: Vec<serde_json::Value> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let sql = format!("SELECT id as refno, noun FROM [{id_list}]");
+        let rows: Vec<PeNounRow> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
         for row in rows {
-            let refno_str = row.get("refno").and_then(|v| v.as_str()).unwrap_or("");
-            let noun = row.get("noun").and_then(|v| v.as_str()).unwrap_or("");
-            if refno_str.is_empty() || noun.is_empty() {
+            if row.noun.is_empty() {
                 continue;
             }
-            if !crate::scene_tree::is_geo_noun(noun) {
+            if !crate::scene_tree::is_geo_noun(&row.noun) {
                 continue;
             }
-            if let Ok(r) = RefnoEnum::from_str(refno_str) {
-                out.push(r);
-            }
+            out.push(row.refno);
         }
     }
 
     Ok(out)
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct PeNounRow {
+    refno: RefnoEnum,
+    noun: String,
 }
 
 /// 检查哪些 refno 还没有生成模型

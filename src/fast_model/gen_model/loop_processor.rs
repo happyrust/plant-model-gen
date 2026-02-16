@@ -38,7 +38,7 @@ pub async fn process_loop_refno_page(
 
     // 离线生成：Generate 阶段只读 geom_input_cache；miss 视为流程不正确（应由 Prefetch 填满）。
     if ctx.is_offline_generate() {
-        let inputs = geom_input_cache::load_loop_inputs_for_refnos_from_global(refnos).await?;
+        let inputs = geom_input_cache::load_loop_inputs_for_refnos_from_global(refnos)?;
         if inputs.len() != refnos.len() {
             let miss_cnt = refnos.len() - inputs.len();
             // 逐 refno 记录，便于后续精确补齐 prefetch 缺口

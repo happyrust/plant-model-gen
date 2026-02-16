@@ -582,33 +582,34 @@ pub async fn run_boolean_worker_from_cache_manager(
         return Ok(0);
     }
 
+    // ── 阶段 1：轻量扫描 inst_info，收集布尔目标（不加载 inst_geos） ──
     let mut inst_info_map: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
-    let mut inst_geos_map: HashMap<String, EleInstGeosData> = HashMap::new();
     let mut neg_relate_map: HashMap<RefnoEnum, Vec<RefnoEnum>> = HashMap::new();
     let mut ngmr_relate_map: HashMap<RefnoEnum, Vec<(RefnoEnum, RefnoEnum)>> = HashMap::new();
-    // 记录每个 target(refno) 属于哪个 dbnum，用于回写 inst_relate_bool 到 instance_cache。
     let mut target_locations: HashMap<RefnoEnum, u32> = HashMap::new();
-    // 元件库（CATE）布尔：以 inst_info.has_cata_neg 为准补齐 targets（CataNeg 不经 neg_relate_map 指向）。
     let mut cata_targets: HashSet<RefnoEnum> = HashSet::new();
+    // 记录每个 refno 的 inst_key，阶段 2 按需加载 geos
+    let mut refno_inst_keys: HashMap<RefnoEnum, String> = HashMap::new();
 
-    for dbnum in dbnums {
-        let refnos = cache_manager.list_refnos(dbnum);
+    for dbnum in &dbnums {
+        let refnos = cache_manager.list_refnos(*dbnum);
         for refno in refnos {
-            let Some(cached) = cache_manager.get_inst_info(dbnum, refno).await else {
+            let Some(cached) = cache_manager.get_inst_info(*dbnum, refno).await else {
                 continue;
             };
 
             if cached.info.has_cata_neg {
                 cata_targets.insert(refno);
-                target_locations.entry(refno).or_insert(dbnum);
+                target_locations.entry(refno).or_insert(*dbnum);
             }
             if !cached.neg_relates.is_empty() {
-                target_locations.entry(refno).or_insert(dbnum);
+                target_locations.entry(refno).or_insert(*dbnum);
             }
             if !cached.ngmr_neg_relates.is_empty() {
-                target_locations.entry(refno).or_insert(dbnum);
+                target_locations.entry(refno).or_insert(*dbnum);
             }
 
+            refno_inst_keys.insert(refno, cached.inst_key);
             inst_info_map.entry(refno).or_insert(cached.info);
             if !cached.neg_relates.is_empty() {
                 neg_relate_map.entry(refno).or_insert(cached.neg_relates);
@@ -616,22 +617,9 @@ pub async fn run_boolean_worker_from_cache_manager(
             if !cached.ngmr_neg_relates.is_empty() {
                 ngmr_relate_map.entry(refno).or_insert(cached.ngmr_neg_relates);
             }
-
-            // geos 按 inst_key 去重
-            let inst_key = cached.inst_key;
-            if !inst_geos_map.contains_key(&inst_key) {
-                if let Some(geos) = cache_manager.get_inst_geos(dbnum, &inst_key).await {
-                    inst_geos_map.insert(inst_key, geos.geos_data);
-                }
-            }
         }
     }
 
-    let mut processed = 0usize;
-    // 目标集合：
-    // - 元件库（CATE）负实体：以 inst_info.has_cata_neg 为准；
-    // - 设计型负实体：以 neg_relate/ngmr_relate 的 key 为准；
-    // 同时过滤掉“看起来像 refno 但实际上是 geom_refno”的 key（即 inst_info_map 中不存在者）。
     let mut targets: HashSet<RefnoEnum> = HashSet::new();
     targets.extend(cata_targets.iter().copied());
     targets.extend(
@@ -647,7 +635,6 @@ pub async fn run_boolean_worker_from_cache_manager(
             .filter(|r| inst_info_map.contains_key(r)),
     );
 
-    // 如果指定了过滤集合，只处理该集合内的 refno（用于 debug_model 模式）
     if let Some(filter_set) = filter_refnos {
         let before_count = targets.len();
         targets.retain(|r| filter_set.contains(r));
@@ -659,6 +646,43 @@ pub async fn run_boolean_worker_from_cache_manager(
             );
         }
     }
+
+    if targets.is_empty() {
+        println!("[boolean_worker_cache] 布尔运算完成: 0 个（无布尔目标，跳过 geos 加载）");
+        return Ok(0);
+    }
+
+    // ── 阶段 2：仅为有布尔目标的 refno 加载 inst_geos ──
+    let mut inst_geos_map: HashMap<String, EleInstGeosData> = HashMap::new();
+    // 收集所有需要的 inst_key（targets + 它们的 neg_relate 引用的 refno）
+    let mut needed_refnos: HashSet<RefnoEnum> = targets.clone();
+    for refno in &targets {
+        if let Some(negs) = neg_relate_map.get(refno) {
+            needed_refnos.extend(negs.iter().copied());
+        }
+        if let Some(ngmrs) = ngmr_relate_map.get(refno) {
+            for (a, b) in ngmrs {
+                needed_refnos.insert(*a);
+                needed_refnos.insert(*b);
+            }
+        }
+    }
+    for refno in &needed_refnos {
+        let Some(inst_key) = refno_inst_keys.get(refno) else {
+            continue;
+        };
+        if inst_geos_map.contains_key(inst_key) {
+            continue;
+        }
+        let dbnum = target_locations.get(refno).copied()
+            .or_else(|| dbnums.first().copied())
+            .unwrap_or(0);
+        if let Some(geos) = cache_manager.get_inst_geos(dbnum, inst_key).await {
+            inst_geos_map.insert(inst_key.clone(), geos.geos_data);
+        }
+    }
+
+    let mut processed = 0usize;
 
     for refno in targets {
         let Some(info) = inst_info_map.get(&refno) else {

@@ -4917,9 +4917,160 @@ fn write_geometry_manifest_parquet(path: PathBuf, manifest: &PrepackGeometryMani
 // 占位符函数：修复预先缺失的函数
 // ============================================================================
 
+fn resolve_project_output_root(output_dir: &Path, db_option: &DbOption) -> PathBuf {
+    if db_option.project_name.is_empty() {
+        return output_dir.to_path_buf();
+    }
+    match output_dir.file_name().and_then(|n| n.to_str()) {
+        Some(name) if name == db_option.project_name => output_dir.to_path_buf(),
+        _ => output_dir.join(&db_option.project_name),
+    }
+}
+
+fn resolve_instances_output_dir(output_dir: &Path, db_option: &DbOption) -> PathBuf {
+    resolve_project_output_root(output_dir, db_option).join("instances")
+}
+
+fn resolve_cache_dir(project_output_root: &Path) -> PathBuf {
+    if let Ok(dir) = std::env::var("FOYER_CACHE_DIR") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    let project_cache_dir = project_output_root.join("instance_cache");
+    if project_cache_dir.exists() {
+        return project_cache_dir;
+    }
+    let shared_cache_dir = PathBuf::from("output/instance_cache");
+    if shared_cache_dir.exists() {
+        return shared_cache_dir;
+    }
+    project_cache_dir
+}
+
+#[derive(Debug, Deserialize)]
+struct InstancesSnapshotLite {
+    #[serde(default)]
+    groups: Vec<serde_json::Value>,
+    #[serde(default)]
+    instances: Vec<serde_json::Value>,
+}
+
+fn instances_non_empty(instances_file: &Path) -> Result<bool> {
+    let bytes = fs::read(instances_file)
+        .with_context(|| format!("读取 instances 文件失败: {}", instances_file.display()))?;
+    let data: InstancesSnapshotLite = serde_json::from_slice(&bytes)
+        .with_context(|| format!("解析 instances 文件失败: {}", instances_file.display()))?;
+    Ok(!(data.groups.is_empty() && data.instances.is_empty()))
+}
+
+fn ensure_instances_non_empty(instances_file: &Path, reason: &str) -> Result<()> {
+    if instances_non_empty(instances_file)? {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "instances 导出为空: {} ({})",
+        instances_file.display(),
+        reason
+    );
+}
+
+async fn group_refnos_by_dbnum(
+    refnos: &[RefnoEnum],
+    verbose: bool,
+) -> HashMap<u32, Vec<RefnoEnum>> {
+    let _ = crate::data_interface::db_meta_manager::db_meta().ensure_loaded();
+    let meta = crate::data_interface::db_meta_manager::db_meta();
+
+    let mut grouped: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
+    for &refno in refnos {
+        if let Some(dbnum) = meta.get_dbnum_by_refno(refno) {
+            grouped.entry(dbnum).or_default().push(refno);
+            continue;
+        }
+        match TreeIndexManager::resolve_dbnum_for_refno(refno).await {
+            Ok(dbnum) => {
+                grouped.entry(dbnum).or_default().push(refno);
+            }
+            Err(e) => {
+                if verbose {
+                    eprintln!("[instances] 无法解析 refno 的 dbnum: refno={} err={}", refno, e);
+                }
+            }
+        }
+    }
+    grouped
+}
+
+async fn export_instances_for_single_dbnum_merge(
+    dbnum: u32,
+    root_refno: Option<RefnoEnum>,
+    mesh_dir: &Path,
+    instances_dir: &Path,
+    cache_dir: &Path,
+    db_option: Arc<DbOption>,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    let instances_path = instances_dir.join(format!("instances_{}.json", dbnum));
+    let mut errors: Vec<String> = Vec::new();
+
+    match export_dbnum_instances_json_from_cache(
+        dbnum,
+        instances_dir,
+        cache_dir,
+        Some(mesh_dir),
+        None,
+        verbose,
+        None,
+        false,
+    )
+    .await
+    {
+        Ok(_) => {
+            if let Err(e) =
+                ensure_instances_non_empty(&instances_path, &format!("dbnum={} cache 导出", dbnum))
+            {
+                errors.push(format!("cache 空结果: {e:#}"));
+            } else {
+                return Ok(());
+            }
+        }
+        Err(e) => {
+            errors.push(format!("cache 导出失败: {e:#}"));
+        }
+    }
+
+    match export_dbnum_instances_json(
+        dbnum,
+        instances_dir,
+        db_option,
+        verbose,
+        None,
+        root_refno,
+        false,
+    )
+    .await
+    {
+        Ok(_) => {
+            if let Err(e) = ensure_instances_non_empty(
+                &instances_path,
+                &format!("dbnum={} Surreal 回退导出", dbnum),
+            ) {
+                errors.push(format!("surreal 空结果: {e:#}"));
+            } else {
+                return Ok(());
+            }
+        }
+        Err(e) => {
+            errors.push(format!("surreal 导出失败: {e:#}"));
+        }
+    }
+
+    anyhow::bail!("dbnum={} instances 导出失败: {}", dbnum, errors.join(" | "));
+}
+
 /// 导出指定 dbnos 的 instances.json（按 dbnum 分组）
 ///
-/// 这是一个占位符函数，用于修复预先缺失的函数定义。
 /// 内部调用 export_dbnum_instances_json 为每个 dbnum 导出。
 pub async fn export_instances_json_for_dbnos(
     dbnos: &[u32],
@@ -4928,19 +5079,17 @@ pub async fn export_instances_json_for_dbnos(
     db_option: Arc<DbOption>,
     _verbose: bool,
 ) -> anyhow::Result<()> {
-    // 约定：instances 输出固定落到 `${output_dir}/instances`，以匹配前端 `/files/output/instances/*`。
-    let instances_dir = output_dir.join("instances");
+    let instances_dir = resolve_instances_output_dir(output_dir, &db_option);
     fs::create_dir_all(&instances_dir)
         .with_context(|| format!("创建 instances 输出目录失败: {}", instances_dir.display()))?;
     for &dbnum in dbnos {
-        export_dbnum_instances_json(dbnum, &instances_dir, db_option.clone(), false, None, None, true).await?;
+        export_dbnum_instances_json(dbnum, &instances_dir, db_option.clone(), false, None, None, false).await?;
     }
     Ok(())
 }
 
 /// 导出指定 refnos 的 instances.json（按 dbnum 分组）
 ///
-/// 这是一个占位符函数，用于修复预先缺失的函数定义。
 /// 内部调用 export_dbnum_instances_json 为每个 dbnum 导出。
 ///
 /// ## 实现说明
@@ -4953,36 +5102,45 @@ pub async fn export_instances_json_for_refnos_grouped_by_dbno(
     _mesh_dir: &Path,
     output_dir: &Path,
     db_option: Arc<DbOption>,
-    _verbose: bool,
+    verbose: bool,
 ) -> anyhow::Result<()> {
-    // 从 refnos 中提取所有唯一的 dbnum
-    // 使用 TreeIndexManager::resolve_dbnum_for_refno 正确解析 dbnum
-    use std::collections::HashSet;
-    use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
-
-    let mut dbnos: HashSet<u32> = HashSet::new();
-    for refno in refnos {
-        if let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(*refno).await {
-            dbnos.insert(dbnum);
-        } else {
-            log::warn!("无法解析 refno {} 的 dbnum，跳过", refno);
-        }
+    if refnos.is_empty() {
+        return Ok(());
     }
 
-    // 为每个 dbnum 导出
-    let instances_dir = output_dir.join("instances");
+    let grouped = group_refnos_by_dbnum(refnos, verbose).await;
+    if grouped.is_empty() {
+        anyhow::bail!("传入 refnos 无法解析到任何 dbnum，无法导出 instances");
+    }
+
+    let mut dbnos: Vec<u32> = grouped.keys().copied().collect();
+    dbnos.sort_unstable();
+
+    let instances_dir = resolve_instances_output_dir(output_dir, &db_option);
     fs::create_dir_all(&instances_dir)
         .with_context(|| format!("创建 instances 输出目录失败: {}", instances_dir.display()))?;
+
     for dbnum in dbnos {
-        export_dbnum_instances_json(dbnum, &instances_dir, db_option.clone(), false, None, None, true).await?;
+        let root_refno = grouped.get(&dbnum).and_then(|v| v.first()).copied();
+        export_dbnum_instances_json(
+            dbnum,
+            &instances_dir,
+            db_option.clone(),
+            false,
+            None,
+            root_refno,
+            false,
+        )
+        .await?;
+        let instances_path = instances_dir.join(format!("instances_{}.json", dbnum));
+        ensure_instances_non_empty(&instances_path, &format!("dbnum={} Surreal 导出", dbnum))?;
     }
     Ok(())
 }
 
 /// 导出指定 refnos 的 instances.json（按 dbnum 分组，合并追加模式）
 ///
-/// 这是一个占位符函数，用于修复预先缺失的函数定义。
-/// 目前与 export_instances_json_for_refnos_grouped_by_dbno 行为相同。
+/// merge 模式优先使用 foyer cache 导出，若失败或结果为空则回退 SurrealDB 导出。
 pub async fn export_instances_json_for_refnos_grouped_by_dbno_merge(
     refnos: &[RefnoEnum],
     mesh_dir: &Path,
@@ -4990,5 +5148,114 @@ pub async fn export_instances_json_for_refnos_grouped_by_dbno_merge(
     db_option: Arc<DbOption>,
     verbose: bool,
 ) -> anyhow::Result<()> {
-    export_instances_json_for_refnos_grouped_by_dbno(refnos, mesh_dir, output_dir, db_option, verbose).await
+    if refnos.is_empty() {
+        return Ok(());
+    }
+
+    let grouped = group_refnos_by_dbnum(refnos, verbose).await;
+    if grouped.is_empty() {
+        anyhow::bail!("传入 refnos 无法解析到任何 dbnum，无法导出 instances");
+    }
+
+    let mut dbnos: Vec<u32> = grouped.keys().copied().collect();
+    dbnos.sort_unstable();
+
+    let project_output_root = resolve_project_output_root(output_dir, &db_option);
+    let instances_dir = project_output_root.join("instances");
+    fs::create_dir_all(&instances_dir)
+        .with_context(|| format!("创建 instances 输出目录失败: {}", instances_dir.display()))?;
+
+    let cache_dir = resolve_cache_dir(&project_output_root);
+    if verbose {
+        println!(
+            "[instances] merge 导出: project_root={}, cache_dir={}",
+            project_output_root.display(),
+            cache_dir.display()
+        );
+    }
+
+    for dbnum in dbnos {
+        let root_refno = grouped.get(&dbnum).and_then(|v| v.first()).copied();
+        let instances_path = instances_dir.join(format!("instances_{}.json", dbnum));
+        let primary = export_instances_for_single_dbnum_merge(
+            dbnum,
+            root_refno,
+            mesh_dir,
+            &instances_dir,
+            &cache_dir,
+            db_option.clone(),
+            verbose,
+        )
+        .await;
+        if primary.is_ok() {
+            continue;
+        }
+
+        let mut errors: Vec<String> = vec![format!(
+            "primary(db_meta_dbnum={}) 失败: {}",
+            dbnum,
+            primary.err().map(|e| e.to_string()).unwrap_or_default()
+        )];
+        let mut recovered = false;
+
+        if let Some(root) = root_refno {
+            match TreeIndexManager::resolve_dbnum_for_refno(root).await {
+                Ok(tree_dbnum) if tree_dbnum != dbnum => {
+                    if verbose {
+                        eprintln!(
+                            "[instances] dbnum 映射不一致: refno={} db_meta_dbnum={} tree_dbnum={}，尝试 tree_dbnum 回退",
+                            root, dbnum, tree_dbnum
+                        );
+                    }
+                    match export_instances_for_single_dbnum_merge(
+                        tree_dbnum,
+                        Some(root),
+                        mesh_dir,
+                        &instances_dir,
+                        &cache_dir,
+                        db_option.clone(),
+                        verbose,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            let tree_instances_path =
+                                instances_dir.join(format!("instances_{}.json", tree_dbnum));
+                            fs::copy(&tree_instances_path, &instances_path).with_context(|| {
+                                format!(
+                                    "tree_dbnum 回退成功后回填目标文件失败: {} -> {}",
+                                    tree_instances_path.display(),
+                                    instances_path.display()
+                                )
+                            })?;
+                            ensure_instances_non_empty(
+                                &instances_path,
+                                &format!(
+                                    "dbnum={} 回填自 tree_dbnum={} 导出结果",
+                                    dbnum, tree_dbnum
+                                ),
+                            )?;
+                            recovered = true;
+                        }
+                        Err(e) => {
+                            errors.push(format!(
+                                "tree_dbnum 回退失败 (tree_dbnum={}): {}",
+                                tree_dbnum, e
+                            ));
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    errors.push(format!("解析 tree_dbnum 失败: refno={} err={}", root, e));
+                }
+            }
+        }
+
+        if !recovered {
+            anyhow::bail!("dbnum={} instances 导出失败: {}", dbnum, errors.join(" | "));
+        }
+    }
+
+    Ok(())
 }

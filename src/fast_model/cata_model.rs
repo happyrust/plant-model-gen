@@ -258,7 +258,7 @@ pub async fn prefetch_tubi_size_and_branch_meta(
     let t_start = Instant::now();
     let sem = Arc::new(Semaphore::new(12));
 
-    // ── 阶段1: LSTU→CATR 过滤（轻量） ──
+    // ── 阶段1: LSTU→CATR 过滤 ──
     let cat_ref_cache: Arc<DashMap<RefnoEnum, RefnoEnum>> = Arc::new(DashMap::new());
     {
         let mut handles = Vec::new();
@@ -284,6 +284,7 @@ pub async fn prefetch_tubi_size_and_branch_meta(
             let _ = h.await;
         }
     }
+
     let p6_valid = cat_ref_cache.len();
     let p6_skip = all_child_refnos.len() - p6_valid;
     let phase1_ms = t_start.elapsed().as_millis();
@@ -787,13 +788,11 @@ async fn gen_cata_geos_inner(
     // resolve_desi_comp 产物缓存（按 cata_hash）。命中时跳过 gen_cata_single_geoms + shape->inst_geo 转换。
     // 初始化失败则自动退化为旧路径（不影响正确性）。
     let cata_resolve_cache: Option<Arc<CataResolveCacheManager>> = if process_cata {
-        let cache_dir = db_option.get_foyer_cache_dir().join("cata_resolve_cache");
-        match CataResolveCacheManager::new(&cache_dir).await {
+        match std::panic::catch_unwind(|| CataResolveCacheManager::new()) {
             Ok(mgr) => Some(Arc::new(mgr)),
             Err(e) => {
                 tracing::warn!(
-                    "init cata_resolve_cache failed, fallback to non-cache path: dir={:?}, err={}",
-                    cache_dir,
+                    "init cata_resolve_cache failed, fallback to non-cache path: err={:?}",
                     e
                 );
                 None
@@ -849,7 +848,7 @@ async fn gen_cata_geos_inner(
         // 预取/预执行完成后，4 个 batch 的主循环（纯 cache hit + per-element 处理）并发执行。
         // ════════════════════════════════════════════════════════════════════════════
 
-        // ── P0 优化（全局）：批量并发预取 attmap / transform / generic_type ──
+        // ── P0 优化（全局）：批量并发预取 attmap + transform ──
         let t_prefetch_global = Instant::now();
         {
             let mut all_refnos: Vec<RefnoEnum> = Vec::new();
@@ -933,7 +932,7 @@ async fn gen_cata_geos_inner(
                     let _permit = sem.acquire().await.unwrap();
 
                     if let Some(cache_mgr) = cata_resolve_cache.as_ref() {
-                        if cache_mgr.get(&cata_hash_owned).await.is_some() {
+                        if cache_mgr.get(&cata_hash_owned).is_some() {
                             pre_gen_skip_cache.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             return;
                         }
@@ -1264,7 +1263,7 @@ async fn gen_cata_geos_inner(
 
                     // 优先走 foyer cache：缓存命中时，直接构造 inst_geo/inst_info 所需的数据并写入 sender。
                     if let Some(cache_mgr) = cata_resolve_cache.as_ref() {
-                        if let Some(resolved_comp) = cache_mgr.get(&cata_hash).await {
+                        if let Some(resolved_comp) = cache_mgr.get(&cata_hash) {
                             debug_model_debug!(
                                 "[cata_hash={}] resolve_desi_comp cache hit (foyer/rkyv)",
                                 cata_hash
@@ -2605,7 +2604,6 @@ async fn gen_cata_geos_inner(
         // 批量从 transform_cache 读取 world_transform（内存缓存 + pe_transform batch fallback）。
         let t_prefetch = Instant::now();
         let all_child_refnos_vec: Vec<RefnoEnum> = all_child_refnos.iter().copied().collect();
-        // cache-only：只读 transform_cache；非 cache-only：可走 cache-first + DB fallback。
         let mut prefetch_targets: Vec<RefnoEnum> = all_child_refnos_vec.clone();
         prefetch_targets.extend(branch_map.iter().map(|x| *x.key()));
         prefetch_targets.sort_by_key(|r| r.refno());

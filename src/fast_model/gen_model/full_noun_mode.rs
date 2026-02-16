@@ -419,8 +419,7 @@ pub async fn gen_full_noun_geos_optimized(
                 loop_vec.len(),
                 prim_refnos_for_prefetch.len()
             );
-            geom_input_cache::init_global_geom_input_cache(ctx_prefetch.db_option.as_ref())
-                .await?;
+            geom_input_cache::init_global_geom_input_cache();
             let _ = geom_input_cache::prefetch_all_geom_inputs(
                 ctx_prefetch.db_option.as_ref(),
                 &loop_vec,
@@ -468,7 +467,7 @@ pub async fn gen_full_noun_geos_optimized(
 
         if !cate_vec.is_empty() {
             let t_prefetch = Instant::now();
-            geom_input_cache::init_global_geom_input_cache(ctx.db_option.as_ref()).await?;
+            geom_input_cache::init_global_geom_input_cache();
             let (_, _, cate_n) = geom_input_cache::prefetch_all_geom_inputs_v2(
                 ctx.db_option.as_ref(),
                 &[],
@@ -587,8 +586,7 @@ pub async fn gen_full_noun_geos_optimized(
                 );
 
                 // 全局 geom_input_cache 已在 orchestrator 初始化；这里再 init 一次保证 Full Noun 直调也可用。
-                geom_input_cache::init_global_geom_input_cache(ctx_prefetch.db_option.as_ref())
-                    .await?;
+                geom_input_cache::init_global_geom_input_cache();
                 let _ = geom_input_cache::prefetch_all_geom_inputs_v2(
                     ctx_prefetch.db_option.as_ref(),
                     &loop_vec,
@@ -634,8 +632,7 @@ pub async fn gen_full_noun_geos_optimized(
 
                 if let Some(target_cata_map) = target_cata_map_for_validate {
                     if !target_cata_map.is_empty() {
-                        let cache_dir = ctx_prefetch.db_option.get_foyer_cache_dir().join("cata_resolve_cache");
-                        cata_resolve_cache::init_global_cata_resolve_cache(cache_dir).await?;
+                        cata_resolve_cache::init_global_cata_resolve_cache();
                         let Some(resolve_cache) = cata_resolve_cache::global_cata_resolve_cache() else {
                             return Err(anyhow::anyhow!("global_cata_resolve_cache 未初始化").into());
                         };
@@ -646,7 +643,7 @@ pub async fn gen_full_noun_geos_optimized(
                         for kv in target_cata_map.iter() {
                             let key = kv.key().clone();
                             drop(kv);
-                            if resolve_cache.get(&key).await.is_none() {
+                            if resolve_cache.get(&key).is_none() {
                                 missing_keys.push(key);
                             }
                         }
@@ -1150,7 +1147,7 @@ async fn prefetch_bran_hang_inputs_for_offline_generate(
 
     // 1) 预取 CATE inputs（child_refnos）
     if !child_refnos.is_empty() {
-        geom_input_cache::init_global_geom_input_cache(ctx_prefetch.db_option.as_ref()).await?;
+        geom_input_cache::init_global_geom_input_cache();
         let empty: Vec<RefnoEnum> = Vec::new();
         let _ = geom_input_cache::prefetch_all_geom_inputs_v2(
             ctx_prefetch.db_option.as_ref(),
@@ -1179,8 +1176,7 @@ async fn prefetch_bran_hang_inputs_for_offline_generate(
             .into());
         }
 
-        let cache_dir = ctx_prefetch.db_option.get_foyer_cache_dir().join("cata_resolve_cache");
-        cata_resolve_cache::init_global_cata_resolve_cache(cache_dir).await?;
+        cata_resolve_cache::init_global_cata_resolve_cache();
         let Some(resolve_cache) = cata_resolve_cache::global_cata_resolve_cache() else {
             return Err(anyhow::anyhow!("global_cata_resolve_cache 未初始化").into());
         };
@@ -1191,7 +1187,7 @@ async fn prefetch_bran_hang_inputs_for_offline_generate(
         for kv in target_cata_map.iter() {
             let key = kv.key().clone();
             drop(kv);
-            if resolve_cache.get(&key).await.is_none() {
+            if resolve_cache.get(&key).is_none() {
                 missing_keys.push(key);
             }
         }
@@ -1213,8 +1209,8 @@ async fn prefetch_bran_hang_inputs_for_offline_generate(
         // 3) 将 BRAN/HANG meta（HPOS/TPOS/尺寸/类型）写入 instance_cache.inst_info_map
         //    以及将子元件 ptset_map 写入 instance_cache（用于 cache-only tubi 生成）。
         db_meta().ensure_loaded()?;
-        geom_input_cache::init_global_geom_input_cache(ctx_prefetch.db_option.as_ref()).await?;
-        let cate_inputs = geom_input_cache::load_cate_inputs_for_refnos_from_global(child_refnos).await?;
+        geom_input_cache::init_global_geom_input_cache();
+        let cate_inputs = geom_input_cache::load_cate_inputs_for_refnos_from_global(child_refnos)?;
 
         let mut inst_infos: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
 
@@ -1224,7 +1220,7 @@ async fn prefetch_bran_hang_inputs_for_offline_generate(
             let group_refnos = kv.value().group_refnos.clone();
             drop(kv);
 
-            let Some(resolved_comp) = resolve_cache.get(&cata_hash).await else {
+            let Some(resolved_comp) = resolve_cache.get(&cata_hash) else {
                 return Err(anyhow::anyhow!(
                     "cata_resolve_cache miss（已校验仍缺失）：cata_hash={}",
                     cata_hash

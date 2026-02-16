@@ -243,8 +243,9 @@ async fn check_pe_transform(
         return Ok(());
     }
 
-    let dir = crate::fast_model::transform_cache::ensure_transform_cache_dir(db_option)?;
-    println!("[precheck] ✅ transform_cache 目录已就绪: {}", dir.display());
+    // transform_cache 已改为纯内存，无需磁盘目录
+    crate::fast_model::transform_cache::init_global_transform_cache();
+    println!("[precheck] ✅ transform_cache 已初始化（纯内存）");
     Ok(())
 }
 

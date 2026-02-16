@@ -678,7 +678,7 @@ async fn consume_batches_loop(
         let mut loop_inputs: HashMap<RefnoEnum, LoopInput> = HashMap::new();
         let mut miss_count = 0u64;
         for &refno in &task.refnos {
-            if let Some(input) = cache.get_loop_input(dbnum, refno).await {
+            if let Some(input) = cache.get_loop_input(dbnum, refno) {
                 loop_inputs.insert(refno, input);
             } else {
                 miss_count += 1;
@@ -726,7 +726,7 @@ async fn consume_batches_prim(
         let mut prim_inputs: HashMap<RefnoEnum, PrimInput> = HashMap::new();
         let mut miss_count = 0u64;
         for &refno in &task.refnos {
-            if let Some(input) = cache.get_prim_input(dbnum, refno).await {
+            if let Some(input) = cache.get_prim_input(dbnum, refno) {
                 prim_inputs.insert(refno, input);
             } else {
                 miss_count += 1;
@@ -772,7 +772,7 @@ pub async fn run_loop_pipeline_from_refnos(
     }
 
     // 以全局 cache 为写入目的地，避免重复打开/加载 index 文件。
-    geom_input_cache::init_global_geom_input_cache(ctx.db_option.as_ref()).await?;
+    geom_input_cache::init_global_geom_input_cache();
     let cache = geom_input_cache::global_geom_input_cache()
         .ok_or_else(|| anyhow::anyhow!("geom_input_cache 未初始化"))?;
 
@@ -860,7 +860,7 @@ pub async fn run_prim_pipeline_from_refnos(
         return Ok(());
     }
 
-    geom_input_cache::init_global_geom_input_cache(ctx.db_option.as_ref()).await?;
+    geom_input_cache::init_global_geom_input_cache();
     let cache = geom_input_cache::global_geom_input_cache()
         .ok_or_else(|| anyhow::anyhow!("geom_input_cache 未初始化"))?;
 

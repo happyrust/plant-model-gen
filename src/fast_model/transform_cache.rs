@@ -1,167 +1,57 @@
 use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasherDefault;
-use std::path::{Path, PathBuf};
 
 use aios_core::{init_surreal, RefnoEnum, SUL_DB, SurrealQueryExt};
 use aios_core::Transform;
-use foyer::{DirectFsDeviceOptionsBuilder, HybridCache, HybridCacheBuilder};
-use serde::{Deserialize, Serialize};
+use dashmap::DashMap;
+use serde::Deserialize;
 use surrealdb::types::SurrealValue;
-use tokio::sync::OnceCell;
-use twox_hash::XxHash64;
+use std::sync::OnceLock;
 
 use crate::data_interface::db_meta_manager::db_meta;
 use crate::options::DbOptionExt;
 
-/// foyer transform 缓存：用于“模型生成阶段”读取/写入 world_transform，避免依赖 SurrealDB 的 pe_transform 预热。
+/// 纯内存 transform 缓存：用于"模型生成阶段"读取/写入 world_transform。
 ///
 /// 约定：
 /// - 只要缓存存在即可（不要求全量命中）。
-/// - miss 时，允许走旧路径按需计算/查询，然后回写到本地缓存。
-/// - 与旧逻辑区分：旧逻辑走 aios_core 内部的 pe_transform / 惰性计算；新逻辑优先读本地 foyer。
-
-#[derive(Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TransformCacheKey {
-    pub dbnum: u32,
-    pub refno: RefnoEnum,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct TransformCacheValue {
-    pub payload: Vec<u8>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct CachedWorldTransform {
-    pub refno: RefnoEnum,
-    pub world: Transform,
-    pub created_at: i64,
-}
+/// - miss 时，允许走旧路径按需计算/查询，然后回写到内存缓存。
 
 pub struct TransformCacheManager {
-    cache: HybridCache<TransformCacheKey, TransformCacheValue, BuildHasherDefault<XxHash64>>,
-    cache_dir: PathBuf,
+    cache: DashMap<(u32, RefnoEnum), Transform>,
 }
 
 impl TransformCacheManager {
-    pub async fn new(cache_dir: &Path) -> anyhow::Result<Self> {
-        if !cache_dir.exists() {
-            std::fs::create_dir_all(cache_dir)?;
-        }
-
-        // 变换缓存通常比 instance_cache 小很多，先给一个中等容量即可。
-        let device_config = DirectFsDeviceOptionsBuilder::new(cache_dir)
-            .with_capacity(512 * 1024 * 1024)
-            .build();
-
-        let cache = HybridCacheBuilder::new()
-            .memory(64 * 1024 * 1024)
-            .with_hash_builder(BuildHasherDefault::<XxHash64>::default())
-            .storage()
-            .with_device_config(device_config)
-            .build()
-            .await?;
-
-        Ok(Self {
-            cache,
-            cache_dir: cache_dir.to_path_buf(),
-        })
-    }
-
-    pub fn cache_dir(&self) -> &Path {
-        &self.cache_dir
-    }
-
-    pub async fn get_world_transform(&self, dbnum: u32, refno: RefnoEnum) -> Option<Transform> {
-        let key = TransformCacheKey { dbnum, refno };
-        match self.cache.get(&key).await {
-            Ok(Some(entry)) => {
-                let payload = &entry.value().payload;
-                serde_json::from_slice::<CachedWorldTransform>(payload)
-                    .ok()
-                    .map(|v| v.world)
-            }
-            _ => None,
+    pub fn new() -> Self {
+        Self {
+            cache: DashMap::new(),
         }
     }
 
-    /// 删除指定 key 的 transform 缓存
+    pub fn get_world_transform(&self, dbnum: u32, refno: RefnoEnum) -> Option<Transform> {
+        self.cache.get(&(dbnum, refno)).map(|v| v.clone())
+    }
+
     pub fn remove(&self, dbnum: u32, refno: RefnoEnum) {
-        let key = TransformCacheKey { dbnum, refno };
-        self.cache.remove(&key);
+        self.cache.remove(&(dbnum, refno));
     }
 
     pub fn insert_world_transform(&self, dbnum: u32, refno: RefnoEnum, world: Transform) {
-        let key = TransformCacheKey { dbnum, refno };
-        let item = CachedWorldTransform {
-            refno,
-            world,
-            created_at: chrono::Utc::now().timestamp_millis(),
-        };
-        let payload = match serde_json::to_vec(&item) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!(
-                    "[transform_cache] 序列化失败，跳过写入: dbnum={}, refno={}, err={}",
-                    dbnum, refno, e
-                );
-                return;
-            }
-        };
-        self.cache.insert(key, TransformCacheValue { payload });
+        self.cache.insert((dbnum, refno), world);
     }
 }
 
-static GLOBAL_TRANSFORM_CACHE: OnceCell<TransformCacheManager> = OnceCell::const_new();
+static GLOBAL_TRANSFORM_CACHE: OnceLock<TransformCacheManager> = OnceLock::new();
 
-pub fn transform_cache_dir_for_option(db_option: &DbOptionExt) -> PathBuf {
-    // 与 instance_cache 同根目录，但使用子目录隔离，避免多个 foyer cache 共享同一 device 目录。
-    db_option.get_foyer_cache_dir().join("transform_cache")
+pub fn init_global_transform_cache() {
+    let _ = GLOBAL_TRANSFORM_CACHE.get_or_init(|| TransformCacheManager::new());
 }
 
-pub fn default_transform_cache_dir() -> PathBuf {
-    // 运行时约定：若未提供 DbOptionExt，则按环境变量 FOYER_CACHE_DIR 或默认 output/instance_cache 推导。
-    let base = std::env::var("FOYER_CACHE_DIR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("output/instance_cache"));
-    base.join("transform_cache")
-}
-
-pub fn ensure_transform_cache_dir(db_option: &DbOptionExt) -> anyhow::Result<PathBuf> {
-    let dir = transform_cache_dir_for_option(db_option);
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir)?;
-    }
-    Ok(dir)
-}
-
-pub async fn init_global_transform_cache(db_option: &DbOptionExt) -> anyhow::Result<()> {
-    let dir = ensure_transform_cache_dir(db_option)?;
-    let _ = GLOBAL_TRANSFORM_CACHE
-        .get_or_try_init(|| async move { TransformCacheManager::new(&dir).await })
-        .await?;
-    Ok(())
-}
-
-async fn get_global_cache(db_option: Option<&DbOptionExt>) -> anyhow::Result<Option<&'static TransformCacheManager>> {
-    if let Some(db_option) = db_option {
-        init_global_transform_cache(db_option).await?;
-        return Ok(GLOBAL_TRANSFORM_CACHE.get());
-    }
-
-    // 未传 DbOptionExt：尝试用默认路径初始化一次，保证“无配置上下文”的调用点也能 cache-first。
+fn get_global_cache() -> Option<&'static TransformCacheManager> {
+    // 若尚未初始化则自动初始化（纯内存，无副作用）
     if GLOBAL_TRANSFORM_CACHE.get().is_none() {
-        let dir = default_transform_cache_dir();
-        if !dir.exists() {
-            let _ = std::fs::create_dir_all(&dir);
-        }
-        let _ = GLOBAL_TRANSFORM_CACHE
-            .get_or_try_init(|| async move { TransformCacheManager::new(&dir).await })
-            .await?;
+        init_global_transform_cache();
     }
-    Ok(GLOBAL_TRANSFORM_CACHE.get())
+    GLOBAL_TRANSFORM_CACHE.get()
 }
 
 fn resolve_dbnum(refno: RefnoEnum) -> Option<u32> {
@@ -178,9 +68,7 @@ fn resolve_dbnum(refno: RefnoEnum) -> Option<u32> {
     None
 }
 
-/// 模型生成专用：从 foyer transform cache 读取 world_transform；miss 时按需生成并回写缓存。
-///
-/// 与旧逻辑区分：旧逻辑直接调用 `aios_core::get_world_transform`（会优先查 pe_transform 表）。
+/// 模型生成专用：从内存 transform cache 读取 world_transform；miss 时按需生成并回写缓存。
 pub async fn get_world_transform_cache_first(
     db_option: Option<&DbOptionExt>,
     refno: RefnoEnum,
@@ -190,8 +78,8 @@ pub async fn get_world_transform_cache_first(
 
     if use_cache {
         let dbnum = dbnum.unwrap();
-        if let Some(cache) = get_global_cache(db_option).await? {
-            if let Some(hit) = cache.get_world_transform(dbnum, refno).await {
+        if let Some(cache) = get_global_cache() {
+            if let Some(hit) = cache.get_world_transform(dbnum, refno) {
                 return Ok(Some(hit));
             }
         }
@@ -219,23 +107,18 @@ pub async fn get_world_transform_cache_first(
     Ok(computed)
 }
 
-/// 模型生成专用（strict cache-only）：只从 foyer transform_cache 读取 world_transform。
-///
-/// 语义：
-/// - **禁止**回源 SurrealDB（不查询 pe_transform / pe.world_trans）
-/// - **禁止**回退旧计算路径（aios_core::get_world_transform）
-/// - 任意 miss 直接返回 Err（离线 Generate 阶段 miss 代表 Prefetch 不完整）
+/// strict cache-only：只从内存 transform_cache 读取 world_transform。
+/// miss 直接返回 Err（离线 Generate 阶段 miss 代表 Prefetch 不完整）。
 pub async fn get_world_transforms_cache_only_batch(
-    db_option: &DbOptionExt,
+    _db_option: &DbOptionExt,
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<HashMap<RefnoEnum, Transform>> {
     if refnos.is_empty() {
         return Ok(HashMap::new());
     }
 
-    // ref0 != dbnum：离线阶段必须已具备 ref0->dbnum 映射，否则无法按库分桶读缓存。
     db_meta().ensure_loaded()?;
-    init_global_transform_cache(db_option).await?;
+    init_global_transform_cache();
 
     let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() else {
         anyhow::bail!("global transform_cache 未初始化");
@@ -251,7 +134,7 @@ pub async fn get_world_transforms_cache_only_batch(
         if dbnum == 0 {
             anyhow::bail!("无效 dbnum=0（缺少 ref0->dbnum 映射或元数据不完整）: refno={}", r);
         }
-        if let Some(hit) = cache.get_world_transform(dbnum, r).await {
+        if let Some(hit) = cache.get_world_transform(dbnum, r) {
             out.insert(r, hit);
         } else {
             missing.push(r);
@@ -298,7 +181,6 @@ pub async fn ensure_world_transforms_present(
 }
 
 fn transform_from_matrix_cols(cols: &[f64; 16]) -> Option<Transform> {
-    // SurrealDB 存储的矩阵为列主序（与 glam::DMat4::from_cols_array 对齐）。
     let m = glam::DMat4::from_cols_array(cols);
     let (scale, rot, trans) = m.to_scale_rotation_translation();
     Some(Transform {
@@ -309,11 +191,9 @@ fn transform_from_matrix_cols(cols: &[f64; 16]) -> Option<Transform> {
 }
 
 /// 批量版 cache-first world_transform 获取：
-/// - 先读 foyer transform_cache；
+/// - 先读内存 transform_cache；
 /// - miss 的 refno 再通过 SurrealDB pe_transform 批量查询 matrix；
 /// - 仍 miss 的少量 refno 兜底走旧计算路径（aios_core::get_world_transform）。
-///
-/// 说明：该接口用于“预取阶段”的批量提速；生成阶段仍应尽量 cache-only。
 pub async fn get_world_transforms_cache_first_batch(
     db_option: Option<&DbOptionExt>,
     refnos: &[RefnoEnum],
@@ -336,11 +216,10 @@ pub async fn get_world_transforms_cache_first_batch(
     // 1) cache hits
     let mut misses: Vec<RefnoEnum> = Vec::new();
     if use_cache {
-        if let Some(cache) = get_global_cache(db_option).await? {
-            // 这里不做过度并发：foyer HybridCache 本身有内存层，单次 get 较轻；且 refnos 通常为 batch_size 级别。
+        if let Some(cache) = get_global_cache() {
             for &r in refnos {
                 let dbnum = *dbnum_map.get(&r).unwrap_or(&0);
-                if let Some(hit) = cache.get_world_transform(dbnum, r).await {
+                if let Some(hit) = cache.get_world_transform(dbnum, r) {
                     out.insert(r, hit);
                 } else {
                     misses.push(r);
@@ -358,7 +237,6 @@ pub async fn get_world_transforms_cache_first_batch(
     }
 
     // 2) SurrealDB batch query pe_transform.world_trans.d.matrix
-    //    注意：只对 misses 进行查询，减少无谓传输。
     init_surreal().await?;
 
     #[derive(Debug, Deserialize, SurrealValue)]
@@ -369,7 +247,6 @@ pub async fn get_world_transforms_cache_first_batch(
         matrix: Option<Vec<f64>>,
     }
 
-    // 避免 SQL 过大：按固定块查询
     const CHUNK: usize = 200;
     let mut still_missing: HashSet<RefnoEnum> = misses.iter().copied().collect();
 
@@ -380,9 +257,6 @@ pub async fn get_world_transforms_cache_first_batch(
             .collect::<Vec<_>>()
             .join(",");
 
-        // 说明：
-        // - record::id(id) 取 pe 的 id 部分（如 24381_103385），RefnoEnum 可直接反序列化。
-        // - pe_transform 的主键形制：pe_transform:<pe_id>，用 type::record 构造。
         let sql = format!(
             r#"
             SELECT
@@ -425,7 +299,6 @@ pub async fn get_world_transforms_cache_first_batch(
     }
 
     // 3) 兜底：少量 miss 走旧计算路径（并回写缓存）
-    //    说明：此分支理论上应该很少触发；若频繁触发，说明 pe_transform 不完整或查询口径需要调整。
     for r in still_missing {
         if let Ok(Some(t)) = aios_core::get_world_transform(r).await {
             out.insert(r, t.clone());
@@ -462,7 +335,6 @@ mod tests {
         assert!((t.scale.x - scale.x as f32).abs() < eps);
         assert!((t.scale.y - scale.y as f32).abs() < eps);
         assert!((t.scale.z - scale.z as f32).abs() < eps);
-        // rotation 只做近似检查：q 与 -q 等价，这里用 dot 取绝对值。
         let dot = t.rotation.dot(glam::Quat::from_xyzw(
             rot.x as f32,
             rot.y as f32,

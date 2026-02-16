@@ -434,16 +434,12 @@ pub async fn gen_all_geos_data(
             cache_run_mode.as_str()
         );
 
-        if !matches!(cache_run_mode, geom_input_cache::CacheRunMode::Direct) {
-            if let Err(e) = geom_input_cache::init_global_geom_input_cache(db_option).await {
-                eprintln!("[gen_model] ⚠️  初始化 geom_input_cache 失败: {}", e);
-            } else {
-                println!(
-                    "[gen_model] geom_input_cache 已初始化 (mode={})",
-                    cache_run_mode.as_str()
-                );
-            }
-        }
+        // 纯内存 DashMap，无磁盘 I/O，无条件初始化
+        geom_input_cache::init_global_geom_input_cache();
+        println!(
+            "[gen_model] geom_input_cache 已初始化 (mode={})",
+            cache_run_mode.as_str()
+        );
     }
 
 

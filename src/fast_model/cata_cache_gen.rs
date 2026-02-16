@@ -167,8 +167,7 @@ pub async fn gen_cata_geos_for_cache(
     }
 
     let cata_resolve_cache = Arc::new(
-        CataResolveCacheManager::new(&db_option.get_foyer_cache_dir().join("cata_resolve_cache"))
-            .await?,
+        CataResolveCacheManager::new(),
     );
 
     // 计算批次
@@ -260,7 +259,7 @@ pub async fn gen_cata_geos_for_cache(
             }
 
             // 需要生成元件库几何：优先从 foyer cache 读取 resolve_desi_comp 产物（按 cata_hash）
-            let resolved_comp: CataResolvedComp = match cata_resolve_cache.get(&cata_hash).await {
+            let resolved_comp: CataResolvedComp = match cata_resolve_cache.get(&cata_hash) {
                 Some(v) => {
                     debug_model_debug!(
                         "[gen_cata_geos_for_cache][cata_hash={}] resolve_desi_comp cache hit",

@@ -215,6 +215,15 @@ impl GeomInputCacheManager {
         });
         count
     }
+
+    /// 清空所有 LOOP/PRIM/CATE 输入缓存，释放内存（分批生成时在批次间调用）。
+    pub fn clear(&self) -> usize {
+        let count = self.loop_inputs.len() + self.prim_inputs.len() + self.cate_inputs.len();
+        self.loop_inputs.clear();
+        self.prim_inputs.clear();
+        self.cate_inputs.clear();
+        count
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -804,6 +813,13 @@ pub fn init_global_geom_input_cache() {
 /// 获取全局 geom_input_cache 引用（未初始化返回 None）。
 pub fn global_geom_input_cache() -> Option<&'static GeomInputCacheManager> {
     GLOBAL_GEOM_INPUT_CACHE.get()
+}
+
+/// 清空全局 geom_input 缓存（分批生成时在批次间调用）。
+pub fn clear_global_geom_input_cache() -> usize {
+    GLOBAL_GEOM_INPUT_CACHE.get()
+        .map(|mgr| mgr.clear())
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

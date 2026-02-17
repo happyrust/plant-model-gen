@@ -152,6 +152,10 @@ pub struct FullNounConfig {
 
     /// 调试模式：限制每种 Noun 类型的处理数量（None 表示不限制）
     pub debug_limit_per_noun: Option<usize>,
+
+    /// BRAN 分批大小。None 表示不分批（全量处理）。
+    /// 通过环境变量 AIOS_BRAN_BATCH_SIZE 设置。
+    pub bran_batch_size: Option<usize>,
 }
 
 impl FullNounConfig {
@@ -186,6 +190,10 @@ impl FullNounConfig {
             enabled_categories: opt.full_noun_enabled_categories.clone(),
             excluded_nouns: opt.full_noun_excluded_nouns.clone(),
             debug_limit_per_noun: opt.debug_limit_per_noun,
+            bran_batch_size: std::env::var("AIOS_BRAN_BATCH_SIZE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| v > 0),
         })
     }
 
@@ -200,6 +208,7 @@ impl FullNounConfig {
             enabled_categories: Vec::new(),
             excluded_nouns: Vec::new(),
             debug_limit_per_noun: None,
+            bran_batch_size: None,
         }
     }
 
@@ -326,6 +335,11 @@ impl FullNounConfig {
         if let Some(limit) = self.debug_limit_per_noun {
             println!("╠════════════════════════════════════════╣");
             println!("║ 调试限制: 每个 Noun 最多 {:<8} 个实例 ║", limit);
+        }
+
+        if let Some(bbs) = self.bran_batch_size {
+            println!("╠════════════════════════════════════════╣");
+            println!("║ BRAN 分批大小: {:<23} ║", bbs);
         }
 
         println!("╚════════════════════════════════════════╝");

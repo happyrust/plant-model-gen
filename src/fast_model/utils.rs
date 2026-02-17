@@ -6,8 +6,23 @@ use std::collections::HashMap;
 use tokio::sync::OnceCell;
 use tokio::task::JoinSet;
 
+static SURREAL_INIT: OnceCell<()> = OnceCell::const_new();
 static INST_RELATE_AABB_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 static INST_RELATE_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
+
+/// 确保 SurrealDB 连接已初始化（幂等，仅首次真正执行 `init_surreal`）。
+///
+/// `aios_core::init_surreal()` 每次调用都会尝试 connect + signin + use_ns_db，
+/// 在并发 spawn task 中多次调用会导致 WebSocket 连接竞争/死锁。
+/// 此函数用 `OnceCell` 保证只执行一次。
+pub async fn ensure_surreal_init() -> anyhow::Result<()> {
+    SURREAL_INIT
+        .get_or_try_init(|| async {
+            aios_core::init_surreal().await
+        })
+        .await?;
+    Ok(())
+}
 
 /// 确保 inst_relate_aabb 以"关系表"方式工作：in=pe，out=aabb，且 `in` 唯一。
 ///

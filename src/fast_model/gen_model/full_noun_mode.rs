@@ -322,7 +322,7 @@ pub async fn gen_full_noun_geos_optimized(
 
         bran_roots_vec = bran_hanger_roots.into_iter().collect();
         if !bran_roots_vec.is_empty() {
-            // BRAN/HANG 阶段也遵循“两阶段（Prefetch -> Generate）”语义：
+            // BRAN/HANG 阶段也遵循"两阶段（Prefetch -> Generate）"语义：
             // - PrefetchThenGenerate：先填充缓存，再进入离线 Generate
             // - CacheOnly：不预取，直接离线 Generate（若缓存不全应直接失败）
             let ctx_bran_prefetch = NounProcessContext::new(
@@ -334,15 +334,50 @@ pub async fn gen_full_noun_geos_optimized(
             let ctx_bran_generate = ctx_bran_prefetch.with_stage(GenStage::Generate);
 
             let bran_start = Instant::now();
-            process_bran_hang_core_logic(
-                &ctx_bran_prefetch,
-                &ctx_bran_generate,
-                &bran_roots_vec,
-                loop_sjus_map_arc.clone(),
-                sender.clone(),
-                &mut bran_generated_refnos,
-            )
-            .await?;
+
+            // Direct 模式下提前初始化数据库连接，避免分批时每批重复 init_surreal 导致连接竞争
+            if !ctx_bran_generate.is_offline_generate() {
+                if let Err(e) = crate::fast_model::utils::ensure_surreal_init().await {
+                    eprintln!("[Pipeline] 数据库连接预初始化失败: {}", e);
+                }
+            }
+
+            // 分批处理 BRAN/HANG：每批处理 bran_batch_size 个根节点，
+            // 批次间清理 geom_input_cache + transform_cache 释放内存，
+            // cata_resolve_cache 跨批保留（同型号复用率高）。
+            let bran_batch_size = config.bran_batch_size.unwrap_or(bran_roots_vec.len());
+            let total_batches = (bran_roots_vec.len() + bran_batch_size - 1) / bran_batch_size;
+            if total_batches > 1 {
+                println!(
+                    "[Pipeline] BRAN/HANG 分批处理: {} 个根节点, 每批 {}, 共 {} 批",
+                    bran_roots_vec.len(), bran_batch_size, total_batches
+                );
+            }
+
+            for (batch_idx, batch) in bran_roots_vec.chunks(bran_batch_size).enumerate() {
+                if total_batches > 1 {
+                    println!(
+                        "[Pipeline] BRAN/HANG 批次 {}/{} ({} 个根节点)",
+                        batch_idx + 1, total_batches, batch.len()
+                    );
+                }
+
+                process_bran_hang_core_logic(
+                    &ctx_bran_prefetch,
+                    &ctx_bran_generate,
+                    batch,
+                    loop_sjus_map_arc.clone(),
+                    sender.clone(),
+                    &mut bran_generated_refnos,
+                )
+                .await?;
+
+                // 非最后一批时清理临时缓存
+                if total_batches > 1 && batch_idx + 1 < total_batches {
+                    super::batch_cleanup::cleanup_batch_caches();
+                }
+            }
+
             bran_duration = bran_start.elapsed();
 
             // 记录 BRAN/HANG 为 Cate 类别

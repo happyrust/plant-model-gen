@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use aios_core::{init_surreal, RefnoEnum, SUL_DB, SurrealQueryExt};
+use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
 use aios_core::Transform;
 use dashmap::DashMap;
 use serde::Deserialize;
@@ -38,12 +38,26 @@ impl TransformCacheManager {
     pub fn insert_world_transform(&self, dbnum: u32, refno: RefnoEnum, world: Transform) {
         self.cache.insert((dbnum, refno), world);
     }
+
+    /// 清空所有缓存条目，释放内存（分批生成时在批次间调用）。
+    pub fn clear(&self) -> usize {
+        let count = self.cache.len();
+        self.cache.clear();
+        count
+    }
 }
 
 static GLOBAL_TRANSFORM_CACHE: OnceLock<TransformCacheManager> = OnceLock::new();
 
 pub fn init_global_transform_cache() {
     let _ = GLOBAL_TRANSFORM_CACHE.get_or_init(|| TransformCacheManager::new());
+}
+
+/// 清空全局 transform 缓存（分批生成时在批次间调用）。
+pub fn clear_global_transform_cache() -> usize {
+    GLOBAL_TRANSFORM_CACHE.get()
+        .map(|mgr| mgr.clear())
+        .unwrap_or(0)
 }
 
 fn get_global_cache() -> Option<&'static TransformCacheManager> {
@@ -237,7 +251,7 @@ pub async fn get_world_transforms_cache_first_batch(
     }
 
     // 2) SurrealDB batch query pe_transform.world_trans.d.matrix
-    init_surreal().await?;
+    crate::fast_model::utils::ensure_surreal_init().await?;
 
     #[derive(Debug, Deserialize, SurrealValue)]
     struct PeWorldMatrixRow {

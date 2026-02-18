@@ -151,7 +151,8 @@ pub fn convert_row_to_attmap(row: &MySqlRow, type_hash: i32, column_names: &[&st
                     }
                     DbAttributeType::DOUBLEVEC => {
                         row.try_get::<Vec<u8>, _>(t).map(|v| {
-                            let v = bincode::deserialize::<Vec<f64>>(&v).unwrap();
+                            let v =
+                                aios_core::tool::rkyv_tool::from_bytes::<Vec<f64>>(&v).unwrap_or_default();
                             r.entry(hash).or_insert(AttrVal::DoubleArrayType(v))
                         })?;
                     }
@@ -401,7 +402,13 @@ fn gen_insert_attr_info_sql(attr_info: &DashMap<i32, DashMap<i32, AttrInfo>>) ->
     for info in attr_info {
         let type_hash = *info.key() as u32;
         let type_name = db1_dehash(type_hash);
-        let info = hex::encode(bincode::serialize(&info.value()).unwrap());
+        let mut info_entries = info
+            .value()
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect::<Vec<_>>();
+        info_entries.sort_unstable_by_key(|(attr_hash, _)| *attr_hash);
+        let info = hex::encode(aios_core::tool::rkyv_tool::to_bytes(&info_entries).unwrap());
         sql.push_str(&format!("( {} , '{}', 0x{} ),", type_hash, type_name, info));
     }
     sql.remove(sql.len() - 1);

@@ -56,17 +56,27 @@ pub fn is_e3d_trace_enabled() -> bool {
 
 /// 查询 Tubi 尺寸
 ///
-/// 从旧 gen_model.rs 迁移，用于 cata_model
+/// 优先从 SCOM PARA 直接读取（廉价），仅在失败时回退到完整几何求解
 pub async fn query_tubi_size(
     refno: RefnoEnum,
     tubi_cat_ref: RefnoEnum,
     is_hang: bool,
 ) -> Result<TubiSize> {
-    let tubi_geoms_info = resolve_desi_comp(refno, Some(tubi_cat_ref))
+    // 快速路径：直接从 SCOM 的 PARA 读取管径（1 次 DB 查询）
+    if let Ok(cat_att) = aios_core::get_named_attmap(tubi_cat_ref).await {
+        let params = cat_att.get_f32_vec("PARA").unwrap_or_default();
+        if params.len() >= 2 {
+            let tubi_bore = params[if is_hang { 0 } else { 1 }] as f32;
+            if tubi_bore > 0.0 {
+                return Ok(TubiSize::BoreSize(tubi_bore));
+            }
+        }
+    }
+
+    // 慢速路径：完整几何求解（含表达式计算）
+    let tubi_geoms_info = resolve_desi_comp(refno, Some(tubi_cat_ref), None)
         .await
         .unwrap_or_default();
-
-    // 从几何参数查询尺寸
     for geom in &tubi_geoms_info.geometries {
         if let BoxImplied(d) = geom {
             return Ok(TubiSize::BoxSize((d.height, d.width)));
@@ -74,16 +84,6 @@ pub async fn query_tubi_size(
             return Ok(TubiSize::BoreSize(d.diameter));
         }
     }
-
-    // 从属性映射查询
-    if let Ok(cat_att) = aios_core::get_named_attmap(tubi_cat_ref).await {
-        let params = cat_att.get_f32_vec("PARA").unwrap_or_default();
-        if params.len() >= 2 {
-            let tubi_bore = params[if is_hang { 0 } else { 1 }] as f32;
-            return Ok(TubiSize::BoreSize(tubi_bore));
-        }
-    }
-
 
     Ok(TubiSize::None)
 }

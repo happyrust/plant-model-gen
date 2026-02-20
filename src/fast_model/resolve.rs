@@ -7,7 +7,7 @@ use aios_core::expression::query_cata::{query_axis_params, resolve_cata_comp};
 use aios_core::expression::resolve::{SCOM_INFO_MAP, resolve_axis_param};
 use aios_core::parsed_data::{CateAxisParam, CateGeomsInfo};
 use aios_core::pdms_data::{PlinParam, ScomInfo, GmParam};
-use aios_core::{CataContext, RefU64, RefnoEnum, SUL_DB};
+use aios_core::{CataContext, NamedAttrMap, RefU64, RefnoEnum, SUL_DB};
 use anyhow::anyhow;
 use std::collections::{BTreeMap, HashMap};
 
@@ -162,8 +162,15 @@ pub async fn resolve_axis_params(
 pub async fn resolve_desi_comp(
     desi_refno: RefnoEnum,
     mut tubi_scom: Option<RefnoEnum>,
+    desi_att_opt: Option<&NamedAttrMap>,
 ) -> anyhow::Result<CateGeomsInfo> {
-    let desi_att = aios_core::get_named_attmap(desi_refno).await?;
+    let owned_att;
+    let desi_att = if let Some(att) = desi_att_opt {
+        att
+    } else {
+        owned_att = aios_core::get_named_attmap(desi_refno).await?;
+        &owned_att
+    };
     let is_tubi = tubi_scom.is_some();
 
     let scom_ref = if let Some(scom) = tubi_scom {
@@ -180,15 +187,15 @@ pub async fn resolve_desi_comp(
     debug_model_trace!("scom_ref: {:?}", &scom_ref);
     let scom_info = get_or_create_scom_info(scom_ref).await?;
     debug_model_trace!("scom_info: {:?}", &scom_info);
-    let mut context = aios_core::get_or_create_cata_context(desi_refno, is_tubi)
-        .await
-        .unwrap();
+    let mut context = aios_core::create_cata_context_with_att(
+        desi_refno, desi_att, scom_ref, &scom_info.attr_map, is_tubi,
+    ).await.unwrap();
 
-    // 🔍 调试：打印 DESI 的 DESP 数据
-    if let Ok(desi_attmap) = aios_core::get_named_attmap(desi_refno).await {
-        if let Some(desp) = desi_attmap.get_f32_vec("DESP") {
+    // 🔍 调试：打印 DESI 的 DESP 数据（复用已有的 desi_att，避免重复 I/O）
+    {
+        if let Some(desp) = desi_att.get_f32_vec("DESP") {
             debug_model_trace!("   ✅ DESP array: {:?}", desp);
-            if let Some(unipar) = desi_attmap.get_i32_vec("UNIPAR") {
+            if let Some(unipar) = desi_att.get_i32_vec("UNIPAR") {
                 debug_model_trace!("   UNIPAR array: {:?}", unipar);
 
                 use aios_core::consts::WORD_HASH;
@@ -230,39 +237,32 @@ pub async fn resolve_desi_comp(
     debug_model_trace!("   PARA string: '{}'", para_str);
     debug_model_trace!("   Parsed values: {:?}", para_values);
 
-    // 🔍 查询 SurrealDB 中的原始 PARA 数据和 UNIPAR
-    let unipar_vec = if let Ok(scom_attmap) = aios_core::get_named_attmap(scom_ref).await {
+    // 从已有的 scom_info.attr_map 获取 UNIPAR（避免重复 I/O）
+    let scom_attmap = &scom_info.attr_map;
+    let unipar_vec = {
         if let Some(raw_para) = scom_attmap.get_as_string("PARA") {
             debug_model_trace!("   🔍 SurrealDB 原始 PARA: '{}'", raw_para);
         }
-        // 打印 SCOM 的其他关键属性
         debug_model_trace!("   🔍 SCOM name: {:?}", scom_attmap.get_as_string("NAME"));
         debug_model_trace!("   🔍 SCOM noun: {:?}", scom_attmap.get_type_str());
 
-        // 🔍 关键：查询 UNIPAR（参数类型描述）
         if let Some(unipar) = scom_attmap.get_i32_vec("UNIPAR") {
             debug_model_trace!("   🔍 UNIPAR (参数类型): {:?}", unipar);
 
-            // 分析每个 PARA 值的类型
             use aios_core::tool::db_tool::db1_dehash;
 
             for (i, (value, &utype)) in para_values.iter().zip(unipar.iter()).enumerate() {
                 if utype == WORD_HASH as i32 {
-                    // 尝试 dehash WORD 类型的值
-                    // 先解析为 f32，再转为 u32
                     if let Ok(num_value) = value.parse::<f32>() {
                         let word = db1_dehash(num_value as u32);
                         debug_model_trace!(
                             "      PARA[{}] = {} ⚠️  类型=WORD, dehash='{}'",
-                            i,
-                            value,
-                            word
+                            i, value, word
                         );
                     } else {
                         debug_model_trace!(
                             "      PARA[{}] = {} ⚠️  类型=WORD (无法解析为数字)",
-                            i,
-                            value
+                            i, value
                         );
                     }
                 } else {
@@ -274,8 +274,6 @@ pub async fn resolve_desi_comp(
             debug_model_trace!("   ⚠️  SCOM 没有 UNIPAR 属性");
             None
         }
-    } else {
-        None
     };
 
     // ⚠️  重要修复：
@@ -362,8 +360,10 @@ pub async fn resolve_desi_comp(
 
     // 🔍 表达式预验证：在调用 resolve_cata_comp 前检查所有表达式的语法
     // 这有助于快速定位元件库中的表达式错误
-    let scom_name = scom_info.attr_map.get_as_string("NAME").unwrap_or_else(|| "未知".to_string());
-    validate_scom_expressions(desi_refno, scom_ref, &scom_name, &scom_info);
+    if aios_core::is_debug_model_enabled() {
+        let scom_name = scom_info.attr_map.get_as_string("NAME").unwrap_or_else(|| "未知".to_string());
+        validate_scom_expressions(desi_refno, scom_ref, &scom_name, &scom_info);
+    }
 
     let geom_info = resolve_cata_comp(&desi_att, &scom_info, Some(context));
     debug_model_trace!("geom_info: {:?}", &geom_info);

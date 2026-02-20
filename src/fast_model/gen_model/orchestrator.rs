@@ -641,7 +641,7 @@ async fn process_full_noun_mode(
 
 
 
-    let (sender, receiver) = flume::unbounded::<aios_core::geometry::ShapeInstancesData>();
+    let (sender, receiver) = flume::bounded::<aios_core::geometry::ShapeInstancesData>(100);
 
     let replace_exist = db_option.inner.is_replace_mesh();
 
@@ -772,6 +772,8 @@ async fn process_full_noun_mode(
 
         // SurrealDB 写入后台任务句柄：不阻塞 cache 写入和后续 batch 接收
         let mut db_write_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        // 控制 SurrealDB 后台写入的最大并发数
+        let db_write_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
 
         loop {
 
@@ -781,30 +783,25 @@ async fn process_full_noun_mode(
 
             };
 
-
+            let shape_insts_arc = std::sync::Arc::new(shape_insts);
 
             #[cfg(feature = "profile")]
-
             let _enter = sink_span.enter();
-
-
 
             batch_cnt += 1;
 
-
-
             // 记录本批次触达的实例 refno（用于后续 inst_relate_aabb 写入范围收敛）
-            for r in shape_insts.inst_info_map.keys() {
+            for r in shape_insts_arc.inst_info_map.keys() {
                 touched_refnos_for_insert.insert(*r);
             }
-            for r in shape_insts.inst_tubi_map.keys() {
+            for r in shape_insts_arc.inst_tubi_map.keys() {
                 touched_refnos_for_insert.insert(*r);
             }
 
             if let Some(ref cache_manager) = cache_manager_for_insert {
                 let t0 = Instant::now();
 
-                let by_dbnum = match split_shape_instances_by_dbnum(&shape_insts).await {
+                let by_dbnum = match split_shape_instances_by_dbnum(&shape_insts_arc).await {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("[cache] batch 拆分 dbnum 失败，跳过写 cache: {}", e);
@@ -849,7 +846,7 @@ async fn process_full_noun_mode(
 
                 let t0 = Instant::now();
 
-                if let Err(e) = writer.write_batch(&shape_insts) {
+                if let Err(e) = writer.write_batch(&shape_insts_arc) {
 
                     eprintln!("[Parquet] 写入批次失败: {}", e);
 
@@ -865,7 +862,7 @@ async fn process_full_noun_mode(
 
                 let t0 = Instant::now();
 
-                if let Err(e) = writer.write_batch(&shape_insts) {
+                if let Err(e) = writer.write_batch(&shape_insts_arc) {
 
                     eprintln!("[DuckDB] 写入批次失败: {}", e);
 
@@ -876,10 +873,21 @@ async fn process_full_noun_mode(
             }
 
             // SurrealDB 写入放到后台，不阻塞 cache 写入和后续 batch 接收
+            // 采用 Semaphore 限流，防止瞬发海量并发协程打垮数据库导致事务冲突风暴
+            // 此处在 receiver 循环外侧初始化，限定最大并行写库数为 8
             if use_surrealdb {
                 let t0 = Instant::now();
+                let sem = db_write_semaphore.clone();
+                let shape_insts_clone = shape_insts_arc.clone();
                 db_write_handles.push(tokio::spawn(async move {
-                    if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
+                    let _permit = match sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("获取写库并发锁失败: {}", e);
+                            return;
+                        }
+                    };
+                    if let Err(e) = save_instance_data_optimize(&shape_insts_clone, replace_exist).await {
                         eprintln!("保存实例数据失败: {}", e);
                     }
                 }));
@@ -1593,7 +1601,7 @@ async fn process_targeted_generation(
 
 
 
-    let (sender, receiver) = flume::unbounded();
+    let (sender, receiver) = flume::bounded(100);
 
     let receiver: flume::Receiver<aios_core::geometry::ShapeInstancesData> = receiver.clone();
 
@@ -1623,23 +1631,35 @@ async fn process_targeted_generation(
 
 
 
+    let mut db_write_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let db_write_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+
     let insert_task = tokio::task::spawn(async move {
 
         while let Ok(shape_insts) = receiver.recv_async().await {
-
+            let shape_insts_arc = std::sync::Arc::new(shape_insts);
+            // SurrealDB 写入放到后台，不阻塞 cache 写入和后续 batch 接收
+            // 采用 Semaphore 限流，防止瞬发海量并发协程打垮数据库导致事务冲突风暴
             if use_surrealdb {
-
-                if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
-
-                    eprintln!("保存实例数据失败: {}", e);
-
-                }
-
+                let sem = db_write_semaphore.clone();
+                let shape_insts_clone = shape_insts_arc.clone();
+                db_write_handles.push(tokio::spawn(async move {
+                    let _permit = match sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("获取写库并发锁失败: {}", e);
+                            return;
+                        }
+                    };
+                    if let Err(e) = save_instance_data_optimize(&shape_insts_clone, replace_exist).await {
+                        eprintln!("保存实例数据失败: {}", e);
+                    }
+                }));
             }
 
             if let Some(ref cache_manager) = cache_manager_for_insert {
 
-                let by_dbnum = match split_shape_instances_by_dbnum(&shape_insts).await {
+                let by_dbnum = match split_shape_instances_by_dbnum(&shape_insts_arc).await {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("[cache] batch 拆分 dbnum 失败，跳过写 cache: {}", e);
@@ -1678,6 +1698,10 @@ async fn process_targeted_generation(
 
         }
 
+        // 等待所有的 db 写入句柄完成
+        for h in db_write_handles {
+            let _ = h.await;
+        }
     });
 
 

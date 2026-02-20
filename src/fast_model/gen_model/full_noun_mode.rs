@@ -12,8 +12,6 @@ use dashmap::DashMap;
 use glam::Vec3;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -1598,7 +1596,7 @@ pub async fn gen_full_noun_geos(
     let config = FullNounConfig::from_db_option_ext(&db_option)
         .map_err(|e| anyhow::anyhow!("配置错误: {}", e))?;
 
-    let (sender, receiver) = flume::unbounded();
+    let (sender, receiver) = flume::bounded::<ShapeInstancesData>(100);
     let replace_exist = db_option.inner.is_replace_mesh();
     let use_surrealdb = db_option.use_surrealdb;
 
@@ -1610,26 +1608,8 @@ pub async fn gen_full_noun_geos(
         Arc::new(tokio::sync::Mutex::new(None));
     let insert_err_for_task = insert_err.clone();
 
-    // Full Noun 生成过程中，部分子任务可能会持有 sender 的 clone，导致 channel 不会自然断开；
-    // 这里用一个 “done + idle timeout” 机制兜底，避免在 insert_handle.await 处永久挂起。
-    let done = Arc::new(AtomicBool::new(false));
-    let done_rx = done.clone();
     let insert_handle = tokio::spawn(async move {
-        loop {
-            let next = if done_rx.load(Ordering::Relaxed) {
-                match tokio::time::timeout(Duration::from_millis(800), receiver.recv_async()).await {
-                    Ok(Ok(v)) => Some(v),
-                    Ok(Err(_)) => return, // channel 断开
-                    Err(_) => None,       // idle timeout：认为发送端已结束但 channel 未断开
-                }
-            } else {
-                match receiver.recv_async().await {
-                    Ok(v) => Some(v),
-                    Err(_) => return,
-                }
-            };
-
-            let Some(shape_insts) = next else { break };
+        while let Ok(shape_insts) = receiver.recv_async().await {
             if use_surrealdb {
                 if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
                     eprintln!("保存实例数据失败: {}", e);
@@ -1657,16 +1637,16 @@ pub async fn gen_full_noun_geos(
         }
     });
 
-    let categorized = match gen_full_noun_geos_optimized(db_option.clone(), &config, sender).await {
+    let categorized = match gen_full_noun_geos_optimized(db_option.clone(), &config, sender.clone()).await {
         Ok(v) => v,
         Err(e) => {
-            done.store(true, Ordering::Relaxed);
+            drop(sender);
             let _ = insert_handle.await;
             return Err(anyhow::anyhow!("Full Noun 生成失败: {}", e));
         }
     };
 
-    done.store(true, Ordering::Relaxed);
+    drop(sender);
     let _ = insert_handle.await;
     if let Some(e) = insert_err.lock().await.take() {
         return Err(e);

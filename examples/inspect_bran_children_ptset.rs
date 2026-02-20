@@ -3,9 +3,9 @@
 //! 用法：
 //!   ROOT_REFNO="24381/103385" CACHE_DIR="output/instance_cache" cargo run --example inspect_bran_children_ptset
 
-use anyhow::{Context, Result};
 use aios_core::RefnoEnum;
 use aios_database::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+use anyhow::{Context, Result};
 use std::env;
 use std::path::PathBuf;
 
@@ -67,20 +67,30 @@ async fn main() -> Result<()> {
                 found = true;
                 let wt = info.get_ele_world_transform();
                 println!("  cata_hash={:?}", info.cata_hash);
-                println!("  world_t=({:.3},{:.3},{:.3})",
-                    wt.translation.x, wt.translation.y, wt.translation.z);
+                println!(
+                    "  world_t=({:.3},{:.3},{:.3})",
+                    wt.translation.x, wt.translation.y, wt.translation.z
+                );
 
                 println!("  ptset_map.len()={}", info.ptset_map.len());
                 for (num, axis) in &info.ptset_map {
                     let transformed = axis.transformed(&wt);
-                    println!("    [{}] local=({:.3},{:.3},{:.3}) -> world=({:.3},{:.3},{:.3})",
+                    println!(
+                        "    [{}] local=({:.3},{:.3},{:.3}) -> world=({:.3},{:.3},{:.3})",
                         num,
-                        axis.pt.0.x, axis.pt.0.y, axis.pt.0.z,
-                        transformed.pt.0.x, transformed.pt.0.y, transformed.pt.0.z);
+                        axis.pt.0.x,
+                        axis.pt.0.y,
+                        axis.pt.0.z,
+                        transformed.pt.0.x,
+                        transformed.pt.0.y,
+                        transformed.pt.0.z
+                    );
                 }
                 break;
             }
-            if found { break; }
+            if found {
+                break;
+            }
         }
         if !found {
             println!("  ⚠️ 未在 cache 中找到 inst_info");

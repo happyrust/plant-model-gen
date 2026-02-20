@@ -3,15 +3,15 @@
 //! 用法：
 //!   TREE_PATH="output/scene_tree/7997.tree" PARENT_REFNO="7997/1234" cargo run --release --example verify_tree_children_order
 
-use anyhow::{Context, Result};
-use aios_core::tree_query::TreeFile;
 use aios_core::RefU64;
+use aios_core::tree_query::TreeFile;
+use anyhow::{Context, Result};
 use std::env;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
-    let tree_path_str = env::var("TREE_PATH")
-        .unwrap_or_else(|_| "output/scene_tree/7997.tree".to_string());
+    let tree_path_str =
+        env::var("TREE_PATH").unwrap_or_else(|_| "output/scene_tree/7997.tree".to_string());
     let tree_path = PathBuf::from(&tree_path_str);
 
     println!("加载 tree 文件: {}", tree_path.display());
@@ -40,7 +40,8 @@ fn main() -> Result<()> {
 
                     // 获取 children
                     let node_id = tree_file.arena.get_node_id(node).unwrap();
-                    let children: Vec<_> = node_id.children(&tree_file.arena)
+                    let children: Vec<_> = node_id
+                        .children(&tree_file.arena)
                         .map(|child_id| {
                             let child = tree_file.arena.get(child_id).unwrap().get();
                             child.refno
@@ -60,21 +61,26 @@ fn main() -> Result<()> {
         println!("\n前 10 个节点:");
         for (i, node) in tree_file.arena.iter().enumerate().take(10) {
             let meta = node.get();
-            println!("  [{}] refno={} owner={} noun={}", i, meta.refno, meta.owner, meta.noun);
+            println!(
+                "  [{}] refno={} owner={} noun={}",
+                i, meta.refno, meta.owner, meta.noun
+            );
         }
 
         // 找到一个有多个 children 的 BRAN 节点作为示例
         println!("\n寻找有多个 children 的节点 (BRAN=23):");
         for node in tree_file.arena.iter() {
             let meta = node.get();
-            if meta.noun == 23 { // BRAN
+            if meta.noun == 23 {
+                // BRAN
                 let node_id = tree_file.arena.get_node_id(node).unwrap();
                 let children_count = node_id.children(&tree_file.arena).count();
                 if children_count >= 3 {
                     println!("  {} (children={})", meta.refno, children_count);
 
                     // 显示 children
-                    let children: Vec<_> = node_id.children(&tree_file.arena)
+                    let children: Vec<_> = node_id
+                        .children(&tree_file.arena)
                         .map(|child_id| {
                             let child = tree_file.arena.get(child_id).unwrap().get();
                             child.refno

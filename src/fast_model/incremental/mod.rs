@@ -36,21 +36,6 @@ use aios_core::options::DbOption;
 //     generator.generate_incremental_models_for_sesno(sesno).await
 // }
 
-// /// 便捷函数：生成指定 sesno 的增量模型（增强版本，推荐使用）
-// ///
-// /// # 参数
-// /// * `sesno` - 目标会话号
-// /// * `db_option` - 数据库配置选项
-// ///
-// /// # 返回值
-// /// * `anyhow::Result<IncrementalGenerationResult>` - 详细的生成结果
-// pub async fn generate_models_for_sesno_v2(
-//     sesno: u32,
-//     db_option: &DbOption,
-// ) -> anyhow::Result<IncrementalGenerationResult> {
-//     generate_models_for_sesno_enhanced(sesno, db_option, None).await
-// }
-
 #[cfg(test)]
 mod tests {
     use super::*;

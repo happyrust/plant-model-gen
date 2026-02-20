@@ -1,30 +1,37 @@
 //! 进度管理器
 //!
-//! 负责管理解析任务的进度跟踪和实时更新
+//! 基于统一的 ProgressHub 实现，提供 gRPC 服务的进度跟踪和实时更新功能
 
 use crate::grpc_service::error::{ServiceError, ServiceResult};
-use crate::grpc_service::types::{ProgressUpdate, TaskProgress, TaskStatus};
-use chrono::{DateTime, Utc};
-use dashmap::DashMap;
+use crate::grpc_service::types::{ProgressUpdate, TaskProgress, TaskStatus as GrpcTaskStatus};
+use crate::shared::{ProgressHub, ProgressMessage, ProgressMessageBuilder, TaskStatus};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// 进度管理器
+///
+/// 封装 ProgressHub，提供 gRPC 服务的进度跟踪接口
 #[derive(Debug, Clone)]
 pub struct ProgressManager {
-    /// 进度广播通道
-    progress_channels: Arc<DashMap<String, broadcast::Sender<ProgressUpdate>>>,
-    /// 当前任务进度
-    current_tasks: Arc<DashMap<String, TaskProgress>>,
+    hub: Arc<ProgressHub>,
 }
 
 impl ProgressManager {
     /// 创建新的进度管理器
     pub fn new() -> Self {
         Self {
-            progress_channels: Arc::new(DashMap::new()),
-            current_tasks: Arc::new(DashMap::new()),
+            hub: Arc::new(ProgressHub::default()),
         }
+    }
+
+    /// 使用自定义的 ProgressHub
+    pub fn with_hub(hub: Arc<ProgressHub>) -> Self {
+        Self { hub }
+    }
+
+    /// 获取内部的 ProgressHub 引用
+    pub fn hub(&self) -> &ProgressHub {
+        &self.hub
     }
 
     /// 创建新任务
@@ -32,68 +39,56 @@ impl ProgressManager {
         &self,
         task_id: String,
     ) -> ServiceResult<broadcast::Receiver<ProgressUpdate>> {
-        let (sender, receiver) = broadcast::channel(1000);
+        // 注册任务到 ProgressHub
+        let mut rx = self.hub.register(task_id.clone());
 
-        // 创建任务进度记录
-        let task_progress = TaskProgress {
-            task_id: task_id.clone(),
-            progress: 0.0,
-            status: TaskStatus::Pending,
-            message: "Task created".to_string(),
-            start_time: Utc::now(),
-            estimated_completion: None,
-            details: None,
-        };
+        // 将 ProgressMessage 转换为 ProgressUpdate 的适配器
+        let (tx, grpc_rx) = broadcast::channel(100);
 
-        self.progress_channels.insert(task_id.clone(), sender);
-        self.current_tasks.insert(task_id, task_progress);
+        // 启动转换任务
+        tokio::spawn(async move {
+            while let Ok(msg) = rx.recv().await {
+                let update = convert_to_progress_update(msg);
+                let _ = tx.send(update);
+            }
+        });
 
-        Ok(receiver)
+        Ok(grpc_rx)
     }
 
     /// 更新任务进度
     pub async fn update_progress(&self, update: ProgressUpdate) -> ServiceResult<()> {
-        // 更新任务进度记录
-        if let Some(mut task) = self.current_tasks.get_mut(&update.task_id) {
-            task.progress = update.progress;
-            task.status = update.status.clone();
-            task.message = update.message.clone();
-            task.details = update.details.clone();
-        }
-
-        // 广播进度更新
-        if let Some(sender) = self.progress_channels.get(&update.task_id) {
-            if let Err(_) = sender.send(update) {
-                // 如果发送失败，说明没有接收者，可以考虑清理
-                log::warn!("No receivers for task progress");
-            }
-        }
-
+        let message = convert_from_progress_update(update);
+        self.hub
+            .publish(message)
+            .map_err(|e| ServiceError::Internal(e))?;
         Ok(())
     }
 
     /// 获取任务进度
     pub async fn get_task_progress(&self, task_id: &str) -> Option<TaskProgress> {
-        self.current_tasks.get(task_id).map(|entry| entry.clone())
+        self.hub
+            .get_task_state(task_id)
+            .map(convert_to_task_progress)
     }
 
     /// 检查任务是否存在
     pub fn has_task(&self, task_id: &str) -> bool {
-        self.current_tasks.contains_key(task_id)
+        self.hub.has_task(task_id)
     }
 
     /// 移除已完成的任务
     pub async fn remove_task(&self, task_id: &str) -> ServiceResult<()> {
-        self.progress_channels.remove(task_id);
-        self.current_tasks.remove(task_id);
+        self.hub.unregister(task_id);
         Ok(())
     }
 
     /// 获取所有活跃任务
     pub async fn get_active_tasks(&self) -> Vec<TaskProgress> {
-        self.current_tasks
-            .iter()
-            .map(|entry| entry.value().clone())
+        self.hub
+            .all_task_states()
+            .into_iter()
+            .map(convert_to_task_progress)
             .collect()
     }
 }
@@ -101,5 +96,117 @@ impl ProgressManager {
 impl Default for ProgressManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 将 ProgressMessage 转换为 gRPC 的 ProgressUpdate
+fn convert_to_progress_update(msg: ProgressMessage) -> ProgressUpdate {
+    ProgressUpdate {
+        task_id: msg.task_id,
+        progress: msg.percentage,
+        status: convert_task_status(&msg.status),
+        message: msg.message,
+        timestamp: msg.timestamp,
+        details: msg.details.and_then(|d| {
+            Some(crate::grpc_service::types::ProgressDetails {
+                current_step: msg.current_step.clone(),
+                total_steps: msg.total_steps,
+                current_step_index: msg.current_step_number,
+                processed_items: msg.processed_items,
+                total_items: msg.total_items,
+                errors: vec![], // 可以从 details JSON 中提取
+            })
+        }),
+    }
+}
+
+/// 将 gRPC 的 ProgressUpdate 转换为 ProgressMessage
+fn convert_from_progress_update(update: ProgressUpdate) -> ProgressMessage {
+    let details = update.details.as_ref();
+    ProgressMessageBuilder::new(update.task_id)
+        .status(convert_task_status_reverse(&update.status))
+        .percentage(update.progress)
+        .step(
+            details.map(|d| d.current_step.clone()).unwrap_or_default(),
+            details.map(|d| d.current_step_index).unwrap_or(0),
+            details.map(|d| d.total_steps).unwrap_or(0),
+        )
+        .items(
+            details.map(|d| d.processed_items).unwrap_or(0),
+            details.map(|d| d.total_items).unwrap_or(0),
+        )
+        .message(update.message)
+        .build()
+}
+
+/// 将 ProgressMessage 转换为 TaskProgress
+fn convert_to_task_progress(msg: ProgressMessage) -> TaskProgress {
+    TaskProgress {
+        task_id: msg.task_id,
+        progress: msg.percentage,
+        status: convert_task_status(&msg.status),
+        message: msg.message,
+        start_time: msg.timestamp, // 注意：这里使用的是消息时间戳，实际应该记录任务开始时间
+        estimated_completion: None,
+        details: Some(crate::grpc_service::types::ProgressDetails {
+            current_step: msg.current_step,
+            total_steps: msg.total_steps,
+            current_step_index: msg.current_step_number,
+            processed_items: msg.processed_items,
+            total_items: msg.total_items,
+            errors: vec![],
+        }),
+    }
+}
+
+/// 转换任务状态（ProgressHub -> gRPC）
+fn convert_task_status(status: &TaskStatus) -> GrpcTaskStatus {
+    match status {
+        TaskStatus::Pending => GrpcTaskStatus::Pending,
+        TaskStatus::Running => GrpcTaskStatus::Running,
+        TaskStatus::Completed => GrpcTaskStatus::Completed,
+        TaskStatus::Failed => GrpcTaskStatus::Failed,
+        TaskStatus::Cancelled => GrpcTaskStatus::Cancelled,
+    }
+}
+
+/// 转换任务状态（gRPC -> ProgressHub）
+fn convert_task_status_reverse(status: &GrpcTaskStatus) -> TaskStatus {
+    match status {
+        GrpcTaskStatus::Pending => TaskStatus::Pending,
+        GrpcTaskStatus::Running => TaskStatus::Running,
+        GrpcTaskStatus::Completed => TaskStatus::Completed,
+        GrpcTaskStatus::Failed => TaskStatus::Failed,
+        GrpcTaskStatus::Cancelled => TaskStatus::Cancelled,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    #[tokio::test]
+    async fn test_progress_manager() {
+        let manager = ProgressManager::new();
+
+        // 创建任务
+        let mut rx = manager.create_task("test-task".to_string()).await.unwrap();
+
+        // 更新进度
+        let update = ProgressUpdate {
+            task_id: "test-task".to_string(),
+            progress: 50.0,
+            status: GrpcTaskStatus::Running,
+            message: "Processing...".to_string(),
+            timestamp: Utc::now(),
+            details: None,
+        };
+
+        manager.update_progress(update).await.unwrap();
+
+        // 接收更新
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.progress, 50.0);
     }
 }

@@ -14,8 +14,8 @@
 //! - ZONE_REFNO：目标 ZONE refno（默认 "24381/146882"）
 //! - ROOM_RELATION_CONCURRENCY / ROOM_RELATION_CANDIDATE_LIMIT：房间计算性能调参
 
-use anyhow::{Context, Result};
 use aios_core::RefnoEnum;
+use anyhow::{Context, Result};
 use std::env;
 
 const DEFAULT_ZONE_REFNO: &str = "24381/146882";
@@ -23,7 +23,8 @@ const DEFAULT_ZONE_REFNO: &str = "24381/146882";
 #[tokio::main]
 async fn main() -> Result<()> {
     // 1) 配置加载
-    let dbopt_path = env::var("DBOPTION_PATH").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let dbopt_path =
+        env::var("DBOPTION_PATH").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let mut db_option_ext = aios_database::options::get_db_option_ext_from_path(&dbopt_path)
         .with_context(|| format!("加载 DbOption 失败: {}", dbopt_path))?;
 
@@ -78,7 +79,9 @@ async fn main() -> Result<()> {
         // 注意：Refno 的 ref0（如 24381）不一定等同于 SurrealDB 的 dbnum。
         // cache 按 dbnum 分批存储，这里从 db_meta_info.json 推导实际 dbnum。
         let db_meta = aios_database::data_interface::db_meta_manager::db_meta();
-        db_meta.ensure_loaded().context("加载 db_meta_info.json 失败")?;
+        db_meta
+            .ensure_loaded()
+            .context("加载 db_meta_info.json 失败")?;
         let cache_dbnum: u32 = db_meta
             .get_dbnum_by_refno(zone_refno)
             .context("无法从 db_meta_info.json 推导 cache dbnum")?;
@@ -122,9 +125,13 @@ async fn main() -> Result<()> {
 
         let idx = aios_database::sqlite_index::SqliteAabbIndex::open(&idx_path)
             .context("打开 SQLite 索引失败")?;
-        idx.init_schema().context("初始化 SQLite 索引 schema 失败")?;
+        idx.init_schema()
+            .context("初始化 SQLite 索引 schema 失败")?;
         let import_stats = idx
-            .import_from_instances_json(&instances_path, &aios_database::sqlite_index::ImportConfig::default())
+            .import_from_instances_json(
+                &instances_path,
+                &aios_database::sqlite_index::ImportConfig::default(),
+            )
             .context("导入 instances.json 到 SQLite 空间索引失败")?;
 
         println!(
@@ -177,7 +184,10 @@ async fn main() -> Result<()> {
     let group_children = room_tree_children_core(&group_id, 2000)
         .await
         .context("room_tree_children_core(group) 失败")?;
-    println!("🏠 rooms in sample group: {}", group_children.children.len());
+    println!(
+        "🏠 rooms in sample group: {}",
+        group_children.children.len()
+    );
 
     // 祖先链验证：优先取该 group 下的第一个 room
     let mut sample_room_refno: Option<RefnoEnum> = None;
@@ -194,7 +204,9 @@ async fn main() -> Result<()> {
             .context("room_tree_ancestors_core(room) 失败")?;
         println!("🧬 ancestors ids len={}", anc.ids.len());
     } else {
-        println!("⚠️ sample group 下无 room 节点（可能 room_relate 未覆盖该组），跳过 ancestors 校验");
+        println!(
+            "⚠️ sample group 下无 room 节点（可能 room_relate 未覆盖该组），跳过 ancestors 校验"
+        );
     }
 
     // 搜索验证：用 group 名称作为 keyword（通常可命中）

@@ -18,9 +18,11 @@ use std::collections::{BTreeSet, HashMap};
 
 use std::path::Path;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use std::sync::Arc;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 
 
@@ -85,6 +87,17 @@ use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 use aios_core::tool::db_tool::db1_hash;
 
 use dashmap::{DashMap, DashSet};
+
+fn read_bool_env(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn is_generate_core_only_mode() -> bool {
+    read_bool_env("AIOS_GEN_MODEL_GENERATE_ONLY")
+}
 
 /// 按 dbnum 拆分一个 batch，保证写入 InstanceCache 时“一个 batch 只落到一个 dbnum 分桶”。
 ///
@@ -585,6 +598,14 @@ async fn filter_bran_hang_refnos(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
 
 }
 
+fn is_only_bran_hang_categories(categories: &[String]) -> bool {
+    !categories.is_empty()
+        && categories.iter().all(|cat| {
+            let upper = cat.trim().to_ascii_uppercase();
+            upper == "BRAN" || upper == "HANG"
+        })
+}
+
 
 
 /// 处理 Full Noun 模式的生成流程
@@ -642,6 +663,8 @@ async fn process_full_noun_mode(
     let config = FullNounConfig::from_db_option_ext(db_option)
 
         .map_err(|e| anyhow::anyhow!("配置错误: {}", e))?;
+
+    let skip_boolean_for_bran_hang = is_only_bran_hang_categories(&config.enabled_categories);
 
 
 
@@ -753,9 +776,13 @@ async fn process_full_noun_mode(
 
         .and_then(|nums| nums.first().copied());
 
+    let producer_done = Arc::new(AtomicBool::new(false));
+    let producer_done_for_insert = producer_done.clone();
+
 
 
     let insert_handle = tokio::spawn(async move {
+        const DB_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 
         #[cfg(feature = "profile")]
 
@@ -775,15 +802,32 @@ async fn process_full_noun_mode(
 
         let mut t_duckdb = std::time::Duration::ZERO;
 
-        // SurrealDB 写入后台任务句柄：不阻塞 cache 写入和后续 batch 接收
-        let mut db_write_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-
         loop {
 
-            let Ok(shape_insts) = receiver.recv_async().await else {
+            let next = if producer_done_for_insert.load(Ordering::Relaxed) {
+                match tokio::time::timeout(Duration::from_millis(800), receiver.recv_async()).await {
+                    Ok(Ok(v)) => Some(v),
+                    Ok(Err(_)) => None,
+                    Err(_) => {
+                        let sender_cnt = receiver.sender_count();
+                        if sender_cnt > 0 {
+                            eprintln!(
+                                "[gen_model] instance_sink idle timeout after producer_done; sender_count={}，提前结束等待",
+                                sender_cnt
+                            );
+                        }
+                        None
+                    }
+                }
+            } else {
+                match receiver.recv_async().await {
+                    Ok(v) => Some(v),
+                    Err(_) => None,
+                }
+            };
 
+            let Some(shape_insts) = next else {
                 break;
-
             };
 
 
@@ -795,6 +839,9 @@ async fn process_full_noun_mode(
 
 
             batch_cnt += 1;
+            if batch_cnt % 200 == 0 {
+                println!("[gen_model] instance_sink 已处理批次: {}", batch_cnt);
+            }
 
 
 
@@ -812,8 +859,11 @@ async fn process_full_noun_mode(
                 let by_dbnum = match split_shape_instances_by_dbnum(&shape_insts).await {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("[cache] batch 拆分 dbnum 失败，跳过写 cache: {}", e);
-                        continue;
+                        return Err(anyhow::anyhow!(
+                            "[cache] batch 拆分 dbnum 失败(batch={}): {}",
+                            batch_cnt,
+                            e
+                        ));
                     }
                 };
 
@@ -880,33 +930,34 @@ async fn process_full_noun_mode(
 
             }
 
-            // SurrealDB 写入放到后台，不阻塞 cache 写入和后续 batch 接收
+            // SurrealDB 写入：串行 + 超时保护，避免无界并发写入压垮查询路径。
             if use_surrealdb {
                 let t0 = Instant::now();
-                db_write_handles.push(tokio::spawn(async move {
-                    if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
-                        eprintln!("保存实例数据失败: {}", e);
+                let batch_id = batch_cnt;
+                let shape_insts_for_db = shape_insts;
+                let mut save_task = tokio::spawn(async move {
+                    save_instance_data_optimize(&shape_insts_for_db, replace_exist).await
+                });
+                match tokio::time::timeout(DB_WRITE_TIMEOUT, &mut save_task).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(e))) => {
+                        eprintln!("保存实例数据失败(batch={}): {}", batch_id, e);
                     }
-                }));
+                    Ok(Err(e)) => {
+                        eprintln!("[gen_model] 保存实例数据任务异常(batch={}): {}", batch_id, e);
+                    }
+                    Err(_) => {
+                        save_task.abort();
+                        eprintln!(
+                            "保存实例数据超时(batch={}): timeout={}s，已取消任务",
+                            batch_id,
+                            DB_WRITE_TIMEOUT.as_secs()
+                        );
+                    }
+                }
                 t_save_db += t0.elapsed();
             }
 
-        }
-
-        // 等待所有 SurrealDB 后台写入完成
-        if !db_write_handles.is_empty() {
-            let t_wait = Instant::now();
-            let total = db_write_handles.len();
-            for h in db_write_handles {
-                let _ = h.await;
-            }
-            let wait_ms = t_wait.elapsed().as_millis();
-            if wait_ms > 100 {
-                println!(
-                    "[gen_model] SurrealDB 后台写入等待完成: {} 个任务, 额外等待 {} ms",
-                    total, wait_ms
-                );
-            }
         }
 
 
@@ -935,6 +986,8 @@ async fn process_full_noun_mode(
 
         }
 
+        Ok(())
+
     });
 
 
@@ -945,17 +998,34 @@ async fn process_full_noun_mode(
 
         .map_err(|e| anyhow::anyhow!("Full Noun 生成失败: {}", e))?;
 
+    producer_done.store(true, Ordering::Relaxed);
+
 
 
     // 🔥 显式 drop sender，让 receiver 的循环能够正常结束
 
     // 否则 insert_handle.await 会永久阻塞
 
+    println!("[gen_model] Full Noun 主流程已结束，开始等待 instance_sink 收尾...");
     drop(sender);
 
 
 
-    let _ = insert_handle.await;
+    match insert_handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return Err(FullNounError::Other(anyhow::anyhow!(
+                "[gen_model] instance_sink 执行失败: {}",
+                e
+            )));
+        }
+        Err(e) => {
+            return Err(FullNounError::Other(anyhow::anyhow!(
+                "[gen_model] instance_sink 任务异常退出: {}",
+                e
+            )));
+        }
+    }
 
 
 
@@ -994,6 +1064,18 @@ async fn process_full_noun_mode(
     );
 
 
+
+    if is_generate_core_only_mode() {
+        println!(
+            "[gen_model] AIOS_GEN_MODEL_GENERATE_ONLY=1：仅执行模型生成核心阶段（Prefetch->Generate->CacheWrite），跳过 mesh/boolean/export/index"
+        );
+        if let Some(ref ctx) = foyer_cache_ctx {
+            if let Err(e) = ctx.cache().close().await {
+                eprintln!("[cache] 关闭缓存失败: {}", e);
+            }
+        }
+        return Ok(true);
+    }
 
     perf.mark("mesh_generation");
 
@@ -1109,7 +1191,7 @@ async fn process_full_noun_mode(
 
 
 
-        // 3️⃣ 写入 inst_relate_aabb 并导出 Parquet（供房间计算使用）
+        // 3️⃣ 写入 inst_relate_aabb（供房间计算使用）
 
         if use_surrealdb {
 
@@ -1220,7 +1302,7 @@ async fn process_full_noun_mode(
 
         // 4️⃣ 可选执行布尔运算
 
-        if db_option.inner.apply_boolean_operation {
+        if db_option.inner.apply_boolean_operation && !skip_boolean_for_bran_hang {
 
             let bool_start = Instant::now();
 
@@ -1258,6 +1340,10 @@ async fn process_full_noun_mode(
 
             );
 
+        } else if db_option.inner.apply_boolean_operation && skip_boolean_for_bran_hang {
+            println!(
+                "[gen_model] Full Noun 模式仅 BRAN/HANG 类别：已跳过布尔运算"
+            );
         }
 
 
@@ -1642,8 +1728,7 @@ async fn process_targeted_generation(
                 let by_dbnum = match split_shape_instances_by_dbnum(&shape_insts).await {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("[cache] batch 拆分 dbnum 失败，跳过写 cache: {}", e);
-                        continue;
+                        return Err(anyhow::anyhow!("[cache] batch 拆分 dbnum 失败: {}", e));
                     }
                 };
 
@@ -1677,6 +1762,7 @@ async fn process_targeted_generation(
             }
 
         }
+        Ok(())
 
     });
 
@@ -1706,17 +1792,27 @@ async fn process_targeted_generation(
 
     drop(sender);
 
-    let _ = insert_task.await;
+    match insert_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(FullNounError::Other(e)),
+        Err(e) => {
+            return Err(FullNounError::Other(anyhow::anyhow!(
+                "[gen_model] insert_task 任务异常退出: {}",
+                e
+            )))
+        }
+    }
 
 
 
     // 方案 B：补齐 BRAN/HANG 的 tubi（从 SurrealDB 的 tubi_relate 读取最小必要信息），
 
     // 并写入 foyer cache，确保后续 export-dbnum-instances-json / mbd_pipe_api 能从 cache 拿到 inst_tubi_map 数据。
+    let branch_refnos = filter_bran_hang_refnos(&target_root_refnos).await;
+    let skip_boolean_for_bran_hang =
+        !target_root_refnos.is_empty() && branch_refnos.len() == target_root_refnos.len();
 
     if let Some(ref ctx) = foyer_cache_ctx {
-
-        let branch_refnos = filter_bran_hang_refnos(&target_root_refnos).await;
 
         if !branch_refnos.is_empty() {
 
@@ -1824,7 +1920,21 @@ async fn process_targeted_generation(
 
     );
 
-
+    if is_generate_core_only_mode() {
+        println!(
+            "[gen_model] AIOS_GEN_MODEL_GENERATE_ONLY=1：仅执行模型生成核心阶段（Prefetch->Generate->CacheWrite），跳过 mesh/boolean/capture/index"
+        );
+        if let Some(ref ctx) = foyer_cache_ctx {
+            if let Err(e) = ctx.cache().close().await {
+                eprintln!("[cache] 关闭缓存失败: {}", e);
+            }
+        }
+        println!(
+            "[gen_model] gen_all_geos_data 完成（核心阶段），总耗时 {} ms",
+            time.elapsed().as_millis()
+        );
+        return Ok(true);
+    }
 
     if db_option.inner.gen_mesh {
 
@@ -1971,7 +2081,7 @@ async fn process_targeted_generation(
 
 
 
-        if db_option.inner.apply_boolean_operation {
+        if db_option.inner.apply_boolean_operation && !skip_boolean_for_bran_hang {
 
             let bool_start = Instant::now();
 
@@ -2035,6 +2145,8 @@ async fn process_targeted_generation(
 
             );
 
+        } else if db_option.inner.apply_boolean_operation && skip_boolean_for_bran_hang {
+            println!("[gen_model] 目标均为 BRAN/HANG：已跳过布尔运算");
         }
 
     }
@@ -2279,8 +2391,11 @@ async fn process_full_database_generation(
                     let by_dbnum = match split_shape_instances_by_dbnum(&shape_insts).await {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!("[cache] batch 拆分 dbnum 失败，跳过写 cache: {}", e);
-                            continue;
+                            return Err(anyhow::anyhow!(
+                                "[cache] batch 拆分 dbnum 失败(dbnum={}): {}",
+                                dbnum,
+                                e
+                            ));
                         }
                     };
                     if by_dbnum.len() != 1 || !by_dbnum.contains_key(&dbnum) {
@@ -2321,6 +2436,7 @@ async fn process_full_database_generation(
                 }
 
             }
+            Ok(())
 
         });
 
@@ -2344,7 +2460,17 @@ async fn process_full_database_generation(
 
         drop(sender);
 
-        let _ = insert_task.await;
+        match insert_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(FullNounError::Other(e)),
+            Err(e) => {
+                return Err(FullNounError::Other(anyhow::anyhow!(
+                    "[gen_model] insert_task(dbnum={}) 任务异常退出: {}",
+                    dbnum,
+                    e
+                )))
+            }
+        }
 
 
 

@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
 use aios_core::Transform;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use serde::Deserialize;
 use surrealdb::types::SurrealValue;
 use std::sync::OnceLock;
@@ -18,12 +19,14 @@ use crate::options::DbOptionExt;
 
 pub struct TransformCacheManager {
     cache: DashMap<(u32, RefnoEnum), Transform>,
+    pins: DashMap<(u32, RefnoEnum), u32>,
 }
 
 impl TransformCacheManager {
     pub fn new() -> Self {
         Self {
             cache: DashMap::new(),
+            pins: DashMap::new(),
         }
     }
 
@@ -45,6 +48,123 @@ impl TransformCacheManager {
         self.cache.clear();
         count
     }
+
+    /// 按 refno 定向清理 world_transform 缓存，避免并发任务互相清空全局缓存。
+    pub fn clear_refnos(&self, refnos: &[RefnoEnum]) -> usize {
+        if refnos.is_empty() {
+            return 0;
+        }
+        let keys = Self::map_refnos_to_keys(refnos);
+        let mut count = 0usize;
+        for (dbnum, refno) in keys {
+            if self.cache.remove(&(dbnum, refno)).is_some() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// 为一组 refno 增加缓存租约（pin），用于并发任务隔离。
+    pub fn pin_refnos(&self, refnos: &[RefnoEnum]) -> usize {
+        if refnos.is_empty() {
+            return 0;
+        }
+        let keys = Self::map_refnos_to_keys(refnos);
+        self.pin_keys(&keys)
+    }
+
+    /// 释放一组 refno 的缓存租约（不清理缓存条目）。
+    pub fn unpin_refnos(&self, refnos: &[RefnoEnum]) -> usize {
+        if refnos.is_empty() {
+            return 0;
+        }
+        let keys = Self::map_refnos_to_keys(refnos);
+        self.unpin_keys(&keys)
+    }
+
+    /// 释放一组 refno 的缓存租约，并在无人持有时清理缓存条目。
+    pub fn release_refnos_and_clear(&self, refnos: &[RefnoEnum]) -> usize {
+        if refnos.is_empty() {
+            return 0;
+        }
+        let keys = Self::map_refnos_to_keys(refnos);
+        self.release_keys_and_clear(&keys)
+    }
+
+    fn map_refnos_to_keys(refnos: &[RefnoEnum]) -> Vec<(u32, RefnoEnum)> {
+        let _ = db_meta().ensure_loaded();
+
+        let mut keys = Vec::with_capacity(refnos.len());
+        for &refno in refnos {
+            let Some(dbnum) = db_meta().get_dbnum_by_refno(refno) else {
+                continue;
+            };
+            keys.push((dbnum, refno));
+        }
+        keys
+    }
+
+    fn pin_keys(&self, keys: &[(u32, RefnoEnum)]) -> usize {
+        let mut pinned = 0usize;
+        for &key in keys {
+            match self.pins.entry(key) {
+                Entry::Occupied(mut occ) => {
+                    *occ.get_mut() += 1;
+                }
+                Entry::Vacant(vac) => {
+                    vac.insert(1);
+                }
+            }
+            pinned += 1;
+        }
+        pinned
+    }
+
+    fn unpin_keys(&self, keys: &[(u32, RefnoEnum)]) -> usize {
+        let mut released = 0usize;
+        for &key in keys {
+            match self.pins.entry(key) {
+                Entry::Occupied(mut occ) => {
+                    let cnt = occ.get_mut();
+                    if *cnt > 1 {
+                        *cnt -= 1;
+                    } else {
+                        occ.remove();
+                    }
+                    released += 1;
+                }
+                Entry::Vacant(_) => {}
+            }
+        }
+        released
+    }
+
+    fn release_keys_and_clear(&self, keys: &[(u32, RefnoEnum)]) -> usize {
+        let mut removed = 0usize;
+        for &key in keys {
+            let mut can_clear = true;
+
+            match self.pins.entry(key) {
+                Entry::Occupied(mut occ) => {
+                    let cnt = occ.get_mut();
+                    if *cnt > 1 {
+                        *cnt -= 1;
+                        can_clear = false;
+                    } else {
+                        occ.remove();
+                    }
+                }
+                Entry::Vacant(_) => {
+                    // 未被 pin 的历史调用，维持兼容：允许直接清理。
+                }
+            }
+
+            if can_clear && self.cache.remove(&key).is_some() {
+                removed += 1;
+            }
+        }
+        removed
+    }
 }
 
 static GLOBAL_TRANSFORM_CACHE: OnceLock<TransformCacheManager> = OnceLock::new();
@@ -57,6 +177,30 @@ pub fn init_global_transform_cache() {
 pub fn clear_global_transform_cache() -> usize {
     GLOBAL_TRANSFORM_CACHE.get()
         .map(|mgr| mgr.clear())
+        .unwrap_or(0)
+}
+
+/// 按 refno 清理全局 transform 缓存（用于分批任务隔离）。
+pub fn clear_global_transform_cache_for_refnos(refnos: &[RefnoEnum]) -> usize {
+    GLOBAL_TRANSFORM_CACHE
+        .get()
+        .map(|mgr| mgr.release_refnos_and_clear(refnos))
+        .unwrap_or(0)
+}
+
+/// 为一组 refno 增加全局 transform 缓存租约（pin）。
+pub fn pin_global_transform_cache_for_refnos(refnos: &[RefnoEnum]) -> usize {
+    GLOBAL_TRANSFORM_CACHE
+        .get()
+        .map(|mgr| mgr.pin_refnos(refnos))
+        .unwrap_or(0)
+}
+
+/// 释放一组 refno 的全局 transform 缓存租约（不清理条目）。
+pub fn release_global_transform_cache_for_refnos(refnos: &[RefnoEnum]) -> usize {
+    GLOBAL_TRANSFORM_CACHE
+        .get()
+        .map(|mgr| mgr.unpin_refnos(refnos))
         .unwrap_or(0)
 }
 
@@ -356,5 +500,26 @@ mod tests {
             rot.w as f32,
         ));
         assert!(dot.abs() > 1.0 - 1e-3);
+    }
+
+    #[test]
+    fn test_transform_cache_pin_release_two_tasks_same_refno() {
+        let mgr = TransformCacheManager::new();
+        let refno: RefnoEnum = "24381/36716".into();
+        let dbnum = 1112u32;
+
+        mgr.insert_world_transform(dbnum, refno.clone(), Transform::IDENTITY);
+        let keys = vec![(dbnum, refno.clone())];
+
+        assert_eq!(mgr.pin_keys(&keys), 1);
+        assert_eq!(mgr.pin_keys(&keys), 1);
+
+        let removed_first = mgr.release_keys_and_clear(&keys);
+        assert_eq!(removed_first, 0, "仍有并发租约时不应清理缓存");
+        assert!(mgr.get_world_transform(dbnum, refno.clone()).is_some());
+
+        let removed_second = mgr.release_keys_and_clear(&keys);
+        assert_eq!(removed_second, 1, "最后一个租约释放后应清理对应缓存条目");
+        assert!(mgr.get_world_transform(dbnum, refno).is_none());
     }
 }

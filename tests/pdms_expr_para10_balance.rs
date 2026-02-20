@@ -38,10 +38,7 @@ async fn test_pdms_expr_contains_para10_inner_group_is_closed() {
     let mut io = PdmsIO::new("ams", file_path, true);
     io.open().expect("open pdms db");
 
-    let ele = io
-        .auto_get_element(refno)
-        .await
-        .expect("auto_get_element");
+    let ele = io.auto_get_element(refno).await.expect("auto_get_element");
     let att = ele.att_map();
 
     let px = att
@@ -58,4 +55,3 @@ async fn test_pdms_expr_contains_para10_inner_group_is_closed() {
     let bal = paren_balance(&px);
     assert_eq!(bal, 0, "PX parentheses not balanced: bal={bal}, PX={px}");
 }
-

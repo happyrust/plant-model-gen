@@ -930,6 +930,141 @@ pub async fn run_prim_pipeline_from_refnos(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// CATE 流水线
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct CateReadyBatchTask {
+    key: ReadyBatchKey,
+    refnos: Vec<RefnoEnum>,
+    target_cata_map: Arc<DashMap<String, aios_core::pdms_types::CataHashRefnoKV>>,
+}
+
+async fn consume_batches_cate(
+    ctx: NounProcessContext,
+    cache: &'static GeomInputCacheManager,
+    rx: flume::Receiver<CateReadyBatchTask>,
+    sender: flume::Sender<ShapeInstancesData>,
+    stats: Arc<PipelineStats>,
+) -> anyhow::Result<()> {
+    while let Ok(task) = rx.recv_async().await {
+        let dbnum = task.key.dbnum;
+        let mut miss_count = 0u64;
+        // 验证 cache 中存在 cate input
+        for &refno in &task.refnos {
+            if cache.get_cate_input(dbnum, refno).is_none() {
+                miss_count += 1;
+            }
+        }
+        if miss_count > 0 {
+            stats.cache_miss_hard_fail.fetch_add(miss_count, Ordering::Relaxed);
+        }
+        let hit = task.refnos.len() as u64 - miss_count;
+        stats.cache_hit_count.fetch_add(hit, Ordering::Relaxed);
+
+        // 调用 cate_processor 的 cache-only 生成
+        super::cate_processor::gen_cate_instances_from_cache_only(
+            &ctx,
+            &task.target_cata_map,
+            sender.clone(),
+            &task.refnos,
+            false,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("gen_cate_instances_from_cache_only failed: {}", e))?;
+    }
+    Ok(())
+}
+
+pub async fn run_cate_pipeline_from_refnos(
+    ctx: &NounProcessContext,
+    sender: flume::Sender<ShapeInstancesData>,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<()> {
+    if refnos.is_empty() {
+        return Ok(());
+    }
+
+    geom_input_cache::init_global_geom_input_cache();
+    let cache = geom_input_cache::global_geom_input_cache()
+        .ok_or_else(|| anyhow::anyhow!("geom_input_cache 未初始化"))?;
+
+    let (tx, rx) = flume::unbounded::<CateReadyBatchTask>();
+    let consumer_ctx = ctx.clone();
+    let consumer_sender = sender.clone();
+    let stats = Arc::new(PipelineStats::default());
+    let consumer_stats = stats.clone();
+    let consumer = tokio::spawn(async move {
+        consume_batches_cate(consumer_ctx, cache, rx, consumer_sender, consumer_stats).await
+    });
+
+    let sem = Arc::new(Semaphore::new(DEFAULT_IN_FLIGHT_WRITES));
+    let mut join_set = tokio::task::JoinSet::<anyhow::Result<()>>::new();
+
+    let chunk_size = ctx.batch_size.max(1);
+    let groups = group_refnos_by_dbnum(refnos)?;
+    for (dbnum, refs) in groups {
+        for chunk in refs.chunks(chunk_size) {
+            let permit = sem.clone().acquire_owned().await?;
+            let tx = tx.clone();
+            let db_option = ctx.db_option.clone();
+            let refnos_vec: Vec<RefnoEnum> = chunk.to_vec();
+            let stats = stats.clone();
+
+            join_set.spawn(async move {
+                let _permit = permit;
+                stats.prefetch_count.fetch_add(refnos_vec.len() as u64, Ordering::Relaxed);
+
+                // 1) prefetch cate inputs → geom_input_cache
+                geom_input_cache::prefetch_cate_inputs(cache, db_option.as_ref(), dbnum, &refnos_vec).await?;
+
+                // 2) build cata_hash_map
+                let target_cata_map = Arc::new(
+                    super::utilities::build_cata_hash_map_from_tree_by_dbnum(dbnum, &refnos_vec).await?,
+                );
+
+                // 3) prefetch cata_resolve_cache
+                if !target_cata_map.is_empty() {
+                    let outcome = super::cata_resolve_cache_pipeline::prefetch_cata_resolve_cache_for_target_map(
+                        db_option.clone(),
+                        target_cata_map.clone(),
+                    )
+                    .await?;
+                    if outcome.failed > 0 {
+                        eprintln!(
+                            "[cate_pipeline] cata_resolve_cache prefetch: ok={}, failed={}, dbnum={}",
+                            outcome.computed, outcome.failed, dbnum
+                        );
+                    }
+                }
+
+                tx.send(CateReadyBatchTask {
+                    key: ReadyBatchKey { dbnum },
+                    refnos: refnos_vec,
+                    target_cata_map,
+                })
+                .map_err(|e| anyhow::anyhow!("send CateReadyBatchTask failed: {}", e))?;
+
+                Ok(())
+            });
+        }
+    }
+
+    drop(tx);
+    while let Some(res) = join_set.join_next().await {
+        res.map_err(|e| anyhow::anyhow!("cate prefetch task join failed: {}", e))??;
+    }
+
+    let consumer_result = consumer
+        .await
+        .map_err(|e| anyhow::anyhow!("cate consumer join failed: {}", e))?;
+    log_pipeline_stats("cate", &stats);
+    consumer_result?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,10 +1073,7 @@ mod tests {
     #[tokio::test]
     async fn test_pipeline_per_refno_roundtrip_smoke() {
         // 验证 per-refno 写入 -> ReadyBatchTask 传递 refnos -> per-refno 读回 的链路。
-        use tempfile::tempdir;
-
-        let dir = tempdir().unwrap();
-        let cache = GeomInputCacheManager::new(dir.path()).await.unwrap();
+        let cache = GeomInputCacheManager::new();
 
         let r1: RefnoEnum = "100/200".into();
         let r2: RefnoEnum = "100/201".into();
@@ -952,33 +1084,27 @@ mod tests {
             refno: r1,
             attmap: aios_core::NamedAttrMap::default(),
             world_transform: Default::default(),
-            owner_refno: None,
+            owner_refno: RefnoEnum::default(),
             owner_type: String::new(),
             visible: true,
-            neg_refnos: vec![],
-            cmpf_neg_refnos: vec![],
         };
         let cate2 = CateInput {
             refno: r2,
             attmap: aios_core::NamedAttrMap::default(),
             world_transform: Default::default(),
-            owner_refno: None,
+            owner_refno: RefnoEnum::default(),
             owner_type: String::new(),
             visible: true,
-            neg_refnos: vec![],
-            cmpf_neg_refnos: vec![],
         };
         cache.insert_cate_input(dbnum, r1, &cate1);
         cache.insert_cate_input(dbnum, r2, &cate2);
 
         // 模拟 consumer 侧 per-refno 读回
-        let got1 = cache.get_cate_input(dbnum, r1).await;
-        let got2 = cache.get_cate_input(dbnum, r2).await;
+        let got1 = cache.get_cate_input(dbnum, r1);
+        let got2 = cache.get_cate_input(dbnum, r2);
         assert!(got1.is_some(), "r1 must be present");
         assert!(got2.is_some(), "r2 must be present");
         assert_eq!(got1.unwrap().refno, r1);
         assert_eq!(got2.unwrap().refno, r2);
-
-        cache.close().await.unwrap();
     }
 }

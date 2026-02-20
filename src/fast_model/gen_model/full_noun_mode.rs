@@ -459,6 +459,7 @@ pub async fn gen_full_noun_geos_optimized(
                 ctx_prefetch.db_option.as_ref(),
                 &loop_vec,
                 &prim_refnos_for_prefetch,
+                &[],
             )
             .await?;
         }
@@ -503,7 +504,7 @@ pub async fn gen_full_noun_geos_optimized(
         if !cate_vec.is_empty() {
             let t_prefetch = Instant::now();
             geom_input_cache::init_global_geom_input_cache();
-            let (_, _, cate_n) = geom_input_cache::prefetch_all_geom_inputs_v2(
+            let (_, _, cate_n) = geom_input_cache::prefetch_all_geom_inputs(
                 ctx.db_option.as_ref(),
                 &[],
                 &[],
@@ -622,7 +623,7 @@ pub async fn gen_full_noun_geos_optimized(
 
                 // 全局 geom_input_cache 已在 orchestrator 初始化；这里再 init 一次保证 Full Noun 直调也可用。
                 geom_input_cache::init_global_geom_input_cache();
-                let _ = geom_input_cache::prefetch_all_geom_inputs_v2(
+                let _ = geom_input_cache::prefetch_all_geom_inputs(
                     ctx_prefetch.db_option.as_ref(),
                     &loop_vec,
                     &prim_vec,
@@ -1183,7 +1184,7 @@ async fn prefetch_bran_hang_inputs_for_offline_generate(
     if !child_refnos.is_empty() {
         geom_input_cache::init_global_geom_input_cache();
         let empty: Vec<RefnoEnum> = Vec::new();
-        let _ = geom_input_cache::prefetch_all_geom_inputs_v2(
+        let _ = geom_input_cache::prefetch_all_geom_inputs(
             ctx_prefetch.db_option.as_ref(),
             &empty,
             &empty,

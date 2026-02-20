@@ -297,7 +297,9 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     // cache-only 也需要连接 SurrealDB（输入数据源）；区别仅在于 instances 的读取/写入策略。
     ensure_surreal_connected(db_option_ext).await?;
     if !db_option_ext.use_surrealdb {
-        println!("📦 cache-only：OBJ 实例数据从 foyer cache 读取（不从 SurrealDB 查询 inst_relate）");
+        println!(
+            "📦 cache-only：OBJ 实例数据从 foyer cache 读取（不从 SurrealDB 查询 inst_relate）"
+        );
     }
 
     // 如果需要导出 SVG，设置环境变量
@@ -397,7 +399,11 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             } else {
                 let base_name = get_output_filename_for_refno(*refno).await;
                 // 确保输出到 output/{project_name} 目录
-                format!("{}/{}", db_option_ext.get_project_output_dir().display(), base_name)
+                format!(
+                    "{}/{}",
+                    db_option_ext.get_project_output_dir().display(),
+                    base_name
+                )
             };
 
             println!("\n🔄 导出 {} -> {} ...", refno, final_output_path);
@@ -444,7 +450,8 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
     println!("📊 查询该数据库下的所有 SITE...");
 
     use aios_database::fast_model::query_provider;
-    let sites: Vec<RefnoEnum> = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
+    let sites: Vec<RefnoEnum> =
+        query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
     println!("   - 找到 {} 个 SITE", sites.len());
 
     if sites.is_empty() {
@@ -488,7 +495,11 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
         println!("\n📂 拆分模式：每个 SITE 导出为独立文件");
         for (idx, site_refno) in sites.iter().enumerate() {
             let site_name = get_site_name_for_export(*site_refno, dbnum, "obj").await;
-            let output_file = format!("{}/{}", db_option_ext.get_project_output_dir().display(), site_name);
+            let output_file = format!(
+                "{}/{}",
+                db_option_ext.get_project_output_dir().display(),
+                site_name
+            );
             println!(
                 "\n🔄 [{}/{}] 导出 SITE: {} -> {}",
                 idx + 1,
@@ -527,7 +538,11 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
     } else {
         // 默认合并模式：将所有 SITE 合并到一个文件
         println!("\n🔀 合并模式：将所有 SITE 合并到一个文件（默认）");
-        let output_file = format!("{}/dbno_{}.obj", db_option_ext.get_project_output_dir().display(), dbnum);
+        let output_file = format!(
+            "{}/dbno_{}.obj",
+            db_option_ext.get_project_output_dir().display(),
+            dbnum
+        );
         println!(
             "🔄 导出合并文件: {} (包含 {} 个 SITE)",
             output_file,
@@ -568,7 +583,9 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
 
     ensure_surreal_connected(db_option_ext).await?;
     if !db_option_ext.use_surrealdb {
-        println!("📦 cache-only：GLB 实例数据从 foyer cache 读取（不从 SurrealDB 查询 inst_relate）");
+        println!(
+            "📦 cache-only：GLB 实例数据从 foyer cache 读取（不从 SurrealDB 查询 inst_relate）"
+        );
     }
 
     // 获取 mesh 目录
@@ -610,7 +627,7 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             println!("   - 强制开启 replace_mesh、gen_mesh 和 apply_boolean_operation");
 
             use aios_database::fast_model::gen_all_geos_data;
-        ensure_surreal_connected(db_option_ext).await?;
+            ensure_surreal_connected(db_option_ext).await?;
 
             unsafe {
                 std::env::set_var("FORCE_REPLACE_MESH", "true");
@@ -645,10 +662,13 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             let final_output_path = if let Some(ref path) = config.output_path {
                 path.clone()
             } else {
-                let base_name =
-                    get_output_filename_for_refno(*refno).await;
+                let base_name = get_output_filename_for_refno(*refno).await;
                 // 确保输出到 output/{project_name} 目录
-                format!("{}/{}.glb", db_option_ext.get_project_output_dir().display(), base_name.replace(".obj", ""))
+                format!(
+                    "{}/{}.glb",
+                    db_option_ext.get_project_output_dir().display(),
+                    base_name.replace(".obj", "")
+                )
             };
 
             println!("\n🔄 导出 {} -> {} ...", refno, final_output_path);
@@ -693,7 +713,8 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
     println!("📊 查询该数据库下的所有 SITE...");
 
     use aios_database::fast_model::query_provider;
-    let sites: Vec<RefnoEnum> = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
+    let sites: Vec<RefnoEnum> =
+        query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
     println!("   - 找到 {} 个 SITE", sites.len());
 
     if sites.is_empty() {
@@ -734,7 +755,11 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
         println!("\n📂 拆分模式：每个 SITE 导出为独立文件");
         for (idx, site_refno) in sites.iter().enumerate() {
             let site_name = get_site_name_for_export(*site_refno, dbnum, "glb").await;
-            let output_file = format!("{}/{}", db_option_ext.get_project_output_dir().display(), site_name);
+            let output_file = format!(
+                "{}/{}",
+                db_option_ext.get_project_output_dir().display(),
+                site_name
+            );
             println!(
                 "\n🔄 [{}/{}] 导出 SITE: {} -> {}",
                 idx + 1,
@@ -772,7 +797,11 @@ async fn export_glb_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
     } else {
         // 默认合并模式：将所有 SITE 合并到一个文件
         println!("\n🔀 合并模式：将所有 SITE 合并到一个文件（默认）");
-        let output_file = format!("{}/dbno_{}.glb", db_option_ext.get_project_output_dir().display(), dbnum);
+        let output_file = format!(
+            "{}/dbno_{}.glb",
+            db_option_ext.get_project_output_dir().display(),
+            dbnum
+        );
         println!(
             "🔄 导出合并文件: {} (包含 {} 个 SITE)",
             output_file,
@@ -813,7 +842,9 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
 
     ensure_surreal_connected(db_option_ext).await?;
     if !db_option_ext.use_surrealdb {
-        println!("📦 cache-only：glTF 实例数据从 foyer cache 读取（不从 SurrealDB 查询 inst_relate）");
+        println!(
+            "📦 cache-only：glTF 实例数据从 foyer cache 读取（不从 SurrealDB 查询 inst_relate）"
+        );
     }
 
     // 获取 mesh 目录
@@ -847,7 +878,8 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
         println!("📊 查询该数据库下的所有 SITE...");
 
         use aios_database::fast_model::query_provider;
-        let sites: Vec<RefnoEnum> = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
+        let sites: Vec<RefnoEnum> =
+            query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
         println!("   - 找到 {} 个 SITE", sites.len());
 
         if sites.is_empty() {
@@ -891,7 +923,11 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
         let exporter = GltfExporter::new();
         for (idx, site_refno) in sites.iter().enumerate() {
             let site_name = get_site_name_for_export(*site_refno, dbnum, "gltf").await;
-            let output_file = format!("{}/{}", db_option_ext.get_project_output_dir().display(), site_name);
+            let output_file = format!(
+                "{}/{}",
+                db_option_ext.get_project_output_dir().display(),
+                site_name
+            );
 
             println!(
                 "\n🔄 [{}/{}] 导出 SITE: {} -> {}",
@@ -983,10 +1019,13 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
             let final_output_path = if let Some(ref path) = config.output_path {
                 path.clone()
             } else {
-                let base_name =
-                    get_output_filename_for_refno(*refno).await;
+                let base_name = get_output_filename_for_refno(*refno).await;
                 // 确保输出到 output/{project_name} 目录
-                format!("{}/{}.gltf", db_option_ext.get_project_output_dir().display(), base_name.replace(".obj", ""))
+                format!(
+                    "{}/{}.gltf",
+                    db_option_ext.get_project_output_dir().display(),
+                    base_name.replace(".obj", "")
+                )
             };
 
             println!("\n🔄 导出 {} -> {} ...", refno, final_output_path);
@@ -1027,7 +1066,8 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
     println!("📊 查询该数据库下的所有 SITE...");
 
     use aios_database::fast_model::query_provider;
-    let sites: Vec<RefnoEnum> = query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
+    let sites: Vec<RefnoEnum> =
+        query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
     println!("   - 找到 {} 个 SITE", sites.len());
 
     if sites.is_empty() {
@@ -1068,7 +1108,11 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
         println!("\n📂 拆分模式：每个 SITE 导出为独立文件");
         for (idx, site_refno) in sites.iter().enumerate() {
             let site_name = get_site_name_for_export(*site_refno, dbnum, "gltf").await;
-            let output_file = format!("{}/{}", db_option_ext.get_project_output_dir().display(), site_name);
+            let output_file = format!(
+                "{}/{}",
+                db_option_ext.get_project_output_dir().display(),
+                site_name
+            );
             println!(
                 "\n🔄 [{}/{}] 导出 SITE: {} -> {}",
                 idx + 1,
@@ -1106,7 +1150,11 @@ async fn export_gltf_mode_for_db(config: &ExportConfig, db_option_ext: &DbOption
     } else {
         // 默认合并模式：将所有 SITE 合并到一个文件
         println!("\n🔀 合并模式：将所有 SITE 合并到一个文件（默认）");
-        let output_file = format!("{}/dbno_{}.gltf", db_option_ext.get_project_output_dir().display(), dbnum);
+        let output_file = format!(
+            "{}/dbno_{}.gltf",
+            db_option_ext.get_project_output_dir().display(),
+            dbnum
+        );
         println!(
             "🔄 导出合并文件: {} (包含 {} 个 SITE)",
             output_file,
@@ -1295,7 +1343,11 @@ async fn export_instanced_bundle_mode(
     // 确定输出目录
     let output_dir = config.output_path.clone().unwrap_or_else(|| {
         let first_refno = refnos[0].to_string().replace('/', "_");
-        format!("{}/instanced-bundle/{}", db_option_ext.get_project_output_dir().display(), first_refno)
+        format!(
+            "{}/instanced-bundle/{}",
+            db_option_ext.get_project_output_dir().display(),
+            first_refno
+        )
     });
 
     println!("   - 输出目录: {}", output_dir);
@@ -1481,11 +1533,17 @@ pub async fn export_dbnum_instances_json_mode(
     println!("====================================");
 
     // 设置输出目录
-    let output_dir = output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("instances"));
+    let output_dir =
+        output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("instances"));
 
     if from_cache {
-        async fn cache_has_any_tubi(cache_dir: &std::path::Path, dbnum: u32) -> anyhow::Result<bool> {
-            let cache = aios_database::fast_model::instance_cache::InstanceCacheManager::new(cache_dir).await?;
+        async fn cache_has_any_tubi(
+            cache_dir: &std::path::Path,
+            dbnum: u32,
+        ) -> anyhow::Result<bool> {
+            let cache =
+                aios_database::fast_model::instance_cache::InstanceCacheManager::new(cache_dir)
+                    .await?;
             let refnos = cache.list_refnos(dbnum);
             for &refno in &refnos {
                 if let Some(info) = cache.get_inst_info(dbnum, refno).await {
@@ -1502,16 +1560,16 @@ pub async fn export_dbnum_instances_json_mode(
             db_option_ext: &DbOptionExt,
             root_refno: Option<RefnoEnum>,
         ) -> anyhow::Result<()> {
-            use aios_database::fast_model::foyer_cache::FoyerCacheContext;
-            use aios_database::fast_model::gen_model::tree_index_manager::TreeIndexManager;
             use aios_core::geometry::{EleGeosInfo, TubiData};
+            use aios_core::rs_surreal::geometry_query::PlantTransform;
             use aios_core::shape::pdms_shape::RsVec3;
             use aios_core::types::PlantAabb;
             use aios_core::{SUL_DB, SurrealQueryExt};
+            use aios_database::fast_model::foyer_cache::FoyerCacheContext;
+            use aios_database::fast_model::gen_model::tree_index_manager::TreeIndexManager;
             use serde::{Deserialize, Serialize};
             use surrealdb::types as surrealdb_types;
             use surrealdb::types::SurrealValue;
-            use aios_core::rs_surreal::geometry_query::PlantTransform;
 
             // 方案 B：tubi 导出以 tubi_relate 为准。
             // 这里“只读 SurrealDB + 写 foyer cache”，把 tubi_relate 的最小必要信息落到 cache：
@@ -1522,7 +1580,8 @@ pub async fn export_dbnum_instances_json_mode(
                 anyhow::bail!("use_cache=false，无法写入 foyer cache");
             };
 
-            let branch_refnos: Vec<RefnoEnum> = if let Some(r) = root_refno.filter(|r| r.is_valid()) {
+            let branch_refnos: Vec<RefnoEnum> = if let Some(r) = root_refno.filter(|r| r.is_valid())
+            {
                 let is_branch = TreeIndexManager::with_default_dir(vec![dbnum])
                     .load_index(dbnum)
                     .ok()
@@ -1568,7 +1627,9 @@ pub async fn export_dbnum_instances_json_mode(
 
             let cache_manager = ctx.cache_arc();
             for owner in &branch_refnos {
-                let owner_att = aios_core::get_named_attmap(*owner).await.unwrap_or_default();
+                let owner_att = aios_core::get_named_attmap(*owner)
+                    .await
+                    .unwrap_or_default();
                 let owner_type = owner_att.get_type_str().to_string();
 
                 // 注意：tubi_relate 的复合 ID 为 [owner_refno, index]；
@@ -1660,21 +1721,26 @@ pub async fn export_dbnum_instances_json_mode(
             Ok((stats, trans_count, aabb_count)) => {
                 // 若 tubi 为空，则对现有 cache 做一次“tubi-only 补齐”，再重试导出。
                 if !cache_has_any_tubi(&cache_dir, dbnum).await.unwrap_or(false) {
-                    println!("\n⚠️  检测到 cache.inst_tubi_map 为空：将尝试补齐 BRAN/HANG tubi 并重新导出...");
+                    println!(
+                        "\n⚠️  检测到 cache.inst_tubi_map 为空：将尝试补齐 BRAN/HANG tubi 并重新导出..."
+                    );
                     if let Err(e) = gen_tubi_into_cache(dbnum, db_option_ext, root_refno).await {
                         eprintln!("⚠️  tubi 补齐失败（将继续输出当前导出结果）: {}", e);
                     } else {
                         println!("✅ tubi 补齐完成，重新导出...");
-                        if let Ok((stats, trans_count, aabb_count)) = export_dbnum_instances_json_from_cache(
-                            dbnum,
-                            &output_dir,
-                            &cache_dir,
-                            Some(&mesh_dir),
-                            Some(mesh_lod_tag.as_str()),
-                            verbose,
-                            None,
-                            detailed,
-                        ).await {
+                        if let Ok((stats, trans_count, aabb_count)) =
+                            export_dbnum_instances_json_from_cache(
+                                dbnum,
+                                &output_dir,
+                                &cache_dir,
+                                Some(&mesh_dir),
+                                Some(mesh_lod_tag.as_str()),
+                                verbose,
+                                None,
+                                detailed,
+                            )
+                            .await
+                        {
                             println!("\n🎉 导出完成！（缓存路径）");
                             println!("📊 统计信息:");
                             println!("   - BRAN/HANG/EQUI 分组数量: {}", stats.refno_count);
@@ -1734,7 +1800,10 @@ pub async fn export_dbnum_instances_json_mode(
                         ensure_surreal_connected(db_option_ext).await?;
 
                         // Step 1: 检测 TreeIndex 是否存在，若缺失则通过 gen_tree_only 解析生成
-                        let tree_path = db_option_ext.get_project_output_dir().join("scene_tree").join(format!("{}.tree", dbnum));
+                        let tree_path = db_option_ext
+                            .get_project_output_dir()
+                            .join("scene_tree")
+                            .join(format!("{}.tree", dbnum));
                         if !tree_path.exists() {
                             println!("📂 检测到 TreeIndex 缺失: {}", tree_path.display());
                             println!("🔄 正在通过 PDMS 解析生成 TreeIndex (gen_tree_only 模式)...");
@@ -1807,26 +1876,46 @@ pub async fn export_dbnum_instances_json_mode(
                             Ok((stats, trans_count, aabb_count)) => {
                                 // 与首次导出一致：若 tubi 为空，则尝试补齐后再导出一次。
                                 if !cache_has_any_tubi(&cache_dir, dbnum).await.unwrap_or(false) {
-                                    println!("\n⚠️  检测到 cache.inst_tubi_map 为空：将尝试补齐 BRAN/HANG tubi 并重新导出...");
-                                    if let Err(e) = gen_tubi_into_cache(dbnum, &db_option_ext_override, root_refno).await {
-                                        eprintln!("⚠️  tubi 补齐失败（将继续输出当前导出结果）: {}", e);
+                                    println!(
+                                        "\n⚠️  检测到 cache.inst_tubi_map 为空：将尝试补齐 BRAN/HANG tubi 并重新导出..."
+                                    );
+                                    if let Err(e) = gen_tubi_into_cache(
+                                        dbnum,
+                                        &db_option_ext_override,
+                                        root_refno,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!(
+                                            "⚠️  tubi 补齐失败（将继续输出当前导出结果）: {}",
+                                            e
+                                        );
                                     } else {
                                         println!("✅ tubi 补齐完成，重新导出...");
-                                        if let Ok((stats, trans_count, aabb_count)) = export_dbnum_instances_json_from_cache(
-                                            dbnum,
-                                            &output_dir,
-                                            &cache_dir,
-                                            Some(&mesh_dir),
-                                            Some(mesh_lod_tag.as_str()),
-                                            verbose,
-                                            None,
-                                            detailed,
-                                        ).await {
+                                        if let Ok((stats, trans_count, aabb_count)) =
+                                            export_dbnum_instances_json_from_cache(
+                                                dbnum,
+                                                &output_dir,
+                                                &cache_dir,
+                                                Some(&mesh_dir),
+                                                Some(mesh_lod_tag.as_str()),
+                                                verbose,
+                                                None,
+                                                detailed,
+                                            )
+                                            .await
+                                        {
                                             println!("\n🎉 导出完成！（缓存路径）");
                                             println!("📊 统计信息:");
-                                            println!("   - BRAN/HANG/EQUI 分组数量: {}", stats.refno_count);
+                                            println!(
+                                                "   - BRAN/HANG/EQUI 分组数量: {}",
+                                                stats.refno_count
+                                            );
                                             println!("   - 子节点数量: {}", stats.descendant_count);
-                                            println!("   - 输出文件大小: {} 字节", stats.output_file_size);
+                                            println!(
+                                                "   - 输出文件大小: {} 字节",
+                                                stats.output_file_size
+                                            );
                                             println!("   - 变换矩阵数量 (trans): {}", trans_count);
                                             println!("   - 包围盒数量 (aabb): {}", aabb_count);
                                             println!("   - 耗时: {:?}", stats.elapsed_time);
@@ -1853,7 +1942,10 @@ pub async fn export_dbnum_instances_json_mode(
 
                     // 用户拒绝或 autorun=false 时无效输入，给出手动命令建议
                     println!("\n💡 建议：请手动运行以下命令生成模型数据：");
-                    println!("   cargo run --bin aios-database -- --debug-model --dbnum {} --regen-model", dbnum);
+                    println!(
+                        "   cargo run --bin aios-database -- --debug-model --dbnum {} --regen-model",
+                        dbnum
+                    );
                     return Err(anyhow!(
                         "dbnum={} 尚未生成模型数据，请先生成后再导出",
                         dbnum
@@ -1896,9 +1988,76 @@ pub async fn export_dbnum_instances_json_mode(
     println!("   - 子节点数量: {}", stats.descendant_count);
     println!("   - 几何引用数量: {}", stats.geometry_count);
     println!("   - 输出文件大小: {} 字节", stats.output_file_size);
-    println!("   - 变换矩阵数量 (trans): {} (+{})", stats.mesh_files_found, stats.node_count);
-    println!("   - 包围盒数量 (aabb): {} (+{})", stats.mesh_files_missing, stats.mesh_count);
+    println!(
+        "   - 变换矩阵数量 (trans): {} (+{})",
+        stats.mesh_files_found, stats.node_count
+    );
+    println!(
+        "   - 包围盒数量 (aabb): {} (+{})",
+        stats.mesh_files_missing, stats.mesh_count
+    );
     println!("   - 耗时: {:?}", stats.elapsed_time);
+    Ok(())
+}
+
+/// 预检查并补齐 cache：若 `dbnum` 下存在缺失 refno，则仅对缺失 refno 触发模型生成并写回 foyer cache。
+async fn ensure_cache_refnos_ready_for_parquet(
+    dbnum: u32,
+    db_option_ext: &DbOptionExt,
+    verbose: bool,
+) -> Result<()> {
+    use aios_database::fast_model::gen_all_geos_data;
+    use aios_database::fast_model::gen_model::tree_index_manager::{
+        TreeIndexManager, ensure_tree_index_exists, load_index_with_large_stack,
+    };
+    use aios_database::fast_model::instance_cache::InstanceCacheManager;
+    use std::collections::HashSet;
+
+    let cache_dir = db_option_ext.get_foyer_cache_dir();
+    let cache_manager = InstanceCacheManager::new(&cache_dir).await?;
+    let cached_refnos: HashSet<RefnoEnum> = cache_manager.list_refnos(dbnum).into_iter().collect();
+
+    // 以 TreeIndex 作为期望集合，差集即需要补齐的 refno。
+    let tree_manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+    let tree_dir = tree_manager.tree_dir().to_path_buf();
+    ensure_tree_index_exists(dbnum, &tree_dir).await?;
+    let tree_index = load_index_with_large_stack(&tree_dir, dbnum)?;
+    let missing_refnos: Vec<RefnoEnum> = tree_index
+        .all_refnos()
+        .into_iter()
+        .map(RefnoEnum::from)
+        .filter(|r| !cached_refnos.contains(r))
+        .collect();
+
+    if missing_refnos.is_empty() {
+        if verbose {
+            println!("✅ cache 预检查通过：dbnum={} 无缺失 refno", dbnum);
+        }
+        return Ok(());
+    }
+
+    println!(
+        "⚠️  检测到 cache 缺失 refno：dbnum={} missing={}，开始定向补齐...",
+        dbnum,
+        missing_refnos.len()
+    );
+
+    // 生成阶段仍需连接 SurrealDB 读取输入数据（PE/属性/世界矩阵等）。
+    ensure_surreal_connected(db_option_ext).await?;
+
+    let mut override_opt = db_option_ext.clone();
+    override_opt.inner.manual_db_nums = Some(vec![dbnum]);
+    override_opt.use_cache = true;
+    override_opt.use_surrealdb = true; // 仅作为输入读取，不写 inst_*。
+    override_opt.inner.save_db = Some(false);
+    override_opt.export_instances = false;
+    override_opt.full_noun_mode = false;
+    override_opt.inner.gen_mesh = true;
+    override_opt.inner.replace_mesh = Some(false); // 仅补齐缺失，避免全量覆盖
+
+    gen_all_geos_data(missing_refnos, &override_opt, None, None).await?;
+
+    println!("✅ cache 缺失 refno 补齐完成，继续导出 parquet");
     Ok(())
 }
 
@@ -1925,11 +2084,8 @@ pub async fn export_dbnum_instances_parquet_mode(
     println!("====================================");
 
     // 设置输出目录
-    let output_dir = output_override.unwrap_or_else(|| {
-        db_option_ext
-            .get_project_output_dir()
-            .join("parquet")
-    });
+    let output_dir =
+        output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("parquet"));
 
     // 连接数据库
     println!("📡 连接数据库...");
@@ -1951,7 +2107,10 @@ pub async fn export_dbnum_instances_parquet_mode(
     println!("\n🎉 Parquet 导出完成！");
     println!("📊 统计信息:");
     println!("   - 实例数量 (instances): {}", stats.instance_count);
-    println!("   - 几何引用数量 (geo_instances): {}", stats.geo_instance_count);
+    println!(
+        "   - 几何引用数量 (geo_instances): {}",
+        stats.geo_instance_count
+    );
     println!("   - TUBI 数量 (tubings): {}", stats.tubing_count);
     println!("   - 变换矩阵数量 (transforms): {}", stats.transform_count);
     println!("   - 包围盒数量 (aabb): {}", stats.aabb_count);
@@ -1966,11 +2125,13 @@ pub async fn export_dbnum_instances_parquet_mode(
 ///
 /// 与 `export_dbnum_instances_parquet_mode` 输出相同 schema，但数据源为 foyer cache
 /// 而非 SurrealDB，适用于 cache-only 模式 (`use_cache=true, use_surrealdb=false`)。
+/// 默认仅导出缓存已有数据；当 `fill_missing_cache=true` 时会先补齐缺失 refno。
 pub async fn export_dbnum_instances_parquet_from_cache_mode(
     dbnum: u32,
     verbose: bool,
     output_override: Option<PathBuf>,
     db_option_ext: &DbOptionExt,
+    fill_missing_cache: bool,
 ) -> Result<()> {
     use aios_database::fast_model::export_model::export_dbnum_instances_parquet::export_dbnum_instances_parquet_from_cache;
 
@@ -1978,15 +2139,18 @@ pub async fn export_dbnum_instances_parquet_from_cache_mode(
     println!("====================================");
 
     // 设置输出目录
-    let output_dir = output_override.unwrap_or_else(|| {
-        db_option_ext
-            .get_project_output_dir()
-            .join("parquet")
-    });
+    let output_dir =
+        output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("parquet"));
 
     let cache_dir = db_option_ext.get_foyer_cache_dir();
     let mesh_dir = db_option_ext.inner.get_meshes_path();
     let mesh_lod_tag = format!("{:?}", db_option_ext.inner.mesh_precision.default_lod);
+
+    if fill_missing_cache {
+        ensure_cache_refnos_ready_for_parquet(dbnum, db_option_ext, verbose).await?;
+    } else if verbose {
+        println!("ℹ️  默认模式：仅导出 cache 中已存在的 refno，不自动补齐缺失数据");
+    }
 
     let stats = export_dbnum_instances_parquet_from_cache(
         dbnum,
@@ -2002,7 +2166,10 @@ pub async fn export_dbnum_instances_parquet_from_cache_mode(
     println!("\n🎉 Parquet 导出完成！（缓存路径）");
     println!("📊 统计信息:");
     println!("   - 实例数量 (instances): {}", stats.instance_count);
-    println!("   - 几何引用数量 (geo_instances): {}", stats.geo_instance_count);
+    println!(
+        "   - 几何引用数量 (geo_instances): {}",
+        stats.geo_instance_count
+    );
     println!("   - TUBI 数量 (tubings): {}", stats.tubing_count);
     println!("   - 变换矩阵数量 (transforms): {}", stats.transform_count);
     println!("   - 包围盒数量 (aabb): {}", stats.aabb_count);
@@ -2048,7 +2215,10 @@ pub async fn export_pdms_tree_parquet_mode(
     println!("\n🎉 PDMS Tree Parquet 导出完成！");
     println!("📊 统计信息:");
     println!("   - 节点数量: {}", stats.node_count);
-    println!("   - 输出文件: {}", output_dir.join(&stats.file_name).display());
+    println!(
+        "   - 输出文件: {}",
+        output_dir.join(&stats.file_name).display()
+    );
     println!("   - 文件大小: {} 字节", stats.total_bytes);
     println!("   - generated_at: {}", stats.generated_at);
 
@@ -2089,7 +2259,10 @@ pub async fn export_world_sites_parquet_mode(
     println!("📊 统计信息:");
     println!("   - world_refno: {}", stats.world_refno);
     println!("   - SITE 数量: {}", stats.site_count);
-    println!("   - 输出文件: {}", output_dir.join(&stats.file_name).display());
+    println!(
+        "   - 输出文件: {}",
+        output_dir.join(&stats.file_name).display()
+    );
     println!("   - 文件大小: {} 字节", stats.total_bytes);
     println!("   - generated_at: {}", stats.generated_at);
 
@@ -2211,7 +2384,8 @@ pub async fn room_compute_mode(
 
     // 性能剖析：feature=profile 时启用 Chrome Trace
     #[cfg(feature = "profile")]
-    let _trace_path = aios_database::profiling::init_chrome_tracing_for_db_option(db_option_ext, "room_compute");
+    let _trace_path =
+        aios_database::profiling::init_chrome_tracing_for_db_option(db_option_ext, "room_compute");
     #[cfg(feature = "profile")]
     let _root_span = tracing::info_span!("room_compute_mode").entered();
 
@@ -2241,11 +2415,7 @@ pub async fn room_compute_mode(
     // 执行房间关系构建
     println!("\n🔄 开始构建房间关系...");
 
-    let stats = build_room_relations(
-        &db_option_ext.inner,
-        db_nums.as_deref(),
-        refno_root,
-    ).await?;
+    let stats = build_room_relations(&db_option_ext.inner, db_nums.as_deref(), refno_root).await?;
 
     let duration = start_time.elapsed();
 

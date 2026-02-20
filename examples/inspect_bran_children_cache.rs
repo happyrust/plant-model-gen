@@ -4,8 +4,8 @@
 //!   $env:ROOT_REFNO="24381/103385"
 //!   cargo run --example inspect_bran_children_cache
 
-use anyhow::{Context, Result};
 use aios_core::RefnoEnum;
+use anyhow::{Context, Result};
 use std::env;
 use std::path::PathBuf;
 
@@ -23,15 +23,16 @@ async fn main() -> Result<()> {
         .ensure_loaded()
         .context("db_meta_info.json 未加载")?;
 
-    let Some(dbnum) = aios_database::data_interface::db_meta_manager::db_meta()
-        .get_dbnum_by_refno(root) else {
+    let Some(dbnum) =
+        aios_database::data_interface::db_meta_manager::db_meta().get_dbnum_by_refno(root)
+    else {
         anyhow::bail!("无法获取 dbnum");
     };
 
     println!("🔎 BRAN={} dbnum={}", root, dbnum);
 
-    let cache = aios_database::fast_model::instance_cache::InstanceCacheManager::new(&cache_dir)
-        .await?;
+    let cache =
+        aios_database::fast_model::instance_cache::InstanceCacheManager::new(&cache_dir).await?;
 
     let batch_ids = cache.list_batches(dbnum);
     println!("📦 共 {} 个 batch", batch_ids.len());
@@ -48,7 +49,9 @@ async fn main() -> Result<()> {
 
         // 收集属于该 BRAN 的子元件
         println!("\n📊 inst_info_map 中属于 BRAN {} 的子元件:", root);
-        let mut children_in_info: Vec<_> = batch.inst_info_map.iter()
+        let mut children_in_info: Vec<_> = batch
+            .inst_info_map
+            .iter()
             .filter(|(_, info)| info.owner_refno.refno().0 == root_u64)
             .collect();
         children_in_info.sort_by_key(|(k, _)| k.refno().0);
@@ -56,8 +59,10 @@ async fn main() -> Result<()> {
         for (refno, info) in &children_in_info {
             let inst_key = info.get_inst_key();
             let has_geos = batch.inst_geos_map.contains_key(&inst_key);
-            println!("  {} -> inst_key={}, has_geos={}, cata_hash={:?}",
-                refno, inst_key, has_geos, info.cata_hash);
+            println!(
+                "  {} -> inst_key={}, has_geos={}, cata_hash={:?}",
+                refno, inst_key, has_geos, info.cata_hash
+            );
         }
 
         println!("\n📊 inst_geos_map 中的所有 key:");

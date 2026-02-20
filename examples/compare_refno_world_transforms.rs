@@ -12,8 +12,8 @@
 //!   $env:CACHE_DIR="output/AvevaMarineSample/instance_cache"
 //!   cargo run --example compare_refno_world_transforms --features sqlite-index
 
+use aios_core::{RefnoEnum, get_named_attmap, init_surreal, query_pe_transform};
 use anyhow::{Context, Result};
-use aios_core::{get_named_attmap, init_surreal, query_pe_transform, RefnoEnum};
 use std::env;
 use std::path::PathBuf;
 
@@ -34,19 +34,29 @@ async fn main() -> Result<()> {
         .ensure_loaded()
         .context("db_meta_info.json 未加载（请先生成 output/AvevaMarineSample/scene_tree/db_meta_info.json）")?;
 
-    let Some(dbnum) = aios_database::data_interface::db_meta_manager::db_meta().get_dbnum_by_refno(refno) else {
+    let Some(dbnum) =
+        aios_database::data_interface::db_meta_manager::db_meta().get_dbnum_by_refno(refno)
+    else {
         anyhow::bail!("无法从 db_meta 推导 dbnum: {}", refno);
     };
 
-    println!("🔎 compare world transforms: refno={}, dbnum={}", refno, dbnum);
+    println!(
+        "🔎 compare world transforms: refno={}, dbnum={}",
+        refno, dbnum
+    );
     println!("   - cache_dir: {}", cache_dir.display());
 
     // 1) instance_cache
-    let inst_cache = aios_database::fast_model::instance_cache::InstanceCacheManager::new(&cache_dir)
-        .await
-        .context("打开 InstanceCacheManager 失败")?;
+    let inst_cache =
+        aios_database::fast_model::instance_cache::InstanceCacheManager::new(&cache_dir)
+            .await
+            .context("打开 InstanceCacheManager 失败")?;
     let batch_ids = inst_cache.list_batches(dbnum);
-    let mut best: Option<(String, i64, aios_database::fast_model::instance_cache::CachedInstanceBatch)> = None;
+    let mut best: Option<(
+        String,
+        i64,
+        aios_database::fast_model::instance_cache::CachedInstanceBatch,
+    )> = None;
     for bid in batch_ids {
         let Some(batch) = inst_cache.get(dbnum, &bid).await else {
             continue;
@@ -62,7 +72,10 @@ async fn main() -> Result<()> {
     match best {
         Some((bid, ts, batch)) => {
             let info = batch.inst_info_map.get(&refno).unwrap();
-            println!("\n== instance_cache hit batch_id={} created_at={} ==", bid, ts);
+            println!(
+                "\n== instance_cache hit batch_id={} created_at={} ==",
+                bid, ts
+            );
             println!("inst_info.world_transform(raw): {:?}", info.world_transform);
             println!(
                 "inst_info.world_transform(effective): {:?}",
@@ -104,4 +117,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-

@@ -4,8 +4,8 @@
 //!   $env:REFNO="24381/103385"
 //!   cargo run --example inspect_surreal_pe_and_noun_attr
 
+use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt, init_surreal};
 use anyhow::Result;
-use aios_core::{init_surreal, RefnoEnum, SUL_DB, SurrealQueryExt};
 use serde_json::Value;
 use std::env;
 
@@ -48,4 +48,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-

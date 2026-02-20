@@ -6,8 +6,8 @@
 //!   $env:OBJ="output/Copy-of-1RCS184YP-YK_109VP.obj"
 //!   cargo run --example verify_export_transform_for_refno
 
-use anyhow::{Context, Result};
 use aios_core::RefnoEnum;
+use anyhow::{Context, Result};
 use std::env;
 use std::path::PathBuf;
 
@@ -45,7 +45,10 @@ fn bbox_of_mesh(mesh: &aios_core::shape::pdms_shape::PlantMesh) -> Option<([f32;
     Some((mn, mx))
 }
 
-fn parse_obj_group_bbox(obj_path: &PathBuf, group: &str) -> Result<Option<([f32; 3], [f32; 3], usize)>> {
+fn parse_obj_group_bbox(
+    obj_path: &PathBuf,
+    group: &str,
+) -> Result<Option<([f32; 3], [f32; 3], usize)>> {
     let s = std::fs::read_to_string(obj_path)
         .with_context(|| format!("读取 OBJ 失败: {}", obj_path.display()))?;
     let mut cur: Option<&str> = None;
@@ -118,7 +121,11 @@ async fn main() -> Result<()> {
 
     // 找“最新命中”的 batch（与 inspect_cache_geom_refno 同语义）
     let want_u64 = refno.refno();
-    let mut best: Option<(String, i64, aios_database::fast_model::instance_cache::CachedInstanceBatch)> = None;
+    let mut best: Option<(
+        String,
+        i64,
+        aios_database::fast_model::instance_cache::CachedInstanceBatch,
+    )> = None;
     for bid in batch_ids {
         let Some(batch) = cache.get(dbnum, &bid).await else {
             continue;
@@ -155,10 +162,7 @@ async fn main() -> Result<()> {
     println!("refno={} dbnum={} batch_id={}", refno, dbnum, batch_id);
 
     // 仅验证第一个 inst（本 case 两个 inst transform 相同）
-    let inst0 = geos
-        .insts
-        .first()
-        .context("inst_geos.insts 为空")?;
+    let inst0 = geos.insts.first().context("inst_geos.insts 为空")?;
 
     let mesh_dir = PathBuf::from("assets/meshes/lod_L1");
     let glb = mesh_dir.join(format!("{}_L1.glb", inst0.geo_hash));
@@ -176,12 +180,10 @@ async fn main() -> Result<()> {
 
     // OBJ group AABB（group 名为 refno 的 '_' 形式）
     let group = refno.to_string().replace('/', "_");
-    let Some((mn_o, mx_o, vcnt)) = parse_obj_group_bbox(&obj_path, &group)?
-    else {
+    let Some((mn_o, mx_o, vcnt)) = parse_obj_group_bbox(&obj_path, &group)? else {
         anyhow::bail!("OBJ 中未找到 group: {}", group);
     };
     println!("obj group verts={} AABB: {}", vcnt, fmt_bbox(mn_o, mx_o));
 
     Ok(())
 }
-

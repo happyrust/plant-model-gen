@@ -2029,7 +2029,7 @@ pub async fn export_all_relates_prepack_lod_parquet(
 }
 
 #[derive(Deserialize)]
-struct PrepackInstancesV2 {
+struct PrepackInstances {
     version: Option<u32>,
     generated_at: String,
     colors: Option<Vec<[f32; 4]>>,
@@ -4485,7 +4485,7 @@ fn write_prepack_parquet_and_patch_manifest(output_dir: &Path) -> Result<()> {
     let geometry_manifest_path = output_dir.join("geometry_manifest.json");
     let manifest_path = output_dir.join("manifest.json");
 
-    let instances: PrepackInstancesV2 = serde_json::from_slice(&fs::read(&instances_path)?)?;
+    let instances: PrepackInstances = serde_json::from_slice(&fs::read(&instances_path)?)?;
     let geom_manifest: PrepackGeometryManifest = serde_json::from_slice(&fs::read(&geometry_manifest_path)?)?;
 
     let instances_parquet_name = "instances.parquet";
@@ -4530,7 +4530,7 @@ fn write_prepack_parquet_and_patch_manifest(output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_instances_parquet(path: PathBuf, instances: &PrepackInstancesV2) -> Result<()> {
+fn write_instances_parquet(path: PathBuf, instances: &PrepackInstances) -> Result<()> {
     let colors = instances.colors.clone().unwrap_or_default();
 
     let mut refnos: Vec<Option<String>> = Vec::new();

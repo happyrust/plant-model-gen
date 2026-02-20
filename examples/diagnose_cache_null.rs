@@ -19,11 +19,16 @@ async fn main() -> anyhow::Result<()> {
     let cache_dir = PathBuf::from("output/AvevaMarineSample/instance_cache");
     println!("📂 cache_dir: {}", cache_dir.display());
 
-    let cache = aios_database::fast_model::instance_cache::InstanceCacheManager::new(&cache_dir).await?;
+    let cache =
+        aios_database::fast_model::instance_cache::InstanceCacheManager::new(&cache_dir).await?;
 
     // 列出 dbnum=7997 的所有 batch
     let batches = cache.list_batches(7997);
-    println!("📋 dbnum=7997 共 {} 个 batch: {:?}", batches.len(), &batches[..batches.len().min(10)]);
+    println!(
+        "📋 dbnum=7997 共 {} 个 batch: {:?}",
+        batches.len(),
+        &batches[..batches.len().min(10)]
+    );
 
     for (dbnum, batch_id) in &failing_batches {
         println!("\n{'='*60}");
@@ -57,7 +62,9 @@ async fn main() -> anyhow::Result<()> {
     // foyer 使用二进制格式，不容易直接读取
     // 更好的方案：修改 instance_cache.rs 的 get() 方法，在反序列化失败时 dump 原始 JSON
 
-    println!("\n\n📝 建议：在 instance_cache.rs 的 get() 方法中，反序列化失败时 dump 原始 payload 到文件");
+    println!(
+        "\n\n📝 建议：在 instance_cache.rs 的 get() 方法中，反序列化失败时 dump 原始 payload 到文件"
+    );
     println!("   然后用 serde_json::Value 做宽松反序列化来定位 null 字段");
 
     Ok(())

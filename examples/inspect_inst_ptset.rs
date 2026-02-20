@@ -3,8 +3,8 @@
 //! 用法：
 //!   REFNO="24381/103386" CACHE_DIR="output/instance_cache" cargo run --example inspect_inst_ptset
 
-use anyhow::{Context, Result};
 use aios_core::RefnoEnum;
+use anyhow::{Context, Result};
 use std::env;
 use std::path::PathBuf;
 
@@ -56,21 +56,34 @@ async fn main() -> Result<()> {
             println!("cata_hash={:?}", info.cata_hash);
 
             let wt = info.get_ele_world_transform();
-            println!("world_transform: t=({:.3},{:.3},{:.3})",
-                wt.translation.x, wt.translation.y, wt.translation.z);
-            println!("world_transform: s=({:.3},{:.3},{:.3})",
-                wt.scale.x, wt.scale.y, wt.scale.z);
+            println!(
+                "world_transform: t=({:.3},{:.3},{:.3})",
+                wt.translation.x, wt.translation.y, wt.translation.z
+            );
+            println!(
+                "world_transform: s=({:.3},{:.3},{:.3})",
+                wt.scale.x, wt.scale.y, wt.scale.z
+            );
 
             println!("\nptset_map.len()={}", info.ptset_map.len());
             for (num, axis) in &info.ptset_map {
-                println!("  [{}] pt=({:.3},{:.3},{:.3}) dir={:?}",
-                    num, axis.pt.0.x, axis.pt.0.y, axis.pt.0.z,
-                    axis.dir.as_ref().map(|d| format!("({:.3},{:.3},{:.3})", d.0.x, d.0.y, d.0.z)));
+                println!(
+                    "  [{}] pt=({:.3},{:.3},{:.3}) dir={:?}",
+                    num,
+                    axis.pt.0.x,
+                    axis.pt.0.y,
+                    axis.pt.0.z,
+                    axis.dir
+                        .as_ref()
+                        .map(|d| format!("({:.3},{:.3},{:.3})", d.0.x, d.0.y, d.0.z))
+                );
 
                 // 变换到世界坐标
                 let transformed = axis.transformed(&wt);
-                println!("      -> world_pt=({:.3},{:.3},{:.3})",
-                    transformed.pt.0.x, transformed.pt.0.y, transformed.pt.0.z);
+                println!(
+                    "      -> world_pt=({:.3},{:.3},{:.3})",
+                    transformed.pt.0.x, transformed.pt.0.y, transformed.pt.0.z
+                );
             }
 
             return Ok(());

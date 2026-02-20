@@ -6,8 +6,8 @@
 //!   $env:CACHE_DIR="output/instance_cache"
 //!   cargo run --example inspect_bran_tubi_topology
 
-use anyhow::{Context, Result};
 use aios_core::RefnoEnum;
+use anyhow::{Context, Result};
 use glam::Vec3;
 use std::env;
 use std::path::PathBuf;
@@ -28,11 +28,7 @@ fn dist(a: Vec3, b: Vec3) -> f32 {
 fn unit_dir(a: Vec3, b: Vec3) -> Vec3 {
     let d = b - a;
     let len = d.length();
-    if len <= 1e-6 {
-        Vec3::ZERO
-    } else {
-        d / len
-    }
+    if len <= 1e-6 { Vec3::ZERO } else { d / len }
 }
 
 fn parse_arrive_leave_from_tubi_info_id(id: &str) -> Option<(i32, i32)> {
@@ -95,11 +91,7 @@ async fn main() -> Result<()> {
             // 注意：inst_tubi_map 的 key 可能是 SesRef([refno,sesno])，直接 get(&r) 会 miss。
             // 这里按 RefU64 归一化匹配，语义与导出侧一致（“最新覆盖旧”）。
             let want = r.refno();
-            if let Some((_, info)) = batch
-                .inst_tubi_map
-                .iter()
-                .find(|(k, _)| k.refno() == want)
-            {
+            if let Some((_, info)) = batch.inst_tubi_map.iter().find(|(k, _)| k.refno() == want) {
                 hit = Some((bid.clone(), info.clone()));
                 break;
             };

@@ -41,7 +41,11 @@ async fn main() -> anyhow::Result<()> {
         let att = ele.att_map();
 
         println!();
-        println!("refno={refno} TYPE={:?} SESNO={:?}", att.get_type(), att.sesno());
+        println!(
+            "refno={refno} TYPE={:?} SESNO={:?}",
+            att.get_type(),
+            att.sesno()
+        );
         println!("---- attrs contains 'PARA' ----");
         let mut str_cnt = 0usize;
         let mut hits = 0usize;

@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use aios_core::geometry::csg::generate_csg_mesh;
+use aios_core::geometry::csg::{CsgDebugContext, generate_csg_mesh, with_csg_debug_context};
 use aios_core::mesh_precision::MeshPrecisionSettings;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 
@@ -49,9 +49,14 @@ pub async fn run_mesh_worker_from_cache_manager(
     }
 
     let mut unique_geo: HashMap<u64, (PdmsGeoParam, bool)> = HashMap::new();
+    let mut geo_hash_refnos = HashMap::new();
 
     for dbnum in dbnums {
         let params = cache_manager.collect_all_geo_params(dbnum).await;
+        let refno_map = cache_manager.collect_geo_hash_refnos(dbnum).await;
+        for (geo_hash, refno) in refno_map {
+            geo_hash_refnos.entry(geo_hash).or_insert(refno);
+        }
         for p in params {
             unique_geo.entry(p.geo_hash).or_insert_with(|| {
                 (p.geo_param, p.unit_flag)
@@ -130,6 +135,7 @@ pub async fn run_mesh_worker_from_cache_manager(
         let profile = precision.profile_for_geo(geo_type_name);
         let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
         let lod_settings = profile.csg_settings;
+        let refno_for_log = geo_hash_refnos.get(&geo_hash).copied();
 
         let geo_param_for_mesh = if unit_flag {
             geo_param.to_unit_param()
@@ -137,7 +143,20 @@ pub async fn run_mesh_worker_from_cache_manager(
             geo_param
         };
 
-        match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
+        let csg_debug_ctx = CsgDebugContext::new(
+            Some(mesh_id.clone()),
+            Some(geo_type_name.to_string()),
+            refno_for_log,
+        );
+        match with_csg_debug_context(csg_debug_ctx, || {
+            generate_csg_mesh(
+                &geo_param_for_mesh,
+                &lod_settings,
+                non_scalable_geo,
+                false,
+                refno_for_log,
+            )
+        }) {
             Some(csg_mesh) => {
                 let mesh_base_path = lod_dir.join(&mesh_filename);
                 let glb_path = mesh_base_path.with_extension("glb");

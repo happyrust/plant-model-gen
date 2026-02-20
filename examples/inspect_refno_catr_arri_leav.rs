@@ -11,8 +11,8 @@
 //! - CATR/SPRE foreign_refno（若能解析）
 //! - aios_core::get_cat_refno(refno) 的结果
 
+use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt, init_surreal};
 use anyhow::Result;
-use aios_core::{init_surreal, RefnoEnum, SUL_DB, SurrealQueryExt};
 use std::env;
 use std::str::FromStr;
 
@@ -42,7 +42,10 @@ async fn main() -> Result<()> {
             "SELECT noun, name, record::id(owner) as owner, record::id(refno) as refno_id FROM pe:{};",
             r
         );
-        match SUL_DB.query_take::<Vec<serde_json::Value>>(&pe_sql, 0).await {
+        match SUL_DB
+            .query_take::<Vec<serde_json::Value>>(&pe_sql, 0)
+            .await
+        {
             Ok(pe_rows) => {
                 println!("pe_rows(len={})={}", pe_rows.len(), pe_sql);
                 if let Some(row) = pe_rows.first() {
@@ -70,11 +73,21 @@ async fn main() -> Result<()> {
             FROM pe:{} FETCH refno;"#,
             r
         );
-        match SUL_DB.query_take::<Vec<serde_json::Value>>(&att_sql, 0).await {
+        match SUL_DB
+            .query_take::<Vec<serde_json::Value>>(&att_sql, 0)
+            .await
+        {
             Ok(rows) => {
-                println!("att_rows(len={})={}", rows.len(), att_sql.replace('\n', " "));
+                println!(
+                    "att_rows(len={})={}",
+                    rows.len(),
+                    att_sql.replace('\n', " ")
+                );
                 if let Some(row) = rows.first() {
-                    println!("att_row={}", serde_json::to_string_pretty(row).unwrap_or_default());
+                    println!(
+                        "att_row={}",
+                        serde_json::to_string_pretty(row).unwrap_or_default()
+                    );
                 }
             }
             Err(e) => {

@@ -51,7 +51,10 @@ async fn main() -> Result<()> {
                     }
                     hits += 1;
                     println!("\n== hit #{hits} ==");
-                    println!("  dbnum={} batch_id={} created_at={}", db, batch_id, batch.created_at);
+                    println!(
+                        "  dbnum={} batch_id={} created_at={}",
+                        db, batch_id, batch.created_at
+                    );
                     println!("  refno={} type_name={}", geos.refno, geos.type_name);
                     println!(
                         "  unit_flag={} geo_type={:?}",

@@ -14,7 +14,10 @@ fn main() {
     if let (Some(&min), Some(&max)) = (mesh.indices.iter().min(), mesh.indices.iter().max()) {
         println!("  索引范围: [{}..={}]", min, max);
     }
-    println!("  前10个索引: {:?}", &mesh.indices[..mesh.indices.len().min(10)]);
+    println!(
+        "  前10个索引: {:?}",
+        &mesh.indices[..mesh.indices.len().min(10)]
+    );
 
     // 顶点范围（快速判断是否出现“尺寸被意外放大/缩小”）
     if !mesh.vertices.is_empty() {
@@ -62,7 +65,10 @@ fn main() {
         println!("  normals 统计:");
         println!("    - zero: {}", zero_cnt);
         println!("    - non_finite: {}", non_finite_cnt);
-        println!("    - len(min/mean/max): {:.6}/{:.6}/{:.6}", min_len, mean_len, max_len);
+        println!(
+            "    - len(min/mean/max): {:.6}/{:.6}/{:.6}",
+            min_len, mean_len, max_len
+        );
 
         // 打印 non-finite 的具体法线与关联信息，方便定位上游生成问题。
         for (i, n) in mesh.normals.iter().enumerate() {
@@ -74,7 +80,10 @@ fn main() {
             println!("  non_finite normals 顶点索引: {:?}", non_finite_indices);
             for &i in non_finite_indices.iter().take(8) {
                 let v = mesh.vertices.get(i).copied().unwrap_or_default();
-                println!("    - i={i} v=({:.6},{:.6},{:.6}) n=({},{},{})", v.x, v.y, v.z, mesh.normals[i].x, mesh.normals[i].y, mesh.normals[i].z);
+                println!(
+                    "    - i={i} v=({:.6},{:.6},{:.6}) n=({},{},{})",
+                    v.x, v.y, v.z, mesh.normals[i].x, mesh.normals[i].y, mesh.normals[i].z
+                );
             }
 
             // 这些顶点被多少个三角形引用？
@@ -160,8 +169,7 @@ fn main() {
             let i0 = tri[0] as usize;
             let i1 = tri[1] as usize;
             let i2 = tri[2] as usize;
-            if i0 >= mesh.vertices.len() || i1 >= mesh.vertices.len() || i2 >= mesh.vertices.len()
-            {
+            if i0 >= mesh.vertices.len() || i1 >= mesh.vertices.len() || i2 >= mesh.vertices.len() {
                 continue;
             }
             let v0 = mesh.vertices[i0];
@@ -207,8 +215,7 @@ fn main() {
             let i0 = tri[0] as usize;
             let i1 = tri[1] as usize;
             let i2 = tri[2] as usize;
-            if i0 >= mesh.vertices.len() || i1 >= mesh.vertices.len() || i2 >= mesh.vertices.len()
-            {
+            if i0 >= mesh.vertices.len() || i1 >= mesh.vertices.len() || i2 >= mesh.vertices.len() {
                 continue;
             }
             let v0 = mesh.vertices[i0];

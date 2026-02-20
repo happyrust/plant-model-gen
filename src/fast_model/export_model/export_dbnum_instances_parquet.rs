@@ -141,6 +141,172 @@ fn write_parquet(path: &Path, batch: &RecordBatch) -> Result<u64> {
     Ok(size)
 }
 
+const MESH_CHECK_LOD_TAG: &str = "L1";
+const MESH_REPORT_REFNO_SAMPLE_LIMIT: usize = 50;
+
+struct MissingMeshReportSummary {
+    report_file: String,
+    checked_geo_hashes: usize,
+    missing_geo_hashes: usize,
+    missing_owner_refnos: usize,
+}
+
+fn mesh_base_dir_from_db_option(db_option: &DbOption) -> PathBuf {
+    db_option
+        .meshes_path
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("assets/meshes"))
+}
+
+fn normalize_mesh_base_dir(mesh_dir: &Path) -> PathBuf {
+    let is_lod_dir = mesh_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().starts_with("lod_"))
+        .unwrap_or(false);
+    if is_lod_dir {
+        mesh_dir.parent().unwrap_or(mesh_dir).to_path_buf()
+    } else {
+        mesh_dir.to_path_buf()
+    }
+}
+
+fn mesh_candidates_for_geo_hash(mesh_base_dir: &Path, geo_hash: &str, lod_tag: &str) -> [PathBuf; 3] {
+    let lod_dir = mesh_base_dir.join(format!("lod_{}", lod_tag));
+    [
+        lod_dir.join(format!("{}_{}.glb", geo_hash, lod_tag)),
+        lod_dir.join(format!("{}.glb", geo_hash)),
+        mesh_base_dir.join(format!("{}.glb", geo_hash)),
+    ]
+}
+
+fn is_builtin_geo_hash(geo_hash: &str) -> bool {
+    matches!(geo_hash.trim(), "1" | "2" | "3")
+}
+
+fn record_geo_hash_usage(
+    geo_hash: &str,
+    owner_refno: &str,
+    owner_refnos_by_hash: &mut HashMap<String, HashSet<String>>,
+    row_count_by_hash: &mut HashMap<String, usize>,
+) {
+    let hash = geo_hash.trim();
+    if hash.is_empty() || owner_refno.trim().is_empty() {
+        return;
+    }
+    owner_refnos_by_hash
+        .entry(hash.to_string())
+        .or_default()
+        .insert(owner_refno.to_string());
+    *row_count_by_hash.entry(hash.to_string()).or_insert(0) += 1;
+}
+
+fn write_missing_mesh_report(
+    output_dir: &Path,
+    dbnum: u32,
+    mesh_base_dir: &Path,
+    lod_tag: &str,
+    owner_refnos_by_hash: &HashMap<String, HashSet<String>>,
+    row_count_by_hash: &HashMap<String, usize>,
+    verbose: bool,
+) -> Result<MissingMeshReportSummary> {
+    let mut checked_geo_hashes = 0usize;
+    let mut missing_owner_union: HashSet<String> = HashSet::new();
+    let mut missing_entries: Vec<(String, usize, usize, Vec<String>, Vec<String>)> = Vec::new();
+
+    for geo_hash in owner_refnos_by_hash.keys() {
+        let hash = geo_hash.trim();
+        if hash.is_empty() || is_builtin_geo_hash(hash) {
+            continue;
+        }
+        checked_geo_hashes += 1;
+
+        let candidates = mesh_candidates_for_geo_hash(mesh_base_dir, hash, lod_tag);
+        let exists = candidates.iter().any(|p| p.exists());
+        if exists {
+            continue;
+        }
+
+        let mut owners = owner_refnos_by_hash
+            .get(hash)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        owners.sort();
+        for r in &owners {
+            missing_owner_union.insert(r.clone());
+        }
+        let owner_sample = owners
+            .iter()
+            .take(MESH_REPORT_REFNO_SAMPLE_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>();
+        let row_count = *row_count_by_hash.get(hash).unwrap_or(&0);
+        let candidate_paths = candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>();
+        missing_entries.push((hash.to_string(), row_count, owners.len(), owner_sample, candidate_paths));
+    }
+
+    missing_entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let missing_geo_hashes_json = missing_entries
+        .iter()
+        .map(|(geo_hash, row_count, owner_count, owner_sample, candidate_paths)| {
+            json!({
+                "geo_hash": geo_hash,
+                "row_count": row_count,
+                "owner_refno_count": owner_count,
+                "owner_refno_sample": owner_sample,
+                "owner_refno_sample_count": owner_sample.len(),
+                "mesh_candidates": candidate_paths,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let report = json!({
+        "version": 1,
+        "generated_at": generated_at,
+        "dbnum": dbnum,
+        "mesh_base_dir": mesh_base_dir.display().to_string(),
+        "lod_tag": lod_tag,
+        "checked_geo_hashes": checked_geo_hashes,
+        "missing_geo_hashes": missing_entries.len(),
+        "missing_owner_refnos": missing_owner_union.len(),
+        "missing_geo_hash_list": missing_geo_hashes_json,
+    });
+
+    let report_file = format!("missing_mesh_report_{}.json", dbnum);
+    let report_path = output_dir.join(&report_file);
+    fs::write(&report_path, serde_json::to_string_pretty(&report)?)
+        .with_context(|| format!("写入缺失 mesh 报告失败: {}", report_path.display()))?;
+
+    if !missing_entries.is_empty() {
+        eprintln!(
+            "[parquet] dbnum={} 检测到缺失 mesh: geo_hashes={}, owner_refnos={}，报告={}",
+            dbnum,
+            missing_entries.len(),
+            missing_owner_union.len(),
+            report_path.display()
+        );
+    } else if verbose {
+        println!(
+            "   ✅ mesh 校验通过: checked_geo_hashes={} (lod={})",
+            checked_geo_hashes, lod_tag
+        );
+    }
+
+    Ok(MissingMeshReportSummary {
+        report_file,
+        checked_geo_hashes,
+        missing_geo_hashes: missing_entries.len(),
+        missing_owner_refnos: missing_owner_union.len(),
+    })
+}
+
 // =============================================================================
 // Schema 定义
 // =============================================================================
@@ -644,7 +810,7 @@ pub struct ParquetExportStats {
 pub async fn export_dbnum_instances_parquet(
     dbnum: u32,
     output_dir: &Path,
-    _db_option: Arc<DbOption>,
+    db_option: Arc<DbOption>,
     verbose: bool,
     target_unit: Option<LengthUnit>,
     root_refno: Option<RefnoEnum>,
@@ -661,6 +827,7 @@ pub async fn export_dbnum_instances_parquet(
     // 确保输出目录存在
     fs::create_dir_all(output_dir)
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
+    let mesh_base_dir = mesh_base_dir_from_db_option(&db_option);
 
     // =========================================================================
     // 1. 使用 TreeIndex 获取 refno 列表
@@ -806,6 +973,8 @@ pub async fn export_dbnum_instances_parquet(
     let mut tubing_rows: Vec<TubingRow> = Vec::new();
     let mut trans_hashes: HashSet<String> = HashSet::new();
     let mut aabb_hashes: HashSet<String> = HashSet::new();
+    let mut owner_refnos_by_hash: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut row_count_by_hash: HashMap<String, usize> = HashMap::new();
 
     // 处理 grouped children
     for (owner_refno, children) in &grouped_children {
@@ -855,6 +1024,12 @@ pub async fn export_dbnum_instances_parquet(
                     geo_hash: inst.geo_hash.clone(),
                     geo_trans_hash: inst.trans_hash.clone().unwrap_or_default(),
                 });
+                record_geo_hash_usage(
+                    &inst.geo_hash,
+                    &child.refno.to_string(),
+                    &mut owner_refnos_by_hash,
+                    &mut row_count_by_hash,
+                );
             }
         }
 
@@ -886,6 +1061,12 @@ pub async fn export_dbnum_instances_parquet(
                     spec_value: tubi.spec_value.unwrap_or(0),
                     dbnum,
                 });
+                record_geo_hash_usage(
+                    &tubi.geo_hash.clone().unwrap_or_default(),
+                    &owner_refno.to_string(),
+                    &mut owner_refnos_by_hash,
+                    &mut row_count_by_hash,
+                );
             }
         }
     }
@@ -933,8 +1114,24 @@ pub async fn export_dbnum_instances_parquet(
                 geo_hash: inst.geo_hash.clone(),
                 geo_trans_hash: inst.trans_hash.clone().unwrap_or_default(),
             });
+            record_geo_hash_usage(
+                &inst.geo_hash,
+                &child.refno.to_string(),
+                &mut owner_refnos_by_hash,
+                &mut row_count_by_hash,
+            );
         }
     }
+
+    let missing_mesh_report = write_missing_mesh_report(
+        output_dir,
+        dbnum,
+        &mesh_base_dir,
+        MESH_CHECK_LOD_TAG,
+        &owner_refnos_by_hash,
+        &row_count_by_hash,
+        verbose,
+    )?;
 
     // =========================================================================
     // 6. 查询 trans/aabb 实际数据
@@ -1045,6 +1242,13 @@ pub async fn export_dbnum_instances_parquet(
                 "rows": aabb_row_data.len(),
             },
         },
+        "mesh_validation": {
+            "lod_tag": MESH_CHECK_LOD_TAG,
+            "report_file": missing_mesh_report.report_file,
+            "checked_geo_hashes": missing_mesh_report.checked_geo_hashes,
+            "missing_geo_hashes": missing_mesh_report.missing_geo_hashes,
+            "missing_owner_refnos": missing_mesh_report.missing_owner_refnos,
+        },
         "total_bytes": total_bytes,
     });
 
@@ -1113,6 +1317,9 @@ pub async fn export_dbnum_instances_parquet_from_cache(
 
     fs::create_dir_all(output_dir)
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
+    let mesh_base_dir = mesh_dir
+        .map(normalize_mesh_base_dir)
+        .unwrap_or_else(|| PathBuf::from("assets/meshes"));
 
     // =========================================================================
     // 1. 从 per-refno 缓存加载数据
@@ -1392,6 +1599,8 @@ pub async fn export_dbnum_instances_parquet_from_cache(
     let mut trans_table: HashMap<String, [f64; 16]> = HashMap::new();
     let mut aabb_table: HashMap<String, AabbRow> = HashMap::new();
     let mut mesh_aabb_cache: HashMap<u64, Aabb> = HashMap::new();
+    let mut owner_refnos_by_hash: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut row_count_by_hash: HashMap<String, usize> = HashMap::new();
 
     // 处理所有 inst_info_map 中的 refno（grouped + ungrouped 统一处理）
     let all_refnos: Vec<RefnoEnum> = inst_info_map.keys().copied().collect();
@@ -1468,6 +1677,12 @@ pub async fn export_dbnum_instances_parquet_from_cache(
                 geo_hash: inst.geo_hash.to_string(),
                 geo_trans_hash,
             });
+            record_geo_hash_usage(
+                &inst.geo_hash.to_string(),
+                &refno.to_string(),
+                &mut owner_refnos_by_hash,
+                &mut row_count_by_hash,
+            );
         }
     }
 
@@ -1510,13 +1725,29 @@ pub async fn export_dbnum_instances_parquet_from_cache(
             owner_refno_str: owner_refno.to_string(),
             owner_refno_u64: refno_to_u64(&owner_refno),
             order: index,
-            geo_hash,
+            geo_hash: geo_hash.clone(),
             trans_hash,
             aabb_hash,
             spec_value: 0,
             dbnum,
         });
+        record_geo_hash_usage(
+            &geo_hash,
+            &owner_refno.to_string(),
+            &mut owner_refnos_by_hash,
+            &mut row_count_by_hash,
+        );
     }
+
+    let missing_mesh_report = write_missing_mesh_report(
+        output_dir,
+        dbnum,
+        &mesh_base_dir,
+        MESH_CHECK_LOD_TAG,
+        &owner_refnos_by_hash,
+        &row_count_by_hash,
+        verbose,
+    )?;
 
     // =========================================================================
     // 6. 写入 Parquet 文件（复用已有 schema + write_parquet）
@@ -1642,6 +1873,13 @@ pub async fn export_dbnum_instances_parquet_from_cache(
                 "file": "aabb.parquet",
                 "rows": aabb_row_data.len(),
             },
+        },
+        "mesh_validation": {
+            "lod_tag": MESH_CHECK_LOD_TAG,
+            "report_file": missing_mesh_report.report_file,
+            "checked_geo_hashes": missing_mesh_report.checked_geo_hashes,
+            "missing_geo_hashes": missing_mesh_report.missing_geo_hashes,
+            "missing_owner_refnos": missing_mesh_report.missing_owner_refnos,
         },
         "total_bytes": total_bytes,
     });

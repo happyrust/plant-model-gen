@@ -95,7 +95,7 @@ pub async fn process_cate_refno_page(
     Ok(())
 }
 
-async fn gen_cate_instances_from_cache_only(
+pub(crate) async fn gen_cate_instances_from_cache_only(
     ctx: &NounProcessContext,
     target_cata_map: &Arc<DashMap<String, aios_core::pdms_types::CataHashRefnoKV>>,
     sender: flume::Sender<ShapeInstancesData>,
@@ -159,6 +159,10 @@ async fn gen_cate_instances_from_cache_only(
 
     let respect_tufl = std::env::var_os("AIOS_RESPECT_TUFL").is_some();
     let mut shape_insts_data = ShapeInstancesData::default();
+    let mut cata_cache_miss_groups = 0usize;
+    let mut cata_cache_miss_refnos = 0usize;
+    let mut cata_cache_miss_samples: Vec<String> = Vec::new();
+    const CATA_CACHE_MISS_SAMPLE_LIMIT: usize = 12;
 
     // 3) 按 cata_hash 分组处理（注意：dashmap entry 不能跨 await 持有）
     for kv in target_cata_map.iter() {
@@ -184,11 +188,11 @@ async fn gen_cate_instances_from_cache_only(
                     group_refnos.iter().take(8).collect::<Vec<_>>()
                 );
             } else {
-                println!(
-                    "[cate_processor] cache-only 容错: cata_resolve_cache miss cata_hash={}, skip {} refnos",
-                    cata_hash,
-                    group_refnos.len()
-                );
+                cata_cache_miss_groups += 1;
+                cata_cache_miss_refnos += group_refnos.len();
+                if cata_cache_miss_samples.len() < CATA_CACHE_MISS_SAMPLE_LIMIT {
+                    cata_cache_miss_samples.push(format!("{}({})", cata_hash, group_refnos.len()));
+                }
                 continue;
             }
         };
@@ -280,6 +284,15 @@ async fn gen_cate_instances_from_cache_only(
                     .expect("send cate shape_insts_data error");
             }
         }
+    }
+
+    if !strict && cata_cache_miss_groups > 0 {
+        println!(
+            "[cate_processor] cache-only 容错: cata_resolve_cache miss groups={}, skipped_refnos={}, sample=[{}]",
+            cata_cache_miss_groups,
+            cata_cache_miss_refnos,
+            cata_cache_miss_samples.join(", ")
+        );
     }
 
     if shape_insts_data.inst_cnt() > 0 {

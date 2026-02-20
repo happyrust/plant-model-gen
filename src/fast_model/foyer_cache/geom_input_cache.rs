@@ -18,6 +18,7 @@ use aios_core::types::NamedAttrMap;
 use aios_core::RefnoEnum;
 use aios_core::Transform;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -100,6 +101,7 @@ pub struct GeomInputCacheManager {
     loop_inputs: DashMap<(u32, RefnoEnum), LoopInput>,
     prim_inputs: DashMap<(u32, RefnoEnum), PrimInput>,
     cate_inputs: DashMap<(u32, RefnoEnum), CateInput>,
+    pins: DashMap<(u32, RefnoEnum), u32>,
 }
 
 impl GeomInputCacheManager {
@@ -108,6 +110,7 @@ impl GeomInputCacheManager {
             loop_inputs: DashMap::new(),
             prim_inputs: DashMap::new(),
             cate_inputs: DashMap::new(),
+            pins: DashMap::new(),
         }
     }
 
@@ -223,6 +226,139 @@ impl GeomInputCacheManager {
         self.prim_inputs.clear();
         self.cate_inputs.clear();
         count
+    }
+
+    /// 按 refno 定向清理缓存，避免并发任务之间互相清空全局缓存。
+    pub fn clear_refnos(&self, refnos: &[RefnoEnum]) -> usize {
+        if refnos.is_empty() {
+            return 0;
+        }
+
+        let keys = Self::map_refnos_to_keys(refnos);
+        let mut count = 0usize;
+        for (dbnum, refno) in keys {
+            if self.loop_inputs.remove(&(dbnum, refno)).is_some() {
+                count += 1;
+            }
+            if self.prim_inputs.remove(&(dbnum, refno)).is_some() {
+                count += 1;
+            }
+            if self.cate_inputs.remove(&(dbnum, refno)).is_some() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// 为一组 refno 增加缓存租约（pin），用于并发任务隔离。
+    pub fn pin_refnos(&self, refnos: &[RefnoEnum]) -> usize {
+        if refnos.is_empty() {
+            return 0;
+        }
+        let keys = Self::map_refnos_to_keys(refnos);
+        self.pin_keys(&keys)
+    }
+
+    /// 释放一组 refno 的缓存租约（不清理缓存条目）。
+    pub fn unpin_refnos(&self, refnos: &[RefnoEnum]) -> usize {
+        if refnos.is_empty() {
+            return 0;
+        }
+        let keys = Self::map_refnos_to_keys(refnos);
+        self.unpin_keys(&keys)
+    }
+
+    /// 释放一组 refno 的缓存租约，并在无人持有时清理对应缓存条目。
+    pub fn release_refnos_and_clear(&self, refnos: &[RefnoEnum]) -> usize {
+        if refnos.is_empty() {
+            return 0;
+        }
+        let keys = Self::map_refnos_to_keys(refnos);
+        self.release_keys_and_clear(&keys)
+    }
+
+    fn map_refnos_to_keys(refnos: &[RefnoEnum]) -> Vec<(u32, RefnoEnum)> {
+        let db_meta = crate::data_interface::db_meta_manager::db_meta();
+        let _ = db_meta.ensure_loaded();
+
+        let mut keys = Vec::with_capacity(refnos.len());
+        for &refno in refnos {
+            let Some(dbnum) = db_meta.get_dbnum_by_refno(refno) else {
+                continue;
+            };
+            keys.push((dbnum, refno));
+        }
+        keys
+    }
+
+    fn pin_keys(&self, keys: &[(u32, RefnoEnum)]) -> usize {
+        let mut pinned = 0usize;
+        for &key in keys {
+            match self.pins.entry(key) {
+                Entry::Occupied(mut occ) => {
+                    *occ.get_mut() += 1;
+                }
+                Entry::Vacant(vac) => {
+                    vac.insert(1);
+                }
+            }
+            pinned += 1;
+        }
+        pinned
+    }
+
+    fn unpin_keys(&self, keys: &[(u32, RefnoEnum)]) -> usize {
+        let mut released = 0usize;
+        for &key in keys {
+            match self.pins.entry(key) {
+                Entry::Occupied(mut occ) => {
+                    let cnt = occ.get_mut();
+                    if *cnt > 1 {
+                        *cnt -= 1;
+                    } else {
+                        occ.remove();
+                    }
+                    released += 1;
+                }
+                Entry::Vacant(_) => {}
+            }
+        }
+        released
+    }
+
+    fn release_keys_and_clear(&self, keys: &[(u32, RefnoEnum)]) -> usize {
+        let mut removed = 0usize;
+        for &key in keys {
+            let mut can_clear = true;
+
+            match self.pins.entry(key) {
+                Entry::Occupied(mut occ) => {
+                    let cnt = occ.get_mut();
+                    if *cnt > 1 {
+                        *cnt -= 1;
+                        can_clear = false;
+                    } else {
+                        occ.remove();
+                    }
+                }
+                Entry::Vacant(_) => {
+                    // 未被 pin 的历史调用，维持兼容：允许直接清理。
+                }
+            }
+
+            if can_clear {
+                if self.loop_inputs.remove(&key).is_some() {
+                    removed += 1;
+                }
+                if self.prim_inputs.remove(&key).is_some() {
+                    removed += 1;
+                }
+                if self.cate_inputs.remove(&key).is_some() {
+                    removed += 1;
+                }
+            }
+        }
+        removed
     }
 }
 
@@ -822,6 +958,30 @@ pub fn clear_global_geom_input_cache() -> usize {
         .unwrap_or(0)
 }
 
+/// 按 refno 清理全局 geom_input 缓存（用于分批任务隔离）。
+pub fn clear_global_geom_input_cache_for_refnos(refnos: &[RefnoEnum]) -> usize {
+    GLOBAL_GEOM_INPUT_CACHE
+        .get()
+        .map(|mgr| mgr.release_refnos_and_clear(refnos))
+        .unwrap_or(0)
+}
+
+/// 为一组 refno 增加全局 geom_input 缓存租约（pin）。
+pub fn pin_global_geom_input_cache_for_refnos(refnos: &[RefnoEnum]) -> usize {
+    GLOBAL_GEOM_INPUT_CACHE
+        .get()
+        .map(|mgr| mgr.pin_refnos(refnos))
+        .unwrap_or(0)
+}
+
+/// 释放一组 refno 的全局 geom_input 缓存租约（不清理条目）。
+pub fn release_global_geom_input_cache_for_refnos(refnos: &[RefnoEnum]) -> usize {
+    GLOBAL_GEOM_INPUT_CACHE
+        .get()
+        .map(|mgr| mgr.unpin_refnos(refnos))
+        .unwrap_or(0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheRunMode {
     /// 不使用输入缓存，保持原实时查询路径。
@@ -887,25 +1047,11 @@ pub fn is_geom_input_cache_pipeline_enabled() -> bool {
 // Orchestrator 入口：按 dbnum 分组预取 LOOP/PRIM/CATE 输入
 // ---------------------------------------------------------------------------
 
-/// 预取指定 refnos 的 LOOP/PRIM 输入数据到 geom_input_cache（兼容旧签名）。
-///
-/// 按 dbnum 分组，分别调用 `prefetch_loop_inputs` / `prefetch_prim_inputs`。
-/// 需要先调用 `init_global_geom_input_cache` 初始化全局缓存。
-pub async fn prefetch_all_geom_inputs(
-    db_option: &crate::options::DbOptionExt,
-    loop_refnos: &[RefnoEnum],
-    prim_refnos: &[RefnoEnum],
-) -> anyhow::Result<(usize, usize)> {
-    let (loop_n, prim_n, _cate_n) =
-        prefetch_all_geom_inputs_v2(db_option, loop_refnos, prim_refnos, &[]).await?;
-    Ok((loop_n, prim_n))
-}
-
 /// 预取指定 refnos 的 LOOP/PRIM/CATE 输入数据到 geom_input_cache。
 ///
 /// 按 dbnum 分组，分别调用 `prefetch_loop_inputs` / `prefetch_prim_inputs` / `prefetch_cate_inputs`。
 /// 需要先调用 `init_global_geom_input_cache` 初始化全局缓存。
-pub async fn prefetch_all_geom_inputs_v2(
+pub async fn prefetch_all_geom_inputs(
     db_option: &crate::options::DbOptionExt,
     loop_refnos: &[RefnoEnum],
     prim_refnos: &[RefnoEnum],
@@ -937,7 +1083,7 @@ pub async fn prefetch_all_geom_inputs_v2(
     }
 
     println!(
-        "[geom_input_cache] prefetch_all(v2) 完成: loop={}, prim={}, cate={}, elapsed={} ms",
+        "[geom_input_cache] prefetch_all 完成: loop={}, prim={}, cate={}, elapsed={} ms",
         total_loop,
         total_prim,
         total_cate,
@@ -1200,5 +1346,63 @@ mod tests {
 
         let all = mgr.get_all_cate_inputs(1112);
         assert!(all.contains_key(&refno));
+    }
+
+    #[test]
+    fn test_geom_input_cache_pin_release_two_tasks_same_refno() {
+        let mgr = GeomInputCacheManager::new();
+        let refno: RefnoEnum = "24381/36716".into();
+        let dbnum = 1112u32;
+
+        let loop_input = LoopInput {
+            refno: refno.clone(),
+            attmap: aios_core::NamedAttrMap::default(),
+            world_transform: aios_core::Transform::IDENTITY,
+            loops: Vec::new(),
+            height: 0.0,
+            owner_refno: RefnoEnum::default(),
+            owner_type: String::new(),
+            visible: true,
+            neg_refnos: Vec::new(),
+            cmpf_neg_refnos: Vec::new(),
+        };
+        let prim_input = PrimInput {
+            refno: refno.clone(),
+            attmap: aios_core::NamedAttrMap::default(),
+            world_transform: aios_core::Transform::IDENTITY,
+            owner_refno: RefnoEnum::default(),
+            owner_type: String::new(),
+            visible: true,
+            neg_refnos: Vec::new(),
+            poly_extra: None,
+        };
+        let cate_input = CateInput {
+            refno: refno.clone(),
+            attmap: aios_core::NamedAttrMap::default(),
+            world_transform: aios_core::Transform::IDENTITY,
+            owner_refno: RefnoEnum::default(),
+            owner_type: String::new(),
+            visible: true,
+        };
+
+        mgr.insert_loop_input(dbnum, refno.clone(), &loop_input);
+        mgr.insert_prim_input(dbnum, refno.clone(), &prim_input);
+        mgr.insert_cate_input(dbnum, refno.clone(), &cate_input);
+
+        let keys = vec![(dbnum, refno.clone())];
+        assert_eq!(mgr.pin_keys(&keys), 1);
+        assert_eq!(mgr.pin_keys(&keys), 1);
+
+        let removed_first = mgr.release_keys_and_clear(&keys);
+        assert_eq!(removed_first, 0, "仍有并发租约时不应清理缓存");
+        assert!(mgr.get_loop_input(dbnum, refno.clone()).is_some());
+        assert!(mgr.get_prim_input(dbnum, refno.clone()).is_some());
+        assert!(mgr.get_cate_input(dbnum, refno.clone()).is_some());
+
+        let removed_second = mgr.release_keys_and_clear(&keys);
+        assert_eq!(removed_second, 3, "最后一个租约释放后应清理全部同 key 条目");
+        assert!(mgr.get_loop_input(dbnum, refno.clone()).is_none());
+        assert!(mgr.get_prim_input(dbnum, refno.clone()).is_none());
+        assert!(mgr.get_cate_input(dbnum, refno).is_none());
     }
 }

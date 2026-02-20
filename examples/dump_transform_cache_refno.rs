@@ -7,8 +7,8 @@
 //!   $env:CACHE_DIR="output/AvevaMarineSample/instance_cache"
 //!   cargo run --example dump_transform_cache_refno --features sqlite-index
 
-use anyhow::{Context, Result};
 use aios_core::RefnoEnum;
+use anyhow::{Context, Result};
 use std::env;
 use std::path::PathBuf;
 
@@ -28,7 +28,9 @@ async fn main() -> Result<()> {
         .ensure_loaded()
         .context("db_meta_info.json 未加载（请先生成 output/scene_tree/db_meta_info.json）")?;
 
-    let Some(dbnum) = aios_database::data_interface::db_meta_manager::db_meta().get_dbnum_by_refno(refno) else {
+    let Some(dbnum) =
+        aios_database::data_interface::db_meta_manager::db_meta().get_dbnum_by_refno(refno)
+    else {
         anyhow::bail!("无法从 db_meta 推导 dbnum: {}", refno);
     };
 
@@ -36,11 +38,16 @@ async fn main() -> Result<()> {
     println!("   - cache_dir: {}", cache_dir.display());
 
     // 1) instance_cache（按“最新覆盖旧”找 inst_info）
-    let inst_cache = aios_database::fast_model::instance_cache::InstanceCacheManager::new(&cache_dir)
-        .await
-        .context("打开 InstanceCacheManager 失败")?;
+    let inst_cache =
+        aios_database::fast_model::instance_cache::InstanceCacheManager::new(&cache_dir)
+            .await
+            .context("打开 InstanceCacheManager 失败")?;
     let batch_ids = inst_cache.list_batches(dbnum);
-    let mut best: Option<(String, i64, aios_database::fast_model::instance_cache::CachedInstanceBatch)> = None;
+    let mut best: Option<(
+        String,
+        i64,
+        aios_database::fast_model::instance_cache::CachedInstanceBatch,
+    )> = None;
     for bid in batch_ids {
         let Some(batch) = inst_cache.get(dbnum, &bid).await else {
             continue;
@@ -56,7 +63,10 @@ async fn main() -> Result<()> {
     match best {
         Some((bid, ts, batch)) => {
             let info = batch.inst_info_map.get(&refno).unwrap();
-            println!("\n== instance_cache hit batch_id={} created_at={} ==", bid, ts);
+            println!(
+                "\n== instance_cache hit batch_id={} created_at={} ==",
+                bid, ts
+            );
             println!("inst_info.world_transform(raw): {:?}", info.world_transform);
             println!(
                 "inst_info.world_transform(effective): {:?}",
@@ -70,9 +80,10 @@ async fn main() -> Result<()> {
 
     // 2) transform_cache（foyer）
     let trans_dir = cache_dir.join("transform_cache");
-    let trans_cache = aios_database::fast_model::transform_cache::TransformCacheManager::new(&trans_dir)
-        .await
-        .with_context(|| format!("打开 TransformCacheManager 失败: {}", trans_dir.display()))?;
+    let trans_cache =
+        aios_database::fast_model::transform_cache::TransformCacheManager::new(&trans_dir)
+            .await
+            .with_context(|| format!("打开 TransformCacheManager 失败: {}", trans_dir.display()))?;
     let hit = trans_cache.get_world_transform(dbnum, refno).await;
     match hit {
         Some(t) => {
@@ -86,4 +97,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-

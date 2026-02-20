@@ -13,8 +13,8 @@
 //!   $env:OWNER_REFNO="17496/171606"   # 只检查指定 owner_refno 的 group（默认取第一个 group）
 //!   $env:TOL_MM="1.0"                # 容差（mm）
 
-use anyhow::{Context, Result};
 use aios_core::RefnoEnum;
+use anyhow::{Context, Result};
 use glam::Vec3;
 use serde::Deserialize;
 use std::env;
@@ -64,7 +64,10 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|x| x.parse::<u32>().ok())
         .unwrap_or(1112);
-    let tol = parse_f32(&env::var("TOL_MM").unwrap_or_else(|_| "1.0".to_string()), 1.0);
+    let tol = parse_f32(
+        &env::var("TOL_MM").unwrap_or_else(|_| "1.0".to_string()),
+        1.0,
+    );
 
     let cache_dir = PathBuf::from(
         env::var("CACHE_DIR").unwrap_or_else(|_| "output/AvevaMarineSample/instance_cache".into()),
@@ -100,7 +103,12 @@ async fn main() -> Result<()> {
     let mut tubis = group.tubings.clone();
     tubis.sort_by_key(|t| t.order);
 
-    println!("dbnum={} owner_refno={} tubings={}", dbnum, group.owner_refno, tubis.len());
+    println!(
+        "dbnum={} owner_refno={} tubings={}",
+        dbnum,
+        group.owner_refno,
+        tubis.len()
+    );
     println!("cache_dir={}", cache_dir.display());
     println!("instances_json={}", instances_json.display());
     println!("tol_mm={}", tol);
@@ -119,7 +127,8 @@ async fn main() -> Result<()> {
         .collect();
     let mut resolved: std::collections::HashMap<RefnoEnum, aios_core::geometry::EleGeosInfo> =
         std::collections::HashMap::new();
-    let mut hit_from: std::collections::HashMap<RefnoEnum, String> = std::collections::HashMap::new();
+    let mut hit_from: std::collections::HashMap<RefnoEnum, String> =
+        std::collections::HashMap::new();
 
     for bid in batch_ids.iter().rev() {
         if resolved.len() == need.len() {
@@ -162,14 +171,8 @@ async fn main() -> Result<()> {
             .tubi_end_pt
             .unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 1.0)));
 
-        let arrive_axis = info
-            .arrive_axis_pt
-            .map(vec3_from_arr)
-            .unwrap_or(end);
-        let leave_axis = info
-            .leave_axis_pt
-            .map(vec3_from_arr)
-            .unwrap_or(start);
+        let arrive_axis = info.arrive_axis_pt.map(vec3_from_arr).unwrap_or(end);
+        let leave_axis = info.leave_axis_pt.map(vec3_from_arr).unwrap_or(start);
 
         pts_list.push(TubiPts {
             refno: r,
@@ -180,7 +183,11 @@ async fn main() -> Result<()> {
         });
     }
 
-    println!("tubi_resolved={} missing_in_cache={}", pts_list.len(), missing);
+    println!(
+        "tubi_resolved={} missing_in_cache={}",
+        pts_list.len(),
+        missing
+    );
     if let Some(t0) = pts_list.first() {
         if let Some(bid) = hit_from.get(&t0.refno) {
             println!("sample_hit_batch: {} -> {}", t0.refno, bid);
@@ -335,7 +342,10 @@ async fn main() -> Result<()> {
                 .filter(|&i| !visited[i] && !has_prev[i])
                 .collect();
             if starts.is_empty() {
-                if let Some(i) = (0..pts.len()).filter(|&i| !visited[i]).min_by_key(|&i| key(i)) {
+                if let Some(i) = (0..pts.len())
+                    .filter(|&i| !visited[i])
+                    .min_by_key(|&i| key(i))
+                {
                     starts.push(i);
                 }
             }

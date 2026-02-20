@@ -15,8 +15,8 @@
 //!   $env:MAX=50   # 限制输出条数
 //!   $env:BATCH="xxx"  # 指定 batch_id（不指定则用最新 batch）
 //!
-use anyhow::{Context, Result};
 use aios_core::RefnoEnum;
+use anyhow::{Context, Result};
 use glam::Vec3;
 use std::env;
 use std::path::PathBuf;
@@ -49,7 +49,8 @@ async fn main() -> Result<()> {
     aios_database::data_interface::db_meta_manager::db_meta()
         .ensure_loaded()
         .context("db_meta_info.json 未加载（请先生成 output/scene_tree/db_meta_info.json）")?;
-    let Some(dbnum) = aios_database::data_interface::db_meta_manager::db_meta().get_dbnum_by_refno(root)
+    let Some(dbnum) =
+        aios_database::data_interface::db_meta_manager::db_meta().get_dbnum_by_refno(root)
     else {
         anyhow::bail!("无法从 db_meta 推导 dbnum: {}", root);
     };
@@ -103,10 +104,7 @@ async fn main() -> Result<()> {
 
             println!("\n== tubi #{} batch_id={} ==", printed + 1, bid);
             println!("key_refno={} (key_refu64={})", k, k.refno());
-            println!(
-                "owner_refno={} (expect ROOT_REFNO)",
-                info.owner_refno
-            );
+            println!("owner_refno={} (expect ROOT_REFNO)", info.owner_refno);
             println!("type(owner_type)={}", info.owner_type);
             println!(
                 "world_transform: t=({:.3},{:.3},{:.3}) s=({:.3},{:.3},{:.3})",
@@ -185,10 +183,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    println!("\nsummary: tubi_found(owner==ROOT)={} printed={}", found, printed);
+    println!(
+        "\nsummary: tubi_found(owner==ROOT)={} printed={}",
+        found, printed
+    );
     if found == 0 {
         println!("⚠️ 未在 cache.inst_tubi_map 中找到 owner_refno==ROOT 的 tubi 记录。");
-        println!("   这通常意味着：tubi 写入 key/owner 与导出筛选条件不一致，或 BRAN/HANG tubing 未生成/未写入 cache。");
+        println!(
+            "   这通常意味着：tubi 写入 key/owner 与导出筛选条件不一致，或 BRAN/HANG tubing 未生成/未写入 cache。"
+        );
     }
 
     Ok(())

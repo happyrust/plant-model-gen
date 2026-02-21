@@ -201,7 +201,6 @@ dependencies = [
  "base64 0.22.1",
  "bevy_reflect",
  "bevy_transform",
- "bincode 1.3.3",
  "bitflags 2.10.0",
  "bitvec",
  "byteorder",

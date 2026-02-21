@@ -151,7 +151,11 @@ pub fn convert_row_to_attmap(row: &MySqlRow, type_hash: i32, column_names: &[&st
                     }
                     DbAttributeType::DOUBLEVEC => {
                         row.try_get::<Vec<u8>, _>(t).map(|v| {
-                            let v = bincode::deserialize::<Vec<f64>>(&v).unwrap();
+                            // 从数据库取到的 Vec<u8> 通常是不保证对齐的，必须先放入 AlignedVec
+                            // 才能被 rkyv_bytes_unchecked 正确处理转化为 Vec<f64>
+                            let mut aligned = rkyv::util::AlignedVec::with_capacity(v.len());
+                            aligned.extend_from_slice(&v);
+                            let v: Vec<f64> = unsafe { rkyv::from_bytes_unchecked(&aligned) }.unwrap_or_default();
                             r.entry(hash).or_insert(AttrVal::DoubleArrayType(v))
                         })?;
                     }
@@ -401,7 +405,9 @@ fn gen_insert_attr_info_sql(attr_info: &DashMap<i32, DashMap<i32, AttrInfo>>) ->
     for info in attr_info {
         let type_hash = *info.key() as u32;
         let type_name = db1_dehash(type_hash);
-        let info = hex::encode(bincode::serialize(&info.value()).unwrap());
+        // 使用 rkyv 来将其序列化成字节数组并用 hex 转码存储，替代旧有的 bincode::serialize()
+        let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&info.value()).unwrap();
+        let info = hex::encode(&*rkyv_bytes);
         sql.push_str(&format!("( {} , '{}', 0x{} ),", type_hash, type_name, info));
     }
     sql.remove(sql.len() - 1);

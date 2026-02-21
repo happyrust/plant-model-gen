@@ -43,7 +43,7 @@ use crate::fast_model::export_model::model_exporter::{
 };
 use crate::fast_model::instance_cache::InstanceCacheManager;
 use crate::fast_model::gen_model::tree_index_manager::{
-    ensure_tree_index_exists, load_index_with_large_stack, TreeIndexManager,
+    load_index_with_large_stack, TreeIndexManager,
 };
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use crate::fast_model::material_config::MaterialLibrary;
@@ -51,7 +51,7 @@ use crate::fast_model::query_compat::query_deep_visible_inst_refnos;
 use crate::fast_model::query_provider;
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
 
-/// 用 rkyv 序列化 geo_param 并计算 hash（替代 bincode::serialize）
+/// 用 rkyv 序列化 geo_param 并计算 hash
 fn rkyv_geo_param_hash(geo_param: &PdmsGeoParam) -> Option<u64> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -2698,11 +2698,10 @@ pub async fn export_dbnum_instances_json(
 
     // 尝试加载 TreeIndex；若提供了 root_refno 且 TreeIndex 不可用，
     // 可直接从 inst_relate 查询该 owner 的子节点（无需 pe 表数据）。
-    let tree_index_result = async {
-        ensure_tree_index_exists(dbnum, &tree_dir).await?;
+    // Tree 文件由预检查阶段（precheck）统一保证：若 tree 文件缺失，请先运行预检查。
+    let tree_index_result =
         load_index_with_large_stack(&tree_dir, dbnum)
-            .with_context(|| format!("加载 TreeIndex 失败: {}", tree_path.display()))
-    }.await;
+            .with_context(|| format!("加载 TreeIndex 失败: {}", tree_path.display()));
 
     // 获取待导出的 refno 列表
     let mut all_refnos: Vec<RefnoEnum> = if let Some(root) = root_refno {

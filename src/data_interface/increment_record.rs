@@ -126,7 +126,9 @@ fn gen_insert_increment_sql(
         }
         let old_data = hex::encode(increment_data.old_attr.into_rkyv_compress_bytes());
         let new_data = hex::encode(increment_data.new_attr.into_rkyv_compress_bytes());
-        let children = hex::encode(bincode::serialize(&increment_data.children).unwrap_or(vec![]));
+        // 使用 rkyv 替代 bincode 进行 children 的序列化操作以匹配目前统一采用的 rkyv 标准。
+        let children_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&increment_data.children).unwrap_or_default();
+        let children = hex::encode(&*children_bytes);
         let local: DateTime<Local> = Local::now();
         let dbnum = increment_data.numbdb;
         let refno = increment_data.refno;
@@ -169,8 +171,13 @@ pub async fn query_key_data(
     let refno = RefnoEnum(val.get::<i64, _>("REFNO") as u64);
     let operate = val.get::<i32, _>("OPERATE");
     let numb_db = val.get::<i32, _>("NUMBDB");
-    let children: Vec<RefnoEnum> =
-        bincode::deserialize(&val.get::<Vec<u8>, _>("CHILDREN")).unwrap_or_default();
+    
+    // 使用 rkyv 替代 bincode 将存放 children 字节的数据经对齐处理后反序列化成原结构
+    let children_bytes = val.get::<Vec<u8>, _>("CHILDREN");
+    let mut aligned_children = rkyv::util::AlignedVec::with_capacity(children_bytes.len());
+    aligned_children.extend_from_slice(&children_bytes);
+    let children: Vec<RefnoEnum> = unsafe { rkyv::from_bytes_unchecked(&aligned_children) }.unwrap_or_default();
+    
     let old_data = AttrMap::from_rkvy_compress_bytes(&val.get::<Vec<u8>, _>("OLD_DATA"))?;
     let new_data = AttrMap::from_rkvy_compress_bytes(&val.get::<Vec<u8>, _>("NEW_DATA"))?;
     let time = val.get::<String, _>("TIME");

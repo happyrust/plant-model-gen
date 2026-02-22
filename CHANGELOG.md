@@ -16,6 +16,11 @@
   - 类型/函数重命名：`FullNounConfig/Error` -> `IndexTreeConfig/Error`，`gen_full_noun_geos_optimized` -> `gen_index_tree_geos_optimized`
   - `noun_collection` 对外命名改为 `IndexTreeTargetCollection`
   - 日志与性能标签统一为 `index_tree_*` 语义
+  - **彻底清理残留**：
+    - 删除孤立的遗留文件 `src/fast_model/gen_model/statistics.rs`
+    - 更新 `src/perf_timer.rs` 文档示例，移除 `full_noun` 硬编码
+    - 全量更新所有架构与流程文档（`docs/`），将 `Full Noun` 描述平滑替换为 `Index Tree`
+    - 对历史设计文档（`docs/architecture/`）增加过期/存档声明标识
 
 - **配置键统一为 `index_tree_*`**
   - `full_noun_max_concurrent_nouns` -> `index_tree_max_concurrent_targets`

@@ -1,3 +1,6 @@
+> [!NOTE]
+> 此文档为历史设计存档，当前的生产环境已将其统一升华为 `Index Tree 模式`。
+
 # BRAN/HANG Mesh 生成验证指南
 
 本文档说明如何验证 Full Noun 模式下 BRAN/HANG 的 mesh 生成修复是否生效。

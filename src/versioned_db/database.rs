@@ -73,6 +73,36 @@ pub enum SenderJsonsData {
     // Kuzu 数据: Vec<(PE, NamedAttrMap)>
 }
 
+#[inline]
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+}
+
+#[inline]
+fn resolve_indextree_chunk_concurrency(is_save_db: bool) -> usize {
+    let default_concurrency = if is_save_db {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get().saturating_div(2).max(1).min(8))
+            .unwrap_or(2)
+    };
+
+    env_usize("AIOS_INDEXTREE_CHUNK_CONCURRENCY")
+        .map(|v| v.max(1).min(8))
+        .unwrap_or(default_concurrency)
+}
+
+#[inline]
+fn resolve_single_indextree_chunk_size(db_option: &DbOption) -> usize {
+    env_usize("AIOS_INDEXTREE_SINGLE_CHUNK_SIZE")
+        .unwrap_or(db_option.att_chunk as usize)
+        .max(1)
+}
+
 #[cfg(feature = "surreal-save")]
 static ELE_REUSE_RELATE_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 
@@ -1511,6 +1541,7 @@ pub async fn sync_total_async_threaded(
             }
             let dbno_set = cur_dbno_set.clone();
             let mut time = Instant::now();
+            let scan_stage_start = Instant::now();
 
             // 检查过滤条件
             let condition1 = is_parse_sys && is_total_sync;
@@ -1626,8 +1657,10 @@ pub async fn sync_total_async_threaded(
                         }
                     }
                 }
+                let file_scan_ms = scan_stage_start.elapsed().as_millis();
 
                 let project_name = project.as_str().to_string(); // 获取项目名称的字符串
+                let db_basic_stage_start = Instant::now();
                 let mut db_basic = match parse_file_db_basic_data(
                     &path,
                     &file_name,
@@ -1656,6 +1689,7 @@ pub async fn sync_total_async_threaded(
                     );
                     continue;
                 }
+                let db_basic_parse_ms = db_basic_stage_start.elapsed().as_millis();
 
                 let db_basic = Arc::new(db_basic);
                 if is_save_db {
@@ -1679,27 +1713,47 @@ pub async fn sync_total_async_threaded(
                     crate::meili::pdms_index::MeiliEnvConfig::from_db_option(db_option_arc.as_ref());
                 let mut meili_spool: Option<crate::meili::pdms_index::PdmsSpoolWriter> = None;
                 let mut tree_nodes: HashMap<RefU64, TreeNodeMeta> = HashMap::new();
-                //按照SITE划分？
                 let mut total_cnt = 0;
-                for (chunk_index, chunk) in all_refnos.chunks(chunk_size).enumerate() {
-                    let db_option_clone = db_option_arc.clone();
-                    let file_name_clone = file_name.clone();
-                    let chunk_refnos = chunk.to_vec();
-                    let project_name_clone = project_name.clone();
-                    let db_basic_clone = db_basic.clone();
-                    let debug_refnos = debug_refnos.clone();
-                    let ses_range_map_clone = ses_range_map.clone();
-                    let ignore_world_refno = true;
-                    match parse_file_with_chunk(
-                        db_basic_clone.clone(),
-                        &file_name_clone,
-                        project_name_clone.as_str(),
-                        &chunk_refnos,
-                        &ses_range_map_clone,
-                        ignore_world_refno,
-                    )
-                    .await
-                    {
+                let chunk_stage_start = Instant::now();
+                let chunk_concurrency = resolve_indextree_chunk_concurrency(is_save_db);
+                info!(
+                    "[indextree] 开始 chunk 解析: file={}, chunk_size={}, chunk_concurrency={}, refnos={}",
+                    file_name,
+                    chunk_size,
+                    chunk_concurrency,
+                    all_refnos.len()
+                );
+
+                let chunk_jobs: Vec<(usize, Vec<RefU64>)> = all_refnos
+                    .chunks(chunk_size)
+                    .enumerate()
+                    .map(|(chunk_index, chunk)| (chunk_index, chunk.to_vec()))
+                    .collect();
+
+                let mut chunk_stream = futures::stream::iter(
+                    chunk_jobs.into_iter().map(|(chunk_index, chunk_refnos)| {
+                        let file_name_clone = file_name.clone();
+                        let project_name_clone = project_name.clone();
+                        let db_basic_clone = db_basic.clone();
+                        let ses_range_map_clone = ses_range_map.clone();
+                        async move {
+                            let result = parse_file_with_chunk(
+                                db_basic_clone,
+                                &file_name_clone,
+                                project_name_clone.as_str(),
+                                &chunk_refnos,
+                                &ses_range_map_clone,
+                                true,
+                            )
+                            .await;
+                            (chunk_index, result)
+                        }
+                    }),
+                )
+                .buffer_unordered(chunk_concurrency);
+
+                while let Some((chunk_index, parse_result)) = chunk_stream.next().await {
+                    match parse_result {
                         Ok(PdmsDbData {
                             total_attr_map,
                             type_ele_map,
@@ -1731,7 +1785,7 @@ pub async fn sync_total_async_threaded(
                                     let name = crate::api::element::cal_default_name(
                                         refno,
                                         att,
-                                        &db_basic_clone.children_map,
+                                        &db_basic.children_map,
                                     );
                                     let doc = crate::meili::pdms_index::PdmsNodeDoc {
                                         id: format!("{}_{}", dbnum, refno),
@@ -1770,12 +1824,12 @@ pub async fn sync_total_async_threaded(
                                 //开始执行保存数据
                                 info!("开始保存pe数量: {}", total_attr_map_arc.len());
                                 save_pes(
-                                    &db_basic_clone,
+                                    &db_basic,
                                     &total_attr_map_arc,
                                     dbnum as i32,
-                                    &file_name_clone,
+                                    &file_name,
                                     &db_type,
-                                    &db_option_clone,
+                                    db_option_arc.as_ref(),
                                     sender_clone.clone(),
                                 )
                                 .await
@@ -1784,11 +1838,11 @@ pub async fn sync_total_async_threaded(
                             if b_save_mysql && !gen_tree_only {
                                 #[cfg(feature = "sql")]
                                 save_pes_mysql(
-                                    &db_basic_clone,
+                                    &db_basic,
                                     &project_name,
                                     &total_attr_map_arc,
                                     &pool,
-                                    &db_option_clone,
+                                    db_option_arc.as_ref(),
                                     dbnum as i32,
                                     &sender_clone,
                                 )
@@ -1803,7 +1857,7 @@ pub async fn sync_total_async_threaded(
                                     }
                                     //UDA 还是要单独存，不然数据很容易混乱
                                     for refnos in
-                                        &kv.value().iter().chunks(db_option_clone.att_chunk as _)
+                                        &kv.value().iter().chunks(db_option_arc.att_chunk as _)
                                     {
                                         let mut json_vec = vec![];
                                         let mut uda_json_vec = vec![];
@@ -1851,10 +1905,14 @@ pub async fn sync_total_async_threaded(
                             }
                         }
                         Err(e) => {
-                            dbg!(e.to_string());
+                            warn!(
+                                "parse_file_with_chunk 失败(file={}, chunk={}): {}",
+                                file_name, chunk_index, e
+                            );
                         }
                     }
                 }
+                let chunk_parse_ms = chunk_stage_start.elapsed().as_millis();
 
                 // 本 db 文件解析完成：导入 Meilisearch（失败不阻塞解析主流程）
                 if let (Some(cfg), Some(mut spool)) = (meili_cfg.as_ref(), meili_spool) {
@@ -1881,6 +1939,7 @@ pub async fn sync_total_async_threaded(
                 // 解析期：每处理完一个 db 文件就更新 db_meta_info.json（即使 save_db=false 且 gen_tree_only=true 也要生成）。
                 //
                 // 该文件用于：refno(ref_0) -> dbnum 的快速映射，以及记录 db 文件头的关键信息以便排查。
+                let db_meta_stage_start = Instant::now();
                 {
                     let mut ref0s = BTreeSet::new();
                     for refno in tree_nodes.keys() {
@@ -1920,6 +1979,9 @@ pub async fn sync_total_async_threaded(
                         );
                     }
                 }
+                let db_meta_update_ms = db_meta_stage_start.elapsed().as_millis();
+
+                let tree_export_stage_start = Instant::now();
                 if let Err(e) = export_tree_file(
                     dbnum,
                     db_basic.as_ref(),
@@ -1929,11 +1991,19 @@ pub async fn sync_total_async_threaded(
                 ) {
                     warn!("[tree_export] dbnum={} 导出失败: {}", dbnum, e);
                 }
+                let tree_export_ms = tree_export_stage_start.elapsed().as_millis();
 
                 info!(
-                    "解析任务完成, 耗时: {} s, 总数量: {}",
+                    "解析任务完成 file={} dbnum={} 总耗时={:.3}s 总数量={} [scan={}ms, db_basic={}ms, chunk={}ms, tree_export={}ms, db_meta={}ms]",
+                    file_name,
+                    dbnum,
                     time.elapsed().as_secs_f32(),
-                    total_cnt
+                    total_cnt,
+                    file_scan_ms,
+                    db_basic_parse_ms,
+                    chunk_parse_ms,
+                    tree_export_ms,
+                    db_meta_update_ms
                 );
             }
             //单个文件多线程
@@ -2053,7 +2123,8 @@ pub async fn parse_single_db_file(
     target_dbnum: u32,
 ) -> anyhow::Result<()> {
     let time = Instant::now();
-    let chunk_size = db_option.att_chunk as usize;
+    let chunk_size = resolve_single_indextree_chunk_size(db_option);
+    let chunk_concurrency = resolve_indextree_chunk_concurrency(false);
     let path = PathBuf::from(file_path);
     let file_name = path.file_name()
         .and_then(|n| n.to_str())
@@ -2071,12 +2142,14 @@ pub async fn parse_single_db_file(
     };
 
     // 解析基本数据
+    let db_basic_stage_start = Instant::now();
     let db_basic = match parse_file_db_basic_data(&path, &file_name, project_name) {
         Ok(data) => data,
         Err(e) => {
             anyhow::bail!("parse_file_db_basic_data 失败: {}", e);
         }
     };
+    let db_basic_parse_ms = db_basic_stage_start.elapsed().as_millis();
 
     let all_refnos: Vec<_> = db_basic.refno_table_map.iter().map(|entry| *entry.key()).collect();
     if all_refnos.is_empty() {
@@ -2090,19 +2163,43 @@ pub async fn parse_single_db_file(
     let ses_range_map: BTreeMap<i32, Range<u32>> = BTreeMap::new();
 
     // 分块解析
-    for chunk in all_refnos.chunks(chunk_size) {
-        let chunk_refnos = chunk.to_vec();
+    let chunk_stage_start = Instant::now();
+    info!(
+        "[indextree-single] 开始 chunk 解析: file={}, chunk_size={}, chunk_concurrency={}, refnos={}",
+        file_name,
+        chunk_size,
+        chunk_concurrency,
+        all_refnos.len()
+    );
+    let chunk_jobs: Vec<(usize, Vec<RefU64>)> = all_refnos
+        .chunks(chunk_size)
+        .enumerate()
+        .map(|(chunk_index, chunk)| (chunk_index, chunk.to_vec()))
+        .collect();
 
-        match parse_file_with_chunk(
-            db_basic.clone(),
-            &file_name,
-            project_name,
-            &chunk_refnos,
-            &ses_range_map,
-            true, // ignore_world_refno
-        )
-        .await
-        {
+    let mut chunk_stream = futures::stream::iter(
+        chunk_jobs.into_iter().map(|(chunk_index, chunk_refnos)| {
+            let db_basic_clone = db_basic.clone();
+            let file_name_clone = file_name.clone();
+            let ses_range_map_clone = ses_range_map.clone();
+            async move {
+                let result = parse_file_with_chunk(
+                    db_basic_clone,
+                    &file_name_clone,
+                    project_name,
+                    &chunk_refnos,
+                    &ses_range_map_clone,
+                    true,
+                )
+                .await;
+                (chunk_index, result)
+            }
+        }),
+    )
+    .buffer_unordered(chunk_concurrency);
+
+    while let Some((chunk_index, parse_result)) = chunk_stream.next().await {
+        match parse_result {
             Ok(PdmsDbData {
                 total_attr_map,
                 dbnum,
@@ -2123,12 +2220,17 @@ pub async fn parse_single_db_file(
                 }
             }
             Err(e) => {
-                warn!("parse_file_with_chunk 失败: {}", e);
+                warn!(
+                    "parse_file_with_chunk 失败(file={}, chunk={}): {}",
+                    file_name, chunk_index, e
+                );
             }
         }
     }
+    let chunk_parse_ms = chunk_stage_start.elapsed().as_millis();
 
     // 导出 tree 文件
+    let tree_export_stage_start = Instant::now();
     let output_dir = db_meta_info::get_project_tree_dir(project_name);
     if let Err(e) = export_tree_file(
         target_dbnum,
@@ -2139,8 +2241,10 @@ pub async fn parse_single_db_file(
     ) {
         anyhow::bail!("export_tree_file 失败: {}", e);
     }
+    let tree_export_ms = tree_export_stage_start.elapsed().as_millis();
 
     // 收集 ref0s 并更新 db_meta_info.json
+    let db_meta_stage_start = Instant::now();
     let ref0s: std::collections::BTreeSet<u32> = tree_nodes
         .keys()
         .map(|r| r.get_0())
@@ -2188,11 +2292,16 @@ pub async fn parse_single_db_file(
     ) {
         warn!("update_db_meta_info_json 失败: {}", e);
     }
+    let db_meta_update_ms = db_meta_stage_start.elapsed().as_millis();
 
     println!(
-        "✅ 解析完成，耗时: {:.2}s，生成 {} 个节点",
+        "✅ 解析完成，耗时: {:.2}s，生成 {} 个节点 [db_basic={}ms, chunk={}ms, tree_export={}ms, db_meta={}ms]",
         time.elapsed().as_secs_f32(),
-        tree_nodes.len()
+        tree_nodes.len(),
+        db_basic_parse_ms,
+        chunk_parse_ms,
+        tree_export_ms,
+        db_meta_update_ms
     );
 
     Ok(())

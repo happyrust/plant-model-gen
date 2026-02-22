@@ -25,8 +25,8 @@ pub async fn gen_all_geos_data(
 
 根据以下条件决定生成路径：
 
-1. **Full Noun 模式** (`db_option.full_noun_mode = true`)
-   - 使用优化的 `gen_full_noun_geos_optimized` 管线
+1. **Index Tree 模式** (`db_option.index_tree_mode = true`)
+   - 使用优化的 `gen_index_tree_geos_optimized` 管线
    - 按 NOUN 类型分类处理（Loop/Prim/Cate）
    - 支持并发批量处理
 
@@ -59,9 +59,9 @@ run_precheck(db_option, Some(precheck_config)).await?;
 
 ## 2. 数据生成阶段
 
-### 2.1 Full Noun 模式生成流程
+### 2.1 Index Tree 模式生成流程
 
-**位置**：`src/fast_model/gen_model/full_noun_mode.rs`
+**位置**：`src/fast_model/gen_model/index_tree_mode.rs`
 
 #### 2.1.1 NOUN 分类
 
@@ -104,9 +104,9 @@ for chunk in noun_infos.chunks(2) {
 - **PrimProcessor**：处理 CYL、BOX、SPHE 等
 - **CateProcessor**：处理 EQUI、STRU 等元件库
 
-### 2.2 非 Full Noun 模式生成流程
+### 2.2 非 Index Tree 模式生成流程
 
-**位置**：`src/fast_model/gen_model/non_full_noun.rs`
+**位置**：`src/fast_model/gen_model/non_index_tree.rs`
 
 - 支持增量更新（`incr_updates`）
 - 支持手动 refno 列表
@@ -122,7 +122,7 @@ for chunk in noun_infos.chunks(2) {
 let (sender, receiver) = flume::unbounded();
 
 // 生产者：生成几何数据
-gen_full_noun_geos_optimized(..., sender.clone()).await?;
+gen_index_tree_geos_optimized(..., sender.clone()).await?;
 
 // 消费者：异步写回数据库
 let insert_handle = tokio::spawn(async move {
@@ -486,7 +486,7 @@ if let Some(ref cache_manager) = cache_manager_for_insert {
 
 ### 8.1 并发处理
 
-- Full Noun 模式：每次处理 2 个 NOUN 类型（可配置）
+- Index Tree 模式：每次处理 2 个 NOUN 类型（可配置）
 - 事务批处理：最多 2 个并发事务
 - 生成和写入并行执行
 
@@ -521,7 +521,7 @@ if let Some(ref cache_manager) = cache_manager_for_insert {
         ┌───────────┼───────────┐
         │           │           │
         ▼           ▼           ▼
-   Full Noun   增量/手动/调试   全量数据库
+   Index Tree   增量/手动/调试   全量数据库
     模式          模式           生成
         │           │           │
         └───────────┼───────────┘
@@ -563,14 +563,14 @@ if let Some(ref cache_manager) = cache_manager_for_insert {
 
 ### 10.1 DbOption 配置
 
-- `full_noun_mode`: 是否启用 Full Noun 模式
+- `index_tree_mode`: 是否启用 Index Tree 模式
 - `use_surrealdb`: 是否写入 SurrealDB
 - `use_cache`: 是否使用缓存
 - `gen_mesh`: 是否生成 mesh
 - `apply_boolean_operation`: 是否执行布尔运算
 - `replace_exist`: 是否替换已存在的数据
 
-### 10.2 Full Noun 配置
+### 10.2 Index Tree 配置
 
 - `concurrency`: 并发度（默认 2）
 - `batch_size`: 批次大小（默认 100）

@@ -10,7 +10,7 @@
 
 ### 1.1 触发时机
 
-在模型生成完成后（Full Noun 模式），如果配置了 `mesh_formats.contains(&MeshFormat::Glb)`：
+在模型生成完成后（Index Tree 模式），如果配置了 `mesh_formats.contains(&MeshFormat::Glb)`：
 
 ```rust
 if db_option.mesh_formats.contains(&MeshFormat::Glb) {
@@ -330,7 +330,7 @@ output/database_models/{dbnum}/
 ### 3.1 在 orchestrator.rs 中的集成
 
 ```rust
-// Full Noun 模式
+// Index Tree 模式
 async fn process_full_noun_mode(...) -> Result<bool> {
     // 1. 初始化 Parquet 写入器（可选）
     let parquet_writer = ParquetStreamWriter::new(&parquet_dir)?;

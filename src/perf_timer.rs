@@ -10,7 +10,7 @@
 //! timer.print_summary();
 //!
 //! // 可选：保存结构化报告
-//! let metadata = serde_json::json!({"mode": "full_noun"});
+//! let metadata = serde_json::json!({"mode": "index_tree"});
 //! timer.save_json(&path, metadata).ok();
 //! ```
 //!

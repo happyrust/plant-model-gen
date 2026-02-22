@@ -200,9 +200,7 @@ impl DbMetaManager {
                 })
             }
             Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
+                let rt = build_indextree_runtime()?;
                 rt.block_on(async {
                     let cur_dbno_set = Arc::new(DashSet::new());
                     // 【关键】只处理 DESI 类型的 db 文件
@@ -301,8 +299,52 @@ pub fn ref0s_to_dbnums(ref0s: &[u32]) -> Vec<u32> {
     db_meta().ref0s_to_dbnums(ref0s)
 }
 
+#[inline]
+fn env_bool_true(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+#[inline]
+fn resolve_indextree_rt_threads() -> usize {
+    let default_threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4)
+        .max(1);
+
+    std::env::var("AIOS_INDEXTREE_RT_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .map(|v| v.min(64))
+        .unwrap_or(default_threads)
+}
+
+fn build_indextree_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    if env_bool_true("AIOS_INDEXTREE_FORCE_CURRENT_THREAD") {
+        println!("⚙️ 使用单线程 runtime（AIOS_INDEXTREE_FORCE_CURRENT_THREAD=1）");
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(Into::into);
+    }
+
+    let worker_threads = resolve_indextree_rt_threads();
+    println!("⚙️ 使用多线程 runtime（worker_threads={}）", worker_threads);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .map_err(Into::into)
+}
+
 /// 生成所有 DESI 类型的 indextree 文件
-pub fn generate_desi_indextree() -> anyhow::Result<()> {
+pub fn generate_desi_indextree(ignore_manual_dbnum: bool) -> anyhow::Result<()> {
     use crate::versioned_db::database::sync_total_async_threaded;
     use aios_core::options::DbOption;
     use dashmap::DashSet;
@@ -324,6 +366,10 @@ pub fn generate_desi_indextree() -> anyhow::Result<()> {
     db_option.total_sync = true;
     db_option.save_db = Some(false);
 
+    if ignore_manual_dbnum {
+        db_option.manual_db_nums = None;
+    }
+
     let project_name = db_option.project_name.clone();
     println!("🔄 正在生成 DESI 类型 indextree (项目: {})...", project_name);
 
@@ -344,9 +390,7 @@ pub fn generate_desi_indextree() -> anyhow::Result<()> {
             })
         }
         Err(_) => {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
+            let rt = build_indextree_runtime()?;
             rt.block_on(async {
                 let cur_dbno_set = Arc::new(DashSet::new());
                 sync_total_async_threaded(
@@ -427,9 +471,7 @@ pub fn generate_single_indextree(target_dbnum: u32) -> anyhow::Result<()> {
             })
         }
         Err(_) => {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
+            let rt = build_indextree_runtime()?;
             rt.block_on(async {
                 crate::versioned_db::database::parse_single_db_file(
                     &db_option, &project_name, &file_path, target_dbnum,

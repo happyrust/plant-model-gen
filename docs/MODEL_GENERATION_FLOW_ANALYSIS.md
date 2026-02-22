@@ -10,7 +10,7 @@
 
 这是模型生成的主入口函数，根据配置路由到不同的生成策略：
 
-1. **Full Noun 模式** (`process_full_noun_mode`)
+1. **Index Tree 模式** (`process_index_tree_mode`)
 2. **增量/手动/调试模式** (`process_targeted_generation`)
 3. **全量数据库生成** (`process_full_database_generation`)
 
@@ -29,7 +29,7 @@ if db_option.use_surrealdb {
 
 模型生成采用**生产者-消费者模式**：
 
-- **生产者**：`gen_full_noun_geos_optimized` 或 `gen_geos_data` 生成 `ShapeInstancesData`
+- **生产者**：`gen_index_tree_geos_optimized` 或 `gen_geos_data` 生成 `ShapeInstancesData`
 - **通道**：通过 `flume::unbounded` channel 异步传递数据
 - **消费者**：独立的异步任务接收数据并写回数据库
 

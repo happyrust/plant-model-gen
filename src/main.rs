@@ -392,6 +392,12 @@ async fn main() -> anyhow::Result<()> {
                 .num_args(0..=1),
         )
         .arg(
+            Arg::new("gen-all-desi-indextree")
+                .long("gen-all-desi-indextree")
+                .help("强制生成所有 DESI 类型的 indextree 文件（绕过配置文件中的 manual_db_nums 限制）")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("capture")
                 .long("capture")
                 .help("After model generation, export OBJ and capture screenshots (optionally provide output directory)")
@@ -1141,6 +1147,14 @@ async fn main() -> anyhow::Result<()> {
         aios_database::init_logging(true);
     }
 
+    // ========== 处理 --gen-all-desi-indextree 参数 ==========
+    if matches.get_flag("gen-all-desi-indextree") {
+        println!("🔄 生成所有 DESI 类型的 indextree (忽略 manual_db_nums)...");
+        aios_database::data_interface::db_meta_manager::generate_desi_indextree(true)?;
+        println!("✅ indextree 生成完成");
+        return Ok(());
+    }
+
     // ========== 处理 --gen-indextree 参数 ==========
     if matches.contains_id("gen-indextree") {
         let dbnum: Option<u32> = matches
@@ -1152,7 +1166,7 @@ async fn main() -> anyhow::Result<()> {
             aios_database::data_interface::db_meta_manager::generate_single_indextree(dbnum)?;
         } else {
             println!("🔄 生成所有 DESI 类型的 indextree...");
-            aios_database::data_interface::db_meta_manager::generate_desi_indextree()?;
+            aios_database::data_interface::db_meta_manager::generate_desi_indextree(false)?;
         }
         println!("✅ indextree 生成完成");
         return Ok(());

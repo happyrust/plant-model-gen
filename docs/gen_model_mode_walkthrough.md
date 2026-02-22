@@ -1,6 +1,6 @@
-# Full Noun 模式：模型生成流程分析与总结
+# Index Tree 模式：模型生成流程分析与总结
 
-在当前架构中，模型生成流程完全重构并进入了“Full Noun 优先”的高度模块化与并行阶段。整个流程可以通过入口 `orchestrator.rs` 追踪至核心管线 `full_noun_mode.rs`，包含了细粒度的预处理、预取缓存和基于分阶段的几何模型并行生成机制。
+在当前架构中，模型生成流程完全重构并进入了“Index Tree 优先”的高度模块化与并行阶段。整个流程可以通过入口 `orchestrator.rs` 追踪至核心管线 `index_tree_mode.rs`，包含了细粒度的预处理、预取缓存和基于分阶段的几何模型并行生成机制。
 
 以下是当前模型生成流程的核心执行步骤：
 
@@ -12,8 +12,8 @@
    - 检查各个数据库是否已存在由 PDMS 原始数据转化的 `Tree 索引文件` (`.tree`)。若缺失则当场触发全量同步拉取，生成所需的树形信息结构。
    - 检测本地变换缓存 `transform_cache`（foyer 本地缓存位置），确保基础路径环境就绪。
 
-## 二、 核心生成流水线 (Gen Full Noun Geos Optimized)
-预检查完成后进入了 `gen_full_noun_geos_optimized` 方法。
+## 二、 核心生成流水线 (Gen Index Tree Geos Optimized)
+预检查完成后进入了 `gen_index_tree_geos_optimized` 方法。
 这个核心管线的设计原则是：**分类处理、严格依赖排序（BRAN优先 -> LOOP -> PRIM -> CATE）、利用流式并发或两阶段高速缓存。**
 
 ### 1. 阶段一：BRAN/HANG 核心管线 (Pipeline Phase 1)

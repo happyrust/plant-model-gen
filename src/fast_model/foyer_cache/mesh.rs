@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use aios_core::geometry::csg::{CsgDebugContext, generate_csg_mesh, with_csg_debug_context};
+use aios_core::geometry::csg::generate_csg_mesh;
 use aios_core::mesh_precision::MeshPrecisionSettings;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 
@@ -143,20 +143,13 @@ pub async fn run_mesh_worker_from_cache_manager(
             geo_param
         };
 
-        let csg_debug_ctx = CsgDebugContext::new(
-            Some(mesh_id.clone()),
-            Some(geo_type_name.to_string()),
+        match generate_csg_mesh(
+            &geo_param_for_mesh,
+            &lod_settings,
+            non_scalable_geo,
+            false,
             refno_for_log,
-        );
-        match with_csg_debug_context(csg_debug_ctx, || {
-            generate_csg_mesh(
-                &geo_param_for_mesh,
-                &lod_settings,
-                non_scalable_geo,
-                false,
-                refno_for_log,
-            )
-        }) {
+        ) {
             Some(csg_mesh) => {
                 let mesh_base_path = lod_dir.join(&mesh_filename);
                 let glb_path = mesh_base_path.with_extension("glb");

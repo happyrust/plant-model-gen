@@ -16,7 +16,7 @@ use crate::options::{DbOptionExt, MeshFormat};
 use crate::{batch_update_err, db_err, deser_err, log_err, query_err};
 use aios_core::accel_tree::acceleration_tree::RStarBoundingBox;
 use aios_core::error::{init_deserialize_error, init_query_error, init_save_database_error};
-use aios_core::geometry::csg::{CsgDebugContext, GeneratedMesh, generate_csg_mesh, with_csg_debug_context};
+use aios_core::geometry::csg::{GeneratedMesh, generate_csg_mesh};
 use aios_core::mesh_precision::MeshPrecisionSettings;
 use aios_core::options::DbOption;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
@@ -974,14 +974,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
             g.param.clone()
         };
 
-        let csg_debug_ctx = CsgDebugContext::new(
-            Some(mesh_id.clone()),
-            Some(geo_type_name.to_string()),
-            None,
-        );
-        match with_csg_debug_context(csg_debug_ctx, || {
-            generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None)
-        }) {
+        match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
             Some(csg_mesh) => {
                 if let Err(e) = handle_csg_mesh(
                     &lod_dir,
@@ -1177,20 +1170,13 @@ pub async fn gen_inst_meshes(
 
                         let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
 
-                        let csg_debug_ctx = CsgDebugContext::new(
-                            Some(mesh_id.clone()),
-                            Some(geo_type_name.to_string()),
+                        match generate_csg_mesh(
+                            &g.param,
+                            &lod_settings,
+                            non_scalable_geo,
+                            false,
                             refno_for_mesh,
-                        );
-                        match with_csg_debug_context(csg_debug_ctx, || {
-                            generate_csg_mesh(
-                                &g.param,
-                                &lod_settings,
-                                non_scalable_geo,
-                                false,
-                                refno_for_mesh,
-                            )
-                        }) {
+                        ) {
                             Some(csg_mesh) => {
                                 if let Err(e) = handle_csg_mesh(
                                     &dir,

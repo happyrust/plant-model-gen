@@ -101,7 +101,6 @@ pub(crate) async fn split_shape_instances_by_dbnum(
             return Ok(*v);
         }
         let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno)
-            .await
             .map_err(|e| anyhow::anyhow!("缺少 ref0->dbnum 映射: refno={refno}, err={e}"))?;
         cache.insert(refno, dbnum);
         Ok(dbnum)
@@ -412,14 +411,11 @@ pub async fn gen_all_geos_data(
         );
 
         if !matches!(cache_run_mode, geom_input_cache::CacheRunMode::Direct) {
-            if let Err(e) = geom_input_cache::init_global_geom_input_cache(db_option).await {
-                eprintln!("[gen_model] ⚠️  初始化 geom_input_cache 失败: {}", e);
-            } else {
-                println!(
-                    "[gen_model] geom_input_cache 已初始化 (mode={})",
-                    cache_run_mode.as_str()
-                );
-            }
+            geom_input_cache::init_global_geom_input_cache();
+            println!(
+                "[gen_model] geom_input_cache 已初始化 (mode={})",
+                cache_run_mode.as_str()
+            );
         }
     }
 
@@ -521,12 +517,9 @@ async fn filter_bran_hang_refnos(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
 
         }
 
-        let dbnum = match TreeIndexManager::resolve_dbnum_for_refno(r).await {
-
+        let dbnum = match TreeIndexManager::resolve_dbnum_for_refno(r) {
             Ok(v) => v,
-
             Err(_) => continue,
-
         };
 
         let manager = TreeIndexManager::with_default_dir(vec![dbnum]);

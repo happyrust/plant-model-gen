@@ -2050,7 +2050,6 @@ async fn ensure_cache_refnos_ready_for_parquet(
     override_opt.use_surrealdb = true; // 仅作为输入读取，不写 inst_*。
     override_opt.inner.save_db = Some(false);
     override_opt.export_instances = false;
-    override_opt.full_noun_mode = false;
     override_opt.inner.gen_mesh = true;
     override_opt.inner.replace_mesh = Some(false); // 仅补齐缺失，避免全量覆盖
 

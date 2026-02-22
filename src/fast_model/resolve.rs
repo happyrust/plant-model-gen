@@ -187,9 +187,9 @@ pub async fn resolve_desi_comp(
     debug_model_trace!("scom_ref: {:?}", &scom_ref);
     let scom_info = get_or_create_scom_info(scom_ref).await?;
     debug_model_trace!("scom_info: {:?}", &scom_info);
-    let mut context = aios_core::create_cata_context_with_att(
-        desi_refno, desi_att, scom_ref, &scom_info.attr_map, is_tubi,
-    ).await.unwrap();
+    let mut context = aios_core::rs_surreal::resolve::get_or_create_cata_context(
+        desi_refno, is_tubi,
+    ).await?;
 
     // 🔍 调试：打印 DESI 的 DESP 数据（复用已有的 desi_att，避免重复 I/O）
     {

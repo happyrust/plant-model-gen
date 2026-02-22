@@ -29,29 +29,14 @@ impl FoyerCacheContext {
     /// - 若 `db_option.use_cache=false`，请使用 [`Self::try_from_db_option`]。
     /// - 该函数会尽力预初始化 `transform_cache`（失败仅降级，不阻断）。
     pub async fn from_db_option(db_option: &DbOptionExt) -> anyhow::Result<Self> {
-        // foyer transform_cache：模型生成阶段统一走 cache-first 获取 world_transform。
-        // 这里只做一次初始化（创建目录 + 初始化 HybridCache）；失败则退化为按需计算。
-        if let Err(e) = crate::fast_model::transform_cache::init_global_transform_cache(db_option).await {
-            eprintln!(
-                "[foyer_cache] ⚠️  初始化 transform_cache 失败（将退化为按需计算）: {}",
-                e
-            );
-        }
+        // 纯内存 transform_cache：模型生成阶段统一走 cache-first 获取 world_transform。
+        crate::fast_model::transform_cache::init_global_transform_cache();
 
         let cache_dir = db_option.get_foyer_cache_dir();
         let cache = Arc::new(InstanceCacheManager::new(&cache_dir).await?);
 
         // 初始化 geom_input_cache（LOOP/PRIM 输入缓存）
-        let geom_input_cache = match GeomInputCacheManager::new(&cache_dir.join("geom_input_cache")).await {
-            Ok(mgr) => Some(Arc::new(mgr)),
-            Err(e) => {
-                eprintln!(
-                    "[foyer_cache] ⚠️  初始化 geom_input_cache 失败（将退化为直接查询）: {}",
-                    e
-                );
-                None
-            }
-        };
+        let geom_input_cache = Some(Arc::new(GeomInputCacheManager::new()));
 
         Ok(Self { cache_dir, cache, geom_input_cache })
     }
@@ -71,10 +56,7 @@ impl FoyerCacheContext {
     pub async fn from_cache_dir(cache_dir: impl AsRef<Path>) -> anyhow::Result<Self> {
         let cache_dir = cache_dir.as_ref().to_path_buf();
         let cache = Arc::new(InstanceCacheManager::new(&cache_dir).await?);
-        let geom_input_cache = GeomInputCacheManager::new(&cache_dir.join("geom_input_cache"))
-            .await
-            .ok()
-            .map(Arc::new);
+        let geom_input_cache = Some(Arc::new(GeomInputCacheManager::new()));
         Ok(Self { cache_dir, cache, geom_input_cache })
     }
 

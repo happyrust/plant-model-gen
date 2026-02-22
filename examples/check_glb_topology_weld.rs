@@ -27,7 +27,11 @@ fn main() {
     let mesh = import_glb_to_mesh(Path::new(&path)).unwrap();
     println!("几何体: {path}");
     println!("  eps: {eps:.3e}");
-    println!("  raw: verts={} tris={}", mesh.vertices.len(), mesh.indices.len() / 3);
+    println!(
+        "  raw: verts={} tris={}",
+        mesh.vertices.len(),
+        mesh.indices.len() / 3
+    );
 
     // 量化焊接：顶点 -> canonical index
     let mut map: HashMap<QKey, u32> = HashMap::new();
@@ -96,4 +100,3 @@ fn main() {
     println!("    - count=2 (manifold): {}", e2);
     println!("    - count>2 (non-manifold): {}", e_gt2);
 }
-

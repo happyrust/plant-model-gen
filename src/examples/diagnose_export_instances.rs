@@ -8,4 +8,3 @@
 fn main() {
     println!("diagnose_export_instances: placeholder (no-op)");
 }
-

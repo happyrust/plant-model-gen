@@ -37,7 +37,7 @@ async fn load_tree_index_for_refno(refno: RefnoEnum) -> anyhow::Result<Arc<TreeI
     let tree_dir = TreeIndexManager::with_default_dir(Vec::new())
         .tree_dir()
         .to_path_buf();
-    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno).await?;
+    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno)?;
 
     // 方案乙：按需生成缺失的 `{dbnum}.tree`（避免 tree 缺失导致查询直接失败/返回空）。
     ensure_tree_index_exists(dbnum, &tree_dir).await?;

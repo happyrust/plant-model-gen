@@ -463,6 +463,14 @@ pub async fn run_boolean_worker_from_cache_manager(
     cache_manager: &InstanceCacheManager,
     filter_refnos: Option<&HashSet<RefnoEnum>>,
 ) -> anyhow::Result<usize> {
+    fn is_source_level_manifold_error(err: &anyhow::Error) -> bool {
+        let msg = err.to_string();
+        msg.contains("Manifold mesh 为空")
+            || msg.contains("No such file or directory")
+            || msg.contains("系统找不到指定的文件")
+            || msg.contains("(os error 2)")
+    }
+
     fn aabb_contains(
         outer: &parry3d::bounding_volume::Aabb,
         inner: &parry3d::bounding_volume::Aabb,
@@ -582,33 +590,41 @@ pub async fn run_boolean_worker_from_cache_manager(
         return Ok(0);
     }
 
+    // ── 阶段 1：从“布尔目标索引”收集目标（不做全量扫描，不加载 inst_geos） ──
     let mut inst_info_map: HashMap<RefnoEnum, EleGeosInfo> = HashMap::new();
-    let mut inst_geos_map: HashMap<String, EleInstGeosData> = HashMap::new();
     let mut neg_relate_map: HashMap<RefnoEnum, Vec<RefnoEnum>> = HashMap::new();
     let mut ngmr_relate_map: HashMap<RefnoEnum, Vec<(RefnoEnum, RefnoEnum)>> = HashMap::new();
-    // 记录每个 target(refno) 属于哪个 dbnum，用于回写 inst_relate_bool 到 instance_cache。
     let mut target_locations: HashMap<RefnoEnum, u32> = HashMap::new();
-    // 元件库（CATE）布尔：以 inst_info.has_cata_neg 为准补齐 targets（CataNeg 不经 neg_relate_map 指向）。
     let mut cata_targets: HashSet<RefnoEnum> = HashSet::new();
+    // 记录每个 refno 的 inst_key，阶段 2 按需加载 geos
+    let mut refno_inst_keys: HashMap<RefnoEnum, String> = HashMap::new();
+    let mut indexed_targets = 0usize;
 
-    for dbnum in dbnums {
-        let refnos = cache_manager.list_refnos(dbnum);
+    for dbnum in &dbnums {
+        let refnos = cache_manager.list_boolean_targets(*dbnum);
+        indexed_targets += refnos.len();
         for refno in refnos {
-            let Some(cached) = cache_manager.get_inst_info(dbnum, refno).await else {
+            let Some(cached) = cache_manager.get_inst_info(*dbnum, refno).await else {
                 continue;
             };
 
+            target_locations.entry(refno).or_insert(*dbnum);
             if cached.info.has_cata_neg {
                 cata_targets.insert(refno);
-                target_locations.entry(refno).or_insert(dbnum);
             }
             if !cached.neg_relates.is_empty() {
-                target_locations.entry(refno).or_insert(dbnum);
+                for carrier in &cached.neg_relates {
+                    target_locations.entry(*carrier).or_insert(*dbnum);
+                }
             }
             if !cached.ngmr_neg_relates.is_empty() {
-                target_locations.entry(refno).or_insert(dbnum);
+                for (carrier, ngmr_geom_refno) in &cached.ngmr_neg_relates {
+                    target_locations.entry(*carrier).or_insert(*dbnum);
+                    target_locations.entry(*ngmr_geom_refno).or_insert(*dbnum);
+                }
             }
 
+            refno_inst_keys.insert(refno, cached.inst_key);
             inst_info_map.entry(refno).or_insert(cached.info);
             if !cached.neg_relates.is_empty() {
                 neg_relate_map.entry(refno).or_insert(cached.neg_relates);
@@ -616,22 +632,16 @@ pub async fn run_boolean_worker_from_cache_manager(
             if !cached.ngmr_neg_relates.is_empty() {
                 ngmr_relate_map.entry(refno).or_insert(cached.ngmr_neg_relates);
             }
-
-            // geos 按 inst_key 去重
-            let inst_key = cached.inst_key;
-            if !inst_geos_map.contains_key(&inst_key) {
-                if let Some(geos) = cache_manager.get_inst_geos(dbnum, &inst_key).await {
-                    inst_geos_map.insert(inst_key, geos.geos_data);
-                }
-            }
         }
     }
 
-    let mut processed = 0usize;
-    // 目标集合：
-    // - 元件库（CATE）负实体：以 inst_info.has_cata_neg 为准；
-    // - 设计型负实体：以 neg_relate/ngmr_relate 的 key 为准；
-    // 同时过滤掉“看起来像 refno 但实际上是 geom_refno”的 key（即 inst_info_map 中不存在者）。
+    if indexed_targets == 0 {
+        println!(
+            "[boolean_worker_cache] 布尔运算完成: 0 个（无布尔目标索引，跳过）"
+        );
+        return Ok(0);
+    }
+
     let mut targets: HashSet<RefnoEnum> = HashSet::new();
     targets.extend(cata_targets.iter().copied());
     targets.extend(
@@ -647,7 +657,6 @@ pub async fn run_boolean_worker_from_cache_manager(
             .filter(|r| inst_info_map.contains_key(r)),
     );
 
-    // 如果指定了过滤集合，只处理该集合内的 refno（用于 debug_model 模式）
     if let Some(filter_set) = filter_refnos {
         let before_count = targets.len();
         targets.retain(|r| filter_set.contains(r));
@@ -660,7 +669,104 @@ pub async fn run_boolean_worker_from_cache_manager(
         }
     }
 
+    if targets.is_empty() {
+        println!("[boolean_worker_cache] 布尔运算完成: 0 个（无布尔目标，跳过 geos 加载）");
+        return Ok(0);
+    }
+    let total_targets = targets.len();
+
+    // ── 阶段 2：仅为有布尔目标的 refno 加载 inst_geos ──
+    let mut inst_geos_map: HashMap<String, EleInstGeosData> = HashMap::new();
+    // 收集所有需要的 inst_key（targets + 它们的 neg_relate 引用的 refno）
+    let mut needed_refnos: HashSet<RefnoEnum> = targets.clone();
+    for refno in &targets {
+        if let Some(negs) = neg_relate_map.get(refno) {
+            needed_refnos.extend(negs.iter().copied());
+        }
+        if let Some(ngmrs) = ngmr_relate_map.get(refno) {
+            for (a, b) in ngmrs {
+                needed_refnos.insert(*a);
+                needed_refnos.insert(*b);
+            }
+        }
+    }
+    for refno in &needed_refnos {
+        let Some(inst_key) = refno_inst_keys.get(refno) else {
+            continue;
+        };
+        if inst_geos_map.contains_key(inst_key) {
+            continue;
+        }
+        let dbnum = target_locations.get(refno).copied()
+            .or_else(|| dbnums.first().copied())
+            .unwrap_or(0);
+        if let Some(geos) = cache_manager.get_inst_geos(dbnum, inst_key).await {
+            inst_geos_map.insert(inst_key.clone(), geos.geos_data);
+        }
+    }
+
+    let mut processed = 0usize;
+    let heartbeat_secs = std::env::var("AIOS_BOOL_PROGRESS_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(15);
+    let bool_start = std::time::Instant::now();
+    let mut last_heartbeat = bool_start;
+    println!(
+        "[boolean_worker_cache] 布尔任务开始: targets={}, heartbeat={}s",
+        total_targets, heartbeat_secs
+    );
+    // 缓存“源级失败”的 geo_hash（文件缺失/导入后空网格），避免在不同 refno 上重复高成本重试。
+    let mut source_failed_geo_hashes: HashMap<u64, String> = HashMap::new();
+    let mut source_failed_geo_hashes_warned: HashSet<u64> = HashSet::new();
+
+    let mut try_load_manifold = |scene: &str,
+                                 refno: RefnoEnum,
+                                 geo_param: &PdmsGeoParam,
+                                 geo_hash: u64,
+                                 mat: DMat4,
+                                 more_precision: bool|
+     -> Option<ManifoldRust> {
+        if let Some(cached_reason) = source_failed_geo_hashes.get(&geo_hash) {
+            if source_failed_geo_hashes_warned.insert(geo_hash) {
+                eprintln!(
+                    "[bool][{}] 跳过已知失败几何: refno={} mesh_id={} reason={}",
+                    scene, refno, geo_hash, cached_reason
+                );
+            }
+            return None;
+        }
+
+        match load_or_generate_manifold_glb(geo_param, geo_hash, mat, more_precision) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                if is_source_level_manifold_error(&e) {
+                    source_failed_geo_hashes.insert(geo_hash, e.to_string());
+                }
+                log_load_manifold_failed(scene, refno, &geo_hash.to_string(), &e);
+                None
+            }
+        }
+    };
+
+    let mut maybe_heartbeat = |refno: RefnoEnum, stage: &str, processed_now: usize| {
+        let now = std::time::Instant::now();
+        if now.duration_since(last_heartbeat).as_secs() >= heartbeat_secs {
+            println!(
+                "[boolean_worker_cache] 心跳: processed={}/{} current_refno={} stage={} elapsed={}s",
+                processed_now,
+                total_targets,
+                refno,
+                stage,
+                bool_start.elapsed().as_secs()
+            );
+            last_heartbeat = now;
+        }
+    };
+
     for refno in targets {
+        maybe_heartbeat(refno, "target_start", processed);
         let Some(info) = inst_info_map.get(&refno) else {
             continue;
         };
@@ -714,9 +820,11 @@ pub async fn run_boolean_worker_from_cache_manager(
                 mat_local.w_axis.x, mat_local.w_axis.y, mat_local.w_axis.z,
                 mat_local.x_axis.length(), mat_local.y_axis.length(), mat_local.z_axis.length()
             );
-            match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, mat, false) {
-                Ok(m) => pos_manifolds.push(m),
-                Err(e) => log_load_manifold_failed("cache_pos", refno, &inst.geo_hash.to_string(), &e),
+            maybe_heartbeat(refno, "cache_pos", processed);
+            if let Some(m) =
+                try_load_manifold("cache_pos", refno, &inst.geo_param, inst.geo_hash, mat, false)
+            {
+                pos_manifolds.push(m);
             }
         }
         if pos_manifolds.is_empty() {
@@ -758,9 +866,16 @@ pub async fn run_boolean_worker_from_cache_manager(
                 } else {
                     mat_local
                 };
-                match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, mat, true) {
-                    Ok(m) => neg_manifolds.push(m),
-                    Err(e) => log_load_manifold_failed("cache_cata_neg", refno, &inst.geo_hash.to_string(), &e),
+                maybe_heartbeat(refno, "cache_cata_neg", processed);
+                if let Some(m) = try_load_manifold(
+                    "cache_cata_neg",
+                    refno,
+                    &inst.geo_param,
+                    inst.geo_hash,
+                    mat,
+                    true,
+                ) {
+                    neg_manifolds.push(m);
                 }
             }
         }
@@ -796,9 +911,16 @@ pub async fn run_boolean_worker_from_cache_manager(
                     } else {
                         inverse_pos_geo_local * inverse_pos_world * neg_world_mat
                     };
-                    match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, mat, true) {
-                        Ok(m) => neg_manifolds.push(m),
-                        Err(e) => log_load_manifold_failed("cache_neg", refno, &inst.geo_hash.to_string(), &e),
+                    maybe_heartbeat(refno, "cache_neg", processed);
+                    if let Some(m) = try_load_manifold(
+                        "cache_neg",
+                        refno,
+                        &inst.geo_param,
+                        inst.geo_hash,
+                        mat,
+                        true,
+                    ) {
+                        neg_manifolds.push(m);
                     }
                 }
             }
@@ -891,31 +1013,36 @@ pub async fn run_boolean_worker_from_cache_manager(
                             mat.w_axis.z
                         );
                     }
-                    match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, mat, true) {
-                        Ok(m) => {
-                            if debug_this {
-                                if let Some(aabb) = m.get_mesh().cal_aabb() {
-                                    eprintln!(
-                                        "[bool][cache][dbg]   ngmr manifold_aabb: {}",
-                                        fmt_aabb(&aabb)
-                                    );
-                                }
+                    maybe_heartbeat(refno, "cache_ngmr", processed);
+                    if let Some(m) = try_load_manifold(
+                        "cache_ngmr",
+                        refno,
+                        &inst.geo_param,
+                        inst.geo_hash,
+                        mat,
+                        true,
+                    ) {
+                        if debug_this {
+                            if let Some(aabb) = m.get_mesh().cal_aabb() {
+                                eprintln!(
+                                    "[bool][cache][dbg]   ngmr manifold_aabb: {}",
+                                    fmt_aabb(&aabb)
+                                );
                             }
-                            if debug_dump {
-                                let mut path = PathBuf::from("test_output/cache_bool_debug");
-                                let _ = fs::create_dir_all(&path);
-                                path.push(format!(
-                                    "{}_ngmr_{}_{}.glb",
-                                    refno.to_string(),
-                                    carrier_refno.to_string(),
-                                    inst.refno.to_string()
-                                ));
-                                let mesh = manifold_to_normal_mesh(m.get_mesh());
-                                let _ = export_single_mesh_to_glb(&mesh, &path);
-                            }
-                            neg_manifolds.push(m)
                         }
-                        Err(e) => log_load_manifold_failed("cache_ngmr", refno, &inst.geo_hash.to_string(), &e),
+                        if debug_dump {
+                            let mut path = PathBuf::from("test_output/cache_bool_debug");
+                            let _ = fs::create_dir_all(&path);
+                            path.push(format!(
+                                "{}_ngmr_{}_{}.glb",
+                                refno.to_string(),
+                                carrier_refno.to_string(),
+                                inst.refno.to_string()
+                            ));
+                            let mesh = manifold_to_normal_mesh(m.get_mesh());
+                            let _ = export_single_mesh_to_glb(&mesh, &path);
+                        }
+                        neg_manifolds.push(m);
                     }
                 }
             }
@@ -990,9 +1117,16 @@ pub async fn run_boolean_worker_from_cache_manager(
                     continue;
                 }
                 let mat = local_mat_for_inst(inst);
-                match load_or_generate_manifold_glb(&inst.geo_param, inst.geo_hash, mat, true) {
-                    Ok(m) => pos_hi.push(m),
-                    Err(e) => log_load_manifold_failed("cache_pos_hi", refno, &inst.geo_hash.to_string(), &e),
+                maybe_heartbeat(refno, "cache_pos_hi", processed);
+                if let Some(m) = try_load_manifold(
+                    "cache_pos_hi",
+                    refno,
+                    &inst.geo_param,
+                    inst.geo_hash,
+                    mat,
+                    true,
+                ) {
+                    pos_hi.push(m);
                 }
             }
             if !pos_hi.is_empty() {

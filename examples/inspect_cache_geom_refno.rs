@@ -8,8 +8,8 @@
 //!   $env:CACHE_DIR="output/instance_cache"
 //!   cargo run --example inspect_cache_geom_refno
 
-use anyhow::{Context, Result};
 use aios_core::RefnoEnum;
+use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
@@ -49,8 +49,11 @@ async fn main() -> Result<()> {
     let want_u64 = refno.refno();
 
     // 选择“最新”的命中 batch（按 created_at），避免误读旧缓存。
-    let mut best: Option<(String, i64, aios_database::fast_model::instance_cache::CachedInstanceBatch)> =
-        None;
+    let mut best: Option<(
+        String,
+        i64,
+        aios_database::fast_model::instance_cache::CachedInstanceBatch,
+    )> = None;
 
     // 汇总所有 batch 中的关系（便于确认“关系缺失” vs “仅最新 batch 丢失/覆盖”）
     let mut all_neg_carriers: HashSet<RefnoEnum> = HashSet::new();
@@ -107,7 +110,10 @@ async fn main() -> Result<()> {
         .values()
         .find(|g| g.refno.refno() == want_u64 && !g.insts.is_empty());
 
-    println!("\n== latest hit batch_id={} created_at={} ==", batch_id, batch.created_at);
+    println!(
+        "\n== latest hit batch_id={} created_at={} ==",
+        batch_id, batch.created_at
+    );
     println!(
         "== all batches relation summary ==\n  - neg carriers: {}\n  - ngmr pairs: {}",
         all_neg_carriers.len(),
@@ -135,7 +141,10 @@ async fn main() -> Result<()> {
         Some(v) => {
             println!("ngmr_neg_relate_map[target={}] pairs={}", refno, v.len());
             for (i, (carrier, geom_refno)) in v.iter().enumerate() {
-                println!("  - ngmr_pair[{}] carrier={} geom_refno={}", i, carrier, geom_refno);
+                println!(
+                    "  - ngmr_pair[{}] carrier={} geom_refno={}",
+                    i, carrier, geom_refno
+                );
             }
         }
         None => println!("ngmr_neg_relate_map[target={}] pairs=<none>", refno),
@@ -210,9 +219,7 @@ async fn main() -> Result<()> {
             println!("    geo_transform: {:?}", inst.geo_transform);
             println!(
                 "    scale: [{:.6}, {:.6}, {:.6}]",
-                inst.geo_transform.scale.x,
-                inst.geo_transform.scale.y,
-                inst.geo_transform.scale.z
+                inst.geo_transform.scale.x, inst.geo_transform.scale.y, inst.geo_transform.scale.z
             );
             println!(
                 "    translation: [{:.3}, {:.3}, {:.3}]",

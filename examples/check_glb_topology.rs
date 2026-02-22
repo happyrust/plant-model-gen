@@ -117,7 +117,9 @@ fn main() {
             center += v;
         }
         center /= mesh.vertices.len() as f32;
-        println!("  center approx: ({:.3},{:.3},{:.3})", center.x, center.y, center.z);
+        println!(
+            "  center approx: ({:.3},{:.3},{:.3})",
+            center.x, center.y, center.z
+        );
     }
 }
-

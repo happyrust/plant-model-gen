@@ -233,6 +233,135 @@ struct BranchCacheMeta {
     is_hang: bool,
 }
 
+/// tubi_size + branch_meta 预取结果（可在阶段4之前 spawn，与 CATE 生成并行）
+#[derive(Clone, Debug)]
+pub struct BranchPrefetchResult {
+    pub tubi_size_cache: Arc<DashMap<RefnoEnum, TubiSize>>,
+    pub branch_meta_cache: Arc<DashMap<RefnoEnum, BranchMetaPrefetched>>,
+}
+
+/// 单个 branch 的预取元数据
+#[derive(Clone, Debug)]
+pub struct BranchMetaPrefetched {
+    pub h_tubi_size: TubiSize,
+    pub bran_owner_type: String,
+}
+
+/// 独立预取 tubi_size + branch_meta（可在 CATE 生成之前 spawn 并行）
+///
+/// - `all_child_refnos`: branch_map 中所有子元件 refno（去重后）
+/// - `branch_refnos`: 所有 BRAN/HANG 根 refno
+pub async fn prefetch_tubi_size_and_branch_meta(
+    all_child_refnos: &[RefnoEnum],
+    branch_refnos: &[RefnoEnum],
+) -> anyhow::Result<BranchPrefetchResult> {
+    let t_start = Instant::now();
+    let sem = Arc::new(Semaphore::new(12));
+
+    // ── 阶段1: LSTU→CATR 过滤 ──
+    let cat_ref_cache: Arc<DashMap<RefnoEnum, RefnoEnum>> = Arc::new(DashMap::new());
+    {
+        let mut handles = Vec::new();
+        for &refno in all_child_refnos {
+            let sem = sem.clone();
+            let cat_ref_cache = cat_ref_cache.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let lstube_cat_ref = aios_core::query_single_by_paths(
+                    refno,
+                    &["->LSTU->CATR"],
+                    &["REFNO"],
+                )
+                .await
+                .map(|x| x.get_refno_or_default())
+                .unwrap_or_default();
+                if lstube_cat_ref.is_valid() {
+                    cat_ref_cache.insert(refno, lstube_cat_ref);
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+    }
+
+    let p6_valid = cat_ref_cache.len();
+    let p6_skip = all_child_refnos.len() - p6_valid;
+    let phase1_ms = t_start.elapsed().as_millis();
+
+    // ── 阶段2: query_tubi_size（重量） ──
+    let t_phase2 = Instant::now();
+    let tubi_size_cache: Arc<DashMap<RefnoEnum, TubiSize>> = Arc::new(DashMap::new());
+    {
+        let mut handles = Vec::new();
+        for item in cat_ref_cache.iter() {
+            let refno = *item.key();
+            let lstube_cat_ref = *item.value();
+            let sem = sem.clone();
+            let cache = tubi_size_cache.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let tubi_size = fast_model::query_tubi_size(refno, lstube_cat_ref, false)
+                    .await
+                    .unwrap_or(TubiSize::None);
+                if !matches!(tubi_size, TubiSize::None) {
+                    cache.insert(refno, tubi_size);
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+    }
+    let phase2_ms = t_phase2.elapsed().as_millis();
+
+    // ── 阶段3: branch_meta 预取 ──
+    let t_bm = Instant::now();
+    let branch_meta_cache: Arc<DashMap<RefnoEnum, BranchMetaPrefetched>> = Arc::new(DashMap::new());
+    {
+        let mut handles = Vec::new();
+        for &branch_refno in branch_refnos {
+            let sem = sem.clone();
+            let cache = branch_meta_cache.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let Ok(branch_att) = aios_core::get_named_attmap(branch_refno).await else {
+                    return;
+                };
+                let is_hang = branch_att.get_type_str() == "HANG";
+                let h_ref = branch_att
+                    .get_foreign_refno(if is_hang { "HREF" } else { "HSTU" })
+                    .unwrap_or_default();
+                let tubi_att = aios_core::get_named_attmap(h_ref).await.unwrap_or_default();
+                let tubi_cat_ref = tubi_att.get_foreign_refno("CATR").unwrap_or_default();
+                let h_tubi_size = fast_model::query_tubi_size(branch_refno, tubi_cat_ref, is_hang)
+                    .await
+                    .unwrap_or(TubiSize::None);
+                let bran_owner_type = aios_core::get_type_name(branch_att.get_owner())
+                    .await
+                    .unwrap_or_default();
+                cache.insert(branch_refno, BranchMetaPrefetched { h_tubi_size, bran_owner_type });
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+    }
+    let bm_ms = t_bm.elapsed().as_millis();
+
+    println!(
+        "    [BRAN_TUBI] 独立预取完成: children={}, tubi_valid={}/{}, branch_meta={}/{}, elapsed={}ms (phase1={}ms, phase2={}ms, bm={}ms)",
+        all_child_refnos.len(), tubi_size_cache.len(), p6_valid,
+        branch_meta_cache.len(), branch_refnos.len(),
+        t_start.elapsed().as_millis(), phase1_ms, phase2_ms, bm_ms
+    );
+
+    Ok(BranchPrefetchResult {
+        tubi_size_cache,
+        branch_meta_cache,
+    })
+}
+
 #[derive(Debug, Serialize)]
 struct BranchTubiMissReasonStat {
     count: usize,
@@ -492,6 +621,7 @@ pub async fn gen_cata_geos(
         true,
         true,
         BranchTubiMode::DbFallback,
+        None,
     )
     .await
     .map(|_| true)
@@ -515,6 +645,7 @@ pub async fn gen_cata_instances(
         true,
         false,
         BranchTubiMode::DbFallback,
+        None,
     )
     .await?
     .cate
@@ -540,6 +671,32 @@ pub async fn gen_branch_tubi(
     .await
 }
 
+/// BRAN/HANG tubing（DB fallback 模式，可接受外部预取结果）
+pub async fn gen_branch_tubi_from_db_with_prefetch(
+    db_option: Arc<DbOptionExt>,
+    branch_map: Arc<DashMap<RefnoEnum, Vec<SPdmsElement>>>,
+    sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
+    sender: flume::Sender<ShapeInstancesData>,
+    local_al_map: Arc<DashMap<RefnoEnum, [CateAxisParam; 2]>>,
+    prefetch: Option<BranchPrefetchResult>,
+) -> anyhow::Result<BranchTubiOutcome> {
+    gen_cata_geos_inner(
+        db_option,
+        Arc::new(DashMap::new()),
+        branch_map,
+        sjus_map_arc,
+        sender,
+        local_al_map,
+        false,
+        true,
+        BranchTubiMode::DbFallback,
+        prefetch,
+    )
+    .await?
+    .branch
+    .ok_or_else(|| anyhow::anyhow!("branch outcome missing"))
+}
+
 /// BRAN/HANG tubing（DB fallback 模式）
 /// - cache 命中优先
 /// - cache miss 时可回源 DB 补齐 arrive/leave
@@ -560,6 +717,7 @@ pub async fn gen_branch_tubi_from_db(
         false,
         true,
         BranchTubiMode::DbFallback,
+        None,
     )
     .await?
     .branch
@@ -586,6 +744,7 @@ pub async fn gen_branch_tubi_cache_only(
         false,
         true,
         BranchTubiMode::CacheOnly,
+        None,
     )
     .await?
     .branch
@@ -603,6 +762,7 @@ async fn gen_cata_geos_inner(
     process_cata: bool,
     process_branch: bool,
     branch_mode: BranchTubiMode,
+    external_prefetch: Option<BranchPrefetchResult>,
 ) -> anyhow::Result<GenOutcome> {
     // Initialize Chrome tracing
     #[cfg(feature = "profile")]
@@ -628,13 +788,11 @@ async fn gen_cata_geos_inner(
     // resolve_desi_comp 产物缓存（按 cata_hash）。命中时跳过 gen_cata_single_geoms + shape->inst_geo 转换。
     // 初始化失败则自动退化为旧路径（不影响正确性）。
     let cata_resolve_cache: Option<Arc<CataResolveCacheManager>> = if process_cata {
-        let cache_dir = db_option.get_foyer_cache_dir().join("cata_resolve_cache");
-        match CataResolveCacheManager::new(&cache_dir).await {
+        match std::panic::catch_unwind(|| CataResolveCacheManager::new()) {
             Ok(mgr) => Some(Arc::new(mgr)),
             Err(e) => {
                 tracing::warn!(
-                    "init cata_resolve_cache failed, fallback to non-cache path: dir={:?}, err={}",
-                    cache_dir,
+                    "init cata_resolve_cache failed, fallback to non-cache path: err={:?}",
                     e
                 );
                 None
@@ -690,7 +848,7 @@ async fn gen_cata_geos_inner(
         // 预取/预执行完成后，4 个 batch 的主循环（纯 cache hit + per-element 处理）并发执行。
         // ════════════════════════════════════════════════════════════════════════════
 
-        // ── P0 优化（全局）：批量并发预取 attmap / transform / generic_type ──
+        // ── P0 优化（全局）：批量并发预取 attmap + transform ──
         let t_prefetch_global = Instant::now();
         {
             let mut all_refnos: Vec<RefnoEnum> = Vec::new();
@@ -774,7 +932,7 @@ async fn gen_cata_geos_inner(
                     let _permit = sem.acquire().await.unwrap();
 
                     if let Some(cache_mgr) = cata_resolve_cache.as_ref() {
-                        if cache_mgr.get(&cata_hash_owned).await.is_some() {
+                        if cache_mgr.get(&cata_hash_owned).is_some() {
                             pre_gen_skip_cache.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             return;
                         }
@@ -1105,7 +1263,7 @@ async fn gen_cata_geos_inner(
 
                     // 优先走 foyer cache：缓存命中时，直接构造 inst_geo/inst_info 所需的数据并写入 sender。
                     if let Some(cache_mgr) = cata_resolve_cache.as_ref() {
-                        if let Some(resolved_comp) = cache_mgr.get(&cata_hash).await {
+                        if let Some(resolved_comp) = cache_mgr.get(&cata_hash) {
                             debug_model_debug!(
                                 "[cata_hash={}] resolve_desi_comp cache hit (foyer/rkyv)",
                                 cata_hash
@@ -2446,7 +2604,6 @@ async fn gen_cata_geos_inner(
         // 批量从 transform_cache 读取 world_transform（内存缓存 + pe_transform batch fallback）。
         let t_prefetch = Instant::now();
         let all_child_refnos_vec: Vec<RefnoEnum> = all_child_refnos.iter().copied().collect();
-        // cache-only：只读 transform_cache；非 cache-only：可走 cache-first + DB fallback。
         let mut prefetch_targets: Vec<RefnoEnum> = all_child_refnos_vec.clone();
         prefetch_targets.extend(branch_map.iter().map(|x| *x.key()));
         prefetch_targets.sort_by_key(|r| r.refno());
@@ -2488,7 +2645,14 @@ async fn gen_cata_geos_inner(
         //
         // 【优化策略】在循环前批量并发预取所有子元素的 tubi_size，循环内直接查缓存。
         // ════════════════════════════════════════════════════════════════════════════
-        let tubi_size_cache: Arc<DashMap<RefnoEnum, TubiSize>> = if !matches!(branch_mode, BranchTubiMode::CacheOnly) {
+        let tubi_size_cache: Arc<DashMap<RefnoEnum, TubiSize>> = if let Some(ref pf) = external_prefetch {
+            // 外部已预取（与阶段4并行），直接复用
+            println!(
+                "    [BRAN_TUBI] P4 tubi_size: 使用外部预取结果 (hit={})",
+                pf.tubi_size_cache.len()
+            );
+            pf.tubi_size_cache.clone()
+        } else if !matches!(branch_mode, BranchTubiMode::CacheOnly) {
             let t_p4_prefetch = Instant::now();
             let cache = Arc::new(DashMap::new());
             let sem = Arc::new(Semaphore::new(12));
@@ -2579,7 +2743,21 @@ async fn gen_cata_geos_inner(
             h_tubi_size: TubiSize,
             bran_owner_type: String,
         }
-        let branch_meta_cache: DashMap<RefnoEnum, BranchMetaCached> = if !matches!(branch_mode, BranchTubiMode::CacheOnly) {
+        let branch_meta_cache: DashMap<RefnoEnum, BranchMetaCached> = if let Some(ref pf) = external_prefetch {
+            // 外部已预取，转换类型
+            let m = DashMap::new();
+            for item in pf.branch_meta_cache.iter() {
+                m.insert(*item.key(), BranchMetaCached {
+                    h_tubi_size: item.value().h_tubi_size,
+                    bran_owner_type: item.value().bran_owner_type.clone(),
+                });
+            }
+            println!(
+                "    [BRAN_TUBI] P4 branch_meta: 使用外部预取结果 (hit={})",
+                m.len()
+            );
+            m
+        } else if !matches!(branch_mode, BranchTubiMode::CacheOnly) {
             let t_p4_bm = Instant::now();
             let cache = Arc::new(DashMap::new());
             let sem = Arc::new(Semaphore::new(12));

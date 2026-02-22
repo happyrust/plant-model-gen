@@ -33,7 +33,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("glb: {path}");
-    println!("verts={} tris={}", mesh.vertices.len(), mesh.indices.len() / 3);
+    println!(
+        "verts={} tris={}",
+        mesh.vertices.len(),
+        mesh.indices.len() / 3
+    );
 
     for axis in ['x', 'y'] {
         let (min_v, max_v, center) = axis_stats(&mesh, axis);

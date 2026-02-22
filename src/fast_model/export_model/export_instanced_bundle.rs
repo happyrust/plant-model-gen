@@ -511,7 +511,7 @@ pub async fn export_instanced_bundle_for_refnos(
 
         let mut managers: HashMap<u32, TreeIndexManager> = HashMap::new();
         for &refno in &all_refnos {
-            let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(refno).await else {
+            let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(refno) else {
                 continue;
             };
             let manager = managers

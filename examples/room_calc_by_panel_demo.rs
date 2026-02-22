@@ -25,8 +25,8 @@
 //! - 仅当启用 `--write-db` 时才会连接 SurrealDB（用于查询 PANE->SBFR->FRMW->ROOM_NUM，并写入 room_relate）
 //! - 若启用 `--auto-gen-model true`，会先通过 Foyer Cache 自动生成模型/mesh/空间索引，再做房间计算
 
-use anyhow::{Context, Result};
 use aios_core::{RecordId, RefnoEnum, SUL_DB, SurrealQueryExt, init_surreal};
+use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -34,7 +34,11 @@ use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "房间计算回归：按 panel 计算房间内构件并可选落库")]
+#[command(
+    author,
+    version,
+    about = "房间计算回归：按 panel 计算房间内构件并可选落库"
+)]
 struct Args {
     /// 待测 panel refno（格式：24381/35798）
     #[arg(long, default_value = "17496/199296")]
@@ -266,7 +270,10 @@ async fn main() -> Result<()> {
     if let Some(ref cache_dir) = args.foyer_cache_dir {
         db_option_ext.foyer_cache_dir = Some(cache_dir.clone());
     }
-    let foyer_cache_dir = db_option_ext.get_foyer_cache_dir().to_string_lossy().to_string();
+    let foyer_cache_dir = db_option_ext
+        .get_foyer_cache_dir()
+        .to_string_lossy()
+        .to_string();
 
     println!("🎯 panel: {}", panel_refno);
     println!("   - dbnum: {}", dbnum);
@@ -315,7 +322,10 @@ async fn main() -> Result<()> {
     // 5) 运行期：强制房间计算走 cache 查询 inst 信息（避免依赖 SurrealDB 的 inst_relate/inst_relate_aabb）。
     // 注意：room_model.rs 内部通过环境变量开关，这里用 CLI 参数控制其取值（不是测试输入）。
     unsafe {
-        std::env::set_var("AIOS_ROOM_USE_CACHE", if args.room_use_cache { "1" } else { "0" });
+        std::env::set_var(
+            "AIOS_ROOM_USE_CACHE",
+            if args.room_use_cache { "1" } else { "0" },
+        );
         std::env::set_var("FOYER_CACHE_DIR", &foyer_cache_dir);
     }
 
@@ -333,15 +343,25 @@ async fn main() -> Result<()> {
             // 不是纯数字 refno。因此这里用 pe-key 做关联查询。
             let panel_pe = pe_key(panel_refno);
 
-            let sbfr_sql = format!("SELECT VALUE OWNER FROM PANE WHERE REFNO = {} LIMIT 1", panel_pe);
+            let sbfr_sql = format!(
+                "SELECT VALUE OWNER FROM PANE WHERE REFNO = {} LIMIT 1",
+                panel_pe
+            );
             let sbfr_ids: Vec<RecordId> = SUL_DB.query_take(&sbfr_sql, 0).await.unwrap_or_default();
             sbfr_pe = sbfr_ids
                 .first()
                 .map(record_id_to_surreal_literal)
                 .unwrap_or_default();
-            anyhow::ensure!(!sbfr_pe.is_empty(), "未找到 PANE.OWNER(SBFR) : {}", panel_refno);
+            anyhow::ensure!(
+                !sbfr_pe.is_empty(),
+                "未找到 PANE.OWNER(SBFR) : {}",
+                panel_refno
+            );
 
-            let frmw_sql = format!("SELECT VALUE OWNER FROM SBFR WHERE REFNO = {} LIMIT 1", sbfr_pe);
+            let frmw_sql = format!(
+                "SELECT VALUE OWNER FROM SBFR WHERE REFNO = {} LIMIT 1",
+                sbfr_pe
+            );
             let frmw_ids: Vec<RecordId> = SUL_DB.query_take(&frmw_sql, 0).await.unwrap_or_default();
             frmw_pe = frmw_ids
                 .first()
@@ -357,7 +377,10 @@ async fn main() -> Result<()> {
                 "SELECT VALUE array::last(string::split(NAME, '-')) FROM FRMW WHERE REFNO = {} LIMIT 1",
                 frmw_pe
             );
-            let room_nums: Vec<String> = SUL_DB.query_take(&room_num_sql, 0).await.unwrap_or_default();
+            let room_nums: Vec<String> = SUL_DB
+                .query_take(&room_num_sql, 0)
+                .await
+                .unwrap_or_default();
             room_num = room_nums.first().cloned().unwrap_or_default();
             anyhow::ensure!(
                 !room_num.is_empty(),
@@ -389,7 +412,11 @@ async fn main() -> Result<()> {
     .await
     .context("房间计算失败")?;
 
-    println!("✅ 房间计算完成: panel={}, components={}", panel_refno, within.len());
+    println!(
+        "✅ 房间计算完成: panel={}, components={}",
+        panel_refno,
+        within.len()
+    );
 
     // 断言：期望 refnos 必须包含在结果中（用于回归）
     if !expect_refnos.is_empty() {
@@ -427,9 +454,15 @@ async fn main() -> Result<()> {
     }
 
     // 8) 覆盖写入：先删旧的，再批量写入新的（与 room_model.rs 的 save_room_relate 保持一致）。
-    anyhow::ensure!(!room_num.is_empty(), "未提供 ROOM_NUM 且无法获取房间号（写库需要 room_num）");
+    anyhow::ensure!(
+        !room_num.is_empty(),
+        "未提供 ROOM_NUM 且无法获取房间号（写库需要 room_num）"
+    );
 
-    let delete_sql = format!("DELETE room_relate WHERE `in` = {};", panel_refno.to_pe_key());
+    let delete_sql = format!(
+        "DELETE room_relate WHERE `in` = {};",
+        panel_refno.to_pe_key()
+    );
     SUL_DB.query(&delete_sql).await?;
 
     if !within.is_empty() {

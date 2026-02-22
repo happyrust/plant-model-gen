@@ -13,7 +13,7 @@
 //! ✅ **正确用法**：
 //! ```rust
 //! use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
-//! let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno).await?;
+//! let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno)?;
 //! ```
 
 use crate::versioned_db::db_meta_info::DEFAULT_TREE_DIR;
@@ -279,7 +279,7 @@ impl TreeIndexManager {
     ///
     /// ✅ **正确用法**：
     /// ```rust
-    /// let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno).await?;
+    /// let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno)?;
     /// ```
     ///
     /// **查询优先级（cache-only）**：
@@ -287,7 +287,7 @@ impl TreeIndexManager {
     /// 2. db_meta_cache - 内存缓存
     ///
     /// 约定：不回退到 SurrealDB 查询（SurrealDB 仅作为“生成完成后的一键备份落库”目的地）。
-    pub async fn resolve_dbnum_for_refno(refno: RefnoEnum) -> anyhow::Result<u32> {
+    pub fn resolve_dbnum_for_refno(refno: RefnoEnum) -> anyhow::Result<u32> {
         // 优先使用 DbMetaManager 的快速查询（通过 db_meta_info.json）。
         //
         // 注意：该映射需要先 ensure_loaded；否则 get_dbnum_by_refno 会因未加载而返回 None，
@@ -313,8 +313,8 @@ impl TreeIndexManager {
     }
 
     /// 通过 refno 加载对应 TreeIndex
-    pub async fn load_index_for_refno(&self, refno: RefnoEnum) -> anyhow::Result<Arc<TreeIndex>> {
-        let dbnum = Self::resolve_dbnum_for_refno(refno).await?;
+    pub fn load_index_for_refno(&self, refno: RefnoEnum) -> anyhow::Result<Arc<TreeIndex>> {
+        let dbnum = Self::resolve_dbnum_for_refno(refno)?;
         self.load_index(dbnum)
     }
 
@@ -712,7 +712,7 @@ impl TreeIndexManager {
     pub async fn collect_children_elements_from_tree(
         parent: RefnoEnum,
     ) -> anyhow::Result<Vec<SPdmsElement>> {
-        let dbnum = Self::resolve_dbnum_for_refno(parent).await?;
+        let dbnum = Self::resolve_dbnum_for_refno(parent)?;
         let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
         let index = manager.load_index(dbnum)?;
 

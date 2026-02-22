@@ -65,7 +65,7 @@ pub async fn write_tubi_relate_into_cache_with_ctx(
     }
 
     // tubi_relate 读取依赖 SurrealDB：此处统一确保连接已就绪。
-    aios_core::init_surreal().await?;
+    crate::fast_model::utils::ensure_surreal_init().await?;
 
     #[derive(Serialize, Deserialize, Debug, SurrealValue)]
     struct TubiRelateRow {

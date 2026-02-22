@@ -5,13 +5,15 @@
 //!   $env:REFNOS="24381/145019,24381/145032"
 //!   $env:CACHE_DIR="output/AvevaMarineSample/instance_cache"
 //!   cargo run --example inspect_cache_ptset
-use anyhow::{Context, Result};
 use aios_core::RefnoEnum;
+use anyhow::{Context, Result};
 use std::env;
 use std::path::PathBuf;
 
 fn parse_u32_env(name: &str) -> Option<u32> {
-    env::var(name).ok().and_then(|s| s.trim().parse::<u32>().ok())
+    env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
 fn parse_refnos_env() -> Vec<RefnoEnum> {
@@ -28,7 +30,10 @@ fn parse_refnos_env() -> Vec<RefnoEnum> {
 async fn main() -> Result<()> {
     let dbnum = parse_u32_env("DBNUM").context("请设置 DBNUM，例如 7997")?;
     let refnos = parse_refnos_env();
-    anyhow::ensure!(!refnos.is_empty(), "请设置 REFNOS，例如 24381/145019,24381/145020");
+    anyhow::ensure!(
+        !refnos.is_empty(),
+        "请设置 REFNOS，例如 24381/145019,24381/145020"
+    );
 
     // 读取 ARRI/LEAV 需要 SurrealDB（只读）
     let _ = aios_core::init_surreal().await;
@@ -90,11 +95,7 @@ async fn main() -> Result<()> {
             }
             println!(
                 "  pt_key={} number={} pt=({:.3},{:.3},{:.3})",
-                pt_key,
-                pt.number,
-                pt.pt.x,
-                pt.pt.y,
-                pt.pt.z
+                pt_key, pt.number, pt.pt.x, pt.pt.y, pt.pt.z
             );
             shown += 1;
         }

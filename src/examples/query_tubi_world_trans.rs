@@ -1,6 +1,6 @@
 //! 查询指定 BRAN/HANG 的 tubi_relate world_trans，用于对比形态异常
 
-use aios_core::{init_surreal, SUL_DB, SurrealQueryExt};
+use aios_core::{SUL_DB, SurrealQueryExt, init_surreal};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

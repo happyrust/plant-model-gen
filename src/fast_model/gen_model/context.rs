@@ -55,6 +55,12 @@ impl NounProcessContext {
         cloned
     }
 
+    pub fn with_cache_run_mode(&self, mode: CacheRunMode) -> Self {
+        let mut cloned = self.clone();
+        cloned.cache_run_mode = mode;
+        cloned
+    }
+
     /// 是否处于“离线生成”阶段：Generate 阶段且非 Direct 模式。
     ///
     /// 该判断用于 LOOP/PRIM 的输入缓存消费逻辑：

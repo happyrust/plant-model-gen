@@ -8,9 +8,9 @@
 //! 用法：
 //! - cargo run --example update_db_meta_info_for_dbnum --features sqlite-index -- --config DbOption-room-gen-7999 --dbnum 7999
 
+use aios_core::{SUL_DB, SurrealQueryExt, init_surreal};
 use anyhow::{Context, Result};
-use aios_core::{init_surreal, SUL_DB, SurrealQueryExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 fn upsert_ref0_to_dbnum(meta: &mut Value, ref0: u32, dbnum: u32) -> Result<bool> {
@@ -91,7 +91,11 @@ async fn main() -> Result<()> {
         let dbnum = dbnums.first().copied().context("refno.dbnum 查询为空")?;
 
         total = 1;
-        inserted = if upsert_ref0_to_dbnum(&mut meta, ref0, dbnum)? { 1 } else { 0 };
+        inserted = if upsert_ref0_to_dbnum(&mut meta, ref0, dbnum)? {
+            1
+        } else {
+            0
+        };
 
         println!(
             "🔧 按 refno 补齐映射: refno={} => ref0={} -> dbnum={}",
@@ -146,7 +150,10 @@ async fn main() -> Result<()> {
     )
     .with_context(|| format!("写入失败: {}", meta_path.display()))?;
 
-    println!("✅ db_meta_info.json 已更新：total_rows={} newly_inserted={}", total, inserted);
+    println!(
+        "✅ db_meta_info.json 已更新：total_rows={} newly_inserted={}",
+        total, inserted
+    );
 
     Ok(())
 }

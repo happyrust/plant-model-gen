@@ -27,6 +27,7 @@ pub mod noun_collection; // Noun 收集和分类 // 分类 Refno 存储 (Phase 3
 pub mod input_cache_pipeline; // LOOP/PRIM 输入缓存流水线（key-driven）
 pub mod cata_resolve_cache_pipeline; // CATE resolve 产物预热流水线（foyer/rkyv）
 pub mod neg_query; // TreeIndex 批量查询辅助（按 dbnum 分组，返回 root -> Vec<desc>）
+pub mod batch_cleanup; // 分批生成时的批次间缓存清理
 
 // 处理器模块
 pub mod cate_helpers; // Cate 工具函数

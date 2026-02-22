@@ -477,6 +477,9 @@ pub async fn gen_prim_geos_from_inputs(
 ) -> anyhow::Result<bool> {
     let t = Instant::now();
     let batch_size_cfg = db_option.inner.gen_model_batch_size;
+    let diag_enabled = std::env::var("GEN_MODEL_DIAG")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
     let prim_cnt = prim_inputs.len();
     if prim_cnt == 0 {
         return Ok(true);
@@ -489,6 +492,7 @@ pub async fn gen_prim_geos_from_inputs(
     for i in 0..batch_chunks_cnt {
         let all_inputs = all_inputs.clone();
         let sender = sender.clone();
+        let diag_enabled = diag_enabled;
 
         let handle = tokio::spawn(async move {
             let batch_start_time = Instant::now();
@@ -498,6 +502,19 @@ pub async fn gen_prim_geos_from_inputs(
                 return Ok::<_, anyhow::Error>(());
             }
             let end_idx = (start_idx + batch_size).min(all_inputs.len());
+            if diag_enabled {
+                let first = all_inputs[start_idx].refno;
+                let last = all_inputs[end_idx - 1].refno;
+                println!(
+                    "[gen_prim_geos_from_inputs][diag] 批次 {} 开始: range=({}~{}), first={}, last={}, count={}",
+                    i,
+                    start_idx + 1,
+                    end_idx,
+                    first,
+                    last,
+                    end_idx - start_idx
+                );
+            }
 
             let mut skipped_in_batch = 0usize;
             let mut processed_in_batch = 0usize;
@@ -573,6 +590,16 @@ pub async fn gen_prim_geos_from_inputs(
                 i, processed_in_batch, skipped_in_batch, sent_count,
                 batch_start_time.elapsed().as_millis(), batch_size_cfg
             );
+            if diag_enabled {
+                println!(
+                    "[gen_prim_geos_from_inputs][diag] 批次 {} 完成: processed={}, skipped={}, sent={}, elapsed={} ms",
+                    i,
+                    processed_in_batch,
+                    skipped_in_batch,
+                    sent_count,
+                    batch_start_time.elapsed().as_millis()
+                );
+            }
 
             Ok::<_, anyhow::Error>(())
         });
@@ -580,11 +607,36 @@ pub async fn gen_prim_geos_from_inputs(
         handles.push(handle);
     }
 
-    let _ = futures::future::join_all(take(&mut handles)).await;
+    let results = futures::future::join_all(take(&mut handles)).await;
+    let mut success_count = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for (idx, r) in results.into_iter().enumerate() {
+        match r {
+            Ok(Ok(())) => success_count += 1,
+            Ok(Err(e)) => failures.push(format!("batch={} err={}", idx, e)),
+            Err(e) => failures.push(format!("batch={} join_err={}", idx, e)),
+        }
+    }
+    if !failures.is_empty() {
+        let preview = failures
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!(
+            "gen_prim_geos_from_inputs 失败: success_batches={}, failed_batches={}, sample=[{}]",
+            success_count,
+            failures.len(),
+            preview
+        );
+    }
+
     if is_e3d_debug_enabled() {
         println!(
-            "[gen_prim_geos_from_inputs] 完成! 总数: {}, 总耗时: {} ms",
+            "[gen_prim_geos_from_inputs] 完成! 总数: {}, batch_success={}, 总耗时: {} ms",
             prim_cnt,
+            success_count,
             t.elapsed().as_millis()
         );
     }

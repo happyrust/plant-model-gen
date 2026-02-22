@@ -7,7 +7,7 @@
 
 use crate::fast_model::gen_model::cate_single::{CateCsgShapeMap, gen_cata_single_geoms};
 use crate::fast_model::gen_model::utilities::is_valid_cata_hash;
-use crate::fast_model::foyer_cache::cata_resolve_cache::{CataResolveCacheManager, CataResolvedComp, PreparedInstGeo};
+use crate::fast_model::foyer_cache::cata_resolve_cache::{CataResolvedComp, PreparedInstGeo};
 use crate::fast_model::instance_cache::InstanceCacheManager;
 use crate::fast_model::refno_errors::{RefnoErrorKind, RefnoErrorStage, record_refno_error};
 use crate::fast_model::{SEND_INST_SIZE, shared};
@@ -27,7 +27,7 @@ use glam::Vec3;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::fast_model::cata_model::BranchTubiOutcome;
 
@@ -138,14 +138,17 @@ fn build_prepared_inst_geos_from_shapes(shapes: Vec<CateCsgShape>) -> (Vec<Prepa
 /// - 不创建 `tubi_info_map`
 /// - 不收集 `local_al_map`
 /// - 不设置 `geos_info.tubi_info_id`
+///
+/// 内部对每个 cata_hash 并行处理（JoinSet + Semaphore），
+/// 每个 task 独立通过 sender 发送 ShapeInstancesData。
 pub async fn gen_cata_geos_for_cache(
     db_option: Arc<DbOptionExt>,
     target_cata_map: Arc<DashMap<String, CataHashRefnoKV>>,
-    sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
+    _sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
     sender: flume::Sender<ShapeInstancesData>,
 ) -> anyhow::Result<SimpleCataOutcome> {
     let total_t = Instant::now();
-    let total_time_stats = Arc::new(Mutex::new(HashMap::new()));
+    let total_time_stats: Arc<DashMap<String, u64>> = Arc::new(DashMap::new());
 
     let all_unique_keys: Vec<String> = target_cata_map
         .iter()
@@ -166,62 +169,45 @@ pub async fn gen_cata_geos_for_cache(
         });
     }
 
-    let cata_resolve_cache = Arc::new(
-        CataResolveCacheManager::new(&db_option.get_foyer_cache_dir().join("cata_resolve_cache"))
-            .await?,
+    let replace_exist = db_option.inner.is_replace_mesh();
+    let respect_tufl = std::env::var_os("AIOS_RESPECT_TUFL").is_some();
+    let concurrency = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4);
+    let sem = Arc::new(Semaphore::new(concurrency));
+
+    println!(
+        "[gen_cata_geos_for_cache] 并行处理 {} 个 cata_hash, concurrency={}",
+        unique_cata_cnt, concurrency
     );
 
-    // 计算批次
-    let mut batch_chunks_cnt = 4usize.min(unique_cata_cnt.max(1));
-    let mut batch_size = (unique_cata_cnt + batch_chunks_cnt - 1) / batch_chunks_cnt;
-    if batch_size == 0 {
-        batch_size = 1;
-    }
-    if batch_size == 1 {
-        batch_chunks_cnt = unique_cata_cnt;
-    } else {
-        batch_chunks_cnt = (unique_cata_cnt + batch_size - 1) / batch_size;
-    }
+    let mut join_set = tokio::task::JoinSet::new();
 
-    let replace_exist = db_option.inner.is_replace_mesh();
-
-    for i in 0..batch_chunks_cnt {
-        let start_idx = i * batch_size;
-        if start_idx >= unique_cata_cnt {
+    for cata_hash in all_unique_keys {
+        if cata_hash == "0" {
             continue;
         }
-        let end_idx = (start_idx + batch_size).min(unique_cata_cnt);
 
-        let mut shape_insts_data = ShapeInstancesData::default();
-        let mut db_time_get_named_attmap: u128 = 0;
-        let mut db_time_get_cat_refno: u128 = 0;
-        let mut db_time_query_single: u128 = 0;
-        let mut db_time_gen_single_geoms: u128 = 0;
+        let Some(target_cata) = target_cata_map.get(&cata_hash) else {
+            continue;
+        };
+        let target_exist_inst = target_cata.exist_inst;
+        let target_group_refnos = target_cata.group_refnos.clone();
+        let target_ptset = target_cata.ptset.clone();
+        drop(target_cata);
 
-        for j in start_idx..end_idx {
-            let cata_hash = all_unique_keys[j].clone();
-            if cata_hash == "0" {
-                continue;
-            }
+        let sender = sender.clone();
+        let sem = sem.clone();
+        let time_stats = total_time_stats.clone();
+        let force_regen_cata = replace_exist;
 
-            let Some(target_cata) = target_cata_map.get(&cata_hash) else {
-                continue;
-            };
-            let target_exist_inst = target_cata.exist_inst;
-            let target_group_refnos = target_cata.group_refnos.clone();
-            let target_ptset = target_cata.ptset.clone();
-            drop(target_cata);
+        join_set.spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore closed");
 
-            let force_regen_cata = replace_exist;
-
-            // 复用路径：inst_info 已存在
+            // ── 复用路径：inst_info 已存在 ──
             if target_exist_inst && !force_regen_cata {
-                debug_model_debug!(
-                    "[gen_cata_geos_for_cache][cata_hash={}] reuse existing inst_info",
-                    cata_hash
-                );
-
                 let reuse_ptset_map = target_ptset.clone().unwrap_or_default();
+                let mut shape_insts_data = ShapeInstancesData::default();
 
                 for &ele_refno in target_group_refnos.iter() {
                     let ele_att = match aios_core::get_named_attmap(ele_refno).await {
@@ -248,120 +234,98 @@ pub async fn gen_cata_geos_for_cache(
                         is_solid: true,
                         ..Default::default()
                     };
-
                     shape_insts_data.insert_info(ele_refno, geos_info);
-                    if shape_insts_data.inst_cnt() >= SEND_INST_SIZE {
-                        sender
-                            .send(std::mem::take(&mut shape_insts_data))
-                            .expect("send cate shape_insts_data error");
-                    }
                 }
-                continue;
+
+                if shape_insts_data.inst_cnt() > 0 {
+                    let _ = sender.send(shape_insts_data);
+                }
+                return Ok::<_, anyhow::Error>(());
             }
 
-            // 需要生成元件库几何：优先从 foyer cache 读取 resolve_desi_comp 产物（按 cata_hash）
-            let resolved_comp: CataResolvedComp = match cata_resolve_cache.get(&cata_hash).await {
-                Some(v) => {
-                    debug_model_debug!(
-                        "[gen_cata_geos_for_cache][cata_hash={}] resolve_desi_comp cache hit",
-                        cata_hash
-                    );
-                    v
-                }
-                None => {
-                    debug_model_debug!(
-                        "[gen_cata_geos_for_cache][cata_hash={}] resolve_desi_comp cache miss (compute + writeback)",
-                        cata_hash
-                    );
-                    // miss：走旧链路计算一次，并回灌缓存
-                    let ele_refno = match target_group_refnos.first().copied() {
-                        Some(r) => r,
-                        None => continue,
-                    };
-
-                    let t_get_cat_refno = Instant::now();
-                    let result = aios_core::get_cat_refno(ele_refno).await;
-                    let cata_refno = match result {
-                        Ok(Some(refno)) => refno,
-                        _ => continue,
-                    };
-                    db_time_get_cat_refno += t_get_cat_refno.elapsed().as_millis();
-
-                    let t_query_single = Instant::now();
-                    let gmse_refno = aios_core::query_single_by_paths(
-                        cata_refno,
-                        &["->GMRE", "->GSTR"],
-                        &["REFNO"],
-                    )
-                    .await
-                    .map(|x| x.get_refno_or_default());
-                    db_time_query_single += t_query_single.elapsed().as_millis();
-
-                    let valid_gmse = gmse_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
-                    if !valid_gmse {
-                        let ngmr_refno =
-                            aios_core::query_single_by_paths(cata_refno, &["->NGMR"], &["REFNO"])
-                                .await
-                                .map(|x| x.get_refno_or_default());
-                        let valid_ngmr =
-                            ngmr_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
-                        if !valid_ngmr {
-                            continue;
-                        }
-                    }
-
-                    let csg_shapes_map = CateCsgShapeMap::new();
-                    let design_axis_map = DashMap::new();
-
-                    let t_get_named_attmap = Instant::now();
-                    let _desi_att = match aios_core::get_named_attmap(ele_refno).await {
-                        Ok(att) => att,
-                        Err(_) => continue,
-                    };
-                    db_time_get_named_attmap += t_get_named_attmap.elapsed().as_millis();
-
-                    let t_gen_single_geoms = Instant::now();
-                    let r =
-                        gen_cata_single_geoms(ele_refno, &csg_shapes_map, &design_axis_map).await;
-                    db_time_gen_single_geoms += t_gen_single_geoms.elapsed().as_millis();
-
-                    if r.is_err() {
-                        continue;
-                    }
-
-                    // 从 design_axis_map 获取 ptset_map
-                    let ptset_map: BTreeMap<i32, CateAxisParam> = design_axis_map
-                        .get(&ele_refno)
-                        .map(|v| v.clone())
-                        .unwrap_or_default();
-
-                    // 从 csg_shapes_map 获取当前元件的 shapes
-                    let shapes: Vec<CateCsgShape> = csg_shapes_map
-                        .get(&ele_refno)
-                        .map(|v| v.clone())
-                        .unwrap_or_default();
-
-                    let (geos, has_solid) = build_prepared_inst_geos_from_shapes(shapes);
-                    let resolved_comp = CataResolvedComp {
-                        created_at: Utc::now().timestamp_millis(),
-                        ptset_items: ptset_map.into_iter().collect(),
-                        geos,
-                        has_solid,
-                    };
-
-                    cata_resolve_cache.insert(cata_hash.clone(), &resolved_comp);
-                    resolved_comp
-                }
+            // ── 计算路径：resolve_desi_comp ──
+            let ele_refno = match target_group_refnos.first().copied() {
+                Some(r) => r,
+                None => return Ok(()),
             };
 
-            // 运行期过滤：AIOS_RESPECT_TUFL=1 时丢弃 TUFL 不可见的 shape
-            let respect_tufl = std::env::var_os("AIOS_RESPECT_TUFL").is_some();
+            let t_get_cat_refno = Instant::now();
+            let cata_refno = match aios_core::get_cat_refno(ele_refno).await {
+                Ok(Some(refno)) => refno,
+                _ => return Ok(()),
+            };
+            let dt_cat_refno = t_get_cat_refno.elapsed().as_millis() as u64;
+
+            let t_query_single = Instant::now();
+            let gmse_refno = aios_core::query_single_by_paths(
+                cata_refno,
+                &["->GMRE", "->GSTR"],
+                &["REFNO"],
+            )
+            .await
+            .map(|x| x.get_refno_or_default());
+            let dt_query_single = t_query_single.elapsed().as_millis() as u64;
+
+            let valid_gmse = gmse_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
+            if !valid_gmse {
+                let ngmr_refno =
+                    aios_core::query_single_by_paths(cata_refno, &["->NGMR"], &["REFNO"])
+                        .await
+                        .map(|x| x.get_refno_or_default());
+                let valid_ngmr = ngmr_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
+                if !valid_ngmr {
+                    return Ok(());
+                }
+            }
+
+            let csg_shapes_map = CateCsgShapeMap::new();
+            let design_axis_map = DashMap::new();
+
+            let t_get_named_attmap = Instant::now();
+            let _desi_att = match aios_core::get_named_attmap(ele_refno).await {
+                Ok(att) => att,
+                Err(_) => return Ok(()),
+            };
+            let dt_attmap = t_get_named_attmap.elapsed().as_millis() as u64;
+
+            let t_gen_single_geoms = Instant::now();
+            let r = gen_cata_single_geoms(ele_refno, &csg_shapes_map, &design_axis_map).await;
+            let dt_gen = t_gen_single_geoms.elapsed().as_millis() as u64;
+
+            if r.is_err() {
+                return Ok(());
+            }
+
+            // 汇总计时
+            *time_stats.entry("get_cat_refno".to_string()).or_insert(0) += dt_cat_refno;
+            *time_stats.entry("query_single".to_string()).or_insert(0) += dt_query_single;
+            *time_stats.entry("get_named_attmap".to_string()).or_insert(0) += dt_attmap;
+            *time_stats.entry("gen_single_geoms".to_string()).or_insert(0) += dt_gen;
+
+            let ptset_map: BTreeMap<i32, CateAxisParam> = design_axis_map
+                .get(&ele_refno)
+                .map(|v| v.clone())
+                .unwrap_or_default();
+
+            let shapes: Vec<CateCsgShape> = csg_shapes_map
+                .get(&ele_refno)
+                .map(|v| v.clone())
+                .unwrap_or_default();
+
+            let (geos, has_solid) = build_prepared_inst_geos_from_shapes(shapes);
+            let resolved_comp = CataResolvedComp {
+                created_at: Utc::now().timestamp_millis(),
+                ptset_items: ptset_map.into_iter().collect(),
+                geos,
+                has_solid,
+            };
+
+            // 构建 geo_insts
             let mut geo_insts: Vec<EleInstGeo> = Vec::new();
             for g in resolved_comp.geos.iter() {
                 if respect_tufl && !g.shape_visible {
                     continue;
                 }
-
                 let visible = g.geo_type == GeoBasicType::Pos;
                 geo_insts.push(EleInstGeo {
                     geo_hash: g.geo_hash,
@@ -377,10 +341,10 @@ pub async fn gen_cata_geos_for_cache(
                 });
             }
 
-            let has_solid = resolved_comp.has_solid;
-            let ptset_map: BTreeMap<i32, CateAxisParam> = resolved_comp.ptset_map();
+            let ptset_map_resolved = resolved_comp.ptset_map();
 
             // 处理 group_refnos 中的每个元件
+            let mut shape_insts_data = ShapeInstancesData::default();
             for &group_refno in target_group_refnos.iter() {
                 let ele_att = match aios_core::get_named_attmap(group_refno).await {
                     Ok(att) => att,
@@ -396,22 +360,20 @@ pub async fn gen_cata_geos_for_cache(
                     None
                 };
 
-                let mut geos_info = EleGeosInfo {
+                let geos_info = EleGeosInfo {
                     refno: group_refno,
                     sesno: ele_att.sesno(),
                     owner_refno,
                     owner_type,
                     cata_hash: cata_hash_for_info.clone(),
                     visible: true,
-                    ptset_map: ptset_map.clone(),
+                    ptset_map: ptset_map_resolved.clone(),
                     is_solid: has_solid,
                     ..Default::default()
                 };
 
-                // 插入 EleGeosInfo
                 shape_insts_data.insert_info(group_refno, geos_info.clone());
 
-                // ====== 关键：插入 EleInstGeosData（包含几何实例和变换） ======
                 if !geo_insts.is_empty() {
                     let inst_key = geos_info.get_inst_key();
                     let geos_data = EleInstGeosData {
@@ -426,34 +388,28 @@ pub async fn gen_cata_geos_for_cache(
                 }
             }
 
-            if shape_insts_data.inst_cnt() >= SEND_INST_SIZE {
-                sender
-                    .send(std::mem::take(&mut shape_insts_data))
-                    .expect("send cate shape_insts_data error");
+            if shape_insts_data.inst_cnt() > 0 {
+                let _ = sender.send(shape_insts_data);
             }
-        }
 
-        // 更新时间统计
-        {
-            let mut stats = total_time_stats.lock().await;
-            *stats.entry("get_named_attmap".to_string()).or_insert(0) +=
-                db_time_get_named_attmap as u64;
-            *stats.entry("get_cat_refno".to_string()).or_insert(0) +=
-                db_time_get_cat_refno as u64;
-            *stats.entry("query_single".to_string()).or_insert(0) +=
-                db_time_query_single as u64;
-            *stats.entry("gen_single_geoms".to_string()).or_insert(0) +=
-                db_time_gen_single_geoms as u64;
-        }
+            Ok::<_, anyhow::Error>(())
+        });
+    }
 
-        if shape_insts_data.inst_cnt() > 0 {
-            sender
-                .send(shape_insts_data)
-                .expect("send cate shape_insts_data error");
+    // 等待所有并行任务完成
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("[gen_cata_geos_for_cache] task error: {}", e),
+            Err(e) => eprintln!("[gen_cata_geos_for_cache] task panic: {}", e),
         }
     }
 
-    let time_stats = total_time_stats.lock().await.clone();
+    let time_stats: HashMap<String, u64> = total_time_stats
+        .iter()
+        .map(|e| (e.key().clone(), *e.value()))
+        .collect();
+
     Ok(SimpleCataOutcome {
         time_stats,
         unique_cata_cnt,

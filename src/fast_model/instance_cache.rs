@@ -8,8 +8,8 @@ use aios_core::geometry::{EleGeosInfo, EleInstGeosData, ShapeInstancesData};
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::parsed_data::CateAxisParam;
 use aios_core::RefnoEnum;
-use foyer::{DirectFsDeviceOptionsBuilder, HybridCache, HybridCacheBuilder};
-use serde::{Deserialize, Serialize};
+use foyer::{BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use twox_hash::XxHash64;
 use crate::data_interface::db_meta_manager::db_meta;
 
@@ -23,7 +23,26 @@ use crate::fast_model::foyer_cache::rkyv_payload;
 #[derive(Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstInfoKey {
     pub dbnum: u32,
+    #[serde(
+        serialize_with = "serialize_inst_info_key_refno",
+        deserialize_with = "deserialize_inst_info_key_refno"
+    )]
     pub refno: RefnoEnum,
+}
+
+fn serialize_inst_info_key_refno<S>(value: &RefnoEnum, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&value.to_string())
+}
+
+fn deserialize_inst_info_key_refno<'de, D>(deserializer: D) -> Result<RefnoEnum, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(RefnoEnum::from(raw.as_str()))
 }
 
 /// inst_key 级别的缓存 Key（多 refno 可共享同一 inst_key）
@@ -94,6 +113,9 @@ struct RefnoIndex {
     /// dbnum -> 已缓存的 inst_key 集合
     #[serde(default)]
     geos_by_dbnum: HashMap<u32, HashSet<String>>,
+    /// dbnum -> 布尔目标 refno 集合（仅记录存在布尔关系的实例）
+    #[serde(default)]
+    bool_targets_by_dbnum: HashMap<u32, HashSet<RefnoEnum>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -109,10 +131,19 @@ pub struct InstanceCacheManager {
 
 impl InstanceCacheManager {
     const INDEX_FILE_NAME: &'static str = "instance_cache_refno_index.json";
+    const LAYOUT_FILE_NAME: &'static str = "instance_cache_layout.json";
+    const LAYOUT_VERSION: u32 = 2;
 
     pub async fn new(cache_dir: &Path) -> anyhow::Result<Self> {
         if !cache_dir.exists() {
             std::fs::create_dir_all(cache_dir)?;
+        }
+
+        if Self::ensure_layout_compatible(cache_dir)? {
+            eprintln!(
+                "[instance_cache] 检测到旧版或损坏缓存布局，已重建 info/geos/index: {}",
+                cache_dir.display()
+            );
         }
 
         let index = Self::load_index(cache_dir);
@@ -122,14 +153,14 @@ impl InstanceCacheManager {
         if !info_dir.exists() {
             std::fs::create_dir_all(&info_dir)?;
         }
-        let info_device = DirectFsDeviceOptionsBuilder::new(&info_dir)
+        let info_device = FsDeviceBuilder::new(&info_dir)
             .with_capacity(512 * 1024 * 1024)
-            .build();
+            .build()?;
         let info_cache = HybridCacheBuilder::new()
             .memory(64 * 1024 * 1024)
             .with_hash_builder(BuildHasherDefault::<XxHash64>::default())
             .storage()
-            .with_device_config(info_device)
+            .with_engine_config(BlockEngineConfig::new(info_device))
             .build()
             .await?;
 
@@ -138,14 +169,14 @@ impl InstanceCacheManager {
         if !geos_dir.exists() {
             std::fs::create_dir_all(&geos_dir)?;
         }
-        let geos_device = DirectFsDeviceOptionsBuilder::new(&geos_dir)
+        let geos_device = FsDeviceBuilder::new(&geos_dir)
             .with_capacity(512 * 1024 * 1024)
-            .build();
+            .build()?;
         let geos_cache = HybridCacheBuilder::new()
             .memory(64 * 1024 * 1024)
             .with_hash_builder(BuildHasherDefault::<XxHash64>::default())
             .storage()
-            .with_device_config(geos_device)
+            .with_engine_config(BlockEngineConfig::new(geos_device))
             .build()
             .await?;
 
@@ -252,6 +283,22 @@ impl InstanceCacheManager {
             for inst_key in shape_insts.inst_geos_map.keys() {
                 geos_set.insert(inst_key.clone());
             }
+            let bool_targets = index.bool_targets_by_dbnum.entry(dbnum).or_default();
+            for (refno, info) in &shape_insts.inst_info_map {
+                let has_neg_rel = shape_insts
+                    .neg_relate_map
+                    .get(refno)
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false);
+                let has_ngmr_rel = shape_insts
+                    .ngmr_neg_relate_map
+                    .get(refno)
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false);
+                if info.has_cata_neg || has_neg_rel || has_ngmr_rel {
+                    bool_targets.insert(*refno);
+                }
+            }
             let _ = self.save_index_locked(&index);
         }
 
@@ -274,6 +321,7 @@ impl InstanceCacheManager {
         self.info_cache
             .insert(key, CachePayloadValue { payload });
         self.update_refno_index(dbnum, refno);
+        self.update_boolean_target_index(dbnum, refno, info);
     }
 
     /// 写入单个 inst_key 的 geos 数据
@@ -421,6 +469,16 @@ impl InstanceCacheManager {
         index.by_dbnum.keys().copied().collect()
     }
 
+    /// 列出指定 dbnum 下所有已缓存的布尔目标 refno
+    pub fn list_boolean_targets(&self, dbnum: u32) -> Vec<RefnoEnum> {
+        let index = self.index.lock().expect("instance_cache index lock poisoned");
+        index
+            .bool_targets_by_dbnum
+            .get(&dbnum)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
     /// 列出指定 dbnum 下所有已缓存的 inst_key
     pub fn list_inst_keys(&self, dbnum: u32) -> Vec<String> {
         let index = self.index.lock().expect("instance_cache index lock poisoned");
@@ -562,6 +620,27 @@ impl InstanceCacheManager {
         items
     }
 
+    /// 收集指定 dbnum 下 geo_hash 对应的一个示例 refno（用于日志定位）。
+    ///
+    /// 说明：
+    /// - 仅用于调试/日志标签，不参与业务分桶与目录命名逻辑；
+    /// - 同一 geo_hash 可能被多个 refno 复用，此处保留首次出现的 refno。
+    pub async fn collect_geo_hash_refnos(&self, dbnum: u32) -> HashMap<u64, RefnoEnum> {
+        let mut map = HashMap::new();
+
+        for inst_key in self.list_inst_keys(dbnum) {
+            let Some(cached) = self.get_inst_geos(dbnum, &inst_key).await else {
+                continue;
+            };
+            let refno = cached.geos_data.refno;
+            for inst in &cached.geos_data.insts {
+                map.entry(inst.geo_hash).or_insert(refno);
+            }
+        }
+
+        map
+    }
+
     // -----------------------------------------------------------------------
     // 删除 API
     // -----------------------------------------------------------------------
@@ -610,6 +689,52 @@ impl InstanceCacheManager {
         cache_dir.join(Self::INDEX_FILE_NAME)
     }
 
+    fn layout_path(cache_dir: &Path) -> PathBuf {
+        cache_dir.join(Self::LAYOUT_FILE_NAME)
+    }
+
+    fn ensure_layout_compatible(cache_dir: &Path) -> anyhow::Result<bool> {
+        #[derive(Deserialize)]
+        struct LayoutMeta {
+            version: u32,
+        }
+
+        let layout_path = Self::layout_path(cache_dir);
+        let mut need_reset = true;
+
+        if let Ok(text) = fs::read_to_string(&layout_path) {
+            if let Ok(meta) = serde_json::from_str::<LayoutMeta>(&text) {
+                need_reset = meta.version != Self::LAYOUT_VERSION;
+            }
+        }
+
+        if need_reset {
+            Self::reset_storage(cache_dir)?;
+            let layout = serde_json::json!({ "version": Self::LAYOUT_VERSION });
+            fs::write(layout_path, serde_json::to_vec(&layout)?)?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn reset_storage(cache_dir: &Path) -> anyhow::Result<()> {
+        for name in ["info", "geos"] {
+            let dir = cache_dir.join(name);
+            if dir.exists() {
+                fs::remove_dir_all(&dir)?;
+            }
+            fs::create_dir_all(&dir)?;
+        }
+
+        let index_path = Self::index_path(cache_dir);
+        if index_path.exists() {
+            fs::remove_file(index_path)?;
+        }
+
+        Ok(())
+    }
+
     fn load_index(cache_dir: &Path) -> RefnoIndex {
         let path = Self::index_path(cache_dir);
         if let Ok(text) = fs::read_to_string(&path) {
@@ -635,6 +760,23 @@ impl InstanceCacheManager {
                 .entry(dbnum)
                 .or_default()
                 .insert(inst_key.to_string())
+            {
+                let _ = self.save_index_locked(&index);
+            }
+        }
+    }
+
+    fn update_boolean_target_index(&self, dbnum: u32, refno: RefnoEnum, info: &CachedInstInfo) {
+        if !info.info.has_cata_neg && info.neg_relates.is_empty() && info.ngmr_neg_relates.is_empty()
+        {
+            return;
+        }
+        if let Ok(mut index) = self.index.lock() {
+            if index
+                .bool_targets_by_dbnum
+                .entry(dbnum)
+                .or_default()
+                .insert(refno)
             {
                 let _ = self.save_index_locked(&index);
             }

@@ -31,7 +31,7 @@ pub fn update_db_meta_info_json(
     update: DbFileMetaUpdate,
 ) -> anyhow::Result<()> {
     use std::fs;
-    use serde_json::{json, Value};
+    use serde_json::{json, Map, Value};
     
     let meta_path = output_dir.join("db_meta_info.json");
     
@@ -47,15 +47,6 @@ pub fn update_db_meta_info_json(
             "db_files": {}
         })
     };
-    
-    // 更新 ref0_to_dbnum 映射
-    if let Some(ref0_map) = meta.get_mut("ref0_to_dbnum") {
-        if let Some(obj) = ref0_map.as_object_mut() {
-            for ref0 in &update.ref0s {
-                obj.insert(ref0.to_string(), json!(update.dbnum));
-            }
-        }
-    }
     
     // 将 sesno_timestamp (i64 秒级时间戳) 转为 RFC3339 字符串
     let updated_at_str = update.sesno_timestamp
@@ -79,6 +70,26 @@ pub fn update_db_meta_info_json(
             }));
         }
     }
+
+    // ref0_to_dbnum 必须只从 db_files[*].ref0s 推导，避免历史/手工脏映射残留。
+    // 这样可以保证：映射来源始终是“扫描解析数据库文件”的结果。
+    let mut rebuilt_ref0_map = Map::new();
+    if let Some(db_files_obj) = meta.get("db_files").and_then(|v| v.as_object()) {
+        for (dbnum_str, info) in db_files_obj {
+            let Ok(dbnum) = dbnum_str.parse::<u32>() else {
+                continue;
+            };
+            let Some(ref0s) = info.get("ref0s").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for ref0 in ref0s {
+                if let Some(ref0_u64) = ref0.as_u64() {
+                    rebuilt_ref0_map.insert(ref0_u64.to_string(), json!(dbnum));
+                }
+            }
+        }
+    }
+    meta["ref0_to_dbnum"] = Value::Object(rebuilt_ref0_map);
     
     // 更新 updated_at
     if let Some(updated_at) = meta.get_mut("updated_at") {

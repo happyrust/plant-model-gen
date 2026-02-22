@@ -3,8 +3,8 @@
 //! 用法：
 //!   ROOT_REFNO="24381/103385" cargo run --example check_tubi_connectivity
 
-use anyhow::{Context, Result};
 use aios_core::RefnoEnum;
+use anyhow::{Context, Result};
 use glam::Vec3;
 use std::env;
 use std::path::PathBuf;
@@ -29,21 +29,22 @@ async fn main() -> Result<()> {
         .ensure_loaded()
         .context("db_meta_info.json 未加载")?;
 
-    let Some(dbnum) = aios_database::data_interface::db_meta_manager::db_meta()
-        .get_dbnum_by_refno(root) else {
+    let Some(dbnum) =
+        aios_database::data_interface::db_meta_manager::db_meta().get_dbnum_by_refno(root)
+    else {
         anyhow::bail!("无法获取 dbnum");
     };
 
     println!("🔎 BRAN={} dbnum={}", root, dbnum);
 
-    let cache = aios_database::fast_model::instance_cache::InstanceCacheManager::new(&cache_dir)
-        .await?;
+    let cache =
+        aios_database::fast_model::instance_cache::InstanceCacheManager::new(&cache_dir).await?;
 
     // 收集所有 tubi 的端点
     struct TubiEndpoints {
         refno: RefnoEnum,
-        p0: Vec3,  // start
-        p1: Vec3,  // end
+        p0: Vec3, // start
+        p1: Vec3, // end
     }
 
     let mut tubis: Vec<TubiEndpoints> = Vec::new();
@@ -51,10 +52,14 @@ async fn main() -> Result<()> {
     let root_u64 = root.refno().0;
 
     for batch_id in batch_ids.iter().rev() {
-        let Some(batch) = cache.get(dbnum, batch_id).await else { continue };
+        let Some(batch) = cache.get(dbnum, batch_id).await else {
+            continue;
+        };
 
         for (k, info) in batch.inst_tubi_map.iter() {
-            if info.owner_refno.refno().0 != root_u64 { continue }
+            if info.owner_refno.refno().0 != root_u64 {
+                continue;
+            }
 
             let wt = info.get_ele_world_transform();
             let m = wt.to_matrix();
@@ -63,7 +68,9 @@ async fn main() -> Result<()> {
 
             tubis.push(TubiEndpoints { refno: *k, p0, p1 });
         }
-        if !tubis.is_empty() { break }
+        if !tubis.is_empty() {
+            break;
+        }
     }
 
     println!("\n📊 共 {} 条 tubi:\n", tubis.len());
@@ -79,20 +86,42 @@ async fn main() -> Result<()> {
 
     for (i, t1) in tubis.iter().enumerate() {
         for (j, t2) in tubis.iter().enumerate() {
-            if i >= j { continue }
+            if i >= j {
+                continue;
+            }
 
             // 检查 t1.p1 是否连接 t2.p0 或 t2.p1
             if dist(t1.p1, t2.p0) < TOL {
-                println!("✅ tubi#{}.p1 -> tubi#{}.p0 (dist={:.3})", i+1, j+1, dist(t1.p1, t2.p0));
+                println!(
+                    "✅ tubi#{}.p1 -> tubi#{}.p0 (dist={:.3})",
+                    i + 1,
+                    j + 1,
+                    dist(t1.p1, t2.p0)
+                );
             }
             if dist(t1.p1, t2.p1) < TOL {
-                println!("✅ tubi#{}.p1 -> tubi#{}.p1 (dist={:.3})", i+1, j+1, dist(t1.p1, t2.p1));
+                println!(
+                    "✅ tubi#{}.p1 -> tubi#{}.p1 (dist={:.3})",
+                    i + 1,
+                    j + 1,
+                    dist(t1.p1, t2.p1)
+                );
             }
             if dist(t1.p0, t2.p0) < TOL {
-                println!("✅ tubi#{}.p0 -> tubi#{}.p0 (dist={:.3})", i+1, j+1, dist(t1.p0, t2.p0));
+                println!(
+                    "✅ tubi#{}.p0 -> tubi#{}.p0 (dist={:.3})",
+                    i + 1,
+                    j + 1,
+                    dist(t1.p0, t2.p0)
+                );
             }
             if dist(t1.p0, t2.p1) < TOL {
-                println!("✅ tubi#{}.p0 -> tubi#{}.p1 (dist={:.3})", i+1, j+1, dist(t1.p0, t2.p1));
+                println!(
+                    "✅ tubi#{}.p0 -> tubi#{}.p1 (dist={:.3})",
+                    i + 1,
+                    j + 1,
+                    dist(t1.p0, t2.p1)
+                );
             }
         }
     }

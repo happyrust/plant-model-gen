@@ -12,9 +12,9 @@
 //!   - neg_relate_map keys for this refno
 //!   - ngmr_neg_relate_map keys for this refno
 
-use anyhow::{Context, Result};
-use aios_core::geometry::GeoBasicType;
 use aios_core::RefnoEnum;
+use aios_core::geometry::GeoBasicType;
+use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
@@ -35,11 +35,16 @@ async fn main() -> Result<()> {
         .ensure_loaded()
         .context("db_meta_info.json 未加载（请先生成 output/scene_tree/db_meta_info.json）")?;
 
-    let Some(dbnum) = aios_database::data_interface::db_meta_manager::db_meta().get_dbnum_by_refno(refno) else {
+    let Some(dbnum) =
+        aios_database::data_interface::db_meta_manager::db_meta().get_dbnum_by_refno(refno)
+    else {
         anyhow::bail!("无法从 db_meta 推导 dbnum: {}", refno);
     };
 
-    println!("🔎 dump cache bool inputs: refno={}, dbnum={}", refno, dbnum);
+    println!(
+        "🔎 dump cache bool inputs: refno={}, dbnum={}",
+        refno, dbnum
+    );
     println!("   - cache_dir: {}", cache_dir.display());
 
     let cache = aios_database::fast_model::instance_cache::InstanceCacheManager::new(&cache_dir)
@@ -76,8 +81,14 @@ async fn main() -> Result<()> {
         println!("✅ hit batch_id={}", batch_id);
         println!("   - inst_key={}", inst_key);
         println!("   - geos.type_name={}", geos.type_name);
-        println!("   - owner_type={} owner_refno={}", info.owner_type, info.owner_refno);
-        println!("   - has_cata_neg={} is_solid={}", info.has_cata_neg, info.is_solid);
+        println!(
+            "   - owner_type={} owner_refno={}",
+            info.owner_type, info.owner_refno
+        );
+        println!(
+            "   - has_cata_neg={} is_solid={}",
+            info.has_cata_neg, info.is_solid
+        );
         println!(
             "   - world_trans: t=({:.3},{:.3},{:.3}) s=({:.3},{:.3},{:.3})",
             info.world_transform.translation.x,
@@ -162,9 +173,10 @@ async fn main() -> Result<()> {
             match inst.geo_type {
                 GeoBasicType::CataNeg => n_cata_neg += 1,
                 GeoBasicType::CataCrossNeg => n_cata_cross += 1,
-                GeoBasicType::Pos | GeoBasicType::Compound | GeoBasicType::CatePos | GeoBasicType::DesiPos => {
-                    n_pos_like += 1
-                }
+                GeoBasicType::Pos
+                | GeoBasicType::Compound
+                | GeoBasicType::CatePos
+                | GeoBasicType::DesiPos => n_pos_like += 1,
                 _ => {}
             }
         }
@@ -176,6 +188,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    anyhow::bail!("未在 cache 中找到 refno={} 的 inst_info+inst_geos（请先 regen-model 生成缓存）", refno);
+    anyhow::bail!(
+        "未在 cache 中找到 refno={} 的 inst_info+inst_geos（请先 regen-model 生成缓存）",
+        refno
+    );
 }
-

@@ -9,8 +9,8 @@
 //!   set CACHE_DIR=output/instance_cache
 //!   cargo run --example inspect_cache_refno --features sqlite-index
 
-use anyhow::{Context, Result};
 use aios_core::RefnoEnum;
+use anyhow::{Context, Result};
 use std::env;
 use std::path::PathBuf;
 
@@ -56,7 +56,10 @@ async fn main() -> Result<()> {
         };
 
         // inst_info_map: key 可能是 Refno 或 SesRef([refno,sesno])，这里按 RefU64 归一化。
-        let info_hit = batch.inst_info_map.iter().any(|(k, _)| k.refno() == want_u64);
+        let info_hit = batch
+            .inst_info_map
+            .iter()
+            .any(|(k, _)| k.refno() == want_u64);
         if info_hit {
             found_info += 1;
         }
@@ -91,7 +94,9 @@ async fn main() -> Result<()> {
         found_info, found_geos
     );
     if found_info > 0 && found_geos == 0 {
-        println!("⚠️ 该 refno 在 cache 里只有 inst_info（AABB/transform），没有 inst_geos（geo_hash/insts）。");
+        println!(
+            "⚠️ 该 refno 在 cache 里只有 inst_info（AABB/transform），没有 inst_geos（geo_hash/insts）。"
+        );
         println!("   这会导致 cache-only 的 query_insts / room_calc 无法加载 TriMesh。");
     }
 

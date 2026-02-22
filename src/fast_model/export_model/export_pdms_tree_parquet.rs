@@ -359,7 +359,7 @@ pub async fn export_world_sites_parquet(output_dir: &Path, verbose: bool) -> Res
             let mut dbnums_for_sites: Vec<u32> = Vec::with_capacity(sites.len());
             for ele in &sites {
                 let site_refno = ele.refno;
-                let dbnum = TreeIndexManager::resolve_dbnum_for_refno(site_refno).await.unwrap_or(0);
+                let dbnum = TreeIndexManager::resolve_dbnum_for_refno(site_refno).unwrap_or(0);
                 dbnums_for_sites.push(dbnum);
             }
 

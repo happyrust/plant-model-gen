@@ -1,20 +1,4 @@
 #V2
-SELECT POSS, POSE FROM att_STWALL WHERE refno = '24381_37115'
-INFO FOR DB
-SELECT * FROM pe WHERE id = pe:24381_37115
-SELECT * FROM noun_STWALL WHERE id = noun_STWALL:24381_37115
-SELECT * FROM pe:17496_106028;
-SELECT id, noun, name FROM pe:17496_142306, pe:17496_142305, pe:17496_125330, pe:17496_106029, pe:17496_106030;
-SELECT * FROM ngmr_relate WHERE out = pe:17496_106028;
-SELECT * FROM neg_relate WHERE out = pe:17496_106028;
-SELECT id, noun, CATR FROM pe:17496_142306;
-SELECT id, noun, SPRE FROM pe:17496_142306;
-SELECT id, noun, name FROM pe:13244_695323;
-SELECT id, noun, name FROM pe:13244_695323->children;
-SELECT * FROM pe WHERE owner = pe:13244_695323;
-SELECT id, noun, name FROM pe WHERE noun = 'NGMR' AND owner = pe:13244_695323;
-SELECT * FROM pe:13244_695315;
-SELECT id, noun, NAPP FROM pe:13244_695315;
 SELECT id, noun, owner FROM pe:17496_142306;
 SELECT * FROM ngmr_relate WHERE pe = pe:17496_142306;
 SELECT id, noun, owner FROM pe:17496_142306; SELECT id, noun FROM pe:17496_142306.owner;
@@ -99,3 +83,19 @@ RETURN count((SELECT id FROM tubi_relate:[pe:24381_145018, 0]..[pe:24381_145018,
 RETURN count((SELECT id FROM geo_relate WHERE in IN (SELECT VALUE out FROM inst_relate WHERE in = pe:`24381_145022`) AND trans.d = NONE));
 RETURN count((SELECT id FROM tubi_relate:[pe:24381_145018, 0]..[pe:24381_145018, ..] WHERE start_pt.d = NONE OR end_pt.d = NONE));
 RETURN count((SELECT id FROM tubi_info WHERE string::starts_with(record::id(id), '13648074980233081144_')));
+INFO FOR ROOT;
+USE NS 1516; INFO FOR NS;
+USE NS '1516'; USE DB 'AvevaMarineSample'; INFO FOR DB;
+USE NS '1516'; USE DB 'AvevaMarineSample'; INFO FOR TABLE pe_transform;
+INFO FOR DB;
+SELECT count() AS total FROM pe_7997 GROUP ALL;
+SELECT count() AS with_inst FROM pe_7997 WHERE inst_relate_id != NONE GROUP ALL;
+SELECT count() AS bran FROM pe_7997 WHERE noun='BRAN' GROUP ALL;
+SELECT count() AS hang FROM pe_7997 WHERE noun='HANG' GROUP ALL;
+SELECT * FROM pe_7997 LIMIT 1;
+SELECT * FROM inst_relate LIMIT 1;
+SELECT count() AS inst_cnt FROM inst_relate WHERE string::starts_with(<string> id, 'inst_relate:`24381_') OR string::starts_with(<string> id, 'inst_relate:`16189_') GROUP ALL;
+SELECT count() AS tubi_cnt FROM tubi_relate WHERE string::starts_with(<string> id, 'tubi_relate:[pe:`24381_') OR string::starts_with(<string> id, 'tubi_relate:[pe:`16189_') GROUP ALL;
+SELECT count() AS inst_cnt FROM inst_relate WHERE string::starts_with(<string> id, 'inst_relate:`24381_') OR string::starts_with(<string> id, 'inst_relate:`16189_') GROUP ALL;
+SELECT count() AS tubi_cnt FROM tubi_relate WHERE string::starts_with(<string> id, 'tubi_relate:[pe:`24381_') OR string::starts_with(<string> id, 'tubi_relate:[pe:`16189_') GROUP ALL;
+SELECT count() AS pe_cnt FROM pe_7997 GROUP ALL;

@@ -3,8 +3,8 @@
 //! 用法：
 //!   cargo run --example surreal_info_db
 
+use aios_core::{SUL_DB, SurrealQueryExt, init_surreal};
 use anyhow::Result;
-use aios_core::{init_surreal, SUL_DB, SurrealQueryExt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,4 +20,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-

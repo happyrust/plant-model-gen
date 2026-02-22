@@ -1,15 +1,15 @@
 //! 验证 --sync-to-db 后 SurrealDB 中 24381/145018 相关表的数据
-//! 
+//!
 //! 基于 plant-surrealdb skill 的最佳实践：
 //! - 使用 SELECT VALUE count() 获取标量值
 //! - 使用 ID Range 查询 tubi_relate
 //! - 使用正确的 pe key 格式 (pe:`ref0_ref1`)
-//! 
+//!
 //! 用法: cargo run --example verify_sync_to_db_24381_145018
 
-use aios_core::{SUL_DB, SurrealQueryExt, init_surreal, RefnoEnum};
-use std::str::FromStr;
+use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt, init_surreal};
 use anyhow::Result;
+use std::str::FromStr;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
     let refnos: Vec<RefnoEnum> = (145018..=145035)
         .map(|n| RefnoEnum::from_str(&format!("24381/{}", n)).unwrap())
         .collect();
-    
+
     let pe_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
     let pe_list_str = pe_keys.join(", ");
 
@@ -114,11 +114,15 @@ async fn main() -> Result<()> {
         "SELECT in, out, owner FROM inst_relate WHERE in = {} LIMIT 5;",
         bran_refno.to_pe_key()
     );
-    match SUL_DB.query_take::<Vec<serde_json::Value>>(&sql_detail, 0).await {
+    match SUL_DB
+        .query_take::<Vec<serde_json::Value>>(&sql_detail, 0)
+        .await
+    {
         Ok(results) => {
             println!("   找到 {} 条记录", results.len());
             for (i, record) in results.iter().enumerate() {
-                println!("   记录 {}: in={:?}, out={:?}, owner={:?}", 
+                println!(
+                    "   记录 {}: in={:?}, out={:?}, owner={:?}",
                     i + 1,
                     record.get("in"),
                     record.get("out"),
@@ -140,11 +144,15 @@ async fn main() -> Result<()> {
         "SELECT id[0] as bran_refno, id[1] as index, in as leave, out as arrive FROM tubi_relate:[{}, 0]..[{}, ..] LIMIT 5;",
         bran_pe_key, bran_pe_key
     );
-    match SUL_DB.query_take::<Vec<serde_json::Value>>(&sql_tubi_detail, 0).await {
+    match SUL_DB
+        .query_take::<Vec<serde_json::Value>>(&sql_tubi_detail, 0)
+        .await
+    {
         Ok(results) => {
             println!("   找到 {} 条记录", results.len());
             for (i, record) in results.iter().enumerate() {
-                println!("   记录 {}: bran={:?}, index={:?}, leave={:?}, arrive={:?}", 
+                println!(
+                    "   记录 {}: bran={:?}, index={:?}, leave={:?}, arrive={:?}",
                     i + 1,
                     record.get("bran_refno"),
                     record.get("index"),
@@ -162,10 +170,14 @@ async fn main() -> Result<()> {
     // 9. 检查 pe 表是否存在该记录（验证 pe key 格式）
     println!("\n9. 验证 pe 表记录是否存在:");
     let sql_pe = format!("SELECT id, noun, name FROM {};", bran_refno.to_pe_key());
-    match SUL_DB.query_take::<Vec<serde_json::Value>>(&sql_pe, 0).await {
+    match SUL_DB
+        .query_take::<Vec<serde_json::Value>>(&sql_pe, 0)
+        .await
+    {
         Ok(results) => {
             if let Some(record) = results.first() {
-                println!("   ✅ pe 记录存在: id={:?}, noun={:?}, name={:?}",
+                println!(
+                    "   ✅ pe 记录存在: id={:?}, noun={:?}, name={:?}",
                     record.get("id"),
                     record.get("noun"),
                     record.get("name")

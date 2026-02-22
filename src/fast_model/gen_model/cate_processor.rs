@@ -62,7 +62,7 @@ pub async fn process_cate_refno_page(
 
     // Generate 阶段（且非 Direct）：严格只读缓存，不回查 SurrealDB。
     if ctx.is_offline_generate() {
-        return gen_cate_instances_from_cache_only(ctx, &target_cata_map, sender, refnos).await;
+        return gen_cate_instances_from_cache_only(ctx, &target_cata_map, sender, refnos, false).await;
     }
 
     // 方案 A（Direct/非离线）：允许在 Prefetch 阶段预热 resolve_desi_comp 产物缓存（按 cata_hash）。
@@ -95,15 +95,16 @@ pub async fn process_cate_refno_page(
     Ok(())
 }
 
-async fn gen_cate_instances_from_cache_only(
+pub(crate) async fn gen_cate_instances_from_cache_only(
     ctx: &NounProcessContext,
     target_cata_map: &Arc<DashMap<String, aios_core::pdms_types::CataHashRefnoKV>>,
     sender: flume::Sender<ShapeInstancesData>,
     refnos: &[RefnoEnum],
+    strict: bool,
 ) -> Result<()> {
     // 1) cate inst 输入：仅从 geom_input_cache 读取
-    geom_input_cache::init_global_geom_input_cache(ctx.db_option.as_ref()).await?;
-    let cate_inputs = geom_input_cache::load_cate_inputs_for_refnos_from_global(refnos).await?;
+    geom_input_cache::init_global_geom_input_cache();
+    let cate_inputs = geom_input_cache::load_cate_inputs_for_refnos_from_global(refnos)?;
     if cate_inputs.len() != refnos.len() {
         let mut missing: Vec<RefnoEnum> = refnos
             .iter()
@@ -121,23 +122,30 @@ async fn gen_cate_instances_from_cache_only(
                 );
             }
         });
-        anyhow::bail!(
-            "离线生成禁止 CATE 输入 miss：request={}, hit={}, missing={}, sample=[{}]",
-            refnos.len(),
-            cate_inputs.len(),
-            missing.len(),
-            missing
-                .iter()
-                .take(32)
-                .map(|r| r.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        if strict {
+            anyhow::bail!(
+                "离线生成禁止 CATE 输入 miss：request={}, hit={}, missing={}, sample=[{}]",
+                refnos.len(),
+                cate_inputs.len(),
+                missing.len(),
+                missing
+                    .iter()
+                    .take(32)
+                    .map(|r| r.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        } else {
+            println!(
+                "[cate_processor] cache-only 容错: cate_input miss {}/{}, 跳过缺失 refno",
+                missing.len(),
+                refnos.len()
+            );
+        }
     }
 
     // 2) prepared geos/ptset：仅从 cata_resolve_cache 读取
-    let cache_dir = ctx.db_option.get_foyer_cache_dir().join("cata_resolve_cache");
-    cata_resolve_cache::init_global_cata_resolve_cache(cache_dir).await?;
+    cata_resolve_cache::init_global_cata_resolve_cache();
     let Some(resolve_cache) = cata_resolve_cache::global_cata_resolve_cache() else {
         cache_miss_report::with_global_report(|r| {
             r.record_simple_miss(
@@ -151,6 +159,10 @@ async fn gen_cate_instances_from_cache_only(
 
     let respect_tufl = std::env::var_os("AIOS_RESPECT_TUFL").is_some();
     let mut shape_insts_data = ShapeInstancesData::default();
+    let mut cata_cache_miss_groups = 0usize;
+    let mut cata_cache_miss_refnos = 0usize;
+    let mut cata_cache_miss_samples: Vec<String> = Vec::new();
+    const CATA_CACHE_MISS_SAMPLE_LIMIT: usize = 12;
 
     // 3) 按 cata_hash 分组处理（注意：dashmap entry 不能跨 await 持有）
     for kv in target_cata_map.iter() {
@@ -158,7 +170,7 @@ async fn gen_cate_instances_from_cache_only(
         let group_refnos = kv.value().group_refnos.clone();
         drop(kv);
 
-        let Some(resolved_comp) = resolve_cache.get(&cata_hash).await else {
+        let Some(resolved_comp) = resolve_cache.get(&cata_hash) else {
             cache_miss_report::with_global_report(|r| {
                 for &rno in &group_refnos {
                     r.record_refno_miss(
@@ -169,11 +181,20 @@ async fn gen_cate_instances_from_cache_only(
                     );
                 }
             });
-            anyhow::bail!(
-                "离线生成禁止 cata_resolve_cache miss：cata_hash={}, group_refnos_sample={:?}",
-                cata_hash,
-                group_refnos.iter().take(8).collect::<Vec<_>>()
-            );
+            if strict {
+                anyhow::bail!(
+                    "离线生成禁止 cata_resolve_cache miss：cata_hash={}, group_refnos_sample={:?}",
+                    cata_hash,
+                    group_refnos.iter().take(8).collect::<Vec<_>>()
+                );
+            } else {
+                cata_cache_miss_groups += 1;
+                cata_cache_miss_refnos += group_refnos.len();
+                if cata_cache_miss_samples.len() < CATA_CACHE_MISS_SAMPLE_LIMIT {
+                    cata_cache_miss_samples.push(format!("{}({})", cata_hash, group_refnos.len()));
+                }
+                continue;
+            }
         };
 
         // 3.1) 将 prepared geos 转为 inst_geo 列表（复用于组内每个实例）
@@ -202,19 +223,22 @@ async fn gen_cate_instances_from_cache_only(
 
         for &group_refno in group_refnos.iter() {
             let Some(input) = cate_inputs.get(&group_refno) else {
-                cache_miss_report::with_global_report(|r| {
-                    r.record_refno_miss(
-                        ctx.gen_stage.as_str(),
-                        "cate:cate_input_miss",
+                if strict {
+                    cache_miss_report::with_global_report(|r| {
+                        r.record_refno_miss(
+                            ctx.gen_stage.as_str(),
+                            "cate:cate_input_miss",
+                            group_refno,
+                            Some("missing cate input in geom_input_cache (need prefetch)"),
+                        )
+                    });
+                    anyhow::bail!(
+                        "离线生成禁止 CATE 输入 miss：refno={}, cata_hash={}",
                         group_refno,
-                        Some("missing cate input in geom_input_cache (need prefetch)"),
-                    )
-                });
-                anyhow::bail!(
-                    "离线生成禁止 CATE 输入 miss：refno={}, cata_hash={}",
-                    group_refno,
-                    cata_hash
-                );
+                        cata_hash
+                    );
+                }
+                continue;
             };
 
             let type_name = input.attmap.get_type_str().to_string();
@@ -260,6 +284,15 @@ async fn gen_cate_instances_from_cache_only(
                     .expect("send cate shape_insts_data error");
             }
         }
+    }
+
+    if !strict && cata_cache_miss_groups > 0 {
+        println!(
+            "[cate_processor] cache-only 容错: cata_resolve_cache miss groups={}, skipped_refnos={}, sample=[{}]",
+            cata_cache_miss_groups,
+            cata_cache_miss_refnos,
+            cata_cache_miss_samples.join(", ")
+        );
     }
 
     if shape_insts_data.inst_cnt() > 0 {

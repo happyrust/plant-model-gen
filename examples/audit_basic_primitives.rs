@@ -14,9 +14,9 @@
 //! - 不设置 OWNER_REFNO：扫描该 refno 所在 dbnum 下的全部基本体（可能很大）
 //! - 设置 MAX_ANOMALIES：限制输出条数（默认 50）
 
-use anyhow::{Context, Result};
-use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::RefnoEnum;
+use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
@@ -103,7 +103,9 @@ fn approx_one(s: f32) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let owner_refno = env::var("OWNER_REFNO").ok().map(|s| RefnoEnum::from(s.as_str()));
+    let owner_refno = env::var("OWNER_REFNO")
+        .ok()
+        .map(|s| RefnoEnum::from(s.as_str()));
     if let Some(o) = owner_refno {
         anyhow::ensure!(o.is_valid(), "无效 OWNER_REFNO: {}", o);
     }
@@ -160,7 +162,11 @@ async fn main() -> Result<()> {
     metas.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
 
     // Pass 2：newest-first 扫描，每个 refno 只处理一次（取“最新命中”）。
-    let owner_u64 = if scan_all_db { None } else { owner_refno.map(|o| o.refno()) };
+    let owner_u64 = if scan_all_db {
+        None
+    } else {
+        owner_refno.map(|o| o.refno())
+    };
     // 以 RefnoEnum 去重：同一几何 refno 只取“最新命中”的 inst_geos。
     let mut seen_refnos: HashSet<RefnoEnum> = HashSet::new();
 
@@ -225,7 +231,10 @@ async fn main() -> Result<()> {
                     total_anomalies += 1;
                     if printed < max_anomalies {
                         printed += 1;
-                        println!("\n⚠️ anomaly (latest batch): batch_id={} created_at={}", batch_id, created_at);
+                        println!(
+                            "\n⚠️ anomaly (latest batch): batch_id={} created_at={}",
+                            batch_id, created_at
+                        );
                         println!(
                             "   - refno={} type_name={} geo_hash={} kind={} unit_flag={} geo_type={:?}",
                             geos.refno,
@@ -254,7 +263,10 @@ async fn main() -> Result<()> {
 
     println!("\n== summary ==");
     println!("basic_prim_insts: {}", total_prim_insts);
-    println!("anomalies(unit_flag=false but scale!=1): {}", total_anomalies);
+    println!(
+        "anomalies(unit_flag=false but scale!=1): {}",
+        total_anomalies
+    );
     if total_anomalies > printed {
         println!("(仅输出前 {} 条；可用 MAX_ANOMALIES 调整)", printed);
     }
@@ -265,7 +277,11 @@ async fn main() -> Result<()> {
     for (geo_hash, sigs) in geo_hash_signatures.iter() {
         if sigs.len() > 1 {
             collision_cnt += 1;
-            println!("\n⚠️ geo_hash 参数碰撞: geo_hash={} signatures={}", geo_hash, sigs.len());
+            println!(
+                "\n⚠️ geo_hash 参数碰撞: geo_hash={} signatures={}",
+                geo_hash,
+                sigs.len()
+            );
             for s in sigs.iter().take(8) {
                 println!("   - {}", s);
             }
@@ -274,7 +290,10 @@ async fn main() -> Result<()> {
             }
         }
     }
-    println!("\ngeo_hash_collisions(distinct signatures > 1): {}", collision_cnt);
+    println!(
+        "\ngeo_hash_collisions(distinct signatures > 1): {}",
+        collision_cnt
+    );
 
     Ok(())
 }

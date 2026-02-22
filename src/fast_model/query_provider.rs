@@ -279,13 +279,13 @@ pub async fn query_by_type(
 ///
 /// ```rust,ignore
 /// // 查询全库所有 EQUI 和 FITT
-/// let refnos = query_by_noun_all_db(&["EQUI", "FITT"]).await?;
+/// let refnos = query_by_noun_all_db(&["EQUI", "FITT"])?;
 /// ```
 ///
 /// # 实现说明
 ///
 /// 此函数使用 TreeIndexManager 查询全库范围内的所有实例。
-pub async fn query_by_noun_all_db(nouns: &[&str]) -> anyhow::Result<Vec<RefnoEnum>> {
+pub fn query_by_noun_all_db(nouns: &[&str]) -> anyhow::Result<Vec<RefnoEnum>> {
     if nouns.is_empty() {
         return Ok(Vec::new());
     }
@@ -304,7 +304,7 @@ pub async fn query_by_noun_all_db(nouns: &[&str]) -> anyhow::Result<Vec<RefnoEnu
 }
 
 /// 统计指定 noun 在全库范围内的实例数量（GROUP ALL + LIMIT 1）
-pub async fn count_noun_all_db(noun: &str) -> anyhow::Result<u64> {
+pub fn count_noun_all_db(noun: &str) -> anyhow::Result<u64> {
     if noun.is_empty() {
         return Ok(0);
     }
@@ -316,7 +316,7 @@ pub async fn count_noun_all_db(noun: &str) -> anyhow::Result<u64> {
 }
 
 /// 根据分页参数获取指定 noun 的 refno 列表
-pub async fn query_noun_page_all_db(
+pub fn query_noun_page_all_db(
     noun: &str,
     start: usize,
     limit: usize,
@@ -486,7 +486,7 @@ pub async fn query_multi_descendants_with_self(
 
     let mut root_dbnums: Vec<(RefnoEnum, u32)> = Vec::with_capacity(refnos.len());
     for &root in refnos {
-        let dbnum = TreeIndexManager::resolve_dbnum_for_refno(root).await?;
+        let dbnum = TreeIndexManager::resolve_dbnum_for_refno(root)?;
         root_dbnums.push((root, dbnum));
     }
 

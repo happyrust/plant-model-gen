@@ -37,18 +37,17 @@ save_spatial_tree_to_db = false
 enable_sqlite_rtree = true
 gen_model_batch_size = 16
 
-# Full Noun 模式配置：只生成房间相关面板 + 管道分支，避免全库跑
-full_noun_mode = true
-full_noun_max_concurrent_nouns = 1
-full_noun_batch_size = 200
+# IndexTree 默认管线调优配置：只生成房间相关面板 + 管道分支，避免全库跑
+index_tree_max_concurrent_targets = 1
+index_tree_batch_size = 200
 
 # 启用的 noun 类别/具体 noun 名称
 # 这里用“具体 noun 名称”模式，确保只处理 PANE/BRAN
-full_noun_enabled_categories = ["PANE", "BRAN"]
-full_noun_excluded_nouns = []
+index_tree_enabled_target_types = ["PANE", "BRAN"]
+index_tree_excluded_target_types = []
 
 # 0 表示不限制（生成全部）
-debug_limit_per_noun = 0
+index_tree_debug_limit_per_target_type = 0
 
 build_cate_relate = false
 

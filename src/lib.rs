@@ -468,72 +468,6 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 
 
 
-    // 检查是否启用 Full Noun 模式（优先级最高，在增量更新之前检查）
-
-    let full_noun_mode = std::env::var("FULL_NOUN_MODE")
-
-        .map(|v| v.to_lowercase() == "true")
-
-        .unwrap_or(false);
-
-
-
-    if full_noun_mode {
-
-        log::info!("[run_cli] 检测到 Full Noun 模式，跳过增量更新检测");
-
-
-
-        if db_option.is_gen_mesh_or_model() {
-
-            log::info!("正在生成模型（Full Noun 模式）");
-
-            let mut time = Instant::now();
-
-            fs::create_dir_all("assets/meshes")?;
-
-            gen_all_geos_data(vec![], &db_option_ext, None, None).await?;
-
-        }
-
-
-
-        // Full Noun 模式也支持房间计算
-
-        if db_option.gen_spatial_tree {
-
-            log::info!("🏠 启用房间计算功能");
-
-            log::info!("房间关键字为: {:?}", db_option.get_room_key_word());
-
-            log::info!("正在执行房间计算...");
-
-            log::info!("正在构建房间关系和空间索引...");
-
-            let time = Instant::now();
-
-            if let Err(e) = build_room_relations(&db_option, None, None).await {
-
-                log::error!("❌ 房间计算失败: {}", e);
-
-                return Err(e);
-
-            }
-
-            log::info!("✅ 房间计算完成，耗时: {} ms", time.elapsed().as_millis());
-
-        }
-
-
-
-        // Full Noun 模式下跳过后续的增量更新和其他处理
-
-        return Ok(());
-
-    }
-
-
-
     let mgr = Arc::new(AiosDBManager::init_form_config().await?);
 
     /// 创建db manager
@@ -987,4 +921,3 @@ pub mod web_api;
 #[cfg(feature = "web_server")]
 
 pub mod web_server;
-

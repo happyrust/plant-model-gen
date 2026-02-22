@@ -58,36 +58,32 @@ pub struct DbOptionExt {
     #[serde(default)]
     pub target_sesno: Option<u32>,
 
-    /// 启用全库 Noun 扫描模式（不按 dbnum/refno 层级过滤）
-    #[serde(default)]
-    pub full_noun_mode: bool,
-
-    /// Full Noun 模式下同时进行的 Noun 级任务数量
+    /// IndexTree 模式下同时进行的 Noun 级任务数量
     /// 默认为 None 时使用合理的并发数（如 CPU 核数）
     #[serde(default)]
-    pub full_noun_max_concurrent_nouns: Option<usize>,
+    pub index_tree_max_concurrent_targets: Option<usize>,
 
-    /// Full Noun 模式下单个 Noun 的 refno 列表按批次切分的大小
+    /// IndexTree 模式下单个 Noun 的 refno 列表按批次切分的大小
     /// 默认为 None 时复用 gen_model_batch_size
     #[serde(default)]
-    pub full_noun_batch_size: Option<usize>,
+    pub index_tree_batch_size: Option<usize>,
 
-    /// Full Noun 模式下启用的 noun 类别列表
+    /// IndexTree 模式下启用的 noun 类别列表
     /// 可选值: "cate", "loop", "prim" 或具体 noun 名称如 "BRAN", "PANE"
     /// 空 vec 表示启用所有类别（默认行为）
     #[serde(default)]
-    pub full_noun_enabled_categories: Vec<String>,
+    pub index_tree_enabled_target_types: Vec<String>,
 
-    /// Full Noun 模式下禁用的 noun 列表
+    /// IndexTree 模式下禁用的 noun 列表
     /// 即使类别启用，这里的 noun 也会被过滤掉
     #[serde(default)]
-    pub full_noun_excluded_nouns: Vec<String>,
+    pub index_tree_excluded_target_types: Vec<String>,
 
     /// 调试模式：限制每种 Noun 类型的处理数量
     /// 设置为 None 或 0 表示不限制，设置为具体数字则只处理前 N 个实例
     /// 用于快速测试和调试，避免处理全库数据
     #[serde(default)]
-    pub debug_limit_per_noun: Option<usize>,
+    pub index_tree_debug_limit_per_target_type: Option<usize>,
 
     /// 生成的模型格式列表
     /// 默认为 [PdmsMesh]
@@ -143,19 +139,19 @@ impl DerefMut for DbOptionExt {
 }
 
 impl DbOptionExt {
-    /// 获取 Full Noun 模式下的实际并发数
+    /// 获取 IndexTree 模式下的实际并发数
     /// 如果未配置，返回 CPU 核数（最小为 2，最大为 8）
-    pub fn get_full_noun_concurrency(&self) -> usize {
-        self.full_noun_max_concurrent_nouns.unwrap_or_else(|| {
+    pub fn get_index_tree_concurrency(&self) -> usize {
+        self.index_tree_max_concurrent_targets.unwrap_or_else(|| {
             let cpu_count = num_cpus::get();
             cpu_count.clamp(2, 8)
         })
     }
 
-    /// 获取 Full Noun 模式下的实际批次大小
+    /// 获取 IndexTree 模式下的实际批次大小
     /// 如果未配置，复用 gen_model_batch_size
-    pub fn get_full_noun_batch_size(&self) -> usize {
-        self.full_noun_batch_size
+    pub fn get_index_tree_batch_size(&self) -> usize {
+        self.index_tree_batch_size
             .unwrap_or(self.inner.gen_model_batch_size)
     }
 
@@ -177,16 +173,16 @@ impl DbOptionExt {
     /// 检查 noun 类别是否启用
     /// 空列表表示启用所有类别
     pub fn is_noun_category_enabled(&self, category: &str) -> bool {
-        self.full_noun_enabled_categories.is_empty()
+        self.index_tree_enabled_target_types.is_empty()
             || self
-                .full_noun_enabled_categories
+                .index_tree_enabled_target_types
                 .iter()
                 .any(|cat| cat == category || cat.to_lowercase() == category.to_lowercase())
     }
 
     /// 检查具体 noun 是否被排除
     pub fn is_noun_excluded(&self, noun: &str) -> bool {
-        self.full_noun_excluded_nouns
+        self.index_tree_excluded_target_types
             .iter()
             .any(|excluded| excluded == noun || excluded.to_lowercase() == noun.to_lowercase())
     }
@@ -194,8 +190,8 @@ impl DbOptionExt {
     /// 检查具体 noun 是否在启用的列表中（当使用具体 noun 名称时）
     pub fn is_noun_explicitly_enabled(&self, noun: &str) -> bool {
         // 如果启用了具体 noun 名称，则检查
-        !self.full_noun_enabled_categories.is_empty()
-            && (self.full_noun_enabled_categories.iter()
+        !self.index_tree_enabled_target_types.is_empty()
+            && (self.index_tree_enabled_target_types.iter()
                 .any(|cat| cat == noun || cat.to_lowercase() == noun.to_lowercase())
                 // 也检查类别名称
                 || self.is_noun_category_enabled(noun))
@@ -255,12 +251,11 @@ impl From<DbOption> for DbOptionExt {
             http_server: None,
             http_port: None,
             target_sesno: None,
-            full_noun_mode: false,
-            full_noun_max_concurrent_nouns: None,
-            full_noun_batch_size: None,
-            full_noun_enabled_categories: Vec::new(),
-            full_noun_excluded_nouns: Vec::new(),
-            debug_limit_per_noun: None,
+            index_tree_max_concurrent_targets: None,
+            index_tree_batch_size: None,
+            index_tree_enabled_target_types: Vec::new(),
+            index_tree_excluded_target_types: Vec::new(),
+            index_tree_debug_limit_per_target_type: None,
             mesh_formats: vec![MeshFormat::PdmsMesh],
             use_surrealdb: true,
             use_cache: true,
@@ -302,25 +297,58 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
     let toml_value: toml::Value = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("Failed to parse TOML from {}: {}", config_file, e))?;
 
-    // 提取扩展字段
-    let full_noun_mode = toml_value
-        .get("full_noun_mode")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // 不兼容旧键：发现即报错，避免静默误跑
+    let legacy_key_mapping = [
+        ("full_noun_mode", "(已移除，IndexTree 现在是默认管线)"),
+        (
+            "full_noun_max_concurrent_nouns",
+            "index_tree_max_concurrent_targets",
+        ),
+        ("full_noun_batch_size", "index_tree_batch_size"),
+        (
+            "full_noun_enabled_categories",
+            "index_tree_enabled_target_types",
+        ),
+        (
+            "full_noun_excluded_nouns",
+            "index_tree_excluded_target_types",
+        ),
+        (
+            "debug_limit_per_noun",
+            "index_tree_debug_limit_per_target_type",
+        ),
+    ];
+    let legacy_hits: Vec<(&str, &str)> = legacy_key_mapping
+        .iter()
+        .copied()
+        .filter(|(legacy, _)| toml_value.get(*legacy).is_some())
+        .collect();
+    if !legacy_hits.is_empty() {
+        let migration = legacy_hits
+            .iter()
+            .map(|(legacy, new_key)| format!("{} -> {}", legacy, new_key))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow::anyhow!(
+            "配置文件 {} 使用了已移除的旧键，请迁移后重试: {}",
+            config_file,
+            migration
+        ));
+    }
 
-    let full_noun_max_concurrent_nouns = toml_value
-        .get("full_noun_max_concurrent_nouns")
+    let index_tree_max_concurrent_targets = toml_value
+        .get("index_tree_max_concurrent_targets")
         .and_then(|v| v.as_integer())
         .map(|v| v as usize);
 
-    let full_noun_batch_size = toml_value
-        .get("full_noun_batch_size")
+    let index_tree_batch_size = toml_value
+        .get("index_tree_batch_size")
         .and_then(|v| v.as_integer())
         .map(|v| v as usize);
 
     // 解析启用的 noun 类别
-    let full_noun_enabled_categories = toml_value
-        .get("full_noun_enabled_categories")
+    let index_tree_enabled_target_types = toml_value
+        .get("index_tree_enabled_target_types")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -330,8 +358,8 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .unwrap_or_default();
 
     // 解析禁用的 noun 列表
-    let full_noun_excluded_nouns = toml_value
-        .get("full_noun_excluded_nouns")
+    let index_tree_excluded_target_types = toml_value
+        .get("index_tree_excluded_target_types")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -341,8 +369,8 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .unwrap_or_default();
 
     // 解析调试限制
-    let debug_limit_per_noun = toml_value
-        .get("debug_limit_per_noun")
+    let index_tree_debug_limit_per_target_type = toml_value
+        .get("index_tree_debug_limit_per_target_type")
         .and_then(|v| v.as_integer())
         .map(|v| v as usize)
         .filter(|&v| v > 0); // 0 表示不限制，转换为 None
@@ -424,12 +452,11 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         http_server: None,
         http_port: None,
         target_sesno: None,
-        full_noun_mode,
-        full_noun_max_concurrent_nouns,
-        full_noun_batch_size,
-        full_noun_enabled_categories,
-        full_noun_excluded_nouns,
-        debug_limit_per_noun,
+        index_tree_max_concurrent_targets,
+        index_tree_batch_size,
+        index_tree_enabled_target_types,
+        index_tree_excluded_target_types,
+        index_tree_debug_limit_per_target_type,
         mesh_formats,
         use_surrealdb,
         use_cache,
@@ -450,17 +477,16 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         "   - LOD profiles 数量: {}",
         db_option_ext.inner.mesh_precision.lod_profiles.len()
     );
-    println!("   - full_noun_mode: {}", db_option_ext.full_noun_mode);
-    if !db_option_ext.full_noun_enabled_categories.is_empty() {
+    if !db_option_ext.index_tree_enabled_target_types.is_empty() {
         println!(
             "   - 启用的 noun 类别: {:?}",
-            db_option_ext.full_noun_enabled_categories
+            db_option_ext.index_tree_enabled_target_types
         );
     }
-    if !db_option_ext.full_noun_excluded_nouns.is_empty() {
+    if !db_option_ext.index_tree_excluded_target_types.is_empty() {
         println!(
             "   - 排除的 noun: {:?}",
-            db_option_ext.full_noun_excluded_nouns
+            db_option_ext.index_tree_excluded_target_types
         );
     }
 

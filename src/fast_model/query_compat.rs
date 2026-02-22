@@ -23,11 +23,12 @@ use aios_core::tool::db_tool::db1_hash;
 use aios_core::tree_query::{TreeIndex, TreeQuery, TreeQueryFilter, TreeQueryOptions};
 use aios_core::types::{NamedAttrMap as NamedAttMap, SPdmsElement as PE};
 use once_cell::sync::Lazy;
+use std::collections::HashSet;
 use std::sync::Arc;
 
-static VISIBLE_GEO_NOUN_HASHES: Lazy<Vec<u32>> =
+static VISIBLE_GEO_NOUN_HASHES: Lazy<HashSet<u32>> =
     Lazy::new(|| VISBILE_GEO_NOUNS.iter().map(|&name| db1_hash(name)).collect());
-static NEG_GEO_NOUN_HASHES: Lazy<Vec<u32>> =
+static NEG_GEO_NOUN_HASHES: Lazy<HashSet<u32>> =
     Lazy::new(|| TOTAL_NEG_NOUN_NAMES.iter().map(|&name| db1_hash(name)).collect());
 static BRAN_HASH: Lazy<u32> = Lazy::new(|| db1_hash("BRAN"));
 static HANG_HASH: Lazy<u32> = Lazy::new(|| db1_hash("HANG"));
@@ -45,7 +46,7 @@ async fn load_tree_index_for_refno(refno: RefnoEnum) -> anyhow::Result<Arc<TreeI
     load_index_with_large_stack(&tree_dir, dbnum)
 }
 
-fn build_noun_hashes(nouns: &[&str]) -> Option<Vec<u32>> {
+fn build_noun_hashes(nouns: &[&str]) -> Option<HashSet<u32>> {
     if nouns.is_empty() {
         None
     } else {
@@ -69,7 +70,7 @@ fn parse_max_depth(range_str: Option<&str>) -> Option<usize> {
 
 async fn query_descendants_bfs(
     refno: RefnoEnum,
-    noun_hashes: Option<Vec<u32>>,
+    noun_hashes: Option<HashSet<u32>>,
     include_self: bool,
     range_str: Option<&str>,
 ) -> anyhow::Result<Vec<RefnoEnum>> {
@@ -90,7 +91,7 @@ async fn query_descendants_bfs(
 
 async fn query_children_filtered(
     refno: RefnoEnum,
-    noun_hashes: Option<Vec<u32>>,
+    noun_hashes: Option<HashSet<u32>>,
 ) -> anyhow::Result<Vec<RefnoEnum>> {
     let index = load_tree_index_for_refno(refno).await?;
     let filter = TreeQueryFilter {

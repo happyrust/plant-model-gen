@@ -339,7 +339,7 @@ pub async fn collect_export_refnos(
         );
     }
 
-    let noun_hashes: Option<Vec<u32>> = filter_nouns
+    let noun_hashes: Option<HashSet<u32>> = filter_nouns
         .filter(|n| !n.is_empty())
         .map(|nouns| nouns.iter().map(|s| db1_hash(s.as_str())).collect());
 

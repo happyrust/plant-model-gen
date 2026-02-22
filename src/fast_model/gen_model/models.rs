@@ -5,7 +5,7 @@ use aios_core::RefnoEnum;
 use futures::stream::FuturesUnordered;
 use std::sync::Arc;
 
-/// Noun 分类枚举，用于 Full Noun 模式
+/// Noun 分类枚举，用于 IndexTree 目标类型处理
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NounCategory {
     /// 使用元件库的 Noun

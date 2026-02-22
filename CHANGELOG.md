@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-02-22
+
+### Breaking
+
+- **模型生成模式开关已移除，统一为 IndexTree 默认管线**
+  - 删除 `full_noun_mode` 配置与 `FULL_NOUN_MODE` 环境分支
+  - 删除旧的 `non_full_noun` 主路径与相关路由
+  - `manual/debug/incremental/full` 统一收敛到单入口 `process_index_tree_generation`
+
+### Changed
+
+- **Full Noun 语义重命名为 IndexTree**
+  - 文件重命名：`full_noun_mode.rs` -> `index_tree_mode.rs`
+  - 类型/函数重命名：`FullNounConfig/Error` -> `IndexTreeConfig/Error`，`gen_full_noun_geos_optimized` -> `gen_index_tree_geos_optimized`
+  - `noun_collection` 对外命名改为 `IndexTreeTargetCollection`
+  - 日志与性能标签统一为 `index_tree_*` 语义
+
+- **配置键统一为 `index_tree_*`**
+  - `full_noun_max_concurrent_nouns` -> `index_tree_max_concurrent_targets`
+  - `full_noun_batch_size` -> `index_tree_batch_size`
+  - `full_noun_enabled_categories` -> `index_tree_enabled_target_types`
+  - `full_noun_excluded_nouns` -> `index_tree_excluded_target_types`
+  - `debug_limit_per_noun` -> `index_tree_debug_limit_per_target_type`
+  - `db_options/*.toml` 全量切换到新键
+
+### Fixed
+
+- **`--gen-indextree <dbnum>` 配置读取路径与主流程统一**
+  - `generate_single_indextree` 不再硬编码 `DbOption.toml`
+  - 改为优先读取 `DB_OPTION_FILE`，默认 `db_options/DbOption.toml`
+
 ## 2026-02-13
 
 ### Refactored

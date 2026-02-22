@@ -491,7 +491,7 @@ pub async fn query_multi_descendants_with_self(
     }
 
     // 这里直接用 TreeIndex 查询（并在大栈线程加载 `.tree`），避免依赖全局 Provider 的初始化时机。
-    let noun_hashes: Option<Vec<u32>> = if nouns.is_empty() {
+    let noun_hashes: Option<HashSet<u32>> = if nouns.is_empty() {
         None
     } else {
         Some(nouns.iter().map(|&n| db1_hash(n)).collect())

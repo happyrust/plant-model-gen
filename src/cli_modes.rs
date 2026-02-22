@@ -1766,8 +1766,7 @@ pub async fn export_dbnum_instances_json_mode(
                         db_option_ext_override.use_surrealdb = true; // 需要从 SurrealDB 读取输入数据
                         db_option_ext_override.inner.save_db = Some(false); // 不写回 SurrealDB
                         db_option_ext_override.export_instances = false; // 禁用自动导出，由我们的代码单独处理
-                        // 禁用 Full Noun 模式，使用全库生成以确保所有类型节点都被处理
-                        db_option_ext_override.full_noun_mode = false;
+                        // IndexTree 已默认启用：无需模式开关
 
                         unsafe {
                             std::env::set_var("FORCE_REPLACE_MESH", "true");

@@ -77,7 +77,7 @@ pub fn query_descendants_map_by_dbnum(
     // best-effort：单个 refno 缺映射不会导致整个 batch 的 neg_refnos 全部丢失。
     let (grouped, missing_dbnum) = group_by_dbnum_best_effort(roots, |r| db_meta().get_dbnum_by_refno(r));
 
-    let noun_hashes: Option<Vec<u32>> = if nouns.is_empty() {
+    let noun_hashes: Option<HashSet<u32>> = if nouns.is_empty() {
         None
     } else {
         Some(nouns.iter().map(|n| db1_hash(n)).collect())

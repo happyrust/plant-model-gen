@@ -201,10 +201,7 @@ pub use gen_model::*;
 
 
 // ✅ 已完成迁移：
-
-// - gen_geos_data_by_dbnum → gen_model::non_full_noun (✅ 已完成)
-
-// - gen_geos_data → gen_model::non_full_noun (✅ 已完成)
+// - 模型生成统一入口：gen_model::gen_all_geos_data（IndexTree 单管线）
 
 // - process_meshes_by_dbnos → gen_model::mesh_processing (✅ 已完成)
 
@@ -569,4 +566,3 @@ macro_rules! smart_debug_model_warn {
     }};
 
 }
-

@@ -585,7 +585,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("gen-nouns")
                 .long("gen-nouns")
-                .help("Only generate specified noun types (comma-separated, e.g. BRAN,PANE). Overrides full_noun_enabled_categories in DbOption")
+                .help("Only generate specified noun types (comma-separated, e.g. BRAN,PANE). Overrides index_tree_enabled_target_types in DbOption")
                 .value_name("NOUNS")
                 .value_delimiter(',')
                 .num_args(1..),
@@ -877,10 +877,10 @@ async fn main() -> anyhow::Result<()> {
         let v: Vec<String> = nouns.map(|s| s.to_uppercase()).collect();
         if !v.is_empty() {
             println!(
-                "🔧 CLI 覆盖 full_noun_enabled_categories: {:?} -> {:?}",
-                db_option_ext.full_noun_enabled_categories, v
+                "🔧 CLI 覆盖 index_tree_enabled_target_types: {:?} -> {:?}",
+                db_option_ext.index_tree_enabled_target_types, v
             );
-            db_option_ext.full_noun_enabled_categories = v;
+            db_option_ext.index_tree_enabled_target_types = v;
         }
     }
 
@@ -969,21 +969,15 @@ async fn main() -> anyhow::Result<()> {
     println!("🔧 配置加载完成:");
     println!("   - 配置文件路径: {}", config_path);
     println!(
-        "   - full_noun_enabled_categories: {:?}",
-        db_option_ext.full_noun_enabled_categories
+        "   - index_tree_enabled_target_types: {:?}",
+        db_option_ext.index_tree_enabled_target_types
     );
     println!(
-        "   - full_noun_excluded_nouns: {:?}",
-        db_option_ext.full_noun_excluded_nouns
+        "   - index_tree_excluded_target_types: {:?}",
+        db_option_ext.index_tree_excluded_target_types
     );
 
-    // 设置 Full Noun 模式环境变量
-    if db_option_ext.full_noun_mode {
-        unsafe {
-            std::env::set_var("FULL_NOUN_MODE", "true");
-        }
-        println!("✅ Full Noun 模式已启用");
-    }
+    println!("✅ IndexTree 默认生成管线已启用（无模式开关）");
     let config_debug_refnos: Option<Vec<String>> = db_option_ext.inner.debug_model_refnos.clone();
     let log_model_error = matches.get_flag("log-model-error");
     let debug_model_requested = matches.contains_id("debug-model") || log_model_error;

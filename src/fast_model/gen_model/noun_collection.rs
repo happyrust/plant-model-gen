@@ -4,9 +4,9 @@ use aios_core::pdms_types::{
 };
 use std::collections::HashSet;
 
-/// Full Noun 模式下的 Noun 列表聚合结果
+/// IndexTree 管线下的目标类型聚合结果
 #[derive(Debug, Clone)]
-pub struct FullNounCollection {
+pub struct IndexTreeTargetCollection {
     /// 按类别分组的 Noun 列表
     pub cate_nouns: Vec<&'static str>,
     pub loop_owner_nouns: Vec<&'static str>,
@@ -15,8 +15,8 @@ pub struct FullNounCollection {
     pub all_nouns: HashSet<&'static str>,
 }
 
-impl FullNounCollection {
-    /// 聚合并去重所有 Noun 列表（兼容版本）
+impl IndexTreeTargetCollection {
+    /// 聚合并去重所有 Noun 列表
     ///
     /// 从 pdms_types 中的常量收集：
     /// - USE_CATE_NOUN_NAMES
@@ -33,7 +33,7 @@ impl FullNounCollection {
     /// 根据 config 过滤启用的 noun 类别和具体 noun
     pub fn collect_with_config(
         extra_nouns: Option<&[&'static str]>,
-        config: Option<&super::config::FullNounConfig>,
+        config: Option<&super::config::IndexTreeConfig>,
     ) -> Self {
         // 收集 cate nouns（仅在类别内部去重，不做跨类别互斥）
         let mut cate_nouns = Vec::new();
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn test_collect_nouns() {
-        let collection = FullNounCollection::collect(None);
+        let collection = IndexTreeTargetCollection::collect(None);
 
         // 所有类别中的 noun 都应该出现在 all_nouns 中
         for &noun in collection
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_get_category() {
-        let collection = FullNounCollection::collect(None);
+        let collection = IndexTreeTargetCollection::collect(None);
 
         // 测试已知的noun
         if let Some(&first_cate) = collection.cate_nouns.first() {
@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn test_extra_nouns() {
         let extras = vec!["CUSTOM1", "CUSTOM2"];
-        let collection = FullNounCollection::collect(Some(&extras));
+        let collection = IndexTreeTargetCollection::collect(Some(&extras));
 
         assert!(collection.all_nouns.contains("CUSTOM1"));
         assert!(collection.all_nouns.contains("CUSTOM2"));

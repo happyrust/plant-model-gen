@@ -17,9 +17,9 @@ use tokio::sync::RwLock;
 
 use super::cate_processor::process_cate_refno_page;
 use super::categorized_refnos::CategorizedRefnos;
-use super::config::FullNounConfig;
+use super::config::IndexTreeConfig;
 use super::context::{GenStage, NounProcessContext};
-use super::errors::{FullNounError, Result};
+use super::errors::{IndexTreeError, Result};
 use super::cata_resolve_cache_pipeline;
 use super::loop_processor::process_loop_refno_page;
 use super::prim_processor::process_prim_refno_page;
@@ -49,14 +49,14 @@ use tracing::{info, instrument};
 /// 根据配置决定是否警告或报错
 pub fn validate_sjus_map(
     sjus_map: &DashMap<RefnoEnum, (Vec3, f32)>,
-    config: &FullNounConfig,
+    config: &IndexTreeConfig,
 ) -> Result<()> {
     if config.validate_sjus_map && sjus_map.is_empty() {
         let warning = "⚠️ SJUS map 为空，几何体生成可能产生不正确的结果";
 
         if config.strict_validation {
             log::error!("{}", warning);
-            return Err(FullNounError::EmptySjusMap);
+            return Err(IndexTreeError::EmptySjusMap);
         } else {
             log::warn!("{}", warning);
             log::warn!("  提示：如果这是预期行为，可以在配置中禁用 validate_sjus_map");
@@ -72,7 +72,7 @@ fn track_refno_issues(refnos: &[RefnoEnum], context: &str, stage: RefnoErrorStag
             record_refno_error(
                 RefnoErrorKind::ZeroOrNegative,
                 stage,
-                "fast_model/gen_model/full_noun_mode.rs",
+                "fast_model/gen_model/index_tree_mode.rs",
                 "collect_refnos",
                 format!("{} 返回无效 RefNo=0", context),
                 Some(&refno),
@@ -86,7 +86,7 @@ fn track_refno_issues(refnos: &[RefnoEnum], context: &str, stage: RefnoErrorStag
             record_refno_error(
                 RefnoErrorKind::Duplicate,
                 stage,
-                "fast_model/gen_model/full_noun_mode.rs",
+                "fast_model/gen_model/index_tree_mode.rs",
                 "collect_refnos",
                 format!("{} 中检测到重复 RefNo", context),
                 Some(&refno),
@@ -201,7 +201,7 @@ pub async fn process_nouns_by_type(
 
         for handle in handles {
             handle.await.map_err(|e| {
-                FullNounError::GeometryGenerationFailed(format!("{:?}", category), e.to_string())
+                IndexTreeError::GeometryGenerationFailed(format!("{:?}", category), e.to_string())
             })??;
         }
     }
@@ -239,21 +239,21 @@ async fn process_single_noun_type(
                 process_loop_refno_page(ctx, loop_sjus_map.clone(), sender.clone(), slice)
                     .await
                     .map_err(|e| {
-                        FullNounError::GeometryGenerationFailed(format!("loop:{}", noun), e.to_string())
+                        IndexTreeError::GeometryGenerationFailed(format!("loop:{}", noun), e.to_string())
                     })?;
             }
             NounCategoryType::Prim => {
                 process_prim_refno_page(ctx, sender.clone(), slice)
                     .await
                     .map_err(|e| {
-                        FullNounError::GeometryGenerationFailed(format!("prim:{}", noun), e.to_string())
+                        IndexTreeError::GeometryGenerationFailed(format!("prim:{}", noun), e.to_string())
                     })?;
             }
             NounCategoryType::Cate => {
                 process_cate_refno_page(ctx, loop_sjus_map.clone(), sender.clone(), slice)
                     .await
                     .map_err(|e| {
-                        FullNounError::GeometryGenerationFailed(format!("cate:{}", noun), e.to_string())
+                        IndexTreeError::GeometryGenerationFailed(format!("cate:{}", noun), e.to_string())
                     })?;
             }
         }
@@ -262,7 +262,7 @@ async fn process_single_noun_type(
     Ok(())
 }
 
-/// Full Noun 模式下生成所有几何体（优化版本）
+/// IndexTree 模式下生成所有几何体（优化版本）
 ///
 /// # 主要改进
 /// 1. ✅ BRAN/HANG 优先处理：先处理 BRAN/HANG 及其依赖，记录已生成的子节点
@@ -270,20 +270,24 @@ async fn process_single_noun_type(
 /// 3. ✅ 批量并发：每个类别内部使用批量并发处理
 /// 4. ✅ 内存优化：使用 CategorizedRefnos 替代三个 HashSet
 /// 5. ✅ 数据验证：检查 SJUS map 完整性
-/// 6. ✅ 类型安全：使用 FullNounConfig 和错误类型
+/// 6. ✅ 类型安全：使用 IndexTreeConfig 和错误类型
 ///
 /// # 执行顺序
 /// BRAN/HANG 优先 -> LOOP -> PRIM -> CATE（跳过已生成的 refno）
 #[cfg_attr(feature = "profile", instrument(skip(db_option, config, sender)))]
-pub async fn gen_full_noun_geos_optimized(
+pub async fn gen_index_tree_geos_optimized(
     db_option: Arc<DbOptionExt>,
-    config: &FullNounConfig,
+    config: &IndexTreeConfig,
     sender: flume::Sender<ShapeInstancesData>,
+    seed_roots: Option<Vec<RefnoEnum>>,
 ) -> Result<CategorizedRefnos> {
     let total_start = Instant::now();
 
-    println!("🚀 启动 Full Noun 模式（统一流水线版）");
+    println!("🚀 启动 IndexTree 模式（统一流水线版）");
     config.print_info();
+    if let Some(roots) = seed_roots.as_ref() {
+        println!("[Pipeline] 使用外部 roots 直入模式: {} 个", roots.len());
+    }
 
     // 1. 获取数据库过滤列表
     let dbnums = get_filtered_dbnums(&db_option).await?;
@@ -300,7 +304,9 @@ pub async fn gen_full_noun_geos_optimized(
     // ============================================================================
     // 🚩 [第一阶段] BRAN/HANG 核心逻辑（始终执行）
     // ============================================================================
-    let need_bran_hang_stage = config.enabled_categories.is_empty()
+    let has_seed_roots = seed_roots.is_some();
+    let need_bran_hang_stage = has_seed_roots
+        || config.enabled_categories.is_empty()
         || config.enabled_categories.iter().any(|cat| {
             let upper = cat.to_uppercase();
             upper == "BRAN" || upper == "HANG"
@@ -310,11 +316,36 @@ pub async fn gen_full_noun_geos_optimized(
     let mut bran_duration = Duration::ZERO;
     if need_bran_hang_stage {
         let mut bran_hanger_roots: HashSet<RefnoEnum> = HashSet::new();
-        for noun in &["BRAN", "HANG"] {
-            let refnos = query_noun_refnos(noun, &dbnums, config.debug_limit_per_noun).await?;
-            if !refnos.is_empty() {
-                println!("[Pipeline] 收集到 {} 根节点: {} 个", noun, refnos.len());
-                bran_hanger_roots.extend(refnos);
+        if let Some(roots) = seed_roots.as_ref() {
+            for &root in roots {
+                if !root.is_valid() {
+                    continue;
+                }
+                let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(root).await else {
+                    continue;
+                };
+                let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+                let Some(noun) = manager.get_noun(root) else {
+                    continue;
+                };
+                let noun_upper = noun.to_uppercase();
+                if noun_upper == "BRAN" || noun_upper == "HANG" {
+                    bran_hanger_roots.insert(root);
+                }
+            }
+            if !bran_hanger_roots.is_empty() {
+                println!(
+                    "[Pipeline] seed_roots 中 BRAN/HANG 根节点: {} 个",
+                    bran_hanger_roots.len()
+                );
+            }
+        } else {
+            for noun in &["BRAN", "HANG"] {
+                let refnos = query_noun_refnos(noun, &dbnums, config.index_tree_debug_limit_per_target_type).await?;
+                if !refnos.is_empty() {
+                    println!("[Pipeline] 收集到 {} 根节点: {} 个", noun, refnos.len());
+                    bran_hanger_roots.extend(refnos);
+                }
             }
         }
 
@@ -490,49 +521,63 @@ pub async fn gen_full_noun_geos_optimized(
     // ============================================================================
     println!("🔍 正在收集其余 Noun 的根节点并执行深度递归查询...");
 
-    let entry_nouns = get_entry_nouns(config);
-    if entry_nouns.is_empty() {
-        println!("[Pipeline] 加载到的其余入口 Noun 列表为空。");
-    } else {
-        println!("📌 补充入口 Noun 列表: {:?}", entry_nouns);
+    let mut all_roots = HashSet::new();
+    let mut loop_refnos = HashSet::new();
+    let mut prim_refnos = HashSet::new();
+    let mut cate_refnos = HashSet::new();
 
-        let mut all_roots = HashSet::new();
-        let mut loop_refnos = HashSet::new();
-        let mut prim_refnos = HashSet::new();
-        let mut cate_refnos = HashSet::new();
-
-        // 收集根节点
-        for entry in &entry_nouns {
-            let noun_upper = entry.to_uppercase();
-            let noun_str = noun_upper.as_str();
-
-            // 跳过已处理的 BRAN/HANG
-            if noun_str == "BRAN" || noun_str == "HANG" {
-                continue;
-            }
-
-            let refnos = query_noun_refnos(noun_str, &dbnums, config.debug_limit_per_noun).await?;
-            if refnos.is_empty() {
-                continue;
-            }
-
-            track_refno_issues(&refnos, noun_str, RefnoErrorStage::InputParse);
-            all_roots.extend(refnos.iter().copied());
-
-            if GNERAL_LOOP_OWNER_NOUN_NAMES.contains(&noun_str) {
-                loop_refnos.extend(refnos.iter().copied());
-            }
-            if GNERAL_PRIM_NOUN_NAMES.contains(&noun_str) {
-                prim_refnos.extend(refnos.iter().copied());
-            }
-            if USE_CATE_NOUN_NAMES.contains(&noun_str) {
-                cate_refnos.extend(refnos.iter().copied());
+    if let Some(roots) = seed_roots.as_ref() {
+        for &root in roots {
+            if root.is_valid() {
+                all_roots.insert(root);
             }
         }
-
         if !all_roots.is_empty() {
-            println!("[Pipeline] 其余根节点总数 {}", all_roots.len());
-            let roots_vec: Vec<RefnoEnum> = all_roots.into_iter().collect();
+            let roots_vec: Vec<RefnoEnum> = all_roots.iter().copied().collect();
+            track_refno_issues(&roots_vec, "seed_roots", RefnoErrorStage::InputParse);
+            println!("[Pipeline] 使用 seed_roots 作为入口 roots，总数 {}", all_roots.len());
+        }
+    } else {
+        let entry_nouns = get_entry_nouns(config);
+        if entry_nouns.is_empty() {
+            println!("[Pipeline] 加载到的其余入口 Noun 列表为空。");
+        } else {
+            println!("📌 补充入口 Noun 列表: {:?}", entry_nouns);
+
+            // 收集根节点
+            for entry in &entry_nouns {
+                let noun_upper = entry.to_uppercase();
+                let noun_str = noun_upper.as_str();
+
+                // 跳过已处理的 BRAN/HANG
+                if noun_str == "BRAN" || noun_str == "HANG" {
+                    continue;
+                }
+
+                let refnos = query_noun_refnos(noun_str, &dbnums, config.index_tree_debug_limit_per_target_type).await?;
+                if refnos.is_empty() {
+                    continue;
+                }
+
+                track_refno_issues(&refnos, noun_str, RefnoErrorStage::InputParse);
+                all_roots.extend(refnos.iter().copied());
+
+                if GNERAL_LOOP_OWNER_NOUN_NAMES.contains(&noun_str) {
+                    loop_refnos.extend(refnos.iter().copied());
+                }
+                if GNERAL_PRIM_NOUN_NAMES.contains(&noun_str) {
+                    prim_refnos.extend(refnos.iter().copied());
+                }
+                if USE_CATE_NOUN_NAMES.contains(&noun_str) {
+                    cate_refnos.extend(refnos.iter().copied());
+                }
+            }
+        }
+    }
+
+    if !all_roots.is_empty() {
+        println!("[Pipeline] 其余根节点总数 {}", all_roots.len());
+        let roots_vec: Vec<RefnoEnum> = all_roots.into_iter().collect();
 
             // 递归收集子节点
             collect_all_descendants(&roots_vec, &mut loop_refnos, &mut prim_refnos, &mut cate_refnos)
@@ -562,7 +607,7 @@ pub async fn gen_full_noun_geos_optimized(
                     cate_vec.len()
                 );
 
-                // 全局 geom_input_cache 已在 orchestrator 初始化；这里再 init 一次保证 Full Noun 直调也可用。
+                // 全局 geom_input_cache 已在 orchestrator 初始化；这里再 init 一次保证 IndexTree 直调也可用。
                 geom_input_cache::init_global_geom_input_cache(ctx_prefetch.db_option.as_ref())
                     .await?;
                 let _ = geom_input_cache::prefetch_all_geom_inputs_v2(
@@ -606,7 +651,7 @@ pub async fn gen_full_noun_geos_optimized(
                     &cate_vec,
                 )
                 .await
-                .map_err(FullNounError::from)?;
+                .map_err(IndexTreeError::from)?;
 
                 if let Some(target_cata_map) = target_cata_map_for_validate {
                     if !target_cata_map.is_empty() {
@@ -659,10 +704,11 @@ pub async fn gen_full_noun_geos_optimized(
                 &bran_generated_refnos,
                 loop_sjus_map_arc.clone(),
                 sender.clone(),
+                has_seed_roots,
             )
             .await?;
             let (prim_vec, prim_dur) =
-                process_prim_stage(&ctx, prim_refnos, config, &dbnums, sender.clone())
+                process_prim_stage(&ctx, prim_refnos, config, &dbnums, sender.clone(), has_seed_roots)
                 .await?;
             let (cate_vec, cate_dur) = process_cate_stage(
                 &ctx,
@@ -672,6 +718,7 @@ pub async fn gen_full_noun_geos_optimized(
                 &bran_generated_refnos,
                 loop_sjus_map_arc,
                 sender,
+                has_seed_roots,
             )
             .await?;
 
@@ -688,7 +735,6 @@ pub async fn gen_full_noun_geos_optimized(
 
             let total_duration = total_start.elapsed();
             print_final_summary(total_duration, loop_dur, prim_dur, cate_dur, bran_duration);
-        }
     }
 
     categorized.print_statistics();
@@ -1095,7 +1141,7 @@ async fn prefetch_bran_hang_inputs_for_offline_generate(
         .await?;
         geom_input_cache::ensure_geom_inputs_present_for_refnos_from_global(&empty, &empty, child_refnos)
             .await
-            .map_err(FullNounError::from)?;
+            .map_err(IndexTreeError::from)?;
     }
 
     // 2) 预热 cata_resolve_cache（按 cata_hash）
@@ -1334,16 +1380,38 @@ async fn prefetch_bran_hang_inputs_for_offline_generate(
 
 async fn process_loop_stage(
     ctx: &NounProcessContext,
-    _loop_refnos: HashSet<RefnoEnum>,
-    config: &FullNounConfig,
+    loop_refnos: HashSet<RefnoEnum>,
+    config: &IndexTreeConfig,
     dbnums: &[u32],
-    bran_generated_refnos: &HashSet<RefnoEnum>,
+    _bran_generated_refnos: &HashSet<RefnoEnum>,
     loop_sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
     sender: flume::Sender<ShapeInstancesData>,
+    use_input_roots: bool,
 ) -> Result<(Vec<RefnoEnum>, Duration)> {
     let start = Instant::now();
+    if use_input_roots {
+        let mut vec: Vec<RefnoEnum> = loop_refnos.into_iter().collect();
+        vec.sort_by_key(|r| r.to_string());
+        let ranges = ctx.bounded_chunks(vec.len());
+        for (page_idx, (s, e)) in ranges.into_iter().enumerate() {
+            let slice = &vec[s..e];
+            println!(
+                "[Loop][seed_roots] 处理第 {} 页 ({} ~ {})",
+                page_idx + 1,
+                s + 1,
+                e
+            );
+            process_loop_refno_page(ctx, loop_sjus_map_arc.clone(), sender.clone(), slice)
+                .await
+                .map_err(|e| {
+                    IndexTreeError::GeometryGenerationFailed("loop(seed_roots)".to_string(), e.to_string())
+                })?;
+        }
+        return Ok((vec, start.elapsed()));
+    }
+
     let mut loop_noun_infos = prequery_noun_counts(&GNERAL_LOOP_OWNER_NOUN_NAMES, dbnums).await?;
-    // FullNounConfig.enabled_categories 的语义：空=全启用；否则按类别/具体 noun 精确过滤。
+    // IndexTreeConfig.enabled_categories 的语义：空=全启用；否则按类别/具体 noun 精确过滤。
     loop_noun_infos.retain(|info| config.should_process_noun(info.noun, "loop"));
     loop_noun_infos.retain(|info| info.count > 0);
 
@@ -1355,12 +1423,34 @@ async fn process_loop_stage(
 
 async fn process_prim_stage(
     ctx: &NounProcessContext,
-    _refnos: HashSet<RefnoEnum>,
-    config: &FullNounConfig,
+    refnos: HashSet<RefnoEnum>,
+    config: &IndexTreeConfig,
     dbnums: &[u32],
     sender: flume::Sender<ShapeInstancesData>,
+    use_input_roots: bool,
 ) -> Result<(Vec<RefnoEnum>, Duration)> {
     let start = Instant::now();
+    if use_input_roots {
+        let mut vec: Vec<RefnoEnum> = refnos.into_iter().collect();
+        vec.sort_by_key(|r| r.to_string());
+        let ranges = ctx.bounded_chunks(vec.len());
+        for (page_idx, (s, e)) in ranges.into_iter().enumerate() {
+            let slice = &vec[s..e];
+            println!(
+                "[Prim][seed_roots] 处理第 {} 页 ({} ~ {})",
+                page_idx + 1,
+                s + 1,
+                e
+            );
+            process_prim_refno_page(ctx, sender.clone(), slice)
+                .await
+                .map_err(|e| {
+                    IndexTreeError::GeometryGenerationFailed("prim(seed_roots)".to_string(), e.to_string())
+                })?;
+        }
+        return Ok((vec, start.elapsed()));
+    }
+
     let mut prim_noun_infos = prequery_noun_counts(&GNERAL_PRIM_NOUN_NAMES, dbnums).await?;
     prim_noun_infos.retain(|info| config.should_process_noun(info.noun, "prim"));
     let vec = process_nouns_by_type(
@@ -1376,14 +1466,39 @@ async fn process_prim_stage(
 
 async fn process_cate_stage(
     ctx: &NounProcessContext,
-    _refnos: HashSet<RefnoEnum>,
-    config: &FullNounConfig,
+    refnos: HashSet<RefnoEnum>,
+    config: &IndexTreeConfig,
     dbnums: &[u32],
     bran_generated_refnos: &HashSet<RefnoEnum>,
     loop_sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
     sender: flume::Sender<ShapeInstancesData>,
+    use_input_roots: bool,
 ) -> Result<(Vec<RefnoEnum>, Duration)> {
     let start = Instant::now();
+    if use_input_roots {
+        let mut vec: Vec<RefnoEnum> = refnos
+            .into_iter()
+            .filter(|r| !bran_generated_refnos.contains(r))
+            .collect();
+        vec.sort_by_key(|r| r.to_string());
+        let ranges = ctx.bounded_chunks(vec.len());
+        for (page_idx, (s, e)) in ranges.into_iter().enumerate() {
+            let slice = &vec[s..e];
+            println!(
+                "[Cate][seed_roots] 处理第 {} 页 ({} ~ {})",
+                page_idx + 1,
+                s + 1,
+                e
+            );
+            process_cate_refno_page(ctx, loop_sjus_map_arc.clone(), sender.clone(), slice)
+                .await
+                .map_err(|e| {
+                    IndexTreeError::GeometryGenerationFailed("cate(seed_roots)".to_string(), e.to_string())
+                })?;
+        }
+        return Ok((vec, start.elapsed()));
+    }
+
     let mut cate_noun_infos = prequery_noun_counts(&USE_CATE_NOUN_NAMES, dbnums).await?;
     cate_noun_infos.retain(|info| config.should_process_noun(info.noun, "cate"));
     for info in &mut cate_noun_infos {
@@ -1404,7 +1519,7 @@ async fn process_cate_stage(
 }
 
 fn print_final_summary(total: Duration, l: Duration, p: Duration, c: Duration, b: Duration) {
-    println!("✅ Full Noun 处理完成 (GeneralPath)");
+    println!("✅ IndexTree 处理完成 (GeneralPath)");
     println!(
         "⏱️  Total: {} ms [L: {}ms, P: {}ms, C: {}ms, B: {}ms]",
         total.as_millis(),
@@ -1420,7 +1535,7 @@ async fn get_filtered_dbnums(db_option: &DbOptionExt) -> Result<Vec<u32>> {
         manual
     } else {
         query_mdb_db_nums(None, DBType::DESI).await.map_err(|e| {
-            FullNounError::DatabaseError(format!("query_mdb_db_nums(None, DESI) failed: {}", e))
+            IndexTreeError::DatabaseError(format!("query_mdb_db_nums(None, DESI) failed: {}", e))
         })?
     };
 
@@ -1430,7 +1545,7 @@ async fn get_filtered_dbnums(db_option: &DbOptionExt) -> Result<Vec<u32>> {
     Ok(dbnums)
 }
 
-fn get_entry_nouns(config: &FullNounConfig) -> Vec<String> {
+fn get_entry_nouns(config: &IndexTreeConfig) -> Vec<String> {
     let has_explicit_entry_nouns = config.enabled_categories.iter().any(|cat| {
         let lower = cat.to_lowercase();
         !matches!(lower.as_str(), "cate" | "loop" | "prim")
@@ -1480,10 +1595,10 @@ fn resolve_tree_dbnums(dbnums: &[u32]) -> Result<Vec<u32>> {
     }
     db_meta()
         .ensure_loaded()
-        .map_err(|e| FullNounError::DatabaseError(format!("加载 db_meta_info.json 失败: {}", e)))?;
+        .map_err(|e| IndexTreeError::DatabaseError(format!("加载 db_meta_info.json 失败: {}", e)))?;
     let mut all_dbnums = db_meta().get_all_dbnums();
     if all_dbnums.is_empty() {
-        return Err(FullNounError::DatabaseError(
+        return Err(IndexTreeError::DatabaseError(
             "db_meta_info.json 中未找到可用 dbnum".to_string(),
         ));
     }
@@ -1503,7 +1618,7 @@ async fn collect_all_descendants(
         true,
     )
         .await
-        .map_err(|e| FullNounError::DatabaseError(format!("collect_descendant_filter_ids(loop) failed: {}", e)))?;
+        .map_err(|e| IndexTreeError::DatabaseError(format!("collect_descendant_filter_ids(loop) failed: {}", e)))?;
     track_refno_issues(&loop_descendants, "loop_descendants", RefnoErrorStage::Query);
     loop_refnos.extend(loop_descendants);
 
@@ -1515,14 +1630,14 @@ async fn collect_all_descendants(
         true,
     )
         .await
-        .map_err(|e| FullNounError::DatabaseError(format!("collect_descendant_filter_ids(prim) failed: {}", e)))?;
+        .map_err(|e| IndexTreeError::DatabaseError(format!("collect_descendant_filter_ids(prim) failed: {}", e)))?;
     track_refno_issues(&prim_descendants, "prim_descendants", RefnoErrorStage::Query);
     prim_refnos.extend(prim_descendants);
 
     let cate_descendants =
         query_provider::query_multi_descendants_with_self(roots, &USE_CATE_NOUN_NAMES, true)
         .await
-        .map_err(|e| FullNounError::DatabaseError(format!("collect_descendant_filter_ids(cate) failed: {}", e)))?;
+        .map_err(|e| IndexTreeError::DatabaseError(format!("collect_descendant_filter_ids(cate) failed: {}", e)))?;
     track_refno_issues(&cate_descendants, "cate_descendants", RefnoErrorStage::Query);
     cate_refnos.extend(cate_descendants);
 
@@ -1536,7 +1651,7 @@ mod tests {
     #[test]
     fn test_validate_sjus_map_empty_warning() {
         let sjus_map = DashMap::new();
-        let config = FullNounConfig::default();
+        let config = IndexTreeConfig::default();
 
         // 默认配置下，空 map 会警告但不报错
         let result = validate_sjus_map(&sjus_map, &config);
@@ -1546,13 +1661,13 @@ mod tests {
     #[test]
     fn test_validate_sjus_map_empty_strict() {
         let sjus_map = DashMap::new();
-        let config = FullNounConfig::default().with_strict_validation(true);
+        let config = IndexTreeConfig::default().with_strict_validation(true);
 
         // 严格模式下，空 map 会报错
         let result = validate_sjus_map(&sjus_map, &config);
         assert!(result.is_err());
 
-        if let Err(FullNounError::EmptySjusMap) = result {
+        if let Err(IndexTreeError::EmptySjusMap) = result {
             // 正确
         } else {
             panic!("Expected EmptySjusMap error");
@@ -1564,104 +1679,10 @@ mod tests {
     //     let sjus_map = DashMap::new();
     //     sjus_map.insert(RefnoEnum::RefU64(1), (Vec3::ZERO, 1.0));
 
-    //     let config = FullNounConfig::default().with_strict_validation(true);
+    //     let config = IndexTreeConfig::default().with_strict_validation(true);
 
     //     // 有数据时不应报错
     //     let result = validate_sjus_map(&sjus_map, &config);
     //     assert!(result.is_ok());
     // }
-}
-
-// ============================================================================
-// 兼容层函数（从 legacy.rs 迁移）
-// ============================================================================
-
-use super::orchestrator::split_shape_instances_by_dbnum;
-use crate::fast_model::foyer_cache::FoyerCacheContext;
-use crate::fast_model::pdms_inst::save_instance_data_optimize;
-// Duplicate import removed
-use anyhow::Result as AnyhowResult;
-
-/// 兼容函数：旧版的 gen_full_noun_geos
-///
-/// 为了保持向后兼容，保留这个函数签名。
-/// 内部转发到优化版本 gen_full_noun_geos_optimized
-#[deprecated(note = "请使用 gen_full_noun_geos_optimized 替代")]
-pub async fn gen_full_noun_geos(
-    db_option: Arc<DbOptionExt>,
-    _extra_nouns: Option<Vec<&'static str>>,
-) -> AnyhowResult<super::models::DbModelInstRefnos> {
-    println!("⚠️ 警告：使用已弃用的 gen_full_noun_geos，内部已转发到优化版本");
-
-    let config = FullNounConfig::from_db_option_ext(&db_option)
-        .map_err(|e| anyhow::anyhow!("配置错误: {}", e))?;
-
-    let (sender, receiver) = flume::bounded::<ShapeInstancesData>(100);
-    let replace_exist = db_option.inner.is_replace_mesh();
-    let use_surrealdb = db_option.use_surrealdb;
-
-    // 兼容层也遵守新语义：输出优先写 foyer cache；是否写 SurrealDB 由 use_surrealdb 控制。
-    // cache_dir 由 DbOptionExt.foyer_cache_dir 决定（默认为 output/<project>/instance_cache）。
-    let foyer_cache_ctx = FoyerCacheContext::try_from_db_option(db_option.as_ref()).await?;
-    let cache_manager_for_insert = foyer_cache_ctx.as_ref().map(|c| c.cache_arc());
-    let insert_err: Arc<tokio::sync::Mutex<Option<anyhow::Error>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-    let insert_err_for_task = insert_err.clone();
-
-    let insert_handle = tokio::spawn(async move {
-        while let Ok(shape_insts) = receiver.recv_async().await {
-            if use_surrealdb {
-                if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
-                    eprintln!("保存实例数据失败: {}", e);
-                }
-            }
-
-            if let Some(ref cache_manager) = cache_manager_for_insert {
-                // cache-only 语义：按 dbnum 严格分桶（ref0 != dbnum，必须走映射）。
-                match split_shape_instances_by_dbnum(&shape_insts).await {
-                    Ok(by_dbnum) => {
-                        for (dbnum, sub) in by_dbnum {
-                            cache_manager.insert_from_shape(dbnum, &sub);
-                        }
-                    }
-                    Err(e) => {
-                        // 兼容层下也不应“悄悄跳过写 cache”，否则后续离线阶段必然 cache miss。
-                        let mut g = insert_err_for_task.lock().await;
-                        if g.is_none() {
-                            *g = Some(e);
-                        }
-                        return;
-                    }
-                }
-            }
-        }
-    });
-
-    let categorized = match gen_full_noun_geos_optimized(db_option.clone(), &config, sender.clone()).await {
-        Ok(v) => v,
-        Err(e) => {
-            drop(sender);
-            let _ = insert_handle.await;
-            return Err(anyhow::anyhow!("Full Noun 生成失败: {}", e));
-        }
-    };
-
-    drop(sender);
-    let _ = insert_handle.await;
-    if let Some(e) = insert_err.lock().await.take() {
-        return Err(e);
-    }
-
-    let cate = categorized.get_by_category(super::models::NounCategory::Cate);
-    let loops = categorized.get_by_category(super::models::NounCategory::LoopOwner);
-    let prims = categorized.get_by_category(super::models::NounCategory::Prim);
-
-    let result = super::models::DbModelInstRefnos {
-        bran_hanger_refnos: Arc::new(Vec::new()),
-        use_cate_refnos: Arc::new(cate),
-        loop_owner_refnos: Arc::new(loops),
-        prim_refnos: Arc::new(prims),
-    };
-
-    Ok(result)
 }

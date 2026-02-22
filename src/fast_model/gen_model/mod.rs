@@ -1,4 +1,4 @@
-// Full Noun 模式模型生成 - 模块化重构版本
+// IndexTree 模式模型生成 - 模块化重构版本
 //
 // 本模块将原先的 2,095 行单文件重构为模块化结构，解决以下问题：
 // 1. 文件过大（超出 250 行限制 8.4 倍）
@@ -18,7 +18,7 @@ macro_rules! e3d_dbg {
 
 // 核心模块
 pub mod categorized_refnos;
-pub mod cache_miss_report; // Full Noun cache-first 缺失报告（output/<project>/cache_miss_report.json）
+pub mod cache_miss_report; // IndexTree cache-first 缺失报告（output/<project>/cache_miss_report.json）
 pub mod config; // 配置管理 (Phase 2)
 pub mod context; // 处理上下文
 pub mod errors; // 错误类型 (Phase 2)
@@ -36,14 +36,11 @@ pub mod loop_processor; // Loop 处理器
 pub mod prim_processor;
 pub mod processor; // 通用处理器（消除冗余） // Prim 处理器
 
-// Full Noun 主逻辑 (Phase 3 - 优化版本)
-pub mod full_noun_mode;
+// IndexTree 主逻辑 (Phase 3 - 优化版本)
+pub mod index_tree_mode;
 
 // 编排器模块：主入口函数和流程协调
 pub mod orchestrator;
-
-// 非 Full Noun 模式（增量更新、手动 refno、调试模式等）
-mod non_full_noun;
 
 // 实用工具
 pub mod utilities;
@@ -56,16 +53,16 @@ pub mod mesh_processing;
 // 重新导出常用类型
 pub use context::NounProcessContext;
 pub use models::{DbModelInstRefnos, NounCategory};
-pub use noun_collection::FullNounCollection;
+pub use noun_collection::IndexTreeTargetCollection;
 pub use processor::NounProcessor;
 
 // Phase 2: 错误和配置
-pub use config::{BatchSize, Concurrency, FullNounConfig};
-pub use errors::{FullNounError, Result};
+pub use config::{BatchSize, Concurrency, IndexTreeConfig};
+pub use errors::{IndexTreeError, Result};
 
 // Phase 3: 优化后的数据结构和主函数
 pub use categorized_refnos::{CategorizedRefnos, CategoryStatistics};
-pub use full_noun_mode::{gen_full_noun_geos, gen_full_noun_geos_optimized, validate_sjus_map};
+pub use index_tree_mode::{gen_index_tree_geos_optimized, validate_sjus_map};
 
 // 重新导出处理函数
 pub use cate_processor::process_cate_refno_page;
@@ -74,9 +71,6 @@ pub use prim_processor::process_prim_refno_page;
 
 // 编排器：主入口函数
 pub use orchestrator::gen_all_geos_data;
-
-// 非 Full Noun 入口已停用（仅保留 Full Noun 入口）
-// pub use non_full_noun::{gen_geos_data, gen_geos_data_by_dbnum};
 
 // 实用工具函数
 pub use utilities::{

@@ -37,17 +37,16 @@ save_spatial_tree_to_db = false
 enable_sqlite_rtree = false
 gen_model_batch_size = 16
 
-# Full Noun 模式配置
-full_noun_mode = true
-full_noun_max_concurrent_nouns = 6
-full_noun_batch_size = 200
+# IndexTree 默认管线调优配置
+index_tree_max_concurrent_targets = 6
+index_tree_batch_size = 200
 
 # 只生成 PANE 类型（走 LOOP 管线）
-full_noun_enabled_categories = ["PANE"]
-full_noun_excluded_nouns = []
+index_tree_enabled_target_types = ["PANE"]
+index_tree_excluded_target_types = []
 
 # 不限制数量，生成所有 PANE
-debug_limit_per_noun = 0
+index_tree_debug_limit_per_target_type = 0
 
 # 指定 dbnum = 7997
 manual_db_nums = [7997]

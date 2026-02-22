@@ -1,4 +1,4 @@
-use super::errors::{FullNounError, Result};
+use super::errors::{IndexTreeError, Result};
 use aios_core::options::DbOption;
 use std::num::NonZeroUsize;
 
@@ -34,7 +34,7 @@ impl Concurrency {
     /// ```
     pub fn new(n: usize) -> Result<Self> {
         if n == 0 {
-            return Err(FullNounError::InvalidConcurrency(n, Self::MIN, Self::MAX));
+            return Err(IndexTreeError::InvalidConcurrency(n, Self::MIN, Self::MAX));
         }
 
         let clamped = n.clamp(Self::MIN, Self::MAX);
@@ -89,7 +89,7 @@ impl BatchSize {
     /// 创建新的批次大小配置
     pub fn new(n: usize) -> Result<Self> {
         if n == 0 {
-            return Err(FullNounError::InvalidBatchSize(n));
+            return Err(IndexTreeError::InvalidBatchSize(n));
         }
 
         let clamped = n.clamp(Self::MIN, Self::MAX);
@@ -124,14 +124,11 @@ impl Default for BatchSize {
     }
 }
 
-/// Full Noun 模式的统一配置
+/// IndexTree 模式的统一配置
 ///
-/// 封装所有 Full Noun 相关配置，提供类型安全和验证
+/// 封装所有 IndexTree 相关配置，提供类型安全和验证
 #[derive(Debug, Clone)]
-pub struct FullNounConfig {
-    /// 是否启用 Full Noun 模式
-    pub enabled: bool,
-
+pub struct IndexTreeConfig {
     /// 并发处理的 Noun 数量
     pub concurrency: Concurrency,
 
@@ -151,10 +148,10 @@ pub struct FullNounConfig {
     pub excluded_nouns: Vec<String>,
 
     /// 调试模式：限制每种 Noun 类型的处理数量（None 表示不限制）
-    pub debug_limit_per_noun: Option<usize>,
+    pub index_tree_debug_limit_per_target_type: Option<usize>,
 }
 
-impl FullNounConfig {
+impl IndexTreeConfig {
     /// 从 DbOption 创建配置
     ///
     /// # Arguments
@@ -163,7 +160,7 @@ impl FullNounConfig {
     /// # Errors
     /// * 如果并发数或批次大小无效
     ///
-    /// 注意：由于 DbOption 在 aios-core 中可能没有 full_noun_* 字段，
+    /// 注意：由于 DbOption 在 aios-core 中可能没有 index_tree_* 字段，
     /// 这个函数用于兼容性。实际使用时建议使用 from_db_option_ext。
     pub fn from_db_option(_opt: &DbOption) -> Result<Self> {
         // 使用默认配置，因为标准 DbOption 可能没有这些字段
@@ -172,41 +169,33 @@ impl FullNounConfig {
 
     /// 从 DbOptionExt 创建配置（推荐）
     ///
-    /// DbOptionExt 在 src/options.rs 中定义，包含 Full Noun 相关字段
+    /// DbOptionExt 在 src/options.rs 中定义，包含 IndexTree 相关字段
     pub fn from_db_option_ext(opt: &crate::options::DbOptionExt) -> Result<Self> {
-        let concurrency = Concurrency::new(opt.get_full_noun_concurrency())?;
-        let batch_size = BatchSize::new(opt.get_full_noun_batch_size())?;
+        let concurrency = Concurrency::new(opt.get_index_tree_concurrency())?;
+        let batch_size = BatchSize::new(opt.get_index_tree_batch_size())?;
 
         Ok(Self {
-            enabled: opt.full_noun_mode,
             concurrency,
             batch_size,
             validate_sjus_map: true,  // 默认启用验证
             strict_validation: false, // 默认只警告，不报错
-            enabled_categories: opt.full_noun_enabled_categories.clone(),
-            excluded_nouns: opt.full_noun_excluded_nouns.clone(),
-            debug_limit_per_noun: opt.debug_limit_per_noun,
+            enabled_categories: opt.index_tree_enabled_target_types.clone(),
+            excluded_nouns: opt.index_tree_excluded_target_types.clone(),
+            index_tree_debug_limit_per_target_type: opt.index_tree_debug_limit_per_target_type,
         })
     }
 
     /// 创建默认配置
     pub fn default() -> Self {
         Self {
-            enabled: false,
             concurrency: Concurrency::default(),
             batch_size: BatchSize::default(),
             validate_sjus_map: true,
             strict_validation: false,
             enabled_categories: Vec::new(),
             excluded_nouns: Vec::new(),
-            debug_limit_per_noun: None,
+            index_tree_debug_limit_per_target_type: None,
         }
-    }
-
-    /// 构建器模式：设置是否启用
-    pub fn with_enabled(mut self, enabled: bool) -> Self {
-        self.enabled = enabled;
-        self
     }
 
     /// 构建器模式：设置并发数
@@ -284,16 +273,8 @@ impl FullNounConfig {
     /// 打印配置信息
     pub fn print_info(&self) {
         println!("╔════════════════════════════════════════╗");
-        println!("║    Full Noun 模式配置                    ║");
+        println!("║    IndexTree 默认管线配置                ║");
         println!("╠════════════════════════════════════════╣");
-        println!(
-            "║ 启用状态: {:<28} ║",
-            if self.enabled {
-                "✅ 已启用"
-            } else {
-                "❌ 未启用"
-            }
-        );
         println!("║ 并发 Noun 数: {:<24} ║", self.concurrency.get());
         println!("║ 批次大小: {:<28} ║", self.batch_size.get());
         println!(
@@ -323,7 +304,7 @@ impl FullNounConfig {
             println!("║ 排除 Noun: {:<26} ║", self.excluded_nouns.join(", "));
         }
 
-        if let Some(limit) = self.debug_limit_per_noun {
+        if let Some(limit) = self.index_tree_debug_limit_per_target_type {
             println!("╠════════════════════════════════════════╣");
             println!("║ 调试限制: 每个 Noun 最多 {:<8} 个实例 ║", limit);
         }
@@ -332,7 +313,7 @@ impl FullNounConfig {
     }
 }
 
-impl Default for FullNounConfig {
+impl Default for IndexTreeConfig {
     fn default() -> Self {
         Self::default()
     }
@@ -370,7 +351,7 @@ mod tests {
         let result = Concurrency::new(0);
         assert!(result.is_err());
 
-        if let Err(FullNounError::InvalidConcurrency(val, min, max)) = result {
+        if let Err(IndexTreeError::InvalidConcurrency(val, min, max)) = result {
             assert_eq!(val, 0);
             assert_eq!(min, Concurrency::MIN);
             assert_eq!(max, Concurrency::MAX);
@@ -393,12 +374,10 @@ mod tests {
 
     #[test]
     fn test_config_builder() {
-        let config = FullNounConfig::default()
-            .with_enabled(true)
+        let config = IndexTreeConfig::default()
             .with_concurrency(Concurrency::new(6).unwrap())
             .with_strict_validation(true);
 
-        assert!(config.enabled);
         assert_eq!(config.concurrency.get(), 6);
         assert!(config.strict_validation);
     }
@@ -406,11 +385,11 @@ mod tests {
     // #[test]
     // fn test_config_from_db_option() {
     //     let mut db_opt = DbOption::default();
-    //     db_opt.full_noun_mode = true;
-    //     db_opt.full_noun_max_concurrent_nouns = 6;
-    //     db_opt.full_noun_batch_size = 200;
+    //     db_opt.index_tree_mode = true;
+    //     db_opt.index_tree_max_concurrent_targets = 6;
+    //     db_opt.index_tree_batch_size = 200;
 
-    //     let config = FullNounConfig::from_db_option(&db_opt).unwrap();
+    //     let config = IndexTreeConfig::from_db_option(&db_opt).unwrap();
 
     //     assert!(config.enabled);
     //     assert_eq!(config.concurrency.get(), 6);

@@ -4,7 +4,7 @@
 
 //! 负责协调整个模型生成流程：
 
-//! - Full Noun 模式 vs 非 Full Noun 模式的路由
+//! - IndexTree 单管线路由（Full / Manual / Debug / Incremental）
 
 //! - 几何体生成、Mesh 生成、布尔运算的编排
 
@@ -29,10 +29,6 @@ use crate::fast_model::export_model::export_prepack_lod::export_prepack_lod_for_
 use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_dbnos;
 
 use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_refnos_grouped_by_dbno;
-
-use crate::fast_model::query_provider;
-
-use crate::fast_model::query_compat::{query_deep_neg_inst_refnos, query_deep_visible_inst_refnos};
 
 use crate::fast_model::unit_converter::LengthUnit;
 
@@ -68,17 +64,15 @@ use crate::fast_model::export_model::{DuckDBStreamWriter, DuckDBWriteMode};
 
 
 
-use super::config::FullNounConfig;
+use super::config::IndexTreeConfig;
 
-use super::errors::{FullNounError, Result};
+use super::errors::{IndexTreeError, Result};
 
 use super::cache_miss_report;
 
-use super::full_noun_mode::gen_full_noun_geos_optimized;
+use super::index_tree_mode::gen_index_tree_geos_optimized;
 
 use super::models::NounCategory;
-
-use std::str::FromStr;
 
 use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 
@@ -163,25 +157,23 @@ pub(crate) async fn split_shape_instances_by_dbnum(
     Ok(out)
 }
 
+#[derive(Debug, Clone)]
+enum GenerationScope {
+    Full,
+    Manual { roots: Vec<RefnoEnum> },
+    Debug { roots: Vec<RefnoEnum> },
+    Incremental { log: IncrGeoUpdateLog },
+}
+
 
 
 /// 主入口函数：生成所有几何体数据
 
 ///
 
-/// 这是主要的公共 API，根据配置路由到不同的生成策略：
-
-/// - Full Noun 模式：使用新优化的 gen_full_noun_geos_optimized 管线
-
-/// - 非 Full Noun 模式：
-
-///   - 增量更新模式（incr_updates 非空）
-
-///   - 手动 refno 模式（manual_refnos 非空）
-
-///   - 调试模式（debug_model_refnos 非空）
-
-///   - 全量生成模式（按 dbnum 循环）
+/// 这是主要的公共 API，统一收敛到 IndexTree 生成管线：
+/// - Full：按 `index_tree_enabled_target_types` 从 TreeIndex 提取入口 roots
+/// - Manual / Debug / Incremental：构造 roots 并集后以 seed_roots 直入
 
 ///
 
@@ -229,7 +221,7 @@ pub async fn gen_all_geos_data(
 
         if !db_option.use_surrealdb {
 
-            return Err(FullNounError::Other(anyhow::anyhow!(
+            return Err(IndexTreeError::Other(anyhow::anyhow!(
 
                 "cache-only 模式下不支持 --target-sesno（需要从 SurrealDB 获取 element_changes）：sesno={}",
 
@@ -263,7 +255,7 @@ pub async fn gen_all_geos_data(
 
                     eprintln!("获取 sesno {} 的变更失败: {}", sesno, e);
 
-                    return Err(FullNounError::Other(e));
+                    return Err(IndexTreeError::Other(e));
 
                 }
 
@@ -360,7 +352,7 @@ pub async fn gen_all_geos_data(
 
 
 
-    // TreeIndex 文件（output/scene_tree/{dbnum}.tree）在不少流程中是必需的（Full Noun/导出/层级查询）。
+    // TreeIndex 文件（output/scene_tree/{dbnum}.tree）在不少流程中是必需的（IndexTree/导出/层级查询）。
 
     // cache-only：不允许自动生成/回退 SurrealDB；缺失即报错，避免“看似成功但数据为空”。
 
@@ -376,18 +368,12 @@ pub async fn gen_all_geos_data(
 
 
 
-    // 调试：打印 Full Noun 模式配置
+    // 调试：打印 IndexTree 模式配置
 
     println!(
-
-        "[gen_model] Full Noun 模式配置: full_noun_mode={}, concurrency={}, batch_size={}",
-
-        db_option.full_noun_mode,
-
-        db_option.get_full_noun_concurrency(),
-
-        db_option.get_full_noun_batch_size()
-
+        "[gen_model] IndexTree 默认管线配置: concurrency={}, batch_size={}",
+        db_option.get_index_tree_concurrency(),
+        db_option.get_index_tree_batch_size()
     );
 
 
@@ -402,7 +388,7 @@ pub async fn gen_all_geos_data(
 
             // 严重错误，建议直接中断，否则后续写入必挂
 
-            return Err(FullNounError::Other(e));
+            return Err(IndexTreeError::Other(e));
 
         }
 
@@ -441,63 +427,53 @@ pub async fn gen_all_geos_data(
 
     // =========================
 
-    // Full Noun 模式：新管线
+    // IndexTree 模式：新管线
 
     // =========================
 
-    // 恢复非 Full Noun 入口：debug/manual/incr 走定向生成，避免被 Full Noun 吞掉
-
-    let is_incr_update = final_incr_updates.is_some();
-
-    let has_manual_refnos = !manual_refnos.is_empty();
-
-    let has_debug = db_option
-
-        .inner
-
-        .debug_model_refnos
-
-        .as_ref()
-
-        .map(|v| !v.is_empty())
-
-        .unwrap_or(false);
+    // 统一入口：manual/debug/incr/full 全部收敛到 IndexTree 生成管线
 
     perf.mark("route_decision");
+    let debug_roots = db_option.inner.get_all_debug_refnos().await;
+    let incr_visible_roots: Vec<RefnoEnum> = final_incr_updates
+        .as_ref()
+        .map(|log| log.get_all_visible_refnos().into_iter().collect())
+        .unwrap_or_default();
 
-    let result = if has_debug || has_manual_refnos || is_incr_update {
+    let has_manual = !manual_refnos.is_empty();
+    let has_debug = !debug_roots.is_empty();
+    let has_incr = !incr_visible_roots.is_empty();
 
-        perf.mark("targeted_generation");
-
-        process_targeted_generation(
-
-            manual_refnos,
-
-            db_option,
-
-            final_incr_updates,
-
-            target_sesno,
-
-            time,
-
-        )
-
-        .await
-
-    } else if db_option.full_noun_mode {
-
-        perf.mark("full_noun_pipeline");
-
-        process_full_noun_mode(db_option, final_incr_updates, time).await
-
+    let scope = if has_manual && !has_debug && !has_incr {
+        GenerationScope::Manual {
+            roots: manual_refnos.clone(),
+        }
+    } else if has_debug && !has_manual && !has_incr {
+        GenerationScope::Debug {
+            roots: debug_roots.clone(),
+        }
+    } else if has_incr && !has_manual && !has_debug {
+        GenerationScope::Incremental {
+            log: final_incr_updates.clone().unwrap_or_default(),
+        }
+    } else if has_manual || has_debug || has_incr {
+        let mut merged: std::collections::HashSet<RefnoEnum> = std::collections::HashSet::new();
+        merged.extend(manual_refnos.iter().copied());
+        merged.extend(debug_roots.iter().copied());
+        merged.extend(incr_visible_roots.iter().copied());
+        println!(
+            "[gen_model] 检测到混合输入(manual/debug/incr)，按 roots 并集执行：{} 个",
+            merged.len()
+        );
+        GenerationScope::Manual {
+            roots: merged.into_iter().collect(),
+        }
     } else {
-
-        perf.mark("full_database_generation");
-
-        process_full_database_generation(db_option, target_sesno, time).await
-
+        GenerationScope::Full
     };
+
+    perf.mark("index_tree_generation");
+    let result = process_index_tree_generation(scope, db_option, target_sesno, time).await;
 
 
 
@@ -583,25 +559,20 @@ async fn filter_bran_hang_refnos(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
 
 
 
-/// 处理 Full Noun 模式的生成流程
+/// 处理 IndexTree 模式的生成流程
 
-async fn process_full_noun_mode(
-
+async fn process_index_tree_generation(
+    scope: GenerationScope,
     db_option: &DbOptionExt,
-
-    incr_updates: Option<IncrGeoUpdateLog>,
-
+    _target_sesno: Option<u32>,
     time: Instant,
-
 ) -> Result<bool> {
-
-    let mut perf = crate::perf_timer::PerfTimer::new("full_noun_mode");
+    let mut perf = crate::perf_timer::PerfTimer::new("index_tree_generation");
 
     perf.mark("init");
 
 
-
-    println!("[gen_model] 进入 Full Noun 模式（新 gen_model 管线）");
+    println!("[gen_model] 进入 IndexTree 生成模式（统一管线）");
 
 
 
@@ -609,7 +580,7 @@ async fn process_full_noun_mode(
 
         println!(
 
-            "[gen_model] 提示: Full Noun 新管线已支持 manual_db_nums / exclude_db_nums 过滤，当前仍按配置执行"
+            "[gen_model] 提示: IndexTree 新管线已支持 manual_db_nums / exclude_db_nums 过滤，当前仍按配置执行"
 
         );
 
@@ -617,11 +588,25 @@ async fn process_full_noun_mode(
 
 
 
-    if incr_updates.is_some() {
-
-        println!("[gen_model] 警告: Full Noun 模式下增量更新将被忽略，将执行全库重建");
-
-    }
+    let seed_roots = match &scope {
+        GenerationScope::Full => {
+            println!("[gen_model] 当前 scope: Full（按 target_type 入口查询 roots）");
+            None
+        }
+        GenerationScope::Manual { roots } => {
+            println!("[gen_model] 当前 scope: Manual roots={}", roots.len());
+            Some(roots.clone())
+        }
+        GenerationScope::Debug { roots } => {
+            println!("[gen_model] 当前 scope: Debug roots={}", roots.len());
+            Some(roots.clone())
+        }
+        GenerationScope::Incremental { log } => {
+            let roots: Vec<RefnoEnum> = log.get_all_visible_refnos().into_iter().collect();
+            println!("[gen_model] 当前 scope: Incremental roots={}", roots.len());
+            Some(roots)
+        }
+    };
 
 
 
@@ -635,7 +620,7 @@ async fn process_full_noun_mode(
 
     // 1️⃣ 生成/更新 inst_relate，并获取分类后的根 refno
 
-    let config = FullNounConfig::from_db_option_ext(db_option)
+    let config = IndexTreeConfig::from_db_option_ext(db_option)
 
         .map_err(|e| anyhow::anyhow!("配置错误: {}", e))?;
 
@@ -733,7 +718,7 @@ async fn process_full_noun_mode(
 
     let touched_dbnums_for_insert = touched_dbnums.clone();
 
-    // Full Noun 下用于 inst_relate_aabb 写入的 refno 集合：只收集“本次生成触达”的实例，
+    // IndexTree 下用于 inst_relate_aabb 写入的 refno 集合：只收集“本次生成触达”的实例，
     // 避免通过 pe_transform 全库扫描导致卡死/耗时失真。
     let touched_refnos: Arc<DashSet<RefnoEnum>> = Arc::new(DashSet::new());
     let touched_refnos_for_insert = touched_refnos.clone();
@@ -942,11 +927,16 @@ async fn process_full_noun_mode(
 
 
 
-    let categorized = gen_full_noun_geos_optimized(Arc::new(db_option.clone()), &config, sender.clone())
+    let categorized = gen_index_tree_geos_optimized(
+        Arc::new(db_option.clone()),
+        &config,
+        sender.clone(),
+        seed_roots,
+    )
 
         .await
 
-        .map_err(|e| anyhow::anyhow!("Full Noun 生成失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("IndexTree 生成失败: {}", e))?;
 
 
 
@@ -990,7 +980,7 @@ async fn process_full_noun_mode(
 
     println!(
 
-        "[gen_model] Full Noun 模式 insts 入库完成，用时 {} ms",
+        "[gen_model] IndexTree 模式 insts 入库完成，用时 {} ms",
 
         full_start.elapsed().as_millis()
 
@@ -1008,7 +998,7 @@ async fn process_full_noun_mode(
 
         let mesh_start = Instant::now();
 
-        println!("[gen_model] Full Noun 模式开始生成三角网格（深度收集几何节点）");
+        println!("[gen_model] IndexTree 模式开始生成三角网格（深度收集几何节点）");
 
 
 
@@ -1093,7 +1083,7 @@ async fn process_full_noun_mode(
 
             println!(
 
-                "[gen_model] Full Noun 模式 mesh 生成完成，用时 {} ms",
+                "[gen_model] IndexTree 模式 mesh 生成完成，用时 {} ms",
 
                 mesh_start.elapsed().as_millis()
 
@@ -1115,12 +1105,12 @@ async fn process_full_noun_mode(
             let skip_aabb_write = std::env::var_os("AIOS_SKIP_INST_RELATE_AABB").is_some();
             if skip_aabb_write {
                 println!(
-                    "[gen_model] Full Noun 模式跳过 inst_relate_aabb 写入（AIOS_SKIP_INST_RELATE_AABB=1）"
+                    "[gen_model] IndexTree 模式跳过 inst_relate_aabb 写入（AIOS_SKIP_INST_RELATE_AABB=1）"
                 );
             } else {
                 let aabb_start = Instant::now();
 
-                println!("[gen_model] Full Noun 模式开始写入 inst_relate_aabb");
+                println!("[gen_model] IndexTree 模式开始写入 inst_relate_aabb");
 
                 // 只写本次生成触达的 refno，避免 pe_transform 全库扫描导致卡死/耗时失真。
                 let mut aabb_refnos: Vec<RefnoEnum> =
@@ -1149,11 +1139,11 @@ async fn process_full_noun_mode(
 
                 if aabb_refnos.is_empty() {
                     eprintln!(
-                        "[gen_model] Full Noun 模式写入 inst_relate_aabb 被跳过：本次生成未收集到可用 refno"
+                        "[gen_model] IndexTree 模式写入 inst_relate_aabb 被跳过：本次生成未收集到可用 refno"
                     );
                 } else {
                     println!(
-                        "[gen_model] Full Noun 模式 inst_relate_aabb 写入范围: refnos={}",
+                        "[gen_model] IndexTree 模式 inst_relate_aabb 写入范围: refnos={}",
                         aabb_refnos.len()
                     );
 
@@ -1163,10 +1153,10 @@ async fn process_full_noun_mode(
                     )
                     .await
                     {
-                        eprintln!("[gen_model] Full Noun 模式写入 inst_relate_aabb 失败: {}", e);
+                        eprintln!("[gen_model] IndexTree 模式写入 inst_relate_aabb 失败: {}", e);
                     } else {
                         println!(
-                            "[gen_model] Full Noun 模式完成 inst_relate_aabb 写入，用时 {} ms",
+                            "[gen_model] IndexTree 模式完成 inst_relate_aabb 写入，用时 {} ms",
                             aabb_start.elapsed().as_millis()
                         );
                     }
@@ -1187,7 +1177,7 @@ async fn process_full_noun_mode(
 
             let bool_start = Instant::now();
 
-            println!("[gen_model] Full Noun 模式开始布尔运算（boolean worker）");
+            println!("[gen_model] IndexTree 模式开始布尔运算（boolean worker）");
 
             if let Some(ref ctx) = foyer_cache_ctx {
 
@@ -1195,7 +1185,7 @@ async fn process_full_noun_mode(
 
                 {
 
-                    eprintln!("[gen_model] Full Noun 缓存布尔运算失败: {}", e);
+                    eprintln!("[gen_model] IndexTree 缓存布尔运算失败: {}", e);
 
                 }
 
@@ -1205,7 +1195,7 @@ async fn process_full_noun_mode(
 
                 if let Err(e) = run_boolean_worker(Arc::new(db_option.inner.clone()), 100).await {
 
-                    eprintln!("[gen_model] Full Noun 布尔运算失败: {}", e);
+                    eprintln!("[gen_model] IndexTree 布尔运算失败: {}", e);
 
                 }
 
@@ -1215,7 +1205,7 @@ async fn process_full_noun_mode(
 
             println!(
 
-                "[gen_model] Full Noun 模式布尔运算完成，用时 {} ms",
+                "[gen_model] IndexTree 模式布尔运算完成，用时 {} ms",
 
                 bool_start.elapsed().as_millis()
 
@@ -1305,7 +1295,7 @@ async fn process_full_noun_mode(
 
     println!(
 
-        "[gen_model] Full Noun 模式全部完成，总用时 {} ms",
+        "[gen_model] IndexTree 模式全部完成，总用时 {} ms",
 
         full_start.elapsed().as_millis()
 
@@ -1389,7 +1379,7 @@ async fn process_full_noun_mode(
 
         {
 
-            eprintln!("[instances] Full Noun 导出失败: {}", e);
+            eprintln!("[instances] IndexTree 导出失败: {}", e);
 
         }
 
@@ -1453,13 +1443,13 @@ async fn process_full_noun_mode(
 
 
 
-    let enabled_nouns = db_option.full_noun_enabled_categories.clone();
+    let enabled_nouns = db_option.index_tree_enabled_target_types.clone();
 
 
 
     let metadata = serde_json::json!({
 
-        "mode": "full_noun",
+        "mode": "index_tree",
 
         "project_name": project_name,
 
@@ -1475,17 +1465,17 @@ async fn process_full_noun_mode(
 
         "gen_mesh": db_option.inner.gen_mesh,
 
-        "concurrency": db_option.get_full_noun_concurrency(),
+        "concurrency": db_option.get_index_tree_concurrency(),
 
-        "batch_size": db_option.get_full_noun_batch_size(),
+        "batch_size": db_option.get_index_tree_batch_size(),
 
     });
 
 
 
-    let json_path = profile_dir.join(format!("perf_gen_model_full_noun_dbnum_{}_{}.json", dbnum_tag, timestamp));
+    let json_path = profile_dir.join(format!("perf_gen_model_index_tree_dbnum_{}_{}.json", dbnum_tag, timestamp));
 
-    let csv_path = profile_dir.join(format!("perf_gen_model_full_noun_dbnum_{}_{}.csv", dbnum_tag, timestamp));
+    let csv_path = profile_dir.join(format!("perf_gen_model_index_tree_dbnum_{}_{}.csv", dbnum_tag, timestamp));
 
 
 
@@ -1502,1251 +1492,6 @@ async fn process_full_noun_mode(
     }
 
     Ok(true)
-
-}
-
-
-
-/// 处理增量/手动/调试模式的目标生成
-
-#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "targeted_generation"))]
-
-async fn process_targeted_generation(
-
-    manual_refnos: Vec<RefnoEnum>,
-
-    db_option: &DbOptionExt,
-
-    incr_updates: Option<IncrGeoUpdateLog>,
-
-    target_sesno: Option<u32>,
-
-    time: Instant,
-
-) -> Result<bool> {
-
-    let is_incr_update = incr_updates.is_some();
-
-    let has_manual_refnos = !manual_refnos.is_empty();
-
-
-
-    let mode_label = if is_incr_update {
-
-        "增量"
-
-    } else if has_manual_refnos {
-
-        "手动"
-
-    } else {
-
-        "调试"
-
-    };
-
-
-
-    // foyer cache-only 上下文：统一管理 cache_dir 与 InstanceCacheManager（并尽力预初始化 transform_cache）。
-
-    let foyer_cache_ctx = crate::fast_model::foyer_cache::FoyerCacheContext::try_from_db_option(db_option).await?;
-
-
-
-    let target_count = if is_incr_update {
-
-        incr_updates.as_ref().map(|log| log.count()).unwrap_or(0)
-
-    } else if has_manual_refnos {
-
-        manual_refnos.len()
-
-    } else {
-
-        db_option
-
-            .inner
-
-            .debug_model_refnos
-
-            .as_ref()
-
-            .map(|v| v.len())
-
-            .unwrap_or(0)
-
-    };
-
-
-
-    println!(
-
-        "[gen_model] 进入{}生成路径，目标节点数: {}",
-
-        mode_label, target_count
-
-    );
-
-    println!(
-
-        "[gen_model] 缓存开关: use_cache={}, foyer_primary={}, dual_run={}",
-
-        db_option.use_cache,
-
-        db_option.foyer_primary,
-
-        db_option.dual_run_enabled
-
-    );
-
-
-
-    let (sender, receiver) = flume::bounded(100);
-
-    let receiver: flume::Receiver<aios_core::geometry::ShapeInstancesData> = receiver.clone();
-
-
-
-    let replace_exist = db_option.inner.is_replace_mesh();
-
-    let use_surrealdb = db_option.use_surrealdb;
-
-    let cache_manager_for_insert = foyer_cache_ctx.as_ref().map(|c| c.cache_arc());
-
-    let touched_dbnums: Arc<std::sync::Mutex<BTreeSet<u32>>> =
-
-        Arc::new(std::sync::Mutex::new(BTreeSet::new()));
-
-    let touched_dbnums_for_insert = touched_dbnums.clone();
-
-
-
-    // 当 manual_db_nums 只有一个值时，直接使用该 dbnum，无需从 refno 反推
-
-    let known_dbnum: Option<u32> = db_option.inner.manual_db_nums.as_ref()
-
-        .filter(|nums| nums.len() == 1)
-
-        .and_then(|nums| nums.first().copied());
-
-
-
-    let mut db_write_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    let db_write_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
-
-    let insert_task = tokio::task::spawn(async move {
-
-        while let Ok(shape_insts) = receiver.recv_async().await {
-            let shape_insts_arc = std::sync::Arc::new(shape_insts);
-            // SurrealDB 写入放到后台，不阻塞 cache 写入和后续 batch 接收
-            // 采用 Semaphore 限流，防止瞬发海量并发协程打垮数据库导致事务冲突风暴
-            if use_surrealdb {
-                let sem = db_write_semaphore.clone();
-                let shape_insts_clone = shape_insts_arc.clone();
-                db_write_handles.push(tokio::spawn(async move {
-                    let _permit = match sem.acquire_owned().await {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!("获取写库并发锁失败: {}", e);
-                            return;
-                        }
-                    };
-                    if let Err(e) = save_instance_data_optimize(&shape_insts_clone, replace_exist).await {
-                        eprintln!("保存实例数据失败: {}", e);
-                    }
-                }));
-            }
-
-            if let Some(ref cache_manager) = cache_manager_for_insert {
-
-                let by_dbnum = match split_shape_instances_by_dbnum(&shape_insts_arc).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("[cache] batch 拆分 dbnum 失败，跳过写 cache: {}", e);
-                        continue;
-                    }
-                };
-
-                if by_dbnum.len() > 1 {
-                    eprintln!(
-                        "[cache] ⚠️ batch 同时包含多个 dbnum，将按 dbnum 拆分写入: dbnums={:?}",
-                        by_dbnum.keys().collect::<Vec<_>>()
-                    );
-                }
-
-                if let Some(known) = known_dbnum {
-                    if let Some(sub) = by_dbnum.get(&known) {
-                        cache_manager.insert_from_shape(known, sub);
-                        let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(known));
-                    }
-                    for dbnum in by_dbnum.keys().copied() {
-                        if dbnum != known {
-                            eprintln!(
-                                "[cache] ⚠️ manual_db_nums 指定 dbnum={}，但 batch 内出现 dbnum={}，已忽略",
-                                known, dbnum
-                            );
-                        }
-                    }
-                } else {
-                    for (dbnum, sub) in by_dbnum {
-                        cache_manager.insert_from_shape(dbnum, &sub);
-                        let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(dbnum));
-                    }
-                }
-
-            }
-
-        }
-
-        // 等待所有的 db 写入句柄完成
-        for h in db_write_handles {
-            let _ = h.await;
-        }
-    });
-
-
-
-    let target_root_refnos = super::non_full_noun::gen_geos_data(
-
-        None,
-
-        manual_refnos.clone(),
-
-        db_option,
-
-        incr_updates.clone(),
-
-        sender.clone(),
-
-        target_sesno,
-
-        has_manual_refnos, // 手动模式时启用手动布尔运算
-
-    )
-
-    .await?;
-
-
-
-    drop(sender);
-
-    let _ = insert_task.await;
-
-
-
-    // 方案 B：补齐 BRAN/HANG 的 tubi（从 SurrealDB 的 tubi_relate 读取最小必要信息），
-
-    // 并写入 foyer cache，确保后续 export-dbnum-instances-json / mbd_pipe_api 能从 cache 拿到 inst_tubi_map 数据。
-
-    if let Some(ref ctx) = foyer_cache_ctx {
-
-        let branch_refnos = filter_bran_hang_refnos(&target_root_refnos).await;
-
-        if !branch_refnos.is_empty() {
-
-            println!(
-
-                "[gen_model] cache-only: 开始写入 BRAN/HANG tubi_relate 到 cache（count={}）",
-
-                branch_refnos.len()
-
-            );
-
-            use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
-
-            use std::collections::HashMap;
-
-
-
-            // 定向生成可能跨 dbnum：按 owner_refno 分组写 cache。
-
-            let mut groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
-
-            for &owner in &branch_refnos {
-
-                let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(owner).await else {
-
-                    continue;
-
-                };
-
-                if dbnum == 0 {
-
-                    continue;
-
-                }
-
-                groups.entry(dbnum).or_default().push(owner);
-
-            }
-
-
-
-            for (dbnum, owners) in groups {
-
-                match crate::fast_model::foyer_cache::geos::write_tubi_relate_into_cache_with_ctx(
-
-                    ctx,
-
-                    dbnum,
-
-                    &owners,
-
-                )
-
-                .await
-
-                {
-
-                    Ok(cnt) => {
-
-                        if cnt > 0 {
-
-                            let _ = touched_dbnums.lock().map(|mut s| s.insert(dbnum));
-
-                        }
-
-                        println!(
-
-                            "[gen_model] cache-only: dbnum={} 写入 tubi_relate -> cache 完成（tubi_cnt={}）",
-
-                            dbnum, cnt
-
-                        );
-
-                    }
-
-                    Err(e) => {
-
-                        eprintln!(
-
-                            "[gen_model] cache-only: dbnum={} 写入 tubi_relate -> cache 失败: {}",
-
-                            dbnum, e
-
-                        );
-
-                    }
-
-                }
-
-            }
-
-        }
-
-    }
-
-
-
-    println!(
-
-        "[gen_model] {}路径几何体生成完成，共 {} 个根节点",
-
-        mode_label,
-
-        target_root_refnos.len()
-
-    );
-
-
-
-    if db_option.inner.gen_mesh {
-
-        let mesh_start = Instant::now();
-
-        println!("[gen_model] 开始 mesh 生成");
-
-
-
-        let mut ran_primary = false;
-
-        if let Some(ref ctx) = foyer_cache_ctx {
-
-            let mesh_dir = db_option.inner.get_meshes_path();
-
-            match crate::fast_model::foyer_cache::mesh::run_mesh_worker(
-
-                ctx,
-
-                &mesh_dir,
-
-                &db_option.inner.mesh_precision,
-
-                &db_option.mesh_formats,
-
-            )
-
-            .await
-
-            {
-
-                Ok(n) if n > 0 => {
-                    println!("[gen_model] mesh worker 缓存路径完成: {} 个", n);
-                    ran_primary = true;
-                }
-
-                Ok(_) => {
-                    println!("[gen_model] mesh worker 缓存路径: 0 个 mesh，回退 SurrealDB");
-                }
-
-                Err(e) => {
-                    eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
-                }
-
-            }
-
-        }
-
-        if use_surrealdb && !ran_primary {
-
-            if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
-
-                eprintln!("[gen_model] mesh worker 失败: {}", e);
-
-            } else {
-
-                ran_primary = true;
-
-            }
-
-        }
-
-
-
-        if ran_primary {
-
-            println!(
-
-                "[gen_model] 完成 mesh 生成，用时 {} ms",
-
-                mesh_start.elapsed().as_millis()
-
-            );
-
-        }
-
-
-
-        if use_surrealdb {
-
-            let aabb_start = Instant::now();
-
-            println!("[gen_model] 开始写入 inst_relate_aabb");
-
-            let mut aabb_refnos = target_root_refnos.clone();
-
-            match query_provider::query_multi_descendants(&target_root_refnos, &[]).await {
-
-                Ok(descendants) if !descendants.is_empty() => {
-
-                    aabb_refnos.extend(descendants);
-
-                }
-
-                Ok(_) => {}
-
-                Err(e) => {
-
-                    eprintln!(
-
-                        "[gen_model] 查询子孙节点失败，仅写根节点 inst_relate_aabb: {}",
-
-                        e
-
-                    );
-
-                }
-
-            };
-
-
-
-            if let Err(e) = crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
-
-                &aabb_refnos,
-
-                db_option.is_replace_mesh(),
-
-            )
-
-            .await
-
-            {
-
-                eprintln!("[gen_model] 写入 inst_relate_aabb 失败: {}", e);
-
-            } else {
-
-                println!(
-
-                    "[gen_model] 完成 inst_relate_aabb 写入，用时 {} ms",
-
-                    aabb_start.elapsed().as_millis()
-
-                );
-
-            }
-
-        }
-
-
-
-        if db_option.inner.apply_boolean_operation {
-
-            let bool_start = Instant::now();
-
-            println!("[gen_model] 开始布尔运算 worker");
-
-
-
-            // 构建 debug_model 过滤集合（用于调试模式只处理指定 refno）
-
-            let filter_refnos: Option<std::collections::HashSet<aios_core::RefnoEnum>> = {
-
-                let debug_refnos = db_option.inner.get_all_debug_refnos().await;
-
-                if debug_refnos.is_empty() {
-
-                    None
-
-                } else {
-
-                    Some(debug_refnos.into_iter().collect())
-
-                }
-
-            };
-
-
-
-            if let Some(ref ctx) = foyer_cache_ctx {
-
-                if let Err(e) = crate::fast_model::foyer_cache::boolean::run_boolean_worker_with_filter(
-
-                    ctx,
-
-                    filter_refnos.as_ref(),
-
-                ).await {
-
-                    eprintln!("[gen_model] 缓存布尔运算失败: {}", e);
-
-                }
-
-            }
-
-            if use_surrealdb {
-
-                if let Err(e) = run_boolean_worker(Arc::new(db_option.inner.clone()), 100).await {
-
-                    eprintln!("[gen_model] boolean worker 失败: {}", e);
-
-                }
-
-            }
-
-
-
-            println!(
-
-                "[gen_model] 完成布尔运算，用时 {} ms",
-
-                bool_start.elapsed().as_millis()
-
-            );
-
-        }
-
-    }
-
-    // ⚠️ 布尔运算完成后、capture 之前必须 close cache 强制刷盘。
-    // 原因：布尔 worker 通过 foyer_cache_ctx 的 InstanceCacheManager 写入 inst_relate_bool_map，
-    // 但 capture 内部会创建新的 InstanceCacheManager（query.rs），新实例只能从磁盘读取。
-    // 若不先 close，布尔结果可能还在内存层，capture 看不到 → 截图中没有布尔孔洞。
-    if let Some(ref ctx) = foyer_cache_ctx {
-
-        if let Err(e) = ctx.cache().close().await {
-
-            eprintln!("[cache] 关闭缓存失败: {}", e);
-
-        }
-
-    }
-
-
-
-    if let Err(err) = capture_refnos_if_enabled(&target_root_refnos, db_option).await {
-
-        eprintln!("[capture] 捕获截图失败: {}", err);
-
-    }
-
-
-
-    // 生成 SQLite 空间索引（从 foyer cache 批量落库）
-
-    let touched_dbnums_vec: Vec<u32> = touched_dbnums
-
-        .lock()
-
-        .map(|s| s.iter().copied().collect())
-
-        .unwrap_or_default();
-
-    if let Err(e) = update_sqlite_spatial_index_from_cache(db_option, &touched_dbnums_vec).await {
-
-        eprintln!("[gen_model] SQLite 空间索引生成失败: {}", e);
-
-    }
-
-
-
-    println!(
-
-        "[gen_model] gen_all_geos_data 完成，总耗时 {} ms",
-
-        time.elapsed().as_millis()
-
-    );
-
-
-
-    Ok(true)
-
-}
-
-
-
-/// 处理全量数据库生成（按 dbnum 循环）
-
-async fn process_full_database_generation(
-
-    db_option: &DbOptionExt,
-
-    target_sesno: Option<u32>,
-
-    time: Instant,
-
-) -> Result<bool> {
-
-    let mut dbnos: Vec<u32> = if let Some(nums) = db_option.inner.manual_db_nums.clone() {
-
-        nums
-
-    } else {
-
-        aios_core::query_mdb_db_nums(None, aios_core::DBType::DESI).await?
-
-    };
-
-
-
-    // 过滤掉 exclude_db_nums 中的数据库编号
-
-    if let Some(exclude_nums) = &db_option.inner.exclude_db_nums {
-
-        use std::collections::HashSet;
-
-        let exclude: HashSet<u32> = exclude_nums.iter().copied().collect();
-
-        dbnos.retain(|dbnum| !exclude.contains(dbnum));
-
-    }
-
-
-
-    println!(
-
-        "[gen_model] 进入全量生成路径，共 {} 个数据库待处理",
-
-        dbnos.len()
-
-    );
-
-
-
-    let db_option_arc = Arc::new(db_option.clone());
-
-    let use_surrealdb = db_option.use_surrealdb;
-
-    let replace_exist = db_option.inner.is_replace_mesh();
-
-    // 缓存功能已禁用
-
-    if dbnos.is_empty() {
-
-        println!("[gen_model] 未找到需要生成的数据库，直接结束");
-
-    }
-
-
-
-    // foyer cache-only 上下文：全量模式下也只初始化一次并在各 dbnum 间复用。
-
-    let foyer_cache_ctx = crate::fast_model::foyer_cache::FoyerCacheContext::try_from_db_option(db_option).await?;
-
-
-
-    // 初始化 Parquet 写入器
-
-    let parquet_writer: Option<std::sync::Arc<ParquetStreamWriter>> = None;
-
-    /*
-
-    let parquet_writer = {
-
-        let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
-
-        let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
-
-        match ParquetStreamWriter::new(&parquet_dir) {
-
-            Ok(writer) => Some(std::sync::Arc::new(writer)),
-
-            Err(e) => {
-
-                eprintln!("[Parquet] 初始化写入器失败: {}, 跳过 Parquet 导出", e);
-
-                None
-
-            }
-
-        }
-
-    };
-
-    */
-
-    #[cfg(feature = "duckdb-feature")]
-
-    let duckdb_writer: Option<std::sync::Arc<DuckDBStreamWriter>> = None;
-
-    /*
-
-    #[cfg(feature = "duckdb-feature")]
-
-    let duckdb_writer = {
-
-        let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
-
-        let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
-
-        let duckdb_dir = parquet_dir.join("database_models/_global");
-
-        match DuckDBStreamWriter::new(&duckdb_dir, DuckDBWriteMode::Rebuild) {
-
-            Ok(writer) => Some(std::sync::Arc::new(writer)),
-
-            Err(e) => {
-
-                eprintln!("[DuckDB] 初始化写入器失败: {}, 跳过 DuckDB 导出", e);
-
-                None
-
-            }
-
-        }
-
-    };
-
-    */
-
-
-
-    for dbnum in dbnos.clone() {
-
-        println!("[gen_model] -> 开始处理数据库 {}", dbnum);
-
-        let db_start = Instant::now();
-
-
-
-        let (sender, receiver) = flume::unbounded();
-
-        let receiver: flume::Receiver<aios_core::geometry::ShapeInstancesData> = receiver.clone();
-
-
-
-        let parquet_writer_clone = parquet_writer.clone();
-
-        #[cfg(feature = "duckdb-feature")]
-
-        let duckdb_writer_clone = duckdb_writer.clone();
-
-
-
-        let cache_manager_for_insert = foyer_cache_ctx.as_ref().map(|c| c.cache_arc());
-
-
-
-        let insert_task = tokio::task::spawn(async move {
-
-            while let Ok(shape_insts) = receiver.recv_async().await {
-
-                if use_surrealdb {
-
-                    if let Err(e) = save_instance_data_optimize(&shape_insts, replace_exist).await {
-
-                        eprintln!("保存实例数据失败: {}", e);
-
-                    }
-
-                }
-
-                if let Some(ref cache_manager) = cache_manager_for_insert {
-
-                    let by_dbnum = match split_shape_instances_by_dbnum(&shape_insts).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            eprintln!("[cache] batch 拆分 dbnum 失败，跳过写 cache: {}", e);
-                            continue;
-                        }
-                    };
-                    if by_dbnum.len() != 1 || !by_dbnum.contains_key(&dbnum) {
-                        eprintln!(
-                            "[cache] ⚠️ full-db 生成路径期望单库 dbnum={}，但 batch 出现 dbnums={:?}",
-                            dbnum,
-                            by_dbnum.keys().collect::<Vec<_>>()
-                        );
-                    }
-                    if let Some(sub) = by_dbnum.get(&dbnum) {
-                        cache_manager.insert_from_shape(dbnum, sub);
-                    }
-
-                }
-
-                // 同时写入 Parquet（如果启用）
-
-                if let Some(ref writer) = parquet_writer_clone {
-
-                    if let Err(e) = writer.write_batch(&shape_insts) {
-
-                        eprintln!("[Parquet] 写入批次失败: {}", e);
-
-                    }
-
-                }
-
-                #[cfg(feature = "duckdb-feature")]
-
-                if let Some(ref writer) = duckdb_writer_clone {
-
-                    if let Err(e) = writer.write_batch(&shape_insts) {
-
-                        eprintln!("[DuckDB] 写入批次失败: {}", e);
-
-                    }
-
-                }
-
-            }
-
-        });
-
-
-
-        let db_refnos = super::non_full_noun::gen_geos_data_by_dbnum(
-
-            dbnum,
-
-            db_option_arc.clone(),
-
-            sender.clone(),
-
-            target_sesno,
-
-        )
-
-        .await?;
-
-
-
-        drop(sender);
-
-        let _ = insert_task.await;
-
-
-
-        println!(
-
-            "[gen_model] -> 数据库 {} insts 入库完成，用时 {} ms",
-
-            dbnum,
-
-            db_start.elapsed().as_millis()
-
-        );
-
-
-
-        // 方案 B：补齐 BRAN/HANG 的 tubi（从 SurrealDB 的 tubi_relate 读取最小必要信息），
-
-        // 并写入 foyer cache，确保 export-dbnum-instances-json 等流程能拿到 inst_tubi_map。
-
-        if let Some(ref ctx) = foyer_cache_ctx {
-
-            let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-
-            let mut branch_refnos = manager.query_noun_refnos("BRAN", None);
-
-            branch_refnos.extend(manager.query_noun_refnos("HANG", None));
-
-            if !branch_refnos.is_empty() {
-
-                println!(
-
-                    "[gen_model] cache-only: dbnum={} 开始写入 BRAN/HANG tubi_relate 到 cache（count={}）",
-
-                    dbnum,
-
-                    branch_refnos.len()
-
-                );
-
-                match crate::fast_model::foyer_cache::geos::write_tubi_relate_into_cache_with_ctx(
-
-                    ctx,
-
-                    dbnum,
-
-                    &branch_refnos,
-
-                )
-
-                .await
-
-                {
-
-                    Ok(cnt) => println!(
-
-                        "[gen_model] cache-only: dbnum={} 写入 tubi_relate -> cache 完成（tubi_cnt={}）",
-
-                        dbnum, cnt
-
-                    ),
-
-                    Err(e) => eprintln!(
-
-                        "[gen_model] cache-only: dbnum={} 写入 tubi_relate -> cache 失败: {}",
-
-                        dbnum, e
-
-                    ),
-
-                }
-
-            }
-
-        }
-
-
-
-            if db_option_arc.gen_mesh {
-
-                let mesh_start = Instant::now();
-
-                println!("[gen_model] -> 数据库 {} 开始生成三角网格", dbnum);
-
-
-
-                let mut ran_primary = false;
-
-            if let Some(ref ctx) = foyer_cache_ctx {
-
-                let mesh_dir = db_option_arc.inner.get_meshes_path();
-
-                match crate::fast_model::foyer_cache::mesh::run_mesh_worker(
-
-                    ctx,
-
-                    &mesh_dir,
-
-                    &db_option_arc.inner.mesh_precision,
-
-                    &db_option_arc.mesh_formats,
-
-                )
-
-                .await
-
-                {
-
-                    Ok(n) if n > 0 => {
-                        println!("[gen_model] mesh worker 缓存路径完成: {} 个", n);
-                        ran_primary = true;
-                    }
-
-                    Ok(_) => {
-                        println!("[gen_model] mesh worker 缓存路径: 0 个 mesh，回退 SurrealDB");
-                    }
-
-                    Err(e) => {
-                        eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
-                    }
-
-                }
-
-            }
-
-            if use_surrealdb && !ran_primary {
-
-                db_refnos
-
-                    .execute_gen_inst_meshes(Some(db_option_arc.clone()))
-
-                    .await;
-
-                ran_primary = true;
-
-            }
-
-
-
-            if ran_primary {
-
-                println!(
-
-                    "[gen_model] -> 数据库 {} 三角网格生成完成，用时 {} ms",
-
-                    dbnum,
-
-                    mesh_start.elapsed().as_millis()
-
-                );
-
-            }
-
-        }
-
-
-
-        println!(
-
-            "[gen_model] -> 数据库 {} 处理完成，总耗时 {} ms",
-
-            dbnum,
-
-            db_start.elapsed().as_millis()
-
-        );
-
-    }
-
-
-
-    if let Some(ref ctx) = foyer_cache_ctx {
-
-        if let Err(e) = ctx.cache().close().await {
-
-            eprintln!("[cache] 关闭缓存失败: {}", e);
-
-        }
-
-    }
-
-
-
-    // 完成 Parquet 写入并合并文件
-
-    if let Some(ref writer) = parquet_writer {
-
-        if let Err(e) = writer.finalize() {
-
-            eprintln!("[Parquet] 合并文件失败: {}", e);
-
-        }
-
-    }
-
-    #[cfg(feature = "duckdb-feature")]
-
-    if let Some(ref writer) = duckdb_writer {
-
-        if let Err(e) = writer.finalize() {
-
-            eprintln!("[DuckDB] finalize 失败: {}", e);
-
-        }
-
-    }
-
-
-
-    // 生成 SQLite 空间索引（从 foyer cache 批量落库）
-
-    if let Err(e) = update_sqlite_spatial_index_from_cache(db_option, &dbnos).await {
-
-        eprintln!("[gen_model] SQLite 空间索引生成失败: {}", e);
-
-    }
-
-
-
-    println!(
-
-        "[gen_model] gen_all_geos_data 完成，总耗时 {} ms",
-
-        time.elapsed().as_millis()
-
-    );
-
-
-
-    // ✅ 模型生成完毕后导出 instances.json（按 dbno）
-
-    if db_option.export_instances {
-
-        let mesh_dir =
-
-            Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes"));
-
-        if let Err(e) = export_instances_json_for_dbnos(
-
-            &dbnos,
-
-            mesh_dir,
-
-            &db_option.get_project_output_dir(),
-
-            Arc::new(db_option.inner.clone()),
-
-            true,
-
-        )
-
-        .await
-
-        {
-
-            eprintln!("[instances] 全量生成导出失败: {}", e);
-
-        }
-
-    }
-
-
-
-    Ok(true)
-
-}
-
-
-
-/// 执行手动布尔运算
-
-async fn execute_manual_boolean_operations(
-
-    target_root_refnos: &[RefnoEnum],
-
-    db_option: &DbOptionExt,
-
-) {
-
-    use crate::fast_model::manifold_bool::{
-
-        apply_cata_neg_boolean_manifold, apply_insts_boolean_manifold,
-
-    };
-
-    use std::collections::HashSet;
-
-
-
-    println!("[gen_model] 手动布尔运算模式：开始执行布尔运算");
-
-
-
-    // 查询需要布尔运算的实例（基于 target_root_refnos 的子孙节点）
-
-    let mut boolean_refnos = vec![];
-
-    for &root_refno in target_root_refnos {
-
-        // 查询深度可见实例
-
-        if let Ok(visible_refnos) = query_deep_visible_inst_refnos(root_refno).await {
-
-            boolean_refnos.extend(visible_refnos);
-
-        }
-
-        // 查询深度负实例
-
-        if let Ok(neg_refnos) = query_deep_neg_inst_refnos(root_refno).await {
-
-            boolean_refnos.extend(neg_refnos);
-
-        }
-
-    }
-
-
-
-    // 去重
-
-    let boolean_refnos: Vec<aios_core::RefnoEnum> = boolean_refnos
-
-        .into_iter()
-
-        .collect::<HashSet<_>>()
-
-        .into_iter()
-
-        .collect();
-
-
-
-    if !boolean_refnos.is_empty() {
-
-        let replace_exist = db_option.inner.is_replace_mesh();
-
-        println!(
-
-            "[gen_model] 手动布尔运算模式：找到 {} 个需要布尔运算的实例",
-
-            boolean_refnos.len()
-
-        );
-
-
-
-        let boolean_start = Instant::now();
-
-
-
-        // 执行元件库级布尔运算
-
-        if let Err(e) = apply_cata_neg_boolean_manifold(&boolean_refnos, replace_exist).await {
-
-            eprintln!("[gen_model] 手动布尔运算模式：元件库级布尔运算失败: {}", e);
-
-        }
-
-
-
-        // 执行实例级布尔运算
-
-        if let Err(e) = apply_insts_boolean_manifold(&boolean_refnos, replace_exist).await {
-
-            eprintln!("[gen_model] 手动布尔运算模式：实例级布尔运算失败: {}", e);
-
-        } else {
-
-            println!(
-
-                "[gen_model] 手动布尔运算模式：布尔运算完成，用时 {} ms",
-
-                boolean_start.elapsed().as_millis()
-
-            );
-
-        }
-
-    } else {
-
-        println!("[gen_model] 手动布尔运算模式：没有需要布尔运算的实例");
-
-    }
 
 }
 
@@ -2955,4 +1700,3 @@ fn initialize_spatial_index() {
     // No-op when feature is disabled
 
 }
-

@@ -370,15 +370,16 @@ pub fn generate_single_indextree(target_dbnum: u32) -> anyhow::Result<()> {
     use std::fs;
     use std::io::Read;
 
-    // 从 DbOption.toml 读取配置
-    let config_path = "DbOption.toml";
-    if !std::path::Path::new(config_path).exists() {
-        anyhow::bail!("未找到配置文件 DbOption.toml");
+    // 优先使用环境变量指定配置，否则回退到默认配置
+    let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let config_path = format!("{}.toml", config_name);
+    if !std::path::Path::new(&config_path).exists() {
+        anyhow::bail!("未找到配置文件 {}", config_path);
     }
 
-    let content = fs::read_to_string(config_path)?;
+    let content = fs::read_to_string(&config_path)?;
     let db_option: DbOption = toml::from_str(&content)
-        .map_err(|e| anyhow::anyhow!("解析 DbOption.toml 失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("解析 {} 失败: {}", config_path, e))?;
 
     let project_name = db_option.project_name.clone();
     let project_dir = db_option.get_project_path(&project_name)

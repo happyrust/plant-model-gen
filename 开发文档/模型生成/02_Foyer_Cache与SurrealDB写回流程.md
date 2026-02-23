@@ -274,12 +274,16 @@ flush_latest_instance_cache_to_surreal(cache_dir, dbnums, replace_exist, verbose
 
 ## 五、配置与控制
 
-### 5.1 写入目标控制
+### 5.1 数据源模式控制（强互斥）
 
 | 配置项 | 位置 | 说明 |
 |--------|------|------|
-| `use_surrealdb` | `src/options.rs` | 控制是否写入 SurrealDB |
+| `use_cache` | `src/options.rs` | 启用 foyer cache 模式（此时 `use_surrealdb` 必须为 `false`） |
+| `use_surrealdb` | `src/options.rs` | 启用 SurrealDB 模式（此时 `use_cache` 必须为 `false`） |
 | `foyer_cache_dir` | `DbOptionExt` | Foyer Cache 目录路径 |
+
+启动阶段会校验：`use_cache` 与 `use_surrealdb` 必须严格互斥，且恰好一个为 `true`。  
+非法组合（同为 `true` 或同为 `false`）会直接失败并提示修正配置（fail-fast）。
 
 ### 5.2 并发控制参数
 
@@ -330,15 +334,12 @@ gen_model flush-cache-to-db \
     │
     ├─► ShapeInstancesData 生成
     │       │
-    │       ├─────────────────────────────────────────┐
-    │       │                                         │
-    │       ▼                                         ▼
-    │   Foyer Cache                              SurrealDB
-    │   insert_from_shape()                      save_instance_data_optimize()
-    │       │                                         │
-    │       ▼                                         ▼
-    │   CachedInstanceBatch                      inst_geo, inst_info,
-    │   (inst_relate_bool_map=空)                inst_relate, geo_relate...
+    │       ▼
+    │   按模式二选一：
+    │   - use_cache=true, use_surrealdb=false
+    │     => Foyer Cache（insert_from_shape）
+    │   - use_cache=false, use_surrealdb=true
+    │     => SurrealDB（save_instance_data_optimize）
     │
 [布尔运算阶段]
     │
@@ -368,11 +369,11 @@ gen_model flush-cache-to-db \
 
 ## 八、总结
 
-1. **双写模式**: 模型生成时可同时写入 Foyer Cache 和 SurrealDB（由 `use_surrealdb` 控制）
+1. **强互斥模式**: `use_cache` 与 `use_surrealdb` 必须二选一；不再允许“cache + SurrealDB 同时开启”
 
 2. **Cache-Only 布尔**: 布尔运算结果仅写入 Cache 的 `inst_relate_bool_map`，不直接写 SurrealDB
 
-3. **延迟落库**: 通过 `flush-cache-to-db` 命令可将 Cache 数据批量同步到 SurrealDB
+3. **延迟落库**: 通过 `flush-cache-to-db` 命令可将 Cache 数据批量同步到 SurrealDB（显式手动触发）
 
 4. **幂等写入**: SurrealDB 写入使用 `UPSERT` 和 `INSERT IGNORE` 保证幂等性
 

@@ -39,7 +39,7 @@ enable_sqlite_rtree = true
 gen_model_batch_size = 16
 
 # 缓存/双路径对比配置
-use_surrealdb = true
+use_surrealdb = false
 use_cache = true
 
 # IndexTree 默认管线调优配置

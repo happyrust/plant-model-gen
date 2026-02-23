@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-02-23
+
+### Breaking
+
+- **`use_cache` 与 `use_surrealdb` 现在必须严格互斥（且恰好一个为 true）**
+  - 启动配置解析增加 fail-fast 校验：`(true,true)` 与 `(false,false)` 会直接报错并终止
+  - `DbOptionExt` 默认数据源改为 cache 模式：`use_cache=true`、`use_surrealdb=false`
+  - 配置文件若未显式设置数据源，默认将按互斥规则落到 cache 模式
+
+### Changed
+
+- **新增统一数据源模式校验函数**
+  - `src/options.rs` 增加 `validate_data_source_mode(use_cache, use_surrealdb) -> anyhow::Result<()>`
+  - `get_db_option_ext` 与 `get_db_option_ext_from_path` 在构造 `DbOptionExt` 后立即执行校验
+  - 新增单测覆盖四种组合，仅允许 `(true,false)` 与 `(false,true)`
+
+- **修正冲突的示例/运行配置**
+  - `db_options/*.toml` 中原先 `use_cache=true,use_surrealdb=true` 的示例已统一改为互斥合法组合（cache 模式）
+
+### Documentation
+
+- **更新 Foyer Cache 与 SurrealDB 流程文档**
+  - `开发文档/模型生成/02_Foyer_Cache与SurrealDB写回流程.md` 明确“数据源二选一”与启动失败行为
+
 ## 2026-02-22
 
 ### Breaking

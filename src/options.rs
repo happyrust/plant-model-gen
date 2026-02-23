@@ -6,6 +6,27 @@ fn default_true() -> bool {
     true
 }
 
+fn default_false() -> bool {
+    false
+}
+
+/// 校验数据源模式（`use_cache` / `use_surrealdb`）是否合法。
+///
+/// 规则：两者必须严格互斥，且恰好一个为 `true`。
+pub fn validate_data_source_mode(use_cache: bool, use_surrealdb: bool) -> anyhow::Result<()> {
+    match (use_cache, use_surrealdb) {
+        (true, false) | (false, true) => Ok(()),
+        _ => anyhow::bail!(
+            "非法数据源模式: use_cache={}, use_surrealdb={}。\
+             规则要求两者严格互斥且恰好一个为 true。\
+             推荐配置：cache 模式(use_cache=true,use_surrealdb=false)；\
+             Surreal 模式(use_cache=false,use_surrealdb=true)。",
+            use_cache,
+            use_surrealdb
+        ),
+    }
+}
+
 /// 生成的网格模型格式
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -90,16 +111,19 @@ pub struct DbOptionExt {
     #[serde(default)]
     pub mesh_formats: Vec<MeshFormat>,
 
-    /// 是否启用 SurrealDB 模型数据写入/导出对照路径
+    /// 是否启用 SurrealDB 模型路径
     ///
-    /// 约定：
-    /// - SurrealDB 始终作为“输入数据源”（属性/loop/世界矩阵等）读取；
-    /// - 当该值为 false 时：模型生成过程中不写入 inst_* 等模型相关表，导出时实例数据优先从 foyer cache 读取；
-    /// - 当该值为 true 时：允许写入模型数据到 SurrealDB，导出也可直接从 SurrealDB 查询 instances（用于对照/迁移验证）。
-    #[serde(default = "default_true")]
+    /// 注意：与 `use_cache` 必须严格互斥，且恰好一个为 true。
+    /// - `true`  => SurrealDB 模式（`use_cache` 必须为 false）
+    /// - `false` => 非 SurrealDB 模式
+    #[serde(default = "default_false")]
     pub use_surrealdb: bool,
 
     /// 是否启用 foyer 缓存路径
+    ///
+    /// 注意：与 `use_surrealdb` 必须严格互斥，且恰好一个为 true。
+    /// - `true`  => cache 模式（`use_surrealdb` 必须为 false）
+    /// - `false` => 非 cache 模式
     #[serde(default = "default_true")]
     pub use_cache: bool,
 
@@ -257,7 +281,7 @@ impl From<DbOption> for DbOptionExt {
             index_tree_excluded_target_types: Vec::new(),
             index_tree_debug_limit_per_target_type: None,
             mesh_formats: vec![MeshFormat::PdmsMesh],
-            use_surrealdb: true,
+            use_surrealdb: false,
             use_cache: true,
             dual_run_enabled: false,
             foyer_primary: true,
@@ -271,7 +295,11 @@ impl From<DbOption> for DbOptionExt {
 /// 获取扩展的数据库选项
 pub fn get_db_option_ext() -> DbOptionExt {
     let db_option = aios_core::get_db_option();
-    DbOptionExt::from(db_option.clone())
+    let db_option_ext = DbOptionExt::from(db_option.clone());
+    if let Err(e) = validate_data_source_mode(db_option_ext.use_cache, db_option_ext.use_surrealdb) {
+        panic!("DbOptionExt 数据源模式校验失败: {}", e);
+    }
+    db_option_ext
 }
 
 /// 从指定路径加载扩展的数据库选项
@@ -410,7 +438,7 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
     let use_surrealdb = toml_value
         .get("use_surrealdb")
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let use_cache = toml_value
         .get("use_cache")
@@ -467,6 +495,16 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         secondary_mesh_dir,
     };
 
+    validate_data_source_mode(db_option_ext.use_cache, db_option_ext.use_surrealdb).map_err(
+        |e| {
+            anyhow::anyhow!(
+                "配置文件 {} 数据源模式非法: {}",
+                config_file,
+                e
+            )
+        },
+    )?;
+
     // 打印加载的配置
     println!("📋 加载的配置:");
     println!(
@@ -491,4 +529,17 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
     }
 
     Ok(db_option_ext)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_data_source_mode;
+
+    #[test]
+    fn data_source_mode_accepts_only_exclusive_true() {
+        assert!(validate_data_source_mode(true, false).is_ok());
+        assert!(validate_data_source_mode(false, true).is_ok());
+        assert!(validate_data_source_mode(true, true).is_err());
+        assert!(validate_data_source_mode(false, false).is_err());
+    }
 }

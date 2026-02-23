@@ -28,7 +28,7 @@ replace_mesh = true
 save_db = false
 
 # 运行期：仍可连接 DB，但输出/缓存目录改到 C 盘，避免 D 盘空间不足导致失败
-use_surrealdb = true
+use_surrealdb = false
 use_cache = true
 
 # 解析期只生成 scene tree 文件，跳过 PE/属性数据保存

@@ -106,7 +106,7 @@ pub async fn query_insts_with_batch(
                     refno.owner ?? refno as owner,
                     refno.world_trans as world_trans,
                     refno.world_aabb as world_aabb,
-                    [{{ "transform": refno.world_trans, "geo_hash": mesh_id, "is_tubi": false, "unit_flag": false }}] as insts,
+                    [{{ "geo_transform": refno.world_trans, "geo_hash": mesh_id, "is_tubi": false, "unit_flag": false }}] as insts,
                     true as has_neg
                 FROM [{bool_keys}]
                 WHERE status = 'Success'

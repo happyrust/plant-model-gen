@@ -1215,7 +1215,7 @@ async fn try_build_tree_index_for_refno(
     refno: RefnoEnum,
 ) -> anyhow::Result<crate::fast_model::gen_model::tree_index_manager::TreeIndexManager> {
     use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
-    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno).await?;
+    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno)?;
     Ok(TreeIndexManager::with_default_dir(vec![dbnum]))
 }
 

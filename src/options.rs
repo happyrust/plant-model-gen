@@ -177,6 +177,7 @@ impl DbOptionExt {
     pub fn get_index_tree_batch_size(&self) -> usize {
         self.index_tree_batch_size
             .unwrap_or(self.inner.gen_model_batch_size)
+            .max(super::fast_model::gen_model::config::BatchSize::DEFAULT)
     }
 
     /// 获取预烘 TriMesh(L0) 目录，默认在 meshes/trimesh_L0

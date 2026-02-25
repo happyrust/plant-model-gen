@@ -160,7 +160,6 @@ async fn query_children_nodes(
     // 层级查询统一走 TreeIndex（indextree）：这里仅需要父节点 noun 做路由判断。
     let parent_refno = RefnoEnum::from(RefU64(refno));
     let parent_noun = TreeIndexManager::resolve_dbnum_for_refno(parent_refno)
-        .await
         .ok()
         .and_then(|dbnum| {
             let mgr = TreeIndexManager::with_default_dir(vec![dbnum]);
@@ -291,7 +290,6 @@ async fn query_children_by_type(
         _ => {
             let parent_refno_enum = RefnoEnum::from(RefU64(parent_refno));
             let dbnum = TreeIndexManager::resolve_dbnum_for_refno(parent_refno_enum)
-                .await
                 .ok();
             let Some(dbnum) = dbnum else {
                 return Ok(Vec::new());

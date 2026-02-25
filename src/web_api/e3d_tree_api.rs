@@ -226,7 +226,7 @@ async fn get_children(
         // 层级查询统一走 indextree（TreeIndex）；name 可从 SurrealDB（输入数据源）读取。
         use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 
-        match TreeIndexManager::resolve_dbnum_for_refno(parent_refno).await {
+        match TreeIndexManager::resolve_dbnum_for_refno(parent_refno) {
             Ok(dbnum) => {
                 let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
                 let child_refnos = manager.query_children(parent_refno);
@@ -310,7 +310,7 @@ async fn get_subtree_refnos(
     let mut out: Vec<RefnoEnum> = if max_depth <= 0 {
         Vec::new()
     } else {
-        let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(root_refno).await else {
+        let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(root_refno) else {
             return Ok(Json(SubtreeRefnosResponse {
                 success: false,
                 refnos: vec![],
@@ -365,9 +365,8 @@ async fn get_visible_insts(
     // 2) 优先用 instances_{dbnum}.json 做“可加载几何”过滤：与前端实际加载数据保持一致。
     //    - 这可以避免 query_deep_visible_inst_refnos 返回“组节点/无几何节点”，导致前端 instances 缺失。
     //    - 若文件不存在，再回退到 inst_relate 的几何实例查询做过滤。
-    async fn parse_dbno(r: RefnoEnum) -> Option<u32> {
+    fn parse_dbno(r: RefnoEnum) -> Option<u32> {
         crate::fast_model::gen_model::tree_index_manager::TreeIndexManager::resolve_dbnum_for_refno(r)
-            .await
             .ok()
     }
 
@@ -397,7 +396,7 @@ async fn get_visible_insts(
     // - instances_{dbnum}.json 位于项目输出目录：output/<project_name>/instances/
     // - 历史兼容：也支持旧路径 output/instances/
     // - 文件读取/解析成功时：即使结果为空，也不回退 inst_relate（避免 inst_relate 缺失时接口直接报错）
-    let (refnos, file_ok) = if let Some(dbnum) = parse_dbno(refno).await {
+    let (refnos, file_ok) = if let Some(dbnum) = parse_dbno(refno) {
         let project_name = state.db_manager.db_option.project_name.clone();
         let instances_path_new = std::path::Path::new("output")
             .join(&project_name)
@@ -549,7 +548,7 @@ async fn query_node(refno: RefnoEnum) -> anyhow::Result<Option<TreeNodeDto>> {
     // 与 fn::default_name 一致：name 为空时生成 "{noun} {order+1}"
     if name.trim().is_empty() {
         use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
-        let order = match TreeIndexManager::resolve_dbnum_for_refno(refno).await {
+        let order = match TreeIndexManager::resolve_dbnum_for_refno(refno) {
             Ok(dbnum) => {
                 let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
                 let siblings = manager.query_children(pe.owner);

@@ -743,7 +743,7 @@ pub async fn api_stream_generate(
                             dbnos.push(dbnum);
                             continue;
                         }
-                        match TreeIndexManager::resolve_dbnum_for_refno(*r).await {
+                        match TreeIndexManager::resolve_dbnum_for_refno(*r) {
                             Ok(dbnum) => dbnos.push(dbnum),
                             Err(e) => {
                                 warn!("[StreamGenerate] 无法解析 dbnum: refno={}, err={}", r, e);

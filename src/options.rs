@@ -116,7 +116,7 @@ pub struct DbOptionExt {
     /// 注意：与 `use_cache` 必须严格互斥，且恰好一个为 true。
     /// - `true`  => SurrealDB 模式（`use_cache` 必须为 false）
     /// - `false` => 非 SurrealDB 模式
-    #[serde(default = "default_false")]
+    #[serde(default = "default_true")]
     pub use_surrealdb: bool,
 
     /// 是否启用 foyer 缓存路径
@@ -124,7 +124,7 @@ pub struct DbOptionExt {
     /// 注意：与 `use_surrealdb` 必须严格互斥，且恰好一个为 true。
     /// - `true`  => cache 模式（`use_surrealdb` 必须为 false）
     /// - `false` => 非 cache 模式
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub use_cache: bool,
 
     /// 是否双路径对比（主路径 + 副路径）
@@ -281,8 +281,8 @@ impl From<DbOption> for DbOptionExt {
             index_tree_excluded_target_types: Vec::new(),
             index_tree_debug_limit_per_target_type: None,
             mesh_formats: vec![MeshFormat::PdmsMesh],
-            use_surrealdb: false,
-            use_cache: true,
+            use_surrealdb: true,
+            use_cache: false,
             dual_run_enabled: false,
             foyer_primary: true,
             secondary_db_write: true,
@@ -438,12 +438,12 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
     let use_surrealdb = toml_value
         .get("use_surrealdb")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     let use_cache = toml_value
         .get("use_cache")
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let dual_run_enabled = toml_value
         .get("dual_run_enabled")

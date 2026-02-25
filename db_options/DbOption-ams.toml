@@ -43,16 +43,15 @@ index_tree_batch_size = 200
 # 启用的 noun 类别/具体 noun 名称
 # 可选值: "cate", "loop", "prim" 或具体 noun 名称如 "BRAN", "PANE"
 # 空 vec 表示启用所有类别（默认行为）
-# 示例1: 只生成 BRAN 和 PANE 类型
-index_tree_enabled_target_types = ["BRAN"]
-
+# 示例1: 全类别（推荐） -> []
+index_tree_enabled_target_types = []
 # 排除的 noun 列表
 # 即使类别启用，这里的 noun 也会被过滤掉
 index_tree_excluded_target_types = []
 
 # 调试模式：限制每种 Noun 类型的处理数量
 # 设置为 10 表示只处理每种类型的前 10 个实例
-# 注释掉或设置为 0 表示不限制（生成所有 BRAN）
+# 注释掉或设置为 0 表示不限制（生成所有类型）
 # index_tree_debug_limit_per_target_type = 20
 
 build_cate_relate = false

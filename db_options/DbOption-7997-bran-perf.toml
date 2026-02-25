@@ -37,11 +37,11 @@ gen_model_batch_size = 16
 index_tree_max_concurrent_targets = 6
 index_tree_batch_size = 200
 
-# 只生成 BRAN 类型
-index_tree_enabled_target_types = ["BRAN"]
+# 标准管线：启用所有类别
+index_tree_enabled_target_types = []
 index_tree_excluded_target_types = []
 
-# 不限制数量，生成所有 BRAN
+# 不限制数量（全类别）
 index_tree_debug_limit_per_target_type = 0
 
 # 指定 dbnum = 7997

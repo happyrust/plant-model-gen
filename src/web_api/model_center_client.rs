@@ -647,3 +647,178 @@ async fn query_workflow_data(form_id: &str) -> anyhow::Result<SyncWorkflowData> 
         attachments,
     })
 }
+
+// ============================================================================
+// 外部校审系统出站调用
+// ============================================================================
+
+/// 外部校审系统配置
+#[derive(Clone, Debug)]
+pub struct ExternalReviewConfig {
+    pub base_url: String,
+    pub workflow_sync_path: String,
+    pub workflow_delete_path: String,
+    pub auth_secret: String,
+    pub timeout_seconds: u64,
+}
+
+impl Default for ExternalReviewConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            workflow_sync_path: "/api/workflow/sync".to_string(),
+            workflow_delete_path: "/api/workflow/delete".to_string(),
+            auth_secret: "shared-review-secret".to_string(),
+            timeout_seconds: 15,
+        }
+    }
+}
+
+impl ExternalReviewConfig {
+    /// 从 DbOption.toml 加载 [external_review] 配置
+    pub fn from_config_file() -> Self {
+        let paths = [
+            "db_options/DbOption.toml",
+            "../db_options/DbOption.toml",
+            "DbOption.toml",
+        ];
+        for path in &paths {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(doc) = content.parse::<toml::Value>() {
+                    if let Some(section) = doc.get("external_review") {
+                        return Self {
+                            base_url: section.get("base_url")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            workflow_sync_path: section.get("workflow_sync_path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("/api/workflow/sync")
+                                .to_string(),
+                            workflow_delete_path: section.get("workflow_delete_path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("/api/workflow/delete")
+                                .to_string(),
+                            auth_secret: section.get("auth_secret")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("shared-review-secret")
+                                .to_string(),
+                            timeout_seconds: section.get("timeout_seconds")
+                                .and_then(|v| v.as_integer())
+                                .unwrap_or(15) as u64,
+                        };
+                    }
+                }
+            }
+        }
+        Self::default()
+    }
+
+    /// base_url 为空时启用 mock 模式
+    pub fn is_mock(&self) -> bool {
+        self.base_url.trim().is_empty()
+    }
+}
+
+#[cfg(feature = "web_server")]
+lazy_static::lazy_static! {
+    pub static ref EXTERNAL_REVIEW_CONFIG: ExternalReviewConfig = ExternalReviewConfig::from_config_file();
+}
+
+/// 异步通知外部系统工作流状态变更（提交/驳回）
+/// fire-and-forget：不阻塞主流程
+#[cfg(feature = "web_server")]
+pub fn notify_workflow_sync_async(task_id: String, action: String, operator_id: String, comment: Option<String>) {
+    if EXTERNAL_REVIEW_CONFIG.is_mock() {
+        info!("[外部校审] mock 模式，跳过工作流同步: task={}, action={}", task_id, action);
+        return;
+    }
+    tokio::spawn(async move {
+        if let Err(e) = notify_workflow_sync(&task_id, &action, &operator_id, comment.as_deref()).await {
+            warn!("[外部校审] 工作流同步失败: task={}, err={}", task_id, e);
+        }
+    });
+}
+
+#[cfg(feature = "web_server")]
+async fn notify_workflow_sync(task_id: &str, action: &str, operator_id: &str, comment: Option<&str>) -> anyhow::Result<()> {
+    let config = &*EXTERNAL_REVIEW_CONFIG;
+    let url = format!("{}{}", config.base_url.trim_end_matches('/'), config.workflow_sync_path);
+    
+    let token_plain = format!("{}:{}", task_id, operator_id);
+    let token = sha256_hex(&format!("{}:{}", config.auth_secret, token_plain));
+    
+    let body = serde_json::json!({
+        "task_id": task_id,
+        "action": action,
+        "operator_id": operator_id,
+        "comment": comment.unwrap_or(""),
+        "token": token,
+    });
+    
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(config.timeout_seconds))
+        .build()?;
+    
+    let resp = client.post(&url)
+        .json(&body)
+        .send()
+        .await?;
+    
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("外部系统返回错误 {}: {}", status, text);
+    }
+    
+    info!("[外部校审] 工作流同步成功: task={}, action={}", task_id, action);
+    Ok(())
+}
+
+/// 异步通知外部系统删除校审数据
+#[cfg(feature = "web_server")]
+pub fn notify_workflow_delete_async(task_id: String, operator_id: String) {
+    if EXTERNAL_REVIEW_CONFIG.is_mock() {
+        info!("[外部校审] mock 模式，跳过删除通知: task={}", task_id);
+        return;
+    }
+    tokio::spawn(async move {
+        if let Err(e) = notify_workflow_delete(&task_id, &operator_id).await {
+            warn!("[外部校审] 删除通知失败: task={}, err={}", task_id, e);
+        }
+    });
+}
+
+#[cfg(feature = "web_server")]
+async fn notify_workflow_delete(task_id: &str, operator_id: &str) -> anyhow::Result<()> {
+    let config = &*EXTERNAL_REVIEW_CONFIG;
+    let url = format!("{}{}", config.base_url.trim_end_matches('/'), config.workflow_delete_path);
+    
+    let token_plain = format!("{}:{}", task_id, operator_id);
+    let token = sha256_hex(&format!("{}:{}", config.auth_secret, token_plain));
+    
+    let body = serde_json::json!({
+        "task_id": task_id,
+        "operator_id": operator_id,
+        "token": token,
+    });
+    
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(config.timeout_seconds))
+        .build()?;
+    
+    let resp = client.post(&url)
+        .json(&body)
+        .send()
+        .await?;
+    
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("外部系统返回错误 {}: {}", status, text);
+    }
+    
+    info!("[外部校审] 删除通知成功: task={}", task_id);
+    Ok(())
+}
+

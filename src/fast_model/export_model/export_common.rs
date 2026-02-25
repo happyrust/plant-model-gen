@@ -479,8 +479,9 @@ pub async fn collect_export_data(
 
         let file_exists = existing_files.contains(std::ffi::OsStr::new(&filename));
         let fallback_exists = existing_files.contains(std::ffi::OsStr::new(&fallback_filename));
+        let is_tubi_hash = geo_hash.as_str() == aios_core::prim_geo::basic::TUBI_GEO_HASH.to_string().as_str() || geo_hash.starts_with("t_");
 
-        if file_exists || fallback_exists {
+        if file_exists || fallback_exists || is_tubi_hash {
             valid_geo_hashes.insert((*geo_hash).clone());
             loaded_count += 1;
             if verbose && **usage_count > 1 {

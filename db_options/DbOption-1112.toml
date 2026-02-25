@@ -52,7 +52,7 @@ index_tree_batch_size = 200
 # 启用的 noun 类别/具体 noun 名称
 # 可选值: "cate", "loop", "prim" 或具体 noun 名称如 "BRAN", "PANE"
 # 空 vec 表示启用所有类别（默认行为）
-index_tree_enabled_target_types = ["BRAN", "HANG"]
+index_tree_enabled_target_types = []
 index_tree_excluded_target_types = []
 
 # 调试模式：限制每种 Noun 类型的处理数量

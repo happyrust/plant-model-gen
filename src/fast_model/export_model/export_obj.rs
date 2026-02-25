@@ -2,7 +2,7 @@ use aios_core::RefnoEnum;
 use aios_core::shape::pdms_shape::PlantMesh;
 use anyhow::{Context, Result};
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::fast_model::unit_converter::UnitConverter;
@@ -546,8 +546,8 @@ pub async fn export_obj_for_refnos(
         unit_converter: UnitConverter::default(),
         use_basic_materials: false,
         include_negative: false,
-        allow_surrealdb: true,
-        cache_dir: None,
+        allow_surrealdb: false,
+        cache_dir: Some(PathBuf::from("output/foyer_cache")),
     };
 
     let PreparedObjExportData {

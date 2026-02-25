@@ -124,7 +124,7 @@ function Mesh-DirSig([string]$meshDir) {
 
 function Run-One([string]$mode, [hashtable]$envs, [string]$cfgNoExt, [string]$cacheDir, [string]$meshDir, [string]$projectName) {
   Write-Host ""
-  Write-Host ("==== RUN: {0} (dbnum={1}, noun={2}) ====" -f $mode, $Dbnum, $Noun)
+  Write-Host ("==== RUN: {0} (dbnum={1}, noun={2} deprecated/ignored) ====" -f $mode, $Dbnum, $Noun)
 
   # 公平：清空缓存与 mesh 输出目录
   Ensure-DirEmpty $cacheDir
@@ -247,10 +247,9 @@ try {
   # 为公平对比：避免 precheck 扫全库 + 避免 DB 写入，把输出统一落在 foyer/meshes
   $tomlNow = Upsert-TomlLine $tomlNow "use_surrealdb" "false"
   $tomlNow = Upsert-TomlLine $tomlNow "save_db" "false"
-  $tomlNow = Upsert-TomlLine $tomlNow "full_noun_mode" "true"
-  $tomlNow = Upsert-TomlLine $tomlNow "full_noun_enabled_categories" ("[`"{0}`"]" -f $Noun)
-  $tomlNow = Upsert-TomlLine $tomlNow "full_noun_excluded_nouns" "[]"
-  $tomlNow = Upsert-TomlLine $tomlNow "debug_limit_per_noun" "0"
+  $tomlNow = Upsert-TomlLine $tomlNow "index_tree_enabled_target_types" "[]"
+  $tomlNow = Upsert-TomlLine $tomlNow "index_tree_excluded_target_types" "[]"
+  $tomlNow = Upsert-TomlLine $tomlNow "index_tree_debug_limit_per_target_type" "0"
   $tomlNow = Upsert-TomlLine $tomlNow "manual_db_nums" ("[{0}]" -f $Dbnum)
   $tomlNow = Upsert-TomlLine $tomlNow "foyer_cache_dir" ("`"{0}`"" -f $nowCacheDir.Replace('\','/'))
   $tomlNow = Upsert-TomlLine $tomlNow "meshes_path" ("`"{0}`"" -f $nowMeshDir.Replace('\','/'))
@@ -261,10 +260,9 @@ try {
   $tomlCO = Upsert-TomlLine $tomlCO "export_instances" "true"
   $tomlCO = Upsert-TomlLine $tomlCO "use_surrealdb" "false"
   $tomlCO = Upsert-TomlLine $tomlCO "save_db" "false"
-  $tomlCO = Upsert-TomlLine $tomlCO "full_noun_mode" "true"
-  $tomlCO = Upsert-TomlLine $tomlCO "full_noun_enabled_categories" ("[`"{0}`"]" -f $Noun)
-  $tomlCO = Upsert-TomlLine $tomlCO "full_noun_excluded_nouns" "[]"
-  $tomlCO = Upsert-TomlLine $tomlCO "debug_limit_per_noun" "0"
+  $tomlCO = Upsert-TomlLine $tomlCO "index_tree_enabled_target_types" "[]"
+  $tomlCO = Upsert-TomlLine $tomlCO "index_tree_excluded_target_types" "[]"
+  $tomlCO = Upsert-TomlLine $tomlCO "index_tree_debug_limit_per_target_type" "0"
   $tomlCO = Upsert-TomlLine $tomlCO "manual_db_nums" ("[{0}]" -f $Dbnum)
   $tomlCO = Upsert-TomlLine $tomlCO "foyer_cache_dir" ("`"{0}`"" -f $coCacheDir.Replace('\','/'))
   $tomlCO = Upsert-TomlLine $tomlCO "meshes_path" ("`"{0}`"" -f $coMeshDir.Replace('\','/'))

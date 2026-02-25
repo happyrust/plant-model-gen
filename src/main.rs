@@ -554,7 +554,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("use-surrealdb")
                 .long("use-surrealdb")
-                .help("Enable SurrealDB instances source / model-data writes for export/debug flows (default: cache-only instances, no fallback)")
+                .help("Force enable SurrealDB instances source / model-data writes for export/debug flows (default follows config)")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -789,37 +789,6 @@ async fn main() -> anyhow::Result<()> {
                 .value_name("REFNO")
                 .action(clap::ArgAction::Set),
         )
-        // ========== 缓存清理命令 ==========
-        .arg(
-            Arg::new("clean-cache")
-                .long("clean-cache")
-                .help("清理 foyer instance_cache 缓存数据")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("clean-cache-dbnums")
-                .long("clean-cache-dbnums")
-                .help("指定要清理的 dbnum 列表（逗号分隔）")
-                .value_delimiter(',')
-                .value_parser(clap::value_parser!(u32))
-                .requires("clean-cache"),
-        )
-        .arg(
-            Arg::new("clean-cache-refnos")
-                .long("clean-cache-refnos")
-                .help("指定要清理的 refno 列表（逗号分隔）")
-                .value_delimiter(',')
-                .value_parser(clap::value_parser!(u64))
-                .requires("clean-cache")
-                .conflicts_with("clean-cache-dbnums"),
-        )
-        .arg(
-            Arg::new("clean-cache-all")
-                .long("clean-cache-all")
-                .help("清理所有缓存数据")
-                .action(clap::ArgAction::SetTrue)
-                .requires("clean-cache"),
-        )
         // ========== pe_transform 刷新命令 ==========
         .arg(
             Arg::new("refresh-transform")
@@ -934,56 +903,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // ========== 缓存清理命令 ==========
-    if matches.get_flag("clean-cache") {
-        let cache_dir = db_option_ext.get_foyer_cache_dir();
-        let verbose = matches.get_flag("verbose");
 
-        println!("\n🧹 clean-cache: 清理 foyer instance_cache 缓存数据");
-        println!("   缓存目录: {}", cache_dir.display());
-
-        let stats = if matches.get_flag("clean-cache-all") {
-            // 清理所有缓存
-            println!("   模式: 清理所有缓存");
-            aios_database::fast_model::cache_clean::clean_all_cache(&cache_dir, verbose).await?
-        } else if let Some(dbnums) = matches.get_many::<u32>("clean-cache-dbnums") {
-            // 按 dbnum 清理
-            let dbnums: Vec<u32> = dbnums.copied().collect();
-            println!("   模式: 按 dbnum 清理，目标: {:?}", dbnums);
-            aios_database::fast_model::cache_clean::clean_cache_by_dbnum(
-                &cache_dir, &dbnums, verbose,
-            )
-            .await?
-        } else if let Some(refnos) = matches.get_many::<u64>("clean-cache-refnos") {
-            // 按 refno 清理（需要初始化 db_meta）
-            let refnos: Vec<aios_core::RefnoEnum> = refnos
-                .map(|&r| aios_core::RefnoEnum::from(aios_core::RefU64(r)))
-                .collect();
-            println!("   模式: 按 refno 清理，目标: {:?}", refnos);
-
-            // 初始化 db_meta 以解析 refno -> dbnum
-            init_surreal().await?;
-            aios_database::fast_model::cache_clean::clean_cache_by_refno(
-                &cache_dir, &refnos, verbose,
-            )
-            .await?
-        } else {
-            // 未指定清理目标，提示用户
-            println!("⚠️ 请指定清理目标：");
-            println!("   --clean-cache-all          清理所有缓存");
-            println!("   --clean-cache-dbnums 1,2   按 dbnum 清理");
-            println!("   --clean-cache-refnos 123   按 refno 清理");
-            return Ok(());
-        };
-
-        println!(
-            "✅ 缓存清理完成：移除 {} 个 batch，影响 {} 个 dbnum: {:?}",
-            stats.instance_batches_removed,
-            stats.dbnums_affected.len(),
-            stats.dbnums_affected
-        );
-        return Ok(());
-    }
 
     // 调试：显示配置加载结果
     println!("🔧 配置加载完成:");
@@ -1211,11 +1131,11 @@ async fn main() -> anyhow::Result<()> {
         db_option_ext.inner.replace_mesh = Some(true);
     }
 
-    // ========== OBJ 导出：默认走缓存，SurrealDB 需显式开关 ==========
+    // ========== OBJ 导出：默认沿用配置，--use-surrealdb 可强制切到 SurrealDB ==========
     //
     // 约定：
-    // - 默认（不传 --use-surrealdb）时，OBJ 导出/截图相关路径不依赖 SurrealDB；
-    // - 若需走 SurrealDB（用于对照/迁移验证），必须显式添加 --use-surrealdb；
+    // - 默认（不传 --use-surrealdb）时，沿用 DbOption 中 use_cache/use_surrealdb；
+    // - 传 --use-surrealdb 时，强制使用 SurrealDB（并关闭 cache）；
     // - 这不是 fallback：cache 与 surrealdb 两条路径同时存在仅用于验证准确性。
     let obj_export_flow = matches.get_flag("export-obj")
         || matches.get_flag("export-svg")
@@ -1223,16 +1143,15 @@ async fn main() -> anyhow::Result<()> {
         || (debug_model_requested && capture_dir.is_some());
 
     if obj_export_flow {
-        let cli_use_surrealdb = matches.get_flag("use-surrealdb");
-        db_option_ext.use_surrealdb = cli_use_surrealdb;
-        if cli_use_surrealdb {
+        if matches.get_flag("use-surrealdb") {
             // SurrealDB-only：用于对照验证，避免与 cache 混用
+            db_option_ext.use_surrealdb = true;
             db_option_ext.use_cache = false;
         }
 
         if !db_option_ext.use_cache && !db_option_ext.use_surrealdb {
             anyhow::bail!(
-                "OBJ 导出默认关闭 SurrealDB，但当前配置未启用 use_cache；请开启 use_cache 或添加 --use-surrealdb"
+                "OBJ 导出时 use_cache/use_surrealdb 同时为 false，请在配置中启用其一，或添加 --use-surrealdb"
             );
         }
 
@@ -1245,11 +1164,8 @@ async fn main() -> anyhow::Result<()> {
 
     // ========== 处理 --debug-model 与导出标志的组合 ==========
     if let Some(refnos_vec) = &debug_model_refnos {
-        // 如果用户开启了 --capture 但没有指定任何导出标志，则默认走 OBJ 导出流程：
-        // - export_obj_mode 内部会在需要时触发模型生成（配合 --regen-model 可强制重建）
-        // - gen_all_geos_data 末尾会调用 capture_refnos_if_enabled 生成截图
-        //
-        // 这样可以保证 `--debug-model ... --capture ...` 的行为稳定且符合“生成模型并截图”的预期。
+        // 如果用户开启了 --capture 但没有指定任何导出标志，则默认走 OBJ 导出流程。
+        // 这样可保证 `--debug-model ... --capture ...` 行为稳定：统一复用导出链路收集几何并触发截图。
         if capture_dir.is_some()
             && !matches.get_flag("export-obj")
             && !matches.get_flag("export-svg")
@@ -1978,23 +1894,6 @@ async fn main() -> anyhow::Result<()> {
             let count = aios_core::transform::refresh_pe_transform_for_dbnums(&dbnums).await?;
             println!("✅ pe_transform 刷新完成，共处理 {} 个节点", count);
             return Ok(());
-        }
-    }
-
-    // ========== 处理 --debug-model + --capture 但无导出标志的情况 ==========
-    // 如果使用了 --debug-model 和 --capture 但没有指定导出标志，直接触发模型生成和 capture
-    if debug_model_requested && capture_dir.is_some() {
-        if let Some(refnos_vec) = &debug_model_refnos {
-            if !refnos_vec.is_empty() {
-                println!(
-                    "🎯 调试模式 + 截图模式：生成模型并截图 (无导出标志): {:?}",
-                    refnos_vec
-                );
-                // 确保 gen_mesh 已启用（已在前面设置）
-                // 直接调用 run_app，它会通过 run_cli -> gen_all_geos_data 生成模型
-                // gen_all_geos_data 会检查 debug_model_refnos 并生成模型，然后触发 capture
-                return run_app(Some(db_option_ext)).await;
-            }
         }
     }
 

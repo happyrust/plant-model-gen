@@ -14,7 +14,7 @@
 
 
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use std::path::Path;
 
@@ -92,24 +92,65 @@ pub(crate) async fn split_shape_instances_by_dbnum(
 
     let mut out: HashMap<u32, ShapeInstancesData> = HashMap::new();
     let mut cache: HashMap<RefnoEnum, u32> = HashMap::new();
+    let mut missing_by_source: HashMap<&'static str, usize> = HashMap::new();
+    let mut missing_refnos: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     async fn get_dbnum_cached(
         refno: RefnoEnum,
+        source: &'static str,
         cache: &mut HashMap<RefnoEnum, u32>,
-    ) -> anyhow::Result<u32> {
+        missing_by_source: &mut HashMap<&'static str, usize>,
+        missing_refnos: &mut std::collections::BTreeSet<String>,
+    ) -> Option<u32> {
         if let Some(v) = cache.get(&refno) {
-            return Ok(*v);
+            return Some(*v);
         }
         let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno)
-            .map_err(|e| anyhow::anyhow!("缺少 ref0->dbnum 映射: refno={refno}, err={e}"))?;
-        cache.insert(refno, dbnum);
-        Ok(dbnum)
+            .ok();
+        if let Some(dbnum) = dbnum {
+            cache.insert(refno, dbnum);
+            return Some(dbnum);
+        }
+        *missing_by_source.entry(source).or_insert(0) += 1;
+        missing_refnos.insert(refno.to_string());
+        None
+    }
+
+    fn summarize_missing_sources(missing_by_source: &HashMap<&'static str, usize>) -> String {
+        let mut parts: Vec<String> = missing_by_source
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}"))
+            .collect();
+        parts.sort();
+        parts.join(", ")
+    }
+
+    fn summarize_missing_samples(
+        missing_refnos: &std::collections::BTreeSet<String>,
+        max_n: usize,
+    ) -> String {
+        missing_refnos
+            .iter()
+            .take(max_n)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     // inst_info
     for (refno, info) in shape_insts.inst_info_map.iter() {
         let refno = *refno;
-        let dbnum = get_dbnum_cached(refno, &mut cache).await?;
+        let Some(dbnum) = get_dbnum_cached(
+            refno,
+            "inst_info.key",
+            &mut cache,
+            &mut missing_by_source,
+            &mut missing_refnos,
+        )
+        .await
+        else {
+            continue;
+        };
         out.entry(dbnum)
             .or_insert_with(ShapeInstancesData::default)
             .inst_info_map
@@ -119,7 +160,17 @@ pub(crate) async fn split_shape_instances_by_dbnum(
     // inst_tubi
     for (refno, tubi) in shape_insts.inst_tubi_map.iter() {
         let refno = *refno;
-        let dbnum = get_dbnum_cached(refno, &mut cache).await?;
+        let Some(dbnum) = get_dbnum_cached(
+            refno,
+            "inst_tubi.key",
+            &mut cache,
+            &mut missing_by_source,
+            &mut missing_refnos,
+        )
+        .await
+        else {
+            continue;
+        };
         out.entry(dbnum)
             .or_insert_with(ShapeInstancesData::default)
             .inst_tubi_map
@@ -130,7 +181,17 @@ pub(crate) async fn split_shape_instances_by_dbnum(
     for (inst_key, geos_data) in shape_insts.inst_geos_map.iter() {
         let inst_key = inst_key.clone();
         let geos_data = geos_data.clone();
-        let dbnum = get_dbnum_cached(geos_data.refno, &mut cache).await?;
+        let Some(dbnum) = get_dbnum_cached(
+            geos_data.refno,
+            "inst_geos.refno",
+            &mut cache,
+            &mut missing_by_source,
+            &mut missing_refnos,
+        )
+        .await
+        else {
+            continue;
+        };
         out.entry(dbnum)
             .or_insert_with(ShapeInstancesData::default)
             .inst_geos_map
@@ -139,18 +200,49 @@ pub(crate) async fn split_shape_instances_by_dbnum(
 
     // neg_relate / ngmr_neg_relate：按 key(refno) 分桶
     for (refno, v) in &shape_insts.neg_relate_map {
-        let dbnum = get_dbnum_cached(*refno, &mut cache).await?;
+        let Some(dbnum) = get_dbnum_cached(
+            *refno,
+            "neg_relate.key",
+            &mut cache,
+            &mut missing_by_source,
+            &mut missing_refnos,
+        )
+        .await
+        else {
+            continue;
+        };
         out.entry(dbnum)
             .or_insert_with(ShapeInstancesData::default)
             .neg_relate_map
             .insert(*refno, v.clone());
     }
     for (refno, v) in &shape_insts.ngmr_neg_relate_map {
-        let dbnum = get_dbnum_cached(*refno, &mut cache).await?;
+        let Some(dbnum) = get_dbnum_cached(
+            *refno,
+            "ngmr_neg_relate.key",
+            &mut cache,
+            &mut missing_by_source,
+            &mut missing_refnos,
+        )
+        .await
+        else {
+            continue;
+        };
         out.entry(dbnum)
             .or_insert_with(ShapeInstancesData::default)
             .ngmr_neg_relate_map
             .insert(*refno, v.clone());
+    }
+
+    if !missing_refnos.is_empty() {
+        let source_summary = summarize_missing_sources(&missing_by_source);
+        let sample = summarize_missing_samples(&missing_refnos, 8);
+        return Err(anyhow::anyhow!(
+            "缺少 ref0->dbnum 映射: unique_refnos={}, sources=[{}], sample=[{}]",
+            missing_refnos.len(),
+            source_summary,
+            sample
+        ));
     }
 
     Ok(out)
@@ -162,6 +254,72 @@ enum GenerationScope {
     Manual { roots: Vec<RefnoEnum> },
     Debug { roots: Vec<RefnoEnum> },
     Incremental { log: IncrGeoUpdateLog },
+}
+
+fn decide_generation_scope(
+    manual_refnos: &[RefnoEnum],
+    debug_roots: &[RefnoEnum],
+    has_incr_log: bool,
+    incr_visible_roots: &[RefnoEnum],
+    incr_updates: Option<&IncrGeoUpdateLog>,
+) -> GenerationScope {
+    let has_manual = !manual_refnos.is_empty();
+    let has_debug = !debug_roots.is_empty();
+
+    if has_manual && !has_debug && !has_incr_log {
+        return GenerationScope::Manual {
+            roots: manual_refnos.to_vec(),
+        };
+    }
+
+    if has_debug && !has_manual && !has_incr_log {
+        return GenerationScope::Debug {
+            roots: debug_roots.to_vec(),
+        };
+    }
+
+    if has_incr_log && !has_manual && !has_debug {
+        return GenerationScope::Incremental {
+            log: incr_updates.cloned().unwrap_or_default(),
+        };
+    }
+
+    if has_manual || has_debug || has_incr_log {
+        let mut merged: HashSet<RefnoEnum> = HashSet::new();
+        merged.extend(manual_refnos.iter().copied());
+        merged.extend(debug_roots.iter().copied());
+        merged.extend(incr_visible_roots.iter().copied());
+        return GenerationScope::Manual {
+            roots: merged.into_iter().collect(),
+        };
+    }
+
+    GenerationScope::Full
+}
+
+async fn collect_db_write_failures(db_write_handles: Vec<tokio::task::JoinHandle<bool>>) -> usize {
+    let mut db_write_failures = 0usize;
+    for h in db_write_handles {
+        match h.await {
+            Ok(true) => {}
+            Ok(false) => db_write_failures += 1,
+            Err(e) => {
+                eprintln!("等待写库任务失败: {}", e);
+                db_write_failures += 1;
+            }
+        }
+    }
+    db_write_failures
+}
+
+fn ensure_no_db_write_failures(db_write_failures: usize) -> anyhow::Result<()> {
+    if db_write_failures > 0 {
+        return Err(anyhow::anyhow!(
+            "SurrealDB 批量写入存在失败任务: {}",
+            db_write_failures
+        ));
+    }
+    Ok(())
 }
 
 
@@ -435,38 +593,36 @@ pub async fn gen_all_geos_data(
         .as_ref()
         .map(|log| log.get_all_visible_refnos().into_iter().collect())
         .unwrap_or_default();
+    let has_incr_log = final_incr_updates
+        .as_ref()
+        .map(|log| log.count() > 0)
+        .unwrap_or(false);
+    let has_incr_visible_roots = !incr_visible_roots.is_empty();
 
-    let has_manual = !manual_refnos.is_empty();
-    let has_debug = !debug_roots.is_empty();
-    let has_incr = !incr_visible_roots.is_empty();
+    let scope = decide_generation_scope(
+        &manual_refnos,
+        &debug_roots,
+        has_incr_log,
+        &incr_visible_roots,
+        final_incr_updates.as_ref(),
+    );
 
-    let scope = if has_manual && !has_debug && !has_incr {
-        GenerationScope::Manual {
-            roots: manual_refnos.clone(),
-        }
-    } else if has_debug && !has_manual && !has_incr {
-        GenerationScope::Debug {
-            roots: debug_roots.clone(),
-        }
-    } else if has_incr && !has_manual && !has_debug {
-        GenerationScope::Incremental {
-            log: final_incr_updates.clone().unwrap_or_default(),
-        }
-    } else if has_manual || has_debug || has_incr {
-        let mut merged: std::collections::HashSet<RefnoEnum> = std::collections::HashSet::new();
-        merged.extend(manual_refnos.iter().copied());
-        merged.extend(debug_roots.iter().copied());
-        merged.extend(incr_visible_roots.iter().copied());
+    if matches!(scope, GenerationScope::Incremental { .. }) && !has_incr_visible_roots {
         println!(
-            "[gen_model] 检测到混合输入(manual/debug/incr)，按 roots 并集执行：{} 个",
-            merged.len()
+            "[gen_model] 增量日志存在但未解析到可见 roots，将按 Incremental 空 roots 路径执行（不会回退 Full）"
         );
-        GenerationScope::Manual {
-            roots: merged.into_iter().collect(),
+    }
+
+    let input_source_cnt =
+        (!manual_refnos.is_empty() as u8) + (!debug_roots.is_empty() as u8) + (has_incr_log as u8);
+    if input_source_cnt >= 2 {
+        if let GenerationScope::Manual { roots } = &scope {
+            println!(
+                "[gen_model] 检测到混合输入(manual/debug/incr)，按 roots 并集执行：{} 个",
+                roots.len()
+            );
         }
-    } else {
-        GenerationScope::Full
-    };
+    }
 
     perf.mark("index_tree_generation");
     let result = process_index_tree_generation(scope, db_option, target_sesno, time).await;
@@ -627,35 +783,46 @@ async fn process_index_tree_generation(
 
 
 
-    // 初始化 Parquet 写入器
+    // 初始化 Parquet 写入器（默认关闭，通过环境变量显式开启）。
+    //
+    // 开关：AIOS_ENABLE_PARQUET_STREAM_WRITER=1|true|yes|on
+    // 说明：此前该路径固定为 None，容易造成“看似支持但实际未启用”的误解；
+    // 这里改为显式开关，默认行为保持不变（关闭）。
+    let enable_parquet_stream_writer = std::env::var("AIOS_ENABLE_PARQUET_STREAM_WRITER")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
 
-    let parquet_writer: Option<std::sync::Arc<ParquetStreamWriter>> = None;
-
-    /*
-
-    let parquet_writer = {
-
+    let parquet_writer = if enable_parquet_stream_writer {
         let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
+        let parquet_dir = std::path::Path::new(output_dir)
+            .parent()
+            .unwrap_or(std::path::Path::new("output"));
 
-        let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
-
-        match ParquetStreamWriter::new(&parquet_dir) {
-
-            Ok(writer) => Some(std::sync::Arc::new(writer)),
-
-            Err(e) => {
-
-                eprintln!("[Parquet] 初始化写入器失败: {}, 跳过 Parquet 导出", e);
-
-                None
-
+        match ParquetStreamWriter::new(parquet_dir) {
+            Ok(writer) => {
+                println!(
+                    "[Parquet] 已启用流式写入（AIOS_ENABLE_PARQUET_STREAM_WRITER=1），输出目录: {}",
+                    parquet_dir.display()
+                );
+                Some(std::sync::Arc::new(writer))
             }
-
+            Err(e) => {
+                eprintln!("[Parquet] 初始化写入器失败: {}, 回退为禁用", e);
+                None
+            }
         }
-
+    } else {
+        println!(
+            "[Parquet] 流式写入已禁用（可设置 AIOS_ENABLE_PARQUET_STREAM_WRITER=1 显式开启）"
+        );
+        None
     };
-
-    */
 
     #[cfg(feature = "duckdb-feature")]
 
@@ -749,7 +916,8 @@ async fn process_index_tree_generation(
         let mut t_duckdb = std::time::Duration::ZERO;
 
         // SurrealDB 写入后台任务句柄：不阻塞 cache 写入和后续 batch 接收
-        let mut db_write_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut db_write_handles: Vec<tokio::task::JoinHandle<bool>> = Vec::new();
+        let mut db_write_failures: usize = 0;
         // 控制 SurrealDB 后台写入的最大并发数
         let db_write_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
 
@@ -782,8 +950,8 @@ async fn process_index_tree_generation(
                 let by_dbnum = match split_shape_instances_by_dbnum(&shape_insts_arc).await {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("[cache] batch 拆分 dbnum 失败，跳过写 cache: {}", e);
-                        continue;
+                        eprintln!("[cache] batch 拆分 dbnum 失败，跳过写 cache（继续后续写入）: {}", e);
+                        HashMap::new()
                     }
                 };
 
@@ -862,12 +1030,14 @@ async fn process_index_tree_generation(
                         Ok(p) => p,
                         Err(e) => {
                             eprintln!("获取写库并发锁失败: {}", e);
-                            return;
+                            return false;
                         }
                     };
                     if let Err(e) = save_instance_data_optimize(&shape_insts_clone, replace_exist).await {
                         eprintln!("保存实例数据失败: {}", e);
+                        return false;
                     }
+                    true
                 }));
                 t_save_db += t0.elapsed();
             }
@@ -878,9 +1048,7 @@ async fn process_index_tree_generation(
         if !db_write_handles.is_empty() {
             let t_wait = Instant::now();
             let total = db_write_handles.len();
-            for h in db_write_handles {
-                let _ = h.await;
-            }
+            db_write_failures += collect_db_write_failures(db_write_handles).await;
             let wait_ms = t_wait.elapsed().as_millis();
             if wait_ms > 100 {
                 println!(
@@ -916,6 +1084,10 @@ async fn process_index_tree_generation(
 
         }
 
+        ensure_no_db_write_failures(db_write_failures)?;
+
+        Ok::<(), anyhow::Error>(())
+
     });
 
 
@@ -941,7 +1113,10 @@ async fn process_index_tree_generation(
 
 
 
-    let _ = insert_handle.await;
+    insert_handle
+        .await
+        .map_err(|e| anyhow::anyhow!("instance sink 任务异常退出: {}", e))?
+        .map_err(IndexTreeError::Other)?;
 
 
 
@@ -1330,15 +1505,18 @@ async fn process_index_tree_generation(
 
     if db_option.export_instances {
 
-        let mut dbnos: Vec<u32> = if let Some(nums) = db_option.inner.manual_db_nums.clone() {
-
-            nums
-
-        } else {
-
-            aios_core::query_mdb_db_nums(None, aios_core::DBType::DESI).await?
-
-        };
+        let (dbno_source, mut dbnos): (&str, Vec<u32>) =
+            if let Some(nums) = db_option.inner.manual_db_nums.clone() {
+                ("manual_db_nums", nums)
+            } else if !touched_dbnums_vec.is_empty() {
+                // 优先导出本次生成实际触达的 dbnum，避免扫描全 MDB 触发无关库的 tree 缺失报错。
+                ("touched_dbnums", touched_dbnums_vec.clone())
+            } else {
+                (
+                    "query_mdb_db_nums",
+                    aios_core::query_mdb_db_nums(None, aios_core::DBType::DESI).await?,
+                )
+            };
 
         if let Some(exclude_nums) = &db_option.inner.exclude_db_nums {
 
@@ -1350,30 +1528,34 @@ async fn process_index_tree_generation(
 
         }
 
+        dbnos.sort_unstable();
+        dbnos.dedup();
+
+        if dbnos.is_empty() {
+            println!("[instances] 跳过导出：未解析到可用 dbnum（source={})", dbno_source);
+        } else {
+            println!(
+                "[instances] 开始导出 instances.json: source={}, dbnums={:?}",
+                dbno_source, dbnos
+            );
+        }
+
         let mesh_dir =
 
             Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes"));
 
-        if let Err(e) = export_instances_json_for_dbnos(
-
-            &dbnos,
-
-            mesh_dir,
-
-            &db_option.get_project_output_dir(),
-
-            Arc::new(db_option.inner.clone()),
-
-            true,
-
-        )
-
-        .await
-
-        {
-
-            eprintln!("[instances] IndexTree 导出失败: {}", e);
-
+        if !dbnos.is_empty() {
+            if let Err(e) = export_instances_json_for_dbnos(
+                &dbnos,
+                mesh_dir,
+                &db_option.get_project_output_dir(),
+                Arc::new(db_option.inner.clone()),
+                true,
+            )
+            .await
+            {
+                eprintln!("[instances] IndexTree 导出失败: {}", e);
+            }
         }
 
     }
@@ -1692,4 +1874,41 @@ fn initialize_spatial_index() {
 
     // No-op when feature is disabled
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_route_incremental_when_visible_roots_empty() {
+        let manual_refnos: Vec<RefnoEnum> = Vec::new();
+        let debug_roots: Vec<RefnoEnum> = Vec::new();
+        let mut incr_log = IncrGeoUpdateLog::default();
+        incr_log.prim_refnos.insert("17496_171666".into());
+
+        let scope = decide_generation_scope(
+            &manual_refnos,
+            &debug_roots,
+            true,
+            &[],
+            Some(&incr_log),
+        );
+
+        assert!(matches!(scope, GenerationScope::Incremental { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_db_write_failures_are_not_silenced() {
+        let handles = vec![tokio::spawn(async { true }), tokio::spawn(async { false })];
+        let failures = collect_db_write_failures(handles).await;
+        let result = ensure_no_db_write_failures(failures);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("SurrealDB 批量写入存在失败任务")
+        );
+    }
 }

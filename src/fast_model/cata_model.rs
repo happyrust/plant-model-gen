@@ -4,7 +4,8 @@ use crate::data_interface::db_model::TUBI_TOL;
 use crate::data_interface::interface::PdmsDataInterface;
 use crate::fast_model;
 use crate::fast_model::foyer_cache::cata_resolve_cache::{
-    CataResolveCacheManager, CataResolvedComp, PreparedInstGeo,
+    CataResolvedComp, PreparedInstGeo, global_cata_resolve_cache,
+    init_global_cata_resolve_cache,
 };
 use crate::fast_model::gen_model::cate_helpers::cal_sjus_value;
 use crate::fast_model::gen_model::cate_single::{CateCsgShapeMap, gen_cata_single_geoms};
@@ -256,7 +257,8 @@ pub async fn prefetch_tubi_size_and_branch_meta(
     branch_refnos: &[RefnoEnum],
 ) -> anyhow::Result<BranchPrefetchResult> {
     let t_start = Instant::now();
-    let sem = Arc::new(Semaphore::new(12));
+    let prefetch_concurrency = branch_tubi_p4_prefetch_concurrency();
+    let sem = Arc::new(Semaphore::new(prefetch_concurrency));
 
     // ── 阶段1: LSTU→CATR 过滤 ──
     let cat_ref_cache: Arc<DashMap<RefnoEnum, RefnoEnum>> = Arc::new(DashMap::new());
@@ -350,9 +352,10 @@ pub async fn prefetch_tubi_size_and_branch_meta(
     let bm_ms = t_bm.elapsed().as_millis();
 
     println!(
-        "    [BRAN_TUBI] 独立预取完成: children={}, tubi_valid={}/{}, branch_meta={}/{}, elapsed={}ms (phase1={}ms, phase2={}ms, bm={}ms)",
+        "    [BRAN_TUBI] 独立预取完成: children={}, tubi_valid={}/{}, branch_meta={}/{}, concurrency={}, elapsed={}ms (phase1={}ms, phase2={}ms, bm={}ms)",
         all_child_refnos.len(), tubi_size_cache.len(), p6_valid,
         branch_meta_cache.len(), branch_refnos.len(),
+        prefetch_concurrency,
         t_start.elapsed().as_millis(), phase1_ms, phase2_ms, bm_ms
     );
 
@@ -386,6 +389,38 @@ fn cache_miss_refno_limit() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(200)
+}
+
+fn cata_p1_pre_gen_concurrency() -> usize {
+    std::env::var("AIOS_CATA_P1_PREGEN_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .map(|v| v.min(32))
+        .unwrap_or(6)
+}
+
+fn cata_p1_slow_topn() -> usize {
+    std::env::var("AIOS_CATA_P1_SLOW_TOPN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(5)
+}
+
+fn cata_p1_slow_threshold_ms() -> u128 {
+    std::env::var("AIOS_CATA_P1_SLOW_THRESHOLD_MS")
+        .ok()
+        .and_then(|v| v.parse::<u128>().ok())
+        .unwrap_or(1000)
+}
+
+fn branch_tubi_p4_prefetch_concurrency() -> usize {
+    std::env::var("AIOS_BRANCH_TUBI_P4_PREFETCH_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .map(|v| v.min(32))
+        .unwrap_or(12)
 }
 
 fn record_branch_cache_miss(
@@ -622,6 +657,7 @@ pub async fn gen_cata_geos(
         true,
         BranchTubiMode::DbFallback,
         None,
+        None,
     )
     .await
     .map(|_| true)
@@ -645,6 +681,7 @@ pub async fn gen_cata_instances(
         true,
         false,
         BranchTubiMode::DbFallback,
+        None,
         None,
     )
     .await?
@@ -679,6 +716,7 @@ pub async fn gen_branch_tubi_from_db_with_prefetch(
     sender: flume::Sender<ShapeInstancesData>,
     local_al_map: Arc<DashMap<RefnoEnum, [CateAxisParam; 2]>>,
     prefetch: Option<BranchPrefetchResult>,
+    external_prefetch_wait_ms: Option<u128>,
 ) -> anyhow::Result<BranchTubiOutcome> {
     gen_cata_geos_inner(
         db_option,
@@ -691,6 +729,7 @@ pub async fn gen_branch_tubi_from_db_with_prefetch(
         true,
         BranchTubiMode::DbFallback,
         prefetch,
+        external_prefetch_wait_ms,
     )
     .await?
     .branch
@@ -717,6 +756,7 @@ pub async fn gen_branch_tubi_from_db(
         false,
         true,
         BranchTubiMode::DbFallback,
+        None,
         None,
     )
     .await?
@@ -745,6 +785,7 @@ pub async fn gen_branch_tubi_cache_only(
         true,
         BranchTubiMode::CacheOnly,
         None,
+        None,
     )
     .await?
     .branch
@@ -763,6 +804,7 @@ async fn gen_cata_geos_inner(
     process_branch: bool,
     branch_mode: BranchTubiMode,
     external_prefetch: Option<BranchPrefetchResult>,
+    external_prefetch_wait_ms: Option<u128>,
 ) -> anyhow::Result<GenOutcome> {
     // Initialize Chrome tracing
     #[cfg(feature = "profile")]
@@ -785,19 +827,10 @@ async fn gen_cata_geos_inner(
     // 用于收集总耗时的互斥锁
     let total_time_stats = Arc::new(Mutex::new(HashMap::new()));
 
-    // resolve_desi_comp 产物缓存（按 cata_hash）。命中时跳过 gen_cata_single_geoms + shape->inst_geo 转换。
-    // 初始化失败则自动退化为旧路径（不影响正确性）。
-    let cata_resolve_cache: Option<Arc<CataResolveCacheManager>> = if process_cata {
-        match std::panic::catch_unwind(|| CataResolveCacheManager::new()) {
-            Ok(mgr) => Some(Arc::new(mgr)),
-            Err(e) => {
-                tracing::warn!(
-                    "init cata_resolve_cache failed, fallback to non-cache path: err={:?}",
-                    e
-                );
-                None
-            }
-        }
+    // resolve_desi_comp 产物缓存（按 cata_hash）。使用进程内全局缓存，跨多轮 gen_cata_geos 调用复用。
+    let cata_resolve_cache = if process_cata {
+        init_global_cata_resolve_cache();
+        global_cata_resolve_cache()
     } else {
         None
     };
@@ -893,9 +926,12 @@ async fn gen_cata_geos_inner(
         let pre_gen_results: Arc<DashMap<RefnoEnum, (Arc<CateCsgShapeMap>, Arc<DashMap<RefnoEnum, crate::data_interface::structs::PlantAxisMap>>)>> = Arc::new(DashMap::new());
         let pre_gen_skip_cache = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let pre_gen_fail_cnt = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let pre_gen_timing_samples: Arc<Mutex<Vec<(u128, RefnoEnum, String, bool)>>> =
+            Arc::new(Mutex::new(Vec::new()));
         {
             let t_pre_gen = Instant::now();
-            let sem = Arc::new(Semaphore::new(6));
+            let pre_gen_concurrency = cata_p1_pre_gen_concurrency();
+            let sem = Arc::new(Semaphore::new(pre_gen_concurrency));
             let mut pre_gen_handles = Vec::new();
 
             for j in 0..unique_cata_cnt {
@@ -907,6 +943,7 @@ async fn gen_cata_geos_inner(
                     Some(tc) => tc,
                     None => continue,
                 };
+                let cata_hash_owned = cata_hash.clone();
                 let target_exist_inst = target_cata.exist_inst;
                 let target_group_refnos = target_cata.group_refnos.clone();
                 drop(target_cata);
@@ -915,6 +952,12 @@ async fn gen_cata_geos_inner(
                 if !needs_generate {
                     continue;
                 }
+                if let Some(cache_mgr) = cata_resolve_cache.as_ref() {
+                    if cache_mgr.get(cata_hash).is_some() {
+                        pre_gen_skip_cache.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                }
                 let ele_refno = match target_group_refnos.first().copied() {
                     Some(r) => r,
                     None => continue,
@@ -922,32 +965,29 @@ async fn gen_cata_geos_inner(
 
                 let sem = sem.clone();
                 let pre_gen_results = pre_gen_results.clone();
-                let cata_resolve_cache = cata_resolve_cache.clone();
-                let cata_hash_owned = cata_hash.clone();
-
-                let pre_gen_skip_cache = pre_gen_skip_cache.clone();
                 let pre_gen_fail_cnt = pre_gen_fail_cnt.clone();
+                let pre_gen_timing_samples = pre_gen_timing_samples.clone();
 
                 pre_gen_handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-
-                    if let Some(cache_mgr) = cata_resolve_cache.as_ref() {
-                        if cache_mgr.get(&cata_hash_owned).is_some() {
-                            pre_gen_skip_cache.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            return;
-                        }
-                    }
+                    let t_item = Instant::now();
 
                     let csg_shapes_map = Arc::new(CateCsgShapeMap::new());
                     let design_axis_map = Arc::new(DashMap::new());
-                    match gen_cata_single_geoms(ele_refno, &csg_shapes_map, &design_axis_map).await {
+                    let ok = match gen_cata_single_geoms(ele_refno, &csg_shapes_map, &design_axis_map).await {
                         Ok(_) => {
                             pre_gen_results.insert(ele_refno, (csg_shapes_map, design_axis_map));
+                            true
                         }
                         Err(_) => {
                             pre_gen_fail_cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            false
                         }
-                    }
+                    };
+                    pre_gen_timing_samples
+                        .lock()
+                        .await
+                        .push((t_item.elapsed().as_millis(), ele_refno, cata_hash_owned, ok));
                 }));
             }
 
@@ -957,13 +997,48 @@ async fn gen_cata_geos_inner(
                     let _ = h.await;
                 }
                 println!(
-                    "    [gen_cata_geos] P1 全局并发预执行完成: cata_cnt={}, hit={}, skip_cache={}, fail={}, elapsed={}ms",
+                    "    [gen_cata_geos] P1 全局并发预执行完成: cata_cnt={}, hit={}, skip_cache={}, fail={}, elapsed={}ms (concurrency={})",
                     handle_cnt,
                     pre_gen_results.len(),
                     pre_gen_skip_cache.load(std::sync::atomic::Ordering::Relaxed),
                     pre_gen_fail_cnt.load(std::sync::atomic::Ordering::Relaxed),
-                    t_pre_gen.elapsed().as_millis()
+                    t_pre_gen.elapsed().as_millis(),
+                    pre_gen_concurrency
                 );
+                let mut samples = {
+                    let mut guard = pre_gen_timing_samples.lock().await;
+                    std::mem::take(&mut *guard)
+                };
+                if !samples.is_empty() {
+                    samples.sort_by(|a, b| b.0.cmp(&a.0));
+                    let topn = cata_p1_slow_topn().min(samples.len());
+                    let slow_threshold_ms = cata_p1_slow_threshold_ms();
+                    let slow_cnt = samples
+                        .iter()
+                        .filter(|(elapsed, _, _, _)| *elapsed >= slow_threshold_ms)
+                        .count();
+                    if topn > 0 {
+                        println!(
+                            "    [gen_cata_geos] P1 最慢项 Top{} (threshold={}ms, slow_count={}/{}):",
+                            topn,
+                            slow_threshold_ms,
+                            slow_cnt,
+                            samples.len()
+                        );
+                        for (rank, (elapsed, ele_refno, cata_hash, ok)) in
+                            samples.iter().take(topn).enumerate()
+                        {
+                            println!(
+                                "      [P1 slow #{:02}] {} ms | status={} | refno={} | cata_hash={}",
+                                rank + 1,
+                                elapsed,
+                                if *ok { "ok" } else { "fail" },
+                                ele_refno,
+                                cata_hash
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -1390,10 +1465,8 @@ async fn gen_cata_geos_inner(
                                     has_solid = true;
                                 }
 
-                                // 将 CATE 的负实体关系写入 neg_relate_map
-                                if !cata_neg_refnos.is_empty() {
-                                    shape_insts_data.insert_negs(geom_refno, &cata_neg_refnos);
-                                }
+                                // CATE 本体孔洞走 inst.geo_type=CataNeg + cata_neg_refnos，
+                                // 不写 neg_relate_map（该关系用于设计负实体 carrier，不适用于 CATA 几何 refno）。
 
                                 geo_insts_tpl.push(EleInstGeo {
                                     geo_hash: g.geo_hash,
@@ -2189,11 +2262,8 @@ async fn gen_cata_geos_inner(
                                 cata_neg_refnos: cata_neg_refnos.clone(),
                             };
 
-                            // 将 CATE 的负实体关系写入 neg_relate_map
-                            // 这样可以统一 LOOP/PRIM/CATE 的负实体存储方式
-                            if !cata_neg_refnos.is_empty() {
-                                shape_insts_data.insert_negs(geom_refno, &cata_neg_refnos);
-                            }
+                            // CATE 本体孔洞走 inst.geo_type=CataNeg + cata_neg_refnos，
+                            // 不写 neg_relate_map（该关系用于设计负实体 carrier，不适用于 CATA 几何 refno）。
 
                             if is_ngmr {
                                 if let Ok(target_owners) =
@@ -2439,6 +2509,11 @@ async fn gen_cata_geos_inner(
     let mut tubi_query_time: u128 = 0;
     // P4 profiling: 详细计时器（定位 process_branch 中 99% 未统计时间）
     let mut p4_global_prepare_time: u128 = 0;
+    let mut p4_local_prepare_time: u128 = 0;
+    let mut p4_axis_cache_time: u128 = 0;
+    let mut p4_transform_prefetch_time: u128 = 0;
+    let mut p4_axis_db_fallback_time: u128 = 0;
+    let p4_external_prefetch_wait_time: u128 = external_prefetch_wait_ms.unwrap_or(0);
     let mut p4_branch_meta_time: u128 = 0;   // get_named_attmap(h_ref) + query_tubi_size + get_type_name
     let mut p4_spkbrk_time: u128 = 0;        // get_named_attmap(refno) for SPKBRK check
     let mut p4_lstube_time: u128 = 0;         // query_single_by_paths(LSTU->CATR) + query_tubi_size
@@ -2543,7 +2618,9 @@ async fn gen_cata_geos_inner(
                 }
             }
         }
-        tubi_query_time += t_axis_cache.elapsed().as_millis();
+        let axis_cache_elapsed = t_axis_cache.elapsed().as_millis();
+        p4_axis_cache_time = axis_cache_elapsed;
+        tubi_query_time += axis_cache_elapsed;
         debug_model!(
             "[BRAN_TUBI] cache-first axis_map: need={}, hit={}",
             need_axis_refnos.len(),
@@ -2552,6 +2629,7 @@ async fn gen_cata_geos_inner(
         cache_only_axis_hit_total = cache_al_map_global.len();
 
         let mut axis_missing_refnos_for_cache_only: Vec<RefnoEnum> = Vec::new();
+        let mut axis_db_fallback_refno_cnt: usize = 0;
         // DB 补齐：仅对 local_al_map 与 cache_al_map_global 都 miss 的 refno 查询 arrive/leave 点。
         let t_axis_db = Instant::now();
         let exist_al_map_global = {
@@ -2581,15 +2659,22 @@ async fn gen_cata_geos_inner(
                 );
             } else {
                 let refus: Vec<RefU64> = missing_refnos.iter().map(|x| x.refno()).collect();
+                axis_db_fallback_refno_cnt = refus.len();
                 aios_core::query_arrive_leave_points_of_component(&refus[..])
                     .await
                     .unwrap_or_default()
             }
         };
-        tubi_query_time += t_axis_db.elapsed().as_millis();
+        let axis_db_elapsed = t_axis_db.elapsed().as_millis();
+        tubi_query_time += axis_db_elapsed;
+        if axis_db_fallback_refno_cnt > 0 {
+            p4_axis_db_fallback_time = axis_db_elapsed;
+        }
         debug_model!(
-            "[BRAN_TUBI] db axis_map补齐: total={}",
-            exist_al_map_global.len()
+            "[BRAN_TUBI] db axis_map补齐: total={}, fallback_refnos={}, elapsed={}ms",
+            exist_al_map_global.len(),
+            axis_db_fallback_refno_cnt,
+            axis_db_elapsed
         );
         if matches!(branch_mode, BranchTubiMode::CacheOnly) && !axis_missing_refnos_for_cache_only.is_empty() {
             debug_model!(
@@ -2622,18 +2707,34 @@ async fn gen_cata_geos_inner(
             .await
             .unwrap_or_default()
         };
+        let transform_prefetch_elapsed = t_prefetch.elapsed().as_millis();
+        p4_transform_prefetch_time = transform_prefetch_elapsed;
         debug_model!(
             "[BRAN_TUBI] 全局预取 world_transform: count={}, elapsed={}ms",
             prefetch_transforms_global.len(),
-            t_prefetch.elapsed().as_millis()
+            transform_prefetch_elapsed
         );
 
+        p4_local_prepare_time = t_global_prepare.elapsed().as_millis();
         debug_model!(
             "[BRAN_TUBI] 全局准备完成(transform/axis): children_unique={}, axis_need={}, elapsed={}ms",
             all_child_refnos.len(),
             need_axis_refnos.len(),
-            t_global_prepare.elapsed().as_millis()
+            p4_local_prepare_time
         );
+
+        // 只为具备 axis_map 的子元件预取 tubi_size：
+        // 这些 refno 才可能在后续生成中成为 segment.leave_refno。
+        let tubi_prefetch_candidates: Vec<RefnoEnum> = all_child_refnos
+            .iter()
+            .copied()
+            .filter(|r| {
+                exist_al_map_global.contains_key(r)
+                    || local_al_map.contains_key(r)
+                    || cache_al_map_global.contains_key(r)
+            })
+            .collect();
+        let p4_prefetch_concurrency = branch_tubi_p4_prefetch_concurrency();
 
         // ════════════════════════════════════════════════════════════════════════════
         // P4 优化：全局批量并发预取 tubi_size 数据
@@ -2655,7 +2756,7 @@ async fn gen_cata_geos_inner(
         } else if !matches!(branch_mode, BranchTubiMode::CacheOnly) {
             let t_p4_prefetch = Instant::now();
             let cache = Arc::new(DashMap::new());
-            let sem = Arc::new(Semaphore::new(12));
+            let sem = Arc::new(Semaphore::new(p4_prefetch_concurrency));
 
             // P6 优化：分两阶段预取，先过滤无效元素再查询 tubi_size
             // 原逻辑：对所有子元素都执行 query_single_by_paths + resolve_desi_comp
@@ -2666,7 +2767,7 @@ async fn gen_cata_geos_inner(
             let cat_ref_cache: Arc<DashMap<RefnoEnum, RefnoEnum>> = Arc::new(DashMap::new());
             {
                 let mut phase1_handles = Vec::new();
-                for &refno in all_child_refnos.iter() {
+                for &refno in tubi_prefetch_candidates.iter() {
                     let sem = sem.clone();
                     let cat_ref_cache = cat_ref_cache.clone();
                     phase1_handles.push(tokio::spawn(async move {
@@ -2689,13 +2790,15 @@ async fn gen_cata_geos_inner(
                 }
             }
             let p6_valid_count = cat_ref_cache.len();
-            let p6_skipped = all_child_refnos.len() - p6_valid_count;
+            let p6_skipped = tubi_prefetch_candidates.len().saturating_sub(p6_valid_count);
             println!(
-                "    [BRAN_TUBI] P6 LSTU→CATR 过滤: total={}, valid={}, skip={} ({:.0}%), elapsed={}ms",
+                "    [BRAN_TUBI] P6 LSTU→CATR 过滤: total_children={}, axis_candidates={}, valid={}, skip={} ({:.0}%), concurrency={}, elapsed={}ms",
                 all_child_refnos.len(),
+                tubi_prefetch_candidates.len(),
                 p6_valid_count,
                 p6_skipped,
-                p6_skipped as f64 / all_child_refnos.len().max(1) as f64 * 100.0,
+                p6_skipped as f64 / tubi_prefetch_candidates.len().max(1) as f64 * 100.0,
+                p4_prefetch_concurrency,
                 t_p4_prefetch.elapsed().as_millis()
             );
 
@@ -2723,11 +2826,13 @@ async fn gen_cata_geos_inner(
                 }
             }
             println!(
-                "    [BRAN_TUBI] P4 全局预取 tubi_size 完成: total={}, queried={}, hit={}, skip={}, elapsed={}ms (phase2={}ms)",
+                "    [BRAN_TUBI] P4 全局预取 tubi_size 完成: total_children={}, axis_candidates={}, queried={}, hit={}, skip={}, concurrency={}, elapsed={}ms (phase2={}ms)",
                 all_child_refnos.len(),
+                tubi_prefetch_candidates.len(),
                 p6_valid_count,
                 cache.len(),
                 p6_skipped,
+                p4_prefetch_concurrency,
                 t_p4_prefetch.elapsed().as_millis(),
                 t_p4_phase2.elapsed().as_millis()
             );
@@ -2760,7 +2865,7 @@ async fn gen_cata_geos_inner(
         } else if !matches!(branch_mode, BranchTubiMode::CacheOnly) {
             let t_p4_bm = Instant::now();
             let cache = Arc::new(DashMap::new());
-            let sem = Arc::new(Semaphore::new(12));
+            let sem = Arc::new(Semaphore::new(p4_prefetch_concurrency));
             let branch_refnos: Vec<RefnoEnum> = branch_map.iter().map(|x| *x.key()).collect();
             let mut handles = Vec::new();
 
@@ -2805,9 +2910,10 @@ async fn gen_cata_geos_inner(
                 m
             });
             println!(
-                "    [BRAN_TUBI] P4 全局预取 branch_meta 完成: total={}, hit={}, elapsed={}ms",
+                "    [BRAN_TUBI] P4 全局预取 branch_meta 完成: total={}, hit={}, concurrency={}, elapsed={}ms",
                 branch_refnos.len(),
                 cache.len(),
+                p4_prefetch_concurrency,
                 t_p4_bm.elapsed().as_millis()
             );
             cache
@@ -3980,13 +4086,37 @@ async fn gen_cata_geos_inner(
         time_stats.insert("tubi_query".to_string(), tubi_query_time as u64);
         // P4 profiling: 详细计时
         time_stats.insert("p4_global_prepare".to_string(), p4_global_prepare_time as u64);
+        time_stats.insert("p4_local_prepare".to_string(), p4_local_prepare_time as u64);
+        time_stats.insert("p4_axis_cache".to_string(), p4_axis_cache_time as u64);
+        time_stats.insert(
+            "p4_transform_prefetch".to_string(),
+            p4_transform_prefetch_time as u64,
+        );
+        time_stats.insert(
+            "p4_axis_db_fallback".to_string(),
+            p4_axis_db_fallback_time as u64,
+        );
+        time_stats.insert(
+            "p4_external_prefetch_wait".to_string(),
+            p4_external_prefetch_wait_time as u64,
+        );
         time_stats.insert("p4_branch_meta".to_string(), p4_branch_meta_time as u64);
         time_stats.insert("p4_spkbrk".to_string(), p4_spkbrk_time as u64);
         time_stats.insert("p4_lstube".to_string(), p4_lstube_time as u64);
         println!(
-            "  [TUBI perf] P4详细计时: global_prepare={}ms, branch_meta={}ms(n={}), spkbrk={}ms(n={}), lstube={}ms(n={})",
-            p4_global_prepare_time, p4_branch_meta_time, p4_branch_meta_cnt,
-            p4_spkbrk_time, p4_spkbrk_cnt, p4_lstube_time, p4_lstube_cnt
+            "  [TUBI perf] P4详细计时: global_prepare={}ms, local_prepare={}ms, axis_cache={}ms, transform_prefetch={}ms, axis_db_fallback={}ms, external_wait={}ms(outside), branch_meta={}ms(n={}), spkbrk={}ms(n={}), lstube={}ms(n={})",
+            p4_global_prepare_time,
+            p4_local_prepare_time,
+            p4_axis_cache_time,
+            p4_transform_prefetch_time,
+            p4_axis_db_fallback_time,
+            p4_external_prefetch_wait_time,
+            p4_branch_meta_time,
+            p4_branch_meta_cnt,
+            p4_spkbrk_time,
+            p4_spkbrk_cnt,
+            p4_lstube_time,
+            p4_lstube_cnt
         );
         let p4_accounted = p4_global_prepare_time + p4_branch_meta_time + p4_spkbrk_time
             + p4_lstube_time

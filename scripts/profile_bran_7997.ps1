@@ -13,7 +13,7 @@ param(
   [Parameter(Mandatory=$false)]
   [string]$Noun = "BRAN",
 
-  # 为了可控：默认只跑前 N 个 refno（0 表示不限制，可能非常久）
+  # 兼容保留参数：不再按单 noun 做限流，统一走标准管线
   [Parameter(Mandatory=$false)]
   [int]$Limit = 200,
 
@@ -75,12 +75,19 @@ function Find-NewestLog([datetime]$since) {
 
 function Find-NewestPerfCsv([datetime]$since, [string]$perfDir, [int]$dbnum) {
   if (-not (Test-Path $perfDir)) { return $null }
-  $pattern = ("perf_gen_model_full_noun_dbnum_{0}_*.csv" -f $dbnum)
-  $files = Get-ChildItem -Path $perfDir -Filter $pattern -ErrorAction SilentlyContinue |
-    Where-Object { $_.LastWriteTime -ge $since } |
-    Sort-Object LastWriteTime -Descending
-  if (-not $files -or $files.Count -eq 0) { return $null }
-  return $files[0].FullName
+  $patterns = @(
+    ("perf_gen_model_index_tree_dbnum_{0}_*.csv" -f $dbnum),
+    ("perf_gen_model_full_noun_dbnum_{0}_*.csv" -f $dbnum)
+  )
+  foreach ($pattern in $patterns) {
+    $files = Get-ChildItem -Path $perfDir -Filter $pattern -ErrorAction SilentlyContinue |
+      Where-Object { $_.LastWriteTime -ge $since } |
+      Sort-Object LastWriteTime -Descending
+    if ($files -and $files.Count -gt 0) {
+      return $files[0].FullName
+    }
+  }
+  return $null
 }
 
 function Parse-TimeFromPerfCsv([string]$csvPath) {
@@ -126,7 +133,8 @@ function Run-One([string]$label, [string]$cfgNoExt, [string]$cacheDir, [string]$
   Write-Host ("config : {0}" -f $cfgNoExt)
   Write-Host ("cache  : {0}" -f $cacheDir)
   Write-Host ("meshes : {0}" -f $meshDir)
-  Write-Host ("limit  : {0}" -f $Limit)
+  Write-Host ("limit  : {0} (deprecated, ignored)" -f $Limit)
+  Write-Host ("noun   : {0} (deprecated, ignored)" -f $Noun)
   Write-Host ("mode   : {0}" -f ($(if ($Release) { "release" } else { "debug" })))
 
   if ($clearCache) {
@@ -215,12 +223,11 @@ try {
   # profile: 减少非核心开销（不写 DB / 不跑 precheck）
   $toml = Upsert-TomlLine $toml "save_db" "false"
   $toml = Upsert-TomlLine $toml "use_surrealdb" "false"
-  # 只跑指定 dbnum / noun
+  # 只跑指定 dbnum，noun 参数不再生效（统一标准管线）
   $toml = Upsert-TomlLine $toml "manual_db_nums" ("[{0}]" -f $Dbnum)
-  $toml = Upsert-TomlLine $toml "full_noun_mode" "true"
-  $toml = Upsert-TomlLine $toml "full_noun_enabled_categories" ("[`"{0}`"]" -f $Noun)
-  $toml = Upsert-TomlLine $toml "full_noun_excluded_nouns" "[]"
-  $toml = Upsert-TomlLine $toml "debug_limit_per_noun" ("{0}" -f $Limit)
+  $toml = Upsert-TomlLine $toml "index_tree_enabled_target_types" "[]"
+  $toml = Upsert-TomlLine $toml "index_tree_excluded_target_types" "[]"
+  $toml = Upsert-TomlLine $toml "index_tree_debug_limit_per_target_type" "0"
   # 输出目录隔离（便于清空）
   $toml = Upsert-TomlLine $toml "foyer_cache_dir" ("`"{0}`"" -f $cacheDir)
   $toml = Upsert-TomlLine $toml "meshes_path" ("`"{0}`"" -f $meshDir)

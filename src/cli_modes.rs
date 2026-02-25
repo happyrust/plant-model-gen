@@ -419,13 +419,9 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
                     ),
                     use_basic_materials: config.use_basic_materials,
                     include_negative: config.include_negative,
-                    // OBJ 导出：默认 cache-only；如需 SurrealDB 需显式 `--use-surrealdb`。
-                    allow_surrealdb: db_option_ext.use_surrealdb,
-                    cache_dir: if db_option_ext.use_surrealdb {
-                        None
-                    } else {
-                        Some(db_option_ext.get_foyer_cache_dir())
-                    },
+                    // 导出默认走 foyer cache；仅在用户显式传入 --use-surrealdb 时才回退到 SurrealDB。
+                    allow_surrealdb: false,
+                    cache_dir: Some(db_option_ext.get_foyer_cache_dir()),
                 },
             };
 

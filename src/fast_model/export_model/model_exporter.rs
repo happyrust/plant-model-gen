@@ -93,7 +93,7 @@ impl Default for CommonExportConfig {
             unit_converter: UnitConverter::default(),
             use_basic_materials: false,
             include_negative: false,
-            allow_surrealdb: true,
+            allow_surrealdb: false,
             cache_dir: None,
         }
     }
@@ -115,7 +115,7 @@ impl CommonExportConfig {
             unit_converter: UnitConverter::new(source_unit, target_unit),
             use_basic_materials: false,
             include_negative: false,
-            allow_surrealdb: true,
+            allow_surrealdb: false,
             cache_dir: None,
         }
     }

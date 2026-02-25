@@ -1,8 +1,4 @@
 #V2
-SELECT id, noun, owner FROM pe:17496_142306;
-SELECT * FROM ngmr_relate WHERE pe = pe:17496_142306;
-SELECT id, noun, owner FROM pe:17496_142306; SELECT id, noun FROM pe:17496_142306.owner;
-SELECT count() FROM inst_geo GROUP ALL;
 SELECT count() FROM inst_info GROUP ALL; SELECT count() FROM inst_relate GROUP ALL; SELECT count() FROM inst_relate_aabb GROUP ALL; SELECT count() FROM inst_relate_bool GROUP ALL;
 SELECT count() FROM inst_relate_cata_bool GROUP ALL; SELECT count() FROM geo_relate GROUP ALL; SELECT count() FROM ngmr_relate GROUP ALL; SELECT count() FROM neg_relate GROUP ALL;
 SELECT count() FROM tubi_info GROUP ALL; SELECT count() FROM tubi_relate GROUP ALL; SELECT count() FROM aabb GROUP ALL; SELECT count() FROM trans GROUP ALL;
@@ -99,3 +95,7 @@ SELECT count() AS tubi_cnt FROM tubi_relate WHERE string::starts_with(<string> i
 SELECT count() AS inst_cnt FROM inst_relate WHERE string::starts_with(<string> id, 'inst_relate:`24381_') OR string::starts_with(<string> id, 'inst_relate:`16189_') GROUP ALL;
 SELECT count() AS tubi_cnt FROM tubi_relate WHERE string::starts_with(<string> id, 'tubi_relate:[pe:`24381_') OR string::starts_with(<string> id, 'tubi_relate:[pe:`16189_') GROUP ALL;
 SELECT count() AS pe_cnt FROM pe_7997 GROUP ALL;
+SELECT id, refno, name, aabb, bbox, geo_hash, mesh_url FROM aios_entity WHERE refno = '24381_145018' OR refno = '24381/145018';
+INFO FOR DB;
+SELECT id, refno, type, geo_hash, status FROM inst_node WHERE refno = '24381/145018' OR refno = '24381_145018' OR id = inst_node:⟨24381_145018⟩ OR id = inst_node:⟨24381/145018⟩;
+SELECT refno, name FROM scene_node WHERE refno = '24381_145018' OR refno = '24381/145018' LIMIT 5;

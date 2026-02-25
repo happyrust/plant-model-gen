@@ -14,7 +14,7 @@
 
 ## 二、 核心生成流水线 (Gen Index Tree Geos Optimized)
 预检查完成后进入了 `gen_index_tree_geos_optimized` 方法。
-这个核心管线的设计原则是：**分类处理、严格依赖排序（BRAN优先 -> LOOP -> PRIM -> CATE）、利用流式并发或两阶段高速缓存。**
+这个核心管线的设计原则是：**分类处理、严格依赖排序（BRAN优先 -> LOOP -> CATE -> PRIM）、利用流式并发或两阶段高速缓存。**
 
 ### 1. 阶段一：BRAN/HANG 核心管线 (Pipeline Phase 1)
 管道与支吊架（`BRAN`/`HANG`）由于包含复杂连通拓扑和依赖，会作为独立的“第一阶段优先”进行深度遍历生成：
@@ -32,8 +32,8 @@
 - **依序并行生成**：
   严格遵循如下依赖顺序分批次分段执行逻辑：
   1. **`process_loop_stage`**：处理 `LOOP` 图形。
-  2. **`process_prim_stage`**：处理原生图元 `PRIM` 。
-  3. **`process_cate_stage`**：处理剩余的定义件 `CATE`。
+  2. **`process_cate_stage`**：处理剩余的定义件 `CATE`。
+  3. **`process_prim_stage`**：处理原生图元 `PRIM` 。
 
 ### 3. 基于流式通道的高速生成 (Streaming Generation Scheme)
 流程中值得关注的优化是其引用的 **通道流式分发机制**。当符合条件（开启指定环境变量、并选择走内存优先时）：

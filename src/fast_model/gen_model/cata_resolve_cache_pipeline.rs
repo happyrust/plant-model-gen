@@ -24,7 +24,8 @@ use dashmap::DashMap;
 use tokio::sync::Semaphore;
 
 use crate::fast_model::foyer_cache::cata_resolve_cache::{
-    CataResolveCacheManager, CataResolvedComp, PreparedInstGeo,
+    CataResolvedComp, PreparedInstGeo, global_cata_resolve_cache,
+    init_global_cata_resolve_cache,
 };
 use crate::fast_model::gen_model::cate_single::{gen_cata_single_geoms, CateCsgShapeMap};
 use crate::options::DbOptionExt;
@@ -153,7 +154,10 @@ pub async fn prefetch_cata_resolve_cache_for_target_map(
 ) -> anyhow::Result<PrefetchOutcome> {
     let t0 = Instant::now();
 
-    let cache_mgr = Arc::new(CataResolveCacheManager::new());
+    init_global_cata_resolve_cache();
+    let Some(cache_mgr) = global_cata_resolve_cache() else {
+        anyhow::bail!("global_cata_resolve_cache 未初始化");
+    };
 
     let replace_exist = db_option.inner.is_replace_mesh();
     let concurrency = cata_resolve_cache_prefetch_concurrency();
@@ -188,7 +192,6 @@ pub async fn prefetch_cata_resolve_cache_for_target_map(
             continue;
         }
 
-        let cache_mgr = cache_mgr.clone();
         let sem = sem.clone();
         join_set.spawn(async move {
             let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);

@@ -16,6 +16,7 @@ use tracing::{info, warn};
 use aios_core::SUL_DB;
 use axum::extract::Extension;
 use crate::web_api::jwt_auth::{TokenClaims, generate_form_id};
+use crate::web_api::model_center_client::{notify_workflow_sync_async, notify_workflow_delete_async};
 use std::collections::HashSet;
 
 // ============================================================================
@@ -69,6 +70,8 @@ pub struct ReviewActionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SubmitToNextRequest {
     pub comment: Option<String>,
+    pub operator_id: Option<String>,
+    pub operator_name: Option<String>,
 }
 
 /// 驳回请求
@@ -77,6 +80,8 @@ pub struct SubmitToNextRequest {
 pub struct ReturnRequest {
     pub target_node: String,  // 目标节点: sj/jd/sh
     pub reason: String,       // 驳回原因
+    pub operator_id: Option<String>,
+    pub operator_name: Option<String>,
 }
 
 /// 工作流步骤
@@ -648,6 +653,8 @@ async fn delete_task(
     
     match SUL_DB.query(sql).bind(("id", id.clone())).await {
         Ok(_) => {
+            // 异步通知外部系统
+            notify_workflow_delete_async(id.clone(), "system".to_string());
             (StatusCode::OK, Json(ActionResponse {
                 success: true,
                 message: Some("任务已删除".to_string()),
@@ -1515,13 +1522,15 @@ async fn submit_to_next_node(
     }
 
     // 4. 记录工作流历史
+    let op_id = request.operator_id.as_deref().filter(|s| !s.is_empty()).unwrap_or("system");
+    let op_name = request.operator_name.as_deref().filter(|s| !s.is_empty()).unwrap_or("系统用户");
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,
             node: $from_node,
             action: 'submit',
-            operator_id: 'system',
-            operator_name: '系统用户',
+            operator_id: $operator_id,
+            operator_name: $operator_name,
             comment: $comment,
             timestamp: time::now()
         }
@@ -1530,11 +1539,21 @@ async fn submit_to_next_node(
     let _ = SUL_DB.query(history_sql)
         .bind(("task_id", id.clone()))
         .bind(("from_node", current_node.clone()))
+        .bind(("operator_id", op_id.to_string()))
+        .bind(("operator_name", op_name.to_string()))
         .bind(("comment", request.comment))
         .await;
 
     let from_name = get_node_display_name(&current_node);
     let to_name = get_node_display_name(next_node);
+
+    // 5. 异步通知外部系统
+    notify_workflow_sync_async(
+        id.clone(),
+        "submit".to_string(),
+        op_id.to_string(),
+        None,
+    );
 
     (StatusCode::OK, Json(ActionResponse {
         success: true,
@@ -1620,13 +1639,15 @@ async fn return_to_node(
     }
 
     // 4. 记录工作流历史
+    let op_id = request.operator_id.as_deref().filter(|s| !s.is_empty()).unwrap_or("system");
+    let op_name = request.operator_name.as_deref().filter(|s| !s.is_empty()).unwrap_or("系统用户");
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,
             node: $from_node,
             action: 'return',
-            operator_id: 'system',
-            operator_name: '系统用户',
+            operator_id: $operator_id,
+            operator_name: $operator_name,
             comment: $comment,
             timestamp: time::now()
         }
@@ -1635,11 +1656,21 @@ async fn return_to_node(
     let _ = SUL_DB.query(history_sql)
         .bind(("task_id", id.clone()))
         .bind(("from_node", current_node.clone()))
+        .bind(("operator_id", op_id.to_string()))
+        .bind(("operator_name", op_name.to_string()))
         .bind(("comment", Some(request.reason.clone())))
         .await;
 
     let from_name = get_node_display_name(&current_node);
     let to_name = get_node_display_name(&request.target_node);
+
+    // 5. 异步通知外部系统
+    notify_workflow_sync_async(
+        id.clone(),
+        "return".to_string(),
+        op_id.to_string(),
+        Some(request.reason.clone()),
+    );
 
     (StatusCode::OK, Json(ActionResponse {
         success: true,

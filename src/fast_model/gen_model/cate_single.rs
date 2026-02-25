@@ -13,6 +13,23 @@ use std::sync::Arc;
 
 pub type CateCsgShapeMap = DashMap<RefnoEnum, Vec<CateCsgShape>>;
 
+fn cata_p1_trace_refno_filter() -> Option<String> {
+    std::env::var("AIOS_CATA_P1_TRACE_REFNO")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn should_trace_cata_p1(design_refno: RefnoEnum) -> bool {
+    let Some(target) = cata_p1_trace_refno_filter() else {
+        return false;
+    };
+    let target_normalized = target.replace('/', "_");
+    target == design_refno.to_string()
+        || target_normalized == design_refno.to_string()
+        || target == design_refno.to_e3d_id()
+}
+
 /// 获取单个元件的模型数据
 ///
 /// # Arguments
@@ -36,6 +53,7 @@ pub async fn gen_cata_single_geoms(
     design_axis_map: &DashMap<RefnoEnum, PlantAxisMap>,
 ) -> anyhow::Result<bool> {
     let total_start = std::time::Instant::now();
+    let trace_this = should_trace_cata_p1(design_refno);
 
     // Timing for get_named_attmap
     let t_get_attmap = std::time::Instant::now();
@@ -100,6 +118,19 @@ pub async fn gen_cata_single_geoms(
         let t_profile = std::time::Instant::now();
         create_profile_geos(design_refno, &geoms_info, &csg_shape_map).await?;
         let profile_time = t_profile.elapsed().as_millis();
+        let total_elapsed = total_start.elapsed().as_millis();
+
+        if trace_this {
+            println!(
+                "    [P1 trace] refno={} type={} stage=profile get_attmap={}ms resolve={}ms profile={}ms total={}ms",
+                design_refno,
+                type_name,
+                get_attmap_time,
+                resolve_time,
+                profile_time,
+                total_elapsed
+            );
+        }
 
         #[cfg(feature = "profile")]
         {
@@ -113,7 +144,7 @@ pub async fn gen_cata_single_geoms(
                 get_attmap_time,
                 resolve_time,
                 profile_time,
-                total_start.elapsed().as_millis()
+                total_elapsed
             );
         }
 
@@ -188,6 +219,7 @@ pub async fn gen_cata_single_geoms(
 
     // 保存轴映射
     let t_axis_map = std::time::Instant::now();
+    let axis_map_len = axis_map.len();
     design_axis_map.insert(design_refno, axis_map);
     let axis_map_time = t_axis_map.elapsed().as_millis();
 
@@ -218,6 +250,26 @@ pub async fn gen_cata_single_geoms(
         );
     }
 
+    let total_elapsed = total_start.elapsed().as_millis();
+    if trace_this {
+        println!(
+            "    [P1 trace] refno={} type={} stage=regular get_attmap={}ms resolve={}ms convert_geo={}ms({}/{}) convert_ngeo={}ms({}/{}) axis_map={}ms(len={}) total={}ms",
+            design_refno,
+            type_name,
+            get_attmap_time,
+            resolve_time,
+            convert_geo_time,
+            geo_count,
+            geometries.len(),
+            convert_ngeo_time,
+            ngeo_count,
+            n_geometries.len(),
+            axis_map_time,
+            axis_map_len,
+            total_elapsed
+        );
+    }
+
     #[cfg(feature = "profile")]
     {
         let timestamp = chrono::Local::now()
@@ -234,7 +286,7 @@ pub async fn gen_cata_single_geoms(
             ngeo_count,
             convert_ngeo_time,
             axis_map_time,
-            total_start.elapsed().as_millis()
+            total_elapsed
         );
     }
 

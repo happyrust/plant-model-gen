@@ -273,10 +273,48 @@ impl InstanceCacheManager {
             count += 1;
         }
 
+        // 2.5) 写入仅存在于 inst_tubi_map 中的 TUBI 条目
+        //      BRAN/HANG 本身作为 tubi 的 leave_refno 进入 inst_tubi_map，
+        //      但可能不在 inst_info_map 中（BRAN 本身不是几何元素）。
+        //      此时需要独立创建一条 CachedInstInfo，使 cache query 端能读到 tubi 数据。
+        for (refno, tubi_info) in &shape_insts.inst_tubi_map {
+            if shape_insts.inst_info_map.contains_key(refno) {
+                // 已在上面 step 2 中通过 inst_info_map 关联写入，跳过
+                continue;
+            }
+            let inst_key = tubi_info.get_inst_key();
+            let cached = CachedInstInfo {
+                info: tubi_info.clone(),
+                tubi: Some(tubi_info.clone()),
+                inst_key,
+                neg_relates: vec![],
+                ngmr_neg_relates: vec![],
+                relate_bool: None,
+                created_at: now,
+            };
+            let key = InstInfoKey { dbnum, refno: *refno };
+            let payload = match rkyv_payload::encode(INST_INFO_TYPE_TAG, INST_INFO_SCHEMA_V1, &cached) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!(
+                        "[instance_cache] rkyv 序列化 inst_tubi(独立) 失败: dbnum={}, refno={}, err={}",
+                        dbnum, refno, e
+                    );
+                    continue;
+                }
+            };
+            self.info_cache.insert(key, CachePayloadValue { payload });
+            count += 1;
+        }
+
         // 3) 批量更新索引（一次磁盘 IO）
         if let Ok(mut index) = self.index.lock() {
             let refno_set = index.by_dbnum.entry(dbnum).or_default();
             for refno in shape_insts.inst_info_map.keys() {
+                refno_set.insert(*refno);
+            }
+            // TUBI 独立 refno 也需要加入索引
+            for refno in shape_insts.inst_tubi_map.keys() {
                 refno_set.insert(*refno);
             }
             let geos_set = index.geos_by_dbnum.entry(dbnum).or_default();

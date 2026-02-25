@@ -10,6 +10,24 @@ use aios_core::pdms_data::{PlinParam, ScomInfo, GmParam};
 use aios_core::{CataContext, NamedAttrMap, RefU64, RefnoEnum, SUL_DB};
 use anyhow::anyhow;
 use std::collections::{BTreeMap, HashMap};
+use std::time::Instant;
+
+fn resolve_trace_refno_filter() -> Option<String> {
+    std::env::var("AIOS_CATA_P1_TRACE_REFNO")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn should_trace_resolve_desi(desi_refno: RefnoEnum) -> bool {
+    let Some(target) = resolve_trace_refno_filter() else {
+        return false;
+    };
+    let target_normalized = target.replace('/', "_");
+    target == desi_refno.to_string()
+        || target_normalized == desi_refno.to_string()
+        || target == desi_refno.to_e3d_id()
+}
 
 fn normalize_gm_param_expressions_in_place(gm: &mut GmParam) {
     // 仅做“去掉 ATTRIB :NAME 中的冒号”这种低风险规整，避免 aios_core 表达式解析器直接拒绝。
@@ -164,6 +182,9 @@ pub async fn resolve_desi_comp(
     mut tubi_scom: Option<RefnoEnum>,
     desi_att_opt: Option<&NamedAttrMap>,
 ) -> anyhow::Result<CateGeomsInfo> {
+    let trace_resolve = should_trace_resolve_desi(desi_refno);
+    let t_total = Instant::now();
+    let t_desi_att = Instant::now();
     let owned_att;
     let desi_att = if let Some(att) = desi_att_opt {
         att
@@ -171,8 +192,10 @@ pub async fn resolve_desi_comp(
         owned_att = aios_core::get_named_attmap(desi_refno).await?;
         &owned_att
     };
+    let desi_att_fetch_time = t_desi_att.elapsed().as_millis();
     let is_tubi = tubi_scom.is_some();
 
+    let t_scom_ref = Instant::now();
     let scom_ref = if let Some(scom) = tubi_scom {
         scom
     } else {
@@ -184,13 +207,19 @@ pub async fn resolve_desi_comp(
             )))?;
         scom
     };
+    let scom_ref_time = t_scom_ref.elapsed().as_millis();
     debug_model_trace!("scom_ref: {:?}", &scom_ref);
+    let t_scom_info = Instant::now();
     let scom_info = get_or_create_scom_info(scom_ref).await?;
+    let scom_info_time = t_scom_info.elapsed().as_millis();
     debug_model_trace!("scom_info: {:?}", &scom_info);
+    let t_context = Instant::now();
     let mut context = aios_core::rs_surreal::resolve::get_or_create_cata_context(
         desi_refno, is_tubi,
     ).await?;
+    let context_time = t_context.elapsed().as_millis();
 
+    let t_bind_params = Instant::now();
     // 🔍 调试：打印 DESI 的 DESP 数据（复用已有的 desi_att，避免重复 I/O）
     {
         if let Some(desp) = desi_att.get_f32_vec("DESP") {
@@ -341,6 +370,7 @@ pub async fn resolve_desi_comp(
             }
         }
     }
+    let bind_params_time = t_bind_params.elapsed().as_millis();
 
     crate::smart_debug_model_debug!("=== DEBUG: CataContext for {} ===", desi_refno.to_string());
     crate::smart_debug_model_debug!("Context entries count: {}", context.context.len());
@@ -360,13 +390,38 @@ pub async fn resolve_desi_comp(
 
     // 🔍 表达式预验证：在调用 resolve_cata_comp 前检查所有表达式的语法
     // 这有助于快速定位元件库中的表达式错误
+    let t_validate = Instant::now();
     if aios_core::is_debug_model_enabled() {
         let scom_name = scom_info.attr_map.get_as_string("NAME").unwrap_or_else(|| "未知".to_string());
         validate_scom_expressions(desi_refno, scom_ref, &scom_name, &scom_info);
     }
+    let validate_expr_time = t_validate.elapsed().as_millis();
 
+    let context_entry_count = context.context.len();
+    let t_resolve_comp = Instant::now();
     let geom_info = resolve_cata_comp(&desi_att, &scom_info, Some(context));
+    let resolve_comp_time = t_resolve_comp.elapsed().as_millis();
     debug_model_trace!("geom_info: {:?}", &geom_info);
+    if trace_resolve {
+        println!(
+            "    [resolve trace] refno={} total={}ms att={}ms scom_ref={}ms scom_info={}ms context={}ms bind_params={}ms validate={}ms resolve_comp={}ms context_entries={} para={} axis={} gm={} ngm={} is_tubi={}",
+            desi_refno,
+            t_total.elapsed().as_millis(),
+            desi_att_fetch_time,
+            scom_ref_time,
+            scom_info_time,
+            context_time,
+            bind_params_time,
+            validate_expr_time,
+            resolve_comp_time,
+            context_entry_count,
+            para_values.len(),
+            scom_info.axis_params.len(),
+            scom_info.gm_params.len(),
+            scom_info.ngm_params.len(),
+            is_tubi
+        );
+    }
 
     match geom_info {
         Ok(info) => Ok(info),

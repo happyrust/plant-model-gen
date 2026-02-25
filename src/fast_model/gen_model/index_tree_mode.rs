@@ -4,7 +4,7 @@ use aios_core::options::DbOption;
 use crate::options::DbOptionExt;
 
 use aios_core::pdms_types::{
-    BRAN_COMPONENT_NOUN_NAMES, GNERAL_LOOP_OWNER_NOUN_NAMES, GNERAL_PRIM_NOUN_NAMES, USE_CATE_NOUN_NAMES,
+    GNERAL_LOOP_OWNER_NOUN_NAMES, GNERAL_PRIM_NOUN_NAMES, USE_CATE_NOUN_NAMES,
 };
 use aios_core::pe::SPdmsElement;
 use aios_core::{DBType, query_mdb_db_nums};
@@ -266,14 +266,14 @@ async fn process_single_noun_type(
 ///
 /// # 主要改进
 /// 1. ✅ BRAN/HANG 优先处理：先处理 BRAN/HANG 及其依赖，记录已生成的子节点
-/// 2. ✅ 顺序执行：LOOP -> PRIM -> CATE（确保依赖关系正确）
+/// 2. ✅ 顺序执行：LOOP -> CATE -> PRIM（确保依赖关系正确）
 /// 3. ✅ 批量并发：每个类别内部使用批量并发处理
 /// 4. ✅ 内存优化：使用 CategorizedRefnos 替代三个 HashSet
 /// 5. ✅ 数据验证：检查 SJUS map 完整性
 /// 6. ✅ 类型安全：使用 IndexTreeConfig 和错误类型
 ///
 /// # 执行顺序
-/// BRAN/HANG 优先 -> LOOP -> PRIM -> CATE（跳过已生成的 refno）
+/// BRAN/HANG 优先 -> LOOP -> CATE -> PRIM（跳过已生成的 refno）
 #[cfg_attr(feature = "profile", instrument(skip(db_option, config, sender)))]
 pub async fn gen_index_tree_geos_optimized(
     db_option: Arc<DbOptionExt>,
@@ -384,140 +384,7 @@ pub async fn gen_index_tree_geos_optimized(
     }
 
     // ============================================================================
-    // 🚦 [判定点] 如果仅启用了 BRAN/HANG，此时可以结束
-    // ============================================================================
-    // 注意：`enabled_categories = []` 的语义是“启用所有类别”，不能被误判为“仅 BRAN/HANG”。
-    // Rust 的 `Iterator::all` 在空迭代器上返回 true（空集恒真），因此这里必须显式要求非空。
-    let only_bran_hang = !config.enabled_categories.is_empty()
-        && config.enabled_categories.iter().all(|cat| {
-            let upper = cat.to_uppercase();
-            upper == "BRAN" || upper == "HANG"
-        });
-
-    if only_bran_hang {
-        // 重要语义说明：
-        // - BRAN/HANG 本身多为“容器/挂点”，可渲染几何往往来自其子孙（LOOP/PRIM/CATE 等）。
-        // - 因此当用户显式指定仅 BRAN/HANG 时，不应直接退出；而应仅以 BRAN/HANG 作为根，
-        //   深度收集其子孙并生成几何（同时严格按 dbnum 过滤，避免跨库污染）。
-        println!(
-            "✅ [Optimization] 仅启用 BRAN/HANG：以 BRAN/HANG 为根，生成其子孙中的 LOOP/PRIM/CATE 几何（dbnum 过滤生效）"
-        );
-
-        // BRAN/HANG 的层级关系以 children/tree 为准（owner 深度查询在此场景下可能为空）。
-        // 因此这里用 TreeIndex 进行子孙收集，并按 noun 类型过滤到 LOOP/PRIM/CATE 三类。
-        let tree_dbnums = resolve_tree_dbnums(&dbnums)?;
-        let manager = TreeIndexManager::with_default_dir(tree_dbnums);
-
-        let mut loop_refnos: HashSet<RefnoEnum> = HashSet::new();
-        let mut prim_refnos: HashSet<RefnoEnum> = HashSet::new();
-        let mut cate_refnos: HashSet<RefnoEnum> = HashSet::new();
-        for &root in &bran_roots_vec {
-            loop_refnos.extend(manager.query_descendants_filtered(root, &GNERAL_LOOP_OWNER_NOUN_NAMES, None));
-            prim_refnos.extend(manager.query_descendants_filtered(root, &GNERAL_PRIM_NOUN_NAMES, None));
-            cate_refnos.extend(manager.query_descendants_filtered(root, &USE_CATE_NOUN_NAMES, None));
-            // BRAN 下的管道组件（如 TUBI/ELBO/TEE...）常不在 USE_CATE_NOUN_NAMES 中，需要单独纳入。
-            cate_refnos.extend(manager.query_descendants_filtered(root, &BRAN_COMPONENT_NOUN_NAMES, None));
-        }
-
-        println!(
-            "[BRAN-only] 子孙收集结果: LOOP={}, PRIM={}, CATE={}",
-            loop_refnos.len(),
-            prim_refnos.len(),
-            cate_refnos.len()
-        );
-
-        let ctx_prefetch = NounProcessContext::new(
-            db_option.clone(),
-            config.batch_size.get(),
-            config.concurrency.get(),
-        )
-        .with_stage(GenStage::Prefetch);
-
-        // LOOP
-        let mut loop_vec: Vec<RefnoEnum> = loop_refnos.into_iter().collect();
-        loop_vec.sort_by_key(|r| r.to_string());
-
-        // PrefetchThenGenerate：先把 LOOP/PRIM 输入写入 geom_input_cache（BRAN-only 也适用）
-        if matches!(
-            ctx_prefetch.cache_run_mode,
-            geom_input_cache::CacheRunMode::PrefetchThenGenerate
-        ) {
-            let prim_refnos_for_prefetch: Vec<RefnoEnum> = prim_refnos.iter().copied().collect();
-            println!(
-                "[BRAN-only][Prefetch] 预取 LOOP/PRIM 输入到 geom_input_cache: loop_refnos={}, prim_refnos={}",
-                loop_vec.len(),
-                prim_refnos_for_prefetch.len()
-            );
-            geom_input_cache::init_global_geom_input_cache();
-            let _ = geom_input_cache::prefetch_all_geom_inputs(
-                ctx_prefetch.db_option.as_ref(),
-                &loop_vec,
-                &prim_refnos_for_prefetch,
-                &[],
-            )
-            .await?;
-        }
-
-        let ctx = ctx_prefetch.with_stage(GenStage::Generate);
-        for (i, chunk) in loop_vec.chunks(ctx.batch_size.max(1)).enumerate() {
-            println!(
-                "[BRAN-only][LOOP] 分页 {}/{} ({} ~ {})",
-                i + 1,
-                (loop_vec.len() + ctx.batch_size.max(1) - 1) / ctx.batch_size.max(1),
-                i * ctx.batch_size.max(1) + 1,
-                (i * ctx.batch_size.max(1) + chunk.len())
-            );
-            process_loop_refno_page(&ctx, loop_sjus_map_arc.clone(), sender.clone(), chunk).await?;
-        }
-        for r in &loop_vec {
-            categorized.insert(*r, super::models::NounCategory::LoopOwner);
-        }
-
-        // PRIM
-        let mut prim_vec: Vec<RefnoEnum> = prim_refnos.into_iter().collect();
-        prim_vec.sort_by_key(|r| r.to_string());
-        for (i, chunk) in prim_vec.chunks(ctx.batch_size.max(1)).enumerate() {
-            println!(
-                "[BRAN-only][PRIM] 分页 {}/{} ({} ~ {})",
-                i + 1,
-                (prim_vec.len() + ctx.batch_size.max(1) - 1) / ctx.batch_size.max(1),
-                i * ctx.batch_size.max(1) + 1,
-                (i * ctx.batch_size.max(1) + chunk.len())
-            );
-            process_prim_refno_page(&ctx, sender.clone(), chunk).await?;
-        }
-        for r in &prim_vec {
-            categorized.insert(*r, super::models::NounCategory::Prim);
-        }
-
-        // CATE
-        let mut cate_vec: Vec<RefnoEnum> = cate_refnos.into_iter().collect();
-        cate_vec.sort_by_key(|r| r.to_string());
-        for (i, chunk) in cate_vec.chunks(ctx.batch_size.max(1)).enumerate() {
-            println!(
-                "[BRAN-only][CATE] 分页 {}/{} ({} ~ {})",
-                i + 1,
-                (cate_vec.len() + ctx.batch_size.max(1) - 1) / ctx.batch_size.max(1),
-                i * ctx.batch_size.max(1) + 1,
-                (i * ctx.batch_size.max(1) + chunk.len())
-            );
-            process_cate_refno_page(
-                &ctx,
-                loop_sjus_map_arc.clone(),
-                sender.clone(),
-                chunk,
-            )
-            .await?;
-        }
-        for r in &cate_vec {
-            categorized.insert(*r, super::models::NounCategory::Cate);
-        }
-
-        return Ok(categorized);
-    }
-
-    // ============================================================================
-    // 🔍 [第二阶段] 通用深度查询路径（处理 LOOP/PRIM/CATE）
+    // 🔍 [第二阶段] 通用深度查询路径（处理 LOOP/CATE/PRIM）
     // ============================================================================
     println!("🔍 正在收集其余 Noun 的根节点并执行深度递归查询...");
 
@@ -584,7 +451,7 @@ pub async fn gen_index_tree_geos_optimized(
                 .await?;
 
             // 两阶段（Prefetch -> Generate）：
-            // - PrefetchThenGenerate：先把 LOOP/PRIM 输入预取到 geom_input_cache，再进入纯离线生成阶段消费缓存
+            // - PrefetchThenGenerate：先把 LOOP/CATE/PRIM 输入预取到 geom_input_cache，再进入纯离线生成阶段消费缓存
             // - CacheOnly：不做预取，直接进入离线生成阶段（只读 cache，miss 按策略跳过并记录）
             let ctx_prefetch = NounProcessContext::new(
                 db_option.clone(),
@@ -601,10 +468,10 @@ pub async fn gen_index_tree_geos_optimized(
                 let prim_vec: Vec<RefnoEnum> = prim_refnos.iter().copied().collect();
                 let cate_vec: Vec<RefnoEnum> = cate_refnos.iter().copied().collect();
                 println!(
-                    "[Pipeline] PrefetchThenGenerate: 开始预取 LOOP/PRIM/CATE 输入到 geom_input_cache (loop_refnos={}, prim_refnos={}, cate_refnos={})",
+                    "[Pipeline] PrefetchThenGenerate: 开始预取 LOOP/CATE/PRIM 输入到 geom_input_cache (loop_refnos={}, cate_refnos={}, prim_refnos={})",
                     loop_vec.len(),
-                    prim_vec.len(),
-                    cate_vec.len()
+                    cate_vec.len(),
+                    prim_vec.len()
                 );
 
                 // 全局 geom_input_cache 已在 orchestrator 初始化；这里再 init 一次保证 IndexTree 直调也可用。
@@ -693,7 +560,7 @@ pub async fn gen_index_tree_geos_optimized(
 
             let ctx = ctx_prefetch.with_stage(GenStage::Generate);
 
-            // [1-3/4] 处理 LOOP, PRIM, CATE
+            // [1-3/4] 处理 LOOP, CATE, PRIM
             let (loop_vec, loop_dur) = process_loop_stage(
                 &ctx,
                 loop_refnos,
@@ -705,9 +572,6 @@ pub async fn gen_index_tree_geos_optimized(
                 has_seed_roots,
             )
             .await?;
-            let (prim_vec, prim_dur) =
-                process_prim_stage(&ctx, prim_refnos, config, &dbnums, sender.clone(), has_seed_roots)
-                .await?;
             let (cate_vec, cate_dur) = process_cate_stage(
                 &ctx,
                 cate_refnos,
@@ -715,10 +579,13 @@ pub async fn gen_index_tree_geos_optimized(
                 &dbnums,
                 &bran_generated_refnos,
                 loop_sjus_map_arc,
-                sender,
+                sender.clone(),
                 has_seed_roots,
             )
             .await?;
+            let (prim_vec, prim_dur) =
+                process_prim_stage(&ctx, prim_refnos, config, &dbnums, sender.clone(), has_seed_roots)
+                .await?;
 
             // 归类结果
             for r in &cate_vec {
@@ -732,7 +599,7 @@ pub async fn gen_index_tree_geos_optimized(
             }
 
             let total_duration = total_start.elapsed();
-            print_final_summary(total_duration, loop_dur, prim_dur, cate_dur, bran_duration);
+            print_final_summary(total_duration, loop_dur, cate_dur, prim_dur, bran_duration);
     }
 
     categorized.print_statistics();
@@ -843,6 +710,37 @@ async fn process_bran_hang_core_logic(
     let t3_ms = t3.elapsed().as_millis();
     println!("  [BRAN perf] 阶段3 prefetch_offline_inputs: {} ms", t3_ms);
 
+    // ── 阶段 3.5: 与 CATE 生成并行的 BRAN/TUBI 元信息预取（仅 Direct） ──
+    let branch_tubi_prefetch_task: Option<
+        tokio::task::JoinHandle<anyhow::Result<cata_model::BranchPrefetchResult>>,
+    > = if ctx_generate.is_offline_generate() || child_refnos.is_empty() || branch_refnos_map.is_empty()
+    {
+        None
+    } else {
+        let mut prefetch_child_refnos = child_refnos.clone();
+        prefetch_child_refnos.sort_by_key(|r| r.refno());
+        prefetch_child_refnos.dedup();
+
+        let mut prefetch_branch_refnos: Vec<RefnoEnum> =
+            branch_refnos_map.iter().map(|x| *x.key()).collect();
+        prefetch_branch_refnos.sort_by_key(|r| r.refno());
+        prefetch_branch_refnos.dedup();
+
+        println!(
+            "  [BRAN perf] 阶段3.5 spawn_tubi_prefetch: children_unique={}, branch_roots={}",
+            prefetch_child_refnos.len(),
+            prefetch_branch_refnos.len()
+        );
+
+        Some(tokio::spawn(async move {
+            cata_model::prefetch_tubi_size_and_branch_meta(
+                &prefetch_child_refnos,
+                &prefetch_branch_refnos,
+            )
+            .await
+        }))
+    };
+
     // ── 阶段 4: 生成 CATE 几何（Generate 阶段；离线时只读缓存） ──
     let t4 = Instant::now();
     #[cfg(feature = "profile")]
@@ -933,12 +831,47 @@ async fn process_bran_hang_core_logic(
         )
         .await
     } else {
-        cata_model::gen_branch_tubi_from_db(
+        let t_prefetch_wait = Instant::now();
+        let mut external_prefetch = None;
+        let mut external_prefetch_wait_ms = None;
+        if let Some(handle) = branch_tubi_prefetch_task {
+            match handle.await {
+                Ok(Ok(prefetch)) => {
+                    let wait_ms = t_prefetch_wait.elapsed().as_millis();
+                    external_prefetch_wait_ms = Some(wait_ms);
+                    println!(
+                        "  [BRAN perf] 阶段6 使用外部 tubi_prefetch: wait={} ms, tubi_cache_hit={}, branch_meta_hit={}",
+                        wait_ms,
+                        prefetch.tubi_size_cache.len(),
+                        prefetch.branch_meta_cache.len()
+                    );
+                    external_prefetch = Some(prefetch);
+                }
+                Ok(Err(e)) => {
+                    external_prefetch_wait_ms = Some(t_prefetch_wait.elapsed().as_millis());
+                    eprintln!(
+                        "  [BRAN perf] 阶段6 外部 tubi_prefetch 失败，将回退内部预取: {}",
+                        e
+                    );
+                }
+                Err(e) => {
+                    external_prefetch_wait_ms = Some(t_prefetch_wait.elapsed().as_millis());
+                    eprintln!(
+                        "  [BRAN perf] 阶段6 外部 tubi_prefetch 任务异常，将回退内部预取: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        cata_model::gen_branch_tubi_from_db_with_prefetch(
             db_option.clone(),
             Arc::new(branch_refnos_map),
             loop_sjus_map_arc,
             sender,
             local_al_map,
+            external_prefetch,
+            external_prefetch_wait_ms,
         )
         .await
     };
@@ -1515,14 +1448,14 @@ async fn process_cate_stage(
     Ok((vec, start.elapsed()))
 }
 
-fn print_final_summary(total: Duration, l: Duration, p: Duration, c: Duration, b: Duration) {
+fn print_final_summary(total: Duration, l: Duration, c: Duration, p: Duration, b: Duration) {
     println!("✅ IndexTree 处理完成 (GeneralPath)");
     println!(
-        "⏱️  Total: {} ms [L: {}ms, P: {}ms, C: {}ms, B: {}ms]",
+        "⏱️  Total: {} ms [L: {}ms, C: {}ms, P: {}ms, B: {}ms]",
         total.as_millis(),
         l.as_millis(),
-        p.as_millis(),
         c.as_millis(),
+        p.as_millis(),
         b.as_millis()
     );
 }
@@ -1530,10 +1463,15 @@ fn print_final_summary(total: Duration, l: Duration, p: Duration, c: Duration, b
 async fn get_filtered_dbnums(db_option: &DbOptionExt) -> Result<Vec<u32>> {
     let mut dbnums: Vec<u32> = if let Some(manual) = db_option.manual_db_nums.clone() {
         manual
-    } else {
+    } else if db_option.use_surrealdb {
         query_mdb_db_nums(None, DBType::DESI).await.map_err(|e| {
             IndexTreeError::DatabaseError(format!("query_mdb_db_nums(None, DESI) failed: {}", e))
         })?
+    } else {
+        db_meta()
+            .ensure_loaded()
+            .map_err(|e| IndexTreeError::DatabaseError(format!("加载 db_meta_info.json 失败: {}", e)))?;
+        db_meta().get_all_dbnums()
     };
 
     if let Some(exclude) = &db_option.exclude_db_nums {

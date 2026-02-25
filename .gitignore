@@ -148,6 +148,8 @@ deploy/
 db_options/_tmp/
 
 ams-8020.db
-target-web-server-check
+ams-8021.db
 nul
 test_output
+target
+logs

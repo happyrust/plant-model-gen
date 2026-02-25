@@ -24,10 +24,15 @@ use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use glam::DMat4;
 use parry3d::bounding_volume::Aabb;
+#[cfg(feature = "parquet-export")]
 use parquet::arrow::ArrowWriter;
+#[cfg(feature = "parquet-export")]
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, StringArray, UInt32Array};
+#[cfg(feature = "parquet-export")]
 use arrow_array::builder::{FixedSizeListBuilder, PrimitiveBuilder};
+#[cfg(feature = "parquet-export")]
 use arrow_array::types::Float32Type;
+#[cfg(feature = "parquet-export")]
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -4479,6 +4484,7 @@ fn as_mat4_16(v: &[f32]) -> Result<[f32; 16]> {
     Ok(slice)
 }
 
+#[cfg(feature = "parquet-export")]
 fn write_prepack_parquet_and_patch_manifest(output_dir: &Path) -> Result<()> {
     let instances_path = output_dir.join("instances.json");
     let geometry_manifest_path = output_dir.join("geometry_manifest.json");
@@ -4529,6 +4535,12 @@ fn write_prepack_parquet_and_patch_manifest(output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "parquet-export"))]
+fn write_prepack_parquet_and_patch_manifest(_output_dir: &Path) -> Result<()> {
+    anyhow::bail!("parquet 导出功能未启用，请使用 --features parquet-export 重新编译")
+}
+
+#[cfg(feature = "parquet-export")]
 fn write_instances_parquet(path: PathBuf, instances: &PrepackInstances) -> Result<()> {
     let colors = instances.colors.clone().unwrap_or_default();
 
@@ -4754,6 +4766,7 @@ fn write_instances_parquet(path: PathBuf, instances: &PrepackInstances) -> Resul
     Ok(())
 }
 
+#[cfg(feature = "parquet-export")]
 fn write_geometry_manifest_parquet(path: PathBuf, manifest: &PrepackGeometryManifest) -> Result<()> {
     let mut geo_hashes: Vec<Option<String>> = Vec::new();
     let mut geo_indices: Vec<u32> = Vec::new();

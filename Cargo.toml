@@ -106,12 +106,9 @@ rumqttc = "0.25.0"
 
 futures-util = "0.3"
 
-
-memchr = "2.5.0"
-
-nom = "7.1.1"
-
 regex = "1.12.1"
+
+nom = "8"
 
 calamine = "0.31.0"
 
@@ -149,6 +146,9 @@ surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1", 
 
 ] }
 
+# surrealdb-types 需要显式引入：SurrealValue derive 宏默认使用 ::surrealdb_types 路径
+surrealdb-types = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1" }
+
 
 
 # pdms_io = { git = "https://github.com/happyrust/pdms-io.git" }
@@ -185,7 +185,9 @@ sha2 = "0.10"
 
 id_tree = { version = "1.8.0", features = ["serde_support"] }
 
-indextree = { path = "../indextree/indextree", features = ["rkyv"] }
+indextree = { git = "https://github.com/happyrust/indextree", branch = "main", features = [
+    "rkyv",
+] }
 
 glam = { version = "0.30.8", features = ["serde", "rkyv"] }
 
@@ -409,160 +411,6 @@ cc = { version = "1.0", features = ["parallel"] }
 
 
 [dev-dependencies]
-
 tempfile = "3"
 
 
-#[profile.release]
-
-#lto = true
-
-#strip = true
-
-#opt-level = 3
-
-#panic = 'abort'
-
-#codegen-units = 1
-
-
-# [patch."https://gitee.com/happydpc/rs-core.git"]
-
-# aios_core = { path = "../rs-core" }
-
-
-# [patch."https://gitee.com/happydpc/aios-parse-pdms.git"]
-
-# parse_pdms_db = { path = "../aios-parse-pdms-fork" }
-
-
-# [patch."https://gitee.com/happydpc/pdms-io.git"]
-
-# pdms_io = { path = "../pdms-io" }
-
-
-# Examples
-
-[[example]]
-
-name = "debug_query_multi_filter"
-
-path = "src/examples/debug_query_multi_filter.rs"
-
-
-[[example]]
-
-name = "verify_lod_feature"
-
-path = "src/examples/verify_lod_feature.rs"
-
-required-features = ["gen_model"]
-
-
-[[example]]
-
-name = "debug_refno_21491_19209"
-
-path = "src/examples/debug_refno_21491_19209.rs"
-
-
-[[example]]
-
-name = "compare_visible_geo_descendants"
-
-path = "src/examples/compare_visible_geo_descendants.rs"
-
-
-[[example]]
-
-name = "refresh_pe_transform"
-
-path = "examples/refresh_pe_transform.rs"
-
-
-[[example]]
-
-name = "room_calc_by_panel_demo"
-
-path = "examples/room_calc_by_panel_demo.rs"
-
-required-features = ["gen_model", "sqlite-index"]
-
-
-[[example]]
-
-name = "room_calculation_demo"
-
-path = "examples/room_calculation_demo.rs"
-
-required-features = ["gen_model", "sqlite-index"]
-
-
-[[example]]
-
-name = "verify_inst_relate_fix"
-
-path = "src/examples/verify_inst_relate_fix.rs"
-
-required-features = ["gen_model"]
-
-
-[[example]]
-
-name = "diagnose_export_instances"
-
-path = "src/examples/diagnose_export_instances.rs"
-
-required-features = ["gen_model"]
-
-
-[[example]]
-
-name = "query_tubi_world_trans"
-
-path = "src/examples/query_tubi_world_trans.rs"
-
-required-features = ["gen_model"]
-
-
-[[example]]
-
-name = "verify_sync_to_db_24381_145018"
-
-path = "examples/verify_sync_to_db_24381_145018.rs"
-
-required-features = ["gen_model"]
-
-
-[[example]]
-
-name = "capture_model_baseline"
-
-path = "examples/capture_model_baseline.rs"
-
-required-features = ["gen_model"]
-
-
-eframe = { git = "https://github.com/emilk/egui.git", rev = "fa4cfec777c9ea21b8643f77b6a26561da44aad0", package = "eframe" }
-
-
-[patch."https://github.com/happyrust/rs-core"]
-aios_core = { path = "../rs-core" }
-
-[patch."https://github.com/happyrust/rs-core.git"]
-aios_core = { path = "../rs-core" }
-
-[patch."https://github.com/happyrust/indextree"]
-indextree = { path = "../indextree/indextree" }
-
-[patch."https://github.com/happyrust/surrealdb"]
-surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "updated", default-features = false, features = [
-    "protocol-ws",
-    "kv-mem",
-] }
-surrealdb-types = { git = "https://gitee.com/happydpc/surrealdb", branch = "updated" }
-
-
-# [patch."https://gitee.com/happydpc/rust-ploop-processor.git"]
-
-# ploop-rs = { path = "../rust-ploop-processor/ploop-rs" }

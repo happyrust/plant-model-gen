@@ -6,11 +6,13 @@ use aios_core::{RefnoEnum, RefU64, SUL_DB, SurrealQueryExt};
 use anyhow::Result;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use surrealdb::types::{self as surrealdb_types, SurrealValue};
+use surrealdb::types as surrealdb_types;
+use surrealdb::types::SurrealValue;
 use std::collections::HashSet;
 
 /// Scene Node 状态
 #[derive(Debug, Serialize, Deserialize, SurrealValue)]
+#[surreal(crate = "surrealdb_types")]
 pub struct SceneNodeStatus {
     pub id: i64,
     pub has_geo: bool,

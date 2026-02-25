@@ -22,8 +22,10 @@ pub mod model_exporter;
 
 pub mod name_config;
 
+#[cfg(feature = "parquet-export")]
 pub mod parquet_writer;
 
+#[cfg(feature = "parquet-export")]
 pub mod parquet_stream_writer;
 
 // #[cfg(feature = "duckdb-feature")]
@@ -40,14 +42,19 @@ pub mod duckdb_reader;
 
 pub mod simple_color_palette;
 
+#[cfg(feature = "parquet-export")]
 pub mod pe_parquet_writer;
 
+#[cfg(feature = "parquet-export")]
 pub mod attr_parquet_writer;
 
+#[cfg(feature = "parquet-export")]
 pub mod export_parquet;
 
+#[cfg(feature = "parquet-export")]
 pub mod export_dbnum_instances_parquet;
 
+#[cfg(feature = "parquet-export")]
 pub mod export_pdms_tree_parquet;
 
 
@@ -56,6 +63,7 @@ pub use export_common::*;
 
 pub use name_config::NameConfig;
 
+#[cfg(feature = "parquet-export")]
 pub use parquet_stream_writer::ParquetStreamWriter;
 
 #[cfg(feature = "duckdb-feature")]

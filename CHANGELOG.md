@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-02-25
+
+### Changed
+
+- **清理 19 个未使用的 crate 依赖**
+  - 移除：`approx`、`async-once-cell`、`async-std`、`base64`、`byteorder`、`cached`、`cavalier_contours`、`downcast-rs`、`dpcsync`、`flate2`、`jsonxf`、`nom-derive`、`pollster`、`rand`、`strum_macros`、`surrealdb-types`、`toml_edit`、`bevy_transform`、`bevy_reflect`
+  - 减少编译时间与依赖体积
+
+- **Parquet/Polars 依赖改为可选 `parquet-export` feature**
+  - `parquet`、`arrow-array`、`arrow-schema`、`polars` 移入 `parquet-export` feature gate
+  - `scene_tree::parquet_export` 模块与 `mbd_pipe_api` 的 Parquet 路径均加上 `#[cfg(feature = "parquet-export")]`
+  - 默认构建不再拉取重量级 Arrow/Polars 依赖
+
+- **SurrealDB 写操作增加 kv_dual_write 同步**
+  - `cache_flush.rs`、`pdms_inst.rs`、`utils.rs` 中的 INSERT/UPDATE 语句在写入 SurrealDB 后同步调用 `aios_core::kv_dual_write`
+
+### Added
+
+- **模型回归测试模块** `test_model_regression`
+- **MBD Pipe API parquet-export 未启用时自动回退到 SurrealDB**
+
 ## 2026-02-23
 
 ### Breaking

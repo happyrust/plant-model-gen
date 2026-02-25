@@ -53,6 +53,7 @@ pub async fn save_tubi_info_batch_with_replace(
                 .query(&sql)
                 .await
                 .with_context(|| format!("写入 tubi_info 失败 (insert ignore): {}", written))?;
+            aios_core::kv_dual_write(&sql).await;
         }
     }
 
@@ -68,7 +69,8 @@ async fn delete_inst_relate_by_in(refnos: &[RefnoEnum], chunk_size: usize) -> an
     for chunk in refnos.chunks(chunk_size.max(1)) {
         let in_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
         let sql = format!("DELETE FROM inst_relate WHERE in IN [{in_keys}];");
-        SUL_DB.query(sql).await?;
+        SUL_DB.query(&sql).await?;
+        aios_core::kv_dual_write(&sql).await;
     }
     Ok(())
 }
@@ -85,7 +87,8 @@ async fn delete_geo_relate_by_inst_info_ids(inst_info_ids: &[String], chunk_size
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!("DELETE geo_relate WHERE in IN [{in_keys}];");
-        SUL_DB.query(sql).await?;
+        SUL_DB.query(&sql).await?;
+        aios_core::kv_dual_write(&sql).await;
     }
     Ok(())
 }
@@ -98,8 +101,12 @@ async fn delete_boolean_relations_by_targets(target_refnos: &[RefnoEnum], chunk_
     for chunk in target_refnos.chunks(chunk_size.max(1)) {
         let out_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
         // out=目标正实体(pe key)
-        SUL_DB.query(format!("DELETE neg_relate WHERE out IN [{out_keys}];")).await?;
-        SUL_DB.query(format!("DELETE ngmr_relate WHERE out IN [{out_keys}];")).await?;
+        let neg_sql = format!("DELETE neg_relate WHERE out IN [{out_keys}];");
+        SUL_DB.query(&neg_sql).await?;
+        aios_core::kv_dual_write(&neg_sql).await;
+        let ngmr_sql = format!("DELETE ngmr_relate WHERE out IN [{out_keys}];");
+        SUL_DB.query(&ngmr_sql).await?;
+        aios_core::kv_dual_write(&ngmr_sql).await;
     }
     Ok(())
 }
@@ -116,7 +123,8 @@ async fn delete_inst_relate_bool_records(refnos: &[RefnoEnum], chunk_size: usize
     }
 
     for sql in build_delete_inst_relate_bool_records_sql(refnos, chunk_size) {
-        SUL_DB.query(sql).await?;
+        SUL_DB.query(&sql).await?;
+        aios_core::kv_dual_write(&sql).await;
     }
     Ok(())
 }
@@ -174,7 +182,9 @@ async fn delete_inst_geo_by_hashes(geo_hashes: &[u64], chunk_size: usize) -> any
         if ids.is_empty() {
             continue;
         }
-        SUL_DB.query(format!("DELETE [{ids}];")).await?;
+        let sql = format!("DELETE [{ids}];");
+        SUL_DB.query(&sql).await?;
+        aios_core::kv_dual_write(&sql).await;
     }
     Ok(())
 }
@@ -970,7 +980,13 @@ impl TransactionBatcher {
                 .await;
 
                 match run_once {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        // 双写到 KV_DB
+                        if aios_core::is_model_kv_enabled() {
+                            let _ = aios_core::KV_DB.query(query.clone()).await;
+                        }
+                        return Ok(());
+                    }
                     Err(e) => {
                         let es = e.to_string();
 
@@ -1118,6 +1134,7 @@ pub async fn save_tubi_info_batch(
         
         let sql = format!("INSERT INTO tubi_info [{}];", values.join(","));
         SUL_DB.query(&sql).await?;
+        aios_core::kv_dual_write(&sql).await;
         inserted += chunk.len();
         
         debug_model_debug!(

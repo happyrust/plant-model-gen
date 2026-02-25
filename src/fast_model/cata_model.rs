@@ -4042,11 +4042,12 @@ async fn gen_cata_geos_inner(
             );
 
             let t_query = Instant::now();
-            if let Err(e) = SUL_DB.query(sql).await {
+            if let Err(e) = SUL_DB.query(&sql).await {
                 debug_model!("[BRAN_TUBI] 写入 tubi_relate 失败: {}", e);
                 // 保持原来的 unwrap 语义
                 panic!("写入 tubi_relate 失败: {}", e);
             }
+            aios_core::kv_dual_write(&sql).await;
             tubi_query_time = t_query.elapsed().as_millis();
             debug_model!(
                 "[BRAN_TUBI] 写入 tubi_relate 成功，用时 {} ms",

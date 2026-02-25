@@ -56,6 +56,7 @@ use crate::fast_model::pdms_inst::save_instance_data_optimize;
 
 use crate::options::{DbOptionExt, MeshFormat};
 
+#[cfg(feature = "parquet-export")]
 use crate::fast_model::export_model::ParquetStreamWriter;
 
 #[cfg(feature = "duckdb-feature")]
@@ -798,6 +799,7 @@ async fn process_index_tree_generation(
         })
         .unwrap_or(false);
 
+    #[cfg(feature = "parquet-export")]
     let parquet_writer = if enable_parquet_stream_writer {
         let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
         let parquet_dir = std::path::Path::new(output_dir)
@@ -823,6 +825,9 @@ async fn process_index_tree_generation(
         );
         None
     };
+
+    #[cfg(not(feature = "parquet-export"))]
+    let parquet_writer: Option<()> = None;
 
     #[cfg(feature = "duckdb-feature")]
 
@@ -858,6 +863,7 @@ async fn process_index_tree_generation(
 
     */
 
+    #[cfg(feature = "parquet-export")]
     let parquet_writer_clone = parquet_writer.clone();
 
     #[cfg(feature = "duckdb-feature")]
@@ -988,6 +994,7 @@ async fn process_index_tree_generation(
 
             // 同时写入 Parquet（如果启用）
 
+            #[cfg(feature = "parquet-export")]
             if let Some(ref writer) = parquet_writer_clone {
 
                 let t0 = Instant::now();
@@ -1122,6 +1129,7 @@ async fn process_index_tree_generation(
 
     // 完成 Parquet 写入并合并文件
 
+    #[cfg(feature = "parquet-export")]
     if let Some(ref writer) = parquet_writer {
 
         if let Err(e) = writer.finalize() {

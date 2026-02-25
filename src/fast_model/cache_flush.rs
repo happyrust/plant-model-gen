@@ -459,6 +459,7 @@ async fn flush_tubi_relate_to_surreal(
             let pe = owner.to_pe_key();
             let sql = format!("DELETE tubi_relate:[{pe}, 0]..[{pe}, ..];");
             SUL_DB.query(&sql).await.with_context(|| format!("删除旧 tubi_relate 失败 owner={owner} sql={sql}"))?;
+            aios_core::kv_dual_write(&sql).await;
         }
     }
 
@@ -471,12 +472,14 @@ async fn flush_tubi_relate_to_surreal(
     for chunk in aabb_rows.chunks(300) {
         let sql = format!("INSERT IGNORE INTO aabb [{}];", chunk.join(","));
         SUL_DB.query(&sql).await.with_context(|| format!("写入 aabb 失败: {sql}"))?;
+        aios_core::kv_dual_write(&sql).await;
     }
 
     // ---- 第 5 步：写入依赖表 vec3 ----
     for chunk in pts_rows.chunks(100) {
         let sql = format!("INSERT IGNORE INTO vec3 [{}];", chunk.join(","));
         SUL_DB.query(&sql).await.with_context(|| format!("写入 vec3 失败: {sql}"))?;
+        aios_core::kv_dual_write(&sql).await;
     }
 
     // ---- 第 6 步：批量执行 RELATE（RUS-184: 事务包裹，保证单 chunk 原子性）----
@@ -484,6 +487,7 @@ async fn flush_tubi_relate_to_surreal(
         let body = chunk.join("");
         let sql = format!("BEGIN TRANSACTION;\n{body}\nCOMMIT TRANSACTION;");
         SUL_DB.query(&sql).await.with_context(|| format!("执行 tubi_relate RELATE 失败: {sql}"))?;
+        aios_core::kv_dual_write(&sql).await;
     }
 
     Ok(total)

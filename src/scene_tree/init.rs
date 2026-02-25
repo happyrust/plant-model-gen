@@ -132,10 +132,13 @@ pub async fn init_scene_tree_from_root(
     );
 
     // 6. 导出 Parquet 文件（使用 root 的 dbnum）
-    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(root_refno)?;
-    let output_dir = crate::versioned_db::db_meta_info::get_project_tree_dir(&get_project_name_from_config());
-    if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbnum, &output_dir).await {
-        eprintln!("[scene_tree] Parquet 导出失败: {}", e);
+    #[cfg(feature = "parquet-export")]
+    {
+        let dbnum = TreeIndexManager::resolve_dbnum_for_refno(root_refno)?;
+        let output_dir = crate::versioned_db::db_meta_info::get_project_tree_dir(&get_project_name_from_config());
+        if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbnum, &output_dir).await {
+            eprintln!("[scene_tree] Parquet 导出失败: {}", e);
+        }
     }
 
     Ok(SceneTreeInitResult {
@@ -176,9 +179,12 @@ pub async fn init_scene_tree_by_dbno(dbnum: u32, force_rebuild: bool) -> Result<
     );
 
     // 6. 导出 Parquet 文件
-    let output_dir = crate::versioned_db::db_meta_info::get_project_tree_dir(&get_project_name_from_config());
-    if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbnum, &output_dir).await {
-        eprintln!("[scene_tree] Parquet 导出失败: {}", e);
+    #[cfg(feature = "parquet-export")]
+    {
+        let output_dir = crate::versioned_db::db_meta_info::get_project_tree_dir(&get_project_name_from_config());
+        if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbnum, &output_dir).await {
+            eprintln!("[scene_tree] Parquet 导出失败: {}", e);
+        }
     }
 
     Ok(SceneTreeInitResult {

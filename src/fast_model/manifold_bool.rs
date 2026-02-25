@@ -669,6 +669,7 @@ pub async fn apply_cata_neg_boolean_manifold(
                 );
                 return Err(e.into());
             }
+            aios_core::kv_dual_write(&update_sql).await;
         }
     }
 

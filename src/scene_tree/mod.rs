@@ -9,6 +9,7 @@ use anyhow::Result;
 pub mod init;
 pub mod query;
 pub mod schema;
+#[cfg(feature = "parquet-export")]
 pub mod parquet_export;
 
 pub fn is_geo_noun(noun: &str) -> bool {
@@ -24,6 +25,7 @@ pub use query::{
     SceneNodeStatus,
 };
 pub use schema::init_schema;
+#[cfg(feature = "parquet-export")]
 pub use parquet_export::export_scene_tree_parquet;
 
 /// 检查 scene_tree 是否已初始化

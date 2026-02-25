@@ -7,13 +7,10 @@
 			"path": "../rs-core"
 		},
 		{
-			"path": "../manifold-rs"
+			"path": "../pdms-io-fork"
 		},
 		{
-			"path": "../plant-model"
-		},
-		{
-			"path": "../e3d-reverse"
+			"path": "../surrealdb"
 		}
 	],
 	"settings": {

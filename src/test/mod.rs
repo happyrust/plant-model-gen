@@ -15,6 +15,8 @@ mod test_room_specific_refno; // 特定 refno 房间测试
 // mod test_room_tee_containment; // 房间-三通包含关系测试
 mod test_check_frmw_structure; // 检查 FRMW 数据库结构
 #[cfg(feature = "gen_model")]
+mod test_model_regression; // 模型生成回归测试（布尔运算验证等）
+#[cfg(feature = "gen_model")]
 mod test_scene_tree; // Scene Tree 模块测试
 #[cfg(feature = "gen_model")]
 mod test_scene_tree_simple; // Scene Tree 模块简化测试

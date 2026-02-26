@@ -2,7 +2,7 @@
 //!
 //! 在模型生成开始前，统一检查并生成必要的预处理数据：
 //! - Tree 索引文件（{dbnum}.tree）
-//! - foyer transform_cache（世界坐标变换本地缓存，仅做存在性检查）
+//! - model_cache transform_cache（世界坐标变换本地缓存，仅做存在性检查）
 //! - db_meta_info.json（数据库元信息）
 //!
 //! # 设计原则
@@ -26,7 +26,7 @@ pub struct PrecheckConfig {
     pub enabled: bool,
     /// 是否检查 Tree 文件
     pub check_tree: bool,
-    /// 是否检查 transform_cache（foyer）
+    /// 是否检查 transform_cache（model cache）
     pub check_pe_transform: bool,
     /// 是否检查 db_meta_info
     pub check_db_meta: bool,
@@ -220,7 +220,7 @@ async fn check_tree_files(
     Ok(())
 }
 
-/// 检查 foyer transform_cache 是否存在（不要求全量命中）。
+/// 检查 model_cache transform_cache 是否存在（不要求全量命中）。
 ///
 /// 约定：precheck 只做“存在性检查”，miss 由后续模型生成阶段按需计算并回写。
 async fn check_pe_transform(
@@ -228,7 +228,7 @@ async fn check_pe_transform(
     dbnums: &[u32],
     stats: &mut PrecheckStats,
 ) -> Result<()> {
-    println!("[precheck] 🔄 检查 transform_cache（foyer）...");
+    println!("[precheck] 🔄 检查 transform_cache（model cache）...");
 
     if dbnums.is_empty() {
         println!("[precheck] ⚠️  没有需要检查的数据库");
@@ -298,7 +298,7 @@ pub async fn run_precheck(
         check_tree_files(&dbnums, &config.tree_output_dir, &mut stats).await?;
     }
 
-    // 4. 检查 transform_cache（foyer）：与数据源无关，cache-only / surrealdb 都可用。
+    // 4. 检查 transform_cache（model cache）：与数据源无关，cache-only / surrealdb 都可用。
     if config.check_pe_transform {
         check_pe_transform(db_option, &dbnums, &mut stats).await?;
     }
@@ -308,3 +308,4 @@ pub async fn run_precheck(
 
     Ok(stats)
 }
+

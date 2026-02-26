@@ -8242,31 +8242,44 @@ pub async fn api_get_scene_tree_file(
         })
     } else {
         // 尝试导出
-        let output_dir = std::path::Path::new("output/database_models").join(dbno.to_string());
-        match crate::scene_tree::export_scene_tree_parquet(dbno, &output_dir).await {
-            Ok(count) => {
-                Json(SceneTreeFileResponse {
-                    success: true,
-                    dbno,
-                    filename,
-                    url,
-                    exists: true,
-                    node_count: Some(count),
-                    message: format!("Scene tree exported: {} nodes", count),
-                })
-            }
-            Err(e) => {
-                Json(SceneTreeFileResponse {
-                    success: false,
-                    dbno,
-                    filename,
-                    url,
-                    exists: false,
-                    node_count: None,
-                    message: format!("Export failed: {}", e),
-                })
+        #[cfg(feature = "parquet-export")]
+        {
+            let output_dir = std::path::Path::new("output/database_models").join(dbno.to_string());
+            match crate::scene_tree::export_scene_tree_parquet(dbno, &output_dir).await {
+                Ok(count) => {
+                    return Json(SceneTreeFileResponse {
+                        success: true,
+                        dbno,
+                        filename,
+                        url,
+                        exists: true,
+                        node_count: Some(count),
+                        message: format!("Scene tree exported: {} nodes", count),
+                    });
+                }
+                Err(e) => {
+                    return Json(SceneTreeFileResponse {
+                        success: false,
+                        dbno,
+                        filename: filename.clone(),
+                        url: url.clone(),
+                        exists: false,
+                        node_count: None,
+                        message: format!("Export failed: {}", e),
+                    });
+                }
             }
         }
+        #[cfg(not(feature = "parquet-export"))]
+        Json(SceneTreeFileResponse {
+            success: false,
+            dbno,
+            filename,
+            url,
+            exists: false,
+            node_count: None,
+            message: "parquet-export feature not enabled".to_string(),
+        })
     }
 }
 

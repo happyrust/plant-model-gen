@@ -15,8 +15,7 @@ fn skip_if_no_fixture() -> bool {
     if !path.exists() {
         eprintln!(
             "⚠️  跳过测试：fixture 文件不存在。请先运行:\n\
-             cargo run --example capture_model_baseline --features gen_model -- {}",
-            REFNO
+             cargo test --features gen_model --lib test::test_model_regression::capture_baseline::capture_17496_106028 -- --nocapture --ignored"
         );
         return true;
     }
@@ -30,11 +29,8 @@ fn skip_if_no_geom_data() -> bool {
     let instances = load_geom_instances(REFNO);
     if instances.as_ref().map(|v| v.is_empty()).unwrap_or(true) {
         eprintln!(
-            "⚠️  跳过测试：geom_instances 为空（foyer cache 未填充）。请先运行:\n\
-             cargo run --bin aios-database -- --debug-model {} --regen-model --export-obj\n\
-             然后重新捕获 baseline:\n\
-             cargo run --example capture_model_baseline --features gen_model -- {}",
-            REFNO, REFNO
+            "⚠️  跳过测试：geom_instances 为空。请启动 SurrealDB 后运行:\n\
+             cargo test --features gen_model --lib test::test_model_regression::capture_baseline::capture_17496_106028 -- --nocapture --ignored"
         );
         return true;
     }

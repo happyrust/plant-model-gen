@@ -368,7 +368,7 @@ mod tests {
         }
 
         let db_option = get_db_option();
-        // 强制走 DB(inst_relate) 拉取 world_aabb/world_trans，避免依赖本地 foyer cache。
+        // 强制走 DB(inst_relate) 拉取 world_aabb/world_trans，避免依赖本地 model cache。
         let _g_use_cache = EnvGuard::set_force("AIOS_ROOM_USE_CACHE", "0".to_string());
         // 开启“薄面板→2D 投影”兜底（默认即为 true；此处显式设置以便在现场跑用例时更可控）。
         let _g_floor_2d =
@@ -1009,3 +1009,4 @@ mod tests {
         Ok(())
     }
 }
+

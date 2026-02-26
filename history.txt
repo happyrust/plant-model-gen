@@ -1,101 +1,101 @@
 #V2
-SELECT count() FROM inst_info GROUP ALL; SELECT count() FROM inst_relate GROUP ALL; SELECT count() FROM inst_relate_aabb GROUP ALL; SELECT count() FROM inst_relate_bool GROUP ALL;
-SELECT count() FROM inst_relate_cata_bool GROUP ALL; SELECT count() FROM geo_relate GROUP ALL; SELECT count() FROM ngmr_relate GROUP ALL; SELECT count() FROM neg_relate GROUP ALL;
-SELECT count() FROM tubi_info GROUP ALL; SELECT count() FROM tubi_relate GROUP ALL; SELECT count() FROM aabb GROUP ALL; SELECT count() FROM trans GROUP ALL;
-SELECT count() FROM inst_geo GROUP ALL; SELECT count() FROM inst_info GROUP ALL; SELECT count() FROM inst_relate GROUP ALL; SELECT count() FROM inst_relate_aabb GROUP ALL;
-SELECT count() FROM inst_relate_bool GROUP ALL; SELECT count() FROM inst_relate_cata_bool GROUP ALL; SELECT count() FROM geo_relate GROUP ALL; SELECT count() FROM ngmr_relate GROUP ALL;
-SELECT count() FROM neg_relate GROUP ALL; SELECT count() FROM tubi_info GROUP ALL; SELECT count() FROM tubi_relate GROUP ALL; SELECT count() FROM aabb GROUP ALL; SELECT count() FROM trans GROUP ALL;
-SELECT * FROM inst_relate LIMIT 5;
-SELECT * FROM inst_relate LIMIT 10;
-SELECT * FROM inst_relate LIMIT 3;
-SELECT id, in, out, owner_refno, owner_type, generic FROM inst_relate;
-SELECT id, d FROM inst_info LIMIT 5;
-SELECT id, d FROM inst_info WHERE d != NONE LIMIT 5;
-SELECT * FROM inst_info LIMIT 2;
-SELECT * FROM inst_geo LIMIT 2;
-SELECT * FROM geo_relate LIMIT 3;
-SELECT * FROM tubi_relate LIMIT 3;
-SELECT * FROM aabb LIMIT 3;
-SELECT * FROM trans LIMIT 2;
-SELECT id, in, out, geo, aabb, world_trans, start_pt, end_pt, bore_size, bad FROM tubi_relate;
-SELECT count() FROM inst_info WHERE id IN (SELECT out FROM inst_relate) GROUP ALL;
-SELECT out FROM inst_relate GROUP BY out;
-SELECT * FROM pe:24381_145018;
-LET $pes = [pe:`24381_145022`,pe:`24381_145024`,pe:`24381_145027`,pe:`24381_145028`,pe:`24381_145029`,pe:`24381_145030`,pe:`24381_145032`,pe:`24381_145034`,pe:`24381_145035`];
-LET $infos = [inst_info:⟨24381_145022⟩,inst_info:⟨24381_145024⟩,inst_info:⟨24381_145027⟩,inst_info:⟨24381_145028⟩,inst_info:⟨24381_145029⟩,inst_info:⟨24381_145030⟩,inst_info:⟨24381_145032⟩,inst_info:⟨24381_145034⟩,inst_info:⟨24381_145035⟩];
-SELECT count() AS inst_relate_cnt FROM inst_relate WHERE in IN $pes;
-SELECT count() AS inst_info_cnt FROM inst_info WHERE id IN $infos;
-SELECT count() AS geo_relate_cnt FROM geo_relate WHERE in IN $infos;
-SELECT count() AS inst_relate_aabb_cnt FROM inst_relate_aabb WHERE in IN $pes;
-LET $pes = [pe:`24381_145022`,pe:`24381_145024`,pe:`24381_145027`,pe:`24381_145028`,pe:`24381_145029`,pe:`24381_145030`,pe:`24381_145032`,pe:`24381_145034`,pe:`24381_145035`];
-LET $infos = [inst_info:`24381_145022`,inst_info:`24381_145024`,inst_info:`24381_145027`,inst_info:`24381_145028`,inst_info:`24381_145029`,inst_info:`24381_145030`,inst_info:`24381_145032`,inst_info:`24381_145034`,inst_info:`24381_145035`];
-SELECT count() AS cnt FROM inst_relate WHERE in IN $pes GROUP ALL;
-SELECT count() AS cnt FROM inst_info WHERE id IN $infos GROUP ALL;
-SELECT count() AS cnt FROM geo_relate WHERE in IN $infos GROUP ALL;
-SELECT count() AS cnt FROM inst_relate_aabb WHERE in IN $pes GROUP ALL;
-SELECT VALUE id FROM inst_info LIMIT 5;
-LET $pes = [pe:`24381_145022`,pe:`24381_145024`,pe:`24381_145027`,pe:`24381_145028`,pe:`24381_145029`,pe:`24381_145030`,pe:`24381_145032`,pe:`24381_145034`,pe:`24381_145035`];
-LET $outs = (SELECT VALUE out FROM inst_relate WHERE in IN $pes);
-SELECT count() AS inst_info_cnt FROM inst_info WHERE id IN $outs GROUP ALL;
-SELECT count() AS geo_relate_cnt FROM geo_relate WHERE in IN $outs GROUP ALL;
-SELECT VALUE id FROM inst_info WHERE id IN $outs LIMIT 3;
-LET $pes = [pe:`24381_145022`,pe:`24381_145024`,pe:`24381_145027`,pe:`24381_145028`,pe:`24381_145029`,pe:`24381_145030`,pe:`24381_145032`,pe:`24381_145034`,pe:`24381_145035`];
-SELECT record::id(in) AS in_id, record::id(out) AS out_id FROM inst_relate WHERE in IN $pes;
-SELECT * FROM inst_info:`273164669750072258`;
-SELECT record::id(in) AS inst_info_id, record::id(out) AS inst_geo_id FROM geo_relate WHERE in = inst_info:`273164669750072258` LIMIT 5;
-SELECT * FROM geo_relate LIMIT 1;
-LET $pes = [pe:`24381_145022`,pe:`24381_145024`,pe:`24381_145027`,pe:`24381_145028`,pe:`24381_145029`,pe:`24381_145030`,pe:`24381_145032`,pe:`24381_145034`,pe:`24381_145035`];
-SELECT in, record::id(in) AS inst_info_id, count() AS geo_cnt FROM geo_relate WHERE in IN (SELECT VALUE out FROM inst_relate WHERE in IN $pes) GROUP BY in;
-LET $pes = [pe:`24381_145022`,pe:`24381_145024`,pe:`24381_145027`,pe:`24381_145028`,pe:`24381_145029`,pe:`24381_145030`,pe:`24381_145032`,pe:`24381_145034`,pe:`24381_145035`];
-LET $infos = (SELECT VALUE out FROM inst_relate WHERE in IN $pes);
-SELECT count() AS geo_total FROM geo_relate WHERE in IN $infos GROUP ALL;
-SELECT count() AS geo_missing_trans FROM geo_relate WHERE in IN $infos AND trans.d = NONE GROUP ALL;
-LET $pes = [pe:`24381_145022`,pe:`24381_145024`,pe:`24381_145027`,pe:`24381_145028`,pe:`24381_145029`,pe:`24381_145030`,pe:`24381_145032`,pe:`24381_145034`,pe:`24381_145035`];
-LET $infos = (SELECT VALUE out FROM inst_relate WHERE in IN $pes);
-SELECT count() AS geo_missing_param FROM geo_relate WHERE in IN $infos AND out.param = NONE GROUP ALL;
-SELECT count() AS tubi_total FROM tubi_relate:[pe:24381_145018, 0]..[pe:24381_145018, ..] GROUP ALL;
-SELECT count() AS tubi_missing_world_trans FROM tubi_relate:[pe:24381_145018, 0]..[pe:24381_145018, ..] WHERE world_trans.d = NONE GROUP ALL;
-SELECT count() AS tubi_missing_aabb FROM tubi_relate:[pe:24381_145018, 0]..[pe:24381_145018, ..] WHERE aabb.d = NONE GROUP ALL;
-SELECT count() AS tubi_missing_pts FROM tubi_relate:[pe:24381_145018, 0]..[pe:24381_145018, ..] WHERE start_pt.d = NONE OR end_pt.d = NONE OR arrive_axis.d = NONE OR leave_axis.d = NONE GROUP ALL;
-SELECT record::id(in) AS leave, record::id(start_pt) AS start_id, start_pt.d AS start_d, record::id(arrive_axis) AS arrive_id, arrive_axis.d AS arrive_d FROM tubi_relate:[pe:24381_145018, 0]..[pe:24381_145018, ..] LIMIT 3;
-SELECT count() AS miss_start_end FROM tubi_relate:[pe:24381_145018, 0]..[pe:24381_145018, ..] WHERE start_pt.d = NONE OR end_pt.d = NONE GROUP ALL;
-SELECT count() AS miss_arrive_axis FROM tubi_relate:[pe:24381_145018, 0]..[pe:24381_145018, ..] WHERE arrive_axis != vec3:⟨0⟩ AND arrive_axis.d = NONE GROUP ALL;
-SELECT count() AS miss_leave_axis FROM tubi_relate:[pe:24381_145018, 0]..[pe:24381_145018, ..] WHERE leave_axis != vec3:⟨0⟩ AND leave_axis.d = NONE GROUP ALL;
-SELECT count() AS tubi_info_cnt FROM tubi_info WHERE string::contains(record::id(id), '24381_145018') GROUP ALL;
-SELECT VALUE record::id(id) FROM tubi_info WHERE string::contains(record::id(id), '24381_145018') LIMIT 5;
-SELECT * FROM tubi_info LIMIT 1;
-SELECT count() AS c1 FROM tubi_info WHERE string::starts_with(record::id(id), '13648074980233081144_') GROUP ALL;
-SELECT count() AS c2 FROM tubi_info WHERE string::starts_with(record::id(id), '14009272945149862748_') GROUP ALL;
-SELECT count() AS c3 FROM tubi_info WHERE string::starts_with(record::id(id), '273164669750072258_') GROUP ALL;
-SELECT count() AS c4 FROM tubi_info WHERE string::starts_with(record::id(id), '3691487179807065189_') GROUP ALL;
-LET $pes = [pe:`24381_145022`,pe:`24381_145024`,pe:`24381_145027`,pe:`24381_145028`,pe:`24381_145029`,pe:`24381_145030`,pe:`24381_145032`,pe:`24381_145034`,pe:`24381_145035`];
-LET $infos = (SELECT VALUE out FROM inst_relate WHERE in IN $pes);
-SELECT count() AS geo_distinct FROM (SELECT out FROM geo_relate WHERE in IN $infos GROUP BY out) GROUP ALL;
-LET $pes = [pe:`24381_145022`,pe:`24381_145024`,pe:`24381_145027`,pe:`24381_145028`,pe:`24381_145029`,pe:`24381_145030`,pe:`24381_145032`,pe:`24381_145034`,pe:`24381_145035`];
-SELECT count() AS neg_cnt FROM neg_relate WHERE out IN $pes GROUP ALL;
-SELECT count() AS ngmr_cnt FROM ngmr_relate WHERE out IN $pes GROUP ALL;
-RETURN count((SELECT id FROM tubi_relate:[pe:24381_145018, 0]..[pe:24381_145018, ..] WHERE world_trans.d = NONE));
-RETURN count((SELECT id FROM tubi_relate:[pe:24381_145018, 0]..[pe:24381_145018, ..] WHERE aabb.d = NONE));
-RETURN count((SELECT id FROM geo_relate WHERE in IN (SELECT VALUE out FROM inst_relate WHERE in = pe:`24381_145022`) AND trans.d = NONE));
-RETURN count((SELECT id FROM tubi_relate:[pe:24381_145018, 0]..[pe:24381_145018, ..] WHERE start_pt.d = NONE OR end_pt.d = NONE));
-RETURN count((SELECT id FROM tubi_info WHERE string::starts_with(record::id(id), '13648074980233081144_')));
-INFO FOR ROOT;
-USE NS 1516; INFO FOR NS;
-USE NS '1516'; USE DB 'AvevaMarineSample'; INFO FOR DB;
-USE NS '1516'; USE DB 'AvevaMarineSample'; INFO FOR TABLE pe_transform;
-INFO FOR DB;
-SELECT count() AS total FROM pe_7997 GROUP ALL;
-SELECT count() AS with_inst FROM pe_7997 WHERE inst_relate_id != NONE GROUP ALL;
-SELECT count() AS bran FROM pe_7997 WHERE noun='BRAN' GROUP ALL;
-SELECT count() AS hang FROM pe_7997 WHERE noun='HANG' GROUP ALL;
-SELECT * FROM pe_7997 LIMIT 1;
-SELECT * FROM inst_relate LIMIT 1;
-SELECT count() AS inst_cnt FROM inst_relate WHERE string::starts_with(<string> id, 'inst_relate:`24381_') OR string::starts_with(<string> id, 'inst_relate:`16189_') GROUP ALL;
-SELECT count() AS tubi_cnt FROM tubi_relate WHERE string::starts_with(<string> id, 'tubi_relate:[pe:`24381_') OR string::starts_with(<string> id, 'tubi_relate:[pe:`16189_') GROUP ALL;
-SELECT count() AS inst_cnt FROM inst_relate WHERE string::starts_with(<string> id, 'inst_relate:`24381_') OR string::starts_with(<string> id, 'inst_relate:`16189_') GROUP ALL;
-SELECT count() AS tubi_cnt FROM tubi_relate WHERE string::starts_with(<string> id, 'tubi_relate:[pe:`24381_') OR string::starts_with(<string> id, 'tubi_relate:[pe:`16189_') GROUP ALL;
-SELECT count() AS pe_cnt FROM pe_7997 GROUP ALL;
-SELECT id, refno, name, aabb, bbox, geo_hash, mesh_url FROM aios_entity WHERE refno = '24381_145018' OR refno = '24381/145018';
-INFO FOR DB;
-SELECT id, refno, type, geo_hash, status FROM inst_node WHERE refno = '24381/145018' OR refno = '24381_145018' OR id = inst_node:⟨24381_145018⟩ OR id = inst_node:⟨24381/145018⟩;
-SELECT refno, name FROM scene_node WHERE refno = '24381_145018' OR refno = '24381/145018' LIMIT 5;
+-- 3a. 同库中有 CATR 的 FITT 示例
+SELECT id, noun, CATR, SPRE FROM pe WHERE noun = 'FITT' AND CATR != NONE LIMIT 5;
+-- 3b. 同库中有 SPRE 的 FITT 示例
+SELECT id, noun, CATR, SPRE FROM pe WHERE noun = 'FITT' AND SPRE != NONE LIMIT 5;
+-- 3c. 统计 FITT 中 CATR/SPRE 为空的数量
+SELECT count() as total FROM pe WHERE noun = 'FITT';
+SELECT count() as catr_null FROM pe WHERE noun = 'FITT' AND CATR IS NONE;
+SELECT count() as spre_null FROM pe WHERE noun = 'FITT' AND SPRE IS NONE;
+-- 3d. 查看这些元素的全部字段（取一个代表）
+SELECT * FROM pe:⟨17496_106029⟩;
+-- 4a. 有 CATR 的 FITT 示例（其他 dbnum）
+SELECT id, noun, dbnum, CATR, SPRE FROM pe WHERE noun = 'FITT' AND CATR != NONE LIMIT 3;
+-- 4b. 按 dbnum 统计 FITT 有/无 CATR
+SELECT dbnum, count() as cnt, array::group(CATR != NONE) as has_catr FROM pe WHERE noun = 'FITT' GROUP BY dbnum;
+-- 4c. 查看 STWALL 的情况
+SELECT id, noun, dbnum, CATR, SPRE FROM pe WHERE noun = 'STWALL' LIMIT 5;
+-- 5a. 用户说的正确路径
+SELECT refno.SPRE.refno.CATR FROM pe:⟨17496_106029⟩;
+-- 5b. query_single_by_paths 实际生成的 SQL
+(select value refno.* from (select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩) where id != none)[0];
+-- 5c. query_catr_via_sql 实际生成的 SQL
+select value array::first(array::flatten([    refno.CATR.refno.CATR[where noun in ["SCOM", "SPRF", "SFIT", "JOIN", "SPCO"]],    refno.CATR.refno.PRTREF.refno.CATR[where noun in ["SCOM", "SPRF", "SFIT", "JOIN", "SPCO"]],    refno.CATR[where noun in ["SCOM", "SPRF", "SFIT", "JOIN", "SPCO"]]]))from only pe:⟨17496_106029⟩ limit 1;
+-- 5d. 中间步骤验证
+SELECT refno.SPRE FROM pe:⟨17496_106029⟩;
+SELECT refno.SPRE.refno FROM pe:⟨17496_106029⟩;
+SELECT refno.SPRE.refno.CATR FROM pe:⟨17496_106029⟩;
+SELECT refno.SPRE.refno.CATR.refno FROM pe:⟨17496_106029⟩;
+-- Step1: 内层子查询 - 两个路径返回什么
+select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩;
+-- Step2: where id != none 过滤后
+-- A: 直接用 record ID 数组测试 refno.*
+select value refno.* from [pe:⟨13244_50221⟩, pe:⟨13244_47129⟩] where id != none;
+-- B: 从子查询的结果做 refno.* 展开
+select value refno.* from (select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩) where id != none;
+-- C: 完整 SQL（query_single_by_paths 原样）
+(select value refno.* from (select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩) where id != none)[0];
+-- D: 测试子查询的 where id != none 是否兼容
+select id from (select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩);
+-- E: 不带 where，直接展开
+select value refno.* from (select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩);
+-- F: 简化测试 - 从 pe record 取 refno.*
+select value refno.* from pe:⟨13244_50221⟩;
+-- 方案: 用 LET 解决子查询嵌套问题
+LET $ids = (select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩);
+(select value refno.* from $ids where id != none)[0];
+-- 方案A: LET + 取 index=1
+LET $ids = (select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩);
+(select value refno.* from $ids where id != none)[0];
+-- 方案B: 单条 SQL，用 array::flatten 消除嵌套
+(select value refno.* from array::flatten((select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩)) where id != none)[0];
+-- 检查 inst_relate 是否有数据
+SELECT id, in, out FROM inst_relate WHERE in = pe:⟨17496_106028⟩ OR in = pe:⟨17496_106029⟩ OR in = pe:⟨17496_106030⟩ LIMIT 10;
+-- 检查 inst_relate_bool 状态
+SELECT id, refno, status FROM inst_relate_bool WHERE refno IN [pe:⟨17496_106028⟩, pe:⟨17496_106029⟩] LIMIT 5;
+-- A: inst_relate 全部子元素
+SELECT id, in, out, in.world_trans != NONE as has_wt FROM inst_relate:⟨17496_106028⟩, inst_relate:⟨17496_106029⟩, inst_relate:⟨17496_106030⟩, inst_relate:⟨17496_142305⟩, inst_relate:⟨17496_142306⟩, inst_relate:⟨17496_125330⟩;
+-- B: Path B 的完整查询（模拟 query_insts_with_batch）
+SELECT in.id as refno, in.world_trans as world_trans, (SELECT trans.d as transform, record::id(out) as geo_hash, out.unit_flag ?? false as unit_flag FROM out->geo_relate WHERE visible && out.meshed && (trans.d ?? NONE) != NONE && geo_type IN ['Pos', 'DesiPos', 'CatePos']) as insts FROM inst_relate:⟨17496_106028⟩, inst_relate:⟨17496_106029⟩ WHERE in.world_trans != NONE;
+-- A: inst_relate 的 out (inst_info) 指向什么
+SELECT id, out FROM inst_relate:⟨17496_106028⟩;
+-- B: inst_info 记录内容
+SELECT * FROM inst_info:⟨75144747916844⟩;
+-- C: inst_info 的 geo_relate（不带过滤）
+SELECT * FROM inst_info:⟨75144747916844⟩->geo_relate;
+-- D: 用 out->geo_relate 方式查（模拟 Path B 子查询）
+SELECT trans.d as transform, record::id(out) as geo_hash, visible, out.meshed as meshed, geo_type FROM inst_relate:⟨17496_106028⟩.out->geo_relate;
+-- A: trans 原始值
+SELECT trans FROM inst_info:⟨75144747916844⟩->geo_relate;
+-- B: trans.d 是否存在
+SELECT trans.d FROM inst_info:⟨75144747916844⟩->geo_relate;
+-- C: 直接查 trans record
+SELECT * FROM trans:⟨14267194508439763708⟩;
+-- D: 完整 Path B 子查询（不带 trans.d 过滤）
+SELECT in.id as refno, (SELECT record::id(out) as geo_hash, visible, out.meshed as meshed, geo_type, trans.d as td FROM out->geo_relate WHERE visible && out.meshed && geo_type IN ['Pos', 'DesiPos', 'CatePos']) as insts FROM inst_relate:⟨17496_106028⟩ WHERE in.world_trans != NONE;
+-- E: 完整 Path B 子查询（带 trans.d 过滤）
+SELECT in.id as refno, (SELECT record::id(out) as geo_hash, trans.d as td FROM out->geo_relate WHERE visible && out.meshed && (trans.d ?? NONE) != NONE && geo_type IN ['Pos', 'DesiPos', 'CatePos']) as insts FROM inst_relate:⟨17496_106028⟩ WHERE in.world_trans != NONE;
+-- A: 嵌套子查询中 out 是什么？
+SELECT (SELECT out FROM out->geo_relate) as test FROM inst_relate:⟨17496_106028⟩;
+-- B: 直接用 inst_info record id 硬编码（绕过 out 作用域）
+SELECT * FROM inst_info:⟨75144747916844⟩->geo_relate WHERE visible && geo_type IN ['Pos', 'DesiPos', 'CatePos'];
+-- C: 用 $parent 引用外层的 out
+SELECT in.id as refno, (SELECT record::id(out) as geo_hash FROM $parent.out->geo_relate WHERE visible && geo_type IN ['Pos', 'DesiPos', 'CatePos']) as insts FROM inst_relate:⟨17496_106028⟩;
+-- D: 最简嵌套测试——子查询 FROM out->geo_relate 是否能解析
+SELECT (SELECT * FROM out->geo_relate) as gr FROM inst_relate:⟨17496_106028⟩;
+-- E: 直接链式访问（不用子查询）
+SELECT in.id as refno, out->geo_relate.* as geo_data FROM inst_relate:⟨17496_106028⟩;
+SELECT in as refno, (SELECT record::id(out) as geo_hash, out.meshed as meshed, out.unit_flag as unit_flag, geo_type, visible, (trans.d ?? NONE) != NONE as has_trans FROM $parent.out->geo_relate) as geos FROM inst_relate:17496_106028,inst_relate:17496_106029,inst_relate:17496_125330,inst_relate:17496_142305,inst_relate:17496_142306;
+SELECT * FROM inst_relate_bool:17496_106028;
+SELECT VALUE id FROM pe:17496_106028;
+LET $targets = [pe:`17496_142305`, pe:`17496_125330`];
+SELECT id, geo_type, visible, geom_refno, out FROM inst_info:75144747936146->geo_relate ORDER BY geo_type, id;
+SELECT id, geo_type, visible, geom_refno, out FROM inst_info:75144747953121->geo_relate ORDER BY geo_type, id;
+SELECT VALUE id FROM pe:17496_106028;
+SELECT id, in, geo_type, visible, geom_refno, out FROM geo_relate WHERE in = inst_info:75144747936146 ORDER BY geo_type, id;
+SELECT id
+SELECT VALUE count() FROM geo_relate GROUP ALL;
+SELECT id, in, out, geo_type, visible, geom_refno FROM geo_relate LIMIT 20;
+SELECT id, in, geo_type, geom_refno, out, visible FROM geo_relate WHERE geo_type = 'CatePos' AND in IN [inst_info:75144747953122, inst_info:75144747953121, inst_info:75144747936146] ORDER BY in, id;
+SELECT id, in, geo_type, geom_refno, out, visible FROM geo_relate WHERE in IN [inst_info:75144747953122, inst_info:75144747953121, inst_info:75144747936146] AND geo_type = 'CatePos' ORDER BY in, id;
+SELECT id, in, geo_type, geom_refno, out, visible FROM geo_relate LIMIT 50;

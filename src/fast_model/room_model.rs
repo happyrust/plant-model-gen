@@ -104,7 +104,7 @@ static ROOM_CALC_CONFIG: std::sync::OnceLock<RoomCalcEnvConfig> = std::sync::Onc
 
 fn resolve_room_calc_env_config(db_option: &DbOption) -> RoomCalcEnvConfig {
 
-    let cache_dir = env::var("FOYER_CACHE_DIR")
+    let cache_dir = env::var("MODEL_CACHE_DIR")
 
         .ok()
 
@@ -186,7 +186,7 @@ fn get_room_calc_config() -> RoomCalcEnvConfig {
 
     // Fallback: if init_room_calc_config not called, derive reasonable defaults from env
 
-    let cache_dir = env::var("FOYER_CACHE_DIR")
+    let cache_dir = env::var("MODEL_CACHE_DIR")
 
         .ok()
 
@@ -430,7 +430,7 @@ fn append_room_calc_missing_refnos(
 
 #[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "pregen_panels_cache"))]
 
-async fn pregen_room_panels_into_foyer_cache(
+async fn pregen_room_panels_into_model_cache(
 
     db_option: &DbOption,
 
@@ -482,7 +482,7 @@ async fn pregen_room_panels_into_foyer_cache(
 
         anyhow::anyhow!(
 
-            "房间计算无法加载 db_meta_info.json（需要 ref0->cache_dbnum 映射以写入 foyer cache）: {}",
+            "房间计算无法加载 db_meta_info.json（需要 ref0->cache_dbnum 映射以写入 model cache）: {}",
 
             e
 
@@ -492,7 +492,7 @@ async fn pregen_room_panels_into_foyer_cache(
 
 
 
-    let cache_dir = env::var("FOYER_CACHE_DIR")
+    let cache_dir = env::var("MODEL_CACHE_DIR")
 
         .ok()
 
@@ -549,9 +549,9 @@ async fn pregen_room_panels_into_foyer_cache(
 
 
 
-    // 复用既有 foyer cache 定向生成流程（manual_refnos 路径）。
+    // 复用既有 model cache 定向生成流程（manual_refnos 路径）。
 
-    // 注意：这里“不把模型写回 SurrealDB(inst_*/geo_*)”，只写 foyer cache + mesh + sqlite 索引（若启用）。
+    // 注意：这里“不把模型写回 SurrealDB(inst_*/geo_*)”，只写 model cache + mesh + sqlite 索引（若启用）。
 
     let mut opt = DbOptionExt::from(db_option.clone());
 
@@ -577,7 +577,7 @@ async fn pregen_room_panels_into_foyer_cache(
 
     // 手动 refnos 可能跨 dbnum：确保 db_meta 路径与 cache_dir 一致。
 
-    opt.foyer_cache_dir = Some(cache_dir.to_string_lossy().to_string());
+    opt.model_cache_dir = Some(cache_dir.to_string_lossy().to_string());
 
 
 
@@ -589,7 +589,7 @@ async fn pregen_room_panels_into_foyer_cache(
 
     info!(
 
-        "房间计算：检测到 {} 个 panel 缺失模型数据，开始定向补齐（写 foyer cache）",
+        "房间计算：检测到 {} 个 panel 缺失模型数据，开始定向补齐（写 model cache）",
 
         missing.len()
 
@@ -1119,7 +1119,7 @@ pub async fn build_room_relations_with_cancel(
 
     ))]
 
-    pregen_room_panels_into_foyer_cache(db_option, &room_panel_map).await?;
+    pregen_room_panels_into_model_cache(db_option, &room_panel_map).await?;
 
 
 
@@ -2211,9 +2211,9 @@ async fn cal_room_refnos_with_options(
 
 
 
-    // cache 缺失面板模型数据：在房间计算流程内按需补齐（复用 foyer cache 定向生成流程）。
+    // cache 缺失面板模型数据：在房间计算流程内按需补齐（复用 model cache 定向生成流程）。
 
-    // 注意：内层自动补齐逻辑已移除——面板 cache 应在外层 pregen_room_panels_into_foyer_cache 统一预生成。
+    // 注意：内层自动补齐逻辑已移除——面板 cache 应在外层 pregen_room_panels_into_model_cache 统一预生成。
 
     #[cfg(all(
 
@@ -2231,7 +2231,7 @@ async fn cal_room_refnos_with_options(
 
         let tmp = vec![(RefnoEnum::default(), String::new(), vec![panel_refno])];
 
-        if let Err(e) = pregen_room_panels_into_foyer_cache(&db_opt, &tmp).await {
+        if let Err(e) = pregen_room_panels_into_model_cache(&db_opt, &tmp).await {
 
             warn!("房间计算自动补齐 panel 模型失败: panel={}, err={}", panel_refno, e);
 
@@ -5521,7 +5521,7 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
 
     ))]
 
-    pregen_room_panels_into_foyer_cache(db_option, &room_panel_map).await?;
+    pregen_room_panels_into_model_cache(db_option, &room_panel_map).await?;
 
 
 
@@ -6131,7 +6131,7 @@ pub async fn rebuild_room_relations_for_rooms(
 
     ))]
 
-    pregen_room_panels_into_foyer_cache(db_option, &room_panel_map).await?;
+    pregen_room_panels_into_model_cache(db_option, &room_panel_map).await?;
 
 
 
@@ -6172,4 +6172,7 @@ pub async fn rebuild_room_relations_for_rooms(
     Ok(stats)
 
 }
+
+
+
 

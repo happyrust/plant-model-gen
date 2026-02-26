@@ -21,7 +21,7 @@ use std::mem::take;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
-use crate::fast_model::foyer_cache::geom_input_cache::LoopInput;
+// LoopInput 已随 model_cache 模块移除
 
 ///处理带有loop的元件
 pub async fn gen_loop_geos(
@@ -327,7 +327,8 @@ pub async fn gen_loop_geos(
     Ok(true)
 }
 
-/// cache-only：基于预取的 `LoopInput` 直接生成 loop 几何（不访问 SurrealDB）。
+// [foyer-removal] cache-only 函数已禁用，LoopInput 类型已随 model_cache 移除
+/*
 pub async fn gen_loop_geos_from_inputs(
     db_option: Arc<DbOptionExt>,
     loop_inputs: std::collections::HashMap<RefnoEnum, LoopInput>,
@@ -531,3 +532,5 @@ pub async fn gen_loop_geos_from_inputs(
     }
     Ok(true)
 }
+*/
+

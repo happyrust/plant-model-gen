@@ -1,4 +1,4 @@
-//! foyer cache 专用的几何生成模块
+//! model cache 专用的几何生成模块
 //!
 //! 将 CATA、BRAN/HANG、tubi 三个阶段分离：
 //! 1. `gen_cata_geos_for_cache` - CATA 几何生成，不收集 tubi 相关信息
@@ -7,7 +7,7 @@
 
 use crate::fast_model::gen_model::cate_single::{CateCsgShapeMap, gen_cata_single_geoms};
 use crate::fast_model::gen_model::utilities::is_valid_cata_hash;
-use crate::fast_model::foyer_cache::cata_resolve_cache::{CataResolvedComp, PreparedInstGeo};
+use crate::fast_model::model_cache::cata_resolve_cache::{CataResolvedComp, PreparedInstGeo};
 use crate::fast_model::instance_cache::InstanceCacheManager;
 use crate::fast_model::refno_errors::{RefnoErrorKind, RefnoErrorStage, record_refno_error};
 use crate::fast_model::{SEND_INST_SIZE, shared};
@@ -31,7 +31,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::fast_model::cata_model::BranchTubiOutcome;
 
-/// foyer cache 专用的简化 CATA 输出结构
+/// model cache 专用的简化 CATA 输出结构
 #[derive(Debug, Default)]
 pub struct SimpleCataOutcome {
     pub time_stats: HashMap<String, u64>,
@@ -39,7 +39,7 @@ pub struct SimpleCataOutcome {
     pub elapsed_ms: u128,
 }
 
-/// foyer cache 专用的简化 BRAN 输出结构
+/// model cache 专用的简化 BRAN 输出结构
 #[derive(Debug, Default)]
 pub struct SimpleBranOutcome {
     pub time_stats: HashMap<String, u64>,
@@ -132,7 +132,7 @@ fn build_prepared_inst_geos_from_shapes(shapes: Vec<CateCsgShape>) -> (Vec<Prepa
     (out, has_solid)
 }
 
-/// foyer cache 专用：仅生成 CATA 几何体，不收集 tubi 相关信息
+/// model cache 专用：仅生成 CATA 几何体，不收集 tubi 相关信息
 ///
 /// 与 `gen_cata_instances` 的区别：
 /// - 不创建 `tubi_info_map`
@@ -417,7 +417,7 @@ pub async fn gen_cata_geos_for_cache(
     })
 }
 
-/// foyer cache 专用：仅生成 BRAN/HANG 几何体，不生成 tubi
+/// model cache 专用：仅生成 BRAN/HANG 几何体，不生成 tubi
 ///
 /// 与 `gen_branch_tubi` 的区别：
 /// - 只处理 BRAN/HANG 的基本几何信息
@@ -602,9 +602,9 @@ pub async fn gen_bran_geos_for_cache(
     })
 }
 
-/// foyer cache 专用：在所有 BRAN 模型生成完成后，单独遍历 BRAN 生成 tubi
+/// model cache 专用：在所有 BRAN 模型生成完成后，单独遍历 BRAN 生成 tubi
 ///
-/// 从 foyer cache 获取点数据来生成 tubi（不依赖 SurrealDB）：
+/// 从 model cache 获取点数据来生成 tubi（不依赖 SurrealDB）：
 /// 1. 使用 `InstanceCacheManager::get_ptset_maps_for_refnos` 获取 ARRIVE/LEAVE 点
 /// 2. 遍历 BRAN/HANG 的子元件，基于 cache 中的点数据生成 tubi
 pub async fn gen_tubi_for_cache(
@@ -616,7 +616,7 @@ pub async fn gen_tubi_for_cache(
     // 兼容入口：内部自建 InstanceCacheManager。
     // 若调用方（如 orchestrator）已持有缓存管理器，请优先使用 `gen_tubi_for_cache_with_cache_manager`，
     // 以避免重复打开/加载 index。
-    let cache_dir = db_option.get_foyer_cache_dir();
+    let cache_dir = db_option.get_model_cache_dir();
     let cache_manager = InstanceCacheManager::new(&cache_dir).await?;
     gen_tubi_for_cache_with_cache_manager(
         db_option,
@@ -679,14 +679,20 @@ pub async fn gen_tubi_for_cache_with_cache_manager(
         }
     }
 
-    // 2. 从 foyer cache 获取 ARRIVE/LEAVE 点数据
-    let local_al_map: Arc<DashMap<RefnoEnum, [CateAxisParam; 2]>> = Arc::new(
-        cache_manager
+    // 2. 从 model cache 获取 ARRIVE/LEAVE 点数据
+    let local_al_map: Arc<DashMap<RefnoEnum, [CateAxisParam; 2]>> = Arc::new({
+        let hm = cache_manager
             .get_ptset_maps_for_refnos_auto(&all_child_refnos)
-            .await
-            .into_iter()
-            .collect(),
-    );
+            .await;
+        let dm = DashMap::new();
+        for (k, btree) in hm {
+            let items: Vec<CateAxisParam> = btree.into_values().collect();
+            if items.len() >= 2 {
+                dm.insert(k, [items[0].clone(), items[1].clone()]);
+            }
+        }
+        dm
+    });
 
     debug_model!(
         "[gen_tubi_for_cache] 从 cache 获取到 {} 个元件的 arrive/leave 点",
@@ -712,3 +718,5 @@ pub async fn gen_tubi_for_cache_with_cache_manager(
 
     Ok(outcome)
 }
+
+

@@ -42,7 +42,7 @@ use crate::data_interface::increment_record::IncrGeoUpdateLog;
 
 use crate::data_interface::sesno_increment::get_changes_at_sesno;
 
-use crate::fast_model::capture::capture_refnos_if_enabled;
+// use crate::fast_model::capture::capture_refnos_if_enabled; // removed on foyer-cache-cleanup
 
 use crate::data_interface::db_meta_manager::db_meta;
 
@@ -366,8 +366,8 @@ pub async fn gen_all_geos_data(
     perf.mark("init");
 
     // cache-first 缺失报告：生成过程中按需补充记录，结束时输出到 output/<project>/cache_miss_report.json
-    let cache_run_mode = crate::fast_model::foyer_cache::geom_input_cache::resolve_cache_run_mode();
-    cache_miss_report::init_global_cache_miss_report(db_option, cache_run_mode.as_str());
+    // cache-first 模式已移除（foyer-cache-cleanup），使用 Direct 模式
+    cache_miss_report::init_global_cache_miss_report(db_option, "Direct");
 
     let mut final_incr_updates = incr_updates;
 
@@ -560,23 +560,8 @@ pub async fn gen_all_geos_data(
 
     // =========================
 
-    {
-        use crate::fast_model::foyer_cache::geom_input_cache;
-
-        let cache_run_mode = geom_input_cache::resolve_cache_run_mode();
-        println!(
-            "[gen_model] geom_input_cache 运行模式: {}",
-            cache_run_mode.as_str()
-        );
-
-        if !matches!(cache_run_mode, geom_input_cache::CacheRunMode::Direct) {
-            geom_input_cache::init_global_geom_input_cache();
-            println!(
-                "[gen_model] geom_input_cache 已初始化 (mode={})",
-                cache_run_mode.as_str()
-            );
-        }
-    }
+    // geom_input_cache 已移除（foyer-cache-cleanup），跳过缓存初始化
+    println!("[gen_model] geom_input_cache: Direct 模式（cache 已移除）");
 
 
 
@@ -799,6 +784,7 @@ async fn process_index_tree_generation(
         })
         .unwrap_or(false);
 
+    // ParquetStreamWriter 需要 parquet-export feature
     #[cfg(feature = "parquet-export")]
     let parquet_writer = if enable_parquet_stream_writer {
         let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
@@ -825,9 +811,8 @@ async fn process_index_tree_generation(
         );
         None
     };
-
     #[cfg(not(feature = "parquet-export"))]
-    let parquet_writer: Option<()> = None;
+    let parquet_writer: Option<std::sync::Arc<()>> = None;
 
     #[cfg(feature = "duckdb-feature")]
 
@@ -863,7 +848,7 @@ async fn process_index_tree_generation(
 
     */
 
-    #[cfg(feature = "parquet-export")]
+    #[allow(unused_variables)]
     let parquet_writer_clone = parquet_writer.clone();
 
     #[cfg(feature = "duckdb-feature")]
@@ -872,11 +857,10 @@ async fn process_index_tree_generation(
 
 
 
-    // foyer cache-only 上下文：统一管理 cache_dir 与 InstanceCacheManager（并尽力预初始化 transform_cache）。
-
-    let foyer_cache_ctx = crate::fast_model::foyer_cache::FoyerCacheContext::try_from_db_option(db_option).await?;
-
-    let cache_manager_for_insert = foyer_cache_ctx.as_ref().map(|c| c.cache_arc());
+    // model cache-only 已移除（foyer-cache-cleanup）
+    let model_cache_ctx: Option<()> = None;
+    #[allow(unused_variables)]
+    let cache_manager_for_insert: Option<()> = None;
 
     let touched_dbnums: Arc<std::sync::Mutex<BTreeSet<u32>>> =
 
@@ -950,64 +934,13 @@ async fn process_index_tree_generation(
                 touched_refnos_for_insert.insert(*r);
             }
 
-            if let Some(ref cache_manager) = cache_manager_for_insert {
-                let t0 = Instant::now();
-
-                let by_dbnum = match split_shape_instances_by_dbnum(&shape_insts_arc).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("[cache] batch 拆分 dbnum 失败，跳过写 cache（继续后续写入）: {}", e);
-                        HashMap::new()
-                    }
-                };
-
-                if by_dbnum.len() > 1 {
-                    eprintln!(
-                        "[cache] ⚠️ batch 同时包含多个 dbnum，将按 dbnum 拆分写入: dbnums={:?}",
-                        by_dbnum.keys().collect::<Vec<_>>()
-                    );
-                }
-
-                if let Some(known) = known_dbnum {
-                    if let Some(sub) = by_dbnum.get(&known) {
-                        cache_manager.insert_from_shape(known, sub);
-                        let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(known));
-                    }
-                    // 其他 dbnum 的数据直接报警（manual_db_nums=单库时出现多库，属于上游 bug）
-                    for dbnum in by_dbnum.keys().copied() {
-                        if dbnum != known {
-                            eprintln!(
-                                "[cache] ⚠️ manual_db_nums 指定 dbnum={}，但 batch 内出现 dbnum={}，已忽略",
-                                known, dbnum
-                            );
-                        }
-                    }
-                } else {
-                    for (dbnum, sub) in by_dbnum {
-                        cache_manager.insert_from_shape(dbnum, &sub);
-                        let _ = touched_dbnums_for_insert.lock().map(|mut s| s.insert(dbnum));
-                    }
-                }
-
-                t_cache += t0.elapsed();
-            }
+            // [foyer-removal] cache_manager 已移除，跳过 insert_from_shape
+            let _ = &cache_manager_for_insert;
 
             // 同时写入 Parquet（如果启用）
 
-            #[cfg(feature = "parquet-export")]
-            if let Some(ref writer) = parquet_writer_clone {
-
-                let t0 = Instant::now();
-
-                if let Err(e) = writer.write_batch(&shape_insts_arc) {
-
-                    eprintln!("[Parquet] 写入批次失败: {}", e);
-
-                }
-
-                t_parquet += t0.elapsed();
-
-            }
+            // [foyer-removal] parquet_writer 已移除，跳过 write_batch
+            let _ = &parquet_writer_clone;
 
             #[cfg(feature = "duckdb-feature")]
 
@@ -1129,16 +1062,8 @@ async fn process_index_tree_generation(
 
     // 完成 Parquet 写入并合并文件
 
-    #[cfg(feature = "parquet-export")]
-    if let Some(ref writer) = parquet_writer {
-
-        if let Err(e) = writer.finalize() {
-
-            eprintln!("[Parquet] 合并文件失败: {}", e);
-
-        }
-
-    }
+    // [foyer-removal] parquet_writer 已移除，跳过 finalize
+    let _ = &parquet_writer;
 
     #[cfg(feature = "duckdb-feature")]
 
@@ -1200,42 +1125,8 @@ async fn process_index_tree_generation(
 
 
 
-        if let Some(ref ctx) = foyer_cache_ctx {
-
-            let mesh_dir = db_option.inner.get_meshes_path();
-
-            match crate::fast_model::foyer_cache::mesh::run_mesh_worker(
-
-                ctx,
-
-                &mesh_dir,
-
-                &db_option.inner.mesh_precision,
-
-                &db_option.mesh_formats,
-
-            )
-
-            .await
-
-            {
-
-                Ok(n) if n > 0 => {
-                    println!("[gen_model] mesh worker 缓存路径完成: {} 个", n);
-                    ran_primary = true;
-                }
-
-                Ok(_) => {
-                    println!("[gen_model] mesh worker 缓存路径: 0 个 mesh，回退 SurrealDB");
-                }
-
-                Err(e) => {
-                    eprintln!("[gen_model] mesh worker 缓存路径失败: {}", e);
-                }
-
-            }
-
-        }
+        // model_cache mesh worker 已移除（foyer-cache-cleanup）
+        let _ = &model_cache_ctx;
 
 
 
@@ -1355,17 +1246,7 @@ async fn process_index_tree_generation(
 
             println!("[gen_model] IndexTree 模式开始布尔运算（boolean worker）");
 
-            if let Some(ref ctx) = foyer_cache_ctx {
-
-                if let Err(e) = crate::fast_model::foyer_cache::boolean::run_boolean_worker(ctx).await
-
-                {
-
-                    eprintln!("[gen_model] IndexTree 缓存布尔运算失败: {}", e);
-
-                }
-
-            }
+            // model_cache boolean worker 已移除（foyer-cache-cleanup）
 
             if use_surrealdb {
 
@@ -1487,7 +1368,7 @@ async fn process_index_tree_generation(
 
 
 
-    // 4️⃣ 生成 SQLite 空间索引（从 foyer cache 批量落库）
+    // 4️⃣ 生成 SQLite 空间索引（从 model cache 批量落库）
 
     let touched_dbnums_vec: Vec<u32> = touched_dbnums
 
@@ -1570,15 +1451,7 @@ async fn process_index_tree_generation(
 
 
 
-    if let Some(ref ctx) = foyer_cache_ctx {
-
-        if let Err(e) = ctx.cache().close().await {
-
-            eprintln!("[cache] 关闭缓存失败: {}", e);
-
-        }
-
-    }
+    // model_cache close 已移除（foyer-cache-cleanup）
 
 
 
@@ -1682,7 +1555,7 @@ async fn process_index_tree_generation(
 
 // ============================================================================
 
-// SQLite 空间索引：从 foyer cache 生成/增量更新 output/spatial_index.sqlite
+// SQLite 空间索引：从 model cache 生成/增量更新 output/spatial_index.sqlite
 
 //
 
@@ -1774,7 +1647,7 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
 
     // mesh_lod_tag 仅用于导出侧选择 mesh（用于补齐/计算 AABB）
 
-    let cache_dir = db_option.get_foyer_cache_dir();
+    let cache_dir = db_option.get_model_cache_dir();
 
     let mesh_dir = db_option.inner.get_meshes_path();
 
@@ -1920,3 +1793,6 @@ mod tests {
         );
     }
 }
+
+
+

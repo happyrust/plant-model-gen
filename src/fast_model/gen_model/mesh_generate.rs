@@ -129,7 +129,7 @@ async fn query_pending_cata_boolean(
         String::new()
     } else {
         // 非覆盖模式下：跳过已成功写入 inst_relate_cata_bool 的实例，避免重复计算
-        "AND (SELECT status FROM inst_relate_cata_bool WHERE refno = in AND status = 'Success' LIMIT 1) = NONE"
+        "AND (SELECT status FROM $parent.out->inst_relate_cata_bool WHERE status = 'Success' LIMIT 1) = NONE"
             .to_string()
     };
 
@@ -493,37 +493,22 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
     Ok(())
 }
 
-/// 基于 foyer 缓存的 Mesh 生成 Worker（不访问 SurrealDB）
+// [foyer-removal] cache-only mesh worker 函数已禁用
+/*
 pub async fn run_mesh_worker_from_cache_manager(
     cache_manager: &crate::fast_model::instance_cache::InstanceCacheManager,
     mesh_dir: &Path,
     precision: &MeshPrecisionSettings,
     mesh_formats: &[MeshFormat],
-) -> anyhow::Result<usize> {
-    crate::fast_model::foyer_cache::mesh::run_mesh_worker_from_cache_manager(
-        cache_manager,
-        mesh_dir,
-        precision,
-        mesh_formats,
-    )
-    .await
-}
+) -> anyhow::Result<usize> { unimplemented!() }
 
-/// 基于 foyer 缓存的 Mesh 生成 Worker（不访问 SurrealDB）
 pub async fn run_mesh_worker_from_cache(
     cache_dir: &Path,
     mesh_dir: &Path,
     precision: &MeshPrecisionSettings,
     mesh_formats: &[MeshFormat],
-) -> anyhow::Result<usize> {
-    crate::fast_model::foyer_cache::mesh::run_mesh_worker_from_cache(
-        cache_dir,
-        mesh_dir,
-        precision,
-        mesh_formats,
-    )
-    .await
-}
+) -> anyhow::Result<usize> { unimplemented!() }
+*/
 
 /// 基于 inst_relate 状态的布尔运算 Worker
 ///
@@ -1520,3 +1505,5 @@ pub async fn update_scene_node_aabbs_by_refnos(
 
     Ok(())
 }
+
+

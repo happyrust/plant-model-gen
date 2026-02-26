@@ -546,8 +546,8 @@ pub async fn export_obj_for_refnos(
         unit_converter: UnitConverter::default(),
         use_basic_materials: false,
         include_negative: false,
-        allow_surrealdb: false,
-        cache_dir: Some(PathBuf::from("output/foyer_cache")),
+        allow_surrealdb: true,
+        cache_dir: None,
     };
 
     let PreparedObjExportData {
@@ -652,3 +652,4 @@ impl ModelExporter for ObjExporter {
         "OBJ"
     }
 }
+

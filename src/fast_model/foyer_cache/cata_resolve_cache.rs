@@ -1,24 +1,17 @@
-//! CATA `resolve_desi_comp` 产物缓存（按 cata_hash）
-//!
-//! 目标：将 CATE 元件库的"可复用几何准备结果"缓存到内存，避免后续运行重复调用
-//! `resolve_desi_comp -> try_convert -> unit 参数/scale 归一` 这一整段链路。
-//!
-//! 注意：
-//! - 缓存粒度：`cata_hash`（同组 design_refno 共享）。
-//! - 纯内存缓存，进程退出后丢失。
+//! [foyer-removal] 桩模块：cata_resolve_cache 已移除，此处仅提供编译兼容。
 
-use aios_core::geometry::GeoBasicType;
-use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
-use aios_core::parsed_data::CateAxisParam;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use aios_core::RefnoEnum;
 use aios_core::Transform;
+use aios_core::geometry::GeoBasicType;
+use aios_core::parsed_data::CateAxisParam;
+use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use dashmap::DashMap;
-use std::sync::OnceLock;
+use once_cell::sync::OnceCell;
 
-// ---------------------------------------------------------------------------
-// 对外数据结构
-// ---------------------------------------------------------------------------
-
+/// 预处理的实例几何信息（缓存用）
 #[derive(Clone, Debug)]
 pub struct PreparedInstGeo {
     pub geo_hash: u64,
@@ -32,6 +25,7 @@ pub struct PreparedInstGeo {
     pub unit_flag: bool,
 }
 
+/// 已解析的元件库组件（缓存用）
 #[derive(Clone, Debug)]
 pub struct CataResolvedComp {
     pub created_at: i64,
@@ -41,48 +35,41 @@ pub struct CataResolvedComp {
 }
 
 impl CataResolvedComp {
-    #[inline]
-    pub fn ptset_map(&self) -> std::collections::BTreeMap<i32, CateAxisParam> {
+    /// 将 ptset_items 转换为 BTreeMap
+    pub fn ptset_map(&self) -> BTreeMap<i32, CateAxisParam> {
         self.ptset_items.iter().cloned().collect()
     }
 }
 
-// ---------------------------------------------------------------------------
-// Cache Manager（纯内存 DashMap）
-// ---------------------------------------------------------------------------
-
-pub struct CataResolveCacheManager {
+/// 进程内 cata_resolve 缓存（桩实现）
+pub struct CataResolveCache {
     cache: DashMap<String, CataResolvedComp>,
 }
 
-impl CataResolveCacheManager {
+impl CataResolveCache {
     pub fn new() -> Self {
         Self {
             cache: DashMap::new(),
         }
     }
 
-    pub fn insert(&self, cata_hash: String, value: &CataResolvedComp) {
-        self.cache.insert(cata_hash, value.clone());
+    pub fn get(&self, key: &str) -> Option<CataResolvedComp> {
+        self.cache.get(key).map(|v| v.clone())
     }
 
-    pub fn get(&self, cata_hash: &str) -> Option<CataResolvedComp> {
-        self.cache.get(cata_hash).map(|v| v.clone())
+    pub fn insert(&self, key: String, value: &CataResolvedComp) {
+        self.cache.insert(key, value.clone());
     }
 }
 
-// ---------------------------------------------------------------------------
-// 全局缓存管理
-// ---------------------------------------------------------------------------
+static GLOBAL_CACHE: OnceCell<Arc<CataResolveCache>> = OnceCell::new();
 
-static GLOBAL_CATA_RESOLVE_CACHE: OnceLock<CataResolveCacheManager> = OnceLock::new();
-
-/// 初始化全局 cata_resolve_cache（幂等，仅首次生效）。
+/// 初始化全局 cata_resolve 缓存
 pub fn init_global_cata_resolve_cache() {
-    let _ = GLOBAL_CATA_RESOLVE_CACHE.get_or_init(|| CataResolveCacheManager::new());
+    let _ = GLOBAL_CACHE.set(Arc::new(CataResolveCache::new()));
 }
 
-/// 获取全局 cata_resolve_cache 引用（未初始化返回 None）。
-pub fn global_cata_resolve_cache() -> Option<&'static CataResolveCacheManager> {
-    GLOBAL_CATA_RESOLVE_CACHE.get()
+/// 获取全局 cata_resolve 缓存
+pub fn global_cata_resolve_cache() -> Option<Arc<CataResolveCache>> {
+    GLOBAL_CACHE.get().cloned()
 }

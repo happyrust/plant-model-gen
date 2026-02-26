@@ -48,7 +48,7 @@ pub struct CacheMissReport {
     pub generated_at: String,
     pub mode: String,
     pub project_name: String,
-    pub foyer_cache_dir: String,
+    pub model_cache_dir: String,
 
     /// 聚合 bucket：key = "{stage}:{kind}"
     pub buckets: BTreeMap<String, CacheMissBucket>,
@@ -70,7 +70,7 @@ impl CacheMissReport {
             generated_at: now.to_rfc3339(),
             mode: mode.into(),
             project_name: db_option.inner.project_name.clone(),
-            foyer_cache_dir: db_option.get_foyer_cache_dir().display().to_string(),
+            model_cache_dir: db_option.get_model_cache_dir().display().to_string(),
             buckets: BTreeMap::new(),
             sample_limit: DEFAULT_SAMPLE_LIMIT,
         }
@@ -158,3 +158,4 @@ pub fn with_global_report<R>(f: impl FnOnce(&mut CacheMissReport) -> R) -> Optio
 pub fn snapshot_global_report() -> Option<CacheMissReport> {
     with_global_report(|r| r.clone())
 }
+

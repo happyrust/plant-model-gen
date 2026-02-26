@@ -80,7 +80,7 @@ pub struct CommonExportConfig {
     /// - false: 使用缓存数据源（不回退 SurrealDB）
     pub allow_surrealdb: bool,
 
-    /// 当 `allow_surrealdb=false` 时使用的 foyer/instance_cache 目录。
+    /// 当 `allow_surrealdb=false` 时使用的 model/instance_cache 目录。
     pub cache_dir: Option<PathBuf>,
 }
 
@@ -93,7 +93,7 @@ impl Default for CommonExportConfig {
             unit_converter: UnitConverter::default(),
             use_basic_materials: false,
             include_negative: false,
-            allow_surrealdb: false,
+            allow_surrealdb: true,
             cache_dir: None,
         }
     }
@@ -115,7 +115,7 @@ impl CommonExportConfig {
             unit_converter: UnitConverter::new(source_unit, target_unit),
             use_basic_materials: false,
             include_negative: false,
-            allow_surrealdb: false,
+            allow_surrealdb: true,
             cache_dir: None,
         }
     }
@@ -490,11 +490,11 @@ pub async fn query_geometry_instances_ext(
     Ok(geom_insts)
 }
 
-/// 缓存路径：从 foyer/instance_cache 读取几何实例数据，构造与 SurrealDB `query_insts` 等价的 GeomInstQuery。
+/// 缓存路径：从 model/instance_cache 读取几何实例数据，构造与 SurrealDB `query_insts` 等价的 GeomInstQuery。
 ///
 /// 约定：该函数**不回退** SurrealDB；若缓存缺失则直接返回错误。
 ///
-/// 推荐：新代码优先从 `crate::fast_model::foyer_cache::query` 入口使用该能力（作为 cache-only 专区门面）。
+/// 推荐：新代码优先从 `crate::fast_model::model_cache::query` 入口使用该能力（作为 cache-only 专区门面）。
 pub async fn query_geometry_instances_ext_from_cache(
     refnos: &[RefnoEnum],
     cache_dir: &Path,
@@ -502,7 +502,7 @@ pub async fn query_geometry_instances_ext_from_cache(
     include_negative: bool,
     verbose: bool,
 ) -> Result<Vec<GeomInstQuery>> {
-    crate::fast_model::foyer_cache::query::query_geometry_instances_ext_from_cache(
+    crate::fast_model::model_cache::query::query_geometry_instances_ext_from_cache(
         refnos,
         cache_dir,
         enable_holes,
@@ -511,3 +511,5 @@ pub async fn query_geometry_instances_ext_from_cache(
     )
     .await
 }
+
+

@@ -11,6 +11,9 @@
 		},
 		{
 			"path": "../surrealdb"
+		},
+		{
+			"path": "../plant3d-web"
 		}
 	],
 	"settings": {

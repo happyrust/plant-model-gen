@@ -119,7 +119,7 @@ pub struct DbOptionExt {
     #[serde(default = "default_true")]
     pub use_surrealdb: bool,
 
-    /// 是否启用 foyer 缓存路径
+    /// 是否启用 model 缓存路径
     ///
     /// 注意：与 `use_surrealdb` 必须严格互斥，且恰好一个为 true。
     /// - `true`  => cache 模式（`use_surrealdb` 必须为 false）
@@ -133,15 +133,15 @@ pub struct DbOptionExt {
 
     /// 双路径下主路径是否为缓存
     #[serde(default = "default_true")]
-    pub foyer_primary: bool,
+    pub model_cache_primary: bool,
 
     /// 副路径是否允许写入 SurrealDB
     #[serde(default = "default_true")]
     pub secondary_db_write: bool,
 
-    /// foyer 缓存目录（默认 output/instance_cache）
+    /// model 缓存目录（默认 output/instance_cache）
     #[serde(default)]
-    pub foyer_cache_dir: Option<String>,
+    pub model_cache_dir: Option<String>,
 
     /// 副路径 mesh 输出目录（默认 output/meshes_shadow）
     #[serde(default)]
@@ -234,11 +234,11 @@ impl DbOptionExt {
         std::path::PathBuf::from("output").join(project_name)
     }
 
-    /// 获取 foyer 缓存目录，默认为 output/{project_name}/instance_cache
+    /// 获取 model 缓存目录，默认为 output/{project_name}/instance_cache
     ///
-    /// 注意：如果用户已自定义 foyer_cache_dir，则直接使用用户配置
-    pub fn get_foyer_cache_dir(&self) -> std::path::PathBuf {
-        if let Some(ref custom_dir) = self.foyer_cache_dir {
+    /// 注意：如果用户已自定义 model_cache_dir，则直接使用用户配置
+    pub fn get_model_cache_dir(&self) -> std::path::PathBuf {
+        if let Some(ref custom_dir) = self.model_cache_dir {
             return std::path::PathBuf::from(custom_dir);
         }
         self.get_project_output_dir().join("instance_cache")
@@ -257,6 +257,11 @@ impl DbOptionExt {
     /// 获取 scene_tree 目录，默认为 output/{project_name}/scene_tree
     pub fn get_scene_tree_dir(&self) -> std::path::PathBuf {
         self.get_project_output_dir().join("scene_tree")
+    }
+
+    /// 获取 foyer cache 目录（兼容旧代码路径），默认为 model_cache_dir
+    pub fn get_foyer_cache_dir(&self) -> std::path::PathBuf {
+        self.get_model_cache_dir()
     }
 
     /// 获取 db_meta_info.json 路径
@@ -285,9 +290,9 @@ impl From<DbOption> for DbOptionExt {
             use_surrealdb: true,
             use_cache: false,
             dual_run_enabled: false,
-            foyer_primary: true,
+            model_cache_primary: true,
             secondary_db_write: true,
-            foyer_cache_dir: None,
+            model_cache_dir: None,
             secondary_mesh_dir: None,
         }
     }
@@ -451,8 +456,8 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let foyer_primary = toml_value
-        .get("foyer_primary")
+    let model_cache_primary = toml_value
+        .get("model_cache_primary")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
@@ -461,8 +466,8 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    let foyer_cache_dir = toml_value
-        .get("foyer_cache_dir")
+    let model_cache_dir = toml_value
+        .get("model_cache_dir")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
@@ -490,9 +495,9 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         use_surrealdb,
         use_cache,
         dual_run_enabled,
-        foyer_primary,
+        model_cache_primary,
         secondary_db_write,
-        foyer_cache_dir,
+        model_cache_dir,
         secondary_mesh_dir,
     };
 
@@ -544,3 +549,6 @@ mod tests {
         assert!(validate_data_source_mode(false, false).is_err());
     }
 }
+
+
+

@@ -38,11 +38,11 @@ impl Default for MbdPipeSource {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MbdPipeQuery {
-    /// 数据来源：parquet=Parquet 文件（默认），db=SurrealDB，cache=foyer cache
+    /// 数据来源：parquet=Parquet 文件（默认），db=SurrealDB，cache=model cache
     pub source: MbdPipeSource,
     /// dbno（可选；若不传则尝试从 output/scene_tree/db_meta_info.json 推导）
     pub dbno: Option<u32>,
-    /// foyer instance_cache 的 batch_id（可选；若不传则默认按 latest）
+    /// model instance_cache 的 batch_id（可选；若不传则默认按 latest）
     pub batch_id: Option<String>,
     /// 调试开关：返回 debug_info（包含实际使用的 cache/dbnum/batch 等）
     pub debug: bool,
@@ -339,7 +339,6 @@ async fn get_mbd_pipe(
     let branch_refno = input_refno_enum.clone();
 
     let (segments, mut debug_info) = match query.source {
-        #[cfg(feature = "parquet-export")]
         MbdPipeSource::Parquet => match fetch_tubi_segments_from_parquet_with_debug(
             branch_refno.clone(),
             query.dbno,
@@ -390,35 +389,13 @@ async fn get_mbd_pipe(
                 }
             }
         },
-        #[cfg(not(feature = "parquet-export"))]
-        MbdPipeSource::Parquet => {
-            // parquet-export feature 未启用，直接回退到 SurrealDB
-            match fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await {
-                Ok((segs, mut db_debug)) => {
-                    db_debug.fallback_used = true;
-                    db_debug.fallback_reason = Some(
-                        "parquet-export feature 未启用，已自动回退到 SurrealDB".to_string()
-                    );
-                    (segs, db_debug)
-                }
-                Err(db_err) => {
-                    return json_utf8(MbdPipeResponse {
-                        success: false,
-                        error_message: Some(format!(
-                            "parquet-export 未启用且 SurrealDB 也失败({db_err})"
-                        )),
-                        data: None,
-                    });
-                }
-            }
-        },
         MbdPipeSource::Db => match fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await {
             Ok(v) => v,
             Err(e) => {
                 return json_utf8(MbdPipeResponse {
                     success: false,
                     error_message: Some(format!(
-                        "从 SurrealDB 读取分支管段失败: {e}（可尝试 ?source=cache 走 foyer cache）"
+                        "从 SurrealDB 读取分支管段失败: {e}（可尝试 ?source=cache 走 model cache）"
                     )),
                     data: None,
                 });
@@ -436,7 +413,7 @@ async fn get_mbd_pipe(
             Err(e) => {
                 return json_utf8(MbdPipeResponse {
                     success: false,
-                    error_message: Some(format!("从 foyer cache 读取分支管段失败: {e}")),
+                    error_message: Some(format!("从 model cache 读取分支管段失败: {e}")),
                     data: None,
                 });
             }
@@ -739,11 +716,9 @@ async fn get_mbd_pipe(
 }
 
 /// 正在后台导出的 dbnum 集合（防重复并发触发）
-#[cfg(feature = "parquet-export")]
 static EXPORTING_DBNUMS: Lazy<Mutex<HashSet<u32>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 /// 后台异步触发 parquet 导出（不阻塞当前请求）
-#[cfg(feature = "parquet-export")]
 async fn trigger_async_parquet_export(dbnum: u32) -> anyhow::Result<()> {
     use crate::fast_model::export_model::export_dbnum_instances_parquet::export_dbnum_instances_parquet;
     use std::sync::Arc;
@@ -801,7 +776,6 @@ async fn trigger_async_parquet_export(dbnum: u32) -> anyhow::Result<()> {
     result
 }
 
-#[cfg(feature = "parquet-export")]
 async fn fetch_tubi_segments_from_parquet_with_debug(
     branch_refno: RefnoEnum,
     dbno: Option<u32>,
@@ -983,9 +957,9 @@ async fn fetch_tubi_segments_from_cache_with_debug(
     debug.inferred_dbnum = Some(inferred_dbnum);
 
     // 运行时约定：
-    // - 若 FOYER_CACHE_DIR 指定，则优先使用
+    // - 若 MODEL_CACHE_DIR 指定，则优先使用
     // - 否则优先尝试项目内默认输出目录（AvevaMarineSample），再回退到 output/instance_cache
-    let cache_dir = std::env::var("FOYER_CACHE_DIR")
+    let cache_dir = std::env::var("MODEL_CACHE_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
@@ -1410,4 +1384,6 @@ mod tests {
         assert_eq!(b.to_array(), [5.0, 0.0, 0.0]);
     }
 }
+
+
 

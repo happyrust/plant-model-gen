@@ -26,8 +26,8 @@ use super::prim_processor::process_prim_refno_page;
 use super::tree_index_manager::TreeIndexManager;
 use super::utilities::build_cata_hash_map_from_tree;
 use crate::data_interface::db_meta;
-use crate::fast_model::foyer_cache::geom_input_cache;
-use crate::fast_model::foyer_cache::cata_resolve_cache;
+use crate::fast_model::model_cache::geom_input_cache;
+use crate::fast_model::model_cache::cata_resolve_cache;
 use crate::fast_model::instance_cache::InstanceCacheManager;
 use crate::fast_model::transform_cache;
 
@@ -460,10 +460,8 @@ pub async fn gen_index_tree_geos_optimized(
             )
             .with_stage(GenStage::Prefetch);
 
-            if matches!(
-                ctx_prefetch.cache_run_mode,
-                geom_input_cache::CacheRunMode::PrefetchThenGenerate
-            ) {
+            // [foyer-removal] PrefetchThenGenerate 已移除，此分支不再触发
+            if false {
                 let loop_vec: Vec<RefnoEnum> = loop_refnos.iter().copied().collect();
                 let prim_vec: Vec<RefnoEnum> = prim_refnos.iter().copied().collect();
                 let cate_vec: Vec<RefnoEnum> = cate_refnos.iter().copied().collect();
@@ -520,7 +518,7 @@ pub async fn gen_index_tree_geos_optimized(
 
                 if let Some(target_cata_map) = target_cata_map_for_validate {
                     if !target_cata_map.is_empty() {
-                        let cache_dir = ctx_prefetch.db_option.get_foyer_cache_dir().join("cata_resolve_cache");
+                        let cache_dir = ctx_prefetch.db_option.get_model_cache_dir().join("cata_resolve_cache");
                         cata_resolve_cache::init_global_cata_resolve_cache();
                         let Some(resolve_cache) = cata_resolve_cache::global_cata_resolve_cache() else {
                             return Err(anyhow::anyhow!("global_cata_resolve_cache 未初始化").into());
@@ -663,11 +661,8 @@ async fn process_bran_hang_core_logic(
             Ok(m) => m,
             Err(e) => {
                 // 离线 Generate 阶段不允许缺失 tree/db_meta（否则无法按 cata_hash 分组消费缓存）。
+                // [foyer-removal] PrefetchThenGenerate 已移除
                 if ctx_generate.is_offline_generate()
-                    || matches!(
-                        ctx_prefetch.cache_run_mode,
-                        geom_input_cache::CacheRunMode::PrefetchThenGenerate
-                    )
                 {
                     return Err(e.into());
                 }
@@ -693,10 +688,8 @@ async fn process_bran_hang_core_logic(
     let t3 = Instant::now();
     #[cfg(feature = "profile")]
     let _span3 = tracing::info_span!("bran_prefetch_offline_inputs").entered();
-    if matches!(
-        ctx_prefetch.cache_run_mode,
-        geom_input_cache::CacheRunMode::PrefetchThenGenerate
-    ) {
+    // [foyer-removal] PrefetchThenGenerate 已移除，此分支不再触发
+    if false {
         prefetch_bran_hang_inputs_for_offline_generate(
             ctx_prefetch,
             bran_roots,
@@ -945,7 +938,7 @@ async fn insert_inst_info_into_instance_cache(
     }
 
     db_meta().ensure_loaded()?;
-    let cache_dir = db_option.get_foyer_cache_dir();
+    let cache_dir = db_option.get_model_cache_dir();
     let cache_manager = InstanceCacheManager::new(&cache_dir).await?;
 
     // 将 inst_info 按 dbnum 分桶写入 instance_cache（ref0 != dbnum）。
@@ -983,7 +976,7 @@ async fn ensure_inst_info_present_in_instance_cache(
     }
 
     db_meta().ensure_loaded()?;
-    let cache_dir = db_option.get_foyer_cache_dir();
+    let cache_dir = db_option.get_model_cache_dir();
     let cache = InstanceCacheManager::new(&cache_dir).await?;
 
     // 按 dbnum 分组；ref0 != dbnum，必须走 db_meta 映射。
@@ -1028,7 +1021,7 @@ async fn ensure_inst_info_present_in_instance_cache(
     Ok(())
 }
 
-/// BRAN/HANG 离线 Generate 的 Prefetch 阶段：将生成热路径需要的输入填满到 foyer cache。
+/// BRAN/HANG 离线 Generate 的 Prefetch 阶段：将生成热路径需要的输入填满到 model cache。
 ///
 /// 目标：Generate 阶段严格只读 cache（geom_input_cache/cata_resolve_cache/transform_cache/instance_cache）。
 async fn prefetch_bran_hang_inputs_for_offline_generate(
@@ -1089,7 +1082,7 @@ async fn prefetch_bran_hang_inputs_for_offline_generate(
             .into());
         }
 
-        let cache_dir = ctx_prefetch.db_option.get_foyer_cache_dir().join("cata_resolve_cache");
+        let cache_dir = ctx_prefetch.db_option.get_model_cache_dir().join("cata_resolve_cache");
         cata_resolve_cache::init_global_cata_resolve_cache();
         let Some(resolve_cache) = cata_resolve_cache::global_cata_resolve_cache() else {
             return Err(anyhow::anyhow!("global_cata_resolve_cache 未初始化").into());
@@ -1621,3 +1614,5 @@ mod tests {
     //     assert!(result.is_ok());
     // }
 }
+
+

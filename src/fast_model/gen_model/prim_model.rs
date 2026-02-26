@@ -16,7 +16,7 @@ use std::mem::take;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
-use crate::fast_model::foyer_cache::geom_input_cache::PrimInput;
+// PrimInput 已随 model_cache 模块移除
 
 // ---------------------------------------------------------------------------
 // 公共工具函数
@@ -189,7 +189,7 @@ async fn build_polyhedron_from_db(
 
 /// 从缓存的 PrimPolyExtra 构建多面体 CSG shape。
 fn build_polyhedron_from_cache(
-    extra: &crate::fast_model::foyer_cache::geom_input_cache::PrimPolyExtra,
+    extra: &crate::fast_model::model_cache::geom_input_cache::PrimPolyExtra,
 ) -> Box<dyn BrepShapeTrait> {
     let polygons = extra
         .polygons
@@ -469,7 +469,8 @@ pub async fn gen_prim_geos(
     Ok(true)
 }
 
-/// cache-only：基于预取的 `PrimInput` 直接生成 prim 几何（不访问 SurrealDB）。
+// [foyer-removal] cache-only 函数已禁用，PrimInput 类型已随 model_cache 移除
+/*
 pub async fn gen_prim_geos_from_inputs(
     db_option: Arc<DbOptionExt>,
     prim_inputs: HashMap<RefnoEnum, PrimInput>,
@@ -642,3 +643,5 @@ pub async fn gen_prim_geos_from_inputs(
     }
     Ok(true)
 }
+*/
+

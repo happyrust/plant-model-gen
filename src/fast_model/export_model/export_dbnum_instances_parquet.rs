@@ -1275,10 +1275,10 @@ pub async fn export_dbnum_instances_parquet(
 // Cache → Parquet 导出
 // =============================================================================
 
-/// 从 foyer cache 导出指定 dbnum 的实例数据为多表 Parquet 格式
+/// 从 model cache 导出指定 dbnum 的实例数据为多表 Parquet 格式
 ///
 /// 与 `export_dbnum_instances_parquet()` 输出**完全相同 schema** 的 Parquet 文件，
-/// 但数据源是 foyer cache 而非 SurrealDB，适用于 cache-only 模式。
+/// 但数据源是 model cache 而非 SurrealDB，适用于 cache-only 模式。
 ///
 /// # 输出文件
 /// - `instances_{dbnum}.parquet`
@@ -1849,7 +1849,7 @@ pub async fn export_dbnum_instances_parquet_from_cache(
     let manifest = json!({
         "version": 1,
         "format": "parquet",
-        "source": "foyer_cache",
+        "source": "model_cache",
         "generated_at": generated_at,
         "dbnum": dbnum,
         "tables": {
@@ -1913,3 +1913,5 @@ pub async fn export_dbnum_instances_parquet_from_cache(
         elapsed,
     })
 }
+
+

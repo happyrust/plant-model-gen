@@ -41,16 +41,16 @@ gen_model_batch_size = 16
 # 缓存/双路径对比配置
 # use_surrealdb: 是否启用 SurrealDB 写入/扫库路径（布尔仍依赖 DB）
 use_surrealdb = false
-# use_cache: 是否启用 foyer 缓存路径
+# use_cache: 是否启用 model 缓存路径
 use_cache = true
 # dual_run_enabled: 是否双路径对比（主路径 + 副路径）
 dual_run_enabled = true
-# foyer_primary: 双路径下主路径是否为缓存
-foyer_primary = true
+# model_cache_primary: 双路径下主路径是否为缓存
+model_cache_primary = true
 # secondary_db_write: 副路径是否允许写入 SurrealDB
 secondary_db_write = true
-# foyer_cache_dir: foyer 缓存目录（默认 output/instance_cache）
-foyer_cache_dir = "output/instance_cache"
+# model_cache_dir: model 缓存目录（默认 output/instance_cache）
+model_cache_dir = "output/instance_cache"
 # secondary_mesh_dir: 副路径 mesh 输出目录（默认 output/meshes_shadow）
 secondary_mesh_dir = "output/meshes_shadow"
 
@@ -271,3 +271,6 @@ base_url = "http://localhost:3000"
 token_secret = "your-shared-secret-key"
 # 请求超时时间 (秒)
 timeout_seconds = 30
+
+
+

@@ -24,10 +24,7 @@ pub mod context; // 处理上下文
 pub mod errors; // 错误类型 (Phase 2)
 pub mod models; // 数据模型定义
 pub mod noun_collection; // Noun 收集和分类 // 分类 Refno 存储 (Phase 3)
-pub mod input_cache_pipeline; // LOOP/PRIM 输入缓存流水线（key-driven）
-pub mod cata_resolve_cache_pipeline; // CATE resolve 产物预热流水线（foyer/rkyv）
 pub mod neg_query; // TreeIndex 批量查询辅助（按 dbnum 分组，返回 root -> Vec<desc>）
-pub mod batch_cleanup; // 分批生成时的批次间缓存清理
 
 // 处理器模块
 pub mod cate_helpers; // Cate 工具函数
@@ -50,6 +47,22 @@ pub mod precheck_coordinator; // 预检查协调器
 
 // Mesh 处理
 pub mod mesh_processing;
+
+// 从 fast_model 根目录迁入的模型生成管线模块
+pub mod query_provider; // TreeIndex 查询提供者
+pub mod cata_model; // CATE 模型生成
+pub mod loop_model; // LOOP 模型生成
+pub mod prim_model; // PRIM 模型生成
+pub mod manifold_bool; // 布尔运算
+pub mod mesh_generate; // 网格生成
+pub mod pdms_inst; // 实例数据保存
+pub mod resolve; // 几何解析
+pub mod transform_cache; // 变换缓存
+pub mod db_meta_cache; // DB 元数据缓存
+pub mod inst_query; // inst_relate/geo_relate 查询
+pub mod query; // 查询工具
+pub mod query_compat; // 查询兼容层
+pub mod cata_resolve_cache_pipeline; // [foyer-removal] 桩模块
 
 // 重新导出常用类型
 pub use context::NounProcessContext;
@@ -83,3 +96,14 @@ pub use mesh_processing::process_meshes_by_dbnos;
 
 // 预检查相关类型
 pub use precheck_coordinator::{run_precheck, PrecheckConfig, PrecheckStats};
+
+// 迁入模块的重导出
+pub use query::*;
+pub use resolve::*;
+pub use mesh_generate::{
+    booleans_meshes_in_db, gen_inst_meshes, gen_meshes_in_db, process_meshes_update_db,
+    process_meshes_update_db_deep, process_meshes_update_db_deep_default,
+    process_meshes_bran, update_inst_relate_aabbs_by_refnos,
+    run_mesh_worker,
+};
+

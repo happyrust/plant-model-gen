@@ -1,12 +1,19 @@
-use crate::fast_model::foyer_cache::geom_input_cache::{self, CacheRunMode};
 use crate::options::DbOptionExt;
 use std::sync::Arc;
+
+/// cache-first 运行模式（model_cache 已移除，仅保留 Direct）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheRunMode {
+    /// 直接模式：所有查询走 SurrealDB
+    Direct,
+    // PrefetchThenGenerate 和 CacheOnly 已随 foyer-cache-cleanup 移除
+}
 
 /// Full Noun / cache-first 运行的阶段标识。
 ///
 /// 约定：
-/// - Prefetch 阶段：允许访问 SurrealDB 拉取输入并写入 foyer cache（仅 PrefetchThenGenerate 模式）
-/// - Generate 阶段：应尽量只读/写 foyer cache（cache-first / cache-only 离线生成）
+/// - Prefetch 阶段：允许访问 SurrealDB 拉取输入并写入 model cache（仅 PrefetchThenGenerate 模式）
+/// - Generate 阶段：应尽量只读/写 model cache（cache-first / cache-only 离线生成）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GenStage {
     Prefetch,
@@ -44,7 +51,7 @@ impl NounProcessContext {
             db_option,
             batch_size,
             batch_concurrency: batch_concurrency.max(1),
-            cache_run_mode: geom_input_cache::resolve_cache_run_mode(),
+            cache_run_mode: CacheRunMode::Direct,
             gen_stage: GenStage::Generate,
         }
     }
@@ -134,3 +141,5 @@ mod tests {
         assert_eq!(ctx.batch_concurrency, 1); // 自动修正为最小值1
     }
 }
+
+

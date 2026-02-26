@@ -275,7 +275,7 @@ fn parse_length_unit(unit: &str) -> LengthUnit {
 /// 连接 SurrealDB（用于读取 PDMS 输入数据或写入模型数据）。
 ///
 /// 约定（重要）：cache-only 也需要连接 SurrealDB 作为“输入数据源”（PE/属性/世界矩阵等）。
-/// cache-only 的区别仅在于：不写入 inst_* 等模型相关表，且导出期实例数据优先从 foyer cache 读取。
+/// cache-only 的区别仅在于：不写入 inst_* 等模型相关表，且导出期实例数据优先从 model cache 读取。
 async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
     if db_option_ext.use_surrealdb {
         println!("\n📡 连接数据库（SurrealDB 写入启用）...");
@@ -298,7 +298,7 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     ensure_surreal_connected(db_option_ext).await?;
     if !db_option_ext.use_surrealdb {
         println!(
-            "📦 cache-only：OBJ 实例数据从 foyer cache 读取（不从 SurrealDB 查询 inst_relate）"
+            "📦 cache-only：OBJ 实例数据从 model cache 读取（不从 SurrealDB 查询 inst_relate）"
         );
     }
 
@@ -357,7 +357,7 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             }
 
             // 无论是否写库，--regen-model 都表示"重建模型数据"：
-            // - use_surrealdb=false：生成结果落地 foyer cache（SurrealDB 仅作为输入源，不写 inst_*）
+            // - use_surrealdb=false：生成结果落地 model cache（SurrealDB 仅作为输入源，不写 inst_*）
             // - use_surrealdb=true ：同时允许写入/对照验证
             use aios_database::fast_model::gen_all_geos_data;
 
@@ -419,9 +419,9 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
                     ),
                     use_basic_materials: config.use_basic_materials,
                     include_negative: config.include_negative,
-                    // 导出默认走 foyer cache；仅在用户显式传入 --use-surrealdb 时才回退到 SurrealDB。
-                    allow_surrealdb: false,
-                    cache_dir: Some(db_option_ext.get_foyer_cache_dir()),
+                    // [foyer-removal] cache 已移除，默认走 SurrealDB
+                    allow_surrealdb: true,
+                    cache_dir: None,
                 },
             };
 
@@ -580,7 +580,7 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     ensure_surreal_connected(db_option_ext).await?;
     if !db_option_ext.use_surrealdb {
         println!(
-            "📦 cache-only：GLB 实例数据从 foyer cache 读取（不从 SurrealDB 查询 inst_relate）"
+            "📦 cache-only：GLB 实例数据从 model cache 读取（不从 SurrealDB 查询 inst_relate）"
         );
     }
 
@@ -684,7 +684,7 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
                     cache_dir: if db_option_ext.use_surrealdb {
                         None
                     } else {
-                        Some(db_option_ext.get_foyer_cache_dir())
+                        Some(db_option_ext.get_model_cache_dir())
                     },
                 },
             };
@@ -839,7 +839,7 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
     ensure_surreal_connected(db_option_ext).await?;
     if !db_option_ext.use_surrealdb {
         println!(
-            "📦 cache-only：glTF 实例数据从 foyer cache 读取（不从 SurrealDB 查询 inst_relate）"
+            "📦 cache-only：glTF 实例数据从 model cache 读取（不从 SurrealDB 查询 inst_relate）"
         );
     }
 
@@ -948,7 +948,7 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
                     cache_dir: if db_option_ext.use_surrealdb {
                         None
                     } else {
-                        Some(db_option_ext.get_foyer_cache_dir())
+                        Some(db_option_ext.get_model_cache_dir())
                     },
                 },
             };
@@ -1508,7 +1508,7 @@ pub async fn export_all_parquet_mode(
 /// # 参数
 /// - `autorun`: 若为 `true`（默认），缓存缺失时自动生成模型数据；若为 `false`，则询问用户确认
 /// - `root_refno`: 若提供，则仅导出该 refno 下的 visible 子孙节点；否则导出整个 dbnum
-/// - `from_cache`: 若为 `true`，使用 foyer cache 导出；若为 `false`（默认），使用 SurrealDB 导出
+/// - `from_cache`: 若为 `true`，使用 model cache 导出；若为 `false`（默认），使用 SurrealDB 导出
 /// - `detailed`: 若为 `true`，使用详细格式（version 3）；若为 `false`（默认），使用精简格式（version 4）
 pub async fn export_dbnum_instances_json_mode(
     dbnum: u32,
@@ -1561,19 +1561,19 @@ pub async fn export_dbnum_instances_json_mode(
             use aios_core::shape::pdms_shape::RsVec3;
             use aios_core::types::PlantAabb;
             use aios_core::{SUL_DB, SurrealQueryExt};
-            use aios_database::fast_model::foyer_cache::FoyerCacheContext;
+            use aios_database::fast_model::model_cache::ModelCacheContext;
             use aios_database::fast_model::gen_model::tree_index_manager::TreeIndexManager;
             use serde::{Deserialize, Serialize};
             use surrealdb::types as surrealdb_types;
             use surrealdb::types::SurrealValue;
 
             // 方案 B：tubi 导出以 tubi_relate 为准。
-            // 这里“只读 SurrealDB + 写 foyer cache”，把 tubi_relate 的最小必要信息落到 cache：
+            // 这里“只读 SurrealDB + 写 model cache”，把 tubi_relate 的最小必要信息落到 cache：
             // owner_refno, leave_refno, arrive_refno, index/order, world_trans/aabb, start/end。
             ensure_surreal_connected(db_option_ext).await?;
 
-            let Some(ctx) = FoyerCacheContext::try_from_db_option(db_option_ext).await? else {
-                anyhow::bail!("use_cache=false，无法写入 foyer cache");
+            let Some(ctx) = ModelCacheContext::try_from_db_option(db_option_ext).await? else {
+                anyhow::bail!("use_cache=false，无法写入 model cache");
             };
 
             let branch_refnos: Vec<RefnoEnum> = if let Some(r) = root_refno.filter(|r| r.is_valid())
@@ -1681,7 +1681,7 @@ pub async fn export_dbnum_instances_json_mode(
             Ok(())
         }
 
-        let cache_dir = db_option_ext.get_foyer_cache_dir();
+        let cache_dir = db_option_ext.get_model_cache_dir();
         let mesh_dir = ExportConfig::default().get_mesh_dir(db_option_ext);
         let mesh_lod_tag = format!("{:?}", db_option_ext.inner.mesh_precision.default_lod);
 
@@ -1837,7 +1837,7 @@ pub async fn export_dbnum_instances_json_mode(
                             std::env::set_var("FORCE_REPLACE_MESH", "true");
                         }
 
-                        // Step 3: 生成模型（仅写入 foyer cache）
+                        // Step 3: 生成模型（仅写入 model cache）
                         // 捕获错误但继续尝试导出（缓存可能已有部分数据）
                         match gen_all_geos_data(vec![], &db_option_ext_override, None, None).await {
                             Ok(_) => {
@@ -1995,7 +1995,7 @@ pub async fn export_dbnum_instances_json_mode(
     Ok(())
 }
 
-/// 预检查并补齐 cache：若 `dbnum` 下存在缺失 refno，则仅对缺失 refno 触发模型生成并写回 foyer cache。
+/// 预检查并补齐 cache：若 `dbnum` 下存在缺失 refno，则仅对缺失 refno 触发模型生成并写回 model cache。
 async fn ensure_cache_refnos_ready_for_parquet(
     dbnum: u32,
     db_option_ext: &DbOptionExt,
@@ -2008,7 +2008,7 @@ async fn ensure_cache_refnos_ready_for_parquet(
     use aios_database::fast_model::instance_cache::InstanceCacheManager;
     use std::collections::HashSet;
 
-    let cache_dir = db_option_ext.get_foyer_cache_dir();
+    let cache_dir = db_option_ext.get_model_cache_dir();
     let cache_manager = InstanceCacheManager::new(&cache_dir).await?;
     let cached_refnos: HashSet<RefnoEnum> = cache_manager.list_refnos(dbnum).into_iter().collect();
 
@@ -2064,6 +2064,7 @@ async fn ensure_cache_refnos_ready_for_parquet(
 /// - `transforms.parquet`            — 共享表（去重的变换矩阵）
 /// - `aabb.parquet`                  — 共享表（去重的包围盒）
 /// - `manifest_{dbnum}.json`         — 导出元信息
+#[cfg(feature = "parquet-export")]
 pub async fn export_dbnum_instances_parquet_mode(
     dbnum: u32,
     verbose: bool,
@@ -2115,11 +2116,12 @@ pub async fn export_dbnum_instances_parquet_mode(
     Ok(())
 }
 
-/// 从 foyer cache 导出指定 dbnum 的实例数据为多表 Parquet 格式
+/// 从 model cache 导出指定 dbnum 的实例数据为多表 Parquet 格式
 ///
-/// 与 `export_dbnum_instances_parquet_mode` 输出相同 schema，但数据源为 foyer cache
+/// 与 `export_dbnum_instances_parquet_mode` 输出相同 schema，但数据源为 model cache
 /// 而非 SurrealDB，适用于 cache-only 模式 (`use_cache=true, use_surrealdb=false`)。
 /// 默认仅导出缓存已有数据；当 `fill_missing_cache=true` 时会先补齐缺失 refno。
+#[cfg(feature = "parquet-export")]
 pub async fn export_dbnum_instances_parquet_from_cache_mode(
     dbnum: u32,
     verbose: bool,
@@ -2129,14 +2131,14 @@ pub async fn export_dbnum_instances_parquet_from_cache_mode(
 ) -> Result<()> {
     use aios_database::fast_model::export_model::export_dbnum_instances_parquet::export_dbnum_instances_parquet_from_cache;
 
-    println!("\n🎯 从 foyer cache 导出 dbnum 实例数据为 Parquet（多表）");
+    println!("\n🎯 从 model cache 导出 dbnum 实例数据为 Parquet（多表）");
     println!("====================================");
 
     // 设置输出目录
     let output_dir =
         output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("parquet"));
 
-    let cache_dir = db_option_ext.get_foyer_cache_dir();
+    let cache_dir = db_option_ext.get_model_cache_dir();
     let mesh_dir = db_option_ext.inner.get_meshes_path();
     let mesh_lod_tag = format!("{:?}", db_option_ext.inner.mesh_precision.default_lod);
 
@@ -2177,6 +2179,7 @@ pub async fn export_dbnum_instances_parquet_from_cache_mode(
 /// 导出指定 dbnum 的 PDMS Tree（TreeIndex + name/noun/children_count）为 Parquet
 ///
 /// 输出目录默认为：output/<project>/scene_tree_parquet/
+#[cfg(feature = "parquet-export")]
 pub async fn export_pdms_tree_parquet_mode(
     dbnum: u32,
     verbose: bool,
@@ -2222,6 +2225,7 @@ pub async fn export_pdms_tree_parquet_mode(
 /// 导出 WORL -> SITE 节点列表为 Parquet（替代后端 e3d children 对 WORL 的特判）
 ///
 /// 输出目录默认为：output/<project>/scene_tree_parquet/
+#[cfg(feature = "parquet-export")]
 pub async fn export_world_sites_parquet_mode(
     verbose: bool,
     output_override: Option<PathBuf>,
@@ -2480,3 +2484,6 @@ pub async fn export_room_instances_mode(output_dir: Option<PathBuf>, verbose: bo
 
     Ok(())
 }
+
+
+

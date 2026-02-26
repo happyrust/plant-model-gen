@@ -1,7 +1,5 @@
-use super::cache_miss_report;
 use super::context::NounProcessContext;
 use crate::fast_model::prim_model;
-use crate::fast_model::foyer_cache::geom_input_cache;
 use aios_core::RefnoEnum;
 use aios_core::geometry::ShapeInstancesData;
 use anyhow::{Result, bail};
@@ -35,52 +33,7 @@ pub async fn process_prim_refno_page(
         return Ok(());
     }
 
-    // 离线生成：Generate 阶段只读 geom_input_cache；miss 视为流程不正确（应由 Prefetch 填满）。
-    if ctx.is_offline_generate() {
-        let inputs = geom_input_cache::load_prim_inputs_for_refnos_from_global(refnos)?;
-        if inputs.len() != refnos.len() {
-            let miss_cnt = refnos.len() - inputs.len();
-            let mut missing: Vec<RefnoEnum> = Vec::with_capacity(miss_cnt);
-            for &r in refnos.iter().filter(|r| !inputs.contains_key(r)) {
-                missing.push(r);
-                cache_miss_report::with_global_report(|rep| {
-                    rep.record_refno_miss(
-                        "generate",
-                        "prim_input",
-                        r,
-                        Some("geom_input_cache miss"),
-                    )
-                });
-            }
-            eprintln!(
-                "[prim_processor] offline-generate: geom_input_cache miss: request={}, hit={}, miss={}",
-                refnos.len(),
-                inputs.len(),
-                miss_cnt
-            );
-            missing.sort_by_key(|r| r.refno());
-            bail!(
-                "离线生成禁止 PRIM 输入 miss：request={}, hit={}, missing={}, sample=[{}]",
-                refnos.len(),
-                inputs.len(),
-                missing.len(),
-                missing
-                    .iter()
-                    .take(32)
-                    .map(|r| r.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-
-        if inputs.is_empty() {
-            bail!("离线生成：PRIM 输入为空（应由 Prefetch 填充）");
-        }
-        if !prim_model::gen_prim_geos_from_inputs(ctx.db_option.clone(), inputs, sender).await? {
-            bail!("prim geos generation from cache failed");
-        }
-        return Ok(());
-    }
+    // 离线生成路径已移除（foyer-cache-cleanup），直接走 SurrealDB
 
     // 生成 prim 几何体
     if !prim_model::gen_prim_geos(ctx.db_option.clone(), refnos, sender).await? {
@@ -109,3 +62,4 @@ mod tests {
         assert!(result.is_ok());
     }
 }
+

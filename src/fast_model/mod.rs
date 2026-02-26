@@ -1,18 +1,26 @@
 pub mod gen_model;
 
-pub mod cata_model;
-
+pub use gen_model::cata_model;
 pub mod cata_cache_gen;
+
+// [foyer-removal] 桩模块 —— 提供编译兼容，运行时不应被调用
+pub mod instance_cache;
+pub mod model_cache;
+pub mod model_store;
+pub mod foyer_cache;
+pub mod cache_flush;
+
+
 
 pub mod reuse_unit;
 
 
 
-pub mod prim_model;
+pub use gen_model::prim_model;
 
 
 
-pub mod loop_model;
+pub use gen_model::loop_model;
 
 
 
@@ -36,13 +44,9 @@ pub use refno_errors::{
 
 
 
-pub mod capture;
+pub use gen_model::manifold_bool;
 
-
-
-pub mod manifold_bool;
-
-pub mod mesh_generate;
+pub use gen_model::mesh_generate;
 
 
 
@@ -90,35 +94,26 @@ pub mod cal_model;
 
 
 
-pub mod pdms_inst;
+pub use gen_model::pdms_inst;
 
 
 
-pub mod resolve;
+pub use gen_model::resolve;
 
 
 
-pub mod query;
+pub use gen_model::query;
 
 // inst_relate/geo_relate 查询（v2）：用于绕开旧 schema 字段，便于导出/诊断
 
-pub mod inst_query;
+pub use gen_model::inst_query;
 
-pub mod query_compat;
+pub use gen_model::query_compat;
 
-pub mod query_provider; // 新的统一查询提供者 // 查询兼容层
+pub use gen_model::query_provider; // 统一查询提供者
 
-pub mod db_meta_cache;
-
-pub mod instance_cache;
-
-pub mod transform_cache;
-
-pub mod foyer_cache;
-
-pub mod cache_flush;
-
-pub mod cache_clean;
+pub use gen_model::db_meta_cache;
+pub use gen_model::transform_cache;
 
 
 
@@ -135,8 +130,6 @@ pub mod export_model;
 // 重新导出 scene_tree 模块（用于替代 inst_relate_aabb）
 
 pub use crate::scene_tree;
-
-pub use capture::*;
 
 pub use export_model::{export_glb, export_gltf, export_instanced_bundle, model_exporter};
 
@@ -197,6 +190,47 @@ use dashmap::{DashMap, DashSet};
 // 优先使用新的 gen_model 模块的 API
 
 pub use gen_model::*;
+
+// [foyer-removal] CaptureConfig 桩
+use std::path::PathBuf;
+use once_cell::sync::OnceCell;
+
+#[derive(Clone, Debug)]
+pub struct CaptureConfig {
+    pub output_dir: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub include_descendants: bool,
+    pub views: Option<Vec<String>>,
+    pub baseline_dir: Option<PathBuf>,
+    pub diff_dir: Option<PathBuf>,
+}
+
+impl CaptureConfig {
+    pub fn new(
+        output_dir: PathBuf,
+        width: u32,
+        height: u32,
+        include_descendants: bool,
+        views: u8,
+        baseline_dir: Option<PathBuf>,
+        diff_dir: Option<PathBuf>,
+    ) -> Self {
+        let _ = views;
+        Self { output_dir, width, height, include_descendants, views: None, baseline_dir, diff_dir }
+    }
+}
+
+static CAPTURE_CONFIG: OnceCell<std::sync::Mutex<Option<CaptureConfig>>> = OnceCell::new();
+
+pub fn set_capture_config(config: Option<CaptureConfig>) {
+    let cell = CAPTURE_CONFIG.get_or_init(|| std::sync::Mutex::new(None));
+    *cell.lock().unwrap() = config;
+}
+
+pub fn get_capture_config() -> Option<CaptureConfig> {
+    CAPTURE_CONFIG.get().and_then(|m| m.lock().unwrap().clone())
+}
 
 
 
@@ -349,27 +383,7 @@ pub async fn preload_mesh_cache() -> anyhow::Result<()> {
 
 
 
-// pub use gen_model_refactored::DbModelInstRefnos;
-
-pub use query::*;
-
-pub use resolve::*;
-
-
-
-// Re-export mesh generation functions
-
-pub use mesh_generate::{
-
-    booleans_meshes_in_db, gen_inst_meshes, gen_meshes_in_db, process_meshes_update_db,
-
-    process_meshes_update_db_deep, process_meshes_update_db_deep_default,
-
-    process_meshes_bran, update_inst_relate_aabbs_by_refnos,
-
-    run_mesh_worker,
-
-};
+// 以下重导出已通过 pub use gen_model::* 覆盖（query/resolve/mesh_generate 已迁入 gen_model）
 
 
 

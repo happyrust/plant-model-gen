@@ -74,7 +74,7 @@ pub struct PtsetResponse {
     /// 世界坐标变换矩阵（4x4 列主序，16 个数字）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub world_transform: Option<Vec<f64>>,
-    /// 对应 foyer instance_cache 的“快照版本”（通常取 meta_{dbno}.json 中的 batch_id）
+    /// 对应 model instance_cache 的“快照版本”（通常取 meta_{dbno}.json 中的 batch_id）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_id: Option<String>,
     /// 数据单位信息
@@ -98,7 +98,7 @@ pub struct PtsetUnitInfo {
 pub struct PtsetQuery {
     /// dbno（可选；若不传则尝试从 output/scene_tree/db_meta_info.json 推导）
     pub dbno: Option<u32>,
-    /// foyer instance_cache 的 batch_id（可选；若不传则默认按 latest）
+    /// model instance_cache 的 batch_id（可选；若不传则默认按 latest）
     pub batch_id: Option<String>,
 }
 
@@ -109,7 +109,7 @@ async fn get_ptset_by_refno(
 ) -> Result<Json<PtsetResponse>, StatusCode> {
     let refno_str = refno.to_string();
 
-    // 1) 优先从 foyer instance_cache 按需读取（与模型 instances.json 同源）
+    // 1) 优先从 model instance_cache 按需读取（与模型 instances.json 同源）
     //    - 若传入 dbno/batch_id：按“截至 batch 的最新快照”查找
     //    - 若未传：尝试推导 dbno 并回退到 latest batch
     if let Ok(Some((ptset_points, world_transform, snapshot_batch_id))) =
@@ -220,8 +220,8 @@ async fn try_get_ptset_from_cache(
         return Ok(None);
     }
 
-    // 运行时约定：默认读 output/instance_cache；也可由 FOYER_CACHE_DIR 指定。
-    let cache_dir = std::env::var("FOYER_CACHE_DIR")
+    // 运行时约定：默认读 output/instance_cache；也可由 MODEL_CACHE_DIR 指定。
+    let cache_dir = std::env::var("MODEL_CACHE_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
@@ -247,3 +247,5 @@ async fn try_get_ptset_from_cache(
 
     Ok(Some((points, world_transform, snapshot_id)))
 }
+
+

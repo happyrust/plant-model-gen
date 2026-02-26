@@ -220,5 +220,7 @@ timeout_seconds = 30
 # ===== aios-database 扩展字段（DbOptionExt）=====
 # 不导出 instances_{dbnum}.json，避免写入 output/instances（D 盘空间不足）
 export_instances = false
-# foyer 缓存目录指到 C 盘
-foyer_cache_dir = "C:/aios_run/instance_cache"
+# model 缓存目录指到 C 盘
+model_cache_dir = "C:/aios_run/instance_cache"
+
+

@@ -165,7 +165,7 @@ async fn sync_cache_to_db_if_enabled(
         None
     };
 
-    let cache_dir = db_option_ext.get_foyer_cache_dir();
+    let cache_dir = db_option_ext.get_model_cache_dir();
     let flushed = aios_database::fast_model::cache_flush::flush_latest_instance_cache_to_surreal(
         &cache_dir,
         None, // 同步所有 dbnums（refno_filter 会在 merge 后精确过滤）
@@ -239,6 +239,7 @@ async fn post_export_steps(
     // 确保数据库已连接
     init_surreal().await?;
 
+    #[cfg(feature = "parquet-export")]
     if want_parquet {
         let fill_missing_cache = matches.get_flag("fill-missing-cache");
         println!(
@@ -482,7 +483,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("flush-cache-to-db")
                 .long("flush-cache-to-db")
-                .help("Flush foyer instance_cache to SurrealDB (backup). Requires SurrealDB config in DbOption")
+                .help("Flush model instance_cache to SurrealDB (backup). Requires SurrealDB config in DbOption")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -667,7 +668,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("from-cache")
                 .long("from-cache")
-                .help("Use foyer cache instead of SurrealDB for export")
+                .help("Use model cache instead of SurrealDB for export")
                 .action(clap::ArgAction::SetTrue)
                 .requires("export-dbnum-instances-json"),
         )
@@ -875,11 +876,11 @@ async fn main() -> anyhow::Result<()> {
 
     // ========== cache -> SurrealDB：一键备份落库 ==========
     if matches.get_flag("flush-cache-to-db") {
-        println!("\n🗄️  flush-cache-to-db: 将 foyer instance_cache 写入 SurrealDB（备份）");
+        println!("\n🗄️  flush-cache-to-db: 将 model instance_cache 写入 SurrealDB（备份）");
         init_surreal().await?;
         println!("✅ 数据库连接成功");
 
-        let cache_dir = db_option_ext.get_foyer_cache_dir();
+        let cache_dir = db_option_ext.get_model_cache_dir();
         let dbnums: Option<Vec<u32>> = matches
             .get_many::<u32>("flush-cache-dbnums")
             .map(|v| v.copied().collect());
@@ -1157,7 +1158,7 @@ async fn main() -> anyhow::Result<()> {
 
         if !db_option_ext.use_surrealdb {
             println!(
-                "📦 cache-only：OBJ 导出默认使用 indextree + foyer 缓存（instances 从缓存读，不写入 inst_*）。SurrealDB 仍作为输入数据源连接（PE/属性/世界矩阵等）。如需写入/对照验证，请添加 --use-surrealdb。"
+                "📦 cache-only：OBJ 导出默认使用 indextree + model 缓存（instances 从缓存读，不写入 inst_*）。SurrealDB 仍作为输入数据源连接（PE/属性/世界矩阵等）。如需写入/对照验证，请添加 --use-surrealdb。"
             );
         }
     }
@@ -1668,7 +1669,7 @@ async fn main() -> anyhow::Result<()> {
         println!(
             "   - 数据源: {}",
             if from_cache {
-                "foyer cache"
+                "model cache"
             } else {
                 "SurrealDB"
             }
@@ -1702,6 +1703,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 导出 WORL -> SITE 节点列表为 Parquet（Full Parquet Mode 的根节点 children 数据源）
+    #[cfg(feature = "parquet-export")]
     if matches.get_flag("export-world-sites-parquet") {
         use crate::cli_modes::export_world_sites_parquet_mode;
         let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
@@ -1709,6 +1711,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 导出指定 dbnum 的 PDMS Tree 为 Parquet（TreeIndex + pe.name）
+    #[cfg(feature = "parquet-export")]
     if matches.get_flag("export-pdms-tree-parquet") {
         use crate::cli_modes::export_pdms_tree_parquet_mode;
         let dbnum = matches.get_one::<u32>("dbnum").copied();
@@ -1745,7 +1748,7 @@ async fn main() -> anyhow::Result<()> {
 
         println!("🎯 导出 dbnum 实例数据为 Parquet（多表，供 DuckDB 查询）");
         println!("   - 按 dbnum={} 过滤", dbnum);
-        println!("   - 数据源: foyer cache");
+        println!("   - 数据源: model cache");
         if fill_missing_cache {
             println!("   - 导出前策略: 自动补齐缺失 refno");
         } else {
@@ -1755,6 +1758,7 @@ async fn main() -> anyhow::Result<()> {
             println!("   - 输出目录: {}", dir.display());
         }
 
+        #[cfg(feature = "parquet-export")]
         return crate::cli_modes::export_dbnum_instances_parquet_from_cache_mode(
             dbnum,
             verbose,
@@ -2008,3 +2012,5 @@ fn maybe_redirect_stdio_to_log_file() {
         }
     }
 }
+
+

@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::debug_model_debug;
+// model_store 已移除，使用 SUL_DB 直接查询
 use crate::fast_model::utils;
 // use crate::fast_model::EXIST_MESH_GEOS;
 
@@ -49,11 +50,9 @@ pub async fn save_tubi_info_batch_with_replace(
         }
         if !rows.is_empty() {
             let sql = format!("INSERT IGNORE INTO tubi_info [{}];", rows.join(","));
-            SUL_DB
-                .query(&sql)
+            SUL_DB.query_response(&sql)
                 .await
                 .with_context(|| format!("写入 tubi_info 失败 (insert ignore): {}", written))?;
-            aios_core::kv_dual_write(&sql).await;
         }
     }
 
@@ -69,8 +68,7 @@ async fn delete_inst_relate_by_in(refnos: &[RefnoEnum], chunk_size: usize) -> an
     for chunk in refnos.chunks(chunk_size.max(1)) {
         let in_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
         let sql = format!("DELETE FROM inst_relate WHERE in IN [{in_keys}];");
-        SUL_DB.query(&sql).await?;
-        aios_core::kv_dual_write(&sql).await;
+        SUL_DB.query_response(&sql).await?;
     }
     Ok(())
 }
@@ -87,8 +85,7 @@ async fn delete_geo_relate_by_inst_info_ids(inst_info_ids: &[String], chunk_size
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!("DELETE geo_relate WHERE in IN [{in_keys}];");
-        SUL_DB.query(&sql).await?;
-        aios_core::kv_dual_write(&sql).await;
+        SUL_DB.query_response(&sql).await?;
     }
     Ok(())
 }
@@ -102,11 +99,9 @@ async fn delete_boolean_relations_by_targets(target_refnos: &[RefnoEnum], chunk_
         let out_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
         // out=目标正实体(pe key)
         let neg_sql = format!("DELETE neg_relate WHERE out IN [{out_keys}];");
-        SUL_DB.query(&neg_sql).await?;
-        aios_core::kv_dual_write(&neg_sql).await;
+        SUL_DB.query_response(&neg_sql).await?;
         let ngmr_sql = format!("DELETE ngmr_relate WHERE out IN [{out_keys}];");
-        SUL_DB.query(&ngmr_sql).await?;
-        aios_core::kv_dual_write(&ngmr_sql).await;
+        SUL_DB.query_response(&ngmr_sql).await?;
     }
     Ok(())
 }
@@ -123,8 +118,7 @@ async fn delete_inst_relate_bool_records(refnos: &[RefnoEnum], chunk_size: usize
     }
 
     for sql in build_delete_inst_relate_bool_records_sql(refnos, chunk_size) {
-        SUL_DB.query(&sql).await?;
-        aios_core::kv_dual_write(&sql).await;
+        SUL_DB.query_response(&sql).await?;
     }
     Ok(())
 }
@@ -183,8 +177,7 @@ async fn delete_inst_geo_by_hashes(geo_hashes: &[u64], chunk_size: usize) -> any
             continue;
         }
         let sql = format!("DELETE [{ids}];");
-        SUL_DB.query(&sql).await?;
-        aios_core::kv_dual_write(&sql).await;
+        SUL_DB.query_response(&sql).await?;
     }
     Ok(())
 }
@@ -233,7 +226,7 @@ pub async fn save_instance_data_optimize(
     if replace_exist {
         // ⚠️ 已知风险(RUS-178)：replace_exist 的"先删后写"不是原子操作。
         // 如果在 DELETE 之后、INSERT 之前发生崩溃/断电，会导致数据丢失。
-        // 当前缓解措施：foyer cache 仍保留完整数据，可通过 --flush-cache-to-db 重新回写。
+        // 当前缓解措施：model cache 仍保留完整数据，可通过 --flush-cache-to-db 重新回写。
         // 长期方案：考虑引入 WAL 或两阶段提交机制。
         //
         // replace 模式下需要确保 inst_info_map 对应的 inst_relate 都被级联删除，
@@ -972,7 +965,7 @@ impl TransactionBatcher {
                 attempt += 1;
 
                 let run_once = async {
-                    match SUL_DB.query(query.clone()).await {
+                    match SUL_DB.query_response(query.clone()).await {
                         Ok(mut resp) => take_all_results_or_err!(resp),
                         Err(err) => Err(anyhow::Error::from(err)),
                     }
@@ -981,10 +974,6 @@ impl TransactionBatcher {
 
                 match run_once {
                     Ok(()) => {
-                        // 双写到 KV_DB
-                        if aios_core::is_model_kv_enabled() {
-                            let _ = aios_core::KV_DB.query(query.clone()).await;
-                        }
                         return Ok(());
                     }
                     Err(e) => {
@@ -1002,7 +991,7 @@ impl TransactionBatcher {
                             );
                             let repair_sql = "REMOVE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb; \
 DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS in UNIQUE;";
-                            let _ = SUL_DB.query(repair_sql).await;
+                            let _ = SUL_DB.query_response(repair_sql).await;
                             continue;
                         }
 
@@ -1133,8 +1122,7 @@ pub async fn save_tubi_info_batch(
             .collect();
         
         let sql = format!("INSERT INTO tubi_info [{}];", values.join(","));
-        SUL_DB.query(&sql).await?;
-        aios_core::kv_dual_write(&sql).await;
+        SUL_DB.query_response(&sql).await?;
         inserted += chunk.len();
         
         debug_model_debug!(
@@ -1173,3 +1161,4 @@ async fn query_existing_tubi_info_ids(ids: &[String]) -> anyhow::Result<HashSet<
     
     Ok(existing)
 }
+

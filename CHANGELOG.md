@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-02-26
+
+### Fixed
+
+- **SurrealDB 3.x 嵌套子查询兼容修复（inst_query.rs）**
+  - `FROM out->geo_relate` → `FROM $parent.out->geo_relate`（2 处）
+  - SQL alias `transform` → `geo_transform`，与 `ModelHashInst` 结构体字段名对齐
+  - 导出查询 geo_type 过滤增加 `'Compound'` 回退（2 处）
+
 ## 2026-02-25
 
 ### Changed

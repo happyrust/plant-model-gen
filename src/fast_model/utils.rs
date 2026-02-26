@@ -199,15 +199,20 @@ pub async fn save_inst_relate_cata_bool(
     status: &str,
     source: &str,
 ) {
-    let refno_str = refno.to_string();
-    let id_key = format!("inst_relate_cata_bool:⟨{}⟩", refno_str);
-    let refno_key = format!("pe:⟨{}⟩", refno_str);
-    let mesh_str = mesh_id
-        .map(|m| format!("'{}'", m))
-        .unwrap_or_else(|| "NONE".to_string());
-    let sql = format!(
-        "UPSERT {id_key} CONTENT {{ refno: {refno_key}, mesh_id: {mesh_str}, status: '{status}', source: '{source}', updated_at: time::now() }};",
+    let refno_key = refno.to_pe_key();
+    let mut sql = format!(
+        "LET $inst_info = (SELECT VALUE out FROM {refno_key}->inst_relate LIMIT 1)[0];"
     );
+
+    // 始终先删除旧记录，保证每个 inst_info 仅保留一条最新状态关系。
+    sql.push_str("IF $inst_info != NONE { DELETE inst_relate_cata_bool WHERE in = $inst_info;");
+    if let Some(mesh_id) = mesh_id {
+        let mesh_key = format!("inst_geo:⟨{}⟩", mesh_id);
+        sql.push_str(&format!(
+            "INSERT RELATION INTO inst_relate_cata_bool [{{ in: $inst_info, out: {mesh_key}, status: '{status}', source: '{source}', updated_at: time::now() }}];"
+        ));
+    }
+    sql.push_str("};");
 
     if let Err(e) = SUL_DB.query(&sql).await {
         init_save_database_error(

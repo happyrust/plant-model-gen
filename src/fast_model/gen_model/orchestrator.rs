@@ -47,9 +47,8 @@ use crate::data_interface::sesno_increment::get_changes_at_sesno;
 use crate::data_interface::db_meta_manager::db_meta;
 
 use crate::fast_model::mesh_generate::{
-
-    run_boolean_worker, run_mesh_worker,
-
+    run_boolean_worker,
+    MeshTask, extract_mesh_tasks, run_mesh_worker_from_channel,
 };
 
 use crate::fast_model::pdms_inst::save_instance_data_optimize;
@@ -767,6 +766,25 @@ async fn process_index_tree_generation(
 
     let use_surrealdb = db_option.use_surrealdb;
 
+    // Mesh channel: insert_handle 在 save 成功后发送 MeshTask，mesh_handle 并行消费
+    let gen_mesh = db_option.inner.gen_mesh;
+    let (mesh_tx, mesh_rx) = if gen_mesh && use_surrealdb {
+        let (tx, rx) = flume::bounded::<Vec<MeshTask>>(100);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    // 启动 mesh worker（与 insert_handle 并行）
+    let mesh_handle = if let Some(rx) = mesh_rx {
+        let db_opt = Arc::new(db_option.inner.clone());
+        Some(tokio::spawn(async move {
+            run_mesh_worker_from_channel(rx, db_opt).await
+        }))
+    } else {
+        None
+    };
+
 
 
     // 初始化 Parquet 写入器（默认关闭，通过环境变量显式开启）。
@@ -965,6 +983,7 @@ async fn process_index_tree_generation(
                 let t0 = Instant::now();
                 let sem = db_write_semaphore.clone();
                 let shape_insts_clone = shape_insts_arc.clone();
+                let mesh_tx_clone = mesh_tx.clone();
                 db_write_handles.push(tokio::spawn(async move {
                     let _permit = match sem.acquire_owned().await {
                         Ok(p) => p,
@@ -976,6 +995,15 @@ async fn process_index_tree_generation(
                     if let Err(e) = save_instance_data_optimize(&shape_insts_clone, replace_exist).await {
                         eprintln!("保存实例数据失败: {}", e);
                         return false;
+                    }
+                    // save 成功后，提取 mesh 任务并发送到 mesh channel
+                    if let Some(tx) = mesh_tx_clone {
+                        let tasks = extract_mesh_tasks(&shape_insts_clone);
+                        if !tasks.is_empty() {
+                            if let Err(e) = tx.send_async(tasks).await {
+                                eprintln!("[mesh_channel] 发送 mesh 任务失败: {}", e);
+                            }
+                        }
                     }
                     true
                 }));
@@ -1046,17 +1074,15 @@ async fn process_index_tree_generation(
 
 
     // 🔥 显式 drop sender，让 receiver 的循环能够正常结束
-
     // 否则 insert_handle.await 会永久阻塞
-
     drop(sender);
-
-
 
     insert_handle
         .await
         .map_err(|e| anyhow::anyhow!("instance sink 任务异常退出: {}", e))?
         .map_err(IndexTreeError::Other)?;
+    // mesh_tx 已被 insert_handle 的 async move 闭包捕获，
+    // insert_handle 完成后 mesh_tx 自动 drop → mesh_handle 的 recv 循环正常结束
 
 
 
@@ -1093,69 +1119,47 @@ async fn process_index_tree_generation(
 
 
 
-    // 2️⃣ 可选执行 mesh 生成
+    // 2️⃣ 可选执行 mesh 生成（已通过 mesh_handle 并行处理，此处等待完成）
 
     if db_option.inner.gen_mesh {
 
         let mesh_start = Instant::now();
 
-        println!("[gen_model] IndexTree 模式开始生成三角网格（深度收集几何节点）");
-
-
-
-        // 收集所有 refnos
-
+        // 收集所有 refnos（后续 web bundle / aabb 等步骤仍需使用）
         let cate = categorized.get_by_category(NounCategory::Cate);
-
         let loops = categorized.get_by_category(NounCategory::LoopOwner);
-
         let prims = categorized.get_by_category(NounCategory::Prim);
-
         let mut all_refnos = Vec::new();
-
         all_refnos.extend(cate);
-
         all_refnos.extend(loops);
-
         all_refnos.extend(prims);
 
-
-
         let mut ran_primary = false;
-
-
 
         // model_cache mesh worker 已移除（foyer-cache-cleanup）
         let _ = &model_cache_ctx;
 
-
-
-        if use_surrealdb && !ran_primary {
-
-            if let Err(e) = run_mesh_worker(Arc::new(db_option.inner.clone()), 100).await {
-
-                eprintln!("[gen_model] mesh worker 失败: {}", e);
-
-            } else {
-
-                ran_primary = true;
-
+        // 等待 mesh_handle 完成（已与 insert_handle 并行执行）
+        if let Some(handle) = mesh_handle {
+            println!("[gen_model] 等待 mesh_worker_channel 完成...");
+            match handle.await {
+                Ok(Ok(())) => {
+                    ran_primary = true;
+                }
+                Ok(Err(e)) => {
+                    eprintln!("[gen_model] mesh_worker_channel 失败: {}", e);
+                }
+                Err(e) => {
+                    eprintln!("[gen_model] mesh_worker_channel 任务异常退出: {}", e);
+                }
             }
-
         }
 
-
-
         if ran_primary {
-
             println!(
-
                 "[gen_model] IndexTree 模式 mesh 生成完成，用时 {} ms",
-
                 mesh_start.elapsed().as_millis()
-
             );
-
         }
 
 

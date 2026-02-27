@@ -367,7 +367,15 @@ async fn test_online_regression() {
             let _ = std::fs::remove_file(&tmp_obj);
         }
         Err(e) => {
-            println!("⚠️  OBJ 导出失败（跳过 OBJ 比对）: {}", e);
+            let allow = std::env::var("AIOS_TEST_ALLOW_OBJ_EXPORT_FAILURE")
+                .ok()
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if allow {
+                eprintln!("⚠️  OBJ 导出失败（AIOS_TEST_ALLOW_OBJ_EXPORT_FAILURE=1，降级跳过）: {}", e);
+            } else {
+                panic!("OBJ 导出失败（设置 AIOS_TEST_ALLOW_OBJ_EXPORT_FAILURE=1 可降级跳过）: {}", e);
+            }
         }
     }
 

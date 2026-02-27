@@ -52,11 +52,158 @@ use parse_pdms_db::parse::round_f32;
 use serde_json::Value as JsonValue;
 use surrealdb::types as surrealdb_types;
 use surrealdb::types::SurrealValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use aios_core::geometry::ShapeInstancesData;
+
+/// Mesh Worker 执行报告（可观测容错）
+#[derive(Debug, Clone)]
+pub struct MeshWorkerReport {
+    /// 接收到的批次总数
+    pub batch_count: usize,
+    /// 实际处理（生成 mesh）的几何体数
+    pub total_processed: usize,
+    /// 去重跳过的几何体数
+    pub total_skipped: usize,
+    /// 执行的 DB 更新批次数
+    pub db_update_batches: usize,
+    /// DB 更新失败的批次数
+    pub db_update_failed_batches: usize,
+    /// DB 更新失败涉及的语句数
+    pub db_update_failed_statements: usize,
+    /// 总耗时（毫秒）
+    pub elapsed_ms: u128,
+    /// 是否发生过可恢复降级（DB 写入失败等）
+    pub degraded: bool,
+}
+
+impl MeshWorkerReport {
+    fn new() -> Self {
+        Self {
+            batch_count: 0,
+            total_processed: 0,
+            total_skipped: 0,
+            db_update_batches: 0,
+            db_update_failed_batches: 0,
+            db_update_failed_statements: 0,
+            elapsed_ms: 0,
+            degraded: false,
+        }
+    }
+
+    /// 打印统一 summary
+    pub fn print_summary(&self) {
+        let status = if self.degraded { "⚠️  DEGRADED" } else { "✅ OK" };
+        println!(
+            "╔════════════════════════════════════════╗\n\
+             ║  [mesh_worker_channel] Report  {}  ║\n\
+             ╠════════════════════════════════════════╣\n\
+             ║  处理总数:       {:>8}              ║\n\
+             ║  去重跳过:       {:>8}              ║\n\
+             ║  总批次:         {:>8}              ║\n\
+             ║  DB 更新批次:    {:>8}              ║\n\
+             ║  DB 失败批次:    {:>8}              ║\n\
+             ║  DB 失败语句:    {:>8}              ║\n\
+             ║  总耗时:         {:>8} ms            ║\n\
+             ╚════════════════════════════════════════╝",
+            status,
+            self.total_processed,
+            self.total_skipped,
+            self.batch_count,
+            self.db_update_batches,
+            self.db_update_failed_batches,
+            self.db_update_failed_statements,
+            self.elapsed_ms,
+        );
+    }
+}
+
+/// 有界去重器：HashSet + VecDeque 实现 LRU 式淘汰
+///
+/// 当容量达到上限时，弹出最早插入的元素以保证内存有上界。
+pub struct RecentGeoDeduper {
+    set: HashSet<u64>,
+    order: VecDeque<u64>,
+    capacity: usize,
+    /// 累计插入（新增）次数
+    pub insert_count: usize,
+    /// 累计重复命中次数
+    pub duplicate_count: usize,
+    /// 累计淘汰次数
+    pub evict_count: usize,
+}
+
+impl RecentGeoDeduper {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            set: HashSet::with_capacity(capacity.min(65536)),
+            order: VecDeque::with_capacity(capacity.min(65536)),
+            capacity,
+            insert_count: 0,
+            duplicate_count: 0,
+            evict_count: 0,
+        }
+    }
+
+    /// 尝试插入。返回 true 表示新增（未重复），false 表示重复。
+    pub fn insert(&mut self, value: u64) -> bool {
+        if self.set.contains(&value) {
+            self.duplicate_count += 1;
+            return false;
+        }
+        // 超容量淘汰最早的
+        if self.set.len() >= self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+                self.evict_count += 1;
+            }
+        }
+        self.set.insert(value);
+        self.order.push_back(value);
+        self.insert_count += 1;
+        true
+    }
+}
+
+/// SQL flush 阈值
+const MAX_UPDATE_STMTS_PER_FLUSH: usize = 200;
+const MAX_UPDATE_SQL_BYTES: usize = 512 * 1024;
+
+/// 将累积的 UPDATE 语句 flush 到 SurrealDB，返回 (成功, 失败语句数)
+async fn flush_update_stmts(stmts: &mut Vec<String>, report: &mut MeshWorkerReport) {
+    if stmts.is_empty() {
+        return;
+    }
+    let stmt_count = stmts.len();
+    let sql = stmts.join("");
+    stmts.clear();
+
+    report.db_update_batches += 1;
+    match SUL_DB.query(&sql).await {
+        Ok(_) => {}
+        Err(e) => {
+            report.db_update_failed_batches += 1;
+            report.db_update_failed_statements += stmt_count;
+            report.degraded = true;
+            let preview: String = sql.chars().take(500).collect();
+            eprintln!(
+                "[mesh_worker_channel] DB flush 失败: {} 条语句, error={}, sql_preview={}",
+                stmt_count, e, preview
+            );
+        }
+    }
+}
+
+/// 检查是否需要 flush（达到语句数或字节数阈值）
+fn should_flush(stmts: &[String]) -> bool {
+    if stmts.len() >= MAX_UPDATE_STMTS_PER_FLUSH {
+        return true;
+    }
+    let total_bytes: usize = stmts.iter().map(|s| s.len()).sum();
+    total_bytes >= MAX_UPDATE_SQL_BYTES
+}
 
 /// 内存直传的 Mesh 生成任务（无需查 DB）
 #[derive(Debug, Clone)]
@@ -554,11 +701,14 @@ pub async fn run_mesh_worker_from_cache(
 /// 从 `flume::Receiver<Vec<MeshTask>>` 接收 mesh 任务，直接使用内存中的几何参数
 /// 调用 `generate_csg_mesh` 生成网格，无需查询数据库获取 param。
 ///
-/// 去重：内部维护 `HashSet<u64>` 跟踪已处理的 `geo_hash`，跳过重复任务。
+/// 去重：内部维护 `RecentGeoDeduper`（有界 200,000）跟踪已处理的 `geo_hash`，跳过重复任务。
+///
+/// 容错：DB 更新失败属于"可恢复错误"，计数并置 `degraded=true`，继续后续批次。
+/// 目录创建失败等"不可恢复错误"仍返回 `Err`。
 pub async fn run_mesh_worker_from_channel(
     receiver: flume::Receiver<Vec<MeshTask>>,
     db_option: Arc<DbOption>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<MeshWorkerReport> {
     let mesh_dir = db_option.get_meshes_path();
     if !mesh_dir.exists() {
         std::fs::create_dir_all(&mesh_dir)?;
@@ -583,10 +733,8 @@ pub async fn run_mesh_worker_from_channel(
     let pts_json_map: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
     let inst_aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
 
-    let mut processed: HashSet<u64> = HashSet::new();
-    let mut total_processed = 0usize;
-    let mut total_skipped = 0usize;
-    let mut batch_count = 0usize;
+    let mut deduper = RecentGeoDeduper::new(200_000);
+    let mut report = MeshWorkerReport::new();
     let worker_start = std::time::Instant::now();
 
     println!(
@@ -597,14 +745,14 @@ pub async fn run_mesh_worker_from_channel(
     );
 
     while let Ok(tasks) = receiver.recv_async().await {
-        batch_count += 1;
+        report.batch_count += 1;
         let batch_start = std::time::Instant::now();
         let mut batch_new = 0usize;
-        let mut update_sql = String::new();
+        let mut update_stmts: Vec<String> = Vec::new();
 
         for task in &tasks {
-            if !processed.insert(task.geo_hash) {
-                total_skipped += 1;
+            if !deduper.insert(task.geo_hash) {
+                report.total_skipped += 1;
                 continue;
             }
 
@@ -623,6 +771,8 @@ pub async fn run_mesh_worker_from_channel(
 
             let target_dir = if task.is_neg { &neg_dir } else { &lod_dir };
 
+            // handle_csg_mesh 仍使用 &mut String，此处用临时 String 桥接后拆分为语句
+            let mut tmp_sql = String::new();
             match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
                 Some(csg_mesh) => {
                     if let Err(e) = handle_csg_mesh(
@@ -633,14 +783,14 @@ pub async fn run_mesh_worker_from_channel(
                         &aabb_map,
                         &pts_json_map,
                         &inst_aabb_map,
-                        &mut update_sql,
+                        &mut tmp_sql,
                         &mesh_formats,
                         task.is_neg,
                     )
                     .await
                     {
                         debug_model_warn!("CSG mesh 生成失败 for {}: {}", mesh_id, e);
-                        update_sql.push_str(&format!(
+                        tmp_sql.push_str(&format!(
                             "UPDATE inst_geo:⟨{}⟩ SET bad=true, meshed=true;",
                             mesh_id
                         ));
@@ -652,31 +802,36 @@ pub async fn run_mesh_worker_from_channel(
                         mesh_id,
                         geo_type_name
                     );
-                    update_sql.push_str(&format!(
+                    tmp_sql.push_str(&format!(
                         "UPDATE inst_geo:⟨{}⟩ SET bad=true, meshed=true;",
                         mesh_id
                     ));
                 }
             }
-            batch_new += 1;
-        }
 
-        // 批量回写 DB
-        if !update_sql.is_empty() {
-            match SUL_DB.query(&update_sql).await {
-                Ok(_) => {}
-                Err(e) => eprintln!("[mesh_worker_channel] 更新数据库失败: {}", e),
+            // 将临时 SQL 作为一条语句收集
+            if !tmp_sql.is_empty() {
+                update_stmts.push(tmp_sql);
+            }
+            batch_new += 1;
+
+            // 检查阈值，满足则立即 flush
+            if should_flush(&update_stmts) {
+                flush_update_stmts(&mut update_stmts, &mut report).await;
             }
         }
 
-        total_processed += batch_new;
+        // batch 结束后 final flush
+        flush_update_stmts(&mut update_stmts, &mut report).await;
+
+        report.total_processed += batch_new;
 
         println!(
             "[mesh_worker_channel] 📊 批次 {} | 新增 {} 个 | 跳过 {} | 累计 {} | 用时 {} ms",
-            batch_count,
+            report.batch_count,
             batch_new,
-            total_skipped,
-            total_processed,
+            report.total_skipped,
+            report.total_processed,
             batch_start.elapsed().as_millis()
         );
     }
@@ -685,31 +840,19 @@ pub async fn run_mesh_worker_from_channel(
     utils::save_pts_to_surreal(&pts_json_map).await;
     utils::save_aabb_to_surreal(&aabb_map).await;
 
-    let total_time = worker_start.elapsed();
-    let avg_speed = if total_time.as_secs() > 0 {
-        total_processed as f64 / total_time.as_secs_f64()
-    } else {
-        total_processed as f64
-    };
+    report.elapsed_ms = worker_start.elapsed().as_millis();
 
-    println!(
-        "╔════════════════════════════════════════╗\n\
-         ║  [mesh_worker_channel] Mesh 生成完成   ║\n\
-         ╠════════════════════════════════════════╣\n\
-         ║  处理总数:   {:>8}                  ║\n\
-         ║  去重跳过:   {:>8}                  ║\n\
-         ║  总批次:     {:>8}                  ║\n\
-         ║  总耗时:     {:>8} ms              ║\n\
-         ║  平均速度:   {:>8.1} 个/秒          ║\n\
-         ╚════════════════════════════════════════╝",
-        total_processed,
-        total_skipped,
-        batch_count,
-        total_time.as_millis(),
-        avg_speed
-    );
+    // 打印去重器统计
+    if deduper.evict_count > 0 {
+        println!(
+            "[mesh_worker_channel] 去重器统计: 新增={}, 重复={}, 淘汰={}",
+            deduper.insert_count, deduper.duplicate_count, deduper.evict_count
+        );
+    }
 
-    Ok(())
+    report.print_summary();
+
+    Ok(report)
 }
 
 /// 基于 inst_relate 状态的布尔运算 Worker
@@ -1743,4 +1886,93 @@ pub async fn update_scene_node_aabbs_by_refnos(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn test_deduper_basic_insert_and_duplicate() {
+        let mut d = RecentGeoDeduper::new(10);
+        assert!(d.insert(1));
+        assert!(d.insert(2));
+        assert!(!d.insert(1)); // 重复
+        assert_eq!(d.insert_count, 2);
+        assert_eq!(d.duplicate_count, 1);
+        assert_eq!(d.evict_count, 0);
+    }
+
+    #[test]
+    fn test_deduper_eviction_at_capacity() {
+        let mut d = RecentGeoDeduper::new(3);
+        assert!(d.insert(10));
+        assert!(d.insert(20));
+        assert!(d.insert(30));
+        // 容量已满，插入 40 应淘汰最早的 10
+        assert!(d.insert(40));
+        assert_eq!(d.evict_count, 1);
+        // 10 已被淘汰，再次插入应视为新增
+        assert!(d.insert(10));
+        assert_eq!(d.insert_count, 5);
+        assert_eq!(d.evict_count, 2); // 淘汰了 20
+        // 20 已被淘汰
+        assert!(d.insert(20));
+        assert_eq!(d.evict_count, 3); // 淘汰了 30
+    }
+
+    #[test]
+    fn test_deduper_zero_capacity() {
+        let mut d = RecentGeoDeduper::new(0);
+        // 容量为 0 时每次插入都立即淘汰（边界情况）
+        // insert(1): set.len()=0 >= capacity=0 → 但 order 为空不淘汰 → 插入
+        assert!(d.insert(1));
+        // insert(2): set.len()=1 >= capacity=0 → 淘汰 1 → 插入 2
+        assert!(d.insert(2));
+        assert_eq!(d.evict_count, 1);
+        // 1 已被淘汰，不是重复
+        assert!(d.insert(1));
+        assert_eq!(d.evict_count, 2);
+    }
+
+    #[test]
+    fn test_should_flush_by_stmt_count() {
+        let stmts: Vec<String> = (0..MAX_UPDATE_STMTS_PER_FLUSH)
+            .map(|i| format!("UPDATE x:{};", i))
+            .collect();
+        assert!(should_flush(&stmts));
+
+        let small: Vec<String> = vec!["UPDATE x:1;".to_string()];
+        assert!(!should_flush(&small));
+    }
+
+    #[test]
+    fn test_should_flush_by_byte_size() {
+        // 构造一条超长语句
+        let big_stmt = "X".repeat(MAX_UPDATE_SQL_BYTES + 1);
+        let stmts = vec![big_stmt];
+        assert!(should_flush(&stmts));
+    }
+
+    #[test]
+    fn test_mesh_worker_report_default() {
+        let r = MeshWorkerReport::new();
+        assert_eq!(r.batch_count, 0);
+        assert_eq!(r.total_processed, 0);
+        assert_eq!(r.total_skipped, 0);
+        assert_eq!(r.db_update_batches, 0);
+        assert_eq!(r.db_update_failed_batches, 0);
+        assert_eq!(r.db_update_failed_statements, 0);
+        assert_eq!(r.elapsed_ms, 0);
+        assert!(!r.degraded);
+    }
+
+    #[test]
+    fn test_mesh_worker_report_degraded_flag() {
+        let mut r = MeshWorkerReport::new();
+        r.db_update_failed_batches = 1;
+        r.db_update_failed_statements = 5;
+        r.degraded = true;
+        assert!(r.degraded);
+        // print_summary 不应 panic
+        r.print_summary();
+    }
+}

@@ -689,13 +689,15 @@ async fn main() -> anyhow::Result<()> {
             Arg::new("fill-missing-cache")
                 .long("fill-missing-cache")
                 .help("When exporting dbnum parquet from cache, auto-generate missing refnos before export (default: disabled)")
-                .action(clap::ArgAction::SetTrue),
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("from-surrealdb"),
         )
         .arg(
             Arg::new("from-surrealdb")
                 .long("from-surrealdb")
                 .help("Use SurrealDB as data source for parquet export (instead of model cache)")
-                .action(clap::ArgAction::SetTrue),
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("fill-missing-cache"),
         )
         .arg(
             Arg::new("export-pdms-tree-parquet")

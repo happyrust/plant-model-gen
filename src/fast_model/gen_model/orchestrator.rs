@@ -48,7 +48,7 @@ use crate::data_interface::db_meta_manager::db_meta;
 
 use crate::fast_model::mesh_generate::{
     run_boolean_worker,
-    MeshTask, extract_mesh_tasks, run_mesh_worker_from_channel,
+    MeshTask, MeshWorkerReport, extract_mesh_tasks, run_mesh_worker_from_channel,
 };
 
 use crate::fast_model::pdms_inst::save_instance_data_optimize;
@@ -1143,23 +1143,31 @@ async fn process_index_tree_generation(
         if let Some(handle) = mesh_handle {
             println!("[gen_model] 等待 mesh_worker_channel 完成...");
             match handle.await {
-                Ok(Ok(())) => {
+                Ok(Ok(report)) => {
                     ran_primary = true;
+                    if report.degraded {
+                        eprintln!(
+                            "[gen_model] ⚠️ mesh_worker_channel 完成但存在降级: 失败批次={}, 失败语句={}",
+                            report.db_update_failed_batches,
+                            report.db_update_failed_statements,
+                        );
+                    }
+                    println!(
+                        "[gen_model] IndexTree 模式 mesh 生成完成，用时 {} ms",
+                        mesh_start.elapsed().as_millis()
+                    );
                 }
                 Ok(Err(e)) => {
-                    eprintln!("[gen_model] mesh_worker_channel 失败: {}", e);
+                    return Err(IndexTreeError::Other(anyhow::anyhow!(
+                        "mesh_worker_channel 不可恢复错误: {}", e
+                    )));
                 }
                 Err(e) => {
-                    eprintln!("[gen_model] mesh_worker_channel 任务异常退出: {}", e);
+                    return Err(IndexTreeError::Other(anyhow::anyhow!(
+                        "mesh_worker_channel 任务 panic: {}", e
+                    )));
                 }
             }
-        }
-
-        if ran_primary {
-            println!(
-                "[gen_model] IndexTree 模式 mesh 生成完成，用时 {} ms",
-                mesh_start.elapsed().as_millis()
-            );
         }
 
 

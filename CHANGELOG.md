@@ -15,11 +15,27 @@
 
 - **`build_manifold_mesh_path` 匹配 `_m.manifold` 文件名格式**
 
+- **mesh_worker 可观测容错重构**
+  - `run_mesh_worker_from_channel` 返回 `MeshWorkerReport`（含 batch_count、total_processed、total_skipped、db_update_batches/failed、elapsed_ms、degraded 等 8 字段）
+  - DB 更新失败属可恢复错误，计数并置 `degraded=true`，继续后续批次
+  - SQL 分块 flush：`Vec<String>` 替代单 `String` 累加，阈值 200 条 / 512KB
+  - `RecentGeoDeduper` 有界去重器（capacity=200,000）替代无界 `HashSet<u64>`
+  - `orchestrator.rs`：mesh_handle 接入 `MeshWorkerReport`，不可恢复错误 / panic 返回 `Err` 中断
+
+- **布尔运算负实体膨胀消除共面薄片**
+  - `NEG_INFLATE_EPSILON_MM=0.5` 常量
+  - `apply_cata_neg_boolean_manifold` / `apply_boolean_for_query`：负实体 inflate 后再 difference
+
+- **CLI 参数冲突约束**
+  - `--fill-missing-cache` 与 `--from-surrealdb` 互斥（`conflicts_with`）
+
 ### Added
 
 - **`pdms_inst.rs` 负实体实例查询支持**
 - **`export_dbnum_instances_parquet.rs` Parquet 导出优化**
 - **模型回归测试 `boolean_17496_106028`**
+  - OBJ 导出失败默认 `panic!`，环境变量 `AIOS_TEST_ALLOW_OBJ_EXPORT_FAILURE=1` 允许降级跳过
+- **`RecentGeoDeduper` + `MeshWorkerReport` 单元测试（7 个）**
 
 ## 2026-02-26
 

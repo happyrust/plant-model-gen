@@ -50,6 +50,10 @@ use std::path::{Path, PathBuf};
 
 use std::{fs, io};
 
+/// 负实体膨胀量（mm）：消除布尔运算中共面薄片的 epsilon
+/// 每边扩展此值，使负实体略微超出正实体表面，产生干净切割
+const NEG_INFLATE_EPSILON_MM: f64 = 0.5;
+
 
 
 async fn filter_out_bran_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
@@ -1036,7 +1040,7 @@ pub async fn apply_cata_neg_boolean_manifold(
 
                 ) {
 
-                    Some(manifold) => neg_manifolds.push(manifold),
+                    Some(manifold) => neg_manifolds.push(manifold.inflate_from_center(NEG_INFLATE_EPSILON_MM)),
 
                     None => neg_load_fail_cnt += 1,
 
@@ -1712,7 +1716,7 @@ async fn apply_boolean_for_query(
 
                     }
 
-                    neg_manifolds.push(manifold);
+                    neg_manifolds.push(manifold.inflate_from_center(NEG_INFLATE_EPSILON_MM));
 
                 }
 

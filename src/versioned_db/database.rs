@@ -1709,8 +1709,10 @@ pub async fn sync_total_async_threaded(
 
                 // 解析期：把 refno/noun/name/site 收集到 JSONL（中间格式），并在本 db 文件解析完成后批量导入 Meilisearch。
                 // 该流程不依赖 surreal-save feature；未配置 meili_url 时自动跳过。
+                #[cfg(feature = "meili")]
                 let meili_cfg =
                     crate::meili::pdms_index::MeiliEnvConfig::from_db_option(db_option_arc.as_ref());
+                #[cfg(feature = "meili")]
                 let mut meili_spool: Option<crate::meili::pdms_index::PdmsSpoolWriter> = None;
                 let mut tree_nodes: HashMap<RefU64, TreeNodeMeta> = HashMap::new();
                 let mut total_cnt = 0;
@@ -1764,44 +1766,46 @@ pub async fn sync_total_async_threaded(
                             let total_attr_map_arc = Arc::new(total_attr_map);
 
                             // Meilisearch spool：每个 chunk 产出一批 total_attr_map，直接追加写入 JSONL。
-                            if meili_spool.is_none() {
-                                if let Some(cfg) = meili_cfg.as_ref() {
-                                    match crate::meili::pdms_index::PdmsSpoolWriter::create(
-                                        &cfg.spool_dir,
-                                        dbnum as i32,
-                                    ) {
-                                        Ok(w) => meili_spool = Some(w),
-                                        Err(e) => {
-                                            warn!("创建 Meili spool 失败(dbnum={}): {}", dbnum, e);
+                            #[cfg(feature = "meili")]
+                            {
+                                if meili_spool.is_none() {
+                                    if let Some(cfg) = meili_cfg.as_ref() {
+                                        match crate::meili::pdms_index::PdmsSpoolWriter::create(
+                                            &cfg.spool_dir,
+                                            dbnum as i32,
+                                        ) {
+                                            Ok(w) => meili_spool = Some(w),
+                                            Err(e) => {
+                                                warn!("创建 Meili spool 失败(dbnum={}): {}", dbnum, e);
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            if let Some(spool) = meili_spool.as_mut() {
-                                for entry in total_attr_map_arc.iter() {
-                                    let refno = *entry.key();
-                                    let att = entry.value();
-                                    let noun = att.get_type_str().to_string();
-                                    let name = crate::api::element::cal_default_name(
-                                        refno,
-                                        att,
-                                        &db_basic.children_map,
-                                    );
-                                    let doc = crate::meili::pdms_index::PdmsNodeDoc {
-                                        id: format!("{}_{}", dbnum, refno),
-                                        refno: refno.to_string(),
-                                        noun,
-                                        name,
-                                        site: dbnum.to_string(),
-                                    };
-                                    if let Err(e) = spool.write_doc(&doc) {
-                                        // 失败后直接关闭 spool，避免一直刷日志/拖慢解析
-                                        warn!(
-                                            "写入 Meili spool 失败(dbnum={}, refno={}): {}",
-                                            dbnum, refno, e
+                                if let Some(spool) = meili_spool.as_mut() {
+                                    for entry in total_attr_map_arc.iter() {
+                                        let refno = *entry.key();
+                                        let att = entry.value();
+                                        let noun = att.get_type_str().to_string();
+                                        let name = crate::api::element::cal_default_name(
+                                            refno,
+                                            att,
+                                            &db_basic.children_map,
                                         );
-                                        meili_spool = None;
-                                        break;
+                                        let doc = crate::meili::pdms_index::PdmsNodeDoc {
+                                            id: format!("{}_{}", dbnum, refno),
+                                            refno: refno.to_string(),
+                                            noun,
+                                            name,
+                                            site: dbnum.to_string(),
+                                        };
+                                        if let Err(e) = spool.write_doc(&doc) {
+                                            warn!(
+                                                "写入 Meili spool 失败(dbnum={}, refno={}): {}",
+                                                dbnum, refno, e
+                                            );
+                                            meili_spool = None;
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -1915,6 +1919,7 @@ pub async fn sync_total_async_threaded(
                 let chunk_parse_ms = chunk_stage_start.elapsed().as_millis();
 
                 // 本 db 文件解析完成：导入 Meilisearch（失败不阻塞解析主流程）
+                #[cfg(feature = "meili")]
                 if let (Some(cfg), Some(mut spool)) = (meili_cfg.as_ref(), meili_spool) {
                     if let Err(e) = spool.flush() {
                         warn!("flush Meili spool 失败(dbnum={}): {}", dbnum, e);

@@ -1014,7 +1014,7 @@ DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS in UNIQ
                             e,
                             debug_query
                         );
-                        let file_name = format!("failed_sql_batch_{}.log", uuid::Uuid::new_v4());
+                        let file_name = format!("failed_sql_batch_{}.log", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
                         if let Err(write_err) = std::fs::write(&file_name, &debug_query) {
                             eprintln!("写入失败 SQL 诊断日志至 {} 时出错: {}", file_name, write_err);
                         } else {

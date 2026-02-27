@@ -44,7 +44,16 @@ path = "src/bin/meili_reindex.rs"
 
 # 该工具依赖 DuckDB/MeiliSearch 相关能力，默认不参与构建主流程。
 
-required-features = ["duckdb-feature"]
+required-features = ["duckdb-feature", "meili"]
+
+
+[[bin]]
+
+name = "meili_import_spool"
+
+path = "src/bin/meili_import_spool.rs"
+
+required-features = ["meili"]
 
 
 [dependencies]
@@ -118,7 +127,7 @@ derive_more = { version = "1.0.0", features = ["deref", "deref_mut"] }
 
 bitflags = "2.9.4"
 
-bitvec = "1.0.0"
+# bitvec 已移除（仅 plug_in 死代码使用）
 
 chrono = "0.4.22"
 
@@ -160,7 +169,7 @@ pdms_io = { path = "../pdms-io-fork" }
 
 # 通用依赖
 
-uuid = { version = "1.0", features = ["v4", "serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"], optional = true }
 
 num_cpus = "1.16"
 
@@ -170,7 +179,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 
     "rustls-tls",
 
-] }
+], optional = true }
 
 
 clap = { version = "4.3.5", features = ["derive"] }
@@ -197,16 +206,12 @@ rkyv = { version = "0.8.12", features = ["hashbrown-0_15"] }
 
 rfd = { version = "0.15.4", features = ["async-std"], optional = true }
 
-meilisearch-sdk = "0.26.1"
+meilisearch-sdk = { version = "0.26.1", optional = true }
 
 # redb = "3.0.1" # Removed - using SQLite for all storage
 
 
-image = { version = "0.24", default-features = false, features = ["png"] }
-
-imageproc = "0.23"
-
-rusttype = "0.9"
+# image/imageproc/rusttype 已移除（无使用）
 
 gltf = "1.4"
 
@@ -243,7 +248,7 @@ tracing = "0.1.40"
 
 tracing-subscriber = { version = "0.3.18", features = ["registry", "json"] }
 
-tracing-chrome = "0.7.1"
+tracing-chrome = { version = "0.7.1", optional = true }
 
 strum = { version = "0.27.2", features = ["derive"] }
 
@@ -251,7 +256,7 @@ simplelog = "0.12.2"
 
 flume = "0.11.0"
 
-rust-embed = "8.2.0"
+rust-embed = { version = "8.2.0", optional = true }
 
 twox-hash = "1.6"
 
@@ -360,7 +365,7 @@ project_hd = []
 
 project_hh = []
 
-profile = [] #性能分析，包含tracing功能
+profile = ["dep:tracing-chrome"] #性能分析，包含tracing功能
 
 web_server = [
 
@@ -384,6 +389,12 @@ web_server = [
 
     "sqlite-index",
 
+    "dep:reqwest",
+
+    "dep:uuid",
+
+    "meili",
+
 ] #Web UI功能
 
 duckdb-feature = ["dep:duckdb"] # DuckDB 模型导出功能
@@ -391,6 +402,8 @@ duckdb-feature = ["dep:duckdb"] # DuckDB 模型导出功能
 sqlite-index = ["dep:rusqlite", "dep:tokio-util"] # SQLite RTree 空间索引功能
 
 debug_e3d = []
+
+meili = ["dep:meilisearch-sdk"]
 
 # 凸分解：拆分为“运行时（无 miniacd）”与“生成（依赖 miniacd）”两层，避免仅做碰撞/单测时被 pyo3 依赖拖慢/阻塞。
 

@@ -31,7 +31,7 @@ pub enum MbdPipeSource {
 
 impl Default for MbdPipeSource {
     fn default() -> Self {
-        Self::Parquet
+        Self::Db
     }
 }
 
@@ -74,7 +74,7 @@ pub struct MbdPipeQuery {
 impl Default for MbdPipeQuery {
     fn default() -> Self {
         Self {
-            source: MbdPipeSource::Parquet,
+            source: MbdPipeSource::Db,
             dbno: None,
             batch_id: None,
             debug: false,
@@ -825,10 +825,15 @@ async fn fetch_tubi_segments_from_parquet_with_debug(
 
     // 读取 tubings parquet，按 owner_refno_str 过滤
     let owner_refno_str = branch_refno.to_string();
-    let tubings_df = LazyFrame::scan_parquet(&tubings_path, Default::default())?
-        .filter(col("owner_refno_str").eq(lit(owner_refno_str.clone())))
-        .sort(["order"], Default::default())
-        .collect()?;
+    let tubings_df = {
+        let file = std::fs::File::open(&tubings_path)?;
+        let full_df = ParquetReader::new(file).finish()?;
+        let mask = full_df.column("owner_refno_str")?.str()?.into_iter()
+            .map(|opt| opt.map_or(false, |v| v == owner_refno_str))
+            .collect::<BooleanChunked>();
+        let filtered = full_df.filter(&mask)?;
+        filtered.sort(["order"], Default::default())?
+    };
 
     if tubings_df.height() == 0 {
         anyhow::bail!(
@@ -849,10 +854,13 @@ async fn fetch_tubi_segments_from_parquet_with_debug(
 
     // 读取 transforms parquet，按需过滤
     let trans_map: HashMap<String, glam::Mat4> = if transforms_path.exists() {
-        let hash_series = Series::new("h".into(), &trans_hashes);
-        let trans_df = LazyFrame::scan_parquet(&transforms_path, Default::default())?
-            .filter(col("trans_hash").is_in(lit(hash_series)))
-            .collect()?;
+        let file = std::fs::File::open(&transforms_path)?;
+        let full_trans_df = ParquetReader::new(file).finish()?;
+        let hash_set: std::collections::HashSet<&str> = trans_hashes.iter().map(|s| s.as_str()).collect();
+        let mask = full_trans_df.column("trans_hash")?.str()?.into_iter()
+            .map(|opt| opt.map_or(false, |v| hash_set.contains(v)))
+            .collect::<BooleanChunked>();
+        let trans_df = full_trans_df.filter(&mask)?;
         let mut m: HashMap<String, glam::Mat4> = HashMap::new();
         for i in 0..trans_df.height() {
             let hash = trans_df.column("trans_hash")?.str()?.get(i).unwrap_or_default().to_string();
@@ -1035,18 +1043,18 @@ async fn fetch_tubi_segments_from_cache_with_debug(
     debug.batches_used = vec!["per-refno".to_string()];
     for &leave_refno in &cached_refnos {
         let Some(cached) = cache.get_inst_info(active_dbnum, leave_refno).await else { continue };
-        let Some(ref tubi_info) = cached.tubi else { continue };
+        let Some(ref tubi_data) = cached.info.tubi else { continue };
         if cached.info.owner_refno.refno() != branch_u64 {
             continue;
         }
         // cache 里 tubi start_pt/end_pt 可能未写入（或被裁剪），此时用 tubi 的 world_transform
         // 将 unit cylinder 的端点 (0,0,0)-(0,0,1) 变换到世界坐标，作为稳定兜底。
-        let tubi_start = tubi_info.tubi.as_ref().and_then(|t| t.start_pt);
-        let tubi_end = tubi_info.tubi.as_ref().and_then(|t| t.end_pt);
+        let tubi_start = tubi_data.start_pt;
+        let tubi_end = tubi_data.end_pt;
         let (start, end) = match (tubi_start, tubi_end) {
             (Some(s), Some(e)) => (s, e),
             _ => {
-                let wt = tubi_info.get_ele_world_transform();
+                let wt = cached.info.get_ele_world_transform();
                 let m = wt.to_matrix();
                 (
                     tubi_start
@@ -1060,12 +1068,12 @@ async fn fetch_tubi_segments_from_cache_with_debug(
             leave_refno,
             CacheTubiSeg {
                 refno: leave_refno,
-                arrive_refno: tubi_info.tubi.as_ref().and_then(|t| t.arrive_refno),
-                order: tubi_info.tubi.as_ref().and_then(|t| t.index),
+                arrive_refno: tubi_data.arrive_refno,
+                order: tubi_data.index,
                 start,
                 end,
-                arrive_axis: tubi_info.tubi.as_ref().and_then(|t| t.arrive_axis_pt).map(Vec3::from),
-                leave_axis: tubi_info.tubi.as_ref().and_then(|t| t.leave_axis_pt).map(Vec3::from),
+                arrive_axis: tubi_data.arrive_axis_pt.map(Vec3::from),
+                leave_axis: tubi_data.leave_axis_pt.map(Vec3::from),
             },
         );
     }

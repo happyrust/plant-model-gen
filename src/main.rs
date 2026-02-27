@@ -1274,7 +1274,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --defer-db-write：模型生成阶段不写 SurrealDB，SQL 输出到 .surql 文件
-    if matches.get_flag("defer-db-write") {
+    let defer_db_write_explicit = matches.get_flag("defer-db-write");
+    if defer_db_write_explicit {
         println!("🗂️ 检测到 --defer-db-write 参数，模型生成阶段将跳过 SurrealDB 写入，SQL 输出到 .surql 文件");
         db_option_ext.defer_db_write = true;
     }
@@ -1299,6 +1300,25 @@ async fn main() -> anyhow::Result<()> {
         || (debug_model_requested && capture_dir.is_some());
 
     if obj_export_flow {
+        // 导出依赖 inst_relate/inst_relate_bool 等库内数据。
+        // 若 defer_db_write 来自配置文件，默认自动关闭以保证导出完整性；
+        // 若用户显式传入 --defer-db-write，则直接报错，避免产生“仅部分可见”的误导性 OBJ。
+        if db_option_ext.defer_db_write {
+            if defer_db_write_explicit {
+                anyhow::bail!(
+                    "检测到 --defer-db-write 与导出参数同时使用。\
+                    defer 模式不会在本轮写入 SurrealDB，OBJ/GLB 可能仅导出到部分几何（常见表现：只看到 TUBI）。\
+                    请先生成并 --import-sql，再执行导出，或移除 --defer-db-write。"
+                );
+            } else {
+                println!(
+                    "⚠️ 检测到配置 defer_db_write=true，且本次请求导出模型；\
+                    已自动切换为直写 SurrealDB 以保证导出完整性。"
+                );
+                db_option_ext.defer_db_write = false;
+            }
+        }
+
         if matches.get_flag("use-surrealdb") {
             // SurrealDB-only：用于对照验证，避免与 cache 混用
             db_option_ext.use_surrealdb = true;

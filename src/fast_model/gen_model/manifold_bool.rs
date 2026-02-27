@@ -2280,7 +2280,7 @@ pub async fn apply_insts_boolean_manifold(
 
     let queries: Vec<ManiGeoTransQuery> =
 
-        query_manifold_boolean_operations_batch_optimized(&targets).await?;
+        query_manifold_boolean_operations_batch_optimized(&targets, replace_exist).await?;
 
     println!(
 

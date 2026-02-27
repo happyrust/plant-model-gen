@@ -1068,6 +1068,14 @@ async fn process_index_tree_generation(
 
 
 
+        println!(
+            "[insert_handle] 汇总: batch_cnt={}, t_save_db={}ms, t_cache={}ms, t_parquet={}ms",
+            batch_cnt,
+            t_save_db.as_millis(),
+            t_cache.as_millis(),
+            t_parquet.as_millis(),
+        );
+
         #[cfg(feature = "profile")]
 
         {

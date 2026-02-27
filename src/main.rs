@@ -820,6 +820,19 @@ async fn main() -> anyhow::Result<()> {
                 .value_delimiter(',')
                 .num_args(1..),
         )
+        // ========== MBD JSON 预生成 ==========
+        .arg(
+            Arg::new("export-mbd")
+                .long("export-mbd")
+                .help("预生成所有 BRAN/HANG 的 MBD 标注 JSON 文件（按 --dbnum 过滤，不传则全量）")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("export-mbd-refno")
+                .long("export-mbd-refno")
+                .help("预生成指定 refno 及其子孙 BRAN/HANG 的 MBD 标注 JSON 文件")
+                .value_name("REFNO"),
+        )
         .get_matches();
 
     // 获取配置文件路径
@@ -1009,6 +1022,38 @@ async fn main() -> anyhow::Result<()> {
     }
 
 
+
+    // ========== MBD JSON 预生成 ==========
+    #[cfg(feature = "web_server")]
+    if matches.get_flag("export-mbd") || matches.get_one::<String>("export-mbd-refno").is_some() {
+        use aios_database::web_api::{MbdExportScope, export_mbd_json_batch, get_mbd_output_dir};
+
+        init_surreal().await?;
+        let output_dir = get_mbd_output_dir();
+
+        let scope = if let Some(refno_str) = matches.get_one::<String>("export-mbd-refno") {
+            use aios_core::pdms_types::RefnoEnum;
+            use std::str::FromStr;
+            let refno_str = refno_str.replace('_', "/");
+            let refno = RefnoEnum::from_str(&refno_str)
+                .map_err(|e| anyhow::anyhow!("无效的 refno '{}': {e}", refno_str))?;
+            println!("🎯 MBD 预生成：指定 refno={} 及其子孙 BRAN/HANG", refno);
+            MbdExportScope::ByRefno(refno)
+        } else if let Some(dbnum) = matches.get_one::<u32>("dbnum").copied() {
+            println!("🎯 MBD 预生成：dbnum={} 下所有 BRAN/HANG", dbnum);
+            MbdExportScope::ByDbnum(dbnum)
+        } else {
+            println!("🎯 MBD 预生成：全量 BRAN/HANG");
+            MbdExportScope::AllDbnums
+        };
+
+        let stats = export_mbd_json_batch(&output_dir, scope).await?;
+        println!(
+            "✅ MBD 预生成完成：{}/{} 成功，输出目录 {}",
+            stats.success, stats.total, stats.output_dir
+        );
+        return Ok(());
+    }
 
     // 调试：显示配置加载结果
     println!("🔧 配置加载完成:");

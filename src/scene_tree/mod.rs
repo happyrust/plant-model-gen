@@ -30,8 +30,8 @@ pub use parquet_export::export_scene_tree_parquet;
 
 /// 检查 scene_tree 是否已初始化
 pub async fn is_initialized() -> Result<bool> {
-    // 使用 VALUE 提取 count 值
-    let sql = "SELECT VALUE count() FROM scene_node GROUP ALL";
+    // 用 RETURN 返回纯 int，避免 record/object 反序列化兼容问题
+    let sql = "RETURN array::len((SELECT id FROM scene_node LIMIT 1));";
     let result: Vec<i64> = SUL_DB.query_take(sql, 0).await.unwrap_or_default();
     Ok(result.first().copied().unwrap_or(0) > 0)
 }

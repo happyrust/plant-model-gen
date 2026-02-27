@@ -243,17 +243,7 @@ pub async fn get_world_transform_cache_first(
         }
     }
 
-    // miss：先用"直接读 pe.world_trans"的轻量路径（不依赖 pe_transform 预热）。
-    if let Ok(Some(world)) = aios_core::rs_surreal::query_pe_world_trans(refno).await {
-        if let (true, Some(dbnum)) = (use_cache, dbnum) {
-            if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
-                cache.insert_world_transform(dbnum, refno, world.clone());
-            }
-        }
-        return Ok(Some(world));
-    }
-
-    // 再兜底走旧计算路径（策略/惰性计算）。
+    // miss：走旧计算路径（策略/惰性计算）。
     let computed = aios_core::get_world_transform(refno).await?;
     if let Some(world) = computed.clone() {
         if let (true, Some(dbnum)) = (use_cache, dbnum) {

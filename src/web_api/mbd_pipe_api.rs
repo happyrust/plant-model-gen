@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, Query},
     http::{HeaderValue, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json,
 };
 use glam::Vec3;
@@ -69,6 +69,10 @@ pub struct MbdPipeQuery {
     pub include_branch_attrs: bool,
     /// 是否尝试用 TreeIndex 的 noun 辅助推断 weld_type（默认关闭，避免额外依赖/误判）
     pub include_weld_nouns: bool,
+    /// 是否输出弯头数据（BEND/ELBO）
+    pub include_bends: bool,
+    /// 弯头标注模式：workpoint（中心线交点，默认）/ facecenter（端面中心）
+    pub bend_mode: MbdBendMode,
 }
 
 impl Default for MbdPipeQuery {
@@ -91,6 +95,8 @@ impl Default for MbdPipeQuery {
             include_slopes: true,
             include_branch_attrs: true,
             include_weld_nouns: false,
+            include_bends: true,
+            bend_mode: MbdBendMode::default(),
         }
     }
 }
@@ -112,6 +118,7 @@ pub struct MbdPipeData {
     pub dims: Vec<MbdDimDto>,
     pub welds: Vec<MbdWeldDto>,
     pub slopes: Vec<MbdSlopeDto>,
+    pub bends: Vec<MbdBendDto>,
     pub stats: MbdPipeStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_info: Option<MbdPipeDebugInfo>,
@@ -123,6 +130,7 @@ pub struct MbdPipeStats {
     pub dims_count: usize,
     pub welds_count: usize,
     pub slopes_count: usize,
+    pub bends_count: usize,
 }
 
 /// 分支属性（对齐 MBD/markpipe/branAttlist.txt 的 BranAttarr）
@@ -214,6 +222,38 @@ pub struct MbdSlopeDto {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MbdBendMode {
+    /// 中心线交点（WorkPoint）
+    Workpoint,
+    /// 端面中心（P1/P2 FaceCenter）
+    Facecenter,
+}
+
+impl Default for MbdBendMode {
+    fn default() -> Self {
+        Self::Workpoint
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MbdBendDto {
+    pub id: String,
+    pub refno: String,
+    pub noun: String,
+    /// 弯曲角度（度）
+    pub angle: Option<f32>,
+    /// 弯曲半径（mm）
+    pub radius: Option<f32>,
+    /// 中心线交点（WorkPoint）
+    pub work_point: [f32; 3],
+    /// 端面中心 P1（ARRI 侧）
+    pub face_center_1: Option<[f32; 3]>,
+    /// 端面中心 P2（LEAV 侧）
+    pub face_center_2: Option<[f32; 3]>,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct MbdPipeDebugInfo {
     pub cache_dir: Option<String>,
@@ -229,7 +269,9 @@ pub struct MbdPipeDebugInfo {
 }
 
 pub fn create_mbd_pipe_routes() -> Router {
-    Router::new().route("/api/mbd/pipe/{refno}", get(get_mbd_pipe))
+    Router::new()
+        .route("/api/mbd/pipe/{refno}", get(get_mbd_pipe))
+        .route("/api/mbd/generate", post(post_generate_mbd))
 }
 
 fn json_utf8<T: Serialize>(value: T) -> Response {
@@ -680,11 +722,22 @@ async fn get_mbd_pipe(
         }
     }
 
+    let mut bends: Vec<MbdBendDto> = Vec::new();
+    if query.include_bends {
+        match fetch_bend_elements_for_branch(branch_refno, query.bend_mode).await {
+            Ok(v) => bends = v,
+            Err(e) => {
+                debug_info.notes.push(format!("弯头查询失败（已忽略）: {e}"));
+            }
+        }
+    }
+
     let stats = MbdPipeStats {
         segments_count: out_segments.len(),
         dims_count: dims.len(),
         welds_count: welds.len(),
         slopes_count: slopes.len(),
+        bends_count: bends.len(),
     };
 
     if query.debug {
@@ -692,8 +745,8 @@ async fn get_mbd_pipe(
         debug_info.requested_dbno = query.dbno;
         debug_info.requested_batch_id = query.batch_id.clone();
         debug_info.notes.push(format!(
-            "stats: segs={} dims={} welds={} slopes={}",
-            stats.segments_count, stats.dims_count, stats.welds_count, stats.slopes_count
+            "stats: segs={} dims={} welds={} slopes={} bends={}",
+            stats.segments_count, stats.dims_count, stats.welds_count, stats.slopes_count, stats.bends_count
         ));
     }
 
@@ -709,6 +762,7 @@ async fn get_mbd_pipe(
             dims,
             welds,
             slopes,
+            bends,
             stats,
             debug_info: query.debug.then_some(debug_info),
         }),
@@ -1178,6 +1232,94 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
     Ok((segs, debug))
 }
 
+/// 查询分支下的 BEND/ELBO 元件，返回弯头标注数据
+async fn fetch_bend_elements_for_branch(
+    branch_refno: RefnoEnum,
+    bend_mode: MbdBendMode,
+) -> anyhow::Result<Vec<MbdBendDto>> {
+    use aios_core::rs_surreal::geometry_query::PlantTransform;
+    use aios_core::shape::pdms_shape::RsVec3;
+    use aios_core::{SUL_DB, SurrealQueryExt};
+    use serde::{Deserialize, Serialize};
+    use surrealdb::types::SurrealValue;
+
+    aios_core::init_surreal().await?;
+
+    let pe_key = branch_refno.to_pe_key();
+
+    // 查询 BEND/ELBO 子元件：refno、noun、world_trans（→ work_point）、ptset（→ face_center）
+    #[derive(Serialize, Deserialize, Debug, SurrealValue)]
+    struct BendRow {
+        pub refno: RefnoEnum,
+        pub noun: String,
+        #[serde(default)]
+        pub world_trans: Option<PlantTransform>,
+        #[serde(default)]
+        pub ptset_pts: Option<Vec<Vec<RsVec3>>>,
+    }
+
+    let sql = format!(
+        r#"
+        SELECT
+            in as refno,
+            in.noun as noun,
+            world_trans.d as world_trans,
+            out.ptset[*].pt as ptset_pts
+        FROM pe:{pe_key}<-pe_owner->inst_relate
+        WHERE in.noun IN ['BEND', 'ELBO'];
+        "#
+    );
+
+    let rows: Vec<BendRow> = match SUL_DB.query_take(&sql, 0).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[mbd-pipe] fetch_bend_elements 查询失败: {e}");
+            return Ok(Vec::new());
+        }
+    };
+
+    let mut bends: Vec<MbdBendDto> = Vec::with_capacity(rows.len());
+
+    for row in &rows {
+        let wt = row.world_trans.clone().unwrap_or_default();
+        let m = wt.to_matrix();
+        let work_point = m.transform_point3(glam::Vec3::ZERO);
+
+        // ptset_pts: Vec<Vec<RsVec3>> — 每个 ptset entry 的 pt 数组
+        // face_center = 每组 pt 的第一个点（如果存在）
+        let (fc1, fc2) = if let Some(ref pts_groups) = row.ptset_pts {
+            let p1 = pts_groups.first().and_then(|g| g.first()).map(|p| p.0);
+            let p2 = pts_groups.get(1).and_then(|g| g.first()).map(|p| p.0);
+            (p1, p2)
+        } else {
+            (None, None)
+        };
+
+        // 获取 ANGL、RADI 属性
+        let (angle, radius) = match aios_core::get_named_attmap(row.refno.clone()).await {
+            Ok(att) => {
+                let angl = att.get_f64("ANGL").map(|v| v as f32);
+                let radi = att.get_f64("RADI").map(|v| v as f32);
+                (angl, radi)
+            }
+            Err(_) => (None, None),
+        };
+
+        bends.push(MbdBendDto {
+            id: format!("bend:{}", row.refno),
+            refno: row.refno.to_string(),
+            noun: row.noun.clone(),
+            angle,
+            radius,
+            work_point: work_point.to_array(),
+            face_center_1: fc1.map(|v| v.to_array()),
+            face_center_2: fc2.map(|v| v.to_array()),
+        });
+    }
+
+    Ok(bends)
+}
+
 fn determine_weld_type(noun1: Option<&str>, noun2: Option<&str>) -> MbdWeldType {
     let n1 = noun1.unwrap_or("");
     let n2 = noun2.unwrap_or("");
@@ -1303,6 +1445,550 @@ fn closest_endpoints(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> (Vec3, Vec3, f32
         }
     }
     best
+}
+
+// ===== MBD JSON 预生成与导出 =====
+
+/// 导出范围
+#[derive(Debug, Clone)]
+pub enum MbdExportScope {
+    /// 查询该 dbnum 下所有 noun=BRAN/HANG 的 refno
+    ByDbnum(u32),
+    /// 查询该 refno 的子孙中所有 BRAN/HANG（含自身若为 BRAN）
+    ByRefno(RefnoEnum),
+    /// 遍历所有已知 dbnum
+    AllDbnums,
+}
+
+/// 导出统计
+#[derive(Debug, Clone, Serialize)]
+pub struct MbdExportStats {
+    pub total: usize,
+    pub success: usize,
+    pub failed: Vec<MbdExportFailure>,
+    pub elapsed_ms: u64,
+    pub output_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MbdExportFailure {
+    pub refno: String,
+    pub error: String,
+}
+
+/// manifest.json 结构
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MbdManifest {
+    pub project: String,
+    pub generated_at: String,
+    pub count: usize,
+    pub branches: Vec<MbdManifestEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MbdManifestEntry {
+    pub refno: String,
+    pub file: String,
+    pub segments: usize,
+}
+
+/// API 请求体
+#[derive(Debug, Clone, Deserialize)]
+struct MbdGenerateRequest {
+    dbnum: Option<u32>,
+    refno: Option<String>,
+}
+
+/// 预生成默认查询参数（全量，source=Db）
+fn export_default_query() -> MbdPipeQuery {
+    MbdPipeQuery {
+        source: MbdPipeSource::Db,
+        include_dims: true,
+        include_chain_dims: true,
+        include_overall_dim: true,
+        include_port_dims: true,
+        include_welds: true,
+        include_slopes: true,
+        include_bends: true,
+        include_branch_attrs: true,
+        include_weld_nouns: false,
+        debug: false,
+        ..Default::default()
+    }
+}
+
+/// 核心 MBD 数据生成逻辑（不依赖 axum，可被 API handler 和批量导出共用）
+pub async fn generate_mbd_data(
+    branch_refno: RefnoEnum,
+    query: &MbdPipeQuery,
+) -> anyhow::Result<MbdPipeData> {
+    let (segments, mut debug_info) =
+        fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await?;
+
+    let (branch_name, branch_attrs) = if query.include_branch_attrs {
+        match try_fill_branch_name_and_attrs(branch_refno).await {
+            Ok(v) => v,
+            Err(e) => {
+                debug_info
+                    .notes
+                    .push(format!("分支属性填充失败（已忽略）: {e}"));
+                (branch_refno.to_string(), BranchAttrsDto::default())
+            }
+        }
+    } else {
+        (branch_refno.to_string(), BranchAttrsDto::default())
+    };
+
+    let mut out_segments: Vec<MbdPipeSegmentDto> = Vec::with_capacity(segments.len());
+    for (i, seg) in segments.iter().enumerate() {
+        out_segments.push(MbdPipeSegmentDto {
+            id: format!("seg:{}:{i}", seg.refno),
+            refno: seg.refno.to_string(),
+            noun: "TUBI".to_string(),
+            name: None,
+            arrive: Some([seg.start.x, seg.start.y, seg.start.z]),
+            leave: Some([seg.end.x, seg.end.y, seg.end.z]),
+            length: seg.start.distance(seg.end),
+            straight_length: seg.start.distance(seg.end),
+            outside_diameter: None,
+            bore: None,
+        });
+    }
+
+    let mut dims: Vec<MbdDimDto> = Vec::new();
+    if query.include_dims {
+        for (i, seg) in segments.iter().enumerate() {
+            let length = seg.start.distance(seg.end);
+            if length < query.dim_min_length {
+                continue;
+            }
+            dims.push(MbdDimDto {
+                id: format!("dim:{}:{i}", seg.refno),
+                kind: MbdDimKind::Segment,
+                group_id: None,
+                seq: Some(i as u32),
+                start: [seg.start.x, seg.start.y, seg.start.z],
+                end: [seg.end.x, seg.end.y, seg.end.z],
+                length,
+                text: format_dim_length_text_mm(length),
+            });
+        }
+    }
+
+    if query.include_port_dims {
+        for (i, seg) in segments.iter().enumerate() {
+            let (start, end) = segment_port_points(seg);
+            let length = start.distance(end);
+            if length < query.dim_min_length {
+                continue;
+            }
+            dims.push(MbdDimDto {
+                id: format!("dim:port:{}:{i}", seg.refno),
+                kind: MbdDimKind::Port,
+                group_id: None,
+                seq: Some(i as u32),
+                start: [start.x, start.y, start.z],
+                end: [end.x, end.y, end.z],
+                length,
+                text: format_dim_length_text_mm(length),
+            });
+        }
+    }
+
+    let mut welds: Vec<MbdWeldDto> = Vec::new();
+    let mut weld_joints: Vec<WeldJoint> = Vec::new();
+
+    if query.include_welds || query.include_chain_dims || query.include_overall_dim {
+        let mut shop_idx = 0usize;
+        let mut field_idx = 0usize;
+
+        let noun_lookup = if query.include_welds && query.include_weld_nouns {
+            match try_build_tree_index_for_refno(branch_refno).await {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    debug_info
+                        .notes
+                        .push(format!("TreeIndex 初始化失败（weld_nouns 已忽略）: {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        for i in 0..segments.len().saturating_sub(1) {
+            let seg1 = &segments[i];
+            let seg2 = &segments[i + 1];
+
+            let (p1, p2, dist) = closest_endpoints(seg1.start, seg1.end, seg2.start, seg2.end);
+            if dist >= query.weld_merge_threshold {
+                continue;
+            }
+
+            weld_joints.push(WeldJoint {
+                left_endpoint: p1,
+                right_endpoint: p2,
+                mid: midpoint(p1, p2),
+            });
+
+            if !query.include_welds {
+                continue;
+            }
+
+            let mut noun1: Option<&str> = Some("TUBI");
+            let mut noun2: Option<&str> = Some("TUBI");
+            let mut _noun_s1_owned: Option<String> = None;
+            let mut _noun_s2_owned: Option<String> = None;
+            if let Some(lookup) = noun_lookup.as_ref() {
+                if let Some(r1) = seg1.arrive_refno {
+                    if let Some(n) = lookup.get_noun(r1) {
+                        _noun_s1_owned = Some(n);
+                        noun1 = _noun_s1_owned.as_deref();
+                    }
+                }
+                if let Some(r2) = seg2.arrive_refno {
+                    if let Some(n) = lookup.get_noun(r2) {
+                        _noun_s2_owned = Some(n);
+                        noun2 = _noun_s2_owned.as_deref();
+                    }
+                }
+            }
+            let weld_type = determine_weld_type(noun1, noun2);
+
+            let at_ends = i == 0 || (i + 1) == (segments.len().saturating_sub(1));
+            let shop_candidate = false;
+            let is_shop = !at_ends && shop_candidate;
+
+            let label = if is_shop {
+                shop_idx += 1;
+                format!("A{shop_idx}")
+            } else {
+                field_idx += 1;
+                format!("M{field_idx}")
+            };
+
+            welds.push(MbdWeldDto {
+                id: format!("weld:{}:{i}", branch_refno),
+                position: midpoint(p1, p2).to_array(),
+                weld_type,
+                is_shop,
+                label,
+                left_refno: seg1.refno.to_string(),
+                right_refno: seg2.refno.to_string(),
+            });
+        }
+    }
+
+    if query.include_chain_dims {
+        let ends: Vec<(Vec3, Vec3)> = segments.iter().map(|s| (s.start, s.end)).collect();
+        let chain_pts = build_chain_points_from_ends(&ends, &weld_joints);
+
+        let group_id = Some(format!("chain:{}", branch_refno));
+        for i in 0..chain_pts.len().saturating_sub(1) {
+            let a = chain_pts[i];
+            let b = chain_pts[i + 1];
+            let length = a.distance(b);
+            if length < query.dim_min_length {
+                continue;
+            }
+            dims.push(MbdDimDto {
+                id: format!("dim:chain:{}:{i}", branch_refno),
+                kind: MbdDimKind::Chain,
+                group_id: group_id.clone(),
+                seq: Some(i as u32),
+                start: [a.x, a.y, a.z],
+                end: [b.x, b.y, b.z],
+                length,
+                text: format_dim_length_text_mm(length),
+            });
+        }
+    }
+
+    if query.include_overall_dim {
+        let mut total = 0.0f32;
+        for seg in &segments {
+            total += seg.start.distance(seg.end);
+        }
+
+        if !segments.is_empty() {
+            let ends: Vec<(Vec3, Vec3)> = segments.iter().map(|s| (s.start, s.end)).collect();
+            let chain_pts = build_chain_points_from_ends(&ends, &weld_joints);
+            let (a, b) = if chain_pts.len() >= 2 {
+                (chain_pts[0], chain_pts[chain_pts.len() - 1])
+            } else {
+                (segments[0].start, segments[0].end)
+            };
+
+            if total >= query.dim_min_length {
+                dims.push(MbdDimDto {
+                    id: format!("dim:overall:{}", branch_refno),
+                    kind: MbdDimKind::Overall,
+                    group_id: Some(format!("overall:{}", branch_refno)),
+                    seq: None,
+                    start: [a.x, a.y, a.z],
+                    end: [b.x, b.y, b.z],
+                    length: total,
+                    text: format!("TOTAL {}", format_dim_length_text_mm(total)),
+                });
+            }
+        }
+    }
+
+    let mut slopes: Vec<MbdSlopeDto> = Vec::new();
+    if query.include_slopes {
+        for (i, seg) in segments.iter().enumerate() {
+            let dx = seg.end.x - seg.start.x;
+            let dy = seg.end.y - seg.start.y;
+            let dz = seg.end.z - seg.start.z;
+            let horizontal = (dx * dx + dy * dy).sqrt();
+            if horizontal <= 1e-3 {
+                continue;
+            }
+            let slope = dz / horizontal;
+            let abs_slope = slope.abs();
+            if abs_slope < query.min_slope || abs_slope > query.max_slope {
+                continue;
+            }
+            let text = format!("slope {:.1}%", abs_slope * 100.0);
+            slopes.push(MbdSlopeDto {
+                id: format!("slope:{}:{i}", seg.refno),
+                start: [seg.start.x, seg.start.y, seg.start.z],
+                end: [seg.end.x, seg.end.y, seg.end.z],
+                slope,
+                text,
+            });
+        }
+    }
+
+    let bends: Vec<MbdBendDto> = if query.include_bends {
+        fetch_bend_elements_for_branch(branch_refno, query.bend_mode)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let stats = MbdPipeStats {
+        segments_count: out_segments.len(),
+        dims_count: dims.len(),
+        welds_count: welds.len(),
+        slopes_count: slopes.len(),
+        bends_count: bends.len(),
+    };
+
+    Ok(MbdPipeData {
+        input_refno: branch_refno.to_string(),
+        branch_refno: branch_refno.to_string(),
+        branch_name,
+        branch_attrs,
+        segments: out_segments,
+        dims,
+        welds,
+        slopes,
+        bends,
+        stats,
+        debug_info: None,
+    })
+}
+
+/// 生成单个 BRAN 的 MBD JSON 并写入磁盘
+pub async fn export_mbd_json_for_bran(
+    branch_refno: RefnoEnum,
+    output_dir: &FsPath,
+) -> anyhow::Result<(PathBuf, usize)> {
+    let query = export_default_query();
+    let data = generate_mbd_data(branch_refno.clone(), &query).await?;
+    let seg_count = data.segments.len();
+
+    let response = MbdPipeResponse {
+        success: true,
+        error_message: None,
+        data: Some(data),
+    };
+    let json = serde_json::to_string_pretty(&response)?;
+
+    std::fs::create_dir_all(output_dir)?;
+    let file_name = format!("{}.json", branch_refno);
+    let file_path = output_dir.join(&file_name);
+    std::fs::write(&file_path, json.as_bytes())?;
+
+    Ok((file_path, seg_count))
+}
+
+/// 根据 scope 收集 BRAN/HANG refno 列表
+async fn collect_bran_refnos_for_scope(
+    scope: &MbdExportScope,
+) -> anyhow::Result<Vec<RefnoEnum>> {
+    use aios_core::{SUL_DB, SurrealQueryExt};
+
+    aios_core::init_surreal().await?;
+
+    match scope {
+        MbdExportScope::ByDbnum(dbnum) => {
+            let sql = "SELECT value id FROM pe WHERE noun IN ['BRAN', 'HANG']";
+            let all_refnos: Vec<RefnoEnum> = SUL_DB.query_take(sql, 0).await?;
+
+            let db_meta = crate::data_interface::db_meta_manager::db_meta();
+            db_meta.ensure_loaded()?;
+
+            let filtered: Vec<RefnoEnum> = all_refnos
+                .into_iter()
+                .filter(|r| {
+                    db_meta
+                        .get_dbnum_by_refno(r.clone())
+                        .map_or(false, |d| d == *dbnum)
+                })
+                .collect();
+            Ok(filtered)
+        }
+        MbdExportScope::ByRefno(refno) => {
+            let brans = aios_core::collect_descendant_filter_ids_with_self(
+                &[refno.clone()],
+                &["BRAN", "HANG"],
+                None,
+                true,
+            )
+            .await?;
+            Ok(brans)
+        }
+        MbdExportScope::AllDbnums => {
+            let sql = "SELECT value id FROM pe WHERE noun IN ['BRAN', 'HANG']";
+            let all_refnos: Vec<RefnoEnum> = SUL_DB.query_take(sql, 0).await?;
+            Ok(all_refnos)
+        }
+    }
+}
+
+/// 批量生成 MBD JSON
+pub async fn export_mbd_json_batch(
+    output_dir: &FsPath,
+    scope: MbdExportScope,
+) -> anyhow::Result<MbdExportStats> {
+    let start = std::time::Instant::now();
+    let bran_refnos = collect_bran_refnos_for_scope(&scope).await?;
+
+    println!(
+        "📋 MBD 预生成：共 {} 个 BRAN/HANG 待处理 → {}",
+        bran_refnos.len(),
+        output_dir.display()
+    );
+
+    let total = bran_refnos.len();
+    let mut success = 0usize;
+    let mut failed: Vec<MbdExportFailure> = Vec::new();
+    let mut manifest_entries: Vec<MbdManifestEntry> = Vec::new();
+
+    for (idx, refno) in bran_refnos.iter().enumerate() {
+        match export_mbd_json_for_bran(refno.clone(), output_dir).await {
+            Ok((_path, seg_count)) => {
+                success += 1;
+                manifest_entries.push(MbdManifestEntry {
+                    refno: refno.to_string(),
+                    file: format!("{}.json", refno),
+                    segments: seg_count,
+                });
+                if (idx + 1) % 10 == 0 || idx + 1 == total {
+                    println!(
+                        "  [{}/{}] ✅ {} ({} segments)",
+                        idx + 1,
+                        total,
+                        refno,
+                        seg_count
+                    );
+                }
+            }
+            Err(e) => {
+                failed.push(MbdExportFailure {
+                    refno: refno.to_string(),
+                    error: e.to_string(),
+                });
+                if (idx + 1) % 10 == 0 || idx + 1 == total {
+                    println!("  [{}/{}] ❌ {} → {}", idx + 1, total, refno, e);
+                }
+            }
+        }
+    }
+
+    // 写 manifest.json
+    let project_name = aios_core::get_db_option().project_name.clone();
+    let manifest = MbdManifest {
+        project: project_name,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        count: manifest_entries.len(),
+        branches: manifest_entries,
+    };
+    let manifest_path = output_dir.join("manifest.json");
+    std::fs::create_dir_all(output_dir)?;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    println!(
+        "📊 MBD 预生成完成：{}/{} 成功，{} 失败，耗时 {}ms",
+        success,
+        total,
+        failed.len(),
+        elapsed_ms
+    );
+
+    Ok(MbdExportStats {
+        total,
+        success,
+        failed,
+        elapsed_ms,
+        output_dir: output_dir.display().to_string(),
+    })
+}
+
+/// 获取 MBD 输出目录
+pub fn get_mbd_output_dir() -> PathBuf {
+    let db_option = aios_core::get_db_option();
+    let project_name = &db_option.project_name;
+    if project_name.is_empty() {
+        PathBuf::from("output/mbd")
+    } else {
+        PathBuf::from(format!("output/{project_name}/mbd"))
+    }
+}
+
+/// POST /api/mbd/generate handler
+async fn post_generate_mbd(
+    Json(req): Json<MbdGenerateRequest>,
+) -> impl IntoResponse {
+    let output_dir = get_mbd_output_dir();
+
+    let scope = if let Some(refno_str) = &req.refno {
+        match refno_str.parse::<RefnoEnum>() {
+            Ok(r) => MbdExportScope::ByRefno(r),
+            Err(e) => {
+                return json_utf8(serde_json::json!({
+                    "success": false,
+                    "error": format!("无效的 refno: {e}")
+                }));
+            }
+        }
+    } else if let Some(dbnum) = req.dbnum {
+        MbdExportScope::ByDbnum(dbnum)
+    } else {
+        MbdExportScope::AllDbnums
+    };
+
+    match export_mbd_json_batch(&output_dir, scope).await {
+        Ok(stats) => json_utf8(serde_json::json!({
+            "success": true,
+            "total": stats.total,
+            "success_count": stats.success,
+            "failed": stats.failed,
+            "elapsed_ms": stats.elapsed_ms,
+            "output_dir": stats.output_dir,
+        })),
+        Err(e) => json_utf8(serde_json::json!({
+            "success": false,
+            "error": e.to_string()
+        })),
+    }
 }
 
 #[cfg(test)]

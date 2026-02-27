@@ -104,13 +104,13 @@ pub async fn query_insts_with_batch(
                 SELECT
                     refno,
                     refno.owner ?? refno as owner,
-                    refno.world_trans as world_trans,
+                    type::record("pe_transform", record::id(refno)).world_trans.d as world_trans,
                     refno.world_aabb as world_aabb,
-                    [{{ "geo_transform": refno.world_trans, "geo_hash": mesh_id, "is_tubi": false, "unit_flag": false }}] as insts,
+                    [{{ "geo_transform": type::record("pe_transform", record::id(refno)).world_trans.d, "geo_hash": mesh_id, "is_tubi": false, "unit_flag": false }}] as insts,
                     true as has_neg
                 FROM [{bool_keys}]
                 WHERE status = 'Success'
-                  AND refno.world_trans != NONE
+                  AND type::record("pe_transform", record::id(refno)).world_trans.d != NONE
                 "#,
                 bool_keys = bool_keys_str
             );
@@ -135,13 +135,13 @@ pub async fn query_insts_with_batch(
 
             if !non_bool_keys.is_empty() {
                 let non_bool_keys_str = non_bool_keys.join(",");
-                // 利用 pe 表的计算字段：in.world_trans / in.world_aabb
+                // 直接从 pe_transform 表获取 world_trans（pe.world_trans 已废弃）
                 let geo_sql = format!(
                     r#"
                     SELECT
                         in.id as refno,
                         in.owner ?? in as owner,
-                        in.world_trans as world_trans,
+                        type::record("pe_transform", record::id(in)).world_trans.d as world_trans,
                         in.world_aabb as world_aabb,
                         (SELECT trans.d as geo_transform, record::id(out) as geo_hash, false as is_tubi, out.unit_flag ?? false as unit_flag
                          FROM $parent.out->geo_relate
@@ -150,7 +150,7 @@ pub async fn query_insts_with_batch(
                            && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']) as insts,
                         false as has_neg
                     FROM [{non_bool_keys}]
-                    WHERE in.world_trans != NONE
+                    WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE
                     "#,
                     non_bool_keys = non_bool_keys_str
                 );
@@ -174,7 +174,7 @@ pub async fn query_insts_with_batch(
                 SELECT
                     in.id as refno,
                     in.owner ?? in as owner,
-                    in.world_trans as world_trans,
+                    type::record("pe_transform", record::id(in)).world_trans.d as world_trans,
                     in.world_aabb as world_aabb,
                     (SELECT trans.d as geo_transform, record::id(out) as geo_hash, false as is_tubi, out.unit_flag ?? false as unit_flag
                      FROM $parent.out->geo_relate
@@ -183,7 +183,7 @@ pub async fn query_insts_with_batch(
                        && geo_type IN ['Pos', 'Compound']) as insts,
                     false as has_neg
                 FROM [{inst_relate_keys}]
-                WHERE in.world_trans != NONE
+                WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE
                 "#,
                 inst_relate_keys = inst_relate_keys_str
             );

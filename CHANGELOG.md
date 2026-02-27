@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-02-28
+
+### Added
+
+- **MBD 弯头标注支持（BEND/ELBO）**
+  - `MbdBendDto`：弯曲角度、半径、中心线交点（WorkPoint）、端面中心（P1/P2）
+  - `MbdBendMode` 枚举：`workpoint`（默认）/ `facecenter` 两种标注模式
+  - `include_bends` 查询参数控制是否输出弯头数据
+
+- **MBD JSON 批量预生成 CLI**
+  - `--export-mbd`：预生成所有 BRAN/HANG 的 MBD 标注 JSON（按 `--dbnum` 过滤，不传则全量）
+  - `--export-mbd-refno <REFNO>`：预生成指定 refno 及其子孙 BRAN/HANG
+  - `export_mbd_json_batch`：批量生成 + manifest.json 输出
+  - `POST /api/mbd/generate`：HTTP 触发批量预生成
+
+### Changed
+
+- **world_trans 查询迁移至 pe_transform 表**
+  - `inst_query.rs`：所有 `world_trans` 查询改为 `type::record("pe_transform", record::id(...)).world_trans.d`
+  - `transform_cache.rs`：移除 `query_pe_world_trans` 中间兜底路径，直接走计算路径
+  - `handlers.rs`：spatial rebuild 查询同步迁移
+
+- **scene_tree 初始化检查优化**
+  - `is_initialized` 改用 `RETURN array::len(...)` 替代 `GROUP ALL`，避免反序列化兼容问题
+
 ## 2026-02-27
 
 ### Added

@@ -1766,9 +1766,9 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
         let t0 = std::time::Instant::now();
 
         loop {
-            // 临时方案：移除 in.id != none 条件以避免 "Expected any, got record" 错误
+            // 直接从 pe_transform 表获取 world_trans（inst_relate.world_trans 已废弃）
             let sql = format!(
-                "SELECT value fn::newest_pe_id(in) FROM inst_relate WHERE world_trans.d != none LIMIT {} START {};",
+                "SELECT value fn::newest_pe_id(in) FROM inst_relate WHERE type::record(\"pe_transform\", record::id(in)).world_trans.d != none LIMIT {} START {};",
                 batch, offset
             );
 

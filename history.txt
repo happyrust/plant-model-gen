@@ -1,18 +1,4 @@
 #V2
-SELECT id, in, out FROM inst_relate WHERE in = pe:⟨17496_106028⟩ OR in = pe:⟨17496_106029⟩ OR in = pe:⟨17496_106030⟩ LIMIT 10;
--- 检查 inst_relate_bool 状态
-SELECT id, refno, status FROM inst_relate_bool WHERE refno IN [pe:⟨17496_106028⟩, pe:⟨17496_106029⟩] LIMIT 5;
--- A: inst_relate 全部子元素
-SELECT id, in, out, in.world_trans != NONE as has_wt FROM inst_relate:⟨17496_106028⟩, inst_relate:⟨17496_106029⟩, inst_relate:⟨17496_106030⟩, inst_relate:⟨17496_142305⟩, inst_relate:⟨17496_142306⟩, inst_relate:⟨17496_125330⟩;
--- B: Path B 的完整查询（模拟 query_insts_with_batch）
-SELECT in.id as refno, in.world_trans as world_trans, (SELECT trans.d as transform, record::id(out) as geo_hash, out.unit_flag ?? false as unit_flag FROM out->geo_relate WHERE visible && out.meshed && (trans.d ?? NONE) != NONE && geo_type IN ['Pos', 'DesiPos', 'CatePos']) as insts FROM inst_relate:⟨17496_106028⟩, inst_relate:⟨17496_106029⟩ WHERE in.world_trans != NONE;
--- A: inst_relate 的 out (inst_info) 指向什么
-SELECT id, out FROM inst_relate:⟨17496_106028⟩;
--- B: inst_info 记录内容
-SELECT * FROM inst_info:⟨75144747916844⟩;
--- C: inst_info 的 geo_relate（不带过滤）
-SELECT * FROM inst_info:⟨75144747916844⟩->geo_relate;
--- D: 用 out->geo_relate 方式查（模拟 Path B 子查询）
 SELECT trans.d as transform, record::id(out) as geo_hash, visible, out.meshed as meshed, geo_type FROM inst_relate:⟨17496_106028⟩.out->geo_relate;
 -- A: trans 原始值
 SELECT trans FROM inst_info:⟨75144747916844⟩->geo_relate;
@@ -99,3 +85,17 @@ SELECT count() FROM neg_relate; SELECT count() FROM ngmr_relate; SELECT * FROM p
 SELECT * FROM ngmr_relate LIMIT 5;
 SELECT count() as cnt FROM neg_relate; SELECT * FROM neg_relate WHERE in.in = pe:⟨17496_105990⟩ OR out = pe:⟨17496_105990⟩ LIMIT 10; SELECT * FROM geo_relate WHERE in = inst_info:⟨17496_105990_716⟩;
 SELECT * FROM inst_geo:⟨10927591427900188196⟩;
+SELECT id, out, out.meshed, out.bad, geo_type, visible FROM (SELECT VALUE out FROM inst_relate:⟨24383_75978⟩)->geo_relate;
+SELECT id, out, out.meshed, out.bad, geo_type, visible FROM (SELECT VALUE out FROM inst_relate:⟨24383_75979⟩)->geo_relate;
+SELECT id, out, out.meshed, out.bad, geo_type, visible FROM (SELECT VALUE out FROM inst_relate:⟨24383_75980⟩)->geo_relate;
+-- 查看 75978 geo_relate 的 out (inst_geo) id 及 meshed 状态
+SELECT id, record::id(out) as geo_hash, out.meshed, geo_type, visible FROM geo_relate WHERE id IN [geo_relate:`10819572234287921350`, geo_relate:`14884176454898051515`, geo_relate:`1950688932254308362`];
+-- 75980 的 geo_relate
+SELECT id, record::id(out) as geo_hash, out.meshed, geo_type, visible FROM geo_relate WHERE id IN [geo_relate:`10817976847516279936`, geo_relate:`18065336716871909405`, geo_relate:`3834607451116674086`];
+-- 查询 pe_transform 是否存在
+SELECT id, world_trans FROM pe_transform WHERE id IN [pe_transform:⟨24383_75978⟩, pe_transform:⟨24383_75979⟩, pe_transform:⟨24383_75980⟩, pe_transform:⟨24383_75983⟩];
+SELECT id, record::id(out) as geo_hash, visible, geo_type, trans, trans.d as trans_d, out.meshed, out.unit_flag FROM geo_relate WHERE in IN (SELECT VALUE out FROM [inst_relate:⟨24383_75978⟩, inst_relate:⟨24383_75979⟩]) AND record::id(out) = '14196667531097533575';
+SELECT id, status, mesh_id FROM inst_relate_bool WHERE id IN [inst_relate_bool:⟨24383_75978⟩, inst_relate_bool:⟨24383_75979⟩, inst_relate_bool:⟨24383_75980⟩, inst_relate_bool:⟨24383_75983⟩];
+SELECT in as refno, in.owner as owner, type::record("pe_transform", record::id(in)).world_trans.d as world_trans, (SELECT record::id(out) as geo_hash, out.unit_flag, geo_type, visible, out.meshed, (trans.d ?? NONE) != NONE as has_trans FROM $parent.out->geo_relate WHERE visible && (out.meshed || out.unit_flag || record::id(out) IN ['1','2','3']) && (trans.d ?? NONE) != NONE && geo_type IN ['Pos', 'CatePos', 'Compound']) as insts FROM [inst_relate:⟨24383_75978⟩, inst_relate:⟨24383_75979⟩, inst_relate:⟨24383_75980⟩] WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE;
+SELECT id, world_trans FROM pe WHERE id IN [pe:⟨24383_75978⟩, pe:⟨24383_75979⟩, pe:⟨24383_75980⟩, pe:⟨24383_75983⟩];
+INFO FOR TABLE pe;

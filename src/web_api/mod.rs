@@ -21,7 +21,10 @@ pub use ptset_api::create_ptset_routes;
 pub use pdms_transform_api::create_pdms_transform_routes;
 pub use collision_api::{CollisionApiState, create_collision_routes};
 pub use pipeline_annotation_api::create_pipeline_annotation_routes;
-pub use mbd_pipe_api::create_mbd_pipe_routes;
+pub use mbd_pipe_api::{
+    create_mbd_pipe_routes, export_mbd_json_batch, generate_mbd_data, get_mbd_output_dir,
+    MbdExportScope, MbdExportStats,
+};
 pub use pdms_model_query_api::create_pdms_model_query_routes;
 pub use scene_tree_api::create_scene_tree_routes;
 pub use export_api::create_export_api_routes;

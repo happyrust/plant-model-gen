@@ -65,6 +65,8 @@ pub struct MeshTask {
     pub geo_hash: u64,
     /// 几何参数（直接用于 CSG 生成）
     pub geo_param: PdmsGeoParam,
+    /// 是否为负实体（负实体 mesh 存入 neg/ 子目录）
+    pub is_neg: bool,
 }
 
 /// 从 ShapeInstancesData 中提取 MeshTask 列表
@@ -83,6 +85,7 @@ pub fn extract_mesh_tasks(data: &ShapeInstancesData) -> Vec<MeshTask> {
                 tasks.push(MeshTask {
                     geo_hash: inst.geo_hash,
                     geo_param: inst.geo_param.clone(),
+                    is_neg: inst.is_neg(),
                 });
             }
         }
@@ -571,6 +574,11 @@ pub async fn run_mesh_worker_from_channel(
         std::fs::create_dir_all(&lod_dir)?;
     }
 
+    let neg_dir = mesh_dir.join("neg");
+    if !neg_dir.exists() {
+        std::fs::create_dir_all(&neg_dir)?;
+    }
+
     let aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
     let pts_json_map: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
     let inst_aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
@@ -584,7 +592,7 @@ pub async fn run_mesh_worker_from_channel(
     println!(
         "╔════════════════════════════════════════╗\n\
          ║  [mesh_worker_channel] 开始处理 Mesh   ║\n\
-         ║  模式: 内存数据直传（无 DB 轮询）      ║\n\
+         ║  模式: Manifold-first（neg 单独目录）   ║\n\
          ╚════════════════════════════════════════╝"
     );
 
@@ -613,10 +621,12 @@ pub async fn run_mesh_worker_from_channel(
                 task.geo_param.clone()
             };
 
+            let target_dir = if task.is_neg { &neg_dir } else { &lod_dir };
+
             match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
                 Some(csg_mesh) => {
                     if let Err(e) = handle_csg_mesh(
-                        &lod_dir,
+                        target_dir,
                         &mesh_id,
                         &mesh_filename,
                         csg_mesh,
@@ -625,6 +635,7 @@ pub async fn run_mesh_worker_from_channel(
                         &inst_aabb_map,
                         &mut update_sql,
                         &mesh_formats,
+                        task.is_neg,
                     )
                     .await
                     {
@@ -1162,6 +1173,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
                     &inst_aabb_map,
                     &mut update_sql,
                     mesh_formats,
+                    false,
                 )
                 .await
                 {
@@ -1364,6 +1376,7 @@ pub async fn gen_inst_meshes(
                                     &inst_aabb_map,
                                     &mut update_sql,
                                     &mesh_formats,
+                                    false,
                                 )
                                 .await
                                 {
@@ -1464,6 +1477,7 @@ async fn handle_csg_mesh(
     inst_aabb_map: &Arc<DashMap<String, Aabb>>,
     update_sql: &mut String,
     mesh_formats: &[MeshFormat],
+    is_neg: bool,
 ) -> anyhow::Result<()> {
     if generated.mesh.aabb.is_none() {
         generated.mesh.aabb = generated.aabb;
@@ -1476,13 +1490,55 @@ async fn handle_csg_mesh(
     let pt_refs = derive_csg_points(&generated.mesh, pts_json_map);
 
     let mesh_base_path = dir.join(mesh_id);
-    
-    // 强制生成 GLB
+
+    // ── Manifold-first：焊接 + 绕序修复 + Manifold 验证，保存为 _m.manifold ──
+    {
+        use aios_core::csg::manifold::{ManifoldMeshRust, ManifoldRust};
+        let verts: Vec<glam::Vec3> = generated.mesh.vertices.clone();
+        let indices = &generated.mesh.indices;
+        // 焊接（本地坐标系，单位矩阵）
+        let mut welded = ManifoldMeshRust::from_vertices_indices(
+            &verts, indices, glam::DMat4::IDENTITY, false,
+        );
+        // 修复混合绕序（CSG 生成的底/顶面可能与侧面绕序不一致）
+        welded.orient_consistently();
+        // 转换为 Manifold 并取回验证后的 mesh
+        let manifold = ManifoldRust::from_mesh(&welded);
+        let validated_mesh = manifold.get_mesh();
+        if !validated_mesh.indices.is_empty() {
+            let manifold_path = dir.join(format!("{}_m.manifold", mesh_id));
+            if let Err(e) = validated_mesh.save_to_file(&manifold_path) {
+                debug_model_warn!("   ⚠️ 保存 _m.manifold 失败: {} - {}", mesh_id, e);
+            }
+        } else {
+            debug_model_warn!("   ⚠️ Manifold 转换为空，跳过 _m.manifold 保存: {}", mesh_id);
+        }
+    }
+
+    // ── AABB 计算（正负实体都需要，布尔查询依赖 inst_geo.aabb） ──
+    let aabb_hash = gen_aabb_hash(&mesh_aabb);
+    aabb_map.entry(aabb_hash.to_string()).or_insert(mesh_aabb);
+    if !EXIST_MESH_GEO_HASHES.contains_key(inst_key) {
+        EXIST_MESH_GEO_HASHES.insert(inst_key.to_string(), mesh_aabb);
+    }
+    inst_aabb_map.insert(inst_key.to_string(), mesh_aabb);
+
+    if is_neg {
+        // 负实体：保存 .manifold + AABB，不生成 GLB/OBJ
+        update_sql.push_str(&format!(
+            "update inst_geo:⟨{}⟩ set meshed = true, aabb = aabb:⟨{}⟩, pts=[{}];",
+            inst_key,
+            aabb_hash,
+            pt_refs.join(","),
+        ));
+        return Ok(());
+    }
+
+    // ── 正实体：同时生成 GLB（兼容现有渲染流程） ──
     let glb_path = mesh_base_path.with_extension("glb");
     if let Err(e) = export_single_mesh_to_glb(&generated.mesh, &glb_path) {
         debug_model_warn!("   ⚠️ 生成 GLB 失败: {} - {}", mesh_id, e);
     } else {
-        // 可选：预计算并落盘凸分解（默认关闭，避免拖慢主流程）。
         #[cfg(feature = "convex-decomposition")]
         {
             let precompute = std::env::var("AIOS_PRECOMPUTE_CONVEX")
@@ -1493,7 +1549,6 @@ async fn handle_csg_mesh(
                 })
                 .unwrap_or(false);
 
-            // 1/2/3 为标准单位几何：geo_hash 全库复用，不能按实例尺寸落盘凸分解。
             if precompute && !matches!(inst_key, "1" | "2" | "3") {
                 let base_mesh_dir = crate::fast_model::convex_decomp::normalize_base_mesh_dir(dir);
                 if let Err(e) = crate::fast_model::convex_decomp::build_and_save_convex_from_glb(
@@ -1518,15 +1573,6 @@ async fn handle_csg_mesh(
             debug_model_warn!("   ⚠️ 生成 OBJ 失败: {} - {}", mesh_id, e);
         }
     }
-
-    let aabb_hash = gen_aabb_hash(&mesh_aabb);
-    aabb_map.entry(aabb_hash.to_string()).or_insert(mesh_aabb);
-    // EXIST_MESH_GEO_HASHES/inst_aabb_map 的 key 统一使用 inst_geo id（不带 LOD 后缀），
-    // 与 preload_mesh_cache/query_inst_geo_ids 的使用保持一致。
-    if !EXIST_MESH_GEO_HASHES.contains_key(inst_key) {
-        EXIST_MESH_GEO_HASHES.insert(inst_key.to_string(), mesh_aabb);
-    }
-    inst_aabb_map.insert(inst_key.to_string(), mesh_aabb);
 
     update_sql.push_str(&format!(
         "update inst_geo:⟨{}⟩ set meshed = true, aabb = aabb:⟨{}⟩, pts=[{}];",

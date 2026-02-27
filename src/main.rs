@@ -692,6 +692,12 @@ async fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("from-surrealdb")
+                .long("from-surrealdb")
+                .help("Use SurrealDB as data source for parquet export (instead of model cache)")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("export-pdms-tree-parquet")
                 .long("export-pdms-tree-parquet")
                 .help("Export PDMS TreeIndex + pe.name as Parquet (pdms_tree_{dbnum}.parquet) for DuckDB-WASM model tree queries")
@@ -1746,16 +1752,34 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+        let from_surrealdb = matches.get_flag("from-surrealdb");
+
         println!("🎯 导出 dbnum 实例数据为 Parquet（多表，供 DuckDB 查询）");
         println!("   - 按 dbnum={} 过滤", dbnum);
-        println!("   - 数据源: model cache");
-        if fill_missing_cache {
-            println!("   - 导出前策略: 自动补齐缺失 refno");
+        if from_surrealdb {
+            println!("   - 数据源: SurrealDB");
         } else {
-            println!("   - 导出前策略: 仅导出已生成 cache（默认）");
+            println!("   - 数据源: model cache");
+            if fill_missing_cache {
+                println!("   - 导出前策略: 自动补齐缺失 refno");
+            } else {
+                println!("   - 导出前策略: 仅导出已生成 cache（默认）");
+            }
         }
         if let Some(ref dir) = export_bundle_dir {
             println!("   - 输出目录: {}", dir.display());
+        }
+
+        #[cfg(feature = "parquet-export")]
+        if from_surrealdb {
+            return crate::cli_modes::export_dbnum_instances_parquet_mode(
+                dbnum,
+                verbose,
+                export_bundle_dir,
+                &db_option_ext,
+                None, // root_refno
+            )
+            .await;
         }
 
         #[cfg(feature = "parquet-export")]

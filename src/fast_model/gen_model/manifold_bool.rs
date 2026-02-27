@@ -156,6 +156,36 @@ fn build_lod_mesh_path(base_dir: &Path, mesh_id: &str) -> PathBuf {
 
 }
 
+/// 构建 _m.manifold 布尔运算专用 mesh 文件路径（优先在 lod 目录，其次在 neg 目录）
+fn build_manifold_mesh_path(base_dir: &Path, mesh_id: &str) -> Option<PathBuf> {
+    // 溯源到不含 lod_ 的基础目录
+    let mut clean_base = base_dir.to_path_buf();
+    while let Some(last_component) = clean_base.file_name().and_then(|n| n.to_str()) {
+        if last_component.starts_with("lod_") {
+            clean_base.pop();
+        } else {
+            break;
+        }
+    }
+
+    let default_lod = aios_core::mesh_precision::active_precision().default_lod;
+    let filename = format!("{}_{:?}_m.manifold", mesh_id, default_lod);
+
+    // 优先在 lod 目录查找
+    let lod_path = clean_base.join(format!("lod_{:?}", default_lod)).join(&filename);
+    if lod_path.exists() {
+        return Some(lod_path);
+    }
+
+    // 其次在 neg 目录查找
+    let neg_path = clean_base.join("neg").join(&filename);
+    if neg_path.exists() {
+        return Some(neg_path);
+    }
+
+    None
+}
+
 
 
 fn mesh_base_dir() -> PathBuf {
@@ -276,100 +306,54 @@ fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<M
 
     let base_dir = mesh_base_dir();
 
+    // ── 从 .manifold 加载（生成阶段已完成 Manifold 验证，直接变换即可） ──
+    if let Some(manifold_path) = build_manifold_mesh_path(&base_dir, id) {
+        use aios_core::csg::manifold::ManifoldMeshRust;
+        match ManifoldMeshRust::load_from_file(&manifold_path) {
+            Ok(raw_mesh) => {
+                if !raw_mesh.vertices.is_empty() && !raw_mesh.indices.is_empty() {
+                    let transformed_verts: Vec<f32> = raw_mesh.vertices.chunks_exact(3)
+                        .flat_map(|c| {
+                            let pt = mat.transform_point3(glam::DVec3::new(
+                                c[0] as f64, c[1] as f64, c[2] as f64,
+                            ));
+                            [pt.x as f32, pt.y as f32, pt.z as f32]
+                        })
+                        .collect();
+                    let manifold = ManifoldRust::from_mesh(&ManifoldMeshRust {
+                        vertices: transformed_verts,
+                        indices: raw_mesh.indices,
+                    });
+                    match validate_manifold_result(manifold, id) {
+                        Ok(m) => {
+                            debug_model_debug!(
+                                "load_manifold: 从 .manifold 加载成功: id={} path={}",
+                                id, manifold_path.display()
+                            );
+                            return Ok(m);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[Manifold] .manifold 加载失败: id={} err={}",
+                                id, e
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[Manifold] .manifold 文件读取失败: id={} err={}",
+                    id, e
+                );
+            }
+        }
+    }
+
+    // ── 兼容：从 GLB 加载（旧数据没有 .manifold） ──
     let mesh_path = build_lod_mesh_path(&base_dir, id);
-
-
-
-    let mut manifold = ManifoldRust::import_glb_to_manifold(&mesh_path, mat, more_precision)?;
-
-    if manifold.get_mesh().indices.is_empty() {
-
-        // 经验：部分 mesh 在默认精度下会“焊接过度”导致 Manifold 转换后变成空几何；
-
-        // 此时尝试提升精度重试一次，仍为空则视为加载失败，让上层走 bad_bool/失败路径。
-
-        if !more_precision {
-
-            eprintln!(
-
-                "[Manifold] ⚠️ import_glb_to_manifold 结果为空，尝试 more_precision=true 重试: id={} path={}",
-
-                id,
-
-                mesh_path.display()
-
-            );
-
-            manifold = ManifoldRust::import_glb_to_manifold(&mesh_path, mat, true)?;
-
-        }
-
-    }
-
-
-
-    if manifold.get_mesh().indices.is_empty() {
-
-        return Err(anyhow::anyhow!(
-
-            "Manifold mesh 为空：id={} path={} (more_precision={})",
-
-            id,
-
-            mesh_path.display(),
-
-            more_precision
-
-        ));
-
-    }
-
-
-
-    // 兼容：aios_core 里用一个极小 cube 充当“空 manifold”，这里将其视为加载失败，
-
-    // 避免后续布尔运算被这个哨兵几何体污染。
-
-    let mesh = manifold.get_mesh();
-
-    if let Some(aabb) = mesh.cal_aabb() {
-
-        let ext_mag = aabb.extents().magnitude();
-
-        if ext_mag.is_finite() && ext_mag < 1e-6 {
-
-            return Err(anyhow::anyhow!(
-
-                "Manifold mesh 可能为空（哨兵 cube）：id={} path={} ext_mag={:.3e}",
-
-                id,
-
-                mesh_path.display(),
-
-                ext_mag
-
-            ));
-
-        }
-
-    } else {
-
-        return Err(anyhow::anyhow!(
-
-            "Manifold mesh AABB 无效：id={} path={}",
-
-            id,
-
-            mesh_path.display()
-
-        ));
-
-    }
-
-
-
-    Ok(manifold)
-
+    let manifold = ManifoldRust::import_glb_to_manifold(&mesh_path, mat, more_precision)?;
+    validate_manifold_result(manifold, id)
 }
 
 

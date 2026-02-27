@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-02-27
+
+### Changed
+
+- **Manifold-First 管线：生成阶段即完成 Manifold 验证**
+  - `handle_csg_mesh`：焊接 → `orient_consistently()` 绕序修复 → `from_mesh()` → 保存为 `_m.manifold`
+  - `_m` 后缀区分布尔运算专用 mesh，与显示用 mesh 分离
+  - 生成阶段完成所有 Manifold 验证，加载阶段无需焊接或 fallback
+
+- **`load_manifold` 简化**
+  - 从 `_m.manifold` 加载后仅做坐标变换 + `from_mesh()`，移除焊接、capping、reverse winding、AABB cube fallback
+  - GLB 路径仅保留作为旧数据兼容
+
+- **`build_manifold_mesh_path` 匹配 `_m.manifold` 文件名格式**
+
+### Added
+
+- **`pdms_inst.rs` 负实体实例查询支持**
+- **`export_dbnum_instances_parquet.rs` Parquet 导出优化**
+- **模型回归测试 `boolean_17496_106028`**
+
 ## 2026-02-26
 
 ### Fixed

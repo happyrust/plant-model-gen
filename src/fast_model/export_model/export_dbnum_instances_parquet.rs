@@ -3,13 +3,13 @@
 //! 从 SurrealDB 读取 inst_relate / geo_relate / tubi_relate / trans / aabb 数据，
 //! 生成多表 Parquet 文件组，供前端 DuckDB (含 duckdb-wasm) 直接查询。
 //!
-//! 输出表：
-//! - `instances.parquet`     — 一行一个实例 refno
-//! - `geo_instances.parquet` — 一行一个几何引用 (refno × geo_index)
-//! - `tubings.parquet`       — 一行一个 TUBI 段
-//! - `transforms.parquet`    — 共享表，一行一个唯一 trans_hash
-//! - `aabb.parquet`          — 共享表，一行一个唯一 aabb_hash
-//! - `manifest.json`         — 元信息
+//! 输出表（所有文件名均带 `_{dbnum}` 后缀，避免多 dbnum 导出时互相覆盖）：
+//! - `instances_{dbnum}.parquet`     — 一行一个实例 refno
+//! - `geo_instances_{dbnum}.parquet` — 一行一个几何引用 (refno × geo_index)
+//! - `tubings_{dbnum}.parquet`       — 一行一个 TUBI 段
+//! - `transforms_{dbnum}.parquet`    — 一行一个唯一 trans_hash
+//! - `aabb_{dbnum}.parquet`          — 一行一个唯一 aabb_hash
+//! - `manifest_{dbnum}.json`         — 元信息
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -1188,25 +1188,25 @@ pub async fn export_dbnum_instances_parquet(
         }
     }
 
-    // transforms.parquet
+    // transforms_{dbnum}.parquet
     if !transform_rows.is_empty() {
         let batch = build_transforms_batch(&transform_rows)?;
-        let path = output_dir.join("transforms.parquet");
+        let path = output_dir.join(format!("transforms_{}.parquet", dbnum));
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
-            println!("   ✅ transforms.parquet: {} 行, {} 字节", transform_rows.len(), size);
+            println!("   ✅ transforms_{}.parquet: {} 行, {} 字节", dbnum, transform_rows.len(), size);
         }
     }
 
-    // aabb.parquet
+    // aabb_{dbnum}.parquet
     if !aabb_row_data.is_empty() {
         let batch = build_aabb_batch(&aabb_row_data)?;
-        let path = output_dir.join("aabb.parquet");
+        let path = output_dir.join(format!("aabb_{}.parquet", dbnum));
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
-            println!("   ✅ aabb.parquet: {} 行, {} 字节", aabb_row_data.len(), size);
+            println!("   ✅ aabb_{}.parquet: {} 行, {} 字节", dbnum, aabb_row_data.len(), size);
         }
     }
 
@@ -1234,11 +1234,11 @@ pub async fn export_dbnum_instances_parquet(
                 "rows": tubing_rows.len(),
             },
             "transforms": {
-                "file": "transforms.parquet",
+                "file": format!("transforms_{}.parquet", dbnum),
                 "rows": transform_rows.len(),
             },
             "aabb": {
-                "file": "aabb.parquet",
+                "file": format!("aabb_{}.parquet", dbnum),
                 "rows": aabb_row_data.len(),
             },
         },
@@ -1284,8 +1284,8 @@ pub async fn export_dbnum_instances_parquet(
 /// - `instances_{dbnum}.parquet`
 /// - `geo_instances_{dbnum}.parquet`
 /// - `tubings_{dbnum}.parquet`
-/// - `transforms.parquet`
-/// - `aabb.parquet`
+/// - `transforms_{dbnum}.parquet`
+/// - `aabb_{dbnum}.parquet`
 /// - `manifest_{dbnum}.json`
 pub async fn export_dbnum_instances_parquet_from_cache(
     dbnum: u32,
@@ -1345,8 +1345,8 @@ pub async fn export_dbnum_instances_parquet_from_cache(
             continue;
         };
         inst_info_map.insert(refno, cached.info.clone());
-        if let Some(tubi) = cached.tubi.clone() {
-            inst_tubi_map.insert(refno, tubi);
+        if cached.info.tubi.is_some() {
+            inst_tubi_map.insert(refno, cached.info.clone());
         }
         if !cached.neg_relates.is_empty() {
             neg_relate_map.insert(refno, cached.neg_relates.clone());
@@ -1571,6 +1571,33 @@ pub async fn export_dbnum_instances_parquet_from_cache(
     let tree_index = load_index_with_large_stack(&tree_dir, dbnum).ok();
 
     // =========================================================================
+    // 2.5 从 TreeIndex 构建 default_name 映射（与 fn::default_name 一致）
+    // =========================================================================
+    let order_map: HashMap<aios_core::pdms_types::RefU64, usize> = if let Some(ref idx) = tree_index {
+        let all_u64s = idx.all_refnos();
+        let mut children_by_owner: HashMap<aios_core::pdms_types::RefU64, Vec<aios_core::pdms_types::RefU64>> = HashMap::new();
+        for r in &all_u64s {
+            if let Some(meta) = idx.node_meta(*r) {
+                if meta.owner.0 != 0 {
+                    children_by_owner.entry(meta.owner).or_default().push(*r);
+                }
+            }
+        }
+        for children in children_by_owner.values_mut() {
+            children.sort_by_key(|r| r.0);
+        }
+        let mut map = HashMap::new();
+        for children in children_by_owner.values() {
+            for (i, r) in children.iter().enumerate() {
+                map.insert(*r, i);
+            }
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
+    // =========================================================================
     // 3. 按 owner_type 分组
     // =========================================================================
     let mut grouped_children: HashMap<RefnoEnum, Vec<RefnoEnum>> = HashMap::new();
@@ -1633,13 +1660,15 @@ pub async fn export_dbnum_instances_parquet_from_cache(
         let has_neg = neg_relate_map.contains_key(refno)
             || inst_geos.insts.iter().any(|g| !g.cata_neg_refnos.is_empty());
 
-        // 获取 noun/name
+        // 获取 noun/name（name 为空时生成 default_name: "{NOUN} {order+1}"）
         let (noun, name) = tree_index
             .as_ref()
             .and_then(|idx| {
                 idx.node_meta(refno.refno()).map(|meta| {
                     let noun_str = aios_core::tool::db_tool::db1_dehash(meta.noun);
-                    (noun_str, String::new())
+                    let order = order_map.get(&refno.refno()).copied().unwrap_or(0);
+                    let default_name = format!("{} {}", noun_str, order + 1);
+                    (noun_str, default_name)
                 })
             })
             .unwrap_or_default();
@@ -1813,12 +1842,13 @@ pub async fn export_dbnum_instances_parquet_from_cache(
 
     if !transform_rows.is_empty() {
         let batch = build_transforms_batch(&transform_rows)?;
-        let path = output_dir.join("transforms.parquet");
+        let path = output_dir.join(format!("transforms_{}.parquet", dbnum));
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
             println!(
-                "   ✅ transforms.parquet: {} 行, {} 字节",
+                "   ✅ transforms_{}.parquet: {} 行, {} 字节",
+                dbnum,
                 transform_rows.len(),
                 size
             );
@@ -1830,12 +1860,13 @@ pub async fn export_dbnum_instances_parquet_from_cache(
 
     if !aabb_row_data.is_empty() {
         let batch = build_aabb_batch(&aabb_row_data)?;
-        let path = output_dir.join("aabb.parquet");
+        let path = output_dir.join(format!("aabb_{}.parquet", dbnum));
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
             println!(
-                "   ✅ aabb.parquet: {} 行, {} 字节",
+                "   ✅ aabb_{}.parquet: {} 行, {} 字节",
+                dbnum,
                 aabb_row_data.len(),
                 size
             );
@@ -1866,11 +1897,11 @@ pub async fn export_dbnum_instances_parquet_from_cache(
                 "rows": tubing_rows.len(),
             },
             "transforms": {
-                "file": "transforms.parquet",
+                "file": format!("transforms_{}.parquet", dbnum),
                 "rows": transform_rows.len(),
             },
             "aabb": {
-                "file": "aabb.parquet",
+                "file": format!("aabb_{}.parquet", dbnum),
                 "rows": aabb_row_data.len(),
             },
         },

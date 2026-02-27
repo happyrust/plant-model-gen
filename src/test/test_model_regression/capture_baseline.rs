@@ -94,7 +94,7 @@ async fn capture_baseline(refno_str: &str) -> anyhow::Result<()> {
 
     // 4. 导出统计
     let export_summary = ExportSummary {
-        component_count: geom_insts.iter().filter(|g| g.insts.iter().any(|i| !i.is_tubi)).count(),
+        component_count: total_component_insts,
         tubing_count: total_tubi_insts,
         total_instances: total_component_insts + total_tubi_insts,
         geo_hash_set: all_geo_hashes.into_iter().collect(),

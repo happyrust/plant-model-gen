@@ -1,55 +1,4 @@
 #V2
--- 3a. 同库中有 CATR 的 FITT 示例
-SELECT id, noun, CATR, SPRE FROM pe WHERE noun = 'FITT' AND CATR != NONE LIMIT 5;
--- 3b. 同库中有 SPRE 的 FITT 示例
-SELECT id, noun, CATR, SPRE FROM pe WHERE noun = 'FITT' AND SPRE != NONE LIMIT 5;
--- 3c. 统计 FITT 中 CATR/SPRE 为空的数量
-SELECT count() as total FROM pe WHERE noun = 'FITT';
-SELECT count() as catr_null FROM pe WHERE noun = 'FITT' AND CATR IS NONE;
-SELECT count() as spre_null FROM pe WHERE noun = 'FITT' AND SPRE IS NONE;
--- 3d. 查看这些元素的全部字段（取一个代表）
-SELECT * FROM pe:⟨17496_106029⟩;
--- 4a. 有 CATR 的 FITT 示例（其他 dbnum）
-SELECT id, noun, dbnum, CATR, SPRE FROM pe WHERE noun = 'FITT' AND CATR != NONE LIMIT 3;
--- 4b. 按 dbnum 统计 FITT 有/无 CATR
-SELECT dbnum, count() as cnt, array::group(CATR != NONE) as has_catr FROM pe WHERE noun = 'FITT' GROUP BY dbnum;
--- 4c. 查看 STWALL 的情况
-SELECT id, noun, dbnum, CATR, SPRE FROM pe WHERE noun = 'STWALL' LIMIT 5;
--- 5a. 用户说的正确路径
-SELECT refno.SPRE.refno.CATR FROM pe:⟨17496_106029⟩;
--- 5b. query_single_by_paths 实际生成的 SQL
-(select value refno.* from (select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩) where id != none)[0];
--- 5c. query_catr_via_sql 实际生成的 SQL
-select value array::first(array::flatten([    refno.CATR.refno.CATR[where noun in ["SCOM", "SPRF", "SFIT", "JOIN", "SPCO"]],    refno.CATR.refno.PRTREF.refno.CATR[where noun in ["SCOM", "SPRF", "SFIT", "JOIN", "SPCO"]],    refno.CATR[where noun in ["SCOM", "SPRF", "SFIT", "JOIN", "SPCO"]]]))from only pe:⟨17496_106029⟩ limit 1;
--- 5d. 中间步骤验证
-SELECT refno.SPRE FROM pe:⟨17496_106029⟩;
-SELECT refno.SPRE.refno FROM pe:⟨17496_106029⟩;
-SELECT refno.SPRE.refno.CATR FROM pe:⟨17496_106029⟩;
-SELECT refno.SPRE.refno.CATR.refno FROM pe:⟨17496_106029⟩;
--- Step1: 内层子查询 - 两个路径返回什么
-select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩;
--- Step2: where id != none 过滤后
--- A: 直接用 record ID 数组测试 refno.*
-select value refno.* from [pe:⟨13244_50221⟩, pe:⟨13244_47129⟩] where id != none;
--- B: 从子查询的结果做 refno.* 展开
-select value refno.* from (select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩) where id != none;
--- C: 完整 SQL（query_single_by_paths 原样）
-(select value refno.* from (select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩) where id != none)[0];
--- D: 测试子查询的 where id != none 是否兼容
-select id from (select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩);
--- E: 不带 where，直接展开
-select value refno.* from (select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩);
--- F: 简化测试 - 从 pe record 取 refno.*
-select value refno.* from pe:⟨13244_50221⟩;
--- 方案: 用 LET 解决子查询嵌套问题
-LET $ids = (select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩);
-(select value refno.* from $ids where id != none)[0];
--- 方案A: LET + 取 index=1
-LET $ids = (select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩);
-(select value refno.* from $ids where id != none)[0];
--- 方案B: 单条 SQL，用 array::flatten 消除嵌套
-(select value refno.* from array::flatten((select value [refno.SPRE, refno.SPRE.refno.CATR] from only pe:⟨17496_106029⟩)) where id != none)[0];
--- 检查 inst_relate 是否有数据
 SELECT id, in, out FROM inst_relate WHERE in = pe:⟨17496_106028⟩ OR in = pe:⟨17496_106029⟩ OR in = pe:⟨17496_106030⟩ LIMIT 10;
 -- 检查 inst_relate_bool 状态
 SELECT id, refno, status FROM inst_relate_bool WHERE refno IN [pe:⟨17496_106028⟩, pe:⟨17496_106029⟩] LIMIT 5;
@@ -99,3 +48,54 @@ SELECT id, in, out, geo_type, visible, geom_refno FROM geo_relate LIMIT 20;
 SELECT id, in, geo_type, geom_refno, out, visible FROM geo_relate WHERE geo_type = 'CatePos' AND in IN [inst_info:75144747953122, inst_info:75144747953121, inst_info:75144747936146] ORDER BY in, id;
 SELECT id, in, geo_type, geom_refno, out, visible FROM geo_relate WHERE in IN [inst_info:75144747953122, inst_info:75144747953121, inst_info:75144747936146] AND geo_type = 'CatePos' ORDER BY in, id;
 SELECT id, in, geo_type, geom_refno, out, visible FROM geo_relate LIMIT 50;
+SELECT noun, name FROM pe:⟨17496_105990⟩;
+SELECT noun, name, SPRE, CATR FROM pe:⟨17496_105990⟩;
+SELECT noun, name, id FROM pe:⟨17496_105990⟩; SELECT value ->pe_owner.out FROM pe:⟨17496_105990⟩; SELECT value <-pe_owner.in FROM pe:⟨17496_105990⟩;
+SELECT noun, name, SPRE, CATR FROM [pe:⟨17496_105991⟩, pe:⟨17496_105992⟩]; SELECT noun, name FROM pe:⟨17496_105989⟩;
+SELECT noun, name, SPRE, CATR FROM pe:⟨17496_105991⟩; SELECT noun, name, SPRE, CATR FROM pe:⟨17496_105992⟩;
+SELECT POSS, POSE, HEIG, JUST, SJUS FROM pe:⟨17496_105990⟩; SELECT * FROM inst_relate:⟨17496_105990⟩; SELECT value ->pe_owner..->pe_owner.out FROM pe:⟨17496_105990⟩ LIMIT 5;
+SELECT * FROM inst_info:⟨17496_105990_716⟩; SELECT * FROM geo_relate WHERE in = inst_info:⟨17496_105990_716⟩;
+SELECT * FROM neg_relate WHERE in.in = pe:⟨17496_105990⟩ OR out.in = pe:⟨17496_105990⟩; SELECT * FROM neg_relate WHERE in = inst_info:⟨17496_105990_716⟩ OR out = inst_info:⟨17496_105990_716⟩;
+SELECT * FROM neg_relate WHERE string::contains(string::concat('', id), '105990') LIMIT 10;
+SELECT noun, POSS, POSE, HEIG, JUST, SJUS, SPRE, CATR FROM pe:⟨17496_105997⟩;
+SELECT value ->pe_owner.out FROM pe:⟨17496_105997⟩; SELECT noun, name, SPRE, CATR FROM pe:⟨17496_105997⟩.refno.CATR; SELECT noun, name, SPRE, CATR FROM pe:⟨17496_105997⟩.refno.SPRE;
+SELECT value refno.SPRE FROM pe:⟨17496_105990⟩;
+SELECT value refno.SPRE FROM pe:⟨17496_105997⟩; SELECT value refno.CATR FROM pe:⟨17496_105997⟩;
+SELECT refno FROM pe:⟨17496_105990⟩;
+SELECT * FROM pe:⟨17496_105990⟩;
+SELECT * FROM GWALL:⟨17496_105990⟩; SELECT * FROM GWALL:⟨17496_105997⟩;
+SELECT * FROM inst_relate:⟨17496_105991⟩; SELECT * FROM inst_relate:⟨17496_105992⟩;
+SELECT * FROM NPYR:⟨17496_105991⟩; SELECT * FROM PLOO:⟨17496_105992⟩;
+SELECT POSS, POSE, HEIG, JUST, SJUS, THIC FROM GWALL:⟨17496_105990⟩; SELECT POSS, POSE, HEIG, JUST, SJUS, THIC FROM GWALL:⟨17496_105997⟩;
+SELECT value ->pe_owner.out.{id, noun, name} FROM pe:⟨17496_105989⟩;
+SELECT id, noun, name FROM pe WHERE owner = pe:⟨17496_105989⟩ ORDER BY id;
+SELECT value array::first(array::flatten([refno.CATR.refno.CATR[WHERE noun IN ['SCOM', 'SPRF', 'SFIT', 'JOIN', 'SPCO']], refno.CATR.refno.PRTREF.refno.CATR[WHERE noun IN ['SCOM', 'SPRF', 'SFIT', 'JOIN', 'SPCO']], refno.SPRE.refno.CATR[WHERE noun IN ['SCOM', 'SPRF', 'SFIT', 'JOIN', 'SPCO']], refno.CATR[WHERE noun IN ['SCOM', 'SPRF', 'SFIT', 'JOIN', 'SPCO']]])) FROM ONLY pe:⟨17496_105990⟩ LIMIT 1;
+SELECT value array::first(array::flatten([refno.CATR.refno.CATR[WHERE noun IN ['SCOM', 'SPRF', 'SFIT', 'JOIN', 'SPCO']], refno.CATR.refno.PRTREF.refno.CATR[WHERE noun IN ['SCOM', 'SPRF', 'SFIT', 'JOIN', 'SPCO']], refno.SPRE.refno.CATR[WHERE noun IN ['SCOM', 'SPRF', 'SFIT', 'JOIN', 'SPCO']], refno.CATR[WHERE noun IN ['SCOM', 'SPRF', 'SFIT', 'JOIN', 'SPCO']]])) FROM ONLY pe:⟨17496_105997⟩ LIMIT 1;
+SELECT * FROM inst_relate:⟨17496_105991⟩; SELECT * FROM geo_relate WHERE in = inst_info:⟨17496_105991_716⟩;
+SELECT * FROM inst_geo:⟨10927591427900188196⟩;
+SELECT geo_type, visible, out.meshed as meshed, out.unit_flag as unit_flag FROM geo_relate WHERE in = inst_info:⟨17496_105991_716⟩; SELECT id, meshed, unit_flag FROM inst_geo:⟨10927591427900188196⟩; SELECT solid, owner_type FROM inst_relate:⟨17496_105991⟩;
+SELECT * FROM PLOO:⟨17496_105992⟩; SELECT value ->pe_owner.out.{id, noun} FROM pe:⟨17496_105992⟩; SELECT id, noun FROM pe WHERE owner = pe:⟨17496_105992⟩;
+SELECT * FROM PAVE:⟨17496_105993⟩; SELECT * FROM PAVE:⟨17496_105994⟩; SELECT * FROM PAVE:⟨17496_105995⟩; SELECT * FROM PAVE:⟨17496_105996⟩;
+SELECT value { loops: (SELECT value [refno.POS[0], refno.POS[1], refno.FRAD] FROM id.children WHERE noun IN ['PAVE', 'PONT']), height: refno.HEIG } FROM pe:⟨17496_105990⟩.children WHERE noun IN ['LOOP', 'PLOO'];
+SELECT id, children FROM pe:⟨17496_105992⟩; SELECT id, noun, refno.POS FROM pe:⟨17496_105992⟩.children;
+SELECT value (SELECT value [refno.POS[0], refno.POS[1], refno.FRAD] FROM id.children WHERE noun IN ['PAVE', 'PONT']) FROM pe:⟨17496_105992⟩;
+SELECT id.children FROM pe:⟨17496_105992⟩;
+SELECT children FROM pe:⟨17496_105992⟩; SELECT value children FROM pe:⟨17496_105992⟩;
+SELECT children as loops, refno.HEIG as height FROM pe:⟨17496_105990⟩.children WHERE noun IN ['LOOP', 'PLOO'];
+SELECT (SELECT value [refno.POS[0], refno.POS[1], refno.FRAD] FROM children WHERE noun IN ['PAVE', 'PONT']) as loops, refno.HEIG as height FROM pe:⟨17496_105990⟩.children WHERE noun IN ['LOOP', 'PLOO'];
+SELECT value children[WHERE noun IN ['PAVE', 'PONT']].refno.POS FROM pe:⟨17496_105992⟩;
+SELECT children[WHERE noun IN ['PAVE', 'PONT']].refno.POS as loops, refno.HEIG as height FROM pe:⟨17496_105990⟩.children WHERE noun IN ['LOOP', 'PLOO'];
+SELECT children[WHERE noun IN ['PAVE', 'PONT']].refno.FRAD as frads FROM pe:⟨17496_105990⟩.children WHERE noun IN ['LOOP', 'PLOO'];
+SELECT value { loops: (SELECT value [refno.POS[0], refno.POS[1], refno.FRAD] FROM id.children WHERE noun IN ['PAVE', 'PONT']), height: refno.HEIG } FROM pe:⟨17496_105992⟩;
+SELECT (SELECT value [refno.POS[0], refno.POS[1], refno.FRAD] FROM id.children WHERE noun IN ['PAVE', 'PONT']) as loops FROM pe:⟨17496_105992⟩;
+SELECT value [refno.POS[0], refno.POS[1], refno.FRAD] FROM pe:⟨17496_105992⟩.children WHERE noun IN ['PAVE', 'PONT'];
+SELECT value id.children FROM pe:⟨17496_105992⟩;
+SELECT value [refno.POS[0], refno.POS[1], refno.FRAD] FROM pe:⟨17496_105992⟩.id.children WHERE noun IN ['PAVE', 'PONT'];
+SELECT children[WHERE noun IN ['PAVE', 'PONT']].refno.POS as positions, children[WHERE noun IN ['PAVE', 'PONT']].refno.FRAD as frads, refno.HEIG as height FROM pe:⟨17496_105990⟩.children WHERE noun IN ['LOOP', 'PLOO'];
+SELECT * FROM neg_relate WHERE out = pe:⟨17496_105990⟩; SELECT * FROM ngmr_relate WHERE out = pe:⟨17496_105990⟩; SELECT * FROM pe:⟨17496_105990⟩->inst_relate;
+SELECT * FROM neg_relate WHERE out = pe:⟨17496_105990⟩ OR in.out = pe:⟨17496_105990⟩; SELECT * FROM ngmr_relate WHERE out = pe:⟨17496_105990⟩ OR in.out = pe:⟨17496_105990⟩;
+SELECT * FROM neg_relate LIMIT 5; SELECT * FROM ngmr_relate WHERE out = pe:⟨17496_105990⟩ LIMIT 5;
+SELECT count() FROM neg_relate; SELECT count() FROM ngmr_relate; SELECT * FROM pe:⟨17496_105990⟩->inst_relate->inst_info->geo_relate; SELECT * FROM inst_info:⟨17496_105990_716⟩->geo_relate;
+SELECT * FROM ngmr_relate LIMIT 5;
+SELECT count() as cnt FROM neg_relate; SELECT * FROM neg_relate WHERE in.in = pe:⟨17496_105990⟩ OR out = pe:⟨17496_105990⟩ LIMIT 10; SELECT * FROM geo_relate WHERE in = inst_info:⟨17496_105990_716⟩;
+SELECT * FROM inst_geo:⟨10927591427900188196⟩;

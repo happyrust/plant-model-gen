@@ -1242,6 +1242,13 @@ async fn process_index_tree_generation(
 
 
 
+        // 3.5️⃣ 补建跨阶段缺失的 neg_relate（LOOP 阶段发现负实体但 PRIM 阶段才创建 geo_relate）
+        if use_surrealdb {
+            if let Err(e) = crate::fast_model::gen_model::pdms_inst::reconcile_missing_neg_relate(&all_refnos).await {
+                eprintln!("[gen_model] reconcile_missing_neg_relate 失败: {}", e);
+            }
+        }
+
         // 4️⃣ 可选执行布尔运算
 
         if db_option.inner.apply_boolean_operation {

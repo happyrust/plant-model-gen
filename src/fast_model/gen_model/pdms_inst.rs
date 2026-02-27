@@ -90,17 +90,21 @@ async fn delete_geo_relate_by_inst_info_ids(inst_info_ids: &[String], chunk_size
     Ok(())
 }
 
-/// replace_exist=true 时，按目标正实体(out=pe) 删除 neg_relate/ngmr_relate，避免悬挂旧 geo_relate id。
-async fn delete_boolean_relations_by_targets(target_refnos: &[RefnoEnum], chunk_size: usize) -> anyhow::Result<()> {
-    if target_refnos.is_empty() {
+/// replace_exist=true 时，按载体(pe) 删除 neg_relate/ngmr_relate。
+///
+/// 为什么用 pe 而不用 out：
+/// - out 是正实体（如 WALL），多个 batch 共享同一 target
+/// - 按 out 删除会跨 batch 覆盖（无论并发还是顺序执行）
+/// - pe 是负载体（如 FIXING），每个 batch 独有，按 pe 删除并发安全
+async fn delete_boolean_relations_by_carriers(carrier_refnos: &[RefnoEnum], chunk_size: usize) -> anyhow::Result<()> {
+    if carrier_refnos.is_empty() {
         return Ok(());
     }
-    for chunk in target_refnos.chunks(chunk_size.max(1)) {
-        let out_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
-        // out=目标正实体(pe key)
-        let neg_sql = format!("DELETE neg_relate WHERE out IN [{out_keys}];");
+    for chunk in carrier_refnos.chunks(chunk_size.max(1)) {
+        let pe_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
+        let neg_sql = format!("DELETE neg_relate WHERE pe IN [{pe_keys}];");
         SUL_DB.query_response(&neg_sql).await?;
-        let ngmr_sql = format!("DELETE ngmr_relate WHERE out IN [{out_keys}];");
+        let ngmr_sql = format!("DELETE ngmr_relate WHERE pe IN [{pe_keys}];");
         SUL_DB.query_response(&ngmr_sql).await?;
     }
     Ok(())
@@ -270,14 +274,10 @@ pub async fn save_instance_data_optimize(
             inst_info_ids.len()
         );
         delete_geo_relate_by_inst_info_ids(&inst_info_ids, CHUNK_SIZE).await?;
-        // neg_relate.out / ngmr_relate.out 是 target refno（被切割的正实体），
-        // 不一定在 inst_info_map.keys() 中，需要额外收集 neg_relate_map/ngmr_neg_relate_map 的 key。
-        let mut bool_targets: Vec<RefnoEnum> = refnos.clone();
-        bool_targets.extend(inst_mgr.neg_relate_map.keys().copied());
-        bool_targets.extend(inst_mgr.ngmr_neg_relate_map.keys().copied());
-        bool_targets.sort_unstable();
-        bool_targets.dedup();
-        delete_boolean_relations_by_targets(&bool_targets, CHUNK_SIZE).await?;
+        // 按载体(pe)删除本 batch 的旧 neg_relate/ngmr_relate。
+        // 不能用 out（正实体）删除，因为多个 batch 共享同一 target（如 WALL），
+        // 会导致跨 batch 覆盖（无论并发还是顺序执行）。
+        delete_boolean_relations_by_carriers(&refnos, CHUNK_SIZE).await?;
     }
 
     // inst_geo & geo_relate
@@ -1527,19 +1527,14 @@ pub async fn save_instance_data_to_sql_file(
     let mut neg_geo_by_carrier: HashMap<RefnoEnum, Vec<u64>> = HashMap::new();
     let mut cata_cross_neg_geo_map: HashMap<(RefnoEnum, RefnoEnum), Vec<u64>> = HashMap::new();
 
-    // DELETE（replace_exist=true 时）
+    // DELETE（replace_exist=true 时）——直接执行到 DB，不写入 .surql
+    // 在批次开始时提前清理已存在的数据，确保 .surql 文件只包含 INSERT 语句
+    // 复用 save_instance_data_optimize 的封装函数，保持删除逻辑一致
     if replace_exist {
         let refnos: Vec<RefnoEnum> = inst_mgr.inst_info_map.keys().copied().collect();
-        // delete inst_relate
-        for chunk in refnos.chunks(CHUNK_SIZE) {
-            let in_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
-            writer.write_statement(&format!("DELETE FROM inst_relate WHERE in IN [{in_keys}]"))?;
-        }
-        // delete inst_relate_bool
-        for sql in build_delete_inst_relate_bool_records_sql(&refnos, CHUNK_SIZE) {
-            writer.write_statement(&sql)?;
-        }
-        // delete inst_geo
+        delete_inst_relate_by_in(&refnos, CHUNK_SIZE).await?;
+        delete_inst_relate_bool_records(&refnos, CHUNK_SIZE).await?;
+
         let geo_hashes: Vec<u64> = inst_mgr
             .inst_geos_map
             .values()
@@ -1547,19 +1542,8 @@ pub async fn save_instance_data_to_sql_file(
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        for chunk in geo_hashes.chunks(CHUNK_SIZE) {
-            let ids = chunk
-                .iter()
-                .copied()
-                .filter(|h| *h >= 10)
-                .map(|h| format!("inst_geo:{h}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            if !ids.is_empty() {
-                writer.write_statement(&format!("DELETE [{ids}]"))?;
-            }
-        }
-        // delete geo_relate
+        delete_inst_geo_by_hashes(&geo_hashes, CHUNK_SIZE).await?;
+
         let inst_info_ids: Vec<String> = inst_mgr
             .inst_geos_map
             .values()
@@ -1567,25 +1551,8 @@ pub async fn save_instance_data_to_sql_file(
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        for chunk in inst_info_ids.chunks(CHUNK_SIZE) {
-            let in_keys = chunk
-                .iter()
-                .map(|id| format!("inst_info:⟨{}⟩", id))
-                .collect::<Vec<_>>()
-                .join(",");
-            writer.write_statement(&format!("DELETE geo_relate WHERE in IN [{in_keys}]"))?;
-        }
-        // delete neg_relate / ngmr_relate
-        let mut bool_targets: Vec<RefnoEnum> = refnos.clone();
-        bool_targets.extend(inst_mgr.neg_relate_map.keys().copied());
-        bool_targets.extend(inst_mgr.ngmr_neg_relate_map.keys().copied());
-        bool_targets.sort_unstable();
-        bool_targets.dedup();
-        for chunk in bool_targets.chunks(CHUNK_SIZE) {
-            let out_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
-            writer.write_statement(&format!("DELETE neg_relate WHERE out IN [{out_keys}]"))?;
-            writer.write_statement(&format!("DELETE ngmr_relate WHERE out IN [{out_keys}]"))?;
-        }
+        delete_geo_relate_by_inst_info_ids(&inst_info_ids, CHUNK_SIZE).await?;
+        delete_boolean_relations_by_carriers(&refnos, CHUNK_SIZE).await?;
     }
 
     // inst_geo & geo_relate
@@ -1878,13 +1845,13 @@ pub async fn save_instance_data_to_sql_file(
 
     // inst_relate_aabb
     if !inst_relate_aabb_buffer.is_empty() {
-        // 先删后插
-        let in_keys: Vec<String> = inst_mgr.inst_info_map.keys().map(|k| k.to_pe_key()).collect();
-        for chunk in in_keys.chunks(CHUNK_SIZE) {
-            writer.write_statement(&format!(
-                "DELETE inst_relate_aabb WHERE in IN [{}]",
-                chunk.join(",")
-            ))?;
+        // 先点删（直接执行到 DB）后插（写入 .surql）
+        let aabb_ids: Vec<String> = inst_mgr.inst_info_map.keys()
+            .map(|k| k.to_table_key("inst_relate_aabb"))
+            .collect();
+        for chunk in aabb_ids.chunks(CHUNK_SIZE) {
+            let ids = chunk.join(",");
+            SUL_DB.query_response(&format!("DELETE [{ids}];")).await?;
         }
         for chunk in inst_relate_aabb_buffer.chunks(CHUNK_SIZE) {
             writer.write_statement(&format!(

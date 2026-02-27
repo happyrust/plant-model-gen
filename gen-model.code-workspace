@@ -22,6 +22,7 @@
 			"titleBar.activeBackground": "#751F47",
 			"titleBar.activeForeground": "#FEFCFD"
 		},
-		"git.ignoreLimitWarning": true
+		"git.ignoreLimitWarning": true,
+		"powershell.cwd": "gen_model-dev"
 	}
 }

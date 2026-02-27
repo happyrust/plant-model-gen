@@ -2174,7 +2174,7 @@ async fn gen_cata_geos_inner(
 
             // ── 主循环：处理本 batch 的 cata_hash ──
 
-            for j in start_idx..end_idx {
+            'cata_loop: for j in start_idx..end_idx {
 
                 #[cfg(feature = "profile")]
 
@@ -2466,6 +2466,7 @@ async fn gen_cata_geos_inner(
 
                     let result = aios_core::get_cat_refno(ele_refno).await;
 
+                    let has_catr;
                     let cata_refno = if let Ok(Some(refno)) = result {
 
                         debug_model_debug!(
@@ -2480,53 +2481,39 @@ async fn gen_cata_geos_inner(
 
                         );
 
+                        has_catr = true;
                         refno
 
                     } else {
 
                         debug_model_debug!(
 
-                            "[WARN] get_cat_refno failed for ele_refno={} (result={:?})",
+                            "[INFO] ele_refno={} 无元件库引用，将通过子原语直接生成几何体",
 
-                            ele_refno,
-
-                            result
+                            ele_refno
 
                         );
 
-                        use crate::fast_model::ModelErrorKind;
-
-                        crate::model_error!(
-
-                            code = "E-REF-001",
-
-                            kind = ModelErrorKind::InvalidReference,
-
-                            stage = "get_cat_refno",
-
-                            refno = ele_refno,
-
-                            desc = "获取元件库引用失败",
-
-                            "ele_refno={}, result={:?}",
-
-                            ele_refno,
-
-                            result
-
-                        );
-
-                        #[cfg(feature = "profile")]
-
-                        tracing::debug!(ele_refno = ?ele_refno, "元件库引用为空，跳过");
-
-                        continue;
+                        has_catr = false;
+                        ele_refno
 
                     };
 
                     db_time_get_cat_refno += t_get_cat_refno.elapsed().as_millis();
 
 
+
+                    // 无元件库引用（如 FIXING）时，跳过 GMSE/NGMR 查询和 cache 路径，
+                    // 直接进入 gen_cata_single_geoms 通过子原语生成几何体。
+                    let mut valid_gmse = false;
+                    let mut valid_ngmr = false;
+                    let mut gmse_refno: Result<RefnoEnum, anyhow::Error> = Ok(RefnoEnum::default());
+
+                    'catr_path: {
+
+                    if !has_catr {
+                        break 'catr_path;
+                    }
 
                     #[cfg(feature = "profile")]
 
@@ -2540,7 +2527,7 @@ async fn gen_cata_geos_inner(
 
                     tracing::debug!(cata_refno = ?cata_refno, "Querying GMSE");
 
-                    let gmse_refno = aios_core::query_single_by_paths(
+                    gmse_refno = aios_core::query_single_by_paths(
 
                         cata_refno,
 
@@ -2556,7 +2543,7 @@ async fn gen_cata_geos_inner(
 
                     db_time_query_single += t_query_single.elapsed().as_millis();
 
-                    match gmse_refno {
+                    match &gmse_refno {
 
                         Ok(gmse) => {
 
@@ -2564,7 +2551,7 @@ async fn gen_cata_geos_inner(
 
                                 "[cata_hash={}] ele_refno={} gmse_refno={}",
 
-                                cata_hash,
+                                &cata_hash,
 
                                 ele_refno,
 
@@ -2612,7 +2599,7 @@ async fn gen_cata_geos_inner(
 
                             );
 
-                            continue;
+                            continue 'cata_loop;
 
                         }
 
@@ -2638,9 +2625,9 @@ async fn gen_cata_geos_inner(
 
 
 
-                    let valid_gmse = gmse_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
+                    valid_gmse = gmse_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
 
-                    let valid_ngmr = ngmr_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
+                    valid_ngmr = ngmr_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
 
 
 
@@ -2668,7 +2655,7 @@ async fn gen_cata_geos_inner(
 
                         );
 
-                        continue;
+                        continue 'cata_loop;
 
                     }
 
@@ -3356,7 +3343,7 @@ async fn gen_cata_geos_inner(
 
                             // 完成当前 cata_hash 的写入，进入下一个 key（跳过 gen_cata_single_geoms/shape 处理链路）。
 
-                            continue;
+                            continue 'cata_loop;
 
                         } else {
 
@@ -3380,7 +3367,7 @@ async fn gen_cata_geos_inner(
 
                                 );
 
-                                continue;
+                                continue 'cata_loop;
 
                             }
 
@@ -3388,7 +3375,7 @@ async fn gen_cata_geos_inner(
 
                     }
 
-
+                    } // 'catr_path
 
                     // ════════════════════════════════════════════════════════════════════════════
 

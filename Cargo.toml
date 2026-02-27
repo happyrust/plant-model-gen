@@ -153,6 +153,8 @@ surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1", 
 
     "kv-mem",
 
+    "kv-rocksdb",
+
 ] }
 
 # surrealdb-types 需要显式引入：SurrealValue derive 宏默认使用 ::surrealdb_types 路径

@@ -788,7 +788,7 @@ async fn process_index_tree_generation(
 
     // Mesh channel: insert_handle 在 save 成功后发送 MeshTask，mesh_handle 并行消费
     let gen_mesh = db_option.inner.gen_mesh;
-    let (mesh_tx, mesh_rx) = if gen_mesh && use_surrealdb && !defer_db_write {
+    let (mesh_tx, mesh_rx) = if gen_mesh && use_surrealdb {
         let (tx, rx) = flume::bounded::<Vec<MeshTask>>(100);
         (Some(tx), Some(rx))
     } else {
@@ -798,8 +798,9 @@ async fn process_index_tree_generation(
     // 启动 mesh worker（与 insert_handle 并行）
     let mesh_handle = if let Some(rx) = mesh_rx {
         let db_opt = Arc::new(db_option.inner.clone());
+        let mesh_sql_writer = sql_file_writer.clone(); // defer 模式时 Some，传统模式时 None
         Some(tokio::spawn(async move {
-            run_mesh_worker_from_channel(rx, db_opt).await
+            run_mesh_worker_from_channel(rx, db_opt, mesh_sql_writer).await
         }))
     } else {
         None
@@ -1018,6 +1019,15 @@ async fn process_index_tree_generation(
                         eprintln!("[defer_db_write] 写入 SQL 文件失败: {}", e);
                     }
                     t_save_db += t0.elapsed();
+                }
+                // defer 模式也提取 mesh 任务，发送到 channel 做内存直生成
+                if let Some(ref tx) = mesh_tx {
+                    let tasks = extract_mesh_tasks(&shape_insts_arc);
+                    if !tasks.is_empty() {
+                        if let Err(e) = tx.send_async(tasks).await {
+                            eprintln!("[defer_db_write] 发送 mesh 任务失败: {}", e);
+                        }
+                    }
                 }
             } else if use_surrealdb {
                 let t0 = Instant::now();

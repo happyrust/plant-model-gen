@@ -708,7 +708,9 @@ pub async fn run_mesh_worker_from_cache(
 pub async fn run_mesh_worker_from_channel(
     receiver: flume::Receiver<Vec<MeshTask>>,
     db_option: Arc<DbOption>,
+    sql_writer: Option<Arc<super::sql_file_writer::SqlFileWriter>>,
 ) -> anyhow::Result<MeshWorkerReport> {
+    let deferred = sql_writer.is_some();
     let mesh_dir = db_option.get_meshes_path();
     if !mesh_dir.exists() {
         std::fs::create_dir_all(&mesh_dir)?;
@@ -817,12 +819,22 @@ pub async fn run_mesh_worker_from_channel(
 
             // 检查阈值，满足则立即 flush
             if should_flush(&update_stmts) {
-                flush_update_stmts(&mut update_stmts, &mut report).await;
+                if let Some(ref sw) = sql_writer {
+                    let _ = sw.write_statements(&update_stmts);
+                    update_stmts.clear();
+                } else {
+                    flush_update_stmts(&mut update_stmts, &mut report).await;
+                }
             }
         }
 
         // batch 结束后 final flush
-        flush_update_stmts(&mut update_stmts, &mut report).await;
+        if let Some(ref sw) = sql_writer {
+            let _ = sw.write_statements(&update_stmts);
+            update_stmts.clear();
+        } else {
+            flush_update_stmts(&mut update_stmts, &mut report).await;
+        }
 
         report.total_processed += batch_new;
 
@@ -837,8 +849,49 @@ pub async fn run_mesh_worker_from_channel(
     }
 
     // 保存 aabb 和 pts 数据
-    utils::save_pts_to_surreal(&pts_json_map).await;
-    utils::save_aabb_to_surreal(&aabb_map).await;
+    if let Some(ref sw) = sql_writer {
+        // defer 模式：将 INSERT IGNORE 写入 .surql 文件
+        // aabb
+        if !aabb_map.is_empty() {
+            let keys: Vec<String> = aabb_map.iter().map(|kv| kv.key().clone()).collect();
+            for chunk in keys.chunks(300) {
+                let mut rows: Vec<String> = Vec::with_capacity(chunk.len());
+                for k in chunk {
+                    let v = aabb_map.get(k).unwrap();
+                    let d = serde_json::to_string(v.value()).unwrap();
+                    let id_key = if k.starts_with("aabb:") {
+                        k.to_string()
+                    } else {
+                        format!("aabb:⟨{}⟩", k)
+                    };
+                    rows.push(format!("{{'id':{id_key}, 'd':{d}}}"));
+                }
+                let sql = format!("INSERT IGNORE INTO aabb [{}]", rows.join(","));
+                let _ = sw.write_statement(&sql);
+            }
+        }
+        // vec3
+        if !pts_json_map.is_empty() {
+            let keys: Vec<u64> = pts_json_map.iter().map(|kv| *kv.key()).collect();
+            for chunk in keys.chunks(100) {
+                let mut rows: Vec<String> = Vec::with_capacity(chunk.len());
+                for &k in chunk {
+                    let v = pts_json_map.get(&k).unwrap();
+                    rows.push(format!("{{'id':vec3:⟨{}⟩, 'd':{}}}", k, v.value()));
+                }
+                let sql = format!("INSERT IGNORE INTO vec3 [{}]", rows.join(","));
+                let _ = sw.write_statement(&sql);
+            }
+        }
+        println!(
+            "[mesh_worker_channel] deferred: aabb={} pts={} 条写入 .surql",
+            aabb_map.len(),
+            pts_json_map.len()
+        );
+    } else {
+        utils::save_pts_to_surreal(&pts_json_map).await;
+        utils::save_aabb_to_surreal(&aabb_map).await;
+    }
 
     report.elapsed_ms = worker_start.elapsed().as_millis();
 

@@ -56,6 +56,7 @@ pub mod prim_model; // PRIM 模型生成
 pub mod manifold_bool; // 布尔运算
 pub mod mesh_generate; // 网格生成
 pub mod pdms_inst; // 实例数据保存
+pub mod sql_file_writer; // 延迟 SQL 文件写入器（零 DB 写入模式）
 pub mod resolve; // 几何解析
 pub mod transform_cache; // 变换缓存
 pub mod db_meta_cache; // DB 元数据缓存

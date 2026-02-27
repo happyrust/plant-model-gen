@@ -1273,3 +1273,668 @@ pub async fn reconcile_missing_neg_relate(
     Ok(created)
 }
 
+// ============================================================================
+// 零 DB 写入模式：将 SQL 输出到 .surql 文件
+// ============================================================================
+
+use super::sql_file_writer::SqlFileWriter;
+use super::tree_index_manager::TreeIndexManager;
+
+/// inst_relate 中 fn::* 的预计算结果缓存
+pub struct InstRelatePrecomputed {
+    /// refno → zone PE key (e.g. "pe:⟨17496_8517⟩")，None 表示未找到 ZONE 祖先
+    zone_map: HashMap<RefnoEnum, Option<String>>,
+    /// refno → spec_value (i64)
+    spec_map: HashMap<RefnoEnum, i64>,
+    /// refno → ses_date (Option<String>，SurrealDB datetime 格式)
+    dt_map: HashMap<RefnoEnum, Option<String>>,
+}
+
+impl InstRelatePrecomputed {
+    /// 从 TreeIndex 本地缓存 + 批量 DB 读取构建预计算缓存。
+    ///
+    /// - zone_refno: 纯本地 TreeIndex 查询（零 DB 访问）
+    /// - spec_value: 批量读 PE 表（一次 DB 读）
+    /// - dt: 批量读 ses 表（一次 DB 读）
+    pub async fn build(refnos: &[RefnoEnum]) -> Self {
+        let mut zone_map: HashMap<RefnoEnum, Option<String>> = HashMap::new();
+        let mut spec_map: HashMap<RefnoEnum, i64> = HashMap::new();
+        let mut dt_map: HashMap<RefnoEnum, Option<String>> = HashMap::new();
+
+        if refnos.is_empty() {
+            return Self { zone_map, spec_map, dt_map };
+        }
+
+        // 1. zone_refno: 从 TreeIndex 本地查询（零 DB 访问）
+        let mut zone_owner_refnos: HashSet<RefnoEnum> = HashSet::new();
+
+        for &refno in refnos {
+            let manager = match TreeIndexManager::resolve_dbnum_for_refno(refno) {
+                Ok(dbnum) => TreeIndexManager::with_default_dir(vec![dbnum]),
+                Err(_) => {
+                    zone_map.insert(refno, None);
+                    continue;
+                }
+            };
+            let zones = manager.query_ancestors_filtered(refno, &["ZONE"]);
+            if let Some(zone) = zones.first() {
+                zone_map.insert(refno, Some(zone.to_pe_key()));
+                // 收集 zone 的 owner（用于后续查 spec_value）
+                let zone_refno_val = zone.refno();
+                if let Ok(index) = manager.load_index(
+                    TreeIndexManager::resolve_dbnum_for_refno(*zone).unwrap_or(0),
+                ) {
+                    if let Some(meta) = index.node_meta(zone_refno_val) {
+                        let owner_refno = RefnoEnum::from(meta.owner);
+                        zone_owner_refnos.insert(owner_refno);
+                    }
+                }
+            } else {
+                zone_map.insert(refno, None);
+            }
+        }
+
+        // 2. spec_value: 批量读 PE 表获取 zone owner 的 spec_value
+        let mut owner_spec_map: HashMap<String, i64> = HashMap::new();
+        if !zone_owner_refnos.is_empty() {
+            let pe_keys: Vec<String> = zone_owner_refnos.iter().map(|r| r.to_pe_key()).collect();
+            let sql = format!(
+                "SELECT record::id(id) AS rid, spec_value FROM pe WHERE id IN [{}];",
+                pe_keys.join(",")
+            );
+            match SUL_DB.query_response(&sql).await {
+                Ok(mut resp) => {
+                    let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+                    for row in rows {
+                        if let (Some(rid), spec) = (
+                            row.get("rid").and_then(|v| v.as_str()),
+                            row.get("spec_value").and_then(|v| v.as_i64()).unwrap_or(0),
+                        ) {
+                            owner_spec_map.insert(rid.to_string(), spec);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[precompute] 批量读取 spec_value 失败: {}", e);
+                }
+            }
+        }
+
+        // 为每个 refno 查找对应的 spec_value
+        for &refno in refnos {
+            let spec = if let Some(Some(zone_key)) = zone_map.get(&refno) {
+                // 从 TreeIndex 查 zone 的 owner
+                let manager = match TreeIndexManager::resolve_dbnum_for_refno(refno) {
+                    Ok(dbnum) => TreeIndexManager::with_default_dir(vec![dbnum]),
+                    Err(_) => { spec_map.insert(refno, 0); continue; }
+                };
+                let zones = manager.query_ancestors_filtered(refno, &["ZONE"]);
+                if let Some(zone) = zones.first() {
+                    let zone_refno_val = zone.refno();
+                    if let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(*zone) {
+                        if let Ok(index) = manager.load_index(dbnum) {
+                            if let Some(meta) = index.node_meta(zone_refno_val) {
+                                let owner_key = format!("{}", meta.owner);
+                                owner_spec_map.get(&owner_key).copied().unwrap_or(0)
+                            } else { 0 }
+                        } else { 0 }
+                    } else { 0 }
+                } else { 0 }
+            } else { 0 };
+            spec_map.insert(refno, spec);
+        }
+
+        // 3. dt (ses_date): 批量读 PE 的 dbnum+sesno，再批量读 ses 表
+        // 收集所有 PE 的 dbnum 和 sesno
+        {
+            let pe_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
+            // 分批查询避免 SQL 过长
+            let mut pe_dbnum_sesno: HashMap<String, (u32, u32)> = HashMap::new();
+            for chunk in pe_keys.chunks(500) {
+                let sql = format!(
+                    "SELECT record::id(id) AS rid, dbnum, sesno FROM pe WHERE id IN [{}];",
+                    chunk.join(",")
+                );
+                match SUL_DB.query_response(&sql).await {
+                    Ok(mut resp) => {
+                        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+                        for row in rows {
+                            if let Some(rid) = row.get("rid").and_then(|v| v.as_str()) {
+                                let dbnum = row.get("dbnum").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let sesno = row.get("sesno").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                pe_dbnum_sesno.insert(rid.to_string(), (dbnum, sesno));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[precompute] 批量读取 PE dbnum/sesno 失败: {}", e);
+                    }
+                }
+            }
+
+            // 构建唯一的 ses ID 集合并批量查询 date
+            let mut ses_keys: HashSet<String> = HashSet::new();
+            for (_, (dbnum, sesno)) in &pe_dbnum_sesno {
+                if *sesno > 0 {
+                    ses_keys.insert(format!("ses:[{},{}]", dbnum, sesno));
+                }
+            }
+
+            let mut ses_date_map: HashMap<String, String> = HashMap::new();
+            if !ses_keys.is_empty() {
+                let keys_vec: Vec<String> = ses_keys.into_iter().collect();
+                for chunk in keys_vec.chunks(500) {
+                    let sql = format!(
+                        "SELECT record::id(id) AS rid, date FROM ses WHERE id IN [{}];",
+                        chunk.join(",")
+                    );
+                    match SUL_DB.query_response(&sql).await {
+                        Ok(mut resp) => {
+                            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+                            for row in rows {
+                                if let (Some(rid), Some(date)) = (
+                                    row.get("rid").and_then(|v| v.as_str()),
+                                    row.get("date").and_then(|v| v.as_str()),
+                                ) {
+                                    ses_date_map.insert(rid.to_string(), date.to_string());
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[precompute] 批量读取 ses date 失败: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // 填充 dt_map
+            for &refno in refnos {
+                let refno_str = format!("{}", refno.refno());
+                if let Some((dbnum, sesno)) = pe_dbnum_sesno.get(&refno_str) {
+                    if *sesno > 0 {
+                        let ses_key = format!("[{},{}]", dbnum, sesno);
+                        dt_map.insert(refno, ses_date_map.get(&ses_key).cloned());
+                    } else {
+                        dt_map.insert(refno, None);
+                    }
+                } else {
+                    dt_map.insert(refno, None);
+                }
+            }
+        }
+
+        println!(
+            "[precompute] InstRelatePrecomputed 构建完成: refnos={}, zones={}, specs={}, dts={}",
+            refnos.len(),
+            zone_map.values().filter(|v| v.is_some()).count(),
+            spec_map.len(),
+            dt_map.values().filter(|v| v.is_some()).count(),
+        );
+
+        Self { zone_map, spec_map, dt_map }
+    }
+
+    /// 获取预计算的 zone PE key
+    pub fn zone_key(&self, refno: &RefnoEnum) -> String {
+        self.zone_map
+            .get(refno)
+            .and_then(|v| v.clone())
+            .unwrap_or_else(|| "NONE".to_string())
+    }
+
+    /// 获取预计算的 spec_value
+    pub fn spec_value(&self, refno: &RefnoEnum) -> i64 {
+        self.spec_map.get(refno).copied().unwrap_or(0)
+    }
+
+    /// 获取预计算的 ses_date
+    pub fn dt(&self, refno: &RefnoEnum) -> String {
+        self.dt_map
+            .get(refno)
+            .and_then(|v| v.clone())
+            .map(|d| format!("'{}'", d))
+            .unwrap_or_else(|| "NONE".to_string())
+    }
+}
+
+/// 将 instance 数据保存到 .surql 文件（零 DB 写入模式）。
+///
+/// 逻辑与 `save_instance_data_optimize` 完全对应，但所有 SQL 写入文件而非 SurrealDB，
+/// 且 inst_relate 中的 `fn::find_ancestor_type` / `fn::ses_date` 已替换为预计算常量值。
+#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "save_instance_data_to_sql_file"))]
+pub async fn save_instance_data_to_sql_file(
+    inst_mgr: &ShapeInstancesData,
+    replace_exist: bool,
+    writer: &SqlFileWriter,
+    precomputed: &InstRelatePrecomputed,
+) -> anyhow::Result<()> {
+    const CHUNK_SIZE: usize = 200;
+
+    writer.write_comment(&format!(
+        "batch: inst_info={}, inst_geo_keys={}, tubi_keys={}, replace_exist={}",
+        inst_mgr.inst_info_map.len(),
+        inst_mgr.inst_geos_map.len(),
+        inst_mgr.inst_tubi_map.len(),
+        replace_exist
+    ))?;
+
+    let mut aabb_map: HashMap<u64, String> = HashMap::new();
+    let mut transform_map: HashMap<u64, String> = HashMap::new();
+    if let Entry::Vacant(entry) = transform_map.entry(0) {
+        entry.insert(serde_json::to_string(&Transform::IDENTITY)?);
+    }
+    let mut vec3_map: HashMap<u64, String> = HashMap::new();
+    let mut neg_geo_by_carrier: HashMap<RefnoEnum, Vec<u64>> = HashMap::new();
+    let mut cata_cross_neg_geo_map: HashMap<(RefnoEnum, RefnoEnum), Vec<u64>> = HashMap::new();
+
+    // DELETE（replace_exist=true 时）
+    if replace_exist {
+        let refnos: Vec<RefnoEnum> = inst_mgr.inst_info_map.keys().copied().collect();
+        // delete inst_relate
+        for chunk in refnos.chunks(CHUNK_SIZE) {
+            let in_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
+            writer.write_statement(&format!("DELETE FROM inst_relate WHERE in IN [{in_keys}]"))?;
+        }
+        // delete inst_relate_bool
+        for sql in build_delete_inst_relate_bool_records_sql(&refnos, CHUNK_SIZE) {
+            writer.write_statement(&sql)?;
+        }
+        // delete inst_geo
+        let geo_hashes: Vec<u64> = inst_mgr
+            .inst_geos_map
+            .values()
+            .flat_map(|d| d.insts.iter().map(|g| g.geo_hash))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        for chunk in geo_hashes.chunks(CHUNK_SIZE) {
+            let ids = chunk
+                .iter()
+                .copied()
+                .filter(|h| *h >= 10)
+                .map(|h| format!("inst_geo:{h}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            if !ids.is_empty() {
+                writer.write_statement(&format!("DELETE [{ids}]"))?;
+            }
+        }
+        // delete geo_relate
+        let inst_info_ids: Vec<String> = inst_mgr
+            .inst_geos_map
+            .values()
+            .map(|x| x.id())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        for chunk in inst_info_ids.chunks(CHUNK_SIZE) {
+            let in_keys = chunk
+                .iter()
+                .map(|id| format!("inst_info:⟨{}⟩", id))
+                .collect::<Vec<_>>()
+                .join(",");
+            writer.write_statement(&format!("DELETE geo_relate WHERE in IN [{in_keys}]"))?;
+        }
+        // delete neg_relate / ngmr_relate
+        let mut bool_targets: Vec<RefnoEnum> = refnos.clone();
+        bool_targets.extend(inst_mgr.neg_relate_map.keys().copied());
+        bool_targets.extend(inst_mgr.ngmr_neg_relate_map.keys().copied());
+        bool_targets.sort_unstable();
+        bool_targets.dedup();
+        for chunk in bool_targets.chunks(CHUNK_SIZE) {
+            let out_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
+            writer.write_statement(&format!("DELETE neg_relate WHERE out IN [{out_keys}]"))?;
+            writer.write_statement(&format!("DELETE ngmr_relate WHERE out IN [{out_keys}]"))?;
+        }
+    }
+
+    // inst_geo & geo_relate
+    let mut inst_geo_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+    let mut geo_relate_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+
+    for inst_geo_data in inst_mgr.inst_geos_map.values() {
+        for inst in &inst_geo_data.insts {
+            if inst.geo_transform.translation.is_nan()
+                || inst.geo_transform.rotation.is_nan()
+                || inst.geo_transform.scale.is_nan()
+            {
+                continue;
+            }
+
+            let transform_hash = gen_plant_transform_hash(&inst.geo_transform);
+            if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
+                entry.insert(serde_json::to_string(&inst.geo_transform)?);
+            }
+
+            let key_pts = inst.geo_param.key_points();
+            let mut pt_hashes = Vec::with_capacity(key_pts.len());
+            for key_pt in key_pts {
+                let pts_hash = key_pt.gen_hash();
+                pt_hashes.push(format!("vec3:⟨{}⟩", pts_hash));
+                if let Entry::Vacant(entry) = vec3_map.entry(pts_hash) {
+                    entry.insert(serde_json::to_string(&key_pt)?);
+                }
+            }
+
+            let cat_negs_str = if !inst.cata_neg_refnos.is_empty() {
+                format!(
+                    ", cata_neg: [{}]",
+                    inst.cata_neg_refnos.iter().map(|x| x.to_pe_key()).join(",")
+                )
+            } else {
+                String::new()
+            };
+
+            let relate_json = format!(
+                r#"in: inst_info:⟨{0}⟩, out: inst_geo:⟨{1}⟩, trans: trans:⟨{2}⟩, geom_refno: pe:{3}, pts: [{4}], geo_type: '{5}', visible: {6} {7}"#,
+                inst_geo_data.id(),
+                inst.geo_hash,
+                transform_hash,
+                inst.refno,
+                pt_hashes.join(","),
+                inst.geo_type.to_string(),
+                inst.visible,
+                cat_negs_str
+            );
+            let relate_id = gen_string_hash(&relate_json);
+            geo_relate_buffer.push(format!("{{ {relate_json}, id: '{relate_id}' }}"));
+
+            use aios_core::geometry::GeoBasicType;
+            let carrier_refno = inst_geo_data.refno;
+            let geom_refno = inst.refno;
+            match inst.geo_type {
+                GeoBasicType::Neg => {
+                    neg_geo_by_carrier
+                        .entry(carrier_refno)
+                        .or_insert_with(Vec::new)
+                        .push(relate_id);
+                }
+                GeoBasicType::CataCrossNeg => {
+                    cata_cross_neg_geo_map
+                        .entry((carrier_refno, geom_refno))
+                        .or_insert_with(Vec::new)
+                        .push(relate_id);
+                }
+                _ => {}
+            }
+
+            inst_geo_buffer.push(inst.gen_unit_geo_sur_json());
+
+            if inst_geo_buffer.len() >= CHUNK_SIZE {
+                writer.write_statement(&format!(
+                    "INSERT IGNORE INTO inst_geo [{}]",
+                    inst_geo_buffer.join(",")
+                ))?;
+                inst_geo_buffer.clear();
+            }
+
+            if geo_relate_buffer.len() >= CHUNK_SIZE {
+                writer.write_statement(&format!(
+                    "INSERT RELATION INTO geo_relate [{}]",
+                    geo_relate_buffer.join(",")
+                ))?;
+                geo_relate_buffer.clear();
+            }
+        }
+    }
+
+    if !inst_geo_buffer.is_empty() {
+        writer.write_statement(&format!(
+            "INSERT IGNORE INTO inst_geo [{}]",
+            inst_geo_buffer.join(",")
+        ))?;
+    }
+    if !geo_relate_buffer.is_empty() {
+        writer.write_statement(&format!(
+            "INSERT RELATION INTO geo_relate [{}]",
+            geo_relate_buffer.join(",")
+        ))?;
+    }
+
+    // tubi -> aabb & transform maps
+    for tubi in inst_mgr.inst_tubi_map.values() {
+        if let Some(aabb) = tubi.aabb {
+            let aabb_hash = gen_aabb_hash(&aabb);
+            if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
+                entry.insert(serde_json::to_string(&aabb)?);
+            }
+        }
+        let transform_hash = gen_plant_transform_hash(&tubi.world_transform);
+        if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
+            entry.insert(serde_json::to_string(&tubi.world_transform)?);
+        }
+    }
+
+    // neg_relate
+    if !inst_mgr.neg_relate_map.is_empty() {
+        let mut neg_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+        for (target, neg_refnos) in &inst_mgr.neg_relate_map {
+            for neg_refno in neg_refnos.iter() {
+                if let Some(geo_relate_ids) = neg_geo_by_carrier.get(neg_refno) {
+                    for geo_relate_id in geo_relate_ids.iter() {
+                        neg_buffer.push(format!(
+                            "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', {2}], out: {2}, pe: {1} }}",
+                            geo_relate_id,
+                            neg_refno.to_pe_key(),
+                            target.to_pe_key(),
+                        ));
+                        if neg_buffer.len() >= CHUNK_SIZE {
+                            writer.write_statement(&format!(
+                                "INSERT RELATION IGNORE INTO neg_relate [{}]",
+                                neg_buffer.join(",")
+                            ))?;
+                            neg_buffer.clear();
+                        }
+                    }
+                }
+            }
+        }
+        if !neg_buffer.is_empty() {
+            writer.write_statement(&format!(
+                "INSERT RELATION IGNORE INTO neg_relate [{}]",
+                neg_buffer.join(",")
+            ))?;
+        }
+    }
+
+    // ngmr_relate
+    if !inst_mgr.ngmr_neg_relate_map.is_empty() {
+        let mut ngmr_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+        for (target_k, refnos) in &inst_mgr.ngmr_neg_relate_map {
+            let target_pe = target_k.to_pe_key();
+            for (ele_refno, ngmr_geom_refno) in refnos {
+                let key = (*ele_refno, *ngmr_geom_refno);
+                if let Some(geo_relate_ids) = cata_cross_neg_geo_map.get(&key) {
+                    for geo_relate_id in geo_relate_ids.iter() {
+                        let ele_pe = ele_refno.to_pe_key();
+                        let ngmr_pe = ngmr_geom_refno.to_pe_key();
+                        ngmr_buffer.push(format!(
+                            "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', {2}], out: {2}, pe: {1}, ngmr: {3} }}",
+                            geo_relate_id, ele_pe, target_pe, ngmr_pe
+                        ));
+                        if ngmr_buffer.len() >= CHUNK_SIZE {
+                            writer.write_statement(&format!(
+                                "INSERT RELATION IGNORE INTO ngmr_relate [{}]",
+                                ngmr_buffer.join(",")
+                            ))?;
+                            ngmr_buffer.clear();
+                        }
+                    }
+                }
+            }
+        }
+        if !ngmr_buffer.is_empty() {
+            writer.write_statement(&format!(
+                "INSERT RELATION IGNORE INTO ngmr_relate [{}]",
+                ngmr_buffer.join(",")
+            ))?;
+        }
+    }
+
+    // inst_info & inst_relate（使用预计算值替代 fn::*）
+    let mut inst_info_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+    let mut inst_relate_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+    let mut inst_relate_aabb_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+
+    for (key, info) in &inst_mgr.inst_info_map {
+        if info.world_transform.translation.is_nan()
+            || info.world_transform.rotation.is_nan()
+            || info.world_transform.scale.is_nan()
+        {
+            continue;
+        }
+
+        inst_info_buffer.push(info.gen_sur_json_full());
+        if inst_info_buffer.len() >= CHUNK_SIZE {
+            writer.write_statement(&format!(
+                "INSERT IGNORE INTO inst_info [{}]",
+                inst_info_buffer.join(",")
+            ))?;
+            inst_info_buffer.clear();
+        }
+
+        let transform_hash = gen_plant_transform_hash(&info.world_transform);
+        if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
+            entry.insert(serde_json::to_string(&info.world_transform)?);
+        }
+
+        if let Some(aabb) = info.aabb {
+            let aabb_hash = gen_aabb_hash(&aabb);
+            if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
+                entry.insert(serde_json::to_string(&aabb)?);
+            }
+            inst_relate_aabb_buffer.push(format!(
+                "{{id: {0}, in: {1}, out: aabb:⟨{2}⟩}}",
+                key.to_table_key("inst_relate_aabb"),
+                key.to_pe_key(),
+                aabb_hash
+            ));
+        }
+
+        // inst_relate: 使用预计算值替代 fn::find_ancestor_type / fn::ses_date
+        let zone_key = precomputed.zone_key(key);
+        let spec_value = precomputed.spec_value(key);
+        let dt = precomputed.dt(key);
+
+        let relate_sql = format!(
+            "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, zone_refno: {3}, spec_value: {4}, dt: {5}, has_cata_neg: {6}, solid: {7}, owner_refno: {8}, owner_type: '{9}'}}",
+            key.to_inst_relate_key(),
+            key.to_pe_key(),
+            info.id_str(),
+            zone_key,
+            spec_value,
+            dt,
+            info.has_cata_neg,
+            info.is_solid,
+            info.owner_refno.to_pe_key(),
+            info.owner_type
+        );
+        inst_relate_buffer.push(relate_sql);
+        if inst_relate_buffer.len() >= CHUNK_SIZE {
+            writer.write_statement(&format!(
+                "INSERT RELATION INTO inst_relate [{}]",
+                inst_relate_buffer.join(",")
+            ))?;
+            inst_relate_buffer.clear();
+        }
+    }
+
+    // flush remaining inst_info
+    if !inst_info_buffer.is_empty() {
+        writer.write_statement(&format!(
+            "INSERT IGNORE INTO inst_info [{}]",
+            inst_info_buffer.join(",")
+        ))?;
+    }
+
+    // flush remaining inst_relate
+    if !inst_relate_buffer.is_empty() {
+        writer.write_statement(&format!(
+            "INSERT RELATION INTO inst_relate [{}]",
+            inst_relate_buffer.join(",")
+        ))?;
+    }
+
+    // aabb
+    if !aabb_map.is_empty() {
+        let mut json_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+        for (&hash, value) in &aabb_map {
+            json_buffer.push(format!("{{'id':aabb:⟨{}⟩, 'd':{}}}", hash, value));
+            if json_buffer.len() >= CHUNK_SIZE {
+                writer.write_statement(&format!(
+                    "INSERT IGNORE INTO aabb [{}]",
+                    json_buffer.join(",")
+                ))?;
+                json_buffer.clear();
+            }
+        }
+        if !json_buffer.is_empty() {
+            writer.write_statement(&format!(
+                "INSERT IGNORE INTO aabb [{}]",
+                json_buffer.join(",")
+            ))?;
+        }
+    }
+
+    // inst_relate_aabb
+    if !inst_relate_aabb_buffer.is_empty() {
+        // 先删后插
+        let in_keys: Vec<String> = inst_mgr.inst_info_map.keys().map(|k| k.to_pe_key()).collect();
+        for chunk in in_keys.chunks(CHUNK_SIZE) {
+            writer.write_statement(&format!(
+                "DELETE inst_relate_aabb WHERE in IN [{}]",
+                chunk.join(",")
+            ))?;
+        }
+        for chunk in inst_relate_aabb_buffer.chunks(CHUNK_SIZE) {
+            writer.write_statement(&format!(
+                "INSERT RELATION INTO inst_relate_aabb [{}]",
+                chunk.join(",")
+            ))?;
+        }
+    }
+
+    // transform
+    if !transform_map.is_empty() {
+        let mut json_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+        for (&hash, value) in &transform_map {
+            json_buffer.push(format!("{{'id':trans:⟨{}⟩, 'd':{}}}", hash, value));
+            if json_buffer.len() >= CHUNK_SIZE {
+                writer.write_statement(&format!(
+                    "INSERT IGNORE INTO trans [{}]",
+                    json_buffer.join(",")
+                ))?;
+                json_buffer.clear();
+            }
+        }
+        if !json_buffer.is_empty() {
+            writer.write_statement(&format!(
+                "INSERT IGNORE INTO trans [{}]",
+                json_buffer.join(",")
+            ))?;
+        }
+    }
+
+    // vec3
+    if !vec3_map.is_empty() {
+        let mut json_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+        for (&hash, value) in &vec3_map {
+            json_buffer.push(format!("{{'id':vec3:⟨{}⟩, 'd':{}}}", hash, value));
+            if json_buffer.len() >= CHUNK_SIZE {
+                writer.write_statement(&format!(
+                    "INSERT IGNORE INTO vec3 [{}]",
+                    json_buffer.join(",")
+                ))?;
+                json_buffer.clear();
+            }
+        }
+        if !json_buffer.is_empty() {
+            writer.write_statement(&format!(
+                "INSERT IGNORE INTO vec3 [{}]",
+                json_buffer.join(",")
+            ))?;
+        }
+    }
+
+    Ok(())
+}

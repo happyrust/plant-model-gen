@@ -52,6 +52,7 @@ use crate::fast_model::mesh_generate::{
 };
 
 use crate::fast_model::pdms_inst::save_instance_data_optimize;
+use crate::fast_model::pdms_inst::{save_instance_data_to_sql_file, InstRelatePrecomputed};
 
 use crate::options::{DbOptionExt, MeshFormat};
 
@@ -537,7 +538,7 @@ pub async fn gen_all_geos_data(
 
     // ✅ SurrealDB 写入侧初始化：仅在 use_surrealdb=true 时需要。
 
-    if db_option.use_surrealdb {
+    if db_option.use_surrealdb && !db_option.defer_db_write {
 
         if let Err(e) = aios_core::rs_surreal::inst::init_model_tables().await {
 
@@ -765,10 +766,29 @@ async fn process_index_tree_generation(
     let replace_exist = db_option.inner.is_replace_mesh();
 
     let use_surrealdb = db_option.use_surrealdb;
+    let defer_db_write = db_option.defer_db_write;
+
+    // defer_db_write 模式：初始化 SqlFileWriter
+    let sql_file_writer: Option<Arc<super::sql_file_writer::SqlFileWriter>> = if defer_db_write {
+        let output_dir = db_option.get_project_output_dir();
+        let path = super::sql_file_writer::SqlFileWriter::default_path(&output_dir, None);
+        match super::sql_file_writer::SqlFileWriter::new(&path) {
+            Ok(w) => {
+                println!("[gen_model] 🗂️ defer_db_write 模式已启用，SQL 输出到: {}", path.display());
+                Some(Arc::new(w))
+            }
+            Err(e) => {
+                eprintln!("[gen_model] ❌ 创建 SqlFileWriter 失败: {}", e);
+                return Err(IndexTreeError::Other(e));
+            }
+        }
+    } else {
+        None
+    };
 
     // Mesh channel: insert_handle 在 save 成功后发送 MeshTask，mesh_handle 并行消费
     let gen_mesh = db_option.inner.gen_mesh;
-    let (mesh_tx, mesh_rx) = if gen_mesh && use_surrealdb {
+    let (mesh_tx, mesh_rx) = if gen_mesh && use_surrealdb && !defer_db_write {
         let (tx, rx) = flume::bounded::<Vec<MeshTask>>(100);
         (Some(tx), Some(rx))
     } else {
@@ -903,6 +923,8 @@ async fn process_index_tree_generation(
 
 
 
+    let sql_writer_clone = sql_file_writer.clone();
+
     let insert_handle = tokio::spawn(async move {
 
         #[cfg(feature = "profile")]
@@ -979,7 +1001,25 @@ async fn process_index_tree_generation(
             // SurrealDB 写入放到后台，不阻塞 cache 写入和后续 batch 接收
             // 采用 Semaphore 限流，防止瞬发海量并发协程打垮数据库导致事务冲突风暴
             // 此处在 receiver 循环外侧初始化，限定最大并行写库数为 8
-            if use_surrealdb {
+            if defer_db_write {
+                // defer_db_write 模式：SQL 写入文件，不写 SurrealDB
+                if let Some(ref writer) = sql_writer_clone {
+                    let t0 = Instant::now();
+                    // 收集本批次的 refnos 用于预计算
+                    let batch_refnos: Vec<aios_core::RefnoEnum> =
+                        shape_insts_arc.inst_info_map.keys().copied().collect();
+                    let precomputed = InstRelatePrecomputed::build(&batch_refnos).await;
+                    if let Err(e) = save_instance_data_to_sql_file(
+                        &shape_insts_arc,
+                        replace_exist,
+                        writer,
+                        &precomputed,
+                    ).await {
+                        eprintln!("[defer_db_write] 写入 SQL 文件失败: {}", e);
+                    }
+                    t_save_db += t0.elapsed();
+                }
+            } else if use_surrealdb {
                 let t0 = Instant::now();
                 let sem = db_write_semaphore.clone();
                 let shape_insts_clone = shape_insts_arc.clone();
@@ -1084,7 +1124,19 @@ async fn process_index_tree_generation(
     // mesh_tx 已被 insert_handle 的 async move 闭包捕获，
     // insert_handle 完成后 mesh_tx 自动 drop → mesh_handle 的 recv 循环正常结束
 
-
+    // defer_db_write 模式：输出 surql 文件摘要
+    if let Some(ref writer) = sql_file_writer {
+        writer.flush()?;
+        println!(
+            "[gen_model] 🗂️ defer_db_write 完成: {} 条 SQL 语句已写入 {}",
+            writer.statement_count(),
+            writer.path().display()
+        );
+        println!(
+            "[gen_model] 提示: 使用 --import-sql {} 导入到 SurrealDB",
+            writer.path().display()
+        );
+    }
 
     // 完成 Parquet 写入并合并文件
 
@@ -1178,7 +1230,7 @@ async fn process_index_tree_generation(
 
         // 3️⃣ 写入 inst_relate_aabb 并导出 Parquet（供房间计算使用）
 
-        if use_surrealdb {
+        if use_surrealdb && !defer_db_write {
 
             // 性能实验：允许跳过 AABB 写入，便于先定位“生成/mesh/boolean”的主耗时。
             let skip_aabb_write = std::env::var_os("AIOS_SKIP_INST_RELATE_AABB").is_some();
@@ -1251,7 +1303,7 @@ async fn process_index_tree_generation(
 
 
         // 3.5️⃣ 补建跨阶段缺失的 neg_relate（LOOP 阶段发现负实体但 PRIM 阶段才创建 geo_relate）
-        if use_surrealdb {
+        if use_surrealdb && !defer_db_write {
             if let Err(e) = crate::fast_model::gen_model::pdms_inst::reconcile_missing_neg_relate(&all_refnos).await {
                 eprintln!("[gen_model] reconcile_missing_neg_relate 失败: {}", e);
             }
@@ -1267,7 +1319,7 @@ async fn process_index_tree_generation(
 
             // model_cache boolean worker 已移除（foyer-cache-cleanup）
 
-            if use_surrealdb {
+            if use_surrealdb && !defer_db_write {
 
                 if let Err(e) = run_boolean_worker(Arc::new(db_option.inner.clone()), 100).await {
 

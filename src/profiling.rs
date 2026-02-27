@@ -53,7 +53,8 @@ pub fn init_chrome_tracing(trace_path: impl AsRef<Path>) -> anyhow::Result<()> {
         TRACING_GUARD = Some(guard);
     }
 
-    tracing_subscriber::registry().with(chrome_layer).init();
+    // 使用 try_init 避免与已有的 log crate logger (如 simplelog) 冲突
+    let _ = tracing_subscriber::registry().with(chrome_layer).try_init();
 
     println!(
         "[profile] Chrome tracing 已启用，输出: {}",

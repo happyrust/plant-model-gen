@@ -2,6 +2,17 @@
 
 ## 2026-02-27
 
+### Added
+
+- **defer_db_write 零 DB 写入模式**
+  - `--defer-db-write` CLI 参数：模型生成阶段跳过 SurrealDB 写入，所有 SQL 输出到 `.surql` 文件
+  - `--import-sql <PATH>` CLI 参数：Phase 2 批量导入 `.surql` 文件并自动执行后处理（init_model_tables → reconcile → boolean → aabb）
+  - `SqlFileWriter`：线程安全的 `.surql` 文件写入器，支持并发追加、事务批量导入、自动重试
+  - `InstRelatePrecomputed`：预计算 zone_refno/spec_value/ses_date 替代 SurrealDB `fn::*` 调用
+  - `save_instance_data_to_sql_file`：零 DB 写入版实例数据保存
+  - `DbOptionExt.defer_db_write` 配置字段
+  - Orchestrator 双模式集成：defer 模式下跳过 init_model_tables/reconcile/aabb/boolean
+
 ### Changed
 
 - **Manifold-First 管线：生成阶段即完成 Manifold 验证**

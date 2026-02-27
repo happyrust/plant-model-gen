@@ -481,6 +481,19 @@ async fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("defer-db-write")
+                .long("defer-db-write")
+                .help("Defer DB writes: output all SQL to .surql files instead of writing to SurrealDB during model generation")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("import-sql")
+                .long("import-sql")
+                .help("Import a .surql file into SurrealDB and run post-processing (reconcile/boolean/aabb)")
+                .value_name("PATH")
+                .num_args(1),
+        )
+        .arg(
             Arg::new("flush-cache-to-db")
                 .long("flush-cache-to-db")
                 .help("Flush model instance_cache to SurrealDB (backup). Requires SurrealDB config in DbOption")
@@ -882,6 +895,89 @@ async fn main() -> anyhow::Result<()> {
     // 同步精度配置到 rs-core 全局 active_precision，保证布尔/导出等逻辑使用同一套 LOD
     aios_core::mesh_precision::set_active_precision(db_option_ext.inner.mesh_precision.clone());
 
+    // ========== import-sql：导入 .surql 文件并执行后处理 ==========
+    if let Some(sql_path) = matches.get_one::<String>("import-sql") {
+        let path = std::path::Path::new(sql_path);
+        if !path.exists() {
+            anyhow::bail!("--import-sql 文件不存在: {}", path.display());
+        }
+        println!("\n🗂️  import-sql: 导入 {} 到 SurrealDB", path.display());
+        init_surreal().await?;
+        println!("✅ 数据库连接成功");
+
+        // Phase 2 Step 1: 初始化表结构
+        println!("[import-sql] Phase 2.1: 初始化 inst_relate 表结构...");
+        aios_core::rs_surreal::inst::init_model_tables().await?;
+
+        // Phase 2 Step 2: 批量导入 SQL
+        println!("[import-sql] Phase 2.2: 批量导入 SQL 语句...");
+        let (success, failed) =
+            aios_database::fast_model::gen_model::sql_file_writer::import_sql_file(path, 500)
+                .await?;
+        if failed > 0 {
+            eprintln!(
+                "[import-sql] ⚠️ 导入存在失败: 成功={}, 失败={}",
+                success, failed
+            );
+        }
+
+        // Phase 2 Step 3: reconcile_missing_neg_relate
+        println!("[import-sql] Phase 2.3: reconcile_missing_neg_relate...");
+        // 获取所有已导入的 inst_relate 的 in 端 refno
+        {
+            use aios_core::SurrealQueryExt;
+            let sql = "SELECT value in FROM inst_relate;";
+            let refnos: Vec<aios_core::RefnoEnum> =
+                aios_core::SUL_DB.query_take(sql, 0).await.unwrap_or_default();
+            if !refnos.is_empty() {
+                if let Err(e) =
+                    aios_database::fast_model::gen_model::pdms_inst::reconcile_missing_neg_relate(
+                        &refnos,
+                    )
+                    .await
+                {
+                    eprintln!("[import-sql] reconcile_missing_neg_relate 失败: {}", e);
+                }
+            }
+        }
+
+        // Phase 2 Step 4: boolean worker
+        if db_option_ext.inner.apply_boolean_operation {
+            println!("[import-sql] Phase 2.4: 布尔运算...");
+            if let Err(e) = aios_database::fast_model::mesh_generate::run_boolean_worker(
+                std::sync::Arc::new(db_option_ext.inner.clone()),
+                100,
+            )
+            .await
+            {
+                eprintln!("[import-sql] 布尔运算失败: {}", e);
+            }
+        }
+
+        // Phase 2 Step 5: update aabb
+        println!("[import-sql] Phase 2.5: 更新 inst_relate_aabb...");
+        {
+            use aios_core::SurrealQueryExt;
+            let sql = "SELECT value in FROM inst_relate;";
+            let refnos: Vec<aios_core::RefnoEnum> =
+                aios_core::SUL_DB.query_take(sql, 0).await.unwrap_or_default();
+            if !refnos.is_empty() {
+                if let Err(e) =
+                    aios_database::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
+                        &refnos,
+                        db_option_ext.is_replace_mesh(),
+                    )
+                    .await
+                {
+                    eprintln!("[import-sql] 更新 inst_relate_aabb 失败: {}", e);
+                }
+            }
+        }
+
+        println!("✅ import-sql 全部完成");
+        return Ok(());
+    }
+
     // ========== cache -> SurrealDB：一键备份落库 ==========
     if matches.get_flag("flush-cache-to-db") {
         println!("\n🗄️  flush-cache-to-db: 将 model instance_cache 写入 SurrealDB（备份）");
@@ -1130,6 +1226,12 @@ async fn main() -> anyhow::Result<()> {
             println!("🔄 --regen-model 自动开启 apply_boolean_operation（生成 CatePos 布尔结果）");
             db_option_ext.inner.apply_boolean_operation = true;
         }
+    }
+
+    // --defer-db-write：模型生成阶段不写 SurrealDB，SQL 输出到 .surql 文件
+    if matches.get_flag("defer-db-write") {
+        println!("🗂️ 检测到 --defer-db-write 参数，模型生成阶段将跳过 SurrealDB 写入，SQL 输出到 .surql 文件");
+        db_option_ext.defer_db_write = true;
     }
 
     // 调试模式下，如果配置开启了 gen_mesh，默认也应强制重新生成 mesh

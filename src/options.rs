@@ -146,6 +146,15 @@ pub struct DbOptionExt {
     /// 副路径 mesh 输出目录（默认 output/meshes_shadow）
     #[serde(default)]
     pub secondary_mesh_dir: Option<String>,
+
+    /// 延迟写入模式：模型生成阶段不写 SurrealDB，所有 SQL 输出到 .surql 文件。
+    ///
+    /// 启用后：
+    /// - save_instance_data 写入 .surql 文件而非 SUL_DB
+    /// - 跳过 init_model_tables / reconcile_neg_relate / boolean / aabb 写入
+    /// - 生成完成后可通过 --import-sql 导入
+    #[serde(default)]
+    pub defer_db_write: bool,
 }
 
 impl Deref for DbOptionExt {
@@ -294,6 +303,7 @@ impl From<DbOption> for DbOptionExt {
             secondary_db_write: true,
             model_cache_dir: None,
             secondary_mesh_dir: None,
+            defer_db_write: false,
         }
     }
 }
@@ -499,6 +509,7 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         secondary_db_write,
         model_cache_dir,
         secondary_mesh_dir,
+        defer_db_write: false,
     };
 
     validate_data_source_mode(db_option_ext.use_cache, db_option_ext.use_surrealdb).map_err(

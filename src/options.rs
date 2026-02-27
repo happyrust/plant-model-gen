@@ -486,6 +486,11 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    let defer_db_write = toml_value
+        .get("defer_db_write")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // 构建 DbOptionExt
     let db_option_ext = DbOptionExt {
         inner: db_option,
@@ -509,7 +514,7 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         secondary_db_write,
         model_cache_dir,
         secondary_mesh_dir,
-        defer_db_write: false,
+        defer_db_write,
     };
 
     validate_data_source_mode(db_option_ext.use_cache, db_option_ext.use_surrealdb).map_err(

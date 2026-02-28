@@ -25,8 +25,6 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 [target.x86_64-apple-darwin]
 # rustflags = ["-C", "link-args=-Wl,-stack_size,0x1000000"]
 
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/bin/ld64.lld"]
 
 [unstable]
 codegen-backend = true
@@ -40,7 +38,7 @@ split-debuginfo = "unpacked"  # macOS 关键优化：调试信息不打包，大
 
 [profile.dev.package."*"]
 codegen-backend = "llvm"
-opt-level = 1  # 依赖项轻度优化，减小产物体积加速链接
+#opt-level = 1  # 依赖项轻度优化，减小产物体积加速链接
 
 [profile.test]
 # 单测/集成测试在 Windows + cranelift 下更易触发内存/链接异常；
@@ -49,3 +47,15 @@ codegen-backend = "llvm"
 
 [profile.test.package."*"]
 codegen-backend = "llvm"
+
+# ─── release：加速编译，保留足够运行时性能 ───────────────────────────────────
+# 默认 release: opt-level=3, codegen-units=1, incremental=false
+# 以下配置在"编译速度"与"运行性能"之间取折中：
+[profile.release]
+opt-level = 2              # 比 3 少几个重量级 pass（如 vectorization aggressive），编译快 20-40%
+codegen-units = 16         # 并行代码生成，充分利用多核；代价：跨 codegen-unit 内联机会减少
+incremental = true         # 开启增量，迭代改动无需全量重编
+split-debuginfo = "unpacked"  # macOS 链接加速，同 dev 配置
+
+[profile.release.package."*"]
+opt-level = 2              # 依赖项同步降级，否则自身 opt=2 但依赖仍跑 opt=3 pass

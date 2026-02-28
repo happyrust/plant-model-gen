@@ -421,6 +421,16 @@ cc = { version = "1.0", features = ["parallel"] }
 # prost-build = "0.14.1"  # 移到 grpc feature 中
 
 
+# ─── production：面向上线的最优产物，编译慢但性能最强 ──────────────────────────
+# 用法：./build_production.sh  或  cargo build --profile production
+[profile.production]
+inherits = "release"       # 继承当前 release 的基础设置
+opt-level = 3              # 最高优化级别
+codegen-units = 1          # 单 CGU，最大化跨单元内联与优化
+lto = "thin"               # Thin LTO：跨 crate 内联优化，比 fat 快很多但效果接近
+incremental = false        # 关闭增量，确保产物一致可重复
+strip = "symbols"          # 剥离符号表，减小二进制体积
+
 [dev-dependencies]
 tempfile = "3"
 

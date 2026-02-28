@@ -39,6 +39,11 @@ use aios_core::geometry::csg::UNIT_MESH_SCALE;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 
 use aios_core::shape::pdms_shape::BrepShapeTrait;
+use crate::fast_model::gen_model::boolean_task::{
+    BooleanTask, BooleanTaskType, CataNegBoolTask, InstNegBoolTask, NegEntityData,
+};
+use crate::fast_model::gen_model::sql_file_writer::SqlFileWriter;
+use async_trait::async_trait;
 
 // InstanceCacheManager 已随 instance_cache 模块移除
 
@@ -49,6 +54,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use std::{fs, io};
+use std::sync::Arc;
 
 /// 负实体膨胀量（mm）：消除布尔运算中共面薄片的 epsilon
 /// 每边扩展此值，使负实体略微超出正实体表面，产生干净切割
@@ -2308,6 +2314,789 @@ pub async fn apply_insts_boolean_manifold(
 }
 
 
+
+/// 内存任务驱动布尔 worker 执行报告
+#[derive(Debug, Clone, Default)]
+pub struct BoolWorkerReport {
+    pub total: usize,
+    pub cata_cnt: usize,
+    pub inst_cnt: usize,
+    pub success: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub deferred_mode: bool,
+    pub elapsed_ms: u128,
+    pub skip_reasons: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskExecOutcome {
+    Success,
+    Failed,
+}
+
+#[async_trait]
+pub trait BoolResultWriter: Send + Sync {
+    fn deferred_mode(&self) -> bool;
+    async fn write_inst_success(
+        &self,
+        refno: RefnoEnum,
+        mesh_id: &str,
+        aabb: Option<parry3d::bounding_volume::Aabb>,
+    ) -> anyhow::Result<()>;
+    async fn write_inst_failed(&self, refno: RefnoEnum) -> anyhow::Result<()>;
+    async fn write_cata_status(
+        &self,
+        refno: RefnoEnum,
+        mesh_id: Option<&str>,
+        status: &str,
+        source: &str,
+    ) -> anyhow::Result<()>;
+    async fn apply_cata_update_sql(&self, sql: &str) -> anyhow::Result<()>;
+}
+
+struct DbBoolWriter;
+
+#[async_trait]
+impl BoolResultWriter for DbBoolWriter {
+    fn deferred_mode(&self) -> bool {
+        false
+    }
+
+    async fn write_inst_success(
+        &self,
+        refno: RefnoEnum,
+        mesh_id: &str,
+        aabb: Option<parry3d::bounding_volume::Aabb>,
+    ) -> anyhow::Result<()> {
+        update_booled_result(refno, mesh_id, aabb).await
+    }
+
+    async fn write_inst_failed(&self, refno: RefnoEnum) -> anyhow::Result<()> {
+        mark_bool_failed(refno).await
+    }
+
+    async fn write_cata_status(
+        &self,
+        refno: RefnoEnum,
+        mesh_id: Option<&str>,
+        status: &str,
+        source: &str,
+    ) -> anyhow::Result<()> {
+        crate::fast_model::utils::save_inst_relate_cata_bool(refno, mesh_id, status, source).await;
+        Ok(())
+    }
+
+    async fn apply_cata_update_sql(&self, sql: &str) -> anyhow::Result<()> {
+        if sql.trim().is_empty() {
+            return Ok(());
+        }
+        SUL_DB.query(sql).await?;
+        Ok(())
+    }
+}
+
+struct SqlBoolWriter {
+    writer: Arc<SqlFileWriter>,
+}
+
+impl SqlBoolWriter {
+    fn new(writer: Arc<SqlFileWriter>) -> Self {
+        Self { writer }
+    }
+}
+
+#[async_trait]
+impl BoolResultWriter for SqlBoolWriter {
+    fn deferred_mode(&self) -> bool {
+        true
+    }
+
+    async fn write_inst_success(
+        &self,
+        refno: RefnoEnum,
+        mesh_id: &str,
+        aabb: Option<parry3d::bounding_volume::Aabb>,
+    ) -> anyhow::Result<()> {
+        let mut sqls = Vec::new();
+        if let Some(aabb) = aabb {
+            let aabb_hash = aios_core::gen_aabb_hash(&aabb).to_string();
+            let aabb_json = serde_json::to_string(&aabb)?;
+            sqls.push(format!(
+                "INSERT IGNORE INTO aabb [{{'id':aabb:⟨{}⟩, 'd':{}}}]",
+                aabb_hash, aabb_json
+            ));
+            sqls.push(format!(
+                "DELETE [inst_relate_aabb:⟨{}⟩];INSERT RELATION INTO inst_relate_aabb [{{ id: inst_relate_aabb:⟨{}⟩, in: pe:⟨{}⟩, out: aabb:⟨{}⟩ }}]",
+                refno, refno, refno, aabb_hash
+            ));
+        }
+        sqls.push(build_inst_relate_bool_upsert_sql(
+            refno,
+            Some(mesh_id),
+            "Success",
+            "bool_mesh",
+        ));
+        self.writer.write_statements(&sqls)?;
+        Ok(())
+    }
+
+    async fn write_inst_failed(&self, refno: RefnoEnum) -> anyhow::Result<()> {
+        self.writer.write_statement(&build_inst_relate_bool_upsert_sql(
+            refno,
+            None,
+            "Failed",
+            "bool_mesh",
+        ))?;
+        Ok(())
+    }
+
+    async fn write_cata_status(
+        &self,
+        refno: RefnoEnum,
+        mesh_id: Option<&str>,
+        status: &str,
+        source: &str,
+    ) -> anyhow::Result<()> {
+        self.writer
+            .write_statement(&build_cata_status_sql(refno, mesh_id, status, source))?;
+        Ok(())
+    }
+
+    async fn apply_cata_update_sql(&self, sql: &str) -> anyhow::Result<()> {
+        if sql.trim().is_empty() {
+            return Ok(());
+        }
+        self.writer.write_statement(sql)?;
+        Ok(())
+    }
+}
+
+fn build_inst_relate_bool_upsert_sql(
+    refno: RefnoEnum,
+    mesh_id: Option<&str>,
+    status: &str,
+    source: &str,
+) -> String {
+    let refno_str = refno.to_string();
+    let id_key = format!("inst_relate_bool:⟨{}⟩", refno_str);
+    let refno_key = format!("pe:⟨{}⟩", refno_str);
+    let mesh_str = mesh_id
+        .map(|m| format!("'{}'", m))
+        .unwrap_or_else(|| "NONE".to_string());
+    format!(
+        "UPSERT {id_key} CONTENT {{ refno: {refno_key}, mesh_id: {mesh_str}, status: '{status}', source: '{source}', updated_at: time::now() }}"
+    )
+}
+
+fn build_cata_status_sql(
+    refno: RefnoEnum,
+    mesh_id: Option<&str>,
+    status: &str,
+    source: &str,
+) -> String {
+    let refno_key = refno.to_pe_key();
+    let mut sql = format!("LET $inst_info = (SELECT VALUE out FROM {refno_key}->inst_relate LIMIT 1)[0];");
+    sql.push_str(
+        "IF $inst_info != NONE { LET $old_ids = SELECT VALUE id FROM inst_relate_cata_bool WHERE in = $inst_info; DELETE $old_ids;",
+    );
+    if let Some(mesh_id) = mesh_id {
+        let mesh_key = format!("inst_geo:⟨{}⟩", mesh_id);
+        sql.push_str(&format!(
+            "INSERT RELATION INTO inst_relate_cata_bool [{{ in: $inst_info, out: {mesh_key}, status: '{status}', source: '{source}', updated_at: time::now() }}];"
+        ));
+    }
+    sql.push_str("};");
+    sql
+}
+
+fn bool_result_file_exists(mesh_id: &str) -> bool {
+    boolean_glb_path(mesh_id).exists() || boolean_obj_path(mesh_id).exists()
+}
+
+fn append_cata_update_sql(
+    sql: &mut String,
+    task: &CataNegBoolTask,
+    refno: RefnoEnum,
+    mesh_id: &str,
+    pos_geom_refno: RefnoEnum,
+    aabb: Option<parry3d::bounding_volume::Aabb>,
+) -> anyhow::Result<()> {
+    let inst_info_record = format!("inst_info:⟨{}⟩", task.inst_info_id);
+
+    if let Some(aabb) = aabb {
+        let aabb_hash = aios_core::gen_aabb_hash(&aabb).to_string();
+        let aabb_json = serde_json::to_string(&aabb)?;
+        sql.push_str(&format!(
+            "INSERT IGNORE INTO aabb [{{'id':aabb:⟨{}⟩, 'd':{}}}];",
+            aabb_hash, aabb_json
+        ));
+        sql.push_str(&format!(
+            "create inst_geo:⟨{}⟩ set meshed = true, aabb = aabb:⟨{}⟩;",
+            mesh_id, aabb_hash
+        ));
+    } else {
+        sql.push_str(&format!("create inst_geo:⟨{}⟩ set meshed = true;", mesh_id));
+    }
+
+    let relation_id = refno.to_string();
+    sql.push_str(&format!(
+        "LET $old_geo_ids = SELECT VALUE id FROM {}->geo_relate WHERE geo_type = 'CatePos'; DELETE $old_geo_ids;",
+        inst_info_record,
+    ));
+    sql.push_str(&format!(
+        "INSERT RELATION INTO geo_relate {{ in: {}, id: '{rel_id}', out: inst_geo:⟨{mesh_id}⟩, geom_refno: pe:⟨{geom_refno}⟩, geo_type: 'CatePos', trans: trans:⟨0⟩, visible: true }};",
+        inst_info_record,
+        rel_id = relation_id,
+        mesh_id = mesh_id,
+        geom_refno = pos_geom_refno,
+    ));
+    sql.push_str(&format!(
+        "UPDATE {}->geo_relate SET geo_type = 'Compound', visible = false WHERE geom_refno = pe:⟨{}⟩ AND geo_type IN ['Pos','Compound'];",
+        inst_info_record,
+        pos_geom_refno,
+    ));
+    Ok(())
+}
+
+fn subtract_neg_with_fallback(
+    mut pos_manifold: ManifoldRust,
+    neg_manifolds: &[ManifoldRust],
+) -> ManifoldRust {
+    let mut result = pos_manifold.clone();
+    for neg in neg_manifolds {
+        if result.get_mesh().indices.is_empty() {
+            break;
+        }
+        let mut next = result.clone();
+        next.inner = next.inner.difference(&neg.inner);
+        result = next;
+    }
+    if result.get_mesh().indices.is_empty() && !neg_manifolds.is_empty() {
+        let neg_union = ManifoldRust::batch_boolean(
+            neg_manifolds,
+            aios_core::csg::manifold::ManifoldOpType::Union,
+        );
+        pos_manifold.inner = pos_manifold.inner.difference(&neg_union.inner);
+        if !pos_manifold.get_mesh().indices.is_empty() {
+            return pos_manifold;
+        }
+    }
+    result
+}
+
+async fn process_cata_task(
+    refno: RefnoEnum,
+    task: CataNegBoolTask,
+    writer: &dyn BoolResultWriter,
+) -> anyhow::Result<TaskExecOutcome> {
+    use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
+
+    if task.boolean_groups.is_empty() {
+        return Ok(TaskExecOutcome::Failed);
+    }
+
+    let mut source_failed_geo_hashes: HashMap<u64, String> = HashMap::new();
+    let mut source_failed_geo_hashes_warned: HashSet<u64> = HashSet::new();
+    let mut update_sql = String::new();
+
+    let mut try_load_geo_manifold = |scene: &str,
+                                     geo_param: &PdmsGeoParam,
+                                     geo_hash: u64,
+                                     mat: DMat4,
+                                     more_precision: bool|
+     -> Option<ManifoldRust> {
+        if let Some(reason) = source_failed_geo_hashes.get(&geo_hash) {
+            if source_failed_geo_hashes_warned.insert(geo_hash) {
+                eprintln!(
+                    "[bool][{}] 跳过已知失败几何: refno={} mesh_id={} reason={}",
+                    scene, refno, geo_hash, reason
+                );
+            }
+            return None;
+        }
+        match load_manifold_from_geo_param(geo_param, geo_hash, mat, more_precision) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                if is_source_level_manifold_error(&e) {
+                    source_failed_geo_hashes.insert(geo_hash, e.to_string());
+                }
+                log_load_manifold_failed(scene, refno, &geo_hash.to_string(), &e);
+                None
+            }
+        }
+    };
+
+    // Union 合并方案：每个 boolean_group 产出一个中间结果，最终 union 合并为单一 manifold
+    let refu64: aios_core::RefU64 = refno.into();
+    let mesh_id = refu64.to_string();
+    let mut group_results: Vec<ManifoldRust> = Vec::new();
+    // 记录第一个成功分组的 pos_geom_refno，用于 SQL 回写
+    let mut first_pos_geom_refno: Option<RefnoEnum> = None;
+
+    for bg in task.boolean_groups.iter() {
+        if bg.is_empty() {
+            continue;
+        }
+        let Some(pos) = task.geo_data_map.get(&bg[0]) else {
+            continue;
+        };
+
+        let pos_geo_hash = pos.geo_hash;
+        let mut pos_tf = pos.transform;
+        if matches!(pos_geo_hash, 1 | 2 | 3) {
+            pos_tf.scale /= UNIT_MESH_SCALE;
+        }
+        let pos_manifold = match try_load_geo_manifold(
+            "cata_pos",
+            &pos.param,
+            pos_geo_hash,
+            pos_tf.to_matrix().as_dmat4(),
+            false,
+        ) {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let mut neg_manifolds = Vec::new();
+        for &neg in bg.iter().skip(1) {
+            let Some(neg_geo) = task.geo_data_map.get(&neg) else {
+                continue;
+            };
+            let neg_geo_hash = neg_geo.geo_hash;
+            let mut neg_tf = neg_geo.transform;
+            if matches!(neg_geo_hash, 1 | 2 | 3) {
+                neg_tf.scale /= UNIT_MESH_SCALE;
+            }
+            if let Some(m) = try_load_geo_manifold(
+                "cata_neg",
+                &neg_geo.param,
+                neg_geo_hash,
+                neg_tf.to_matrix().as_dmat4(),
+                true,
+            ) {
+                neg_manifolds.push(m.inflate_from_center(NEG_INFLATE_EPSILON_MM));
+            }
+        }
+
+        if bg.len() > 1 && neg_manifolds.is_empty() {
+            continue;
+        }
+
+        let mut result = pos_manifold.batch_boolean_subtract(&neg_manifolds);
+        // 低精度失败时用高精度重试
+        if !neg_manifolds.is_empty() && result.get_mesh().indices.is_empty() {
+            if let Ok(pos_hi) = load_manifold_from_geo_param(
+                &pos.param,
+                pos_geo_hash,
+                pos_tf.to_matrix().as_dmat4(),
+                true,
+            ) {
+                result = pos_hi.batch_boolean_subtract(&neg_manifolds);
+            }
+        }
+
+        if !result.get_mesh().indices.is_empty() {
+            if first_pos_geom_refno.is_none() {
+                first_pos_geom_refno = Some(bg[0]);
+            }
+            group_results.push(result);
+        }
+    }
+
+    // 将所有分组结果 union 合并为最终 manifold
+    if group_results.is_empty() {
+        writer
+            .write_cata_status(refno, None, "Failed", "cata_bool")
+            .await?;
+        return Ok(TaskExecOutcome::Failed);
+    }
+
+    let final_manifold = if group_results.len() == 1 {
+        group_results.into_iter().next().unwrap()
+    } else {
+        ManifoldRust::batch_boolean(
+            &group_results,
+            aios_core::csg::manifold::ManifoldOpType::Union,
+        )
+    };
+
+    if final_manifold.get_mesh().indices.is_empty() {
+        writer
+            .write_cata_status(refno, None, "Failed", "cata_bool")
+            .await?;
+        return Ok(TaskExecOutcome::Failed);
+    }
+
+    let target_path = boolean_glb_path(&mesh_id);
+    ensure_parent_dir(&target_path)?;
+    let normal_mesh = manifold_to_normal_mesh(final_manifold.get_mesh());
+    if export_single_mesh_to_glb(&normal_mesh, &target_path).is_ok() {
+        append_cata_update_sql(
+            &mut update_sql,
+            &task,
+            refno,
+            &mesh_id,
+            first_pos_geom_refno.unwrap(),
+            final_manifold.get_mesh().cal_aabb(),
+        )?;
+        writer
+            .write_cata_status(refno, Some(&mesh_id), "Success", "cata_bool")
+            .await?;
+        writer.apply_cata_update_sql(&update_sql).await?;
+        Ok(TaskExecOutcome::Success)
+    } else {
+        writer
+            .write_cata_status(refno, None, "Failed", "cata_bool")
+            .await?;
+        Ok(TaskExecOutcome::Failed)
+    }
+}
+
+async fn process_inst_task(
+    refno: RefnoEnum,
+    task: InstNegBoolTask,
+    writer: &dyn BoolResultWriter,
+) -> anyhow::Result<TaskExecOutcome> {
+    use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
+
+    if task.pos_geos.is_empty() || task.neg_entities.is_empty() {
+        writer.write_inst_failed(refno).await?;
+        return Ok(TaskExecOutcome::Failed);
+    }
+
+    let pos_world_mat = task.inst_world_transform.to_matrix().as_dmat4();
+    let inverse_pos_world = pos_world_mat.inverse();
+
+    let mut pos_manifolds = Vec::new();
+    for pos in &task.pos_geos {
+        let pos_local_mat = pos.local_transform.to_matrix().as_dmat4();
+        match load_manifold(&pos.geo_hash, pos_local_mat, false) {
+            Ok(manifold) => pos_manifolds.push(manifold),
+            Err(e) => log_load_manifold_failed("inst_pos", refno, &pos.geo_hash, &e),
+        }
+    }
+    if pos_manifolds.is_empty() {
+        writer.write_inst_failed(refno).await?;
+        return Ok(TaskExecOutcome::Failed);
+    }
+
+    let pos_manifold = ManifoldRust::batch_boolean(
+        &pos_manifolds,
+        aios_core::csg::manifold::ManifoldOpType::Union,
+    );
+    if pos_manifold.get_mesh().indices.is_empty() {
+        writer.write_inst_failed(refno).await?;
+        return Ok(TaskExecOutcome::Failed);
+    }
+
+    let mut neg_manifolds = Vec::new();
+    for neg_entity in &task.neg_entities {
+        let carrier_world_mat = neg_entity.carrier_world_transform.to_matrix().as_dmat4();
+        for neg_geo in &neg_entity.neg_geos {
+            if let Some(expect_refno) = neg_entity.ngmr_geom_refno {
+                if neg_geo.geom_refno != expect_refno {
+                    continue;
+                }
+            }
+
+            let is_unit_mesh = matches!(neg_geo.geo_hash.as_str(), "1" | "2" | "3");
+            let mut geo_tf = neg_geo.local_transform;
+            if is_unit_mesh {
+                geo_tf.scale /= UNIT_MESH_SCALE;
+            }
+            let neg_world_mat = carrier_world_mat * geo_tf.to_matrix().as_dmat4();
+            let relative_mat = inverse_pos_world * neg_world_mat;
+
+            match load_manifold(&neg_geo.geo_hash, relative_mat, true) {
+                Ok(manifold) => {
+                    neg_manifolds.push(manifold.inflate_from_center(NEG_INFLATE_EPSILON_MM))
+                }
+                Err(e) => log_load_manifold_failed("inst_neg", refno, &neg_geo.geo_hash, &e),
+            }
+        }
+    }
+    if neg_manifolds.is_empty() {
+        writer.write_inst_failed(refno).await?;
+        return Ok(TaskExecOutcome::Failed);
+    }
+
+    let mut final_manifold = subtract_neg_with_fallback(pos_manifold, &neg_manifolds);
+    if final_manifold.get_mesh().indices.is_empty() {
+        let mut pos_hi_manifolds = Vec::new();
+        for pos in &task.pos_geos {
+            let pos_local_mat = pos.local_transform.to_matrix().as_dmat4();
+            if let Ok(m) = load_manifold(&pos.geo_hash, pos_local_mat, true) {
+                pos_hi_manifolds.push(m);
+            }
+        }
+        if !pos_hi_manifolds.is_empty() {
+            let pos_hi = ManifoldRust::batch_boolean(
+                &pos_hi_manifolds,
+                aios_core::csg::manifold::ManifoldOpType::Union,
+            );
+            final_manifold = subtract_neg_with_fallback(pos_hi, &neg_manifolds);
+        }
+    }
+
+    if final_manifold.get_mesh().indices.is_empty() {
+        writer.write_inst_failed(refno).await?;
+        return Ok(TaskExecOutcome::Failed);
+    }
+
+    let refu64: aios_core::RefU64 = refno.into();
+    let mesh_id = refu64.to_string();
+    let target_path = boolean_glb_path(&mesh_id);
+    ensure_parent_dir(&target_path)?;
+    let normal_mesh = manifold_to_normal_mesh(final_manifold.get_mesh());
+    if export_single_mesh_to_glb(&normal_mesh, &target_path).is_err() {
+        writer.write_inst_failed(refno).await?;
+        return Ok(TaskExecOutcome::Failed);
+    }
+
+    writer
+        .write_inst_success(refno, &mesh_id, final_manifold.get_mesh().cal_aabb())
+        .await?;
+    Ok(TaskExecOutcome::Success)
+}
+
+/// 批量查询 DB 中布尔运算已成功完成的 refno 集合。
+/// 同时检查 inst_relate_bool 和 inst_relate_cata_bool 两张表。
+async fn batch_query_bool_success_refnos(
+    tasks: &[BooleanTask],
+) -> anyhow::Result<HashSet<RefnoEnum>> {
+    let refnos: Vec<RefnoEnum> = tasks
+        .iter()
+        .filter(|t| t.noun.as_deref() != Some("BRAN"))
+        .map(|t| t.refno)
+        .collect();
+
+    if refnos.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let mut success_set = HashSet::new();
+
+    // 分块查询，每次最多 200 个
+    for chunk in refnos.chunks(200) {
+        let ids: Vec<String> = chunk
+            .iter()
+            .map(|r| format!("inst_relate_bool:⟨{}⟩", r))
+            .collect();
+        let sql = format!(
+            "SELECT VALUE in FROM [{}] WHERE status = 'Success'",
+            ids.join(",")
+        );
+        match SUL_DB.query_take::<Vec<RefnoEnum>>(&sql, 0).await {
+            Ok(found) => {
+                for r in found {
+                    success_set.insert(r);
+                }
+            }
+            Err(_) => {} // 查询失败静默跳过，回退到仅文件判定
+        }
+
+        // 同时查 cata_bool 表
+        let cata_ids: Vec<String> = chunk
+            .iter()
+            .map(|r| format!("inst_relate_cata_bool:⟨{}⟩", r))
+            .collect();
+        let cata_sql = format!(
+            "SELECT VALUE in.refno FROM [{}] WHERE status = 'Success'",
+            cata_ids.join(",")
+        );
+        match SUL_DB.query_take::<Vec<RefnoEnum>>(&cata_sql, 0).await {
+            Ok(found) => {
+                for r in found {
+                    success_set.insert(r);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    Ok(success_set)
+}
+
+pub async fn run_bool_worker_from_tasks(
+    tasks: Vec<BooleanTask>,
+    db_option: Arc<aios_core::options::DbOption>,
+    sql_writer: Option<Arc<SqlFileWriter>>,
+) -> anyhow::Result<BoolWorkerReport> {
+    use super::refno_assoc_index::RefnoAssocIndexBatch;
+
+    let started = std::time::Instant::now();
+    let replace_exist = db_option.is_replace_mesh();
+    let deferred_mode = sql_writer.is_some();
+    let writer: Arc<dyn BoolResultWriter> = if let Some(ref w) = sql_writer {
+        Arc::new(SqlBoolWriter::new(w.clone()))
+    } else {
+        Arc::new(DbBoolWriter)
+    };
+
+    let mut report = BoolWorkerReport {
+        total: tasks.len(),
+        deferred_mode,
+        ..Default::default()
+    };
+
+    println!(
+        "[bool_worker/memory] 启动: total={} replace_exist={} defer_db_write={}",
+        report.total, replace_exist, report.deferred_mode
+    );
+
+    let mut assoc_batch = RefnoAssocIndexBatch::default();
+
+    // T6: 批量预查询 DB 状态，用于非 deferred 模式下的增强 skip 判定
+    let db_success_set: HashSet<RefnoEnum> = if !replace_exist && !deferred_mode {
+        match batch_query_bool_success_refnos(&tasks).await {
+            Ok(set) => {
+                if !set.is_empty() {
+                    println!("[bool_worker/memory] 预查询 DB 已成功 refno 数: {}", set.len());
+                }
+                set
+            }
+            Err(e) => {
+                eprintln!("[bool_worker/memory] 预查询 DB 布尔状态失败，降级为仅文件判定: {}", e);
+                HashSet::new()
+            }
+        }
+    } else {
+        HashSet::new()
+    };
+
+    // T8: 并发执行布尔运算
+    // 先串行过滤 skip 任务，然后并发处理剩余任务
+    let mut executable_tasks: Vec<BooleanTask> = Vec::new();
+    for task in tasks {
+        let refno = task.refno;
+        if task.noun.as_deref() == Some("BRAN") {
+            report.skipped += 1;
+            *report.skip_reasons.entry("bran".to_string()).or_insert(0) += 1;
+            continue;
+        }
+
+        let refu64: aios_core::RefU64 = refno.into();
+        let mesh_id = refu64.to_string();
+        if !replace_exist {
+            let file_exists = bool_result_file_exists(&mesh_id);
+            let should_skip = if deferred_mode {
+                file_exists
+            } else {
+                file_exists && db_success_set.contains(&refno)
+            };
+            if should_skip {
+                report.skipped += 1;
+                *report
+                    .skip_reasons
+                    .entry("skip_file_and_db_ok".to_string())
+                    .or_insert(0) += 1;
+                continue;
+            }
+        }
+
+        match &task.task_type {
+            BooleanTaskType::CataNeg(_) => report.cata_cnt += 1,
+            BooleanTaskType::InstNeg(_) => report.inst_cnt += 1,
+        }
+        executable_tasks.push(task);
+    }
+
+    if executable_tasks.is_empty() {
+        // 没有需要执行的任务，直接返回
+        report.elapsed_ms = started.elapsed().as_millis();
+        println!(
+            "[bool_worker/memory] 结束（无可执行任务）: total={} skipped={} elapsed={}ms",
+            report.total, report.skipped, report.elapsed_ms
+        );
+        return Ok(report);
+    }
+
+    // 并发执行
+    let concurrency = num_cpus::get().clamp(2, 6);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+
+    println!(
+        "[bool_worker/memory] 开始并发执行 {} 个任务，并发数={}",
+        executable_tasks.len(),
+        concurrency
+    );
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for task in executable_tasks {
+        let writer = writer.clone();
+        let sem = semaphore.clone();
+        join_set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let refno = task.refno;
+            let outcome = match task.task_type {
+                BooleanTaskType::CataNeg(cata_task) => {
+                    process_cata_task(refno, cata_task, writer.as_ref()).await
+                }
+                BooleanTaskType::InstNeg(inst_task) => {
+                    process_inst_task(refno, inst_task, writer.as_ref()).await
+                }
+            };
+            (refno, outcome)
+        });
+    }
+
+    // 收集结果
+    while let Some(join_result) = join_set.join_next().await {
+        match join_result {
+            Ok((refno, outcome)) => match outcome {
+                Ok(TaskExecOutcome::Success) => {
+                    report.success += 1;
+                    let bool_record_id = format!("inst_relate_bool:⟨{}⟩", refno);
+                    let cata_bool_record_id = format!("inst_relate_cata_bool:⟨{}⟩", refno);
+                    assoc_batch.add_inst_relate_bool_id(refno, bool_record_id);
+                    assoc_batch.add_inst_relate_cata_bool_id(refno, cata_bool_record_id);
+                }
+                Ok(TaskExecOutcome::Failed) => {
+                    report.failed += 1;
+                }
+                Err(e) => {
+                    report.failed += 1;
+                    eprintln!("[bool_worker/memory] 任务执行失败: refno={} err={}", refno, e);
+                }
+            },
+            Err(e) => {
+                report.failed += 1;
+                eprintln!("[bool_worker/memory] 任务 panic: {}", e);
+            }
+        }
+    }
+
+    // 写入 refno_assoc_index
+    if !assoc_batch.is_empty() {
+        if let Some(ref w) = sql_writer {
+            if let Err(e) = assoc_batch.write_to_sql_file(w) {
+                eprintln!("[bool_worker/memory] refno_assoc_index 写入 SQL 文件失败: {}", e);
+            }
+        } else {
+            if let Err(e) = assoc_batch.upsert_to_db().await {
+                eprintln!("[bool_worker/memory] refno_assoc_index 写入 DB 失败: {}", e);
+            }
+        }
+    }
+
+    report.elapsed_ms = started.elapsed().as_millis();
+    println!(
+        "[bool_worker/memory] 结束: total={} cata={} inst={} success={} failed={} skipped={} elapsed={}ms",
+        report.total,
+        report.cata_cnt,
+        report.inst_cnt,
+        report.success,
+        report.failed,
+        report.skipped,
+        report.elapsed_ms
+    );
+    if !report.skip_reasons.is_empty() {
+        println!("[bool_worker/memory] skipped 原因分布: {:?}", report.skip_reasons);
+    }
+
+    Ok(report)
+}
 
 // [foyer-removal] cache-only 布尔运算函数已禁用
 /*

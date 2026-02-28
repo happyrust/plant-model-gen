@@ -1344,6 +1344,10 @@ async fn process_index_tree_generation(
 
             println!("[gen_model] IndexTree 模式开始布尔运算（boolean worker）");
             println!(
+                "[gen_model] boolean_pipeline_mode={:?}, defer_db_write={}, use_surrealdb={}, enable_db_backfill={}",
+                db_option.boolean_pipeline_mode, defer_db_write, use_surrealdb, db_option.enable_db_backfill
+            );
+            println!(
                 "[gen_model] 布尔任务统计: total={} (insert_batch_cnt={})",
                 bool_tasks.len(),
                 insert_report.batch_cnt
@@ -1364,9 +1368,36 @@ async fn process_index_tree_generation(
                     }
                 }
                 BooleanPipelineMode::MemoryTasks => {
-                    if bool_tasks.is_empty() {
+                    // 模式组合合法性守卫：MemoryTasks 至少需要一种写入通道
+                    if !defer_db_write && !use_surrealdb {
+                        eprintln!(
+                            "[gen_model] boolean_pipeline_mode=memory_tasks 非法：defer_db_write=false 且 use_surrealdb=false，无写入通道，跳过布尔"
+                        );
+                    } else if bool_tasks.is_empty() {
                         println!("[gen_model] boolean_pipeline_mode=memory_tasks，但没有可执行布尔任务");
                     } else {
+                        // T7: DB backfill — 补齐内存中缺失的 cata 任务
+                        if db_option.enable_db_backfill {
+                            match super::boolean_backfill::backfill_cata_tasks_from_db(
+                                &mut bool_tasks,
+                                use_surrealdb,
+                            )
+                            .await
+                            {
+                                Ok(count) if count > 0 => {
+                                    println!(
+                                        "[gen_model] DB backfill 补齐了 {} 个 cata 布尔任务，当前总数 {}",
+                                        count,
+                                        bool_tasks.len()
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("[gen_model] DB backfill 失败（非致命，继续执行）: {}", e);
+                                }
+                                _ => {}
+                            }
+                        }
+
                         match run_bool_worker_from_tasks(
                             std::mem::take(&mut bool_tasks),
                             Arc::new(db_option.inner.clone()),

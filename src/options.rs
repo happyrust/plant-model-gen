@@ -10,6 +10,14 @@ fn default_false() -> bool {
     false
 }
 
+fn default_boolean_pipeline_mode() -> BooleanPipelineMode {
+    BooleanPipelineMode::DbLegacy
+}
+
+fn default_regen_delete_mode() -> RegenDeleteMode {
+    RegenDeleteMode::Legacy
+}
+
 /// 校验数据源模式（`use_cache` / `use_surrealdb`）是否合法。
 ///
 /// 规则：两者必须严格互斥，且恰好一个为 `true`。
@@ -42,6 +50,38 @@ pub enum MeshFormat {
 impl Default for MeshFormat {
     fn default() -> Self {
         Self::PdmsMesh
+    }
+}
+
+/// 布尔运算管线模式
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BooleanPipelineMode {
+    /// 旧路径：从 DB 扫描待处理布尔任务
+    DbLegacy,
+    /// 新路径：由内存任务驱动布尔计算
+    MemoryTasks,
+}
+
+impl Default for BooleanPipelineMode {
+    fn default() -> Self {
+        Self::DbLegacy
+    }
+}
+
+/// regen-model 删旧模式
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RegenDeleteMode {
+    /// 旧路径：多表查询后逐表删除
+    Legacy,
+    /// 新路径：按 refno_assoc_index 聚合索引删除
+    RefnoAssocIndex,
+}
+
+impl Default for RegenDeleteMode {
+    fn default() -> Self {
+        Self::Legacy
     }
 }
 
@@ -155,6 +195,18 @@ pub struct DbOptionExt {
     /// - 生成完成后可通过 --import-sql 导入
     #[serde(default)]
     pub defer_db_write: bool,
+
+    /// 布尔运算执行模式
+    #[serde(default = "default_boolean_pipeline_mode")]
+    pub boolean_pipeline_mode: BooleanPipelineMode,
+
+    /// regen-model 删旧模式
+    #[serde(default = "default_regen_delete_mode")]
+    pub regen_delete_mode: RegenDeleteMode,
+
+    /// 布尔运算前是否从 DB 批量补齐缺失的 cata 任务
+    #[serde(default)]
+    pub enable_db_backfill: bool,
 }
 
 impl Deref for DbOptionExt {
@@ -304,6 +356,9 @@ impl From<DbOption> for DbOptionExt {
             model_cache_dir: None,
             secondary_mesh_dir: None,
             defer_db_write: false,
+            boolean_pipeline_mode: BooleanPipelineMode::DbLegacy,
+            regen_delete_mode: RegenDeleteMode::Legacy,
+            enable_db_backfill: false,
         }
     }
 }
@@ -491,6 +546,29 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let boolean_pipeline_mode = toml_value
+        .get("boolean_pipeline_mode")
+        .and_then(|v| v.as_str())
+        .map(|s| match s.to_ascii_lowercase().as_str() {
+            "memory_tasks" => BooleanPipelineMode::MemoryTasks,
+            _ => BooleanPipelineMode::DbLegacy,
+        })
+        .unwrap_or(BooleanPipelineMode::DbLegacy);
+
+    let regen_delete_mode = toml_value
+        .get("regen_delete_mode")
+        .and_then(|v| v.as_str())
+        .map(|s| match s.to_ascii_lowercase().as_str() {
+            "refno_assoc_index" => RegenDeleteMode::RefnoAssocIndex,
+            _ => RegenDeleteMode::Legacy,
+        })
+        .unwrap_or(RegenDeleteMode::Legacy);
+
+    let enable_db_backfill = toml_value
+        .get("enable_db_backfill")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // 构建 DbOptionExt
     let db_option_ext = DbOptionExt {
         inner: db_option,
@@ -515,6 +593,9 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         model_cache_dir,
         secondary_mesh_dir,
         defer_db_write,
+        boolean_pipeline_mode,
+        regen_delete_mode,
+        enable_db_backfill,
     };
 
     validate_data_source_mode(db_option_ext.use_cache, db_option_ext.use_surrealdb).map_err(
@@ -548,6 +629,17 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
             "   - 排除的 noun: {:?}",
             db_option_ext.index_tree_excluded_target_types
         );
+    }
+    println!(
+        "   - boolean_pipeline_mode: {:?}",
+        db_option_ext.boolean_pipeline_mode
+    );
+    println!(
+        "   - regen_delete_mode: {:?}",
+        db_option_ext.regen_delete_mode
+    );
+    if db_option_ext.enable_db_backfill {
+        println!("   - enable_db_backfill: true");
     }
 
     Ok(db_option_ext)

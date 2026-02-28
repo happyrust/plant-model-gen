@@ -608,12 +608,25 @@ async fn main() -> anyhow::Result<()> {
                 .value_parser(clap::value_parser!(u32)),
         )
         .arg(
+            Arg::new("root-refno")
+                .long("root-refno")
+                .help("Root refno for scoped export (e.g. 24381_145018 or 24381/145018)")
+                .value_name("REFNO"),
+        )
+        .arg(
             Arg::new("gen-nouns")
                 .long("gen-nouns")
                 .help("Only generate specified noun types (comma-separated, e.g. BRAN,PANE). Overrides index_tree_enabled_target_types in DbOption")
                 .value_name("NOUNS")
                 .value_delimiter(',')
                 .num_args(1..),
+        )
+        .arg(
+            Arg::new("gen-limit-per-noun")
+                .long("gen-limit-per-noun")
+                .help("Limit max instances per noun type during generation (e.g. 50). 0 means unlimited.")
+                .value_name("LIMIT")
+                .value_parser(clap::value_parser!(usize)),
         )
         .arg(
             Arg::new("verbose")
@@ -903,6 +916,14 @@ async fn main() -> anyhow::Result<()> {
             );
             db_option_ext.index_tree_enabled_target_types = v;
         }
+    }
+    if let Some(limit) = matches.get_one::<usize>("gen-limit-per-noun").copied() {
+        let override_limit = if limit == 0 { None } else { Some(limit) };
+        println!(
+            "🔧 CLI 覆盖 index_tree_debug_limit_per_target_type: {:?} -> {:?}",
+            db_option_ext.index_tree_debug_limit_per_target_type, override_limit
+        );
+        db_option_ext.index_tree_debug_limit_per_target_type = override_limit;
     }
 
     // 同步精度配置到 rs-core 全局 active_precision，保证布尔/导出等逻辑使用同一套 LOD
@@ -1257,13 +1278,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ========== 处理 --regen-model 参数（影响纯模型生成） ==========
-    if matches.get_flag("regen-model") {
+    let regen_model_requested = matches.get_flag("regen-model");
+    if regen_model_requested {
         println!("🔄 检测到 --regen-model 参数，强制开启 replace_mesh 模式");
         // 与 replace_mesh 配合：强制 mesh_worker 忽略 mesh_sig 缓存，确保本次能看到最新代码/配置效果。
         unsafe {
             std::env::set_var("FORCE_REGEN_MESH", "1");
-            // 兼容 cache-only mesh_worker 的替换语义（run_mesh_worker_from_cache_manager 读取该变量）。
-            std::env::set_var("FORCE_REPLACE_MESH", "true");
         }
         db_option_ext.inner.replace_mesh = Some(true);
         // 元件库(cata_neg)/设计型负实体导出依赖布尔结果（CatePos），因此 regen-model 必须开启布尔运算。
@@ -1286,6 +1306,38 @@ async fn main() -> anyhow::Result<()> {
             println!("🔄 调试模式启用 gen_mesh，默认开启 replace_mesh 以重新生成模型数据");
         }
         db_option_ext.inner.replace_mesh = Some(true);
+    }
+
+    // ========== 集中处理 --regen-model：在所有导出分支之前一次性完成模型重建 ==========
+    if regen_model_requested {
+        // 确定 regen 的目标 refnos：优先 debug-model 指定的 refnos，其次 CLI 独立 refno 参数，
+        // 再次 dbnum（查询所有 SITE），最后全库模式。
+        let regen_refnos_vec: Vec<String> = if let Some(ref refnos) = debug_model_refnos {
+            refnos.clone()
+        } else if let Some(refnos) = matches.get_many::<String>("export-obj-refnos") {
+            refnos.map(|s| s.to_string()).collect()
+        } else if let Some(refnos) = matches.get_many::<String>("export-glb-refnos") {
+            refnos.map(|s| s.to_string()).collect()
+        } else if let Some(refnos) = matches.get_many::<String>("export-gltf-refnos") {
+            refnos.map(|s| s.to_string()).collect()
+        } else {
+            vec![]
+        };
+        let regen_config = build_export_config(
+            regen_refnos_vec,
+            None,
+            None,
+            include_descendants,
+            source_unit,
+            target_unit,
+            verbose,
+            false,
+            dbnum,
+            split_by_site,
+            include_negative,
+            false,
+        );
+        cli_modes::run_regen_model(&regen_config, &db_option_ext).await?;
     }
 
     // ========== OBJ 导出：默认沿用配置，--use-surrealdb 可强制切到 SurrealDB ==========
@@ -1360,7 +1412,7 @@ async fn main() -> anyhow::Result<()> {
                 source_unit,
                 target_unit,
                 verbose,
-                matches.get_flag("regen-model"),
+                false, // regen-model 已在导出前集中处理
                 None,
                 split_by_site,
                 include_negative,
@@ -1406,7 +1458,7 @@ async fn main() -> anyhow::Result<()> {
                 source_unit,
                 target_unit,
                 verbose,
-                matches.get_flag("regen-model"),
+                false, // regen-model 已在导出前集中处理
                 None,
                 split_by_site,
                 include_negative,
@@ -1433,7 +1485,7 @@ async fn main() -> anyhow::Result<()> {
                 source_unit,
                 target_unit,
                 verbose,
-                matches.get_flag("regen-model"),
+                false, // regen-model 已在导出前集中处理
                 None,
                 split_by_site,
                 include_negative,
@@ -1460,7 +1512,7 @@ async fn main() -> anyhow::Result<()> {
                 source_unit,
                 target_unit,
                 verbose,
-                matches.get_flag("regen-model"),
+                false, // regen-model 已在导出前集中处理
                 None,
                 split_by_site,
                 include_negative,
@@ -1488,7 +1540,7 @@ async fn main() -> anyhow::Result<()> {
                 source_unit,
                 target_unit,
                 verbose,
-                matches.get_flag("regen-model"),
+                false, // regen-model 已在导出前集中处理
                 None,
                 split_by_site,
                 include_negative,
@@ -1520,7 +1572,7 @@ async fn main() -> anyhow::Result<()> {
                 source_unit,
                 target_unit,
                 verbose,
-                matches.get_flag("regen-model"),
+                false, // regen-model 已在导出前集中处理
                 Some(dbnum),
                 split_by_site,
                 include_negative,
@@ -1546,7 +1598,7 @@ async fn main() -> anyhow::Result<()> {
                 source_unit,
                 target_unit,
                 verbose,
-                matches.get_flag("regen-model"),
+                false, // regen-model 已在导出前集中处理
                 Some(dbnum),
                 split_by_site,
                 include_negative,
@@ -1573,7 +1625,7 @@ async fn main() -> anyhow::Result<()> {
                 source_unit,
                 target_unit,
                 verbose,
-                matches.get_flag("regen-model"),
+                false, // regen-model 已在导出前集中处理
                 Some(dbnum),
                 split_by_site,
                 include_negative,
@@ -1606,7 +1658,7 @@ async fn main() -> anyhow::Result<()> {
                 source_unit,
                 target_unit,
                 verbose,
-                matches.get_flag("regen-model"),
+                false, // regen-model 已在导出前集中处理
                 None,
                 split_by_site,
                 include_negative,
@@ -1695,7 +1747,7 @@ async fn main() -> anyhow::Result<()> {
             source_unit.to_string(),
             target_unit.to_string(),
             verbose,
-            matches.get_flag("regen-model"),
+            false, // regen-model 已在导出前集中处理
             use_basic_materials,
             split_by_site,
             include_negative,
@@ -1720,7 +1772,7 @@ async fn main() -> anyhow::Result<()> {
             source_unit.to_string(),
             target_unit.to_string(),
             verbose,
-            matches.get_flag("regen-model"),
+            false, // regen-model 已在导出前集中处理
             use_basic_materials,
             split_by_site,
             include_negative,
@@ -1745,7 +1797,7 @@ async fn main() -> anyhow::Result<()> {
             source_unit.to_string(),
             target_unit.to_string(),
             verbose,
-            matches.get_flag("regen-model"),
+            false, // regen-model 已在导出前集中处理
             use_basic_materials,
             split_by_site,
             include_negative,
@@ -1908,23 +1960,57 @@ async fn main() -> anyhow::Result<()> {
     if matches.get_flag("export-dbnum-instances-parquet")
         || matches.get_flag("export-dbnum-instances")
     {
-        let dbnum = matches.get_one::<u32>("dbnum").copied();
+        use aios_core::pdms_types::RefnoEnum;
+        use std::str::FromStr;
+
+        let dbnum_cli = matches.get_one::<u32>("dbnum").copied();
+        let root_refno: Option<RefnoEnum> = matches
+            .get_one::<String>("root-refno")
+            .and_then(|s| {
+                let refno_str = s.replace('_', "/");
+                RefnoEnum::from_str(&refno_str).ok()
+            });
+        let dbnum_from_root = root_refno.as_ref().and_then(|r| {
+            aios_database::data_interface::db_meta().get_dbnum_by_refno(*r)
+        });
+
         let fill_missing_cache = matches.get_flag("fill-missing-cache");
         let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
 
-        let dbnum = match dbnum {
-            Some(n) => n,
-            None => {
-                eprintln!("❌ 错误: --export-dbnum-instances-parquet 需要提供 --dbnum 参数");
+        if let (Some(dbnum_cli), Some(dbnum_root), Some(root)) =
+            (dbnum_cli, dbnum_from_root, root_refno.as_ref())
+        {
+            if dbnum_cli != dbnum_root {
+                eprintln!(
+                    "❌ 错误: --dbnum={} 与 --root-refno={} 推导 dbnum={} 不一致",
+                    dbnum_cli, root, dbnum_root
+                );
+                std::process::exit(1);
+            }
+        }
+
+        let dbnum = match (dbnum_cli, dbnum_from_root) {
+            (Some(n), _) => n,
+            (None, Some(n)) => n,
+            (None, None) => {
+                eprintln!("❌ 错误: --export-dbnum-instances-parquet 需要提供 --dbnum 或 --root-refno");
                 eprintln!("   例如: cargo run -- --export-dbnum-instances-parquet --dbnum 7997");
+                eprintln!("   或者: cargo run -- --export-dbnum-instances-parquet --root-refno 24381_145018");
                 std::process::exit(1);
             }
         };
 
-        let from_surrealdb = matches.get_flag("from-surrealdb");
+        let mut from_surrealdb = matches.get_flag("from-surrealdb");
+        if root_refno.is_some() && !from_surrealdb {
+            println!("⚠️  检测到 --root-refno，自动切换到 SurrealDB 数据源（cache 模式不支持按 root 范围导出）");
+            from_surrealdb = true;
+        }
 
         println!("🎯 导出 dbnum 实例数据为 Parquet（多表，供 DuckDB 查询）");
         println!("   - 按 dbnum={} 过滤", dbnum);
+        if let Some(ref root) = root_refno {
+            println!("   - 根节点: {}（仅导出其 visible 子孙）", root);
+        }
         if from_surrealdb {
             println!("   - 数据源: SurrealDB");
         } else {
@@ -1946,7 +2032,7 @@ async fn main() -> anyhow::Result<()> {
                 verbose,
                 export_bundle_dir,
                 &db_option_ext,
-                None, // root_refno
+                root_refno,
             )
             .await;
         }
@@ -2205,5 +2291,3 @@ fn maybe_redirect_stdio_to_log_file() {
         }
     }
 }
-
-

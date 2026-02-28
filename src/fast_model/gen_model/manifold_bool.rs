@@ -160,7 +160,7 @@ fn build_lod_mesh_path(base_dir: &Path, mesh_id: &str) -> PathBuf {
 
 }
 
-/// 构建 _m.manifold 布尔运算专用 mesh 文件路径（优先在 lod 目录，其次在 neg 目录）
+/// 构建 _m.manifold 布尔运算专用 mesh 文件路径（在 manifold 目录查找）
 fn build_manifold_mesh_path(base_dir: &Path, mesh_id: &str) -> Option<PathBuf> {
     // 溯源到不含 lod_ 的基础目录
     let mut clean_base = base_dir.to_path_buf();
@@ -172,19 +172,12 @@ fn build_manifold_mesh_path(base_dir: &Path, mesh_id: &str) -> Option<PathBuf> {
         }
     }
 
-    let default_lod = aios_core::mesh_precision::active_precision().default_lod;
-    let filename = format!("{}_{:?}_m.manifold", mesh_id, default_lod);
+    let filename = format!("{}_m.manifold", mesh_id);
 
-    // 优先在 lod 目录查找
-    let lod_path = clean_base.join(format!("lod_{:?}", default_lod)).join(&filename);
-    if lod_path.exists() {
-        return Some(lod_path);
-    }
-
-    // 其次在 neg 目录查找
-    let neg_path = clean_base.join("neg").join(&filename);
-    if neg_path.exists() {
-        return Some(neg_path);
+    // 在 manifold 目录查找
+    let manifold_path = clean_base.join("manifold").join(&filename);
+    if manifold_path.exists() {
+        return Some(manifold_path);
     }
 
     None

@@ -726,9 +726,9 @@ pub async fn run_mesh_worker_from_channel(
         std::fs::create_dir_all(&lod_dir)?;
     }
 
-    let neg_dir = mesh_dir.join("neg");
-    if !neg_dir.exists() {
-        std::fs::create_dir_all(&neg_dir)?;
+    let manifold_dir = mesh_dir.join("manifold");
+    if !manifold_dir.exists() {
+        std::fs::create_dir_all(&manifold_dir)?;
     }
 
     let aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
@@ -742,7 +742,7 @@ pub async fn run_mesh_worker_from_channel(
     println!(
         "╔════════════════════════════════════════╗\n\
          ║  [mesh_worker_channel] 开始处理 Mesh   ║\n\
-         ║  模式: Manifold-first（neg 单独目录）   ║\n\
+         ║  模式: Manifold-first（manifold 单独目录）║\n\
          ╚════════════════════════════════════════╝"
     );
 
@@ -771,7 +771,7 @@ pub async fn run_mesh_worker_from_channel(
                 task.geo_param.clone()
             };
 
-            let target_dir = if task.is_neg { &neg_dir } else { &lod_dir };
+            let target_dir = if task.is_neg { &manifold_dir } else { &lod_dir };
 
             // handle_csg_mesh 仍使用 &mut String，此处用临时 String 桥接后拆分为语句
             let mut tmp_sql = String::new();
@@ -779,6 +779,7 @@ pub async fn run_mesh_worker_from_channel(
                 Some(csg_mesh) => {
                     if let Err(e) = handle_csg_mesh(
                         target_dir,
+                        &manifold_dir,
                         &mesh_id,
                         &mesh_filename,
                         csg_mesh,
@@ -1316,6 +1317,12 @@ pub async fn gen_inst_meshes_by_geo_ids(
     if !lod_dir.exists() {
         std::fs::create_dir_all(&lod_dir)?;
     }
+
+    // 创建 manifold 目录（所有 .manifold 文件统一存放）
+    let manifold_dir = dir.join("manifold");
+    if !manifold_dir.exists() {
+        std::fs::create_dir_all(&manifold_dir)?;
+    }
     
     // 构建查询的 id 列表
     let ids_str = geo_ids.iter().map(|id| id.to_raw()).join(",");
@@ -1361,6 +1368,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
             Some(csg_mesh) => {
                 if let Err(e) = handle_csg_mesh(
                     &lod_dir,
+                    &manifold_dir,
                     &mesh_id,
                     &mesh_filename,
                     csg_mesh,
@@ -1442,6 +1450,12 @@ pub async fn gen_inst_meshes(
     // 计数/调试用途（目前未外显）
     let mut i = 0;
 
+    // 创建 manifold 目录（所有 .manifold 文件统一存放，在 LOD 路径解析前从原始 dir 派生）
+    let manifold_dir = dir.join("manifold");
+    if !manifold_dir.exists() {
+        std::fs::create_dir_all(&manifold_dir)?;
+    }
+
     // 根据 LOD 级别创建子目录（如果传入的 dir 不是已经包含 lod_ 前缀）
     let dir = if let Some(dir_name) = dir.file_name() {
         let dir_str = dir_name.to_string_lossy();
@@ -1517,6 +1531,7 @@ pub async fn gen_inst_meshes(
             chunk_records.into_iter().collect();
         // 克隆所需上下文到异步任务中
         let dir = dir.clone();
+        let manifold_dir = manifold_dir.clone();
         let aabb_map = aabb_map.clone();
         let pts_json_map = pts_json_map.clone();
         let precision = Arc::new(precision.clone()); // Clone Arc<MeshPrecisionSettings>
@@ -1564,6 +1579,7 @@ pub async fn gen_inst_meshes(
                             Some(csg_mesh) => {
                                 if let Err(e) = handle_csg_mesh(
                                     &dir,
+                                    &manifold_dir,
                                     &mesh_id,
                                     &mesh_filename,
                                     csg_mesh,
@@ -1665,6 +1681,7 @@ pub async fn gen_inst_meshes(
 
 async fn handle_csg_mesh(
     dir: &Path,
+    manifold_dir: &Path,
     inst_key: &str,
     mesh_id: &str,
     mut generated: GeneratedMesh,
@@ -1702,7 +1719,7 @@ async fn handle_csg_mesh(
         let manifold = ManifoldRust::from_mesh(&welded);
         let validated_mesh = manifold.get_mesh();
         if !validated_mesh.indices.is_empty() {
-            let manifold_path = dir.join(format!("{}_m.manifold", mesh_id));
+            let manifold_path = manifold_dir.join(format!("{}_m.manifold", mesh_id));
             if let Err(e) = validated_mesh.save_to_file(&manifold_path) {
                 debug_model_warn!("   ⚠️ 保存 _m.manifold 失败: {} - {}", mesh_id, e);
             }

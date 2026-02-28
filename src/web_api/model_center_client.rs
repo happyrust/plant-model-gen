@@ -514,19 +514,27 @@ async fn delete_review_data(
         }
 
         let _ = SUL_DB
-            .query("DELETE review_form_model WHERE form_id = $form_id")
+            .query(
+                "LET $ids = SELECT VALUE id FROM review_form_model WHERE form_id = $form_id;\nDELETE $ids;",
+            )
             .bind(("form_id", form_id.clone()))
             .await;
         let _ = SUL_DB
-            .query("DELETE review_opinion WHERE form_id = $form_id")
+            .query(
+                "LET $ids = SELECT VALUE id FROM review_opinion WHERE form_id = $form_id;\nDELETE $ids;",
+            )
             .bind(("form_id", form_id.clone()))
             .await;
         let _ = SUL_DB
-            .query("DELETE review_attachment WHERE form_id = $form_id")
+            .query(
+                "LET $ids = SELECT VALUE id FROM review_attachment WHERE form_id = $form_id;\nDELETE $ids;",
+            )
             .bind(("form_id", form_id.clone()))
             .await;
         let _ = SUL_DB
-            .query("DELETE review_tasks WHERE form_id = $form_id")
+            .query(
+                "LET $ids = SELECT VALUE id FROM review_tasks WHERE form_id = $form_id;\nDELETE $ids;",
+            )
             .bind(("form_id", form_id.clone()))
             .await;
     }
@@ -821,4 +829,3 @@ async fn notify_workflow_delete(task_id: &str, operator_id: &str) -> anyhow::Res
     info!("[外部校审] 删除通知成功: task={}", task_id);
     Ok(())
 }
-

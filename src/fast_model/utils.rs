@@ -205,7 +205,9 @@ pub async fn save_inst_relate_cata_bool(
     );
 
     // 始终先删除旧记录，保证每个 inst_info 仅保留一条最新状态关系。
-    sql.push_str("IF $inst_info != NONE { DELETE inst_relate_cata_bool WHERE in = $inst_info;");
+    sql.push_str(
+        "IF $inst_info != NONE { LET $old_ids = SELECT VALUE id FROM inst_relate_cata_bool WHERE in = $inst_info; DELETE $old_ids;",
+    );
     if let Some(mesh_id) = mesh_id {
         let mesh_key = format!("inst_geo:⟨{}⟩", mesh_id);
         sql.push_str(&format!(

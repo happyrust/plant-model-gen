@@ -5829,7 +5829,9 @@ async fn delete_room_relations_for_panels(panels: &[PanelRoom]) -> anyhow::Resul
 
 
 
-    let sql = format!("delete room_relate where `in` in [{}];", panel_list);
+    let sql = format!(
+        "LET $ids = SELECT VALUE id FROM [{panel_list}]->room_relate;\nDELETE $ids;"
+    );
 
 
 
@@ -6172,7 +6174,6 @@ pub async fn rebuild_room_relations_for_rooms(
     Ok(stats)
 
 }
-
 
 
 

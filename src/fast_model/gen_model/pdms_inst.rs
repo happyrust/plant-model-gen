@@ -67,7 +67,9 @@ async fn delete_inst_relate_by_in(refnos: &[RefnoEnum], chunk_size: usize) -> an
     }
     for chunk in refnos.chunks(chunk_size.max(1)) {
         let in_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
-        let sql = format!("DELETE FROM inst_relate WHERE in IN [{in_keys}];");
+        let sql = format!(
+            "LET $ids = SELECT VALUE id FROM [{in_keys}]->inst_relate;\nDELETE $ids;"
+        );
         SUL_DB.query_response(&sql).await?;
     }
     Ok(())
@@ -84,7 +86,9 @@ async fn delete_geo_relate_by_inst_info_ids(inst_info_ids: &[String], chunk_size
             .map(|id| format!("inst_info:⟨{}⟩", id))
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!("DELETE geo_relate WHERE in IN [{in_keys}];");
+        let sql = format!(
+            "LET $ids = SELECT VALUE id FROM [{in_keys}]->geo_relate;\nDELETE $ids;"
+        );
         SUL_DB.query_response(&sql).await?;
     }
     Ok(())
@@ -101,10 +105,18 @@ async fn delete_boolean_relations_by_carriers(carrier_refnos: &[RefnoEnum], chun
         return Ok(());
     }
     for chunk in carrier_refnos.chunks(chunk_size.max(1)) {
-        let pe_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
-        let neg_sql = format!("DELETE neg_relate WHERE pe IN [{pe_keys}];");
+        let pe_conditions = chunk
+            .iter()
+            .map(|r| format!("pe = {}", r.to_pe_key()))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let neg_sql = format!(
+            "LET $ids = SELECT VALUE id FROM neg_relate WHERE {pe_conditions};\nDELETE $ids;"
+        );
         SUL_DB.query_response(&neg_sql).await?;
-        let ngmr_sql = format!("DELETE ngmr_relate WHERE pe IN [{pe_keys}];");
+        let ngmr_sql = format!(
+            "LET $ids = SELECT VALUE id FROM ngmr_relate WHERE {pe_conditions};\nDELETE $ids;"
+        );
         SUL_DB.query_response(&ngmr_sql).await?;
     }
     Ok(())
@@ -463,7 +475,7 @@ pub async fn save_instance_data_optimize(
                             neg_buffer.clear();
                         }
                     }
-                } 
+                }
             }
         }
 
@@ -778,7 +790,7 @@ pub async fn save_instance_data_optimize(
                     for idx in (0..n).step_by(CHUNK_SIZE) {
                         let end = (idx + CHUNK_SIZE).min(n);
                         let delete_stmt = format!(
-                            "DELETE inst_relate_aabb WHERE in IN [{}];",
+                            "LET $ids = SELECT VALUE id FROM [{}]->inst_relate_aabb;\nDELETE $ids;",
                             ($ins)[idx..end].join(",")
                         );
                         let insert_stmt = format!(
@@ -1020,7 +1032,7 @@ DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS in UNIQ
                         } else {
                             eprintln!("❌ 写入失败超出重试限制，导致失败的 SQL 块已转储至 {}", file_name);
                         }
-                        
+
                         return Err(e);
                     }
                 }
@@ -1075,12 +1087,12 @@ fn build_transaction_block(statements: &[String]) -> String {
 }
 
 /// 增量保存 tubi_info 数据到数据库
-/// 
+///
 /// 仅写入尚不存在的 tubi_info 记录，返回新增记录数量。
-/// 
+///
 /// # 参数
 /// - `tubi_info_map`: 组合键 ID -> TubiInfoData 的映射
-/// 
+///
 /// # 返回
 /// - `Ok(usize)`: 新增的记录数量
 pub async fn save_tubi_info_batch(
@@ -1089,30 +1101,30 @@ pub async fn save_tubi_info_batch(
     if tubi_info_map.is_empty() {
         return Ok(0);
     }
-    
+
     const CHUNK_SIZE: usize = 200;
-    
+
     // 1. 查询已存在的 tubi_info ID
     let ids: Vec<String> = tubi_info_map.iter().map(|e| e.key().clone()).collect();
     let existing = query_existing_tubi_info_ids(&ids).await?;
-    
+
     debug_model_debug!(
         "save_tubi_info_batch: total={}, existing={}, to_insert={}",
         ids.len(),
         existing.len(),
         ids.len() - existing.len()
     );
-    
+
     // 2. 过滤出需要新建的
     let new_entries: Vec<_> = tubi_info_map
         .iter()
         .filter(|e| !existing.contains(e.key()))
         .collect();
-    
+
     if new_entries.is_empty() {
         return Ok(0);
     }
-    
+
     // 3. 批量 INSERT
     let mut inserted = 0;
     for chunk in new_entries.chunks(CHUNK_SIZE) {
@@ -1120,17 +1132,17 @@ pub async fn save_tubi_info_batch(
             .iter()
             .map(|e| e.value().to_surreal_json())
             .collect();
-        
+
         let sql = format!("INSERT INTO tubi_info [{}];", values.join(","));
         SUL_DB.query_response(&sql).await?;
         inserted += chunk.len();
-        
+
         debug_model_debug!(
             "save_tubi_info_batch: inserted chunk of {} records",
             chunk.len()
         );
     }
-    
+
     Ok(inserted)
 }
 
@@ -1139,26 +1151,26 @@ async fn query_existing_tubi_info_ids(ids: &[String]) -> anyhow::Result<HashSet<
     if ids.is_empty() {
         return Ok(HashSet::new());
     }
-    
+
     // 分批查询以避免 SQL 过长
     const BATCH_SIZE: usize = 500;
     let mut existing = HashSet::new();
-    
+
     for chunk in ids.chunks(BATCH_SIZE) {
         let id_list: String = chunk
             .iter()
             .map(|id| format!("tubi_info:⟨{}⟩", id))
             .join(",");
-        
+
         let sql = format!(
             "SELECT VALUE record::id(id) FROM tubi_info WHERE id IN [{}];",
             id_list
         );
-        
+
         let result: Vec<String> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
         existing.extend(result);
     }
-    
+
     Ok(existing)
 }
 
@@ -1845,17 +1857,11 @@ pub async fn save_instance_data_to_sql_file(
 
     // inst_relate_aabb
     if !inst_relate_aabb_buffer.is_empty() {
-        // 先点删（直接执行到 DB）后插（写入 .surql）
-        let aabb_ids: Vec<String> = inst_mgr.inst_info_map.keys()
-            .map(|k| k.to_table_key("inst_relate_aabb"))
-            .collect();
-        for chunk in aabb_ids.chunks(CHUNK_SIZE) {
-            let ids = chunk.join(",");
-            SUL_DB.query_response(&format!("DELETE [{ids}];")).await?;
-        }
+        // 用户要求不做删除：改为仅写入 INSERT RELATION IGNORE，
+        // 由唯一键/幂等语义保证重复导入可安全跳过。
         for chunk in inst_relate_aabb_buffer.chunks(CHUNK_SIZE) {
             writer.write_statement(&format!(
-                "INSERT RELATION INTO inst_relate_aabb [{}]",
+                "INSERT RELATION IGNORE INTO inst_relate_aabb [{}]",
                 chunk.join(",")
             ))?;
         }

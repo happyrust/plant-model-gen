@@ -278,7 +278,10 @@ mod tests {
     }
 
     async fn delete_room_relate_for_panel(panel_refno: RefnoEnum) -> Result<()> {
-        let sql = format!("delete room_relate where `in` = {};", panel_refno.to_pe_key());
+        let sql = format!(
+            "LET $ids = SELECT VALUE id FROM [{}]->room_relate;\nDELETE $ids;",
+            panel_refno.to_pe_key()
+        );
         SUL_DB.query(&sql).await?;
         Ok(())
     }
@@ -513,7 +516,7 @@ mod tests {
         if want_write {
             let room_num_escaped = room_num.replace('\'', "''");
             let delete_sql = format!(
-                "DELETE room_relate WHERE `in` = {} AND out = {};",
+                "LET $ids = SELECT VALUE id FROM room_relate WHERE `in` = {} AND out = {};\nDELETE $ids;",
                 panel_refno_anchor.to_pe_key(),
                 elbow_refno.to_pe_key()
             );
@@ -1009,4 +1012,3 @@ mod tests {
         Ok(())
     }
 }
-

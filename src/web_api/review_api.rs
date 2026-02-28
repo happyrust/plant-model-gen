@@ -649,7 +649,7 @@ async fn delete_task(
 ) -> impl IntoResponse {
     info!("Deleting task: {}", id);
     
-    let sql = "DELETE review_tasks WHERE record::id(id) = $id";
+    let sql = "DELETE [type::record('review_tasks', $id)]";
     
     match SUL_DB.query(sql).bind(("id", id.clone())).await {
         Ok(_) => {
@@ -1010,7 +1010,7 @@ async fn delete_record(
 ) -> impl IntoResponse {
     info!("Deleting record: {}", record_id);
     
-    let sql = "DELETE review_records WHERE record::id(id) = $id";
+    let sql = "DELETE [type::record('review_records', $id)]";
     
     match SUL_DB.query(sql).bind(("id", record_id)).await {
         Ok(_) => (StatusCode::OK, Json(ActionResponse {
@@ -1035,7 +1035,10 @@ async fn clear_records_by_task(
 ) -> impl IntoResponse {
     info!("Clearing records for task: {}", task_id);
     
-    let sql = "DELETE FROM review_records WHERE task_id = $task_id";
+    let sql = r#"
+        LET $ids = SELECT VALUE id FROM review_records WHERE task_id = $task_id;
+        DELETE $ids;
+    "#;
     
     match SUL_DB.query(sql).bind(("task_id", task_id)).await {
         Ok(_) => (StatusCode::OK, Json(ActionResponse {
@@ -1236,7 +1239,7 @@ async fn delete_comment(
 ) -> impl IntoResponse {
     info!("Deleting comment: {}", comment_id);
     
-    let sql = "DELETE review_comments WHERE record::id(id) = $id";
+    let sql = "DELETE [type::record('review_comments', $id)]";
     
     match SUL_DB.query(sql).bind(("id", comment_id)).await {
         Ok(_) => (StatusCode::OK, Json(ActionResponse {
@@ -2087,21 +2090,23 @@ async fn delete_attachment(
         }
     }
 
+    let _ = SUL_DB
+        .query(
+            r#"
+            LET $ids = SELECT VALUE id FROM review_attachment WHERE file_id = $file_id;
+            DELETE $ids;
+            "#,
+        )
+        .bind(("file_id", attachment_id.clone()))
+        .await;
+
     if deleted {
-        let _ = SUL_DB
-            .query("DELETE review_attachment WHERE file_id = $file_id")
-            .bind(("file_id", attachment_id.clone()))
-            .await;
         (StatusCode::OK, Json(ActionResponse {
             success: true,
             message: Some("附件已删除".to_string()),
             error_message: None,
         }))
     } else {
-        let _ = SUL_DB
-            .query("DELETE review_attachment WHERE file_id = $file_id")
-            .bind(("file_id", attachment_id.clone()))
-            .await;
         // 文件可能已被删除，仍返回成功
         (StatusCode::OK, Json(ActionResponse {
             success: true,

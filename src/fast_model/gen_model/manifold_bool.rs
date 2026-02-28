@@ -1192,7 +1192,7 @@ pub async fn apply_cata_neg_boolean_manifold(
 
                 // 先删除该实例下全部旧 CatePos（兼容历史 id 规则，且避免同实例重复导出）
                 update_sql.push_str(&format!(
-                    "DELETE geo_relate WHERE in = {} AND geo_type = 'CatePos';",
+                    "LET $old_geo_ids = SELECT VALUE id FROM {}->geo_relate WHERE geo_type = 'CatePos'; DELETE $old_geo_ids;",
                     &g.inst_info_id.to_raw(),
                 ));
 
@@ -2325,4 +2325,3 @@ pub async fn run_boolean_worker_from_cache_manager(
 
 pub async fn run_boolean_worker_from_cache(cache_dir: &Path) -> anyhow::Result<usize> { unimplemented!() }
 */
-

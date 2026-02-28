@@ -209,8 +209,10 @@ DELETE scene_node;
 async fn cleanup_scene_tree_by_dbno(dbnum: u32) -> Result<()> {
     let sql = format!(
         r#"
-DELETE contains WHERE in.dbnum = {dbnum} OR out.dbnum = {dbnum};
-DELETE scene_node WHERE dbnum = {dbnum};
+LET $contains_ids = SELECT VALUE id FROM contains WHERE in.dbnum = {dbnum} OR out.dbnum = {dbnum};
+DELETE $contains_ids;
+LET $scene_node_ids = SELECT VALUE id FROM scene_node WHERE dbnum = {dbnum};
+DELETE $scene_node_ids;
 "#
     );
     SUL_DB.query_response(&sql).await?;

@@ -460,7 +460,7 @@ async fn main() -> Result<()> {
     );
 
     let delete_sql = format!(
-        "DELETE room_relate WHERE `in` = {};",
+        "LET $ids = SELECT VALUE id FROM [{}]->room_relate;\nDELETE $ids;",
         panel_refno.to_pe_key()
     );
     SUL_DB.query(&delete_sql).await?;

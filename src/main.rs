@@ -184,6 +184,82 @@ async fn sync_cache_to_db_if_enabled(
     Ok(())
 }
 
+/// 导入 .surql 并执行后处理：reconcile_missing_neg_relate / boolean / inst_relate_aabb。
+#[cfg(not(feature = "gui"))]
+async fn run_import_and_post_process(
+    sql_path: &Path,
+    db_option_ext: &aios_database::options::DbOptionExt,
+) -> anyhow::Result<()> {
+    if !sql_path.exists() {
+        anyhow::bail!("--import-sql 文件不存在: {}", sql_path.display());
+    }
+
+    println!("\n🗂️  import-sql: 导入 {} 到 SurrealDB", sql_path.display());
+    init_surreal().await?;
+    println!("✅ 数据库连接成功");
+
+    // Phase 2 Step 1: 初始化表结构
+    println!("[import-sql] Phase 2.1: 初始化 inst_relate 表结构...");
+    aios_core::rs_surreal::inst::init_model_tables().await?;
+
+    // Phase 2 Step 2: 批量导入 SQL
+    println!("[import-sql] Phase 2.2: 批量导入 SQL 语句...");
+    let (success, failed) =
+        aios_database::fast_model::gen_model::sql_file_writer::import_sql_file(sql_path, 500)
+            .await?;
+    if failed > 0 {
+        eprintln!(
+            "[import-sql] ⚠️ 导入存在失败: 成功={}, 失败={}",
+            success, failed
+        );
+    }
+
+    use aios_core::SurrealQueryExt;
+    let sql = "SELECT value in FROM inst_relate;";
+    let refnos: Vec<aios_core::RefnoEnum> =
+        aios_core::SUL_DB.query_take(sql, 0).await.unwrap_or_default();
+
+    // Phase 2 Step 3: reconcile_missing_neg_relate
+    println!("[import-sql] Phase 2.3: reconcile_missing_neg_relate...");
+    if !refnos.is_empty() {
+        if let Err(e) =
+            aios_database::fast_model::gen_model::pdms_inst::reconcile_missing_neg_relate(&refnos)
+                .await
+        {
+            eprintln!("[import-sql] reconcile_missing_neg_relate 失败: {}", e);
+        }
+    }
+
+    // Phase 2 Step 4: boolean worker
+    if db_option_ext.inner.apply_boolean_operation {
+        println!("[import-sql] Phase 2.4: 布尔运算...");
+        if let Err(e) = aios_database::fast_model::mesh_generate::run_boolean_worker(
+            std::sync::Arc::new(db_option_ext.inner.clone()),
+            100,
+        )
+        .await
+        {
+            eprintln!("[import-sql] 布尔运算失败: {}", e);
+        }
+    }
+
+    // Phase 2 Step 5: update aabb
+    println!("[import-sql] Phase 2.5: 更新 inst_relate_aabb...");
+    if !refnos.is_empty() {
+        if let Err(e) = aios_database::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
+            &refnos,
+            db_option_ext.is_replace_mesh(),
+        )
+        .await
+        {
+            eprintln!("[import-sql] 更新 inst_relate_aabb 失败: {}", e);
+        }
+    }
+
+    println!("✅ import-sql 全部完成");
+    Ok(())
+}
+
 /// debug-model 流程的后置步骤：sync-to-db + export-dbnum-instances（parquet/json）
 ///
 /// 将 sync + 导出合并为一个调用，避免 debug-model 分支中重复编写。
@@ -477,7 +553,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("regen-model")
                 .long("regen-model")
-                .help("Regenerate model data before export (forces replace_mesh mode)")
+                .help("Regenerate model data (forces replace_mesh mode). With export flags: regenerate first then export; without export flags: regenerate only")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -932,83 +1008,7 @@ async fn main() -> anyhow::Result<()> {
     // ========== import-sql：导入 .surql 文件并执行后处理 ==========
     if let Some(sql_path) = matches.get_one::<String>("import-sql") {
         let path = std::path::Path::new(sql_path);
-        if !path.exists() {
-            anyhow::bail!("--import-sql 文件不存在: {}", path.display());
-        }
-        println!("\n🗂️  import-sql: 导入 {} 到 SurrealDB", path.display());
-        init_surreal().await?;
-        println!("✅ 数据库连接成功");
-
-        // Phase 2 Step 1: 初始化表结构
-        println!("[import-sql] Phase 2.1: 初始化 inst_relate 表结构...");
-        aios_core::rs_surreal::inst::init_model_tables().await?;
-
-        // Phase 2 Step 2: 批量导入 SQL
-        println!("[import-sql] Phase 2.2: 批量导入 SQL 语句...");
-        let (success, failed) =
-            aios_database::fast_model::gen_model::sql_file_writer::import_sql_file(path, 500)
-                .await?;
-        if failed > 0 {
-            eprintln!(
-                "[import-sql] ⚠️ 导入存在失败: 成功={}, 失败={}",
-                success, failed
-            );
-        }
-
-        // Phase 2 Step 3: reconcile_missing_neg_relate
-        println!("[import-sql] Phase 2.3: reconcile_missing_neg_relate...");
-        // 获取所有已导入的 inst_relate 的 in 端 refno
-        {
-            use aios_core::SurrealQueryExt;
-            let sql = "SELECT value in FROM inst_relate;";
-            let refnos: Vec<aios_core::RefnoEnum> =
-                aios_core::SUL_DB.query_take(sql, 0).await.unwrap_or_default();
-            if !refnos.is_empty() {
-                if let Err(e) =
-                    aios_database::fast_model::gen_model::pdms_inst::reconcile_missing_neg_relate(
-                        &refnos,
-                    )
-                    .await
-                {
-                    eprintln!("[import-sql] reconcile_missing_neg_relate 失败: {}", e);
-                }
-            }
-        }
-
-        // Phase 2 Step 4: boolean worker
-        if db_option_ext.inner.apply_boolean_operation {
-            println!("[import-sql] Phase 2.4: 布尔运算...");
-            if let Err(e) = aios_database::fast_model::mesh_generate::run_boolean_worker(
-                std::sync::Arc::new(db_option_ext.inner.clone()),
-                100,
-            )
-            .await
-            {
-                eprintln!("[import-sql] 布尔运算失败: {}", e);
-            }
-        }
-
-        // Phase 2 Step 5: update aabb
-        println!("[import-sql] Phase 2.5: 更新 inst_relate_aabb...");
-        {
-            use aios_core::SurrealQueryExt;
-            let sql = "SELECT value in FROM inst_relate;";
-            let refnos: Vec<aios_core::RefnoEnum> =
-                aios_core::SUL_DB.query_take(sql, 0).await.unwrap_or_default();
-            if !refnos.is_empty() {
-                if let Err(e) =
-                    aios_database::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
-                        &refnos,
-                        db_option_ext.is_replace_mesh(),
-                    )
-                    .await
-                {
-                    eprintln!("[import-sql] 更新 inst_relate_aabb 失败: {}", e);
-                }
-            }
-        }
-
-        println!("✅ import-sql 全部完成");
+        run_import_and_post_process(path, &db_option_ext).await?;
         return Ok(());
     }
 
@@ -1277,7 +1277,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // ========== 处理 --regen-model 参数（影响纯模型生成） ==========
+    // ========== 处理 --regen-model 参数 ==========
     let regen_model_requested = matches.get_flag("regen-model");
     if regen_model_requested {
         println!("🔄 检测到 --regen-model 参数，强制开启 replace_mesh 模式");
@@ -1308,7 +1308,26 @@ async fn main() -> anyhow::Result<()> {
         db_option_ext.inner.replace_mesh = Some(true);
     }
 
-    // ========== 集中处理 --regen-model：在所有导出分支之前一次性完成模型重建 ==========
+    // 模型导出请求：默认只导出不触发生成；仅当显式 --regen-model 才前置生成。
+    let model_export_requested = matches.get_flag("export-obj")
+        || matches.get_flag("export-svg")
+        || matches.get_flag("export-glb")
+        || matches.get_flag("export-gltf")
+        || matches.contains_id("export-obj-refnos")
+        || matches.contains_id("export-glb-refnos")
+        || matches.contains_id("export-gltf-refnos")
+        || (debug_model_requested && capture_dir.is_some());
+    let any_export_requested = model_export_requested
+        || matches.get_flag("export-all-parquet")
+        || matches.get_flag("export-all-relates")
+        || matches.get_flag("export-dbnum-instances-json")
+        || matches.get_flag("export-dbnum-instances-parquet")
+        || matches.get_flag("export-dbnum-instances")
+        || matches.get_flag("export-room-instances")
+        || matches.get_flag("export-pdms-tree-parquet")
+        || matches.get_flag("export-world-sites-parquet");
+
+    // ========== 仅在显式 --regen-model 时执行生成 ==========
     if regen_model_requested {
         // 确定 regen 的目标 refnos：优先 debug-model 指定的 refnos，其次 CLI 独立 refno 参数，
         // 再次 dbnum（查询所有 SITE），最后全库模式。
@@ -1337,40 +1356,31 @@ async fn main() -> anyhow::Result<()> {
             include_negative,
             false,
         );
-        cli_modes::run_regen_model(&regen_config, &db_option_ext).await?;
+        let regen_result = cli_modes::run_regen_model(&regen_config, &db_option_ext).await?;
+
+        // 仅在“重建 + 导出”时，defer 模式自动导入 SQL 后再导出，避免导出读到旧数据。
+        if any_export_requested {
+            if let Some(sql_path) = regen_result.deferred_sql_path.as_deref() {
+                println!(
+                    "🗂️ 检测到 defer_db_write 产物，开始自动导入并后处理: {}",
+                    sql_path.display()
+                );
+                run_import_and_post_process(sql_path, &db_option_ext).await?;
+                db_option_ext.defer_db_write = false;
+            }
+        } else {
+            println!("✅ --regen-model 单独执行完成（未请求导出，流程到此结束）");
+            return Ok(());
+        }
     }
 
-    // ========== OBJ 导出：默认沿用配置，--use-surrealdb 可强制切到 SurrealDB ==========
+    // ========== 模型导出：默认沿用配置，--use-surrealdb 可强制切到 SurrealDB ==========
     //
     // 约定：
     // - 默认（不传 --use-surrealdb）时，沿用 DbOption 中 use_cache/use_surrealdb；
     // - 传 --use-surrealdb 时，强制使用 SurrealDB（并关闭 cache）；
     // - 这不是 fallback：cache 与 surrealdb 两条路径同时存在仅用于验证准确性。
-    let obj_export_flow = matches.get_flag("export-obj")
-        || matches.get_flag("export-svg")
-        || matches.contains_id("export-obj-refnos")
-        || (debug_model_requested && capture_dir.is_some());
-
-    if obj_export_flow {
-        // 导出依赖 inst_relate/inst_relate_bool 等库内数据。
-        // 若 defer_db_write 来自配置文件，默认自动关闭以保证导出完整性；
-        // 若用户显式传入 --defer-db-write，则直接报错，避免产生“仅部分可见”的误导性 OBJ。
-        if db_option_ext.defer_db_write {
-            if defer_db_write_explicit {
-                anyhow::bail!(
-                    "检测到 --defer-db-write 与导出参数同时使用。\
-                    defer 模式不会在本轮写入 SurrealDB，OBJ/GLB 可能仅导出到部分几何（常见表现：只看到 TUBI）。\
-                    请先生成并 --import-sql，再执行导出，或移除 --defer-db-write。"
-                );
-            } else {
-                println!(
-                    "⚠️ 检测到配置 defer_db_write=true，且本次请求导出模型；\
-                    已自动切换为直写 SurrealDB 以保证导出完整性。"
-                );
-                db_option_ext.defer_db_write = false;
-            }
-        }
-
+    if model_export_requested {
         if matches.get_flag("use-surrealdb") {
             // SurrealDB-only：用于对照验证，避免与 cache 混用
             db_option_ext.use_surrealdb = true;
@@ -1379,7 +1389,7 @@ async fn main() -> anyhow::Result<()> {
 
         if !db_option_ext.use_cache && !db_option_ext.use_surrealdb {
             anyhow::bail!(
-                "OBJ 导出时 use_cache/use_surrealdb 同时为 false，请在配置中启用其一，或添加 --use-surrealdb"
+                "模型导出时 use_cache/use_surrealdb 同时为 false，请在配置中启用其一，或添加 --use-surrealdb"
             );
         }
 
@@ -1579,10 +1589,11 @@ async fn main() -> anyhow::Result<()> {
                 matches.get_flag("export-svg"),
             );
             let result = export_obj_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(
-                matches.get_flag("sync-to-db"),
+            post_export_steps(
+                &matches,
                 &db_option_ext,
                 debug_model_refnos.as_deref(),
+                verbose,
             )
             .await?;
             return result;
@@ -1606,10 +1617,11 @@ async fn main() -> anyhow::Result<()> {
             );
             config.use_basic_materials = use_basic_materials;
             let result = export_glb_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(
-                matches.get_flag("sync-to-db"),
+            post_export_steps(
+                &matches,
                 &db_option_ext,
                 debug_model_refnos.as_deref(),
+                verbose,
             )
             .await?;
             return result;
@@ -1633,10 +1645,11 @@ async fn main() -> anyhow::Result<()> {
             );
             config.use_basic_materials = use_basic_materials;
             let result = export_gltf_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(
-                matches.get_flag("sync-to-db"),
+            post_export_steps(
+                &matches,
                 &db_option_ext,
                 debug_model_refnos.as_deref(),
+                verbose,
             )
             .await?;
             return result;
@@ -1665,10 +1678,11 @@ async fn main() -> anyhow::Result<()> {
                 matches.get_flag("export-svg"),
             );
             let result = export_obj_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(
-                matches.get_flag("sync-to-db"),
+            post_export_steps(
+                &matches,
                 &db_option_ext,
                 debug_model_refnos.as_deref(),
+                verbose,
             )
             .await?;
             return result;
@@ -1695,10 +1709,11 @@ async fn main() -> anyhow::Result<()> {
             );
             config.use_basic_materials = use_basic_materials;
             let result = export_glb_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(
-                matches.get_flag("sync-to-db"),
+            post_export_steps(
+                &matches,
                 &db_option_ext,
                 debug_model_refnos.as_deref(),
+                verbose,
             )
             .await?;
             return result;
@@ -1725,10 +1740,11 @@ async fn main() -> anyhow::Result<()> {
             );
             config.use_basic_materials = use_basic_materials;
             let result = export_gltf_mode(config, &db_option_ext).await;
-            sync_cache_to_db_if_enabled(
-                matches.get_flag("sync-to-db"),
+            post_export_steps(
+                &matches,
                 &db_option_ext,
                 debug_model_refnos.as_deref(),
+                verbose,
             )
             .await?;
             return result;
@@ -1754,10 +1770,11 @@ async fn main() -> anyhow::Result<()> {
             matches.get_flag("export-svg"),
         );
         let result = export_gltf_mode(config, &db_option_ext).await;
-        sync_cache_to_db_if_enabled(
-            matches.get_flag("sync-to-db"),
+        post_export_steps(
+            &matches,
             &db_option_ext,
             debug_model_refnos.as_deref(),
+            verbose,
         )
         .await?;
         return result;
@@ -1779,10 +1796,11 @@ async fn main() -> anyhow::Result<()> {
             matches.get_flag("export-svg"),
         );
         let result = export_glb_mode(config, &db_option_ext).await;
-        sync_cache_to_db_if_enabled(
-            matches.get_flag("sync-to-db"),
+        post_export_steps(
+            &matches,
             &db_option_ext,
             debug_model_refnos.as_deref(),
+            verbose,
         )
         .await?;
         return result;
@@ -1804,10 +1822,11 @@ async fn main() -> anyhow::Result<()> {
             matches.get_flag("export-svg"),
         );
         let result = export_obj_mode(config, &db_option_ext).await;
-        sync_cache_to_db_if_enabled(
-            matches.get_flag("sync-to-db"),
+        post_export_steps(
+            &matches,
             &db_option_ext,
             debug_model_refnos.as_deref(),
+            verbose,
         )
         .await?;
         return result;

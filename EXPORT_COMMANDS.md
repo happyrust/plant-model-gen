@@ -1,123 +1,43 @@
 # 导出命令使用说明
 
-## 概述
+## 核心语义（2026-02-28）
 
-`aios-database` 现在支持两种导出模式：
+- 默认 `--export-*` 是**纯导出**：只查询 DB/缓存，不触发模型生成。
+- `--regen-model` 单独使用：只执行模型重建，不导出。
+- `--regen-model + --export-*`：先重建，再导出；若 `defer_db_write=true` 产生 `.surql`，会自动导入并做后处理后再导出。
 
-### 1. 非调试模式（推荐用于生产环境）
-
-使用独立的导出参数，不启用调试功能：
-
-```bash
-# 导出 OBJ 格式
-cargo run --bin aios-database -- --export-obj-refnos="21491_18957"
-
-# 导出 GLB 格式
-cargo run --bin aios-database -- --export-glb-refnos="21491_18957"
-
-# 导出 glTF 格式
-cargo run --bin aios-database -- --export-gltf-refnos="21491_18957"
-
-# 导出 XKT 格式
-cargo run --bin aios-database -- --export-xkt-refnos="21491_18957"
-```
-
-### 2. 调试模式（用于开发调试）
-
-使用 `--debug-model-refnos` 配合导出选项，会同时启用调试功能：
+## 常用命令
 
 ```bash
-# 导出 OBJ 格式（调试模式）
-cargo run --bin aios-database -- --debug-model-refnos="21491_18957" --export-obj
+# 1) 纯导出（默认）
+cargo run --bin aios-database -- --export-obj --dbnum 7997
+cargo run --bin aios-database -- --export-glb-refnos 24381_145018
+cargo run --bin aios-database -- --export-gltf
 
-# 导出 GLB 格式（调试模式）
-cargo run --bin aios-database -- --debug-model-refnos="21491_18957" --export-glb
+# 2) 仅重建（不导出）
+cargo run --bin aios-database -- --regen-model --dbnum 7997
 
-# 导出 glTF 格式（调试模式）
-cargo run --bin aios-database -- --debug-model-refnos="21491_18957" --export-gltf
-
-# 导出 XKT 格式（调试模式）
-cargo run --bin aios-database -- --debug-model-refnos="21491_18957" --export-xkt
+# 3) 重建后导出
+cargo run --bin aios-database -- --regen-model --export-obj --debug-model 24381_145018
 ```
 
-## 主要区别
-
-- **`--export-*-refnos`**: 独立参数，不启用调试模式，适合生产环境使用
-- **`--debug-model-refnos` + `--export-*`**: 同时启用调试模式，适合开发调试使用
-
-## 支持的格式
-
-- OBJ (`.obj`)
-- GLB (`.glb`)
-- glTF (`.gltf`)
-- XKT (`.xkt`)
-
-## 通用参数
-
-所有导出命令都支持以下参数：
+## 调试与截图
 
 ```bash
-# 指定输出路径
---export-obj-output="path/to/output.xkt"
+# 调试导出（自动截图）
+cargo run --bin aios-database -- --debug-model 24381_145018 --export-obj
 
-# 过滤特定类型
---export-filter-nouns="EQUI,PIPE,VALV"
-
-# 是否包含子孙节点
---export-include-descendants=false
-
-# 重新生成 mesh（强制 replace_mesh 模式）
---gen-mesh
-
-# 详细输出
---verbose
+# 调试 + 手动截图目录
+cargo run --bin aios-database -- --debug-model 24381_145018 --capture output/screenshots
 ```
 
-## XKT 特定参数
+## 常见参数
 
 ```bash
-# 禁用压缩
---xkt-compress=false
-
-# 验证输出文件
---xkt-validate
-
-# 跳过 Mesh 生成
---xkt-skip-mesh
-
-# 指定数据库配置
---xkt-db-config="DbOption.toml"
-
-# 指定数据库编号
---xkt-dbno=1112
+--export-obj-output <PATH>          # 指定输出路径
+--export-filter-nouns EQUI,PIPE     # 类型过滤
+--export-include-descendants=false   # 是否包含子孙节点
+--use-surrealdb                      # 强制实例数据走 SurrealDB 路径
+--basic-materials                    # GLB/glTF 使用基础材质
+--verbose                            # 详细日志
 ```
-
-## 完整示例
-
-```bash
-# 非调试模式 - 导出 XKT 并验证
-cargo run --bin aios-database -- \
-  --config=DbOption \
-  --export-xkt-refnos="21491_18957" \
-  --export-filter-nouns="EQUI,PIPE" \
-  --export-include-descendants=true \
-  --xkt-compress=true \
-  --xkt-validate \
-  --verbose
-
-# 调试模式 - 导出 glTF
-cargo run --bin aios-database -- \
-  --debug-model-refnos="21491_18957" \
-  --export-gltf \
-  --export-obj-output="output/my_model.gltf"
-
-# 重新生成 mesh 并导出 OBJ
-cargo run --bin aios-database -- \
-  --debug-model-refnos="21491_18957" \
-  --gen-mesh \
-  --export-obj
-```
-
-## 详细文档
-
-更多详细信息请参阅: `docs/guides/export_commands.md`

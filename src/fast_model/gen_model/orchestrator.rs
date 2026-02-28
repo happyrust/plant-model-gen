@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 
@@ -50,11 +50,13 @@ use crate::fast_model::mesh_generate::{
     run_boolean_worker,
     MeshTask, MeshWorkerReport, extract_mesh_tasks, run_mesh_worker_from_channel,
 };
+use crate::fast_model::gen_model::boolean_task::{BooleanTask, BooleanTaskAccumulator};
+use crate::fast_model::gen_model::manifold_bool::run_bool_worker_from_tasks;
 
 use crate::fast_model::pdms_inst::save_instance_data_optimize;
 use crate::fast_model::pdms_inst::{save_instance_data_to_sql_file, InstRelatePrecomputed};
 
-use crate::options::{DbOptionExt, MeshFormat};
+use crate::options::{BooleanPipelineMode, DbOptionExt, MeshFormat};
 
 #[cfg(feature = "parquet-export")]
 use crate::fast_model::export_model::ParquetStreamWriter;
@@ -79,7 +81,7 @@ use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 
 use aios_core::tool::db_tool::db1_hash;
 
-use dashmap::{DashMap, DashSet};
+
 
 /// 按 dbnum 拆分一个 batch，保证写入 InstanceCache 时“一个 batch 只落到一个 dbnum 分桶”。
 ///
@@ -323,6 +325,18 @@ fn ensure_no_db_write_failures(db_write_failures: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct InsertHandleReport {
+    batch_cnt: u64,
+    bool_tasks: Vec<BooleanTask>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GenModelResult {
+    pub success: bool,
+    pub deferred_sql_path: Option<PathBuf>,
+}
+
 
 
 /// 主入口函数：生成所有几何体数据
@@ -356,8 +370,7 @@ pub async fn gen_all_geos_data(
     incr_updates: Option<IncrGeoUpdateLog>,
 
     target_sesno: Option<u32>,
-
-) -> Result<bool> {
+) -> Result<GenModelResult> {
 
     let time = Instant::now();
 
@@ -403,7 +416,10 @@ pub async fn gen_all_geos_data(
 
                         println!("[gen_model] sesno {} 没有发现变更，跳过增量生成", sesno);
 
-                        return Ok(false);
+                        return Ok(GenModelResult {
+                            success: false,
+                            deferred_sql_path: None,
+                        });
 
                     }
 
@@ -701,7 +717,7 @@ async fn process_index_tree_generation(
     db_option: &DbOptionExt,
     _target_sesno: Option<u32>,
     time: Instant,
-) -> Result<bool> {
+) -> Result<GenModelResult> {
     let mut perf = crate::perf_timer::PerfTimer::new("index_tree_generation");
 
     perf.mark("init");
@@ -909,7 +925,8 @@ async fn process_index_tree_generation(
 
     // IndexTree 下用于 inst_relate_aabb 写入的 refno 集合：只收集“本次生成触达”的实例，
     // 避免通过 pe_transform 全库扫描导致卡死/耗时失真。
-    let touched_refnos: Arc<DashSet<RefnoEnum>> = Arc::new(DashSet::new());
+    let touched_refnos: Arc<std::sync::Mutex<std::collections::HashSet<RefnoEnum>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let touched_refnos_for_insert = touched_refnos.clone();
 
 
@@ -951,6 +968,7 @@ async fn process_index_tree_generation(
         let mut db_write_failures: usize = 0;
         // 控制 SurrealDB 后台写入的最大并发数
         let db_write_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+        let mut bool_accumulator = BooleanTaskAccumulator::default();
 
         loop {
 
@@ -968,11 +986,14 @@ async fn process_index_tree_generation(
             batch_cnt += 1;
 
             // 记录本批次触达的实例 refno（用于后续 inst_relate_aabb 写入范围收敛）
-            for r in shape_insts_arc.inst_info_map.keys() {
-                touched_refnos_for_insert.insert(*r);
-            }
-            for r in shape_insts_arc.inst_tubi_map.keys() {
-                touched_refnos_for_insert.insert(*r);
+            {
+                let mut guard = touched_refnos_for_insert.lock().unwrap();
+                for r in shape_insts_arc.inst_info_map.keys() {
+                    guard.insert(*r);
+                }
+                for r in shape_insts_arc.inst_tubi_map.keys() {
+                    guard.insert(*r);
+                }
             }
 
             // [foyer-removal] cache_manager 已移除，跳过 insert_from_shape
@@ -999,9 +1020,22 @@ async fn process_index_tree_generation(
 
             }
 
+            // Mesh 提取：与数据库操作解耦，只要解析完图元就直接派发
+            if let Some(ref tx) = mesh_tx {
+                let tasks = extract_mesh_tasks(&shape_insts_arc);
+                if !tasks.is_empty() {
+                    if let Err(e) = tx.send_async(tasks).await {
+                        eprintln!("[mesh_channel] 发送 mesh 任务失败: {}", e);
+                    }
+                }
+            }
+
+            // 布尔任务跨批次汇总：统一在 insert_handle 结束后一次性抽取，避免漏任务。
+            bool_accumulator.merge_batch(&shape_insts_arc);
+
             // SurrealDB 写入放到后台，不阻塞 cache 写入和后续 batch 接收
             // 采用 Semaphore 限流，防止瞬发海量并发协程打垮数据库导致事务冲突风暴
-            // 此处在 receiver 循环外侧初始化，限定最大并行写库数为 8
+            // 此处在 spawn 外侧 acquire，当达到并发上限时直接施加回压（Backpressure），阻塞 recv 接收
             if defer_db_write {
                 // defer_db_write 模式：SQL 写入文件，不写 SurrealDB
                 if let Some(ref writer) = sql_writer_clone {
@@ -1020,40 +1054,25 @@ async fn process_index_tree_generation(
                     }
                     t_save_db += t0.elapsed();
                 }
-                // defer 模式也提取 mesh 任务，发送到 channel 做内存直生成
-                if let Some(ref tx) = mesh_tx {
-                    let tasks = extract_mesh_tasks(&shape_insts_arc);
-                    if !tasks.is_empty() {
-                        if let Err(e) = tx.send_async(tasks).await {
-                            eprintln!("[defer_db_write] 发送 mesh 任务失败: {}", e);
-                        }
-                    }
-                }
             } else if use_surrealdb {
                 let t0 = Instant::now();
-                let sem = db_write_semaphore.clone();
+                
+                // 在主循环中 acquire 以提供反压
+                let permit = match db_write_semaphore.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("获取写库并发锁失败: {}", e);
+                        continue;
+                    }
+                };
+                
                 let shape_insts_clone = shape_insts_arc.clone();
-                let mesh_tx_clone = mesh_tx.clone();
                 db_write_handles.push(tokio::spawn(async move {
-                    let _permit = match sem.acquire_owned().await {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!("获取写库并发锁失败: {}", e);
-                            return false;
-                        }
-                    };
+                    let _permit_holder = permit; // 离开作用域时自动释放信号量
+
                     if let Err(e) = save_instance_data_optimize(&shape_insts_clone, replace_exist).await {
                         eprintln!("保存实例数据失败: {}", e);
                         return false;
-                    }
-                    // save 成功后，提取 mesh 任务并发送到 mesh channel
-                    if let Some(tx) = mesh_tx_clone {
-                        let tasks = extract_mesh_tasks(&shape_insts_clone);
-                        if !tasks.is_empty() {
-                            if let Err(e) = tx.send_async(tasks).await {
-                                eprintln!("[mesh_channel] 发送 mesh 任务失败: {}", e);
-                            }
-                        }
                     }
                     true
                 }));
@@ -1111,8 +1130,8 @@ async fn process_index_tree_generation(
         }
 
         ensure_no_db_write_failures(db_write_failures)?;
-
-        Ok::<(), anyhow::Error>(())
+        let bool_tasks = bool_accumulator.build_tasks();
+        Ok::<InsertHandleReport, anyhow::Error>(InsertHandleReport { batch_cnt, bool_tasks })
 
     });
 
@@ -1135,26 +1154,13 @@ async fn process_index_tree_generation(
     // 否则 insert_handle.await 会永久阻塞
     drop(sender);
 
-    insert_handle
+    let insert_report = insert_handle
         .await
         .map_err(|e| anyhow::anyhow!("instance sink 任务异常退出: {}", e))?
         .map_err(IndexTreeError::Other)?;
+    let mut bool_tasks = insert_report.bool_tasks;
     // mesh_tx 已被 insert_handle 的 async move 闭包捕获，
     // insert_handle 完成后 mesh_tx 自动 drop → mesh_handle 的 recv 循环正常结束
-
-    // defer_db_write 模式：输出 surql 文件摘要
-    if let Some(ref writer) = sql_file_writer {
-        writer.flush()?;
-        println!(
-            "[gen_model] 🗂️ defer_db_write 完成: {} 条 SQL 语句已写入 {}",
-            writer.statement_count(),
-            writer.path().display()
-        );
-        println!(
-            "[gen_model] 提示: 使用 --import-sql {} 导入到 SurrealDB",
-            writer.path().display()
-        );
-    }
 
     // 完成 Parquet 写入并合并文件
 
@@ -1199,7 +1205,8 @@ async fn process_index_tree_generation(
         let cate = categorized.get_by_category(NounCategory::Cate);
         let loops = categorized.get_by_category(NounCategory::LoopOwner);
         let prims = categorized.get_by_category(NounCategory::Prim);
-        let mut all_refnos = Vec::new();
+        
+        let mut all_refnos = Vec::with_capacity(cate.len() + loops.len() + prims.len());
         all_refnos.extend(cate);
         all_refnos.extend(loops);
         all_refnos.extend(prims);
@@ -1262,8 +1269,10 @@ async fn process_index_tree_generation(
                 println!("[gen_model] IndexTree 模式开始写入 inst_relate_aabb");
 
                 // 只写本次生成触达的 refno，避免 pe_transform 全库扫描导致卡死/耗时失真。
-                let mut aabb_refnos: Vec<RefnoEnum> =
-                    touched_refnos.iter().map(|r| *r.key()).collect();
+                let mut aabb_refnos: Vec<RefnoEnum> = {
+                    let guard = touched_refnos.lock().unwrap();
+                    guard.iter().copied().collect()
+                };
 
                 // manual_db_nums=单库时，严格按 db_meta 映射过滤，避免混入其他 dbnum 的 refno。
                 if let Some(known) = known_dbnum {
@@ -1334,17 +1343,55 @@ async fn process_index_tree_generation(
             let bool_start = Instant::now();
 
             println!("[gen_model] IndexTree 模式开始布尔运算（boolean worker）");
+            println!(
+                "[gen_model] 布尔任务统计: total={} (insert_batch_cnt={})",
+                bool_tasks.len(),
+                insert_report.batch_cnt
+            );
 
             // model_cache boolean worker 已移除（foyer-cache-cleanup）
-
-            if use_surrealdb && !defer_db_write {
-
-                if let Err(e) = run_boolean_worker(Arc::new(db_option.inner.clone()), 100).await {
-
-                    eprintln!("[gen_model] IndexTree 布尔运算失败: {}", e);
-
+            match db_option.boolean_pipeline_mode {
+                BooleanPipelineMode::DbLegacy => {
+                    if use_surrealdb && !defer_db_write {
+                        if let Err(e) = run_boolean_worker(Arc::new(db_option.inner.clone()), 100).await {
+                            eprintln!("[gen_model] IndexTree 布尔运算失败（db_legacy）: {}", e);
+                        }
+                    } else {
+                        println!(
+                            "[gen_model] boolean_pipeline_mode=db_legacy，当前模式不满足执行条件（use_surrealdb={} defer_db_write={}）",
+                            use_surrealdb, defer_db_write
+                        );
+                    }
                 }
-
+                BooleanPipelineMode::MemoryTasks => {
+                    if bool_tasks.is_empty() {
+                        println!("[gen_model] boolean_pipeline_mode=memory_tasks，但没有可执行布尔任务");
+                    } else {
+                        match run_bool_worker_from_tasks(
+                            std::mem::take(&mut bool_tasks),
+                            Arc::new(db_option.inner.clone()),
+                            sql_file_writer.clone(),
+                        )
+                        .await
+                        {
+                            Ok(report) => {
+                                println!(
+                                    "[gen_model] memory bool worker 完成: total={} cata={} inst={} success={} failed={} skipped={} defer={}",
+                                    report.total,
+                                    report.cata_cnt,
+                                    report.inst_cnt,
+                                    report.success,
+                                    report.failed,
+                                    report.skipped,
+                                    report.deferred_mode
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("[gen_model] IndexTree 布尔运算失败（memory_tasks）: {}", e);
+                            }
+                        }
+                    }
+                }
             }
 
 
@@ -1357,6 +1404,20 @@ async fn process_index_tree_generation(
 
             );
 
+        }
+
+        // defer_db_write 模式：布尔阶段后再 flush，确保布尔 SQL 也写入同一文件。
+        if let Some(ref writer) = sql_file_writer {
+            writer.flush()?;
+            println!(
+                "[gen_model] 🗂️ defer_db_write 完成: {} 条 SQL 语句已写入 {}",
+                writer.statement_count(),
+                writer.path().display()
+            );
+            println!(
+                "[gen_model] 提示: 使用 --import-sql {} 导入到 SurrealDB",
+                writer.path().display()
+            );
         }
 
 
@@ -1636,7 +1697,13 @@ async fn process_index_tree_generation(
 
     }
 
-    Ok(true)
+    let deferred_sql_path = sql_file_writer
+        .as_ref()
+        .map(|writer| writer.path().to_path_buf());
+    Ok(GenModelResult {
+        success: true,
+        deferred_sql_path,
+    })
 
 }
 

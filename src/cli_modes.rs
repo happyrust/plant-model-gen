@@ -14,7 +14,8 @@ use aios_database::fast_model::export_model::export_obj::ObjExporter;
 use aios_database::options::DbOptionExt;
 // use aios_database::fast_model::export_xkt::XktExporter;
 use aios_database::fast_model::model_exporter::{
-    CommonExportConfig, GlbExportConfig, GltfExportConfig, ModelExporter, ObjExportConfig,
+    CommonExportConfig, ExportStats, GlbExportConfig, GltfExportConfig, ModelExporter,
+    ObjExportConfig,
     XktExportConfig, collect_export_refnos,
 };
 use aios_database::fast_model::unit_converter::{LengthUnit, UnitConverter};
@@ -289,12 +290,30 @@ async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
     Ok(())
 }
 
+fn report_obj_export_outcome(label: &str, output_file: &str, stats: &ExportStats) -> Result<()> {
+    if stats.geometry_count == 0 {
+        println!("⚠️  {}跳过导出：无几何可导出 -> {}", label, output_file);
+        return Ok(());
+    }
+
+    if !Path::new(output_file).exists() {
+        anyhow::bail!(
+            "OBJ 导出异常：geometry_count={} 但输出文件不存在: {}",
+            stats.geometry_count,
+            output_file
+        );
+    }
+
+    println!("✅ {}导出成功: {}", label, output_file);
+    Ok(())
+}
+
 /// 集中执行 --regen-model 的模型重建逻辑。
 /// 在所有导出函数之前调用一次，不再分散到各导出函数内部。
 pub async fn run_regen_model(
     config: &ExportConfig,
     db_option_ext: &DbOptionExt,
-) -> Result<()> {
+) -> Result<aios_database::fast_model::gen_model::GenModelResult> {
     println!("\n🔄 --regen-model：开始重新生成几何体数据...");
     println!("   - 强制开启 replace_mesh、gen_mesh 和 apply_boolean_operation");
 
@@ -322,9 +341,9 @@ pub async fn run_regen_model(
         std::env::remove_var("FORCE_REPLACE_MESH");
     }
 
-    result?;
+    let gen_result = result?;
     println!("✅ 模型重新生成完成");
-    Ok(())
+    Ok(gen_result)
 }
 
 /// 根据 ExportConfig 确定需要 regen 的目标 refno 集合。
@@ -463,11 +482,11 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
                 },
             };
 
-            exporter
+            let stats = exporter
                 .export(&[*refno], &mesh_dir, &final_output_path, export_config)
                 .await?;
 
-            println!("✅ 导出成功: {}", final_output_path);
+            report_obj_export_outcome("", &final_output_path, &stats)?;
         }
     }
 
@@ -526,19 +545,23 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
                     cache_dir: None,
                 },
             };
-            if let Err(e) = exporter
+            match exporter
                 .export(&[*site_refno], &mesh_dir, &output_file, export_config)
                 .await
             {
-                println!(
-                    "❌ [{}/{}] 导出失败: {} - {}",
-                    idx + 1,
-                    sites.len(),
-                    output_file,
-                    e
-                );
-            } else {
-                println!("✅ [{}/{}] 导出成功: {}", idx + 1, sites.len(), output_file);
+                Err(e) => {
+                    println!(
+                        "❌ [{}/{}] 导出失败: {} - {}",
+                        idx + 1,
+                        sites.len(),
+                        output_file,
+                        e
+                    );
+                }
+                Ok(stats) => {
+                    let label = format!("[{}/{}] ", idx + 1, sites.len());
+                    report_obj_export_outcome(&label, &output_file, &stats)?;
+                }
             }
         }
     } else {
@@ -569,13 +592,16 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
         };
 
         // 将所有 SITE 一次性导出
-        if let Err(e) = exporter
+        match exporter
             .export(&sites, &mesh_dir, &output_file, export_config)
             .await
         {
-            println!("❌ 导出失败: {} - {}", output_file, e);
-        } else {
-            println!("✅ 导出成功: {}", output_file);
+            Err(e) => {
+                println!("❌ 导出失败: {} - {}", output_file, e);
+            }
+            Ok(stats) => {
+                report_obj_export_outcome("", &output_file, &stats)?;
+            }
         }
     }
 

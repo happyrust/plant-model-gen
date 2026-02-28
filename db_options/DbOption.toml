@@ -25,7 +25,7 @@ module = "DESI"
 #是否生成模型数据
 gen_model = true
 gen_mesh = true
-replace_mesh = true
+replace_mesh = false
 save_db = true
 use_surrealdb = true
 use_cache = false

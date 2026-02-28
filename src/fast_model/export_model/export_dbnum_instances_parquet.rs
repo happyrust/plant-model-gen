@@ -3,13 +3,13 @@
 //! 从 SurrealDB 读取 inst_relate / geo_relate / tubi_relate / trans / aabb 数据，
 //! 生成多表 Parquet 文件组，供前端 DuckDB (含 duckdb-wasm) 直接查询。
 //!
-//! 输出表（所有文件名均带 `_{dbnum}` 后缀，避免多 dbnum 导出时互相覆盖）：
-//! - `instances_{dbnum}.parquet`     — 一行一个实例 refno
-//! - `geo_instances_{dbnum}.parquet` — 一行一个几何引用 (refno × geo_index)
-//! - `tubings_{dbnum}.parquet`       — 一行一个 TUBI 段
-//! - `transforms_{dbnum}.parquet`    — 一行一个唯一 trans_hash
-//! - `aabb_{dbnum}.parquet`          — 一行一个唯一 aabb_hash
-//! - `manifest_{dbnum}.json`         — 元信息
+//! 输出表（按 dbnum 分目录，文件名固定）：
+//! - `instances.parquet`     — 一行一个实例 refno
+//! - `geo_instances.parquet` — 一行一个几何引用 (refno × geo_index)
+//! - `tubings.parquet`       — 一行一个 TUBI 段
+//! - `transforms.parquet`    — 一行一个唯一 trans_hash
+//! - `aabb.parquet`          — 一行一个唯一 aabb_hash
+//! - `manifest.json`         — 元信息
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -1158,55 +1158,63 @@ pub async fn export_dbnum_instances_parquet(
     // instances.parquet
     if !instance_rows.is_empty() {
         let batch = build_instances_batch(&instance_rows)?;
-        let path = output_dir.join(format!("instances_{}.parquet", dbnum));
+        let path = output_dir.join("instances.parquet");
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
-            println!("   ✅ instances_{}.parquet: {} 行, {} 字节", dbnum, instance_rows.len(), size);
+            println!("   ✅ instances.parquet: {} 行, {} 字节", instance_rows.len(), size);
         }
     }
 
     // geo_instances.parquet
     if !geo_instance_rows.is_empty() {
         let batch = build_geo_instances_batch(&geo_instance_rows)?;
-        let path = output_dir.join(format!("geo_instances_{}.parquet", dbnum));
+        let path = output_dir.join("geo_instances.parquet");
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
-            println!("   ✅ geo_instances_{}.parquet: {} 行, {} 字节", dbnum, geo_instance_rows.len(), size);
+            println!(
+                "   ✅ geo_instances.parquet: {} 行, {} 字节",
+                geo_instance_rows.len(),
+                size
+            );
         }
     }
 
     // tubings.parquet
     if !tubing_rows.is_empty() {
         let batch = build_tubings_batch(&tubing_rows)?;
-        let path = output_dir.join(format!("tubings_{}.parquet", dbnum));
+        let path = output_dir.join("tubings.parquet");
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
-            println!("   ✅ tubings_{}.parquet: {} 行, {} 字节", dbnum, tubing_rows.len(), size);
+            println!("   ✅ tubings.parquet: {} 行, {} 字节", tubing_rows.len(), size);
         }
     }
 
-    // transforms_{dbnum}.parquet
+    // transforms.parquet
     if !transform_rows.is_empty() {
         let batch = build_transforms_batch(&transform_rows)?;
-        let path = output_dir.join(format!("transforms_{}.parquet", dbnum));
+        let path = output_dir.join("transforms.parquet");
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
-            println!("   ✅ transforms_{}.parquet: {} 行, {} 字节", dbnum, transform_rows.len(), size);
+            println!(
+                "   ✅ transforms.parquet: {} 行, {} 字节",
+                transform_rows.len(),
+                size
+            );
         }
     }
 
-    // aabb_{dbnum}.parquet
+    // aabb.parquet
     if !aabb_row_data.is_empty() {
         let batch = build_aabb_batch(&aabb_row_data)?;
-        let path = output_dir.join(format!("aabb_{}.parquet", dbnum));
+        let path = output_dir.join("aabb.parquet");
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
-            println!("   ✅ aabb_{}.parquet: {} 行, {} 字节", dbnum, aabb_row_data.len(), size);
+            println!("   ✅ aabb.parquet: {} 行, {} 字节", aabb_row_data.len(), size);
         }
     }
 
@@ -1222,23 +1230,23 @@ pub async fn export_dbnum_instances_parquet(
         "root_refno": root_refno.map(|r| r.to_string()),
         "tables": {
             "instances": {
-                "file": format!("instances_{}.parquet", dbnum),
+                "file": "instances.parquet",
                 "rows": instance_rows.len(),
             },
             "geo_instances": {
-                "file": format!("geo_instances_{}.parquet", dbnum),
+                "file": "geo_instances.parquet",
                 "rows": geo_instance_rows.len(),
             },
             "tubings": {
-                "file": format!("tubings_{}.parquet", dbnum),
+                "file": "tubings.parquet",
                 "rows": tubing_rows.len(),
             },
             "transforms": {
-                "file": format!("transforms_{}.parquet", dbnum),
+                "file": "transforms.parquet",
                 "rows": transform_rows.len(),
             },
             "aabb": {
-                "file": format!("aabb_{}.parquet", dbnum),
+                "file": "aabb.parquet",
                 "rows": aabb_row_data.len(),
             },
         },
@@ -1252,10 +1260,10 @@ pub async fn export_dbnum_instances_parquet(
         "total_bytes": total_bytes,
     });
 
-    let manifest_path = output_dir.join(format!("manifest_{}.json", dbnum));
+    let manifest_path = output_dir.join("manifest.json");
     fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
     if verbose {
-        println!("   ✅ manifest_{}.json 已写入", dbnum);
+        println!("   ✅ manifest.json 已写入");
     }
 
     let elapsed = start_time.elapsed();
@@ -1281,12 +1289,12 @@ pub async fn export_dbnum_instances_parquet(
 /// 但数据源是 model cache 而非 SurrealDB，适用于 cache-only 模式。
 ///
 /// # 输出文件
-/// - `instances_{dbnum}.parquet`
-/// - `geo_instances_{dbnum}.parquet`
-/// - `tubings_{dbnum}.parquet`
-/// - `transforms_{dbnum}.parquet`
-/// - `aabb_{dbnum}.parquet`
-/// - `manifest_{dbnum}.json`
+/// - `instances.parquet`
+/// - `geo_instances.parquet`
+/// - `tubings.parquet`
+/// - `transforms.parquet`
+/// - `aabb.parquet`
+/// - `manifest.json`
 pub async fn export_dbnum_instances_parquet_from_cache(
     dbnum: u32,
     output_dir: &Path,
@@ -1785,13 +1793,12 @@ pub async fn export_dbnum_instances_parquet_from_cache(
 
     if !instance_rows.is_empty() {
         let batch = build_instances_batch(&instance_rows)?;
-        let path = output_dir.join(format!("instances_{}.parquet", dbnum));
+        let path = output_dir.join("instances.parquet");
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
             println!(
-                "   ✅ instances_{}.parquet: {} 行, {} 字节",
-                dbnum,
+                "   ✅ instances.parquet: {} 行, {} 字节",
                 instance_rows.len(),
                 size
             );
@@ -1800,13 +1807,12 @@ pub async fn export_dbnum_instances_parquet_from_cache(
 
     if !geo_instance_rows.is_empty() {
         let batch = build_geo_instances_batch(&geo_instance_rows)?;
-        let path = output_dir.join(format!("geo_instances_{}.parquet", dbnum));
+        let path = output_dir.join("geo_instances.parquet");
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
             println!(
-                "   ✅ geo_instances_{}.parquet: {} 行, {} 字节",
-                dbnum,
+                "   ✅ geo_instances.parquet: {} 行, {} 字节",
                 geo_instance_rows.len(),
                 size
             );
@@ -1815,13 +1821,12 @@ pub async fn export_dbnum_instances_parquet_from_cache(
 
     if !tubing_rows.is_empty() {
         let batch = build_tubings_batch(&tubing_rows)?;
-        let path = output_dir.join(format!("tubings_{}.parquet", dbnum));
+        let path = output_dir.join("tubings.parquet");
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
             println!(
-                "   ✅ tubings_{}.parquet: {} 行, {} 字节",
-                dbnum,
+                "   ✅ tubings.parquet: {} 行, {} 字节",
                 tubing_rows.len(),
                 size
             );
@@ -1842,13 +1847,12 @@ pub async fn export_dbnum_instances_parquet_from_cache(
 
     if !transform_rows.is_empty() {
         let batch = build_transforms_batch(&transform_rows)?;
-        let path = output_dir.join(format!("transforms_{}.parquet", dbnum));
+        let path = output_dir.join("transforms.parquet");
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
             println!(
-                "   ✅ transforms_{}.parquet: {} 行, {} 字节",
-                dbnum,
+                "   ✅ transforms.parquet: {} 行, {} 字节",
                 transform_rows.len(),
                 size
             );
@@ -1860,13 +1864,12 @@ pub async fn export_dbnum_instances_parquet_from_cache(
 
     if !aabb_row_data.is_empty() {
         let batch = build_aabb_batch(&aabb_row_data)?;
-        let path = output_dir.join(format!("aabb_{}.parquet", dbnum));
+        let path = output_dir.join("aabb.parquet");
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
             println!(
-                "   ✅ aabb_{}.parquet: {} 行, {} 字节",
-                dbnum,
+                "   ✅ aabb.parquet: {} 行, {} 字节",
                 aabb_row_data.len(),
                 size
             );
@@ -1885,23 +1888,23 @@ pub async fn export_dbnum_instances_parquet_from_cache(
         "dbnum": dbnum,
         "tables": {
             "instances": {
-                "file": format!("instances_{}.parquet", dbnum),
+                "file": "instances.parquet",
                 "rows": instance_rows.len(),
             },
             "geo_instances": {
-                "file": format!("geo_instances_{}.parquet", dbnum),
+                "file": "geo_instances.parquet",
                 "rows": geo_instance_rows.len(),
             },
             "tubings": {
-                "file": format!("tubings_{}.parquet", dbnum),
+                "file": "tubings.parquet",
                 "rows": tubing_rows.len(),
             },
             "transforms": {
-                "file": format!("transforms_{}.parquet", dbnum),
+                "file": "transforms.parquet",
                 "rows": transform_rows.len(),
             },
             "aabb": {
-                "file": format!("aabb_{}.parquet", dbnum),
+                "file": "aabb.parquet",
                 "rows": aabb_row_data.len(),
             },
         },
@@ -1915,13 +1918,13 @@ pub async fn export_dbnum_instances_parquet_from_cache(
         "total_bytes": total_bytes,
     });
 
-    let manifest_path = output_dir.join(format!("manifest_{}.json", dbnum));
+    let manifest_path = output_dir.join("manifest.json");
     fs::write(
         &manifest_path,
         serde_json::to_string_pretty(&manifest)?,
     )?;
     if verbose {
-        println!("   ✅ manifest_{}.json 已写入", dbnum);
+        println!("   ✅ manifest.json 已写入");
     }
 
     let elapsed = start_time.elapsed();
@@ -1944,5 +1947,4 @@ pub async fn export_dbnum_instances_parquet_from_cache(
         elapsed,
     })
 }
-
 

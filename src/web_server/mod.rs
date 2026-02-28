@@ -48,6 +48,7 @@ pub mod parquet_compact_worker;
 pub mod stream_generate; // 流式模型生成模块
 pub mod sqlite_spatial_api;
 pub mod output_instances_files;
+pub mod model_runtime; // 模型实时补齐 + parquet 增量队列
 
 use crate::web_api::{
     E3dTreeApiState, NounHierarchyApiState, SpatialQueryApiState, create_e3d_tree_routes,
@@ -57,7 +58,6 @@ use crate::web_api::{
     create_mbd_pipe_routes,
     create_pdms_model_query_routes,
     create_jwt_auth_routes, create_review_api_routes, create_scene_tree_routes,
-    create_export_api_routes,
     SearchApiState, create_search_routes,
 };
 use handlers::*;
@@ -184,7 +184,7 @@ pub async fn start_web_server_with_config(
 
     // 预先初始化 OnceCell，确保配置已加载
     let _ = aios_core::get_db_option();
-    
+
     // 获取配置并初始化数据库（包括 SurrealDB）
     let db_option = aios_core::get_db_option();
     match aios_core::initialize_databases(db_option).await {
@@ -227,6 +227,8 @@ pub async fn start_web_server_with_config(
     };
     let _compact_worker_handle = parquet_compact_worker::start_compact_worker(compact_worker_config);
     println!("🔄 Parquet compact worker 已启动 (每 30 秒扫描一次)");
+    model_runtime::ensure_runtime_started();
+    println!("🔄 Model runtime worker 已启动");
 
     // 初始化空间查询API
     let db_manager = crate::AiosDBManager::init_form_config().await?;
@@ -311,6 +313,21 @@ pub async fn start_web_server_with_config(
         .route(
             "/api/model/stream-generate-by-root/{refno}",
             get(stream_generate::api_stream_generate_by_root),
+        )
+        // 实时查库返回实例数据（用于 parquet miss 回填）
+        .route(
+            "/api/model/realtime-instances-by-refnos",
+            post(model_runtime::api_realtime_instances_by_refnos),
+        )
+        // parquet 增量导出入队（后台 worker 聚合去重）
+        .route(
+            "/api/model/parquet-incr-enqueue",
+            post(model_runtime::api_parquet_incremental_enqueue),
+        )
+        // parquet 版本查询（前端轮询）
+        .route(
+            "/api/model/parquet-version/{dbno}",
+            get(model_runtime::api_parquet_version),
         )
         // 获取指定 dbno 的 Parquet 文件列表
         .route(
@@ -883,7 +900,6 @@ pub async fn start_web_server_with_config(
         .merge(room_routes)
         .merge(collision_routes)
         .merge(search_routes)
-        .merge(create_export_api_routes())
         .merge(create_review_integration_routes())
         .merge(create_model_center_routes())
         .merge(create_jwt_auth_routes())

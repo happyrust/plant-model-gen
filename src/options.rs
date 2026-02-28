@@ -52,7 +52,7 @@ pub struct DbOptionExt {
     pub inner: DbOption,
 
     /// 模型生成完成后，是否导出 instances_{dbnum}.json（输出到 output/instances/instances_{dbnum}.json）
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub export_instances: bool,
 
     /// 预烘 TriMesh(L0) 输出目录（默认 meshes/trimesh_L0）
@@ -283,7 +283,7 @@ impl From<DbOption> for DbOptionExt {
     fn from(option: DbOption) -> Self {
         Self {
             inner: option,
-            export_instances: true,
+            export_instances: false,
             trimesh_l0_dir: None,
             mqtt_server: None,
             mqtt_port: None,
@@ -430,7 +430,7 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
     let export_instances = toml_value
         .get("export_instances")
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     // 解析输出格式
     let mesh_formats = toml_value

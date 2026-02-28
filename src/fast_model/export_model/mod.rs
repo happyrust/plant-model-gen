@@ -45,11 +45,6 @@ pub mod simple_color_palette;
 #[cfg(feature = "parquet-export")]
 pub mod pe_parquet_writer;
 
-#[cfg(feature = "parquet-export")]
-pub mod attr_parquet_writer;
-
-#[cfg(feature = "parquet-export")]
-pub mod export_parquet;
 
 #[cfg(feature = "parquet-export")]
 pub mod export_dbnum_instances_parquet;

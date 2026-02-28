@@ -792,9 +792,9 @@ async fn trigger_async_parquet_export(dbnum: u32) -> anyhow::Result<()> {
         let project_name = &db_option.project_name;
 
         let output_dir = if project_name.is_empty() {
-            PathBuf::from("output/instances")
+            PathBuf::from("output/instances").join(dbnum.to_string())
         } else {
-            PathBuf::from(format!("output/{project_name}/instances"))
+            PathBuf::from(format!("output/{project_name}/instances")).join(dbnum.to_string())
         };
 
         println!(
@@ -852,23 +852,18 @@ async fn fetch_tubi_segments_from_parquet_with_debug(
     }
     debug.inferred_dbnum = Some(inferred_dbnum);
 
-    // 确定 parquet 输出目录：优先 output/{project}/instances，回退 output/{project}/parquet
+    // 确定 parquet 输出目录：仅使用 output/{project}/instances/{dbnum}
     let db_option = aios_core::get_db_option();
     let project_name = &db_option.project_name;
-    let instances_dir = if project_name.is_empty() {
+    let instances_root = if project_name.is_empty() {
         PathBuf::from("output/instances")
     } else {
-        let d1 = PathBuf::from(format!("output/{project_name}/instances"));
-        if d1.exists() {
-            d1
-        } else {
-            let d2 = PathBuf::from(format!("output/{project_name}/parquet"));
-            if d2.exists() { d2 } else { d1 }
-        }
+        PathBuf::from(format!("output/{project_name}/instances"))
     };
+    let instances_dir = instances_root.join(inferred_dbnum.to_string());
     debug.cache_dir = Some(instances_dir.display().to_string());
 
-    let tubings_path = instances_dir.join(format!("tubings_{inferred_dbnum}.parquet"));
+    let tubings_path = instances_dir.join("tubings.parquet");
     if !tubings_path.exists() {
         anyhow::bail!(
             "tubings parquet 文件不存在: {}",
@@ -2078,6 +2073,5 @@ mod tests {
         assert_eq!(b.to_array(), [5.0, 0.0, 0.0]);
     }
 }
-
 
 

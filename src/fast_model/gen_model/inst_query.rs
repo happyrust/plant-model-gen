@@ -127,6 +127,9 @@ pub async fn query_insts_with_batch(
             results.append(&mut bool_results);
 
             // ========== 路径 B：原始几何查询（排除已有布尔结果的） ==========
+            // inst_relate 记录里可能出现 `in = NONE`（例如数据写入/迁移中断或旧数据残留），
+            // 这会导致后续 `record::id(in)` 报错：Expected `record` but found `NONE`。
+            // 因此这里必须显式过滤掉 in 为 NONE 的记录。
             let non_bool_keys: Vec<String> = chunk
                 .iter()
                 .filter(|r| !bool_refnos.contains(*r))
@@ -150,7 +153,8 @@ pub async fn query_insts_with_batch(
                            && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']) as insts,
                         false as has_neg
                     FROM [{non_bool_keys}]
-                    WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE
+                    WHERE in != NONE
+                      AND type::record("pe_transform", record::id(in)).world_trans.d != NONE
                     "#,
                     non_bool_keys = non_bool_keys_str
                 );
@@ -183,7 +187,8 @@ pub async fn query_insts_with_batch(
                        && geo_type IN ['Pos', 'Compound']) as insts,
                     false as has_neg
                 FROM [{inst_relate_keys}]
-                WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE
+                WHERE in != NONE
+                  AND type::record("pe_transform", record::id(in)).world_trans.d != NONE
                 "#,
                 inst_relate_keys = inst_relate_keys_str
             );

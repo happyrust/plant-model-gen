@@ -46,7 +46,7 @@ use_surrealdb = false
 use_cache = true
 
 # IndexTree 默认管线调优配置
-index_tree_max_concurrent_targets = 6
+index_tree_max_concurrent_targets = 12
 index_tree_batch_size = 200
 
 # 启用的 noun 类别/具体 noun 名称
@@ -216,3 +216,6 @@ min_height_segments = 1
 max_height_segments = 1
 target_segment_length = 400.0
 non_scalable_factor = 1.0
+
+# benchmark override
+export_instances = false

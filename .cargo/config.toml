@@ -1,6 +1,12 @@
 [build]
 # 默认禁用 OCC 功能避免 glam 版本冲突
 rustflags = []
+# ─── sccache 跨项目编译缓存（可选）─────────────────────────────────────────
+# 适用场景：频繁切换分支、clean build、多 repo 联调（rs-core/pdms-io-fork 改动后）
+# 启用方式：先安装 `brew install sccache`，然后取消下面这行注释
+# 注意：sccache 与 incremental 编译互斥。启用 sccache 时建议同时设置：
+#   export CARGO_INCREMENTAL=0
+# rustc-wrapper = "sccache"
 
 # 增大主线程栈大小，避免 debug 模式下 async 函数状态机导致的栈溢出
 # 16MB 栈大小足以应对深度 async 调用链
@@ -20,16 +26,21 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 # rustflags = ["-C", "link-args=-Wl,-stack_size,0x1000000"]
 
 [target.aarch64-apple-darwin]
-# rustflags = ["-C", "link-args=-Wl,-stack_size,0x1000000"]
+rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/bin/ld64.lld"]
 
 [unstable]
 codegen-backend = true
 
 [profile.dev]
 codegen-backend = "cranelift"
+debug = 1              # 仅行号表，加快编译和链接
+incremental = true     # 显式开启增量编译（dev 默认已开，防止被环境变量覆盖）
+split-debuginfo = "unpacked"  # macOS 关键优化：调试信息不打包，大幅缩短链接时间
+                               # Linux 下此选项为默认行为，无负面影响
 
 [profile.dev.package."*"]
 codegen-backend = "llvm"
+opt-level = 1  # 依赖项轻度优化，减小产物体积加速链接
 
 [profile.test]
 # 单测/集成测试在 Windows + cranelift 下更易触发内存/链接异常；

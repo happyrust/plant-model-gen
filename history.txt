@@ -1,5 +1,4 @@
 #V2
-SELECT trans.d as transform, record::id(out) as geo_hash, visible, out.meshed as meshed, geo_type FROM inst_relate:⟨17496_106028⟩.out->geo_relate;
 -- A: trans 原始值
 SELECT trans FROM inst_info:⟨75144747916844⟩->geo_relate;
 -- B: trans.d 是否存在
@@ -99,3 +98,4 @@ SELECT id, status, mesh_id FROM inst_relate_bool WHERE id IN [inst_relate_bool:�
 SELECT in as refno, in.owner as owner, type::record("pe_transform", record::id(in)).world_trans.d as world_trans, (SELECT record::id(out) as geo_hash, out.unit_flag, geo_type, visible, out.meshed, (trans.d ?? NONE) != NONE as has_trans FROM $parent.out->geo_relate WHERE visible && (out.meshed || out.unit_flag || record::id(out) IN ['1','2','3']) && (trans.d ?? NONE) != NONE && geo_type IN ['Pos', 'CatePos', 'Compound']) as insts FROM [inst_relate:⟨24383_75978⟩, inst_relate:⟨24383_75979⟩, inst_relate:⟨24383_75980⟩] WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE;
 SELECT id, world_trans FROM pe WHERE id IN [pe:⟨24383_75978⟩, pe:⟨24383_75979⟩, pe:⟨24383_75980⟩, pe:⟨24383_75983⟩];
 INFO FOR TABLE pe;
+SELECT in.id as in_id, in FROM [inst_relate:`24383_75976`];

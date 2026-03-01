@@ -287,6 +287,12 @@ async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
         .await
         .context("初始化 SurrealDB 失败（需要读取 PDMS 输入数据）")?;
     println!("✅ 数据库连接成功");
+
+    // 根据 model_write_mode 初始化 KV_DB（Dual / KvOnly 模式）
+    aios_core::ensure_model_kv_connected(&db_option_ext.inner)
+        .await
+        .context("初始化模型 KV 连接失败")?;
+
     Ok(())
 }
 

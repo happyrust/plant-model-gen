@@ -154,4 +154,6 @@ test_output
 target
 target-check
 target-run-debug-model
+data.rdb.kv
+failed_sql_batch_*.log
 logs

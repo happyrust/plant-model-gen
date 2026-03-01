@@ -29,10 +29,9 @@ replace_mesh = false
 save_db = true
 use_surrealdb = true
 use_cache = false
-defer_db_write = false
+defer_db_write = true
 boolean_pipeline_mode = "db_legacy"
-# 模型写入模式: surreal_only / dual / kv_only
-model_write_mode = "kv_only"
+regen_delete_mode = "refno_assoc_index"
 # 解析期只生成 scene tree 文件，跳过 PE/属性数据保存
 gen_tree_only = false
 apply_boolean_operation = true
@@ -272,3 +271,4 @@ workflow_sync_path = "/api/workflow/sync"
 workflow_delete_path = "/api/workflow/delete"
 auth_secret = "shared-review-secret"
 timeout_seconds = 15
+

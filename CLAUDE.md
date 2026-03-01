@@ -1,5 +1,9 @@
 调试时，一定要使用debug模式，不要编译release.
 不要使用 cargo clean.
+执行 `cargo check` 时，使用独立的 target 目录以避免与正在运行的 build 产生文件锁冲突：
+```powershell
+$env:CARGO_TARGET_DIR="target-check"; cargo check --bin web_server --features web_server
+```
 
 ## ⚠️ ref0 ≠ dbnum（严重易错点）
 

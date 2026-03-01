@@ -33,7 +33,7 @@
 //! 查询条件：`geo_type IN ['Pos', 'DesiPos', 'CatePos']`
 
 use anyhow::Context;
-use aios_core::{GeomInstQuery, RefnoEnum, SUL_DB, SurrealQueryExt};
+use aios_core::{GeomInstQuery, RefnoEnum, SurrealQueryExt, model_primary_db};
 use surrealdb::types::SurrealValue;
 use serde::{Deserialize, Serialize};
 use aios_core::prim_geo::basic::TUBI_GEO_HASH;
@@ -115,7 +115,7 @@ pub async fn query_insts_with_batch(
                 bool_keys = bool_keys_str
             );
 
-            let mut bool_results: Vec<GeomInstQuery> = SUL_DB
+            let mut bool_results: Vec<GeomInstQuery> = model_primary_db()
                 .query_take(&bool_sql, 0)
                 .await
                 .with_context(|| format!("query_insts_with_batch bool SQL: {}", bool_sql))?;
@@ -159,7 +159,7 @@ pub async fn query_insts_with_batch(
                     non_bool_keys = non_bool_keys_str
                 );
 
-                let mut geo_results: Vec<GeomInstQuery> = SUL_DB
+                let mut geo_results: Vec<GeomInstQuery> = model_primary_db()
                     .query_take(&geo_sql, 0)
                     .await
                     .with_context(|| format!("query_insts_with_batch geo SQL: {}", geo_sql))?;
@@ -193,7 +193,7 @@ pub async fn query_insts_with_batch(
                 inst_relate_keys = inst_relate_keys_str
             );
 
-            let mut chunk_result: Vec<GeomInstQuery> = SUL_DB
+            let mut chunk_result: Vec<GeomInstQuery> = model_primary_db()
                 .query_take(&sql, 0)
                 .await
                 .with_context(|| format!("query_insts_with_batch SQL: {}", sql))?;
@@ -222,7 +222,7 @@ pub async fn query_insts_with_batch(
         }
 
         if !tubi_sql_batch.is_empty() {
-            let mut resp = SUL_DB
+            let mut resp = model_primary_db()
                 .query_response(&tubi_sql_batch)
                 .await
                 .with_context(|| format!("query_insts_with_batch tubi SQL: {}", tubi_sql_batch))?;

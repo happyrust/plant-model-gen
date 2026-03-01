@@ -771,14 +771,12 @@ pub async fn run_mesh_worker_from_channel(
                 task.geo_param.clone()
             };
 
-            let target_dir = if task.is_neg { &manifold_dir } else { &lod_dir };
-
             // handle_csg_mesh 仍使用 &mut String，此处用临时 String 桥接后拆分为语句
             let mut tmp_sql = String::new();
             match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
                 Some(csg_mesh) => {
                     if let Err(e) = handle_csg_mesh(
-                        target_dir,
+                        &lod_dir,
                         &manifold_dir,
                         &mesh_id,
                         &mesh_filename,

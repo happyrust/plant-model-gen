@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 1. 查询 tubi_relate 记录数
     let sql = format!(
-        "SELECT count() as cnt FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];"
+        "SELECT count() as cnt FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..] GROUP ALL;"
     );
     let rows: Vec<serde_json::Value> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
     println!("tubi_relate 查询结果: {:?}", rows);

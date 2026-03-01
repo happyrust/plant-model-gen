@@ -563,6 +563,13 @@ async fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("model-write-mode")
+                .long("model-write-mode")
+                .help("Model write target: surreal_only (default), dual (SUL_DB+KV_DB), kv_only (KV_DB only)")
+                .value_name("MODE")
+                .value_parser(["surreal_only", "dual", "kv_only"]),
+        )
+        .arg(
             Arg::new("import-sql")
                 .long("import-sql")
                 .help("Import a .surql file into SurrealDB and run post-processing (reconcile/boolean/aabb)")
@@ -1298,6 +1305,15 @@ async fn main() -> anyhow::Result<()> {
     if defer_db_write_explicit {
         println!("🗂️ 检测到 --defer-db-write 参数，模型生成阶段将跳过 SurrealDB 写入，SQL 输出到 .surql 文件");
         db_option_ext.defer_db_write = true;
+    }
+
+    // --model-write-mode：覆盖模型写入路由模式
+    if let Some(mode_str) = matches.get_one::<String>("model-write-mode") {
+        println!("🔧 CLI 覆盖 model_write_mode = {}", mode_str);
+        let mode = aios_core::options::ModelWriteMode::parse(mode_str);
+        aios_core::set_model_write_mode(mode);
+        // 同时更新 DbOption 字段，让 initialize_databases 能读到
+        db_option_ext.inner.model_write_mode = Some(mode_str.to_string());
     }
 
     // 调试模式下，如果配置开启了 gen_mesh，默认也应强制重新生成 mesh

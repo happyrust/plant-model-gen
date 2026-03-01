@@ -180,7 +180,7 @@ pub async fn save_inst_relate_bool(
         "UPSERT {id_key} CONTENT {{ refno: {refno_key}, mesh_id: {mesh_str}, status: '{status}', source: '{source}', updated_at: time::now() }};",
     );
 
-    if let Err(e) = SUL_DB.query(&sql).await {
+    if let Err(e) = aios_core::model_query_response(&sql).await {
         let msg = format!("{sql}\n-- err: {e}");
         init_save_database_error(
             &msg,
@@ -188,7 +188,6 @@ pub async fn save_inst_relate_bool(
         );
         anyhow::bail!("save_inst_relate_bool 失败: refno={refno} err={e}");
     }
-    aios_core::kv_dual_write(&sql).await;
     Ok(())
 }
 
@@ -216,13 +215,11 @@ pub async fn save_inst_relate_cata_bool(
     }
     sql.push_str("};");
 
-    if let Err(e) = SUL_DB.query(&sql).await {
+    if let Err(e) = aios_core::model_query_response(&sql).await {
         init_save_database_error(
             &format!("{sql}\n-- err: {e}"),
             &std::panic::Location::caller().to_string(),
         );
-    } else {
-        aios_core::kv_dual_write(&sql).await;
     }
 }
 

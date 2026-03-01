@@ -533,7 +533,7 @@ pub async fn export_prepack_lod_for_refnos(
 
 
 
-            let batch_children: Vec<RefnoEnum> = aios_core::SUL_DB
+            let batch_children: Vec<RefnoEnum> = aios_core::model_primary_db()
 
                 .query_take(sql, 0)
 
@@ -873,7 +873,7 @@ pub async fn export_prepack_lod_for_refnos(
 
 
 
-            let batch_owners: Vec<RefnoEnum> = aios_core::SUL_DB
+            let batch_owners: Vec<RefnoEnum> = aios_core::model_primary_db()
 
                 .query_take(sql, 0)
 
@@ -961,7 +961,7 @@ pub async fn export_prepack_lod_for_refnos(
 
 
 
-            let batch_owners: Vec<RefnoEnum> = aios_core::SUL_DB
+            let batch_owners: Vec<RefnoEnum> = aios_core::model_primary_db()
 
                 .query_take(sql, 0)
 
@@ -3443,7 +3443,7 @@ pub async fn export_all_relates_prepack_lod(
 
     );
 
-    let equi_refnos: Vec<RefnoEnum> = aios_core::SUL_DB.query_take(&equi_sql, 0).await?;
+    let equi_refnos: Vec<RefnoEnum> = aios_core::model_primary_db().query_take(&equi_sql, 0).await?;
 
     println!(
 
@@ -3467,7 +3467,7 @@ pub async fn export_all_relates_prepack_lod(
 
     );
 
-    let mut all_refnos: Vec<RefnoEnum> = aios_core::SUL_DB.query_take(&sql_all, 0).await?;
+    let mut all_refnos: Vec<RefnoEnum> = aios_core::model_primary_db().query_take(&sql_all, 0).await?;
 
 
 
@@ -3920,7 +3920,7 @@ pub async fn export_all_relates_prepack_lod_parquet(
 
     );
 
-    let equi_refnos: Vec<RefnoEnum> = aios_core::SUL_DB.query_take(&equi_sql, 0).await?;
+    let equi_refnos: Vec<RefnoEnum> = aios_core::model_primary_db().query_take(&equi_sql, 0).await?;
 
     println!(
 
@@ -3942,7 +3942,7 @@ pub async fn export_all_relates_prepack_lod_parquet(
 
     );
 
-    let mut all_refnos: Vec<RefnoEnum> = aios_core::SUL_DB.query_take(&sql_all, 0).await?;
+    let mut all_refnos: Vec<RefnoEnum> = aios_core::model_primary_db().query_take(&sql_all, 0).await?;
 
 
 
@@ -4729,7 +4729,7 @@ async fn query_trans_by_hashes(
 
 ) -> Result<HashMap<String, serde_json::Value>> {
 
-    use aios_core::SUL_DB;
+    let model_db = aios_core::model_primary_db();
 
 
 
@@ -4773,7 +4773,7 @@ async fn query_trans_by_hashes(
 
 
 
-        let rows: Vec<TransQueryRow> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let rows: Vec<TransQueryRow> = model_db.query_take(&sql, 0).await.unwrap_or_default();
 
         for row in rows {
 
@@ -4877,7 +4877,7 @@ async fn query_aabb_by_hashes(
 
 ) -> Result<HashMap<String, serde_json::Value>> {
 
-    use aios_core::SUL_DB;
+    let model_db = aios_core::model_primary_db();
 
 
 
@@ -4919,7 +4919,7 @@ async fn query_aabb_by_hashes(
 
 
 
-        let rows: Vec<AabbQueryRow> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let rows: Vec<AabbQueryRow> = model_db.query_take(&sql, 0).await.unwrap_or_default();
 
         for row in rows {
 
@@ -5261,7 +5261,7 @@ async fn query_inst_relate_rows_by_refnos(
 
         let mut chunk_rows: Vec<InstRelateRow> =
 
-            aios_core::SUL_DB.query_take(&sql, 0).await?;
+            aios_core::model_primary_db().query_take(&sql, 0).await?;
 
         rows.append(&mut chunk_rows);
 
@@ -5447,7 +5447,7 @@ pub async fn export_dbnum_instances_json(
 
             );
 
-            let refno_strs: Vec<String> = aios_core::SUL_DB.query_take(&sql, 0).await?;
+            let refno_strs: Vec<String> = aios_core::model_primary_db().query_take(&sql, 0).await?;
 
             if refno_strs.is_empty() {
 
@@ -5745,7 +5745,7 @@ pub async fn export_dbnum_instances_json(
 
 
 
-            let mut resp = aios_core::SUL_DB.query_response(&sql_batch).await?;
+            let mut resp = aios_core::model_primary_db().query_response(&sql_batch).await?;
 
             for (stmt_idx, owner_refno) in owners_chunk.iter().enumerate() {
 
@@ -8637,7 +8637,7 @@ pub async fn export_global_trans_aabb_json(
 
         );
 
-        let trans_results: Vec<TransRow> = aios_core::SUL_DB
+        let trans_results: Vec<TransRow> = aios_core::model_primary_db()
 
             .query_take(&trans_sql, 0)
 
@@ -8795,7 +8795,7 @@ pub async fn export_global_trans_aabb_json(
 
         );
 
-        let aabb_results: Vec<AabbRow> = aios_core::SUL_DB
+        let aabb_results: Vec<AabbRow> = aios_core::model_primary_db()
 
             .query_take(&aabb_sql, 0)
 

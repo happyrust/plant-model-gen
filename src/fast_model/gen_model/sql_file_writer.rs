@@ -113,7 +113,7 @@ pub async fn import_sql_file(
     path: &std::path::Path,
     batch_size: usize,
 ) -> anyhow::Result<(usize, usize)> {
-    use aios_core::{SUL_DB, SurrealQueryExt};
+    use aios_core::model_query_response;
     use std::io::BufRead;
 
     let file = std::fs::File::open(path)
@@ -151,7 +151,7 @@ pub async fn import_sql_file(
         let mut retries = 0u32;
         let max_retries = 3u32;
         loop {
-            match SUL_DB.query_response(&block).await {
+            match model_query_response(&block).await {
                 Ok(_) => {
                     success += chunk.len();
                     break;

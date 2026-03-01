@@ -30,7 +30,7 @@ use aios_core::{
 
 };
 
-use aios_core::{RefnoEnum, SUL_DB, model_primary_db, model_query_response, utils::RecordIdExt};
+use aios_core::{RefnoEnum, model_primary_db, model_query_response, utils::RecordIdExt};
 
 use aios_core::geometry::{EleGeosInfo, EleInstGeosData, GeoBasicType};
 
@@ -61,28 +61,6 @@ use std::sync::Arc;
 const NEG_INFLATE_EPSILON_MM: f64 = 0.5;
 
 
-
-async fn filter_out_bran_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
-
-    if refnos.is_empty() {
-
-        return Ok(Vec::new());
-
-    }
-
-    let refno_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
-
-    let refno_keys = refno_keys.join(",");
-
-    let sql = format!(
-
-        "SELECT value id FROM [{refno_keys}] WHERE noun != 'BRAN'"
-
-    );
-
-    SUL_DB.query_take(&sql, 0).await
-
-}
 
 
 
@@ -813,17 +791,7 @@ pub async fn apply_cata_neg_boolean_manifold(
 
 
 
-    let filtered_refnos = filter_out_bran_refnos(refnos).await?;
-
-    if filtered_refnos.is_empty() {
-
-        return Ok(());
-
-    }
-
-
-
-    let params = query_cata_neg_boolean_groups(&filtered_refnos, replace_exist).await?;
+    let params = query_cata_neg_boolean_groups(refnos, replace_exist).await?;
 
     if params.is_empty() {
 
@@ -2214,44 +2182,6 @@ pub async fn apply_insts_boolean_manifold(
 
 
 
-    let filtered_refnos = filter_out_bran_refnos(refnos).await?;
-
-    if filtered_refnos.is_empty() {
-
-        return Ok(());
-
-    }
-
-
-
-    if filtered_refnos.len() != refnos.len() {
-
-        debug_model_debug!(
-
-            "实例布尔：跳过 BRAN 类型实体 {} 个（输入={} 过滤后={}）",
-
-            refnos.len().saturating_sub(filtered_refnos.len()),
-
-            refnos.len(),
-
-            filtered_refnos.len()
-
-        );
-
-    }
-
-
-
-    let refnos = filtered_refnos;
-
-    if refnos.is_empty() {
-
-        return Ok(());
-
-    }
-
-
-
     // 先用新的批量 API 筛选出存在负实体的实例
 
     let neg_mapping = query_negative_entities_batch(&refnos).await?;
@@ -3198,3 +3128,4 @@ mod tests {
         assert!(should_skip_by_existing_result(true, true, false));
     }
 }
+

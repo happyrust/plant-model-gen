@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
+use aios_core::{RefnoEnum, SurrealQueryExt, model_primary_db};
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use parry3d::bounding_volume::Aabb;
@@ -162,7 +162,7 @@ async fn query_room_relations() -> Result<Vec<RoomRelateRecord>> {
         FROM room_relate
     "#;
 
-    let records: Vec<RoomRelateRecord> = SUL_DB
+    let records: Vec<RoomRelateRecord> = model_primary_db()
         .query_take(sql, 0)
         .await
         .context("查询 room_relate 失败")?;
@@ -180,7 +180,7 @@ async fn query_room_panel_relations() -> Result<Vec<RoomPanelRecord>> {
         FROM room_panel_relate
     "#;
 
-    let records: Vec<RoomPanelRecord> = SUL_DB
+    let records: Vec<RoomPanelRecord> = model_primary_db()
         .query_take(sql, 0)
         .await
         .context("查询 room_panel_relate 失败")?;
@@ -215,7 +215,7 @@ async fn query_panel_geometries(panel_refnos: &[RefnoEnum]) -> Result<Vec<PanelG
         pe_list
     );
 
-    let records: Vec<PanelGeomQuery> = SUL_DB
+    let records: Vec<PanelGeomQuery> = model_primary_db()
         .query_take(&sql, 0)
         .await
         .unwrap_or_default();

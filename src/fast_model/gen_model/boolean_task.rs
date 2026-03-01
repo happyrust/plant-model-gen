@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 pub struct BooleanTask {
     /// 目标实例参考号（被切割对象）
     pub refno: RefnoEnum,
-    /// 目标实例 noun（用于内存侧 BRAN 过滤）
+    /// 目标实例 noun（用于按任务类型区分 BRAN 过滤）
     pub noun: Option<String>,
     /// 任务类型
     pub task_type: BooleanTaskType,
@@ -172,9 +172,6 @@ pub fn extract_cata_neg_tasks(shape_insts: &ShapeInstancesData) -> Vec<BooleanTa
     for (refno, info) in &shape_insts.inst_info_map {
         let refno = *refno;
         let noun = noun_map.get(&refno).cloned();
-        if noun.as_deref() == Some("BRAN") {
-            continue;
-        }
 
         let inst_key = info.get_inst_key();
         let Some(geos_data) = shape_insts.inst_geos_map.get(&inst_key) else {
@@ -350,4 +347,160 @@ pub fn build_boolean_tasks(shape_insts: &ShapeInstancesData) -> Vec<BooleanTask>
     tasks.extend(extract_cata_neg_tasks(shape_insts));
     tasks.extend(extract_inst_neg_tasks(shape_insts));
     tasks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aios_core::geometry::{EleGeosInfo, EleInstGeo, EleInstGeosData};
+
+    fn refno(s: &str) -> RefnoEnum {
+        RefnoEnum::from(s)
+    }
+
+    fn add_info_and_geos(
+        shape: &mut ShapeInstancesData,
+        target_refno: RefnoEnum,
+        noun: &str,
+        geos: Vec<EleInstGeo>,
+    ) {
+        let info = EleGeosInfo {
+            refno: target_refno,
+            sesno: 1,
+            ..Default::default()
+        };
+        let inst_key = info.get_inst_key();
+        shape.insert_info(target_refno, info);
+        shape.insert_geos_data(
+            inst_key.clone(),
+            EleInstGeosData {
+                inst_key,
+                refno: target_refno,
+                insts: geos,
+                type_name: noun.to_string(),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn bran_with_cata_neg_should_build_cata_task() {
+        let mut shape = ShapeInstancesData::default();
+        let target = refno("24381/145018");
+        let pos = refno("24381/145019");
+        let neg = refno("24381/145020");
+
+        add_info_and_geos(
+            &mut shape,
+            target,
+            "BRAN",
+            vec![
+                EleInstGeo {
+                    geo_hash: 101,
+                    refno: pos,
+                    geo_type: GeoBasicType::Pos,
+                    cata_neg_refnos: vec![neg],
+                    ..Default::default()
+                },
+                EleInstGeo {
+                    geo_hash: 102,
+                    refno: neg,
+                    geo_type: GeoBasicType::Neg,
+                    ..Default::default()
+                },
+            ],
+        );
+
+        let tasks = extract_cata_neg_tasks(&shape);
+        assert_eq!(tasks.len(), 1);
+        assert!(matches!(tasks[0].task_type, BooleanTaskType::CataNeg(_)));
+        assert_eq!(tasks[0].noun.as_deref(), Some("BRAN"));
+    }
+
+    #[test]
+    fn bran_with_inst_neg_relation_should_not_build_inst_task() {
+        let mut shape = ShapeInstancesData::default();
+        let target = refno("24381/145018");
+        let carrier = refno("24381/145999");
+        let target_pos = refno("24381/145021");
+        let carrier_neg = refno("24381/145022");
+
+        add_info_and_geos(
+            &mut shape,
+            target,
+            "BRAN",
+            vec![EleInstGeo {
+                geo_hash: 201,
+                refno: target_pos,
+                geo_type: GeoBasicType::Pos,
+                ..Default::default()
+            }],
+        );
+        add_info_and_geos(
+            &mut shape,
+            carrier,
+            "PIPE",
+            vec![EleInstGeo {
+                geo_hash: 202,
+                refno: carrier_neg,
+                geo_type: GeoBasicType::Neg,
+                ..Default::default()
+            }],
+        );
+        shape.insert_negs(target, &[carrier]);
+
+        let tasks = extract_inst_neg_tasks(&shape);
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn non_bran_should_keep_existing_cata_and_inst_behavior() {
+        let mut shape = ShapeInstancesData::default();
+        let target = refno("24381/145018");
+        let carrier = refno("24381/145999");
+        let target_pos = refno("24381/145021");
+        let target_neg = refno("24381/145023");
+        let carrier_neg = refno("24381/145022");
+
+        add_info_and_geos(
+            &mut shape,
+            target,
+            "PIPE",
+            vec![
+                EleInstGeo {
+                    geo_hash: 301,
+                    refno: target_pos,
+                    geo_type: GeoBasicType::Pos,
+                    cata_neg_refnos: vec![target_neg],
+                    ..Default::default()
+                },
+                EleInstGeo {
+                    geo_hash: 302,
+                    refno: target_neg,
+                    geo_type: GeoBasicType::Neg,
+                    ..Default::default()
+                },
+            ],
+        );
+        add_info_and_geos(
+            &mut shape,
+            carrier,
+            "PIPE",
+            vec![EleInstGeo {
+                geo_hash: 303,
+                refno: carrier_neg,
+                geo_type: GeoBasicType::Neg,
+                ..Default::default()
+            }],
+        );
+        shape.insert_negs(target, &[carrier]);
+
+        let cata_tasks = extract_cata_neg_tasks(&shape);
+        let inst_tasks = extract_inst_neg_tasks(&shape);
+
+        assert_eq!(cata_tasks.len(), 1);
+        assert_eq!(inst_tasks.len(), 1);
+        assert!(matches!(cata_tasks[0].task_type, BooleanTaskType::CataNeg(_)));
+        assert!(matches!(inst_tasks[0].task_type, BooleanTaskType::InstNeg(_)));
+    }
 }

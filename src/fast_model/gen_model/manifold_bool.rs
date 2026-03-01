@@ -70,8 +70,6 @@ async fn filter_out_bran_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<Refn
 
     }
 
-
-
     let refno_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
 
     let refno_keys = refno_keys.join(",");
@@ -2515,6 +2513,28 @@ fn bool_result_file_exists(mesh_id: &str) -> bool {
     boolean_glb_path(mesh_id).exists() || boolean_obj_path(mesh_id).exists()
 }
 
+#[inline]
+fn should_skip_bran_task(task: &BooleanTask) -> bool {
+    task.noun.as_deref() == Some("BRAN") && matches!(task.task_type, BooleanTaskType::InstNeg(_))
+}
+
+fn collect_refnos_for_db_success_prefetch(tasks: &[BooleanTask]) -> Vec<RefnoEnum> {
+    tasks
+        .iter()
+        .filter(|task| !should_skip_bran_task(task))
+        .map(|task| task.refno)
+        .collect()
+}
+
+#[inline]
+fn should_skip_by_existing_result(file_exists: bool, deferred_mode: bool, db_success: bool) -> bool {
+    if deferred_mode {
+        file_exists
+    } else {
+        file_exists && db_success
+    }
+}
+
 fn append_cata_update_sql(
     sql: &mut String,
     task: &CataNegBoolTask,
@@ -2866,11 +2886,7 @@ async fn process_inst_task(
 async fn batch_query_bool_success_refnos(
     tasks: &[BooleanTask],
 ) -> anyhow::Result<HashSet<RefnoEnum>> {
-    let refnos: Vec<RefnoEnum> = tasks
-        .iter()
-        .filter(|t| t.noun.as_deref() != Some("BRAN"))
-        .map(|t| t.refno)
-        .collect();
+    let refnos = collect_refnos_for_db_success_prefetch(tasks);
 
     if refnos.is_empty() {
         return Ok(HashSet::new());
@@ -2971,9 +2987,12 @@ pub async fn run_bool_worker_from_tasks(
     let mut executable_tasks: Vec<BooleanTask> = Vec::new();
     for task in tasks {
         let refno = task.refno;
-        if task.noun.as_deref() == Some("BRAN") {
+        if should_skip_bran_task(&task) {
             report.skipped += 1;
-            *report.skip_reasons.entry("bran".to_string()).or_insert(0) += 1;
+            *report
+                .skip_reasons
+                .entry("bran_inst_only".to_string())
+                .or_insert(0) += 1;
             continue;
         }
 
@@ -2981,11 +3000,11 @@ pub async fn run_bool_worker_from_tasks(
         let mesh_id = refu64.to_string();
         if !replace_exist {
             let file_exists = bool_result_file_exists(&mesh_id);
-            let should_skip = if deferred_mode {
-                file_exists
-            } else {
-                file_exists && db_success_set.contains(&refno)
-            };
+            let should_skip = should_skip_by_existing_result(
+                file_exists,
+                deferred_mode,
+                db_success_set.contains(&refno),
+            );
             if should_skip {
                 report.skipped += 1;
                 *report
@@ -3108,3 +3127,74 @@ pub async fn run_boolean_worker_from_cache_manager(
 
 pub async fn run_boolean_worker_from_cache(cache_dir: &Path) -> anyhow::Result<usize> { unimplemented!() }
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn refno(s: &str) -> RefnoEnum {
+        RefnoEnum::from(s)
+    }
+
+    fn cata_task(refno: RefnoEnum, noun: Option<&str>) -> BooleanTask {
+        BooleanTask {
+            refno,
+            noun: noun.map(ToString::to_string),
+            task_type: BooleanTaskType::CataNeg(CataNegBoolTask {
+                inst_info_id: "inst_info".to_string(),
+                boolean_groups: Vec::new(),
+                geo_data_map: HashMap::new(),
+            }),
+        }
+    }
+
+    fn inst_task(refno: RefnoEnum, noun: Option<&str>) -> BooleanTask {
+        BooleanTask {
+            refno,
+            noun: noun.map(ToString::to_string),
+            task_type: BooleanTaskType::InstNeg(InstNegBoolTask {
+                inst_world_transform: aios_core::Transform::default(),
+                pos_geos: Vec::new(),
+                neg_entities: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn bran_cata_task_should_not_be_skipped() {
+        let task = cata_task(refno("24381/145018"), Some("BRAN"));
+        assert!(!should_skip_bran_task(&task));
+    }
+
+    #[test]
+    fn bran_inst_task_should_be_skipped() {
+        let task = inst_task(refno("24381/145019"), Some("BRAN"));
+        assert!(should_skip_bran_task(&task));
+    }
+
+    #[test]
+    fn db_prefetch_should_keep_bran_cata_and_drop_bran_inst() {
+        let bran_cata = cata_task(refno("24381/145020"), Some("BRAN"));
+        let bran_inst = inst_task(refno("24381/145021"), Some("BRAN"));
+        let pipe_inst = inst_task(refno("24381/145022"), Some("PIPE"));
+
+        let refnos = collect_refnos_for_db_success_prefetch(&[bran_cata, bran_inst, pipe_inst]);
+
+        assert_eq!(refnos, vec![refno("24381/145020"), refno("24381/145022")]);
+    }
+
+    #[test]
+    fn non_deferred_skip_requires_file_and_db_success() {
+        assert!(!should_skip_by_existing_result(false, false, true));
+        assert!(!should_skip_by_existing_result(true, false, false));
+        assert!(should_skip_by_existing_result(true, false, true));
+    }
+
+    #[test]
+    fn deferred_skip_requires_file_only() {
+        assert!(!should_skip_by_existing_result(false, true, true));
+        assert!(!should_skip_by_existing_result(false, true, false));
+        assert!(should_skip_by_existing_result(true, true, false));
+    }
+}

@@ -152,4 +152,6 @@ ams-8021.db
 nul
 test_output
 target
+target-check
+target-run-debug-model
 logs

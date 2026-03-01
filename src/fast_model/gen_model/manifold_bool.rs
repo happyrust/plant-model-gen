@@ -30,7 +30,7 @@ use aios_core::{
 
 };
 
-use aios_core::{RefnoEnum, SUL_DB, utils::RecordIdExt};
+use aios_core::{RefnoEnum, SUL_DB, model_primary_db, model_query_response, utils::RecordIdExt};
 
 use aios_core::geometry::{EleGeosInfo, EleInstGeosData, GeoBasicType};
 
@@ -1317,7 +1317,7 @@ pub async fn apply_cata_neg_boolean_manifold(
 
 
 
-            if let Err(e) = SUL_DB.query(update_sql.clone()).await {
+            if let Err(e) = model_query_response(&update_sql).await {
 
                 debug_model_warn!(
 
@@ -1405,7 +1405,8 @@ async fn apply_boolean_for_query(
 
         );
 
-        let existing_status: Vec<Option<String>> = SUL_DB.query_take(&check_sql, 0).await?;
+        let existing_status: Vec<Option<String>> =
+            model_primary_db().query_take(&check_sql, 0).await?;
 
         if matches!(
 
@@ -2391,7 +2392,7 @@ impl BoolResultWriter for DbBoolWriter {
         if sql.trim().is_empty() {
             return Ok(());
         }
-        SUL_DB.query(sql).await?;
+        model_query_response(sql).await?;
         Ok(())
     }
 }
@@ -2887,7 +2888,7 @@ async fn batch_query_bool_success_refnos(
             "SELECT VALUE in FROM [{}] WHERE status = 'Success'",
             ids.join(",")
         );
-        match SUL_DB.query_take::<Vec<RefnoEnum>>(&sql, 0).await {
+        match model_primary_db().query_take::<Vec<RefnoEnum>>(&sql, 0).await {
             Ok(found) => {
                 for r in found {
                     success_set.insert(r);
@@ -2905,7 +2906,7 @@ async fn batch_query_bool_success_refnos(
             "SELECT VALUE in.refno FROM [{}] WHERE status = 'Success'",
             cata_ids.join(",")
         );
-        match SUL_DB.query_take::<Vec<RefnoEnum>>(&cata_sql, 0).await {
+        match model_primary_db().query_take::<Vec<RefnoEnum>>(&cata_sql, 0).await {
             Ok(found) => {
                 for r in found {
                     success_set.insert(r);

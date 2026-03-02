@@ -25,7 +25,7 @@ use aios_core::shape::pdms_shape::{PlantMesh, RsVec3};
 use aios_core::tool::float_tool::{dvec4_round_3, f64_round};
 use aios_core::{
     RecordId, RefU64, RefnoEnum, SUL_DB, gen_aabb_hash, get_inst_relate_keys,
-    utils::RecordIdExt, model_primary_db, model_query_response,
+    utils::RecordIdExt,
 };
 use crate::fast_model::query_compat::{query_deep_neg_inst_refnos, query_deep_visible_inst_refnos};
 use aios_core::{get_db_option, init_test_surreal};
@@ -181,7 +181,7 @@ async fn flush_update_stmts(stmts: &mut Vec<String>, report: &mut MeshWorkerRepo
     stmts.clear();
 
     report.db_update_batches += 1;
-    match model_query_response(&sql).await {
+    match SUL_DB.query(&sql).await {
         Ok(_) => {}
         Err(e) => {
             report.db_update_failed_batches += 1;
@@ -323,7 +323,7 @@ async fn query_pending_cata_boolean(
 	LIMIT {limit};"#,
     );
 
-    let refnos: Vec<RefnoEnum> = model_primary_db().query_take(&sql, 0).await?;
+    let refnos: Vec<RefnoEnum> = SUL_DB.query_take(&sql, 0).await?;
     Ok(refnos)
 }
 
@@ -334,7 +334,7 @@ async fn query_relation_targets(table: &str) -> anyhow::Result<Vec<RefnoEnum>> {
 FROM {table}
 GROUP BY out;"#
     );
-    let refnos: Vec<RefnoEnum> = model_primary_db().query_take(&sql, 0).await?;
+    let refnos: Vec<RefnoEnum> = SUL_DB.query_take(&sql, 0).await?;
     Ok(refnos)
 }
 
@@ -396,7 +396,7 @@ LIMIT {remaining};
             chunk.join(",")
         );
 
-        let mut refnos: Vec<RefnoEnum> = model_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+        let mut refnos: Vec<RefnoEnum> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
         pending.append(&mut refnos);
     }
 
@@ -422,7 +422,7 @@ async fn query_pending_mesh_geo_ids(limit: usize, replace_exist: bool) -> anyhow
         )
     };
 
-    let ids: Vec<RecordId> = model_primary_db().query_take(&sql, 0).await?;
+    let ids: Vec<RecordId> = SUL_DB.query_take(&sql, 0).await?;
     Ok(ids)
 }
 
@@ -434,7 +434,7 @@ async fn query_total_pending_mesh_count(replace_exist: bool) -> anyhow::Result<u
         "SELECT VALUE count() FROM inst_geo WHERE meshed != true AND param != NONE AND bad != true GROUP ALL".to_string()
     };
     
-    let counts: Vec<i64> = model_primary_db().query_take(&sql, 0).await?;
+    let counts: Vec<i64> = SUL_DB.query_take(&sql, 0).await?;
     Ok(counts.first().copied().unwrap_or(0) as usize)
 }
 
@@ -451,7 +451,7 @@ async fn snapshot_mesh_geo_ids_for_replace(batch_size: usize) -> anyhow::Result<
             batch_size, start
         );
 
-        let mut page: Vec<RecordId> = model_primary_db().query_take(&sql, 0).await?;
+        let mut page: Vec<RecordId> = SUL_DB.query_take(&sql, 0).await?;
         if page.is_empty() {
             break;
         }
@@ -1331,7 +1331,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
         ids_str
     );
     
-    let mut response = model_primary_db().query(&sql).await?;
+    let mut response = SUL_DB.query(&sql).await?;
     let geo_params: Vec<QueryGeoParam> = response.take(0).unwrap_or_default();
     
     if geo_params.is_empty() {
@@ -1399,7 +1399,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
     // 执行批量更新
     if !update_sql.is_empty() {
         println!("[gen_inst_meshes_by_geo_ids] 执行 update_sql ({} bytes)", update_sql.len());
-        match model_query_response(&update_sql).await {
+        match SUL_DB.query(&update_sql).await {
             Ok(_) => println!("[gen_inst_meshes_by_geo_ids] update_sql 执行成功"),
             Err(e) => eprintln!("[gen_inst_meshes_by_geo_ids] 更新数据库失败: {}", e),
         }
@@ -1543,7 +1543,7 @@ pub async fn gen_inst_meshes(
                 "select id, param, unit_flag ?? false as unit_flag from [{}] where param != NONE",
                 ids
             );
-            match model_primary_db().query(&sql).await {
+            match SUL_DB.query(&sql).await {
                 Ok(mut response) => {
                     let result: Vec<QueryGeoParam> = response.take(0).unwrap();
                     i += 1;
@@ -1623,7 +1623,7 @@ pub async fn gen_inst_meshes(
                     if !update_sql.is_empty() {
                         // 批量回写 SurrealDB（使用一个语句拼接多条 update）
                         println!("准备执行批量更新 SQL，长度: {}", update_sql.len());
-                        match model_query_response(&update_sql).await {
+                        match SUL_DB.query(&update_sql).await {
                             Ok(_) => {
                                 println!("✅ 批量更新成功");
                             }
@@ -1816,7 +1816,7 @@ fn derive_csg_points(mesh: &PlantMesh, pts_json_map: &Arc<DashMap<u64, String>>)
 /// 查询所有 pe_transform 的 refno（仅 world_trans 存在的实例）
 pub async fn fetch_inst_relate_refnos() -> anyhow::Result<Vec<RefnoEnum>> {
     let sql = "SELECT VALUE record::id(id) FROM pe_transform WHERE world_trans != none";
-    let refno_strings: Vec<String> = model_primary_db().query_take(sql, 0).await?;
+    let refno_strings: Vec<String> = SUL_DB.query_take(sql, 0).await?;
     let refnos = refno_strings
         .into_iter()
         .filter_map(|refno| {
@@ -1843,7 +1843,7 @@ async fn filter_missing_inst_aabb(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<Re
         pe_keys.join(",")
     );
 
-    let existing: Vec<RefnoEnum> = model_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+    let existing: Vec<RefnoEnum> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
     let existing: HashSet<RefnoEnum> = existing.into_iter().collect();
 
     let missing = refnos

@@ -424,7 +424,7 @@ pub async fn export_instanced_bundle_for_refnos(
             
             // 1. 检查记录是否存在（不带过滤条件）
             let count_sql = format!("SELECT count() AS cnt FROM inst_relate WHERE in IN [{}];", pe_list);
-            match aios_core::model_primary_db().query_response(&count_sql).await {
+            match aios_core::SUL_DB.query_response(&count_sql).await {
                 Ok(mut resp) => {
                     if let Ok(counts) = resp.take::<Vec<serde_json::Value>>(0) {
                         println!("   - inst_relate 总记录数（无过滤）: {:?}", counts);
@@ -445,7 +445,7 @@ pub async fn export_instanced_bundle_for_refnos(
                      AND record::exists(type::record('inst_relate_aabb', record::id(in)));"#, 
                 pe_list
             );
-            match aios_core::model_primary_db().query_response(&filter_sql).await {
+            match aios_core::SUL_DB.query_response(&filter_sql).await {
                 Ok(mut resp) => {
                     if let Ok(counts) = resp.take::<Vec<serde_json::Value>>(0) {
                         println!("   - inst_relate 记录数（带 aabb/trans 过滤）: {:?}", counts);
@@ -474,7 +474,7 @@ pub async fn export_instanced_bundle_for_refnos(
                    LIMIT 5;"#, 
                 pe_list
             );
-            match aios_core::model_primary_db().query_response(&detail_sql).await {
+            match aios_core::SUL_DB.query_response(&detail_sql).await {
                 Ok(mut resp) => {
                     if let Ok(records) = resp.take::<Vec<serde_json::Value>>(0) {
                         println!("   - 详细记录（前5条）:");
@@ -555,7 +555,7 @@ pub async fn export_instanced_bundle_for_refnos(
              
              // 1. 检查记录是否存在
              let count_sql = format!("SELECT count() AS cnt FROM inst_relate WHERE in IN [{}];", pe_list);
-             match aios_core::model_primary_db().query_response(&count_sql).await {
+             match aios_core::SUL_DB.query_response(&count_sql).await {
                  Ok(mut resp) => {
                       if let Ok(counts) = resp.take::<Vec<serde_json::Value>>(0) {
                           println!("   - inst_relate 记录数: {:?}", counts);
@@ -569,7 +569,7 @@ pub async fn export_instanced_bundle_for_refnos(
                  "SELECT in, aabb, world_trans, geo_type, visible, out.meshed as is_meshed FROM inst_relate WHERE in IN [{}];", 
                  pe_list
              );
-             match aios_core::model_primary_db().query_response(&check_sql).await {
+             match aios_core::SUL_DB.query_response(&check_sql).await {
                  Ok(mut resp) => {
                       if let Ok(records) = resp.take::<Vec<serde_json::Value>>(0) {
                           println!("   - 详细记录检查 (前10条):");

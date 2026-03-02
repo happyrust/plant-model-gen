@@ -225,8 +225,11 @@ try {
   $toml = Upsert-TomlLine $toml "export_instances" "false"
   # profile: 减少非核心开销（不写 DB / 不跑 precheck）
   $toml = Upsert-TomlLine $toml "save_db" "false"
-  $toml = Upsert-TomlLine $toml "use_surrealdb" "false"
-  $toml = Upsert-TomlLine $toml "use_cache" "true"
+  $toml = Upsert-TomlLine $toml "use_surrealdb" "true"
+  $toml = Upsert-TomlLine $toml "use_cache" "false"
+  # 嵌入式 RocksDB 后端（跳过 WebSocket，直接读本地数据目录）
+  $toml = Upsert-TomlLine $toml "surreal_backend" "`"rocksdb`""
+  $toml = Upsert-TomlLine $toml "surreal_local_path" "`"D:/backup-dbs/ams-8020.db`""
   # 只跑指定 dbnum，noun 参数不再生效（统一标准管线）
   $toml = Upsert-TomlLine $toml "manual_db_nums" ("[{0}]" -f $Dbnum)
   $toml = Upsert-TomlLine $toml "index_tree_enabled_target_types" ("[`"$Noun`"]")
@@ -239,6 +242,30 @@ try {
   Set-Content -LiteralPath ("$cfgNoExt.toml") -Value $toml -Encoding UTF8
 
   $perfDir = ("output/{0}/profile" -f $projectName).Replace('\', '/')
+
+  # 嵌入式 SurrealKV 模式：自动停掉占用数据目录的 SurrealDB 服务进程
+  $skvPath = Get-TomlStringValue $toml "surreal_local_path"
+  if ($skvPath) {
+    $vPort = Get-TomlStringValue $baseToml "v_port"
+    if (-not $vPort) { $vPort = "8020" }
+    Write-Host "🔍 嵌入式模式：检查端口 $vPort 上的 SurrealDB 服务..."
+    $tcpConns = Get-NetTCPConnection -LocalPort $vPort -ErrorAction SilentlyContinue
+    if ($tcpConns) {
+      $procIds = $tcpConns | Select-Object -ExpandProperty OwningProcess -Unique
+      foreach ($procId in $procIds) {
+        $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+        if ($proc) {
+          Write-Host "🛑 停止占用端口 ${vPort} 的进程: $($proc.Name) (PID=$procId)"
+          Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+        }
+      }
+      Start-Sleep -Seconds 2
+      Write-Host "✅ SurrealDB 服务已停止，嵌入式模式可安全访问数据目录"
+    }
+    else {
+      Write-Host "✅ 端口 $vPort 未被占用，无需停止服务"
+    }
+  }
 
   $cold = Run-One "cold" $cfgNoExt $cacheDir $meshDir $perfDir $true
 

@@ -1314,10 +1314,6 @@ async fn main() -> anyhow::Result<()> {
         aios_core::set_model_write_mode(mode);
         // 同时更新 DbOption 字段，让 initialize_databases 能读到
         db_option_ext.inner.model_write_mode = Some(mode_str.to_string());
-    } else if let Some(ref mode_str) = db_option_ext.inner.model_write_mode {
-        let mode = aios_core::options::ModelWriteMode::parse(mode_str);
-        aios_core::set_model_write_mode(mode);
-        println!("📋 配置文件 model_write_mode = {} ({:?})", mode_str, mode);
     }
 
     // 调试模式下，如果配置开启了 gen_mesh，默认也应强制重新生成 mesh

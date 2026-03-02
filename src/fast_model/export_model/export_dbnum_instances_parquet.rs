@@ -581,7 +581,7 @@ async fn query_inst_relate_rows(
         );
 
         let mut chunk_rows: Vec<InstRelateRow> =
-            aios_core::model_primary_db().query_take(&sql, 0).await?;
+            aios_core::SUL_DB.query_take(&sql, 0).await?;
         rows.append(&mut chunk_rows);
     }
 
@@ -618,7 +618,7 @@ async fn query_tubi_relate(
             ));
         }
 
-        let mut resp = aios_core::model_primary_db().query_response(&sql_batch).await?;
+        let mut resp = aios_core::SUL_DB.query_response(&sql_batch).await?;
         for (stmt_idx, owner_refno) in owners_chunk.iter().enumerate() {
             let raw_rows: Vec<TubiQueryResult> = resp.take(stmt_idx)?;
             for row in raw_rows {
@@ -648,7 +648,7 @@ async fn query_trans_rows(
     unit_converter: &UnitConverter,
     verbose: bool,
 ) -> Result<Vec<TransformRow>> {
-    let model_db = aios_core::model_primary_db();
+    use aios_core::SUL_DB;
 
     let mut result = Vec::new();
     if hashes.is_empty() {
@@ -669,7 +669,7 @@ async fn query_trans_rows(
             println!("   查询 trans: {} 个", chunk.len());
         }
 
-        let rows: Vec<TransQueryRow> = model_db.query_take(&sql, 0).await.unwrap_or_default();
+        let rows: Vec<TransQueryRow> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
         for row in rows {
             if let Some(obj) = row.d.as_object() {
                 let translation = obj.get("translation")
@@ -736,7 +736,7 @@ async fn query_aabb_rows(
     unit_converter: &UnitConverter,
     verbose: bool,
 ) -> Result<Vec<AabbRow>> {
-    let model_db = aios_core::model_primary_db();
+    use aios_core::SUL_DB;
 
     let mut result = Vec::new();
     if hashes.is_empty() {
@@ -757,7 +757,7 @@ async fn query_aabb_rows(
             println!("   查询 aabb: {} 个", chunk.len());
         }
 
-        let rows: Vec<AabbQueryRow> = model_db.query_take(&sql, 0).await.unwrap_or_default();
+        let rows: Vec<AabbQueryRow> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
         for row in rows {
             if let Some(aabb) = row.d {
                 let mins = aabb.0.mins;

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use aios_core::shape::pdms_shape::PlantMesh;
-use aios_core::{RefnoEnum, SurrealQueryExt, query_insts, model_primary_db};
+use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt, query_insts};
 use anyhow::{Context, Result, anyhow};
 use glam::Vec3;
 use serde_json::{Value, json};
@@ -223,7 +223,7 @@ async fn filter_refnos_with_inst_relate_aabb(refnos: &[RefnoEnum]) -> Vec<RefnoE
     // 避免后续 query_insts 反序列化 world_aabb = null。
     let sql = format!("SELECT VALUE in.id FROM [{ids}]");
 
-    let existing: Vec<RefnoEnum> = model_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+    let existing: Vec<RefnoEnum> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
     if existing.is_empty() {
         return Vec::new();
     }

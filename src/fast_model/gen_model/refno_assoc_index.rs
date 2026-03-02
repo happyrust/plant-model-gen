@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashSet};
 
-use aios_core::{RefnoEnum, SurrealQueryExt, model_primary_db, model_query_response};
+use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
 use anyhow::Context;
 use serde_json::Value;
 use tokio::sync::OnceCell;
@@ -48,7 +48,7 @@ DEFINE FIELD IF NOT EXISTS updated_at ON TABLE refno_assoc_index TYPE datetime;
 DEFINE FIELD IF NOT EXISTS version ON TABLE refno_assoc_index TYPE int;
 DEFINE INDEX IF NOT EXISTS idx_refno_assoc_refno ON TABLE refno_assoc_index FIELDS refno UNIQUE;
 "#;
-            let _ = model_query_response(sql).await;
+            let _ = SUL_DB.query(sql).await;
         })
         .await;
 }
@@ -158,7 +158,8 @@ impl RefnoAssocIndexBatch {
         ensure_refno_assoc_index_schema().await;
 
         for sql in self.to_upsert_sqls() {
-            model_query_response(&sql)
+            SUL_DB
+                .query_response(&sql)
                 .await
                 .with_context(|| format!("写入 refno_assoc_index 失败: {}", sql))?;
         }
@@ -265,7 +266,7 @@ async fn load_assoc_rows(
             .map(|r| assoc_record_id(*r))
             .collect::<Vec<_>>();
         let sql = format!("SELECT * FROM [{}];", ids.join(","));
-        let mut resp = model_primary_db().query_response(&sql).await?;
+        let mut resp = SUL_DB.query_response(&sql).await?;
         let mut part: Vec<Value> = resp.take(0).unwrap_or_default();
         rows.append(&mut part);
         index_ids.extend(ids);
@@ -316,7 +317,7 @@ pub async fn delete_by_refnos(
 
     let sqls = build_delete_sql_from_rows(&rows, &index_ids, chunk_size);
     for sql in &sqls {
-        model_query_response(sql).await?;
+        SUL_DB.query_response(sql).await?;
     }
 
     Ok(RefnoAssocDeleteSummary {

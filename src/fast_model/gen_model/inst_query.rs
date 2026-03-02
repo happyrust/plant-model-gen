@@ -124,15 +124,6 @@ pub async fn query_insts_with_batch(
             let bool_refnos: std::collections::HashSet<_> =
                 bool_results.iter().map(|r| r.refno.clone()).collect();
 
-            // [DIAG] 临时诊断：打印 Path A 结果
-            if !bool_results.is_empty() {
-                eprintln!("[DIAG inst_query] Path A (inst_relate_bool): {} results", bool_results.len());
-                for r in &bool_results {
-                    let hashes: Vec<_> = r.insts.iter().map(|i| i.geo_hash.as_str()).collect();
-                    eprintln!("  refno={} geo_hashes={:?} has_neg={}", r.refno, hashes, r.has_neg);
-                }
-            }
-
             results.append(&mut bool_results);
 
             // ========== 路径 B：原始几何查询（排除已有布尔结果的） ==========
@@ -144,32 +135,6 @@ pub async fn query_insts_with_batch(
                 .filter(|r| !bool_refnos.contains(*r))
                 .map(|r| r.to_inst_relate_key())
                 .collect();
-
-            // [DIAG] 临时诊断：查 inst_relate.out (inst_info) -> geo_relate 详情
-            {
-                let diag_ir_keys: Vec<String> = chunk
-                    .iter()
-                    .filter(|r| !bool_refnos.contains(*r))
-                    .map(|r| r.to_inst_relate_key())
-                    .collect();
-                if !diag_ir_keys.is_empty() {
-                    // 先查 inst_relate 的 out (inst_info ID)，再查该 inst_info 下的 geo_relate
-                    let diag_sql = format!(
-                        "LET $inst_infos = SELECT VALUE out FROM [{}] WHERE in != NONE; SELECT geo_type, visible, record::id(id) as rel_id, record::id(in) as in_id, record::id(out) as out_id, out.meshed as meshed FROM geo_relate WHERE in IN $inst_infos;",
-                        diag_ir_keys.join(",")
-                    );
-                    match model_primary_db().query(&diag_sql).await {
-                        Ok(mut r) => match r.take::<Vec<serde_json::Value>>(1) {
-                            Ok(rows) => {
-                                eprintln!("[DIAG geo_relate] rows={}", rows.len());
-                                for row in &rows { eprintln!("[DIAG geo_relate] {}", row); }
-                            }
-                            Err(e) => eprintln!("[DIAG geo_relate] take err: {}", e),
-                        },
-                        Err(e) => eprintln!("[DIAG geo_relate] query err: {}", e),
-                    }
-                }
-            }
 
             if !non_bool_keys.is_empty() {
                 let non_bool_keys_str = non_bool_keys.join(",");
@@ -198,16 +163,6 @@ pub async fn query_insts_with_batch(
                     .query_take(&geo_sql, 0)
                     .await
                     .with_context(|| format!("query_insts_with_batch geo SQL: {}", geo_sql))?;
-
-                // [DIAG] 临时诊断：打印 Path B 结果
-                if !geo_results.is_empty() {
-                    eprintln!("[DIAG inst_query] Path B (inst_relate): {} results", geo_results.len());
-                    for r in &geo_results {
-                        let hashes: Vec<_> = r.insts.iter().map(|i| i.geo_hash.as_str()).collect();
-                        eprintln!("  refno={} geo_hashes={:?} has_neg={}", r.refno, hashes, r.has_neg);
-                    }
-                }
-
                 results.append(&mut geo_results);
             }
         } else {

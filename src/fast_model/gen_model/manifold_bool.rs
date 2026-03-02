@@ -30,7 +30,7 @@ use aios_core::{
 
 };
 
-use aios_core::{RefnoEnum, model_primary_db, model_query_response, utils::RecordIdExt};
+use aios_core::{RefnoEnum, SUL_DB, utils::RecordIdExt};
 
 use aios_core::geometry::{EleGeosInfo, EleInstGeosData, GeoBasicType};
 
@@ -61,6 +61,30 @@ use std::sync::Arc;
 const NEG_INFLATE_EPSILON_MM: f64 = 0.5;
 
 
+
+async fn filter_out_bran_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
+
+    if refnos.is_empty() {
+
+        return Ok(Vec::new());
+
+    }
+
+
+
+    let refno_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
+
+    let refno_keys = refno_keys.join(",");
+
+    let sql = format!(
+
+        "SELECT value id FROM [{refno_keys}] WHERE noun != 'BRAN'"
+
+    );
+
+    SUL_DB.query_take(&sql, 0).await
+
+}
 
 
 
@@ -791,7 +815,17 @@ pub async fn apply_cata_neg_boolean_manifold(
 
 
 
-    let params = query_cata_neg_boolean_groups(refnos, replace_exist).await?;
+    let filtered_refnos = filter_out_bran_refnos(refnos).await?;
+
+    if filtered_refnos.is_empty() {
+
+        return Ok(());
+
+    }
+
+
+
+    let params = query_cata_neg_boolean_groups(&filtered_refnos, replace_exist).await?;
 
     if params.is_empty() {
 
@@ -1157,7 +1191,7 @@ pub async fn apply_cata_neg_boolean_manifold(
 
                 // 先删除该实例下全部旧 CatePos（兼容历史 id 规则，且避免同实例重复导出）
                 update_sql.push_str(&format!(
-                    "DELETE FROM geo_relate WHERE in = {} AND geo_type = 'CatePos';",
+                    "LET $old_geo_ids = SELECT VALUE id FROM {}->geo_relate WHERE geo_type = 'CatePos'; DELETE $old_geo_ids;",
                     &g.inst_info_id.to_raw(),
                 ));
 
@@ -1191,10 +1225,9 @@ pub async fn apply_cata_neg_boolean_manifold(
 
                 // 并设置 visible=false，使其在查询时被排除
 
-                // SurrealDB 3.x: `A->geo_relate` 图遍历可能返回空，改用 WHERE in =
                 let hide_original_sql = format!(
 
-                    "UPDATE geo_relate SET geo_type = 'Compound', visible = false WHERE in = {} AND geom_refno = pe:⟨{}⟩ AND geo_type IN ['Pos','Compound'];",
+                    "UPDATE {}->geo_relate SET geo_type = 'Compound', visible = false WHERE geom_refno = pe:⟨{}⟩ AND geo_type IN ['Pos','Compound'];",
 
                     &g.inst_info_id.to_raw(),
 
@@ -1284,7 +1317,7 @@ pub async fn apply_cata_neg_boolean_manifold(
 
 
 
-            if let Err(e) = model_query_response(&update_sql).await {
+            if let Err(e) = SUL_DB.query(update_sql.clone()).await {
 
                 debug_model_warn!(
 
@@ -1372,8 +1405,7 @@ async fn apply_boolean_for_query(
 
         );
 
-        let existing_status: Vec<Option<String>> =
-            model_primary_db().query_take(&check_sql, 0).await?;
+        let existing_status: Vec<Option<String>> = SUL_DB.query_take(&check_sql, 0).await?;
 
         if matches!(
 
@@ -2183,6 +2215,44 @@ pub async fn apply_insts_boolean_manifold(
 
 
 
+    let filtered_refnos = filter_out_bran_refnos(refnos).await?;
+
+    if filtered_refnos.is_empty() {
+
+        return Ok(());
+
+    }
+
+
+
+    if filtered_refnos.len() != refnos.len() {
+
+        debug_model_debug!(
+
+            "实例布尔：跳过 BRAN 类型实体 {} 个（输入={} 过滤后={}）",
+
+            refnos.len().saturating_sub(filtered_refnos.len()),
+
+            refnos.len(),
+
+            filtered_refnos.len()
+
+        );
+
+    }
+
+
+
+    let refnos = filtered_refnos;
+
+    if refnos.is_empty() {
+
+        return Ok(());
+
+    }
+
+
+
     // 先用新的批量 API 筛选出存在负实体的实例
 
     let neg_mapping = query_negative_entities_batch(&refnos).await?;
@@ -2321,7 +2391,7 @@ impl BoolResultWriter for DbBoolWriter {
         if sql.trim().is_empty() {
             return Ok(());
         }
-        model_query_response(sql).await?;
+        SUL_DB.query(sql).await?;
         Ok(())
     }
 }
@@ -2357,12 +2427,8 @@ impl BoolResultWriter for SqlBoolWriter {
                 aabb_hash, aabb_json
             ));
             sqls.push(format!(
-                "DELETE FROM inst_relate_aabb WHERE in = {} AND out = aabb:⟨{}⟩;",
-                refno, aabb_hash
-            ));
-            sqls.push(format!(
-                "INSERT RELATION INTO inst_relate_aabb [{{ id: inst_relate_aabb:⟨{}⟩, in: pe:⟨{}⟩, out: aabb:⟨{}⟩ }}]",
-                refno, refno, aabb_hash
+                "DELETE [inst_relate_aabb:⟨{}⟩];INSERT RELATION INTO inst_relate_aabb [{{ id: inst_relate_aabb:⟨{}⟩, in: pe:⟨{}⟩, out: aabb:⟨{}⟩ }}]",
+                refno, refno, refno, aabb_hash
             ));
         }
         sqls.push(build_inst_relate_bool_upsert_sql(
@@ -2430,11 +2496,10 @@ fn build_cata_status_sql(
     source: &str,
 ) -> String {
     let refno_key = refno.to_pe_key();
-    // SurrealDB 3.x: `pe->inst_relate` 图遍历可能返回空，改用 WHERE in =
-    let mut sql = format!("LET $inst_info = (SELECT VALUE out FROM inst_relate WHERE in = {refno_key} LIMIT 1)[0];");
-    sql.push_str(&format!(
-        "IF $inst_info != NONE {{ LET $old_ids = SELECT VALUE id FROM inst_relate_cata_bool WHERE in = $inst_info AND source = '{source}'; DELETE $old_ids;",
-    ));
+    let mut sql = format!("LET $inst_info = (SELECT VALUE out FROM {refno_key}->inst_relate LIMIT 1)[0];");
+    sql.push_str(
+        "IF $inst_info != NONE { LET $old_ids = SELECT VALUE id FROM inst_relate_cata_bool WHERE in = $inst_info; DELETE $old_ids;",
+    );
     if let Some(mesh_id) = mesh_id {
         let mesh_key = format!("inst_geo:⟨{}⟩", mesh_id);
         sql.push_str(&format!(
@@ -2447,28 +2512,6 @@ fn build_cata_status_sql(
 
 fn bool_result_file_exists(mesh_id: &str) -> bool {
     boolean_glb_path(mesh_id).exists() || boolean_obj_path(mesh_id).exists()
-}
-
-#[inline]
-fn should_skip_bran_task(task: &BooleanTask) -> bool {
-    task.noun.as_deref() == Some("BRAN") && matches!(task.task_type, BooleanTaskType::InstNeg(_))
-}
-
-fn collect_refnos_for_db_success_prefetch(tasks: &[BooleanTask]) -> Vec<RefnoEnum> {
-    tasks
-        .iter()
-        .filter(|task| !should_skip_bran_task(task))
-        .map(|task| task.refno)
-        .collect()
-}
-
-#[inline]
-fn should_skip_by_existing_result(file_exists: bool, deferred_mode: bool, db_success: bool) -> bool {
-    if deferred_mode {
-        file_exists
-    } else {
-        file_exists && db_success
-    }
 }
 
 fn append_cata_update_sql(
@@ -2498,7 +2541,7 @@ fn append_cata_update_sql(
 
     let relation_id = refno.to_string();
     sql.push_str(&format!(
-        "DELETE FROM geo_relate WHERE in = {} AND geo_type = 'CatePos';",
+        "LET $old_geo_ids = SELECT VALUE id FROM {}->geo_relate WHERE geo_type = 'CatePos'; DELETE $old_geo_ids;",
         inst_info_record,
     ));
     sql.push_str(&format!(
@@ -2508,9 +2551,8 @@ fn append_cata_update_sql(
         mesh_id = mesh_id,
         geom_refno = pos_geom_refno,
     ));
-    // SurrealDB 3.x: `A->geo_relate` 图遍历可能返回空，改用 WHERE in =
     sql.push_str(&format!(
-        "UPDATE geo_relate SET geo_type = 'Compound', visible = false WHERE in = {} AND geom_refno = pe:⟨{}⟩ AND geo_type IN ['Pos','Compound'];",
+        "UPDATE {}->geo_relate SET geo_type = 'Compound', visible = false WHERE geom_refno = pe:⟨{}⟩ AND geo_type IN ['Pos','Compound'];",
         inst_info_record,
         pos_geom_refno,
     ));
@@ -2823,7 +2865,11 @@ async fn process_inst_task(
 async fn batch_query_bool_success_refnos(
     tasks: &[BooleanTask],
 ) -> anyhow::Result<HashSet<RefnoEnum>> {
-    let refnos = collect_refnos_for_db_success_prefetch(tasks);
+    let refnos: Vec<RefnoEnum> = tasks
+        .iter()
+        .filter(|t| t.noun.as_deref() != Some("BRAN"))
+        .map(|t| t.refno)
+        .collect();
 
     if refnos.is_empty() {
         return Ok(HashSet::new());
@@ -2841,7 +2887,7 @@ async fn batch_query_bool_success_refnos(
             "SELECT VALUE in FROM [{}] WHERE status = 'Success'",
             ids.join(",")
         );
-        match model_primary_db().query_take::<Vec<RefnoEnum>>(&sql, 0).await {
+        match SUL_DB.query_take::<Vec<RefnoEnum>>(&sql, 0).await {
             Ok(found) => {
                 for r in found {
                     success_set.insert(r);
@@ -2859,7 +2905,7 @@ async fn batch_query_bool_success_refnos(
             "SELECT VALUE in.refno FROM [{}] WHERE status = 'Success'",
             cata_ids.join(",")
         );
-        match model_primary_db().query_take::<Vec<RefnoEnum>>(&cata_sql, 0).await {
+        match SUL_DB.query_take::<Vec<RefnoEnum>>(&cata_sql, 0).await {
             Ok(found) => {
                 for r in found {
                     success_set.insert(r);
@@ -2924,12 +2970,9 @@ pub async fn run_bool_worker_from_tasks(
     let mut executable_tasks: Vec<BooleanTask> = Vec::new();
     for task in tasks {
         let refno = task.refno;
-        if should_skip_bran_task(&task) {
+        if task.noun.as_deref() == Some("BRAN") {
             report.skipped += 1;
-            *report
-                .skip_reasons
-                .entry("bran_inst_only".to_string())
-                .or_insert(0) += 1;
+            *report.skip_reasons.entry("bran".to_string()).or_insert(0) += 1;
             continue;
         }
 
@@ -2937,11 +2980,11 @@ pub async fn run_bool_worker_from_tasks(
         let mesh_id = refu64.to_string();
         if !replace_exist {
             let file_exists = bool_result_file_exists(&mesh_id);
-            let should_skip = should_skip_by_existing_result(
-                file_exists,
-                deferred_mode,
-                db_success_set.contains(&refno),
-            );
+            let should_skip = if deferred_mode {
+                file_exists
+            } else {
+                file_exists && db_success_set.contains(&refno)
+            };
             if should_skip {
                 report.skipped += 1;
                 *report
@@ -3064,75 +3107,3 @@ pub async fn run_boolean_worker_from_cache_manager(
 
 pub async fn run_boolean_worker_from_cache(cache_dir: &Path) -> anyhow::Result<usize> { unimplemented!() }
 */
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn refno(s: &str) -> RefnoEnum {
-        RefnoEnum::from(s)
-    }
-
-    fn cata_task(refno: RefnoEnum, noun: Option<&str>) -> BooleanTask {
-        BooleanTask {
-            refno,
-            noun: noun.map(ToString::to_string),
-            task_type: BooleanTaskType::CataNeg(CataNegBoolTask {
-                inst_info_id: "inst_info".to_string(),
-                boolean_groups: Vec::new(),
-                geo_data_map: HashMap::new(),
-            }),
-        }
-    }
-
-    fn inst_task(refno: RefnoEnum, noun: Option<&str>) -> BooleanTask {
-        BooleanTask {
-            refno,
-            noun: noun.map(ToString::to_string),
-            task_type: BooleanTaskType::InstNeg(InstNegBoolTask {
-                inst_world_transform: aios_core::Transform::default(),
-                pos_geos: Vec::new(),
-                neg_entities: Vec::new(),
-            }),
-        }
-    }
-
-    #[test]
-    fn bran_cata_task_should_not_be_skipped() {
-        let task = cata_task(refno("24381/145018"), Some("BRAN"));
-        assert!(!should_skip_bran_task(&task));
-    }
-
-    #[test]
-    fn bran_inst_task_should_be_skipped() {
-        let task = inst_task(refno("24381/145019"), Some("BRAN"));
-        assert!(should_skip_bran_task(&task));
-    }
-
-    #[test]
-    fn db_prefetch_should_keep_bran_cata_and_drop_bran_inst() {
-        let bran_cata = cata_task(refno("24381/145020"), Some("BRAN"));
-        let bran_inst = inst_task(refno("24381/145021"), Some("BRAN"));
-        let pipe_inst = inst_task(refno("24381/145022"), Some("PIPE"));
-
-        let refnos = collect_refnos_for_db_success_prefetch(&[bran_cata, bran_inst, pipe_inst]);
-
-        assert_eq!(refnos, vec![refno("24381/145020"), refno("24381/145022")]);
-    }
-
-    #[test]
-    fn non_deferred_skip_requires_file_and_db_success() {
-        assert!(!should_skip_by_existing_result(false, false, true));
-        assert!(!should_skip_by_existing_result(true, false, false));
-        assert!(should_skip_by_existing_result(true, false, true));
-    }
-
-    #[test]
-    fn deferred_skip_requires_file_only() {
-        assert!(!should_skip_by_existing_result(false, true, true));
-        assert!(!should_skip_by_existing_result(false, true, false));
-        assert!(should_skip_by_existing_result(true, true, false));
-    }
-}
-

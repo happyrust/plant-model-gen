@@ -703,36 +703,13 @@ async fn process_bran_hang_core_logic(
     let t3_ms = t3.elapsed().as_millis();
     println!("  [BRAN perf] 阶段3 prefetch_offline_inputs: {} ms", t3_ms);
 
-    // ── 阶段 3.5: 与 CATE 生成并行的 BRAN/TUBI 元信息预取（仅 Direct） ──
+    // ── 阶段 3.5: tubi_prefetch（已禁用） ──
+    // 原逻辑 spawn 独立 task 建立第二个 SurrealDB 连接做逐条预取（1700+ 次查询），
+    // 导致连接竞争/死锁。去掉后，阶段 6 内部的 P4 优化会在主连接上完成同样工作。
     let branch_tubi_prefetch_task: Option<
         tokio::task::JoinHandle<anyhow::Result<cata_model::BranchPrefetchResult>>,
-    > = if ctx_generate.is_offline_generate() || child_refnos.is_empty() || branch_refnos_map.is_empty()
-    {
-        None
-    } else {
-        let mut prefetch_child_refnos = child_refnos.clone();
-        prefetch_child_refnos.sort_by_key(|r| r.refno());
-        prefetch_child_refnos.dedup();
-
-        let mut prefetch_branch_refnos: Vec<RefnoEnum> =
-            branch_refnos_map.iter().map(|x| *x.key()).collect();
-        prefetch_branch_refnos.sort_by_key(|r| r.refno());
-        prefetch_branch_refnos.dedup();
-
-        println!(
-            "  [BRAN perf] 阶段3.5 spawn_tubi_prefetch: children_unique={}, branch_roots={}",
-            prefetch_child_refnos.len(),
-            prefetch_branch_refnos.len()
-        );
-
-        Some(tokio::spawn(async move {
-            cata_model::prefetch_tubi_size_and_branch_meta(
-                &prefetch_child_refnos,
-                &prefetch_branch_refnos,
-            )
-            .await
-        }))
-    };
+    > = None;
+    println!("  [BRAN perf] 阶段3.5 spawn_tubi_prefetch: 已跳过（由阶段6内部P4优化替代）");
 
     // ── 阶段 4: 生成 CATE 几何（Generate 阶段；离线时只读缓存） ──
     let t4 = Instant::now();

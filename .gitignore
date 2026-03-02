@@ -152,8 +152,16 @@ ams-8021.db
 nul
 test_output
 target
-target-check
-target-run-debug-model
-data.rdb.kv
-failed_sql_batch_*.log
 logs
+target-check
+target-run-boolean
+target-run-boolean2
+target-run-boolean3
+
+# SurrealKV 测试数据库文件
+db-data/*.skv
+db-data/version-test.skv/
+# SurrealDB 运行时
+.surreal.pid
+data/surrealkv
+target-run-debug-model

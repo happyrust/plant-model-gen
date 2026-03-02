@@ -31,12 +31,6 @@
    - 处理有 `neg_relate`/`ngmr_relate` 的实例
    - 结果: 更新 `bool_status='Success'`, `booled_id='{mesh_id}'`, `aabb=aabb:⟨hash⟩`
 
-## BRAN 过滤策略（MemoryTasks 路径）
-
-- `BRAN + CataNeg`：允许执行（按几何数据构建并运行）
-- `BRAN + InstNeg`：跳过（避免实例级 BRAN 布尔）
-- 说明：该策略用于当前 `gen_model` 的 MemoryTasks 流水线；旧路径若仍使用 `filter_out_bran_refnos`，行为可能不同。
-
 ## 重要更新 (2024-12)
 
 ### neg_relate / ngmr_relate 新结构

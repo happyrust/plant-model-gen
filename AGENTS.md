@@ -94,3 +94,55 @@ let dbnum = db_meta().get_dbnum_by_refno(refno)
 2. 或重建 scene_tree 元数据
 
 **禁止**用 ref0 值作为 dbnum 的兜底。
+
+## Cursor Cloud specific instructions
+
+### 环境概述
+
+本项目是一个 Rust nightly 项目（PDMS/E3D 3D 模型处理平台），主要包含：
+- `aios-database` CLI：解析 PDMS 数据库、生成 3D 模型
+- `web_server` 二进制：Axum HTTP 服务，端口 8080，提供 Web UI 和 REST API
+
+### 依赖结构（重要）
+
+项目依赖三个本地 sibling 仓库（通过 `Cargo.toml` 中的 `[patch]` 块引用）：
+- `/rs-core` → `aios_core` crate（从 `happyrust/rs-core` dev-3.1 分支克隆）
+- `/pdms-io-fork` → `pdms_io` + `parse_pdms_db` crate（`pdms_io` 为 stub 实现，`parse_pdms_db` 从 `happyrust/aios-parse-pdms` dev-3.1 克隆）
+
+多个 GitHub 上的 fork 仓库（`indextree`、`rstar`、`calamine`、`cavalier_contours`、`id_tree`、`rust-ploop-processor`）已被删除。环境通过 git URL 重定向到 `/opt/cargo-mirrors/` 下的本地镜像来解决：
+- `~/.gitconfig` 中配置了 `url.*.insteadOf` 规则
+- 本地镜像基于上游仓库 + 所需特性修改（如 indextree 的 rkyv 支持、rstar 的 serde 特性）
+- `ploop-rs` 为 stub 实现
+
+### 构建命令
+
+```bash
+# 必须设置 C++ 编译器（clang 默认无法找到 libstdc++ 头文件）
+export CXX=g++-13 CC=gcc-13
+
+# 检查 lib（默认 features）
+CARGO_TARGET_DIR="target-check" cargo check --lib
+
+# 构建 web_server（需要额外启用 mqtt feature 以解决现有 cfg gate 缺失问题）
+cargo build --bin web_server --no-default-features --features "ws,sqlite-index,surreal-save,web_server,mqtt,gen_model,manifold,kv-rocksdb"
+
+# 运行测试
+CARGO_TARGET_DIR="target-check" cargo test --lib
+```
+
+### 已知问题
+
+1. **web_server feature 编译需要 mqtt**：`sync_control_handlers.rs` 和 `remote_runtime.rs` 引用了 `#[cfg(feature = "mqtt")]` 门控的函数但自身未加门控，构建 web_server 需同时启用 `mqtt` feature。
+2. **缺失源文件**：`src/bin/meili_reindex.rs` 和 `src/fast_model/export_model/duckdb_exporter.rs` 不存在，`cargo fmt` 会报 warning。
+3. **SurrealDB 未运行**：大部分需要数据库的测试和功能会报 connection refused，这是预期的。Web 服务器可正常启动并提供 UI。
+4. **PDMS 数据不可用**：`pdms_io` 为 stub 实现，涉及真实 PDMS 文件 I/O 的功能会返回错误。
+
+### 运行 web_server
+
+```bash
+export CXX=g++-13 CC=gcc-13
+./target/debug/web_server
+# 访问 http://localhost:8080
+```
+
+服务器会报数据库连接失败的错误日志，但 Web UI 和 API 端点可正常使用。

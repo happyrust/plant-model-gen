@@ -65,7 +65,8 @@ batch_insert_sql_cnt = 100
 # ============================================================
 # SurrealDB 后端配置 —— 本地 RocksDB 嵌入式
 # ============================================================
-surreal_backend = "rocksdb"
+rocksdb_mode = "file"
+surrealkv_mode = "ws"
 surreal_local_path = "D:/backup-dbs/ams-8020.db"
 
 # surrealdb数据库配置（WS 模式不使用，但字段必须存在）

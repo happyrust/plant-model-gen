@@ -42,8 +42,15 @@ enable_sqlite_rtree = false
 gen_model_batch_size = 16
 
 # 缓存/双路径对比配置
-use_surrealdb = false
-use_cache = true
+use_surrealdb = true
+use_cache = false
+
+# ============================================================
+# SurrealDB 后端配置 —— 本地 RocksDB 嵌入式
+# ============================================================
+rocksdb_mode = "file"
+surrealkv_mode = "ws"
+surreal_local_path = "/Volumes/DPC/work/db-data/ams-8020.db"
 
 # IndexTree 默认管线调优配置
 index_tree_max_concurrent_targets = 6

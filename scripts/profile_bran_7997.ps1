@@ -228,7 +228,7 @@ try {
   $toml = Upsert-TomlLine $toml "use_surrealdb" "true"
   $toml = Upsert-TomlLine $toml "use_cache" "false"
   # 嵌入式 RocksDB 后端（跳过 WebSocket，直接读本地数据目录）
-  $toml = Upsert-TomlLine $toml "surreal_backend" "`"rocksdb`""
+  $toml = Upsert-TomlLine $toml "rocksdb_mode" "`"file`""
   $toml = Upsert-TomlLine $toml "surreal_local_path" "`"D:/backup-dbs/ams-8020.db`""
   # 只跑指定 dbnum，noun 参数不再生效（统一标准管线）
   $toml = Upsert-TomlLine $toml "manual_db_nums" ("[{0}]" -f $Dbnum)

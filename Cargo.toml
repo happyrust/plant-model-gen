@@ -153,7 +153,7 @@ surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1", 
 surrealdb-types = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1" }
 
 
-pdms_io = { git = "https://github.com/happyrust/pdms-io.git", branch = "dev-3.1", features = ["sync-archive"] }
+pdms_io = { git = "https://github.com/happyrust/pdms-io.git", branch = "dev-3.1" }
 
 # gen-xkt = { path = "../gen-xkt" }
 

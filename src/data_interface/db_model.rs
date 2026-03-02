@@ -20,6 +20,7 @@ use once_cell::sync::Lazy;
 use parry3d::bounding_volume::{Aabb, BoundingVolume};
 use parry3d::math::Vector;
 use parry3d::query::{Ray, RayCast};
+#[cfg(feature = "mqtt")]
 use pdms_io::sync::clone::{CloneOptions, execute_clone};
 // use pdms_io::sync::clone::{execute_clone, CloneOptions};
 use pdms_io::watch::PdmsWatcher;
@@ -62,6 +63,7 @@ impl AiosDBManager {
     }
 
     //开启定时同步更新任务
+    #[cfg(feature = "mqtt")]
     pub async fn run_e3d_clone_bg_task(mgr: Arc<AiosDBManager>) -> anyhow::Result<()> {
         dbg!("定时同步数据任务开启");
         let forever = tokio::spawn(async move {
@@ -77,6 +79,7 @@ impl AiosDBManager {
     }
 
     //增量从服务器里的数据clone到本地
+    #[cfg(feature = "mqtt")]
     pub async fn exec_delta_clone_remotes(
         watcher: &PdmsWatcher,
         sync_msg: SyncE3dFileMsg,
@@ -186,6 +189,7 @@ impl AiosDBManager {
 
     ///另外将里面可能有关联的db，也要同步检查后一下？？
     ///处理mqtt的消息, 通知需要处理的db 文件名，然后对应的归属地也需要发送
+    #[cfg(feature = "mqtt")]
     pub async fn poll_sync_e3d_mqtt_events(watcher: Arc<PdmsWatcher>) {
         let db_option = get_db_option();
         let location = db_option.location.clone();
@@ -244,6 +248,7 @@ impl AiosDBManager {
     }
 
     ///处理mqtt的消息，带重连退避（单位ms）
+    #[cfg(feature = "mqtt")]
     pub async fn poll_sync_e3d_mqtt_events_with_backoff(
         watcher: Arc<PdmsWatcher>,
         initial_backoff_ms: u64,

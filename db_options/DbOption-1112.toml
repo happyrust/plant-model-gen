@@ -44,13 +44,8 @@ gen_model_batch_size = 16
 # 缓存/双路径对比配置
 use_surrealdb = true
 use_cache = false
-
-# ============================================================
-# SurrealDB 后端配置 —— 本地 RocksDB 嵌入式
-# ============================================================
-rocksdb_mode = "file"
-surrealkv_mode = "ws"
-surreal_local_path = "/Volumes/DPC/work/db-data/ams-8020.db"
+surreal_backend = "rocksdb"
+surreal_local_path = "D:/backup-dbs/ams-8020.db"
 
 # IndexTree 默认管线调优配置
 index_tree_max_concurrent_targets = 6
@@ -59,7 +54,7 @@ index_tree_batch_size = 200
 # 启用的 noun 类别/具体 noun 名称
 # 可选值: "cate", "loop", "prim" 或具体 noun 名称如 "BRAN", "PANE"
 # 空 vec 表示启用所有类别（默认行为）
-index_tree_enabled_target_types = []
+index_tree_enabled_target_types = ["BRAN"]
 index_tree_excluded_target_types = []
 
 # 调试模式：限制每种 Noun 类型的处理数量

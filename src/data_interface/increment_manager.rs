@@ -18,6 +18,7 @@ use notify::{RecursiveMode, Watcher};
 use parse_pdms_db::parse::parse_db_basic_info;
 use pdms_io::defines::DbPageBasicInfo;
 use pdms_io::io::{EleOperationData, EleOperationDetail, PdmsIO};
+#[cfg(feature = "mqtt")]
 use pdms_io::sync::compress::{CompressOptions, execute_compress};
 // use pdms_io::sync::compress::{execute_compress, CompressOptions};
 use pdms_io::watch::PdmsWatcher;
@@ -634,15 +635,20 @@ impl AiosDBManager {
                                             format!("assets/archives/{}.cba", file_name).into();
                                         // dbg!(&output);
 
-                                        let compress_opt = CompressOptions::new(
-                                            path.clone(),
-                                            output.clone(),
-                                            "assets/temp",
-                                        );
-                                        let file_hash = execute_compress(compress_opt)
-                                            .await
-                                            .unwrap()
-                                            .to_string();
+                                        #[cfg(feature = "mqtt")]
+                                        let file_hash = {
+                                            let compress_opt = CompressOptions::new(
+                                                path.clone(),
+                                                output.clone(),
+                                                "assets/temp",
+                                            );
+                                            execute_compress(compress_opt)
+                                                .await
+                                                .unwrap()
+                                                .to_string()
+                                        };
+                                        #[cfg(not(feature = "mqtt"))]
+                                        let file_hash = String::new();
                                         // dbg!(&file_hash);
                                         #[cfg(feature = "web_server")]
                                         {

@@ -139,9 +139,8 @@ parry2d = { version = "0.25.0", features = ["serde-serialize"] }
 
 # parse_pdms_db = { git = "https://github.com/happyrust/aios-parse-pdms" }
 
-# 统一使用 `pdms-io-fork` 内置版本，避免多份 crate 漂移。
-
-parse_pdms_db = { path = "../pdms-io-fork/crates/parse_pdms_db" }
+# 与 pdms_io-old 保持同源，避免 lockfile package collision。
+parse_pdms_db = { path = "../pdms-io-old/crates/parse_pdms_db" }
 
 # 使用本地 rs-core，便于联调与修复（例如 to_pe_key 的 SurrealQL record id 拼接问题）。
 

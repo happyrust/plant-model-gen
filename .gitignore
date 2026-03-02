@@ -133,6 +133,9 @@ data/test_db/
 # Specific large binaries
 web_server
 aios-database
+!/src/web_server/
+!/src/web_server/output_instances_files.rs
+!/src/web_server/model_runtime.rs
 
 # Lock files (optional - uncomment if you want to ignore them)
 # Cargo.lock
@@ -165,3 +168,5 @@ db-data/version-test.skv/
 .surreal.pid
 data/surrealkv
 target-run-debug-model
+data.rdb.kv
+failed_sql_batch_*.log

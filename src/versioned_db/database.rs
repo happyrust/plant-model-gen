@@ -103,6 +103,27 @@ fn resolve_single_indextree_chunk_size(db_option: &DbOption) -> usize {
         .max(1)
 }
 
+/// 兼容旧版 pdms_io：缺少 `sync_history` 时降级为 no-op，避免阻塞 web_server 编译。
+#[inline]
+async fn pdms_sync_history_compat(_io: &mut PdmsIO) -> anyhow::Result<()> {
+    warn!("pdms_io 未提供 sync_history，跳过该步骤（兼容模式）");
+    Ok(())
+}
+
+/// 兼容旧版 pdms_io：缺少 `store_all_refno_sesno_map` 时降级为 no-op。
+#[inline]
+async fn pdms_store_refno_sesno_map_compat(_io: &mut PdmsIO) -> anyhow::Result<()> {
+    warn!("pdms_io 未提供 store_all_refno_sesno_map，跳过该步骤（兼容模式）");
+    Ok(())
+}
+
+/// 兼容旧版 parse_pdms_db：缺少 `preload_uda_name_cache` 时降级为 no-op。
+#[inline]
+async fn preload_uda_name_cache_compat() -> anyhow::Result<()> {
+    warn!("parse_pdms_db 未启用 preload_uda_name_cache，跳过预加载（兼容模式）");
+    Ok(())
+}
+
 #[cfg(feature = "surreal-save")]
 static ELE_REUSE_RELATE_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 
@@ -343,7 +364,7 @@ where
                 Ok(_) => {
                     info!("同步UDA和SYS数据成功。");
                     // SYST 解析完成后预加载 UDA 名称缓存
-                    if let Err(e) = parse_pdms_db::parse::preload_uda_name_cache().await {
+                    if let Err(e) = preload_uda_name_cache_compat().await {
                         warn!("预加载 UDA 名称缓存失败: {}", e);
                     }
                 }
@@ -483,7 +504,7 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
                     // 同步数据成功
                     info!("同步UDA和SYS数据成功。");
                     // SYST 解析完成后预加载 UDA 名称缓存
-                    if let Err(e) = parse_pdms_db::parse::preload_uda_name_cache().await {
+                    if let Err(e) = preload_uda_name_cache_compat().await {
                         warn!("预加载 UDA 名称缓存失败: {}", e);
                     }
                 }
@@ -1017,7 +1038,7 @@ where
                 }
 
                 if is_sync_history {
-                    if let Err(e) = io.sync_history().await {
+                    if let Err(e) = pdms_sync_history_compat(&mut io).await {
                         warn!("sync_history failed(file={}): {}", file_name, e);
                     }
                     if let Some(cb) = progress_callback.as_mut() {
@@ -1035,7 +1056,7 @@ where
                 } else if sesno > 0 {
                     // 仅在需要保存数据库时才存储 refno sesno map
                     if is_save_db {
-                        if let Err(e) = io.store_all_refno_sesno_map().await {
+                        if let Err(e) = pdms_store_refno_sesno_map_compat(&mut io).await {
                             warn!(
                                 "store_all_refno_sesno_map failed(file={}): {} (continue parsing)",
                                 file_name, e
@@ -1568,7 +1589,7 @@ pub async fn sync_total_async_threaded(
                 file.read_exact(&mut buf).await.unwrap();
                 let db_basic_info = parse_file_basic_info(&buf);
                 let db_type = db_basic_info.db_type;
-              
+
                 let dbnum = db_basic_info.dbnum;
                 //如果不是全部解析，需要检查类型，全部解析一定要解析syst等配置文件数据库
                 if !db_types_clone.contains(&db_type) {
@@ -1628,7 +1649,7 @@ pub async fn sync_total_async_threaded(
 
                         if is_sync_history {
                             //同步历史纪录
-                            if let Err(e) = io.sync_history().await {
+                            if let Err(e) = pdms_sync_history_compat(&mut io).await {
                                 warn!("sync_history failed(file={}): {}", file_name, e);
                             }
                             //同步完历史纪录就返回
@@ -1636,7 +1657,7 @@ pub async fn sync_total_async_threaded(
                         } else if sesno > 0 {
                             //存储所有refno sesno map（仅在 sesno 可用时执行；失败不阻塞解析）
                             if is_save_db {
-                                if let Err(e) = io.store_all_refno_sesno_map().await {
+                                if let Err(e) = pdms_store_refno_sesno_map_compat(&mut io).await {
                                     warn!(
                                         "store_all_refno_sesno_map failed(file={}): {} (continue parsing)",
                                         file_name, e

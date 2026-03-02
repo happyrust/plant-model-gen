@@ -162,8 +162,10 @@ fn build_delete_inst_relate_by_in_sql(refnos: &[RefnoEnum], chunk_size: usize) -
     let mut sqls = Vec::new();
     for chunk in refnos.chunks(chunk_size.max(1)) {
         let in_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
+        // SurrealDB 3.x: `[pe:⟨X⟩]->inst_relate` 图遍历可能返回空，
+        // 改用 `DELETE FROM inst_relate WHERE in IN [...]` 确保正确删除。
         sqls.push(format!(
-            "LET $ids = SELECT VALUE id FROM [{in_keys}]->inst_relate;\nDELETE $ids;"
+            "DELETE FROM inst_relate WHERE in IN [{in_keys}];"
         ));
     }
     sqls
@@ -183,8 +185,10 @@ fn build_delete_geo_relate_by_inst_info_ids_sql(
             .map(|id| format!("inst_info:⟨{}⟩", id))
             .collect::<Vec<_>>()
             .join(",");
+        // SurrealDB 3.x: `[inst_info:⟨X⟩]->geo_relate` 图遍历可能返回空，
+        // 改用 `DELETE FROM geo_relate WHERE in IN [...]` 确保正确删除。
         sqls.push(format!(
-            "LET $ids = SELECT VALUE id FROM [{in_keys}]->geo_relate;\nDELETE $ids;"
+            "DELETE FROM geo_relate WHERE in IN [{in_keys}];"
         ));
     }
     sqls
@@ -904,8 +908,9 @@ pub async fn save_instance_data_optimize(
                 if n > 0 {
                     for idx in (0..n).step_by(CHUNK_SIZE) {
                         let end = (idx + CHUNK_SIZE).min(n);
+                        // SurrealDB 3.x: 图遍历可能返回空，改用 WHERE in IN
                         let delete_stmt = format!(
-                            "LET $ids = SELECT VALUE id FROM [{}]->inst_relate_aabb;\nDELETE $ids;",
+                            "DELETE FROM inst_relate_aabb WHERE in IN [{}];",
                             ($ins)[idx..end].join(",")
                         );
                         let insert_stmt = format!(

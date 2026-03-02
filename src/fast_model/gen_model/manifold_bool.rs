@@ -1157,7 +1157,7 @@ pub async fn apply_cata_neg_boolean_manifold(
 
                 // 先删除该实例下全部旧 CatePos（兼容历史 id 规则，且避免同实例重复导出）
                 update_sql.push_str(&format!(
-                    "LET $old_geo_ids = SELECT VALUE id FROM {}->geo_relate WHERE geo_type = 'CatePos'; DELETE $old_geo_ids;",
+                    "DELETE FROM geo_relate WHERE in = {} AND geo_type = 'CatePos';",
                     &g.inst_info_id.to_raw(),
                 ));
 
@@ -1191,9 +1191,10 @@ pub async fn apply_cata_neg_boolean_manifold(
 
                 // 并设置 visible=false，使其在查询时被排除
 
+                // SurrealDB 3.x: `A->geo_relate` 图遍历可能返回空，改用 WHERE in =
                 let hide_original_sql = format!(
 
-                    "UPDATE {}->geo_relate SET geo_type = 'Compound', visible = false WHERE geom_refno = pe:⟨{}⟩ AND geo_type IN ['Pos','Compound'];",
+                    "UPDATE geo_relate SET geo_type = 'Compound', visible = false WHERE in = {} AND geom_refno = pe:⟨{}⟩ AND geo_type IN ['Pos','Compound'];",
 
                     &g.inst_info_id.to_raw(),
 
@@ -2356,8 +2357,12 @@ impl BoolResultWriter for SqlBoolWriter {
                 aabb_hash, aabb_json
             ));
             sqls.push(format!(
-                "DELETE [inst_relate_aabb:⟨{}⟩];INSERT RELATION INTO inst_relate_aabb [{{ id: inst_relate_aabb:⟨{}⟩, in: pe:⟨{}⟩, out: aabb:⟨{}⟩ }}]",
-                refno, refno, refno, aabb_hash
+                "DELETE FROM inst_relate_aabb WHERE in = {} AND out = aabb:⟨{}⟩;",
+                refno, aabb_hash
+            ));
+            sqls.push(format!(
+                "INSERT RELATION INTO inst_relate_aabb [{{ id: inst_relate_aabb:⟨{}⟩, in: pe:⟨{}⟩, out: aabb:⟨{}⟩ }}]",
+                refno, refno, aabb_hash
             ));
         }
         sqls.push(build_inst_relate_bool_upsert_sql(
@@ -2425,10 +2430,11 @@ fn build_cata_status_sql(
     source: &str,
 ) -> String {
     let refno_key = refno.to_pe_key();
-    let mut sql = format!("LET $inst_info = (SELECT VALUE out FROM {refno_key}->inst_relate LIMIT 1)[0];");
-    sql.push_str(
-        "IF $inst_info != NONE { LET $old_ids = SELECT VALUE id FROM inst_relate_cata_bool WHERE in = $inst_info; DELETE $old_ids;",
-    );
+    // SurrealDB 3.x: `pe->inst_relate` 图遍历可能返回空，改用 WHERE in =
+    let mut sql = format!("LET $inst_info = (SELECT VALUE out FROM inst_relate WHERE in = {refno_key} LIMIT 1)[0];");
+    sql.push_str(&format!(
+        "IF $inst_info != NONE {{ LET $old_ids = SELECT VALUE id FROM inst_relate_cata_bool WHERE in = $inst_info AND source = '{source}'; DELETE $old_ids;",
+    ));
     if let Some(mesh_id) = mesh_id {
         let mesh_key = format!("inst_geo:⟨{}⟩", mesh_id);
         sql.push_str(&format!(
@@ -2492,7 +2498,7 @@ fn append_cata_update_sql(
 
     let relation_id = refno.to_string();
     sql.push_str(&format!(
-        "LET $old_geo_ids = SELECT VALUE id FROM {}->geo_relate WHERE geo_type = 'CatePos'; DELETE $old_geo_ids;",
+        "DELETE FROM geo_relate WHERE in = {} AND geo_type = 'CatePos';",
         inst_info_record,
     ));
     sql.push_str(&format!(
@@ -2502,8 +2508,9 @@ fn append_cata_update_sql(
         mesh_id = mesh_id,
         geom_refno = pos_geom_refno,
     ));
+    // SurrealDB 3.x: `A->geo_relate` 图遍历可能返回空，改用 WHERE in =
     sql.push_str(&format!(
-        "UPDATE {}->geo_relate SET geo_type = 'Compound', visible = false WHERE geom_refno = pe:⟨{}⟩ AND geo_type IN ['Pos','Compound'];",
+        "UPDATE geo_relate SET geo_type = 'Compound', visible = false WHERE in = {} AND geom_refno = pe:⟨{}⟩ AND geo_type IN ['Pos','Compound'];",
         inst_info_record,
         pos_geom_refno,
     ));

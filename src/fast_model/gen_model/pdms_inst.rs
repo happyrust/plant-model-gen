@@ -741,7 +741,7 @@ pub async fn save_instance_data_optimize(
 
         // inst_relate 不再保存 world_trans；世界变换统一从 pe_transform 获取。
         let relate_sql = format!(
-            "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, zone_refno: fn::find_ancestor_type({1}, 'ZONE'), spec_value: (fn::find_ancestor_type({1}, 'ZONE').owner.spec_value) ?? 0, dt: fn::ses_date({1}), has_cata_neg: {3}, solid: {4}, owner_refno: {5}, owner_type: '{6}'}}",
+            "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, zone_refno: NONE, spec_value: 0, dt: fn::ses_date({1}), has_cata_neg: {3}, solid: {4}, owner_refno: {5}, owner_type: '{6}'}}",
             key.to_inst_relate_key(),
             key.to_pe_key(),
             info.id_str(),
@@ -1430,8 +1430,8 @@ pub struct InstRelatePrecomputed {
 impl InstRelatePrecomputed {
     /// 从 TreeIndex 本地缓存 + 批量 DB 读取构建预计算缓存。
     ///
-    /// - zone_refno: 纯本地 TreeIndex 查询（零 DB 访问）
-    /// - spec_value: 批量读 PE 表（一次 DB 读）
+    /// - zone_refno: 使用默认值 NONE（已禁用 TreeIndex 查询）
+    /// - spec_value: 使用默认值 0（已禁用 DB 查询）
     /// - dt: 批量读 ses 表（一次 DB 读）
     pub async fn build(refnos: &[RefnoEnum]) -> Self {
         let mut zone_map: HashMap<RefnoEnum, Option<String>> = HashMap::new();
@@ -1442,83 +1442,14 @@ impl InstRelatePrecomputed {
             return Self { zone_map, spec_map, dt_map };
         }
 
-        // 1. zone_refno: 从 TreeIndex 本地查询（零 DB 访问）
-        let mut zone_owner_refnos: HashSet<RefnoEnum> = HashSet::new();
-
+        // 1. zone_refno: 使用默认值 NONE（已禁用查询）
         for &refno in refnos {
-            let manager = match TreeIndexManager::resolve_dbnum_for_refno(refno) {
-                Ok(dbnum) => TreeIndexManager::with_default_dir(vec![dbnum]),
-                Err(_) => {
-                    zone_map.insert(refno, None);
-                    continue;
-                }
-            };
-            let zones = manager.query_ancestors_filtered(refno, &["ZONE"]);
-            if let Some(zone) = zones.first() {
-                zone_map.insert(refno, Some(zone.to_pe_key()));
-                // 收集 zone 的 owner（用于后续查 spec_value）
-                let zone_refno_val = zone.refno();
-                if let Ok(index) = manager.load_index(
-                    TreeIndexManager::resolve_dbnum_for_refno(*zone).unwrap_or(0),
-                ) {
-                    if let Some(meta) = index.node_meta(zone_refno_val) {
-                        let owner_refno = RefnoEnum::from(meta.owner);
-                        zone_owner_refnos.insert(owner_refno);
-                    }
-                }
-            } else {
-                zone_map.insert(refno, None);
-            }
+            zone_map.insert(refno, None);
         }
 
-        // 2. spec_value: 批量读 PE 表获取 zone owner 的 spec_value
-        let mut owner_spec_map: HashMap<String, i64> = HashMap::new();
-        if !zone_owner_refnos.is_empty() {
-            let pe_keys: Vec<String> = zone_owner_refnos.iter().map(|r| r.to_pe_key()).collect();
-            let sql = format!(
-                "SELECT record::id(id) AS rid, spec_value FROM pe WHERE id IN [{}];",
-                pe_keys.join(",")
-            );
-            match model_primary_db().query_response(&sql).await {
-                Ok(mut resp) => {
-                    let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-                    for row in rows {
-                        if let (Some(rid), spec) = (
-                            row.get("rid").and_then(|v| v.as_str()),
-                            row.get("spec_value").and_then(|v| v.as_i64()).unwrap_or(0),
-                        ) {
-                            owner_spec_map.insert(rid.to_string(), spec);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[precompute] 批量读取 spec_value 失败: {}", e);
-                }
-            }
-        }
-
-        // 为每个 refno 查找对应的 spec_value
+        // 2. spec_value: 使用默认值 0（已禁用查询）
         for &refno in refnos {
-            let spec = if let Some(Some(zone_key)) = zone_map.get(&refno) {
-                // 从 TreeIndex 查 zone 的 owner
-                let manager = match TreeIndexManager::resolve_dbnum_for_refno(refno) {
-                    Ok(dbnum) => TreeIndexManager::with_default_dir(vec![dbnum]),
-                    Err(_) => { spec_map.insert(refno, 0); continue; }
-                };
-                let zones = manager.query_ancestors_filtered(refno, &["ZONE"]);
-                if let Some(zone) = zones.first() {
-                    let zone_refno_val = zone.refno();
-                    if let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(*zone) {
-                        if let Ok(index) = manager.load_index(dbnum) {
-                            if let Some(meta) = index.node_meta(zone_refno_val) {
-                                let owner_key = format!("{}", meta.owner);
-                                owner_spec_map.get(&owner_key).copied().unwrap_or(0)
-                            } else { 0 }
-                        } else { 0 }
-                    } else { 0 }
-                } else { 0 }
-            } else { 0 };
-            spec_map.insert(refno, spec);
+            spec_map.insert(refno, 0);
         }
 
         // 3. dt (ses_date): 批量读 PE 的 dbnum+sesno，再批量读 ses 表

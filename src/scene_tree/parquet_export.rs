@@ -45,7 +45,7 @@ pub async fn export_scene_tree_parquet(dbnum: u32, output_dir: &Path) -> Result<
             generated,
             dbnum,
             geo_type,
-            fn::default_name(type::thing('pe', record::id(id))) ?? '' as name
+            fn::default_name(type::record('pe', record::id(id))) ?? '' as name
         FROM scene_node
         WHERE dbnum = {}"#,
         dbnum

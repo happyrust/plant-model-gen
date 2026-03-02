@@ -276,6 +276,8 @@ mode = "file"
 path = "D:/backup-dbs/ams-8020.db"
 
 # SurrealKV 连接配置 (模型数据写入)
+# enabled = false 时模型数据写回主 SurrealDB，避免跨库 pe 表缺失
 [surrealkv]
+enabled = false
 mode = "file"
 path = "D:/backup-dbs/ams-8020.db.kv"

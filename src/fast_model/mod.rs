@@ -267,7 +267,7 @@ pub static EXIST_MESH_GEO_HASHES: Lazy<DashMap<String, Aabb>> = Lazy::new(|| Das
 
 pub async fn preload_mesh_cache() -> anyhow::Result<()> {
 
-    use aios_core::SUL_DB;
+    use aios_core::model_primary_db;
 
     use aios_core::types::PlantAabb;
 
@@ -305,7 +305,7 @@ pub async fn preload_mesh_cache() -> anyhow::Result<()> {
 
     
 
-    let mut response = SUL_DB.query(sql).await?;
+    let mut response = model_primary_db().query(sql).await?;
 
     let rows: Vec<GeoCacheRow> = response.take(0)?;
 

@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use aios_core::Datetime;
 use aios_core::pdms_types::TOTAL_CATA_GEO_NOUN_NAMES;
-use aios_core::{RefnoEnum, SUL_DB, get_pe};
+use aios_core::{RefnoEnum, project_primary_db, get_pe};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -77,7 +77,7 @@ pub async fn get_changes_at_sesno(sesno: u32) -> anyhow::Result<IncrGeoUpdateLog
         sesno
     );
 
-    let mut response = SUL_DB.query(sql).await?;
+    let mut response = project_primary_db().query(sql).await?;
     let raw_values: Vec<JsonValue> = response.take(0)?;
     let changes: Vec<ElementChange> = raw_values
         .into_iter()
@@ -140,7 +140,7 @@ pub async fn get_changes_between_sesnos(
         start_sesno, end_sesno
     );
 
-    let mut response = SUL_DB.query(sql).await?;
+    let mut response = project_primary_db().query(sql).await?;
     let raw_values: Vec<JsonValue> = response.take(0)?;
     let changes: Vec<ElementChange> = raw_values
         .into_iter()
@@ -211,7 +211,7 @@ pub async fn has_changes_at_sesno(sesno: u32) -> anyhow::Result<bool> {
         sesno
     );
 
-    let mut response = SUL_DB.query(sql).await?;
+    let mut response = project_primary_db().query(sql).await?;
     let count: Option<i64> = response.take("count")?;
 
     Ok(count.unwrap_or(0) > 0)

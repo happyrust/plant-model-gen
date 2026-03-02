@@ -92,7 +92,6 @@ surreal_script_dir = "./surreal"
 
 
 #调试选项
-save_model_mesh_to_graph_db = true
 need_sync_refno_basic = false       #是否重新生成 refno_basic 缓存
 reset_mdb_project = false           #是否重新生成 mdb 缓存
 only_update_dbinfo = false

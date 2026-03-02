@@ -94,7 +94,7 @@ use aios_core::{DbOptionSurrealExt, connect_local_rocksdb};
 
 use aios_core::{
 
-    SUL_DB, SurrealQueryExt, build_cate_relate, init_surreal_with_retry, init_test_surreal,
+    project_primary_db, SurrealQueryExt, build_cate_relate, init_surreal_with_retry, init_test_surreal,
 
 };
 

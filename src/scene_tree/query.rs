@@ -2,7 +2,7 @@
 //!
 //! 提供生成状态查询、AABB 更新等功能
 
-use aios_core::{RefnoEnum, RefU64, SUL_DB, SurrealQueryExt};
+use aios_core::{RefnoEnum, RefU64, project_primary_db, SurrealQueryExt};
 use anyhow::Result;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,7 @@ pub async fn query_generation_status(
         id_list
     );
 
-    let result: Vec<SceneNodeStatus> = SUL_DB.query_take(&sql, 0).await?;
+    let result: Vec<SceneNodeStatus> = project_primary_db().query_take(&sql, 0).await?;
     Ok(result)
 }
 
@@ -61,7 +61,7 @@ pub async fn filter_ungenerated_geo_nodes(
         id_list
     );
 
-    let result: Vec<i64> = SUL_DB.query_take(&sql, 0).await?;
+    let result: Vec<i64> = project_primary_db().query_take(&sql, 0).await?;
     Ok(result)
 }
 
@@ -78,7 +78,7 @@ pub async fn mark_as_generated(ids: &[i64]) -> Result<()> {
         .join(",");
 
     let sql = format!("UPDATE [{}] SET generated = true", id_list);
-    SUL_DB.query_response(&sql).await?;
+    project_primary_db().query_response(&sql).await?;
     Ok(())
 }
 
@@ -110,7 +110,7 @@ pub async fn query_ungenerated_leaves(root_id: i64) -> Result<Vec<i64>> {
                 "SELECT VALUE record::id(out) FROM contains WHERE in IN [{}]",
                 in_list
             );
-            let children: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+            let children: Vec<i64> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
 
             for child_id in children {
                 if visited.insert(child_id) {
@@ -140,7 +140,7 @@ pub async fn query_ungenerated_leaves(root_id: i64) -> Result<Vec<i64>> {
             "SELECT VALUE record::id(id) FROM [{}] WHERE has_geo = true AND is_leaf = true AND generated = false",
             id_list
         );
-        let mut part: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let mut part: Vec<i64> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
         result.append(&mut part);
     }
 
@@ -153,7 +153,7 @@ pub async fn query_children_ids(parent_id: i64, limit: usize) -> Result<Vec<i64>
     let sql = format!(
         "SELECT VALUE record::id(out) FROM contains WHERE in = scene_node:{parent_id} LIMIT {limit}"
     );
-    let result: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+    let result: Vec<i64> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
     Ok(result)
 }
 
@@ -166,7 +166,7 @@ pub async fn query_ancestor_ids(start_id: i64, limit: usize) -> Result<Vec<i64>>
     let mut current = start_id;
     for _ in 0..limit {
         let sql = format!("SELECT VALUE parent FROM scene_node:{current} LIMIT 1");
-        let parents: Vec<Option<i64>> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let parents: Vec<Option<i64>> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
         let Some(Some(parent_id)) = parents.into_iter().next() else {
             break;
         };
@@ -202,7 +202,7 @@ pub async fn update_scene_node_aabb(
             ));
         }
         if !sql.is_empty() {
-            SUL_DB.query_response(&sql).await?;
+            project_primary_db().query_response(&sql).await?;
         }
     }
     Ok(())
@@ -227,6 +227,6 @@ pub async fn query_generated_refnos(
         id_list
     );
 
-    let ids: Vec<i64> = SUL_DB.query_take(&sql, 0).await?;
+    let ids: Vec<i64> = project_primary_db().query_take(&sql, 0).await?;
     Ok(ids.into_iter().map(|id| RefnoEnum::from(RefU64(id as u64))).collect())
 }

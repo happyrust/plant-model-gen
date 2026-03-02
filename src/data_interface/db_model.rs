@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aios_core::SUL_DB;
+use aios_core::project_primary_db;
 use aios_core::accel_tree::acceleration_tree::{AccelerationTree, RStarBoundingBox};
 use aios_core::file_helper::collect_db_dirs;
 use aios_core::get_db_option;
@@ -217,7 +217,7 @@ impl AiosDBManager {
                                 //检查是否和本地的location一致，如果不一致，才发生更新
                                 if sync_e3d.location != location {
                                     //自己本地也要保存, todo 后续还是要配置哪些dbs，哪个地方能修改，哪个地方是不能改的
-                                    SUL_DB
+                                    project_primary_db()
                                         .query(format!(
                                             "INSERT IGNORE INTO e3d_sync {} ",
                                             serde_json::to_string(&sync_e3d).unwrap()
@@ -279,7 +279,7 @@ impl AiosDBManager {
                         Incoming(Packet::Publish(p)) => {
                             let sync_e3d = SyncE3dFileMsg::from(p.payload.to_vec());
                             if sync_e3d.location != location {
-                                let _ = SUL_DB
+                                let _ = project_primary_db()
                                     .query(format!(
                                         "INSERT IGNORE INTO e3d_sync {} ",
                                         serde_json::to_string(&sync_e3d).unwrap()

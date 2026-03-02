@@ -62,7 +62,7 @@ use aios_core::tool::math_tool::to_pdms_vec_str;
 
 use aios_core::{
 
-    HASH_PSEUDO_ATT_MAPS, NamedAttrMap, NamedAttrValue, RefU64, RefnoEnum, SUL_DB, gen_aabb_hash, gen_plant_transform_hash,
+    HASH_PSEUDO_ATT_MAPS, NamedAttrMap, NamedAttrValue, RefU64, RefnoEnum, model_primary_db, gen_aabb_hash, gen_plant_transform_hash,
 
 };
 
@@ -8073,7 +8073,7 @@ async fn gen_cata_geos_inner(
 
             let t_query = Instant::now();
 
-            if let Err(e) = SUL_DB.query(sql).await {
+            if let Err(e) = model_primary_db().query(sql).await {
 
                 debug_model!("[BRAN_TUBI] 写入 tubi_relate 失败: {}", e);
 

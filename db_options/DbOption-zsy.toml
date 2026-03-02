@@ -121,9 +121,19 @@ file_server_host = "http://localhost:8082/assets/archives"
 
 surreal_script_dir = "../rs-core/resource/surreal"
 
+# SurrealDB 连接配置 (PE/属性/输入数据读取)
+# 离线模型生成使用 file 模式 (嵌入式 RocksDB)
+[surrealdb]
+mode = "file"
+path = "data.rdb"
+
+# SurrealKV 连接配置 (模型数据写入)
+# 离线模型生成使用 file 模式 (嵌入式 SurrealKV)
+[surrealkv]
+mode = "file"
+path = "data.kv"
 
 #调试选项
-save_model_mesh_to_graph_db = true
 need_sync_refno_basic = false       #是否重新生成 refno_basic 缓存
 reset_mdb_project = false           #是否重新生成 mdb 缓存
 only_update_dbinfo = false

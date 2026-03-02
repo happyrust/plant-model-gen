@@ -10,7 +10,7 @@ use aios_core::pe::SPdmsElement;
 use aios_core::tool::db_tool::db1_dehash;
 use aios_core::version::{backup_data, backup_owner_relate};
 use aios_core::{RefU64Vec, get_db_option};
-use aios_core::{SUL_DB, clear_all_caches};
+use aios_core::{project_primary_db, clear_all_caches};
 use futures::StreamExt;
 use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
@@ -233,7 +233,7 @@ impl AiosDBManager {
             //更新 sesno 到 db_file_info 中的sql
             let sql = format!("UPDATE db_file_info:{} SET sesno={};", file_name, end_sesno);
             //执行更新
-            SUL_DB.query(sql).await.unwrap();
+            project_primary_db().query(sql).await.unwrap();
         }
 
         Ok(true)
@@ -253,7 +253,7 @@ impl AiosDBManager {
     ///
     /// 当数据库查询失败时会返回错误
     async fn query_latest_sesno_by_file_name(file_name: &str) -> anyhow::Result<u32> {
-        let mut response = SUL_DB
+        let mut response = project_primary_db()
             .query(format!(
                 r#"
                 select value sesno from only db_file_info:{} limit 1;
@@ -281,7 +281,7 @@ impl AiosDBManager {
     async fn query_latest_sesno_by_dbnum(dbnum: u32) -> anyhow::Result<u32> {
         // 从dbnum_info_table中查询对应dbnum的最大sesno
         // 使用更高效的查询，直接获取该dbnum的最大sesno值
-        let mut response = SUL_DB
+        let mut response = project_primary_db()
             .query(format!(
                 r#"
                 math::max(array::flatten([
@@ -588,7 +588,7 @@ impl AiosDBManager {
                                         file_name,
                                         &file_hash
                                     );
-                                    let mut response = SUL_DB.query(&sql).await.unwrap();
+                                    let mut response = project_primary_db().query(&sql).await.unwrap();
                                     let id = response.take::<Vec<String>>(0).unwrap();
                                     if id.is_empty() {
                                         println!("发现新增 db 文件，推送：{}", &file_name);
@@ -690,7 +690,7 @@ impl AiosDBManager {
                                         );
                                         // dbg!(&sql);
                                         // println!("sql is {}", &sql);
-                                        let mut response = SUL_DB.query(&sql).await.unwrap();
+                                        let mut response = project_primary_db().query(&sql).await.unwrap();
                                         // dbg!(&response);
                                         let id = response.take::<Vec<String>>(0).unwrap();
                                         // dbg!(id.len());
@@ -720,7 +720,7 @@ impl AiosDBManager {
                                 SyncE3dFileMsg::new(notify_file_names, notify_file_hashes);
                             //自己本地也要保存
                             // todo 后续还是要配置哪些dbs，哪个地方能修改，哪个地方是不能改的
-                            SUL_DB
+                            project_primary_db()
                                 .query(format!(
                                     "INSERT IGNORE INTO e3d_sync {} ",
                                     serde_json::to_string(&payload).unwrap()

@@ -1,4 +1,4 @@
-use aios_core::{RefnoEnum, RefU64, SUL_DB, SurrealQueryExt};
+use aios_core::{RefnoEnum, RefU64, project_primary_db, SurrealQueryExt};
 use axum::{
     Router,
     extract::{Path, Query, State},
@@ -622,7 +622,7 @@ async fn get_site_nodes(
                 "SELECT VALUE record::id(out) FROM contains WHERE in IN [{}]",
                 in_list
             );
-            let children: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+            let children: Vec<i64> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
 
             for child_id in children {
                 if all_ids.len() >= MAX_NODES {
@@ -660,7 +660,7 @@ async fn get_site_nodes(
             id_list
         );
 
-        let rows: Vec<SceneNodeRow> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let rows: Vec<SceneNodeRow> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
 
         for row in rows {
             let refno = RefnoEnum::from(RefU64(row.id as u64));

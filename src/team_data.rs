@@ -2,7 +2,7 @@ use crate::consts::TEAM_DATA_TABLE;
 #[cfg(feature = "sql")]
 use aios_core::db_pool::get_project_pool;
 use aios_core::error::init_query_error;
-use aios_core::{RefU64, SUL_DB, init_test_surreal, query_filter_ancestors};
+use aios_core::{RefU64, project_primary_db, init_test_surreal, query_filter_ancestors};
 use aios_core::{get_db_option, get_default_name, get_named_attmap};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -96,7 +96,7 @@ pub async fn sync_team_data() -> anyhow::Result<()> {
 /// 查询 DB 类型的所有参考号
 async fn query_all_db_refnos() -> anyhow::Result<Vec<RefU64>> {
     let sql = "SELECT value REFNO FROM DB".to_string();
-    let mut result = SUL_DB.query(sql).await?;
+    let mut result = project_primary_db().query(sql).await?;
     let refnos: Vec<RefU64> = result.take(0)?;
     Ok(refnos)
 }

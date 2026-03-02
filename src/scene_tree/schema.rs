@@ -2,7 +2,7 @@
 //!
 //! 定义 scene_node 和 contains 关系表的 Schema
 
-use aios_core::{SUL_DB, SurrealQueryExt};
+use aios_core::{project_primary_db, SurrealQueryExt};
 use anyhow::Result;
 
 /// 初始化 Scene Tree 表结构
@@ -46,7 +46,7 @@ DEFINE INDEX IF NOT EXISTS idx_geo_type ON TABLE scene_node COLUMNS geo_type;
 DEFINE TABLE IF NOT EXISTS contains TYPE RELATION FROM scene_node TO scene_node;
 "#;
 
-    SUL_DB.query_response(sql).await?;
+    project_primary_db().query_response(sql).await?;
     println!("[scene_tree] Schema 初始化完成");
     Ok(())
 }

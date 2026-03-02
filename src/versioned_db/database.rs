@@ -1,5 +1,5 @@
 #[cfg(feature = "surreal-save")]
-use aios_core::SUL_DB;
+use aios_core::project_primary_db;
 use log::{info, warn, error, debug};
 
 // 内存KV数据库全局连接（从 aios_core 导入）
@@ -131,30 +131,30 @@ static ELE_REUSE_RELATE_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 async fn ensure_ele_reuse_relate_relation_schema() {
     ELE_REUSE_RELATE_SCHEMA_INIT
         .get_or_init(|| async {
-            let _ = SUL_DB.query("REMOVE TABLE ele_reuse_relate;").await;
+            let _ = project_primary_db().query("REMOVE TABLE ele_reuse_relate;").await;
 
-            let _ = SUL_DB
+            let _ = project_primary_db()
                 .query("DEFINE TABLE ele_reuse_relate TYPE RELATION;")
                 .await;
 
-            let _ = SUL_DB
+            let _ = project_primary_db()
                 .query("REMOVE FIELD in ON TABLE ele_reuse_relate;")
                 .await;
-            let _ = SUL_DB
+            let _ = project_primary_db()
                 .query("REMOVE FIELD out ON TABLE ele_reuse_relate;")
                 .await;
-            let _ = SUL_DB
+            let _ = project_primary_db()
                 .query("DEFINE FIELD in ON TABLE ele_reuse_relate TYPE record<pe>;")
                 .await;
-            let _ = SUL_DB
+            let _ = project_primary_db()
                 .query("DEFINE FIELD out ON TABLE ele_reuse_relate TYPE record<inst_info>;")
                 .await;
-            let _ = SUL_DB
+            let _ = project_primary_db()
                 .query(
                     "DEFINE INDEX idx_ele_reuse_relate_in ON TABLE ele_reuse_relate FIELDS in UNIQUE;",
                 )
                 .await;
-            let _ = SUL_DB
+            let _ = project_primary_db()
                 .query(
                     "DEFINE INDEX idx_ele_reuse_relate_out ON TABLE ele_reuse_relate FIELDS out;",
                 )
@@ -270,7 +270,7 @@ where
         // 解析前移除EVENT，防止大量的event触发
         info!("正在移除dbnum_event以提高解析性能...");
         let remove_event_sql = "REMOVE EVENT update_dbnum_event ON pe;";
-        match SUL_DB.query(remove_event_sql).await {
+        match project_primary_db().query(remove_event_sql).await {
             Ok(_) => info!("成功移除update_dbnum_event"),
             Err(e) => info!("移除update_dbnum_event失败（可能不存在）: {:?}", e),
         }
@@ -434,7 +434,7 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
         // 解析前移除EVENT，防止大量的event触发
         info!("正在移除dbnum_event以提高解析性能...");
         let remove_event_sql = "REMOVE EVENT update_dbnum_event ON pe;";
-        match SUL_DB.query(remove_event_sql).await {
+        match project_primary_db().query(remove_event_sql).await {
             Ok(_) => info!("成功移除update_dbnum_event"),
             Err(e) => info!("移除update_dbnum_event失败（可能不存在）: {:?}", e),
         }
@@ -607,7 +607,7 @@ DEFINE EVENT OVERWRITE update_dbnum_event ON pe WHEN $event = "CREATE" OR $event
         };
     "#;
 
-    SUL_DB.query(event_sql).await?;
+    project_primary_db().query(event_sql).await?;
     Ok(())
 }
 
@@ -747,7 +747,7 @@ where
 
                                 // 保存到主数据库
                                 let mut response =
-                                    SUL_DB.query(&sql).await.expect("insert pes failed");
+                                    project_primary_db().query(&sql).await.expect("insert pes failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -774,7 +774,7 @@ where
                                 );
 
                                 // 保存到主数据库
-                                SUL_DB.query(&sql).await.expect("insert pe_owner failed");
+                                project_primary_db().query(&sql).await.expect("insert pe_owner failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -802,7 +802,7 @@ where
                                 );
 
                                 // 保存到主数据库
-                                SUL_DB.query(&sql).await.expect("insert ele_reuse_relate failed");
+                                project_primary_db().query(&sql).await.expect("insert ele_reuse_relate failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -828,7 +828,7 @@ where
                                     type_name,
                                     jsons.join(",")
                                 );
-                                SUL_DB.query(sql).await.expect("insert att failed");
+                                project_primary_db().query(sql).await.expect("insert att failed");
                             }
                         }
                         #[cfg(not(feature = "surreal-save"))]
@@ -838,7 +838,7 @@ where
                         #[cfg(feature = "surreal-save")]
                         SenderJsonsData::DbnumInfoUpdate(sqls) => {
                             for sql in sqls {
-                                SUL_DB.query(sql).await.expect("update dbnum_info failed");
+                                project_primary_db().query(sql).await.expect("update dbnum_info failed");
                             }
                         }
                         #[cfg(not(feature = "surreal-save"))]
@@ -849,7 +849,7 @@ where
                         SenderJsonsData::PartitionedPEJson { table_name, sql } => {
                             // 保存简化PE数据到分表
                             log::debug!("插入到分表 {}", table_name);
-                            SUL_DB
+                            project_primary_db()
                                 .query(&sql)
                                 .await
                                 .expect("insert partitioned pe failed");
@@ -1354,7 +1354,7 @@ pub async fn sync_total_async_threaded(
 
                                 // 保存到主数据库
                                 let mut response =
-                                    SUL_DB.query(&sql).await.expect("insert pes failed");
+                                    project_primary_db().query(&sql).await.expect("insert pes failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -1381,7 +1381,7 @@ pub async fn sync_total_async_threaded(
                                 );
 
                                 // 保存到主数据库
-                                SUL_DB.query(&sql).await.expect("insert pe_owner failed");
+                                project_primary_db().query(&sql).await.expect("insert pe_owner failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -1409,7 +1409,7 @@ pub async fn sync_total_async_threaded(
                                 );
 
                                 // 保存到主数据库
-                                SUL_DB.query(&sql).await.expect("insert ele_reuse_relate failed");
+                                project_primary_db().query(&sql).await.expect("insert ele_reuse_relate failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -1434,7 +1434,7 @@ pub async fn sync_total_async_threaded(
                                     format!("INSERT IGNORE INTO {} [{}]", table, atts.join(","));
 
                                 // 保存到主数据库
-                                SUL_DB.query(&sql).await.expect("insert atts failed");
+                                project_primary_db().query(&sql).await.expect("insert atts failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -1457,7 +1457,7 @@ pub async fn sync_total_async_threaded(
                             if !updates.is_empty() {
                                 // 使用UPSERT语法来更新或插入dbnum_info_table记录
                                 for update in updates {
-                                    SUL_DB
+                                    project_primary_db()
                                         .query(update.as_str())
                                         .await
                                         .expect("upsert dbnum_info failed");
@@ -1484,7 +1484,7 @@ pub async fn sync_total_async_threaded(
                         SenderJsonsData::PartitionedPEJson { table_name, sql } => {
                             // 保存简化PE数据到分表
                             log::debug!("插入到分表 {}", table_name);
-                            SUL_DB
+                            project_primary_db()
                                 .query(&sql)
                                 .await
                                 .expect("insert partitioned pe failed");
@@ -1634,7 +1634,7 @@ pub async fn sync_total_async_threaded(
                             //     INSERT INTO db_file_info (id, db_type, sesno, dbnum, dt) VALUES ('{0}', '{1}', {2}, {3}, '{4}');",
                             //     &file_name, db_type, sesno, dbnum, dt.and_utc().to_rfc3339()
                             // );
-                            // SUL_DB.query(&sql).await.expect("save db_info failed");
+                            // project_primary_db().query(&sql).await.expect("save db_info failed");
                             // if sync_versioned {
                             //     continue;
                             // }
@@ -2047,7 +2047,7 @@ pub async fn sync_total_async_threaded(
         //执行保存db_info sql
         // let db_info_sql = db_info_sql.join(";");
         // if !db_info_sql.is_empty() {
-        //     SUL_DB.query(&db_info_sql).await.expect("save db_info failed");
+        //     project_primary_db().query(&db_info_sql).await.expect("save db_info failed");
         // }
     })
     .await

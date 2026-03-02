@@ -6,7 +6,7 @@
 //! - `/api/pdms/type-info?refno=...`：返回 noun / owner_noun
 //! - `/api/pdms/children?refno=...`：返回 pe->owns 的子节点（按 order_index）
 
-use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
+use aios_core::{RefnoEnum, project_primary_db, SurrealQueryExt};
 use axum::{
     Router,
     extract::Query,
@@ -216,7 +216,7 @@ async fn get_children(Query(query): Query<RefnoQuery>) -> Result<Response, Statu
                     "#
                 );
 
-                let mut rows: Vec<TubiRow> = match SUL_DB.query_take(&sql, 0).await {
+                let mut rows: Vec<TubiRow> = match project_primary_db().query_take(&sql, 0).await {
                     Ok(v) => v,
                     Err(e) => {
                         return Ok(json_utf8(ChildrenResponse {
@@ -257,7 +257,7 @@ async fn get_children(Query(query): Query<RefnoQuery>) -> Result<Response, Statu
         "SELECT record::id(out) as child, order_index FROM pe:⟨{refno_key}⟩->owns ORDER BY order_index"
     );
 
-    let rows: Vec<ChildRow> = match SUL_DB.query_take(&sql, 0).await {
+    let rows: Vec<ChildRow> = match project_primary_db().query_take(&sql, 0).await {
         Ok(v) => v,
         Err(e) => {
             return Ok(json_utf8(ChildrenResponse {

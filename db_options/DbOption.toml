@@ -125,7 +125,6 @@ surreal_script_dir = "../rs-core/resource/surreal"
 
 
 #调试选项
-save_model_mesh_to_graph_db = true
 need_sync_refno_basic = false       #是否重新生成 refno_basic 缓存
 reset_mdb_project = false           #是否重新生成 mdb 缓存
 only_update_dbinfo = false
@@ -270,3 +269,13 @@ workflow_sync_path = "/api/workflow/sync"
 workflow_delete_path = "/api/workflow/delete"
 auth_secret = "shared-review-secret"
 timeout_seconds = 15
+
+# SurrealDB 连接配置 (PE/属性/输入数据)
+[surrealdb]
+mode = "file"
+path = "D:/backup-dbs/ams-8020.db"
+
+# SurrealKV 连接配置 (模型数据写入)
+[surrealkv]
+mode = "file"
+path = "D:/backup-dbs/ams-8020.db.kv"

@@ -11,7 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use aios_core::SUL_DB;
+use aios_core::project_primary_db;
 
 // ============================================================================
 // Request/Response Structs
@@ -165,7 +165,7 @@ async fn query_collision_for_refnos(refnos: &[String]) -> Result<Vec<CollisionIt
         return Ok(vec![]);
     }
     let sql = "SELECT * FROM collision_events WHERE object_one IN $refnos OR object_two IN $refnos LIMIT 50";
-    let mut resp = SUL_DB.query(sql)
+    let mut resp = project_primary_db().query(sql)
         .bind(("refnos", refnos.to_vec()))
         .await?;
     let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
@@ -267,7 +267,7 @@ async fn get_collision_data(
     };
 
     // 查询碰撞数据
-    let mut query = SUL_DB.query(&sql);
+    let mut query = project_primary_db().query(&sql);
     if let Some(ref refno) = params.refno {
         query = query.bind(("refno", refno.clone()));
     }

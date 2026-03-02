@@ -1,4 +1,4 @@
-use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
+use aios_core::{RefnoEnum, project_primary_db, SurrealQueryExt};
 use aios_core::parsed_data::CateAxisParam;
 use aios_core::shape::pdms_shape::RsVec3;
 use aios_core::vec3_pool::{decompress_ptset, CateAxisParamCompact};
@@ -141,7 +141,7 @@ async fn get_ptset_by_refno(
     );
 
     // 使用 query_take 获取压缩格式的 ptset 数据
-    let query_result: Option<CompressedPtsetQueryResult> = match SUL_DB.query_take(&sql, 0).await {
+    let query_result: Option<CompressedPtsetQueryResult> = match project_primary_db().query_take(&sql, 0).await {
         Ok(result) => result,
         Err(e) => {
             return Ok(Json(PtsetResponse {

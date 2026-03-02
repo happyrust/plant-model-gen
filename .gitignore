@@ -43,6 +43,7 @@ surreal-8010.kv
 data/test_db/
 data/surrealkv/
 data.rdb.kv
+data.rdb/
 cmd/ams-8009-test.db/
 scripts/db/ams-8009-test.db/
 scripts/db/ams-demo.db/

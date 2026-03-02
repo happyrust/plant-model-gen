@@ -1,4 +1,4 @@
-use aios_core::{RefnoEnum, SUL_DB};
+use aios_core::{RefnoEnum, project_primary_db};
 use dashmap::DashMap;
 use itertools::Itertools;
 
@@ -30,7 +30,7 @@ pub async fn manual_update_aabbs(replace_exist: bool) -> anyhow::Result<()> {
         let sql = format!(
             "SELECT value in.id AS refno FROM inst_relate LIMIT {QUERY_CHUNK_SIZE} START {offset}"
         );
-        let mut response = SUL_DB.query(&sql).await?;
+        let mut response = project_primary_db().query(&sql).await?;
 
         let refnos: Vec<RefnoEnum> = response.take(0).unwrap();
         if refnos.is_empty() {

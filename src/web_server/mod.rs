@@ -944,7 +944,7 @@ pub async fn start_web_server_with_config(
 
 async fn auto_update_scheduler(state: AppState) {
     use crate::web_server::models::{IncrementalUpdateRequest, UpdateType};
-    use aios_core::SUL_DB;
+    use aios_core::project_primary_db;
     use axum::{Json, extract::State as AxumState};
     use std::time::Duration;
 
@@ -954,7 +954,7 @@ async fn auto_update_scheduler(state: AppState) {
 
         // 读取 auto_update 的记录
         let sql = "SELECT dbnum, file_name, sesno, project, auto_update, updating FROM dbnum_info_table WHERE auto_update = true";
-        let rows = match SUL_DB.query(sql).await {
+        let rows = match project_primary_db().query(sql).await {
             Ok(mut resp) => resp.take::<Vec<serde_json::Value>>(0).unwrap_or_default(),
             Err(_) => continue,
         };

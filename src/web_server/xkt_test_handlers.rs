@@ -351,14 +351,14 @@ pub struct GetRefnoNameResponse {
 /// 获取参考号的全名称
 pub async fn get_refno_name(Query(params): Query<GetRefnoNameRequest>) -> impl IntoResponse {
     // 使用全局 SurrealDB 实例查询
-    use aios_core::SUL_DB;
+    use aios_core::project_primary_db;
 
     let query = format!(
         "SELECT default_full_name FROM pe WHERE refno = '{}'",
         params.refno
     );
 
-    match SUL_DB.query(&query).await {
+    match project_primary_db().query(&query).await {
         Ok(mut result) => {
             let records: Vec<serde_json::Value> = result.take(0).unwrap_or_default();
 

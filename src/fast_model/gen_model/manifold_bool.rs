@@ -30,7 +30,7 @@ use aios_core::{
 
 };
 
-use aios_core::{RefnoEnum, SUL_DB, utils::RecordIdExt};
+use aios_core::{RefnoEnum, utils::RecordIdExt, model_primary_db};
 
 use aios_core::geometry::{EleGeosInfo, EleInstGeosData, GeoBasicType};
 
@@ -82,7 +82,7 @@ async fn filter_out_bran_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<Refn
 
     );
 
-    SUL_DB.query_take(&sql, 0).await
+    model_primary_db().query_take(&sql, 0).await
 
 }
 
@@ -1317,7 +1317,7 @@ pub async fn apply_cata_neg_boolean_manifold(
 
 
 
-            if let Err(e) = SUL_DB.query(update_sql.clone()).await {
+            if let Err(e) = model_primary_db().query(update_sql.clone()).await {
 
                 debug_model_warn!(
 
@@ -1405,7 +1405,7 @@ async fn apply_boolean_for_query(
 
         );
 
-        let existing_status: Vec<Option<String>> = SUL_DB.query_take(&check_sql, 0).await?;
+        let existing_status: Vec<Option<String>> = model_primary_db().query_take(&check_sql, 0).await?;
 
         if matches!(
 
@@ -2391,7 +2391,7 @@ impl BoolResultWriter for DbBoolWriter {
         if sql.trim().is_empty() {
             return Ok(());
         }
-        SUL_DB.query(sql).await?;
+        model_primary_db().query(sql).await?;
         Ok(())
     }
 }
@@ -2887,7 +2887,7 @@ async fn batch_query_bool_success_refnos(
             "SELECT VALUE in FROM [{}] WHERE status = 'Success'",
             ids.join(",")
         );
-        match SUL_DB.query_take::<Vec<RefnoEnum>>(&sql, 0).await {
+        match model_primary_db().query_take::<Vec<RefnoEnum>>(&sql, 0).await {
             Ok(found) => {
                 for r in found {
                     success_set.insert(r);
@@ -2905,7 +2905,7 @@ async fn batch_query_bool_success_refnos(
             "SELECT VALUE in.refno FROM [{}] WHERE status = 'Success'",
             cata_ids.join(",")
         );
-        match SUL_DB.query_take::<Vec<RefnoEnum>>(&cata_sql, 0).await {
+        match model_primary_db().query_take::<Vec<RefnoEnum>>(&cata_sql, 0).await {
             Ok(found) => {
                 for r in found {
                     success_set.insert(r);

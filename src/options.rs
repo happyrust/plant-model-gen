@@ -157,7 +157,7 @@ pub struct DbOptionExt {
     /// 延迟写入模式：模型生成阶段不写 SurrealDB，所有 SQL 输出到 .surql 文件。
     ///
     /// 启用后：
-    /// - save_instance_data 写入 .surql 文件而非 SUL_DB
+    /// - save_instance_data 写入 .surql 文件而非 project_primary_db()
     /// - 跳过 init_model_tables / reconcile_neg_relate / boolean / aabb 写入
     /// - 生成完成后可通过 --import-sql 导入
     #[serde(default)]

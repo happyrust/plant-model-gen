@@ -15,7 +15,7 @@
 #[cfg(all(feature = "gen_model", not(target_arch = "wasm32")))]
 mod tests {
     use aios_core::{
-        RefnoEnum, RefU64, SUL_DB, SurrealQueryExt,
+        RefnoEnum, RefU64, project_primary_db, SurrealQueryExt,
     };
     use crate::scene_tree;
 
@@ -186,7 +186,7 @@ mod tests {
             TEST_DBNO
         );
 
-        match SUL_DB.query(&sql).await {
+        match project_primary_db().query(&sql).await {
             Ok(mut resp) => {
                 let results: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
                 println!("✓ 查询成功，geo_type 分布:");
@@ -231,11 +231,11 @@ mod tests {
             TEST_DBNO
         );
 
-        let pos_count: i64 = SUL_DB.query_take(&sql_pos, 0).await
+        let pos_count: i64 = project_primary_db().query_take(&sql_pos, 0).await
             .map(|v: Vec<i64>| v.first().copied().unwrap_or(0))
             .unwrap_or(0);
 
-        let neg_count: i64 = SUL_DB.query_take(&sql_neg, 0).await
+        let neg_count: i64 = project_primary_db().query_take(&sql_neg, 0).await
             .map(|v: Vec<i64>| v.first().copied().unwrap_or(0))
             .unwrap_or(0);
 

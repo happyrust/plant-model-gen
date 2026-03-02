@@ -13,7 +13,7 @@ mod tests {
     use aios_core::{
         RefnoEnum,
         RecordId,
-        SUL_DB,
+        project_primary_db,
         SurrealQueryExt,
         get_db_option,
         init_surreal,
@@ -90,7 +90,7 @@ mod tests {
             pe_transform_id
         );
         let mut trans_ids: Vec<String> =
-            SUL_DB.query_take(&trans_id_sql, 0).await.unwrap_or_default();
+            project_primary_db().query_take(&trans_id_sql, 0).await.unwrap_or_default();
         let trans_id = trans_ids
             .pop()
             .context("未找到 pe_transform.world_trans 记录")?;
@@ -100,7 +100,7 @@ mod tests {
             pe_transform_id
         );
         let mut trans_values: Vec<Value> =
-            SUL_DB.query_take(&trans_value_sql, 0).await.unwrap_or_default();
+            project_primary_db().query_take(&trans_value_sql, 0).await.unwrap_or_default();
         let trans_value = trans_values
             .pop()
             .context("未找到 world_trans.d 数据")?;
@@ -127,20 +127,20 @@ mod tests {
             "SELECT VALUE count() FROM trans WHERE id = {} GROUP ALL LIMIT 1",
             new_trans_id
         );
-        let counts: Vec<i64> = SUL_DB.query_take(&exists_sql, 0).await.unwrap_or_default();
+        let counts: Vec<i64> = project_primary_db().query_take(&exists_sql, 0).await.unwrap_or_default();
         let new_trans_created = counts.first().copied().unwrap_or(0) == 0;
 
         let insert_sql = format!(
             "INSERT IGNORE INTO trans [{{'id':{}, 'd':{}}}];",
             new_trans_id, trans_json
         );
-        SUL_DB.query(&insert_sql).await?;
+        project_primary_db().query(&insert_sql).await?;
 
         let update_sql = format!(
             "UPDATE {} SET world_trans = {};",
             pe_transform_id, new_trans_id
         );
-        SUL_DB.query(&update_sql).await?;
+        project_primary_db().query(&update_sql).await?;
 
         update_inst_relate_aabbs_by_refnos(&[refno], true).await?;
 
@@ -158,12 +158,12 @@ mod tests {
             "UPDATE {} SET world_trans = {};",
             backup.pe_transform_id, backup.old_trans_id
         );
-        SUL_DB.query(&update_sql).await?;
+        project_primary_db().query(&update_sql).await?;
         update_inst_relate_aabbs_by_refnos(&[backup.refno], true).await?;
 
         if backup.new_trans_created {
             let delete_sql = format!("DELETE {};", backup.new_trans_id);
-            SUL_DB.query(&delete_sql).await?;
+            project_primary_db().query(&delete_sql).await?;
         }
         Ok(())
     }
@@ -176,7 +176,7 @@ mod tests {
             pane_refno.to_pe_key()
         );
         let rows: Vec<(RecordId, String)> =
-            SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+            project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
 
         let mut room_num = String::new();
         let mut within_refnos = HashSet::new();
@@ -195,7 +195,7 @@ mod tests {
             "SELECT VALUE count() FROM room_relate WHERE `in` = {} GROUP ALL LIMIT 1",
             panel_refno.to_pe_key()
         );
-        let counts: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let counts: Vec<i64> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
         counts.first().copied().unwrap_or(0)
     }
 
@@ -204,7 +204,7 @@ mod tests {
             "SELECT VALUE count() FROM room_relate WHERE `out` = {} GROUP ALL LIMIT 1",
             component_refno.to_pe_key()
         );
-        let counts: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let counts: Vec<i64> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
         counts.first().copied().unwrap_or(0)
     }
 
@@ -218,7 +218,7 @@ mod tests {
             component_refno.to_pe_key(),
             room_num_escaped
         );
-        let counts: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let counts: Vec<i64> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
         counts.first().copied().unwrap_or(0)
     }
 
@@ -227,7 +227,7 @@ mod tests {
             "SELECT VALUE count() FROM inst_relate WHERE `in` = {} GROUP ALL LIMIT 1",
             refno.to_pe_key()
         );
-        let counts: Vec<i64> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let counts: Vec<i64> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
         counts.first().copied().unwrap_or(0)
     }
 
@@ -237,7 +237,7 @@ mod tests {
             "SELECT VALUE array::last(string::split(NAME, '-')) FROM FRMW WHERE REFNO = {}",
             frmw_refno.refno().0
         );
-        let room_nums: Vec<String> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let room_nums: Vec<String> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
         let room_num = room_nums.first().cloned().unwrap_or_default();
         if room_num.is_empty() {
             return Err(anyhow::anyhow!("未能从 FRMW.NAME 解析房间号: {}", frmw_refno));
@@ -282,7 +282,7 @@ mod tests {
             "LET $ids = SELECT VALUE id FROM [{}]->room_relate;\nDELETE $ids;",
             panel_refno.to_pe_key()
         );
-        SUL_DB.query(&sql).await?;
+        project_primary_db().query(&sql).await?;
         Ok(())
     }
 
@@ -310,7 +310,7 @@ mod tests {
         }
 
         let batch_sql = sql_statements.join("\n");
-        SUL_DB.query(&batch_sql).await?;
+        project_primary_db().query(&batch_sql).await?;
         Ok(())
     }
 
@@ -397,7 +397,7 @@ mod tests {
                 "SELECT VALUE room_num FROM {}<-room_panel_relate LIMIT 1;",
                 panel_refno_anchor.to_pe_key()
             );
-            let rows: Vec<String> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+            let rows: Vec<String> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
             if let Some(v) = rows.first() {
                 room_num = v.clone();
             }
@@ -520,7 +520,7 @@ mod tests {
                 panel_refno_anchor.to_pe_key(),
                 elbow_refno.to_pe_key()
             );
-            SUL_DB.query(&delete_sql).await?;
+            project_primary_db().query(&delete_sql).await?;
 
             let relation_id = format!("{}_{}", panel_refno_anchor, elbow_refno);
             let relate_sql = format!(
@@ -530,14 +530,14 @@ mod tests {
                 elbow_refno.to_pe_key(),
                 room_num_escaped
             );
-            SUL_DB.query(&relate_sql).await?;
+            project_primary_db().query(&relate_sql).await?;
 
             let check_sql = format!(
                 "SELECT VALUE room_num FROM room_relate WHERE `in` = {} AND out = {} LIMIT 1;",
                 panel_refno_anchor.to_pe_key(),
                 elbow_refno.to_pe_key()
             );
-            let rows: Vec<String> = SUL_DB.query_take(&check_sql, 0).await.unwrap_or_default();
+            let rows: Vec<String> = project_primary_db().query_take(&check_sql, 0).await.unwrap_or_default();
             anyhow::ensure!(
                 rows.first().map(|s| s.as_str()) == Some(room_num.as_str()),
                 "写库校验失败：room_relate 未找到或 room_num 不匹配：panel={} elbow={} expect_room_num={} got={:?}",
@@ -573,7 +573,7 @@ mod tests {
             "SELECT REFNO, OWNER, noun, NAME FROM FRMW WHERE REFNO = {}",
             frmw_refno.refno().0
         );
-        let frmw_info: Vec<serde_json::Value> = SUL_DB.query_take(&frmw_sql, 0).await?;
+        let frmw_info: Vec<serde_json::Value> = project_primary_db().query_take(&frmw_sql, 0).await?;
         if let Some(info) = frmw_info.first() {
             println!("   FRMW 信息: {}", serde_json::to_string_pretty(info)?);
         }
@@ -584,7 +584,7 @@ mod tests {
             "SELECT REFNO, OWNER, noun, NAME FROM pe WHERE REFNO = {}",
             pipe_refno.refno().0
         );
-        let pipe_info: Vec<serde_json::Value> = SUL_DB.query_take(&pipe_sql, 0).await?;
+        let pipe_info: Vec<serde_json::Value> = project_primary_db().query_take(&pipe_sql, 0).await?;
         if let Some(info) = pipe_info.first() {
             println!("   管道信息: {}", serde_json::to_string_pretty(info)?);
         }
@@ -600,7 +600,7 @@ mod tests {
             "#,
             frmw_refno.to_pe_key()
         );
-        let panels: Vec<Vec<RefnoEnum>> = SUL_DB.query_take(&panels_sql, 0).await.unwrap_or_default();
+        let panels: Vec<Vec<RefnoEnum>> = project_primary_db().query_take(&panels_sql, 0).await.unwrap_or_default();
         if let Some(panel_list) = panels.first() {
             println!("   找到 {} 个面板", panel_list.len());
             for (i, panel) in panel_list.iter().take(5).enumerate() {
@@ -638,7 +638,7 @@ mod tests {
             "#,
             frmw_refno.to_pe_key()
         );
-        let frmw_insts: Vec<serde_json::Value> = SUL_DB.query_take(&frmw_inst_sql, 0).await.unwrap_or_default();
+        let frmw_insts: Vec<serde_json::Value> = project_primary_db().query_take(&frmw_inst_sql, 0).await.unwrap_or_default();
         println!("   FRMW inst_relate 数量: {}", frmw_insts.len());
         if let Some(inst) = frmw_insts.first() {
             println!("   FRMW AABB: {:?}", inst.get("world_aabb"));
@@ -655,7 +655,7 @@ mod tests {
             "#,
             pipe_refno.to_pe_key()
         );
-        let pipe_insts: Vec<serde_json::Value> = SUL_DB.query_take(&pipe_inst_sql, 0).await.unwrap_or_default();
+        let pipe_insts: Vec<serde_json::Value> = project_primary_db().query_take(&pipe_inst_sql, 0).await.unwrap_or_default();
         println!("   管道 inst_relate 数量: {}", pipe_insts.len());
         if let Some(inst) = pipe_insts.first() {
             println!("   管道 AABB: {:?}", inst.get("world_aabb"));
@@ -727,7 +727,7 @@ mod tests {
             "#,
             frmw_refno.to_pe_key()
         );
-        let panels: Vec<Vec<RefnoEnum>> = SUL_DB.query_take(&panels_sql, 0).await.unwrap_or_default();
+        let panels: Vec<Vec<RefnoEnum>> = project_primary_db().query_take(&panels_sql, 0).await.unwrap_or_default();
         
         let panel_refnos: Vec<RefnoEnum> = panels.into_iter().flatten().collect();
         println!("📋 找到 {} 个面板", panel_refnos.len());
@@ -831,7 +831,7 @@ mod tests {
             "SELECT VALUE array::last(string::split(NAME, '-')) FROM FRMW WHERE REFNO = {}",
             frmw_refno.refno().0
         );
-        let room_nums: Vec<String> = SUL_DB.query_take(&room_num_sql, 0).await.unwrap_or_default();
+        let room_nums: Vec<String> = project_primary_db().query_take(&room_num_sql, 0).await.unwrap_or_default();
         let room_num = room_nums.first().cloned().unwrap_or_default();
         if room_num.is_empty() {
             return Err(anyhow::anyhow!("未能解析房间号，无法执行重建"));
@@ -862,7 +862,7 @@ mod tests {
             "SELECT VALUE count() FROM room_relate WHERE out = {} AND room_num = '{}' GROUP ALL LIMIT 1",
             tee_key, room_num_sql_escaped
         );
-        let counts: Vec<i64> = SUL_DB.query_take(&verify_sql, 0).await.unwrap_or_default();
+        let counts: Vec<i64> = project_primary_db().query_take(&verify_sql, 0).await.unwrap_or_default();
         let count = counts.first().copied().unwrap_or(0);
         println!("📊 room_relate 记录数: {}", count);
 

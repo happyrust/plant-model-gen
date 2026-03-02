@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
+use aios_core::{RefnoEnum, model_primary_db, SurrealQueryExt};
 use aios_core::Transform;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -414,7 +414,7 @@ pub async fn get_world_transforms_cache_first_batch(
             "#
         );
 
-        let rows: Vec<PeWorldMatrixRow> = SUL_DB.query_take(&sql, 0).await?;
+        let rows: Vec<PeWorldMatrixRow> = model_primary_db().query_take(&sql, 0).await?;
         for row in rows {
             let Some(r) = row.refno else { continue };
             let Some(m) = row.matrix else { continue };

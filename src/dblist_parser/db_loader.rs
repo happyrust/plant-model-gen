@@ -2,7 +2,7 @@
 //!
 //! 将解析的 PDMS 元素数据加载到 SurrealDB 内存数据库中
 
-use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
+use aios_core::{RefnoEnum, project_primary_db, SurrealQueryExt};
 use anyhow::Result;
 use serde_json::json;
 use std::collections::HashMap;
@@ -59,7 +59,7 @@ impl DblistLoader {
     /// 清理现有数据
     async fn cleanup_existing_data(&self) -> Result<()> {
         let sql = "DELETE FROM pe;";
-        SUL_DB.query(sql).await?;
+        project_primary_db().query(sql).await?;
         println!("🧹 清理现有数据完成");
         Ok(())
     }
@@ -71,7 +71,7 @@ impl DblistLoader {
             -- 确保表存在（SurrealDB 会自动创建）
             -- 定义一些必要的字段类型
         "#;
-        SUL_DB.query(sql).await?;
+        project_primary_db().query(sql).await?;
         Ok(())
     }
 
@@ -113,7 +113,7 @@ impl DblistLoader {
             element_id, attributes
         );
 
-        SUL_DB.query(&sql).await?;
+        project_primary_db().query(&sql).await?;
 
         println!("📦 加载元素: {} ({})", noun, element_id);
         Ok(())
@@ -131,7 +131,7 @@ impl DblistLoader {
     /// 获取所有加载的 RefnoEnum
     pub async fn get_all_refnos(&self) -> Result<Vec<RefnoEnum>> {
         let sql = "SELECT VALUE id FROM pe;";
-        let records: Vec<aios_core::RecordId> = SUL_DB.query_take(sql, 0).await?;
+        let records: Vec<aios_core::RecordId> = project_primary_db().query_take(sql, 0).await?;
 
         let mut refnos = Vec::new();
         for record in records {
@@ -156,7 +156,7 @@ impl DblistLoader {
     /// 按类型获取 RefnoEnum
     pub async fn get_refnos_by_noun(&self, noun: &str) -> Result<Vec<RefnoEnum>> {
         let sql = format!("SELECT VALUE id FROM pe WHERE noun = '{}';", noun);
-        let records: Vec<aios_core::RecordId> = SUL_DB.query_take(&sql, 0).await?;
+        let records: Vec<aios_core::RecordId> = project_primary_db().query_take(&sql, 0).await?;
 
         let mut refnos = Vec::new();
         for record in records {

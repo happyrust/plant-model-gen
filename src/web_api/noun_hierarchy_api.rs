@@ -1,5 +1,5 @@
 use aios_core::rs_surreal::query::NounHierarchyItem;
-use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
+use aios_core::{RefnoEnum, project_primary_db, SurrealQueryExt};
 use axum::{Router, extract::State, http::StatusCode, response::Json, routing::post};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -201,7 +201,7 @@ async fn query_noun_tree(
         request.root_refno
     );
 
-    match SUL_DB
+    match project_primary_db()
         .query_take::<Vec<PeRow>>(&root_query, 0)
         .await
     {
@@ -305,7 +305,7 @@ async fn build_tree_recursive(
 
         children_query.push_str(" LIMIT 100");
 
-        match SUL_DB
+        match project_primary_db()
             .query_take::<Vec<PeRow>>(&children_query, 0)
             .await
         {

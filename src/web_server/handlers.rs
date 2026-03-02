@@ -167,7 +167,7 @@ use super::{
 use crate::fast_model::session::{PdmsTimeExtractor, SESSION_STORE};
 #[cfg(feature = "sqlite-index")]
 use crate::spatial_index::SqliteSpatialIndex;
-use aios_core::SUL_DB;
+use aios_core::project_primary_db;
 #[cfg(feature = "sqlite-index")]
 use nalgebra::{Point3, Vector3};
 #[cfg(feature = "sqlite-index")]
@@ -361,7 +361,7 @@ pub async fn ensure_projects_schema() {
 DEFINE TABLE projects SCHEMALESS;
 DEFINE INDEX idx_projects_name ON TABLE projects COLUMNS name UNIQUE;
 "#;
-    let _ = SUL_DB.query(defines).await;
+    let _ = project_primary_db().query(defines).await;
 }
 
 /// 列出项目
@@ -497,7 +497,7 @@ pub async fn api_get_projects(
     let mut items: Vec<ProjectItem> = Vec::new();
     let mut total: usize = 0;
 
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut resp) => {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             for row in rows {
@@ -530,7 +530,7 @@ pub async fn api_get_projects(
         Err(_) => {}
     }
 
-    if let Ok(mut resp) = SUL_DB.query(count_sql).await {
+    if let Ok(mut resp) = project_primary_db().query(count_sql).await {
         let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
         total = rows.get(0).and_then(|r| r["total"].as_u64()).unwrap_or(0) as usize;
     }
@@ -716,7 +716,7 @@ pub async fn api_create_project(
         "SELECT * FROM projects WHERE name = '{}' LIMIT 1",
         req.name.replace("'", "\\'")
     );
-    if let Ok(mut resp) = SUL_DB.query(check_sql).await {
+    if let Ok(mut resp) = project_primary_db().query(check_sql).await {
         let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
         if !rows.is_empty() {
             return Err((
@@ -753,7 +753,7 @@ pub async fn api_create_project(
     }
 
     let sql = format!("CREATE projects CONTENT {} RETURN AFTER", body);
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut resp) => {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             let item = rows.get(0).cloned().unwrap_or(json!({"name":"unknown"}));
@@ -803,7 +803,7 @@ pub async fn api_get_project(
     }
     let id_esc = id.replace("'", "\\'");
     let sql = format!("SELECT *, id as id FROM type::record('{}')", id_esc);
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut resp) => {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             if let Some(row) = rows.into_iter().next() {
@@ -902,7 +902,7 @@ pub async fn api_update_project(
             "SELECT * FROM projects WHERE name = '{}' LIMIT 1",
             name.replace("'", "\\'")
         );
-        if let Ok(mut resp) = SUL_DB.query(check_sql).await {
+        if let Ok(mut resp) = project_primary_db().query(check_sql).await {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             // 若找到记录且不是当前 id，则冲突
             if let Some(r) = rows.get(0) {
@@ -945,7 +945,7 @@ pub async fn api_update_project(
         "UPDATE type::record('{}') MERGE {} RETURN AFTER",
         id_esc, body
     );
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut resp) => {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             if let Some(item) = rows.get(0) {
@@ -981,7 +981,7 @@ pub async fn api_delete_project(
     }
     let id_esc = id.replace("'", "\\'");
     let sql = format!("DELETE type::record('{}') RETURN BEFORE", id_esc);
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut resp) => {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             if rows.is_empty() {
@@ -1054,7 +1054,7 @@ pub async fn api_healthcheck_project(
     // 查询 health_url
     let id_esc = id.replace("'", "\\'");
     let get_sql = format!("SELECT health_url FROM type::record('{}')", id_esc);
-    let health_url = match SUL_DB.query(get_sql).await {
+    let health_url = match project_primary_db().query(get_sql).await {
         Ok(mut resp) => {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             rows.get(0)
@@ -1094,7 +1094,7 @@ pub async fn api_healthcheck_project(
         "UPDATE type::record('{}') MERGE {{ status: '{}', last_health_check: '{}', updated_at: '{}' }} RETURN AFTER",
         id_esc, status_str, now, now
     );
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut resp) => {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             let item = rows.get(0).cloned().unwrap_or(json!({"id": id}));
@@ -1181,7 +1181,7 @@ pub async fn api_projects_demo() -> Result<Json<serde_json::Value>, StatusCode> 
             "bob"
         )
     );
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(_) => Ok(Json(json!({"status":"success","source":"surrealdb"}))),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -1215,7 +1215,7 @@ pub async fn projects_health_scheduler() {
 
         // 读取所有配置了 health_url 的项目
         let sql = "SELECT id, health_url, status FROM projects WHERE defined(health_url)";
-        let rows: Vec<serde_json::Value> = match SUL_DB.query(sql).await {
+        let rows: Vec<serde_json::Value> = match project_primary_db().query(sql).await {
             Ok(mut resp) => resp.take(0).unwrap_or_default(),
             Err(_) => continue,
         };
@@ -1241,7 +1241,7 @@ pub async fn projects_health_scheduler() {
                 "UPDATE type::record('{}') MERGE {{ status: '{}', last_health_check: '{}', updated_at: '{}' }}",
                 id_esc, status_str, now, now
             );
-            let _ = SUL_DB.query(update).await;
+            let _ = project_primary_db().query(update).await;
         }
     }
 }
@@ -1638,21 +1638,21 @@ pub async fn get_config_templates(
 pub async fn get_available_databases(
     State(_state): State<AppState>,
 ) -> Result<Json<Vec<DatabaseInfo>>, StatusCode> {
-    use aios_core::SUL_DB;
+    use aios_core::project_primary_db;
 
     // 查询真实的数据库信息
     let mut databases = Vec::new();
 
     // 查询所有不同的数据库编号
     let sql = "SELECT DISTINCT dbnum FROM pe ORDER BY dbnum";
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut response) => {
             let db_nums: Vec<u32> = response.take(0).unwrap_or_default();
 
             for db_num in db_nums {
                 // 查询每个数据库的记录数量
                 let count_sql = format!("SELECT count() FROM pe WHERE dbnum = {}", db_num);
-                let record_count = match SUL_DB.query(&count_sql).await {
+                let record_count = match project_primary_db().query(&count_sql).await {
                     Ok(mut resp) => {
                         let count: Option<u64> = resp.take(0).unwrap_or(None);
                         count.unwrap_or(0)
@@ -1665,7 +1665,7 @@ pub async fn get_available_databases(
                     "SELECT sesno FROM pe WHERE dbnum = {} ORDER BY sesno DESC LIMIT 1",
                     db_num
                 );
-                let last_updated = match SUL_DB.query(&time_sql).await {
+                let last_updated = match project_primary_db().query(&time_sql).await {
                     Ok(mut resp) => {
                         let _sesno: Option<u32> = resp.take(0).unwrap_or(None);
                         SystemTime::now() // 简化处理，使用当前时间
@@ -1736,7 +1736,7 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
     {
         use crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos;
         // use crate::spatial_index::SqliteSpatialIndex;
-        use aios_core::{RefU64, RefnoEnum, SUL_DB};
+        use aios_core::{RefU64, RefnoEnum, project_primary_db};
 
         if !SqliteSpatialIndex::is_enabled() {
             return Ok(Json(
@@ -1772,7 +1772,7 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
                 batch, offset
             );
 
-            let mut resp = match SUL_DB.query(sql).await {
+            let mut resp = match project_primary_db().query(sql).await {
                 Ok(v) => v,
                 Err(e) => {
                     return Ok(Json(
@@ -2199,7 +2199,7 @@ pub async fn ensure_deployment_sites_schema() {
 DEFINE TABLE deployment_sites SCHEMALESS;
 DEFINE INDEX idx_deployment_sites_name ON TABLE deployment_sites COLUMNS name UNIQUE;
 "#;
-    let _ = SUL_DB.query(defines).await;
+    let _ = project_primary_db().query(defines).await;
 }
 
 /// 获取部署站点列表
@@ -2388,7 +2388,7 @@ pub async fn api_import_deployment_site_from_dboption(
         "SELECT * FROM deployment_sites WHERE name = '{}' LIMIT 1",
         site_name.replace("'", "\\'")
     );
-    if let Ok(mut resp) = SUL_DB.query(check_sql).await {
+    if let Ok(mut resp) = project_primary_db().query(check_sql).await {
         let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
         if !rows.is_empty() {
             return Err((
@@ -2471,7 +2471,7 @@ pub async fn api_import_deployment_site_from_dboption(
     })?;
 
     let sql = format!("CREATE deployment_sites CONTENT {}", site_json);
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut resp) => {
             let items: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             if let Some(item) = items.get(0) {
@@ -2631,7 +2631,7 @@ pub async fn api_update_deployment_site(
             "SELECT * FROM deployment_sites WHERE name = '{}' LIMIT 1",
             name.replace("'", "\\'")
         );
-        if let Ok(mut resp) = SUL_DB.query(check_sql).await {
+        if let Ok(mut resp) = project_primary_db().query(check_sql).await {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             if let Some(r) = rows.get(0) {
                 if r["id"].as_str().map(|s| s != id).unwrap_or(true) {
@@ -2674,7 +2674,7 @@ pub async fn api_update_deployment_site(
         id_esc, body
     );
 
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut resp) => {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             if let Some(item) = rows.get(0) {
@@ -2703,7 +2703,7 @@ pub async fn api_delete_deployment_site(
     let id_esc = id.replace("'", "\\'");
     let sql = format!("DELETE type::record('{}') RETURN BEFORE", id_esc);
 
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut resp) => {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             if rows.is_empty() {
@@ -2817,7 +2817,7 @@ pub async fn api_browse_deployment_site_directory(
             Ok(Some(site)) => site,
             Ok(None) => {
                 let sql = format!("SELECT * FROM type::record('{}')", id.replace('\'', "\\'"));
-                match SUL_DB.query(sql).await {
+                match project_primary_db().query(sql).await {
                     Ok(mut resp) => {
                         let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
                         match rows.into_iter().next() {
@@ -2995,7 +2995,7 @@ pub async fn api_create_deployment_site_task(
         "SELECT * FROM type::record('{}')",
         req.site_id.replace("'", "\\'")
     );
-    let site = match SUL_DB.query(site_sql).await {
+    let site = match project_primary_db().query(site_sql).await {
         Ok(mut resp) => {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             match rows.get(0) {
@@ -3125,7 +3125,7 @@ pub async fn api_export_deployment_site_config(
 
     let id_esc = id.replace("'", "\\'");
     let sql = format!("SELECT config, name FROM type::record('{}')", id_esc);
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut resp) => {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             if let Some(row) = rows.get(0) {
@@ -3150,7 +3150,7 @@ pub async fn api_export_deployment_site_config(
 pub async fn get_system_status(
     State(state): State<AppState>,
 ) -> Result<Json<SystemStatus>, StatusCode> {
-    use aios_core::SUL_DB;
+    use aios_core::project_primary_db;
     use std::process;
     use sysinfo::System;
 
@@ -3188,7 +3188,7 @@ pub async fn get_system_status(
     };
 
     // 测试数据库连接
-    let surrealdb_connected = match SUL_DB.query("SELECT 1").await {
+    let surrealdb_connected = match project_primary_db().query("SELECT 1").await {
         Ok(_) => true,
         Err(_) => false,
     };
@@ -3776,7 +3776,7 @@ pub async fn test_tcp_connection(addr: &str) -> bool {
 pub async fn test_database_functionality() -> (bool, Option<String>) {
     use tokio::time::{Duration, timeout};
 
-    match timeout(Duration::from_secs(5), SUL_DB.query("SELECT 1 as test")).await {
+    match timeout(Duration::from_secs(5), project_primary_db().query("SELECT 1 as test")).await {
         Ok(Ok(_)) => (true, None),
         Ok(Err(e)) => (false, Some(format!("数据库查询失败: {}", e))),
         Err(_) => (false, Some("数据库连接超时".to_string())),
@@ -3883,7 +3883,7 @@ pub async fn get_surreal_status(
     _state: State<AppState>,
     Query(q): Query<SurrealStatusQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use aios_core::{SUL_DB, get_db_option};
+    use aios_core::{project_primary_db, get_db_option};
 
     let opt = get_db_option();
     let ip_raw = q.ip.unwrap_or(opt.v_ip.clone());
@@ -3899,7 +3899,7 @@ pub async fn get_surreal_status(
     let listening = is_addr_listening(&bind_addr);
 
     // 是否能够进行基本查询（需要已初始化连接）
-    let connected = match SUL_DB.query("SELECT 1").await {
+    let connected = match project_primary_db().query("SELECT 1").await {
         Ok(_) => true,
         Err(_) => false,
     };
@@ -3927,7 +3927,7 @@ pub async fn test_surreal_connection(
     _state: State<AppState>,
     Json(request): Json<SurrealTestRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use aios_core::SUL_DB;
+    use aios_core::project_primary_db;
     use tokio::time::{Duration, timeout};
 
     let connection_url = format!("ws://{}:{}", request.ip, request.port);
@@ -5279,7 +5279,7 @@ pub async fn get_db_status_list(
     Query(params): Query<DbStatusQuery>,
     State(_state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use aios_core::SUL_DB;
+    use aios_core::project_primary_db;
 
     // 构建查询SQL
     let mut sql = "SELECT * FROM dbnum_info_table".to_string();
@@ -5308,7 +5308,7 @@ pub async fn get_db_status_list(
         }
     }
 
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut response) => {
             let db_infos: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
             let mut status_list = Vec::new();
@@ -5360,11 +5360,11 @@ pub async fn get_db_status_detail(
     Path(dbnum): Path<u32>,
     State(_state): State<AppState>,
 ) -> Result<Json<DbStatusInfo>, StatusCode> {
-    use aios_core::SUL_DB;
+    use aios_core::project_primary_db;
 
     let sql = format!("SELECT * FROM dbnum_info_table WHERE dbnum = {}", dbnum);
 
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut response) => {
             let db_infos: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
             if let Some(db_info) = db_infos.first() {
@@ -5419,7 +5419,7 @@ pub async fn execute_incremental_update(
                 db
             ));
         }
-        let _ = SUL_DB.query(sql).await;
+        let _ = project_primary_db().query(sql).await;
     }
 
     // 创建并启动任务
@@ -5481,7 +5481,7 @@ async fn set_update_finalize(dbnums: &[u32], result: &str) {
             result, ts, db
         ));
     }
-    let _ = SUL_DB.query(sql).await;
+    let _ = project_primary_db().query(sql).await;
 }
 
 /// 检查文件版本更新
@@ -5489,11 +5489,11 @@ pub async fn check_file_versions(
     Query(params): Query<DbStatusQuery>,
     State(_state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use aios_core::SUL_DB;
+    use aios_core::project_primary_db;
 
     let sql = "SELECT dbnum, file_name, sesno, project FROM dbnum_info_table ORDER BY dbnum";
 
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut response) => {
             let db_infos: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
             let mut version_checks = Vec::new();
@@ -5600,7 +5600,7 @@ fn get_latest_sesno_from_file(_project: &str, _dbnum: u32) -> Option<u32> {
 
 /// 检查模型生成状态
 async fn check_model_status(dbnum: u32) -> ModelStatus {
-    use aios_core::SUL_DB;
+    use aios_core::project_primary_db;
 
     // 查询是否存在该数据库的几何数据
     let sql = format!(
@@ -5608,7 +5608,7 @@ async fn check_model_status(dbnum: u32) -> ModelStatus {
         dbnum
     );
 
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut response) => {
             let counts: Vec<u64> = response.take(0).unwrap_or_default();
             if let Some(count) = counts.first() {

@@ -46,21 +46,21 @@ pub async fn get_config_templates(
 pub async fn get_available_databases(
     State(_state): State<AppState>,
 ) -> Result<Json<Vec<DatabaseInfo>>, StatusCode> {
-    use aios_core::SUL_DB;
+    use aios_core::project_primary_db;
 
     // 查询真实的数据库信息
     let mut databases = Vec::new();
 
     // 查询所有不同的数据库编号
     let sql = "SELECT DISTINCT dbnum FROM pe ORDER BY dbnum";
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut response) => {
             let db_nums: Vec<u32> = response.take(0).unwrap_or_default();
 
             for db_num in db_nums {
                 // 查询每个数据库的记录数量
                 let count_sql = format!("SELECT count() FROM pe WHERE dbnum = {}", db_num);
-                let record_count = match SUL_DB.query(&count_sql).await {
+                let record_count = match project_primary_db().query(&count_sql).await {
                     Ok(mut resp) => {
                         let count: Option<u64> = resp.take(0).unwrap_or(None);
                         count.unwrap_or(0)
@@ -73,7 +73,7 @@ pub async fn get_available_databases(
                     "SELECT sesno FROM pe WHERE dbnum = {} ORDER BY sesno DESC LIMIT 1",
                     db_num
                 );
-                let last_updated = match SUL_DB.query(&time_sql).await {
+                let last_updated = match project_primary_db().query(&time_sql).await {
                     Ok(mut resp) => {
                         let _sesno: Option<u32> = resp.take(0).unwrap_or(None);
                         SystemTime::now() // 简化处理，使用当前时间

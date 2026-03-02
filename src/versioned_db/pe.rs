@@ -2,7 +2,7 @@ use crate::api::element::{cal_default_name, gen_pdms_element_insert_sql};
 use crate::consts::PDMS_ELEMENTS_TABLE;
 use crate::versioned_db::database::SenderJsonsData;
 #[cfg(feature = "surreal-save")]
-use aios_core::SUL_DB;
+use aios_core::project_primary_db;
 
 use aios_core::db::*;
 use aios_core::options::DbOption;
@@ -357,7 +357,7 @@ async fn test_query_pe_with_children() -> anyhow::Result<()> {
     let _ = aios_core::init_test_surreal().await;
     // 查询任意一条 pe 记录，验证 children 反序列化
     let sql = "SELECT * FROM pe LIMIT 1";
-    let mut response = SUL_DB.query(sql).await?;
+    let mut response = project_primary_db().query(sql).await?;
     let result: Vec<SPdmsElement> = response.take(0).unwrap_or_default();
     if let Some(pe) = result.get(0) {
         println!("refno={:?}, children={:?}", pe.refno(), pe.children);

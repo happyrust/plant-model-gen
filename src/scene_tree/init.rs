@@ -8,7 +8,7 @@ use aios_core::pdms_types::{
 };
 use aios_core::tool::db_tool::db1_dehash;
 use aios_core::tree_query::{TreeQuery, TreeQueryFilter};
-use aios_core::{RefnoEnum, RefU64, SUL_DB, SurrealQueryExt};
+use aios_core::{RefnoEnum, RefU64, project_primary_db, SurrealQueryExt};
 use anyhow::Result;
 use std::collections::VecDeque;
 
@@ -200,7 +200,7 @@ async fn cleanup_existing_scene_tree() -> Result<()> {
 DELETE contains;
 DELETE scene_node;
 "#;
-    SUL_DB.query_response(sql).await?;
+    project_primary_db().query_response(sql).await?;
     println!("[scene_tree] 已清理旧的 scene_node/contains 数据");
     Ok(())
 }
@@ -215,7 +215,7 @@ LET $scene_node_ids = SELECT VALUE id FROM scene_node WHERE dbnum = {dbnum};
 DELETE $scene_node_ids;
 "#
     );
-    SUL_DB.query_response(&sql).await?;
+    project_primary_db().query_response(&sql).await?;
     println!("[scene_tree] 已清理 dbnum={} 的 scene_node/contains 数据", dbnum);
     Ok(())
 }
@@ -289,7 +289,7 @@ async fn get_geo_type_by_refno(refno: RefnoEnum) -> Result<Option<String>> {
         "SELECT VALUE geo_type FROM geo_relate:{}",
         refno.refno().0
     );
-    let result: Vec<String> = SUL_DB.query_take(&sql, 0).await?;
+    let result: Vec<String> = project_primary_db().query_take(&sql, 0).await?;
     Ok(result.into_iter().next())
 }
 
@@ -314,7 +314,7 @@ async fn batch_insert_nodes(nodes: &[SceneNodeData]) -> Result<()> {
             ));
         }
         if !sql.is_empty() {
-            SUL_DB.query_response(&sql).await?;
+            project_primary_db().query_response(&sql).await?;
         }
     }
     Ok(())
@@ -333,7 +333,7 @@ async fn batch_insert_relations(relations: &[(i64, i64)]) -> Result<()> {
             ));
         }
         if !sql.is_empty() {
-            SUL_DB.query_response(&sql).await?;
+            project_primary_db().query_response(&sql).await?;
         }
     }
     Ok(())

@@ -2,7 +2,7 @@
 //!
 //! 将 scene_node 数据导出为 Parquet 文件，供前端直接加载使用。
 
-use aios_core::{SUL_DB, SurrealQueryExt};
+use aios_core::{project_primary_db, SurrealQueryExt};
 use anyhow::Result;
 use polars::prelude::*;
 use serde::Deserialize;
@@ -51,7 +51,7 @@ pub async fn export_scene_tree_parquet(dbnum: u32, output_dir: &Path) -> Result<
         dbnum
     );
 
-    let rows: Vec<SceneNodeRow> = SUL_DB.query_take(&sql, 0).await?;
+    let rows: Vec<SceneNodeRow> = project_primary_db().query_take(&sql, 0).await?;
     if rows.is_empty() {
         println!("[scene_tree_parquet] dbnum={} 没有节点数据", dbnum);
         return Ok(0);

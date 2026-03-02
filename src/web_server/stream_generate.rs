@@ -2,7 +2,7 @@
 //!
 //! 实现增量模型生成 API，通过 SSE 推送生成进度。
 
-use aios_core::{RefU64, RefnoEnum, SUL_DB, SurrealQueryExt};
+use aios_core::{RefU64, RefnoEnum, project_primary_db, SurrealQueryExt};
 use axum::{
     extract::{Json, Path, Query, State},
     response::sse::{Event, KeepAlive, Sse},
@@ -244,7 +244,7 @@ async fn filter_geo_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum
             .join(",");
 
         let sql = format!("SELECT id as refno, noun FROM [{id_list}]");
-        let rows: Vec<PeNounRow> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let rows: Vec<PeNounRow> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
         for row in rows {
             if row.noun.is_empty() {
                 continue;

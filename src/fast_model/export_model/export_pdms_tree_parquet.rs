@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use aios_core::pdms_types::{RefU64, RefnoEnum};
 use aios_core::tool::db_tool::db1_dehash;
-use aios_core::{SurrealQueryExt, DBType, SUL_DB};
+use aios_core::{SurrealQueryExt, DBType, project_primary_db};
 use anyhow::{Context, Result};
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -146,7 +146,7 @@ async fn query_pe_names(refnos: &[RefnoEnum], verbose: bool) -> Result<HashMap<R
             "#
         );
 
-        let rows: Vec<PeNameRow> = match SUL_DB.query_take(&sql, 0).await {
+        let rows: Vec<PeNameRow> = match project_primary_db().query_take(&sql, 0).await {
             Ok(v) => v,
             Err(e) => {
                 if verbose {

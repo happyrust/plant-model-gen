@@ -13,7 +13,7 @@
 #[cfg(test)]
 #[cfg(all(feature = "gen_model", not(target_arch = "wasm32")))]
 mod tests {
-    use aios_core::{RefnoEnum, RefU64, SUL_DB, SurrealQueryExt};
+    use aios_core::{RefnoEnum, RefU64, project_primary_db, SurrealQueryExt};
     use crate::scene_tree;
 
     const TEST_DBNO: i32 = 1112;

@@ -1,4 +1,4 @@
-use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt, get_named_attmap, get_type_name};
+use aios_core::{RefnoEnum, project_primary_db, SurrealQueryExt, get_named_attmap, get_type_name};
 use surrealdb::types::SurrealValue;
 use axum::{
     Router,
@@ -47,7 +47,7 @@ async fn get_transform(Path(refno): Path<RefnoEnum>) -> Result<Json<TransformRes
         world_trans: Option<serde_json::Value>,
     }
 
-    match SUL_DB.query_take::<Option<TransformQueryResult>>(&sql, 0).await {
+    match project_primary_db().query_take::<Option<TransformQueryResult>>(&sql, 0).await {
         Ok(Some(result)) => {
             // 解析变换矩阵
             let world_transform = parse_transform_matrix(result.world_trans);
@@ -61,7 +61,7 @@ async fn get_transform(Path(refno): Path<RefnoEnum>) -> Result<Json<TransformRes
                 owner: Option<String>,
             }
 
-            let owner = match SUL_DB.query_take::<Option<OwnerQueryResult>>(&owner_sql, 0).await {
+            let owner = match project_primary_db().query_take::<Option<OwnerQueryResult>>(&owner_sql, 0).await {
                 Ok(Some(result)) => result.owner,
                 _ => None,
             };

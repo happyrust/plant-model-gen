@@ -17,7 +17,7 @@ use crate::web_server::{
 // 引入真实实现作为委托
 #[cfg(feature = "sqlite-index")]
 use crate::web_server::handlers as real_handlers;
-use aios_core::SUL_DB;
+use aios_core::project_primary_db;
 use aios_core::get_db_option;
 
 pub async fn get_db_status_list(
@@ -29,7 +29,7 @@ pub async fn get_db_status_list(
 
     let mut db_statuses: Vec<DbStatusInfo> = Vec::new();
 
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut response) => {
             let rows: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
 
@@ -88,7 +88,7 @@ pub async fn get_db_status_detail(
         dbnum
     );
 
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut response) => {
             let rows: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
             if let Some(row) = rows.into_iter().next() {
@@ -182,7 +182,7 @@ pub async fn set_auto_update(
         if req.auto_update { "true" } else { "false" },
         dbnum
     );
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(_) => Ok(Json(
             json!({"status":"success","dbnum":dbnum,"auto_update":req.auto_update}),
         )),
@@ -217,7 +217,7 @@ pub async fn set_auto_update_type(
         "UPDATE dbnum_info_table SET auto_update_type = '{}' WHERE dbnum = {}",
         t, dbnum
     );
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(_) => Ok(Json(
             json!({"status":"success","dbnum":dbnum,"auto_update_type":t}),
         )),
@@ -287,7 +287,7 @@ async fn convert_row_to_status(row: serde_json::Value) -> Option<DbStatusInfo> {
 
 async fn query_count_pe(dbnum: u32) -> Option<u64> {
     let sql = format!("SELECT count() FROM pe WHERE dbnum = {}", dbnum);
-    if let Ok(mut response) = SUL_DB.query(sql).await {
+    if let Ok(mut response) = project_primary_db().query(sql).await {
         let counts: Vec<u64> = response.take(0).ok()?;
         return counts.into_iter().next();
     }
@@ -296,7 +296,7 @@ async fn query_count_pe(dbnum: u32) -> Option<u64> {
 
 async fn check_model_status(dbnum: u32) -> ModelStatus {
     let sql = format!("SELECT count() FROM inst_geo WHERE dbnum = {}", dbnum);
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut response) => {
             let counts: Vec<u64> = response.take(0).unwrap_or_default();
             if counts.first().copied().unwrap_or(0) > 0 {
@@ -385,7 +385,7 @@ pub struct LocalScanResult {
 pub async fn scan_local_files() -> Result<Json<serde_json::Value>, StatusCode> {
     // 查询 SurrealDB 中的 db 列表
     let sql = "SELECT dbnum, project, sesno FROM dbnum_info_table ORDER BY dbnum";
-    let (rows,): (Vec<serde_json::Value>,) = match SUL_DB.query(sql).await {
+    let (rows,): (Vec<serde_json::Value>,) = match project_primary_db().query(sql).await {
         Ok(mut resp) => (resp.take(0).unwrap_or_default(),),
         Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
     };
@@ -431,7 +431,7 @@ pub async fn sync_file_metadata(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // 查询列表
     let sql = "SELECT dbnum, project FROM dbnum_info_table ORDER BY dbnum";
-    let (rows,): (Vec<serde_json::Value>,) = match SUL_DB.query(sql).await {
+    let (rows,): (Vec<serde_json::Value>,) = match project_primary_db().query(sql).await {
         Ok(mut resp) => (resp.take(0).unwrap_or_default(),),
         Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
     };
@@ -454,7 +454,7 @@ pub async fn sync_file_metadata(
     }
 
     if !updates.is_empty() {
-        let _ = SUL_DB.query(updates).await;
+        let _ = project_primary_db().query(updates).await;
     }
 
     Ok(Json(json!({"status":"success"})))
@@ -465,7 +465,7 @@ pub async fn rescan_and_cache(
     Json(req): Json<SyncFileMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let sql = "SELECT dbnum, project FROM dbnum_info_table ORDER BY dbnum";
-    let (rows,): (Vec<serde_json::Value>,) = match SUL_DB.query(sql).await {
+    let (rows,): (Vec<serde_json::Value>,) = match project_primary_db().query(sql).await {
         Ok(mut resp) => (resp.take(0).unwrap_or_default(),),
         Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
     };

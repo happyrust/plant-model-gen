@@ -5,7 +5,7 @@
 #[cfg(test)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 mod tests {
-    use aios_core::{init_surreal, RefnoEnum, SUL_DB, SurrealQueryExt};
+    use aios_core::{init_surreal, RefnoEnum, project_primary_db, SurrealQueryExt};
     use anyhow::Result;
     use std::str::FromStr;
 
@@ -31,7 +31,7 @@ mod tests {
             frmw_refno.refno().0
         );
         let result1: Vec<serde_json::Value> =
-            SUL_DB.query_take(&sql1, 0).await.unwrap_or_default();
+            project_primary_db().query_take(&sql1, 0).await.unwrap_or_default();
         println!("   FRMW 节点信息: {:?}", result1);
 
         // 2. 查询直接子节点
@@ -41,7 +41,7 @@ mod tests {
             frmw_refno.refno().0
         );
         let result2: Vec<serde_json::Value> =
-            SUL_DB.query_take(&sql2, 0).await.unwrap_or_default();
+            project_primary_db().query_take(&sql2, 0).await.unwrap_or_default();
         println!("   找到 {} 个直接子节点:", result2.len());
         for (i, item) in result2.iter().enumerate() {
             println!("      [{}] {:?}", i + 1, item);
@@ -55,7 +55,7 @@ mod tests {
             "SELECT value REFNO FROM PANE WHERE OWNER.OWNER = {}",
             frmw_refno.refno().0
         );
-        let result3_1: Vec<RefnoEnum> = SUL_DB.query_take(&sql3_1, 0).await.unwrap_or_default();
+        let result3_1: Vec<RefnoEnum> = project_primary_db().query_take(&sql3_1, 0).await.unwrap_or_default();
         println!("   3.1 PANE WHERE OWNER.OWNER = FRMW: {} 个", result3_1.len());
 
         // 3.2 OWNER = FRMW
@@ -63,13 +63,13 @@ mod tests {
             "SELECT value REFNO FROM PANE WHERE OWNER = {}",
             frmw_refno.refno().0
         );
-        let result3_2: Vec<RefnoEnum> = SUL_DB.query_take(&sql3_2, 0).await.unwrap_or_default();
+        let result3_2: Vec<RefnoEnum> = project_primary_db().query_take(&sql3_2, 0).await.unwrap_or_default();
         println!("   3.2 PANE WHERE OWNER = FRMW: {} 个", result3_2.len());
 
         // 3.3 查询所有 PANE 并检查层级
         let sql3_3 = "SELECT value REFNO, OWNER, OWNER.OWNER FROM PANE LIMIT 10".to_string();
         let result3_3: Vec<serde_json::Value> =
-            SUL_DB.query_take(&sql3_3, 0).await.unwrap_or_default();
+            project_primary_db().query_take(&sql3_3, 0).await.unwrap_or_default();
         println!("   3.3 示例 PANE 结构 (前10个):");
         for (i, item) in result3_3.iter().enumerate() {
             println!("      [{}] {:?}", i + 1, item);
@@ -81,7 +81,7 @@ mod tests {
             "SELECT value REFNO FROM SBFR WHERE OWNER = {}",
             frmw_refno.refno().0
         );
-        let result4: Vec<RefnoEnum> = SUL_DB.query_take(&sql4, 0).await.unwrap_or_default();
+        let result4: Vec<RefnoEnum> = project_primary_db().query_take(&sql4, 0).await.unwrap_or_default();
         println!("   SBFR WHERE OWNER = FRMW: {} 个", result4.len());
 
         // 5. 检查三通的位置和所属关系
@@ -91,7 +91,7 @@ mod tests {
             tee_refno.refno().0
         );
         let result5: Vec<serde_json::Value> =
-            SUL_DB.query_take(&sql5, 0).await.unwrap_or_default();
+            project_primary_db().query_take(&sql5, 0).await.unwrap_or_default();
         println!("   三通节点信息: {:?}", result5);
 
         // 6. 查询三通所在的管道或分支
@@ -101,7 +101,7 @@ mod tests {
             tee_refno.refno().0
         );
         let result6: Vec<serde_json::Value> =
-            SUL_DB.query_take(&sql6, 0).await.unwrap_or_default();
+            project_primary_db().query_take(&sql6, 0).await.unwrap_or_default();
         println!("   三通的层级结构: {:?}", result6);
 
         println!("\n{}", "=".repeat(80));

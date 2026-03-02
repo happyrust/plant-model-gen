@@ -81,7 +81,7 @@ pub async fn get_all_database_status(
     _state: State<AppState>,
     Query(query): Query<StatusQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use aios_core::SUL_DB;
+    use aios_core::project_primary_db;
 
     // 构建查询SQL
     let mut sql = "SELECT * FROM dbnum_info_table".to_string();
@@ -109,7 +109,7 @@ pub async fn get_all_database_status(
 
     // 执行查询
     let mut databases = Vec::new();
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(mut response) => {
             let rows: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
 
@@ -254,12 +254,12 @@ pub async fn get_database_details(
     _state: State<AppState>,
     Path(db_num): Path<u32>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use aios_core::SUL_DB;
+    use aios_core::project_primary_db;
 
     // 从数据库获取详细信息
     let sql = format!("SELECT * FROM dbnum_info_table WHERE dbnum = {}", db_num);
 
-    let database = match SUL_DB.query(sql).await {
+    let database = match project_primary_db().query(sql).await {
         Ok(mut response) => {
             let rows: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
 
@@ -473,7 +473,7 @@ pub async fn trigger_database_update(
     state: State<AppState>,
     Path(db_num): Path<u32>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use aios_core::SUL_DB;
+    use aios_core::project_primary_db;
 
     println!("触发数据库 {} 更新", db_num);
 
@@ -483,7 +483,7 @@ pub async fn trigger_database_update(
         db_num
     );
 
-    match SUL_DB.query(sql).await {
+    match project_primary_db().query(sql).await {
         Ok(_) => {
             // 创建更新任务
             let request = BatchOperationRequest {
@@ -575,12 +575,12 @@ pub async fn clear_database_cache(
 pub async fn get_module_list(
     _state: State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use aios_core::SUL_DB;
+    use aios_core::project_primary_db;
 
     // 从数据库获取实际的模块类型
     let sql = "SELECT DISTINCT db_type FROM dbnum_info_table WHERE db_type IS NOT NULL";
 
-    let modules = match SUL_DB.query(sql).await {
+    let modules = match project_primary_db().query(sql).await {
         Ok(mut response) => {
             let rows: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
             rows.iter()

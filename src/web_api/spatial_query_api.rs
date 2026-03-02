@@ -1,4 +1,4 @@
-use aios_core::{RefnoEnum, RefU64, SUL_DB, SurrealQueryExt};
+use aios_core::{RefnoEnum, RefU64, project_primary_db, SurrealQueryExt};
 use axum::{
     Router,
     extract::{Path, State},
@@ -91,7 +91,7 @@ async fn query_spatial_node(
         refno
     );
 
-    match SUL_DB
+    match project_primary_db()
         .query_take::<Vec<PeRow>>(&node_query, 0)
         .await
     {
@@ -202,7 +202,7 @@ async fn get_node_info(
         refno
     );
 
-    match SUL_DB.query_take::<Vec<PeRow>>(&query, 0).await {
+    match project_primary_db().query_take::<Vec<PeRow>>(&query, 0).await {
         Ok(records) => {
             if let Some(record) = records.first() {
                 let name = record
@@ -314,7 +314,7 @@ async fn query_children_by_type(
         }
     };
 
-    let records: Vec<PeRow> = SUL_DB.query_take(&query, 0).await?;
+    let records: Vec<PeRow> = project_primary_db().query_take(&query, 0).await?;
 
     let children = records
         .into_iter()

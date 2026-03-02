@@ -217,7 +217,7 @@ async fn run_import_and_post_process(
     use aios_core::SurrealQueryExt;
     let sql = "SELECT value in FROM inst_relate;";
     let refnos: Vec<aios_core::RefnoEnum> =
-        aios_core::SUL_DB.query_take(sql, 0).await.unwrap_or_default();
+        aios_core::project_primary_db().query_take(sql, 0).await.unwrap_or_default();
 
     // Phase 2 Step 3: reconcile_missing_neg_relate
     println!("[import-sql] Phase 2.3: reconcile_missing_neg_relate...");

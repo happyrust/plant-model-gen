@@ -32,7 +32,7 @@ load_spatial_tree = false
 save_spatial_tree_to_db = false
 gen_model_batch_size = 16
 
-meshes_path="E:\\RustProject\\new\\rs-plant3-d\\assets\\meshes"
+meshes_path = "E:\\RustProject\\new\\rs-plant3-d\\assets\\meshes"
 
 #生成补充类型的graph，方便查询直接生成语句
 gen_noun_graph = false
@@ -81,8 +81,19 @@ remote_file_server_hosts = []
 file_server_host = "http://192.168.31.38:8100/asset/archives"
 
 
+# SurrealDB 连接配置 (PE/属性/输入数据读取)
+# 离线模型生成使用 file 模式 (嵌入式 RocksDB)
+[surrealdb]
+mode = "file"
+path = "data.rdb"
+
+# SurrealKV 连接配置 (模型数据写入)
+# 离线模型生成使用 file 模式 (嵌入式 SurrealKV)
+[surrealkv]
+mode = "file"
+path = "data.kv"
+
 #调试选项
-save_model_mesh_to_graph_db = true
 need_sync_refno_basic = false       #是否重新生成 refno_basic 缓存
 reset_mdb_project = false           #是否重新生成 mdb 缓存
 only_update_dbinfo = false
@@ -102,7 +113,7 @@ puhua_database_ip = ""
 puhua_database_user = ""
 puhua_database_password = ""
 
-room_keyword = "-RM"   # 2016  K-R-K100   (-R-)
+room_keyword = "-RM" # 2016  K-R-K100   (-R-)
 
 #debug_model_refnos = ["=24381/35855", "=24383/71551", "=24381/95690"]
 #debug_model_refnos = ["24381/36155", "24383/67004"]

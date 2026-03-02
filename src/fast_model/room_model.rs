@@ -6,7 +6,7 @@ use aios_core::room::algorithm::*;
 
 use aios_core::shape::pdms_shape::PlantMesh;
 
-use aios_core::{GeomInstQuery, ModelHashInst, RefU64, RefnoEnum, SUL_DB};
+use aios_core::{GeomInstQuery, ModelHashInst, RefU64, RefnoEnum, model_primary_db};
 
 
 
@@ -1625,7 +1625,7 @@ where
 
 
 
-    let mut response = SUL_DB.query(sql).await?;
+    let mut response = model_primary_db().query(sql).await?;
 
     let raw_result: Vec<(RecordId, String, Vec<RecordId>)> = response.take(0)?;
 
@@ -1789,7 +1789,7 @@ async fn create_room_panel_relations_batch(
 
     let batch_sql = sql_statements.join("\n");
 
-    SUL_DB.query(batch_sql).await?;
+    model_primary_db().query(batch_sql).await?;
 
 
 
@@ -3743,7 +3743,7 @@ async fn save_room_relate(
 
     let batch_sql = sql_statements.join("\n");
 
-    SUL_DB.query(&batch_sql).await?;
+    model_primary_db().query(&batch_sql).await?;
 
 
 
@@ -5793,7 +5793,7 @@ async fn query_panels_containing_refnos(
 
 
 
-    let mut response = SUL_DB.query(&sql).await?;
+    let mut response = model_primary_db().query(&sql).await?;
 
     let panels: Vec<PanelRoom> = response.take(0)?;
 
@@ -5831,7 +5831,7 @@ async fn delete_room_relations_for_panels(panels: &[PanelRoom]) -> anyhow::Resul
 
 
 
-    SUL_DB.query(sql).await?;
+    model_primary_db().query(sql).await?;
 
     debug!("已删除 {} 个面板的房间关系", panels.len());
 

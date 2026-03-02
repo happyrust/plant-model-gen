@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 use tracing::{info, warn};
 
-use aios_core::SUL_DB;
+use aios_core::project_primary_db;
 use axum::extract::Extension;
 use crate::web_api::jwt_auth::{TokenClaims, generate_form_id};
 use crate::web_api::model_center_client::{notify_workflow_sync_async, notify_workflow_delete_async};
@@ -388,7 +388,7 @@ async fn create_task(
             updated_at = time::now()
     "#;
     
-    let result = SUL_DB
+    let result = project_primary_db()
         .query(sql)
         .bind(("id", task_id.clone()))
         .bind(("form_id", form_id.clone()))
@@ -415,7 +415,7 @@ async fn create_task(
                 if comp.ref_no.trim().is_empty() {
                     continue;
                 }
-                let _ = SUL_DB
+                let _ = project_primary_db()
                     .query(
                         r#"
                         CREATE ONLY review_form_model SET
@@ -512,7 +512,7 @@ async fn list_tasks(
         where_clause, limit, offset
     );
     
-    let mut q = SUL_DB.query(&sql);
+    let mut q = project_primary_db().query(&sql);
     for (name, value) in &bindings {
         q = q.bind((*name, value.clone()));
     }
@@ -551,7 +551,7 @@ async fn get_task(
     // 使用 record::id(id) 提取 key 进行比较
     let sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id LIMIT 1";
     
-    match SUL_DB.query(sql).bind(("id", id.clone())).await {
+    match project_primary_db().query(sql).bind(("id", id.clone())).await {
         Ok(mut response) => {
             let rows: Vec<TaskRow> = response.take(0).unwrap_or_default();
             if let Some(row) = rows.into_iter().next() {
@@ -600,7 +600,7 @@ async fn update_task(
         updates.join(", ")
     );
     
-    let mut q = SUL_DB.query(&sql).bind(("id", id.clone()));
+    let mut q = project_primary_db().query(&sql).bind(("id", id.clone()));
     
     if let Some(ref title) = request.title { q = q.bind(("title", title.clone())); }
     if let Some(ref description) = request.description { q = q.bind(("description", description.clone())); }
@@ -616,7 +616,7 @@ async fn update_task(
         Ok(_) => {
             // 返回更新后的任务
             let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id";
-            if let Ok(mut resp) = SUL_DB.query(get_sql).bind(("id", id.clone())).await {
+            if let Ok(mut resp) = project_primary_db().query(get_sql).bind(("id", id.clone())).await {
                 let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
                 if let Some(row) = rows.into_iter().next() {
                     return (StatusCode::OK, Json(TaskResponse {
@@ -651,7 +651,7 @@ async fn delete_task(
     
     let sql = "DELETE [type::record('review_tasks', $id)]";
     
-    match SUL_DB.query(sql).bind(("id", id.clone())).await {
+    match project_primary_db().query(sql).bind(("id", id.clone())).await {
         Ok(_) => {
             // 异步通知外部系统
             notify_workflow_delete_async(id.clone(), "system".to_string());
@@ -716,7 +716,7 @@ async fn update_task_status(id: String, status: String, comment: Option<String>)
         "UPDATE review_tasks SET status = $status, updated_at = time::now() WHERE record::id(id) = $id"
     };
     
-    let mut q = SUL_DB.query(sql)
+    let mut q = project_primary_db().query(sql)
         .bind(("id", id.clone()))
         .bind(("status", status.clone()));
     
@@ -737,7 +737,7 @@ async fn update_task_status(id: String, status: String, comment: Option<String>)
                     timestamp: time::now()
                 }
             "#;
-            let _ = SUL_DB.query(history_sql)
+            let _ = project_primary_db().query(history_sql)
                 .bind(("task_id", id))
                 .bind(("action", status.clone()))
                 .bind(("comment", comment))
@@ -798,7 +798,7 @@ async fn get_task_history(
     
     let sql = "SELECT * FROM review_history WHERE task_id = $task_id ORDER BY timestamp DESC";
     
-    match SUL_DB.query(sql).bind(("task_id", id.clone())).await {
+    match project_primary_db().query(sql).bind(("task_id", id.clone())).await {
         Ok(mut response) => {
             let rows: Vec<HistoryRow> = response.take(0).unwrap_or_default();
             let history: Vec<HistoryItem> = rows.into_iter().map(|r| HistoryItem {
@@ -903,7 +903,7 @@ async fn create_record(
         }
     "#;
     
-    match SUL_DB.query(sql)
+    match project_primary_db().query(sql)
         .bind(("id", record_id.clone()))
         .bind(("task_id", request.task_id.clone()))
         .bind(("type", request.r#type.clone()))
@@ -969,7 +969,7 @@ async fn get_records_by_task(
     
     let sql = "SELECT * FROM review_records WHERE task_id = $task_id ORDER BY confirmed_at DESC";
     
-    match SUL_DB.query(sql).bind(("task_id", task_id)).await {
+    match project_primary_db().query(sql).bind(("task_id", task_id)).await {
         Ok(mut response) => {
             let rows: Vec<RecordRow> = response.take(0).unwrap_or_default();
             let records: Vec<ConfirmedRecordWithMeta> = rows.into_iter().map(|r| ConfirmedRecordWithMeta {
@@ -1012,7 +1012,7 @@ async fn delete_record(
     
     let sql = "DELETE [type::record('review_records', $id)]";
     
-    match SUL_DB.query(sql).bind(("id", record_id)).await {
+    match project_primary_db().query(sql).bind(("id", record_id)).await {
         Ok(_) => (StatusCode::OK, Json(ActionResponse {
             success: true,
             message: Some("记录已删除".to_string()),
@@ -1040,7 +1040,7 @@ async fn clear_records_by_task(
         DELETE $ids;
     "#;
     
-    match SUL_DB.query(sql).bind(("task_id", task_id)).await {
+    match project_primary_db().query(sql).bind(("task_id", task_id)).await {
         Ok(_) => (StatusCode::OK, Json(ActionResponse {
             success: true,
             message: Some("记录已清空".to_string()),
@@ -1126,7 +1126,7 @@ async fn create_comment(
         }
     "#;
     
-    match SUL_DB.query(sql)
+    match project_primary_db().query(sql)
         .bind(("id", comment_id.clone()))
         .bind(("annotation_id", request.annotation_id.clone()))
         .bind(("annotation_type", request.annotation_type.clone()))
@@ -1194,7 +1194,7 @@ async fn get_comments_by_annotation(
         "SELECT * FROM review_comments WHERE annotation_id = $annotation_id ORDER BY created_at ASC"
     };
     
-    let mut q = SUL_DB.query(sql).bind(("annotation_id", annotation_id));
+    let mut q = project_primary_db().query(sql).bind(("annotation_id", annotation_id));
     if let Some(ref t) = query.r#type {
         q = q.bind(("type", t.clone()));
     }
@@ -1241,7 +1241,7 @@ async fn delete_comment(
     
     let sql = "DELETE [type::record('review_comments', $id)]";
     
-    match SUL_DB.query(sql).bind(("id", comment_id)).await {
+    match project_primary_db().query(sql).bind(("id", comment_id)).await {
         Ok(_) => (StatusCode::OK, Json(ActionResponse {
             success: true,
             message: Some("评论已删除".to_string()),
@@ -1457,7 +1457,7 @@ async fn submit_to_next_node(
 
     // 1. 获取当前任务
     let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id LIMIT 1";
-    let task_result = SUL_DB.query(get_sql).bind(("id", id.clone())).await;
+    let task_result = project_primary_db().query(get_sql).bind(("id", id.clone())).await;
 
     let current_node = match task_result {
         Ok(mut resp) => {
@@ -1511,7 +1511,7 @@ async fn submit_to_next_node(
         WHERE record::id(id) = $id
     "#;
 
-    if let Err(e) = SUL_DB.query(update_sql)
+    if let Err(e) = project_primary_db().query(update_sql)
         .bind(("id", id.clone()))
         .bind(("next_node", next_node))
         .bind(("status", next_status))
@@ -1539,7 +1539,7 @@ async fn submit_to_next_node(
         }
     "#;
 
-    let _ = SUL_DB.query(history_sql)
+    let _ = project_primary_db().query(history_sql)
         .bind(("task_id", id.clone()))
         .bind(("from_node", current_node.clone()))
         .bind(("operator_id", op_id.to_string()))
@@ -1574,7 +1574,7 @@ async fn return_to_node(
 
     // 1. 获取当前任务
     let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id LIMIT 1";
-    let task_result = SUL_DB.query(get_sql).bind(("id", id.clone())).await;
+    let task_result = project_primary_db().query(get_sql).bind(("id", id.clone())).await;
 
     let current_node = match task_result {
         Ok(mut resp) => {
@@ -1627,7 +1627,7 @@ async fn return_to_node(
         WHERE record::id(id) = $id
     "#;
 
-    if let Err(e) = SUL_DB.query(update_sql)
+    if let Err(e) = project_primary_db().query(update_sql)
         .bind(("id", id.clone()))
         .bind(("target_node", request.target_node.clone()))
         .bind(("status", next_status))
@@ -1656,7 +1656,7 @@ async fn return_to_node(
         }
     "#;
 
-    let _ = SUL_DB.query(history_sql)
+    let _ = project_primary_db().query(history_sql)
         .bind(("task_id", id.clone()))
         .bind(("from_node", current_node.clone()))
         .bind(("operator_id", op_id.to_string()))
@@ -1702,7 +1702,7 @@ async fn get_workflow_history(
 
     // 1. 获取当前任务的节点信息
     let get_sql = "SELECT current_node FROM review_tasks WHERE record::id(id) = $id LIMIT 1";
-    let current_node = match SUL_DB.query(get_sql).bind(("id", id.clone())).await {
+    let current_node = match project_primary_db().query(get_sql).bind(("id", id.clone())).await {
         Ok(mut resp) => {
             let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
             match rows.into_iter().next() {
@@ -1747,7 +1747,7 @@ async fn get_workflow_history(
         ORDER BY timestamp ASC
     "#;
 
-    let history = match SUL_DB.query(history_sql).bind(("task_id", id.clone())).await {
+    let history = match project_primary_db().query(history_sql).bind(("task_id", id.clone())).await {
         Ok(mut resp) => {
             let rows: Vec<WorkflowRow> = resp.take(0).unwrap_or_default();
             rows.into_iter().map(|r| WorkflowStep {
@@ -1933,7 +1933,7 @@ async fn upload_attachment(
             }
 
             let sql = "SELECT form_id, components FROM review_tasks WHERE record::id(id) = $id LIMIT 1";
-            if let Ok(mut resp) = SUL_DB.query(sql).bind(("id", tid.to_string())).await {
+            if let Ok(mut resp) = project_primary_db().query(sql).bind(("id", tid.to_string())).await {
                 let rows: Vec<TaskLookupRow> = resp.take(0).unwrap_or_default();
                 if let Some(row) = rows.into_iter().next() {
                     resolved_form_id = row
@@ -2000,7 +2000,7 @@ async fn upload_attachment(
         }
     "#;
 
-    if let Err(e) = SUL_DB
+    if let Err(e) = project_primary_db()
         .query(insert_sql)
         .bind(("form_id", resolved_form_id))
         .bind(("model_refnos", resolved_model_refnos))
@@ -2050,7 +2050,7 @@ async fn delete_attachment(
 
     // 优先使用 DB 中记录的 file_ext
     let mut db_ext: Option<String> = None;
-    if let Ok(mut resp) = SUL_DB
+    if let Ok(mut resp) = project_primary_db()
         .query("SELECT file_ext FROM review_attachment WHERE file_id = $file_id LIMIT 1")
         .bind(("file_id", attachment_id.clone()))
         .await
@@ -2090,7 +2090,7 @@ async fn delete_attachment(
         }
     }
 
-    let _ = SUL_DB
+    let _ = project_primary_db()
         .query(
             r#"
             LET $ids = SELECT VALUE id FROM review_attachment WHERE file_id = $file_id;
@@ -2164,7 +2164,7 @@ async fn export_review_data(
     };
 
     // 查询任务
-    let tasks: Vec<ReviewTask> = match SUL_DB.query(&sql).await {
+    let tasks: Vec<ReviewTask> = match project_primary_db().query(&sql).await {
         Ok(mut resp) => {
             let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
             rows.into_iter().map(|r| r.to_review_task()).collect()
@@ -2200,7 +2200,7 @@ async fn export_review_data(
         }
 
         let sql = "SELECT * FROM review_comments ORDER BY created_at ASC LIMIT 10000";
-        match SUL_DB.query(sql).await {
+        match project_primary_db().query(sql).await {
             Ok(mut resp) => {
                 let rows: Vec<CommentRow> = resp.take(0).unwrap_or_default();
                 Some(rows.into_iter().map(|r| AnnotationComment {
@@ -2245,7 +2245,7 @@ async fn export_review_data(
             Some(vec![])
         } else {
             let sql = "SELECT * FROM review_records WHERE task_id IN $task_ids ORDER BY confirmed_at ASC LIMIT 10000";
-            match SUL_DB.query(sql).bind(("task_ids", task_ids)).await {
+            match project_primary_db().query(sql).bind(("task_ids", task_ids)).await {
                 Ok(mut resp) => {
                     let rows: Vec<RecordRow> = resp.take(0).unwrap_or_default();
                     Some(rows.into_iter().map(|r| ConfirmedRecordWithMeta {
@@ -2312,7 +2312,7 @@ async fn import_review_data(
     for task in request.tasks {
         // 检查任务是否已存在
         let check_sql = "SELECT id FROM review_tasks WHERE record::id(id) = $id";
-        let exists = match SUL_DB.query(check_sql).bind(("id", task.id.clone())).await {
+        let exists = match project_primary_db().query(check_sql).bind(("id", task.id.clone())).await {
             Ok(mut resp) => {
                 let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
                 !rows.is_empty()
@@ -2354,7 +2354,7 @@ async fn import_review_data(
                 updated_at = time::now()"#
         };
 
-        let result = SUL_DB.query(sql)
+        let result = project_primary_db().query(sql)
             .bind(("id", task.id.clone()))
             .bind(("form_id", task.form_id.clone()))
             .bind(("title", task.title.clone()))
@@ -2377,7 +2377,7 @@ async fn import_review_data(
                         if comp.ref_no.trim().is_empty() {
                             continue;
                         }
-                        let _ = SUL_DB
+                        let _ = project_primary_db()
                             .query(
                                 r#"
                                 CREATE ONLY review_form_model SET

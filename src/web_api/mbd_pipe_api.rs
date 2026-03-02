@@ -1141,7 +1141,7 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
 ) -> anyhow::Result<(Vec<CacheTubiSeg>, MbdPipeDebugInfo)> {
     use aios_core::rs_surreal::geometry_query::PlantTransform;
     use aios_core::shape::pdms_shape::RsVec3;
-    use aios_core::{SUL_DB, SurrealQueryExt};
+    use aios_core::{project_primary_db, SurrealQueryExt};
     use serde::{Deserialize, Serialize};
     use surrealdb::types::SurrealValue;
 
@@ -1187,7 +1187,7 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
         "#
     );
 
-    let rows: Vec<TubiRelateRow> = SUL_DB.query_take(&sql, 0).await?;
+    let rows: Vec<TubiRelateRow> = project_primary_db().query_take(&sql, 0).await?;
     if rows.is_empty() {
         anyhow::bail!("tubi_relate 无结果（branch_refno={} pe_key={}）", branch_refno, pe_key);
     }
@@ -1234,7 +1234,7 @@ async fn fetch_bend_elements_for_branch(
 ) -> anyhow::Result<Vec<MbdBendDto>> {
     use aios_core::rs_surreal::geometry_query::PlantTransform;
     use aios_core::shape::pdms_shape::RsVec3;
-    use aios_core::{SUL_DB, SurrealQueryExt};
+    use aios_core::{project_primary_db, SurrealQueryExt};
     use serde::{Deserialize, Serialize};
     use surrealdb::types::SurrealValue;
 
@@ -1265,7 +1265,7 @@ async fn fetch_bend_elements_for_branch(
         "#
     );
 
-    let rows: Vec<BendRow> = match SUL_DB.query_take(&sql, 0).await {
+    let rows: Vec<BendRow> = match project_primary_db().query_take(&sql, 0).await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[mbd-pipe] fetch_bend_elements 查询失败: {e}");
@@ -1814,14 +1814,14 @@ pub async fn export_mbd_json_for_bran(
 async fn collect_bran_refnos_for_scope(
     scope: &MbdExportScope,
 ) -> anyhow::Result<Vec<RefnoEnum>> {
-    use aios_core::{SUL_DB, SurrealQueryExt};
+    use aios_core::{project_primary_db, SurrealQueryExt};
 
     aios_core::init_surreal().await?;
 
     match scope {
         MbdExportScope::ByDbnum(dbnum) => {
             let sql = "SELECT value id FROM pe WHERE noun IN ['BRAN', 'HANG']";
-            let all_refnos: Vec<RefnoEnum> = SUL_DB.query_take(sql, 0).await?;
+            let all_refnos: Vec<RefnoEnum> = project_primary_db().query_take(sql, 0).await?;
 
             let db_meta = crate::data_interface::db_meta_manager::db_meta();
             db_meta.ensure_loaded()?;
@@ -1848,7 +1848,7 @@ async fn collect_bran_refnos_for_scope(
         }
         MbdExportScope::AllDbnums => {
             let sql = "SELECT value id FROM pe WHERE noun IN ['BRAN', 'HANG']";
-            let all_refnos: Vec<RefnoEnum> = SUL_DB.query_take(sql, 0).await?;
+            let all_refnos: Vec<RefnoEnum> = project_primary_db().query_take(sql, 0).await?;
             Ok(all_refnos)
         }
     }

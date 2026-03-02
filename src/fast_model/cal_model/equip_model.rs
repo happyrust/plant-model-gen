@@ -1,6 +1,6 @@
 use crate::fast_model::query_provider;
 use crate::fast_model::utils::save_transforms_to_surreal;
-use aios_core::{RefU64, RefnoEnum, SUL_DB, gen_plant_transform_hash};
+use aios_core::{RefU64, RefnoEnum, project_primary_db, gen_plant_transform_hash};
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
 use aios_core::{query_neareast_along_axis, query_neareast_by_pos_dir};
 
@@ -22,7 +22,7 @@ pub async fn update_cal_equip() -> anyhow::Result<()> {
 //这样可以减少查询次数，提高性能
 //这个表的数据是在equip的数据变更时，由equip的数据变更触发的
 pub async fn update_cal_equip_wtrans() -> anyhow::Result<()> {
-    let mut response = SUL_DB
+    let mut response = project_primary_db()
         .query(format!(
             r#"select value id from {} where type::record("cal_equi", record::id(id))!=none"#,
             "EQUI"
@@ -63,14 +63,14 @@ pub async fn update_cal_equip_wtrans() -> anyhow::Result<()> {
         ));
     }
     save_transforms_to_surreal(&transform_map).await?;
-    SUL_DB.query(sql).await.unwrap();
+    project_primary_db().query(sql).await.unwrap();
     Ok(())
 }
 
 //取得设备下的所有aabb，然后取下面的点到楼板的最近距离
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
 pub async fn cal_equip_nearest_floor() -> anyhow::Result<()> {
-    let mut response = SUL_DB
+    let mut response = project_primary_db()
         .query(format!(r#"select value record::id(id) from {} where type::record("cal_equi", record::id(id))!=none"#, "EQUI"))
         .await?;
     let equips: Vec<RefnoEnum> = response.take(0)?;
@@ -87,7 +87,7 @@ pub async fn cal_equip_nearest_floor() -> anyhow::Result<()> {
             "SELECT VALUE array::len(->nearest_relate) FROM {} LIMIT 1",
             equip.to_pe_key()
         );
-        let has_nearest: Vec<i64> = SUL_DB.query_take(&has_nearest_sql, 0).await.unwrap_or_default();
+        let has_nearest: Vec<i64> = project_primary_db().query_take(&has_nearest_sql, 0).await.unwrap_or_default();
         if has_nearest.first().copied().unwrap_or(0) != 0 {
             continue;
         }
@@ -114,7 +114,7 @@ pub async fn cal_equip_nearest_floor() -> anyhow::Result<()> {
              FROM inst_relate_aabb \
              WHERE in IN [{pe_keys}] AND out.d != none"
         );
-        let raw_values: Vec<JsonValue> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+        let raw_values: Vec<JsonValue> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
         let Ok(aabbs) = raw_values
             .into_iter()
             .map(serde_json::from_value)
@@ -148,7 +148,7 @@ pub async fn cal_equip_nearest_floor() -> anyhow::Result<()> {
         }
     }
     if !equip_sql.is_empty() {
-        SUL_DB.query(equip_sql).await.unwrap();
+        project_primary_db().query(equip_sql).await.unwrap();
     }
     Ok(())
 }

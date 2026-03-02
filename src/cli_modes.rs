@@ -1411,7 +1411,7 @@ pub async fn export_dbnum_instances_json_mode(
             use aios_core::rs_surreal::geometry_query::PlantTransform;
             use aios_core::shape::pdms_shape::RsVec3;
             use aios_core::types::PlantAabb;
-            use aios_core::{SUL_DB, SurrealQueryExt};
+            use aios_core::{project_primary_db, SurrealQueryExt};
             use aios_database::fast_model::model_cache::ModelCacheContext;
             use aios_database::fast_model::gen_model::tree_index_manager::TreeIndexManager;
             use serde::{Deserialize, Serialize};
@@ -1496,7 +1496,7 @@ pub async fn export_dbnum_instances_json_mode(
                     FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
                     "#
                 );
-                let rows: Vec<TubiRelateRow> = SUL_DB.query_take(&sql, 0).await?;
+                let rows: Vec<TubiRelateRow> = project_primary_db().query_take(&sql, 0).await?;
                 if rows.is_empty() {
                     continue;
                 }

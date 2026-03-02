@@ -8,7 +8,7 @@
 //! use crate::{db_err, query_err, deser_err};
 //!
 //! // 数据库查询错误
-//! let result = SUL_DB.query(&sql).await
+//! let result = project_primary_db().query(&sql).await
 //!     .map_err(query_err!(sql))?;
 //!
 //! // 解析响应错误

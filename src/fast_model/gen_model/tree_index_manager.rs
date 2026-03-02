@@ -764,7 +764,7 @@ impl TreeIndexManager {
 /// * `dbnum` - 数据库编号
 /// * `output_dir` - 输出目录 (如 "output/scene_tree")
 pub async fn generate_tree_index_from_db(dbnum: u32, output_dir: &Path) -> anyhow::Result<()> {
-    use aios_core::{SUL_DB, SurrealQueryExt};
+    use aios_core::{model_primary_db, SurrealQueryExt};
     use crate::versioned_db::tree_export::{export_tree_file, TreeNodeMeta};
     use aios_core::db::DbBasicData;
     use std::collections::HashMap;
@@ -786,7 +786,7 @@ pub async fn generate_tree_index_from_db(dbnum: u32, output_dir: &Path) -> anyho
         dbnum
     );
 
-    let rows: Vec<PeRow> = SUL_DB.query_take(&sql, 0).await?;
+    let rows: Vec<PeRow> = model_primary_db().query_take(&sql, 0).await?;
 
     if rows.is_empty() {
         anyhow::bail!("dbnum={} 在 SurrealDB 中没有找到任何节点", dbnum);
@@ -866,10 +866,10 @@ pub async fn generate_tree_indices_from_db(dbnums: &[u32], output_dir: &Path) ->
 
 /// 从 SurrealDB 获取所有可用的 dbnum 列表
 pub async fn get_available_dbnums_from_db() -> anyhow::Result<Vec<u32>> {
-    use aios_core::{SUL_DB, SurrealQueryExt};
+    use aios_core::{model_primary_db, SurrealQueryExt};
 
     let sql = "SELECT DISTINCT dbnum FROM pe WHERE dbnum != NONE";
-    let dbnums: Vec<i32> = SUL_DB.query_take(sql, 0).await?;
+    let dbnums: Vec<i32> = model_primary_db().query_take(sql, 0).await?;
 
     Ok(dbnums.into_iter().filter(|&d| d > 0).map(|d| d as u32).collect())
 }

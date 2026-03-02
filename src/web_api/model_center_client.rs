@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 #[cfg(feature = "web_server")]
-use aios_core::SUL_DB;
+use aios_core::project_primary_db;
 
 #[cfg(feature = "web_server")]
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
@@ -406,7 +406,7 @@ async fn sync_workflow_handler(
     // 模型清单来自 review_form_model
     let model_refnos = query_workflow_models(&request.form_id).await.unwrap_or_default();
     if let Some(comment) = request.comments.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let _ = SUL_DB
+        let _ = project_primary_db()
             .query(
                 r#"
                 CREATE review_opinion CONTENT {
@@ -482,7 +482,7 @@ async fn delete_review_data(
 
     for form_id in &request.form_ids {
         // 删除物理附件文件（如果有）
-        if let Ok(mut resp) = SUL_DB
+        if let Ok(mut resp) = project_primary_db()
             .query("SELECT file_id, file_ext FROM review_attachment WHERE form_id = $form_id")
             .bind(("form_id", form_id.clone()))
             .await
@@ -513,25 +513,25 @@ async fn delete_review_data(
             }
         }
 
-        let _ = SUL_DB
+        let _ = project_primary_db()
             .query(
                 "LET $ids = SELECT VALUE id FROM review_form_model WHERE form_id = $form_id;\nDELETE $ids;",
             )
             .bind(("form_id", form_id.clone()))
             .await;
-        let _ = SUL_DB
+        let _ = project_primary_db()
             .query(
                 "LET $ids = SELECT VALUE id FROM review_opinion WHERE form_id = $form_id;\nDELETE $ids;",
             )
             .bind(("form_id", form_id.clone()))
             .await;
-        let _ = SUL_DB
+        let _ = project_primary_db()
             .query(
                 "LET $ids = SELECT VALUE id FROM review_attachment WHERE form_id = $form_id;\nDELETE $ids;",
             )
             .bind(("form_id", form_id.clone()))
             .await;
-        let _ = SUL_DB
+        let _ = project_primary_db()
             .query(
                 "LET $ids = SELECT VALUE id FROM review_tasks WHERE form_id = $form_id;\nDELETE $ids;",
             )
@@ -557,7 +557,7 @@ async fn query_workflow_models(form_id: &str) -> anyhow::Result<Vec<String>> {
         WHERE form_id = $form_id
     "#;
     
-    let mut response = SUL_DB
+    let mut response = project_primary_db()
         .query(sql)
         .bind(("form_id", form_id.to_string()))
         .await?;
@@ -581,7 +581,7 @@ async fn query_workflow_opinions(form_id: &str) -> anyhow::Result<Vec<WorkflowOp
         ORDER BY seq_order ASC
     "#;
     
-    let mut response = SUL_DB
+    let mut response = project_primary_db()
         .query(sql)
         .bind(("form_id", form_id.to_string()))
         .await?;
@@ -616,7 +616,7 @@ async fn query_workflow_attachments(form_id: &str) -> anyhow::Result<Vec<Workflo
         WHERE form_id = $form_id
     "#;
     
-    let mut response = SUL_DB
+    let mut response = project_primary_db()
         .query(sql)
         .bind(("form_id", form_id.to_string()))
         .await?;

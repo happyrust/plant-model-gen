@@ -1,5 +1,5 @@
 use aios_core::error::init_save_database_error;
-use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
+use aios_core::{RefnoEnum, SurrealQueryExt, model_primary_db};
 use dashmap::DashMap;
 use parry3d::bounding_volume::Aabb;
 use std::collections::HashMap;
@@ -36,7 +36,7 @@ pub async fn ensure_inst_relate_aabb_relation_schema() {
         .get_or_init(|| async {
             // 检查表是否已经是 RELATION 类型：尝试查询一条带 in/out 的记录。
             // 如果 INFO FOR TABLE 返回的定义中包含 "RELATION"，说明已迁移过，跳过重建。
-            let already_relation = match SUL_DB
+            let already_relation = match model_primary_db()
                 .query("INFO FOR TABLE inst_relate_aabb;")
                 .await
             {
@@ -55,13 +55,13 @@ pub async fn ensure_inst_relate_aabb_relation_schema() {
 
             if already_relation {
                 // 表已经是 RELATION 类型，只需确保字段和索引定义正确（DEFINE IF NOT EXISTS 语义）
-                let _ = SUL_DB
+                let _ = model_primary_db()
                     .query("DEFINE FIELD in ON TABLE inst_relate_aabb TYPE record<pe>;")
                     .await;
-                let _ = SUL_DB
+                let _ = model_primary_db()
                     .query("DEFINE FIELD out ON TABLE inst_relate_aabb TYPE record<aabb>;")
                     .await;
-                let _ = SUL_DB
+                let _ = model_primary_db()
                     .query(
                         "DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS in UNIQUE;",
                     )
@@ -70,27 +70,27 @@ pub async fn ensure_inst_relate_aabb_relation_schema() {
             }
 
             // 表不存在或不是 RELATION 类型，需要重建
-            let _ = SUL_DB.query("REMOVE TABLE inst_relate_aabb;").await;
-            let _ = SUL_DB
+            let _ = model_primary_db().query("REMOVE TABLE inst_relate_aabb;").await;
+            let _ = model_primary_db()
                 .query("DEFINE TABLE inst_relate_aabb TYPE RELATION;")
                 .await;
 
-            let _ = SUL_DB
+            let _ = model_primary_db()
                 .query("REMOVE FIELD in ON TABLE inst_relate_aabb;")
                 .await;
-            let _ = SUL_DB
+            let _ = model_primary_db()
                 .query("REMOVE FIELD out ON TABLE inst_relate_aabb;")
                 .await;
-            let _ = SUL_DB
+            let _ = model_primary_db()
                 .query("REMOVE FIELD refno ON TABLE inst_relate_aabb;")
                 .await;
-            let _ = SUL_DB
+            let _ = model_primary_db()
                 .query("DEFINE FIELD in ON TABLE inst_relate_aabb TYPE record<pe>;")
                 .await;
-            let _ = SUL_DB
+            let _ = model_primary_db()
                 .query("DEFINE FIELD out ON TABLE inst_relate_aabb TYPE record<aabb>;")
                 .await;
-            let _ = SUL_DB
+            let _ = model_primary_db()
                 .query(
                     "DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS in UNIQUE;",
                 )
@@ -105,25 +105,25 @@ pub async fn ensure_inst_relate_aabb_relation_schema() {
 pub async fn ensure_inst_relate_relation_schema() {
     INST_RELATE_SCHEMA_INIT
         .get_or_init(|| async {
-            let _ = SUL_DB.query("REMOVE TABLE inst_relate;").await;
+            let _ = model_primary_db().query("REMOVE TABLE inst_relate;").await;
 
-            let _ = SUL_DB
+            let _ = model_primary_db()
                 .query("DEFINE TABLE inst_relate TYPE RELATION;")
                 .await;
 
             // TYPE RELATION 会隐式创建 in/out 字段，但默认 TYPE record；这里显式改为更严格的类型。
-            let _ = SUL_DB.query("REMOVE FIELD in ON TABLE inst_relate;").await;
-            let _ = SUL_DB.query("REMOVE FIELD out ON TABLE inst_relate;").await;
-            let _ = SUL_DB
+            let _ = model_primary_db().query("REMOVE FIELD in ON TABLE inst_relate;").await;
+            let _ = model_primary_db().query("REMOVE FIELD out ON TABLE inst_relate;").await;
+            let _ = model_primary_db()
                 .query("DEFINE FIELD in ON TABLE inst_relate TYPE record<pe>;")
                 .await;
-            let _ = SUL_DB
+            let _ = model_primary_db()
                 .query("DEFINE FIELD out ON TABLE inst_relate TYPE record<inst_info>;")
                 .await;
-            let _ = SUL_DB
+            let _ = model_primary_db()
                 .query("DEFINE INDEX idx_inst_relate_in ON TABLE inst_relate FIELDS in UNIQUE;")
                 .await;
-            let _ = SUL_DB
+            let _ = model_primary_db()
                 .query("DEFINE INDEX idx_inst_relate_out ON TABLE inst_relate FIELDS out;")
                 .await;
         })
@@ -149,7 +149,7 @@ pub async fn save_aabb_to_surreal(aabb_map: &DashMap<String, Aabb>) {
                 rows.push(format!("{{'id':{id_key}, 'd':{d}}}"));
             }
             let sql = format!("INSERT IGNORE INTO aabb [{}];", rows.join(","));
-            match SUL_DB.query(&sql).await {
+            match model_primary_db().query(&sql).await {
                 Ok(_) => {}
                 Err(_) => {
                     init_save_database_error(&sql, &std::panic::Location::caller().to_string());
@@ -280,7 +280,7 @@ pub async fn save_inst_relate_aabb(
             relation_records.join(",")
         ));
 
-        if let Err(e) = SUL_DB.query_take::<surrealdb::types::Value>(&sql, 0).await {
+        if let Err(e) = model_primary_db().query_take::<surrealdb::types::Value>(&sql, 0).await {
             init_save_database_error(
                 &format!("{sql}\n-- err: {e}"),
                 &std::panic::Location::caller().to_string(),
@@ -299,7 +299,7 @@ pub async fn save_pts_to_surreal(vec3_map: &DashMap<u64, String>) {
                 rows.push(format!("{{'id':vec3:⟨{}⟩, 'd':{}}}", k, v.value()));
             }
             let sql = format!("INSERT IGNORE INTO vec3 [{}];", rows.join(","));
-            match SUL_DB.query(&sql).await {
+            match model_primary_db().query(&sql).await {
                 Ok(_) => {}
                 Err(_e) => {
                     init_save_database_error(&sql, &std::panic::Location::caller().to_string());
@@ -322,7 +322,7 @@ pub async fn save_transforms_to_surreal(trans_map: &HashMap<u64, String>) -> any
                 }
             }
             let sql = build_save_transforms_sql(&part);
-            SUL_DB
+            model_primary_db()
                 .query(&sql)
                 .await
                 .with_context(|| format!("写入 trans 失败: {sql}"))?;

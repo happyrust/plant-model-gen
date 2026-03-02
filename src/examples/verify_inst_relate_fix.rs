@@ -1,6 +1,6 @@
 //! 验证 inst_relate 中 owner_refno 和 owner_type 修复
 
-use aios_core::{SUL_DB, SurrealQueryExt, init_surreal};
+use aios_core::{project_primary_db, SurrealQueryExt, init_surreal};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("查询 SQL: {}", sql);
 
-    let result: Vec<serde_json::Value> = SUL_DB.query_take(sql, 0).await?;
+    let result: Vec<serde_json::Value> = project_primary_db().query_take(sql, 0).await?;
 
     if result.is_empty() {
         println!("❌ 未找到 pe:17496_171626 的 inst_relate 记录");

@@ -5,7 +5,7 @@ use aios_core::parsed_data::TubiInfoData;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::pdms_types::*;
 use aios_core::types::*;
-use aios_core::{SUL_DB, SurrealQueryExt, get_db_option, gen_aabb_hash, gen_plant_transform_hash, gen_string_hash, model_query_response, model_primary_db};
+use aios_core::{SurrealQueryExt, get_db_option, gen_aabb_hash, gen_plant_transform_hash, gen_string_hash, model_query_response, model_primary_db};
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::debug_model_debug;
-// model_store 已移除，使用 SUL_DB 直接查询
+// model_store 已移除，使用 model_primary_db() 直接查询
 use crate::fast_model::utils;
 use crate::options::{RegenDeleteMode, get_db_option_ext};
 use super::refno_assoc_index::{
@@ -1088,7 +1088,7 @@ impl TransactionBatcher {
                     || msg.contains("This transaction can be retried")
             }
 
-            // 注意：不要对 SUL_DB 做 clone 再 query。
+            // 注意：不要对 model_primary_db() 做 clone 再 query。
             // 在当前 surrealdb client 实现中，clone 后可能丢失已选定的 namespace/database，
             // 从而随机触发 “Specify a namespace to use” 并导致整块事务回滚。
             //
@@ -1479,7 +1479,7 @@ impl InstRelatePrecomputed {
                 "SELECT record::id(id) AS rid, spec_value FROM pe WHERE id IN [{}];",
                 pe_keys.join(",")
             );
-            match SUL_DB.query_response(&sql).await {
+            match model_primary_db().query_response(&sql).await {
                 Ok(mut resp) => {
                     let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
                     for row in rows {
@@ -1532,7 +1532,7 @@ impl InstRelatePrecomputed {
                     "SELECT record::id(id) AS rid, dbnum, sesno FROM pe WHERE id IN [{}];",
                     chunk.join(",")
                 );
-                match SUL_DB.query_response(&sql).await {
+                match model_primary_db().query_response(&sql).await {
                     Ok(mut resp) => {
                         let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
                         for row in rows {
@@ -1565,7 +1565,7 @@ impl InstRelatePrecomputed {
                         "SELECT record::id(id) AS rid, date FROM ses WHERE id IN [{}];",
                         chunk.join(",")
                     );
-                    match SUL_DB.query_response(&sql).await {
+                    match model_primary_db().query_response(&sql).await {
                         Ok(mut resp) => {
                             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
                             for row in rows {

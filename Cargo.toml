@@ -137,14 +137,9 @@ parry3d = { version = "0.25.0", features = ["serde-serialize"] }
 
 parry2d = { version = "0.25.0", features = ["serde-serialize"] }
 
-# parse_pdms_db = { git = "https://github.com/happyrust/aios-parse-pdms" }
+parse_pdms_db = { git = "https://github.com/happyrust/pdms-io.git", branch = "dev-3.1" }
 
-# 与 pdms_io 保持同源，避免 lockfile package collision。
-parse_pdms_db = { path = "../pdms-io-fork/crates/parse_pdms_db" }
-
-# 使用本地 rs-core，便于联调与修复（例如 to_pe_key 的 SurrealQL record id 拼接问题）。
-
-aios_core = { path = "../rs-core" }
+aios_core = { git = "https://github.com/happyrust/rs-core.git", branch = "dev-3.1" }
 
 surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1", default-features = false, features = [
 
@@ -158,9 +153,7 @@ surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1", 
 surrealdb-types = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1" }
 
 
-# pdms_io = { git = "https://github.com/happyrust/pdms-io.git" }
-
-pdms_io = { path = "../pdms-io-fork", features = ["sync-archive"] }
+pdms_io = { git = "https://github.com/happyrust/pdms-io.git", branch = "dev-3.1", features = ["sync-archive"] }
 
 # gen-xkt = { path = "../gen-xkt" }
 
@@ -447,3 +440,13 @@ strip = "symbols"    # 剥离符号表，减小二进制体积
 
 [dev-dependencies]
 tempfile = "3"
+
+# ═══════════════════════════════════════════════════════════════
+# 本地路径覆盖（联调时取消注释，CI/远程编译时注释掉整个 [patch] block）
+# ═══════════════════════════════════════════════════════════════
+[patch."https://github.com/happyrust/rs-core.git"]
+aios_core = { path = "../rs-core" }
+
+[patch."https://github.com/happyrust/pdms-io.git"]
+pdms_io = { path = "../pdms-io-fork" }
+parse_pdms_db = { path = "../pdms-io-fork/crates/parse_pdms_db" }

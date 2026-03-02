@@ -12,6 +12,7 @@ use crate::web_server::{AppState, remote_sync_handlers, sync_control_center::*};
 // ========= 控制接口 =========
 
 /// 测试触发文件下载（仅用于测试）
+#[cfg(feature = "mqtt")]
 pub async fn trigger_file_download(
     _state: State<AppState>,
     Json(request): Json<serde_json::Value>,
@@ -52,6 +53,18 @@ pub async fn trigger_file_download(
             "message": format!("下载失败: {}", e)
         }))),
     }
+}
+
+/// 测试触发文件下载（仅用于测试，mqtt 特性未启用时的占位实现）
+#[cfg(not(feature = "mqtt"))]
+pub async fn trigger_file_download(
+    _state: State<AppState>,
+    Json(_request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(json!({
+        "status": "error",
+        "message": "当前构建未启用 mqtt feature，无法触发远端文件下载"
+    })))
 }
 pub async fn start_sync_service(
     _state: State<AppState>,

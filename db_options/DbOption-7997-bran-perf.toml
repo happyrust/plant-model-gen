@@ -23,8 +23,7 @@ gen_model = true
 gen_mesh = true
 replace_mesh = true
 save_db = true
-use_surrealdb = false
-use_cache = true
+use_surrealdb = true
 apply_boolean_operation = true
 mesh_tol_ratio = 3.0
 

@@ -555,10 +555,6 @@ async fn pregen_room_panels_into_model_cache(
 
     let mut opt = DbOptionExt::from(db_option.clone());
 
-    opt.use_cache = true;
-
-    opt.use_surrealdb = false;
-
     opt.export_instances = false;
 
     opt.inner.gen_model = true;

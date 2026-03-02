@@ -28,7 +28,6 @@ gen_mesh = true
 replace_mesh = false
 save_db = true
 use_surrealdb = true
-use_cache = false
 defer_db_write = true
 boolean_pipeline_mode = "db_legacy"
 regen_delete_mode = "refno_assoc_index"

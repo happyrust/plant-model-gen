@@ -41,19 +41,32 @@ pub async fn start_runtime(env_id: String) -> anyhow::Result<()> {
         let _ = mgr_clone.async_watch().await;
     });
 
-    // 启动 MQTT 订阅
-    let watcher_arc = mgr.watcher.clone();
-    let mqtt_handle = tokio::spawn(async move {
-        // 忽略错误并常驻循环
-        AiosDBManager::poll_sync_e3d_mqtt_events_with_backoff(watcher_arc, init_ms, max_ms).await;
-    });
+    // 启动 MQTT 订阅（仅在 mqtt feature 启用时）
+    let mqtt_handle = {
+        #[cfg(feature = "mqtt")]
+        {
+            let watcher_arc = mgr.watcher.clone();
+            Some(tokio::spawn(async move {
+                // 忽略错误并常驻循环
+                AiosDBManager::poll_sync_e3d_mqtt_events_with_backoff(
+                    watcher_arc, init_ms, max_ms,
+                )
+                .await;
+            }))
+        }
+        #[cfg(not(feature = "mqtt"))]
+        {
+            let _ = (init_ms, max_ms);
+            None
+        }
+    };
 
     let mut guard = REMOTE_RUNTIME.write().await;
     *guard = Some(RuntimeState {
         env_id,
         mgr,
         watcher_handle: Some(watcher_handle),
-        mqtt_handle: Some(mqtt_handle),
+        mqtt_handle,
     });
     Ok(())
 }

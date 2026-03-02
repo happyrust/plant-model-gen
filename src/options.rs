@@ -18,20 +18,15 @@ fn default_regen_delete_mode() -> RegenDeleteMode {
     RegenDeleteMode::Legacy
 }
 
-/// 校验数据源模式（`use_cache` / `use_surrealdb`）是否合法。
+/// 校验数据源模式是否符合当前固定策略。
 ///
-/// 规则：两者必须严格互斥，且恰好一个为 `true`。
-pub fn validate_data_source_mode(use_cache: bool, use_surrealdb: bool) -> anyhow::Result<()> {
-    match (use_cache, use_surrealdb) {
-        (true, false) | (false, true) => Ok(()),
-        _ => anyhow::bail!(
-            "非法数据源模式: use_cache={}, use_surrealdb={}。\
-             规则要求两者严格互斥且恰好一个为 true。\
-             推荐配置：cache 模式(use_cache=true,use_surrealdb=false)；\
-             Surreal 模式(use_cache=false,use_surrealdb=true)。",
-            use_cache,
-            use_surrealdb
-        ),
+/// 当前策略：输入数据固定读取 SurrealDB。
+/// - `use_surrealdb = true`
+pub fn validate_data_source_mode(use_surrealdb: bool) -> anyhow::Result<()> {
+    if use_surrealdb {
+        Ok(())
+    } else {
+        anyhow::bail!("非法数据源模式: use_surrealdb=false。当前版本已固定输入来源为 SurrealDB，必须满足 use_surrealdb=true。")
     }
 }
 
@@ -151,41 +146,13 @@ pub struct DbOptionExt {
     #[serde(default)]
     pub mesh_formats: Vec<MeshFormat>,
 
-    /// 是否启用 SurrealDB 模型路径
-    ///
-    /// 注意：与 `use_cache` 必须严格互斥，且恰好一个为 true。
-    /// - `true`  => SurrealDB 模式（`use_cache` 必须为 false）
-    /// - `false` => 非 SurrealDB 模式
+    /// 是否启用 SurrealDB 输入路径（当前固定为 true）。
     #[serde(default = "default_true")]
     pub use_surrealdb: bool,
-
-    /// 是否启用 model 缓存路径
-    ///
-    /// 注意：与 `use_surrealdb` 必须严格互斥，且恰好一个为 true。
-    /// - `true`  => cache 模式（`use_surrealdb` 必须为 false）
-    /// - `false` => 非 cache 模式
-    #[serde(default = "default_false")]
-    pub use_cache: bool,
-
-    /// 是否双路径对比（主路径 + 副路径）
-    #[serde(default)]
-    pub dual_run_enabled: bool,
-
-    /// 双路径下主路径是否为缓存
-    #[serde(default = "default_true")]
-    pub model_cache_primary: bool,
-
-    /// 副路径是否允许写入 SurrealDB
-    #[serde(default = "default_true")]
-    pub secondary_db_write: bool,
 
     /// model 缓存目录（默认 output/instance_cache）
     #[serde(default)]
     pub model_cache_dir: Option<String>,
-
-    /// 副路径 mesh 输出目录（默认 output/meshes_shadow）
-    #[serde(default)]
-    pub secondary_mesh_dir: Option<String>,
 
     /// 延迟写入模式：模型生成阶段不写 SurrealDB，所有 SQL 输出到 .surql 文件。
     ///
@@ -305,16 +272,6 @@ impl DbOptionExt {
         self.get_project_output_dir().join("instance_cache")
     }
 
-    /// 获取副路径 mesh 输出目录，默认为 output/{project_name}/meshes_shadow
-    ///
-    /// 注意：如果用户已自定义 secondary_mesh_dir，则直接使用用户配置
-    pub fn get_secondary_mesh_dir(&self) -> std::path::PathBuf {
-        if let Some(ref custom_dir) = self.secondary_mesh_dir {
-            return std::path::PathBuf::from(custom_dir);
-        }
-        self.get_project_output_dir().join("meshes_shadow")
-    }
-
     /// 获取 scene_tree 目录，默认为 output/{project_name}/scene_tree
     pub fn get_scene_tree_dir(&self) -> std::path::PathBuf {
         self.get_project_output_dir().join("scene_tree")
@@ -349,12 +306,7 @@ impl From<DbOption> for DbOptionExt {
             index_tree_debug_limit_per_target_type: None,
             mesh_formats: vec![MeshFormat::PdmsMesh],
             use_surrealdb: true,
-            use_cache: false,
-            dual_run_enabled: false,
-            model_cache_primary: true,
-            secondary_db_write: true,
             model_cache_dir: None,
-            secondary_mesh_dir: None,
             defer_db_write: false,
             boolean_pipeline_mode: BooleanPipelineMode::DbLegacy,
             regen_delete_mode: RegenDeleteMode::Legacy,
@@ -367,7 +319,7 @@ impl From<DbOption> for DbOptionExt {
 pub fn get_db_option_ext() -> DbOptionExt {
     let db_option = aios_core::get_db_option();
     let db_option_ext = DbOptionExt::from(db_option.clone());
-    if let Err(e) = validate_data_source_mode(db_option_ext.use_cache, db_option_ext.use_surrealdb) {
+    if let Err(e) = validate_data_source_mode(db_option_ext.use_surrealdb) {
         panic!("DbOptionExt 数据源模式校验失败: {}", e);
     }
     db_option_ext
@@ -505,39 +457,11 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         })
         .unwrap_or_else(|| vec![MeshFormat::PdmsMesh]);
 
-    // 解析缓存/双路径配置
-    let use_surrealdb = toml_value
-        .get("use_surrealdb")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-
-    let use_cache = toml_value
-        .get("use_cache")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let dual_run_enabled = toml_value
-        .get("dual_run_enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let model_cache_primary = toml_value
-        .get("model_cache_primary")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-
-    let secondary_db_write = toml_value
-        .get("secondary_db_write")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    // 数据源策略已固定为 SurrealDB 输入。
+    let use_surrealdb = true;
 
     let model_cache_dir = toml_value
         .get("model_cache_dir")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    let secondary_mesh_dir = toml_value
-        .get("secondary_mesh_dir")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
@@ -586,19 +510,14 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         index_tree_debug_limit_per_target_type,
         mesh_formats,
         use_surrealdb,
-        use_cache,
-        dual_run_enabled,
-        model_cache_primary,
-        secondary_db_write,
         model_cache_dir,
-        secondary_mesh_dir,
         defer_db_write,
         boolean_pipeline_mode,
         regen_delete_mode,
         enable_db_backfill,
     };
 
-    validate_data_source_mode(db_option_ext.use_cache, db_option_ext.use_surrealdb).map_err(
+    validate_data_source_mode(db_option_ext.use_surrealdb).map_err(
         |e| {
             anyhow::anyhow!(
                 "配置文件 {} 数据源模式非法: {}",
@@ -650,11 +569,9 @@ mod tests {
     use super::validate_data_source_mode;
 
     #[test]
-    fn data_source_mode_accepts_only_exclusive_true() {
-        assert!(validate_data_source_mode(true, false).is_ok());
-        assert!(validate_data_source_mode(false, true).is_ok());
-        assert!(validate_data_source_mode(true, true).is_err());
-        assert!(validate_data_source_mode(false, false).is_err());
+    fn data_source_mode_requires_fixed_surreal_input() {
+        assert!(validate_data_source_mode(true).is_ok());
+        assert!(validate_data_source_mode(false).is_err());
     }
 }
 

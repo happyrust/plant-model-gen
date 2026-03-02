@@ -228,11 +228,11 @@ fn resolve_dbnum(refno: RefnoEnum) -> Option<u32> {
 
 /// 模型生成专用：从内存 transform cache 读取 world_transform；miss 时按需生成并回写缓存。
 pub async fn get_world_transform_cache_first(
-    db_option: Option<&DbOptionExt>,
+    _db_option: Option<&DbOptionExt>,
     refno: RefnoEnum,
 ) -> anyhow::Result<Option<Transform>> {
     let dbnum = resolve_dbnum(refno);
-    let use_cache = db_option.map(|x| x.use_cache).unwrap_or(true) && dbnum.is_some();
+    let use_cache = dbnum.is_some();
 
     if use_cache {
         let dbnum = dbnum.unwrap();
@@ -343,14 +343,13 @@ fn transform_from_matrix_cols(cols: &[f64; 16]) -> Option<Transform> {
 /// - miss 的 refno 再通过 SurrealDB pe_transform 批量查询 matrix；
 /// - 仍 miss 的少量 refno 兜底走旧计算路径（aios_core::get_world_transform）。
 pub async fn get_world_transforms_cache_first_batch(
-    db_option: Option<&DbOptionExt>,
+    _db_option: Option<&DbOptionExt>,
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<HashMap<RefnoEnum, Transform>> {
     if refnos.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let use_cache = db_option.map(|x| x.use_cache).unwrap_or(true);
     let mut out: HashMap<RefnoEnum, Transform> = HashMap::new();
 
     // 记录每个 refno 的 dbnum（用于写回缓存；ref0 != dbnum，必须通过 db_meta 映射）
@@ -363,18 +362,14 @@ pub async fn get_world_transforms_cache_first_batch(
 
     // 1) cache hits
     let mut misses: Vec<RefnoEnum> = Vec::new();
-    if use_cache {
-        if let Some(cache) = get_global_cache() {
-            for &r in refnos {
-                let dbnum = *dbnum_map.get(&r).unwrap_or(&0);
-                if let Some(hit) = cache.get_world_transform(dbnum, r) {
-                    out.insert(r, hit);
-                } else {
-                    misses.push(r);
-                }
+    if let Some(cache) = get_global_cache() {
+        for &r in refnos {
+            let dbnum = *dbnum_map.get(&r).unwrap_or(&0);
+            if let Some(hit) = cache.get_world_transform(dbnum, r) {
+                out.insert(r, hit);
+            } else {
+                misses.push(r);
             }
-        } else {
-            misses.extend_from_slice(refnos);
         }
     } else {
         misses.extend_from_slice(refnos);
@@ -431,11 +426,9 @@ pub async fn get_world_transforms_cache_first_batch(
             if let Some(t) = transform_from_matrix_cols(&cols) {
                 out.insert(r, t.clone());
                 still_missing.remove(&r);
-                if use_cache {
-                    if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
-                        if let Some(&dbnum) = dbnum_map.get(&r) {
-                            cache.insert_world_transform(dbnum, r, t);
-                        }
+                if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
+                    if let Some(&dbnum) = dbnum_map.get(&r) {
+                        cache.insert_world_transform(dbnum, r, t);
                     }
                 }
             }
@@ -450,11 +443,9 @@ pub async fn get_world_transforms_cache_first_batch(
     for r in still_missing {
         if let Ok(Some(t)) = aios_core::get_world_transform(r).await {
             out.insert(r, t.clone());
-            if use_cache {
-                if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
-                    if let Some(&dbnum) = dbnum_map.get(&r) {
-                        cache.insert_world_transform(dbnum, r, t);
-                    }
+            if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
+                if let Some(&dbnum) = dbnum_map.get(&r) {
+                    cache.insert_world_transform(dbnum, r, t);
                 }
             }
         }

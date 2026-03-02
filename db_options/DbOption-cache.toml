@@ -38,9 +38,8 @@ save_spatial_tree_to_db = false
 enable_sqlite_rtree = true
 gen_model_batch_size = 16
 
-# 缓存/双路径对比配置
-use_surrealdb = false
-use_cache = true
+# 数据输入来源固定为 SurrealDB（旧的 use_cache 配置已废弃）
+use_surrealdb = true
 
 # IndexTree 默认管线调优配置
 index_tree_max_concurrent_targets = 6

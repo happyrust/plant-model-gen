@@ -245,7 +245,7 @@ try {
   $tomlNow = Upsert-TomlLine $tomlNow "enable_log" "true"
   $tomlNow = Upsert-TomlLine $tomlNow "export_instances" "true"
   # 为公平对比：避免 precheck 扫全库 + 避免 DB 写入，把输出统一落在 foyer/meshes
-  $tomlNow = Upsert-TomlLine $tomlNow "use_surrealdb" "false"
+  $tomlNow = Upsert-TomlLine $tomlNow "use_surrealdb" "true"
   $tomlNow = Upsert-TomlLine $tomlNow "save_db" "false"
   $tomlNow = Upsert-TomlLine $tomlNow "index_tree_enabled_target_types" "[]"
   $tomlNow = Upsert-TomlLine $tomlNow "index_tree_excluded_target_types" "[]"
@@ -258,7 +258,7 @@ try {
   $tomlCO = $baseToml
   $tomlCO = Upsert-TomlLine $tomlCO "enable_log" "true"
   $tomlCO = Upsert-TomlLine $tomlCO "export_instances" "true"
-  $tomlCO = Upsert-TomlLine $tomlCO "use_surrealdb" "false"
+  $tomlCO = Upsert-TomlLine $tomlCO "use_surrealdb" "true"
   $tomlCO = Upsert-TomlLine $tomlCO "save_db" "false"
   $tomlCO = Upsert-TomlLine $tomlCO "index_tree_enabled_target_types" "[]"
   $tomlCO = Upsert-TomlLine $tomlCO "index_tree_excluded_target_types" "[]"

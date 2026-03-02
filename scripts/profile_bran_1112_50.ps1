@@ -85,8 +85,7 @@ try {
   $toml = Upsert-TomlLine $toml "enable_log" "true"
   $toml = Upsert-TomlLine $toml "export_instances" "false"
   $toml = Upsert-TomlLine $toml "save_db" "false"
-  $toml = Upsert-TomlLine $toml "use_surrealdb" "false"
-  $toml = Upsert-TomlLine $toml "use_cache" "true"
+  $toml = Upsert-TomlLine $toml "use_surrealdb" "true"
   $toml = Upsert-TomlLine $toml "manual_db_nums" ("[{0}]" -f $Dbnum)
   $toml = Upsert-TomlLine $toml "index_tree_enabled_target_types" '["BRAN"]'
   $toml = Upsert-TomlLine $toml "index_tree_excluded_target_types" "[]"

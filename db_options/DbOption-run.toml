@@ -27,9 +27,8 @@ gen_mesh = true
 replace_mesh = true
 save_db = false
 
-# 运行期：仍可连接 DB，但输出/缓存目录改到 C 盘，避免 D 盘空间不足导致失败
-use_surrealdb = false
-use_cache = true
+# 数据输入来源固定为 SurrealDB（旧的 use_cache 配置已废弃）
+use_surrealdb = true
 
 # 解析期只生成 scene tree 文件，跳过 PE/属性数据保存
 gen_tree_only = false

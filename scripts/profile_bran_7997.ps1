@@ -226,7 +226,6 @@ try {
   # profile: 减少非核心开销（不写 DB / 不跑 precheck）
   $toml = Upsert-TomlLine $toml "save_db" "false"
   $toml = Upsert-TomlLine $toml "use_surrealdb" "true"
-  $toml = Upsert-TomlLine $toml "use_cache" "false"
   # 嵌入式 RocksDB 后端（跳过 WebSocket，直接读本地数据目录）
   $toml = Upsert-TomlLine $toml "rocksdb_mode" "`"file`""
   $toml = Upsert-TomlLine $toml "surreal_local_path" "`"D:/backup-dbs/ams-8020.db`""

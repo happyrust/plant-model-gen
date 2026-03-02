@@ -130,7 +130,7 @@ $report = @"
 - **dbnum**: 7997
 - **noun**: PANE (LOOP 管线)
 - **gen_mesh**: false
-- **use_surrealdb**: false (不回写)
+- **use_surrealdb**: true（固定输入源）
 - **配置文件**: ``$ConfigName``
 
 ## 总耗时对比

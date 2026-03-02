@@ -150,9 +150,7 @@ pub async fn save_aabb_to_surreal(aabb_map: &DashMap<String, Aabb>) {
             }
             let sql = format!("INSERT IGNORE INTO aabb [{}];", rows.join(","));
             match SUL_DB.query(&sql).await {
-                Ok(_) => {
-                    aios_core::kv_dual_write(&sql).await;
-                }
+                Ok(_) => {}
                 Err(_) => {
                     init_save_database_error(&sql, &std::panic::Location::caller().to_string());
                 }
@@ -287,8 +285,6 @@ pub async fn save_inst_relate_aabb(
                 &format!("{sql}\n-- err: {e}"),
                 &std::panic::Location::caller().to_string(),
             );
-        } else {
-            aios_core::kv_dual_write(&sql).await;
         }
     }
 }
@@ -304,9 +300,7 @@ pub async fn save_pts_to_surreal(vec3_map: &DashMap<u64, String>) {
             }
             let sql = format!("INSERT IGNORE INTO vec3 [{}];", rows.join(","));
             match SUL_DB.query(&sql).await {
-                Ok(_) => {
-                    aios_core::kv_dual_write(&sql).await;
-                }
+                Ok(_) => {}
                 Err(_e) => {
                     init_save_database_error(&sql, &std::panic::Location::caller().to_string());
                 }
@@ -332,7 +326,6 @@ pub async fn save_transforms_to_surreal(trans_map: &HashMap<u64, String>) -> any
                 .query(&sql)
                 .await
                 .with_context(|| format!("写入 trans 失败: {sql}"))?;
-            aios_core::kv_dual_write(&sql).await;
         }
     }
     Ok(())

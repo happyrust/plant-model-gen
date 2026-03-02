@@ -27,7 +27,8 @@ gen_mesh = true
 replace_mesh = true
 save_db = true
 use_surrealdb = true
-use_cache = false
+surreal_backend = "rocksdb"
+surreal_local_path = "D:/backup-dbs/ams-8020.db"
 gen_tree_only = false
 apply_boolean_operation = true
 mesh_tol_ratio = 3.0
@@ -38,17 +39,16 @@ save_spatial_tree_to_db = false
 enable_sqlite_rtree = false
 gen_model_batch_size = 16
 
-# Full Noun 模式配置
-full_noun_mode = true
-full_noun_max_concurrent_nouns = 6
-full_noun_batch_size = 200
+# IndexTree 管线配置
+index_tree_max_concurrent_targets = 6
+index_tree_batch_size = 200
 
 # 生成所有类型（空 = 全部启用）
-full_noun_enabled_categories = []
-full_noun_excluded_nouns = []
+index_tree_enabled_target_types = []
+index_tree_excluded_target_types = []
 
 # 不限制数量
-debug_limit_per_noun = 0
+index_tree_debug_limit_per_target_type = 0
 
 # 指定 dbnum = 7997
 manual_db_nums = [7997]
@@ -106,7 +106,7 @@ debug_print_world_transform = false
 only_rebuild_pdms_element = false
 
 debug_refno_types = ["CATA", "LOOP", "PRIM"]
-included_db_files = ["ams1112_0001"]
+included_db_files = ["ams7997_0001"]
 plat_url = ""
 
 puhua_database_ip = ""

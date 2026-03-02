@@ -7,7 +7,6 @@ use aios_core::pdms_types::{
     GNERAL_LOOP_OWNER_NOUN_NAMES, GNERAL_PRIM_NOUN_NAMES, USE_CATE_NOUN_NAMES,
 };
 use aios_core::pe::SPdmsElement;
-use aios_core::{DBType, query_mdb_db_nums};
 use dashmap::DashMap;
 use glam::Vec3;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1433,16 +1432,37 @@ fn print_final_summary(total: Duration, l: Duration, c: Duration, p: Duration, b
 async fn get_filtered_dbnums(db_option: &DbOptionExt) -> Result<Vec<u32>> {
     let mut dbnums: Vec<u32> = if let Some(manual) = db_option.manual_db_nums.clone() {
         manual
-    } else if db_option.use_surrealdb {
-        query_mdb_db_nums(None, DBType::DESI).await.map_err(|e| {
-            IndexTreeError::DatabaseError(format!("query_mdb_db_nums(None, DESI) failed: {}", e))
-        })?
     } else {
-        db_meta()
-            .ensure_loaded()
-            .map_err(|e| IndexTreeError::DatabaseError(format!("加载 db_meta_info.json 失败: {}", e)))?;
-        db_meta().get_all_dbnums()
+        // 固定策略：优先走本地 db_meta（由 scene_tree 阶段产出），避免对 MDB 表的依赖。
+        let mut from_meta = Vec::new();
+        match db_meta().ensure_loaded() {
+            Ok(_) => {
+                from_meta = db_meta().get_all_dbnums();
+            }
+            Err(e) => {
+                log::warn!(
+                    "[IndexTree] 加载 db_meta_info.json 失败，尝试从 SurrealDB(pe) 获取 dbnum: {}",
+                    e
+                );
+            }
+        }
+
+        if from_meta.is_empty() {
+            super::tree_index_manager::get_available_dbnums_from_db()
+                .await
+                .map_err(|e| {
+                    IndexTreeError::DatabaseError(format!(
+                        "无法获取可用 dbnum（db_meta 与 pe 查询均失败）: {}",
+                        e
+                    ))
+                })?
+        } else {
+            from_meta
+        }
     };
+
+    dbnums.sort_unstable();
+    dbnums.dedup();
 
     if let Some(exclude) = &db_option.exclude_db_nums {
         dbnums.retain(|dbnum| !exclude.contains(dbnum));

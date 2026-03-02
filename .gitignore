@@ -1,51 +1,11 @@
-/target
-.idea/
-/assets/
-/asset/
-models/
-final.obj
-watcher.json
-/all_attr_info.json
-accel_tree.bin
-/pdms-io/
-aios-database.exe
-mqtt-server.exe
-simple-http-server.exe
-simple_grpc
-npm-cache
-
-frontend/v0-aios-database-management/.next
-frontend/v0-aios-database-management/node_modules
-
-# Ignore all node_modules directories
-node_modules/
-**/node_modules/
-
-# Temporary and backup files
-*.tmp
-*.bak
-*.swp
-*.swo
-*~
-.DS_Store
-
-# IDE crash reports and temporary files
-rustc-ice-*.txt
-
-# Test and output directories (keep tracked files)
-*.log
-*.db-shm
-*.db-wal
-
-# SQLite databases
-*.sqlite*
-*.db
-
-# JSON files that are likely large or generated
-all_attr_info.json
-
-# Build artifacts and binaries
+# ═══════════════════════════════════════════════════════════════
+# Build artifacts & binaries
+# ═══════════════════════════════════════════════════════════════
+/target/
 target/
+target-check/
+target-run-boolean*/
+target-run-debug-model/
 dist/
 build/
 *.exe
@@ -53,120 +13,137 @@ build/
 *.so
 *.dylib
 *.pdb
-*.obj
+
+# ═══════════════════════════════════════════════════════════════
+# IDE & OS
+# ═══════════════════════════════════════════════════════════════
+.idea/
+.DS_Store
+.ace-tool/
+rustc-ice-*.txt
+
+# ═══════════════════════════════════════════════════════════════
+# Node.js
+# ═══════════════════════════════════════════════════════════════
 node_modules/
 
-# Web server binaries and test outputs
-web-server
-web-test
-rumqttd-server
-
-# Database files (should be generated, not committed)
+# ═══════════════════════════════════════════════════════════════
+# Database files
+# ═══════════════════════════════════════════════════════════════
 *.db
 *.sqlite*
-*.json
-*.log
-
-# Model and cache files
-all_attr_info.json
-*.cache
-*.xkt
-*.obj
-*.3dm
-
-# Log files (keep small ones like basic git logs)
-*.log.*
-debug_*.log
-
-# Temp directories
-tmp/
-temp/
-.cache/
-.worktrees/
-worktrees/
-
-# Binary files and build artifacts
-*.exe
-*.dll
-*.so
-*.dylib
-*.pdb
-*.obj
-
-# Build directories
-/target/
-/dist/
-/build/
-
-# Generated output directory
-output/
-
-# External repositories (managed separately)
-docs.surrealdb.com/
-external/rs-core/
-node_modules
-
-# Local SurrealDB datasets
+*.db-shm
+*.db-wal
 ams-8009-test.db
 ams-demo.db/
 ams-test.db/
+ams-8020.db
+ams-8021.db
 surreal-8010.kv
-rumqttd-server/target
-
-web-test
-
-# Process ID files
-*.pid
-surreal-*.pid
-
-# Chrome trace files
-chrome_trace_*.json
-
-# Additional database directories
+data/test_db/
+data/surrealkv/
+data.rdb.kv
 cmd/ams-8009-test.db/
 scripts/db/ams-8009-test.db/
 scripts/db/ams-demo.db/
 
-# Test database directory
-data/test_db/
+# SurrealKV
+db-data/*.skv
+db-data/version-test.skv/
+.surreal.pid
+*.pid
 
-# Specific large binaries
+# ═══════════════════════════════════════════════════════════════
+# Assets & model output
+# ═══════════════════════════════════════════════════════════════
+/assets/
+/asset/
+models/
+output/
+test_output/
+final.obj
+*.obj
+*.3dm
+*.xkt
+*.cache
+all_attr_info.json
+
+# ═══════════════════════════════════════════════════════════════
+# Logs & temporary files
+# ═══════════════════════════════════════════════════════════════
+logs/
+*.log
+*.log.*
+debug_*.log
+failed_sql_batch_*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+tmp/
+temp/
+.cache/
+nul
+
+# ═══════════════════════════════════════════════════════════════
+# External binaries & tools
+# ═══════════════════════════════════════════════════════════════
+aios-database.exe
+mqtt-server.exe
+simple-http-server.exe
+simple_grpc
 web_server
 aios-database
+web-server
+web-test/
+rumqttd-server/
 !/src/web_server/
-!/src/web_server/output_instances_files.rs
-!/src/web_server/model_runtime.rs
 
-# Lock files (optional - uncomment if you want to ignore them)
-# Cargo.lock
-# package-lock.json
-# pnpm-lock.yamlexport.sql
-.ace-tool/
+# ═══════════════════════════════════════════════════════════════
+# PDMS IO
+# ═══════════════════════════════════════════════════════════════
+/pdms-io/
+watcher.json
+accel_tree.bin
+
+# ═══════════════════════════════════════════════════════════════
+# External repos & deploy
+# ═══════════════════════════════════════════════════════════════
+docs.surrealdb.com/
+external/rs-core/
 deploy/
+
+# ═══════════════════════════════════════════════════════════════
+# Archives
+# ═══════════════════════════════════════════════════════════════
 *.tar.gz
 *.zip
 *.7z
 *.rar
 
+# ═══════════════════════════════════════════════════════════════
+# Generated JSON & traces
+# ═══════════════════════════════════════════════════════════════
+*.json
+!/Cargo.lock
+!/.vscode/*.json
+!gen-model.code-workspace
+chrome_trace_*.json
+
+# ═══════════════════════════════════════════════════════════════
+# Frontend
+# ═══════════════════════════════════════════════════════════════
+frontend/v0-aios-database-management/.next
+npm-cache
+
+# ═══════════════════════════════════════════════════════════════
+# Worktrees
+# ═══════════════════════════════════════════════════════════════
+.worktrees/
+worktrees/
+
+# ═══════════════════════════════════════════════════════════════
+# DB options temp
+# ═══════════════════════════════════════════════════════════════
 db_options/_tmp/
-
-ams-8020.db
-ams-8021.db
-nul
-test_output
-target
-logs
-target-check
-target-run-boolean
-target-run-boolean2
-target-run-boolean3
-
-# SurrealKV 测试数据库文件
-db-data/*.skv
-db-data/version-test.skv/
-# SurrealDB 运行时
-.surreal.pid
-data/surrealkv
-target-run-debug-model
-data.rdb.kv
-failed_sql_batch_*.log

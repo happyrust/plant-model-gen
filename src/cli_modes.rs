@@ -273,16 +273,9 @@ fn parse_length_unit(unit: &str) -> LengthUnit {
     }
 }
 
-/// 连接 SurrealDB（用于读取 PDMS 输入数据或写入模型数据）。
-///
-/// 约定（重要）：cache-only 也需要连接 SurrealDB 作为“输入数据源”（PE/属性/世界矩阵等）。
-/// cache-only 的区别仅在于：不写入 inst_* 等模型相关表，且导出期实例数据优先从 model cache 读取。
-async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
-    if db_option_ext.use_surrealdb {
-        println!("\n📡 连接数据库（SurrealDB 写入启用）...");
-    } else {
-        println!("\n📡 连接数据库（SurrealDB 只读）...");
-    }
+/// 连接 SurrealDB（固定输入数据源）。
+async fn ensure_surreal_connected(_db_option_ext: &DbOptionExt) -> Result<()> {
+    println!("\n📡 连接数据库（SurrealDB）...");
     init_surreal()
         .await
         .context("初始化 SurrealDB 失败（需要读取 PDMS 输入数据）")?;
@@ -395,13 +388,7 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     println!("\n🎯 OBJ 导出模式");
     println!("================");
 
-    // cache-only 也需要连接 SurrealDB（输入数据源）；区别仅在于 instances 的读取/写入策略。
     ensure_surreal_connected(db_option_ext).await?;
-    if !db_option_ext.use_surrealdb {
-        println!(
-            "📦 cache-only：OBJ 实例数据从 model cache 读取（不从 SurrealDB 查询 inst_relate）"
-        );
-    }
 
     // 如果需要导出 SVG，设置环境变量
     if config.export_svg {
@@ -614,11 +601,6 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     println!("================");
 
     ensure_surreal_connected(db_option_ext).await?;
-    if !db_option_ext.use_surrealdb {
-        println!(
-            "📦 cache-only：GLB 实例数据从 model cache 读取（不从 SurrealDB 查询 inst_relate）"
-        );
-    }
 
     // 获取 mesh 目录
     let mesh_dir = config.get_mesh_dir(db_option_ext);
@@ -680,12 +662,8 @@ pub async fn export_glb_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
                     ),
                     use_basic_materials: config.use_basic_materials,
                     include_negative: config.include_negative,
-                    allow_surrealdb: db_option_ext.use_surrealdb,
-                    cache_dir: if db_option_ext.use_surrealdb {
-                        None
-                    } else {
-                        Some(db_option_ext.get_model_cache_dir())
-                    },
+                    allow_surrealdb: true,
+                    cache_dir: None,
                 },
             };
             let _ = GlbExporter::new()
@@ -812,11 +790,6 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
     println!("================");
 
     ensure_surreal_connected(db_option_ext).await?;
-    if !db_option_ext.use_surrealdb {
-        println!(
-            "📦 cache-only：glTF 实例数据从 model cache 读取（不从 SurrealDB 查询 inst_relate）"
-        );
-    }
 
     // 获取 mesh 目录
     let mesh_dir = config.get_mesh_dir(db_option_ext);
@@ -886,12 +859,8 @@ pub async fn export_gltf_mode(config: ExportConfig, db_option_ext: &DbOptionExt)
                     ),
                     use_basic_materials: config.use_basic_materials,
                     include_negative: config.include_negative,
-                    allow_surrealdb: db_option_ext.use_surrealdb,
-                    cache_dir: if db_option_ext.use_surrealdb {
-                        None
-                    } else {
-                        Some(db_option_ext.get_model_cache_dir())
-                    },
+                    allow_surrealdb: true,
+                    cache_dir: None,
                 },
             };
             match exporter
@@ -1455,7 +1424,7 @@ pub async fn export_dbnum_instances_json_mode(
             ensure_surreal_connected(db_option_ext).await?;
 
             let Some(ctx) = ModelCacheContext::try_from_db_option(db_option_ext).await? else {
-                anyhow::bail!("use_cache=false，无法写入 model cache");
+                anyhow::bail!("model cache 上下文不可用，无法写入缓存");
             };
 
             let branch_refnos: Vec<RefnoEnum> = if let Some(r) = root_refno.filter(|r| r.is_valid())
@@ -1709,8 +1678,6 @@ pub async fn export_dbnum_instances_json_mode(
 
                         let mut db_option_ext_override = db_option_ext.clone();
                         db_option_ext_override.inner = db_option_clone;
-                        db_option_ext_override.use_cache = true; // 确保缓存写入
-                        db_option_ext_override.use_surrealdb = true; // 需要从 SurrealDB 读取输入数据
                         db_option_ext_override.inner.save_db = Some(false); // 不写回 SurrealDB
                         db_option_ext_override.export_instances = false; // 禁用自动导出，由我们的代码单独处理
                         // IndexTree 已默认启用：无需模式开关
@@ -1833,14 +1800,8 @@ pub async fn export_dbnum_instances_json_mode(
         }
     }
 
-    if !db_option_ext.use_surrealdb {
-        return Err(anyhow!("未启用 SurrealDB 且缓存导出失败，无法继续导出"));
-    }
-
     // 连接数据库
-    println!("📡 连接数据库...");
-    init_surreal().await?;
-    println!("✅ 数据库连接成功");
+    ensure_surreal_connected(db_option_ext).await?;
 
     // 调用导出函数（SurrealDB 路径，内部已包含增量合并 trans/aabb）
     let db_option = Arc::new((**db_option_ext).clone());
@@ -1924,8 +1885,6 @@ async fn ensure_cache_refnos_ready_for_parquet(
 
     let mut override_opt = db_option_ext.clone();
     override_opt.inner.manual_db_nums = Some(vec![dbnum]);
-    override_opt.use_cache = true;
-    override_opt.use_surrealdb = true; // 仅作为输入读取，不写 inst_*。
     override_opt.inner.save_db = Some(false);
     override_opt.export_instances = false;
     override_opt.inner.gen_mesh = true;
@@ -2002,7 +1961,7 @@ pub async fn export_dbnum_instances_parquet_mode(
 /// 从 model cache 导出指定 dbnum 的实例数据为多表 Parquet 格式
 ///
 /// 与 `export_dbnum_instances_parquet_mode` 输出相同 schema，但数据源为 model cache
-/// 而非 SurrealDB，适用于 cache-only 模式 (`use_cache=true, use_surrealdb=false`)。
+/// 而非 SurrealDB，适用于离线缓存导出场景。
 /// 默认仅导出缓存已有数据；当 `fill_missing_cache=true` 时会先补齐缺失 refno。
 #[cfg(feature = "parquet-export")]
 pub async fn export_dbnum_instances_parquet_from_cache_mode(

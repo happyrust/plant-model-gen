@@ -38,21 +38,10 @@ save_spatial_tree_to_db = false
 enable_sqlite_rtree = true
 gen_model_batch_size = 16
 
-# 缓存/双路径对比配置
-# use_surrealdb: 是否启用 SurrealDB 写入/扫库路径（布尔仍依赖 DB）
-use_surrealdb = false
-# use_cache: 是否启用 model 缓存路径
-use_cache = true
-# dual_run_enabled: 是否双路径对比（主路径 + 副路径）
-dual_run_enabled = true
-# model_cache_primary: 双路径下主路径是否为缓存
-model_cache_primary = true
-# secondary_db_write: 副路径是否允许写入 SurrealDB
-secondary_db_write = true
-# model_cache_dir: model 缓存目录（默认 output/instance_cache）
+# 数据输入来源固定为 SurrealDB（旧的缓存/双路径配置已废弃）
+use_surrealdb = true
+# model_cache_dir 作为工具链路径参数保留（不再代表数据源模式）
 model_cache_dir = "output/instance_cache"
-# secondary_mesh_dir: 副路径 mesh 输出目录（默认 output/meshes_shadow）
-secondary_mesh_dir = "output/meshes_shadow"
 
 # IndexTree 默认管线调优配置
 index_tree_max_concurrent_targets = 6

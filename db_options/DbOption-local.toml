@@ -25,7 +25,6 @@ gen_mesh = true
 replace_mesh = true
 save_db = true
 use_surrealdb = true
-use_cache = false
 gen_tree_only = false
 apply_boolean_operation = true
 mesh_tol_ratio = 3.0

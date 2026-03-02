@@ -563,13 +563,6 @@ async fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
-            Arg::new("model-write-mode")
-                .long("model-write-mode")
-                .help("Model write target: surreal_only (default), dual (SUL_DB+KV_DB), kv_only (KV_DB only)")
-                .value_name("MODE")
-                .value_parser(["surreal_only", "dual", "kv_only"]),
-        )
-        .arg(
             Arg::new("import-sql")
                 .long("import-sql")
                 .help("Import a .surql file into SurrealDB and run post-processing (reconcile/boolean/aabb)")
@@ -1307,15 +1300,6 @@ async fn main() -> anyhow::Result<()> {
         db_option_ext.defer_db_write = true;
     }
 
-    // --model-write-mode：覆盖模型写入路由模式
-    if let Some(mode_str) = matches.get_one::<String>("model-write-mode") {
-        println!("🔧 CLI 覆盖 model_write_mode = {}", mode_str);
-        let mode = aios_core::options::ModelWriteMode::parse(mode_str);
-        aios_core::set_model_write_mode(mode);
-        // 同时更新 DbOption 字段，让 initialize_databases 能读到
-        db_option_ext.inner.model_write_mode = Some(mode_str.to_string());
-    }
-
     // 调试模式下，如果配置开启了 gen_mesh，默认也应强制重新生成 mesh
     if debug_model_requested && db_option_ext.inner.gen_mesh {
         if db_option_ext.inner.replace_mesh != Some(true) {
@@ -1390,30 +1374,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ========== 模型导出：默认沿用配置，--use-surrealdb 可强制切到 SurrealDB ==========
-    //
-    // 约定：
-    // - 默认（不传 --use-surrealdb）时，沿用 DbOption 中 use_cache/use_surrealdb；
-    // - 传 --use-surrealdb 时，强制使用 SurrealDB（并关闭 cache）；
-    // - 这不是 fallback：cache 与 surrealdb 两条路径同时存在仅用于验证准确性。
+    // 当前策略固定为 SurrealDB 输入，导出流程仅保留该路径。
     if model_export_requested {
-        if matches.get_flag("use-surrealdb") {
-            // SurrealDB-only：用于对照验证，避免与 cache 混用
-            db_option_ext.use_surrealdb = true;
-            db_option_ext.use_cache = false;
-        }
-
-        if !db_option_ext.use_cache && !db_option_ext.use_surrealdb {
-            anyhow::bail!(
-                "模型导出时 use_cache/use_surrealdb 同时为 false，请在配置中启用其一，或添加 --use-surrealdb"
-            );
-        }
-
-        if !db_option_ext.use_surrealdb {
-            println!(
-                "📦 cache-only：OBJ 导出默认使用 indextree + model 缓存（instances 从缓存读，不写入 inst_*）。SurrealDB 仍作为输入数据源连接（PE/属性/世界矩阵等）。如需写入/对照验证，请添加 --use-surrealdb。"
-            );
-        }
+        db_option_ext.use_surrealdb = true;
     }
 
     // ========== 处理 --debug-model 与导出标志的组合 ==========

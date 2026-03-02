@@ -1,0 +1,14 @@
+   Compiling surrealdb-librocksdb-sys v0.17.3+10.6.2
+warning: unexpected `cfg` condition value: `grpc`
+ --> build.rs:3:11
+  |
+3 |     #[cfg(feature = "grpc")]
+  |           ^^^^^^^^^^^^^^^^
+  |
+  = note: expected values for `feature` are: `console`, `convex-decomposition`, `convex-runtime`, `debug_e3d`, `debug_expr`, `debug_obj_export`, `default`, `duckdb-feature`, `eframe`, `gen_model`, `gpui`, `kv-rocksdb`, `local`, `manifold`, `meili`, `mem-kv-save`, `mqtt`, `parquet-export`, `profile`, `project_hd`, `project_hh`, `prost`, `rfd`, `rstar`, `rust-embed`, `sqlite-index`, `surreal-save`, `test`, `tonic`, `tonic-reflection`, `truck`, `viewer`, `web_server`, and `ws`
+  = help: consider adding `grpc` as a feature in `Cargo.toml`
+  = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+  = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: `aios-database` (build script) generated 1 warning
+   Compiling aios-database v0.2.3 (D:\work\plant-code\plant-model-gen)

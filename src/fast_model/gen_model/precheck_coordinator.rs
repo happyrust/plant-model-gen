@@ -13,7 +13,9 @@
 //! - **性能优先**：使用并行处理提升大规模数据的处理速度
 
 use crate::data_interface::db_meta_manager::db_meta;
-use crate::fast_model::gen_model::tree_index_manager::{ensure_tree_index_exists, TreeIndexManager};
+use crate::fast_model::gen_model::tree_index_manager::{
+    ensure_tree_index_exists, get_available_dbnums_from_db, TreeIndexManager,
+};
 use crate::options::DbOptionExt;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -67,23 +69,23 @@ pub struct PrecheckStats {
 ///
 /// 优先级：
 /// 1. manual_db_nums（手动指定）
-/// 2. 从 SurrealDB 查询所有可用 dbnum
-/// 3. 从 db_meta_info.json 获取（cache-only 模式）
+/// 2. 从 db_meta_info.json 读取
+/// 3. 从 SurrealDB(pe.dbnum) 回退查询
 /// 4. 应用 exclude_db_nums 过滤
 async fn extract_target_dbnums(db_option: &DbOptionExt) -> Result<Vec<u32>> {
     let mut dbnums: Vec<u32> = if let Some(manual) = &db_option.inner.manual_db_nums {
         manual.clone()
-    } else if db_option.use_surrealdb {
-        // 从 SurrealDB 查询所有可用的 dbnum
-        aios_core::query_mdb_db_nums(None, aios_core::DBType::DESI)
-            .await
-            .context("查询数据库编号失败")?
     } else {
-        // cache-only 模式：从 db_meta_info.json 获取
+        let mut from_meta = Vec::new();
         if db_meta().ensure_loaded().is_ok() {
-            db_meta().get_all_dbnums()
+            from_meta = db_meta().get_all_dbnums();
+        }
+        if from_meta.is_empty() {
+            get_available_dbnums_from_db()
+                .await
+                .context("从 SurrealDB(pe) 查询数据库编号失败")?
         } else {
-            Vec::new()
+            from_meta
         }
     };
 
@@ -224,7 +226,7 @@ async fn check_tree_files(
 ///
 /// 约定：precheck 只做“存在性检查”，miss 由后续模型生成阶段按需计算并回写。
 async fn check_pe_transform(
-    db_option: &DbOptionExt,
+    _db_option: &DbOptionExt,
     dbnums: &[u32],
     stats: &mut PrecheckStats,
 ) -> Result<()> {
@@ -237,11 +239,6 @@ async fn check_pe_transform(
 
     stats.pe_transform_checked = dbnums.len();
     stats.pe_transform_refreshed = 0;
-
-    if !db_option.use_cache {
-        println!("[precheck] ⚠️  use_cache=false：跳过 transform_cache 检查");
-        return Ok(());
-    }
 
     // transform_cache 已改为纯内存，无需磁盘目录
     crate::fast_model::transform_cache::init_global_transform_cache();

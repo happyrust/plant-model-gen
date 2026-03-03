@@ -474,20 +474,14 @@ fn build_aabb_batch(rows: &[AabbRow]) -> Result<RecordBatch> {
 }
 
 // =============================================================================
-// SurrealDB 查询结构体（复用 export_prepack_lod 中的定义）
+// SurrealDB 查询结构体
 // =============================================================================
 
 use serde::{Deserialize, Serialize};
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 
-#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
-struct InstRelateRow {
-    pub owner_refno: Option<RefnoEnum>,
-    pub owner_type: Option<String>,
-    pub refno: RefnoEnum,
-    pub noun: Option<String>,
-    pub spec_value: Option<i64>,
-}
+// InstRelateRow 使用 export_common 中的共享定义
+use super::InstRelateRow;
 
 #[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
 struct TubiQueryResult {
@@ -515,55 +509,6 @@ struct AabbQueryRow {
 // =============================================================================
 // SurrealDB 查询函数
 // =============================================================================
-
-/// 使用 TreeIndex refno 列表分批查询 inst_relate
-async fn query_inst_relate_rows(
-    refnos: &[RefnoEnum],
-    verbose: bool,
-) -> Result<Vec<InstRelateRow>> {
-    if refnos.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    const BATCH_SIZE: usize = 500;
-    let mut rows = Vec::new();
-
-    for (idx, chunk) in refnos.chunks(BATCH_SIZE).enumerate() {
-        if verbose {
-            println!(
-                "   - 查询 inst_relate 分批 {}/{} (批大小 {})",
-                idx + 1,
-                (refnos.len() + BATCH_SIZE - 1) / BATCH_SIZE,
-                chunk.len()
-            );
-        }
-
-        let pe_list = chunk
-            .iter()
-            .map(|r| format!("pe:⟨{}⟩", r.to_string()))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let sql = format!(
-            r#"
-            SELECT
-                owner_refno,
-                owner_type,
-                in as refno,
-                in.noun as noun,
-                spec_value as spec_value
-            FROM inst_relate
-            WHERE in IN [{pe_list}]
-            "#
-        );
-
-        let mut chunk_rows: Vec<InstRelateRow> =
-            aios_core::project_primary_db().query_take(&sql, 0).await?;
-        rows.append(&mut chunk_rows);
-    }
-
-    Ok(rows)
-}
 
 /// 批量查询 tubi_relate
 async fn query_tubi_relate(
@@ -836,7 +781,7 @@ pub async fn export_dbnum_instances_parquet(
     if verbose {
         println!("🔍 按 TreeIndex refno 查询 inst_relate...");
     }
-    let inst_rows = query_inst_relate_rows(&all_refnos, verbose).await?;
+    let inst_rows = super::query_inst_relate_batch(&all_refnos, false, verbose).await?;
     if verbose {
         println!("✅ inst_relate 命中记录: {}", inst_rows.len());
     }

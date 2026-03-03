@@ -5141,137 +5141,8 @@ fn merge_and_write_shared_table(
 
 
 
-/// TreeIndex 驱动的 inst_relate 查询结果结构体
-
-#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
-
-struct InstRelateRow {
-
-    pub owner_refno: Option<RefnoEnum>,
-
-    pub owner_type: Option<String>,
-
-    pub refno: RefnoEnum,
-
-    pub noun: Option<String>,
-
-    pub name: Option<String>,
-
-    pub aabb_hash: Option<String>,
-
-    pub spec_value: Option<i64>,
-
-}
-
-
-
-/// 使用 TreeIndex refno 列表分批查询 inst_relate（避免全表扫描）
-
-async fn query_inst_relate_rows_by_refnos(
-
-    refnos: &[RefnoEnum],
-
-    verbose: bool,
-
-) -> Result<Vec<InstRelateRow>> {
-
-    if refnos.is_empty() {
-
-        return Ok(Vec::new());
-
-    }
-
-
-
-    const BATCH_SIZE: usize = 500;
-
-    let mut rows = Vec::new();
-
-
-
-    for (idx, chunk) in refnos.chunks(BATCH_SIZE).enumerate() {
-
-        if verbose {
-
-            println!(
-
-                "   - 查询 inst_relate 分批 {}/{} (批大小 {})",
-
-                idx + 1,
-
-                (refnos.len() + BATCH_SIZE - 1) / BATCH_SIZE,
-
-                chunk.len()
-
-            );
-
-        }
-
-
-
-        // 构建 PE 列表
-
-        let pe_list = chunk
-
-            .iter()
-
-            .map(|r| format!("pe:⟨{}⟩", r.to_string()))
-
-            .collect::<Vec<_>>()
-
-            .join(", ");
-
-
-
-        // 从 inst_relate 表查询，正向关联到 inst_relate_aabb
-
-        let sql = format!(
-
-            r#"
-
-            SELECT
-
-                owner_refno,
-
-                owner_type,
-
-                in as refno,
-
-                in.noun as noun,
-
-                fn::default_full_name(in) as name,
-
-                record::id(in->inst_relate_aabb[0].out) as aabb_hash,
-
-                spec_value as spec_value
-
-            FROM inst_relate
-
-            WHERE in IN [{pe_list}]
-
-                AND in->inst_relate_aabb[0].out != NONE
-
-                AND in->inst_relate_aabb[0].out.d != NONE
-
-            "#
-
-        );
-
-
-
-        let mut chunk_rows: Vec<InstRelateRow> =
-
-            aios_core::model_primary_db().query_take(&sql, 0).await?;
-
-        rows.append(&mut chunk_rows);
-
-    }
-
-
-
-    Ok(rows)
-
-}
+// InstRelateRow 使用 export_common 中的共享定义
+use super::InstRelateRow;
 
 
 
@@ -5515,7 +5386,10 @@ pub async fn export_dbnum_instances_json(
 
     }
 
-    let inst_rows = query_inst_relate_rows_by_refnos(&all_refnos, verbose).await?;
+    let inst_rows = super::query_inst_relate_batch(&all_refnos, true, verbose).await?;
+
+    // 独立查询 aabb_hash（分离出的图遍历子查询，避免在 inst_relate 查询中重复执行）
+    let aabb_map = super::query_inst_relate_aabb_batch(&all_refnos, verbose).await?;
 
     if verbose {
 
@@ -5537,7 +5411,7 @@ pub async fn export_dbnum_instances_json(
 
         name: Option<String>,
 
-        aabb_hash: Option<String>,  // V3: aabb hash
+        aabb_hash: Option<String>,  // 从 aabb_map 后处理填充
 
         spec_value: Option<i64>,
 
@@ -5629,7 +5503,7 @@ pub async fn export_dbnum_instances_json(
 
                 name: row.name,
 
-                aabb_hash: row.aabb_hash,
+                aabb_hash: aabb_map.get(&row.refno).cloned(),
 
                 spec_value: row.spec_value,
 

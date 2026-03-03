@@ -520,6 +520,7 @@ pub async fn query_multi_descendants_with_self(
                 noun_hashes: noun_hashes.clone(),
                 ..Default::default()
             },
+            prune_on_match: false,
         };
 
         for r in index.collect_descendants_bfs(root.refno(), &options) {

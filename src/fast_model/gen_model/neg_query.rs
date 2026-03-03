@@ -89,6 +89,7 @@ pub fn query_descendants_map_by_dbnum(
             noun_hashes,
             ..Default::default()
         },
+        prune_on_match: false,
     };
 
     let tree_dir = tree_dir.as_ref();

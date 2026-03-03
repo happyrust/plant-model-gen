@@ -393,6 +393,7 @@ pub async fn collect_export_refnos(
                 noun_hashes: noun_hashes.clone(),
                 ..Default::default()
             },
+            prune_on_match: false,
         };
 
         for root in roots {

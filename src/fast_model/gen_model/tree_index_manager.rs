@@ -423,6 +423,7 @@ impl TreeIndexManager {
                         include_self: false,
                         max_depth,
                         filter: TreeQueryFilter::default(),
+                        prune_on_match: false,
                     };
                     return index
                         .collect_descendants_bfs(refno, &options)
@@ -461,6 +462,7 @@ impl TreeIndexManager {
                             noun_hashes: Some(noun_hashes),
                             ..Default::default()
                         },
+                        prune_on_match: false,
                     };
                     return index
                         .collect_descendants_bfs(refno, &options)
@@ -500,6 +502,7 @@ impl TreeIndexManager {
                                 noun_hashes: Some(noun_hashes.clone()),
                                 ..Default::default()
                             },
+                            prune_on_match: false,
                         };
                         for desc in index.collect_descendants_bfs(refno, &options) {
                             if seen.insert(desc) {
@@ -515,6 +518,87 @@ impl TreeIndexManager {
         result
     }
 
+    /// 批量 BFS 收集目标 noun refnos，匹配后 prune（不再递归子节点）
+    pub fn collect_target_refnos_pruned(
+        &self,
+        roots: &[RefnoEnum],
+        nouns: &[&str],
+    ) -> Vec<RefnoEnum> {
+        let noun_hashes: std::collections::HashSet<u32> =
+            nouns.iter().map(|n| db1_hash(n)).collect();
+        let mut result = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for &root in roots {
+            let refno = root.refno();
+            for &dbnum in &self.dbnums {
+                if let Ok(index) = self.load_index(dbnum) {
+                    if index.contains_refno(refno) {
+                        let options = TreeQueryOptions {
+                            include_self: true,
+                            max_depth: None,
+                            filter: TreeQueryFilter {
+                                noun_hashes: Some(noun_hashes.clone()),
+                                ..Default::default()
+                            },
+                            prune_on_match: true,
+                        };
+                        for desc in index.collect_descendants_bfs(refno, &options) {
+                            if seen.insert(desc) {
+                                result.push(RefnoEnum::from(desc));
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// 批量 BFS 收集目标 noun refnos 并按 noun_hash 分组
+    pub fn collect_target_refnos_grouped(
+        &self,
+        roots: &[RefnoEnum],
+        nouns: &[&str],
+        prune: bool,
+    ) -> std::collections::HashMap<u32, Vec<RefnoEnum>> {
+        let noun_hashes: std::collections::HashSet<u32> =
+            nouns.iter().map(|n| db1_hash(n)).collect();
+        let mut grouped: std::collections::HashMap<u32, Vec<RefnoEnum>> = std::collections::HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for &root in roots {
+            let refno = root.refno();
+            for &dbnum in &self.dbnums {
+                if let Ok(index) = self.load_index(dbnum) {
+                    if index.contains_refno(refno) {
+                        let options = TreeQueryOptions {
+                            include_self: true,
+                            max_depth: None,
+                            filter: TreeQueryFilter {
+                                noun_hashes: Some(noun_hashes.clone()),
+                                ..Default::default()
+                            },
+                            prune_on_match: prune,
+                        };
+                        for (noun_hash, refnos) in index.collect_descendants_bfs_grouped(refno, &options) {
+                            for r in refnos {
+                                if seen.insert(r) {
+                                    grouped.entry(noun_hash).or_default().push(RefnoEnum::from(r));
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        grouped
+    }
+
     /// 查询指定节点的直接子节点
     pub fn query_children(&self, parent: RefnoEnum) -> Vec<RefnoEnum> {
         let refno = parent.refno();
@@ -525,6 +609,7 @@ impl TreeIndexManager {
                         include_self: false,
                         max_depth: Some(1),
                         filter: TreeQueryFilter::default(),
+                        prune_on_match: false,
                     };
                     return index
                         .collect_descendants_bfs(refno, &options)
@@ -553,6 +638,7 @@ impl TreeIndexManager {
                             noun_hashes: Some(noun_hashes),
                             ..Default::default()
                         },
+                        prune_on_match: false,
                     };
                     return index
                         .collect_descendants_bfs(refno, &options)
@@ -575,6 +661,7 @@ impl TreeIndexManager {
                         include_self: false,
                         max_depth: None,
                         filter: TreeQueryFilter::default(),
+                        prune_on_match: false,
                     };
                     return index
                         .collect_ancestors_root_to_parent(refno, &options)
@@ -603,6 +690,7 @@ impl TreeIndexManager {
                             noun_hashes: Some(noun_hashes),
                             ..Default::default()
                         },
+                        prune_on_match: false,
                     };
                     return index
                         .collect_ancestors_root_to_parent(refno, &options)

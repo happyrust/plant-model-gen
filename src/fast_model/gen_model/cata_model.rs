@@ -100,13 +100,9 @@ use std::time::Instant;
 
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
-
-
 // #[cfg(feature = "profile")]
 
 use tracing::{Level, info_span, instrument};
-
-
 
 // Chrome tracing（统一走 crate::profiling，避免重复 init）
 
@@ -121,8 +117,6 @@ pub fn init_chrome_tracing() -> anyhow::Result<()> {
     crate::profiling::init_chrome_tracing("output/profile/chrome_trace_cata_model.json")
 
 }
-
-
 
 #[derive(Debug, Default, IntoPrimitive, Eq, PartialEq, TryFromPrimitive, Copy, Clone)]
 
@@ -152,8 +146,6 @@ pub enum NgmrRemovedType {
 
 }
 
-
-
 /// 普通 CATE 生成阶段的输出
 
 pub struct CateGenOutcome {
@@ -172,8 +164,6 @@ pub struct CateGenOutcome {
 
 }
 
-
-
 fn build_prepared_inst_geos_from_shapes_for_cache(
 
     shapes: Vec<CateCsgShape>,
@@ -183,8 +173,6 @@ fn build_prepared_inst_geos_from_shapes_for_cache(
     let mut out: Vec<PreparedInstGeo> = Vec::new();
 
     let mut has_solid = false;
-
-
 
     for shape in shapes.into_iter() {
 
@@ -208,8 +196,6 @@ fn build_prepared_inst_geos_from_shapes_for_cache(
 
         } = shape;
 
-
-
         // resolve_desi_comp 的缓存只保存“可生成”的条目；无效几何直接跳过。
 
         if !csg_shape.check_valid() {
@@ -217,8 +203,6 @@ fn build_prepared_inst_geos_from_shapes_for_cache(
             continue;
 
         }
-
-
 
         // 获取形状自身的变换（包含 scale）
 
@@ -228,8 +212,6 @@ fn build_prepared_inst_geos_from_shapes_for_cache(
 
         let unit_flag = csg_shape.is_reuse_unit();
 
-
-
         // 合并变换：shape_transform 是元件变换，shape_trans 是形状自身变换
 
         let translation = shape_transform.translation + shape_transform.rotation * shape_trans.translation;
@@ -237,8 +219,6 @@ fn build_prepared_inst_geos_from_shapes_for_cache(
         let rotation = shape_transform.rotation;
 
         let scale = shape_trans.scale;
-
-
 
         let mut transform = Transform {
 
@@ -250,15 +230,11 @@ fn build_prepared_inst_geos_from_shapes_for_cache(
 
         };
 
-
-
         if transform.translation.is_nan() || transform.rotation.is_nan() || transform.scale.is_nan() {
 
             continue;
 
         }
-
-
 
         // 获取 geo_param
 
@@ -267,8 +243,6 @@ fn build_prepared_inst_geos_from_shapes_for_cache(
             .convert_to_geo_param()
 
             .unwrap_or(PdmsGeoParam::Unknown);
-
-
 
         // unit_flag=true 时，写入"单位参数"，保留 transform.scale
 
@@ -284,13 +258,9 @@ fn build_prepared_inst_geos_from_shapes_for_cache(
 
         }
 
-
-
         // 统一处理 transform.scale
 
         crate::fast_model::reuse_unit::normalize_transform_scale(&mut transform, unit_flag, geo_hash);
-
-
 
         let geo_type = if is_ngmr {
 
@@ -302,15 +272,11 @@ fn build_prepared_inst_geos_from_shapes_for_cache(
 
         };
 
-
-
         if geo_type == GeoBasicType::Pos {
 
             has_solid = true;
 
         }
-
-
 
         out.push(PreparedInstGeo {
 
@@ -336,13 +302,9 @@ fn build_prepared_inst_geos_from_shapes_for_cache(
 
     }
 
-
-
     (out, has_solid)
 
 }
-
-
 
 fn build_tubi_transform_from_segment(
 
@@ -398,8 +360,6 @@ fn build_tubi_transform_from_segment(
 
 }
 
-
-
 /// BRAN/HANG tubing 生成阶段的输出
 
 pub struct BranchTubiOutcome {
@@ -416,8 +376,6 @@ pub struct BranchTubiOutcome {
 
 }
 
-
-
 pub struct GenOutcome {
 
     pub cate: Option<CateGenOutcome>,
@@ -425,8 +383,6 @@ pub struct GenOutcome {
     pub branch: Option<BranchTubiOutcome>,
 
 }
-
-
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 
@@ -442,8 +398,6 @@ enum BranchTubiMode {
 
 }
 
-
-
 pub(crate) const BRANCH_META_HPOS_NO: i32 = -9101;
 
 pub(crate) const BRANCH_META_TPOS_NO: i32 = -9102;
@@ -451,8 +405,6 @@ pub(crate) const BRANCH_META_TPOS_NO: i32 = -9102;
 pub(crate) const BRANCH_META_SIZE_NO: i32 = -9103;
 
 pub(crate) const BRANCH_META_KIND_NO: i32 = -9104;
-
-
 
 #[derive(Debug, Clone)]
 
@@ -468,8 +420,6 @@ struct BranchCacheMeta {
 
 }
 
-
-
 /// tubi_size + branch_meta 预取结果（可在阶段4之前 spawn，与 CATE 生成并行）
 
 #[derive(Clone, Debug)]
@@ -482,8 +432,6 @@ pub struct BranchPrefetchResult {
 
 }
 
-
-
 /// 单个 branch 的预取元数据
 
 #[derive(Clone, Debug)]
@@ -495,8 +443,6 @@ pub struct BranchMetaPrefetched {
     pub bran_owner_type: String,
 
 }
-
-
 
 /// 独立预取 tubi_size + branch_meta（可在 CATE 生成之前 spawn 并行）
 
@@ -519,8 +465,6 @@ pub async fn prefetch_tubi_size_and_branch_meta(
     let prefetch_concurrency = branch_tubi_p4_prefetch_concurrency();
 
     let sem = Arc::new(Semaphore::new(prefetch_concurrency));
-
-
 
     // ── 阶段1: LSTU→CATR 过滤 ──
 
@@ -574,15 +518,11 @@ pub async fn prefetch_tubi_size_and_branch_meta(
 
     }
 
-
-
     let p6_valid = cat_ref_cache.len();
 
     let p6_skip = all_child_refnos.len() - p6_valid;
 
     let phase1_ms = t_start.elapsed().as_millis();
-
-
 
     // ── 阶段2: query_tubi_size（重量） ──
 
@@ -633,8 +573,6 @@ pub async fn prefetch_tubi_size_and_branch_meta(
     }
 
     let phase2_ms = t_phase2.elapsed().as_millis();
-
-
 
     // ── 阶段3: branch_meta 预取 ──
 
@@ -702,8 +640,6 @@ pub async fn prefetch_tubi_size_and_branch_meta(
 
     let bm_ms = t_bm.elapsed().as_millis();
 
-
-
     println!(
 
         "    [BRAN_TUBI] 独立预取完成: children={}, tubi_valid={}/{}, branch_meta={}/{}, concurrency={}, elapsed={}ms (phase1={}ms, phase2={}ms, bm={}ms)",
@@ -718,8 +654,6 @@ pub async fn prefetch_tubi_size_and_branch_meta(
 
     );
 
-
-
     Ok(BranchPrefetchResult {
 
         tubi_size_cache,
@@ -730,8 +664,6 @@ pub async fn prefetch_tubi_size_and_branch_meta(
 
 }
 
-
-
 #[derive(Debug, Serialize)]
 
 struct BranchTubiMissReasonStat {
@@ -741,8 +673,6 @@ struct BranchTubiMissReasonStat {
     refnos: Vec<String>,
 
 }
-
-
 
 #[derive(Debug, Serialize)]
 
@@ -766,8 +696,6 @@ struct BranchTubiCacheMissReport {
 
 }
 
-
-
 fn cache_miss_refno_limit() -> usize {
 
     std::env::var("AIOS_BRANCH_TUBI_MISS_REFNO_LIMIT")
@@ -781,8 +709,6 @@ fn cache_miss_refno_limit() -> usize {
         .unwrap_or(200)
 
 }
-
-
 
 fn cata_p1_pre_gen_concurrency() -> usize {
 
@@ -800,8 +726,6 @@ fn cata_p1_pre_gen_concurrency() -> usize {
 
 }
 
-
-
 fn cata_p1_slow_topn() -> usize {
 
     std::env::var("AIOS_CATA_P1_SLOW_TOPN")
@@ -814,8 +738,6 @@ fn cata_p1_slow_topn() -> usize {
 
 }
 
-
-
 fn cata_p1_slow_threshold_ms() -> u128 {
 
     std::env::var("AIOS_CATA_P1_SLOW_THRESHOLD_MS")
@@ -827,8 +749,6 @@ fn cata_p1_slow_threshold_ms() -> u128 {
         .unwrap_or(1000)
 
 }
-
-
 
 fn branch_tubi_p4_prefetch_concurrency() -> usize {
 
@@ -845,8 +765,6 @@ fn branch_tubi_p4_prefetch_concurrency() -> usize {
         .unwrap_or(12)
 
 }
-
-
 
 fn record_branch_cache_miss(
 
@@ -868,8 +786,6 @@ fn record_branch_cache_miss(
 
 }
 
-
-
 fn axis_to_tubi_size(axis: &CateAxisParam) -> Option<TubiSize> {
 
     if axis.pwidth > 0.0 && axis.pheight > 0.0 {
@@ -888,15 +804,11 @@ fn axis_to_tubi_size(axis: &CateAxisParam) -> Option<TubiSize> {
 
 }
 
-
-
 fn derive_tubi_size_from_axis_pair(axis: &[CateAxisParam; 2]) -> Option<TubiSize> {
 
     axis_to_tubi_size(&axis[1]).or_else(|| axis_to_tubi_size(&axis[0]))
 
 }
-
-
 
 fn select_axis_pair_from_ptset_map(
 
@@ -923,8 +835,6 @@ fn select_axis_pair_from_ptset_map(
     Some([items[0].clone(), items[1].clone()])
 
 }
-
-
 
 fn parse_branch_cache_meta(info: &EleGeosInfo) -> Option<BranchCacheMeta> {
 
@@ -984,8 +894,6 @@ fn parse_branch_cache_meta(info: &EleGeosInfo) -> Option<BranchCacheMeta> {
 
 }
 
-
-
 async fn load_cached_inst_info_for_refnos(
 
     cache_manager: &InstanceCacheManager,
@@ -1002,13 +910,9 @@ async fn load_cached_inst_info_for_refnos(
 
     }
 
-
-
     // cache-only：ref0 != dbnum，必须依赖 db_meta 映射来分桶读取；缺失视为致命错误。
 
     db_meta().ensure_loaded()?;
-
-
 
     let mut groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
 
@@ -1048,8 +952,6 @@ async fn load_cached_inst_info_for_refnos(
 
         }
 
-
-
         if !missing_refnos.is_empty() {
 
             missing_refnos.sort_by_key(|r| r.refno());
@@ -1082,13 +984,9 @@ async fn load_cached_inst_info_for_refnos(
 
     }
 
-
-
     Ok(result)
 
 }
-
-
 
 fn write_branch_tubi_cache_miss_report(
 
@@ -1266,13 +1164,9 @@ fn write_branch_tubi_cache_miss_report(
 
 }
 
-
-
 // gen_cata_single_geoms 已移至 gen_model/cate_single.rs
 
 // cal_sjus_value 已移至 gen_model/cate_helpers.rs
-
-
 
 /// 生成元件库的branch型几何体
 
@@ -1326,8 +1220,6 @@ pub async fn gen_cata_geos(
 
 }
 
-
-
 /// 仅处理普通 CATE 元件库几何体（不处理 BRAN/HANG tubing）
 
 pub async fn gen_cata_instances(
@@ -1378,8 +1270,6 @@ pub async fn gen_cata_instances(
 
 }
 
-
-
 /// 仅处理 BRAN/HANG tubing（不生成普通 CATE 几何体）
 
 pub async fn gen_branch_tubi(
@@ -1415,8 +1305,6 @@ pub async fn gen_branch_tubi(
     .await
 
 }
-
-
 
 /// BRAN/HANG tubing（DB fallback 模式，可接受外部预取结果）
 
@@ -1472,8 +1360,6 @@ pub async fn gen_branch_tubi_from_db_with_prefetch(
 
 }
 
-
-
 /// BRAN/HANG tubing（DB fallback 模式）
 
 /// - cache 命中优先
@@ -1527,8 +1413,6 @@ pub async fn gen_branch_tubi_from_db(
     .ok_or_else(|| anyhow::anyhow!("branch outcome missing"))
 
 }
-
-
 
 /// BRAN/HANG tubing（strict cache-only 模式）
 
@@ -1584,8 +1468,6 @@ pub async fn gen_branch_tubi_cache_only(
 
 }
 
-
-
 #[instrument(skip(db_option, target_cata_map, branch_map, sjus_map_arc, sender))]
 
 async fn gen_cata_geos_inner(
@@ -1620,8 +1502,6 @@ async fn gen_cata_geos_inner(
 
     init_chrome_tracing()?;
 
-
-
     let total_t = Instant::now();
 
     // let mut handles = FuturesUnordered::new();
@@ -1648,13 +1528,9 @@ async fn gen_cata_geos_inner(
 
     let tubi_info_map: Arc<DashMap<String, TubiInfoData>> = Arc::new(DashMap::new());
 
-
-
     // 用于收集总耗时的互斥锁
 
     let total_time_stats = Arc::new(Mutex::new(HashMap::new()));
-
-
 
     // resolve_desi_comp 产物缓存（按 cata_hash）。使用进程内全局缓存，跨多轮 gen_cata_geos 调用复用。
 
@@ -1672,8 +1548,6 @@ async fn gen_cata_geos_inner(
 
     let cata_resolve_cache_only = std::env::var_os("AIOS_CATA_RESOLVE_CACHE_ONLY").is_some();
 
-
-
     let db_time_fetch_keys = Instant::now();
 
     let all_unique_keys = Arc::new(
@@ -1687,8 +1561,6 @@ async fn gen_cata_geos_inner(
             .collect::<Vec<_>>(),
 
     );
-
-
 
     let unique_cata_cnt = all_unique_keys.len();
 
@@ -1704,29 +1576,34 @@ async fn gen_cata_geos_inner(
 
     );
 
-    let mut batch_chunks_cnt = 4usize.min(unique_cata_cnt.max(1));
-
-    let mut batch_size = (unique_cata_cnt + batch_chunks_cnt - 1) / batch_chunks_cnt;
-
-    if batch_size == 0 {
-
-        batch_size = 1;
-
-    }
-
     let test_refno = db_option.get_test_refno();
 
-    //如果只有一个元件，就不分块了
+    // ── worker 分组：按 refno 数量（而非 cata_hash 数量）动态分组 ──
+    // 每个 worker 覆盖约 WORKER_REFNO_BATCH 个 refnos，独立完成预取+生成。
+    const WORKER_REFNO_BATCH: usize = 200;
+    const WORKER_CONCURRENCY: usize = 6;
 
-    if batch_size == 1 {
-
-        batch_chunks_cnt = unique_cata_cnt;
-
-    } else {
-
-        batch_chunks_cnt = (unique_cata_cnt + batch_size - 1) / batch_size;
-
-    }
+    let worker_ranges: Vec<(usize, usize)> = {
+        let mut ranges = Vec::new();
+        let mut group_start = 0usize;
+        let mut acc_refnos = 0usize;
+        for j in 0..unique_cata_cnt {
+            let cata_hash = &all_unique_keys[j];
+            if cata_hash != "0" {
+                if let Some(tc) = target_cata_map.get(cata_hash) {
+                    acc_refnos += tc.group_refnos.len();
+                }
+            }
+            if acc_refnos >= WORKER_REFNO_BATCH || j == unique_cata_cnt - 1 {
+                if acc_refnos > 0 || j == unique_cata_cnt - 1 {
+                    ranges.push((group_start, j + 1));
+                }
+                group_start = j + 1;
+                acc_refnos = 0;
+            }
+        }
+        ranges
+    };
 
     #[cfg(feature = "profile")]
 
@@ -1734,115 +1611,17 @@ async fn gen_cata_geos_inner(
 
         unique_cata_cnt,
 
-        batch_chunks_cnt,
+        worker_count = worker_ranges.len(),
 
         "Starting to process catalog models"
 
     );
 
-
-
     if process_cata && !all_unique_keys.is_empty() {
 
         // ════════════════════════════════════════════════════════════════════════════
-
-        // P3 优化：P0/P1 全局执行一次 + 4 个 batch 主循环并发
-
+        // Worker 流水线模式：按 refno 数量动态分组，每个 worker 独立完成预取+生成。
         // ════════════════════════════════════════════════════════════════════════════
-
-        //
-
-        // 【优化原理】
-
-        // P0 预取和 P1 预执行只需全局执行一次（覆盖所有 unique_cata），
-
-        // 避免 4 个 batch 各自独立预取导致数据库并发请求爆炸。
-
-        // 预取/预执行完成后，4 个 batch 的主循环（纯 cache hit + per-element 处理）并发执行。
-
-        // ════════════════════════════════════════════════════════════════════════════
-
-
-
-        // ── P0 优化（全局）：批量并发预取 attmap + transform ──
-
-        let t_prefetch_global = Instant::now();
-
-        {
-
-            let mut all_refnos: Vec<RefnoEnum> = Vec::new();
-
-            for j in 0..unique_cata_cnt {
-
-                let cata_hash = &all_unique_keys[j];
-
-                if cata_hash == "0" {
-
-                    continue;
-
-                }
-
-                if let Some(target_cata) = target_cata_map.get(cata_hash) {
-
-                    all_refnos.extend_from_slice(&target_cata.group_refnos);
-
-                }
-
-            }
-
-            all_refnos.sort_unstable();
-
-            all_refnos.dedup();
-
-
-
-            if !all_refnos.is_empty() {
-
-                let attmap_futs: Vec<_> = all_refnos
-
-                    .iter()
-
-                    .map(|&r| aios_core::get_named_attmap(r))
-
-                    .collect();
-
-                let transform_fut = crate::fast_model::transform_cache::get_world_transforms_cache_first_batch(
-
-                    Some(db_option.as_ref()),
-
-                    &all_refnos,
-
-                );
-
-
-
-                let (attmap_results, _transform_result) = tokio::join!(
-
-                    futures::future::join_all(attmap_futs),
-
-                    transform_fut,
-
-                );
-
-                let _ = attmap_results;
-
-
-
-                println!(
-
-                    "    [gen_cata_geos] P0 全局预取完成: refnos={}, elapsed={}ms",
-
-                    all_refnos.len(),
-
-                    t_prefetch_global.elapsed().as_millis()
-
-                );
-
-            }
-
-        }
-
-
 
         // ── P1 优化（全局）：并发预执行 gen_cata_single_geoms ──
 
@@ -1867,8 +1646,6 @@ async fn gen_cata_geos_inner(
             let sem = Arc::new(Semaphore::new(pre_gen_concurrency));
 
             let mut pre_gen_handles = Vec::new();
-
-
 
             for j in 0..unique_cata_cnt {
 
@@ -1895,8 +1672,6 @@ async fn gen_cata_geos_inner(
                 let target_group_refnos = target_cata.group_refnos.clone();
 
                 drop(target_cata);
-
-
 
                 let needs_generate = process_cata && (force_regen_cata_flag || !target_exist_inst);
 
@@ -1926,8 +1701,6 @@ async fn gen_cata_geos_inner(
 
                 };
 
-
-
                 let sem = sem.clone();
 
                 let pre_gen_results = pre_gen_results.clone();
@@ -1936,15 +1709,11 @@ async fn gen_cata_geos_inner(
 
                 let pre_gen_timing_samples = pre_gen_timing_samples.clone();
 
-
-
                 pre_gen_handles.push(tokio::spawn(async move {
 
                     let _permit = sem.acquire().await.unwrap();
 
                     let t_item = Instant::now();
-
-
 
                     let csg_shapes_map = Arc::new(CateCsgShapeMap::new());
 
@@ -1981,8 +1750,6 @@ async fn gen_cata_geos_inner(
                 }));
 
             }
-
-
 
             if !pre_gen_handles.is_empty() {
 
@@ -2084,19 +1851,24 @@ async fn gen_cata_geos_inner(
 
         }
 
-
-
         // ── P2 优化（全局）：pos_neg_cache 共享 ──
 
         let pos_neg_cache: Arc<DashMap<RefnoEnum, HashMap<RefnoEnum, Vec<RefnoEnum>>>> = Arc::new(DashMap::new());
 
+        // ── Worker 流水线：按 refno 数量分组，每个 worker 独立预取+生成 ──
 
-
-        // ── P3 优化：4 个 batch 主循环并发执行 ──
+        let worker_sem = Arc::new(Semaphore::new(WORKER_CONCURRENCY));
 
         let mut batch_handles = Vec::new();
 
-        for i in 0..batch_chunks_cnt {
+        println!(
+            "    [gen_cata_geos] worker 流水线: {} 个 worker, concurrency={}, refno_batch={}",
+            worker_ranges.len(),
+            WORKER_CONCURRENCY,
+            WORKER_REFNO_BATCH,
+        );
+
+        for (worker_idx, &(start_idx, end_idx)) in worker_ranges.iter().enumerate() {
 
             let all_unique_keys = all_unique_keys.clone();
 
@@ -2120,31 +1892,43 @@ async fn gen_cata_geos_inner(
 
             let pos_neg_cache = pos_neg_cache.clone();
 
-            let batch_id = i + 1;
+            let worker_sem = worker_sem.clone();
 
-
-
-            let start_idx = i * batch_size;
-
-            if start_idx >= unique_cata_cnt {
-
-                continue;
-
-            }
-
-            let mut end_idx = start_idx + batch_size;
-
-            if end_idx > unique_cata_cnt {
-
-                end_idx = unique_cata_cnt;
-
-            }
-
-
+            let batch_id = worker_idx + 1;
 
             batch_handles.push(tokio::spawn(async move {
 
+            let _permit = worker_sem.acquire().await.expect("worker semaphore closed");
 
+            let t_worker = Instant::now();
+
+            // ── worker 预取：收集本 worker 范围内的 refnos，批量预取 attmap + transform ──
+            {
+                let mut worker_refnos: Vec<RefnoEnum> = Vec::new();
+                for j in start_idx..end_idx {
+                    let cata_hash = &all_unique_keys[j];
+                    if cata_hash == "0" { continue; }
+                    if let Some(tc) = target_cata_map.get(cata_hash) {
+                        worker_refnos.extend_from_slice(&tc.group_refnos);
+                    }
+                }
+                worker_refnos.sort_unstable();
+                worker_refnos.dedup();
+                if !worker_refnos.is_empty() {
+                    let attmap_futs: Vec<_> = worker_refnos
+                        .iter()
+                        .map(|&r| aios_core::get_named_attmap(r))
+                        .collect();
+                    let transform_fut = crate::fast_model::transform_cache::get_world_transforms_cache_first_batch(
+                        Some(db_option.as_ref()),
+                        &worker_refnos,
+                    );
+                    let _ = tokio::join!(
+                        futures::future::join_all(attmap_futs),
+                        transform_fut,
+                    );
+                }
+            }
 
             let mut shape_insts_data = ShapeInstancesData::default();
 
@@ -2153,8 +1937,6 @@ async fn gen_cata_geos_inner(
                 shape_insts_data.fill_basic_shapes();
 
             }
-
-
 
             let mut db_time_get_named_attmap = 0;
 
@@ -2170,17 +1952,13 @@ async fn gen_cata_geos_inner(
 
             let mut db_time_query_refnos = 0;
 
-
-
-            // ── 主循环：处理本 batch 的 cata_hash ──
+            // ── 主循环：处理本 worker 的 cata_hash ──
 
             'cata_loop: for j in start_idx..end_idx {
 
                 #[cfg(feature = "profile")]
 
                 tracing::debug!(item_idx = j, "Processing item");
-
-
 
                 let cata_hash = all_unique_keys[j].clone();
 
@@ -2218,8 +1996,6 @@ async fn gen_cata_geos_inner(
 
                 );
 
-
-
                 // regen-model/replace_mesh 场景：更偏向“重建并校验几何正确性”，
 
                 // 若复用旧 inst_info/inst_geo，可能掩盖“同一 cata_hash 组内部分 refno 缺失实例”的问题。
@@ -2227,8 +2003,6 @@ async fn gen_cata_geos_inner(
                 // 因此在 replace_mesh 模式下强制走生成路径，确保 group_refnos 都会被补齐。
 
                 let force_regen_cata = process_cata && replace_exist;
-
-
 
                 // 复用路径：inst_info 已存在（且 ptset 已可解析），跳过昂贵的元件库几何生成。
 
@@ -2244,11 +2018,7 @@ async fn gen_cata_geos_inner(
 
                     );
 
-
-
                     let reuse_ptset_map = target_ptset.clone().unwrap_or_default();
-
-
 
                     // 伪属性缓存（用于 ATTRIB ... OF PREV 等表达式）；按 cata_hash 共享即可。
 
@@ -2320,8 +2090,6 @@ async fn gen_cata_geos_inner(
 
                     }
 
-
-
                     for &ele_refno in target_group_refnos.iter() {
 
                         let ele_att = match aios_core::get_named_attmap(ele_refno).await {
@@ -2331,8 +2099,6 @@ async fn gen_cata_geos_inner(
                             Err(_) => continue,
 
                         };
-
-
 
                         let (owner_refno, owner_type) =
 
@@ -2347,8 +2113,6 @@ async fn gen_cata_geos_inner(
                             None
 
                         };
-
-
 
                         let mut geos_info = EleGeosInfo {
 
@@ -2372,8 +2136,6 @@ async fn gen_cata_geos_inner(
 
                         };
 
-
-
                         if ele_att.contains_key("ARRI") && !reuse_ptset_map.is_empty() {
 
                             let arrive = ele_att.get_i32("ARRI").unwrap_or(-1);
@@ -2387,8 +2149,6 @@ async fn gen_cata_geos_inner(
                             {
 
                                 local_al_map_clone.insert(ele_refno, [a.clone(), l.clone()]);
-
-
 
                                 // 仅对“有效 cata_hash”收集 tubi_info，避免 refno 兜底 key 进入数据库。
 
@@ -2418,8 +2178,6 @@ async fn gen_cata_geos_inner(
 
                         }
 
-
-
                         shape_insts_data.insert_info(ele_refno, geos_info);
 
                         if shape_insts_data.inst_cnt() >= SEND_INST_SIZE {
@@ -2438,8 +2196,6 @@ async fn gen_cata_geos_inner(
 
                 }
 
-
-
                 // inst_info 不存在：需要生成元件库几何（并产出 inst_info/inst_geo/geo_relate 等）。
 
                 if process_cata && (force_regen_cata || !target_exist_inst) {
@@ -2455,8 +2211,6 @@ async fn gen_cata_geos_inner(
                     };
 
                     process_refno = Some(ele_refno);
-
-
 
                     let t_get_cat_refno = Instant::now();
 
@@ -2501,8 +2255,6 @@ async fn gen_cata_geos_inner(
 
                     db_time_get_cat_refno += t_get_cat_refno.elapsed().as_millis();
 
-
-
                     // 无元件库引用（如 FIXING）时，跳过 GMSE/NGMR 查询和 cache 路径，
                     // 直接进入 gen_cata_single_geoms 通过子原语生成几何体。
                     let mut valid_gmse = false;
@@ -2518,8 +2270,6 @@ async fn gen_cata_geos_inner(
                     #[cfg(feature = "profile")]
 
                     tracing::debug!(ele_refno = ?ele_refno, cata_refno = ?cata_refno, "开始生成元件库模型");
-
-
 
                     let t_query_single = Instant::now();
 
@@ -2605,8 +2355,6 @@ async fn gen_cata_geos_inner(
 
                     }
 
-
-
                     let t_query_single2 = Instant::now();
 
                     #[cfg(feature = "profile")]
@@ -2623,13 +2371,9 @@ async fn gen_cata_geos_inner(
 
                     db_time_query_single += t_query_single2.elapsed().as_millis();
 
-
-
                     valid_gmse = gmse_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
 
                     valid_ngmr = ngmr_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
-
-
 
                     if !valid_gmse && !valid_ngmr {
 
@@ -2659,8 +2403,6 @@ async fn gen_cata_geos_inner(
 
                     }
 
-
-
                     // 优先走 foyer cache：缓存命中时，直接构造 inst_geo/inst_info 所需的数据并写入 sender。
 
                     if let Some(cache_mgr) = cata_resolve_cache.as_ref() {
@@ -2674,8 +2416,6 @@ async fn gen_cata_geos_inner(
                                 cata_hash
 
                             );
-
-
 
                             // ──────────────────────────────────────────────────────────────────────
 
@@ -2723,8 +2463,6 @@ async fn gen_cata_geos_inner(
 
                             db_time_query_refnos += t_query_refnos.elapsed().as_millis();
 
-
-
                             let neg_own_pos_map: HashMap<RefnoEnum, RefnoEnum> = pos_neg_map
 
                                 .iter()
@@ -2733,11 +2471,7 @@ async fn gen_cata_geos_inner(
 
                                 .collect();
 
-
-
                             let cur_ptset_map = resolved_comp.ptset_map();
-
-
 
                             // 伪属性缓存：按 cata_hash 共享（同 inst_info exist 分支保持一致）。
 
@@ -2764,8 +2498,6 @@ async fn gen_cata_geos_inner(
                                             let mut lock = HASH_PSEUDO_ATT_MAPS.write().await;
 
                                             db_time_hash_lock += t_lock.elapsed().as_millis();
-
-
 
                                             let psudo_map = lock
 
@@ -2829,8 +2561,6 @@ async fn gen_cata_geos_inner(
 
                             }
 
-
-
                             // 将缓存里的 PreparedInstGeo 转换为 EleInstGeo（补齐 Neg/Compound/NGMR 关系）。
 
                             let respect_tufl = std::env::var_os("AIOS_RESPECT_TUFL").is_some();
@@ -2847,8 +2577,6 @@ async fn gen_cata_geos_inner(
 
                             }
 
-
-
                             let mut geo_insts_tpl: Vec<EleInstGeo> = Vec::new();
 
                             let mut has_cata_neg = false;
@@ -2863,15 +2591,11 @@ async fn gen_cata_geos_inner(
 
                                 }
 
-
-
                                 let geom_refno = g.geom_refno;
 
                                 let is_ngmr = g.geo_type == GeoBasicType::CataCrossNeg;
 
                                 let is_neg = neg_own_pos_map.contains_key(&geom_refno);
-
-
 
                                 let mut cata_neg_refnos =
 
@@ -2884,8 +2608,6 @@ async fn gen_cata_geos_inner(
                                     has_cata_neg = true;
 
                                 }
-
-
 
                                 let geo_type = if is_ngmr {
 
@@ -2907,8 +2629,6 @@ async fn gen_cata_geos_inner(
 
                                 };
 
-
-
                                 if geo_type == GeoBasicType::Pos || geo_type == GeoBasicType::Compound
 
                                 {
@@ -2917,13 +2637,9 @@ async fn gen_cata_geos_inner(
 
                                 }
 
-
-
                                 // CATE 本体孔洞走 inst.geo_type=CataNeg + cata_neg_refnos，
 
                                 // 不写 neg_relate_map（该关系用于设计负实体 carrier，不适用于 CATA 几何 refno）。
-
-
 
                                 geo_insts_tpl.push(EleInstGeo {
 
@@ -2952,8 +2668,6 @@ async fn gen_cata_geos_inner(
                                 });
 
                             }
-
-
 
                             // 逐个实例写入（每个 refno 都需要有 inst_info/inst_geo/geo_relate）
 
@@ -3045,8 +2759,6 @@ async fn gen_cata_geos_inner(
 
                                     t_get_world_transform.elapsed().as_millis();
 
-
-
                                 let t_get_named_attmap2 = Instant::now();
 
                                 let ele_att = match aios_core::get_named_attmap(ele_refno).await {
@@ -3087,8 +2799,6 @@ async fn gen_cata_geos_inner(
 
                                     t_get_named_attmap2.elapsed().as_millis();
 
-
-
                                 // SJUS 调整：保持与旧生成分支一致
 
                                 if let Some(sjus) = ele_att.get_str("SJUS") {
@@ -3100,8 +2810,6 @@ async fn gen_cata_geos_inner(
                                         let height = sjus_adjust.value().1;
 
                                         let off_z = cal_sjus_value(sjus, height);
-
-
 
                                         let t_get_world_transform2 = Instant::now();
 
@@ -3147,8 +2855,6 @@ async fn gen_cata_geos_inner(
 
                                             t_get_world_transform2.elapsed().as_millis();
 
-
-
                                         world_transform.translation.z = parent_trans.translation.z;
 
                                         world_transform.translation = world_transform.translation
@@ -3160,8 +2866,6 @@ async fn gen_cata_geos_inner(
                                     }
 
                                 }
-
-
 
                                 let (owner_refno, owner_type) =
 
@@ -3178,8 +2882,6 @@ async fn gen_cata_geos_inner(
                                 };
 
                                 let cur_type = ele_att.get_type_str();
-
-
 
                                 let mut geos_info = EleGeosInfo {
 
@@ -3211,8 +2913,6 @@ async fn gen_cata_geos_inner(
 
                                 };
 
-
-
                                 if ele_att.contains_key("ARRI") && !cur_ptset_map.is_empty() {
 
                                     let arrive = ele_att.get_i32("ARRI").unwrap_or(-1);
@@ -3226,8 +2926,6 @@ async fn gen_cata_geos_inner(
                                     {
 
                                         local_al_map_clone.insert(ele_refno, [a.clone(), l.clone()]);
-
-
 
                                         // 收集 tubi_info（增量，自动去重）
 
@@ -3257,8 +2955,6 @@ async fn gen_cata_geos_inner(
 
                                 }
 
-
-
                                 // 注意：即使本组缓存的 insts 为空，我们也应尽量收集 ARRIVE/LEAVE 点，
 
                                 // 以保证 BRAN tubing 第二阶段仍可工作；但不写入 inst_geo/inst_info。
@@ -3268,8 +2964,6 @@ async fn gen_cata_geos_inner(
                                     continue;
 
                                 }
-
-
 
                                 // NGMR：按实例写入（owner 可能依赖 ele_refno）
 
@@ -3301,8 +2995,6 @@ async fn gen_cata_geos_inner(
 
                                 }
 
-
-
                                 let inst_key = geos_info.get_inst_key();
 
                                 let geos_data = EleInstGeosData {
@@ -3321,8 +3013,6 @@ async fn gen_cata_geos_inner(
 
                                 };
 
-
-
                                 shape_insts_data.insert_info(ele_refno, geos_info);
 
                                 shape_insts_data.insert_geos_data(inst_key, geos_data);
@@ -3338,8 +3028,6 @@ async fn gen_cata_geos_inner(
                                 }
 
                             }
-
-
 
                             // 完成当前 cata_hash 的写入，进入下一个 key（跳过 gen_cata_single_geoms/shape 处理链路）。
 
@@ -3389,8 +3077,6 @@ async fn gen_cata_geos_inner(
 
                     let desi_att: NamedAttrMap;
 
-
-
                     if let Some((_key, (pre_shapes, pre_axis))) = pre_gen_results.remove(&ele_refno) {
 
                         // ──────────────────────────────────────────────────────────────────────
@@ -3430,8 +3116,6 @@ async fn gen_cata_geos_inner(
                         }
 
                         desi_att = desi_att_result.unwrap();
-
-
 
                         // 将 Arc<CateCsgShapeMap> 解包：如果是唯一引用则 unwrap，否则逐条复制
 
@@ -3497,8 +3181,6 @@ async fn gen_cata_geos_inner(
 
                         );
 
-
-
                         let t_get_named_attmap = Instant::now();
 
                         #[cfg(feature = "profile")]
@@ -3539,11 +3221,7 @@ async fn gen_cata_geos_inner(
 
                         db_time_get_named_attmap += t_get_named_attmap.elapsed().as_millis();
 
-
-
                         design_axis_map = DashMap::new();
-
-
 
                         let t_gen_single_geoms = Instant::now();
 
@@ -3567,15 +3245,11 @@ async fn gen_cata_geos_inner(
 
                         );
 
-
-
                         if let Err(e) = r {
 
                             #[cfg(feature = "profile")]
 
                             tracing::error!(ele_refno = ?ele_refno, error = ?e, "生成元件库模型失败");
-
-
 
                             // 根据错误信息分类
 
@@ -3611,8 +3285,6 @@ async fn gen_cata_geos_inner(
 
                             };
 
-
-
                             let desc = match code {
 
                                 "E-EXPR-001" => "表达式计算失败",
@@ -3622,8 +3294,6 @@ async fn gen_cata_geos_inner(
                                 _ => "生成模型失败",
 
                             };
-
-
 
                             crate::model_error!(
 
@@ -3655,11 +3325,7 @@ async fn gen_cata_geos_inner(
 
                     }
 
-
-
                     let cur_type = desi_att.get_type_str();
-
-
 
                     // 生成成功后，将 resolve_desi_comp 产物回灌到 foyer cache（按 cata_hash）。
 
@@ -3704,8 +3370,6 @@ async fn gen_cata_geos_inner(
                         }
 
                     }
-
-
 
                     // 同一 cata_hash 可能对应多个 design_refno（group_refnos）。
 
@@ -3761,8 +3425,6 @@ async fn gen_cata_geos_inner(
 
                     }
 
-
-
                     {
 
                         // 将一些伪属性需要用到的值存下来，后面也要更新维护这些伪属性，避免重复计算
@@ -3773,15 +3435,11 @@ async fn gen_cata_geos_inner(
 
                         db_time_hash_lock += t_lock.elapsed().as_millis();
 
-
-
                         let psudo_map = lock
 
                             .entry(cata_hash.clone())
 
                             .or_insert(NamedAttrMap::default());
-
-
 
                         if desi_att.contains_key("LEAV") {
 
@@ -3807,8 +3465,6 @@ async fn gen_cata_geos_inner(
 
                             }
 
-
-
                             if axis_map.contains_key(&leave) {
 
                                 let v = axis_map.get(&leave).unwrap();
@@ -3828,8 +3484,6 @@ async fn gen_cata_geos_inner(
                         }
 
                     }
-
-
 
                     /// 处理几何体的 shapes：按 group_refnos 逐个处理，确保同一 cata_hash 组内每个 refno 都被写入。
 
@@ -3961,8 +3615,6 @@ async fn gen_cata_geos_inner(
 
                         );
 
-
-
                         let t_get_named_attmap2 = Instant::now();
 
                         let ele_att = match aios_core::get_named_attmap(ele_refno).await {
@@ -4001,8 +3653,6 @@ async fn gen_cata_geos_inner(
 
                         db_time_get_named_attmap += t_get_named_attmap2.elapsed().as_millis();
 
-
-
                         if let Some(sjus) = ele_att.get_str("SJUS") {
 
                             let parent = ele_att.get_owner();
@@ -4012,8 +3662,6 @@ async fn gen_cata_geos_inner(
                                 let height = sjus_adjust.value().1;
 
                                 let off_z = cal_sjus_value(sjus, height);
-
-
 
                                 let t_get_world_transform2 = Instant::now();
 
@@ -4053,8 +3701,6 @@ async fn gen_cata_geos_inner(
 
                                     t_get_world_transform2.elapsed().as_millis();
 
-
-
                                 world_transform.translation.z = parent_trans.translation.z;
 
                                 world_transform.translation = world_transform.translation
@@ -4066,8 +3712,6 @@ async fn gen_cata_geos_inner(
                             }
 
                         }
-
-
 
                         // ──────────────────────────────────────────────────────────────────────
 
@@ -4117,8 +3761,6 @@ async fn gen_cata_geos_inner(
 
                         db_time_query_refnos += t_query_refnos.elapsed().as_millis();
 
-
-
                         let mut neg_own_pos_map: HashMap<RefnoEnum, RefnoEnum> = pos_neg_map
 
                             .iter()
@@ -4129,8 +3771,6 @@ async fn gen_cata_geos_inner(
 
                             .collect();
 
-
-
                         let cur_ptset_map = design_axis_map
 
                             .remove(&ele_refno)
@@ -4138,8 +3778,6 @@ async fn gen_cata_geos_inner(
                             .map(|x| x.1)
 
                             .unwrap_or_default();
-
-
 
                         let (owner_refno, owner_type) =
 
@@ -4182,8 +3820,6 @@ async fn gen_cata_geos_inner(
                             ..Default::default()
 
                         };
-
-
 
                         if ele_att.contains_key("ARRI") && !cur_ptset_map.is_empty() {
 
@@ -4229,8 +3865,6 @@ async fn gen_cata_geos_inner(
 
                         };
 
-
-
                         let mut geo_insts = vec![];
 
                         // 诊断：为什么最终 inst_cnt=0（通常是所有 shape 都在这里被跳过）
@@ -4259,8 +3893,6 @@ async fn gen_cata_geos_inner(
 
                         }
 
-
-
                         debug_model!(
 
                             "About to process {} shapes for ele_refno={}",
@@ -4270,8 +3902,6 @@ async fn gen_cata_geos_inner(
                             ele_refno
 
                         );
-
-
 
                         for (shape_idx, shape) in shapes.into_iter().enumerate() {
 
@@ -4306,8 +3936,6 @@ async fn gen_cata_geos_inner(
                                 ..
 
                             } = shape;
-
-
 
                             if !csg_shape.check_valid() {
 
@@ -4453,8 +4081,6 @@ async fn gen_cata_geos_inner(
 
                             let unit_flag = csg_shape.is_reuse_unit();
 
-
-
                             // unit_flag=true 时，写入"单位参数"，避免同一 geo_hash 复用时 mesh 被绝对尺寸污染，
 
                             // 同时确保保留 transform.scale 时不会重复缩放。
@@ -4470,8 +4096,6 @@ async fn gen_cata_geos_inner(
                                     .unwrap_or(geo_param);
 
                             }
-
-
 
                             // 统一处理 transform.scale 清零逻辑
 
@@ -4511,13 +4135,9 @@ async fn gen_cata_geos_inner(
 
                             };
 
-
-
                             // CATE 本体孔洞走 inst.geo_type=CataNeg + cata_neg_refnos，
 
                             // 不写 neg_relate_map（该关系用于设计负实体 carrier，不适用于 CATA 几何 refno）。
-
-
 
                             if is_ngmr {
 
@@ -4715,8 +4335,6 @@ async fn gen_cata_geos_inner(
 
                         };
 
-
-
                     let ele_att = aios_core::get_named_attmap(ele_refno)
 
                         .await
@@ -4740,8 +4358,6 @@ async fn gen_cata_geos_inner(
                         }
 
                     }
-
-
 
                     // 收集 arrive/leave 点信息
 
@@ -4853,8 +4469,6 @@ async fn gen_cata_geos_inner(
 
                     );
 
-
-
                     sender
 
                         .send(std::mem::take(&mut shape_insts_data))
@@ -4864,8 +4478,6 @@ async fn gen_cata_geos_inner(
                 }
 
             }
-
-
 
             // 将本批次的时间统计添加到总时间统计中（始终启用，开销可忽略）
 
@@ -4901,8 +4513,6 @@ async fn gen_cata_geos_inner(
 
             }
 
-
-
             if shape_insts_data.inst_cnt() > 0 {
 
                 debug_model!(
@@ -4925,27 +4535,21 @@ async fn gen_cata_geos_inner(
 
             }
 
-
-
             #[cfg(feature = "profile")]
 
             tracing::info!(batch_id, "Batch processing complete");
-
-
 
             })); // end tokio::spawn + batch_handles.push
 
         }
 
-
-
-        // P3: 等待所有 batch 并发完成
+        // 等待所有 worker 完成
 
         if !batch_handles.is_empty() {
 
-            let batch_cnt = batch_handles.len();
+            let worker_cnt = batch_handles.len();
 
-            let t_all_batches = Instant::now();
+            let t_all_workers = Instant::now();
 
             for h in batch_handles {
 
@@ -4955,11 +4559,11 @@ async fn gen_cata_geos_inner(
 
             println!(
 
-                "    [gen_cata_geos] P3 所有 {} 个 batch 并发完成, elapsed={}ms",
+                "    [gen_cata_geos] 所有 {} 个 worker 完成, elapsed={}ms",
 
-                batch_cnt,
+                worker_cnt,
 
-                t_all_batches.elapsed().as_millis()
+                t_all_workers.elapsed().as_millis()
 
             );
 
@@ -4967,19 +4571,13 @@ async fn gen_cata_geos_inner(
 
     }
 
-
-
     #[cfg(feature = "profile")]
 
     tracing::info!("Waiting for batches to complete");
 
-
-
     // Wait for batches to complete
 
     // while let Some(_) = handles.next().await {}
-
-
 
     let mut process_branch_time: u128 = 0;
 
@@ -5029,8 +4627,6 @@ async fn gen_cata_geos_inner(
 
     let mut p4_branch_meta_cnt: u32 = 0;
 
-
-
     let mut tubi_refnos: Vec<String> = Vec::new();
 
     let mut tubi_pts_map: DashMap<u64, String> = DashMap::new();
@@ -5061,11 +4657,7 @@ async fn gen_cata_geos_inner(
 
         let mut tubi_shape_insts_data = ShapeInstancesData::default();
 
-
-
         let t_process_branch = Instant::now();
-
-
 
         // ---------------------------------------------------------------------
 
@@ -5082,8 +4674,6 @@ async fn gen_cata_geos_inner(
         // ---------------------------------------------------------------------
 
         let t_global_prepare = Instant::now();
-
-
 
         // 1) 收集本轮所有子元件 refno（去重），用于批量预取 world_transform。
 
@@ -5116,8 +4706,6 @@ async fn gen_cata_geos_inner(
         let need_axis_refnos: Vec<RefnoEnum> = need_axis_set.into_iter().collect();
 
         cache_only_axis_need_total = need_axis_refnos.len();
-
-
 
         // cache-first：尽量从 foyer cache 获取 arrive/leave 点，减少 DB 查询量。
 
@@ -5243,8 +4831,6 @@ async fn gen_cata_geos_inner(
 
         cache_only_axis_hit_total = cache_al_map_global.len();
 
-
-
         let mut axis_missing_refnos_for_cache_only: Vec<RefnoEnum> = Vec::new();
 
         let mut axis_db_fallback_refno_cnt: usize = 0;
@@ -5359,8 +4945,6 @@ async fn gen_cata_geos_inner(
 
         }
 
-
-
         // 批量从 transform_cache 读取 world_transform（内存缓存 + pe_transform batch fallback）。
 
         let t_prefetch = Instant::now();
@@ -5417,8 +5001,6 @@ async fn gen_cata_geos_inner(
 
         );
 
-
-
         p4_local_prepare_time = t_global_prepare.elapsed().as_millis();
 
         debug_model!(
@@ -5432,8 +5014,6 @@ async fn gen_cata_geos_inner(
             p4_local_prepare_time
 
         );
-
-
 
         // 只为具备 axis_map 的子元件预取 tubi_size：
 
@@ -5458,8 +5038,6 @@ async fn gen_cata_geos_inner(
             .collect();
 
         let p4_prefetch_concurrency = branch_tubi_p4_prefetch_concurrency();
-
-
 
         // ════════════════════════════════════════════════════════════════════════════
 
@@ -5503,8 +5081,6 @@ async fn gen_cata_geos_inner(
 
             let sem = Arc::new(Semaphore::new(p4_prefetch_concurrency));
 
-
-
             // P6 优化：分两阶段预取，先过滤无效元素再查询 tubi_size
 
             // 原逻辑：对所有子元素都执行 query_single_by_paths + resolve_desi_comp
@@ -5512,8 +5088,6 @@ async fn gen_cata_geos_inner(
             // 问题：全量数据中只有 ~37% 有 tubi_size，63% 的 resolve_desi_comp 调用完全无效
 
             // 优化：阶段1 批量查 LSTU→CATR（轻量），阶段2 只对有效的调用 query_tubi_size（重量）
-
-
 
             // 阶段 1：并发查询所有子元素的 LSTU→CATR 路径（轻量查询）
 
@@ -5591,8 +5165,6 @@ async fn gen_cata_geos_inner(
 
             );
 
-
-
             // 阶段 2：只对有 LSTU→CATR 的子元素查询 tubi_size（重量查询）
 
             let t_p4_phase2 = Instant::now();
@@ -5669,8 +5241,6 @@ async fn gen_cata_geos_inner(
 
         };
 
-
-
         // P4 优化（第二部分）：全局批量并发预取 branch_meta 数据
 
         // 瓶颈：每个 branch 串行查询 get_named_attmap(h_ref) + query_tubi_size + get_type_name = 3.5s
@@ -5724,8 +5294,6 @@ async fn gen_cata_geos_inner(
             let branch_refnos: Vec<RefnoEnum> = branch_map.iter().map(|x| *x.key()).collect();
 
             let mut handles = Vec::new();
-
-
 
             // 使用 Semaphore 控制并发度
 
@@ -5829,13 +5397,9 @@ async fn gen_cata_geos_inner(
 
         };
 
-
-
         // P4 全局准备（含预取）总耗时
 
         p4_global_prepare_time = t_global_prepare.elapsed().as_millis();
-
-
 
         for bran_data in branch_map.iter() {
 
@@ -5847,8 +5411,6 @@ async fn gen_cata_geos_inner(
 
                 || branch_refno.to_e3d_id() == "24381/103385";
 
-
-
             debug_model!(
 
                 "[BRAN_TUBI] 开始处理 BRAN/HANG 分支: refno={}, children_len={}",
@@ -5859,13 +5421,9 @@ async fn gen_cata_geos_inner(
 
             );
 
-
-
             #[cfg(feature = "profile")]
 
             let branch_item_start = Instant::now();
-
-
 
             let t_get_children = Instant::now();
 
@@ -5876,8 +5434,6 @@ async fn gen_cata_geos_inner(
             // };
 
             db_time_get_children += t_get_children.elapsed().as_millis();
-
-
 
             let t_get_world_transform = Instant::now();
 
@@ -5975,8 +5531,6 @@ async fn gen_cata_geos_inner(
 
             db_time_get_branch_transform += t_get_world_transform.elapsed().as_millis();
 
-
-
             let branch_sesno: i32;
 
             let branch_type_str: String;
@@ -5996,8 +5550,6 @@ async fn gen_cata_geos_inner(
             let tdir: Vec3;
 
             let mut h_tubi_size: TubiSize;
-
-
 
             if matches!(branch_mode, BranchTubiMode::CacheOnly) {
 
@@ -6019,8 +5571,6 @@ async fn gen_cata_geos_inner(
 
                 tref = branch_refno;
 
-
-
                 let meta = parse_branch_cache_meta(branch_info).ok_or_else(|| {
 
                     anyhow::anyhow!(
@@ -6032,8 +5582,6 @@ async fn gen_cata_geos_inner(
                     )
 
                 })?;
-
-
 
                 let h_world = meta.h_axis.transformed(&branch_transform);
 
@@ -6131,8 +5679,6 @@ async fn gen_cata_geos_inner(
 
                 db_time_get_branch_att += t_get_named_attmap.elapsed().as_millis();
 
-
-
                 let Some(hpt) = branch_att.get_vec3("HPOS") else {
 
                     record_refno_error(
@@ -6175,8 +5721,6 @@ async fn gen_cata_geos_inner(
 
                     branch_transform.transform_point(branch_att.get_vec3("TPOS").unwrap());
 
-
-
                 is_hang = branch_att.get_type_str() == "HANG";
 
                 let h_ref = branch_att
@@ -6184,8 +5728,6 @@ async fn gen_cata_geos_inner(
                     .get_foreign_refno(if is_hang { "HREF" } else { "HSTU" })
 
                     .unwrap_or_default();
-
-
 
                 let t_branch_meta = Instant::now();
 
@@ -6238,8 +5780,6 @@ async fn gen_cata_geos_inner(
                 p4_branch_meta_cnt += 1;
 
             }
-
-
 
             if matches!(h_tubi_size, TubiSize::None) {
 
@@ -6298,8 +5838,6 @@ async fn gen_cata_geos_inner(
                 index: 0,
 
             };
-
-
 
             let is_hvac = bran_owner_type == "HVAC";
 
@@ -6601,8 +6139,6 @@ async fn gen_cata_geos_inner(
 
                             }
 
-
-
                             let arrive_hash = RsVec3(bran_ttube_pt).gen_hash();
 
                             if !tubi_pts_map.contains_key(&arrive_hash) {
@@ -6677,8 +6213,6 @@ async fn gen_cata_geos_inner(
 
             }
 
-
-
             let mut bran_comp_vec = vec![];
 
             let len = children.len();
@@ -6696,8 +6230,6 @@ async fn gen_cata_geos_inner(
                 len
 
             );
-
-
 
             let mut leave_type = "BRAN".to_string();
 
@@ -6862,8 +6394,6 @@ async fn gen_cata_geos_inner(
                                 continue;
 
                             };
-
-
 
                             let actual_vec = **a_pos - current_tubing.start_pt;
 
@@ -7477,8 +7007,6 @@ async fn gen_cata_geos_inner(
 
                 }
 
-
-
                 if index == len - 1 && !exclude {
 
                     let last_dist = bran_ttube_pt.distance(current_tubing.start_pt);
@@ -7917,8 +7445,6 @@ async fn gen_cata_geos_inner(
 
             }
 
-
-
             let branch_tubi_added: i32 = tubi_count - branch_tubi_before;
 
             debug_model!(
@@ -7930,8 +7456,6 @@ async fn gen_cata_geos_inner(
                 branch_tubi_added
 
             );
-
-
 
             #[cfg(feature = "profile")]
 
@@ -7957,8 +7481,6 @@ async fn gen_cata_geos_inner(
 
         process_branch_time = t_process_branch.elapsed().as_millis();
 
-
-
         #[cfg(feature = "profile")]
 
         tracing::info!(
@@ -7983,8 +7505,6 @@ async fn gen_cata_geos_inner(
 
         );
 
-
-
         // 提取tubi相关的refno列表
 
         tubi_refnos = tubi_shape_insts_data
@@ -7996,8 +7516,6 @@ async fn gen_cata_geos_inner(
             .map(|(refno, _)| refno.to_pe_key())
 
             .collect();
-
-
 
         let t_send_data = Instant::now();
 
@@ -8012,8 +7530,6 @@ async fn gen_cata_geos_inner(
         }
 
         send_data_time = t_send_data.elapsed().as_millis();
-
-
 
         tubi_query_time = 0;
 
@@ -8049,8 +7565,6 @@ async fn gen_cata_geos_inner(
 
             }
 
-
-
             let sql = tubi_relates.join("");
 
             debug_model!(
@@ -8068,8 +7582,6 @@ async fn gen_cata_geos_inner(
                     .unwrap_or("<empty>")
 
             );
-
-
 
             let t_query = Instant::now();
 
@@ -8092,8 +7604,6 @@ async fn gen_cata_geos_inner(
                 tubi_query_time
 
             );
-
-
 
             // 不再更新PE表的has_tubi字段，直接使用tubi_relate表判断
 
@@ -8121,8 +7631,6 @@ async fn gen_cata_geos_inner(
 
     }
 
-
-
     // 获取并打印汇总统计信息
 
     let mut time_stats = HashMap::new();
@@ -8132,8 +7640,6 @@ async fn gen_cata_geos_inner(
         time_stats = stats.into_inner();
 
     }
-
-
 
     // 添加分支处理的时间统计
 
@@ -8293,8 +7799,6 @@ async fn gen_cata_geos_inner(
 
     }
 
-
-
     // 打印汇总统计信息
 
     println!("\n==== 数据库操作总耗时统计 (ms) ====");
@@ -8304,8 +7808,6 @@ async fn gen_cata_geos_inner(
         time_stats.iter().map(|(k, v)| (k.clone(), *v)).collect();
 
     stats_vec.sort_by(|a, b| b.1.cmp(&a.1)); // 按耗时降序排序
-
-
 
     // 默认不展开细项，避免刷屏；需要时显式打开：AIOS_PRINT_DB_TIME_STATS=1
 
@@ -8347,8 +7849,6 @@ async fn gen_cata_geos_inner(
 
     }
 
-
-
     let total_elapsed_ms = total_t.elapsed().as_millis();
 
     println!(
@@ -8358,8 +7858,6 @@ async fn gen_cata_geos_inner(
         unique_cata_cnt, total_elapsed_ms
 
     );
-
-
 
     let cate_outcome = if process_cata {
 
@@ -8391,8 +7889,6 @@ async fn gen_cata_geos_inner(
 
     };
 
-
-
     let branch_outcome = if process_branch {
 
         Some(BranchTubiOutcome {
@@ -8415,8 +7911,6 @@ async fn gen_cata_geos_inner(
 
     };
 
-
-
     Ok(GenOutcome {
 
         cate: cate_outcome,
@@ -8426,8 +7920,6 @@ async fn gen_cata_geos_inner(
     })
 
 }
-
-
 
 //收集ngmr的信息
 
@@ -8535,15 +8027,11 @@ pub async fn query_ngmr_owner(
 
 }
 
-
-
 // ============================================================================
 
 // 基于 tubi_info 的独立 Tubi 生成（第二阶段）
 
 // ============================================================================
-
-
 
 /// 基于数据库 tubi_info 表独立生成 BRAN/HANG tubing
 

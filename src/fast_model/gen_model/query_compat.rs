@@ -79,6 +79,7 @@ async fn query_descendants_bfs(
             noun_hashes,
             ..Default::default()
         },
+        prune_on_match: false,
     };
     let descendants = index
         .query_descendants_bfs(refno.refno(), options)
@@ -291,6 +292,7 @@ pub async fn query_filter_ancestors(
             noun_hashes: build_noun_hashes(nouns),
             ..Default::default()
         },
+        prune_on_match: false,
     };
     let ancestors = index
         .query_ancestors_root_to_parent(refno.refno(), options)

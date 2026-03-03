@@ -6,6 +6,7 @@ use crate::options::DbOptionExt;
 use aios_core::pdms_types::{
     GNERAL_LOOP_OWNER_NOUN_NAMES, GNERAL_PRIM_NOUN_NAMES, USE_CATE_NOUN_NAMES,
 };
+use aios_core::tool::db_tool::db1_hash;
 use aios_core::pe::SPdmsElement;
 use dashmap::DashMap;
 use glam::Vec3;
@@ -314,38 +315,29 @@ pub async fn gen_index_tree_geos_optimized(
     let mut bran_roots_vec: Vec<RefnoEnum> = Vec::new();
     let mut bran_duration = Duration::ZERO;
     if need_bran_hang_stage {
-        let mut bran_hanger_roots: HashSet<RefnoEnum> = HashSet::new();
+        let bran_hanger_roots: HashSet<RefnoEnum>;
         if let Some(roots) = seed_roots.as_ref() {
-            for &root in roots {
-                if !root.is_valid() {
-                    continue;
-                }
-                let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(root) else {
-                    continue;
-                };
-                let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-                let Some(noun) = manager.get_noun(root) else {
-                    continue;
-                };
-                let noun_upper = noun.to_uppercase();
-                if noun_upper == "BRAN" || noun_upper == "HANG" {
-                    bran_hanger_roots.insert(root);
-                }
-            }
-            if !bran_hanger_roots.is_empty() {
+            // 从 seed_roots 出发，IndexTree BFS 收集 BRAN/HANG，遇到即 prune
+            let tree_dbnums = resolve_tree_dbnums(&dbnums)?;
+            let manager = TreeIndexManager::with_default_dir(tree_dbnums);
+            let collected = manager.collect_target_refnos_pruned(roots, &["BRAN", "HANG"]);
+            if !collected.is_empty() {
                 println!(
-                    "[Pipeline] seed_roots 中 BRAN/HANG 根节点: {} 个",
-                    bran_hanger_roots.len()
+                    "[Pipeline] 从 seed_roots BFS 收集到 BRAN/HANG: {} 个",
+                    collected.len()
                 );
             }
+            bran_hanger_roots = collected.into_iter().collect();
         } else {
+            let mut roots_set = HashSet::new();
             for noun in &["BRAN", "HANG"] {
                 let refnos = query_noun_refnos(noun, &dbnums, config.index_tree_debug_limit_per_target_type).await?;
                 if !refnos.is_empty() {
                     println!("[Pipeline] 收集到 {} 根节点: {} 个", noun, refnos.len());
-                    bran_hanger_roots.extend(refnos);
+                    roots_set.extend(refnos);
                 }
             }
+            bran_hanger_roots = roots_set;
         }
 
         bran_roots_vec = bran_hanger_roots.into_iter().collect();
@@ -385,69 +377,71 @@ pub async fn gen_index_tree_geos_optimized(
     // ============================================================================
     // 🔍 [第二阶段] 通用深度查询路径（处理 LOOP/CATE/PRIM）
     // ============================================================================
-    println!("🔍 正在收集其余 Noun 的根节点并执行深度递归查询...");
-
-    let mut all_roots = HashSet::new();
     let mut loop_refnos = HashSet::new();
     let mut prim_refnos = HashSet::new();
     let mut cate_refnos = HashSet::new();
 
-    if let Some(roots) = seed_roots.as_ref() {
-        for &root in roots {
-            if root.is_valid() {
-                all_roots.insert(root);
-            }
-        }
-        if !all_roots.is_empty() {
-            let roots_vec: Vec<RefnoEnum> = all_roots.iter().copied().collect();
-            track_refno_issues(&roots_vec, "seed_roots", RefnoErrorStage::InputParse);
-            println!("[Pipeline] 使用 seed_roots 作为入口 roots，总数 {}", all_roots.len());
-        }
+    // 收集目标 nouns（排除 BRAN/HANG，已在第一阶段处理）
+    let entry_nouns = get_entry_nouns(config);
+    let target_nouns: Vec<String> = entry_nouns
+        .into_iter()
+        .filter(|n| {
+            let upper = n.to_uppercase();
+            upper != "BRAN" && upper != "HANG"
+        })
+        .collect();
+
+    if target_nouns.is_empty() {
+        println!("[Pipeline] 第二阶段入口 Noun 列表为空，跳过 LOOP/CATE/PRIM。");
     } else {
-        let entry_nouns = get_entry_nouns(config);
-        if entry_nouns.is_empty() {
-            println!("[Pipeline] 加载到的其余入口 Noun 列表为空。");
+        println!("🔍 正在从 IndexTree BFS 批量收集目标 Noun refnos...");
+        println!("📌 目标 Noun 列表: {:?}", target_nouns);
+
+        let noun_strs: Vec<&str> = target_nouns.iter().map(|s| s.as_str()).collect();
+        let tree_dbnums = resolve_tree_dbnums(&dbnums)?;
+        let manager = TreeIndexManager::with_default_dir(tree_dbnums.clone());
+
+        // 确定 BFS 根节点：seed_roots 或 tree 根节点
+        let bfs_roots: Vec<RefnoEnum> = if let Some(roots) = seed_roots.as_ref() {
+            roots.iter().copied().filter(|r| r.is_valid()).collect()
         } else {
-            println!("📌 补充入口 Noun 列表: {:?}", entry_nouns);
-
-            // 收集根节点
-            for entry in &entry_nouns {
-                let noun_upper = entry.to_uppercase();
-                let noun_str = noun_upper.as_str();
-
-                // 跳过已处理的 BRAN/HANG
-                if noun_str == "BRAN" || noun_str == "HANG" {
-                    continue;
-                }
-
-                let refnos = query_noun_refnos(noun_str, &dbnums, config.index_tree_debug_limit_per_target_type).await?;
-                if refnos.is_empty() {
-                    continue;
-                }
-
-                track_refno_issues(&refnos, noun_str, RefnoErrorStage::InputParse);
-                all_roots.extend(refnos.iter().copied());
-
-                if GNERAL_LOOP_OWNER_NOUN_NAMES.contains(&noun_str) {
-                    loop_refnos.extend(refnos.iter().copied());
-                }
-                if GNERAL_PRIM_NOUN_NAMES.contains(&noun_str) {
-                    prim_refnos.extend(refnos.iter().copied());
-                }
-                if USE_CATE_NOUN_NAMES.contains(&noun_str) {
-                    cate_refnos.extend(refnos.iter().copied());
+            let mut roots = Vec::new();
+            for &dbnum in &tree_dbnums {
+                if let Ok(index) = manager.load_index(dbnum) {
+                    roots.extend(index.roots().iter().map(|&r| RefnoEnum::from(r)));
                 }
             }
+            roots
+        };
+
+        // 一次 BFS 收集所有目标 noun refnos，按 noun_hash 分组
+        let grouped = manager.collect_target_refnos_grouped(&bfs_roots, &noun_strs, false);
+
+        // 构建分类用的 noun_hash 集合
+        let loop_hashes: HashSet<u32> = GNERAL_LOOP_OWNER_NOUN_NAMES.iter().map(|n| db1_hash(n)).collect();
+        let prim_hashes: HashSet<u32> = GNERAL_PRIM_NOUN_NAMES.iter().map(|n| db1_hash(n)).collect();
+        let cate_hashes: HashSet<u32> = USE_CATE_NOUN_NAMES.iter().map(|n| db1_hash(n)).collect();
+
+        let mut total = 0usize;
+        for (noun_hash, refnos) in &grouped {
+            total += refnos.len();
+            if loop_hashes.contains(noun_hash) {
+                loop_refnos.extend(refnos.iter().copied());
+            }
+            if prim_hashes.contains(noun_hash) {
+                prim_refnos.extend(refnos.iter().copied());
+            }
+            if cate_hashes.contains(noun_hash) {
+                cate_refnos.extend(refnos.iter().copied());
+            }
         }
+        println!(
+            "[Pipeline] BFS 收集完成: 总计 {} 个 refnos (loop={}, prim={}, cate={})",
+            total, loop_refnos.len(), prim_refnos.len(), cate_refnos.len()
+        );
     }
 
-    if !all_roots.is_empty() {
-        println!("[Pipeline] 其余根节点总数 {}", all_roots.len());
-        let roots_vec: Vec<RefnoEnum> = all_roots.into_iter().collect();
-
-            // 递归收集子节点
-            collect_all_descendants(&roots_vec, &mut loop_refnos, &mut prim_refnos, &mut cate_refnos)
-                .await?;
+    if !loop_refnos.is_empty() || !prim_refnos.is_empty() || !cate_refnos.is_empty() {
 
             // 两阶段（Prefetch -> Generate）：
             // - PrefetchThenGenerate：先把 LOOP/CATE/PRIM 输入预取到 geom_input_cache，再进入纯离线生成阶段消费缓存

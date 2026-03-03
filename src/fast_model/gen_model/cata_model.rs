@@ -1708,9 +1708,10 @@ async fn gen_cata_geos_inner(
                 }
             }
 
-            // ── worker 内 gen_cata_single_geoms（原 P1，按需执行） ──
+            // ── worker 内 gen_cata_single_geoms（原 P1，并发执行） ──
             {
                 let force_regen_cata = force_regen_cata_flag;
+                let mut pre_gen_futs = FuturesUnordered::new();
                 for j in start_idx..end_idx {
                     let cata_hash = &all_unique_keys[j];
                     if cata_hash == "0" { continue; }
@@ -1734,12 +1735,16 @@ async fn gen_cata_geos_inner(
                         None => continue,
                     };
 
-                    let csg_shapes_map = Arc::new(CateCsgShapeMap::new());
-                    let design_axis_map = Arc::new(DashMap::new());
-                    if let Ok(_) = gen_cata_single_geoms(ele_refno, &csg_shapes_map, &design_axis_map).await {
-                        pre_gen_results.insert(ele_refno, (csg_shapes_map, design_axis_map));
-                    }
+                    let pre_gen_results = pre_gen_results.clone();
+                    pre_gen_futs.push(async move {
+                        let csg_shapes_map = Arc::new(CateCsgShapeMap::new());
+                        let design_axis_map = Arc::new(DashMap::new());
+                        if let Ok(_) = gen_cata_single_geoms(ele_refno, &csg_shapes_map, &design_axis_map).await {
+                            pre_gen_results.insert(ele_refno, (csg_shapes_map, design_axis_map));
+                        }
+                    });
                 }
+                while let Some(_) = pre_gen_futs.next().await {}
             }
 
             let mut shape_insts_data = ShapeInstancesData::default();

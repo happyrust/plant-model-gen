@@ -173,7 +173,8 @@ default = [
     "manifold",
     "project_hd",
     "surreal-save",
-    "kv-rocksdb",
+    # "kv-rocksdb",
+    "parquet-export",
 ]
 # Parquet/Polars 数据导出（编译较重，日常开发可不启用）
 parquet-export = [

@@ -691,10 +691,6 @@ pub async fn save_instance_data_optimize(
     let mut inst_relate_aabb_ins: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
     let mut inst_relate_aabb_chunks: Vec<(Vec<String>, Vec<String>)> = Vec::new();
 
-    // 收集空间索引数据: (id_i64, noun, min_x, max_x, min_y, max_y, min_z, max_z)
-    #[cfg(feature = "sqlite-index")]
-    let mut spatial_entries: Vec<(i64, String, f64, f64, f64, f64, f64, f64)> = Vec::new();
-
     for (key, info) in &inst_mgr.inst_info_map {
         inst_keys.push(*key);
         if let Some(batch) = refno_assoc_batch.as_mut() {
@@ -746,19 +742,6 @@ pub async fn save_instance_data_optimize(
             }
             inst_relate_aabb_buffer.push(aabb_row_sql);
             inst_relate_aabb_ins.push(key.to_pe_key());
-
-            #[cfg(feature = "sqlite-index")]
-            {
-                let id = key.refno().0 as i64;
-                let noun = "UNKOWN".to_string();
-                spatial_entries.push((
-                    id,
-                    noun,
-                    aabb.mins.x as f64, aabb.maxs.x as f64,
-                    aabb.mins.y as f64, aabb.maxs.y as f64,
-                    aabb.mins.z as f64, aabb.maxs.z as f64,
-                ));
-            }
         }
 
         // inst_relate 不再保存 world_trans；世界变换统一从 pe_transform 获取。
@@ -997,24 +980,6 @@ pub async fn save_instance_data_optimize(
         }
 
         vec3_batcher.finish().await?;
-    }
-
-    // 批量写入 SQLite 空间索引
-    #[cfg(feature = "sqlite-index")]
-    if !spatial_entries.is_empty() {
-        let count = spatial_entries.len();
-        match crate::spatial_index::SqliteSpatialIndex::with_default_path() {
-            Ok(idx) => {
-                if let Err(e) = idx.inner().insert_aabbs_with_items(spatial_entries) {
-                    eprintln!("[spatial_index] 写入失败: {}", e);
-                } else {
-                    debug_model_debug!("[spatial_index] 批量写入 {} 条 AABB", count);
-                }
-            }
-            Err(e) => {
-                eprintln!("[spatial_index] 打开索引失败: {}", e);
-            }
-        }
     }
 
     if let Some(batch) = refno_assoc_batch.as_ref() {

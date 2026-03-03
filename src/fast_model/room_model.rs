@@ -268,6 +268,178 @@ async fn query_insts_for_room_calc(
 
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[derive(Debug, Deserialize, SurrealValue)]
+struct InstRelateAabbRow {
+    refno: RefnoEnum,
+    #[serde(default)]
+    noun: String,
+    aabb: JsonValue,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn parse_inst_relate_aabb(value: &JsonValue) -> Option<Aabb> {
+    if value.is_null() {
+        return None;
+    }
+
+    if let Ok(aabb) = serde_json::from_value::<Aabb>(value.clone()) {
+        return Some(aabb);
+    }
+
+    let read_xyz = |node: &JsonValue| -> Option<[f32; 3]> {
+        Some([
+            node.get("x")?.as_f64()? as f32,
+            node.get("y")?.as_f64()? as f32,
+            node.get("z")?.as_f64()? as f32,
+        ])
+    };
+    let read_arr3 = |node: &JsonValue| -> Option<[f32; 3]> {
+        let arr = node.as_array()?;
+        if arr.len() < 3 {
+            return None;
+        }
+        Some([
+            arr[0].as_f64()? as f32,
+            arr[1].as_f64()? as f32,
+            arr[2].as_f64()? as f32,
+        ])
+    };
+
+    if let (Some(mins), Some(maxs)) = (value.get("mins"), value.get("maxs")) {
+        if let (Some(min), Some(max)) = (read_xyz(mins), read_xyz(maxs)) {
+            return Some(Aabb::new(min.into(), max.into()));
+        }
+        if let (Some(min), Some(max)) = (read_arr3(mins), read_arr3(maxs)) {
+            return Some(Aabb::new(min.into(), max.into()));
+        }
+    }
+
+    if let (Some(min), Some(max)) = (value.get("min"), value.get("max")) {
+        if let (Some(min), Some(max)) = (read_arr3(min), read_arr3(max)) {
+            return Some(Aabb::new(min.into(), max.into()));
+        }
+    }
+
+    None
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
+    db_nums: Option<&[u32]>,
+    refno_root: Option<RefnoEnum>,
+) -> anyhow::Result<usize> {
+    use crate::data_interface::db_meta;
+    use crate::fast_model::query_compat::query_visible_geo_descendants;
+
+    const CHUNK_SIZE: usize = 5000;
+    let db_filter: Option<HashSet<u32>> = db_nums.map(|nums| nums.iter().copied().collect());
+
+    if db_filter.is_some() {
+        db_meta().ensure_loaded().map_err(|e| {
+            anyhow::anyhow!(
+                "房间计算前刷新 SQLite 索引失败：无法加载 db_meta_info 映射: {}",
+                e
+            )
+        })?;
+    }
+
+    let refno_filter: Option<HashSet<RefU64>> = if let Some(root) = refno_root {
+        let set = query_visible_geo_descendants(root, true, None)
+            .await?
+            .into_iter()
+            .map(|r| r.refno())
+            .collect::<HashSet<_>>();
+        Some(set)
+    } else {
+        None
+    };
+
+    let idx = SqliteSpatialIndex::with_default_path()?;
+    idx.clear()?;
+
+    let mut offset: usize = 0;
+    let mut total_inserted: usize = 0;
+    let mut skipped_by_db: usize = 0;
+    let mut skipped_by_refno_root: usize = 0;
+    let mut skipped_by_missing_dbmap: usize = 0;
+    let mut skipped_by_invalid_aabb: usize = 0;
+
+    loop {
+        let sql = format!(
+            "SELECT in.id as refno, in.noun ?? '' as noun, out.d as aabb \
+             FROM inst_relate_aabb \
+             WHERE out.d != NONE \
+             ORDER BY in.id \
+             LIMIT {CHUNK_SIZE} START {offset}"
+        );
+        let mut response = model_primary_db().query(&sql).await?;
+        let rows: Vec<InstRelateAabbRow> = response.take(0)?;
+
+        if rows.is_empty() {
+            break;
+        }
+        offset += CHUNK_SIZE;
+
+        let mut batch: Vec<(i64, String, f64, f64, f64, f64, f64, f64)> =
+            Vec::with_capacity(rows.len());
+        for row in rows {
+            let ref_u64 = row.refno.refno();
+
+            if let Some(filter) = &refno_filter {
+                if !filter.contains(&ref_u64) {
+                    skipped_by_refno_root += 1;
+                    continue;
+                }
+            }
+
+            if let Some(filter) = &db_filter {
+                match db_meta().get_dbnum_by_refno(row.refno) {
+                    Some(dbnum) if filter.contains(&dbnum) => {}
+                    Some(_) => {
+                        skipped_by_db += 1;
+                        continue;
+                    }
+                    None => {
+                        skipped_by_missing_dbmap += 1;
+                        continue;
+                    }
+                }
+            }
+
+            let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
+                skipped_by_invalid_aabb += 1;
+                continue;
+            };
+
+            batch.push((
+                ref_u64.0 as i64,
+                row.noun,
+                aabb.mins.x as f64,
+                aabb.maxs.x as f64,
+                aabb.mins.y as f64,
+                aabb.maxs.y as f64,
+                aabb.mins.z as f64,
+                aabb.maxs.z as f64,
+            ));
+        }
+
+        if !batch.is_empty() {
+            total_inserted += idx.inner().insert_aabbs_with_items(batch)?;
+        }
+    }
+
+    info!(
+        "[room_model] SQLite AABB 刷新完成: inserted={}, skipped_db={}, skipped_refno_root={}, skipped_missing_dbmap={}, skipped_invalid_aabb={}",
+        total_inserted,
+        skipped_by_db,
+        skipped_by_refno_root,
+        skipped_by_missing_dbmap,
+        skipped_by_invalid_aabb
+    );
+    Ok(total_inserted)
+}
+
 
 
 /// 房间关系构建统计信息
@@ -996,6 +1168,14 @@ pub async fn build_room_relations_with_cancel(
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
     init_room_calc_config(db_option);
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    {
+        if let Some(ref cb) = progress_callback {
+            cb(0.02, "正在刷新 SQLite AABB 索引");
+        }
+        refresh_sqlite_spatial_index_from_inst_relate_aabb(db_nums, refno_root.clone()).await?;
+    }
 
 
 
@@ -5435,6 +5615,14 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
 
     init_room_calc_config(db_option);
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    {
+        if let Some(ref cb) = progress_callback {
+            cb(0.02, "正在刷新 SQLite AABB 索引");
+        }
+        refresh_sqlite_spatial_index_from_inst_relate_aabb(None, None).await?;
+    }
+
 
 
     // 1. 查询房间面板关系
@@ -5622,6 +5810,9 @@ pub async fn update_room_relations_incremental_original(
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
     init_room_calc_config(&db_option);
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    refresh_sqlite_spatial_index_from_inst_relate_aabb(None, None).await?;
 
 
 
@@ -6170,6 +6361,3 @@ pub async fn rebuild_room_relations_for_rooms(
     Ok(stats)
 
 }
-
-
-

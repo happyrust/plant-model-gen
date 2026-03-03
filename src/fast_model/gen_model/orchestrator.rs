@@ -1465,8 +1465,6 @@ async fn process_index_tree_generation(
 
     );
 
-    // 4️⃣ 生成 SQLite 空间索引（从 model cache 批量落库）
-
     let touched_dbnums_vec: Vec<u32> = touched_dbnums
 
         .lock()
@@ -1474,12 +1472,6 @@ async fn process_index_tree_generation(
         .map(|s| s.iter().copied().collect())
 
         .unwrap_or_default();
-
-    if let Err(e) = update_sqlite_spatial_index_from_cache(db_option, &touched_dbnums_vec).await {
-
-        eprintln!("[gen_model] SQLite 空间索引生成失败: {}", e);
-
-    }
 
     perf.mark("instances_export");
 

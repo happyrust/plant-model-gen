@@ -76,6 +76,7 @@ aios_core = { git = "https://github.com/happyrust/rs-core.git", branch = "dev-3.
 surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1", default-features = false, features = [
     "protocol-ws",
     "kv-mem",
+    "kv-rocksdb",
 ] }
 # surrealdb-types 需要显式引入：SurrealValue derive 宏默认使用 ::surrealdb_types 路径
 surrealdb-types = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1" }

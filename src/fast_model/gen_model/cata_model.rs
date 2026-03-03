@@ -1708,10 +1708,10 @@ async fn gen_cata_geos_inner(
                 }
             }
 
-            // ── worker 内 gen_cata_single_geoms（原 P1，并发执行） ──
+            // ── worker 内 gen_cata_single_geoms（原 P1，受限并发执行） ──
             {
                 let force_regen_cata = force_regen_cata_flag;
-                let mut pre_gen_futs = FuturesUnordered::new();
+                let mut tasks: Vec<RefnoEnum> = Vec::new();
                 for j in start_idx..end_idx {
                     let cata_hash = &all_unique_keys[j];
                     if cata_hash == "0" { continue; }
@@ -1730,21 +1730,21 @@ async fn gen_cata_geos_inner(
                         if cache_mgr.get(cata_hash).is_some() { continue; }
                     }
 
-                    let ele_refno = match target_group_refnos.first().copied() {
-                        Some(r) => r,
-                        None => continue,
-                    };
-
-                    let pre_gen_results = pre_gen_results.clone();
-                    pre_gen_futs.push(async move {
+                    if let Some(&ele_refno) = target_group_refnos.first() {
+                        tasks.push(ele_refno);
+                    }
+                }
+                const PRE_GEN_CONCURRENCY: usize = 4;
+                let pre_gen_results_ref = &pre_gen_results;
+                futures::stream::iter(tasks.into_iter().map(|ele_refno| {
+                    async move {
                         let csg_shapes_map = Arc::new(CateCsgShapeMap::new());
                         let design_axis_map = Arc::new(DashMap::new());
                         if let Ok(_) = gen_cata_single_geoms(ele_refno, &csg_shapes_map, &design_axis_map).await {
-                            pre_gen_results.insert(ele_refno, (csg_shapes_map, design_axis_map));
+                            pre_gen_results_ref.insert(ele_refno, (csg_shapes_map, design_axis_map));
                         }
-                    });
-                }
-                while let Some(_) = pre_gen_futs.next().await {}
+                    }
+                })).buffer_unordered(PRE_GEN_CONCURRENCY).collect::<Vec<_>>().await;
             }
 
             let mut shape_insts_data = ShapeInstancesData::default();

@@ -922,6 +922,12 @@ async fn main() -> anyhow::Result<()> {
                 .help("预生成指定 refno 及其子孙 BRAN/HANG 的 MBD 标注 JSON 文件")
                 .value_name("REFNO"),
         )
+        .arg(
+            Arg::new("offline")
+                .long("offline")
+                .help("Use embedded file mode instead of WebSocket. Auto-kills any running SurrealDB server on the configured port")
+                .action(clap::ArgAction::SetTrue),
+        )
         .get_matches();
 
     // 获取配置文件路径
@@ -934,8 +940,22 @@ async fn main() -> anyhow::Result<()> {
         std::env::set_var("DB_OPTION_FILE", config_path);
     }
 
+    // --offline：在 get_db_option() OnceCell 初始化前设置环境变量，覆盖 surrealdb.mode = file
+    let is_offline = matches.get_flag("offline");
+    if is_offline {
+        println!("🔌 --offline 模式：切换为嵌入式文件连接");
+        unsafe {
+            std::env::set_var("SURREAL_CONN_MODE", "file");
+        }
+    }
+
     // 预先初始化 OnceCell，避免后续第一次 get_db_option() 时覆盖 active_precision
-    let _ = aios_core::get_db_option();
+    let db_option = aios_core::get_db_option();
+
+    // --offline 时立即关闭占用 ws 端口的 server 进程（RocksDB 排他锁）
+    if is_offline {
+        crate::cli_modes::kill_process_on_port(db_option.surrealdb.port);
+    }
 
     let export_all_lods = matches.get_flag("export-all-lods");
     unsafe {

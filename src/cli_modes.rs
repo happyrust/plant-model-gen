@@ -273,11 +273,59 @@ fn parse_length_unit(unit: &str) -> LengthUnit {
     }
 }
 
+/// 关闭占用指定端口的进程（避免 file 模式下 RocksDB 排他锁冲突）。
+///
+/// Windows: 通过 `netstat` 查找 LISTENING 状态的 PID，再用 `taskkill` 强制终止。
+pub fn kill_process_on_port(port: u16) {
+    let output = match std::process::Command::new("netstat")
+        .args(["-ano"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("⚠️  无法执行 netstat: {}", e);
+            return;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let listen_pattern = format!(":{}", port);
+
+    for line in stdout.lines() {
+        if !line.contains(&listen_pattern) || !line.contains("LISTENING") {
+            continue;
+        }
+        // netstat 输出格式: proto  local_addr  foreign_addr  state  PID
+        let pid = line.split_whitespace().last().unwrap_or("");
+        if pid.is_empty() || pid == "0" {
+            continue;
+        }
+        println!("🔪 关闭占用端口 {} 的进程 (PID={})...", port, pid);
+        let kill_result = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", pid])
+            .output();
+        match kill_result {
+            Ok(r) if r.status.success() => {
+                println!("   ✅ 进程 {} 已终止", pid);
+                // 等待端口释放
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Ok(r) => {
+                let stderr = String::from_utf8_lossy(&r.stderr);
+                eprintln!("   ⚠️  taskkill 退出码 {}: {}", r.status, stderr.trim());
+            }
+            Err(e) => eprintln!("   ⚠️  无法执行 taskkill: {}", e),
+        }
+    }
+}
+
 /// 连接 SurrealDB（固定输入数据源）。
 ///
 /// ws 模式下会先检测目标端口是否可达：
 /// - 已启动 → 直接连接
 /// - 未启动 → 使用 `[web_server]` 配置自动拉起 SurrealDB 后台进程，等待就绪后再连接
+///
+/// file 模式下会先关闭可能占用数据目录的 ws server 进程（RocksDB 排他锁）。
 async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
     use aios_core::options::DbConnMode;
 
@@ -303,6 +351,9 @@ async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
             auto_start_surreal(&db_option_ext.inner).await?;
         }
     } else {
+        // 嵌入式 file 模式：先关闭可能占用数据目录的 ws server（RocksDB 排他锁）
+        let port = sdb_cfg.port;
+        kill_process_on_port(port);
         println!("\n📡 连接数据库（SurrealDB 嵌入式模式）...");
     }
 

@@ -1,0 +1,1 @@
+LET $elbos = [pe:⟨24381_145019⟩, pe:⟨24381_145021⟩, pe:⟨24381_145023⟩, pe:⟨24381_145025⟩, pe:⟨24381_145026⟩, pe:⟨24381_145028⟩, pe:⟨24381_145029⟩, pe:⟨24381_145031⟩, pe:⟨24381_145033⟩]; SELECT in as pe, out as inst_info, (SELECT record::id(out) as geo_id, out.meshed as meshed, out.bad as bad, geo_type FROM $parent.out->geo_relate) as geos FROM inst_relate WHERE in IN $elbos;

@@ -107,7 +107,10 @@ impl SqlFileWriter {
 
 /// 从 .surql 文件批量导入 SQL 到 SurrealDB。
 ///
-/// 按 `batch_size` 条语句为一个事务块执行，支持重试。
+/// **流式读取**：逐行读取文件，攒够 `batch_size` 条即提交事务，
+/// 内存占用恒定（≈ batch_size 条语句），适合数十万条以上的大文件。
+///
+/// 支持重试（指数退避，最多 3 次）。
 /// 返回 (成功语句数, 失败语句数)。
 pub async fn import_sql_file(
     path: &std::path::Path,
@@ -116,78 +119,67 @@ pub async fn import_sql_file(
     use aios_core::{model_primary_db, SurrealQueryExt};
     use std::io::BufRead;
 
-    let file = std::fs::File::open(path)
-        .map_err(|e| anyhow::anyhow!("打开 surql 文件失败 {}: {}", path.display(), e))?;
+    // 轻量扫描：统计有效语句数（用于进度显示），不保存内容
+    let total = {
+        let f = std::fs::File::open(path)
+            .map_err(|e| anyhow::anyhow!("打开 surql 文件失败 {}: {}", path.display(), e))?;
+        let r = std::io::BufReader::new(f);
+        r.lines()
+            .filter_map(|l| l.ok())
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with("--")
+            })
+            .count()
+    };
+
+    println!(
+        "[import_sql] 共 {} 条 SQL 语句，批次大小={}，预计 {} 批",
+        total,
+        batch_size,
+        (total + batch_size - 1) / batch_size.max(1)
+    );
+
+    // 流式读取 + 分批提交
+    let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
 
-    let mut statements: Vec<String> = Vec::new();
+    let mut batch: Vec<String> = Vec::with_capacity(batch_size);
+    let mut success = 0usize;
+    let mut failed = 0usize;
+    let mut batch_idx = 0usize;
+
     for line in reader.lines() {
         let line = line?;
         let trimmed = line.trim();
-        // 跳过空行和注释
         if trimmed.is_empty() || trimmed.starts_with("--") {
             continue;
         }
-        statements.push(trimmed.to_string());
-    }
+        batch.push(trimmed.to_string());
 
-    let total = statements.len();
-    println!(
-        "[import_sql] 读取 {} 条 SQL 语句，批次大小={}，预计 {} 批",
-        total,
-        batch_size,
-        (total + batch_size - 1) / batch_size
-    );
+        if batch.len() >= batch_size {
+            let (s, f) = execute_batch(&batch, batch_idx).await;
+            success += s;
+            failed += f;
+            batch_idx += 1;
+            batch.clear();
 
-    let mut success = 0usize;
-    let mut failed = 0usize;
-
-    for (batch_idx, chunk) in statements.chunks(batch_size).enumerate() {
-        let block = format!(
-            "BEGIN TRANSACTION;\n{}\nCOMMIT TRANSACTION;",
-            chunk.join("\n")
-        );
-
-        let mut retries = 0u32;
-        let max_retries = 3u32;
-        loop {
-            match model_primary_db().query_response(&block).await {
-                Ok(_) => {
-                    success += chunk.len();
-                    break;
-                }
-                Err(e) => {
-                    retries += 1;
-                    if retries > max_retries {
-                        eprintln!(
-                            "[import_sql] 批次 {} 执行失败（重试 {} 次后放弃）: {}",
-                            batch_idx, max_retries, e
-                        );
-                        failed += chunk.len();
-                        break;
-                    }
-                    let backoff = std::time::Duration::from_millis(100 * retries as u64);
-                    eprintln!(
-                        "[import_sql] 批次 {} 执行失败，{}ms 后重试 ({}/{}): {}",
-                        batch_idx,
-                        backoff.as_millis(),
-                        retries,
-                        max_retries,
-                        e
-                    );
-                    tokio::time::sleep(backoff).await;
-                }
+            if batch_idx % 10 == 0 {
+                println!(
+                    "[import_sql] 进度: {}/{} 条 ({:.1}%)",
+                    success + failed,
+                    total,
+                    (success + failed) as f64 / total.max(1) as f64 * 100.0
+                );
             }
         }
+    }
 
-        if (batch_idx + 1) % 10 == 0 || batch_idx == (total / batch_size) {
-            println!(
-                "[import_sql] 进度: {}/{} 条 ({:.1}%)",
-                success + failed,
-                total,
-                (success + failed) as f64 / total as f64 * 100.0
-            );
-        }
+    // 处理最后一个不满批次
+    if !batch.is_empty() {
+        let (s, f) = execute_batch(&batch, batch_idx).await;
+        success += s;
+        failed += f;
     }
 
     println!(
@@ -196,6 +188,46 @@ pub async fn import_sql_file(
     );
 
     Ok((success, failed))
+}
+
+/// 执行一个批次的 SQL 语句（事务包裹 + 重试）。
+/// 返回 (成功条数, 失败条数)。
+async fn execute_batch(stmts: &[String], batch_idx: usize) -> (usize, usize) {
+    use aios_core::{model_primary_db, SurrealQueryExt};
+
+    let block = format!(
+        "BEGIN TRANSACTION;\n{}\nCOMMIT TRANSACTION;",
+        stmts.join("\n")
+    );
+    let count = stmts.len();
+
+    let mut retries = 0u32;
+    let max_retries = 3u32;
+    loop {
+        match model_primary_db().query_response(&block).await {
+            Ok(_) => return (count, 0),
+            Err(e) => {
+                retries += 1;
+                if retries > max_retries {
+                    eprintln!(
+                        "[import_sql] 批次 {} 执行失败（重试 {} 次后放弃）: {}",
+                        batch_idx, max_retries, e
+                    );
+                    return (0, count);
+                }
+                let backoff = std::time::Duration::from_millis(100 * retries as u64);
+                eprintln!(
+                    "[import_sql] 批次 {} 执行失败，{}ms 后重试 ({}/{}): {}",
+                    batch_idx,
+                    backoff.as_millis(),
+                    retries,
+                    max_retries,
+                    e
+                );
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
 }
 
 impl Drop for SqlFileWriter {

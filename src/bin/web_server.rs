@@ -67,6 +67,15 @@ async fn main() -> anyhow::Result<()> {
         match child {
             Ok(child) => {
                 println!("✅ SurrealDB 进程已启动 (PID: {})", child.id());
+                // 覆盖 surrealdb 连接模式为 ws，避免 rocksdb 文件锁冲突
+                let (bind_ip, bind_port) = ws_cfg.surreal_bind.split_once(':')
+                    .unwrap_or(("0.0.0.0", "8020"));
+                let conn_ip = if bind_ip == "0.0.0.0" { "127.0.0.1" } else { bind_ip };
+                unsafe {
+                    std::env::set_var("SURREAL_CONN_MODE", "ws");
+                    std::env::set_var("SURREAL_CONN_IP", conn_ip);
+                    std::env::set_var("SURREAL_CONN_PORT", bind_port);
+                }
                 // 等待 SurrealDB 就绪
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 Some(child)

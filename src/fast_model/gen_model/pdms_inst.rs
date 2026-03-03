@@ -841,36 +841,6 @@ pub async fn save_instance_data_optimize(
     inst_relate_batcher.finish().await?;
     debug_model_debug!("✅ [DEBUG] inst_relate_batcher finished successfully");
 
-    // 调试：确认 inst_relate 是否已写入数据库
-    if !inst_keys.is_empty() {
-        let pe_list = inst_keys.iter().map(|k| k.to_pe_key()).join(",");
-        let verify_sql = format!(
-            "SELECT count() AS cnt FROM inst_relate WHERE in IN [{}];",
-            pe_list
-        );
-        match model_primary_db().query_response(&verify_sql).await {
-            Ok(mut resp) => match resp.take::<Vec<serde_json::Value>>(0) {
-                Ok(counts) => debug_model_debug!(
-                    "🔍 [DEBUG] inst_relate verify counts for [{}]: {:?}",
-                    pe_list,
-                    counts
-                ),
-                Err(err) => debug_model_debug!(
-                    "❌ [DEBUG] inst_relate verify take failed (sql: {}): {}",
-                    verify_sql,
-                    err
-                ),
-            },
-            Err(e) => {
-                debug_model_debug!(
-                    "❌ [DEBUG] inst_relate verify query failed (sql: {}): {}",
-                    verify_sql,
-                    e
-                );
-            }
-        }
-    }
-
     debug_model_debug!("🔍 [DEBUG] Finishing inst_info_batcher...");
     inst_info_batcher.finish().await?;
     debug_model_debug!("✅ [DEBUG] inst_info_batcher finished successfully");
@@ -909,15 +879,10 @@ pub async fn save_instance_data_optimize(
                 if n > 0 {
                     for idx in (0..n).step_by(CHUNK_SIZE) {
                         let end = (idx + CHUNK_SIZE).min(n);
-                        let delete_stmt = format!(
-                            "LET $ids = SELECT VALUE id FROM [{}]->inst_relate_aabb;\nDELETE $ids;",
-                            ($ins)[idx..end].join(",")
-                        );
                         let insert_stmt = format!(
                             "INSERT RELATION INTO inst_relate_aabb [{}];",
                             ($rows)[idx..end].join(",")
                         );
-                        inst_aabb_batcher.push(delete_stmt).await?;
                         inst_aabb_batcher.push(insert_stmt).await?;
                     }
                     total += n;
@@ -1591,8 +1556,7 @@ pub async fn save_instance_data_to_sql_file(
     let mut cata_cross_neg_geo_map: HashMap<(RefnoEnum, RefnoEnum), Vec<u64>> = HashMap::new();
 
     // DELETE（replace_exist=true 时）
-    // - legacy：保持旧行为（直接执行到 DB）
-    // - refno_assoc_index：按聚合索引生成删除 SQL，写入 .surql，不在本阶段执行
+    // 统一写入 .surql 文件，不直接执行到 DB（pre_cleanup_for_regen 已在前置阶段完成清理）
     if replace_exist {
         let refnos: Vec<RefnoEnum> = inst_mgr.inst_info_map.keys().copied().collect();
         let geo_hashes: Vec<u64> = inst_mgr
@@ -1637,11 +1601,27 @@ pub async fn save_instance_data_to_sql_file(
                 CHUNK_SIZE,
             ))?;
         } else {
-            delete_inst_relate_by_in(&refnos, CHUNK_SIZE).await?;
-            delete_inst_relate_bool_records(&refnos, CHUNK_SIZE).await?;
-            delete_inst_geo_by_hashes(&geo_hashes, CHUNK_SIZE).await?;
-            delete_geo_relate_by_inst_info_ids(&inst_info_ids, CHUNK_SIZE).await?;
-            delete_boolean_relations_by_carriers(&refnos, CHUNK_SIZE).await?;
+            // Legacy 模式：也写入 .surql 文件而非直接执行，避免阻塞 ~120 秒
+            writer.write_statements(&build_delete_inst_relate_by_in_sql(
+                &refnos,
+                CHUNK_SIZE,
+            ))?;
+            writer.write_statements(&build_delete_inst_relate_bool_records_sql(
+                &refnos,
+                CHUNK_SIZE,
+            ))?;
+            writer.write_statements(&build_delete_inst_geo_by_hashes_sql(
+                &geo_hashes,
+                CHUNK_SIZE,
+            ))?;
+            writer.write_statements(&build_delete_geo_relate_by_inst_info_ids_sql(
+                &inst_info_ids,
+                CHUNK_SIZE,
+            ))?;
+            writer.write_statements(&build_delete_boolean_relations_by_carriers_sql(
+                &refnos,
+                CHUNK_SIZE,
+            ))?;
         }
     }
 

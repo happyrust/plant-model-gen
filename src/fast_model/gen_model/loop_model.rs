@@ -168,13 +168,22 @@ pub async fn gen_loop_geos(
                 let mut geo_hash = 0;
                 let mut item_trans = Transform::IDENTITY;
                 let mut geo_param = PdmsGeoParam::Unknown;
-                let Ok(loop_res) = aios_core::fetch_loops_and_height(target_refno).await
-                else {
-                    continue;
+                let loop_res = match aios_core::fetch_loops_and_height(target_refno).await {
+                    Ok(res) => res,
+                    Err(e) => {
+                        debug_model_warn!(
+                            "{}: fetch_loops_and_height 失败: {} (type={})",
+                            target_refno, e, target_type
+                        );
+                        continue;
+                    }
                 };
                 let verts = loop_res.loops;
                 let height = loop_res.height;
-                // dbg!((&verts, height));
+                debug_model_warn!(
+                    "{}: fetch_loops_and_height 结果: loops={}, height={} (type={})",
+                    target_refno, verts.len(), height, target_type
+                );
                 match target_type {
                     "NREV" | "REVO" => {
                         let angle = target_att.get_f32("ANGL").unwrap_or_default();
@@ -246,10 +255,18 @@ pub async fn gen_loop_geos(
                 }
                 let visible = target_att.is_visible_by_level(None).unwrap_or(true);
                 geos_info.visible = visible;
+                debug_model_warn!(
+                    "{}: geo_hash={}, geo_param={:?}, trans_nan=({},{},{})",
+                    target_refno, geo_hash, std::mem::discriminant(&geo_param),
+                    item_trans.translation.is_nan(),
+                    item_trans.rotation.is_nan(),
+                    item_trans.scale.is_nan()
+                );
                 if item_trans.translation.is_nan()
                     || item_trans.rotation.is_nan()
                     || item_trans.scale.is_nan()
                 {
+                    debug_model_warn!("{}: 跳过 — Transform 包含 NaN", target_refno);
                     continue;
                 }
                 let mut tr: Transform = item_trans;

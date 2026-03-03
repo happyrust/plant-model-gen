@@ -24,6 +24,8 @@ Write-Host "  数据目录: $dbPath"
 Write-Host "  保留期:  30天"
 Write-Host "=========================================="
 
+$env:SURREAL_PLANNER_STRATEGY = "compute-only"
+
 surreal start `
     --user root `
     --pass root `

@@ -1117,7 +1117,7 @@ pub async fn export_dbnum_instances_parquet(
     let mut total_bytes: u64 = 0;
 
     // instances.parquet
-    if !instance_rows.is_empty() {
+    {
         let batch = build_instances_batch(&instance_rows)?;
         let path = output_dir.join("instances.parquet");
         let size = write_parquet(&path, &batch)?;
@@ -1128,7 +1128,7 @@ pub async fn export_dbnum_instances_parquet(
     }
 
     // geo_instances.parquet
-    if !geo_instance_rows.is_empty() {
+    {
         let batch = build_geo_instances_batch(&geo_instance_rows)?;
         let path = output_dir.join("geo_instances.parquet");
         let size = write_parquet(&path, &batch)?;
@@ -1143,7 +1143,7 @@ pub async fn export_dbnum_instances_parquet(
     }
 
     // tubings.parquet
-    if !tubing_rows.is_empty() {
+    {
         let batch = build_tubings_batch(&tubing_rows)?;
         let path = output_dir.join("tubings.parquet");
         let size = write_parquet(&path, &batch)?;
@@ -1154,7 +1154,7 @@ pub async fn export_dbnum_instances_parquet(
     }
 
     // transforms.parquet
-    if !transform_rows.is_empty() {
+    {
         let batch = build_transforms_batch(&transform_rows)?;
         let path = output_dir.join("transforms.parquet");
         let size = write_parquet(&path, &batch)?;
@@ -1169,7 +1169,7 @@ pub async fn export_dbnum_instances_parquet(
     }
 
     // aabb.parquet
-    if !aabb_row_data.is_empty() {
+    {
         let batch = build_aabb_batch(&aabb_row_data)?;
         let path = output_dir.join("aabb.parquet");
         let size = write_parquet(&path, &batch)?;
@@ -1225,6 +1225,57 @@ pub async fn export_dbnum_instances_parquet(
     fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
     if verbose {
         println!("   ✅ manifest.json 已写入");
+    }
+
+    // 写一份 manifest_{dbnum}.json 到 parquet/ 根目录，文件路径加 {dbnum}/ 前缀，
+    // 与前端 buildFilesOutputUrl(`parquet/manifest_${dbno}.json`) 路径对齐。
+    if let Some(parent) = output_dir.parent() {
+        let subdir = output_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| dbnum.to_string());
+        let web_manifest = json!({
+            "version": 1,
+            "format": "parquet",
+            "generated_at": generated_at,
+            "dbnum": dbnum,
+            "root_refno": root_refno.map(|r| r.to_string()),
+            "tables": {
+                "instances": {
+                    "file": format!("{}/instances.parquet", subdir),
+                    "rows": instance_rows.len(),
+                },
+                "geo_instances": {
+                    "file": format!("{}/geo_instances.parquet", subdir),
+                    "rows": geo_instance_rows.len(),
+                },
+                "tubings": {
+                    "file": format!("{}/tubings.parquet", subdir),
+                    "rows": tubing_rows.len(),
+                },
+                "transforms": {
+                    "file": format!("{}/transforms.parquet", subdir),
+                    "rows": transform_rows.len(),
+                },
+                "aabb": {
+                    "file": format!("{}/aabb.parquet", subdir),
+                    "rows": aabb_row_data.len(),
+                },
+            },
+            "mesh_validation": {
+                "lod_tag": MESH_CHECK_LOD_TAG,
+                "report_file": format!("{}/{}", subdir, missing_mesh_report.report_file),
+                "checked_geo_hashes": missing_mesh_report.checked_geo_hashes,
+                "missing_geo_hashes": missing_mesh_report.missing_geo_hashes,
+                "missing_owner_refnos": missing_mesh_report.missing_owner_refnos,
+            },
+            "total_bytes": total_bytes,
+        });
+        let web_manifest_path = parent.join(format!("manifest_{}.json", dbnum));
+        fs::write(&web_manifest_path, serde_json::to_string_pretty(&web_manifest)?)?;
+        if verbose {
+            println!("   ✅ manifest_{}.json 已写入 (web 兼容)", dbnum);
+        }
     }
 
     let elapsed = start_time.elapsed();

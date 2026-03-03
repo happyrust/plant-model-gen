@@ -671,6 +671,7 @@ async fn process_index_tree_generation(
     let model_cache_ctx: Option<()> = None;
     #[allow(unused_variables)]
     let cache_manager_for_insert: Option<()> = None;
+
     let touched_dbnums: Arc<std::sync::Mutex<BTreeSet<u32>>> =
         Arc::new(std::sync::Mutex::new(BTreeSet::new()));
     let touched_dbnums_for_insert = touched_dbnums.clone();
@@ -713,7 +714,8 @@ async fn process_index_tree_generation(
         let mut t_mesh = std::time::Duration::ZERO;
         let mut mesh_total = 0usize;
         // 预加载 mesh 缓存 + 已有 inst_geo IDs（一次性）
-        if gen_mesh {
+        // replace_exist（--regen-model）时跳过预加载，强制重新生成 mesh
+        if gen_mesh && !replace_exist {
             if let Err(e) = crate::fast_model::preload_mesh_cache().await {
                 eprintln!("[mesh_inline] 预加载 mesh 缓存失败: {}", e);
             }
@@ -725,6 +727,8 @@ async fn process_index_tree_generation(
                 }
                 Err(e) => eprintln!("[mesh_inline] 预加载 inst_geo IDs 失败: {}", e),
             }
+        } else if gen_mesh {
+            println!("[mesh_inline] replace_exist 模式，跳过去重器预加载，强制重新生成 mesh");
         }
 
         loop {
@@ -956,9 +960,6 @@ async fn process_index_tree_generation(
         all_refnos.extend(loops);
         all_refnos.extend(prims);
         let mut ran_primary = false;
-
-        // model_cache mesh worker 已移除（foyer-cache-cleanup）
-        let _ = &model_cache_ctx;
 
         // mesh 已在 insert_handle 内联完成，无需额外等待
         ran_primary = gen_mesh;

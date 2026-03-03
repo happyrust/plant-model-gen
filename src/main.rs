@@ -791,15 +791,14 @@ async fn main() -> anyhow::Result<()> {
             Arg::new("fill-missing-cache")
                 .long("fill-missing-cache")
                 .help("When exporting dbnum parquet from cache, auto-generate missing refnos before export (default: disabled)")
-                .action(clap::ArgAction::SetTrue)
-                .conflicts_with("from-surrealdb"),
+                .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("from-surrealdb")
                 .long("from-surrealdb")
-                .help("Use SurrealDB as data source for parquet export (instead of model cache)")
-                .action(clap::ArgAction::SetTrue)
-                .conflicts_with("fill-missing-cache"),
+                .help("Use SurrealDB as data source for parquet export (default: true)")
+                .default_value("true")
+                .value_parser(clap::value_parser!(bool)),
         )
         .arg(
             Arg::new("export-pdms-tree-parquet")
@@ -2050,7 +2049,11 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        let mut from_surrealdb = matches.get_flag("from-surrealdb");
+        let mut from_surrealdb = if matches.get_flag("fill-missing-cache") {
+            false // --fill-missing-cache 使用 model cache
+        } else {
+            matches.get_one::<bool>("from-surrealdb").copied().unwrap_or(true)
+        };
         if root_refno.is_some() && !from_surrealdb {
             println!("⚠️  检测到 --root-refno，自动切换到 SurrealDB 数据源（cache 模式不支持按 root 范围导出）");
             from_surrealdb = true;

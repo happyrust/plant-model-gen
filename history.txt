@@ -33,3 +33,31 @@ SELECT in as inst_info_id, geo_type, record::id(out) as geo_hash, out.meshed as 
 SELECT * FROM inst_geo:⟨10105853823688291601⟩;
 RETURN !NONE; RETURN NONE != true; RETURN !false; RETURN !true;
 LET $elbos = [pe:⟨24381_145019⟩, pe:⟨24381_145021⟩, pe:⟨24381_145023⟩, pe:⟨24381_145025⟩, pe:⟨24381_145026⟩, pe:⟨24381_145028⟩, pe:⟨24381_145029⟩, pe:⟨24381_145031⟩, pe:⟨24381_145033⟩]; SELECT in as pe, out as inst_info, (SELECT record::id(out) as geo_id, out.meshed as meshed, out.bad as bad, geo_type FROM $parent.out->geo_relate) as geos FROM inst_relate WHERE in IN $elbos;
+SELECT count() as cnt FROM pe WHERE dbno = 7997 GROUP ALL;
+INFO FOR ROOT;
+INFO FOR NS;
+SELECT count() as cnt FROM pe WHERE dbno = 7997 GROUP ALL;
+SELECT * FROM pe_transform LIMIT 2;
+SELECT * FROM pe_transform WHERE id = pe_transform:⟨17496_106105⟩;
+RETURN type::record('pe_transform', '17496_106105').world_trans
+RETURN type::record('pe_transform', '17496_106105').world_trans.d
+RETURN trans:⟨10286132038810117175⟩.d
+SELECT * FROM trans:⟨10286132038810117175⟩
+SELECT count() FROM trans
+SELECT count() FROM inst_relate WHERE in IN [pe:⟨17496_106105⟩]
+SELECT count() FROM inst_relate
+SELECT count() FROM inst_info; SELECT count() FROM geo_relate; SELECT count() FROM inst_geo
+INFO FOR DB
+SELECT count() AS c FROM pe GROUP ALL; SELECT count() AS c FROM pe_transform GROUP ALL; SELECT count() AS c FROM pe_owner GROUP ALL
+SELECT * FROM pe:⟨17496_161317⟩
+SELECT * FROM neg_relate WHERE in.in = pe:⟨17496_106105⟩; SELECT * FROM inst_relate_bool WHERE id = inst_relate_bool:⟨17496_106105⟩
+SELECT * FROM neg_relate LIMIT 5; SELECT VALUE out FROM neg_relate GROUP BY out;
+SELECT id, geo_type, record::id(geom_refno) as neg_carrier, record::id(geom_refno.owner) as parent_id FROM geo_relate WHERE geo_type = 'Neg' LIMIT 10;
+INSERT RELATION IGNORE INTO neg_relate [{ in: geo_relate:⟨16335937270172198261⟩, id: ['16335937270172198261', pe:⟨17496_106105⟩], out: pe:⟨17496_106105⟩, pe: pe:⟨17496_156765⟩ }]; SELECT * FROM neg_relate;
+INSERT RELATION INTO neg_relate { in: geo_relate:⟨16335937270172198261⟩, id: ['16335937270172198261', pe:⟨17496_106105⟩], out: pe:⟨17496_106105⟩, pe: pe:⟨17496_156765⟩ };
+INFO FOR TABLE neg_relate;
+SELECT * FROM neg_relate LIMIT 5; SELECT count() FROM neg_relate GROUP ALL;
+SELECT record::id(id) as gr_id, record::id(geom_refno) as neg_carrier, record::id(geom_refno.owner) as parent_id FROM geo_relate WHERE geo_type = 'Neg' LIMIT 5;
+INSERT RELATION INTO neg_relate { in: geo_relate:⟨16335937270172198261⟩, id: ['16335937270172198261', pe:⟨17496_106105⟩], out: pe:⟨17496_106105⟩, pe: pe:⟨17496_156765⟩ }; SELECT * FROM neg_relate;
+REMOVE INDEX unique_neg_relate ON TABLE neg_relate; DEFINE INDEX unique_neg_relate ON neg_relate FIELDS in, out UNIQUE; INSERT RELATION INTO neg_relate { in: geo_relate:⟨16335937270172198261⟩, id: ['16335937270172198261', pe:⟨17496_106105⟩], out: pe:⟨17496_106105⟩, pe: pe:⟨17496_156765⟩ }; SELECT * FROM neg_relate;
+DELETE FROM neg_relate; REMOVE INDEX unique_neg_relate ON TABLE neg_relate; DEFINE INDEX unique_neg_relate ON TABLE neg_relate FIELDS in, out UNIQUE;

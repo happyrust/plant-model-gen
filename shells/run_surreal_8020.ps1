@@ -27,5 +27,6 @@ $env:SURREAL_ROCKSDB_TARGET_FILE_SIZE_MULTIPLIER = "2"
 $env:SURREAL_ROCKSDB_FILE_COMPACTION_TRIGGER = "4"
 $env:SURREAL_ROCKSDB_STORAGE_LOG_LEVEL = "warn"
 $env:SURREAL_ROCKSDB_BLOB_COMPRESSION_TYPE = "lz4"
+$env:SURREAL_PLANNER_STRATEGY = "compute-only"
 
 surreal start --user root --pass root --bind 0.0.0.0:$port --log warn --temporary-directory $tmpDir rocksdb://ams-$port.db

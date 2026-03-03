@@ -148,3 +148,5 @@ worktrees/
 # DB options temp
 # ═══════════════════════════════════════════════════════════════
 db_options/_tmp/
+
+target_check

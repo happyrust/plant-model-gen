@@ -14,7 +14,7 @@
 //! ```
 
 use crate::fast_model::gen_model::tree_index_manager::{
-    ensure_tree_index_exists, load_index_with_large_stack, TreeIndexManager,
+    load_index_with_large_stack, TreeIndexManager,
 };
 use crate::fast_model::query_provider;
 use aios_core::RefnoEnum;
@@ -38,9 +38,6 @@ async fn load_tree_index_for_refno(refno: RefnoEnum) -> anyhow::Result<Arc<TreeI
         .tree_dir()
         .to_path_buf();
     let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno)?;
-
-    // 方案乙：按需生成缺失的 `{dbnum}.tree`（避免 tree 缺失导致查询直接失败/返回空）。
-    ensure_tree_index_exists(dbnum, &tree_dir).await?;
 
     // 大栈线程加载，避免 Windows 反序列化大 `.tree` 文件时触发栈溢出。
     load_index_with_large_stack(&tree_dir, dbnum)

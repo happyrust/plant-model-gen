@@ -32,7 +32,7 @@ use serde_json::json;
 
 // 注: trans/aabb 查询在本模块内自行实现（避免跨模块耦合）
 use crate::fast_model::gen_model::tree_index_manager::{
-    ensure_tree_index_exists, load_index_with_large_stack, TreeIndexManager,
+    load_index_with_large_stack, TreeIndexManager,
 };
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
 
@@ -45,7 +45,6 @@ struct InstanceRow {
     refno_str: String,
     refno_u64: u64,
     noun: String,
-    name: String,
     owner_refno_str: Option<String>,
     owner_refno_u64: Option<u64>,
     owner_noun: String,
@@ -104,23 +103,7 @@ struct AabbRow {
 // =============================================================================
 
 fn refno_to_u64(r: &RefnoEnum) -> u64 {
-    let s = r.to_string().replace('/', "_");
-    // 将 "ref0_sesno" 格式转换为一个唯一的 u64
-    // 方法: ref0 * 1_000_000 + sesno
-    // 注意：这里的 ref0 不是 dbnum，仅用于生成唯一 ID
-    let parts: Vec<&str> = s.split('_').collect();
-    if parts.len() == 2 {
-        let db = parts[0].parse::<u64>().unwrap_or(0);
-        let ses = parts[1].parse::<u64>().unwrap_or(0);
-        db * 1_000_000 + ses
-    } else {
-        // fallback: 使用 hash
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        s.hash(&mut hasher);
-        hasher.finish()
-    }
+    *r.refno()
 }
 
 fn writer_props() -> WriterProperties {
@@ -316,7 +299,6 @@ fn instances_schema() -> Schema {
         Field::new("refno_str", DataType::Utf8, false),
         Field::new("refno_u64", DataType::UInt64, false),
         Field::new("noun", DataType::Utf8, false),
-        Field::new("name", DataType::Utf8, true),
         Field::new("owner_refno_str", DataType::Utf8, true),
         Field::new("owner_refno_u64", DataType::UInt64, true),
         Field::new("owner_noun", DataType::Utf8, false),
@@ -399,7 +381,6 @@ fn build_instances_batch(rows: &[InstanceRow]) -> Result<RecordBatch> {
             Arc::new(StringArray::from(rows.iter().map(|r| r.refno_str.as_str()).collect::<Vec<_>>())) as ArrayRef,
             Arc::new(UInt64Array::from(rows.iter().map(|r| r.refno_u64).collect::<Vec<_>>())) as ArrayRef,
             Arc::new(StringArray::from(rows.iter().map(|r| r.noun.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(StringArray::from(rows.iter().map(|r| Some(r.name.as_str())).collect::<Vec<_>>())) as ArrayRef,
             Arc::new(StringArray::from(rows.iter().map(|r| r.owner_refno_str.as_deref()).collect::<Vec<_>>())) as ArrayRef,
             Arc::new(UInt64Array::from(rows.iter().map(|r| r.owner_refno_u64).collect::<Vec<Option<u64>>>())) as ArrayRef,
             Arc::new(StringArray::from(rows.iter().map(|r| r.owner_noun.as_str()).collect::<Vec<_>>())) as ArrayRef,
@@ -505,8 +486,6 @@ struct InstRelateRow {
     pub owner_type: Option<String>,
     pub refno: RefnoEnum,
     pub noun: Option<String>,
-    pub name: Option<String>,
-    pub aabb_hash: Option<String>,
     pub spec_value: Option<i64>,
 }
 
@@ -572,8 +551,6 @@ async fn query_inst_relate_rows(
                 owner_type,
                 in as refno,
                 in.noun as noun,
-                fn::default_full_name(in) as name,
-                IF in->inst_relate_aabb[0].out != NONE THEN record::id(in->inst_relate_aabb[0].out) END as aabb_hash,
                 spec_value as spec_value
             FROM inst_relate
             WHERE in IN [{pe_list}]
@@ -599,7 +576,7 @@ async fn query_tubi_relate(
         return Ok(tubings_map);
     }
 
-    for owners_chunk in owner_refnos.chunks(50) {
+    for owners_chunk in owner_refnos.chunks(200) {
         let mut sql_batch = String::new();
         for owner_refno in owners_chunk {
             let pe_key = owner_refno.to_pe_key();
@@ -836,15 +813,6 @@ pub async fn export_dbnum_instances_parquet(
         println!("🔍 加载 TreeIndex...");
     }
     let tree_manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-    let tree_dir = tree_manager.tree_dir().to_path_buf();
-    let tree_path = tree_dir.join(format!("{}.tree", dbnum));
-
-    ensure_tree_index_exists(dbnum, &tree_dir)
-        .await
-        .with_context(|| format!("按需生成 TreeIndex 失败: {}", tree_path.display()))?;
-
-    let tree_index = load_index_with_large_stack(&tree_dir, dbnum)
-        .with_context(|| format!("加载 TreeIndex 失败: {}", tree_path.display()))?;
 
     let mut all_refnos: Vec<RefnoEnum> = if let Some(root) = root_refno {
         use crate::fast_model::query_compat::query_deep_visible_inst_refnos;
@@ -853,11 +821,8 @@ pub async fn export_dbnum_instances_parquet(
         }
         query_deep_visible_inst_refnos(root).await?
     } else {
-        tree_index
-            .all_refnos()
-            .into_iter()
-            .map(RefnoEnum::from)
-            .collect()
+        // 仅获取可见几何 noun 类型的 refno，排除 SITE/ZONE/WORL 等层级节点
+        tree_manager.query_visible_geo_refnos()
     };
     all_refnos.sort_by_key(|r| r.to_string());
 
@@ -880,8 +845,6 @@ pub async fn export_dbnum_instances_parquet(
     struct ChildInfo {
         refno: RefnoEnum,
         noun: String,
-        name: String,
-        aabb_hash: Option<String>,
         spec_value: i64,
         owner_refno: Option<RefnoEnum>,
         owner_type: String,
@@ -902,8 +865,6 @@ pub async fn export_dbnum_instances_parquet(
         let child = ChildInfo {
             refno: row.refno,
             noun: row.noun.unwrap_or_default(),
-            name: row.name.unwrap_or_default().trim().trim_start_matches('/').to_string(),
-            aabb_hash: row.aabb_hash,
             spec_value: row.spec_value.unwrap_or(0),
             owner_refno: row.owner_refno,
             owner_type: owner_type.clone(),
@@ -986,7 +947,6 @@ pub async fn export_dbnum_instances_parquet(
             if export_inst.insts.is_empty() { continue }
 
             let child_aabb_hash = export_inst.world_aabb_hash.clone()
-                .or_else(|| child.aabb_hash.clone())
                 .unwrap_or_default();
 
             let trans_hash = export_inst.world_trans_hash.clone().unwrap_or_default();
@@ -1004,7 +964,6 @@ pub async fn export_dbnum_instances_parquet(
                 refno_str: child.refno.to_string(),
                 refno_u64: refno_to_u64(&child.refno),
                 noun: child.noun.clone(),
-                name: child.name.clone(),
                 owner_refno_str: Some(owner_refno.to_string()),
                 owner_refno_u64: Some(refno_to_u64(owner_refno)),
                 owner_noun: owner_type.to_string(),
@@ -1078,7 +1037,6 @@ pub async fn export_dbnum_instances_parquet(
         if export_inst.insts.is_empty() { continue }
 
         let child_aabb_hash = export_inst.world_aabb_hash.clone()
-            .or_else(|| child.aabb_hash.clone())
             .unwrap_or_default();
 
         let trans_hash = export_inst.world_trans_hash.clone().unwrap_or_default();
@@ -1095,7 +1053,6 @@ pub async fn export_dbnum_instances_parquet(
             refno_str: child.refno.to_string(),
             refno_u64: refno_to_u64(&child.refno),
             noun: child.noun.clone(),
-            name: child.name.clone(),
             owner_refno_str: child.owner_refno.map(|r| r.to_string()),
             owner_refno_u64: child.owner_refno.map(|r| refno_to_u64(&r)),
             owner_noun: child.owner_type.clone(),
@@ -1139,8 +1096,12 @@ pub async fn export_dbnum_instances_parquet(
     if verbose {
         println!("🔍 查询 {} 个 trans, {} 个 aabb...", trans_hashes.len(), aabb_hashes.len());
     }
-    let transform_rows = query_trans_rows(&trans_hashes, &unit_converter, verbose).await?;
-    let aabb_row_data = query_aabb_rows(&aabb_hashes, &unit_converter, verbose).await?;
+    let (transform_rows_result, aabb_rows_result) = tokio::join!(
+        query_trans_rows(&trans_hashes, &unit_converter, verbose),
+        query_aabb_rows(&aabb_hashes, &unit_converter, verbose),
+    );
+    let transform_rows = transform_rows_result?;
+    let aabb_row_data = aabb_rows_result?;
 
     if verbose {
         println!("✅ trans 命中: {}, aabb 命中: {}", transform_rows.len(), aabb_row_data.len());
@@ -1691,7 +1652,6 @@ pub async fn export_dbnum_instances_parquet_from_cache(
             refno_str: refno.to_string(),
             refno_u64: refno_to_u64(refno),
             noun,
-            name,
             owner_refno_str: owner_refno.map(|r| r.to_string()),
             owner_refno_u64: owner_refno.map(|r| refno_to_u64(&r)),
             owner_noun: info.owner_type.to_ascii_uppercase(),

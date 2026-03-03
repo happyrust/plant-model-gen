@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;
 
 use crate::fast_model::gen_model::tree_index_manager::{
-    ensure_tree_index_exists, load_index_with_large_stack, TreeIndexManager,
+    load_index_with_large_stack, TreeIndexManager,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,9 +186,6 @@ pub async fn export_pdms_tree_parquet(dbnum: u32, output_dir: &Path, verbose: bo
     let tree_manager = TreeIndexManager::with_default_dir(vec![dbnum]);
     let tree_dir = tree_manager.tree_dir().to_path_buf();
     let tree_path = tree_dir.join(format!("{}.tree", dbnum));
-    ensure_tree_index_exists(dbnum, &tree_dir)
-        .await
-        .with_context(|| format!("按需生成 TreeIndex 失败: {}", tree_path.display()))?;
     let tree_index = load_index_with_large_stack(&tree_dir, dbnum)
         .with_context(|| format!("加载 TreeIndex 失败: {}", tree_path.display()))?;
 

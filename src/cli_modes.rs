@@ -1846,7 +1846,7 @@ async fn ensure_cache_refnos_ready_for_parquet(
 ) -> Result<()> {
     use aios_database::fast_model::gen_all_geos_data;
     use aios_database::fast_model::gen_model::tree_index_manager::{
-        TreeIndexManager, ensure_tree_index_exists, load_index_with_large_stack,
+        TreeIndexManager, load_index_with_large_stack,
     };
     use aios_database::fast_model::instance_cache::InstanceCacheManager;
     use std::collections::HashSet;
@@ -1858,7 +1858,6 @@ async fn ensure_cache_refnos_ready_for_parquet(
     // 以 TreeIndex 作为期望集合，差集即需要补齐的 refno。
     let tree_manager = TreeIndexManager::with_default_dir(vec![dbnum]);
     let tree_dir = tree_manager.tree_dir().to_path_buf();
-    ensure_tree_index_exists(dbnum, &tree_dir).await?;
     let tree_index = load_index_with_large_stack(&tree_dir, dbnum)?;
     let missing_refnos: Vec<RefnoEnum> = tree_index
         .all_refnos()

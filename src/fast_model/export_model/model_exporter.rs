@@ -317,7 +317,7 @@ pub async fn collect_export_refnos(
     // cache-only：层级查询严格走 TreeIndex（indextree），不允许导出阶段回退/自动生成/交互询问。
     use crate::data_interface::db_meta_manager::db_meta;
     use crate::fast_model::gen_model::tree_index_manager::{
-        TreeIndexManager, disable_auto_generate_tree, load_index_with_large_stack,
+        TreeIndexManager, load_index_with_large_stack,
     };
     use aios_core::tool::db_tool::db1_hash;
     use aios_core::tree_query::{TreeQueryFilter, TreeQueryOptions};

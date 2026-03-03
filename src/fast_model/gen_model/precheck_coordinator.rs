@@ -13,9 +13,7 @@
 //! - **性能优先**：使用并行处理提升大规模数据的处理速度
 
 use crate::data_interface::db_meta_manager::db_meta;
-use crate::fast_model::gen_model::tree_index_manager::{
-    ensure_tree_index_exists, get_available_dbnums_from_db, TreeIndexManager,
-};
+use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 use crate::options::DbOptionExt;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -70,8 +68,7 @@ pub struct PrecheckStats {
 /// 优先级：
 /// 1. manual_db_nums（手动指定）
 /// 2. 从 db_meta_info.json 读取
-/// 3. 从 SurrealDB(pe.dbnum) 回退查询
-/// 4. 应用 exclude_db_nums 过滤
+/// 3. 应用 exclude_db_nums 过滤
 async fn extract_target_dbnums(db_option: &DbOptionExt) -> Result<Vec<u32>> {
     let mut dbnums: Vec<u32> = if let Some(manual) = &db_option.inner.manual_db_nums {
         manual.clone()
@@ -80,13 +77,7 @@ async fn extract_target_dbnums(db_option: &DbOptionExt) -> Result<Vec<u32>> {
         if db_meta().ensure_loaded().is_ok() {
             from_meta = db_meta().get_all_dbnums();
         }
-        if from_meta.is_empty() {
-            get_available_dbnums_from_db()
-                .await
-                .context("从 SurrealDB(pe) 查询数据库编号失败")?
-        } else {
-            from_meta
-        }
+        from_meta
     };
 
     // 应用排除列表
@@ -167,57 +158,10 @@ async fn check_tree_files(
     println!("[precheck] 缺失的数据库: {:?}", missing);
     println!("[precheck] 🔄 开始并行生成缺失的 Tree 文件...");
 
-    // 并行生成 Tree 文件
-    let tree_dir_owned = tree_dir.to_path_buf();
-    let mut tasks = Vec::new();
+    println!("[precheck] ⚠️  缺失的 Tree 文件需要通过 PDMS 解析(--parse-db)生成");
 
-    for dbnum in missing.iter().copied() {
-        let tree_dir_clone = tree_dir_owned.clone();
-        let task = tokio::spawn(async move {
-            match ensure_tree_index_exists(dbnum, &tree_dir_clone).await {
-                Ok(_) => (dbnum, true),
-                Err(e) => {
-                    eprintln!("[precheck] Tree 文件生成失败 (dbnum={}): {}", dbnum, e);
-                    (dbnum, false)
-                }
-            }
-        });
-        tasks.push(task);
-    }
-
-    // 等待所有任务完成
-    let mut generated = 0;
-    let mut failed = 0;
-
-    for (idx, task) in tasks.into_iter().enumerate() {
-        match task.await {
-            Ok((dbnum, success)) => {
-                if success {
-                    println!("[precheck] [{}/{}] 生成 {}.tree ✅", idx + 1, missing.len(), dbnum);
-                    generated += 1;
-                } else {
-                    println!("[precheck] [{}/{}] 生成 {}.tree ❌", idx + 1, missing.len(), dbnum);
-                    failed += 1;
-                }
-            }
-            Err(e) => {
-                eprintln!("[precheck] 任务执行失败: {}", e);
-                failed += 1;
-            }
-        }
-    }
-
-    stats.tree_generated = generated;
-    stats.tree_failed = failed;
-
-    if failed > 0 {
-        println!(
-            "[precheck] ⚠️  Tree 文件生成部分失败：{} 个成功，{} 个失败",
-            generated, failed
-        );
-    } else {
-        println!("[precheck] ✅ Tree 文件生成完成（{} 个）", generated);
-    }
+    stats.tree_generated = 0;
+    stats.tree_failed = missing.len();
 
     Ok(())
 }

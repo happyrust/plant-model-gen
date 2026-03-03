@@ -1448,14 +1448,9 @@ async fn get_filtered_dbnums(db_option: &DbOptionExt) -> Result<Vec<u32>> {
         }
 
         if from_meta.is_empty() {
-            super::tree_index_manager::get_available_dbnums_from_db()
-                .await
-                .map_err(|e| {
-                    IndexTreeError::DatabaseError(format!(
-                        "无法获取可用 dbnum（db_meta 与 pe 查询均失败）: {}",
-                        e
-                    ))
-                })?
+            return Err(IndexTreeError::DatabaseError(
+                "db_meta_info.json 为空且无其他 dbnum 来源，请先运行 --parse-db".to_string(),
+            ));
         } else {
             from_meta
         }

@@ -26,29 +26,12 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+
 
 static TREE_INDEX_CACHE: Lazy<DashMap<(PathBuf, u32), Arc<TreeIndex>>> =
     Lazy::new(DashMap::new);
 
-/// 全局开关：是否允许自动生成缺失的 tree 索引文件
-static AUTO_GENERATE_TREE_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// 启用自动生成缺失的 tree 索引文件
-pub fn enable_auto_generate_tree() {
-    AUTO_GENERATE_TREE_ENABLED.store(true, Ordering::Relaxed);
-    log::info!("[TreeIndexManager] 已启用自动生成 tree 索引文件");
-}
-
-/// 禁用自动生成缺失的 tree 索引文件
-pub fn disable_auto_generate_tree() {
-    AUTO_GENERATE_TREE_ENABLED.store(false, Ordering::Relaxed);
-}
-
-/// 检查是否启用了自动生成
-pub fn is_auto_generate_tree_enabled() -> bool {
-    AUTO_GENERATE_TREE_ENABLED.load(Ordering::Relaxed)
-}
 
 /// 从 DbOption.toml 读取 project_name，返回 output/{project}/scene_tree 路径
 /// 优先使用 DB_OPTION_FILE 环境变量指定的配置文件
@@ -128,14 +111,8 @@ impl std::fmt::Display for TreeIndexMissingError {
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  解决方案:                                                                     ║
 ║                                                                               ║
-║  方案1: 重新解析数据库（推荐）                                                  ║
+║  重新解析数据库（推荐）                                                         ║
 ║    cargo run --bin aios-database -- --parse-db                               ║
-║                                                                               ║
-║  方案2: 从 SurrealDB 重建 tree 索引                                            ║
-║    cargo run --bin aios-database -- --rebuild-tree-index                     ║
-║                                                                               ║
-║  方案3: 启用自动生成（在程序中调用）                                            ║
-║    aios_database::fast_model::gen_model::tree_index_manager::enable_auto_generate_tree();
 ╚══════════════════════════════════════════════════════════════════════════════╝
 "#,
             tree_file = self.tree_file_path.display(),
@@ -198,55 +175,11 @@ impl TreeIndexManager {
         // 检查 tree 文件是否存在
         let tree_file_path = self.tree_dir.join(format!("{}.tree", dbnum));
         if !tree_file_path.exists() {
-            // 检查目录是否存在
-            if !self.tree_dir.exists() {
-                return Err(TreeIndexMissingError {
-                    dbnum,
-                    tree_dir: self.tree_dir.clone(),
-                    tree_file_path,
-                }.into());
-            }
-
-            // 如果启用了自动生成，尝试生成
-            if is_auto_generate_tree_enabled() {
-                log::info!("[TreeIndexManager] Tree 索引文件不存在，尝试从 SurrealDB 重建: dbnum={}", dbnum);
-                // 使用 tokio runtime 执行异步生成。
-                //
-                // 注意：load_index 可能在非 tokio 线程里被调用（例如 tree-index-loader-* 线程），
-                // 这时 Handle::current() 会 panic。这里用 try_current + 兜底 runtime，保证稳定性。
-                let tree_dir = self.tree_dir.clone();
-                let result = match tokio::runtime::Handle::try_current() {
-                    Ok(handle) => tokio::task::block_in_place(|| {
-                        handle.block_on(async { generate_tree_index_from_db(dbnum, &tree_dir).await })
-                    }),
-                    Err(_) => {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()?;
-                        rt.block_on(async { generate_tree_index_from_db(dbnum, &tree_dir).await })
-                    }
-                };
-
-                match result {
-                    Ok(_) => {
-                        log::info!("[TreeIndexManager] 已成功生成 tree 索引文件: dbnum={}", dbnum);
-                    }
-                    Err(e) => {
-                        log::warn!("[TreeIndexManager] 自动生成 tree 索引失败: {}", e);
-                        return Err(TreeIndexMissingError {
-                            dbnum,
-                            tree_dir: self.tree_dir.clone(),
-                            tree_file_path,
-                        }.into());
-                    }
-                }
-            } else {
-                return Err(TreeIndexMissingError {
-                    dbnum,
-                    tree_dir: self.tree_dir.clone(),
-                    tree_file_path,
-                }.into());
-            }
+            return Err(TreeIndexMissingError {
+                dbnum,
+                tree_dir: self.tree_dir.clone(),
+                tree_file_path,
+            }.into());
         }
 
         let index = load_tree_index_from_dir(dbnum, &self.tree_dir)?;
@@ -700,6 +633,43 @@ impl TreeIndexManager {
         self.get_node_meta(refno).map(|meta| db1_dehash(meta.noun))
     }
 
+    /// 查询所有可见几何类型的 refnos
+    ///
+    /// 等价于 `all_refnos()` + 按 `VISBILE_GEO_NOUNS` 过滤 noun，
+    /// 只返回有可见几何的实例节点（排除 SITE/ZONE/WORL 等层级节点）。
+    ///
+    /// 用途：Parquet 导出时按 dbnum 获取有模型数据的 refno 列表。
+    pub fn query_visible_geo_refnos(&self) -> Vec<RefnoEnum> {
+        use aios_core::pdms_types::VISBILE_GEO_NOUNS;
+
+        let visible_hashes: std::collections::HashSet<u32> = VISBILE_GEO_NOUNS
+            .iter()
+            .map(|&name| db1_hash(name))
+            .collect();
+
+        let mut refnos = Vec::new();
+        for &dbnum in &self.dbnums {
+            match self.load_index(dbnum) {
+                Ok(index) => {
+                    for refno in index.all_refnos() {
+                        if let Some(meta) = index.node_meta(refno) {
+                            if visible_hashes.contains(&meta.noun) {
+                                refnos.push(RefnoEnum::from(refno));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[TreeIndexManager] 加载 TreeIndex dbnum={} 失败: {}",
+                        dbnum, e
+                    );
+                }
+            }
+        }
+        refnos
+    }
+
     /// 仅基于 TreeIndex 查询“直接子节点元素列表”（不访问 SurrealDB）。
     ///
     /// 用途：
@@ -751,128 +721,7 @@ impl TreeIndexManager {
     }
 }
 
-// ============================================================================
-// 从 SurrealDB 生成 tree 索引文件
-// ============================================================================
 
-/// 从 SurrealDB 生成指定 dbnum 的 tree 索引文件
-///
-/// 该函数查询 SurrealDB 中的 pe 表，获取所有节点的层级关系，
-/// 然后生成 tree 索引文件保存到指定目录。
-///
-/// # Arguments
-/// * `dbnum` - 数据库编号
-/// * `output_dir` - 输出目录 (如 "output/scene_tree")
-pub async fn generate_tree_index_from_db(dbnum: u32, output_dir: &Path) -> anyhow::Result<()> {
-    use aios_core::{model_primary_db, SurrealQueryExt};
-    use crate::versioned_db::tree_export::{export_tree_file, TreeNodeMeta};
-    use aios_core::db::DbBasicData;
-    use std::collections::HashMap;
-    use surrealdb::types::SurrealValue;
-
-    log::info!("[generate_tree_index] 开始从 SurrealDB 生成 tree 索引: dbnum={}", dbnum);
-
-    // 查询指定 dbnum 的所有节点
-    #[derive(Debug, serde::Deserialize, SurrealValue)]
-    struct PeRow {
-        refno: Option<u64>,
-        owner: Option<u64>,
-        noun: Option<String>,
-        cata_hash: Option<u64>,
-    }
-
-    let sql = format!(
-        "SELECT refno, owner, noun, cata_hash FROM pe WHERE dbnum = {}",
-        dbnum
-    );
-
-    let rows: Vec<PeRow> = model_primary_db().query_take(&sql, 0).await?;
-
-    if rows.is_empty() {
-        anyhow::bail!("dbnum={} 在 SurrealDB 中没有找到任何节点", dbnum);
-    }
-
-    log::info!("[generate_tree_index] 查询到 {} 个节点", rows.len());
-
-    // 构建 tree_nodes HashMap
-    let mut tree_nodes: HashMap<RefU64, TreeNodeMeta> = HashMap::new();
-
-    for row in rows {
-        let Some(refno_val) = row.refno else { continue };
-        let refno = RefU64(refno_val);
-
-        let owner = row.owner.map(RefU64).unwrap_or(refno);
-        let noun = row.noun.as_deref().unwrap_or("UNKNOWN");
-        let noun_hash = db1_hash(noun);
-
-        tree_nodes.insert(refno, TreeNodeMeta {
-            refno,
-            owner,
-            noun: noun_hash,
-            cata_hash: row.cata_hash,
-        });
-    }
-
-    // 创建 DbBasicData (仅用于兼容 export_tree_file 签名)
-    let db_basic = DbBasicData::default();
-
-    // 确保输出目录存在
-    std::fs::create_dir_all(output_dir)?;
-
-    // 从 SurrealDB 构建时没有 children_map，使用空 map（顺序不保证）
-    // 注意：正确的 tree 应该从 PDMS 解析时生成，这里仅作为 fallback
-    let children_map: HashMap<RefU64, Vec<RefU64>> = HashMap::new();
-
-    // 导出 tree 文件
-    export_tree_file(dbnum, &db_basic, &tree_nodes, &children_map, output_dir)?;
-
-    log::info!(
-        "[generate_tree_index] 成功生成 tree 索引文件: {}/{}.tree ({} 节点)",
-        output_dir.display(),
-        dbnum,
-        tree_nodes.len()
-    );
-
-    Ok(())
-}
-
-/// 确保指定 dbnum 的 `{dbnum}.tree` 文件存在；若缺失则从 SurrealDB 生成。
-pub async fn ensure_tree_index_exists(dbnum: u32, output_dir: &Path) -> anyhow::Result<()> {
-    let tree_path = output_dir.join(format!("{}.tree", dbnum));
-    if tree_path.is_file() {
-        return Ok(());
-    }
-
-    log::info!(
-        "[tree_index] 缺失 tree 索引文件，开始按需生成: {}",
-        tree_path.display()
-    );
-    generate_tree_index_from_db(dbnum, output_dir).await
-}
-
-/// 批量生成多个 dbnum 的 tree 索引文件
-pub async fn generate_tree_indices_from_db(dbnums: &[u32], output_dir: &Path) -> anyhow::Result<usize> {
-    let mut success_count = 0;
-
-    for &dbnum in dbnums {
-        match generate_tree_index_from_db(dbnum, output_dir).await {
-            Ok(_) => success_count += 1,
-            Err(e) => log::warn!("[generate_tree_index] dbnum={} 生成失败: {}", dbnum, e),
-        }
-    }
-
-    Ok(success_count)
-}
-
-/// 从 SurrealDB 获取所有可用的 dbnum 列表
-pub async fn get_available_dbnums_from_db() -> anyhow::Result<Vec<u32>> {
-    use aios_core::{model_primary_db, SurrealQueryExt};
-
-    let sql = "SELECT DISTINCT dbnum FROM pe WHERE dbnum != NONE";
-    let dbnums: Vec<i32> = model_primary_db().query_take(sql, 0).await?;
-
-    Ok(dbnums.into_iter().filter(|&d| d > 0).map(|d| d as u32).collect())
-}
 
 #[cfg(test)]
 mod tests {

@@ -40,7 +40,9 @@ use crate::data_interface::db_meta_manager::db_meta;
 
 use crate::fast_model::mesh_generate::{
     run_boolean_worker,
-    MeshTask, MeshWorkerReport, extract_mesh_tasks, run_mesh_worker_from_channel,
+    MeshTask, MeshResult, MeshWorkerReport, RecentGeoDeduper,
+    extract_mesh_tasks, generate_meshes_for_batch, query_existing_inst_geo_ids,
+    run_mesh_worker_from_channel,
 };
 use crate::fast_model::gen_model::boolean_task::{BooleanTask, BooleanTaskAccumulator};
 use crate::fast_model::gen_model::manifold_bool::run_bool_worker_from_tasks;
@@ -706,6 +708,19 @@ async fn process_index_tree_generation(
 
     let replace_exist = db_option.inner.is_replace_mesh();
 
+    // 🧹 预处理清理：在生成前一次性删除目标 refnos 的旧模型记录，
+    // 避免生成过程中 DELETE + INSERT IGNORE 与 mesh worker 的竞态条件。
+    if replace_exist && !db_option.defer_db_write && db_option.use_surrealdb {
+        if let Some(ref roots) = seed_roots {
+            if !roots.is_empty() {
+                perf.mark("pre_cleanup_for_regen");
+                if let Err(e) = super::pdms_inst::pre_cleanup_for_regen(roots).await {
+                    eprintln!("[gen_model] ⚠️ pre_cleanup_for_regen 失败（继续生成）: {}", e);
+                }
+            }
+        }
+    }
+
     let use_surrealdb = db_option.use_surrealdb;
     let defer_db_write = db_option.defer_db_write;
 
@@ -727,25 +742,8 @@ async fn process_index_tree_generation(
         None
     };
 
-    // Mesh channel: insert_handle 在 save 成功后发送 MeshTask，mesh_handle 并行消费
+    // Mesh 生成：内联模式，每批次先生成 mesh 再写 DB，消除 UPDATE 竞态
     let gen_mesh = db_option.inner.gen_mesh;
-    let (mesh_tx, mesh_rx) = if gen_mesh && use_surrealdb {
-        let (tx, rx) = flume::bounded::<Vec<MeshTask>>(100);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
-    // 启动 mesh worker（与 insert_handle 并行）
-    let mesh_handle = if let Some(rx) = mesh_rx {
-        let db_opt = Arc::new(db_option.inner.clone());
-        let mesh_sql_writer = sql_file_writer.clone(); // defer 模式时 Some，传统模式时 None
-        Some(tokio::spawn(async move {
-            run_mesh_worker_from_channel(rx, db_opt, mesh_sql_writer).await
-        }))
-    } else {
-        None
-    };
 
     // 初始化 Parquet 写入器（默认关闭，通过环境变量显式开启）。
     //
@@ -859,6 +857,7 @@ async fn process_index_tree_generation(
         .and_then(|nums| nums.first().copied());
 
     let sql_writer_clone = sql_file_writer.clone();
+    let db_option_inner = db_option.inner.clone();
 
     let insert_handle = tokio::spawn(async move {
 
@@ -884,6 +883,27 @@ async fn process_index_tree_generation(
         // 控制 SurrealDB 后台写入的最大并发数
         let db_write_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
         let mut bool_accumulator = BooleanTaskAccumulator::default();
+
+        // Mesh 内联生成所需的跨批次共享状态
+        let mut mesh_deduper = RecentGeoDeduper::new(200_000);
+        let mesh_aabb_map: Arc<dashmap::DashMap<String, parry3d::bounding_volume::Aabb>> = Arc::new(dashmap::DashMap::new());
+        let mesh_pts_map: Arc<dashmap::DashMap<u64, String>> = Arc::new(dashmap::DashMap::new());
+        let mut t_mesh = std::time::Duration::ZERO;
+        let mut mesh_total = 0usize;
+        // 预加载 mesh 缓存 + 已有 inst_geo IDs（一次性）
+        if gen_mesh {
+            if let Err(e) = crate::fast_model::preload_mesh_cache().await {
+                eprintln!("[mesh_inline] 预加载 mesh 缓存失败: {}", e);
+            }
+            match query_existing_inst_geo_ids().await {
+                Ok(ids) => {
+                    let count = ids.len();
+                    mesh_deduper.preload(ids);
+                    println!("[mesh_inline] 预加载 {} 个已有 inst_geo ID 到去重器 (capacity={})", count, mesh_deduper.capacity);
+                }
+                Err(e) => eprintln!("[mesh_inline] 预加载 inst_geo IDs 失败: {}", e),
+            }
+        }
 
         loop {
 
@@ -935,15 +955,24 @@ async fn process_index_tree_generation(
 
             }
 
-            // Mesh 提取：与数据库操作解耦，只要解析完图元就直接派发
-            if let Some(ref tx) = mesh_tx {
+            // Mesh 内联生成：先生成 mesh，再将结果合并到 inst_geo INSERT 中
+            let mesh_results: HashMap<u64, MeshResult> = if gen_mesh {
                 let tasks = extract_mesh_tasks(&shape_insts_arc);
                 if !tasks.is_empty() {
-                    if let Err(e) = tx.send_async(tasks).await {
-                        eprintln!("[mesh_channel] 发送 mesh 任务失败: {}", e);
-                    }
+                    let t0 = Instant::now();
+                    let results = generate_meshes_for_batch(
+                        &tasks, &db_option_inner, &mut mesh_deduper,
+                        &mesh_aabb_map, &mesh_pts_map,
+                    ).await;
+                    mesh_total += results.len();
+                    t_mesh += t0.elapsed();
+                    results
+                } else {
+                    HashMap::new()
                 }
-            }
+            } else {
+                HashMap::new()
+            };
 
             // 布尔任务跨批次汇总：统一在 insert_handle 结束后一次性抽取，避免漏任务。
             bool_accumulator.merge_batch(&shape_insts_arc);
@@ -964,6 +993,7 @@ async fn process_index_tree_generation(
                         replace_exist,
                         writer,
                         &precomputed,
+                        &mesh_results,
                     ).await {
                         eprintln!("[defer_db_write] 写入 SQL 文件失败: {}", e);
                     }
@@ -985,7 +1015,7 @@ async fn process_index_tree_generation(
                 db_write_handles.push(tokio::spawn(async move {
                     let _permit_holder = permit; // 离开作用域时自动释放信号量
 
-                    if let Err(e) = save_instance_data_optimize(&shape_insts_clone, replace_exist).await {
+                    if let Err(e) = save_instance_data_optimize(&shape_insts_clone, replace_exist, &mesh_results).await {
                         eprintln!("保存实例数据失败: {}", e);
                         return false;
                     }
@@ -1010,10 +1040,57 @@ async fn process_index_tree_generation(
             }
         }
 
+        // 保存 mesh 生成的 aabb/pts 数据
+        if gen_mesh && (!mesh_aabb_map.is_empty() || !mesh_pts_map.is_empty()) {
+            if let Some(ref writer) = sql_writer_clone {
+                // defer 模式：写入 .surql 文件
+                if !mesh_aabb_map.is_empty() {
+                    let keys: Vec<String> = mesh_aabb_map.iter().map(|kv| kv.key().clone()).collect();
+                    for chunk in keys.chunks(300) {
+                        let mut rows: Vec<String> = Vec::with_capacity(chunk.len());
+                        for k in chunk {
+                            let v = mesh_aabb_map.get(k).unwrap();
+                            let d = serde_json::to_string(v.value()).unwrap();
+                            let id_key = if k.starts_with("aabb:") {
+                                k.to_string()
+                            } else {
+                                format!("aabb:⟨{}⟩", k)
+                            };
+                            rows.push(format!("{{'id':{id_key}, 'd':{d}}}"));
+                        }
+                        let sql = format!("INSERT IGNORE INTO aabb [{}]", rows.join(","));
+                        let _ = writer.write_statement(&sql);
+                    }
+                }
+                if !mesh_pts_map.is_empty() {
+                    let keys: Vec<u64> = mesh_pts_map.iter().map(|kv| *kv.key()).collect();
+                    for chunk in keys.chunks(100) {
+                        let mut rows: Vec<String> = Vec::with_capacity(chunk.len());
+                        for &k in chunk {
+                            let v = mesh_pts_map.get(&k).unwrap();
+                            rows.push(format!("{{'id':vec3:⟨{}⟩, 'd':{}}}", k, v.value()));
+                        }
+                        let sql = format!("INSERT IGNORE INTO vec3 [{}]", rows.join(","));
+                        let _ = writer.write_statement(&sql);
+                    }
+                }
+                println!(
+                    "[mesh_inline] deferred: aabb={} pts={} 条写入 .surql",
+                    mesh_aabb_map.len(), mesh_pts_map.len()
+                );
+            } else {
+                // 直接模式：写入 SurrealDB
+                crate::fast_model::utils::save_pts_to_surreal(&mesh_pts_map).await;
+                crate::fast_model::utils::save_aabb_to_surreal(&mesh_aabb_map).await;
+            }
+        }
+
         println!(
-            "[insert_handle] 汇总: batch_cnt={}, t_save_db={}ms, t_cache={}ms, t_parquet={}ms",
+            "[insert_handle] 汇总: batch_cnt={}, t_save_db={}ms, t_mesh={}ms (mesh={}), t_cache={}ms, t_parquet={}ms",
             batch_cnt,
             t_save_db.as_millis(),
+            t_mesh.as_millis(),
+            mesh_total,
             t_cache.as_millis(),
             t_parquet.as_millis(),
         );
@@ -1068,25 +1145,6 @@ async fn process_index_tree_generation(
         .map_err(|e| anyhow::anyhow!("instance sink 任务异常退出: {}", e))?
         .map_err(IndexTreeError::Other)?;
     let mut bool_tasks = insert_report.bool_tasks;
-    // mesh_tx 已被 insert_handle 的 async move 闭包捕获，
-    // insert_handle 完成后 mesh_tx 自动 drop → mesh_handle 的 recv 循环正常结束
-
-    // 完成 Parquet 写入并合并文件
-
-    // [foyer-removal] parquet_writer 已移除，跳过 finalize
-    let _ = &parquet_writer;
-
-    #[cfg(feature = "duckdb-feature")]
-
-    if let Some(ref writer) = duckdb_writer {
-
-        if let Err(e) = writer.finalize() {
-
-            eprintln!("[DuckDB] finalize 失败: {}", e);
-
-        }
-
-    }
 
     println!(
 
@@ -1119,35 +1177,13 @@ async fn process_index_tree_generation(
         // model_cache mesh worker 已移除（foyer-cache-cleanup）
         let _ = &model_cache_ctx;
 
-        // 等待 mesh_handle 完成（已与 insert_handle 并行执行）
-        if let Some(handle) = mesh_handle {
-            println!("[gen_model] 等待 mesh_worker_channel 完成...");
-            match handle.await {
-                Ok(Ok(report)) => {
-                    ran_primary = true;
-                    if report.degraded {
-                        eprintln!(
-                            "[gen_model] ⚠️ mesh_worker_channel 完成但存在降级: 失败批次={}, 失败语句={}",
-                            report.db_update_failed_batches,
-                            report.db_update_failed_statements,
-                        );
-                    }
-                    println!(
-                        "[gen_model] IndexTree 模式 mesh 生成完成，用时 {} ms",
-                        mesh_start.elapsed().as_millis()
-                    );
-                }
-                Ok(Err(e)) => {
-                    return Err(IndexTreeError::Other(anyhow::anyhow!(
-                        "mesh_worker_channel 不可恢复错误: {}", e
-                    )));
-                }
-                Err(e) => {
-                    return Err(IndexTreeError::Other(anyhow::anyhow!(
-                        "mesh_worker_channel 任务 panic: {}", e
-                    )));
-                }
-            }
+        // mesh 已在 insert_handle 内联完成，无需额外等待
+        ran_primary = gen_mesh;
+        if gen_mesh {
+            println!(
+                "[gen_model] IndexTree 模式 mesh 内联生成完成，用时 {} ms",
+                mesh_start.elapsed().as_millis()
+            );
         }
 
         perf.mark("aabb_write");
@@ -1626,11 +1662,9 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
     if !db_option.inner.enable_sqlite_rtree {
 
         // 常见误区：已切换到 cache 生成，但忘了开 enable_sqlite_rtree，导致 spatial_index.sqlite 不会更新，
-
         // 房间计算（SQLite RTree 粗筛）会退化/失效。
 
         let idx_path = SqliteSpatialIndex::default_path();
-
         if !idx_path.exists() {
 
             eprintln!(

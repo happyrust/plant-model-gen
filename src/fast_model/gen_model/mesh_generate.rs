@@ -126,7 +126,7 @@ impl MeshWorkerReport {
 pub struct RecentGeoDeduper {
     set: HashSet<u64>,
     order: VecDeque<u64>,
-    capacity: usize,
+    pub capacity: usize,
     /// 累计插入（新增）次数
     pub insert_count: usize,
     /// 累计重复命中次数
@@ -165,6 +165,32 @@ impl RecentGeoDeduper {
         self.insert_count += 1;
         true
     }
+
+    /// 批量预加载已知 ID（不计入 insert_count，自动扩容）
+    pub fn preload(&mut self, ids: impl IntoIterator<Item = u64>) {
+        for id in ids {
+            if self.set.insert(id) {
+                self.order.push_back(id);
+            }
+        }
+        // 扩容以容纳预加载数据 + 后续新增
+        if self.set.len() > self.capacity {
+            self.capacity = self.set.len() + 100_000;
+        }
+    }
+}
+
+/// 从数据库查询所有已有 inst_geo 的 geo_hash（u64 ID），用于启动时预加载去重
+pub async fn query_existing_inst_geo_ids() -> anyhow::Result<Vec<u64>> {
+    let sql = "SELECT VALUE record::id(id) FROM inst_geo";
+    let ids: Vec<String> = model_primary_db().query_take(sql, 0).await?;
+    let mut result = Vec::with_capacity(ids.len());
+    for id_str in ids {
+        if let Ok(hash) = id_str.parse::<u64>() {
+            result.push(hash);
+        }
+    }
+    Ok(result)
 }
 
 /// SQL flush 阈值
@@ -216,6 +242,60 @@ pub struct MeshTask {
     pub is_neg: bool,
 }
 
+/// 单个 geo_hash 的 mesh 生成结果
+///
+/// 用于在 mesh 生成完成后，将结果合并到 inst_geo 的 INSERT 语句中，
+/// 消除先 INSERT 再 UPDATE meshed 的两步写入竞态。
+#[derive(Debug, Clone)]
+pub struct MeshResult {
+    pub meshed: bool,
+    pub bad: bool,
+    pub aabb_hash: Option<u64>,
+    pub pts_hashes: Vec<u64>,
+}
+
+impl MeshResult {
+    /// 生成失败时的默认结果
+    pub fn failed() -> Self {
+        Self { meshed: true, bad: true, aabb_hash: None, pts_hashes: vec![] }
+    }
+
+    /// 生成 UPDATE inst_geo SQL（供向后兼容的 channel worker 使用）
+    pub fn to_update_sql(&self, geo_hash: &str) -> String {
+        if self.bad {
+            return format!("UPDATE inst_geo:⟨{}⟩ SET bad=true, meshed=true;", geo_hash);
+        }
+        let aabb_part = self.aabb_hash
+            .map(|h| format!(", aabb = aabb:⟨{}⟩", h))
+            .unwrap_or_default();
+        let pts_part = if self.pts_hashes.is_empty() {
+            String::new()
+        } else {
+            let refs: Vec<String> = self.pts_hashes.iter().map(|h| format!("vec3:⟨{}⟩", h)).collect();
+            format!(", pts=[{}]", refs.join(","))
+        };
+        format!("update inst_geo:⟨{}⟩ set meshed = true{}{};", geo_hash, aabb_part, pts_part)
+    }
+
+    /// 生成 inst_geo INSERT JSON 中的 mesh 附加字段片段
+    ///
+    /// 返回如 `,'meshed':true,'aabb':aabb:⟨hash⟩,'pts':[vec3:⟨...⟩]`
+    pub fn to_insert_fields(&self) -> String {
+        let mut s = format!(", 'meshed': {}", self.meshed);
+        if self.bad {
+            s.push_str(", 'bad': true");
+        }
+        if let Some(h) = self.aabb_hash {
+            s.push_str(&format!(", 'aabb': aabb:⟨{}⟩", h));
+        }
+        if !self.pts_hashes.is_empty() {
+            let refs: Vec<String> = self.pts_hashes.iter().map(|h| format!("vec3:⟨{}⟩", h)).collect();
+            s.push_str(&format!(", 'pts': [{}]", refs.join(",")));
+        }
+        s
+    }
+}
+
 /// 从 ShapeInstancesData 中提取 MeshTask 列表
 ///
 /// 遍历 `inst_geos_map`，收集每个 `EleInstGeo` 的 `(geo_hash, geo_param)`。
@@ -238,6 +318,111 @@ pub fn extract_mesh_tasks(data: &ShapeInstancesData) -> Vec<MeshTask> {
         }
     }
     tasks
+}
+
+/// 批量生成一组 MeshTask 的 mesh，返回 geo_hash → MeshResult 映射
+///
+/// 在 insert_handle 中内联调用，mesh 完成后再将结果合并到 inst_geo 的 INSERT 中，
+/// 消除先 INSERT 再 UPDATE meshed 的竞态。
+///
+/// `deduper` / `aabb_map` / `pts_json_map` 跨批次共享，由调用方持有。
+pub async fn generate_meshes_for_batch(
+    tasks: &[MeshTask],
+    db_option: &DbOption,
+    deduper: &mut RecentGeoDeduper,
+    aabb_map: &Arc<DashMap<String, Aabb>>,
+    pts_json_map: &Arc<DashMap<u64, String>>,
+) -> HashMap<u64, MeshResult> {
+    let mesh_dir = db_option.get_meshes_path();
+    let precision = db_option.mesh_precision().clone();
+    let mesh_formats = crate::options::get_db_option_ext().mesh_formats.clone();
+
+    let lod_dir = mesh_dir.join(format!("lod_{:?}", precision.default_lod));
+    let manifold_dir = mesh_dir.join("manifold");
+    let inst_aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
+
+    let mut results = HashMap::new();
+    let mut skipped_by_cache = 0usize;
+
+    for task in tasks {
+        // 第一层去重：跨批次内存去重器
+        if !deduper.insert(task.geo_hash) {
+            continue;
+        }
+
+        let mesh_id = task.geo_hash.to_string();
+
+        // 第二层去重：检查 DB 预加载缓存（EXIST_MESH_GEO_HASHES）
+        // 如果该 geo_hash 已经在数据库中 meshed=true，直接复用缓存的 AABB，跳过 CSG 生成
+        if let Some(cached_aabb) = EXIST_MESH_GEO_HASHES.get(&mesh_id) {
+            let cached = *cached_aabb;
+            drop(cached_aabb);
+            let ext_mag = cached.extents().magnitude();
+            let valid = ext_mag > 1e-4 && ext_mag < f32::INFINITY;
+            let aabb_hash = if valid {
+                let h = gen_aabb_hash(&cached);
+                aabb_map.entry(h.to_string()).or_insert(cached);
+                Some(h)
+            } else {
+                None
+            };
+            results.insert(task.geo_hash, MeshResult {
+                meshed: true,
+                bad: !valid,
+                aabb_hash,
+                pts_hashes: vec![],
+            });
+            skipped_by_cache += 1;
+            continue;
+        }
+
+        let geo_type_name = task.geo_param.type_name();
+        let profile = precision.profile_for_geo(geo_type_name);
+        let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
+        let lod_settings = profile.csg_settings;
+        let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
+
+        let geo_param_for_mesh = if task.geo_param.is_reuse_unit() {
+            task.geo_param.to_unit_param()
+        } else {
+            task.geo_param.clone()
+        };
+
+        let mr = match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
+            Some(csg_mesh) => {
+                match handle_csg_mesh(
+                    &lod_dir, &manifold_dir,
+                    &mesh_id, &mesh_filename,
+                    csg_mesh,
+                    aabb_map, pts_json_map, &inst_aabb_map,
+                    &mesh_formats, task.is_neg,
+                ).await {
+                    Ok(mr) => mr,
+                    Err(e) => {
+                        debug_model_warn!("CSG mesh 生成失败 for {}: {}", mesh_id, e);
+                        MeshResult::failed()
+                    }
+                }
+            }
+            None => {
+                debug_model_warn!("CSG mesh 返回 None for {} (type={})", mesh_id, geo_type_name);
+                MeshResult::failed()
+            }
+        };
+
+        results.insert(task.geo_hash, mr);
+    }
+
+    if skipped_by_cache > 0 {
+        debug_model_debug!(
+            "[mesh_batch] 跳过已缓存: {} / 总计: {} / 新生成: {}",
+            skipped_by_cache,
+            tasks.len(),
+            results.len() - skipped_by_cache
+        );
+    }
+
+    results
 }
 
 /// 在数据库中生成网格模型并更新包围盒
@@ -771,11 +956,9 @@ pub async fn run_mesh_worker_from_channel(
                 task.geo_param.clone()
             };
 
-            // handle_csg_mesh 仍使用 &mut String，此处用临时 String 桥接后拆分为语句
-            let mut tmp_sql = String::new();
-            match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
+            let mesh_result = match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
                 Some(csg_mesh) => {
-                    if let Err(e) = handle_csg_mesh(
+                    match handle_csg_mesh(
                         &lod_dir,
                         &manifold_dir,
                         &mesh_id,
@@ -784,17 +967,16 @@ pub async fn run_mesh_worker_from_channel(
                         &aabb_map,
                         &pts_json_map,
                         &inst_aabb_map,
-                        &mut tmp_sql,
                         &mesh_formats,
                         task.is_neg,
                     )
                     .await
                     {
-                        debug_model_warn!("CSG mesh 生成失败 for {}: {}", mesh_id, e);
-                        tmp_sql.push_str(&format!(
-                            "UPDATE inst_geo:⟨{}⟩ SET bad=true, meshed=true;",
-                            mesh_id
-                        ));
+                        Ok(mr) => mr,
+                        Err(e) => {
+                            debug_model_warn!("CSG mesh 生成失败 for {}: {}", mesh_id, e);
+                            MeshResult::failed()
+                        }
                     }
                 }
                 None => {
@@ -803,17 +985,11 @@ pub async fn run_mesh_worker_from_channel(
                         mesh_id,
                         geo_type_name
                     );
-                    tmp_sql.push_str(&format!(
-                        "UPDATE inst_geo:⟨{}⟩ SET bad=true, meshed=true;",
-                        mesh_id
-                    ));
+                    MeshResult::failed()
                 }
-            }
+            };
 
-            // 将临时 SQL 作为一条语句收集
-            if !tmp_sql.is_empty() {
-                update_stmts.push(tmp_sql);
-            }
+            update_stmts.push(mesh_result.to_update_sql(&mesh_id));
             batch_new += 1;
 
             // 检查阈值，满足则立即 flush
@@ -1362,9 +1538,9 @@ pub async fn gen_inst_meshes_by_geo_ids(
             g.param.clone()
         };
 
-        match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
+        let mr = match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
             Some(csg_mesh) => {
-                if let Err(e) = handle_csg_mesh(
+                match handle_csg_mesh(
                     &lod_dir,
                     &manifold_dir,
                     &mesh_id,
@@ -1373,15 +1549,16 @@ pub async fn gen_inst_meshes_by_geo_ids(
                     &aabb_map,
                     &pts_json_map,
                     &inst_aabb_map,
-                    &mut update_sql,
                     mesh_formats,
                     false,
                 )
                 .await
                 {
-                    debug_model_warn!("CSG mesh 生成失败 for {}: {}", mesh_id, e);
-                    // 设置 bad=true 和 meshed=true 避免重复处理
-                    update_sql.push_str(&format!("UPDATE inst_geo:⟨{}⟩ SET bad=true, meshed=true;", mesh_id));
+                    Ok(mr) => mr,
+                    Err(e) => {
+                        debug_model_warn!("CSG mesh 生成失败 for {}: {}", mesh_id, e);
+                        MeshResult::failed()
+                    }
                 }
             }
             None => {
@@ -1390,10 +1567,10 @@ pub async fn gen_inst_meshes_by_geo_ids(
                     mesh_id,
                     geo_type_name
                 );
-                // 设置 bad=true 和 meshed=true 避免重复处理
-                update_sql.push_str(&format!("UPDATE inst_geo:⟨{}⟩ SET bad=true, meshed=true;", mesh_id));
+                MeshResult::failed()
             }
-        }
+        };
+        update_sql.push_str(&mr.to_update_sql(&mesh_id));
     }
     
     // 执行批量更新
@@ -1575,7 +1752,7 @@ pub async fn gen_inst_meshes(
                             refno_for_mesh,
                         ) {
                             Some(csg_mesh) => {
-                                if let Err(e) = handle_csg_mesh(
+                                let mr = match handle_csg_mesh(
                                     &dir,
                                     &manifold_dir,
                                     &mesh_id,
@@ -1584,23 +1761,22 @@ pub async fn gen_inst_meshes(
                                     &aabb_map,
                                     &pts_json_map,
                                     &inst_aabb_map,
-                                    &mut update_sql,
                                     &mesh_formats,
                                     false,
                                 )
                                 .await
                                 {
-                                    debug_model_warn!(
-                                        "CSG mesh generation failed for {}: {}",
-                                        mesh_id,
-                                        e
-                                    );
-                                    // 标记 bad，避免后续重复尝试
-                                    update_sql.push_str(&format!(
-                                        "update inst_geo:⟨{}⟩ set bad=true;",
-                                        mesh_id
-                                    ));
-                                }
+                                    Ok(mr) => mr,
+                                    Err(e) => {
+                                        debug_model_warn!(
+                                            "CSG mesh generation failed for {}: {}",
+                                            mesh_id,
+                                            e
+                                        );
+                                        MeshResult::failed()
+                                    }
+                                };
+                                update_sql.push_str(&mr.to_update_sql(&mesh_id));
                             }
                             None => {
                                 // CSG 生成失败
@@ -1686,10 +1862,9 @@ async fn handle_csg_mesh(
     aabb_map: &Arc<DashMap<String, Aabb>>,
     pts_json_map: &Arc<DashMap<u64, String>>,
     inst_aabb_map: &Arc<DashMap<String, Aabb>>,
-    update_sql: &mut String,
     mesh_formats: &[MeshFormat],
     is_neg: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<MeshResult> {
     if generated.mesh.aabb.is_none() {
         generated.mesh.aabb = generated.aabb;
     }
@@ -1698,7 +1873,7 @@ async fn handle_csg_mesh(
         .aabb
         .ok_or_else(|| anyhow!("CSG mesh 缺少有效的 AABB"))?;
 
-    let pt_refs = derive_csg_points(&generated.mesh, pts_json_map);
+    let pts_hashes = derive_csg_point_hashes(&generated.mesh, pts_json_map);
 
     let mesh_base_path = dir.join(mesh_id);
 
@@ -1736,13 +1911,12 @@ async fn handle_csg_mesh(
 
     if is_neg {
         // 负实体：保存 .manifold + AABB，不生成 GLB/OBJ
-        update_sql.push_str(&format!(
-            "update inst_geo:⟨{}⟩ set meshed = true, aabb = aabb:⟨{}⟩, pts=[{}];",
-            inst_key,
-            aabb_hash,
-            pt_refs.join(","),
-        ));
-        return Ok(());
+        return Ok(MeshResult {
+            meshed: true,
+            bad: false,
+            aabb_hash: Some(aabb_hash),
+            pts_hashes,
+        });
     }
 
     // ── 正实体：同时生成 GLB（兼容现有渲染流程） ──
@@ -1785,17 +1959,15 @@ async fn handle_csg_mesh(
         }
     }
 
-    update_sql.push_str(&format!(
-        "update inst_geo:⟨{}⟩ set meshed = true, aabb = aabb:⟨{}⟩, pts=[{}];",
-        inst_key,
-        aabb_hash,
-        pt_refs.join(","),
-    ));
-
-    Ok(())
+    Ok(MeshResult {
+        meshed: true,
+        bad: false,
+        aabb_hash: Some(aabb_hash),
+        pts_hashes,
+    })
 }
 
-fn derive_csg_points(mesh: &PlantMesh, pts_json_map: &Arc<DashMap<u64, String>>) -> Vec<String> {
+fn derive_csg_point_hashes(mesh: &PlantMesh, pts_json_map: &Arc<DashMap<u64, String>>) -> Vec<u64> {
     let mut hashes = HashSet::new();
     for vertex in &mesh.vertices {
         let rs_vec = RsVec3(*vertex);
@@ -1806,10 +1978,7 @@ fn derive_csg_points(mesh: &PlantMesh, pts_json_map: &Arc<DashMap<u64, String>>)
             }
         }
     }
-    hashes
-        .into_iter()
-        .map(|hash| format!("vec3:⟨{}⟩", hash))
-        .collect()
+    hashes.into_iter().collect()
 }
 
 

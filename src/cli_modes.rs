@@ -274,13 +274,99 @@ fn parse_length_unit(unit: &str) -> LengthUnit {
 }
 
 /// 连接 SurrealDB（固定输入数据源）。
-async fn ensure_surreal_connected(_db_option_ext: &DbOptionExt) -> Result<()> {
-    println!("\n📡 连接数据库（SurrealDB）...");
+///
+/// ws 模式下会先检测目标端口是否可达：
+/// - 已启动 → 直接连接
+/// - 未启动 → 使用 `[web_server]` 配置自动拉起 SurrealDB 后台进程，等待就绪后再连接
+async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
+    use aios_core::options::DbConnMode;
+
+    let sdb_cfg = db_option_ext.inner.effective_surrealdb();
+
+    if sdb_cfg.mode == DbConnMode::Ws {
+        let ip = if sdb_cfg.ip == "localhost" { "127.0.0.1" } else { &sdb_cfg.ip };
+        let addr = format!("{}:{}", ip, sdb_cfg.port);
+
+        // 快速探测端口
+        let reachable = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+
+        if reachable {
+            println!("\n📡 SurrealDB 已在 {} 运行，直接连接...", addr);
+        } else {
+            println!("\n⚠️  SurrealDB 未在 {} 运行，尝试自动启动...", addr);
+            auto_start_surreal(&db_option_ext.inner).await?;
+        }
+    } else {
+        println!("\n📡 连接数据库（SurrealDB 嵌入式模式）...");
+    }
+
     init_surreal()
         .await
         .context("初始化 SurrealDB 失败（需要读取 PDMS 输入数据）")?;
     println!("✅ 数据库连接成功");
     Ok(())
+}
+
+/// 使用 `[web_server]` 配置自动启动 SurrealDB 后台进程。
+///
+/// 数据路径优先级：`[web_server].surreal_data_path` > `[surrealdb].path` > 默认
+async fn auto_start_surreal(db_option: &aios_core::options::DbOption) -> Result<()> {
+    let ws_cfg = &db_option.web_server;
+    let sdb_cfg = db_option.effective_surrealdb();
+
+    let data_path = ws_cfg.effective_data_path(sdb_cfg.path.as_deref());
+    let db_uri = format!("rocksdb://{}", data_path);
+    let bind = &ws_cfg.surreal_bind;
+
+    println!("🚀 启动 SurrealDB: {} start --bind {} {}", ws_cfg.surreal_bin, bind, db_uri);
+
+    let child = std::process::Command::new(&ws_cfg.surreal_bin)
+        .arg("start")
+        .arg("--user")
+        .arg(&ws_cfg.surreal_user)
+        .arg("--pass")
+        .arg(&ws_cfg.surreal_password)
+        .arg("--bind")
+        .arg(bind)
+        .arg("--log")
+        .arg("warn")
+        .arg(&db_uri)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("无法启动 SurrealDB（请确认 '{}' 在 PATH 中）", ws_cfg.surreal_bin))?;
+
+    println!("   PID: {}", child.id());
+
+    // 等待端口就绪（最多 30 秒）
+    let ip = if sdb_cfg.ip == "localhost" { "127.0.0.1" } else { &sdb_cfg.ip };
+    let addr = format!("{}:{}", ip, sdb_cfg.port);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+    loop {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "SurrealDB 启动超时（30s），端口 {} 仍未就绪。请手动检查。",
+                addr
+            );
+        }
+        if let Ok(Ok(_)) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        {
+            println!("✅ SurrealDB 已就绪 ({})", addr);
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 fn report_obj_export_outcome(label: &str, output_file: &str, stats: &ExportStats) -> Result<()> {
@@ -299,6 +385,23 @@ fn report_obj_export_outcome(label: &str, output_file: &str, stats: &ExportStats
 
     println!("✅ {}导出成功: {}", label, output_file);
     Ok(())
+}
+
+/// --debug-model 模式：直接生成模型，不清理、不强制 FORCE_REPLACE_MESH。
+/// 增量补充缺失的 inst_geo/mesh/布尔结果。
+pub async fn run_generate_model(
+    config: &ExportConfig,
+    db_option_ext: &DbOptionExt,
+) -> Result<aios_database::fast_model::gen_model::GenModelResult> {
+    println!("\n🔧 --debug-model：开始增量生成几何体数据...");
+
+    ensure_surreal_connected(db_option_ext).await?;
+
+    use aios_database::fast_model::gen_all_geos_data;
+    let target_refnos = collect_regen_target_refnos(config).await?;
+    let gen_result = gen_all_geos_data(target_refnos, db_option_ext, None, None).await?;
+    println!("✅ 模型增量生成完成");
+    Ok(gen_result)
 }
 
 /// 集中执行 --regen-model 的模型重建逻辑。

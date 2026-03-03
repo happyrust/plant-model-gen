@@ -22,6 +22,7 @@ use crate::fast_model::debug_model_debug;
 // model_store 已移除，使用 model_primary_db() 直接查询
 use crate::fast_model::utils;
 use crate::options::{RegenDeleteMode, get_db_option_ext};
+use super::mesh_generate::MeshResult;
 use super::refno_assoc_index::{
     RefnoAssocIndexBatch, build_delete_sql_by_refnos as build_assoc_delete_sql_by_refnos,
     delete_by_refnos as delete_by_refno_assoc_index,
@@ -235,11 +236,97 @@ fn build_delete_inst_geo_by_hashes_sql(geo_hashes: &[u64], chunk_size: usize) ->
     sqls
 }
 
+/// 模型重新生成前的预处理清理
+///
+/// 在 `--regen-model` 等 replace_exist=true 场景下，于生成流程启动前一次性删除
+/// 目标 refnos（及其后代）的所有关联模型记录，包括：
+/// - inst_geo（几何参数，跳过内置 hash < 10）
+/// - geo_relate（几何关系）
+/// - inst_relate（实例关系）
+/// - inst_relate_bool（布尔运算结果）
+/// - neg_relate / ngmr_relate（负实体 / 交叉负实体关系）
+///
+/// 将清理逻辑集中到前处理阶段，避免与并行的 mesh worker 产生竞态条件
+/// （此前 DELETE + INSERT IGNORE 在 save_instance_data_optimize 中执行，
+///   会覆盖 mesh worker 已写入的 meshed=true）。
+pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<()> {
+    if seed_refnos.is_empty() {
+        return Ok(());
+    }
+
+    const CHUNK_SIZE: usize = 100;
+
+    // 展开 seed_refnos 到所有后代（包含自身），不过滤 noun 类型
+    let all_refnos =
+        aios_core::collect_descendant_filter_ids_with_self(seed_refnos, &[], None, true).await?;
+
+    println!(
+        "[pre_cleanup_for_regen] seed_refnos={}, 展开后 all_refnos={}",
+        seed_refnos.len(),
+        all_refnos.len()
+    );
+
+    if all_refnos.is_empty() {
+        return Ok(());
+    }
+
+    let t = std::time::Instant::now();
+
+    // 1. 查询所有关联的 inst_geo hash（通过 inst_relate → geo_relate → inst_geo）
+    for chunk in all_refnos.chunks(CHUNK_SIZE) {
+        let pe_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
+
+        // 查出当前 chunk 关联的 inst_info id，再通过 inst_info 查 geo_relate
+        // 注意：SurrealDB 3.x 中 [id]->relation 图遍历可能返回空，必须用 WHERE in IN 模式
+        let sql = format!(
+            "LET $inst_ids = SELECT VALUE out FROM inst_relate WHERE in IN [{pe_keys}];\
+             SELECT VALUE record::id(out) FROM geo_relate WHERE in IN $inst_ids;"
+        );
+        let geo_hashes: Vec<String> = model_primary_db()
+            .query_take(&sql, 1)
+            .await
+            .unwrap_or_default();
+
+        // 转成 u64 用于 delete_inst_geo_by_hashes
+        let hashes: Vec<u64> = geo_hashes
+            .iter()
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect();
+        if !hashes.is_empty() {
+            delete_inst_geo_by_hashes(&hashes, CHUNK_SIZE).await?;
+        }
+
+        // 2. 删除 geo_relate（通过 inst_info id 关联）
+        let sql = format!(
+            "LET $inst_ids = SELECT VALUE out FROM inst_relate WHERE in IN [{pe_keys}];\
+             DELETE FROM geo_relate WHERE in IN $inst_ids;"
+        );
+        let _ = model_query_response(&sql).await;
+
+        // 3. 删除 inst_relate
+        delete_inst_relate_by_in(chunk, CHUNK_SIZE).await?;
+    }
+
+    // 4. 删除 inst_relate_bool
+    delete_inst_relate_bool_records(&all_refnos, CHUNK_SIZE).await?;
+
+    // 5. 删除 neg_relate / ngmr_relate
+    delete_boolean_relations_by_carriers(&all_refnos, CHUNK_SIZE).await?;
+
+    println!(
+        "[pre_cleanup_for_regen] 清理完成，耗时 {} ms",
+        t.elapsed().as_millis()
+    );
+
+    Ok(())
+}
+
 /// 保存 instance 数据到数据库（事务化批处理版本）
 #[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "save_instance_data_optimize"))]
 pub async fn save_instance_data_optimize(
     inst_mgr: &ShapeInstancesData,
     replace_exist: bool,
+    mesh_results: &HashMap<u64, MeshResult>,
 ) -> anyhow::Result<()> {
     debug_model_debug!(
         "save_instance_data_optimize start: inst_info={}, inst_geo_keys={}, tubi_keys={}, replace_exist={}",
@@ -283,79 +370,6 @@ pub async fn save_instance_data_optimize(
     //   用于 ngmr_relate: 通过 (负载体, ngmr_geom_refno) 找到对应的 CataCrossNeg geo_relate
     let mut neg_geo_by_carrier: HashMap<RefnoEnum, Vec<u64>> = HashMap::new();
     let mut cata_cross_neg_geo_map: HashMap<(RefnoEnum, RefnoEnum), Vec<u64>> = HashMap::new();
-    if replace_exist {
-        // ⚠️ 已知风险(RUS-178)：replace_exist 的"先删后写"不是原子操作。
-        // 如果在 DELETE 之后、INSERT 之前发生崩溃/断电，会导致数据丢失。
-        // 当前缓解措施：model cache 仍保留完整数据，可通过 --flush-cache-to-db 重新回写。
-        // 长期方案：考虑引入 WAL 或两阶段提交机制。
-        //
-        // replace 模式下需要确保 inst_info_map 对应的 inst_relate 都被级联删除，
-        // 否则会出现同一 inst_relate ID 已存在但 out 指向不同 inst_info 的冲突（SurrealDB 的 in/out 不可变）。
-        // 注意：inst_tubi_map 不再创建 inst_relate（tubing 使用 tubi_relate），所以不需要删除
-        let refnos: Vec<RefnoEnum> = inst_mgr.inst_info_map.keys().copied().collect();
-        // 删除本轮将要重建的 inst_geo（否则 INSERT IGNORE 不会覆盖 unit_flag/param 等字段）。
-        let geo_hashes: Vec<u64> = inst_mgr
-            .inst_geos_map
-            .values()
-            .flat_map(|d| d.insts.iter().map(|g| g.geo_hash))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        debug_model_debug!(
-            "save_instance_data_optimize deleting existing inst_geo records: {}",
-            geo_hashes.len()
-        );
-        delete_inst_geo_by_hashes(&geo_hashes, CHUNK_SIZE).await?;
-
-        let mut deleted_by_assoc_index = false;
-        if use_refno_assoc_index {
-            let summary = delete_by_refno_assoc_index(&refnos, CHUNK_SIZE).await?;
-            if summary.used_index {
-                deleted_by_assoc_index = true;
-                debug_model_debug!(
-                    "save_instance_data_optimize 使用 refno_assoc_index 删除旧关系: statements={}, refnos={}/{}",
-                    summary.deleted_statement_count,
-                    summary.indexed_refnos,
-                    summary.requested_refnos
-                );
-            } else {
-                debug_model_debug!(
-                    "save_instance_data_optimize refno_assoc_index 不完整，回退 legacy 删除: indexed_refnos={}/{}",
-                    summary.indexed_refnos,
-                    summary.requested_refnos
-                );
-            }
-        }
-
-        if !deleted_by_assoc_index {
-            debug_model_debug!(
-                "save_instance_data_optimize deleting existing inst_relate for {} refnos",
-                refnos.len()
-            );
-            delete_inst_relate_by_in(&refnos, CHUNK_SIZE).await?;
-            // 清理历史布尔结果表（否则导出/截图会优先命中旧 inst_relate_bool，误读 booled mesh）。
-            delete_inst_relate_bool_records(&refnos, CHUNK_SIZE).await?;
-
-            // 同步清理 geo_relate（以及依赖它的 neg/ngmr 关系），避免旧几何残留/重复 Pos。
-            // 注意：这里只删除“关系记录”，不删除 inst_info/inst_geo 本体，符合 replace 模式的复用目标。
-            let inst_info_ids: Vec<String> = inst_mgr
-                .inst_geos_map
-                .values()
-                .map(|x| x.id())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            debug_model_debug!(
-                "save_instance_data_optimize deleting existing geo_relate for {} inst_info ids",
-                inst_info_ids.len()
-            );
-            delete_geo_relate_by_inst_info_ids(&inst_info_ids, CHUNK_SIZE).await?;
-            // 按载体(pe)删除本 batch 的旧 neg_relate/ngmr_relate。
-            // 不能用 out（正实体）删除，因为多个 batch 共享同一 target（如 WALL），
-            // 会导致跨 batch 覆盖（无论并发还是顺序执行）。
-            delete_boolean_relations_by_carriers(&refnos, CHUNK_SIZE).await?;
-        }
-    }
 
     // inst_geo & geo_relate
     let mut geo_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
@@ -468,7 +482,15 @@ pub async fn save_instance_data_optimize(
                 _ => {}
             }
 
-            inst_geo_buffer.push(inst.gen_unit_geo_sur_json());
+            let mut geo_json = inst.gen_unit_geo_sur_json();
+            if let Some(mr) = mesh_results.get(&inst.geo_hash) {
+                if let Some(pos) = geo_json.rfind('}') {
+                    geo_json.truncate(pos);
+                    geo_json.push_str(&mr.to_insert_fields());
+                    geo_json.push_str(" }");
+                }
+            }
+            inst_geo_buffer.push(geo_json);
 
             if inst_geo_buffer.len() >= CHUNK_SIZE {
                 let statement = format!(
@@ -1575,6 +1597,7 @@ pub async fn save_instance_data_to_sql_file(
     replace_exist: bool,
     writer: &SqlFileWriter,
     precomputed: &InstRelatePrecomputed,
+    mesh_results: &HashMap<u64, MeshResult>,
 ) -> anyhow::Result<()> {
     const CHUNK_SIZE: usize = 200;
     let regen_delete_mode = get_db_option_ext().regen_delete_mode;
@@ -1727,7 +1750,15 @@ pub async fn save_instance_data_to_sql_file(
                 _ => {}
             }
 
-            inst_geo_buffer.push(inst.gen_unit_geo_sur_json());
+            let mut geo_json = inst.gen_unit_geo_sur_json();
+            if let Some(mr) = mesh_results.get(&inst.geo_hash) {
+                if let Some(pos) = geo_json.rfind('}') {
+                    geo_json.truncate(pos);
+                    geo_json.push_str(&mr.to_insert_fields());
+                    geo_json.push_str(" }");
+                }
+            }
+            inst_geo_buffer.push(geo_json);
 
             if inst_geo_buffer.len() >= CHUNK_SIZE {
                 writer.write_statement(&format!(

@@ -1,4 +1,4 @@
-#![feature(let_chains)]
+﻿#![feature(let_chains)]
 #![feature(duration_constructors)]
 // 暂时屏蔽warnings
 #![allow(warnings)]
@@ -1291,6 +1291,12 @@ async fn main() -> anyhow::Result<()> {
             println!("🔄 --regen-model 自动开启 apply_boolean_operation（生成 CatePos 布尔结果）");
             db_option_ext.inner.apply_boolean_operation = true;
         }
+        // regen-model: auto-enable defer_db_write to eliminate race condition
+        // between mesh worker UPDATE and inst_geo INSERT IGNORE
+        if !db_option_ext.defer_db_write {
+            println!("[regen-model] auto-enable defer_db_write");
+            db_option_ext.defer_db_write = true;
+        }
     }
 
     // --defer-db-write：模型生成阶段不写 SurrealDB，SQL 输出到 .surql 文件
@@ -1308,7 +1314,7 @@ async fn main() -> anyhow::Result<()> {
         db_option_ext.inner.replace_mesh = Some(true);
     }
 
-    // 模型导出请求：默认只导出不触发生成；仅当显式 --regen-model 才前置生成。
+    // 模型导出请求：默认只导出不触发生成；--regen-model 或 --debug-model 前置生成。
     let model_export_requested = matches.get_flag("export-obj")
         || matches.get_flag("export-svg")
         || matches.get_flag("export-glb")
@@ -1327,11 +1333,14 @@ async fn main() -> anyhow::Result<()> {
         || matches.get_flag("export-pdms-tree-parquet")
         || matches.get_flag("export-world-sites-parquet");
 
-    // ========== 仅在显式 --regen-model 时执行生成 ==========
-    if regen_model_requested {
-        // 确定 regen 的目标 refnos：优先 debug-model 指定的 refnos，其次 CLI 独立 refno 参数，
+    // ========== 执行模型生成 ==========
+    // --regen-model: 清理后重新生成（强制 replace_mesh + FORCE_REGEN_MESH）
+    // --debug-model: 直接增量生成（不清理，补充缺失的 inst_geo/mesh/布尔结果）
+    let should_generate = regen_model_requested || debug_model_requested;
+    if should_generate {
+        // 确定生成的目标 refnos：优先 debug-model 指定的 refnos，其次 CLI 独立 refno 参数，
         // 再次 dbnum（查询所有 SITE），最后全库模式。
-        let regen_refnos_vec: Vec<String> = if let Some(ref refnos) = debug_model_refnos {
+        let gen_refnos_vec: Vec<String> = if let Some(ref refnos) = debug_model_refnos {
             refnos.clone()
         } else if let Some(refnos) = matches.get_many::<String>("export-obj-refnos") {
             refnos.map(|s| s.to_string()).collect()
@@ -1342,8 +1351,8 @@ async fn main() -> anyhow::Result<()> {
         } else {
             vec![]
         };
-        let regen_config = build_export_config(
-            regen_refnos_vec,
+        let gen_config = build_export_config(
+            gen_refnos_vec,
             None,
             None,
             include_descendants,
@@ -1356,21 +1365,28 @@ async fn main() -> anyhow::Result<()> {
             include_negative,
             false,
         );
-        let regen_result = cli_modes::run_regen_model(&regen_config, &db_option_ext).await?;
 
-        // 仅在“重建 + 导出”时，defer 模式自动导入 SQL 后再导出，避免导出读到旧数据。
-        if any_export_requested {
-            if let Some(sql_path) = regen_result.deferred_sql_path.as_deref() {
-                println!(
-                    "🗂️ 检测到 defer_db_write 产物，开始自动导入并后处理: {}",
-                    sql_path.display()
-                );
-                run_import_and_post_process(sql_path, &db_option_ext).await?;
-                db_option_ext.defer_db_write = false;
+        if regen_model_requested {
+            // --regen-model: 清理 + 强制重新生成
+            let regen_result = cli_modes::run_regen_model(&gen_config, &db_option_ext).await?;
+
+            // 仅在"重建 + 导出"时，defer 模式自动导入 SQL 后再导出，避免导出读到旧数据。
+            if any_export_requested {
+                if let Some(sql_path) = regen_result.deferred_sql_path.as_deref() {
+                    println!(
+                        "🗂️ 检测到 defer_db_write 产物，开始自动导入并后处理: {}",
+                        sql_path.display()
+                    );
+                    run_import_and_post_process(sql_path, &db_option_ext).await?;
+                    db_option_ext.defer_db_write = false;
+                }
+            } else {
+                println!("✅ --regen-model 单独执行完成（未请求导出，流程到此结束）");
+                return Ok(());
             }
         } else {
-            println!("✅ --regen-model 单独执行完成（未请求导出，流程到此结束）");
-            return Ok(());
+            // --debug-model: 增量生成（不清理、不强制 FORCE_REPLACE_MESH）
+            let _gen_result = cli_modes::run_generate_model(&gen_config, &db_option_ext).await?;
         }
     }
 

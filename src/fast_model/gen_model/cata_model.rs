@@ -1623,233 +1623,11 @@ async fn gen_cata_geos_inner(
         // Worker 流水线模式：按 refno 数量动态分组，每个 worker 独立完成预取+生成。
         // ════════════════════════════════════════════════════════════════════════════
 
-        // ── P1 优化（全局）：并发预执行 gen_cata_single_geoms ──
+        // [P1 已合并到 worker] gen_cata_single_geoms 在每个 worker 内部按需执行。
 
         let force_regen_cata_flag = process_cata && replace_exist;
 
         let pre_gen_results: Arc<DashMap<RefnoEnum, (Arc<CateCsgShapeMap>, Arc<DashMap<RefnoEnum, crate::data_interface::structs::PlantAxisMap>>)>> = Arc::new(DashMap::new());
-
-        let pre_gen_skip_cache = Arc::new(std::sync::atomic::AtomicU32::new(0));
-
-        let pre_gen_fail_cnt = Arc::new(std::sync::atomic::AtomicU32::new(0));
-
-        let pre_gen_timing_samples: Arc<Mutex<Vec<(u128, RefnoEnum, String, bool)>>> =
-
-            Arc::new(Mutex::new(Vec::new()));
-
-        {
-
-            let t_pre_gen = Instant::now();
-
-            let pre_gen_concurrency = cata_p1_pre_gen_concurrency();
-
-            let sem = Arc::new(Semaphore::new(pre_gen_concurrency));
-
-            let mut pre_gen_handles = Vec::new();
-
-            for j in 0..unique_cata_cnt {
-
-                let cata_hash = &all_unique_keys[j];
-
-                if cata_hash == "0" {
-
-                    continue;
-
-                }
-
-                let target_cata = match target_cata_map.get(cata_hash) {
-
-                    Some(tc) => tc,
-
-                    None => continue,
-
-                };
-
-                let cata_hash_owned = cata_hash.clone();
-
-                let target_exist_inst = target_cata.exist_inst;
-
-                let target_group_refnos = target_cata.group_refnos.clone();
-
-                drop(target_cata);
-
-                let needs_generate = process_cata && (force_regen_cata_flag || !target_exist_inst);
-
-                if !needs_generate {
-
-                    continue;
-
-                }
-
-                if let Some(cache_mgr) = cata_resolve_cache.as_ref() {
-
-                    if cache_mgr.get(cata_hash).is_some() {
-
-                        pre_gen_skip_cache.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                        continue;
-
-                    }
-
-                }
-
-                let ele_refno = match target_group_refnos.first().copied() {
-
-                    Some(r) => r,
-
-                    None => continue,
-
-                };
-
-                let sem = sem.clone();
-
-                let pre_gen_results = pre_gen_results.clone();
-
-                let pre_gen_fail_cnt = pre_gen_fail_cnt.clone();
-
-                let pre_gen_timing_samples = pre_gen_timing_samples.clone();
-
-                pre_gen_handles.push(tokio::spawn(async move {
-
-                    let _permit = sem.acquire().await.unwrap();
-
-                    let t_item = Instant::now();
-
-                    let csg_shapes_map = Arc::new(CateCsgShapeMap::new());
-
-                    let design_axis_map = Arc::new(DashMap::new());
-
-                    let ok = match gen_cata_single_geoms(ele_refno, &csg_shapes_map, &design_axis_map).await {
-
-                        Ok(_) => {
-
-                            pre_gen_results.insert(ele_refno, (csg_shapes_map, design_axis_map));
-
-                            true
-
-                        }
-
-                        Err(_) => {
-
-                            pre_gen_fail_cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                            false
-
-                        }
-
-                    };
-
-                    pre_gen_timing_samples
-
-                        .lock()
-
-                        .await
-
-                        .push((t_item.elapsed().as_millis(), ele_refno, cata_hash_owned, ok));
-
-                }));
-
-            }
-
-            if !pre_gen_handles.is_empty() {
-
-                let handle_cnt = pre_gen_handles.len();
-
-                for h in pre_gen_handles {
-
-                    let _ = h.await;
-
-                }
-
-                println!(
-
-                    "    [gen_cata_geos] P1 全局并发预执行完成: cata_cnt={}, hit={}, skip_cache={}, fail={}, elapsed={}ms (concurrency={})",
-
-                    handle_cnt,
-
-                    pre_gen_results.len(),
-
-                    pre_gen_skip_cache.load(std::sync::atomic::Ordering::Relaxed),
-
-                    pre_gen_fail_cnt.load(std::sync::atomic::Ordering::Relaxed),
-
-                    t_pre_gen.elapsed().as_millis(),
-
-                    pre_gen_concurrency
-
-                );
-
-                let mut samples = {
-
-                    let mut guard = pre_gen_timing_samples.lock().await;
-
-                    std::mem::take(&mut *guard)
-
-                };
-
-                if !samples.is_empty() {
-
-                    samples.sort_by(|a, b| b.0.cmp(&a.0));
-
-                    let topn = cata_p1_slow_topn().min(samples.len());
-
-                    let slow_threshold_ms = cata_p1_slow_threshold_ms();
-
-                    let slow_cnt = samples
-
-                        .iter()
-
-                        .filter(|(elapsed, _, _, _)| *elapsed >= slow_threshold_ms)
-
-                        .count();
-
-                    if topn > 0 {
-
-                        println!(
-
-                            "    [gen_cata_geos] P1 最慢项 Top{} (threshold={}ms, slow_count={}/{}):",
-
-                            topn,
-
-                            slow_threshold_ms,
-
-                            slow_cnt,
-
-                            samples.len()
-
-                        );
-
-                        for (rank, (elapsed, ele_refno, cata_hash, ok)) in
-
-                            samples.iter().take(topn).enumerate()
-
-                        {
-
-                            println!(
-
-                                "      [P1 slow #{:02}] {} ms | status={} | refno={} | cata_hash={}",
-
-                                rank + 1,
-
-                                elapsed,
-
-                                if *ok { "ok" } else { "fail" },
-
-                                ele_refno,
-
-                                cata_hash
-
-                            );
-
-                        }
-
-                    }
-
-                }
-
-            }
-
-        }
 
         // ── P2 优化（全局）：pos_neg_cache 共享 ──
 
@@ -1927,6 +1705,40 @@ async fn gen_cata_geos_inner(
                         futures::future::join_all(attmap_futs),
                         transform_fut,
                     );
+                }
+            }
+
+            // ── worker 内 gen_cata_single_geoms（原 P1，按需执行） ──
+            {
+                let force_regen_cata = force_regen_cata_flag;
+                for j in start_idx..end_idx {
+                    let cata_hash = &all_unique_keys[j];
+                    if cata_hash == "0" { continue; }
+                    let target_cata = match target_cata_map.get(cata_hash) {
+                        Some(tc) => tc,
+                        None => continue,
+                    };
+                    let target_exist_inst = target_cata.exist_inst;
+                    let target_group_refnos = target_cata.group_refnos.clone();
+                    drop(target_cata);
+
+                    let needs_generate = process_cata && (force_regen_cata || !target_exist_inst);
+                    if !needs_generate { continue; }
+
+                    if let Some(cache_mgr) = cata_resolve_cache.as_ref() {
+                        if cache_mgr.get(cata_hash).is_some() { continue; }
+                    }
+
+                    let ele_refno = match target_group_refnos.first().copied() {
+                        Some(r) => r,
+                        None => continue,
+                    };
+
+                    let csg_shapes_map = Arc::new(CateCsgShapeMap::new());
+                    let design_axis_map = Arc::new(DashMap::new());
+                    if let Ok(_) = gen_cata_single_geoms(ele_refno, &csg_shapes_map, &design_axis_map).await {
+                        pre_gen_results.insert(ele_refno, (csg_shapes_map, design_axis_map));
+                    }
                 }
             }
 

@@ -1,0 +1,18 @@
+#V2
+SELECT id, noun FROM pe:⟨24381/145018⟩;
+INFO FOR KV;
+INFO FOR NS;
+SELECT id, noun, name FROM pe:⟨24381_145018⟩;
+INFO FOR DB;
+INFO FOR NS;
+SELECT id, noun, name FROM pe:⟨24381_145018⟩;
+INFO FOR NS;
+INFO FOR DB;
+SELECT id, noun, name FROM pe:⟨24381_145018⟩;
+SELECT id, noun, name FROM pe:⟨24381_145018⟩.children WHERE noun IN ['BEND', 'ELBO', 'FITT', 'VALV', 'REDU', 'TEE', 'FLAN', 'GASK'];
+LET $children = SELECT VALUE id FROM pe:⟨24381_145018⟩.children WHERE noun IN ['ELBO', 'VALV'];
+SELECT id, in, out FROM inst_relate WHERE in IN $children;
+SELECT id, in, out, (SELECT geo_type, visible, record::id(out) as geo_hash, out.meshed as meshed FROM geo_relate WHERE in = $parent.out) as geos FROM inst_relate WHERE in IN [pe:⟨24381_145019⟩, pe:⟨24381_145021⟩, pe:⟨24381_145035⟩];
+-- 1. 检查 ELBO 的 pe_transform 是否存在
+SELECT id, world_trans FROM [pe_transform:⟨24381_145019⟩, pe_transform:⟨24381_145021⟩, pe_transform:⟨24381_145023⟩];
+-- 2. 模拟导出查询: 对 ELBO 执行 inst_relate 查询

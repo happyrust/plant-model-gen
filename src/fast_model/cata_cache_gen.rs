@@ -27,7 +27,9 @@ use glam::Vec3;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{Mutex, Semaphore};
+#[cfg(feature = "profile")]
+use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 
 use crate::fast_model::cata_model::BranchTubiOutcome;
 
@@ -148,6 +150,7 @@ pub async fn gen_cata_geos_for_cache(
     sender: flume::Sender<ShapeInstancesData>,
 ) -> anyhow::Result<SimpleCataOutcome> {
     let total_t = Instant::now();
+    #[cfg(feature = "profile")]
     let total_time_stats: Arc<DashMap<String, u64>> = Arc::new(DashMap::new());
 
     let all_unique_keys: Vec<String> = target_cata_map
@@ -198,14 +201,14 @@ pub async fn gen_cata_geos_for_cache(
 
         let sender = sender.clone();
         let sem = sem.clone();
+        #[cfg(feature = "profile")]
         let time_stats = total_time_stats.clone();
-        let force_regen_cata = replace_exist;
 
         join_set.spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
 
             // ── 复用路径：inst_info 已存在 ──
-            if target_exist_inst && !force_regen_cata {
+            if target_exist_inst {
                 let reuse_ptset_map = target_ptset.clone().unwrap_or_default();
                 let mut shape_insts_data = ShapeInstancesData::default();
 
@@ -249,13 +252,16 @@ pub async fn gen_cata_geos_for_cache(
                 None => return Ok(()),
             };
 
+            #[cfg(feature = "profile")]
             let t_get_cat_refno = Instant::now();
             let cata_refno = match aios_core::get_cat_refno(ele_refno).await {
                 Ok(Some(refno)) => refno,
                 _ => return Ok(()),
             };
+            #[cfg(feature = "profile")]
             let dt_cat_refno = t_get_cat_refno.elapsed().as_millis() as u64;
 
+            #[cfg(feature = "profile")]
             let t_query_single = Instant::now();
             let gmse_refno = aios_core::query_single_by_paths(
                 cata_refno,
@@ -264,6 +270,7 @@ pub async fn gen_cata_geos_for_cache(
             )
             .await
             .map(|x| x.get_refno_or_default());
+            #[cfg(feature = "profile")]
             let dt_query_single = t_query_single.elapsed().as_millis() as u64;
 
             let valid_gmse = gmse_refno.as_ref().map(|r| r.is_valid()).unwrap_or(false);
@@ -281,15 +288,19 @@ pub async fn gen_cata_geos_for_cache(
             let csg_shapes_map = CateCsgShapeMap::new();
             let design_axis_map = DashMap::new();
 
+            #[cfg(feature = "profile")]
             let t_get_named_attmap = Instant::now();
             let _desi_att = match aios_core::get_named_attmap(ele_refno).await {
                 Ok(att) => att,
                 Err(_) => return Ok(()),
             };
+            #[cfg(feature = "profile")]
             let dt_attmap = t_get_named_attmap.elapsed().as_millis() as u64;
 
+            #[cfg(feature = "profile")]
             let t_gen_single_geoms = Instant::now();
             let r = gen_cata_single_geoms(ele_refno, &csg_shapes_map, &design_axis_map).await;
+            #[cfg(feature = "profile")]
             let dt_gen = t_gen_single_geoms.elapsed().as_millis() as u64;
 
             if r.is_err() {
@@ -297,10 +308,13 @@ pub async fn gen_cata_geos_for_cache(
             }
 
             // 汇总计时
-            *time_stats.entry("get_cat_refno".to_string()).or_insert(0) += dt_cat_refno;
-            *time_stats.entry("query_single".to_string()).or_insert(0) += dt_query_single;
-            *time_stats.entry("get_named_attmap".to_string()).or_insert(0) += dt_attmap;
-            *time_stats.entry("gen_single_geoms".to_string()).or_insert(0) += dt_gen;
+            #[cfg(feature = "profile")]
+            {
+                *time_stats.entry("get_cat_refno".to_string()).or_insert(0) += dt_cat_refno;
+                *time_stats.entry("query_single".to_string()).or_insert(0) += dt_query_single;
+                *time_stats.entry("get_named_attmap".to_string()).or_insert(0) += dt_attmap;
+                *time_stats.entry("gen_single_geoms".to_string()).or_insert(0) += dt_gen;
+            }
 
             let ptset_map: BTreeMap<i32, CateAxisParam> = design_axis_map
                 .get(&ele_refno)
@@ -405,10 +419,13 @@ pub async fn gen_cata_geos_for_cache(
         }
     }
 
+    #[cfg(feature = "profile")]
     let time_stats: HashMap<String, u64> = total_time_stats
         .iter()
         .map(|e| (e.key().clone(), *e.value()))
         .collect();
+    #[cfg(not(feature = "profile"))]
+    let time_stats: HashMap<String, u64> = HashMap::new();
 
     Ok(SimpleCataOutcome {
         time_stats,
@@ -430,6 +447,7 @@ pub async fn gen_bran_geos_for_cache(
     sender: flume::Sender<ShapeInstancesData>,
 ) -> anyhow::Result<SimpleBranOutcome> {
     let total_t = Instant::now();
+    #[cfg(feature = "profile")]
     let total_time_stats = Arc::new(Mutex::new(HashMap::new()));
 
     let bran_count = branch_map.len();
@@ -449,8 +467,11 @@ pub async fn gen_bran_geos_for_cache(
     let mut shape_insts_data = ShapeInstancesData::default();
     shape_insts_data.fill_basic_shapes();
 
+    #[cfg(feature = "profile")]
     let mut db_time_get_branch_att: u128 = 0;
+    #[cfg(feature = "profile")]
     let mut db_time_get_branch_transform: u128 = 0;
+    #[cfg(feature = "profile")]
     let mut db_time_get_children_att: u128 = 0;
 
     for bran_data in branch_map.iter() {
@@ -464,6 +485,7 @@ pub async fn gen_bran_geos_for_cache(
         );
 
         // 获取 BRAN/HANG 属性
+        #[cfg(feature = "profile")]
         let t_get_branch_att = Instant::now();
         let branch_att = match aios_core::get_named_attmap(branch_refno).await {
             Ok(att) => att,
@@ -482,9 +504,11 @@ pub async fn gen_bran_geos_for_cache(
                 continue;
             }
         };
-        db_time_get_branch_att += t_get_branch_att.elapsed().as_millis();
+        #[cfg(feature = "profile")]
+        { db_time_get_branch_att += t_get_branch_att.elapsed().as_millis(); }
 
         // 获取 world_transform
+        #[cfg(feature = "profile")]
         let t_get_branch_transform = Instant::now();
         let _branch_transform =
             match crate::fast_model::transform_cache::get_world_transform_cache_first(
@@ -523,7 +547,8 @@ pub async fn gen_bran_geos_for_cache(
                     continue;
                 }
             };
-        db_time_get_branch_transform += t_get_branch_transform.elapsed().as_millis();
+        #[cfg(feature = "profile")]
+        { db_time_get_branch_transform += t_get_branch_transform.elapsed().as_millis(); }
 
         // 处理 BRAN/HANG 本身的几何信息
         let (owner_refno, owner_type) = shared::get_owner_info_from_attr(&branch_att).await;
@@ -545,12 +570,14 @@ pub async fn gen_bran_geos_for_cache(
         for child in children.iter() {
             let child_refno = child.refno;
 
+            #[cfg(feature = "profile")]
             let t_get_child_att = Instant::now();
             let child_att = match aios_core::get_named_attmap(child_refno).await {
                 Ok(att) => att,
                 Err(_) => continue,
             };
-            db_time_get_children_att += t_get_child_att.elapsed().as_millis();
+            #[cfg(feature = "profile")]
+            { db_time_get_children_att += t_get_child_att.elapsed().as_millis(); }
 
             let (child_owner_refno, child_owner_type) =
                 shared::get_owner_info_from_attr(&child_att).await;
@@ -578,6 +605,7 @@ pub async fn gen_bran_geos_for_cache(
     }
 
     // 更新时间统计
+    #[cfg(feature = "profile")]
     {
         let mut stats = total_time_stats.lock().await;
         *stats.entry("get_branch_att".to_string()).or_insert(0) +=
@@ -594,7 +622,10 @@ pub async fn gen_bran_geos_for_cache(
             .expect("send bran shape_insts_data error");
     }
 
+    #[cfg(feature = "profile")]
     let time_stats = total_time_stats.lock().await.clone();
+    #[cfg(not(feature = "profile"))]
+    let time_stats: HashMap<String, u64> = HashMap::new();
     Ok(SimpleBranOutcome {
         time_stats,
         bran_count,

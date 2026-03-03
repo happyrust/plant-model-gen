@@ -710,7 +710,8 @@ async fn process_index_tree_generation(
 
     // 🧹 预处理清理：在生成前一次性删除目标 refnos 的旧模型记录，
     // 避免生成过程中 DELETE + INSERT IGNORE 与 mesh worker 的竞态条件。
-    if replace_exist && !db_option.defer_db_write && db_option.use_surrealdb {
+    // defer_db_write 模式下也需要清理：DELETE 直接写 DB，新 INSERT 走 deferred .surql 文件
+    if replace_exist && db_option.use_surrealdb {
         if let Some(ref roots) = seed_roots {
             if !roots.is_empty() {
                 perf.mark("pre_cleanup_for_regen");

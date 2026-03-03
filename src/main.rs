@@ -1299,6 +1299,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ========== 处理 --regen-model 参数 ==========
     let regen_model_requested = matches.get_flag("regen-model");
+    let mut regen_auto_enabled_defer_db_write = false;
     if regen_model_requested {
         println!("🔄 检测到 --regen-model 参数，强制开启 replace_mesh 模式");
         // 与 replace_mesh 配合：强制 mesh_worker 忽略 mesh_sig 缓存，确保本次能看到最新代码/配置效果。
@@ -1311,11 +1312,11 @@ async fn main() -> anyhow::Result<()> {
             println!("🔄 --regen-model 自动开启 apply_boolean_operation（生成 CatePos 布尔结果）");
             db_option_ext.inner.apply_boolean_operation = true;
         }
-        // regen-model: auto-enable defer_db_write to eliminate race condition
-        // between mesh worker UPDATE and inst_geo INSERT IGNORE
+        // regen-model: 若未显式指定 defer，则自动开启以规避生成阶段竞态
         if !db_option_ext.defer_db_write {
             println!("[regen-model] auto-enable defer_db_write");
             db_option_ext.defer_db_write = true;
+            regen_auto_enabled_defer_db_write = true;
         }
     }
 
@@ -1401,6 +1402,21 @@ async fn main() -> anyhow::Result<()> {
                     db_option_ext.defer_db_write = false;
                 }
             } else {
+                if let Some(sql_path) = regen_result.deferred_sql_path.as_deref() {
+                    if defer_db_write_explicit {
+                        println!(
+                            "🗂️ --defer-db-write 已显式开启，已生成 SQL 但不自动导入: {}",
+                            sql_path.display()
+                        );
+                    } else if regen_auto_enabled_defer_db_write {
+                        println!(
+                            "🗂️ 检测到 --regen-model 自动 defer 产物，开始自动导入并后处理: {}",
+                            sql_path.display()
+                        );
+                        run_import_and_post_process(sql_path, &db_option_ext).await?;
+                        db_option_ext.defer_db_write = false;
+                    }
+                }
                 println!("✅ --regen-model 单独执行完成（未请求导出，流程到此结束）");
                 return Ok(());
             }

@@ -275,8 +275,47 @@ fn parse_length_unit(unit: &str) -> LengthUnit {
 
 /// 关闭占用指定端口的进程（避免 file 模式下 RocksDB 排他锁冲突）。
 ///
-/// Windows: 通过 `netstat` 查找 LISTENING 状态的 PID，再用 `taskkill` 强制终止。
+/// - macOS/Linux: 通过 `lsof` 查找占用端口的 PID，再用 `kill -9` 强制终止。
+/// - Windows: 通过 `netstat` 查找 LISTENING 状态的 PID，再用 `taskkill` 强制终止。
 pub fn kill_process_on_port(port: u16) {
+    let pids = find_pids_on_port(port);
+    if pids.is_empty() {
+        return;
+    }
+    for pid in &pids {
+        println!("🔪 关闭占用端口 {} 的进程 (PID={})...", port, pid);
+        if kill_pid(pid) {
+            println!("   ✅ 进程 {} 已终止", pid);
+        }
+    }
+    // 等待端口释放
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+/// 查找占用指定端口的进程 PID 列表。
+#[cfg(unix)]
+pub(crate) fn find_pids_on_port(port: u16) -> Vec<String> {
+    // lsof -ti :<port>  → 仅输出 PID，每行一个
+    let output = match std::process::Command::new("lsof")
+        .args(["-ti", &format!(":{}", port)])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("⚠️  无法执行 lsof: {}", e);
+            return vec![];
+        }
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 查找占用指定端口的进程 PID 列表。
+#[cfg(windows)]
+pub(crate) fn find_pids_on_port(port: u16) -> Vec<String> {
     let output = match std::process::Command::new("netstat")
         .args(["-ano"])
         .output()
@@ -284,37 +323,61 @@ pub fn kill_process_on_port(port: u16) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("⚠️  无法执行 netstat: {}", e);
-            return;
+            return vec![];
         }
     };
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     let listen_pattern = format!(":{}", port);
-
+    let mut pids = vec![];
     for line in stdout.lines() {
         if !line.contains(&listen_pattern) || !line.contains("LISTENING") {
             continue;
         }
-        // netstat 输出格式: proto  local_addr  foreign_addr  state  PID
-        let pid = line.split_whitespace().last().unwrap_or("");
-        if pid.is_empty() || pid == "0" {
-            continue;
+        if let Some(pid) = line.split_whitespace().last() {
+            if !pid.is_empty() && pid != "0" {
+                pids.push(pid.to_string());
+            }
         }
-        println!("🔪 关闭占用端口 {} 的进程 (PID={})...", port, pid);
-        let kill_result = std::process::Command::new("taskkill")
-            .args(["/F", "/PID", pid])
-            .output();
-        match kill_result {
-            Ok(r) if r.status.success() => {
-                println!("   ✅ 进程 {} 已终止", pid);
-                // 等待端口释放
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-            Ok(r) => {
-                let stderr = String::from_utf8_lossy(&r.stderr);
-                eprintln!("   ⚠️  taskkill 退出码 {}: {}", r.status, stderr.trim());
-            }
-            Err(e) => eprintln!("   ⚠️  无法执行 taskkill: {}", e),
+    }
+    pids
+}
+
+/// 强制终止指定 PID 的进程，返回是否成功。
+#[cfg(unix)]
+fn kill_pid(pid: &str) -> bool {
+    match std::process::Command::new("kill")
+        .args(["-9", pid])
+        .output()
+    {
+        Ok(r) if r.status.success() => true,
+        Ok(r) => {
+            let stderr = String::from_utf8_lossy(&r.stderr);
+            eprintln!("   ⚠️  kill 退出码 {}: {}", r.status, stderr.trim());
+            false
+        }
+        Err(e) => {
+            eprintln!("   ⚠️  无法执行 kill: {}", e);
+            false
+        }
+    }
+}
+
+/// 强制终止指定 PID 的进程，返回是否成功。
+#[cfg(windows)]
+fn kill_pid(pid: &str) -> bool {
+    match std::process::Command::new("taskkill")
+        .args(["/F", "/PID", pid])
+        .output()
+    {
+        Ok(r) if r.status.success() => true,
+        Ok(r) => {
+            let stderr = String::from_utf8_lossy(&r.stderr);
+            eprintln!("   ⚠️  taskkill 退出码 {}: {}", r.status, stderr.trim());
+            false
+        }
+        Err(e) => {
+            eprintln!("   ⚠️  无法执行 taskkill: {}", e);
+            false
         }
     }
 }
@@ -334,6 +397,8 @@ async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
     if sdb_cfg.mode == DbConnMode::Ws {
         let ip = if sdb_cfg.ip == "localhost" { "127.0.0.1" } else { &sdb_cfg.ip };
         let addr = format!("{}:{}", ip, sdb_cfg.port);
+        let is_local_target =
+            sdb_cfg.ip == "localhost" || sdb_cfg.ip == "127.0.0.1" || sdb_cfg.ip == "::1";
 
         // 快速探测端口
         let reachable = tokio::time::timeout(
@@ -346,9 +411,14 @@ async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
 
         if reachable {
             println!("\n📡 SurrealDB 已在 {} 运行，直接连接...", addr);
-        } else {
+        } else if is_local_target {
             println!("\n⚠️  SurrealDB 未在 {} 运行，尝试自动启动...", addr);
             auto_start_surreal(&db_option_ext.inner).await?;
+        } else {
+            anyhow::bail!(
+                "SurrealDB 远端地址不可达: {}。请先启动远端服务或检查网络/配置。",
+                addr
+            );
         }
     } else {
         // 嵌入式 file 模式：先关闭可能占用数据目录的 ws server（RocksDB 排他锁）
@@ -364,40 +434,44 @@ async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
     Ok(())
 }
 
-/// 使用 `[web_server]` 配置自动启动 SurrealDB 后台进程。
+/// 使用 `surreal start` 自动启动本地 SurrealDB 后台进程。
 ///
-/// 数据路径优先级：`[web_server].surreal_data_path` > `[surrealdb].path` > 默认
+/// 数据路径优先级：`[surrealdb].path` > 默认 `db-data/{project}_{port}.rdb`
 async fn auto_start_surreal(db_option: &aios_core::options::DbOption) -> Result<()> {
-    let ws_cfg = &db_option.web_server;
     let sdb_cfg = db_option.effective_surrealdb();
 
-    let data_path = ws_cfg.effective_data_path(sdb_cfg.path.as_deref());
+    let data_path = db_option.surrealdb_data_path();
     let db_uri = format!("rocksdb://{}", data_path);
-    let bind = &ws_cfg.surreal_bind;
+    let bind_ip = if sdb_cfg.ip == "localhost" {
+        "127.0.0.1".to_string()
+    } else {
+        sdb_cfg.ip.clone()
+    };
+    let bind = format!("{}:{}", bind_ip, sdb_cfg.port);
+    let surreal_bin = std::env::var("SURREAL_BIN").unwrap_or_else(|_| "surreal".to_string());
 
-    println!("🚀 启动 SurrealDB: {} start --bind {} {}", ws_cfg.surreal_bin, bind, db_uri);
+    println!("🚀 启动 SurrealDB: {} start --bind {} {}", surreal_bin, bind, db_uri);
 
-    let child = std::process::Command::new(&ws_cfg.surreal_bin)
+    let child = std::process::Command::new(&surreal_bin)
         .arg("start")
         .arg("--user")
-        .arg(&ws_cfg.surreal_user)
+        .arg(&sdb_cfg.user)
         .arg("--pass")
-        .arg(&ws_cfg.surreal_password)
+        .arg(&sdb_cfg.password)
         .arg("--bind")
-        .arg(bind)
+        .arg(&bind)
         .arg("--log")
         .arg("warn")
         .arg(&db_uri)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .with_context(|| format!("无法启动 SurrealDB（请确认 '{}' 在 PATH 中）", ws_cfg.surreal_bin))?;
+        .with_context(|| format!("无法启动 SurrealDB（请确认 '{}' 在 PATH 中）", surreal_bin))?;
 
     println!("   PID: {}", child.id());
 
     // 等待端口就绪（最多 30 秒）
-    let ip = if sdb_cfg.ip == "localhost" { "127.0.0.1" } else { &sdb_cfg.ip };
-    let addr = format!("{}:{}", ip, sdb_cfg.port);
+    let addr = bind;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
     loop {
@@ -2480,5 +2554,3 @@ pub async fn export_room_instances_mode(output_dir: Option<PathBuf>, verbose: bo
 
     Ok(())
 }
-
-

@@ -180,9 +180,11 @@ impl RecentGeoDeduper {
     }
 }
 
-/// 从数据库查询所有已有 inst_geo 的 geo_hash（u64 ID），用于启动时预加载去重
-pub async fn query_existing_inst_geo_ids() -> anyhow::Result<Vec<u64>> {
-    let sql = "SELECT VALUE record::id(id) FROM inst_geo";
+/// 从数据库查询已完成 meshing 的 inst_geo ID（u64），用于启动时预加载去重
+///
+/// 只预加载 `meshed=true` 且 `bad!=true` 的记录，避免误跳过仍需补算的几何。
+pub async fn query_existing_meshed_inst_geo_ids() -> anyhow::Result<Vec<u64>> {
+    let sql = "SELECT VALUE record::id(id) FROM inst_geo WHERE meshed = true AND bad != true";
     let ids: Vec<String> = model_primary_db().query_take(sql, 0).await?;
     let mut result = Vec::with_capacity(ids.len());
     for id_str in ids {
@@ -542,10 +544,10 @@ async fn query_relation_targets_combined() -> anyhow::Result<HashSet<RefnoEnum>>
 }
 
 /// 查询需要执行实例级布尔运算的实例列表
-/// 
+///
 /// 直接从 neg_relate/ngmr_relate 的 out 字段获取目标，不依赖 inst_relate_aabb
 /// 因为某些元素（如 STWALL）没有自己的几何体但需要被切割
-/// 
+///
 /// - replace_exist=true: 返回所有候选，忽略已处理状态（强制重新布尔）
 /// - replace_exist=false: 过滤掉已成功处理的，避免重复计算
 async fn query_pending_inst_boolean(
@@ -618,7 +620,7 @@ async fn query_total_pending_mesh_count(replace_exist: bool) -> anyhow::Result<u
     } else {
         "SELECT VALUE count() FROM inst_geo WHERE meshed != true AND param != NONE AND bad != true GROUP ALL".to_string()
     };
-    
+
     let counts: Vec<i64> = model_primary_db().query_take(&sql, 0).await?;
     Ok(counts.first().copied().unwrap_or(0) as usize)
 }
@@ -661,13 +663,13 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
     let mut total_processed = 0usize;
     let mut stalled_rounds = 0usize;
     let mut last_pending: Option<HashSet<String>> = None;
-    
+
     // 获取 mesh 生成所需的配置
     let mesh_dir = db_option.get_meshes_path();
     if !mesh_dir.exists() {
         std::fs::create_dir_all(&mesh_dir)?;
     }
-    
+
     let precision = db_option.mesh_precision().clone();
     let mesh_formats = crate::options::get_db_option_ext().mesh_formats.clone();
 
@@ -763,14 +765,14 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
     loop {
         let round_start = std::time::Instant::now();
         let pending_geo_ids = query_pending_mesh_geo_ids(batch_size, replace_exist).await?;
-        
+
         let pending: HashSet<_> = pending_geo_ids.iter().map(|id| id.to_raw()).collect();
-        
+
         if pending.is_empty() {
             println!("[mesh_worker] 没有待处理 mesh 任务，退出");
             break;
         }
-        
+
         // 检测是否卡住（连续多轮处理相同的 geo_ids）
         if let Some(prev) = &last_pending {
             if *prev == pending {
@@ -780,16 +782,16 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
             }
         }
         last_pending = Some(pending.clone());
-        
+
         round += 1;
-        
+
         // 🔥 计算并显示进度
         let progress_pct = if total_count > 0 {
             (total_processed as f64 / total_count as f64 * 100.0).min(100.0)
         } else {
             0.0
         };
-        
+
         println!(
             "[mesh_worker] 📊 进度: [{}/{}] ({:.1}%) | 轮次 {} | 本批 {} 个",
             total_processed,
@@ -798,7 +800,7 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
             round,
             pending_geo_ids.len()
         );
-        
+
         if !pending_geo_ids.is_empty() {
             let t = std::time::Instant::now();
             // 直接基于 geo_ids 生成 mesh
@@ -808,7 +810,7 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
                 &pending_geo_ids,
                 &mesh_formats,
             ).await?;
-            
+
             println!(
                 "[mesh_worker] ✅ 轮次 {} 完成: {} 个，用时 {} ms",
                 round,
@@ -816,9 +818,9 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
                 t.elapsed().as_millis()
             );
         }
-        
+
         total_processed += pending_geo_ids.len();
-        
+
         // 如果连续3轮 pending 集合未变化，可能卡住了
         if stalled_rounds >= 3 {
             let sample: Vec<_> = pending.iter().take(5).cloned().collect();
@@ -838,14 +840,14 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
             }
         }
     }
-    
+
     let total_time = worker_start.elapsed();
     let avg_speed = if total_time.as_secs() > 0 {
         total_processed as f64 / total_time.as_secs_f64()
     } else {
         total_processed as f64
     };
-    
+
     println!(
         "╔════════════════════════════════════════╗\n\
          ║  [mesh_worker] Mesh 生成完成           ║\n\
@@ -860,7 +862,7 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
         total_time.as_millis(),
         avg_speed
     );
-    
+
     Ok(())
 }
 
@@ -1218,11 +1220,11 @@ pub async fn process_meshes_update_db(
 }
 
 /// BRAN 专用的网格处理函数
-/// 
+///
 /// BRAN 类型不需要：
 /// - 查找子节点（没有 deep 遍历）
 /// - 布尔运算（没有负实体计算）
-/// 
+///
 /// # 参数
 /// * `option` - 数据库选项
 /// * `refnos` - BRAN 类型的 refno 列表
@@ -1254,7 +1256,7 @@ pub async fn process_meshes_bran(
         .as_ref()
         .map(|opt| opt.mesh_formats.clone())
         .unwrap_or_else(|| crate::options::get_db_option_ext().mesh_formats.clone());
-    
+
     // 生成模型文件
     gen_inst_meshes(
         &dir,
@@ -1268,7 +1270,7 @@ pub async fn process_meshes_bran(
         "[BRAN] gen_inst_meshes finished: {} ms",
         time.elapsed().as_millis()
     );
-    
+
     let time = std::time::Instant::now();
     update_inst_relate_aabbs_by_refnos(&refnos, replace_exist)
         .await
@@ -1398,7 +1400,7 @@ pub async fn process_meshes_update_db_deep(
 
                 if dboption.apply_boolean_operation {
                     let bool_time = std::time::Instant::now();
-                    
+
                     // 过滤掉 BRAN 类型，BRAN 不需要布尔运算
                     let boolean_refnos = {
                         let refno_keys: Vec<String> = target_visible_refnos.iter().map(|r| r.to_pe_key()).collect();
@@ -1415,7 +1417,7 @@ pub async fn process_meshes_update_db_deep(
                             })
                         }
                     };
-                    
+
                     if boolean_refnos.is_empty() {
                         debug_model!("  跳过布尔运算：全部为 BRAN 类型");
                     } else {
@@ -1485,7 +1487,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
     if geo_ids.is_empty() {
         return Ok(());
     }
-    
+
     // 创建 LOD 子目录
     let lod_dir = dir.join(format!("lod_{:?}", precision.default_lod));
     if !lod_dir.exists() {
@@ -1497,35 +1499,35 @@ pub async fn gen_inst_meshes_by_geo_ids(
     if !manifold_dir.exists() {
         std::fs::create_dir_all(&manifold_dir)?;
     }
-    
+
     // 构建查询的 id 列表
     let ids_str = geo_ids.iter().map(|id| id.to_raw()).join(",");
-    
+
     // 查询 inst_geo 的参数
     let sql = format!(
         "SELECT id, param, unit_flag ?? false as unit_flag FROM [{}] WHERE param != NONE",
         ids_str
     );
-    
+
     let mut response = model_primary_db().query(&sql).await?;
     let geo_params: Vec<QueryGeoParam> = response.take(0).unwrap_or_default();
-    
+
     if geo_params.is_empty() {
         debug_model_debug!("[gen_inst_meshes_by_geo_ids] 没有找到有效的几何参数");
         return Ok(());
     }
-    
+
     let aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
     let pts_json_map: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
     let inst_aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
     let mut update_sql = String::new();
-    
+
     for g in geo_params {
         let geo_type_name = g.param.type_name();
         let profile = precision.profile_for_geo(geo_type_name);
         let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
         let mesh_id = g.id.to_mesh_id();
-        
+
         // 不需要 refno
         let mut lod_settings = profile.csg_settings;
 
@@ -1572,7 +1574,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
         };
         update_sql.push_str(&mr.to_update_sql(&mesh_id));
     }
-    
+
     // 执行批量更新
     if !update_sql.is_empty() {
         println!("[gen_inst_meshes_by_geo_ids] 执行 update_sql ({} bytes)", update_sql.len());
@@ -1583,11 +1585,11 @@ pub async fn gen_inst_meshes_by_geo_ids(
     } else {
         println!("[gen_inst_meshes_by_geo_ids] update_sql 为空，没有需要更新的记录");
     }
-    
+
     // 保存 aabb 和 pts 数据
     utils::save_pts_to_surreal(&pts_json_map).await;
     utils::save_aabb_to_surreal(&aabb_map).await;
-    
+
     Ok(())
 }
 
@@ -2088,7 +2090,7 @@ pub async fn update_scene_node_aabbs_by_refnos(
         for r in result {
             // 过滤 world_trans 为 None 的记录
             let Some(world_trans) = r.world_trans else { continue };
-            
+
             // 计算合并后的 AABB
             let mut aabb = Aabb::new_invalid();
             for g in &r.geo_aabbs {

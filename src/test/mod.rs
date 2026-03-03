@@ -23,3 +23,4 @@ mod test_scene_tree_simple; // Scene Tree 模块简化测试
 // mod test_find_valid_room_data; // 查找可用于房间测试的有效数据
 #[cfg(feature = "grpc")]
 mod test_sctn_contact;
+mod test_offline_mode; // offline 模式端口 kill 测试

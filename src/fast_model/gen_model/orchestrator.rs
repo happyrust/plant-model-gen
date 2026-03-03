@@ -41,7 +41,7 @@ use crate::data_interface::db_meta_manager::db_meta;
 use crate::fast_model::mesh_generate::{
     run_boolean_worker,
     MeshTask, MeshResult, MeshWorkerReport, RecentGeoDeduper,
-    extract_mesh_tasks, generate_meshes_for_batch, query_existing_inst_geo_ids,
+    extract_mesh_tasks, generate_meshes_for_batch, query_existing_meshed_inst_geo_ids,
     run_mesh_worker_from_channel,
 };
 use crate::fast_model::gen_model::boolean_task::{BooleanTask, BooleanTaskAccumulator};
@@ -896,11 +896,11 @@ async fn process_index_tree_generation(
             if let Err(e) = crate::fast_model::preload_mesh_cache().await {
                 eprintln!("[mesh_inline] 预加载 mesh 缓存失败: {}", e);
             }
-            match query_existing_inst_geo_ids().await {
+            match query_existing_meshed_inst_geo_ids().await {
                 Ok(ids) => {
                     let count = ids.len();
                     mesh_deduper.preload(ids);
-                    println!("[mesh_inline] 预加载 {} 个已有 inst_geo ID 到去重器 (capacity={})", count, mesh_deduper.capacity);
+                    println!("[mesh_inline] 预加载 {} 个已 meshed inst_geo ID 到去重器 (capacity={})", count, mesh_deduper.capacity);
                 }
                 Err(e) => eprintln!("[mesh_inline] 预加载 inst_geo IDs 失败: {}", e),
             }
@@ -1002,7 +1002,7 @@ async fn process_index_tree_generation(
                 }
             } else if use_surrealdb {
                 let t0 = Instant::now();
-                
+
                 // 在主循环中 acquire 以提供反压
                 let permit = match db_write_semaphore.clone().acquire_owned().await {
                     Ok(p) => p,
@@ -1011,7 +1011,7 @@ async fn process_index_tree_generation(
                         continue;
                     }
                 };
-                
+
                 let shape_insts_clone = shape_insts_arc.clone();
                 db_write_handles.push(tokio::spawn(async move {
                     let _permit_holder = permit; // 离开作用域时自动释放信号量
@@ -1167,7 +1167,7 @@ async fn process_index_tree_generation(
         let cate = categorized.get_by_category(NounCategory::Cate);
         let loops = categorized.get_by_category(NounCategory::LoopOwner);
         let prims = categorized.get_by_category(NounCategory::Prim);
-        
+
         let mut all_refnos = Vec::with_capacity(cate.len() + loops.len() + prims.len());
         all_refnos.extend(cate);
         all_refnos.extend(loops);
@@ -1828,4 +1828,3 @@ mod tests {
         );
     }
 }
-

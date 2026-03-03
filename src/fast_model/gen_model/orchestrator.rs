@@ -1,43 +1,23 @@
 //! 模型生成编排器
-
 //!
-
 //! 负责协调整个模型生成流程：
-
 //! - IndexTree 单管线路由（Full / Manual / Debug / Incremental）
-
 //! - 几何体生成、Mesh 生成、布尔运算的编排
-
 //! - 增量更新、手动 refno、调试模式的处理
-
 //! - 空间索引和截图捕获的触发
-
 use std::collections::{BTreeSet, HashMap, HashSet};
-
 use std::path::{Path, PathBuf};
-
 use std::sync::Arc;
-
 use std::time::Instant;
-
 use crate::fast_model::export_model::export_prepack_lod::export_prepack_lod_for_refnos;
-
 use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_dbnos;
-
 use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_refnos_grouped_by_dbno;
-
 use crate::fast_model::unit_converter::LengthUnit;
-
 use aios_core::RefnoEnum;
-
 use crate::data_interface::increment_record::IncrGeoUpdateLog;
-
 use crate::data_interface::sesno_increment::get_changes_at_sesno;
-
 // use crate::fast_model::capture::capture_refnos_if_enabled; // removed on foyer-cache-cleanup
-
 use crate::data_interface::db_meta_manager::db_meta;
-
 use crate::fast_model::mesh_generate::{
     run_boolean_worker,
     MeshTask, MeshResult, MeshWorkerReport, RecentGeoDeduper,
@@ -46,31 +26,21 @@ use crate::fast_model::mesh_generate::{
 };
 use crate::fast_model::gen_model::boolean_task::{BooleanTask, BooleanTaskAccumulator};
 use crate::fast_model::gen_model::manifold_bool::run_bool_worker_from_tasks;
-
 use crate::fast_model::pdms_inst::save_instance_data_optimize;
 use crate::fast_model::pdms_inst::{save_instance_data_to_sql_file, InstRelatePrecomputed};
-
 use crate::options::{BooleanPipelineMode, DbOptionExt, MeshFormat};
 
 #[cfg(feature = "parquet-export")]
 use crate::fast_model::export_model::ParquetStreamWriter;
 
 #[cfg(feature = "duckdb-feature")]
-
 use crate::fast_model::export_model::{DuckDBStreamWriter, DuckDBWriteMode};
-
 use super::config::IndexTreeConfig;
-
 use super::errors::{IndexTreeError, Result};
-
 use super::cache_miss_report;
-
 use super::index_tree_mode::gen_index_tree_geos_optimized;
-
 use super::models::NounCategory;
-
 use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
-
 use aios_core::tool::db_tool::db1_hash;
 
 /// 按 dbnum 拆分一个 batch，保证写入 InstanceCache 时“一个 batch 只落到一个 dbnum 分桶”。
@@ -82,7 +52,6 @@ pub(crate) async fn split_shape_instances_by_dbnum(
     shape_insts: &aios_core::geometry::ShapeInstancesData,
 ) -> anyhow::Result<HashMap<u32, aios_core::geometry::ShapeInstancesData>> {
     use aios_core::geometry::ShapeInstancesData;
-
     let mut out: HashMap<u32, ShapeInstancesData> = HashMap::new();
     let mut cache: HashMap<RefnoEnum, u32> = HashMap::new();
     let mut missing_by_source: HashMap<&'static str, usize> = HashMap::new();
@@ -258,7 +227,6 @@ fn decide_generation_scope(
 ) -> GenerationScope {
     let has_manual = !manual_refnos.is_empty();
     let has_debug = !debug_roots.is_empty();
-
     if has_manual && !has_debug && !has_incr_log {
         return GenerationScope::Manual {
             roots: manual_refnos.to_vec(),
@@ -328,178 +296,108 @@ pub struct GenModelResult {
 }
 
 /// 主入口函数：生成所有几何体数据
-
 ///
-
 /// 这是主要的公共 API，统一收敛到 IndexTree 生成管线：
 /// - Full：按 `index_tree_enabled_target_types` 从 TreeIndex 提取入口 roots
 /// - Manual / Debug / Incremental：构造 roots 并集后以 seed_roots 直入
-
 ///
-
 /// # Arguments
-
 /// * `manual_refnos` - 手动指定的 refno 列表
-
 /// * `db_option` - 数据库配置
-
 /// * `incr_updates` - 增量更新日志
-
 /// * `target_sesno` - 目标 sesno
-
 #[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "gen_all_geos_data"))]
-
 pub async fn gen_all_geos_data(
-
     manual_refnos: Vec<RefnoEnum>,
-
     db_option: &DbOptionExt,
-
     incr_updates: Option<IncrGeoUpdateLog>,
-
     target_sesno: Option<u32>,
 ) -> Result<GenModelResult> {
-
     let time = Instant::now();
-
     let mut perf = crate::perf_timer::PerfTimer::new("gen_all_geos_data");
-
     perf.mark("init");
 
     // cache-first 缺失报告：生成过程中按需补充记录，结束时输出到 output/<project>/cache_miss_report.json
     // cache-first 模式已移除（foyer-cache-cleanup），使用 Direct 模式
     cache_miss_report::init_global_cache_miss_report(db_option, "Direct");
-
     let mut final_incr_updates = incr_updates;
 
     // 如果指定了 target_sesno，获取该 sesno 的增量数据
-
     if let Some(sesno) = target_sesno {
-
         if !db_option.use_surrealdb {
-
             return Err(IndexTreeError::Other(anyhow::anyhow!(
-
                 "cache-only 模式下不支持 --target-sesno（需要从 SurrealDB 获取 element_changes）：sesno={}",
-
                 sesno
-
             )));
-
         }
 
         if final_incr_updates.is_none() {
-
             match get_changes_at_sesno(sesno).await {
-
                 Ok(sesno_changes) => {
-
                     if sesno_changes.count() > 0 {
-
                         final_incr_updates = Some(sesno_changes);
-
                     } else {
-
                         println!("[gen_model] sesno {} 没有发现变更，跳过增量生成", sesno);
-
                         return Ok(GenModelResult {
                             success: false,
                             deferred_sql_path: None,
                         });
-
                     }
-
                 }
 
                 Err(e) => {
-
                     eprintln!("获取 sesno {} 的变更失败: {}", sesno, e);
-
                     return Err(IndexTreeError::Other(e));
-
                 }
-
             }
-
         }
-
     }
 
     let incr_count = final_incr_updates
-
         .as_ref()
-
         .map(|log| log.count())
-
         .unwrap_or(0);
-
     println!(
-
         "[gen_model] 启动 gen_all_geos_data: manual_refnos={}, incr_updates={}, target_sesno={:?}",
-
         manual_refnos.len(),
-
         incr_count,
-
         target_sesno,
-
     );
 
     // 性能剖析：尽量在最上层启用 tracing，覆盖 precheck -> gen_model -> mesh -> room 计算全链路。
 
     #[cfg(feature = "profile")]
-
     let _ = crate::profiling::init_chrome_tracing_for_db_option(db_option, "full_flow_room");
-
     perf.mark("precheck");
 
     // ✨ 执行预检查：确保 Tree 文件、pe_transform、db_meta_info 就绪
-
     if db_option.use_surrealdb {
-
         use crate::fast_model::gen_model::precheck_coordinator::{run_precheck, PrecheckConfig};
-
         let precheck_config = PrecheckConfig {
-
             enabled: true,
-
             check_tree: true,
-
             check_pe_transform: true,
-
             check_db_meta: true,
-
             tree_output_dir: db_option.get_project_output_dir().join("scene_tree").to_string_lossy().to_string(),
-
         };
-
         match run_precheck(db_option, Some(precheck_config)).await {
-
             Ok(stats) => {
-
                 log::info!("[gen_model] 预检查完成: {:?}", stats);
-
             }
 
             Err(e) => {
-
                 log::warn!("[gen_model] 预检查部分失败: {}", e);
 
                 // 不阻断流程，继续执行
-
             }
-
         }
 
     } else {
-
         // cache-only 模式：仅检查 db_meta_info
         let _ = db_meta().ensure_loaded();
-
     }
 
     // 调试：打印 IndexTree 模式配置
-
     println!(
         "[gen_model] IndexTree 默认管线配置: concurrency={}, batch_size={}",
         db_option.get_index_tree_concurrency(),
@@ -507,38 +405,27 @@ pub async fn gen_all_geos_data(
     );
 
     // ✅ SurrealDB 写入侧初始化：仅在 use_surrealdb=true 时需要。
-
     if db_option.use_surrealdb && !db_option.defer_db_write {
-
         if let Err(e) = aios_core::rs_surreal::inst::init_model_tables().await {
-
             eprintln!("[gen_model] ❌ 初始化 inst_relate 表结构失败: {}", e);
 
             // 严重错误，建议直接中断，否则后续写入必挂
-
             return Err(IndexTreeError::Other(e));
-
         }
-
     }
 
     // =========================
-
     // LOOP/PRIM 输入缓存初始化（按环境变量启用）
 
     // =========================
-
     // geom_input_cache 已移除（foyer-cache-cleanup），跳过缓存初始化
     println!("[gen_model] geom_input_cache: Direct 模式（cache 已移除）");
 
     // =========================
-
     // IndexTree 模式：新管线
 
     // =========================
-
     // 统一入口：manual/debug/incr/full 全部收敛到 IndexTree 生成管线
-
     perf.mark("route_decision");
     let debug_roots = db_option.inner.get_all_debug_refnos().await;
     let incr_visible_roots: Vec<RefnoEnum> = final_incr_updates
@@ -550,7 +437,6 @@ pub async fn gen_all_geos_data(
         .map(|log| log.count() > 0)
         .unwrap_or(false);
     let has_incr_visible_roots = !incr_visible_roots.is_empty();
-
     let scope = decide_generation_scope(
         &manual_refnos,
         &debug_roots,
@@ -558,7 +444,6 @@ pub async fn gen_all_geos_data(
         &incr_visible_roots,
         final_incr_updates.as_ref(),
     );
-
     if matches!(scope, GenerationScope::Incremental { .. }) && !has_incr_visible_roots {
         println!(
             "[gen_model] 增量日志存在但未解析到可见 roots，将按 Incremental 空 roots 路径执行（不会回退 Full）"
@@ -578,7 +463,6 @@ pub async fn gen_all_geos_data(
 
     perf.mark("index_tree_generation");
     let result = process_index_tree_generation(scope, db_option, target_sesno, time).await;
-
     perf.print_summary();
 
     // 输出 cache miss 报告（覆盖写）。
@@ -600,58 +484,37 @@ pub async fn gen_all_geos_data(
     }
 
     result
-
 }
 
 async fn filter_bran_hang_refnos(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
-
     let bran_hash = db1_hash("BRAN");
-
     let hang_hash = db1_hash("HANG");
-
     let mut out = Vec::new();
-
     for &r in refnos {
-
         if !r.is_valid() {
-
             continue;
-
         }
 
         let dbnum = match TreeIndexManager::resolve_dbnum_for_refno(r) {
             Ok(v) => v,
             Err(_) => continue,
         };
-
         let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-
         let Ok(index) = manager.load_index(dbnum) else {
-
             continue;
-
         };
-
         let Some(meta) = index.node_meta(r.refno()) else {
-
             continue;
-
         };
-
         if meta.noun == bran_hash || meta.noun == hang_hash {
-
             out.push(r);
-
         }
-
     }
 
     out
-
 }
 
 /// 处理 IndexTree 模式的生成流程
-
 async fn process_index_tree_generation(
     scope: GenerationScope,
     db_option: &DbOptionExt,
@@ -659,19 +522,12 @@ async fn process_index_tree_generation(
     time: Instant,
 ) -> Result<GenModelResult> {
     let mut perf = crate::perf_timer::PerfTimer::new("index_tree_generation");
-
     perf.mark("init");
-
     println!("[gen_model] 进入 IndexTree 生成模式（统一管线）");
-
     if db_option.manual_db_nums.is_some() || db_option.exclude_db_nums.is_some() {
-
         println!(
-
             "[gen_model] 提示: IndexTree 新管线已支持 manual_db_nums / exclude_db_nums 过滤，当前仍按配置执行"
-
         );
-
     }
 
     let seed_roots = match &scope {
@@ -693,19 +549,13 @@ async fn process_index_tree_generation(
             Some(roots)
         }
     };
-
     let full_start = Instant::now();
-
     perf.mark("categorize_and_inst_relate");
 
     // 1️⃣ 生成/更新 inst_relate，并获取分类后的根 refno
-
     let config = IndexTreeConfig::from_db_option_ext(db_option)
-
         .map_err(|e| anyhow::anyhow!("配置错误: {}", e))?;
-
     let (sender, receiver) = flume::bounded::<aios_core::geometry::ShapeInstancesData>(100);
-
     let replace_exist = db_option.inner.is_replace_mesh();
 
     // 🧹 预处理清理：在生成前一次性删除目标 refnos 的旧模型记录，
@@ -762,13 +612,13 @@ async fn process_index_tree_generation(
         .unwrap_or(false);
 
     // ParquetStreamWriter 需要 parquet-export feature
+
     #[cfg(feature = "parquet-export")]
     let parquet_writer = if enable_parquet_stream_writer {
         let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
         let parquet_dir = std::path::Path::new(output_dir)
             .parent()
             .unwrap_or(std::path::Path::new("output"));
-
         match ParquetStreamWriter::new(parquet_dir) {
             Ok(writer) => {
                 println!(
@@ -788,59 +638,41 @@ async fn process_index_tree_generation(
         );
         None
     };
+
     #[cfg(not(feature = "parquet-export"))]
     let parquet_writer: Option<std::sync::Arc<()>> = None;
 
     #[cfg(feature = "duckdb-feature")]
-
     let duckdb_writer: Option<std::sync::Arc<DuckDBStreamWriter>> = None;
-
     /*
 
     #[cfg(feature = "duckdb-feature")]
-
     let duckdb_writer = {
-
         let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
-
         let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
-
         let duckdb_dir = parquet_dir.join("database_models/_global");
-
         match DuckDBStreamWriter::new(&duckdb_dir, DuckDBWriteMode::Rebuild) {
-
             Ok(writer) => Some(std::sync::Arc::new(writer)),
-
             Err(e) => {
-
                 eprintln!("[DuckDB] 初始化写入器失败: {}, 跳过 DuckDB 导出", e);
-
                 None
-
             }
-
         }
 
     };
-
     */
-
     #[allow(unused_variables)]
     let parquet_writer_clone = parquet_writer.clone();
 
     #[cfg(feature = "duckdb-feature")]
-
     let duckdb_writer_clone = duckdb_writer.clone();
 
     // model cache-only 已移除（foyer-cache-cleanup）
     let model_cache_ctx: Option<()> = None;
     #[allow(unused_variables)]
     let cache_manager_for_insert: Option<()> = None;
-
     let touched_dbnums: Arc<std::sync::Mutex<BTreeSet<u32>>> =
-
         Arc::new(std::sync::Mutex::new(BTreeSet::new()));
-
     let touched_dbnums_for_insert = touched_dbnums.clone();
 
     // IndexTree 下用于 inst_relate_aabb 写入的 refno 集合：只收集“本次生成触达”的实例，
@@ -850,32 +682,21 @@ async fn process_index_tree_generation(
     let touched_refnos_for_insert = touched_refnos.clone();
 
     // 当 manual_db_nums 只有一个值时，直接使用该 dbnum，无需从 refno 反推
-
     let known_dbnum: Option<u32> = db_option.inner.manual_db_nums.as_ref()
-
         .filter(|nums| nums.len() == 1)
-
         .and_then(|nums| nums.first().copied());
-
     let sql_writer_clone = sql_file_writer.clone();
     let db_option_inner = db_option.inner.clone();
-
     let insert_handle = tokio::spawn(async move {
 
         #[cfg(feature = "profile")]
-
         let sink_span = tracing::info_span!("instance_sink");
-
         let mut batch_cnt: u64 = 0;
-
         let mut t_save_db = std::time::Duration::ZERO;
-
         let mut t_cache = std::time::Duration::ZERO;
-
         let mut t_parquet = std::time::Duration::ZERO;
 
         #[cfg(feature = "duckdb-feature")]
-
         let mut t_duckdb = std::time::Duration::ZERO;
 
         // SurrealDB 写入后台任务句柄：不阻塞 cache 写入和后续 batch 接收
@@ -907,18 +728,13 @@ async fn process_index_tree_generation(
         }
 
         loop {
-
             let Ok(shape_insts) = receiver.recv_async().await else {
-
                 break;
-
             };
-
             let shape_insts_arc = std::sync::Arc::new(shape_insts);
 
             #[cfg(feature = "profile")]
             let _enter = sink_span.enter();
-
             batch_cnt += 1;
 
             // 记录本批次触达的实例 refno（用于后续 inst_relate_aabb 写入范围收敛）
@@ -936,24 +752,17 @@ async fn process_index_tree_generation(
             let _ = &cache_manager_for_insert;
 
             // 同时写入 Parquet（如果启用）
-
             // [foyer-removal] parquet_writer 已移除，跳过 write_batch
             let _ = &parquet_writer_clone;
 
             #[cfg(feature = "duckdb-feature")]
-
             if let Some(ref writer) = duckdb_writer_clone {
-
                 let t0 = Instant::now();
-
                 if let Err(e) = writer.write_batch(&shape_insts_arc) {
-
                     eprintln!("[DuckDB] 写入批次失败: {}", e);
-
                 }
 
                 t_duckdb += t0.elapsed();
-
             }
 
             // Mesh 内联生成：先生成 mesh，再将结果合并到 inst_geo INSERT 中
@@ -1011,11 +820,9 @@ async fn process_index_tree_generation(
                         continue;
                     }
                 };
-
                 let shape_insts_clone = shape_insts_arc.clone();
                 db_write_handles.push(tokio::spawn(async move {
                     let _permit_holder = permit; // 离开作用域时自动释放信号量
-
                     if let Err(e) = save_instance_data_optimize(&shape_insts_clone, replace_exist, &mesh_results).await {
                         eprintln!("保存实例数据失败: {}", e);
                         return false;
@@ -1024,7 +831,6 @@ async fn process_index_tree_generation(
                 }));
                 t_save_db += t0.elapsed();
             }
-
         }
 
         // 等待所有 SurrealDB 后台写入完成
@@ -1097,82 +903,58 @@ async fn process_index_tree_generation(
         );
 
         #[cfg(feature = "profile")]
-
         {
-
             tracing::info!(
-
                 batch_cnt,
-
                 save_db_ms = t_save_db.as_millis() as u64,
-
                 cache_ms = t_cache.as_millis() as u64,
-
                 parquet_ms = t_parquet.as_millis() as u64,
-
                 "instance_sink finished"
-
             );
 
             #[cfg(feature = "duckdb-feature")]
-
             tracing::info!(duckdb_ms = t_duckdb.as_millis() as u64, "instance_sink duckdb finished");
-
         }
 
         ensure_no_db_write_failures(db_write_failures)?;
         let bool_tasks = bool_accumulator.build_tasks();
         Ok::<InsertHandleReport, anyhow::Error>(InsertHandleReport { batch_cnt, bool_tasks })
-
     });
-
     let categorized = gen_index_tree_geos_optimized(
         Arc::new(db_option.clone()),
         &config,
         sender.clone(),
         seed_roots,
     )
-
         .await
-
         .map_err(|e| anyhow::anyhow!("IndexTree 生成失败: {}", e))?;
 
     // 🔥 显式 drop sender，让 receiver 的循环能够正常结束
     // 否则 insert_handle.await 会永久阻塞
     drop(sender);
-
     let insert_report = insert_handle
         .await
         .map_err(|e| anyhow::anyhow!("instance sink 任务异常退出: {}", e))?
         .map_err(IndexTreeError::Other)?;
     let mut bool_tasks = insert_report.bool_tasks;
-
     println!(
-
         "[gen_model] IndexTree 模式 insts 入库完成，用时 {} ms",
-
         full_start.elapsed().as_millis()
-
     );
-
     perf.mark("mesh_generation");
 
     // 2️⃣ 可选执行 mesh 生成（已通过 mesh_handle 并行处理，此处等待完成）
-
     if db_option.inner.gen_mesh {
-
         let mesh_start = Instant::now();
 
         // 收集所有 refnos（后续 web bundle / aabb 等步骤仍需使用）
         let cate = categorized.get_by_category(NounCategory::Cate);
         let loops = categorized.get_by_category(NounCategory::LoopOwner);
         let prims = categorized.get_by_category(NounCategory::Prim);
-
         let mut all_refnos = Vec::with_capacity(cate.len() + loops.len() + prims.len());
         all_refnos.extend(cate);
         all_refnos.extend(loops);
         all_refnos.extend(prims);
-
         let mut ran_primary = false;
 
         // model_cache mesh worker 已移除（foyer-cache-cleanup）
@@ -1190,9 +972,7 @@ async fn process_index_tree_generation(
         perf.mark("aabb_write");
 
         // 3️⃣ 写入 inst_relate_aabb 并导出 Parquet（供房间计算使用）
-
         if use_surrealdb && !defer_db_write {
-
             // 性能实验：允许跳过 AABB 写入，便于先定位“生成/mesh/boolean”的主耗时。
             let skip_aabb_write = std::env::var_os("AIOS_SKIP_INST_RELATE_AABB").is_some();
             if skip_aabb_write {
@@ -1201,7 +981,6 @@ async fn process_index_tree_generation(
                 );
             } else {
                 let aabb_start = Instant::now();
-
                 println!("[gen_model] IndexTree 模式开始写入 inst_relate_aabb");
 
                 // 只写本次生成触达的 refno，避免 pe_transform 全库扫描导致卡死/耗时失真。
@@ -1240,7 +1019,6 @@ async fn process_index_tree_generation(
                         "[gen_model] IndexTree 模式 inst_relate_aabb 写入范围: refnos={}",
                         aabb_refnos.len()
                     );
-
                     if let Err(e) = crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
                         &aabb_refnos,
                         db_option.is_replace_mesh(),
@@ -1256,7 +1034,6 @@ async fn process_index_tree_generation(
                     }
                 }
             }
-
         }
 
         perf.mark("boolean_operation");
@@ -1269,11 +1046,8 @@ async fn process_index_tree_generation(
         }
 
         // 4️⃣ 可选执行布尔运算
-
         if db_option.inner.apply_boolean_operation {
-
             let bool_start = Instant::now();
-
             println!("[gen_model] IndexTree 模式开始布尔运算（boolean worker）");
             println!(
                 "[gen_model] boolean_pipeline_mode={:?}, defer_db_write={}, use_surrealdb={}, enable_db_backfill={}",
@@ -1358,13 +1132,9 @@ async fn process_index_tree_generation(
             }
 
             println!(
-
                 "[gen_model] IndexTree 模式布尔运算完成，用时 {} ms",
-
                 bool_start.elapsed().as_millis()
-
             );
-
         }
 
         // defer_db_write 模式：布尔阶段后再 flush，确保布尔 SQL 也写入同一文件。
@@ -1384,101 +1154,56 @@ async fn process_index_tree_generation(
         perf.mark("web_bundle_export");
 
         // 5️⃣ 生成 Web Bundle (GLB + JSON 数据包)
-
         if db_option.mesh_formats.contains(&MeshFormat::Glb) {
-
             let web_bundle_start = Instant::now();
-
             println!("[gen_model] 开始生成 Web Bundle (GLB + JSON 数据包)...");
-
         let mesh_dir = Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes"));
 
         // 输出到与 meshes 同级的 web_bundle 目录
-
         let output_dir = mesh_dir.parent().unwrap_or(mesh_dir).join("web_bundle");
-
         if let Err(e) = export_prepack_lod_for_refnos(
-
             &all_refnos,
-
             &mesh_dir,
-
             &output_dir,
-
             Arc::new(db_option.inner.clone()),
-
             true, // include_descendants
-
             None, // filter_nouns
-
             true, // verbose
-
             None, // name_config
-
             false, // export_all_lods: 改为 false，遵循 DbOption 中的默认设置
-
             LengthUnit::Millimeter,
-
             LengthUnit::Millimeter,
-
         )
-
         .await
-
         {
-
             eprintln!("[gen_model] 生成 Web Bundle 失败: {}", e);
-
             } else {
-
                 println!(
-
                     "[gen_model] Web Bundle 生成完成，输出目录: {}, 用时 {} ms",
-
                     output_dir.display(),
-
                     web_bundle_start.elapsed().as_millis()
-
                 );
-
             }
-
         }
-
     }
 
     perf.mark("sqlite_spatial_index");
-
     println!(
-
         "[gen_model] IndexTree 模式全部完成，总用时 {} ms",
-
         full_start.elapsed().as_millis()
-
     );
-
     println!(
-
         "[gen_model] gen_all_geos_data 总耗时: {} ms",
-
         time.elapsed().as_millis()
-
     );
-
     let touched_dbnums_vec: Vec<u32> = touched_dbnums
-
         .lock()
-
         .map(|s| s.iter().copied().collect())
-
         .unwrap_or_default();
-
     perf.mark("instances_export");
 
     // ✅ 模型生成完毕后导出 instances.json（按 dbno）
-
     if db_option.export_instances {
-
         let (dbno_source, mut dbnos): (&str, Vec<u32>) =
             if let Some(nums) = db_option.inner.manual_db_nums.clone() {
                 ("manual_db_nums", nums)
@@ -1491,20 +1216,14 @@ async fn process_index_tree_generation(
                     aios_core::query_mdb_db_nums(None, aios_core::DBType::DESI).await?,
                 )
             };
-
         if let Some(exclude_nums) = &db_option.inner.exclude_db_nums {
-
             use std::collections::HashSet;
-
             let exclude: HashSet<u32> = exclude_nums.iter().copied().collect();
-
             dbnos.retain(|dbnum| !exclude.contains(dbnum));
-
         }
 
         dbnos.sort_unstable();
         dbnos.dedup();
-
         if dbnos.is_empty() {
             println!("[instances] 跳过导出：未解析到可用 dbnum（source={})", dbno_source);
         } else {
@@ -1515,9 +1234,7 @@ async fn process_index_tree_generation(
         }
 
         let mesh_dir =
-
             Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes"));
-
         if !dbnos.is_empty() {
             if let Err(e) = export_instances_json_for_dbnos(
                 &dbnos,
@@ -1531,87 +1248,51 @@ async fn process_index_tree_generation(
                 eprintln!("[instances] IndexTree 导出失败: {}", e);
             }
         }
-
     }
 
     // model_cache close 已移除（foyer-cache-cleanup）
-
     perf.end_current();
 
     // 输出性能摘要到控制台
-
     perf.print_summary();
 
     // 保存性能报告为 JSON 和 CSV
-
     let project_name = if !db_option.inner.project_name.is_empty() {
-
         db_option.inner.project_name.clone()
-
     } else {
-
         "default".to_string()
-
     };
-
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-
     let profile_dir = std::path::PathBuf::from("output")
-
         .join(&project_name)
-
         .join("profile");
 
     // 收集配置元数据
-
     let dbnum_tag = db_option.inner.manual_db_nums.as_ref()
-
         .and_then(|nums| nums.first().copied())
-
         .map(|n| n.to_string())
-
         .unwrap_or_else(|| "all".to_string());
-
     let enabled_nouns = db_option.index_tree_enabled_target_types.clone();
-
     let metadata = serde_json::json!({
-
         "mode": "index_tree",
-
         "project_name": project_name,
-
         "dbnum": dbnum_tag,
-
         "enabled_nouns": enabled_nouns,
-
         "use_surrealdb": db_option.use_surrealdb,
-
         "model_cache_write": true,
-
         "apply_boolean": db_option.inner.apply_boolean_operation,
-
         "gen_mesh": db_option.inner.gen_mesh,
-
         "concurrency": db_option.get_index_tree_concurrency(),
-
         "batch_size": db_option.get_index_tree_batch_size(),
-
     });
-
     let json_path = profile_dir.join(format!("perf_gen_model_index_tree_dbnum_{}_{}.json", dbnum_tag, timestamp));
-
     let csv_path = profile_dir.join(format!("perf_gen_model_index_tree_dbnum_{}_{}.csv", dbnum_tag, timestamp));
-
     if let Err(e) = perf.save_json(&json_path, metadata.clone()) {
-
         eprintln!("[perf] 保存 JSON 报告失败: {}", e);
-
     }
 
     if let Err(e) = perf.save_csv(&csv_path, metadata) {
-
         eprintln!("[perf] 保存 CSV 报告失败: {}", e);
-
     }
 
     let deferred_sql_path = sql_file_writer
@@ -1621,175 +1302,107 @@ async fn process_index_tree_generation(
         success: true,
         deferred_sql_path,
     })
-
 }
 
 // ============================================================================
-
 // SQLite 空间索引：从 model cache 生成/增量更新 output/spatial_index.sqlite
-
 //
-
 // 目标：模型生成（写 cache）后，将 AABB 批量落库到 SQLite RTree，供房间计算等流程做粗筛。
 
 // ============================================================================
 
 #[cfg(feature = "sqlite-index")]
-
 async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums: &[u32]) -> Result<()> {
-
     use crate::spatial_index::SqliteSpatialIndex;
-
     use crate::sqlite_index::{ImportConfig, SqliteAabbIndex};
-
     use std::fs;
-
     use std::path::PathBuf;
-
     if dbnums.is_empty() {
-
         return Ok(());
-
     }
 
     if !db_option.inner.enable_sqlite_rtree {
-
         // 常见误区：已切换到 cache 生成，但忘了开 enable_sqlite_rtree，导致 spatial_index.sqlite 不会更新，
         // 房间计算（SQLite RTree 粗筛）会退化/失效。
-
         let idx_path = SqliteSpatialIndex::default_path();
         if !idx_path.exists() {
-
             eprintln!(
-
                 "[gen_model] 警告：enable_sqlite_rtree=false，且未发现 {:?}；模型 AABB 不会落库到 SQLite。\
-
                  若需房间计算粗筛/诊断，请在 DbOption.toml 开启 enable_sqlite_rtree=true 或使用 CLI 导入 instances.json。",
-
                 idx_path
-
             );
-
         }
 
         return Ok(());
-
     }
 
     // 打开/初始化索引（幂等）
-
     let idx_path = SqliteSpatialIndex::default_path();
-
     if let Some(parent) = idx_path.parent() {
-
         fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!(e))?;
-
     }
 
     let idx = SqliteAabbIndex::open(&idx_path).map_err(|e| anyhow::anyhow!(e))?;
-
     idx.init_schema().map_err(|e| anyhow::anyhow!(e))?;
 
     // 为避免 aabb.json/trans.json（固定文件名）互相覆盖，每个 dbnum 独立输出目录。
-
     let base_out = db_option.get_project_output_dir().join("instances_cache_for_index");
-
     fs::create_dir_all(&base_out).map_err(|e| anyhow::anyhow!(e))?;
 
     // mesh_lod_tag 仅用于导出侧选择 mesh（用于补齐/计算 AABB）
-
     let cache_dir = db_option.get_model_cache_dir();
-
     let mesh_dir = db_option.inner.get_meshes_path();
-
     let mesh_lod_tag = format!("{:?}", db_option.inner.mesh_precision.default_lod);
 
     // 去重并保证顺序稳定（便于日志与排查）
-
     let mut uniq: BTreeSet<u32> = BTreeSet::new();
-
     uniq.extend(dbnums.iter().copied());
-
     for dbnum in uniq {
-
         let out_dir = base_out.join(format!("{}", dbnum));
-
         fs::create_dir_all(&out_dir).map_err(|e| anyhow::anyhow!(e))?;
 
         // 1) cache -> instances_{dbnum}.json + aabb.json + trans.json
-
         let _ = crate::fast_model::export_model::export_prepack_lod::export_dbnum_instances_json_from_cache(
-
             dbnum,
-
             &out_dir,
-
             &cache_dir,
-
             Some(&mesh_dir),
-
             Some(mesh_lod_tag.as_str()),
-
             false,
-
             None,
-
             false,
-
         )
-
         .await?;
 
         // 2) instances_{dbnum}.json -> spatial_index.sqlite (RTree)
-
         let instances_path = out_dir.join(format!("instances_{}.json", dbnum));
-
         if instances_path.exists() {
-
             let _ = idx.import_from_instances_json(&instances_path, &ImportConfig::default())?;
-
         }
-
     }
 
     Ok(())
-
 }
 
 #[cfg(not(feature = "sqlite-index"))]
-
 async fn update_sqlite_spatial_index_from_cache(_db_option: &DbOptionExt, _dbnums: &[u32]) -> Result<()> {
-
     Ok(())
-
 }
 
 /// 初始化空间索引（如果启用）
-
 #[cfg(feature = "duckdb-feature")]
-
 fn initialize_spatial_index() {
-
     // if SqliteSpatialIndex::is_enabled() {
-
     //     match SqliteSpatialIndex::with_default_path() {
-
     //         Ok(_index) => println!("SQLite spatial index initialized"),
-
     //         Err(e) => eprintln!("Failed to initialize SQLite spatial index: {}", e),
-
     //     }
-
     // }
-
 }
 
 #[cfg(not(feature = "duckdb-feature"))]
-
 fn initialize_spatial_index() {
-
     // No-op when feature is disabled
-
 }
 
 #[cfg(test)]
@@ -1802,7 +1415,6 @@ mod tests {
         let debug_roots: Vec<RefnoEnum> = Vec::new();
         let mut incr_log = IncrGeoUpdateLog::default();
         incr_log.prim_refnos.insert("17496_171666".into());
-
         let scope = decide_generation_scope(
             &manual_refnos,
             &debug_roots,
@@ -1810,7 +1422,6 @@ mod tests {
             &[],
             Some(&incr_log),
         );
-
         assert!(matches!(scope, GenerationScope::Incremental { .. }));
     }
 

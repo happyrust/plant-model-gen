@@ -12,8 +12,6 @@
 
 //! - 空间索引和截图捕获的触发
 
-
-
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use std::path::{Path, PathBuf};
@@ -21,8 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use std::time::Instant;
-
-
 
 use crate::fast_model::export_model::export_prepack_lod::export_prepack_lod_for_refnos;
 
@@ -32,11 +28,7 @@ use crate::fast_model::export_model::export_prepack_lod::export_instances_json_f
 
 use crate::fast_model::unit_converter::LengthUnit;
 
-
-
 use aios_core::RefnoEnum;
-
-
 
 use crate::data_interface::increment_record::IncrGeoUpdateLog;
 
@@ -65,8 +57,6 @@ use crate::fast_model::export_model::ParquetStreamWriter;
 
 use crate::fast_model::export_model::{DuckDBStreamWriter, DuckDBWriteMode};
 
-
-
 use super::config::IndexTreeConfig;
 
 use super::errors::{IndexTreeError, Result};
@@ -80,8 +70,6 @@ use super::models::NounCategory;
 use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 
 use aios_core::tool::db_tool::db1_hash;
-
-
 
 /// 按 dbnum 拆分一个 batch，保证写入 InstanceCache 时“一个 batch 只落到一个 dbnum 分桶”。
 ///
@@ -337,8 +325,6 @@ pub struct GenModelResult {
     pub deferred_sql_path: Option<PathBuf>,
 }
 
-
-
 /// 主入口函数：生成所有几何体数据
 
 ///
@@ -383,8 +369,6 @@ pub async fn gen_all_geos_data(
     cache_miss_report::init_global_cache_miss_report(db_option, "Direct");
 
     let mut final_incr_updates = incr_updates;
-
-
 
     // 如果指定了 target_sesno，获取该 sesno 的增量数据
 
@@ -439,8 +423,6 @@ pub async fn gen_all_geos_data(
 
     }
 
-
-
     let incr_count = final_incr_updates
 
         .as_ref()
@@ -448,8 +430,6 @@ pub async fn gen_all_geos_data(
         .map(|log| log.count())
 
         .unwrap_or(0);
-
-
 
     println!(
 
@@ -463,15 +443,11 @@ pub async fn gen_all_geos_data(
 
     );
 
-
-
     // 性能剖析：尽量在最上层启用 tracing，覆盖 precheck -> gen_model -> mesh -> room 计算全链路。
 
     #[cfg(feature = "profile")]
 
     let _ = crate::profiling::init_chrome_tracing_for_db_option(db_option, "full_flow_room");
-
-
 
     perf.mark("precheck");
 
@@ -480,8 +456,6 @@ pub async fn gen_all_geos_data(
     if db_option.use_surrealdb {
 
         use crate::fast_model::gen_model::precheck_coordinator::{run_precheck, PrecheckConfig};
-
-
 
         let precheck_config = PrecheckConfig {
 
@@ -496,8 +470,6 @@ pub async fn gen_all_geos_data(
             tree_output_dir: db_option.get_project_output_dir().join("scene_tree").to_string_lossy().to_string(),
 
         };
-
-
 
         match run_precheck(db_option, Some(precheck_config)).await {
 
@@ -524,24 +496,6 @@ pub async fn gen_all_geos_data(
 
     }
 
-
-
-    // TreeIndex 文件（output/scene_tree/{dbnum}.tree）在不少流程中是必需的（IndexTree/导出/层级查询）。
-
-    // cache-only：不允许自动生成/回退 SurrealDB；缺失即报错，避免“看似成功但数据为空”。
-
-    if db_option.use_surrealdb {
-
-        crate::fast_model::gen_model::tree_index_manager::enable_auto_generate_tree();
-
-    } else {
-
-        crate::fast_model::gen_model::tree_index_manager::disable_auto_generate_tree();
-
-    }
-
-
-
     // 调试：打印 IndexTree 模式配置
 
     println!(
@@ -549,8 +503,6 @@ pub async fn gen_all_geos_data(
         db_option.get_index_tree_concurrency(),
         db_option.get_index_tree_batch_size()
     );
-
-
 
     // ✅ SurrealDB 写入侧初始化：仅在 use_surrealdb=true 时需要。
 
@@ -568,8 +520,6 @@ pub async fn gen_all_geos_data(
 
     }
 
-
-
     // =========================
 
     // LOOP/PRIM 输入缓存初始化（按环境变量启用）
@@ -578,8 +528,6 @@ pub async fn gen_all_geos_data(
 
     // geom_input_cache 已移除（foyer-cache-cleanup），跳过缓存初始化
     println!("[gen_model] geom_input_cache: Direct 模式（cache 已移除）");
-
-
 
     // =========================
 
@@ -629,8 +577,6 @@ pub async fn gen_all_geos_data(
     perf.mark("index_tree_generation");
     let result = process_index_tree_generation(scope, db_option, target_sesno, time).await;
 
-
-
     perf.print_summary();
 
     // 输出 cache miss 报告（覆盖写）。
@@ -655,8 +601,6 @@ pub async fn gen_all_geos_data(
 
 }
 
-
-
 async fn filter_bran_hang_refnos(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
 
     let bran_hash = db1_hash("BRAN");
@@ -664,8 +608,6 @@ async fn filter_bran_hang_refnos(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
     let hang_hash = db1_hash("HANG");
 
     let mut out = Vec::new();
-
-
 
     for &r in refnos {
 
@@ -702,13 +644,9 @@ async fn filter_bran_hang_refnos(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
 
     }
 
-
-
     out
 
 }
-
-
 
 /// 处理 IndexTree 模式的生成流程
 
@@ -722,10 +660,7 @@ async fn process_index_tree_generation(
 
     perf.mark("init");
 
-
     println!("[gen_model] 进入 IndexTree 生成模式（统一管线）");
-
-
 
     if db_option.manual_db_nums.is_some() || db_option.exclude_db_nums.is_some() {
 
@@ -736,8 +671,6 @@ async fn process_index_tree_generation(
         );
 
     }
-
-
 
     let seed_roots = match &scope {
         GenerationScope::Full => {
@@ -759,23 +692,15 @@ async fn process_index_tree_generation(
         }
     };
 
-
-
     let full_start = Instant::now();
 
-
-
     perf.mark("categorize_and_inst_relate");
-
-
 
     // 1️⃣ 生成/更新 inst_relate，并获取分类后的根 refno
 
     let config = IndexTreeConfig::from_db_option_ext(db_option)
 
         .map_err(|e| anyhow::anyhow!("配置错误: {}", e))?;
-
-
 
     let (sender, receiver) = flume::bounded::<aios_core::geometry::ShapeInstancesData>(100);
 
@@ -821,8 +746,6 @@ async fn process_index_tree_generation(
     } else {
         None
     };
-
-
 
     // 初始化 Parquet 写入器（默认关闭，通过环境变量显式开启）。
     //
@@ -910,8 +833,6 @@ async fn process_index_tree_generation(
 
     let duckdb_writer_clone = duckdb_writer.clone();
 
-
-
     // model cache-only 已移除（foyer-cache-cleanup）
     let model_cache_ctx: Option<()> = None;
     #[allow(unused_variables)]
@@ -929,8 +850,6 @@ async fn process_index_tree_generation(
         Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let touched_refnos_for_insert = touched_refnos.clone();
 
-
-
     // 当 manual_db_nums 只有一个值时，直接使用该 dbnum，无需从 refno 反推
 
     let known_dbnum: Option<u32> = db_option.inner.manual_db_nums.as_ref()
@@ -939,8 +858,6 @@ async fn process_index_tree_generation(
 
         .and_then(|nums| nums.first().copied());
 
-
-
     let sql_writer_clone = sql_file_writer.clone();
 
     let insert_handle = tokio::spawn(async move {
@@ -948,8 +865,6 @@ async fn process_index_tree_generation(
         #[cfg(feature = "profile")]
 
         let sink_span = tracing::info_span!("instance_sink");
-
-
 
         let mut batch_cnt: u64 = 0;
 
@@ -1095,8 +1010,6 @@ async fn process_index_tree_generation(
             }
         }
 
-
-
         println!(
             "[insert_handle] 汇总: batch_cnt={}, t_save_db={}ms, t_cache={}ms, t_parquet={}ms",
             batch_cnt,
@@ -1135,8 +1048,6 @@ async fn process_index_tree_generation(
 
     });
 
-
-
     let categorized = gen_index_tree_geos_optimized(
         Arc::new(db_option.clone()),
         &config,
@@ -1147,8 +1058,6 @@ async fn process_index_tree_generation(
         .await
 
         .map_err(|e| anyhow::anyhow!("IndexTree 生成失败: {}", e))?;
-
-
 
     // 🔥 显式 drop sender，让 receiver 的循环能够正常结束
     // 否则 insert_handle.await 会永久阻塞
@@ -1179,8 +1088,6 @@ async fn process_index_tree_generation(
 
     }
 
-
-
     println!(
 
         "[gen_model] IndexTree 模式 insts 入库完成，用时 {} ms",
@@ -1189,11 +1096,7 @@ async fn process_index_tree_generation(
 
     );
 
-
-
     perf.mark("mesh_generation");
-
-
 
     // 2️⃣ 可选执行 mesh 生成（已通过 mesh_handle 并行处理，此处等待完成）
 
@@ -1247,11 +1150,7 @@ async fn process_index_tree_generation(
             }
         }
 
-
-
         perf.mark("aabb_write");
-
-
 
         // 3️⃣ 写入 inst_relate_aabb 并导出 Parquet（供房间计算使用）
 
@@ -1323,11 +1222,7 @@ async fn process_index_tree_generation(
 
         }
 
-
-
         perf.mark("boolean_operation");
-
-
 
         // 3.5️⃣ 补建跨阶段缺失的 neg_relate（LOOP 阶段发现负实体但 PRIM 阶段才创建 geo_relate）
         if use_surrealdb && !defer_db_write {
@@ -1425,8 +1320,6 @@ async fn process_index_tree_generation(
                 }
             }
 
-
-
             println!(
 
                 "[gen_model] IndexTree 模式布尔运算完成，用时 {} ms",
@@ -1451,11 +1344,7 @@ async fn process_index_tree_generation(
             );
         }
 
-
-
         perf.mark("web_bundle_export");
-
-
 
         // 5️⃣ 生成 Web Bundle (GLB + JSON 数据包)
 
@@ -1465,15 +1354,11 @@ async fn process_index_tree_generation(
 
             println!("[gen_model] 开始生成 Web Bundle (GLB + JSON 数据包)...");
 
-
-
         let mesh_dir = Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes"));
 
         // 输出到与 meshes 同级的 web_bundle 目录
 
         let output_dir = mesh_dir.parent().unwrap_or(mesh_dir).join("web_bundle");
-
-
 
         if let Err(e) = export_prepack_lod_for_refnos(
 
@@ -1525,11 +1410,7 @@ async fn process_index_tree_generation(
 
     }
 
-
-
     perf.mark("sqlite_spatial_index");
-
-
 
     println!(
 
@@ -1547,8 +1428,6 @@ async fn process_index_tree_generation(
 
     );
 
-
-
     // 4️⃣ 生成 SQLite 空间索引（从 model cache 批量落库）
 
     let touched_dbnums_vec: Vec<u32> = touched_dbnums
@@ -1565,11 +1444,7 @@ async fn process_index_tree_generation(
 
     }
 
-
-
     perf.mark("instances_export");
-
-
 
     // ✅ 模型生成完毕后导出 instances.json（按 dbno）
 
@@ -1630,21 +1505,13 @@ async fn process_index_tree_generation(
 
     }
 
-
-
     // model_cache close 已移除（foyer-cache-cleanup）
 
-
-
     perf.end_current();
-
-
 
     // 输出性能摘要到控制台
 
     perf.print_summary();
-
-
 
     // 保存性能报告为 JSON 和 CSV
 
@@ -1666,8 +1533,6 @@ async fn process_index_tree_generation(
 
         .join("profile");
 
-
-
     // 收集配置元数据
 
     let dbnum_tag = db_option.inner.manual_db_nums.as_ref()
@@ -1678,11 +1543,7 @@ async fn process_index_tree_generation(
 
         .unwrap_or_else(|| "all".to_string());
 
-
-
     let enabled_nouns = db_option.index_tree_enabled_target_types.clone();
-
-
 
     let metadata = serde_json::json!({
 
@@ -1708,13 +1569,9 @@ async fn process_index_tree_generation(
 
     });
 
-
-
     let json_path = profile_dir.join(format!("perf_gen_model_index_tree_dbnum_{}_{}.json", dbnum_tag, timestamp));
 
     let csv_path = profile_dir.join(format!("perf_gen_model_index_tree_dbnum_{}_{}.csv", dbnum_tag, timestamp));
-
-
 
     if let Err(e) = perf.save_json(&json_path, metadata.clone()) {
 
@@ -1738,8 +1595,6 @@ async fn process_index_tree_generation(
 
 }
 
-
-
 // ============================================================================
 
 // SQLite 空间索引：从 model cache 生成/增量更新 output/spatial_index.sqlite
@@ -1749,8 +1604,6 @@ async fn process_index_tree_generation(
 // 目标：模型生成（写 cache）后，将 AABB 批量落库到 SQLite RTree，供房间计算等流程做粗筛。
 
 // ============================================================================
-
-
 
 #[cfg(feature = "sqlite-index")]
 
@@ -1763,8 +1616,6 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
     use std::fs;
 
     use std::path::PathBuf;
-
-
 
     if dbnums.is_empty() {
 
@@ -1798,8 +1649,6 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
 
     }
 
-
-
     // 打开/初始化索引（幂等）
 
     let idx_path = SqliteSpatialIndex::default_path();
@@ -1814,15 +1663,11 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
 
     idx.init_schema().map_err(|e| anyhow::anyhow!(e))?;
 
-
-
     // 为避免 aabb.json/trans.json（固定文件名）互相覆盖，每个 dbnum 独立输出目录。
 
     let base_out = db_option.get_project_output_dir().join("instances_cache_for_index");
 
     fs::create_dir_all(&base_out).map_err(|e| anyhow::anyhow!(e))?;
-
-
 
     // mesh_lod_tag 仅用于导出侧选择 mesh（用于补齐/计算 AABB）
 
@@ -1832,23 +1677,17 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
 
     let mesh_lod_tag = format!("{:?}", db_option.inner.mesh_precision.default_lod);
 
-
-
     // 去重并保证顺序稳定（便于日志与排查）
 
     let mut uniq: BTreeSet<u32> = BTreeSet::new();
 
     uniq.extend(dbnums.iter().copied());
 
-
-
     for dbnum in uniq {
 
         let out_dir = base_out.join(format!("{}", dbnum));
 
         fs::create_dir_all(&out_dir).map_err(|e| anyhow::anyhow!(e))?;
-
-
 
         // 1) cache -> instances_{dbnum}.json + aabb.json + trans.json
 
@@ -1874,8 +1713,6 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
 
         .await?;
 
-
-
         // 2) instances_{dbnum}.json -> spatial_index.sqlite (RTree)
 
         let instances_path = out_dir.join(format!("instances_{}.json", dbnum));
@@ -1888,13 +1725,9 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
 
     }
 
-
-
     Ok(())
 
 }
-
-
 
 #[cfg(not(feature = "sqlite-index"))]
 
@@ -1903,8 +1736,6 @@ async fn update_sqlite_spatial_index_from_cache(_db_option: &DbOptionExt, _dbnum
     Ok(())
 
 }
-
-
 
 /// 初始化空间索引（如果启用）
 
@@ -1925,8 +1756,6 @@ fn initialize_spatial_index() {
     // }
 
 }
-
-
 
 #[cfg(not(feature = "duckdb-feature"))]
 
@@ -1972,6 +1801,4 @@ mod tests {
         );
     }
 }
-
-
 

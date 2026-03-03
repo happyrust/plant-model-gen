@@ -326,7 +326,7 @@ pub async fn collect_export_refnos(
     db_meta().ensure_loaded()?;
 
     // 强制关闭 “缺失则自动从 SurrealDB 生成 tree 文件” 的全局开关，保证导出语义确定。
-    disable_auto_generate_tree();
+    // disable_auto_generate_tree 已移除
 
     let tree_dir = TreeIndexManager::with_default_dir(Vec::new())
         .tree_dir()

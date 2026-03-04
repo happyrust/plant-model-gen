@@ -31,6 +31,12 @@ pub struct CreateTaskRequest {
     #[serde(default)]
     pub description: String,
     pub model_name: String,
+    /// 校核人 ID（三段审批第二段，jd 节点负责人）
+    pub checker_id: Option<String>,
+    /// 审核人 ID（三段审批第三段，sh 节点负责人）
+    pub approver_id: Option<String>,
+    /// 兼容旧字段：语义等同 checker_id
+    #[serde(default)]
     pub reviewer_id: String,
     /// 外部传入的 form_id（若不传则后端生成）
     pub form_id: Option<String>,
@@ -149,7 +155,20 @@ pub struct ReviewTask {
     pub priority: String,
     pub requester_id: String,
     pub requester_name: String,
+    /// 校核人 ID（jd 节点负责人）
+    #[serde(default)]
+    pub checker_id: String,
+    #[serde(default)]
+    pub checker_name: String,
+    /// 审核人 ID（sh 节点负责人）
+    #[serde(default)]
+    pub approver_id: String,
+    #[serde(default)]
+    pub approver_name: String,
+    /// 兼容旧字段（语义等同 checker_id）
+    #[serde(default)]
     pub reviewer_id: String,
+    #[serde(default)]
     pub reviewer_name: String,
     #[serde(default)]
     pub components: Vec<ReviewComponent>,
@@ -158,12 +177,11 @@ pub struct ReviewTask {
     pub created_at: i64,
     pub updated_at: i64,
     pub due_date: Option<i64>,
-    // 多级审批流程字段
     #[serde(default = "default_current_node")]
-    pub current_node: String,                    // 当前节点: sj/jd/sh/pz
+    pub current_node: String,
     #[serde(default)]
-    pub workflow_history: Vec<WorkflowStep>,     // 流程历史
-    pub return_reason: Option<String>,           // 驳回原因
+    pub workflow_history: Vec<WorkflowStep>,
+    pub return_reason: Option<String>,
 }
 
 fn default_current_node() -> String {
@@ -210,6 +228,8 @@ pub struct TaskListQuery {
     pub status: Option<String>,
     pub priority: Option<String>,
     pub requester_id: Option<String>,
+    pub checker_id: Option<String>,
+    pub approver_id: Option<String>,
     pub reviewer_id: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
@@ -230,6 +250,10 @@ struct TaskRow {
     priority: Option<String>,
     requester_id: Option<String>,
     requester_name: Option<String>,
+    checker_id: Option<String>,
+    checker_name: Option<String>,
+    approver_id: Option<String>,
+    approver_name: Option<String>,
     reviewer_id: Option<String>,
     reviewer_name: Option<String>,
     components: Option<Vec<ReviewComponent>>,
@@ -238,7 +262,6 @@ struct TaskRow {
     created_at: Option<surrealdb::types::Datetime>,
     updated_at: Option<surrealdb::types::Datetime>,
     due_date: Option<surrealdb::types::Datetime>,
-    // 多级审批流程字段
     current_node: Option<String>,
     workflow_history: Option<Vec<WorkflowStep>>,
     return_reason: Option<String>,
@@ -246,11 +269,16 @@ struct TaskRow {
 
 impl TaskRow {
     fn to_review_task(self) -> ReviewTask {
-        // 从 RecordIdKey 提取实际的字符串 ID
         let id = match &self.id.key {
             surrealdb::types::RecordIdKey::String(s) => s.clone(),
             other => format!("{:?}", other),
         };
+        let checker_id = self.checker_id.clone().filter(|s| !s.is_empty())
+            .or_else(|| self.reviewer_id.clone())
+            .unwrap_or_default();
+        let checker_name = self.checker_name.clone().filter(|s| !s.is_empty())
+            .or_else(|| self.reviewer_name.clone())
+            .unwrap_or_default();
         ReviewTask {
             id,
             form_id: self.form_id.unwrap_or_default(),
@@ -261,15 +289,18 @@ impl TaskRow {
             priority: self.priority.unwrap_or_else(default_priority),
             requester_id: self.requester_id.unwrap_or_default(),
             requester_name: self.requester_name.unwrap_or_default(),
-            reviewer_id: self.reviewer_id.unwrap_or_default(),
-            reviewer_name: self.reviewer_name.unwrap_or_default(),
+            checker_id: checker_id.clone(),
+            checker_name: checker_name.clone(),
+            approver_id: self.approver_id.unwrap_or_default(),
+            approver_name: self.approver_name.unwrap_or_default(),
+            reviewer_id: self.reviewer_id.unwrap_or_else(|| checker_id),
+            reviewer_name: self.reviewer_name.unwrap_or_else(|| checker_name),
             components: self.components.unwrap_or_default(),
             attachments: self.attachments,
             review_comment: self.review_comment,
             created_at: datetime_to_millis(&self.created_at),
             updated_at: datetime_to_millis(&self.updated_at),
             due_date: self.due_date.map(|dt| datetime_to_millis(&Some(dt))),
-            // 多级审批流程字段
             current_node: self.current_node.unwrap_or_else(default_current_node),
             workflow_history: self.workflow_history.unwrap_or_default(),
             return_reason: self.return_reason,
@@ -354,9 +385,11 @@ async fn create_task(
     
     let requester_id = claims.user_id.clone();
     let requester_name = claims.user_id.clone();
-    
-    // 获取审核人名称（后续从用户表查询）
-    let reviewer_name = "审核人";
+
+    let checker_id = request.checker_id.clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| request.reviewer_id.clone());
+    let approver_id = request.approver_id.clone().unwrap_or_default();
 
     let form_id = request
         .form_id
@@ -377,6 +410,10 @@ async fn create_task(
             priority = $priority,
             requester_id = $requester_id,
             requester_name = $requester_name,
+            checker_id = $checker_id,
+            checker_name = $checker_name,
+            approver_id = $approver_id,
+            approver_name = $approver_name,
             reviewer_id = $reviewer_id,
             reviewer_name = $reviewer_name,
             components = $components,
@@ -398,8 +435,12 @@ async fn create_task(
         .bind(("priority", request.priority.clone()))
         .bind(("requester_id", requester_id.clone()))
         .bind(("requester_name", requester_name.clone()))
+        .bind(("checker_id", checker_id.clone()))
+        .bind(("checker_name", checker_id.clone()))
+        .bind(("approver_id", approver_id.clone()))
+        .bind(("approver_name", approver_id.clone()))
         .bind(("reviewer_id", request.reviewer_id.clone()))
-        .bind(("reviewer_name", reviewer_name))
+        .bind(("reviewer_name", checker_id.clone()))
         .bind(("components", request.components.clone()))
         .bind(("attachments", request.attachments.clone()))
         .bind(("due_date", request.due_date.map(|d| chrono::DateTime::from_timestamp_millis(d).map(|dt| dt.to_rfc3339())).flatten()))
@@ -410,9 +451,10 @@ async fn create_task(
             // CREATE 成功，无需解析响应（避免 datetime 反序列化问题）
             info!("Created task: {}", task_id);
 
-            // 将任务关联的模型 refno 写入 review_form_model（用于 workflow/sync 汇总）
+            let mut seen_refnos = HashSet::new();
             for comp in &request.components {
-                if comp.ref_no.trim().is_empty() {
+                let refno = comp.ref_no.trim();
+                if refno.is_empty() || !seen_refnos.insert(refno.to_string()) {
                     continue;
                 }
                 let _ = project_primary_db()
@@ -425,7 +467,7 @@ async fn create_task(
                         "#,
                     )
                     .bind(("form_id", form_id.clone()))
-                    .bind(("model_refno", comp.ref_no.clone()))
+                    .bind(("model_refno", refno.to_string()))
                     .await;
             }
 
@@ -439,8 +481,12 @@ async fn create_task(
                 priority: request.priority,
                 requester_id,
                 requester_name,
+                checker_id: checker_id.clone(),
+                checker_name: checker_id.clone(),
+                approver_id: approver_id.clone(),
+                approver_name: approver_id.clone(),
                 reviewer_id: request.reviewer_id,
-                reviewer_name: reviewer_name.to_string(),
+                reviewer_name: checker_id.clone(),
                 components: request.components,
                 attachments: request.attachments,
                 review_comment: None,
@@ -493,8 +539,16 @@ async fn list_tasks(
         conditions.push("requester_id = $requester_id");
         bindings.push(("requester_id", requester_id.clone()));
     }
+    if let Some(ref checker_id) = query.checker_id {
+        conditions.push("(checker_id = $checker_id OR reviewer_id = $checker_id)");
+        bindings.push(("checker_id", checker_id.clone()));
+    }
+    if let Some(ref approver_id) = query.approver_id {
+        conditions.push("approver_id = $approver_id");
+        bindings.push(("approver_id", approver_id.clone()));
+    }
     if let Some(ref reviewer_id) = query.reviewer_id {
-        conditions.push("reviewer_id = $reviewer_id");
+        conditions.push("(reviewer_id = $reviewer_id OR checker_id = $reviewer_id)");
         bindings.push(("reviewer_id", reviewer_id.clone()));
     }
     
@@ -506,23 +560,32 @@ async fn list_tasks(
     
     let limit = query.limit.unwrap_or(100);
     let offset = query.offset.unwrap_or(0);
-    
-    let sql = format!(
+
+    let count_sql = format!(
+        "SELECT count() AS total FROM review_tasks {} GROUP ALL",
+        where_clause
+    );
+    let data_sql = format!(
         "SELECT * FROM review_tasks {} ORDER BY created_at DESC LIMIT {} START {}",
         where_clause, limit, offset
     );
-    
-    let mut q = project_primary_db().query(&sql);
+
+    let combined = format!("{};\n{};", count_sql, data_sql);
+    let mut q = project_primary_db().query(&combined);
     for (name, value) in &bindings {
         q = q.bind((*name, value.clone()));
     }
-    
+
     match q.await {
         Ok(mut response) => {
-            let rows: Vec<TaskRow> = response.take(0).unwrap_or_default();
+            #[derive(Debug, serde::Deserialize, SurrealValue)]
+            struct CountRow { total: i64 }
+            let count_rows: Vec<CountRow> = response.take(0).unwrap_or_default();
+            let total = count_rows.first().map(|r| r.total).unwrap_or(0);
+
+            let rows: Vec<TaskRow> = response.take(1).unwrap_or_default();
             let tasks: Vec<ReviewTask> = rows.into_iter().map(|r| r.to_review_task()).collect();
-            let total = tasks.len() as i64;
-            
+
             (StatusCode::OK, Json(TaskListResponse {
                 success: true,
                 tasks,
@@ -648,16 +711,22 @@ async fn delete_task(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     info!("Deleting task: {}", id);
-    
-    let sql = "DELETE [type::record('review_tasks', $id)]";
-    
-    match project_primary_db().query(sql).bind(("id", id.clone())).await {
+
+    let cascade_sql = r#"
+        DELETE FROM review_records WHERE task_id = $id;
+        DELETE FROM review_workflow_history WHERE task_id = $id;
+        DELETE FROM review_history WHERE task_id = $id;
+        DELETE FROM review_form_model WHERE form_id IN
+            (SELECT VALUE form_id FROM review_tasks WHERE record::id(id) = $id);
+        DELETE [type::record('review_tasks', $id)];
+    "#;
+
+    match project_primary_db().query(cascade_sql).bind(("id", id.clone())).await {
         Ok(_) => {
-            // 异步通知外部系统
             notify_workflow_delete_async(id.clone(), "system".to_string());
             (StatusCode::OK, Json(ActionResponse {
                 success: true,
-                message: Some("任务已删除".to_string()),
+                message: Some("任务及关联数据已删除".to_string()),
                 error_message: None,
             }))
         }
@@ -676,27 +745,27 @@ async fn delete_task(
 // Handlers - 审核操作
 // ============================================================================
 
-/// POST /api/review/tasks/:id/start-review - 开始审核
+/// POST /api/review/tasks/:id/start-review - 开始审核（兼容旧 API，映射到 jd 节点）
 async fn start_review(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    update_task_status(id, "in_review".to_string(), None).await
+    update_task_status(id, "in_review".to_string(), Some("jd".to_string()), None).await
 }
 
-/// POST /api/review/tasks/:id/approve - 通过审核
+/// POST /api/review/tasks/:id/approve - 通过审核（兼容旧 API，映射到 approved + pz 节点）
 async fn approve_task(
     Path(id): Path<String>,
     Json(request): Json<ReviewActionRequest>,
 ) -> impl IntoResponse {
-    update_task_status(id, "approved".to_string(), request.comment).await
+    update_task_status(id, "approved".to_string(), Some("pz".to_string()), request.comment).await
 }
 
-/// POST /api/review/tasks/:id/reject - 驳回审核
+/// POST /api/review/tasks/:id/reject - 驳回审核（兼容旧 API，驳回到 sj 节点）
 async fn reject_task(
     Path(id): Path<String>,
     Json(request): Json<ReviewActionRequest>,
 ) -> impl IntoResponse {
-    update_task_status(id, "rejected".to_string(), request.comment).await
+    update_task_status(id, "rejected".to_string(), Some("sj".to_string()), request.comment).await
 }
 
 /// POST /api/review/tasks/:id/cancel - 取消任务
@@ -704,29 +773,45 @@ async fn cancel_task(
     Path(id): Path<String>,
     Json(request): Json<ReviewActionRequest>,
 ) -> impl IntoResponse {
-    update_task_status(id, "cancelled".to_string(), request.reason).await
+    update_task_status(id, "cancelled".to_string(), None, request.reason).await
 }
 
-async fn update_task_status(id: String, status: String, comment: Option<String>) -> (StatusCode, Json<ActionResponse>) {
-    info!("Updating task {} status to {}", id, status);
+async fn update_task_status(
+    id: String,
+    status: String,
+    target_node: Option<String>,
+    comment: Option<String>,
+) -> (StatusCode, Json<ActionResponse>) {
+    info!("Updating task {} status to {}, node to {:?}", id, status, target_node);
     
-    let sql = if comment.is_some() {
-        "UPDATE review_tasks SET status = $status, review_comment = $comment, updated_at = time::now() WHERE record::id(id) = $id"
-    } else {
-        "UPDATE review_tasks SET status = $status, updated_at = time::now() WHERE record::id(id) = $id"
+    let sql = match (&target_node, &comment) {
+        (Some(_), Some(_)) => {
+            "UPDATE review_tasks SET status = $status, current_node = $node, review_comment = $comment, updated_at = time::now() WHERE record::id(id) = $id"
+        }
+        (Some(_), None) => {
+            "UPDATE review_tasks SET status = $status, current_node = $node, updated_at = time::now() WHERE record::id(id) = $id"
+        }
+        (None, Some(_)) => {
+            "UPDATE review_tasks SET status = $status, review_comment = $comment, updated_at = time::now() WHERE record::id(id) = $id"
+        }
+        (None, None) => {
+            "UPDATE review_tasks SET status = $status, updated_at = time::now() WHERE record::id(id) = $id"
+        }
     };
     
     let mut q = project_primary_db().query(sql)
         .bind(("id", id.clone()))
         .bind(("status", status.clone()));
     
+    if let Some(ref node) = target_node {
+        q = q.bind(("node", node.clone()));
+    }
     if let Some(ref c) = comment {
         q = q.bind(("comment", c.clone()));
     }
     
     match q.await {
         Ok(_) => {
-            // 记录历史
             let history_sql = r#"
                 CREATE review_history CONTENT {
                     task_id: $task_id,
@@ -1450,20 +1535,21 @@ fn can_return_to(current: &str, target: &str) -> bool {
 
 /// POST /api/review/tasks/:id/submit - 提交到下一节点
 async fn submit_to_next_node(
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<String>,
     Json(request): Json<SubmitToNextRequest>,
 ) -> impl IntoResponse {
-    info!("Submitting task {} to next node", id);
+    info!("Submitting task {} to next node, operator={}", id, claims.user_id);
 
     // 1. 获取当前任务
     let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id LIMIT 1";
     let task_result = project_primary_db().query(get_sql).bind(("id", id.clone())).await;
 
-    let current_node = match task_result {
+    let task_row = match task_result {
         Ok(mut resp) => {
             let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
             match rows.into_iter().next() {
-                Some(row) => row.current_node.unwrap_or_else(|| "sj".to_string()),
+                Some(row) => row,
                 None => {
                     return (StatusCode::NOT_FOUND, Json(ActionResponse {
                         success: false,
@@ -1482,26 +1568,65 @@ async fn submit_to_next_node(
         }
     };
 
-    // 2. 获取下一节点
-    let next_node = match get_next_node(&current_node) {
-        Some(n) => n,
-        None => {
-            return (StatusCode::BAD_REQUEST, Json(ActionResponse {
-                success: false,
-                message: None,
-                error_message: Some("当前已是最后节点，无法继续提交".to_string()),
-            }));
+    let current_node = task_row.current_node.clone().unwrap_or_else(|| "sj".to_string());
+
+    // 1.1 权限校验：检查当前用户是否为本节点负责人
+    let operator_user = &claims.user_id;
+    let has_permission = match current_node.as_str() {
+        "sj" => task_row.requester_id.as_deref() == Some(operator_user),
+        "jd" => {
+            task_row.checker_id.as_deref() == Some(operator_user)
+                || task_row.reviewer_id.as_deref() == Some(operator_user)
+        }
+        "sh" => task_row.approver_id.as_deref() == Some(operator_user),
+        "pz" => task_row.approver_id.as_deref() == Some(operator_user),
+        _ => false,
+    };
+
+    if !has_permission {
+        return (StatusCode::FORBIDDEN, Json(ActionResponse {
+            success: false,
+            message: None,
+            error_message: Some(format!(
+                "权限不足：用户 {} 不是「{}」节点的负责人",
+                operator_user, get_node_display_name(&current_node)
+            )),
+        }));
+    }
+
+    // 2. 操作人信息
+    let op_id = if claims.user_id.is_empty() {
+        request.operator_id.as_deref().filter(|s| !s.is_empty()).unwrap_or("system")
+    } else {
+        &claims.user_id
+    };
+    let op_name = request.operator_name.as_deref().filter(|s| !s.is_empty()).unwrap_or(op_id);
+
+    // 3. 判断是否为最终节点批准，还是向下流转
+    let (next_node_str, next_status, action_label) = if current_node == "pz" {
+        // pz 是最终节点：批准完成
+        ("pz".to_string(), "approved", "approve")
+    } else {
+        match get_next_node(&current_node) {
+            Some(n) => {
+                let status = match n {
+                    "jd" => "submitted",
+                    "sh" | "pz" => "in_review",
+                    _ => "submitted",
+                };
+                (n.to_string(), status, "submit")
+            }
+            None => {
+                return (StatusCode::BAD_REQUEST, Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some("当前已是最后节点，无法继续提交".to_string()),
+                }));
+            }
         }
     };
 
-    // 2.1 规范化状态：从 sj 提交到 jd -> submitted，其余进入 in_review
-    let next_status = match next_node {
-        "jd" => "submitted",
-        "sh" | "pz" => "in_review",
-        _ => "submitted",
-    };
-
-    // 3. 更新任务节点
+    // 4. 更新任务节点和状态
     let update_sql = r#"
         UPDATE review_tasks SET
             current_node = $next_node,
@@ -1513,7 +1638,7 @@ async fn submit_to_next_node(
 
     if let Err(e) = project_primary_db().query(update_sql)
         .bind(("id", id.clone()))
-        .bind(("next_node", next_node))
+        .bind(("next_node", next_node_str.clone()))
         .bind(("status", next_status))
         .await
     {
@@ -1524,14 +1649,12 @@ async fn submit_to_next_node(
         }));
     }
 
-    // 4. 记录工作流历史
-    let op_id = request.operator_id.as_deref().filter(|s| !s.is_empty()).unwrap_or("system");
-    let op_name = request.operator_name.as_deref().filter(|s| !s.is_empty()).unwrap_or("系统用户");
+    // 5. 记录工作流历史
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,
             node: $from_node,
-            action: 'submit',
+            action: $action,
             operator_id: $operator_id,
             operator_name: $operator_name,
             comment: $comment,
@@ -1542,45 +1665,55 @@ async fn submit_to_next_node(
     let _ = project_primary_db().query(history_sql)
         .bind(("task_id", id.clone()))
         .bind(("from_node", current_node.clone()))
+        .bind(("action", action_label.to_string()))
         .bind(("operator_id", op_id.to_string()))
         .bind(("operator_name", op_name.to_string()))
         .bind(("comment", request.comment))
         .await;
 
     let from_name = get_node_display_name(&current_node);
-    let to_name = get_node_display_name(next_node);
 
-    // 5. 异步通知外部系统
+    // 6. 异步通知外部系统
     notify_workflow_sync_async(
         id.clone(),
-        "submit".to_string(),
+        action_label.to_string(),
         op_id.to_string(),
         None,
     );
 
-    (StatusCode::OK, Json(ActionResponse {
-        success: true,
-        message: Some(format!("已从「{}」提交到「{}」", from_name, to_name)),
-        error_message: None,
-    }))
+    if current_node == "pz" {
+        (StatusCode::OK, Json(ActionResponse {
+            success: true,
+            message: Some(format!("「{}」已批准，审批流程完成", from_name)),
+            error_message: None,
+        }))
+    } else {
+        let to_name = get_node_display_name(&next_node_str);
+        (StatusCode::OK, Json(ActionResponse {
+            success: true,
+            message: Some(format!("已从「{}」提交到「{}」", from_name, to_name)),
+            error_message: None,
+        }))
+    }
 }
 
 /// POST /api/review/tasks/:id/return - 驳回到指定节点
 async fn return_to_node(
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<String>,
     Json(request): Json<ReturnRequest>,
 ) -> impl IntoResponse {
-    info!("Returning task {} to node {}", id, request.target_node);
+    info!("Returning task {} to node {}, operator={}", id, request.target_node, claims.user_id);
 
     // 1. 获取当前任务
     let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id LIMIT 1";
     let task_result = project_primary_db().query(get_sql).bind(("id", id.clone())).await;
 
-    let current_node = match task_result {
+    let task_row = match task_result {
         Ok(mut resp) => {
             let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
             match rows.into_iter().next() {
-                Some(row) => row.current_node.unwrap_or_else(|| "sj".to_string()),
+                Some(row) => row,
                 None => {
                     return (StatusCode::NOT_FOUND, Json(ActionResponse {
                         success: false,
@@ -1598,6 +1731,30 @@ async fn return_to_node(
             }));
         }
     };
+
+    let current_node = task_row.current_node.clone().unwrap_or_else(|| "sj".to_string());
+
+    // 1.1 权限校验
+    let operator_user = &claims.user_id;
+    let has_permission = match current_node.as_str() {
+        "jd" => {
+            task_row.checker_id.as_deref() == Some(operator_user)
+                || task_row.reviewer_id.as_deref() == Some(operator_user)
+        }
+        "sh" | "pz" => task_row.approver_id.as_deref() == Some(operator_user),
+        _ => false,
+    };
+
+    if !has_permission {
+        return (StatusCode::FORBIDDEN, Json(ActionResponse {
+            success: false,
+            message: None,
+            error_message: Some(format!(
+                "权限不足：用户 {} 不是「{}」节点的负责人",
+                operator_user, get_node_display_name(&current_node)
+            )),
+        }));
+    }
 
     // 2. 验证目标节点
     if !can_return_to(&current_node, &request.target_node) {
@@ -1642,8 +1799,12 @@ async fn return_to_node(
     }
 
     // 4. 记录工作流历史
-    let op_id = request.operator_id.as_deref().filter(|s| !s.is_empty()).unwrap_or("system");
-    let op_name = request.operator_name.as_deref().filter(|s| !s.is_empty()).unwrap_or("系统用户");
+    let op_id = if claims.user_id.is_empty() {
+        request.operator_id.as_deref().filter(|s| !s.is_empty()).unwrap_or("system")
+    } else {
+        &claims.user_id
+    };
+    let op_name = request.operator_name.as_deref().filter(|s| !s.is_empty()).unwrap_or(op_id);
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,
@@ -2148,23 +2309,22 @@ async fn export_review_data(
 ) -> impl IntoResponse {
     info!("Exporting review data");
 
-    // 构建查询条件
-    let sql = if let Some(ref ids) = request.task_ids {
+    let (sql, use_ids_param) = if let Some(ref ids) = request.task_ids {
         if ids.is_empty() {
-            "SELECT * FROM review_tasks ORDER BY created_at DESC LIMIT 100".to_string()
+            ("SELECT * FROM review_tasks ORDER BY created_at DESC LIMIT 100".to_string(), false)
         } else {
-            let id_list: Vec<String> = ids.iter().map(|id| format!("'{}'", id)).collect();
-            format!(
-                "SELECT * FROM review_tasks WHERE record::id(id) IN [{}]",
-                id_list.join(", ")
-            )
+            ("SELECT * FROM review_tasks WHERE record::id(id) IN $task_ids".to_string(), true)
         }
     } else {
-        "SELECT * FROM review_tasks ORDER BY created_at DESC LIMIT 100".to_string()
+        ("SELECT * FROM review_tasks ORDER BY created_at DESC LIMIT 100".to_string(), false)
     };
 
-    // 查询任务
-    let tasks: Vec<ReviewTask> = match project_primary_db().query(&sql).await {
+    let mut q = project_primary_db().query(&sql);
+    if use_ids_param {
+        q = q.bind(("task_ids", request.task_ids.clone().unwrap_or_default()));
+    }
+
+    let tasks: Vec<ReviewTask> = match q.await {
         Ok(mut resp) => {
             let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
             rows.into_iter().map(|r| r.to_review_task()).collect()
@@ -2408,4 +2568,160 @@ async fn import_review_data(
         skipped_count: skipped,
         error_message: None,
     }))
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_next_node() {
+        assert_eq!(get_next_node("sj"), Some("jd"));
+        assert_eq!(get_next_node("jd"), Some("sh"));
+        assert_eq!(get_next_node("sh"), Some("pz"));
+        assert_eq!(get_next_node("pz"), None);
+        assert_eq!(get_next_node("unknown"), None);
+        assert_eq!(get_next_node(""), None);
+    }
+
+    #[test]
+    fn test_can_return_to() {
+        assert!(can_return_to("jd", "sj"));
+        assert!(can_return_to("sh", "sj"));
+        assert!(can_return_to("sh", "jd"));
+        assert!(can_return_to("pz", "sj"));
+        assert!(can_return_to("pz", "jd"));
+        assert!(can_return_to("pz", "sh"));
+
+        assert!(!can_return_to("sj", "jd"));
+        assert!(!can_return_to("sj", "sj"));
+        assert!(!can_return_to("jd", "sh"));
+        assert!(!can_return_to("jd", "jd"));
+        assert!(!can_return_to("unknown", "sj"));
+        assert!(!can_return_to("sj", "unknown"));
+    }
+
+    #[test]
+    fn test_get_node_display_name() {
+        assert_eq!(get_node_display_name("sj"), "编制");
+        assert_eq!(get_node_display_name("jd"), "校对");
+        assert_eq!(get_node_display_name("sh"), "审核");
+        assert_eq!(get_node_display_name("pz"), "批准");
+        assert_eq!(get_node_display_name("invalid"), "未知");
+    }
+
+    #[test]
+    fn test_workflow_nodes_order() {
+        assert_eq!(WORKFLOW_NODES, ["sj", "jd", "sh", "pz"]);
+        assert_eq!(WORKFLOW_NODES.len(), 4);
+    }
+
+    #[test]
+    fn test_default_values() {
+        assert_eq!(default_priority(), "medium");
+        assert_eq!(default_status(), "draft");
+        assert_eq!(default_current_node(), "sj");
+    }
+
+    #[test]
+    fn test_task_row_to_review_task_compat() {
+        let row = TaskRow {
+            id: surrealdb::types::RecordId {
+                table: "review_tasks".to_string().into(),
+                key: surrealdb::types::RecordIdKey::String("task-123".to_string()),
+            },
+            form_id: Some("form-456".to_string()),
+            title: Some("Test Task".to_string()),
+            description: None,
+            model_name: Some("Model A".to_string()),
+            status: Some("draft".to_string()),
+            priority: Some("high".to_string()),
+            requester_id: Some("user-1".to_string()),
+            requester_name: Some("张三".to_string()),
+            checker_id: None,
+            checker_name: None,
+            approver_id: Some("user-3".to_string()),
+            approver_name: Some("王五".to_string()),
+            reviewer_id: Some("user-2".to_string()),
+            reviewer_name: Some("李四".to_string()),
+            components: None,
+            attachments: None,
+            review_comment: None,
+            created_at: None,
+            updated_at: None,
+            due_date: None,
+            current_node: Some("jd".to_string()),
+            workflow_history: None,
+            return_reason: None,
+        };
+
+        let task = row.to_review_task();
+
+        assert_eq!(task.id, "task-123");
+        assert_eq!(task.form_id, "form-456");
+        assert_eq!(task.title, "Test Task");
+        assert_eq!(task.model_name, "Model A");
+        assert_eq!(task.status, "draft");
+        assert_eq!(task.priority, "high");
+        assert_eq!(task.current_node, "jd");
+        // checker_id 为空时应回退到 reviewer_id
+        assert_eq!(task.checker_id, "user-2");
+        assert_eq!(task.checker_name, "李四");
+        assert_eq!(task.approver_id, "user-3");
+        assert_eq!(task.approver_name, "王五");
+        // reviewer 字段兼容
+        assert_eq!(task.reviewer_id, "user-2");
+        assert_eq!(task.reviewer_name, "李四");
+    }
+
+    #[test]
+    fn test_task_row_to_review_task_checker_preferred() {
+        let row = TaskRow {
+            id: surrealdb::types::RecordId {
+                table: "review_tasks".to_string().into(),
+                key: surrealdb::types::RecordIdKey::String("task-789".to_string()),
+            },
+            form_id: None,
+            title: Some("Task with checker".to_string()),
+            description: None,
+            model_name: None,
+            status: None,
+            priority: None,
+            requester_id: None,
+            requester_name: None,
+            checker_id: Some("checker-1".to_string()),
+            checker_name: Some("校核员".to_string()),
+            approver_id: Some("approver-1".to_string()),
+            approver_name: Some("审核员".to_string()),
+            reviewer_id: Some("old-reviewer".to_string()),
+            reviewer_name: Some("旧审核人".to_string()),
+            components: None,
+            attachments: None,
+            review_comment: None,
+            created_at: None,
+            updated_at: None,
+            due_date: None,
+            current_node: None,
+            workflow_history: None,
+            return_reason: None,
+        };
+
+        let task = row.to_review_task();
+
+        // checker_id 有值时优先使用
+        assert_eq!(task.checker_id, "checker-1");
+        assert_eq!(task.checker_name, "校核员");
+        assert_eq!(task.approver_id, "approver-1");
+        // reviewer 字段仍保留原值
+        assert_eq!(task.reviewer_id, "old-reviewer");
+        assert_eq!(task.reviewer_name, "旧审核人");
+        // 默认值回退
+        assert_eq!(task.status, "draft");
+        assert_eq!(task.priority, "medium");
+        assert_eq!(task.current_node, "sj");
+    }
 }

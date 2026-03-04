@@ -85,10 +85,12 @@ async fn query_spatial_node(
         }
     };
 
-    // 查询节点信息
+    // 查询节点信息（使用 pe_key 点查，避免全表扫描）
+    let parent_refno_enum = RefnoEnum::from(RefU64(refno));
+    let pe_key = parent_refno_enum.to_pe_key();
     let node_query = format!(
-        "SELECT refno, name, noun FROM pe WHERE refno = {} LIMIT 1",
-        refno
+        "SELECT refno, name, noun FROM {} LIMIT 1",
+        pe_key
     );
 
     match project_primary_db()
@@ -197,9 +199,11 @@ async fn get_node_info(
         }
     };
 
+    // 使用 pe_key 点查，避免全表扫描
+    let pe_key = RefnoEnum::from(RefU64(refno)).to_pe_key();
     let query = format!(
-        "SELECT refno, name, noun, owner FROM pe WHERE refno = {} LIMIT 1",
-        refno
+        "SELECT refno, name, noun, owner FROM {} LIMIT 1",
+        pe_key
     );
 
     match project_primary_db().query_take::<Vec<PeRow>>(&query, 0).await {
@@ -267,23 +271,22 @@ async fn query_children_by_type(
 ) -> anyhow::Result<Vec<SpatialNode>> {
     let parent_noun = parent_noun.trim().to_uppercase();
 
+    let parent_pe_key = RefnoEnum::from(RefU64(parent_refno)).to_pe_key();
     let query = match parent_noun.as_str() {
-        // Space -> Room (通过 room_panel_relate 关系)
+        // Space -> Room：room_panel_relate 使用 in/out（in=空间, out=面板），图遍历获取子节点
         "FRMW" | "SBFR" => {
             format!(
-                "SELECT pe.refno, pe.name, pe.noun FROM pe \
-                 WHERE pe.refno IN (SELECT refno FROM room_panel_relate WHERE owner = {}) \
-                 LIMIT 100",
-                parent_refno
+                "SELECT refno: out.refno, name: out.name, noun: out.noun \
+                 FROM {}->room_panel_relate LIMIT 100",
+                parent_pe_key
             )
         }
-        // Room -> Component (通过 room_relate 关系)
+        // Room -> Component：room_relate 使用 in/out（in=面板, out=构件），图遍历获取子节点
         "PANE" => {
             format!(
-                "SELECT pe.refno, pe.name, pe.noun FROM pe \
-                 WHERE pe.refno IN (SELECT refno FROM room_relate WHERE owner = {}) \
-                 LIMIT 100",
-                parent_refno
+                "SELECT refno: out.refno, name: out.name, noun: out.noun \
+                 FROM {}->room_relate LIMIT 100",
+                parent_pe_key
             )
         }
         // 其他类型 -> 直接子节点：pe_owner 层级关系改走 TreeIndex。

@@ -14,7 +14,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 
 use aios_core::options::DbOption;
@@ -507,12 +506,6 @@ struct AabbQueryRow {
     d: Option<aios_core::types::PlantAabb>,
 }
 
-/// 诊断用：count() GROUP ALL 的返回行（plant-surrealdb 技能：用 SurrealValue 强类型）
-#[derive(Debug, Deserialize, SurrealValue)]
-struct CountRow {
-    cnt: u64,
-}
-
 // =============================================================================
 // SurrealDB 查询函数
 // =============================================================================
@@ -864,8 +857,6 @@ pub async fn export_dbnum_instances_parquet(
         println!("🚀 开始导出 dbnum={} 的实例数据为 Parquet，目标单位: {:?}", dbnum, target);
     }
 
-    const TRACE_REFNO: &str = "24381_145019"; // 诊断用：逐阶段追踪
-
     // 确保输出目录存在
     fs::create_dir_all(output_dir)
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
@@ -895,39 +886,6 @@ pub async fn export_dbnum_instances_parquet(
     };
 
     // =========================================================================
-    // 诊断：几何实例链检查（plant-surrealdb 技能：图遍历 pe->inst_relate / pe->inst_relate_aabb）
-    // 使用图查询而非 WHERE in = ...，符合 SurrealDB 关系表约定
-    // =========================================================================
-    if verbose {
-        let refno_str = TRACE_REFNO.replace('_', "/");
-        if let Ok(trace_refno) = RefnoEnum::from_str(&refno_str) {
-            let pe_key = trace_refno.to_pe_key();
-            let diag_sql = format!(
-                "SELECT count() as cnt FROM {pe_key}->inst_relate GROUP ALL; \
-                 SELECT count() as cnt FROM {pe_key}->inst_relate_aabb[? out != NONE AND out.d != NONE] GROUP ALL;"
-            );
-            if let Ok(mut resp) = aios_core::project_primary_db().query_response(&diag_sql).await {
-                let inst_cnt: u64 = resp
-                    .take::<Vec<CountRow>>(0)
-                    .ok()
-                    .and_then(|v| v.into_iter().next())
-                    .map(|r| r.cnt)
-                    .unwrap_or(0);
-                let aabb_cnt: u64 = resp
-                    .take::<Vec<CountRow>>(1)
-                    .ok()
-                    .and_then(|v| v.into_iter().next())
-                    .map(|r| r.cnt)
-                    .unwrap_or(0);
-                println!(
-                    "   [diag {}] inst_relate={} inst_relate_aabb(有效)={} | 若 aabb=0 需跑 update_inst_relate_aabbs_by_refnos",
-                    TRACE_REFNO, inst_cnt, aabb_cnt
-                );
-            }
-        }
-    }
-
-    // =========================================================================
     // 1-2. 扫描 inst_relate（按 dbnum 对应的 ref0 前缀过滤）
     // =========================================================================
     let inst_rows = if let Some(root) = root_refno {
@@ -937,20 +895,13 @@ pub async fn export_dbnum_instances_parquet(
             println!("🔍 查询 {} 的可见实例节点...", root);
         }
         let sub_refnos = query_deep_visible_inst_refnos(root).await?;
-        let in_sub = sub_refnos.iter().any(|r| r.to_string() == TRACE_REFNO);
         if verbose {
             println!("✅ 子树 refno 数量: {}", sub_refnos.len());
-            println!("   [trace {}] 阶段0 sub_refnos(TreeIndex): {}", TRACE_REFNO, if in_sub { "✓" } else { "✗" });
         }
         query_inst_relate_by_refnos(&sub_refnos, verbose).await?
     } else {
         query_inst_relate_by_dbnum(dbnum, verbose).await?
     };
-
-    let in_inst = inst_rows.iter().any(|r| r.refno.to_string() == TRACE_REFNO);
-    if verbose {
-        println!("   [trace {}] 阶段1 inst_rows: {} (共{}条)", TRACE_REFNO, if in_inst { "✓" } else { "✗" }, inst_rows.len());
-    }
 
     // 按 owner 分组
     struct ChildInfo {
@@ -1019,8 +970,6 @@ pub async fn export_dbnum_instances_parquet(
                 for inst in export_insts {
                     export_inst_map.insert(inst.refno, inst);
                 }
-                let in_export = export_inst_map.keys().any(|r| r.to_string() == TRACE_REFNO);
-                let insts_len = export_inst_map.iter().find(|(r, _)| r.to_string() == TRACE_REFNO).map(|(_, e)| e.insts.len()).unwrap_or(0);
                 if verbose {
                     println!("✅ 查询到 {} 个 refno 有几何体实例 (inst_relate 共 {} 个)", export_inst_map.len(), in_refnos.len());
                     let in_set: HashSet<_> = in_refnos.iter().collect();
@@ -1031,7 +980,6 @@ pub async fn export_dbnum_instances_parquet(
                     } else if !missing_geo.is_empty() {
                         println!("   ⚠️ {} 个 refno 在 inst_relate 但无几何体，样例: {:?}", missing_geo.len(), missing_geo.iter().take(5).map(|r| r.to_string()).collect::<Vec<_>>());
                     }
-                    println!("   [trace {}] 阶段2 export_inst_map: {} (insts={})", TRACE_REFNO, if in_export { "✓" } else { "✗" }, insts_len);
                 }
             }
             Err(e) => {
@@ -1215,11 +1163,6 @@ pub async fn export_dbnum_instances_parquet(
                 &mut row_count_by_hash,
             );
         }
-    }
-
-    let in_final = instance_rows.iter().any(|r| r.refno_str == TRACE_REFNO);
-    if verbose {
-        println!("   [trace {}] 阶段3 instance_rows(最终输出): {} (共{}行)", TRACE_REFNO, if in_final { "✓" } else { "✗" }, instance_rows.len());
     }
 
     let missing_mesh_report = write_missing_mesh_report(

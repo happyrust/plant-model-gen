@@ -557,11 +557,20 @@ async fn process_index_tree_generation(
         .map_err(|e| anyhow::anyhow!("配置错误: {}", e))?;
     let (sender, receiver) = flume::bounded::<aios_core::geometry::ShapeInstancesData>(100);
     let replace_exist = db_option.inner.is_replace_mesh();
+    let use_surrealdb = db_option.use_surrealdb;
+    let defer_db_write = db_option.defer_db_write;
+
+    // 迁移/修复关系表 schema 只需要在生成流程入口执行一次，
+    // 避免在 save_instance_data_optimize 的每个批次重复触发。
+    if use_surrealdb && !defer_db_write {
+        crate::fast_model::utils::ensure_inst_relate_relation_schema().await;
+        crate::fast_model::utils::ensure_inst_relate_aabb_relation_schema().await;
+    }
 
     // 🧹 预处理清理：在生成前一次性删除目标 refnos 的旧模型记录，
     // 避免生成过程中 DELETE + INSERT IGNORE 与 mesh worker 的竞态条件。
     // defer_db_write 模式下也需要清理：DELETE 直接写 DB，新 INSERT 走 deferred .surql 文件
-    if replace_exist && db_option.use_surrealdb {
+    if replace_exist && use_surrealdb {
         if let Some(ref roots) = seed_roots {
             if !roots.is_empty() {
                 perf.mark("pre_cleanup_for_regen");
@@ -571,9 +580,6 @@ async fn process_index_tree_generation(
             }
         }
     }
-
-    let use_surrealdb = db_option.use_surrealdb;
-    let defer_db_write = db_option.defer_db_write;
 
     // defer_db_write 模式：初始化 SqlFileWriter
     let sql_file_writer: Option<Arc<super::sql_file_writer::SqlFileWriter>> = if defer_db_write {

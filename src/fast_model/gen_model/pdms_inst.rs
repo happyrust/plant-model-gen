@@ -20,7 +20,6 @@ use std::time::Duration;
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::debug_model_debug;
 // model_store 已移除，使用 model_primary_db() 直接查询
-use crate::fast_model::utils;
 use crate::options::{RegenDeleteMode, get_db_option_ext};
 use super::mesh_generate::MeshResult;
 use super::refno_assoc_index::{
@@ -68,7 +67,18 @@ pub async fn save_tubi_info_batch_with_replace(
 /// replace_exist=true 时，仅删除 inst_relate（按 in=pe），避免级联误删 inst_info/inst_geo，
 /// 以支持“inst_relate 重建 + inst_info/ptset 复用”的工作流。
 async fn delete_inst_relate_by_in(refnos: &[RefnoEnum], chunk_size: usize) -> anyhow::Result<()> {
-    for sql in build_delete_inst_relate_by_in_sql(refnos, chunk_size) {
+    for sql in build_delete_inst_relate_by_in_sql(refnos, chunk_size, None) {
+        model_query_response(&sql).await?;
+    }
+    Ok(())
+}
+
+async fn delete_inst_relate_by_in_with_dbnum(
+    refnos: &[RefnoEnum],
+    chunk_size: usize,
+    dbnum: u32,
+) -> anyhow::Result<()> {
+    for sql in build_delete_inst_relate_by_in_sql(refnos, chunk_size, Some(dbnum)) {
         model_query_response(&sql).await?;
     }
     Ok(())
@@ -156,18 +166,71 @@ async fn delete_inst_geo_by_hashes(geo_hashes: &[u64], chunk_size: usize) -> any
     Ok(())
 }
 
-fn build_delete_inst_relate_by_in_sql(refnos: &[RefnoEnum], chunk_size: usize) -> Vec<String> {
+fn build_delete_inst_relate_by_in_sql(
+    refnos: &[RefnoEnum],
+    chunk_size: usize,
+    dbnum: Option<u32>,
+) -> Vec<String> {
     if refnos.is_empty() {
         return Vec::new();
     }
     let mut sqls = Vec::new();
     for chunk in refnos.chunks(chunk_size.max(1)) {
         let in_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
-        sqls.push(format!(
-            "LET $ids = SELECT VALUE id FROM [{in_keys}]->inst_relate;\nDELETE $ids;"
-        ));
+        if let Some(dbnum) = dbnum {
+            sqls.push(format!(
+                "LET $ids = SELECT VALUE id FROM inst_relate WHERE dbnum = {dbnum} AND in IN [{in_keys}];\nDELETE $ids;"
+            ));
+        } else {
+            sqls.push(format!(
+                "LET $ids = SELECT VALUE id FROM [{in_keys}]->inst_relate;\nDELETE $ids;"
+            ));
+        }
     }
     sqls
+}
+
+async fn query_refno_dbnum_map(refnos: &[RefnoEnum], chunk_size: usize) -> HashMap<RefnoEnum, u32> {
+    if refnos.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut refno_by_rid: HashMap<String, RefnoEnum> = HashMap::with_capacity(refnos.len());
+    let mut dbnum_map: HashMap<RefnoEnum, u32> = HashMap::with_capacity(refnos.len());
+    for &refno in refnos {
+        refno_by_rid.insert(format!("{}", refno.refno()), refno);
+        dbnum_map.insert(refno, 0);
+    }
+
+    for chunk in refnos.chunks(chunk_size.max(1)) {
+        let ids = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT record::id(id) AS rid, dbnum FROM [{}];", ids);
+
+        match model_primary_db().query_response(&sql).await {
+            Ok(mut resp) => {
+                let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+                for row in rows {
+                    let Some(rid) = row.get("rid").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let Some(refno) = refno_by_rid.get(rid).copied() else {
+                        continue;
+                    };
+                    let dbnum = row.get("dbnum").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    dbnum_map.insert(refno, dbnum);
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[query_refno_dbnum_map] 批量查询 pe.dbnum 失败 (chunk={}): {}",
+                    chunk.len(),
+                    e
+                );
+            }
+        }
+    }
+
+    dbnum_map
 }
 
 fn build_delete_geo_relate_by_inst_info_ids_sql(
@@ -299,22 +362,37 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
         }
     }
 
+    let refno_dbnum_map = query_refno_dbnum_map(&all_refnos, CHUNK_SIZE).await;
+    let mut refnos_by_dbnum: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
+    for &refno in &all_refnos {
+        let dbnum = *refno_dbnum_map.get(&refno).unwrap_or(&0);
+        refnos_by_dbnum.entry(dbnum).or_default().push(refno);
+    }
+    println!(
+        "[pre_cleanup_for_regen] dbnum 分组完成: groups={}",
+        refnos_by_dbnum.len()
+    );
+
     // 2. 降级使用分批高并发扫描删除 (Legacy 模式)
-    let db = model_primary_db();
     
     // 限制最大并发数，以防止对单一 SurrealDB 底层施加过大连接压力
     use futures::stream::{self, StreamExt};
     let limit_concurrency = 16; 
 
-    let chunks: Vec<Vec<RefnoEnum>> = all_refnos.chunks(CHUNK_SIZE).map(|c| c.to_vec()).collect();
+    let mut chunks: Vec<(u32, Vec<RefnoEnum>)> = Vec::new();
+    for (dbnum, refs) in refnos_by_dbnum {
+        for chunk in refs.chunks(CHUNK_SIZE) {
+            chunks.push((dbnum, chunk.to_vec()));
+        }
+    }
     let mut chunk_stream = stream::iter(chunks)
-        .map(|chunk_vec| {
+        .map(|(dbnum, chunk_vec)| {
             tokio::spawn(async move {
                 let pe_keys = chunk_vec.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
 
                 // 步骤 a: 获取关联的 geo_relate -> inst_geo (如果需要删除的话)
                 let sql = format!(
-                    "LET $inst_ids = SELECT VALUE out FROM inst_relate WHERE in IN [{pe_keys}];\
+                    "LET $inst_ids = SELECT VALUE out FROM inst_relate WHERE dbnum = {dbnum} AND in IN [{pe_keys}];\
                      SELECT VALUE record::id(out) FROM geo_relate WHERE in IN $inst_ids;"
                 );
                 
@@ -334,13 +412,13 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
 
                 // 步骤 b: 删除 geo_relate
                 let sql_relate = format!(
-                    "LET $inst_ids = SELECT VALUE out FROM inst_relate WHERE in IN [{pe_keys}];\
+                    "LET $inst_ids = SELECT VALUE out FROM inst_relate WHERE dbnum = {dbnum} AND in IN [{pe_keys}];\
                      DELETE FROM geo_relate WHERE in IN $inst_ids;"
                 );
                 let _ = model_query_response(&sql_relate).await;
 
                 // 步骤 c: 删除 inst_relate
-                let _ = delete_inst_relate_by_in(&chunk_vec, CHUNK_SIZE).await;
+                let _ = delete_inst_relate_by_in_with_dbnum(&chunk_vec, CHUNK_SIZE, dbnum).await;
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -414,13 +492,10 @@ pub async fn save_instance_data_optimize(
         None
     };
 
-    // 统一迁移/修复 inst_relate 的历史 schema（普通表 -> RELATION），确保 pe -> inst_info 关系可复用
-    utils::ensure_inst_relate_relation_schema().await;
-    // 统一迁移/修复 inst_relate_aabb 的历史 schema（refno/aabb -> in/out），避免写入时触发类型强制失败
-    utils::ensure_inst_relate_aabb_relation_schema().await;
-
     let mut aabb_map: HashMap<u64, String> = HashMap::new();
     let mut transform_map: HashMap<u64, String> = HashMap::new();
+    let inst_refnos: Vec<RefnoEnum> = inst_mgr.inst_info_map.keys().copied().collect();
+    let inst_dbnum_map = query_refno_dbnum_map(&inst_refnos, CHUNK_SIZE).await;
     if let Entry::Vacant(entry) = transform_map.entry(0) {
         entry.insert(serde_json::to_string(&Transform::IDENTITY)?);
     }
@@ -603,18 +678,13 @@ pub async fn save_instance_data_optimize(
 
     geo_batcher.finish().await?;
 
-    // tubi -> aabb & transform maps
+    // tubi -> aabb map
     for tubi in inst_mgr.inst_tubi_map.values() {
         if let Some(aabb) = tubi.aabb {
             let aabb_hash = gen_aabb_hash(&aabb);
             if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
                 entry.insert(serde_json::to_string(&aabb)?);
             }
-        }
-
-        let transform_hash = gen_plant_transform_hash(&tubi.world_transform);
-        if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
-            entry.insert(serde_json::to_string(&tubi.world_transform)?);
         }
     }
 
@@ -781,11 +851,6 @@ pub async fn save_instance_data_optimize(
             inst_info_buffer.clear();
         }
 
-        let transform_hash = gen_plant_transform_hash(&info.world_transform);
-        if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
-            entry.insert(serde_json::to_string(&info.world_transform)?);
-        }
-
         if let Some(aabb) = info.aabb {
             let aabb_hash = gen_aabb_hash(&aabb);
             if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
@@ -808,11 +873,13 @@ pub async fn save_instance_data_optimize(
         }
 
         // inst_relate 不再保存 world_trans；世界变换统一从 pe_transform 获取。
+        let dbnum = inst_dbnum_map.get(key).copied().unwrap_or(0);
         let relate_sql = format!(
-            "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, zone_refno: NONE, spec_value: 0, dt: fn::ses_date({1}), has_cata_neg: {3}, solid: {4}, owner_refno: {5}, owner_type: '{6}'}}",
+            "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, dbnum: {3}, zone_refno: NONE, spec_value: 0, dt: fn::ses_date({1}), has_cata_neg: {4}, solid: {5}, owner_refno: {6}, owner_type: '{7}'}}",
             key.to_inst_relate_key(),
             key.to_pe_key(),
             info.id_str(),
+            dbnum,
             info.has_cata_neg,
             info.is_solid,
             info.owner_refno.to_pe_key(),
@@ -855,7 +922,7 @@ pub async fn save_instance_data_optimize(
     // 这里把 inst_relate_aabb 的写入延后到 aabb UPSERT 之后，保证 out 侧不会出现空记录。
 
     // inst_tubi_map 不再创建 inst_relate（tubing 使用专门的 tubi_relate 表）
-    // 只收集 transform 和 aabb 数据用于其他用途
+    // world_transform 已提前写入 pe_transform，这里仅收集 aabb 数据用于 tubi_relate
     if !inst_mgr.inst_tubi_map.is_empty() {
         debug_model_debug!(
             "save_instance_data_optimize processing inst_tubi_map: {} Tubing records (不创建 inst_relate)",
@@ -868,11 +935,6 @@ pub async fn save_instance_data_optimize(
                 || info.world_transform.scale.is_nan()
             {
                 continue;
-            }
-
-            let transform_hash = gen_plant_transform_hash(&info.world_transform);
-            if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
-                entry.insert(serde_json::to_string(&info.world_transform)?);
             }
 
             // 收集 aabb 数据（用于 tubi_relate）
@@ -1437,6 +1499,8 @@ pub struct InstRelatePrecomputed {
     spec_map: HashMap<RefnoEnum, i64>,
     /// refno → ses_date (Option<String>，SurrealDB datetime 格式)
     dt_map: HashMap<RefnoEnum, Option<String>>,
+    /// refno → dbnum
+    dbnum_map: HashMap<RefnoEnum, u32>,
 }
 
 impl InstRelatePrecomputed {
@@ -1449,9 +1513,10 @@ impl InstRelatePrecomputed {
         let mut zone_map: HashMap<RefnoEnum, Option<String>> = HashMap::new();
         let mut spec_map: HashMap<RefnoEnum, i64> = HashMap::new();
         let mut dt_map: HashMap<RefnoEnum, Option<String>> = HashMap::new();
+        let mut dbnum_map: HashMap<RefnoEnum, u32> = HashMap::new();
 
         if refnos.is_empty() {
-            return Self { zone_map, spec_map, dt_map };
+            return Self { zone_map, spec_map, dt_map, dbnum_map };
         }
 
         // 1. zone_refno: 使用默认值 NONE（已禁用查询）
@@ -1531,6 +1596,7 @@ impl InstRelatePrecomputed {
             for &refno in refnos {
                 let refno_str = format!("{}", refno.refno());
                 if let Some((dbnum, sesno)) = pe_dbnum_sesno.get(&refno_str) {
+                    dbnum_map.insert(refno, *dbnum);
                     if *sesno > 0 {
                         let ses_key = format!("[{},{}]", dbnum, sesno);
                         dt_map.insert(refno, ses_date_map.get(&ses_key).cloned());
@@ -1538,20 +1604,22 @@ impl InstRelatePrecomputed {
                         dt_map.insert(refno, None);
                     }
                 } else {
+                    dbnum_map.insert(refno, 0);
                     dt_map.insert(refno, None);
                 }
             }
         }
 
         println!(
-            "[precompute] InstRelatePrecomputed 构建完成: refnos={}, zones={}, specs={}, dts={}",
+            "[precompute] InstRelatePrecomputed 构建完成: refnos={}, zones={}, specs={}, dts={}, dbnums={}",
             refnos.len(),
             zone_map.values().filter(|v| v.is_some()).count(),
             spec_map.len(),
             dt_map.values().filter(|v| v.is_some()).count(),
+            dbnum_map.len(),
         );
 
-        Self { zone_map, spec_map, dt_map }
+        Self { zone_map, spec_map, dt_map, dbnum_map }
     }
 
     /// 获取预计算的 zone PE key
@@ -1574,6 +1642,11 @@ impl InstRelatePrecomputed {
             .and_then(|v| v.clone())
             .map(|d| format!("'{}'", d))
             .unwrap_or_else(|| "NONE".to_string())
+    }
+
+    /// 获取预计算的 dbnum
+    pub fn dbnum(&self, refno: &RefnoEnum) -> u32 {
+        self.dbnum_map.get(refno).copied().unwrap_or(0)
     }
 }
 
@@ -1641,6 +1714,7 @@ pub async fn save_instance_data_to_sql_file(
                     writer.write_statements(&build_delete_inst_relate_by_in_sql(
                         &refnos,
                         CHUNK_SIZE,
+                        None,
                     ))?;
                     writer.write_statements(&build_delete_inst_relate_bool_records_sql(
                         &refnos,
@@ -1665,6 +1739,7 @@ pub async fn save_instance_data_to_sql_file(
             writer.write_statements(&build_delete_inst_relate_by_in_sql(
                 &refnos,
                 CHUNK_SIZE,
+                None,
             ))?;
             writer.write_statements(&build_delete_inst_relate_bool_records_sql(
                 &refnos,
@@ -1796,17 +1871,13 @@ pub async fn save_instance_data_to_sql_file(
         ))?;
     }
 
-    // tubi -> aabb & transform maps
+    // tubi -> aabb map
     for tubi in inst_mgr.inst_tubi_map.values() {
         if let Some(aabb) = tubi.aabb {
             let aabb_hash = gen_aabb_hash(&aabb);
             if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
                 entry.insert(serde_json::to_string(&aabb)?);
             }
-        }
-        let transform_hash = gen_plant_transform_hash(&tubi.world_transform);
-        if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
-            entry.insert(serde_json::to_string(&tubi.world_transform)?);
         }
     }
 
@@ -1915,11 +1986,6 @@ pub async fn save_instance_data_to_sql_file(
             inst_info_buffer.clear();
         }
 
-        let transform_hash = gen_plant_transform_hash(&info.world_transform);
-        if let Entry::Vacant(entry) = transform_map.entry(transform_hash) {
-            entry.insert(serde_json::to_string(&info.world_transform)?);
-        }
-
         if let Some(aabb) = info.aabb {
             let aabb_hash = gen_aabb_hash(&aabb);
             if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
@@ -1940,12 +2006,14 @@ pub async fn save_instance_data_to_sql_file(
         let zone_key = precomputed.zone_key(key);
         let spec_value = precomputed.spec_value(key);
         let dt = precomputed.dt(key);
+        let dbnum = precomputed.dbnum(key);
 
         let relate_sql = format!(
-            "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, zone_refno: {3}, spec_value: {4}, dt: {5}, has_cata_neg: {6}, solid: {7}, owner_refno: {8}, owner_type: '{9}'}}",
+            "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, dbnum: {3}, zone_refno: {4}, spec_value: {5}, dt: {6}, has_cata_neg: {7}, solid: {8}, owner_refno: {9}, owner_type: '{10}'}}",
             key.to_inst_relate_key(),
             key.to_pe_key(),
             info.id_str(),
+            dbnum,
             zone_key,
             spec_value,
             dt,

@@ -68,7 +68,7 @@ meshes_path = "./assets/meshes"
 gen_noun_graph = false
 
 # 仅生成/计算与目标构件相关的 dbno，避免全库跑
-# manual_db_nums = [1112]
+manual_db_nums = [7997]
 
 #arangodb 配置
 arangodb_database = "ams"
@@ -282,7 +282,7 @@ surreal_password = "root"
 
 # SurrealDB 连接配置 (PE/属性/输入数据)
 [surrealdb]
-mode = "ws"
+mode = "file"
 path = "/Volumes/DPC/work/db-data/ams-8020.db"
 
 # SurrealKV 连接配置 (模型数据写入)

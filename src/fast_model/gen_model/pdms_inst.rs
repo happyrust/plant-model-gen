@@ -254,7 +254,7 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
         return Ok(());
     }
 
-    const CHUNK_SIZE: usize = 100;
+    const CHUNK_SIZE: usize = 200;
 
     // 展开 seed_refnos 到所有后代（包含自身），不过滤 noun 类型
     let all_refnos =
@@ -272,49 +272,112 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
 
     let t = std::time::Instant::now();
 
-    // 1. 查询所有关联的 inst_geo hash（通过 inst_relate → geo_relate → inst_geo）
-    for chunk in all_refnos.chunks(CHUNK_SIZE) {
-        let pe_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
-
-        // 查出当前 chunk 关联的 inst_info id，再通过 inst_info 查 geo_relate
-        let sql = format!(
-            "LET $inst_ids = SELECT VALUE out FROM [{pe_keys}]->inst_relate;\
-             SELECT VALUE record::id(out) FROM $inst_ids->geo_relate;"
-        );
-        let geo_hashes: Vec<String> = model_primary_db()
-            .query_take(&sql, 1)
-            .await
-            .unwrap_or_default();
-
-        // 转成 u64 用于 delete_inst_geo_by_hashes
-        let hashes: Vec<u64> = geo_hashes
-            .iter()
-            .filter_map(|s| s.parse::<u64>().ok())
-            .collect();
-        if !hashes.is_empty() {
-            delete_inst_geo_by_hashes(&hashes, CHUNK_SIZE).await?;
+    // 1. 优先尝试使用高效的 refno_assoc_index
+    let regen_delete_mode = get_db_option_ext().regen_delete_mode;
+    if regen_delete_mode == RegenDeleteMode::RefnoAssocIndex {
+        match delete_by_refno_assoc_index(&all_refnos, CHUNK_SIZE).await {
+            Ok(summary) => {
+                if summary.used_index {
+                    println!(
+                        "[pre_cleanup_for_regen] 清理完成 (RefnoAssocIndex)，耗时 {} ms",
+                        t.elapsed().as_millis()
+                    );
+                    return Ok(());
+                } else {
+                    println!(
+                        "[pre_cleanup_for_regen] RefnoAssocIndex 不完整 (indexed: {}, req: {})，降级到 Legacy 模式进行全量扫描清理",
+                        summary.indexed_refnos, summary.requested_refnos
+                    );
+                }
+            }
+            Err(e) => {
+                println!(
+                    "[pre_cleanup_for_regen] RefnoAssocIndex 清理失败: {}，降级到 Legacy 模式",
+                    e
+                );
+            }
         }
-
-        // 2. 删除 geo_relate（通过 inst_info id 关联）
-        let sql = format!(
-            "LET $inst_ids = SELECT VALUE out FROM [{pe_keys}]->inst_relate;\
-             LET $gr_ids = SELECT VALUE id FROM $inst_ids->geo_relate;\
-             DELETE $gr_ids;"
-        );
-        let _ = model_query_response(&sql).await;
-
-        // 3. 删除 inst_relate
-        delete_inst_relate_by_in(chunk, CHUNK_SIZE).await?;
     }
 
-    // 4. 删除 inst_relate_bool
-    delete_inst_relate_bool_records(&all_refnos, CHUNK_SIZE).await?;
+    // 2. 降级使用分批高并发扫描删除 (Legacy 模式)
+    let db = model_primary_db();
+    
+    // 限制最大并发数，以防止对单一 SurrealDB 底层施加过大连接压力
+    use futures::stream::{self, StreamExt};
+    let limit_concurrency = 16; 
 
-    // 5. 删除 neg_relate / ngmr_relate
-    delete_boolean_relations_by_carriers(&all_refnos, CHUNK_SIZE).await?;
+    let chunks: Vec<Vec<RefnoEnum>> = all_refnos.chunks(CHUNK_SIZE).map(|c| c.to_vec()).collect();
+    let mut chunk_stream = stream::iter(chunks)
+        .map(|chunk_vec| {
+            tokio::spawn(async move {
+                let pe_keys = chunk_vec.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
+
+                // 步骤 a: 获取关联的 geo_relate -> inst_geo (如果需要删除的话)
+                let sql = format!(
+                    "LET $inst_ids = SELECT VALUE out FROM inst_relate WHERE in IN [{pe_keys}];\
+                     SELECT VALUE record::id(out) FROM geo_relate WHERE in IN $inst_ids;"
+                );
+                
+                let geo_hashes: Vec<String> = model_primary_db()
+                    .query_take(&sql, 1)
+                    .await
+                    .unwrap_or_default();
+
+                let hashes: Vec<u64> = geo_hashes
+                    .iter()
+                    .filter_map(|s| s.parse::<u64>().ok())
+                    .collect();
+                    
+                if !hashes.is_empty() {
+                    let _ = delete_inst_geo_by_hashes(&hashes, CHUNK_SIZE).await;
+                }
+
+                // 步骤 b: 删除 geo_relate
+                let sql_relate = format!(
+                    "LET $inst_ids = SELECT VALUE out FROM inst_relate WHERE in IN [{pe_keys}];\
+                     DELETE FROM geo_relate WHERE in IN $inst_ids;"
+                );
+                let _ = model_query_response(&sql_relate).await;
+
+                // 步骤 c: 删除 inst_relate
+                let _ = delete_inst_relate_by_in(&chunk_vec, CHUNK_SIZE).await;
+
+                Ok::<(), anyhow::Error>(())
+            })
+        })
+        .buffer_unordered(limit_concurrency);
+
+    while let Some(res) = chunk_stream.next().await {
+        match res {
+            Ok(Err(e)) => eprintln!("[pre_cleanup_for_regen] chunk 处理失败返回: {}", e),
+            Err(e) => eprintln!("[pre_cleanup_for_regen] chunk tokio 任务崩溃: {}", e),
+            _ => {}
+        }
+    }
+
+    // 处理独立的记录（bool 记录、负实体关系等）
+    let bool_sqls = build_delete_inst_relate_bool_records_sql(&all_refnos, CHUNK_SIZE);
+    let neg_sqls = build_delete_boolean_relations_by_carriers_sql(&all_refnos, CHUNK_SIZE);
+    
+    let mut misc_stream = stream::iter(bool_sqls.into_iter().chain(neg_sqls.into_iter()))
+        .map(|sql| {
+            tokio::spawn(async move {
+                let _ = model_query_response(&sql).await;
+                Ok::<(), anyhow::Error>(())
+            })
+        })
+        .buffer_unordered(limit_concurrency);
+
+    while let Some(res) = misc_stream.next().await {
+        match res {
+            Ok(Err(e)) => eprintln!("[pre_cleanup_for_regen] misc 独立处理失败: {}", e),
+            Err(e) => eprintln!("[pre_cleanup_for_regen] misc tokio 任务崩溃: {}", e),
+            _ => {}
+        }
+    }
 
     println!(
-        "[pre_cleanup_for_regen] 清理完成，耗时 {} ms",
+        "[pre_cleanup_for_regen] 清理完成 (Legacy 并发模式)，耗时 {} ms",
         t.elapsed().as_millis()
     );
 

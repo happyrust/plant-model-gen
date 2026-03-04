@@ -631,3 +631,152 @@ fn ensure_normals(mesh: &mut PlantMesh) {
 
     mesh.normals = normals;
 }
+
+// =============================================================================
+// inst_relate 共享查询
+// =============================================================================
+
+use serde::{Deserialize, Serialize};
+use surrealdb::types::SurrealValue;
+
+/// inst_relate 查询结果（统一结构体）
+///
+/// 两种导出路径（Parquet / JSON）共用。
+/// `name` 和 `aabb_hash` 为可选字段，仅在 JSON 导出路径中填充。
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
+pub struct InstRelateRow {
+    pub owner_refno: Option<RefnoEnum>,
+    pub owner_type: Option<String>,
+    pub refno: RefnoEnum,
+    pub noun: Option<String>,
+    pub name: Option<String>,
+    pub spec_value: Option<i64>,
+}
+
+/// inst_relate_aabb 查询结果
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
+pub struct InstRelateAabbRow {
+    pub refno: RefnoEnum,
+    pub aabb_hash: Option<String>,
+}
+
+/// 批量查询 inst_relate（基础版，不含 aabb_hash）
+///
+/// 使用图遍历语法 `[{pe_list}]->inst_relate` 替代 `FROM inst_relate WHERE in IN [...]`。
+/// `include_name` 为 true 时额外查询 `fn::default_full_name(in) as name`。
+pub async fn query_inst_relate_batch(
+    refnos: &[RefnoEnum],
+    include_name: bool,
+    verbose: bool,
+) -> Result<Vec<InstRelateRow>> {
+    use aios_core::{SurrealQueryExt, model_primary_db};
+
+    if refnos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    const BATCH_SIZE: usize = 500;
+    let mut rows = Vec::new();
+
+    for (idx, chunk) in refnos.chunks(BATCH_SIZE).enumerate() {
+        if verbose {
+            println!(
+                "   - 查询 inst_relate 分批 {}/{} (批大小 {})",
+                idx + 1,
+                (refnos.len() + BATCH_SIZE - 1) / BATCH_SIZE,
+                chunk.len()
+            );
+        }
+
+        let pe_list = chunk
+            .iter()
+            .map(|r| format!("pe:⟨{}⟩", r.to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let name_field = if include_name {
+            "fn::default_full_name(in) as name,"
+        } else {
+            "NONE as name,"
+        };
+
+        let sql = format!(
+            r#"
+            SELECT
+                owner_refno,
+                owner_type,
+                in as refno,
+                in.noun as noun,
+                {name_field}
+                spec_value
+            FROM [{pe_list}]->inst_relate
+            "#
+        );
+
+        let mut chunk_rows: Vec<InstRelateRow> =
+            model_primary_db().query_take(&sql, 0).await?;
+        rows.append(&mut chunk_rows);
+    }
+
+    Ok(rows)
+}
+
+/// 批量查询 inst_relate_aabb（独立步骤）
+///
+/// 从 PE 节点出发图遍历 `inst_relate_aabb`，返回 refno → aabb_hash 映射。
+/// 仅返回有有效 AABB 数据的记录（`out != NONE AND out.d != NONE`）。
+pub async fn query_inst_relate_aabb_batch(
+    refnos: &[RefnoEnum],
+    verbose: bool,
+) -> Result<std::collections::HashMap<RefnoEnum, String>> {
+    use aios_core::{SurrealQueryExt, model_primary_db};
+
+    let mut map = std::collections::HashMap::new();
+    if refnos.is_empty() {
+        return Ok(map);
+    }
+
+    const BATCH_SIZE: usize = 500;
+
+    for (idx, chunk) in refnos.chunks(BATCH_SIZE).enumerate() {
+        if verbose {
+            println!(
+                "   - 查询 inst_relate_aabb 分批 {}/{} (批大小 {})",
+                idx + 1,
+                (refnos.len() + BATCH_SIZE - 1) / BATCH_SIZE,
+                chunk.len()
+            );
+        }
+
+        let pe_list = chunk
+            .iter()
+            .map(|r| format!("pe:⟨{}⟩", r.to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            r#"
+            SELECT
+                record::id(in) as refno,
+                record::id(out) as aabb_hash
+            FROM [{pe_list}]->inst_relate_aabb
+            WHERE out != NONE AND out.d != NONE
+            "#
+        );
+
+        let chunk_rows: Vec<InstRelateAabbRow> =
+            model_primary_db().query_take(&sql, 0).await?;
+
+        for row in chunk_rows {
+            if let Some(hash) = row.aabb_hash {
+                map.insert(row.refno, hash);
+            }
+        }
+    }
+
+    if verbose {
+        println!("   ✅ inst_relate_aabb 命中: {} 条", map.len());
+    }
+
+    Ok(map)
+}

@@ -424,7 +424,11 @@ async fn main() -> anyhow::Result<()> {
                 .short('c')
                 .help("Path to the configuration file (Without extension)")
                 .value_name("CONFIG_PATH")
-                .default_value("db_options/DbOption"),
+                .default_value(if cfg!(target_family = "unix") {
+                    "db_options/DbOption-mac"
+                } else {
+                    "db_options/DbOption"
+                }),
         )
         .arg(
             Arg::new("gen-lod")

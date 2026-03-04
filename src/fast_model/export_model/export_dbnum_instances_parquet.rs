@@ -474,20 +474,14 @@ fn build_aabb_batch(rows: &[AabbRow]) -> Result<RecordBatch> {
 }
 
 // =============================================================================
-// SurrealDB 查询结构体（复用 export_prepack_lod 中的定义）
+// SurrealDB 查询结构体
 // =============================================================================
 
 use serde::{Deserialize, Serialize};
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 
-#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
-struct InstRelateRow {
-    pub owner_refno: Option<RefnoEnum>,
-    pub owner_type: Option<String>,
-    pub refno: RefnoEnum,
-    pub noun: Option<String>,
-    pub spec_value: Option<i64>,
-}
+// InstRelateRow 使用 export_common 中的共享定义
+use super::InstRelateRow;
 
 #[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
 struct TubiQueryResult {

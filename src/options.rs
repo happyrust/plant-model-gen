@@ -90,6 +90,10 @@ pub struct DbOptionExt {
     #[serde(default = "default_false")]
     pub export_instances: bool,
 
+    /// 模型生成完成后，是否按 manual_db_nums 自动导出 Parquet（instances/tubings/transforms 等）
+    #[serde(default = "default_false")]
+    pub export_parquet_after_gen: bool,
+
     /// 预烘 TriMesh(L0) 输出目录（默认 meshes/trimesh_L0）
     #[serde(default)]
     pub trimesh_l0_dir: Option<String>,
@@ -293,6 +297,7 @@ impl From<DbOption> for DbOptionExt {
         Self {
             inner: option,
             export_instances: false,
+            export_parquet_after_gen: false,
             trimesh_l0_dir: None,
             mqtt_server: None,
             mqtt_port: None,
@@ -493,10 +498,16 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let export_parquet_after_gen = toml_value
+        .get("export_parquet_after_gen")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // 构建 DbOptionExt
     let db_option_ext = DbOptionExt {
         inner: db_option,
         export_instances,
+        export_parquet_after_gen,
         trimesh_l0_dir,
         mqtt_server: None,
         mqtt_port: None,

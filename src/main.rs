@@ -1,4 +1,4 @@
-﻿#![feature(let_chains)]
+#![feature(let_chains)]
 #![feature(duration_constructors)]
 // 暂时屏蔽warnings
 #![allow(warnings)]
@@ -705,6 +705,12 @@ async fn main() -> anyhow::Result<()> {
                 .value_parser(clap::value_parser!(usize)),
         )
         .arg(
+            Arg::new("export-parquet-after-gen")
+                .long("export-parquet-after-gen")
+                .help("After model generation, automatically export Parquet for each dbnum in manual_db_nums (instances/tubings/transforms/aabb)")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("verbose")
                 .long("verbose")
                 .short('v')
@@ -1019,6 +1025,10 @@ async fn main() -> anyhow::Result<()> {
             db_option_ext.index_tree_debug_limit_per_target_type, override_limit
         );
         db_option_ext.index_tree_debug_limit_per_target_type = override_limit;
+    }
+    if matches.get_flag("export-parquet-after-gen") {
+        db_option_ext.export_parquet_after_gen = true;
+        println!("🔧 模型生成完成后将自动导出 Parquet（按 manual_db_nums）");
     }
 
     // 同步精度配置到 rs-core 全局 active_precision，保证布尔/导出等逻辑使用同一套 LOD

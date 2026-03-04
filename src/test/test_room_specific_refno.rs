@@ -634,6 +634,7 @@ mod tests {
         let _g_use_cache = EnvGuard::set_force("AIOS_ROOM_USE_CACHE", "0".to_string());
         let _g_floor_2d =
             EnvGuard::set_force("ROOM_RELATION_FLOOR_2D_FALLBACK", "1".to_string());
+        let _g_debug = EnvGuard::set_force("AIOS_ROOM_DEBUG", "1".to_string());
 
         let tmp_index_path = PathBuf::from("output").join("test_spatial_index_single_panel.sqlite");
         if let Some(parent) = tmp_index_path.parent() {
@@ -647,9 +648,40 @@ mod tests {
             EnvGuard::set_force("ROOM_RELATION_CANDIDATE_LIMIT", "2000".to_string());
 
         if !expected_in.is_empty() {
-            let aabb_map = crate::fast_model::room_model::query_aabb_from_inst_relate_aabb(&expected_in)
-                .await
-                .context("从 inst_relate_aabb 查询 EXPECTED_IN 的 AABB 失败")?;
+            for r in &expected_in {
+                let pe_key = r.to_pe_key();
+                let diag_sql = format!(
+                    "SELECT noun, OWNER, REFNO FROM {pe_key}; \
+                     SELECT count() as cnt FROM inst_relate_aabb WHERE in = {pe_key} GROUP ALL; \
+                     SELECT count() as cnt FROM inst_relate WHERE in = {pe_key} GROUP ALL;"
+                );
+                let mut resp = project_primary_db().query(&diag_sql).await?;
+                let pe_info: Option<serde_json::Value> = resp.take(0)?;
+                let aabb_cnt: Option<serde_json::Value> = resp.take(1)?;
+                let rel_cnt: Option<serde_json::Value> = resp.take(2)?;
+                println!(
+                    "🔎 诊断 {}: pe={:?} inst_relate_aabb_cnt={:?} inst_relate_cnt={:?}",
+                    r,
+                    pe_info,
+                    aabb_cnt,
+                    rel_cnt
+                );
+            }
+
+            let mut aabb_map =
+                crate::fast_model::room_model::query_aabb_from_inst_relate_aabb(&expected_in)
+                    .await
+                    .context("从 inst_relate_aabb 查询 EXPECTED_IN 的 AABB 失败")?;
+
+            let expected_in_has_aabb: Vec<_> = expected_in
+                .iter()
+                .map(|r| (r.clone(), aabb_map.contains_key(r)))
+                .collect();
+            println!(
+                "📦 aabb_map size={} expected_in_has_aabb={:?}",
+                aabb_map.len(),
+                expected_in_has_aabb
+            );
 
             if !aabb_map.is_empty() {
                 use crate::sqlite_index::SqliteAabbIndex;
@@ -693,6 +725,12 @@ mod tests {
         )
         .await
         .context("cal_room_refnos 失败")?;
+
+        println!(
+            "📋 cal_room_refnos 完成: within.len()={} contains_expected={:?}",
+            within.len(),
+            expected_in.iter().map(|r| (r, within.contains(r))).collect::<Vec<_>>()
+        );
 
         assert!(
             !within.contains(&panel_refno),

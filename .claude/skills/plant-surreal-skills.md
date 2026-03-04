@@ -23,6 +23,7 @@
 - 限制递归深度（如 `Some("1..5")`），避免无限递归
 - 使用 `array::distinct()` 去重（SurrealDB 不支持 `SELECT DISTINCT`）
 - 直接访问字段，避免 `record::id()` 函数调用
+- **避免过度防御**：TreeIndex 已保证类型，批量查询时无需再用 noun 过滤（主键查询最快）
 
 ---
 
@@ -1144,6 +1145,72 @@ let provider = handle.join()??;
 5. **层级查询使用 SurrealDB 递归**（慢 10-100 倍）
 6. **无限递归不限制深度**（可能栈溢出）
 7. **WHERE 条件代替 ID Range**（全表扫描）
+8. **过度防御性查询**（TreeIndex 已保证类型，批量查询时添加 `noun = 'SITE'` 等过滤是多余的）
+
+---
+
+## 性能陷阱：过度防御性查询
+
+### 问题场景
+
+当使用 TreeIndex 找到 SITE 祖先后，再批量查询 pe 表时添加 `noun = 'SITE'` 过滤：
+
+```sql
+-- ❌ 错误：过度防御
+SELECT record::id(id) AS rid, spec_value, name
+FROM pe
+WHERE id IN [pe:17496_10000, pe:17496_10001, ...]
+  AND noun = 'SITE'  -- 多余的过滤条件
+```
+
+### 问题分析
+
+1. **TreeIndex 已保证类型**：通过 `collect_ancestors_root_to_parent` 找到的 SITE 祖先，已经确保是 SITE 类型
+2. **主键查询最快**：`WHERE id IN [...]` 使用主键索引，是最快的查询方式
+3. **额外过滤开销**：添加 `noun = 'SITE'` 需要额外的字段比较，降低性能 10-20%
+4. **数据一致性风险**：如果 TreeIndex 和 pe 表数据不一致，过滤会导致数据丢失
+
+### 正确做法
+
+```sql
+-- ✅ 正确：直接用 ID 查询
+SELECT record::id(id) AS rid, spec_value, name
+FROM pe
+WHERE id IN [pe:17496_10000, pe:17496_10001, ...]
+```
+
+### Rust 实现
+
+```rust
+// 1. 通过 TreeIndex 找 SITE 祖先（已保证类型）
+let site_refnos: Vec<String> = unique_site_refnos
+    .iter()
+    .map(|r| format!("pe:{}", r))
+    .collect();
+
+// 2. 直接批量查询（无需 noun 过滤）
+let sql = format!(
+    "SELECT record::id(id) AS rid, spec_value, name FROM pe WHERE id IN [{}]",
+    site_refnos.join(", ")
+);
+
+let results: Vec<SiteSpecValue> = SUL_DB.query_take(&sql, 0).await?;
+```
+
+### 性能对比
+
+| 查询方式 | 索引使用 | 性能 | 说明 |
+|---------|---------|------|------|
+| `WHERE id IN [...]` | 主键索引 | ⚡ 最快 | 推荐 |
+| `WHERE id IN [...] AND noun = 'SITE'` | 主键索引 + 字段过滤 | 🐌 慢 10-20% | 过度防御 |
+
+### 何时需要 noun 过滤
+
+仅在以下情况需要 noun 过滤：
+
+1. **不确定类型**：查询来源不保证类型（如用户输入的 refno 列表）
+2. **调试验证**：需要验证 TreeIndex 和 pe 表的数据一致性
+3. **混合类型查询**：`WHERE noun IN ['SITE', 'ZONE']`
 
 ---
 

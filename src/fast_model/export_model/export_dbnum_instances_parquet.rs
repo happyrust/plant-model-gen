@@ -864,6 +864,29 @@ pub async fn export_dbnum_instances_parquet(
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
     let mesh_base_dir = mesh_base_dir_from_db_option(&db_option);
 
+    // 构建/加载 spec_info（BRAN/HANG/EQUI/WALL/FLOOR 专业信息），用于 spec_value=0 时回填
+    let tree_manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+    let tree_dir = tree_manager.tree_dir();
+    let spec_info_map = match crate::fast_model::export_model::spec_info::load_or_build_spec_info(
+        dbnum,
+        tree_dir,
+        output_dir,
+        verbose,
+    )
+    .await
+    {
+        Ok(m) => {
+            if verbose && !m.is_empty() {
+                println!("   📋 spec_info: {} 条 refno->spec_value 映射", m.len());
+            }
+            m
+        }
+        Err(e) => {
+            eprintln!("   ⚠️ spec_info 加载/构建失败 (将使用 spec_value=0): {}", e);
+            HashMap::new()
+        }
+    };
+
     // =========================================================================
     // 1-2. 扫描 inst_relate（按 dbnum 对应的 ref0 前缀过滤）
     // =========================================================================
@@ -876,11 +899,28 @@ pub async fn export_dbnum_instances_parquet(
         let sub_refnos = query_deep_visible_inst_refnos(root).await?;
         if verbose {
             println!("✅ 子树 refno 数量: {}", sub_refnos.len());
+            let has_145019 = sub_refnos.iter().any(|r| r.to_string() == "24381_145019");
+            if !has_145019 {
+                println!("   ⚠️ 24381_145019 不在 query_deep_visible_inst_refnos 结果中（TreeIndex 查询）");
+            }
         }
         query_inst_relate_by_refnos(&sub_refnos, verbose).await?
     } else {
         query_inst_relate_by_dbnum(dbnum, verbose).await?
     };
+
+    // 诊断：若 verbose 且目标 refno 不在 inst_rows 中，提示可能原因
+    if verbose {
+        const DEBUG_REFNO: &str = "24381_145019";
+        let has_target = inst_rows.iter().any(|r| r.refno.to_string() == DEBUG_REFNO);
+        if !has_target && root_refno.is_some() {
+            println!("   ⚠️ {} 不在 inst_rows 中。可能原因: query_deep_visible_inst_refnos 未返回该 refno（TreeIndex 中无或非 BRAN 直连子节点）", DEBUG_REFNO);
+        } else if !has_target {
+            println!("   ⚠️ {} 不在 inst_rows 中。可能原因: inst_relate 无此记录或 ref0 前缀过滤未命中", DEBUG_REFNO);
+        } else {
+            println!("   ✓ {} 在 inst_rows 中，继续检查几何体...", DEBUG_REFNO);
+        }
+    }
 
     // 按 owner 分组
     struct ChildInfo {
@@ -903,10 +943,20 @@ pub async fn export_dbnum_instances_parquet(
             .unwrap_or_default()
             .to_ascii_uppercase();
 
+        let mut spec_value = row.spec_value.unwrap_or(0);
+        if spec_value == 0 {
+            spec_value = *spec_info_map.get(&refno_to_u64(&row.refno)).unwrap_or(&0);
+            // 组件(ELBO/BEND等)的 refno 不在 spec_info，用 owner(BRAN/HANG) 查
+            if spec_value == 0 {
+                if let Some(owner) = &row.owner_refno {
+                    spec_value = *spec_info_map.get(&refno_to_u64(owner)).unwrap_or(&0);
+                }
+            }
+        }
         let child = ChildInfo {
             refno: row.refno,
             noun: row.noun.unwrap_or_default(),
-            spec_value: row.spec_value.unwrap_or(0),
+            spec_value,
             owner_refno: row.owner_refno,
             owner_type: owner_type.clone(),
         };
@@ -940,7 +990,16 @@ pub async fn export_dbnum_instances_parquet(
                     export_inst_map.insert(inst.refno, inst);
                 }
                 if verbose {
-                    println!("✅ 查询到 {} 个 refno 有几何体实例", export_inst_map.len());
+                    println!("✅ 查询到 {} 个 refno 有几何体实例 (inst_relate 共 {} 个)", export_inst_map.len(), in_refnos.len());
+                    // 诊断：inst_relate 有但 query_insts_for_export 无（缺 geo_relate/inst_relate_bool）
+                    let in_set: HashSet<_> = in_refnos.iter().collect();
+                    let exported_set: HashSet<_> = export_inst_map.keys().collect();
+                    let missing_geo: Vec<_> = in_set.difference(&exported_set).collect();
+                    if !missing_geo.is_empty() && missing_geo.len() <= 20 {
+                        println!("   ⚠️ 以下 refno 在 inst_relate 但无几何体(geo_relate/inst_relate_bool): {:?}", missing_geo.iter().map(|r| r.to_string()).collect::<Vec<_>>());
+                    } else if !missing_geo.is_empty() {
+                        println!("   ⚠️ {} 个 refno 在 inst_relate 但无几何体，样例: {:?}", missing_geo.len(), missing_geo.iter().take(5).map(|r| r.to_string()).collect::<Vec<_>>());
+                    }
                 }
             }
             Err(e) => {
@@ -984,8 +1043,18 @@ pub async fn export_dbnum_instances_parquet(
 
         for child in children {
             let export_inst = export_inst_map.get(&child.refno);
-            let Some(export_inst) = export_inst else { continue };
-            if export_inst.insts.is_empty() { continue }
+            let Some(export_inst) = export_inst else {
+                if verbose && child.refno.to_string() == "24381_145019" {
+                    println!("   [debug] 24381_145019 跳过: 不在 export_inst_map（无 geo_relate/inst_relate_bool）");
+                }
+                continue;
+            };
+            if export_inst.insts.is_empty() {
+                if verbose && child.refno.to_string() == "24381_145019" {
+                    println!("   [debug] 24381_145019 跳过: export_inst.insts 为空（有结构无几何）");
+                }
+                continue;
+            }
 
             let child_aabb_hash = export_inst.world_aabb_hash.clone()
                 .unwrap_or_default();
@@ -1049,6 +1118,11 @@ pub async fn export_dbnum_instances_parquet(
                     .and_then(|v| u32::try_from(v).ok())
                     .unwrap_or(0);
 
+                let mut tubi_spec = tubi.spec_value.unwrap_or(0);
+                if tubi_spec == 0 {
+                    tubi_spec = *spec_info_map.get(&refno_to_u64(owner_refno)).unwrap_or(&0);
+                }
+
                 tubing_rows.push(TubingRow {
                     tubi_refno_str: tubi.leave.to_string(),
                     tubi_refno_u64: refno_to_u64(&tubi.leave),
@@ -1058,7 +1132,7 @@ pub async fn export_dbnum_instances_parquet(
                     geo_hash,
                     trans_hash,
                     aabb_hash,
-                    spec_value: tubi.spec_value.unwrap_or(0),
+                    spec_value: tubi_spec,
                     dbnum,
                 });
                 record_geo_hash_usage(

@@ -327,7 +327,7 @@ fn parse_inst_relate_aabb(value: &JsonValue) -> Option<Aabb> {
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 #[derive(Debug, Deserialize, SurrealValue)]
 struct QueryAabbRowRaw {
-    refno: Option<RefnoEnum>,
+    refno: RefnoEnum, // 表查询 in.id 返回 RecordId，RefnoEnum 可直接反序列化
     aabb: JsonValue,
 }
 
@@ -345,25 +345,53 @@ pub(crate) async fn query_aabb_from_inst_relate_aabb(
     let pe_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
     let ids = pe_keys.join(",");
 
-    // 图遍历：FROM [ids]->inst_relate_aabb；WHERE 过滤 in/out 为 None 的行
+    // 图遍历 FROM [ids]->inst_relate_aabb 在此数据上返回 0 行（SurrealDB 语义差异），改用表查询
     let sql = format!(
-        "SELECT in as refno, out.d as aabb FROM [{ids}]->inst_relate_aabb WHERE in != NONE AND out.d != NONE"
+        "SELECT in.id as refno, out.d as aabb FROM inst_relate_aabb WHERE in INSIDE [{ids}] AND out.d != NONE"
     );
 
     let mut response = model_primary_db().query(&sql).await?;
     let rows: Vec<QueryAabbRowRaw> = response.take(0)?;
+    let total_rows = rows.len();
+
+    let debug_query = env::var("AIOS_ROOM_DEBUG")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     let mut map = HashMap::new();
+    let mut skipped_refno = 0usize;
+    let mut skipped_aabb = 0usize;
     for row in rows {
-        let Some(refno) = row.refno.filter(RefnoEnum::is_valid) else {
+        if !row.refno.is_valid() {
+            skipped_refno += 1;
+            if debug_query {
+                debug!("query_aabb_from_inst_relate_aabb: 跳过 refno invalid {}", row.refno);
+            }
             continue;
-        };
+        }
         let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
+            skipped_aabb += 1;
+            if debug_query {
+                debug!(
+                    "query_aabb_from_inst_relate_aabb: 跳过 aabb 解析失败 refno={}",
+                    row.refno
+                );
+            }
             continue;
         };
-        map.entry(refno)
+        map.entry(row.refno)
             .and_modify(|acc| *acc = merge_aabb(acc, &aabb))
             .or_insert(aabb);
+    }
+    if debug_query {
+        println!(
+            "[room_debug] query_aabb_from_inst_relate_aabb: rows={} skipped_refno={} skipped_aabb={} map_size={}",
+            total_rows, skipped_refno, skipped_aabb, map.len()
+        );
+        if total_rows > 0 && map.is_empty() {
+            println!("[room_debug] 所有 {} 行均被过滤", total_rows);
+        }
     }
     Ok(map)
 }

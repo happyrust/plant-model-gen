@@ -282,7 +282,7 @@ surreal_password = "root"
 
 # SurrealDB 连接配置 (PE/属性/输入数据)
 [surrealdb]
-mode = "ws"
+mode = "file"
 path = "D:/backup-dbs/ams-8020.db"
 
 # SurrealKV 连接配置 (模型数据写入)

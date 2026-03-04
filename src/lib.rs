@@ -503,6 +503,46 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 
         gen_all_geos_data(vec![], &db_option_ext, None, None).await?;
 
+        // 模型生成完成后，若启用 export_parquet_after_gen，按 manual_db_nums 逐个导出 Parquet
+        if db_option_ext.export_parquet_after_gen {
+            if let Some(ref dbnums) = db_option_ext.inner.manual_db_nums {
+                if !dbnums.is_empty() {
+                    #[cfg(feature = "parquet-export")]
+                    {
+                        use aios_core::init_surreal;
+                        use crate::fast_model::export_model::export_dbnum_instances_parquet::export_dbnum_instances_parquet;
+                        use std::sync::Arc;
+
+                        init_surreal().await?;
+                        let base_output_dir =
+                            db_option_ext.get_project_output_dir().join("parquet");
+                        let db_option = Arc::new(db_option_ext.inner.clone());
+                        for &dbnum in dbnums {
+                            log::info!("📦 自动导出 dbnum={} 的 Parquet...", dbnum);
+                            let output_dir = base_output_dir.join(dbnum.to_string());
+                            if let Err(e) = export_dbnum_instances_parquet(
+                                dbnum,
+                                &output_dir,
+                                db_option.clone(),
+                                true, // verbose
+                                None, // target_unit
+                                None, // root_refno
+                            )
+                            .await
+                            {
+                                log::error!("Parquet 导出 dbnum={} 失败: {}", dbnum, e);
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "parquet-export"))]
+                    {
+                        log::warn!("export_parquet_after_gen 已启用，但 parquet-export 特性未编译，跳过 Parquet 导出");
+                    }
+                }
+            } else {
+                log::warn!("export_parquet_after_gen 已启用，但 manual_db_nums 未设置，无法按 dbnum 导出 Parquet");
+            }
+        }
     }
 
 

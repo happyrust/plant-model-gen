@@ -269,6 +269,17 @@ impl DbMetaManager {
         self.db_files.read().unwrap().get(&dbnum).cloned()
     }
 
+    /// 根据 dbnum 从 ref0_to_dbnum 反查对应的 ref0 列表
+    /// 当 db_files 无该 dbnum 或 ref0s 为空时，用此方法兜底（ref0 ≠ dbnum）
+    pub fn get_ref0s_by_dbnum(&self, dbnum: u32) -> Vec<u32> {
+        self.ref0_to_dbnum
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(|(&ref0, &d)| if d == dbnum { Some(ref0) } else { None })
+            .collect()
+    }
+
     /// 将 ref0 列表转换为 dbnum 列表（去重）
     pub fn ref0s_to_dbnums(&self, ref0s: &[u32]) -> Vec<u32> {
         let dbnums: std::collections::HashSet<u32> = ref0s

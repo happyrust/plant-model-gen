@@ -111,8 +111,8 @@ pub async fn cal_equip_nearest_floor() -> anyhow::Result<()> {
             .join(",");
         let sql = format!(
             "SELECT VALUE out.d \
-             FROM inst_relate_aabb \
-             WHERE in IN [{pe_keys}] AND out.d != none"
+             FROM [{pe_keys}]->inst_relate_aabb \
+             WHERE out.d != none"
         );
         let raw_values: Vec<JsonValue> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
         let Ok(aabbs) = raw_values

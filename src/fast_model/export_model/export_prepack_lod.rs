@@ -506,40 +506,22 @@ pub async fn export_prepack_lod_for_refnos(
         let mut children: Vec<RefnoEnum> = Vec::new();
 
         for chunk in expanded_refnos.chunks(SQL_BATCH_SIZE) {
-
-            let pe_keys_str = chunk
-
+            let owner_refnos = chunk
                 .iter()
-
                 .map(|r| r.to_pe_key())
-
-                .collect::<Vec<_>>()
-
-                .join(", ");
-
+                .collect::<Vec<_>>();
             let sql = format!(
-
                 r#"
-
                 SELECT VALUE in.id FROM inst_relate
-
-                WHERE owner_type = 'EQUI' AND owner_refno IN [{}]
-
-            "#,
-
-                pe_keys_str
-
+                WHERE owner_type = 'EQUI' AND owner_refno IN $owner_refnos
+            "#
             );
-
-
-
-            let batch_children: Vec<RefnoEnum> = aios_core::model_primary_db()
-
-                .query_take(sql, 0)
-
+            let mut resp = aios_core::model_primary_db()
+                .query(sql)
+                .bind(("owner_refnos", owner_refnos))
                 .await
-
                 .with_context(|| "查询 EQUI 子组件失败")?;
+            let batch_children: Vec<RefnoEnum> = resp.take(0).unwrap_or_default();
 
             children.extend(batch_children);
 
@@ -846,40 +828,22 @@ pub async fn export_prepack_lod_for_refnos(
         let mut bran_hang_owners: Vec<RefnoEnum> = Vec::new();
 
         for chunk in all_refnos.chunks(SQL_BATCH_SIZE) {
-
-            let pe_keys_str = chunk
-
+            let owner_refnos = chunk
                 .iter()
-
                 .map(|r| r.to_pe_key())
-
-                .collect::<Vec<_>>()
-
-                .join(", ");
-
+                .collect::<Vec<_>>();
             let sql = format!(
-
                 r#"
-
                 SELECT VALUE owner_refno FROM inst_relate
-
-                WHERE owner_type in ['BRAN', 'HANG'] AND owner_refno IN [{}]
-
-            "#,
-
-                pe_keys_str
-
+                WHERE owner_type in ['BRAN', 'HANG'] AND owner_refno IN $owner_refnos
+            "#
             );
-
-
-
-            let batch_owners: Vec<RefnoEnum> = aios_core::model_primary_db()
-
-                .query_take(sql, 0)
-
+            let mut resp = aios_core::model_primary_db()
+                .query(sql)
+                .bind(("owner_refnos", owner_refnos))
                 .await
-
                 .with_context(|| "查询 BRAN/HANG owner 失败")?;
+            let batch_owners: Vec<RefnoEnum> = resp.take(0).unwrap_or_default();
 
             bran_hang_owners.extend(batch_owners);
 
@@ -934,40 +898,22 @@ pub async fn export_prepack_lod_for_refnos(
         let mut equi_owner_list: Vec<RefnoEnum> = Vec::new();
 
         for chunk in all_refnos.chunks(SQL_BATCH_SIZE) {
-
-            let pe_keys_str = chunk
-
+            let owner_refnos = chunk
                 .iter()
-
                 .map(|r| r.to_pe_key())
-
-                .collect::<Vec<_>>()
-
-                .join(", ");
-
+                .collect::<Vec<_>>();
             let sql = format!(
-
                 r#"
-
                 SELECT VALUE owner_refno FROM inst_relate
-
-                WHERE owner_type = 'EQUI' AND owner_refno IN [{}]
-
-            "#,
-
-                pe_keys_str
-
+                WHERE owner_type = 'EQUI' AND owner_refno IN $owner_refnos
+            "#
             );
-
-
-
-            let batch_owners: Vec<RefnoEnum> = aios_core::model_primary_db()
-
-                .query_take(sql, 0)
-
+            let mut resp = aios_core::model_primary_db()
+                .query(sql)
+                .bind(("owner_refnos", owner_refnos))
                 .await
-
                 .with_context(|| "查询 EQUI owner 失败")?;
+            let batch_owners: Vec<RefnoEnum> = resp.take(0).unwrap_or_default();
 
             equi_owner_list.extend(batch_owners);
 
@@ -3401,35 +3347,13 @@ pub async fn export_all_relates_prepack_lod(
 
 
 
-    // P2 修复：移除重复的 normalized_owner_types 声明，复用上面第 1608 行的变量
-
-    let owner_filter_clause =
-
-        if let Some(types) = normalized_owner_types.as_ref().filter(|v| !v.is_empty()) {
-
-            let list = types
-
-                .iter()
-
-                .map(|t| format!("'{}'", t))
-
-                .collect::<Vec<_>>()
-
-                .join(", ");
-
-            println!("   - 按 owner_type 过滤 inst_relate: {:?}", types);
-
-            // 修复：只按 owner_type 过滤，不使用 generic 字段避免不精确匹配
-
-            format!(" AND owner_type IN [{list}]")
-
-        } else {
-
-            println!("   - 未指定 owner_type 过滤（仅排除 EQUI）");
-
-            String::new()
-
-        };
+    // 过滤条件改为参数绑定，避免拼接 `owner_type IN [..]` 列表
+    let owner_types_filter = normalized_owner_types.clone().unwrap_or_default();
+    if owner_types_filter.is_empty() {
+        println!("   - 未指定 owner_type 过滤（仅排除 EQUI）");
+    } else {
+        println!("   - 按 owner_type 过滤 inst_relate: {:?}", owner_types_filter);
+    }
 
 
 
@@ -3460,14 +3384,14 @@ pub async fn export_all_relates_prepack_lod(
     // 4. 再次扫描 inst_relate，收集需要导出的实体（不按 owner_type 过滤，仅排除 EQUI）
 
     let sql_all = format!(
-
-        "SELECT value in.id FROM inst_relate WHERE {}{} AND record::exists(type::record('inst_relate_aabb', record::id(in)))",
-
-        db_filter, owner_filter_clause
-
+        "SELECT value in.id FROM inst_relate WHERE {} AND (array::len($owner_types) = 0 OR owner_type IN $owner_types) AND record::exists(type::record('inst_relate_aabb', record::id(in)))",
+        db_filter
     );
-
-    let mut all_refnos: Vec<RefnoEnum> = aios_core::model_primary_db().query_take(&sql_all, 0).await?;
+    let mut resp = aios_core::model_primary_db()
+        .query(&sql_all)
+        .bind(("owner_types", owner_types_filter))
+        .await?;
+    let mut all_refnos: Vec<RefnoEnum> = resp.take(0)?;
 
 
 
@@ -3884,31 +3808,12 @@ pub async fn export_all_relates_prepack_lod_parquet(
 
         .map(|types| types.iter().map(|t| t.to_uppercase()).collect::<Vec<_>>());
 
-    let owner_filter_clause =
-
-        if let Some(types) = normalized_owner_types.as_ref().filter(|v| !v.is_empty()) {
-
-            let list = types
-
-                .iter()
-
-                .map(|t| format!("'{}'", t))
-
-                .collect::<Vec<_>>()
-
-                .join(", ");
-
-            println!("   - 按 owner_type 过滤 inst_relate: {:?}", types);
-
-            format!(" AND owner_type IN [{list}]")
-
-        } else {
-
-            println!("   - 未指定 owner_type 过滤（仅排除 EQUI）");
-
-            String::new()
-
-        };
+    let owner_types_filter = normalized_owner_types.clone().unwrap_or_default();
+    if owner_types_filter.is_empty() {
+        println!("   - 未指定 owner_type 过滤（仅排除 EQUI）");
+    } else {
+        println!("   - 按 owner_type 过滤 inst_relate: {:?}", owner_types_filter);
+    }
 
 
 
@@ -3935,14 +3840,14 @@ pub async fn export_all_relates_prepack_lod_parquet(
 
 
     let sql_all = format!(
-
-        "SELECT value in.id FROM inst_relate WHERE {}{} AND record::exists(type::record('inst_relate_aabb', record::id(in)))",
-
-        db_filter, owner_filter_clause
-
+        "SELECT value in.id FROM inst_relate WHERE {} AND (array::len($owner_types) = 0 OR owner_type IN $owner_types) AND record::exists(type::record('inst_relate_aabb', record::id(in)))",
+        db_filter
     );
-
-    let mut all_refnos: Vec<RefnoEnum> = aios_core::model_primary_db().query_take(&sql_all, 0).await?;
+    let mut resp = aios_core::model_primary_db()
+        .query(&sql_all)
+        .bind(("owner_types", owner_types_filter))
+        .await?;
+    let mut all_refnos: Vec<RefnoEnum> = resp.take(0)?;
 
 
 

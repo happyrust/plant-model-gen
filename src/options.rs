@@ -145,6 +145,11 @@ pub struct DbOptionExt {
     #[serde(default)]
     pub index_tree_debug_limit_per_target_type: Option<usize>,
 
+    /// 模型生成空跑模式：仅收集 refno 并记录日志，不执行几何生成、DB 写入等
+    /// 用于第一步调试分析（如检查 24381_145019 是否进入处理管道）
+    #[serde(default)]
+    pub gen_model_dry_run: bool,
+
     /// 生成的模型格式列表
     /// 默认为 [PdmsMesh]
     #[serde(default)]
@@ -316,6 +321,7 @@ impl From<DbOption> for DbOptionExt {
             boolean_pipeline_mode: BooleanPipelineMode::DbLegacy,
             regen_delete_mode: RegenDeleteMode::Legacy,
             enable_db_backfill: false,
+            gen_model_dry_run: false,
         }
     }
 }
@@ -498,6 +504,11 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let gen_model_dry_run = toml_value
+        .get("gen_model_dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let export_parquet_after_gen = toml_value
         .get("export_parquet_after_gen")
         .and_then(|v| v.as_bool())
@@ -526,6 +537,7 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         boolean_pipeline_mode,
         regen_delete_mode,
         enable_db_backfill,
+        gen_model_dry_run,
     };
 
     validate_data_source_mode(db_option_ext.use_surrealdb).map_err(

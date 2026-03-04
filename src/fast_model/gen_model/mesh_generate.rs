@@ -2010,7 +2010,7 @@ async fn filter_missing_inst_aabb(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<Re
     }
 
     let sql = format!(
-        "SELECT value in FROM inst_relate_aabb WHERE in IN [{}]",
+        "SELECT value in FROM [{}]->inst_relate_aabb",
         pe_keys.join(",")
     );
 

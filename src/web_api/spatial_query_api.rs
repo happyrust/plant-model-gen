@@ -304,11 +304,11 @@ async fn query_children_by_type(
             }
             let ids = children
                 .iter()
-                .map(|r| r.refno().0.to_string())
+                .map(|r| r.to_pe_key())
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "SELECT refno, name, noun FROM pe WHERE refno IN [{}] LIMIT 100",
+                "SELECT refno, name, noun FROM [{}] LIMIT 100",
                 ids
             )
         }

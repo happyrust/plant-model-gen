@@ -619,7 +619,7 @@ async fn get_site_nodes(
                 .join(",");
 
             let sql = format!(
-                "SELECT VALUE record::id(out) FROM contains WHERE in IN [{}]",
+                "SELECT VALUE record::id(out) FROM [{}]->contains",
                 in_list
             );
             let children: Vec<i64> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();

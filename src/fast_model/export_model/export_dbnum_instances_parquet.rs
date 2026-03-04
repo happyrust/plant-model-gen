@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use aios_core::options::DbOption;
@@ -506,6 +507,12 @@ struct AabbQueryRow {
     d: Option<aios_core::types::PlantAabb>,
 }
 
+/// 诊断用：count() GROUP ALL 的返回行（plant-surrealdb 技能：用 SurrealValue 强类型）
+#[derive(Debug, Deserialize, SurrealValue)]
+struct CountRow {
+    cnt: u64,
+}
+
 // =============================================================================
 // SurrealDB 查询函数
 // =============================================================================
@@ -517,49 +524,54 @@ async fn query_inst_relate_by_dbnum(
 ) -> Result<Vec<InstRelateRow>> {
     use crate::data_interface::db_meta;
 
-    // 1. 获取 dbnum 对应的 ref0 列表
+    // 1. 获取 dbnum 对应的 ref0 列表（ref0 ≠ dbnum，需从 db_meta_info 映射）
     db_meta().ensure_loaded()?;
-    let ref0s = db_meta()
-        .get_db_file_info(dbnum)
-        .map(|info| info.ref0s)
-        .unwrap_or_else(|| {
-            // fallback：假设 ref0 == dbnum（单库常见情况）
-            if verbose {
-                println!("⚠️  db_meta_info 中未找到 dbnum={} 的文件信息，fallback ref0={}", dbnum, dbnum);
+    let (ref0s, ref0_source) = match db_meta().get_db_file_info(dbnum) {
+        Some(info) if !info.ref0s.is_empty() => (info.ref0s, "db_files"),
+        _ => {
+            let from_ref0_map = db_meta().get_ref0s_by_dbnum(dbnum);
+            if !from_ref0_map.is_empty() {
+                if verbose {
+                    println!("🔍 dbnum={} 从 ref0_to_dbnum 反查得到 ref0 列表: {:?}", dbnum, from_ref0_map);
+                }
+                (from_ref0_map, "ref0_to_dbnum")
+            } else {
+                if verbose {
+                    println!("⚠️  dbnum={} 无 ref0 映射，fallback ref0=[{}]", dbnum, dbnum);
+                }
+                (vec![dbnum], "fallback")
             }
-            vec![dbnum]
-        });
+        }
+    };
 
     if verbose {
         println!("🔍 dbnum={} 对应 ref0 列表: {:?}", dbnum, ref0s);
     }
 
-    // 2. 按 ref0 前缀扫描 inst_relate
-    let where_clause = ref0s
-        .iter()
-        .map(|ref0| format!("string::starts_with(record::id(id), \"{ref0}_\")"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-
-    let sql = format!(
-        r#"
-        SELECT
-            owner_refno,
-            owner_type,
-            in as refno,
-            in.noun as noun,
-            spec_value as spec_value
-        FROM inst_relate
-        WHERE {where_clause}
-        "#
-    );
-
+    // 2. 使用 ID range 扫描 inst_relate（inst_relate 的 id 格式为 inst_relate:⟨ref0_ref1⟩）
+    // 直接用 range 查询比 WHERE 条件更高效，利用 SurrealDB 的 O(log n) ID 范围扫描
+    const REF1_RANGE_END: u32 = 1_000_000;
     if verbose {
-        println!("🔍 扫描 inst_relate (ref0 前缀过滤)...");
+        println!("🔍 扫描 inst_relate (ID range，{} 个 ref0)...", ref0s.len());
     }
+    let mut rows: Vec<InstRelateRow> = Vec::new();
+    for ref0 in &ref0s {
+        let sql = format!(
+            r#"
+            SELECT
+                owner_refno,
+                owner_type,
+                in as refno,
+                in.noun as noun,
+                spec_value as spec_value
+            FROM inst_relate:⟨{ref0}_0⟩..inst_relate:⟨{ref0}_{REF1_RANGE_END}⟩
+            "#
+        );
 
-    let rows: Vec<InstRelateRow> =
-        aios_core::project_primary_db().query_take(&sql, 0).await?;
+        let batch: Vec<InstRelateRow> =
+            aios_core::project_primary_db().query_take(&sql, 0).await?;
+        rows.extend(batch);
+    }
 
     if verbose {
         println!("✅ inst_relate 命中记录: {}", rows.len());
@@ -604,8 +616,7 @@ async fn query_inst_relate_by_refnos(
                 in as refno,
                 in.noun as noun,
                 spec_value as spec_value
-            FROM inst_relate
-            WHERE in IN [{pe_list}]
+            FROM [{pe_list}]->inst_relate
             "#
         );
 
@@ -853,6 +864,8 @@ pub async fn export_dbnum_instances_parquet(
         println!("🚀 开始导出 dbnum={} 的实例数据为 Parquet，目标单位: {:?}", dbnum, target);
     }
 
+    const TRACE_REFNO: &str = "24381_145019"; // 诊断用：逐阶段追踪
+
     // 确保输出目录存在
     fs::create_dir_all(output_dir)
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
@@ -882,6 +895,39 @@ pub async fn export_dbnum_instances_parquet(
     };
 
     // =========================================================================
+    // 诊断：几何实例链检查（plant-surrealdb 技能：图遍历 pe->inst_relate / pe->inst_relate_aabb）
+    // 使用图查询而非 WHERE in = ...，符合 SurrealDB 关系表约定
+    // =========================================================================
+    if verbose {
+        let refno_str = TRACE_REFNO.replace('_', "/");
+        if let Ok(trace_refno) = RefnoEnum::from_str(&refno_str) {
+            let pe_key = trace_refno.to_pe_key();
+            let diag_sql = format!(
+                "SELECT count() as cnt FROM {pe_key}->inst_relate GROUP ALL; \
+                 SELECT count() as cnt FROM {pe_key}->inst_relate_aabb[? out != NONE AND out.d != NONE] GROUP ALL;"
+            );
+            if let Ok(mut resp) = aios_core::project_primary_db().query_response(&diag_sql).await {
+                let inst_cnt: u64 = resp
+                    .take::<Vec<CountRow>>(0)
+                    .ok()
+                    .and_then(|v| v.into_iter().next())
+                    .map(|r| r.cnt)
+                    .unwrap_or(0);
+                let aabb_cnt: u64 = resp
+                    .take::<Vec<CountRow>>(1)
+                    .ok()
+                    .and_then(|v| v.into_iter().next())
+                    .map(|r| r.cnt)
+                    .unwrap_or(0);
+                println!(
+                    "   [diag {}] inst_relate={} inst_relate_aabb(有效)={} | 若 aabb=0 需跑 update_inst_relate_aabbs_by_refnos",
+                    TRACE_REFNO, inst_cnt, aabb_cnt
+                );
+            }
+        }
+    }
+
+    // =========================================================================
     // 1-2. 扫描 inst_relate（按 dbnum 对应的 ref0 前缀过滤）
     // =========================================================================
     let inst_rows = if let Some(root) = root_refno {
@@ -891,29 +937,19 @@ pub async fn export_dbnum_instances_parquet(
             println!("🔍 查询 {} 的可见实例节点...", root);
         }
         let sub_refnos = query_deep_visible_inst_refnos(root).await?;
+        let in_sub = sub_refnos.iter().any(|r| r.to_string() == TRACE_REFNO);
         if verbose {
             println!("✅ 子树 refno 数量: {}", sub_refnos.len());
-            let has_145019 = sub_refnos.iter().any(|r| r.to_string() == "24381_145019");
-            if !has_145019 {
-                println!("   ⚠️ 24381_145019 不在 query_deep_visible_inst_refnos 结果中（TreeIndex 查询）");
-            }
+            println!("   [trace {}] 阶段0 sub_refnos(TreeIndex): {}", TRACE_REFNO, if in_sub { "✓" } else { "✗" });
         }
         query_inst_relate_by_refnos(&sub_refnos, verbose).await?
     } else {
         query_inst_relate_by_dbnum(dbnum, verbose).await?
     };
 
-    // 诊断：若 verbose 且目标 refno 不在 inst_rows 中，提示可能原因
+    let in_inst = inst_rows.iter().any(|r| r.refno.to_string() == TRACE_REFNO);
     if verbose {
-        const DEBUG_REFNO: &str = "24381_145019";
-        let has_target = inst_rows.iter().any(|r| r.refno.to_string() == DEBUG_REFNO);
-        if !has_target && root_refno.is_some() {
-            println!("   ⚠️ {} 不在 inst_rows 中。可能原因: query_deep_visible_inst_refnos 未返回该 refno（TreeIndex 中无或非 BRAN 直连子节点）", DEBUG_REFNO);
-        } else if !has_target {
-            println!("   ⚠️ {} 不在 inst_rows 中。可能原因: inst_relate 无此记录或 ref0 前缀过滤未命中", DEBUG_REFNO);
-        } else {
-            println!("   ✓ {} 在 inst_rows 中，继续检查几何体...", DEBUG_REFNO);
-        }
+        println!("   [trace {}] 阶段1 inst_rows: {} (共{}条)", TRACE_REFNO, if in_inst { "✓" } else { "✗" }, inst_rows.len());
     }
 
     // 按 owner 分组
@@ -983,9 +1019,10 @@ pub async fn export_dbnum_instances_parquet(
                 for inst in export_insts {
                     export_inst_map.insert(inst.refno, inst);
                 }
+                let in_export = export_inst_map.keys().any(|r| r.to_string() == TRACE_REFNO);
+                let insts_len = export_inst_map.iter().find(|(r, _)| r.to_string() == TRACE_REFNO).map(|(_, e)| e.insts.len()).unwrap_or(0);
                 if verbose {
                     println!("✅ 查询到 {} 个 refno 有几何体实例 (inst_relate 共 {} 个)", export_inst_map.len(), in_refnos.len());
-                    // 诊断：inst_relate 有但 query_insts_for_export 无（缺 geo_relate/inst_relate_bool）
                     let in_set: HashSet<_> = in_refnos.iter().collect();
                     let exported_set: HashSet<_> = export_inst_map.keys().collect();
                     let missing_geo: Vec<_> = in_set.difference(&exported_set).collect();
@@ -994,6 +1031,7 @@ pub async fn export_dbnum_instances_parquet(
                     } else if !missing_geo.is_empty() {
                         println!("   ⚠️ {} 个 refno 在 inst_relate 但无几何体，样例: {:?}", missing_geo.len(), missing_geo.iter().take(5).map(|r| r.to_string()).collect::<Vec<_>>());
                     }
+                    println!("   [trace {}] 阶段2 export_inst_map: {} (insts={})", TRACE_REFNO, if in_export { "✓" } else { "✗" }, insts_len);
                 }
             }
             Err(e) => {
@@ -1037,18 +1075,8 @@ pub async fn export_dbnum_instances_parquet(
 
         for child in children {
             let export_inst = export_inst_map.get(&child.refno);
-            let Some(export_inst) = export_inst else {
-                if verbose && child.refno.to_string() == "24381_145019" {
-                    println!("   [debug] 24381_145019 跳过: 不在 export_inst_map（无 geo_relate/inst_relate_bool）");
-                }
-                continue;
-            };
-            if export_inst.insts.is_empty() {
-                if verbose && child.refno.to_string() == "24381_145019" {
-                    println!("   [debug] 24381_145019 跳过: export_inst.insts 为空（有结构无几何）");
-                }
-                continue;
-            }
+            let Some(export_inst) = export_inst else { continue };
+            if export_inst.insts.is_empty() { continue }
 
             let child_aabb_hash = export_inst.world_aabb_hash.clone()
                 .unwrap_or_default();
@@ -1187,6 +1215,11 @@ pub async fn export_dbnum_instances_parquet(
                 &mut row_count_by_hash,
             );
         }
+    }
+
+    let in_final = instance_rows.iter().any(|r| r.refno_str == TRACE_REFNO);
+    if verbose {
+        println!("   [trace {}] 阶段3 instance_rows(最终输出): {} (共{}行)", TRACE_REFNO, if in_final { "✓" } else { "✗" }, instance_rows.len());
     }
 
     let missing_mesh_report = write_missing_mesh_report(

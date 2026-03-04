@@ -107,7 +107,7 @@ pub async fn query_ungenerated_leaves(root_id: i64) -> Result<Vec<i64>> {
 
             // 关系表 contains 的 in/out 字段是 record<scene_node>
             let sql = format!(
-                "SELECT VALUE record::id(out) FROM contains WHERE in IN [{}]",
+                "SELECT VALUE record::id(out) FROM [{}]->contains",
                 in_list
             );
             let children: Vec<i64> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();

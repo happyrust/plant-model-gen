@@ -1,3 +1,4 @@
+# ====== rs-core 同步管线（仅 run_app 同步流程使用，不影响模型生成/导出） ======
 total_sync = false
 replace_dbs = false
 incr_sync = false
@@ -10,7 +11,7 @@ sync_live = false
 enable_index = false
 sync_chunk_size = 10_0000
 
-#项目设置
+# ====== 项目设置 ======
 project_path = "D:/AVEVA/Projects/E3D2.1"
 #project_path = "/Volumes/DPC/work/e3d_models"
 included_projects = ["AvevaMarineSample", "AvevaCatalogue", "SCB", "ZDJ"]
@@ -22,27 +23,30 @@ project_name = "AvevaMarineSample"
 project_code = '1516'
 surreal_ns = '1516'
 module = "DESI"
-#是否生成模型数据
+
+# ====== 模型生成 ======
 gen_model = true
 gen_mesh = true
 replace_mesh = false
 save_db = true
-# 数据输入来源固定为 SurrealDB（use_cache 已废弃并会被忽略）
-use_surrealdb = true
+# 数据输入来源固定为 SurrealDB（use_surrealdb 已硬编码为 true，无需配置）
 defer_db_write = false
 boolean_pipeline_mode = "db_legacy"
-# 解析期只生成 scene tree 文件，跳过 PE/属性数据保存
 gen_tree_only = false
 apply_boolean_operation = true
 mesh_tol_ratio = 3.0
-#是否启用房间计算
+gen_model_batch_size = 16
+build_cate_relate = false
+meshes_path = "./assets/meshes"
+gen_history_model = false
+
+# ====== 空间计算 ======
 gen_spatial_tree = true
 load_spatial_tree = false
 save_spatial_tree_to_db = false
 enable_sqlite_rtree = true
-gen_model_batch_size = 16
 
-# IndexTree 默认管线调优配置
+# ====== IndexTree 默认管线调优配置 ======
 index_tree_max_concurrent_targets = 6
 index_tree_batch_size = 200
 
@@ -60,102 +64,68 @@ index_tree_enabled_target_types = ["BRAN"]
 # 设置为 0 表示不限制（生成所有房间模型）
 index_tree_debug_limit_per_target_type = 0
 
-build_cate_relate = false
-
-meshes_path = "./assets/meshes"
-
-#生成补充类型的graph，方便查询直接生成语句
-gen_noun_graph = false
-
 # 仅生成/计算与目标构件相关的 dbno，避免全库跑
 # manual_db_nums = [1112]
 
-#arangodb 配置
-arangodb_database = "ams"
-multi_threads = false
+# ====== 同步管线辅助配置 ======
 only_sync_sys = false
-arangodb_url = "http://127.0.0.1:8529"
 rebuild_ssc_tree = false
-arangodb_user = "root"
-arangodb_password = ""
 
-#tidb 配置
+# ====== TiDB 配置 ======
 ip = "127.0.0.1"
 user = "root"
 password = ""
 port = "3306"
 #port = "4000"
-sql_threads_number = 10
-batch_insert_sql_cnt = 100 #mysql 批量插入的数量
+sql_threads_number = 50
+batch_insert_sql_cnt = 100
 
-
-# surrealdb数据库配置
-v_ip = "localhost"
-v_port = 8020
-v_user = "root"
-v_password = "root"
+# ====== SurrealDB 连接认证（rs-core init_surreal 使用） ======
+surreal_ip = "localhost"
+surreal_port = 8020
+surreal_user = "root"
+surreal_password = "root"
 pe_chunk = 300
 att_chunk = 200
 
-kv_ip = "localhost"
-kv_port = "8010"
-
-
-#mqtt 事件 ip
+# ====== MQTT ======
 mqtt_host = "127.0.0.1"
-
-
 mqtt_port = 1883
 
-
+# ====== 部署配置 ======
 location = "sjz"
-
-
 location_dbs = [251181]
-
-
-#服务器启动配置
-server_release_ip = "127.0.0.1:9099"
-
-# hash文件的站点
-remote_file_server_hosts = []
 file_server_host = "http://localhost:8082/assets/archives"
-
+remote_file_server_hosts = []
 surreal_script_dir = "../rs-core/resource/surreal"
 
-
-#调试选项
-need_sync_refno_basic = false       #是否重新生成 refno_basic 缓存
-reset_mdb_project = false           #是否重新生成 mdb 缓存
+# ====== 调试选项 ======
+need_sync_refno_basic = false
+reset_mdb_project = false
 only_update_dbinfo = false
 debug_print_world_transform = false
 only_rebuild_pdms_element = false
-
 debug_refno_types = ["CATA", "LOOP", "PRIM"]
 # included_db_files = ["ams1112_0001"]
 # manual_db_nums = [1112, 25688, 7999, 8000, 7997]  # IndexTree 默认管线下此配置生效
 # exclude_db_nums = [] #不参与生成模型的数据库编号
-plat_url = ""
 
-#puhua
+# ====== puhua 数据库 ======
 puhua_database_ip = ""
 puhua_database_user = ""
 puhua_database_password = ""
 
-
-room_keyword = "-RM" # 2016  K-R-K100   (-R-)
-# room_keyword = "-R-" # 2016  K-R-K100   (-R-)
+# ====== 房间关键词 ======
+room_key_word = ["-RM"]
+# room_key_word = ["-R-"]  # 2016  K-R-K100  (-R-)
 
 #test_refno = "24381_46952"
 
 # debug_model_refnos = ["25688/7960"]
-gen_history_model = false
 # debug_model_refnos = ["17496/201375"]
-
 # debug_model_refnos = ["24383_73962"]
 
-
-# 精度配置（LOD 分级：数字越大，几何更粗，用于远距渲染）
+# ====== 精度配置（LOD 分级：数字越大，几何更粗，用于远距渲染） ======
 [mesh_precision]
 default_lod = "L1"
 
@@ -248,7 +218,7 @@ max_height_segments = 1
 target_segment_length = 400.0
 non_scalable_factor = 1.0
 
-# 模型中心（洲影）配置
+# ====== 模型中心（洲影）配置 ======
 [model_center]
 # 模型中心服务地址 (IP:端口)
 # 本地开发环境使用 localhost
@@ -259,7 +229,7 @@ token_secret = "your-shared-secret-key"
 # 请求超时时间 (秒)
 timeout_seconds = 30
 
-# 外部校审系统出站调用配置
+# ====== 外部校审系统出站调用配置 ======
 # base_url 为空时自动 mock，不会发出实际请求
 [external_review]
 base_url = ""
@@ -270,7 +240,7 @@ workflow_delete_path = "/api/workflow/delete"
 auth_secret = "shared-review-secret"
 timeout_seconds = 15
 
-# Web Server 配置
+# ====== Web Server 配置 ======
 [web_server]
 port = 8080
 auto_start_surreal = true
@@ -280,12 +250,12 @@ surreal_bind = "0.0.0.0:8020"
 surreal_user = "root"
 surreal_password = "root"
 
-# SurrealDB 连接配置 (PE/属性/输入数据)
+# ====== SurrealDB 连接配置 (PE/属性/输入数据) ======
 [surrealdb]
 mode = "file"
 path = "D:/backup-dbs/ams-8020.db"
 
-# SurrealKV 连接配置 (模型数据写入)
+# ====== SurrealKV 连接配置 (模型数据写入) ======
 # enabled = false 时模型数据写回主 SurrealDB，避免跨库 pe 表缺失
 [surrealkv]
 enabled = false

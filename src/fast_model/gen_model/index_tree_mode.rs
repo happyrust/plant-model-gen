@@ -631,7 +631,10 @@ async fn process_bran_hang_core_logic(
     let branch_refnos_map: DashMap<RefnoEnum, Vec<SPdmsElement>> = DashMap::new();
     let mut total_children: usize = 0;
     for &refno in bran_roots {
-        if let Ok(children) = TreeIndexManager::collect_children_elements_from_tree(refno).await {
+        // 使用 CATE 子孙收集（含孙子层），修复 ELBO 等非直子管件漏掉问题（如 BRAN->CONN->ELBO）
+        if let Ok(children) =
+            TreeIndexManager::collect_bran_cate_descendant_elements_from_tree(refno).await
+        {
             total_children += children.len();
             for child in &children {
                 bran_generated_refnos.insert(child.refno);
@@ -686,6 +689,19 @@ async fn process_bran_hang_core_logic(
         "  [BRAN perf] 阶段2 build_cata_hash_map: {} ms (child_refnos={}, unique_cata={})",
         t2_ms, child_refnos.len(), unique_cata_cnt
     );
+    // 记录每个 BRAN 子 refno，便于 grep 分析（如 24381_145019 是否进入 gen_cata_instances）
+    for r in &child_refnos {
+        println!("[gen_model] BRAN child refno={}", r.to_string());
+    }
+
+    // 空跑模式：仅检查 refno 是否被处理，跳过几何生成与 DB 写入
+    if db_option.gen_model_dry_run {
+        println!(
+            "  [gen_model] 空跑结束，跳过 gen_cata_instances / gen_branch_tubi（child_refnos={}）",
+            child_refnos.len()
+        );
+        return Ok(());
+    }
 
     // ── 阶段 3: Prefetch（仅 PrefetchThenGenerate） ──
     let t3 = Instant::now();

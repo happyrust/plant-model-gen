@@ -58,7 +58,7 @@ pub async fn fetch_cata_bool_tasks_from_db(
         // 查询 inst_relate 获取 inst_info_id 和 noun
         let inst_sql = format!(
             "SELECT in.id AS refno_id, id AS inst_relate_id, out AS inst_info_id, in.noun AS noun \
-             FROM inst_relate WHERE in IN [{}] AND has_cata_neg = true",
+             FROM [{}]->inst_relate WHERE has_cata_neg = true",
             pe_keys_str
         );
 

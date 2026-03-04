@@ -286,30 +286,18 @@ async fn build_tree_recursive(
 
     // 如果还未达到最大深度，查询子节点
     if depth < max_depth {
-        let mut children_query = format!(
-            "SELECT refno, name, noun, owner FROM pe WHERE owner = {}",
-            refno
-        );
-
-        // 如果指定了名词过滤，添加过滤条件
-        if let Some(nouns) = filter_nouns {
-            if !nouns.is_empty() {
-                let noun_list = nouns
-                    .iter()
-                    .map(|n| format!("'{}'", n))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                children_query.push_str(&format!(" AND noun IN [{}]", noun_list));
-            }
-        }
-
-        children_query.push_str(" LIMIT 100");
+        let nouns_filter = filter_nouns.clone().unwrap_or_default();
+        let children_query =
+            "SELECT refno, name, noun, owner FROM pe WHERE owner = $owner_refno AND (array::len($nouns) = 0 OR noun IN $nouns) LIMIT 100";
 
         match project_primary_db()
-            .query_take::<Vec<PeRow>>(&children_query, 0)
+            .query(children_query)
+            .bind(("owner_refno", refno))
+            .bind(("nouns", nouns_filter))
             .await
         {
-            Ok(records) => {
+            Ok(mut resp) => {
+                let records: Vec<PeRow> = resp.take(0).unwrap_or_default();
                 for record in records {
                     if let (Some(child_refno), Some(child_name), Some(child_noun)) = (
                         record.refno,

@@ -15,49 +15,6 @@ use std::path::{Path, PathBuf};
 
 use chrono::{Datelike, Local, Timelike};
 
-// #region agent log
-// 轻量 NDJSON 记录器：用于 debug-mode 下确认“本次运行的二进制确实生效并能写日志”。
-// 注意：本仓库的其它模块也有各自的 agent_log；这里做一个最小实现，避免 main.rs 直接调用时报未定义。
-#[cfg(not(feature = "gui"))]
-fn agent_now_ms() -> u128 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
-}
-
-#[cfg(not(feature = "gui"))]
-fn agent_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
-    if std::env::var_os("AIOS_AGENT_DEBUG").is_none()
-        && std::env::var_os("AIOS_AGENT_DEBUG_REFNO").is_none()
-        && std::env::var_os("AIOS_AGENT_DEBUG_GEOM_REFNO").is_none()
-        && std::env::var_os("AIOS_LOG_FILE").is_none()
-    {
-        return;
-    }
-
-    use serde_json::json;
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    let run_id = std::env::var("AIOS_AGENT_RUNID").unwrap_or_else(|_| "run1".to_string());
-    let payload = json!({
-        "runId": run_id,
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": agent_now_ms(),
-    });
-
-    let path = r"d:\work\plant-code\gen_model-dev\.cursor\debug.log";
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{}", payload.to_string());
-    }
-}
-// #endregion
-
 #[cfg(not(feature = "gui"))]
 mod cli_modes;
 
@@ -393,28 +350,6 @@ async fn main() -> anyhow::Result<()> {
     // 仅在显式 `--verbose` 或后台服务模式（如 --grpc-server）时保留控制台输出。
     maybe_redirect_stdio_to_log_file();
 
-    // #region agent log
-    // 进程启动心跳：只要启用了 --debug-model（即 AIOS_LOG_FILE 存在）或显式 AIOS_AGENT_DEBUG，就写入 NDJSON，
-    // 用于确认本次运行确实“能写到 debug.log”，避免出现“日志文件不存在”的情况。
-    if std::env::var_os("AIOS_LOG_FILE").is_some()
-        || std::env::var_os("AIOS_AGENT_DEBUG").is_some()
-        || std::env::var_os("AIOS_AGENT_DEBUG_REFNO").is_some()
-        || std::env::var_os("AIOS_AGENT_DEBUG_GEOM_REFNO").is_some()
-    {
-        agent_log(
-            "H0",
-            "main.rs:main",
-            "startup",
-            serde_json::json!({
-                "AIOS_LOG_FILE": std::env::var("AIOS_LOG_FILE").ok(),
-                "AIOS_AGENT_RUNID": std::env::var("AIOS_AGENT_RUNID").ok(),
-                "AIOS_AGENT_DEBUG_REFNO": std::env::var("AIOS_AGENT_DEBUG_REFNO").ok(),
-                "AIOS_AGENT_DEBUG_GEOM_REFNO": std::env::var("AIOS_AGENT_DEBUG_GEOM_REFNO").ok(),
-            }),
-        );
-    }
-    // #endregion
-
     let matches = Command::new("aios-database")
         .version("0.1.3")
         .about("AIOS Database Processing Tool")
@@ -707,6 +642,12 @@ async fn main() -> anyhow::Result<()> {
                 .help("Limit max instances per noun type during generation (e.g. 50). 0 means unlimited.")
                 .value_name("LIMIT")
                 .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("gen-dry-run")
+                .long("gen-dry-run")
+                .help("Dry run: only collect refnos and log, skip geometry generation and DB writes. Use to verify refnos are processed (e.g. grep 24381_145019)")
+                .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("export-parquet-after-gen")
@@ -1029,6 +970,10 @@ async fn main() -> anyhow::Result<()> {
             db_option_ext.index_tree_debug_limit_per_target_type, override_limit
         );
         db_option_ext.index_tree_debug_limit_per_target_type = override_limit;
+    }
+    if matches.get_flag("gen-dry-run") {
+        db_option_ext.gen_model_dry_run = true;
+        println!("🔧 模型生成空跑模式: 仅收集 refno 并记录日志，跳过几何生成与 DB 写入");
     }
     if matches.get_flag("export-parquet-after-gen") {
         db_option_ext.export_parquet_after_gen = true;

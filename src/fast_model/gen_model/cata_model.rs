@@ -164,6 +164,18 @@ pub struct CateGenOutcome {
 
 }
 
+/// 记录每个 refno 的模型生成信息，便于通过 grep 等工具分析（如判断 24381/145019 是否生成）
+#[inline]
+fn log_cata_refno_generated(refno: &RefnoEnum, info: &EleGeosInfo, source: &str) {
+    println!(
+        "[gen_model] cate refno={} owner={} owner_type={} source={}",
+        refno.to_string(),
+        info.owner_refno.to_string(),
+        info.owner_type,
+        source
+    );
+}
+
 fn build_prepared_inst_geos_from_shapes_for_cache(
 
     shapes: Vec<CateCsgShape>,
@@ -1995,6 +2007,7 @@ async fn gen_cata_geos_inner(
 
                         }
 
+                        log_cata_refno_generated(&ele_refno, &geos_info, "reused");
                         shape_insts_data.insert_info(ele_refno, geos_info);
 
                         if shape_insts_data.inst_cnt() >= SEND_INST_SIZE {
@@ -2830,6 +2843,7 @@ async fn gen_cata_geos_inner(
 
                                 };
 
+                                log_cata_refno_generated(&ele_refno, &geos_info, "cache");
                                 shape_insts_data.insert_info(ele_refno, geos_info);
 
                                 shape_insts_data.insert_geos_data(inst_key, geos_data);
@@ -4058,6 +4072,7 @@ async fn gen_cata_geos_inner(
 
                                 );
 
+                                log_cata_refno_generated(&ele_refno, &geos_info, "generated");
                                 shape_insts_data.insert_info(ele_refno, geos_info.clone());
 
                                 shape_insts_data
@@ -4268,6 +4283,7 @@ async fn gen_cata_geos_inner(
 
                     }
 
+                    log_cata_refno_generated(&ele_refno, &geos_info, "generated");
                     shape_insts_data.insert_info(ele_refno, geos_info);
 
                 }
@@ -7963,7 +7979,7 @@ pub async fn gen_tubi_from_db(
 
         // 约定：BRAN/HANG 的层级/过滤查询统一走 indextree（TreeIndex），避免依赖 SurrealDB 的图查询。
 
-        match crate::fast_model::gen_model::tree_index_manager::TreeIndexManager::collect_children_elements_from_tree(branch_refno).await {
+        match crate::fast_model::gen_model::tree_index_manager::TreeIndexManager::collect_bran_cate_descendant_elements_from_tree(branch_refno).await {
 
             Ok(children) => {
 

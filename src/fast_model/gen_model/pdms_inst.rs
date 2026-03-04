@@ -277,10 +277,9 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
         let pe_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
 
         // 查出当前 chunk 关联的 inst_info id，再通过 inst_info 查 geo_relate
-        // 注意：SurrealDB 3.x 中 [id]->relation 图遍历可能返回空，必须用 WHERE in IN 模式
         let sql = format!(
-            "LET $inst_ids = SELECT VALUE out FROM inst_relate WHERE in IN [{pe_keys}];\
-             SELECT VALUE record::id(out) FROM geo_relate WHERE in IN $inst_ids;"
+            "LET $inst_ids = SELECT VALUE out FROM [{pe_keys}]->inst_relate;\
+             SELECT VALUE record::id(out) FROM $inst_ids->geo_relate;"
         );
         let geo_hashes: Vec<String> = model_primary_db()
             .query_take(&sql, 1)
@@ -298,8 +297,9 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
 
         // 2. 删除 geo_relate（通过 inst_info id 关联）
         let sql = format!(
-            "LET $inst_ids = SELECT VALUE out FROM inst_relate WHERE in IN [{pe_keys}];\
-             DELETE FROM geo_relate WHERE in IN $inst_ids;"
+            "LET $inst_ids = SELECT VALUE out FROM [{pe_keys}]->inst_relate;\
+             LET $gr_ids = SELECT VALUE id FROM $inst_ids->geo_relate;\
+             DELETE $gr_ids;"
         );
         let _ = model_query_response(&sql).await;
 
@@ -1239,10 +1239,7 @@ async fn query_existing_tubi_info_ids(ids: &[String]) -> anyhow::Result<HashSet<
             .map(|id| format!("tubi_info:⟨{}⟩", id))
             .join(",");
 
-        let sql = format!(
-            "SELECT VALUE record::id(id) FROM tubi_info WHERE id IN [{}];",
-            id_list
-        );
+        let sql = format!("SELECT VALUE record::id(id) FROM [{}];", id_list);
 
         let result: Vec<String> = model_primary_db().query_take(&sql, 0).await.unwrap_or_default();
         existing.extend(result);
@@ -1275,17 +1272,17 @@ pub async fn reconcile_missing_neg_relate(
         .map(|r| r.to_pe_key())
         .collect::<Vec<_>>()
         .join(",");
-    let sql = format!(
-        r#"SELECT
+    let sql = r#"SELECT
             record::id(id) as gr_id,
             record::id(geom_refno) as neg_carrier,
             record::id(geom_refno.owner) as parent_id
         FROM geo_relate
         WHERE geo_type = 'Neg'
-          AND geom_refno IN [{pe_list}]"#
-    );
-
-    let mut response = model_primary_db().query_response(&sql).await?;
+          AND geom_refno IN $geom_refnos"#;
+    let mut response = model_primary_db()
+        .query(sql)
+        .bind(("geom_refnos", pe_list.split(',').map(|s| s.to_string()).collect::<Vec<_>>()))
+        .await?;
     let neg_geos: Vec<serde_json::Value> = response.take(0)?;
     if neg_geos.is_empty() {
         return Ok(0);
@@ -1317,7 +1314,7 @@ pub async fn reconcile_missing_neg_relate(
         .collect::<Vec<_>>()
         .join(",");
     let check_sql = format!(
-        "SELECT VALUE record::id(in) FROM neg_relate WHERE in IN [{gr_id_list}]"
+        "SELECT VALUE record::id(in) FROM [{gr_id_list}]->neg_relate"
     );
     let mut check_resp = model_primary_db().query_response(&check_sql).await?;
     let existing_vec: Vec<String> = check_resp.take(0).unwrap_or_default();
@@ -1412,7 +1409,7 @@ impl InstRelatePrecomputed {
             let mut pe_dbnum_sesno: HashMap<String, (u32, u32)> = HashMap::new();
             for chunk in pe_keys.chunks(500) {
                 let sql = format!(
-                    "SELECT record::id(id) AS rid, dbnum, sesno FROM pe WHERE id IN [{}];",
+                    "SELECT record::id(id) AS rid, dbnum, sesno FROM [{}];",
                     chunk.join(",")
                 );
                 match model_primary_db().query_response(&sql).await {
@@ -1445,7 +1442,7 @@ impl InstRelatePrecomputed {
                 let keys_vec: Vec<String> = ses_keys.into_iter().collect();
                 for chunk in keys_vec.chunks(500) {
                     let sql = format!(
-                        "SELECT record::id(id) AS rid, date FROM ses WHERE id IN [{}];",
+                        "SELECT record::id(id) AS rid, date FROM [{}];",
                         chunk.join(",")
                     );
                     match model_primary_db().query_response(&sql).await {

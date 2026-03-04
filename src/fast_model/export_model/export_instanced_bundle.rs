@@ -423,7 +423,10 @@ pub async fn export_instanced_bundle_for_refnos(
             let pe_list = pe_keys.join(",");
             
             // 1. 检查记录是否存在（不带过滤条件）
-            let count_sql = format!("SELECT count() AS cnt FROM inst_relate WHERE in IN [{}];", pe_list);
+            let count_sql = format!(
+                "SELECT count() AS cnt FROM [{}]->inst_relate GROUP ALL;",
+                pe_list
+            );
             match aios_core::project_primary_db().query_response(&count_sql).await {
                 Ok(mut resp) => {
                     if let Ok(counts) = resp.take::<Vec<serde_json::Value>>(0) {
@@ -435,14 +438,14 @@ pub async fn export_instanced_bundle_for_refnos(
             
             // 2. 检查带过滤条件的记录数
             let filter_sql = format!(
-                r#"SELECT count() AS cnt FROM inst_relate 
-                   WHERE in IN [{}] 
-                     AND (SELECT VALUE world_trans 
+                r#"SELECT count() AS cnt FROM [{}]->inst_relate
+                   WHERE (SELECT VALUE world_trans
                           FROM pe_transform 
                           WHERE id = type::record('pe_transform', record::id(in)) 
                           LIMIT 1
                          )[0] != NONE 
-                     AND record::exists(type::record('inst_relate_aabb', record::id(in)));"#, 
+                     AND record::exists(type::record('inst_relate_aabb', record::id(in)))
+                   GROUP ALL;"#,
                 pe_list
             );
             match aios_core::project_primary_db().query_response(&filter_sql).await {
@@ -469,8 +472,7 @@ pub async fn export_instanced_bundle_for_refnos(
                         LIMIT 1
                        )[0] as world_trans,
                        record::exists(type::record('inst_relate_aabb', record::id(in))) as has_aabb
-                   FROM inst_relate 
-                   WHERE in IN [{}] 
+                   FROM [{}]->inst_relate
                    LIMIT 5;"#, 
                 pe_list
             );
@@ -554,7 +556,10 @@ pub async fn export_instanced_bundle_for_refnos(
              let pe_list = pe_keys.join(",");
              
              // 1. 检查记录是否存在
-             let count_sql = format!("SELECT count() AS cnt FROM inst_relate WHERE in IN [{}];", pe_list);
+             let count_sql = format!(
+                 "SELECT count() AS cnt FROM [{}]->inst_relate GROUP ALL;",
+                 pe_list
+             );
              match aios_core::project_primary_db().query_response(&count_sql).await {
                  Ok(mut resp) => {
                       if let Ok(counts) = resp.take::<Vec<serde_json::Value>>(0) {
@@ -566,7 +571,7 @@ pub async fn export_instanced_bundle_for_refnos(
              
              // 2. 检查关键字段 (aabb, world_trans)
              let check_sql = format!(
-                 "SELECT in, aabb, world_trans, geo_type, visible, out.meshed as is_meshed FROM inst_relate WHERE in IN [{}];", 
+                 "SELECT in, aabb, world_trans, geo_type, visible, out.meshed as is_meshed FROM [{}]->inst_relate;", 
                  pe_list
              );
              match aios_core::project_primary_db().query_response(&check_sql).await {

@@ -17,6 +17,7 @@
 //! ```
 
 use crate::versioned_db::db_meta_info::DEFAULT_TREE_DIR;
+use aios_core::pdms_types::BRAN_COMPONENT_NOUN_NAMES;
 use aios_core::tool::db_tool::{db1_dehash, db1_hash};
 use aios_core::tree_query::{load_tree_index_from_dir, TreeIndex, TreeQuery, TreeQueryFilter, TreeQueryOptions};
 use aios_core::pe::SPdmsElement;
@@ -789,6 +790,47 @@ impl TreeIndexManager {
             ele.dbnum = dbnum as i32;
             ele.sesno = 0;
             // name/status_code/lock/deleted/... 保持默认值（空/false/None）
+            out.push(ele);
+        }
+
+        Ok(out)
+    }
+
+    /// 收集 BRAN 下所有 CATE/管件子孙节点（含孙子层，用于修复 ELBO 等非直子场景）
+    ///
+    /// 当 ELBO 等管件不是 BRAN 的直接子节点（如 BRAN->CONN->ELBO）时，
+    /// `collect_children_elements_from_tree` 会漏掉。本方法用 BFS 子孙收集 + BRAN_COMPONENT 过滤。
+    pub async fn collect_bran_cate_descendant_elements_from_tree(
+        parent: RefnoEnum,
+    ) -> anyhow::Result<Vec<SPdmsElement>> {
+        let dbnum = Self::resolve_dbnum_for_refno(parent)?;
+        let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+        let index = manager.load_index(dbnum)?;
+
+        let noun_hashes: std::collections::HashSet<u32> =
+            BRAN_COMPONENT_NOUN_NAMES.iter().map(|n| db1_hash(n)).collect();
+        let options = TreeQueryOptions {
+            include_self: false,
+            max_depth: None,
+            filter: TreeQueryFilter {
+                noun_hashes: Some(noun_hashes),
+                ..Default::default()
+            },
+            prune_on_match: false,
+        };
+        let descendant_u64s = index.collect_descendants_bfs(parent.refno(), &options);
+
+        let mut out: Vec<SPdmsElement> = Vec::with_capacity(descendant_u64s.len());
+        for child in descendant_u64s {
+            let Some(meta) = index.node_meta(child) else {
+                continue;
+            };
+            let mut ele = SPdmsElement::default();
+            ele.refno = RefnoEnum::from(meta.refno);
+            ele.owner = RefnoEnum::from(meta.owner);
+            ele.noun = db1_dehash(meta.noun);
+            ele.dbnum = dbnum as i32;
+            ele.sesno = 0;
             out.push(ele);
         }
 

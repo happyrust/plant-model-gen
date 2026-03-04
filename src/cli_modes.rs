@@ -2467,12 +2467,9 @@ async fn build_spatial_index_from_db(
     println!("   ✅ 索引文件创建成功: {}", idx_path.display());
 
     // 查询所有构件的 AABB
-    let sql = if let Some(nums) = db_nums {
-        let db_filter = nums.iter().map(|n| format!("{}u", n)).collect::<Vec<_>>().join(",");
-        format!(
-            "SELECT id, noun, world_aabb FROM pe WHERE world_aabb != NONE AND dbnum IN [{}]",
-            db_filter
-        )
+    let sql = if db_nums.is_some() {
+        "SELECT id, noun, world_aabb FROM pe WHERE world_aabb != NONE AND dbnum IN $dbnums"
+            .to_string()
     } else {
         "SELECT id, noun, world_aabb FROM pe WHERE world_aabb != NONE".to_string()
     };
@@ -2486,10 +2483,11 @@ async fn build_spatial_index_from_db(
         world_aabb: aios_core::types::PlantAabb,
     }
 
-    let records: Vec<AabbRecord> = model_primary_db()
-        .query(&sql)
-        .await?
-        .take(0)?;
+    let mut q = model_primary_db().query(&sql);
+    if let Some(nums) = db_nums {
+        q = q.bind(("dbnums", nums.to_vec()));
+    }
+    let records: Vec<AabbRecord> = q.await?.take(0)?;
 
     println!("   📊 查询到 {} 个构件", records.len());
 

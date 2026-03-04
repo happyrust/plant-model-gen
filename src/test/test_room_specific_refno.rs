@@ -551,6 +551,174 @@ mod tests {
         Ok(())
     }
 
+    /// 单独房间计算测试：指定 panel refno，计算归属 refnos，通过断言验证。
+    ///
+    /// 环境变量：
+    /// - ROOM_TEST_PANEL_REFNO: 被测面板 refno（默认 24381/35798）
+    /// - ROOM_TEST_EXPECTED_IN: 必须出现在结果中的 refnos，逗号分隔（如 24381/145019,24381/145020）
+    /// - ROOM_TEST_EXPECTED_NOT_IN: 必须不在结果中的 refnos，逗号分隔
+    #[tokio::test]
+    #[ignore = "需要真实数据库连接 + 本地 meshes，运行: cargo test test_room_calc_single_panel --features sqlite-index -- --ignored"]
+    async fn test_room_calc_single_panel() -> Result<()> {
+        use std::env;
+        use std::fs;
+        use std::path::PathBuf;
+
+        println!("\n🏠 单独房间计算测试");
+        println!("{}", "=".repeat(80));
+
+        init_surreal().await.context("初始化 SurrealDB 失败")?;
+
+        let panel_refno_str = env::var("ROOM_TEST_PANEL_REFNO")
+            .unwrap_or_else(|_| "24381/35798".to_string());
+        let panel_refno = RefnoEnum::from_str(panel_refno_str.trim())
+            .map_err(|_| anyhow::anyhow!("无效的 panel refno: {}", panel_refno_str))?;
+
+        let expected_in: Vec<RefnoEnum> = env::var("ROOM_TEST_EXPECTED_IN")
+            .unwrap_or_else(|_| {
+                if panel_refno_str.trim() == "24381/35798" {
+                    "24381/145019".to_string()
+                } else {
+                    String::new()
+                }
+            })
+            .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+            .filter_map(|s| {
+                let s = s.trim();
+                if s.is_empty() {
+                    return None;
+                }
+                RefnoEnum::from_str(s).ok()
+            })
+            .collect();
+
+        let expected_not_in: Vec<RefnoEnum> = env::var("ROOM_TEST_EXPECTED_NOT_IN")
+            .unwrap_or_default()
+            .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+            .filter_map(|s| {
+                let s = s.trim();
+                if s.is_empty() {
+                    return None;
+                }
+                RefnoEnum::from_str(s).ok()
+            })
+            .collect();
+
+        println!("📍 panel refno: {}", panel_refno);
+        println!("📍 expected_in: {:?}", expected_in);
+        println!("📍 expected_not_in: {:?}", expected_not_in);
+
+        struct EnvGuard {
+            key: &'static str,
+            old: Option<String>,
+        }
+        impl EnvGuard {
+            fn set_force(key: &'static str, value: String) -> Self {
+                let old = env::var(key).ok();
+                unsafe { env::set_var(key, &value) };
+                Self { key, old }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.old {
+                        Some(v) => env::set_var(self.key, v),
+                        None => env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+
+        let db_option = get_db_option();
+        let _g_use_cache = EnvGuard::set_force("AIOS_ROOM_USE_CACHE", "0".to_string());
+        let _g_floor_2d =
+            EnvGuard::set_force("ROOM_RELATION_FLOOR_2D_FALLBACK", "1".to_string());
+
+        let tmp_index_path = PathBuf::from("output").join("test_spatial_index_single_panel.sqlite");
+        if let Some(parent) = tmp_index_path.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        let _g_idx = EnvGuard::set_force(
+            "AIOS_SPATIAL_INDEX_SQLITE",
+            tmp_index_path.to_string_lossy().to_string(),
+        );
+        let _g_limit =
+            EnvGuard::set_force("ROOM_RELATION_CANDIDATE_LIMIT", "2000".to_string());
+
+        if !expected_in.is_empty() {
+            let aabb_map = crate::fast_model::room_model::query_aabb_from_inst_relate_aabb(&expected_in)
+                .await
+                .context("从 inst_relate_aabb 查询 EXPECTED_IN 的 AABB 失败")?;
+
+            if !aabb_map.is_empty() {
+                use crate::sqlite_index::SqliteAabbIndex;
+                let idx = SqliteAabbIndex::open(&tmp_index_path)
+                    .context("打开/创建临时空间索引失败")?;
+                idx.init_schema().context("初始化临时空间索引 schema 失败")?;
+
+                let batch: Vec<(i64, f64, f64, f64, f64, f64, f64)> = aabb_map
+                    .into_iter()
+                    .map(|(r, aabb)| {
+                        (
+                            r.refno().0 as i64,
+                            aabb.mins.x as f64,
+                            aabb.maxs.x as f64,
+                            aabb.mins.y as f64,
+                            aabb.maxs.y as f64,
+                            aabb.mins.z as f64,
+                            aabb.maxs.z as f64,
+                        )
+                    })
+                    .collect();
+                idx.insert_many(batch)
+                    .context("写入 EXPECTED_IN AABB 到临时空间索引失败")?;
+            }
+        }
+
+        let mesh_dir = db_option.get_meshes_path();
+        anyhow::ensure!(
+            mesh_dir.exists(),
+            "meshes_path 不存在：{:?}（请先生成/同步对应 meshes）",
+            mesh_dir
+        );
+
+        let inside_tol = 0.1_f32;
+        let exclude = HashSet::<RefnoEnum>::new();
+        let within = crate::fast_model::room_model::cal_room_refnos(
+            &mesh_dir,
+            panel_refno,
+            &exclude,
+            inside_tol,
+        )
+        .await
+        .context("cal_room_refnos 失败")?;
+
+        assert!(
+            !within.contains(&panel_refno),
+            "结果不应包含 panel 自身: {}",
+            panel_refno
+        );
+
+        for r in &expected_in {
+            assert!(
+                within.contains(r),
+                "EXPECTED_IN 中的 refno 应在结果中: {}",
+                r
+            );
+        }
+        for r in &expected_not_in {
+            assert!(
+                !within.contains(r),
+                "EXPECTED_NOT_IN 中的 refno 不应在结果中: {}",
+                r
+            );
+        }
+
+        println!("✅ 房间计算完成: panel={}, 结果数={}", panel_refno, within.len());
+        Ok(())
+    }
+
     /// 测试 FRMW 和管道的几何信息查询
     #[tokio::test]
     #[ignore = "需要真实数据库连接，手动运行"]

@@ -325,6 +325,50 @@ fn parse_inst_relate_aabb(value: &JsonValue) -> Option<Aabb> {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[derive(Debug, Deserialize, SurrealValue)]
+struct QueryAabbRowRaw {
+    refno: Option<RefnoEnum>,
+    aabb: JsonValue,
+}
+
+/// 从 inst_relate_aabb 批量查询 refno -> Aabb 映射。
+/// 使用 pe->inst_relate_aabb 图遍历，避免 inst_relate_aabb 关系 id 格式差异。
+/// 同 refno 多条记录时取 union Aabb（merge）。
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+pub(crate) async fn query_aabb_from_inst_relate_aabb(
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<HashMap<RefnoEnum, Aabb>> {
+    if refnos.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let pe_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
+    let ids = pe_keys.join(",");
+
+    // 图遍历：FROM [ids]->inst_relate_aabb；WHERE 过滤 in/out 为 None 的行
+    let sql = format!(
+        "SELECT in as refno, out.d as aabb FROM [{ids}]->inst_relate_aabb WHERE in != NONE AND out.d != NONE"
+    );
+
+    let mut response = model_primary_db().query(&sql).await?;
+    let rows: Vec<QueryAabbRowRaw> = response.take(0)?;
+
+    let mut map = HashMap::new();
+    for row in rows {
+        let Some(refno) = row.refno.filter(RefnoEnum::is_valid) else {
+            continue;
+        };
+        let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
+            continue;
+        };
+        map.entry(refno)
+            .and_modify(|acc| *acc = merge_aabb(acc, &aabb))
+            .or_insert(aabb);
+    }
+    Ok(map)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
     db_nums: Option<&[u32]>,
     refno_root: Option<RefnoEnum>,
@@ -2155,42 +2199,28 @@ pub(crate) async fn is_refno_in_panel_by_aabb8(
 
 
 
-    // 2) 取 candidate 的 world_aabb（可能有多组，取 union）
+    // 2) 取 candidate 的 AABB：优先 inst_relate_aabb，缺失则用 query_insts world_aabb
 
-    let candidate_geom_groups =
+    let mut candidate_aabb: Option<Aabb> = query_aabb_from_inst_relate_aabb(&[candidate_refno])
+        .await
+        .ok()
+        .and_then(|m| m.into_values().next());
 
-        query_insts_for_room_calc(&[candidate_refno], true).await.unwrap_or_default();
-
-    if candidate_geom_groups.is_empty() {
-
-        return Ok(false);
-
-    }
-
-
-
-    let mut candidate_aabb: Option<Aabb> = None;
-
-    for g in &candidate_geom_groups {
-
-        let Some(ref world_aabb) = g.world_aabb else { continue };
-
-        let aabb: Aabb = world_aabb.clone().into();
-
-        candidate_aabb = Some(match candidate_aabb {
-
-            None => aabb,
-
-            Some(acc) => merge_aabb(&acc, &aabb),
-
-        });
-
+    if candidate_aabb.is_none() {
+        let candidate_geom_groups =
+            query_insts_for_room_calc(&[candidate_refno], true).await.unwrap_or_default();
+        for g in &candidate_geom_groups {
+            let Some(ref world_aabb) = g.world_aabb else { continue };
+            let aabb: Aabb = world_aabb.clone().into();
+            candidate_aabb = Some(match candidate_aabb {
+                None => aabb,
+                Some(acc) => merge_aabb(&acc, &aabb),
+            });
+        }
     }
 
     let Some(candidate_aabb) = candidate_aabb else {
-
         return Ok(false);
-
     };
 
 
@@ -2469,24 +2499,23 @@ async fn cal_room_refnos_with_options(
 
 
 
-    // 步骤 2：加载面板 TriMesh（用于点包含测试）；panel_aabb 优先用 inst_info.world_aabb，缺失则从 TriMesh 推导。
+    // 步骤 2：加载面板 TriMesh（用于点包含测试）；panel_aabb 优先从 inst_relate_aabb 获取，缺失则用 inst_info.world_aabb，再缺失则从 TriMesh 推导。
 
-    let mut panel_aabb: Option<Aabb> = None;
+    let mut panel_aabb: Option<Aabb> =
+        query_aabb_from_inst_relate_aabb(&[panel_refno])
+            .await
+            .ok()
+            .and_then(|m| m.into_values().next());
 
-    for geom_inst in &panel_geom_insts {
-
-        let Some(ref world_aabb) = geom_inst.world_aabb else { continue };
-
-        let geom_aabb: Aabb = world_aabb.clone().into();
-
-        panel_aabb = Some(match panel_aabb {
-
-            None => geom_aabb,
-
-            Some(acc) => merge_aabb(&acc, &geom_aabb),
-
-        });
-
+    if panel_aabb.is_none() {
+        for geom_inst in &panel_geom_insts {
+            let Some(ref world_aabb) = geom_inst.world_aabb else { continue };
+            let geom_aabb: Aabb = world_aabb.clone().into();
+            panel_aabb = Some(match panel_aabb {
+                None => geom_aabb,
+                Some(acc) => merge_aabb(&acc, &geom_aabb),
+            });
+        }
     }
 
 
@@ -2794,93 +2823,41 @@ async fn cal_room_refnos_with_options(
 
 
     // 步骤 4：粗算判定 — 候选 AABB 27 关键点投票 >50% 在 panel mesh 内
+    // 候选 AABB 优先从 inst_relate_aabb 获取，缺失则跳过。
 
     let coarse_start = Instant::now();
 
-
-
-    let candidate_geom_groups = match query_insts_for_room_calc(&candidates, true).await {
-
-        Ok(v) => v,
-
+    let candidate_aabb_map = match query_aabb_from_inst_relate_aabb(&candidates).await {
+        Ok(m) => m,
         Err(e) => {
-
-            warn!("批量查询候选构件几何实例失败: error={}", e);
-
-            Vec::new()
-
+            warn!("批量查询候选构件 AABB (inst_relate_aabb) 失败: error={}", e);
+            HashMap::new()
         }
-
     };
 
-
-
-    let candidate_geom_map: HashMap<RefnoEnum, GeomInstQuery> = candidate_geom_groups
-
-        .into_iter()
-
-        .map(|g| (g.refno, g))
-
-        .collect();
-
-
-
-    // 方案 2：cache 缺失则跳过，并记录缺失 refno 清单（不回退到 SurrealDB 模型数据）。
-
     let missing_candidates: Vec<RefnoEnum> = candidates
-
         .iter()
-
         .copied()
-
-        .filter(|r| !candidate_geom_map.contains_key(r))
-
+        .filter(|r| !candidate_aabb_map.contains_key(r))
         .collect();
-
     if !missing_candidates.is_empty() {
-
         warn!(
-
-            "房间计算候选构件缓存缺失: panel={}, missing_count={}",
-
+            "房间计算候选构件 inst_relate_aabb 缺失: panel={}, missing_count={}",
             panel_refno,
-
             missing_candidates.len()
-
         );
-
-        let _ = append_room_calc_missing_refnos(panel_refno, "candidate_geom_cache_missing", &missing_candidates);
-
+        let _ = append_room_calc_missing_refnos(panel_refno, "candidate_aabb_inst_relate_missing", &missing_candidates);
     }
 
-
-
     let mut within_refnos = HashSet::<RefnoEnum>::new();
-
     for candidate_refno in &candidates {
-
-        let Some(geom) = candidate_geom_map.get(candidate_refno) else {
-
+        let Some(cand_aabb) = candidate_aabb_map.get(candidate_refno) else {
             continue;
-
         };
-
-        let Some(ref world_aabb) = geom.world_aabb else {
-
-            continue;
-
-        };
-
-        let cand_aabb: Aabb = world_aabb.clone().into();
-
-        let key_points = extract_aabb_key_points(&cand_aabb);
-
+        let key_points = extract_aabb_key_points(cand_aabb);
         if is_geom_in_panel(&key_points, &panel_meshes, inside_tol, &floor_2d) {
-
             within_refnos.insert(*candidate_refno);
-
         }
-
     }
 
 

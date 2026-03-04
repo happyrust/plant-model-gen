@@ -924,6 +924,7 @@ async fn process_index_tree_generation(
         let bool_tasks = bool_accumulator.build_tasks();
         Ok::<InsertHandleReport, anyhow::Error>(InsertHandleReport { batch_cnt, bool_tasks })
     });
+    println!("⏳ [1/5] 几何体生成 (BRAN/HANG + LOOP/CATE/PRIM)...");
     let categorized = gen_index_tree_geos_optimized(
         Arc::new(db_option.clone()),
         &config,
@@ -932,9 +933,14 @@ async fn process_index_tree_generation(
     )
         .await
         .map_err(|e| anyhow::anyhow!("IndexTree 生成失败: {}", e))?;
+    println!(
+        "✅ [1/5] 几何体生成完成, 用时 {}ms",
+        full_start.elapsed().as_millis()
+    );
 
     // 🔥 显式 drop sender，让 receiver 的循环能够正常结束
     // 否则 insert_handle.await 会永久阻塞
+    println!("⏳ [2/5] 实例数据入库...");
     drop(sender);
     let insert_report = insert_handle
         .await
@@ -942,7 +948,7 @@ async fn process_index_tree_generation(
         .map_err(IndexTreeError::Other)?;
     let mut bool_tasks = insert_report.bool_tasks;
     println!(
-        "[gen_model] IndexTree 模式 insts 入库完成，用时 {} ms",
+        "✅ [2/5] 实例数据入库完成, 用时 {}ms",
         full_start.elapsed().as_millis()
     );
     perf.mark("mesh_generation");
@@ -971,6 +977,7 @@ async fn process_index_tree_generation(
         }
 
         perf.mark("aabb_write");
+        println!("⏳ [3/5] AABB 写入...");
 
         // 3️⃣ 写入 inst_relate_aabb 并导出 Parquet（供房间计算使用）
         if use_surrealdb && !defer_db_write {
@@ -1038,6 +1045,7 @@ async fn process_index_tree_generation(
         }
 
         perf.mark("boolean_operation");
+        println!("⏳ [4/5] 布尔运算...");
 
         // 3.5️⃣ 补建跨阶段缺失的 neg_relate（LOOP 阶段发现负实体但 PRIM 阶段才创建 geo_relate）
         if use_surrealdb && !defer_db_write {
@@ -1153,6 +1161,7 @@ async fn process_index_tree_generation(
         }
 
         perf.mark("web_bundle_export");
+        println!("⏳ [5/5] 导出...");
 
         // 5️⃣ 生成 Web Bundle (GLB + JSON 数据包)
         if db_option.mesh_formats.contains(&MeshFormat::Glb) {

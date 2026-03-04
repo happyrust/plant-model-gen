@@ -1639,12 +1639,15 @@ async fn gen_cata_geos_inner(
 
         let mut batch_handles = Vec::new();
 
+        let total_worker_cnt = worker_ranges.len();
         println!(
             "    [gen_cata_geos] worker 流水线: {} 个 worker, concurrency={}, refno_batch={}",
-            worker_ranges.len(),
+            total_worker_cnt,
             WORKER_CONCURRENCY,
             WORKER_REFNO_BATCH,
         );
+
+        let completed_worker_cnt = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         for (worker_idx, &(start_idx, end_idx)) in worker_ranges.iter().enumerate() {
 
@@ -1671,6 +1674,8 @@ async fn gen_cata_geos_inner(
             let pos_neg_cache = pos_neg_cache.clone();
 
             let worker_sem = worker_sem.clone();
+
+            let completed_worker_cnt = completed_worker_cnt.clone();
 
             let batch_id = worker_idx + 1;
 
@@ -4351,6 +4356,13 @@ async fn gen_cata_geos_inner(
 
             tracing::info!(batch_id, "Batch processing complete");
 
+            let done = completed_worker_cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let pct = done as f64 / total_worker_cnt as f64 * 100.0;
+            println!(
+                "    [gen_cata_geos] worker {}/{} 完成 (elapsed={}ms) | 总进度: {:.1}%",
+                done, total_worker_cnt, t_worker.elapsed().as_millis(), pct
+            );
+
             })); // end tokio::spawn + batch_handles.push
 
         }
@@ -5212,6 +5224,10 @@ async fn gen_cata_geos_inner(
         // P4 全局准备（含预取）总耗时
 
         p4_global_prepare_time = t_global_prepare.elapsed().as_millis();
+
+        let tubi_total_branches = branch_map.len();
+        let mut tubi_processed: usize = 0;
+        let mut tubi_last_report = Instant::now();
 
         for bran_data in branch_map.iter() {
 
@@ -7287,6 +7303,16 @@ async fn gen_cata_geos_inner(
 
                 );
 
+            }
+
+            tubi_processed += 1;
+            if tubi_processed % 100 == 0 || tubi_last_report.elapsed().as_secs() >= 5 {
+                let pct = tubi_processed as f64 / tubi_total_branches as f64 * 100.0;
+                println!(
+                    "    [BRAN_TUBI] 进度: {}/{} ({:.1}%) elapsed={}ms",
+                    tubi_processed, tubi_total_branches, pct, t_process_branch.elapsed().as_millis()
+                );
+                tubi_last_report = Instant::now();
             }
 
         }

@@ -2437,6 +2437,92 @@ pub struct RoomComputeCliConfig {
     pub verbose: bool,
 }
 
+/// 从数据库构建 AABB 空间索引
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn build_spatial_index_from_db(
+    db_nums: Option<&[u32]>,
+    verbose: bool,
+) -> Result<()> {
+    use aios_database::sqlite_index::SqliteAabbIndex;
+    use aios_database::spatial_index::SqliteSpatialIndex;
+    use aios_core::model_primary_db;
+    use surrealdb::types::SurrealValue;
+    use std::time::Instant;
+
+    println!("\n🗃️ 构建空间索引");
+    println!("==========================================");
+
+    let start_time = Instant::now();
+    let idx_path = SqliteSpatialIndex::default_path();
+
+    // 删除旧索引
+    if idx_path.exists() {
+        std::fs::remove_file(&idx_path)?;
+        println!("   ✅ 已删除旧索引文件");
+    }
+
+    // 创建索引
+    let idx = SqliteAabbIndex::open(&idx_path)?;
+    idx.init_schema()?;
+    println!("   ✅ 索引文件创建成功: {}", idx_path.display());
+
+    // 查询所有构件的 AABB
+    let sql = if let Some(nums) = db_nums {
+        let db_filter = nums.iter().map(|n| format!("{}u", n)).collect::<Vec<_>>().join(",");
+        format!(
+            "SELECT id, noun, world_aabb FROM pe WHERE world_aabb != NONE AND dbnum IN [{}]",
+            db_filter
+        )
+    } else {
+        "SELECT id, noun, world_aabb FROM pe WHERE world_aabb != NONE".to_string()
+    };
+
+    println!("   🔍 查询构件 AABB...");
+
+    #[derive(serde::Deserialize, SurrealValue)]
+    struct AabbRecord {
+        id: RefnoEnum,
+        noun: String,
+        world_aabb: aios_core::types::PlantAabb,
+    }
+
+    let records: Vec<AabbRecord> = model_primary_db()
+        .query(&sql)
+        .await?
+        .take(0)?;
+
+    println!("   📊 查询到 {} 个构件", records.len());
+
+    // 批量插入
+    const BATCH_SIZE: usize = 10000;
+    let mut inserted = 0;
+
+    for chunk in records.chunks(BATCH_SIZE) {
+        let items: Vec<_> = chunk.iter().map(|r| {
+            let id = r.id.refno().0 as i64;
+            let inner_aabb = &r.world_aabb.0;
+            (id, r.noun.clone(),
+             inner_aabb.mins.x as f64, inner_aabb.maxs.x as f64,
+             inner_aabb.mins.y as f64, inner_aabb.maxs.y as f64,
+             inner_aabb.mins.z as f64, inner_aabb.maxs.z as f64)
+        }).collect();
+
+        idx.insert_aabbs_with_items(items)?;
+        inserted += chunk.len();
+
+        if verbose {
+            println!("   ⏳ 已插入 {}/{} 个构件", inserted, records.len());
+        }
+    }
+
+    let duration = start_time.elapsed();
+    println!("   ✅ 空间索引构建完成");
+    println!("   📊 总计: {} 个构件", inserted);
+    println!("   ⏱️  耗时: {:.2}s", duration.as_secs_f64());
+
+    Ok(())
+}
+
 /// 房间计算 CLI 模式
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub async fn room_compute_mode(
@@ -2479,6 +2565,9 @@ pub async fn room_compute_mode(
     // 初始化数据库连接
     println!("\n📡 初始化数据库连接...");
     init_surreal().await?;
+
+    // 构建空间索引
+    build_spatial_index_from_db(db_nums.as_deref(), verbose).await?;
 
     // 执行房间关系构建
     println!("\n🔄 开始构建房间关系...");

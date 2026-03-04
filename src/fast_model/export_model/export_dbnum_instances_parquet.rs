@@ -516,8 +516,66 @@ struct AabbQueryRow {
 // SurrealDB 查询函数
 // =============================================================================
 
-/// 使用 TreeIndex refno 列表分批查询 inst_relate
-async fn query_inst_relate_rows(
+/// 通过 dbnum 对应的 ref0 前缀直接扫描 inst_relate（无需 TreeIndex）
+async fn query_inst_relate_by_dbnum(
+    dbnum: u32,
+    verbose: bool,
+) -> Result<Vec<InstRelateRow>> {
+    use crate::data_interface::db_meta;
+
+    // 1. 获取 dbnum 对应的 ref0 列表
+    db_meta().ensure_loaded()?;
+    let ref0s = db_meta()
+        .get_db_file_info(dbnum)
+        .map(|info| info.ref0s)
+        .unwrap_or_else(|| {
+            // fallback：假设 ref0 == dbnum（单库常见情况）
+            if verbose {
+                println!("⚠️  db_meta_info 中未找到 dbnum={} 的文件信息，fallback ref0={}", dbnum, dbnum);
+            }
+            vec![dbnum]
+        });
+
+    if verbose {
+        println!("🔍 dbnum={} 对应 ref0 列表: {:?}", dbnum, ref0s);
+    }
+
+    // 2. 按 ref0 前缀扫描 inst_relate
+    let where_clause = ref0s
+        .iter()
+        .map(|ref0| format!("string::starts_with(record::id(id), \"{ref0}_\")"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let sql = format!(
+        r#"
+        SELECT
+            owner_refno,
+            owner_type,
+            in as refno,
+            in.noun as noun,
+            spec_value as spec_value
+        FROM inst_relate
+        WHERE {where_clause}
+        "#
+    );
+
+    if verbose {
+        println!("🔍 扫描 inst_relate (ref0 前缀过滤)...");
+    }
+
+    let rows: Vec<InstRelateRow> =
+        aios_core::project_primary_db().query_take(&sql, 0).await?;
+
+    if verbose {
+        println!("✅ inst_relate 命中记录: {}", rows.len());
+    }
+
+    Ok(rows)
+}
+
+/// 使用 refno 列表分批查询 inst_relate（root_refno 子树模式使用）
+async fn query_inst_relate_by_refnos(
     refnos: &[RefnoEnum],
     verbose: bool,
 ) -> Result<Vec<InstRelateRow>> {
@@ -807,39 +865,22 @@ pub async fn export_dbnum_instances_parquet(
     let mesh_base_dir = mesh_base_dir_from_db_option(&db_option);
 
     // =========================================================================
-    // 1. 使用 TreeIndex 获取 refno 列表
+    // 1-2. 扫描 inst_relate（按 dbnum 对应的 ref0 前缀过滤）
     // =========================================================================
-    if verbose {
-        println!("🔍 加载 TreeIndex...");
-    }
-    let tree_manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-
-    let mut all_refnos: Vec<RefnoEnum> = if let Some(root) = root_refno {
+    let inst_rows = if let Some(root) = root_refno {
+        // root_refno 模式：先查子树 refno，再分批查 inst_relate
         use crate::fast_model::query_compat::query_deep_visible_inst_refnos;
         if verbose {
             println!("🔍 查询 {} 的可见实例节点...", root);
         }
-        query_deep_visible_inst_refnos(root).await?
+        let sub_refnos = query_deep_visible_inst_refnos(root).await?;
+        if verbose {
+            println!("✅ 子树 refno 数量: {}", sub_refnos.len());
+        }
+        query_inst_relate_by_refnos(&sub_refnos, verbose).await?
     } else {
-        // 仅获取可见几何 noun 类型的 refno，排除 SITE/ZONE/WORL 等层级节点
-        tree_manager.query_visible_geo_refnos()
+        query_inst_relate_by_dbnum(dbnum, verbose).await?
     };
-    all_refnos.sort_by_key(|r| r.to_string());
-
-    if verbose {
-        println!("✅ TreeIndex 加载完成，refno 数量: {}", all_refnos.len());
-    }
-
-    // =========================================================================
-    // 2. 分批查询 inst_relate
-    // =========================================================================
-    if verbose {
-        println!("🔍 按 TreeIndex refno 查询 inst_relate...");
-    }
-    let inst_rows = query_inst_relate_rows(&all_refnos, verbose).await?;
-    if verbose {
-        println!("✅ inst_relate 命中记录: {}", inst_rows.len());
-    }
 
     // 按 owner 分组
     struct ChildInfo {

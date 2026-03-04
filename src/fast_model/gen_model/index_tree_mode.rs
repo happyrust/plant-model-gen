@@ -171,6 +171,8 @@ pub async fn process_nouns_by_type(
     );
 
     let mut all_processed_refnos = Vec::new();
+    let total_chunks = (noun_infos.len() + 1) / 2;
+    let mut cumulative_count: usize = 0;
 
     // 每次处理 2 个 NOUN 类型
     for (chunk_idx, chunk) in noun_infos.chunks(2).enumerate() {
@@ -178,6 +180,7 @@ pub async fn process_nouns_by_type(
         println!("[{:?}] 第 {} 批并发处理: {:?}", category, chunk_idx + 1, noun_names);
 
         // 收集本批次的 refnos
+        let chunk_count: usize = chunk.iter().map(|n| n.count).sum();
         for info in chunk {
             all_processed_refnos.extend(info.refnos.iter().copied());
         }
@@ -204,6 +207,13 @@ pub async fn process_nouns_by_type(
                 IndexTreeError::GeometryGenerationFailed(format!("{:?}", category), e.to_string())
             })??;
         }
+
+        cumulative_count += chunk_count;
+        let pct = cumulative_count as f64 / total_count as f64 * 100.0;
+        println!(
+            "[{:?}] 第 {}/{} 批完成 | 总进度: {}/{} ({:.1}%)",
+            category, chunk_idx + 1, total_chunks, cumulative_count, total_count, pct
+        );
     }
 
     Ok(all_processed_refnos)

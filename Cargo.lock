@@ -305,7 +305,6 @@ dependencies = [
  "gltf",
  "hash32 1.0.0",
  "hexasphere",
- "i_triangle",
  "id_tree 1.8.0 (git+https://github.com/happyrust/id_tree)",
  "indexmap 2.13.0",
  "indextree",
@@ -340,6 +339,7 @@ dependencies = [
  "serde_with",
  "simplelog",
  "smol_str 0.3.5",
+ "spade",
  "strum 0.27.2",
  "strum_macros 0.27.2",
  "surrealdb",
@@ -5750,19 +5750,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9190f86706ca38ac8add223b2aed8b1330002b5cdbbce28fb58b10914d38fc27"
 
 [[package]]
-name = "i_key_sort"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c4d36ff9fb73dc62e163e25a07523ca5c2126660fb2485cdecf063e59b58f29"
-
-[[package]]
 name = "i_overlay"
 version = "4.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413183068e6e0289e18d7d0a1f661b81546e6918d5453a44570b9ab30cbed1b3"
 dependencies = [
  "i_float",
- "i_key_sort 0.6.0",
+ "i_key_sort",
  "i_shape",
  "i_tree",
  "rayon",
@@ -5782,17 +5776,6 @@ name = "i_tree"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35e6d558e6d4c7b82bc51d9c771e7a927862a161a7d87bf2b0541450e0e20915"
-
-[[package]]
-name = "i_triangle"
-version = "0.37.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "004c21865714658e094feffabc5ae4bb71b9159baef1cb4133b2a3756391b4bc"
-dependencies = [
- "i_key_sort 0.10.1",
- "i_overlay",
- "i_tree",
-]
 
 [[package]]
 name = "iana-time-zone"

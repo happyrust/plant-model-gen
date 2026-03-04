@@ -80,7 +80,23 @@ pub async fn gen_cata_single_geoms(
 
     // Timing for resolve_desi_comp
     let t_resolve = std::time::Instant::now();
-    let geoms_info = resolve_desi_comp(design_refno, None, Some(&desi_att)).await?;
+    let geoms_info = match resolve_desi_comp(design_refno, None, Some(&desi_att)).await {
+        Ok(info) => info,
+        Err(e) => {
+            // 无 CAT 引用时，按 cata_model 的设计应走“子原语直解”路径。
+            // 这里回退为以 design_refno 作为 scom_ref 再尝试一次，避免直接中断整条负实体链路。
+            let err_msg = e.to_string();
+            if err_msg.contains("CAT引用不存在") {
+                debug_model_debug!(
+                    "[fallback] design_refno={} 无CAT，改用 design_refno 作为 scom_ref 重试 resolve_desi_comp",
+                    design_refno
+                );
+                resolve_desi_comp(design_refno, Some(design_refno), Some(&desi_att)).await?
+            } else {
+                return Err(e);
+            }
+        }
+    };
     let resolve_time = t_resolve.elapsed().as_millis();
     debug_model!(
         "📦 resolve_desi_comp 返回: geometries={}, n_geometries={}",

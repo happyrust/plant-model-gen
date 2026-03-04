@@ -252,7 +252,7 @@ async fn get_node_info(
 // === 辅助函数 ===
 
 /// 判断节点类型
-fn determine_node_type(noun: &str) -> String {
+pub(crate) fn determine_node_type(noun: &str) -> String {
     match noun {
         "FRMW" | "SBFR" => "SPACE".to_string(),
         "PANE" => "ROOM".to_string(),

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use aios_core::{RefnoEnum, model_primary_db, SurrealQueryExt};
 use aios_core::Transform;
+use aios_core::rs_surreal::geometry_query::PlantTransform;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use serde::Deserialize;
@@ -379,24 +380,24 @@ pub async fn get_world_transforms_cache_first_batch(
         return Ok(out);
     }
 
-    // 2) SurrealDB batch query pe_transform.world_trans.d.matrix
+    // 2) SurrealDB batch query pe_transform.world_trans.d
     crate::fast_model::utils::ensure_surreal_init().await?;
 
     #[derive(Debug, Deserialize, SurrealValue)]
-    struct PeWorldMatrixRow {
+    struct PeWorldTransRow {
         #[serde(default)]
         refno: Option<RefnoEnum>,
         #[serde(default)]
-        matrix: Option<Vec<f64>>,
+        world_trans: Option<PlantTransform>,
     }
 
     const CHUNK: usize = 200;
     let mut still_missing: HashSet<RefnoEnum> = misses.iter().copied().collect();
 
     for chunk in misses.chunks(CHUNK) {
-        let ids = chunk
+        let pt_ids = chunk
             .iter()
-            .map(|r| r.to_pe_key())
+            .map(|r| r.to_table_key("pe_transform"))
             .collect::<Vec<_>>()
             .join(",");
 
@@ -404,32 +405,21 @@ pub async fn get_world_transforms_cache_first_batch(
             r#"
             SELECT
                 record::id(id) as refno,
-                (
-                    SELECT VALUE world_trans.d.matrix
-                    FROM pe_transform
-                    WHERE id = type::record('pe_transform', record::id(id))
-                    LIMIT 1
-                )[0] as matrix
-            FROM [{ids}];
+                world_trans.d as world_trans
+            FROM [{pt_ids}];
             "#
         );
 
-        let rows: Vec<PeWorldMatrixRow> = model_primary_db().query_take(&sql, 0).await?;
+        let rows: Vec<PeWorldTransRow> = model_primary_db().query_take(&sql, 0).await?;
         for row in rows {
             let Some(r) = row.refno else { continue };
-            let Some(m) = row.matrix else { continue };
-            if m.len() != 16 {
-                continue;
-            }
-            let mut cols = [0.0f64; 16];
-            cols.copy_from_slice(&m[..16]);
-            if let Some(t) = transform_from_matrix_cols(&cols) {
-                out.insert(r, t.clone());
-                still_missing.remove(&r);
-                if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
-                    if let Some(&dbnum) = dbnum_map.get(&r) {
-                        cache.insert_world_transform(dbnum, r, t);
-                    }
+            let Some(pt) = row.world_trans else { continue };
+            let t: Transform = pt.0;
+            out.insert(r, t.clone());
+            still_missing.remove(&r);
+            if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
+                if let Some(&dbnum) = dbnum_map.get(&r) {
+                    cache.insert_world_transform(dbnum, r, t);
                 }
             }
         }

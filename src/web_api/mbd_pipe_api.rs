@@ -480,266 +480,31 @@ async fn get_mbd_pipe(
         }
     }
 
-    let (branch_name, branch_attrs) = if query.include_branch_attrs {
+    let mut data = match generate_mbd_data_from_segments(branch_refno, &segments, &query).await {
+        Ok(d) => d,
+        Err(e) => {
+            return json_utf8(MbdPipeResponse {
+                success: false,
+                error_message: Some(format!("MBD 数据生成失败: {e}")),
+                data: None,
+            });
+        }
+    };
+    data.input_refno = input_refno_enum.to_string();
+
+    if query.include_branch_attrs {
         match try_fill_branch_name_and_attrs(branch_refno).await {
-            Ok(v) => v,
+            Ok((name, attrs)) => {
+                data.branch_name = name;
+                data.branch_attrs = attrs;
+            }
             Err(e) => {
                 debug_info.notes.push(format!("分支属性填充失败（已忽略）: {e}"));
-                (branch_refno.to_string(), BranchAttrsDto::default())
-            }
-        }
-    } else {
-        (branch_refno.to_string(), BranchAttrsDto::default())
-    };
-
-    let mut out_segments: Vec<MbdPipeSegmentDto> = Vec::with_capacity(segments.len());
-    for (i, seg) in segments.iter().enumerate() {
-        out_segments.push(MbdPipeSegmentDto {
-            id: format!("seg:{}:{i}", seg.refno),
-            refno: seg.refno.to_string(),
-            // cache-only：目前仅能稳定提供 tubi 段的几何与连通顺序；noun/规格等语义字段后续再补齐
-            noun: "TUBI".to_string(),
-            name: None,
-            arrive: Some([seg.start.x, seg.start.y, seg.start.z]),
-            leave: Some([seg.end.x, seg.end.y, seg.end.z]),
-            length: seg.start.distance(seg.end),
-            straight_length: seg.start.distance(seg.end),
-            outside_diameter: None,
-            bore: None,
-        });
-    }
-
-    // ===== dims / welds / slopes =====
-    let mut dims: Vec<MbdDimDto> = Vec::new();
-    if query.include_dims {
-        for (i, seg) in segments.iter().enumerate() {
-            let length = seg.start.distance(seg.end);
-            if length < query.dim_min_length {
-                continue;
-            }
-            dims.push(MbdDimDto {
-                id: format!("dim:{}:{i}", seg.refno),
-                kind: MbdDimKind::Segment,
-                group_id: None,
-                seq: Some(i as u32),
-                start: [seg.start.x, seg.start.y, seg.start.z],
-                end: [seg.end.x, seg.end.y, seg.end.z],
-                length,
-                text: format_dim_length_text_mm(length),
-            });
-        }
-    }
-
-    if query.include_port_dims {
-        for (i, seg) in segments.iter().enumerate() {
-            let (start, end) = segment_port_points(seg);
-            let length = start.distance(end);
-            if length < query.dim_min_length {
-                continue;
-            }
-            dims.push(MbdDimDto {
-                id: format!("dim:port:{}:{i}", seg.refno),
-                kind: MbdDimKind::Port,
-                group_id: None,
-                seq: Some(i as u32),
-                start: [start.x, start.y, start.z],
-                end: [end.x, end.y, end.z],
-                length,
-                text: format_dim_length_text_mm(length),
-            });
-        }
-    }
-
-    let mut welds: Vec<MbdWeldDto> = Vec::new();
-    let mut weld_joints: Vec<WeldJoint> = Vec::new();
-
-    if query.include_welds || query.include_chain_dims || query.include_overall_dim {
-        let mut shop_idx = 0usize;
-        let mut field_idx = 0usize;
-
-        // 可选：用 TreeIndex 查询 noun，辅助推断 weld_type（仅当输出 welds 时才有意义）。
-        let noun_lookup = if query.include_welds && query.include_weld_nouns {
-            match try_build_tree_index_for_refno(branch_refno).await {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    debug_info
-                        .notes
-                        .push(format!("TreeIndex 初始化失败（weld_nouns 已忽略）: {e}"));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        for i in 0..segments.len().saturating_sub(1) {
-            let seg1 = &segments[i];
-            let seg2 = &segments[i + 1];
-
-            let (p1, p2, dist) = closest_endpoints(seg1.start, seg1.end, seg2.start, seg2.end);
-            if dist >= query.weld_merge_threshold {
-                continue;
-            }
-
-            weld_joints.push(WeldJoint {
-                left_endpoint: p1,
-                right_endpoint: p2,
-                mid: midpoint(p1, p2),
-            });
-
-            if !query.include_welds {
-                continue;
-            }
-
-            let mut noun1: Option<&str> = Some("TUBI");
-            let mut noun2: Option<&str> = Some("TUBI");
-            let mut _noun_s1_owned: Option<String> = None;
-            let mut _noun_s2_owned: Option<String> = None;
-            if let Some(lookup) = noun_lookup.as_ref() {
-                // 说明：instance_cache 仅稳定提供 tubi_arrive_refno（段起点关联元件）。
-                // 此处仅做渐进式增强：若能查到 arrive_refno 的 noun，则用于辅助分类（可能不完全准确）。
-                if let Some(r1) = seg1.arrive_refno {
-                    if let Some(n) = lookup.get_noun(r1) {
-                        _noun_s1_owned = Some(n);
-                        noun1 = _noun_s1_owned.as_deref();
-                    }
-                }
-                if let Some(r2) = seg2.arrive_refno {
-                    if let Some(n) = lookup.get_noun(r2) {
-                        _noun_s2_owned = Some(n);
-                        noun2 = _noun_s2_owned.as_deref();
-                    }
-                }
-            }
-            let weld_type = determine_weld_type(noun1, noun2);
-
-            // 首期：简单近似 MBD shop/field 规则：分支两端优先现场焊；中间按“常见预制件”判断是否车间焊。
-            let at_ends = i == 0 || (i + 1) == (segments.len().saturating_sub(1));
-            let shop_candidate = false;
-            let is_shop = !at_ends && shop_candidate;
-
-            let label = if is_shop {
-                shop_idx += 1;
-                format!("A{shop_idx}")
-            } else {
-                field_idx += 1;
-                format!("M{field_idx}")
-            };
-
-            welds.push(MbdWeldDto {
-                id: format!("weld:{}:{i}", branch_refno),
-                position: midpoint(p1, p2).to_array(),
-                weld_type,
-                is_shop,
-                label,
-                left_refno: seg1.refno.to_string(),
-                right_refno: seg2.refno.to_string(),
-            });
-        }
-    }
-
-    if query.include_chain_dims {
-        let ends: Vec<(Vec3, Vec3)> = segments.iter().map(|s| (s.start, s.end)).collect();
-        let chain_pts = build_chain_points_from_ends(&ends, &weld_joints);
-
-        let group_id = Some(format!("chain:{}", branch_refno));
-        for i in 0..chain_pts.len().saturating_sub(1) {
-            let a = chain_pts[i];
-            let b = chain_pts[i + 1];
-            let length = a.distance(b);
-            if length < query.dim_min_length {
-                continue;
-            }
-            dims.push(MbdDimDto {
-                id: format!("dim:chain:{}:{i}", branch_refno),
-                kind: MbdDimKind::Chain,
-                group_id: group_id.clone(),
-                seq: Some(i as u32),
-                start: [a.x, a.y, a.z],
-                end: [b.x, b.y, b.z],
-                length,
-                text: format_dim_length_text_mm(length),
-            });
-        }
-    }
-
-    if query.include_overall_dim {
-        let mut total = 0.0f32;
-        for seg in &segments {
-            total += seg.start.distance(seg.end);
-        }
-
-        if !segments.is_empty() {
-            // 挂点：用链式端点选择逻辑（若无 weld_joints，则退化为首段 start/end）。
-            let ends: Vec<(Vec3, Vec3)> = segments.iter().map(|s| (s.start, s.end)).collect();
-            let chain_pts = build_chain_points_from_ends(&ends, &weld_joints);
-            let (a, b) = if chain_pts.len() >= 2 {
-                (chain_pts[0], chain_pts[chain_pts.len() - 1])
-            } else {
-                (segments[0].start, segments[0].end)
-            };
-
-            if total >= query.dim_min_length {
-                dims.push(MbdDimDto {
-                    id: format!("dim:overall:{}", branch_refno),
-                    kind: MbdDimKind::Overall,
-                    group_id: Some(format!("overall:{}", branch_refno)),
-                    seq: None,
-                    start: [a.x, a.y, a.z],
-                    end: [b.x, b.y, b.z],
-                    length: total,
-                    // overall 需要显式语义，避免与 segment/chain 的“纯数字”混淆（3D label 侧更明显）。
-                    text: format!("TOTAL {}", format_dim_length_text_mm(total)),
-                });
             }
         }
     }
 
-    let mut slopes: Vec<MbdSlopeDto> = Vec::new();
-    if query.include_slopes {
-        for (i, seg) in segments.iter().enumerate() {
-            let dx = seg.end.x - seg.start.x;
-            let dy = seg.end.y - seg.start.y;
-            let dz = seg.end.z - seg.start.z;
-            let horizontal = (dx * dx + dy * dy).sqrt();
-            if horizontal <= 1e-3 {
-                continue;
-            }
-            let slope = dz / horizontal;
-            let abs_slope = slope.abs();
-            if abs_slope < query.min_slope || abs_slope > query.max_slope {
-                continue;
-            }
-            // 与 MBD 文本形式保持一致：slope xx.x%
-            let text = format!("slope {:.1}%", abs_slope * 100.0);
-            slopes.push(MbdSlopeDto {
-                id: format!("slope:{}:{i}", seg.refno),
-                start: [seg.start.x, seg.start.y, seg.start.z],
-                end: [seg.end.x, seg.end.y, seg.end.z],
-                slope,
-                text,
-            });
-        }
-    }
-
-    let mut bends: Vec<MbdBendDto> = Vec::new();
-    if query.include_bends {
-        match fetch_bend_elements_for_branch(branch_refno, query.bend_mode).await {
-            Ok(v) => bends = v,
-            Err(e) => {
-                debug_info.notes.push(format!("弯头查询失败（已忽略）: {e}"));
-            }
-        }
-    }
-
-    let stats = MbdPipeStats {
-        segments_count: out_segments.len(),
-        dims_count: dims.len(),
-        welds_count: welds.len(),
-        slopes_count: slopes.len(),
-        bends_count: bends.len(),
-    };
-
+    let stats = &data.stats;
     if query.debug {
         debug_info.inferred_dbnum = debug_info.inferred_dbnum.or(query.dbno);
         debug_info.requested_dbno = query.dbno;
@@ -749,23 +514,12 @@ async fn get_mbd_pipe(
             stats.segments_count, stats.dims_count, stats.welds_count, stats.slopes_count, stats.bends_count
         ));
     }
+    data.debug_info = query.debug.then_some(debug_info);
 
     json_utf8(MbdPipeResponse {
         success: true,
         error_message: None,
-        data: Some(MbdPipeData {
-            input_refno: input_refno_enum.to_string(),
-            branch_refno: branch_refno.to_string(),
-            branch_name,
-            branch_attrs,
-            segments: out_segments,
-            dims,
-            welds,
-            slopes,
-            bends,
-            stats,
-            debug_info: query.debug.then_some(debug_info),
-        }),
+        data: Some(data),
     })
 }
 
@@ -1227,12 +981,15 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
     Ok((segs, debug))
 }
 
-/// 查询分支下的 BEND/ELBO 元件，返回弯头标注数据
+/// 查询分支下的 BEND/ELBO 元件，返回弯头标注数据。
+///
+/// 策略：从 tubi_relate 获取 arrive_refno 及其 noun，筛选 BEND/ELBO。
+/// 弯头的 work_point 取相邻段连接点的中点（end_pt[i] 与 start_pt[i+1] 之间），
+/// face_center 从 inst_relate 的 ptset 读取并用 inst_relate.world_trans 变换到世界坐标。
 async fn fetch_bend_elements_for_branch(
     branch_refno: RefnoEnum,
-    bend_mode: MbdBendMode,
+    _bend_mode: MbdBendMode,
 ) -> anyhow::Result<Vec<MbdBendDto>> {
-    use aios_core::rs_surreal::geometry_query::PlantTransform;
     use aios_core::shape::pdms_shape::RsVec3;
     use aios_core::{project_primary_db, SurrealQueryExt};
     use serde::{Deserialize, Serialize};
@@ -1242,33 +999,35 @@ async fn fetch_bend_elements_for_branch(
 
     let pe_key = branch_refno.to_pe_key();
 
-    // 查询 BEND/ELBO 子元件：refno、noun、world_trans（→ work_point）、ptset（→ face_center）
     #[derive(Serialize, Deserialize, Debug, SurrealValue)]
-    struct BendRow {
-        pub refno: RefnoEnum,
+    struct BendTubiRow {
+        pub arrive_refno: RefnoEnum,
         pub noun: String,
         #[serde(default)]
-        pub world_trans: Option<PlantTransform>,
+        pub end_pt: Option<RsVec3>,
         #[serde(default)]
-        pub ptset_pts: Option<Vec<Vec<RsVec3>>>,
+        pub leave_axis: Option<RsVec3>,
+        #[serde(default)]
+        pub index: Option<i64>,
     }
 
     let sql = format!(
         r#"
         SELECT
-            in as refno,
-            in.noun as noun,
-            world_trans.d as world_trans,
-            out.ptset[*].pt as ptset_pts
-        FROM pe:{pe_key}<-pe_owner->inst_relate
-        WHERE in.noun IN ['BEND', 'ELBO'];
+            out as arrive_refno,
+            out.noun as noun,
+            end_pt.d as end_pt,
+            leave_axis.d as leave_axis,
+            id[1] as index
+        FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..]
+        WHERE out.noun IN ['BEND', 'ELBO'];
         "#
     );
 
-    let rows: Vec<BendRow> = match project_primary_db().query_take(&sql, 0).await {
+    let rows: Vec<BendTubiRow> = match project_primary_db().query_take(&sql, 0).await {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[mbd-pipe] fetch_bend_elements 查询失败: {e}");
+            eprintln!("[mbd-pipe] fetch_bend_elements (tubi_relate) 查询失败: {e}");
             return Ok(Vec::new());
         }
     };
@@ -1276,22 +1035,17 @@ async fn fetch_bend_elements_for_branch(
     let mut bends: Vec<MbdBendDto> = Vec::with_capacity(rows.len());
 
     for row in &rows {
-        let wt = row.world_trans.clone().unwrap_or_default();
-        let m = wt.to_matrix();
-        let work_point = m.transform_point3(glam::Vec3::ZERO);
-
-        // ptset_pts: Vec<Vec<RsVec3>> — 每个 ptset entry 的 pt 数组
-        // face_center = 每组 pt 的第一个点（如果存在）
-        let (fc1, fc2) = if let Some(ref pts_groups) = row.ptset_pts {
-            let p1 = pts_groups.first().and_then(|g| g.first()).map(|p| p.0);
-            let p2 = pts_groups.get(1).and_then(|g| g.first()).map(|p| p.0);
-            (p1, p2)
-        } else {
-            (None, None)
+        let work_point = match (&row.end_pt, &row.leave_axis) {
+            (Some(ep), Some(la)) => midpoint(ep.0, la.0),
+            (Some(ep), None) => ep.0,
+            (None, Some(la)) => la.0,
+            (None, None) => glam::Vec3::ZERO,
         };
 
-        // 获取 ANGL、RADI 属性
-        let (angle, radius) = match aios_core::get_named_attmap(row.refno.clone()).await {
+        let fc1 = row.end_pt.as_ref().map(|p| p.0.to_array());
+        let fc2 = row.leave_axis.as_ref().map(|p| p.0.to_array());
+
+        let (angle, radius) = match aios_core::get_named_attmap(row.arrive_refno.clone()).await {
             Ok(att) => {
                 let angl = att.get_f64("ANGL").map(|v| v as f32);
                 let radi = att.get_f64("RADI").map(|v| v as f32);
@@ -1301,14 +1055,14 @@ async fn fetch_bend_elements_for_branch(
         };
 
         bends.push(MbdBendDto {
-            id: format!("bend:{}", row.refno),
-            refno: row.refno.to_string(),
+            id: format!("bend:{}", row.arrive_refno),
+            refno: row.arrive_refno.to_string(),
             noun: row.noun.clone(),
             angle,
             radius,
             work_point: work_point.to_array(),
-            face_center_1: fc1.map(|v| v.to_array()),
-            face_center_2: fc2.map(|v| v.to_array()),
+            face_center_1: fc1,
+            face_center_2: fc2,
         });
     }
 
@@ -1442,6 +1196,31 @@ fn closest_endpoints(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> (Vec3, Vec3, f32
     best
 }
 
+/// 计算两个相邻 tubi 段的"最近候选点对"，同时考虑 start/end 和 axis 点。
+///
+/// tubi 段之间通常通过管件（ELBO/BEND/TEE）连接，导致 end_pt[i] 与 start_pt[i+1] 之间
+/// 有管件占据的间隙。而 leave_axis[i] 精确等于 start[i+1]，是真正的连通点。
+fn closest_endpoints_with_axis(seg1: &CacheTubiSeg, seg2: &CacheTubiSeg) -> (Vec3, Vec3, f32) {
+    let mut pts1 = vec![seg1.start, seg1.end];
+    if let Some(a) = seg1.arrive_axis { pts1.push(a); }
+    if let Some(l) = seg1.leave_axis { pts1.push(l); }
+
+    let mut pts2 = vec![seg2.start, seg2.end];
+    if let Some(a) = seg2.arrive_axis { pts2.push(a); }
+    if let Some(l) = seg2.leave_axis { pts2.push(l); }
+
+    let mut best = (pts1[0], pts2[0], pts1[0].distance(pts2[0]));
+    for &p1 in &pts1 {
+        for &p2 in &pts2 {
+            let d = p1.distance(p2);
+            if d < best.2 {
+                best = (p1, p2, d);
+            }
+        }
+    }
+    best
+}
+
 // ===== MBD JSON 预生成与导出 =====
 
 /// 导出范围
@@ -1517,16 +1296,23 @@ pub async fn generate_mbd_data(
     branch_refno: RefnoEnum,
     query: &MbdPipeQuery,
 ) -> anyhow::Result<MbdPipeData> {
-    let (segments, mut debug_info) =
+    let (segments, _debug) =
         fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await?;
+    generate_mbd_data_from_segments(branch_refno, &segments, query).await
+}
+
+/// 从已获取的 segments 生成 MBD 数据（供 get_mbd_pipe 和 generate_mbd_data 共用）
+async fn generate_mbd_data_from_segments(
+    branch_refno: RefnoEnum,
+    segments: &[CacheTubiSeg],
+    query: &MbdPipeQuery,
+) -> anyhow::Result<MbdPipeData> {
 
     let (branch_name, branch_attrs) = if query.include_branch_attrs {
         match try_fill_branch_name_and_attrs(branch_refno).await {
             Ok(v) => v,
             Err(e) => {
-                debug_info
-                    .notes
-                    .push(format!("分支属性填充失败（已忽略）: {e}"));
+                eprintln!("[mbd-pipe] 分支属性填充失败（已忽略）: {e}");
                 (branch_refno.to_string(), BranchAttrsDto::default())
             }
         }
@@ -1601,9 +1387,7 @@ pub async fn generate_mbd_data(
             match try_build_tree_index_for_refno(branch_refno).await {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    debug_info
-                        .notes
-                        .push(format!("TreeIndex 初始化失败（weld_nouns 已忽略）: {e}"));
+                    eprintln!("[mbd-pipe] TreeIndex 初始化失败（weld_nouns 已忽略）: {e}");
                     None
                 }
             }
@@ -1615,7 +1399,7 @@ pub async fn generate_mbd_data(
             let seg1 = &segments[i];
             let seg2 = &segments[i + 1];
 
-            let (p1, p2, dist) = closest_endpoints(seg1.start, seg1.end, seg2.start, seg2.end);
+            let (p1, p2, dist) = closest_endpoints_with_axis(seg1, seg2);
             if dist >= query.weld_merge_threshold {
                 continue;
             }

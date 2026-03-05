@@ -178,19 +178,63 @@ impl RecentGeoDeduper {
     }
 }
 
-/// 从数据库查询已完成 meshing 的 inst_geo ID（u64），用于启动时预加载去重
+/// 扫描 meshes 目录下所有 lod_* 子目录中的 .glb 文件，提取已存在的 geo hash ID
 ///
-/// 只预加载 `meshed=true` 且 `bad!=true` 的记录，避免误跳过仍需补算的几何。
-pub async fn query_existing_meshed_inst_geo_ids() -> anyhow::Result<Vec<u64>> {
-    let sql = "SELECT VALUE record::id(id) FROM inst_geo WHERE meshed = true AND bad != true";
-    let ids: Vec<String> = model_primary_db().query_take(sql, 0).await?;
-    let mut result = Vec::with_capacity(ids.len());
-    for id_str in ids {
-        if let Ok(hash) = id_str.parse::<u64>() {
-            result.push(hash);
+/// 文件名格式：`{geo_hash}_{LOD}.glb` 或 `{geo_hash}.glb`，提取下划线前（或 `.` 前）的 u64。
+pub fn scan_existing_mesh_ids_from_dir(mesh_dir: &std::path::Path) -> Vec<u64> {
+    let start = std::time::Instant::now();
+    let mut ids = Vec::new();
+
+    if !mesh_dir.exists() {
+        return ids;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(mesh_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("lod_") {
+                        collect_geo_ids_from_glb_dir(&path, &mut ids);
+                    }
+                }
+            }
         }
     }
-    Ok(result)
+
+    ids.sort_unstable();
+    ids.dedup();
+
+    debug_model!(
+        "📂 扫描 meshes 目录完成: {} 个唯一 geo hash, 耗时 {} ms (目录: {})",
+        ids.len(),
+        start.elapsed().as_millis(),
+        mesh_dir.display()
+    );
+    ids
+}
+
+fn collect_geo_ids_from_glb_dir(dir: &std::path::Path, ids: &mut Vec<u64>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map_or(false, |e| e == "glb") {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                let id_part = stem.split('_').next().unwrap_or(stem);
+                if let Ok(id) = id_part.parse::<u64>() {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+}
+
+/// 启动时扫描 meshes 目录获取已存在的 mesh geo ID（u64），用于预加载去重器
+pub fn query_existing_meshed_inst_geo_ids() -> Vec<u64> {
+    let mesh_dir = get_db_option().get_meshes_path();
+    scan_existing_mesh_ids_from_dir(&mesh_dir)
 }
 
 /// SQL flush 阈值
@@ -352,14 +396,14 @@ pub async fn generate_meshes_for_batch(
 
         let mesh_id = task.geo_hash.to_string();
 
-        // 第二层去重：检查 DB 预加载缓存（EXIST_MESH_GEO_HASHES）
-        // 如果该 geo_hash 已经在数据库中 meshed=true，直接复用缓存的 AABB，跳过 CSG 生成
+        // 第二层去重：检查预加载缓存（EXIST_MESH_GEO_HASHES）
+        // 如果该 geo_hash 的 mesh 文件已存在，跳过 CSG 生成；有 AABB 则复用，无则仅标记已完成
         if let Some(cached_aabb) = EXIST_MESH_GEO_HASHES.get(&mesh_id) {
             let cached = *cached_aabb;
             drop(cached_aabb);
             let ext_mag = cached.extents().magnitude();
-            let valid = ext_mag > 1e-4 && ext_mag < f32::INFINITY;
-            let aabb_hash = if valid {
+            let has_valid_aabb = ext_mag > 1e-4 && ext_mag < f32::INFINITY;
+            let aabb_hash = if has_valid_aabb {
                 let h = gen_aabb_hash(&cached);
                 aabb_map.entry(h.to_string()).or_insert(cached);
                 Some(h)
@@ -368,7 +412,7 @@ pub async fn generate_meshes_for_batch(
             };
             results.insert(task.geo_hash, MeshResult {
                 meshed: true,
-                bad: !valid,
+                bad: false,
                 aabb_hash,
                 pts_hashes: vec![],
             });
@@ -663,8 +707,8 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
     let precision = db_option.mesh_precision().clone();
     let mesh_formats = crate::options::get_db_option_ext().mesh_formats.clone();
 
-    // 性能优化：启动前预加载数据库中已网格化的几何信息到内存，避免后续循环中重复查询。
-    crate::fast_model::preload_mesh_cache().await?;
+    // 性能优化：启动前扫描 meshes 目录预加载已有 geo hash 到内存，避免后续重复生成。
+    crate::fast_model::preload_mesh_cache();
 
     // 🔥 查询待处理的总数，用于显示进度
     let total_count = query_total_pending_mesh_count(replace_exist).await?;
@@ -896,7 +940,7 @@ pub async fn run_mesh_worker_from_channel(
     let precision = db_option.mesh_precision().clone();
     let mesh_formats = crate::options::get_db_option_ext().mesh_formats.clone();
 
-    crate::fast_model::preload_mesh_cache().await?;
+    crate::fast_model::preload_mesh_cache();
 
     let lod_dir = mesh_dir.join(format!("lod_{:?}", precision.default_lod));
     if !lod_dir.exists() {

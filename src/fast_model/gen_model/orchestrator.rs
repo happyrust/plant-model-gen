@@ -721,17 +721,11 @@ async fn process_index_tree_generation(
         // 预加载 mesh 缓存 + 已有 inst_geo IDs（一次性）
         // replace_exist（--regen-model）时跳过预加载，强制重新生成 mesh
         if gen_mesh && !replace_exist {
-            if let Err(e) = crate::fast_model::preload_mesh_cache().await {
-                eprintln!("[mesh_inline] 预加载 mesh 缓存失败: {}", e);
-            }
-            match query_existing_meshed_inst_geo_ids().await {
-                Ok(ids) => {
-                    let count = ids.len();
-                    mesh_deduper.preload(ids);
-                    println!("[mesh_inline] 预加载 {} 个已 meshed inst_geo ID 到去重器 (capacity={})", count, mesh_deduper.capacity);
-                }
-                Err(e) => eprintln!("[mesh_inline] 预加载 inst_geo IDs 失败: {}", e),
-            }
+            crate::fast_model::preload_mesh_cache();
+            let ids = query_existing_meshed_inst_geo_ids();
+            let count = ids.len();
+            mesh_deduper.preload(ids);
+            println!("[mesh_inline] 预加载 {} 个已 meshed inst_geo ID 到去重器 (capacity={})", count, mesh_deduper.capacity);
         } else if gen_mesh {
             println!("[mesh_inline] replace_exist 模式，跳过去重器预加载，强制重新生成 mesh");
         }

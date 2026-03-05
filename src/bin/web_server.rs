@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
                 .short('c')
                 .help("Path to the configuration file (Without extension)")
                 .value_name("CONFIG_PATH")
-                .default_value(if cfg!(target_family = "unix") {
+                .default_value(if cfg!(target_os = "macos") {
                     "db_options/DbOption-mac"
                 } else {
                     "db_options/DbOption"
@@ -72,9 +72,15 @@ async fn main() -> anyhow::Result<()> {
             Ok(child) => {
                 println!("✅ SurrealDB 进程已启动 (PID: {})", child.id());
                 // 覆盖 surrealdb 连接模式为 ws，避免 rocksdb 文件锁冲突
-                let (bind_ip, bind_port) = ws_cfg.surreal_bind.split_once(':')
+                let (bind_ip, bind_port) = ws_cfg
+                    .surreal_bind
+                    .split_once(':')
                     .unwrap_or(("0.0.0.0", "8020"));
-                let conn_ip = if bind_ip == "0.0.0.0" { "127.0.0.1" } else { bind_ip };
+                let conn_ip = if bind_ip == "0.0.0.0" {
+                    "127.0.0.1"
+                } else {
+                    bind_ip
+                };
                 unsafe {
                     std::env::set_var("SURREAL_CONN_MODE", "ws");
                     std::env::set_var("SURREAL_CONN_IP", conn_ip);
@@ -86,7 +92,10 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => {
                 eprintln!("❌ 无法启动 SurrealDB: {}", e);
-                eprintln!("   请确认 '{}' 在 PATH 中或配置 surreal_bin 为完整路径", ws_cfg.surreal_bin);
+                eprintln!(
+                    "   请确认 '{}' 在 PATH 中或配置 surreal_bin 为完整路径",
+                    ws_cfg.surreal_bin
+                );
                 return Err(e.into());
             }
         }

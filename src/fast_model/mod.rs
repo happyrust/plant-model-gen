@@ -363,33 +363,31 @@ fn load_aabb_cache_from_disk(mesh_dir: &std::path::Path) -> usize {
     count
 }
 
-/// 从 meshes 目录预加载几何网格缓存
+/// 从内存中的 AABB 缓存导出 geo_hash 列表。
 ///
-/// 优先从 `aabb_cache.rkyv` 读取有效 AABB，再扫描 .glb 文件补充新增 geo_hash。
+/// 仅返回已经拥有有效 AABB 的 mesh，供 mesh 去重器预加载使用。
+pub fn cached_mesh_geo_ids() -> Vec<u64> {
+    let mut ids = Vec::with_capacity(EXIST_MESH_GEO_HASHES.len());
+    for kv in EXIST_MESH_GEO_HASHES.iter() {
+        if let Ok(id) = kv.key().parse::<u64>() {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// 从 `meshes/aabb_cache.rkyv` 预加载几何网格缓存。
+///
+/// mesh 预加载/去重只依赖持久化的 AABB 缓存，不再扫描 `.glb` 文件列表。
 pub fn preload_mesh_cache() {
-    use crate::fast_model::mesh_generate::scan_existing_mesh_ids_from_dir;
-
     let mesh_dir = aios_core::get_db_option().get_meshes_path();
-
-    // 优先从 rkyv 缓存读取（含有效 AABB）
     let cache_count = load_aabb_cache_from_disk(&mesh_dir);
 
-    // 再扫描目录补充新增的 geo_hash（可能尚未写入 rkyv 缓存）
-    let ids = scan_existing_mesh_ids_from_dir(&mesh_dir);
-    let mut new_count = 0usize;
-    for id in ids {
-        let mesh_id = id.to_string();
-        // or_insert：rkyv 已加载的不覆盖
-        EXIST_MESH_GEO_HASHES.entry(mesh_id).or_insert_with(|| {
-            new_count += 1;
-            Aabb::new_invalid()
-        });
-    }
-
     debug_model!(
-        "✅ 缓存预加载: rkyv={} 条有效 AABB, 目录扫描补充 {} 条（无 AABB）",
+        "✅ 缓存预加载: rkyv={} 条有效 AABB",
         cache_count,
-        new_count,
     );
 }
 

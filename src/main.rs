@@ -173,8 +173,10 @@ async fn run_import_and_post_process(
 
     use aios_core::SurrealQueryExt;
     let sql = "SELECT value in FROM inst_relate;";
-    let refnos: Vec<aios_core::RefnoEnum> =
-        aios_core::project_primary_db().query_take(sql, 0).await.unwrap_or_default();
+    let refnos: Vec<aios_core::RefnoEnum> = aios_core::project_primary_db()
+        .query_take(sql, 0)
+        .await
+        .unwrap_or_default();
 
     // Phase 2 Step 3: reconcile_missing_neg_relate
     println!("[import-sql] Phase 2.3: reconcile_missing_neg_relate...");
@@ -346,7 +348,7 @@ async fn main() -> anyhow::Result<()> {
                 .short('c')
                 .help("Path to the configuration file (Without extension)")
                 .value_name("CONFIG_PATH")
-                .default_value(if cfg!(target_family = "unix") {
+                .default_value(if cfg!(target_os = "macos") {
                     "db_options/DbOption-mac"
                 } else {
                     "db_options/DbOption"
@@ -1005,8 +1007,6 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-
-
     // ========== MBD JSON 预生成 ==========
     #[cfg(feature = "web_server")]
     if matches.get_flag("export-mbd") || matches.get_one::<String>("export-mbd-refno").is_some() {
@@ -1261,7 +1261,9 @@ async fn main() -> anyhow::Result<()> {
     // --defer-db-write：模型生成阶段不写 SurrealDB，SQL 输出到 .surql 文件
     let defer_db_write_explicit = matches.get_flag("defer-db-write");
     if defer_db_write_explicit {
-        println!("🗂️ 检测到 --defer-db-write 参数，模型生成阶段将跳过 SurrealDB 写入，SQL 输出到 .surql 文件");
+        println!(
+            "🗂️ 检测到 --defer-db-write 参数，模型生成阶段将跳过 SurrealDB 写入，SQL 输出到 .surql 文件"
+        );
         db_option_ext.defer_db_write = true;
     }
 
@@ -1951,15 +1953,13 @@ async fn main() -> anyhow::Result<()> {
         use std::str::FromStr;
 
         let dbnum_cli = matches.get_one::<u32>("dbnum").copied();
-        let root_refno: Option<RefnoEnum> = matches
-            .get_one::<String>("root-refno")
-            .and_then(|s| {
-                let refno_str = s.replace('_', "/");
-                RefnoEnum::from_str(&refno_str).ok()
-            });
-        let dbnum_from_root = root_refno.as_ref().and_then(|r| {
-            aios_database::data_interface::db_meta().get_dbnum_by_refno(*r)
+        let root_refno: Option<RefnoEnum> = matches.get_one::<String>("root-refno").and_then(|s| {
+            let refno_str = s.replace('_', "/");
+            RefnoEnum::from_str(&refno_str).ok()
         });
+        let dbnum_from_root = root_refno
+            .as_ref()
+            .and_then(|r| aios_database::data_interface::db_meta().get_dbnum_by_refno(*r));
 
         let fill_missing_cache = matches.get_flag("fill-missing-cache");
         let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
@@ -1980,9 +1980,13 @@ async fn main() -> anyhow::Result<()> {
             (Some(n), _) => n,
             (None, Some(n)) => n,
             (None, None) => {
-                eprintln!("❌ 错误: --export-dbnum-instances-parquet 需要提供 --dbnum 或 --root-refno");
+                eprintln!(
+                    "❌ 错误: --export-dbnum-instances-parquet 需要提供 --dbnum 或 --root-refno"
+                );
                 eprintln!("   例如: cargo run -- --export-dbnum-instances-parquet --dbnum 7997");
-                eprintln!("   或者: cargo run -- --export-dbnum-instances-parquet --root-refno 24381_145018");
+                eprintln!(
+                    "   或者: cargo run -- --export-dbnum-instances-parquet --root-refno 24381_145018"
+                );
                 std::process::exit(1);
             }
         };
@@ -1990,10 +1994,15 @@ async fn main() -> anyhow::Result<()> {
         let mut from_surrealdb = if matches.get_flag("fill-missing-cache") {
             false // --fill-missing-cache 使用 model cache
         } else {
-            matches.get_one::<bool>("from-surrealdb").copied().unwrap_or(true)
+            matches
+                .get_one::<bool>("from-surrealdb")
+                .copied()
+                .unwrap_or(true)
         };
         if root_refno.is_some() && !from_surrealdb {
-            println!("⚠️  检测到 --root-refno，自动切换到 SurrealDB 数据源（cache 模式不支持按 root 范围导出）");
+            println!(
+                "⚠️  检测到 --root-refno，自动切换到 SurrealDB 数据源（cache 模式不支持按 root 范围导出）"
+            );
             from_surrealdb = true;
         }
 
@@ -2099,7 +2108,9 @@ async fn main() -> anyhow::Result<()> {
 
     // ========== 处理 room 子命令 ==========
     if let Some(room_matches) = matches.subcommand_matches("room") {
-        use crate::cli_modes::{export_room_instances_mode, room_clean_mode, room_compute_mode, room_compute_panel_mode};
+        use crate::cli_modes::{
+            export_room_instances_mode, room_clean_mode, room_compute_mode, room_compute_panel_mode,
+        };
         use aios_core::RefnoEnum;
         use std::str::FromStr;
 
@@ -2128,8 +2139,13 @@ async fn main() -> anyhow::Result<()> {
                     .get_many::<String>("expect-refnos")
                     .map(|v| v.map(|s| s.to_string()).collect());
 
-                return room_compute_panel_mode(panel_refno, expect_refnos, verbose, &db_option_ext)
-                    .await;
+                return room_compute_panel_mode(
+                    panel_refno,
+                    expect_refnos,
+                    verbose,
+                    &db_option_ext,
+                )
+                .await;
             }
             Some(("clean", _)) => {
                 return room_clean_mode(&db_option_ext).await;
@@ -2196,7 +2212,10 @@ fn maybe_redirect_stdio_to_log_file() {
 
     // 默认不重定向，避免 spawn 子进程后终端无输出导致“卡住”的假象。
     // 需要重定向时设置环境变量 AIOS_REDIRECT_STDIO=1。
-    if std::env::var_os("AIOS_REDIRECT_STDIO").map(|v| v != "1").unwrap_or(true) {
+    if std::env::var_os("AIOS_REDIRECT_STDIO")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
         return;
     }
 

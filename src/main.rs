@@ -770,12 +770,6 @@ async fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
-            Arg::new("export-room-instances")
-                .long("export-room-instances")
-                .help("Export room calculation results as JSON (room_relations.json + room_geometries.json)")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
             Arg::new("import-spatial-index")
                 .long("import-spatial-index")
                 .help("Import instances.json to SQLite spatial index")
@@ -814,41 +808,45 @@ async fn main() -> anyhow::Result<()> {
                 .value_delimiter(',')
                 .num_args(1..),
         )
-        // ========== 房间计算命令 ==========
-        .arg(
-            Arg::new("room-compute")
-                .long("room-compute")
-                .help("Run room relation computation (build spatial relationships between rooms and components)")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("room-keywords")
-                .long("room-keywords")
-                .help("Room keywords for filtering (comma-separated, e.g., '-RM,-ROOM')")
-                .value_name("KEYWORDS")
-                .value_delimiter(',')
-                .num_args(1..),
-        )
-        .arg(
-            Arg::new("room-force-rebuild")
-                .long("room-force-rebuild")
-                .help("Force rebuild all room relations (ignore existing data)")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("room-db-nums")
-                .long("room-db-nums")
-                .help("Database numbers to process (comma-separated, e.g., '1112,1113')")
-                .value_name("DB_NUMS")
-                .value_delimiter(',')
-                .num_args(1..),
-        )
-        .arg(
-            Arg::new("room-refno-root")
-                .long("room-refno-root")
-                .help("Root refno for room calculation scope (e.g., '21491_10000'). Only rooms under this subtree will be processed.")
-                .value_name("REFNO")
-                .action(clap::ArgAction::Set),
+        // ========== 房间计算子命令 ==========
+        .subcommand(
+            Command::new("room")
+                .about("房间计算相关命令")
+                .subcommand(
+                    Command::new("compute")
+                        .about("执行房间关系计算（构件空间归属判定）")
+                        .arg(Arg::new("keywords").long("keywords").short('k')
+                            .help("房间名称关键词过滤（逗号分隔）")
+                            .value_delimiter(',')
+                            .num_args(1..))
+                        .arg(Arg::new("db-nums").long("db-nums")
+                            .help("限定数据库编号（逗号分隔）")
+                            .value_delimiter(',')
+                            .num_args(1..))
+                        .arg(Arg::new("refno-root").long("refno-root")
+                            .help("限定 refno 子树根（如 21491_10000）")),
+                )
+                .subcommand(
+                    Command::new("compute-panel")
+                        .about("指定单个面板 refno 执行房间计算")
+                        .arg(Arg::new("panel-refno")
+                            .help("面板参考号（如 24381/35798）")
+                            .required(true))
+                        .arg(Arg::new("expect-refnos").long("expect-refnos")
+                            .help("期望命中的构件 refno（逗号分隔），用于验证计算结果")
+                            .value_delimiter(',')
+                            .num_args(1..)),
+                )
+                .subcommand(
+                    Command::new("clean")
+                        .about("清理已有的房间关系数据（room_relate + room_panel_relate）"),
+                )
+                .subcommand(
+                    Command::new("export")
+                        .about("导出房间计算结果为 JSON")
+                        .arg(Arg::new("output").long("output").short('o')
+                            .help("输出目录")),
+                ),
         )
         // ========== pe_transform 刷新命令 ==========
         .arg(
@@ -1280,12 +1278,12 @@ async fn main() -> anyhow::Result<()> {
         db_option_ext.defer_db_write = true;
     }
 
-    // 调试模式下，如果配置开启了 gen_mesh，默认也应强制重新生成 mesh
-    if debug_model_requested && db_option_ext.inner.gen_mesh {
-        if db_option_ext.inner.replace_mesh != Some(true) {
-            println!("🔄 调试模式启用 gen_mesh，默认开启 replace_mesh 以重新生成模型数据");
+    // --debug-model 是增量模式，不应强制 replace_mesh（不清理旧数据）；
+    // 只有 --regen-model 才需要 replace_mesh + pre_cleanup_for_regen。
+    if debug_model_requested && !regen_model_requested && db_option_ext.inner.gen_mesh {
+        if db_option_ext.inner.replace_mesh == Some(true) {
+            println!("⚠️ 调试模式检测到 replace_mesh=true（配置/--regen-model），保持不变");
         }
-        db_option_ext.inner.replace_mesh = Some(true);
     }
 
     // 模型导出请求：默认只导出不触发生成；--regen-model 或 --debug-model 前置生成。
@@ -1303,7 +1301,6 @@ async fn main() -> anyhow::Result<()> {
         || matches.get_flag("export-dbnum-instances-json")
         || matches.get_flag("export-dbnum-instances-parquet")
         || matches.get_flag("export-dbnum-instances")
-        || matches.get_flag("export-room-instances")
         || matches.get_flag("export-pdms-tree-parquet")
         || matches.get_flag("export-world-sites-parquet");
 
@@ -2055,15 +2052,6 @@ async fn main() -> anyhow::Result<()> {
         .await;
     }
 
-    // 导出房间实例数据
-    if matches.get_flag("export-room-instances") {
-        use crate::cli_modes::export_room_instances_mode;
-
-        let output_dir = matches.get_one::<String>("output").map(PathBuf::from);
-
-        return export_room_instances_mode(output_dir, verbose).await;
-    }
-
     // 导入 instances.json 到 SQLite 空间索引
     if let Some(json_path) = matches.get_one::<String>("import-spatial-index") {
         use crate::cli_modes::import_spatial_index_mode;
@@ -2122,49 +2110,52 @@ async fn main() -> anyhow::Result<()> {
         .await;
     }
 
-    // ========== 处理 --room-compute 房间计算命令 ==========
-    if matches.get_flag("room-compute") {
-        use crate::cli_modes::room_compute_mode;
+    // ========== 处理 room 子命令 ==========
+    if let Some(room_matches) = matches.subcommand_matches("room") {
+        use crate::cli_modes::{export_room_instances_mode, room_clean_mode, room_compute_mode, room_compute_panel_mode};
         use aios_core::RefnoEnum;
         use std::str::FromStr;
 
-        let room_keywords: Option<Vec<String>> = matches
-            .get_many::<String>("room-keywords")
-            .map(|kws| kws.map(|s| s.to_string()).collect());
+        match room_matches.subcommand() {
+            Some(("compute", sub_m)) => {
+                let keywords: Option<Vec<String>> = sub_m
+                    .get_many::<String>("keywords")
+                    .map(|kws| kws.map(|s| s.to_string()).collect());
 
-        let force_rebuild = matches.get_flag("room-force-rebuild");
+                let db_nums: Option<Vec<u32>> = sub_m
+                    .get_many::<String>("db-nums")
+                    .map(|nums| nums.filter_map(|s| s.parse::<u32>().ok()).collect());
 
-        let db_nums: Option<Vec<u32>> = matches
-            .get_many::<String>("room-db-nums")
-            .map(|nums| nums.filter_map(|s| s.parse::<u32>().ok()).collect());
+                let refno_root: Option<RefnoEnum> =
+                    sub_m.get_one::<String>("refno-root").and_then(|s| {
+                        let refno_str = s.replace('_', "/");
+                        RefnoEnum::from_str(&refno_str).ok()
+                    });
 
-        let refno_root: Option<RefnoEnum> =
-            matches.get_one::<String>("room-refno-root").and_then(|s| {
-                let refno_str = s.replace('_', "/");
-                RefnoEnum::from_str(&refno_str).ok()
-            });
+                return room_compute_mode(keywords, db_nums, refno_root, verbose, &db_option_ext)
+                    .await;
+            }
+            Some(("compute-panel", sub_m)) => {
+                let panel_refno = sub_m.get_one::<String>("panel-refno").unwrap();
+                let expect_refnos: Option<Vec<String>> = sub_m
+                    .get_many::<String>("expect-refnos")
+                    .map(|v| v.map(|s| s.to_string()).collect());
 
-        println!("🏠 启动房间计算模式");
-        if let Some(ref kws) = room_keywords {
-            println!("   - 房间关键词: {:?}", kws);
+                return room_compute_panel_mode(panel_refno, expect_refnos, verbose, &db_option_ext)
+                    .await;
+            }
+            Some(("clean", _)) => {
+                return room_clean_mode(&db_option_ext).await;
+            }
+            Some(("export", sub_m)) => {
+                let output_dir = sub_m.get_one::<String>("output").map(PathBuf::from);
+                return export_room_instances_mode(output_dir, verbose).await;
+            }
+            _ => {
+                println!("请指定 room 子命令，使用 --help 查看可用命令");
+                return Ok(());
+            }
         }
-        if let Some(ref nums) = db_nums {
-            println!("   - 数据库编号: {:?}", nums);
-        }
-        if let Some(ref root) = refno_root {
-            println!("   - refno 子树根: {}", root);
-        }
-        println!("   - 强制重建: {}", force_rebuild);
-
-        return room_compute_mode(
-            room_keywords,
-            db_nums,
-            refno_root,
-            force_rebuild,
-            verbose,
-            &db_option_ext,
-        )
-        .await;
     }
 
     // ========== 处理 --refresh-transform pe_transform 刷新命令 ==========

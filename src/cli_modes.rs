@@ -450,6 +450,8 @@ async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
 /// - surreal_bin: 环境变量 SURREAL_BIN > [web_server].surreal_bin > "surreal"
 /// - 数据路径: [web_server].surreal_data_path > [surrealdb].path > 默认 db-data/{project}_{port}.rdb
 /// - 监听地址: [web_server].surreal_bind（如 0.0.0.0:8020）
+///
+/// 启动前会检测 RocksDB LOCK 文件：若无 surreal 进程持有则自动清理残留锁，避免崩溃后无法重启。
 async fn auto_start_surreal(db_option: &aios_core::options::DbOption) -> Result<()> {
     let sdb_cfg = db_option.effective_surrealdb();
     let ws_cfg = &db_option.web_server;
@@ -460,49 +462,121 @@ async fn auto_start_surreal(db_option: &aios_core::options::DbOption) -> Result<
     let surreal_bin = std::env::var("SURREAL_BIN")
         .unwrap_or_else(|_| ws_cfg.surreal_bin.clone());
 
+    // 清理残留 LOCK 文件（无 surreal 进程时属于崩溃残留）
+    cleanup_stale_rocksdb_lock(&data_path);
+
     println!("🚀 启动 SurrealDB: {} start --bind {} {}", surreal_bin, bind, db_uri);
 
-    let child = std::process::Command::new(&surreal_bin)
+    let result = try_start_surreal_process(&surreal_bin, &sdb_cfg.user, &sdb_cfg.password, &bind, &db_uri).await;
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let err_msg = e.to_string();
+            // LOCK 文件冲突：可能在检测和启动之间有残留，再清理一次重试
+            if err_msg.contains("LOCK") || err_msg.contains("lock file") {
+                println!("⚠️  检测到 LOCK 文件冲突，清理后重试...");
+                cleanup_stale_rocksdb_lock(&data_path);
+                try_start_surreal_process(&surreal_bin, &sdb_cfg.user, &sdb_cfg.password, &bind, &db_uri).await
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// 清理 RocksDB 残留 LOCK 文件（仅在没有 surreal 进程运行时才清理）
+fn cleanup_stale_rocksdb_lock(data_path: &str) {
+    let lock_path = std::path::Path::new(data_path).join("LOCK");
+    if !lock_path.exists() {
+        return;
+    }
+
+    // 检查是否有 surreal 进程在运行
+    let has_surreal_process = std::process::Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq surreal.exe", "/NH"])
+        .output()
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout);
+            out.contains("surreal.exe")
+        })
+        .unwrap_or(false);
+
+    if has_surreal_process {
+        println!("   ⚠️  LOCK 文件存在且有 surreal 进程在运行，跳过清理");
+        return;
+    }
+
+    // 无 surreal 进程 → 残留锁，安全删除
+    match std::fs::remove_file(&lock_path) {
+        Ok(()) => println!("   🧹 已清理残留 LOCK 文件: {}", lock_path.display()),
+        Err(e) => println!("   ⚠️  无法删除 LOCK 文件: {} ({})", lock_path.display(), e),
+    }
+}
+
+/// 启动 surreal 进程并等待端口就绪
+async fn try_start_surreal_process(
+    surreal_bin: &str,
+    user: &str,
+    password: &str,
+    bind: &str,
+    db_uri: &str,
+) -> Result<()> {
+    let mut child = std::process::Command::new(surreal_bin)
         .arg("start")
         .arg("--user")
-        .arg(&sdb_cfg.user)
+        .arg(user)
         .arg("--pass")
-        .arg(&sdb_cfg.password)
+        .arg(password)
         .arg("--bind")
-        .arg(&bind)
+        .arg(bind)
         .arg("--log")
         .arg("warn")
-        .arg(&db_uri)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .arg(db_uri)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("无法启动 SurrealDB（请确认 '{}' 在 PATH 中）", surreal_bin))?;
 
     println!("   PID: {}", child.id());
 
-    // 等待端口就绪（最多 30 秒），使用客户端连接地址检测
-    let connect_ip = if sdb_cfg.ip == "localhost" {
-        "127.0.0.1"
-    } else {
-        &sdb_cfg.ip
-    };
-    let addr = format!("{}:{}", connect_ip, sdb_cfg.port);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // 等待端口就绪（最多 60 秒）
+    let timeout_secs = 60u64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     loop {
+        // 检查子进程是否已经退出（启动失败）
+        if let Some(status) = child.try_wait().ok().flatten() {
+            let stderr_output = child
+                .stderr
+                .take()
+                .map(|mut s| {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut s, &mut buf).ok();
+                    buf
+                })
+                .unwrap_or_default();
+            anyhow::bail!(
+                "SurrealDB 进程已退出（exit={}）。\nstderr: {}",
+                status,
+                if stderr_output.is_empty() { "(空)" } else { &stderr_output }
+            );
+        }
+
         if std::time::Instant::now() > deadline {
             anyhow::bail!(
-                "SurrealDB 启动超时（30s），端口 {} 仍未就绪。请手动检查。",
-                addr
+                "SurrealDB 启动超时（{}s），端口 {} 仍未就绪。请手动检查。",
+                timeout_secs,
+                bind
             );
         }
         if let Ok(Ok(_)) = tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            tokio::net::TcpStream::connect(&addr),
+            tokio::net::TcpStream::connect(bind),
         )
         .await
         {
-            println!("✅ SurrealDB 已就绪 ({})", addr);
+            println!("✅ SurrealDB 已就绪 ({})", bind);
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2553,20 +2627,151 @@ async fn build_spatial_index_from_db(
     Ok(())
 }
 
+/// 从 inst_relate_aabb 关系表构建 AABB 空间索引
+///
+/// 与 `build_spatial_index_from_db`（读 pe.world_aabb）不同，
+/// 此函数读取 `gen_all_geos_data` 实际写入的 `inst_relate_aabb` + `aabb` 表，
+/// 适用于增量生成后的 compute-panel 场景。
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
+    use aios_database::sqlite_index::SqliteAabbIndex;
+    use aios_database::spatial_index::SqliteSpatialIndex;
+    use aios_core::model_primary_db;
+    use aios_core::SurrealQueryExt;
+    use std::time::Instant;
+
+    println!("\n🗃️ 构建空间索引 (from inst_relate_aabb)");
+    println!("==========================================");
+
+    let start_time = Instant::now();
+    let idx_path = SqliteSpatialIndex::default_path();
+
+    if idx_path.exists() {
+        std::fs::remove_file(&idx_path)?;
+        if verbose {
+            println!("   ✅ 已删除旧索引文件");
+        }
+    }
+
+    let idx = SqliteAabbIndex::open(&idx_path)?;
+    idx.init_schema()?;
+
+    // 从 inst_relate_aabb 查询所有记录，join aabb 表取坐标
+    let sql = r#"SELECT in AS refno, out.d AS aabb FROM inst_relate_aabb"#;
+    let records: Vec<serde_json::Value> = model_primary_db().query_take(sql, 0).await?;
+
+    println!("   📊 查询到 {} 个 inst_relate_aabb 记录", records.len());
+
+    let mut inserted = 0usize;
+    let mut batch: Vec<(i64, f64, f64, f64, f64, f64, f64)> = Vec::new();
+
+    for rec in &records {
+        // refno 可能是 pe:⟨24381_145019⟩ 格式的 RecordId
+        let refno_val = match rec.get("refno") {
+            Some(v) => v,
+            None => continue,
+        };
+        // 从 record id 提取 refno u64
+        let refno_id: i64 = if let Some(s) = refno_val.as_str() {
+            // "24381_145019" 格式
+            let parts: Vec<&str> = s.split('_').collect();
+            if parts.len() == 2 {
+                if let (Ok(a), Ok(b)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                    ((a << 20) | b) as i64
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        } else if let Some(obj) = refno_val.as_object() {
+            // {"tb": "pe", "id": {"String": "24381_145019"}} 格式
+            if let Some(id_val) = obj.get("id") {
+                let id_str = if let Some(s) = id_val.as_str() {
+                    s.to_string()
+                } else if let Some(inner) = id_val.get("String").and_then(|v| v.as_str()) {
+                    inner.to_string()
+                } else {
+                    continue;
+                };
+                let parts: Vec<&str> = id_str.split('_').collect();
+                if parts.len() == 2 {
+                    if let (Ok(a), Ok(b)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                        ((a << 20) | b) as i64
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
+
+        // 解析 aabb：格式为 {"mins": {"x":..,"y":..,"z":..}, "maxs": {...}}
+        let aabb_val = match rec.get("aabb") {
+            Some(v) if !v.is_null() => v,
+            _ => continue,
+        };
+
+        let (minx, miny, minz, maxx, maxy, maxz) =
+            if let (Some(mins), Some(maxs)) = (aabb_val.get("mins"), aabb_val.get("maxs")) {
+                let get3 = |v: &serde_json::Value| -> Option<(f64, f64, f64)> {
+                    Some((v.get("x")?.as_f64()?, v.get("y")?.as_f64()?, v.get("z")?.as_f64()?))
+                };
+                match (get3(mins), get3(maxs)) {
+                    (Some(mn), Some(mx)) => (mn.0, mn.1, mn.2, mx.0, mx.1, mx.2),
+                    _ => continue,
+                }
+            } else if let (Some(min_arr), Some(max_arr)) =
+                (aabb_val.get("min").and_then(|v| v.as_array()),
+                 aabb_val.get("max").and_then(|v| v.as_array()))
+            {
+                if min_arr.len() >= 3 && max_arr.len() >= 3 {
+                    (
+                        min_arr[0].as_f64().unwrap_or(0.0),
+                        min_arr[1].as_f64().unwrap_or(0.0),
+                        min_arr[2].as_f64().unwrap_or(0.0),
+                        max_arr[0].as_f64().unwrap_or(0.0),
+                        max_arr[1].as_f64().unwrap_or(0.0),
+                        max_arr[2].as_f64().unwrap_or(0.0),
+                    )
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+
+        batch.push((refno_id, minx, maxx, miny, maxy, minz, maxz));
+        inserted += 1;
+    }
+
+    idx.insert_many(batch)?;
+
+    let duration = start_time.elapsed();
+    println!("   ✅ 空间索引构建完成");
+    println!("   📊 总计: {} 个构件", inserted);
+    println!("   ⏱️  耗时: {:.2}s", duration.as_secs_f64());
+
+    Ok(())
+}
+
 /// 房间计算 CLI 模式
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub async fn room_compute_mode(
     room_keywords: Option<Vec<String>>,
     db_nums: Option<Vec<u32>>,
     refno_root: Option<RefnoEnum>,
-    force_rebuild: bool,
     verbose: bool,
     db_option_ext: &DbOptionExt,
 ) -> Result<()> {
     use aios_database::fast_model::{RoomBuildStats, build_room_relations};
     use std::time::Instant;
 
-    // 性能剖析：feature=profile 时启用 Chrome Trace
     #[cfg(feature = "profile")]
     let _trace_path =
         aios_database::profiling::init_chrome_tracing_for_db_option(db_option_ext, "room_compute");
@@ -2578,7 +2783,6 @@ pub async fn room_compute_mode(
 
     let start_time = Instant::now();
 
-    // 获取房间关键词
     let keywords = room_keywords.unwrap_or_else(|| db_option_ext.get_room_key_word());
     println!("   - 房间关键词: {:?}", keywords);
 
@@ -2590,23 +2794,33 @@ pub async fn room_compute_mode(
     if let Some(ref root) = refno_root {
         println!("   - refno 子树根: {}", root);
     }
-    println!("   - 强制重建: {}", force_rebuild);
 
-    // 初始化数据库连接
     println!("\n📡 初始化数据库连接...");
     init_surreal().await?;
 
-    // 构建空间索引
+    // 前置检查：inst_relate_aabb 是否有数据
+    {
+        use aios_core::SurrealQueryExt;
+        let count: Vec<usize> = aios_core::SUL_DB
+            .query_take("SELECT VALUE count() FROM inst_relate_aabb GROUP ALL", 0)
+            .await
+            .unwrap_or_default();
+        if count.first().map_or(true, |c| *c == 0) {
+            anyhow::bail!(
+                "inst_relate_aabb 表为空，请先执行模型生成（--debug-model / --regen-model）"
+            );
+        }
+        println!("   - inst_relate_aabb 记录数: {}", count[0]);
+    }
+
     build_spatial_index_from_db(db_nums.as_deref(), verbose).await?;
 
-    // 执行房间关系构建
     println!("\n🔄 开始构建房间关系...");
 
     let stats = build_room_relations(&db_option_ext.inner, db_nums.as_deref(), refno_root).await?;
 
     let duration = start_time.elapsed();
 
-    // 输出结果
     println!("\n🎉 房间计算完成！");
     println!("==========================================");
     println!("📊 统计信息:");
@@ -2621,16 +2835,238 @@ pub async fn room_compute_mode(
     Ok(())
 }
 
+/// 指定单个面板 refno 执行房间计算
+///
+/// 自动生成所需模型：
+/// - panel refno 本身会被加入增量生成列表
+/// - expect-refnos 会检查 owner noun，若为 BRAN/HANG 则切换到生成 owner 的模型
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+pub async fn room_compute_panel_mode(
+    panel_refno_str: &str,
+    expect_refnos: Option<Vec<String>>,
+    verbose: bool,
+    db_option_ext: &DbOptionExt,
+) -> Result<()> {
+    use aios_database::fast_model::room_model::{
+        RoomComputeOptions, cal_room_refnos_with_options, save_room_relate,
+    };
+    use std::collections::HashSet;
+    use std::str::FromStr;
+    use std::time::Instant;
+
+    #[cfg(feature = "profile")]
+    let _trace_path = aios_database::profiling::init_chrome_tracing_for_db_option(
+        db_option_ext,
+        "room_compute_panel",
+    );
+
+    println!("\n🏠 单面板房间计算模式");
+    println!("==========================================");
+
+    let start_time = Instant::now();
+
+    let panel_refno = RefnoEnum::from_str(&panel_refno_str.replace('_', "/"))
+        .map_err(|_| anyhow!("无效的面板 refno: {}", panel_refno_str))?;
+    println!("   - 面板 refno: {}", panel_refno);
+    if let Some(ref expected) = expect_refnos {
+        println!("   - 期望命中: {:?}", expected);
+    }
+
+    ensure_surreal_connected(db_option_ext).await?;
+
+    // ========== 自动生成模型 ==========
+    // 收集需要生成模型的 refno：panel 本身 + expect refnos（BRAN/HANG 切换到 owner）
+    let mut gen_refnos: Vec<RefnoEnum> = vec![panel_refno];
+
+    if let Some(ref expected) = expect_refnos {
+        for exp_str in expected {
+            let exp = RefnoEnum::from_str(&exp_str.replace('_', "/"))
+                .map_err(|_| anyhow!("无效的期望 refno: {}", exp_str))?;
+
+            // 查询该 refno 的 owner 和 noun
+            let pe = aios_core::rs_surreal::get_pe(exp).await?;
+            if let Some(pe) = pe {
+                let noun_upper = pe.noun.to_uppercase();
+                if noun_upper == "BRAN" || noun_upper == "HANG" {
+                    // BRAN/HANG 本身就是模型生成的入口，直接生成
+                    println!("   📦 {} (noun={}) 直接加入生成列表", exp, noun_upper);
+                    gen_refnos.push(exp);
+                } else {
+                    // 非 BRAN/HANG，查询其 owner 是否为 BRAN/HANG
+                    let owner = pe.get_owner();
+                    let owner_pe = aios_core::rs_surreal::get_pe(owner).await?;
+                    if let Some(owner_pe) = owner_pe {
+                        let owner_noun = owner_pe.noun.to_uppercase();
+                        if owner_noun == "BRAN" || owner_noun == "HANG" {
+                            println!(
+                                "   📦 {} (noun={}) → 切换到 owner {} (noun={})",
+                                exp, noun_upper, owner, owner_noun
+                            );
+                            gen_refnos.push(owner);
+                        } else {
+                            println!("   📦 {} (noun={}, owner noun={}) 直接加入", exp, noun_upper, owner_noun);
+                            gen_refnos.push(exp);
+                        }
+                    } else {
+                        gen_refnos.push(exp);
+                    }
+                }
+            } else {
+                println!("   ⚠️ {} 未找到 PE 记录，跳过自动生成", exp);
+            }
+        }
+    }
+
+    // 去重
+    gen_refnos.sort();
+    gen_refnos.dedup();
+
+    println!("\n🔨 自动生成模型 ({} 个目标)...", gen_refnos.len());
+    for r in &gen_refnos {
+        println!("   - {}", r);
+    }
+
+    {
+        use aios_database::fast_model::gen_all_geos_data;
+        aios_core::set_debug_model_enabled(true);
+        let mut gen_opt = db_option_ext.clone();
+        gen_opt.inner.gen_model = true;
+        gen_opt.inner.gen_mesh = true;
+        gen_opt.inner.replace_mesh = Some(true);
+        gen_all_geos_data(gen_refnos, &gen_opt, None, None).await?;
+    }
+    println!("✅ 模型生成完成");
+
+    // ========== 诊断 inst_relate_aabb 数据 ==========
+    {
+        use aios_core::model_primary_db;
+        use aios_core::SurrealQueryExt;
+        let count: Vec<serde_json::Value> = model_primary_db()
+            .query_take("SELECT count() FROM inst_relate_aabb GROUP ALL", 0)
+            .await
+            .unwrap_or_default();
+        println!("🔍 inst_relate_aabb 记录数: {:?}", count);
+    }
+
+    // ========== 执行房间计算（内部自动刷新空间索引） ==========
+    let mesh_dir = db_option_ext.inner.get_meshes_path();
+    let options = RoomComputeOptions::default();
+    let exclude = HashSet::new();
+
+    println!("\n🔄 计算面板 {} 的房间归属...", panel_refno);
+    let result = cal_room_refnos_with_options(&mesh_dir, panel_refno, &exclude, options).await?;
+
+    let duration = start_time.elapsed();
+
+    println!("\n🎉 计算完成！");
+    println!("==========================================");
+    println!("   - 面板: {}", panel_refno);
+    println!("   - 命中构件数: {}", result.len());
+    println!("   - 耗时: {:.2}s", duration.as_secs_f64());
+
+    if verbose || result.len() <= 50 {
+        for r in &result {
+            println!("   - {}", r);
+        }
+    } else {
+        println!("   (构件过多，使用 --verbose 查看全部)");
+    }
+
+    // 验证期望构件
+    if let Some(expected) = expect_refnos {
+        println!("\n📋 期望验证:");
+        let mut all_pass = true;
+        for exp_str in &expected {
+            let exp = RefnoEnum::from_str(&exp_str.replace('_', "/"))
+                .map_err(|_| anyhow!("无效的期望 refno: {}", exp_str))?;
+            if result.contains(&exp) {
+                println!("  ✅ {} — 命中", exp);
+            } else {
+                println!("  ❌ {} — 未命中", exp);
+                all_pass = false;
+            }
+        }
+        if !all_pass {
+            anyhow::bail!("期望验证失败：部分构件未命中");
+        }
+        println!("  ✅ 全部验证通过");
+    }
+
+    if !result.is_empty() {
+        save_room_relate(panel_refno, &result, "manual").await?;
+        println!("💾 已保存 {} 条房间关系", result.len());
+    }
+
+    Ok(())
+}
+
+/// 清理房间关系数据
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+pub async fn room_clean_mode(db_option_ext: &DbOptionExt) -> Result<()> {
+    use aios_core::SurrealQueryExt;
+
+    println!("\n🗑️ 清理房间关系数据");
+    println!("==========================================");
+
+    init_surreal().await?;
+
+    // 查询当前数据量
+    let room_count: Vec<usize> = aios_core::SUL_DB
+        .query_take("SELECT VALUE count() FROM room_relate GROUP ALL", 0)
+        .await
+        .unwrap_or_default();
+    let panel_count: Vec<usize> = aios_core::SUL_DB
+        .query_take("SELECT VALUE count() FROM room_panel_relate GROUP ALL", 0)
+        .await
+        .unwrap_or_default();
+
+    let rc = room_count.first().copied().unwrap_or(0);
+    let pc = panel_count.first().copied().unwrap_or(0);
+
+    if rc == 0 && pc == 0 {
+        println!("   数据库中无房间关系数据，无需清理");
+        return Ok(());
+    }
+
+    println!("   - room_relate 记录数: {}", rc);
+    println!("   - room_panel_relate 记录数: {}", pc);
+
+    aios_core::SUL_DB
+        .query_response("DELETE room_relate; DELETE room_panel_relate;")
+        .await?;
+
+    println!("✅ 清理完成");
+    Ok(())
+}
+
 /// 房间计算 CLI 模式（无 sqlite-index 特性时的占位实现）
 #[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
 pub async fn room_compute_mode(
     _room_keywords: Option<Vec<String>>,
     _db_nums: Option<Vec<u32>>,
     _refno_root: Option<RefnoEnum>,
-    _force_rebuild: bool,
     _verbose: bool,
     _db_option_ext: &DbOptionExt,
 ) -> Result<()> {
+    Err(anyhow!(
+        "房间计算需要 sqlite-index 特性，请使用 --features sqlite-index 编译"
+    ))
+}
+
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
+pub async fn room_compute_panel_mode(
+    _panel_refno_str: &str,
+    _expect_refnos: Option<Vec<String>>,
+    _verbose: bool,
+    _db_option_ext: &DbOptionExt,
+) -> Result<()> {
+    Err(anyhow!(
+        "房间计算需要 sqlite-index 特性，请使用 --features sqlite-index 编译"
+    ))
+}
+
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
+pub async fn room_clean_mode(_db_option_ext: &DbOptionExt) -> Result<()> {
     Err(anyhow!(
         "房间计算需要 sqlite-index 特性，请使用 --features sqlite-index 编译"
     ))

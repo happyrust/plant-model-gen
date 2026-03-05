@@ -886,7 +886,7 @@ async fn pregen_room_panels_into_model_cache(
 
 #[derive(Debug, Clone, Copy)]
 
-struct RoomComputeOptions {
+pub struct RoomComputeOptions {
 
     inside_tol: f32,
 
@@ -2526,7 +2526,7 @@ pub(crate) async fn is_refno_in_panel_by_aabb_vote(
 
 #[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "cal_room_refnos_with_options"))]
 
-async fn cal_room_refnos_with_options(
+pub async fn cal_room_refnos_with_options(
 
     mesh_dir: &PathBuf,
 
@@ -4013,7 +4013,7 @@ fn is_point_inside_mesh_raycast(point: &Point<Real>, tri_mesh: &TriMesh) -> bool
 
 /// 改进版本的房间关系保存
 
-async fn save_room_relate(
+pub async fn save_room_relate(
 
     panel_refno: RefnoEnum,
 

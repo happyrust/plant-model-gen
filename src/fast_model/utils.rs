@@ -25,12 +25,6 @@ pub async fn ensure_surreal_init() -> anyhow::Result<()> {
 }
 
 /// 确保 inst_relate_aabb 以"关系表"方式工作：in=pe，out=aabb，且 `in` 唯一。
-///
-/// 历史遗留：某些数据库中 inst_relate_aabb 曾是普通表（refno/aabb），字段类型可能是必填 record，
-/// 仅写 in/out 会触发类型强制失败。
-///
-/// 修复(RUS-179)：改为条件式迁移——先检查表是否已经是 RELATION 类型，
-/// 如果是则跳过，避免 REMOVE TABLE 清空其他 dbnum 的已有数据。
 pub async fn ensure_inst_relate_aabb_relation_schema() {
     INST_RELATE_AABB_SCHEMA_INIT
         .get_or_init(|| async {
@@ -53,37 +47,13 @@ pub async fn ensure_inst_relate_aabb_relation_schema() {
                 Err(_) => false,
             };
 
-            if already_relation {
-                // 表已经是 RELATION 类型，只需确保字段和索引定义正确（DEFINE IF NOT EXISTS 语义）
+            if !already_relation {
+                // 表不存在或不是 RELATION 类型，重建为 RELATION
+                let _ = model_primary_db().query("REMOVE TABLE inst_relate_aabb;").await;
                 let _ = model_primary_db()
-                    .query("DEFINE FIELD in ON TABLE inst_relate_aabb TYPE record<pe>;")
+                    .query("DEFINE TABLE inst_relate_aabb TYPE RELATION;")
                     .await;
-                let _ = model_primary_db()
-                    .query("DEFINE FIELD out ON TABLE inst_relate_aabb TYPE record<aabb>;")
-                    .await;
-                let _ = model_primary_db()
-                    .query(
-                        "DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS in UNIQUE;",
-                    )
-                    .await;
-                return;
             }
-
-            // 表不存在或不是 RELATION 类型，需要重建
-            let _ = model_primary_db().query("REMOVE TABLE inst_relate_aabb;").await;
-            let _ = model_primary_db()
-                .query("DEFINE TABLE inst_relate_aabb TYPE RELATION;")
-                .await;
-
-            let _ = model_primary_db()
-                .query("REMOVE FIELD in ON TABLE inst_relate_aabb;")
-                .await;
-            let _ = model_primary_db()
-                .query("REMOVE FIELD out ON TABLE inst_relate_aabb;")
-                .await;
-            let _ = model_primary_db()
-                .query("REMOVE FIELD refno ON TABLE inst_relate_aabb;")
-                .await;
             let _ = model_primary_db()
                 .query("DEFINE FIELD in ON TABLE inst_relate_aabb TYPE record<pe>;")
                 .await;
@@ -100,8 +70,6 @@ pub async fn ensure_inst_relate_aabb_relation_schema() {
 }
 
 /// 确保 inst_relate 以“关系表”方式工作：in=pe，out=inst_info。
-///
-/// 需要重建 inst_relate，保证旧的普通表结构不影响图查询与复用逻辑。
 pub async fn ensure_inst_relate_relation_schema() {
     INST_RELATE_SCHEMA_INIT
         .get_or_init(|| async {
@@ -269,12 +237,12 @@ pub async fn save_inst_relate_aabb(
 
         // 先删除旧记录（通过 ID），再批量插入新记录
         let mut sql = String::new();
-        if !relation_ids.is_empty() {
-            sql.push_str(&format!(
-                "DELETE [{}];",
-                relation_ids.join(",")
-            ));
-        }
+        // if !relation_ids.is_empty() {
+        //     sql.push_str(&format!(
+        //         "DELETE [{}];",
+        //         relation_ids.join(",")
+        //     ));
+        // }
         sql.push_str(&format!(
             "INSERT RELATION INTO inst_relate_aabb [{}];",
             relation_records.join(",")

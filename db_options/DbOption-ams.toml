@@ -115,18 +115,6 @@ file_server_host = "http://localhost:8082/assets/archives"
 
 surreal_script_dir = "../rs-core/resource/surreal"
 
-# SurrealDB 连接配置 (PE/属性/输入数据读取)
-# 离线模型生成使用 file 模式 (嵌入式 RocksDB)
-[surrealdb]
-mode = "file"
-path = "data.rdb"
-
-# SurrealKV 连接配置 (模型数据写入)
-# 离线模型生成使用 file 模式 (嵌入式 SurrealKV)
-[surrealkv]
-mode = "file"
-path = "data.kv"
-
 #调试选项
 need_sync_refno_basic = false       #是否重新生成 refno_basic 缓存
 reset_mdb_project = false           #是否重新生成 mdb 缓存
@@ -140,7 +128,7 @@ debug_refno_types = ["CATA", "LOOP", "PRIM"]
 included_db_files = ["ams1112_0001"]
 #included_db_files = ["zdj7600_0001"]
 #manual_db_nums = [7999, 7997, 8000, 1112]
-manual_db_nums = [1112]
+manual_db_nums = [7997]
 
 # Meilisearch（用于模型树筛选/搜索）
 meili_url = "http://127.0.0.1:7700"
@@ -165,6 +153,19 @@ gen_history_model = false
 # debug_model_refnos = ["17496/201375"]
 
 # debug_model_refnos = ["17496_195578"]
+
+# SurrealDB 连接配置 (PE/属性/输入数据读取)
+# 离线模型生成使用 file 模式 (嵌入式 RocksDB)
+[surrealdb]
+mode = "file"
+path = "D:/backup-dbs/ams-8020.db"
+
+# SurrealKV 连接配置 (模型数据写入)
+# 离线模型生成使用 file 模式 (嵌入式 SurrealKV)
+[surrealkv]
+enabled = false
+mode = "file"
+path = "D:/backup-dbs/ams-8020.db.kv"
 
 
 # 精度配置（LOD 分级：数字越大，几何更粗，用于远距渲染）

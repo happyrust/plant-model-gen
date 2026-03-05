@@ -168,7 +168,8 @@ fn build_lod_mesh_path(base_dir: &Path, mesh_id: &str) -> PathBuf {
 
 /// 构建 _m.manifold 布尔运算专用 mesh 文件路径（在 manifold 目录查找）
 fn build_manifold_mesh_path(base_dir: &Path, mesh_id: &str) -> Option<PathBuf> {
-    // 溯源到不含 lod_ 的基础目录
+    use aios_core::mesh_precision::LodLevel;
+
     let mut clean_base = base_dir.to_path_buf();
     while let Some(last_component) = clean_base.file_name().and_then(|n| n.to_str()) {
         if last_component.starts_with("lod_") {
@@ -178,12 +179,19 @@ fn build_manifold_mesh_path(base_dir: &Path, mesh_id: &str) -> Option<PathBuf> {
         }
     }
 
-    let filename = format!("{}_m.manifold", mesh_id);
+    let manifold_dir = clean_base.join("manifold");
 
-    // 在 manifold 目录查找
-    let manifold_path = clean_base.join("manifold").join(&filename);
-    if manifold_path.exists() {
-        return Some(manifold_path);
+    let default_lod = aios_core::mesh_precision::active_precision().default_lod;
+    let lod_filename = format!("{}_{:?}_m.manifold", mesh_id, default_lod);
+    let lod_path = manifold_dir.join(&lod_filename);
+    if lod_path.exists() {
+        return Some(lod_path);
+    }
+
+    let legacy_filename = format!("{}_m.manifold", mesh_id);
+    let legacy_path = manifold_dir.join(&legacy_filename);
+    if legacy_path.exists() {
+        return Some(legacy_path);
     }
 
     None
@@ -1602,8 +1610,6 @@ async fn apply_boolean_for_query(
                 continue;
 
             }
-
-
 
             let neg_mesh_id = id.to_mesh_id();
 

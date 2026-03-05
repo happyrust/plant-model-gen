@@ -121,16 +121,16 @@ impl ConfigManager {
         }
 
         // 验证数据库连接
-        if config.v_ip.is_empty() {
+        if config.surreal_ip.is_empty() {
             errors.push("数据库IP不能为空".to_string());
         }
 
-        if config.v_port == 0 {
+        if config.surreal_port == 0 {
             errors.push("数据库端口无效".to_string());
         }
 
         // 验证用户名和密码
-        if config.v_user.is_empty() {
+        if config.surreal_user.is_empty() {
             errors.push("数据库用户名不能为空".to_string());
         }
 
@@ -160,10 +160,10 @@ impl ConfigManager {
         db_option.mdb_name = "ALL".to_string();
         db_option.module = "DESI".to_string();
 
-        db_option.v_ip = "127.0.0.1".to_string();
-        db_option.v_port = 8009;
-        db_option.v_user = "root".to_string();
-        db_option.v_password = "root".to_string();
+        db_option.surreal_ip = "127.0.0.1".to_string();
+        db_option.surreal_port = 8009;
+        db_option.surreal_user = "root".to_string();
+        db_option.surreal_password = "root".to_string();
 
         db_option.gen_model = true;
         db_option.gen_mesh = false;

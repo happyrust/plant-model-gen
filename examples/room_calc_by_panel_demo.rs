@@ -83,10 +83,15 @@ struct Args {
     #[arg(long)]
     foyer_cache_dir: Option<String>,
 
-    /// 是否使用缓存查询 inst 信息（默认：若环境变量 AIOS_ROOM_USE_CACHE 已设置则沿用，否则为 true）
+    /// 是否使用缓存查询 inst 信息（默认 true；传 false 走 SurrealDB 直查）
     ///
     /// 示例：`--room-use-cache false`
-    #[arg(long, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new())]
+    #[arg(
+        long,
+        default_value_t = true,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::Set
+    )]
     room_use_cache: bool,
 
     /// 是否写入 SurrealDB 的 room_relate（含 DELETE + RELATE）
@@ -268,7 +273,7 @@ async fn main() -> Result<()> {
 
     // cache 目录（生成/房间计算共用）
     if let Some(ref cache_dir) = args.foyer_cache_dir {
-        db_option_ext.foyer_cache_dir = Some(cache_dir.clone());
+        db_option_ext.model_cache_dir = Some(cache_dir.clone());
     }
     let foyer_cache_dir = db_option_ext
         .get_foyer_cache_dir()
@@ -280,19 +285,19 @@ async fn main() -> Result<()> {
     println!("   - auto_gen_model: {}", args.auto_gen_model);
     println!("   - write_db: {}", args.write_db);
     println!("   - inside_tol: {}", inside_tol);
+    println!("   - room_use_cache: {}", args.room_use_cache);
     println!("   - foyer_cache_dir: {}", foyer_cache_dir);
+
+    // 3.5) 初始化 SurrealDB —— ensure_spatial_index_ready / SurrealDB 直查 / write_db / auto_gen 均需要。
+    init_surreal().await.context("初始化 SurrealDB 失败")?;
 
     // 4) 自动生成模型/mesh/空间索引（Foyer Cache）
     if args.auto_gen_model {
         println!("🔄 自动生成模型（Foyer Cache）: dbnum={}", dbnum);
 
         // TreeIndex 是 Full Noun / cache-only 链路的前置；缺失时先解析生成。
-        // 该步骤可能依赖 PDMS 数据库文件可访问。
         ensure_tree_index_by_parse(&db_option_ext, dbnum).await?;
 
-        // 强制 cache-only 生成：不依赖/不写入 SurrealDB
-        db_option_ext.use_cache = true;
-        db_option_ext.use_surrealdb = false;
         db_option_ext.export_instances = true;
 
         db_option_ext.inner.manual_db_nums = Some(vec![dbnum]);
@@ -319,8 +324,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    // 5) 运行期：强制房间计算走 cache 查询 inst 信息（避免依赖 SurrealDB 的 inst_relate/inst_relate_aabb）。
-    // 注意：room_model.rs 内部通过环境变量开关，这里用 CLI 参数控制其取值（不是测试输入）。
+    // 5) 运行期：设置房间计算数据源开关
     unsafe {
         std::env::set_var(
             "AIOS_ROOM_USE_CACHE",
@@ -334,8 +338,6 @@ async fn main() -> Result<()> {
     let mut frmw_pe = String::new();
 
     if args.write_db {
-        // 初始化 SurrealDB（写库/查询 room_num 都需要）
-        init_surreal().await.context("初始化 SurrealDB 失败")?;
 
         if room_num.is_empty() {
             // panel -> SBFR(OWNER) -> FRMW(OWNER) -> room_num(FRMW.NAME 最后一段)
@@ -401,6 +403,25 @@ async fn main() -> Result<()> {
     }
 
     // 7) 计算“该 panel”的房间构件集合
+    // 6.5) Diagnostic: check panel data availability in SurrealDB
+    {
+        let pk = panel_refno.to_string().replace("/", "_");
+        let tables = vec![
+            "pe", "inst_relate", "inst_relate_aabb", "geo_relate",
+            "pe_transform", "inst_geo", "inst_relate_bool",
+        ];
+        for t in &tables {
+            let sql = format!("SELECT count() as cnt FROM {t} GROUP ALL");
+            let r: Vec<serde_json::Value> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
+            let cnt = r.first().and_then(|v| v.get("cnt")).and_then(|v| v.as_i64()).unwrap_or(0);
+            println!("[diag] {t}: {cnt} rows");
+        }
+
+        let sql_ir = format!("SELECT * FROM inst_relate WHERE record::id(in) = '{pk}' LIMIT 3");
+        let r_ir: Vec<serde_json::Value> = SUL_DB.query_take(&sql_ir, 0).await.unwrap_or_default();
+        println!("[diag] inst_relate(in has {pk}): {} rows, sample={}", r_ir.len(), serde_json::to_string(&r_ir.first()).unwrap_or_default());
+    }
+
     let mesh_dir = db_option_ext.inner.get_meshes_path();
     let exclude = HashSet::<RefnoEnum>::new();
     let within = aios_database::fast_model::room_model::cal_room_refnos(

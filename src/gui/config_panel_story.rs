@@ -140,16 +140,16 @@ impl ConfigPanelStory {
             input.set_value(db_option.mdb_name.clone(), window, cx)
         });
         db_ip.update(cx, |input, cx| {
-            input.set_value(db_option.v_ip.clone(), window, cx)
+            input.set_value(db_option.surreal_ip.clone(), window, cx)
         });
         db_port.update(cx, |input, cx| {
-            input.set_value(db_option.v_port.to_string(), window, cx)
+            input.set_value(db_option.surreal_port.to_string(), window, cx)
         });
         db_username.update(cx, |input, cx| {
-            input.set_value(db_option.v_user.clone(), window, cx)
+            input.set_value(db_option.surreal_user.clone(), window, cx)
         });
         db_password.update(cx, |input, cx| {
-            input.set_value(db_option.v_password.clone(), window, cx)
+            input.set_value(db_option.surreal_password.clone(), window, cx)
         });
 
         // 初始化异地部署相关输入框
@@ -227,10 +227,10 @@ impl ConfigPanelStory {
         db_option.project_path = self.project_path.read(cx).value().to_string();
         db_option.project_name = self.project_name.read(cx).value().to_string();
         db_option.mdb_name = self.mdb_name.read(cx).value().to_string();
-        db_option.v_ip = self.db_ip.read(cx).value().to_string();
-        db_option.v_port = self.db_port.read(cx).value().parse().unwrap_or(8008);
-        db_option.v_user = self.db_username.read(cx).value().to_string();
-        db_option.v_password = self.db_password.read(cx).value().to_string();
+        db_option.surreal_ip = self.db_ip.read(cx).value().to_string();
+        db_option.surreal_port = self.db_port.read(cx).value().parse().unwrap_or(8008);
+        db_option.surreal_user = self.db_username.read(cx).value().to_string();
+        db_option.surreal_password = self.db_password.read(cx).value().to_string();
 
         db_option.sync_live = Some(self.live_update);
         db_option.sync_graph_db = Some(self.remote_sync);
@@ -334,16 +334,16 @@ impl ConfigPanelStory {
             input.set_value(config.mdb_name.clone(), window, cx)
         });
         self.db_ip.update(cx, |input, cx| {
-            input.set_value(config.v_ip.clone(), window, cx)
+            input.set_value(config.surreal_ip.clone(), window, cx)
         });
         self.db_port.update(cx, |input, cx| {
-            input.set_value(config.v_port.to_string(), window, cx)
+            input.set_value(config.surreal_port.to_string(), window, cx)
         });
         self.db_username.update(cx, |input, cx| {
-            input.set_value(config.v_user.clone(), window, cx)
+            input.set_value(config.surreal_user.clone(), window, cx)
         });
         self.db_password.update(cx, |input, cx| {
-            input.set_value(config.v_password.clone(), window, cx)
+            input.set_value(config.surreal_password.clone(), window, cx)
         });
 
         self.parse_all = config.total_sync;

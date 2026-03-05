@@ -1,39 +1,4 @@
 #V2
-SELECT id, noun FROM pe:⟨24381/145018⟩;
-INFO FOR KV;
-INFO FOR NS;
-SELECT id, noun, name FROM pe:⟨24381_145018⟩;
-INFO FOR DB;
-INFO FOR NS;
-SELECT id, noun, name FROM pe:⟨24381_145018⟩;
-INFO FOR NS;
-INFO FOR DB;
-SELECT id, noun, name FROM pe:⟨24381_145018⟩;
-SELECT id, noun, name FROM pe:⟨24381_145018⟩.children WHERE noun IN ['BEND', 'ELBO', 'FITT', 'VALV', 'REDU', 'TEE', 'FLAN', 'GASK'];
-LET $children = SELECT VALUE id FROM pe:⟨24381_145018⟩.children WHERE noun IN ['ELBO', 'VALV'];
-SELECT id, in, out FROM inst_relate WHERE in IN $children;
-SELECT id, in, out, (SELECT geo_type, visible, record::id(out) as geo_hash, out.meshed as meshed FROM geo_relate WHERE in = $parent.out) as geos FROM inst_relate WHERE in IN [pe:⟨24381_145019⟩, pe:⟨24381_145021⟩, pe:⟨24381_145035⟩];
--- 1. 检查 ELBO 的 pe_transform 是否存在
-SELECT id, world_trans FROM [pe_transform:⟨24381_145019⟩, pe_transform:⟨24381_145021⟩, pe_transform:⟨24381_145023⟩];
--- 2. 模拟导出查询: 对 ELBO 执行 inst_relate 查询
-SELECT id, world_trans FROM [pe_transform:⟨24381_145019⟩, pe_transform:⟨24381_145021⟩, pe_transform:⟨24381_145023⟩];
-SELECT id, world_trans FROM [pe_transform:⟨24381_145019⟩, pe_transform:⟨24381_145021⟩];
-SELECT id FROM [pe_transform:⟨24381_145019⟩];
-SELECT id FROM [pe_transform:⟨24381_145019⟩, pe_transform:⟨24381_145021⟩];
-INFO FOR NS;
-SELECT id, noun FROM pe:⟨24381_145019⟩;
-SELECT id FROM [pe_transform:⟨24381_145019⟩, pe_transform:⟨24381_145021⟩, pe_transform:⟨24381_145023⟩];
-SELECT id, world_trans FROM pe_transform:⟨24381_145019⟩;
-SELECT geo_type, visible, out.meshed as meshed, (trans.d ?? NONE) != NONE as has_trans FROM geo_relate WHERE in = inst_info:⟨6062703271187847688⟩;
-SELECT in.id as refno, (SELECT geo_type, record::id(out) as geo_hash FROM $parent.out->geo_relate WHERE visible AND out.meshed AND (trans.d ?? NONE) != NONE AND geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']) as insts FROM inst_relate:⟨24381_145019⟩ WHERE in != NONE;
-SELECT id, meshed, visible, unit_flag FROM inst_geo:⟨3⟩;
-SELECT in.id as refno, in.owner as owner, type::record('pe_transform', record::id(in)).world_trans.d as world_trans, (SELECT trans.d as geo_transform, record::id(out) as geo_hash, out.meshed as m FROM $parent.out->geo_relate WHERE visible AND out.meshed AND (trans.d ?? NONE) != NONE AND geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']) as insts FROM inst_relate:⟨24381_145019⟩ WHERE in != NONE AND type::record('pe_transform', record::id(in)).world_trans.d != NONE;
-SELECT geo_type, visible, record::id(out) as geo_hash, out.meshed as meshed, out.unit_flag as unit_flag, trans.d as geo_transform FROM geo_relate WHERE in = inst_info:⟨6062703271187847688⟩;
-SELECT in as inst_info_id, geo_type, record::id(out) as geo_hash, out.meshed as meshed, out.unit_flag as unit_flag FROM geo_relate WHERE in IN [inst_info:⟨6062703271187847688⟩, inst_info:⟨17097231269516340480⟩, inst_info:⟨17431769398764899592⟩, inst_info:⟨9533258195730365182⟩, inst_info:⟨3691487179807065189⟩] AND out.meshed = NONE;
-SELECT * FROM inst_geo:⟨10105853823688291601⟩;
-RETURN !NONE; RETURN NONE != true; RETURN !false; RETURN !true;
-LET $elbos = [pe:⟨24381_145019⟩, pe:⟨24381_145021⟩, pe:⟨24381_145023⟩, pe:⟨24381_145025⟩, pe:⟨24381_145026⟩, pe:⟨24381_145028⟩, pe:⟨24381_145029⟩, pe:⟨24381_145031⟩, pe:⟨24381_145033⟩]; SELECT in as pe, out as inst_info, (SELECT record::id(out) as geo_id, out.meshed as meshed, out.bad as bad, geo_type FROM $parent.out->geo_relate) as geos FROM inst_relate WHERE in IN $elbos;
-SELECT count() as cnt FROM pe WHERE dbno = 7997 GROUP ALL;
 INFO FOR ROOT;
 INFO FOR NS;
 SELECT count() as cnt FROM pe WHERE dbno = 7997 GROUP ALL;
@@ -61,3 +26,76 @@ SELECT record::id(id) as gr_id, record::id(geom_refno) as neg_carrier, record::i
 INSERT RELATION INTO neg_relate { in: geo_relate:⟨16335937270172198261⟩, id: ['16335937270172198261', pe:⟨17496_106105⟩], out: pe:⟨17496_106105⟩, pe: pe:⟨17496_156765⟩ }; SELECT * FROM neg_relate;
 REMOVE INDEX unique_neg_relate ON TABLE neg_relate; DEFINE INDEX unique_neg_relate ON neg_relate FIELDS in, out UNIQUE; INSERT RELATION INTO neg_relate { in: geo_relate:⟨16335937270172198261⟩, id: ['16335937270172198261', pe:⟨17496_106105⟩], out: pe:⟨17496_106105⟩, pe: pe:⟨17496_156765⟩ }; SELECT * FROM neg_relate;
 DELETE FROM neg_relate; REMOVE INDEX unique_neg_relate ON TABLE neg_relate; DEFINE INDEX unique_neg_relate ON TABLE neg_relate FIELDS in, out UNIQUE;
+-- NXTR 24381/35961 结构分析查询
+-- 用法: surreal sql --endpoint ws://127.0.0.1:8020 --user root --pass root --ns 1516 --db AvevaMarineSample --file docs/queries_nxtr.surql
+-- ① NXTR 自身
+SELECT * FROM ONLY pe:⟨24381_35961⟩;
+-- ② pe_owner 子节点（标准层级）
+SELECT id, noun, name, deleted FROM pe:⟨24381_35961⟩<-pe_owner.in;
+-- ③ geom.rs 同款：LOOP/PLOO 下的 PAVE/PONT
+-- NXTR 24381/35961 结构分析查询（每行单语句，便于管道执行）
+-- 用法: Get-Content docs\\queries_nxtr.surql | surreal sql -e ws://127.0.0.1:8020 -u root -p root --namespace 1516 --database AvevaMarineSample
+SELECT * FROM ONLY pe:`24381_35961`;
+SELECT id, noun, name, deleted FROM pe:`24381_35961`<-pe_owner.in;
+SELECT children[WHERE noun IN ["PAVE", "PONT"]].refno.POS as positions, children[WHERE noun IN ["PAVE", "PONT"]].refno.FRAD as frads, refno.HEIG as height FROM pe:`24381_35961`.children WHERE noun IN ["LOOP", "PLOO"];
+SELECT refno.HEIG as height, noun as noun, record::id(owner) as owner FROM pe:`24381_35961`;
+SELECT id, noun, name FROM pe:`24381_35960`<-pe_owner.in;
+SELECT id, noun FROM pe:`24381_35962`<-pe_owner.in;
+SELECT * FROM ONLY pe:`24381_35962`;
+-- NXTR 24381/35961 结构分析查询（每行单语句，便于管道执行）
+-- 用法: Get-Content docs\\queries_nxtr.surql | surreal sql -e ws://127.0.0.1:8020 -u root -p root --namespace 1516 --database AvevaMarineSample
+SELECT * FROM ONLY pe:`24381_35961`;
+SELECT id, noun, name, deleted FROM pe:`24381_35961`<-pe_owner.in;
+SELECT children[WHERE noun IN ["PAVE", "PONT"]].refno.POS as positions, children[WHERE noun IN ["PAVE", "PONT"]].refno.FRAD as frads, refno.HEIG as height FROM pe:`24381_35961`.children WHERE noun IN ["LOOP", "PLOO"];
+SELECT refno.HEIG as height, noun as noun, record::id(owner) as owner FROM pe:`24381_35961`;
+SELECT id, noun, name FROM pe:`24381_35960`<-pe_owner.in;
+SELECT id, noun FROM pe:`24381_35962`<-pe_owner.in;
+SELECT * FROM ONLY pe:`24381_35962`;
+SELECT refno.POS as pos, refno.FRAD as frad FROM pe:`24381_35963`;
+SELECT in AS gr_id, in.geo_type AS geo_type, in.out AS mesh_id, pe AS carrier, out AS target FROM pe:`24381_35960`<-neg_relate;
+SELECT id, geo_type, out AS mesh_id, geom_refno, in AS inst_id FROM geo_relate WHERE out = inst_geo:`3080706177900460082`;
+SELECT id, geo_type, out AS mesh_id, geom_refno, in AS inst_id FROM geo_relate WHERE out = inst_geo:`16133896684222058552`;
+SELECT * FROM ONLY pe:`24381_35961`;
+SELECT id, geo_type, out AS mesh_id, geom_refno, trans.d AS trans FROM geo_relate WHERE id IN [geo_relate:`13906540843283966235`, geo_relate:`17113089350423021850`];
+SELECT id, geo_type, out AS mesh_id, geom_refno FROM inst_info:`24381_35961_63`->geo_relate;
+SELECT count() FROM inst_info:`24381_35961_63`->geo_relate;
+SELECT count() AS c FROM neg_relate;
+SELECT count() AS c FROM ngmr_relate;
+SELECT VALUE {id, pe, in, out} FROM neg_relate LIMIT 20;
+SELECT count() AS c FROM geo_relate WHERE geo_type='Neg';
+SELECT count() AS c FROM geo_relate WHERE geo_type='CataCrossNeg';
+SELECT VALUE {id, geo_type, geom_refno, out} FROM geo_relate WHERE geo_type='Neg' LIMIT 20;
+SELECT record::id(id) AS gr_id, record::id(geom_refno) AS neg_carrier, record::id(geom_refno.owner) AS parent_id, geo_type FROM geo_relate WHERE geo_type IN ['Neg','CataNeg'] AND geom_refno IN [pe:`24381_35960`,pe:`24381_35961`,pe:`24381_35962`,pe:`24381_35963`,pe:`24381_35964`,pe:`24381_35965`,pe:`24381_35966`,pe:`24381_35967`,pe:`24381_35968`,pe:`24381_35969`,pe:`24381_35970`,pe:`24381_35971`,pe:`24381_35972`,pe:`24381_35973`,pe:`24381_35974`,pe:`24381_35975`,pe:`24381_35976`,pe:`24381_35977`,pe:`24381_35978`,pe:`24381_35979`];
+SELECT VALUE out FROM neg_relate GROUP BY out;
+SELECT id, geo_type, out AS mesh_id, record::id(geom_refno) AS geom_refno, record::id(in) AS inst_info FROM geo_relate WHERE geom_refno = pe:`24381_35961`;
+SELECT id, geo_type, out AS mesh_id, record::id(geom_refno) AS geom_refno, record::id(in) AS inst_info FROM geo_relate WHERE in = inst_info:`24381_35961_63`;
+SELECT id, geo_type, out AS mesh_id, record::id(geom_refno) AS geom_refno, record::id(in) AS inst_info FROM geo_relate WHERE geom_refno = pe:`24381_35960`;
+SELECT id, meshed, param IS NOT NONE AS has_param, bad FROM inst_geo:`16133896684222058552`;
+SELECT id, meshed, param IS NOT NONE AS has_param, bad FROM inst_geo:`3080706177900460082`;
+SELECT * FROM neg_relate LIMIT 5;
+SELECT * FROM geo_relate WHERE geom_refno = pe:24381_35961;
+SELECT * FROM geo_relate WHERE geom_refno = pe:24381_35960;
+INSERT RELATION IGNORE INTO neg_relate [{ in: geo_relate:`9582475794974559371`, id: ['9582475794974559371', pe:`24381_35960`], out: pe:`24381_35960`, pe: pe:`24381_35961` }];
+INSERT RELATION INTO neg_relate [{ in: geo_relate:`9582475794974559371`, id: ['9582475794974559371', pe:`24381_35960`], out: pe:`24381_35960`, pe: pe:`24381_35961` }];
+SELECT * FROM neg_relate:['9582475794974559371', pe:`24381_35960`];
+INFO FOR TABLE neg_relate;
+REMOVE INDEX unique_neg_relate ON TABLE neg_relate;
+REMOVE INDEX idx_pe_neg_relate_reverse ON TABLE neg_relate;
+DEFINE INDEX unique_neg_relate ON TABLE neg_relate FIELDS in, out UNIQUE;
+DEFINE INDEX idx_pe_neg_relate_reverse ON TABLE neg_relate FIELDS out;
+SELECT pe, type::record('pe_transform', record::id(pe)).world_trans.d AS carrier_wt FROM ngmr_relate WHERE out = pe:⟨17496_106028⟩ LIMIT 10;
+SELECT id, world_trans.d.translation FROM pe_transform WHERE id IN [pe_transform:⟨17496_106028⟩, pe_transform:⟨17496_142305⟩, pe_transform:⟨17496_142306⟩, pe_transform:⟨17496_125330⟩, pe_transform:⟨17496_106029⟩];
+SELECT id, pe, out, in FROM ngmr_relate WHERE out = pe:⟨17496_106028⟩ LIMIT 5;
+SELECT id, world_trans.d[12] as tx, world_trans.d[13] as ty, world_trans.d[14] as tz FROM [pe_transform:⟨17496_142305⟩, pe_transform:⟨17496_142306⟩, pe_transform:⟨17496_125330⟩, pe_transform:⟨17496_106029⟩, pe_transform:⟨17496_106028⟩];
+SELECT * FROM pe_transform:⟨17496_106028⟩;
+SELECT * FROM [pe_transform:⟨17496_142305⟩, pe_transform:⟨17496_142306⟩, pe_transform:⟨17496_125330⟩, pe_transform:⟨17496_106029⟩];
+SELECT id, POS, ORI FROM [pe:⟨17496_142305⟩, pe:⟨17496_142306⟩, pe:⟨17496_125330⟩, pe:⟨17496_106028⟩];
+SELECT id, POS, ORI FROM pe:⟨17496_142305⟩; SELECT id, POS, ORI FROM pe:⟨17496_142306⟩; SELECT id, POS, ORI FROM pe:⟨17496_125330⟩; SELECT id, POS, ORI FROM pe:⟨17496_106028⟩;
+SELECT id, in, out, trans.d[12] as tx, trans.d[13] as ty, trans.d[14] as tz, geo_type FROM [geo_relate:⟨13056965495127136362⟩, geo_relate:⟨13581580652763031352⟩, geo_relate:⟨3534493992845817569⟩];
+SELECT id, trans, in FROM geo_relate:⟨13056965495127136362⟩;
+SELECT trans FROM geo_relate:⟨13056965495127136362⟩; SELECT trans FROM geo_relate:⟨13581580652763031352⟩; SELECT trans FROM geo_relate:⟨3534493992845817569⟩;
+SELECT id, noun, POSS, POSE, CREF FROM pe:⟨17496_142305⟩; SELECT id, noun, POSS, POSE, CREF FROM pe:⟨17496_142306⟩; SELECT id, noun, POSS, POSE, CREF FROM pe:⟨17496_125330⟩;
+SELECT * FROM pe:⟨17496_142305⟩;
+SELECT id, world_trans.translation FROM [pe:⟨17496_142305⟩, pe:⟨17496_142306⟩, pe:⟨17496_125330⟩, pe:⟨17496_106029⟩, pe:⟨17496_106028⟩];
+SELECT * FROM trans:⟨10896272074439642140⟩;
+SELECT * FROM pe:⟨17496_142306⟩;

@@ -3343,10 +3343,10 @@ pub async fn start_surreal_server(
     let opt = get_db_option();
     // 优先使用前端传入的覆盖参数
     let (mut ip, mut port, mut user, mut pass, mut project) = (
-        opt.v_ip.clone(),
-        opt.v_port,
-        opt.v_user.clone(),
-        opt.v_password.clone(),
+        opt.surreal_ip.clone(),
+        opt.surreal_port,
+        opt.surreal_user.clone(),
+        opt.surreal_password.clone(),
         opt.project_name.clone(),
     );
 
@@ -3626,8 +3626,8 @@ pub async fn stop_surreal_server(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use aios_core::get_db_option;
     let opt = get_db_option();
-    let mut ip = opt.v_ip.clone();
-    let mut port = opt.v_port;
+    let mut ip = opt.surreal_ip.clone();
+    let mut port = opt.surreal_port;
     if let Some(Json(body)) = &_payload {
         if let Some(s) = body.get("bind_ip").and_then(|v| v.as_str()) {
             ip = s.to_string();
@@ -3827,10 +3827,10 @@ pub async fn restart_surreal_server(
     use aios_core::get_db_option;
 
     let opt = get_db_option();
-    let mut ip = opt.v_ip.clone();
-    let mut port = opt.v_port;
-    let mut user = opt.v_user.clone();
-    let mut pass = opt.v_password.clone();
+    let mut ip = opt.surreal_ip.clone();
+    let mut port = opt.surreal_port;
+    let mut user = opt.surreal_user.clone();
+    let mut pass = opt.surreal_password.clone();
     let mut project = opt.project_name.clone();
 
     if let Some(Json(body)) = &_payload {
@@ -3886,14 +3886,14 @@ pub async fn get_surreal_status(
     use aios_core::{project_primary_db, get_db_option};
 
     let opt = get_db_option();
-    let ip_raw = q.ip.unwrap_or(opt.v_ip.clone());
+    let ip_raw = q.ip.unwrap_or(opt.surreal_ip.clone());
     // SurrealDB 2.x 不接受 "localhost"，必须使用 IP 地址
     let ip = if ip_raw == "localhost" {
         "127.0.0.1".to_string()
     } else {
         ip_raw
     };
-    let port = q.port.unwrap_or(opt.v_port);
+    let port = q.port.unwrap_or(opt.surreal_port);
     let bind_addr = format!("{}:{}", ip, port);
 
     let listening = is_addr_listening(&bind_addr);
@@ -4347,11 +4347,11 @@ async fn execute_real_task(state: AppState, task_id: String) {
         };
         parse_opt.included_projects = included_projects;
         // 连接参数来源于 WebUI 配置
-        // 注意：v_port 在 aios_core 中通常为 u16，db_port 这里是 String，尽量解析；失败则回退默认端口
-        parse_opt.v_ip = config.db_ip.clone();
-        parse_opt.v_user = config.db_user.clone();
-        parse_opt.v_password = config.db_password.clone();
-        parse_opt.v_port = config.db_port.parse::<u16>().unwrap_or(8009);
+        // 注意：surreal_port 在 aios_core 中通常为 u16，db_port 这里是 String，尽量解析；失败则回退默认端口
+        parse_opt.surreal_ip = config.db_ip.clone();
+        parse_opt.surreal_user = config.db_user.clone();
+        parse_opt.surreal_password = config.db_password.clone();
+        parse_opt.surreal_port = config.db_port.parse::<u16>().unwrap_or(8009);
         // 覆盖 WebUI 任务层的关键参数 - 使用任务配置而不依赖 DbOption.toml
         parse_opt.manual_db_nums = if config.manual_db_nums.is_empty() {
             None
@@ -6566,10 +6566,10 @@ pub async fn get_startup_scripts(
     if scripts.is_empty() {
         let opt = get_db_option();
         scripts.push(StartupScript {
-            name: format!("run_surreal_{}.sh", opt.v_port),
-            path: format!("cmd/run_surreal_{}.sh", opt.v_port),
-            description: format!("Default SurrealDB server on port {}", opt.v_port),
-            port: opt.v_port,
+            name: format!("run_surreal_{}.sh", opt.surreal_port),
+            path: format!("cmd/run_surreal_{}.sh", opt.surreal_port),
+            description: format!("Default SurrealDB server on port {}", opt.surreal_port),
+            port: opt.surreal_port,
             executable: false,
         });
     }
@@ -6627,10 +6627,10 @@ pub struct StartDatabaseRequest {
 fn get_db_config_from_options() -> DatabaseConnectionConfig {
     let opt = get_db_option();
     DatabaseConnectionConfig {
-        ip: opt.v_ip.clone(),
-        port: opt.v_port,
-        user: opt.v_user.clone(),
-        password: opt.v_password.clone(),
+        ip: opt.surreal_ip.clone(),
+        port: opt.surreal_port,
+        user: opt.surreal_user.clone(),
+        password: opt.surreal_password.clone(),
         namespace: Some(opt.surreal_ns.to_string()),
         database: Some(opt.project_name.clone()),
     }
@@ -6711,7 +6711,7 @@ async fn create_default_startup_script(
     // 创建脚本内容
     let script_content = format!(
         "#!/bin/bash\nsurreal start --user {} --pass {} --bind {}:{} rocksdb://ams-{}-test.db\n",
-        opt.v_user, opt.v_password, opt.v_ip, port, port
+        opt.surreal_user, opt.surreal_password, opt.surreal_ip, port, port
     );
 
     // 写入脚本文件
@@ -7668,10 +7668,10 @@ async fn execute_refno_model_generation(
               let mut parse_opt = aios_core::options::DbOption::default();
               // 复用任务配置中的连接参数
               parse_opt.included_projects = vec![config.project_name.clone()];
-              parse_opt.v_ip = config.db_ip.clone();
-              parse_opt.v_user = config.db_user.clone();
-              parse_opt.v_password = config.db_password.clone();
-              parse_opt.v_port = config.db_port.parse::<u16>().unwrap_or(8009);
+              parse_opt.surreal_ip = config.db_ip.clone();
+              parse_opt.surreal_user = config.db_user.clone();
+              parse_opt.surreal_password = config.db_password.clone();
+              parse_opt.surreal_port = config.db_port.parse::<u16>().unwrap_or(8009);
               parse_opt.manual_db_nums = Some(vec![*db_num]);
               parse_opt.project_name = config.project_name.clone();
               parse_opt.project_code = config.project_code.to_string();

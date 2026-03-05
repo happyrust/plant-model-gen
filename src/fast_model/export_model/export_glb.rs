@@ -837,6 +837,10 @@ fn write_glb_file(gltf: &Value, buffer_data: &[u8], output_path: &str) -> Result
 
     let total_length = 12 + 8 + json_bytes.len() + 8 + bin_data.len();
 
+    // 确保父目录存在
+    if let Some(parent) = Path::new(output_path).parent() {
+        std::fs::create_dir_all(parent).context("创建输出目录失败")?;
+    }
     let mut file = File::create(output_path)?;
     file.write_all(b"glTF")?;
     file.write_all(&2u32.to_le_bytes())?;
@@ -1187,6 +1191,11 @@ pub fn export_single_mesh_to_glb(mesh: &PlantMesh, output_path: &Path) -> Result
     glb_data.extend_from_slice(&buffer_data);
     glb_data.extend(vec![0u8; buffer_padding]); // zero padding
 
+    // 确保父目录存在（含 lod_L1 等）
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建目录失败: {}", parent.display()))?;
+    }
     // 写入文件
     let mut file = File::create(output_path)
         .with_context(|| format!("创建文件失败: {}", output_path.display()))?;

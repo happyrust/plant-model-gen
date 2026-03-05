@@ -541,11 +541,9 @@ async fn query_inst_relate_by_dbnum(
         println!("🔍 dbnum={} 对应 ref0 列表: {:?}", dbnum, ref0s);
     }
 
-    // 2. 使用 ID range 扫描 inst_relate（inst_relate 的 id 格式为 inst_relate:⟨ref0_ref1⟩）
-    // 直接用 range 查询比 WHERE 条件更高效，利用 SurrealDB 的 O(log n) ID 范围扫描
-    const REF1_RANGE_END: u32 = 1_000_000;
+    // 2. 按 ref0 分批查询 inst_relate（通过 string::starts_with 过滤 ID 前缀）
     if verbose {
-        println!("🔍 扫描 inst_relate (ID range，{} 个 ref0)...", ref0s.len());
+        println!("🔍 扫描 inst_relate (WHERE 过滤，{} 个 ref0)...", ref0s.len());
     }
     let mut rows: Vec<InstRelateRow> = Vec::new();
     for ref0 in &ref0s {
@@ -557,7 +555,8 @@ async fn query_inst_relate_by_dbnum(
                 in as refno,
                 in.noun as noun,
                 spec_value as spec_value
-            FROM inst_relate:⟨{ref0}_0⟩..inst_relate:⟨{ref0}_{REF1_RANGE_END}⟩
+            FROM inst_relate
+            WHERE string::starts_with(record::id(id), '{ref0}_')
             "#
         );
 

@@ -51,9 +51,9 @@ impl DatabaseDiagnosticResult {
             checks: Vec::new(),
             recommendations: Vec::new(),
             connection_info: ConnectionInfo {
-                host: db_option.v_ip.clone(),
-                port: db_option.v_port,
-                user: db_option.v_user.clone(),
+                host: db_option.surreal_ip.clone(),
+                port: db_option.surreal_port,
+                user: db_option.surreal_user.clone(),
                 project_name: db_option.project_name.clone(),
                 project_code: db_option.project_code.to_string(),
                 connection_string: db_option.get_version_db_conn_str(),
@@ -125,15 +125,15 @@ async fn check_configuration(result: &mut DatabaseDiagnosticResult) {
 
     let mut issues = Vec::new();
 
-    if db_option.v_ip.is_empty() {
+    if db_option.surreal_ip.is_empty() {
         issues.push("数据库IP为空");
     }
 
-    if db_option.v_port == 0 || db_option.v_port > 65535 {
+    if db_option.surreal_port == 0 {
         issues.push("数据库端口无效");
     }
 
-    if db_option.v_user.is_empty() {
+    if db_option.surreal_user.is_empty() {
         issues.push("数据库用户名为空");
     }
 
@@ -216,7 +216,7 @@ async fn check_surreal_cli(result: &mut DatabaseDiagnosticResult) {
 async fn check_port_listening(result: &mut DatabaseDiagnosticResult) {
     let start_time = std::time::Instant::now();
     let db_option = get_db_option();
-    let addr = format!("{}:{}", db_option.v_ip, db_option.v_port);
+    let addr = format!("{}:{}", db_option.surreal_ip, db_option.surreal_port);
 
     let listening = super::handlers::is_addr_listening(&addr);
 
@@ -242,7 +242,7 @@ async fn check_port_listening(result: &mut DatabaseDiagnosticResult) {
 async fn check_tcp_connection(result: &mut DatabaseDiagnosticResult) {
     let start_time = std::time::Instant::now();
     let db_option = get_db_option();
-    let addr = format!("{}:{}", db_option.v_ip, db_option.v_port);
+    let addr = format!("{}:{}", db_option.surreal_ip, db_option.surreal_port);
 
     let connected = super::handlers::test_tcp_connection(&addr).await;
 

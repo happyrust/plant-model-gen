@@ -699,6 +699,64 @@ pub async fn save_instance_data_optimize(
             debug_model_debug!("  目标: {}, 负实体数量: {}", target, refnos.len());
         }
 
+        // 跨 batch 兜底：若负载体的 Neg/CataNeg 几何不在当前 inst_mgr 中，
+        // 则从 DB 回查 geo_relate，避免“负实体与被减实体分批写入”导致 neg_relate 丢失。
+        let mut missing_carriers: HashSet<RefnoEnum> = HashSet::new();
+        for neg_refnos in inst_mgr.neg_relate_map.values() {
+            for neg_refno in neg_refnos.iter() {
+                if !neg_geo_by_carrier.contains_key(neg_refno) {
+                    missing_carriers.insert(*neg_refno);
+                }
+            }
+        }
+        if !missing_carriers.is_empty() {
+            let carrier_list = missing_carriers
+                .iter()
+                .map(|r| r.to_pe_key())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT
+                    record::id(geom_refno) AS carrier,
+                    record::id(id) AS gr_id
+                FROM geo_relate
+                WHERE geo_type IN ['Neg', 'CataNeg']
+                  AND geom_refno IN [{carrier_list}]"#
+            );
+            let mut resp = model_primary_db().query_response(&sql).await?;
+            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+            let mut loaded = 0usize;
+            for row in rows {
+                let carrier = row
+                    .get("carrier")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let gr_id = row
+                    .get("gr_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if carrier.is_empty() || gr_id.is_empty() {
+                    continue;
+                }
+                let Ok(carrier_refno) = carrier.parse::<RefnoEnum>() else {
+                    continue;
+                };
+                let Ok(gr_id_u64) = gr_id.parse::<u64>() else {
+                    continue;
+                };
+                neg_geo_by_carrier
+                    .entry(carrier_refno)
+                    .or_insert_with(Vec::new)
+                    .push(gr_id_u64);
+                loaded += 1;
+            }
+            debug_model_debug!(
+                "neg_relate DB回查: missing_carriers={}, loaded_geo_relate_ids={}",
+                missing_carriers.len(),
+                loaded
+            );
+        }
+
         let mut neg_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
         let mut neg_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
 
@@ -1381,7 +1439,7 @@ async fn query_existing_tubi_info_ids(ids: &[String]) -> anyhow::Result<HashSet<
 /// 对应条目，`neg_relate` 未实际写入。
 ///
 /// 此函数在所有阶段（LOOP/CATE/PRIM）完成后、布尔运算前调用，
-/// 从 DB 查询已有的 Neg geo_relate 并补建缺失的 neg_relate。
+/// 从 DB 查询已有的 Neg/CataNeg geo_relate 并补建缺失的 neg_relate。
 pub async fn reconcile_missing_neg_relate(
     all_refnos: &[RefnoEnum],
 ) -> anyhow::Result<usize> {
@@ -1391,23 +1449,20 @@ pub async fn reconcile_missing_neg_relate(
 
     let refno_set: HashSet<RefnoEnum> = all_refnos.iter().copied().collect();
 
-    // 1. 查询当前 batch 中所有 Neg 类型 geo_relate，及其负载体的父元素
+    // 1. 查询当前 batch 中所有 Neg/CataNeg 类型 geo_relate，及其负载体的父元素
     let pe_list = all_refnos
         .iter()
         .map(|r| r.to_pe_key())
         .collect::<Vec<_>>()
         .join(",");
-    let sql = r#"SELECT
+    let sql = format!(r#"SELECT
             record::id(id) as gr_id,
             record::id(geom_refno) as neg_carrier,
             record::id(geom_refno.owner) as parent_id
         FROM geo_relate
-        WHERE geo_type = 'Neg'
-          AND geom_refno IN $geom_refnos"#;
-    let mut response = model_primary_db()
-        .query(sql)
-        .bind(("geom_refnos", pe_list.split(',').map(|s| s.to_string()).collect::<Vec<_>>()))
-        .await?;
+        WHERE geo_type IN ['Neg', 'CataNeg']
+          AND geom_refno IN [{pe_list}]"#);
+    let mut response = model_primary_db().query_response(&sql).await?;
     let neg_geos: Vec<serde_json::Value> = response.take(0)?;
     if neg_geos.is_empty() {
         return Ok(0);

@@ -6,3 +6,5 @@ mod obj_parser;
 mod capture_baseline;
 #[cfg(test)]
 mod boolean_17496_106028;
+#[cfg(test)]
+mod test_fitt_transform;

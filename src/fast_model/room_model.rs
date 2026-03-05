@@ -92,7 +92,42 @@ struct RoomCalcEnvConfig {
 
 static ROOM_CALC_CONFIG: std::sync::OnceLock<RoomCalcEnvConfig> = std::sync::OnceLock::new();
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+static SPATIAL_INDEX_READY: std::sync::OnceLock<Result<usize, String>> = std::sync::OnceLock::new();
 
+/// 确保 spatial_index.sqlite 已从 inst_relate_aabb 刷新（进程生命周期内至多执行一次）。
+///
+/// `force=true` 时忽略缓存、强制重新刷新（全量 build_room_relations 使用）。
+/// `force=false` 时仅首次调用执行（单 panel cal_room_refnos 路径使用）。
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn ensure_spatial_index_ready(
+    db_nums: Option<&[u32]>,
+    refno_root: Option<RefnoEnum>,
+    force: bool,
+) -> anyhow::Result<()> {
+    if !force {
+        if let Some(prev) = SPATIAL_INDEX_READY.get() {
+            return prev
+                .as_ref()
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("{}", e));
+        }
+    }
+
+    let result = refresh_sqlite_spatial_index_from_inst_relate_aabb(db_nums, refno_root).await;
+    match &result {
+        Ok(count) => {
+            info!("[room_model] ensure_spatial_index_ready: 索引就绪, inserted={count}");
+            let _ = SPATIAL_INDEX_READY.set(Ok(*count));
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            error!("[room_model] ensure_spatial_index_ready: 索引刷新失败: {msg}");
+            let _ = SPATIAL_INDEX_READY.set(Err(msg));
+        }
+    }
+    result.map(|_| ())
+}
 
 /// Resolve room calc config from env vars (read-only) and DbOption defaults.
 
@@ -1246,7 +1281,7 @@ pub async fn build_room_relations_with_cancel(
         if let Some(ref cb) = progress_callback {
             cb(0.02, "正在刷新 SQLite AABB 索引");
         }
-        refresh_sqlite_spatial_index_from_inst_relate_aabb(db_nums, refno_root.clone()).await?;
+        ensure_spatial_index_ready(db_nums, refno_root.clone(), true).await?;
     }
 
 
@@ -2675,6 +2710,10 @@ async fn cal_room_refnos_with_options(
 
 
     // 步骤 3：粗算 - 通过空间索引查询候选构件
+
+    // 自动确保 SQLite 空间索引已从 inst_relate_aabb 刷新（进程内至多一次）
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    ensure_spatial_index_ready(None, None, false).await?;
 
     let coarse_start = Instant::now();
 
@@ -5625,7 +5664,7 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
         if let Some(ref cb) = progress_callback {
             cb(0.02, "正在刷新 SQLite AABB 索引");
         }
-        refresh_sqlite_spatial_index_from_inst_relate_aabb(None, None).await?;
+        ensure_spatial_index_ready(None, None, true).await?;
     }
 
 
@@ -5817,7 +5856,7 @@ pub async fn update_room_relations_incremental_original(
     init_room_calc_config(&db_option);
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-    refresh_sqlite_spatial_index_from_inst_relate_aabb(None, None).await?;
+    ensure_spatial_index_ready(None, None, true).await?;
 
 
 

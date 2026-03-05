@@ -391,6 +391,29 @@ pub async fn generate_meshes_for_batch(
     for task in tasks {
         // 第一层去重：跨批次内存去重器
         if !deduper.insert(task.geo_hash) {
+            // 即使 deduper 跳过（增量模式预加载），仍从缓存获取 AABB，
+            // 保证 inst_relate_aabb 在增量模式下也能正确写入。
+            let mesh_id = task.geo_hash.to_string();
+            if let Some(cached_aabb) = EXIST_MESH_GEO_HASHES.get(&mesh_id) {
+                let cached = *cached_aabb;
+                drop(cached_aabb);
+                let ext_mag = cached.extents().magnitude();
+                let valid = ext_mag > 1e-4 && ext_mag < f32::INFINITY;
+                let aabb_hash = if valid {
+                    let h = gen_aabb_hash(&cached);
+                    aabb_map.entry(h.to_string()).or_insert(cached);
+                    Some(h)
+                } else {
+                    None
+                };
+                results.insert(task.geo_hash, MeshResult {
+                    meshed: true,
+                    bad: !valid,
+                    aabb_hash,
+                    pts_hashes: vec![],
+                });
+                skipped_by_cache += 1;
+            }
             continue;
         }
 

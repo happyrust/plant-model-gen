@@ -1879,30 +1879,6 @@ async fn handle_csg_mesh(
 
     let mesh_base_path = dir.join(mesh_id);
 
-    // ── Manifold-first：焊接 + 绕序修复 + Manifold 验证，保存为 _m.manifold ──
-    {
-        use aios_core::csg::manifold::{ManifoldMeshRust, ManifoldRust};
-        let verts: Vec<glam::Vec3> = generated.mesh.vertices.clone();
-        let indices = &generated.mesh.indices;
-        // 焊接（本地坐标系，单位矩阵）
-        let mut welded = ManifoldMeshRust::from_vertices_indices(
-            &verts, indices, glam::DMat4::IDENTITY, false,
-        );
-        // 修复混合绕序（CSG 生成的底/顶面可能与侧面绕序不一致）
-        welded.orient_consistently();
-        // 转换为 Manifold 并取回验证后的 mesh
-        let manifold = ManifoldRust::from_mesh(&welded);
-        let validated_mesh = manifold.get_mesh();
-        if !validated_mesh.indices.is_empty() {
-            let manifold_path = manifold_dir.join(format!("{}_m.manifold", mesh_id));
-            if let Err(e) = validated_mesh.save_to_file(&manifold_path) {
-                debug_model_warn!("   ⚠️ 保存 _m.manifold 失败: {} - {}", mesh_id, e);
-            }
-        } else {
-            debug_model_warn!("   ⚠️ Manifold 转换为空，跳过 _m.manifold 保存: {}", mesh_id);
-        }
-    }
-
     // ── AABB 计算（正负实体都需要，布尔查询依赖 inst_geo.aabb） ──
     let aabb_hash = gen_aabb_hash(&mesh_aabb);
     aabb_map.entry(aabb_hash.to_string()).or_insert(mesh_aabb);
@@ -1912,7 +1888,22 @@ async fn handle_csg_mesh(
     inst_aabb_map.insert(inst_key.to_string(), mesh_aabb);
 
     if is_neg {
-        // 负实体：保存 .manifold + AABB，不生成 GLB/OBJ
+        // 负实体：保存 .manifold + AABB，不生成 GLB
+        // CSG 生成的 mesh 本身就是 manifold，直接保存原始数据。
+        use aios_core::csg::manifold::ManifoldMeshRust;
+        let flat_verts: Vec<f32> = generated.mesh.vertices.iter()
+            .flat_map(|v| [v.x, v.y, v.z])
+            .collect();
+        let raw = ManifoldMeshRust {
+            vertices: flat_verts,
+            indices: generated.mesh.indices.clone(),
+        };
+        if !raw.indices.is_empty() {
+            let manifold_path = manifold_dir.join(format!("{}_m.manifold", mesh_id));
+            if let Err(e) = raw.save_to_file(&manifold_path) {
+                debug_model_warn!("   ⚠️ 保存 _m.manifold 失败: {} - {}", mesh_id, e);
+            }
+        }
         return Ok(MeshResult {
             meshed: true,
             bad: false,

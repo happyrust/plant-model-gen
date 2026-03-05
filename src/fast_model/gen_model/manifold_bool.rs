@@ -447,17 +447,11 @@ pub(crate) fn load_manifold_from_geo_param(
 
         PdmsGeoParam::Unknown | PdmsGeoParam::CompoundShape => {
 
-            // 对于 Unknown 和 CompoundShape，回退到从 glb 加载
-
-            debug_model_debug!(
-
-                "load_manifold_from_geo_param: geo_param 不支持直接生成，回退到 glb 加载: geo_hash={}",
-
-                geo_hash
-
-            );
-
-            return load_manifold(&geo_hash.to_string(), mat, more_precision);
+            return Err(anyhow::anyhow!(
+                "geo_param 不支持直接生成 manifold: geo_hash={} type={:?}",
+                geo_hash,
+                geo_param.type_name()
+            ));
 
         }
 
@@ -471,17 +465,11 @@ pub(crate) fn load_manifold_from_geo_param(
 
                 Err(e) => {
 
-                    debug_model_debug!(
-
-                        "load_manifold_from_geo_param: gen_csg_shape 失败 ({}), 尝试回退到 glb 加载: geo_hash={}",
-
-                        e,
-
-                        geo_hash
-
-                    );
-
-                    return load_manifold(&geo_hash.to_string(), mat, more_precision);
+                    return Err(anyhow::anyhow!(
+                        "gen_csg_shape 失败: geo_hash={} err={}",
+                        geo_hash,
+                        e
+                    ));
 
                 }
 

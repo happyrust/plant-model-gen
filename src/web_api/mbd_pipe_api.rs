@@ -1539,7 +1539,7 @@ async fn generate_mbd_data_from_segments(
 
     if query.include_overall_dim {
         let mut total = 0.0f32;
-        for seg in &segments {
+        for seg in segments {
             total += seg.start.distance(seg.end);
         }
 

@@ -101,14 +101,14 @@ impl Default for MbdPipeQuery {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MbdPipeResponse {
     pub success: bool,
     pub error_message: Option<String>,
     pub data: Option<MbdPipeData>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MbdPipeData {
     pub input_refno: String,
     pub branch_refno: String,
@@ -120,11 +120,11 @@ pub struct MbdPipeData {
     pub slopes: Vec<MbdSlopeDto>,
     pub bends: Vec<MbdBendDto>,
     pub stats: MbdPipeStats,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug_info: Option<MbdPipeDebugInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MbdPipeStats {
     pub segments_count: usize,
     pub dims_count: usize,
@@ -134,7 +134,7 @@ pub struct MbdPipeStats {
 }
 
 /// 分支属性（对齐 MBD/markpipe/branAttlist.txt 的 BranAttarr）
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BranchAttrsDto {
     pub duty: Option<String>,
     pub pspec: Option<String>,
@@ -152,7 +152,7 @@ pub struct BranchAttrsDto {
     pub fluid: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MbdPipeSegmentDto {
     pub id: String,
     pub refno: String,
@@ -166,7 +166,7 @@ pub struct MbdPipeSegmentDto {
     pub bore: Option<f32>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MbdDimKind {
     /// 每段长度（tubi 段 start/end）
@@ -179,13 +179,13 @@ pub enum MbdDimKind {
     Port,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MbdDimDto {
     pub id: String,
     pub kind: MbdDimKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u32>,
     pub start: [f32; 3],
     pub end: [f32; 3],
@@ -193,14 +193,14 @@ pub struct MbdDimDto {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum MbdWeldType {
     Butt = 0,
     Fillet = 1,
     Socket = 2,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MbdWeldDto {
     pub id: String,
     pub position: [f32; 3],
@@ -212,7 +212,7 @@ pub struct MbdWeldDto {
     pub right_refno: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MbdSlopeDto {
     pub id: String,
     pub start: [f32; 3],
@@ -237,7 +237,7 @@ impl Default for MbdBendMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MbdBendDto {
     pub id: String,
     pub refno: String,
@@ -254,7 +254,7 @@ pub struct MbdBendDto {
     pub face_center_2: Option<[f32; 3]>,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MbdPipeDebugInfo {
     pub cache_dir: Option<String>,
     pub requested_dbno: Option<u32>,
@@ -375,6 +375,59 @@ async fn get_mbd_pipe(
             });
         }
     };
+
+    // ── 优先读取预生成 JSON 文件 ──────────────────────────────
+    // 预生成 JSON 在 export_mbd_json_for_bran() 中生成，路径为 output/{project}/mbd/{refno}.json
+    // 命中则直接返回，跳过实时计算。
+    {
+        let json_path = get_mbd_output_dir().join(format!("{}.json", input_refno_enum));
+        if json_path.exists() {
+            match std::fs::read_to_string(&json_path) {
+                Ok(content) => {
+                    match serde_json::from_str::<MbdPipeResponse>(&content) {
+                        Ok(mut resp) => {
+                            if query.debug {
+                                // 在 debug_info 中标明数据来源
+                                let debug_info = resp.data.as_mut()
+                                    .and_then(|d| d.debug_info.as_mut());
+                                if let Some(info) = debug_info {
+                                    info.notes.push("source=pregenerated_json".to_string());
+                                    info.notes.push(format!("file={}", json_path.display()));
+                                } else if let Some(ref mut d) = resp.data {
+                                    d.debug_info = Some(MbdPipeDebugInfo {
+                                        notes: vec![
+                                            "source=pregenerated_json".to_string(),
+                                            format!("file={}", json_path.display()),
+                                        ],
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+                            println!(
+                                "[mbd-pipe] 命中预生成 JSON: {}",
+                                json_path.display()
+                            );
+                            return json_utf8(resp);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[mbd-pipe] 预生成 JSON 反序列化失败（回退实时计算）: {} — {e}",
+                                json_path.display()
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[mbd-pipe] 预生成 JSON 读取失败（回退实时计算）: {} — {e}",
+                        json_path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    // ── 实时计算路径（预生成未命中时走此分支） ────────────────────
 
     // cache-only 约定：当前接口以“输入即 BRAN/HANG refno”为前提，不回退 SurrealDB 做祖先解析。
     // plant3d-web 的测试路由与面板逻辑也是以分支 refno 为输入。
@@ -1287,6 +1340,7 @@ fn export_default_query() -> MbdPipeQuery {
         include_branch_attrs: true,
         include_weld_nouns: false,
         debug: false,
+        bend_mode: MbdBendMode::Facecenter,
         ..Default::default()
     }
 }

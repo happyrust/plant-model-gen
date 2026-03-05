@@ -68,13 +68,15 @@ pub mod room_worker; // 后台房间计算 Worker
 
 pub use room_model::{
 
-    IncrementalUpdateResult, RoomBuildStats, build_room_relations,
+    CoarseAabbDiagnostic, IncrementalUpdateResult, RoomBuildStats, build_room_relations,
 
-    build_room_relations_with_cancel, rebuild_room_relations_for_rooms,
+    build_room_relations_with_cancel, diagnose_coarse_aabb_intersection,
 
-    rebuild_room_relations_for_rooms_with_cancel, regenerate_room_models_by_keywords,
+    rebuild_room_relations_for_rooms, rebuild_room_relations_for_rooms_with_cancel,
 
-    update_room_relations_incremental, update_room_relations_incremental_with_cancel,
+    regenerate_room_models_by_keywords, update_room_relations_incremental,
+
+    update_room_relations_incremental_with_cancel,
 
 };
 

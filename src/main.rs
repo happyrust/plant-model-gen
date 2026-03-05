@@ -346,8 +346,8 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(not(feature = "gui"))]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 默认把模型生成/导出过程的所有 stdout/stderr 写入日志文件，避免控制台刷屏导致“看似死循环”。
-    // 仅在显式 `--verbose` 或后台服务模式（如 --grpc-server）时保留控制台输出。
+    // 默认不重定向 stdout/stderr，保证终端有输出，避免控制台刷屏导致“看似死循环”。
+    // 默认不重定向；-v/--verbose 始终保留控制台输出；AIOS_REDIRECT_STDIO=1 可启用重定向到 logs/。
     maybe_redirect_stdio_to_log_file();
 
     let matches = Command::new("aios-database")
@@ -2210,12 +2210,19 @@ fn maybe_redirect_stdio_to_log_file() {
     let has_flag = |flag: &str| args.iter().any(|a| a == flag);
 
     // 显式 verbose / 服务模式：不重定向，便于交互调试/观察运行状态。
-    if has_flag("--verbose") || has_flag("--grpc-server") {
+    // 支持 -v 和 --verbose，避免用户加 -v 后仍被重定向导致终端无输出（看似卡住）。
+    if has_flag("--verbose") || has_flag("-v") || has_flag("--grpc-server") {
         // 允许用户按需设置 AIOS_LOG_TO_CONSOLE=1，把 log::info 也打印到控制台。
         return;
     }
 
-    // 仅在“可能产生海量输出”的路径下默认重定向（debug-model/export/capture 等）。
+    // 默认不重定向，避免 spawn 子进程后终端无输出导致“卡住”的假象。
+    // 需要重定向时设置环境变量 AIOS_REDIRECT_STDIO=1。
+    if std::env::var_os("AIOS_REDIRECT_STDIO").map(|v| v != "1").unwrap_or(true) {
+        return;
+    }
+
+    // 仅在“可能产生海量输出”的路径下重定向（debug-model/export/capture 等）。
     let should_redirect = has_flag("--debug-model")
         || has_flag("--export-obj")
         || has_flag("--export-glb")

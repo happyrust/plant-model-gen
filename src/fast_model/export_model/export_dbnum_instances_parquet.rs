@@ -510,60 +510,34 @@ struct AabbQueryRow {
 // SurrealDB 查询函数
 // =============================================================================
 
-/// 通过 dbnum 对应的 ref0 前缀直接扫描 inst_relate（无需 TreeIndex）
+/// 通过 dbnum 字段过滤 inst_relate（命中 dbnum 索引路径）
 async fn query_inst_relate_by_dbnum(
     dbnum: u32,
     verbose: bool,
 ) -> Result<Vec<InstRelateRow>> {
-    use crate::data_interface::db_meta;
-
-    // 1. 获取 dbnum 对应的 ref0 列表（ref0 ≠ dbnum，需从 db_meta_info 映射）
-    db_meta().ensure_loaded()?;
-    let (ref0s, ref0_source) = match db_meta().get_db_file_info(dbnum) {
-        Some(info) if !info.ref0s.is_empty() => (info.ref0s, "db_files"),
-        _ => {
-            let from_ref0_map = db_meta().get_ref0s_by_dbnum(dbnum);
-            if !from_ref0_map.is_empty() {
-                if verbose {
-                    println!("🔍 dbnum={} 从 ref0_to_dbnum 反查得到 ref0 列表: {:?}", dbnum, from_ref0_map);
-                }
-                (from_ref0_map, "ref0_to_dbnum")
-            } else {
-                if verbose {
-                    println!("⚠️  dbnum={} 无 ref0 映射，fallback ref0=[{}]", dbnum, dbnum);
-                }
-                (vec![dbnum], "fallback")
-            }
-        }
-    };
-
     if verbose {
-        println!("🔍 dbnum={} 对应 ref0 列表: {:?}", dbnum, ref0s);
-    }
-
-    // 2. 按 ref0 分批查询 inst_relate（通过 string::starts_with 过滤 ID 前缀）
-    if verbose {
-        println!("🔍 扫描 inst_relate (WHERE 过滤，{} 个 ref0)...", ref0s.len());
-    }
-    let mut rows: Vec<InstRelateRow> = Vec::new();
-    for ref0 in &ref0s {
-        let sql = format!(
-            r#"
-            SELECT
-                owner_refno,
-                owner_type,
-                in as refno,
-                in.noun as noun,
-                spec_value as spec_value
-            FROM inst_relate
-            WHERE string::starts_with(record::id(id), '{ref0}_')
-            "#
+        println!(
+            "🔍 扫描 inst_relate（索引路径: WHERE dbnum = {}）...",
+            dbnum
         );
-
-        let batch: Vec<InstRelateRow> =
-            aios_core::project_primary_db().query_take(&sql, 0).await?;
-        rows.extend(batch);
     }
+
+    let sql = r#"
+        SELECT
+            owner_refno,
+            owner_type,
+            in as refno,
+            in.noun as noun,
+            spec_value as spec_value
+        FROM inst_relate
+        WHERE dbnum = $dbnum
+    "#;
+
+    let mut resp = aios_core::project_primary_db()
+        .query(sql)
+        .bind(("dbnum", dbnum))
+        .await?;
+    let rows: Vec<InstRelateRow> = resp.take(0)?;
 
     if verbose {
         println!("✅ inst_relate 命中记录: {}", rows.len());

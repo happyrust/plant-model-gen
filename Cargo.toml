@@ -76,7 +76,6 @@ aios_core = { git = "https://github.com/happyrust/rs-core.git", branch = "dev-3.
 surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1", default-features = false, features = [
     "protocol-ws",
     "kv-mem",
-    "kv-rocksdb",
 ] }
 # surrealdb-types 需要显式引入：SurrealValue derive 宏默认使用 ::surrealdb_types 路径
 surrealdb-types = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1" }
@@ -171,10 +170,10 @@ rust_xlsxwriter = "0.91.0"
 default = [
     "ws",
     "gen_model",
+    "sqlite-index",
     "manifold",
     "project_hd",
     "surreal-save",
-    "kv-rocksdb",
     "parquet-export",
 ]
 # Parquet/Polars 数据导出（编译较重，日常开发可不启用）
@@ -200,7 +199,7 @@ manifold = ["aios_core/manifold"]
 surreal-save = []
 test = ["aios_core/test"]
 mem-kv-save = ["aios_core/mem-kv-save"] #额外保存PE数据到内存KV数据库
-kv-rocksdb = ["aios_core/kv-rocksdb"] # 嵌入式 RocksDB 后端
+kv-rocksdb = ["aios_core/kv-rocksdb", "surrealdb/kv-rocksdb"] # 嵌入式 RocksDB 后端，默认不编译以加快构建
 project_hd = []
 project_hh = []
 profile = ["dep:tracing-chrome"] #性能分析，包含tracing功能

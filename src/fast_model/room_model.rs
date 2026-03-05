@@ -16,7 +16,7 @@ use glam::{Mat4, Vec3};
 
 use itertools::Itertools;
 
-use parry3d::bounding_volume::Aabb;
+use parry3d::bounding_volume::{Aabb, BoundingVolume};
 
 use parry3d::math::{Isometry, Vector};
 
@@ -2184,9 +2184,107 @@ pub async fn cal_room_refnos(
 
 }
 
+/// 粗算（AABB 相交）诊断结果：用于验证 SQLite RTree 粗筛是否正确。
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[derive(Debug, Clone)]
+pub struct CoarseAabbDiagnostic {
+    pub panel_aabb: Option<Aabb>,
+    pub query_aabb: Option<Aabb>,
+    pub expect_refno_aabb_intersects: Vec<(RefnoEnum, Option<Aabb>, bool)>,
+    pub rtree_candidates: Vec<RefnoEnum>,
+    pub expect_refno_in_rtree: Vec<(RefnoEnum, bool)>,
+}
 
+/// 粗算诊断：分析 AABB 相交查询是否正确。
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+pub async fn diagnose_coarse_aabb_intersection(
+    panel_refno: RefnoEnum,
+    expect_refnos: &[RefnoEnum],
+) -> anyhow::Result<CoarseAabbDiagnostic> {
+    ensure_spatial_index_ready(None, None, false).await?;
+    let floor_2d = Floor2dConfig::from_env();
 
-/// 单点验证：使用“简化算法（AABB 8 角点全在）”判断某个构件是否属于指定房间面板。
+    let mut panel_aabb: Option<Aabb> =
+        query_aabb_from_inst_relate_aabb(&[panel_refno]).await.ok().and_then(|m| m.into_values().next());
+    if panel_aabb.is_none() {
+        let geom_insts = query_insts_for_room_calc(&[panel_refno], true).await.unwrap_or_default();
+        for g in &geom_insts {
+            let Some(ref world_aabb) = g.world_aabb else { continue };
+            let a: Aabb = world_aabb.clone().into();
+            panel_aabb = Some(match panel_aabb {
+                None => a,
+                Some(acc) => merge_aabb(&acc, &a),
+            });
+        }
+    }
+
+    let query_aabb = match &panel_aabb {
+        None => None,
+        Some(pa) => {
+            let z_thickness = pa.maxs.z - pa.mins.z;
+            let q = if !floor_2d.enabled || z_thickness > floor_2d.z_thickness_max {
+                *pa
+            } else {
+                let x_ext = (pa.maxs.x - pa.mins.x).abs();
+                let y_ext = (pa.maxs.y - pa.mins.y).abs();
+                let extrude = floor_2d
+                    .extrude_height
+                    .map(|v| v as Real)
+                    .unwrap_or_else(|| x_ext.max(y_ext).max(1.0));
+                let mut a = *pa;
+                a.mins.z -= 0.1;
+                a.maxs.z += extrude;
+                a
+            };
+            Some(q)
+        }
+    };
+
+    let expect_aabb_map = query_aabb_from_inst_relate_aabb(expect_refnos).await.unwrap_or_default();
+    let expect_refno_aabb_intersects: Vec<_> = expect_refnos
+        .iter()
+        .map(|r| {
+            let aabb = expect_aabb_map.get(r).copied();
+            let intersects = query_aabb
+                .as_ref()
+                .and_then(|qb| aabb.as_ref().map(|ab| ab.intersects(qb)))
+                .unwrap_or(false);
+            (*r, aabb, intersects)
+        })
+        .collect();
+
+    let rtree_candidates = match &query_aabb {
+        Some(qa) => {
+            let idx = SqliteSpatialIndex::with_default_path()?;
+            let ids = idx.query_intersect(qa)?;
+            ids.into_iter()
+                .filter_map(|id| {
+                    let c = RefnoEnum::from(id);
+                    if c.is_valid() && c != panel_refno {
+                        Some(c)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+
+    let candidate_set: HashSet<RefnoEnum> = rtree_candidates.iter().cloned().collect();
+    let expect_refno_in_rtree: Vec<_> =
+        expect_refnos.iter().map(|r| (*r, candidate_set.contains(r))).collect();
+
+    Ok(CoarseAabbDiagnostic {
+        panel_aabb,
+        query_aabb,
+        expect_refno_aabb_intersects,
+        rtree_candidates,
+        expect_refno_in_rtree,
+    })
+}
+
+/// 单点验证：使用"简化算法（AABB 8 角点全在）"判断某个构件是否属于指定房间面板。
 
 ///
 

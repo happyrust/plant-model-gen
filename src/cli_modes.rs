@@ -412,8 +412,18 @@ async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
         if reachable {
             println!("\n📡 SurrealDB 已在 {} 运行，直接连接...", addr);
         } else if is_local_target {
-            println!("\n⚠️  SurrealDB 未在 {} 运行，尝试自动启动...", addr);
-            auto_start_surreal(&db_option_ext.inner).await?;
+            let auto_start = db_option_ext.inner.web_server.auto_start_surreal;
+            if auto_start {
+                println!("\n⚠️  SurrealDB 未在 {} 运行，尝试自动启动（auto_start_surreal = true）...", addr);
+                auto_start_surreal(&db_option_ext.inner).await?;
+            } else {
+                anyhow::bail!(
+                    "SurrealDB 未在 {} 运行。请手动启动 SurrealDB，或设置 [web_server] auto_start_surreal = true 以自动启动。\n   \
+                    手动启动示例: surreal start --user root --pass root --bind 0.0.0.0:{} rocksdb://<数据路径>",
+                    addr,
+                    sdb_cfg.port
+                );
+            }
         } else {
             anyhow::bail!(
                 "SurrealDB 远端地址不可达: {}。请先启动远端服务或检查网络/配置。",
@@ -436,19 +446,19 @@ async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
 
 /// 使用 `surreal start` 自动启动本地 SurrealDB 后台进程。
 ///
-/// 数据路径优先级：`[surrealdb].path` > 默认 `db-data/{project}_{port}.rdb`
+/// 配置优先级：
+/// - surreal_bin: 环境变量 SURREAL_BIN > [web_server].surreal_bin > "surreal"
+/// - 数据路径: [web_server].surreal_data_path > [surrealdb].path > 默认 db-data/{project}_{port}.rdb
+/// - 监听地址: [web_server].surreal_bind（如 0.0.0.0:8020）
 async fn auto_start_surreal(db_option: &aios_core::options::DbOption) -> Result<()> {
     let sdb_cfg = db_option.effective_surrealdb();
+    let ws_cfg = &db_option.web_server;
 
-    let data_path = db_option.surrealdb_data_path();
+    let data_path = ws_cfg.effective_data_path(db_option.surrealdb.path.as_deref());
     let db_uri = format!("rocksdb://{}", data_path);
-    let bind_ip = if sdb_cfg.ip == "localhost" {
-        "127.0.0.1".to_string()
-    } else {
-        sdb_cfg.ip.clone()
-    };
-    let bind = format!("{}:{}", bind_ip, sdb_cfg.port);
-    let surreal_bin = std::env::var("SURREAL_BIN").unwrap_or_else(|_| "surreal".to_string());
+    let bind = ws_cfg.surreal_bind.clone();
+    let surreal_bin = std::env::var("SURREAL_BIN")
+        .unwrap_or_else(|_| ws_cfg.surreal_bin.clone());
 
     println!("🚀 启动 SurrealDB: {} start --bind {} {}", surreal_bin, bind, db_uri);
 
@@ -470,8 +480,13 @@ async fn auto_start_surreal(db_option: &aios_core::options::DbOption) -> Result<
 
     println!("   PID: {}", child.id());
 
-    // 等待端口就绪（最多 30 秒）
-    let addr = bind;
+    // 等待端口就绪（最多 30 秒），使用客户端连接地址检测
+    let connect_ip = if sdb_cfg.ip == "localhost" {
+        "127.0.0.1"
+    } else {
+        &sdb_cfg.ip
+    };
+    let addr = format!("{}:{}", connect_ip, sdb_cfg.port);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
     loop {

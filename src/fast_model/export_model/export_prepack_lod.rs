@@ -3334,8 +3334,9 @@ pub async fn export_all_relates_prepack_lod(
     let db_filter = if let Some(dbnum) = dbnum {
 
         println!("   - 模式: 按 dbnum={} 过滤", dbnum);
+        println!("   - 过滤路径: 使用 inst_relate.dbnum 索引字段");
 
-        format!("string::starts_with(record::id(in), '{}_') ", dbnum)
+        "dbnum = $dbnum ".to_string()
 
     } else {
 
@@ -3367,7 +3368,15 @@ pub async fn export_all_relates_prepack_lod(
 
     );
 
-    let equi_refnos: Vec<RefnoEnum> = aios_core::model_primary_db().query_take(&equi_sql, 0).await?;
+    let equi_refnos: Vec<RefnoEnum> = if let Some(dbnum) = dbnum {
+        let mut resp = aios_core::model_primary_db()
+            .query(&equi_sql)
+            .bind(("dbnum", dbnum))
+            .await?;
+        resp.take(0)?
+    } else {
+        aios_core::model_primary_db().query_take(&equi_sql, 0).await?
+    };
 
     println!(
 
@@ -3387,10 +3396,13 @@ pub async fn export_all_relates_prepack_lod(
         "SELECT value in.id FROM inst_relate WHERE {} AND (array::len($owner_types) = 0 OR owner_type IN $owner_types) AND record::exists(type::record('inst_relate_aabb', record::id(in)))",
         db_filter
     );
-    let mut resp = aios_core::model_primary_db()
+    let mut query = aios_core::model_primary_db()
         .query(&sql_all)
-        .bind(("owner_types", owner_types_filter))
-        .await?;
+        .bind(("owner_types", owner_types_filter));
+    if let Some(dbnum) = dbnum {
+        query = query.bind(("dbnum", dbnum));
+    }
+    let mut resp = query.await?;
     let mut all_refnos: Vec<RefnoEnum> = resp.take(0)?;
 
 
@@ -3789,8 +3801,9 @@ pub async fn export_all_relates_prepack_lod_parquet(
     let db_filter = if let Some(dbnum) = dbnum {
 
         println!("   - 模式: 按 dbnum={} 过滤", dbnum);
+        println!("   - 过滤路径: 使用 inst_relate.dbnum 索引字段");
 
-        format!("string::starts_with(record::id(in), '{}_') ", dbnum)
+        "dbnum = $dbnum ".to_string()
 
     } else {
 
@@ -3825,7 +3838,15 @@ pub async fn export_all_relates_prepack_lod_parquet(
 
     );
 
-    let equi_refnos: Vec<RefnoEnum> = aios_core::model_primary_db().query_take(&equi_sql, 0).await?;
+    let equi_refnos: Vec<RefnoEnum> = if let Some(dbnum) = dbnum {
+        let mut resp = aios_core::model_primary_db()
+            .query(&equi_sql)
+            .bind(("dbnum", dbnum))
+            .await?;
+        resp.take(0)?
+    } else {
+        aios_core::model_primary_db().query_take(&equi_sql, 0).await?
+    };
 
     println!(
 
@@ -3843,10 +3864,13 @@ pub async fn export_all_relates_prepack_lod_parquet(
         "SELECT value in.id FROM inst_relate WHERE {} AND (array::len($owner_types) = 0 OR owner_type IN $owner_types) AND record::exists(type::record('inst_relate_aabb', record::id(in)))",
         db_filter
     );
-    let mut resp = aios_core::model_primary_db()
+    let mut query = aios_core::model_primary_db()
         .query(&sql_all)
-        .bind(("owner_types", owner_types_filter))
-        .await?;
+        .bind(("owner_types", owner_types_filter));
+    if let Some(dbnum) = dbnum {
+        query = query.bind(("dbnum", dbnum));
+    }
+    let mut resp = query.await?;
     let mut all_refnos: Vec<RefnoEnum> = resp.take(0)?;
 
 

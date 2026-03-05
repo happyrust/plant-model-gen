@@ -10,13 +10,10 @@
 //!     --dboption-path DbOption-room-pane17496-cache `
 //!     --auto-gen-model true
 //!
-//! 回归用例（24381）：
-//!   cargo run --example room_calc_by_panel_demo --features "gen_model,sqlite-index" -- `
-//!     --panel-refno 24381/35798 `
-//!     --expect-refnos 24381/145019 `
-//!     --dbnum 7997 `
-//!     --dboption-path DbOption `
-//!     --auto-gen-model true
+//! 回归测试（panel 24381/35798 应包含弯头 24381/145019）：
+//!   cargo run --example room_calc_by_panel_demo -- \
+//!     --panel-refno 24381/35798 \
+//!     --expect-refnos 24381/145019
 //!
 //! 可选环境变量（仅影响日志输出）：
 //! - AIOS_LOG_TO_CONSOLE=1：将日志同时输出到控制台（默认只写文件）
@@ -424,6 +421,56 @@ async fn main() -> Result<()> {
 
     let mesh_dir = db_option_ext.inner.get_meshes_path();
     let exclude = HashSet::<RefnoEnum>::new();
+
+    // 粗算诊断：在期望 refnos 时先验证 AABB 相交查询是否正确
+    if !expect_refnos.is_empty() {
+        println!("\n📐 粗算（AABB 相交）诊断:");
+        match aios_database::fast_model::diagnose_coarse_aabb_intersection(
+            panel_refno,
+            &expect_refnos,
+        )
+        .await
+        {
+            Ok(diag) => {
+                if let Some(pa) = &diag.panel_aabb {
+                    println!(
+                        "   panel_aabb: ({:.2},{:.2},{:.2})..({:.2},{:.2},{:.2})",
+                        pa.mins.x, pa.mins.y, pa.mins.z, pa.maxs.x, pa.maxs.y, pa.maxs.z
+                    );
+                } else {
+                    println!("   panel_aabb: (缺失)");
+                }
+                if let Some(qa) = &diag.query_aabb {
+                    println!(
+                        "   query_aabb: ({:.2},{:.2},{:.2})..({:.2},{:.2},{:.2})",
+                        qa.mins.x, qa.mins.y, qa.mins.z, qa.maxs.x, qa.maxs.y, qa.maxs.z
+                    );
+                }
+                for (r, aabb_opt, intersects) in &diag.expect_refno_aabb_intersects {
+                    let aabb_str = aabb_opt
+                        .as_ref()
+                        .map(|a| format!("({:.1},{:.1},{:.1})..({:.1},{:.1},{:.1})", a.mins.x, a.mins.y, a.mins.z, a.maxs.x, a.maxs.y, a.maxs.z))
+                        .unwrap_or_else(|| "缺失".to_string());
+                    println!(
+                        "   expect {}: aabb={} 与query_aabb相交={}",
+                        r, aabb_str, intersects
+                    );
+                }
+                for (r, in_rtree) in &diag.expect_refno_in_rtree {
+                    println!("   expect {} 在RTree候选列表: {}", r, in_rtree);
+                }
+                println!("   RTree 候选总数: {}", diag.rtree_candidates.len());
+                let all_ok = diag.expect_refno_in_rtree.iter().all(|(_, in_rtree)| *in_rtree);
+                if all_ok {
+                    println!("   ✅ 粗算通过：所有 expect_refno 均在候选列表中");
+                } else {
+                    println!("   ❌ 粗算异常：部分 expect_refno 未进入候选（将导致细算漏判）");
+                }
+            }
+            Err(e) => println!("   粗算诊断失败: {}", e),
+        }
+    }
+
     let within = aios_database::fast_model::room_model::cal_room_refnos(
         &mesh_dir,
         panel_refno,

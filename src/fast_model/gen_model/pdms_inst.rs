@@ -313,6 +313,8 @@ fn build_delete_inst_geo_by_hashes_sql(geo_hashes: &[u64], chunk_size: usize) ->
 /// （此前 DELETE + INSERT IGNORE 在 save_instance_data_optimize 中执行，
 ///   会覆盖 mesh worker 已写入的 meshed=true）。
 pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<()> {
+    //默认不要清理了。
+    return Ok(());
     if seed_refnos.is_empty() {
         return Ok(());
     }

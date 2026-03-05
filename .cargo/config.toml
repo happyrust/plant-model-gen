@@ -1,12 +1,21 @@
 [build]
 # 默认禁用 OCC 功能避免 glam 版本冲突
 rustflags = []
-# ─── sccache 跨项目编译缓存（可选）─────────────────────────────────────────
-# 适用场景：频繁切换分支、clean build、多 repo 联调（rs-core/pdms-io-fork 改动后）
-# 启用方式：先安装 `brew install sccache`，然后取消下面这行注释
-# 注意：sccache 与 incremental 编译互斥。启用 sccache 时建议同时设置：
+# ─── 为何有时感觉“每次都重编”？───────────────────────────────────────────────
+# 1. Feature 组合不同：每种 --features 对应独立产物。跑 room_demo 用 gen_model+sqlite-index，
+#    若平时只 build 默认 features，首次跑该 example 会触发该组合的完整构建。
+# 2. 首次跑某个 example：example 与 main/bin 的依赖可能不同，首次需完整构建该 example。
+# 3. 建议：固定用同一套 features 跑回归，如总是 `--features "gen_model,sqlite-index"`，
+#    第二次起即为增量。
+# 4. [patch] aios_core = { path = "../rs-core" }：rs-core 任一文件改动会触发 aios-database 重编。
+# 5. 启用 sccache 时需设置 CARGO_INCREMENTAL=0（见下方 rustc-wrapper）。
+# ─── sccache 跨项目编译缓存（已启用）─────────────────────────────────────────
+# 适用场景：频繁切换分支、clean build、surrealdb-core 等大依赖反复重编
+# 安装：brew install sccache
+# 注意：sccache 与 incremental 互斥，必须设置环境变量：
 #   export CARGO_INCREMENTAL=0
-# rustc-wrapper = "sccache"
+# 可将该行加入 ~/.zshrc 或项目 .envrc（direnv）
+rustc-wrapper = "sccache"
 
 # 增大主线程栈大小，避免 debug 模式下 async 函数状态机导致的栈溢出
 # 16MB 栈大小足以应对深度 async 调用链

@@ -90,7 +90,9 @@ use aios_core::tool::db_tool::{db1_dehash, db1_hash};
 
 use aios_core::utils::RecordIdExt;
 
-use aios_core::{DbOptionSurrealExt, connect_local_rocksdb};
+use aios_core::DbOptionSurrealExt;
+#[cfg(feature = "kv-rocksdb")]
+use aios_core::connect_local_rocksdb;
 
 use aios_core::{
 

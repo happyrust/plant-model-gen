@@ -255,27 +255,141 @@ use parry3d::bounding_volume::Aabb;
 
 pub static EXIST_MESH_GEO_HASHES: Lazy<DashMap<String, Aabb>> = Lazy::new(|| DashMap::new());
 
+// ── AABB rkyv 缓存 ──
 
+const AABB_CACHE_FILENAME: &str = "aabb_cache.rkyv";
+const AABB_CACHE_VERSION: u32 = 1;
 
-/// 从 meshes 目录扫描文件名预加载已存在的几何网格 ID 到内存缓存
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct AabbCacheFileV1 {
+    pub version: u32,
+    pub entries: Vec<AabbCacheEntryV1>,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct AabbCacheEntryV1 {
+    pub geo_hash: u64,
+    pub mins: [f32; 3],
+    pub maxs: [f32; 3],
+}
+
+/// 将 `EXIST_MESH_GEO_HASHES` 中有效的 AABB 持久化到 `meshes/aabb_cache.rkyv`
+pub fn save_aabb_cache_to_disk() {
+    let mesh_dir = aios_core::get_db_option().get_meshes_path();
+    let cache_path = mesh_dir.join(AABB_CACHE_FILENAME);
+    let tmp_path = mesh_dir.join(format!("{}.tmp", AABB_CACHE_FILENAME));
+
+    let mut entries = Vec::new();
+    for kv in EXIST_MESH_GEO_HASHES.iter() {
+        let aabb = *kv.value();
+        let ext_mag = aabb.extents().magnitude();
+        if ext_mag > 1e-4 && ext_mag < f32::INFINITY {
+            if let Ok(geo_hash) = kv.key().parse::<u64>() {
+                entries.push(AabbCacheEntryV1 {
+                    geo_hash,
+                    mins: [aabb.mins.x, aabb.mins.y, aabb.mins.z],
+                    maxs: [aabb.maxs.x, aabb.maxs.y, aabb.maxs.z],
+                });
+            }
+        }
+    }
+
+    let file = AabbCacheFileV1 {
+        version: AABB_CACHE_VERSION,
+        entries,
+    };
+
+    match rkyv::to_bytes::<rkyv::rancor::Error>(&file) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+                eprintln!("[aabb_cache] 写入临时文件失败: {}", e);
+                return;
+            }
+            if let Err(e) = std::fs::rename(&tmp_path, &cache_path) {
+                eprintln!("[aabb_cache] rename 失败: {}", e);
+                return;
+            }
+            debug_model!(
+                "✅ AABB 缓存已保存: {} 条有效 AABB → {} ({} bytes)",
+                file.entries.len(),
+                cache_path.display(),
+                bytes.len(),
+            );
+        }
+        Err(e) => {
+            eprintln!("[aabb_cache] rkyv 序列化失败: {:?}", e);
+        }
+    }
+}
+
+/// 从 `meshes/aabb_cache.rkyv` 加载 AABB 缓存到 `EXIST_MESH_GEO_HASHES`
 ///
-/// 扫描 lod_* 子目录下的 .glb 文件名提取 geo_hash，填入 `EXIST_MESH_GEO_HASHES`，
-/// 以便在后续生成过程中通过内存直接跳过已处理项目，提升性能。
+/// 返回成功加载的有效 AABB 条数。文件不存在或解析失败时返回 0。
+fn load_aabb_cache_from_disk(mesh_dir: &std::path::Path) -> usize {
+    use parry3d::math::Point;
+
+    let cache_path = mesh_dir.join(AABB_CACHE_FILENAME);
+    let data = match std::fs::read(&cache_path) {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+
+    let file: AabbCacheFileV1 =
+        match rkyv::from_bytes::<AabbCacheFileV1, rkyv::rancor::Error>(&data) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[aabb_cache] rkyv 反序列化失败，将忽略缓存文件: {:?}", e);
+                return 0;
+            }
+        };
+
+    if file.version != AABB_CACHE_VERSION {
+        eprintln!(
+            "[aabb_cache] 版本不匹配: file={} expected={}, 忽略",
+            file.version, AABB_CACHE_VERSION
+        );
+        return 0;
+    }
+
+    let mut count = 0usize;
+    for entry in &file.entries {
+        let aabb = Aabb::new(
+            Point::from(entry.mins),
+            Point::from(entry.maxs),
+        );
+        EXIST_MESH_GEO_HASHES.insert(entry.geo_hash.to_string(), aabb);
+        count += 1;
+    }
+    count
+}
+
+/// 从 meshes 目录预加载几何网格缓存
+///
+/// 优先从 `aabb_cache.rkyv` 读取有效 AABB，再扫描 .glb 文件补充新增 geo_hash。
 pub fn preload_mesh_cache() {
     use crate::fast_model::mesh_generate::scan_existing_mesh_ids_from_dir;
 
     let mesh_dir = aios_core::get_db_option().get_meshes_path();
-    let ids = scan_existing_mesh_ids_from_dir(&mesh_dir);
-    let count = ids.len();
 
+    // 优先从 rkyv 缓存读取（含有效 AABB）
+    let cache_count = load_aabb_cache_from_disk(&mesh_dir);
+
+    // 再扫描目录补充新增的 geo_hash（可能尚未写入 rkyv 缓存）
+    let ids = scan_existing_mesh_ids_from_dir(&mesh_dir);
+    let mut new_count = 0usize;
     for id in ids {
         let mesh_id = id.to_string();
-        EXIST_MESH_GEO_HASHES.entry(mesh_id).or_insert(Aabb::new_invalid());
+        // or_insert：rkyv 已加载的不覆盖
+        EXIST_MESH_GEO_HASHES.entry(mesh_id).or_insert_with(|| {
+            new_count += 1;
+            Aabb::new_invalid()
+        });
     }
 
     debug_model!(
-        "✅ 几何缓存预加载完成: 从文件系统扫描到 {} 个 mesh，耗时已包含在 scan 日志中",
-        count,
+        "✅ 缓存预加载: rkyv={} 条有效 AABB, 目录扫描补充 {} 条（无 AABB）",
+        cache_count,
+        new_count,
     );
 }
 

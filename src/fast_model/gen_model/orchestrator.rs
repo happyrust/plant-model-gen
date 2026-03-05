@@ -897,6 +897,11 @@ async fn process_index_tree_generation(
             }
         }
 
+        // 持久化 AABB 缓存到 meshes/aabb_cache.rkyv
+        if gen_mesh {
+            crate::fast_model::save_aabb_cache_to_disk();
+        }
+
         println!(
             "[insert_handle] 汇总: batch_cnt={}, t_save_db={}ms, t_mesh={}ms (mesh={}), t_cache={}ms, t_parquet={}ms",
             batch_cnt,

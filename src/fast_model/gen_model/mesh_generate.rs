@@ -1876,6 +1876,9 @@ pub async fn gen_inst_meshes(
     utils::save_pts_to_surreal(&pts_json_map).await;
     utils::save_aabb_to_surreal(&aabb_map).await;
 
+    // 持久化 AABB 缓存到 meshes/aabb_cache.rkyv
+    crate::fast_model::save_aabb_cache_to_disk();
+
     Ok(())
 }
 

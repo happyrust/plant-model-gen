@@ -437,7 +437,7 @@ async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
         println!("\n📡 连接数据库（SurrealDB 嵌入式模式）...");
     }
 
-    init_surreal()
+    aios_database::fast_model::utils::ensure_surreal_init()
         .await
         .context("初始化 SurrealDB 失败（需要读取 PDMS 输入数据）")?;
     println!("✅ 数据库连接成功");

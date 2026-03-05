@@ -757,10 +757,10 @@ pub async fn query_inst_relate_aabb_batch(
         let sql = format!(
             r#"
             SELECT
-                record::id(in) as refno,
-                record::id(out) as aabb_hash
-            FROM [{pe_list}]->inst_relate_aabb
-            WHERE out != NONE AND out.d != NONE
+                record::id(refno) as refno,
+                record::id(aabb_id) as aabb_hash
+            FROM inst_relate_aabb
+            WHERE refno IN [{pe_list}] AND aabb_id != NONE AND aabb_id.d != NONE
             "#
         );
 

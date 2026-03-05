@@ -219,9 +219,9 @@ async fn filter_refnos_with_inst_relate_aabb(refnos: &[RefnoEnum]) -> Vec<RefnoE
         .collect::<Vec<_>>()
         .join(",");
 
-    // inst_relate_aabb 是关系表：in=pe, out=aabb。这里只取存在记录的 in.id，
+    // inst_relate_aabb 为普通表（refno, aabb_id）。这里只取存在记录的 refno，
     // 避免后续 query_insts 反序列化 world_aabb = null。
-    let sql = format!("SELECT VALUE in.id FROM [{ids}]");
+    let sql = format!("SELECT VALUE refno FROM [{ids}]");
 
     let existing: Vec<RefnoEnum> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
     if existing.is_empty() {

@@ -208,7 +208,7 @@ async fn query_panel_geometries(panel_refnos: &[RefnoEnum]) -> Result<Vec<PanelG
                 WHERE id = type::record('pe_transform', record::id(in))
                 LIMIT 1
             )[0] as world_trans,
-            (SELECT out.d FROM in->inst_relate_aabb)[0] as world_aabb
+            type::record('inst_relate_aabb', record::id(in)).aabb_id.d as world_aabb
         FROM [{}]->inst_relate
         "#,
         pe_list

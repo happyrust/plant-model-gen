@@ -362,12 +362,12 @@ fn parse_inst_relate_aabb(value: &JsonValue) -> Option<Aabb> {
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 #[derive(Debug, Deserialize, SurrealValue)]
 struct QueryAabbRowRaw {
-    refno: RefnoEnum, // 表查询 in.id 返回 RecordId，RefnoEnum 可直接反序列化
+    refno: RefnoEnum, // inst_relate_aabb 普通表字段，RefnoEnum 可直接反序列化
     aabb: JsonValue,
 }
 
 /// 从 inst_relate_aabb 批量查询 refno -> Aabb 映射。
-/// 使用 pe->inst_relate_aabb 图遍历，避免 inst_relate_aabb 关系 id 格式差异。
+/// inst_relate_aabb 为普通表（refno, aabb_id），通过 refno 过滤。
 /// 同 refno 多条记录时取 union Aabb（merge）。
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub(crate) async fn query_aabb_from_inst_relate_aabb(
@@ -380,9 +380,8 @@ pub(crate) async fn query_aabb_from_inst_relate_aabb(
     let pe_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
     let ids = pe_keys.join(",");
 
-    // 图遍历 FROM [ids]->inst_relate_aabb 在此数据上返回 0 行（SurrealDB 语义差异），改用表查询
     let sql = format!(
-        "SELECT in.id as refno, out.d as aabb FROM inst_relate_aabb WHERE in INSIDE [{ids}] AND out.d != NONE"
+        "SELECT refno, aabb_id.d as aabb FROM inst_relate_aabb WHERE refno IN [{ids}] AND aabb_id.d != NONE"
     );
 
     let mut response = model_primary_db().query(&sql).await?;
@@ -474,10 +473,10 @@ async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
 
     loop {
         let sql = format!(
-            "SELECT in.id as refno, in.noun ?? '' as noun, out.d as aabb \
+            "SELECT refno, refno.noun ?? '' as noun, aabb_id.d as aabb \
              FROM inst_relate_aabb \
-             WHERE out.d != NONE \
-             ORDER BY in.id \
+             WHERE aabb_id.d != NONE \
+             ORDER BY refno \
              LIMIT {CHUNK_SIZE} START {offset}"
         );
         let mut response = model_primary_db().query(&sql).await?;

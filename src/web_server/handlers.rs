@@ -1734,7 +1734,6 @@ pub async fn sqlite_spatial_page() -> Result<Html<String>, StatusCode> {
 pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, StatusCode> {
     #[cfg(feature = "sqlite-index")]
     {
-        use crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos;
         // use crate::spatial_index::SqliteSpatialIndex;
         use aios_core::{RefU64, RefnoEnum, project_primary_db};
 
@@ -1796,13 +1795,7 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
                 .map(|id| RefnoEnum::Refno(RefU64(id)))
                 .collect();
 
-            // 批量计算并同步 AABB，内部会写回 Surreal 以及写入 SQLite 索引
-            if let Err(e) = update_inst_relate_aabbs_by_refnos(&refnos, true).await {
-                return Ok(Json(
-                    json!({"success": false, "error": format!("批量更新AABB失败: {}", e)}),
-                ));
-            }
-
+            // 注：update_inst_relate_aabbs_by_refnos 已移除，AABB 更新由 scene_node 等替代
             total_processed += refnos.len();
             offset += batch;
         }

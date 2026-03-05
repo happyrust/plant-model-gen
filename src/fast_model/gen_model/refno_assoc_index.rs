@@ -44,6 +44,7 @@ DEFINE FIELD IF NOT EXISTS ngmr_relate_ids ON TABLE refno_assoc_index TYPE array
 DEFINE FIELD IF NOT EXISTS inst_relate_bool_ids ON TABLE refno_assoc_index TYPE array<string>;
 DEFINE FIELD IF NOT EXISTS inst_relate_cata_bool_ids ON TABLE refno_assoc_index TYPE array<string>;
 DEFINE FIELD IF NOT EXISTS inst_relate_aabb_ids ON TABLE refno_assoc_index TYPE array<string>;
+DEFINE FIELD IF NOT EXISTS inst_relate_booled_aabb_ids ON TABLE refno_assoc_index TYPE array<string>;
 DEFINE FIELD IF NOT EXISTS updated_at ON TABLE refno_assoc_index TYPE datetime;
 DEFINE FIELD IF NOT EXISTS version ON TABLE refno_assoc_index TYPE int;
 DEFINE INDEX IF NOT EXISTS idx_refno_assoc_refno ON TABLE refno_assoc_index FIELDS refno UNIQUE;
@@ -64,6 +65,7 @@ pub struct RefnoAssocIndexEntry {
     pub inst_relate_bool_ids: BTreeSet<String>,
     pub inst_relate_cata_bool_ids: BTreeSet<String>,
     pub inst_relate_aabb_ids: BTreeSet<String>,
+    pub inst_relate_booled_aabb_ids: BTreeSet<String>,
 }
 
 impl RefnoAssocIndexEntry {
@@ -79,6 +81,7 @@ impl RefnoAssocIndexEntry {
                 inst_relate_bool_ids: {}, \
                 inst_relate_cata_bool_ids: {}, \
                 inst_relate_aabb_ids: {}, \
+                inst_relate_booled_aabb_ids: {}, \
                 updated_at: time::now(), \
                 version: 1 \
             }};",
@@ -92,6 +95,7 @@ impl RefnoAssocIndexEntry {
             array_to_sql_string(&self.inst_relate_bool_ids),
             array_to_sql_string(&self.inst_relate_cata_bool_ids),
             array_to_sql_string(&self.inst_relate_aabb_ids),
+            array_to_sql_string(&self.inst_relate_booled_aabb_ids),
         )
     }
 }
@@ -143,6 +147,10 @@ impl RefnoAssocIndexBatch {
 
     pub fn add_inst_relate_aabb_id(&mut self, refno: RefnoEnum, id: String) {
         self.entry_mut(refno).inst_relate_aabb_ids.insert(id);
+    }
+
+    pub fn add_inst_relate_booled_aabb_id(&mut self, refno: RefnoEnum, id: String) {
+        self.entry_mut(refno).inst_relate_booled_aabb_ids.insert(id);
     }
 
     fn to_upsert_sqls(&self) -> Vec<String> {

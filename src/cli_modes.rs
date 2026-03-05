@@ -2627,7 +2627,7 @@ async fn build_spatial_index_from_db(
     Ok(())
 }
 
-/// 从 inst_relate_aabb 关系表构建 AABB 空间索引
+/// 从 inst_relate_aabb 普通表构建 AABB 空间索引
 ///
 /// 与 `build_spatial_index_from_db`（读 pe.world_aabb）不同，
 /// 此函数读取 `gen_all_geos_data` 实际写入的 `inst_relate_aabb` + `aabb` 表，
@@ -2656,8 +2656,8 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
     let idx = SqliteAabbIndex::open(&idx_path)?;
     idx.init_schema()?;
 
-    // 从 inst_relate_aabb 查询所有记录，join aabb 表取坐标
-    let sql = r#"SELECT in AS refno, out.d AS aabb FROM inst_relate_aabb"#;
+    // 从 inst_relate_aabb 普通表查询所有记录，join aabb 表取坐标
+    let sql = r#"SELECT refno, aabb_id.d AS aabb FROM inst_relate_aabb"#;
     let records: Vec<serde_json::Value> = model_primary_db().query_take(sql, 0).await?;
 
     println!("   📊 查询到 {} 个 inst_relate_aabb 记录", records.len());

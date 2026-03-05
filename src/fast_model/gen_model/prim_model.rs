@@ -1,4 +1,5 @@
 use crate::fast_model::gen_model::is_e3d_debug_enabled;
+use crate::fast_model::gen_model::neg_query;
 use crate::fast_model::{SEND_INST_SIZE, shared};
 use crate::{consts::*, e3d_dbg};
 use crate::fast_model::query_compat::query_filter_deep_children_atts;
@@ -16,7 +17,6 @@ use std::mem::take;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
-// PrimInput 已随 model_cache 模块移除
 
 // ---------------------------------------------------------------------------
 // 公共工具函数
@@ -327,6 +327,38 @@ pub async fn gen_prim_geos(
                 i, start_idx, end_idx, batch_item_count
             );
 
+            // ── 批量预取：attmap + transform 并发，neg 走 TreeIndex ──
+            let batch_refnos: Vec<RefnoEnum> = all_refnos[start_idx..end_idx].to_vec();
+            {
+                let t_prefetch = Instant::now();
+                let attmap_futs: Vec<_> = batch_refnos.iter()
+                    .map(|&r| aios_core::get_named_attmap(r))
+                    .collect();
+                let transform_fut = crate::fast_model::gen_model::transform_cache::get_world_transforms_cache_first_batch(
+                    Some(db_option.as_ref()),
+                    &batch_refnos,
+                );
+                let _ = tokio::join!(
+                    futures::future::join_all(attmap_futs),
+                    transform_fut,
+                );
+                e3d_dbg!(
+                    "[gen_prim_geos] 批次 {} 预取 attmap+transform 完成: {} 个, 耗时 {} ms",
+                    i, batch_item_count, t_prefetch.elapsed().as_millis()
+                );
+            }
+
+            let neg_map = {
+                let tree_dir = db_option.get_project_output_dir().join("scene_tree");
+                neg_query::query_descendants_map_by_dbnum(
+                    &tree_dir,
+                    &batch_refnos,
+                    &GENRAL_NEG_NOUN_NAMES,
+                    false,
+                ).unwrap_or_default()
+            };
+
+            // ── 主循环：从缓存读取 ──
             let mut processed_in_batch = 0usize;
             let mut skipped_in_batch = 0usize;
             let mut sent_count = 0usize;
@@ -338,9 +370,8 @@ pub async fn gen_prim_geos(
                     *cnt -= 1;
                 }
 
-                // 1. 获取世界变换
                 let trans_result =
-                    crate::fast_model::transform_cache::get_world_transform_cache_first(
+                    crate::fast_model::gen_model::transform_cache::get_world_transform_cache_first(
                         Some(db_option.as_ref()),
                         refno,
                     )
@@ -353,7 +384,6 @@ pub async fn gen_prim_geos(
                     continue;
                 };
 
-                // 2. 获取属性
                 let attr = aios_core::get_named_attmap(refno).await.unwrap_or_default();
                 let visible = attr.is_visible_by_level(None).unwrap_or(true);
                 let (owner_refno, owner_type) = shared::get_owner_info_from_attr(&attr).await;
@@ -370,7 +400,6 @@ pub async fn gen_prim_geos(
                     ..Default::default()
                 };
 
-                // 3. 构建 CSG shape
                 let neg_limit_size: Option<f32> = if GENRAL_NEG_NOUN_NAMES.contains(&cur_type) {
                     Some(1000_000.0)
                 } else {
@@ -388,7 +417,6 @@ pub async fn gen_prim_geos(
                     continue;
                 };
 
-                // 4. 构建 inst_geo
                 let Some(inst_geo) = build_inst_geo_from_shape(
                     csg_shape, refno, visible, attr.is_neg(),
                 ) else {
@@ -396,17 +424,8 @@ pub async fn gen_prim_geos(
                     continue;
                 };
 
-                // 5. 查询负实体
-                let neg_refnos =
-                    crate::fast_model::query_provider::query_multi_descendants_with_self(
-                        &[refno],
-                        &GENRAL_NEG_NOUN_NAMES,
-                        false,
-                    )
-                    .await
-                    .unwrap_or_default();
+                let neg_refnos = neg_map.get(&refno).cloned().unwrap_or_default();
 
-                // 6. 插入结果
                 insert_prim_result(
                     &mut shape_insts_data,
                     geos_info,
@@ -416,7 +435,6 @@ pub async fn gen_prim_geos(
                 );
                 processed_in_batch += 1;
 
-                // 7. 按阈值发送
                 flush_if_needed(&mut shape_insts_data, &sender, i, &mut sent_count)?;
             }
 

@@ -7,7 +7,6 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinSet;
 
 static SURREAL_INIT: OnceCell<()> = OnceCell::const_new();
-static INST_RELATE_AABB_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 static INST_RELATE_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 
 /// 确保 SurrealDB 连接已初始化（幂等，仅首次真正执行 `init_surreal`）。
@@ -24,50 +23,6 @@ pub async fn ensure_surreal_init() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 确保 inst_relate_aabb 以"关系表"方式工作：in=pe，out=aabb，且 `in` 唯一。
-pub async fn ensure_inst_relate_aabb_relation_schema() {
-    INST_RELATE_AABB_SCHEMA_INIT
-        .get_or_init(|| async {
-            // 检查表是否已经是 RELATION 类型：尝试查询一条带 in/out 的记录。
-            // 如果 INFO FOR TABLE 返回的定义中包含 "RELATION"，说明已迁移过，跳过重建。
-            let already_relation = match model_primary_db()
-                .query("INFO FOR TABLE inst_relate_aabb;")
-                .await
-            {
-                Ok(mut resp) => {
-                    // INFO FOR TABLE 返回一个 object，检查其中是否包含 RELATION 标记
-                    match resp.take::<Option<serde_json::Value>>(0) {
-                        Ok(Some(val)) => {
-                            let s = val.to_string();
-                            s.contains("RELATION")
-                        }
-                        _ => false,
-                    }
-                }
-                Err(_) => false,
-            };
-
-            if !already_relation {
-                // 表不存在或不是 RELATION 类型，重建为 RELATION
-                let _ = model_primary_db().query("REMOVE TABLE inst_relate_aabb;").await;
-                let _ = model_primary_db()
-                    .query("DEFINE TABLE inst_relate_aabb TYPE RELATION;")
-                    .await;
-            }
-            let _ = model_primary_db()
-                .query("DEFINE FIELD in ON TABLE inst_relate_aabb TYPE record<pe>;")
-                .await;
-            let _ = model_primary_db()
-                .query("DEFINE FIELD out ON TABLE inst_relate_aabb TYPE record<aabb>;")
-                .await;
-            let _ = model_primary_db()
-                .query(
-                    "DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS in UNIQUE;",
-                )
-                .await;
-        })
-        .await;
-}
 
 /// 确保 inst_relate 以“关系表”方式工作：in=pe，out=inst_info。
 pub async fn ensure_inst_relate_relation_schema() {
@@ -189,28 +144,26 @@ pub async fn save_inst_relate_cata_bool(
     }
 }
 
-/// 批量保存实例 AABB 到独立表 inst_relate_aabb
-pub async fn save_inst_relate_aabb(
+/// 批量写入 inst_aabb_map 到指定的普通表（INSERT IGNORE）
+async fn batch_insert_aabb_table(
+    table: &str,
     inst_aabb_map: &DashMap<RefnoEnum, String>,
-    _source: &str,
 ) {
-    ensure_inst_relate_aabb_relation_schema().await;
-
     if inst_aabb_map.is_empty() {
         return;
     }
 
-    let keys = inst_aabb_map
+    let keys: Vec<RefnoEnum> = inst_aabb_map
         .iter()
         .map(|kv| kv.key().clone())
-        .collect::<Vec<_>>();
+        .collect();
 
     for chunk in keys.chunks(200) {
-        let mut relation_ids = Vec::new();
-        let mut relation_records = Vec::new();
+        let mut rows = Vec::with_capacity(chunk.len());
 
         for refno in chunk {
             let Some(aabb_hash) = inst_aabb_map.get(refno) else { continue };
+            let refno_str = refno.to_string();
             let refno_key = refno.to_pe_key();
             let aabb_key = {
                 let v = aabb_hash.value();
@@ -220,34 +173,16 @@ pub async fn save_inst_relate_aabb(
                     format!("aabb:⟨{}⟩", v)
                 }
             };
-
-            // 使用批量插入语法，指定 ID 为 refno，这样导出代码可以通过 inst_relate_aabb:refno 查询
-            let refno_str = refno.to_string();
-            let relation_id = format!("inst_relate_aabb:⟨{}⟩", refno_str);
-            relation_ids.push(relation_id.clone());
-            relation_records.push(format!(
-                "{{ id: {}, in: {}, out: {} }}",
-                relation_id, refno_key, aabb_key
+            rows.push(format!(
+                "{{ id: {table}:⟨{refno_str}⟩, refno: {refno_key}, aabb_id: {aabb_key} }}"
             ));
         }
 
-        if relation_records.is_empty() {
+        if rows.is_empty() {
             continue;
         }
 
-        // 先删除旧记录（通过 ID），再批量插入新记录
-        let mut sql = String::new();
-        // if !relation_ids.is_empty() {
-        //     sql.push_str(&format!(
-        //         "DELETE [{}];",
-        //         relation_ids.join(",")
-        //     ));
-        // }
-        sql.push_str(&format!(
-            "INSERT RELATION INTO inst_relate_aabb [{}];",
-            relation_records.join(",")
-        ));
-
+        let sql = format!("INSERT IGNORE INTO {table} [{}];", rows.join(","));
         if let Err(e) = model_primary_db().query_take::<surrealdb::types::Value>(&sql, 0).await {
             init_save_database_error(
                 &format!("{sql}\n-- err: {e}"),
@@ -255,6 +190,22 @@ pub async fn save_inst_relate_aabb(
             );
         }
     }
+}
+
+/// 批量保存实例 AABB 到普通表 inst_relate_aabb（原始几何 AABB）
+pub async fn save_inst_relate_aabb(
+    inst_aabb_map: &DashMap<RefnoEnum, String>,
+    _source: &str,
+) {
+    batch_insert_aabb_table("inst_relate_aabb", inst_aabb_map).await;
+}
+
+/// 批量保存布尔运算后的 AABB 到普通表 inst_relate_booled_aabb
+pub async fn save_inst_relate_booled_aabb(
+    inst_aabb_map: &DashMap<RefnoEnum, String>,
+    _source: &str,
+) {
+    batch_insert_aabb_table("inst_relate_booled_aabb", inst_aabb_map).await;
 }
 
 pub async fn save_pts_to_surreal(vec3_map: &DashMap<u64, String>) {

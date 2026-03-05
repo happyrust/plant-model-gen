@@ -564,7 +564,6 @@ async fn process_index_tree_generation(
     // 避免在 save_instance_data_optimize 的每个批次重复触发。
     if use_surrealdb && !defer_db_write {
         crate::fast_model::utils::ensure_inst_relate_relation_schema().await;
-        crate::fast_model::utils::ensure_inst_relate_aabb_relation_schema().await;
     }
 
     // 🧹 预处理清理：在生成前一次性删除目标 refnos 的旧模型记录，
@@ -814,6 +813,7 @@ async fn process_index_tree_generation(
                         writer,
                         &precomputed,
                         &mesh_results,
+                        &mesh_aabb_map,
                     ).await {
                         eprintln!("[defer_db_write] 写入 SQL 文件失败: {}", e);
                     }
@@ -831,9 +831,10 @@ async fn process_index_tree_generation(
                     }
                 };
                 let shape_insts_clone = shape_insts_arc.clone();
+                let aabb_map_clone = mesh_aabb_map.clone();
                 db_write_handles.push(tokio::spawn(async move {
                     let _permit_holder = permit; // 离开作用域时自动释放信号量
-                    if let Err(e) = save_instance_data_optimize(&shape_insts_clone, replace_exist, &mesh_results).await {
+                    if let Err(e) = save_instance_data_optimize(&shape_insts_clone, replace_exist, &mesh_results, &aabb_map_clone).await {
                         eprintln!("保存实例数据失败: {}", e);
                         return false;
                     }
@@ -1030,22 +1031,9 @@ async fn process_index_tree_generation(
                     );
                 } else {
                     println!(
-                        "[gen_model] IndexTree 模式 inst_relate_aabb 写入范围: refnos={}",
+                        "[gen_model] IndexTree 模式 inst_relate_aabb 写入已跳过（update_inst_relate_aabbs_by_refnos 已移除，由 scene_node 等替代），refnos={}",
                         aabb_refnos.len()
                     );
-                    if let Err(e) = crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
-                        &aabb_refnos,
-                        db_option.is_replace_mesh(),
-                    )
-                    .await
-                    {
-                        eprintln!("[gen_model] IndexTree 模式写入 inst_relate_aabb 失败: {}", e);
-                    } else {
-                        println!(
-                            "[gen_model] IndexTree 模式完成 inst_relate_aabb 写入，用时 {} ms",
-                            aabb_start.elapsed().as_millis()
-                        );
-                    }
                 }
             }
         }

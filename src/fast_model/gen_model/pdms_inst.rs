@@ -17,6 +17,8 @@ use rkyv::vec;
 use tokio::task::JoinHandle;
 use std::time::Duration;
 
+use parry3d::bounding_volume::{Aabb, BoundingVolume};
+
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::debug_model_debug;
 // model_store 已移除，使用 model_primary_db() 直接查询
@@ -470,6 +472,7 @@ pub async fn save_instance_data_optimize(
     inst_mgr: &ShapeInstancesData,
     replace_exist: bool,
     mesh_results: &HashMap<u64, MeshResult>,
+    mesh_aabb_map: &DashMap<String, Aabb>,
 ) -> anyhow::Result<()> {
     debug_model_debug!(
         "save_instance_data_optimize start: inst_info={}, inst_geo_keys={}, tubi_keys={}, replace_exist={}",
@@ -911,16 +914,34 @@ pub async fn save_instance_data_optimize(
             inst_info_buffer.clear();
         }
 
-        if let Some(aabb) = info.aabb {
-            let aabb_hash = gen_aabb_hash(&aabb);
+        let resolved_aabb: Option<(u64, Aabb)> = if let Some(aabb) = info.aabb {
+            Some((gen_aabb_hash(&aabb), aabb))
+        } else if let Some(geos_info) = inst_mgr.inst_geos_map.get(&info.get_inst_key()) {
+            let mut union_aabb: Option<Aabb> = None;
+            for inst in &geos_info.insts {
+                if let Some(mr) = mesh_results.get(&inst.geo_hash) {
+                    if let Some(h) = mr.aabb_hash {
+                        if let Some(aabb_ref) = mesh_aabb_map.get(&h.to_string()) {
+                            union_aabb = Some(match union_aabb {
+                                Some(existing) => existing.merged(&*aabb_ref),
+                                None => *aabb_ref,
+                            });
+                        }
+                    }
+                }
+            }
+            union_aabb.map(|aabb| (gen_aabb_hash(&aabb), aabb))
+        } else {
+            None
+        };
+
+        if let Some((aabb_hash, aabb)) = resolved_aabb {
             if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
                 entry.insert(serde_json::to_string(&aabb)?);
             }
 
-            // inst_relate_aabb 为关系表：in=pe, out=aabb（只存关系，不存其他字段）
-            // 使用批量 DELETE + INSERT RELATION 做幂等更新
             let aabb_row_sql = format!(
-                "{{id: {0}, in: {1}, out: aabb:⟨{2}⟩}}",
+                "{{id: {0}, refno: {1}, aabb_id: aabb:⟨{2}⟩}}",
                 key.to_table_key("inst_relate_aabb"),
                 key.to_pe_key(),
                 aabb_hash
@@ -955,7 +976,7 @@ pub async fn save_instance_data_optimize(
             inst_relate_batcher.push(statement).await?;
             inst_relate_buffer.clear();
 
-            // 延后处理 inst_relate_aabb（必须在 aabb UPSERT 之后写关系，避免 out 侧空记录 d=NONE）
+            // 延后处理 inst_relate_aabb（必须在 aabb UPSERT 之后写，避免 aabb_id 侧空记录 d=NONE）
             if !inst_relate_aabb_buffer.is_empty() {
                 inst_relate_aabb_chunks.push((
                     std::mem::take(&mut inst_relate_aabb_buffer),
@@ -977,9 +998,9 @@ pub async fn save_instance_data_optimize(
         );
     }
 
-    // 注意：inst_relate_aabb(out) 指向 aabb 表的记录。
-    // 若先写关系再写 aabb 内容，SurrealDB 可能会"隐式创建"空的 aabb 记录（d = NONE）。
-    // 这里把 inst_relate_aabb 的写入延后到 aabb UPSERT 之后，保证 out 侧不会出现空记录。
+    // 注意：inst_relate_aabb.aabb_id 指向 aabb 表的记录。
+    // 若先写 inst_relate_aabb 再写 aabb 内容，SurrealDB 可能会"隐式创建"空的 aabb 记录（d = NONE）。
+    // 这里把 inst_relate_aabb 的写入延后到 aabb UPSERT 之后，保证 aabb_id 侧不会出现空记录。
 
     // inst_tubi_map 不再创建 inst_relate（tubing 使用专门的 tubi_relate 表）
     // world_transform 已提前写入 pe_transform，这里仅收集 aabb 数据用于 tubi_relate
@@ -1052,7 +1073,7 @@ pub async fn save_instance_data_optimize(
         aabb_batcher.finish().await?;
     }
 
-    // inst_relate_aabb（关系表：in=pe, out=aabb），按历史约定延后到 aabb 写入之后执行
+    // inst_relate_aabb（普通表：refno=pe, aabb_id=aabb），按历史约定延后到 aabb 写入之后执行
     if !inst_relate_aabb_chunks.is_empty() || !inst_relate_aabb_buffer.is_empty() {
         let mut inst_aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
 
@@ -1065,7 +1086,7 @@ pub async fn save_instance_data_optimize(
                     for idx in (0..n).step_by(CHUNK_SIZE) {
                         let end = (idx + CHUNK_SIZE).min(n);
                         let insert_stmt = format!(
-                            "INSERT RELATION INTO inst_relate_aabb [{}];",
+                            "INSERT IGNORE INTO inst_relate_aabb [{}];",
                             ($rows)[idx..end].join(",")
                         );
                         inst_aabb_batcher.push(insert_stmt).await?;
@@ -1264,7 +1285,7 @@ impl TransactionBatcher {
                                 "⚠️ [DEBUG] 检测到 inst_relate_aabb 唯一索引冲突，尝试重建索引并重试..."
                             );
                             let repair_sql = "REMOVE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb; \
-DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS in UNIQUE;";
+DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS refno UNIQUE;";
                             let _ = model_query_response(repair_sql).await;
                             continue;
                         }
@@ -1718,6 +1739,7 @@ pub async fn save_instance_data_to_sql_file(
     writer: &SqlFileWriter,
     precomputed: &InstRelatePrecomputed,
     mesh_results: &HashMap<u64, MeshResult>,
+    mesh_aabb_map: &DashMap<String, Aabb>,
 ) -> anyhow::Result<()> {
     const CHUNK_SIZE: usize = 200;
     let regen_delete_mode = get_db_option_ext().regen_delete_mode;
@@ -2043,13 +2065,33 @@ pub async fn save_instance_data_to_sql_file(
             inst_info_buffer.clear();
         }
 
-        if let Some(aabb) = info.aabb {
-            let aabb_hash = gen_aabb_hash(&aabb);
+        let resolved_aabb: Option<(u64, Aabb)> = if let Some(aabb) = info.aabb {
+            Some((gen_aabb_hash(&aabb), aabb))
+        } else if let Some(geos_info) = inst_mgr.inst_geos_map.get(&info.get_inst_key()) {
+            let mut union_aabb: Option<Aabb> = None;
+            for inst in &geos_info.insts {
+                if let Some(mr) = mesh_results.get(&inst.geo_hash) {
+                    if let Some(h) = mr.aabb_hash {
+                        if let Some(aabb_ref) = mesh_aabb_map.get(&h.to_string()) {
+                            union_aabb = Some(match union_aabb {
+                                Some(existing) => existing.merged(&*aabb_ref),
+                                None => *aabb_ref,
+                            });
+                        }
+                    }
+                }
+            }
+            union_aabb.map(|aabb| (gen_aabb_hash(&aabb), aabb))
+        } else {
+            None
+        };
+
+        if let Some((aabb_hash, aabb)) = resolved_aabb {
             if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
                 entry.insert(serde_json::to_string(&aabb)?);
             }
             inst_relate_aabb_buffer.push(format!(
-                "{{id: {0}, in: {1}, out: aabb:⟨{2}⟩}}",
+                "{{id: {0}, refno: {1}, aabb_id: aabb:⟨{2}⟩}}",
                 key.to_table_key("inst_relate_aabb"),
                 key.to_pe_key(),
                 aabb_hash
@@ -2128,11 +2170,11 @@ pub async fn save_instance_data_to_sql_file(
 
     // inst_relate_aabb
     if !inst_relate_aabb_buffer.is_empty() {
-        // 用户要求不做删除：改为仅写入 INSERT RELATION IGNORE，
+        // 用户要求不做删除：改为仅写入 INSERT IGNORE，
         // 由唯一键/幂等语义保证重复导入可安全跳过。
         for chunk in inst_relate_aabb_buffer.chunks(CHUNK_SIZE) {
             writer.write_statement(&format!(
-                "INSERT RELATION IGNORE INTO inst_relate_aabb [{}]",
+                "INSERT IGNORE INTO inst_relate_aabb [{}]",
                 chunk.join(",")
             ))?;
         }

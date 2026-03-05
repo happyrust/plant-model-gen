@@ -108,7 +108,6 @@ pub use resolve::*;
 pub use mesh_generate::{
     booleans_meshes_in_db, gen_inst_meshes, gen_meshes_in_db, process_meshes_update_db,
     process_meshes_update_db_deep, process_meshes_update_db_deep_default,
-    process_meshes_bran, update_inst_relate_aabbs_by_refnos,
-    run_mesh_worker,
+    process_meshes_bran, run_mesh_worker,
 };
 

@@ -200,19 +200,6 @@ async fn run_import_and_post_process(
         }
     }
 
-    // Phase 2 Step 5: update aabb
-    println!("[import-sql] Phase 2.5: 更新 inst_relate_aabb...");
-    if !refnos.is_empty() {
-        if let Err(e) = aios_database::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
-            &refnos,
-            db_option_ext.is_replace_mesh(),
-        )
-        .await
-        {
-            eprintln!("[import-sql] 更新 inst_relate_aabb 失败: {}", e);
-        }
-    }
-
     println!("✅ import-sql 全部完成");
     Ok(())
 }

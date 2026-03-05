@@ -31,11 +31,9 @@ use crate::fast_model::query_compat::{query_deep_neg_inst_refnos, query_deep_vis
 use aios_core::{get_db_option, init_test_surreal};
 // 导入几何查询相关的结构体和方法
 use aios_core::{
-    CataNegGroup, GeoAabbTrans, GeoParam, GmGeoData, ManiGeoTransQuery, NegInfo, ParamNegInfo,
-    QueryAabbParam, QueryGeoParam, query_aabb_params, query_geo_params, query_inst_geo_ids,
+    CataNegGroup, GeoParam, GmGeoData, ManiGeoTransQuery, NegInfo, ParamNegInfo, QueryGeoParam,
+    query_geo_params, query_inst_geo_ids,
 };
-// 重新导出 aios_core 中的 AABB 更新函数
-pub use aios_core::update_inst_relate_aabbs_by_refnos;
 // 使用 aios_core 中查询方法的宏
 use aios_core::query_db;
 use anyhow::anyhow;
@@ -475,14 +473,6 @@ pub async fn gen_meshes_in_db(
             .unwrap();
         // println!(
         //     "gen_inst_meshes finished: {} ms",
-        //     time.elapsed().as_millis()
-        // );
-        // let time = std::time::Instant::now();
-        update_inst_relate_aabbs_by_refnos(chunk, replace_exist)
-            .await
-            .unwrap();
-        // println!(
-        //     "update_inst_relate_aabbs finished: {} ms",
         //     time.elapsed().as_millis()
         // );
     }
@@ -1204,14 +1194,6 @@ pub async fn process_meshes_update_db(
         "gen_inst_meshes finished: {} ms",
         time.elapsed().as_millis()
     );
-    let time = std::time::Instant::now();
-    update_inst_relate_aabbs_by_refnos(&refnos, replace_exist)
-        .await
-        .unwrap();
-    println!(
-        "update_inst_relate_aabbs finished: {} ms",
-        time.elapsed().as_millis()
-    );
 
     apply_cata_neg_boolean_manifold(&refnos, replace_exist).await?;
     apply_insts_boolean_manifold(&refnos, replace_exist).await?;
@@ -1268,15 +1250,6 @@ pub async fn process_meshes_bran(
     .await?;
     println!(
         "[BRAN] gen_inst_meshes finished: {} ms",
-        time.elapsed().as_millis()
-    );
-
-    let time = std::time::Instant::now();
-    update_inst_relate_aabbs_by_refnos(&refnos, replace_exist)
-        .await
-        .unwrap();
-    println!(
-        "[BRAN] update_inst_relate_aabbs finished: {} ms",
         time.elapsed().as_millis()
     );
 
@@ -1374,22 +1347,6 @@ pub async fn process_meshes_update_db_deep(
                     debug_model!(
                         "  ✅ gen_inst_meshes 完成: {} ms",
                         mesh_time.elapsed().as_millis()
-                    );
-
-                    let aabb_time = std::time::Instant::now();
-                    // 更新aabb 到inst relate，geo relate
-                    update_inst_relate_aabbs_by_refnos(&update_refnos, replace_exist)
-                        .await
-                        .map_err(|e| {
-                            eprintln!(
-                                "❌ update_inst_relate_aabbs_by_refnos 失败 (refno: {}): {}",
-                                refno, e
-                            );
-                            anyhow::anyhow!("更新 AABB 失败 for refno {}: {}", refno, e)
-                        })?;
-                    debug_model!(
-                        "  ✅ update_inst_relate_aabbs 完成: {} ms",
-                        aabb_time.elapsed().as_millis()
                     );
                 }
 
@@ -2001,7 +1958,7 @@ async fn filter_missing_inst_aabb(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<Re
     }
 
     let sql = format!(
-        "SELECT value in FROM [{}]->inst_relate_aabb",
+        "SELECT VALUE refno FROM inst_relate_aabb WHERE refno IN [{}]",
         pe_keys.join(",")
     );
 
@@ -2048,7 +2005,8 @@ pub async fn filter_missing_scene_node(refnos: &[RefnoEnum]) -> anyhow::Result<V
 
 /// 使用 scene_tree 更新 AABB 数据
 ///
-/// 替代 `update_inst_relate_aabbs_by_refnos`，写入 scene_node 表
+/// 替代 `update_inst_relate_aabbs_by_refnos`，写入 scene_node 表。
+/// 注：依赖的 `query_aabb_params` 已从 rs-core 移除，当前返回错误。
 #[cfg(feature = "gen_model")]
 pub async fn update_scene_node_aabbs_by_refnos(
     refnos: &[RefnoEnum],
@@ -2057,63 +2015,9 @@ pub async fn update_scene_node_aabbs_by_refnos(
     if refnos.is_empty() {
         return Ok(());
     }
-
-    const CHUNK: usize = 100;
-
-    #[derive(serde::Deserialize)]
-    struct InstAabbRow {
-        #[serde(rename = "in")]
-        refno: String,
-        aabb: String,
-    }
-
-    let inst_aabb_map = DashMap::new();
-
-    for chunk in refnos.chunks(CHUNK) {
-        if chunk.is_empty() {
-            continue;
-        }
-
-        // 获取 inst_relate.aabb 数据
-        let inst_keys = get_inst_relate_keys(chunk);
-        let result = query_aabb_params(&inst_keys, true).await?;
-
-        for r in result {
-            // 过滤 world_trans 为 None 的记录
-            let Some(world_trans) = r.world_trans else { continue };
-
-            // 计算合并后的 AABB
-            let mut aabb = Aabb::new_invalid();
-            for g in &r.geo_aabbs {
-                let t = world_trans * &g.trans;
-                let tmp_aabb = g.aabb.scaled(&t.scale.into());
-                let tmp_aabb = tmp_aabb.transform_by(&Isometry {
-                    rotation: t.rotation.into(),
-                    translation: t.translation.into(),
-                });
-                aabb.merge(&tmp_aabb);
-            }
-
-            // 过滤无效 AABB
-            let extent = aabb.extents().magnitude();
-            if extent.is_nan() || extent.is_infinite() {
-                continue;
-            }
-
-            let aabb_hash = gen_aabb_hash(&aabb);
-            inst_aabb_map.insert(r.refno, aabb_hash.to_string());
-        }
-    }
-
-    // 使用 scene_tree 模块更新
-    crate::scene_tree::update_scene_node_aabb(&inst_aabb_map).await?;
-
-    println!(
-        "[scene_tree] 更新 {} 个节点的 AABB",
-        inst_aabb_map.len()
-    );
-
-    Ok(())
+    anyhow::bail!(
+        "update_scene_node_aabbs_by_refnos 暂不可用：query_aabb_params 已从 rs-core 移除"
+    )
 }
 
 #[cfg(test)]

@@ -75,6 +75,23 @@ pub async fn gen_loop_geos(
             if is_e3d_debug_enabled() {
                 println!("当前范围: {start_idx} ~ {end_idx}");
             }
+
+            // ── 批量预取：attmap + transform 并发 ──
+            {
+                let batch_refnos: Vec<RefnoEnum> = all_loop_owner_refnos[start_idx..end_idx].to_vec();
+                let attmap_futs: Vec<_> = batch_refnos.iter()
+                    .map(|&r| aios_core::get_named_attmap(r))
+                    .collect();
+                let transform_fut = crate::fast_model::gen_model::transform_cache::get_world_transforms_cache_first_batch(
+                    Some(db_option.as_ref()),
+                    &batch_refnos,
+                );
+                let _ = tokio::join!(
+                    futures::future::join_all(attmap_futs),
+                    transform_fut,
+                );
+            }
+
             let mut shape_insts_data = ShapeInstancesData::default();
             for j in start_idx..end_idx {
                 let target_refno = all_loop_owner_refnos[j];
@@ -83,7 +100,7 @@ pub async fn gen_loop_geos(
                     .unwrap_or_default();
                 let target_type = target_att.get_type_str();
                 let Ok(Some(mut trans_origin)) =
-                    crate::fast_model::transform_cache::get_world_transform_cache_first(
+                    crate::fast_model::gen_model::transform_cache::get_world_transform_cache_first(
                         Some(db_option.as_ref()),
                         target_refno,
                     )

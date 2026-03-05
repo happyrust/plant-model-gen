@@ -618,20 +618,6 @@ pub async fn api_stream_generate(
                                                 );
                                             }
 
-                                            // 布尔查询/任务要求 inst_relate_aabb 存在（否则会被过滤为 0）
-                                            // 这里先补齐 AABB，再做布尔，保证能产出 inst_relate_bool
-                                            if let Err(e) = crate::fast_model::mesh_generate::update_inst_relate_aabbs_by_refnos(
-                                                &batch_all,
-                                                replace_exist,
-                                            )
-                                            .await
-                                            {
-                                                warn!(
-                                                    "[StreamGenerate] 批次 {} 更新 AABB 失败(继续推进): {}",
-                                                    batch_index, e
-                                                );
-                                            }
-
                                             if let Err(e) =
                                                 crate::fast_model::mesh_generate::booleans_meshes_in_db(
                                                     Some(std::sync::Arc::new(db_option.clone())),

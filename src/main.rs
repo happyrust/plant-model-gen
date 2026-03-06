@@ -65,6 +65,38 @@ fn build_export_config(
     }
 }
 
+#[cfg(not(feature = "gui"))]
+fn should_exit_after_debug_model_generation(
+    debug_model_requested: bool,
+    follow_up_export_requested: bool,
+    grpc_server_requested: bool,
+) -> bool {
+    debug_model_requested && !follow_up_export_requested && !grpc_server_requested
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pure_debug_model_should_exit_early() {
+        assert!(super::should_exit_after_debug_model_generation(
+            true, false, false
+        ));
+    }
+
+    #[test]
+    fn debug_model_with_follow_up_work_should_not_exit_early() {
+        assert!(!super::should_exit_after_debug_model_generation(
+            true, true, false
+        ));
+        assert!(!super::should_exit_after_debug_model_generation(
+            true, false, true
+        ));
+        assert!(!super::should_exit_after_debug_model_generation(
+            false, false, false
+        ));
+    }
+}
+
 /// 模型生成完成后同步缓存数据到 SurrealDB 的辅助函数
 ///
 /// `debug_model_refnos`: 当指定时，仅同步这些 refno 的子孙节点数据（避免同步整个 cache）。
@@ -1282,6 +1314,8 @@ async fn main() -> anyhow::Result<()> {
         || matches.contains_id("export-glb-refnos")
         || matches.contains_id("export-gltf-refnos")
         || (debug_model_requested && capture_dir.is_some());
+    let follow_up_export_requested =
+        model_export_requested || matches.get_flag("export-parquet-after-gen");
     let any_export_requested = model_export_requested
         || matches.get_flag("export-all-parquet")
         || matches.get_flag("export-all-relates")
@@ -1360,6 +1394,15 @@ async fn main() -> anyhow::Result<()> {
         } else {
             // --debug-model: 增量生成（不清理、不强制 FORCE_REPLACE_MESH）
             let _gen_result = cli_modes::run_generate_model(&gen_config, &db_option_ext).await?;
+
+            if should_exit_after_debug_model_generation(
+                debug_model_requested,
+                follow_up_export_requested,
+                matches.get_flag("grpc-server"),
+            ) {
+                println!("✅ --debug-model 单独执行完成（未请求后续导出/服务启动，流程到此结束）");
+                return Ok(());
+            }
         }
     }
 

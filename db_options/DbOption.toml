@@ -240,6 +240,14 @@ workflow_delete_path = "/api/workflow/delete"
 auth_secret = "shared-review-secret"
 timeout_seconds = 15
 
+# ====== 校审接口认证配置 ======
+# 本地/联调阶段可临时关闭 JWT 校验；上线前请改回 enabled = true
+[review_auth]
+enabled = false
+debug_project_id = "debug-project"
+debug_user_id = "debug-user"
+debug_role = "sj"
+
 # ====== Web Server 配置 ======
 [web_server]
 port = 8080

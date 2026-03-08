@@ -603,6 +603,14 @@ pub async fn gen_index_tree_geos_optimized(
             print_final_summary(total_duration, loop_dur, cate_dur, prim_dur, bran_duration);
     }
 
+    // ============================================================================
+    // 🚩 [补充录入] 确保 BRAN/HANG 阶段生成的子管件进入后续的导出与构建流水线
+    // ============================================================================
+    for r in &bran_generated_refnos {
+        // BRAN 的管件子代统一视为 Cate (元件) 类型
+        categorized.insert(*r, super::models::NounCategory::Cate);
+    }
+
     categorized.print_statistics();
     Ok(categorized)
 }

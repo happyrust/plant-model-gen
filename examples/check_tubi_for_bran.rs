@@ -17,9 +17,8 @@ async fn main() -> anyhow::Result<()> {
     println!("✓ SurrealDB 连接成功\n");
 
     // 1. 查询 tubi_relate 记录数
-    let sql = format!(
-        "SELECT count() as cnt FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..] GROUP ALL;"
-    );
+    let sql =
+        format!("SELECT count() as cnt FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..] GROUP ALL;");
     let rows: Vec<serde_json::Value> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
     println!("tubi_relate 查询结果: {:?}", rows);
 
@@ -36,16 +35,21 @@ async fn main() -> anyhow::Result<()> {
         FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
         "#
     );
-    let detail_rows: Vec<serde_json::Value> = SUL_DB.query_take(&detail_sql, 0).await.unwrap_or_default();
+    let detail_rows: Vec<serde_json::Value> =
+        SUL_DB.query_take(&detail_sql, 0).await.unwrap_or_default();
     println!("\ntubi_relate 段数: {}", detail_rows.len());
 
     if detail_rows.is_empty() {
         println!("\n⚠️  该 BRAN 无 tubi_relate 数据，需要先执行模型生成：");
-        println!("   cargo run --bin aios-database -- --debug-model {} --regen-model", target);
+        println!(
+            "   cargo run --bin aios-database -- --debug-model {} --regen-model",
+            target
+        );
     } else {
         println!("\n✅ 该 BRAN 已有 tubi_relate 数据，各段详情：");
         for (i, row) in detail_rows.iter().enumerate() {
-            println!("  [{}] leave={}, arrive={}, index={}, start_pt={}, end_pt={}",
+            println!(
+                "  [{}] leave={}, arrive={}, index={}, start_pt={}, end_pt={}",
                 i,
                 row.get("leave_refno").unwrap_or(&serde_json::Value::Null),
                 row.get("arrive_refno").unwrap_or(&serde_json::Value::Null),
@@ -57,13 +61,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 3. 检查 pe 表中该 refno 的 noun
-    let pe_sql = format!(
-        "SELECT id, noun FROM {} LIMIT 1;",
-        pe_key
-    );
+    let pe_sql = format!("SELECT id, noun FROM {} LIMIT 1;", pe_key);
     let pe_rows: Vec<serde_json::Value> = SUL_DB.query_take(&pe_sql, 0).await.unwrap_or_default();
     if let Some(row) = pe_rows.first() {
-        println!("\npe 表记录: noun={}", row.get("noun").unwrap_or(&serde_json::Value::Null));
+        println!(
+            "\npe 表记录: noun={}",
+            row.get("noun").unwrap_or(&serde_json::Value::Null)
+        );
     } else {
         println!("\n⚠️  pe 表中未找到 {} 的记录", pe_key);
     }

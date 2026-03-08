@@ -560,26 +560,6 @@ async fn process_index_tree_generation(
     let use_surrealdb = db_option.use_surrealdb;
     let defer_db_write = db_option.defer_db_write;
 
-    // 迁移/修复关系表 schema 只需要在生成流程入口执行一次，
-    // 避免在 save_instance_data_optimize 的每个批次重复触发。
-    if use_surrealdb && !defer_db_write {
-        crate::fast_model::utils::ensure_inst_relate_relation_schema().await;
-    }
-
-    // 🧹 预处理清理：在生成前一次性删除目标 refnos 的旧模型记录，
-    // 避免生成过程中 DELETE + INSERT IGNORE 与 mesh worker 的竞态条件。
-    // defer_db_write 模式下也需要清理：DELETE 直接写 DB，新 INSERT 走 deferred .surql 文件
-    if replace_exist && use_surrealdb {
-        if let Some(ref roots) = seed_roots {
-            if !roots.is_empty() {
-                perf.mark("pre_cleanup_for_regen");
-                if let Err(e) = super::pdms_inst::pre_cleanup_for_regen(roots).await {
-                    eprintln!("[gen_model] ⚠️ pre_cleanup_for_regen 失败（继续生成）: {}", e);
-                }
-            }
-        }
-    }
-
     // defer_db_write 模式：初始化 SqlFileWriter
     let sql_file_writer: Option<Arc<super::sql_file_writer::SqlFileWriter>> = if defer_db_write {
         let output_dir = db_option.get_project_output_dir();
@@ -735,6 +715,7 @@ async fn process_index_tree_generation(
                 break;
             };
             let shape_insts_arc = std::sync::Arc::new(shape_insts);
+            let batch_start = Instant::now();
 
             #[cfg(feature = "profile")]
             let _enter = sink_span.enter();
@@ -769,7 +750,7 @@ async fn process_index_tree_generation(
             }
 
             // Mesh 内联生成：先生成 mesh，再将结果合并到 inst_geo INSERT 中
-            let mesh_results: HashMap<u64, MeshResult> = if gen_mesh {
+            let (mesh_results, batch_mesh_ms): (HashMap<u64, MeshResult>, u128) = if gen_mesh {
                 let tasks = extract_mesh_tasks(&shape_insts_arc);
                 if !tasks.is_empty() {
                     let t0 = Instant::now();
@@ -777,14 +758,15 @@ async fn process_index_tree_generation(
                         &tasks, &db_option_inner, &mut mesh_deduper,
                         &mesh_aabb_map, &mesh_pts_map,
                     ).await;
+                    let elapsed = t0.elapsed();
                     mesh_total += results.len();
-                    t_mesh += t0.elapsed();
-                    results
+                    t_mesh += elapsed;
+                    (results, elapsed.as_millis())
                 } else {
-                    HashMap::new()
+                    (HashMap::new(), 0)
                 }
             } else {
-                HashMap::new()
+                (HashMap::new(), 0)
             };
 
             // 布尔任务跨批次汇总：统一在 insert_handle 结束后一次性抽取，避免漏任务。
@@ -793,7 +775,7 @@ async fn process_index_tree_generation(
             // SurrealDB 写入放到后台，不阻塞 cache 写入和后续 batch 接收
             // 采用 Semaphore 限流，防止瞬发海量并发协程打垮数据库导致事务冲突风暴
             // 此处在 spawn 外侧 acquire，当达到并发上限时直接施加回压（Backpressure），阻塞 recv 接收
-            if defer_db_write {
+            let batch_save_ms: u128 = if defer_db_write {
                 // defer_db_write 模式：SQL 写入文件，不写 SurrealDB
                 if let Some(ref writer) = sql_writer_clone {
                     let t0 = Instant::now();
@@ -811,7 +793,11 @@ async fn process_index_tree_generation(
                     ).await {
                         eprintln!("[defer_db_write] 写入 SQL 文件失败: {}", e);
                     }
-                    t_save_db += t0.elapsed();
+                    let elapsed = t0.elapsed();
+                    t_save_db += elapsed;
+                    elapsed.as_millis()
+                } else {
+                    0
                 }
             } else if use_surrealdb {
                 let t0 = Instant::now();
@@ -834,7 +820,27 @@ async fn process_index_tree_generation(
                     }
                     true
                 }));
-                t_save_db += t0.elapsed();
+                let elapsed = t0.elapsed();
+                t_save_db += elapsed;
+                elapsed.as_millis()
+            } else {
+                0
+            };
+
+            // 每批次耗时日志：便于定位最慢的 batch（AIOS_LOG_BATCH_PERF=1 启用）
+            if std::env::var("AIOS_LOG_BATCH_PERF").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(true) {
+                let refno_count = shape_insts_arc.inst_info_map.len() + shape_insts_arc.inst_tubi_map.len();
+                let inst_geo_count = shape_insts_arc.inst_geos_map.len();
+                let batch_total_ms = batch_start.elapsed().as_millis();
+                let sample: String = shape_insts_arc.inst_info_map.keys()
+                    .take(3)
+                    .map(|r| r.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "[batch_perf] batch={} refnos={} inst_geos={} mesh_ms={} save_ms={} total_ms={} sample=[{}]",
+                    batch_cnt, refno_count, inst_geo_count, batch_mesh_ms, batch_save_ms, batch_total_ms, sample
+                );
             }
         }
 

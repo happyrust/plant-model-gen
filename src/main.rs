@@ -205,8 +205,10 @@ async fn run_import_and_post_process(
 
     use aios_core::SurrealQueryExt;
     let sql = "SELECT value in FROM inst_relate;";
-    let refnos: Vec<aios_core::RefnoEnum> =
-        aios_core::project_primary_db().query_take(sql, 0).await.unwrap_or_default();
+    let refnos: Vec<aios_core::RefnoEnum> = aios_core::project_primary_db()
+        .query_take(sql, 0)
+        .await
+        .unwrap_or_default();
 
     // Phase 2 Step 3: reconcile_missing_neg_relate
     println!("[import-sql] Phase 2.3: reconcile_missing_neg_relate...");
@@ -254,9 +256,9 @@ async fn post_export_steps(
     )
     .await?;
 
-    // 2. export-dbnum-instances-parquet / export-dbnum-instances-json
-    let want_parquet = matches.get_flag("export-dbnum-instances-parquet")
-        || matches.get_flag("export-dbnum-instances");
+    // 2. export-parquet / export-dbnum-instances-json
+    let want_parquet =
+        matches.get_flag("export-parquet") || matches.get_flag("export-dbnum-instances");
     let want_json = matches.get_flag("export-dbnum-instances-json");
 
     if !want_parquet && !want_json {
@@ -293,22 +295,16 @@ async fn post_export_steps(
 
     #[cfg(feature = "parquet-export")]
     if want_parquet {
-        let fill_missing_cache = matches.get_flag("fill-missing-cache");
         println!(
-            "\n📦 后置步骤：从 cache 导出 dbnum={} 实例数据为 Parquet",
+            "\n📦 后置步骤：从 SurrealDB 导出 dbnum={} 实例数据为 Parquet",
             dbnum
         );
-        if fill_missing_cache {
-            println!("   - 导出前策略: 自动补齐缺失 refno");
-        } else {
-            println!("   - 导出前策略: 仅导出已生成 cache（默认）");
-        }
-        crate::cli_modes::export_dbnum_instances_parquet_from_cache_mode(
+        crate::cli_modes::export_dbnum_instances_parquet_mode(
             dbnum,
             verbose,
             output_override.clone(),
             db_option_ext,
-            fill_missing_cache,
+            root_refno,
         )
         .await?;
     }
@@ -369,7 +365,7 @@ async fn main() -> anyhow::Result<()> {
     // 默认不重定向；-v/--verbose 始终保留控制台输出；AIOS_REDIRECT_STDIO=1 可启用重定向到 logs/。
     maybe_redirect_stdio_to_log_file();
 
-    let matches = Command::new("aios-database")
+    let matches = aios_database::cli_args::add_export_instance_args(Command::new("aios-database")
         .version("0.1.3")
         .about("AIOS Database Processing Tool")
         .arg(
@@ -407,10 +403,20 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("debug-model")
                 .long("debug-model")
-                .help("Enable debug model output. Can optionally specify reference numbers (comma-separated)")
+                .help("Enable debug model output with verbose debug logging. Can optionally specify reference numbers (comma-separated)")
                 .value_name("REFNOS")
                 .value_delimiter(',')
-                .num_args(0..),
+                .num_args(0..)
+                .conflicts_with("root-model"),
+        )
+        .arg(
+            Arg::new("root-model")
+                .long("root-model")
+                .help("Incremental model generation for specified refnos WITHOUT debug logging (quieter alternative to --debug-model)")
+                .value_name("REFNOS")
+                .value_delimiter(',')
+                .num_args(0..)
+                .conflicts_with("debug-model"),
         )
         .arg(
             Arg::new("debug-model-errors-only")
@@ -730,64 +736,7 @@ async fn main() -> anyhow::Result<()> {
                 .long("export-all-parquet")
                 .help("Export all inst_relate entities in Prepack LOD format with additional Parquet manifests (instances.parquet + geometry_manifest.parquet)")
                 .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("export-dbnum-instances-json")
-                .long("export-dbnum-instances-json")
-                .help("Export dbnum instances as JSON (default: SurrealDB + compact format)")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("from-cache")
-                .long("from-cache")
-                .help("Use model cache instead of SurrealDB for export")
-                .action(clap::ArgAction::SetTrue)
-                .requires("export-dbnum-instances-json"),
-        )
-        .arg(
-            Arg::new("detailed")
-                .long("detailed")
-                .help("Export detailed JSON format with all fields (default: compact)")
-                .action(clap::ArgAction::SetTrue)
-                .requires("export-dbnum-instances-json"),
-        )
-        .arg(
-            Arg::new("export-dbnum-instances-parquet")
-                .long("export-dbnum-instances-parquet")
-                .help("Export dbnum instances as multi-table Parquet (instances/geo_instances/tubings/transforms/aabb) for DuckDB querying")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("fill-missing-cache")
-                .long("fill-missing-cache")
-                .help("When exporting dbnum parquet from cache, auto-generate missing refnos before export (default: disabled)")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("from-surrealdb")
-                .long("from-surrealdb")
-                .help("Use SurrealDB as data source for parquet export (default: true)")
-                .default_value("true")
-                .value_parser(clap::value_parser!(bool)),
-        )
-        .arg(
-            Arg::new("export-pdms-tree-parquet")
-                .long("export-pdms-tree-parquet")
-                .help("Export PDMS TreeIndex + pe.name as Parquet (pdms_tree_{dbnum}.parquet) for DuckDB-WASM model tree queries")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("export-world-sites-parquet")
-                .long("export-world-sites-parquet")
-                .help("Export WORL->SITE nodes as Parquet (world_sites.parquet) for DuckDB-WASM (Full Parquet Mode)")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("export-dbnum-instances")
-                .long("export-dbnum-instances")
-                .help("Export dbnum instances (default: Parquet format; use --export-dbnum-instances-json for JSON)")
-                .action(clap::ArgAction::SetTrue),
-        )
+        ))
         .arg(
             Arg::new("import-spatial-index")
                 .long("import-spatial-index")
@@ -890,6 +839,12 @@ async fn main() -> anyhow::Result<()> {
                 .value_name("REFNO"),
         )
         .arg(
+            Arg::new("force")
+                .long("force")
+                .help("Force kill processes holding RocksDB LOCK files before connecting (强制终止占用 LOCK 的进程)")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("offline")
                 .long("offline")
                 .help("Use embedded file mode instead of WebSocket. Auto-kills any running SurrealDB server on the configured port")
@@ -913,6 +868,14 @@ async fn main() -> anyhow::Result<()> {
         println!("🔌 --offline 模式：切换为嵌入式文件连接");
         unsafe {
             std::env::set_var("SURREAL_CONN_MODE", "file");
+        }
+    }
+
+    // --force：强制清理 RocksDB LOCK 文件（kill 占用进程）
+    if matches.get_flag("force") {
+        println!("🔧 --force 模式：将强制清理 LOCK 文件");
+        unsafe {
+            std::env::set_var("AIOS_FORCE_LOCK", "1");
         }
     }
 
@@ -1037,8 +1000,6 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-
-
     // ========== MBD JSON 预生成 ==========
     #[cfg(feature = "web_server")]
     if matches.get_flag("export-mbd") || matches.get_one::<String>("export-mbd-refno").is_some() {
@@ -1087,16 +1048,18 @@ async fn main() -> anyhow::Result<()> {
     let config_debug_refnos: Option<Vec<String>> = db_option_ext.inner.debug_model_refnos.clone();
     let log_model_error = matches.get_flag("log-model-error");
     let debug_model_requested = matches.contains_id("debug-model") || log_model_error;
+    let root_model_requested = matches.contains_id("root-model");
+    let any_model_requested = debug_model_requested || root_model_requested;
     let debug_model_errors_only = matches.get_flag("debug-model-errors-only") || log_model_error;
 
     if log_model_error {
         println!("📊 启用模型错误记录模式（自动开启 debug-model + errors-only）");
     }
 
-    if !debug_model_requested && db_option_ext.inner.debug_model_refnos.is_some() {
-        println!("ℹ️ 未开启调试模式，本次运行将忽略配置中的 debug_model_refnos");
+    if !any_model_requested && db_option_ext.inner.debug_model_refnos.is_some() {
+        println!("ℹ️ 未开启调试/根模型模式，本次运行将忽略配置中的 debug_model_refnos");
     }
-    if !debug_model_requested {
+    if !any_model_requested {
         aios_core::set_debug_model_enabled(false);
         db_option_ext.inner.debug_model_refnos = None;
     }
@@ -1176,35 +1139,51 @@ async fn main() -> anyhow::Result<()> {
         aios_database::fast_model::set_capture_config(None);
     }
 
-    // ========== 首先处理 --debug-model 参数（必须在所有导出逻辑之前） ==========
-    let debug_model_refnos: Option<Vec<String>> = if debug_model_requested {
-        aios_core::set_debug_model_enabled(true);
-        clear_ploop_debug_cache(); // 清理PLOOP调试文件缓存，允许重新生成
-        println!("✅ 已启用 debug_model 调试信息打印");
+    // ========== 首先处理 --debug-model / --root-model 参数（必须在所有导出逻辑之前） ==========
+    let debug_model_refnos: Option<Vec<String>> = if any_model_requested {
+        // --debug-model 才启用调试打印；--root-model 不启用
+        if debug_model_requested {
+            aios_core::set_debug_model_enabled(true);
+            clear_ploop_debug_cache(); // 清理PLOOP调试文件缓存，允许重新生成
+            println!("✅ 已启用 debug_model 调试信息打印");
+        } else {
+            println!("✅ 已启用 root-model 模式（不打印调试信息）");
+        }
 
         if !db_option_ext.inner.gen_mesh {
-            println!("🔄 调试模式自动开启 gen_mesh");
+            println!("🔄 自动开启 gen_mesh");
             db_option_ext.inner.gen_mesh = true;
         }
 
         // 确保 gen_model 也被启用，以便 is_gen_mesh_or_model() 返回 true
         if !db_option_ext.inner.gen_model {
-            println!("🔄 调试模式自动开启 gen_model");
+            println!("🔄 自动开启 gen_model");
             db_option_ext.inner.gen_model = true;
         }
 
+        // 从 --debug-model 或 --root-model 中取 refnos
         let cli_refnos: Vec<String> = matches
             .get_many::<String>("debug-model")
+            .or_else(|| matches.get_many::<String>("root-model"))
             .map(|values| values.map(|s| s.to_string()).collect())
             .unwrap_or_else(Vec::new);
 
+        let mode_label = if debug_model_requested {
+            "debug-model"
+        } else {
+            "root-model"
+        };
+
         if !cli_refnos.is_empty() {
-            println!("🔍 使用命令行指定的 debug-model 参考号: {:?}", cli_refnos);
+            println!(
+                "🔍 使用命令行指定的 {} 参考号: {:?}",
+                mode_label, cli_refnos
+            );
             db_option_ext.inner.debug_model_refnos = Some(cli_refnos.clone());
             Some(cli_refnos)
         } else if let Some(config_refnos) = config_debug_refnos.as_ref() {
             if config_refnos.is_empty() {
-                println!("💡 仅启用调试模式，未指定参考号");
+                println!("💡 仅启用 {} 模式，未指定参考号", mode_label);
                 db_option_ext.inner.debug_model_refnos = Some(Vec::new());
                 None
             } else {
@@ -1216,7 +1195,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(config_refnos.clone())
             }
         } else {
-            println!("💡 仅启用调试模式，未指定参考号");
+            println!("💡 仅启用 {} 模式，未指定参考号", mode_label);
             db_option_ext.inner.debug_model_refnos = None;
             None
         }
@@ -1225,6 +1204,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if debug_model_requested {
+        // 仅 --debug-model 才启用日志文件写入
         db_option_ext.inner.enable_log = true;
         let now = Local::now();
         let log_refno = debug_model_refnos
@@ -1293,13 +1273,15 @@ async fn main() -> anyhow::Result<()> {
     // --defer-db-write：模型生成阶段不写 SurrealDB，SQL 输出到 .surql 文件
     let defer_db_write_explicit = matches.get_flag("defer-db-write");
     if defer_db_write_explicit {
-        println!("🗂️ 检测到 --defer-db-write 参数，模型生成阶段将跳过 SurrealDB 写入，SQL 输出到 .surql 文件");
+        println!(
+            "🗂️ 检测到 --defer-db-write 参数，模型生成阶段将跳过 SurrealDB 写入，SQL 输出到 .surql 文件"
+        );
         db_option_ext.defer_db_write = true;
     }
 
     // --debug-model 是增量模式，不应强制 replace_mesh（不清理旧数据）；
     // 只有 --regen-model 才需要 replace_mesh + pre_cleanup_for_regen。
-    if debug_model_requested && !regen_model_requested && db_option_ext.inner.gen_mesh {
+    if any_model_requested && !regen_model_requested && db_option_ext.inner.gen_mesh {
         if db_option_ext.inner.replace_mesh == Some(true) {
             println!("⚠️ 调试模式检测到 replace_mesh=true（配置/--regen-model），保持不变");
         }
@@ -1313,14 +1295,14 @@ async fn main() -> anyhow::Result<()> {
         || matches.contains_id("export-obj-refnos")
         || matches.contains_id("export-glb-refnos")
         || matches.contains_id("export-gltf-refnos")
-        || (debug_model_requested && capture_dir.is_some());
+        || (any_model_requested && capture_dir.is_some());
     let follow_up_export_requested =
         model_export_requested || matches.get_flag("export-parquet-after-gen");
     let any_export_requested = model_export_requested
         || matches.get_flag("export-all-parquet")
         || matches.get_flag("export-all-relates")
         || matches.get_flag("export-dbnum-instances-json")
-        || matches.get_flag("export-dbnum-instances-parquet")
+        || matches.get_flag("export-parquet")
         || matches.get_flag("export-dbnum-instances")
         || matches.get_flag("export-pdms-tree-parquet")
         || matches.get_flag("export-world-sites-parquet");
@@ -1328,7 +1310,7 @@ async fn main() -> anyhow::Result<()> {
     // ========== 执行模型生成 ==========
     // --regen-model: 清理后重新生成（强制 replace_mesh + FORCE_REGEN_MESH）
     // --debug-model: 直接增量生成（不清理，补充缺失的 inst_geo/mesh/布尔结果）
-    let should_generate = regen_model_requested || debug_model_requested;
+    let should_generate = regen_model_requested || any_model_requested;
     if should_generate {
         // 确定生成的目标 refnos：优先 debug-model 指定的 refnos，其次 CLI 独立 refno 参数，
         // 再次 dbnum（查询所有 SITE），最后全库模式。
@@ -1893,9 +1875,10 @@ async fn main() -> anyhow::Result<()> {
         let dbnum = matches.get_one::<u32>("dbnum").copied();
         let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
 
-        // 解析 --debug-model 参数作为 root_refno
+        // 解析 --debug-model / --root-model 参数作为 root_refno
         let root_refno: Option<RefnoEnum> = matches
             .get_many::<String>("debug-model")
+            .or_else(|| matches.get_many::<String>("root-model"))
             .and_then(|values| values.into_iter().next())
             .and_then(|s| {
                 let refno_str = s.replace('_', "/");
@@ -1985,26 +1968,21 @@ async fn main() -> anyhow::Result<()> {
             .await;
     }
 
-    // 导出 dbnum 实例数据为 Parquet（显式 --export-dbnum-instances-parquet）
+    // 导出 dbnum 实例数据为 Parquet（显式 --export-parquet）
     // 或默认格式（--export-dbnum-instances，默认 Parquet）
-    if matches.get_flag("export-dbnum-instances-parquet")
-        || matches.get_flag("export-dbnum-instances")
-    {
+    if matches.get_flag("export-parquet") || matches.get_flag("export-dbnum-instances") {
         use aios_core::pdms_types::RefnoEnum;
         use std::str::FromStr;
 
         let dbnum_cli = matches.get_one::<u32>("dbnum").copied();
-        let root_refno: Option<RefnoEnum> = matches
-            .get_one::<String>("root-refno")
-            .and_then(|s| {
-                let refno_str = s.replace('_', "/");
-                RefnoEnum::from_str(&refno_str).ok()
-            });
-        let dbnum_from_root = root_refno.as_ref().and_then(|r| {
-            aios_database::data_interface::db_meta().get_dbnum_by_refno(*r)
+        let root_refno: Option<RefnoEnum> = matches.get_one::<String>("root-refno").and_then(|s| {
+            let refno_str = s.replace('_', "/");
+            RefnoEnum::from_str(&refno_str).ok()
         });
+        let dbnum_from_root = root_refno
+            .as_ref()
+            .and_then(|r| aios_database::data_interface::db_meta().get_dbnum_by_refno(*r));
 
-        let fill_missing_cache = matches.get_flag("fill-missing-cache");
         let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
 
         if let (Some(dbnum_cli), Some(dbnum_root), Some(root)) =
@@ -2019,65 +1997,78 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        let dbnum = match (dbnum_cli, dbnum_from_root) {
-            (Some(n), _) => n,
-            (None, Some(n)) => n,
-            (None, None) => {
-                eprintln!("❌ 错误: --export-dbnum-instances-parquet 需要提供 --dbnum 或 --root-refno");
-                eprintln!("   例如: cargo run -- --export-dbnum-instances-parquet --dbnum 7997");
-                eprintln!("   或者: cargo run -- --export-dbnum-instances-parquet --root-refno 24381_145018");
-                std::process::exit(1);
-            }
+        let single_dbnum = match (dbnum_cli, dbnum_from_root) {
+            (Some(n), _) => Some(n),
+            (None, Some(n)) => Some(n),
+            (None, None) => None,
         };
 
-        let mut from_surrealdb = if matches.get_flag("fill-missing-cache") {
-            false // --fill-missing-cache 使用 model cache
-        } else {
-            matches.get_one::<bool>("from-surrealdb").copied().unwrap_or(true)
-        };
-        if root_refno.is_some() && !from_surrealdb {
-            println!("⚠️  检测到 --root-refno，自动切换到 SurrealDB 数据源（cache 模式不支持按 root 范围导出）");
-            from_surrealdb = true;
+        // 未指定 dbnum：扫描 inst_relate 所有 distinct dbnum，逐一导出
+        if single_dbnum.is_none() {
+            use aios_database::fast_model::export_model::export_dbnum_instances_parquet::query_distinct_dbnums_from_inst_relate;
+
+            println!("📋 未指定 --dbnum，扫描 inst_relate 所有 dbnum...");
+            init_surreal().await?;
+            let dbnums = query_distinct_dbnums_from_inst_relate().await?;
+
+            if dbnums.is_empty() {
+                eprintln!("❌ 错误: inst_relate 表中未找到任何 dbnum");
+                std::process::exit(1);
+            }
+
+            println!("📋 扫描到 {} 个 dbnum: {:?}", dbnums.len(), dbnums);
+
+            #[cfg(feature = "parquet-export")]
+            {
+                for (i, dbnum) in dbnums.iter().enumerate() {
+                    println!(
+                        "\n{} [{}/{}] 导出 dbnum={}",
+                        "=".repeat(30),
+                        i + 1,
+                        dbnums.len(),
+                        dbnum,
+                    );
+                    crate::cli_modes::export_dbnum_instances_parquet_mode(
+                        *dbnum,
+                        verbose,
+                        export_bundle_dir.clone(),
+                        &db_option_ext,
+                        None,
+                    )
+                    .await?;
+                }
+                println!("\n🎉 所有 dbnum 导出完成！共 {} 个", dbnums.len());
+                return Ok(());
+            }
+
+            #[cfg(not(feature = "parquet-export"))]
+            {
+                eprintln!(
+                    "❌ 错误: parquet-export 特性未启用，请使用 --features parquet-export 编译"
+                );
+                std::process::exit(1);
+            }
         }
+
+        let dbnum = single_dbnum.unwrap();
 
         println!("🎯 导出 dbnum 实例数据为 Parquet（多表，供 DuckDB 查询）");
         println!("   - 按 dbnum={} 过滤", dbnum);
         if let Some(ref root) = root_refno {
             println!("   - 根节点: {}（仅导出其 visible 子孙）", root);
         }
-        if from_surrealdb {
-            println!("   - 数据源: SurrealDB");
-        } else {
-            println!("   - 数据源: model cache");
-            if fill_missing_cache {
-                println!("   - 导出前策略: 自动补齐缺失 refno");
-            } else {
-                println!("   - 导出前策略: 仅导出已生成 cache（默认）");
-            }
-        }
+        println!("   - 数据源: SurrealDB");
         if let Some(ref dir) = export_bundle_dir {
             println!("   - 输出目录: {}", dir.display());
         }
 
         #[cfg(feature = "parquet-export")]
-        if from_surrealdb {
-            return crate::cli_modes::export_dbnum_instances_parquet_mode(
-                dbnum,
-                verbose,
-                export_bundle_dir,
-                &db_option_ext,
-                root_refno,
-            )
-            .await;
-        }
-
-        #[cfg(feature = "parquet-export")]
-        return crate::cli_modes::export_dbnum_instances_parquet_from_cache_mode(
+        return crate::cli_modes::export_dbnum_instances_parquet_mode(
             dbnum,
             verbose,
             export_bundle_dir,
             &db_option_ext,
-            fill_missing_cache,
+            root_refno,
         )
         .await;
     }
@@ -2142,7 +2133,9 @@ async fn main() -> anyhow::Result<()> {
 
     // ========== 处理 room 子命令 ==========
     if let Some(room_matches) = matches.subcommand_matches("room") {
-        use crate::cli_modes::{export_room_instances_mode, room_clean_mode, room_compute_mode, room_compute_panel_mode};
+        use crate::cli_modes::{
+            export_room_instances_mode, room_clean_mode, room_compute_mode, room_compute_panel_mode,
+        };
         use aios_core::RefnoEnum;
         use std::str::FromStr;
 
@@ -2171,8 +2164,13 @@ async fn main() -> anyhow::Result<()> {
                     .get_many::<String>("expect-refnos")
                     .map(|v| v.map(|s| s.to_string()).collect());
 
-                return room_compute_panel_mode(panel_refno, expect_refnos, verbose, &db_option_ext)
-                    .await;
+                return room_compute_panel_mode(
+                    panel_refno,
+                    expect_refnos,
+                    verbose,
+                    &db_option_ext,
+                )
+                .await;
             }
             Some(("clean", _)) => {
                 return room_clean_mode(&db_option_ext).await;
@@ -2239,12 +2237,16 @@ fn maybe_redirect_stdio_to_log_file() {
 
     // 默认不重定向，避免 spawn 子进程后终端无输出导致“卡住”的假象。
     // 需要重定向时设置环境变量 AIOS_REDIRECT_STDIO=1。
-    if std::env::var_os("AIOS_REDIRECT_STDIO").map(|v| v != "1").unwrap_or(true) {
+    if std::env::var_os("AIOS_REDIRECT_STDIO")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
         return;
     }
 
     // 仅在“可能产生海量输出”的路径下重定向（debug-model/export/capture 等）。
     let should_redirect = has_flag("--debug-model")
+        || has_flag("--root-model")
         || has_flag("--export-obj")
         || has_flag("--export-glb")
         || has_flag("--export-gltf")
@@ -2274,6 +2276,7 @@ fn maybe_redirect_stdio_to_log_file() {
     }
 
     let ref_tag = first_value_after_flag(&args, "--debug-model")
+        .or_else(|| first_value_after_flag(&args, "--root-model"))
         .or_else(|| first_value_after_flag(&args, "--export-obj-refnos"))
         .or_else(|| first_value_after_flag(&args, "--export-glb-refnos"))
         .or_else(|| first_value_after_flag(&args, "--export-gltf-refnos"))

@@ -36,7 +36,7 @@ gen_tree_only = false
 apply_boolean_operation = true
 mesh_tol_ratio = 3.0
 #是否启用房间计算
-gen_spatial_tree = true
+gen_spatial_tree = false
 load_spatial_tree = false
 save_spatial_tree_to_db = false
 enable_sqlite_rtree = true
@@ -50,7 +50,7 @@ index_tree_batch_size = 200
 # 可选值: "cate", "loop", "prim" 或具体 noun 名称如 "BRAN", "PANE"
 # 空 vec 表示启用所有类别（默认行为）
 # 房间相关类型: FRMW(框架), SBFR(子框架), PANE(面板)
-# index_tree_enabled_target_types = ["PANE", "BRAN", "HANG"]
+index_tree_enabled_target_types = ["PANE", "BRAN", "HANG"]
 
 # 排除的 noun 列表
 # 即使类别启用，这里的 noun 也会被过滤掉
@@ -269,6 +269,14 @@ workflow_sync_path = "/api/workflow/sync"
 workflow_delete_path = "/api/workflow/delete"
 auth_secret = "shared-review-secret"
 timeout_seconds = 15
+
+# 校审接口认证配置
+# 本地/联调阶段可临时关闭 JWT 校验；上线前请改回 enabled = true
+[review_auth]
+enabled = false
+debug_project_id = "debug-project"
+debug_user_id = "debug-user"
+debug_role = "sj"
 
 # Web Server 配置
 [web_server]

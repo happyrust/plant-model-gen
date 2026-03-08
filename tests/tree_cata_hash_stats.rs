@@ -70,6 +70,7 @@ fn test_tree_cata_hash_stats() {
         include_self: true,
         max_depth: None,
         filter: TreeQueryFilter::default(),
+        prune_on_match: false,
     };
 
     for &root in index.roots() {

@@ -1,7 +1,23 @@
 //! 测试 Parquet 导出功能
 
+use clap::Command;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// 测试 Parquet CLI 不再暴露 cache 相关参数
+#[test]
+fn test_parquet_cli_args_remove_cache_flags() {
+    let command = crate::cli_args::add_export_instance_args(Command::new("aios-database"));
+    let arg_ids: Vec<String> = command
+        .get_arguments()
+        .map(|arg| arg.get_id().to_string())
+        .collect();
+
+    assert!(arg_ids.iter().any(|id| id == "export-parquet"));
+    assert!(arg_ids.iter().any(|id| id == "export-dbnum-instances"));
+    assert!(!arg_ids.iter().any(|id| id == "fill-missing-cache"));
+    assert!(!arg_ids.iter().any(|id| id == "from-surrealdb"));
+}
 
 /// 测试导出 dbnum 实例数据为 Parquet
 #[tokio::test]

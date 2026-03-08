@@ -321,13 +321,19 @@ fn parse_datetime(s: &Option<String>) -> i64 {
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
 }
 
+fn parse_datetime_value(dt: &Option<surrealdb::types::Datetime>) -> i64 {
+    dt.as_ref()
+        .map(|value| value.timestamp_millis())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
+}
+
 // ============================================================================
 // Routes
 // ============================================================================
 
 pub fn create_review_api_routes() -> Router {
     use axum::middleware;
-    use crate::web_api::jwt_auth::jwt_auth_middleware;
+    use crate::web_api::jwt_auth::{REVIEW_AUTH_CONFIG, review_auth_middleware};
 
     Router::new()
         // 提资单 CRUD
@@ -365,8 +371,11 @@ pub fn create_review_api_routes() -> Router {
         .route("/api/users", get(list_users))
         .route("/api/users/me", get(get_current_user))
         .route("/api/users/reviewers", get(get_reviewers))
-        // 文档一致：校审相关 API 强制要求 JWT
-        .layer(middleware::from_fn(jwt_auth_middleware))
+        // 校审相关 API 默认强制 JWT；联调时可通过 review_auth.enabled=false 临时关闭
+        .layer(middleware::from_fn_with_state(
+            REVIEW_AUTH_CONFIG.clone(),
+            review_auth_middleware,
+        ))
 }
 
 // ============================================================================
@@ -875,13 +884,13 @@ async fn get_task_history(
         id: surrealdb::types::RecordId,
         task_id: Option<String>,
         action: Option<String>,
-        user_id: Option<String>,
-        user_name: Option<String>,
+        operator_id: Option<String>,
+        operator_name: Option<String>,
         comment: Option<String>,
-        timestamp: Option<String>,
+        timestamp: Option<surrealdb::types::Datetime>,
     }
     
-    let sql = "SELECT * FROM review_history WHERE task_id = $task_id ORDER BY timestamp DESC";
+    let sql = "SELECT * FROM review_workflow_history WHERE task_id = $task_id ORDER BY timestamp DESC";
     
     match project_primary_db().query(sql).bind(("task_id", id.clone())).await {
         Ok(mut response) => {
@@ -890,10 +899,10 @@ async fn get_task_history(
                 id: format!("{:?}", r.id.key),
                 task_id: r.task_id.unwrap_or_default(),
                 action: r.action.unwrap_or_default(),
-                user_id: r.user_id.unwrap_or_default(),
-                user_name: r.user_name.unwrap_or_default(),
+                user_id: r.operator_id.unwrap_or_default(),
+                user_name: r.operator_name.unwrap_or_default(),
                 comment: r.comment,
-                timestamp: parse_datetime(&r.timestamp),
+                timestamp: parse_datetime_value(&r.timestamp),
             }).collect();
             
             (StatusCode::OK, Json(HistoryResponse {
@@ -1049,7 +1058,7 @@ async fn get_records_by_task(
         obb_annotations: Option<Vec<serde_json::Value>>,
         measurements: Option<Vec<serde_json::Value>>,
         note: Option<String>,
-        confirmed_at: Option<String>,
+        confirmed_at: Option<surrealdb::types::Datetime>,
     }
     
     let sql = "SELECT * FROM review_records WHERE task_id = $task_id ORDER BY confirmed_at DESC";
@@ -1067,7 +1076,7 @@ async fn get_records_by_task(
                 obb_annotations: r.obb_annotations.unwrap_or_default(),
                 measurements: r.measurements.unwrap_or_default(),
                 note: r.note.unwrap_or_default(),
-                confirmed_at: parse_datetime(&r.confirmed_at),
+                confirmed_at: parse_datetime_value(&r.confirmed_at),
             }).collect();
             
             (StatusCode::OK, Json(ConfirmedRecordResponse {
@@ -1270,7 +1279,7 @@ async fn get_comments_by_annotation(
         author_role: Option<String>,
         content: Option<String>,
         reply_to_id: Option<String>,
-        created_at: Option<String>,
+        created_at: Option<surrealdb::types::Datetime>,
     }
     
     let sql = if query.r#type.is_some() {
@@ -1296,7 +1305,7 @@ async fn get_comments_by_annotation(
                 author_role: r.author_role.unwrap_or_default(),
                 content: r.content.unwrap_or_default(),
                 reply_to_id: r.reply_to_id,
-                created_at: parse_datetime(&r.created_at),
+                created_at: parse_datetime_value(&r.created_at),
             }).collect();
             
             (StatusCode::OK, Json(CommentResponse {
@@ -1862,10 +1871,15 @@ async fn get_workflow_history(
     info!("Getting workflow history for task {}", id);
 
     // 1. 获取当前任务的节点信息
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct CurrentNodeRow {
+        current_node: Option<String>,
+    }
+
     let get_sql = "SELECT current_node FROM review_tasks WHERE record::id(id) = $id LIMIT 1";
     let current_node = match project_primary_db().query(get_sql).bind(("id", id.clone())).await {
         Ok(mut resp) => {
-            let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
+            let rows: Vec<CurrentNodeRow> = resp.take(0).unwrap_or_default();
             match rows.into_iter().next() {
                 Some(row) => row.current_node.unwrap_or_else(|| "sj".to_string()),
                 None => {
@@ -2356,7 +2370,7 @@ async fn export_review_data(
             author_role: Option<String>,
             content: Option<String>,
             reply_to_id: Option<String>,
-            created_at: Option<String>,
+            created_at: Option<surrealdb::types::Datetime>,
         }
 
         let sql = "SELECT * FROM review_comments ORDER BY created_at ASC LIMIT 10000";
@@ -2372,7 +2386,7 @@ async fn export_review_data(
                     author_role: r.author_role.unwrap_or_default(),
                     content: r.content.unwrap_or_default(),
                     reply_to_id: r.reply_to_id,
-                    created_at: parse_datetime(&r.created_at),
+                    created_at: parse_datetime_value(&r.created_at),
                 }).collect())
             }
             Err(e) => {
@@ -2398,7 +2412,7 @@ async fn export_review_data(
             obb_annotations: Option<Vec<serde_json::Value>>,
             measurements: Option<Vec<serde_json::Value>>,
             note: Option<String>,
-            confirmed_at: Option<String>,
+            confirmed_at: Option<surrealdb::types::Datetime>,
         }
 
         if task_ids.is_empty() {
@@ -2418,7 +2432,7 @@ async fn export_review_data(
                         obb_annotations: r.obb_annotations.unwrap_or_default(),
                         measurements: r.measurements.unwrap_or_default(),
                         note: r.note.unwrap_or_default(),
-                        confirmed_at: parse_datetime(&r.confirmed_at),
+                        confirmed_at: parse_datetime_value(&r.confirmed_at),
                     }).collect())
                 }
                 Err(e) => {

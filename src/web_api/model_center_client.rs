@@ -685,37 +685,47 @@ impl Default for ExternalReviewConfig {
 impl ExternalReviewConfig {
     /// 从 DbOption.toml 加载 [external_review] 配置
     pub fn from_config_file() -> Self {
-        let paths = [
-            "db_options/DbOption.toml",
-            "../db_options/DbOption.toml",
-            "DbOption.toml",
-        ];
-        for path in &paths {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                if let Ok(doc) = content.parse::<toml::Value>() {
-                    if let Some(section) = doc.get("external_review") {
-                        return Self {
-                            base_url: section.get("base_url")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            workflow_sync_path: section.get("workflow_sync_path")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("/api/workflow/sync")
-                                .to_string(),
-                            workflow_delete_path: section.get("workflow_delete_path")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("/api/workflow/delete")
-                                .to_string(),
-                            auth_secret: section.get("auth_secret")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("shared-review-secret")
-                                .to_string(),
-                            timeout_seconds: section.get("timeout_seconds")
-                                .and_then(|v| v.as_integer())
-                                .unwrap_or(15) as u64,
-                        };
-                    }
+        use config as cfg;
+
+        let mut names = Vec::new();
+        if let Ok(config_path) = std::env::var("DB_OPTION_FILE") {
+            names.push(
+                config_path
+                    .strip_suffix(".toml")
+                    .unwrap_or(&config_path)
+                    .to_string(),
+            );
+        }
+        names.extend([
+            "db_options/DbOption".to_string(),
+            "../db_options/DbOption".to_string(),
+            "DbOption".to_string(),
+        ]);
+
+        for name in &names {
+            let file_path = format!("{}.toml", name);
+            if std::path::Path::new(&file_path).exists() {
+                if let Ok(config) = cfg::Config::builder()
+                    .add_source(cfg::File::with_name(name))
+                    .build()
+                {
+                    return Self {
+                        base_url: config
+                            .get_string("external_review.base_url")
+                            .unwrap_or_default(),
+                        workflow_sync_path: config
+                            .get_string("external_review.workflow_sync_path")
+                            .unwrap_or_else(|_| "/api/workflow/sync".to_string()),
+                        workflow_delete_path: config
+                            .get_string("external_review.workflow_delete_path")
+                            .unwrap_or_else(|_| "/api/workflow/delete".to_string()),
+                        auth_secret: config
+                            .get_string("external_review.auth_secret")
+                            .unwrap_or_else(|_| "shared-review-secret".to_string()),
+                        timeout_seconds: config
+                            .get_int("external_review.timeout_seconds")
+                            .unwrap_or(15) as u64,
+                    };
                 }
             }
         }

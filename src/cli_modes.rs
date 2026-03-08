@@ -15,8 +15,7 @@ use aios_database::options::DbOptionExt;
 // use aios_database::fast_model::export_xkt::XktExporter;
 use aios_database::fast_model::model_exporter::{
     CommonExportConfig, ExportStats, GlbExportConfig, GltfExportConfig, ModelExporter,
-    ObjExportConfig,
-    XktExportConfig, collect_export_refnos,
+    ObjExportConfig, XktExportConfig, collect_export_refnos,
 };
 use aios_database::fast_model::unit_converter::{LengthUnit, UnitConverter};
 
@@ -395,7 +394,11 @@ async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
     let sdb_cfg = db_option_ext.inner.effective_surrealdb();
 
     if sdb_cfg.mode == DbConnMode::Ws {
-        let ip = if sdb_cfg.ip == "localhost" { "127.0.0.1" } else { &sdb_cfg.ip };
+        let ip = if sdb_cfg.ip == "localhost" {
+            "127.0.0.1"
+        } else {
+            &sdb_cfg.ip
+        };
         let addr = format!("{}:{}", ip, sdb_cfg.port);
         let is_local_target =
             sdb_cfg.ip == "localhost" || sdb_cfg.ip == "127.0.0.1" || sdb_cfg.ip == "::1";
@@ -414,7 +417,10 @@ async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
         } else if is_local_target {
             let auto_start = db_option_ext.inner.web_server.auto_start_surreal;
             if auto_start {
-                println!("\n⚠️  SurrealDB 未在 {} 运行，尝试自动启动（auto_start_surreal = true）...", addr);
+                println!(
+                    "\n⚠️  SurrealDB 未在 {} 运行，尝试自动启动（auto_start_surreal = true）...",
+                    addr
+                );
                 auto_start_surreal(&db_option_ext.inner).await?;
             } else {
                 anyhow::bail!(
@@ -451,48 +457,21 @@ async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
 /// - 数据路径: [web_server].surreal_data_path > [surrealdb].path > 默认 db-data/{project}_{port}.rdb
 /// - 监听地址: [web_server].surreal_bind（如 0.0.0.0:8020）
 ///
-/// 启动前会检测 RocksDB LOCK 文件：若无 surreal 进程持有则自动清理残留锁，避免崩溃后无法重启。
-async fn auto_start_surreal(db_option: &aios_core::options::DbOption) -> Result<()> {
-    let sdb_cfg = db_option.effective_surrealdb();
-    let ws_cfg = &db_option.web_server;
-
-    let data_path = ws_cfg.effective_data_path(db_option.surrealdb.path.as_deref());
-    let db_uri = format!("rocksdb://{}", data_path);
-    let bind = ws_cfg.surreal_bind.clone();
-    let surreal_bin = std::env::var("SURREAL_BIN")
-        .unwrap_or_else(|_| ws_cfg.surreal_bin.clone());
-
-    // 清理残留 LOCK 文件（无 surreal 进程时属于崩溃残留）
-    cleanup_stale_rocksdb_lock(&data_path);
-
-    println!("🚀 启动 SurrealDB: {} start --bind {} {}", surreal_bin, bind, db_uri);
-
-    let result = try_start_surreal_process(&surreal_bin, &sdb_cfg.user, &sdb_cfg.password, &bind, &db_uri).await;
-
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let err_msg = e.to_string();
-            // LOCK 文件冲突：可能在检测和启动之间有残留，再清理一次重试
-            if err_msg.contains("LOCK") || err_msg.contains("lock file") {
-                println!("⚠️  检测到 LOCK 文件冲突，清理后重试...");
-                cleanup_stale_rocksdb_lock(&data_path);
-                try_start_surreal_process(&surreal_bin, &sdb_cfg.user, &sdb_cfg.password, &bind, &db_uri).await
-            } else {
-                Err(e)
-            }
-        }
-    }
-}
-
-/// 清理 RocksDB 残留 LOCK 文件（仅在没有 surreal 进程运行时才清理）
-fn cleanup_stale_rocksdb_lock(data_path: &str) {
+/// 清理 RocksDB 残留 LOCK 文件（仅在没有 surreal 进程运行时才清理）。
+/// 当未启用 kv-rocksdb 时使用此本地实现，跨平台：macOS/Linux 用 pgrep，Windows 用 tasklist。
+#[cfg(not(feature = "kv-rocksdb"))]
+fn cleanup_stale_rocksdb_lock_local(data_path: &str) {
     let lock_path = std::path::Path::new(data_path).join("LOCK");
     if !lock_path.exists() {
         return;
     }
-
-    // 检查是否有 surreal 进程在运行
+    #[cfg(unix)]
+    let has_surreal_process = std::process::Command::new("pgrep")
+        .arg("surreal")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    #[cfg(windows)]
     let has_surreal_process = std::process::Command::new("tasklist")
         .args(["/FI", "IMAGENAME eq surreal.exe", "/NH"])
         .output()
@@ -501,16 +480,82 @@ fn cleanup_stale_rocksdb_lock(data_path: &str) {
             out.contains("surreal.exe")
         })
         .unwrap_or(false);
-
     if has_surreal_process {
         println!("   ⚠️  LOCK 文件存在且有 surreal 进程在运行，跳过清理");
         return;
     }
-
-    // 无 surreal 进程 → 残留锁，安全删除
     match std::fs::remove_file(&lock_path) {
         Ok(()) => println!("   🧹 已清理残留 LOCK 文件: {}", lock_path.display()),
         Err(e) => println!("   ⚠️  无法删除 LOCK 文件: {} ({})", lock_path.display(), e),
+    }
+}
+
+/// 启动前会检测 RocksDB LOCK 文件：若无 surreal 进程持有则自动清理残留锁，避免崩溃后无法重启。
+async fn auto_start_surreal(db_option: &aios_core::options::DbOption) -> Result<()> {
+    let sdb_cfg = db_option.effective_surrealdb();
+    let ws_cfg = &db_option.web_server;
+
+    let data_path = ws_cfg.effective_data_path(db_option.surrealdb.path.as_deref());
+    let db_uri = format!("rocksdb://{}", data_path);
+    let bind = ws_cfg.surreal_bind.clone();
+    let surreal_bin = std::env::var("SURREAL_BIN").unwrap_or_else(|_| ws_cfg.surreal_bin.clone());
+
+    // 清理残留 LOCK 文件（无 surreal 进程时属于崩溃残留）
+    #[cfg(feature = "kv-rocksdb")]
+    aios_core::cleanup_stale_rocksdb_lock(
+        &data_path,
+        std::env::var("AIOS_FORCE_LOCK")
+            .map(|v| v == "1")
+            .unwrap_or(false),
+    );
+    #[cfg(not(feature = "kv-rocksdb"))]
+    cleanup_stale_rocksdb_lock_local(&data_path);
+
+    println!(
+        "🚀 启动 SurrealDB: {} start --bind {} {}",
+        surreal_bin, bind, db_uri
+    );
+
+    let result = try_start_surreal_process(
+        &surreal_bin,
+        &sdb_cfg.user,
+        &sdb_cfg.password,
+        &bind,
+        &db_uri,
+    )
+    .await;
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let err_msg = e.to_string();
+            // LOCK 文件冲突：可能在检测和启动之间有残留，再清理一次重试
+            if err_msg.contains("LOCK")
+                || err_msg.contains("lock file")
+                || err_msg.contains("Resource temporarily unavailable")
+            {
+                println!("⚠️  检测到 LOCK 文件冲突，清理后重试...");
+                #[cfg(feature = "kv-rocksdb")]
+                aios_core::cleanup_stale_rocksdb_lock(
+                    &data_path,
+                    std::env::var("AIOS_FORCE_LOCK")
+                        .map(|v| v == "1")
+                        .unwrap_or(false),
+                );
+                #[cfg(not(feature = "kv-rocksdb"))]
+                cleanup_stale_rocksdb_lock_local(&data_path);
+                try_start_surreal_process(
+                    &surreal_bin,
+                    &sdb_cfg.user,
+                    &sdb_cfg.password,
+                    &bind,
+                    &db_uri,
+                )
+                .await
+            } else {
+                Err(e)
+            }
+        }
     }
 }
 
@@ -559,7 +604,11 @@ async fn try_start_surreal_process(
             anyhow::bail!(
                 "SurrealDB 进程已退出（exit={}）。\nstderr: {}",
                 status,
-                if stderr_output.is_empty() { "(空)" } else { &stderr_output }
+                if stderr_output.is_empty() {
+                    "(空)"
+                } else {
+                    &stderr_output
+                }
             );
         }
 
@@ -686,7 +735,11 @@ async fn collect_regen_target_refnos(config: &ExportConfig) -> Result<Vec<RefnoE
         if sites.is_empty() {
             anyhow::bail!("dbnum={} 下未找到任何 SITE，无法 regen", dbnum);
         }
-        println!("   - regen 目标: dbnum={} 下 {} 个 SITE", dbnum, sites.len());
+        println!(
+            "   - regen 目标: dbnum={} 下 {} 个 SITE",
+            dbnum,
+            sites.len()
+        );
         Ok(sites)
     } else if !config.refnos_str.is_empty() {
         // 按 refnos → 展开子孙
@@ -1745,9 +1798,9 @@ pub async fn export_dbnum_instances_json_mode(
             use aios_core::rs_surreal::geometry_query::PlantTransform;
             use aios_core::shape::pdms_shape::RsVec3;
             use aios_core::types::PlantAabb;
-            use aios_core::{project_primary_db, SurrealQueryExt};
-            use aios_database::fast_model::model_cache::ModelCacheContext;
+            use aios_core::{SurrealQueryExt, project_primary_db};
             use aios_database::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+            use aios_database::fast_model::model_cache::ModelCacheContext;
             use serde::{Deserialize, Serialize};
             use surrealdb::types as surrealdb_types;
             use surrealdb::types::SurrealValue;
@@ -2172,63 +2225,6 @@ pub async fn export_dbnum_instances_json_mode(
     Ok(())
 }
 
-/// 预检查并补齐 cache：若 `dbnum` 下存在缺失 refno，则仅对缺失 refno 触发模型生成并写回 model cache。
-async fn ensure_cache_refnos_ready_for_parquet(
-    dbnum: u32,
-    db_option_ext: &DbOptionExt,
-    verbose: bool,
-) -> Result<()> {
-    use aios_database::fast_model::gen_all_geos_data;
-    use aios_database::fast_model::gen_model::tree_index_manager::{
-        TreeIndexManager, load_index_with_large_stack,
-    };
-    use aios_database::fast_model::instance_cache::InstanceCacheManager;
-    use std::collections::HashSet;
-
-    let cache_dir = db_option_ext.get_model_cache_dir();
-    let cache_manager = InstanceCacheManager::new(&cache_dir).await?;
-    let cached_refnos: HashSet<RefnoEnum> = cache_manager.list_refnos(dbnum).into_iter().collect();
-
-    // 以 TreeIndex 作为期望集合，差集即需要补齐的 refno。
-    let tree_manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-    let tree_dir = tree_manager.tree_dir().to_path_buf();
-    let tree_index = load_index_with_large_stack(&tree_dir, dbnum)?;
-    let missing_refnos: Vec<RefnoEnum> = tree_index
-        .all_refnos()
-        .into_iter()
-        .map(RefnoEnum::from)
-        .filter(|r| !cached_refnos.contains(r))
-        .collect();
-
-    if missing_refnos.is_empty() {
-        if verbose {
-            println!("✅ cache 预检查通过：dbnum={} 无缺失 refno", dbnum);
-        }
-        return Ok(());
-    }
-
-    println!(
-        "⚠️  检测到 cache 缺失 refno：dbnum={} missing={}，开始定向补齐...",
-        dbnum,
-        missing_refnos.len()
-    );
-
-    // 生成阶段仍需连接 SurrealDB 读取输入数据（PE/属性/世界矩阵等）。
-    ensure_surreal_connected(db_option_ext).await?;
-
-    let mut override_opt = db_option_ext.clone();
-    override_opt.inner.manual_db_nums = Some(vec![dbnum]);
-    override_opt.inner.save_db = Some(false);
-    override_opt.export_instances = false;
-    override_opt.inner.gen_mesh = true;
-    override_opt.inner.replace_mesh = Some(false); // 仅补齐缺失，避免全量覆盖
-
-    gen_all_geos_data(missing_refnos, &override_opt, None, None).await?;
-
-    println!("✅ cache 缺失 refno 补齐完成，继续导出 parquet");
-    Ok(())
-}
-
 /// 导出指定 dbnum 的实例数据为多表 Parquet 格式
 ///
 /// 输出文件：
@@ -2291,66 +2287,6 @@ pub async fn export_dbnum_instances_parquet_mode(
     Ok(())
 }
 
-/// 从 model cache 导出指定 dbnum 的实例数据为多表 Parquet 格式
-///
-/// 与 `export_dbnum_instances_parquet_mode` 输出相同 schema，但数据源为 model cache
-/// 而非 SurrealDB，适用于离线缓存导出场景。
-/// 默认仅导出缓存已有数据；当 `fill_missing_cache=true` 时会先补齐缺失 refno。
-#[cfg(feature = "parquet-export")]
-pub async fn export_dbnum_instances_parquet_from_cache_mode(
-    dbnum: u32,
-    verbose: bool,
-    output_override: Option<PathBuf>,
-    db_option_ext: &DbOptionExt,
-    fill_missing_cache: bool,
-) -> Result<()> {
-    use aios_database::fast_model::export_model::export_dbnum_instances_parquet::export_dbnum_instances_parquet_from_cache;
-
-    println!("\n🎯 从 model cache 导出 dbnum 实例数据为 Parquet（多表）");
-    println!("====================================");
-
-    // 设置输出目录（按 dbnum 分目录，避免不同库互相覆盖）
-    let base_output_dir =
-        output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("parquet"));
-    let output_dir = base_output_dir.join(dbnum.to_string());
-
-    let cache_dir = db_option_ext.get_model_cache_dir();
-    let mesh_dir = db_option_ext.inner.get_meshes_path();
-    let mesh_lod_tag = format!("{:?}", db_option_ext.inner.mesh_precision.default_lod);
-
-    if fill_missing_cache {
-        ensure_cache_refnos_ready_for_parquet(dbnum, db_option_ext, verbose).await?;
-    } else if verbose {
-        println!("ℹ️  默认模式：仅导出 cache 中已存在的 refno，不自动补齐缺失数据");
-    }
-
-    let stats = export_dbnum_instances_parquet_from_cache(
-        dbnum,
-        &output_dir,
-        &cache_dir,
-        Some(&mesh_dir),
-        Some(&mesh_lod_tag),
-        verbose,
-        None, // 使用默认毫米单位
-    )
-    .await?;
-
-    println!("\n🎉 Parquet 导出完成！（缓存路径）");
-    println!("📊 统计信息:");
-    println!("   - 实例数量 (instances): {}", stats.instance_count);
-    println!(
-        "   - 几何引用数量 (geo_instances): {}",
-        stats.geo_instance_count
-    );
-    println!("   - TUBI 数量 (tubings): {}", stats.tubing_count);
-    println!("   - 变换矩阵数量 (transforms): {}", stats.transform_count);
-    println!("   - 包围盒数量 (aabb): {}", stats.aabb_count);
-    println!("   - 总文件大小: {} 字节", stats.total_bytes);
-    println!("   - 耗时: {:?}", stats.elapsed);
-    println!("   - 输出目录: {}", output_dir.display());
-
-    Ok(())
-}
 
 /// 导出指定 dbnum 的 PDMS Tree（TreeIndex + name/noun/children_count）为 Parquet
 ///
@@ -2545,15 +2481,12 @@ pub struct RoomComputeCliConfig {
 
 /// 从数据库构建 AABB 空间索引
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-async fn build_spatial_index_from_db(
-    db_nums: Option<&[u32]>,
-    verbose: bool,
-) -> Result<()> {
-    use aios_database::sqlite_index::SqliteAabbIndex;
-    use aios_database::spatial_index::SqliteSpatialIndex;
+async fn build_spatial_index_from_db(db_nums: Option<&[u32]>, verbose: bool) -> Result<()> {
     use aios_core::model_primary_db;
-    use surrealdb::types::SurrealValue;
+    use aios_database::spatial_index::SqliteSpatialIndex;
+    use aios_database::sqlite_index::SqliteAabbIndex;
     use std::time::Instant;
+    use surrealdb::types::SurrealValue;
 
     println!("\n🗃️ 构建空间索引");
     println!("==========================================");
@@ -2602,14 +2535,23 @@ async fn build_spatial_index_from_db(
     let mut inserted = 0;
 
     for chunk in records.chunks(BATCH_SIZE) {
-        let items: Vec<_> = chunk.iter().map(|r| {
-            let id = r.id.refno().0 as i64;
-            let inner_aabb = &r.world_aabb.0;
-            (id, r.noun.clone(),
-             inner_aabb.mins.x as f64, inner_aabb.maxs.x as f64,
-             inner_aabb.mins.y as f64, inner_aabb.maxs.y as f64,
-             inner_aabb.mins.z as f64, inner_aabb.maxs.z as f64)
-        }).collect();
+        let items: Vec<_> = chunk
+            .iter()
+            .map(|r| {
+                let id = r.id.refno().0 as i64;
+                let inner_aabb = &r.world_aabb.0;
+                (
+                    id,
+                    r.noun.clone(),
+                    inner_aabb.mins.x as f64,
+                    inner_aabb.maxs.x as f64,
+                    inner_aabb.mins.y as f64,
+                    inner_aabb.maxs.y as f64,
+                    inner_aabb.mins.z as f64,
+                    inner_aabb.maxs.z as f64,
+                )
+            })
+            .collect();
 
         idx.insert_aabbs_with_items(items)?;
         inserted += chunk.len();
@@ -2634,10 +2576,10 @@ async fn build_spatial_index_from_db(
 /// 适用于增量生成后的 compute-panel 场景。
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
-    use aios_database::sqlite_index::SqliteAabbIndex;
-    use aios_database::spatial_index::SqliteSpatialIndex;
-    use aios_core::model_primary_db;
     use aios_core::SurrealQueryExt;
+    use aios_core::model_primary_db;
+    use aios_database::spatial_index::SqliteSpatialIndex;
+    use aios_database::sqlite_index::SqliteAabbIndex;
     use std::time::Instant;
 
     println!("\n🗃️ 构建空间索引 (from inst_relate_aabb)");
@@ -2720,16 +2662,20 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
         let (minx, miny, minz, maxx, maxy, maxz) =
             if let (Some(mins), Some(maxs)) = (aabb_val.get("mins"), aabb_val.get("maxs")) {
                 let get3 = |v: &serde_json::Value| -> Option<(f64, f64, f64)> {
-                    Some((v.get("x")?.as_f64()?, v.get("y")?.as_f64()?, v.get("z")?.as_f64()?))
+                    Some((
+                        v.get("x")?.as_f64()?,
+                        v.get("y")?.as_f64()?,
+                        v.get("z")?.as_f64()?,
+                    ))
                 };
                 match (get3(mins), get3(maxs)) {
                     (Some(mn), Some(mx)) => (mn.0, mn.1, mn.2, mx.0, mx.1, mx.2),
                     _ => continue,
                 }
-            } else if let (Some(min_arr), Some(max_arr)) =
-                (aabb_val.get("min").and_then(|v| v.as_array()),
-                 aabb_val.get("max").and_then(|v| v.as_array()))
-            {
+            } else if let (Some(min_arr), Some(max_arr)) = (
+                aabb_val.get("min").and_then(|v| v.as_array()),
+                aabb_val.get("max").and_then(|v| v.as_array()),
+            ) {
                 if min_arr.len() >= 3 && max_arr.len() >= 3 {
                     (
                         min_arr[0].as_f64().unwrap_or(0.0),
@@ -2904,7 +2850,10 @@ pub async fn room_compute_panel_mode(
                             );
                             gen_refnos.push(owner);
                         } else {
-                            println!("   📦 {} (noun={}, owner noun={}) 直接加入", exp, noun_upper, owner_noun);
+                            println!(
+                                "   📦 {} (noun={}, owner noun={}) 直接加入",
+                                exp, noun_upper, owner_noun
+                            );
                             gen_refnos.push(exp);
                         }
                     } else {
@@ -2939,8 +2888,8 @@ pub async fn room_compute_panel_mode(
 
     // ========== 诊断 inst_relate_aabb 数据 ==========
     {
-        use aios_core::model_primary_db;
         use aios_core::SurrealQueryExt;
+        use aios_core::model_primary_db;
         let count: Vec<serde_json::Value> = model_primary_db()
             .query_take("SELECT count() FROM inst_relate_aabb GROUP ALL", 0)
             .await

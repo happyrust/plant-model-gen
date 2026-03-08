@@ -8,8 +8,8 @@
 //! 用法:
 //!   cargo run --example verify_fitt_transform
 
-use aios_core::*;
 use aios_core::transform::get_local_mat4;
+use aios_core::*;
 use anyhow::Result;
 use glam::DVec3;
 
@@ -46,8 +46,14 @@ async fn main() -> Result<()> {
         .expect("STWALL world_mat 为 None");
     let (_, stwall_rot, stwall_trans) = stwall_world.to_scale_rotation_translation();
     println!("\n📍 STWALL world:");
-    println!("   translation: [{:.1}, {:.1}, {:.1}]", stwall_trans.x, stwall_trans.y, stwall_trans.z);
-    println!("   rotation:    [{:.4}, {:.4}, {:.4}, {:.4}]", stwall_rot.x, stwall_rot.y, stwall_rot.z, stwall_rot.w);
+    println!(
+        "   translation: [{:.1}, {:.1}, {:.1}]",
+        stwall_trans.x, stwall_trans.y, stwall_trans.z
+    );
+    println!(
+        "   rotation:    [{:.4}, {:.4}, {:.4}, {:.4}]",
+        stwall_rot.x, stwall_rot.y, stwall_rot.z, stwall_rot.w
+    );
 
     let tolerance = 1.0; // 1mm
     let mut all_pass = true;
@@ -69,8 +75,14 @@ async fn main() -> Result<()> {
         match &local_mat {
             Some(mat) => {
                 let (_, rot, trans) = mat.to_scale_rotation_translation();
-                println!("   local translation: [{:.1}, {:.1}, {:.1}]", trans.x, trans.y, trans.z);
-                println!("   local rotation:    [{:.4}, {:.4}, {:.4}, {:.4}]", rot.x, rot.y, rot.z, rot.w);
+                println!(
+                    "   local translation: [{:.1}, {:.1}, {:.1}]",
+                    trans.x, trans.y, trans.z
+                );
+                println!(
+                    "   local rotation:    [{:.4}, {:.4}, {:.4}, {:.4}]",
+                    rot.x, rot.y, rot.z, rot.w
+                );
 
                 if DVec3::new(trans.x, trans.y, trans.z).length() < 0.01 {
                     println!("   ❌ local_mat 是 IDENTITY（bug 未修复）");
@@ -84,9 +96,18 @@ async fn main() -> Result<()> {
                 let computed_pos = DVec3::new(cw_trans.x, cw_trans.y, cw_trans.z);
                 let diff = (computed_pos - case.expected_world_pos).length();
 
-                println!("   computed world: [{:.1}, {:.1}, {:.1}]", cw_trans.x, cw_trans.y, cw_trans.z);
-                println!("   PDMS expected:  [{:.1}, {:.1}, {:.1}]", case.expected_world_pos.x, case.expected_world_pos.y, case.expected_world_pos.z);
-                println!("   world rotation: [{:.4}, {:.4}, {:.4}, {:.4}]", cw_rot.x, cw_rot.y, cw_rot.z, cw_rot.w);
+                println!(
+                    "   computed world: [{:.1}, {:.1}, {:.1}]",
+                    cw_trans.x, cw_trans.y, cw_trans.z
+                );
+                println!(
+                    "   PDMS expected:  [{:.1}, {:.1}, {:.1}]",
+                    case.expected_world_pos.x, case.expected_world_pos.y, case.expected_world_pos.z
+                );
+                println!(
+                    "   world rotation: [{:.4}, {:.4}, {:.4}, {:.4}]",
+                    cw_rot.x, cw_rot.y, cw_rot.z, cw_rot.w
+                );
                 println!("   差异: {:.2}mm", diff);
 
                 if diff < tolerance {

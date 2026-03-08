@@ -11,12 +11,11 @@ use once_cell::sync::Lazy;
 
 use aios_core::RefnoEnum;
 use axum::{
-    Router,
     extract::{Path, Query},
-    http::{HeaderValue, header::CONTENT_TYPE},
+    http::{header::CONTENT_TYPE, HeaderValue},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json,
+    Json, Router,
 };
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
@@ -35,9 +34,24 @@ impl Default for MbdPipeSource {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MbdPipeMode {
+    Construction,
+    Inspection,
+}
+
+impl Default for MbdPipeMode {
+    fn default() -> Self {
+        Self::Construction
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MbdPipeQuery {
+    /// 语义模式：construction=施工表达（默认），inspection=几何校核
+    pub mode: Option<MbdPipeMode>,
     /// 数据来源：parquet=Parquet 文件（默认），db=SurrealDB，cache=model cache
     pub source: MbdPipeSource,
     /// dbno（可选；若不传则尝试从 output/scene_tree/db_meta_info.json 推导）
@@ -55,22 +69,30 @@ pub struct MbdPipeQuery {
     /// 最小尺寸长度（mm）
     pub dim_min_length: f32,
     /// 是否额外输出“焊口链式尺寸”（包含两端）到 dims 数组（kind=chain）
-    pub include_chain_dims: bool,
+    pub include_chain_dims: Option<bool>,
     /// 是否额外输出“总长尺寸”（kind=overall）到 dims 数组
-    pub include_overall_dim: bool,
+    pub include_overall_dim: Option<bool>,
     /// 是否额外输出“端口间距尺寸”（优先用 arrive_axis_pt/leave_axis_pt；kind=port）到 dims 数组
-    pub include_port_dims: bool,
+    pub include_port_dims: Option<bool>,
     /// 焊缝合并阈值（mm）：相邻段端口距离小于该值则认为是焊缝
     pub weld_merge_threshold: f32,
-    pub include_dims: bool,
-    pub include_welds: bool,
-    pub include_slopes: bool,
+    pub include_dims: Option<bool>,
+    pub include_welds: Option<bool>,
+    pub include_slopes: Option<bool>,
+    /// 是否输出切管/直管长度清单
+    pub include_cut_tubis: Option<bool>,
+    /// 是否输出离散管件标注目标
+    pub include_fittings: Option<bool>,
+    /// 是否输出类型化标签
+    pub include_tags: Option<bool>,
+    /// 是否输出布局提示（内嵌到各类标注对象）
+    pub include_layout_hints: Option<bool>,
     /// 是否尝试填充分支属性（失败则忽略，不影响 success）
     pub include_branch_attrs: bool,
     /// 是否尝试用 TreeIndex 的 noun 辅助推断 weld_type（默认关闭，避免额外依赖/误判）
     pub include_weld_nouns: bool,
     /// 是否输出弯头数据（BEND/ELBO）
-    pub include_bends: bool,
+    pub include_bends: Option<bool>,
     /// 弯头标注模式：workpoint（中心线交点，默认）/ facecenter（端面中心）
     pub bend_mode: MbdBendMode,
 }
@@ -78,6 +100,7 @@ pub struct MbdPipeQuery {
 impl Default for MbdPipeQuery {
     fn default() -> Self {
         Self {
+            mode: None,
             source: MbdPipeSource::Db,
             dbno: None,
             batch_id: None,
@@ -86,17 +109,136 @@ impl Default for MbdPipeQuery {
             min_slope: 0.001,
             max_slope: 0.1,
             dim_min_length: 1.0,
-            include_chain_dims: false,
-            include_overall_dim: false,
-            include_port_dims: false,
+            include_chain_dims: None,
+            include_overall_dim: None,
+            include_port_dims: None,
             weld_merge_threshold: 1.0,
-            include_dims: true,
-            include_welds: true,
-            include_slopes: true,
+            include_dims: None,
+            include_welds: None,
+            include_slopes: None,
+            include_cut_tubis: None,
+            include_fittings: None,
+            include_tags: None,
+            include_layout_hints: None,
             include_branch_attrs: true,
             include_weld_nouns: false,
-            include_bends: true,
+            include_bends: None,
             bend_mode: MbdBendMode::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MbdPipeModeDefaults {
+    include_dims: bool,
+    include_chain_dims: bool,
+    include_overall_dim: bool,
+    include_port_dims: bool,
+    include_welds: bool,
+    include_slopes: bool,
+    include_bends: bool,
+    include_cut_tubis: bool,
+    include_fittings: bool,
+    include_tags: bool,
+    include_layout_hints: bool,
+}
+
+impl MbdPipeModeDefaults {
+    fn for_mode(mode: MbdPipeMode) -> Self {
+        match mode {
+            MbdPipeMode::Construction => Self {
+                include_dims: true,
+                include_chain_dims: true,
+                include_overall_dim: false,
+                include_port_dims: false,
+                include_welds: true,
+                include_slopes: true,
+                include_bends: false,
+                include_cut_tubis: true,
+                include_fittings: true,
+                include_tags: true,
+                include_layout_hints: true,
+            },
+            MbdPipeMode::Inspection => Self {
+                include_dims: true,
+                include_chain_dims: false,
+                include_overall_dim: false,
+                include_port_dims: true,
+                include_welds: false,
+                include_slopes: false,
+                include_bends: false,
+                include_cut_tubis: false,
+                include_fittings: false,
+                include_tags: false,
+                include_layout_hints: false,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedMbdPipeQuery {
+    mode: MbdPipeMode,
+    source: MbdPipeSource,
+    dbno: Option<u32>,
+    batch_id: Option<String>,
+    debug: bool,
+    strict_dbno: bool,
+    min_slope: f32,
+    max_slope: f32,
+    dim_min_length: f32,
+    include_chain_dims: bool,
+    include_overall_dim: bool,
+    include_port_dims: bool,
+    weld_merge_threshold: f32,
+    include_dims: bool,
+    include_welds: bool,
+    include_slopes: bool,
+    include_cut_tubis: bool,
+    include_fittings: bool,
+    include_tags: bool,
+    include_layout_hints: bool,
+    include_branch_attrs: bool,
+    include_weld_nouns: bool,
+    include_bends: bool,
+    bend_mode: MbdBendMode,
+}
+
+impl MbdPipeQuery {
+    fn resolve(&self) -> ResolvedMbdPipeQuery {
+        let mode = self.mode.unwrap_or_default();
+        let defaults = MbdPipeModeDefaults::for_mode(mode);
+        ResolvedMbdPipeQuery {
+            mode,
+            source: self.source,
+            dbno: self.dbno,
+            batch_id: self.batch_id.clone(),
+            debug: self.debug,
+            strict_dbno: self.strict_dbno,
+            min_slope: self.min_slope,
+            max_slope: self.max_slope,
+            dim_min_length: self.dim_min_length,
+            include_chain_dims: self
+                .include_chain_dims
+                .unwrap_or(defaults.include_chain_dims),
+            include_overall_dim: self
+                .include_overall_dim
+                .unwrap_or(defaults.include_overall_dim),
+            include_port_dims: self.include_port_dims.unwrap_or(defaults.include_port_dims),
+            weld_merge_threshold: self.weld_merge_threshold,
+            include_dims: self.include_dims.unwrap_or(defaults.include_dims),
+            include_welds: self.include_welds.unwrap_or(defaults.include_welds),
+            include_slopes: self.include_slopes.unwrap_or(defaults.include_slopes),
+            include_cut_tubis: self.include_cut_tubis.unwrap_or(defaults.include_cut_tubis),
+            include_fittings: self.include_fittings.unwrap_or(defaults.include_fittings),
+            include_tags: self.include_tags.unwrap_or(defaults.include_tags),
+            include_layout_hints: self
+                .include_layout_hints
+                .unwrap_or(defaults.include_layout_hints),
+            include_branch_attrs: self.include_branch_attrs,
+            include_weld_nouns: self.include_weld_nouns,
+            include_bends: self.include_bends.unwrap_or(defaults.include_bends),
+            bend_mode: self.bend_mode,
         }
     }
 }
@@ -116,11 +258,14 @@ pub struct MbdPipeData {
     pub branch_attrs: BranchAttrsDto,
     pub segments: Vec<MbdPipeSegmentDto>,
     pub dims: Vec<MbdDimDto>,
+    pub cut_tubis: Vec<MbdCutTubiDto>,
     pub welds: Vec<MbdWeldDto>,
     pub slopes: Vec<MbdSlopeDto>,
+    pub fittings: Vec<MbdFittingDto>,
+    pub tags: Vec<MbdTagDto>,
     pub bends: Vec<MbdBendDto>,
     pub stats: MbdPipeStats,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_info: Option<MbdPipeDebugInfo>,
 }
 
@@ -128,8 +273,11 @@ pub struct MbdPipeData {
 pub struct MbdPipeStats {
     pub segments_count: usize,
     pub dims_count: usize,
+    pub cut_tubis_count: usize,
     pub welds_count: usize,
     pub slopes_count: usize,
+    pub fittings_count: usize,
+    pub tags_count: usize,
     pub bends_count: usize,
 }
 
@@ -183,14 +331,16 @@ pub enum MbdDimKind {
 pub struct MbdDimDto {
     pub id: String,
     pub kind: MbdDimKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub group_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub seq: Option<u32>,
     pub start: [f32; 3],
     pub end: [f32; 3],
     pub length: f32,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_hint: Option<MbdLayoutHint>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -210,6 +360,8 @@ pub struct MbdWeldDto {
     pub label: String,
     pub left_refno: String,
     pub right_refno: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_hint: Option<MbdLayoutHint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +372,76 @@ pub struct MbdSlopeDto {
     /// 坡度（dz / horizontal_dist），保留符号
     pub slope: f32,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MbdLayoutHint {
+    pub anchor_point: [f32; 3],
+    pub primary_axis: [f32; 3],
+    pub offset_dir: [f32; 3],
+    pub char_dir: [f32; 3],
+    pub label_role: String,
+    pub avoid_line_of_sight: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_segment_id: Option<String>,
+    pub offset_level: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppress_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MbdCutTubiDto {
+    pub id: String,
+    pub segment_id: String,
+    pub refno: String,
+    pub start: [f32; 3],
+    pub end: [f32; 3],
+    pub length: f32,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_hint: Option<MbdLayoutHint>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MbdFittingKind {
+    Elbo,
+    Bend,
+    Tee,
+    Olet,
+    Flan,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MbdFittingDto {
+    pub id: String,
+    pub refno: String,
+    pub noun: String,
+    pub kind: MbdFittingKind,
+    pub anchor_point: [f32; 3],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub angle: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub face_center_1: Option<[f32; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub face_center_2: Option<[f32; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_hint: Option<MbdLayoutHint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MbdTagDto {
+    pub id: String,
+    pub refno: String,
+    pub noun: String,
+    pub role: String,
+    pub text: String,
+    pub position: [f32; 3],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_hint: Option<MbdLayoutHint>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -309,7 +531,9 @@ fn fix_mojibake_utf8_latin1(s: String) -> String {
     let bytes: Vec<u8> = s.chars().map(|c| c as u8).collect();
     match String::from_utf8(bytes) {
         Ok(fixed) => {
-            let has_cjk = fixed.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c));
+            let has_cjk = fixed
+                .chars()
+                .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c));
             if has_cjk {
                 fixed
             } else {
@@ -339,6 +563,586 @@ struct CacheTubiSeg {
     leave_axis: Option<Vec3>,
 }
 
+#[derive(Debug, Clone)]
+struct BranchTopology {
+    branch_refno: RefnoEnum,
+    segments: Vec<CacheTubiSeg>,
+}
+
+struct BranchTopologyBuilder;
+
+impl BranchTopologyBuilder {
+    fn build(branch_refno: RefnoEnum, segments: Vec<CacheTubiSeg>) -> BranchTopology {
+        BranchTopology {
+            branch_refno,
+            segments,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RawFittingElement {
+    refno: RefnoEnum,
+    noun: String,
+    anchor_point: Vec3,
+    face_center_1: Option<Vec3>,
+    face_center_2: Option<Vec3>,
+    angle: Option<f32>,
+    radius: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BranchMeasurementOutput {
+    segments: Vec<MbdPipeSegmentDto>,
+    dims: Vec<MbdDimDto>,
+    cut_tubis: Vec<MbdCutTubiDto>,
+    welds: Vec<MbdWeldDto>,
+    slopes: Vec<MbdSlopeDto>,
+    fittings: Vec<MbdFittingDto>,
+    tags: Vec<MbdTagDto>,
+    bends: Vec<MbdBendDto>,
+}
+
+struct AnnotationLayoutPlanner;
+
+impl AnnotationLayoutPlanner {
+    fn segment_id(seg: &CacheTubiSeg, index: usize) -> String {
+        format!("seg:{}:{index}", seg.refno)
+    }
+
+    fn axis_or_default(start: Vec3, end: Vec3) -> Vec3 {
+        let axis = end - start;
+        if axis.length_squared() > 1e-6 {
+            axis.normalize()
+        } else {
+            Vec3::X
+        }
+    }
+
+    fn choose_offset_dir(axis: Vec3) -> Vec3 {
+        let up = if axis.cross(Vec3::Z).length_squared() > 1e-6 {
+            Vec3::Z
+        } else {
+            Vec3::Y
+        };
+        let dir = axis.cross(up);
+        if dir.length_squared() > 1e-6 {
+            dir.normalize()
+        } else {
+            Vec3::X
+        }
+    }
+
+    fn char_dir(axis: Vec3, offset_dir: Vec3) -> Vec3 {
+        let dir = offset_dir.cross(axis);
+        if dir.length_squared() > 1e-6 {
+            dir.normalize()
+        } else {
+            Vec3::Y
+        }
+    }
+
+    fn project_point_to_segment(anchor: Vec3, seg: &CacheTubiSeg) -> Vec3 {
+        let axis = seg.end - seg.start;
+        let denom = axis.length_squared();
+        if denom <= 1e-6 {
+            return seg.start;
+        }
+        let t = (anchor - seg.start).dot(axis) / denom;
+        seg.start + axis * t.clamp(0.0, 1.0)
+    }
+
+    fn owner_segment(topology: &BranchTopology, anchor: Vec3) -> Option<(usize, &CacheTubiSeg)> {
+        topology
+            .segments
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let da = Self::project_point_to_segment(anchor, a).distance_squared(anchor);
+                let db = Self::project_point_to_segment(anchor, b).distance_squared(anchor);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
+    fn linear_hint(
+        topology: &BranchTopology,
+        start: Vec3,
+        end: Vec3,
+        label_role: &str,
+        offset_level: u32,
+        suppress_reason: Option<String>,
+    ) -> MbdLayoutHint {
+        let anchor = (start + end) * 0.5;
+        let owner = Self::owner_segment(topology, anchor);
+        let axis = owner
+            .map(|(_, seg)| Self::axis_or_default(seg.start, seg.end))
+            .unwrap_or_else(|| Self::axis_or_default(start, end));
+        let offset_dir = Self::choose_offset_dir(axis);
+        let char_dir = Self::char_dir(axis, offset_dir);
+        MbdLayoutHint {
+            anchor_point: anchor.to_array(),
+            primary_axis: axis.to_array(),
+            offset_dir: offset_dir.to_array(),
+            char_dir: char_dir.to_array(),
+            label_role: label_role.to_string(),
+            avoid_line_of_sight: true,
+            owner_segment_id: owner.map(|(index, seg)| Self::segment_id(seg, index)),
+            offset_level,
+            suppress_reason,
+        }
+    }
+
+    fn anchor_hint(
+        topology: &BranchTopology,
+        anchor: Vec3,
+        label_role: &str,
+        offset_level: u32,
+        suppress_reason: Option<String>,
+    ) -> MbdLayoutHint {
+        let owner = Self::owner_segment(topology, anchor);
+        let axis = owner
+            .map(|(_, seg)| Self::axis_or_default(seg.start, seg.end))
+            .unwrap_or(Vec3::X);
+        let offset_dir = Self::choose_offset_dir(axis);
+        let char_dir = Self::char_dir(axis, offset_dir);
+        MbdLayoutHint {
+            anchor_point: anchor.to_array(),
+            primary_axis: axis.to_array(),
+            offset_dir: offset_dir.to_array(),
+            char_dir: char_dir.to_array(),
+            label_role: label_role.to_string(),
+            avoid_line_of_sight: true,
+            owner_segment_id: owner.map(|(index, seg)| Self::segment_id(seg, index)),
+            offset_level,
+            suppress_reason,
+        }
+    }
+}
+
+struct BranchMeasurementPlanner<'a> {
+    query: &'a ResolvedMbdPipeQuery,
+    topology: &'a BranchTopology,
+    fitting_elements: &'a [RawFittingElement],
+    bends: &'a [MbdBendDto],
+}
+
+impl<'a> BranchMeasurementPlanner<'a> {
+    fn new(
+        query: &'a ResolvedMbdPipeQuery,
+        topology: &'a BranchTopology,
+        fitting_elements: &'a [RawFittingElement],
+        bends: &'a [MbdBendDto],
+    ) -> Self {
+        Self {
+            query,
+            topology,
+            fitting_elements,
+            bends,
+        }
+    }
+
+    fn build(&self) -> BranchMeasurementOutput {
+        let mut output = BranchMeasurementOutput::default();
+        output.segments = self.build_segments();
+        output.dims = self.build_dims();
+        output.cut_tubis = self.build_cut_tubis();
+        output.welds = self.build_welds();
+        output.slopes = self.build_slopes();
+        output.bends = self.bends.to_vec();
+        output.fittings = self.build_fittings();
+        output.tags = self.build_tags(&output.cut_tubis, &output.fittings);
+        output
+    }
+
+    fn build_segments(&self) -> Vec<MbdPipeSegmentDto> {
+        self.topology
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(i, seg)| MbdPipeSegmentDto {
+                id: AnnotationLayoutPlanner::segment_id(seg, i),
+                refno: seg.refno.to_string(),
+                noun: "TUBI".to_string(),
+                name: None,
+                arrive: Some([seg.start.x, seg.start.y, seg.start.z]),
+                leave: Some([seg.end.x, seg.end.y, seg.end.z]),
+                length: seg.start.distance(seg.end),
+                straight_length: seg.start.distance(seg.end),
+                outside_diameter: None,
+                bore: None,
+            })
+            .collect()
+    }
+
+    fn build_dims(&self) -> Vec<MbdDimDto> {
+        let mut dims = Vec::new();
+        if self.query.include_dims {
+            for (i, seg) in self.topology.segments.iter().enumerate() {
+                let length = seg.start.distance(seg.end);
+                if length < self.query.dim_min_length {
+                    continue;
+                }
+                dims.push(MbdDimDto {
+                    id: format!("dim:{}:{i}", seg.refno),
+                    kind: MbdDimKind::Segment,
+                    group_id: None,
+                    seq: Some(i as u32),
+                    start: [seg.start.x, seg.start.y, seg.start.z],
+                    end: [seg.end.x, seg.end.y, seg.end.z],
+                    length,
+                    text: format_dim_length_text_mm(length),
+                    layout_hint: self.query.include_layout_hints.then(|| {
+                        AnnotationLayoutPlanner::linear_hint(
+                            self.topology,
+                            seg.start,
+                            seg.end,
+                            "segment",
+                            0,
+                            None,
+                        )
+                    }),
+                });
+            }
+        }
+
+        if self.query.include_port_dims {
+            for (i, seg) in self.topology.segments.iter().enumerate() {
+                let (start, end) = segment_port_points(seg);
+                let length = start.distance(end);
+                if length < self.query.dim_min_length {
+                    continue;
+                }
+                dims.push(MbdDimDto {
+                    id: format!("dim:port:{}:{i}", seg.refno),
+                    kind: MbdDimKind::Port,
+                    group_id: None,
+                    seq: Some(i as u32),
+                    start: start.to_array(),
+                    end: end.to_array(),
+                    length,
+                    text: format_dim_length_text_mm(length),
+                    layout_hint: self.query.include_layout_hints.then(|| {
+                        AnnotationLayoutPlanner::linear_hint(
+                            self.topology,
+                            start,
+                            end,
+                            "port",
+                            1,
+                            None,
+                        )
+                    }),
+                });
+            }
+        }
+
+        let mut weld_joints = Vec::new();
+        if self.query.include_welds
+            || self.query.include_chain_dims
+            || self.query.include_overall_dim
+        {
+            for i in 0..self.topology.segments.len().saturating_sub(1) {
+                let seg1 = &self.topology.segments[i];
+                let seg2 = &self.topology.segments[i + 1];
+                let (p1, p2, dist) = closest_endpoints(seg1.start, seg1.end, seg2.start, seg2.end);
+                if dist >= self.query.weld_merge_threshold {
+                    continue;
+                }
+                weld_joints.push(WeldJoint {
+                    left_endpoint: p1,
+                    right_endpoint: p2,
+                    mid: midpoint(p1, p2),
+                });
+            }
+        }
+
+        if self.query.include_chain_dims {
+            let ends: Vec<(Vec3, Vec3)> = self
+                .topology
+                .segments
+                .iter()
+                .map(|s| (s.start, s.end))
+                .collect();
+            let chain_pts = build_chain_points_from_ends(&ends, &weld_joints);
+            let group_id = Some(format!("chain:{}", self.topology.branch_refno));
+            for i in 0..chain_pts.len().saturating_sub(1) {
+                let a = chain_pts[i];
+                let b = chain_pts[i + 1];
+                let length = a.distance(b);
+                if length < self.query.dim_min_length {
+                    continue;
+                }
+                dims.push(MbdDimDto {
+                    id: format!("dim:chain:{}:{i}", self.topology.branch_refno),
+                    kind: MbdDimKind::Chain,
+                    group_id: group_id.clone(),
+                    seq: Some(i as u32),
+                    start: a.to_array(),
+                    end: b.to_array(),
+                    length,
+                    text: format_dim_length_text_mm(length),
+                    layout_hint: self.query.include_layout_hints.then(|| {
+                        AnnotationLayoutPlanner::linear_hint(self.topology, a, b, "chain", 1, None)
+                    }),
+                });
+            }
+        }
+
+        if self.query.include_overall_dim && !self.topology.segments.is_empty() {
+            let total: f32 = self
+                .topology
+                .segments
+                .iter()
+                .map(|seg| seg.start.distance(seg.end))
+                .sum();
+            let ends: Vec<(Vec3, Vec3)> = self
+                .topology
+                .segments
+                .iter()
+                .map(|s| (s.start, s.end))
+                .collect();
+            let chain_pts = build_chain_points_from_ends(&ends, &weld_joints);
+            let (a, b) = if chain_pts.len() >= 2 {
+                (chain_pts[0], chain_pts[chain_pts.len() - 1])
+            } else {
+                (
+                    self.topology.segments[0].start,
+                    self.topology.segments[0].end,
+                )
+            };
+            if total >= self.query.dim_min_length {
+                dims.push(MbdDimDto {
+                    id: format!("dim:overall:{}", self.topology.branch_refno),
+                    kind: MbdDimKind::Overall,
+                    group_id: Some(format!("overall:{}", self.topology.branch_refno)),
+                    seq: None,
+                    start: a.to_array(),
+                    end: b.to_array(),
+                    length: total,
+                    text: format_dim_length_text_mm(total),
+                    layout_hint: self.query.include_layout_hints.then(|| {
+                        AnnotationLayoutPlanner::linear_hint(
+                            self.topology,
+                            a,
+                            b,
+                            "overall",
+                            2,
+                            Some("overall_disabled_by_default".to_string()),
+                        )
+                    }),
+                });
+            }
+        }
+
+        dims
+    }
+
+    fn build_cut_tubis(&self) -> Vec<MbdCutTubiDto> {
+        if !self.query.include_cut_tubis {
+            return Vec::new();
+        }
+        self.topology
+            .segments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, seg)| {
+                let length = seg.start.distance(seg.end);
+                if length < self.query.dim_min_length {
+                    return None;
+                }
+                Some(MbdCutTubiDto {
+                    id: format!("cut_tubi:{}:{i}", seg.refno),
+                    segment_id: AnnotationLayoutPlanner::segment_id(seg, i),
+                    refno: seg.refno.to_string(),
+                    start: seg.start.to_array(),
+                    end: seg.end.to_array(),
+                    length,
+                    text: format_dim_length_text_mm(length),
+                    layout_hint: self.query.include_layout_hints.then(|| {
+                        AnnotationLayoutPlanner::linear_hint(
+                            self.topology,
+                            seg.start,
+                            seg.end,
+                            "cut_tubi",
+                            1,
+                            None,
+                        )
+                    }),
+                })
+            })
+            .collect()
+    }
+
+    fn build_welds(&self) -> Vec<MbdWeldDto> {
+        if !self.query.include_welds {
+            return Vec::new();
+        }
+        let mut welds = Vec::new();
+        let mut field_idx = 0usize;
+        for i in 0..self.topology.segments.len().saturating_sub(1) {
+            let seg1 = &self.topology.segments[i];
+            let seg2 = &self.topology.segments[i + 1];
+            let (p1, p2, dist) = closest_endpoints(seg1.start, seg1.end, seg2.start, seg2.end);
+            if dist >= self.query.weld_merge_threshold {
+                continue;
+            }
+            field_idx += 1;
+            let position = midpoint(p1, p2);
+            welds.push(MbdWeldDto {
+                id: format!("weld:{}:{i}", self.topology.branch_refno),
+                position: position.to_array(),
+                weld_type: MbdWeldType::Butt,
+                is_shop: false,
+                label: format!("M{field_idx}"),
+                left_refno: seg1.refno.to_string(),
+                right_refno: seg2.refno.to_string(),
+                layout_hint: self.query.include_layout_hints.then(|| {
+                    AnnotationLayoutPlanner::anchor_hint(self.topology, position, "weld", 2, None)
+                }),
+            });
+        }
+        welds
+    }
+
+    fn build_slopes(&self) -> Vec<MbdSlopeDto> {
+        if !self.query.include_slopes {
+            return Vec::new();
+        }
+        self.topology
+            .segments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, seg)| {
+                let dx = seg.end.x - seg.start.x;
+                let dy = seg.end.y - seg.start.y;
+                let dz = seg.end.z - seg.start.z;
+                let horizontal = (dx * dx + dy * dy).sqrt();
+                if horizontal <= 1e-3 {
+                    return None;
+                }
+                let slope = dz / horizontal;
+                let abs_slope = slope.abs();
+                if abs_slope < self.query.min_slope || abs_slope > self.query.max_slope {
+                    return None;
+                }
+                Some(MbdSlopeDto {
+                    id: format!("slope:{}:{i}", seg.refno),
+                    start: seg.start.to_array(),
+                    end: seg.end.to_array(),
+                    slope,
+                    text: format!("slope {:.1}%", abs_slope * 100.0),
+                })
+            })
+            .collect()
+    }
+
+    fn build_fittings(&self) -> Vec<MbdFittingDto> {
+        if !self.query.include_fittings {
+            return Vec::new();
+        }
+        self.fitting_elements
+            .iter()
+            .filter_map(|item| {
+                let kind = fitting_kind_from_noun(&item.noun);
+                if kind == MbdFittingKind::Unknown {
+                    return None;
+                }
+                Some(MbdFittingDto {
+                    id: format!("fitting:{}", item.refno),
+                    refno: item.refno.to_string(),
+                    noun: item.noun.clone(),
+                    kind,
+                    anchor_point: item.anchor_point.to_array(),
+                    angle: item.angle,
+                    radius: item.radius,
+                    face_center_1: item.face_center_1.map(|v| v.to_array()),
+                    face_center_2: item.face_center_2.map(|v| v.to_array()),
+                    layout_hint: self.query.include_layout_hints.then(|| {
+                        AnnotationLayoutPlanner::anchor_hint(
+                            self.topology,
+                            item.anchor_point,
+                            fitting_label_role(kind),
+                            2,
+                            None,
+                        )
+                    }),
+                })
+            })
+            .collect()
+    }
+
+    fn build_tags(
+        &self,
+        cut_tubis: &[MbdCutTubiDto],
+        fittings: &[MbdFittingDto],
+    ) -> Vec<MbdTagDto> {
+        if !self.query.include_tags {
+            return Vec::new();
+        }
+        let mut tags = Vec::new();
+        for cut in cut_tubis {
+            let start = Vec3::from_array(cut.start);
+            let end = Vec3::from_array(cut.end);
+            let pos = (start + end) * 0.5;
+            tags.push(MbdTagDto {
+                id: format!("tag:tubi:{}", cut.refno),
+                refno: cut.refno.clone(),
+                noun: "TUBI".to_string(),
+                role: "tubi".to_string(),
+                text: format!("L={}", cut.text),
+                position: pos.to_array(),
+                layout_hint: self.query.include_layout_hints.then(|| {
+                    AnnotationLayoutPlanner::anchor_hint(self.topology, pos, "tag_tubi", 1, None)
+                }),
+            });
+        }
+        for fitting in fittings {
+            let text = match fitting.kind {
+                MbdFittingKind::Elbo | MbdFittingKind::Bend => {
+                    match (fitting.angle, fitting.radius) {
+                        (Some(angle), Some(radius)) => {
+                            format!("{} {:.1}° R{:.0}", fitting.noun, angle, radius)
+                        }
+                        (Some(angle), None) => format!("{} {:.1}°", fitting.noun, angle),
+                        _ => fitting.noun.clone(),
+                    }
+                }
+                _ => fitting.noun.clone(),
+            };
+            let pos = Vec3::from_array(fitting.anchor_point);
+            tags.push(MbdTagDto {
+                id: format!("tag:fitting:{}", fitting.refno),
+                refno: fitting.refno.clone(),
+                noun: fitting.noun.clone(),
+                role: fitting_label_role(fitting.kind).to_string(),
+                text,
+                position: pos.to_array(),
+                layout_hint: fitting.layout_hint.clone(),
+            });
+        }
+        tags
+    }
+}
+
+fn fitting_kind_from_noun(noun: &str) -> MbdFittingKind {
+    match noun {
+        "ELBO" => MbdFittingKind::Elbo,
+        "BEND" => MbdFittingKind::Bend,
+        "TEE" => MbdFittingKind::Tee,
+        "OLET" => MbdFittingKind::Olet,
+        "FLAN" | "FLNG" => MbdFittingKind::Flan,
+        _ => MbdFittingKind::Unknown,
+    }
+}
+
+fn fitting_label_role(kind: MbdFittingKind) -> &'static str {
+    match kind {
+        MbdFittingKind::Elbo | MbdFittingKind::Bend => "fitting_bend",
+        MbdFittingKind::Tee | MbdFittingKind::Olet => "fitting_branch",
+        MbdFittingKind::Flan => "fitting_flan",
+        MbdFittingKind::Unknown => "fitting",
+    }
+}
+
 #[inline]
 fn segment_port_points(seg: &CacheTubiSeg) -> (Vec3, Vec3) {
     // 口径对齐既有 cache 实现：
@@ -358,13 +1162,18 @@ fn format_dim_length_text_mm(length: f32) -> String {
         return "0".to_string();
     }
     let s = format!("{:.0}", length);
-    if s == "-0" { "0".to_string() } else { s }
+    if s == "-0" {
+        "0".to_string()
+    } else {
+        s
+    }
 }
 
 async fn get_mbd_pipe(
     Path(refno): Path<String>,
     Query(query): Query<MbdPipeQuery>,
 ) -> impl IntoResponse {
+    let query = query.resolve();
     let input_refno_enum = match refno.parse::<RefnoEnum>() {
         Ok(v) => v,
         Err(e) => {
@@ -376,47 +1185,39 @@ async fn get_mbd_pipe(
         }
     };
 
-    // ── 优先读取预生成 JSON 文件 ──────────────────────────────
-    // 预生成 JSON 在 export_mbd_json_for_bran() 中生成，路径为 output/{project}/mbd/{refno}.json
-    // 命中则直接返回，跳过实时计算。
+    // 优先读取预生成 JSON；若命中则直接返回，避免重复实时计算。
     {
         let json_path = get_mbd_output_dir().join(format!("{}.json", input_refno_enum));
         if json_path.exists() {
             match std::fs::read_to_string(&json_path) {
-                Ok(content) => {
-                    match serde_json::from_str::<MbdPipeResponse>(&content) {
-                        Ok(mut resp) => {
-                            if query.debug {
-                                // 在 debug_info 中标明数据来源
-                                let debug_info = resp.data.as_mut()
-                                    .and_then(|d| d.debug_info.as_mut());
-                                if let Some(info) = debug_info {
-                                    info.notes.push("source=pregenerated_json".to_string());
-                                    info.notes.push(format!("file={}", json_path.display()));
-                                } else if let Some(ref mut d) = resp.data {
-                                    d.debug_info = Some(MbdPipeDebugInfo {
-                                        notes: vec![
-                                            "source=pregenerated_json".to_string(),
-                                            format!("file={}", json_path.display()),
-                                        ],
-                                        ..Default::default()
-                                    });
-                                }
+                Ok(content) => match serde_json::from_str::<MbdPipeResponse>(&content) {
+                    Ok(mut resp) => {
+                        if query.debug {
+                            let debug_info =
+                                resp.data.as_mut().and_then(|data| data.debug_info.as_mut());
+                            if let Some(info) = debug_info {
+                                info.notes.push("source=pregenerated_json".to_string());
+                                info.notes.push(format!("file={}", json_path.display()));
+                            } else if let Some(ref mut data) = resp.data {
+                                data.debug_info = Some(MbdPipeDebugInfo {
+                                    notes: vec![
+                                        "source=pregenerated_json".to_string(),
+                                        format!("file={}", json_path.display()),
+                                    ],
+                                    ..Default::default()
+                                });
                             }
-                            println!(
-                                "[mbd-pipe] 命中预生成 JSON: {}",
-                                json_path.display()
-                            );
-                            return json_utf8(resp);
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "[mbd-pipe] 预生成 JSON 反序列化失败（回退实时计算）: {} — {e}",
-                                json_path.display()
-                            );
-                        }
+                        println!("[mbd-pipe] 命中预生成 JSON: {}", json_path.display());
+                        return json_utf8(resp);
                     }
-                }
+                    Err(e) => {
+                        eprintln!(
+                            "[mbd-pipe] 预生成 JSON 反序列化失败（回退实时计算）: {} — {e}",
+                            json_path.display()
+                        );
+                    }
+                },
                 Err(e) => {
                     eprintln!(
                         "[mbd-pipe] 预生成 JSON 读取失败（回退实时计算）: {} — {e}",
@@ -427,75 +1228,80 @@ async fn get_mbd_pipe(
         }
     }
 
-    // ── 实时计算路径（预生成未命中时走此分支） ────────────────────
-
     // cache-only 约定：当前接口以“输入即 BRAN/HANG refno”为前提，不回退 SurrealDB 做祖先解析。
     // plant3d-web 的测试路由与面板逻辑也是以分支 refno 为输入。
     let branch_refno = input_refno_enum.clone();
 
     let (segments, mut debug_info) = match query.source {
-        MbdPipeSource::Parquet => match fetch_tubi_segments_from_parquet_with_debug(
-            branch_refno.clone(),
-            query.dbno,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(parquet_err) => {
-                // Parquet 失败 → 自动 fallback 到 SurrealDB
-                match fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await {
-                    Ok((segs, mut db_debug)) => {
-                        db_debug.fallback_used = true;
-                        db_debug.fallback_reason = Some(format!(
-                            "parquet 失败({parquet_err})，已自动回退到 SurrealDB"
-                        ));
-                        db_debug.notes.push("auto-fallback: parquet→db".into());
+        MbdPipeSource::Parquet => {
+            match fetch_tubi_segments_from_parquet_with_debug(branch_refno.clone(), query.dbno)
+                .await
+            {
+                Ok(v) => v,
+                Err(parquet_err) => {
+                    // Parquet 失败 → 自动 fallback 到 SurrealDB
+                    match fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await {
+                        Ok((segs, mut db_debug)) => {
+                            db_debug.fallback_used = true;
+                            db_debug.fallback_reason = Some(format!(
+                                "parquet 失败({parquet_err})，已自动回退到 SurrealDB"
+                            ));
+                            db_debug.notes.push("auto-fallback: parquet→db".into());
 
-                        // 后台异步导出 parquet（不阻塞当前请求）
-                        // DB 路径不会设置 inferred_dbnum，需要主动推导
-                        let dbno_for_export = query.dbno.or_else(|| {
-                            use crate::data_interface::db_meta_manager::db_meta;
-                            let _ = db_meta().ensure_loaded();
-                            let d = db_meta().get_dbnum_by_refno(branch_refno.clone()).unwrap_or(0);
-                            if d > 0 { Some(d) } else { None }
-                        });
-                        if let Some(dbnum) = dbno_for_export {
-                            tokio::spawn(async move {
-                                if let Err(e) = trigger_async_parquet_export(dbnum).await {
-                                    eprintln!("[mbd-pipe] 后台 parquet 导出失败: {e}");
+                            // 后台异步导出 parquet（不阻塞当前请求）
+                            // DB 路径不会设置 inferred_dbnum，需要主动推导
+                            let dbno_for_export = query.dbno.or_else(|| {
+                                use crate::data_interface::db_meta_manager::db_meta;
+                                let _ = db_meta().ensure_loaded();
+                                let d = db_meta()
+                                    .get_dbnum_by_refno(branch_refno.clone())
+                                    .unwrap_or(0);
+                                if d > 0 {
+                                    Some(d)
+                                } else {
+                                    None
                                 }
                             });
-                            db_debug.notes.push(format!(
-                                "已触发后台 parquet 导出 dbnum={dbnum}"
-                            ));
-                        }
+                            if let Some(dbnum) = dbno_for_export {
+                                tokio::spawn(async move {
+                                    if let Err(e) = trigger_async_parquet_export(dbnum).await {
+                                        eprintln!("[mbd-pipe] 后台 parquet 导出失败: {e}");
+                                    }
+                                });
+                                db_debug
+                                    .notes
+                                    .push(format!("已触发后台 parquet 导出 dbnum={dbnum}"));
+                            }
 
-                        (segs, db_debug)
-                    }
-                    Err(db_err) => {
-                        return json_utf8(MbdPipeResponse {
-                            success: false,
-                            error_message: Some(format!(
-                                "Parquet 失败({parquet_err})，SurrealDB 也失败({db_err})"
-                            )),
-                            data: None,
-                        });
+                            (segs, db_debug)
+                        }
+                        Err(db_err) => {
+                            return json_utf8(MbdPipeResponse {
+                                success: false,
+                                error_message: Some(format!(
+                                    "Parquet 失败({parquet_err})，SurrealDB 也失败({db_err})"
+                                )),
+                                data: None,
+                            });
+                        }
                     }
                 }
             }
-        },
-        MbdPipeSource::Db => match fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await {
-            Ok(v) => v,
-            Err(e) => {
-                return json_utf8(MbdPipeResponse {
-                    success: false,
-                    error_message: Some(format!(
+        }
+        MbdPipeSource::Db => {
+            match fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    return json_utf8(MbdPipeResponse {
+                        success: false,
+                        error_message: Some(format!(
                         "从 SurrealDB 读取分支管段失败: {e}（可尝试 ?source=cache 走 model cache）"
                     )),
-                    data: None,
-                });
+                        data: None,
+                    });
+                }
             }
-        },
+        }
         MbdPipeSource::Cache => match fetch_tubi_segments_from_cache_with_debug(
             branch_refno.clone(),
             query.dbno,
@@ -533,47 +1339,61 @@ async fn get_mbd_pipe(
         }
     }
 
-    let mut data = match generate_mbd_data_from_segments(branch_refno, &segments, &query).await {
-        Ok(d) => d,
-        Err(e) => {
-            return json_utf8(MbdPipeResponse {
-                success: false,
-                error_message: Some(format!("MBD 数据生成失败: {e}")),
-                data: None,
-            });
-        }
-    };
-    data.input_refno = input_refno_enum.to_string();
-
-    if query.include_branch_attrs {
+    let (branch_name, branch_attrs) = if query.include_branch_attrs {
         match try_fill_branch_name_and_attrs(branch_refno).await {
-            Ok((name, attrs)) => {
-                data.branch_name = name;
-                data.branch_attrs = attrs;
-            }
+            Ok(v) => v,
             Err(e) => {
-                debug_info.notes.push(format!("分支属性填充失败（已忽略）: {e}"));
+                debug_info
+                    .notes
+                    .push(format!("分支属性填充失败（已忽略）: {e}"));
+                (branch_refno.to_string(), BranchAttrsDto::default())
             }
         }
-    }
+    } else {
+        (branch_refno.to_string(), BranchAttrsDto::default())
+    };
 
-    let stats = &data.stats;
-    if query.debug {
-        debug_info.inferred_dbnum = debug_info.inferred_dbnum.or(query.dbno);
-        debug_info.requested_dbno = query.dbno;
-        debug_info.requested_batch_id = query.batch_id.clone();
-        debug_info.notes.push(format!(
-            "stats: segs={} dims={} welds={} slopes={} bends={}",
-            stats.segments_count, stats.dims_count, stats.welds_count, stats.slopes_count, stats.bends_count
-        ));
-    }
-    data.debug_info = query.debug.then_some(debug_info);
+    debug_info.inferred_dbnum = debug_info.inferred_dbnum.or(query.dbno);
+    debug_info.requested_dbno = query.dbno;
+    debug_info.requested_batch_id = query.batch_id.clone();
 
-    json_utf8(MbdPipeResponse {
-        success: true,
-        error_message: None,
-        data: Some(data),
-    })
+    match build_mbd_pipe_data_from_segments(
+        branch_refno.clone(),
+        &query,
+        segments,
+        branch_name,
+        branch_attrs,
+        debug_info,
+    )
+    .await
+    {
+        Ok(mut data) => {
+            data.input_refno = input_refno_enum.to_string();
+            if let Some(debug) = data.debug_info.as_mut() {
+                debug.notes.push(format!(
+                    "stats: segs={} dims={} cut_tubis={} welds={} slopes={} fittings={} tags={} bends={}",
+                    data.stats.segments_count,
+                    data.stats.dims_count,
+                    data.stats.cut_tubis_count,
+                    data.stats.welds_count,
+                    data.stats.slopes_count,
+                    data.stats.fittings_count,
+                    data.stats.tags_count,
+                    data.stats.bends_count,
+                ));
+            }
+            json_utf8(MbdPipeResponse {
+                success: true,
+                error_message: None,
+                data: Some(data),
+            })
+        }
+        Err(e) => json_utf8(MbdPipeResponse {
+            success: false,
+            error_message: Some(format!("生成管道标注失败: {e}")),
+            data: None,
+        }),
+    }
 }
 
 /// 正在后台导出的 dbnum 集合（防重复并发触发）
@@ -672,10 +1492,7 @@ async fn fetch_tubi_segments_from_parquet_with_debug(
 
     let tubings_path = instances_dir.join("tubings.parquet");
     if !tubings_path.exists() {
-        anyhow::bail!(
-            "tubings parquet 文件不存在: {}",
-            tubings_path.display()
-        );
+        anyhow::bail!("tubings parquet 文件不存在: {}", tubings_path.display());
     }
     let transforms_path = instances_dir.join("transforms.parquet");
 
@@ -684,7 +1501,10 @@ async fn fetch_tubi_segments_from_parquet_with_debug(
     let tubings_df = {
         let file = std::fs::File::open(&tubings_path)?;
         let full_df = ParquetReader::new(file).finish()?;
-        let mask = full_df.column("owner_refno_str")?.str()?.into_iter()
+        let mask = full_df
+            .column("owner_refno_str")?
+            .str()?
+            .into_iter()
             .map(|opt| opt.map_or(false, |v| v == owner_refno_str))
             .collect::<BooleanChunked>();
         let filtered = full_df.filter(&mask)?;
@@ -698,7 +1518,9 @@ async fn fetch_tubi_segments_from_parquet_with_debug(
             tubings_path.display()
         );
     }
-    debug.notes.push(format!("tubings rows={}", tubings_df.height()));
+    debug
+        .notes
+        .push(format!("tubings rows={}", tubings_df.height()));
 
     // 收集需要的 trans_hash 值
     let trans_hashes: Vec<String> = tubings_df
@@ -712,16 +1534,27 @@ async fn fetch_tubi_segments_from_parquet_with_debug(
     let trans_map: HashMap<String, glam::Mat4> = if transforms_path.exists() {
         let file = std::fs::File::open(&transforms_path)?;
         let full_trans_df = ParquetReader::new(file).finish()?;
-        let hash_set: std::collections::HashSet<&str> = trans_hashes.iter().map(|s| s.as_str()).collect();
-        let mask = full_trans_df.column("trans_hash")?.str()?.into_iter()
+        let hash_set: std::collections::HashSet<&str> =
+            trans_hashes.iter().map(|s| s.as_str()).collect();
+        let mask = full_trans_df
+            .column("trans_hash")?
+            .str()?
+            .into_iter()
             .map(|opt| opt.map_or(false, |v| hash_set.contains(v)))
             .collect::<BooleanChunked>();
         let trans_df = full_trans_df.filter(&mask)?;
         let mut m: HashMap<String, glam::Mat4> = HashMap::new();
         for i in 0..trans_df.height() {
-            let hash = trans_df.column("trans_hash")?.str()?.get(i).unwrap_or_default().to_string();
+            let hash = trans_df
+                .column("trans_hash")?
+                .str()?
+                .get(i)
+                .unwrap_or_default()
+                .to_string();
             let get_f = |name: &str| -> f32 {
-                trans_df.column(name).ok()
+                trans_df
+                    .column(name)
+                    .ok()
                     .and_then(|c| c.f64().ok())
                     .and_then(|ca| ca.get(i))
                     .unwrap_or(0.0) as f32
@@ -737,7 +1570,9 @@ async fn fetch_tubi_segments_from_parquet_with_debug(
         debug.notes.push(format!("transforms loaded={}", m.len()));
         m
     } else {
-        debug.notes.push("transforms.parquet 不存在，使用单位矩阵".to_string());
+        debug
+            .notes
+            .push("transforms.parquet 不存在，使用单位矩阵".to_string());
         HashMap::new()
     };
 
@@ -770,7 +1605,8 @@ async fn fetch_tubi_segments_from_parquet_with_debug(
     segs.sort_by(|a, b| {
         let ao = a.order.unwrap_or(u32::MAX);
         let bo = b.order.unwrap_or(u32::MAX);
-        ao.cmp(&bo).then_with(|| a.refno.to_string().cmp(&b.refno.to_string()))
+        ao.cmp(&bo)
+            .then_with(|| a.refno.to_string().cmp(&b.refno.to_string()))
     });
 
     Ok((segs, debug))
@@ -785,13 +1621,9 @@ async fn fetch_tubi_segments_from_cache(
     use crate::data_interface::db_meta_manager::db_meta;
     use crate::fast_model::instance_cache::InstanceCacheManager;
 
-    let (segs, _debug) = fetch_tubi_segments_from_cache_with_debug(
-        branch_refno,
-        dbno,
-        batch_id,
-        strict_dbno,
-    )
-    .await?;
+    let (segs, _debug) =
+        fetch_tubi_segments_from_cache_with_debug(branch_refno, dbno, batch_id, strict_dbno)
+            .await?;
     Ok(segs)
 }
 
@@ -856,7 +1688,8 @@ async fn fetch_tubi_segments_from_cache_with_debug(
             active_dbnum = candidates[0];
             cached_refnos = cache.list_refnos(active_dbnum);
             debug.fallback_used = true;
-            debug.fallback_reason = Some("指定 dbno 无数据；cache 仅有 1 个 dbnum，已自动回退".to_string());
+            debug.fallback_reason =
+                Some("指定 dbno 无数据；cache 仅有 1 个 dbnum，已自动回退".to_string());
         } else {
             'outer: for cand in candidates {
                 let cand_refnos = cache.list_refnos(cand);
@@ -898,8 +1731,12 @@ async fn fetch_tubi_segments_from_cache_with_debug(
     let mut merged: HashMap<RefnoEnum, CacheTubiSeg> = HashMap::new();
     debug.batches_used = vec!["per-refno".to_string()];
     for &leave_refno in &cached_refnos {
-        let Some(cached) = cache.get_inst_info(active_dbnum, leave_refno).await else { continue };
-        let Some(ref tubi_data) = cached.info.tubi else { continue };
+        let Some(cached) = cache.get_inst_info(active_dbnum, leave_refno).await else {
+            continue;
+        };
+        let Some(ref tubi_data) = cached.info.tubi else {
+            continue;
+        };
         if cached.info.owner_refno.refno() != branch_u64 {
             continue;
         }
@@ -913,10 +1750,8 @@ async fn fetch_tubi_segments_from_cache_with_debug(
                 let wt = cached.info.get_ele_world_transform();
                 let m = wt.to_matrix();
                 (
-                    tubi_start
-                        .unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 0.0))),
-                    tubi_end
-                        .unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 1.0))),
+                    tubi_start.unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 0.0))),
+                    tubi_end.unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 1.0))),
                 )
             }
         };
@@ -938,7 +1773,8 @@ async fn fetch_tubi_segments_from_cache_with_debug(
     segs.sort_by(|a, b| {
         let ao = a.order.unwrap_or(u32::MAX);
         let bo = b.order.unwrap_or(u32::MAX);
-        ao.cmp(&bo).then_with(|| a.refno.to_string().cmp(&b.refno.to_string()))
+        ao.cmp(&bo)
+            .then_with(|| a.refno.to_string().cmp(&b.refno.to_string()))
     });
     Ok((segs, debug))
 }
@@ -948,7 +1784,7 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
 ) -> anyhow::Result<(Vec<CacheTubiSeg>, MbdPipeDebugInfo)> {
     use aios_core::rs_surreal::geometry_query::PlantTransform;
     use aios_core::shape::pdms_shape::RsVec3;
-    use aios_core::{project_primary_db, SurrealQueryExt};
+    use aios_core::{SurrealQueryExt, SUL_DB};
     use serde::{Deserialize, Serialize};
     use surrealdb::types::SurrealValue;
 
@@ -994,9 +1830,13 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
         "#
     );
 
-    let rows: Vec<TubiRelateRow> = project_primary_db().query_take(&sql, 0).await?;
+    let rows: Vec<TubiRelateRow> = SUL_DB.query_take(&sql, 0).await?;
     if rows.is_empty() {
-        anyhow::bail!("tubi_relate 无结果（branch_refno={} pe_key={}）", branch_refno, pe_key);
+        anyhow::bail!(
+            "tubi_relate 无结果（branch_refno={} pe_key={}）",
+            branch_refno,
+            pe_key
+        );
     }
 
     let mut segs: Vec<CacheTubiSeg> = Vec::with_capacity(rows.len());
@@ -1028,23 +1868,41 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
     segs.sort_by(|a, b| {
         let ao = a.order.unwrap_or(u32::MAX);
         let bo = b.order.unwrap_or(u32::MAX);
-        ao.cmp(&bo).then_with(|| a.refno.to_string().cmp(&b.refno.to_string()))
+        ao.cmp(&bo)
+            .then_with(|| a.refno.to_string().cmp(&b.refno.to_string()))
     });
 
     Ok((segs, debug))
 }
 
-/// 查询分支下的 BEND/ELBO 元件，返回弯头标注数据。
-///
-/// 策略：从 tubi_relate 获取 arrive_refno 及其 noun，筛选 BEND/ELBO。
-/// 弯头的 work_point 取相邻段连接点的中点（end_pt[i] 与 start_pt[i+1] 之间），
-/// face_center 从 inst_relate 的 ptset 读取并用 inst_relate.world_trans 变换到世界坐标。
+fn build_branch_child_element_query(pe_key: &str, nouns: &[&str]) -> String {
+    let nouns_sql = nouns
+        .iter()
+        .map(|noun| format!("'{noun}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        r#"
+        SELECT
+            record::id(in) as refno,
+            in.noun as noun,
+            in.world_trans as world_trans,
+            in.ptset[*].pt as ptset_pts
+        FROM {pe_key}<-pe_owner
+        WHERE in.noun IN [{nouns_sql}];
+        "#
+    )
+}
+
+/// 查询分支下的 BEND/ELBO 元件，返回弯头标注数据
 async fn fetch_bend_elements_for_branch(
     branch_refno: RefnoEnum,
-    _bend_mode: MbdBendMode,
+    bend_mode: MbdBendMode,
 ) -> anyhow::Result<Vec<MbdBendDto>> {
+    use aios_core::rs_surreal::geometry_query::PlantTransform;
     use aios_core::shape::pdms_shape::RsVec3;
-    use aios_core::{project_primary_db, SurrealQueryExt};
+    use aios_core::{SurrealQueryExt, SUL_DB};
     use serde::{Deserialize, Serialize};
     use surrealdb::types::SurrealValue;
 
@@ -1052,35 +1910,23 @@ async fn fetch_bend_elements_for_branch(
 
     let pe_key = branch_refno.to_pe_key();
 
+    // 查询 BEND/ELBO 子元件：refno、noun、world_trans（→ work_point）、ptset（→ face_center）
     #[derive(Serialize, Deserialize, Debug, SurrealValue)]
-    struct BendTubiRow {
-        pub arrive_refno: RefnoEnum,
+    struct BendRow {
+        pub refno: RefnoEnum,
         pub noun: String,
         #[serde(default)]
-        pub end_pt: Option<RsVec3>,
+        pub world_trans: Option<PlantTransform>,
         #[serde(default)]
-        pub leave_axis: Option<RsVec3>,
-        #[serde(default)]
-        pub index: Option<i64>,
+        pub ptset_pts: Option<Vec<Option<Vec<RsVec3>>>>,
     }
 
-    let sql = format!(
-        r#"
-        SELECT
-            out as arrive_refno,
-            out.noun as noun,
-            end_pt.d as end_pt,
-            leave_axis.d as leave_axis,
-            id[1] as index
-        FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..]
-        WHERE out.noun IN ['BEND', 'ELBO'];
-        "#
-    );
+    let sql = build_branch_child_element_query(&pe_key, &["BEND", "ELBO"]);
 
-    let rows: Vec<BendTubiRow> = match project_primary_db().query_take(&sql, 0).await {
+    let rows: Vec<BendRow> = match SUL_DB.query_take(&sql, 0).await {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[mbd-pipe] fetch_bend_elements (tubi_relate) 查询失败: {e}");
+            eprintln!("[mbd-pipe] fetch_bend_elements 查询失败: {e}");
             return Ok(Vec::new());
         }
     };
@@ -1088,17 +1934,24 @@ async fn fetch_bend_elements_for_branch(
     let mut bends: Vec<MbdBendDto> = Vec::with_capacity(rows.len());
 
     for row in &rows {
-        let work_point = match (&row.end_pt, &row.leave_axis) {
-            (Some(ep), Some(la)) => midpoint(ep.0, la.0),
-            (Some(ep), None) => ep.0,
-            (None, Some(la)) => la.0,
-            (None, None) => glam::Vec3::ZERO,
+        let wt = row.world_trans.clone().unwrap_or_default();
+        let m = wt.to_matrix();
+        let work_point = m.transform_point3(glam::Vec3::ZERO);
+
+        // ptset_pts: Vec<Vec<RsVec3>> — 每个 ptset entry 的 pt 数组
+        // face_center = 每组 pt 的第一个点（如果存在）
+        let (fc1, fc2) = if let Some(ref pts_groups) = row.ptset_pts {
+            let valid_groups = pts_groups.iter().filter_map(|group| group.as_ref());
+            let mut centers = valid_groups.filter_map(|group| group.first()).map(|p| p.0);
+            let p1 = centers.next();
+            let p2 = centers.next();
+            (p1, p2)
+        } else {
+            (None, None)
         };
 
-        let fc1 = row.end_pt.as_ref().map(|p| p.0.to_array());
-        let fc2 = row.leave_axis.as_ref().map(|p| p.0.to_array());
-
-        let (angle, radius) = match aios_core::get_named_attmap(row.arrive_refno.clone()).await {
+        // 获取 ANGL、RADI 属性
+        let (angle, radius) = match aios_core::get_named_attmap(row.refno.clone()).await {
             Ok(att) => {
                 let angl = att.get_f64("ANGL").map(|v| v as f32);
                 let radi = att.get_f64("RADI").map(|v| v as f32);
@@ -1108,18 +1961,85 @@ async fn fetch_bend_elements_for_branch(
         };
 
         bends.push(MbdBendDto {
-            id: format!("bend:{}", row.arrive_refno),
-            refno: row.arrive_refno.to_string(),
+            id: format!("bend:{}", row.refno),
+            refno: row.refno.to_string(),
             noun: row.noun.clone(),
             angle,
             radius,
             work_point: work_point.to_array(),
-            face_center_1: fc1,
-            face_center_2: fc2,
+            face_center_1: fc1.map(|v| v.to_array()),
+            face_center_2: fc2.map(|v| v.to_array()),
         });
     }
 
     Ok(bends)
+}
+
+/// 查询分支下的 TEE/OLET/FLAN 元件，返回第一阶段离散标注目标
+async fn fetch_discrete_fitting_elements_for_branch(
+    branch_refno: RefnoEnum,
+) -> anyhow::Result<Vec<RawFittingElement>> {
+    use aios_core::rs_surreal::geometry_query::PlantTransform;
+    use aios_core::shape::pdms_shape::RsVec3;
+    use aios_core::{SurrealQueryExt, SUL_DB};
+    use serde::{Deserialize, Serialize};
+    use surrealdb::types::SurrealValue;
+
+    aios_core::init_surreal().await?;
+
+    #[derive(Serialize, Deserialize, Debug, SurrealValue)]
+    struct FittingRow {
+        pub refno: RefnoEnum,
+        pub noun: String,
+        #[serde(default)]
+        pub world_trans: Option<PlantTransform>,
+        #[serde(default)]
+        pub ptset_pts: Option<Vec<Option<Vec<RsVec3>>>>,
+    }
+
+    let pe_key = branch_refno.to_pe_key();
+    let sql = build_branch_child_element_query(&pe_key, &["TEE", "OLET", "FLAN", "FLNG"]);
+
+    let rows: Vec<FittingRow> = match SUL_DB.query_take(&sql, 0).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[mbd-pipe] fetch_discrete_fitting_elements 查询失败: {e}");
+            return Ok(Vec::new());
+        }
+    };
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let anchor = row
+            .world_trans
+            .map(|wt| wt.to_matrix().transform_point3(Vec3::ZERO))
+            .unwrap_or(Vec3::ZERO);
+
+        let mut flat_pts = row
+            .ptset_pts
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .flat_map(|pts| pts.into_iter())
+            .map(|p| p.0)
+            .collect::<Vec<_>>();
+        flat_pts.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+
+        let face_center_1 = flat_pts.first().copied();
+        let face_center_2 = flat_pts.get(1).copied();
+
+        items.push(RawFittingElement {
+            refno: row.refno,
+            noun: row.noun,
+            anchor_point: face_center_1.unwrap_or(anchor),
+            face_center_1,
+            face_center_2,
+            angle: None,
+            radius: None,
+        });
+    }
+
+    Ok(items)
 }
 
 fn determine_weld_type(noun1: Option<&str>, noun2: Option<&str>) -> MbdWeldType {
@@ -1188,7 +2108,11 @@ fn other_endpoint(a: Vec3, b: Vec3, used: Vec3) -> Vec3 {
         a
     } else {
         // 兜底：若 used 不是端点（理论上不应发生），则取离 used 更远的端点作为“外侧端点”。
-        if a.distance(used) > b.distance(used) { a } else { b }
+        if a.distance(used) > b.distance(used) {
+            a
+        } else {
+            b
+        }
     }
 }
 
@@ -1233,42 +2157,12 @@ fn midpoint(a: Vec3, b: Vec3) -> Vec3 {
 /// 目的：容忍段方向反转（start/end 颠倒）导致的焊缝漏检。
 #[inline]
 fn closest_endpoints(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> (Vec3, Vec3, f32) {
-    let pairs = [
-        (a0, b0),
-        (a0, b1),
-        (a1, b0),
-        (a1, b1),
-    ];
+    let pairs = [(a0, b0), (a0, b1), (a1, b0), (a1, b1)];
     let mut best = (pairs[0].0, pairs[0].1, pairs[0].0.distance(pairs[0].1));
     for (pa, pb) in pairs.into_iter().skip(1) {
         let d = pa.distance(pb);
         if d < best.2 {
             best = (pa, pb, d);
-        }
-    }
-    best
-}
-
-/// 计算两个相邻 tubi 段的"最近候选点对"，同时考虑 start/end 和 axis 点。
-///
-/// tubi 段之间通常通过管件（ELBO/BEND/TEE）连接，导致 end_pt[i] 与 start_pt[i+1] 之间
-/// 有管件占据的间隙。而 leave_axis[i] 精确等于 start[i+1]，是真正的连通点。
-fn closest_endpoints_with_axis(seg1: &CacheTubiSeg, seg2: &CacheTubiSeg) -> (Vec3, Vec3, f32) {
-    let mut pts1 = vec![seg1.start, seg1.end];
-    if let Some(a) = seg1.arrive_axis { pts1.push(a); }
-    if let Some(l) = seg1.leave_axis { pts1.push(l); }
-
-    let mut pts2 = vec![seg2.start, seg2.end];
-    if let Some(a) = seg2.arrive_axis { pts2.push(a); }
-    if let Some(l) = seg2.leave_axis { pts2.push(l); }
-
-    let mut best = (pts1[0], pts2[0], pts1[0].distance(pts2[0]));
-    for &p1 in &pts1 {
-        for &p2 in &pts2 {
-            let d = p1.distance(p2);
-            if d < best.2 {
-                best = (p1, p2, d);
-            }
         }
     }
     best
@@ -1329,284 +2223,78 @@ struct MbdGenerateRequest {
 /// 预生成默认查询参数（全量，source=Db）
 fn export_default_query() -> MbdPipeQuery {
     MbdPipeQuery {
+        mode: Some(MbdPipeMode::Construction),
         source: MbdPipeSource::Db,
-        include_dims: true,
-        include_chain_dims: true,
-        include_overall_dim: true,
-        include_port_dims: true,
-        include_welds: true,
-        include_slopes: true,
-        include_bends: true,
+        include_dims: Some(true),
+        include_chain_dims: Some(true),
+        include_overall_dim: Some(false),
+        include_port_dims: Some(false),
+        include_welds: Some(true),
+        include_slopes: Some(true),
+        include_bends: Some(true),
+        include_cut_tubis: Some(true),
+        include_fittings: Some(true),
+        include_tags: Some(true),
+        include_layout_hints: Some(true),
         include_branch_attrs: true,
         include_weld_nouns: false,
         debug: false,
-        bend_mode: MbdBendMode::Facecenter,
         ..Default::default()
     }
 }
 
-/// 核心 MBD 数据生成逻辑（不依赖 axum，可被 API handler 和批量导出共用）
-pub async fn generate_mbd_data(
+async fn build_mbd_pipe_data_from_segments(
     branch_refno: RefnoEnum,
-    query: &MbdPipeQuery,
+    query: &ResolvedMbdPipeQuery,
+    segments: Vec<CacheTubiSeg>,
+    branch_name: String,
+    branch_attrs: BranchAttrsDto,
+    debug_info: MbdPipeDebugInfo,
 ) -> anyhow::Result<MbdPipeData> {
-    let (segments, _debug) =
-        fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await?;
-    generate_mbd_data_from_segments(branch_refno, &segments, query).await
-}
+    let topology = BranchTopologyBuilder::build(branch_refno.clone(), segments);
 
-/// 从已获取的 segments 生成 MBD 数据（供 get_mbd_pipe 和 generate_mbd_data 共用）
-async fn generate_mbd_data_from_segments(
-    branch_refno: RefnoEnum,
-    segments: &[CacheTubiSeg],
-    query: &MbdPipeQuery,
-) -> anyhow::Result<MbdPipeData> {
-
-    let (branch_name, branch_attrs) = if query.include_branch_attrs {
-        match try_fill_branch_name_and_attrs(branch_refno).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[mbd-pipe] 分支属性填充失败（已忽略）: {e}");
-                (branch_refno.to_string(), BranchAttrsDto::default())
-            }
-        }
-    } else {
-        (branch_refno.to_string(), BranchAttrsDto::default())
-    };
-
-    let mut out_segments: Vec<MbdPipeSegmentDto> = Vec::with_capacity(segments.len());
-    for (i, seg) in segments.iter().enumerate() {
-        out_segments.push(MbdPipeSegmentDto {
-            id: format!("seg:{}:{i}", seg.refno),
-            refno: seg.refno.to_string(),
-            noun: "TUBI".to_string(),
-            name: None,
-            arrive: Some([seg.start.x, seg.start.y, seg.start.z]),
-            leave: Some([seg.end.x, seg.end.y, seg.end.z]),
-            length: seg.start.distance(seg.end),
-            straight_length: seg.start.distance(seg.end),
-            outside_diameter: None,
-            bore: None,
-        });
-    }
-
-    let mut dims: Vec<MbdDimDto> = Vec::new();
-    if query.include_dims {
-        for (i, seg) in segments.iter().enumerate() {
-            let length = seg.start.distance(seg.end);
-            if length < query.dim_min_length {
-                continue;
-            }
-            dims.push(MbdDimDto {
-                id: format!("dim:{}:{i}", seg.refno),
-                kind: MbdDimKind::Segment,
-                group_id: None,
-                seq: Some(i as u32),
-                start: [seg.start.x, seg.start.y, seg.start.z],
-                end: [seg.end.x, seg.end.y, seg.end.z],
-                length,
-                text: format_dim_length_text_mm(length),
-            });
-        }
-    }
-
-    if query.include_port_dims {
-        for (i, seg) in segments.iter().enumerate() {
-            let (start, end) = segment_port_points(seg);
-            let length = start.distance(end);
-            if length < query.dim_min_length {
-                continue;
-            }
-            dims.push(MbdDimDto {
-                id: format!("dim:port:{}:{i}", seg.refno),
-                kind: MbdDimKind::Port,
-                group_id: None,
-                seq: Some(i as u32),
-                start: [start.x, start.y, start.z],
-                end: [end.x, end.y, end.z],
-                length,
-                text: format_dim_length_text_mm(length),
-            });
-        }
-    }
-
-    let mut welds: Vec<MbdWeldDto> = Vec::new();
-    let mut weld_joints: Vec<WeldJoint> = Vec::new();
-
-    if query.include_welds || query.include_chain_dims || query.include_overall_dim {
-        let mut shop_idx = 0usize;
-        let mut field_idx = 0usize;
-
-        let noun_lookup = if query.include_welds && query.include_weld_nouns {
-            match try_build_tree_index_for_refno(branch_refno).await {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    eprintln!("[mbd-pipe] TreeIndex 初始化失败（weld_nouns 已忽略）: {e}");
-                    None
-                }
-            }
+    let bends: Vec<MbdBendDto> =
+        if query.include_bends || query.include_fittings || query.include_tags {
+            fetch_bend_elements_for_branch(branch_refno.clone(), query.bend_mode)
+                .await
+                .unwrap_or_default()
         } else {
-            None
+            Vec::new()
         };
 
-        for i in 0..segments.len().saturating_sub(1) {
-            let seg1 = &segments[i];
-            let seg2 = &segments[i + 1];
-
-            let (p1, p2, dist) = closest_endpoints_with_axis(seg1, seg2);
-            if dist >= query.weld_merge_threshold {
-                continue;
-            }
-
-            weld_joints.push(WeldJoint {
-                left_endpoint: p1,
-                right_endpoint: p2,
-                mid: midpoint(p1, p2),
-            });
-
-            if !query.include_welds {
-                continue;
-            }
-
-            let mut noun1: Option<&str> = Some("TUBI");
-            let mut noun2: Option<&str> = Some("TUBI");
-            let mut _noun_s1_owned: Option<String> = None;
-            let mut _noun_s2_owned: Option<String> = None;
-            if let Some(lookup) = noun_lookup.as_ref() {
-                if let Some(r1) = seg1.arrive_refno {
-                    if let Some(n) = lookup.get_noun(r1) {
-                        _noun_s1_owned = Some(n);
-                        noun1 = _noun_s1_owned.as_deref();
-                    }
-                }
-                if let Some(r2) = seg2.arrive_refno {
-                    if let Some(n) = lookup.get_noun(r2) {
-                        _noun_s2_owned = Some(n);
-                        noun2 = _noun_s2_owned.as_deref();
-                    }
-                }
-            }
-            let weld_type = determine_weld_type(noun1, noun2);
-
-            let at_ends = i == 0 || (i + 1) == (segments.len().saturating_sub(1));
-            let shop_candidate = false;
-            let is_shop = !at_ends && shop_candidate;
-
-            let label = if is_shop {
-                shop_idx += 1;
-                format!("A{shop_idx}")
-            } else {
-                field_idx += 1;
-                format!("M{field_idx}")
-            };
-
-            welds.push(MbdWeldDto {
-                id: format!("weld:{}:{i}", branch_refno),
-                position: midpoint(p1, p2).to_array(),
-                weld_type,
-                is_shop,
-                label,
-                left_refno: seg1.refno.to_string(),
-                right_refno: seg2.refno.to_string(),
-            });
-        }
-    }
-
-    if query.include_chain_dims {
-        let ends: Vec<(Vec3, Vec3)> = segments.iter().map(|s| (s.start, s.end)).collect();
-        let chain_pts = build_chain_points_from_ends(&ends, &weld_joints);
-
-        let group_id = Some(format!("chain:{}", branch_refno));
-        for i in 0..chain_pts.len().saturating_sub(1) {
-            let a = chain_pts[i];
-            let b = chain_pts[i + 1];
-            let length = a.distance(b);
-            if length < query.dim_min_length {
-                continue;
-            }
-            dims.push(MbdDimDto {
-                id: format!("dim:chain:{}:{i}", branch_refno),
-                kind: MbdDimKind::Chain,
-                group_id: group_id.clone(),
-                seq: Some(i as u32),
-                start: [a.x, a.y, a.z],
-                end: [b.x, b.y, b.z],
-                length,
-                text: format_dim_length_text_mm(length),
-            });
-        }
-    }
-
-    if query.include_overall_dim {
-        let mut total = 0.0f32;
-        for seg in segments {
-            total += seg.start.distance(seg.end);
-        }
-
-        if !segments.is_empty() {
-            let ends: Vec<(Vec3, Vec3)> = segments.iter().map(|s| (s.start, s.end)).collect();
-            let chain_pts = build_chain_points_from_ends(&ends, &weld_joints);
-            let (a, b) = if chain_pts.len() >= 2 {
-                (chain_pts[0], chain_pts[chain_pts.len() - 1])
-            } else {
-                (segments[0].start, segments[0].end)
-            };
-
-            if total >= query.dim_min_length {
-                dims.push(MbdDimDto {
-                    id: format!("dim:overall:{}", branch_refno),
-                    kind: MbdDimKind::Overall,
-                    group_id: Some(format!("overall:{}", branch_refno)),
-                    seq: None,
-                    start: [a.x, a.y, a.z],
-                    end: [b.x, b.y, b.z],
-                    length: total,
-                    text: format!("TOTAL {}", format_dim_length_text_mm(total)),
-                });
-            }
-        }
-    }
-
-    let mut slopes: Vec<MbdSlopeDto> = Vec::new();
-    if query.include_slopes {
-        for (i, seg) in segments.iter().enumerate() {
-            let dx = seg.end.x - seg.start.x;
-            let dy = seg.end.y - seg.start.y;
-            let dz = seg.end.z - seg.start.z;
-            let horizontal = (dx * dx + dy * dy).sqrt();
-            if horizontal <= 1e-3 {
-                continue;
-            }
-            let slope = dz / horizontal;
-            let abs_slope = slope.abs();
-            if abs_slope < query.min_slope || abs_slope > query.max_slope {
-                continue;
-            }
-            let text = format!("slope {:.1}%", abs_slope * 100.0);
-            slopes.push(MbdSlopeDto {
-                id: format!("slope:{}:{i}", seg.refno),
-                start: [seg.start.x, seg.start.y, seg.start.z],
-                end: [seg.end.x, seg.end.y, seg.end.z],
-                slope,
-                text,
-            });
-        }
-    }
-
-    let bends: Vec<MbdBendDto> = if query.include_bends {
-        fetch_bend_elements_for_branch(branch_refno, query.bend_mode)
+    let mut fitting_elements = if query.include_fittings || query.include_tags {
+        fetch_discrete_fitting_elements_for_branch(branch_refno.clone())
             .await
             .unwrap_or_default()
     } else {
         Vec::new()
     };
 
+    for bend in &bends {
+        fitting_elements.push(RawFittingElement {
+            refno: bend
+                .refno
+                .parse::<RefnoEnum>()
+                .unwrap_or_else(|_| branch_refno.clone()),
+            noun: bend.noun.clone(),
+            anchor_point: Vec3::from_array(bend.work_point),
+            face_center_1: bend.face_center_1.map(Vec3::from_array),
+            face_center_2: bend.face_center_2.map(Vec3::from_array),
+            angle: bend.angle,
+            radius: bend.radius,
+        });
+    }
+
+    let output = BranchMeasurementPlanner::new(query, &topology, &fitting_elements, &bends).build();
     let stats = MbdPipeStats {
-        segments_count: out_segments.len(),
-        dims_count: dims.len(),
-        welds_count: welds.len(),
-        slopes_count: slopes.len(),
-        bends_count: bends.len(),
+        segments_count: output.segments.len(),
+        dims_count: output.dims.len(),
+        cut_tubis_count: output.cut_tubis.len(),
+        welds_count: output.welds.len(),
+        slopes_count: output.slopes.len(),
+        fittings_count: output.fittings.len(),
+        tags_count: output.tags.len(),
+        bends_count: output.bends.len(),
     };
 
     Ok(MbdPipeData {
@@ -1614,14 +2302,51 @@ async fn generate_mbd_data_from_segments(
         branch_refno: branch_refno.to_string(),
         branch_name,
         branch_attrs,
-        segments: out_segments,
-        dims,
-        welds,
-        slopes,
-        bends,
+        segments: output.segments,
+        dims: output.dims,
+        cut_tubis: output.cut_tubis,
+        welds: output.welds,
+        slopes: output.slopes,
+        fittings: output.fittings,
+        tags: output.tags,
+        bends: output.bends,
         stats,
-        debug_info: None,
+        debug_info: query.debug.then_some(debug_info),
     })
+}
+
+/// 核心 MBD 数据生成逻辑（不依赖 axum，可被 API handler 和批量导出共用）
+pub async fn generate_mbd_data(
+    branch_refno: RefnoEnum,
+    query: &MbdPipeQuery,
+) -> anyhow::Result<MbdPipeData> {
+    let query = query.resolve();
+    let (segments, mut debug_info) =
+        fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await?;
+
+    let (branch_name, branch_attrs) = if query.include_branch_attrs {
+        match try_fill_branch_name_and_attrs(branch_refno).await {
+            Ok(v) => v,
+            Err(e) => {
+                debug_info
+                    .notes
+                    .push(format!("分支属性填充失败（已忽略）: {e}"));
+                (branch_refno.to_string(), BranchAttrsDto::default())
+            }
+        }
+    } else {
+        (branch_refno.to_string(), BranchAttrsDto::default())
+    };
+
+    build_mbd_pipe_data_from_segments(
+        branch_refno,
+        &query,
+        segments,
+        branch_name,
+        branch_attrs,
+        debug_info,
+    )
+    .await
 }
 
 /// 生成单个 BRAN 的 MBD JSON 并写入磁盘
@@ -1649,17 +2374,15 @@ pub async fn export_mbd_json_for_bran(
 }
 
 /// 根据 scope 收集 BRAN/HANG refno 列表
-async fn collect_bran_refnos_for_scope(
-    scope: &MbdExportScope,
-) -> anyhow::Result<Vec<RefnoEnum>> {
-    use aios_core::{project_primary_db, SurrealQueryExt};
+async fn collect_bran_refnos_for_scope(scope: &MbdExportScope) -> anyhow::Result<Vec<RefnoEnum>> {
+    use aios_core::{SurrealQueryExt, SUL_DB};
 
     aios_core::init_surreal().await?;
 
     match scope {
         MbdExportScope::ByDbnum(dbnum) => {
             let sql = "SELECT value id FROM pe WHERE noun IN ['BRAN', 'HANG']";
-            let all_refnos: Vec<RefnoEnum> = project_primary_db().query_take(sql, 0).await?;
+            let all_refnos: Vec<RefnoEnum> = SUL_DB.query_take(sql, 0).await?;
 
             let db_meta = crate::data_interface::db_meta_manager::db_meta();
             db_meta.ensure_loaded()?;
@@ -1686,7 +2409,7 @@ async fn collect_bran_refnos_for_scope(
         }
         MbdExportScope::AllDbnums => {
             let sql = "SELECT value id FROM pe WHERE noun IN ['BRAN', 'HANG']";
-            let all_refnos: Vec<RefnoEnum> = project_primary_db().query_take(sql, 0).await?;
+            let all_refnos: Vec<RefnoEnum> = SUL_DB.query_take(sql, 0).await?;
             Ok(all_refnos)
         }
     }
@@ -1752,10 +2475,7 @@ pub async fn export_mbd_json_batch(
     };
     let manifest_path = output_dir.join("manifest.json");
     std::fs::create_dir_all(output_dir)?;
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_string_pretty(&manifest)?,
-    )?;
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
     println!(
@@ -1787,9 +2507,7 @@ pub fn get_mbd_output_dir() -> PathBuf {
 }
 
 /// POST /api/mbd/generate handler
-async fn post_generate_mbd(
-    Json(req): Json<MbdGenerateRequest>,
-) -> impl IntoResponse {
+async fn post_generate_mbd(Json(req): Json<MbdGenerateRequest>) -> impl IntoResponse {
     let output_dir = get_mbd_output_dir();
 
     let scope = if let Some(refno_str) = &req.refno {
@@ -1827,6 +2545,7 @@ async fn post_generate_mbd(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
 
     #[test]
     fn test_closest_endpoints_direction_flip() {
@@ -1910,6 +2629,270 @@ mod tests {
         assert_eq!(a.to_array(), [2.0, 0.0, 0.0]);
         assert_eq!(b.to_array(), [5.0, 0.0, 0.0]);
     }
+
+    #[test]
+    fn test_mbd_pipe_mode_defaults_to_construction() {
+        let resolved = MbdPipeQuery::default().resolve();
+        assert_eq!(resolved.mode, MbdPipeMode::Construction);
+        assert!(resolved.include_dims);
+        assert!(resolved.include_chain_dims);
+        assert!(!resolved.include_overall_dim);
+        assert!(!resolved.include_port_dims);
+        assert!(resolved.include_welds);
+        assert!(resolved.include_slopes);
+        assert!(!resolved.include_bends);
+        assert!(resolved.include_cut_tubis);
+        assert!(resolved.include_fittings);
+        assert!(resolved.include_tags);
+        assert!(resolved.include_layout_hints);
+    }
+
+    #[test]
+    fn test_mbd_pipe_mode_inspection_can_deserialize() {
+        let mode: MbdPipeMode = serde_json::from_value(json!("inspection")).unwrap();
+        assert_eq!(mode, MbdPipeMode::Inspection);
+    }
+
+    #[test]
+    fn test_mbd_pipe_query_resolve_inspection_defaults() {
+        let resolved = MbdPipeQuery {
+            mode: Some(MbdPipeMode::Inspection),
+            ..Default::default()
+        }
+        .resolve();
+
+        assert_eq!(resolved.mode, MbdPipeMode::Inspection);
+        assert!(resolved.include_dims);
+        assert!(!resolved.include_chain_dims);
+        assert!(!resolved.include_overall_dim);
+        assert!(resolved.include_port_dims);
+        assert!(!resolved.include_welds);
+        assert!(!resolved.include_slopes);
+        assert!(!resolved.include_bends);
+        assert!(!resolved.include_cut_tubis);
+        assert!(!resolved.include_fittings);
+        assert!(!resolved.include_tags);
+        assert!(!resolved.include_layout_hints);
+    }
+
+    #[test]
+    fn test_mbd_pipe_query_resolve_explicit_port_override_on_construction() {
+        let resolved = MbdPipeQuery {
+            include_port_dims: Some(true),
+            ..Default::default()
+        }
+        .resolve();
+
+        assert_eq!(resolved.mode, MbdPipeMode::Construction);
+        assert!(resolved.include_port_dims);
+    }
+
+    #[test]
+    fn test_mbd_pipe_query_resolve_explicit_chain_override_on_inspection() {
+        let resolved = MbdPipeQuery {
+            mode: Some(MbdPipeMode::Inspection),
+            include_chain_dims: Some(true),
+            ..Default::default()
+        }
+        .resolve();
+
+        assert_eq!(resolved.mode, MbdPipeMode::Inspection);
+        assert!(resolved.include_chain_dims);
+        assert!(resolved.include_port_dims);
+    }
+
+    #[test]
+    fn test_mbd_pipe_query_resolve_explicit_new_flags_override_mode_defaults() {
+        let resolved = MbdPipeQuery {
+            mode: Some(MbdPipeMode::Inspection),
+            include_cut_tubis: Some(true),
+            include_fittings: Some(true),
+            include_tags: Some(true),
+            include_layout_hints: Some(true),
+            ..Default::default()
+        }
+        .resolve();
+
+        assert!(resolved.include_cut_tubis);
+        assert!(resolved.include_fittings);
+        assert!(resolved.include_tags);
+        assert!(resolved.include_layout_hints);
+    }
+
+    #[test]
+    fn test_measurement_planner_separates_cut_tubis_from_dims() {
+        let query = MbdPipeQuery::default().resolve();
+        let topology = BranchTopologyBuilder::build(
+            RefnoEnum::from("24381_145018"),
+            vec![
+                CacheTubiSeg {
+                    refno: RefnoEnum::from("1_1"),
+                    arrive_refno: None,
+                    order: Some(0),
+                    start: Vec3::new(0.0, 0.0, 0.0),
+                    end: Vec3::new(100.0, 0.0, 0.0),
+                    arrive_axis: None,
+                    leave_axis: None,
+                },
+                CacheTubiSeg {
+                    refno: RefnoEnum::from("1_2"),
+                    arrive_refno: None,
+                    order: Some(1),
+                    start: Vec3::new(100.0, 0.0, 0.0),
+                    end: Vec3::new(220.0, 0.0, 0.0),
+                    arrive_axis: None,
+                    leave_axis: None,
+                },
+            ],
+        );
+
+        let output = BranchMeasurementPlanner::new(&query, &topology, &[], &[]).build();
+
+        assert_eq!(output.cut_tubis.len(), 2);
+        assert!(output.dims.iter().all(|dim| {
+            matches!(
+                dim.kind,
+                MbdDimKind::Segment | MbdDimKind::Chain | MbdDimKind::Overall | MbdDimKind::Port
+            )
+        }));
+        assert!(output.dims.iter().all(|dim| dim.id.starts_with("dim:")));
+        assert!(output
+            .cut_tubis
+            .iter()
+            .all(|item| item.id.starts_with("cut_tubi:")));
+    }
+
+    #[test]
+    fn test_measurement_planner_generates_fittings_and_tags_with_layout_hints() {
+        let query = MbdPipeQuery::default().resolve();
+        let topology = BranchTopologyBuilder::build(
+            RefnoEnum::from("24381_145018"),
+            vec![CacheTubiSeg {
+                refno: RefnoEnum::from("1_1"),
+                arrive_refno: None,
+                order: Some(0),
+                start: Vec3::new(0.0, 0.0, 0.0),
+                end: Vec3::new(100.0, 0.0, 0.0),
+                arrive_axis: None,
+                leave_axis: None,
+            }],
+        );
+        let fittings = vec![
+            RawFittingElement {
+                refno: RefnoEnum::from("2_1"),
+                noun: "TEE".to_string(),
+                anchor_point: Vec3::new(50.0, 0.0, 0.0),
+                face_center_1: None,
+                face_center_2: None,
+                angle: None,
+                radius: None,
+            },
+            RawFittingElement {
+                refno: RefnoEnum::from("2_2"),
+                noun: "FLAN".to_string(),
+                anchor_point: Vec3::new(100.0, 0.0, 0.0),
+                face_center_1: None,
+                face_center_2: None,
+                angle: None,
+                radius: None,
+            },
+        ];
+
+        let output = BranchMeasurementPlanner::new(&query, &topology, &fittings, &[]).build();
+
+        assert_eq!(output.fittings.len(), 2);
+        assert!(output.tags.iter().any(|tag| tag.noun == "TEE"));
+        assert!(output.tags.iter().any(|tag| tag.noun == "FLAN"));
+        assert!(output.fittings.iter().all(|item| item
+            .layout_hint
+            .as_ref()
+            .and_then(|hint| hint.owner_segment_id.clone())
+            .is_some()));
+    }
+
+    #[test]
+    fn test_bend_query_uses_direct_branch_children() {
+        let sql = build_branch_child_element_query("pe:`24381_145018`", &["BEND", "ELBO"]);
+
+        assert!(sql.contains("FROM pe:`24381_145018`<-pe_owner"));
+        assert!(!sql.contains("->inst_relate"));
+        assert!(sql.contains("record::id(in) as refno"));
+        assert!(sql.contains("in.world_trans as world_trans"));
+        assert!(sql.contains("in.ptset[*].pt as ptset_pts"));
+    }
+
+    #[test]
+    fn test_discrete_fitting_query_uses_direct_branch_children() {
+        let sql =
+            build_branch_child_element_query("pe:`24381_145018`", &["TEE", "OLET", "FLAN", "FLNG"]);
+
+        assert!(sql.contains("FROM pe:`24381_145018`<-pe_owner"));
+        assert!(!sql.contains("->inst_relate"));
+        assert!(sql.contains("WHERE in.noun IN ['TEE', 'OLET', 'FLAN', 'FLNG']"));
+    }
+
+    #[test]
+    fn test_stats_serialization_exposes_phase1_counts() {
+        let stats = MbdPipeStats {
+            segments_count: 1,
+            dims_count: 2,
+            cut_tubis_count: 3,
+            welds_count: 4,
+            slopes_count: 5,
+            fittings_count: 6,
+            tags_count: 7,
+            bends_count: 8,
+        };
+        let json = serde_json::to_value(stats).expect("stats serialize");
+        assert!(json.get("cut_tubis_count").is_some());
+        assert!(json.get("fittings_count").is_some());
+        assert!(json.get("tags_count").is_some());
+    }
+
+    #[test]
+    fn test_data_serialization_exposes_phase1_collections() {
+        let data = MbdPipeData {
+            input_refno: "24381_145018".to_string(),
+            branch_refno: "24381_145018".to_string(),
+            branch_name: "demo".to_string(),
+            branch_attrs: BranchAttrsDto::default(),
+            segments: Vec::new(),
+            dims: Vec::new(),
+            cut_tubis: Vec::new(),
+            welds: Vec::new(),
+            slopes: Vec::new(),
+            fittings: Vec::new(),
+            tags: Vec::new(),
+            bends: Vec::new(),
+            stats: MbdPipeStats::default(),
+            debug_info: Some(MbdPipeDebugInfo::default()),
+        };
+        let json = serde_json::to_value(data).expect("data serialize");
+        assert!(json.get("cut_tubis").is_some());
+        assert!(json.get("fittings").is_some());
+        assert!(json.get("tags").is_some());
+    }
+
+    #[test]
+    fn test_debug_notes_use_phase1_stats_format() {
+        let debug = MbdPipeDebugInfo {
+            notes: vec![
+                "stats: segs=1 dims=2 cut_tubis=3 welds=4 slopes=5 fittings=6 tags=7 bends=8"
+                    .to_string(),
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(debug).expect("debug serialize");
+        let notes = json
+            .get("notes")
+            .and_then(Value::as_array)
+            .expect("notes array");
+        let last = notes
+            .last()
+            .and_then(Value::as_str)
+            .expect("last note string");
+        assert!(last.contains("cut_tubis="));
+        assert!(last.contains("fittings="));
+        assert!(last.contains("tags="));
+    }
 }
-
-

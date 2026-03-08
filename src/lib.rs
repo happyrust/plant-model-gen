@@ -162,6 +162,8 @@ pub mod cata;
 
 pub mod consts;
 
+pub mod cli_args;
+
 pub mod data_interface;
 
 pub mod dblist_parser;
@@ -549,41 +551,7 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 
 
 
-    if db_option.gen_spatial_tree {
-
-        log::info!("🏠 启用房间计算功能");
-
-        log::info!("房间关键字为: {:?}", db_option.get_room_key_word());
-
-        log::info!("正在执行房间计算...");
-
-        log::info!("正在构建房间关系和空间索引...");
-
-        // SQLite R*-tree will be used for spatial indexing
-
-        let mut time = Instant::now();
-
-        if let Err(e) = build_room_relations(&db_option, None, None).await {
-
-            log::error!("❌ 房间计算失败: {}", e);
-
-            return Err(e);
-
-        }
-
-        log::info!("✅ 房间计算完成，耗时: {} ms", time.elapsed().as_millis());
-
-        // 未来可以在这里添加更多房间计算相关功能
-
-        // log::info!("正在计算设备房间关系");
-
-        // update_cal_equip().await?;
-
-        // log::info!("正在计算分支房间关系");
-
-        // update_cal_bran_component().await?;
-
-    }
+    // 房间计算已迁移至独立 CLI 子命令：`aios-database room compute`
 
 
 
@@ -915,13 +883,6 @@ async fn run_app_internal(db_option_ext: options::DbOptionExt) -> anyhow::Result
 
     aios_core::initialize_databases(&db_option_ext.inner).await?;
 
-
-
-    if db_option_ext.inner.gen_spatial_tree {
-
-        // SQLite R*-tree initialization is handled in spatial_index_builder
-
-    }
 
 
 

@@ -158,11 +158,21 @@ async fn main() -> Result<()> {
 
     // 诊断：各关键表行数
     {
-        let tables = ["pe", "inst_relate", "inst_relate_aabb", "geo_relate", "inst_geo"];
+        let tables = [
+            "pe",
+            "inst_relate",
+            "inst_relate_aabb",
+            "geo_relate",
+            "inst_geo",
+        ];
         for t in &tables {
             let sql = format!("SELECT count() as cnt FROM {t} GROUP ALL");
             let r: Vec<serde_json::Value> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
-            let cnt = r.first().and_then(|v| v.get("cnt")).and_then(|v| v.as_i64()).unwrap_or(0);
+            let cnt = r
+                .first()
+                .and_then(|v| v.get("cnt"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             println!("[diag] {t}: {cnt} rows");
         }
     }
@@ -181,7 +191,11 @@ async fn main() -> Result<()> {
             .first()
             .map(record_id_to_surreal_literal)
             .unwrap_or_default();
-        anyhow::ensure!(!sbfr_pe.is_empty(), "未找到 PANE.OWNER(SBFR) : {}", panel_refno);
+        anyhow::ensure!(
+            !sbfr_pe.is_empty(),
+            "未找到 PANE.OWNER(SBFR) : {}",
+            panel_refno
+        );
 
         let frmw_sql = format!(
             "SELECT VALUE OWNER FROM SBFR WHERE REFNO = {} LIMIT 1",
@@ -192,7 +206,11 @@ async fn main() -> Result<()> {
             .first()
             .map(record_id_to_surreal_literal)
             .unwrap_or_default();
-        anyhow::ensure!(!frmw_pe.is_empty(), "未找到 SBFR.OWNER(FRMW) : SBFR={}", sbfr_pe);
+        anyhow::ensure!(
+            !frmw_pe.is_empty(),
+            "未找到 SBFR.OWNER(FRMW) : SBFR={}",
+            sbfr_pe
+        );
 
         let room_num_sql = format!(
             "SELECT VALUE array::last(string::split(NAME, '-')) FROM FRMW WHERE REFNO = {} LIMIT 1",
@@ -203,7 +221,11 @@ async fn main() -> Result<()> {
             .await
             .unwrap_or_default();
         room_num = room_nums.first().cloned().unwrap_or_default();
-        anyhow::ensure!(!room_num.is_empty(), "未能从 FRMW.NAME 解析房间号: FRMW={}", frmw_pe);
+        anyhow::ensure!(
+            !room_num.is_empty(),
+            "未能从 FRMW.NAME 解析房间号: FRMW={}",
+            frmw_pe
+        );
 
         println!("   - SBFR(pe): {}", sbfr_pe);
         println!("   - FRMW(pe): {}", frmw_pe);
@@ -241,7 +263,12 @@ async fn main() -> Result<()> {
                 for (r, aabb_opt, intersects) in &diag.expect_refno_aabb_intersects {
                     let aabb_str = aabb_opt
                         .as_ref()
-                        .map(|a| format!("({:.1},{:.1},{:.1})..({:.1},{:.1},{:.1})", a.mins.x, a.mins.y, a.mins.z, a.maxs.x, a.maxs.y, a.maxs.z))
+                        .map(|a| {
+                            format!(
+                                "({:.1},{:.1},{:.1})..({:.1},{:.1},{:.1})",
+                                a.mins.x, a.mins.y, a.mins.z, a.maxs.x, a.maxs.y, a.maxs.z
+                            )
+                        })
                         .unwrap_or_else(|| "缺失".to_string());
                     println!(
                         "   expect {}: aabb={} 与query_aabb相交={}",
@@ -252,7 +279,10 @@ async fn main() -> Result<()> {
                     println!("   expect {} 在RTree候选列表: {}", r, in_rtree);
                 }
                 println!("   RTree 候选总数: {}", diag.rtree_candidates.len());
-                let all_ok = diag.expect_refno_in_rtree.iter().all(|(_, in_rtree)| *in_rtree);
+                let all_ok = diag
+                    .expect_refno_in_rtree
+                    .iter()
+                    .all(|(_, in_rtree)| *in_rtree);
                 if all_ok {
                     println!("   ✅ 粗算通过：所有 expect_refno 均在候选列表中");
                 } else {

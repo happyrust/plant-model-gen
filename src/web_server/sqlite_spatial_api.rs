@@ -75,6 +75,8 @@ pub struct SqliteSpatialQueryParams {
     pub nouns: Option<String>,
     /// 是否包含自身（mode=refno 时有效，默认 true）
     pub include_self: Option<bool>,
+    /// 查询形状："cube"（默认）| "sphere"（球体，会对结果做距离二次过滤）
+    pub shape: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -330,6 +332,18 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
     let query_aabb = expand_aabb(base_aabb, distance);
     let query_bbox_dto = aabb_to_dto(&query_aabb);
 
+    // 球体模式：计算查询 AABB 的中心和半径，用于二次距离过滤
+    let is_sphere = params.shape.as_deref().unwrap_or("cube").eq_ignore_ascii_case("sphere");
+    let sphere_center_x = (query_aabb.mins.x + query_aabb.maxs.x) * 0.5;
+    let sphere_center_y = (query_aabb.mins.y + query_aabb.maxs.y) * 0.5;
+    let sphere_center_z = (query_aabb.mins.z + query_aabb.maxs.z) * 0.5;
+    let sphere_radius = (query_aabb.maxs.x - query_aabb.mins.x).max(
+        (query_aabb.maxs.y - query_aabb.mins.y).max(
+            query_aabb.maxs.z - query_aabb.mins.z,
+        ),
+    ) * 0.5;
+    let sphere_radius_sq = sphere_radius * sphere_radius;
+
     let ids = match idx.query_intersect(
         query_aabb.mins.x as f64,
         query_aabb.maxs.x as f64,
@@ -419,6 +433,22 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
             .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
             .optional()
             .unwrap_or(None);
+
+        // 球体模式：基于元素 AABB 中心到查询中心的距离做精确过滤
+        if is_sphere {
+            if let Some((minx, miny, minz, maxx, maxy, maxz)) = aabb_row {
+                let cx = (minx + maxx) * 0.5;
+                let cy = (miny + maxy) * 0.5;
+                let cz = (minz + maxz) * 0.5;
+                let dx = cx - sphere_center_x;
+                let dy = cy - sphere_center_y;
+                let dz = cz - sphere_center_z;
+                if dx * dx + dy * dy + dz * dz > sphere_radius_sq {
+                    continue;
+                }
+            }
+        }
+
         let aabb = aabb_row.map(|(minx, miny, minz, maxx, maxy, maxz)| aabb_dto_from_row(minx, miny, minz, maxx, maxy, maxz));
 
         let refno = i64_to_refno_str(id as i64);
@@ -536,6 +566,7 @@ mod tests {
             max_results: None,
             nouns: None,
             include_self: None,
+            shape: None,
         };
         let resp = do_spatial_query(params);
         assert!(resp.success);

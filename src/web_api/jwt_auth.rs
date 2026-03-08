@@ -4,16 +4,18 @@
 
 use axum::{
     Router,
-    extract::Json,
-    http::StatusCode,
-    routing::post,
+    extract::{Json, State},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::IntoResponse,
+    routing::post,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 #[cfg(feature = "web_server")]
-use jsonwebtoken::{encode, decode, Header, Algorithm, Validation, EncodingKey, DecodingKey, TokenData};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation, decode, encode,
+};
 
 // ============================================================================
 // Configuration
@@ -28,6 +30,19 @@ pub struct JwtConfig {
     pub expiration_hours: u64,
 }
 
+/// 校审接口认证配置
+#[derive(Clone, Debug)]
+pub struct ReviewAuthConfig {
+    /// 是否启用 JWT 认证
+    pub enabled: bool,
+    /// 关闭认证时注入的调试项目号
+    pub debug_project_id: String,
+    /// 关闭认证时注入的调试用户
+    pub debug_user_id: String,
+    /// 关闭认证时注入的调试角色
+    pub debug_role: String,
+}
+
 impl Default for JwtConfig {
     fn default() -> Self {
         Self {
@@ -38,29 +53,95 @@ impl Default for JwtConfig {
     }
 }
 
+impl Default for ReviewAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            debug_project_id: "debug-project".to_string(),
+            debug_user_id: "debug-user".to_string(),
+            debug_role: "sj".to_string(),
+        }
+    }
+}
+
+fn build_config_names(config_path: Option<&str>) -> Vec<String> {
+    let mut config_names = Vec::new();
+
+    if let Some(config_path) = config_path {
+        let normalized = config_path
+            .strip_suffix(".toml")
+            .unwrap_or(config_path)
+            .to_string();
+        config_names.push(normalized);
+    }
+
+    config_names.extend(
+        [
+            "db_options/DbOption".to_string(),
+            "../db_options/DbOption".to_string(),
+            "DbOption".to_string(),
+        ],
+    );
+
+    config_names
+}
+
+fn load_config() -> Option<config::Config> {
+    use config as cfg;
+
+    let env_config = std::env::var("DB_OPTION_FILE").ok();
+    let config_names = build_config_names(env_config.as_deref());
+
+    for name in config_names {
+        let file_path = format!("{}.toml", name);
+        if std::path::Path::new(&file_path).exists() {
+            if let Ok(config) = cfg::Config::builder()
+                .add_source(cfg::File::with_name(&name))
+                .build()
+            {
+                return Some(config);
+            }
+        }
+    }
+
+    None
+}
+
 impl JwtConfig {
     /// 从配置文件加载
     pub fn from_config_file() -> Self {
-        let config_path = "DbOption.toml";
-        if let Ok(content) = std::fs::read_to_string(config_path) {
-            if let Ok(toml_value) = content.parse::<toml::Value>() {
-                if let Some(mc) = toml_value.get("model_center") {
-                    let secret = mc.get("token_secret")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("default-jwt-secret-key")
-                        .to_string();
-                    
-                    let expiration_hours = mc.get("token_expiration_hours")
-                        .and_then(|v| v.as_integer())
-                        .unwrap_or(24) as u64;
-                    
-                    return Self {
-                        secret,
-                        expiration_hours,
-                    };
-                }
-            }
+        if let Some(config) = load_config() {
+            return Self {
+                secret: config
+                    .get_string("model_center.token_secret")
+                    .unwrap_or_else(|_| "default-jwt-secret-key".to_string()),
+                expiration_hours: config
+                    .get_int("model_center.token_expiration_hours")
+                    .unwrap_or(24) as u64,
+            };
         }
+        Self::default()
+    }
+}
+
+impl ReviewAuthConfig {
+    /// 从配置文件加载
+    pub fn from_config_file() -> Self {
+        if let Some(config) = load_config() {
+            return Self {
+                enabled: config.get_bool("review_auth.enabled").unwrap_or(true),
+                debug_project_id: config
+                    .get_string("review_auth.debug_project_id")
+                    .unwrap_or_else(|_| "debug-project".to_string()),
+                debug_user_id: config
+                    .get_string("review_auth.debug_user_id")
+                    .unwrap_or_else(|_| "debug-user".to_string()),
+                debug_role: config
+                    .get_string("review_auth.debug_role")
+                    .unwrap_or_else(|_| "sj".to_string()),
+            };
+        }
+
         Self::default()
     }
 }
@@ -97,7 +178,7 @@ impl Role {
             _ => None,
         }
     }
-    
+
     /// 转换为字符串
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -108,7 +189,7 @@ impl Role {
             Role::Pz => "pz",
         }
     }
-    
+
     /// 获取角色显示名称
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -119,7 +200,7 @@ impl Role {
             Role::Pz => "批准",
         }
     }
-    
+
     /// 获取所有有效角色值
     pub fn valid_values() -> &'static [&'static str] {
         &["admin", "sj", "jd", "sh", "pz"]
@@ -218,23 +299,36 @@ pub struct VerifyData {
 
 lazy_static::lazy_static! {
     static ref JWT_CONFIG: JwtConfig = JwtConfig::from_config_file();
+    pub static ref REVIEW_AUTH_CONFIG: ReviewAuthConfig = ReviewAuthConfig::from_config_file();
 }
 
 /// 生成 form_id (UUID)
 pub fn generate_form_id() -> String {
-    format!("FORM-{}", uuid::Uuid::new_v4().to_string().replace("-", "").to_uppercase()[..12].to_string())
+    format!(
+        "FORM-{}",
+        uuid::Uuid::new_v4()
+            .to_string()
+            .replace("-", "")
+            .to_uppercase()[..12]
+            .to_string()
+    )
 }
 
 /// 生成 JWT Token
 #[cfg(feature = "web_server")]
-pub fn create_token(project_id: &str, user_id: &str, form_id: &str, role: Option<&str>) -> Result<(String, u64), String> {
+pub fn create_token(
+    project_id: &str,
+    user_id: &str,
+    form_id: &str,
+    role: Option<&str>,
+) -> Result<(String, u64), String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_secs();
-    
+
     let exp = now + JWT_CONFIG.expiration_hours * 3600;
-    
+
     let claims = TokenClaims {
         project_id: project_id.to_string(),
         user_id: user_id.to_string(),
@@ -243,13 +337,14 @@ pub fn create_token(project_id: &str, user_id: &str, form_id: &str, role: Option
         exp,
         iat: now,
     };
-    
+
     let token = encode(
         &Header::default(),
         &claims,
         &EncodingKey::from_secret(JWT_CONFIG.secret.as_bytes()),
-    ).map_err(|e| e.to_string())?;
-    
+    )
+    .map_err(|e| e.to_string())?;
+
     Ok((token, exp))
 }
 
@@ -258,13 +353,14 @@ pub fn create_token(project_id: &str, user_id: &str, form_id: &str, role: Option
 pub fn verify_token(token: &str) -> Result<TokenClaims, String> {
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
-    
+
     let token_data: TokenData<TokenClaims> = decode(
         token,
         &DecodingKey::from_secret(JWT_CONFIG.secret.as_bytes()),
         &validation,
-    ).map_err(|e| e.to_string())?;
-    
+    )
+    .map_err(|e| e.to_string())?;
+
     Ok(token_data.claims)
 }
 
@@ -274,13 +370,14 @@ pub fn decode_token_unsafe(token: &str) -> Result<TokenClaims, String> {
     let mut validation = Validation::new(Algorithm::HS256);
     validation.insecure_disable_signature_validation();
     validation.validate_exp = false;
-    
+
     let token_data: TokenData<TokenClaims> = decode(
         token,
         &DecodingKey::from_secret(&[]), // 不需要密钥
         &validation,
-    ).map_err(|e| e.to_string())?;
-    
+    )
+    .map_err(|e| e.to_string())?;
+
     Ok(token_data.claims)
 }
 
@@ -300,12 +397,59 @@ pub fn create_jwt_auth_routes() -> Router {
 // Axum Middleware
 // ============================================================================
 
-use axum::{
-    extract::Request,
-    middleware::Next,
-    response::Response,
-    http::header::AUTHORIZATION,
-};
+use axum::{extract::Request, middleware::Next, response::Response};
+
+fn unauthorized_error(message: String) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "success": false,
+            "error_message": message
+        })),
+    )
+}
+
+fn extract_bearer_token<'a>(headers: &'a HeaderMap) -> Option<&'a str> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+fn resolve_token_claims(
+    headers: &HeaderMap,
+) -> Result<TokenClaims, (StatusCode, Json<serde_json::Value>)> {
+    let token = extract_bearer_token(headers).ok_or_else(|| {
+        unauthorized_error("Missing or invalid Authorization header".to_string())
+    })?;
+
+    verify_token(token).map_err(|e| {
+        warn!("JWT verification failed: {}", e);
+        unauthorized_error(format!("Invalid token: {}", e))
+    })
+}
+
+fn build_debug_claims(config: &ReviewAuthConfig) -> TokenClaims {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let role = config.debug_role.trim();
+
+    TokenClaims {
+        project_id: config.debug_project_id.clone(),
+        user_id: config.debug_user_id.clone(),
+        form_id: "FORM-DEBUG-AUTH-BYPASS".to_string(),
+        role: if role.is_empty() {
+            None
+        } else {
+            Some(role.to_string())
+        },
+        exp: now + 365 * 24 * 3600,
+        iat: now,
+    }
+}
 
 /// JWT 认证中间件
 /// 从 Authorization header 提取 Bearer token 并验证
@@ -314,52 +458,38 @@ pub async fn jwt_auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-    // 从 Authorization header 提取 token
-    let auth_header = request.headers()
-        .get(AUTHORIZATION)
-        .and_then(|h| h.to_str().ok());
+    let claims = resolve_token_claims(request.headers())?;
+    request.extensions_mut().insert(claims);
+    Ok(next.run(request).await)
+}
 
-    let token = match auth_header {
-        Some(h) if h.starts_with("Bearer ") => &h[7..],
-        _ => {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error_message": "Missing or invalid Authorization header"
-                }))
-            ));
-        }
-    };
-
-    // 验证 token
-    match verify_token(token) {
-        Ok(claims) => {
-            // 将 claims 存入 request extensions
-            request.extensions_mut().insert(claims);
-            Ok(next.run(request).await)
-        }
-        Err(e) => {
-            warn!("JWT verification failed: {}", e);
-            Err((
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error_message": format!("Invalid token: {}", e)
-                }))
-            ))
-        }
+/// 校审 API 认证中间件
+/// 启用认证时校验 JWT；关闭认证时注入调试身份
+#[cfg(feature = "web_server")]
+pub async fn review_auth_middleware(
+    State(config): State<ReviewAuthConfig>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    if config.enabled {
+        let claims = resolve_token_claims(request.headers())?;
+        request.extensions_mut().insert(claims);
+    } else {
+        let claims = extract_bearer_token(request.headers())
+            .and_then(|token| decode_token_unsafe(token).ok())
+            .unwrap_or_else(|| build_debug_claims(&config));
+        request.extensions_mut().insert(claims);
     }
+
+    Ok(next.run(request).await)
 }
 
 /// 可选的 JWT 认证中间件（不强制要求 token）
 #[cfg(feature = "web_server")]
-pub async fn jwt_auth_optional_middleware(
-    mut request: Request,
-    next: Next,
-) -> Response {
+pub async fn jwt_auth_optional_middleware(mut request: Request, next: Next) -> Response {
     // 尝试从 Authorization header 提取 token
-    if let Some(auth_header) = request.headers()
+    if let Some(auth_header) = request
+        .headers()
         .get(AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
     {
@@ -376,7 +506,18 @@ pub async fn jwt_auth_optional_middleware(
 /// 角色验证中间件工厂
 /// 检查用户是否具有指定角色之一
 #[cfg(feature = "web_server")]
-pub fn require_roles(allowed_roles: &'static [&'static str]) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, (StatusCode, Json<serde_json::Value>)>> + Send>> + Clone + Send {
+pub fn require_roles(
+    allowed_roles: &'static [&'static str],
+) -> impl Fn(
+    Request,
+    Next,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<Response, (StatusCode, Json<serde_json::Value>)>>
+            + Send,
+    >,
+> + Clone
++ Send {
     move |request: Request, next: Next| {
         Box::pin(async move {
             // 从 extensions 获取 claims
@@ -397,19 +538,17 @@ pub fn require_roles(allowed_roles: &'static [&'static str]) -> impl Fn(Request,
                                     "Access denied. Required roles: {:?}, your role: {}",
                                     allowed_roles, user_role
                                 )
-                            }))
+                            })),
                         ))
                     }
                 }
-                None => {
-                    Err((
-                        StatusCode::UNAUTHORIZED,
-                        Json(serde_json::json!({
-                            "success": false,
-                            "error_message": "No authentication token found"
-                        }))
-                    ))
-                }
+                None => Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error_message": "No authentication token found"
+                    })),
+                )),
             }
         })
     }
@@ -417,112 +556,139 @@ pub fn require_roles(allowed_roles: &'static [&'static str]) -> impl Fn(Request,
 
 /// 获取 Token
 #[cfg(feature = "web_server")]
-async fn get_token(
-    Json(request): Json<TokenRequest>,
-) -> impl IntoResponse {
+async fn get_token(Json(request): Json<TokenRequest>) -> impl IntoResponse {
     // 获取 project_id 和 user_id (支持两种格式)
     let project_id = match &request.project_id {
         Some(id) if !id.is_empty() => id.clone(),
         _ => {
             warn!("Missing project_id/project");
-            return (StatusCode::BAD_REQUEST, Json(TokenResponse {
-                code: -1,
-                message: "Missing required field: project_id or project".to_string(),
-                data: None,
-            }));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(TokenResponse {
+                    code: -1,
+                    message: "Missing required field: project_id or project".to_string(),
+                    data: None,
+                }),
+            );
         }
     };
-    
+
     let user_id = match &request.user_id {
         Some(id) if !id.is_empty() => id.clone(),
         _ => {
             warn!("Missing user_id/username");
-            return (StatusCode::BAD_REQUEST, Json(TokenResponse {
-                code: -1,
-                message: "Missing required field: user_id or username".to_string(),
-                data: None,
-            }));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(TokenResponse {
+                    code: -1,
+                    message: "Missing required field: user_id or username".to_string(),
+                    data: None,
+                }),
+            );
         }
     };
-    
-    info!("Token request: project_id={}, user_id={}, role={:?}", project_id, user_id, request.role);
-    
+
+    info!(
+        "Token request: project_id={}, user_id={}, role={:?}",
+        project_id, user_id, request.role
+    );
+
     // 验证 role (如果提供了)
     let validated_role = if let Some(ref role_str) = request.role {
         match Role::from_str(role_str) {
             Some(role) => Some(role.as_str()),
             None => {
                 warn!("Invalid role: {}", role_str);
-                return (StatusCode::BAD_REQUEST, Json(TokenResponse {
-                    code: -1,
-                    message: format!("Invalid role: '{}'. Valid values are: {:?}", role_str, Role::valid_values()),
-                    data: None,
-                }));
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(TokenResponse {
+                        code: -1,
+                        message: format!(
+                            "Invalid role: '{}'. Valid values are: {:?}",
+                            role_str,
+                            Role::valid_values()
+                        ),
+                        data: None,
+                    }),
+                );
             }
         }
     } else {
         None
     };
-    
+
     // 生成或使用传入的 form_id
     let form_id = request.form_id.unwrap_or_else(generate_form_id);
-    
+
     // 生成 token
     match create_token(&project_id, &user_id, &form_id, validated_role) {
         Ok((token, expires_at)) => {
             info!("Token generated for user={}, form_id={}", user_id, form_id);
-            (StatusCode::OK, Json(TokenResponse {
-                code: 0,
-                message: "ok".to_string(),
-                data: Some(TokenData_ {
-                    token,
-                    expires_at,
-                    form_id,
+            (
+                StatusCode::OK,
+                Json(TokenResponse {
+                    code: 0,
+                    message: "ok".to_string(),
+                    data: Some(TokenData_ {
+                        token,
+                        expires_at,
+                        form_id,
+                    }),
                 }),
-            }))
+            )
         }
         Err(e) => {
             warn!("Token generation failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(TokenResponse {
-                code: -1,
-                message: format!("Token generation failed: {}", e),
-                data: None,
-            }))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(TokenResponse {
+                    code: -1,
+                    message: format!("Token generation failed: {}", e),
+                    data: None,
+                }),
+            )
         }
     }
 }
 
 /// 验证 Token
 #[cfg(feature = "web_server")]
-async fn verify_token_handler(
-    Json(request): Json<VerifyRequest>,
-) -> impl IntoResponse {
+async fn verify_token_handler(Json(request): Json<VerifyRequest>) -> impl IntoResponse {
     info!("Token verification request");
-    
+
     match verify_token(&request.token) {
         Ok(claims) => {
-            info!("Token verified: user_id={}, form_id={}", claims.user_id, claims.form_id);
-            (StatusCode::OK, Json(VerifyResponse {
-                code: 0,
-                message: "ok".to_string(),
-                data: Some(VerifyData {
-                    valid: true,
-                    claims: Some(claims),
-                    error: None,
+            info!(
+                "Token verified: user_id={}, form_id={}",
+                claims.user_id, claims.form_id
+            );
+            (
+                StatusCode::OK,
+                Json(VerifyResponse {
+                    code: 0,
+                    message: "ok".to_string(),
+                    data: Some(VerifyData {
+                        valid: true,
+                        claims: Some(claims),
+                        error: None,
+                    }),
                 }),
-            }))
+            )
         }
         Err(e) => {
             warn!("Token verification failed: {}", e);
-            (StatusCode::OK, Json(VerifyResponse {
-                code: 0,
-                message: "ok".to_string(),
-                data: Some(VerifyData {
-                    valid: false,
-                    claims: None,
-                    error: Some(e),
+            (
+                StatusCode::OK,
+                Json(VerifyResponse {
+                    code: 0,
+                    message: "ok".to_string(),
+                    data: Some(VerifyData {
+                        valid: false,
+                        claims: None,
+                        error: Some(e),
+                    }),
                 }),
-            }))
+            )
         }
     }
 }
@@ -535,42 +701,161 @@ async fn verify_token_handler(
 #[cfg(feature = "web_server")]
 mod tests {
     use super::*;
-    
+    use axum::{
+        Extension, Json, Router,
+        http::{Request, StatusCode},
+        middleware,
+        routing::get,
+    };
+    use tower::ServiceExt;
+
+    async fn claims_echo_handler(Extension(claims): Extension<TokenClaims>) -> Json<TokenClaims> {
+        Json(claims)
+    }
+
     #[test]
     fn test_create_and_verify_token() {
         let (token, _exp) = create_token("2410", "kangwp", "FORM-TEST123", None).unwrap();
         assert!(!token.is_empty());
-        
+
         let claims = verify_token(&token).unwrap();
         assert_eq!(claims.project_id, "2410");
         assert_eq!(claims.user_id, "kangwp");
         assert_eq!(claims.form_id, "FORM-TEST123");
         assert_eq!(claims.role, None);
     }
-    
+
     #[test]
     fn test_create_token_with_role() {
-        let (token, _exp) = create_token("testproject", "testuser", "FORM-TEST123", Some("pz")).unwrap();
+        let (token, _exp) =
+            create_token("testproject", "testuser", "FORM-TEST123", Some("pz")).unwrap();
         assert!(!token.is_empty());
-        
+
         let claims = verify_token(&token).unwrap();
         assert_eq!(claims.project_id, "testproject");
         assert_eq!(claims.user_id, "testuser");
         assert_eq!(claims.role, Some("pz".to_string()));
     }
-    
+
     #[test]
     fn test_decode_token_unsafe() {
         let (token, _exp) = create_token("2410", "kangwp", "FORM-TEST123", None).unwrap();
-        
+
         let claims = decode_token_unsafe(&token).unwrap();
         assert_eq!(claims.project_id, "2410");
         assert_eq!(claims.user_id, "kangwp");
     }
-    
+
     #[test]
     fn test_invalid_token() {
         let result = verify_token("invalid-token");
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn test_review_auth_middleware_requires_authorization_when_enabled() {
+        let app = Router::new()
+            .route("/claims", get(claims_echo_handler))
+            .layer(middleware::from_fn_with_state(
+                ReviewAuthConfig {
+                    enabled: true,
+                    debug_project_id: "debug-project".to_string(),
+                    debug_user_id: "debug-user".to_string(),
+                    debug_role: "sj".to_string(),
+                },
+                review_auth_middleware,
+            ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/claims")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_review_auth_middleware_injects_debug_claims_when_disabled() {
+        let app = Router::new()
+            .route("/claims", get(claims_echo_handler))
+            .layer(middleware::from_fn_with_state(
+                ReviewAuthConfig {
+                    enabled: false,
+                    debug_project_id: "debug-project".to_string(),
+                    debug_user_id: "debug-user".to_string(),
+                    debug_role: "sj".to_string(),
+                },
+                review_auth_middleware,
+            ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/claims")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let claims: TokenClaims = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(claims.project_id, "debug-project");
+        assert_eq!(claims.user_id, "debug-user");
+        assert_eq!(claims.role.as_deref(), Some("sj"));
+    }
+
+    #[test]
+    fn test_build_config_names_prefers_explicit_config() {
+        let names = build_config_names(Some("/tmp/demo-config.toml"));
+        assert_eq!(names.first().map(String::as_str), Some("/tmp/demo-config"));
+    }
+
+    #[tokio::test]
+    async fn test_review_auth_middleware_decodes_token_without_verification_when_disabled() {
+        let app = Router::new()
+            .route("/claims", get(claims_echo_handler))
+            .layer(middleware::from_fn_with_state(
+                ReviewAuthConfig {
+                    enabled: false,
+                    debug_project_id: "debug-project".to_string(),
+                    debug_user_id: "debug-user".to_string(),
+                    debug_role: "sj".to_string(),
+                },
+                review_auth_middleware,
+            ));
+
+        let (token, _) = create_token("1516", "user-002", "FORM-TEST123", Some("jd")).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/claims")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let claims: TokenClaims = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(claims.project_id, "1516");
+        assert_eq!(claims.user_id, "user-002");
+        assert_eq!(claims.role.as_deref(), Some("jd"));
+    }
+
 }

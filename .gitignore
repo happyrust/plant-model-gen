@@ -152,3 +152,5 @@ worktrees/
 db_options/_tmp/
 
 target_check
+# Release build artifacts
+release-build/

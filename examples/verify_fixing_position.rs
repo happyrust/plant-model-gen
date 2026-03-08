@@ -73,7 +73,10 @@ async fn main() -> Result<()> {
     let local_mat = transform::get_local_mat4(target_refno).await?;
     if let Some(m) = local_mat {
         let t = m.col(3);
-        println!("   local_mat translation = ({:.3}, {:.3}, {:.3})", t.x, t.y, t.z);
+        println!(
+            "   local_mat translation = ({:.3}, {:.3}, {:.3})",
+            t.x, t.y, t.z
+        );
     } else {
         println!("   ⚠️  local_mat = None (策略未返回变换)");
     }
@@ -89,9 +92,18 @@ async fn main() -> Result<()> {
         println!("   world pos = ({:.3}, {:.3}, {:.3})", t.x, t.y, t.z);
 
         println!("\n═══════════════════════════════════════════════════");
-        println!("  期望位置: ({:.3}, {:.3}, {:.3})", expected_pos.x, expected_pos.y, expected_pos.z);
-        println!("  计算位置: ({:.3}, {:.3}, {:.3})", calculated_pos.x, calculated_pos.y, calculated_pos.z);
-        println!("  偏差:     ({:.3}, {:.3}, {:.3})  |{:.3}| mm", diff.x, diff.y, diff.z, dist);
+        println!(
+            "  期望位置: ({:.3}, {:.3}, {:.3})",
+            expected_pos.x, expected_pos.y, expected_pos.z
+        );
+        println!(
+            "  计算位置: ({:.3}, {:.3}, {:.3})",
+            calculated_pos.x, calculated_pos.y, calculated_pos.z
+        );
+        println!(
+            "  偏差:     ({:.3}, {:.3}, {:.3})  |{:.3}| mm",
+            diff.x, diff.y, diff.z, dist
+        );
 
         if dist < tolerance_mm {
             println!("  ✅ 通过 (偏差 < {:.1}mm)", tolerance_mm);

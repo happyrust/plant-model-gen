@@ -8,12 +8,11 @@
 
 ## 一、架构概览
 
-当前存在 **三套** Parquet 导出路径，职责有重叠：
+当前存在 **两套主 Parquet 写入路径**，职责仍有一定重叠：
 
 | 模块 | 数据源 | 触发场景 | 输出格式 |
 |------|--------|---------|---------|
-| `export_dbnum_instances_parquet.rs` (SurrealDB 路径) | SurrealDB 实时查询 | CLI `--export-parquet`、MBD pipe 后台 | 5 表 + manifest |
-| `export_dbnum_instances_parquet.rs` (Cache 路径) | model cache 文件 | CLI `--export-parquet-from-cache` | 同上 schema |
+| `export_dbnum_instances_parquet.rs` | SurrealDB 实时查询 | CLI `--export-parquet`、`--export-dbnum-instances`、MBD pipe 后台 | 5 表 + manifest |
 | `parquet_writer.rs` (`ParquetManager`) | `ExportData` 内存结构 | `instance_export.rs` 增量写 | Polars DataFrame → incremental parquet |
 | `parquet_stream_writer.rs` (`ParquetStreamWriter`) | `ShapeInstancesData` 流式 | 模型生成期间流式写 | 同上 + merge |
 
@@ -43,7 +42,7 @@ fn::default_full_name(in) as name
 **建议**：
 - 改用 `in.name as name`（直接取 pe.name）
 - name 为空时，在 Rust 端用 TreeIndex 的 order_map 兜底生成 `"{NOUN} {order+1}"`
-- Cache 路径已经采用了这种方式（`export_dbnum_instances_parquet_from_cache` 第 1671-1682 行），应统一
+- 保持唯一 SurrealDB 导出路径内部策略一致，避免再引入平行导出实现
 
 #### 2. `in->inst_relate_aabb[0].out` 图遍历语法
 **位置**：`export_dbnum_instances_parquet.rs:576`
@@ -124,14 +123,13 @@ aabb_hash: child_aabb_hash,              // move（较好）
 
 ### 🟢 P2 - 改善建议
 
-#### 7. 三套导出路径代码重复
+#### 7. 多套导出/写入路径代码重复
 **问题**：
-- `export_dbnum_instances_parquet`（SurrealDB 路径）和 `export_dbnum_instances_parquet_from_cache`（Cache 路径）共享 ~60% 相同的行构建 + Parquet 写入逻辑
+- `export_dbnum_instances_parquet` 与增量写入链路（`parquet_writer.rs` / `parquet_stream_writer.rs`）仍存在 schema、批构建和文件写入层面的重复
 - `parquet_writer.rs` 和 `parquet_stream_writer.rs` 的 DataFrame 创建、geo_items 格式处理、compact 逻辑高度相似
 
 **建议**：
 - 提取公共的 `ParquetTableBuilder` trait/struct：负责 schema 定义、batch 构建、文件写入
-- 将数据源抽象为 trait：`SurrealDbSource` / `CacheSource`
 - `ParquetManager` 与 `ParquetStreamWriter` 合并为一个带模式标记的统一 writer
 
 

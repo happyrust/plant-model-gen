@@ -181,6 +181,110 @@ fn build_manifold_mesh_path(base_dir: &Path, mesh_id: &str) -> Option<PathBuf> {
     None
 }
 
+fn basis_is_identity_like(mat: &DMat4, eps: f64) -> bool {
+    (mat.col(0).truncate() - glam::DVec3::X).length() <= eps
+        && (mat.col(1).truncate() - glam::DVec3::Y).length() <= eps
+        && (mat.col(2).truncate() - glam::DVec3::Z).length() <= eps
+}
+
+fn aabb_overlap_volume(
+    a: &parry3d::bounding_volume::Aabb,
+    b: &parry3d::bounding_volume::Aabb,
+) -> f64 {
+    let dx = (a.maxs.x.min(b.maxs.x) - a.mins.x.max(b.mins.x)).max(0.0) as f64;
+    let dy = (a.maxs.y.min(b.maxs.y) - a.mins.y.max(b.mins.y)).max(0.0) as f64;
+    let dz = (a.maxs.z.min(b.maxs.z) - a.mins.z.max(b.mins.z)).max(0.0) as f64;
+    dx * dy * dz
+}
+
+fn manifold_overlap_score(
+    manifold: &ManifoldRust,
+    pos_aabb: Option<&parry3d::bounding_volume::Aabb>,
+) -> f64 {
+    match (pos_aabb, manifold.get_mesh().cal_aabb()) {
+        (Some(pos_aabb), Some(neg_aabb)) => aabb_overlap_volume(pos_aabb, &neg_aabb),
+        _ => 0.0,
+    }
+}
+
+fn select_neg_manifold_candidate(
+    refno: RefnoEnum,
+    mesh_id: &str,
+    pos_aabb: Option<&parry3d::bounding_volume::Aabb>,
+    primary: ManifoldRust,
+    fallback: ManifoldRust,
+) -> ManifoldRust {
+    let primary_score = manifold_overlap_score(&primary, pos_aabb);
+    let fallback_score = manifold_overlap_score(&fallback, pos_aabb);
+    if fallback_score > primary_score && fallback_score > 0.0 {
+        eprintln!(
+            "[bool_fallback] select translation-only by overlap: refno={} mesh_id={} primary_overlap={:.3} fallback_overlap={:.3}",
+            refno,
+            mesh_id,
+            primary_score,
+            fallback_score
+        );
+        fallback
+    } else {
+        primary
+    }
+}
+
+fn load_neg_manifold_with_fallback(
+    refno: RefnoEnum,
+    mesh_id: &str,
+    relative_mat: DMat4,
+    translation_only_relative: DMat4,
+    allow_translate_only_fallback: bool,
+    pos_aabb: Option<&parry3d::bounding_volume::Aabb>,
+) -> anyhow::Result<ManifoldRust> {
+    let primary = load_manifold(mesh_id, relative_mat, true);
+    if !allow_translate_only_fallback {
+        return primary;
+    }
+
+    match primary {
+        Ok(primary_manifold) => match load_manifold(mesh_id, translation_only_relative, true) {
+            Ok(fallback_manifold) => Ok(select_neg_manifold_candidate(
+                refno,
+                mesh_id,
+                pos_aabb,
+                primary_manifold,
+                fallback_manifold,
+            )),
+            Err(fallback_err) => {
+                eprintln!(
+                    "[bool_fallback] translation-only probe failed: refno={} mesh_id={} err={}",
+                    refno,
+                    mesh_id,
+                    fallback_err
+                );
+                Ok(primary_manifold)
+            }
+        },
+        Err(primary_err) => match load_manifold(mesh_id, translation_only_relative, true) {
+            Ok(fallback_manifold) => {
+                eprintln!(
+                    "[bool_fallback] primary transform failed, use translation-only: refno={} mesh_id={} err={}",
+                    refno,
+                    mesh_id,
+                    primary_err
+                );
+                Ok(fallback_manifold)
+            }
+            Err(fallback_err) => {
+                eprintln!(
+                    "[bool_fallback] translation-only failed: refno={} mesh_id={} err={}",
+                    refno,
+                    mesh_id,
+                    fallback_err
+                );
+                Err(primary_err)
+            }
+        },
+    }
+}
+
 fn mesh_base_dir() -> PathBuf {
 
     get_db_option()
@@ -228,8 +332,6 @@ fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<M
     // 对标准单位几何体（1/2/3）强制使用内置几何生成，避免磁盘上被误写/污染的同名 GLB 影响布尔结果。
 
     if matches!(id, "1" | "2" | "3") {
-
-        debug_model_debug!("load_manifold: 使用内置 unit mesh: id={}", id);
 
         let unit_mesh = match id {
 
@@ -307,16 +409,12 @@ fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<M
                             [pt.x as f32, pt.y as f32, pt.z as f32]
                         })
                         .collect();
-                    let manifold = ManifoldRust::from_mesh(&ManifoldMeshRust {
+                    let manifold = ManifoldRust::from_mesh_with_cap(&ManifoldMeshRust {
                         vertices: transformed_verts,
                         indices: raw_mesh.indices,
                     });
                     match validate_manifold_result(manifold, id) {
                         Ok(m) => {
-                            debug_model_debug!(
-                                "load_manifold: 从 .manifold 加载成功: id={} path={}",
-                                id, manifold_path.display()
-                            );
                             return Ok(m);
                         }
                         Err(e) => {
@@ -1413,23 +1511,7 @@ async fn apply_boolean_for_query(
 
     // 调试：打印正实体 AABB
 
-    if let Some(pos_aabb) = pos_manifold.get_mesh().cal_aabb() {
-
-        println!("[AABB_DBG] pos refno={} aabb: min=({:.1},{:.1},{:.1}) max=({:.1},{:.1},{:.1}) verts={} tris={}",
-
-            query.refno,
-
-            pos_aabb.mins.x, pos_aabb.mins.y, pos_aabb.mins.z,
-
-            pos_aabb.maxs.x, pos_aabb.maxs.y, pos_aabb.maxs.z,
-
-            pos_manifold.get_mesh().vertices.len() / 3,
-
-            pos_manifold.get_mesh().indices.len() / 3,
-
-        );
-
-    }
+    let pos_aabb = pos_manifold.get_mesh().cal_aabb();
 
     // 计算正实体世界坐标系的逆矩阵，用于将负实体转换到正实体的相对坐标系
 
@@ -1493,76 +1575,27 @@ async fn apply_boolean_for_query(
 
             let relative_mat = inverse_pos_world * neg_world_mat;
 
-            
+            let geo_local_mat = geo_local_trans.0.to_matrix().as_dmat4();
 
-            // 调试：打印变换矩阵信息
+            let translation_only_relative = DMat4::from_translation(relative_mat.col(3).truncate());
 
-            println!("[变换调试] neg_id={}", neg_mesh_id);
+            let allow_translate_only_fallback = !is_unit_mesh && basis_is_identity_like(&geo_local_mat, 1e-6);
 
-            println!("  pos_world_trans: {:?}", pos_world_mat.col(3));
-
-            println!("  carrier_world: {:?}", carrier_world_mat.col(3));
-
-            println!("  geo_local: {:?}", geo_local_trans.0.to_matrix().as_dmat4().col(3));
-
-            println!("  geo_scale: {:?}", geo_local_trans.0.scale);
-
-            if is_unit_mesh {
-
-                println!("  geo_scale_eff(unit/100): {:?}", geo_tf.scale);
-
-            }
-
-            if let Some(t) = carrier_world_trans.as_ref() {
-
-                println!("  carrier_scale: {:?}", t.0.scale);
-
-            }
-
-            println!("  relative: {:?}", relative_mat.col(3));
-
-            println!(
-
-                "  relative_basis_len: x={:.6} y={:.6} z={:.6}",
-
-                relative_mat.col(0).truncate().length(),
-
-                relative_mat.col(1).truncate().length(),
-
-                relative_mat.col(2).truncate().length(),
-
-            );
-
-            debug_model_debug!("加载负实体 mesh: {} (相对于正实体坐标系)", neg_mesh_id);
-
-            match load_manifold(&neg_mesh_id, relative_mat, true) {
+            match load_neg_manifold_with_fallback(
+                query.refno,
+                &neg_mesh_id,
+                relative_mat,
+                translation_only_relative,
+                allow_translate_only_fallback,
+                pos_aabb.as_ref(),
+            ) {
 
                 Ok(manifold) => {
-
-                    if let Some(neg_aabb) = manifold.get_mesh().cal_aabb() {
-
-                        println!("[AABB_DBG] neg[{}] id={} aabb: min=({:.1},{:.1},{:.1}) max=({:.1},{:.1},{:.1}) verts={} tris={}",
-
-                            neg_manifolds.len(), neg_mesh_id,
-
-                            neg_aabb.mins.x, neg_aabb.mins.y, neg_aabb.mins.z,
-
-                            neg_aabb.maxs.x, neg_aabb.maxs.y, neg_aabb.maxs.z,
-
-                            manifold.get_mesh().vertices.len() / 3,
-
-                            manifold.get_mesh().indices.len() / 3,
-
-                        );
-
-                    }
-
                     neg_manifolds.push(manifold.inflate_from_center(NEG_INFLATE_EPSILON_MM));
 
                 }
 
                 Err(e) => {
-
                     // 负实体可能数量很大，简单限流，避免刷屏
 
                     if neg_load_fail_logged < 10 {
@@ -2529,6 +2562,7 @@ async fn process_inst_task(
         &pos_manifolds,
         aios_core::csg::manifold::ManifoldOpType::Union,
     );
+    let pos_aabb = pos_manifold.get_mesh().cal_aabb();
     if pos_manifold.get_mesh().indices.is_empty() {
         writer.write_inst_failed(refno).await?;
         return Ok(TaskExecOutcome::Failed);
@@ -2552,11 +2586,24 @@ async fn process_inst_task(
             let neg_world_mat = carrier_world_mat * geo_tf.to_matrix().as_dmat4();
             let relative_mat = inverse_pos_world * neg_world_mat;
 
-            match load_manifold(&neg_geo.geo_hash, relative_mat, true) {
+            let geo_local_mat = geo_tf.to_matrix().as_dmat4();
+            let translation_only_relative = DMat4::from_translation(relative_mat.col(3).truncate());
+            let allow_translate_only_fallback = !is_unit_mesh && basis_is_identity_like(&geo_local_mat, 1e-6);
+
+            match load_neg_manifold_with_fallback(
+                refno,
+                &neg_geo.geo_hash,
+                relative_mat,
+                translation_only_relative,
+                allow_translate_only_fallback,
+                pos_aabb.as_ref(),
+            ) {
                 Ok(manifold) => {
                     neg_manifolds.push(manifold.inflate_from_center(NEG_INFLATE_EPSILON_MM))
                 }
-                Err(e) => log_load_manifold_failed("inst_neg", refno, &neg_geo.geo_hash, &e),
+                Err(e) => {
+                    log_load_manifold_failed("inst_neg", refno, &neg_geo.geo_hash, &e)
+                }
             }
         }
     }

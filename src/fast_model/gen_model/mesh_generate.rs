@@ -19,6 +19,7 @@ use aios_core::error::{init_deserialize_error, init_query_error, init_save_datab
 use aios_core::geometry::csg::{GeneratedMesh, generate_csg_mesh};
 use aios_core::mesh_precision::MeshPrecisionSettings;
 use aios_core::options::DbOption;
+use aios_core::pdms_types::TOTAL_NEG_NOUN_NAMES;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::SurrealQueryExt;
 use aios_core::shape::pdms_shape::{PlantMesh, RsVec3};
@@ -455,7 +456,7 @@ pub async fn generate_meshes_for_batch(
             task.geo_param.clone()
         };
 
-        let mr = match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
+        let mr = match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, task.is_neg, None) {
             Some(csg_mesh) => {
                 match handle_csg_mesh(
                     &lod_dir, &manifold_dir,
@@ -1015,7 +1016,7 @@ pub async fn run_mesh_worker_from_channel(
                 task.geo_param.clone()
             };
 
-            let mesh_result = match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
+            let mesh_result = match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, task.is_neg, None) {
                 Some(csg_mesh) => {
                     match handle_csg_mesh(
                         &lod_dir,
@@ -1550,6 +1551,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
         let geo_type_name = g.param.type_name();
         let profile = precision.profile_for_geo(geo_type_name);
         let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
+        let is_neg_mesh = TOTAL_NEG_NOUN_NAMES.contains(&geo_type_name);
         let mesh_id = g.id.to_mesh_id();
 
         // 不需要 refno
@@ -1564,7 +1566,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
             g.param.clone()
         };
 
-        let mr = match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
+        let mr = match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, is_neg_mesh, None) {
             Some(csg_mesh) => {
                 match handle_csg_mesh(
                     &lod_dir,
@@ -1576,7 +1578,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
                     &pts_json_map,
                     &inst_aabb_map,
                     mesh_formats,
-                    false,
+                    is_neg_mesh,
                 )
                 .await
                 {
@@ -1758,6 +1760,7 @@ pub async fn gen_inst_meshes(
                         let geo_type_name = g.param.type_name();
                         let profile = precision.profile_for_geo(geo_type_name);
                         let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
+                        let is_neg_mesh = TOTAL_NEG_NOUN_NAMES.contains(&geo_type_name);
                         let mesh_id = g.id.to_mesh_id();
                         let geo_raw = g.id.to_raw();
                         let refno_for_mesh: Option<RefnoEnum> = chunk_refno_map
@@ -1774,7 +1777,7 @@ pub async fn gen_inst_meshes(
                             &g.param,
                             &lod_settings,
                             non_scalable_geo,
-                            false,
+                            is_neg_mesh,
                             refno_for_mesh,
                         ) {
                             Some(csg_mesh) => {
@@ -1788,7 +1791,7 @@ pub async fn gen_inst_meshes(
                                     &pts_json_map,
                                     &inst_aabb_map,
                                     &mesh_formats,
-                                    false,
+                                    is_neg_mesh,
                                 )
                                 .await
                                 {

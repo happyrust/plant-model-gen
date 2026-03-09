@@ -44,7 +44,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let ws_cfg = &db_option.web_server;
-    let port = ws_cfg.port;
+    let port = std::env::var("WEB_SERVER_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(ws_cfg.port);
 
     // 自启动 SurrealDB
     let _surreal_child = if ws_cfg.auto_start_surreal {

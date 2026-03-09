@@ -4573,6 +4573,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
                     ("保存模型数据", 100.0, "正在保存生成的模型数据..."),
                 ];
 
+                let monitor_start = Instant::now();
                 for (sub_step, sub_progress, details) in sub_steps {
                     // 检查任务是否被取消
                     {
@@ -4613,10 +4614,48 @@ async fn execute_real_task(state: AppState, task_id: String) {
 
                     tokio::time::sleep(wait_time).await;
                 }
+
+                // 子步骤走完后，gen_all_geos_data 可能仍在运行
+                // 持续以心跳方式更新进度，直到被 abort
+                let max_percentage = base_percentage + step_percentage;
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    {
+                        let task_manager = state_clone.task_manager.lock().await;
+                        if let Some(task) = task_manager.active_tasks.get(&task_id_clone) {
+                            if task.status == TaskStatus::Cancelled {
+                                return;
+                            }
+                        } else {
+                            return;
+                        }
+                    }
+                    let elapsed_secs = monitor_start.elapsed().as_secs();
+                    let mut task_manager = state_clone.task_manager.lock().await;
+                    if let Some(task) = task_manager.active_tasks.get_mut(&task_id_clone) {
+                        task.update_progress(
+                            format!("生成几何数据 - 处理中 ({}s)", elapsed_secs),
+                            current_step,
+                            total_steps,
+                            max_percentage,
+                        );
+                    }
+                    drop(task_manager);
+                }
             })
         };
 
-        let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
+        let mut db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
+        let target_nouns: Vec<String> = config
+            .target_nouns
+            .iter()
+            .map(|noun| noun.trim())
+            .filter(|noun| !noun.is_empty())
+            .map(|noun| noun.to_uppercase())
+            .collect();
+        if !target_nouns.is_empty() {
+            db_option_ext.index_tree_enabled_target_types = target_nouns;
+        }
 
         if let Err(e) = gen_all_geos_data(vec![], &db_option_ext, None, config.target_sesno).await {
             let mut task_manager = state.task_manager.lock().await;

@@ -443,6 +443,7 @@ pub async fn execute_batch_operation(
             apply_boolean_operation: false,
             mesh_tol_ratio: 0.01,
             room_keyword: "-RM".to_string(),
+            target_nouns: vec![],
             target_sesno: None,
             meshes_path: None,
             export_json: false,

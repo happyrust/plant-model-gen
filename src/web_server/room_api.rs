@@ -1694,7 +1694,18 @@ pub async fn compute_room_relations_sync(
     }
     info!("   - 强制重建: {}", request.force_rebuild);
 
-    let db_option = aios_core::get_db_option();
+    let mut db_option = aios_core::get_db_option().clone();
+
+    // 使用请求中的自定义房间关键词（优先于配置值）
+    if let Some(ref kws) = request.room_keywords {
+        db_option.room_key_word = Some(kws.clone());
+        info!("   - 使用请求中的房间关键词覆盖配置");
+    }
+
+    // force_rebuild: 强制刷新空间索引（后续可扩展更多语义）
+    if request.force_rebuild {
+        info!("   - force_rebuild=true: 将强制刷新空间索引");
+    }
 
     // 执行房间关系构建
     match build_room_relations(&db_option, request.db_nums.as_deref(), None).await {

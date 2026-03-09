@@ -471,7 +471,7 @@ pub(crate) fn load_manifold_from_geo_param(
 
     mat: DMat4,
 
-    more_precision: bool,
+    _more_precision: bool,
 
 ) -> anyhow::Result<ManifoldRust> {
 
@@ -551,7 +551,7 @@ pub(crate) fn load_manifold_from_geo_param(
 
     }
 
-    let manifold = ManifoldRust::from_vertices_indices(&plant_mesh.vertices, &plant_mesh.indices, mat, more_precision);
+    let manifold = ManifoldRust::from_plant_mesh_transformed(&plant_mesh.vertices, &plant_mesh.indices, mat);
 
     validate_manifold_result(manifold, &geo_hash.to_string())
 

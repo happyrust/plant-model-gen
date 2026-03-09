@@ -363,15 +363,16 @@ impl RoomWorker {
             RoomTaskType::RebuildByRoomNumbers(room_numbers) => {
                 // 调用针对特定房间的重建
                 super::room_model::rebuild_room_relations_for_rooms_with_cancel(
-                    room_numbers.clone(),
+                    Some(room_numbers.clone()),
                     &task.db_option,
                     Some(cancel_token.clone()),
                     Some(progress_callback),
                 ).await
             }
             RoomTaskType::IncrementalUpdate => {
-                // 增量更新
+                // 增量更新（无指定 refnos，回退到全量重建）
                 super::room_model::update_room_relations_incremental_with_cancel(
+                    &[],
                     &task.db_option,
                     Some(cancel_token.clone()),
                     Some(progress_callback),

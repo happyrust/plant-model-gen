@@ -505,7 +505,7 @@ fn step3_parameter_configuration() -> String {
                                 <span x-text="surrealStatusText()"></span>
                             </div>
                             <div class="text-xs text-gray-500 mt-1">
-                                <span x-text="`目标: ${config.db_ip || '127.0.0.1'}:${parseInt(config.db_port || '8009') || 0}`"></span>
+                                <span x-text="`目标: ${config.db_ip || '127.0.0.1'}:${parseInt(config.db_port || '8020') || 0}`"></span>
                             </div>
                         </div>
                     </div>
@@ -592,7 +592,7 @@ fn step3_parameter_configuration() -> String {
                             <input type="text"
                                    x-model="config.db_port"
                                    class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                                   placeholder="8009">
+                                   placeholder="8020">
                         </div>
                     </div>
                 </div>
@@ -716,6 +716,14 @@ fn step3_parameter_configuration() -> String {
                                class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                                placeholder="-RM">
                     </div>
+                    <div class="md:col-span-2">
+                        <label class="block text-sm font-medium text-gray-700 mb-2">目标类型 / Noun</label>
+                        <input type="text"
+                               x-model="config.target_nouns"
+                               class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                               placeholder="BRAN,PANE,HANG 或 loop,prim,cate；留空表示全部">
+                        <p class="text-xs text-gray-500 mt-2">支持具体 noun 和类别名，提交后会映射到 IndexTree 的目标类型过滤。</p>
+                    </div>
                 </div>
             </div>
 
@@ -766,6 +774,7 @@ fn step3_parameter_configuration() -> String {
                         <p>• 生成模型: <span x-text="config.gen_model ? '是' : '否'"></span></p>
                         <p>• 生成网格: <span x-text="config.gen_mesh ? '是' : '否'"></span></p>
                         <p>• 启用房间计算: <span x-text="config.gen_spatial_tree ? '是' : '否'"></span></p>
+                        <p>• 目标类型: <span x-text="config.target_nouns || '全部'"></span></p>
                         <p>• 并行处理: <span x-text="parallelProcessing ? '是' : '否'"></span></p>
                     </div>
                 </div>
@@ -1080,7 +1089,7 @@ fn wizard_javascript() -> String {
                     db_type: 'surrealdb',
                     surreal_ns: 1516,
                     db_ip: '127.0.0.1',
-                    db_port: '8009',
+                    db_port: '8020',
                     db_user: 'root',
                     db_password: 'root',
                     gen_model: true,
@@ -1088,7 +1097,8 @@ fn wizard_javascript() -> String {
                     gen_spatial_tree: true,
                     apply_boolean_operation: true,
                     mesh_tol_ratio: 3.0,
-                    room_keyword: '-RM'
+                    room_keyword: '-RM',
+                    target_nouns: ''
                 },
                 parallelProcessing: false,
                 maxConcurrent: 2,
@@ -1632,6 +1642,11 @@ fn wizard_javascript() -> String {
                         const manualDbNums = this.manualDbNums ?
                             this.manualDbNums.split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n)) :
                             [];
+                        const targetNouns = (this.config.target_nouns || '')
+                            .split(',')
+                            .map(noun => noun.trim())
+                            .filter(noun => noun.length > 0)
+                            .map(noun => noun.toUpperCase());
 
                         const projectMap = this.buildProjectMap();
                         const selectedProjectPaths = this.selectedProjects.map(name => {
@@ -1660,7 +1675,8 @@ fn wizard_javascript() -> String {
                                 gen_spatial_tree: this.config.gen_spatial_tree,
                                 apply_boolean_operation: this.config.apply_boolean_operation,
                                 mesh_tol_ratio: this.config.mesh_tol_ratio,
-                                room_keyword: this.config.room_keyword
+                                room_keyword: this.config.room_keyword,
+                                target_nouns: targetNouns
                             },
                             selected_projects: selectedProjectPaths,
                             root_directory: this.directoryPath,

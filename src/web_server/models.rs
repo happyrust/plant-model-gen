@@ -234,6 +234,9 @@ pub struct DatabaseConfig {
     pub mesh_tol_ratio: f64,
     /// 房间关键字
     pub room_keyword: String,
+    /// 目标 Noun / 类别过滤（为空表示生成全部）
+    #[serde(default)]
+    pub target_nouns: Vec<String>,
     /// 目标会话号（可选）：基于特定sesno的增量生成
     #[serde(default)]
     pub target_sesno: Option<u32>,
@@ -271,6 +274,7 @@ impl Default for DatabaseConfig {
             apply_boolean_operation: true,
             mesh_tol_ratio: 3.0,
             room_keyword: "-RM".to_string(),
+            target_nouns: vec![],
             target_sesno: None,
             meshes_path: None,
             export_json: false,
@@ -291,6 +295,7 @@ impl DatabaseConfig {
             .into_iter()
             .next()
             .unwrap_or_else(|| "-RM".to_string());
+        let target_nouns = vec![];
 
         DatabaseConfig {
             name: if opt.project_name.is_empty() {
@@ -317,6 +322,7 @@ impl DatabaseConfig {
             apply_boolean_operation: opt.apply_boolean_operation,
             mesh_tol_ratio,
             room_keyword,
+            target_nouns,
             target_sesno: None,
             meshes_path: opt.meshes_path.clone(),
             export_json: opt.export_json,

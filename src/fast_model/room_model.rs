@@ -6,7 +6,7 @@ use aios_core::room::algorithm::*;
 
 use aios_core::shape::pdms_shape::PlantMesh;
 
-use aios_core::{GeomInstQuery, ModelHashInst, RefU64, RefnoEnum, model_primary_db};
+use aios_core::{GeomInstQuery, ModelHashInst, RefU64, RefnoEnum, SurrealQueryExt, model_primary_db};
 
 
 
@@ -384,8 +384,7 @@ pub(crate) async fn query_aabb_from_inst_relate_aabb(
         "SELECT refno, aabb_id.d as aabb FROM inst_relate_aabb WHERE refno IN [{ids}] AND aabb_id.d != NONE"
     );
 
-    let mut response = model_primary_db().query(&sql).await?;
-    let rows: Vec<QueryAabbRowRaw> = response.take(0)?;
+    let rows: Vec<QueryAabbRowRaw> = model_primary_db().query_take(&sql, 0).await?;
     let total_rows = rows.len();
 
     let debug_query = env::var("AIOS_ROOM_DEBUG")
@@ -479,8 +478,7 @@ async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
              ORDER BY refno \
              LIMIT {CHUNK_SIZE} START {offset}"
         );
-        let mut response = model_primary_db().query(&sql).await?;
-        let rows: Vec<InstRelateAabbRow> = response.take(0)?;
+        let rows: Vec<InstRelateAabbRow> = model_primary_db().query_take(&sql, 0).await?;
 
         if rows.is_empty() {
             break;
@@ -1391,6 +1389,18 @@ pub async fn build_room_relations_with_cancel(
 
 
 
+    // 清理目标作用域的旧关系，再写入过滤后的新关系
+    if let Some(ref cb) = progress_callback {
+        cb(0.08, "正在清理旧房间关系");
+    }
+    cleanup_room_relations_for_scope(&room_panel_map).await?;
+
+    // 持久化过滤后的 room_panel_relate
+    create_room_panel_relations_batch(&room_panel_map).await?;
+    info!("已写入 {} 个房间的 room_panel_relate", room_panel_map.len());
+
+
+
     #[cfg(all(
 
         not(target_arch = "wasm32"),
@@ -1864,6 +1874,9 @@ pub async fn build_room_panels_relate_for_query(
 
 
 /// 改进版本的房间面板关系构建通用函数
+///
+/// 注意：此函数仅返回映射结果，不再隐式持久化 room_panel_relate。
+/// 调用方需在过滤后显式调用 `create_room_panel_relations_batch` 写入关系。
 
 async fn build_room_panels_relate_common<F>(
 
@@ -1879,7 +1892,7 @@ where
 
 {
 
-    build_room_panels_relate_common_with_persist(room_key_word, match_room_fn, true).await
+    build_room_panels_relate_common_with_persist(room_key_word, match_room_fn, false).await
 
 }
 
@@ -1911,9 +1924,7 @@ where
 
 
 
-    let mut response = model_primary_db().query(sql).await?;
-
-    let raw_result: Vec<(RecordId, String, Vec<RecordId>)> = response.take(0)?;
+    let raw_result: Vec<(RecordId, String, Vec<RecordId>)> = model_primary_db().query_take(&sql, 0).await?;
 
 
 
@@ -2075,7 +2086,7 @@ async fn create_room_panel_relations_batch(
 
     let batch_sql = sql_statements.join("\n");
 
-    model_primary_db().query(batch_sql).await?;
+    model_primary_db().query_response(batch_sql).await?;
 
 
 
@@ -4064,7 +4075,7 @@ pub async fn save_room_relate(
 
     let batch_sql = sql_statements.join("\n");
 
-    model_primary_db().query(&batch_sql).await?;
+    model_primary_db().query_response(&batch_sql).await?;
 
 
 
@@ -5666,6 +5677,8 @@ pub async fn update_room_relations_incremental(
 
     update_room_relations_incremental_with_cancel(
 
+        refnos,
+
         &aios_core::get_db_option(),
 
         None,
@@ -5691,10 +5704,15 @@ pub async fn update_room_relations_incremental(
 
 
 /// 支持取消和进度回调的房间关系增量更新
+///
+/// - `refnos` 非空时：真正的增量更新，只影响包含这些构件的面板
+/// - `refnos` 为空时：回退到全量重建
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
 pub async fn update_room_relations_incremental_with_cancel(
+
+    refnos: &[RefnoEnum],
 
     db_option: &DbOption,
 
@@ -5704,13 +5722,148 @@ pub async fn update_room_relations_incremental_with_cancel(
 
 ) -> anyhow::Result<RoomBuildStats> {
 
-    // 逻辑：增量更新实际上是找到受影响的房间并重新计算
+    // 空 refnos 回退到全量重建
+    if refnos.is_empty() {
+        info!("增量更新：refnos 为空，回退到全量重建");
+        return build_room_relations_with_cancel(
+            db_option, None, None, cancel_token, progress_callback,
+        ).await;
+    }
 
-    // 为了简单起见，这里重用重建逻辑，但只针对受影响的房间（如果能找到的话）
+    let start_time = Instant::now();
+    info!("开始增量更新房间关系，涉及 {} 个构件", refnos.len());
 
-    // 或者直接调用 build_room_relations_with_cancel 作为一个安全的回退
+    if let Some(ref cb) = progress_callback {
+        cb(0.0, "开始增量更新房间关系");
+    }
 
-    build_room_relations_with_cancel(db_option, None, None, cancel_token, progress_callback).await
+    // 1. 查询这些 refnos 相关的房间面板
+    if let Some(ref cb) = progress_callback {
+        cb(0.05, "查询受影响的房间面板");
+    }
+    let affected_panels = query_panels_containing_refnos(refnos).await?;
+    info!("找到 {} 个受影响的房间面板", affected_panels.len());
+
+    if affected_panels.is_empty() {
+        warn!("没有找到受影响的房间面板");
+        return Ok(RoomBuildStats {
+            total_rooms: 0,
+            total_panels: 0,
+            total_components: 0,
+            build_time_ms: start_time.elapsed().as_millis() as u64,
+            cache_hit_rate: 0.0,
+            memory_usage_mb: 0.0,
+            failed_panels: 0,
+            missing_candidates: 0,
+        });
+    }
+
+    if let Some(ref token) = cancel_token {
+        if token.is_cancelled() {
+            anyhow::bail!("增量更新任务已取消");
+        }
+    }
+
+    // 2. 删除这些面板的旧 room_relate
+    if let Some(ref cb) = progress_callback {
+        cb(0.10, "清理受影响面板的旧关系");
+    }
+    delete_room_relations_for_panels(&affected_panels).await?;
+    info!("已删除 {} 个面板的旧 room_relate", affected_panels.len());
+
+    // 3. 准备计算环境
+    let mesh_dir = db_option.get_meshes_path();
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    init_room_calc_config(db_option);
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    {
+        if let Some(ref cb) = progress_callback {
+            cb(0.15, "刷新空间索引");
+        }
+        ensure_spatial_index_ready(None, None, true).await?;
+    }
+
+    // 获取所有房间面板（用于排除）
+    let room_key_words = db_option.get_room_key_word();
+    let all_room_panels = build_room_panels_relate_for_query(&room_key_words).await?;
+    let exclude_panel_refnos: HashSet<RefnoEnum> = all_room_panels
+        .iter()
+        .flat_map(|(_, _, panels)| panels.clone())
+        .collect();
+    let exclude_panel_refnos = Arc::new(exclude_panel_refnos);
+
+    let compute_options = RoomComputeOptions::default();
+    CACHE_METRICS.reset();
+
+    if let Some(ref token) = cancel_token {
+        if token.is_cancelled() {
+            anyhow::bail!("增量更新任务已取消");
+        }
+    }
+
+    // 4. 并发处理每个受影响面板
+    if let Some(ref cb) = progress_callback {
+        cb(0.20, &format!("计算 {} 个面板的房间关系", affected_panels.len()));
+    }
+
+    use futures::stream::{self, StreamExt};
+
+    let total_panels = affected_panels.len();
+    let processed = Arc::new(AtomicU64::new(0));
+
+    let results = stream::iter(affected_panels)
+        .map(|pr| {
+            let mesh_dir = mesh_dir.clone();
+            let exclude_panel_refnos = exclude_panel_refnos.clone();
+            let options = compute_options;
+            let processed = processed.clone();
+            let progress_callback = &progress_callback;
+            let total = total_panels;
+            async move {
+                let count = process_panel_for_room(
+                    &mesh_dir,
+                    pr.panel,
+                    &pr.room_num,
+                    exclude_panel_refnos.as_ref(),
+                    options,
+                )
+                .await;
+                let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(cb) = progress_callback {
+                    let pct = 0.20 + 0.75 * (done as f32 / total as f32);
+                    cb(pct, &format!("已处理 {}/{} 个面板", done, total));
+                }
+                count
+            }
+        })
+        .buffer_unordered(compute_options.concurrency.max(1))
+        .collect::<Vec<_>>()
+        .await;
+
+    let updated_elements: usize = results.iter().sum();
+    let duration = start_time.elapsed();
+
+    info!(
+        "增量更新完成: {} 个面板, {} 个构件, 耗时 {:?}",
+        total_panels, updated_elements, duration
+    );
+
+    if let Some(ref cb) = progress_callback {
+        cb(1.0, "增量更新完成");
+    }
+
+    Ok(RoomBuildStats {
+        total_rooms: total_panels,
+        total_panels,
+        total_components: updated_elements,
+        build_time_ms: duration.as_millis() as u64,
+        cache_hit_rate: CACHE_METRICS.hit_rate(),
+        memory_usage_mb: estimate_memory_usage().await,
+        failed_panels: 0,
+        missing_candidates: 0,
+    })
 
 }
 
@@ -5720,7 +5873,7 @@ pub async fn update_room_relations_incremental_with_cancel(
 
 pub async fn rebuild_room_relations_for_rooms_with_cancel(
 
-    room_numbers: Vec<String>,
+    room_numbers: Option<Vec<String>>,
 
     db_option: &DbOption,
 
@@ -5778,11 +5931,15 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
 
 
 
-    // 2. 过滤指定房间
+    // 2. 过滤指定房间（None 表示处理所有房间）
 
-    let numbers_set: HashSet<String> = room_numbers.into_iter().collect();
+    if let Some(ref numbers) = room_numbers {
 
-    room_panel_map.retain(|(_, room_num, _)| numbers_set.contains(room_num));
+        let numbers_set: HashSet<&String> = numbers.iter().collect();
+
+        room_panel_map.retain(|(_, room_num, _)| numbers_set.contains(room_num));
+
+    }
 
     info!("过滤后处理 {} 个房间", room_panel_map.len());
 
@@ -5811,6 +5968,17 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
         });
 
     }
+
+
+
+    // 3. 清理目标作用域的旧关系，再写入过滤后的新关系
+    if let Some(ref cb) = progress_callback {
+        cb(0.08, "正在清理旧房间关系");
+    }
+    cleanup_room_relations_for_scope(&room_panel_map).await?;
+
+    create_room_panel_relations_batch(&room_panel_map).await?;
+    info!("已写入 {} 个房间的 room_panel_relate", room_panel_map.len());
 
 
 
@@ -5878,188 +6046,6 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
 
 
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-
-pub async fn update_room_relations_incremental_original(
-
-    refnos: &[RefnoEnum],
-
-) -> anyhow::Result<IncrementalUpdateResult> {
-
-    let start_time = Instant::now();
-
-    info!("开始增量更新房间关系，涉及 {} 个构件", refnos.len());
-
-
-
-    if refnos.is_empty() {
-
-        return Ok(IncrementalUpdateResult {
-
-            affected_rooms: 0,
-
-            updated_elements: 0,
-
-            duration_ms: 0,
-
-        });
-
-    }
-
-
-
-    // 1. 查询这些 refnos 相关的房间面板
-
-    let affected_panels = query_panels_containing_refnos(refnos).await?;
-
-    info!("找到 {} 个受影响的房间面板", affected_panels.len());
-
-
-
-    if affected_panels.is_empty() {
-
-        warn!("没有找到受影响的房间面板");
-
-        return Ok(IncrementalUpdateResult {
-
-            affected_rooms: 0,
-
-            updated_elements: refnos.len(),
-
-            duration_ms: start_time.elapsed().as_millis() as u64,
-
-        });
-
-    }
-
-
-
-    // 2. 删除这些面板的旧关系
-
-    delete_room_relations_for_panels(&affected_panels).await?;
-
-    info!("已删除 {} 个面板的旧房间关系", affected_panels.len());
-
-
-
-    // 3. 重新计算并保存新关系
-
-    let db_option = aios_core::get_db_option();
-
-    let mesh_dir = db_option.get_meshes_path();
-
-    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-
-    init_room_calc_config(&db_option);
-
-    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-    ensure_spatial_index_ready(None, None, true).await?;
-
-
-
-    // 获取所有房间面板（用于排除）
-
-    let room_key_words = db_option.get_room_key_word();
-
-    let all_room_panels = build_room_panels_relate_for_query(&room_key_words).await?;
-
-    let exclude_panel_refnos: HashSet<RefnoEnum> = all_room_panels
-
-        .iter()
-
-        .flat_map(|(_, _, panels)| panels.clone())
-
-        .collect();
-
-    let exclude_panel_refnos = Arc::new(exclude_panel_refnos);
-
-
-
-    let compute_options = RoomComputeOptions::default();
-
-    CACHE_METRICS.reset();
-
-
-
-    let mut updated_elements = 0;
-
-    let affected_rooms = affected_panels.len();
-
-
-
-    // 并发处理每个面板
-
-    use futures::stream::{self, StreamExt};
-
-
-
-    let results = stream::iter(affected_panels)
-
-        .map(|pr| {
-
-            let mesh_dir = mesh_dir.clone();
-
-            let exclude_panel_refnos = exclude_panel_refnos.clone();
-
-            let options = compute_options;
-
-            async move {
-
-                process_panel_for_room(
-
-                    &mesh_dir,
-
-                    pr.panel,
-
-                    &pr.room_num,
-
-                    exclude_panel_refnos.as_ref(),
-
-                    options,
-
-                )
-
-                .await
-
-            }
-
-        })
-
-        .buffer_unordered(compute_options.concurrency.max(1))
-
-        .collect::<Vec<_>>()
-
-        .await;
-
-
-
-    updated_elements = results.iter().sum();
-
-
-
-    let duration = start_time.elapsed();
-
-    info!(
-
-        "增量更新完成: {} 个房间, {} 个元素, 耗时 {:?}",
-
-        affected_rooms, updated_elements, duration
-
-    );
-
-
-
-    Ok(IncrementalUpdateResult {
-
-        affected_rooms,
-
-        updated_elements,
-
-        duration_ms: duration.as_millis() as u64,
-
-    })
-
-}
 
 
 
@@ -6125,9 +6111,7 @@ async fn query_panels_containing_refnos(
 
 
 
-    let mut response = model_primary_db().query(&sql).await?;
-
-    let panels: Vec<PanelRoom> = response.take(0)?;
+    let panels: Vec<PanelRoom> = model_primary_db().query_take(&sql, 0).await?;
 
 
 
@@ -6137,9 +6121,11 @@ async fn query_panels_containing_refnos(
 
 
 
-/// 删除指定面板的房间关系
+/// 删除指定面板的 room_relate 关系
+///
+/// 只清理 panel->room_relate->component 边，不涉及 room_panel_relate。
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
 
 async fn delete_room_relations_for_panels(panels: &[PanelRoom]) -> anyhow::Result<()> {
 
@@ -6163,9 +6149,110 @@ async fn delete_room_relations_for_panels(panels: &[PanelRoom]) -> anyhow::Resul
 
 
 
-    model_primary_db().query(sql).await?;
+    model_primary_db().query_response(sql).await?;
 
-    debug!("已删除 {} 个面板的房间关系", panels.len());
+    debug!("已删除 {} 个面板的 room_relate", panels.len());
+
+
+
+    Ok(())
+
+}
+
+
+
+/// 删除指定房间的 room_panel_relate 关系
+///
+/// 清理 room->room_panel_relate->panel 边。
+
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+
+async fn delete_room_panel_relations_for_rooms(
+    room_refnos: &[RefnoEnum],
+) -> anyhow::Result<()> {
+
+    if room_refnos.is_empty() {
+
+        return Ok(());
+
+    }
+
+
+
+    let room_keys: Vec<String> = room_refnos.iter().map(|r| r.to_pe_key()).collect();
+
+    let room_list = room_keys.join(",");
+
+
+
+    let sql = format!(
+        "LET $ids = SELECT VALUE id FROM [{room_list}]->room_panel_relate;\nDELETE $ids;"
+    );
+
+
+
+    model_primary_db().query_response(sql).await?;
+
+    debug!("已删除 {} 个房间的 room_panel_relate", room_refnos.len());
+
+
+
+    Ok(())
+
+}
+
+
+
+/// 统一清理指定作用域的房间关系
+///
+/// 同时删除：
+/// - 目标房间的 room_panel_relate（room->panel）
+/// - 目标面板的 room_relate（panel->component）
+
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+
+async fn cleanup_room_relations_for_scope(
+    room_panel_map: &[(RefnoEnum, String, Vec<RefnoEnum>)],
+) -> anyhow::Result<()> {
+
+    if room_panel_map.is_empty() {
+
+        return Ok(());
+
+    }
+
+
+
+    // 1. 收集目标房间和面板
+    let room_refnos: Vec<RefnoEnum> = room_panel_map.iter().map(|(r, _, _)| *r).collect();
+
+    let panels_to_delete: Vec<PanelRoom> = room_panel_map
+        .iter()
+        .flat_map(|(_, room_num, panels)| {
+            panels.iter().map(move |p| PanelRoom {
+                panel: *p,
+                room_num: room_num.clone(),
+            })
+        })
+        .collect();
+
+
+
+    info!(
+        "清理作用域: {} 个房间, {} 个面板",
+        room_refnos.len(),
+        panels_to_delete.len()
+    );
+
+
+
+    // 2. 删除旧 room_relate（panel->component）
+    delete_room_relations_for_panels(&panels_to_delete).await?;
+
+
+
+    // 3. 删除旧 room_panel_relate（room->panel）
+    delete_room_panel_relations_for_rooms(&room_refnos).await?;
 
 
 
@@ -6318,20 +6405,12 @@ pub async fn regenerate_room_models_by_keywords(
 
 
 /// 针对特定房间重建关系（不生成模型）
-
 ///
-
+/// 委托给 `rebuild_room_relations_for_rooms_with_cancel`，不带取消和进度回调。
+///
 /// # 参数
-
-/// * `room_numbers` - 房间号列表（可选，为空则处理所有房间）
-
+/// * `room_numbers` - 房间号列表（可选，None 则处理所有房间）
 /// * `db_option` - 数据库配置
-
-///
-
-/// # 返回值
-
-/// * `RoomBuildStats` - 构建统计信息
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
@@ -6343,162 +6422,6 @@ pub async fn rebuild_room_relations_for_rooms(
 
 ) -> anyhow::Result<RoomBuildStats> {
 
-    info!("开始重建房间关系");
-
-    let start_time = Instant::now();
-
-
-
-    let mesh_dir = db_option.get_meshes_path();
-
-    let room_key_words = db_option.get_room_key_word();
-
-    let compute_options = RoomComputeOptions::default();
-
-
-
-    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-
-    init_room_calc_config(db_option);
-
-
-
-    // 1. 查询房间面板关系
-
-    let mut room_panel_map = build_room_panels_relate(&room_key_words).await?;
-
-
-
-    // 2. 如果指定了房间号，进行过滤
-
-    if let Some(ref numbers) = room_numbers {
-
-        let numbers_set: HashSet<String> = numbers.iter().cloned().collect();
-
-        room_panel_map.retain(|(_, room_num, _)| numbers_set.contains(room_num));
-
-        info!("过滤后剩余 {} 个房间", room_panel_map.len());
-
-    }
-
-
-
-    if room_panel_map.is_empty() {
-
-        warn!("没有找到需要处理的房间");
-
-        return Ok(RoomBuildStats {
-
-            total_rooms: 0,
-
-            total_panels: 0,
-
-            total_components: 0,
-
-            build_time_ms: 0,
-
-            cache_hit_rate: 0.0,
-
-            memory_usage_mb: 0.0,
-
-            failed_panels: 0,
-
-            missing_candidates: 0,
-
-        });
-
-    }
-
-
-
-    let exclude_panel_refnos: HashSet<RefnoEnum> = room_panel_map
-
-        .iter()
-
-        .flat_map(|(_, _, panels)| panels.clone())
-
-        .collect();
-
-
-
-    // 3. 删除旧关系
-
-    let panels_to_delete: Vec<PanelRoom> = room_panel_map
-
-        .iter()
-
-        .flat_map(|(_, room_num, panels)| {
-
-            panels.iter().map(move |p| PanelRoom {
-
-                panel: *p,
-
-                room_num: room_num.clone(),
-
-            })
-
-        })
-
-        .collect();
-
-    delete_room_relations_for_panels(&panels_to_delete).await?;
-
-    info!("已删除 {} 个面板的旧关系", panels_to_delete.len());
-
-
-
-    CACHE_METRICS.reset();
-
-
-
-    #[cfg(all(
-
-        not(target_arch = "wasm32"),
-
-        feature = "sqlite-index",
-
-        feature = "gen_model"
-
-    ))]
-
-    pregen_room_panels_into_model_cache(db_option, &room_panel_map).await?;
-
-
-
-    let stats = compute_room_relations(
-
-        &mesh_dir,
-
-        room_panel_map,
-
-        exclude_panel_refnos,
-
-        compute_options,
-
-    )
-
-    .await?;
-
-
-
-    info!(
-
-        "房间关系重建完成: {} 个房间, {} 个面板, {} 个构件, 耗时 {:?}, 缓存命中率 {:.2}%",
-
-        stats.total_rooms,
-
-        stats.total_panels,
-
-        stats.total_components,
-
-        Duration::from_millis(stats.build_time_ms),
-
-        stats.cache_hit_rate * 100.0
-
-    );
-
-
-
-    Ok(stats)
+    rebuild_room_relations_for_rooms_with_cancel(room_numbers, db_option, None, None).await
 
 }

@@ -14,13 +14,16 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 #[cfg(feature = "web_server")]
-use aios_core::project_primary_db;
+use aios_core::{project_primary_db, init_surreal};
 
 #[cfg(feature = "web_server")]
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 
 #[cfg(feature = "web_server")]
 use super::jwt_auth::{create_token, generate_form_id, verify_token};
+
+#[cfg(feature = "web_server")]
+use super::review_api::ReviewTask;
 
 #[cfg(feature = "web_server")]
 use sha2::{Digest, Sha256};
@@ -90,6 +93,9 @@ pub struct EmbedUrlData {
     pub token: String,
     /// 查询参数
     pub query: EmbedUrlQuery,
+    /// 既有任务上下文（若该 form_id 已存在）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<ReviewTask>,
 }
 
 #[derive(Debug, Serialize)]
@@ -300,6 +306,13 @@ async fn get_embed_url(
     }
 
     let form_id = form_id.unwrap_or_else(generate_form_id);
+    let existing_task = match find_task_by_form_id(&form_id).await {
+        Ok(task) => task,
+        Err(e) => {
+            warn!("Failed to load task for form_id={}: {}", form_id, e);
+            None
+        }
+    };
     
     // 2. 生成 JWT token
     match create_token(&request.project_id, &request.user_id, &form_id, None) {
@@ -324,6 +337,7 @@ async fn get_embed_url(
                         form_id,
                         is_reviewer,
                     },
+                    task: existing_task,
                 }),
             }))
         }
@@ -569,6 +583,101 @@ async fn query_workflow_models(form_id: &str) -> anyhow::Result<Vec<String>> {
     
     let rows: Vec<ModelRow> = response.take(0)?;
     Ok(rows.into_iter().filter_map(|r| r.model_refno).collect())
+}
+
+/// 查询 form_id 对应的既有任务
+#[cfg(feature = "web_server")]
+async fn find_task_by_form_id(form_id: &str) -> anyhow::Result<Option<ReviewTask>> {
+    #[derive(Debug, serde::Deserialize, SurrealValue)]
+    struct TaskRow {
+        id: surrealdb::types::RecordId,
+        form_id: Option<String>,
+        title: Option<String>,
+        description: Option<String>,
+        model_name: Option<String>,
+        status: Option<String>,
+        priority: Option<String>,
+        requester_id: Option<String>,
+        requester_name: Option<String>,
+        checker_id: Option<String>,
+        checker_name: Option<String>,
+        approver_id: Option<String>,
+        approver_name: Option<String>,
+        reviewer_id: Option<String>,
+        reviewer_name: Option<String>,
+        components: Option<Vec<super::review_api::ReviewComponent>>,
+        attachments: Option<Vec<super::review_api::ReviewAttachment>>,
+        review_comment: Option<String>,
+        created_at: Option<surrealdb::types::Datetime>,
+        updated_at: Option<surrealdb::types::Datetime>,
+        due_date: Option<surrealdb::types::Datetime>,
+        current_node: Option<String>,
+        workflow_history: Option<Vec<super::review_api::WorkflowStep>>,
+        return_reason: Option<String>,
+    }
+
+    fn to_millis(value: Option<surrealdb::types::Datetime>) -> Option<i64> {
+        value.map(|dt| dt.timestamp_millis())
+    }
+
+    let mut response = project_primary_db()
+        .query(
+            r#"
+            SELECT * FROM review_tasks
+            WHERE form_id = $form_id
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(("form_id", form_id.to_string()))
+        .await?;
+
+    let rows: Vec<TaskRow> = response.take(0)?;
+    Ok(rows.into_iter().next().map(|row| {
+        let id = match row.id.key {
+            surrealdb::types::RecordIdKey::String(value) => value,
+            other => format!("{:?}", other),
+        };
+        let checker_id = row
+            .checker_id
+            .clone()
+            .filter(|value| !value.is_empty())
+            .or_else(|| row.reviewer_id.clone())
+            .unwrap_or_default();
+        let checker_name = row
+            .checker_name
+            .clone()
+            .filter(|value| !value.is_empty())
+            .or_else(|| row.reviewer_name.clone())
+            .unwrap_or_default();
+
+        ReviewTask {
+            id,
+            form_id: row.form_id.unwrap_or_default(),
+            title: row.title.unwrap_or_default(),
+            description: row.description.unwrap_or_default(),
+            model_name: row.model_name.unwrap_or_default(),
+            status: row.status.unwrap_or_else(|| "draft".to_string()),
+            priority: row.priority.unwrap_or_else(|| "medium".to_string()),
+            requester_id: row.requester_id.unwrap_or_default(),
+            requester_name: row.requester_name.unwrap_or_default(),
+            checker_id: checker_id.clone(),
+            checker_name: checker_name.clone(),
+            approver_id: row.approver_id.unwrap_or_default(),
+            approver_name: row.approver_name.unwrap_or_default(),
+            reviewer_id: row.reviewer_id.unwrap_or_else(|| checker_id),
+            reviewer_name: row.reviewer_name.unwrap_or_else(|| checker_name),
+            components: row.components.unwrap_or_default(),
+            attachments: row.attachments,
+            review_comment: row.review_comment,
+            created_at: to_millis(row.created_at).unwrap_or_default(),
+            updated_at: to_millis(row.updated_at).unwrap_or_default(),
+            due_date: to_millis(row.due_date),
+            current_node: row.current_node.unwrap_or_else(|| "sj".to_string()),
+            workflow_history: row.workflow_history.unwrap_or_default(),
+            return_reason: row.return_reason,
+        }
+    }))
 }
 
 /// 查询表单关联的所有审批意见
@@ -838,4 +947,195 @@ async fn notify_workflow_delete(task_id: &str, operator_id: &str) -> anyhow::Res
     
     info!("[外部校审] 删除通知成功: task={}", task_id);
     Ok(())
+}
+
+#[cfg(test)]
+#[cfg(feature = "web_server")]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use serde::Deserialize;
+    use tower::ServiceExt;
+
+    #[derive(Debug, Deserialize)]
+    struct EmbedUrlResponseBody {
+        code: i32,
+        message: String,
+        data: Option<serde_json::Value>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct EmbedUrlQueryBody {
+        form_id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct EmbedTaskBody {
+        id: String,
+        form_id: String,
+        requester_id: String,
+        current_node: String,
+        status: String,
+    }
+
+    async fn cleanup_form(form_id: &str) {
+        let _ = project_primary_db()
+            .query("LET $ids = SELECT VALUE id FROM review_tasks WHERE form_id = $form_id; DELETE $ids;")
+            .bind(("form_id", form_id.to_string()))
+            .await;
+    }
+
+    async fn insert_task_with_form_id(form_id: &str, user_id: &str) {
+        let _ = init_surreal().await;
+        let _ = cleanup_form(form_id).await;
+        project_primary_db()
+            .query(
+                r#"
+                CREATE ONLY review_tasks SET
+                    id = $id,
+                    form_id = $form_id,
+                    title = $title,
+                    description = $description,
+                    model_name = $model_name,
+                    status = $status,
+                    priority = 'medium',
+                    requester_id = $requester_id,
+                    requester_name = $requester_id,
+                    checker_id = 'checker-1',
+                    checker_name = 'checker-1',
+                    approver_id = 'approver-1',
+                    approver_name = 'approver-1',
+                    reviewer_id = 'checker-1',
+                    reviewer_name = 'checker-1',
+                    components = [],
+                    attachments = NONE,
+                    current_node = $current_node,
+                    workflow_history = [],
+                    created_at = time::now(),
+                    updated_at = time::now()
+                "#,
+            )
+            .bind(("id", format!("task-{}", form_id.to_lowercase())))
+            .bind(("form_id", form_id.to_string()))
+            .bind(("title", format!("Task for {form_id}")))
+            .bind(("description", "existing seeded task".to_string()))
+            .bind(("model_name", "demo-model".to_string()))
+            .bind(("status", "in_review".to_string()))
+            .bind(("requester_id", user_id.to_string()))
+            .bind(("current_node", "jd".to_string()))
+            .await
+            .expect("seed review task");
+    }
+
+    #[tokio::test]
+    async fn test_embed_url_rejects_mismatched_form_id_from_jwt() {
+        let app = create_model_center_routes();
+        let (token, _) = create_token("project-1", "user-1", "FORM-EXPECTED", Some("sj")).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/review/embed-url")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "project_id": "project-1",
+                            "user_id": "user-1",
+                            "form_id": "FORM-OTHER",
+                            "token": token
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_embed_url_accepts_matching_form_id_from_jwt() {
+        let app = create_model_center_routes();
+        let (token, _) = create_token("project-1", "user-1", "FORM-EXPECTED", Some("sj")).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/review/embed-url")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "project_id": "project-1",
+                            "user_id": "user-1",
+                            "form_id": "FORM-EXPECTED",
+                            "token": token
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: EmbedUrlResponseBody = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.code, 200);
+        assert_eq!(payload.message, "ok");
+        let data = payload.data.expect("embed data");
+        assert_eq!(data.get("query").and_then(|q| q.get("form_id").or_else(|| q.get("formId"))).and_then(|v| v.as_str()), Some("FORM-EXPECTED"));
+        let response_token = data.get("token").and_then(|v| v.as_str()).expect("response token");
+        assert_eq!(verify_token(response_token).unwrap().user_id, "user-1");
+        assert!(data.get("task").is_none() || data.get("task").is_some_and(|v| v.is_null()));
+    }
+
+    #[tokio::test]
+    async fn test_embed_url_returns_existing_task_for_form_id() {
+        let form_id = "FORM-DB-BACKED-EXISTING";
+        insert_task_with_form_id(form_id, "user-existing").await;
+
+        let app = create_model_center_routes();
+        let (token, _) = create_token("project-1", "user-existing", form_id, Some("jd")).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/review/embed-url")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "project_id": "project-1",
+                            "user_id": "user-existing",
+                            "form_id": form_id,
+                            "token": token
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: EmbedUrlResponseBody = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload.code, 200);
+        let data = payload.data.expect("embed data");
+        assert_eq!(data.get("query").and_then(|q| q.get("form_id").or_else(|| q.get("formId"))).and_then(|v| v.as_str()), Some(form_id));
+        let task = data.get("task").and_then(|v| v.as_object()).expect("existing task restored");
+        assert_eq!(task.get("form_id").or_else(|| task.get("formId")).and_then(|v| v.as_str()), Some(form_id));
+        assert_eq!(task.get("requesterId").and_then(|v| v.as_str()), Some("user-existing"));
+        assert_eq!(task.get("currentNode").and_then(|v| v.as_str()), Some("jd"));
+        assert_eq!(task.get("status").and_then(|v| v.as_str()), Some("in_review"));
+        assert!(task.get("id").and_then(|v| v.as_str()).is_some_and(|id| id.starts_with("task-form-db-backed-existing")));
+        let response_token = data.get("token").and_then(|v| v.as_str()).expect("response token");
+        assert_eq!(verify_token(response_token).unwrap().form_id, form_id);
+
+        cleanup_form(form_id).await;
+    }
 }

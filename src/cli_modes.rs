@@ -650,6 +650,235 @@ fn report_obj_export_outcome(label: &str, output_file: &str, stats: &ExportStats
     Ok(())
 }
 
+fn resolve_room_compute_generation_target(
+    expected: RefnoEnum,
+    noun_upper: &str,
+    owner: Option<(RefnoEnum, &str)>,
+) -> RefnoEnum {
+    if noun_upper == "BRAN" || noun_upper == "HANG" {
+        return expected;
+    }
+
+    if let Some((owner_refno, owner_noun)) = owner {
+        if owner_noun == "BRAN" || owner_noun == "HANG" {
+            return owner_refno;
+        }
+    }
+
+    expected
+}
+
+fn build_room_compute_panel_gen_refnos(
+    panel_refno: RefnoEnum,
+    extra_targets: Vec<RefnoEnum>,
+) -> Vec<RefnoEnum> {
+    let mut gen_refnos = vec![panel_refno];
+    gen_refnos.extend(extra_targets);
+    gen_refnos.sort();
+    gen_refnos.dedup();
+    gen_refnos
+}
+
+fn build_room_compute_panel_gen_option(
+    db_option_ext: &DbOptionExt,
+    manual_db_nums: Option<Vec<u32>>,
+) -> DbOptionExt {
+    let mut gen_opt = db_option_ext.clone();
+    gen_opt.inner.gen_model = true;
+    gen_opt.inner.gen_mesh = true;
+    gen_opt.inner.replace_mesh = Some(true);
+    gen_opt.inner.manual_db_nums = manual_db_nums.map(|mut nums| {
+        nums.sort_unstable();
+        nums.dedup();
+        nums
+    });
+    gen_opt
+}
+
+fn derive_room_compute_panel_dbnums(refnos: &[RefnoEnum]) -> Vec<u32> {
+    use aios_database::data_interface::db_meta_manager::db_meta;
+
+    let _ = db_meta().ensure_loaded();
+    let mut dbnums: Vec<u32> = refnos
+        .iter()
+        .filter_map(|r| db_meta().get_dbnum_by_refno(*r))
+        .filter(|&dbnum| dbnum > 0)
+        .collect();
+    dbnums.sort_unstable();
+    dbnums.dedup();
+    dbnums
+}
+
+fn build_room_compute_panel_spatial_index_roots(
+    panel_refno: RefnoEnum,
+    gen_refnos: &[RefnoEnum],
+) -> Vec<RefnoEnum> {
+    let mut roots: Vec<RefnoEnum> = gen_refnos
+        .iter()
+        .copied()
+        .filter(|refno| *refno != panel_refno)
+        .collect();
+    roots.sort();
+    roots.dedup();
+    if roots.is_empty() {
+        roots.push(panel_refno);
+    }
+    roots
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn build_room_compute_panel_calc_options() -> aios_database::fast_model::room_model::RoomComputeOptions
+{
+    aios_database::fast_model::room_model::RoomComputeOptions::default()
+        .with_prebuilt_spatial_index()
+        .with_surreal_query()
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn build_room_compute_panel_spatial_index_items(
+    geom_insts: Vec<aios_core::GeomInstQuery>,
+    local_aabb_map: &std::collections::HashMap<String, parry3d::bounding_volume::Aabb>,
+) -> Vec<(i64, String, f64, f64, f64, f64, f64, f64)> {
+    use std::collections::BTreeMap;
+
+    let mut merged: BTreeMap<i64, (String, f64, f64, f64, f64, f64, f64)> = BTreeMap::new();
+
+    for geom_inst in geom_insts {
+        let Some(aabb) = resolve_room_compute_panel_geom_inst_aabb(&geom_inst, local_aabb_map)
+            .or_else(|| geom_inst.world_aabb.map(|aabb| aabb.0))
+        else {
+            continue;
+        };
+        let id = geom_inst.refno.refno().0 as i64;
+        let noun = if !geom_inst.insts.is_empty() && geom_inst.insts.iter().all(|inst| inst.is_tubi)
+        {
+            "TUBI".to_string()
+        } else {
+            "UNKNOWN".to_string()
+        };
+
+        merged
+            .entry(id)
+            .and_modify(|entry| {
+                if entry.0 == "UNKNOWN" && noun != "UNKNOWN" {
+                    entry.0 = noun.clone();
+                }
+                entry.1 = entry.1.min(aabb.mins.x as f64);
+                entry.2 = entry.2.max(aabb.maxs.x as f64);
+                entry.3 = entry.3.min(aabb.mins.y as f64);
+                entry.4 = entry.4.max(aabb.maxs.y as f64);
+                entry.5 = entry.5.min(aabb.mins.z as f64);
+                entry.6 = entry.6.max(aabb.maxs.z as f64);
+            })
+            .or_insert((
+                noun,
+                aabb.mins.x as f64,
+                aabb.maxs.x as f64,
+                aabb.mins.y as f64,
+                aabb.maxs.y as f64,
+                aabb.mins.z as f64,
+                aabb.maxs.z as f64,
+            ));
+    }
+
+    merged
+        .into_iter()
+        .map(|(id, (noun, minx, maxx, miny, maxy, minz, maxz))| {
+            (id, noun, minx, maxx, miny, maxy, minz, maxz)
+        })
+        .collect()
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn resolve_room_compute_panel_geom_inst_aabb(
+    geom_inst: &aios_core::GeomInstQuery,
+    local_aabb_map: &std::collections::HashMap<String, parry3d::bounding_volume::Aabb>,
+) -> Option<parry3d::bounding_volume::Aabb> {
+    use aios_database::fast_model::shared::aabb_apply_transform;
+    use aios_core::geometry::csg::UNIT_MESH_SCALE;
+    use parry3d::bounding_volume::BoundingVolume;
+
+    let mut merged_world_aabb: Option<parry3d::bounding_volume::Aabb> = None;
+
+    for inst in &geom_inst.insts {
+        let geo_hash = inst.geo_hash.strip_prefix("t_").unwrap_or(inst.geo_hash.as_str());
+        let Some(local_aabb) = local_aabb_map.get(geo_hash) else {
+            continue;
+        };
+        if local_aabb.extents().magnitude() <= 1e-4 {
+            continue;
+        }
+
+        let mut final_transform = if geom_inst.has_neg {
+            inst.geo_transform.0
+        } else {
+            geom_inst.world_trans.0 * inst.geo_transform.0
+        };
+        if inst.unit_flag {
+            final_transform.scale /= UNIT_MESH_SCALE;
+        }
+
+        let world_aabb = aabb_apply_transform(local_aabb, &final_transform);
+        merged_world_aabb = Some(match merged_world_aabb {
+            Some(acc) => acc.merged(&world_aabb),
+            None => world_aabb,
+        });
+    }
+
+    merged_world_aabb
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn rebuild_room_compute_panel_spatial_index(
+    db_option_ext: &DbOptionExt,
+    root_refnos: &[RefnoEnum],
+    verbose: bool,
+) -> Result<()> {
+    use aios_database::fast_model::query_provider::query_multi_descendants_with_self;
+    use aios_database::fast_model::{preload_mesh_cache, EXIST_MESH_GEO_HASHES};
+    use aios_database::spatial_index::SqliteSpatialIndex;
+    use aios_database::sqlite_index::SqliteAabbIndex;
+    use aios_core::query_insts;
+
+    if root_refnos.is_empty() {
+        return Ok(());
+    }
+
+    let idx_path = SqliteSpatialIndex::default_path();
+    if idx_path.exists() {
+        std::fs::remove_file(&idx_path)?;
+    }
+    let idx = SqliteAabbIndex::open(&idx_path)?;
+    idx.init_schema()?;
+
+    let mut expanded_refnos = root_refnos.to_vec();
+    let descendants = query_multi_descendants_with_self(root_refnos, &[], false).await?;
+    expanded_refnos.extend(descendants);
+    expanded_refnos.sort();
+    expanded_refnos.dedup();
+
+    preload_mesh_cache();
+    let local_aabb_map: std::collections::HashMap<String, parry3d::bounding_volume::Aabb> =
+        EXIST_MESH_GEO_HASHES
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect();
+    let geom_insts = query_insts(&expanded_refnos, true).await?;
+    let items = build_room_compute_panel_spatial_index_items(geom_insts, &local_aabb_map);
+    if verbose {
+        println!(
+            "   - 空间索引根节点: {}，展开后节点: {}，本地 AABB 缓存: {}",
+            root_refnos.len(),
+            expanded_refnos.len(),
+            local_aabb_map.len()
+        );
+    }
+    println!("   - 已写入 SQLite 空间索引项: {}", items.len());
+    idx.insert_aabbs_with_items(items)?;
+
+    Ok(())
+}
+
 /// --debug-model 模式：直接生成模型，不清理、不强制 FORCE_REPLACE_MESH。
 /// 增量补充缺失的 inst_geo/mesh/布尔结果。
 pub async fn run_generate_model(
@@ -2581,6 +2810,13 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
     use aios_database::spatial_index::SqliteSpatialIndex;
     use aios_database::sqlite_index::SqliteAabbIndex;
     use std::time::Instant;
+    use surrealdb::types::SurrealValue;
+
+    #[derive(serde::Deserialize, SurrealValue)]
+    struct InstRelateAabbRecord {
+        refno: RefnoEnum,
+        aabb: serde_json::Value,
+    }
 
     println!("\n🗃️ 构建空间索引 (from inst_relate_aabb)");
     println!("==========================================");
@@ -2600,7 +2836,7 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
 
     // 从 inst_relate_aabb 普通表查询所有记录，join aabb 表取坐标
     let sql = r#"SELECT refno, aabb_id.d AS aabb FROM inst_relate_aabb"#;
-    let records: Vec<serde_json::Value> = model_primary_db().query_take(sql, 0).await?;
+    let records: Vec<InstRelateAabbRecord> = model_primary_db().query_take(sql, 0).await?;
 
     println!("   📊 查询到 {} 个 inst_relate_aabb 记录", records.len());
 
@@ -2608,67 +2844,38 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
     let mut batch: Vec<(i64, f64, f64, f64, f64, f64, f64)> = Vec::new();
 
     for rec in &records {
-        // refno 可能是 pe:⟨24381_145019⟩ 格式的 RecordId
-        let refno_val = match rec.get("refno") {
-            Some(v) => v,
-            None => continue,
-        };
-        // 从 record id 提取 refno u64
-        let refno_id: i64 = if let Some(s) = refno_val.as_str() {
-            // "24381_145019" 格式
-            let parts: Vec<&str> = s.split('_').collect();
-            if parts.len() == 2 {
-                if let (Ok(a), Ok(b)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
-                    ((a << 20) | b) as i64
-                } else {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-        } else if let Some(obj) = refno_val.as_object() {
-            // {"tb": "pe", "id": {"String": "24381_145019"}} 格式
-            if let Some(id_val) = obj.get("id") {
-                let id_str = if let Some(s) = id_val.as_str() {
-                    s.to_string()
-                } else if let Some(inner) = id_val.get("String").and_then(|v| v.as_str()) {
-                    inner.to_string()
-                } else {
-                    continue;
-                };
-                let parts: Vec<&str> = id_str.split('_').collect();
-                if parts.len() == 2 {
-                    if let (Ok(a), Ok(b)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
-                        ((a << 20) | b) as i64
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-        } else {
-            continue;
-        };
+        let refno_id = rec.refno.refno().0 as i64;
 
         // 解析 aabb：格式为 {"mins": {"x":..,"y":..,"z":..}, "maxs": {...}}
-        let aabb_val = match rec.get("aabb") {
-            Some(v) if !v.is_null() => v,
-            _ => continue,
-        };
+        if rec.aabb.is_null() {
+            continue;
+        }
+        let aabb_val = &rec.aabb;
 
         let (minx, miny, minz, maxx, maxy, maxz) =
             if let (Some(mins), Some(maxs)) = (aabb_val.get("mins"), aabb_val.get("maxs")) {
-                let get3 = |v: &serde_json::Value| -> Option<(f64, f64, f64)> {
+                let get3_obj = |v: &serde_json::Value| -> Option<(f64, f64, f64)> {
                     Some((
                         v.get("x")?.as_f64()?,
                         v.get("y")?.as_f64()?,
                         v.get("z")?.as_f64()?,
                     ))
                 };
-                match (get3(mins), get3(maxs)) {
+                let get3_arr = |v: &serde_json::Value| -> Option<(f64, f64, f64)> {
+                    let arr = v.as_array()?;
+                    if arr.len() < 3 {
+                        return None;
+                    }
+                    Some((
+                        arr[0].as_f64()?,
+                        arr[1].as_f64()?,
+                        arr[2].as_f64()?,
+                    ))
+                };
+                match (
+                    get3_obj(mins).or_else(|| get3_arr(mins)),
+                    get3_obj(maxs).or_else(|| get3_arr(maxs)),
+                ) {
                     (Some(mn), Some(mx)) => (mn.0, mn.1, mn.2, mx.0, mx.1, mx.2),
                     _ => continue,
                 }
@@ -2704,6 +2911,15 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
     println!("   ⏱️  耗时: {:.2}s", duration.as_secs_f64());
 
     Ok(())
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+pub async fn rebuild_room_spatial_index_mode(verbose: bool) -> Result<()> {
+    println!("\n🗃️ 正式重建房间计算 SQLite 空间索引");
+    println!("==========================================");
+
+    ensure_surreal_connected(&aios_database::options::get_db_option_ext()).await?;
+    build_spatial_index_from_inst_relate(verbose).await
 }
 
 /// 房间计算 CLI 模式
@@ -2790,6 +3006,7 @@ pub async fn room_compute_mode(
 pub async fn room_compute_panel_mode(
     panel_refno_str: &str,
     expect_refnos: Option<Vec<String>>,
+    rebuild_spatial_index: bool,
     verbose: bool,
     db_option_ext: &DbOptionExt,
 ) -> Result<()> {
@@ -2817,89 +3034,108 @@ pub async fn room_compute_panel_mode(
     if let Some(ref expected) = expect_refnos {
         println!("   - 期望命中: {:?}", expected);
     }
+    println!(
+        "   - SQLite 空间索引: {}",
+        if rebuild_spatial_index {
+            "显式重建局部索引"
+        } else {
+            "复用现有索引"
+        }
+    );
 
     ensure_surreal_connected(db_option_ext).await?;
 
-    // ========== 自动生成模型 ==========
-    // 收集需要生成模型的 refno：panel 本身 + expect refnos（BRAN/HANG 切换到 owner）
-    let mut gen_refnos: Vec<RefnoEnum> = vec![panel_refno];
+    if rebuild_spatial_index {
+        // ========== 仅在显式指定时才生成模型并重建局部索引 ==========
+        let mut extra_gen_refnos: Vec<RefnoEnum> = Vec::new();
+        let mut expected_root_refnos: Vec<RefnoEnum> = Vec::new();
 
-    if let Some(ref expected) = expect_refnos {
-        for exp_str in expected {
-            let exp = RefnoEnum::from_str(&exp_str.replace('_', "/"))
-                .map_err(|_| anyhow!("无效的期望 refno: {}", exp_str))?;
+        if let Some(ref expected) = expect_refnos {
+            for exp_str in expected {
+                let exp = RefnoEnum::from_str(&exp_str.replace('_', "/"))
+                    .map_err(|_| anyhow!("无效的期望 refno: {}", exp_str))?;
+                expected_root_refnos.push(exp);
+                extra_gen_refnos.push(exp);
 
-            // 查询该 refno 的 owner 和 noun
-            let pe = aios_core::rs_surreal::get_pe(exp).await?;
-            if let Some(pe) = pe {
-                let noun_upper = pe.noun.to_uppercase();
-                if noun_upper == "BRAN" || noun_upper == "HANG" {
-                    // BRAN/HANG 本身就是模型生成的入口，直接生成
-                    println!("   📦 {} (noun={}) 直接加入生成列表", exp, noun_upper);
-                    gen_refnos.push(exp);
-                } else {
-                    // 非 BRAN/HANG，查询其 owner 是否为 BRAN/HANG
-                    let owner = pe.get_owner();
-                    let owner_pe = aios_core::rs_surreal::get_pe(owner).await?;
-                    if let Some(owner_pe) = owner_pe {
-                        let owner_noun = owner_pe.noun.to_uppercase();
-                        if owner_noun == "BRAN" || owner_noun == "HANG" {
-                            println!(
-                                "   📦 {} (noun={}) → 切换到 owner {} (noun={})",
-                                exp, noun_upper, owner, owner_noun
-                            );
-                            gen_refnos.push(owner);
-                        } else {
-                            println!(
-                                "   📦 {} (noun={}, owner noun={}) 直接加入",
-                                exp, noun_upper, owner_noun
-                            );
-                            gen_refnos.push(exp);
-                        }
+                let pe = aios_core::rs_surreal::get_pe(exp).await?;
+                if let Some(pe) = pe {
+                    let noun_upper = pe.noun.to_uppercase();
+                    let target = if noun_upper == "BRAN" || noun_upper == "HANG" {
+                        println!("   📦 {} (noun={}) 直接加入生成列表", exp, noun_upper);
+                        resolve_room_compute_generation_target(exp, &noun_upper, None)
                     } else {
-                        gen_refnos.push(exp);
-                    }
+                        let owner = pe.get_owner();
+                        let owner_pe = aios_core::rs_surreal::get_pe(owner).await?;
+                        if let Some(owner_pe) = owner_pe {
+                            let owner_noun = owner_pe.noun.to_uppercase();
+                            let resolved = resolve_room_compute_generation_target(
+                                exp,
+                                &noun_upper,
+                                Some((owner, owner_noun.as_str())),
+                            );
+                            if resolved == owner {
+                                println!(
+                                    "   📦 {} (noun={}) → 切换到 owner {} (noun={})",
+                                    exp, noun_upper, owner, owner_noun
+                                );
+                                extra_gen_refnos.push(owner);
+                            } else {
+                                println!(
+                                    "   📦 {} (noun={}, owner noun={}) 直接加入",
+                                    exp, noun_upper, owner_noun
+                                );
+                            }
+                            resolved
+                        } else {
+                            exp
+                        }
+                    };
+                    extra_gen_refnos.push(target);
+                } else {
+                    println!("   ⚠️ {} 未找到 PE 记录，跳过自动生成", exp);
                 }
-            } else {
-                println!("   ⚠️ {} 未找到 PE 记录，跳过自动生成", exp);
             }
         }
-    }
 
-    // 去重
-    gen_refnos.sort();
-    gen_refnos.dedup();
+        let gen_refnos = build_room_compute_panel_gen_refnos(panel_refno, extra_gen_refnos);
+        let derived_dbnums = derive_room_compute_panel_dbnums(&gen_refnos);
+        println!("\n🔨 自动生成模型 ({} 个目标)...", gen_refnos.len());
+        for r in &gen_refnos {
+            println!("   - {}", r);
+        }
+        if !derived_dbnums.is_empty() {
+            println!("   - 关联数据库编号: {:?}", derived_dbnums);
+        }
 
-    println!("\n🔨 自动生成模型 ({} 个目标)...", gen_refnos.len());
-    for r in &gen_refnos {
-        println!("   - {}", r);
-    }
-
-    {
         use aios_database::fast_model::gen_all_geos_data;
         aios_core::set_debug_model_enabled(true);
-        let mut gen_opt = db_option_ext.clone();
-        gen_opt.inner.gen_model = true;
-        gen_opt.inner.gen_mesh = true;
-        gen_opt.inner.replace_mesh = Some(true);
+        let gen_opt = build_room_compute_panel_gen_option(
+            db_option_ext,
+            if derived_dbnums.is_empty() {
+                None
+            } else {
+                Some(derived_dbnums.clone())
+            },
+        );
         gen_all_geos_data(gen_refnos, &gen_opt, None, None).await?;
+        let spatial_index_roots = if expected_root_refnos.is_empty() {
+            build_room_compute_panel_spatial_index_roots(panel_refno, &[panel_refno])
+        } else {
+            build_room_compute_panel_spatial_index_roots(panel_refno, &expected_root_refnos)
+        };
+        if !spatial_index_roots.is_empty() {
+            println!("\n🗃️ 刷新房间计算用 SQLite 空间索引...");
+            rebuild_room_compute_panel_spatial_index(&gen_opt, &spatial_index_roots, verbose)
+                .await?;
+        }
+        println!("✅ 模型生成完成");
+    } else {
+        println!("\n🗃️ 复用现有 SQLite 空间索引，不执行模型生成与局部索引重建");
     }
-    println!("✅ 模型生成完成");
 
-    // ========== 诊断 inst_relate_aabb 数据 ==========
-    {
-        use aios_core::SurrealQueryExt;
-        use aios_core::model_primary_db;
-        let count: Vec<serde_json::Value> = model_primary_db()
-            .query_take("SELECT count() FROM inst_relate_aabb GROUP ALL", 0)
-            .await
-            .unwrap_or_default();
-        println!("🔍 inst_relate_aabb 记录数: {:?}", count);
-    }
-
-    // ========== 执行房间计算（内部自动刷新空间索引） ==========
+    // ========== 执行房间计算（复用刚刚构建的最小 SQLite 空间索引） ==========
     let mesh_dir = db_option_ext.inner.get_meshes_path();
-    let options = RoomComputeOptions::default();
+    let options = build_room_compute_panel_calc_options();
     let exclude = HashSet::new();
 
     println!("\n🔄 计算面板 {} 的房间归属...", panel_refno);
@@ -3006,6 +3242,7 @@ pub async fn room_compute_mode(
 pub async fn room_compute_panel_mode(
     _panel_refno_str: &str,
     _expect_refnos: Option<Vec<String>>,
+    _rebuild_spatial_index: bool,
     _verbose: bool,
     _db_option_ext: &DbOptionExt,
 ) -> Result<()> {
@@ -3057,4 +3294,82 @@ pub async fn export_room_instances_mode(output_dir: Option<PathBuf>, verbose: bo
     println!("     - 耗时: {} ms", geometries_stats.export_time_ms);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_room_compute_panel_calc_options, build_room_compute_panel_gen_option,
+        build_room_compute_panel_gen_refnos, build_room_compute_panel_spatial_index_roots,
+        resolve_room_compute_generation_target,
+    };
+    use aios_core::RefnoEnum;
+    use std::str::FromStr;
+
+    fn refno(s: &str) -> RefnoEnum {
+        RefnoEnum::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn test_resolve_room_compute_generation_target_prefers_bran_owner() {
+        let target = resolve_room_compute_generation_target(
+            refno("24381/145019"),
+            "ELBO",
+            Some((refno("24381/145018"), "BRAN")),
+        );
+
+        assert_eq!(target, refno("24381/145018"));
+    }
+
+    #[test]
+    fn test_build_room_compute_panel_gen_refnos_sorts_and_dedups() {
+        let refnos = build_room_compute_panel_gen_refnos(
+            refno("24381/35798"),
+            vec![
+                refno("24381/145018"),
+                refno("24381/145018"),
+                refno("24381/35798"),
+            ],
+        );
+
+        assert_eq!(refnos, vec![refno("24381/35798"), refno("24381/145018")]);
+    }
+
+    #[test]
+    fn test_build_room_compute_panel_gen_option_enables_instance_export() {
+        let db_option_ext =
+            aios_database::options::get_db_option_ext_from_path("db_options/DbOption-mac")
+                .unwrap();
+
+        let gen_opt =
+            build_room_compute_panel_gen_option(&db_option_ext, Some(vec![7997, 8000, 7997]));
+
+        assert!(!gen_opt.export_instances);
+        assert_eq!(gen_opt.inner.replace_mesh, Some(true));
+        assert!(gen_opt.inner.gen_model);
+        assert!(gen_opt.inner.gen_mesh);
+        assert_eq!(gen_opt.inner.manual_db_nums, Some(vec![7997, 8000]));
+    }
+
+    #[test]
+    fn test_build_room_compute_panel_spatial_index_roots_prefers_non_panel_targets() {
+        let roots = build_room_compute_panel_spatial_index_roots(
+            refno("24381/35798"),
+            &[
+                refno("24381/35798"),
+                refno("24381/145018"),
+                refno("24381/145018"),
+            ],
+        );
+
+        assert_eq!(roots, vec![refno("24381/145018")]);
+    }
+
+    #[test]
+    fn test_build_room_compute_panel_calc_options_preserves_prebuilt_spatial_index() {
+        let options = build_room_compute_panel_calc_options();
+
+        assert!(!options.refresh_spatial_index_enabled());
+        assert!(!options.query_from_cache_enabled());
+    }
 }

@@ -1327,13 +1327,13 @@ async fn apply_boolean_for_query(
 
     let mut pos_manifolds = Vec::new();
 
-    for (pos_id, pos_t) in query.pos_geos.iter() {
+    for pos in query.pos_geos.iter() {
 
-        let pos_mesh_id = pos_id.to_mesh_id();
+        let pos_mesh_id = pos.id.to_mesh_id();
 
         // 正实体使用局部变换
 
-        let pos_local_mat = pos_t.0.to_matrix().as_dmat4();
+        let pos_local_mat = pos.trans.0.to_matrix().as_dmat4();
 
         println!(
 
@@ -1763,11 +1763,11 @@ async fn apply_boolean_for_query(
 
         let mut pos_hi_manifolds = Vec::new();
 
-        for (pos_id, pos_t) in query.pos_geos.iter() {
+        for pos in query.pos_geos.iter() {
 
-            let pos_mesh_id = pos_id.to_mesh_id();
+            let pos_mesh_id = pos.id.to_mesh_id();
 
-            let pos_local_mat = pos_t.0.to_matrix().as_dmat4();
+            let pos_local_mat = pos.trans.0.to_matrix().as_dmat4();
 
             if let Ok(m) = load_manifold(&pos_mesh_id, pos_local_mat, true) {
 

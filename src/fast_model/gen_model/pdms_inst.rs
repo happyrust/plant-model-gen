@@ -1,34 +1,38 @@
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{hash_map::Entry, HashMap};
 
 use aios_core::geometry::ShapeInstancesData;
-use aios_core::parsed_data::TubiInfoData;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
+use aios_core::parsed_data::TubiInfoData;
 use aios_core::pdms_types::*;
 use aios_core::types::*;
-use aios_core::{SurrealQueryExt, get_db_option, gen_aabb_hash, gen_plant_transform_hash, gen_string_hash, model_query_response, model_primary_db};
-use dashmap::DashMap;
-use std::collections::HashSet;
-use std::sync::Arc;
 use aios_core::Transform;
-use futures::StreamExt;
+use aios_core::{
+    gen_aabb_hash, gen_plant_transform_hash, gen_string_hash, get_db_option, model_primary_db,
+    model_query_response, SurrealQueryExt,
+};
+use dashmap::DashMap;
 use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use itertools::Itertools;
 use rkyv::vec;
-use tokio::task::JoinHandle;
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 
 use parry3d::bounding_volume::{Aabb, BoundingVolume};
 
+use super::mesh_generate::MeshResult;
+use super::refno_assoc_index::RefnoAssocIndexBatch;
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::debug_model_debug;
-// model_store 已移除，使用 model_primary_db() 直接查询
-use crate::options::{RegenDeleteMode, get_db_option_ext};
-use super::mesh_generate::MeshResult;
-use super::refno_assoc_index::{
-    RefnoAssocIndexBatch, build_delete_sql_by_refnos as build_assoc_delete_sql_by_refnos,
-    delete_by_refnos as delete_by_refno_assoc_index,
-};
 // use crate::fast_model::EXIST_MESH_GEOS;
+
+#[inline]
+fn is_refno_assoc_index_enabled() -> bool {
+    // refno_assoc_index 已硬关闭：保留兼容类型，但运行时永远不启用。
+    false
+}
 
 /// 将 tubi_info 数据写入数据库（可选覆盖）。
 ///
@@ -43,7 +47,10 @@ pub async fn save_tubi_info_batch_with_replace(
     }
 
     const CHUNK_SIZE: usize = 200;
-    let ids = tubi_info_map.iter().map(|e| e.key().clone()).collect::<Vec<_>>();
+    let ids = tubi_info_map
+        .iter()
+        .map(|e| e.key().clone())
+        .collect::<Vec<_>>();
     let mut written = 0usize;
 
     for chunk in ids.chunks(CHUNK_SIZE) {
@@ -87,7 +94,10 @@ async fn delete_inst_relate_by_in_with_dbnum(
 }
 
 /// replace_exist=true 时，删除指定 inst_info 的 geo_relate（关系表）记录，避免旧几何残留导致同一实例出现多份 Pos。
-async fn delete_geo_relate_by_inst_info_ids(inst_info_ids: &[String], chunk_size: usize) -> anyhow::Result<()> {
+async fn delete_geo_relate_by_inst_info_ids(
+    inst_info_ids: &[String],
+    chunk_size: usize,
+) -> anyhow::Result<()> {
     for sql in build_delete_geo_relate_by_inst_info_ids_sql(inst_info_ids, chunk_size) {
         model_query_response(&sql).await?;
     }
@@ -100,7 +110,10 @@ async fn delete_geo_relate_by_inst_info_ids(inst_info_ids: &[String], chunk_size
 /// - out 是正实体（如 WALL），多个 batch 共享同一 target
 /// - 按 out 删除会跨 batch 覆盖（无论并发还是顺序执行）
 /// - pe 是负载体（如 FIXING），每个 batch 独有，按 pe 删除并发安全
-async fn delete_boolean_relations_by_carriers(carrier_refnos: &[RefnoEnum], chunk_size: usize) -> anyhow::Result<()> {
+async fn delete_boolean_relations_by_carriers(
+    carrier_refnos: &[RefnoEnum],
+    chunk_size: usize,
+) -> anyhow::Result<()> {
     for sql in build_delete_boolean_relations_by_carriers_sql(carrier_refnos, chunk_size) {
         model_query_response(&sql).await?;
     }
@@ -113,7 +126,10 @@ async fn delete_boolean_relations_by_carriers(carrier_refnos: &[RefnoEnum], chun
 /// - 当前轮生成/关系扫描显示 neg/ngmr=0（不会触发布尔 worker），
 /// - 但 `inst_relate_bool:⟨refno⟩` 仍残留 status=Success，导致导出优先使用旧的 booled mesh，
 ///   表现为模型出现莫名缺口/截面不对。
-async fn delete_inst_relate_bool_records(refnos: &[RefnoEnum], chunk_size: usize) -> anyhow::Result<()> {
+async fn delete_inst_relate_bool_records(
+    refnos: &[RefnoEnum],
+    chunk_size: usize,
+) -> anyhow::Result<()> {
     if refnos.is_empty() {
         return Ok(());
     }
@@ -124,7 +140,10 @@ async fn delete_inst_relate_bool_records(refnos: &[RefnoEnum], chunk_size: usize
     Ok(())
 }
 
-fn build_delete_inst_relate_bool_records_sql(refnos: &[RefnoEnum], chunk_size: usize) -> Vec<String> {
+fn build_delete_inst_relate_bool_records_sql(
+    refnos: &[RefnoEnum],
+    chunk_size: usize,
+) -> Vec<String> {
     if refnos.is_empty() {
         return Vec::new();
     }
@@ -178,7 +197,11 @@ fn build_delete_inst_relate_by_in_sql(
     }
     let mut sqls = Vec::new();
     for chunk in refnos.chunks(chunk_size.max(1)) {
-        let in_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
+        let in_keys = chunk
+            .iter()
+            .map(|r| r.to_pe_key())
+            .collect::<Vec<_>>()
+            .join(",");
         if let Some(dbnum) = dbnum {
             sqls.push(format!(
                 "LET $ids = SELECT VALUE id FROM inst_relate WHERE dbnum = {dbnum} AND in IN [{in_keys}];\nDELETE $ids;"
@@ -205,7 +228,11 @@ async fn query_refno_dbnum_map(refnos: &[RefnoEnum], chunk_size: usize) -> HashM
     }
 
     for chunk in refnos.chunks(chunk_size.max(1)) {
-        let ids = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
+        let ids = chunk
+            .iter()
+            .map(|r| r.to_pe_key())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!("SELECT record::id(id) AS rid, dbnum FROM [{}];", ids);
 
         match model_primary_db().query_response(&sql).await {
@@ -339,32 +366,7 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
 
     let t = std::time::Instant::now();
 
-    // 1. 优先尝试使用高效的 refno_assoc_index
-    let regen_delete_mode = get_db_option_ext().regen_delete_mode;
-    if regen_delete_mode == RegenDeleteMode::RefnoAssocIndex {
-        match delete_by_refno_assoc_index(&all_refnos, CHUNK_SIZE).await {
-            Ok(summary) => {
-                if summary.used_index {
-                    println!(
-                        "[pre_cleanup_for_regen] 清理完成 (RefnoAssocIndex)，耗时 {} ms",
-                        t.elapsed().as_millis()
-                    );
-                    return Ok(());
-                } else {
-                    println!(
-                        "[pre_cleanup_for_regen] RefnoAssocIndex 不完整 (indexed: {}, req: {})，降级到 Legacy 模式进行全量扫描清理",
-                        summary.indexed_refnos, summary.requested_refnos
-                    );
-                }
-            }
-            Err(e) => {
-                println!(
-                    "[pre_cleanup_for_regen] RefnoAssocIndex 清理失败: {}，降级到 Legacy 模式",
-                    e
-                );
-            }
-        }
-    }
+    // refno_assoc_index 已硬关闭，清理流程始终走 Legacy 路径。
 
     let refno_dbnum_map = query_refno_dbnum_map(&all_refnos, CHUNK_SIZE).await;
     let mut refnos_by_dbnum: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
@@ -378,10 +380,10 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
     );
 
     // 2. 降级使用分批高并发扫描删除 (Legacy 模式)
-    
+
     // 限制最大并发数，以防止对单一 SurrealDB 底层施加过大连接压力
     use futures::stream::{self, StreamExt};
-    let limit_concurrency = 16; 
+    let limit_concurrency = 16;
 
     let mut chunks: Vec<(u32, Vec<RefnoEnum>)> = Vec::new();
     for (dbnum, refs) in refnos_by_dbnum {
@@ -399,7 +401,7 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
                     "LET $inst_ids = SELECT VALUE out FROM inst_relate WHERE dbnum = {dbnum} AND in IN [{pe_keys}];\
                      SELECT VALUE record::id(out) FROM geo_relate WHERE in IN $inst_ids;"
                 );
-                
+
                 let geo_hashes: Vec<String> = model_primary_db()
                     .query_take(&sql, 1)
                     .await
@@ -409,7 +411,7 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
                     .iter()
                     .filter_map(|s| s.parse::<u64>().ok())
                     .collect();
-                    
+
                 if !hashes.is_empty() {
                     let _ = delete_inst_geo_by_hashes(&hashes, CHUNK_SIZE).await;
                 }
@@ -440,7 +442,7 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
     // 处理独立的记录（bool 记录、负实体关系等）
     let bool_sqls = build_delete_inst_relate_bool_records_sql(&all_refnos, CHUNK_SIZE);
     let neg_sqls = build_delete_boolean_relations_by_carriers_sql(&all_refnos, CHUNK_SIZE);
-    
+
     let mut misc_stream = stream::iter(bool_sqls.into_iter().chain(neg_sqls.into_iter()))
         .map(|sql| {
             tokio::spawn(async move {
@@ -467,7 +469,10 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
 }
 
 /// 保存 instance 数据到数据库（事务化批处理版本）
-#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "save_instance_data_optimize"))]
+#[cfg_attr(
+    feature = "profile",
+    tracing::instrument(skip_all, name = "save_instance_data_optimize")
+)]
 pub async fn save_instance_data_optimize(
     inst_mgr: &ShapeInstancesData,
     replace_exist: bool,
@@ -489,9 +494,7 @@ pub async fn save_instance_data_optimize(
     // 本地 SurrealDB 在并发事务较高时更容易出现 “Transaction conflict: Resource busy”，
     // 这里降低并发以提升整体成功率（结合 TransactionBatcher 内部重试）。
     const MAX_CONCURRENT_TX: usize = 2;
-    let regen_delete_mode = get_db_option_ext().regen_delete_mode;
-    let use_refno_assoc_index = regen_delete_mode == RegenDeleteMode::RefnoAssocIndex;
-    let mut refno_assoc_batch = if use_refno_assoc_index {
+    let mut refno_assoc_batch = if is_refno_assoc_index_enabled() {
         Some(RefnoAssocIndexBatch::default())
     } else {
         None
@@ -575,30 +578,21 @@ pub async fn save_instance_data_optimize(
                     inst_geo_data.refno,
                     format!("inst_info:⟨{}⟩", inst_geo_data.id()),
                 );
-                batch.add_geo_relate_id(
-                    inst_geo_data.refno,
-                    format!("geo_relate:⟨{}⟩", relate_id),
-                );
+                batch.add_geo_relate_id(inst_geo_data.refno, format!("geo_relate:⟨{}⟩", relate_id));
             }
             if let Some(batch) = refno_assoc_batch.as_mut() {
                 batch.add_inst_info_id(
                     inst_geo_data.refno,
                     format!("inst_info:⟨{}⟩", inst_geo_data.id()),
                 );
-                batch.add_geo_relate_id(
-                    inst_geo_data.refno,
-                    format!("geo_relate:⟨{}⟩", relate_id),
-                );
+                batch.add_geo_relate_id(inst_geo_data.refno, format!("geo_relate:⟨{}⟩", relate_id));
             }
             if let Some(batch) = refno_assoc_batch.as_mut() {
                 batch.add_inst_info_id(
                     inst_geo_data.refno,
                     format!("inst_info:⟨{}⟩", inst_geo_data.id()),
                 );
-                batch.add_geo_relate_id(
-                    inst_geo_data.refno,
-                    format!("geo_relate:⟨{}⟩", relate_id),
-                );
+                batch.add_geo_relate_id(inst_geo_data.refno, format!("geo_relate:⟨{}⟩", relate_id));
             }
 
             // 收集 Neg 和 CataCrossNeg 类型的 geo_relate 映射
@@ -1411,10 +1405,7 @@ pub async fn save_tubi_info_batch(
     // 3. 批量 INSERT
     let mut inserted = 0;
     for chunk in new_entries.chunks(CHUNK_SIZE) {
-        let values: Vec<String> = chunk
-            .iter()
-            .map(|e| e.value().to_surreal_json())
-            .collect();
+        let values: Vec<String> = chunk.iter().map(|e| e.value().to_surreal_json()).collect();
 
         let sql = format!("INSERT INTO tubi_info [{}];", values.join(","));
         model_query_response(&sql).await?;
@@ -1447,7 +1438,10 @@ async fn query_existing_tubi_info_ids(ids: &[String]) -> anyhow::Result<HashSet<
 
         let sql = format!("SELECT VALUE record::id(id) FROM [{}];", id_list);
 
-        let result: Vec<String> = model_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+        let result: Vec<String> = model_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .unwrap_or_default();
         existing.extend(result);
     }
 
@@ -1463,9 +1457,7 @@ async fn query_existing_tubi_info_ids(ids: &[String]) -> anyhow::Result<HashSet<
 ///
 /// 此函数在所有阶段（LOOP/CATE/PRIM）完成后、布尔运算前调用，
 /// 从 DB 查询已有的 Neg/CataNeg geo_relate 并补建缺失的 neg_relate。
-pub async fn reconcile_missing_neg_relate(
-    all_refnos: &[RefnoEnum],
-) -> anyhow::Result<usize> {
+pub async fn reconcile_missing_neg_relate(all_refnos: &[RefnoEnum]) -> anyhow::Result<usize> {
     if all_refnos.is_empty() {
         return Ok(0);
     }
@@ -1478,13 +1470,15 @@ pub async fn reconcile_missing_neg_relate(
         .map(|r| r.to_pe_key())
         .collect::<Vec<_>>()
         .join(",");
-    let sql = format!(r#"SELECT
+    let sql = format!(
+        r#"SELECT
             record::id(id) as gr_id,
             record::id(geom_refno) as neg_carrier,
             record::id(geom_refno.owner) as parent_id
         FROM geo_relate
         WHERE geo_type IN ['Neg', 'CataNeg']
-          AND geom_refno IN [{pe_list}]"#);
+          AND geom_refno IN [{pe_list}]"#
+    );
     let mut response = model_primary_db().query_response(&sql).await?;
     let neg_geos: Vec<serde_json::Value> = response.take(0)?;
     if neg_geos.is_empty() {
@@ -1499,13 +1493,29 @@ pub async fn reconcile_missing_neg_relate(
     }
     let mut infos: Vec<NegGeoInfo> = Vec::new();
     for val in &neg_geos {
-        let gr_id = val.get("gr_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        let neg_carrier = val.get("neg_carrier").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        let parent_id = val.get("parent_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let gr_id = val
+            .get("gr_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let neg_carrier = val
+            .get("neg_carrier")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let parent_id = val
+            .get("parent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
         if gr_id.is_empty() || neg_carrier.is_empty() || parent_id.is_empty() {
             continue;
         }
-        infos.push(NegGeoInfo { gr_id, neg_carrier, parent_id });
+        infos.push(NegGeoInfo {
+            gr_id,
+            neg_carrier,
+            parent_id,
+        });
     }
     if infos.is_empty() {
         return Ok(0);
@@ -1516,9 +1526,7 @@ pub async fn reconcile_missing_neg_relate(
         .map(|r| format!("geo_relate:⟨{}⟩", r.gr_id))
         .collect::<Vec<_>>()
         .join(",");
-    let check_sql = format!(
-        "SELECT VALUE record::id(in) FROM [{gr_id_list}]->neg_relate"
-    );
+    let check_sql = format!("SELECT VALUE record::id(in) FROM [{gr_id_list}]->neg_relate");
     let mut check_resp = model_primary_db().query_response(&check_sql).await?;
     let existing_vec: Vec<String> = check_resp.take(0).unwrap_or_default();
     let existing: HashSet<String> = existing_vec.into_iter().collect();
@@ -1540,9 +1548,7 @@ pub async fn reconcile_missing_neg_relate(
 
         neg_buffer.push(format!(
             "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', pe:⟨{2}⟩], out: pe:⟨{2}⟩, pe: pe:⟨{1}⟩ }}",
-            info.gr_id,
-            info.neg_carrier,
-            info.parent_id,
+            info.gr_id, info.neg_carrier, info.parent_id,
         ));
     }
 
@@ -1594,7 +1600,12 @@ impl InstRelatePrecomputed {
         let mut dbnum_map: HashMap<RefnoEnum, u32> = HashMap::new();
 
         if refnos.is_empty() {
-            return Self { zone_map, spec_map, dt_map, dbnum_map };
+            return Self {
+                zone_map,
+                spec_map,
+                dt_map,
+                dbnum_map,
+            };
         }
 
         // 1. zone_refno: 使用默认值 NONE（已禁用查询）
@@ -1623,8 +1634,10 @@ impl InstRelatePrecomputed {
                         let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
                         for row in rows {
                             if let Some(rid) = row.get("rid").and_then(|v| v.as_str()) {
-                                let dbnum = row.get("dbnum").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                                let sesno = row.get("sesno").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let dbnum =
+                                    row.get("dbnum").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let sesno =
+                                    row.get("sesno").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                                 pe_dbnum_sesno.insert(rid.to_string(), (dbnum, sesno));
                             }
                         }
@@ -1697,7 +1710,12 @@ impl InstRelatePrecomputed {
             dbnum_map.len(),
         );
 
-        Self { zone_map, spec_map, dt_map, dbnum_map }
+        Self {
+            zone_map,
+            spec_map,
+            dt_map,
+            dbnum_map,
+        }
     }
 
     /// 获取预计算的 zone PE key
@@ -1732,7 +1750,10 @@ impl InstRelatePrecomputed {
 ///
 /// 逻辑与 `save_instance_data_optimize` 完全对应，但所有 SQL 写入文件而非 SurrealDB，
 /// 且 inst_relate 中的 `fn::find_ancestor_type` / `fn::ses_date` 已替换为预计算常量值。
-#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "save_instance_data_to_sql_file"))]
+#[cfg_attr(
+    feature = "profile",
+    tracing::instrument(skip_all, name = "save_instance_data_to_sql_file")
+)]
 pub async fn save_instance_data_to_sql_file(
     inst_mgr: &ShapeInstancesData,
     replace_exist: bool,
@@ -1742,9 +1763,7 @@ pub async fn save_instance_data_to_sql_file(
     mesh_aabb_map: &DashMap<String, Aabb>,
 ) -> anyhow::Result<()> {
     const CHUNK_SIZE: usize = 200;
-    let regen_delete_mode = get_db_option_ext().regen_delete_mode;
-    let use_refno_assoc_index = regen_delete_mode == RegenDeleteMode::RefnoAssocIndex;
-    let mut refno_assoc_batch = if use_refno_assoc_index {
+    let mut refno_assoc_batch = if is_refno_assoc_index_enabled() {
         Some(RefnoAssocIndexBatch::default())
     } else {
         None
@@ -1786,57 +1805,24 @@ pub async fn save_instance_data_to_sql_file(
             .into_iter()
             .collect();
 
-        if use_refno_assoc_index {
-            match build_assoc_delete_sql_by_refnos(&refnos, CHUNK_SIZE).await? {
-                Some(sqls) => writer.write_statements(&sqls)?,
-                None => {
-                    writer.write_statements(&build_delete_inst_relate_by_in_sql(
-                        &refnos,
-                        CHUNK_SIZE,
-                        None,
-                    ))?;
-                    writer.write_statements(&build_delete_inst_relate_bool_records_sql(
-                        &refnos,
-                        CHUNK_SIZE,
-                    ))?;
-                    writer.write_statements(&build_delete_geo_relate_by_inst_info_ids_sql(
-                        &inst_info_ids,
-                        CHUNK_SIZE,
-                    ))?;
-                    writer.write_statements(&build_delete_boolean_relations_by_carriers_sql(
-                        &refnos,
-                        CHUNK_SIZE,
-                    ))?;
-                }
-            }
-            writer.write_statements(&build_delete_inst_geo_by_hashes_sql(
-                &geo_hashes,
-                CHUNK_SIZE,
-            ))?;
-        } else {
-            // Legacy 模式：也写入 .surql 文件而非直接执行，避免阻塞 ~120 秒
-            writer.write_statements(&build_delete_inst_relate_by_in_sql(
-                &refnos,
-                CHUNK_SIZE,
-                None,
-            ))?;
-            writer.write_statements(&build_delete_inst_relate_bool_records_sql(
-                &refnos,
-                CHUNK_SIZE,
-            ))?;
-            writer.write_statements(&build_delete_inst_geo_by_hashes_sql(
-                &geo_hashes,
-                CHUNK_SIZE,
-            ))?;
-            writer.write_statements(&build_delete_geo_relate_by_inst_info_ids_sql(
-                &inst_info_ids,
-                CHUNK_SIZE,
-            ))?;
-            writer.write_statements(&build_delete_boolean_relations_by_carriers_sql(
-                &refnos,
-                CHUNK_SIZE,
-            ))?;
-        }
+        // Legacy 模式：也写入 .surql 文件而非直接执行，避免阻塞 ~120 秒。
+        writer.write_statements(&build_delete_inst_relate_by_in_sql(
+            &refnos, CHUNK_SIZE, None,
+        ))?;
+        writer.write_statements(&build_delete_inst_relate_bool_records_sql(
+            &refnos, CHUNK_SIZE,
+        ))?;
+        writer.write_statements(&build_delete_inst_geo_by_hashes_sql(
+            &geo_hashes,
+            CHUNK_SIZE,
+        ))?;
+        writer.write_statements(&build_delete_geo_relate_by_inst_info_ids_sql(
+            &inst_info_ids,
+            CHUNK_SIZE,
+        ))?;
+        writer.write_statements(&build_delete_boolean_relations_by_carriers_sql(
+            &refnos, CHUNK_SIZE,
+        ))?;
     }
 
     // inst_geo & geo_relate

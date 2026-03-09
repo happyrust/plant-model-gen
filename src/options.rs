@@ -18,6 +18,15 @@ fn default_regen_delete_mode() -> RegenDeleteMode {
     RegenDeleteMode::Legacy
 }
 
+fn parse_regen_delete_mode(raw: Option<&str>) -> RegenDeleteMode {
+    match raw.map(|s| s.to_ascii_lowercase()) {
+        // refno_assoc_index 已硬关闭：为兼容旧配置，这里统一降级为 Legacy。
+        Some(mode) if mode == "refno_assoc_index" => RegenDeleteMode::Legacy,
+        Some(_) => RegenDeleteMode::Legacy,
+        None => RegenDeleteMode::Legacy,
+    }
+}
+
 /// 校验数据源模式是否符合当前固定策略。
 ///
 /// 当前策略：输入数据固定读取 SurrealDB。
@@ -70,7 +79,7 @@ impl Default for BooleanPipelineMode {
 pub enum RegenDeleteMode {
     /// 旧路径：多表查询后逐表删除
     Legacy,
-    /// 新路径：按 refno_assoc_index 聚合索引删除
+    /// 已停用：历史上按 refno_assoc_index 聚合索引删除
     RefnoAssocIndex,
 }
 
@@ -176,7 +185,9 @@ pub struct DbOptionExt {
     #[serde(default = "default_boolean_pipeline_mode")]
     pub boolean_pipeline_mode: BooleanPipelineMode,
 
-    /// regen-model 删旧模式
+    /// regen-model 删旧模式。
+    ///
+    /// 注意：`refno_assoc_index` 已停用；即使旧配置显式填写，也会在解析时统一降级到 `Legacy`。
     #[serde(default = "default_regen_delete_mode")]
     pub regen_delete_mode: RegenDeleteMode,
 
@@ -490,14 +501,8 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         })
         .unwrap_or(BooleanPipelineMode::DbLegacy);
 
-    let regen_delete_mode = toml_value
-        .get("regen_delete_mode")
-        .and_then(|v| v.as_str())
-        .map(|s| match s.to_ascii_lowercase().as_str() {
-            "refno_assoc_index" => RegenDeleteMode::RefnoAssocIndex,
-            _ => RegenDeleteMode::Legacy,
-        })
-        .unwrap_or(RegenDeleteMode::Legacy);
+    let regen_delete_mode =
+        parse_regen_delete_mode(toml_value.get("regen_delete_mode").and_then(|v| v.as_str()));
 
     let enable_db_backfill = toml_value
         .get("enable_db_backfill")
@@ -540,15 +545,8 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         gen_model_dry_run,
     };
 
-    validate_data_source_mode(db_option_ext.use_surrealdb).map_err(
-        |e| {
-            anyhow::anyhow!(
-                "配置文件 {} 数据源模式非法: {}",
-                config_file,
-                e
-            )
-        },
-    )?;
+    validate_data_source_mode(db_option_ext.use_surrealdb)
+        .map_err(|e| anyhow::anyhow!("配置文件 {} 数据源模式非法: {}", config_file, e))?;
 
     // 打印加载的配置
     println!("📋 加载的配置:");
@@ -589,14 +587,19 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
 
 #[cfg(test)]
 mod tests {
-    use super::validate_data_source_mode;
+    use super::{parse_regen_delete_mode, validate_data_source_mode, RegenDeleteMode};
 
     #[test]
     fn data_source_mode_requires_fixed_surreal_input() {
         assert!(validate_data_source_mode(true).is_ok());
         assert!(validate_data_source_mode(false).is_err());
     }
+
+    #[test]
+    fn regen_delete_mode_refno_assoc_index_is_forced_to_legacy() {
+        assert_eq!(
+            parse_regen_delete_mode(Some("refno_assoc_index")),
+            RegenDeleteMode::Legacy
+        );
+    }
 }
-
-
-

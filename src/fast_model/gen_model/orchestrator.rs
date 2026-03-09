@@ -1321,7 +1321,7 @@ async fn process_index_tree_generation(
 // ============================================================================
 
 #[cfg(feature = "sqlite-index")]
-async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums: &[u32]) -> Result<()> {
+pub async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums: &[u32]) -> Result<()> {
     use crate::spatial_index::SqliteSpatialIndex;
     use crate::sqlite_index::{ImportConfig, SqliteAabbIndex};
     use std::fs;
@@ -1394,7 +1394,7 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
 }
 
 #[cfg(not(feature = "sqlite-index"))]
-async fn update_sqlite_spatial_index_from_cache(_db_option: &DbOptionExt, _dbnums: &[u32]) -> Result<()> {
+pub async fn update_sqlite_spatial_index_from_cache(_db_option: &DbOptionExt, _dbnums: &[u32]) -> Result<()> {
     Ok(())
 }
 

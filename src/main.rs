@@ -334,7 +334,7 @@ use crate::cli_modes::start_grpc_server_mode;
 #[cfg(not(feature = "gui"))]
 use crate::cli_modes::{
     ExportConfig, export_glb_mode, export_gltf_mode, export_model_mode, export_obj_mode,
-    get_output_filename_for_refno,
+    get_output_filename_for_refno, rebuild_room_spatial_index_mode,
 };
 #[cfg(not(feature = "gui"))]
 use aios_core::geometry::csg::clear_ploop_debug_cache;
@@ -803,7 +803,14 @@ async fn main() -> anyhow::Result<()> {
                         .arg(Arg::new("expect-refnos").long("expect-refnos")
                             .help("期望命中的构件 refno（逗号分隔），用于验证计算结果")
                             .value_delimiter(',')
-                            .num_args(1..)),
+                            .num_args(1..))
+                        .arg(Arg::new("rebuild-spatial-index").long("rebuild-spatial-index")
+                            .help("显式重建本次 panel 计算使用的局部 SQLite 空间索引；默认直接复用现有索引")
+                            .action(clap::ArgAction::SetTrue)),
+                )
+                .subcommand(
+                    Command::new("rebuild-spatial-index")
+                        .about("从 inst_relate_aabb 正式重建全量 SQLite 空间索引"),
                 )
                 .subcommand(
                     Command::new("clean")
@@ -2163,14 +2170,19 @@ async fn main() -> anyhow::Result<()> {
                 let expect_refnos: Option<Vec<String>> = sub_m
                     .get_many::<String>("expect-refnos")
                     .map(|v| v.map(|s| s.to_string()).collect());
+                let rebuild_spatial_index = sub_m.get_flag("rebuild-spatial-index");
 
                 return room_compute_panel_mode(
                     panel_refno,
                     expect_refnos,
+                    rebuild_spatial_index,
                     verbose,
                     &db_option_ext,
                 )
                 .await;
+            }
+            Some(("rebuild-spatial-index", _)) => {
+                return rebuild_room_spatial_index_mode(verbose).await;
             }
             Some(("clean", _)) => {
                 return room_clean_mode(&db_option_ext).await;

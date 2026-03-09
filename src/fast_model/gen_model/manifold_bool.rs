@@ -12,11 +12,7 @@ use aios_core::SurrealQueryExt;
 
 use aios_core::csg::manifold::ManifoldRust;
 
-use aios_core::geometry::csg::{unit_box_mesh, unit_cylinder_mesh, unit_sphere_mesh};
-
 use aios_core::get_db_option;
-
-use aios_core::mesh_precision::LodMeshSettings;
 
 use aios_core::rs_surreal::boolean_query_optimized::query_manifold_boolean_operations_batch_optimized;
 
@@ -329,31 +325,23 @@ fn mesh_base_dir() -> PathBuf {
 
 fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<ManifoldRust> {
 
-    // 对标准单位几何体（1/2/3）强制使用内置几何生成，避免磁盘上被误写/污染的同名 GLB 影响布尔结果。
+    // 对标准单位几何体（1/2/3）使用 Manifold 原生构造（无焊接，f64 精度）
 
     if matches!(id, "1" | "2" | "3") {
 
-        let unit_mesh = match id {
+        let unit_manifold = match id {
 
-            "1" => unit_box_mesh(),
+            "1" => ManifoldRust::native_box(1.0, 1.0, 1.0),
 
-            "2" => unit_cylinder_mesh(&LodMeshSettings::default(), false),
+            "2" => ManifoldRust::native_cylinder(0.5, 1.0, 64),
 
-            "3" => unit_sphere_mesh(),
+            "3" => ManifoldRust::native_sphere(0.5, 64),
 
             _ => unreachable!(),
 
         };
 
-        // 将 Vec3 数组转换为 glam::Vec3 数组
-
-        let vertices: Vec<glam::Vec3> = unit_mesh.vertices.iter()
-
-            .map(|v| glam::Vec3::new(v[0], v[1], v[2]))
-
-            .collect();
-
-        let manifold = ManifoldRust::from_vertices_indices(&vertices, &unit_mesh.indices, mat, more_precision);
+        let manifold = unit_manifold.apply_transform(mat);
 
         // 复用下面的"空/哨兵"校验逻辑
 
@@ -487,27 +475,27 @@ pub(crate) fn load_manifold_from_geo_param(
 
 ) -> anyhow::Result<ManifoldRust> {
 
-    // 对标准单位几何体（1/2/3）使用内置几何生成
+    // 对标准单位几何体（1/2/3）使用 Manifold 原生构造（无焊接，f64 精度）
 
     if matches!(geo_hash, 1 | 2 | 3) {
 
-        debug_model_debug!("load_manifold_from_geo_param: 使用内置 unit mesh: geo_hash={}", geo_hash);
+        debug_model_debug!("load_manifold_from_geo_param: 使用原生 Manifold 构造: geo_hash={}", geo_hash);
 
-        let unit_mesh = match geo_hash {
+        let unit_manifold = match geo_hash {
 
-            1 => unit_box_mesh(),
+            1 => ManifoldRust::native_box(1.0, 1.0, 1.0),
 
-            2 => unit_cylinder_mesh(&LodMeshSettings::default(), false),
+            2 => ManifoldRust::native_cylinder(0.5, 1.0, 64),
 
-            3 => unit_sphere_mesh(),
+            3 => ManifoldRust::native_sphere(0.5, 64),
 
             _ => unreachable!(),
 
         };
 
-        let manifold = ManifoldRust::from_vertices_indices(&unit_mesh.vertices, &unit_mesh.indices, mat, more_precision);
+        let transformed = unit_manifold.apply_transform(mat);
 
-        return validate_manifold_result(manifold, &geo_hash.to_string());
+        return validate_manifold_result(transformed, &geo_hash.to_string());
 
     }
 

@@ -3,6 +3,7 @@ name: Multi-Platform Build
 on:
   push:
     branches: [ "ci-multi-platform-build", "main", "master" ]
+    tags: [ "v*.*.*" ]
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
@@ -78,9 +79,20 @@ jobs:
         if: runner.os == 'Windows'
         uses: microsoft/setup-msbuild@v2
       
-      - name: Build web_server
+      - name: Build web_server (standard)
+        if: matrix.artifact_name != 'linux-x64'
         run: |
           cargo build --release --bin web_server --target ${{ matrix.target }} --no-default-features --features ws,sqlite-index,surreal-save,web_server
+        shell: bash
+        env:
+          GIT_ASKPASS: /tmp/git-askpass.sh
+          GIT_TERMINAL_PROMPT: 0
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+      
+      - name: Build web_server (Linux deploy-ready)
+        if: matrix.artifact_name == 'linux-x64'
+        run: |
+          cargo build --release --bin web_server --target ${{ matrix.target }} --no-default-features --features ws,gen_model,manifold,project_hd,surreal-save,sqlite-index,web_server,parquet-export
         shell: bash
         env:
           GIT_ASKPASS: /tmp/git-askpass.sh
@@ -110,6 +122,13 @@ jobs:
           echo "Commit: ${{ github.sha }}" >> release-package/BUILD_INFO.txt
           echo "Branch: ${{ github.ref_name }}" >> release-package/BUILD_INFO.txt
           echo "Target: ${{ matrix.target }}" >> release-package/BUILD_INFO.txt
+          if [ "${{ matrix.artifact_name }}" = "linux-x64" ]; then
+            echo "Features: ws,gen_model,manifold,project_hd,surreal-save,sqlite-index,web_server,parquet-export" >> release-package/BUILD_INFO.txt
+            echo "Deploy-Ready: true" >> release-package/BUILD_INFO.txt
+          else
+            echo "Features: ws,sqlite-index,surreal-save,web_server" >> release-package/BUILD_INFO.txt
+            echo "Deploy-Ready: false" >> release-package/BUILD_INFO.txt
+          fi
         shell: bash
       
       - name: Upload artifacts
@@ -118,3 +137,12 @@ jobs:
           name: ${{ matrix.artifact_name }}-release
           path: release-package/*
           retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-package/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

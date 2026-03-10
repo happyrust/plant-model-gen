@@ -93,6 +93,8 @@ pub struct EmbedUrlData {
     pub token: String,
     /// 查询参数
     pub query: EmbedUrlQuery,
+    /// 稳定的业务 lineage，供前端与 validator 直接读取
+    pub lineage: EmbedLineage,
     /// 既有任务上下文（若该 form_id 已存在）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<ReviewTask>,
@@ -104,6 +106,21 @@ pub struct EmbedUrlQuery {
     pub form_id: String,
     /// 是否为审核人员
     pub is_reviewer: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbedLineage {
+    /// 外部业务主键，跨 open/save/submit/read 必须保持稳定
+    pub form_id: String,
+    /// 当前打开命中的任务 ID；无既有任务时为空
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// 当前任务节点；无既有任务时为空
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_node: Option<String>,
+    /// 当前任务状态；无既有任务时为空
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 /// 缓存预加载请求 (我们调用模型中心)
@@ -334,8 +351,14 @@ async fn get_embed_url(
                     relative_path: PLATFORM_CONFIG.frontend_relative_path.clone(),
                     token,
                     query: EmbedUrlQuery {
-                        form_id,
+                        form_id: form_id.clone(),
                         is_reviewer,
+                    },
+                    lineage: EmbedLineage {
+                        form_id: form_id.clone(),
+                        task_id: existing_task.as_ref().map(|task| task.id.clone()),
+                        current_node: existing_task.as_ref().map(|task| task.current_node.clone()),
+                        status: existing_task.as_ref().map(|task| task.status.clone()),
                     },
                     task: existing_task,
                 }),
@@ -970,6 +993,14 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize)]
+    struct EmbedLineageBody {
+        form_id: String,
+        task_id: Option<String>,
+        current_node: Option<String>,
+        status: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
     struct EmbedTaskBody {
         id: String,
         form_id: String,
@@ -1087,6 +1118,11 @@ mod tests {
         assert_eq!(payload.message, "ok");
         let data = payload.data.expect("embed data");
         assert_eq!(data.get("query").and_then(|q| q.get("form_id").or_else(|| q.get("formId"))).and_then(|v| v.as_str()), Some("FORM-EXPECTED"));
+        let lineage: EmbedLineageBody = serde_json::from_value(data.get("lineage").cloned().expect("lineage")).unwrap();
+        assert_eq!(lineage.form_id, "FORM-EXPECTED");
+        assert_eq!(lineage.task_id, None);
+        assert_eq!(lineage.current_node, None);
+        assert_eq!(lineage.status, None);
         let response_token = data.get("token").and_then(|v| v.as_str()).expect("response token");
         assert_eq!(verify_token(response_token).unwrap().user_id, "user-1");
         assert!(data.get("task").is_none() || data.get("task").is_some_and(|v| v.is_null()));
@@ -1127,6 +1163,11 @@ mod tests {
         assert_eq!(payload.code, 200);
         let data = payload.data.expect("embed data");
         assert_eq!(data.get("query").and_then(|q| q.get("form_id").or_else(|| q.get("formId"))).and_then(|v| v.as_str()), Some(form_id));
+        let lineage: EmbedLineageBody = serde_json::from_value(data.get("lineage").cloned().expect("lineage")).unwrap();
+        assert_eq!(lineage.form_id, form_id);
+        assert!(lineage.task_id.as_deref().is_some_and(|task_id| task_id.starts_with("task-form-db-backed-existing")));
+        assert_eq!(lineage.current_node.as_deref(), Some("jd"));
+        assert_eq!(lineage.status.as_deref(), Some("in_review"));
         let task = data.get("task").and_then(|v| v.as_object()).expect("existing task restored");
         assert_eq!(task.get("form_id").or_else(|| task.get("formId")).and_then(|v| v.as_str()), Some(form_id));
         assert_eq!(task.get("requesterId").and_then(|v| v.as_str()), Some("user-existing"));

@@ -141,7 +141,6 @@ pub mod unit_converter;
 
 
 
-pub mod parquet_fast_model;
 
 
 
@@ -153,7 +152,7 @@ pub mod incremental;
 
 
 
-// aabb_cache 已废弃，改用 DuckDB
+// aabb_cache 已废弃
 
 // #[cfg(feature = "sqlite-index")]
 
@@ -173,15 +172,7 @@ pub mod concurrency;
 
 
 
-// 碰撞检测：改用 DuckDB 空间查询
-
-#[cfg(feature = "duckdb-feature")]
-
-pub mod collision_detect;
-
-#[cfg(feature = "duckdb-feature")]
-
-pub use collision_detect::{CollisionConfig, CollisionDetector, CollisionEvent, CollisionStats};
+// 碰撞检测模块已移除
 
 
 

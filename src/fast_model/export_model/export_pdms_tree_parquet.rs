@@ -1,7 +1,7 @@
 //! PDMS Tree Parquet 导出
 //!
 //! 目的：
-//! - 为前端 DuckDB（含 duckdb-wasm）提供“完全离线”的模型树查询数据源
+//! - 为前端提供”完全离线”的模型树查询数据源
 //! - 覆盖 e3d tree API 的核心字段：refno / owner / noun / name / children_count / dbnum
 //!
 //! 输出：

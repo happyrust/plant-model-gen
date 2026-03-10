@@ -62,9 +62,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 
 
-#[cfg(feature = "duckdb-feature")]
 
-use crate::fast_model::export_model::get_or_init_duckdb_reader;
 
 
 
@@ -1266,7 +1264,7 @@ async fn get_enhanced_trimesh_cache() -> &'static DashMap<String, Arc<TriMesh>> 
 
 /// 5. 支持 dbnum 和 refno 子树范围限制
 
-#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
 #[cfg_attr(feature = "profile", tracing::instrument(skip(db_option)))]
 
@@ -1288,7 +1286,7 @@ pub async fn build_room_relations(
 
 /// 支持取消和进度回调的房间关系构建
 
-#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
 pub async fn build_room_relations_with_cancel(
 
@@ -1537,7 +1535,7 @@ pub async fn build_room_relations_with_cancel(
 
 
 
-#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
 async fn compute_room_relations(
 
@@ -1573,7 +1571,7 @@ async fn compute_room_relations(
 
 
 
-#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
 #[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "compute_room_relations"))]
 
@@ -1641,7 +1639,7 @@ async fn compute_room_relations_with_cancel(
 
             let cancel_token = cancel_token.clone();
 
-            
+
 
             async move {
 
@@ -2204,7 +2202,7 @@ struct PanelProcessOutcome {
 
 
 
-#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
 #[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "process_panel_for_room"))]
 
@@ -3032,7 +3030,7 @@ pub async fn cal_room_refnos_with_options(
 
             //
 
-            // 说明：当前房间计算的 DuckDB 空间索引链路依赖外部文件，容易因环境不齐导致失败；
+            // 说明：当前房间计算的空间索引链路依赖外部文件，容易因环境不齐导致失败；
 
             // 为保证 CLI 可用性，这里优先使用本仓库提供的 SQLite 空间索引（import-spatial-index 生成）。
 
@@ -3284,7 +3282,7 @@ async fn load_geometry_with_enhanced_cache(
 
         let cache_key = format!("{}_{}", geo_hash, lod_level);
 
-        
+
 
         // 1. 检查 TriMesh 缓存 (用于 GLB/GLTF 直接加载的结果)
 
@@ -3330,7 +3328,7 @@ async fn load_geometry_with_enhanced_cache(
 
         let lod_subdir = format!("lod_{}", lod_level);
 
-        
+
 
         // 3. 尝试加载 GLB/GLTF
 
@@ -3408,7 +3406,7 @@ fn load_tri_mesh_from_glb(path: &PathBuf) -> anyhow::Result<TriMesh> {
 
     let glb = gltf::Gltf::from_reader(reader)?;
 
-    
+
 
     let mut vertices = Vec::new();
 
@@ -3512,13 +3510,13 @@ fn transform_tri_mesh(mesh: &TriMesh, transform: Mat4) -> TriMesh {
 
         .collect();
 
-    
+
 
     // 索引不变
 
     let indices = mesh.indices().to_vec();
 
-    
+
 
     // 这里我们假设变换后的几何体仍然是有效的，如果构建失败则 panic (或者应该返回 Result)
 
@@ -3750,7 +3748,7 @@ fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
 
 /// 从 TriMesh 顶点采样关键点
 
-/// 
+///
 
 /// 判断关键点是否在面板 TriMesh 内
 
@@ -4256,7 +4254,7 @@ async fn estimate_memory_usage() -> f32 {
 
 
 
-#[cfg(not(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature"))))]
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
 
 async fn estimate_memory_usage() -> f32 {
 
@@ -5036,13 +5034,13 @@ mod tests {
 
         let metrics = CacheMetrics::new();
 
-        
+
 
         // 初始命中率为 0
 
         assert_eq!(metrics.hit_rate(), 0.0);
 
-        
+
 
         // 记录一些命中和未命中
 
@@ -5052,7 +5050,7 @@ mod tests {
 
         metrics.record_plant_miss();
 
-        
+
 
         // 2 命中 / 3 总计 = 0.666...
 
@@ -5070,7 +5068,7 @@ mod tests {
 
         let metrics = CacheMetrics::new();
 
-        
+
 
         metrics.record_plant_hit();
 
@@ -5080,11 +5078,11 @@ mod tests {
 
         metrics.record_trimesh_miss();
 
-        
+
 
         metrics.reset();
 
-        
+
 
         assert_eq!(metrics.plant_hits.load(Ordering::Relaxed), 0);
 
@@ -5328,7 +5326,7 @@ mod tests {
 
         };
 
-        
+
 
         // 测试序列化
 
@@ -5338,7 +5336,7 @@ mod tests {
 
         assert!(json.contains("\"total_panels\":50"));
 
-        
+
 
         // 测试反序列化
 
@@ -5376,13 +5374,13 @@ mod tests {
 
         };
 
-        
+
 
         let json = serde_json::to_string(&result).unwrap();
 
         assert!(json.contains("\"affected_rooms\":5"));
 
-        
+
 
         let deserialized: IncrementalUpdateResult = serde_json::from_str(&json).unwrap();
 
@@ -5984,7 +5982,7 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
 
     info!("开始重建房间关系 (指定房间，支持取消)");
 
-    
+
 
     if let Some(ref cb) = progress_callback {
 
@@ -6038,7 +6036,7 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
 
     info!("过滤后处理 {} 个房间", room_panel_map.len());
 
-    
+
 
     if room_panel_map.is_empty() {
 
@@ -6406,7 +6404,7 @@ async fn query_panels_containing_refnos(
 
 #[cfg(all(
     not(target_arch = "wasm32"),
-    any(feature = "sqlite-index", feature = "duckdb-feature")
+    feature = "sqlite-index"
 ))]
 
 async fn delete_all_room_relations() -> anyhow::Result<()> {
@@ -6418,7 +6416,7 @@ async fn delete_all_room_relations() -> anyhow::Result<()> {
 
 #[cfg(all(
     not(target_arch = "wasm32"),
-    any(feature = "sqlite-index", feature = "duckdb-feature")
+    feature = "sqlite-index"
 ))]
 
 async fn delete_room_relations_for_panels(panels: &[PanelRoom]) -> anyhow::Result<()> {

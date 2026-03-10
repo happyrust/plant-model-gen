@@ -2529,7 +2529,7 @@ pub async fn export_pdms_tree_parquet_mode(
 ) -> Result<()> {
     use aios_database::fast_model::export_model::export_pdms_tree_parquet::export_pdms_tree_parquet;
 
-    println!("\n🎯 导出 PDMS Tree 为 Parquet（供 DuckDB/duckdb-wasm 查询模型树）");
+    println!("\n🎯 导出 PDMS Tree 为 Parquet（供前端查询模型树）");
     println!("==============================================");
     println!("   - dbnum: {}", dbnum);
 
@@ -2574,7 +2574,7 @@ pub async fn export_world_sites_parquet_mode(
 ) -> Result<()> {
     use aios_database::fast_model::export_model::export_pdms_tree_parquet::export_world_sites_parquet;
 
-    println!("\n🎯 导出 WORL -> SITE 节点列表为 Parquet（供 DuckDB/duckdb-wasm 查询）");
+    println!("\n🎯 导出 WORL -> SITE 节点列表为 Parquet（供前端查询）");
     println!("==========================================================");
 
     // 输出目录：默认 output/<project>/scene_tree_parquet

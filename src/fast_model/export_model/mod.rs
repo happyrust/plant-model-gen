@@ -28,17 +28,8 @@ pub mod parquet_writer;
 #[cfg(feature = "parquet-export")]
 pub mod parquet_stream_writer;
 
-// #[cfg(feature = "duckdb-feature")]
 
-// pub mod duckdb_writer;
 
-#[cfg(feature = "duckdb-feature")]
-
-pub mod duckdb_exporter;
-
-#[cfg(feature = "duckdb-feature")]
-
-pub mod duckdb_reader;
 
 pub mod simple_color_palette;
 
@@ -63,12 +54,4 @@ pub use name_config::NameConfig;
 
 #[cfg(feature = "parquet-export")]
 pub use parquet_stream_writer::ParquetStreamWriter;
-
-#[cfg(feature = "duckdb-feature")]
-
-pub use duckdb_exporter::{DuckDBStreamWriter, DuckDBWriteMode};
-
-#[cfg(feature = "duckdb-feature")]
-
-pub use duckdb_reader::*;
 

@@ -5543,8 +5543,8 @@ async fn convert_to_db_status(db_info: serde_json::Value) -> Option<DbStatusInfo
     let mesh_status = check_mesh_status(dbnum).await;
 
     // 读取本地缓存与文件中的 sesno，基于 sesno 判断是否需要更新
-    // SESSION_STORE removed - now using DuckDB
-    let cached_sesno = 0u32;  // TODO: Replace with DuckDB query
+    // SESSION_STORE removed
+    let cached_sesno = 0u32;
     let latest_file_sesno = get_latest_sesno_from_file(&project, dbnum).unwrap_or(sesno);
 
     // 文件版本信息（用于展示）
@@ -5664,8 +5664,8 @@ async fn check_single_file_version(db_info: serde_json::Value) -> Option<serde_j
     let sesno = db_info["sesno"].as_u64().unwrap_or(0) as u32;
     let project = db_info["project"].as_str().unwrap_or("");
 
-    // SESSION_STORE removed - now using DuckDB
-    let cached_sesno = 0u32;  // TODO: Replace with DuckDB query
+    // SESSION_STORE removed
+    let cached_sesno = 0u32;
     let latest_file_sesno = get_latest_sesno_from_file(project, dbnum).unwrap_or(sesno);
     let needs_update = cached_sesno < latest_file_sesno;
 

@@ -25,19 +25,19 @@ pub fn add_export_instance_args(command: Command) -> Command {
         .arg(
             Arg::new("export-parquet")
                 .long("export-parquet")
-                .help("Export dbnum instances from SurrealDB as multi-table Parquet (instances/geo_instances/tubings/transforms/aabb) for DuckDB querying. If --dbnum is omitted, scans all distinct dbnums from inst_relate and exports each")
+                .help("Export dbnum instances from SurrealDB as multi-table Parquet (instances/geo_instances/tubings/transforms/aabb). If --dbnum is omitted, scans all distinct dbnums from inst_relate and exports each")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("export-pdms-tree-parquet")
                 .long("export-pdms-tree-parquet")
-                .help("Export PDMS TreeIndex + pe.name as Parquet (pdms_tree_{dbnum}.parquet) for DuckDB-WASM model tree queries")
+                .help("Export PDMS TreeIndex + pe.name as Parquet (pdms_tree_{dbnum}.parquet) for model tree queries")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("export-world-sites-parquet")
                 .long("export-world-sites-parquet")
-                .help("Export WORL->SITE nodes as Parquet (world_sites.parquet) for DuckDB-WASM (Full Parquet Mode)")
+                .help("Export WORL->SITE nodes as Parquet (world_sites.parquet)")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(

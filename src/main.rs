@@ -2059,7 +2059,7 @@ async fn main() -> anyhow::Result<()> {
 
         let dbnum = single_dbnum.unwrap();
 
-        println!("🎯 导出 dbnum 实例数据为 Parquet（多表，供 DuckDB 查询）");
+        println!("🎯 导出 dbnum 实例数据为 Parquet（多表，供前端查询）");
         println!("   - 按 dbnum={} 过滤", dbnum);
         if let Some(ref root) = root_refno {
             println!("   - 根节点: {}（仅导出其 visible 子孙）", root);

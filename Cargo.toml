@@ -213,6 +213,7 @@ web_server = [
     "dep:tokio-util",
     "dep:rusqlite",
     "aios_core/web_server",
+    "gen_model",
     "dep:jsonwebtoken",
     "sqlite-index",
     "dep:reqwest",

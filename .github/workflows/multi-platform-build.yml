@@ -10,6 +10,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  RUSTC_WRAPPER: ""
 
 jobs:
   build:
@@ -49,6 +50,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "multi-platform-${{ matrix.artifact_name }}"
+          cache-on-failure: true
       
       - name: Install Linux dependencies
         if: runner.os == 'Linux'

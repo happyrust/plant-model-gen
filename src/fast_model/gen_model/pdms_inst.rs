@@ -479,12 +479,30 @@ pub async fn save_instance_data_optimize(
     mesh_results: &HashMap<u64, MeshResult>,
     mesh_aabb_map: &DashMap<String, Aabb>,
 ) -> anyhow::Result<()> {
+    save_instance_data_with_options(
+        inst_mgr,
+        replace_exist,
+        mesh_results,
+        mesh_aabb_map,
+        true,
+    )
+    .await
+}
+
+pub async fn save_instance_data_with_options(
+    inst_mgr: &ShapeInstancesData,
+    replace_exist: bool,
+    mesh_results: &HashMap<u64, MeshResult>,
+    mesh_aabb_map: &DashMap<String, Aabb>,
+    write_inst_relate_aabb: bool,
+) -> anyhow::Result<()> {
     debug_model_debug!(
-        "save_instance_data_optimize start: inst_info={}, inst_geo_keys={}, tubi_keys={}, replace_exist={}",
+        "save_instance_data_optimize start: inst_info={}, inst_geo_keys={}, tubi_keys={}, replace_exist={}, write_inst_relate_aabb={}",
         inst_mgr.inst_info_map.len(),
         inst_mgr.inst_geos_map.len(),
         inst_mgr.inst_tubi_map.len(),
-        replace_exist
+        replace_exist,
+        write_inst_relate_aabb
     );
 
     // 单条 INSERT 里拼接的记录数，过大容易触发 SurrealDB 事务取消/超时；取小一点更稳。
@@ -619,15 +637,7 @@ pub async fn save_instance_data_optimize(
                 _ => {}
             }
 
-            let mut geo_json = inst.gen_unit_geo_sur_json();
-            if let Some(mr) = mesh_results.get(&inst.geo_hash) {
-                if let Some(pos) = geo_json.rfind('}') {
-                    geo_json.truncate(pos);
-                    geo_json.push_str(&mr.to_insert_fields());
-                    geo_json.push_str(" }");
-                }
-            }
-            inst_geo_buffer.push(geo_json);
+            inst_geo_buffer.push(inst.gen_unit_geo_sur_json());
 
             if inst_geo_buffer.len() >= CHUNK_SIZE {
                 let statement = format!(
@@ -1068,7 +1078,7 @@ pub async fn save_instance_data_optimize(
     }
 
     // inst_relate_aabb（普通表：refno=pe, aabb_id=aabb），按历史约定延后到 aabb 写入之后执行
-    if !inst_relate_aabb_chunks.is_empty() || !inst_relate_aabb_buffer.is_empty() {
+    if write_inst_relate_aabb && (!inst_relate_aabb_chunks.is_empty() || !inst_relate_aabb_buffer.is_empty()) {
         let mut inst_aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
 
         // 统一把积累的 chunks + 剩余 buffer 一次性落库
@@ -1101,6 +1111,11 @@ pub async fn save_instance_data_optimize(
             total
         );
         inst_aabb_batcher.finish().await?;
+    } else if !write_inst_relate_aabb && (!inst_relate_aabb_chunks.is_empty() || !inst_relate_aabb_buffer.is_empty()) {
+        debug_model_debug!(
+            "save_instance_data_optimize skip inst_relate_aabb write: {} buffered rows",
+            inst_relate_aabb_chunks.iter().map(|(rows, _)| rows.len()).sum::<usize>() + inst_relate_aabb_buffer.len()
+        );
     }
 
     // transform
@@ -1165,6 +1180,101 @@ pub async fn save_instance_data_optimize(
         inst_mgr.neg_relate_map.len(),
         inst_mgr.ngmr_neg_relate_map.len()
     );
+
+    Ok(())
+}
+
+pub fn build_inst_relate_aabb_rows(
+    inst_mgr: &ShapeInstancesData,
+    mesh_results: &HashMap<u64, MeshResult>,
+    mesh_aabb_map: &DashMap<String, Aabb>,
+) -> anyhow::Result<(HashMap<u64, String>, Vec<String>)> {
+    let mut aabb_map: HashMap<u64, String> = HashMap::new();
+    let mut inst_relate_aabb_rows: Vec<String> = Vec::new();
+
+    for (key, info) in &inst_mgr.inst_info_map {
+        let resolved_aabb: Option<(u64, Aabb)> = if let Some(aabb) = info.aabb {
+            Some((gen_aabb_hash(&aabb), aabb))
+        } else if let Some(geos_info) = inst_mgr.inst_geos_map.get(&info.get_inst_key()) {
+            let mut union_aabb: Option<Aabb> = None;
+            for inst in &geos_info.insts {
+                if let Some(mr) = mesh_results.get(&inst.geo_hash) {
+                    if let Some(h) = mr.aabb_hash {
+                        if let Some(aabb_ref) = mesh_aabb_map.get(&h.to_string()) {
+                            union_aabb = Some(match union_aabb {
+                                Some(existing) => existing.merged(&*aabb_ref),
+                                None => *aabb_ref,
+                            });
+                        }
+                    }
+                }
+            }
+            union_aabb.map(|aabb| (gen_aabb_hash(&aabb), aabb))
+        } else {
+            None
+        };
+
+        if let Some((aabb_hash, aabb)) = resolved_aabb {
+            if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
+                entry.insert(serde_json::to_string(&aabb)?);
+            }
+
+            inst_relate_aabb_rows.push(format!(
+                "{{id: {0}, refno: {1}, aabb_id: aabb:⟨{2}⟩}}",
+                key.to_table_key("inst_relate_aabb"),
+                key.to_pe_key(),
+                aabb_hash
+            ));
+        }
+    }
+
+    Ok((aabb_map, inst_relate_aabb_rows))
+}
+
+pub async fn save_inst_relate_aabb_rows(
+    aabb_map: &HashMap<u64, String>,
+    inst_relate_aabb_rows: &[String],
+) -> anyhow::Result<()> {
+    if aabb_map.is_empty() && inst_relate_aabb_rows.is_empty() {
+        return Ok(());
+    }
+
+    const CHUNK_SIZE: usize = 100;
+    const MAX_TX_STATEMENTS: usize = 5;
+    const MAX_CONCURRENT_TX: usize = 2;
+
+    if !aabb_map.is_empty() {
+        let mut aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
+        let mut json_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+
+        for (&hash, value) in aabb_map {
+            json_buffer.push(format!("{{'id':aabb:⟨{}⟩, 'd':{}}}", hash, value));
+            if json_buffer.len() >= CHUNK_SIZE {
+                let statement = format!("INSERT IGNORE INTO aabb [{}];", json_buffer.join(","));
+                aabb_batcher.push(statement).await?;
+                json_buffer.clear();
+            }
+        }
+
+        if !json_buffer.is_empty() {
+            let statement = format!("INSERT IGNORE INTO aabb [{}];", json_buffer.join(","));
+            aabb_batcher.push(statement).await?;
+        }
+
+        aabb_batcher.finish().await?;
+    }
+
+    if !inst_relate_aabb_rows.is_empty() {
+        let mut inst_aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
+        for chunk in inst_relate_aabb_rows.chunks(CHUNK_SIZE) {
+            let statement = format!(
+                "INSERT IGNORE INTO inst_relate_aabb [{}];",
+                chunk.join(",")
+            );
+            inst_aabb_batcher.push(statement).await?;
+        }
+        inst_aabb_batcher.finish().await?;
+    }
 
     Ok(())
 }

@@ -22,8 +22,8 @@ test = false
 [[bin]]
 name = "meili_reindex"
 path = "src/bin/meili_reindex.rs"
-# 该工具依赖 DuckDB/MeiliSearch 相关能力，默认不参与构建主流程。
-required-features = ["duckdb-feature", "meili"]
+# 该工具依赖 MeiliSearch 相关能力，默认不参与构建主流程。
+required-features = ["meili"]
 
 [[bin]]
 name = "meili_import_spool"
@@ -160,8 +160,7 @@ sysinfo = { version = "0.37.0", optional = true }
 # SQLite driver for spatial tests and cache
 rusqlite = { version = "0.33", features = ["bundled"], optional = true }
 
-# DuckDB for model data storage (replaces SQLite for model export)
-duckdb = { version = "1.4.3", features = ["bundled"], optional = true }
+# DuckDB removed - backend no longer uses this feature
 
 indicatif = "0.18.1"
 rust_xlsxwriter = "0.91.0"
@@ -221,7 +220,7 @@ web_server = [
     "meili",
     "parquet-export",
 ] #Web UI功能
-duckdb-feature = ["dep:duckdb"] # DuckDB 模型导出功能
+# duckdb-feature removed - no longer needed
 sqlite-index = ["dep:rusqlite", "dep:tokio-util"] # SQLite RTree 空间索引功能
 debug_e3d = []
 meili = ["dep:meilisearch-sdk"]
@@ -250,8 +249,8 @@ tempfile = "3"
 # ═══════════════════════════════════════════════════════════════
 # 本地路径覆盖（联调时取消注释，CI/远程编译时注释掉整个 [patch] block）
 # ═══════════════════════════════════════════════════════════════
-[patch."https://github.com/happyrust/rs-core.git"]
-aios_core = { path = "../rs-core" }
+# [patch."https://github.com/happyrust/rs-core.git"]
+# aios_core = { path = "../rs-core" }
 
 # [patch."https://github.com/happyrust/pdms-io.git"]
 # pdms_io = { path = "../pdms-io-fork" }

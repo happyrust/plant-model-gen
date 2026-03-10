@@ -45,11 +45,10 @@ jobs:
       
       - name: Setup git credentials
         run: |
-          echo "echo \$GH_TOKEN" > /tmp/git-askpass.sh
+          echo '#!/bin/bash' > /tmp/git-askpass.sh
+          echo 'echo "${{ secrets.GH_PAT }}"' >> /tmp/git-askpass.sh
           chmod +x /tmp/git-askpass.sh
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
       
       - name: Configure Cargo to use git CLI
         run: |

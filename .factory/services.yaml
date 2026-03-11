@@ -1,10 +1,12 @@
 commands:
   backend_test: cargo test --features web_server web_api::review_api::tests:: -- --nocapture && cargo test --features web_server web_api::jwt_auth::tests:: -- --nocapture && cargo test --features web_server web_server::room_api::tests:: -- --nocapture && cargo test --features web_server web_server::sqlite_spatial_api::tests:: -- --nocapture
   backend_typecheck: cargo check --tests --lib --bins --features web_server
+  backend_release_check: cargo check --release --bin web_server --no-default-features --features ws,gen_model,manifold,project_hd,surreal-save,sqlite-index,web_server,parquet-export
   frontend_install: npm install --prefix /Volumes/DPC/work/plant-code/plant3d-web
   frontend_test: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web test
   frontend_typecheck: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web run type-check
   frontend_lint: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web run lint
+  frontend_build: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web run build-only
   e2e: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web run test:e2e
 
 services:

@@ -38,7 +38,8 @@ impl SqliteAabbIndex {
             r#"
             CREATE TABLE IF NOT EXISTS items (
                 id INTEGER PRIMARY KEY,
-                noun TEXT
+                noun TEXT,
+                spec_value INTEGER NOT NULL DEFAULT 0
             );
             -- 3D AABB RTree: id, [min_x, max_x], [min_y, max_y], [min_z, max_z]
             CREATE VIRTUAL TABLE IF NOT EXISTS aabb_index USING rtree(
@@ -48,6 +49,10 @@ impl SqliteAabbIndex {
         )?;
         // 兼容旧数据库文件：如果 items 只有 id 列，这条语句会失败；忽略即可。
         let _ = conn.execute("ALTER TABLE items ADD COLUMN noun TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE items ADD COLUMN spec_value INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(())
     }
 
@@ -148,7 +153,7 @@ impl SqliteAabbIndex {
         let mut count = 0;
         {
             let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO items (id, noun) VALUES (?1, ?2)",
+                "INSERT OR REPLACE INTO items (id, noun, spec_value) VALUES (?1, ?2, 0)",
             )?;
             for (id, noun) in iter {
                 stmt.execute(params![id, noun])?;
@@ -164,6 +169,18 @@ impl SqliteAabbIndex {
     where
         I: IntoIterator<Item = (i64, String, f64, f64, f64, f64, f64, f64)>,
     {
+        self.insert_aabbs_with_items_and_spec_values(
+            iter.into_iter()
+                .map(|(id, noun, minx, maxx, miny, maxy, minz, maxz)| {
+                    (id, noun, 0_i64, minx, maxx, miny, maxy, minz, maxz)
+                }),
+        )
+    }
+
+    pub fn insert_aabbs_with_items_and_spec_values<I>(&self, iter: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = (i64, String, i64, f64, f64, f64, f64, f64, f64)>,
+    {
         let mut conn = Connection::open(&self.path)?;
         Self::configure(&conn)?;
         let tx = conn.transaction()?;
@@ -175,11 +192,11 @@ impl SqliteAabbIndex {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             let mut item_stmt = tx.prepare(
-                "INSERT OR REPLACE INTO items (id, noun) VALUES (?1, ?2)",
+                "INSERT OR REPLACE INTO items (id, noun, spec_value) VALUES (?1, ?2, ?3)",
             )?;
-            for (id, noun, minx, maxx, miny, maxy, minz, maxz) in iter {
+            for (id, noun, spec_value, minx, maxx, miny, maxy, minz, maxz) in iter {
                 aabb_stmt.execute(params![id, minx, maxx, miny, maxy, minz, maxz])?;
-                item_stmt.execute(params![id, noun])?;
+                item_stmt.execute(params![id, noun, spec_value])?;
                 count += 1;
             }
         }
@@ -292,7 +309,7 @@ impl SqliteAabbIndex {
             // ========================
             // 旧格式导入逻辑（min/max 直写）
             // ========================
-            let mut aabb_map: HashMap<i64, (String, f64, f64, f64, f64, f64, f64)> = HashMap::new();
+        let mut aabb_map: HashMap<i64, (String, i64, f64, f64, f64, f64, f64, f64)> = HashMap::new();
 
             for group in groups {
                 let owner_noun = group["owner_noun"].as_str().unwrap_or("");
@@ -314,13 +331,13 @@ impl SqliteAabbIndex {
 
             let aabb_items: Vec<_> = aabb_map
                 .into_iter()
-                .map(|(id, (noun, minx, maxx, miny, maxy, minz, maxz))| {
-                    (id, noun, minx, maxx, miny, maxy, minz, maxz)
+                .map(|(id, (noun, spec_value, minx, maxx, miny, maxy, minz, maxz))| {
+                    (id, noun, spec_value, minx, maxx, miny, maxy, minz, maxz)
                 })
                 .collect();
             stats.unique_count = aabb_items.len();
             if !aabb_items.is_empty() {
-                self.insert_aabbs_with_items(aabb_items)?;
+                self.insert_aabbs_with_items_and_spec_values(aabb_items)?;
             }
             stats.total_inserted = stats.equi_count + stats.children_count + stats.tubings_count;
             return Ok(stats);
@@ -403,15 +420,15 @@ impl SqliteAabbIndex {
 
         // 批量插入（避免一次性 Vec 过大）
         const CHUNK: usize = 50_000;
-        let mut buf: Vec<(i64, String, f64, f64, f64, f64, f64, f64)> = Vec::with_capacity(CHUNK);
+        let mut buf: Vec<(i64, String, i64, f64, f64, f64, f64, f64, f64)> = Vec::with_capacity(CHUNK);
         let mut seen: HashSet<i64> = HashSet::new();
 
-        let mut flush = |this: &SqliteAabbIndex, buf: &mut Vec<(i64, String, f64, f64, f64, f64, f64, f64)>| -> anyhow::Result<()> {
+        let mut flush = |this: &SqliteAabbIndex, buf: &mut Vec<(i64, String, i64, f64, f64, f64, f64, f64, f64)>| -> anyhow::Result<()> {
             if buf.is_empty() {
                 return Ok(());
             }
             let items = std::mem::take(buf);
-            this.insert_aabbs_with_items(items)?;
+            this.insert_aabbs_with_items_and_spec_values(items)?;
             Ok(())
         };
 
@@ -443,7 +460,8 @@ impl SqliteAabbIndex {
                             stats.unique_count += 1;
                         }
                         stats.equi_count += 1;
-                        buf.push((id, owner_noun.to_string(), minx, maxx, miny, maxy, minz, maxz));
+                        let spec_value = group.get("spec_value").and_then(|v| v.as_i64()).unwrap_or(0);
+                        buf.push((id, owner_noun.to_string(), spec_value, minx, maxx, miny, maxy, minz, maxz));
                         if buf.len() >= CHUNK {
                             flush(self, &mut buf)?;
                         }
@@ -470,7 +488,8 @@ impl SqliteAabbIndex {
                             stats.unique_count += 1;
                         }
                         stats.children_count += 1;
-                        buf.push((id, owner_noun.to_string(), minx, maxx, miny, maxy, minz, maxz));
+                        let spec_value = child.get("spec_value").and_then(|v| v.as_i64()).unwrap_or(0);
+                        buf.push((id, owner_noun.to_string(), spec_value, minx, maxx, miny, maxy, minz, maxz));
                         if buf.len() >= CHUNK {
                             flush(self, &mut buf)?;
                         }
@@ -493,7 +512,8 @@ impl SqliteAabbIndex {
                             stats.unique_count += 1;
                         }
                         stats.tubings_count += 1;
-                        buf.push((id, "TUBI".to_string(), minx, maxx, miny, maxy, minz, maxz));
+                        let spec_value = t.get("spec_value").and_then(|v| v.as_i64()).unwrap_or(0);
+                        buf.push((id, "TUBI".to_string(), spec_value, minx, maxx, miny, maxy, minz, maxz));
                         if buf.len() >= CHUNK {
                             flush(self, &mut buf)?;
                         }
@@ -526,7 +546,8 @@ impl SqliteAabbIndex {
                     stats.unique_count += 1;
                 }
                 // instances 不计入 total_inserted 的原三类统计，但对 room 计算很关键
-                buf.push((id, noun, minx, maxx, miny, maxy, minz, maxz));
+                let spec_value = inst.get("spec_value").and_then(|v| v.as_i64()).unwrap_or(0);
+                buf.push((id, noun, spec_value, minx, maxx, miny, maxy, minz, maxz));
                 if buf.len() >= CHUNK {
                     flush(self, &mut buf)?;
                 }
@@ -541,26 +562,30 @@ impl SqliteAabbIndex {
 
     /// 合并 AABB 到 map（取并集）
     fn merge_aabb(
-        map: &mut std::collections::HashMap<i64, (String, f64, f64, f64, f64, f64, f64)>,
-        item: (i64, String, f64, f64, f64, f64, f64, f64),
+        map: &mut std::collections::HashMap<i64, (String, i64, f64, f64, f64, f64, f64, f64)>,
+        item: (i64, String, i64, f64, f64, f64, f64, f64, f64),
     ) {
-        let (id, noun, minx, maxx, miny, maxy, minz, maxz) = item;
+        let (id, noun, spec_value, minx, maxx, miny, maxy, minz, maxz) = item;
         map.entry(id)
             .and_modify(|e| {
-                e.1 = e.1.min(minx);  // min_x
-                e.2 = e.2.max(maxx);  // max_x
-                e.3 = e.3.min(miny);  // min_y
-                e.4 = e.4.max(maxy);  // max_y
-                e.5 = e.5.min(minz);  // min_z
-                e.6 = e.6.max(maxz);  // max_z
+                if e.1 == 0 && spec_value != 0 {
+                    e.1 = spec_value;
+                }
+                e.2 = e.2.min(minx);  // min_x
+                e.3 = e.3.max(maxx);  // max_x
+                e.4 = e.4.min(miny);  // min_y
+                e.5 = e.5.max(maxy);  // max_y
+                e.6 = e.6.min(minz);  // min_z
+                e.7 = e.7.max(maxz);  // max_z
             })
-            .or_insert((noun, minx, maxx, miny, maxy, minz, maxz));
+            .or_insert((noun, spec_value, minx, maxx, miny, maxy, minz, maxz));
     }
 
-    fn extract_owner_aabb(group: &serde_json::Value) -> Option<(i64, String, f64, f64, f64, f64, f64, f64)> {
+    fn extract_owner_aabb(group: &serde_json::Value) -> Option<(i64, String, i64, f64, f64, f64, f64, f64, f64)> {
         let refno = group["owner_refno"].as_str()?;
         let id = refno_str_to_i64(refno)?;
         let noun = group["owner_noun"].as_str().unwrap_or("").to_string();
+        let spec_value = group["spec_value"].as_i64().unwrap_or(0);
         let aabb = &group["owner_aabb"];
 
         if aabb.is_null() {
@@ -573,6 +598,7 @@ impl SqliteAabbIndex {
         Some((
             id,
             noun,
+            spec_value,
             min[0].as_f64()?,
             max[0].as_f64()?,
             min[1].as_f64()?,
@@ -584,7 +610,7 @@ impl SqliteAabbIndex {
 
     fn extract_children_aabbs_merged(
         group: &serde_json::Value,
-        map: &mut std::collections::HashMap<i64, (String, f64, f64, f64, f64, f64, f64)>,
+        map: &mut std::collections::HashMap<i64, (String, i64, f64, f64, f64, f64, f64, f64)>,
         stats: &mut ImportStats,
     ) {
         if let Some(children) = group["children"].as_array() {
@@ -599,7 +625,7 @@ impl SqliteAabbIndex {
 
     fn extract_tubings_aabbs_merged(
         group: &serde_json::Value,
-        map: &mut std::collections::HashMap<i64, (String, f64, f64, f64, f64, f64, f64)>,
+        map: &mut std::collections::HashMap<i64, (String, i64, f64, f64, f64, f64, f64, f64)>,
         stats: &mut ImportStats,
     ) {
         if let Some(tubings) = group["tubings"].as_array() {
@@ -614,7 +640,7 @@ impl SqliteAabbIndex {
 
     fn extract_children_aabbs(
         group: &serde_json::Value,
-        items: &mut Vec<(i64, String, f64, f64, f64, f64, f64, f64)>,
+        items: &mut Vec<(i64, String, i64, f64, f64, f64, f64, f64, f64)>,
         stats: &mut ImportStats,
     ) {
         if let Some(children) = group["children"].as_array() {
@@ -629,7 +655,7 @@ impl SqliteAabbIndex {
 
     fn extract_tubings_aabbs(
         group: &serde_json::Value,
-        items: &mut Vec<(i64, String, f64, f64, f64, f64, f64, f64)>,
+        items: &mut Vec<(i64, String, i64, f64, f64, f64, f64, f64, f64)>,
         stats: &mut ImportStats,
     ) {
         if let Some(tubings) = group["tubings"].as_array() {
@@ -642,10 +668,11 @@ impl SqliteAabbIndex {
         }
     }
 
-    fn extract_element_aabb(elem: &serde_json::Value) -> Option<(i64, String, f64, f64, f64, f64, f64, f64)> {
+    fn extract_element_aabb(elem: &serde_json::Value) -> Option<(i64, String, i64, f64, f64, f64, f64, f64, f64)> {
         let refno = elem["refno"].as_str()?;
         let id = refno_str_to_i64(refno)?;
         let noun = elem["noun"].as_str().unwrap_or("").to_string();
+        let spec_value = elem["spec_value"].as_i64().unwrap_or(0);
         let aabb = &elem["aabb"];
 
         if aabb.is_null() {
@@ -658,6 +685,7 @@ impl SqliteAabbIndex {
         Some((
             id,
             noun,
+            spec_value,
             min[0].as_f64()?,
             max[0].as_f64()?,
             min[1].as_f64()?,

@@ -15,3 +15,8 @@ fi
 if [ ! -d "$FRONTEND_ROOT/node_modules" ]; then
   npm --prefix "$FRONTEND_ROOT" install
 fi
+
+echo "release mission expects:"
+echo "- backend tag-driven deploy from plant-model-gen"
+echo "- frontend tag-driven deploy from plant3d-web"
+echo "- runtime model data upload kept separate from code deployment"

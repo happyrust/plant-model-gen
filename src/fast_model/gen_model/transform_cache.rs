@@ -1,66 +1,102 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
-use aios_core::{RefnoEnum, model_primary_db, SurrealQueryExt};
-use aios_core::Transform;
-use aios_core::rs_surreal::geometry_query::PlantTransform;
-use dashmap::DashMap;
+use aios_core::{RefnoEnum, Transform};
 use dashmap::mapref::entry::Entry;
-use serde::Deserialize;
-use surrealdb::types::SurrealValue;
-use std::sync::OnceLock;
+use dashmap::{DashMap, DashSet};
+use futures::StreamExt;
+use tokio::sync::Mutex;
 
 use crate::data_interface::db_meta_manager::db_meta;
 use crate::options::DbOptionExt;
 
-/// 纯内存 transform 缓存：用于"模型生成阶段"读取/写入 world_transform。
-///
-/// 约定：
-/// - 只要缓存存在即可（不要求全量命中）。
-/// - miss 时，允许走旧路径按需计算/查询，然后回写到内存缓存。
+use super::transform_rkyv_cache::{self, LoadedTransformDbnum};
 
+/// 模型生成阶段的 transform 缓存：
+/// - world/local 均放在内存 DashMap 中，按 (dbnum, refno) 索引；
+/// - dbnum 首次访问时按需从 rkyv 文件加载；
+/// - cache-first 路径 miss 时允许回退到 SurrealDB/旧计算路径。
 pub struct TransformCacheManager {
-    cache: DashMap<(u32, RefnoEnum), Transform>,
+    world_cache: DashMap<(u32, RefnoEnum), Transform>,
+    local_cache: DashMap<(u32, RefnoEnum), Transform>,
     pins: DashMap<(u32, RefnoEnum), u32>,
+    loaded_dbnums: DashSet<u32>,
 }
 
 impl TransformCacheManager {
     pub fn new() -> Self {
         Self {
-            cache: DashMap::new(),
+            world_cache: DashMap::new(),
+            local_cache: DashMap::new(),
             pins: DashMap::new(),
+            loaded_dbnums: DashSet::new(),
         }
     }
 
     pub fn get_world_transform(&self, dbnum: u32, refno: RefnoEnum) -> Option<Transform> {
-        self.cache.get(&(dbnum, refno)).map(|v| v.clone())
+        self.world_cache.get(&(dbnum, refno)).map(|v| v.clone())
+    }
+
+    pub fn get_local_transform(&self, dbnum: u32, refno: RefnoEnum) -> Option<Transform> {
+        self.local_cache.get(&(dbnum, refno)).map(|v| v.clone())
     }
 
     pub fn remove(&self, dbnum: u32, refno: RefnoEnum) {
-        self.cache.remove(&(dbnum, refno));
+        self.world_cache.remove(&(dbnum, refno));
+        self.local_cache.remove(&(dbnum, refno));
+        self.loaded_dbnums.remove(&dbnum);
     }
 
     pub fn insert_world_transform(&self, dbnum: u32, refno: RefnoEnum, world: Transform) {
-        self.cache.insert((dbnum, refno), world);
+        self.world_cache.insert((dbnum, refno), world);
+    }
+
+    pub fn insert_local_transform(&self, dbnum: u32, refno: RefnoEnum, local: Transform) {
+        self.local_cache.insert((dbnum, refno), local);
+    }
+
+    pub fn is_dbnum_loaded(&self, dbnum: u32) -> bool {
+        self.loaded_dbnums.contains(&dbnum)
+    }
+
+    pub fn load_dbnum_snapshot(&self, dbnum: u32, snapshot: LoadedTransformDbnum) {
+        for (refno, world) in snapshot.world {
+            self.world_cache.insert((dbnum, refno), world);
+        }
+        for (refno, local) in snapshot.local {
+            self.local_cache.insert((dbnum, refno), local);
+        }
+        self.loaded_dbnums.insert(dbnum);
     }
 
     /// 清空所有缓存条目，释放内存（分批生成时在批次间调用）。
     pub fn clear(&self) -> usize {
-        let count = self.cache.len();
-        self.cache.clear();
+        let count = self.world_cache.len();
+        self.world_cache.clear();
+        self.local_cache.clear();
+        self.pins.clear();
+        self.loaded_dbnums.clear();
         count
     }
 
-    /// 按 refno 定向清理 world_transform 缓存，避免并发任务互相清空全局缓存。
+    /// 按 refno 定向清理 transform 缓存，避免并发任务互相清空全局缓存。
     pub fn clear_refnos(&self, refnos: &[RefnoEnum]) -> usize {
         if refnos.is_empty() {
             return 0;
         }
         let keys = Self::map_refnos_to_keys(refnos);
         let mut count = 0usize;
+        let mut stale_dbnums = HashSet::new();
         for (dbnum, refno) in keys {
-            if self.cache.remove(&(dbnum, refno)).is_some() {
+            let removed_world = self.world_cache.remove(&(dbnum, refno)).is_some();
+            let removed_local = self.local_cache.remove(&(dbnum, refno)).is_some();
+            if removed_world || removed_local {
                 count += 1;
+                stale_dbnums.insert(dbnum);
             }
+        }
+        for dbnum in stale_dbnums {
+            self.loaded_dbnums.remove(&dbnum);
         }
         count
     }
@@ -142,6 +178,8 @@ impl TransformCacheManager {
 
     fn release_keys_and_clear(&self, keys: &[(u32, RefnoEnum)]) -> usize {
         let mut removed = 0usize;
+        let mut stale_dbnums = HashSet::new();
+
         for &key in keys {
             let mut can_clear = true;
 
@@ -160,23 +198,46 @@ impl TransformCacheManager {
                 }
             }
 
-            if can_clear && self.cache.remove(&key).is_some() {
-                removed += 1;
+            if can_clear {
+                let removed_world = self.world_cache.remove(&key).is_some();
+                let removed_local = self.local_cache.remove(&key).is_some();
+                if removed_world || removed_local {
+                    removed += 1;
+                    stale_dbnums.insert(key.0);
+                }
             }
         }
+
+        for dbnum in stale_dbnums {
+            self.loaded_dbnums.remove(&dbnum);
+        }
+
         removed
     }
 }
 
 static GLOBAL_TRANSFORM_CACHE: OnceLock<TransformCacheManager> = OnceLock::new();
+static DBNUM_LOAD_LOCKS: OnceLock<DashMap<u32, Arc<Mutex<()>>>> = OnceLock::new();
 
 pub fn init_global_transform_cache() {
-    let _ = GLOBAL_TRANSFORM_CACHE.get_or_init(|| TransformCacheManager::new());
+    let _ = GLOBAL_TRANSFORM_CACHE.get_or_init(TransformCacheManager::new);
+}
+
+fn dbnum_load_locks() -> &'static DashMap<u32, Arc<Mutex<()>>> {
+    DBNUM_LOAD_LOCKS.get_or_init(DashMap::new)
+}
+
+fn dbnum_load_lock(dbnum: u32) -> Arc<Mutex<()>> {
+    dbnum_load_locks()
+        .entry(dbnum)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 /// 清空全局 transform 缓存（分批生成时在批次间调用）。
 pub fn clear_global_transform_cache() -> usize {
-    GLOBAL_TRANSFORM_CACHE.get()
+    GLOBAL_TRANSFORM_CACHE
+        .get()
         .map(|mgr| mgr.clear())
         .unwrap_or(0)
 }
@@ -206,7 +267,6 @@ pub fn release_global_transform_cache_for_refnos(refnos: &[RefnoEnum]) -> usize 
 }
 
 fn get_global_cache() -> Option<&'static TransformCacheManager> {
-    // 若尚未初始化则自动初始化（纯内存，无副作用）
     if GLOBAL_TRANSFORM_CACHE.get().is_none() {
         init_global_transform_cache();
     }
@@ -219,24 +279,120 @@ fn resolve_dbnum(refno: RefnoEnum) -> Option<u32> {
             return Some(dbnum);
         }
     }
-    // ref0 != dbnum，禁止回退用 ref0 当 dbnum。
-    log::warn!(
-        "[transform_cache] 缺少 ref0->dbnum 映射: refno={}",
-        refno
-    );
+    log::warn!("[transform_cache] 缺少 ref0->dbnum 映射: refno={}", refno);
     None
 }
 
-/// 模型生成专用：从内存 transform cache 读取 world_transform；miss 时按需生成并回写缓存。
+fn transform_from_matrix_cols(cols: &[f64; 16]) -> Option<Transform> {
+    let m = glam::DMat4::from_cols_array(cols);
+    let (scale, rot, trans) = m.to_scale_rotation_translation();
+    Some(Transform {
+        translation: glam::Vec3::new(trans.x as f32, trans.y as f32, trans.z as f32),
+        rotation: glam::Quat::from_xyzw(rot.x as f32, rot.y as f32, rot.z as f32, rot.w as f32),
+        scale: glam::Vec3::new(scale.x as f32, scale.y as f32, scale.z as f32),
+    })
+}
+
+fn transform_from_dmat4(m: glam::DMat4) -> Option<Transform> {
+    transform_from_matrix_cols(&m.to_cols_array())
+}
+
+async fn ensure_dbnum_loaded(
+    db_option: Option<&DbOptionExt>,
+    dbnum: u32,
+    allow_build: bool,
+) -> anyhow::Result<()> {
+    let Some(cache) = get_global_cache() else {
+        anyhow::bail!("global transform_cache 未初始化");
+    };
+
+    if cache.is_dbnum_loaded(dbnum) {
+        return Ok(());
+    }
+
+    let lock = dbnum_load_lock(dbnum);
+    let _guard = lock.lock().await;
+
+    if cache.is_dbnum_loaded(dbnum) {
+        return Ok(());
+    }
+
+    let loaded = if allow_build {
+        Some(transform_rkyv_cache::load_or_build_dbnum_cache(db_option, dbnum).await?)
+    } else {
+        transform_rkyv_cache::load_dbnum_cache_if_fresh(db_option, dbnum)?
+    };
+
+    let Some(snapshot) = loaded else {
+        anyhow::bail!(
+            "transform rkyv cache 缺失或已失效: dbnum={} path={}",
+            dbnum,
+            transform_rkyv_cache::dbnum_cache_path(db_option, dbnum).display()
+        );
+    };
+
+    cache.load_dbnum_snapshot(dbnum, snapshot);
+    Ok(())
+}
+
+async fn ensure_dbnums_loaded_for_refnos(
+    db_option: Option<&DbOptionExt>,
+    refnos: &[RefnoEnum],
+    allow_build: bool,
+) -> anyhow::Result<()> {
+    let mut dbnums = HashSet::new();
+    for &refno in refnos {
+        if let Some(dbnum) = resolve_dbnum(refno) {
+            dbnums.insert(dbnum);
+        }
+    }
+
+    let mut dbnums: Vec<u32> = dbnums.into_iter().collect();
+    dbnums.sort_unstable();
+    for dbnum in dbnums {
+        ensure_dbnum_loaded(db_option, dbnum, allow_build).await?;
+    }
+    Ok(())
+}
+
+async fn best_effort_preload_dbnums(db_option: Option<&DbOptionExt>, refnos: &[RefnoEnum]) {
+    let mut dbnums = HashSet::new();
+    for &refno in refnos {
+        if let Some(dbnum) = resolve_dbnum(refno) {
+            dbnums.insert(dbnum);
+        }
+    }
+
+    let mut dbnums: Vec<u32> = dbnums.into_iter().collect();
+    dbnums.sort_unstable();
+    for dbnum in dbnums {
+        if let Err(err) = ensure_dbnum_loaded(db_option, dbnum, true).await {
+            log::warn!(
+                "[transform_cache] 加载/构建 dbnum={} 的 transform rkyv 失败，将回退 DB: {}",
+                dbnum,
+                err
+            );
+        }
+    }
+}
+
+/// 模型生成专用：优先从内存/rkyv transform_cache 读取 world_transform；
+/// miss 时按需走旧计算路径并回写内存缓存。
 pub async fn get_world_transform_cache_first(
-    _db_option: Option<&DbOptionExt>,
+    db_option: Option<&DbOptionExt>,
     refno: RefnoEnum,
 ) -> anyhow::Result<Option<Transform>> {
     let dbnum = resolve_dbnum(refno);
     let use_cache = dbnum.is_some();
 
-    if use_cache {
-        let dbnum = dbnum.unwrap();
+    if let Some(dbnum) = dbnum {
+        if let Err(err) = ensure_dbnum_loaded(db_option, dbnum, true).await {
+            log::warn!(
+                "[transform_cache] 单点加载 dbnum={} 的 world transform 缓存失败: {}",
+                dbnum,
+                err
+            );
+        }
         if let Some(cache) = get_global_cache() {
             if let Some(hit) = cache.get_world_transform(dbnum, refno) {
                 return Ok(Some(hit));
@@ -244,7 +400,6 @@ pub async fn get_world_transform_cache_first(
         }
     }
 
-    // miss：走旧计算路径（策略/惰性计算）。
     let computed = aios_core::get_world_transform(refno).await?;
     if let Some(world) = computed.clone() {
         if let (true, Some(dbnum)) = (use_cache, dbnum) {
@@ -256,10 +411,47 @@ pub async fn get_world_transform_cache_first(
     Ok(computed)
 }
 
-/// strict cache-only：只从内存 transform_cache 读取 world_transform。
-/// miss 直接返回 Err（离线 Generate 阶段 miss 代表 Prefetch 不完整）。
+/// 模型生成专用：优先从内存/rkyv transform_cache 读取 local_transform；
+/// miss 时按需走旧计算路径并回写内存缓存。
+pub async fn get_local_transform_cache_first(
+    db_option: Option<&DbOptionExt>,
+    refno: RefnoEnum,
+) -> anyhow::Result<Option<Transform>> {
+    let dbnum = resolve_dbnum(refno);
+    let use_cache = dbnum.is_some();
+
+    if let Some(dbnum) = dbnum {
+        if let Err(err) = ensure_dbnum_loaded(db_option, dbnum, true).await {
+            log::warn!(
+                "[transform_cache] 单点加载 dbnum={} 的 local transform 缓存失败: {}",
+                dbnum,
+                err
+            );
+        }
+        if let Some(cache) = get_global_cache() {
+            if let Some(hit) = cache.get_local_transform(dbnum, refno) {
+                return Ok(Some(hit));
+            }
+        }
+    }
+
+    let computed = aios_core::transform::get_local_mat4(refno)
+        .await?
+        .and_then(transform_from_dmat4);
+    if let Some(local) = computed.clone() {
+        if let (true, Some(dbnum)) = (use_cache, dbnum) {
+            if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
+                cache.insert_local_transform(dbnum, refno, local);
+            }
+        }
+    }
+    Ok(computed)
+}
+
+/// strict cache-only：只从内存/rkyv transform_cache 读取 world_transform。
+/// miss 直接返回 Err（离线 Generate 阶段 miss 代表预取或 rkyv 不完整）。
 pub async fn get_world_transforms_cache_only_batch(
-    _db_option: &DbOptionExt,
+    db_option: &DbOptionExt,
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<HashMap<RefnoEnum, Transform>> {
     if refnos.is_empty() {
@@ -268,39 +460,99 @@ pub async fn get_world_transforms_cache_only_batch(
 
     db_meta().ensure_loaded()?;
     init_global_transform_cache();
+    ensure_dbnums_loaded_for_refnos(Some(db_option), refnos, false).await?;
 
     let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() else {
         anyhow::bail!("global transform_cache 未初始化");
     };
 
-    let mut out: HashMap<RefnoEnum, Transform> = HashMap::new();
-    let mut missing: Vec<RefnoEnum> = Vec::new();
+    let mut out = HashMap::new();
+    let mut missing = Vec::new();
 
-    for &r in refnos {
-        let Some(dbnum) = db_meta().get_dbnum_by_refno(r) else {
-            anyhow::bail!("缺少 ref0->dbnum 映射: refno={}", r);
+    for &refno in refnos {
+        let Some(dbnum) = db_meta().get_dbnum_by_refno(refno) else {
+            anyhow::bail!("缺少 ref0->dbnum 映射: refno={}", refno);
         };
         if dbnum == 0 {
-            anyhow::bail!("无效 dbnum=0（缺少 ref0->dbnum 映射或元数据不完整）: refno={}", r);
+            anyhow::bail!(
+                "无效 dbnum=0（缺少 ref0->dbnum 映射或元数据不完整）: refno={}",
+                refno
+            );
         }
-        if let Some(hit) = cache.get_world_transform(dbnum, r) {
-            out.insert(r, hit);
+        if let Some(hit) = cache.get_world_transform(dbnum, refno) {
+            out.insert(refno, hit);
         } else {
-            missing.push(r);
+            missing.push(refno);
         }
     }
 
     if !missing.is_empty() {
-        missing.sort_by_key(|r| r.refno());
+        missing.sort_by_key(|refno| refno.refno());
         const SAMPLE_LIMIT: usize = 16;
         let sample = missing
             .iter()
             .take(SAMPLE_LIMIT)
-            .map(|r| r.to_string())
+            .map(|refno| refno.to_string())
             .collect::<Vec<_>>()
             .join(", ");
         anyhow::bail!(
             "transform_cache miss（cache-only 不允许回源 DB）：missing={}, sample=[{}]",
+            missing.len(),
+            sample
+        );
+    }
+
+    Ok(out)
+}
+
+/// strict cache-only：只从内存/rkyv transform_cache 读取 local_transform。
+pub async fn get_local_transforms_cache_only_batch(
+    db_option: &DbOptionExt,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<HashMap<RefnoEnum, Transform>> {
+    if refnos.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    db_meta().ensure_loaded()?;
+    init_global_transform_cache();
+    ensure_dbnums_loaded_for_refnos(Some(db_option), refnos, false).await?;
+
+    let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() else {
+        anyhow::bail!("global transform_cache 未初始化");
+    };
+
+    let mut out = HashMap::new();
+    let mut missing = Vec::new();
+
+    for &refno in refnos {
+        let Some(dbnum) = db_meta().get_dbnum_by_refno(refno) else {
+            anyhow::bail!("缺少 ref0->dbnum 映射: refno={}", refno);
+        };
+        if dbnum == 0 {
+            anyhow::bail!(
+                "无效 dbnum=0（缺少 ref0->dbnum 映射或元数据不完整）: refno={}",
+                refno
+            );
+        }
+        if let Some(hit) = cache.get_local_transform(dbnum, refno) {
+            out.insert(refno, hit);
+        } else {
+            missing.push(refno);
+        }
+    }
+
+    if !missing.is_empty() {
+        missing.sort_by_key(|refno| refno.refno());
+        const SAMPLE_LIMIT: usize = 16;
+        let sample = missing
+            .iter()
+            .take(SAMPLE_LIMIT)
+            .map(|refno| refno.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "local transform_cache miss（cache-only 不允许回源 DB）：missing={}, sample=[{}]",
             missing.len(),
             sample
         );
@@ -320,7 +572,18 @@ pub async fn get_world_transform_cache_only(
         .ok_or_else(|| anyhow::anyhow!("transform_cache miss: refno={}", refno))
 }
 
-/// strict cache-only：确保给定 refnos 的 transform 均已存在于缓存；缺失直接 Err。
+/// strict cache-only：读取单个 local_transform；miss 直接 Err。
+pub async fn get_local_transform_cache_only(
+    db_option: &DbOptionExt,
+    refno: RefnoEnum,
+) -> anyhow::Result<Transform> {
+    let hm = get_local_transforms_cache_only_batch(db_option, &[refno]).await?;
+    hm.get(&refno)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("local transform_cache miss: refno={}", refno))
+}
+
+/// strict cache-only：确保给定 refnos 的 world transform 均已存在于缓存；缺失直接 Err。
 pub async fn ensure_world_transforms_present(
     db_option: &DbOptionExt,
     refnos: &[RefnoEnum],
@@ -329,47 +592,46 @@ pub async fn ensure_world_transforms_present(
     Ok(())
 }
 
-fn transform_from_matrix_cols(cols: &[f64; 16]) -> Option<Transform> {
-    let m = glam::DMat4::from_cols_array(cols);
-    let (scale, rot, trans) = m.to_scale_rotation_translation();
-    Some(Transform {
-        translation: glam::Vec3::new(trans.x as f32, trans.y as f32, trans.z as f32),
-        rotation: glam::Quat::from_xyzw(rot.x as f32, rot.y as f32, rot.z as f32, rot.w as f32),
-        scale: glam::Vec3::new(scale.x as f32, scale.y as f32, scale.z as f32),
-    })
+/// strict cache-only：确保给定 refnos 的 local transform 均已存在于缓存；缺失直接 Err。
+pub async fn ensure_local_transforms_present(
+    db_option: &DbOptionExt,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<()> {
+    let _ = get_local_transforms_cache_only_batch(db_option, refnos).await?;
+    Ok(())
 }
 
 /// 批量版 cache-first world_transform 获取：
-/// - 先读内存 transform_cache；
-/// - miss 的 refno 再通过 SurrealDB pe_transform 批量查询 matrix；
+/// - 先尝试按 dbnum 从 rkyv 文件加载到内存；
+/// - 再读内存 transform_cache；
+/// - miss 的 refno 再通过 SurrealDB pe_transform 批量查询；
 /// - 仍 miss 的少量 refno 兜底走旧计算路径（aios_core::get_world_transform）。
 pub async fn get_world_transforms_cache_first_batch(
-    _db_option: Option<&DbOptionExt>,
+    db_option: Option<&DbOptionExt>,
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<HashMap<RefnoEnum, Transform>> {
     if refnos.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let mut out: HashMap<RefnoEnum, Transform> = HashMap::new();
+    best_effort_preload_dbnums(db_option, refnos).await;
 
-    // 记录每个 refno 的 dbnum（用于写回缓存；ref0 != dbnum，必须通过 db_meta 映射）
-    let mut dbnum_map: HashMap<RefnoEnum, u32> = HashMap::new();
-    for &r in refnos {
-        if let Some(d) = resolve_dbnum(r) {
-            dbnum_map.insert(r, d);
+    let mut out = HashMap::new();
+    let mut dbnum_map = HashMap::new();
+    for &refno in refnos {
+        if let Some(dbnum) = resolve_dbnum(refno) {
+            dbnum_map.insert(refno, dbnum);
         }
     }
 
-    // 1) cache hits
-    let mut misses: Vec<RefnoEnum> = Vec::new();
+    let mut misses = Vec::new();
     if let Some(cache) = get_global_cache() {
-        for &r in refnos {
-            let dbnum = *dbnum_map.get(&r).unwrap_or(&0);
-            if let Some(hit) = cache.get_world_transform(dbnum, r) {
-                out.insert(r, hit);
+        for &refno in refnos {
+            let dbnum = *dbnum_map.get(&refno).unwrap_or(&0);
+            if let Some(hit) = cache.get_world_transform(dbnum, refno) {
+                out.insert(refno, hit);
             } else {
-                misses.push(r);
+                misses.push(refno);
             }
         }
     } else {
@@ -380,62 +642,89 @@ pub async fn get_world_transforms_cache_first_batch(
         return Ok(out);
     }
 
-    // 2) SurrealDB batch query pe_transform.world_trans.d
-    crate::fast_model::utils::ensure_surreal_init().await?;
-
-    #[derive(Debug, Deserialize, SurrealValue)]
-    struct PeWorldTransRow {
-        #[serde(default)]
-        refno: Option<RefnoEnum>,
-        #[serde(default)]
-        world_trans: Option<PlantTransform>,
-    }
-
-    const CHUNK: usize = 200;
+    let queried = transform_rkyv_cache::query_world_transforms_from_pe_transform(&misses).await?;
     let mut still_missing: HashSet<RefnoEnum> = misses.iter().copied().collect();
 
-    for chunk in misses.chunks(CHUNK) {
-        let pt_ids = chunk
-            .iter()
-            .map(|r| r.to_table_key("pe_transform"))
-            .collect::<Vec<_>>()
-            .join(",");
+    for (refno, world) in queried {
+        still_missing.remove(&refno);
+        out.insert(refno, world.clone());
+        if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
+            if let Some(&dbnum) = dbnum_map.get(&refno) {
+                cache.insert_world_transform(dbnum, refno, world);
+            }
+        }
+    }
 
-        let sql = format!(
-            r#"
-            SELECT
-                record::id(id) as refno,
-                world_trans.d as world_trans
-            FROM [{pt_ids}];
-            "#
-        );
-
-        let rows: Vec<PeWorldTransRow> = model_primary_db().query_take(&sql, 0).await?;
-        for row in rows {
-            let Some(r) = row.refno else { continue };
-            let Some(pt) = row.world_trans else { continue };
-            let t: Transform = pt.0;
-            out.insert(r, t.clone());
-            still_missing.remove(&r);
+    for refno in still_missing {
+        if let Ok(Some(world)) = aios_core::get_world_transform(refno).await {
+            out.insert(refno, world.clone());
             if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
-                if let Some(&dbnum) = dbnum_map.get(&r) {
-                    cache.insert_world_transform(dbnum, r, t);
+                if let Some(&dbnum) = dbnum_map.get(&refno) {
+                    cache.insert_world_transform(dbnum, refno, world);
                 }
             }
         }
     }
 
-    if still_missing.is_empty() {
+    Ok(out)
+}
+
+/// 批量版 cache-first local_transform 获取：
+/// - 先尝试按 dbnum 从 rkyv 文件加载到内存；
+/// - 再读内存 transform_cache；
+/// - miss 的 refno 兜底走旧计算路径（get_local_mat4）。
+pub async fn get_local_transforms_cache_first_batch(
+    db_option: Option<&DbOptionExt>,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<HashMap<RefnoEnum, Transform>> {
+    if refnos.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    best_effort_preload_dbnums(db_option, refnos).await;
+
+    let mut out = HashMap::new();
+    let mut dbnum_map = HashMap::new();
+    for &refno in refnos {
+        if let Some(dbnum) = resolve_dbnum(refno) {
+            dbnum_map.insert(refno, dbnum);
+        }
+    }
+
+    let mut misses = Vec::new();
+    if let Some(cache) = get_global_cache() {
+        for &refno in refnos {
+            let dbnum = *dbnum_map.get(&refno).unwrap_or(&0);
+            if let Some(hit) = cache.get_local_transform(dbnum, refno) {
+                out.insert(refno, hit);
+            } else {
+                misses.push(refno);
+            }
+        }
+    } else {
+        misses.extend_from_slice(refnos);
+    }
+
+    if misses.is_empty() {
         return Ok(out);
     }
 
-    // 3) 兜底：少量 miss 走旧计算路径（并回写缓存）
-    for r in still_missing {
-        if let Ok(Some(t)) = aios_core::get_world_transform(r).await {
-            out.insert(r, t.clone());
+    let mut stream = futures::stream::iter(misses.iter().copied().map(|refno| async move {
+        let local = aios_core::transform::get_local_mat4(refno)
+            .await
+            .ok()
+            .flatten()
+            .and_then(transform_from_dmat4);
+        (refno, local)
+    }))
+    .buffer_unordered(64);
+
+    while let Some((refno, local)) = stream.next().await {
+        if let Some(local) = local {
+            out.insert(refno, local.clone());
             if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
-                if let Some(&dbnum) = dbnum_map.get(&r) {
-                    cache.insert_world_transform(dbnum, r, t);
+                if let Some(&dbnum) = dbnum_map.get(&refno) {
+                    cache.insert_local_transform(dbnum, refno, local);
                 }
             }
         }
@@ -458,6 +747,7 @@ mod tests {
 
         let t = transform_from_matrix_cols(&cols).expect("must decompose");
         let eps = 1e-4;
+
         assert!((t.translation.x - trans.x as f32).abs() < eps);
         assert!((t.translation.y - trans.y as f32).abs() < eps);
         assert!((t.translation.z - trans.z as f32).abs() < eps);
@@ -492,5 +782,29 @@ mod tests {
         let removed_second = mgr.release_keys_and_clear(&keys);
         assert_eq!(removed_second, 1, "最后一个租约释放后应清理对应缓存条目");
         assert!(mgr.get_world_transform(dbnum, refno).is_none());
+    }
+
+    #[test]
+    fn test_load_dbnum_snapshot_marks_loaded() {
+        let mgr = TransformCacheManager::new();
+        let refno: RefnoEnum = "24381/36716".into();
+        let dbnum = 1112u32;
+        let mut world = HashMap::new();
+        let mut local = HashMap::new();
+        world.insert(refno, Transform::IDENTITY);
+        local.insert(refno, Transform::IDENTITY);
+
+        mgr.load_dbnum_snapshot(
+            dbnum,
+            LoadedTransformDbnum {
+                source_version: "v1".into(),
+                world,
+                local,
+            },
+        );
+
+        assert!(mgr.is_dbnum_loaded(dbnum));
+        assert!(mgr.get_world_transform(dbnum, refno).is_some());
+        assert!(mgr.get_local_transform(dbnum, refno).is_some());
     }
 }

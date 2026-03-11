@@ -17,7 +17,7 @@ use parry3d::bounding_volume::Aabb;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::sqlite_index::{i64_to_refno_str, refno_str_to_i64, SqliteAabbIndex};
 
@@ -33,22 +33,28 @@ struct CachedIndex {
     idx: SqliteAabbIndex,
     path: PathBuf,
 }
+static TEST_INDEX_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 
-static CACHED_INDEX: OnceLock<Result<CachedIndex, String>> = OnceLock::new();
+fn test_index_override() -> &'static Mutex<Option<PathBuf>> {
+    TEST_INDEX_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn test_guard() -> &'static Mutex<()> {
+    TEST_GUARD.get_or_init(|| Mutex::new(()))
+}
 
 fn get_cached_index() -> Result<&'static CachedIndex, String> {
-    let result = CACHED_INDEX.get_or_init(|| {
-        let path = sqlite_index_path();
-        let idx = SqliteAabbIndex::open(&path)
-            .map_err(|e| format!("open sqlite index failed: {}", e))?;
-        idx.init_schema()
-            .map_err(|e| format!("init sqlite schema failed: {}", e))?;
-        Ok(CachedIndex { idx, path })
-    });
-    match result {
-        Ok(cached) => Ok(cached),
-        Err(msg) => Err(msg.clone()),
-    }
+    let path = sqlite_index_path();
+    let idx = SqliteAabbIndex::open(&path)
+        .map_err(|e| format!("open sqlite index failed: {}", e))?;
+    idx.init_schema()
+        .map_err(|e| format!("init sqlite schema failed: {}", e))?;
+
+    let cached = Box::leak(Box::new(CachedIndex { idx, path }));
+    Ok(cached)
 }
 
 // ============================================================================
@@ -96,6 +102,7 @@ pub struct SpatialQueryResult {
 pub struct SpatialQueryResultItem {
     pub refno: String,
     pub noun: String,
+    pub spec_value: i64,
     pub aabb: Option<AabbDto>,
 }
 
@@ -128,6 +135,9 @@ pub struct SpatialStatsResult {
 // ============================================================================
 
 fn sqlite_index_path() -> PathBuf {
+    if let Some(path) = test_index_override().lock().ok().and_then(|guard| guard.clone()) {
+        return path;
+    }
     // 兼容两个环境变量名
     for var in ["AIOS_SPATIAL_INDEX_SQLITE", "SQLITE_SPATIAL_INDEX_PATH"] {
         if let Ok(v) = std::env::var(var) {
@@ -378,7 +388,7 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
         }
     };
 
-    let mut stmt_noun = match conn.prepare("SELECT noun FROM items WHERE id = ?1") {
+    let mut stmt_item = match conn.prepare("SELECT noun, spec_value FROM items WHERE id = ?1") {
         Ok(s) => s,
         Err(e) => {
             return SpatialQueryResult {
@@ -386,7 +396,7 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
                 results: None,
                 truncated: None,
                 query_bbox: Some(query_bbox_dto),
-                error: Some(format!("prepare noun stmt failed: {}", e)),
+                error: Some(format!("prepare item stmt failed: {}", e)),
             };
         }
     };
@@ -416,11 +426,11 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
             }
         }
 
-        let noun: Option<String> = stmt_noun
-            .query_row([id], |r| r.get(0))
+        let item_row: Option<(String, i64)> = stmt_item
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1).unwrap_or(0))))
             .optional()
             .unwrap_or(None);
-        let noun = noun.unwrap_or_else(|| "UNKNOWN".to_string());
+        let (noun, spec_value) = item_row.unwrap_or_else(|| ("UNKNOWN".to_string(), 0));
 
         // noun 过滤
         if let Some(ref filter) = noun_filter {
@@ -452,7 +462,7 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
         let aabb = aabb_row.map(|(minx, miny, minz, maxx, maxy, maxz)| aabb_dto_from_row(minx, miny, minz, maxx, maxy, maxz));
 
         let refno = i64_to_refno_str(id as i64);
-        results.push(SpatialQueryResultItem { refno, noun, aabb });
+        results.push(SpatialQueryResultItem { refno, noun, spec_value, aabb });
 
         if results.len() >= max_results {
             truncated = true;
@@ -538,39 +548,90 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn with_test_index<T>(path: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _guard = test_guard().lock().unwrap();
+        clear_test_index_path();
+        set_test_index_path(path);
+        let result = f();
+        clear_test_index_path();
+        result
+    }
+
+    fn set_test_index_path(path: &std::path::Path) {
+        *test_index_override().lock().unwrap() = Some(path.to_path_buf());
+    }
+
+    fn clear_test_index_path() {
+        *test_index_override().lock().unwrap() = None;
+    }
+
     #[test]
     fn bbox_query_returns_refno_strings() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
-        idx.insert_aabbs_with_items(vec![
+        idx.insert_aabbs_with_items_and_spec_values(vec![
             // id = (1<<32)+2 => "1_2"
-            (((1u64 << 32) | 2u64) as i64, "PIPE".to_string(), 0.0, 1.0, 0.0, 1.0, 0.0, 1.0),
-            (((1u64 << 32) | 3u64) as i64, "WALL".to_string(), 10.0, 11.0, 0.0, 1.0, 0.0, 1.0),
+            (((1u64 << 32) | 2u64) as i64, "PIPE".to_string(), 42, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0),
+            (((1u64 << 32) | 3u64) as i64, "WALL".to_string(), 0, 10.0, 11.0, 0.0, 1.0, 0.0, 1.0),
         ]).unwrap();
 
-        unsafe {
-            std::env::set_var("SQLITE_SPATIAL_INDEX_PATH", db.to_string_lossy().to_string());
-        }
-        let params = SqliteSpatialQueryParams {
-            mode: Some("bbox".to_string()),
-            refno: None,
-            distance: Some(0.0),
-            minx: Some(-0.5),
-            miny: Some(-0.5),
-            minz: Some(-0.5),
-            maxx: Some(1.5),
-            maxy: Some(1.5),
-            maxz: Some(1.5),
-            max_results: None,
-            nouns: None,
-            include_self: None,
-            shape: None,
-        };
-        let resp = do_spatial_query(params);
+        let resp = with_test_index(&db, || {
+            let params = SqliteSpatialQueryParams {
+                mode: Some("bbox".to_string()),
+                refno: None,
+                distance: Some(0.0),
+                minx: Some(-0.5),
+                miny: Some(-0.5),
+                minz: Some(-0.5),
+                maxx: Some(1.5),
+                maxy: Some(1.5),
+                maxz: Some(1.5),
+                max_results: None,
+                nouns: None,
+                include_self: None,
+                shape: None,
+            };
+            do_spatial_query(params)
+        });
         assert!(resp.success);
         let items = resp.results.unwrap_or_default();
-        assert!(items.iter().any(|x| x.refno == "1_2" && x.noun == "PIPE"));
+        assert!(items.iter().any(|x| x.refno == "1_2" && x.noun == "PIPE" && x.spec_value == 42));
+        assert!(items.iter().any(|x| x.refno == "1_2"));
+    }
+
+    #[test]
+    fn bbox_query_returns_zero_spec_value_when_missing() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(vec![
+            (((1u64 << 32) | 9u64) as i64, "PIPE".to_string(), 0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0),
+        ]).unwrap();
+
+        let resp = with_test_index(&db, || {
+            let params = SqliteSpatialQueryParams {
+                mode: Some("bbox".to_string()),
+                refno: None,
+                distance: Some(0.0),
+                minx: Some(-0.5),
+                miny: Some(-0.5),
+                minz: Some(-0.5),
+                maxx: Some(1.5),
+                maxy: Some(1.5),
+                maxz: Some(1.5),
+                max_results: None,
+                nouns: None,
+                include_self: None,
+                shape: None,
+            };
+            do_spatial_query(params)
+        });
+        assert!(resp.success);
+        let items = resp.results.unwrap_or_default();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].spec_value, 0);
     }
 }

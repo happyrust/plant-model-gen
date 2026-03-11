@@ -36,3 +36,14 @@ Manual testing surface, browser entry points, and local validation notes.
 
 - Existing code previously defaulted to a non-mission backend port; mission work is expected to align local validation to `3100`.
 - Some external sync behavior may degrade to mock behavior locally; this does not excuse failures in local workflow state, persistence, or viewer location.
+
+## Release Validation Surface
+
+- Production URL: `http://123.57.182.243/`
+- Production API version endpoint target: `http://123.57.182.243/api/version`
+- Required release validation action: open Help/About in the live UI and verify both frontend and backend version metadata are visible.
+- Required production evidence:
+  - screenshot of Help/About showing frontend version/build date/commit
+  - screenshot of Help/About showing backend version/build date/commit
+  - API response capture from `/api/version`
+  - CI evidence that the deployed tag matches the displayed metadata

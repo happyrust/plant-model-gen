@@ -746,10 +746,11 @@ fn build_room_compute_panel_calc_options()
 fn build_room_compute_panel_spatial_index_items(
     geom_insts: Vec<aios_core::GeomInstQuery>,
     local_aabb_map: &std::collections::HashMap<String, parry3d::bounding_volume::Aabb>,
-) -> Vec<(i64, String, f64, f64, f64, f64, f64, f64)> {
+    spec_value_map: &std::collections::HashMap<i64, i64>,
+) -> Vec<(i64, String, i64, f64, f64, f64, f64, f64, f64)> {
     use std::collections::BTreeMap;
 
-    let mut merged: BTreeMap<i64, (String, f64, f64, f64, f64, f64, f64)> = BTreeMap::new();
+    let mut merged: BTreeMap<i64, (String, i64, f64, f64, f64, f64, f64, f64)> = BTreeMap::new();
 
     for geom_inst in geom_insts {
         let Some(aabb) = resolve_room_compute_panel_geom_inst_aabb(&geom_inst, local_aabb_map)
@@ -758,6 +759,7 @@ fn build_room_compute_panel_spatial_index_items(
             continue;
         };
         let id = geom_inst.refno.refno().0 as i64;
+        let spec_value = *spec_value_map.get(&id).unwrap_or(&0);
         let noun = if !geom_inst.insts.is_empty() && geom_inst.insts.iter().all(|inst| inst.is_tubi)
         {
             "TUBI".to_string()
@@ -771,15 +773,19 @@ fn build_room_compute_panel_spatial_index_items(
                 if entry.0 == "UNKNOWN" && noun != "UNKNOWN" {
                     entry.0 = noun.clone();
                 }
-                entry.1 = entry.1.min(aabb.mins.x as f64);
-                entry.2 = entry.2.max(aabb.maxs.x as f64);
-                entry.3 = entry.3.min(aabb.mins.y as f64);
-                entry.4 = entry.4.max(aabb.maxs.y as f64);
-                entry.5 = entry.5.min(aabb.mins.z as f64);
-                entry.6 = entry.6.max(aabb.maxs.z as f64);
+                if entry.1 == 0 && spec_value != 0 {
+                    entry.1 = spec_value;
+                }
+                entry.2 = entry.2.min(aabb.mins.x as f64);
+                entry.3 = entry.3.max(aabb.maxs.x as f64);
+                entry.4 = entry.4.min(aabb.mins.y as f64);
+                entry.5 = entry.5.max(aabb.maxs.y as f64);
+                entry.6 = entry.6.min(aabb.mins.z as f64);
+                entry.7 = entry.7.max(aabb.maxs.z as f64);
             })
             .or_insert((
                 noun,
+                spec_value,
                 aabb.mins.x as f64,
                 aabb.maxs.x as f64,
                 aabb.mins.y as f64,
@@ -791,8 +797,8 @@ fn build_room_compute_panel_spatial_index_items(
 
     merged
         .into_iter()
-        .map(|(id, (noun, minx, maxx, miny, maxy, minz, maxz))| {
-            (id, noun, minx, maxx, miny, maxy, minz, maxz)
+        .map(|(id, (noun, spec_value, minx, maxx, miny, maxy, minz, maxz))| {
+            (id, noun, spec_value, minx, maxx, miny, maxy, minz, maxz)
         })
         .collect()
 }
@@ -846,10 +852,13 @@ async fn rebuild_room_compute_panel_spatial_index(
     verbose: bool,
 ) -> Result<()> {
     use aios_core::query_insts;
+    use aios_core::{project_primary_db, SurrealQueryExt};
     use aios_database::fast_model::query_provider::query_multi_descendants_with_self;
     use aios_database::fast_model::{EXIST_MESH_GEO_HASHES, preload_mesh_cache};
     use aios_database::spatial_index::SqliteSpatialIndex;
     use aios_database::sqlite_index::SqliteAabbIndex;
+    use serde::Deserialize;
+    use surrealdb::types::SurrealValue;
 
     if root_refnos.is_empty() {
         return Ok(());
@@ -867,6 +876,52 @@ async fn rebuild_room_compute_panel_spatial_index(
     expanded_refnos.extend(descendants);
     expanded_refnos.sort();
     expanded_refnos.dedup();
+
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct SpecValueRow {
+        refno: RefnoEnum,
+        spec_value: Option<i64>,
+        owner_refno: Option<RefnoEnum>,
+    }
+
+    let spec_value_map = if expanded_refnos.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        let pe_keys: Vec<String> = expanded_refnos.iter().map(|r| r.to_pe_key()).collect();
+        let sql = format!(
+            r#"
+            SELECT
+                id as refno,
+                ->inst_relate[0].spec_value as spec_value,
+                ->inst_relate[0].owner_refno as owner_refno
+            FROM [{}]
+            "#,
+            pe_keys.join(",")
+        );
+        let rows: Vec<SpecValueRow> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+        let mut direct: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        let mut owners: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for row in rows {
+            let id = row.refno.refno().0 as i64;
+            let spec_value = row.spec_value.unwrap_or(0);
+            direct.insert(id, spec_value);
+            if let Some(owner_refno) = row.owner_refno {
+                owners.insert(id, owner_refno.refno().0 as i64);
+            }
+        }
+
+        let mut effective = std::collections::HashMap::new();
+        for id in expanded_refnos.iter().map(|r| r.refno().0 as i64) {
+            let mut spec_value = *direct.get(&id).unwrap_or(&0);
+            if spec_value == 0 {
+                if let Some(owner_id) = owners.get(&id) {
+                    spec_value = *direct.get(owner_id).unwrap_or(&0);
+                }
+            }
+            effective.insert(id, spec_value);
+        }
+        effective
+    };
 
     preload_mesh_cache();
     let local_aabb_map: std::collections::HashMap<String, parry3d::bounding_volume::Aabb> =
@@ -948,7 +1003,7 @@ async fn rebuild_room_compute_panel_spatial_index(
         }
     }
 
-    let items = build_room_compute_panel_spatial_index_items(geom_insts, &local_aabb_map);
+    let items = build_room_compute_panel_spatial_index_items(geom_insts, &local_aabb_map, &spec_value_map);
     if verbose {
         println!(
             "   - 空间索引根节点: {}，展开后节点: {}，本地 AABB 缓存: {}",
@@ -958,7 +1013,7 @@ async fn rebuild_room_compute_panel_spatial_index(
         );
     }
     println!("   - 已写入 SQLite 空间索引项: {}", items.len());
-    idx.insert_aabbs_with_items(items)?;
+    idx.insert_aabbs_with_items_and_spec_values(items)?;
 
     Ok(())
 }

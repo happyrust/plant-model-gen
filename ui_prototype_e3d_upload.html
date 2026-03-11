@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>E3D Upload Manager</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Fira Sans', sans-serif; }
+        .font-mono { font-family: 'Fira Code', monospace; }
+    </style>
+</head>
+<body class="bg-slate-50">
+    <!-- Header -->
+    <header class="bg-blue-800 text-white p-6 shadow-lg">
+        <h1 class="text-2xl font-bold">E3D Upload Manager</h1>
+        <p class="text-blue-200 text-sm mt-1">工业数据上传与解析平台</p>
+    </header>
+
+    <div class="container mx-auto p-6 max-w-7xl">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+            <!-- 上传区域 -->
+            <div class="bg-white rounded-lg shadow p-6">
+                <h2 class="text-lg font-semibold mb-4 text-slate-800">📤 文件上传</h2>
+                
+                <!-- 拖拽区域 -->
+                <div class="border-2 border-dashed border-slate-300 rounded-lg p-12 text-center mb-4 hover:border-blue-500 transition cursor-pointer">
+                    <svg class="mx-auto h-12 w-12 text-slate-400 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+                    </svg>
+                    <p class="text-slate-600 mb-2">拖拽 E3D 文件到此处</p>
+                    <p class="text-sm text-slate-400">或</p>
+                    <button class="mt-3 px-6 py-2 bg-amber-500 text-white rounded hover:bg-amber-600 transition">选择文件</button>
+                </div>
+
+                <!-- 项目名称 -->
+                <div class="mb-4">
+                    <label class="block text-sm font-medium text-slate-700 mb-2">项目名称</label>
+                    <input type="text" placeholder="my_project" class="w-full px-4 py-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+                </div>
+
+                <!-- 开始解析按钮 -->
+                <button class="w-full px-6 py-3 bg-blue-800 text-white rounded hover:bg-blue-900 transition font-medium">
+                    开始解析
+                </button>
+            </div>
+
+            <!-- 任务列表 -->
+            <div class="bg-white rounded-lg shadow p-6">
+                <h2 class="text-lg font-semibold mb-4 text-slate-800">📋 解析任务</h2>
+                
+                <!-- 任务项 -->
+                <div class="space-y-3">
+                    <div class="border border-slate-200 rounded p-4 hover:shadow-md transition">
+                        <div class="flex justify-between items-start mb-2">
+                            <span class="font-mono text-sm text-slate-700">sample_7997.e3d</span>
+                            <span class="px-2 py-1 bg-green-100 text-green-700 text-xs rounded">完成</span>
+                        </div>
+                        <div class="text-xs text-slate-500 mb-2">项目: test_project</div>
+                        <div class="w-full bg-slate-200 rounded-full h-2">
+                            <div class="bg-green-500 h-2 rounded-full" style="width: 100%"></div>
+                        </div>
+                    </div>
+
+                    <div class="border border-blue-200 rounded p-4 bg-blue-50">
+                        <div class="flex justify-between items-start mb-2">
+                            <span class="font-mono text-sm text-slate-700">plant_model.e3d</span>
+                            <span class="px-2 py-1 bg-blue-100 text-blue-700 text-xs rounded">解析中</span>
+                        </div>
+                        <div class="text-xs text-slate-500 mb-2">项目: my_project</div>
+                        <div class="w-full bg-slate-200 rounded-full h-2">
+                            <div class="bg-blue-500 h-2 rounded-full animate-pulse" style="width: 65%"></div>
+                        </div>
+                        <div class="text-xs text-slate-600 mt-2">进度: 65% - 正在解析几何数据</div>
+                    </div>
+
+                    <div class="border border-slate-200 rounded p-4">
+                        <div class="flex justify-between items-start mb-2">
+                            <span class="font-mono text-sm text-slate-700">offshore_rig.e3d</span>
+                            <span class="px-2 py-1 bg-slate-100 text-slate-600 text-xs rounded">等待中</span>
+                        </div>
+                        <div class="text-xs text-slate-500 mb-2">项目: offshore_project</div>
+                        <div class="w-full bg-slate-200 rounded-full h-2">
+                            <div class="bg-slate-400 h-2 rounded-full" style="width: 0%"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 项目文件浏览器 -->
+        <div class="bg-white rounded-lg shadow p-6">
+            <h2 class="text-lg font-semibold mb-4 text-slate-800">📁 项目文件浏览</h2>
+            
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <!-- 项目列表 -->
+                <div class="border-r border-slate-200 pr-4">
+                    <h3 class="text-sm font-medium text-slate-600 mb-3">项目列表</h3>
+                    <div class="space-y-2">
+                        <div class="p-3 bg-blue-50 border border-blue-200 rounded cursor-pointer hover:bg-blue-100 transition">
+                            <div class="font-medium text-sm">test_project</div>
+                            <div class="text-xs text-slate-500">3 个文件</div>
+                        </div>
+                        <div class="p-3 border border-slate-200 rounded cursor-pointer hover:bg-slate-50 transition">
+                            <div class="font-medium text-sm">my_project</div>
+                            <div class="text-xs text-slate-500">1 个文件</div>
+                        </div>
+                        <div class="p-3 border border-slate-200 rounded cursor-pointer hover:bg-slate-50 transition">
+                            <div class="font-medium text-sm">offshore_project</div>
+                            <div class="text-xs text-slate-500">0 个文件</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 文件列表 -->
+                <div class="border-r border-slate-200 pr-4">
+                    <h3 class="text-sm font-medium text-slate-600 mb-3">文件列表</h3>
+                    <div class="space-y-2">
+                        <div class="p-2 hover:bg-slate-50 rounded cursor-pointer flex items-center">
+                            <svg class="w-4 h-4 text-blue-500 mr-2" fill="currentColor" viewBox="0 0 20 20">
+                                <path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"/>
+                            </svg>
+                            <span class="text-sm">instances/</span>
+                        </div>
+                        <div class="p-2 hover:bg-slate-50 rounded cursor-pointer flex items-center">
+                            <svg class="w-4 h-4 text-blue-500 mr-2" fill="currentColor" viewBox="0 0 20 20">
+                                <path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"/>
+                            </svg>
+                            <span class="text-sm">scene_tree/</span>
+                        </div>
+                        <div class="p-2 hover:bg-slate-50 rounded cursor-pointer flex items-center">
+                            <svg class="w-4 h-4 text-slate-400 mr-2" fill="currentColor" viewBox="0 0 20 20">
+                                <path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z"/>
+                            </svg>
+                            <span class="text-sm font-mono">db_meta_info.json</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 文件详情 -->
+                <div>
+                    <h3 class="text-sm font-medium text-slate-600 mb-3">文件详情</h3>
+                    <div class="text-sm space-y-2">
+                        <div class="flex justify-between">
+                            <span class="text-slate-500">类型:</span>
+                            <span class="font-mono">JSON</span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-slate-500">大小:</span>
+                            <span class="font-mono">2.4 MB</span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-slate-500">修改时间:</span>
+                            <span class="font-mono text-xs">2026-03-11 16:20</span>
+                        </div>
+                        <button class="mt-4 w-full px-4 py-2 bg-slate-100 text-slate-700 rounded hover:bg-slate-200 transition text-sm">
+                            下载文件
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

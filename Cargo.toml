@@ -233,6 +233,7 @@ convex-runtime = []
 convex-decomposition = ["convex-runtime", "dep:miniacd", "dep:glamx"]
 
 [build-dependencies]
+chrono = "0.4.22"
 cc = { version = "1.0", features = ["parallel"] }
 # tonic-build = "0.14.2"  # 移到 grpc feature 中
 # prost-build = "0.14.1"  # 移到 grpc feature 中

@@ -146,3 +146,60 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: production
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x64-release
+          path: ./deploy-package
+      
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      
+      - name: Deploy to production server
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_KEY }}
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H $PROD_HOST >> ~/.ssh/known_hosts
+          
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          RELEASE_DIR="/opt/plant-model-gen/releases/$VERSION"
+          
+          ssh -i ~/.ssh/deploy_key $PROD_USER@$PROD_HOST "mkdir -p $RELEASE_DIR"
+          
+          scp -i ~/.ssh/deploy_key deploy-package/web_server $PROD_USER@$PROD_HOST:$RELEASE_DIR/
+          scp -i ~/.ssh/deploy_key deploy-package/BUILD_INFO.txt $PROD_USER@$PROD_HOST:$RELEASE_DIR/
+          
+          ssh -i ~/.ssh/deploy_key $PROD_USER@$PROD_HOST << 'ENDSSH'
+            VERSION="${{ steps.version.outputs.VERSION }}"
+            RELEASE_DIR="/opt/plant-model-gen/releases/$VERSION"
+            CURRENT_LINK="/opt/plant-model-gen/current"
+            
+            chmod +x $RELEASE_DIR/web_server
+            
+            if [ -L "$CURRENT_LINK" ]; then
+              PREV_RELEASE=$(readlink $CURRENT_LINK)
+              echo "Previous release: $PREV_RELEASE"
+            fi
+            
+            ln -sfn $RELEASE_DIR $CURRENT_LINK
+            echo "Deployed version $VERSION to production"
+            
+            sudo systemctl restart plant-model-gen || echo "Service restart skipped"
+          ENDSSH

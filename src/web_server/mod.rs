@@ -59,6 +59,8 @@ use crate::web_api::{
     create_pdms_model_query_routes,
     create_jwt_auth_routes, create_review_api_routes, create_scene_tree_routes,
     SearchApiState, create_search_routes,
+    UploadApiState, create_upload_routes,
+    create_version_routes,
 };
 use handlers::*;
 use models::*;
@@ -276,6 +278,12 @@ pub async fn start_web_server_with_config(
 
     // 初始化检索 API（Meilisearch 可选；通过环境变量 MEILI_URL/MEILI_API_KEY/MEILI_PDMS_INDEX 配置）
     let search_routes = create_search_routes(SearchApiState::from_env());
+
+    // 初始化上传 API
+    let upload_state = UploadApiState {
+        tasks: Arc::new(RwLock::new(HashMap::new())),
+    };
+    let upload_routes = create_upload_routes(upload_state);
 
     let app = Router::new()
         // API路由
@@ -900,6 +908,7 @@ pub async fn start_web_server_with_config(
         .merge(room_routes)
         .merge(collision_routes)
         .merge(search_routes)
+        .merge(upload_routes)
         .merge(create_review_integration_routes())
         .merge(create_model_center_routes())
         .merge(create_jwt_auth_routes())
@@ -907,6 +916,7 @@ pub async fn start_web_server_with_config(
         .merge(create_scene_tree_routes())
         .merge(create_mbd_pipe_routes())
         .nest("/api/pipeline", create_pipeline_annotation_routes())
+        .nest("/api", create_version_routes())
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

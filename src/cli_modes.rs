@@ -683,6 +683,8 @@ fn build_room_compute_panel_gen_option(
     db_option_ext: &DbOptionExt,
     manual_db_nums: Option<Vec<u32>>,
 ) -> DbOptionExt {
+    use aios_database::options::MeshFormat;
+
     let mut gen_opt = db_option_ext.clone();
     gen_opt.inner.gen_model = true;
     gen_opt.inner.gen_mesh = true;
@@ -692,6 +694,12 @@ fn build_room_compute_panel_gen_option(
         nums.dedup();
         nums
     });
+
+    // 确保导出 GLB 格式，以便生成 inst_relate_aabb
+    if !gen_opt.mesh_formats.contains(&MeshFormat::Glb) {
+        gen_opt.mesh_formats.push(MeshFormat::Glb);
+    }
+
     gen_opt
 }
 
@@ -727,8 +735,8 @@ fn build_room_compute_panel_spatial_index_roots(
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-fn build_room_compute_panel_calc_options() -> aios_database::fast_model::room_model::RoomComputeOptions
-{
+fn build_room_compute_panel_calc_options()
+-> aios_database::fast_model::room_model::RoomComputeOptions {
     aios_database::fast_model::room_model::RoomComputeOptions::default()
         .with_prebuilt_spatial_index()
         .with_surreal_query()
@@ -794,14 +802,17 @@ fn resolve_room_compute_panel_geom_inst_aabb(
     geom_inst: &aios_core::GeomInstQuery,
     local_aabb_map: &std::collections::HashMap<String, parry3d::bounding_volume::Aabb>,
 ) -> Option<parry3d::bounding_volume::Aabb> {
-    use aios_database::fast_model::shared::aabb_apply_transform;
     use aios_core::geometry::csg::UNIT_MESH_SCALE;
+    use aios_database::fast_model::shared::aabb_apply_transform;
     use parry3d::bounding_volume::BoundingVolume;
 
     let mut merged_world_aabb: Option<parry3d::bounding_volume::Aabb> = None;
 
     for inst in &geom_inst.insts {
-        let geo_hash = inst.geo_hash.strip_prefix("t_").unwrap_or(inst.geo_hash.as_str());
+        let geo_hash = inst
+            .geo_hash
+            .strip_prefix("t_")
+            .unwrap_or(inst.geo_hash.as_str());
         let Some(local_aabb) = local_aabb_map.get(geo_hash) else {
             continue;
         };
@@ -834,11 +845,11 @@ async fn rebuild_room_compute_panel_spatial_index(
     root_refnos: &[RefnoEnum],
     verbose: bool,
 ) -> Result<()> {
+    use aios_core::query_insts;
     use aios_database::fast_model::query_provider::query_multi_descendants_with_self;
-    use aios_database::fast_model::{preload_mesh_cache, EXIST_MESH_GEO_HASHES};
+    use aios_database::fast_model::{EXIST_MESH_GEO_HASHES, preload_mesh_cache};
     use aios_database::spatial_index::SqliteSpatialIndex;
     use aios_database::sqlite_index::SqliteAabbIndex;
-    use aios_core::query_insts;
 
     if root_refnos.is_empty() {
         return Ok(());
@@ -863,7 +874,80 @@ async fn rebuild_room_compute_panel_spatial_index(
             .iter()
             .map(|entry| (entry.key().clone(), *entry.value()))
             .collect();
-    let geom_insts = query_insts(&expanded_refnos, true).await?;
+
+    println!("🔍 [DEBUG] 展开后的 refnos 数量: {}", expanded_refnos.len());
+    if verbose {
+        for refno in &expanded_refnos {
+            println!("   - {}", refno);
+        }
+    }
+
+    let geom_insts = match query_insts(&expanded_refnos, true).await {
+        Ok(insts) => insts,
+        Err(e) => {
+            println!("⚠️ query_insts 失败: {}", e);
+            println!("   回退到直接查询 inst_relate_aabb...");
+
+            // 回退方案：直接从 inst_relate_aabb 表查询 aabb
+            use aios_core::{SurrealQueryExt, model_primary_db};
+            use serde::Deserialize;
+            use surrealdb::types::SurrealValue;
+
+            #[derive(Debug, Deserialize, SurrealValue)]
+            struct InstRelateAabbQuery {
+                #[serde(rename = "in")]
+                refno: RefnoEnum,
+                aabb_id: Option<aios_core::types::PlantAabb>,
+            }
+
+            let refno_strs: Vec<String> = expanded_refnos
+                .iter()
+                .map(|r| format!("inst_relate_aabb:`{}`", r))
+                .collect();
+            let sql = format!("SELECT in, aabb_id.d as aabb_id FROM [{}]", refno_strs.join(","));
+
+            let aabb_records: Vec<InstRelateAabbQuery> = model_primary_db()
+                .query_take(&sql, 0)
+                .await
+                .unwrap_or_default();
+
+            println!("   查询到 {} 条 inst_relate_aabb 记录", aabb_records.len());
+
+            // 转换为 GeomInstQuery 格式（只填充必要字段）
+            aabb_records
+                .into_iter()
+                .filter_map(|rec| {
+                    rec.aabb_id.map(|aabb| aios_core::GeomInstQuery {
+                        refno: rec.refno,
+                        owner: rec.refno,
+                        world_trans: aios_core::PlantTransform::default(),
+                        world_aabb: Some(aabb),
+                        insts: Vec::new(),
+                        has_neg: false,
+                    })
+                })
+                .collect()
+        }
+    };
+    println!(
+        "🔍 [DEBUG] query_insts 返回的 GeomInstQuery 数量: {}",
+        geom_insts.len()
+    );
+
+    for (idx, geom_inst) in geom_insts.iter().enumerate() {
+        println!(
+            "   [{}] refno={}, insts.len()={}, has_neg={}, world_aabb={:?}",
+            idx,
+            geom_inst.refno,
+            geom_inst.insts.len(),
+            geom_inst.has_neg,
+            geom_inst.world_aabb.is_some()
+        );
+        if geom_inst.insts.is_empty() {
+            println!("      ⚠️ 该构件没有 inst 记录（inst_relate 可能缺失）");
+        }
+    }
+
     let items = build_room_compute_panel_spatial_index_items(geom_insts, &local_aabb_map);
     if verbose {
         println!(
@@ -2516,7 +2600,6 @@ pub async fn export_dbnum_instances_parquet_mode(
     Ok(())
 }
 
-
 /// 导出指定 dbnum 的 PDMS Tree（TreeIndex + name/noun/children_count）为 Parquet
 ///
 /// 输出目录默认为：output/<project>/scene_tree_parquet/
@@ -2866,11 +2949,7 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
                     if arr.len() < 3 {
                         return None;
                     }
-                    Some((
-                        arr[0].as_f64()?,
-                        arr[1].as_f64()?,
-                        arr[2].as_f64()?,
-                    ))
+                    Some((arr[0].as_f64()?, arr[1].as_f64()?, arr[2].as_f64()?))
                 };
                 match (
                     get3_obj(mins).or_else(|| get3_arr(mins)),
@@ -3117,18 +3196,12 @@ pub async fn room_compute_panel_mode(
                 Some(derived_dbnums.clone())
             },
         );
-        gen_all_geos_data(gen_refnos, &gen_opt, None, None).await?;
-        let spatial_index_roots = if expected_root_refnos.is_empty() {
-            build_room_compute_panel_spatial_index_roots(panel_refno, &[panel_refno])
-        } else {
-            build_room_compute_panel_spatial_index_roots(panel_refno, &expected_root_refnos)
-        };
-        if !spatial_index_roots.is_empty() {
-            println!("\n🗃️ 刷新房间计算用 SQLite 空间索引...");
-            rebuild_room_compute_panel_spatial_index(&gen_opt, &spatial_index_roots, verbose)
-                .await?;
-        }
+        gen_all_geos_data(gen_refnos.clone(), &gen_opt, None, None).await?;
+
         println!("✅ 模型生成完成");
+        println!("\n⚠️  提示：模型已生成，但空间索引未更新。");
+        println!("   如需更新空间索引，请运行：");
+        println!("   cargo run --bin aios-database -- room rebuild-spatial-index");
     } else {
         println!("\n🗃️ 复用现有 SQLite 空间索引，不执行模型生成与局部索引重建");
     }
@@ -3338,8 +3411,7 @@ mod tests {
     #[test]
     fn test_build_room_compute_panel_gen_option_enables_instance_export() {
         let db_option_ext =
-            aios_database::options::get_db_option_ext_from_path("db_options/DbOption-mac")
-                .unwrap();
+            aios_database::options::get_db_option_ext_from_path("db_options/DbOption-mac").unwrap();
 
         let gen_opt =
             build_room_compute_panel_gen_option(&db_option_ext, Some(vec![7997, 8000, 7997]));

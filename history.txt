@@ -1,10 +1,4 @@
 #V2
-SELECT * FROM neg_relate:['9582475794974559371', pe:`24381_35960`];
-INFO FOR TABLE neg_relate;
-REMOVE INDEX unique_neg_relate ON TABLE neg_relate;
-REMOVE INDEX idx_pe_neg_relate_reverse ON TABLE neg_relate;
-DEFINE INDEX unique_neg_relate ON TABLE neg_relate FIELDS in, out UNIQUE;
-DEFINE INDEX idx_pe_neg_relate_reverse ON TABLE neg_relate FIELDS out;
 SELECT pe, type::record('pe_transform', record::id(pe)).world_trans.d AS carrier_wt FROM ngmr_relate WHERE out = pe:⟨17496_106028⟩ LIMIT 10;
 SELECT id, world_trans.d.translation FROM pe_transform WHERE id IN [pe_transform:⟨17496_106028⟩, pe_transform:⟨17496_142305⟩, pe_transform:⟨17496_142306⟩, pe_transform:⟨17496_125330⟩, pe_transform:⟨17496_106029⟩];
 SELECT id, pe, out, in FROM ngmr_relate WHERE out = pe:⟨17496_106028⟩ LIMIT 5;
@@ -99,3 +93,9 @@ SELECT id, task_id, type, confirmed_at FROM review_records LIMIT 5; SELECT id, a
 CREATE review_records CONTENT {  id: 'record-test-manual',  task_id: 'task-test-manual',  type: 'batch',  annotations: [],  cloud_annotations: [],  rect_annotations: [],  obb_annotations: [],  measurements: [],  note: 'manual',  confirmed_at: time::now()};
 SELECT * FROM review_records WHERE task_id = 'task-test-manual';
 DELETE review_records:`record-test-manual`;
+SELECT count() FROM room_relate GROUP ALL;
+SELECT VALUE { panel: in, component: out, room_num: room_num } FROM room_relate LIMIT 10;
+SELECT VALUE { refno: REFNO, noun: noun, owner: owner } FROM pe WHERE REFNO = pe:`24381_145019`;
+SELECT VALUE { refno: REFNO, noun: noun, owner: owner } FROM pe WHERE REFNO = pe:`24381_35798`;
+SELECT VALUE { refno: REFNO, noun: noun, owner: owner } FROM pe WHERE REFNO = pe:`24381_145019`;
+SELECT VALUE { refno: REFNO, noun: noun, owner: owner } FROM pe WHERE REFNO = pe:`24381_35798`;

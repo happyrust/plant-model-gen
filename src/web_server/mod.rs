@@ -965,8 +965,8 @@ async fn auto_update_scheduler(state: AppState) {
             let updating = row["updating"].as_bool().unwrap_or(false);
 
             // 计算是否需要更新
-            // SESSION_STORE removed - now using DuckDB
-            let cached_sesno = 0u32;  // TODO: Replace with DuckDB query
+            // SESSION_STORE removed
+            let cached_sesno = 0u32;
             let latest_file_sesno = {
                 // TODO: Implement proper PDMS sesno extraction
                 // This requires creating PdmsIO from project directory

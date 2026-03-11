@@ -62,9 +62,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 
 
-#[cfg(feature = "duckdb-feature")]
 
-use crate::fast_model::export_model::get_or_init_duckdb_reader;
 
 
 
@@ -93,7 +91,26 @@ struct RoomCalcEnvConfig {
 static ROOM_CALC_CONFIG: std::sync::OnceLock<RoomCalcEnvConfig> = std::sync::OnceLock::new();
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-static SPATIAL_INDEX_READY: std::sync::OnceLock<Result<usize, String>> = std::sync::OnceLock::new();
+static SPATIAL_INDEX_SCOPE: std::sync::LazyLock<std::sync::Mutex<Option<SpatialIndexScope>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpatialIndexScope {
+    Full,
+    Scoped,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+impl SpatialIndexScope {
+    fn from_filters(db_nums: Option<&[u32]>, refno_root: Option<RefnoEnum>) -> Self {
+        if db_nums.is_none() && refno_root.is_none() {
+            Self::Full
+        } else {
+            Self::Scoped
+        }
+    }
+}
 
 /// 确保 spatial_index.sqlite 已从 inst_relate_aabb 刷新（进程生命周期内至多执行一次）。
 ///
@@ -105,12 +122,18 @@ async fn ensure_spatial_index_ready(
     refno_root: Option<RefnoEnum>,
     force: bool,
 ) -> anyhow::Result<()> {
-    if !force {
-        if let Some(prev) = SPATIAL_INDEX_READY.get() {
-            return prev
-                .as_ref()
-                .map(|_| ())
-                .map_err(|e| anyhow::anyhow!("{}", e));
+    let requested_scope = SpatialIndexScope::from_filters(db_nums, refno_root);
+
+    if !force && requested_scope == SpatialIndexScope::Full {
+        let known_scope = *SPATIAL_INDEX_SCOPE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if known_scope == Some(SpatialIndexScope::Full) {
+            if let Ok(idx) = SqliteSpatialIndex::with_default_path() {
+                if idx.get_stats().map(|stats| stats.total_elements).unwrap_or(0) > 0 {
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -118,12 +141,16 @@ async fn ensure_spatial_index_ready(
     match &result {
         Ok(count) => {
             info!("[room_model] ensure_spatial_index_ready: 索引就绪, inserted={count}");
-            let _ = SPATIAL_INDEX_READY.set(Ok(*count));
+            *SPATIAL_INDEX_SCOPE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(requested_scope);
         }
         Err(e) => {
             let msg = format!("{e:#}");
             error!("[room_model] ensure_spatial_index_ready: 索引刷新失败: {msg}");
-            let _ = SPATIAL_INDEX_READY.set(Err(msg));
+            *SPATIAL_INDEX_SCOPE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
     }
     result.map(|_| ())
@@ -895,6 +922,10 @@ pub struct RoomComputeOptions {
 
     candidate_concurrency: usize,
 
+    refresh_spatial_index: bool,
+
+    query_from_cache: bool,
+
 }
 
 
@@ -913,10 +944,34 @@ impl Default for RoomComputeOptions {
 
             candidate_concurrency: default_candidate_concurrency(),
 
+            refresh_spatial_index: true,
+
+            query_from_cache: true,
+
         }
 
     }
 
+}
+
+impl RoomComputeOptions {
+    pub fn with_prebuilt_spatial_index(mut self) -> Self {
+        self.refresh_spatial_index = false;
+        self
+    }
+
+    pub fn refresh_spatial_index_enabled(&self) -> bool {
+        self.refresh_spatial_index
+    }
+
+    pub fn with_surreal_query(mut self) -> Self {
+        self.query_from_cache = false;
+        self
+    }
+
+    pub fn query_from_cache_enabled(&self) -> bool {
+        self.query_from_cache
+    }
 }
 
 
@@ -1209,7 +1264,7 @@ async fn get_enhanced_trimesh_cache() -> &'static DashMap<String, Arc<TriMesh>> 
 
 /// 5. 支持 dbnum 和 refno 子树范围限制
 
-#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
 #[cfg_attr(feature = "profile", tracing::instrument(skip(db_option)))]
 
@@ -1231,7 +1286,7 @@ pub async fn build_room_relations(
 
 /// 支持取消和进度回调的房间关系构建
 
-#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
 pub async fn build_room_relations_with_cancel(
 
@@ -1248,6 +1303,7 @@ pub async fn build_room_relations_with_cancel(
 ) -> anyhow::Result<RoomBuildStats> {
 
     info!("开始构建房间关系 (支持取消和进度)");
+    let full_rebuild = db_nums.is_none() && refno_root.is_none();
 
 
 
@@ -1293,7 +1349,7 @@ pub async fn build_room_relations_with_cancel(
 
     }
 
-    let mut room_panel_map = build_room_panels_relate(&room_key_words).await?;
+    let mut room_panel_map = build_room_panels_relate_for_query(&room_key_words).await?;
 
     info!("查询到 {} 个房间面板映射关系", room_panel_map.len());
 
@@ -1415,6 +1471,24 @@ pub async fn build_room_relations_with_cancel(
 
     }
 
+    let panels_to_delete: Vec<PanelRoom> = room_panel_map
+        .iter()
+        .flat_map(|(_, room_num, panels)| {
+            panels.iter().map(move |panel| PanelRoom {
+                panel: *panel,
+                room_num: room_num.clone(),
+            })
+        })
+        .collect();
+
+    if full_rebuild {
+        delete_all_room_relations().await?;
+        create_room_panel_relations_batch(&room_panel_map).await?;
+    } else {
+        delete_room_relations_for_panels(&panels_to_delete).await?;
+        sync_room_panel_relations(&room_panel_map, false).await?;
+    }
+
 
 
     let stats = compute_room_relations_with_cancel(
@@ -1461,7 +1535,7 @@ pub async fn build_room_relations_with_cancel(
 
 
 
-#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
 async fn compute_room_relations(
 
@@ -1497,7 +1571,7 @@ async fn compute_room_relations(
 
 
 
-#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
 #[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "compute_room_relations"))]
 
@@ -1565,7 +1639,7 @@ async fn compute_room_relations_with_cancel(
 
             let cancel_token = cancel_token.clone();
 
-            
+
 
             async move {
 
@@ -1575,7 +1649,7 @@ async fn compute_room_relations_with_cancel(
 
                     if token.is_cancelled() {
 
-                        return (room_refno, 0, true);
+                        return (room_refno, 0, 0, true);
 
                     }
 
@@ -1584,6 +1658,7 @@ async fn compute_room_relations_with_cancel(
 
 
                 let mut room_components = 0;
+                let mut failed_panels = 0;
 
 
 
@@ -1593,13 +1668,13 @@ async fn compute_room_relations_with_cancel(
 
                         if token.is_cancelled() {
 
-                            return (room_refno, room_components, true);
+                            return (room_refno, room_components, failed_panels, true);
 
                         }
 
                     }
 
-                    room_components += process_panel_for_room(
+                    let outcome = process_panel_for_room(
 
                         &mesh_dir,
 
@@ -1614,12 +1689,14 @@ async fn compute_room_relations_with_cancel(
                     )
 
                     .await;
+                    room_components += outcome.components;
+                    failed_panels += usize::from(outcome.failed);
 
                 }
 
 
 
-                (room_refno, room_components, false)
+                (room_refno, room_components, failed_panels, false)
 
             }
 
@@ -1653,7 +1730,7 @@ async fn compute_room_relations_with_cancel(
 
     // 检查是否有被取消的
 
-    if results.iter().any(|(_, _, cancelled)| *cancelled) {
+    if results.iter().any(|(_, _, _, cancelled)| *cancelled) {
 
         anyhow::bail!("任务在计算房间关系过程中被取消");
 
@@ -1663,7 +1740,8 @@ async fn compute_room_relations_with_cancel(
 
     let total_rooms = results.len();
 
-    let total_components: usize = results.iter().map(|(_, count, _)| *count).sum();
+    let total_components: usize = results.iter().map(|(_, count, _, _)| *count).sum();
+    let failed_panels: usize = results.iter().map(|(_, _, failed, _)| *failed).sum();
 
     let build_time = start_time.elapsed();
 
@@ -1687,7 +1765,7 @@ async fn compute_room_relations_with_cancel(
 
         memory_usage_mb: estimate_memory_usage().await,
 
-        failed_panels: 0,
+        failed_panels,
 
         missing_candidates: 0,
 
@@ -2037,55 +2115,94 @@ where
 
 
 
-/// 批量创建房间面板关系
-
-async fn create_room_panel_relations_batch(
-
+fn build_room_panel_relations_sql(
     room_groups: &[(RefnoEnum, String, Vec<RefnoEnum>)],
+) -> String {
+    room_groups
+        .iter()
+        .map(|(room_refno, room_num_str, panel_refnos)| {
+            let room_num_escaped = room_num_str.replace('\'', "''");
+            format!(
+                "relate {}->room_panel_relate->[{}] set room_num='{}';",
+                room_refno.to_pe_key(),
+                panel_refnos.iter().map(|x| x.to_pe_key()).join(","),
+                room_num_escaped
+            )
+        })
+        .join("\n")
+}
 
-) -> anyhow::Result<()> {
-
-    let mut sql_statements = Vec::new();
-
-
-
-    for (room_refno, room_num_str, panel_refnos) in room_groups {
-
-        let room_num_escaped = room_num_str.replace('\'', "''");
-
-        let sql = format!(
-
-            "relate {}->room_panel_relate->[{}] set room_num='{}';",
-
-            room_refno.to_pe_key(),
-
-            panel_refnos.iter().map(|x| x.to_pe_key()).join(","),
-
-            room_num_escaped
-
-        );
-
-        sql_statements.push(sql);
-
+fn build_delete_room_panel_relations_sql(room_refnos: &[RefnoEnum]) -> Option<String> {
+    if room_refnos.is_empty() {
+        return None;
     }
 
+    Some(format!(
+        "LET $ids = SELECT VALUE id FROM room_panel_relate WHERE out IN [{}];\nDELETE $ids;",
+        room_refnos.iter().map(RefnoEnum::to_pe_key).join(",")
+    ))
+}
 
+fn build_delete_room_relations_sql_for_panels(panel_refnos: &[RefnoEnum]) -> Option<String> {
+    if panel_refnos.is_empty() {
+        return None;
+    }
 
-    // 批量执行 SQL
+    Some(format!(
+        "LET $ids = SELECT VALUE id FROM [{}]->room_relate;\nDELETE $ids;",
+        panel_refnos.iter().map(RefnoEnum::to_pe_key).join(",")
+    ))
+}
 
-    let batch_sql = sql_statements.join("\n");
+async fn create_room_panel_relations_batch(
+    room_groups: &[(RefnoEnum, String, Vec<RefnoEnum>)],
+) -> anyhow::Result<()> {
+    let batch_sql = build_room_panel_relations_sql(room_groups);
+    if batch_sql.is_empty() {
+        return Ok(());
+    }
 
     model_primary_db().query(batch_sql).await?;
-
-
-
     Ok(())
+}
 
+async fn sync_room_panel_relations(
+    room_groups: &[(RefnoEnum, String, Vec<RefnoEnum>)],
+    clear_all_first: bool,
+) -> anyhow::Result<()> {
+    let mut sql_statements = Vec::new();
+
+    if clear_all_first {
+        sql_statements.push("DELETE room_panel_relate;".to_string());
+    } else {
+        let room_refnos: Vec<RefnoEnum> = room_groups.iter().map(|(room_refno, _, _)| *room_refno).collect();
+        if let Some(sql) = build_delete_room_panel_relations_sql(&room_refnos) {
+            sql_statements.push(sql);
+        }
+    }
+
+    let batch_sql = build_room_panel_relations_sql(room_groups);
+    if !batch_sql.is_empty() {
+        sql_statements.push(batch_sql);
+    }
+
+    if sql_statements.is_empty() {
+        return Ok(());
+    }
+
+    model_primary_db().query(sql_statements.join("\n")).await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PanelProcessOutcome {
+    components: usize,
+    failed: bool,
 }
 
 
 
-#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
 #[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "process_panel_for_room"))]
 
@@ -2100,8 +2217,7 @@ async fn process_panel_for_room(
     exclude_panel_refnos: &HashSet<RefnoEnum>,
 
     options: RoomComputeOptions,
-
-) -> usize {
+) -> PanelProcessOutcome {
 
     match cal_room_refnos_with_options(
 
@@ -2122,8 +2238,7 @@ async fn process_panel_for_room(
         Ok(refnos) => {
 
             if refnos.is_empty() {
-
-                return 0;
+                return PanelProcessOutcome::default();
 
             }
 
@@ -2133,11 +2248,17 @@ async fn process_panel_for_room(
 
                 error!("保存房间关系失败: panel={}, error={}", panel_refno, e);
 
-                0
+                PanelProcessOutcome {
+                    components: 0,
+                    failed: true,
+                }
 
             } else {
 
-                refnos.len()
+                PanelProcessOutcome {
+                    components: refnos.len(),
+                    failed: false,
+                }
 
             }
 
@@ -2147,7 +2268,10 @@ async fn process_panel_for_room(
 
             warn!("计算房间构件失败: panel={}, error={}", panel_refno, e);
 
-            0
+            PanelProcessOutcome {
+                components: 0,
+                failed: true,
+            }
 
         }
 
@@ -2571,9 +2695,15 @@ pub async fn cal_room_refnos_with_options(
 
     // 步骤 1：查询面板的几何实例（默认 cache-only）
 
-    let mut panel_geom_insts: Vec<GeomInstQuery> =
-
-        query_insts_for_room_calc(&[panel_refno], true).await.unwrap_or_default();
+    let mut panel_geom_insts: Vec<GeomInstQuery> = if options.query_from_cache_enabled() {
+        query_insts_for_room_calc(&[panel_refno], true)
+            .await
+            .unwrap_or_default()
+    } else {
+        aios_core::query_insts(&[panel_refno], true)
+            .await
+            .unwrap_or_default()
+    };
 
 
 
@@ -2591,7 +2721,10 @@ pub async fn cal_room_refnos_with_options(
 
     ))]
 
-    if panel_geom_insts.is_empty() && parse_env_bool("AIOS_ROOM_AUTOGEN_PANEL", true) {
+    if options.query_from_cache_enabled()
+        && panel_geom_insts.is_empty()
+        && parse_env_bool("AIOS_ROOM_AUTOGEN_PANEL", true)
+    {
 
         let db_opt = aios_core::get_db_option();
 
@@ -2661,13 +2794,16 @@ pub async fn cal_room_refnos_with_options(
 
     // 步骤 2：加载面板 TriMesh（用于点包含测试）；panel_aabb 优先从 inst_relate_aabb 获取，缺失则用 inst_info.world_aabb，再缺失则从 TriMesh 推导。
 
-    let mut panel_aabb: Option<Aabb> =
+    let mut panel_aabb: Option<Aabb> = if options.query_from_cache_enabled() {
         query_aabb_from_inst_relate_aabb(&[panel_refno])
             .await
             .ok()
-            .and_then(|m| m.into_values().next());
+            .and_then(|m| m.into_values().next())
+    } else {
+        None
+    };
 
-    if panel_aabb.is_none() {
+    if options.query_from_cache_enabled() && panel_aabb.is_none() {
         for geom_inst in &panel_geom_insts {
             let Some(ref world_aabb) = geom_inst.world_aabb else { continue };
             let geom_aabb: Aabb = world_aabb.clone().into();
@@ -2810,7 +2946,9 @@ pub async fn cal_room_refnos_with_options(
 
     // 自动确保 SQLite 空间索引已从 inst_relate_aabb 刷新（进程内至多一次）
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-    ensure_spatial_index_ready(None, None, false).await?;
+    if options.refresh_spatial_index_enabled() {
+        ensure_spatial_index_ready(None, None, false).await?;
+    }
 
     let coarse_start = Instant::now();
 
@@ -2892,7 +3030,7 @@ pub async fn cal_room_refnos_with_options(
 
             //
 
-            // 说明：当前房间计算的 DuckDB 空间索引链路依赖外部文件，容易因环境不齐导致失败；
+            // 说明：当前房间计算的空间索引链路依赖外部文件，容易因环境不齐导致失败；
 
             // 为保证 CLI 可用性，这里优先使用本仓库提供的 SQLite 空间索引（import-spatial-index 生成）。
 
@@ -2991,13 +3129,27 @@ pub async fn cal_room_refnos_with_options(
 
     let coarse_start = Instant::now();
 
-    let candidate_aabb_map = match query_aabb_from_inst_relate_aabb(&candidates).await {
+    let mut candidate_aabb_map = match query_aabb_from_inst_relate_aabb(&candidates).await {
         Ok(m) => m,
         Err(e) => {
             warn!("批量查询候选构件 AABB (inst_relate_aabb) 失败: error={}", e);
             HashMap::new()
         }
     };
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    {
+        if let Ok(idx) = SqliteSpatialIndex::with_default_path() {
+            for candidate_refno in &candidates {
+                if candidate_aabb_map.contains_key(candidate_refno) {
+                    continue;
+                }
+                if let Ok(Some(aabb)) = idx.get_aabb(candidate_refno.refno()) {
+                    candidate_aabb_map.insert(*candidate_refno, aabb);
+                }
+            }
+        }
+    }
 
     let missing_candidates: Vec<RefnoEnum> = candidates
         .iter()
@@ -3130,7 +3282,7 @@ async fn load_geometry_with_enhanced_cache(
 
         let cache_key = format!("{}_{}", geo_hash, lod_level);
 
-        
+
 
         // 1. 检查 TriMesh 缓存 (用于 GLB/GLTF 直接加载的结果)
 
@@ -3176,7 +3328,7 @@ async fn load_geometry_with_enhanced_cache(
 
         let lod_subdir = format!("lod_{}", lod_level);
 
-        
+
 
         // 3. 尝试加载 GLB/GLTF
 
@@ -3254,7 +3406,7 @@ fn load_tri_mesh_from_glb(path: &PathBuf) -> anyhow::Result<TriMesh> {
 
     let glb = gltf::Gltf::from_reader(reader)?;
 
-    
+
 
     let mut vertices = Vec::new();
 
@@ -3358,13 +3510,13 @@ fn transform_tri_mesh(mesh: &TriMesh, transform: Mat4) -> TriMesh {
 
         .collect();
 
-    
+
 
     // 索引不变
 
     let indices = mesh.indices().to_vec();
 
-    
+
 
     // 这里我们假设变换后的几何体仍然是有效的，如果构建失败则 panic (或者应该返回 Result)
 
@@ -3596,7 +3748,7 @@ fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
 
 /// 从 TriMesh 顶点采样关键点
 
-/// 
+///
 
 /// 判断关键点是否在面板 TriMesh 内
 
@@ -4102,7 +4254,7 @@ async fn estimate_memory_usage() -> f32 {
 
 
 
-#[cfg(not(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature"))))]
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
 
 async fn estimate_memory_usage() -> f32 {
 
@@ -4283,6 +4435,104 @@ mod tests {
         assert!(sql.contains("'CC' in NAME"));
 
         assert!(sql.contains(" or ")); // 多个关键词应有 or 连接
+
+    }
+
+
+
+    #[test]
+
+    fn test_spatial_index_scope_from_filters() {
+
+        assert_eq!(SpatialIndexScope::from_filters(None, None), SpatialIndexScope::Full);
+
+        assert_eq!(
+
+            SpatialIndexScope::from_filters(Some(&[1112, 1113]), None),
+
+            SpatialIndexScope::Scoped
+
+        );
+
+        assert_eq!(
+
+            SpatialIndexScope::from_filters(None, Some(RefnoEnum::from("1112/1"))),
+
+            SpatialIndexScope::Scoped
+
+        );
+
+    }
+
+
+
+    #[test]
+
+    fn test_build_delete_room_panel_relations_sql_targets_rooms() {
+        let room1 = RefnoEnum::from("1112/1");
+        let room2 = RefnoEnum::from("1112/2");
+
+        let sql = build_delete_room_panel_relations_sql(&[room1, room2])
+
+        .expect("sql");
+
+        assert!(sql.contains("LET $ids = SELECT VALUE id FROM room_panel_relate"));
+
+        assert!(sql.contains(&format!("out IN [{},{}]", room1.to_pe_key(), room2.to_pe_key())));
+
+        assert!(sql.contains("DELETE $ids;"));
+
+    }
+
+
+
+    #[test]
+
+    fn test_build_delete_room_relations_sql_for_panels_targets_panels() {
+        let panel1 = RefnoEnum::from("1112/10");
+        let panel2 = RefnoEnum::from("1112/11");
+
+        let sql = build_delete_room_relations_sql_for_panels(&[panel1, panel2])
+
+        .expect("sql");
+
+        assert!(sql.contains(&format!(
+            "LET $ids = SELECT VALUE id FROM [{},{}]->room_relate;",
+            panel1.to_pe_key(),
+            panel2.to_pe_key()
+        )));
+
+        assert!(sql.contains("DELETE $ids;"));
+
+    }
+
+
+
+    #[test]
+
+    fn test_build_room_panel_relations_sql_escapes_room_num() {
+        let room_refno = RefnoEnum::from("1112/1");
+        let panel1 = RefnoEnum::from("1112/10");
+        let panel2 = RefnoEnum::from("1112/11");
+
+        let sql = build_room_panel_relations_sql(&[(
+
+            room_refno,
+
+            "R'M-01".to_string(),
+
+            vec![panel1, panel2],
+
+        )]);
+
+        assert!(sql.contains(&format!(
+            "relate {}->room_panel_relate->[{},{}]",
+            room_refno.to_pe_key(),
+            panel1.to_pe_key(),
+            panel2.to_pe_key()
+        )));
+
+        assert!(sql.contains("room_num='R''M-01'"));
 
     }
 
@@ -4784,13 +5034,13 @@ mod tests {
 
         let metrics = CacheMetrics::new();
 
-        
+
 
         // 初始命中率为 0
 
         assert_eq!(metrics.hit_rate(), 0.0);
 
-        
+
 
         // 记录一些命中和未命中
 
@@ -4800,7 +5050,7 @@ mod tests {
 
         metrics.record_plant_miss();
 
-        
+
 
         // 2 命中 / 3 总计 = 0.666...
 
@@ -4818,7 +5068,7 @@ mod tests {
 
         let metrics = CacheMetrics::new();
 
-        
+
 
         metrics.record_plant_hit();
 
@@ -4828,11 +5078,11 @@ mod tests {
 
         metrics.record_trimesh_miss();
 
-        
+
 
         metrics.reset();
 
-        
+
 
         assert_eq!(metrics.plant_hits.load(Ordering::Relaxed), 0);
 
@@ -5076,7 +5326,7 @@ mod tests {
 
         };
 
-        
+
 
         // 测试序列化
 
@@ -5086,7 +5336,7 @@ mod tests {
 
         assert!(json.contains("\"total_panels\":50"));
 
-        
+
 
         // 测试反序列化
 
@@ -5124,13 +5374,13 @@ mod tests {
 
         };
 
-        
+
 
         let json = serde_json::to_string(&result).unwrap();
 
         assert!(json.contains("\"affected_rooms\":5"));
 
-        
+
 
         let deserialized: IncrementalUpdateResult = serde_json::from_str(&json).unwrap();
 
@@ -5732,7 +5982,7 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
 
     info!("开始重建房间关系 (指定房间，支持取消)");
 
-    
+
 
     if let Some(ref cb) = progress_callback {
 
@@ -5774,7 +6024,7 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
 
     }
 
-    let mut room_panel_map = build_room_panels_relate(&room_key_words).await?;
+    let mut room_panel_map = build_room_panels_relate_for_query(&room_key_words).await?;
 
 
 
@@ -5786,7 +6036,7 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
 
     info!("过滤后处理 {} 个房间", room_panel_map.len());
 
-    
+
 
     if room_panel_map.is_empty() {
 
@@ -5847,6 +6097,19 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
     ))]
 
     pregen_room_panels_into_model_cache(db_option, &room_panel_map).await?;
+
+    let panels_to_delete: Vec<PanelRoom> = room_panel_map
+        .iter()
+        .flat_map(|(_, room_num, panels)| {
+            panels.iter().map(move |panel| PanelRoom {
+                panel: *panel,
+                room_num: room_num.clone(),
+            })
+        })
+        .collect();
+
+    delete_room_relations_for_panels(&panels_to_delete).await?;
+    sync_room_panel_relations(&room_panel_map, false).await?;
 
 
 
@@ -6033,7 +6296,7 @@ pub async fn update_room_relations_incremental_original(
 
 
 
-    updated_elements = results.iter().sum();
+    updated_elements = results.iter().map(|outcome| outcome.components).sum();
 
 
 
@@ -6139,7 +6402,22 @@ async fn query_panels_containing_refnos(
 
 /// 删除指定面板的房间关系
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "sqlite-index"
+))]
+
+async fn delete_all_room_relations() -> anyhow::Result<()> {
+    model_primary_db()
+        .query("DELETE room_relate;\nDELETE room_panel_relate;")
+        .await?;
+    Ok(())
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "sqlite-index"
+))]
 
 async fn delete_room_relations_for_panels(panels: &[PanelRoom]) -> anyhow::Result<()> {
 
@@ -6151,19 +6429,11 @@ async fn delete_room_relations_for_panels(panels: &[PanelRoom]) -> anyhow::Resul
 
 
 
-    let panel_keys: Vec<String> = panels.iter().map(|p| p.panel.to_pe_key()).collect();
+    let panel_refnos: Vec<RefnoEnum> = panels.iter().map(|p| p.panel).collect();
 
-    let panel_list = panel_keys.join(",");
-
-
-
-    let sql = format!(
-        "LET $ids = SELECT VALUE id FROM [{panel_list}]->room_relate;\nDELETE $ids;"
-    );
-
-
-
-    model_primary_db().query(sql).await?;
+    if let Some(sql) = build_delete_room_relations_sql_for_panels(&panel_refnos) {
+        model_primary_db().query(sql).await?;
+    }
 
     debug!("已删除 {} 个面板的房间关系", panels.len());
 
@@ -6365,7 +6635,7 @@ pub async fn rebuild_room_relations_for_rooms(
 
     // 1. 查询房间面板关系
 
-    let mut room_panel_map = build_room_panels_relate(&room_key_words).await?;
+    let mut room_panel_map = build_room_panels_relate_for_query(&room_key_words).await?;
 
 
 
@@ -6420,33 +6690,6 @@ pub async fn rebuild_room_relations_for_rooms(
         .collect();
 
 
-
-    // 3. 删除旧关系
-
-    let panels_to_delete: Vec<PanelRoom> = room_panel_map
-
-        .iter()
-
-        .flat_map(|(_, room_num, panels)| {
-
-            panels.iter().map(move |p| PanelRoom {
-
-                panel: *p,
-
-                room_num: room_num.clone(),
-
-            })
-
-        })
-
-        .collect();
-
-    delete_room_relations_for_panels(&panels_to_delete).await?;
-
-    info!("已删除 {} 个面板的旧关系", panels_to_delete.len());
-
-
-
     CACHE_METRICS.reset();
 
 
@@ -6462,6 +6705,19 @@ pub async fn rebuild_room_relations_for_rooms(
     ))]
 
     pregen_room_panels_into_model_cache(db_option, &room_panel_map).await?;
+
+    let panels_to_delete: Vec<PanelRoom> = room_panel_map
+        .iter()
+        .flat_map(|(_, room_num, panels)| {
+            panels.iter().map(move |panel| PanelRoom {
+                panel: *panel,
+                room_num: room_num.clone(),
+            })
+        })
+        .collect();
+
+    delete_room_relations_for_panels(&panels_to_delete).await?;
+    sync_room_panel_relations(&room_panel_map, false).await?;
 
 
 

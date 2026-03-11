@@ -33,8 +33,6 @@ use crate::options::{BooleanPipelineMode, DbOptionExt, MeshFormat};
 #[cfg(feature = "parquet-export")]
 use crate::fast_model::export_model::ParquetStreamWriter;
 
-#[cfg(feature = "duckdb-feature")]
-use crate::fast_model::export_model::{DuckDBStreamWriter, DuckDBWriteMode};
 use super::config::IndexTreeConfig;
 use super::errors::{IndexTreeError, Result};
 use super::cache_miss_report;
@@ -627,30 +625,10 @@ async fn process_index_tree_generation(
     #[cfg(not(feature = "parquet-export"))]
     let parquet_writer: Option<std::sync::Arc<()>> = None;
 
-    #[cfg(feature = "duckdb-feature")]
-    let duckdb_writer: Option<std::sync::Arc<DuckDBStreamWriter>> = None;
-    /*
-
-    #[cfg(feature = "duckdb-feature")]
-    let duckdb_writer = {
-        let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
-        let parquet_dir = std::path::Path::new(output_dir).parent().unwrap_or(std::path::Path::new("output"));
-        let duckdb_dir = parquet_dir.join("database_models/_global");
-        match DuckDBStreamWriter::new(&duckdb_dir, DuckDBWriteMode::Rebuild) {
-            Ok(writer) => Some(std::sync::Arc::new(writer)),
-            Err(e) => {
-                eprintln!("[DuckDB] 初始化写入器失败: {}, 跳过 DuckDB 导出", e);
-                None
-            }
-        }
-
-    };
-    */
+    // 
     #[allow(unused_variables)]
     let parquet_writer_clone = parquet_writer.clone();
 
-    #[cfg(feature = "duckdb-feature")]
-    let duckdb_writer_clone = duckdb_writer.clone();
 
     // model cache-only 已移除（foyer-cache-cleanup）
     let model_cache_ctx: Option<()> = None;
@@ -682,8 +660,6 @@ async fn process_index_tree_generation(
         let mut t_cache = std::time::Duration::ZERO;
         let mut t_parquet = std::time::Duration::ZERO;
 
-        #[cfg(feature = "duckdb-feature")]
-        let mut t_duckdb = std::time::Duration::ZERO;
 
         // SurrealDB 写入后台任务句柄：不阻塞 cache 写入和后续 batch 接收
         let mut db_write_handles: Vec<tokio::task::JoinHandle<bool>> = Vec::new();
@@ -739,15 +715,7 @@ async fn process_index_tree_generation(
             // [foyer-removal] parquet_writer 已移除，跳过 write_batch
             let _ = &parquet_writer_clone;
 
-            #[cfg(feature = "duckdb-feature")]
-            if let Some(ref writer) = duckdb_writer_clone {
-                let t0 = Instant::now();
-                if let Err(e) = writer.write_batch(&shape_insts_arc) {
-                    eprintln!("[DuckDB] 写入批次失败: {}", e);
-                }
-
-                t_duckdb += t0.elapsed();
-            }
+            // 
 
             // Mesh 内联生成：先生成 mesh，再将结果合并到 inst_geo INSERT 中
             let (mesh_results, batch_mesh_ms): (HashMap<u64, MeshResult>, u128) = if gen_mesh {
@@ -928,8 +896,6 @@ async fn process_index_tree_generation(
                 "instance_sink finished"
             );
 
-            #[cfg(feature = "duckdb-feature")]
-            tracing::info!(duckdb_ms = t_duckdb.as_millis() as u64, "instance_sink duckdb finished");
         }
 
         ensure_no_db_write_failures(db_write_failures)?;
@@ -1321,7 +1287,7 @@ async fn process_index_tree_generation(
 // ============================================================================
 
 #[cfg(feature = "sqlite-index")]
-async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums: &[u32]) -> Result<()> {
+pub async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums: &[u32]) -> Result<()> {
     use crate::spatial_index::SqliteSpatialIndex;
     use crate::sqlite_index::{ImportConfig, SqliteAabbIndex};
     use std::fs;
@@ -1394,24 +1360,12 @@ async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums:
 }
 
 #[cfg(not(feature = "sqlite-index"))]
-async fn update_sqlite_spatial_index_from_cache(_db_option: &DbOptionExt, _dbnums: &[u32]) -> Result<()> {
+pub async fn update_sqlite_spatial_index_from_cache(_db_option: &DbOptionExt, _dbnums: &[u32]) -> Result<()> {
     Ok(())
 }
 
-/// 初始化空间索引（如果启用）
-#[cfg(feature = "duckdb-feature")]
 fn initialize_spatial_index() {
-    // if SqliteSpatialIndex::is_enabled() {
-    //     match SqliteSpatialIndex::with_default_path() {
-    //         Ok(_index) => println!("SQLite spatial index initialized"),
-    //         Err(e) => eprintln!("Failed to initialize SQLite spatial index: {}", e),
-    //     }
-    // }
-}
-
-#[cfg(not(feature = "duckdb-feature"))]
-fn initialize_spatial_index() {
-    // No-op when feature is disabled
+    // No-op placeholder
 }
 
 #[cfg(test)]

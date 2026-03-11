@@ -1,0 +1,148 @@
+name: Multi-Platform Build
+
+on:
+  push:
+    branches: [ "ci-multi-platform-build", "main", "master" ]
+    tags: [ "v*.*.*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTC_WRAPPER: ""
+
+jobs:
+  build:
+    name: Build - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact_name: linux-x64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: macos-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: windows-x64
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure git for private repos
+        run: |
+          git config --global url."https://${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
+        shell: bash
+      
+      - name: Setup git credentials
+        run: |
+          echo '#!/bin/bash' > /tmp/git-askpass.sh
+          echo 'echo "${{ secrets.GH_PAT }}"' >> /tmp/git-askpass.sh
+          chmod +x /tmp/git-askpass.sh
+        shell: bash
+      
+      - name: Configure Cargo to use git CLI
+        run: |
+          mkdir -p ~/.cargo
+          echo "[net]" >> ~/.cargo/config.toml
+          echo "git-fetch-with-cli = true" >> ~/.cargo/config.toml
+        shell: bash
+      
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+      
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "multi-platform-${{ matrix.artifact_name }}"
+          cache-on-failure: true
+      
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev build-essential
+      
+      - name: Setup Windows build environment
+        if: runner.os == 'Windows'
+        uses: microsoft/setup-msbuild@v2
+      
+      - name: Build web_server (standard)
+        if: matrix.artifact_name != 'linux-x64'
+        run: |
+          cargo build --release --bin web_server --target ${{ matrix.target }} --no-default-features --features ws,sqlite-index,surreal-save,web_server
+        shell: bash
+        env:
+          GIT_ASKPASS: /tmp/git-askpass.sh
+          GIT_TERMINAL_PROMPT: 0
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+      
+      - name: Build web_server (Linux deploy-ready)
+        if: matrix.artifact_name == 'linux-x64'
+        run: |
+          cargo build --release --bin web_server --target ${{ matrix.target }} --no-default-features --features ws,gen_model,manifold,project_hd,surreal-save,sqlite-index,web_server,parquet-export
+        shell: bash
+        env:
+          GIT_ASKPASS: /tmp/git-askpass.sh
+          GIT_TERMINAL_PROMPT: 0
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+      
+      - name: Build library
+        run: |
+          cargo build --release --lib --target ${{ matrix.target }} --no-default-features --features ws,sqlite-index,surreal-save,web_server
+        shell: bash
+        env:
+          GIT_ASKPASS: /tmp/git-askpass.sh
+          GIT_TERMINAL_PROMPT: 0
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+      
+      - name: Package artifacts
+        run: |
+          mkdir -p release-package
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/${{ matrix.target }}/release/web_server.exe release-package/
+            cp target/${{ matrix.target }}/release/aios_database.dll release-package/ 2>/dev/null || true
+          else
+            cp target/${{ matrix.target }}/release/web_server release-package/
+            cp target/${{ matrix.target }}/release/libaios_database.* release-package/ 2>/dev/null || true
+          fi
+          echo "Build Date: $(date '+%Y-%m-%d %H:%M:%S')" > release-package/BUILD_INFO.txt
+          echo "Commit: ${{ github.sha }}" >> release-package/BUILD_INFO.txt
+          echo "Branch: ${{ github.ref_name }}" >> release-package/BUILD_INFO.txt
+          echo "Target: ${{ matrix.target }}" >> release-package/BUILD_INFO.txt
+          if [ "${{ matrix.artifact_name }}" = "linux-x64" ]; then
+            echo "Features: ws,gen_model,manifold,project_hd,surreal-save,sqlite-index,web_server,parquet-export" >> release-package/BUILD_INFO.txt
+            echo "Deploy-Ready: true" >> release-package/BUILD_INFO.txt
+          else
+            echo "Features: ws,sqlite-index,surreal-save,web_server" >> release-package/BUILD_INFO.txt
+            echo "Deploy-Ready: false" >> release-package/BUILD_INFO.txt
+          fi
+        shell: bash
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-release
+          path: release-package/*
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-package/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1462,6 +1462,17 @@ async fn finalize_task_failed(state: &RoomApiState, task_id: &str, error_message
     }
 }
 
+fn build_rebuild_relations_worker_task_type(
+    room_numbers: Option<Vec<String>>,
+) -> WorkerRoomTaskType {
+    match room_numbers {
+        Some(room_numbers) if !room_numbers.is_empty() => {
+            WorkerRoomTaskType::RebuildByRoomNumbers(room_numbers)
+        }
+        _ => WorkerRoomTaskType::RebuildAll,
+    }
+}
+
 /// 只重建房间关系（不生成模型）API
 pub async fn rebuild_room_relations_only(
     State(state): State<RoomApiState>,
@@ -1520,7 +1531,7 @@ pub async fn rebuild_room_relations_only(
     let db_option = aios_core::get_db_option();
     let worker_task = RoomWorkerTask::new(
         task_id.clone(),
-        WorkerRoomTaskType::RebuildAll,
+        build_rebuild_relations_worker_task_type(request.room_numbers.clone()),
         db_option.clone(),
     );
     state.room_worker.submit_task(worker_task).await;
@@ -1665,6 +1676,31 @@ pub async fn get_worker_status(
         "queue_len": queue_len,
         "is_busy": active_count > 0,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_rebuild_relations_worker_task_type_prefers_selected_rooms() {
+        let task_type = build_rebuild_relations_worker_task_type(Some(vec![
+            "R101".to_string(),
+            "R102".to_string(),
+        ]));
+
+        match task_type {
+            WorkerRoomTaskType::RebuildByRoomNumbers(room_numbers) => {
+                assert_eq!(room_numbers, vec!["R101".to_string(), "R102".to_string()]);
+            }
+            other => panic!("expected RebuildByRoomNumbers, got {other:?}"),
+        }
+
+        assert!(matches!(
+            build_rebuild_relations_worker_task_type(None),
+            WorkerRoomTaskType::RebuildAll
+        ));
+    }
 }
 
 /// 同步执行房间计算（直接执行，等待完成后返回结果）

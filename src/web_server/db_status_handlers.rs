@@ -248,8 +248,8 @@ async fn convert_row_to_status(row: serde_json::Value) -> Option<DbStatusInfo> {
     };
 
     // 基于本地 redb 与当前文件 sesno 判断
-    // SESSION_STORE removed - now using DuckDB
-    let cached_sesno = 0u32;  // TODO: Replace with DuckDB query
+    // SESSION_STORE removed
+    let cached_sesno = 0u32;
     let latest_file_sesno = get_latest_sesno_from_file(&project, dbnum).unwrap_or(sesno);
     let needs_update = cached_sesno < latest_file_sesno;
 
@@ -395,8 +395,8 @@ pub async fn scan_local_files() -> Result<Json<serde_json::Value>, StatusCode> {
         let dbnum = row["dbnum"].as_u64().unwrap_or(0) as u32;
         let project = row["project"].as_str().unwrap_or("").to_string();
         let surreal_sesno = row["sesno"].as_u64().unwrap_or(0) as u32;
-        // SESSION_STORE removed - now using DuckDB
-        let cached_sesno = 0u32;  // TODO: Replace with DuckDB query
+        // SESSION_STORE removed
+        let cached_sesno = 0u32;
         let file_sesno = get_latest_sesno_from_file(&project, dbnum).unwrap_or(0);
         let needs_update = cached_sesno < file_sesno;
 
@@ -485,7 +485,7 @@ pub async fn rescan_and_cache(
         }
         let project = row["project"].as_str().unwrap_or("");
         if let Some(_file_sesno) = get_latest_sesno_from_file(project, dbnum) {
-            // SESSION_STORE removed - not available without sqlite-index feature
+            // SESSION_STORE removed
             // Skipping cache update
             updated += 1;
         }

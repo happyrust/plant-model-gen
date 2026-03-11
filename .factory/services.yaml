@@ -1,0 +1,23 @@
+commands:
+  backend_test: cargo test --features web_server web_api::review_api::tests:: -- --nocapture && cargo test --features web_server web_api::jwt_auth::tests:: -- --nocapture && cargo test --features web_server web_server::room_api::tests:: -- --nocapture && cargo test --features web_server web_server::sqlite_spatial_api::tests:: -- --nocapture
+  backend_typecheck: cargo check --tests --lib --bins --features web_server
+  frontend_install: npm install --prefix /Volumes/DPC/work/plant-code/plant3d-web
+  frontend_test: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web test
+  frontend_typecheck: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web run type-check
+  frontend_lint: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web run lint
+  e2e: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web run test:e2e
+
+services:
+  backend:
+    start: DB_OPTION_FILE=db_options/DbOption-mac WEB_SERVER_PORT=3100 cargo run --bin web_server --features web_server
+    stop: lsof -ti :3100 | xargs kill
+    healthcheck: curl -sf http://127.0.0.1:3100/api/health
+    port: 3100
+    depends_on: []
+
+  frontend:
+    start: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web run dev -- --host 127.0.0.1 --port 3101 --strictPort
+    stop: lsof -ti :3101 | xargs kill
+    healthcheck: curl -sf http://127.0.0.1:3101
+    port: 3101
+    depends_on: [backend]

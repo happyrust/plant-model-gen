@@ -28,9 +28,9 @@ use crate::fast_model::gen_all_geos_data;
 
 
 
-// build_room_relations 支持 CLI/web_server + (sqlite-index 或 duckdb-feature)
+// build_room_relations 支持 CLI/web_server + sqlite-index
 
-#[cfg(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature")))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
 use crate::fast_model::room_model::build_room_relations;
 
@@ -38,7 +38,7 @@ use crate::fast_model::room_model::build_room_relations;
 
 // 当条件不满足时提供 stub
 
-#[cfg(not(all(not(target_arch = "wasm32"), any(feature = "sqlite-index", feature = "duckdb-feature"))))]
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
 
 pub async fn build_room_relations(
 
@@ -50,7 +50,7 @@ pub async fn build_room_relations(
 
 ) -> anyhow::Result<()> {
 
-    log::info!("⚠️ build_room_relations 功能需要 (sqlite-index 或 duckdb-feature) 特性");
+    log::info!("⚠️ build_room_relations 功能需要 sqlite-index 特性");
 
     Ok(())
 

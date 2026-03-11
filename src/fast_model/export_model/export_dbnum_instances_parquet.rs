@@ -1,7 +1,7 @@
 //! dbnum 级实例导出 Parquet
 //!
 //! 从 SurrealDB 读取 inst_relate / geo_relate / tubi_relate / trans / aabb 数据，
-//! 生成多表 Parquet 文件组，供前端 DuckDB (含 duckdb-wasm) 直接查询。
+//! 生成多表 Parquet 文件组，供前端直接查询。
 //!
 //! 输出表（按 dbnum 分目录，文件名固定）：
 //! - `instances.parquet`     — 一行一个实例 refno

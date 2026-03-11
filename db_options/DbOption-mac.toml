@@ -50,7 +50,7 @@ index_tree_batch_size = 200
 # 可选值: "cate", "loop", "prim" 或具体 noun 名称如 "BRAN", "PANE"
 # 空 vec 表示启用所有类别（默认行为）
 # 房间相关类型: FRMW(框架), SBFR(子框架), PANE(面板)
-index_tree_enabled_target_types = ["PANE", "BRAN", "HANG"]
+# index_tree_enabled_target_types = ["PANE", "BRAN", "HANG"]
 
 # 排除的 noun 列表
 # 即使类别启用，这里的 noun 也会被过滤掉
@@ -278,9 +278,9 @@ debug_project_id = "debug-project"
 debug_user_id = "debug-user"
 debug_role = "sj"
 
-# Web Server 配置
+# Web Server 配置（3100 与 plant3d-web Vite 代理一致）
 [web_server]
-port = 8080
+port = 3100
 auto_start_surreal = true
 surreal_bin = "surreal"
 surreal_data_path = "/Volumes/DPC/work/db-data/ams-8020.db"

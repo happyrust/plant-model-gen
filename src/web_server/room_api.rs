@@ -1,10 +1,10 @@
 use anyhow::Result;
 use axum::{
-    Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
     routing::{get, post, put},
+    Router,
 };
 use chrono::{DateTime, Utc};
 use glam::Vec3;
@@ -16,22 +16,21 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use aios_core::{
-    RefnoEnum,
     room::{
         data_model::{RoomCode, RoomRelationType},
-        monitoring::{RoomSystemMetrics, get_global_monitor},
+        monitoring::{get_global_monitor, RoomSystemMetrics},
         // query_room_panels_by_keywords,  // Removed: not available in aios_core::room
-        room_system_manager::{RoomSystemManager, SystemOperationResult, get_global_manager},
+        room_system_manager::{get_global_manager, RoomSystemManager, SystemOperationResult},
     },
+    RefnoEnum,
 };
 
+use crate::fast_model::{
+    room_model::build_room_panels_relate_for_query, RoomTaskType as WorkerRoomTaskType, RoomWorker,
+    RoomWorkerConfig, RoomWorkerTask, RoomWorkerTaskStatus,
+};
 use crate::shared::{
     ProgressHub, ProgressMessage, ProgressMessageBuilder, TaskStatus as HubTaskStatus,
-};
-use crate::fast_model::{
-    RoomWorker, RoomWorkerConfig, RoomWorkerTask, RoomTaskType as WorkerRoomTaskType,
-    RoomWorkerTaskStatus,
-    room_model::build_room_panels_relate_for_query,
 };
 
 /// 房间计算 API 状态
@@ -1255,14 +1254,13 @@ pub async fn regenerate_room_models(
             .insert(task_id.clone(), task.clone());
     }
 
-    // 提交到 Worker
-    let db_option = aios_core::get_db_option();
-    let worker_task = RoomWorkerTask::new(
-        task_id.clone(),
-        WorkerRoomTaskType::RebuildAll,
-        db_option.clone(),
-    );
-    state.room_worker.submit_task(worker_task).await;
+    // 异步执行房间模型重新生成（包含模型生成 + 关系重建）
+    let state_clone = state.clone();
+    let request_clone = request.clone();
+    let task_id_clone = task_id.clone();
+    tokio::spawn(async move {
+        execute_room_regenerate(state_clone, task_id_clone, request_clone).await;
+    });
 
     Ok(Json(crate::web_server::models::RoomRegenerateResponse {
         success: true,
@@ -1281,7 +1279,7 @@ async fn execute_room_regenerate(
     request: crate::web_server::models::RoomRegenerateRequest,
 ) {
     use crate::fast_model::gen_model::gen_all_geos_data;
-    use crate::fast_model::build_room_relations;
+    use crate::fast_model::room_model::build_room_relations_with_overrides;
     use crate::options::get_db_option_ext;
 
     info!("📋 开始执行房间模型重新生成任务: {}", task_id);
@@ -1345,9 +1343,11 @@ async fn execute_room_regenerate(
 
     // 阶段 2: 生成模型（gen_all_geos_data 会自动跳过已生成的模型）
     update_status(30.0, format!("正在生成 {} 个面板的模型...", element_count));
-    
+
     if request.force_regenerate {
-        unsafe { std::env::set_var("FORCE_REPLACE_MESH", "true"); }
+        unsafe {
+            std::env::set_var("FORCE_REPLACE_MESH", "true");
+        }
     }
 
     let mut db_option_clone = db_option_ext.clone();
@@ -1364,7 +1364,9 @@ async fn execute_room_regenerate(
         }
         Err(e) => {
             error!("❌ 模型生成失败: {}", e);
-            unsafe { std::env::remove_var("FORCE_REPLACE_MESH"); }
+            unsafe {
+                std::env::remove_var("FORCE_REPLACE_MESH");
+            }
             finalize_task_failed(&state, &task_id, format!("模型生成失败: {}", e)).await;
             return;
         }
@@ -1378,7 +1380,16 @@ async fn execute_room_regenerate(
     update_status(80.0, "正在更新房间关系...".to_string());
 
     let start_time = std::time::Instant::now();
-    match build_room_relations(&db_option_ext, None, None).await {
+    let db_nums = [request.db_num];
+    match build_room_relations_with_overrides(
+        &db_option_ext,
+        Some(&db_nums),
+        None,
+        Some(room_keywords.as_slice()),
+        request.force_regenerate,
+    )
+    .await
+    {
         Ok(_) => {
             let duration = start_time.elapsed();
             info!("✅ 房间关系更新完成，耗时 {:?}", duration);
@@ -1667,10 +1678,10 @@ pub async fn get_worker_status(
     State(state): State<RoomApiState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use serde_json::json;
-    
+
     let active_count = state.room_worker.active_count();
     let queue_len = state.room_worker.queue_len().await;
-    
+
     Ok(Json(json!({
         "active_tasks": active_count,
         "queue_len": queue_len,
@@ -1719,7 +1730,7 @@ mod tests {
 pub async fn compute_room_relations_sync(
     Json(request): Json<crate::web_server::models::RoomComputeSyncRequest>,
 ) -> Result<Json<crate::web_server::models::RoomComputeSyncResponse>, StatusCode> {
-    use crate::fast_model::build_room_relations;
+    use crate::fast_model::room_model::build_room_relations_with_overrides;
 
     info!("🏠 收到同步房间计算请求");
     if let Some(ref kws) = request.room_keywords {
@@ -1733,20 +1744,24 @@ pub async fn compute_room_relations_sync(
     let db_option = aios_core::get_db_option();
 
     // 执行房间关系构建
-    match build_room_relations(&db_option, request.db_nums.as_deref(), None).await {
+    match build_room_relations_with_overrides(
+        &db_option,
+        request.db_nums.as_deref(),
+        None,
+        request.room_keywords.as_deref(),
+        request.force_rebuild,
+    )
+    .await
+    {
         Ok(stats) => {
             info!(
                 "✅ 房间计算完成: {} 房间, {} 面板, {} 构件, 耗时 {}ms",
-                stats.total_rooms, stats.total_panels,
-                stats.total_components, stats.build_time_ms
+                stats.total_rooms, stats.total_panels, stats.total_components, stats.build_time_ms
             );
 
             Ok(Json(crate::web_server::models::RoomComputeSyncResponse {
                 success: true,
-                message: format!(
-                    "房间计算完成，处理了 {} 个房间",
-                    stats.total_rooms
-                ),
+                message: format!("房间计算完成，处理了 {} 个房间", stats.total_rooms),
                 total_rooms: stats.total_rooms,
                 total_panels: stats.total_panels,
                 total_components: stats.total_components,

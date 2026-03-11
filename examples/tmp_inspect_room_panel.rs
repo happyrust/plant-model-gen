@@ -1,7 +1,7 @@
-use anyhow::Result;
-use aios_core::{init_surreal, query_insts, RefnoEnum};
+use aios_core::{RefnoEnum, init_surreal, query_insts};
 use aios_database::options::get_db_option_ext_from_path;
 use aios_database::spatial_index::SqliteSpatialIndex;
+use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,10 +24,7 @@ async fn main() -> Result<()> {
         for inst in row.insts.iter().take(5) {
             println!(
                 "  inst geo_hash={} unit_flag={} is_tubi={} geo_transform={:?}",
-                inst.geo_hash,
-                inst.unit_flag,
-                inst.is_tubi,
-                inst.geo_transform
+                inst.geo_hash, inst.unit_flag, inst.is_tubi, inst.geo_transform
             );
         }
     }

@@ -1,10 +1,10 @@
-use aios_core::{RefnoEnum, RefU64, project_primary_db, SurrealQueryExt};
+use aios_core::{project_primary_db, RefU64, RefnoEnum, SurrealQueryExt};
 use axum::{
-    Router,
     extract::{Path, State},
     http::StatusCode,
     response::Json,
     routing::get,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -88,10 +88,7 @@ async fn query_spatial_node(
     // 查询节点信息（使用 pe_key 点查，避免全表扫描）
     let parent_refno_enum = RefnoEnum::from(RefU64(refno));
     let pe_key = parent_refno_enum.to_pe_key();
-    let node_query = format!(
-        "SELECT refno, name, noun FROM {} LIMIT 1",
-        pe_key
-    );
+    let node_query = format!("SELECT refno, name, noun FROM {} LIMIT 1", pe_key);
 
     match project_primary_db()
         .query_take::<Vec<PeRow>>(&node_query, 0)
@@ -108,14 +105,8 @@ async fn query_spatial_node(
             }
 
             let record = &records[0];
-            let name = record
-                .name
-                .clone()
-                .unwrap_or_else(|| "Unknown".to_string());
-            let noun = record
-                .noun
-                .clone()
-                .unwrap_or_else(|| "UNKNOWN".to_string());
+            let name = record.name.clone().unwrap_or_else(|| "Unknown".to_string());
+            let noun = record.noun.clone().unwrap_or_else(|| "UNKNOWN".to_string());
 
             // 判断节点类型
             let node_type = determine_node_type(&noun);
@@ -201,22 +192,16 @@ async fn get_node_info(
 
     // 使用 pe_key 点查，避免全表扫描
     let pe_key = RefnoEnum::from(RefU64(refno)).to_pe_key();
-    let query = format!(
-        "SELECT refno, name, noun, owner FROM {} LIMIT 1",
-        pe_key
-    );
+    let query = format!("SELECT refno, name, noun, owner FROM {} LIMIT 1", pe_key);
 
-    match project_primary_db().query_take::<Vec<PeRow>>(&query, 0).await {
+    match project_primary_db()
+        .query_take::<Vec<PeRow>>(&query, 0)
+        .await
+    {
         Ok(records) => {
             if let Some(record) = records.first() {
-                let name = record
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| "Unknown".to_string());
-                let noun = record
-                    .noun
-                    .clone()
-                    .unwrap_or_else(|| "UNKNOWN".to_string());
+                let name = record.name.clone().unwrap_or_else(|| "Unknown".to_string());
+                let noun = record.noun.clone().unwrap_or_else(|| "UNKNOWN".to_string());
                 let owner = record.owner;
 
                 let node_type = determine_node_type(&noun);
@@ -264,6 +249,22 @@ pub(crate) fn determine_node_type(noun: &str) -> String {
     }
 }
 
+fn build_relation_children_query(parent_noun: &str, parent_pe_key: &str) -> Option<String> {
+    match parent_noun {
+        "FRMW" | "SBFR" => Some(format!(
+            "SELECT refno: in.refno, name: in.name, noun: in.noun \
+             FROM room_panel_relate WHERE out = {} LIMIT 100",
+            parent_pe_key
+        )),
+        "PANE" => Some(format!(
+            "SELECT refno: in.refno, name: in.name, noun: in.noun \
+             FROM room_relate WHERE out = {} LIMIT 100",
+            parent_pe_key
+        )),
+        _ => None,
+    }
+}
+
 /// 根据父节点类型查询子节点
 async fn query_children_by_type(
     parent_noun: &str,
@@ -272,28 +273,12 @@ async fn query_children_by_type(
     let parent_noun = parent_noun.trim().to_uppercase();
 
     let parent_pe_key = RefnoEnum::from(RefU64(parent_refno)).to_pe_key();
-    let query = match parent_noun.as_str() {
-        // Space -> Room：room_panel_relate 使用 in/out（in=空间, out=面板），图遍历获取子节点
-        "FRMW" | "SBFR" => {
-            format!(
-                "SELECT refno: out.refno, name: out.name, noun: out.noun \
-                 FROM {}->room_panel_relate LIMIT 100",
-                parent_pe_key
-            )
-        }
-        // Room -> Component：room_relate 使用 in/out（in=面板, out=构件），图遍历获取子节点
-        "PANE" => {
-            format!(
-                "SELECT refno: out.refno, name: out.name, noun: out.noun \
-                 FROM {}->room_relate LIMIT 100",
-                parent_pe_key
-            )
-        }
+    let query = match build_relation_children_query(parent_noun.as_str(), &parent_pe_key) {
+        Some(query) => query,
         // 其他类型 -> 直接子节点：pe_owner 层级关系改走 TreeIndex。
-        _ => {
+        None => {
             let parent_refno_enum = RefnoEnum::from(RefU64(parent_refno));
-            let dbnum = TreeIndexManager::resolve_dbnum_for_refno(parent_refno_enum)
-                .ok();
+            let dbnum = TreeIndexManager::resolve_dbnum_for_refno(parent_refno_enum).ok();
             let Some(dbnum) = dbnum else {
                 return Ok(Vec::new());
             };
@@ -310,10 +295,7 @@ async fn query_children_by_type(
                 .map(|r| r.to_pe_key())
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!(
-                "SELECT refno, name, noun FROM [{}] LIMIT 100",
-                ids
-            )
+            format!("SELECT refno, name, noun FROM [{}] LIMIT 100", ids)
         }
     };
 
@@ -337,4 +319,22 @@ async fn query_children_by_type(
         .collect();
 
     Ok(children)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_relation_children_query_uses_relation_targets_as_children() {
+        let space_sql = build_relation_children_query("FRMW", "pe:1").unwrap();
+        assert!(space_sql.contains("SELECT refno: in.refno"));
+        assert!(space_sql.contains("FROM room_panel_relate WHERE out = pe:1"));
+
+        let room_sql = build_relation_children_query("PANE", "pe:2").unwrap();
+        assert!(room_sql.contains("SELECT refno: in.refno"));
+        assert!(room_sql.contains("FROM room_relate WHERE out = pe:2"));
+
+        assert!(build_relation_children_query("PIPE", "pe:3").is_none());
+    }
 }

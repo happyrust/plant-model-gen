@@ -25,6 +25,7 @@ FRONTEND_PROJECT_DIR="/Volumes/DPC/work/plant-code/plant3d-web"
 REMOTE_HOST="${REMOTE_HOST:-123.57.182.243}"
 REMOTE_USER="${REMOTE_USER:-root}"
 REMOTE_PASS="${REMOTE_PASS:-Happytest123_}"
+BACKEND_ORIGIN="${BACKEND_ORIGIN:-http://127.0.0.1:3100}"
 
 # Backend deployment options
 BINARY_SOURCE="${BINARY_SOURCE:-local}"
@@ -71,15 +72,15 @@ REMOTE_HOST="$REMOTE_HOST" \
   "$BACKEND_SCRIPT"
 
 log "Deploying frontend"
-REMOTE_HOST="$REMOTE_HOST" REMOTE_USER="$REMOTE_USER" REMOTE_PASS="$REMOTE_PASS" \
+REMOTE_HOST="$REMOTE_HOST" REMOTE_USER="$REMOTE_USER" REMOTE_PASS="$REMOTE_PASS" BACKEND_ORIGIN="$BACKEND_ORIGIN" \
   "$FRONTEND_SCRIPT"
 
 log "Verifying remote health"
 sshpass -p "$REMOTE_PASS" ssh "${SSH_OPTS[@]}" "$REMOTE_USER@$REMOTE_HOST" "set -e; \
   systemctl is-active web-server; \
   systemctl is-active nginx; \
-  curl -fsS http://127.0.0.1:8080/ >/dev/null; \
-  curl -fsS http://127.0.0.1:8080/api/projects >/dev/null"
+  curl -fsS ${BACKEND_ORIGIN%/}/ >/dev/null; \
+  curl -fsS ${BACKEND_ORIGIN%/}/api/projects >/dev/null"
 
 curl -fsS "http://$REMOTE_HOST/" >/dev/null
 curl -fsS "http://$REMOTE_HOST/api/projects" >/dev/null

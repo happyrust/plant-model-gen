@@ -1368,7 +1368,7 @@ pub struct User {
     pub avatar: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UserListResponse {
     pub success: bool,
     pub users: Vec<User>,
@@ -1376,7 +1376,7 @@ pub struct UserListResponse {
     pub error_message: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UserResponse {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1391,42 +1391,104 @@ pub struct UserListQuery {
     pub status: Option<String>,
 }
 
+fn build_mock_review_users() -> Vec<User> {
+    vec![
+        User {
+            id: "designer_001".to_string(),
+            username: "designer".to_string(),
+            name: "王设计师".to_string(),
+            email: "designer@company.com".to_string(),
+            role: "designer".to_string(),
+            department: Some("设计部".to_string()),
+            avatar: None,
+        },
+        User {
+            id: "proofreader_001".to_string(),
+            username: "proofreader".to_string(),
+            name: "张校对员".to_string(),
+            email: "proofreader@company.com".to_string(),
+            role: "proofreader".to_string(),
+            department: Some("质量部".to_string()),
+            avatar: None,
+        },
+        User {
+            id: "reviewer_001".to_string(),
+            username: "reviewer".to_string(),
+            name: "李审核员".to_string(),
+            email: "reviewer@company.com".to_string(),
+            role: "reviewer".to_string(),
+            department: Some("技术部".to_string()),
+            avatar: None,
+        },
+        User {
+            id: "manager_001".to_string(),
+            username: "manager".to_string(),
+            name: "陈经理".to_string(),
+            email: "manager@company.com".to_string(),
+            role: "manager".to_string(),
+            department: Some("工程部".to_string()),
+            avatar: None,
+        },
+        User {
+            id: "admin_001".to_string(),
+            username: "admin".to_string(),
+            name: "系统管理员".to_string(),
+            email: "admin@company.com".to_string(),
+            role: "admin".to_string(),
+            department: Some("信息技术部".to_string()),
+            avatar: None,
+        },
+    ]
+}
+
+fn default_mock_user() -> User {
+    build_mock_review_users()
+        .into_iter()
+        .find(|user| user.role == "designer")
+        .unwrap_or(User {
+            id: "designer_001".to_string(),
+            username: "designer".to_string(),
+            name: "王设计师".to_string(),
+            email: "designer@company.com".to_string(),
+            role: "designer".to_string(),
+            department: Some("设计部".to_string()),
+            avatar: None,
+        })
+}
+
+fn map_claim_role_to_user_role(role: Option<&str>) -> String {
+    match role.unwrap_or("viewer") {
+        "sj" => "designer".to_string(),
+        "jd" => "proofreader".to_string(),
+        "sh" => "reviewer".to_string(),
+        "pz" => "manager".to_string(),
+        "admin" => "admin".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn current_user_from_claims(claims: &crate::web_api::jwt_auth::TokenClaims) -> User {
+    build_mock_review_users()
+        .into_iter()
+        .find(|user| user.id == claims.user_id)
+        .unwrap_or(User {
+            id: claims.user_id.clone(),
+            username: claims.user_id.clone(),
+            name: claims.user_id.clone(),
+            email: format!("{}@example.com", claims.user_id),
+            role: map_claim_role_to_user_role(claims.role.as_deref()),
+            department: None,
+            avatar: None,
+        })
+}
+
 /// GET /api/users - 获取用户列表
 async fn list_users(
     Query(query): Query<UserListQuery>,
 ) -> impl IntoResponse {
     info!("Listing users");
     
-    // 暂时返回 mock 数据，后续从数据库查询
-    let mock_users = vec![
-        User {
-            id: "user-001".to_string(),
-            username: "designer1".to_string(),
-            name: "设计师小张".to_string(),
-            email: "zhang@example.com".to_string(),
-            role: "designer".to_string(),
-            department: Some("设计部".to_string()),
-            avatar: None,
-        },
-        User {
-            id: "user-002".to_string(),
-            username: "reviewer1".to_string(),
-            name: "校对员小李".to_string(),
-            email: "li@example.com".to_string(),
-            role: "proofreader".to_string(),
-            department: Some("校审部".to_string()),
-            avatar: None,
-        },
-        User {
-            id: "user-003".to_string(),
-            username: "reviewer2".to_string(),
-            name: "审核员小王".to_string(),
-            email: "wang@example.com".to_string(),
-            role: "reviewer".to_string(),
-            department: Some("校审部".to_string()),
-            avatar: None,
-        },
-    ];
+    let mock_users = build_mock_review_users();
     
     let users = if let Some(ref role) = query.role {
         mock_users.into_iter().filter(|u| &u.role == role).collect()
@@ -1449,16 +1511,7 @@ async fn get_current_user(
     use crate::web_api::jwt_auth::TokenClaims;
 
     if let Some(claims) = request.extensions().get::<TokenClaims>() {
-        let role = claims.role.as_deref().unwrap_or("viewer");
-        let user = User {
-            id: claims.user_id.clone(),
-            username: claims.user_id.clone(),
-            name: claims.user_id.clone(),
-            email: format!("{}@example.com", claims.user_id),
-            role: role.to_string(),
-            department: None,
-            avatar: None,
-        };
+        let user = current_user_from_claims(claims);
         return (StatusCode::OK, Json(UserResponse {
             success: true,
             user: Some(user),
@@ -1467,15 +1520,7 @@ async fn get_current_user(
     }
 
     // 如果没有 JWT，返回 mock 用户
-    let user = User {
-        id: "user-001".to_string(),
-        username: "designer1".to_string(),
-        name: "设计师小张".to_string(),
-        email: "zhang@example.com".to_string(),
-        role: "designer".to_string(),
-        department: Some("设计部".to_string()),
-        avatar: None,
-    };
+    let user = default_mock_user();
 
     (StatusCode::OK, Json(UserResponse {
         success: true,
@@ -1488,27 +1533,10 @@ async fn get_current_user(
 async fn get_reviewers() -> impl IntoResponse {
     info!("Getting reviewers");
     
-    // 返回可以审核的用户（校对员和审核员）
-    let reviewers = vec![
-        User {
-            id: "user-002".to_string(),
-            username: "reviewer1".to_string(),
-            name: "校对员小李".to_string(),
-            email: "li@example.com".to_string(),
-            role: "proofreader".to_string(),
-            department: Some("校审部".to_string()),
-            avatar: None,
-        },
-        User {
-            id: "user-003".to_string(),
-            username: "reviewer2".to_string(),
-            name: "审核员小王".to_string(),
-            email: "wang@example.com".to_string(),
-            role: "reviewer".to_string(),
-            department: Some("校审部".to_string()),
-            avatar: None,
-        },
-    ];
+    let reviewers = build_mock_review_users()
+        .into_iter()
+        .filter(|user| matches!(user.role.as_str(), "proofreader" | "reviewer" | "manager" | "admin"))
+        .collect();
     
     (StatusCode::OK, Json(UserListResponse {
         success: true,
@@ -2591,6 +2619,14 @@ async fn import_review_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{self, Body},
+        extract::Extension,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    use crate::web_api::jwt_auth::TokenClaims;
 
     #[test]
     fn test_get_next_node() {
@@ -2737,5 +2773,146 @@ mod tests {
         assert_eq!(task.status, "draft");
         assert_eq!(task.priority, "medium");
         assert_eq!(task.current_node, "sj");
+    }
+
+    #[test]
+    fn test_build_mock_review_users_matches_frontend_contract() {
+        let users = build_mock_review_users();
+        let ids = users.iter().map(|user| user.id.as_str()).collect::<Vec<_>>();
+
+        assert!(ids.contains(&"designer_001"));
+        assert!(ids.contains(&"proofreader_001"));
+        assert!(ids.contains(&"reviewer_001"));
+        assert!(ids.contains(&"manager_001"));
+        assert!(ids.contains(&"admin_001"));
+    }
+
+    #[test]
+    fn test_build_mock_reviewers_only_returns_review_capable_roles() {
+        let reviewers = build_mock_review_users()
+            .into_iter()
+            .filter(|user| matches!(user.role.as_str(), "proofreader" | "reviewer" | "manager" | "admin"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(reviewers.len(), 4);
+        assert!(reviewers.iter().all(|user| user.id != "designer_001"));
+        assert!(reviewers.iter().any(|user| user.id == "proofreader_001"));
+        assert!(reviewers.iter().any(|user| user.id == "reviewer_001"));
+        assert!(reviewers.iter().any(|user| user.id == "manager_001"));
+        assert!(reviewers.iter().any(|user| user.id == "admin_001"));
+    }
+
+    #[test]
+    fn test_default_mock_user_matches_frontend_designer_contract() {
+        let user = default_mock_user();
+
+        assert_eq!(user.id, "designer_001");
+        assert_eq!(user.username, "designer");
+        assert_eq!(user.role, "designer");
+    }
+
+    #[tokio::test]
+    async fn test_get_current_user_returns_frontend_designer_contract_without_claims() {
+        let app = Router::new().route(
+            "/api/users/me",
+            get(get_current_user),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/users/me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: UserResponse = serde_json::from_slice(&body).unwrap();
+        let user = payload.user.expect("expected current user payload");
+
+        assert_eq!(user.id, "designer_001");
+        assert_eq!(user.username, "designer");
+        assert_eq!(user.role, "designer");
+    }
+
+    #[tokio::test]
+    async fn test_get_reviewers_returns_only_review_capable_users() {
+        let app = create_review_api_routes();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/users/reviewers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: UserListResponse = serde_json::from_slice(&body).unwrap();
+        let ids = payload
+            .users
+            .iter()
+            .map(|user| user.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(payload.users.len(), 4);
+        assert!(!ids.contains(&"designer_001"));
+        assert!(ids.contains(&"proofreader_001"));
+        assert!(ids.contains(&"reviewer_001"));
+        assert!(ids.contains(&"manager_001"));
+        assert!(ids.contains(&"admin_001"));
+    }
+
+    #[tokio::test]
+    async fn test_get_current_user_uses_token_claims_when_present() {
+        let app = Router::new().route(
+            "/api/users/me",
+            get(get_current_user),
+        );
+        let claims = TokenClaims {
+            project_id: "project-123".to_string(),
+            user_id: "reviewer_001".to_string(),
+            form_id: "FORM-123".to_string(),
+            role: Some("sh".to_string()),
+            exp: 4_102_444_800,
+            iat: 1_704_067_200,
+        };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/users/me")
+                    .extension(claims)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: UserResponse = serde_json::from_slice(&body).unwrap();
+        let user = payload.user.expect("expected current user payload");
+
+        assert_eq!(user.id, "reviewer_001");
+        assert_eq!(user.username, "reviewer");
+        assert_eq!(user.name, "李审核员");
+        assert_eq!(user.role, "reviewer");
+        assert_eq!(user.email, "reviewer@company.com");
     }
 }

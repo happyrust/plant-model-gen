@@ -1,6 +1,6 @@
 [package]
 name = "aios-database"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 default-run = "aios-database"
 
@@ -200,7 +200,10 @@ manifold = ["aios_core/manifold"]
 surreal-save = []
 test = ["aios_core/test"]
 mem-kv-save = ["aios_core/mem-kv-save"] #额外保存PE数据到内存KV数据库
-kv-rocksdb = ["aios_core/kv-rocksdb", "surrealdb/kv-rocksdb"] # 嵌入式 RocksDB 后端，默认不编译以加快构建
+kv-rocksdb = [
+    "aios_core/kv-rocksdb",
+    "surrealdb/kv-rocksdb",
+] # 嵌入式 RocksDB 后端，默认不编译以加快构建
 project_hd = []
 project_hh = []
 profile = ["dep:tracing-chrome"] #性能分析，包含tracing功能

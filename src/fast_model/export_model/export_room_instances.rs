@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use aios_core::{RefnoEnum, model_primary_db, SurrealQueryExt};
+use aios_core::{model_primary_db, RefnoEnum, SurrealQueryExt};
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use parry3d::bounding_volume::Aabb;
@@ -120,9 +120,9 @@ pub struct RoomExportStats {
 /// room_relate 查询结果
 #[derive(Debug, Clone, Deserialize, SurrealValue)]
 struct RoomRelateRecord {
-    /// 面板 refno (in)
+    /// 面板 refno (out)
     panel_refno: RefnoEnum,
-    /// 构件 refno (out)
+    /// 构件 refno (in)
     component_refno: RefnoEnum,
     /// 房间号
     room_num: String,
@@ -131,9 +131,9 @@ struct RoomRelateRecord {
 /// room_panel_relate 查询结果
 #[derive(Debug, Clone, Deserialize, SurrealValue)]
 struct RoomPanelRecord {
-    /// 房间 refno (in)
+    /// 房间 refno (out)
     room_refno: RefnoEnum,
-    /// 面板 refno (out)
+    /// 面板 refno (in)
     panel_refno: RefnoEnum,
     /// 房间号
     room_num: String,
@@ -152,18 +152,30 @@ struct PanelGeomQuery {
 // 查询函数
 // ============================================================================
 
-/// 查询所有 room_relate 关系
-async fn query_room_relations() -> Result<Vec<RoomRelateRecord>> {
-    let sql = r#"
+fn build_query_room_relations_sql() -> &'static str {
+    r#"
         SELECT
-            in as panel_refno,
-            out as component_refno,
+            out as panel_refno,
+            in as component_refno,
             room_num
         FROM room_relate
-    "#;
+    "#
+}
 
+fn build_query_room_panel_relations_sql() -> &'static str {
+    r#"
+        SELECT
+            out as room_refno,
+            in as panel_refno,
+            room_num
+        FROM room_panel_relate
+    "#
+}
+
+/// 查询所有 room_relate 关系
+async fn query_room_relations() -> Result<Vec<RoomRelateRecord>> {
     let records: Vec<RoomRelateRecord> = model_primary_db()
-        .query_take(sql, 0)
+        .query_take(build_query_room_relations_sql(), 0)
         .await
         .context("查询 room_relate 失败")?;
 
@@ -172,16 +184,8 @@ async fn query_room_relations() -> Result<Vec<RoomRelateRecord>> {
 
 /// 查询所有 room_panel_relate 关系
 async fn query_room_panel_relations() -> Result<Vec<RoomPanelRecord>> {
-    let sql = r#"
-        SELECT
-            in as room_refno,
-            out as panel_refno,
-            room_num
-        FROM room_panel_relate
-    "#;
-
     let records: Vec<RoomPanelRecord> = model_primary_db()
-        .query_take(sql, 0)
+        .query_take(build_query_room_panel_relations_sql(), 0)
         .await
         .context("查询 room_panel_relate 失败")?;
 
@@ -239,10 +243,7 @@ async fn query_panel_geometries(panel_refnos: &[RefnoEnum]) -> Result<Vec<PanelG
 ///   }
 /// }
 /// ```
-pub async fn export_room_relations(
-    output_path: &Path,
-    verbose: bool,
-) -> Result<RoomExportStats> {
+pub async fn export_room_relations(output_path: &Path, verbose: bool) -> Result<RoomExportStats> {
     let start_time = std::time::Instant::now();
 
     if verbose {
@@ -277,7 +278,10 @@ pub async fn export_room_relations(
     let total_components: usize = rooms.values().map(|v| v.len()).sum();
 
     if verbose {
-        info!("   - 共 {} 个房间, {} 个构件", total_rooms, total_components);
+        info!(
+            "   - 共 {} 个房间, {} 个构件",
+            total_rooms, total_components
+        );
     }
 
     // 4. 构建输出数据
@@ -288,8 +292,8 @@ pub async fn export_room_relations(
     };
 
     // 5. 写入文件
-    let json_content = serde_json::to_string_pretty(&data)
-        .context("序列化 room_relations.json 失败")?;
+    let json_content =
+        serde_json::to_string_pretty(&data).context("序列化 room_relations.json 失败")?;
 
     std::fs::write(output_path, &json_content)
         .with_context(|| format!("写入文件失败: {}", output_path.display()))?;
@@ -310,10 +314,7 @@ pub async fn export_room_relations(
 }
 
 /// 导出房间几何数据 (room_geometries.json)
-pub async fn export_room_geometries(
-    output_path: &Path,
-    verbose: bool,
-) -> Result<RoomExportStats> {
+pub async fn export_room_geometries(output_path: &Path, verbose: bool) -> Result<RoomExportStats> {
     let start_time = std::time::Instant::now();
 
     if verbose {
@@ -324,7 +325,10 @@ pub async fn export_room_geometries(
     let panel_relations = query_room_panel_relations().await?;
 
     if verbose {
-        info!("   - 查询到 {} 条 room_panel_relate 记录", panel_relations.len());
+        info!(
+            "   - 查询到 {} 条 room_panel_relate 记录",
+            panel_relations.len()
+        );
     }
 
     // 2. 按房间号分组面板
@@ -337,10 +341,7 @@ pub async fn export_room_geometries(
     }
 
     // 3. 收集所有面板 refno
-    let all_panel_refnos: Vec<RefnoEnum> = panel_relations
-        .iter()
-        .map(|r| r.panel_refno)
-        .collect();
+    let all_panel_refnos: Vec<RefnoEnum> = panel_relations.iter().map(|r| r.panel_refno).collect();
 
     // 4. 查询面板几何数据
     let panel_geoms = query_panel_geometries(&all_panel_refnos).await?;
@@ -363,7 +364,10 @@ pub async fn export_room_geometries(
     let mut total_panels = 0;
 
     for (room_num, panels) in &room_panels {
-        let room_refno = panels.first().map(|(r, _)| r.to_string()).unwrap_or_default();
+        let room_refno = panels
+            .first()
+            .map(|(r, _)| r.to_string())
+            .unwrap_or_default();
 
         let mut room_panels_data: Vec<RoomPanel> = Vec::new();
         let mut room_aabb: Option<AabbJson> = None;
@@ -411,8 +415,8 @@ pub async fn export_room_geometries(
     };
 
     // 8. 写入文件
-    let json_content = serde_json::to_string_pretty(&data)
-        .context("序列化 room_geometries.json 失败")?;
+    let json_content =
+        serde_json::to_string_pretty(&data).context("序列化 room_geometries.json 失败")?;
 
     std::fs::write(output_path, &json_content)
         .with_context(|| format!("写入文件失败: {}", output_path.display()))?;
@@ -519,9 +523,31 @@ pub async fn export_room_instances(
 
     if verbose {
         info!("🎉 房间数据导出完成!");
-        info!("   - room_relations.json: {} 个房间", relations_stats.total_rooms);
-        info!("   - room_geometries.json: {} 个面板", geometries_stats.total_panels);
+        info!(
+            "   - room_relations.json: {} 个房间",
+            relations_stats.total_rooms
+        );
+        info!(
+            "   - room_geometries.json: {} 个面板",
+            geometries_stats.total_panels
+        );
     }
 
     Ok((relations_stats, geometries_stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_room_relation_queries_use_correct_direction() {
+        let room_sql = build_query_room_relations_sql();
+        assert!(room_sql.contains("out as panel_refno"));
+        assert!(room_sql.contains("in as component_refno"));
+
+        let room_panel_sql = build_query_room_panel_relations_sql();
+        assert!(room_panel_sql.contains("out as room_refno"));
+        assert!(room_panel_sql.contains("in as panel_refno"));
+    }
 }

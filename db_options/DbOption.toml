@@ -248,9 +248,9 @@ debug_project_id = "debug-project"
 debug_user_id = "debug-user"
 debug_role = "sj"
 
-# ====== Web Server 配置 ======
+# ====== Web Server 配置（3100 与 plant3d-web Vite 代理一致）======
 [web_server]
-port = 8080
+port = 3100
 auto_start_surreal = true
 surreal_bin = "surreal"
 surreal_data_path = "D:/backup-dbs/ams-8020.db"

@@ -34,20 +34,31 @@ async fn main() -> anyhow::Result<()> {
     // 初始化日志，设置更详细的日志级别
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
 
-    // 读取配置文件
+    // 读取配置文件（路径相对于当前工作目录）
     let config_file = format!("{}.toml", config_path);
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let config_path_full = cwd.join(&config_file);
     let db_option: aios_core::options::DbOption = {
-        let content = std::fs::read_to_string(&config_file)
-            .unwrap_or_else(|e| panic!("❌ 无法读取配置文件 {}: {}", config_file, e));
+        let content = std::fs::read_to_string(&config_file).unwrap_or_else(|e| {
+            panic!("❌ 无法读取配置文件 {} (cwd={:?}): {}", config_file, cwd, e)
+        });
         toml::from_str(&content)
             .unwrap_or_else(|e| panic!("❌ 配置文件解析失败 {}: {}", config_file, e))
     };
 
     let ws_cfg = &db_option.web_server;
+    let port_from_config = ws_cfg.port;
     let port = std::env::var("WEB_SERVER_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(ws_cfg.port);
+        .unwrap_or(port_from_config);
+
+    println!(
+        "⚙️  配置文件: {} | cwd={} | 端口: {}",
+        config_path_full.display(),
+        cwd.display(),
+        port
+    );
 
     // 自启动 SurrealDB
     let _surreal_child = if ws_cfg.auto_start_surreal {
@@ -109,7 +120,6 @@ async fn main() -> anyhow::Result<()> {
 
     println!("🚀 正在启动 AIOS Web UI 服务器...");
     println!("📱 访问地址: http://localhost:{}", port);
-    println!("⚙️  使用配置文件: {}", config_file);
 
     start_web_server_with_config(port, Some(config_path)).await?;
 

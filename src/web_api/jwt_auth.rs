@@ -58,7 +58,7 @@ impl Default for ReviewAuthConfig {
         Self {
             enabled: true,
             debug_project_id: "debug-project".to_string(),
-            debug_user_id: "debug-user".to_string(),
+            debug_user_id: "designer_001".to_string(),
             debug_role: "sj".to_string(),
         }
     }
@@ -135,7 +135,7 @@ impl ReviewAuthConfig {
                     .unwrap_or_else(|_| "debug-project".to_string()),
                 debug_user_id: config
                     .get_string("review_auth.debug_user_id")
-                    .unwrap_or_else(|_| "debug-user".to_string()),
+                    .unwrap_or_else(|_| "designer_001".to_string()),
                 debug_role: config
                     .get_string("review_auth.debug_role")
                     .unwrap_or_else(|_| "sj".to_string()),
@@ -273,6 +273,8 @@ pub struct TokenData_ {
 #[derive(Debug, Deserialize)]
 pub struct VerifyRequest {
     pub token: String,
+    #[serde(default)]
+    pub form_id: Option<String>,
 }
 
 /// Token 验证响应
@@ -658,6 +660,32 @@ async fn verify_token_handler(Json(request): Json<VerifyRequest>) -> impl IntoRe
 
     match verify_token(&request.token) {
         Ok(claims) => {
+            if let Some(form_id) = request
+                .form_id
+                .as_ref()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                if claims.form_id != form_id {
+                    warn!(
+                        "Token verification failed: form_id mismatch, expected={}, actual={}",
+                        form_id,
+                        claims.form_id
+                    );
+                    return (
+                        StatusCode::OK,
+                        Json(VerifyResponse {
+                            code: 0,
+                            message: "ok".to_string(),
+                            data: Some(VerifyData {
+                                valid: false,
+                                claims: None,
+                                error: Some("form_id mismatch".to_string()),
+                            }),
+                        }),
+                    );
+                }
+            }
             info!(
                 "Token verified: user_id={}, form_id={}",
                 claims.user_id, claims.form_id
@@ -708,6 +736,19 @@ mod tests {
         routing::get,
     };
     use tower::ServiceExt;
+
+    #[derive(Debug, Deserialize)]
+    struct VerifyResponseBody {
+        code: i32,
+        data: Option<VerifyDataBody>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct VerifyDataBody {
+        valid: bool,
+        claims: Option<TokenClaims>,
+        error: Option<String>,
+    }
 
     async fn claims_echo_handler(Extension(claims): Extension<TokenClaims>) -> Json<TokenClaims> {
         Json(claims)
@@ -821,6 +862,16 @@ mod tests {
         assert_eq!(names.first().map(String::as_str), Some("/tmp/demo-config"));
     }
 
+    #[test]
+    fn test_review_auth_config_default_matches_frontend_contract() {
+        let config = ReviewAuthConfig::default();
+
+        assert!(config.enabled);
+        assert_eq!(config.debug_project_id, "debug-project");
+        assert_eq!(config.debug_user_id, "designer_001");
+        assert_eq!(config.debug_role, "sj");
+    }
+
     #[tokio::test]
     async fn test_review_auth_middleware_decodes_token_without_verification_when_disabled() {
         let app = Router::new()
@@ -856,6 +907,74 @@ mod tests {
         assert_eq!(claims.project_id, "1516");
         assert_eq!(claims.user_id, "user-002");
         assert_eq!(claims.role.as_deref(), Some("jd"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_token_handler_rejects_form_id_mismatch() {
+        let app = create_jwt_auth_routes();
+        let (token, _) = create_token("project-1", "user-1", "FORM-EXPECTED", Some("sj")).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/verify")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "token": token,
+                            "form_id": "FORM-OTHER"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: VerifyResponseBody = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(payload.code, 0);
+        assert_eq!(payload.data.as_ref().map(|data| data.valid), Some(false));
+        assert_eq!(payload.data.as_ref().and_then(|data| data.error.as_deref()), Some("form_id mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_token_handler_accepts_matching_form_id() {
+        let app = create_jwt_auth_routes();
+        let (token, _) = create_token("project-1", "user-1", "FORM-EXPECTED", Some("sj")).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/verify")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "token": token,
+                            "form_id": "FORM-EXPECTED"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: VerifyResponseBody = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(payload.code, 0);
+        assert_eq!(payload.data.as_ref().map(|data| data.valid), Some(true));
+        assert_eq!(payload.data.as_ref().and_then(|data| data.claims.as_ref()).map(|claims| claims.form_id.as_str()), Some("FORM-EXPECTED"));
     }
 
 }

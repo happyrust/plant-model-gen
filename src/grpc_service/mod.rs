@@ -29,29 +29,12 @@ pub mod auth;
 #[cfg(feature = "grpc")]
 pub mod health;
 
-#[cfg(feature = "grpc")]
-pub mod spatial_query_service;
+// The spatial query gRPC implementation was removed, but the `grpc` feature is
+// also disabled in this workspace today. Keep it out of the module tree so
+// workspace-wide tools like `cargo fmt --all` can parse successfully.
 
-#[cfg(feature = "grpc")]
-pub mod spatial_index_builder;
-
-#[cfg(feature = "grpc")]
-pub mod sctn_contact_detector;
-
-#[cfg(feature = "grpc")]
-pub mod sctn_geometry_extractor;
-
-#[cfg(feature = "grpc")]
-pub mod sctn_raycast_detector;
-
-#[cfg(feature = "grpc")]
-pub mod sctn_path_analyzer;
-
-#[cfg(feature = "grpc")]
-pub mod sctn_collision_optimizer;
-
-#[cfg(feature = "grpc")]
-pub mod sctn_visualizer;
+// Additional spatial gRPC modules are currently absent from `src/grpc_service/`.
+// Keep these declarations disabled until their implementations are restored.
 
 #[cfg(feature = "grpc")]
 #[cfg(test)]
@@ -72,12 +55,3 @@ pub use auth::{AuthConfig, AuthInterceptor, AuthService, InputValidator, RateLim
 
 #[cfg(feature = "grpc")]
 pub use health::{HealthChecker, HealthMonitorService, HealthStatus};
-
-#[cfg(feature = "grpc")]
-pub use spatial_query_service::{SpatialElement, SpatialQueryServiceImpl};
-
-#[cfg(feature = "grpc")]
-pub use sctn_contact_detector::{
-    BatchSctnDetector, CableTraySection, ContactResult, ContactType, SctnContactDetector,
-    SupportRelation,
-};

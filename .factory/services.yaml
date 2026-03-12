@@ -1,37 +1,18 @@
 commands:
-  # Aggregate test command for baseline validation
-  test: cd /Volumes/DPC/work/plant-code/plant3d-web && npm run type-check
-  
-  # Backend commands
-  backend-check: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo check --bin web_server --features web_server
-  backend-test: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo test --no-default-features --features ws,sqlite-index,web_server
-  backend-build: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo build --bin web_server --no-default-features --features ws,sqlite-index,surreal-save,web_server
-  backend-fmt: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo fmt --all
-  backend-clippy: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo clippy --features web_server -- -D warnings
-  
-  # Frontend commands
-  frontend-typecheck: cd /Volumes/DPC/work/plant-code/plant3d-web && npm run type-check
-  frontend-build: cd /Volumes/DPC/work/plant-code/plant3d-web && npm run build-only
-  frontend-test: cd /Volumes/DPC/work/plant-code/plant3d-web && npm run test
+  test: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo check --bin aios-database --quiet
+  room-cli-check: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo check --bin aios-database --quiet
+  room-help: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room --help
+  room-compute-help: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room compute --help
+  room-verify-help: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json --help
+  room-verify-required-input: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json
+  room-verify-missing-input-file: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json --input /tmp/room-verify-missing.json
+  room-verify-fixture: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json --input tests/fixtures/room_compute_validation.json
+  room-release-build: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo build --release --bin aios-database
 
 services:
   surrealdb:
-    start: echo "SurrealDB already running on 8020"
-    stop: echo "Do not stop SurrealDB (shared service)"
-    healthcheck: curl -sf http://localhost:8020/health || echo "SurrealDB running"
+    start: echo "Reuse existing SurrealDB/local DB configuration; do not start a second instance"
+    stop: echo "Do not stop shared SurrealDB from mission automation"
+    healthcheck: (lsof -i :8020 >/dev/null || lsof -i :8009 >/dev/null) && echo "SurrealDB port detected" || echo "SurrealDB port not auto-detected"
     port: 8020
     depends_on: []
-
-  backend:
-    start: cd /Volumes/DPC/work/plant-code/plant-model-gen && ./target/debug/web_server
-    stop: lsof -ti :3100 | xargs kill -TERM
-    healthcheck: curl -sf http://localhost:3100/api/status
-    port: 3100
-    depends_on: [surrealdb]
-
-  frontend:
-    start: cd /Volumes/DPC/work/plant-code/plant3d-web && npm run dev
-    stop: lsof -ti :3101 | xargs kill -TERM
-    healthcheck: curl -sf http://localhost:3101
-    port: 3101
-    depends_on: [backend]

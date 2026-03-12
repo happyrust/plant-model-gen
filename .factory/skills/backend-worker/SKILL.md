@@ -9,34 +9,33 @@ NOTE: Startup and cleanup are handled by `worker-base`. This skill defines the W
 
 ## When to Use This Skill
 
-Use this skill for features that modify the Rust backend (plant-model-gen):
+Use this skill for general Rust backend changes in `plant-model-gen` that do not have a more specific project skill. Common examples:
 - Adding fields to DatabaseConfig or other API structs
 - Threading parameters from API layer to generation pipeline
-- Modifying handlers.rs for task execution logic
+- Modifying handler or CLI/backend wiring
 - Backend-only changes that don't touch frontend
 
 ## Work Procedure
 
 1. **Read feature requirements** from features.json
-2. **Write tests first** (if applicable):
-   - Add unit tests for new struct fields (serialization/deserialization)
-   - Add integration tests for parameter flow if needed
-   - Run `cargo test` - tests should FAIL (red)
+2. **Choose feature-appropriate validation first**:
+   - For API/data-flow changes, add or update targeted tests when they are the safest way to prove behavior
+   - For CLI workflow features, prefer direct CLI validation over broad `cargo test` gates
+   - Do not introduce a broad `cargo test` requirement when the feature's mission or manifest defines a narrower accepted validation path
 3. **Implement changes**:
    - Modify structs in src/web_server/models.rs
    - Thread parameters in src/web_server/handlers.rs
    - Follow existing patterns (Option<T> for new fields)
    - Keep changes minimal and focused
-4. **Run tests** - should now PASS (green):
-   - `cargo test --no-default-features --features ws,sqlite-index,web_server`
-5. **Run validators**:
-   - `cargo check --bin web_server --features web_server`
-   - `cargo fmt --all`
-   - `cargo clippy --features web_server -- -D warnings`
+4. **Run the accepted verification path**:
+   - Use the commands required by the feature, mission manifest, or owning specialized skill
+   - If tests are used, keep them targeted rather than broad workspace gates unless the feature explicitly requires the broad run
+5. **Run validators appropriate to the touched surface**:
+   - For `web_server` backend changes, use validators such as `cargo check --bin web_server --features web_server`, `cargo fmt --all`, and `cargo clippy --features web_server -- -D warnings` when relevant
+   - For CLI-focused features, prefer `cargo check --bin aios-database --quiet` and the required CLI smoke/acceptance commands
 6. **Manual verification**:
-   - Start web_server: `./target/debug/web_server`
-   - Test API with curl: `curl -X POST http://localhost:3100/api/tasks -H "Content-Type: application/json" -d '{"name":"test","task_type":"DataGeneration","config":{...}}'`
-   - Check logs for parameter flow
+   - Use the runtime surface relevant to the feature (for example local API `curl` checks for web work, or direct CLI invocations for command-line work)
+   - Check logs/output for the specific behavior your feature changes
 7. **Commit changes** with clear message
 8. **Fill handoff** with all verification details
 

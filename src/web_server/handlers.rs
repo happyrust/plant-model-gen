@@ -374,7 +374,10 @@ pub async fn api_get_projects(
         // Fallback: 如果 SQLite 表为空，则从 DbOption.toml 的 included_projects 读取
         if items.is_empty() {
             items = load_projects_from_config();
-            println!("📋 [projects] SQLite fallback -> config: {} 条项目", items.len());
+            println!(
+                "📋 [projects] SQLite fallback -> config: {} 条项目",
+                items.len()
+            );
         }
         // 过滤
         if let Some(q) = params.q.as_ref().filter(|s| !s.is_empty()) {
@@ -541,12 +544,19 @@ pub async fn api_get_projects(
         total = rows.get(0).and_then(|r| r["total"].as_u64()).unwrap_or(0) as usize;
     }
 
-    println!("📋 [projects] SurrealDB 分支: 查到 {} 条项目, total={}", items.len(), total);
+    println!(
+        "📋 [projects] SurrealDB 分支: 查到 {} 条项目, total={}",
+        items.len(),
+        total
+    );
     // Fallback: 如果 SQLite 和 SurrealDB 都没有数据，则从 DbOption.toml 的 included_projects 读取
     if items.is_empty() {
         items = load_projects_from_config();
         total = items.len();
-        println!("📋 [projects] SurrealDB fallback -> config: {} 条项目", items.len());
+        println!(
+            "📋 [projects] SurrealDB fallback -> config: {} 条项目",
+            items.len()
+        );
     }
 
     Ok(Json(json!({
@@ -675,7 +685,8 @@ fn try_load_projects_from_sqlite() -> Option<Vec<ProjectItem>> {
 fn open_sqlite_projects_table() -> Option<(rusqlite::Connection, String)> {
     use config as cfg;
     let mut builder = cfg::Config::builder();
-    let cfg_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let cfg_file = format!("{}.toml", cfg_name);
     if std::path::Path::new(&cfg_file).exists() {
         builder = builder.add_source(cfg::File::with_name(&cfg_name));
@@ -1473,7 +1484,9 @@ pub async fn create_task(
     }
     let task_id = task.id.clone();
 
-    task_manager.active_tasks.insert(task_id.clone(), task.clone());
+    task_manager
+        .active_tasks
+        .insert(task_id.clone(), task.clone());
 
     Ok(Json(json!({
         "success": true,
@@ -3260,22 +3273,28 @@ pub struct GetInstancesRequest {
 #[derive(Serialize)]
 pub struct ModelDataResponse {
     pub archetypes: Vec<crate::fast_model::export_model::export_instanced_bundle::ArchetypeInfo>,
-    pub instances_data: Vec<crate::fast_model::export_model::export_instanced_bundle::InstancesData>,
+    pub instances_data:
+        Vec<crate::fast_model::export_model::export_instanced_bundle::InstancesData>,
 }
 
 pub async fn api_get_instances(
     Query(req): Query<GetInstancesRequest>,
 ) -> Result<Json<ModelDataResponse>, (StatusCode, String)> {
-    use crate::fast_model::export_model::export_instanced_bundle::{
-        ArchetypeInfo, InstancesData, InstanceInfo, LodLevelInfo
-    };
-    use aios_core::{RefnoEnum, RefU64, query_insts};
     use crate::fast_model::export_model::ExportData;
+    use crate::fast_model::export_model::export_instanced_bundle::{
+        ArchetypeInfo, InstanceInfo, InstancesData, LodLevelInfo,
+    };
     use aios_core::mesh_precision::LodLevel;
-    
+    use aios_core::{RefU64, RefnoEnum, query_insts};
+
     // Parse refnos locally
     use std::str::FromStr;
-    let refno_strs: Vec<&str> = req.refnos.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let refno_strs: Vec<&str> = req
+        .refnos
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
     let mut refnos = Vec::new();
     for s in refno_strs {
         if let Ok(r) = RefnoEnum::from_str(s) {
@@ -3286,33 +3305,58 @@ pub async fn api_get_instances(
     }
 
     if refnos.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "No valid refnos provided".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "No valid refnos provided".to_string(),
+        ));
     }
 
     use crate::fast_model::export_model::collect_export_data;
 
-    let insts = query_insts(&refnos, false)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Query failed: {}", e)))?;
-    
-    println!("[DEBUG] api_get_instances: Parsed {} refnos: {:?}", refnos.len(), refnos);
-    println!("[DEBUG] api_get_instances: query_insts returned {} records", insts.len());
-    
+    let insts = query_insts(&refnos, false).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Query failed: {}", e),
+        )
+    })?;
+
+    println!(
+        "[DEBUG] api_get_instances: Parsed {} refnos: {:?}",
+        refnos.len(),
+        refnos
+    );
+    println!(
+        "[DEBUG] api_get_instances: query_insts returned {} records",
+        insts.len()
+    );
+
     let db_option = aios_core::get_db_option();
     let mesh_dir = db_option.get_meshes_path();
 
-    let export_data: ExportData = collect_export_data(insts, &refnos, &mesh_dir, false, None, false)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Collect data failed: {}", e)))?;
+    let export_data: ExportData =
+        collect_export_data(insts, &refnos, &mesh_dir, false, None, false)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Collect data failed: {}", e),
+                )
+            })?;
 
-    println!("[DEBUG] api_get_instances: collect_export_data returned {} components, {} tubings", export_data.components.len(), export_data.tubings.len());
+    println!(
+        "[DEBUG] api_get_instances: collect_export_data returned {} components, {} tubings",
+        export_data.components.len(),
+        export_data.tubings.len()
+    );
 
-     // Reconstruct Instances logic
-     let mut geo_hash_usage: std::collections::HashMap<String, Vec<InstanceInfo>> = std::collections::HashMap::new();
-     let mut geo_hash_noun_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-     
-     // Collect components
-     for component in &export_data.components {
+    // Reconstruct Instances logic
+    let mut geo_hash_usage: std::collections::HashMap<String, Vec<InstanceInfo>> =
+        std::collections::HashMap::new();
+    let mut geo_hash_noun_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    // Collect components
+    for component in &export_data.components {
         for geom_inst in &component.geometries {
             let instance = InstanceInfo {
                 refno: component.refno.to_string(),
@@ -3320,40 +3364,59 @@ pub async fn api_get_instances(
                 color: None,
                 name: component.name.clone(),
             };
-            geo_hash_usage.entry(geom_inst.geo_hash.clone())
+            geo_hash_usage
+                .entry(geom_inst.geo_hash.clone())
                 .or_default()
                 .push(instance);
-            geo_hash_noun_map.entry(geom_inst.geo_hash.clone())
+            geo_hash_noun_map
+                .entry(geom_inst.geo_hash.clone())
                 .or_insert_with(|| component.noun.clone());
         }
-     }
+    }
 
-     // Collect TUBI
-     for tubi in &export_data.tubings {
+    // Collect TUBI
+    for tubi in &export_data.tubings {
         let instance = InstanceInfo {
             refno: tubi.refno.to_string(),
             matrix: tubi.transform.to_cols_array(),
             color: None,
             name: Some(tubi.name.clone()),
         };
-        geo_hash_usage.entry(tubi.geo_hash.clone())
+        geo_hash_usage
+            .entry(tubi.geo_hash.clone())
             .or_default()
             .push(instance);
-        geo_hash_noun_map.entry(tubi.geo_hash.clone())
+        geo_hash_noun_map
+            .entry(tubi.geo_hash.clone())
             .or_insert_with(|| "TUBI".to_string());
-     }
+    }
 
-     let mut archetypes = Vec::new();
-     let mut all_instances_data = Vec::new();
-     
-     // Construct response
-     for (geo_hash, instances) in geo_hash_usage {
-        let noun = geo_hash_noun_map.get(&geo_hash).cloned().unwrap_or("UNKNOWN".to_string());
-        
+    let mut archetypes = Vec::new();
+    let mut all_instances_data = Vec::new();
+
+    // Construct response
+    for (geo_hash, instances) in geo_hash_usage {
+        let noun = geo_hash_noun_map
+            .get(&geo_hash)
+            .cloned()
+            .unwrap_or("UNKNOWN".to_string());
+
         let lod_levels = vec![
-             LodLevelInfo { level: "L1".to_string(), geometry_url: format!("{}_L1.glb", geo_hash), distance: 0.0 },
-             LodLevelInfo { level: "L2".to_string(), geometry_url: format!("{}_L2.glb", geo_hash), distance: 50.0 },
-             LodLevelInfo { level: "L3".to_string(), geometry_url: format!("{}_L3.glb", geo_hash), distance: 200.0 },
+            LodLevelInfo {
+                level: "L1".to_string(),
+                geometry_url: format!("{}_L1.glb", geo_hash),
+                distance: 0.0,
+            },
+            LodLevelInfo {
+                level: "L2".to_string(),
+                geometry_url: format!("{}_L2.glb", geo_hash),
+                distance: 50.0,
+            },
+            LodLevelInfo {
+                level: "L3".to_string(),
+                geometry_url: format!("{}_L3.glb", geo_hash),
+                distance: 200.0,
+            },
         ];
 
         let inst_data = InstancesData {
@@ -3370,12 +3433,12 @@ pub async fn api_get_instances(
             instances_url: "".to_string(),
             instance_count: instances.len(),
         });
-     }
+    }
 
-     Ok(Json(ModelDataResponse {
+    Ok(Json(ModelDataResponse {
         archetypes,
         instances_data: all_instances_data,
-     }))
+    }))
 }
 
 /// 启动 SurrealDB 服务（根据 DbOption.toml 配置）
@@ -3822,7 +3885,12 @@ pub async fn test_tcp_connection(addr: &str) -> bool {
 pub async fn test_database_functionality() -> (bool, Option<String>) {
     use tokio::time::{Duration, timeout};
 
-    match timeout(Duration::from_secs(5), project_primary_db().query("SELECT 1 as test")).await {
+    match timeout(
+        Duration::from_secs(5),
+        project_primary_db().query("SELECT 1 as test"),
+    )
+    .await
+    {
         Ok(Ok(_)) => (true, None),
         Ok(Err(e)) => (false, Some(format!("数据库查询失败: {}", e))),
         Err(_) => (false, Some("数据库连接超时".to_string())),
@@ -3929,7 +3997,7 @@ pub async fn get_surreal_status(
     _state: State<AppState>,
     Query(q): Query<SurrealStatusQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use aios_core::{project_primary_db, get_db_option};
+    use aios_core::{get_db_option, project_primary_db};
 
     let opt = get_db_option();
     let ip_raw = q.ip.unwrap_or(opt.surreal_ip.clone());
@@ -4210,7 +4278,10 @@ async fn execute_real_task(state: AppState, task_id: String) {
     db_option.export_json = config.export_json;
     db_option.export_json = config.export_json;
     db_option.export_parquet = config.export_parquet;
-    println!("DEBUG: execute_real_task config.export_json={}, db_option.export_json={}", config.export_json, db_option.export_json);
+    println!(
+        "DEBUG: execute_real_task config.export_json={}, db_option.export_json={}",
+        config.export_json, db_option.export_json
+    );
 
     // 更新任务状态
     let mut update_progress =
@@ -4236,7 +4307,13 @@ async fn execute_real_task(state: AppState, task_id: String) {
     let publish_progress = {
         let hub = state.progress_hub.clone();
         let task_id_clone = task_id.clone();
-        move |step: &str, current: u32, total: u32, percentage: f32, message: &str, processed_items: u64, total_items: u64| {
+        move |step: &str,
+              current: u32,
+              total: u32,
+              percentage: f32,
+              message: &str,
+              processed_items: u64,
+              total_items: u64| {
             let msg = crate::shared::ProgressMessageBuilder::new(task_id_clone.clone())
                 .status(crate::shared::TaskStatus::Running)
                 .percentage(percentage)
@@ -4333,7 +4410,8 @@ async fn execute_real_task(state: AppState, task_id: String) {
         total_steps,
         (current_step as f32 / total_steps as f32) * 100.0,
         &format!("数据库连接成功: {}:{}", config.db_ip, config.db_port),
-        0, 0,
+        0,
+        0,
     );
 
     if is_cancelled().await {
@@ -4488,7 +4566,8 @@ async fn execute_real_task(state: AppState, task_id: String) {
                     total_steps,
                     (current_step as f32 / total_steps as f32) * 100.0,
                     "PDMS/E3D数据解析完成",
-                    0, 0,
+                    0,
+                    0,
                 );
             }
             Err(e) => {
@@ -4603,7 +4682,8 @@ async fn execute_real_task(state: AppState, task_id: String) {
             total_steps,
             base_percentage,
             "开始生成几何模型数据...",
-            0, 0,
+            0,
+            0,
         );
 
         let start_time = Instant::now();
@@ -4669,7 +4749,12 @@ async fn execute_real_task(state: AppState, task_id: String) {
             })
         };
 
-        let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
+        let mut db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
+        db_option_ext.index_tree_enabled_target_types =
+            config.enabled_nouns.clone().unwrap_or_default();
+        db_option_ext.index_tree_excluded_target_types =
+            config.excluded_nouns.clone().unwrap_or_default();
+        db_option_ext.index_tree_debug_limit_per_target_type = config.debug_limit_per_noun_type;
 
         if let Err(e) = gen_all_geos_data(vec![], &db_option_ext, None, config.target_sesno).await {
             let mut task_manager = state.task_manager.lock().await;
@@ -4735,7 +4820,8 @@ async fn execute_real_task(state: AppState, task_id: String) {
             total_steps,
             (current_step as f32 / total_steps as f32) * 100.0,
             &format!("几何数据生成完成，耗时: {}ms", elapsed),
-            0, 0,
+            0,
+            0,
         );
 
         if is_cancelled().await {
@@ -5751,8 +5837,7 @@ pub async fn db_status_page() -> Html<String> {
 
 /// 页面路由处理器
 pub async fn index_page() -> Html<String> {
-    // 切换为更贴近截图的首页（简洁卡片 + 详情弹窗）
-    Html(crate::web_server::simple_templates::render_index_with_sidebar())
+    Html(crate::web_server::simple_templates::render_embed_url_tester_page())
 }
 
 pub async fn dashboard_page() -> Html<String> {
@@ -6261,7 +6346,10 @@ async fn run_sctn_test_pipeline(state: AppState, task_id: String, _req: SctnTest
         task.error = Some("sqlite-index feature not enabled".to_string());
         task.completed_at = Some(std::time::SystemTime::now());
     }
-    SCTN_TEST_RESULTS.insert(task_id, json!({"status":"failed","message":"sqlite-index feature not enabled"}));
+    SCTN_TEST_RESULTS.insert(
+        task_id,
+        json!({"status":"failed","message":"sqlite-index feature not enabled"}),
+    );
 }
 
 #[cfg(feature = "sqlite-index")]
@@ -7565,7 +7653,10 @@ pub async fn api_generate_by_refno(
         config.export_parquet = export_parquet;
     }
 
-    println!("DEBUG: api_generate_by_refno req.export_json={:?}, config.export_json={}", req.export_json, config.export_json);
+    println!(
+        "DEBUG: api_generate_by_refno req.export_json={:?}, config.export_json={}",
+        req.export_json, config.export_json
+    );
 
     // 3. 创建任务
     let task_name = format!(
@@ -7643,8 +7734,8 @@ async fn execute_refno_model_generation(
             Err(_) => {
                 // 尝试手动解析纯数字 (fallback)
                 if let Ok(num) = refno_str.parse::<u64>() {
-                     parsed_refnos.push(RefnoEnum::Refno(RefU64(num)));
-                     continue;
+                    parsed_refnos.push(RefnoEnum::Refno(RefU64(num)));
+                    continue;
                 }
 
                 // 解析失败，记录错误并跳过
@@ -7682,7 +7773,11 @@ async fn execute_refno_model_generation(
 
     // 调用 gen_all_geos_data
     let start_time = Instant::now();
-    let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
+    let mut db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
+    db_option_ext.index_tree_enabled_target_types = config.enabled_nouns.clone().unwrap_or_default();
+    db_option_ext.index_tree_excluded_target_types =
+        config.excluded_nouns.clone().unwrap_or_default();
+    db_option_ext.index_tree_debug_limit_per_target_type = config.debug_limit_per_noun_type;
 
     // 🆕 检查数据是否存在于 pe 表中，如果不存在则先触发解析
     let mut missing_parsing = false;
@@ -7694,67 +7789,70 @@ async fn execute_refno_model_generation(
     }
 
     if missing_parsing {
-         // 获取任务配置中的 dbno (通常 manual_db_nums 包含一个值)
-         if let Some(db_num) = config.manual_db_nums.first() {
-              info!("[RefnoModelGeneration] 检测到数据缺失，尝试解析 DB {}", db_num);
-             
-              // 更新进度：开始解析
-              {
+        // 获取任务配置中的 dbno (通常 manual_db_nums 包含一个值)
+        if let Some(db_num) = config.manual_db_nums.first() {
+            info!(
+                "[RefnoModelGeneration] 检测到数据缺失，尝试解析 DB {}",
+                db_num
+            );
+
+            // 更新进度：开始解析
+            {
+                let mut task_manager = state.task_manager.lock().await;
+                if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
+                    task.update_progress("自动解析缺失数据".to_string(), 0, 3, 10.0);
+                    task.add_log(
+                        LogLevel::Info,
+                        format!("检测到 refno 数据缺失，正在自动解析数据库 DB {}...", db_num),
+                    );
+                }
+            }
+
+            // 构造解析配置
+            let mut parse_opt = aios_core::options::DbOption::default();
+            // 复用任务配置中的连接参数
+            parse_opt.included_projects = vec![config.project_name.clone()];
+            parse_opt.surreal_ip = config.db_ip.clone();
+            parse_opt.surreal_user = config.db_user.clone();
+            parse_opt.surreal_password = config.db_password.clone();
+            parse_opt.surreal_port = config.db_port.parse::<u16>().unwrap_or(8009);
+            parse_opt.manual_db_nums = Some(vec![*db_num]);
+            parse_opt.project_name = config.project_name.clone();
+            parse_opt.project_code = config.project_code.to_string();
+            parse_opt.project_path = config.project_path.clone();
+            parse_opt.total_sync = true; // 全量同步以确保数据完整
+
+            // 使用简单的回调函数 (仅打印日志)
+            let cb = |project_name: &str,
+                      _current_project: usize,
+                      _total_projects: usize,
+                      _current_file: usize,
+                      _total_files: usize,
+                      _current_chunk: usize,
+                      _total_chunks: usize| {
+                debug!("Parsing project: {}", project_name);
+            };
+
+            // 执行解析
+            use crate::versioned_db::database::sync_pdms_with_callback;
+            match sync_pdms_with_callback(&parse_opt, Some(cb)).await {
+                Ok(_) => {
+                    info!("[RefnoModelGeneration] 数据库解析成功");
                     let mut task_manager = state.task_manager.lock().await;
                     if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
-                        task.update_progress("自动解析缺失数据".to_string(), 0, 3, 10.0);
-                        task.add_log(
-                            LogLevel::Info,
-                            format!("检测到 refno 数据缺失，正在自动解析数据库 DB {}...", db_num),
-                        );
+                        task.add_log(LogLevel::Info, "数据库自动解析完成".to_string());
                     }
-              }
-
-              // 构造解析配置
-              let mut parse_opt = aios_core::options::DbOption::default();
-              // 复用任务配置中的连接参数
-              parse_opt.included_projects = vec![config.project_name.clone()];
-              parse_opt.surreal_ip = config.db_ip.clone();
-              parse_opt.surreal_user = config.db_user.clone();
-              parse_opt.surreal_password = config.db_password.clone();
-              parse_opt.surreal_port = config.db_port.parse::<u16>().unwrap_or(8009);
-              parse_opt.manual_db_nums = Some(vec![*db_num]);
-              parse_opt.project_name = config.project_name.clone();
-              parse_opt.project_code = config.project_code.to_string();
-              parse_opt.project_path = config.project_path.clone();
-              parse_opt.total_sync = true; // 全量同步以确保数据完整
-
-              // 使用简单的回调函数 (仅打印日志)
-              let cb = |project_name: &str,
-                            _current_project: usize,
-                            _total_projects: usize,
-                            _current_file: usize,
-                            _total_files: usize,
-                            _current_chunk: usize,
-                            _total_chunks: usize| {
-                 debug!("Parsing project: {}", project_name);
-              };
-
-              // 执行解析
-              use crate::versioned_db::database::sync_pdms_with_callback;
-              match sync_pdms_with_callback(&parse_opt, Some(cb)).await {
-                   Ok(_) => {
-                       info!("[RefnoModelGeneration] 数据库解析成功");
-                       let mut task_manager = state.task_manager.lock().await;
-                        if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
-                            task.add_log(LogLevel::Info, "数据库自动解析完成".to_string());
-                        }
-                   },
-                   Err(e) => {
-                       error!("[RefnoModelGeneration] 数据库解析失败: {}", e);
-                       let mut task_manager = state.task_manager.lock().await;
-                        if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
-                            task.add_log(LogLevel::Error, format!("数据库解析失败: {}", e));
-                            // 解析失败可以选择返回或继续尝试（这里选择记录错误但继续尝试生成，虽然可能会失败）
-                        }
-                   }
-              }
-         }
+                }
+                Err(e) => {
+                    error!("[RefnoModelGeneration] 数据库解析失败: {}", e);
+                    let mut task_manager = state.task_manager.lock().await;
+                    if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
+                        task.add_log(LogLevel::Error, format!("数据库解析失败: {}", e));
+                        // 解析失败可以选择返回或继续尝试（这里选择记录错误但继续尝试生成，虽然可能会失败）
+                    }
+                }
+            }
+        }
     }
 
     // 重新获取 options (避免借用问题，虽然这里 clone 了)
@@ -7773,7 +7871,7 @@ async fn execute_refno_model_generation(
         Ok(_) => {
             // 成功 - 导出 bundle
             let bundle_output_dir = PathBuf::from(format!("output/tasks/{}", task_id));
-            
+
             // 更新进度：开始导出
             {
                 let mut task_manager = state.task_manager.lock().await;
@@ -7788,21 +7886,26 @@ async fn execute_refno_model_generation(
 
             // 导出 bundle
             let config_read = state.config_manager.read().await;
-            let mesh_path_str = config_read.current_config.meshes_path.clone()
-                .unwrap_or_else(|| "/Volumes/DPC/work/plant-code/rs-plant3-d/assets/meshes".to_string());
+            let mesh_path_str = config_read
+                .current_config
+                .meshes_path
+                .clone()
+                .unwrap_or_else(|| {
+                    "/Volumes/DPC/work/plant-code/rs-plant3-d/assets/meshes".to_string()
+                });
             let mesh_dir = std::path::Path::new(&mesh_path_str);
             drop(config_read); // Drop lock just in case
 
             let mut dbno = config.manual_db_nums.first().copied();
-            
+
             // 如果未能从配置获取 dbno，则尝试从数据库查询
             if dbno.is_none() {
                 for refno in &parsed_refnos {
                     // 查询 PE 获取 dbnum
                     if let Ok(Some(pe)) = aios_core::get_pe(*refno).await {
-                         dbno = Some(pe.dbnum as u32);
-                         debug!("从数据库查询到 refno {} 的 dbnum: {}", refno, pe.dbnum);
-                         break;
+                        dbno = Some(pe.dbnum as u32);
+                        debug!("从数据库查询到 refno {} 的 dbnum: {}", refno, pe.dbnum);
+                        break;
                     }
                 }
             }
@@ -7818,7 +7921,7 @@ async fn execute_refno_model_generation(
             match bundle_result {
                 Ok(bundle_path) => {
                     let bundle_url = format!("/files/output/tasks/{}/", task_id);
-                    
+
                     let mut task_manager = state.task_manager.lock().await;
                     if let Some(mut task) = task_manager.active_tasks.remove(&task_id) {
                         task.status = TaskStatus::Completed;
@@ -7834,10 +7937,7 @@ async fn execute_refno_model_generation(
                                 parsed_refnos.len()
                             ),
                         );
-                        task.add_log(
-                            LogLevel::Info,
-                            format!("Bundle 路径: {}", bundle_url),
-                        );
+                        task.add_log(LogLevel::Info, format!("Bundle 路径: {}", bundle_url));
 
                         // Store bundle_url in task metadata
                         if task.metadata.is_none() {
@@ -8115,20 +8215,25 @@ pub async fn api_show_by_refno(
             ));
         }
     };
-    
+
     // 查询所有 refnos (包括 visible)
     // 这里我们先使用前端传递的 refno 列表，实际上应该展开 visible
     // 暂时保持逻辑，使用 parsed_refnos 作为目标
-    
+
     // 3.1 如果 regen_model=true，删除旧数据并强制重新生成
     if req.regen_model {
         info!("[ShowByRefno] regen_model=true, 删除旧的 inst_relate 数据并强制重新生成");
-        
+
         // 删除旧的 inst_relate 记录
-        if let Err(e) = aios_core::rs_surreal::inst::delete_inst_relate_cascade(&parsed_refnos, 50).await {
+        if let Err(e) =
+            aios_core::rs_surreal::inst::delete_inst_relate_cascade(&parsed_refnos, 50).await
+        {
             warn!("[ShowByRefno] 删除旧的 inst_relate 失败: {}, 继续生成", e);
         } else {
-            info!("[ShowByRefno] 已删除 {} 个 refno 的旧 inst_relate 数据", parsed_refnos.len());
+            info!(
+                "[ShowByRefno] 已删除 {} 个 refno 的旧 inst_relate 数据",
+                parsed_refnos.len()
+            );
         }
     }
 
@@ -8144,19 +8249,17 @@ pub async fn api_show_by_refno(
     let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
 
     // 5. 调用生成函数
-    let result = crate::fast_model::gen_all_geos_data(
-        parsed_refnos.clone(),
-        &db_option_ext,
-        None,
-        None,
-    )
-    .await;
+    let result =
+        crate::fast_model::gen_all_geos_data(parsed_refnos.clone(), &db_option_ext, None, None)
+            .await;
 
     match result {
         Ok(_) => {
             // 如果不需要生成 Parquet，直接返回成功 (SurrealDB 中数据已经生成)
             if !req.gen_parquet {
-                info!("[ShowByRefno] 模型生成完成 (SurrealDB)，由于 gen_parquet=false, 跳过 Parquet 导出");
+                info!(
+                    "[ShowByRefno] 模型生成完成 (SurrealDB)，由于 gen_parquet=false, 跳过 Parquet 导出"
+                );
                 return Ok(Json(ShowByRefnoResponse {
                     success: true,
                     bundle_url: None,
@@ -8176,7 +8279,8 @@ pub async fn api_show_by_refno(
 
             // 生成临时任务 ID 用于导出路径隔离
             let temp_task_id = format!("temp_{}", Uuid::new_v4().simple());
-            let bundle_output_dir = std::path::PathBuf::from(format!("output/temp-models/{}", temp_task_id));
+            let bundle_output_dir =
+                std::path::PathBuf::from(format!("output/temp-models/{}", temp_task_id));
 
             let bundle_result = crate::web_server::instance_export::export_model_bundle_with_dbno(
                 &parsed_refnos,
@@ -8190,9 +8294,11 @@ pub async fn api_show_by_refno(
             match bundle_result {
                 Ok(_path) => {
                     info!("[ShowByRefno] 增量 Parquet 导出成功，dbno: {}", dbno);
-                    
+
                     // 获取最新文件列表
-                    let pm = crate::fast_model::export_model::parquet_writer::ParquetManager::new("assets");
+                    let pm = crate::fast_model::export_model::parquet_writer::ParquetManager::new(
+                        "assets",
+                    );
                     let files = pm.list_parquet_files(dbno, None).unwrap_or_default();
 
                     Ok(Json(ShowByRefnoResponse {
@@ -8242,7 +8348,7 @@ pub async fn api_list_parquet_files(
     use crate::fast_model::export_model::parquet_writer::ParquetManager;
 
     let manager = ParquetManager::new("assets");
-    
+
     match manager.list_parquet_files(dbno, query.file_type.as_deref()) {
         Ok(files) => Ok(Json(files)),
         Err(e) => Err((
@@ -8265,17 +8371,15 @@ pub struct SceneTreeFileResponse {
 }
 
 /// 获取指定 dbno 的 scene_tree Parquet 文件信息
-/// 
+///
 /// GET /api/model/{dbno}/scene-tree
-pub async fn api_get_scene_tree_file(
-    Path(dbno): Path<u32>,
-) -> Json<SceneTreeFileResponse> {
+pub async fn api_get_scene_tree_file(Path(dbno): Path<u32>) -> Json<SceneTreeFileResponse> {
     let filename = format!("scene_tree_{}.parquet", dbno);
     let file_path = format!("output/database_models/{}/{}", dbno, filename);
     let url = format!("/files/output/database_models/{}/{}", dbno, filename);
-    
+
     let exists = std::path::Path::new(&file_path).exists();
-    
+
     if exists {
         Json(SceneTreeFileResponse {
             success: true,
@@ -8328,4 +8432,3 @@ pub async fn api_get_scene_tree_file(
         })
     }
 }
-

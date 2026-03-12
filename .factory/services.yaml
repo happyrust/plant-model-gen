@@ -1,4 +1,7 @@
 commands:
+  # Aggregate test command for baseline validation
+  test: cd /Volumes/DPC/work/plant-code/plant3d-web && npm run type-check
+  
   # Backend commands
   backend-check: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo check --bin web_server --features web_server
   backend-test: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo test --no-default-features --features ws,sqlite-index,web_server

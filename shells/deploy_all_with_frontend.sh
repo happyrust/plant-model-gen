@@ -56,6 +56,31 @@ need_cmd() {
   }
 }
 
+# Retry wrapper for transient SSH failures
+retry_with_backoff() {
+  local max_attempts=5
+  local delay=2
+  local attempt=1
+  local exit_code=0
+
+  while [[ $attempt -le $max_attempts ]]; do
+    if "$@"; then
+      return 0
+    else
+      exit_code=$?
+      if [[ $attempt -lt $max_attempts ]]; then
+        log "Attempt $attempt/$max_attempts failed (exit code $exit_code), retrying in ${delay}s..."
+        sleep "$delay"
+        delay=$((delay * 2))
+        attempt=$((attempt + 1))
+      else
+        log "All $max_attempts attempts failed"
+        return $exit_code
+      fi
+    fi
+  done
+}
+
 need_cmd sshpass
 [[ -x "$BACKEND_SCRIPT" ]] || { printf 'Backend deploy script is missing or not executable: %s\n' "$BACKEND_SCRIPT" >&2; exit 1; }
 [[ -x "$FRONTEND_SCRIPT" ]] || { printf 'Frontend deploy script is missing or not executable: %s\n' "$FRONTEND_SCRIPT" >&2; exit 1; }
@@ -76,13 +101,59 @@ REMOTE_HOST="$REMOTE_HOST" REMOTE_USER="$REMOTE_USER" REMOTE_PASS="$REMOTE_PASS"
   "$FRONTEND_SCRIPT"
 
 log "Verifying remote health"
-sshpass -p "$REMOTE_PASS" ssh "${SSH_OPTS[@]}" "$REMOTE_USER@$REMOTE_HOST" "set -e; \
+run_ssh_with_retry() {
+  local attempt=1
+  local max_attempts=5
+  local delay=2
+  
+  while [[ $attempt -le $max_attempts ]]; do
+    if sshpass -p "$REMOTE_PASS" ssh "${SSH_OPTS[@]}" "$REMOTE_USER@$REMOTE_HOST" "$@"; then
+      return 0
+    else
+      local exit_code=$?
+      if [[ $attempt -lt $max_attempts ]]; then
+        log "SSH verification attempt $attempt/$max_attempts failed (exit code $exit_code), retrying in ${delay}s..."
+        sleep "$delay"
+        delay=$((delay * 2))
+        attempt=$((attempt + 1))
+      else
+        log "All $max_attempts SSH verification attempts failed"
+        return $exit_code
+      fi
+    fi
+  done
+}
+
+run_curl_with_retry() {
+  local attempt=1
+  local max_attempts=5
+  local delay=2
+  
+  while [[ $attempt -le $max_attempts ]]; do
+    if curl -fsS "$@" >/dev/null; then
+      return 0
+    else
+      local exit_code=$?
+      if [[ $attempt -lt $max_attempts ]]; then
+        log "curl attempt $attempt/$max_attempts failed (exit code $exit_code), retrying in ${delay}s..."
+        sleep "$delay"
+        delay=$((delay * 2))
+        attempt=$((attempt + 1))
+      else
+        log "All $max_attempts curl attempts failed"
+        return $exit_code
+      fi
+    fi
+  done
+}
+
+run_ssh_with_retry "set -e; \
   systemctl is-active web-server; \
   systemctl is-active nginx; \
   curl -fsS ${BACKEND_ORIGIN%/}/ >/dev/null; \
   curl -fsS ${BACKEND_ORIGIN%/}/api/projects >/dev/null"
 
-curl -fsS "http://$REMOTE_HOST/" >/dev/null
-curl -fsS "http://$REMOTE_HOST/api/projects" >/dev/null
+run_curl_with_retry "http://$REMOTE_HOST/"
+run_curl_with_retry "http://$REMOTE_HOST/api/projects"
 
 log "Backend, frontend, and proxy verification passed"

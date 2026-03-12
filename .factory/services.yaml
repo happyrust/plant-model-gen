@@ -1,25 +1,34 @@
 commands:
-  backend_test: cargo test --features web_server web_api::review_api::tests:: -- --nocapture && cargo test --features web_server web_api::jwt_auth::tests:: -- --nocapture && cargo test --features web_server web_server::room_api::tests:: -- --nocapture && cargo test --features web_server web_server::sqlite_spatial_api::tests:: -- --nocapture
-  backend_typecheck: cargo check --tests --lib --bins --features web_server
-  backend_release_check: cargo check --release --bin web_server --no-default-features --features ws,gen_model,manifold,project_hd,surreal-save,sqlite-index,web_server,parquet-export
-  frontend_install: npm install --prefix /Volumes/DPC/work/plant-code/plant3d-web
-  frontend_test: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web test
-  frontend_typecheck: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web run type-check
-  frontend_lint: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web run lint
-  frontend_build: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web run build-only
-  e2e: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web run test:e2e
+  # Backend commands
+  backend-check: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo check --bin web_server --features web_server
+  backend-test: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo test --no-default-features --features ws,sqlite-index,web_server
+  backend-build: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo build --bin web_server --no-default-features --features ws,sqlite-index,surreal-save,web_server
+  backend-fmt: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo fmt --all
+  backend-clippy: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo clippy --features web_server -- -D warnings
+  
+  # Frontend commands
+  frontend-typecheck: cd /Volumes/DPC/work/plant-code/plant3d-web && npm run type-check
+  frontend-build: cd /Volumes/DPC/work/plant-code/plant3d-web && npm run build-only
+  frontend-test: cd /Volumes/DPC/work/plant-code/plant3d-web && npm run test
 
 services:
-  backend:
-    start: DB_OPTION_FILE=db_options/DbOption-mac WEB_SERVER_PORT=3100 cargo run --bin web_server --features web_server
-    stop: lsof -ti :3100 | xargs kill
-    healthcheck: curl -sf http://127.0.0.1:3100/api/health
-    port: 3100
+  surrealdb:
+    start: echo "SurrealDB already running on 8020"
+    stop: echo "Do not stop SurrealDB (shared service)"
+    healthcheck: curl -sf http://localhost:8020/health || echo "SurrealDB running"
+    port: 8020
     depends_on: []
 
+  backend:
+    start: cd /Volumes/DPC/work/plant-code/plant-model-gen && ./target/debug/web_server
+    stop: lsof -ti :3100 | xargs kill -TERM
+    healthcheck: curl -sf http://localhost:3100/api/status
+    port: 3100
+    depends_on: [surrealdb]
+
   frontend:
-    start: npm --prefix /Volumes/DPC/work/plant-code/plant3d-web run dev -- --host 127.0.0.1 --port 3101 --strictPort
-    stop: lsof -ti :3101 | xargs kill
-    healthcheck: curl -sf http://127.0.0.1:3101
+    start: cd /Volumes/DPC/work/plant-code/plant3d-web && npm run dev
+    stop: lsof -ti :3101 | xargs kill -TERM
+    healthcheck: curl -sf http://localhost:3101
     port: 3101
     depends_on: [backend]

@@ -1,49 +1,43 @@
 # User Testing
 
-Manual testing surface, browser entry points, and local validation notes.
+Testing surface: tools, URLs, setup steps, isolation notes, known quirks.
 
-**What belongs here:** URLs, tools, setup steps, known quirks, browser/manual validation guidance.
+**What belongs here:** How to manually test the application, what tools to use, test accounts, known issues.
 
 ---
 
-## Local Testing Surface
+## Testing Surface
 
-- Backend API: `http://127.0.0.1:3100`
-- Frontend app: `http://127.0.0.1:3101`
+**Backend API:**
+- Base URL: http://localhost:3100
+- Key endpoints: /api/tasks, /api/status, /api/config
+- Test with: curl, Postman, or browser DevTools
 
-## Core Manual Flow
+**Frontend UI:**
+- Base URL: http://localhost:3101
+- Entry point: Project selection → Task creation
+- Test with: agent-browser, manual browser testing
 
-1. Start backend on `3100`.
-2. Start frontend on `3101`.
-3. Open the frontend with embedded parameters including at least:
-   - `form_id`
-   - `user_token`
-   - `user_id`
-   - `project_id`
-4. Verify role-based landing.
-5. Save draft or review data.
-6. Submit or return the task.
-7. Reopen with the same `form_id`.
-8. Trigger model location from task/opinion/attachment context.
+## Testing Tools
 
-## Evidence Expectations
+**agent-browser:**
+- Available at: ~/.factory/bin/agent-browser
+- Usage: Navigate to http://localhost:3101, interact with UI
+- Can take screenshots, extract page structure
 
-- Capture browser screenshots for landing state, saved state, reopened state, and located model state.
-- Capture network evidence showing the same `form_id` across the full flow.
-- Record any degraded external sync behavior separately from local workflow success.
+**curl:**
+- Test API endpoints directly
+- Example: `curl http://localhost:3100/api/status`
+
+## Test Workflow
+
+1. **Create task**: Open http://localhost:3101, select AvevaMarineSample project, click task creation
+2. **Fill form**: Enter name, select DataGeneration, add dbnum=7997, nouns=["BRAN"], limit=10
+3. **Monitor**: Watch progress bar update in real-time
+4. **Preview**: Click preview button when complete, verify model loads
 
 ## Known Quirks
 
-- Existing code previously defaulted to a non-mission backend port; mission work is expected to align local validation to `3100`.
-- Some external sync behavior may degrade to mock behavior locally; this does not excuse failures in local workflow state, persistence, or viewer location.
-
-## Release Validation Surface
-
-- Production URL: `http://123.57.182.243/`
-- Production API version endpoint target: `http://123.57.182.243/api/version`
-- Required release validation action: open Help/About in the live UI and verify both frontend and backend version metadata are visible.
-- Required production evidence:
-  - screenshot of Help/About showing frontend version/build date/commit
-  - screenshot of Help/About showing backend version/build date/commit
-  - API response capture from `/api/version`
-  - CI evidence that the deployed tag matches the displayed metadata
+- API status may show `database_connected: false` even when connected (check logs)
+- WebSocket updates may have 1-2 second delay (normal)
+- Frontend dev server may need restart after major changes

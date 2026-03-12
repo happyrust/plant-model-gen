@@ -613,7 +613,7 @@ async fn update_booled_result(
 
         inst_aabb_map.insert(refno, aabb_hash.to_string());
 
-        crate::fast_model::utils::save_inst_relate_booled_aabb(&inst_aabb_map, "bool_mesh").await;
+        crate::fast_model::utils::save_inst_relate_booled_aabb(&inst_aabb_map, "bool_mesh").await?;
 
         
 
@@ -2167,11 +2167,11 @@ impl BoolResultWriter for SqlBoolWriter {
             let aabb_hash = aios_core::gen_aabb_hash(&aabb).to_string();
             let aabb_json = serde_json::to_string(&aabb)?;
             sqls.push(format!(
-                "INSERT IGNORE INTO aabb [{{'id':aabb:⟨{}⟩, 'd':{}}}]",
+                "UPSERT aabb:⟨{}⟩ SET d = {}",
                 aabb_hash, aabb_json
             ));
             sqls.push(format!(
-                "INSERT IGNORE INTO inst_relate_booled_aabb [{{ id: inst_relate_booled_aabb:⟨{}⟩, refno: pe:⟨{}⟩, aabb_id: aabb:⟨{}⟩ }}]",
+                "UPSERT inst_relate_booled_aabb:⟨{}⟩ SET refno = pe:⟨{}⟩, aabb_id = aabb:⟨{}⟩",
                 refno, refno, aabb_hash
             ));
         }

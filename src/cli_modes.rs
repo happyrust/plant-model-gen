@@ -2956,7 +2956,7 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
         aabb: serde_json::Value,
     }
 
-    println!("\n🗃️ 构建空间索引 (from inst_relate_aabb)");
+    println!("\n🗃️ 构建空间索引 (from inst_relate_aabb + booled_aabb override)");
     println!("==========================================");
 
     let start_time = Instant::now();
@@ -2972,6 +2972,69 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
     let idx = SqliteAabbIndex::open(&idx_path)?;
     idx.init_schema()?;
 
+    fn parse_aabb_json(aabb_val: &serde_json::Value) -> Option<(f64, f64, f64, f64, f64, f64)> {
+        if let (Some(mins), Some(maxs)) = (aabb_val.get("mins"), aabb_val.get("maxs")) {
+            let get3_obj = |v: &serde_json::Value| -> Option<(f64, f64, f64)> {
+                Some((v.get("x")?.as_f64()?, v.get("y")?.as_f64()?, v.get("z")?.as_f64()?))
+            };
+            let get3_arr = |v: &serde_json::Value| -> Option<(f64, f64, f64)> {
+                let arr = v.as_array()?;
+                if arr.len() < 3 { return None; }
+                Some((arr[0].as_f64()?, arr[1].as_f64()?, arr[2].as_f64()?))
+            };
+            match (
+                get3_obj(mins).or_else(|| get3_arr(mins)),
+                get3_obj(maxs).or_else(|| get3_arr(maxs)),
+            ) {
+                (Some(mn), Some(mx)) => Some((mn.0, mn.1, mn.2, mx.0, mx.1, mx.2)),
+                _ => None,
+            }
+        } else if let (Some(min_arr), Some(max_arr)) = (
+            aabb_val.get("min").and_then(|v| v.as_array()),
+            aabb_val.get("max").and_then(|v| v.as_array()),
+        ) {
+            if min_arr.len() >= 3 && max_arr.len() >= 3 {
+                Some((
+                    min_arr[0].as_f64().unwrap_or(0.0),
+                    min_arr[1].as_f64().unwrap_or(0.0),
+                    min_arr[2].as_f64().unwrap_or(0.0),
+                    max_arr[0].as_f64().unwrap_or(0.0),
+                    max_arr[1].as_f64().unwrap_or(0.0),
+                    max_arr[2].as_f64().unwrap_or(0.0),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    // 预加载布尔运算后的 AABB 覆盖（优先级更高）
+    let mut booled_map: std::collections::HashMap<i64, (f64, f64, f64, f64, f64, f64)> =
+        std::collections::HashMap::new();
+    {
+        let booled_sql = r#"SELECT refno, aabb_id.d AS aabb FROM inst_relate_booled_aabb"#;
+        match model_primary_db().query_take::<Vec<InstRelateAabbRecord>>(booled_sql, 0).await {
+            Ok(booled_records) => {
+                for rec in &booled_records {
+                    if rec.aabb.is_null() { continue; }
+                    if let Some(coords) = parse_aabb_json(&rec.aabb) {
+                        booled_map.insert(rec.refno.refno().0 as i64, coords);
+                    }
+                }
+                if !booled_map.is_empty() {
+                    println!("   📊 加载 {} 条布尔运算后 AABB 覆盖", booled_map.len());
+                }
+            }
+            Err(_) => {
+                if verbose {
+                    println!("   ℹ️ inst_relate_booled_aabb 表不存在，跳过");
+                }
+            }
+        }
+    }
+
     // 从 inst_relate_aabb 普通表查询所有记录，join aabb 表取坐标
     let sql = r#"SELECT refno, aabb_id.d AS aabb FROM inst_relate_aabb"#;
     let records: Vec<InstRelateAabbRecord> = model_primary_db().query_take(sql, 0).await?;
@@ -2979,59 +3042,23 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
     println!("   📊 查询到 {} 个 inst_relate_aabb 记录", records.len());
 
     let mut inserted = 0usize;
+    let mut booled_override_count = 0usize;
     let mut batch: Vec<(i64, f64, f64, f64, f64, f64, f64)> = Vec::new();
 
     for rec in &records {
         let refno_id = rec.refno.refno().0 as i64;
 
-        // 解析 aabb：格式为 {"mins": {"x":..,"y":..,"z":..}, "maxs": {...}}
-        if rec.aabb.is_null() {
-            continue;
-        }
-        let aabb_val = &rec.aabb;
-
-        let (minx, miny, minz, maxx, maxy, maxz) =
-            if let (Some(mins), Some(maxs)) = (aabb_val.get("mins"), aabb_val.get("maxs")) {
-                let get3_obj = |v: &serde_json::Value| -> Option<(f64, f64, f64)> {
-                    Some((
-                        v.get("x")?.as_f64()?,
-                        v.get("y")?.as_f64()?,
-                        v.get("z")?.as_f64()?,
-                    ))
-                };
-                let get3_arr = |v: &serde_json::Value| -> Option<(f64, f64, f64)> {
-                    let arr = v.as_array()?;
-                    if arr.len() < 3 {
-                        return None;
-                    }
-                    Some((arr[0].as_f64()?, arr[1].as_f64()?, arr[2].as_f64()?))
-                };
-                match (
-                    get3_obj(mins).or_else(|| get3_arr(mins)),
-                    get3_obj(maxs).or_else(|| get3_arr(maxs)),
-                ) {
-                    (Some(mn), Some(mx)) => (mn.0, mn.1, mn.2, mx.0, mx.1, mx.2),
-                    _ => continue,
-                }
-            } else if let (Some(min_arr), Some(max_arr)) = (
-                aabb_val.get("min").and_then(|v| v.as_array()),
-                aabb_val.get("max").and_then(|v| v.as_array()),
-            ) {
-                if min_arr.len() >= 3 && max_arr.len() >= 3 {
-                    (
-                        min_arr[0].as_f64().unwrap_or(0.0),
-                        min_arr[1].as_f64().unwrap_or(0.0),
-                        min_arr[2].as_f64().unwrap_or(0.0),
-                        max_arr[0].as_f64().unwrap_or(0.0),
-                        max_arr[1].as_f64().unwrap_or(0.0),
-                        max_arr[2].as_f64().unwrap_or(0.0),
-                    )
-                } else {
-                    continue;
-                }
-            } else {
-                continue;
-            };
+        // 优先使用布尔运算后的 AABB
+        let (minx, miny, minz, maxx, maxy, maxz) = if let Some(&coords) = booled_map.get(&refno_id) {
+            booled_override_count += 1;
+            coords
+        } else {
+            if rec.aabb.is_null() { continue; }
+            match parse_aabb_json(&rec.aabb) {
+                Some(coords) => coords,
+                None => continue,
+            }
+        };
 
         batch.push((refno_id, minx, maxx, miny, maxy, minz, maxz));
         inserted += 1;
@@ -3041,7 +3068,7 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
 
     let duration = start_time.elapsed();
     println!("   ✅ 空间索引构建完成");
-    println!("   📊 总计: {} 个构件", inserted);
+    println!("   📊 总计: {} 个构件 (其中 {} 个使用布尔运算后 AABB)", inserted, booled_override_count);
     println!("   ⏱️  耗时: {:.2}s", duration.as_secs_f64());
 
     Ok(())

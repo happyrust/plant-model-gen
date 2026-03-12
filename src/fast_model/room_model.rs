@@ -321,7 +321,8 @@ struct QueryAabbRowRaw {
 }
 
 /// 从 inst_relate_aabb 批量查询 refno -> Aabb 映射。
-/// inst_relate_aabb 为普通表（refno, aabb_id），通过 refno 过滤。
+/// 优先使用 inst_relate_booled_aabb（布尔运算后的 AABB），
+/// 如果布尔运算后没有对应记录，则回退到 inst_relate_aabb（原始几何 AABB）。
 /// 同 refno 多条记录时取 union Aabb（merge）。
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub(crate) async fn query_aabb_from_inst_relate_aabb(
@@ -334,55 +335,79 @@ pub(crate) async fn query_aabb_from_inst_relate_aabb(
     let pe_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
     let ids = pe_keys.join(",");
 
-    let sql = format!(
-        "SELECT refno, aabb_id.d as aabb FROM inst_relate_aabb WHERE refno IN [{ids}] AND aabb_id.d != NONE"
-    );
-
-    let mut response = model_primary_db().query(&sql).await?;
-    let rows: Vec<QueryAabbRowRaw> = response.take(0)?;
-    let total_rows = rows.len();
-
     let debug_query = env::var("AIOS_ROOM_DEBUG")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
+    // 1) 先查布尔运算后的 AABB
+    let booled_sql = format!(
+        "SELECT refno, aabb_id.d as aabb FROM inst_relate_booled_aabb WHERE refno IN [{ids}] AND aabb_id.d != NONE"
+    );
+    let booled_rows: Vec<QueryAabbRowRaw> = match model_primary_db().query(&booled_sql).await {
+        Ok(mut resp) => resp.take(0).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
     let mut map = HashMap::new();
+    let mut booled_count = 0usize;
     let mut skipped_refno = 0usize;
     let mut skipped_aabb = 0usize;
-    for row in rows {
+
+    for row in &booled_rows {
         if !row.refno.is_valid() {
             skipped_refno += 1;
-            if debug_query {
-                debug!(
-                    "query_aabb_from_inst_relate_aabb: 跳过 refno invalid {}",
-                    row.refno
-                );
-            }
             continue;
         }
         let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
             skipped_aabb += 1;
-            if debug_query {
-                debug!(
-                    "query_aabb_from_inst_relate_aabb: 跳过 aabb 解析失败 refno={}",
-                    row.refno
-                );
-            }
             continue;
         };
+        booled_count += 1;
         map.entry(row.refno)
             .and_modify(|acc| *acc = merge_aabb(acc, &aabb))
             .or_insert(aabb);
     }
+
+    // 2) 找出还没有 booled AABB 的 refno，回退查 inst_relate_aabb
+    let missing: Vec<String> = refnos
+        .iter()
+        .filter(|r| !map.contains_key(r))
+        .map(|r| r.to_pe_key())
+        .collect();
+
+    if !missing.is_empty() {
+        let missing_ids = missing.join(",");
+        let fallback_sql = format!(
+            "SELECT refno, aabb_id.d as aabb FROM inst_relate_aabb WHERE refno IN [{missing_ids}] AND aabb_id.d != NONE"
+        );
+        let mut response = model_primary_db().query(&fallback_sql).await?;
+        let rows: Vec<QueryAabbRowRaw> = response.take(0)?;
+
+        for row in rows {
+            if !row.refno.is_valid() {
+                skipped_refno += 1;
+                continue;
+            }
+            let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
+                skipped_aabb += 1;
+                continue;
+            };
+            map.entry(row.refno)
+                .and_modify(|acc| *acc = merge_aabb(acc, &aabb))
+                .or_insert(aabb);
+        }
+    }
+
     if debug_query {
         println!(
-            "[room_debug] query_aabb_from_inst_relate_aabb: rows={} skipped_refno={} skipped_aabb={} map_size={}",
-            total_rows, skipped_refno, skipped_aabb, map.len()
+            "[room_debug] query_aabb: booled={} fallback={} skipped_refno={} skipped_aabb={} map_size={}",
+            booled_count,
+            map.len().saturating_sub(booled_count),
+            skipped_refno,
+            skipped_aabb,
+            map.len()
         );
-        if total_rows > 0 && map.is_empty() {
-            println!("[room_debug] 所有 {} 行均被过滤", total_rows);
-        }
     }
     Ok(map)
 }
@@ -421,8 +446,32 @@ async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
     let idx = SqliteSpatialIndex::with_default_path()?;
     idx.clear()?;
 
+    // 预加载所有布尔运算后的 AABB（优先级更高）
+    let mut booled_aabb_map: HashMap<RefnoEnum, Aabb> = HashMap::new();
+    {
+        let booled_sql = "SELECT refno, aabb_id.d as aabb FROM inst_relate_booled_aabb WHERE aabb_id.d != NONE";
+        match model_primary_db().query(booled_sql).await {
+            Ok(mut resp) => {
+                let booled_rows: Vec<QueryAabbRowRaw> = resp.take(0).unwrap_or_default();
+                for row in booled_rows {
+                    if !row.refno.is_valid() { continue; }
+                    if let Some(aabb) = parse_inst_relate_aabb(&row.aabb) {
+                        booled_aabb_map.insert(row.refno, aabb);
+                    }
+                }
+                if !booled_aabb_map.is_empty() {
+                    info!("[room_model] 加载 {} 条布尔运算后 AABB 用于空间索引覆盖", booled_aabb_map.len());
+                }
+            }
+            Err(e) => {
+                info!("[room_model] inst_relate_booled_aabb 查询失败（表可能不存在），跳过: {e}");
+            }
+        }
+    }
+
     let mut offset: usize = 0;
     let mut total_inserted: usize = 0;
+    let mut booled_override_count: usize = 0;
     let mut skipped_by_db: usize = 0;
     let mut skipped_by_refno_root: usize = 0;
     let mut skipped_by_missing_dbmap: usize = 0;
@@ -470,7 +519,13 @@ async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
                 }
             }
 
-            let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
+            // 优先使用布尔运算后的 AABB
+            let aabb = if let Some(booled) = booled_aabb_map.get(&row.refno) {
+                booled_override_count += 1;
+                *booled
+            } else if let Some(parsed) = parse_inst_relate_aabb(&row.aabb) {
+                parsed
+            } else {
                 skipped_by_invalid_aabb += 1;
                 continue;
             };
@@ -493,8 +548,9 @@ async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
     }
 
     info!(
-        "[room_model] SQLite AABB 刷新完成: inserted={}, skipped_db={}, skipped_refno_root={}, skipped_missing_dbmap={}, skipped_invalid_aabb={}",
+        "[room_model] SQLite AABB 刷新完成: inserted={}, booled_override={}, skipped_db={}, skipped_refno_root={}, skipped_missing_dbmap={}, skipped_invalid_aabb={}",
         total_inserted,
+        booled_override_count,
         skipped_by_db,
         skipped_by_refno_root,
         skipped_by_missing_dbmap,

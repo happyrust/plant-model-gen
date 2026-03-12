@@ -144,13 +144,13 @@ pub async fn save_inst_relate_cata_bool(
     }
 }
 
-/// 批量写入 inst_aabb_map 到指定的普通表（INSERT IGNORE）
+/// 批量写入 inst_aabb_map 到指定的普通表（UPSERT）
 async fn batch_insert_aabb_table(
     table: &str,
     inst_aabb_map: &DashMap<RefnoEnum, String>,
-) {
+) -> anyhow::Result<()> {
     if inst_aabb_map.is_empty() {
-        return;
+        return Ok(());
     }
 
     let keys: Vec<RefnoEnum> = inst_aabb_map
@@ -174,7 +174,7 @@ async fn batch_insert_aabb_table(
                 }
             };
             rows.push(format!(
-                "{{ id: {table}:⟨{refno_str}⟩, refno: {refno_key}, aabb_id: {aabb_key} }}"
+                "UPSERT {table}:⟨{refno_str}⟩ SET refno = {refno_key}, aabb_id = {aabb_key}"
             ));
         }
 
@@ -182,14 +182,18 @@ async fn batch_insert_aabb_table(
             continue;
         }
 
-        let sql = format!("INSERT IGNORE INTO {table} [{}];", rows.join(","));
-        if let Err(e) = model_primary_db().query_take::<surrealdb::types::Value>(&sql, 0).await {
+        let sql = rows.join(";\n") + ";";
+        if let Err(e) = model_primary_db().query(&sql).await {
+            let msg = format!("[batch_insert_aabb_table] {table} 写入失败: {e}");
+            log::error!("{msg}");
             init_save_database_error(
                 &format!("{sql}\n-- err: {e}"),
                 &std::panic::Location::caller().to_string(),
             );
+            return Err(anyhow::anyhow!(msg));
         }
     }
+    Ok(())
 }
 
 /// 批量保存实例 AABB 到普通表 inst_relate_aabb（原始几何 AABB）
@@ -197,15 +201,17 @@ pub async fn save_inst_relate_aabb(
     inst_aabb_map: &DashMap<RefnoEnum, String>,
     _source: &str,
 ) {
-    batch_insert_aabb_table("inst_relate_aabb", inst_aabb_map).await;
+    if let Err(e) = batch_insert_aabb_table("inst_relate_aabb", inst_aabb_map).await {
+        log::error!("save_inst_relate_aabb 失败: {e}");
+    }
 }
 
 /// 批量保存布尔运算后的 AABB 到普通表 inst_relate_booled_aabb
 pub async fn save_inst_relate_booled_aabb(
     inst_aabb_map: &DashMap<RefnoEnum, String>,
     _source: &str,
-) {
-    batch_insert_aabb_table("inst_relate_booled_aabb", inst_aabb_map).await;
+) -> anyhow::Result<()> {
+    batch_insert_aabb_table("inst_relate_booled_aabb", inst_aabb_map).await
 }
 
 pub async fn save_pts_to_surreal(vec3_map: &DashMap<u64, String>) {

@@ -3,45 +3,68 @@
 set -euo pipefail
 
 # ==============================================================================
-# Web Server RSYNC 一键部署脚本（含 surreal 资源目录）
+# Web Server RSYNC 一键部署脚本
+# 目标: 123.57.182.243 (Ubuntu 22.04 x86_64)
 # ==============================================================================
 
 REMOTE_HOST="${REMOTE_HOST:-123.57.182.243}"
 REMOTE_USER="${REMOTE_USER:-root}"
 REMOTE_PASS="${REMOTE_PASS:-Happytest123_}"
-SERVICE_NAME="${SERVICE_NAME:-web-server.service}"
+SERVICE_NAME="${SERVICE_NAME:-web-server}"
 
-BUILD_BINARY="${BUILD_BINARY:-false}" # true 时重新编译
-TARGET="${TARGET:-x86_64-unknown-linux-gnu.2.35}" # Ubuntu 22 兼容目标
+BUILD_BINARY="${BUILD_BINARY:-false}"        # true 时重新编译
+BUILD_PROFILE="${BUILD_PROFILE:-release}"     # release / debug
+TARGET="${TARGET:-x86_64-unknown-linux-gnu}"  # 交叉编译目标
 BINARY_NAME="${BINARY_NAME:-web_server}"
-FEATURES="${FEATURES:-web_server,parquet-export}"
+FEATURES="${FEATURES:-ws,gen_model,manifold,project_hd,surreal-save,sqlite-index,web_server,parquet-export}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-LOCAL_BIN="${PROJECT_DIR}/target/x86_64-unknown-linux-gnu/debug/${BINARY_NAME}"
-LOCAL_CONFIG="${PROJECT_DIR}/db_options/DbOption.toml"
-LOCAL_RS_CORE_DIR="${LOCAL_RS_CORE_DIR:-/Volumes/DPC/work/plant-code/rs-core}"
-LOCAL_SURREAL_DIR="${LOCAL_RS_CORE_DIR}/resource/surreal"
 
+# 二进制路径根据 profile 自动选择
+LOCAL_BIN="${PROJECT_DIR}/target/${TARGET}/${BUILD_PROFILE}/${BINARY_NAME}"
+
+# 运行时资源目录
+ASSETS_DIR="${PROJECT_DIR}/assets"
+OUTPUT_DIR="${PROJECT_DIR}/output"
+DB_OPTION_FILE="${DB_OPTION_FILE:-${PROJECT_DIR}/db_options/DbOption.toml}"
+
+# 远端路径
 REMOTE_BIN_NEW="/root/${BINARY_NAME}.new"
 REMOTE_BIN="/root/${BINARY_NAME}"
-REMOTE_CONFIG="/root/DbOption.toml"
-REMOTE_SURREAL_DIR="/root/resource/surreal"
+REMOTE_ASSETS_DIR="/root/assets"
+REMOTE_OUTPUT_DIR="/root/output"
+REMOTE_DB_OPTION="/root/DbOption.toml"
 
 SSH_OPTS="-o PreferredAuthentications=password -o PubkeyAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-RSYNC_RSH="ssh ${SSH_OPTS}"
-RSYNC_RSH_WITH_PASS="sshpass -p ${REMOTE_PASS} ssh ${SSH_OPTS}"
+RSYNC_RSH="sshpass -p ${REMOTE_PASS} ssh ${SSH_OPTS}"
 
+run_remote() {
+  sshpass -p "${REMOTE_PASS}" ssh ${SSH_OPTS} "${REMOTE_USER}@${REMOTE_HOST}" "$@"
+}
+
+# ── [1/7] 本地预检查 ──────────────────────────────────────────────────────────
 echo "[1/7] 本地预检查"
 command -v sshpass >/dev/null || { echo "缺少 sshpass"; exit 1; }
-command -v rsync >/dev/null || { echo "缺少 rsync"; exit 1; }
-[[ -f "${LOCAL_CONFIG}" ]] || { echo "缺少配置文件: ${LOCAL_CONFIG}"; exit 1; }
-[[ -d "${LOCAL_SURREAL_DIR}" ]] || { echo "缺少目录: ${LOCAL_SURREAL_DIR}"; exit 1; }
+command -v rsync  >/dev/null || { echo "缺少 rsync";  exit 1; }
+[[ -d "${ASSETS_DIR}" ]]     || { echo "缺少 assets 目录: ${ASSETS_DIR}"; exit 1; }
+[[ -f "${DB_OPTION_FILE}" ]] || { echo "缺少配置文件: ${DB_OPTION_FILE}"; exit 1; }
 
+# ── [2/7] 编译 ────────────────────────────────────────────────────────────────
 if [[ "${BUILD_BINARY}" == "true" ]]; then
-  echo "[2/7] cargo-zigbuild 编译"
+  echo "[2/7] cargo build --${BUILD_PROFILE} (target: ${TARGET})"
   cd "${PROJECT_DIR}"
-  cargo zigbuild --bin "${BINARY_NAME}" --target "${TARGET}" --features "${FEATURES}"
+  BUILD_ARGS=(
+    --manifest-path "${PROJECT_DIR}/Cargo.toml"
+    --bin "${BINARY_NAME}"
+    --no-default-features
+    --features "${FEATURES}"
+    --target "${TARGET}"
+  )
+  if [[ "${BUILD_PROFILE}" == "release" ]]; then
+    BUILD_ARGS+=(--release)
+  fi
+  cargo build "${BUILD_ARGS[@]}"
 else
   echo "[2/7] 跳过编译 (BUILD_BINARY=false)"
 fi
@@ -51,50 +74,59 @@ fi
   echo "可设置 BUILD_BINARY=true 自动编译。"
   exit 1
 }
+echo "  二进制文件: ${LOCAL_BIN} ($(du -h "${LOCAL_BIN}" | cut -f1))"
 
-echo "[3/7] 远端准备目录并停服务"
-sshpass -p "${REMOTE_PASS}" ssh ${SSH_OPTS} "${REMOTE_USER}@${REMOTE_HOST}" "
+# ── [3/7] 远端准备：创建目录并停止服务 ────────────────────────────────────────
+echo "[3/7] 远端准备目录并停止服务"
+run_remote "
   set -e
-  mkdir -p /root/resource/surreal
+  mkdir -p '${REMOTE_ASSETS_DIR}' '${REMOTE_OUTPUT_DIR}'
   systemctl stop '${SERVICE_NAME}' || true
 "
 
-echo "[4/7] rsync 同步二进制和配置"
-rsync -av --inplace --chmod=755 -e "${RSYNC_RSH_WITH_PASS}" \
+# ── [4/7] rsync 同步二进制 ────────────────────────────────────────────────────
+echo "[4/7] rsync 同步二进制"
+rsync -avz --inplace --chmod=755 -e "${RSYNC_RSH}" \
   "${LOCAL_BIN}" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_BIN_NEW}"
-rsync -av -e "${RSYNC_RSH_WITH_PASS}" \
-  "${LOCAL_CONFIG}" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CONFIG}"
 
-echo "[5/7] rsync 同步 rs-core/resource/surreal"
-rsync -av --delete -e "${RSYNC_RSH_WITH_PASS}" \
-  "${LOCAL_SURREAL_DIR}/" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_SURREAL_DIR}/"
+# ── [5/7] rsync 同步配置和资源目录 ────────────────────────────────────────────
+echo "[5/7] rsync 同步配置和资源"
+# DbOption.toml
+rsync -avz -e "${RSYNC_RSH}" \
+  "${DB_OPTION_FILE}" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DB_OPTION}"
 
-echo "[6/7] 修正配置并重启服务"
-sshpass -p "${REMOTE_PASS}" ssh ${SSH_OPTS} "${REMOTE_USER}@${REMOTE_HOST}" "
+# assets/
+rsync -avz --delete -e "${RSYNC_RSH}" \
+  "${ASSETS_DIR}/" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ASSETS_DIR}/"
+
+# output/ (可能不存在则跳过)
+if [[ -d "${OUTPUT_DIR}" ]]; then
+  rsync -avz --delete -e "${RSYNC_RSH}" \
+    "${OUTPUT_DIR}/" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_OUTPUT_DIR}/"
+else
+  echo "  跳过 output/ (本地目录不存在)"
+fi
+
+# ── [6/7] 激活二进制并重启服务 ────────────────────────────────────────────────
+echo "[6/7] 激活二进制并重启服务"
+run_remote "
   set -e
-  if grep -q '^surreal_script_dir[[:space:]]*=' '${REMOTE_CONFIG}'; then
-    sed -i 's#^surreal_script_dir[[:space:]]*=.*#surreal_script_dir = \"resource/surreal\"#' '${REMOTE_CONFIG}'
-  else
-    printf '\nsurreal_script_dir = \"resource/surreal\"\n' >> '${REMOTE_CONFIG}'
-  fi
   mv '${REMOTE_BIN_NEW}' '${REMOTE_BIN}'
   chmod +x '${REMOTE_BIN}'
   systemctl daemon-reload || true
   systemctl restart '${SERVICE_NAME}'
 "
 
-echo "[7/7] 验证"
-sshpass -p "${REMOTE_PASS}" ssh ${SSH_OPTS} "${REMOTE_USER}@${REMOTE_HOST}" "
+# ── [7/7] 验证 ────────────────────────────────────────────────────────────────
+echo "[7/7] 验证部署"
+run_remote "
   set -e
   systemctl is-active '${SERVICE_NAME}'
   pgrep -af '^/root/${BINARY_NAME}' || true
-  ls -ld '${REMOTE_SURREAL_DIR}'
-  find '${REMOTE_SURREAL_DIR}' -maxdepth 1 -type f -name '*.surql' | wc -l
-  grep -n '^surreal_script_dir' '${REMOTE_CONFIG}'
+  ls -lh '${REMOTE_BIN}'
   ss -ltnp | grep 8080 || true
-  code=\$(curl -s -o /tmp/web_home_rsync.txt -w '%{http_code}' -m 8 http://127.0.0.1:8080/ || true)
+  code=\$(curl -s -o /dev/null -w '%{http_code}' -m 10 http://127.0.0.1:8080/ || true)
   echo \"home_http_code=\$code\"
-  journalctl -u '${SERVICE_NAME}' --since '-2 min' --no-pager | grep -E 'Failed to define common functions|初始化通用函数失败' || true
 "
 
-echo "RSYNC 部署完成。"
+echo "✅ 部署完成。"

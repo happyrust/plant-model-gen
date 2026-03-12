@@ -1,9 +1,4 @@
 #V2
-LET $frmw_list = SELECT id, NAME, REFNO FROM FRMW WHERE NAME IS NOT NONE AND '-RM' IN NAME LIMIT 10;
-SELECT * FROM $frmw_list;
--- 房间计算查询测试：以 pe 为入口，panel_refno 回归使用 pe，字段用 pe 风格 (owner)
--- 连接: surreal sql --endpoint ws://localhost:8020 --namespace 1516 --database AvevaMarineSample -u root -p root --pretty
--- ========== 前置检查 ==========
 SELECT count() FROM pe WHERE noun = 'PANE' GROUP ALL;
 SELECT count() FROM pe WHERE noun = 'FRMW' AND name CONTAINS 'ROOM' GROUP ALL;
 -- ========== 方式1：从 pe 查询，owner 递归2层到 FRMW ==========
@@ -99,3 +94,8 @@ INFO FOR TABLE inst_relate_bool;
 SELECT * FROM inst_relate_bool WHERE refno = pe:⟨17496_106028⟩;
 SELECT * FROM aabb LIMIT 5;
 SELECT count() FROM aabb GROUP ALL;
+SELECT * FROM inst_relate_booled_aabb WHERE refno = pe:⟨17496_106028⟩;
+SELECT * FROM inst_relate_booled_aabb LIMIT 5;
+SELECT * FROM inst_relate_booled_aabb LIMIT 3;
+SELECT *, aabb_id.d as aabb_data FROM inst_relate_booled_aabb WHERE refno = pe:⟨17496_106028⟩;
+SELECT *, aabb_id.d as aabb_data FROM inst_relate_aabb WHERE refno = pe:⟨17496_106028⟩;

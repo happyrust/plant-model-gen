@@ -643,6 +643,10 @@ mod tests {
             let params = SqliteSpatialQueryParams {
                 mode: Some("bbox".to_string()),
                 refno: None,
+                x: None,
+                y: None,
+                z: None,
+                radius: None,
                 distance: Some(0.0),
                 minx: Some(-0.5),
                 miny: Some(-0.5),
@@ -677,6 +681,10 @@ mod tests {
             let params = SqliteSpatialQueryParams {
                 mode: Some("bbox".to_string()),
                 refno: None,
+                x: None,
+                y: None,
+                z: None,
+                radius: None,
                 distance: Some(0.0),
                 minx: Some(-0.5),
                 miny: Some(-0.5),

@@ -1,12 +1,4 @@
 #V2
-SELECT count() FROM SBFR GROUP ALL;
-SELECT count() FROM PANE GROUP ALL;
-SELECT count() FROM FRMW WHERE NAME IS NOT NONE AND '-RM' IN NAME GROUP ALL;
-SELECT VALUE [    id,    array::last(string::split(NAME, '-')),    array::flatten(        (SELECT VALUE            (SELECT VALUE REFNO FROM PANE WHERE OWNER = $parent.REFNO)         FROM SBFR WHERE OWNER = $parent.REFNO)    )] FROM FRMW
-SELECT VALUE [id, array::last(string::split(NAME, '-')), array::flatten((SELECT VALUE (SELECT VALUE REFNO FROM PANE WHERE OWNER = $parent.REFNO) FROM SBFR WHERE OWNER = $parent.REFNO))] FROM FRMW WHERE NAME IS NOT NONE AND '-RM' IN NAME LIMIT 10;
-BEGIN TRANSACTION;
-LET $frmw_list = SELECT id, NAME, REFNO FROM FRMW WHERE NAME IS NOT NONE AND '-RM' IN NAME LIMIT 10;
-LET $sbfr_list = SELECT id, OWNER, REFNO FROM SBFR WHERE OWNER IN (SELECT VALUE REFNO FROM $frmw_list);
 LET $frmw_list = SELECT id, NAME, REFNO FROM FRMW WHERE NAME IS NOT NONE AND '-RM' IN NAME LIMIT 10;
 SELECT * FROM $frmw_list;
 -- 房间计算查询测试：以 pe 为入口，panel_refno 回归使用 pe，字段用 pe 风格 (owner)
@@ -99,3 +91,11 @@ SELECT record::id(refno) AS refno, aabb_id.d.mins[0] AS min_x, aabb_id.d.maxs[0]
 SELECT record::id(refno) AS refno, aabb_id.d AS aabb FROM inst_relate_aabb WHERE record::id(refno) = '24381_112055' LIMIT 1;
 SELECT refno, aabb_id, aabb_id.d AS aabb FROM inst_relate_aabb WHERE refno = pe:⟨24381_145019⟩; SELECT refno, aabb_id, aabb_id.d AS aabb FROM inst_relate_booled_aabb WHERE refno = pe:⟨24381_145019⟩;
 SELECT refno, aabb_id, aabb_id.d AS aabb FROM inst_relate_aabb WHERE refno = pe:⟨24381_145019⟩;
+SELECT * FROM inst_relate_booled_aabb WHERE refno = pe:⟨17496_106028⟩;
+SELECT id, refno, aabb_id FROM inst_relate_booled_aabb WHERE refno = pe:⟨17496_106028⟩ LIMIT 5;
+SELECT * FROM inst_relate_bool WHERE refno = pe:⟨17496_106028⟩;
+SELECT * FROM inst_relate_booled_aabb WHERE refno = pe:⟨17496_106028⟩ LIMIT 1;
+INFO FOR TABLE inst_relate_bool;
+SELECT * FROM inst_relate_bool WHERE refno = pe:⟨17496_106028⟩;
+SELECT * FROM aabb LIMIT 5;
+SELECT count() FROM aabb GROUP ALL;

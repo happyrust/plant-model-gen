@@ -54,6 +54,11 @@ use tracing::{debug, error, info, warn};
 
 use indicatif::{ProgressBar, ProgressStyle};
 
+/// 房间名称匹配正则表达式（HD项目）
+static ROOM_NAME_HD_REGEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"^[A-Z]\d{3}$").expect("invalid room name regex")
+});
+
 /// Room calc environment config (replaces runtime unsafe env::set_var).
 
 ///
@@ -2585,7 +2590,7 @@ async fn load_geometry_with_enhanced_cache(
             let transformed_mesh = transform_tri_mesh(
                 &cached_trimesh,
                 (world_trans * inst.geo_transform).to_matrix(),
-            );
+            )?;
 
             CACHE_METRICS.record_trimesh_hit();
 
@@ -2639,7 +2644,7 @@ async fn load_geometry_with_enhanced_cache(
                         let transformed_mesh = transform_tri_mesh(
                             &trimesh_arc,
                             (world_trans * inst.geo_transform).to_matrix(),
-                        );
+                        )?;
 
                         return Ok(Arc::new(transformed_mesh));
                     }
@@ -2717,7 +2722,7 @@ fn load_tri_mesh_from_glb(path: &PathBuf) -> anyhow::Result<TriMesh> {
 
 /// 辅助函数：对 TriMesh 应用变换
 
-fn transform_tri_mesh(mesh: &TriMesh, transform: Mat4) -> TriMesh {
+fn transform_tri_mesh(mesh: &TriMesh, transform: Mat4) -> anyhow::Result<TriMesh> {
     let vertices: Vec<Point<Real>> = mesh
         .vertices()
         .iter()
@@ -2732,9 +2737,7 @@ fn transform_tri_mesh(mesh: &TriMesh, transform: Mat4) -> TriMesh {
 
     let indices = mesh.indices().to_vec();
 
-    // 这里我们假设变换后的几何体仍然是有效的，如果构建失败则 panic (或者应该返回 Result)
-
-    TriMesh::new(vertices, indices).expect("变换后的几何体构建失败")
+    TriMesh::new(vertices, indices).map_err(|e| anyhow::anyhow!("变换后的几何体构建失败: {:?}", e))
 }
 
 fn merge_aabb(a: &Aabb, b: &Aabb) -> Aabb {
@@ -3300,9 +3303,7 @@ async fn estimate_memory_usage() -> f32 {
 /// 房间名称匹配函数 (HD项目)
 
 pub fn match_room_name_hd(room_name: &str) -> bool {
-    let regex = Regex::new(r"^[A-Z]\d{3}$").unwrap();
-
-    regex.is_match(room_name)
+    ROOM_NAME_HD_REGEX.is_match(room_name)
 }
 
 /// 房间名称匹配函数 (HH项目)

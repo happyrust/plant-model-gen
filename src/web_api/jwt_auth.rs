@@ -86,7 +86,7 @@ fn build_config_names(config_path: Option<&str>) -> Vec<String> {
     config_names
 }
 
-fn load_config() -> Option<config::Config> {
+pub(crate) fn load_config() -> Option<config::Config> {
     use config as cfg;
 
     let env_config = std::env::var("DB_OPTION_FILE").ok();

@@ -226,6 +226,8 @@ non_scalable_factor = 1.0
 base_url = "http://localhost:3000"
 # Token 密钥 (用于生成 user_token)
 token_secret = "your-shared-secret-key"
+# 前端基地址（用于 embed-url 返回完整 URL），为空则不返回 url 字段
+frontend_base_url = "http://123.57.182.243"
 # 请求超时时间 (秒)
 timeout_seconds = 30
 

@@ -63,10 +63,16 @@ fn get_cached_index() -> Result<&'static CachedIndex, String> {
 
 #[derive(Debug, Deserialize)]
 pub struct SqliteSpatialQueryParams {
-    /// bbox | refno
+    /// bbox | refno | position
     pub mode: Option<String>,
     /// refno string like "17496_123456" (也兼容 "17496/123456")
     pub refno: Option<String>,
+    /// position 模式：中心点坐标
+    pub x: Option<f32>,
+    pub y: Option<f32>,
+    pub z: Option<f32>,
+    /// position 模式：查询半径（毫米）
+    pub radius: Option<f32>,
     /// 额外扩张距离（毫米，默认 0）
     pub distance: Option<f32>,
     pub minx: Option<f32>,
@@ -104,6 +110,7 @@ pub struct SpatialQueryResultItem {
     pub noun: String,
     pub spec_value: i64,
     pub aabb: Option<AabbDto>,
+    pub distance: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -171,7 +178,13 @@ fn parse_mode(params: &SqliteSpatialQueryParams) -> &'static str {
     if mode == "bbox" {
         return "bbox";
     }
-    // 未指定时：优先 refno，否则 bbox
+    if mode == "position" {
+        return "position";
+    }
+    // 未指定时：优先 position，其次 refno，最后 bbox
+    if params.x.is_some() && params.y.is_some() && params.z.is_some() {
+        return "position";
+    }
     if params.refno.as_deref().unwrap_or("").trim().is_empty() {
         "bbox"
     } else {
@@ -273,7 +286,39 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
         None
     };
 
-    let base_aabb = if mode == "refno" {
+    let base_aabb = if mode == "position" {
+        // position 模式：从 x, y, z, radius 构建 AABB
+        const MAX_QUERY_RADIUS: f32 = 100_000.0; // 100m in mm
+        
+        let x = params.x.ok_or_else(|| "missing x".to_string());
+        let y = params.y.ok_or_else(|| "missing y".to_string());
+        let z = params.z.ok_or_else(|| "missing z".to_string());
+        let radius = params.radius.ok_or_else(|| "missing radius".to_string());
+        
+        match (x, y, z, radius) {
+            (Ok(x), Ok(y), Ok(z), Ok(r)) => {
+                if !(x.is_finite() && y.is_finite() && z.is_finite() && r.is_finite() && r > 0.0 && r <= MAX_QUERY_RADIUS) {
+                    return SpatialQueryResult {
+                        success: false,
+                        results: None,
+                        truncated: None,
+                        query_bbox: None,
+                        error: Some(format!("invalid position or radius (must be 0 < radius <= {} mm)", MAX_QUERY_RADIUS)),
+                    };
+                }
+                Aabb::new([x - r, y - r, z - r].into(), [x + r, y + r, z + r].into())
+            }
+            _ => {
+                return SpatialQueryResult {
+                    success: false,
+                    results: None,
+                    truncated: None,
+                    query_bbox: None,
+                    error: Some("missing position parameters (x, y, z, radius)".to_string()),
+                };
+            }
+        }
+    } else if mode == "refno" {
         let refno = params.refno.as_deref().unwrap_or("").trim();
         if refno.is_empty() {
             return SpatialQueryResult {
@@ -342,11 +387,13 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
     let query_aabb = expand_aabb(base_aabb, distance);
     let query_bbox_dto = aabb_to_dto(&query_aabb);
 
-    // 球体模式：计算查询 AABB 的中心和半径，用于二次距离过滤
+    // 计算查询中心点（用于距离计算）
+    let query_center_x = (query_aabb.mins.x + query_aabb.maxs.x) * 0.5;
+    let query_center_y = (query_aabb.mins.y + query_aabb.maxs.y) * 0.5;
+    let query_center_z = (query_aabb.mins.z + query_aabb.maxs.z) * 0.5;
+
+    // 球体模式：用于二次距离过滤
     let is_sphere = params.shape.as_deref().unwrap_or("cube").eq_ignore_ascii_case("sphere");
-    let sphere_center_x = (query_aabb.mins.x + query_aabb.maxs.x) * 0.5;
-    let sphere_center_y = (query_aabb.mins.y + query_aabb.maxs.y) * 0.5;
-    let sphere_center_z = (query_aabb.mins.z + query_aabb.maxs.z) * 0.5;
     let sphere_radius = (query_aabb.maxs.x - query_aabb.mins.x).max(
         (query_aabb.maxs.y - query_aabb.mins.y).max(
             query_aabb.maxs.z - query_aabb.mins.z,
@@ -444,31 +491,46 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
             .optional()
             .unwrap_or(None);
 
-        // 球体模式：基于元素 AABB 中心到查询中心的距离做精确过滤
-        if is_sphere {
-            if let Some((minx, miny, minz, maxx, maxy, maxz)) = aabb_row {
-                let cx = (minx + maxx) * 0.5;
-                let cy = (miny + maxy) * 0.5;
-                let cz = (minz + maxz) * 0.5;
-                let dx = cx - sphere_center_x;
-                let dy = cy - sphere_center_y;
-                let dz = cz - sphere_center_z;
-                if dx * dx + dy * dy + dz * dz > sphere_radius_sq {
-                    continue;
-                }
+        // 计算距离（AABB 中心到查询中心的欧氏距离）
+        let distance = if let Some((minx, miny, minz, maxx, maxy, maxz)) = aabb_row {
+            let cx = (minx + maxx) * 0.5;
+            let cy = (miny + maxy) * 0.5;
+            let cz = (minz + maxz) * 0.5;
+            let dx = cx - query_center_x;
+            let dy = cy - query_center_y;
+            let dz = cz - query_center_z;
+            let dist_sq = dx * dx + dy * dy + dz * dz;
+            
+            // 球体模式：基于距离做精确过滤
+            if is_sphere && dist_sq > sphere_radius_sq {
+                continue;
             }
-        }
+            
+            Some(dist_sq.sqrt())
+        } else {
+            None
+        };
 
         let aabb = aabb_row.map(|(minx, miny, minz, maxx, maxy, maxz)| aabb_dto_from_row(minx, miny, minz, maxx, maxy, maxz));
 
         let refno = i64_to_refno_str(id as i64);
-        results.push(SpatialQueryResultItem { refno, noun, spec_value, aabb });
+        results.push(SpatialQueryResultItem { refno, noun, spec_value, aabb, distance });
 
         if results.len() >= max_results {
             truncated = true;
             break;
         }
     }
+
+    // 按距离从近到远排序
+    results.sort_by(|a, b| {
+        match (a.distance, b.distance) {
+            (Some(da), Some(db)) => da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
 
     SpatialQueryResult {
         success: true,

@@ -20,7 +20,7 @@ use aios_core::{project_primary_db, init_surreal};
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 
 #[cfg(feature = "web_server")]
-use super::jwt_auth::{create_token, generate_form_id, verify_token};
+use super::jwt_auth::{create_token, decode_token_unsafe, generate_form_id, verify_token};
 
 #[cfg(feature = "web_server")]
 use super::review_api::ReviewTask;
@@ -41,6 +41,8 @@ use super::jwt_auth::JwtConfig;
 pub struct PlatformConfig {
     /// 前端相对路径
     pub frontend_relative_path: String,
+    /// 前端基地址（用于拼接完整 URL），为空时不返回 url 字段
+    pub frontend_base_url: String,
 }
 
 impl Default for PlatformConfig {
@@ -48,6 +50,7 @@ impl Default for PlatformConfig {
         Self {
             // plant3d-web 前端的校审页面路径
             frontend_relative_path: "/review/3d-view".to_string(),
+            frontend_base_url: String::new(),
         }
     }
 }
@@ -55,7 +58,14 @@ impl Default for PlatformConfig {
 impl PlatformConfig {
     /// 从配置文件加载
     pub fn from_config_file() -> Self {
-        // 目前只有前端路径配置，直接使用默认值
+        if let Some(config) = super::jwt_auth::load_config() {
+            return Self {
+                frontend_base_url: config
+                    .get_string("model_center.frontend_base_url")
+                    .unwrap_or_default(),
+                ..Self::default()
+            };
+        }
         Self::default()
     }
 }
@@ -83,6 +93,9 @@ pub struct EmbedUrlResponse {
     pub code: i32,
     pub message: String,
     pub data: Option<EmbedUrlData>,
+    /// 拼接好的完整嵌入 URL（含 output_project），外部系统可直接使用
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -261,40 +274,14 @@ async fn get_embed_url(
 ) -> impl IntoResponse {
     info!("Embed URL request: project_id={}, user_id={}", request.project_id, request.user_id);
     
-    // 外部若传 token：
-    // - 文档 2) embed-url：token 使用 JWT
-    // - 兼容旧调用：若不是 JWT 结构，则回退到 SHA256 token 校验
+    // TODO: 暂时关闭 token 验证，后续需恢复
+    // 尝试从 JWT token 中提取 form_id（不做签名校验）
     let mut jwt_claim_form_id: Option<String> = None;
     if let Some(ref token) = request.token {
         let token = token.trim();
         if token.split('.').count() == 3 {
-            match verify_token(token) {
-                Ok(claims) => {
-                    if claims.project_id != request.project_id || claims.user_id != request.user_id {
-                        return (StatusCode::UNAUTHORIZED, Json(EmbedUrlResponse {
-                            code: 401,
-                            message: "unauthorized".to_string(),
-                            data: None,
-                        }));
-                    }
-                    jwt_claim_form_id = Some(claims.form_id);
-                }
-                Err(_) => {
-                    return (StatusCode::UNAUTHORIZED, Json(EmbedUrlResponse {
-                        code: 401,
-                        message: "unauthorized".to_string(),
-                        data: None,
-                    }));
-                }
-            }
-        } else {
-            let expected_plain = format!("{}:{}", request.project_id, request.user_id);
-            if !verify_sha256_token(&expected_plain, token) {
-                return (StatusCode::UNAUTHORIZED, Json(EmbedUrlResponse {
-                    code: 401,
-                    message: "unauthorized".to_string(),
-                    data: None,
-                }));
+            if let Ok(claims) = decode_token_unsafe(token) {
+                jwt_claim_form_id = Some(claims.form_id);
             }
         }
     }
@@ -315,6 +302,7 @@ async fn get_embed_url(
                     code: 401,
                     message: "unauthorized".to_string(),
                     data: None,
+                    url: None,
                 }));
             }
         } else {
@@ -343,7 +331,22 @@ async fn get_embed_url(
             
             info!("Generated form_id={}, token_len={}", form_id, token.len());
             
-            // 4. 返回响应
+            // 4. 拼接完整 URL（如果配置了 frontend_base_url）
+            let full_url = {
+                let base = PLATFORM_CONFIG.frontend_base_url.trim().trim_end_matches('/');
+                if base.is_empty() {
+                    None
+                } else {
+                    let path = &PLATFORM_CONFIG.frontend_relative_path;
+                    let clean_path = if path.starts_with('/') { path.clone() } else { format!("/{}", path) };
+                    Some(format!(
+                        "{}{}?user_token={}&form_id={}&user_id={}&project_id={}&output_project={}",
+                        base, clean_path, token, form_id, request.user_id, request.project_id, request.project_id
+                    ))
+                }
+            };
+
+            // 5. 返回响应
             (StatusCode::OK, Json(EmbedUrlResponse {
                 code: 200,
                 message: "ok".to_string(),
@@ -362,6 +365,7 @@ async fn get_embed_url(
                     },
                     task: existing_task,
                 }),
+                url: full_url,
             }))
         }
         Err(e) => {
@@ -370,6 +374,7 @@ async fn get_embed_url(
                 code: -1,
                 message: format!("Token generation failed: {}", e),
                 data: None,
+                url: None,
             }))
         }
     }
@@ -985,6 +990,7 @@ mod tests {
         code: i32,
         message: String,
         data: Option<serde_json::Value>,
+        url: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]

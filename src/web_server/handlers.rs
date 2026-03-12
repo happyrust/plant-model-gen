@@ -535,6 +535,46 @@ pub async fn api_get_projects(
         total = rows.get(0).and_then(|r| r["total"].as_u64()).unwrap_or(0) as usize;
     }
 
+    // Fallback: 如果 SQLite 和 SurrealDB 都没有数据，则从 DbOption.toml 的 included_projects 读取
+    if items.is_empty() {
+        let opt = aios_core::get_db_option();
+        let included = &opt.included_projects;
+        if !included.is_empty() {
+            let project_name = &opt.project_name;
+            let show_dbnum = opt.manual_db_nums.as_ref().and_then(|v| v.first().copied());
+            for name in included {
+                let mut item = ProjectItem {
+                    id: Some(name.clone()),
+                    name: name.clone(),
+                    version: None,
+                    url: None,
+                    env: Some("local".to_string()),
+                    status: ProjectStatus::Running,
+                    owner: None,
+                    tags: None,
+                    notes: if name == project_name {
+                        Some("当前活动项目".to_string())
+                    } else {
+                        None
+                    },
+                    health_url: None,
+                    last_health_check: None,
+                    created_at: None,
+                    updated_at: None,
+                };
+                // 前端需要 show_dbnum 来匹配主项目
+                if name == project_name {
+                    if let Some(dbnum) = show_dbnum {
+                        // 通过 notes 字段传递 show_dbnum（前端目前不使用这个字段做匹配）
+                        item.notes = Some(format!("当前活动项目 (dbnum: {})", dbnum));
+                    }
+                }
+                items.push(item);
+            }
+            total = items.len();
+        }
+    }
+
     Ok(Json(json!({
         "items": items,
         "total": total,

@@ -3096,17 +3096,60 @@ pub async fn room_compute_mode(
 
     // 前置检查：inst_relate_aabb 是否有数据
     {
-        use aios_core::SurrealQueryExt;
-        let count: Vec<usize> = aios_core::SUL_DB
-            .query_take("SELECT VALUE count() FROM inst_relate_aabb GROUP ALL", 0)
+        println!("   🔍 检查 inst_relate_aabb 表状态...");
+
+        // 方法1: 直接 count，不返回 record 字段，避免 SurrealDB 3.x "Expected any, got record" 问题
+        let has_data = match aios_core::SUL_DB
+            .query("SELECT count() as cnt FROM inst_relate_aabb GROUP ALL")
             .await
-            .unwrap_or_default();
-        if count.first().map_or(true, |c| *c == 0) {
+        {
+            Ok(mut resp) => {
+                let rows: Result<Vec<serde_json::Value>, _> = resp.take(0);
+                match rows {
+                    Ok(vals) if !vals.is_empty() => {
+                        let cnt = vals[0].get("cnt").and_then(|v| v.as_u64()).unwrap_or(0);
+                        println!("   📊 inst_relate_aabb 记录数: {}", cnt);
+                        cnt > 0
+                    }
+                    Ok(_) => {
+                        println!("   ⚠️  count 查询返回空结果");
+                        false
+                    }
+                    Err(e) => {
+                        // count 查询也失败，回退用不含 record 的探测
+                        println!("   ⚠️  count GROUP ALL 反序列化失败: {}，尝试备选探测...", e);
+                        match aios_core::SUL_DB
+                            .query("SELECT record::id(refno) as rid FROM inst_relate_aabb LIMIT 1")
+                            .await
+                        {
+                            Ok(mut resp2) => {
+                                let probe: Result<Vec<serde_json::Value>, _> = resp2.take(0);
+                                match probe {
+                                    Ok(rows) if !rows.is_empty() => {
+                                        println!("   ✅ 备选查询确认 inst_relate_aabb 有数据");
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                            }
+                            Err(_) => false,
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "inst_relate_aabb 查询失败: {}\n请检查数据库连接",
+                    e
+                );
+            }
+        };
+
+        if !has_data {
             anyhow::bail!(
                 "inst_relate_aabb 表为空，请先执行模型生成（--debug-model / --regen-model）"
             );
         }
-        println!("   - inst_relate_aabb 记录数: {}", count[0]);
     }
 
     build_spatial_index_from_db(db_nums.as_deref(), verbose).await?;

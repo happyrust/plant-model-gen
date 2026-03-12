@@ -1,0 +1,59 @@
+{
+  "milestone": "verify-core",
+  "round": 1,
+  "status": "fail",
+  "validatorsRun": {
+    "test": {
+      "passed": true,
+      "command": "cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo check --bin aios-database --quiet",
+      "exitCode": 0
+    },
+    "typecheck": {
+      "passed": true,
+      "command": "cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo check --bin aios-database --quiet",
+      "exitCode": 0
+    },
+    "lint": {
+      "passed": true,
+      "command": "cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo clippy --bin aios-database -- -D warnings",
+      "exitCode": 0
+    },
+    "fmt": {
+      "passed": true,
+      "command": "cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo fmt --all -- --check",
+      "exitCode": 0
+    }
+  },
+  "reviewsSummary": {
+    "total": 2,
+    "passed": 1,
+    "failed": 1,
+    "failedFeatures": [
+      "verify-core-readonly-runner"
+    ]
+  },
+  "blockingIssues": [
+    {
+      "featureId": "verify-core-readonly-runner",
+      "severity": "blocking",
+      "description": "`src/cli_modes.rs`: `verify_room_case` may classify missing expected components as `ScopeMismatch` when the component exists elsewhere in the room (stale panels non-empty), potentially hiding real expectation mismatches."
+    }
+  ],
+  "appliedUpdates": [],
+  "suggestedGuidanceUpdates": [
+    {
+      "target": "skills",
+      "suggestion": "In room-verify-worker, document Rust `cargo test <filter>` pitfalls and recommend exact invocations to ensure intended tests actually run.",
+      "evidence": "Review verify-core-readonly-runner: worker ran `cargo test room_verify_tests --quiet` but it did not execute the new unit tests (per review sharedStateObservations).",
+      "isSystemic": false
+    },
+    {
+      "target": "skills",
+      "suggestion": "Align feature skill assignment: prefer room-verify-worker for verify-core/CLI validation features instead of backend-worker when the work is primarily room CLI + validation gate.",
+      "evidence": "Review stabilize-verify-core-validator-gate: feature skillName=backend-worker but transcript consulted room-verify-worker; suggests specialization mismatch.",
+      "isSystemic": true
+    }
+  ],
+  "rejectedObservations": [],
+  "previousRound": null
+}

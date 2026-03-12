@@ -1,0 +1,40 @@
+{
+  "featureId": "verify-core-readonly-runner",
+  "reviewedAt": "2026-03-12T20:40:00Z",
+  "commitId": "06d1add",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "fail",
+  "codeReview": {
+    "summary": "Implements `aios-database room verify-json --input <file>` and core readonly verification against persisted `room_panel_relate`/`room_relate` using a shared JSON fixture. The core flow is reasonable and guarded against missing persisted data, but there is a blocking misclassification bug in scope-vs-mismatch handling that can report real expectation mismatches as COVERAGE when the component exists elsewhere in the room.",
+    "issues": [
+      {
+        "file": "src/cli_modes.rs",
+        "line": 1025,
+        "severity": "blocking",
+        "description": "`verify_room_case` classifies missing expected components as `ScopeMismatch` whenever the component exists on any other panel in the same room (`stale_panels` non-empty), even if that component is not expected to be on the current panel. This can incorrectly downgrade a true expectation mismatch (component absent from persisted results for this panel) into COVERAGE simply because the component is persisted elsewhere. This violates the feature requirement to keep 'compute-scope mismatch' distinguishable from 'real expectation mismatch'."
+      },
+      {
+        "file": "src/cli_modes.rs",
+        "line": 937,
+        "severity": "non_blocking",
+        "description": "`parse_refno_for_verify` replaces '_' with '/' for parsing. If the fixture already uses '/' (as in the existing fixture), the replacement is harmless; but error messages could be clearer about accepted formats (`24381/35798` vs `24381_35798`) to reduce confusion for users editing fixtures by hand."
+      },
+      {
+        "file": "src/cli_modes.rs",
+        "line": 1127,
+        "severity": "non_blocking",
+        "description": "The verifier prints emoji-heavy output and uses `println!` rather than structured logging. This is fine for a CLI, but if this command will be machine-consumed in CI, consider providing a `--json` output mode later. (Not required by this feature.)"
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "skills",
+      "observation": "The skill encourages 'Prefer direct CLI validation over adding or relying on test commands', but this worker still added multiple unit tests and also ran a `cargo test room_verify_tests` substring filter that did not execute the intended tests. The skill could explicitly document Rust test filtering pitfalls and recommend exact test-name invocations when using `cargo test <filter>`.",
+      "evidence": "Mission transcript skeleton for workerSessionId 70eb100b... shows `cargo test room_verify_tests --quiet` and the handoff notes it did not actually run new unit tests; skill suggested change echoes this."
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "Fail: core CLI wiring and read-only persisted-result verification are present, but scope-vs-mismatch classification is incorrect in `verify_room_case` and can hide real mismatches as coverage issues."
+}

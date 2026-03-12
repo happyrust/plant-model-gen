@@ -1,0 +1,45 @@
+{
+  "featureId": "stabilize-verify-core-validator-gate",
+  "reviewedAt": "2026-03-12T20:31:47.494244+00:00",
+  "commitId": "0e9b92f",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "Commit 0e9b92f narrows the verify-core validation gate to CLI-centric commands by updating .factory/services.yaml, simplifying .factory/init.sh to mission-relevant checks, and updating the backend-worker skill to allow CLI-first validation for CLI features. Changes are scoped to mission automation/docs and do not alter the room verify-json implementation; observed CLI behavior and failure modes remain consistent with a read-only verifier.",
+    "issues": [
+      {
+        "file": ".factory/services.yaml",
+        "line": 1,
+        "severity": "non_blocking",
+        "description": "services.surrealdb.port remains 8020 while healthcheck accepts either 8020 or 8009; this mismatch may confuse automation that uses the declared port field (if any). Consider aligning port metadata with the healthcheck or explicitly documenting multi-port behavior."
+      },
+      {
+        "file": ".factory/services.yaml",
+        "line": 2,
+        "severity": "non_blocking",
+        "description": "commands now hardcode an absolute path (/Volumes/DPC/work/plant-code/plant-model-gen). This was pre-existing pattern, but it reduces portability across machines/worktrees; if the mission runner supports relative paths, prefer repo-root relative commands."
+      },
+      {
+        "file": ".factory/init.sh",
+        "line": 1,
+        "severity": "non_blocking",
+        "description": "init.sh now checks fixture presence and DB port detection only. If the mission depends on a specific DB URL/auth (not just a listening port), the script may still report 'can proceed' while later CLI fails; consider checking configured endpoints if available (without leaking secrets)."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "skills",
+      "observation": "Feature record assigns skillName=backend-worker, but the work is mission automation and verify-core gate tuning; a more specific skill (room-verify-worker) exists and was consulted per transcript. Consider either assigning room-verify-worker for verify-core/CLI validation features or updating backend-worker to explicitly defer to specialized mission skills when present (the commit partially addresses this).",
+      "evidence": "features.json (mission) lists skillName backend-worker; transcript skeleton shows reading .factory/skills/room-verify-worker/SKILL.md and prior scrutiny review; handoff.skillFeedback suggests assigning specialized skill directly."
+    },
+    {
+      "area": "services",
+      "observation": "services.yaml removed backend/frontend services and repurposed commands.test to cargo check for aios-database, which is consistent for verify-core but may not generalize across missions. If services.yaml is intended as a cross-repo baseline, consider clarifying per-mission overrides vs global defaults.",
+      "evidence": "git show 0e9b92f modifies only .factory/services.yaml, .factory/init.sh, and backend-worker skill; services section now only contains surrealdb."
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS: Gate change is scoped to Factory mission automation/skills, aligns validator steps to CLI-only room verify-json flow, and does not introduce correctness/safety regressions in the actual verifier implementation. Minor non-blocking metadata/port/portability concerns noted."
+}

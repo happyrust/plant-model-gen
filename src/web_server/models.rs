@@ -200,6 +200,15 @@ pub struct DatabaseConfig {
     /// 手动指定的 Refno 列表 (字符串格式，如 "123" 或 "1/456")
     #[serde(default)]
     pub manual_refnos: Vec<String>,
+    /// 仅生成这些 noun 类型（可选）
+    #[serde(default)]
+    pub enabled_nouns: Option<Vec<String>>,
+    /// 排除这些 noun 类型（可选）
+    #[serde(default)]
+    pub excluded_nouns: Option<Vec<String>>,
+    /// 每种 noun 类型的调试数量限制（可选）
+    #[serde(default)]
+    pub debug_limit_per_noun_type: Option<usize>,
     /// 项目名称
     pub project_name: String,
     /// 项目路径
@@ -254,6 +263,9 @@ impl Default for DatabaseConfig {
             name: "默认配置".to_string(),
             manual_db_nums: vec![],
             manual_refnos: vec![],
+            enabled_nouns: None,
+            excluded_nouns: None,
+            debug_limit_per_noun_type: None,
             project_name: "AvevaMarineSample".to_string(),
             project_path: "/Users/dongpengcheng/Documents/models/e3d_models".to_string(),
             project_code: 1516,
@@ -300,6 +312,9 @@ impl DatabaseConfig {
             },
             manual_db_nums,
             manual_refnos: vec![],
+            enabled_nouns: None,
+            excluded_nouns: None,
+            debug_limit_per_noun_type: None,
             project_name: opt.project_name.clone(),
             project_path: opt.project_path.clone(),
             project_code,
@@ -1332,6 +1347,15 @@ pub struct RefnoModelGenerationRequest {
     pub db_num: u32,
     /// Refno 列表 (字符串格式，支持 "123" 或 "1/456" 等)
     pub refnos: Vec<String>,
+    /// 仅生成这些 noun 类型（可选）
+    #[serde(default)]
+    pub enabled_nouns: Option<Vec<String>>,
+    /// 排除这些 noun 类型（可选）
+    #[serde(default)]
+    pub excluded_nouns: Option<Vec<String>>,
+    /// 每种 noun 类型的调试数量限制（可选）
+    #[serde(default)]
+    pub debug_limit_per_noun_type: Option<usize>,
     /// 是否生成网格 (可选，默认从配置读取)
     #[serde(default)]
     pub gen_mesh: Option<bool>,
@@ -1561,4 +1585,95 @@ pub struct RoomComputeSyncResponse {
     pub build_time_ms: u64,
     /// 缓存命中率
     pub cache_hit_rate: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DatabaseConfig, RefnoModelGenerationRequest};
+    use serde_json::json;
+
+    #[test]
+    fn database_config_serializes_and_deserializes_new_filter_fields() {
+        let config = DatabaseConfig {
+            enabled_nouns: Some(vec!["BRAN".to_string(), "HANG".to_string()]),
+            excluded_nouns: Some(vec!["PANE".to_string()]),
+            debug_limit_per_noun_type: Some(12),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&config).expect("serialize config");
+        assert_eq!(value["enabled_nouns"], json!(["BRAN", "HANG"]));
+        assert_eq!(value["excluded_nouns"], json!(["PANE"]));
+        assert_eq!(value["debug_limit_per_noun_type"], json!(12));
+
+        let round_trip: DatabaseConfig = serde_json::from_value(value).expect("deserialize config");
+        assert_eq!(round_trip.enabled_nouns, config.enabled_nouns);
+        assert_eq!(round_trip.excluded_nouns, config.excluded_nouns);
+        assert_eq!(
+            round_trip.debug_limit_per_noun_type,
+            config.debug_limit_per_noun_type
+        );
+    }
+
+    #[test]
+    fn database_config_defaults_new_filter_fields_for_backward_compatibility() {
+        let value = json!({
+            "name": "legacy-config",
+            "manual_db_nums": [7997],
+            "project_name": "AvevaMarineSample",
+            "project_path": "/tmp/project",
+            "project_code": 1516,
+            "mdb_name": "ALL",
+            "module": "DESI",
+            "db_type": "surrealdb",
+            "surreal_ns": 1516,
+            "db_ip": "localhost",
+            "db_port": "8020",
+            "db_user": "root",
+            "db_password": "root",
+            "gen_model": true,
+            "gen_mesh": false,
+            "gen_spatial_tree": true,
+            "apply_boolean_operation": true,
+            "mesh_tol_ratio": 3.0,
+            "room_keyword": "-RM"
+        });
+
+        let config: DatabaseConfig = serde_json::from_value(value).expect("deserialize legacy config");
+        assert_eq!(config.enabled_nouns, None);
+        assert_eq!(config.excluded_nouns, None);
+        assert_eq!(config.debug_limit_per_noun_type, None);
+    }
+
+    #[test]
+    fn refno_request_serializes_and_deserializes_new_filter_fields() {
+        let request = RefnoModelGenerationRequest {
+            db_num: 7997,
+            refnos: vec!["24381_145018".to_string()],
+            enabled_nouns: Some(vec!["BRAN".to_string()]),
+            excluded_nouns: Some(vec!["PANE".to_string()]),
+            debug_limit_per_noun_type: Some(5),
+            gen_mesh: Some(true),
+            gen_model: Some(true),
+            apply_boolean_operation: Some(false),
+            meshes_path: Some("/tmp/meshes".to_string()),
+            task_id: Some("task-123".to_string()),
+            export_json: Some(false),
+            export_parquet: Some(true),
+        };
+
+        let value = serde_json::to_value(&request).expect("serialize refno request");
+        assert_eq!(value["enabled_nouns"], json!(["BRAN"]));
+        assert_eq!(value["excluded_nouns"], json!(["PANE"]));
+        assert_eq!(value["debug_limit_per_noun_type"], json!(5));
+
+        let round_trip: RefnoModelGenerationRequest =
+            serde_json::from_value(value).expect("deserialize refno request");
+        assert_eq!(round_trip.enabled_nouns, request.enabled_nouns);
+        assert_eq!(round_trip.excluded_nouns, request.excluded_nouns);
+        assert_eq!(
+            round_trip.debug_limit_per_noun_type,
+            request.debug_limit_per_noun_type
+        );
+    }
 }

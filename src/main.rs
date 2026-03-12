@@ -792,7 +792,10 @@ async fn main() -> anyhow::Result<()> {
                             .value_delimiter(',')
                             .num_args(1..))
                         .arg(Arg::new("refno-root").long("refno-root")
-                            .help("限定 refno 子树根（如 21491_10000）")),
+                            .help("限定 refno 子树根（如 21491_10000）"))
+                        .arg(Arg::new("gen-panels-mesh").long("gen-panels-mesh")
+                            .help("预生成缺失面板的几何模型（默认跳过，仅计算空间关系）")
+                            .action(clap::ArgAction::SetTrue)),
                 )
                 .subcommand(
                     Command::new("compute-panel")
@@ -815,6 +818,18 @@ async fn main() -> anyhow::Result<()> {
                 .subcommand(
                     Command::new("clean")
                         .about("清理已有的房间关系数据（room_relate + room_panel_relate）"),
+                )
+                .subcommand(
+                    Command::new("verify-json")
+                        .about("读取 JSON fixture 校验已持久化的房间计算结果（默认只读）")
+                        .arg(
+                            Arg::new("input")
+                                .long("input")
+                                .short('i')
+                                .help("验证 fixture JSON 路径")
+                                .required(true)
+                                .value_name("FILE"),
+                        ),
                 )
                 .subcommand(
                     Command::new("export")
@@ -2011,6 +2026,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
         // 未指定 dbnum：扫描 inst_relate 所有 distinct dbnum，逐一导出
+        #[cfg(feature = "parquet-export")]
         if single_dbnum.is_none() {
             use aios_database::fast_model::export_model::export_dbnum_instances_parquet::query_distinct_dbnums_from_inst_relate;
 
@@ -2025,36 +2041,33 @@ async fn main() -> anyhow::Result<()> {
 
             println!("📋 扫描到 {} 个 dbnum: {:?}", dbnums.len(), dbnums);
 
-            #[cfg(feature = "parquet-export")]
-            {
-                for (i, dbnum) in dbnums.iter().enumerate() {
-                    println!(
-                        "\n{} [{}/{}] 导出 dbnum={}",
-                        "=".repeat(30),
-                        i + 1,
-                        dbnums.len(),
-                        dbnum,
-                    );
-                    crate::cli_modes::export_dbnum_instances_parquet_mode(
-                        *dbnum,
-                        verbose,
-                        export_bundle_dir.clone(),
-                        &db_option_ext,
-                        None,
-                    )
-                    .await?;
-                }
-                println!("\n🎉 所有 dbnum 导出完成！共 {} 个", dbnums.len());
-                return Ok(());
-            }
-
-            #[cfg(not(feature = "parquet-export"))]
-            {
-                eprintln!(
-                    "❌ 错误: parquet-export 特性未启用，请使用 --features parquet-export 编译"
+            for (i, dbnum) in dbnums.iter().enumerate() {
+                println!(
+                    "\n{} [{}/{}] 导出 dbnum={}",
+                    "=".repeat(30),
+                    i + 1,
+                    dbnums.len(),
+                    dbnum,
                 );
-                std::process::exit(1);
+                crate::cli_modes::export_dbnum_instances_parquet_mode(
+                    *dbnum,
+                    verbose,
+                    export_bundle_dir.clone(),
+                    &db_option_ext,
+                    None,
+                )
+                .await?;
             }
+            println!("\n🎉 所有 dbnum 导出完成！共 {} 个", dbnums.len());
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "parquet-export"))]
+        if single_dbnum.is_none() {
+            eprintln!(
+                "❌ 错误: parquet-export 特性未启用，请使用 --features parquet-export 编译"
+            );
+            std::process::exit(1);
         }
 
         let dbnum = single_dbnum.unwrap();
@@ -2141,7 +2154,8 @@ async fn main() -> anyhow::Result<()> {
     // ========== 处理 room 子命令 ==========
     if let Some(room_matches) = matches.subcommand_matches("room") {
         use crate::cli_modes::{
-            export_room_instances_mode, room_clean_mode, room_compute_mode, room_compute_panel_mode,
+            export_room_instances_mode, room_clean_mode, room_compute_mode,
+            room_compute_panel_mode, room_verify_json_mode,
         };
         use aios_core::RefnoEnum;
         use std::str::FromStr;
@@ -2162,7 +2176,9 @@ async fn main() -> anyhow::Result<()> {
                         RefnoEnum::from_str(&refno_str).ok()
                     });
 
-                return room_compute_mode(keywords, db_nums, refno_root, verbose, &db_option_ext)
+                let gen_panels_mesh = sub_m.get_flag("gen-panels-mesh");
+
+                return room_compute_mode(keywords, db_nums, refno_root, gen_panels_mesh, verbose, &db_option_ext)
                     .await;
             }
             Some(("compute-panel", sub_m)) => {
@@ -2186,6 +2202,10 @@ async fn main() -> anyhow::Result<()> {
             }
             Some(("clean", _)) => {
                 return room_clean_mode(&db_option_ext).await;
+            }
+            Some(("verify-json", sub_m)) => {
+                let input = sub_m.get_one::<String>("input").unwrap();
+                return room_verify_json_mode(Path::new(input), &db_option_ext).await;
             }
             Some(("export", sub_m)) => {
                 let output_dir = sub_m.get_one::<String>("output").map(PathBuf::from);

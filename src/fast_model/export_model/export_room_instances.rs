@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use aios_core::{model_primary_db, RefnoEnum, SurrealQueryExt};
+use aios_core::{RefnoEnum, SurrealQueryExt, model_primary_db};
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use parry3d::bounding_volume::Aabb;
@@ -22,6 +22,34 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 use tracing::{debug, info, warn};
+
+/// Shared JSON fixture contract for post-compute room validation.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RoomComputeValidationFixture {
+    pub description: String,
+    pub test_cases: Vec<RoomComputeValidationCase>,
+}
+
+/// One room validation case from `room_compute_validation.json`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RoomComputeValidationCase {
+    pub case_id: String,
+    pub description: String,
+    pub room_number: String,
+    pub panel_refno: String,
+    pub expected_components: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
+}
+
+impl RoomComputeValidationFixture {
+    pub fn load_from_path(path: &Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("读取验证 fixture 失败: {}", path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("解析验证 fixture JSON 失败: {}", path.display()))
+    }
+}
 
 // ============================================================================
 // 数据结构定义
@@ -119,24 +147,24 @@ pub struct RoomExportStats {
 
 /// room_relate 查询结果
 #[derive(Debug, Clone, Deserialize, SurrealValue)]
-struct RoomRelateRecord {
+pub struct RoomRelateRecord {
     /// 面板 refno (out)
-    panel_refno: RefnoEnum,
+    pub panel_refno: RefnoEnum,
     /// 构件 refno (in)
-    component_refno: RefnoEnum,
+    pub component_refno: RefnoEnum,
     /// 房间号
-    room_num: String,
+    pub room_num: String,
 }
 
 /// room_panel_relate 查询结果
 #[derive(Debug, Clone, Deserialize, SurrealValue)]
-struct RoomPanelRecord {
+pub struct RoomPanelRecord {
     /// 房间 refno (out)
-    room_refno: RefnoEnum,
+    pub room_refno: RefnoEnum,
     /// 面板 refno (in)
-    panel_refno: RefnoEnum,
+    pub panel_refno: RefnoEnum,
     /// 房间号
-    room_num: String,
+    pub room_num: String,
 }
 
 /// 面板几何实例查询结果
@@ -190,6 +218,14 @@ async fn query_room_panel_relations() -> Result<Vec<RoomPanelRecord>> {
         .context("查询 room_panel_relate 失败")?;
 
     Ok(records)
+}
+
+pub async fn query_room_relations_for_verify() -> Result<Vec<RoomRelateRecord>> {
+    query_room_relations().await
+}
+
+pub async fn query_room_panel_relations_for_verify() -> Result<Vec<RoomPanelRecord>> {
+    query_room_panel_relations().await
 }
 
 /// 查询面板的几何实例
@@ -539,6 +575,7 @@ pub async fn export_room_instances(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_room_relation_queries_use_correct_direction() {
@@ -549,5 +586,22 @@ mod tests {
         let room_panel_sql = build_query_room_panel_relations_sql();
         assert!(room_panel_sql.contains("out as room_refno"));
         assert!(room_panel_sql.contains("in as panel_refno"));
+    }
+
+    #[test]
+    fn test_load_room_compute_validation_fixture() {
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/room_compute_validation.json");
+
+        let fixture = RoomComputeValidationFixture::load_from_path(&fixture_path)
+            .expect("fixture should load");
+
+        assert_eq!(fixture.description, "房间计算验证数据集");
+        assert_eq!(fixture.test_cases.len(), 1);
+        let case = &fixture.test_cases[0];
+        assert_eq!(case.case_id, "room_540_panel_validation");
+        assert_eq!(case.room_number, "540");
+        assert_eq!(case.panel_refno, "24381/35798");
+        assert_eq!(case.expected_components, vec!["24381/145019"]);
     }
 }

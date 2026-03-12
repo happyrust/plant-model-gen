@@ -6,6 +6,9 @@ use anyhow::{Context, Result, anyhow};
 
 use aios_core::init_surreal;
 use aios_core::{DBType, query_mdb_db_nums};
+use aios_database::fast_model::export_model::export_room_instances::{
+    RoomComputeValidationCase, RoomComputeValidationFixture,
+};
 use aios_database::fast_model::export_glb::GlbExporter;
 use aios_database::fast_model::export_gltf::GltfExporter;
 use aios_database::fast_model::export_gltf::export_gltf_for_refnos;
@@ -18,6 +21,7 @@ use aios_database::fast_model::model_exporter::{
     ObjExportConfig, XktExportConfig, collect_export_refnos,
 };
 use aios_database::fast_model::unit_converter::{LengthUnit, UnitConverter};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 统一的导出配置结构体
 #[derive(Debug, Clone)]
@@ -797,9 +801,11 @@ fn build_room_compute_panel_spatial_index_items(
 
     merged
         .into_iter()
-        .map(|(id, (noun, spec_value, minx, maxx, miny, maxy, minz, maxz))| {
-            (id, noun, spec_value, minx, maxx, miny, maxy, minz, maxz)
-        })
+        .map(
+            |(id, (noun, spec_value, minx, maxx, miny, maxy, minz, maxz))| {
+                (id, noun, spec_value, minx, maxx, miny, maxy, minz, maxz)
+            },
+        )
         .collect()
 }
 
@@ -846,13 +852,423 @@ fn resolve_room_compute_panel_geom_inst_aabb(
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RoomVerifyCaseStatus {
+    Passed,
+    MissingPersistedResults,
+    ScopeMismatch,
+    ExpectationMismatch,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[derive(Debug, Clone)]
+struct RoomVerifyCaseOutcome {
+    case_id: String,
+    room_number: String,
+    panel_refno: String,
+    status: RoomVerifyCaseStatus,
+    details: Vec<String>,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[derive(Debug, Default)]
+struct RoomPersistedRelations {
+    room_panels: BTreeMap<String, BTreeSet<RefnoEnum>>,
+    room_components_by_panel: BTreeMap<(String, RefnoEnum), BTreeSet<RefnoEnum>>,
+    component_panels_by_room: BTreeMap<String, BTreeMap<RefnoEnum, BTreeSet<RefnoEnum>>>,
+    total_room_panel_records: usize,
+    total_room_relate_records: usize,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[derive(Debug, Default, Clone, Copy)]
+struct RoomVerifySummary {
+    total_cases: usize,
+    passed_cases: usize,
+    failed_cases: usize,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+impl RoomVerifySummary {
+    fn from_outcomes(outcomes: &[RoomVerifyCaseOutcome]) -> Self {
+        let total_cases = outcomes.len();
+        let passed_cases = outcomes
+            .iter()
+            .filter(|outcome| outcome.status == RoomVerifyCaseStatus::Passed)
+            .count();
+        Self {
+            total_cases,
+            passed_cases,
+            failed_cases: total_cases.saturating_sub(passed_cases),
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn parse_refno_for_verify(raw: &str, field_name: &str) -> Result<RefnoEnum> {
+    RefnoEnum::from_str(&raw.replace('_', "/"))
+        .map_err(|_| anyhow!("{} 不是有效 refno: {}", field_name, raw))
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn load_room_persisted_relations() -> Result<RoomPersistedRelations> {
+    use aios_database::fast_model::export_model::export_room_instances::{
+        query_room_panel_relations_for_verify, query_room_relations_for_verify,
+    };
+
+    let room_panel_records = query_room_panel_relations_for_verify().await?;
+    let room_relate_records = query_room_relations_for_verify().await?;
+
+    let mut persisted = RoomPersistedRelations {
+        total_room_panel_records: room_panel_records.len(),
+        total_room_relate_records: room_relate_records.len(),
+        ..Default::default()
+    };
+
+    for record in room_panel_records {
+        persisted
+            .room_panels
+            .entry(record.room_num)
+            .or_default()
+            .insert(record.panel_refno);
+    }
+
+    for record in room_relate_records {
+        persisted
+            .room_components_by_panel
+            .entry((record.room_num.clone(), record.panel_refno))
+            .or_default()
+            .insert(record.component_refno);
+        persisted
+            .component_panels_by_room
+            .entry(record.room_num)
+            .or_default()
+            .entry(record.component_refno)
+            .or_default()
+            .insert(record.panel_refno);
+    }
+
+    Ok(persisted)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn verify_room_case(
+    case: &RoomComputeValidationCase,
+    persisted: &RoomPersistedRelations,
+) -> Result<RoomVerifyCaseOutcome> {
+    let panel_refno = parse_refno_for_verify(&case.panel_refno, "panel_refno")?;
+    let expected_components: Vec<RefnoEnum> = case
+        .expected_components
+        .iter()
+        .map(|component| parse_refno_for_verify(component, "expected_components"))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut details = Vec::new();
+    let room_panels = persisted.room_panels.get(&case.room_number);
+    let room_components = persisted
+        .room_components_by_panel
+        .get(&(case.room_number.clone(), panel_refno));
+
+    let status = match (room_panels, room_components) {
+        (None, None) => {
+            details.push(format!(
+                "room_number={} 在 room_panel_relate 与 room_relate 中都没有持久化结果，请先运行 room compute 或扩大 compute 覆盖范围",
+                case.room_number
+            ));
+            RoomVerifyCaseStatus::MissingPersistedResults
+        }
+        (Some(panels), None) => {
+            if !panels.contains(&panel_refno) {
+                details.push(format!(
+                    "room_number={} 已有持久化面板结果，但不包含期望 panel {}",
+                    case.room_number, panel_refno
+                ));
+                RoomVerifyCaseStatus::ScopeMismatch
+            } else {
+                details.push(format!(
+                    "room_number={} 已包含 panel {}，但缺少对应的 room_relate 持久化结果",
+                    case.room_number, panel_refno
+                ));
+                RoomVerifyCaseStatus::MissingPersistedResults
+            }
+        }
+        (None, Some(_components)) => {
+            details.push(format!(
+                "room_number={} 在 room_relate 中存在构件结果，但 room_panel_relate 缺少 panel {}，持久化结果不完整",
+                case.room_number, panel_refno
+            ));
+            RoomVerifyCaseStatus::MissingPersistedResults
+        }
+        (Some(panels), Some(components)) => {
+            if !panels.contains(&panel_refno) {
+                details.push(format!(
+                    "room_number={} 已有其他面板的持久化结果，但不包含期望 panel {}",
+                    case.room_number, panel_refno
+                ));
+                RoomVerifyCaseStatus::ScopeMismatch
+            } else {
+                let missing_components: Vec<String> = expected_components
+                    .iter()
+                    .filter(|component| !components.contains(component))
+                    .map(|component| component.to_string())
+                    .collect();
+
+                if missing_components.is_empty() {
+                    details.push(format!(
+                        "room_number={} / panel={} 的持久化结果命中 {} 个期望构件",
+                        case.room_number,
+                        panel_refno,
+                        expected_components.len()
+                    ));
+                    RoomVerifyCaseStatus::Passed
+                } else {
+                    let stale_panels: Vec<String> = missing_components
+                        .iter()
+                        .filter_map(|component| {
+                            let component_refno = RefnoEnum::from_str(component).ok()?;
+                            let panels = persisted
+                                .component_panels_by_room
+                                .get(&case.room_number)?
+                                .get(&component_refno)?;
+                            if panels.contains(&panel_refno) {
+                                None
+                            } else {
+                                Some(format!(
+                                    "{} 当前挂在其它 panel: {}",
+                                    component,
+                                    panels
+                                        .iter()
+                                        .map(|panel| panel.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ))
+                            }
+                        })
+                        .collect();
+
+                    details.push(format!(
+                        "缺少期望构件: {}",
+                        missing_components.join(", ")
+                    ));
+                    if !stale_panels.is_empty() {
+                        details.extend(stale_panels);
+                        RoomVerifyCaseStatus::ScopeMismatch
+                    } else {
+                        RoomVerifyCaseStatus::ExpectationMismatch
+                    }
+                }
+            }
+        }
+    };
+
+    Ok(RoomVerifyCaseOutcome {
+        case_id: case.case_id.clone(),
+        room_number: case.room_number.clone(),
+        panel_refno: case.panel_refno.clone(),
+        status,
+        details,
+    })
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn print_room_verify_report(
+    fixture: &RoomComputeValidationFixture,
+    outcomes: &[RoomVerifyCaseOutcome],
+    summary: RoomVerifySummary,
+) {
+    println!("\n🔍 房间持久化结果校验");
+    println!("==========================================");
+    println!("📄 Fixture: {}", fixture.description);
+
+    for outcome in outcomes {
+        let status_label = match outcome.status {
+            RoomVerifyCaseStatus::Passed => "✅ PASS",
+            RoomVerifyCaseStatus::MissingPersistedResults => "❌ PRECONDITION",
+            RoomVerifyCaseStatus::ScopeMismatch => "❌ COVERAGE",
+            RoomVerifyCaseStatus::ExpectationMismatch => "❌ MISMATCH",
+        };
+        println!(
+            "{} {} room={} panel={}",
+            status_label, outcome.case_id, outcome.room_number, outcome.panel_refno
+        );
+        for detail in &outcome.details {
+            println!("   - {}", detail);
+        }
+    }
+
+    println!("\n📊 汇总:");
+    println!("   - 总案例数: {}", summary.total_cases);
+    println!("   - 通过: {}", summary.passed_cases);
+    println!("   - 失败: {}", summary.failed_cases);
+
+    if summary.failed_cases > 0 {
+        let failing_cases = outcomes
+            .iter()
+            .filter(|outcome| outcome.status != RoomVerifyCaseStatus::Passed)
+            .map(|outcome| outcome.case_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("   - 失败 case_id: {}", failing_cases);
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+pub async fn room_verify_json_mode(input: &Path, db_option_ext: &DbOptionExt) -> Result<()> {
+    println!("\n🧪 校验房间持久化结果（只读模式）");
+    println!("==========================================");
+    println!("   - 输入文件: {}", input.display());
+    println!("   - 行为: 只读校验，不重算、不写 room_relate / room_panel_relate");
+
+    let fixture = RoomComputeValidationFixture::load_from_path(input)?;
+    if fixture.test_cases.is_empty() {
+        anyhow::bail!("验证 fixture 不包含任何 test_cases: {}", input.display());
+    }
+
+    ensure_surreal_connected(db_option_ext).await?;
+    let persisted = load_room_persisted_relations().await?;
+
+    if persisted.total_room_panel_records == 0 && persisted.total_room_relate_records == 0 {
+        anyhow::bail!(
+            "未检测到任何持久化房间计算结果（room_panel_relate / room_relate 为空），请先运行 room compute"
+        );
+    }
+
+    let mut outcomes = Vec::with_capacity(fixture.test_cases.len());
+    for case in &fixture.test_cases {
+        outcomes.push(verify_room_case(case, &persisted)?);
+    }
+
+    let summary = RoomVerifySummary::from_outcomes(&outcomes);
+    print_room_verify_report(&fixture, &outcomes, summary);
+
+    if summary.failed_cases > 0 {
+        anyhow::bail!(
+            "房间验证失败: checked={}, passed={}, failed={}",
+            summary.total_cases,
+            summary.passed_cases,
+            summary.failed_cases
+        );
+    }
+
+    println!("\n✅ 所有请求案例均已通过持久化结果校验");
+    Ok(())
+}
+
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
+pub async fn room_verify_json_mode(_input: &Path, _db_option_ext: &DbOptionExt) -> Result<()> {
+    Err(anyhow!(
+        "房间验证需要 sqlite-index 特性，请使用 --features sqlite-index 编译"
+    ))
+}
+
+#[cfg(test)]
+mod room_verify_tests {
+    use super::*;
+
+    fn make_case(expected_components: &[&str]) -> RoomComputeValidationCase {
+        RoomComputeValidationCase {
+            case_id: "case-1".to_string(),
+            description: "test".to_string(),
+            room_number: "540".to_string(),
+            panel_refno: "24381/35798".to_string(),
+            expected_components: expected_components.iter().map(|item| item.to_string()).collect(),
+            notes: String::new(),
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    fn make_persisted_relations() -> RoomPersistedRelations {
+        let panel = RefnoEnum::from("24381/35798");
+        let component = RefnoEnum::from("24381/145019");
+        let other_panel = RefnoEnum::from("24381/35799");
+
+        let mut room_panels = BTreeMap::new();
+        room_panels.insert("540".to_string(), BTreeSet::from([panel]));
+
+        let mut room_components_by_panel = BTreeMap::new();
+        room_components_by_panel.insert(("540".to_string(), panel), BTreeSet::from([component]));
+
+        let mut component_panels_by_room = BTreeMap::new();
+        component_panels_by_room.insert(
+            "540".to_string(),
+            BTreeMap::from([(component, BTreeSet::from([other_panel]))]),
+        );
+
+        RoomPersistedRelations {
+            room_panels,
+            room_components_by_panel,
+            component_panels_by_room,
+            total_room_panel_records: 1,
+            total_room_relate_records: 1,
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    #[test]
+    fn verify_room_case_passes_with_matching_persisted_data() {
+        let mut persisted = make_persisted_relations();
+        let panel = RefnoEnum::from("24381/35798");
+        let component = RefnoEnum::from("24381/145019");
+        persisted.component_panels_by_room.insert(
+            "540".to_string(),
+            BTreeMap::from([(component, BTreeSet::from([panel]))]),
+        );
+
+        let outcome = verify_room_case(&make_case(&["24381/145019"]), &persisted)
+            .expect("verification should succeed");
+
+        assert_eq!(outcome.status, RoomVerifyCaseStatus::Passed);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    #[test]
+    fn verify_room_case_reports_missing_persisted_results() {
+        let persisted = RoomPersistedRelations::default();
+
+        let outcome = verify_room_case(&make_case(&["24381/145019"]), &persisted)
+            .expect("verification should classify missing precompute state");
+
+        assert_eq!(outcome.status, RoomVerifyCaseStatus::MissingPersistedResults);
+        assert!(outcome.details[0].contains("请先运行 room compute"));
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    #[test]
+    fn verify_room_case_reports_scope_mismatch_when_component_exists_on_other_panel() {
+        let persisted = make_persisted_relations();
+
+        let outcome = verify_room_case(&make_case(&["24381/145019"]), &persisted)
+            .expect("verification should classify stale panel scope");
+
+        assert_eq!(outcome.status, RoomVerifyCaseStatus::ScopeMismatch);
+        assert!(outcome
+            .details
+            .iter()
+            .any(|detail| detail.contains("当前挂在其它 panel")));
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    #[test]
+    fn verify_room_case_reports_expectation_mismatch_for_missing_component() {
+        let mut persisted = make_persisted_relations();
+        persisted.component_panels_by_room.insert("540".to_string(), BTreeMap::new());
+
+        let outcome = verify_room_case(&make_case(&["24381/999999"]), &persisted)
+            .expect("verification should classify missing expected component");
+
+        assert_eq!(outcome.status, RoomVerifyCaseStatus::ExpectationMismatch);
+        assert!(outcome.details[0].contains("缺少期望构件"));
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 async fn rebuild_room_compute_panel_spatial_index(
     db_option_ext: &DbOptionExt,
     root_refnos: &[RefnoEnum],
     verbose: bool,
 ) -> Result<()> {
     use aios_core::query_insts;
-    use aios_core::{project_primary_db, SurrealQueryExt};
+    use aios_core::{SurrealQueryExt, project_primary_db};
     use aios_database::fast_model::query_provider::query_multi_descendants_with_self;
     use aios_database::fast_model::{EXIST_MESH_GEO_HASHES, preload_mesh_cache};
     use aios_database::spatial_index::SqliteSpatialIndex;
@@ -898,7 +1314,10 @@ async fn rebuild_room_compute_panel_spatial_index(
             "#,
             pe_keys.join(",")
         );
-        let rows: Vec<SpecValueRow> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+        let rows: Vec<SpecValueRow> = project_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .unwrap_or_default();
         let mut direct: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
         let mut owners: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
         for row in rows {
@@ -959,7 +1378,10 @@ async fn rebuild_room_compute_panel_spatial_index(
                 .iter()
                 .map(|r| format!("inst_relate_aabb:`{}`", r))
                 .collect();
-            let sql = format!("SELECT in, aabb_id.d as aabb_id FROM [{}]", refno_strs.join(","));
+            let sql = format!(
+                "SELECT in, aabb_id.d as aabb_id FROM [{}]",
+                refno_strs.join(",")
+            );
 
             let aabb_records: Vec<InstRelateAabbQuery> = model_primary_db()
                 .query_take(&sql, 0)
@@ -1003,7 +1425,8 @@ async fn rebuild_room_compute_panel_spatial_index(
         }
     }
 
-    let items = build_room_compute_panel_spatial_index_items(geom_insts, &local_aabb_map, &spec_value_map);
+    let items =
+        build_room_compute_panel_spatial_index_items(geom_insts, &local_aabb_map, &spec_value_map);
     if verbose {
         println!(
             "   - 空间索引根节点: {}，展开后节点: {}，本地 AABB 缓存: {}",
@@ -2975,11 +3398,17 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
     fn parse_aabb_json(aabb_val: &serde_json::Value) -> Option<(f64, f64, f64, f64, f64, f64)> {
         if let (Some(mins), Some(maxs)) = (aabb_val.get("mins"), aabb_val.get("maxs")) {
             let get3_obj = |v: &serde_json::Value| -> Option<(f64, f64, f64)> {
-                Some((v.get("x")?.as_f64()?, v.get("y")?.as_f64()?, v.get("z")?.as_f64()?))
+                Some((
+                    v.get("x")?.as_f64()?,
+                    v.get("y")?.as_f64()?,
+                    v.get("z")?.as_f64()?,
+                ))
             };
             let get3_arr = |v: &serde_json::Value| -> Option<(f64, f64, f64)> {
                 let arr = v.as_array()?;
-                if arr.len() < 3 { return None; }
+                if arr.len() < 3 {
+                    return None;
+                }
                 Some((arr[0].as_f64()?, arr[1].as_f64()?, arr[2].as_f64()?))
             };
             match (
@@ -3015,10 +3444,15 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
         std::collections::HashMap::new();
     {
         let booled_sql = r#"SELECT refno, aabb_id.d AS aabb FROM inst_relate_booled_aabb"#;
-        match model_primary_db().query_take::<Vec<InstRelateAabbRecord>>(booled_sql, 0).await {
+        match model_primary_db()
+            .query_take::<Vec<InstRelateAabbRecord>>(booled_sql, 0)
+            .await
+        {
             Ok(booled_records) => {
                 for rec in &booled_records {
-                    if rec.aabb.is_null() { continue; }
+                    if rec.aabb.is_null() {
+                        continue;
+                    }
                     if let Some(coords) = parse_aabb_json(&rec.aabb) {
                         booled_map.insert(rec.refno.refno().0 as i64, coords);
                     }
@@ -3049,11 +3483,14 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
         let refno_id = rec.refno.refno().0 as i64;
 
         // 优先使用布尔运算后的 AABB
-        let (minx, miny, minz, maxx, maxy, maxz) = if let Some(&coords) = booled_map.get(&refno_id) {
+        let (minx, miny, minz, maxx, maxy, maxz) = if let Some(&coords) = booled_map.get(&refno_id)
+        {
             booled_override_count += 1;
             coords
         } else {
-            if rec.aabb.is_null() { continue; }
+            if rec.aabb.is_null() {
+                continue;
+            }
             match parse_aabb_json(&rec.aabb) {
                 Some(coords) => coords,
                 None => continue,
@@ -3068,7 +3505,10 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
 
     let duration = start_time.elapsed();
     println!("   ✅ 空间索引构建完成");
-    println!("   📊 总计: {} 个构件 (其中 {} 个使用布尔运算后 AABB)", inserted, booled_override_count);
+    println!(
+        "   📊 总计: {} 个构件 (其中 {} 个使用布尔运算后 AABB)",
+        inserted, booled_override_count
+    );
     println!("   ⏱️  耗时: {:.2}s", duration.as_secs_f64());
 
     Ok(())
@@ -3089,6 +3529,7 @@ pub async fn room_compute_mode(
     room_keywords: Option<Vec<String>>,
     db_nums: Option<Vec<u32>>,
     refno_root: Option<RefnoEnum>,
+    gen_panels_mesh: bool,
     verbose: bool,
     db_option_ext: &DbOptionExt,
 ) -> Result<()> {
@@ -3100,6 +3541,10 @@ pub async fn room_compute_mode(
         aios_database::profiling::init_chrome_tracing_for_db_option(db_option_ext, "room_compute");
     #[cfg(feature = "profile")]
     let _root_span = tracing::info_span!("room_compute_mode").entered();
+
+    // 通过环境变量控制 pregen_room_panels_into_model_cache 是否执行
+    // SAFETY: 单线程 CLI 入口，此时尚未启动其他线程
+    unsafe { std::env::set_var("AIOS_ROOM_PREGEN_PANELS", if gen_panels_mesh { "1" } else { "0" }); }
 
     println!("\n🏠 房间计算模式");
     println!("==========================================");
@@ -3117,6 +3562,7 @@ pub async fn room_compute_mode(
     if let Some(ref root) = refno_root {
         println!("   - refno 子树根: {}", root);
     }
+    println!("   - 预生成面板模型: {}", if gen_panels_mesh { "是" } else { "否（使用 --gen-panels-mesh 启用）" });
 
     println!("\n📡 初始化数据库连接...");
     init_surreal().await?;
@@ -3144,7 +3590,10 @@ pub async fn room_compute_mode(
                     }
                     Err(e) => {
                         // count 查询也失败，回退用不含 record 的探测
-                        println!("   ⚠️  count GROUP ALL 反序列化失败: {}，尝试备选探测...", e);
+                        println!(
+                            "   ⚠️  count GROUP ALL 反序列化失败: {}，尝试备选探测...",
+                            e
+                        );
                         match aios_core::SUL_DB
                             .query("SELECT record::id(refno) as rid FROM inst_relate_aabb LIMIT 1")
                             .await
@@ -3165,10 +3614,7 @@ pub async fn room_compute_mode(
                 }
             }
             Err(e) => {
-                anyhow::bail!(
-                    "inst_relate_aabb 查询失败: {}\n请检查数据库连接",
-                    e
-                );
+                anyhow::bail!("inst_relate_aabb 查询失败: {}\n请检查数据库连接", e);
             }
         };
 
@@ -3179,7 +3625,8 @@ pub async fn room_compute_mode(
         }
     }
 
-    build_spatial_index_from_db(db_nums.as_deref(), verbose).await?;
+    // 注意：不再调用 build_spatial_index_from_db（从 pe.world_aabb 构建，当前 pe 表无此字段）。
+    // build_room_relations 内部的 ensure_spatial_index_ready 会从 inst_relate_aabb 表构建空间索引。
 
     println!("\n🔄 开始构建房间关系...");
 
@@ -3428,6 +3875,7 @@ pub async fn room_compute_mode(
     _room_keywords: Option<Vec<String>>,
     _db_nums: Option<Vec<u32>>,
     _refno_root: Option<RefnoEnum>,
+    _gen_panels_mesh: bool,
     _verbose: bool,
     _db_option_ext: &DbOptionExt,
 ) -> Result<()> {

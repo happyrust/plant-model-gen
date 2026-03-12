@@ -183,6 +183,10 @@ jobs:
             
             chmod +x $RELEASE_DIR/web_server
             
+            # Create symlink to output directory
+            ln -sfn /root/output $RELEASE_DIR/output
+            echo "Created symlink: $RELEASE_DIR/output -> /root/output"
+            
             if [ -L "$CURRENT_LINK" ]; then
               PREV_RELEASE=$(readlink $CURRENT_LINK)
               echo "Previous release: $PREV_RELEASE"

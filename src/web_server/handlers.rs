@@ -370,6 +370,12 @@ pub async fn api_get_projects(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // 先尝试：从本地 SQLite 读取（由 DbOption.toml 配置）
     if let Some(mut items) = try_load_projects_from_sqlite() {
+        println!("📋 [projects] SQLite 分支: 查到 {} 条项目", items.len());
+        // Fallback: 如果 SQLite 表为空，则从 DbOption.toml 的 included_projects 读取
+        if items.is_empty() {
+            items = load_projects_from_config();
+            println!("📋 [projects] SQLite fallback -> config: {} 条项目", items.len());
+        }
         // 过滤
         if let Some(q) = params.q.as_ref().filter(|s| !s.is_empty()) {
             let ql = q.to_lowercase();
@@ -535,44 +541,12 @@ pub async fn api_get_projects(
         total = rows.get(0).and_then(|r| r["total"].as_u64()).unwrap_or(0) as usize;
     }
 
+    println!("📋 [projects] SurrealDB 分支: 查到 {} 条项目, total={}", items.len(), total);
     // Fallback: 如果 SQLite 和 SurrealDB 都没有数据，则从 DbOption.toml 的 included_projects 读取
     if items.is_empty() {
-        let opt = aios_core::get_db_option();
-        let included = &opt.included_projects;
-        if !included.is_empty() {
-            let project_name = &opt.project_name;
-            let show_dbnum = opt.manual_db_nums.as_ref().and_then(|v| v.first().copied());
-            for name in included {
-                let mut item = ProjectItem {
-                    id: Some(name.clone()),
-                    name: name.clone(),
-                    version: None,
-                    url: None,
-                    env: Some("local".to_string()),
-                    status: ProjectStatus::Running,
-                    owner: None,
-                    tags: None,
-                    notes: if name == project_name {
-                        Some("当前活动项目".to_string())
-                    } else {
-                        None
-                    },
-                    health_url: None,
-                    last_health_check: None,
-                    created_at: None,
-                    updated_at: None,
-                };
-                // 前端需要 show_dbnum 来匹配主项目
-                if name == project_name {
-                    if let Some(dbnum) = show_dbnum {
-                        // 通过 notes 字段传递 show_dbnum（前端目前不使用这个字段做匹配）
-                        item.notes = Some(format!("当前活动项目 (dbnum: {})", dbnum));
-                    }
-                }
-                items.push(item);
-            }
-            total = items.len();
-        }
+        items = load_projects_from_config();
+        total = items.len();
+        println!("📋 [projects] SurrealDB fallback -> config: {} 条项目", items.len());
     }
 
     Ok(Json(json!({
@@ -581,6 +555,45 @@ pub async fn api_get_projects(
         "page": page,
         "per_page": per_page,
     })))
+}
+
+/// 从 DbOption.toml 的 included_projects 读取项目列表作为 fallback
+fn load_projects_from_config() -> Vec<ProjectItem> {
+    let opt = aios_core::get_db_option();
+    let included = &opt.included_projects;
+    if included.is_empty() {
+        return Vec::new();
+    }
+    let project_name = &opt.project_name;
+    let show_dbnum = opt.manual_db_nums.as_ref().and_then(|v| v.first().copied());
+    included
+        .iter()
+        .map(|name| {
+            let notes = if name == project_name {
+                Some(match show_dbnum {
+                    Some(dbnum) => format!("当前活动项目 (dbnum: {})", dbnum),
+                    None => "当前活动项目".to_string(),
+                })
+            } else {
+                None
+            };
+            ProjectItem {
+                id: Some(name.clone()),
+                name: name.clone(),
+                version: None,
+                url: None,
+                env: Some("local".to_string()),
+                status: ProjectStatus::Running,
+                owner: None,
+                tags: None,
+                notes,
+                health_url: None,
+                last_health_check: None,
+                created_at: None,
+                updated_at: None,
+            }
+        })
+        .collect()
 }
 
 /// 将 ProjectStatus 与字符串匹配（兼容大小写）

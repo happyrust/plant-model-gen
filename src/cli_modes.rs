@@ -3257,7 +3257,7 @@ pub fn import_spatial_index_mode(
     _verbose: bool,
 ) -> Result<()> {
     Err(anyhow!(
-        "sqlite-index 特性未启用，请使用 --features sqlite-index 编译"
+        "当前二进制未包含 SQLite 空间索引导入能力，请使用默认方式重新构建 aios-database"
     ))
 }
 
@@ -3373,149 +3373,21 @@ async fn build_spatial_index_from_db(db_nums: Option<&[u32]>, verbose: bool) -> 
 /// 适用于增量生成后的 compute-panel 场景。
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
-    use aios_core::SurrealQueryExt;
-    use aios_core::model_primary_db;
-    use aios_database::spatial_index::SqliteSpatialIndex;
-    use aios_database::sqlite_index::SqliteAabbIndex;
+    use aios_database::fast_model::room_model::refresh_sqlite_spatial_index_from_inst_relate_aabb;
     use std::time::Instant;
-    use surrealdb::types::SurrealValue;
-
-    #[derive(serde::Deserialize, SurrealValue)]
-    struct InstRelateAabbRecord {
-        refno: RefnoEnum,
-        aabb: serde_json::Value,
-    }
 
     println!("\n🗃️ 构建空间索引 (from inst_relate_aabb + booled_aabb override)");
     println!("==========================================");
 
     let start_time = Instant::now();
-    let idx_path = SqliteSpatialIndex::default_path();
-
-    if idx_path.exists() {
-        std::fs::remove_file(&idx_path)?;
-        if verbose {
-            println!("   ✅ 已删除旧索引文件");
-        }
-    }
-
-    let idx = SqliteAabbIndex::open(&idx_path)?;
-    idx.init_schema()?;
-
-    fn parse_aabb_json(aabb_val: &serde_json::Value) -> Option<(f64, f64, f64, f64, f64, f64)> {
-        if let (Some(mins), Some(maxs)) = (aabb_val.get("mins"), aabb_val.get("maxs")) {
-            let get3_obj = |v: &serde_json::Value| -> Option<(f64, f64, f64)> {
-                Some((
-                    v.get("x")?.as_f64()?,
-                    v.get("y")?.as_f64()?,
-                    v.get("z")?.as_f64()?,
-                ))
-            };
-            let get3_arr = |v: &serde_json::Value| -> Option<(f64, f64, f64)> {
-                let arr = v.as_array()?;
-                if arr.len() < 3 {
-                    return None;
-                }
-                Some((arr[0].as_f64()?, arr[1].as_f64()?, arr[2].as_f64()?))
-            };
-            match (
-                get3_obj(mins).or_else(|| get3_arr(mins)),
-                get3_obj(maxs).or_else(|| get3_arr(maxs)),
-            ) {
-                (Some(mn), Some(mx)) => Some((mn.0, mn.1, mn.2, mx.0, mx.1, mx.2)),
-                _ => None,
-            }
-        } else if let (Some(min_arr), Some(max_arr)) = (
-            aabb_val.get("min").and_then(|v| v.as_array()),
-            aabb_val.get("max").and_then(|v| v.as_array()),
-        ) {
-            if min_arr.len() >= 3 && max_arr.len() >= 3 {
-                Some((
-                    min_arr[0].as_f64().unwrap_or(0.0),
-                    min_arr[1].as_f64().unwrap_or(0.0),
-                    min_arr[2].as_f64().unwrap_or(0.0),
-                    max_arr[0].as_f64().unwrap_or(0.0),
-                    max_arr[1].as_f64().unwrap_or(0.0),
-                    max_arr[2].as_f64().unwrap_or(0.0),
-                ))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    // 预加载布尔运算后的 AABB 覆盖（优先级更高）
-    let mut booled_map: std::collections::HashMap<i64, (f64, f64, f64, f64, f64, f64)> =
-        std::collections::HashMap::new();
-    {
-        let booled_sql = r#"SELECT refno, aabb_id.d AS aabb FROM inst_relate_booled_aabb"#;
-        match model_primary_db()
-            .query_take::<Vec<InstRelateAabbRecord>>(booled_sql, 0)
-            .await
-        {
-            Ok(booled_records) => {
-                for rec in &booled_records {
-                    if rec.aabb.is_null() {
-                        continue;
-                    }
-                    if let Some(coords) = parse_aabb_json(&rec.aabb) {
-                        booled_map.insert(rec.refno.refno().0 as i64, coords);
-                    }
-                }
-                if !booled_map.is_empty() {
-                    println!("   📊 加载 {} 条布尔运算后 AABB 覆盖", booled_map.len());
-                }
-            }
-            Err(_) => {
-                if verbose {
-                    println!("   ℹ️ inst_relate_booled_aabb 表不存在，跳过");
-                }
-            }
-        }
-    }
-
-    // 从 inst_relate_aabb 普通表查询所有记录，join aabb 表取坐标
-    let sql = r#"SELECT refno, aabb_id.d AS aabb FROM inst_relate_aabb"#;
-    let records: Vec<InstRelateAabbRecord> = model_primary_db().query_take(sql, 0).await?;
-
-    println!("   📊 查询到 {} 个 inst_relate_aabb 记录", records.len());
-
-    let mut inserted = 0usize;
-    let mut booled_override_count = 0usize;
-    let mut batch: Vec<(i64, f64, f64, f64, f64, f64, f64)> = Vec::new();
-
-    for rec in &records {
-        let refno_id = rec.refno.refno().0 as i64;
-
-        // 优先使用布尔运算后的 AABB
-        let (minx, miny, minz, maxx, maxy, maxz) = if let Some(&coords) = booled_map.get(&refno_id)
-        {
-            booled_override_count += 1;
-            coords
-        } else {
-            if rec.aabb.is_null() {
-                continue;
-            }
-            match parse_aabb_json(&rec.aabb) {
-                Some(coords) => coords,
-                None => continue,
-            }
-        };
-
-        batch.push((refno_id, minx, maxx, miny, maxy, minz, maxz));
-        inserted += 1;
-    }
-
-    idx.insert_many(batch)?;
+    let inserted = refresh_sqlite_spatial_index_from_inst_relate_aabb(None, None).await?;
 
     let duration = start_time.elapsed();
     println!("   ✅ 空间索引构建完成");
-    println!(
-        "   📊 总计: {} 个构件 (其中 {} 个使用布尔运算后 AABB)",
-        inserted, booled_override_count
-    );
+    println!("   📊 总计: {} 个构件", inserted);
+    if verbose {
+        println!("   ℹ️ 已切换为分块全量刷新路径");
+    }
     println!("   ⏱️  耗时: {:.2}s", duration.as_secs_f64());
 
     Ok(())
@@ -3849,6 +3721,234 @@ pub async fn room_compute_panel_mode(
     Ok(())
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SpatialQueryVerifyResultItem {
+    pub refno: String,
+    pub noun: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SpatialQueryVerifySnapshot {
+    pub success: bool,
+    pub query_refno: String,
+    pub distance_mm: f32,
+    pub include_self: bool,
+    pub expected_refnos: Vec<String>,
+    pub matched_expected_refnos: Vec<String>,
+    pub missing_expected_refnos: Vec<String>,
+    pub result_count: usize,
+    pub results: Vec<SpatialQueryVerifyResultItem>,
+}
+
+fn canonicalize_refno_str(refno: &str) -> String {
+    refno.trim().replace('_', "/")
+}
+
+pub fn build_spatial_query_verify_snapshot(
+    query_refno: &str,
+    distance_mm: f32,
+    include_self: bool,
+    expected_refnos: &[String],
+    results: Vec<(String, String)>,
+) -> SpatialQueryVerifySnapshot {
+    let mut normalized_results = results
+        .into_iter()
+        .map(|(refno, noun)| SpatialQueryVerifyResultItem {
+            refno: canonicalize_refno_str(&refno),
+            noun,
+        })
+        .collect::<Vec<_>>();
+    normalized_results.sort_by(|a, b| a.refno.cmp(&b.refno).then_with(|| a.noun.cmp(&b.noun)));
+    normalized_results.dedup_by(|a, b| a.refno == b.refno && a.noun == b.noun);
+
+    let mut normalized_expected = expected_refnos
+        .iter()
+        .map(|s| canonicalize_refno_str(s))
+        .collect::<Vec<_>>();
+    normalized_expected.sort();
+    normalized_expected.dedup();
+
+    let result_refnos = normalized_results
+        .iter()
+        .map(|item| item.refno.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let matched_expected_refnos = normalized_expected
+        .iter()
+        .filter(|refno| result_refnos.contains(*refno))
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_expected_refnos = normalized_expected
+        .iter()
+        .filter(|refno| !result_refnos.contains(*refno))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    SpatialQueryVerifySnapshot {
+        success: missing_expected_refnos.is_empty(),
+        query_refno: canonicalize_refno_str(query_refno),
+        distance_mm,
+        include_self,
+        expected_refnos: normalized_expected,
+        matched_expected_refnos,
+        missing_expected_refnos,
+        result_count: normalized_results.len(),
+        results: normalized_results,
+    }
+}
+
+pub fn write_spatial_query_snapshot_file(
+    output_path: &Path,
+    snapshot: &SpatialQueryVerifySnapshot,
+) -> Result<()> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create snapshot dir: {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(snapshot)?;
+    std::fs::write(output_path, text)
+        .with_context(|| format!("write verify json: {}", output_path.display()))?;
+    Ok(())
+}
+
+pub fn verify_spatial_query_snapshot_file(
+    expected_path: &Path,
+    snapshot: &SpatialQueryVerifySnapshot,
+) -> Result<()> {
+    let expected_text = std::fs::read_to_string(expected_path)
+        .with_context(|| format!("read verify json: {}", expected_path.display()))?;
+    let expected_json: serde_json::Value = serde_json::from_str(&expected_text)
+        .with_context(|| format!("parse verify json: {}", expected_path.display()))?;
+    let actual_json = serde_json::to_value(snapshot)?;
+
+    if expected_json == actual_json {
+        return Ok(());
+    }
+
+    let actual_path = expected_path.with_extension("actual.json");
+    if let Some(parent) = actual_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create actual snapshot dir: {}", parent.display()))?;
+    }
+    std::fs::write(&actual_path, serde_json::to_string_pretty(snapshot)?)
+        .with_context(|| format!("write actual verify json: {}", actual_path.display()))?;
+
+    Err(anyhow!(
+        "verify-json mismatch: expected={}, actual={}",
+        expected_path.display(),
+        actual_path.display()
+    ))
+}
+
+/// 基于 refno 的 SQLite 空间范围查询，并可用 expect-refnos / verify-json 做回归验证。
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+pub async fn spatial_query_refno_mode(
+    query_refno_str: &str,
+    distance_mm: f32,
+    include_self: bool,
+    build_spatial: bool,
+    expect_refnos: Option<Vec<String>>,
+    verify_json_path: Option<&Path>,
+    write_verify_json_path: Option<&Path>,
+    verbose: bool,
+) -> Result<()> {
+    use aios_database::spatial_index::SqliteSpatialIndex;
+    use parry3d::bounding_volume::Aabb;
+
+    if !distance_mm.is_finite() || distance_mm <= 0.0 {
+        anyhow::bail!("distance-mm 必须是正数，当前值: {}", distance_mm);
+    }
+
+    let query_refno_display = canonicalize_refno_str(query_refno_str);
+    let query_refno_id = aios_database::sqlite_index::refno_str_to_i64(&query_refno_display)
+        .ok_or_else(|| anyhow!("无效的 refno: {}", query_refno_str))?;
+    let query_refno = RefU64(query_refno_id as u64);
+
+    println!("\n🔎 SQLite 空间范围查询验证");
+    println!("==========================================");
+    println!("   - 查询 refno: {}", query_refno_display);
+    println!("   - 距离: {:.3} mm", distance_mm);
+    println!("   - 包含自身: {}", if include_self { "是" } else { "否" });
+    println!("   - 刷新索引: {}", if build_spatial { "是" } else { "否" });
+
+    if build_spatial {
+        println!("\n🗃️ 刷新 SQLite 空间索引...");
+        ensure_surreal_connected(&aios_database::options::get_db_option_ext()).await?;
+        build_spatial_index_from_inst_relate(verbose).await?;
+        println!("✅ spatial_index.sqlite 已刷新");
+    }
+
+    let spatial_index = SqliteSpatialIndex::with_default_path()?;
+    println!(
+        "   - 索引路径: {}",
+        SqliteSpatialIndex::default_path().display()
+    );
+
+    let target_aabb = spatial_index
+        .get_aabb(query_refno)?
+        .ok_or_else(|| anyhow!("未找到指定 refno 的 AABB: {}", query_refno_display))?;
+
+    let query_aabb = Aabb::new(
+        [
+            target_aabb.mins.x - distance_mm,
+            target_aabb.mins.y - distance_mm,
+            target_aabb.mins.z - distance_mm,
+        ]
+        .into(),
+        [
+            target_aabb.maxs.x + distance_mm,
+            target_aabb.maxs.y + distance_mm,
+            target_aabb.maxs.z + distance_mm,
+        ]
+        .into(),
+    );
+
+    let mut ids = spatial_index.query_intersect(&query_aabb)?;
+    ids.sort_by_key(|id| id.0);
+
+    let mut results = Vec::new();
+    for id in ids {
+        if !include_self && id.0 == query_refno.0 {
+            continue;
+        }
+        let noun = spatial_index
+            .get_noun(id)?
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+        let refno = aios_database::sqlite_index::i64_to_refno_str(id.0 as i64).replace('_', "/");
+        results.push((refno, noun));
+    }
+
+    let expected_refnos = expect_refnos.unwrap_or_default();
+    let snapshot = build_spatial_query_verify_snapshot(
+        &query_refno_display,
+        distance_mm,
+        include_self,
+        &expected_refnos,
+        results,
+    );
+
+    if let Some(path) = write_verify_json_path {
+        write_spatial_query_snapshot_file(path, &snapshot)?;
+        println!("💾 已写入 verify-json: {}", path.display());
+    }
+
+    if let Some(path) = verify_json_path {
+        verify_spatial_query_snapshot_file(path, &snapshot)?;
+        println!("✅ verify-json 校验通过: {}", path.display());
+    }
+
+    println!("\n{}", serde_json::to_string_pretty(&snapshot)?);
+
+    if !snapshot.missing_expected_refnos.is_empty() {
+        anyhow::bail!(
+            "期望验证失败：缺少 {}",
+            snapshot.missing_expected_refnos.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
 /// 清理房间关系数据
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub async fn room_clean_mode(db_option_ext: &DbOptionExt) -> Result<()> {
@@ -3899,7 +3999,7 @@ pub async fn room_compute_mode(
     _db_option_ext: &DbOptionExt,
 ) -> Result<()> {
     Err(anyhow!(
-        "房间计算需要 sqlite-index 特性，请使用 --features sqlite-index 编译"
+        "当前二进制未包含房间计算所需的 SQLite 空间能力，请使用默认方式重新构建 aios-database"
     ))
 }
 
@@ -3912,14 +4012,30 @@ pub async fn room_compute_panel_mode(
     _db_option_ext: &DbOptionExt,
 ) -> Result<()> {
     Err(anyhow!(
-        "房间计算需要 sqlite-index 特性，请使用 --features sqlite-index 编译"
+        "当前二进制未包含房间计算所需的 SQLite 空间能力，请使用默认方式重新构建 aios-database"
     ))
 }
 
 #[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
 pub async fn room_clean_mode(_db_option_ext: &DbOptionExt) -> Result<()> {
     Err(anyhow!(
-        "房间计算需要 sqlite-index 特性，请使用 --features sqlite-index 编译"
+        "当前二进制未包含房间计算所需的 SQLite 空间能力，请使用默认方式重新构建 aios-database"
+    ))
+}
+
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
+pub async fn spatial_query_refno_mode(
+    _query_refno_str: &str,
+    _distance_mm: f32,
+    _include_self: bool,
+    _build_spatial: bool,
+    _expect_refnos: Option<Vec<String>>,
+    _verify_json_path: Option<&Path>,
+    _write_verify_json_path: Option<&Path>,
+    _verbose: bool,
+) -> Result<()> {
+    Err(anyhow!(
+        "当前二进制未包含 SQLite 空间查询能力，请使用默认方式重新构建 aios-database"
     ))
 }
 

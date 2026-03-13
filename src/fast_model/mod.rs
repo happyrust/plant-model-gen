@@ -143,13 +143,16 @@ impl CaptureConfig {
         baseline_dir: Option<PathBuf>,
         diff_dir: Option<PathBuf>,
     ) -> Self {
-        let _ = views;
         Self {
             output_dir,
             width,
             height,
             include_descendants,
-            views: None,
+            views: if views > 1 {
+                Some((2..=views).map(|idx| format!("view{:02}", idx)).collect())
+            } else {
+                None
+            },
             baseline_dir,
             diff_dir,
         }

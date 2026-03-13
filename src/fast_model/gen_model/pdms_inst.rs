@@ -141,6 +141,26 @@ async fn delete_inst_relate_bool_records(
     Ok(())
 }
 
+/// replace_exist=true 时，删除目标 BRAN/HANG 的所有 tubi_relate 直段记录。
+///
+/// 典型症状：
+/// - BRAN/HANG 重新生成后，新世界坐标直段已写入；
+/// - 但旧的局部坐标 tubi_relate 仍残留在同一 branch range 下；
+/// - 导出阶段按 `tubi_relate:[bran,0]..[bran,..]` 全量读取时，会把新旧两套直段一起带出。
+async fn delete_tubi_relate_by_branch_refnos(
+    branch_refnos: &[RefnoEnum],
+    chunk_size: usize,
+) -> anyhow::Result<()> {
+    if branch_refnos.is_empty() {
+        return Ok(());
+    }
+
+    for sql in build_delete_tubi_relate_by_branch_refnos_sql(branch_refnos, chunk_size) {
+        model_query_response(&sql).await?;
+    }
+    Ok(())
+}
+
 fn build_delete_inst_relate_bool_records_sql(
     refnos: &[RefnoEnum],
     chunk_size: usize,
@@ -163,6 +183,28 @@ fn build_delete_inst_relate_bool_records_sql(
     out
 }
 
+fn build_delete_tubi_relate_by_branch_refnos_sql(
+    branch_refnos: &[RefnoEnum],
+    chunk_size: usize,
+) -> Vec<String> {
+    if branch_refnos.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for chunk in branch_refnos.chunks(chunk_size.max(1)) {
+        let mut statements = Vec::with_capacity(chunk.len());
+        for branch_refno in chunk {
+            let pe_key = branch_refno.to_pe_key();
+            statements.push(format!(
+                "LET $ids = SELECT VALUE id FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..]; DELETE $ids;"
+            ));
+        }
+        out.push(statements.join("\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +216,18 @@ mod tests {
         let sqls = build_delete_inst_relate_bool_records_sql(&refnos, 100);
         assert!(!sqls.is_empty());
         assert!(sqls.iter().all(|s| !s.contains("inst_relate_cata_bool")));
+    }
+
+    #[test]
+    fn build_delete_tubi_relate_by_branch_refnos_sql_should_use_id_range() {
+        let refnos = vec![
+            RefnoEnum::from_str("24381/145569").unwrap(),
+            RefnoEnum::from_str("24381/145570").unwrap(),
+        ];
+        let sqls = build_delete_tubi_relate_by_branch_refnos_sql(&refnos, 100);
+        assert_eq!(sqls.len(), 1);
+        assert!(sqls[0].contains("tubi_relate:[pe:⟨24381_145569⟩, 0]..[pe:⟨24381_145569⟩, ..]"));
+        assert!(sqls[0].contains("tubi_relate:[pe:⟨24381_145570⟩, 0]..[pe:⟨24381_145570⟩, ..]"));
     }
 }
 
@@ -343,8 +397,6 @@ fn build_delete_inst_geo_by_hashes_sql(geo_hashes: &[u64], chunk_size: usize) ->
 /// （此前 DELETE + INSERT IGNORE 在 save_instance_data_optimize 中执行，
 ///   会覆盖 mesh worker 已写入的 meshed=true）。
 pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<()> {
-    //默认不要清理了。
-    return Ok(());
     if seed_refnos.is_empty() {
         return Ok(());
     }
@@ -354,11 +406,19 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
     // 展开 seed_refnos 到所有后代（包含自身），不过滤 noun 类型
     let all_refnos =
         aios_core::collect_descendant_filter_ids_with_self(seed_refnos, &[], None, true).await?;
+    let bran_refnos = aios_core::collect_descendant_filter_ids_with_self(
+        seed_refnos,
+        &["BRAN", "HANG"],
+        None,
+        true,
+    )
+    .await?;
 
     println!(
-        "[pre_cleanup_for_regen] seed_refnos={}, 展开后 all_refnos={}",
+        "[pre_cleanup_for_regen] seed_refnos={}, 展开后 all_refnos={}, bran_or_hang={}",
         seed_refnos.len(),
-        all_refnos.len()
+        all_refnos.len(),
+        bran_refnos.len()
     );
 
     if all_refnos.is_empty() {
@@ -459,6 +519,10 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
             Err(e) => eprintln!("[pre_cleanup_for_regen] misc tokio 任务崩溃: {}", e),
             _ => {}
         }
+    }
+
+    if !bran_refnos.is_empty() {
+        delete_tubi_relate_by_branch_refnos(&bran_refnos, CHUNK_SIZE).await?;
     }
 
     println!(

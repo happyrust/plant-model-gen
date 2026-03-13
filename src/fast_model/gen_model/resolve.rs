@@ -31,20 +31,26 @@ fn should_trace_resolve_desi(desi_refno: RefnoEnum) -> bool {
 
 fn normalize_gm_param_expressions_in_place(gm: &mut GmParam) {
     // 仅做“去掉 ATTRIB :NAME 中的冒号”这种低风险规整，避免 aios_core 表达式解析器直接拒绝。
+    // 额外规整少量历史前缀表达式（如 `TWICE PARAM 3`），避免元件库求值阶段直接丢几何。
     // 不做更激进的重写（例如移除 ATTRIB 或把 [n] 展平），以降低行为回归风险。
-    gm.prad = ExpressionFixer::normalize_attrib_colon(&gm.prad);
-    gm.pang = ExpressionFixer::normalize_attrib_colon(&gm.pang);
-    gm.pwid = ExpressionFixer::normalize_attrib_colon(&gm.pwid);
-    gm.phei = ExpressionFixer::normalize_attrib_colon(&gm.phei);
-    gm.offset = ExpressionFixer::normalize_attrib_colon(&gm.offset);
-    gm.drad = ExpressionFixer::normalize_attrib_colon(&gm.drad);
-    gm.dwid = ExpressionFixer::normalize_attrib_colon(&gm.dwid);
+    let normalize_expr = |expr: &str| {
+        let expr = ExpressionFixer::normalize_attrib_colon(expr);
+        ExpressionFixer::normalize_pdms_prefix_operators(&expr)
+    };
+
+    gm.prad = normalize_expr(&gm.prad);
+    gm.pang = normalize_expr(&gm.pang);
+    gm.pwid = normalize_expr(&gm.pwid);
+    gm.phei = normalize_expr(&gm.phei);
+    gm.offset = normalize_expr(&gm.offset);
+    gm.drad = normalize_expr(&gm.drad);
+    gm.dwid = normalize_expr(&gm.dwid);
 
     for expr in gm.diameters.iter_mut() {
-        *expr = ExpressionFixer::normalize_attrib_colon(expr);
+        *expr = normalize_expr(expr);
     }
     for expr in gm.distances.iter_mut() {
-        *expr = ExpressionFixer::normalize_attrib_colon(expr);
+        *expr = normalize_expr(expr);
     }
 }
 

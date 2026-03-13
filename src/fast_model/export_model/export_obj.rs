@@ -1,9 +1,11 @@
 use aios_core::RefnoEnum;
 use aios_core::shape::pdms_shape::PlantMesh;
 use anyhow::{Context, Result};
+use glam::{DMat4, DVec3};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
 use crate::fast_model::unit_converter::UnitConverter;
 use chrono;
@@ -131,6 +133,286 @@ fn sanitize_obj_group_name(name: &str) -> String {
     // - 用 '_' 替换 '/'（refno 常见形式为 24381/129928）
     // - 将空白字符替换为 '_'（避免被拆成多个 token）
     name.replace('/', "_").replace(['\t', '\r', '\n', ' '], "_")
+}
+
+#[derive(Clone, Copy)]
+struct CaptureTriangle {
+    pts: [DVec3; 3],
+    normal: DVec3,
+    base_color: [u8; 3],
+}
+
+fn base_capture_view_transforms(extra_views: usize) -> Vec<(Option<String>, DMat4)> {
+    let presets = [
+        (60.0f64, -12.0f64, 28.0f64),
+        (60.0, 18.0, 28.0),
+        (60.0, -40.0, 28.0),
+        (36.0, -10.0, 0.0),
+    ];
+
+    presets
+        .into_iter()
+        .enumerate()
+        .take(extra_views + 1)
+        .map(|(idx, (rx_deg, ry_deg, rz_deg))| {
+            let transform = DMat4::from_rotation_z(rz_deg.to_radians())
+                * DMat4::from_rotation_y(ry_deg.to_radians())
+                * DMat4::from_rotation_x(rx_deg.to_radians());
+            let suffix = if idx == 0 {
+                None
+            } else {
+                Some(format!("view{:02}", idx + 1))
+            };
+            (suffix, transform)
+        })
+        .collect()
+}
+
+fn apply_capture_unit_conversion(pt: glam::Vec3, unit_converter: &UnitConverter) -> DVec3 {
+    let converted = if unit_converter.needs_conversion() {
+        unit_converter.convert_vec3(&pt)
+    } else {
+        pt
+    };
+    DVec3::new(converted.x as f64, converted.y as f64, converted.z as f64)
+}
+
+fn append_capture_triangles(
+    triangles: &mut Vec<CaptureTriangle>,
+    export_data: &ExportData,
+    mesh_cache: &crate::fast_model::export_model::export_common::GltfMeshCache,
+    geo_hash: &str,
+    transform: &glam::DMat4,
+    unit_converter: &UnitConverter,
+    mesh_dir: &Path,
+    base_color: [u8; 3],
+) -> Result<()> {
+    if !export_data.valid_geo_hashes.contains(geo_hash) {
+        return Ok(());
+    }
+
+    let arc_mesh = mesh_cache.load_or_get(geo_hash, mesh_dir)?;
+    let mesh = arc_mesh.as_ref().transform_by(transform);
+    let vertex_count = mesh.vertices.len();
+    if vertex_count == 0 {
+        return Ok(());
+    }
+
+    for tri in mesh.indices.chunks(3) {
+        if tri.len() < 3 {
+            continue;
+        }
+        let a_idx = tri[0] as usize;
+        let b_idx = tri[1] as usize;
+        let c_idx = tri[2] as usize;
+        if a_idx >= vertex_count || b_idx >= vertex_count || c_idx >= vertex_count {
+            continue;
+        }
+
+        let a = apply_capture_unit_conversion(mesh.vertices[a_idx], unit_converter);
+        let b = apply_capture_unit_conversion(mesh.vertices[b_idx], unit_converter);
+        let c = apply_capture_unit_conversion(mesh.vertices[c_idx], unit_converter);
+        let normal = (b - a).cross(c - a);
+        if normal.length_squared() <= f64::EPSILON {
+            continue;
+        }
+
+        triangles.push(CaptureTriangle {
+            pts: [a, b, c],
+            normal: normal.normalize(),
+            base_color,
+        });
+    }
+
+    Ok(())
+}
+
+fn collect_capture_triangles(
+    export_data: &ExportData,
+    unit_converter: &UnitConverter,
+    mesh_dir: &Path,
+) -> Result<Vec<CaptureTriangle>> {
+    use crate::fast_model::export_model::export_common::GltfMeshCache;
+
+    let mesh_cache = GltfMeshCache::new();
+    let mut triangles = Vec::new();
+
+    for comp in &export_data.components {
+        for inst in &comp.geometries {
+            let combined_transform = if comp.has_neg {
+                inst.geo_transform
+            } else {
+                comp.world_transform * inst.geo_transform
+            };
+            append_capture_triangles(
+                &mut triangles,
+                export_data,
+                &mesh_cache,
+                &inst.geo_hash,
+                &combined_transform,
+                unit_converter,
+                mesh_dir,
+                [192, 192, 192],
+            )?;
+        }
+    }
+
+    for tubi in &export_data.tubings {
+        append_capture_triangles(
+            &mut triangles,
+            export_data,
+            &mesh_cache,
+            &tubi.geo_hash,
+            &tubi.transform,
+            unit_converter,
+            mesh_dir,
+            [214, 201, 173],
+        )?;
+    }
+
+    Ok(triangles)
+}
+
+fn render_capture_preview(
+    triangles: &[CaptureTriangle],
+    transform: DMat4,
+    width: u32,
+    height: u32,
+    output_path: &Path,
+) -> Result<()> {
+    if triangles.is_empty() {
+        return Ok(());
+    }
+
+    let mut rotated = Vec::with_capacity(triangles.len());
+    let mut min_xy = DVec3::new(f64::INFINITY, f64::INFINITY, 0.0);
+    let mut max_xy = DVec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, 0.0);
+
+    for tri in triangles {
+        let pts = tri.pts.map(|pt| (transform * pt.extend(1.0)).truncate());
+        for pt in &pts {
+            min_xy.x = min_xy.x.min(pt.x);
+            min_xy.y = min_xy.y.min(pt.y);
+            max_xy.x = max_xy.x.max(pt.x);
+            max_xy.y = max_xy.y.max(pt.y);
+        }
+        let normal = (transform * tri.normal.extend(0.0))
+            .truncate()
+            .normalize_or_zero();
+        let depth = (pts[0].z + pts[1].z + pts[2].z) / 3.0;
+        rotated.push((pts, normal, depth, tri.base_color));
+    }
+
+    let width = width.max(64);
+    let height = height.max(64);
+    let margin = 48.0f64;
+    let span_x = (max_xy.x - min_xy.x).max(1e-6);
+    let span_y = (max_xy.y - min_xy.y).max(1e-6);
+    let scale = ((width as f64 - margin * 2.0) / span_x)
+        .min((height as f64 - margin * 2.0) / span_y)
+        .max(1e-6);
+    let center_xy = DVec3::new(
+        (min_xy.x + max_xy.x) * 0.5,
+        (min_xy.y + max_xy.y) * 0.5,
+        0.0,
+    );
+
+    let mut pixmap = Pixmap::new(width, height).context("创建截图像素缓冲失败，尺寸非法")?;
+    pixmap.fill(Color::from_rgba8(44, 44, 46, 255));
+
+    let light_dir = DVec3::new(0.35, -0.45, 0.82).normalize();
+    rotated.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut stroke = Stroke::default();
+    stroke.width = 0.8;
+
+    for (pts, normal, _, base_color) in rotated {
+        let brightness = (0.42 + 0.58 * normal.dot(light_dir).max(0.0)).clamp(0.0, 1.0) as f32;
+        let mut builder = PathBuilder::new();
+        for (idx, pt) in pts.iter().enumerate() {
+            let sx = ((pt.x - center_xy.x) * scale + width as f64 * 0.5) as f32;
+            let sy = (height as f64 * 0.5 - (pt.y - center_xy.y) * scale) as f32;
+            if idx == 0 {
+                builder.move_to(sx, sy);
+            } else {
+                builder.line_to(sx, sy);
+            }
+        }
+        builder.close();
+        let Some(path) = builder.finish() else {
+            continue;
+        };
+
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(
+            ((base_color[0] as f32 * brightness).round() as u8).max(10),
+            ((base_color[1] as f32 * brightness).round() as u8).max(10),
+            ((base_color[2] as f32 * brightness).round() as u8).max(10),
+            255,
+        );
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+
+        let mut outline = Paint::default();
+        outline.set_color_rgba8(24, 24, 26, 72);
+        pixmap.stroke_path(&path, &outline, &stroke, Transform::identity(), None);
+    }
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).context("创建截图目录失败")?;
+    }
+    pixmap
+        .save_png(output_path)
+        .with_context(|| format!("写入截图失败: {}", output_path.display()))?;
+    Ok(())
+}
+
+fn maybe_capture_obj_preview(
+    export_data: &ExportData,
+    output_path: &str,
+    unit_converter: &UnitConverter,
+    mesh_dir: &Path,
+) -> Result<()> {
+    let Some(capture_config) = crate::fast_model::get_capture_config() else {
+        return Ok(());
+    };
+
+    let triangles = collect_capture_triangles(export_data, unit_converter, mesh_dir)?;
+    if triangles.is_empty() {
+        return Ok(());
+    }
+
+    let output_path = Path::new(output_path);
+    let stem = output_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("capture");
+
+    let extra_views = capture_config.views.as_ref().map(|v| v.len()).unwrap_or(0);
+    let view_transforms = base_capture_view_transforms(extra_views);
+    for (suffix, transform) in view_transforms {
+        let filename = match suffix {
+            Some(suffix) => format!("{stem}_{suffix}.png"),
+            None => format!("{stem}.png"),
+        };
+        let image_path = capture_config.output_dir.join(filename);
+        render_capture_preview(
+            &triangles,
+            transform,
+            capture_config.width,
+            capture_config.height,
+            &image_path,
+        )?;
+        println!("📸 已生成截图: {}", image_path.display());
+    }
+
+    Ok(())
 }
 
 fn export_export_data_to_obj_grouped(
@@ -625,6 +907,12 @@ impl ModelExporter for ObjExporter {
             &config.common.unit_converter,
             &effective_mesh_dir,
             config.common.verbose,
+        )?;
+        maybe_capture_obj_preview(
+            &export_data,
+            output_path,
+            &config.common.unit_converter,
+            &effective_mesh_dir,
         )?;
 
         if let Ok(metadata) = std::fs::metadata(output_path) {

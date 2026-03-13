@@ -59,6 +59,16 @@ impl ExpressionFixer {
         ATTRIB_COLON_REGEX.replace_all(expr, "ATTRIB ").to_string()
     }
 
+    /// 规整 PDMS 历史前缀运算写法，避免下游解析器把 `TWICE PARAM 3` 误算成 0。
+    ///
+    /// 当前只做低风险改写：
+    /// - `TWICE xxx` -> `2 TIMES xxx`
+    pub fn normalize_pdms_prefix_operators(expr: &str) -> String {
+        static TWICE_PREFIX_REGEX: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"(?i)\bTWICE\s+").expect("invalid TWICE_PREFIX_REGEX"));
+        TWICE_PREFIX_REGEX.replace_all(expr, "2 TIMES ").to_string()
+    }
+
     /// 预处理ATTRIB表达式，将ATTRIB关键字转换为可解析的变量名
     ///
     /// 注意：函数名会转换为小写，因为 tiny_expr 解析器只识别小写函数名
@@ -423,6 +433,21 @@ mod tests {
             "Expected 'PARA1', got: {}",
             processed3
         );
+    }
+
+    #[test]
+    fn test_normalize_pdms_prefix_operators() {
+        let expr1 = "TWICE PARAM 3";
+        let normalized1 = ExpressionFixer::normalize_pdms_prefix_operators(expr1);
+        assert_eq!(normalized1, "2 TIMES PARAM 3");
+
+        let expr2 = "( TWICE ATTRIB PARA[3 ] )";
+        let normalized2 = ExpressionFixer::normalize_pdms_prefix_operators(expr2);
+        assert_eq!(normalized2, "( 2 TIMES ATTRIB PARA[3 ] )");
+
+        let expr3 = "SUM PARAM 1 PARAM 2";
+        let normalized3 = ExpressionFixer::normalize_pdms_prefix_operators(expr3);
+        assert_eq!(normalized3, expr3);
     }
 
     #[test]

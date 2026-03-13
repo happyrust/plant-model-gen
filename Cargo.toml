@@ -108,6 +108,7 @@ meilisearch-sdk = { version = "0.26.1", optional = true }
 
 # image/imageproc/rusttype 已移除（无使用）
 gltf = "1.4"
+tiny-skia = { version = "0.11", features = ["png-format"] }
 
 # 空间索引相关依赖
 rstar = { version = "0.12", optional = true }

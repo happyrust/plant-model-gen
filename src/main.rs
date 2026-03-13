@@ -173,71 +173,6 @@ async fn sync_cache_to_db_if_enabled(
     Ok(())
 }
 
-/// 导入 .surql 并执行后处理：reconcile_missing_neg_relate / boolean / inst_relate_aabb。
-#[cfg(not(feature = "gui"))]
-async fn run_import_and_post_process(
-    sql_path: &Path,
-    db_option_ext: &aios_database::options::DbOptionExt,
-) -> anyhow::Result<()> {
-    if !sql_path.exists() {
-        anyhow::bail!("--import-sql 文件不存在: {}", sql_path.display());
-    }
-
-    println!("\n🗂️  import-sql: 导入 {} 到 SurrealDB", sql_path.display());
-    init_surreal().await?;
-    println!("✅ 数据库连接成功");
-
-    // Phase 2 Step 1: 初始化表结构
-    println!("[import-sql] Phase 2.1: 初始化 inst_relate 表结构...");
-    aios_core::rs_surreal::inst::init_model_tables().await?;
-
-    // Phase 2 Step 2: 批量导入 SQL
-    println!("[import-sql] Phase 2.2: 批量导入 SQL 语句...");
-    let (success, failed) =
-        aios_database::fast_model::gen_model::sql_file_writer::import_sql_file(sql_path, 500)
-            .await?;
-    if failed > 0 {
-        eprintln!(
-            "[import-sql] ⚠️ 导入存在失败: 成功={}, 失败={}",
-            success, failed
-        );
-    }
-
-    use aios_core::SurrealQueryExt;
-    let sql = "SELECT value in FROM inst_relate;";
-    let refnos: Vec<aios_core::RefnoEnum> = aios_core::project_primary_db()
-        .query_take(sql, 0)
-        .await
-        .unwrap_or_default();
-
-    // Phase 2 Step 3: reconcile_missing_neg_relate
-    println!("[import-sql] Phase 2.3: reconcile_missing_neg_relate...");
-    if !refnos.is_empty() {
-        if let Err(e) =
-            aios_database::fast_model::gen_model::pdms_inst::reconcile_missing_neg_relate(&refnos)
-                .await
-        {
-            eprintln!("[import-sql] reconcile_missing_neg_relate 失败: {}", e);
-        }
-    }
-
-    // Phase 2 Step 4: boolean worker
-    if db_option_ext.inner.apply_boolean_operation {
-        println!("[import-sql] Phase 2.4: 布尔运算...");
-        if let Err(e) = aios_database::fast_model::mesh_generate::run_boolean_worker(
-            std::sync::Arc::new(db_option_ext.inner.clone()),
-            100,
-        )
-        .await
-        {
-            eprintln!("[import-sql] 布尔运算失败: {}", e);
-        }
-    }
-
-    println!("✅ import-sql 全部完成");
-    Ok(())
-}
-
 /// debug-model 流程的后置步骤：sync-to-db + export-dbnum-instances（parquet/json）
 ///
 /// 将 sync + 导出合并为一个调用，避免 debug-model 分支中重复编写。
@@ -523,15 +458,8 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("defer-db-write")
                 .long("defer-db-write")
-                .help("Defer DB writes: output all SQL to .surql files instead of writing to SurrealDB during model generation")
+                .help("Deprecated and ignored: DB writes always stay online during model generation")
                 .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("import-sql")
-                .long("import-sql")
-                .help("Import a .surql file into SurrealDB and run post-processing (reconcile/boolean/aabb)")
-                .value_name("PATH")
-                .num_args(1),
         )
         .arg(
             Arg::new("flush-cache-to-db")
@@ -1033,13 +961,6 @@ async fn main() -> anyhow::Result<()> {
     // 同步精度配置到 rs-core 全局 active_precision，保证布尔/导出等逻辑使用同一套 LOD
     aios_core::mesh_precision::set_active_precision(db_option_ext.inner.mesh_precision.clone());
 
-    // ========== import-sql：导入 .surql 文件并执行后处理 ==========
-    if let Some(sql_path) = matches.get_one::<String>("import-sql") {
-        let path = std::path::Path::new(sql_path);
-        run_import_and_post_process(path, &db_option_ext).await?;
-        return Ok(());
-    }
-
     // ========== cache -> SurrealDB：一键备份落库 ==========
     if matches.get_flag("flush-cache-to-db") {
         println!("\n🗄️  flush-cache-to-db: 将 model instance_cache 写入 SurrealDB（备份）");
@@ -1343,10 +1264,7 @@ async fn main() -> anyhow::Result<()> {
     // --defer-db-write：模型生成阶段不写 SurrealDB，SQL 输出到 .surql 文件
     let defer_db_write_explicit = matches.get_flag("defer-db-write");
     if defer_db_write_explicit {
-        println!(
-            "🗂️ 检测到 --defer-db-write 参数，模型生成阶段将跳过 SurrealDB 写入，SQL 输出到 .surql 文件"
-        );
-        db_option_ext.defer_db_write = true;
+        println!("⚠️ --defer-db-write 已停用，当前版本将忽略该参数并继续在线写库");
     }
 
     // --debug-model 是增量模式，不应强制 replace_mesh（不清理旧数据）；
@@ -1414,32 +1332,7 @@ async fn main() -> anyhow::Result<()> {
             // --regen-model: 清理 + 强制重新生成
             let regen_result = cli_modes::run_regen_model(&gen_config, &db_option_ext).await?;
 
-            // 仅在"重建 + 导出"时，defer 模式自动导入 SQL 后再导出，避免导出读到旧数据。
-            if any_export_requested {
-                if let Some(sql_path) = regen_result.deferred_sql_path.as_deref() {
-                    println!(
-                        "🗂️ 检测到 defer_db_write 产物，开始自动导入并后处理: {}",
-                        sql_path.display()
-                    );
-                    run_import_and_post_process(sql_path, &db_option_ext).await?;
-                    db_option_ext.defer_db_write = false;
-                }
-            } else {
-                if let Some(sql_path) = regen_result.deferred_sql_path.as_deref() {
-                    if defer_db_write_explicit {
-                        println!(
-                            "🗂️ --defer-db-write 已显式开启，已生成 SQL 但不自动导入: {}",
-                            sql_path.display()
-                        );
-                    } else if regen_auto_enabled_defer_db_write {
-                        println!(
-                            "🗂️ 检测到 --regen-model 自动 defer 产物，开始自动导入并后处理: {}",
-                            sql_path.display()
-                        );
-                        run_import_and_post_process(sql_path, &db_option_ext).await?;
-                        db_option_ext.defer_db_write = false;
-                    }
-                }
+            if !any_export_requested {
                 println!("✅ --regen-model 单独执行完成（未请求导出，流程到此结束）");
                 return Ok(());
             }

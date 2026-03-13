@@ -9,6 +9,7 @@ use aios_core::{DBType, query_mdb_db_nums};
 use aios_database::fast_model::export_glb::GlbExporter;
 use aios_database::fast_model::export_gltf::GltfExporter;
 use aios_database::fast_model::export_gltf::export_gltf_for_refnos;
+use aios_database::fast_model::export_model::export_obj::export_obj_for_refnos;
 use aios_database::fast_model::export_instanced_bundle::export_instanced_bundle_for_refnos;
 use aios_database::fast_model::export_model::export_obj::ObjExporter;
 use aios_database::fast_model::export_model::export_room_instances::{
@@ -274,6 +275,18 @@ fn parse_length_unit(unit: &str) -> LengthUnit {
         "yd" => LengthUnit::Yard,
         _ => LengthUnit::Millimeter,
     }
+}
+
+fn normalize_refno_inputs(refnos: &[String]) -> Result<Vec<RefnoEnum>> {
+    let mut parsed = Vec::new();
+    for refno in refnos {
+        let normalized = refno.replace('_', "/");
+        let parsed_refno = RefU64::from_str(&normalized)
+            .map(RefnoEnum::Refno)
+            .map_err(|e| anyhow!("解析参考号失败: {} ({})", refno, e))?;
+        parsed.push(parsed_refno);
+    }
+    Ok(parsed)
 }
 
 /// 关闭占用指定端口的进程（避免 file 模式下 RocksDB 排他锁冲突）。
@@ -1617,18 +1630,13 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     if config.dbnum.is_some() {
         export_obj_mode_for_db(&config, db_option_ext).await?;
     } else {
-        // 原有逻辑：按 refnos 导出
-        // 解析参考号
-        let refnos = config.parse_refnos()?;
-
-        let exporter = ObjExporter::new();
+        // refno 导出统一走标准 descendants-aware OBJ 导出链路，避免 debug-model 仅导出根节点本体。
+        let refnos = normalize_refno_inputs(&config.refnos_str)?;
         for refno in &refnos {
-            // 确定输出文件名
             let final_output_path = if let Some(ref path) = config.output_path {
                 path.clone()
             } else {
                 let base_name = get_output_filename_for_refno(*refno).await;
-                // 确保输出到 output/{project_name} 目录
                 format!(
                     "{}/{}",
                     db_option_ext.get_project_output_dir().display(),
@@ -1637,29 +1645,14 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
             };
 
             println!("\n🔄 导出 {} -> {} ...", refno, final_output_path);
-
-            let export_config = ObjExportConfig {
-                common: CommonExportConfig {
-                    include_descendants: config.include_descendants,
-                    filter_nouns: config.filter_nouns.clone(),
-                    verbose: config.verbose,
-                    unit_converter: UnitConverter::new(
-                        parse_length_unit(&config.source_unit),
-                        parse_length_unit(&config.target_unit),
-                    ),
-                    use_basic_materials: config.use_basic_materials,
-                    include_negative: config.include_negative,
-                    // [foyer-removal] cache 已移除，默认走 SurrealDB
-                    allow_surrealdb: true,
-                    cache_dir: None,
-                },
-            };
-
-            let stats = exporter
-                .export(&[*refno], &mesh_dir, &final_output_path, export_config)
-                .await?;
-
-            report_obj_export_outcome("", &final_output_path, &stats)?;
+            export_obj_for_refnos(
+                &[*refno],
+                &mesh_dir,
+                &final_output_path,
+                config.filter_nouns.as_deref(),
+                config.include_descendants,
+            )
+            .await?;
         }
     }
 

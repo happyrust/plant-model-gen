@@ -10,12 +10,32 @@ fn default_false() -> bool {
     false
 }
 
+fn parse_defer_db_write(_raw: Option<bool>) -> bool {
+    false
+}
+
 fn default_boolean_pipeline_mode() -> BooleanPipelineMode {
     BooleanPipelineMode::DbLegacy
 }
 
 fn default_regen_delete_mode() -> RegenDeleteMode {
     RegenDeleteMode::Legacy
+}
+
+fn default_batch_channel_capacity() -> usize {
+    100
+}
+
+fn default_base_write_concurrency() -> usize {
+    8
+}
+
+fn default_mesh_compute_concurrency() -> usize {
+    4
+}
+
+fn default_inst_aabb_write_concurrency() -> usize {
+    2
 }
 
 fn parse_regen_delete_mode(raw: Option<&str>) -> RegenDeleteMode {
@@ -196,6 +216,22 @@ pub struct DbOptionExt {
     /// 布尔运算前是否从 DB 批量补齐缺失的 cata 任务
     #[serde(default)]
     pub enable_db_backfill: bool,
+
+    /// batch 级流水线 channel 容量
+    #[serde(default = "default_batch_channel_capacity")]
+    pub batch_channel_capacity: usize,
+
+    /// 基础写库并发度
+    #[serde(default = "default_base_write_concurrency")]
+    pub base_write_concurrency: usize,
+
+    /// mesh 计算并发度
+    #[serde(default = "default_mesh_compute_concurrency")]
+    pub mesh_compute_concurrency: usize,
+
+    /// inst_relate_aabb 写入并发度
+    #[serde(default = "default_inst_aabb_write_concurrency")]
+    pub inst_aabb_write_concurrency: usize,
 }
 
 impl Deref for DbOptionExt {
@@ -228,6 +264,22 @@ impl DbOptionExt {
         self.index_tree_batch_size
             .unwrap_or(self.inner.gen_model_batch_size)
             .max(super::fast_model::gen_model::config::BatchSize::DEFAULT)
+    }
+
+    pub fn get_batch_channel_capacity(&self) -> usize {
+        self.batch_channel_capacity.max(1)
+    }
+
+    pub fn get_base_write_concurrency(&self) -> usize {
+        self.base_write_concurrency.max(1)
+    }
+
+    pub fn get_mesh_compute_concurrency(&self) -> usize {
+        self.mesh_compute_concurrency.max(1)
+    }
+
+    pub fn get_inst_aabb_write_concurrency(&self) -> usize {
+        self.inst_aabb_write_concurrency.max(1)
     }
 
     /// 获取预烘 TriMesh(L0) 目录，默认在 meshes/trimesh_L0
@@ -335,6 +387,10 @@ impl From<DbOption> for DbOptionExt {
             regen_delete_mode: RegenDeleteMode::Legacy,
             enable_db_backfill: false,
             gen_model_dry_run: false,
+            batch_channel_capacity: default_batch_channel_capacity(),
+            base_write_concurrency: default_base_write_concurrency(),
+            mesh_compute_concurrency: default_mesh_compute_concurrency(),
+            inst_aabb_write_concurrency: default_inst_aabb_write_concurrency(),
         }
     }
 }
@@ -489,10 +545,11 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let defer_db_write = toml_value
-        .get("defer_db_write")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let defer_db_write = parse_defer_db_write(
+        toml_value
+            .get("defer_db_write")
+            .and_then(|v| v.as_bool()),
+    );
 
     let boolean_pipeline_mode = toml_value
         .get("boolean_pipeline_mode")
@@ -515,6 +572,30 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .get("gen_model_dry_run")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+
+    let batch_channel_capacity = toml_value
+        .get("batch_channel_capacity")
+        .and_then(|v| v.as_integer())
+        .map(|v| v as usize)
+        .unwrap_or_else(default_batch_channel_capacity);
+
+    let base_write_concurrency = toml_value
+        .get("base_write_concurrency")
+        .and_then(|v| v.as_integer())
+        .map(|v| v as usize)
+        .unwrap_or_else(default_base_write_concurrency);
+
+    let mesh_compute_concurrency = toml_value
+        .get("mesh_compute_concurrency")
+        .and_then(|v| v.as_integer())
+        .map(|v| v as usize)
+        .unwrap_or_else(default_mesh_compute_concurrency);
+
+    let inst_aabb_write_concurrency = toml_value
+        .get("inst_aabb_write_concurrency")
+        .and_then(|v| v.as_integer())
+        .map(|v| v as usize)
+        .unwrap_or_else(default_inst_aabb_write_concurrency);
 
     let export_parquet_after_gen = toml_value
         .get("export_parquet_after_gen")
@@ -545,6 +626,10 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         regen_delete_mode,
         enable_db_backfill,
         gen_model_dry_run,
+        batch_channel_capacity,
+        base_write_concurrency,
+        mesh_compute_concurrency,
+        inst_aabb_write_concurrency,
     };
 
     validate_data_source_mode(db_option_ext.use_surrealdb)

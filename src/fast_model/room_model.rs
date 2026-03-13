@@ -1646,6 +1646,8 @@ where
     query_grouped_room_panels_with_loader(grouped_by_db, |dbnum, items| {
         let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
         let tree_dir = manager.tree_dir().to_path_buf();
+        // 显式加载当前 dbnum 的 TreeIndex，并在本批次所有房间间复用同一个 index。
+        // 这里不再走 collect_descendant_filter_ids，避免再次退回到隐式查询路径。
         let index = manager.load_index(dbnum).map_err(|e| {
             let room_hint = items
                 .first()
@@ -1856,7 +1858,7 @@ fn build_delete_room_panel_relations_sql(room_refnos: &[RefnoEnum]) -> Option<St
     }
 
     Some(format!(
-        "LET $ids = SELECT VALUE id FROM room_panel_relate WHERE out IN [{}];\nDELETE $ids;",
+        "LET $ids = SELECT VALUE id FROM room_panel_relate WHERE in IN [{}];\nDELETE $ids;",
         room_refnos.iter().map(RefnoEnum::to_pe_key).join(",")
     ))
 }
@@ -5534,5 +5536,26 @@ mod regression_tests {
         assert!(message.contains("output/demo/scene_tree/7997.tree"));
         assert!(message.contains("parse-db"));
         assert!(message.contains("[ROOM_TREE_INDEX_ROOM_MISSING]"));
+    }
+
+    #[test]
+    fn test_build_delete_room_panel_relations_sql_uses_room_endpoint_direction() {
+        let sql = build_delete_room_panel_relations_sql(&[
+            valid_room_refno("24383_83477"),
+            valid_room_refno("24383_83478"),
+        ])
+        .expect("sql should exist");
+
+        assert!(sql.contains("FROM room_panel_relate WHERE in IN ["));
+        assert!(sql.contains("24383_83477"));
+        assert!(sql.contains("24383_83478"));
+    }
+
+    #[test]
+    fn test_build_compute_options_uses_surrealdb_inputs() {
+        let options = build_compute_options();
+
+        assert!(!options.query_from_cache_enabled());
+        assert!(!options.refresh_spatial_index_enabled());
     }
 }

@@ -19,6 +19,7 @@ pub mod models;
 pub mod ws; // WebSocket 模块
 // pub mod templates; // 暂时禁用，有语法错误
 pub mod batch_tasks_template;
+pub mod dashboard_handlers;
 pub mod database_diagnostics;
 pub mod database_status_handlers;
 pub mod db_connection;
@@ -300,6 +301,10 @@ pub async fn start_web_server_with_config(
         .route("/api/config/templates", get(get_config_templates))
         .route("/api/databases", get(get_available_databases))
         .route("/api/status", get(get_system_status))
+        .route(
+            "/api/dashboard/activities",
+            get(dashboard_handlers::api_dashboard_activities),
+        )
         .route("/api/instances", get(handlers::api_get_instances))
         // 基于 Refno 的模型生成 API
         .route(

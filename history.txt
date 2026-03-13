@@ -1,20 +1,4 @@
 #V2
-SELECT count() FROM pe WHERE noun = 'PANE' GROUP ALL;
-SELECT count() FROM pe WHERE noun = 'FRMW' AND name CONTAINS 'ROOM' GROUP ALL;
--- ========== 方式1：从 pe 查询，owner 递归2层到 FRMW ==========
--- pe.owner 向上2层：PANE -> SBFR -> FRMW
-SELECT id, owner, owner.owner FROM pe WHERE noun = 'PANE' LIMIT 2;
-SELECT id, owner.{2}.id, owner.{2}.name FROM pe WHERE noun = 'PANE' LIMIT 2;
-SELECT count() FROM pe WHERE noun = 'FRMW' AND name CONTAINS 'ROOM' GROUP ALL;
-INFO FOR TABLE PANE;
-SELECT * FROM PANE LIMIT 1;
-SELECT REFNO AS panel_refno, owner.{2}.id AS frmw_id, array::last(string::split(owner.{2}.name, '-')) AS room_num FROM PANE WHERE owner.{2}.name CONTAINS 'ROOM' LIMIT 3;
-SELECT REFNO, owner.id, owner.owner.id, owner.owner.NAME FROM PANE LIMIT 3;
-SELECT id, NAME FROM type::table('FRMW') LIMIT 5;
-SELECT id, NAME FROM FRMW WHERE NAME CONTAINS 'ROOM' LIMIT 5;
-SELECT id, REFNO, OWNER FROM PANE WHERE OWNER.OWNER.NAME CONTAINS 'ROOM' LIMIT 3;
-SELECT REFNO AS panel_refno, owner.{2}.id AS frmw_id, array::last(string::split(owner.{2}.NAME, '-')) AS room_num FROM PANE WHERE owner.{2}.NAME IS NOT NONE LIMIT 5;
-SELECT REFNO AS panel_refno, owner.{2}.id AS frmw_id, owner.{2}.NAME AS frmw_name FROM PANE LIMIT 5;
 SELECT REFNO AS panel_refno, owner.owner.id AS sbfr_id, owner.owner.owner.id AS frmw_id, owner.owner.owner.NAME AS frmw_name FROM PANE LIMIT 5;
 SELECT REFNO, owner, owner.owner, owner.owner.owner FROM PANE LIMIT 1;
 -- 房间计算查询测试：panel_refno 回归 pe，字段用 pe 风格 (owner)
@@ -99,3 +83,19 @@ SELECT * FROM inst_relate_booled_aabb LIMIT 5;
 SELECT * FROM inst_relate_booled_aabb LIMIT 3;
 SELECT *, aabb_id.d as aabb_data FROM inst_relate_booled_aabb WHERE refno = pe:⟨17496_106028⟩;
 SELECT *, aabb_id.d as aabb_data FROM inst_relate_aabb WHERE refno = pe:⟨17496_106028⟩;
+SELECT REFNO, NAME, owner, owner.{1}.REFNO AS owner1_refno, owner.{1}.NAME AS owner1_name, owner.{2}.REFNO AS owner2_refno, owner.{2}.NAME AS owner2_name, owner.{3}.REFNO AS owner3_refno, owner.{3}.NAME AS owner3_name FROM PANE WHERE REFNO = '24381/35798' LIMIT 1;
+SELECT id, REFNO, noun, NAME, owner, owner.{1}.REFNO AS owner1_refno, owner.{1}.NAME AS owner1_name, owner.{2}.REFNO AS owner2_refno, owner.{2}.NAME AS owner2_name, owner.{3}.REFNO AS owner3_refno, owner.{3}.NAME AS owner3_name FROM pe WHERE REFNO = '24381/35798' LIMIT 1;
+SELECT id, attrs.TYPE as type, attrs.PARA as para, attrs.CATR as catr, attrs.PLBR as plbr, attrs.LSTU as lstu, attrs.ANGL as angl, attrs.BRAN as bran, attrs.HREF as href, attrs.TREF as tref FROM pe:⟨24381_145582⟩;
+SELECT id, attrs.TYPE as type, attrs.PARA as para, attrs.CATR as catr, attrs.PLBR as plbr, attrs.LSTU as lstu, attrs.HREF as href, attrs.TREF as tref FROM [pe:⟨24381_145581⟩, pe:⟨24381_145583⟩];
+SELECT id, noun, name, owner, world_trans, world_aabb FROM pe:⟨24381_145582⟩;
+SELECT * FROM inst_relate:⟨24381_145582⟩;
+SELECT id, geom_refno, geo_type, visible, trans, out FROM inst_info:`3442195386587927954`->geo_relate;
+SELECT id, in, out, start_pt, end_pt, bore_size, world_trans, aabb FROM tubi_relate WHERE id[0] = pe:`24381_145569` AND (in = pe:`24381_145581` OR in = pe:`24381_145582` OR out = pe:`24381_145582` OR out = pe:`24381_145583`);
+SELECT id, owner, noun, name FROM pe WHERE owner = pe:`24381_145569` ORDER BY id;
+SELECT VALUE count() FROM tubi_relate:[pe:⟨24381_145569⟩, 0]..[pe:⟨24381_145569⟩, ..] GROUP ALL;
+SELECT VALUE { id: id, in: in, out: out, world_trans: world_trans.d.translation } FROM tubi_relate:[pe:⟨24381_145569⟩, 0]..[pe:⟨24381_145569⟩, ..];
+SELECT * FROM pe:⟨13246_390709⟩;
+SELECT * FROM pe:⟨13246_390709⟩.refno;
+SELECT * FROM pe:⟨13246_390708⟩.refno;
+SELECT * FROM pe:⟨13246_390710⟩.refno;
+SELECT * FROM pe:⟨13246_390681⟩.refno;

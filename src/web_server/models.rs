@@ -615,8 +615,9 @@ pub struct ProjectItem {
     pub created_at: Option<String>,
     #[serde(default)]
     pub updated_at: Option<String>,
+    #[serde(default)]
+    pub show_dbnum: Option<u32>,
 }
-
 /// 创建项目请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectCreateRequest {

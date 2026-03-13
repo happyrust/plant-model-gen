@@ -2213,9 +2213,7 @@ async fn main() -> anyhow::Result<()> {
                 let expect_refnos: Option<Vec<String>> = sub_m
                     .get_many::<String>("expect-refnos")
                     .map(|v| v.map(|s| s.to_string()).collect());
-                let verify_json_path = sub_m
-                    .get_one::<String>("verify-json")
-                    .map(PathBuf::from);
+                let verify_json_path = sub_m.get_one::<String>("verify-json").map(PathBuf::from);
                 let write_verify_json_path = sub_m
                     .get_one::<String>("write-verify-json")
                     .map(PathBuf::from);

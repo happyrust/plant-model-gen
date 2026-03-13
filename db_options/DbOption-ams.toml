@@ -143,8 +143,8 @@ puhua_database_user = ""
 puhua_database_password = ""
 
 
-# room_keyword = "-RM" # 2016  K-R-K100   (-R-)
-room_keyword = "-R-" # 2016  K-R-K100   (-R-)
+room_keyword = "-RM" # 2016  K-R-K100   (-R-)
+# room_keyword = "-R-" # 2016  K-R-K100   (-R-)
 
 #test_refno = "24381_46952"
 

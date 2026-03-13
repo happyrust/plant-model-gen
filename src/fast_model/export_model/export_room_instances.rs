@@ -148,9 +148,9 @@ pub struct RoomExportStats {
 /// room_relate 查询结果
 #[derive(Debug, Clone, Deserialize, SurrealValue)]
 pub struct RoomRelateRecord {
-    /// 面板 refno (out)
+    /// 面板 refno (in)
     pub panel_refno: RefnoEnum,
-    /// 构件 refno (in)
+    /// 构件 refno (out)
     pub component_refno: RefnoEnum,
     /// 房间号
     pub room_num: String,
@@ -159,9 +159,9 @@ pub struct RoomRelateRecord {
 /// room_panel_relate 查询结果
 #[derive(Debug, Clone, Deserialize, SurrealValue)]
 pub struct RoomPanelRecord {
-    /// 房间 refno (out)
+    /// 房间 refno (in)
     pub room_refno: RefnoEnum,
-    /// 面板 refno (in)
+    /// 面板 refno (out)
     pub panel_refno: RefnoEnum,
     /// 房间号
     pub room_num: String,
@@ -183,8 +183,8 @@ struct PanelGeomQuery {
 fn build_query_room_relations_sql() -> &'static str {
     r#"
         SELECT
-            out as panel_refno,
-            in as component_refno,
+            in as panel_refno,
+            out as component_refno,
             room_num
         FROM room_relate
     "#
@@ -193,8 +193,8 @@ fn build_query_room_relations_sql() -> &'static str {
 fn build_query_room_panel_relations_sql() -> &'static str {
     r#"
         SELECT
-            out as room_refno,
-            in as panel_refno,
+            in as room_refno,
+            out as panel_refno,
             room_num
         FROM room_panel_relate
     "#
@@ -580,12 +580,12 @@ mod tests {
     #[test]
     fn test_room_relation_queries_use_correct_direction() {
         let room_sql = build_query_room_relations_sql();
-        assert!(room_sql.contains("out as panel_refno"));
-        assert!(room_sql.contains("in as component_refno"));
+        assert!(room_sql.contains("in as panel_refno"));
+        assert!(room_sql.contains("out as component_refno"));
 
         let room_panel_sql = build_query_room_panel_relations_sql();
-        assert!(room_panel_sql.contains("out as room_refno"));
-        assert!(room_panel_sql.contains("in as panel_refno"));
+        assert!(room_panel_sql.contains("in as room_refno"));
+        assert!(room_panel_sql.contains("out as panel_refno"));
     }
 
     #[test]
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(fixture.test_cases.len(), 1);
         let case = &fixture.test_cases[0];
         assert_eq!(case.case_id, "room_540_panel_validation");
-        assert_eq!(case.room_number, "540");
+        assert_eq!(case.room_number, "R540");
         assert_eq!(case.panel_refno, "24381/35798");
         assert_eq!(case.expected_components, vec!["24381/145019"]);
     }

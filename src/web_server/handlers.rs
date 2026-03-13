@@ -530,6 +530,7 @@ pub async fn api_get_projects(
                     last_health_check: row["last_health_check"].as_str().map(|s| s.to_string()),
                     created_at: row["created_at"].as_str().map(|s| s.to_string()),
                     updated_at: row["updated_at"].as_str().map(|s| s.to_string()),
+                    show_dbnum: project_show_dbnum(row["name"].as_str().unwrap_or("")),
                 };
                 if !item.name.is_empty() {
                     items.push(item);
@@ -601,9 +602,21 @@ fn load_projects_from_config() -> Vec<ProjectItem> {
                 last_health_check: None,
                 created_at: None,
                 updated_at: None,
+                show_dbnum: project_show_dbnum(name),
             }
         })
         .collect()
+}
+
+fn project_show_dbnum(project_name: &str) -> Option<u32> {
+    let opt = aios_core::get_db_option();
+    if opt.project_name == project_name {
+        return opt
+            .manual_db_nums
+            .as_ref()
+            .and_then(|values| values.first().copied());
+    }
+    None
 }
 
 /// 将 ProjectStatus 与字符串匹配（兼容大小写）
@@ -665,6 +678,7 @@ fn try_load_projects_from_sqlite() -> Option<Vec<ProjectItem>> {
                 last_health_check: None,
                 created_at,
                 updated_at,
+                show_dbnum: project_show_dbnum(&name),
             })
         })
         .ok()?;

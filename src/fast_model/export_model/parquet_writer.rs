@@ -37,8 +37,8 @@ struct InstanceRow {
     pub is_tubi: bool,
     pub owner_refno: Option<String>,
     pub geo_items: Vec<GeoItem>,
-    pub inst_trans_id: String,          // 实例世界变换 ID (e.g. {refno}_world)
-    pub aabb: [f32; 6],                 // 包围盒 [min_x, min_y, min_z, max_x, max_y, max_z]
+    pub inst_trans_id: String, // 实例世界变换 ID (e.g. {refno}_world)
+    pub aabb: [f32; 6],        // 包围盒 [min_x, min_y, min_z, max_x, max_y, max_z]
 }
 
 /// Parquet 存储管理器
@@ -76,12 +76,14 @@ impl ParquetManager {
 
     /// 获取 Instances 增量文件路径
     fn get_instances_incremental_path(&self, dbnum: u32, timestamp: &str) -> PathBuf {
-        self.get_dbno_dir(dbnum).join(format!("instances_{}.parquet", timestamp))
+        self.get_dbno_dir(dbnum)
+            .join(format!("instances_{}.parquet", timestamp))
     }
 
     /// 获取 Transforms 增量文件路径
     fn get_transforms_incremental_path(&self, dbnum: u32, timestamp: &str) -> PathBuf {
-        self.get_dbno_dir(dbnum).join(format!("transforms_{}.parquet", timestamp))
+        self.get_dbno_dir(dbnum)
+            .join(format!("transforms_{}.parquet", timestamp))
     }
 
     /// 生成当前时间戳
@@ -104,7 +106,7 @@ impl ParquetManager {
         for entry in std::fs::read_dir(dbno_dir)? {
             let entry = entry?;
             let path = entry.path();
-            
+
             // 检查扩展名
             if path.extension().and_then(|s| s.to_str()) != Some("parquet") {
                 continue;
@@ -116,7 +118,7 @@ impl ParquetManager {
                     files.push(path);
                     continue;
                 }
-                
+
                 if filename.starts_with(&prefix) {
                     files.push(path);
                 }
@@ -136,7 +138,7 @@ impl ParquetManager {
         }
 
         let mut existing_set = std::collections::HashSet::new();
-        
+
         for file_path in &files {
             if let Ok(file) = std::fs::File::open(file_path) {
                 if let Ok(df) = ParquetReader::new(file).finish() {
@@ -153,7 +155,8 @@ impl ParquetManager {
             }
         }
 
-        Ok(refnos.iter()
+        Ok(refnos
+            .iter()
             .filter(|r| existing_set.contains(*r))
             .cloned()
             .collect())
@@ -162,14 +165,14 @@ impl ParquetManager {
     /// 增量写入：同时生成 instances 和 transforms 文件
     pub fn write_incremental(&self, data: &ExportData, dbnum: u32) -> Result<(PathBuf, PathBuf)> {
         let (flat_rows, transform_rows) = self.export_to_rows(data);
-        
+
         if flat_rows.is_empty() {
             return Ok((PathBuf::new(), PathBuf::new()));
         }
 
         // 1. 构建 Instances DataFrame (聚合)
         let instances_df = self.create_instances_dataframe(flat_rows)?;
-        
+
         // 2. 构建 Transforms DataFrame
         let transforms_df = self.create_transforms_dataframe(transform_rows)?;
 
@@ -193,31 +196,34 @@ impl ParquetManager {
 
         println!(
             "✅ 增量 Parquet 写入完成: Instances({}, {}条), Transforms({}, {}条)",
-            inst_path.display(), instances_df.height(),
-            trans_path.display(), transforms_df.height()
+            inst_path.display(),
+            instances_df.height(),
+            trans_path.display(),
+            transforms_df.height()
         );
-        
+
         Ok((inst_path, trans_path))
     }
 
     /// 数据转换逻辑（按 refno 聚合，分离世界变换和局部变换）
     fn export_to_rows(&self, data: &ExportData) -> (Vec<InstanceRow>, Vec<TransformRow>) {
         use std::collections::HashMap;
-        
+
         let mut instance_map: HashMap<String, InstanceRow> = HashMap::new();
         let mut transform_rows = Vec::new();
         let mut palette = SimpleColorPalette::new();
         // 用于记录已添加的世界变换，避免重复
-        let mut added_world_trans: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut added_world_trans: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         // 1. 处理 Components
         for comp in &data.components {
             let refno_str = comp.refno.to_string();
             let color_index = palette.index_for_noun(&comp.noun);
-            
+
             // 生成世界变换 ID
             let world_trans_id = format!("{}_world", comp.refno);
-            
+
             // 如果这个 refno 的世界变换还没添加，则添加
             if !added_world_trans.contains(&world_trans_id) {
                 let world_t_cols = dmat4_to_f32_array(&comp.world_transform);
@@ -227,28 +233,40 @@ impl ParquetManager {
                 });
                 added_world_trans.insert(world_trans_id.clone());
             }
-            
+
             // 获取或创建实例行
-            let instance = instance_map.entry(refno_str.clone()).or_insert_with(|| InstanceRow {
-                refno: refno_str.clone(),
-                noun: comp.noun.clone(),
-                spec_value: comp.spec_value,
-                color_index,
-                is_tubi: false,
-                owner_refno: comp.owner_refno.map(|r| r.to_string()),
-                geo_items: Vec::new(),
-                inst_trans_id: world_trans_id.clone(),
-                aabb: comp.aabb.as_ref().map(|a| [
-                    a.mins().x as f32, a.mins().y as f32, a.mins().z as f32,
-                    a.maxs().x as f32, a.maxs().y as f32, a.maxs().z as f32,
-                ]).unwrap_or([0.0; 6]),
-            });
-            
+            let instance = instance_map
+                .entry(refno_str.clone())
+                .or_insert_with(|| InstanceRow {
+                    refno: refno_str.clone(),
+                    noun: comp.noun.clone(),
+                    spec_value: comp.spec_value,
+                    color_index,
+                    is_tubi: false,
+                    owner_refno: comp.owner_refno.map(|r| r.to_string()),
+                    geo_items: Vec::new(),
+                    inst_trans_id: world_trans_id.clone(),
+                    aabb: comp
+                        .aabb
+                        .as_ref()
+                        .map(|a| {
+                            [
+                                a.mins().x as f32,
+                                a.mins().y as f32,
+                                a.mins().z as f32,
+                                a.maxs().x as f32,
+                                a.maxs().y as f32,
+                                a.maxs().z as f32,
+                            ]
+                        })
+                        .unwrap_or([0.0; 6]),
+                });
+
             // 添加所有几何体（分离存储局部变换）
             for (geo_index, geo) in comp.geometries.iter().enumerate() {
                 // 生成几何体局部变换 ID
                 let geo_trans_id = format!("{}_geo_{}", comp.refno, geo_index);
-                
+
                 // 存储局部变换（不再组合）
                 let geo_t_cols = dmat4_to_f32_array(&geo.geo_transform);
 
@@ -268,10 +286,10 @@ impl ParquetManager {
         let tubi_color_index = palette.index_for_noun("TUBI");
         for tubi in &data.tubings {
             let refno_str = tubi.refno.to_string();
-            
+
             // TUBI 的世界变换 ID
             let world_trans_id = format!("{}_world", tubi.refno);
-            
+
             // 如果这个 refno 的世界变换还没添加，则添加
             if !added_world_trans.contains(&world_trans_id) {
                 let world_t_cols = dmat4_to_f32_array(&tubi.transform);
@@ -281,32 +299,41 @@ impl ParquetManager {
                 });
                 added_world_trans.insert(world_trans_id.clone());
             }
-            
+
             // 获取或创建实例行
-            let instance = instance_map.entry(refno_str.clone()).or_insert_with(|| InstanceRow {
-                refno: refno_str.clone(),
-                noun: "TUBI".to_string(),
-                spec_value: tubi.spec_value,
-                color_index: tubi_color_index,
-                is_tubi: true,
-                owner_refno: Some(tubi.owner_refno.to_string()),
-                geo_items: Vec::new(),
-                inst_trans_id: world_trans_id.clone(),
-                aabb: tubi.aabb.as_ref().map(|a| [
-                    a.mins().x as f32, a.mins().y as f32, a.mins().z as f32,
-                    a.maxs().x as f32, a.maxs().y as f32, a.maxs().z as f32,
-                ]).unwrap_or([0.0; 6]),
-            });
-            
+            let instance = instance_map
+                .entry(refno_str.clone())
+                .or_insert_with(|| InstanceRow {
+                    refno: refno_str.clone(),
+                    noun: "TUBI".to_string(),
+                    spec_value: tubi.spec_value,
+                    color_index: tubi_color_index,
+                    is_tubi: true,
+                    owner_refno: Some(tubi.owner_refno.to_string()),
+                    geo_items: Vec::new(),
+                    inst_trans_id: world_trans_id.clone(),
+                    aabb: tubi
+                        .aabb
+                        .as_ref()
+                        .map(|a| {
+                            [
+                                a.mins().x as f32,
+                                a.mins().y as f32,
+                                a.mins().z as f32,
+                                a.maxs().x as f32,
+                                a.maxs().y as f32,
+                                a.maxs().z as f32,
+                            ]
+                        })
+                        .unwrap_or([0.0; 6]),
+                });
+
             // TUBI 的几何体局部变换 ID（使用单位矩阵）
             let geo_trans_id = format!("{}_geo_{}", tubi.refno, tubi.index);
-            
+
             // TUBI 局部变换为单位矩阵
             let identity_cols: [f32; 16] = [
-                1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0,
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
             ];
 
             instance.geo_items.push(GeoItem {
@@ -328,7 +355,7 @@ impl ParquetManager {
         if rows.is_empty() {
             return Err(anyhow::anyhow!("No instance rows to create DataFrame"));
         }
-        
+
         // 创建基础列
         let refnos: Vec<String> = rows.iter().map(|r| r.refno.clone()).collect();
         let nouns: Vec<String> = rows.iter().map(|r| r.noun.clone()).collect();
@@ -337,7 +364,7 @@ impl ParquetManager {
         let is_tubis: Vec<bool> = rows.iter().map(|r| r.is_tubi).collect();
         let owners: Vec<Option<String>> = rows.iter().map(|r| r.owner_refno.clone()).collect();
         let inst_trans_ids: Vec<String> = rows.iter().map(|r| r.inst_trans_id.clone()).collect();
-        
+
         let min_xs: Vec<f32> = rows.iter().map(|r| r.aabb[0]).collect();
         let min_ys: Vec<f32> = rows.iter().map(|r| r.aabb[1]).collect();
         let min_zs: Vec<f32> = rows.iter().map(|r| r.aabb[2]).collect();
@@ -345,9 +372,10 @@ impl ParquetManager {
         let max_ys: Vec<f32> = rows.iter().map(|r| r.aabb[4]).collect();
         let max_zs: Vec<f32> = rows.iter().map(|r| r.aabb[5]).collect();
 
-        let geo_items_series = self.build_geo_items_series(&rows)?
+        let geo_items_series = self
+            .build_geo_items_series(&rows)?
             .cast(&Self::geo_items_dtype())?;
-        
+
         let df = DataFrame::new(vec![
             Column::from(Series::new("refno".into(), refnos)),
             Column::from(Series::new("noun".into(), nouns)),
@@ -370,7 +398,7 @@ impl ParquetManager {
 
     fn create_transforms_dataframe(&self, rows: Vec<TransformRow>) -> Result<DataFrame> {
         let trans_ids: Vec<String> = rows.iter().map(|r| r.trans_id.clone()).collect();
-        
+
         // 展平 16 个分量
         // 为了方便，这里简单循环
         let mut t_cols: Vec<Vec<f32>> = vec![Vec::new(); 16];
@@ -382,7 +410,10 @@ impl ParquetManager {
 
         let mut cols: Vec<Column> = vec![Column::from(Series::new("trans_id".into(), trans_ids))];
         for i in 0..16 {
-            cols.push(Column::from(Series::new((&format!("t{}", i)).into(), t_cols[i].clone())));
+            cols.push(Column::from(Series::new(
+                (&format!("t{}", i)).into(),
+                t_cols[i].clone(),
+            )));
         }
 
         DataFrame::new(cols).map_err(anyhow::Error::from)
@@ -392,13 +423,13 @@ impl ParquetManager {
     pub fn compact(&self, dbnum: u32) -> Result<Option<(PathBuf, PathBuf)>> {
         let res_instances = self.compact_table(dbnum, "instances", "refno")?;
         let res_transforms = self.compact_table(dbnum, "transforms", "trans_id")?;
-        
+
         if res_instances.is_some() || res_transforms.is_some() {
-             // 简单返回主文件路径，即使其中一个可能没变
-             Ok(Some((
-                 self.get_instances_main_path(dbnum),
-                 self.get_transforms_main_path(dbnum)
-             )))
+            // 简单返回主文件路径，即使其中一个可能没变
+            Ok(Some((
+                self.get_instances_main_path(dbnum),
+                self.get_transforms_main_path(dbnum),
+            )))
         } else {
             Ok(None)
         }
@@ -411,13 +442,17 @@ impl ParquetManager {
             return Ok(None);
         }
 
-        println!("🔄 [{}] 开始合并 {} 个增量文件...", prefix, incremental_files.len());
+        println!(
+            "🔄 [{}] 开始合并 {} 个增量文件...",
+            prefix,
+            incremental_files.len()
+        );
 
         // 读取主文件
         // 修改为: output/database_models/{dbnum}/{prefix}.parquet
         let main_file = self.get_dbno_dir(dbnum).join(format!("{}.parquet", prefix));
         let mut frames = Vec::new();
-        
+
         if main_file.exists() {
             let file = std::fs::File::open(&main_file)?;
             frames.push(ParquetReader::new(file).finish()?);
@@ -430,13 +465,15 @@ impl ParquetManager {
         }
 
         // 合并并去重
-        if frames.is_empty() { return Ok(None); }
-        
+        if frames.is_empty() {
+            return Ok(None);
+        }
+
         // 确保所有 DataFrame 格式一致（处理旧格式/列表格式）
         let mut uniform_frames = Vec::new();
         for df in frames {
-             let df = self.ensure_geo_items_format(df)?;
-             uniform_frames.push(df);
+            let df = self.ensure_geo_items_format(df)?;
+            uniform_frames.push(df);
         }
 
         let mut merged_df = uniform_frames[0].clone();
@@ -446,11 +483,17 @@ impl ParquetManager {
 
         // Polars 去重: keep='last' (保留最新)
         let subset_vec = vec![key_col.to_string()];
-        let unique_df = merged_df.unique::<&[String], &String>(Some(subset_vec.as_slice()), UniqueKeepStrategy::Last, None)?;
+        let unique_df = merged_df.unique::<&[String], &String>(
+            Some(subset_vec.as_slice()),
+            UniqueKeepStrategy::Last,
+            None,
+        )?;
 
         // 写入临时文件
         // 临时文件也放在同一目录下，避免跨设备移动
-        let temp_file = self.get_dbno_dir(dbnum).join(format!("{}.parquet.tmp", prefix));
+        let temp_file = self
+            .get_dbno_dir(dbnum)
+            .join(format!("{}.parquet.tmp", prefix));
         {
             let file = std::fs::File::create(&temp_file)?;
             ParquetWriter::new(file).finish(&mut unique_df.clone())?;
@@ -461,10 +504,15 @@ impl ParquetManager {
 
         // 清理
         for path in &incremental_files {
-             let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(path);
         }
-        
-        println!("✅ [{}] 合并完成: {} 条记录 -> {}", prefix, unique_df.height(), main_file.display());
+
+        println!(
+            "✅ [{}] 合并完成: {} 条记录 -> {}",
+            prefix,
+            unique_df.height(),
+            main_file.display()
+        );
         Ok(Some(main_file))
     }
 
@@ -502,7 +550,11 @@ impl ParquetManager {
                 ])
                 .collect()?;
 
-            println!("   转化完成: {} -> {} 条记录", original_height, agg_df.height());
+            println!(
+                "   转化完成: {} -> {} 条记录",
+                original_height,
+                agg_df.height()
+            );
             agg_df
         } else {
             df
@@ -546,7 +598,8 @@ impl ParquetManager {
     }
 
     fn convert_lists_to_geo_items(&self, mut df: DataFrame) -> Result<DataFrame> {
-        let geo_items = self.build_geo_items_series_from_lists(&df)?
+        let geo_items = self
+            .build_geo_items_series_from_lists(&df)?
             .cast(&Self::geo_items_dtype())?;
         df.with_column(geo_items)?;
         let _ = df.drop_in_place("geo_hashes");
@@ -608,34 +661,37 @@ impl ParquetManager {
 
     fn get_incremental_files_only(&self, dbnum: u32, prefix_type: &str) -> Result<Vec<PathBuf>> {
         let files = self.list_files(dbnum, prefix_type)?;
-        let main_file = self.get_dbno_dir(dbnum).join(format!("{}.parquet", prefix_type));
-        
+        let main_file = self
+            .get_dbno_dir(dbnum)
+            .join(format!("{}.parquet", prefix_type));
+
         Ok(files.into_iter().filter(|p| *p != main_file).collect())
     }
 
     pub fn scan_dbnos_with_incremental(&self) -> Result<Vec<u32>> {
         // 扫描所有 dbnum 子目录，检查是否有增量文件
         let base_dir = self.get_base_dir();
-        if !base_dir.exists() { return Ok(Vec::new()); }
-        
+        if !base_dir.exists() {
+            return Ok(Vec::new());
+        }
+
         let mut dbnos = std::collections::HashSet::new();
         for entry in std::fs::read_dir(base_dir)? {
             let entry = entry?;
             let path = entry.path();
-            
+
             // 检查是否是目录且可解析为 dbnum
             if path.is_dir() {
                 if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
                     if let Ok(dbnum) = dir_name.parse::<u32>() {
                         // 检查是否有增量文件
-                        let has_incremental = std::fs::read_dir(&path)?
-                            .filter_map(|e| e.ok())
-                            .any(|e| {
+                        let has_incremental =
+                            std::fs::read_dir(&path)?.filter_map(|e| e.ok()).any(|e| {
                                 let name = e.file_name().to_string_lossy().to_string();
                                 (name.starts_with("instances_") || name.starts_with("transforms_"))
                                     && name.ends_with(".parquet")
                             });
-                        
+
                         if has_incremental {
                             dbnos.insert(dbnum);
                         }
@@ -645,21 +701,36 @@ impl ParquetManager {
         }
         Ok(dbnos.into_iter().collect())
     }
-    
+
     // 兼容接口：根据类型返回文件名列表
     pub fn list_parquet_files(&self, dbnum: u32, prefix_type: Option<&str>) -> Result<Vec<String>> {
         let type_key = prefix_type.unwrap_or("instances");
         let files = self.list_files(dbnum, type_key)?;
-        Ok(files.iter().filter_map(|p| p.file_name().map(|s| s.to_string_lossy().to_string())).collect())
+        Ok(files
+            .iter()
+            .filter_map(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+            .collect())
     }
 }
 
 pub fn dmat4_to_f32_array(mat: &glam::DMat4) -> [f32; 16] {
     let cols = mat.to_cols_array();
     [
-        cols[0] as f32, cols[1] as f32, cols[2] as f32, cols[3] as f32,
-        cols[4] as f32, cols[5] as f32, cols[6] as f32, cols[7] as f32,
-        cols[8] as f32, cols[9] as f32, cols[10] as f32, cols[11] as f32,
-        cols[12] as f32, cols[13] as f32, cols[14] as f32, cols[15] as f32,
+        cols[0] as f32,
+        cols[1] as f32,
+        cols[2] as f32,
+        cols[3] as f32,
+        cols[4] as f32,
+        cols[5] as f32,
+        cols[6] as f32,
+        cols[7] as f32,
+        cols[8] as f32,
+        cols[9] as f32,
+        cols[10] as f32,
+        cols[11] as f32,
+        cols[12] as f32,
+        cols[13] as f32,
+        cols[14] as f32,
+        cols[15] as f32,
     ]
 }

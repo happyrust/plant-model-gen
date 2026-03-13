@@ -87,7 +87,11 @@ async fn extract_target_dbnums(db_option: &DbOptionExt) -> Result<Vec<u32>> {
     }
 
     // 去重并排序
-    let mut unique_dbnums: Vec<u32> = dbnums.into_iter().collect::<HashSet<_>>().into_iter().collect();
+    let mut unique_dbnums: Vec<u32> = dbnums
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     unique_dbnums.sort_unstable();
 
     Ok(unique_dbnums)
@@ -100,7 +104,10 @@ fn check_db_meta_info(stats: &mut PrecheckStats) -> Result<()> {
     match db_meta().ensure_loaded() {
         Ok(_) => {
             let dbnum_count = db_meta().get_all_dbnums().len();
-            println!("[precheck] ✅ db_meta_info.json 已加载（包含 {} 个数据库）", dbnum_count);
+            println!(
+                "[precheck] ✅ db_meta_info.json 已加载（包含 {} 个数据库）",
+                dbnum_count
+            );
             stats.db_meta_loaded = true;
             Ok(())
         }
@@ -127,8 +134,22 @@ fn print_precheck_summary(stats: &PrecheckStats) {
     if stats.tree_failed > 0 {
         println!("║    - 失败: {} 个 ❌", stats.tree_failed);
     }
-    println!("║  pe_transform: {}", if stats.pe_transform_refreshed > 0 { "✅" } else { "⚠️" });
-    println!("║  db_meta_info: {}", if stats.db_meta_loaded { "✅" } else { "⚠️" });
+    println!(
+        "║  pe_transform: {}",
+        if stats.pe_transform_refreshed > 0 {
+            "✅"
+        } else {
+            "⚠️"
+        }
+    );
+    println!(
+        "║  db_meta_info: {}",
+        if stats.db_meta_loaded {
+            "✅"
+        } else {
+            "⚠️"
+        }
+    );
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 }
@@ -249,4 +270,3 @@ pub async fn run_precheck(
 
     Ok(stats)
 }
-

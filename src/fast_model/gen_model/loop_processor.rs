@@ -47,16 +47,12 @@ pub async fn process_loop_refno_page(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aios_core::options::DbOption;
     use crate::options::DbOptionExt;
+    use aios_core::options::DbOption;
 
     #[tokio::test]
     async fn test_empty_refnos() {
-        let ctx = NounProcessContext::new(
-            Arc::new(DbOptionExt::from(DbOption::default())),
-            100,
-            4,
-        );
+        let ctx = NounProcessContext::new(Arc::new(DbOptionExt::from(DbOption::default())), 100, 4);
         let loop_sjus_map = Arc::new(DashMap::new());
         let (sender, _receiver) = flume::unbounded();
 
@@ -64,4 +60,3 @@ mod tests {
         assert!(result.is_ok());
     }
 }
-

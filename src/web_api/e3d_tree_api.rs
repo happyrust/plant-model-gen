@@ -1,4 +1,4 @@
-use aios_core::{RefnoEnum, RefU64, project_primary_db, SurrealQueryExt};
+use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
 use axum::{
     Router,
     extract::{Path, Query, State},
@@ -345,17 +345,18 @@ async fn get_visible_insts(
 ) -> Result<Json<VisibleInstsResponse>, StatusCode> {
     // 1) 先拿“深度可见实例”（可能包含无几何的组节点）
     // 层级查询统一走 indextree（TreeIndex）
-    let mut candidates = match crate::fast_model::query_compat::query_deep_visible_inst_refnos(refno).await {
-        Ok(v) => v,
-        Err(e) => {
-            return Ok(Json(VisibleInstsResponse {
-                success: false,
-                refno,
-                refnos: vec![],
-                error_message: Some(format!("query_deep_visible_inst_refnos failed: {e}")),
-            }));
-        }
-    };
+    let mut candidates =
+        match crate::fast_model::query_compat::query_deep_visible_inst_refnos(refno).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Json(VisibleInstsResponse {
+                    success: false,
+                    refno,
+                    refnos: vec![],
+                    error_message: Some(format!("query_deep_visible_inst_refnos failed: {e}")),
+                }));
+            }
+        };
 
     // 兼容：如果没有子孙可见节点，至少包含自己
     if candidates.is_empty() {
@@ -366,8 +367,10 @@ async fn get_visible_insts(
     //    - 这可以避免 query_deep_visible_inst_refnos 返回“组节点/无几何节点”，导致前端 instances 缺失。
     //    - 若文件不存在，再回退到 inst_relate 的几何实例查询做过滤。
     fn parse_dbno(r: RefnoEnum) -> Option<u32> {
-        crate::fast_model::gen_model::tree_index_manager::TreeIndexManager::resolve_dbnum_for_refno(r)
-            .ok()
+        crate::fast_model::gen_model::tree_index_manager::TreeIndexManager::resolve_dbnum_for_refno(
+            r,
+        )
+        .ok()
     }
 
     fn collect_component_refnos(v: &serde_json::Value, out: &mut HashSet<String>) {
@@ -402,8 +405,9 @@ async fn get_visible_insts(
             .join(&project_name)
             .join("instances")
             .join(format!("instances_{dbnum}.json"));
-        let instances_path_old =
-            std::path::Path::new("output").join("instances").join(format!("instances_{dbnum}.json"));
+        let instances_path_old = std::path::Path::new("output")
+            .join("instances")
+            .join(format!("instances_{dbnum}.json"));
 
         let bytes = fs::read(&instances_path_new).or_else(|_| fs::read(&instances_path_old));
         if let Ok(bytes) = bytes {
@@ -494,8 +498,8 @@ async fn search_nodes(
 
     // 不使用 pe 全表搜索，必须指定具体 noun 表查询
     const DEFAULT_SEARCH_NOUNS: &[&str] = &[
-        "EQUI", "PIPE", "BRAN", "NOZZ", "VALV", "PUMP", "TANK", "INST",
-        "ZONE", "STRU", "SUBS", "FRMW", "SITE",
+        "EQUI", "PIPE", "BRAN", "NOZZ", "VALV", "PUMP", "TANK", "INST", "ZONE", "STRU", "SUBS",
+        "FRMW", "SITE",
     ];
 
     let nouns: Vec<String> = match request.nouns.as_ref() {
@@ -618,11 +622,11 @@ async fn get_site_nodes(
                 .collect::<Vec<_>>()
                 .join(",");
 
-            let sql = format!(
-                "SELECT VALUE record::id(out) FROM [{}]->contains",
-                in_list
-            );
-            let children: Vec<i64> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+            let sql = format!("SELECT VALUE record::id(out) FROM [{}]->contains", in_list);
+            let children: Vec<i64> = project_primary_db()
+                .query_take(&sql, 0)
+                .await
+                .unwrap_or_default();
 
             for child_id in children {
                 if all_ids.len() >= MAX_NODES {
@@ -660,7 +664,10 @@ async fn get_site_nodes(
             id_list
         );
 
-        let rows: Vec<SceneNodeRow> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+        let rows: Vec<SceneNodeRow> = project_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .unwrap_or_default();
 
         for row in rows {
             let refno = RefnoEnum::from(RefU64(row.id as u64));

@@ -3,18 +3,12 @@
 //! Provides the embed URL for 3D review interface.
 //! This is the Platform's API that external systems (like Model Center) call.
 
-use axum::{
-    Router,
-    extract::Json,
-    http::StatusCode,
-    routing::post,
-    response::IntoResponse,
-};
+use axum::{Router, extract::Json, http::StatusCode, response::IntoResponse, routing::post};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 #[cfg(feature = "web_server")]
-use aios_core::{project_primary_db, init_surreal};
+use aios_core::{init_surreal, project_primary_db};
 
 #[cfg(feature = "web_server")]
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
@@ -30,7 +24,6 @@ use sha2::{Digest, Sha256};
 
 #[cfg(feature = "web_server")]
 use super::jwt_auth::JwtConfig;
-
 
 // ============================================================================
 // Configuration
@@ -269,11 +262,12 @@ fn verify_sha256_token(expected_plain: &str, token: &str) -> bool {
 
 /// 获取嵌入地址 - 平台提供给外部的接口
 #[cfg(feature = "web_server")]
-async fn get_embed_url(
-    Json(request): Json<EmbedUrlRequest>,
-) -> impl IntoResponse {
-    info!("Embed URL request: project_id={}, user_id={}", request.project_id, request.user_id);
-    
+async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoResponse {
+    info!(
+        "Embed URL request: project_id={}, user_id={}",
+        request.project_id, request.user_id
+    );
+
     // TODO: 暂时关闭 token 验证，后续需恢复
     // 尝试从 JWT token 中提取 form_id（不做签名校验）
     let mut jwt_claim_form_id: Option<String> = None;
@@ -298,12 +292,15 @@ async fn get_embed_url(
     if let Some(jwt_form_id) = jwt_claim_form_id {
         if let Some(ref req_form_id) = form_id {
             if req_form_id != &jwt_form_id {
-                return (StatusCode::UNAUTHORIZED, Json(EmbedUrlResponse {
-                    code: 401,
-                    message: "unauthorized".to_string(),
-                    data: None,
-                    url: None,
-                }));
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(EmbedUrlResponse {
+                        code: 401,
+                        message: "unauthorized".to_string(),
+                        data: None,
+                        url: None,
+                    }),
+                );
             }
         } else {
             form_id = Some(jwt_form_id);
@@ -318,109 +315,136 @@ async fn get_embed_url(
             None
         }
     };
-    
+
     // 2. 生成 JWT token
     match create_token(&request.project_id, &request.user_id, &form_id, None) {
         Ok((token, _expires_at)) => {
             // 3. 判断是否为审核人员 (可以根据 extra_parameters 或其他逻辑判断)
-            let is_reviewer = request.extra_parameters
+            let is_reviewer = request
+                .extra_parameters
                 .as_ref()
                 .and_then(|p| p.get("is_reviewer"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            
+
             info!("Generated form_id={}, token_len={}", form_id, token.len());
-            
+
             // 4. 拼接完整 URL（如果配置了 frontend_base_url）
             let full_url = {
-                let base = PLATFORM_CONFIG.frontend_base_url.trim().trim_end_matches('/');
+                let base = PLATFORM_CONFIG
+                    .frontend_base_url
+                    .trim()
+                    .trim_end_matches('/');
                 if base.is_empty() {
                     None
                 } else {
                     let path = &PLATFORM_CONFIG.frontend_relative_path;
-                    let clean_path = if path.starts_with('/') { path.clone() } else { format!("/{}", path) };
+                    let clean_path = if path.starts_with('/') {
+                        path.clone()
+                    } else {
+                        format!("/{}", path)
+                    };
                     Some(format!(
                         "{}{}?user_token={}&form_id={}&user_id={}&project_id={}&output_project={}",
-                        base, clean_path, token, form_id, request.user_id, request.project_id, request.project_id
+                        base,
+                        clean_path,
+                        token,
+                        form_id,
+                        request.user_id,
+                        request.project_id,
+                        request.project_id
                     ))
                 }
             };
 
             // 5. 返回响应
-            (StatusCode::OK, Json(EmbedUrlResponse {
-                code: 200,
-                message: "ok".to_string(),
-                data: Some(EmbedUrlData {
-                    relative_path: PLATFORM_CONFIG.frontend_relative_path.clone(),
-                    token,
-                    query: EmbedUrlQuery {
-                        form_id: form_id.clone(),
-                        is_reviewer,
-                    },
-                    lineage: EmbedLineage {
-                        form_id: form_id.clone(),
-                        task_id: existing_task.as_ref().map(|task| task.id.clone()),
-                        current_node: existing_task.as_ref().map(|task| task.current_node.clone()),
-                        status: existing_task.as_ref().map(|task| task.status.clone()),
-                    },
-                    task: existing_task,
+            (
+                StatusCode::OK,
+                Json(EmbedUrlResponse {
+                    code: 200,
+                    message: "ok".to_string(),
+                    data: Some(EmbedUrlData {
+                        relative_path: PLATFORM_CONFIG.frontend_relative_path.clone(),
+                        token,
+                        query: EmbedUrlQuery {
+                            form_id: form_id.clone(),
+                            is_reviewer,
+                        },
+                        lineage: EmbedLineage {
+                            form_id: form_id.clone(),
+                            task_id: existing_task.as_ref().map(|task| task.id.clone()),
+                            current_node: existing_task
+                                .as_ref()
+                                .map(|task| task.current_node.clone()),
+                            status: existing_task.as_ref().map(|task| task.status.clone()),
+                        },
+                        task: existing_task,
+                    }),
+                    url: full_url,
                 }),
-                url: full_url,
-            }))
+            )
         }
         Err(e) => {
             warn!("Token generation failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(EmbedUrlResponse {
-                code: -1,
-                message: format!("Token generation failed: {}", e),
-                data: None,
-                url: None,
-            }))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(EmbedUrlResponse {
+                    code: -1,
+                    message: format!("Token generation failed: {}", e),
+                    data: None,
+                    url: None,
+                }),
+            )
         }
     }
 }
 
 /// 触发缓存预加载 - 代理到模型中心
 #[cfg(feature = "web_server")]
-async fn preload_cache(
-    Json(request): Json<CachePreloadRequest>,
-) -> impl IntoResponse {
-    info!("Cache preload request: project_id={}, initiator={}", request.project_id, request.initiator);
+async fn preload_cache(Json(request): Json<CachePreloadRequest>) -> impl IntoResponse {
+    info!(
+        "Cache preload request: project_id={}, initiator={}",
+        request.project_id, request.initiator
+    );
 
     // 按文档：token 为 SHA256 哈希校验
     let expected_plain = format!("{}:{}", request.project_id, request.initiator);
     if !verify_sha256_token(&expected_plain, &request.token) {
-        return (StatusCode::UNAUTHORIZED, Json(CachePreloadResponse {
-            code: 401,
-            message: "unauthorized".to_string(),
-            data: None,
-        }));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(CachePreloadResponse {
+                code: 401,
+                message: "unauthorized".to_string(),
+                data: None,
+            }),
+        );
     }
-    
+
     // 这里可以调用模型中心的缓存接口
     // 目前返回一个占位响应
-    (StatusCode::OK, Json(CachePreloadResponse {
-        code: 0,
-        message: "accepted".to_string(),
-        data: Some(serde_json::json!({
-            "task_id": format!("cache_{}", request.project_id)
-        })),
-    }))
+    (
+        StatusCode::OK,
+        Json(CachePreloadResponse {
+            code: 0,
+            message: "accepted".to_string(),
+            data: Some(serde_json::json!({
+                "task_id": format!("cache_{}", request.project_id)
+            })),
+        }),
+    )
 }
 
 /// 同步校审流程信息
 #[cfg(feature = "web_server")]
-async fn sync_workflow_handler(
-    Json(request): Json<SyncWorkflowRequest>,
-) -> impl IntoResponse {
+async fn sync_workflow_handler(Json(request): Json<SyncWorkflowRequest>) -> impl IntoResponse {
     info!(
-        "Sync workflow request: form_id={}, action={}, actor_id={}, actor_role={}", 
+        "Sync workflow request: form_id={}, action={}, actor_id={}, actor_role={}",
         request.form_id, request.action, request.actor.id, request.actor.roles
     );
-    
+
     if let Some(ref next) = request.next_step {
         info!(
-            "Next step: assignee={}, name={}, roles={}", 
+            "Next step: assignee={}, name={}, roles={}",
             next.assignee_id, next.name, next.roles
         );
     }
@@ -428,11 +452,14 @@ async fn sync_workflow_handler(
     // 按文档：token 为 SHA256 哈希校验
     let expected_plain = format!("{}:{}", request.form_id, request.actor.id);
     if !verify_sha256_token(&expected_plain, &request.token) {
-        return (StatusCode::UNAUTHORIZED, Json(SyncWorkflowResponse {
-            code: 401,
-            message: "unauthorized".to_string(),
-            data: None,
-        }));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(SyncWorkflowResponse {
+                code: 401,
+                message: "unauthorized".to_string(),
+                data: None,
+            }),
+        );
     }
 
     // 记录当前节点的审批意见（comments）
@@ -446,8 +473,15 @@ async fn sync_workflow_handler(
     };
 
     // 模型清单来自 review_form_model
-    let model_refnos = query_workflow_models(&request.form_id).await.unwrap_or_default();
-    if let Some(comment) = request.comments.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    let model_refnos = query_workflow_models(&request.form_id)
+        .await
+        .unwrap_or_default();
+    if let Some(comment) = request
+        .comments
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         let _ = project_primary_db()
             .query(
                 r#"
@@ -470,26 +504,34 @@ async fn sync_workflow_handler(
             .bind(("opinion", comment.to_string()))
             .await;
     }
-    
+
     // 查询该 form_id 关联的数据
     let data = match query_workflow_data(&request.form_id).await {
         Ok(d) => d,
         Err(e) => {
-            warn!("Failed to query workflow data for form_id={}: {}", request.form_id, e);
+            warn!(
+                "Failed to query workflow data for form_id={}: {}",
+                request.form_id, e
+            );
             SyncWorkflowData::default()
         }
     };
-    
+
     info!(
         "Returning workflow data: models={}, opinions={}, attachments={}",
-        data.models.len(), data.opinions.len(), data.attachments.len()
+        data.models.len(),
+        data.opinions.len(),
+        data.attachments.len()
     );
-    
-    (StatusCode::OK, Json(SyncWorkflowResponse {
-        code: 200,
-        message: "success".to_string(),
-        data: Some(data),
-    }))
+
+    (
+        StatusCode::OK,
+        Json(SyncWorkflowResponse {
+            code: 200,
+            message: "success".to_string(),
+            data: Some(data),
+        }),
+    )
 }
 
 /// 删除校审数据（模型中心侧）
@@ -510,16 +552,17 @@ pub struct DeleteReviewResponse {
 
 /// POST /api/review/delete
 #[cfg(feature = "web_server")]
-async fn delete_review_data(
-    Json(request): Json<DeleteReviewRequest>,
-) -> impl IntoResponse {
+async fn delete_review_data(Json(request): Json<DeleteReviewRequest>) -> impl IntoResponse {
     let joined = request.form_ids.join(",");
     let expected_plain = format!("{}:{}", joined, request.operator_id);
     if !verify_sha256_token(&expected_plain, &request.token) {
-        return (StatusCode::UNAUTHORIZED, Json(DeleteReviewResponse {
-            code: 401,
-            message: "unauthorized".to_string(),
-        }));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(DeleteReviewResponse {
+                code: 401,
+                message: "unauthorized".to_string(),
+            }),
+        );
     }
 
     for form_id in &request.form_ids {
@@ -581,10 +624,13 @@ async fn delete_review_data(
             .await;
     }
 
-    (StatusCode::OK, Json(DeleteReviewResponse {
-        code: 200,
-        message: "ok".to_string(),
-    }))
+    (
+        StatusCode::OK,
+        Json(DeleteReviewResponse {
+            code: 200,
+            message: "ok".to_string(),
+        }),
+    )
 }
 
 // ============================================================================
@@ -598,17 +644,17 @@ async fn query_workflow_models(form_id: &str) -> anyhow::Result<Vec<String>> {
         SELECT model_refno FROM review_form_model 
         WHERE form_id = $form_id
     "#;
-    
+
     let mut response = project_primary_db()
         .query(sql)
         .bind(("form_id", form_id.to_string()))
         .await?;
-    
+
     #[derive(Debug, serde::Deserialize, SurrealValue)]
     struct ModelRow {
         model_refno: Option<String>,
     }
-    
+
     let rows: Vec<ModelRow> = response.take(0)?;
     Ok(rows.into_iter().filter_map(|r| r.model_refno).collect())
 }
@@ -717,12 +763,12 @@ async fn query_workflow_opinions(form_id: &str) -> anyhow::Result<Vec<WorkflowOp
         WHERE form_id = $form_id
         ORDER BY seq_order ASC
     "#;
-    
+
     let mut response = project_primary_db()
         .query(sql)
         .bind(("form_id", form_id.to_string()))
         .await?;
-    
+
     #[derive(Debug, serde::Deserialize, SurrealValue)]
     struct OpinionRow {
         model_refnos: Option<Vec<String>>,
@@ -732,16 +778,19 @@ async fn query_workflow_opinions(form_id: &str) -> anyhow::Result<Vec<WorkflowOp
         opinion: Option<String>,
         created_at: Option<surrealdb::types::Datetime>,
     }
-    
+
     let rows: Vec<OpinionRow> = response.take(0)?;
-    Ok(rows.into_iter().map(|r| WorkflowOpinion {
-        model: r.model_refnos.unwrap_or_default(),
-        node: r.node.unwrap_or_default(),
-        order: r.seq_order.unwrap_or(0),
-        author: r.author.unwrap_or_default(),
-        opinion: r.opinion.unwrap_or_default(),
-        created_at: r.created_at.map(|dt| dt.to_string()).unwrap_or_default(),
-    }).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| WorkflowOpinion {
+            model: r.model_refnos.unwrap_or_default(),
+            node: r.node.unwrap_or_default(),
+            order: r.seq_order.unwrap_or(0),
+            author: r.author.unwrap_or_default(),
+            opinion: r.opinion.unwrap_or_default(),
+            created_at: r.created_at.map(|dt| dt.to_string()).unwrap_or_default(),
+        })
+        .collect())
 }
 
 /// 查询表单关联的所有附件
@@ -752,12 +801,12 @@ async fn query_workflow_attachments(form_id: &str) -> anyhow::Result<Vec<Workflo
         FROM review_attachment 
         WHERE form_id = $form_id
     "#;
-    
+
     let mut response = project_primary_db()
         .query(sql)
         .bind(("form_id", form_id.to_string()))
         .await?;
-    
+
     #[derive(Debug, serde::Deserialize, SurrealValue)]
     struct AttachmentRow {
         model_refnos: Option<Vec<String>>,
@@ -767,16 +816,19 @@ async fn query_workflow_attachments(form_id: &str) -> anyhow::Result<Vec<Workflo
         description: Option<String>,
         file_ext: Option<String>,
     }
-    
+
     let rows: Vec<AttachmentRow> = response.take(0)?;
-    Ok(rows.into_iter().map(|r| WorkflowAttachment {
-        model: r.model_refnos.unwrap_or_default(),
-        id: r.file_id.unwrap_or_default(),
-        r#type: r.file_type.unwrap_or_default(),
-        download_url: r.download_url.unwrap_or_default(),
-        description: r.description.unwrap_or_default(),
-        file_ext: r.file_ext.unwrap_or_default(),
-    }).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| WorkflowAttachment {
+            model: r.model_refnos.unwrap_or_default(),
+            id: r.file_id.unwrap_or_default(),
+            r#type: r.file_type.unwrap_or_default(),
+            download_url: r.download_url.unwrap_or_default(),
+            description: r.description.unwrap_or_default(),
+            file_ext: r.file_ext.unwrap_or_default(),
+        })
+        .collect())
 }
 
 /// 汇总查询表单的所有校审数据
@@ -784,8 +836,10 @@ async fn query_workflow_attachments(form_id: &str) -> anyhow::Result<Vec<Workflo
 async fn query_workflow_data(form_id: &str) -> anyhow::Result<SyncWorkflowData> {
     let models = query_workflow_models(form_id).await.unwrap_or_default();
     let opinions = query_workflow_opinions(form_id).await.unwrap_or_default();
-    let attachments = query_workflow_attachments(form_id).await.unwrap_or_default();
-    
+    let attachments = query_workflow_attachments(form_id)
+        .await
+        .unwrap_or_default();
+
     Ok(SyncWorkflowData {
         models,
         opinions,
@@ -883,26 +937,45 @@ lazy_static::lazy_static! {
 /// 异步通知外部系统工作流状态变更（提交/驳回）
 /// fire-and-forget：不阻塞主流程
 #[cfg(feature = "web_server")]
-pub fn notify_workflow_sync_async(task_id: String, action: String, operator_id: String, comment: Option<String>) {
+pub fn notify_workflow_sync_async(
+    task_id: String,
+    action: String,
+    operator_id: String,
+    comment: Option<String>,
+) {
     if EXTERNAL_REVIEW_CONFIG.is_mock() {
-        info!("[外部校审] mock 模式，跳过工作流同步: task={}, action={}", task_id, action);
+        info!(
+            "[外部校审] mock 模式，跳过工作流同步: task={}, action={}",
+            task_id, action
+        );
         return;
     }
     tokio::spawn(async move {
-        if let Err(e) = notify_workflow_sync(&task_id, &action, &operator_id, comment.as_deref()).await {
+        if let Err(e) =
+            notify_workflow_sync(&task_id, &action, &operator_id, comment.as_deref()).await
+        {
             warn!("[外部校审] 工作流同步失败: task={}, err={}", task_id, e);
         }
     });
 }
 
 #[cfg(feature = "web_server")]
-async fn notify_workflow_sync(task_id: &str, action: &str, operator_id: &str, comment: Option<&str>) -> anyhow::Result<()> {
+async fn notify_workflow_sync(
+    task_id: &str,
+    action: &str,
+    operator_id: &str,
+    comment: Option<&str>,
+) -> anyhow::Result<()> {
     let config = &*EXTERNAL_REVIEW_CONFIG;
-    let url = format!("{}{}", config.base_url.trim_end_matches('/'), config.workflow_sync_path);
-    
+    let url = format!(
+        "{}{}",
+        config.base_url.trim_end_matches('/'),
+        config.workflow_sync_path
+    );
+
     let token_plain = format!("{}:{}", task_id, operator_id);
     let token = sha256_hex(&format!("{}:{}", config.auth_secret, token_plain));
-    
+
     let body = serde_json::json!({
         "task_id": task_id,
         "action": action,
@@ -910,23 +983,23 @@ async fn notify_workflow_sync(task_id: &str, action: &str, operator_id: &str, co
         "comment": comment.unwrap_or(""),
         "token": token,
     });
-    
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(config.timeout_seconds))
         .build()?;
-    
-    let resp = client.post(&url)
-        .json(&body)
-        .send()
-        .await?;
-    
+
+    let resp = client.post(&url).json(&body).send().await?;
+
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         anyhow::bail!("外部系统返回错误 {}: {}", status, text);
     }
-    
-    info!("[外部校审] 工作流同步成功: task={}, action={}", task_id, action);
+
+    info!(
+        "[外部校审] 工作流同步成功: task={}, action={}",
+        task_id, action
+    );
     Ok(())
 }
 
@@ -947,32 +1020,33 @@ pub fn notify_workflow_delete_async(task_id: String, operator_id: String) {
 #[cfg(feature = "web_server")]
 async fn notify_workflow_delete(task_id: &str, operator_id: &str) -> anyhow::Result<()> {
     let config = &*EXTERNAL_REVIEW_CONFIG;
-    let url = format!("{}{}", config.base_url.trim_end_matches('/'), config.workflow_delete_path);
-    
+    let url = format!(
+        "{}{}",
+        config.base_url.trim_end_matches('/'),
+        config.workflow_delete_path
+    );
+
     let token_plain = format!("{}:{}", task_id, operator_id);
     let token = sha256_hex(&format!("{}:{}", config.auth_secret, token_plain));
-    
+
     let body = serde_json::json!({
         "task_id": task_id,
         "operator_id": operator_id,
         "token": token,
     });
-    
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(config.timeout_seconds))
         .build()?;
-    
-    let resp = client.post(&url)
-        .json(&body)
-        .send()
-        .await?;
-    
+
+    let resp = client.post(&url).json(&body).send().await?;
+
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         anyhow::bail!("外部系统返回错误 {}: {}", status, text);
     }
-    
+
     info!("[外部校审] 删除通知成功: task={}", task_id);
     Ok(())
 }
@@ -981,7 +1055,10 @@ async fn notify_workflow_delete(task_id: &str, operator_id: &str) -> anyhow::Res
 #[cfg(feature = "web_server")]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::{Request, StatusCode}};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
     use serde::Deserialize;
     use tower::ServiceExt;
 
@@ -1118,23 +1195,35 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let payload: EmbedUrlResponseBody = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.code, 200);
         assert_eq!(payload.message, "ok");
         let data = payload.data.expect("embed data");
-        assert_eq!(data.get("query").and_then(|q| q.get("form_id").or_else(|| q.get("formId"))).and_then(|v| v.as_str()), Some("FORM-EXPECTED"));
-        let lineage: EmbedLineageBody = serde_json::from_value(data.get("lineage").cloned().expect("lineage")).unwrap();
+        assert_eq!(
+            data.get("query")
+                .and_then(|q| q.get("form_id").or_else(|| q.get("formId")))
+                .and_then(|v| v.as_str()),
+            Some("FORM-EXPECTED")
+        );
+        let lineage: EmbedLineageBody =
+            serde_json::from_value(data.get("lineage").cloned().expect("lineage")).unwrap();
         assert_eq!(lineage.form_id, "FORM-EXPECTED");
         assert_eq!(lineage.task_id, None);
         assert_eq!(lineage.current_node, None);
         assert_eq!(lineage.status, None);
-        let response_token = data.get("token").and_then(|v| v.as_str()).expect("response token");
+        let response_token = data
+            .get("token")
+            .and_then(|v| v.as_str())
+            .expect("response token");
         assert_eq!(verify_token(response_token).unwrap().user_id, "user-1");
         assert!(data.get("task").is_none() || data.get("task").is_some_and(|v| v.is_null()));
     }
 
     #[tokio::test]
+    #[ignore = "requires an initialized review_tasks database backing store"]
     async fn test_embed_url_returns_existing_task_for_form_id() {
         let form_id = "FORM-DB-BACKED-EXISTING";
         insert_task_with_form_id(form_id, "user-existing").await;
@@ -1163,24 +1252,58 @@ mod tests {
             .unwrap();
 
         let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let payload: EmbedUrlResponseBody = serde_json::from_slice(&body).unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(payload.code, 200);
         let data = payload.data.expect("embed data");
-        assert_eq!(data.get("query").and_then(|q| q.get("form_id").or_else(|| q.get("formId"))).and_then(|v| v.as_str()), Some(form_id));
-        let lineage: EmbedLineageBody = serde_json::from_value(data.get("lineage").cloned().expect("lineage")).unwrap();
+        assert_eq!(
+            data.get("query")
+                .and_then(|q| q.get("form_id").or_else(|| q.get("formId")))
+                .and_then(|v| v.as_str()),
+            Some(form_id)
+        );
+        let lineage: EmbedLineageBody =
+            serde_json::from_value(data.get("lineage").cloned().expect("lineage")).unwrap();
         assert_eq!(lineage.form_id, form_id);
-        assert!(lineage.task_id.as_deref().is_some_and(|task_id| task_id.starts_with("task-form-db-backed-existing")));
+        assert!(
+            lineage
+                .task_id
+                .as_deref()
+                .is_some_and(|task_id| task_id.starts_with("task-form-db-backed-existing"))
+        );
         assert_eq!(lineage.current_node.as_deref(), Some("jd"));
         assert_eq!(lineage.status.as_deref(), Some("in_review"));
-        let task = data.get("task").and_then(|v| v.as_object()).expect("existing task restored");
-        assert_eq!(task.get("form_id").or_else(|| task.get("formId")).and_then(|v| v.as_str()), Some(form_id));
-        assert_eq!(task.get("requesterId").and_then(|v| v.as_str()), Some("user-existing"));
+        let task = data
+            .get("task")
+            .and_then(|v| v.as_object())
+            .expect("existing task restored");
+        assert_eq!(
+            task.get("form_id")
+                .or_else(|| task.get("formId"))
+                .and_then(|v| v.as_str()),
+            Some(form_id)
+        );
+        assert_eq!(
+            task.get("requesterId").and_then(|v| v.as_str()),
+            Some("user-existing")
+        );
         assert_eq!(task.get("currentNode").and_then(|v| v.as_str()), Some("jd"));
-        assert_eq!(task.get("status").and_then(|v| v.as_str()), Some("in_review"));
-        assert!(task.get("id").and_then(|v| v.as_str()).is_some_and(|id| id.starts_with("task-form-db-backed-existing")));
-        let response_token = data.get("token").and_then(|v| v.as_str()).expect("response token");
+        assert_eq!(
+            task.get("status").and_then(|v| v.as_str()),
+            Some("in_review")
+        );
+        assert!(
+            task.get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| id.starts_with("task-form-db-backed-existing"))
+        );
+        let response_token = data
+            .get("token")
+            .and_then(|v| v.as_str())
+            .expect("response token");
         assert_eq!(verify_token(response_token).unwrap().form_id, form_id);
 
         cleanup_form(form_id).await;

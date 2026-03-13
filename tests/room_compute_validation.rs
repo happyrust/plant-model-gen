@@ -24,7 +24,7 @@ async fn test_room_panel_mapping_validation() -> anyhow::Result<()> {
 
     for test_case in &validation.test_cases {
         println!("Running test case: {}", test_case.case_id);
-        
+
         let panel_refno = RefnoEnum::from(test_case.panel_refno.as_str());
         let room_number = &test_case.room_number;
 
@@ -32,9 +32,9 @@ async fn test_room_panel_mapping_validation() -> anyhow::Result<()> {
         let room_panels = build_room_panels_relate_for_query(&vec![]).await?;
 
         // 查找包含目标 panel 的房间
-        let found = room_panels.iter().find(|(_, rnum, panels)| {
-            rnum == room_number && panels.contains(&panel_refno)
-        });
+        let found = room_panels
+            .iter()
+            .find(|(_, rnum, panels)| rnum == room_number && panels.contains(&panel_refno));
 
         assert!(
             found.is_some(),

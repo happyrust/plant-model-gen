@@ -22,6 +22,7 @@ fn test_parquet_cli_args_remove_cache_flags() {
 /// 测试导出 dbnum 实例数据为 Parquet
 #[tokio::test]
 #[cfg(feature = "parquet-export")]
+#[ignore = "requires a SurrealDB build with rocksdb support and seeded export data"]
 async fn test_export_dbnum_instances_parquet() {
     // 初始化测试数据库
     aios_core::init_surreal().await.unwrap();
@@ -55,8 +56,14 @@ async fn test_export_dbnum_instances_parquet() {
 
     if stats.instance_count > 0 {
         // 仅当有实例数据时验证文件
-        assert!(output_dir.join("instances.parquet").exists(), "instances.parquet 应该存在");
-        assert!(output_dir.join("manifest.json").exists(), "manifest.json 应该存在");
+        assert!(
+            output_dir.join("instances.parquet").exists(),
+            "instances.parquet 应该存在"
+        );
+        assert!(
+            output_dir.join("manifest.json").exists(),
+            "manifest.json 应该存在"
+        );
     } else {
         println!("   ⚠️ 没有实例数据（测试环境），跳过文件检查");
     }
@@ -65,6 +72,7 @@ async fn test_export_dbnum_instances_parquet() {
 /// 测试导出 PDMS Tree 为 Parquet
 #[tokio::test]
 #[cfg(feature = "parquet-export")]
+#[ignore = "requires a SurrealDB build with rocksdb support and seeded export data"]
 async fn test_export_pdms_tree_parquet() {
     // 初始化测试数据库
     aios_core::init_surreal().await.unwrap();
@@ -73,14 +81,19 @@ async fn test_export_pdms_tree_parquet() {
     let output_dir = PathBuf::from("output/test/parquet/pdms_tree");
 
     // 调用导出函数
-    let result = crate::fast_model::export_model::export_pdms_tree_parquet::export_pdms_tree_parquet(
-        dbnum,
-        &output_dir,
-        true, // verbose
-    )
-    .await;
+    let result =
+        crate::fast_model::export_model::export_pdms_tree_parquet::export_pdms_tree_parquet(
+            dbnum,
+            &output_dir,
+            true, // verbose
+        )
+        .await;
 
-    assert!(result.is_ok(), "PDMS Tree Parquet 导出应该成功: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "PDMS Tree Parquet 导出应该成功: {:?}",
+        result.err()
+    );
 
     let stats = result.unwrap();
     println!("📊 PDMS Tree 导出统计:");
@@ -102,6 +115,7 @@ async fn test_export_pdms_tree_parquet() {
 /// 因此此测试仅验证导出函数不会出错，不要求必须有数据。
 #[tokio::test]
 #[cfg(feature = "parquet-export")]
+#[ignore = "requires a SurrealDB build with rocksdb support and seeded export data"]
 async fn test_export_scene_tree_parquet() {
     // 初始化测试数据库
     aios_core::init_surreal().await.unwrap();
@@ -110,13 +124,14 @@ async fn test_export_scene_tree_parquet() {
     let output_dir = PathBuf::from("output/test/parquet/scene_tree");
 
     // 调用导出函数
-    let result = crate::scene_tree::parquet_export::export_scene_tree_parquet(
-        dbnum,
-        &output_dir,
-    )
-    .await;
+    let result =
+        crate::scene_tree::parquet_export::export_scene_tree_parquet(dbnum, &output_dir).await;
 
-    assert!(result.is_ok(), "Scene Tree Parquet 导出应该成功: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Scene Tree Parquet 导出应该成功: {:?}",
+        result.err()
+    );
 
     let node_count = result.unwrap();
     println!("📊 Scene Tree 导出统计:");

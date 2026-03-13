@@ -4,15 +4,15 @@ use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::gen_model::is_e3d_debug_enabled;
 use crate::fast_model::query_provider;
 use crate::fast_model::{SEND_INST_SIZE, debug_model_warn, shared};
+use crate::options::DbOptionExt;
 use aios_core::RefU64;
+use aios_core::Transform;
 use aios_core::geometry::*;
 use aios_core::options::DbOption;
-use crate::options::DbOptionExt;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::pdms_types::*;
 use aios_core::prim_geo::{Extrusion, Revolution};
 use aios_core::shape::pdms_shape::{BrepShapeTrait, VerifiedShape};
-use aios_core::Transform;
 use dashmap::DashMap;
 use glam::Vec3;
 use parry3d::bounding_volume::*;
@@ -78,18 +78,17 @@ pub async fn gen_loop_geos(
 
             // ── 批量预取：attmap + transform 并发 ──
             {
-                let batch_refnos: Vec<RefnoEnum> = all_loop_owner_refnos[start_idx..end_idx].to_vec();
-                let attmap_futs: Vec<_> = batch_refnos.iter()
+                let batch_refnos: Vec<RefnoEnum> =
+                    all_loop_owner_refnos[start_idx..end_idx].to_vec();
+                let attmap_futs: Vec<_> = batch_refnos
+                    .iter()
                     .map(|&r| aios_core::get_named_attmap(r))
                     .collect();
                 let transform_fut = crate::fast_model::gen_model::transform_cache::get_world_transforms_cache_first_batch(
                     Some(db_option.as_ref()),
                     &batch_refnos,
                 );
-                let _ = tokio::join!(
-                    futures::future::join_all(attmap_futs),
-                    transform_fut,
-                );
+                let _ = tokio::join!(futures::future::join_all(attmap_futs), transform_fut,);
             }
 
             let mut shape_insts_data = ShapeInstancesData::default();
@@ -146,22 +145,18 @@ pub async fn gen_loop_geos(
 
                     shape_insts_data.insert_negs(target_refno, &neg_refnos);
                     //检查是否有CMPF
-                    let cmpf_refnos = query_provider::get_descendants_by_types(
-                        target_refno,
-                        &["CMPF"],
-                        None,
-                    )
-                    .await
-                    .unwrap_or_default();
-                    if !cmpf_refnos.is_empty() {
-                        //查询cmpf里面的元素
-                        let cmpf_neg_refnos =
-                            query_provider::query_multi_descendants(
-                                &cmpf_refnos,
-                                &GENRAL_NEG_NOUN_NAMES,
-                            )
+                    let cmpf_refnos =
+                        query_provider::get_descendants_by_types(target_refno, &["CMPF"], None)
                             .await
                             .unwrap_or_default();
+                    if !cmpf_refnos.is_empty() {
+                        //查询cmpf里面的元素
+                        let cmpf_neg_refnos = query_provider::query_multi_descendants(
+                            &cmpf_refnos,
+                            &GENRAL_NEG_NOUN_NAMES,
+                        )
+                        .await
+                        .unwrap_or_default();
                         // dbg!(&cmpf_neg_refnos);
                         shape_insts_data.insert_negs(
                             target_refno,
@@ -190,7 +185,9 @@ pub async fn gen_loop_geos(
                     Err(e) => {
                         debug_model_warn!(
                             "{}: fetch_loops_and_height 失败: {} (type={})",
-                            target_refno, e, target_type
+                            target_refno,
+                            e,
+                            target_type
                         );
                         continue;
                     }
@@ -199,7 +196,10 @@ pub async fn gen_loop_geos(
                 let height = loop_res.height;
                 debug_model_warn!(
                     "{}: fetch_loops_and_height 结果: loops={}, height={} (type={})",
-                    target_refno, verts.len(), height, target_type
+                    target_refno,
+                    verts.len(),
+                    height,
+                    target_type
                 );
                 match target_type {
                     "NREV" | "REVO" => {
@@ -274,7 +274,9 @@ pub async fn gen_loop_geos(
                 geos_info.visible = visible;
                 debug_model_warn!(
                     "{}: geo_hash={}, geo_param={:?}, trans_nan=({},{},{})",
-                    target_refno, geo_hash, std::mem::discriminant(&geo_param),
+                    target_refno,
+                    geo_hash,
+                    std::mem::discriminant(&geo_param),
                     item_trans.translation.is_nan(),
                     item_trans.rotation.is_nan(),
                     item_trans.scale.is_nan()
@@ -295,9 +297,7 @@ pub async fn gen_loop_geos(
                 }
                 // 统一处理 transform.scale 清零逻辑
                 crate::fast_model::reuse_unit::normalize_transform_scale(
-                    &mut tr,
-                    unit_flag,
-                    geo_hash,
+                    &mut tr, unit_flag, geo_hash,
                 );
                 //需要判断多个PLOO、LOOP的情况，第二个开始都是负实体
                 let geo_type = if target_att.is_neg() {
@@ -567,4 +567,3 @@ pub async fn gen_loop_geos_from_inputs(
     Ok(true)
 }
 */
-

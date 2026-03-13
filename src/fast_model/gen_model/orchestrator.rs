@@ -5,37 +5,36 @@
 //! - 几何体生成、Mesh 生成、布尔运算的编排
 //! - 增量更新、手动 refno、调试模式的处理
 //! - 空间索引和截图捕获的触发
+use crate::data_interface::increment_record::IncrGeoUpdateLog;
+use crate::data_interface::sesno_increment::get_changes_at_sesno;
+use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_dbnos;
+use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_refnos_grouped_by_dbno;
+use crate::fast_model::export_model::export_prepack_lod::export_prepack_lod_for_refnos;
+use crate::fast_model::unit_converter::LengthUnit;
+use aios_core::RefnoEnum;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use crate::fast_model::export_model::export_prepack_lod::export_prepack_lod_for_refnos;
-use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_dbnos;
-use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_refnos_grouped_by_dbno;
-use crate::fast_model::unit_converter::LengthUnit;
-use aios_core::RefnoEnum;
-use crate::data_interface::increment_record::IncrGeoUpdateLog;
-use crate::data_interface::sesno_increment::get_changes_at_sesno;
 // use crate::fast_model::capture::capture_refnos_if_enabled; // removed on foyer-cache-cleanup
 use crate::data_interface::db_meta_manager::db_meta;
-use crate::fast_model::mesh_generate::{
-    run_boolean_worker,
-    MeshTask, MeshResult, MeshWorkerReport, RecentGeoDeduper,
-    extract_mesh_tasks, generate_meshes_for_batch, query_existing_meshed_inst_geo_ids,
-    run_mesh_worker_from_channel,
-};
 use crate::fast_model::gen_model::boolean_task::{BooleanTask, BooleanTaskAccumulator};
 use crate::fast_model::gen_model::manifold_bool::run_bool_worker_from_tasks;
+use crate::fast_model::mesh_generate::{
+    MeshResult, MeshTask, MeshWorkerReport, RecentGeoDeduper, extract_mesh_tasks,
+    generate_meshes_for_batch, query_existing_meshed_inst_geo_ids, run_boolean_worker,
+    run_mesh_worker_from_channel,
+};
 use crate::fast_model::pdms_inst::save_instance_data_optimize;
-use crate::fast_model::pdms_inst::{save_instance_data_to_sql_file, InstRelatePrecomputed};
+use crate::fast_model::pdms_inst::{InstRelatePrecomputed, save_instance_data_to_sql_file};
 use crate::options::{BooleanPipelineMode, DbOptionExt, MeshFormat};
 
 #[cfg(feature = "parquet-export")]
 use crate::fast_model::export_model::ParquetStreamWriter;
 
+use super::cache_miss_report;
 use super::config::IndexTreeConfig;
 use super::errors::{IndexTreeError, Result};
-use super::cache_miss_report;
 use super::index_tree_mode::gen_index_tree_geos_optimized;
 use super::models::NounCategory;
 use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
@@ -65,8 +64,7 @@ pub(crate) async fn split_shape_instances_by_dbnum(
         if let Some(v) = cache.get(&refno) {
             return Some(*v);
         }
-        let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno)
-            .ok();
+        let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno).ok();
         if let Some(dbnum) = dbnum {
             cache.insert(refno, dbnum);
             return Some(dbnum);
@@ -304,7 +302,10 @@ pub struct GenModelResult {
 /// * `db_option` - 数据库配置
 /// * `incr_updates` - 增量更新日志
 /// * `target_sesno` - 目标 sesno
-#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "gen_all_geos_data"))]
+#[cfg_attr(
+    feature = "profile",
+    tracing::instrument(skip_all, name = "gen_all_geos_data")
+)]
 pub async fn gen_all_geos_data(
     manual_refnos: Vec<RefnoEnum>,
     db_option: &DbOptionExt,
@@ -370,13 +371,17 @@ pub async fn gen_all_geos_data(
 
     // ✨ 执行预检查：确保 Tree 文件、pe_transform、db_meta_info 就绪
     if db_option.use_surrealdb {
-        use crate::fast_model::gen_model::precheck_coordinator::{run_precheck, PrecheckConfig};
+        use crate::fast_model::gen_model::precheck_coordinator::{PrecheckConfig, run_precheck};
         let precheck_config = PrecheckConfig {
             enabled: true,
             check_tree: true,
             check_pe_transform: true,
             check_db_meta: true,
-            tree_output_dir: db_option.get_project_output_dir().join("scene_tree").to_string_lossy().to_string(),
+            tree_output_dir: db_option
+                .get_project_output_dir()
+                .join("scene_tree")
+                .to_string_lossy()
+                .to_string(),
         };
         match run_precheck(db_option, Some(precheck_config)).await {
             Ok(stats) => {
@@ -389,7 +394,6 @@ pub async fn gen_all_geos_data(
                 // 不阻断流程，继续执行
             }
         }
-
     } else {
         // cache-only 模式：仅检查 db_meta_info
         let _ = db_meta().ensure_loaded();
@@ -564,7 +568,10 @@ async fn process_index_tree_generation(
         let path = super::sql_file_writer::SqlFileWriter::default_path(&output_dir, None);
         match super::sql_file_writer::SqlFileWriter::new(&path) {
             Ok(w) => {
-                println!("[gen_model] 🗂️ defer_db_write 模式已启用，SQL 输出到: {}", path.display());
+                println!(
+                    "[gen_model] 🗂️ defer_db_write 模式已启用，SQL 输出到: {}",
+                    path.display()
+                );
                 Some(Arc::new(w))
             }
             Err(e) => {
@@ -598,7 +605,11 @@ async fn process_index_tree_generation(
 
     #[cfg(feature = "parquet-export")]
     let parquet_writer = if enable_parquet_stream_writer {
-        let output_dir = db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes");
+        let output_dir = db_option
+            .inner
+            .meshes_path
+            .as_deref()
+            .unwrap_or("assets/meshes");
         let parquet_dir = std::path::Path::new(output_dir)
             .parent()
             .unwrap_or(std::path::Path::new("output"));
@@ -616,19 +627,16 @@ async fn process_index_tree_generation(
             }
         }
     } else {
-        println!(
-            "[Parquet] 流式写入已禁用（可设置 AIOS_ENABLE_PARQUET_STREAM_WRITER=1 显式开启）"
-        );
+        println!("[Parquet] 流式写入已禁用（可设置 AIOS_ENABLE_PARQUET_STREAM_WRITER=1 显式开启）");
         None
     };
 
     #[cfg(not(feature = "parquet-export"))]
     let parquet_writer: Option<std::sync::Arc<()>> = None;
 
-    // 
+    //
     #[allow(unused_variables)]
     let parquet_writer_clone = parquet_writer.clone();
-
 
     // model cache-only 已移除（foyer-cache-cleanup）
     let model_cache_ctx: Option<()> = None;
@@ -646,20 +654,21 @@ async fn process_index_tree_generation(
     let touched_refnos_for_insert = touched_refnos.clone();
 
     // 当 manual_db_nums 只有一个值时，直接使用该 dbnum，无需从 refno 反推
-    let known_dbnum: Option<u32> = db_option.inner.manual_db_nums.as_ref()
+    let known_dbnum: Option<u32> = db_option
+        .inner
+        .manual_db_nums
+        .as_ref()
         .filter(|nums| nums.len() == 1)
         .and_then(|nums| nums.first().copied());
     let sql_writer_clone = sql_file_writer.clone();
     let db_option_inner = db_option.inner.clone();
     let insert_handle = tokio::spawn(async move {
-
         #[cfg(feature = "profile")]
         let sink_span = tracing::info_span!("instance_sink");
         let mut batch_cnt: u64 = 0;
         let mut t_save_db = std::time::Duration::ZERO;
         let mut t_cache = std::time::Duration::ZERO;
         let mut t_parquet = std::time::Duration::ZERO;
-
 
         // SurrealDB 写入后台任务句柄：不阻塞 cache 写入和后续 batch 接收
         let mut db_write_handles: Vec<tokio::task::JoinHandle<bool>> = Vec::new();
@@ -670,7 +679,8 @@ async fn process_index_tree_generation(
 
         // Mesh 内联生成所需的跨批次共享状态
         let mut mesh_deduper = RecentGeoDeduper::new(200_000);
-        let mesh_aabb_map: Arc<dashmap::DashMap<String, parry3d::bounding_volume::Aabb>> = Arc::new(dashmap::DashMap::new());
+        let mesh_aabb_map: Arc<dashmap::DashMap<String, parry3d::bounding_volume::Aabb>> =
+            Arc::new(dashmap::DashMap::new());
         let mesh_pts_map: Arc<dashmap::DashMap<u64, String>> = Arc::new(dashmap::DashMap::new());
         let mut t_mesh = std::time::Duration::ZERO;
         let mut mesh_total = 0usize;
@@ -681,7 +691,10 @@ async fn process_index_tree_generation(
             let ids = query_existing_meshed_inst_geo_ids();
             let count = ids.len();
             mesh_deduper.preload(ids);
-            println!("[mesh_inline] 预加载 {} 个已 meshed inst_geo ID 到去重器 (capacity={})", count, mesh_deduper.capacity);
+            println!(
+                "[mesh_inline] 预加载 {} 个已 meshed inst_geo ID 到去重器 (capacity={})",
+                count, mesh_deduper.capacity
+            );
         } else if gen_mesh {
             println!("[mesh_inline] replace_exist 模式，跳过去重器预加载，强制重新生成 mesh");
         }
@@ -715,7 +728,7 @@ async fn process_index_tree_generation(
             // [foyer-removal] parquet_writer 已移除，跳过 write_batch
             let _ = &parquet_writer_clone;
 
-            // 
+            //
 
             // Mesh 内联生成：先生成 mesh，再将结果合并到 inst_geo INSERT 中
             let (mesh_results, batch_mesh_ms): (HashMap<u64, MeshResult>, u128) = if gen_mesh {
@@ -723,9 +736,13 @@ async fn process_index_tree_generation(
                 if !tasks.is_empty() {
                     let t0 = Instant::now();
                     let results = generate_meshes_for_batch(
-                        &tasks, &db_option_inner, &mut mesh_deduper,
-                        &mesh_aabb_map, &mesh_pts_map,
-                    ).await;
+                        &tasks,
+                        &db_option_inner,
+                        &mut mesh_deduper,
+                        &mesh_aabb_map,
+                        &mesh_pts_map,
+                    )
+                    .await;
                     let elapsed = t0.elapsed();
                     mesh_total += results.len();
                     t_mesh += elapsed;
@@ -758,7 +775,9 @@ async fn process_index_tree_generation(
                         &precomputed,
                         &mesh_results,
                         &mesh_aabb_map,
-                    ).await {
+                    )
+                    .await
+                    {
                         eprintln!("[defer_db_write] 写入 SQL 文件失败: {}", e);
                     }
                     let elapsed = t0.elapsed();
@@ -782,7 +801,14 @@ async fn process_index_tree_generation(
                 let aabb_map_clone = mesh_aabb_map.clone();
                 db_write_handles.push(tokio::spawn(async move {
                     let _permit_holder = permit; // 离开作用域时自动释放信号量
-                    if let Err(e) = save_instance_data_optimize(&shape_insts_clone, replace_exist, &mesh_results, &aabb_map_clone).await {
+                    if let Err(e) = save_instance_data_optimize(
+                        &shape_insts_clone,
+                        replace_exist,
+                        &mesh_results,
+                        &aabb_map_clone,
+                    )
+                    .await
+                    {
                         eprintln!("保存实例数据失败: {}", e);
                         return false;
                     }
@@ -796,18 +822,30 @@ async fn process_index_tree_generation(
             };
 
             // 每批次耗时日志：便于定位最慢的 batch（AIOS_LOG_BATCH_PERF=1 启用）
-            if std::env::var("AIOS_LOG_BATCH_PERF").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(true) {
-                let refno_count = shape_insts_arc.inst_info_map.len() + shape_insts_arc.inst_tubi_map.len();
+            if std::env::var("AIOS_LOG_BATCH_PERF")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true)
+            {
+                let refno_count =
+                    shape_insts_arc.inst_info_map.len() + shape_insts_arc.inst_tubi_map.len();
                 let inst_geo_count = shape_insts_arc.inst_geos_map.len();
                 let batch_total_ms = batch_start.elapsed().as_millis();
-                let sample: String = shape_insts_arc.inst_info_map.keys()
+                let sample: String = shape_insts_arc
+                    .inst_info_map
+                    .keys()
                     .take(3)
                     .map(|r| r.to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
                 println!(
                     "[batch_perf] batch={} refnos={} inst_geos={} mesh_ms={} save_ms={} total_ms={} sample=[{}]",
-                    batch_cnt, refno_count, inst_geo_count, batch_mesh_ms, batch_save_ms, batch_total_ms, sample
+                    batch_cnt,
+                    refno_count,
+                    inst_geo_count,
+                    batch_mesh_ms,
+                    batch_save_ms,
+                    batch_total_ms,
+                    sample
                 );
             }
         }
@@ -831,7 +869,8 @@ async fn process_index_tree_generation(
             if let Some(ref writer) = sql_writer_clone {
                 // defer 模式：写入 .surql 文件
                 if !mesh_aabb_map.is_empty() {
-                    let keys: Vec<String> = mesh_aabb_map.iter().map(|kv| kv.key().clone()).collect();
+                    let keys: Vec<String> =
+                        mesh_aabb_map.iter().map(|kv| kv.key().clone()).collect();
                     for chunk in keys.chunks(300) {
                         let mut rows: Vec<String> = Vec::with_capacity(chunk.len());
                         for k in chunk {
@@ -862,7 +901,8 @@ async fn process_index_tree_generation(
                 }
                 println!(
                     "[mesh_inline] deferred: aabb={} pts={} 条写入 .surql",
-                    mesh_aabb_map.len(), mesh_pts_map.len()
+                    mesh_aabb_map.len(),
+                    mesh_pts_map.len()
                 );
             } else {
                 // 直接模式：写入 SurrealDB
@@ -895,12 +935,14 @@ async fn process_index_tree_generation(
                 parquet_ms = t_parquet.as_millis() as u64,
                 "instance_sink finished"
             );
-
         }
 
         ensure_no_db_write_failures(db_write_failures)?;
         let bool_tasks = bool_accumulator.build_tasks();
-        Ok::<InsertHandleReport, anyhow::Error>(InsertHandleReport { batch_cnt, bool_tasks })
+        Ok::<InsertHandleReport, anyhow::Error>(InsertHandleReport {
+            batch_cnt,
+            bool_tasks,
+        })
     });
     println!("⏳ [1/5] 几何体生成 (BRAN/HANG + LOOP/CATE/PRIM)...");
     let categorized = gen_index_tree_geos_optimized(
@@ -909,8 +951,8 @@ async fn process_index_tree_generation(
         sender.clone(),
         seed_roots,
     )
-        .await
-        .map_err(|e| anyhow::anyhow!("IndexTree 生成失败: {}", e))?;
+    .await
+    .map_err(|e| anyhow::anyhow!("IndexTree 生成失败: {}", e))?;
     println!(
         "✅ [1/5] 几何体生成完成, 用时 {}ms",
         full_start.elapsed().as_millis()
@@ -1014,7 +1056,10 @@ async fn process_index_tree_generation(
 
         // 3.5️⃣ 补建跨阶段缺失的 neg_relate（LOOP 阶段发现负实体但 PRIM 阶段才创建 geo_relate）
         if use_surrealdb && !defer_db_write {
-            if let Err(e) = crate::fast_model::gen_model::pdms_inst::reconcile_missing_neg_relate(&all_refnos).await {
+            if let Err(e) =
+                crate::fast_model::gen_model::pdms_inst::reconcile_missing_neg_relate(&all_refnos)
+                    .await
+            {
                 eprintln!("[gen_model] reconcile_missing_neg_relate 失败: {}", e);
             }
         }
@@ -1025,7 +1070,10 @@ async fn process_index_tree_generation(
             println!("[gen_model] IndexTree 模式开始布尔运算（boolean worker）");
             println!(
                 "[gen_model] boolean_pipeline_mode={:?}, defer_db_write={}, use_surrealdb={}, enable_db_backfill={}",
-                db_option.boolean_pipeline_mode, defer_db_write, use_surrealdb, db_option.enable_db_backfill
+                db_option.boolean_pipeline_mode,
+                defer_db_write,
+                use_surrealdb,
+                db_option.enable_db_backfill
             );
             println!(
                 "[gen_model] 布尔任务统计: total={} (insert_batch_cnt={})",
@@ -1037,7 +1085,9 @@ async fn process_index_tree_generation(
             match db_option.boolean_pipeline_mode {
                 BooleanPipelineMode::DbLegacy => {
                     if use_surrealdb && !defer_db_write {
-                        if let Err(e) = run_boolean_worker(Arc::new(db_option.inner.clone()), 100).await {
+                        if let Err(e) =
+                            run_boolean_worker(Arc::new(db_option.inner.clone()), 100).await
+                        {
                             eprintln!("[gen_model] IndexTree 布尔运算失败（db_legacy）: {}", e);
                         }
                     } else {
@@ -1054,7 +1104,9 @@ async fn process_index_tree_generation(
                             "[gen_model] boolean_pipeline_mode=memory_tasks 非法：defer_db_write=false 且 use_surrealdb=false，无写入通道，跳过布尔"
                         );
                     } else if bool_tasks.is_empty() {
-                        println!("[gen_model] boolean_pipeline_mode=memory_tasks，但没有可执行布尔任务");
+                        println!(
+                            "[gen_model] boolean_pipeline_mode=memory_tasks，但没有可执行布尔任务"
+                        );
                     } else {
                         // T7: DB backfill — 补齐内存中缺失的 cata 任务
                         if db_option.enable_db_backfill {
@@ -1072,7 +1124,10 @@ async fn process_index_tree_generation(
                                     );
                                 }
                                 Err(e) => {
-                                    eprintln!("[gen_model] DB backfill 失败（非致命，继续执行）: {}", e);
+                                    eprintln!(
+                                        "[gen_model] DB backfill 失败（非致命，继续执行）: {}",
+                                        e
+                                    );
                                 }
                                 _ => {}
                             }
@@ -1098,7 +1153,10 @@ async fn process_index_tree_generation(
                                 );
                             }
                             Err(e) => {
-                                eprintln!("[gen_model] IndexTree 布尔运算失败（memory_tasks）: {}", e);
+                                eprintln!(
+                                    "[gen_model] IndexTree 布尔运算失败（memory_tasks）: {}",
+                                    e
+                                );
                             }
                         }
                     }
@@ -1132,26 +1190,32 @@ async fn process_index_tree_generation(
         if db_option.mesh_formats.contains(&MeshFormat::Glb) {
             let web_bundle_start = Instant::now();
             println!("[gen_model] 开始生成 Web Bundle (GLB + JSON 数据包)...");
-        let mesh_dir = Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes"));
+            let mesh_dir = Path::new(
+                db_option
+                    .inner
+                    .meshes_path
+                    .as_deref()
+                    .unwrap_or("assets/meshes"),
+            );
 
-        // 输出到与 meshes 同级的 web_bundle 目录
-        let output_dir = mesh_dir.parent().unwrap_or(mesh_dir).join("web_bundle");
-        if let Err(e) = export_prepack_lod_for_refnos(
-            &all_refnos,
-            &mesh_dir,
-            &output_dir,
-            Arc::new(db_option.inner.clone()),
-            true, // include_descendants
-            None, // filter_nouns
-            true, // verbose
-            None, // name_config
-            false, // export_all_lods: 改为 false，遵循 DbOption 中的默认设置
-            LengthUnit::Millimeter,
-            LengthUnit::Millimeter,
-        )
-        .await
-        {
-            eprintln!("[gen_model] 生成 Web Bundle 失败: {}", e);
+            // 输出到与 meshes 同级的 web_bundle 目录
+            let output_dir = mesh_dir.parent().unwrap_or(mesh_dir).join("web_bundle");
+            if let Err(e) = export_prepack_lod_for_refnos(
+                &all_refnos,
+                &mesh_dir,
+                &output_dir,
+                Arc::new(db_option.inner.clone()),
+                true,  // include_descendants
+                None,  // filter_nouns
+                true,  // verbose
+                None,  // name_config
+                false, // export_all_lods: 改为 false，遵循 DbOption 中的默认设置
+                LengthUnit::Millimeter,
+                LengthUnit::Millimeter,
+            )
+            .await
+            {
+                eprintln!("[gen_model] 生成 Web Bundle 失败: {}", e);
             } else {
                 println!(
                     "[gen_model] Web Bundle 生成完成，输出目录: {}, 用时 {} ms",
@@ -1200,7 +1264,10 @@ async fn process_index_tree_generation(
         dbnos.sort_unstable();
         dbnos.dedup();
         if dbnos.is_empty() {
-            println!("[instances] 跳过导出：未解析到可用 dbnum（source={})", dbno_source);
+            println!(
+                "[instances] 跳过导出：未解析到可用 dbnum（source={})",
+                dbno_source
+            );
         } else {
             println!(
                 "[instances] 开始导出 instances.json: source={}, dbnums={:?}",
@@ -1208,8 +1275,13 @@ async fn process_index_tree_generation(
             );
         }
 
-        let mesh_dir =
-            Path::new(db_option.inner.meshes_path.as_deref().unwrap_or("assets/meshes"));
+        let mesh_dir = Path::new(
+            db_option
+                .inner
+                .meshes_path
+                .as_deref()
+                .unwrap_or("assets/meshes"),
+        );
         if !dbnos.is_empty() {
             if let Err(e) = export_instances_json_for_dbnos(
                 &dbnos,
@@ -1243,7 +1315,10 @@ async fn process_index_tree_generation(
         .join("profile");
 
     // 收集配置元数据
-    let dbnum_tag = db_option.inner.manual_db_nums.as_ref()
+    let dbnum_tag = db_option
+        .inner
+        .manual_db_nums
+        .as_ref()
         .and_then(|nums| nums.first().copied())
         .map(|n| n.to_string())
         .unwrap_or_else(|| "all".to_string());
@@ -1260,8 +1335,14 @@ async fn process_index_tree_generation(
         "concurrency": db_option.get_index_tree_concurrency(),
         "batch_size": db_option.get_index_tree_batch_size(),
     });
-    let json_path = profile_dir.join(format!("perf_gen_model_index_tree_dbnum_{}_{}.json", dbnum_tag, timestamp));
-    let csv_path = profile_dir.join(format!("perf_gen_model_index_tree_dbnum_{}_{}.csv", dbnum_tag, timestamp));
+    let json_path = profile_dir.join(format!(
+        "perf_gen_model_index_tree_dbnum_{}_{}.json",
+        dbnum_tag, timestamp
+    ));
+    let csv_path = profile_dir.join(format!(
+        "perf_gen_model_index_tree_dbnum_{}_{}.csv",
+        dbnum_tag, timestamp
+    ));
     if let Err(e) = perf.save_json(&json_path, metadata.clone()) {
         eprintln!("[perf] 保存 JSON 报告失败: {}", e);
     }
@@ -1287,7 +1368,10 @@ async fn process_index_tree_generation(
 // ============================================================================
 
 #[cfg(feature = "sqlite-index")]
-pub async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbnums: &[u32]) -> Result<()> {
+pub async fn update_sqlite_spatial_index_from_cache(
+    db_option: &DbOptionExt,
+    dbnums: &[u32],
+) -> Result<()> {
     use crate::spatial_index::SqliteSpatialIndex;
     use crate::sqlite_index::{ImportConfig, SqliteAabbIndex};
     use std::fs;
@@ -1321,7 +1405,9 @@ pub async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbn
     idx.init_schema().map_err(|e| anyhow::anyhow!(e))?;
 
     // 为避免 aabb.json/trans.json（固定文件名）互相覆盖，每个 dbnum 独立输出目录。
-    let base_out = db_option.get_project_output_dir().join("instances_cache_for_index");
+    let base_out = db_option
+        .get_project_output_dir()
+        .join("instances_cache_for_index");
     fs::create_dir_all(&base_out).map_err(|e| anyhow::anyhow!(e))?;
 
     // mesh_lod_tag 仅用于导出侧选择 mesh（用于补齐/计算 AABB）
@@ -1360,7 +1446,10 @@ pub async fn update_sqlite_spatial_index_from_cache(db_option: &DbOptionExt, dbn
 }
 
 #[cfg(not(feature = "sqlite-index"))]
-pub async fn update_sqlite_spatial_index_from_cache(_db_option: &DbOptionExt, _dbnums: &[u32]) -> Result<()> {
+pub async fn update_sqlite_spatial_index_from_cache(
+    _db_option: &DbOptionExt,
+    _dbnums: &[u32],
+) -> Result<()> {
     Ok(())
 }
 
@@ -1378,13 +1467,8 @@ mod tests {
         let debug_roots: Vec<RefnoEnum> = Vec::new();
         let mut incr_log = IncrGeoUpdateLog::default();
         incr_log.prim_refnos.insert("17496_171666".into());
-        let scope = decide_generation_scope(
-            &manual_refnos,
-            &debug_roots,
-            true,
-            &[],
-            Some(&incr_log),
-        );
+        let scope =
+            decide_generation_scope(&manual_refnos, &debug_roots, true, &[], Some(&incr_log));
         assert!(matches!(scope, GenerationScope::Incremental { .. }));
     }
 

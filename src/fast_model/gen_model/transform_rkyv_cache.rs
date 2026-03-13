@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use aios_core::rs_surreal::geometry_query::PlantTransform;
 use aios_core::transform::get_local_mat4;
-use aios_core::{model_primary_db, RefnoEnum, SurrealQueryExt, Transform};
+use aios_core::{RefnoEnum, SurrealQueryExt, Transform, model_primary_db};
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use serde::Deserialize;
@@ -13,7 +13,7 @@ use surrealdb::types::SurrealValue;
 
 use crate::data_interface::db_meta_manager::db_meta;
 use crate::fast_model::gen_model::mesh_generate::fetch_inst_relate_refnos;
-use crate::options::{get_db_option_ext, DbOptionExt};
+use crate::options::{DbOptionExt, get_db_option_ext};
 
 const TRANSFORM_CACHE_DIRNAME: &str = "transforms";
 const TRANSFORM_CACHE_VERSION: u32 = 1;
@@ -162,7 +162,7 @@ pub(crate) fn load_dbnum_cache_if_fresh(
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => {
             return Err(err)
-                .with_context(|| format!("读取 transform rkyv 文件失败: {}", path.display()))
+                .with_context(|| format!("读取 transform rkyv 文件失败: {}", path.display()));
         }
     };
 

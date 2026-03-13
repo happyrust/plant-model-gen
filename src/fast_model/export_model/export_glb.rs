@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use aios_core::shape::pdms_shape::PlantMesh;
-use aios_core::{RefnoEnum, project_primary_db, SurrealQueryExt, query_insts};
+use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db, query_insts};
 use anyhow::{Context, Result, anyhow};
 use glam::Vec3;
 use serde_json::{Value, json};
@@ -18,12 +18,8 @@ use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
 
 use super::export_common::{ExportData, collect_export_data};
 use super::model_exporter::{
-    ExportStats,
-    GlbExportConfig,
-    ModelExporter,
-    collect_export_refnos,
-    query_geometry_instances_ext,
-    query_geometry_instances_ext_from_cache,
+    ExportStats, GlbExportConfig, ModelExporter, collect_export_refnos,
+    query_geometry_instances_ext, query_geometry_instances_ext_from_cache,
 };
 
 fn compute_vertex_normals(mesh: &PlantMesh) -> Vec<Vec3> {
@@ -189,7 +185,10 @@ fn maybe_fix_winding_outward(vertices: &[Vec3], indices: &mut [u32]) -> bool {
         max.z = max.z.max(v.z);
     }
     let ext = max - min;
-    let ext_mag = (ext.x as f64).hypot(ext.y as f64).hypot(ext.z as f64).max(1.0);
+    let ext_mag = (ext.x as f64)
+        .hypot(ext.y as f64)
+        .hypot(ext.z as f64)
+        .max(1.0);
     let vol_threshold = 1e-9 * ext_mag * ext_mag * ext_mag; // ~1e-9 * L^3
 
     let vol6 = approx_signed_volume6(vertices, indices);
@@ -223,7 +222,10 @@ async fn filter_refnos_with_inst_relate_aabb(refnos: &[RefnoEnum]) -> Vec<RefnoE
     // 避免后续 query_insts 反序列化 world_aabb = null。
     let sql = format!("SELECT VALUE refno FROM [{ids}]");
 
-    let existing: Vec<RefnoEnum> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+    let existing: Vec<RefnoEnum> = project_primary_db()
+        .query_take(&sql, 0)
+        .await
+        .unwrap_or_default();
     if existing.is_empty() {
         return Vec::new();
     }
@@ -406,8 +408,9 @@ fn export_mesh_to_glb(
 
     // 为每个唯一几何体构建 buffer 数据
     for geo_hash in &sorted_geo_hashes {
-        let mesh = mesh_cache.load_or_get(geo_hash, mesh_dir)
-             .with_context(|| format!("Export GLB: 加载 mesh {} 失败", geo_hash))?;
+        let mesh = mesh_cache
+            .load_or_get(geo_hash, mesh_dir)
+            .with_context(|| format!("Export GLB: 加载 mesh {} 失败", geo_hash))?;
 
         let vertex_count = mesh.vertices.len();
         let normals: Cow<[Vec3]> = if mesh.normals.len() == vertex_count && !mesh.normals.is_empty()
@@ -1035,7 +1038,10 @@ pub fn export_single_mesh_to_glb(mesh: &PlantMesh, output_path: &Path) -> Result
     // 3) normals：基于（可能已翻面）的 indices 重新计算，确保与绕序一致。
     let normals_source: Cow<[Vec3]> =
         Cow::Owned(compute_vertex_normals_from(&mesh.vertices, &indices));
-    let normals: Vec<f32> = normals_source.iter().flat_map(|n| [n.x, n.y, n.z]).collect();
+    let normals: Vec<f32> = normals_source
+        .iter()
+        .flat_map(|n| [n.x, n.y, n.z])
+        .collect();
 
     // 构建 buffer 数据
     let mut buffer_data = Vec::new();
@@ -1154,7 +1160,7 @@ pub fn export_single_mesh_to_glb(mesh: &PlantMesh, output_path: &Path) -> Result
 
         // 更新 indices accessor index to point to the new accessor at position 2
         gltf["meshes"][0]["primitives"][0]["indices"] = json!(2);
-        
+
         // Also update the indices accessor's bufferView since it moved from index 1 to 2
         // and the bufferViews also shifted (indices bufferView is now at index 2)
         gltf["accessors"][2]["bufferView"] = json!(2);

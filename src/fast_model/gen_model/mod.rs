@@ -89,8 +89,8 @@ pub use loop_processor::process_loop_refno_page;
 pub use prim_processor::process_prim_refno_page;
 
 // 编排器：主入口函数
-pub use orchestrator::gen_all_geos_data;
 pub use orchestrator::GenModelResult;
+pub use orchestrator::gen_all_geos_data;
 
 // 实用工具函数
 pub use utilities::{
@@ -101,7 +101,7 @@ pub use utilities::{
 pub use mesh_processing::process_meshes_by_dbnos;
 
 // 预检查相关类型
-pub use precheck_coordinator::{run_precheck, PrecheckConfig, PrecheckStats};
+pub use precheck_coordinator::{PrecheckConfig, PrecheckStats, run_precheck};
 
 // 迁入模块的重导出
 pub use mesh_generate::{

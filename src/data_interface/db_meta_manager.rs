@@ -1,5 +1,5 @@
 //! DbMetaManager - 数据库元信息管理模块
-//! 
+//!
 //! 统一管理 db_meta_info.json 的加载、缓存和查询
 
 use anyhow::Result;
@@ -69,13 +69,33 @@ impl DbMetaManager {
                 if let Ok(dbnum) = dbnum_str.parse::<u32>() {
                     let file_info = DbFileInfo {
                         dbnum,
-                        db_type: info.get("db_type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        file_name: info.get("file_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        file_path: info.get("file_path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        latest_sesno: info.get("latest_sesno").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                        ref0s: info.get("ref0s")
+                        db_type: info
+                            .get("db_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        file_name: info
+                            .get("file_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        file_path: info
+                            .get("file_path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        latest_sesno: info
+                            .get("latest_sesno")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32,
+                        ref0s: info
+                            .get("ref0s")
                             .and_then(|v| v.as_array())
-                            .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_u64().map(|n| n as u32))
+                                    .collect()
+                            })
                             .unwrap_or_default(),
                     };
                     db_files_map.insert(dbnum, file_info);
@@ -89,8 +109,12 @@ impl DbMetaManager {
         }
 
         *self.meta_path.write().unwrap() = Some(path.to_path_buf());
-        println!("✅ DbMetaManager: 已加载 {:?}, ref0 映射 {} 条, db_files {} 条", 
-            path, ref0_map.len(), db_files_map.len());
+        println!(
+            "✅ DbMetaManager: 已加载 {:?}, ref0 映射 {} 条, db_files {} 条",
+            path,
+            ref0_map.len(),
+            db_files_map.len()
+        );
         Ok(())
     }
 
@@ -120,20 +144,24 @@ impl DbMetaManager {
             }
         }
 
-        anyhow::bail!("自动生成后仍未找到 db_meta_info.json，尝试路径: {:?}", project_paths)
+        anyhow::bail!(
+            "自动生成后仍未找到 db_meta_info.json，尝试路径: {:?}",
+            project_paths
+        )
     }
 
     /// 获取基于项目名称的路径列表
-    /// 
+    ///
     /// 从配置文件读取 project_name，构建 output/{project_name}/scene_tree/ 路径
     /// 优先使用 DB_OPTION_FILE 环境变量指定的配置文件
     fn get_project_based_paths(&self) -> Vec<String> {
         let mut paths = Vec::new();
-        
+
         // 优先使用环境变量指定的配置文件，否则回退到默认
-        let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+        let config_name =
+            std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
         let config_file = format!("{}.toml", config_name);
-        
+
         if let Ok(content) = std::fs::read_to_string(&config_file) {
             // 简单解析 project_name = "xxx"
             for line in content.lines() {
@@ -150,7 +178,7 @@ impl DbMetaManager {
                 }
             }
         }
-        
+
         paths
     }
 
@@ -162,7 +190,8 @@ impl DbMetaManager {
         use std::sync::Arc;
 
         // 从配置文件读取配置
-        let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+        let config_name =
+            std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
         let config_path = format!("{}.toml", config_name);
         if !std::path::Path::new(&config_path).exists() {
             anyhow::bail!("未找到配置文件 {}", config_path);
@@ -180,7 +209,10 @@ impl DbMetaManager {
         // 只生成 project_name 对应的 indextree
         let project_name = db_option.project_name.clone();
 
-        println!("🔄 正在通过 PDMS 解析生成 indextree (gen_tree_only 模式, 项目: {}, 类型: DESI)...", project_name);
+        println!(
+            "🔄 正在通过 PDMS 解析生成 indextree (gen_tree_only 模式, 项目: {}, 类型: DESI)...",
+            project_name
+        );
 
         // 使用 tokio runtime 执行异步生成
         let result = match tokio::runtime::Handle::try_current() {
@@ -195,7 +227,8 @@ impl DbMetaManager {
                             cur_dbno_set,
                             &["DESI"],
                             100,
-                        ).await
+                        )
+                        .await
                     })
                 })
             }
@@ -210,7 +243,8 @@ impl DbMetaManager {
                         cur_dbno_set,
                         &["DESI"],
                         100,
-                    ).await
+                    )
+                    .await
                 })
             }
         };
@@ -232,7 +266,11 @@ impl DbMetaManager {
         if Path::new(&path).exists() {
             self.load(&path)
         } else {
-            anyhow::bail!("项目 {} 的 db_meta_info.json 不存在: {}", project_name, path)
+            anyhow::bail!(
+                "项目 {} 的 db_meta_info.json 不存在: {}",
+                project_name,
+                path
+            )
         }
     }
 
@@ -362,7 +400,8 @@ pub fn generate_desi_indextree(ignore_manual_dbnum: bool) -> anyhow::Result<()> 
     use std::sync::Arc;
 
     // 优先使用环境变量指定的配置文件，否则回退到默认
-    let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let config_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let config_path = format!("{}.toml", config_name);
     if !std::path::Path::new(&config_path).exists() {
         anyhow::bail!("未找到配置文件 {}", config_path);
@@ -382,35 +421,26 @@ pub fn generate_desi_indextree(ignore_manual_dbnum: bool) -> anyhow::Result<()> 
     }
 
     let project_name = db_option.project_name.clone();
-    println!("🔄 正在生成 DESI 类型 indextree (项目: {})...", project_name);
+    println!(
+        "🔄 正在生成 DESI 类型 indextree (项目: {})...",
+        project_name
+    );
 
     // 使用 tokio runtime 执行异步生成
     let result = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    let cur_dbno_set = Arc::new(DashSet::new());
-                    sync_total_async_threaded(
-                        &db_option,
-                        &project_name,
-                        cur_dbno_set,
-                        &["DESI"],
-                        100,
-                    ).await
-                })
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let cur_dbno_set = Arc::new(DashSet::new());
+                sync_total_async_threaded(&db_option, &project_name, cur_dbno_set, &["DESI"], 100)
+                    .await
             })
-        }
+        }),
         Err(_) => {
             let rt = build_indextree_runtime()?;
             rt.block_on(async {
                 let cur_dbno_set = Arc::new(DashSet::new());
-                sync_total_async_threaded(
-                    &db_option,
-                    &project_name,
-                    cur_dbno_set,
-                    &["DESI"],
-                    100,
-                ).await
+                sync_total_async_threaded(&db_option, &project_name, cur_dbno_set, &["DESI"], 100)
+                    .await
             })
         }
     };
@@ -426,7 +456,8 @@ pub fn generate_single_indextree(target_dbnum: u32) -> anyhow::Result<()> {
     use std::io::Read;
 
     // 优先使用环境变量指定配置，否则回退到默认配置
-    let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let config_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let config_path = format!("{}.toml", config_name);
     if !std::path::Path::new(&config_path).exists() {
         anyhow::bail!("未找到配置文件 {}", config_path);
@@ -437,7 +468,8 @@ pub fn generate_single_indextree(target_dbnum: u32) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("解析 {} 失败: {}", config_path, e))?;
 
     let project_name = db_option.project_name.clone();
-    let project_dir = db_option.get_project_path(&project_name)
+    let project_dir = db_option
+        .get_project_path(&project_name)
         .ok_or_else(|| anyhow::anyhow!("无法获取项目路径"))?;
 
     println!("🔍 扫描项目目录: {}", project_dir.display());
@@ -464,29 +496,34 @@ pub fn generate_single_indextree(target_dbnum: u32) -> anyhow::Result<()> {
         }
     }
 
-    let file_path = found_file.ok_or_else(|| {
-        anyhow::anyhow!("未找到 dbnum={} 对应的 db 文件", target_dbnum)
-    })?;
+    let file_path = found_file
+        .ok_or_else(|| anyhow::anyhow!("未找到 dbnum={} 对应的 db 文件", target_dbnum))?;
 
     println!("🔄 正在生成 dbnum={} 的 indextree...", target_dbnum);
 
     // 调用单文件解析函数
     let result = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    crate::versioned_db::database::parse_single_db_file(
-                        &db_option, &project_name, &file_path, target_dbnum,
-                    ).await
-                })
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                crate::versioned_db::database::parse_single_db_file(
+                    &db_option,
+                    &project_name,
+                    &file_path,
+                    target_dbnum,
+                )
+                .await
             })
-        }
+        }),
         Err(_) => {
             let rt = build_indextree_runtime()?;
             rt.block_on(async {
                 crate::versioned_db::database::parse_single_db_file(
-                    &db_option, &project_name, &file_path, target_dbnum,
-                ).await
+                    &db_option,
+                    &project_name,
+                    &file_path,
+                    target_dbnum,
+                )
+                .await
             })
         }
     };

@@ -133,13 +133,7 @@ mod tests {
 
     #[test]
     fn test_batch_concurrency_minimum() {
-        let ctx = NounProcessContext::new(
-            Arc::new(DbOptionExt::from(DbOption::default())),
-            100,
-            0,
-        );
+        let ctx = NounProcessContext::new(Arc::new(DbOptionExt::from(DbOption::default())), 100, 0);
         assert_eq!(ctx.batch_concurrency, 1); // 自动修正为最小值1
     }
 }
-
-

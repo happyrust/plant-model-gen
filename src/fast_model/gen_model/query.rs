@@ -1,8 +1,8 @@
 use crate::fast_model::debug_model_trace;
+use aios_core::RefnoEnum;
 use aios_core::expression::query_cata::query_gm_param;
 use aios_core::pdms_data::GmParam;
 use aios_core::pdms_types::TOTAL_CATA_GEO_NOUN_NAMES;
-use aios_core::RefnoEnum;
 
 /// 查询几何参数
 ///
@@ -45,7 +45,10 @@ pub async fn query_gm_params(refno: RefnoEnum) -> anyhow::Result<Vec<GmParam>> {
             if noun == "SPVE" {
                 // SPVE 是 SPRO 的子节点，会在 query_gm_param 处理 SPRO 时查询
                 if let Some(refno) = geo_am.get_refno() {
-                    crate::smart_debug_model_trace!("   跳过 SPVE 节点（SPRO 的子节点）: {}", refno);
+                    crate::smart_debug_model_trace!(
+                        "   跳过 SPVE 节点（SPRO 的子节点）: {}",
+                        refno
+                    );
                 }
             } else {
                 if let Some(refno) = geo_am.get_refno() {

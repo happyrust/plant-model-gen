@@ -86,7 +86,8 @@ pub async fn build_spec_info_parquet(
             .collect();
         let keys_joined = pe_keys.join(", ");
         let query = format!(r#"SELECT value name FROM [{}]"#, keys_joined);
-        let names: Vec<Option<String>> = SUL_DB.query_take::<Vec<Option<String>>>(&query, 0).await?;
+        let names: Vec<Option<String>> =
+            SUL_DB.query_take::<Vec<Option<String>>>(&query, 0).await?;
         for (i, r) in chunk.iter().enumerate() {
             let name = names.get(i).and_then(|o| o.as_deref()).unwrap_or("");
             site_spec_map.insert(r.0, site_name_to_spec_value(name));
@@ -94,8 +95,10 @@ pub async fn build_spec_info_parquet(
     }
 
     // 层级遍历：每个 SITE 向下收集 BRAN/HANG/EQUI/WALL/FLOOR
-    let noun_hashes: std::collections::HashSet<u32> =
-        DELIVERY_UNIT_NOUNS.iter().map(|n| aios_core::tool::db_tool::db1_hash(n)).collect();
+    let noun_hashes: std::collections::HashSet<u32> = DELIVERY_UNIT_NOUNS
+        .iter()
+        .map(|n| aios_core::tool::db_tool::db1_hash(n))
+        .collect();
 
     let mut spec_map: HashMap<u64, i64> = HashMap::new();
     let mut rows: Vec<(String, u64, String, i64, u32)> = Vec::new();
@@ -211,10 +214,10 @@ async fn load_spec_info_from_parquet(path: &Path) -> Result<HashMap<u64, i64>> {
     use std::fs::File;
 
     // 用 parquet 读
-    let file = File::open(path)
-        .with_context(|| format!("打开 spec_info 失败: {}", path.display()))?;
-    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?
-        .build()?;
+    let file =
+        File::open(path).with_context(|| format!("打开 spec_info 失败: {}", path.display()))?;
+    let reader =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
 
     let mut map = HashMap::new();
     for batch in reader {

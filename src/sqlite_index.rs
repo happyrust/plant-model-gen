@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "sqlite-index")]
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 
 // Minimal SQLite-based AABB index using the SQLite RTree virtual table.
 // This module is feature-gated behind `sqlite-index` and can be integrated
@@ -17,7 +17,9 @@ impl SqliteAabbIndex {
     }
 
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let this = SqliteAabbIndex { path: path.as_ref().to_path_buf() };
+        let this = SqliteAabbIndex {
+            path: path.as_ref().to_path_buf(),
+        };
         let conn = Connection::open(&this.path)?;
         Self::configure(&conn)?;
         drop(conn);
@@ -95,7 +97,9 @@ impl SqliteAabbIndex {
                AND min_y <= ?4 AND max_y >= ?3 \
                AND min_z <= ?6 AND max_z >= ?5",
         )?;
-        let rows = stmt.query_map((minx, maxx, miny, maxy, minz, maxz), |row| row.get::<_, i64>(0))?;
+        let rows = stmt.query_map((minx, maxx, miny, maxy, minz, maxz), |row| {
+            row.get::<_, i64>(0)
+        })?;
         let mut ids = Vec::new();
         for r in rows {
             ids.push(r?);
@@ -121,9 +125,8 @@ impl SqliteAabbIndex {
     // Query all AABBs: returns all (id, min_x, max_x, min_y, max_y, min_z, max_z) tuples
     pub fn query_all_aabbs(&self) -> Result<Vec<(i64, f64, f64, f64, f64, f64, f64)>> {
         let conn = Connection::open(&self.path)?;
-        let mut stmt = conn.prepare(
-            "SELECT id, min_x, max_x, min_y, max_y, min_z, max_z FROM aabb_index"
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, min_x, max_x, min_y, max_y, min_z, max_z FROM aabb_index")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -169,12 +172,11 @@ impl SqliteAabbIndex {
     where
         I: IntoIterator<Item = (i64, String, f64, f64, f64, f64, f64, f64)>,
     {
-        self.insert_aabbs_with_items_and_spec_values(
-            iter.into_iter()
-                .map(|(id, noun, minx, maxx, miny, maxy, minz, maxz)| {
-                    (id, noun, 0_i64, minx, maxx, miny, maxy, minz, maxz)
-                }),
-        )
+        self.insert_aabbs_with_items_and_spec_values(iter.into_iter().map(
+            |(id, noun, minx, maxx, miny, maxy, minz, maxz)| {
+                (id, noun, 0_i64, minx, maxx, miny, maxy, minz, maxz)
+            },
+        ))
     }
 
     pub fn insert_aabbs_with_items_and_spec_values<I>(&self, iter: I) -> Result<usize>
@@ -302,14 +304,20 @@ impl SqliteAabbIndex {
         let looks_like_inline_aabb = groups.iter().any(|g| g.get("owner_aabb").is_some())
             || groups
                 .iter()
-                .flat_map(|g| g.get("children").and_then(|v| v.as_array()).into_iter().flatten())
+                .flat_map(|g| {
+                    g.get("children")
+                        .and_then(|v| v.as_array())
+                        .into_iter()
+                        .flatten()
+                })
                 .any(|c| c.get("aabb").is_some());
 
         if looks_like_inline_aabb {
             // ========================
             // 旧格式导入逻辑（min/max 直写）
             // ========================
-        let mut aabb_map: HashMap<i64, (String, i64, f64, f64, f64, f64, f64, f64)> = HashMap::new();
+            let mut aabb_map: HashMap<i64, (String, i64, f64, f64, f64, f64, f64, f64)> =
+                HashMap::new();
 
             for group in groups {
                 let owner_noun = group["owner_noun"].as_str().unwrap_or("");
@@ -331,9 +339,11 @@ impl SqliteAabbIndex {
 
             let aabb_items: Vec<_> = aabb_map
                 .into_iter()
-                .map(|(id, (noun, spec_value, minx, maxx, miny, maxy, minz, maxz))| {
-                    (id, noun, spec_value, minx, maxx, miny, maxy, minz, maxz)
-                })
+                .map(
+                    |(id, (noun, spec_value, minx, maxx, miny, maxy, minz, maxz))| {
+                        (id, noun, spec_value, minx, maxx, miny, maxy, minz, maxz)
+                    },
+                )
                 .collect();
             stats.unique_count = aabb_items.len();
             if !aabb_items.is_empty() {
@@ -352,7 +362,9 @@ impl SqliteAabbIndex {
                     "instances.json 使用 aabb_hash 格式，但未提供 json_path 上下文，无法定位 aabb.json"
                 ));
             };
-            let base_dir = json_path.parent().ok_or_else(|| anyhow::anyhow!("无法获取 instances.json 所在目录"))?;
+            let base_dir = json_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("无法获取 instances.json 所在目录"))?;
             let aabb_path = base_dir.join("aabb.json");
             if !aabb_path.exists() {
                 return Err(anyhow::anyhow!(
@@ -360,10 +372,12 @@ impl SqliteAabbIndex {
                     aabb_path.display()
                 ));
             }
-            let bytes = std::fs::read(&aabb_path)
-                .map_err(|e| anyhow::anyhow!("读取 aabb.json 失败: {}: {}", aabb_path.display(), e))?;
-            let v: serde_json::Value = serde_json::from_slice(&bytes)
-                .map_err(|e| anyhow::anyhow!("解析 aabb.json 失败: {}: {}", aabb_path.display(), e))?;
+            let bytes = std::fs::read(&aabb_path).map_err(|e| {
+                anyhow::anyhow!("读取 aabb.json 失败: {}: {}", aabb_path.display(), e)
+            })?;
+            let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                anyhow::anyhow!("解析 aabb.json 失败: {}: {}", aabb_path.display(), e)
+            })?;
             v
         };
 
@@ -420,10 +434,13 @@ impl SqliteAabbIndex {
 
         // 批量插入（避免一次性 Vec 过大）
         const CHUNK: usize = 50_000;
-        let mut buf: Vec<(i64, String, i64, f64, f64, f64, f64, f64, f64)> = Vec::with_capacity(CHUNK);
+        let mut buf: Vec<(i64, String, i64, f64, f64, f64, f64, f64, f64)> =
+            Vec::with_capacity(CHUNK);
         let mut seen: HashSet<i64> = HashSet::new();
 
-        let mut flush = |this: &SqliteAabbIndex, buf: &mut Vec<(i64, String, i64, f64, f64, f64, f64, f64, f64)>| -> anyhow::Result<()> {
+        let mut flush = |this: &SqliteAabbIndex,
+                         buf: &mut Vec<(i64, String, i64, f64, f64, f64, f64, f64, f64)>|
+         -> anyhow::Result<()> {
             if buf.is_empty() {
                 return Ok(());
             }
@@ -434,8 +451,14 @@ impl SqliteAabbIndex {
 
         // 1) groups：按配置导入
         for group in groups {
-            let owner_noun = group.get("owner_noun").and_then(|v| v.as_str()).unwrap_or("");
-            let owner_refno = group.get("owner_refno").and_then(|v| v.as_str()).unwrap_or("");
+            let owner_noun = group
+                .get("owner_noun")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let owner_refno = group
+                .get("owner_refno")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
             // EQUI coarse：尝试用 children/tubings 的 AABB 合并近似 owner AABB
             if owner_noun == "EQUI" && config.equi_coarse {
@@ -443,14 +466,20 @@ impl SqliteAabbIndex {
                     let mut merged: Option<(f64, f64, f64, f64, f64, f64)> = None;
                     if let Some(children) = group.get("children").and_then(|v| v.as_array()) {
                         for child in children {
-                            if let Some(b) = child.get("aabb_hash").and_then(|h| aabb_from_table(&aabb_table, h)) {
+                            if let Some(b) = child
+                                .get("aabb_hash")
+                                .and_then(|h| aabb_from_table(&aabb_table, h))
+                            {
                                 merge_bounds(&mut merged, b);
                             }
                         }
                     }
                     if let Some(tubings) = group.get("tubings").and_then(|v| v.as_array()) {
                         for t in tubings {
-                            if let Some(b) = t.get("aabb_hash").and_then(|h| aabb_from_table(&aabb_table, h)) {
+                            if let Some(b) = t
+                                .get("aabb_hash")
+                                .and_then(|h| aabb_from_table(&aabb_table, h))
+                            {
                                 merge_bounds(&mut merged, b);
                             }
                         }
@@ -460,8 +489,21 @@ impl SqliteAabbIndex {
                             stats.unique_count += 1;
                         }
                         stats.equi_count += 1;
-                        let spec_value = group.get("spec_value").and_then(|v| v.as_i64()).unwrap_or(0);
-                        buf.push((id, owner_noun.to_string(), spec_value, minx, maxx, miny, maxy, minz, maxz));
+                        let spec_value = group
+                            .get("spec_value")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        buf.push((
+                            id,
+                            owner_noun.to_string(),
+                            spec_value,
+                            minx,
+                            maxx,
+                            miny,
+                            maxy,
+                            minz,
+                            maxz,
+                        ));
                         if buf.len() >= CHUNK {
                             flush(self, &mut buf)?;
                         }
@@ -488,8 +530,21 @@ impl SqliteAabbIndex {
                             stats.unique_count += 1;
                         }
                         stats.children_count += 1;
-                        let spec_value = child.get("spec_value").and_then(|v| v.as_i64()).unwrap_or(0);
-                        buf.push((id, owner_noun.to_string(), spec_value, minx, maxx, miny, maxy, minz, maxz));
+                        let spec_value = child
+                            .get("spec_value")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        buf.push((
+                            id,
+                            owner_noun.to_string(),
+                            spec_value,
+                            minx,
+                            maxx,
+                            miny,
+                            maxy,
+                            minz,
+                            maxz,
+                        ));
                         if buf.len() >= CHUNK {
                             flush(self, &mut buf)?;
                         }
@@ -513,7 +568,17 @@ impl SqliteAabbIndex {
                         }
                         stats.tubings_count += 1;
                         let spec_value = t.get("spec_value").and_then(|v| v.as_i64()).unwrap_or(0);
-                        buf.push((id, "TUBI".to_string(), spec_value, minx, maxx, miny, maxy, minz, maxz));
+                        buf.push((
+                            id,
+                            "TUBI".to_string(),
+                            spec_value,
+                            minx,
+                            maxx,
+                            miny,
+                            maxy,
+                            minz,
+                            maxz,
+                        ));
                         if buf.len() >= CHUNK {
                             flush(self, &mut buf)?;
                         }
@@ -571,17 +636,19 @@ impl SqliteAabbIndex {
                 if e.1 == 0 && spec_value != 0 {
                     e.1 = spec_value;
                 }
-                e.2 = e.2.min(minx);  // min_x
-                e.3 = e.3.max(maxx);  // max_x
-                e.4 = e.4.min(miny);  // min_y
-                e.5 = e.5.max(maxy);  // max_y
-                e.6 = e.6.min(minz);  // min_z
-                e.7 = e.7.max(maxz);  // max_z
+                e.2 = e.2.min(minx); // min_x
+                e.3 = e.3.max(maxx); // max_x
+                e.4 = e.4.min(miny); // min_y
+                e.5 = e.5.max(maxy); // max_y
+                e.6 = e.6.min(minz); // min_z
+                e.7 = e.7.max(maxz); // max_z
             })
             .or_insert((noun, spec_value, minx, maxx, miny, maxy, minz, maxz));
     }
 
-    fn extract_owner_aabb(group: &serde_json::Value) -> Option<(i64, String, i64, f64, f64, f64, f64, f64, f64)> {
+    fn extract_owner_aabb(
+        group: &serde_json::Value,
+    ) -> Option<(i64, String, i64, f64, f64, f64, f64, f64, f64)> {
         let refno = group["owner_refno"].as_str()?;
         let id = refno_str_to_i64(refno)?;
         let noun = group["owner_noun"].as_str().unwrap_or("").to_string();
@@ -668,7 +735,9 @@ impl SqliteAabbIndex {
         }
     }
 
-    fn extract_element_aabb(elem: &serde_json::Value) -> Option<(i64, String, i64, f64, f64, f64, f64, f64, f64)> {
+    fn extract_element_aabb(
+        elem: &serde_json::Value,
+    ) -> Option<(i64, String, i64, f64, f64, f64, f64, f64, f64)> {
         let refno = elem["refno"].as_str()?;
         let id = refno_str_to_i64(refno)?;
         let noun = elem["noun"].as_str().unwrap_or("").to_string();
@@ -726,9 +795,7 @@ mod tests {
         ];
         idx.insert_many(data).unwrap();
 
-        let ids = idx
-            .query_intersect(4.0, 6.0, 1.0, 3.0, -1.0, 1.0)
-            .unwrap();
+        let ids = idx.query_intersect(4.0, 6.0, 1.0, 3.0, -1.0, 1.0).unwrap();
         assert!(ids.contains(&1) && ids.contains(&2) && !ids.contains(&3));
 
         let _ = fs::remove_file(path);

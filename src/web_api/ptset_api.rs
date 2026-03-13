@@ -1,22 +1,14 @@
-use aios_core::{RefnoEnum, project_primary_db, SurrealQueryExt};
 use aios_core::parsed_data::CateAxisParam;
 use aios_core::shape::pdms_shape::RsVec3;
-use aios_core::vec3_pool::{decompress_ptset, CateAxisParamCompact};
-use axum::{
-    Router,
-    extract::Path,
-    extract::Query,
-    http::StatusCode,
-    response::Json,
-    routing::get,
-};
+use aios_core::vec3_pool::{CateAxisParamCompact, decompress_ptset};
+use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db};
+use axum::{Router, extract::Path, extract::Query, http::StatusCode, response::Json, routing::get};
 use serde::{Deserialize, Serialize};
-use surrealdb::types::{self as surrealdb_types, SurrealValue};
 use std::path::PathBuf;
+use surrealdb::types::{self as surrealdb_types, SurrealValue};
 
 pub fn create_ptset_routes() -> Router {
-    Router::new()
-        .route("/api/pdms/ptset/{refno}", get(get_ptset_by_refno))
+    Router::new().route("/api/pdms/ptset/{refno}", get(get_ptset_by_refno))
 }
 
 // 定义用于接收压缩格式 ptset 的结构
@@ -141,20 +133,21 @@ async fn get_ptset_by_refno(
     );
 
     // 使用 query_take 获取压缩格式的 ptset 数据
-    let query_result: Option<CompressedPtsetQueryResult> = match project_primary_db().query_take(&sql, 0).await {
-        Ok(result) => result,
-        Err(e) => {
-            return Ok(Json(PtsetResponse {
-                success: false,
-                refno: refno_str,
-                ptset: vec![],
-                world_transform: None,
-                batch_id: None,
-                unit_info: None,
-                error_message: Some(format!("数据库查询失败: {}", e)),
-            }));
-        }
-    };
+    let query_result: Option<CompressedPtsetQueryResult> =
+        match project_primary_db().query_take(&sql, 0).await {
+            Ok(result) => result,
+            Err(e) => {
+                return Ok(Json(PtsetResponse {
+                    success: false,
+                    refno: refno_str,
+                    ptset: vec![],
+                    world_transform: None,
+                    batch_id: None,
+                    unit_info: None,
+                    error_message: Some(format!("数据库查询失败: {}", e)),
+                }));
+            }
+        };
 
     // 处理查询结果：解压缩 ptset 数据
     let ptset_points: Vec<PtsetPoint> = match query_result {
@@ -239,13 +232,20 @@ async fn try_get_ptset_from_cache(
         return Ok(None);
     };
 
-    let mut points: Vec<PtsetPoint> = cached.info.ptset_map.values().map(PtsetPoint::from).collect();
+    let mut points: Vec<PtsetPoint> = cached
+        .info
+        .ptset_map
+        .values()
+        .map(PtsetPoint::from)
+        .collect();
     points.sort_by_key(|p| p.number);
 
-    let m = cached.info.get_ele_world_transform().to_matrix().to_cols_array();
+    let m = cached
+        .info
+        .get_ele_world_transform()
+        .to_matrix()
+        .to_cols_array();
     let world_transform: Vec<f64> = m.iter().map(|v| *v as f64).collect();
 
     Ok(Some((points, world_transform, snapshot_id)))
 }
-
-

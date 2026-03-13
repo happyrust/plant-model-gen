@@ -89,7 +89,8 @@ async fn get_litefs_status() -> Value {
 fn get_database_path() -> String {
     use config as cfg;
 
-    let cfg_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let cfg_file = format!("{}.toml", cfg_name);
     if std::path::Path::new(&cfg_file).exists() {
         if let Ok(builder) = cfg::Config::builder()

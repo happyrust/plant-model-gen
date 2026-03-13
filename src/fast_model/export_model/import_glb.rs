@@ -1,11 +1,11 @@
-use std::path::Path;
-use anyhow::{Result, Context, anyhow};
 use aios_core::shape::pdms_shape::PlantMesh;
-use glam::{Vec3, Vec2};
+use anyhow::{Context, Result, anyhow};
+use glam::{Vec2, Vec3};
+use std::path::Path;
 
 pub fn import_glb_to_mesh(path: &Path) -> Result<PlantMesh> {
-    let (document, buffers, _) = gltf::import(path)
-        .with_context(|| format!("Failed to import GLB from {:?}", path))?;
+    let (document, buffers, _) =
+        gltf::import(path).with_context(|| format!("Failed to import GLB from {:?}", path))?;
 
     use gltf::Semantic;
 
@@ -14,7 +14,7 @@ pub fn import_glb_to_mesh(path: &Path) -> Result<PlantMesh> {
     let mut all_normals = Vec::new();
     let mut all_indices = Vec::new();
     let mut all_uvs = Vec::new();
-    
+
     for mesh in document.meshes() {
         for primitive in mesh.primitives() {
             let Some(pos_accessor) = primitive.get(&Semantic::Positions) else {
@@ -32,27 +32,27 @@ pub fn import_glb_to_mesh(path: &Path) -> Result<PlantMesh> {
             }
 
             let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
-            
+
             let vertex_offset = all_vertices.len() as u32;
-            
+
             if let Some(iter) = reader.read_positions() {
                 for v in iter {
                     all_vertices.push(Vec3::new(v[0], v[1], v[2]));
                 }
             }
-            
+
             if let Some(iter) = reader.read_normals() {
-                 for v in iter {
+                for v in iter {
                     all_normals.push(Vec3::new(v[0], v[1], v[2]));
                 }
             }
-            
-             if let Some(iter) = reader.read_tex_coords(0) {
-                 for v in iter.into_f32() {
+
+            if let Some(iter) = reader.read_tex_coords(0) {
+                for v in iter.into_f32() {
                     all_uvs.push(Vec2::new(v[0], v[1]));
                 }
             }
-            
+
             if let Some(iter) = reader.read_indices() {
                 for idx in iter.into_u32() {
                     all_indices.push(idx + vertex_offset);

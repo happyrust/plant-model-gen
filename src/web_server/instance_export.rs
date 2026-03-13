@@ -1,11 +1,10 @@
+use crate::fast_model::export_instanced_bundle::export_instanced_bundle_for_refnos;
+use crate::fast_model::export_model::parquet_writer::ParquetManager;
+use aios_core::{RefnoEnum, get_db_option};
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use anyhow::{Context, Result};
-use aios_core::{RefnoEnum, get_db_option};
-use crate::fast_model::export_instanced_bundle::export_instanced_bundle_for_refnos;
-use crate::fast_model::export_model::parquet_writer::ParquetManager;
-
 
 /// Export complete bundle (GLB + instances.json + manifest.json)
 /// 使用现有的 export_instanced_bundle_for_refnos 方法生成临时 bundle
@@ -28,8 +27,7 @@ pub async fn export_model_bundle_with_dbno(
     dbno: Option<u32>,
 ) -> Result<PathBuf> {
     // Create output directory
-    fs::create_dir_all(output_dir)
-        .context(format!("创建输出目录失败: {:?}", output_dir))?;
+    fs::create_dir_all(output_dir).context(format!("创建输出目录失败: {:?}", output_dir))?;
 
     // Get database option
     let db_option = get_db_option();
@@ -42,23 +40,27 @@ pub async fn export_model_bundle_with_dbno(
         output_dir,
         db_option_arc,
         true, // verbose
-    ).await?;
+    )
+    .await?;
 
     // 如果提供了 dbno 且有数据，则根据配置写入 Parquet 用于持久化
     if let Some(db_num) = dbno {
         // 检查配置是否启用 Parquet 导出 (默认为 true)
         let export_parquet = db_option.export_parquet;
-        
+
         if export_parquet && export_data.total_instances > 0 {
             println!("📦 正在写入 Parquet 增量缓存 (dbno={})...", db_num);
-            
+
             // 写入几何实例数据
             let parquet_manager = ParquetManager::new("assets");
             let project_name = get_db_option().project_name.clone();
             match parquet_manager.write_incremental(&export_data, db_num) {
                 Ok((inst_path, trans_path)) => {
-                    println!("   ✅ 几何实例 Parquet: Instances({}), Transforms({})", 
-                        inst_path.display(), trans_path.display());
+                    println!(
+                        "   ✅ 几何实例 Parquet: Instances({}), Transforms({})",
+                        inst_path.display(),
+                        trans_path.display()
+                    );
                 }
                 Err(e) => {
                     println!("   ⚠️ 几何实例 Parquet 失败: {}", e);
@@ -71,4 +73,3 @@ pub async fn export_model_bundle_with_dbno(
 
     Ok(output_dir.to_path_buf())
 }
-

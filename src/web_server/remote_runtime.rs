@@ -48,10 +48,8 @@ pub async fn start_runtime(env_id: String) -> anyhow::Result<()> {
             let watcher_arc = mgr.watcher.clone();
             Some(tokio::spawn(async move {
                 // 忽略错误并常驻循环
-                AiosDBManager::poll_sync_e3d_mqtt_events_with_backoff(
-                    watcher_arc, init_ms, max_ms,
-                )
-                .await;
+                AiosDBManager::poll_sync_e3d_mqtt_events_with_backoff(watcher_arc, init_ms, max_ms)
+                    .await;
             }))
         }
         #[cfg(not(feature = "mqtt"))]
@@ -74,7 +72,8 @@ pub async fn start_runtime(env_id: String) -> anyhow::Result<()> {
 fn query_backoff_ms(env_id: &str) -> Option<(u64, u64)> {
     // 复用 handlers 中的配置文件约定
     use config as cfg;
-    let cfg_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let cfg_file = format!("{}.toml", cfg_name);
     let db_path = if std::path::Path::new(&cfg_file).exists() {
         cfg::Config::builder()

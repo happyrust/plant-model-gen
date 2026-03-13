@@ -2,11 +2,11 @@
 //
 // 提供 SJUS 对齐计算、NGMR 查询等工具函数
 
+use crate::fast_model::query_compat::query_filter_ancestors;
 use aios_core::consts::{CIVIL_TYPES, NGMR_OWN_TYPES};
 use aios_core::{NamedAttrMap, RefnoEnum};
 use anyhow::Result;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-use crate::fast_model::query_compat::query_filter_ancestors;
 
 /// NGMR 移除类型枚举
 ///

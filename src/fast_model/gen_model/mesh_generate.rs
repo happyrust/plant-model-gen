@@ -10,24 +10,24 @@ use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
 use crate::fast_model::manifold_bool::{
     apply_cata_neg_boolean_manifold, apply_insts_boolean_manifold,
 };
+use crate::fast_model::query_compat::{query_deep_neg_inst_refnos, query_deep_visible_inst_refnos};
 use crate::fast_model::{EXIST_MESH_GEO_HASHES, utils};
 use crate::fast_model::{debug_model, debug_model_debug, debug_model_warn};
 use crate::options::{DbOptionExt, MeshFormat};
 use crate::{batch_update_err, db_err, deser_err, log_err, query_err};
+use aios_core::SurrealQueryExt;
 use aios_core::accel_tree::acceleration_tree::RStarBoundingBox;
 use aios_core::error::{init_deserialize_error, init_query_error, init_save_database_error};
 use aios_core::geometry::csg::{GeneratedMesh, generate_csg_mesh};
 use aios_core::mesh_precision::MeshPrecisionSettings;
 use aios_core::options::DbOption;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
-use aios_core::SurrealQueryExt;
 use aios_core::shape::pdms_shape::{PlantMesh, RsVec3};
 use aios_core::tool::float_tool::{dvec4_round_3, f64_round};
 use aios_core::{
-    RecordId, RefU64, RefnoEnum, gen_aabb_hash, get_inst_relate_keys,
-    utils::RecordIdExt, model_primary_db,
+    RecordId, RefU64, RefnoEnum, gen_aabb_hash, get_inst_relate_keys, model_primary_db,
+    utils::RecordIdExt,
 };
-use crate::fast_model::query_compat::{query_deep_neg_inst_refnos, query_deep_visible_inst_refnos};
 use aios_core::{get_db_option, init_test_surreal};
 // 导入几何查询相关的结构体和方法
 use aios_core::{
@@ -35,11 +35,11 @@ use aios_core::{
     query_geo_params, query_inst_geo_ids,
 };
 // 使用 aios_core 中查询方法的宏
+use aios_core::Transform;
+use aios_core::geometry::ShapeInstancesData;
 use aios_core::query_db;
 use anyhow::anyhow;
-use aios_core::Transform;
 use chrono;
-use std::str::FromStr;
 use dashmap::DashMap;
 use glam::DMat4;
 use itertools::Itertools;
@@ -48,13 +48,13 @@ use parry3d::bounding_volume::*;
 use parry3d::math::Isometry;
 use parse_pdms_db::parse::round_f32;
 use serde_json::Value as JsonValue;
-use surrealdb::types as surrealdb_types;
-use surrealdb::types::SurrealValue;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
-use aios_core::geometry::ShapeInstancesData;
+use surrealdb::types as surrealdb_types;
+use surrealdb::types::SurrealValue;
 
 /// Mesh Worker 执行报告（可观测容错）
 #[derive(Debug, Clone)]
@@ -93,7 +93,11 @@ impl MeshWorkerReport {
 
     /// 打印统一 summary
     pub fn print_summary(&self) {
-        let status = if self.degraded { "⚠️  DEGRADED" } else { "✅ OK" };
+        let status = if self.degraded {
+            "⚠️  DEGRADED"
+        } else {
+            "✅ OK"
+        };
         println!(
             "╔════════════════════════════════════════╗\n\
              ║  [mesh_worker_channel] Report  {}  ║\n\
@@ -301,7 +305,12 @@ pub struct MeshResult {
 impl MeshResult {
     /// 生成失败时的默认结果
     pub fn failed() -> Self {
-        Self { meshed: true, bad: true, aabb_hash: None, pts_hashes: vec![] }
+        Self {
+            meshed: true,
+            bad: true,
+            aabb_hash: None,
+            pts_hashes: vec![],
+        }
     }
 
     /// 生成 UPDATE inst_geo SQL（供向后兼容的 channel worker 使用）
@@ -309,16 +318,24 @@ impl MeshResult {
         if self.bad {
             return format!("UPDATE inst_geo:⟨{}⟩ SET bad=true, meshed=true;", geo_hash);
         }
-        let aabb_part = self.aabb_hash
+        let aabb_part = self
+            .aabb_hash
             .map(|h| format!(", aabb = aabb:⟨{}⟩", h))
             .unwrap_or_default();
         let pts_part = if self.pts_hashes.is_empty() {
             String::new()
         } else {
-            let refs: Vec<String> = self.pts_hashes.iter().map(|h| format!("vec3:⟨{}⟩", h)).collect();
+            let refs: Vec<String> = self
+                .pts_hashes
+                .iter()
+                .map(|h| format!("vec3:⟨{}⟩", h))
+                .collect();
             format!(", pts=[{}]", refs.join(","))
         };
-        format!("update inst_geo:⟨{}⟩ set meshed = true{}{};", geo_hash, aabb_part, pts_part)
+        format!(
+            "update inst_geo:⟨{}⟩ set meshed = true{}{};",
+            geo_hash, aabb_part, pts_part
+        )
     }
 
     /// 生成 inst_geo INSERT JSON 中的 mesh 附加字段片段
@@ -333,7 +350,11 @@ impl MeshResult {
             s.push_str(&format!(", 'aabb': aabb:⟨{}⟩", h));
         }
         if !self.pts_hashes.is_empty() {
-            let refs: Vec<String> = self.pts_hashes.iter().map(|h| format!("vec3:⟨{}⟩", h)).collect();
+            let refs: Vec<String> = self
+                .pts_hashes
+                .iter()
+                .map(|h| format!("vec3:⟨{}⟩", h))
+                .collect();
             s.push_str(&format!(", 'pts': [{}]", refs.join(",")));
         }
         s
@@ -406,12 +427,15 @@ pub async fn generate_meshes_for_batch(
                 } else {
                     None
                 };
-                results.insert(task.geo_hash, MeshResult {
-                    meshed: true,
-                    bad: !valid,
-                    aabb_hash,
-                    pts_hashes: vec![],
-                });
+                results.insert(
+                    task.geo_hash,
+                    MeshResult {
+                        meshed: true,
+                        bad: !valid,
+                        aabb_hash,
+                        pts_hashes: vec![],
+                    },
+                );
                 skipped_by_cache += 1;
             }
             continue;
@@ -433,12 +457,15 @@ pub async fn generate_meshes_for_batch(
             } else {
                 None
             };
-            results.insert(task.geo_hash, MeshResult {
-                meshed: true,
-                bad: false,
-                aabb_hash,
-                pts_hashes: vec![],
-            });
+            results.insert(
+                task.geo_hash,
+                MeshResult {
+                    meshed: true,
+                    bad: false,
+                    aabb_hash,
+                    pts_hashes: vec![],
+                },
+            );
             skipped_by_cache += 1;
             continue;
         }
@@ -455,15 +482,28 @@ pub async fn generate_meshes_for_batch(
             task.geo_param.clone()
         };
 
-        let mr = match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
+        let mr = match generate_csg_mesh(
+            &geo_param_for_mesh,
+            &lod_settings,
+            non_scalable_geo,
+            false,
+            None,
+        ) {
             Some(csg_mesh) => {
                 match handle_csg_mesh(
-                    &lod_dir, &manifold_dir,
-                    &mesh_id, &mesh_filename,
+                    &lod_dir,
+                    &manifold_dir,
+                    &mesh_id,
+                    &mesh_filename,
                     csg_mesh,
-                    aabb_map, pts_json_map, &inst_aabb_map,
-                    &mesh_formats, task.is_neg,
-                ).await {
+                    aabb_map,
+                    pts_json_map,
+                    &inst_aabb_map,
+                    &mesh_formats,
+                    task.is_neg,
+                )
+                .await
+                {
                     Ok(mr) => mr,
                     Err(e) => {
                         debug_model_warn!("CSG mesh 生成失败 for {}: {}", mesh_id, e);
@@ -472,7 +512,11 @@ pub async fn generate_meshes_for_batch(
                 }
             }
             None => {
-                debug_model_warn!("CSG mesh 返回 None for {} (type={})", mesh_id, geo_type_name);
+                debug_model_warn!(
+                    "CSG mesh 返回 None for {} (type={})",
+                    mesh_id,
+                    geo_type_name
+                );
                 MeshResult::failed()
             }
         };
@@ -535,9 +579,15 @@ pub async fn gen_meshes_in_db(
     );
     for chunk in refnos.chunks(100) {
         // 生成模型文件
-        gen_inst_meshes(&dir, &precision, chunk, replace_exist, &[MeshFormat::PdmsMesh])
-            .await
-            .unwrap();
+        gen_inst_meshes(
+            &dir,
+            &precision,
+            chunk,
+            replace_exist,
+            &[MeshFormat::PdmsMesh],
+        )
+        .await
+        .unwrap();
         // println!(
         //     "gen_inst_meshes finished: {} ms",
         //     time.elapsed().as_millis()
@@ -640,7 +690,10 @@ LIMIT {remaining};
             chunk.join(",")
         );
 
-        let mut refnos: Vec<RefnoEnum> = model_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+        let mut refnos: Vec<RefnoEnum> = model_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .unwrap_or_default();
         pending.append(&mut refnos);
     }
 
@@ -651,7 +704,10 @@ LIMIT {remaining};
 /// 查询需要生成 mesh 的 inst_geo 记录的 id
 /// 条件：meshed = false, param != NONE, bad != true
 /// 返回 inst_geo 的 id 列表（geo_hash）
-async fn query_pending_mesh_geo_ids(limit: usize, replace_exist: bool) -> anyhow::Result<Vec<RecordId>> {
+async fn query_pending_mesh_geo_ids(
+    limit: usize,
+    replace_exist: bool,
+) -> anyhow::Result<Vec<RecordId>> {
     // 注意：这里的查询用于“状态收敛式”的 worker（replace_exist=false）。
     // replace_exist=true 会走“快照遍历”分支，避免反复扫描相同的前 N 条记录。
     let sql = if replace_exist {
@@ -673,7 +729,8 @@ async fn query_pending_mesh_geo_ids(limit: usize, replace_exist: bool) -> anyhow
 /// 查询待处理 mesh 的总数（不限制数量）
 async fn query_total_pending_mesh_count(replace_exist: bool) -> anyhow::Result<usize> {
     let sql = if replace_exist {
-        "SELECT VALUE count() FROM inst_geo WHERE param != NONE AND bad != true GROUP ALL".to_string()
+        "SELECT VALUE count() FROM inst_geo WHERE param != NONE AND bad != true GROUP ALL"
+            .to_string()
     } else {
         "SELECT VALUE count() FROM inst_geo WHERE meshed != true AND param != NONE AND bad != true GROUP ALL".to_string()
     };
@@ -861,12 +918,8 @@ pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> any
         if !pending_geo_ids.is_empty() {
             let t = std::time::Instant::now();
             // 直接基于 geo_ids 生成 mesh
-            gen_inst_meshes_by_geo_ids(
-                &mesh_dir,
-                &precision,
-                &pending_geo_ids,
-                &mesh_formats,
-            ).await?;
+            gen_inst_meshes_by_geo_ids(&mesh_dir, &precision, &pending_geo_ids, &mesh_formats)
+                .await?;
 
             println!(
                 "[mesh_worker] ✅ 轮次 {} 完成: {} 个，用时 {} ms",
@@ -1015,7 +1068,13 @@ pub async fn run_mesh_worker_from_channel(
                 task.geo_param.clone()
             };
 
-            let mesh_result = match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
+            let mesh_result = match generate_csg_mesh(
+                &geo_param_for_mesh,
+                &lod_settings,
+                non_scalable_geo,
+                false,
+                None,
+            ) {
                 Some(csg_mesh) => {
                     match handle_csg_mesh(
                         &lod_dir,
@@ -1254,9 +1313,15 @@ pub async fn process_meshes_update_db(
     );
     // dbg!(&target_refnos);
     // 生成模型文件
-    gen_inst_meshes(&dir, &precision, &refnos, replace_exist, &[MeshFormat::PdmsMesh])
-        .await
-        .unwrap();
+    gen_inst_meshes(
+        &dir,
+        &precision,
+        &refnos,
+        replace_exist,
+        &[MeshFormat::PdmsMesh],
+    )
+    .await
+    .unwrap();
     println!(
         "gen_inst_meshes finished: {} ms",
         time.elapsed().as_millis()
@@ -1277,7 +1342,10 @@ pub async fn process_meshes_update_db(
 /// # 参数
 /// * `option` - 数据库选项
 /// * `refnos` - BRAN 类型的 refno 列表
-#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "process_meshes_bran"))]
+#[cfg_attr(
+    feature = "profile",
+    tracing::instrument(skip_all, name = "process_meshes_bran")
+)]
 pub async fn process_meshes_bran(
     option: Option<Arc<DbOptionExt>>,
     refnos: &[RefnoEnum],
@@ -1293,28 +1361,24 @@ pub async fn process_meshes_bran(
     let time = std::time::Instant::now();
     let dir = option
         .as_ref()
-        .map(|x| {
-            Path::new(x.inner.meshes_path.as_deref().unwrap_or("assets/meshes")).to_path_buf()
-        })
+        .map(|x| Path::new(x.inner.meshes_path.as_deref().unwrap_or("assets/meshes")).to_path_buf())
         .unwrap_or_else(|| "assets/meshes".into());
     let precision = option
         .as_ref()
         .map(|opt| opt.inner.mesh_precision.clone())
-        .unwrap_or_else(|| crate::options::get_db_option_ext().inner.mesh_precision.clone());
+        .unwrap_or_else(|| {
+            crate::options::get_db_option_ext()
+                .inner
+                .mesh_precision
+                .clone()
+        });
     let mesh_formats = option
         .as_ref()
         .map(|opt| opt.mesh_formats.clone())
         .unwrap_or_else(|| crate::options::get_db_option_ext().mesh_formats.clone());
 
     // 生成模型文件
-    gen_inst_meshes(
-        &dir,
-        &precision,
-        &refnos,
-        replace_exist,
-        &mesh_formats,
-    )
-    .await?;
+    gen_inst_meshes(&dir, &precision, &refnos, replace_exist, &mesh_formats).await?;
     println!(
         "[BRAN] gen_inst_meshes finished: {} ms",
         time.elapsed().as_millis()
@@ -1354,7 +1418,14 @@ pub async fn process_meshes_update_db_deep(
 ) -> anyhow::Result<()> {
     if !refnos.is_empty() {
         // 确保 mesh根目录存在
-        let dir = Path::new(dboption.inner.meshes_path.as_deref().unwrap_or("assets/meshes")).to_path_buf();
+        let dir = Path::new(
+            dboption
+                .inner
+                .meshes_path
+                .as_deref()
+                .unwrap_or("assets/meshes"),
+        )
+        .to_path_buf();
         if !dir.exists() {
             std::fs::create_dir_all(&dir)?;
         }
@@ -1399,18 +1470,12 @@ pub async fn process_meshes_update_db_deep(
                 if dboption.gen_mesh {
                     // 生成模型文件
                     let mesh_time = std::time::Instant::now();
-                    gen_inst_meshes(
-                        &dir,
-                        precision,
-                        &update_refnos,
-                        replace_exist,
-                        mesh_formats,
-                    )
-                    .await
-                    .map_err(|e| {
-                        eprintln!("❌ gen_inst_meshes 失败 (refno: {}): {}", refno, e);
-                        anyhow::anyhow!("生成网格失败 for refno {}: {}", refno, e)
-                    })?;
+                    gen_inst_meshes(&dir, precision, &update_refnos, replace_exist, mesh_formats)
+                        .await
+                        .map_err(|e| {
+                            eprintln!("❌ gen_inst_meshes 失败 (refno: {}): {}", refno, e);
+                            anyhow::anyhow!("生成网格失败 for refno {}: {}", refno, e)
+                        })?;
                     debug_model!(
                         "  ✅ gen_inst_meshes 完成: {} ms",
                         mesh_time.elapsed().as_millis()
@@ -1427,18 +1492,23 @@ pub async fn process_meshes_update_db_deep(
 
                     // 过滤掉 BRAN 类型，BRAN 不需要布尔运算
                     let boolean_refnos = {
-                        let refno_keys: Vec<String> = target_visible_refnos.iter().map(|r| r.to_pe_key()).collect();
+                        let refno_keys: Vec<String> = target_visible_refnos
+                            .iter()
+                            .map(|r| r.to_pe_key())
+                            .collect();
                         if refno_keys.is_empty() {
                             Vec::new()
                         } else {
                             let refno_keys = refno_keys.join(",");
-                            let sql = format!(
-                                "SELECT value id FROM [{refno_keys}] WHERE noun != 'BRAN'"
-                            );
-                            model_primary_db().query_take::<Vec<RefnoEnum>>(&sql, 0).await.unwrap_or_else(|e| {
-                                eprintln!("SQL error in CSG mesh boolean query: {}", e);
-                                Vec::new()
-                            })
+                            let sql =
+                                format!("SELECT value id FROM [{refno_keys}] WHERE noun != 'BRAN'");
+                            model_primary_db()
+                                .query_take::<Vec<RefnoEnum>>(&sql, 0)
+                                .await
+                                .unwrap_or_else(|e| {
+                                    eprintln!("SQL error in CSG mesh boolean query: {}", e);
+                                    Vec::new()
+                                })
                         }
                     };
 
@@ -1564,7 +1634,13 @@ pub async fn gen_inst_meshes_by_geo_ids(
             g.param.clone()
         };
 
-        let mr = match generate_csg_mesh(&geo_param_for_mesh, &lod_settings, non_scalable_geo, false, None) {
+        let mr = match generate_csg_mesh(
+            &geo_param_for_mesh,
+            &lod_settings,
+            non_scalable_geo,
+            false,
+            None,
+        ) {
             Some(csg_mesh) => {
                 match handle_csg_mesh(
                     &lod_dir,
@@ -1601,7 +1677,10 @@ pub async fn gen_inst_meshes_by_geo_ids(
 
     // 执行批量更新
     if !update_sql.is_empty() {
-        println!("[gen_inst_meshes_by_geo_ids] 执行 update_sql ({} bytes)", update_sql.len());
+        println!(
+            "[gen_inst_meshes_by_geo_ids] 执行 update_sql ({} bytes)",
+            update_sql.len()
+        );
         match model_primary_db().query(&update_sql).await {
             Ok(_) => println!("[gen_inst_meshes_by_geo_ids] update_sql 执行成功"),
             Err(e) => eprintln!("[gen_inst_meshes_by_geo_ids] 更新数据库失败: {}", e),
@@ -1760,10 +1839,8 @@ pub async fn gen_inst_meshes(
                         let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
                         let mesh_id = g.id.to_mesh_id();
                         let geo_raw = g.id.to_raw();
-                        let refno_for_mesh: Option<RefnoEnum> = chunk_refno_map
-                            .get(&geo_raw)
-                            .cloned()
-                            .flatten();
+                        let refno_for_mesh: Option<RefnoEnum> =
+                            chunk_refno_map.get(&geo_raw).cloned().flatten();
 
                         // 统一使用 CSG 方式生成网格
                         let mut lod_settings = profile.csg_settings;
@@ -1918,7 +1995,10 @@ async fn handle_csg_mesh(
         // 负实体：保存 .manifold + AABB，不生成 GLB
         // CSG 生成的 mesh 本身就是 manifold，直接保存原始数据。
         use aios_core::csg::manifold::ManifoldMeshRust;
-        let flat_verts: Vec<f32> = generated.mesh.vertices.iter()
+        let flat_verts: Vec<f32> = generated
+            .mesh
+            .vertices
+            .iter()
             .flat_map(|v| [v.x, v.y, v.z])
             .collect();
         let raw = ManifoldMeshRust {
@@ -1962,11 +2042,7 @@ async fn handle_csg_mesh(
                 )
                 .await
                 {
-                    debug_model_warn!(
-                        "[convex] 预计算失败: geo_hash={}, error={}",
-                        inst_key,
-                        e
-                    );
+                    debug_model_warn!("[convex] 预计算失败: geo_hash={}, error={}", inst_key, e);
                 }
             }
         }
@@ -2001,7 +2077,6 @@ fn derive_csg_point_hashes(mesh: &PlantMesh, pts_json_map: &Arc<DashMap<u64, Str
     hashes.into_iter().collect()
 }
 
-
 /// 查询所有 pe_transform 的 refno（仅 world_trans 存在的实例）
 pub async fn fetch_inst_relate_refnos() -> anyhow::Result<Vec<RefnoEnum>> {
     let sql = "SELECT VALUE record::id(id) FROM pe_transform WHERE world_trans != none";
@@ -2032,7 +2107,10 @@ async fn filter_missing_inst_aabb(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<Re
         pe_keys.join(",")
     );
 
-    let existing: Vec<RefnoEnum> = model_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+    let existing: Vec<RefnoEnum> = model_primary_db()
+        .query_take(&sql, 0)
+        .await
+        .unwrap_or_default();
     let existing: HashSet<RefnoEnum> = existing.into_iter().collect();
 
     let missing = refnos
@@ -2085,9 +2163,7 @@ pub async fn update_scene_node_aabbs_by_refnos(
     if refnos.is_empty() {
         return Ok(());
     }
-    anyhow::bail!(
-        "update_scene_node_aabbs_by_refnos 暂不可用：query_aabb_params 已从 rs-core 移除"
-    )
+    anyhow::bail!("update_scene_node_aabbs_by_refnos 暂不可用：query_aabb_params 已从 rs-core 移除")
 }
 
 #[cfg(test)]

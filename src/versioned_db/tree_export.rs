@@ -1,11 +1,11 @@
 //! tree_export - 场景树导出
 //! 将解析的层级结构导出为 .tree 文件
 
-use std::collections::HashMap;
-use std::path::Path;
 use aios_core::RefU64;
 use aios_core::db::DbBasicData;
 use indextree::Arena;
+use std::collections::HashMap;
+use std::path::Path;
 
 /// 树节点元数据（本地定义，用于解析期收集）
 #[derive(Debug, Clone, Default)]
@@ -78,7 +78,11 @@ pub fn export_tree_file(
     let path = output_dir.join(format!("{}.tree", dbnum));
     tree_file.save(&path)?;
 
-    log::info!("[tree_export] 导出 {} 节点到 {}", tree_nodes.len(), path.display());
+    log::info!(
+        "[tree_export] 导出 {} 节点到 {}",
+        tree_nodes.len(),
+        path.display()
+    );
 
     Ok(())
 }

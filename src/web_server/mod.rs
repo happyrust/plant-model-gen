@@ -30,6 +30,9 @@ pub mod incremental_update_handlers;
 pub mod instance_export;
 pub mod layout;
 pub mod litefs_handlers;
+pub mod model_runtime;
+pub mod output_instances_files;
+pub mod parquet_compact_worker;
 pub mod remote_runtime;
 pub mod remote_sync_handlers;
 pub mod remote_sync_template;
@@ -37,30 +40,24 @@ pub mod room_api;
 pub mod room_page;
 pub mod simple_templates;
 pub mod site_metadata;
+pub mod sqlite_spatial_api;
 pub mod sse_handlers; // SSE 事件流处理器
+pub mod stream_generate; // 流式模型生成模块
 pub mod sync_control_center;
 pub mod sync_control_handlers;
 pub mod task_creation_handlers;
 pub mod topology_handlers; // 拓扑配置处理器
 pub mod wizard_handlers;
-pub mod wizard_template;
-pub mod parquet_compact_worker;
-pub mod stream_generate; // 流式模型生成模块
-pub mod sqlite_spatial_api;
-pub mod output_instances_files;
-pub mod model_runtime; // 模型实时补齐 + parquet 增量队列
+pub mod wizard_template; // 模型实时补齐 + parquet 增量队列
 
 use crate::web_api::{
-    E3dTreeApiState, NounHierarchyApiState, SpatialQueryApiState, create_e3d_tree_routes,
-    create_noun_hierarchy_routes, create_room_tree_routes, create_spatial_query_routes,
-    create_pdms_attr_routes, create_ptset_routes, CollisionApiState, create_collision_routes,
-    create_review_integration_routes, create_model_center_routes, create_pipeline_annotation_routes,
-    create_mbd_pipe_routes,
-    create_pdms_model_query_routes,
-    create_jwt_auth_routes, create_review_api_routes, create_scene_tree_routes,
-    SearchApiState, create_search_routes,
-    UploadApiState, create_upload_routes,
-    create_version_routes,
+    CollisionApiState, E3dTreeApiState, NounHierarchyApiState, SearchApiState,
+    SpatialQueryApiState, UploadApiState, create_collision_routes, create_e3d_tree_routes,
+    create_jwt_auth_routes, create_mbd_pipe_routes, create_model_center_routes,
+    create_noun_hierarchy_routes, create_pdms_attr_routes, create_pdms_model_query_routes,
+    create_pipeline_annotation_routes, create_ptset_routes, create_review_api_routes,
+    create_review_integration_routes, create_room_tree_routes, create_scene_tree_routes,
+    create_search_routes, create_spatial_query_routes, create_upload_routes, create_version_routes,
 };
 use handlers::*;
 use models::*;
@@ -181,7 +178,8 @@ pub async fn start_web_server_with_config(
     println!("🔄 正在初始化数据库连接...");
     println!("📂 当前工作目录: {:?}", std::env::current_dir()?);
 
-    let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let config_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     println!("📄 尝试读取 {}.toml 配置文件...", config_name);
 
     // 预先初始化 OnceCell，确保配置已加载
@@ -227,7 +225,8 @@ pub async fn start_web_server_with_config(
         min_incremental_count: 50,
         output_dir: "output".to_string(),
     };
-    let _compact_worker_handle = parquet_compact_worker::start_compact_worker(compact_worker_config);
+    let _compact_worker_handle =
+        parquet_compact_worker::start_compact_worker(compact_worker_config);
     println!("🔄 Parquet compact worker 已启动 (每 30 秒扫描一次)");
     model_runtime::ensure_runtime_started();
     println!("🔄 Model runtime worker 已启动");
@@ -842,11 +841,22 @@ pub async fn start_web_server_with_config(
                 )
                 .fallback_service(ServeDir::new("output")),
         )
-        .nest_service("/files/output/database_models", ServeDir::new("assets/database_models"))
-        .nest_service("/files/database_models", ServeDir::new("assets/database_models"))
+        .nest_service(
+            "/files/output/database_models",
+            ServeDir::new("assets/database_models"),
+        )
+        .nest_service(
+            "/files/database_models",
+            ServeDir::new("assets/database_models"),
+        )
         .nest_service("/files/meshes", {
             let path = aios_core::get_db_option().get_meshes_path();
-            let serve_path = if path.file_name().and_then(|n| n.to_str()).map(|s| s.starts_with("lod_")).unwrap_or(false) {
+            let serve_path = if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.starts_with("lod_"))
+                .unwrap_or(false)
+            {
                 path.parent().unwrap_or(&path).to_path_buf()
             } else {
                 path
@@ -857,7 +867,10 @@ pub async fn start_web_server_with_config(
         // CBA 文件分发服务 - 用于远程站点下载增量数据包
         .nest_service("/assets/archives", ServeDir::new("assets/archives"))
         // 校审附件文件服务
-        .nest_service("/files/review_attachments", ServeDir::new("assets/review_attachments"))
+        .nest_service(
+            "/files/review_attachments",
+            ServeDir::new("assets/review_attachments"),
+        )
         // 主页面
         .route("/", get(index_page))
         .route("/dashboard", get(dashboard_page))

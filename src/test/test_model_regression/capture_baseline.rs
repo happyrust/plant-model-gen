@@ -18,9 +18,9 @@ async fn capture_17496_106028() {
 }
 
 async fn capture_baseline(refno_str: &str) -> anyhow::Result<()> {
-    let refno: RefnoEnum = refno_str.parse().map_err(|_| {
-        anyhow::anyhow!("无法解析 refno: {}", refno_str)
-    })?;
+    let refno: RefnoEnum = refno_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("无法解析 refno: {}", refno_str))?;
 
     println!("📦 捕获模型回归测试 baseline: {}", refno_str);
 
@@ -50,7 +50,9 @@ async fn capture_baseline(refno_str: &str) -> anyhow::Result<()> {
     // 3. 连接 SurrealDB 查询 GeomInstQuery
     use crate::fast_model::export_model::model_exporter::query_geometry_instances_ext;
     use aios_core::init_test_surreal;
-    init_test_surreal().await.map_err(|e| anyhow::anyhow!("初始化 SurrealDB 失败: {:?}", e))?;
+    init_test_surreal()
+        .await
+        .map_err(|e| anyhow::anyhow!("初始化 SurrealDB 失败: {:?}", e))?;
     println!("✅ SurrealDB 连接成功");
     let geom_insts = query_geometry_instances_ext(&all_refnos, true, false, true).await?;
     println!("✅ 几何实例: {} 个", geom_insts.len());
@@ -176,9 +178,15 @@ async fn capture_baseline(refno_str: &str) -> anyhow::Result<()> {
 
     if !obj_found {
         println!("⚠️  未找到 OBJ 文件，跳过 OBJ 统计。请先运行:");
-        println!("   cargo run --bin aios-database -- --debug-model {} --regen-model --export-obj", refno_str);
+        println!(
+            "   cargo run --bin aios-database -- --debug-model {} --regen-model --export-obj",
+            refno_str
+        );
     }
 
-    println!("\n✅ baseline 捕获完成！fixture 文件位于: {}", out_dir.display());
+    println!(
+        "\n✅ baseline 捕获完成！fixture 文件位于: {}",
+        out_dir.display()
+    );
     Ok(())
 }

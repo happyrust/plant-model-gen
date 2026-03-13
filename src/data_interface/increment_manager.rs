@@ -10,7 +10,7 @@ use aios_core::pe::SPdmsElement;
 use aios_core::tool::db_tool::db1_dehash;
 use aios_core::version::{backup_data, backup_owner_relate};
 use aios_core::{RefU64Vec, get_db_option};
-use aios_core::{project_primary_db, clear_all_caches};
+use aios_core::{clear_all_caches, project_primary_db};
 use futures::StreamExt;
 use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
@@ -588,7 +588,8 @@ impl AiosDBManager {
                                         file_name,
                                         &file_hash
                                     );
-                                    let mut response = project_primary_db().query(&sql).await.unwrap();
+                                    let mut response =
+                                        project_primary_db().query(&sql).await.unwrap();
                                     let id = response.take::<Vec<String>>(0).unwrap();
                                     if id.is_empty() {
                                         println!("发现新增 db 文件，推送：{}", &file_name);
@@ -690,7 +691,8 @@ impl AiosDBManager {
                                         );
                                         // dbg!(&sql);
                                         // println!("sql is {}", &sql);
-                                        let mut response = project_primary_db().query(&sql).await.unwrap();
+                                        let mut response =
+                                            project_primary_db().query(&sql).await.unwrap();
                                         // dbg!(&response);
                                         let id = response.take::<Vec<String>>(0).unwrap();
                                         // dbg!(id.len());

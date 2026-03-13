@@ -16,9 +16,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use aios_core::SurrealQueryExt;
 use aios_core::options::DbOption;
 use aios_core::pdms_types::RefnoEnum;
-use aios_core::SurrealQueryExt;
 use anyhow::{Context, Result};
 use arrow_array::{
     ArrayRef, BooleanArray, Float64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
@@ -32,7 +32,7 @@ use serde_json::json;
 
 // 注: trans/aabb 查询在本模块内自行实现（避免跨模块耦合）
 use crate::fast_model::gen_model::tree_index_manager::{
-    load_index_with_large_stack, TreeIndexManager,
+    TreeIndexManager, load_index_with_large_stack,
 };
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
 
@@ -81,10 +81,22 @@ struct TubingRow {
 /// transforms.parquet 的一行
 struct TransformRow {
     trans_hash: String,
-    m00: f64, m10: f64, m20: f64, m30: f64,
-    m01: f64, m11: f64, m21: f64, m31: f64,
-    m02: f64, m12: f64, m22: f64, m32: f64,
-    m03: f64, m13: f64, m23: f64, m33: f64,
+    m00: f64,
+    m10: f64,
+    m20: f64,
+    m30: f64,
+    m01: f64,
+    m11: f64,
+    m21: f64,
+    m31: f64,
+    m02: f64,
+    m12: f64,
+    m22: f64,
+    m32: f64,
+    m03: f64,
+    m13: f64,
+    m23: f64,
+    m33: f64,
 }
 
 /// aabb.parquet 的一行
@@ -154,7 +166,11 @@ fn normalize_mesh_base_dir(mesh_dir: &Path) -> PathBuf {
     }
 }
 
-fn mesh_candidates_for_geo_hash(mesh_base_dir: &Path, geo_hash: &str, lod_tag: &str) -> [PathBuf; 3] {
+fn mesh_candidates_for_geo_hash(
+    mesh_base_dir: &Path,
+    geo_hash: &str,
+    lod_tag: &str,
+) -> [PathBuf; 3] {
     let lod_dir = mesh_base_dir.join(format!("lod_{}", lod_tag));
     [
         lod_dir.join(format!("{}_{}.glb", geo_hash, lod_tag)),
@@ -230,7 +246,13 @@ fn write_missing_mesh_report(
             .iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>();
-        missing_entries.push((hash.to_string(), row_count, owners.len(), owner_sample, candidate_paths));
+        missing_entries.push((
+            hash.to_string(),
+            row_count,
+            owners.len(),
+            owner_sample,
+            candidate_paths,
+        ));
     }
 
     missing_entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -238,16 +260,18 @@ fn write_missing_mesh_report(
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let missing_geo_hashes_json = missing_entries
         .iter()
-        .map(|(geo_hash, row_count, owner_count, owner_sample, candidate_paths)| {
-            json!({
-                "geo_hash": geo_hash,
-                "row_count": row_count,
-                "owner_refno_count": owner_count,
-                "owner_refno_sample": owner_sample,
-                "owner_refno_sample_count": owner_sample.len(),
-                "mesh_candidates": candidate_paths,
-            })
-        })
+        .map(
+            |(geo_hash, row_count, owner_count, owner_sample, candidate_paths)| {
+                json!({
+                    "geo_hash": geo_hash,
+                    "row_count": row_count,
+                    "owner_refno_count": owner_count,
+                    "owner_refno_sample": owner_sample,
+                    "owner_refno_sample_count": owner_sample.len(),
+                    "mesh_candidates": candidate_paths,
+                })
+            },
+        )
         .collect::<Vec<_>>();
 
     let report = json!({
@@ -378,17 +402,51 @@ fn build_instances_batch(rows: &[InstanceRow]) -> Result<RecordBatch> {
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(StringArray::from(rows.iter().map(|r| r.refno_str.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(UInt64Array::from(rows.iter().map(|r| r.refno_u64).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(StringArray::from(rows.iter().map(|r| r.noun.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(StringArray::from(rows.iter().map(|r| r.owner_refno_str.as_deref()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(UInt64Array::from(rows.iter().map(|r| r.owner_refno_u64).collect::<Vec<Option<u64>>>())) as ArrayRef,
-            Arc::new(StringArray::from(rows.iter().map(|r| r.owner_noun.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(StringArray::from(rows.iter().map(|r| r.trans_hash.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(StringArray::from(rows.iter().map(|r| r.aabb_hash.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(UInt64Array::from(rows.iter().map(|r| r.spec_value as u64).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(BooleanArray::from(rows.iter().map(|r| r.has_neg).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(UInt32Array::from(rows.iter().map(|r| r.dbnum).collect::<Vec<_>>())) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.refno_str.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.refno_u64).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.noun.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.owner_refno_str.as_deref())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt64Array::from(
+                rows.iter()
+                    .map(|r| r.owner_refno_u64)
+                    .collect::<Vec<Option<u64>>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.owner_noun.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.trans_hash.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.aabb_hash.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.spec_value as u64).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.has_neg).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.dbnum).collect::<Vec<_>>(),
+            )) as ArrayRef,
         ],
     )?;
     Ok(batch)
@@ -399,11 +457,25 @@ fn build_geo_instances_batch(rows: &[GeoInstanceRow]) -> Result<RecordBatch> {
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(StringArray::from(rows.iter().map(|r| r.refno_str.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(UInt64Array::from(rows.iter().map(|r| r.refno_u64).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(UInt32Array::from(rows.iter().map(|r| r.geo_index).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(StringArray::from(rows.iter().map(|r| r.geo_hash.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(StringArray::from(rows.iter().map(|r| r.geo_trans_hash.as_str()).collect::<Vec<_>>())) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.refno_str.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.refno_u64).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.geo_index).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.geo_hash.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.geo_trans_hash.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
         ],
     )?;
     Ok(batch)
@@ -414,16 +486,44 @@ fn build_tubings_batch(rows: &[TubingRow]) -> Result<RecordBatch> {
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(StringArray::from(rows.iter().map(|r| r.tubi_refno_str.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(UInt64Array::from(rows.iter().map(|r| r.tubi_refno_u64).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(StringArray::from(rows.iter().map(|r| r.owner_refno_str.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(UInt64Array::from(rows.iter().map(|r| r.owner_refno_u64).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(UInt32Array::from(rows.iter().map(|r| r.order).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(StringArray::from(rows.iter().map(|r| r.geo_hash.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(StringArray::from(rows.iter().map(|r| r.trans_hash.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(StringArray::from(rows.iter().map(|r| r.aabb_hash.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(UInt64Array::from(rows.iter().map(|r| r.spec_value as u64).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(UInt32Array::from(rows.iter().map(|r| r.dbnum).collect::<Vec<_>>())) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.tubi_refno_str.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.tubi_refno_u64).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.owner_refno_str.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.owner_refno_u64).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.order).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.geo_hash.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.trans_hash.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.aabb_hash.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.spec_value as u64).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.dbnum).collect::<Vec<_>>(),
+            )) as ArrayRef,
         ],
     )?;
     Ok(batch)
@@ -434,23 +534,59 @@ fn build_transforms_batch(rows: &[TransformRow]) -> Result<RecordBatch> {
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(StringArray::from(rows.iter().map(|r| r.trans_hash.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m00).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m10).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m20).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m30).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m01).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m11).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m21).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m31).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m02).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m12).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m22).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m32).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m03).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m13).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m23).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.m33).collect::<Vec<_>>())) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.trans_hash.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m00).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m10).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m20).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m30).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m01).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m11).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m21).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m31).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m02).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m12).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m22).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m32).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m03).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m13).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m23).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.m33).collect::<Vec<_>>(),
+            )) as ArrayRef,
         ],
     )?;
     Ok(batch)
@@ -461,13 +597,29 @@ fn build_aabb_batch(rows: &[AabbRow]) -> Result<RecordBatch> {
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(StringArray::from(rows.iter().map(|r| r.aabb_hash.as_str()).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.min_x).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.min_y).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.min_z).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_x).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_y).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_z).collect::<Vec<_>>())) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.aabb_hash.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.min_x).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.min_y).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.min_z).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.max_x).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.max_y).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.max_z).collect::<Vec<_>>(),
+            )) as ArrayRef,
         ],
     )?;
     Ok(batch)
@@ -517,9 +669,7 @@ pub async fn query_distinct_dbnums_from_inst_relate() -> Result<Vec<u32>> {
     use aios_core::SurrealQueryExt;
 
     let sql = "SELECT VALUE array::distinct(dbnum) FROM inst_relate GROUP ALL;";
-    let result: Vec<Vec<i64>> = aios_core::project_primary_db()
-        .query_take(sql, 0)
-        .await?;
+    let result: Vec<Vec<i64>> = aios_core::project_primary_db().query_take(sql, 0).await?;
 
     let mut dbnums: Vec<u32> = result
         .into_iter()
@@ -532,10 +682,7 @@ pub async fn query_distinct_dbnums_from_inst_relate() -> Result<Vec<u32>> {
 }
 
 /// 通过 dbnum 字段过滤 inst_relate（命中 dbnum 索引路径）
-async fn query_inst_relate_by_dbnum(
-    dbnum: u32,
-    verbose: bool,
-) -> Result<Vec<InstRelateRow>> {
+async fn query_inst_relate_by_dbnum(dbnum: u32, verbose: bool) -> Result<Vec<InstRelateRow>> {
     if verbose {
         println!(
             "🔍 扫描 inst_relate（索引路径: WHERE dbnum = {}）...",
@@ -645,7 +792,9 @@ async fn query_tubi_relate(
             ));
         }
 
-        let mut resp = aios_core::project_primary_db().query_response(&sql_batch).await?;
+        let mut resp = aios_core::project_primary_db()
+            .query_response(&sql_batch)
+            .await?;
         for (stmt_idx, owner_refno) in owners_chunk.iter().enumerate() {
             let raw_rows: Vec<TubiQueryResult> = resp.take(stmt_idx)?;
             for row in raw_rows {
@@ -684,9 +833,7 @@ async fn query_trans_rows(
 
     let hashes_vec: Vec<&String> = hashes.iter().collect();
     for chunk in hashes_vec.chunks(500) {
-        let keys: Vec<String> = chunk.iter()
-            .map(|h| format!("trans:⟨{}⟩", h))
-            .collect();
+        let keys: Vec<String> = chunk.iter().map(|h| format!("trans:⟨{}⟩", h)).collect();
         let sql = format!(
             "SELECT record::id(id) as hash, d FROM [{}]",
             keys.join(", ")
@@ -696,10 +843,14 @@ async fn query_trans_rows(
             println!("   查询 trans: {} 个", chunk.len());
         }
 
-        let rows: Vec<TransQueryRow> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+        let rows: Vec<TransQueryRow> = project_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .unwrap_or_default();
         for row in rows {
             if let Some(obj) = row.d.as_object() {
-                let translation = obj.get("translation")
+                let translation = obj
+                    .get("translation")
                     .and_then(|v| v.as_array())
                     .map(|arr| {
                         let x = arr.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -709,7 +860,8 @@ async fn query_trans_rows(
                     })
                     .unwrap_or(glam::DVec3::ZERO);
 
-                let rotation = obj.get("rotation")
+                let rotation = obj
+                    .get("rotation")
                     .and_then(|v| v.as_array())
                     .map(|arr| {
                         let x = arr.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -720,7 +872,8 @@ async fn query_trans_rows(
                     })
                     .unwrap_or(glam::DQuat::IDENTITY);
 
-                let scale = obj.get("scale")
+                let scale = obj
+                    .get("scale")
                     .and_then(|v| v.as_array())
                     .map(|arr| {
                         let x = arr.get(0).and_then(|v| v.as_f64()).unwrap_or(1.0);
@@ -739,16 +892,30 @@ async fn query_trans_rows(
                 );
 
                 let mat = glam::DMat4::from_scale_rotation_translation(
-                    scale, rotation, converted_translation,
+                    scale,
+                    rotation,
+                    converted_translation,
                 );
                 let cols = mat.to_cols_array();
 
                 result.push(TransformRow {
                     trans_hash: row.hash,
-                    m00: cols[0], m10: cols[1], m20: cols[2], m30: cols[3],
-                    m01: cols[4], m11: cols[5], m21: cols[6], m31: cols[7],
-                    m02: cols[8], m12: cols[9], m22: cols[10], m32: cols[11],
-                    m03: cols[12], m13: cols[13], m23: cols[14], m33: cols[15],
+                    m00: cols[0],
+                    m10: cols[1],
+                    m20: cols[2],
+                    m30: cols[3],
+                    m01: cols[4],
+                    m11: cols[5],
+                    m21: cols[6],
+                    m31: cols[7],
+                    m02: cols[8],
+                    m12: cols[9],
+                    m22: cols[10],
+                    m32: cols[11],
+                    m03: cols[12],
+                    m13: cols[13],
+                    m23: cols[14],
+                    m33: cols[15],
                 });
             }
         }
@@ -772,9 +939,7 @@ async fn query_aabb_rows(
 
     let hashes_vec: Vec<&String> = hashes.iter().collect();
     for chunk in hashes_vec.chunks(500) {
-        let keys: Vec<String> = chunk.iter()
-            .map(|h| format!("aabb:⟨{}⟩", h))
-            .collect();
+        let keys: Vec<String> = chunk.iter().map(|h| format!("aabb:⟨{}⟩", h)).collect();
         let sql = format!(
             "SELECT record::id(id) as hash, d FROM [{}]",
             keys.join(", ")
@@ -784,7 +949,10 @@ async fn query_aabb_rows(
             println!("   查询 aabb: {} 个", chunk.len());
         }
 
-        let rows: Vec<AabbQueryRow> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+        let rows: Vec<AabbQueryRow> = project_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .unwrap_or_default();
         for row in rows {
             if let Some(aabb) = row.d {
                 let mins = aabb.0.mins;
@@ -833,7 +1001,10 @@ pub struct ParquetExportStats {
 ///
 /// # 返回
 /// 导出统计信息
-#[cfg_attr(feature = "profile", tracing::instrument(skip_all, name = "export_dbnum_instances_parquet"))]
+#[cfg_attr(
+    feature = "profile",
+    tracing::instrument(skip_all, name = "export_dbnum_instances_parquet")
+)]
 pub async fn export_dbnum_instances_parquet(
     dbnum: u32,
     output_dir: &Path,
@@ -848,7 +1019,10 @@ pub async fn export_dbnum_instances_parquet(
     let unit_converter = UnitConverter::new(LengthUnit::Millimeter, target);
 
     if verbose {
-        println!("🚀 开始导出 dbnum={} 的实例数据为 Parquet，目标单位: {:?}", dbnum, target);
+        println!(
+            "🚀 开始导出 dbnum={} 的实例数据为 Parquet，目标单位: {:?}",
+            dbnum, target
+        );
     }
 
     // 确保输出目录存在
@@ -860,10 +1034,7 @@ pub async fn export_dbnum_instances_parquet(
     let tree_manager = TreeIndexManager::with_default_dir(vec![dbnum]);
     let tree_dir = tree_manager.tree_dir();
     let spec_info_map = match crate::fast_model::export_model::spec_info::load_or_build_spec_info(
-        dbnum,
-        tree_dir,
-        output_dir,
-        verbose,
+        dbnum, tree_dir, output_dir, verbose,
     )
     .await
     {
@@ -965,14 +1136,32 @@ pub async fn export_dbnum_instances_parquet(
                     export_inst_map.insert(inst.refno, inst);
                 }
                 if verbose {
-                    println!("✅ 查询到 {} 个 refno 有几何体实例 (inst_relate 共 {} 个)", export_inst_map.len(), in_refnos.len());
+                    println!(
+                        "✅ 查询到 {} 个 refno 有几何体实例 (inst_relate 共 {} 个)",
+                        export_inst_map.len(),
+                        in_refnos.len()
+                    );
                     let in_set: HashSet<_> = in_refnos.iter().collect();
                     let exported_set: HashSet<_> = export_inst_map.keys().collect();
                     let missing_geo: Vec<_> = in_set.difference(&exported_set).collect();
                     if !missing_geo.is_empty() && missing_geo.len() <= 20 {
-                        println!("   ⚠️ 以下 refno 在 inst_relate 但无几何体(geo_relate/inst_relate_bool): {:?}", missing_geo.iter().map(|r| r.to_string()).collect::<Vec<_>>());
+                        println!(
+                            "   ⚠️ 以下 refno 在 inst_relate 但无几何体(geo_relate/inst_relate_bool): {:?}",
+                            missing_geo
+                                .iter()
+                                .map(|r| r.to_string())
+                                .collect::<Vec<_>>()
+                        );
                     } else if !missing_geo.is_empty() {
-                        println!("   ⚠️ {} 个 refno 在 inst_relate 但无几何体，样例: {:?}", missing_geo.len(), missing_geo.iter().take(5).map(|r| r.to_string()).collect::<Vec<_>>());
+                        println!(
+                            "   ⚠️ {} 个 refno 在 inst_relate 但无几何体，样例: {:?}",
+                            missing_geo.len(),
+                            missing_geo
+                                .iter()
+                                .take(5)
+                                .map(|r| r.to_string())
+                                .collect::<Vec<_>>()
+                        );
                     }
                 }
             }
@@ -990,13 +1179,18 @@ pub async fn export_dbnum_instances_parquet(
     let tubi_owner_refnos: Vec<RefnoEnum> = grouped_children
         .iter()
         .filter(|(_, children)| {
-            children.first().map_or(false, |c| matches!(c.owner_type.as_str(), "BRAN" | "HANG"))
+            children
+                .first()
+                .map_or(false, |c| matches!(c.owner_type.as_str(), "BRAN" | "HANG"))
         })
         .map(|(k, _)| *k)
         .collect();
 
     if verbose {
-        println!("🔍 查询 {} 个 BRAN/HANG owner 的 tubi_relate...", tubi_owner_refnos.len());
+        println!(
+            "🔍 查询 {} 个 BRAN/HANG owner 的 tubi_relate...",
+            tubi_owner_refnos.len()
+        );
     }
     let tubings_map = query_tubi_relate(&tubi_owner_refnos, verbose).await?;
 
@@ -1013,24 +1207,36 @@ pub async fn export_dbnum_instances_parquet(
 
     // 处理 grouped children
     for (owner_refno, children) in &grouped_children {
-        let owner_type = children.first().map(|c| c.owner_type.as_str()).unwrap_or("");
+        let owner_type = children
+            .first()
+            .map(|c| c.owner_type.as_str())
+            .unwrap_or("");
 
         for child in children {
             let export_inst = export_inst_map.get(&child.refno);
-            let Some(export_inst) = export_inst else { continue };
-            if export_inst.insts.is_empty() { continue }
+            let Some(export_inst) = export_inst else {
+                continue;
+            };
+            if export_inst.insts.is_empty() {
+                continue;
+            }
 
-            let child_aabb_hash = export_inst.world_aabb_hash.clone()
-                .unwrap_or_default();
+            let child_aabb_hash = export_inst.world_aabb_hash.clone().unwrap_or_default();
 
             let trans_hash = export_inst.world_trans_hash.clone().unwrap_or_default();
 
             // 收集 hash
-            if !child_aabb_hash.is_empty() { aabb_hashes.insert(child_aabb_hash.clone()); }
-            if !trans_hash.is_empty() { trans_hashes.insert(trans_hash.clone()); }
+            if !child_aabb_hash.is_empty() {
+                aabb_hashes.insert(child_aabb_hash.clone());
+            }
+            if !trans_hash.is_empty() {
+                trans_hashes.insert(trans_hash.clone());
+            }
             for inst in &export_inst.insts {
                 if let Some(ref th) = inst.trans_hash {
-                    if !th.is_empty() { trans_hashes.insert(th.clone()); }
+                    if !th.is_empty() {
+                        trans_hashes.insert(th.clone());
+                    }
                 }
             }
 
@@ -1073,14 +1279,18 @@ pub async fn export_dbnum_instances_parquet(
                 let trans_hash = tubi.world_trans_hash.clone().unwrap_or_default();
                 let geo_hash = tubi.geo_hash.clone().unwrap_or_default();
 
-                if aabb_hash.is_empty() || geo_hash.is_empty() { continue }
+                if aabb_hash.is_empty() || geo_hash.is_empty() {
+                    continue;
+                }
 
-                if !aabb_hash.is_empty() { aabb_hashes.insert(aabb_hash.clone()); }
-                if !trans_hash.is_empty() { trans_hashes.insert(trans_hash.clone()); }
+                if !aabb_hash.is_empty() {
+                    aabb_hashes.insert(aabb_hash.clone());
+                }
+                if !trans_hash.is_empty() {
+                    trans_hashes.insert(trans_hash.clone());
+                }
 
-                let index = tubi.index
-                    .and_then(|v| u32::try_from(v).ok())
-                    .unwrap_or(0);
+                let index = tubi.index.and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
 
                 let mut tubi_spec = tubi.spec_value.unwrap_or(0);
                 if tubi_spec == 0 {
@@ -1112,19 +1322,28 @@ pub async fn export_dbnum_instances_parquet(
     // 处理 ungrouped instances
     for child in &ungrouped {
         let export_inst = export_inst_map.get(&child.refno);
-        let Some(export_inst) = export_inst else { continue };
-        if export_inst.insts.is_empty() { continue }
+        let Some(export_inst) = export_inst else {
+            continue;
+        };
+        if export_inst.insts.is_empty() {
+            continue;
+        }
 
-        let child_aabb_hash = export_inst.world_aabb_hash.clone()
-            .unwrap_or_default();
+        let child_aabb_hash = export_inst.world_aabb_hash.clone().unwrap_or_default();
 
         let trans_hash = export_inst.world_trans_hash.clone().unwrap_or_default();
 
-        if !child_aabb_hash.is_empty() { aabb_hashes.insert(child_aabb_hash.clone()); }
-        if !trans_hash.is_empty() { trans_hashes.insert(trans_hash.clone()); }
+        if !child_aabb_hash.is_empty() {
+            aabb_hashes.insert(child_aabb_hash.clone());
+        }
+        if !trans_hash.is_empty() {
+            trans_hashes.insert(trans_hash.clone());
+        }
         for inst in &export_inst.insts {
             if let Some(ref th) = inst.trans_hash {
-                if !th.is_empty() { trans_hashes.insert(th.clone()); }
+                if !th.is_empty() {
+                    trans_hashes.insert(th.clone());
+                }
             }
         }
 
@@ -1173,7 +1392,11 @@ pub async fn export_dbnum_instances_parquet(
     // 6. 查询 trans/aabb 实际数据
     // =========================================================================
     if verbose {
-        println!("🔍 查询 {} 个 trans, {} 个 aabb...", trans_hashes.len(), aabb_hashes.len());
+        println!(
+            "🔍 查询 {} 个 trans, {} 个 aabb...",
+            trans_hashes.len(),
+            aabb_hashes.len()
+        );
     }
     let (transform_rows_result, aabb_rows_result) = tokio::join!(
         query_trans_rows(&trans_hashes, &unit_converter, verbose),
@@ -1183,7 +1406,11 @@ pub async fn export_dbnum_instances_parquet(
     let aabb_row_data = aabb_rows_result?;
 
     if verbose {
-        println!("✅ trans 命中: {}, aabb 命中: {}", transform_rows.len(), aabb_row_data.len());
+        println!(
+            "✅ trans 命中: {}, aabb 命中: {}",
+            transform_rows.len(),
+            aabb_row_data.len()
+        );
     }
 
     // =========================================================================
@@ -1202,7 +1429,11 @@ pub async fn export_dbnum_instances_parquet(
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
-            println!("   ✅ instances.parquet: {} 行, {} 字节", instance_rows.len(), size);
+            println!(
+                "   ✅ instances.parquet: {} 行, {} 字节",
+                instance_rows.len(),
+                size
+            );
         }
     }
 
@@ -1228,7 +1459,11 @@ pub async fn export_dbnum_instances_parquet(
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
-            println!("   ✅ tubings.parquet: {} 行, {} 字节", tubing_rows.len(), size);
+            println!(
+                "   ✅ tubings.parquet: {} 行, {} 字节",
+                tubing_rows.len(),
+                size
+            );
         }
     }
 
@@ -1254,7 +1489,11 @@ pub async fn export_dbnum_instances_parquet(
         let size = write_parquet(&path, &batch)?;
         total_bytes += size;
         if verbose {
-            println!("   ✅ aabb.parquet: {} 行, {} 字节", aabb_row_data.len(), size);
+            println!(
+                "   ✅ aabb.parquet: {} 行, {} 字节",
+                aabb_row_data.len(),
+                size
+            );
         }
     }
 
@@ -1351,7 +1590,10 @@ pub async fn export_dbnum_instances_parquet(
             "total_bytes": total_bytes,
         });
         let web_manifest_path = parent.join(format!("manifest_{}.json", dbnum));
-        fs::write(&web_manifest_path, serde_json::to_string_pretty(&web_manifest)?)?;
+        fs::write(
+            &web_manifest_path,
+            serde_json::to_string_pretty(&web_manifest)?,
+        )?;
         if verbose {
             println!("   ✅ manifest_{}.json 已写入 (web 兼容)", dbnum);
         }
@@ -1373,4 +1615,3 @@ pub async fn export_dbnum_instances_parquet(
 // =============================================================================
 // Cache → Parquet 导出
 // =============================================================================
-

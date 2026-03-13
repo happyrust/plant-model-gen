@@ -158,4 +158,3 @@ pub fn with_global_report<R>(f: impl FnOnce(&mut CacheMissReport) -> R) -> Optio
 pub fn snapshot_global_report() -> Option<CacheMissReport> {
     with_global_report(|r| r.clone())
 }
-

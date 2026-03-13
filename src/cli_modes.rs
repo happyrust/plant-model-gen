@@ -6,14 +6,14 @@ use anyhow::{Context, Result, anyhow};
 
 use aios_core::init_surreal;
 use aios_core::{DBType, query_mdb_db_nums};
-use aios_database::fast_model::export_model::export_room_instances::{
-    RoomComputeValidationCase, RoomComputeValidationFixture,
-};
 use aios_database::fast_model::export_glb::GlbExporter;
 use aios_database::fast_model::export_gltf::GltfExporter;
 use aios_database::fast_model::export_gltf::export_gltf_for_refnos;
 use aios_database::fast_model::export_instanced_bundle::export_instanced_bundle_for_refnos;
 use aios_database::fast_model::export_model::export_obj::ObjExporter;
+use aios_database::fast_model::export_model::export_room_instances::{
+    RoomComputeValidationCase, RoomComputeValidationFixture,
+};
 use aios_database::options::DbOptionExt;
 // use aios_database::fast_model::export_xkt::XktExporter;
 use aios_database::fast_model::model_exporter::{
@@ -1046,10 +1046,7 @@ fn verify_room_case(
                         })
                         .collect();
 
-                    details.push(format!(
-                        "缺少期望构件: {}",
-                        missing_components.join(", ")
-                    ));
+                    details.push(format!("缺少期望构件: {}", missing_components.join(", ")));
                     if !stale_panels.is_empty() {
                         details.extend(stale_panels);
                         RoomVerifyCaseStatus::ScopeMismatch
@@ -1171,7 +1168,10 @@ mod room_verify_tests {
             description: "test".to_string(),
             room_number: "540".to_string(),
             panel_refno: "24381/35798".to_string(),
-            expected_components: expected_components.iter().map(|item| item.to_string()).collect(),
+            expected_components: expected_components
+                .iter()
+                .map(|item| item.to_string())
+                .collect(),
             notes: String::new(),
         }
     }
@@ -1228,7 +1228,10 @@ mod room_verify_tests {
         let outcome = verify_room_case(&make_case(&["24381/145019"]), &persisted)
             .expect("verification should classify missing precompute state");
 
-        assert_eq!(outcome.status, RoomVerifyCaseStatus::MissingPersistedResults);
+        assert_eq!(
+            outcome.status,
+            RoomVerifyCaseStatus::MissingPersistedResults
+        );
         assert!(outcome.details[0].contains("请先运行 room compute"));
     }
 
@@ -1241,17 +1244,21 @@ mod room_verify_tests {
             .expect("verification should classify stale panel scope");
 
         assert_eq!(outcome.status, RoomVerifyCaseStatus::ScopeMismatch);
-        assert!(outcome
-            .details
-            .iter()
-            .any(|detail| detail.contains("当前挂在其它 panel")));
+        assert!(
+            outcome
+                .details
+                .iter()
+                .any(|detail| detail.contains("当前挂在其它 panel"))
+        );
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
     #[test]
     fn verify_room_case_reports_expectation_mismatch_for_missing_component() {
         let mut persisted = make_persisted_relations();
-        persisted.component_panels_by_room.insert("540".to_string(), BTreeMap::new());
+        persisted
+            .component_panels_by_room
+            .insert("540".to_string(), BTreeMap::new());
 
         let outcome = verify_room_case(&make_case(&["24381/999999"]), &persisted)
             .expect("verification should classify missing expected component");
@@ -3544,7 +3551,12 @@ pub async fn room_compute_mode(
 
     // 通过环境变量控制 pregen_room_panels_into_model_cache 是否执行
     // SAFETY: 单线程 CLI 入口，此时尚未启动其他线程
-    unsafe { std::env::set_var("AIOS_ROOM_PREGEN_PANELS", if gen_panels_mesh { "1" } else { "0" }); }
+    unsafe {
+        std::env::set_var(
+            "AIOS_ROOM_PREGEN_PANELS",
+            if gen_panels_mesh { "1" } else { "0" },
+        );
+    }
 
     println!("\n🏠 房间计算模式");
     println!("==========================================");
@@ -3562,7 +3574,14 @@ pub async fn room_compute_mode(
     if let Some(ref root) = refno_root {
         println!("   - refno 子树根: {}", root);
     }
-    println!("   - 预生成面板模型: {}", if gen_panels_mesh { "是" } else { "否（使用 --gen-panels-mesh 启用）" });
+    println!(
+        "   - 预生成面板模型: {}",
+        if gen_panels_mesh {
+            "是"
+        } else {
+            "否（使用 --gen-panels-mesh 启用）"
+        }
+    );
 
     println!("\n📡 初始化数据库连接...");
     init_surreal().await?;

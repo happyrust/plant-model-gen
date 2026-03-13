@@ -2,13 +2,13 @@
 //!
 //! 提供生成状态查询、AABB 更新等功能
 
-use aios_core::{RefnoEnum, RefU64, project_primary_db, SurrealQueryExt};
+use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
 use anyhow::Result;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use surrealdb::types as surrealdb_types;
 use surrealdb::types::SurrealValue;
-use std::collections::HashSet;
 
 /// Scene Node 状态
 #[derive(Debug, Serialize, Deserialize, SurrealValue)]
@@ -20,9 +20,7 @@ pub struct SceneNodeStatus {
 }
 
 /// 批量查询 refnos 的生成状态
-pub async fn query_generation_status(
-    refnos: &[RefnoEnum],
-) -> Result<Vec<SceneNodeStatus>> {
+pub async fn query_generation_status(refnos: &[RefnoEnum]) -> Result<Vec<SceneNodeStatus>> {
     if refnos.is_empty() {
         return Ok(vec![]);
     }
@@ -43,9 +41,7 @@ pub async fn query_generation_status(
 }
 
 /// 从 refnos 中过滤出未生成的几何节点
-pub async fn filter_ungenerated_geo_nodes(
-    refnos: &[RefnoEnum],
-) -> Result<Vec<i64>> {
+pub async fn filter_ungenerated_geo_nodes(refnos: &[RefnoEnum]) -> Result<Vec<i64>> {
     if refnos.is_empty() {
         return Ok(vec![]);
     }
@@ -106,11 +102,11 @@ pub async fn query_ungenerated_leaves(root_id: i64) -> Result<Vec<i64>> {
                 .join(",");
 
             // 关系表 contains 的 in/out 字段是 record<scene_node>
-            let sql = format!(
-                "SELECT VALUE record::id(out) FROM [{}]->contains",
-                in_list
-            );
-            let children: Vec<i64> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+            let sql = format!("SELECT VALUE record::id(out) FROM [{}]->contains", in_list);
+            let children: Vec<i64> = project_primary_db()
+                .query_take(&sql, 0)
+                .await
+                .unwrap_or_default();
 
             for child_id in children {
                 if visited.insert(child_id) {
@@ -140,7 +136,10 @@ pub async fn query_ungenerated_leaves(root_id: i64) -> Result<Vec<i64>> {
             "SELECT VALUE record::id(id) FROM [{}] WHERE has_geo = true AND is_leaf = true AND generated = false",
             id_list
         );
-        let mut part: Vec<i64> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+        let mut part: Vec<i64> = project_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .unwrap_or_default();
         result.append(&mut part);
     }
 
@@ -153,7 +152,10 @@ pub async fn query_children_ids(parent_id: i64, limit: usize) -> Result<Vec<i64>
     let sql = format!(
         "SELECT VALUE record::id(out) FROM contains WHERE in = scene_node:{parent_id} LIMIT {limit}"
     );
-    let result: Vec<i64> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+    let result: Vec<i64> = project_primary_db()
+        .query_take(&sql, 0)
+        .await
+        .unwrap_or_default();
     Ok(result)
 }
 
@@ -166,7 +168,10 @@ pub async fn query_ancestor_ids(start_id: i64, limit: usize) -> Result<Vec<i64>>
     let mut current = start_id;
     for _ in 0..limit {
         let sql = format!("SELECT VALUE parent FROM scene_node:{current} LIMIT 1");
-        let parents: Vec<Option<i64>> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+        let parents: Vec<Option<i64>> = project_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .unwrap_or_default();
         let Some(Some(parent_id)) = parents.into_iter().next() else {
             break;
         };
@@ -182,9 +187,7 @@ pub async fn query_ancestor_ids(start_id: i64, limit: usize) -> Result<Vec<i64>>
 }
 
 /// 批量更新 scene_node 的 AABB 并标记为已生成
-pub async fn update_scene_node_aabb(
-    inst_aabb_map: &DashMap<RefnoEnum, String>,
-) -> Result<()> {
+pub async fn update_scene_node_aabb(inst_aabb_map: &DashMap<RefnoEnum, String>) -> Result<()> {
     if inst_aabb_map.is_empty() {
         return Ok(());
     }
@@ -194,11 +197,14 @@ pub async fn update_scene_node_aabb(
     for chunk in keys.chunks(200) {
         let mut sql = String::new();
         for refno in chunk {
-            let Some(aabb_hash) = inst_aabb_map.get(refno) else { continue };
+            let Some(aabb_hash) = inst_aabb_map.get(refno) else {
+                continue;
+            };
             let id = refno.refno().0;
             sql.push_str(&format!(
                 "UPDATE scene_node:{} SET aabb = aabb:⟨{}⟩, generated = true;",
-                id, aabb_hash.value()
+                id,
+                aabb_hash.value()
             ));
         }
         if !sql.is_empty() {
@@ -209,9 +215,7 @@ pub async fn update_scene_node_aabb(
 }
 
 /// 查询已生成的节点（替代 inst_relate_aabb 存在性检查）
-pub async fn query_generated_refnos(
-    refnos: &[RefnoEnum],
-) -> Result<Vec<RefnoEnum>> {
+pub async fn query_generated_refnos(refnos: &[RefnoEnum]) -> Result<Vec<RefnoEnum>> {
     if refnos.is_empty() {
         return Ok(vec![]);
     }
@@ -228,5 +232,8 @@ pub async fn query_generated_refnos(
     );
 
     let ids: Vec<i64> = project_primary_db().query_take(&sql, 0).await?;
-    Ok(ids.into_iter().map(|id| RefnoEnum::from(RefU64(id as u64))).collect())
+    Ok(ids
+        .into_iter()
+        .map(|id| RefnoEnum::from(RefU64(id as u64)))
+        .collect())
 }

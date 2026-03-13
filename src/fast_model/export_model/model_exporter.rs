@@ -3,8 +3,8 @@
 //! 本模块提供了统一的模型导出接口，支持多种格式（OBJ、XKT 等）。
 //! 通过实现 `ModelExporter` Trait，可以轻松扩展到其他导出格式。
 
-use aios_core::{GeomInstQuery, RefnoEnum};
 use crate::fast_model::inst_query::query_insts_with_batch;
+use aios_core::{GeomInstQuery, RefnoEnum};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -379,12 +379,8 @@ pub async fn collect_export_refnos(
         }
 
         // 大栈线程加载，避免 Windows 反序列化大 `.tree` 文件触发栈溢出。
-        let index = load_index_with_large_stack(&tree_dir, dbnum).with_context(|| {
-            format!(
-                "加载 TreeIndex 失败: {}",
-                tree_path.display()
-            )
-        })?;
+        let index = load_index_with_large_stack(&tree_dir, dbnum)
+            .with_context(|| format!("加载 TreeIndex 失败: {}", tree_path.display()))?;
 
         let options = TreeQueryOptions {
             include_self: false,
@@ -512,5 +508,3 @@ pub async fn query_geometry_instances_ext_from_cache(
     )
     .await
 }
-
-

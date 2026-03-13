@@ -121,13 +121,11 @@ async fn query_arch_room_groups() -> anyhow::Result<BTreeMap<String, Vec<RoomEnt
         } else {
             first.to_string()
         };
-        map.entry(group)
-            .or_default()
-            .push(RoomEntry {
-                refno,
-                display_name: last.to_string(),
-                full_code: room_code.to_string(),
-            });
+        map.entry(group).or_default().push(RoomEntry {
+            refno,
+            display_name: last.to_string(),
+            full_code: room_code.to_string(),
+        });
     }
 
     for room in rooms_from_relate {
@@ -156,7 +154,10 @@ pub fn create_room_tree_routes() -> Router {
     Router::new()
         .route("/api/room-tree/root", get(get_room_tree_root))
         .route("/api/room-tree/children/{id}", get(get_room_tree_children))
-        .route("/api/room-tree/ancestors/{id}", get(get_room_tree_ancestors))
+        .route(
+            "/api/room-tree/ancestors/{id}",
+            get(get_room_tree_ancestors),
+        )
         .route("/api/room-tree/search", post(search_room_tree))
 }
 
@@ -358,7 +359,9 @@ async fn get_room_tree_children(
     }
 }
 
-async fn get_room_tree_ancestors(Path(id): Path<String>) -> Result<Json<AncestorsResponse>, StatusCode> {
+async fn get_room_tree_ancestors(
+    Path(id): Path<String>,
+) -> Result<Json<AncestorsResponse>, StatusCode> {
     match room_tree_ancestors_core(&id).await {
         Ok(resp) => Ok(Json(resp)),
         Err(e) => Ok(Json(AncestorsResponse {
@@ -369,7 +372,9 @@ async fn get_room_tree_ancestors(Path(id): Path<String>) -> Result<Json<Ancestor
     }
 }
 
-async fn search_room_tree(Json(request): Json<SearchRequest>) -> Result<Json<SearchResponse>, StatusCode> {
+async fn search_room_tree(
+    Json(request): Json<SearchRequest>,
+) -> Result<Json<SearchResponse>, StatusCode> {
     let keyword = request.keyword;
     let limit = request.limit.unwrap_or(50).clamp(1, 200) as usize;
 

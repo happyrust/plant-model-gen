@@ -10,9 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use aios_core::RefnoEnum;
 use aios_core::geometry::ShapeInstancesData;
 use aios_core::prim_geo::basic::TUBI_GEO_HASH;
-use aios_core::RefnoEnum;
 
 use super::simple_color_palette::SimpleColorPalette;
 
@@ -52,7 +52,7 @@ struct GeoItem {
 }
 
 /// Parquet 流式写入器
-/// 
+///
 /// 在模型生成过程中直接将数据按 dbnum 写入 Parquet，使用增量文件机制实现高性能批量插入。
 pub struct ParquetStreamWriter {
     base_dir: PathBuf,
@@ -62,12 +62,12 @@ pub struct ParquetStreamWriter {
 
 impl ParquetStreamWriter {
     /// 创建新的流式写入器
-    /// 
+    ///
     /// # Arguments
     /// * `output_dir` - Parquet 输出目录（通常是 output）
     pub fn new(output_dir: impl AsRef<Path>) -> Result<Self> {
         let base_dir = output_dir.as_ref().join("database_models");
-        
+
         // 确保目录存在
         std::fs::create_dir_all(&base_dir)?;
 
@@ -80,7 +80,7 @@ impl ParquetStreamWriter {
     }
 
     /// 写入一批 ShapeInstancesData
-    /// 
+    ///
     /// 直接写入增量文件，返回：(instance_count, geo_count, transform_count)
     pub fn write_batch(&self, data: &ShapeInstancesData) -> Result<(usize, usize, usize)> {
         // 从 batch 中任意一个 refno 通过 db_meta 映射得到 dbnum（ref0 != dbnum）
@@ -96,41 +96,42 @@ impl ParquetStreamWriter {
             return Ok((0, 0, 0));
         };
 
-        let dbnum = db_meta().get_dbnum_by_refno(sample_refno)
-            .ok_or_else(|| anyhow::anyhow!(
+        let dbnum = db_meta().get_dbnum_by_refno(sample_refno).ok_or_else(|| {
+            anyhow::anyhow!(
                 "[ParquetStreamWriter] 缺少 ref0->dbnum 映射: refno={}",
                 sample_refno
-            ))?;
-        
+            )
+        })?;
+
         // 记录已处理的 dbnum
         {
             let mut processed = self.processed_dbnos.lock().unwrap();
             processed.insert(dbnum);
         }
-        
+
         // 提取行数据
         let (instance_rows, transform_rows) = self.extract_rows(data)?;
-        
+
         if instance_rows.is_empty() {
             return Ok((0, 0, 0));
         }
-        
+
         // 创建 dbnum 目录
         let dbno_dir = self.base_dir.join(dbnum.to_string());
         std::fs::create_dir_all(&dbno_dir)?;
-        
+
         // 生成增量文件
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S_%6f").to_string();
         let inst_incr_path = dbno_dir.join(format!("instance_{}.parquet", timestamp));
         let trans_incr_path = dbno_dir.join(format!("transform_{}.parquet", timestamp));
-        
+
         // 创建 DataFrame 并写入
         let instances_df = self.create_instances_dataframe(instance_rows)?;
         let transforms_df = self.create_transforms_dataframe(transform_rows)?;
-        
+
         let instance_count = instances_df.height();
         let transform_count = transforms_df.height();
-        
+
         {
             let file = std::fs::File::create(&inst_incr_path)?;
             ParquetWriter::new(file).finish(&mut instances_df.clone())?;
@@ -139,40 +140,45 @@ impl ParquetStreamWriter {
             let file = std::fs::File::create(&trans_incr_path)?;
             ParquetWriter::new(file).finish(&mut transforms_df.clone())?;
         }
-        
+
         // 统计
         let geo_count = data.inst_geos_map.len();
-        
+
         Ok((instance_count, geo_count, transform_count))
     }
 
     /// 完成写入并合并所有增量文件
     pub fn finalize(&self) -> Result<()> {
         let processed = self.processed_dbnos.lock().unwrap();
-        
+
         if processed.is_empty() {
             println!("📦 [Parquet] 无数据需要合并");
             return Ok(());
         }
-        
-        println!("🔍 [Parquet] 开始合并 {} 个 dbnum 的数据...", processed.len());
-        
+
+        println!(
+            "🔍 [Parquet] 开始合并 {} 个 dbnum 的数据...",
+            processed.len()
+        );
+
         for dbnum in processed.iter() {
             self.compact_dbno(*dbnum)?;
         }
-        
+
         println!("✅ [Parquet] 全部完成");
         Ok(())
     }
 
     /// 从单个 ShapeInstancesData 中提取行数据
-    fn extract_rows(&self, data: &ShapeInstancesData) 
-        -> Result<(Vec<InstanceRow>, Vec<TransformRow>)> {
+    fn extract_rows(
+        &self,
+        data: &ShapeInstancesData,
+    ) -> Result<(Vec<InstanceRow>, Vec<TransformRow>)> {
         let mut instance_rows = Vec::new();
         let mut transform_rows = Vec::new();
         let mut palette = SimpleColorPalette::new();
         let mut added_trans_ids: HashSet<String> = HashSet::new();
-        
+
         // 遍历 inst_info_map 获取实例信息
         for (refno, info) in &data.inst_info_map {
             let inst_key = info.get_inst_key();
@@ -188,12 +194,15 @@ impl ParquetStreamWriter {
             if added_trans_ids.insert(world_trans_id.clone()) {
                 let world_matrix = info.get_ele_world_transform().to_matrix();
                 let t_cols = dmat4_to_f32_array(&world_matrix.as_dmat4());
-                transform_rows.push(TransformRow { trans_id: world_trans_id.clone(), t_cols });
+                transform_rows.push(TransformRow {
+                    trans_id: world_trans_id.clone(),
+                    t_cols,
+                });
             }
-            
+
             // 从 inst_geos_map 获取该 instance 的所有 geo
             let mut geo_items = Vec::new();
-            
+
             if let Some(geos_data) = data.inst_geos_map.get(&inst_key) {
                 for (idx, geo) in geos_data.insts.iter().enumerate() {
                     let trans_id = format!("{}_geo_{}", refno_str, idx);
@@ -203,14 +212,14 @@ impl ParquetStreamWriter {
                         geo_hash: geo_hash_str,
                         geo_trans_id: trans_id.clone(),
                     });
-                    
+
                     // 生成 transform row
                     let transform_matrix = geo.geo_transform.to_matrix();
                     let t_cols = dmat4_to_f32_array(&transform_matrix.as_dmat4());
                     transform_rows.push(TransformRow { trans_id, t_cols });
                 }
             }
-            
+
             // 提取 AABB
             let (min_x, min_y, min_z, max_x, max_y, max_z) = if let Some(aabb) = &info.aabb {
                 (
@@ -224,7 +233,7 @@ impl ParquetStreamWriter {
             } else {
                 (None, None, None, None, None, None)
             };
-            
+
             instance_rows.push(InstanceRow {
                 refno: refno_str.clone(),
                 noun: noun_str.to_string(),
@@ -246,7 +255,7 @@ impl ParquetStreamWriter {
                 max_z,
             });
         }
-        
+
         // 处理 TUBI
         let tubi_color_index = palette.index_for_noun("TUBI");
         for (refno, tubi_info) in &data.inst_tubi_map {
@@ -255,7 +264,10 @@ impl ParquetStreamWriter {
             if added_trans_ids.insert(world_trans_id.clone()) {
                 let world_matrix = tubi_info.get_ele_world_transform().to_matrix();
                 let t_cols = dmat4_to_f32_array(&world_matrix.as_dmat4());
-                transform_rows.push(TransformRow { trans_id: world_trans_id.clone(), t_cols });
+                transform_rows.push(TransformRow {
+                    trans_id: world_trans_id.clone(),
+                    t_cols,
+                });
             }
 
             let mut geo_items = Vec::new();
@@ -286,12 +298,12 @@ impl ParquetStreamWriter {
                     geo_trans_id: trans_id.clone(),
                 });
                 let identity_cols: [f32; 16] = [
-                    1.0, 0.0, 0.0, 0.0,
-                    0.0, 1.0, 0.0, 0.0,
-                    0.0, 0.0, 1.0, 0.0,
-                    0.0, 0.0, 0.0, 1.0,
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
                 ];
-                transform_rows.push(TransformRow { trans_id, t_cols: identity_cols });
+                transform_rows.push(TransformRow {
+                    trans_id,
+                    t_cols: identity_cols,
+                });
             }
 
             let (min_x, min_y, min_z, max_x, max_y, max_z) = if let Some(aabb) = &tubi_info.aabb {
@@ -328,7 +340,7 @@ impl ParquetStreamWriter {
                 max_z,
             });
         }
-        
+
         Ok((instance_rows, transform_rows))
     }
 
@@ -337,7 +349,7 @@ impl ParquetStreamWriter {
         if rows.is_empty() {
             return Err(anyhow::anyhow!("No instance rows to create DataFrame"));
         }
-        
+
         let refnos: Vec<String> = rows.iter().map(|r| r.refno.clone()).collect();
         let nouns: Vec<String> = rows.iter().map(|r| r.noun.clone()).collect();
         let owners: Vec<Option<String>> = rows.iter().map(|r| r.owner_refno.clone()).collect();
@@ -345,7 +357,7 @@ impl ParquetStreamWriter {
         let specs: Vec<Option<i64>> = rows.iter().map(|r| r.spec_value).collect();
         let is_tubis: Vec<bool> = rows.iter().map(|r| r.is_tubi).collect();
         let inst_trans_ids: Vec<String> = rows.iter().map(|r| r.inst_trans_id.clone()).collect();
-        
+
         // AABB 列
         let min_xs: Vec<Option<f64>> = rows.iter().map(|r| r.min_x).collect();
         let min_ys: Vec<Option<f64>> = rows.iter().map(|r| r.min_y).collect();
@@ -353,10 +365,11 @@ impl ParquetStreamWriter {
         let max_xs: Vec<Option<f64>> = rows.iter().map(|r| r.max_x).collect();
         let max_ys: Vec<Option<f64>> = rows.iter().map(|r| r.max_y).collect();
         let max_zs: Vec<Option<f64>> = rows.iter().map(|r| r.max_z).collect();
-        
-        let geo_items_series = self.build_geo_items_series(&rows)?
+
+        let geo_items_series = self
+            .build_geo_items_series(&rows)?
             .cast(&Self::geo_items_dtype())?;
-        
+
         let df = DataFrame::new(vec![
             Column::from(Series::new("refno".into(), refnos)),
             Column::from(Series::new("noun".into(), nouns)),
@@ -373,7 +386,7 @@ impl ParquetStreamWriter {
             Column::from(Series::new("max_y".into(), max_ys)),
             Column::from(Series::new("max_z".into(), max_zs)),
         ])?;
-        
+
         Ok(df)
     }
 
@@ -424,7 +437,8 @@ impl ParquetStreamWriter {
     }
 
     fn convert_lists_to_geo_items(&self, mut df: DataFrame) -> Result<DataFrame> {
-        let geo_items = self.build_geo_items_series_from_lists(&df)?
+        let geo_items = self
+            .build_geo_items_series_from_lists(&df)?
             .cast(&Self::geo_items_dtype())?;
         df.with_column(geo_items)?;
         let _ = df.drop_in_place("geo_hashes");
@@ -489,9 +503,9 @@ impl ParquetStreamWriter {
         if rows.is_empty() {
             return Err(anyhow::anyhow!("No transform rows to create DataFrame"));
         }
-        
+
         let trans_ids: Vec<String> = rows.iter().map(|r| r.trans_id.clone()).collect();
-        
+
         // 展平 16 个分量
         let mut t_cols: Vec<Vec<f32>> = vec![Vec::new(); 16];
         for row in &rows {
@@ -499,12 +513,15 @@ impl ParquetStreamWriter {
                 t_cols[i].push(row.t_cols[i]);
             }
         }
-        
+
         let mut cols: Vec<Column> = vec![Column::from(Series::new("trans_id".into(), trans_ids))];
         for i in 0..16 {
-            cols.push(Column::from(Series::new(format!("t{}", i).into(), t_cols[i].clone())));
+            cols.push(Column::from(Series::new(
+                format!("t{}", i).into(),
+                t_cols[i].clone(),
+            )));
         }
-        
+
         DataFrame::new(cols).map_err(Into::into)
     }
 
@@ -519,33 +536,38 @@ impl ParquetStreamWriter {
     fn compact_table(&self, dbnum: u32, prefix: &str, key_col: &str) -> Result<()> {
         let dbno_dir = self.base_dir.join(dbnum.to_string());
         let main_file = dbno_dir.join(format!("{}.parquet", prefix));
-        
+
         // 列出所有增量文件
         let incremental_files = self.list_incremental_files(dbnum, prefix)?;
         if incremental_files.is_empty() {
             return Ok(());
         }
-        
-        println!("🔄 [Parquet] dbnum={} {} 合并 {} 个增量文件...", dbnum, prefix, incremental_files.len());
-        
+
+        println!(
+            "🔄 [Parquet] dbnum={} {} 合并 {} 个增量文件...",
+            dbnum,
+            prefix,
+            incremental_files.len()
+        );
+
         let mut frames = Vec::new();
-        
+
         // 读取主文件（如果存在）
         if main_file.exists() {
             let file = std::fs::File::open(&main_file)?;
             frames.push(ParquetReader::new(file).finish()?);
         }
-        
+
         // 读取增量文件
         for path in &incremental_files {
             let file = std::fs::File::open(path)?;
             frames.push(ParquetReader::new(file).finish()?);
         }
-        
+
         if frames.is_empty() {
             return Ok(());
         }
-        
+
         // 合并（先统一 schema）
         let mut uniform_frames = Vec::new();
         for df in frames {
@@ -556,30 +578,35 @@ impl ParquetStreamWriter {
         for df in uniform_frames.iter().skip(1) {
             merged_df = merged_df.vstack(df)?;
         }
-        
+
         // 去重（保留最新）
         let unique_df = merged_df.unique::<&[String], &String>(
             Some(&[key_col.to_string()]),
             UniqueKeepStrategy::Last,
-            None
+            None,
         )?;
-        
+
         // 写入临时文件
         let temp_file = dbno_dir.join(format!("{}.parquet.tmp", prefix));
         {
             let file = std::fs::File::create(&temp_file)?;
             ParquetWriter::new(file).finish(&mut unique_df.clone())?;
         }
-        
+
         // 原子替换
         std::fs::rename(&temp_file, &main_file)?;
-        
+
         // 清理增量文件
         for path in &incremental_files {
             let _ = std::fs::remove_file(path);
         }
-        
-        println!("✅ [Parquet] dbnum={} {} 合并完成: {} 条记录", dbnum, prefix, unique_df.height());
+
+        println!(
+            "✅ [Parquet] dbnum={} {} 合并完成: {} 条记录",
+            dbnum,
+            prefix,
+            unique_df.height()
+        );
         Ok(())
     }
 
@@ -589,26 +616,26 @@ impl ParquetStreamWriter {
         if !dbno_dir.exists() {
             return Ok(Vec::new());
         }
-        
+
         let pattern_prefix = format!("{}_{}", prefix, "");
         let main_filename = format!("{}.parquet", prefix);
-        
+
         let mut files = Vec::new();
         for entry in std::fs::read_dir(dbno_dir)? {
             let entry = entry?;
             let path = entry.path();
-            
+
             if path.extension().and_then(|s| s.to_str()) != Some("parquet") {
                 continue;
             }
-            
+
             if let Some(filename) = path.file_name().and_then(|s| s.to_str()) {
                 if filename.starts_with(&pattern_prefix) && filename != main_filename {
                     files.push(path);
                 }
             }
         }
-        
+
         files.sort();
         Ok(files)
     }
@@ -623,10 +650,22 @@ impl ParquetStreamWriter {
 fn dmat4_to_f32_array(mat: &glam::DMat4) -> [f32; 16] {
     let cols = mat.to_cols_array();
     [
-        cols[0] as f32, cols[1] as f32, cols[2] as f32, cols[3] as f32,
-        cols[4] as f32, cols[5] as f32, cols[6] as f32, cols[7] as f32,
-        cols[8] as f32, cols[9] as f32, cols[10] as f32, cols[11] as f32,
-        cols[12] as f32, cols[13] as f32, cols[14] as f32, cols[15] as f32,
+        cols[0] as f32,
+        cols[1] as f32,
+        cols[2] as f32,
+        cols[3] as f32,
+        cols[4] as f32,
+        cols[5] as f32,
+        cols[6] as f32,
+        cols[7] as f32,
+        cols[8] as f32,
+        cols[9] as f32,
+        cols[10] as f32,
+        cols[11] as f32,
+        cols[12] as f32,
+        cols[13] as f32,
+        cols[14] as f32,
+        cols[15] as f32,
     ]
 }
 
@@ -638,10 +677,10 @@ mod tests {
     fn test_stream_writer_creation() {
         let temp_dir = std::env::temp_dir().join("parquet_stream_test");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        
+
         let writer = ParquetStreamWriter::new(&temp_dir).unwrap();
         assert!(writer.output_path().exists());
-        
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

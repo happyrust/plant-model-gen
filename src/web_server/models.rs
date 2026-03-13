@@ -1639,7 +1639,8 @@ mod tests {
             "room_keyword": "-RM"
         });
 
-        let config: DatabaseConfig = serde_json::from_value(value).expect("deserialize legacy config");
+        let config: DatabaseConfig =
+            serde_json::from_value(value).expect("deserialize legacy config");
         assert_eq!(config.enabled_nouns, None);
         assert_eq!(config.excluded_nouns, None);
         assert_eq!(config.debug_limit_per_noun_type, None);

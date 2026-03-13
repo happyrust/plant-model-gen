@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use crate::sqlite_index::{i64_to_refno_str, refno_str_to_i64, SqliteAabbIndex};
+use crate::sqlite_index::{SqliteAabbIndex, i64_to_refno_str, refno_str_to_i64};
 
 const DEFAULT_DISTANCE: f32 = 0.0;
 const DEFAULT_MAX_HITS: usize = 5000;
@@ -48,8 +48,8 @@ fn test_guard() -> &'static Mutex<()> {
 
 fn get_cached_index() -> Result<&'static CachedIndex, String> {
     let path = sqlite_index_path();
-    let idx = SqliteAabbIndex::open(&path)
-        .map_err(|e| format!("open sqlite index failed: {}", e))?;
+    let idx =
+        SqliteAabbIndex::open(&path).map_err(|e| format!("open sqlite index failed: {}", e))?;
     idx.init_schema()
         .map_err(|e| format!("init sqlite schema failed: {}", e))?;
 
@@ -142,7 +142,11 @@ pub struct SpatialStatsResult {
 // ============================================================================
 
 fn sqlite_index_path() -> PathBuf {
-    if let Some(path) = test_index_override().lock().ok().and_then(|guard| guard.clone()) {
+    if let Some(path) = test_index_override()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+    {
         return path;
     }
     // 兼容两个环境变量名
@@ -199,26 +203,51 @@ fn aabb_from_bbox_params(p: &SqliteSpatialQueryParams) -> Result<Aabb, String> {
     let maxx = p.maxx.ok_or_else(|| "missing maxx".to_string())?;
     let maxy = p.maxy.ok_or_else(|| "missing maxy".to_string())?;
     let maxz = p.maxz.ok_or_else(|| "missing maxz".to_string())?;
-    if !(minx.is_finite() && miny.is_finite() && minz.is_finite() && maxx.is_finite() && maxy.is_finite() && maxz.is_finite()) {
+    if !(minx.is_finite()
+        && miny.is_finite()
+        && minz.is_finite()
+        && maxx.is_finite()
+        && maxy.is_finite()
+        && maxz.is_finite())
+    {
         return Err("bbox contains non-finite value".to_string());
     }
     if minx > maxx || miny > maxy || minz > maxz {
         return Err("bbox min > max".to_string());
     }
-    Ok(Aabb::new([minx, miny, minz].into(), [maxx, maxy, maxz].into()))
+    Ok(Aabb::new(
+        [minx, miny, minz].into(),
+        [maxx, maxy, maxz].into(),
+    ))
 }
 
 fn aabb_dto_from_row(minx: f32, miny: f32, minz: f32, maxx: f32, maxy: f32, maxz: f32) -> AabbDto {
     AabbDto {
-        min: Vec3Dto { x: minx, y: miny, z: minz },
-        max: Vec3Dto { x: maxx, y: maxy, z: maxz },
+        min: Vec3Dto {
+            x: minx,
+            y: miny,
+            z: minz,
+        },
+        max: Vec3Dto {
+            x: maxx,
+            y: maxy,
+            z: maxz,
+        },
     }
 }
 
 fn aabb_to_dto(aabb: &Aabb) -> AabbDto {
     AabbDto {
-        min: Vec3Dto { x: aabb.mins.x, y: aabb.mins.y, z: aabb.mins.z },
-        max: Vec3Dto { x: aabb.maxs.x, y: aabb.maxs.y, z: aabb.maxs.z },
+        min: Vec3Dto {
+            x: aabb.mins.x,
+            y: aabb.mins.y,
+            z: aabb.mins.z,
+        },
+        max: Vec3Dto {
+            x: aabb.maxs.x,
+            y: aabb.maxs.y,
+            z: aabb.maxs.z,
+        },
     }
 }
 
@@ -239,7 +268,9 @@ fn parse_noun_filter(nouns: &Option<String>) -> Option<Vec<String>> {
 // ============================================================================
 
 /// GET /api/sqlite-spatial/query
-pub async fn api_sqlite_spatial_query(Query(params): Query<SqliteSpatialQueryParams>) -> Json<SpatialQueryResult> {
+pub async fn api_sqlite_spatial_query(
+    Query(params): Query<SqliteSpatialQueryParams>,
+) -> Json<SpatialQueryResult> {
     // 将 SQLite 阻塞 I/O 放入 blocking 线程池
     let result = tokio::task::spawn_blocking(move || do_spatial_query(params)).await;
     match result {
@@ -263,10 +294,7 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
                 results: None,
                 truncated: None,
                 query_bbox: None,
-                error: Some(format!(
-                    "{}. 请先运行 import-spatial-index 构建索引。",
-                    e
-                )),
+                error: Some(format!("{}. 请先运行 import-spatial-index 构建索引。", e)),
             };
         }
     };
@@ -274,13 +302,18 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
 
     let mode = parse_mode(&params);
     let distance = params.distance.unwrap_or(DEFAULT_DISTANCE);
-    let max_results = params.max_results.unwrap_or(DEFAULT_MAX_HITS).min(HARD_MAX_HITS);
+    let max_results = params
+        .max_results
+        .unwrap_or(DEFAULT_MAX_HITS)
+        .min(HARD_MAX_HITS);
     let noun_filter = parse_noun_filter(&params.nouns);
     let include_self = params.include_self.unwrap_or(true);
 
     // 记住 refno 对应的 i64 id（用于 include_self 过滤）
     let self_id: Option<i64> = if mode == "refno" && !include_self {
-        params.refno.as_deref()
+        params
+            .refno
+            .as_deref()
             .and_then(|s| refno_str_to_i64(s.trim()))
     } else {
         None
@@ -289,21 +322,30 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
     let base_aabb = if mode == "position" {
         // position 模式：从 x, y, z, radius 构建 AABB
         const MAX_QUERY_RADIUS: f32 = 100_000.0; // 100m in mm
-        
+
         let x = params.x.ok_or_else(|| "missing x".to_string());
         let y = params.y.ok_or_else(|| "missing y".to_string());
         let z = params.z.ok_or_else(|| "missing z".to_string());
         let radius = params.radius.ok_or_else(|| "missing radius".to_string());
-        
+
         match (x, y, z, radius) {
             (Ok(x), Ok(y), Ok(z), Ok(r)) => {
-                if !(x.is_finite() && y.is_finite() && z.is_finite() && r.is_finite() && r > 0.0 && r <= MAX_QUERY_RADIUS) {
+                if !(x.is_finite()
+                    && y.is_finite()
+                    && z.is_finite()
+                    && r.is_finite()
+                    && r > 0.0
+                    && r <= MAX_QUERY_RADIUS)
+                {
                     return SpatialQueryResult {
                         success: false,
                         results: None,
                         truncated: None,
                         query_bbox: None,
-                        error: Some(format!("invalid position or radius (must be 0 < radius <= {} mm)", MAX_QUERY_RADIUS)),
+                        error: Some(format!(
+                            "invalid position or radius (must be 0 < radius <= {} mm)",
+                            MAX_QUERY_RADIUS
+                        )),
                     };
                 }
                 Aabb::new([x - r, y - r, z - r].into(), [x + r, y + r, z + r].into())
@@ -355,7 +397,16 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
             .query_row(
                 "SELECT min_x, min_y, min_z, max_x, max_y, max_z FROM aabb_index WHERE id = ?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .optional()
             .unwrap_or(None);
@@ -393,12 +444,14 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
     let query_center_z = (query_aabb.mins.z + query_aabb.maxs.z) * 0.5;
 
     // 球体模式：用于二次距离过滤
-    let is_sphere = params.shape.as_deref().unwrap_or("cube").eq_ignore_ascii_case("sphere");
-    let sphere_radius = (query_aabb.maxs.x - query_aabb.mins.x).max(
-        (query_aabb.maxs.y - query_aabb.mins.y).max(
-            query_aabb.maxs.z - query_aabb.mins.z,
-        ),
-    ) * 0.5;
+    let is_sphere = params
+        .shape
+        .as_deref()
+        .unwrap_or("cube")
+        .eq_ignore_ascii_case("sphere");
+    let sphere_radius = (query_aabb.maxs.x - query_aabb.mins.x)
+        .max((query_aabb.maxs.y - query_aabb.mins.y).max(query_aabb.maxs.z - query_aabb.mins.z))
+        * 0.5;
     let sphere_radius_sq = sphere_radius * sphere_radius;
 
     let ids = match idx.query_intersect(
@@ -447,9 +500,9 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
             };
         }
     };
-    let mut stmt_aabb = match conn.prepare(
-        "SELECT min_x, min_y, min_z, max_x, max_y, max_z FROM aabb_index WHERE id = ?1",
-    ) {
+    let mut stmt_aabb = match conn
+        .prepare("SELECT min_x, min_y, min_z, max_x, max_y, max_z FROM aabb_index WHERE id = ?1")
+    {
         Ok(s) => s,
         Err(e) => {
             return SpatialQueryResult {
@@ -487,7 +540,16 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
         }
 
         let aabb_row: Option<(f32, f32, f32, f32, f32, f32)> = stmt_aabb
-            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .query_row([id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
             .optional()
             .unwrap_or(None);
 
@@ -500,21 +562,29 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
             let dy = cy - query_center_y;
             let dz = cz - query_center_z;
             let dist_sq = dx * dx + dy * dy + dz * dz;
-            
+
             // 球体模式：基于距离做精确过滤
             if is_sphere && dist_sq > sphere_radius_sq {
                 continue;
             }
-            
+
             Some(dist_sq.sqrt())
         } else {
             None
         };
 
-        let aabb = aabb_row.map(|(minx, miny, minz, maxx, maxy, maxz)| aabb_dto_from_row(minx, miny, minz, maxx, maxy, maxz));
+        let aabb = aabb_row.map(|(minx, miny, minz, maxx, maxy, maxz)| {
+            aabb_dto_from_row(minx, miny, minz, maxx, maxy, maxz)
+        });
 
         let refno = i64_to_refno_str(id as i64);
-        results.push(SpatialQueryResultItem { refno, noun, spec_value, aabb, distance });
+        results.push(SpatialQueryResultItem {
+            refno,
+            noun,
+            spec_value,
+            aabb,
+            distance,
+        });
 
         if results.len() >= max_results {
             truncated = true;
@@ -523,13 +593,11 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
     }
 
     // 按距离从近到远排序
-    results.sort_by(|a, b| {
-        match (a.distance, b.distance) {
-            (Some(da), Some(db)) => da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
+    results.sort_by(|a, b| match (a.distance, b.distance) {
+        (Some(da), Some(db)) => da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
     });
 
     SpatialQueryResult {
@@ -570,10 +638,7 @@ fn do_spatial_stats() -> SpatialStatsResult {
                 total_elements: 0,
                 index_type: String::new(),
                 index_path: path.display().to_string(),
-                error: Some(format!(
-                    "{}. 请先运行 import-spatial-index 构建索引。",
-                    msg
-                )),
+                error: Some(format!("{}. 请先运行 import-spatial-index 构建索引。", msg)),
             };
         }
     };
@@ -635,9 +700,30 @@ mod tests {
         idx.init_schema().unwrap();
         idx.insert_aabbs_with_items_and_spec_values(vec![
             // id = (1<<32)+2 => "1_2"
-            (((1u64 << 32) | 2u64) as i64, "PIPE".to_string(), 42, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0),
-            (((1u64 << 32) | 3u64) as i64, "WALL".to_string(), 0, 10.0, 11.0, 0.0, 1.0, 0.0, 1.0),
-        ]).unwrap();
+            (
+                ((1u64 << 32) | 2u64) as i64,
+                "PIPE".to_string(),
+                42,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+            (
+                ((1u64 << 32) | 3u64) as i64,
+                "WALL".to_string(),
+                0,
+                10.0,
+                11.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+        ])
+        .unwrap();
 
         let resp = with_test_index(&db, || {
             let params = SqliteSpatialQueryParams {
@@ -663,7 +749,11 @@ mod tests {
         });
         assert!(resp.success);
         let items = resp.results.unwrap_or_default();
-        assert!(items.iter().any(|x| x.refno == "1_2" && x.noun == "PIPE" && x.spec_value == 42));
+        assert!(
+            items
+                .iter()
+                .any(|x| x.refno == "1_2" && x.noun == "PIPE" && x.spec_value == 42)
+        );
         assert!(items.iter().any(|x| x.refno == "1_2"));
     }
 
@@ -673,9 +763,18 @@ mod tests {
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
-        idx.insert_aabbs_with_items_and_spec_values(vec![
-            (((1u64 << 32) | 9u64) as i64, "PIPE".to_string(), 0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0),
-        ]).unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(vec![(
+            ((1u64 << 32) | 9u64) as i64,
+            "PIPE".to_string(),
+            0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+        )])
+        .unwrap();
 
         let resp = with_test_index(&db, || {
             let params = SqliteSpatialQueryParams {

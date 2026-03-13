@@ -19,8 +19,7 @@ use super::model_exporter::{
 fn mesh_has_invalid_normals(mesh: &PlantMesh) -> bool {
     // glam::Vec3 implements is_finite; use component checks if upstream changes.
     mesh.normals.iter().any(|n| {
-        !(n.x.is_finite() && n.y.is_finite() && n.z.is_finite())
-            || n.length_squared().is_nan()
+        !(n.x.is_finite() && n.y.is_finite() && n.z.is_finite()) || n.length_squared().is_nan()
     })
 }
 
@@ -131,8 +130,7 @@ fn sanitize_obj_group_name(name: &str) -> String {
     // OBJ 的 group/object 名称以空格分隔；为保证各类查看器/工具链一致性，这里做最小清洗：
     // - 用 '_' 替换 '/'（refno 常见形式为 24381/129928）
     // - 将空白字符替换为 '_'（避免被拆成多个 token）
-    name.replace('/', "_")
-        .replace(['\t', '\r', '\n', ' '], "_")
+    name.replace('/', "_").replace(['\t', '\r', '\n', ' '], "_")
 }
 
 fn export_export_data_to_obj_grouped(
@@ -264,26 +262,24 @@ pub struct PreparedObjExport {
     pub stats: ExportStats,
 }
 
-
-
 fn merge_export_data_into_mesh(export_data: &ExportData, mesh_dir: &Path) -> PlantMesh {
     use crate::fast_model::export_model::export_common::GltfMeshCache;
     let mesh_cache = GltfMeshCache::new();
     let mut merged_mesh = PlantMesh::default();
 
     // 辅助函数：合并单个实例
-    let mut merge_instance = |geo_hash: &str, transform: &glam::DMat4| {
-        match mesh_cache.load_or_get(geo_hash, mesh_dir) {
-            Ok(arc_mesh) => {
-                let transformed = arc_mesh.as_ref().transform_by(transform);
-                merged_mesh.merge(&transformed);
-            }
-            Err(e) => {
-                eprintln!(
-                    "[export_obj] ⚠️ 加载 mesh {} 失败，跳过实例: {}",
-                    geo_hash, e
-                );
-            }
+    let mut merge_instance = |geo_hash: &str, transform: &glam::DMat4| match mesh_cache
+        .load_or_get(geo_hash, mesh_dir)
+    {
+        Ok(arc_mesh) => {
+            let transformed = arc_mesh.as_ref().transform_by(transform);
+            merged_mesh.merge(&transformed);
+        }
+        Err(e) => {
+            eprintln!(
+                "[export_obj] ⚠️ 加载 mesh {} 失败，跳过实例: {}",
+                geo_hash, e
+            );
         }
     };
 
@@ -318,7 +314,7 @@ pub async fn prepare_obj_export(
     config: &CommonExportConfig,
 ) -> Result<PreparedObjExport> {
     // 统一 mesh_dir：很多调用方传的是 `assets/meshes`，但 GLB 实际存放在 `assets/meshes/lod_L{N}`。
-    // 这里必须跟随当前 active_precision.default_lod，否则会误读旧的 LOD（常见表现：截图/OBJ 与最新 mesh 不一致）。 
+    // 这里必须跟随当前 active_precision.default_lod，否则会误读旧的 LOD（常见表现：截图/OBJ 与最新 mesh 不一致）。
     let default_lod = aios_core::mesh_precision::active_precision().default_lod;
     let effective_mesh_dir = match mesh_dir.file_name().and_then(|n| n.to_str()) {
         Some(name) if name.starts_with("lod_") => mesh_dir.to_path_buf(),
@@ -652,4 +648,3 @@ impl ModelExporter for ObjExporter {
         "OBJ"
     }
 }
-

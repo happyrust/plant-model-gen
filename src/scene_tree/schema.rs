@@ -2,7 +2,7 @@
 //!
 //! 定义 scene_node 和 contains 关系表的 Schema
 
-use aios_core::{project_primary_db, SurrealQueryExt};
+use aios_core::{SurrealQueryExt, project_primary_db};
 use anyhow::Result;
 
 /// 初始化 Scene Tree 表结构

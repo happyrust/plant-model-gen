@@ -43,7 +43,10 @@ impl SqlFileWriter {
         if trimmed.is_empty() {
             return Ok(());
         }
-        let mut writer = self.inner.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let mut writer = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {}", e))?;
         writer.write_all(trimmed.as_bytes())?;
         if !trimmed.ends_with(';') {
             writer.write_all(b";")?;
@@ -51,15 +54,24 @@ impl SqlFileWriter {
         writer.write_all(b"\n")?;
         drop(writer);
 
-        let mut count = self.statement_count.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let mut count = self
+            .statement_count
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {}", e))?;
         *count += 1;
         Ok(())
     }
 
     /// 写入多条 SQL 语句。
     pub fn write_statements(&self, sqls: &[String]) -> anyhow::Result<()> {
-        let mut writer = self.inner.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
-        let mut count = self.statement_count.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let mut writer = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let mut count = self
+            .statement_count
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {}", e))?;
         for sql in sqls {
             let trimmed = sql.trim();
             if trimmed.is_empty() {
@@ -77,7 +89,10 @@ impl SqlFileWriter {
 
     /// 写入注释行。
     pub fn write_comment(&self, comment: &str) -> anyhow::Result<()> {
-        let mut writer = self.inner.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let mut writer = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {}", e))?;
         writer.write_all(b"-- ")?;
         writer.write_all(comment.as_bytes())?;
         writer.write_all(b"\n")?;
@@ -86,7 +101,10 @@ impl SqlFileWriter {
 
     /// 刷新缓冲区到磁盘。
     pub fn flush(&self) -> anyhow::Result<()> {
-        let mut writer = self.inner.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let mut writer = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {}", e))?;
         writer.flush()?;
         Ok(())
     }
@@ -98,10 +116,7 @@ impl SqlFileWriter {
 
     /// 返回已写入的语句数。
     pub fn statement_count(&self) -> usize {
-        self.statement_count
-            .lock()
-            .map(|c| *c)
-            .unwrap_or(0)
+        self.statement_count.lock().map(|c| *c).unwrap_or(0)
     }
 }
 
@@ -116,7 +131,7 @@ pub async fn import_sql_file(
     path: &std::path::Path,
     batch_size: usize,
 ) -> anyhow::Result<(usize, usize)> {
-    use aios_core::{model_primary_db, SurrealQueryExt};
+    use aios_core::{SurrealQueryExt, model_primary_db};
     use std::io::BufRead;
 
     // 轻量扫描：统计有效语句数（用于进度显示），不保存内容
@@ -193,7 +208,7 @@ pub async fn import_sql_file(
 /// 执行一个批次的 SQL 语句（事务包裹 + 重试）。
 /// 返回 (成功条数, 失败条数)。
 async fn execute_batch(stmts: &[String], batch_idx: usize) -> (usize, usize) {
-    use aios_core::{model_primary_db, SurrealQueryExt};
+    use aios_core::{SurrealQueryExt, model_primary_db};
 
     let block = format!(
         "BEGIN TRANSACTION;\n{}\nCOMMIT TRANSACTION;",

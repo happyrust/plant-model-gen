@@ -35,7 +35,9 @@ pub fn validate_data_source_mode(use_surrealdb: bool) -> anyhow::Result<()> {
     if use_surrealdb {
         Ok(())
     } else {
-        anyhow::bail!("非法数据源模式: use_surrealdb=false。当前版本已固定输入来源为 SurrealDB，必须满足 use_surrealdb=true。")
+        anyhow::bail!(
+            "非法数据源模式: use_surrealdb=false。当前版本已固定输入来源为 SurrealDB，必须满足 use_surrealdb=true。"
+        )
     }
 }
 
@@ -587,7 +589,7 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_regen_delete_mode, validate_data_source_mode, RegenDeleteMode};
+    use super::{RegenDeleteMode, parse_regen_delete_mode, validate_data_source_mode};
 
     #[test]
     fn data_source_mode_requires_fixed_surreal_input() {

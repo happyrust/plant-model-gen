@@ -139,12 +139,7 @@ pub async fn gen_cata_single_geoms(
         if trace_this {
             println!(
                 "    [P1 trace] refno={} type={} stage=profile get_attmap={}ms resolve={}ms profile={}ms total={}ms",
-                design_refno,
-                type_name,
-                get_attmap_time,
-                resolve_time,
-                profile_time,
-                total_elapsed
+                design_refno, type_name, get_attmap_time, resolve_time, profile_time, total_elapsed
             );
         }
 

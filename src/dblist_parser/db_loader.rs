@@ -2,7 +2,7 @@
 //!
 //! 将解析的 PDMS 元素数据加载到 SurrealDB 内存数据库中
 
-use aios_core::{RefnoEnum, project_primary_db, SurrealQueryExt};
+use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db};
 use anyhow::Result;
 use serde_json::json;
 use std::collections::HashMap;

@@ -6,7 +6,7 @@ use aios_core::room::algorithm::*;
 
 use aios_core::shape::pdms_shape::PlantMesh;
 
-use aios_core::{model_primary_db, GeomInstQuery, ModelHashInst, RefU64, RefnoEnum};
+use aios_core::{GeomInstQuery, ModelHashInst, RefU64, RefnoEnum, model_primary_db};
 
 use dashmap::DashMap;
 
@@ -55,9 +55,13 @@ use tracing::{debug, error, info, warn};
 use indicatif::{ProgressBar, ProgressStyle};
 
 /// 房间名称匹配正则表达式（HD项目）
-static ROOM_NAME_HD_REGEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-    Regex::new(r"^[A-Z]\d{3}$").expect("invalid room name regex")
-});
+static ROOM_NAME_HD_REGEX: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"^[A-Z]\d{3}$").expect("invalid room name regex"));
+
+const ROOM_TREE_INDEX_LOAD_FAILED_TAG: &str = "[ROOM_TREE_INDEX_LOAD_FAILED]";
+const ROOM_TREE_INDEX_ROOM_MISSING_TAG: &str = "[ROOM_TREE_INDEX_ROOM_MISSING]";
+const ROOM_TREE_INDEX_DBNUM_RESOLVE_FAILED_TAG: &str = "[ROOM_TREE_INDEX_DBNUM_RESOLVE_FAILED]";
+const ROOM_TREE_INDEX_QUERY_FAILED_TAG: &str = "[ROOM_TREE_INDEX_QUERY_FAILED]";
 
 /// Room calc environment config (replaces runtime unsafe env::set_var).
 
@@ -449,18 +453,24 @@ async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
     // 预加载所有布尔运算后的 AABB（优先级更高）
     let mut booled_aabb_map: HashMap<RefnoEnum, Aabb> = HashMap::new();
     {
-        let booled_sql = "SELECT refno, aabb_id.d as aabb FROM inst_relate_booled_aabb WHERE aabb_id.d != NONE";
+        let booled_sql =
+            "SELECT refno, aabb_id.d as aabb FROM inst_relate_booled_aabb WHERE aabb_id.d != NONE";
         match model_primary_db().query(booled_sql).await {
             Ok(mut resp) => {
                 let booled_rows: Vec<QueryAabbRowRaw> = resp.take(0).unwrap_or_default();
                 for row in booled_rows {
-                    if !row.refno.is_valid() { continue; }
+                    if !row.refno.is_valid() {
+                        continue;
+                    }
                     if let Some(aabb) = parse_inst_relate_aabb(&row.aabb) {
                         booled_aabb_map.insert(row.refno, aabb);
                     }
                 }
                 if !booled_aabb_map.is_empty() {
-                    info!("[room_model] 加载 {} 条布尔运算后 AABB 用于空间索引覆盖", booled_aabb_map.len());
+                    info!(
+                        "[room_model] 加载 {} 条布尔运算后 AABB 用于空间索引覆盖",
+                        booled_aabb_map.len()
+                    );
                 }
             }
             Err(e) => {
@@ -999,11 +1009,7 @@ impl CacheMetrics {
 
         let total = hits + misses;
 
-        if total == 0.0 {
-            0.0
-        } else {
-            hits / total
-        }
+        if total == 0.0 { 0.0 } else { hits / total }
     }
 }
 
@@ -1263,7 +1269,7 @@ async fn build_room_relations_with_cancel_and_overrides(
         sync_room_panel_relations(&room_panel_relations, false).await?;
     }
 
-    save_room_relate_batch(&computed.panel_relations).await?;
+    save_room_relate_batch_chunked(&computed.panel_relations).await?;
 
     let stats = computed.stats;
 
@@ -1588,62 +1594,13 @@ where
 {
     let start_time = Instant::now();
 
-    let sql = build_room_panel_query_sql(room_key_word);
+    // 优化：使用 TreeIndex 查询房间面板，避免嵌套 SurrealQL
+    let room_groups = query_room_panels_with_tree_index(room_key_word, match_room_fn).await?;
 
-    let mut response = model_primary_db().query(sql).await?;
-
-    let raw_result: Vec<(RecordId, String, Vec<RecordId>)> = response.take(0)?;
-
-    // 转换并过滤结果
-
-    let room_groups: Vec<(RefnoEnum, String, Vec<RefnoEnum>)> = raw_result
-        .into_iter()
-        .filter_map(|(room_thing, room_num, panel_things)| {
-            // 验证房间号格式
-
-            if !match_room_fn(&room_num) {
-                debug!("跳过不匹配的房间号: {}", room_num);
-
-                return None;
-            }
-
-            // 这里克隆一次以避免后续日志对 room_thing 的使用发生 move
-
-            let room_refno = RefnoEnum::from(room_thing.clone());
-
-            if !room_refno.is_valid() {
-                warn!("无效的房间引用号: {:?}", room_thing);
-
-                return None;
-            }
-
-            let panel_refnos: Vec<RefnoEnum> = panel_things
-                .into_iter()
-                .filter_map(|panel_thing| {
-                    let panel_refno = RefnoEnum::from(panel_thing);
-
-                    if panel_refno.is_valid() {
-                        Some(panel_refno)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            if panel_refnos.is_empty() {
-                debug!("房间 {} 没有关联的面板", room_num);
-
-                return None;
-            }
-
-            Some((room_refno, room_num, panel_refnos))
-        })
-        .collect();
-
-    // 批量创建房间面板关系
+    // 批量创建房间面板关系（分块提交）
 
     if persist && !room_groups.is_empty() {
-        create_room_panel_relations_batch(&room_groups).await?;
+        create_room_panel_relations_batch_chunked(&room_groups).await?;
     }
 
     if persist {
@@ -1661,6 +1618,221 @@ where
     }
 
     Ok(room_groups)
+}
+
+/// 使用 TreeIndex 查询房间面板（性能优化版本）
+async fn query_room_panels_with_tree_index<F>(
+    room_key_word: &[String],
+    match_room_fn: F,
+) -> anyhow::Result<Vec<(RefnoEnum, String, Vec<RefnoEnum>)>>
+where
+    F: Fn(&str) -> bool + Send + Sync,
+{
+    use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+    use aios_core::tool::db_tool::db1_hash;
+    use aios_core::tree_query::{TreeQuery, TreeQueryFilter, TreeQueryOptions};
+
+    // 1. 查询候选房间（只查房间本身，不查子孙）
+    let rooms = query_candidate_rooms(room_key_word).await?;
+
+    // 2. 按 dbnum 分组；解析失败直接报错，避免静默漏算房间
+    let grouped_by_db = group_candidate_rooms_by_dbnum(
+        rooms,
+        match_room_fn,
+        TreeIndexManager::resolve_dbnum_for_refno,
+    )?;
+
+    // 3. 对每个 dbnum 只加载一次 TreeIndex，再批量查询房间面板
+    query_grouped_room_panels_with_loader(grouped_by_db, |dbnum, items| {
+        let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+        let tree_dir = manager.tree_dir().to_path_buf();
+        let index = manager.load_index(dbnum).map_err(|e| {
+            let room_hint = items
+                .first()
+                .map(|(room_refno, room_num)| (*room_refno, room_num.as_str()))
+                .unwrap_or((RefnoEnum::default(), "<empty>"));
+            let message = build_tree_index_load_error_message(
+                dbnum,
+                &tree_dir,
+                room_hint.0,
+                room_hint.1,
+                &e.to_string(),
+            );
+            error!("{}", message);
+            anyhow::anyhow!(message)
+        })?;
+        let options = TreeQueryOptions {
+            include_self: false,
+            max_depth: None,
+            filter: TreeQueryFilter {
+                noun_hashes: Some(std::iter::once(db1_hash("PANE")).collect()),
+                ..Default::default()
+            },
+            prune_on_match: false,
+        };
+        let mut out = Vec::new();
+
+        for (room_refno, room_num) in items {
+            let room_refno_u64 = room_refno.refno();
+            if !index.contains_refno(room_refno_u64) {
+                let message = build_tree_index_missing_room_error_message(
+                    dbnum,
+                    &tree_dir,
+                    *room_refno,
+                    room_num,
+                );
+                error!("{}", message);
+                anyhow::bail!(message);
+            }
+
+            let descendants = index
+                .collect_descendants_bfs(room_refno_u64, &options)
+                .into_iter()
+                .map(RefnoEnum::from)
+                .filter(|refno| refno.is_valid())
+                .collect::<Vec<_>>();
+
+            if !descendants.is_empty() {
+                out.push((*room_refno, room_num.clone(), descendants));
+            }
+        }
+
+        Ok(out)
+    })
+}
+
+fn group_candidate_rooms_by_dbnum<F, R>(
+    rooms: Vec<(RefnoEnum, String)>,
+    match_room_fn: F,
+    resolve_dbnum: R,
+) -> anyhow::Result<HashMap<u32, Vec<(RefnoEnum, String)>>>
+where
+    F: Fn(&str) -> bool,
+    R: Fn(RefnoEnum) -> anyhow::Result<u32>,
+{
+    let mut grouped_by_db: HashMap<u32, Vec<(RefnoEnum, String)>> = HashMap::new();
+
+    for (room_refno, room_num) in rooms {
+        if !room_refno.is_valid() || !match_room_fn(&room_num) {
+            continue;
+        }
+
+        let dbnum = resolve_dbnum(room_refno).map_err(|e| {
+            let message = format!(
+                "{ROOM_TREE_INDEX_DBNUM_RESOLVE_FAILED_TAG} 解析房间 dbnum 失败: room_refno={}, room_num={}, error={}",
+                room_refno,
+                room_num,
+                e
+            );
+            error!("{}", message);
+            anyhow::anyhow!(message)
+        })?;
+
+        grouped_by_db
+            .entry(dbnum)
+            .or_default()
+            .push((room_refno, room_num));
+    }
+
+    Ok(grouped_by_db)
+}
+
+fn query_grouped_room_panels_with_loader<F>(
+    grouped_by_db: HashMap<u32, Vec<(RefnoEnum, String)>>,
+    mut load_room_panels: F,
+) -> anyhow::Result<Vec<(RefnoEnum, String, Vec<RefnoEnum>)>>
+where
+    F: FnMut(
+        u32,
+        &[(RefnoEnum, String)],
+    ) -> anyhow::Result<Vec<(RefnoEnum, String, Vec<RefnoEnum>)>>,
+{
+    let mut out = Vec::new();
+
+    for (dbnum, rooms) in grouped_by_db {
+        let mut room_groups = load_room_panels(dbnum, &rooms).map_err(|e| {
+            let message = format!(
+                "{ROOM_TREE_INDEX_QUERY_FAILED_TAG} 按 dbnum 查询房间面板失败: dbnum={}, error={}",
+                dbnum, e
+            );
+            error!("{}", message);
+            anyhow::anyhow!(message)
+        })?;
+        out.append(&mut room_groups);
+    }
+
+    Ok(out)
+}
+
+fn build_tree_index_load_error_message(
+    dbnum: u32,
+    tree_dir: &Path,
+    room_refno: RefnoEnum,
+    room_num: &str,
+    error: &str,
+) -> String {
+    let tree_file = tree_dir.join(format!("{dbnum}.tree"));
+    format!(
+        "{ROOM_TREE_INDEX_LOAD_FAILED_TAG} 加载房间面板 TreeIndex 失败: dbnum={dbnum}, room_refno={room_refno}, room_num={room_num}, tree_dir={}, tree_file={}, error={error}\n\
+         排查建议:\n\
+         - 确认 tree 文件存在且与当前项目匹配\n\
+         - 确认 db_meta_info.json 已生成并能正确解析 refno -> dbnum\n\
+         - 如 tree 文件缺失，可执行: cargo run --bin aios-database -- --parse-db",
+        tree_dir.display(),
+        tree_file.display(),
+    )
+}
+
+fn build_tree_index_missing_room_error_message(
+    dbnum: u32,
+    tree_dir: &Path,
+    room_refno: RefnoEnum,
+    room_num: &str,
+) -> String {
+    let tree_file = tree_dir.join(format!("{dbnum}.tree"));
+    format!(
+        "{ROOM_TREE_INDEX_ROOM_MISSING_TAG} TreeIndex 中缺少房间节点: dbnum={dbnum}, room_refno={room_refno}, room_num={room_num}, tree_dir={}, tree_file={}\n\
+         排查建议:\n\
+         - 确认该房间已出现在 parse-db 产出的 scene_tree 中\n\
+         - 确认当前配置指向了正确项目目录\n\
+         - 如 tree 数据陈旧或缺失，可执行: cargo run --bin aios-database -- --parse-db",
+        tree_dir.display(),
+        tree_file.display(),
+    )
+}
+
+/// 查询候选房间（只查房间本身）
+async fn query_candidate_rooms(
+    room_key_word: &[String],
+) -> anyhow::Result<Vec<(RefnoEnum, String)>> {
+    let filter = if room_key_word.is_empty() {
+        "true".to_string()
+    } else {
+        room_key_word
+            .iter()
+            .map(|x| format!("'{}' in NAME", x.replace('\'', "''")))
+            .join(" or ")
+    };
+
+    #[cfg(feature = "project_hd")]
+    let table = "FRMW";
+    #[cfg(feature = "project_hh")]
+    let table = "SBFR";
+    #[cfg(not(any(feature = "project_hd", feature = "project_hh")))]
+    let table = "FRMW";
+
+    let sql = format!(
+        "SELECT VALUE [id, array::last(string::split(NAME, '-'))] FROM {} WHERE NAME IS NOT NONE AND ({})",
+        table, filter
+    );
+
+    let mut response = model_primary_db().query(sql).await?;
+    let raw_result: Vec<(RecordId, String)> = response.take(0)?;
+
+    Ok(raw_result
+        .into_iter()
+        .map(|(id, name)| (RefnoEnum::from(id), name))
+        .collect())
 }
 
 fn build_room_panel_relations_sql(room_groups: &[(RefnoEnum, String, Vec<RefnoEnum>)]) -> String {
@@ -1709,6 +1881,21 @@ async fn create_room_panel_relations_batch(
     }
 
     model_primary_db().query(batch_sql).await?;
+    Ok(())
+}
+
+/// 分块提交房间面板关系（性能优化版本）
+async fn create_room_panel_relations_batch_chunked(
+    room_groups: &[(RefnoEnum, String, Vec<RefnoEnum>)],
+) -> anyhow::Result<()> {
+    const CHUNK_SIZE: usize = 50; // 每批最多 50 个房间
+
+    for chunk in room_groups.chunks(CHUNK_SIZE) {
+        let batch_sql = build_room_panel_relations_sql(chunk);
+        if !batch_sql.is_empty() {
+            model_primary_db().query(batch_sql).await?;
+        }
+    }
     Ok(())
 }
 
@@ -2233,7 +2420,10 @@ pub async fn cal_room_refnos_with_options(
     ))]
     if options.query_from_cache_enabled()
         && panel_geom_insts.is_empty()
-        && parse_env_bool("AIOS_ROOM_AUTOGEN_PANEL", true)
+        // 默认关闭：外层 pregen_room_panels_into_model_cache 已统一预生成。
+        // 逐面板补齐每次触发 gen_all_geos_data（含 DB 初始化/BFS/预加载 ~200ms），
+        // 在批量计算中会导致严重性能退化。仅在显式 AIOS_ROOM_AUTOGEN_PANEL=1 时启用。
+        && parse_env_bool("AIOS_ROOM_AUTOGEN_PANEL", false)
     {
         let db_opt = aios_core::get_db_option();
 
@@ -3267,17 +3457,11 @@ pub async fn save_room_relate(
         let relation_id = format!("{}_{}", panel_refno, refno);
 
         let sql = format!(
-
             "relate {}->room_relate:{}->{}  set room_num='{}', confidence=0.9, created_at=time::now();",
-
             panel_refno.to_pe_key(),
-
             relation_id,
-
             refno.to_pe_key(),
-
             room_num_escaped.as_str()
-
         );
 
         sql_statements.push(sql);
@@ -3329,6 +3513,21 @@ async fn save_room_relate_batch(panel_relations: &[PanelComputedRelations]) -> a
     }
 
     model_primary_db().query(batch_sql).await?;
+    Ok(())
+}
+
+/// 分块提交房间关系（性能优化版本）
+async fn save_room_relate_batch_chunked(
+    panel_relations: &[PanelComputedRelations],
+) -> anyhow::Result<()> {
+    const CHUNK_SIZE: usize = 100; // 每批最多 100 个面板关系
+
+    for chunk in panel_relations.chunks(CHUNK_SIZE) {
+        let batch_sql = build_room_relate_batch_sql(chunk);
+        if !batch_sql.is_empty() {
+            model_primary_db().query(batch_sql).await?;
+        }
+    }
     Ok(())
 }
 
@@ -3730,9 +3929,9 @@ mod tests {
         // 点正好在表面上（投影距离为0）
 
         let key_points = vec![
-            Point::new(0.0, 50.0, 50.0), // 左面上
+            Point::new(0.0, 50.0, 50.0),   // 左面上
             Point::new(100.0, 50.0, 50.0), // 右面上
-            Point::new(50.0, 0.0, 50.0), // 前面上
+            Point::new(50.0, 0.0, 50.0),   // 前面上
             Point::new(50.0, 100.0, 50.0), // 后面上
         ];
 
@@ -3836,9 +4035,9 @@ mod tests {
         // 3个表面点 + 1个远点 = 75% 在容差内
 
         let mixed_points = vec![
-            Point::new(0.0, 50.0, 50.0), // 表面上
-            Point::new(100.0, 50.0, 50.0), // 表面上
-            Point::new(50.0, 0.0, 50.0), // 表面上
+            Point::new(0.0, 50.0, 50.0),           // 表面上
+            Point::new(100.0, 50.0, 50.0),         // 表面上
+            Point::new(50.0, 0.0, 50.0),           // 表面上
             Point::new(10000.0, 10000.0, 10000.0), // 很远
         ];
 
@@ -3860,10 +4059,10 @@ mod tests {
         // 1个表面点 + 4个远点 = 20% 在容差内
 
         let mostly_far_points = vec![
-            Point::new(0.0, 50.0, 50.0), // 表面上 (1)
-            Point::new(10000.0, 0.0, 0.0), // 很远 (1)
+            Point::new(0.0, 50.0, 50.0),    // 表面上 (1)
+            Point::new(10000.0, 0.0, 0.0),  // 很远 (1)
             Point::new(-10000.0, 0.0, 0.0), // 很远 (2)
-            Point::new(0.0, 10000.0, 0.0), // 很远 (3)
+            Point::new(0.0, 10000.0, 0.0),  // 很远 (3)
             Point::new(0.0, -10000.0, 0.0), // 很远 (4)
         ];
 
@@ -4722,7 +4921,7 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
     let room_panel_relations = computed.panel_relations_by_room();
     delete_room_relations_for_panels(&panels_to_delete).await?;
     sync_room_panel_relations(&room_panel_relations, false).await?;
-    save_room_relate_batch(&computed.panel_relations).await?;
+    save_room_relate_batch_chunked(&computed.panel_relations).await?;
     let stats = computed.stats;
 
     info!("✅ 房间关系重建完成，耗时 {:?}", start_time.elapsed());
@@ -4842,7 +5041,7 @@ pub async fn update_room_relations_incremental_original(
         "已替换 {} 个面板的房间关系",
         affected_panels_for_delete.len()
     );
-    save_room_relate_batch(&panel_relations).await?;
+    save_room_relate_batch_chunked(&panel_relations).await?;
 
     let duration = start_time.elapsed();
 
@@ -5146,7 +5345,7 @@ pub async fn rebuild_room_relations_for_rooms(
     let room_panel_relations = computed.panel_relations_by_room();
     delete_room_relations_for_panels(&panels_to_delete).await?;
     sync_room_panel_relations(&room_panel_relations, false).await?;
-    save_room_relate_batch(&computed.panel_relations).await?;
+    save_room_relate_batch_chunked(&computed.panel_relations).await?;
     let stats = computed.stats;
 
     info!(
@@ -5164,9 +5363,14 @@ pub async fn rebuild_room_relations_for_rooms(
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+    use std::cell::RefCell;
 
     fn refno(value: u64) -> RefnoEnum {
         RefnoEnum::from(RefU64(value))
+    }
+
+    fn valid_room_refno(raw: &str) -> RefnoEnum {
+        RefnoEnum::from(raw)
     }
 
     #[test]
@@ -5237,5 +5441,98 @@ mod regression_tests {
         assert!(sql.contains("room_relate:"));
         assert!(sql.contains("room_num='R101'"));
         assert!(sql.contains("confidence=0.9"));
+    }
+
+    #[test]
+    fn test_group_candidate_rooms_by_dbnum_reports_resolve_failure() {
+        let err = group_candidate_rooms_by_dbnum(
+            vec![(valid_room_refno("24383_83477"), "R101".to_string())],
+            |_| true,
+            |_| anyhow::bail!("missing dbnum"),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("24383_83477"));
+        assert!(err.to_string().contains("missing dbnum"));
+        assert!(
+            err.to_string()
+                .contains("[ROOM_TREE_INDEX_DBNUM_RESOLVE_FAILED]")
+        );
+    }
+
+    #[test]
+    fn test_query_grouped_room_panels_with_loader_batches_each_db_once() {
+        let grouped = HashMap::from([(
+            100_u32,
+            vec![
+                (valid_room_refno("24383_83477"), "R101".to_string()),
+                (valid_room_refno("24383_83478"), "R102".to_string()),
+            ],
+        )]);
+        let calls = RefCell::new(Vec::new());
+
+        let result = query_grouped_room_panels_with_loader(grouped, |dbnum, rooms| {
+            calls.borrow_mut().push((dbnum, rooms.len()));
+            Ok(rooms
+                .iter()
+                .map(|(room_refno, room_num)| (*room_refno, room_num.clone(), vec![refno(999)]))
+                .collect())
+        })
+        .unwrap();
+
+        assert_eq!(calls.into_inner(), vec![(100, 2)]);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].2, vec![refno(999)]);
+    }
+
+    #[test]
+    fn test_query_grouped_room_panels_with_loader_reports_query_failure_tag() {
+        let grouped = HashMap::from([(
+            100_u32,
+            vec![(valid_room_refno("24383_83477"), "R101".to_string())],
+        )]);
+
+        let err = query_grouped_room_panels_with_loader(grouped, |_dbnum, _rooms| {
+            anyhow::bail!("query failed")
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("dbnum=100"));
+        assert!(err.to_string().contains("query failed"));
+        assert!(err.to_string().contains("[ROOM_TREE_INDEX_QUERY_FAILED]"));
+    }
+
+    #[test]
+    fn test_build_tree_index_load_error_includes_online_diagnostics() {
+        let message = build_tree_index_load_error_message(
+            7997,
+            std::path::Path::new("output/demo/scene_tree"),
+            valid_room_refno("24383_83477"),
+            "R101",
+            "missing tree file",
+        );
+
+        assert!(message.contains("dbnum=7997"));
+        assert!(message.contains("room_refno=24383_83477"));
+        assert!(message.contains("room_num=R101"));
+        assert!(message.contains("output/demo/scene_tree/7997.tree"));
+        assert!(message.contains("[ROOM_TREE_INDEX_LOAD_FAILED]"));
+    }
+
+    #[test]
+    fn test_build_tree_index_missing_room_error_includes_online_diagnostics() {
+        let message = build_tree_index_missing_room_error_message(
+            7997,
+            std::path::Path::new("output/demo/scene_tree"),
+            valid_room_refno("24383_83477"),
+            "R101",
+        );
+
+        assert!(message.contains("dbnum=7997"));
+        assert!(message.contains("room_refno=24383_83477"));
+        assert!(message.contains("room_num=R101"));
+        assert!(message.contains("output/demo/scene_tree/7997.tree"));
+        assert!(message.contains("parse-db"));
+        assert!(message.contains("[ROOM_TREE_INDEX_ROOM_MISSING]"));
     }
 }

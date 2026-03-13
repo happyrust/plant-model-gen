@@ -2,17 +2,8 @@
 //!
 //! 提供管道分支（BRAN）的工程标注数据接口
 
-use aios_core::{
-    RefnoEnum,
-    rs_surreal::pipeline::PipelineQueryService,
-};
-use axum::{
-    Router,
-    extract::Path,
-    response::IntoResponse,
-    routing::get,
-    Json,
-};
+use aios_core::{RefnoEnum, rs_surreal::pipeline::PipelineQueryService};
+use axum::{Json, Router, extract::Path, response::IntoResponse, routing::get};
 use serde::{Deserialize, Serialize};
 
 /// 标注命令类型
@@ -33,10 +24,7 @@ pub enum AnnotationCommand {
         leader_end: Option<[f32; 3]>,
     },
     /// 焊缝符号
-    WeldSymbol {
-        position: [f32; 3],
-        weld_type: u8,
-    },
+    WeldSymbol { position: [f32; 3], weld_type: u8 },
     /// 支吊架符号
     SupportSymbol {
         position: [f32; 3],
@@ -71,14 +59,11 @@ pub struct AnnotationData {
 
 /// 创建管道标注路由
 pub fn create_pipeline_annotation_routes() -> Router {
-    Router::new()
-        .route("/annotation/{refno}", get(get_pipeline_annotation))
+    Router::new().route("/annotation/{refno}", get(get_pipeline_annotation))
 }
 
 /// 获取管道分支的标注数据
-async fn get_pipeline_annotation(
-    Path(refno): Path<String>,
-) -> impl IntoResponse {
+async fn get_pipeline_annotation(Path(refno): Path<String>) -> impl IntoResponse {
     // 解析 refno
     let refno_enum = match refno.parse::<RefnoEnum>() {
         Ok(r) => r,
@@ -104,7 +89,8 @@ async fn get_pipeline_annotation(
     };
 
     // 获取分支名称
-    let name = segments.first()
+    let name = segments
+        .first()
         .and_then(|s| s.attrs.get("NAME"))
         .and_then(|v| {
             if let aios_core::NamedAttrValue::StringType(s) = v {
@@ -189,7 +175,10 @@ async fn get_pipeline_annotation(
 }
 
 /// 判断焊缝类型
-fn determine_weld_type(seg1: &aios_core::rs_surreal::pipeline::PipelineSegmentRecord, seg2: &aios_core::rs_surreal::pipeline::PipelineSegmentRecord) -> u8 {
+fn determine_weld_type(
+    seg1: &aios_core::rs_surreal::pipeline::PipelineSegmentRecord,
+    seg2: &aios_core::rs_surreal::pipeline::PipelineSegmentRecord,
+) -> u8 {
     let noun1 = seg1.noun_raw.as_deref().unwrap_or("");
     let noun2 = seg2.noun_raw.as_deref().unwrap_or("");
 

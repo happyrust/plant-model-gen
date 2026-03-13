@@ -6,9 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use aios_core::RefnoEnum;
 use aios_core::tool::db_tool::db1_hash;
 use aios_core::tree_query::{TreeQueryFilter, TreeQueryOptions};
-use aios_core::RefnoEnum;
 
 use crate::data_interface::db_meta;
 use crate::fast_model::gen_model::tree_index_manager::load_index_with_large_stack;
@@ -75,7 +75,8 @@ pub fn query_descendants_map_by_dbnum(
     let _ = db_meta().ensure_loaded();
 
     // best-effort：单个 refno 缺映射不会导致整个 batch 的 neg_refnos 全部丢失。
-    let (grouped, missing_dbnum) = group_by_dbnum_best_effort(roots, |r| db_meta().get_dbnum_by_refno(r));
+    let (grouped, missing_dbnum) =
+        group_by_dbnum_best_effort(roots, |r| db_meta().get_dbnum_by_refno(r));
 
     let noun_hashes: Option<HashSet<u32>> = if nouns.is_empty() {
         None

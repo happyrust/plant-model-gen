@@ -16,13 +16,10 @@ static INST_RELATE_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 /// 此函数用 `OnceCell` 保证只执行一次。
 pub async fn ensure_surreal_init() -> anyhow::Result<()> {
     SURREAL_INIT
-        .get_or_try_init(|| async {
-            aios_core::init_surreal().await
-        })
+        .get_or_try_init(|| async { aios_core::init_surreal().await })
         .await?;
     Ok(())
 }
-
 
 /// 确保 inst_relate 以“关系表”方式工作：in=pe，out=inst_info。
 pub async fn ensure_inst_relate_relation_schema() {
@@ -35,8 +32,12 @@ pub async fn ensure_inst_relate_relation_schema() {
                 .await;
 
             // TYPE RELATION 会隐式创建 in/out 字段，但默认 TYPE record；这里显式改为更严格的类型。
-            let _ = model_primary_db().query("REMOVE FIELD in ON TABLE inst_relate;").await;
-            let _ = model_primary_db().query("REMOVE FIELD out ON TABLE inst_relate;").await;
+            let _ = model_primary_db()
+                .query("REMOVE FIELD in ON TABLE inst_relate;")
+                .await;
+            let _ = model_primary_db()
+                .query("REMOVE FIELD out ON TABLE inst_relate;")
+                .await;
             let _ = model_primary_db()
                 .query("DEFINE FIELD in ON TABLE inst_relate TYPE record<pe>;")
                 .await;
@@ -96,17 +97,16 @@ pub async fn save_inst_relate_bool(
     let id_key = format!("inst_relate_bool:⟨{}⟩", refno_str);
     // inst_relate_bool.refno 约定为 pe 记录引用（与 surreal_schema.sql 一致）
     let refno_key = format!("pe:⟨{}⟩", refno_str);
-    let mesh_str = mesh_id.map(|m| format!("'{}'", m)).unwrap_or_else(|| "NONE".to_string());
+    let mesh_str = mesh_id
+        .map(|m| format!("'{}'", m))
+        .unwrap_or_else(|| "NONE".to_string());
     let sql = format!(
         "UPSERT {id_key} CONTENT {{ refno: {refno_key}, mesh_id: {mesh_str}, status: '{status}', source: '{source}', updated_at: time::now() }};",
     );
 
     if let Err(e) = aios_core::model_query_response(&sql).await {
         let msg = format!("{sql}\n-- err: {e}");
-        init_save_database_error(
-            &msg,
-            &std::panic::Location::caller().to_string(),
-        );
+        init_save_database_error(&msg, &std::panic::Location::caller().to_string());
         anyhow::bail!("save_inst_relate_bool 失败: refno={refno} err={e}");
     }
     Ok(())
@@ -120,9 +120,8 @@ pub async fn save_inst_relate_cata_bool(
     source: &str,
 ) {
     let refno_key = refno.to_pe_key();
-    let mut sql = format!(
-        "LET $inst_info = (SELECT VALUE out FROM {refno_key}->inst_relate LIMIT 1)[0];"
-    );
+    let mut sql =
+        format!("LET $inst_info = (SELECT VALUE out FROM {refno_key}->inst_relate LIMIT 1)[0];");
 
     // 始终先删除旧记录，保证每个 inst_info 仅保留一条最新状态关系。
     sql.push_str(
@@ -153,16 +152,15 @@ async fn batch_insert_aabb_table(
         return Ok(());
     }
 
-    let keys: Vec<RefnoEnum> = inst_aabb_map
-        .iter()
-        .map(|kv| kv.key().clone())
-        .collect();
+    let keys: Vec<RefnoEnum> = inst_aabb_map.iter().map(|kv| kv.key().clone()).collect();
 
     for chunk in keys.chunks(200) {
         let mut rows = Vec::with_capacity(chunk.len());
 
         for refno in chunk {
-            let Some(aabb_hash) = inst_aabb_map.get(refno) else { continue };
+            let Some(aabb_hash) = inst_aabb_map.get(refno) else {
+                continue;
+            };
             let refno_str = refno.to_string();
             let refno_key = refno.to_pe_key();
             let aabb_key = {
@@ -197,10 +195,7 @@ async fn batch_insert_aabb_table(
 }
 
 /// 批量保存实例 AABB 到普通表 inst_relate_aabb（原始几何 AABB）
-pub async fn save_inst_relate_aabb(
-    inst_aabb_map: &DashMap<RefnoEnum, String>,
-    _source: &str,
-) {
+pub async fn save_inst_relate_aabb(inst_aabb_map: &DashMap<RefnoEnum, String>, _source: &str) {
     if let Err(e) = batch_insert_aabb_table("inst_relate_aabb", inst_aabb_map).await {
         log::error!("save_inst_relate_aabb 失败: {e}");
     }

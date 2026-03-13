@@ -13,8 +13,8 @@
 #[cfg(test)]
 #[cfg(all(feature = "gen_model", not(target_arch = "wasm32")))]
 mod tests {
-    use aios_core::{RefnoEnum, RefU64, project_primary_db, SurrealQueryExt};
     use crate::scene_tree;
+    use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
 
     const TEST_DBNO: i32 = 1112;
 
@@ -55,8 +55,10 @@ mod tests {
                 println!("✓ 查询成功，返回 {} 条记录", statuses.len());
                 for status in statuses {
                     let refno = RefnoEnum::from(RefU64(status.id as u64));
-                    println!("  - {}: has_geo={}, generated={}",
-                        refno, status.has_geo, status.generated);
+                    println!(
+                        "  - {}: has_geo={}, generated={}",
+                        refno, status.has_geo, status.generated
+                    );
                 }
             }
             Err(e) => {

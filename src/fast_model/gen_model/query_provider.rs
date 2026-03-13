@@ -17,7 +17,7 @@
 
 use crate::data_interface::db_meta;
 use crate::fast_model::gen_model::tree_index_manager::{
-    load_index_with_large_stack, TreeIndexManager,
+    TreeIndexManager, load_index_with_large_stack,
 };
 use aios_core::RefnoEnum;
 use aios_core::query_provider::*;
@@ -26,8 +26,8 @@ use aios_core::tree_query::{TreeQueryFilter, TreeQueryOptions};
 use aios_core::types::{NamedAttrMap as NamedAttMap, SPdmsElement as PE};
 use anyhow::Context;
 use once_cell::sync::OnceCell;
-use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// 全局查询提供者实例
 static GLOBAL_PROVIDER: OnceCell<Arc<dyn QueryProvider>> = OnceCell::new();
@@ -54,12 +54,12 @@ async fn init_provider() -> anyhow::Result<Arc<dyn QueryProvider>> {
 
     // 检查 tree 目录是否存在且包含 .tree 文件
     let tree_files_exist = tree_dir.exists() && has_tree_files(&tree_dir);
-    
+
     if !tree_files_exist {
         // tree 目录不存在或为空，自动运行解析生成
         print_tree_index_missing_help(&tree_dir);
         println!("🔄 Tree 索引缺失，正在自动解析 PDMS 数据库生成...");
-        
+
         if let Err(e) = auto_generate_tree_index_by_parse(&tree_dir).await {
             anyhow::bail!(
                 "Tree 索引自动生成失败: {}\n\
@@ -67,14 +67,12 @@ async fn init_provider() -> anyhow::Result<Arc<dyn QueryProvider>> {
                 e
             );
         }
-        
+
         // 再次检查是否生成成功
         if !has_tree_files(&tree_dir) {
-            anyhow::bail!(
-                "Tree 索引生成后仍无 .tree 文件，请检查解析日志"
-            );
+            anyhow::bail!("Tree 索引生成后仍无 .tree 文件，请检查解析日志");
         }
-        
+
         println!("✅ Tree 索引生成完成");
     }
 
@@ -133,38 +131,39 @@ fn print_tree_index_missing_help(tree_dir: &std::path::Path) {
 /// 自动通过解析 PDMS 数据库生成 Tree 索引
 async fn auto_generate_tree_index_by_parse(tree_dir: &std::path::Path) -> anyhow::Result<()> {
     use crate::versioned_db::database::sync_pdms;
-    
+
     // 从 DbOption.toml 加载配置
     let db_option = load_db_option_for_parse()?;
-    
+
     println!("📂 解析项目: {}", db_option.project_name);
     println!("📁 输出目录: {}", tree_dir.display());
-    
+
     // 确保输出目录存在
     std::fs::create_dir_all(tree_dir)?;
-    
+
     // 运行解析
     sync_pdms(&db_option).await?;
-    
+
     Ok(())
 }
 
 /// 加载用于解析的 DbOption 配置
 fn load_db_option_for_parse() -> anyhow::Result<aios_core::options::DbOption> {
     use aios_core::options::DbOption;
-    
+
     // 通过环境变量或默认路径加载配置
-    let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let config_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let config_path = format!("{}.toml", config_name);
     if std::path::Path::new(&config_path).exists() {
         let content = std::fs::read_to_string(&config_path)?;
         let mut db_option: DbOption = toml::from_str(&content)
             .map_err(|e| anyhow::anyhow!("解析 {} 失败: {}", config_path, e))?;
-        
+
         // 设置解析模式参数
         db_option.save_db = Some(false); // 不写入 SurrealDB，仅生成本地文件
-        db_option.total_sync = true;     // 全量解析
-        
+        db_option.total_sync = true; // 全量解析
+
         Ok(db_option)
     } else {
         anyhow::bail!("未找到配置文件 {}", config_path)

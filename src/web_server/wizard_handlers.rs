@@ -424,7 +424,8 @@ pub async fn create_wizard_task(
 fn open_sqlite_projects_table() -> Option<(rusqlite::Connection, String)> {
     use config as cfg;
     let mut builder = cfg::Config::builder();
-    let cfg_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let cfg_file = format!("{}.toml", cfg_name);
     if std::path::Path::new(&cfg_file).exists() {
         builder = builder.add_source(cfg::File::with_name(&cfg_name));
@@ -699,7 +700,8 @@ fn open_deployment_sites_sqlite() -> Result<rusqlite::Connection, Box<dyn std::e
     use config as cfg;
 
     // 尝试从配置文件读取SQLite路径，否则使用默认路径
-    let cfg_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let cfg_file = format!("{}.toml", cfg_name);
     let db_path = if std::path::Path::new(&cfg_file).exists() {
         let builder = cfg::Config::builder()
@@ -947,7 +949,10 @@ pub fn load_wizard_config_by_task_id(task_id: &str) -> Option<DataParsingWizardC
     let mut stmt = conn
         .prepare("SELECT wizard_config_json FROM wizard_tasks WHERE id = ?1")
         .ok()?;
-    let cfg_json: Option<String> = stmt.query_row([task_id], |row: &rusqlite::Row| row.get(0)).ok().flatten();
+    let cfg_json: Option<String> = stmt
+        .query_row([task_id], |row: &rusqlite::Row| row.get(0))
+        .ok()
+        .flatten();
     cfg_json.and_then(|s: String| serde_json::from_str::<DataParsingWizardConfig>(&s).ok())
 }
 

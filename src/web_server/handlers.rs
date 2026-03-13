@@ -7774,7 +7774,8 @@ async fn execute_refno_model_generation(
     // 调用 gen_all_geos_data
     let start_time = Instant::now();
     let mut db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
-    db_option_ext.index_tree_enabled_target_types = config.enabled_nouns.clone().unwrap_or_default();
+    db_option_ext.index_tree_enabled_target_types =
+        config.enabled_nouns.clone().unwrap_or_default();
     db_option_ext.index_tree_excluded_target_types =
         config.excluded_nouns.clone().unwrap_or_default();
     db_option_ext.index_tree_debug_limit_per_target_type = config.debug_limit_per_noun_type;

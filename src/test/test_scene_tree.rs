@@ -14,10 +14,8 @@
 #[cfg(test)]
 #[cfg(all(feature = "gen_model", not(target_arch = "wasm32")))]
 mod tests {
-    use aios_core::{
-        RefnoEnum, RefU64, project_primary_db, SurrealQueryExt,
-    };
     use crate::scene_tree;
+    use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
 
     const TEST_DBNO: i32 = 1112;
 
@@ -58,8 +56,10 @@ mod tests {
                 println!("✓ 查询成功，返回 {} 条记录", statuses.len());
                 for status in statuses {
                     let refno = RefnoEnum::from(RefU64(status.id as u64));
-                    println!("  - {}: has_geo={}, generated={}",
-                        refno, status.has_geo, status.generated);
+                    println!(
+                        "  - {}: has_geo={}, generated={}",
+                        refno, status.has_geo, status.generated
+                    );
                 }
             }
             Err(e) => {
@@ -191,12 +191,11 @@ mod tests {
                 let results: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
                 println!("✓ 查询成功，geo_type 分布:");
                 for row in results {
-                    let geo_type = row.get("geo_type")
+                    let geo_type = row
+                        .get("geo_type")
                         .and_then(|v| v.as_str())
                         .unwrap_or("None");
-                    let cnt = row.get("cnt")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
+                    let cnt = row.get("cnt").and_then(|v| v.as_i64()).unwrap_or(0);
                     println!("  - {}: {}", geo_type, cnt);
                 }
             }
@@ -231,11 +230,15 @@ mod tests {
             TEST_DBNO
         );
 
-        let pos_count: i64 = project_primary_db().query_take(&sql_pos, 0).await
+        let pos_count: i64 = project_primary_db()
+            .query_take(&sql_pos, 0)
+            .await
             .map(|v: Vec<i64>| v.first().copied().unwrap_or(0))
             .unwrap_or(0);
 
-        let neg_count: i64 = project_primary_db().query_take(&sql_neg, 0).await
+        let neg_count: i64 = project_primary_db()
+            .query_take(&sql_neg, 0)
+            .await
             .map(|v: Vec<i64>| v.first().copied().unwrap_or(0))
             .unwrap_or(0);
 

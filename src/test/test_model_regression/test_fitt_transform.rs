@@ -49,11 +49,15 @@ async fn test_fitt_local_mat4_not_identity() {
         match &local_mat {
             Some(mat) => {
                 let pos = mat.w_axis.truncate();
-                println!("FITT {} local translation: [{:.1}, {:.1}, {:.1}]", case.refno, pos.x, pos.y, pos.z);
+                println!(
+                    "FITT {} local translation: [{:.1}, {:.1}, {:.1}]",
+                    case.refno, pos.x, pos.y, pos.z
+                );
                 assert!(
                     pos.length() > 0.01,
                     "FITT {} local_mat 不应为 IDENTITY，translation={:?}",
-                    case.refno, pos
+                    case.refno,
+                    pos
                 );
                 println!("  ✅ local_mat 非 IDENTITY");
             }
@@ -80,8 +84,14 @@ async fn test_fitt_world_position_matches_pdms() {
         .expect("STWALL world_mat 为 None");
 
     let (_, _, stwall_trans) = stwall_world.to_scale_rotation_translation();
-    println!("STWALL world pos: [{:.1}, {:.1}, {:.1}]", stwall_trans.x, stwall_trans.y, stwall_trans.z);
-    println!("STWALL expected:  [{:.1}, {:.1}, {:.1}]", STWALL_WORLD_POS.x, STWALL_WORLD_POS.y, STWALL_WORLD_POS.z);
+    println!(
+        "STWALL world pos: [{:.1}, {:.1}, {:.1}]",
+        stwall_trans.x, stwall_trans.y, stwall_trans.z
+    );
+    println!(
+        "STWALL expected:  [{:.1}, {:.1}, {:.1}]",
+        STWALL_WORLD_POS.x, STWALL_WORLD_POS.y, STWALL_WORLD_POS.z
+    );
 
     const TOLERANCE: f64 = 1.0; // 1mm
 
@@ -100,15 +110,28 @@ async fn test_fitt_world_position_matches_pdms() {
         let diff = (computed_pos - case.world_pos).length();
 
         println!("\nFITT {}", case.refno);
-        println!("  computed: [{:.1}, {:.1}, {:.1}]", trans.x, trans.y, trans.z);
-        println!("  PDMS:     [{:.1}, {:.1}, {:.1}]", case.world_pos.x, case.world_pos.y, case.world_pos.z);
-        println!("  rotation: [{:.4}, {:.4}, {:.4}, {:.4}]", rot.x, rot.y, rot.z, rot.w);
+        println!(
+            "  computed: [{:.1}, {:.1}, {:.1}]",
+            trans.x, trans.y, trans.z
+        );
+        println!(
+            "  PDMS:     [{:.1}, {:.1}, {:.1}]",
+            case.world_pos.x, case.world_pos.y, case.world_pos.z
+        );
+        println!(
+            "  rotation: [{:.4}, {:.4}, {:.4}, {:.4}]",
+            rot.x, rot.y, rot.z, rot.w
+        );
         println!("  diff:     {:.2}mm", diff);
 
         assert!(
             diff < TOLERANCE,
             "FITT {} world position 偏差过大: {:.2}mm (tolerance={:.0}mm)\n  computed: {:?}\n  expected: {:?}",
-            case.refno, diff, TOLERANCE, computed_pos, case.world_pos
+            case.refno,
+            diff,
+            TOLERANCE,
+            computed_pos,
+            case.world_pos
         );
         println!("  ✅ 验证通过");
     }

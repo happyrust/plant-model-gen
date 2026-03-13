@@ -17,8 +17,8 @@ use crate::web_server::{
 // 引入真实实现作为委托
 #[cfg(feature = "sqlite-index")]
 use crate::web_server::handlers as real_handlers;
-use aios_core::project_primary_db;
 use aios_core::get_db_option;
+use aios_core::project_primary_db;
 
 pub async fn get_db_status_list(
     State(_state): State<AppState>,
@@ -139,7 +139,9 @@ pub async fn execute_incremental_update(
     Json(_request): Json<IncrementalUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // sqlite-index feature not enabled
-    Ok(Json(serde_json::json!({"status": "error", "message": "sqlite-index feature not enabled"})))
+    Ok(Json(
+        serde_json::json!({"status": "error", "message": "sqlite-index feature not enabled"}),
+    ))
 }
 
 #[cfg(feature = "sqlite-index")]

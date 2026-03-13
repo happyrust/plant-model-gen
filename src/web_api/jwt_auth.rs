@@ -75,13 +75,11 @@ fn build_config_names(config_path: Option<&str>) -> Vec<String> {
         config_names.push(normalized);
     }
 
-    config_names.extend(
-        [
-            "db_options/DbOption".to_string(),
-            "../db_options/DbOption".to_string(),
-            "DbOption".to_string(),
-        ],
-    );
+    config_names.extend([
+        "db_options/DbOption".to_string(),
+        "../db_options/DbOption".to_string(),
+        "DbOption".to_string(),
+    ]);
 
     config_names
 }
@@ -421,9 +419,8 @@ fn extract_bearer_token<'a>(headers: &'a HeaderMap) -> Option<&'a str> {
 fn resolve_token_claims(
     headers: &HeaderMap,
 ) -> Result<TokenClaims, (StatusCode, Json<serde_json::Value>)> {
-    let token = extract_bearer_token(headers).ok_or_else(|| {
-        unauthorized_error("Missing or invalid Authorization header".to_string())
-    })?;
+    let token = extract_bearer_token(headers)
+        .ok_or_else(|| unauthorized_error("Missing or invalid Authorization header".to_string()))?;
 
     verify_token(token).map_err(|e| {
         warn!("JWT verification failed: {}", e);
@@ -669,8 +666,7 @@ async fn verify_token_handler(Json(request): Json<VerifyRequest>) -> impl IntoRe
                 if claims.form_id != form_id {
                     warn!(
                         "Token verification failed: form_id mismatch, expected={}, actual={}",
-                        form_id,
-                        claims.form_id
+                        form_id, claims.form_id
                     );
                     return (
                         StatusCode::OK,
@@ -940,7 +936,10 @@ mod tests {
 
         assert_eq!(payload.code, 0);
         assert_eq!(payload.data.as_ref().map(|data| data.valid), Some(false));
-        assert_eq!(payload.data.as_ref().and_then(|data| data.error.as_deref()), Some("form_id mismatch"));
+        assert_eq!(
+            payload.data.as_ref().and_then(|data| data.error.as_deref()),
+            Some("form_id mismatch")
+        );
     }
 
     #[tokio::test]
@@ -974,7 +973,13 @@ mod tests {
 
         assert_eq!(payload.code, 0);
         assert_eq!(payload.data.as_ref().map(|data| data.valid), Some(true));
-        assert_eq!(payload.data.as_ref().and_then(|data| data.claims.as_ref()).map(|claims| claims.form_id.as_str()), Some("FORM-EXPECTED"));
+        assert_eq!(
+            payload
+                .data
+                .as_ref()
+                .and_then(|data| data.claims.as_ref())
+                .map(|claims| claims.form_id.as_str()),
+            Some("FORM-EXPECTED")
+        );
     }
-
 }

@@ -110,7 +110,8 @@ pub async fn remote_sync_page() -> Html<String> {
 pub fn open_sqlite() -> Result<rusqlite::Connection, Box<dyn std::error::Error>> {
     use config as cfg;
 
-    let cfg_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let cfg_file = format!("{}.toml", cfg_name);
     let db_path = if std::path::Path::new(&cfg_file).exists() {
         let builder = cfg::Config::builder()
@@ -518,7 +519,8 @@ pub async fn apply_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>
     let location: Option<String> = row.get(4).ok();
     let location_dbs: Option<String> = row.get(5).ok();
 
-    let cfg_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let cfg_file = format!("{}.toml", cfg_name);
     let path = std::path::Path::new(&cfg_file);
     if !path.exists() {

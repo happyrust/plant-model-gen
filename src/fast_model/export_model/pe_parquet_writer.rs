@@ -3,12 +3,12 @@
 //! 将 SPdmsElement 数据写入 Parquet 格式
 //! 文件组织结构：output/database_models/{dbnum}/pe.parquet
 
+use crate::fast_model::export_model::parquet_writer::dmat4_to_f32_array;
+use aios_core::types::SPdmsElement;
 use anyhow::Result;
 use chrono::Utc;
 use polars::prelude::*;
 use std::path::{Path, PathBuf};
-use aios_core::types::SPdmsElement;
-use crate::fast_model::export_model::parquet_writer::dmat4_to_f32_array;
 
 /// PE 行数据
 #[derive(Debug, Clone)]
@@ -58,7 +58,9 @@ impl PeParquetManager {
 
     /// 获取 dbnum 的文件夹路径
     fn get_dbno_dir(&self, dbnum: u32) -> PathBuf {
-        self.base_dir.join("database_models").join(dbnum.to_string())
+        self.base_dir
+            .join("database_models")
+            .join(dbnum.to_string())
     }
 
     /// 获取 PE 主文件路径
@@ -68,7 +70,8 @@ impl PeParquetManager {
 
     /// 获取 PE 增量文件路径
     fn get_pe_incremental_path(&self, dbnum: u32, timestamp: &str) -> PathBuf {
-        self.get_dbno_dir(dbnum).join(format!("pe_{}.parquet", timestamp))
+        self.get_dbno_dir(dbnum)
+            .join(format!("pe_{}.parquet", timestamp))
     }
 
     /// 生成当前时间戳
@@ -97,8 +100,12 @@ impl PeParquetManager {
         let file = std::fs::File::create(&path)?;
         ParquetWriter::new(file).finish(&mut df.clone())?;
 
-        println!("✅ PE 增量 Parquet 写入完成: {} ({} 条记录)", path.display(), df.height());
-        
+        println!(
+            "✅ PE 增量 Parquet 写入完成: {} ({} 条记录)",
+            path.display(),
+            df.height()
+        );
+
         Ok(path)
     }
 
@@ -175,7 +182,7 @@ impl PeParquetManager {
         let unique_df = merged_df.unique::<&[String], &String>(
             Some(&["refno".to_string()]),
             UniqueKeepStrategy::Last,
-            None
+            None,
         )?;
 
         // 写入临时文件
@@ -208,7 +215,7 @@ impl PeParquetManager {
         for entry in std::fs::read_dir(dbno_dir)? {
             let entry = entry?;
             let path = entry.path();
-            
+
             if path.extension().and_then(|s| s.to_str()) != Some("parquet") {
                 continue;
             }
@@ -237,21 +244,19 @@ mod tests {
         let manager = PeParquetManager::new(temp_dir.path());
 
         // 创建测试数据
-        let pes = vec![
-            SPdmsElement {
-                refno: RefnoEnum::from("1112_123456"),
-                owner: RefnoEnum::from("1112_100"),
-                name: "Test PE 1".to_string(),
-                noun: "EQUI".to_string(),
-                dbnum: 1112,
-                sesno: 1,
-                status_code: "OK".to_string(),
-                lock: false,
-                deleted: false,
-                typex: Some(10),
-                ..Default::default()
-            },
-        ];
+        let pes = vec![SPdmsElement {
+            refno: RefnoEnum::from("1112_123456"),
+            owner: RefnoEnum::from("1112_100"),
+            name: "Test PE 1".to_string(),
+            noun: "EQUI".to_string(),
+            dbnum: 1112,
+            sesno: 1,
+            status_code: "OK".to_string(),
+            lock: false,
+            deleted: false,
+            typex: Some(10),
+            ..Default::default()
+        }];
 
         // 写入
         let path = manager.write_incremental(&pes, 1112).unwrap();
@@ -261,7 +266,7 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let df = ParquetReader::new(file).finish().unwrap();
         assert_eq!(df.height(), 1);
-        
+
         let refno_col = df.column("refno").unwrap();
         assert_eq!(refno_col.str().unwrap().get(0).unwrap(), "1112_123456");
     }

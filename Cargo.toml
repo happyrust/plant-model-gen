@@ -171,12 +171,13 @@ default = [
     "gen_model",
     "sqlite-index",
     "manifold",
+    "kv-rocksdb",
     "project_hd",
     "surreal-save",
-    "kv-rocksdb",
     "parquet-export",
     "sqlite-index",
 ]
+
 # Parquet/Polars 数据导出（编译较重，日常开发可不启用）
 parquet-export = [
     "dep:parquet",

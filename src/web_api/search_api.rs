@@ -1,10 +1,4 @@
-use axum::{
-    Router,
-    extract::State,
-    http::StatusCode,
-    response::Json,
-    routing::post,
-};
+use axum::{Router, extract::State, http::StatusCode, response::Json, routing::post};
 use meilisearch_sdk::search::Selectors;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -125,7 +119,11 @@ async fn search_pdms(
     let need_facets = req.facets.unwrap_or(false);
 
     if let Some(meili) = state.meili.as_ref() {
-        let q = if keyword.is_empty() { None } else { Some(keyword.as_str()) };
+        let q = if keyword.is_empty() {
+            None
+        } else {
+            Some(keyword.as_str())
+        };
 
         let mut filters: Vec<String> = Vec::new();
         if let Some(nouns) = req.nouns.as_ref() {
@@ -200,7 +198,11 @@ async fn search_pdms(
     let limit_usize = limit.max(1).min(2000);
     let mut out: Vec<PdmsSearchItem> = Vec::new();
 
-    let keyword_opt = if keyword.is_empty() { None } else { Some(keyword.as_str()) };
+    let keyword_opt = if keyword.is_empty() {
+        None
+    } else {
+        Some(keyword.as_str())
+    };
     if let Some(nouns) = req.nouns.as_ref() {
         for noun in nouns {
             if out.len() >= limit_usize {

@@ -6,14 +6,13 @@
 //! - `/api/pdms/type-info?refno=...`：返回 noun / owner_noun
 //! - `/api/pdms/children?refno=...`：返回 pe->owns 的子节点（按 order_index）
 
-use aios_core::{RefnoEnum, project_primary_db, SurrealQueryExt};
+use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db};
 use axum::{
-    Router,
+    Json, Router,
     extract::Query,
-    http::{HeaderValue, header::CONTENT_TYPE, StatusCode},
+    http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::get,
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;
@@ -134,7 +133,7 @@ async fn get_type_info(Query(query): Query<RefnoQuery>) -> Result<Response, Stat
                 owner_refno: None,
                 owner_noun: None,
                 error_message: Some("pe not found".to_string()),
-            }))
+            }));
         }
         Err(e) => {
             return Ok(json_utf8(TypeInfoResponse {
@@ -144,7 +143,7 @@ async fn get_type_info(Query(query): Query<RefnoQuery>) -> Result<Response, Stat
                 owner_refno: None,
                 owner_noun: None,
                 error_message: Some(format!("db error: {e}")),
-            }))
+            }));
         }
     };
 
@@ -224,7 +223,7 @@ async fn get_children(Query(query): Query<RefnoQuery>) -> Result<Response, Statu
                             refno: refno_key,
                             children: vec![],
                             error_message: Some(format!("db error: {e}")),
-                        }))
+                        }));
                     }
                 };
 
@@ -265,7 +264,7 @@ async fn get_children(Query(query): Query<RefnoQuery>) -> Result<Response, Statu
                 refno: refno_key,
                 children: vec![],
                 error_message: Some(format!("db error: {e}")),
-            }))
+            }));
         }
     };
 

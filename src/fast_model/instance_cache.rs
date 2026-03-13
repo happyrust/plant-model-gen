@@ -6,8 +6,8 @@ use std::path::Path;
 
 use aios_core::RefnoEnum;
 use aios_core::geometry::{EleGeosInfo, EleInstGeosData, ShapeInstancesData};
-use aios_core::parsed_data::TubiInfoData;
 use aios_core::parsed_data::CateAxisParam;
+use aios_core::parsed_data::TubiInfoData;
 
 /// 缓存的实例信息（桩）
 #[derive(Clone, Debug)]
@@ -32,7 +32,9 @@ pub struct InstanceCacheManager {
 
 impl InstanceCacheManager {
     pub async fn new(cache_dir: &Path) -> anyhow::Result<Self> {
-        Ok(Self { _path: cache_dir.to_path_buf() })
+        Ok(Self {
+            _path: cache_dir.to_path_buf(),
+        })
     }
 
     pub fn list_refnos(&self, _dbnum: u32) -> Vec<RefnoEnum> {

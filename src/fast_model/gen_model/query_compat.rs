@@ -14,7 +14,7 @@
 //! ```
 
 use crate::fast_model::gen_model::tree_index_manager::{
-    load_index_with_large_stack, TreeIndexManager,
+    TreeIndexManager, load_index_with_large_stack,
 };
 use crate::fast_model::query_provider;
 use aios_core::RefnoEnum;
@@ -26,10 +26,18 @@ use once_cell::sync::Lazy;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-static VISIBLE_GEO_NOUN_HASHES: Lazy<HashSet<u32>> =
-    Lazy::new(|| VISBILE_GEO_NOUNS.iter().map(|&name| db1_hash(name)).collect());
-static NEG_GEO_NOUN_HASHES: Lazy<HashSet<u32>> =
-    Lazy::new(|| TOTAL_NEG_NOUN_NAMES.iter().map(|&name| db1_hash(name)).collect());
+static VISIBLE_GEO_NOUN_HASHES: Lazy<HashSet<u32>> = Lazy::new(|| {
+    VISBILE_GEO_NOUNS
+        .iter()
+        .map(|&name| db1_hash(name))
+        .collect()
+});
+static NEG_GEO_NOUN_HASHES: Lazy<HashSet<u32>> = Lazy::new(|| {
+    TOTAL_NEG_NOUN_NAMES
+        .iter()
+        .map(|&name| db1_hash(name))
+        .collect()
+});
 static BRAN_HASH: Lazy<u32> = Lazy::new(|| db1_hash("BRAN"));
 static HANG_HASH: Lazy<u32> = Lazy::new(|| db1_hash("HANG"));
 
@@ -81,9 +89,7 @@ async fn query_descendants_bfs(
         },
         prune_on_match: false,
     };
-    let descendants = index
-        .query_descendants_bfs(refno.refno(), options)
-        .await?;
+    let descendants = index.query_descendants_bfs(refno.refno(), options).await?;
     Ok(descendants.into_iter().map(RefnoEnum::from).collect())
 }
 

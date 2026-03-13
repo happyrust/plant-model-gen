@@ -2,14 +2,14 @@
 //
 // 从旧 gen_model.rs 迁移的辅助函数
 
-use crate::fast_model::resolve_desi_comp;
 use super::tree_index_manager::TreeIndexManager;
-use aios_core::pdms_types::CataHashRefnoKV;
+use crate::fast_model::resolve_desi_comp;
 use aios_core::parsed_data::geo_params_data::CateGeoParam::{BoxImplied, TubeImplied};
+use aios_core::pdms_types::CataHashRefnoKV;
 use aios_core::prim_geo::tubing::TubiSize;
 use aios_core::tool::db_tool::db1_hash;
 use aios_core::tree_query::{TreeIndex, TreeQuery, TreeQueryFilter};
-use aios_core::{RefnoEnum, RefU64};
+use aios_core::{RefU64, RefnoEnum};
 use anyhow::Result;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
@@ -143,7 +143,9 @@ async fn build_cata_hash_map_from_tree_index(
                 insert_cata_hash_refno(&result_map, &meta);
             }
         }
-        let children = index.query_children(root, TreeQueryFilter::default()).await?;
+        let children = index
+            .query_children(root, TreeQueryFilter::default())
+            .await?;
         for child in children {
             if !visited.insert(child) {
                 continue;
@@ -228,9 +230,9 @@ pub async fn build_cata_hash_map_from_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aios_core::RefU64;
     use aios_core::tool::db_tool::db1_hash;
     use aios_core::tree_query::{TreeFile, TreeIndex, TreeNodeMeta};
-    use aios_core::RefU64;
     use indextree::Arena;
 
     #[tokio::test]

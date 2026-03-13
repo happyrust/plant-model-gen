@@ -47,7 +47,8 @@ impl SqliteSpatialIndex {
 
     pub fn with_default_path() -> anyhow::Result<Self> {
         let path = Self::default_path();
-        let idx = SqliteAabbIndex::open(&path).with_context(|| format!("open sqlite index: {path:?}"))?;
+        let idx =
+            SqliteAabbIndex::open(&path).with_context(|| format!("open sqlite index: {path:?}"))?;
         idx.init_schema().context("init sqlite index schema")?;
         Ok(Self { inner: idx })
     }

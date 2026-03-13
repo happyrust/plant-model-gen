@@ -7,20 +7,22 @@
 
 use crate::fast_model::gen_model::cate_single::{CateCsgShapeMap, gen_cata_single_geoms};
 use crate::fast_model::gen_model::utilities::is_valid_cata_hash;
-use crate::fast_model::model_cache::cata_resolve_cache::{CataResolvedComp, PreparedInstGeo};
 use crate::fast_model::instance_cache::InstanceCacheManager;
+use crate::fast_model::model_cache::cata_resolve_cache::{CataResolvedComp, PreparedInstGeo};
 use crate::fast_model::refno_errors::{RefnoErrorKind, RefnoErrorStage, record_refno_error};
 use crate::fast_model::{SEND_INST_SIZE, shared};
 use crate::fast_model::{debug_model, debug_model_debug};
 use crate::options::DbOptionExt;
+use aios_core::RefnoEnum;
+use aios_core::Transform;
+use aios_core::geometry::{
+    EleGeosInfo, EleInstGeo, EleInstGeosData, GeoBasicType, ShapeInstancesData,
+};
 use aios_core::parsed_data::CateAxisParam;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
-use aios_core::pe::SPdmsElement;
 use aios_core::pdms_types::CataHashRefnoKV;
-use aios_core::geometry::{EleGeosInfo, EleInstGeo, EleInstGeosData, GeoBasicType, ShapeInstancesData};
-use aios_core::RefnoEnum;
+use aios_core::pe::SPdmsElement;
 use aios_core::prim_geo::category::CateCsgShape;
-use aios_core::Transform;
 use chrono::Utc;
 use dashmap::DashMap;
 use glam::Vec3;
@@ -106,7 +108,11 @@ fn build_prepared_inst_geos_from_shapes(shapes: Vec<CateCsgShape>) -> (Vec<Prepa
         }
 
         // 统一处理 transform.scale
-        crate::fast_model::reuse_unit::normalize_transform_scale(&mut transform, unit_flag, geo_hash);
+        crate::fast_model::reuse_unit::normalize_transform_scale(
+            &mut transform,
+            unit_flag,
+            geo_hash,
+        );
 
         let geo_type = if is_ngmr {
             GeoBasicType::CataCrossNeg
@@ -263,13 +269,10 @@ pub async fn gen_cata_geos_for_cache(
 
             #[cfg(feature = "profile")]
             let t_query_single = Instant::now();
-            let gmse_refno = aios_core::query_single_by_paths(
-                cata_refno,
-                &["->GMRE", "->GSTR"],
-                &["REFNO"],
-            )
-            .await
-            .map(|x| x.get_refno_or_default());
+            let gmse_refno =
+                aios_core::query_single_by_paths(cata_refno, &["->GMRE", "->GSTR"], &["REFNO"])
+                    .await
+                    .map(|x| x.get_refno_or_default());
             #[cfg(feature = "profile")]
             let dt_query_single = t_query_single.elapsed().as_millis() as u64;
 
@@ -312,8 +315,12 @@ pub async fn gen_cata_geos_for_cache(
             {
                 *time_stats.entry("get_cat_refno".to_string()).or_insert(0) += dt_cat_refno;
                 *time_stats.entry("query_single".to_string()).or_insert(0) += dt_query_single;
-                *time_stats.entry("get_named_attmap".to_string()).or_insert(0) += dt_attmap;
-                *time_stats.entry("gen_single_geoms".to_string()).or_insert(0) += dt_gen;
+                *time_stats
+                    .entry("get_named_attmap".to_string())
+                    .or_insert(0) += dt_attmap;
+                *time_stats
+                    .entry("gen_single_geoms".to_string())
+                    .or_insert(0) += dt_gen;
             }
 
             let ptset_map: BTreeMap<i32, CateAxisParam> = design_axis_map
@@ -366,8 +373,7 @@ pub async fn gen_cata_geos_for_cache(
                 };
                 let type_name = ele_att.get_type_str().to_string();
 
-                let (owner_refno, owner_type) =
-                    shared::get_owner_info_from_attr(&ele_att).await;
+                let (owner_refno, owner_type) = shared::get_owner_info_from_attr(&ele_att).await;
                 let cata_hash_for_info = if is_valid_cata_hash(&cata_hash) {
                     Some(cata_hash.clone())
                 } else {
@@ -451,10 +457,7 @@ pub async fn gen_bran_geos_for_cache(
     let total_time_stats = Arc::new(Mutex::new(HashMap::new()));
 
     let bran_count = branch_map.len();
-    debug_model_debug!(
-        "[gen_bran_geos_for_cache] start: bran_count={}",
-        bran_count
-    );
+    debug_model_debug!("[gen_bran_geos_for_cache] start: bran_count={}", bran_count);
 
     if branch_map.is_empty() {
         return Ok(SimpleBranOutcome {
@@ -505,7 +508,9 @@ pub async fn gen_bran_geos_for_cache(
             }
         };
         #[cfg(feature = "profile")]
-        { db_time_get_branch_att += t_get_branch_att.elapsed().as_millis(); }
+        {
+            db_time_get_branch_att += t_get_branch_att.elapsed().as_millis();
+        }
 
         // 获取 world_transform
         #[cfg(feature = "profile")]
@@ -548,7 +553,9 @@ pub async fn gen_bran_geos_for_cache(
                 }
             };
         #[cfg(feature = "profile")]
-        { db_time_get_branch_transform += t_get_branch_transform.elapsed().as_millis(); }
+        {
+            db_time_get_branch_transform += t_get_branch_transform.elapsed().as_millis();
+        }
 
         // 处理 BRAN/HANG 本身的几何信息
         let (owner_refno, owner_type) = shared::get_owner_info_from_attr(&branch_att).await;
@@ -577,7 +584,9 @@ pub async fn gen_bran_geos_for_cache(
                 Err(_) => continue,
             };
             #[cfg(feature = "profile")]
-            { db_time_get_children_att += t_get_child_att.elapsed().as_millis(); }
+            {
+                db_time_get_children_att += t_get_child_att.elapsed().as_millis();
+            }
 
             let (child_owner_refno, child_owner_type) =
                 shared::get_owner_info_from_attr(&child_att).await;
@@ -608,8 +617,7 @@ pub async fn gen_bran_geos_for_cache(
     #[cfg(feature = "profile")]
     {
         let mut stats = total_time_stats.lock().await;
-        *stats.entry("get_branch_att".to_string()).or_insert(0) +=
-            db_time_get_branch_att as u64;
+        *stats.entry("get_branch_att".to_string()).or_insert(0) += db_time_get_branch_att as u64;
         *stats.entry("get_branch_transform".to_string()).or_insert(0) +=
             db_time_get_branch_transform as u64;
         *stats.entry("get_children_att".to_string()).or_insert(0) +=
@@ -749,5 +757,3 @@ pub async fn gen_tubi_for_cache_with_cache_manager(
 
     Ok(outcome)
 }
-
-

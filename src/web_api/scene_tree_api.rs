@@ -2,14 +2,14 @@
 //!
 //! 提供场景树初始化和查询的 HTTP 接口
 
+use aios_core::{RefU64, RefnoEnum};
 use axum::{
     Router,
-    extract::{Path, Query, Json as AxumJson},
+    extract::{Json as AxumJson, Path, Query},
     http::StatusCode,
     response::Json,
     routing::{get, post},
 };
-use aios_core::{RefU64, RefnoEnum};
 use serde::{Deserialize, Serialize};
 
 use crate::scene_tree;
@@ -88,7 +88,10 @@ pub struct AncestorsResponse {
 pub fn create_scene_tree_routes() -> Router {
     Router::new()
         .route("/api/scene-tree/init", post(init_scene_tree))
-        .route("/api/scene-tree/init/{dbnum}", post(init_scene_tree_by_dbno))
+        .route(
+            "/api/scene-tree/init/{dbnum}",
+            post(init_scene_tree_by_dbno),
+        )
         .route(
             "/api/scene-tree/init-by-root/{refno}",
             post(init_scene_tree_by_root),
@@ -191,9 +194,7 @@ async fn init_scene_tree_by_root(
 }
 
 /// 查询节点下所有未生成的几何叶子节点
-async fn get_leaves(
-    Path(refno): Path<String>,
-) -> Result<Json<LeavesResponse>, StatusCode> {
+async fn get_leaves(Path(refno): Path<String>) -> Result<Json<LeavesResponse>, StatusCode> {
     // 解析 refno 为 u64
     let root_id = match parse_refno_to_u64(&refno) {
         Some(id) => id as i64,
@@ -328,9 +329,7 @@ async fn get_ancestors(
 /// - `ref0_ref1`（例如 `24381_145018`）
 /// - `ref0/ref1`（例如 `24381/145018`）
 fn parse_refno_to_u64(refno: &str) -> Option<u64> {
-    let (ref0_str, ref1_str) = refno
-        .split_once('_')
-        .or_else(|| refno.split_once('/'))?;
+    let (ref0_str, ref1_str) = refno.split_once('_').or_else(|| refno.split_once('/'))?;
     let ref0: u64 = ref0_str.parse().ok()?;
     let ref1: u64 = ref1_str.parse().ok()?;
     Some((ref0 << 32) | ref1)

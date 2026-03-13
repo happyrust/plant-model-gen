@@ -20,7 +20,7 @@ pub enum TaskType {
     SpatialTreeGeneration,
     FullSync,
     IncrementalSync,
-    ModelExport,  // 新增：模型导出任务
+    ModelExport, // 新增：模型导出任务
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +91,7 @@ pub struct TaskParameters {
     #[serde(rename = "meshTolRatio")]
     pub mesh_tol_ratio: Option<f64>,
     #[serde(rename = "exportWebBundle")]
-    pub export_web_bundle: Option<bool>,  // 导出 Web 数据包
+    pub export_web_bundle: Option<bool>, // 导出 Web 数据包
 
     // 同步任务参数
     #[serde(rename = "syncMode")]
@@ -245,7 +245,9 @@ pub async fn create_task(
 
         tokio::spawn(async move {
             if let Some(refno_str) = refno {
-                if let Err(e) = execute_model_export(&task_id_clone, &refno_str, regen_model, export_obj).await {
+                if let Err(e) =
+                    execute_model_export(&task_id_clone, &refno_str, regen_model, export_obj).await
+                {
                     eprintln!("导出任务 {} 执行失败: {}", task_id_clone, e);
                 }
             } else {
@@ -420,11 +422,14 @@ async fn execute_model_export(
     regen_model: bool,
     export_obj: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::process::Command;
     use std::path::PathBuf;
+    use std::process::Command;
 
     println!("🚀 开始执行导出任务 {}", task_id);
-    println!("   参数: refno={}, regen_model={}, export_obj={}", refno, regen_model, export_obj);
+    println!(
+        "   参数: refno={}, regen_model={}, export_obj={}",
+        refno, regen_model, export_obj
+    );
 
     // 构建命令
     let mut cmd = Command::new("cargo");
@@ -449,16 +454,17 @@ async fn execute_model_export(
 
     if output.status.success() {
         println!("✅ 导出任务 {} 执行成功", task_id);
-        
+
         // 查找生成的文件
         let output_dir = PathBuf::from("output");
         if let Ok(entries) = std::fs::read_dir(&output_dir) {
             for entry in entries.flatten() {
                 let file_name = entry.file_name();
                 let file_name_str = file_name.to_string_lossy();
-                
+
                 // 查找包含 refno 的 .obj 文件
-                if file_name_str.contains(&refno.replace('_', "/")) || file_name_str.contains(refno) {
+                if file_name_str.contains(&refno.replace('_', "/")) || file_name_str.contains(refno)
+                {
                     if file_name_str.ends_with(".obj") {
                         println!("📁 找到导出文件: {}", file_name_str);
                         // 将文件路径记录到任务信息中
@@ -481,7 +487,7 @@ async fn execute_model_export(
 pub async fn download_task_export(
     axum::extract::Path(task_id): axum::extract::Path<String>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    use axum::http::{header, HeaderValue};
+    use axum::http::{HeaderValue, header};
     use axum::response::Response;
     use std::path::PathBuf;
     use tokio::fs::File;
@@ -491,23 +497,20 @@ pub async fn download_task_export(
 
     // 查找导出文件（简化实现：直接在 output 目录查找）
     let output_dir = PathBuf::from("output");
-    
+
     if !output_dir.exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "输出目录不存在".to_string(),
-        ));
+        return Err((StatusCode::NOT_FOUND, "输出目录不存在".to_string()));
     }
 
     // 查找与 task_id 相关的 .obj 文件
     // TODO: 应该从数据库中获取任务记录的文件路径
     let mut found_file: Option<PathBuf> = None;
-    
+
     if let Ok(entries) = std::fs::read_dir(&output_dir) {
         for entry in entries.flatten() {
             let file_name = entry.file_name();
             let file_name_str = file_name.to_string_lossy();
-            
+
             // 临时实现：查找最新的 .obj 文件
             // 更好的实现应该在任务记录中存储文件路径
             if file_name_str.ends_with(".obj") {
@@ -526,15 +529,21 @@ pub async fn download_task_export(
     let file_name = file_path
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "无效的文件名".to_string()))?
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "无效的文件名".to_string(),
+        ))?
         .to_string(); // 转换为拥有的 String
 
     println!("✅ 开始下载文件: {}", file_name);
 
     // 打开文件
-    let file = File::open(&file_path)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("打开文件失败: {}", e)))?;
+    let file = File::open(&file_path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("打开文件失败: {}", e),
+        )
+    })?;
 
     // 创建流式响应
     let stream = ReaderStream::new(file);
@@ -546,7 +555,12 @@ pub async fn download_task_export(
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_DISPOSITION, content_disposition)
         .body(body)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("构建响应失败: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("构建响应失败: {}", e),
+            )
+        })?;
 
     Ok(response)
 }

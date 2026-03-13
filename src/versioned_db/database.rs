@@ -1,6 +1,6 @@
 #[cfg(feature = "surreal-save")]
 use aios_core::project_primary_db;
-use log::{info, warn, error, debug};
+use log::{debug, error, info, warn};
 
 // 内存KV数据库全局连接（从 aios_core 导入）
 #[cfg(feature = "mem-kv-save")]
@@ -36,8 +36,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
 use std::io::Read;
-use std::ops::Range;
 use std::mem::take;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -53,9 +53,9 @@ use crate::consts::*;
 use crate::data_interface::tidb_manager::AiosDBManager;
 // use crate::graph_db::pdms_arango::*;
 use crate::tables::*;
-use crate::versioned_db::pe::*;
 use crate::versioned_db::db_meta_info;
-use crate::versioned_db::tree_export::{export_tree_file, TreeNodeMeta};
+use crate::versioned_db::pe::*;
+use crate::versioned_db::tree_export::{TreeNodeMeta, export_tree_file};
 
 pub enum SenderJsonsData {
     PEJson(Vec<String>),
@@ -67,9 +67,16 @@ pub enum SenderJsonsData {
     // 新增：用于更新dbnum_info_table
     DbnumInfoUpdate(Vec<String>),
     // 新增：用于按db_num分表保存简化的PE数据 (table_name, sql)
-    PartitionedPEJson { table_name: String, sql: String },
+    PartitionedPEJson {
+        table_name: String,
+        sql: String,
+    },
     // 新增：用于 PE Parquet 导出
-    PeParquetData { project_name: String, dbnum: u32, elements: Vec<aios_core::types::SPdmsElement> },
+    PeParquetData {
+        project_name: String,
+        dbnum: u32,
+        elements: Vec<aios_core::types::SPdmsElement>,
+    },
     // Kuzu 数据: Vec<(PE, NamedAttrMap)>
 }
 
@@ -746,8 +753,10 @@ where
                                 let sql = format!("INSERT IGNORE INTO pe [{}]", pes.join(","));
 
                                 // 保存到主数据库
-                                let mut response =
-                                    project_primary_db().query(&sql).await.expect("insert pes failed");
+                                let mut response = project_primary_db()
+                                    .query(&sql)
+                                    .await
+                                    .expect("insert pes failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -774,7 +783,10 @@ where
                                 );
 
                                 // 保存到主数据库
-                                project_primary_db().query(&sql).await.expect("insert pe_owner failed");
+                                project_primary_db()
+                                    .query(&sql)
+                                    .await
+                                    .expect("insert pe_owner failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -802,7 +814,10 @@ where
                                 );
 
                                 // 保存到主数据库
-                                project_primary_db().query(&sql).await.expect("insert ele_reuse_relate failed");
+                                project_primary_db()
+                                    .query(&sql)
+                                    .await
+                                    .expect("insert ele_reuse_relate failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -810,7 +825,10 @@ where
                                     match SUL_MEM_DB.query(&sql).await {
                                         Ok(_) => {}
                                         Err(e) => {
-                                            log::warn!("保存ele_reuse_relate到内存KV数据库失败: {}", e);
+                                            log::warn!(
+                                                "保存ele_reuse_relate到内存KV数据库失败: {}",
+                                                e
+                                            );
                                         }
                                     }
                                 }
@@ -828,7 +846,10 @@ where
                                     type_name,
                                     jsons.join(",")
                                 );
-                                project_primary_db().query(sql).await.expect("insert att failed");
+                                project_primary_db()
+                                    .query(sql)
+                                    .await
+                                    .expect("insert att failed");
                             }
                         }
                         #[cfg(not(feature = "surreal-save"))]
@@ -838,7 +859,10 @@ where
                         #[cfg(feature = "surreal-save")]
                         SenderJsonsData::DbnumInfoUpdate(sqls) => {
                             for sql in sqls {
-                                project_primary_db().query(sql).await.expect("update dbnum_info failed");
+                                project_primary_db()
+                                    .query(sql)
+                                    .await
+                                    .expect("update dbnum_info failed");
                             }
                         }
                         #[cfg(not(feature = "surreal-save"))]
@@ -1076,14 +1100,21 @@ where
                 }
             } else {
                 // open 失败时仍允许继续解析（Meili/Tree 生成不依赖 session 信息）
-                warn!("PdmsIO::open failed(file={}): continue without ses range map", file_name);
+                warn!(
+                    "PdmsIO::open failed(file={}): continue without ses range map",
+                    file_name
+                );
             }
         }
 
         let project_name = project.as_str().to_string();
         let mut db_basic =
             parse_file_db_basic_data(&path, &file_name, project_name.as_str()).unwrap_or_default();
-        let all_refnos: Vec<_> = db_basic.refno_table_map.iter().map(|entry| *entry.key()).collect();
+        let all_refnos: Vec<_> = db_basic
+            .refno_table_map
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
         let total_chunks = std::cmp::max(1, (all_refnos.len() + chunk_size - 1) / chunk_size);
 
         let db_basic = Arc::new(db_basic);
@@ -1203,15 +1234,19 @@ where
                                             uda_json_vec,
                                         )))
                                         .expect("send attmap sql failed");
-                }
-            }
-        }
+                                }
+                            }
+                        }
 
-        if let Err(e) =
-            export_tree_file(dbnum, db_basic.as_ref(), &tree_nodes, &db_basic.children_map, &db_meta_info::get_project_tree_dir(&project_name))
-        {
-            warn!("[tree_export] dbnum={} 导出失败: {}", dbnum, e);
-        }
+                        if let Err(e) = export_tree_file(
+                            dbnum,
+                            db_basic.as_ref(),
+                            &tree_nodes,
+                            &db_basic.children_map,
+                            &db_meta_info::get_project_tree_dir(&project_name),
+                        ) {
+                            warn!("[tree_export] dbnum={} 导出失败: {}", dbnum, e);
+                        }
                     }
                 }
                 Err(e) => {
@@ -1353,8 +1388,10 @@ pub async fn sync_total_async_threaded(
                                 let sql = format!("INSERT IGNORE INTO pe [{}]", pes.join(","));
 
                                 // 保存到主数据库
-                                let mut response =
-                                    project_primary_db().query(&sql).await.expect("insert pes failed");
+                                let mut response = project_primary_db()
+                                    .query(&sql)
+                                    .await
+                                    .expect("insert pes failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -1381,7 +1418,10 @@ pub async fn sync_total_async_threaded(
                                 );
 
                                 // 保存到主数据库
-                                project_primary_db().query(&sql).await.expect("insert pe_owner failed");
+                                project_primary_db()
+                                    .query(&sql)
+                                    .await
+                                    .expect("insert pe_owner failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -1409,7 +1449,10 @@ pub async fn sync_total_async_threaded(
                                 );
 
                                 // 保存到主数据库
-                                project_primary_db().query(&sql).await.expect("insert ele_reuse_relate failed");
+                                project_primary_db()
+                                    .query(&sql)
+                                    .await
+                                    .expect("insert ele_reuse_relate failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -1417,7 +1460,10 @@ pub async fn sync_total_async_threaded(
                                     match SUL_MEM_DB.query(&sql).await {
                                         Ok(_) => {}
                                         Err(e) => {
-                                            log::warn!("保存ele_reuse_relate到内存KV数据库失败: {}", e);
+                                            log::warn!(
+                                                "保存ele_reuse_relate到内存KV数据库失败: {}",
+                                                e
+                                            );
                                         }
                                     }
                                 }
@@ -1434,7 +1480,10 @@ pub async fn sync_total_async_threaded(
                                     format!("INSERT IGNORE INTO {} [{}]", table, atts.join(","));
 
                                 // 保存到主数据库
-                                project_primary_db().query(&sql).await.expect("insert atts failed");
+                                project_primary_db()
+                                    .query(&sql)
+                                    .await
+                                    .expect("insert atts failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -2152,7 +2201,8 @@ pub async fn parse_single_db_file(
     let chunk_size = resolve_single_indextree_chunk_size(db_option);
     let chunk_concurrency = resolve_indextree_chunk_concurrency(false);
     let path = PathBuf::from(file_path);
-    let file_name = path.file_name()
+    let file_name = path
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_string();
@@ -2163,7 +2213,7 @@ pub async fn parse_single_db_file(
     let db_type = {
         let mut file = std::fs::File::open(&path)?;
         let mut buf = [0u8; 60];
-        file.read(&mut buf)?;
+        file.read_exact(&mut buf)?;
         parse_file_basic_info(&buf).db_type
     };
 
@@ -2177,7 +2227,11 @@ pub async fn parse_single_db_file(
     };
     let db_basic_parse_ms = db_basic_stage_start.elapsed().as_millis();
 
-    let all_refnos: Vec<_> = db_basic.refno_table_map.iter().map(|entry| *entry.key()).collect();
+    let all_refnos: Vec<_> = db_basic
+        .refno_table_map
+        .iter()
+        .map(|entry| *entry.key())
+        .collect();
     if all_refnos.is_empty() {
         anyhow::bail!("文件 {} 中没有找到任何 refno", file_name);
     }
@@ -2203,8 +2257,8 @@ pub async fn parse_single_db_file(
         .map(|(chunk_index, chunk)| (chunk_index, chunk.to_vec()))
         .collect();
 
-    let mut chunk_stream = futures::stream::iter(
-        chunk_jobs.into_iter().map(|(chunk_index, chunk_refnos)| {
+    let mut chunk_stream =
+        futures::stream::iter(chunk_jobs.into_iter().map(|(chunk_index, chunk_refnos)| {
             let db_basic_clone = db_basic.clone();
             let file_name_clone = file_name.clone();
             let ses_range_map_clone = ses_range_map.clone();
@@ -2220,9 +2274,8 @@ pub async fn parse_single_db_file(
                 .await;
                 (chunk_index, result)
             }
-        }),
-    )
-    .buffer_unordered(chunk_concurrency);
+        }))
+        .buffer_unordered(chunk_concurrency);
 
     while let Some((chunk_index, parse_result)) = chunk_stream.next().await {
         match parse_result {
@@ -2271,10 +2324,7 @@ pub async fn parse_single_db_file(
 
     // 收集 ref0s 并更新 db_meta_info.json
     let db_meta_stage_start = Instant::now();
-    let ref0s: std::collections::BTreeSet<u32> = tree_nodes
-        .keys()
-        .map(|r| r.get_0())
-        .collect();
+    let ref0s: std::collections::BTreeSet<u32> = tree_nodes.keys().map(|r| r.get_0()).collect();
 
     let file_path_buf = PathBuf::from(file_path);
 

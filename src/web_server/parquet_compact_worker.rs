@@ -86,10 +86,7 @@ async fn scan_and_compact(config: &CompactWorkerConfig) -> anyhow::Result<()> {
                 Ok(files) => {
                     // 计算增量文件数量（排除主文件）
                     let main_file_name = "instances.parquet".to_string();
-                    let incremental_count = files
-                        .iter()
-                        .filter(|f| *f != &main_file_name)
-                        .count();
+                    let incremental_count = files.iter().filter(|f| *f != &main_file_name).count();
 
                     if incremental_count < min_count {
                         return Ok(());
@@ -133,7 +130,7 @@ mod tests {
     fn test_config_default() {
         let config = CompactWorkerConfig::default();
         assert_eq!(config.scan_interval_secs, 30);
-        assert_eq!(config.min_incremental_count, 1);
+        assert_eq!(config.min_incremental_count, 50);
         assert_eq!(config.output_dir, "output");
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! 将 scene_node 数据导出为 Parquet 文件，供前端直接加载使用。
 
-use aios_core::{project_primary_db, SurrealQueryExt};
+use aios_core::{SurrealQueryExt, project_primary_db};
 use anyhow::Result;
 use polars::prelude::*;
 use serde::Deserialize;

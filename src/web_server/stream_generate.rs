@@ -2,7 +2,7 @@
 //!
 //! 实现增量模型生成 API，通过 SSE 推送生成进度。
 
-use aios_core::{RefU64, RefnoEnum, project_primary_db, SurrealQueryExt};
+use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
 use axum::{
     extract::{Json, Path, Query, State},
     response::sse::{Event, KeepAlive, Sse},
@@ -78,7 +78,11 @@ fn default_max_depth() -> u32 {
 
 /// SSE 事件类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum StreamGenerateEvent {
     /// 开始处理
     Started {
@@ -122,18 +126,11 @@ pub enum StreamGenerateEvent {
         duration_ms: u64,
     },
     /// 导出 instances 开始
-    ExportInstancesStarted {
-        message: String,
-    },
+    ExportInstancesStarted { message: String },
     /// 导出 instances 完成
-    ExportInstancesFinished {
-        dbnos: Vec<u32>,
-        duration_ms: u64,
-    },
+    ExportInstancesFinished { dbnos: Vec<u32>, duration_ms: u64 },
     /// 错误
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 // ============================================================================
@@ -244,7 +241,10 @@ async fn filter_geo_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum
             .join(",");
 
         let sql = format!("SELECT id as refno, noun FROM [{id_list}]");
-        let rows: Vec<PeNounRow> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+        let rows: Vec<PeNounRow> = project_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .unwrap_or_default();
         for row in rows {
             if row.noun.is_empty() {
                 continue;
@@ -268,15 +268,15 @@ struct PeNounRow {
 /// 检查哪些 refno 还没有生成模型
 ///
 /// 通过查询 inst_relate 表判断
-pub async fn filter_missing_inst_relate(
-    refnos: &[RefnoEnum],
-) -> anyhow::Result<Vec<RefnoEnum>> {
+pub async fn filter_missing_inst_relate(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
     if refnos.is_empty() {
         return Ok(Vec::new());
     }
 
     // 使用 aios_core 的 query_insts 检查哪些已经有数据
-    let existing = aios_core::query_insts(refnos, false).await.unwrap_or_default();
+    let existing = aios_core::query_insts(refnos, false)
+        .await
+        .unwrap_or_default();
     let existing_set: std::collections::HashSet<RefnoEnum> =
         existing.into_iter().map(|inst| inst.refno).collect();
 

@@ -1480,6 +1480,489 @@ pub fn render_database_connection_page() -> String {
     "##.to_string()
 }
 
+pub fn render_embed_url_tester_page() -> String {
+    let content = r##"
+        <section class="embed-tester-shell">
+            <div class="embed-hero">
+                <div>
+                    <div class="embed-eyebrow">Local review integration check</div>
+                    <h1>Embed URL tester</h1>
+                    <p>
+                        Generate a review embed URL from the local API, inspect the final link, and
+                        open it in a new tab when it looks right.
+                    </p>
+                </div>
+                <div class="embed-hero-badge">
+                    <span class="embed-hero-dot"></span>
+                    <span>Target: <code>/api/review/embed-url</code></span>
+                </div>
+            </div>
+
+            <div class="embed-grid">
+                <section class="embed-panel embed-panel-form">
+                    <div class="embed-panel-header">
+                        <h2>Request payload</h2>
+                        <p>Prefilled with the provided sample values. Edit <code>project_id</code> to test project switching.</p>
+                    </div>
+
+                    <form id="embed-form" class="embed-form">
+                        <label class="embed-field">
+                            <span>project_id</span>
+                            <input id="project-id" name="project_id" type="text" value="AvevaMarineSample" autocomplete="off" required>
+                        </label>
+
+                        <div class="embed-row-two">
+                            <label class="embed-field">
+                                <span>user_id</span>
+                                <input id="user-id" name="user_id" type="text" value="SJ" autocomplete="off" required>
+                            </label>
+                            <label class="embed-field">
+                                <span>form_id (optional)</span>
+                                <input id="form-id" name="form_id" type="text" placeholder="Leave empty to let the API create one" autocomplete="off">
+                            </label>
+                        </div>
+
+                        <label class="embed-field">
+                            <span>token</span>
+                            <textarea id="token" name="token" rows="5" spellcheck="false">eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJwcm9qZWN0X2lkIjoiQXZldmFNYXJpbmVTYW1wbGUiLCJ1c2VyX2lkIjoiU0oiLCJmb3JtX2lkIjoiRk9STS05QTcxMkE0ODA0NzAiLCJyb2xlIjoic2oiLCJleHAiOjE3NzMyODM5MzEsImlhdCI6MTc3MzE5NzUzMX0.a3CZcd7W-zUBw4zCjndFRNRzh7qYuuCPQqhq-ISlKGs</textarea>
+                        </label>
+
+                        <label class="embed-field">
+                            <span>extra_parameters</span>
+                            <textarea id="extra-parameters" name="extra_parameters" rows="4" spellcheck="false">{}</textarea>
+                            <small>The page accepts the UI value as <code>extra_params</code> input but sends <code>extra_parameters</code> to Rust.</small>
+                        </label>
+
+                        <div class="embed-actions">
+                            <button id="generate-btn" type="submit" class="embed-btn embed-btn-primary">Generate URL</button>
+                            <button id="open-btn" type="button" class="embed-btn embed-btn-secondary" disabled>Open generated URL</button>
+                        </div>
+                    </form>
+                </section>
+
+                <section class="embed-panel embed-panel-result">
+                    <div class="embed-panel-header">
+                        <h2>Generated URL</h2>
+                        <p>The final URL stays copyable and openable after a successful request.</p>
+                    </div>
+
+                    <div id="status-banner" class="embed-status embed-status-neutral">Ready to generate an embed URL.</div>
+
+                    <label class="embed-field">
+                        <span>Final URL</span>
+                        <textarea id="final-url" rows="7" readonly placeholder="Generated URL will appear here"></textarea>
+                    </label>
+
+                    <div class="embed-result-actions">
+                        <button id="copy-btn" type="button" class="embed-btn embed-btn-ghost" disabled>Copy URL</button>
+                        <a id="open-link" class="embed-inline-link is-disabled" href="#" target="_blank" rel="noopener noreferrer" aria-disabled="true">Open in new tab</a>
+                    </div>
+
+                    <div class="embed-meta-grid">
+                        <div class="embed-meta-card">
+                            <span class="embed-meta-label">HTTP status</span>
+                            <strong id="http-status">-</strong>
+                        </div>
+                        <div class="embed-meta-card">
+                            <span class="embed-meta-label">Resolved form_id</span>
+                            <strong id="resolved-form-id">-</strong>
+                        </div>
+                    </div>
+
+                    <label class="embed-field">
+                        <span>Last response</span>
+                        <textarea id="response-json" rows="14" readonly placeholder="API response JSON will appear here"></textarea>
+                    </label>
+                </section>
+            </div>
+        </section>
+    "##;
+
+    let extra_head = r#"
+    <style>
+        .embed-tester-shell {
+            display: grid;
+            gap: 1.5rem;
+        }
+        .embed-hero {
+            display: flex;
+            justify-content: space-between;
+            gap: 1rem;
+            align-items: flex-start;
+            padding: 1.75rem;
+            border-radius: 1.25rem;
+            background:
+                radial-gradient(circle at top left, rgba(14, 165, 233, 0.18), transparent 45%),
+                linear-gradient(135deg, #13293d 0%, #1f4e5f 55%, #f4efe6 180%);
+            color: #f8fafc;
+            box-shadow: 0 20px 50px rgba(15, 23, 42, 0.18);
+        }
+        .embed-eyebrow {
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            font-size: 0.72rem;
+            font-weight: 700;
+            color: rgba(226, 232, 240, 0.82);
+            margin-bottom: 0.75rem;
+        }
+        .embed-hero h1 {
+            margin: 0;
+            font-size: clamp(2rem, 3vw, 3rem);
+            line-height: 1;
+        }
+        .embed-hero p {
+            margin: 0.85rem 0 0;
+            max-width: 40rem;
+            color: rgba(226, 232, 240, 0.88);
+            line-height: 1.6;
+        }
+        .embed-hero-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.65rem;
+            padding: 0.8rem 1rem;
+            border-radius: 999px;
+            background: rgba(248, 250, 252, 0.12);
+            border: 1px solid rgba(248, 250, 252, 0.15);
+            white-space: nowrap;
+        }
+        .embed-hero-dot {
+            width: 0.65rem;
+            height: 0.65rem;
+            border-radius: 999px;
+            background: #34d399;
+            box-shadow: 0 0 0 0.35rem rgba(52, 211, 153, 0.18);
+        }
+        .embed-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+            gap: 1.5rem;
+        }
+        .embed-panel {
+            background: rgba(255, 255, 255, 0.94);
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            border-radius: 1.25rem;
+            padding: 1.5rem;
+            box-shadow: 0 18px 45px rgba(15, 23, 42, 0.08);
+        }
+        .embed-panel-header h2 {
+            margin: 0;
+            font-size: 1.1rem;
+            color: #0f172a;
+        }
+        .embed-panel-header p {
+            margin: 0.45rem 0 0;
+            color: #475569;
+            line-height: 1.55;
+        }
+        .embed-form {
+            display: grid;
+            gap: 1rem;
+            margin-top: 1.25rem;
+        }
+        .embed-row-two {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 1rem;
+        }
+        .embed-field {
+            display: grid;
+            gap: 0.45rem;
+        }
+        .embed-field span {
+            font-size: 0.92rem;
+            font-weight: 700;
+            color: #1e293b;
+        }
+        .embed-field small {
+            color: #64748b;
+            line-height: 1.45;
+        }
+        .embed-field input,
+        .embed-field textarea {
+            width: 100%;
+            border: 1px solid #cbd5e1;
+            border-radius: 0.9rem;
+            background: #fff;
+            color: #0f172a;
+            padding: 0.85rem 1rem;
+            font: inherit;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+        .embed-field input:focus,
+        .embed-field textarea:focus {
+            outline: none;
+            border-color: #0f766e;
+            box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12);
+        }
+        .embed-field textarea {
+            resize: vertical;
+            min-height: 7rem;
+        }
+        .embed-actions,
+        .embed-result-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            margin-top: 0.25rem;
+        }
+        .embed-btn {
+            appearance: none;
+            border: 0;
+            border-radius: 999px;
+            padding: 0.85rem 1.2rem;
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
+            transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+        }
+        .embed-btn:hover:not(:disabled) {
+            transform: translateY(-1px);
+        }
+        .embed-btn:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
+        .embed-btn-primary {
+            background: linear-gradient(135deg, #0f766e 0%, #115e59 100%);
+            color: #f8fafc;
+            box-shadow: 0 12px 24px rgba(15, 118, 110, 0.22);
+        }
+        .embed-btn-secondary {
+            background: #0f172a;
+            color: #f8fafc;
+        }
+        .embed-btn-ghost {
+            background: #e2e8f0;
+            color: #0f172a;
+        }
+        .embed-status {
+            margin-top: 1.25rem;
+            border-radius: 1rem;
+            padding: 0.9rem 1rem;
+            font-weight: 700;
+        }
+        .embed-status-neutral {
+            background: #e2e8f0;
+            color: #334155;
+        }
+        .embed-status-success {
+            background: #dcfce7;
+            color: #166534;
+        }
+        .embed-status-error {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+        .embed-meta-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.9rem;
+            margin: 1rem 0;
+        }
+        .embed-meta-card {
+            padding: 1rem;
+            border-radius: 1rem;
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+        }
+        .embed-meta-label {
+            display: block;
+            color: #64748b;
+            font-size: 0.85rem;
+            margin-bottom: 0.4rem;
+        }
+        .embed-inline-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.85rem 1.2rem;
+            border-radius: 999px;
+            background: #f59e0b;
+            color: #111827;
+            font-weight: 700;
+            text-decoration: none;
+        }
+        .embed-inline-link.is-disabled {
+            pointer-events: none;
+            opacity: 0.5;
+        }
+        @media (max-width: 1080px) {
+            .embed-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        @media (max-width: 720px) {
+            .embed-hero {
+                flex-direction: column;
+            }
+            .embed-row-two,
+            .embed-meta-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+    "#;
+
+    let extra_scripts = r##"
+    <script>
+        (function () {
+            const form = document.getElementById('embed-form');
+            const generateBtn = document.getElementById('generate-btn');
+            const openBtn = document.getElementById('open-btn');
+            const copyBtn = document.getElementById('copy-btn');
+            const openLink = document.getElementById('open-link');
+            const finalUrlEl = document.getElementById('final-url');
+            const responseJsonEl = document.getElementById('response-json');
+            const statusBanner = document.getElementById('status-banner');
+            const httpStatusEl = document.getElementById('http-status');
+            const resolvedFormIdEl = document.getElementById('resolved-form-id');
+
+            let generatedUrl = '';
+
+            function setStatus(kind, message) {
+                statusBanner.className = 'embed-status';
+                if (kind === 'success') {
+                    statusBanner.classList.add('embed-status-success');
+                } else if (kind === 'error') {
+                    statusBanner.classList.add('embed-status-error');
+                } else {
+                    statusBanner.classList.add('embed-status-neutral');
+                }
+                statusBanner.textContent = message;
+            }
+
+            function setGeneratedUrl(url) {
+                generatedUrl = url || '';
+                finalUrlEl.value = generatedUrl;
+                const enabled = Boolean(generatedUrl);
+                openBtn.disabled = !enabled;
+                copyBtn.disabled = !enabled;
+                openLink.href = enabled ? generatedUrl : '#';
+                openLink.setAttribute('aria-disabled', enabled ? 'false' : 'true');
+                openLink.classList.toggle('is-disabled', !enabled);
+            }
+
+            function buildFallbackUrl(payload, responseBody) {
+                const data = responseBody && responseBody.data ? responseBody.data : {};
+                const query = data.query || {};
+                const relativePath = data.relative_path || '/review/3d-view';
+                const token = data.token || '';
+                const formId = query.form_id || '';
+                const url = new URL(relativePath, window.location.origin);
+                url.searchParams.set('user_token', token);
+                if (formId) {
+                    url.searchParams.set('form_id', formId);
+                }
+                url.searchParams.set('user_id', payload.user_id || '');
+                url.searchParams.set('project_id', payload.project_id || '');
+                url.searchParams.set('output_project', payload.project_id || '');
+                return url.toString();
+            }
+
+            async function copyUrl() {
+                if (!generatedUrl) {
+                    return;
+                }
+                try {
+                    await navigator.clipboard.writeText(generatedUrl);
+                    setStatus('success', 'URL copied to clipboard.');
+                } catch (error) {
+                    setStatus('error', 'Copy failed. You can still select the URL manually.');
+                }
+            }
+
+            form.addEventListener('submit', async function (event) {
+                event.preventDefault();
+                generateBtn.disabled = true;
+                openBtn.disabled = true;
+                copyBtn.disabled = true;
+                setStatus('neutral', 'Generating embed URL...');
+                setGeneratedUrl('');
+                httpStatusEl.textContent = '-';
+                resolvedFormIdEl.textContent = '-';
+                responseJsonEl.value = '';
+
+                let extraParameters = {};
+                try {
+                    extraParameters = JSON.parse(document.getElementById('extra-parameters').value || '{}');
+                } catch (error) {
+                    generateBtn.disabled = false;
+                    setStatus('error', 'extra_parameters must be valid JSON.');
+                    responseJsonEl.value = String(error);
+                    return;
+                }
+
+                const payload = {
+                    project_id: document.getElementById('project-id').value.trim(),
+                    user_id: document.getElementById('user-id').value.trim(),
+                    token: document.getElementById('token').value.trim(),
+                    extra_parameters: extraParameters
+                };
+
+                const formId = document.getElementById('form-id').value.trim();
+                if (formId) {
+                    payload.form_id = formId;
+                }
+
+                try {
+                    const response = await fetch('/api/review/embed-url', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(payload)
+                    });
+
+                    httpStatusEl.textContent = String(response.status);
+                    const responseBody = await response.json();
+                    responseJsonEl.value = JSON.stringify(responseBody, null, 2);
+
+                    const resolvedFormId = responseBody && responseBody.data && responseBody.data.query
+                        ? responseBody.data.query.form_id || '-'
+                        : '-';
+                    resolvedFormIdEl.textContent = resolvedFormId;
+
+                    if (!response.ok || responseBody.code !== 200) {
+                        setStatus('error', responseBody.message || 'Embed URL generation failed.');
+                        generateBtn.disabled = false;
+                        return;
+                    }
+
+                    const finalUrl = responseBody.url || buildFallbackUrl(payload, responseBody);
+                    setGeneratedUrl(finalUrl);
+                    setStatus('success', responseBody.url
+                        ? 'Embed URL generated from backend response.'
+                        : 'Embed URL generated with local fallback because frontend_base_url is empty.');
+                } catch (error) {
+                    setStatus('error', 'Request failed. Check that the local server is running and try again.');
+                    responseJsonEl.value = String(error);
+                } finally {
+                    generateBtn.disabled = false;
+                }
+            });
+
+            openBtn.addEventListener('click', function () {
+                if (!generatedUrl) {
+                    return;
+                }
+                window.open(generatedUrl, '_blank', 'noopener,noreferrer');
+            });
+
+            copyBtn.addEventListener('click', copyUrl);
+        }());
+    </script>
+    "##;
+
+    crate::web_server::layout::render_layout_with_sidebar(
+        "Embed URL Tester",
+        Some("home"),
+        content,
+        Some(extra_head),
+        Some(extra_scripts),
+    )
+}
+
 pub fn render_simple_dashboard_page() -> String {
     r#"
 <!DOCTYPE html>
@@ -3220,7 +3703,7 @@ pub fn render_config_page_with_sidebar() -> String {
 
 /// 统一布局版：部署站点管理
 pub fn render_deployment_sites_page_with_sidebar() -> String {
-    let content = r##"
+    let content = r#"
         <div class="flex items-center justify-between mb-4">
             <h1 class="text-2xl font-bold text-gray-900">
                 <i class="fas fa-server text-blue-600 mr-2"></i>部署站点管理
@@ -3380,7 +3863,7 @@ pub fn render_deployment_sites_page_with_sidebar() -> String {
             </div>
           </div>
         </div>
-    "##;
+    "#;
 
     let extra_scripts = r#"<script src="/static/projects.js"></script>"#;
 

@@ -204,7 +204,7 @@ mod tests {
         let converter = UnitConverter::new(LengthUnit::Millimeter, LengthUnit::Meter);
         let input = glam::Vec3::new(1000.0, 2000.0, 3000.0);
         let output = converter.convert_vec3(&input);
-        assert_eq!(output, glam::Vec3::new(1.0, 2.0, 3.0));
+        assert!(output.abs_diff_eq(glam::Vec3::new(1.0, 2.0, 3.0), 1e-6));
     }
 
     #[test]

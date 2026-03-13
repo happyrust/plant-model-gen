@@ -8,9 +8,7 @@ use std::collections::HashSet;
 
 use aios_core::{RefnoEnum, SurrealQueryExt, model_primary_db};
 
-use super::boolean_task::{
-    BooleanTask, BooleanTaskType, CataGeoData, CataNegBoolTask,
-};
+use super::boolean_task::{BooleanTask, BooleanTaskType, CataGeoData, CataNegBoolTask};
 
 /// 查询 DB 中需要 cata_neg 布尔但不在现有任务中的 refno 候选集。
 ///
@@ -40,8 +38,8 @@ pub async fn query_cata_backfill_candidates(
 pub async fn fetch_cata_bool_tasks_from_db(
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<Vec<BooleanTask>> {
-    use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
     use aios_core::Transform;
+    use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
     use std::collections::HashMap;
 
     if refnos.is_empty() {
@@ -131,11 +129,13 @@ pub async fn fetch_cata_bool_tasks_from_db(
                 let geom_refno = RefnoEnum::from(geom_refno_str);
 
                 // 为 geo_data_map 插入条目（使用默认参数，实际参数后续按需补齐）
-                geo_data_map.entry(geom_refno).or_insert_with(|| CataGeoData {
-                    geo_hash: 0, // 将从 inst_geo 表补齐
-                    param: PdmsGeoParam::default(),
-                    transform: Transform::default(),
-                });
+                geo_data_map
+                    .entry(geom_refno)
+                    .or_insert_with(|| CataGeoData {
+                        geo_hash: 0, // 将从 inst_geo 表补齐
+                        param: PdmsGeoParam::default(),
+                        transform: Transform::default(),
+                    });
 
                 match geo_type {
                     "Pos" | "CatePos" | "Compound" => pos_geos.push(geom_refno),
@@ -184,10 +184,7 @@ pub async fn backfill_cata_tasks_from_db(
         return Ok(0);
     }
 
-    let existing_refnos: HashSet<RefnoEnum> = existing_tasks
-        .iter()
-        .map(|t| t.refno)
-        .collect();
+    let existing_refnos: HashSet<RefnoEnum> = existing_tasks.iter().map(|t| t.refno).collect();
 
     let candidates = query_cata_backfill_candidates(&existing_refnos).await?;
     if candidates.is_empty() {

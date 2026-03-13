@@ -69,9 +69,15 @@ mod tests {
 
         set_active_precision(precision.clone());
 
-        gen_inst_meshes(&lod_dir, &precision, &[refno], true, &[MeshFormat::PdmsMesh])
-            .await
-            .context("生成 mesh 失败")?;
+        gen_inst_meshes(
+            &lod_dir,
+            &precision,
+            &[refno],
+            true,
+            &[MeshFormat::PdmsMesh],
+        )
+        .await
+        .context("生成 mesh 失败")?;
 
         let size = dir_size(&lod_dir)?;
         anyhow::ensure!(size > 0, "LOD {:?} 未生成任何 mesh 文件", lod);

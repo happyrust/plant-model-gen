@@ -33,8 +33,11 @@ pub async fn ensure_pe_transform_for_refnos(refnos: &[RefnoEnum]) -> anyhow::Res
         return Ok(());
     }
 
-    log::info!("[precheck] 刷新 {} 个 refno 对应的 {} 个数据库的 pe_transform",
-               refnos.len(), dbnum_vec.len());
+    log::info!(
+        "[precheck] 刷新 {} 个 refno 对应的 {} 个数据库的 pe_transform",
+        refnos.len(),
+        dbnum_vec.len()
+    );
 
     // 调用 aios_core 的刷新函数
     match aios_core::transform::refresh_pe_transform_for_dbnums(&dbnum_vec).await {

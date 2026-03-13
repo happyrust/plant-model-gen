@@ -57,18 +57,11 @@ pub enum RoomWorkerTaskStatus {
     /// 排队等待中
     Queued,
     /// 运行中
-    Running {
-        progress: f32,
-        stage: String,
-    },
+    Running { progress: f32, stage: String },
     /// 已完成
-    Completed {
-        stats: RoomBuildStats,
-    },
+    Completed { stats: RoomBuildStats },
     /// 失败
-    Failed {
-        error: String,
-    },
+    Failed { error: String },
     /// 已取消
     Cancelled,
 }
@@ -169,21 +162,27 @@ impl RoomWorker {
     /// 返回 JoinHandle，可用于等待 Worker 结束
     pub fn start(config: RoomWorkerConfig) -> (Arc<Self>, JoinHandle<()>) {
         let worker = Arc::new(Self::new(config));
-        worker.running.store(true, std::sync::atomic::Ordering::SeqCst);
+        worker
+            .running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let worker_clone = worker.clone();
         let handle = tokio::spawn(async move {
             worker_clone.worker_loop().await;
         });
 
-        info!("🚀 RoomWorker 已启动，max_concurrent_tasks={}", worker.config.max_concurrent_tasks);
+        info!(
+            "🚀 RoomWorker 已启动，max_concurrent_tasks={}",
+            worker.config.max_concurrent_tasks
+        );
 
         (worker, handle)
     }
 
     /// 停止 Worker
     pub fn stop(&self) {
-        self.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         info!("🛑 RoomWorker 停止信号已发送");
     }
 
@@ -192,7 +191,7 @@ impl RoomWorker {
     /// 返回任务 ID
     pub async fn submit_task(&self, task: RoomWorkerTask) -> String {
         let task_id = task.id.clone();
-        
+
         // 按优先级插入队列
         let mut queue = self.task_queue.write().await;
         let insert_pos = queue
@@ -201,7 +200,11 @@ impl RoomWorker {
             .unwrap_or(queue.len());
         queue.insert(insert_pos, task);
 
-        info!("📥 任务已提交到队列: id={}, 队列长度={}", task_id, queue.len());
+        info!(
+            "📥 任务已提交到队列: id={}, 队列长度={}",
+            task_id,
+            queue.len()
+        );
         task_id
     }
 
@@ -303,7 +306,8 @@ impl RoomWorker {
 
                 // 4. 创建取消令牌
                 let cancel_token = CancellationToken::new();
-                self.cancel_tokens.insert(task_id.clone(), cancel_token.clone());
+                self.cancel_tokens
+                    .insert(task_id.clone(), cancel_token.clone());
 
                 // 5. 在独立任务中执行
                 let worker = self.clone();
@@ -320,7 +324,11 @@ impl RoomWorker {
     }
 
     /// 执行单个任务
-    async fn execute_task(self: Arc<Self>, mut task: RoomWorkerTask, cancel_token: CancellationToken) {
+    async fn execute_task(
+        self: Arc<Self>,
+        mut task: RoomWorkerTask,
+        cancel_token: CancellationToken,
+    ) {
         let task_id = task.id.clone();
         info!("▶️ 开始执行任务: id={}, type={:?}", task_id, task.task_type);
 
@@ -330,24 +338,25 @@ impl RoomWorker {
         let progress_tx = self.progress_tx.clone();
         let task_id_for_callback = task_id.clone();
         let active_tasks = self.active_tasks.clone();
-        let progress_callback: Box<dyn Fn(f32, &str) + Send + Sync> = Box::new(move |progress, stage| {
-            // 更新活跃任务状态
-            if let Some(mut entry) = active_tasks.get_mut(&task_id_for_callback) {
-                entry.status = RoomWorkerTaskStatus::Running {
+        let progress_callback: Box<dyn Fn(f32, &str) + Send + Sync> =
+            Box::new(move |progress, stage| {
+                // 更新活跃任务状态
+                if let Some(mut entry) = active_tasks.get_mut(&task_id_for_callback) {
+                    entry.status = RoomWorkerTaskStatus::Running {
+                        progress,
+                        stage: stage.to_string(),
+                    };
+                    entry.updated_at = Utc::now();
+                }
+
+                // 广播进度事件
+                let _ = progress_tx.send(ProgressEvent {
+                    task_id: task_id_for_callback.clone(),
                     progress,
                     stage: stage.to_string(),
-                };
-                entry.updated_at = Utc::now();
-            }
-
-            // 广播进度事件
-            let _ = progress_tx.send(ProgressEvent {
-                task_id: task_id_for_callback.clone(),
-                progress,
-                stage: stage.to_string(),
-                timestamp: Utc::now(),
+                    timestamp: Utc::now(),
+                });
             });
-        });
 
         // 执行房间计算
         let result: anyhow::Result<RoomBuildStats> = match &task.task_type {
@@ -358,7 +367,8 @@ impl RoomWorker {
                     None,
                     Some(cancel_token.clone()),
                     Some(progress_callback),
-                ).await
+                )
+                .await
             }
             RoomTaskType::RebuildByRoomNumbers(room_numbers) => {
                 // 调用针对特定房间的重建
@@ -367,7 +377,8 @@ impl RoomWorker {
                     &task.db_option,
                     Some(cancel_token.clone()),
                     Some(progress_callback),
-                ).await
+                )
+                .await
             }
             RoomTaskType::IncrementalUpdate => {
                 // 增量更新
@@ -375,7 +386,8 @@ impl RoomWorker {
                     &task.db_option,
                     Some(cancel_token.clone()),
                     Some(progress_callback),
-                ).await
+                )
+                .await
             }
         };
 
@@ -387,7 +399,11 @@ impl RoomWorker {
             Ok(stats) => {
                 info!(
                     "✅ 任务完成: id={}, 房间={}, 面板={}, 构件={}, 耗时={:?}",
-                    task_id, stats.total_rooms, stats.total_panels, stats.total_components, duration
+                    task_id,
+                    stats.total_rooms,
+                    stats.total_panels,
+                    stats.total_components,
+                    duration
                 );
                 task.status = RoomWorkerTaskStatus::Completed { stats };
             }
@@ -432,25 +448,34 @@ mod tests {
     #[test]
     fn test_task_status_is_terminal() {
         assert!(!RoomWorkerTaskStatus::Queued.is_terminal());
-        assert!(!RoomWorkerTaskStatus::Running {
-            progress: 0.5,
-            stage: "test".to_string()
-        }.is_terminal());
-        assert!(RoomWorkerTaskStatus::Completed {
-            stats: RoomBuildStats {
-                total_rooms: 0,
-                total_panels: 0,
-                total_components: 0,
-                build_time_ms: 0,
-                cache_hit_rate: 0.0,
-                memory_usage_mb: 0.0,
-                failed_panels: 0,
-                missing_candidates: 0,
+        assert!(
+            !RoomWorkerTaskStatus::Running {
+                progress: 0.5,
+                stage: "test".to_string()
             }
-        }.is_terminal());
-        assert!(RoomWorkerTaskStatus::Failed {
-            error: "test".to_string()
-        }.is_terminal());
+            .is_terminal()
+        );
+        assert!(
+            RoomWorkerTaskStatus::Completed {
+                stats: RoomBuildStats {
+                    total_rooms: 0,
+                    total_panels: 0,
+                    total_components: 0,
+                    build_time_ms: 0,
+                    cache_hit_rate: 0.0,
+                    memory_usage_mb: 0.0,
+                    failed_panels: 0,
+                    missing_candidates: 0,
+                }
+            }
+            .is_terminal()
+        );
+        assert!(
+            RoomWorkerTaskStatus::Failed {
+                error: "test".to_string()
+            }
+            .is_terminal()
+        );
         assert!(RoomWorkerTaskStatus::Cancelled.is_terminal());
     }
 }

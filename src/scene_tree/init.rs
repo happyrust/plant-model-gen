@@ -8,7 +8,7 @@ use aios_core::pdms_types::{
 };
 use aios_core::tool::db_tool::db1_dehash;
 use aios_core::tree_query::{TreeQuery, TreeQueryFilter};
-use aios_core::{RefnoEnum, RefU64, project_primary_db, SurrealQueryExt};
+use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
 use anyhow::Result;
 use std::collections::VecDeque;
 
@@ -21,7 +21,11 @@ fn get_project_name_from_config() -> String {
         let line = line.trim();
         if line.starts_with("project_name") {
             if let Some(value) = line.split('=').nth(1) {
-                return value.trim().trim_matches('"').trim_matches('\'').to_string();
+                return value
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string();
             }
         }
     }
@@ -44,7 +48,7 @@ struct SceneNodeData {
     has_geo: bool,
     is_leaf: bool,
     dbnum: i16,
-    geo_type: Option<String>,  // 几何类型：Pos, Neg, CataNeg, CataCrossNeg 等
+    geo_type: Option<String>, // 几何类型：Pos, Neg, CataNeg, CataCrossNeg 等
 }
 
 /// 判断是否为几何节点
@@ -135,7 +139,9 @@ pub async fn init_scene_tree_from_root(
     #[cfg(feature = "parquet-export")]
     {
         let dbnum = TreeIndexManager::resolve_dbnum_for_refno(root_refno)?;
-        let output_dir = crate::versioned_db::db_meta_info::get_project_tree_dir(&get_project_name_from_config());
+        let output_dir = crate::versioned_db::db_meta_info::get_project_tree_dir(
+            &get_project_name_from_config(),
+        );
         if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbnum, &output_dir).await {
             eprintln!("[scene_tree] Parquet 导出失败: {}", e);
         }
@@ -153,7 +159,10 @@ pub async fn init_scene_tree_from_root(
 /// 适用场景：
 /// - 测试/工具按 dbnum 初始化
 /// - 数据库里缺失 MDB name→dbnum 映射时仍可构建
-pub async fn init_scene_tree_by_dbno(dbnum: u32, force_rebuild: bool) -> Result<SceneTreeInitResult> {
+pub async fn init_scene_tree_by_dbno(
+    dbnum: u32,
+    force_rebuild: bool,
+) -> Result<SceneTreeInitResult> {
     let start = std::time::Instant::now();
 
     super::schema::init_schema().await?;
@@ -163,7 +172,10 @@ pub async fn init_scene_tree_by_dbno(dbnum: u32, force_rebuild: bool) -> Result<
     }
 
     let world_refno = RefnoEnum::from(RefU64((dbnum as u64) << 32));
-    println!("[scene_tree] 从 WORLD {} 开始构建 (dbnum={})", world_refno, dbnum);
+    println!(
+        "[scene_tree] 从 WORLD {} 开始构建 (dbnum={})",
+        world_refno, dbnum
+    );
 
     let (nodes, relations) = build_tree_from_world(world_refno).await?;
     let node_count = nodes.len();
@@ -181,7 +193,9 @@ pub async fn init_scene_tree_by_dbno(dbnum: u32, force_rebuild: bool) -> Result<
     // 6. 导出 Parquet 文件
     #[cfg(feature = "parquet-export")]
     {
-        let output_dir = crate::versioned_db::db_meta_info::get_project_tree_dir(&get_project_name_from_config());
+        let output_dir = crate::versioned_db::db_meta_info::get_project_tree_dir(
+            &get_project_name_from_config(),
+        );
         if let Err(e) = super::parquet_export::export_scene_tree_parquet(dbnum, &output_dir).await {
             eprintln!("[scene_tree] Parquet 导出失败: {}", e);
         }
@@ -216,7 +230,10 @@ DELETE $scene_node_ids;
 "#
     );
     project_primary_db().query_response(&sql).await?;
-    println!("[scene_tree] 已清理 dbnum={} 的 scene_node/contains 数据", dbnum);
+    println!(
+        "[scene_tree] 已清理 dbnum={} 的 scene_node/contains 数据",
+        dbnum
+    );
     Ok(())
 }
 
@@ -285,10 +302,7 @@ async fn build_tree_from_world(
 
 /// 获取节点的几何类型（从 geo_relate 表查询）
 async fn get_geo_type_by_refno(refno: RefnoEnum) -> Result<Option<String>> {
-    let sql = format!(
-        "SELECT VALUE geo_type FROM geo_relate:{}",
-        refno.refno().0
-    );
+    let sql = format!("SELECT VALUE geo_type FROM geo_relate:{}", refno.refno().0);
     let result: Vec<String> = project_primary_db().query_take(&sql, 0).await?;
     Ok(result.into_iter().next())
 }

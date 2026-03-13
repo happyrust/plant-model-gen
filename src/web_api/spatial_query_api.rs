@@ -1,10 +1,10 @@
-use aios_core::{project_primary_db, RefU64, RefnoEnum, SurrealQueryExt};
+use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
 use axum::{
+    Router,
     extract::{Path, State},
     http::StatusCode,
     response::Json,
     routing::get,
-    Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

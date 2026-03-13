@@ -3,6 +3,9 @@
 ## 部署目标服务器 
 服务器是123.57.182.243      ssh 的账号密码是 root    Happytest123_
 
+## 测试方案
+任何测试都要优先使用 cli 命令去实现，通过传递参数或者 json 数据来做验证。避免因为使用 test 带来长时间的编译等待时间。
+
 ## Project Structure & Module Organization
 This repository is a Rust workspace centered on model generation, spatial query, and web delivery. Core code lives in `src/`, with major areas such as `src/fast_model/` for generation/export pipelines, `src/web_server/` and `src/web_api/` for HTTP/UI endpoints, `src/grpc_service/` for gRPC, and `src/data_interface/` for database access. Integration tests live in `tests/`, while subsystem and regression tests also exist under `src/test/`. Use `examples/` for diagnostics and one-off verification tools. Supporting assets and runtime data are kept in `assets/`, `resource/`, `proto/`, `db_options/`, `test_data/`, and `docs/`.
 

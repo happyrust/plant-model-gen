@@ -1,6 +1,6 @@
 use super::fixtures::{
-    load_descendant_refnos, load_export_summary, load_geom_instances, load_obj_stats,
-    expected_obj_path, max_transform_diff,
+    expected_obj_path, load_descendant_refnos, load_export_summary, load_geom_instances,
+    load_obj_stats, max_transform_diff,
 };
 use super::obj_parser::parse_obj_file;
 use std::collections::BTreeSet;
@@ -105,10 +105,15 @@ fn test_geo_hash_set_unchanged() {
     let expected_hashes: BTreeSet<String> = summary.geo_hash_set.iter().cloned().collect();
 
     assert_eq!(
-        actual_hashes, expected_hashes,
+        actual_hashes,
+        expected_hashes,
         "geo_hash 集合不一致：\n  多出: {:?}\n  缺少: {:?}",
-        actual_hashes.difference(&expected_hashes).collect::<Vec<_>>(),
-        expected_hashes.difference(&actual_hashes).collect::<Vec<_>>()
+        actual_hashes
+            .difference(&expected_hashes)
+            .collect::<Vec<_>>(),
+        expected_hashes
+            .difference(&actual_hashes)
+            .collect::<Vec<_>>()
     );
     println!(
         "✅ test_geo_hash_set_unchanged: {} 个唯一 geo_hash",
@@ -170,14 +175,8 @@ fn test_instance_counts() {
     }
     let summary = load_export_summary(REFNO).expect("加载 export_summary.json 失败");
 
-    assert!(
-        summary.component_count > 0,
-        "component_count 应大于 0"
-    );
-    assert!(
-        summary.total_instances > 0,
-        "total_instances 应大于 0"
-    );
+    assert!(summary.component_count > 0, "component_count 应大于 0");
+    assert!(summary.total_instances > 0, "total_instances 应大于 0");
     assert_eq!(
         summary.total_instances,
         summary.component_count + summary.tubing_count,
@@ -237,7 +236,7 @@ async fn test_online_regression() {
     use crate::fast_model::export_model::model_exporter::{
         collect_export_refnos, query_geometry_instances_ext,
     };
-    use aios_core::{init_test_surreal, RefnoEnum};
+    use aios_core::{RefnoEnum, init_test_surreal};
     use std::collections::BTreeSet;
 
     // 1. 加载 baseline fixture
@@ -275,10 +274,7 @@ async fn test_online_regression() {
         all_refnos.len(),
         baseline_descendants.count
     );
-    println!(
-        "✅ 子孙节点数量一致: {}",
-        all_refnos.len()
-    );
+    println!("✅ 子孙节点数量一致: {}", all_refnos.len());
 
     // 4. 重新查询几何实例并比对关键指标
     let live_geom_insts = query_geometry_instances_ext(&all_refnos, true, false, true)
@@ -301,7 +297,8 @@ async fn test_online_regression() {
     }
     let baseline_hashes: BTreeSet<String> = baseline_summary.geo_hash_set.iter().cloned().collect();
     assert_eq!(
-        live_hashes, baseline_hashes,
+        live_hashes,
+        baseline_hashes,
         "geo_hash 集合变化:\n  新增: {:?}\n  缺失: {:?}",
         live_hashes.difference(&baseline_hashes).collect::<Vec<_>>(),
         baseline_hashes.difference(&live_hashes).collect::<Vec<_>>()
@@ -332,15 +329,13 @@ async fn test_online_regression() {
     );
 
     // 5. 重新导出 OBJ 并比对统计
-    let mesh_dir = std::path::PathBuf::from(
-        aios_core::get_db_option().get_meshes_path()
-    );
+    let mesh_dir = std::path::PathBuf::from(aios_core::get_db_option().get_meshes_path());
     let tmp_obj = format!("test_data/model_regression/{}/regression_tmp.obj", REFNO);
     match export_obj_for_refnos(&all_refnos, &mesh_dir, &tmp_obj, None, false).await {
         Ok(()) => {
             if let Some(baseline_stats) = baseline_obj_stats {
-                let live_parsed = parse_obj_file(std::path::Path::new(&tmp_obj))
-                    .expect("解析回归 OBJ 失败");
+                let live_parsed =
+                    parse_obj_file(std::path::Path::new(&tmp_obj)).expect("解析回归 OBJ 失败");
                 assert_eq!(
                     live_parsed.vertex_count, baseline_stats.vertex_count,
                     "OBJ vertex_count 变化: live={}, baseline={}",
@@ -372,9 +367,15 @@ async fn test_online_regression() {
                 .map(|v| v == "1")
                 .unwrap_or(false);
             if allow {
-                eprintln!("⚠️  OBJ 导出失败（AIOS_TEST_ALLOW_OBJ_EXPORT_FAILURE=1，降级跳过）: {}", e);
+                eprintln!(
+                    "⚠️  OBJ 导出失败（AIOS_TEST_ALLOW_OBJ_EXPORT_FAILURE=1，降级跳过）: {}",
+                    e
+                );
             } else {
-                panic!("OBJ 导出失败（设置 AIOS_TEST_ALLOW_OBJ_EXPORT_FAILURE=1 可降级跳过）: {}", e);
+                panic!(
+                    "OBJ 导出失败（设置 AIOS_TEST_ALLOW_OBJ_EXPORT_FAILURE=1 可降级跳过）: {}",
+                    e
+                );
             }
         }
     }
@@ -393,7 +394,8 @@ fn test_cross_validation() {
     let summary = load_export_summary(REFNO).expect("加载 export_summary.json 失败");
 
     // 验证实例中的 refno 都在子孙列表中
-    let descendant_set: BTreeSet<&str> = descendants.descendants.iter().map(|s| s.as_str()).collect();
+    let descendant_set: BTreeSet<&str> =
+        descendants.descendants.iter().map(|s| s.as_str()).collect();
     for gi in &instances {
         assert!(
             descendant_set.contains(gi.refno.as_str()),

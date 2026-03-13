@@ -136,9 +136,9 @@ impl ExpressionFixer {
 
         // LENGTH('字符串') 或 LEN('字符串') → 字符串长度（如果是常量字符串）
         let len_str_regex = Regex::new(r"(?i)(?:LENGTH|LEN)\s*\(\s*'([^']*)'\s*\)").unwrap();
-        result = len_str_regex.replace_all(&result, |caps: &regex::Captures| {
-            caps[1].len().to_string()
-        }).to_string();
+        result = len_str_regex
+            .replace_all(&result, |caps: &regex::Captures| caps[1].len().to_string())
+            .to_string();
 
         result
     }
@@ -148,9 +148,9 @@ impl ExpressionFixer {
     fn lowercase_function_names(expr: &str) -> String {
         // 已知的函数名列表（tiny_expr 支持的函数）
         static FUNCTION_NAMES: &[&str] = &[
-            "SQRT", "POW", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2", "ATANT",
-            "LOG", "LOG10", "LN", "EXP", "ABS", "MIN", "MAX", "CEIL", "FLOOR", "ROUND",
-            "INT", "NINT", "SINH", "COSH", "TANH", "PI", "E", "RAND01", "RANDINT",
+            "SQRT", "POW", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2", "ATANT", "LOG",
+            "LOG10", "LN", "EXP", "ABS", "MIN", "MAX", "CEIL", "FLOOR", "ROUND", "INT", "NINT",
+            "SINH", "COSH", "TANH", "PI", "E", "RAND01", "RANDINT",
         ];
 
         let mut result = expr.to_string();
@@ -160,10 +160,12 @@ impl ExpressionFixer {
             // 这样可以避免误匹配变量名
             let pattern = format!(r"(?i)\b{}\s*\(", regex::escape(func_name));
             if let Ok(re) = Regex::new(&pattern) {
-                result = re.replace_all(&result, |caps: &regex::Captures| {
-                    let matched = &caps[0];
-                    matched.to_lowercase()
-                }).to_string();
+                result = re
+                    .replace_all(&result, |caps: &regex::Captures| {
+                        let matched = &caps[0];
+                        matched.to_lowercase()
+                    })
+                    .to_string();
             }
         }
 
@@ -280,7 +282,7 @@ impl ExpressionFixer {
         // 检查括号配对
         let mut bracket_count = 0i32;
         let mut square_bracket_count = 0i32;
-        
+
         for ch in expr.chars() {
             match ch {
                 '(' => bracket_count += 1,
@@ -298,7 +300,7 @@ impl ExpressionFixer {
                     square_bracket_count -= 1;
                     if square_bracket_count < 0 {
                         return Err(ExpressionErrorType::SyntaxError(
-                            "方括号不匹配：多余的 ']'".to_string()
+                            "方括号不匹配：多余的 ']'".to_string(),
                         ));
                     }
                 }
@@ -314,9 +316,7 @@ impl ExpressionFixer {
         }
 
         if square_bracket_count != 0 {
-            return Err(ExpressionErrorType::SyntaxError(
-                "方括号不匹配".to_string()
-            ));
+            return Err(ExpressionErrorType::SyntaxError("方括号不匹配".to_string()));
         }
 
         Ok(())
@@ -384,10 +384,21 @@ mod tests {
         let expr1 = "( MIN ( ATTRIB HEIG,ATTRIB PARA[3 ] ) )";
         let processed1 = ExpressionFixer::preprocess_attrib_expression(expr1);
         // 预期结果：函数名小写，变量名大写，空格清理后
-        assert!(processed1.contains("min(") || processed1.contains("min ("),
-                "Expected lowercase 'min', got: {}", processed1);
-        assert!(processed1.contains("HEIG"), "Expected uppercase 'HEIG', got: {}", processed1);
-        assert!(processed1.contains("PARA3"), "Expected 'PARA3', got: {}", processed1);
+        assert!(
+            processed1.contains("min(") || processed1.contains("min ("),
+            "Expected lowercase 'min', got: {}",
+            processed1
+        );
+        assert!(
+            processed1.contains("HEIG"),
+            "Expected uppercase 'HEIG', got: {}",
+            processed1
+        );
+        assert!(
+            processed1.contains("PARA3"),
+            "Expected 'PARA3', got: {}",
+            processed1
+        );
 
         // 测试简单ATTRIB格式 - 变量名保持大写
         let expr2 = "ATTRIB WIDT + ATTRIB LENG";
@@ -397,9 +408,21 @@ mod tests {
         // 测试复杂表达式 - 函数名小写，变量名大写
         let expr3 = "MAX(ATTRIB PARA[0], ATTRIB PARA[1] * 2)";
         let processed3 = ExpressionFixer::preprocess_attrib_expression(expr3);
-        assert!(processed3.contains("max("), "Expected lowercase 'max(', got: {}", processed3);
-        assert!(processed3.contains("PARA0"), "Expected 'PARA0', got: {}", processed3);
-        assert!(processed3.contains("PARA1"), "Expected 'PARA1', got: {}", processed3);
+        assert!(
+            processed3.contains("max("),
+            "Expected lowercase 'max(', got: {}",
+            processed3
+        );
+        assert!(
+            processed3.contains("PARA0"),
+            "Expected 'PARA0', got: {}",
+            processed3
+        );
+        assert!(
+            processed3.contains("PARA1"),
+            "Expected 'PARA1', got: {}",
+            processed3
+        );
     }
 
     #[test]
@@ -407,26 +430,58 @@ mod tests {
         // 测试 SQRT 函数（大写）转换为小写
         let expr1 = "SQRT( 16 )";
         let processed1 = ExpressionFixer::preprocess_attrib_expression(expr1);
-        assert!(processed1.starts_with("sqrt("), "Expected 'sqrt(', got: {}", processed1);
+        assert!(
+            processed1.starts_with("sqrt("),
+            "Expected 'sqrt(', got: {}",
+            processed1
+        );
 
         // 测试 POW 函数（大写）转换为小写
         let expr2 = "POW( 2, 3 )";
         let processed2 = ExpressionFixer::preprocess_attrib_expression(expr2);
-        assert!(processed2.starts_with("pow("), "Expected 'pow(', got: {}", processed2);
+        assert!(
+            processed2.starts_with("pow("),
+            "Expected 'pow(', got: {}",
+            processed2
+        );
 
         // 测试复杂的 SQRT/POW 组合表达式 - 函数名小写，变量名大写
         let expr3 = "SQRT( POW( ATTRIB PARA[2], 2 ) + POW( ATTRIB PARA[3], 2 ) )";
         let processed3 = ExpressionFixer::preprocess_attrib_expression(expr3);
-        assert!(processed3.contains("sqrt("), "Expected 'sqrt(', got: {}", processed3);
-        assert!(processed3.contains("pow("), "Expected 'pow(', got: {}", processed3);
-        assert!(processed3.contains("PARA2"), "Expected 'PARA2', got: {}", processed3);
-        assert!(processed3.contains("PARA3"), "Expected 'PARA3', got: {}", processed3);
+        assert!(
+            processed3.contains("sqrt("),
+            "Expected 'sqrt(', got: {}",
+            processed3
+        );
+        assert!(
+            processed3.contains("pow("),
+            "Expected 'pow(', got: {}",
+            processed3
+        );
+        assert!(
+            processed3.contains("PARA2"),
+            "Expected 'PARA2', got: {}",
+            processed3
+        );
+        assert!(
+            processed3.contains("PARA3"),
+            "Expected 'PARA3', got: {}",
+            processed3
+        );
 
         // 测试实际问题表达式（来自 RUS-149）- 变量名保持大写
         let expr4 = "( ( SQRT( 3 ) * ATTRIB PARA[9 ] ) / 2 )";
         let processed4 = ExpressionFixer::preprocess_attrib_expression(expr4);
-        assert!(processed4.contains("sqrt("), "Expected 'sqrt(', got: {}", processed4);
-        assert!(processed4.contains("PARA9"), "Expected 'PARA9', got: {}", processed4);
+        assert!(
+            processed4.contains("sqrt("),
+            "Expected 'sqrt(', got: {}",
+            processed4
+        );
+        assert!(
+            processed4.contains("PARA9"),
+            "Expected 'PARA9', got: {}",
+            processed4
+        );
     }
 
     #[test]
@@ -437,17 +492,25 @@ mod tests {
         assert_eq!(result, "sin(45) + cos(45) + tan(45)");
 
         // 测试不转换变量名（变量名后面没有括号）
-        let expr2 = "SQRT + POW";  // 这些是变量名，不是函数调用
+        let expr2 = "SQRT + POW"; // 这些是变量名，不是函数调用
         let result2 = ExpressionFixer::lowercase_function_names(expr2);
-        assert_eq!(result2, "SQRT + POW");  // 不应该被转换
+        assert_eq!(result2, "SQRT + POW"); // 不应该被转换
 
         // 测试函数名后有空格再有括号
         // 注意：函数名和括号之间的空格会被保留（转小写时保持原样）
         // 后续的 preprocess_attrib_expression 会清理这些空格
         let expr3 = "SQRT  ( 16 )";
         let result3 = ExpressionFixer::lowercase_function_names(expr3);
-        assert!(result3.contains("sqrt"), "应该将 SQRT 转为小写: {}", result3);
-        assert!(result3.contains("( 16 )"), "应该保留括号和内容: {}", result3);
+        assert!(
+            result3.contains("sqrt"),
+            "应该将 SQRT 转为小写: {}",
+            result3
+        );
+        assert!(
+            result3.contains("( 16 )"),
+            "应该保留括号和内容: {}",
+            result3
+        );
     }
 
     #[test]
@@ -479,7 +542,12 @@ mod tests {
         assert!(result2.is_ok(), "SQRT(3) failed: {:?}", result2);
         let expected = 1.732; // sqrt(3) ≈ 1.732 (四舍五入到3位小数)
         let actual = result2.unwrap();
-        assert!((actual - expected).abs() < 1e-6, "SQRT(3): actual = {}, expected = {}", actual, expected);
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "SQRT(3): actual = {}, expected = {}",
+            actual,
+            expected
+        );
     }
 
     #[test]
@@ -512,8 +580,13 @@ mod tests {
 
         // 测试 SQRT( POW(a,2) + POW(b,2) ) = sqrt(3^2 + 4^2) = sqrt(9+16) = sqrt(25) = 5
         let expr = "SQRT( POW( ATTRIB PARA[2], 2 ) + POW( ATTRIB PARA[3], 2 ) )";
-        let result = ExpressionFixer::eval_expression_with_attrib_support(expr, &cata_context, "DIST");
-        assert!(result.is_ok(), "Complex SQRT/POW expression failed: {:?}", result);
+        let result =
+            ExpressionFixer::eval_expression_with_attrib_support(expr, &cata_context, "DIST");
+        assert!(
+            result.is_ok(),
+            "Complex SQRT/POW expression failed: {:?}",
+            result
+        );
         assert_eq!(result.unwrap(), 5.0);
     }
 
@@ -534,20 +607,23 @@ mod tests {
 
         // 测试 SIN 函数（大写）
         let expr_sin = "SIN(90)";
-        let result_sin = ExpressionFixer::eval_expression_with_attrib_support(expr_sin, &context, "DIST");
+        let result_sin =
+            ExpressionFixer::eval_expression_with_attrib_support(expr_sin, &context, "DIST");
         assert!(result_sin.is_ok(), "SIN(90) failed: {:?}", result_sin);
         // SIN(90度) = 1.0 (tiny_expr 使用度数)
         assert!((result_sin.unwrap() - 1.0).abs() < 1e-10);
 
         // 测试 COS 函数（大写）
         let expr_cos = "COS(0)";
-        let result_cos = ExpressionFixer::eval_expression_with_attrib_support(expr_cos, &context, "DIST");
+        let result_cos =
+            ExpressionFixer::eval_expression_with_attrib_support(expr_cos, &context, "DIST");
         assert!(result_cos.is_ok(), "COS(0) failed: {:?}", result_cos);
         assert!((result_cos.unwrap() - 1.0).abs() < 1e-10);
 
         // 测试 TAN 函数（大写）
         let expr_tan = "TAN(45)";
-        let result_tan = ExpressionFixer::eval_expression_with_attrib_support(expr_tan, &context, "DIST");
+        let result_tan =
+            ExpressionFixer::eval_expression_with_attrib_support(expr_tan, &context, "DIST");
         assert!(result_tan.is_ok(), "TAN(45) failed: {:?}", result_tan);
         assert!((result_tan.unwrap() - 1.0).abs() < 1e-10);
     }
@@ -572,7 +648,10 @@ mod tests {
         // 测试问题表达式: (TRIM(0.001)*LOWCASE(TRUE))
         let expr4 = "(TRIM(0.001)*LOWCASE(TRUE))";
         let result4 = ExpressionFixer::simplify_string_functions(expr4);
-        assert_eq!(result4, "(0.001*1)", "Complex expression should simplify correctly");
+        assert_eq!(
+            result4, "(0.001*1)",
+            "Complex expression should simplify correctly"
+        );
 
         // 测试 STR(数值) → 数值
         let expr5 = "STR(123.45)";
@@ -598,7 +677,14 @@ mod tests {
         // 简化后应该变成: (0.001*1) = 0.001
         let expr = "(TRIM(0.001)*LOWCASE(TRUE))";
         let result = ExpressionFixer::eval_expression_with_attrib_support(expr, &context, "DIST");
-        assert!(result.is_ok(), "Problem expression should now evaluate: {:?}", result);
-        assert!((result.unwrap() - 0.001).abs() < 1e-6, "Result should be 0.001");
+        assert!(
+            result.is_ok(),
+            "Problem expression should now evaluate: {:?}",
+            result
+        );
+        assert!(
+            (result.unwrap() - 0.001).abs() < 1e-6,
+            "Result should be 0.001"
+        );
     }
 }

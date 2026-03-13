@@ -1,7 +1,7 @@
-use crate::fast_model::mesh_generate::{process_meshes_update_db_deep, process_meshes_bran};
-use aios_core::geometry::ShapeInstancesData;
+use crate::fast_model::mesh_generate::{process_meshes_bran, process_meshes_update_db_deep};
 use crate::options::DbOptionExt;
 use aios_core::RefnoEnum;
+use aios_core::geometry::ShapeInstancesData;
 use futures::stream::FuturesUnordered;
 use std::sync::Arc;
 
@@ -30,8 +30,13 @@ impl DbModelInstRefnos {
         if let Some(db_option) = db_option_arc {
             // BRAN 单独处理，不需要 deep 遍历和布尔运算
             if !self.bran_hanger_refnos.is_empty() {
-                println!("[BRAN] 开始处理 BRAN/HANG 网格: {} 个", self.bran_hanger_refnos.len());
-                if let Err(e) = process_meshes_bran(Some(db_option.clone()), &self.bran_hanger_refnos).await {
+                println!(
+                    "[BRAN] 开始处理 BRAN/HANG 网格: {} 个",
+                    self.bran_hanger_refnos.len()
+                );
+                if let Err(e) =
+                    process_meshes_bran(Some(db_option.clone()), &self.bran_hanger_refnos).await
+                {
                     eprintln!("process_meshes_bran failed: {:?}", e);
                 }
             }

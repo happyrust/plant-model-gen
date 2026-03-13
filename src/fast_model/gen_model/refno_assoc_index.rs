@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashSet};
 
-use aios_core::{RefnoEnum, model_primary_db, SurrealQueryExt};
+use aios_core::{RefnoEnum, SurrealQueryExt, model_primary_db};
 use anyhow::Context;
 use serde_json::Value;
 use tokio::sync::OnceCell;
@@ -107,10 +107,12 @@ pub struct RefnoAssocIndexBatch {
 
 impl RefnoAssocIndexBatch {
     fn entry_mut(&mut self, refno: RefnoEnum) -> &mut RefnoAssocIndexEntry {
-        self.entries.entry(refno).or_insert_with(|| RefnoAssocIndexEntry {
-            refno,
-            ..Default::default()
-        })
+        self.entries
+            .entry(refno)
+            .or_insert_with(|| RefnoAssocIndexEntry {
+                refno,
+                ..Default::default()
+            })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -294,7 +296,9 @@ pub async fn build_delete_sql_by_refnos(
     if rows.len() != refnos.len() {
         return Ok(None);
     }
-    Ok(Some(build_delete_sql_from_rows(&rows, &index_ids, chunk_size)))
+    Ok(Some(build_delete_sql_from_rows(
+        &rows, &index_ids, chunk_size,
+    )))
 }
 
 #[derive(Debug, Default, Clone)]
@@ -335,4 +339,3 @@ pub async fn delete_by_refnos(
         requested_refnos: refnos.len(),
     })
 }
-

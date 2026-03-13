@@ -1,12 +1,12 @@
 //! [foyer-removal] 桩模块：geom_input_cache 已移除。
 
-use std::collections::HashMap;
-use aios_core::RefnoEnum;
-use aios_core::parsed_data::CateAxisParam;
-use aios_core::geometry::EleGeosInfo;
-use aios_core::Transform;
-use aios_core::types::NamedAttrMap;
 use crate::options::DbOptionExt;
+use aios_core::RefnoEnum;
+use aios_core::Transform;
+use aios_core::geometry::EleGeosInfo;
+use aios_core::parsed_data::CateAxisParam;
+use aios_core::types::NamedAttrMap;
+use std::collections::HashMap;
 
 /// 缓存运行模式（桩）
 #[derive(Clone, Debug, PartialEq, Eq)]

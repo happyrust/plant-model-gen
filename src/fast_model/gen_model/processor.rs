@@ -100,8 +100,8 @@ impl NounProcessor {
                 let current_page_size = page_size.min(remaining.max(1));
 
                 // 查询当前页
-                let refnos = query_noun_page_all_db(noun, processed, current_page_size)
-                    .map_err(|e| {
+                let refnos =
+                    query_noun_page_all_db(noun, processed, current_page_size).map_err(|e| {
                         anyhow!("分页查询 {} noun {} 失败: {}", self.category_name, noun, e)
                     })?;
 
@@ -147,16 +147,12 @@ impl NounProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aios_core::options::DbOption;
     use crate::options::DbOptionExt;
+    use aios_core::options::DbOption;
 
     #[tokio::test]
     async fn test_empty_nouns() {
-        let ctx = NounProcessContext::new(
-            Arc::new(DbOptionExt::from(DbOption::default())),
-            100,
-            4,
-        );
+        let ctx = NounProcessContext::new(Arc::new(DbOptionExt::from(DbOption::default())), 100, 4);
         let processor = NounProcessor::new(ctx, "test", None);
         let sink = Arc::new(RwLock::new(HashSet::new()));
 

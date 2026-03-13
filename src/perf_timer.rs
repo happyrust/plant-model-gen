@@ -17,8 +17,8 @@
 //! 同时提供 `profile_span!` 宏在 `feature = "profile"` 下产出 tracing span，
 //! 在非 profile 模式下退化为 0 开销。
 
+use serde::{Deserialize, Serialize};
 use std::time::Instant;
-use serde::{Serialize, Deserialize};
 
 /// 阶段计时记录
 #[derive(Debug, Clone)]
@@ -79,7 +79,10 @@ impl PerfTimer {
     pub fn print_summary(&mut self) {
         self.end_current();
         let total = self.started.elapsed();
-        println!("\n[perf] ============ {} 阶段耗时摘要 ============", self.label);
+        println!(
+            "\n[perf] ============ {} 阶段耗时摘要 ============",
+            self.label
+        );
         for stage in &self.stages {
             let dur = stage
                 .ended_at
@@ -116,22 +119,27 @@ impl PerfTimer {
         let total = self.started.elapsed();
         let total_ms = total.as_millis();
 
-        let stages: Vec<StageSummary> = self.stages.iter().map(|stage| {
-            let dur = stage.ended_at
-                .unwrap_or_else(Instant::now)
-                .duration_since(stage.started_at);
-            let pct = if total.as_micros() > 0 {
-                (dur.as_micros() as f64 / total.as_micros() as f64) * 100.0
-            } else {
-                0.0
-            };
-            StageSummary {
-                name: stage.name.clone(),
-                duration_ms: dur.as_secs_f64() * 1000.0,
-                percentage: pct,
-                started_at_offset_ms: stage.started_at.duration_since(self.started).as_millis(),
-            }
-        }).collect();
+        let stages: Vec<StageSummary> = self
+            .stages
+            .iter()
+            .map(|stage| {
+                let dur = stage
+                    .ended_at
+                    .unwrap_or_else(Instant::now)
+                    .duration_since(stage.started_at);
+                let pct = if total.as_micros() > 0 {
+                    (dur.as_micros() as f64 / total.as_micros() as f64) * 100.0
+                } else {
+                    0.0
+                };
+                StageSummary {
+                    name: stage.name.clone(),
+                    duration_ms: dur.as_secs_f64() * 1000.0,
+                    percentage: pct,
+                    started_at_offset_ms: stage.started_at.duration_since(self.started).as_millis(),
+                }
+            })
+            .collect();
 
         PerfReport {
             label: self.label.clone(),
@@ -143,7 +151,11 @@ impl PerfTimer {
     }
 
     /// 保存性能报告为 JSON 文件
-    pub fn save_json(&mut self, output_path: &std::path::Path, metadata: serde_json::Value) -> std::io::Result<()> {
+    pub fn save_json(
+        &mut self,
+        output_path: &std::path::Path,
+        metadata: serde_json::Value,
+    ) -> std::io::Result<()> {
         let report = self.generate_report(metadata);
         let json = serde_json::to_string_pretty(&report)?;
         if let Some(parent) = output_path.parent() {
@@ -155,7 +167,11 @@ impl PerfTimer {
     }
 
     /// 保存性能报告为 CSV 文件
-    pub fn save_csv(&mut self, output_path: &std::path::Path, metadata: serde_json::Value) -> std::io::Result<()> {
+    pub fn save_csv(
+        &mut self,
+        output_path: &std::path::Path,
+        metadata: serde_json::Value,
+    ) -> std::io::Result<()> {
         use std::io::Write;
         let report = self.generate_report(metadata);
 

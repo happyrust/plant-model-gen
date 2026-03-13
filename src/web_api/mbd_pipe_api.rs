@@ -11,11 +11,11 @@ use once_cell::sync::Lazy;
 
 use aios_core::RefnoEnum;
 use axum::{
+    Json, Router,
     extract::{Path, Query},
-    http::{header::CONTENT_TYPE, HeaderValue},
+    http::{HeaderValue, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
@@ -534,11 +534,7 @@ fn fix_mojibake_utf8_latin1(s: String) -> String {
             let has_cjk = fixed
                 .chars()
                 .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c));
-            if has_cjk {
-                fixed
-            } else {
-                s
-            }
+            if has_cjk { fixed } else { s }
         }
         Err(_) => s,
     }
@@ -1162,11 +1158,7 @@ fn format_dim_length_text_mm(length: f32) -> String {
         return "0".to_string();
     }
     let s = format!("{:.0}", length);
-    if s == "-0" {
-        "0".to_string()
-    } else {
-        s
-    }
+    if s == "-0" { "0".to_string() } else { s }
 }
 
 async fn get_mbd_pipe(
@@ -1256,11 +1248,7 @@ async fn get_mbd_pipe(
                                 let d = db_meta()
                                     .get_dbnum_by_refno(branch_refno.clone())
                                     .unwrap_or(0);
-                                if d > 0 {
-                                    Some(d)
-                                } else {
-                                    None
-                                }
+                                if d > 0 { Some(d) } else { None }
                             });
                             if let Some(dbnum) = dbno_for_export {
                                 tokio::spawn(async move {
@@ -1295,8 +1283,8 @@ async fn get_mbd_pipe(
                     return json_utf8(MbdPipeResponse {
                         success: false,
                         error_message: Some(format!(
-                        "从 SurrealDB 读取分支管段失败: {e}（可尝试 ?source=cache 走 model cache）"
-                    )),
+                            "从 SurrealDB 读取分支管段失败: {e}（可尝试 ?source=cache 走 model cache）"
+                        )),
                         data: None,
                     });
                 }
@@ -1784,7 +1772,7 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
 ) -> anyhow::Result<(Vec<CacheTubiSeg>, MbdPipeDebugInfo)> {
     use aios_core::rs_surreal::geometry_query::PlantTransform;
     use aios_core::shape::pdms_shape::RsVec3;
-    use aios_core::{SurrealQueryExt, SUL_DB};
+    use aios_core::{SUL_DB, SurrealQueryExt};
     use serde::{Deserialize, Serialize};
     use surrealdb::types::SurrealValue;
 
@@ -1902,7 +1890,7 @@ async fn fetch_bend_elements_for_branch(
 ) -> anyhow::Result<Vec<MbdBendDto>> {
     use aios_core::rs_surreal::geometry_query::PlantTransform;
     use aios_core::shape::pdms_shape::RsVec3;
-    use aios_core::{SurrealQueryExt, SUL_DB};
+    use aios_core::{SUL_DB, SurrealQueryExt};
     use serde::{Deserialize, Serialize};
     use surrealdb::types::SurrealValue;
 
@@ -1981,7 +1969,7 @@ async fn fetch_discrete_fitting_elements_for_branch(
 ) -> anyhow::Result<Vec<RawFittingElement>> {
     use aios_core::rs_surreal::geometry_query::PlantTransform;
     use aios_core::shape::pdms_shape::RsVec3;
-    use aios_core::{SurrealQueryExt, SUL_DB};
+    use aios_core::{SUL_DB, SurrealQueryExt};
     use serde::{Deserialize, Serialize};
     use surrealdb::types::SurrealValue;
 
@@ -2375,7 +2363,7 @@ pub async fn export_mbd_json_for_bran(
 
 /// 根据 scope 收集 BRAN/HANG refno 列表
 async fn collect_bran_refnos_for_scope(scope: &MbdExportScope) -> anyhow::Result<Vec<RefnoEnum>> {
-    use aios_core::{SurrealQueryExt, SUL_DB};
+    use aios_core::{SUL_DB, SurrealQueryExt};
 
     aios_core::init_surreal().await?;
 
@@ -2545,7 +2533,7 @@ async fn post_generate_mbd(Json(req): Json<MbdGenerateRequest>) -> impl IntoResp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     #[test]
     fn test_closest_endpoints_direction_flip() {
@@ -2756,10 +2744,12 @@ mod tests {
             )
         }));
         assert!(output.dims.iter().all(|dim| dim.id.starts_with("dim:")));
-        assert!(output
-            .cut_tubis
-            .iter()
-            .all(|item| item.id.starts_with("cut_tubi:")));
+        assert!(
+            output
+                .cut_tubis
+                .iter()
+                .all(|item| item.id.starts_with("cut_tubi:"))
+        );
     }
 
     #[test]
@@ -2803,11 +2793,12 @@ mod tests {
         assert_eq!(output.fittings.len(), 2);
         assert!(output.tags.iter().any(|tag| tag.noun == "TEE"));
         assert!(output.tags.iter().any(|tag| tag.noun == "FLAN"));
-        assert!(output.fittings.iter().all(|item| item
-            .layout_hint
-            .as_ref()
-            .and_then(|hint| hint.owner_segment_id.clone())
-            .is_some()));
+        assert!(output.fittings.iter().all(|item| {
+            item.layout_hint
+                .as_ref()
+                .and_then(|hint| hint.owner_segment_id.clone())
+                .is_some()
+        }));
     }
 
     #[test]

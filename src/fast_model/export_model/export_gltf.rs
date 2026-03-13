@@ -16,12 +16,8 @@ use crate::fast_model::unit_converter::UnitConverter;
 
 use super::export_common::{ExportData, collect_export_data};
 use super::model_exporter::{
-    ExportStats,
-    GltfExportConfig,
-    ModelExporter,
-    collect_export_refnos,
-    query_geometry_instances_ext,
-    query_geometry_instances_ext_from_cache,
+    ExportStats, GltfExportConfig, ModelExporter, collect_export_refnos,
+    query_geometry_instances_ext, query_geometry_instances_ext_from_cache,
 };
 
 /// 导出指定 refno 的整体 glTF 模型（JSON + BIN）
@@ -195,8 +191,9 @@ fn export_mesh_to_gltf(
 
     // 为每个唯一几何体构建 buffer 数据
     for geo_hash in &sorted_geo_hashes {
-        let mesh = mesh_cache.load_or_get(geo_hash, mesh_dir)
-             .with_context(|| format!("Export GLTF: 加载 mesh {} 失败", geo_hash))?;
+        let mesh = mesh_cache
+            .load_or_get(geo_hash, mesh_dir)
+            .with_context(|| format!("Export GLTF: 加载 mesh {} 失败", geo_hash))?;
 
         let vertex_count = mesh.vertices.len();
         let mut min_pos = Vec3::new(f32::MAX, f32::MAX, f32::MAX);

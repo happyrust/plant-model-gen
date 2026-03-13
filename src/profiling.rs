@@ -91,14 +91,11 @@ pub fn init_chrome_tracing_for_db_option(
         .unwrap_or_else(|| "all".to_string());
 
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let out = PathBuf::from("output")
-        .join("profile")
-        .join(format!(
-            "chrome_trace_{}_dbnum_{}_{}.json",
-            stage, dbnum_tag, ts
-        ));
+    let out = PathBuf::from("output").join("profile").join(format!(
+        "chrome_trace_{}_dbnum_{}_{}.json",
+        stage, dbnum_tag, ts
+    ));
 
     init_chrome_tracing(&out)?;
     Ok(out)
 }
-

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[tokio::test]
+#[ignore = "requires a SurrealDB build with rocksdb support and seeded export data"]
 async fn test_export_dbnum_instances_json_1112() {
     // 初始化测试数据库
     aios_core::init_surreal().await.unwrap();
@@ -82,6 +83,7 @@ async fn test_export_dbnum_instances_json_1112() {
 }
 
 #[tokio::test]
+#[ignore = "requires a SurrealDB build with rocksdb support and seeded export data"]
 async fn test_export_dbnum_instances_json_aabb_format() {
     // 测试 AABB 格式正确性
     aios_core::init_surreal().await.unwrap();
@@ -97,7 +99,7 @@ async fn test_export_dbnum_instances_json_aabb_format() {
             &output_dir,
             db_option,
             false,
-            None, // 使用默认毫米单位
+            None,  // 使用默认毫米单位
             None,  // root_refno: 导出整个 dbnum
             false, // detailed: 使用精简格式
         )

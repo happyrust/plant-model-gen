@@ -117,8 +117,7 @@ impl BooleanTaskAccumulator {
         // inst_geos_map: 复用 aios_core 的 insert_geos_data 合并语义，
         // 同 inst_key 跨批次的 insts 会 extend_from_slice 而非覆盖
         for (inst_key, geos) in &batch.inst_geos_map {
-            self.merged
-                .insert_geos_data(inst_key.clone(), geos.clone());
+            self.merged.insert_geos_data(inst_key.clone(), geos.clone());
         }
         // inst_tubi_map: key 是 RefnoEnum（唯一标识），同 refno 跨批次的 tubi 语义相同，覆盖安全
         for (refno, tubi) in &batch.inst_tubi_map {
@@ -239,7 +238,11 @@ pub fn extract_inst_neg_tasks(shape_insts: &ShapeInstancesData) -> Vec<BooleanTa
 
     for (target, pairs) in &shape_insts.ngmr_neg_relate_map {
         let entry = target_neg_specs.entry(*target).or_default();
-        entry.extend(pairs.iter().map(|(carrier, ngmr_geom)| (*carrier, Some(*ngmr_geom))));
+        entry.extend(
+            pairs
+                .iter()
+                .map(|(carrier, ngmr_geom)| (*carrier, Some(*ngmr_geom))),
+        );
     }
 
     for (target_refno, raw_specs) in target_neg_specs {
@@ -253,19 +256,20 @@ pub fn extract_inst_neg_tasks(shape_insts: &ShapeInstancesData) -> Vec<BooleanTa
         };
 
         let inst_key = info.get_inst_key();
-        let pos_geos: Vec<PosGeoData> = if let Some(geos_data) = shape_insts.inst_geos_map.get(&inst_key) {
-            geos_data
-                .insts
-                .iter()
-                .filter(|g| g.geo_type == GeoBasicType::Pos)
-                .map(|g| PosGeoData {
-                    geo_hash: g.geo_hash.to_string(),
-                    local_transform: g.geo_transform,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let pos_geos: Vec<PosGeoData> =
+            if let Some(geos_data) = shape_insts.inst_geos_map.get(&inst_key) {
+                geos_data
+                    .insts
+                    .iter()
+                    .filter(|g| g.geo_type == GeoBasicType::Pos)
+                    .map(|g| PosGeoData {
+                        geo_hash: g.geo_hash.to_string(),
+                        local_transform: g.geo_transform,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         if pos_geos.is_empty() {
             continue;

@@ -1,6 +1,41 @@
 # Quick Deploy Reference
 
-## Deploy from GitHub Actions (Recommended)
+## Prerequisites
+
+- **For local macOS builds (default path):** `cargo install cargo-zigbuild` and [Zig toolchain](https://ziglang.org/download/)
+- **For GitHub artifact/release deploys:** `gh` CLI installed and authenticated
+- **Remote access:** `sshpass` and `rsync` installed locally
+- **Remote credentials:** Default target is `123.57.182.243` (root/Happytest123_) — override via environment variables if needed
+
+## Deploy from Local Build (Default Path)
+
+### Full Stack (Backend + Frontend)
+
+```bash
+# macOS → Linux cross-compilation happens automatically
+./shells/deploy_all_with_frontend.sh
+```
+
+This is the **verified default workflow** for local development:
+1. Auto-detects macOS and uses `cargo zigbuild` to build for Linux x86_64
+2. Deploys backend binary, assets, and configuration
+3. Builds and deploys frontend bundle to nginx
+4. Verifies remote services (systemctl, curl health checks)
+5. Includes retry logic (5 attempts) for transient SSH/rsync failures
+
+### Backend Only
+
+```bash
+./shells/deploy_web_server_bundle.sh
+```
+
+### Force Native Build (No Cross-Compilation)
+
+```bash
+USE_ZIGBUILD=false ./shells/deploy_all_with_frontend.sh
+```
+
+## Deploy from GitHub Actions (CI Artifacts)
 
 ```bash
 # 1. Find the latest successful build
@@ -16,57 +51,33 @@ BINARY_SOURCE=github-artifact GITHUB_RUN_ID=<RUN_ID> ./shells/deploy_all_with_fr
 BINARY_SOURCE=github-release GITHUB_TAG=v1.2.3 ./shells/deploy_all_with_frontend.sh
 ```
 
-## Deploy from Local Build (Development)
+## Post-Deployment Verification
 
-### macOS → Linux Cross-Compilation (Default)
-
-Local deployment now automatically uses `cargo zigbuild` on macOS to cross-compile for Linux x86_64:
+After deployment completes, verify the services manually:
 
 ```bash
-# Builds for Linux automatically on macOS, deploys to remote server
-./shells/deploy_all_with_frontend.sh
+# On local machine:
+curl -fsS http://123.57.182.243/
+curl -fsS http://123.57.182.243/api/projects
+
+# On remote server:
+ssh root@123.57.182.243
+systemctl status web-server
+systemctl status nginx
+curl -fsS http://127.0.0.1:3100/
+curl -fsS http://127.0.0.1:3100/api/projects
 ```
 
-**Prerequisites:** `cargo install cargo-zigbuild` and [Zig toolchain](https://ziglang.org/download/)
+All of these checks are also run automatically by `deploy_all_with_frontend.sh` with retry logic.
 
-### Force Native Build
+## Custom Server Configuration
 
-```bash
-# Build for native platform instead of cross-compiling
-USE_ZIGBUILD=false ./shells/deploy_all_with_frontend.sh
-```
-
-### Backend Only
+Override defaults for non-standard deployments:
 
 ```bash
-# From local build (macOS → Linux with zigbuild)
-./shells/deploy_web_server_bundle.sh
-
-# From artifact
-BINARY_SOURCE=github-artifact GITHUB_RUN_ID=<RUN_ID> ./shells/deploy_web_server_bundle.sh
-
-# From release
-BINARY_SOURCE=github-release GITHUB_TAG=v1.2.3 ./shells/deploy_web_server_bundle.sh
-
-# Force native build
-USE_ZIGBUILD=false ./shells/deploy_web_server_bundle.sh
-```
-
-## Deployment Resilience
-
-All deployment scripts now include automatic retry logic with exponential backoff (5 attempts) for:
-- SSH authentication and command execution
-- rsync/scp file transfers
-- Remote health check verification
-
-This ensures reliable deployment over unstable connections or during transient auth failures.
-
-## Full Example with Custom Server
-
-```bash
-REMOTE_HOST=123.57.182.243 \
-REMOTE_USER=root \
-REMOTE_PASS=Happytest123_ \
+REMOTE_HOST=your.server.ip \
+REMOTE_USER=your_user \
+REMOTE_PASS='your_password' \
 BINARY_SOURCE=github-artifact \
 GITHUB_RUN_ID=12345678 \
 ./shells/deploy_all_with_frontend.sh
@@ -81,9 +92,20 @@ GITHUB_RUN_ID=12345678 \
 | `ZIGBUILD_TARGET` | `x86_64-unknown-linux-gnu` | Target triple for zigbuild |
 | `GITHUB_RUN_ID` | - | Required for `github-artifact` source |
 | `GITHUB_TAG` | - | Required for `github-release` source |
+| `ARTIFACT_NAME` | `linux-x64-release` | Artifact name for GitHub downloads |
 | `REMOTE_HOST` | `123.57.182.243` | Target server IP |
 | `REMOTE_USER` | `root` | SSH username |
 | `REMOTE_PASS` | `Happytest123_` | SSH password |
+| `BACKEND_ORIGIN` | `http://127.0.0.1:3100` | Backend URL for nginx proxy |
+
+## Retry Behavior
+
+All deployment scripts include automatic retry logic with exponential backoff (5 attempts, starting at 2s delay) for:
+- SSH authentication and remote command execution
+- rsync/scp file transfers
+- Remote health check verification
+
+This handles intermittent SSH auth failures and network instability without manual intervention.
 
 ## Additional Documentation
 

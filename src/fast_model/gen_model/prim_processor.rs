@@ -46,20 +46,15 @@ pub async fn process_prim_refno_page(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aios_core::options::DbOption;
     use crate::options::DbOptionExt;
+    use aios_core::options::DbOption;
 
     #[tokio::test]
     async fn test_empty_refnos() {
-        let ctx = NounProcessContext::new(
-            Arc::new(DbOptionExt::from(DbOption::default())),
-            100,
-            4,
-        );
+        let ctx = NounProcessContext::new(Arc::new(DbOptionExt::from(DbOption::default())), 100, 4);
         let (sender, _receiver) = flume::unbounded();
 
         let result = process_prim_refno_page(&ctx, sender, &[]).await;
         assert!(result.is_ok());
     }
 }
-

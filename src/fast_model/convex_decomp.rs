@@ -12,16 +12,16 @@
 //! 缓存键约定（用户已锁定）：仅使用 geo_hash，不纳入 LOD/mesh_signature。
 //! 因此提供 FORCE_REGEN_CONVEX=1 强制失效机制。
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
+use glam::{Mat4, Vec3};
 use once_cell::sync::OnceCell;
 use parry3d::bounding_volume::{Aabb, BoundingVolume};
 use parry3d::math::{Isometry, Point, Vector};
-use parry3d::query::{intersection_test, PointQuery, Ray, RayCast};
+use parry3d::query::{PointQuery, Ray, RayCast, intersection_test};
 use parry3d::shape::{ConvexPolyhedron, TriMesh};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use glam::{Mat4, Vec3};
 
 pub const CONVEX_DECOMP_FILE_VERSION: u32 = 1;
 
@@ -163,7 +163,10 @@ pub fn clear_convex_cache() {
     cache().clear();
 }
 
-pub async fn load_or_build_convex_runtime(mesh_dir: &Path, geo_hash: &str) -> Result<Arc<ConvexRuntime>> {
+pub async fn load_or_build_convex_runtime(
+    mesh_dir: &Path,
+    geo_hash: &str,
+) -> Result<Arc<ConvexRuntime>> {
     let force_regen = env_bool("FORCE_REGEN_CONVEX", false);
     if force_regen {
         cache().remove(geo_hash);
@@ -222,7 +225,8 @@ pub async fn load_or_build_convex_runtime(mesh_dir: &Path, geo_hash: &str) -> Re
 async fn load_runtime_from_file(path: &Path) -> Result<ConvexRuntime> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<ConvexRuntime> {
-        let data = std::fs::read(&path).with_context(|| format!("读取凸分解文件失败: {}", path.display()))?;
+        let data = std::fs::read(&path)
+            .with_context(|| format!("读取凸分解文件失败: {}", path.display()))?;
         let file: ConvexDecompositionFileV1 =
             rkyv::from_bytes::<ConvexDecompositionFileV1, rkyv::rancor::Error>(&data)
                 .map_err(|e| anyhow!("rkyv 反序列化失败: {:?}", e))?;
@@ -258,7 +262,10 @@ fn build_runtime_from_file(file: &ConvexDecompositionFileV1) -> Result<ConvexRun
         });
     }
     if hulls.is_empty() {
-        return Err(anyhow!("凸分解文件有效 hull 为空: geo_hash={}", file.geo_hash));
+        return Err(anyhow!(
+            "凸分解文件有效 hull 为空: geo_hash={}",
+            file.geo_hash
+        ));
     }
     Ok(ConvexRuntime {
         geo_hash: file.geo_hash.clone(),
@@ -333,11 +340,7 @@ fn build_unit_runtime(geo_hash: &str) -> Result<ConvexRuntime> {
     };
 
     // 单位几何体本身是凸的：直接使用其所有顶点生成一个凸包（单 hull）。
-    let verts: Vec<[f32; 3]> = mesh
-        .vertices
-        .iter()
-        .map(|v| [v.x, v.y, v.z])
-        .collect();
+    let verts: Vec<[f32; 3]> = mesh.vertices.iter().map(|v| [v.x, v.y, v.z]).collect();
     if verts.len() < 4 {
         return Err(anyhow!("单位几何顶点不足: geo_hash={}", geo_hash));
     }
@@ -364,13 +367,21 @@ fn build_unit_runtime(geo_hash: &str) -> Result<ConvexRuntime> {
 ///
 /// 注意：该函数依赖 miniacd，仅在启用 `convex-decomposition` feature 时可用。
 #[cfg(feature = "convex-decomposition")]
-pub async fn build_and_save_convex_from_glb(base_mesh_dir: &Path, geo_hash: &str) -> Result<Arc<ConvexRuntime>> {
+pub async fn build_and_save_convex_from_glb(
+    base_mesh_dir: &Path,
+    geo_hash: &str,
+) -> Result<Arc<ConvexRuntime>> {
     let threshold = env_f64("CONVEX_DECOMP_THRESHOLD", 0.05);
     let mcts_iterations = env_u32("CONVEX_DECOMP_MCTS_ITERATIONS", 150);
     let max_points = env_u32("ROOM_RELATION_CONVEX_MAX_POINTS", 128).max(4);
 
-    let glb_path = find_any_glb_path(base_mesh_dir, geo_hash)
-        .with_context(|| format!("未找到可用 GLB: base={} geo_hash={}", base_mesh_dir.display(), geo_hash))?;
+    let glb_path = find_any_glb_path(base_mesh_dir, geo_hash).with_context(|| {
+        format!(
+            "未找到可用 GLB: base={} geo_hash={}",
+            base_mesh_dir.display(),
+            geo_hash
+        )
+    })?;
 
     let geo_hash_string = geo_hash.to_string();
     let mesh = tokio::task::spawn_blocking(move || {
@@ -379,9 +390,17 @@ pub async fn build_and_save_convex_from_glb(base_mesh_dir: &Path, geo_hash: &str
     })
     .await??;
 
-    let (file, runtime) = tokio::task::spawn_blocking(move || -> Result<(ConvexDecompositionFileV1, ConvexRuntime)> {
-        build_convex_from_plant_mesh(&geo_hash_string, threshold, mcts_iterations, max_points, &mesh)
-    })
+    let (file, runtime) = tokio::task::spawn_blocking(
+        move || -> Result<(ConvexDecompositionFileV1, ConvexRuntime)> {
+            build_convex_from_plant_mesh(
+                &geo_hash_string,
+                threshold,
+                mcts_iterations,
+                max_points,
+                &mesh,
+            )
+        },
+    )
     .await??;
 
     // 写盘（rkyv）
@@ -562,7 +581,11 @@ fn is_point_inside_mesh_raycast(point: &Point<f32>, tri_mesh: &TriMesh) -> bool 
     hit_pos_y.is_some() && hit_neg_y.is_some()
 }
 
-fn is_point_inside_any_mesh(point: &Point<f32>, panel_meshes: &[Arc<TriMesh>], tolerance_sq: f32) -> bool {
+fn is_point_inside_any_mesh(
+    point: &Point<f32>,
+    panel_meshes: &[Arc<TriMesh>],
+    tolerance_sq: f32,
+) -> bool {
     for mesh in panel_meshes {
         if is_point_inside_mesh_raycast(point, mesh.as_ref()) {
             return true;
@@ -611,7 +634,8 @@ pub fn component_overlaps_room(
             continue;
         };
         for panel in panel_meshes {
-            if intersection_test(&identity, &world_poly, &identity, panel.as_ref()).unwrap_or(false) {
+            if intersection_test(&identity, &world_poly, &identity, panel.as_ref()).unwrap_or(false)
+            {
                 return true;
             }
         }
@@ -648,7 +672,10 @@ fn transform_aabb_by_mat4(aabb: &Aabb, mat: &Mat4) -> Aabb {
     out
 }
 
-fn build_world_convex_polyhedron(local_vertices: &[[f32; 3]], mat: &Mat4) -> Option<ConvexPolyhedron> {
+fn build_world_convex_polyhedron(
+    local_vertices: &[[f32; 3]],
+    mat: &Mat4,
+) -> Option<ConvexPolyhedron> {
     if local_vertices.len() < 4 {
         return None;
     }
@@ -729,10 +756,7 @@ mod tests {
     }
 
     fn only_corners_as_samples(verts: &[[f32; 3]]) -> Vec<Point<f32>> {
-        verts
-            .iter()
-            .map(|v| Point::new(v[0], v[1], v[2]))
-            .collect()
+        verts.iter().map(|v| Point::new(v[0], v[1], v[2])).collect()
     }
 
     fn centroid_only_sample(verts: &[[f32; 3]]) -> Vec<Point<f32>> {
@@ -770,14 +794,25 @@ mod tests {
     }
 
     fn merge_aabb(a: &Aabb, b: &Aabb) -> Aabb {
-        let mins = Point::new(a.mins.x.min(b.mins.x), a.mins.y.min(b.mins.y), a.mins.z.min(b.mins.z));
-        let maxs = Point::new(a.maxs.x.max(b.maxs.x), a.maxs.y.max(b.maxs.y), a.maxs.z.max(b.maxs.z));
+        let mins = Point::new(
+            a.mins.x.min(b.mins.x),
+            a.mins.y.min(b.mins.y),
+            a.mins.z.min(b.mins.z),
+        );
+        let maxs = Point::new(
+            a.maxs.x.max(b.maxs.x),
+            a.maxs.y.max(b.maxs.y),
+            a.maxs.z.max(b.maxs.z),
+        );
         Aabb::new(mins, maxs)
     }
 
     fn runtime_from_box(min: [f32; 3], max: [f32; 3]) -> ConvexRuntime {
         let verts = box_vertices(min, max);
-        let local_aabb = Aabb::new(Point::new(min[0], min[1], min[2]), Point::new(max[0], max[1], max[2]));
+        let local_aabb = Aabb::new(
+            Point::new(min[0], min[1], min[2]),
+            Point::new(max[0], max[1], max[2]),
+        );
         let sample_points_local = sample_points_from_vertices(&verts, 32);
         ConvexRuntime {
             geo_hash: "test".to_string(),

@@ -2,7 +2,7 @@ use crate::consts::TEAM_DATA_TABLE;
 #[cfg(feature = "sql")]
 use aios_core::db_pool::get_project_pool;
 use aios_core::error::init_query_error;
-use aios_core::{RefU64, project_primary_db, init_test_surreal, query_filter_ancestors};
+use aios_core::{RefU64, init_test_surreal, project_primary_db, query_filter_ancestors};
 use aios_core::{get_db_option, get_default_name, get_named_attmap};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -164,6 +164,7 @@ fn gen_save_team_data_sql(data: Vec<SysDBData>) -> String {
 }
 
 #[tokio::test]
+#[ignore = "requires initialized SurrealDB test data"]
 async fn test_ancestor() -> anyhow::Result<()> {
     init_test_surreal().await;
     let refno = RefU64::from_str("24575/2195").unwrap();

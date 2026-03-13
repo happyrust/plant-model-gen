@@ -5,8 +5,8 @@
 use axum::{
     Router,
     extract::{Json, Query},
-    http::{StatusCode, HeaderMap},
-    routing::{post, get},
+    http::{HeaderMap, StatusCode},
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -123,11 +123,10 @@ async fn get_aux_data(
     headers: HeaderMap,
     Json(request): Json<AuxDataRequest>,
 ) -> Result<Json<AuxDataResponse>, StatusCode> {
-    
     // 1. Auth Check
     let u_code = headers.get("UCode").and_then(|v| v.to_str().ok());
     let u_key = headers.get("UKey").and_then(|v| v.to_str().ok());
-    
+
     // Simple mock auth for now (replace with validation against config later)
     if u_code.is_none() || u_key.is_none() {
         warn!("Missing Auth Headers in Aux Data Request");
@@ -135,7 +134,10 @@ async fn get_aux_data(
     }
     // TODO: Validate code/key match secrets
 
-    info!("Received Aux Data Request: project_id={}, form_id={}", request.project_id, request.form_id);
+    info!(
+        "Received Aux Data Request: project_id={}, form_id={}",
+        request.project_id, request.form_id
+    );
 
     // 尝试从数据库查询真实碰撞数据
     let collision = match query_collision_for_refnos(&request.model_refnos).await {
@@ -160,29 +162,38 @@ async fn get_aux_data(
 }
 
 /// 从数据库查询碰撞数据
-async fn query_collision_for_refnos(refnos: &[String]) -> Result<Vec<CollisionItem>, Box<dyn std::error::Error>> {
+async fn query_collision_for_refnos(
+    refnos: &[String],
+) -> Result<Vec<CollisionItem>, Box<dyn std::error::Error>> {
     if refnos.is_empty() {
         return Ok(vec![]);
     }
     let sql = "SELECT * FROM collision_events WHERE object_one IN $refnos OR object_two IN $refnos LIMIT 50";
-    let mut resp = project_primary_db().query(sql)
+    let mut resp = project_primary_db()
+        .query(sql)
         .bind(("refnos", refnos.to_vec()))
         .await?;
     let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-    Ok(rows.iter().map(|row| CollisionItem {
-        object_one_loc: row["object_one_loc"].as_str().unwrap_or("").to_string(),
-        object_one: row["object_one"].as_str().unwrap_or("").to_string(),
-        object_two_loc: row["object_two_loc"].as_str().unwrap_or("").to_string(),
-        object_two: row["object_two"].as_str().unwrap_or("").to_string(),
-        error_msg: row["error_msg"].as_str().unwrap_or("碰撞").to_string(),
-        object_one_major: row["object_one_major"].as_str().unwrap_or("").to_string(),
-        object_two_major: row["object_two_major"].as_str().unwrap_or("").to_string(),
-        check_usr: row["check_usr"].as_str().unwrap_or("system").to_string(),
-        check_date: row["check_date"].as_str().unwrap_or("").to_string(),
-        up_usr: row["up_usr"].as_str().unwrap_or("").to_string(),
-        up_time: row["up_time"].as_str().unwrap_or("").to_string(),
-        error_status: row["error_status"].as_str().unwrap_or("pending").to_string(),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|row| CollisionItem {
+            object_one_loc: row["object_one_loc"].as_str().unwrap_or("").to_string(),
+            object_one: row["object_one"].as_str().unwrap_or("").to_string(),
+            object_two_loc: row["object_two_loc"].as_str().unwrap_or("").to_string(),
+            object_two: row["object_two"].as_str().unwrap_or("").to_string(),
+            error_msg: row["error_msg"].as_str().unwrap_or("碰撞").to_string(),
+            object_one_major: row["object_one_major"].as_str().unwrap_or("").to_string(),
+            object_two_major: row["object_two_major"].as_str().unwrap_or("").to_string(),
+            check_usr: row["check_usr"].as_str().unwrap_or("system").to_string(),
+            check_date: row["check_date"].as_str().unwrap_or("").to_string(),
+            up_usr: row["up_usr"].as_str().unwrap_or("").to_string(),
+            up_time: row["up_time"].as_str().unwrap_or("").to_string(),
+            error_status: row["error_status"]
+                .as_str()
+                .unwrap_or("pending")
+                .to_string(),
+        })
+        .collect())
 }
 
 /// 生成 mock 碰撞数据，关联 model_refnos
@@ -247,8 +258,10 @@ pub struct CollisionDataResponse {
 async fn get_collision_data(
     Query(params): Query<CollisionQueryParams>,
 ) -> impl axum::response::IntoResponse {
-    info!("Querying collision data: project={:?}, refno={:?}",
-          params.project_id, params.refno);
+    info!(
+        "Querying collision data: project={:?}, refno={:?}",
+        params.project_id, params.refno
+    );
 
     let limit = params.limit.unwrap_or(100);
     let offset = params.offset.unwrap_or(0);
@@ -275,8 +288,9 @@ async fn get_collision_data(
     match query.await {
         Ok(mut resp) => {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-            let items: Vec<CollisionItem> = rows.iter().map(|row| {
-                CollisionItem {
+            let items: Vec<CollisionItem> = rows
+                .iter()
+                .map(|row| CollisionItem {
                     object_one_loc: row["object_one_loc"].as_str().unwrap_or("").to_string(),
                     object_one: row["object_one"].as_str().unwrap_or("").to_string(),
                     object_two_loc: row["object_two_loc"].as_str().unwrap_or("").to_string(),
@@ -288,9 +302,12 @@ async fn get_collision_data(
                     check_date: row["check_date"].as_str().unwrap_or("").to_string(),
                     up_usr: row["up_usr"].as_str().unwrap_or("").to_string(),
                     up_time: row["up_time"].as_str().unwrap_or("").to_string(),
-                    error_status: row["error_status"].as_str().unwrap_or("pending").to_string(),
-                }
-            }).collect();
+                    error_status: row["error_status"]
+                        .as_str()
+                        .unwrap_or("pending")
+                        .to_string(),
+                })
+                .collect();
 
             // 如果数据库为空，返回 mock 数据
             let items = if items.is_empty() {
@@ -301,12 +318,15 @@ async fn get_collision_data(
             };
             let total = items.len() as i32;
 
-            (axum::http::StatusCode::OK, axum::Json(CollisionDataResponse {
-                success: true,
-                data: items,
-                total,
-                error_message: None,
-            }))
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(CollisionDataResponse {
+                    success: true,
+                    data: items,
+                    total,
+                    error_message: None,
+                }),
+            )
         }
         Err(e) => {
             warn!("Failed to query collision data: {}", e);
@@ -314,12 +334,15 @@ async fn get_collision_data(
             let refno = params.refno.clone().unwrap_or_else(|| "0_0".to_string());
             let items = generate_mock_collisions(&[refno]);
             let total = items.len() as i32;
-            (axum::http::StatusCode::OK, axum::Json(CollisionDataResponse {
-                success: true,
-                data: items,
-                total,
-                error_message: None,
-            }))
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(CollisionDataResponse {
+                    success: true,
+                    data: items,
+                    total,
+                    error_message: None,
+                }),
+            )
         }
     }
 }

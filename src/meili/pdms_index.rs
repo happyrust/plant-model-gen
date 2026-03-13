@@ -1,7 +1,7 @@
-use anyhow::Context;
 use aios_core::options::DbOption;
-use meilisearch_sdk::client::Client;
+use anyhow::Context;
 use log::warn;
+use meilisearch_sdk::client::Client;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -35,14 +35,24 @@ impl MeiliEnvConfig {
             .as_ref()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .or_else(|| std::env::var("MEILI_URL").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()))?;
+            .or_else(|| {
+                std::env::var("MEILI_URL")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })?;
 
         let api_key = opt
             .meili_api_key
             .as_ref()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .or_else(|| std::env::var("MEILI_API_KEY").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()));
+            .or_else(|| {
+                std::env::var("MEILI_API_KEY")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            });
 
         let index = opt
             .meili_pdms_index
@@ -62,7 +72,12 @@ impl MeiliEnvConfig {
             .as_ref()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .or_else(|| std::env::var("MEILI_SPOOL_DIR").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()))
+            .or_else(|| {
+                std::env::var("MEILI_SPOOL_DIR")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("output/meili_spool"));
         let batch_size = std::env::var("MEILI_BATCH_SIZE")
@@ -90,7 +105,8 @@ impl PdmsSpoolWriter {
         fs::create_dir_all(spool_dir)
             .with_context(|| format!("create meili spool dir failed: {}", spool_dir.display()))?;
         let path = spool_dir.join(format!("{dbnum}.jsonl"));
-        let f = File::create(&path).with_context(|| format!("create spool file failed: {}", path.display()))?;
+        let f = File::create(&path)
+            .with_context(|| format!("create spool file failed: {}", path.display()))?;
         Ok(Self {
             path,
             w: BufWriter::new(f),
@@ -128,7 +144,8 @@ pub async fn import_spool_file(cfg: &MeiliEnvConfig, spool_path: &Path) -> anyho
     let _ = index.set_filterable_attributes(&["noun", "site"]).await;
     let _ = index.set_searchable_attributes(&["name", "refno"]).await;
 
-    let f = File::open(spool_path).with_context(|| format!("open spool file failed: {}", spool_path.display()))?;
+    let f = File::open(spool_path)
+        .with_context(|| format!("open spool file failed: {}", spool_path.display()))?;
     let reader = BufReader::new(f);
 
     let mut buf: Vec<PdmsNodeDoc> = Vec::with_capacity(cfg.batch_size);

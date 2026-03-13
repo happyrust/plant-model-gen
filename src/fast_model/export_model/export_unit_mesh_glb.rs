@@ -209,12 +209,16 @@ fn export_unit_mesh_to_glb(
         // 尝试从目录下寻找合适的 LOD（这里暂时使用默认逻辑，或者 L1）
         // mesh_dir 可能是 lod_L1，也可能是 base。
         // GltfMeshCache::load_or_get 会尝试处理文件名。
-        let mesh = mesh_cache.load_or_get(geo_hash, mesh_dir)
+        let mesh = mesh_cache
+            .load_or_get(geo_hash, mesh_dir)
             .with_context(|| format!("Export Unit Mesh: 加载 mesh {} 失败", geo_hash))?;
 
         // unit_mesh：保持原始单位，由实例变换的缩放完成换算
         // 非 unit_mesh：直接在顶点上做单位换算
-        let is_unit_mesh = geo_unit_flag_map.get(geo_hash.as_str()).copied().unwrap_or(false);
+        let is_unit_mesh = geo_unit_flag_map
+            .get(geo_hash.as_str())
+            .copied()
+            .unwrap_or(false);
         let convert_vertices = !is_unit_mesh;
 
         let vertex_count = mesh.vertices.len();
@@ -308,7 +312,7 @@ fn export_unit_mesh_to_glb(
     buffer_data.extend_from_slice(&all_normals_bytes);
     buffer_data.extend_from_slice(&all_uvs_bytes);
     buffer_data.extend_from_slice(&all_indices_bytes);
-    
+
     // 预先进行 padding，确保 buffer_length 与 BIN chunk length 一致
     pad_to_4(&mut buffer_data);
     let buffer_length = buffer_data.len();

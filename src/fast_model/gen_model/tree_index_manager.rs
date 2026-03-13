@@ -18,29 +18,28 @@
 
 use crate::versioned_db::db_meta_info::DEFAULT_TREE_DIR;
 use aios_core::pdms_types::BRAN_COMPONENT_NOUN_NAMES;
-use aios_core::tool::db_tool::{db1_dehash, db1_hash};
-use aios_core::tree_query::{load_tree_index_from_dir, TreeIndex, TreeQuery, TreeQueryFilter, TreeQueryOptions};
 use aios_core::pe::SPdmsElement;
-use aios_core::{RefnoEnum, RefU64};
+use aios_core::tool::db_tool::{db1_dehash, db1_hash};
+use aios_core::tree_query::{
+    TreeIndex, TreeQuery, TreeQueryFilter, TreeQueryOptions, load_tree_index_from_dir,
+};
+use aios_core::{RefU64, RefnoEnum};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-
-static TREE_INDEX_CACHE: Lazy<DashMap<(PathBuf, u32), Arc<TreeIndex>>> =
-    Lazy::new(DashMap::new);
-
-
+static TREE_INDEX_CACHE: Lazy<DashMap<(PathBuf, u32), Arc<TreeIndex>>> = Lazy::new(DashMap::new);
 
 /// 从 DbOption.toml 读取 project_name，返回 output/{project}/scene_tree 路径
 /// 优先使用 DB_OPTION_FILE 环境变量指定的配置文件
 fn get_project_tree_dir() -> Option<PathBuf> {
-    let config_name = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let config_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let config_file = format!("{}.toml", config_name);
     let content = std::fs::read_to_string(&config_file).ok()?;
-    
+
     for line in content.lines() {
         let line = line.trim();
         if line.starts_with("project_name") {
@@ -52,7 +51,7 @@ fn get_project_tree_dir() -> Option<PathBuf> {
             }
         }
     }
-    
+
     None
 }
 
@@ -125,7 +124,7 @@ impl std::fmt::Display for TreeIndexMissingError {
 impl std::error::Error for TreeIndexMissingError {}
 
 /// TreeIndex 管理器
-/// 
+///
 /// 提供对指定 dbnum 的 TreeIndex 统一访问接口
 pub struct TreeIndexManager {
     tree_dir: PathBuf,
@@ -134,7 +133,7 @@ pub struct TreeIndexManager {
 
 impl TreeIndexManager {
     /// 创建新的 TreeIndexManager
-    /// 
+    ///
     /// # Arguments
     /// * `tree_dir` - TreeIndex 文件目录 (如 "output/scene_tree")
     /// * `dbnums` - 要管理的 dbnum 列表
@@ -146,7 +145,7 @@ impl TreeIndexManager {
     }
 
     /// 使用默认目录创建 Manager
-    /// 
+    ///
     /// 优先从 DbOption.toml 读取 project_name，使用 output/{project}/scene_tree
     /// 如果读取失败，回退到旧路径 output/scene_tree
     pub fn with_default_dir(dbnums: Vec<u32>) -> Self {
@@ -180,7 +179,8 @@ impl TreeIndexManager {
                 dbnum,
                 tree_dir: self.tree_dir.clone(),
                 tree_file_path,
-            }.into());
+            }
+            .into());
         }
 
         let index = load_tree_index_from_dir(dbnum, &self.tree_dir)?;
@@ -253,7 +253,7 @@ impl TreeIndexManager {
     }
 
     /// 查询指定 noun 类型的所有 refnos
-    /// 
+    ///
     /// # Arguments
     /// * `noun` - Noun 名称 (如 "BRAN", "PANE")
     /// * `limit` - 可选的数量限制
@@ -275,7 +275,8 @@ impl TreeIndexManager {
                 Err(e) => {
                     log::warn!(
                         "[TreeIndexManager] 加载 TreeIndex dbnum={} 失败: {}",
-                        dbnum, e
+                        dbnum,
+                        e
                     );
                 }
             }
@@ -291,18 +292,15 @@ impl TreeIndexManager {
     }
 
     /// 按多个 noun 类型分组查询 refnos
-    /// 
+    ///
     /// # Arguments
     /// * `nouns` - Noun 名称列表
-    /// 
+    ///
     /// # Returns
     /// 按 noun 名称分组的 refnos 映射
     pub fn query_nouns_grouped(&self, nouns: &[&str]) -> HashMap<String, Vec<RefnoEnum>> {
         // 构建目标 noun hash 集合
-        let target_hashes: HashMap<u32, &str> = nouns
-            .iter()
-            .map(|&n| (db1_hash(n), n))
-            .collect();
+        let target_hashes: HashMap<u32, &str> = nouns.iter().map(|&n| (db1_hash(n), n)).collect();
 
         // 按 noun hash 分组收集 refnos
         let mut result: HashMap<String, Vec<RefnoEnum>> = HashMap::new();
@@ -324,7 +322,8 @@ impl TreeIndexManager {
                 Err(e) => {
                     log::warn!(
                         "[TreeIndexManager] 加载 TreeIndex dbnum={} 失败: {}",
-                        dbnum, e
+                        dbnum,
+                        e
                     );
                 }
             }
@@ -345,7 +344,8 @@ impl TreeIndexManager {
                 Err(e) => {
                     log::warn!(
                         "[TreeIndexManager] 加载 TreeIndex dbnum={} 失败: {}",
-                        dbnum, e
+                        dbnum,
+                        e
                     );
                 }
             }
@@ -357,7 +357,7 @@ impl TreeIndexManager {
     /// 统计各 noun 类型的数量
     pub fn count_by_noun(&self) -> HashMap<String, usize> {
         use aios_core::tool::db_tool::db1_dehash;
-        
+
         let mut counts: HashMap<u32, usize> = HashMap::new();
 
         for &dbnum in &self.dbnums {
@@ -372,7 +372,8 @@ impl TreeIndexManager {
                 Err(e) => {
                     log::warn!(
                         "[TreeIndexManager] 加载 TreeIndex dbnum={} 失败: {}",
-                        dbnum, e
+                        dbnum,
+                        e
                     );
                 }
             }
@@ -397,7 +398,8 @@ impl TreeIndexManager {
                 Err(e) => {
                     log::warn!(
                         "[TreeIndexManager] 加载 TreeIndex dbnum={} 失败: {}",
-                        dbnum, e
+                        dbnum,
+                        e
                     );
                 }
             }
@@ -411,7 +413,7 @@ impl TreeIndexManager {
     // ============================================================================
 
     /// 查询指定节点的所有子孙节点
-    /// 
+    ///
     /// # Arguments
     /// * `root` - 根节点
     /// * `max_depth` - 可选的最大深度限制
@@ -438,7 +440,7 @@ impl TreeIndexManager {
     }
 
     /// 查询指定节点的子孙节点，按 noun 类型过滤
-    /// 
+    ///
     /// # Arguments
     /// * `root` - 根节点
     /// * `nouns` - 要过滤的 noun 名称列表
@@ -452,7 +454,7 @@ impl TreeIndexManager {
         let refno = root.refno();
         let noun_hashes: std::collections::HashSet<u32> =
             nouns.iter().map(|n| db1_hash(n)).collect();
-        
+
         for &dbnum in &self.dbnums {
             if let Ok(index) = self.load_index(dbnum) {
                 if index.contains_refno(refno) {
@@ -477,7 +479,7 @@ impl TreeIndexManager {
     }
 
     /// 批量查询多个根节点的子孙节点，按 noun 类型过滤
-    /// 
+    ///
     /// # Arguments
     /// * `roots` - 根节点列表
     /// * `nouns` - 要过滤的 noun 名称列表
@@ -567,7 +569,8 @@ impl TreeIndexManager {
     ) -> std::collections::HashMap<u32, Vec<RefnoEnum>> {
         let noun_hashes: std::collections::HashSet<u32> =
             nouns.iter().map(|n| db1_hash(n)).collect();
-        let mut grouped: std::collections::HashMap<u32, Vec<RefnoEnum>> = std::collections::HashMap::new();
+        let mut grouped: std::collections::HashMap<u32, Vec<RefnoEnum>> =
+            std::collections::HashMap::new();
         let mut seen = std::collections::HashSet::new();
 
         for &root in roots {
@@ -584,10 +587,15 @@ impl TreeIndexManager {
                             },
                             prune_on_match: prune,
                         };
-                        for (noun_hash, refnos) in index.collect_descendants_bfs_grouped(refno, &options) {
+                        for (noun_hash, refnos) in
+                            index.collect_descendants_bfs_grouped(refno, &options)
+                        {
                             for r in refnos {
                                 if seen.insert(r) {
-                                    grouped.entry(noun_hash).or_default().push(RefnoEnum::from(r));
+                                    grouped
+                                        .entry(noun_hash)
+                                        .or_default()
+                                        .push(RefnoEnum::from(r));
                                 }
                             }
                         }
@@ -628,7 +636,7 @@ impl TreeIndexManager {
         let refno = parent.refno();
         let noun_hashes: std::collections::HashSet<u32> =
             nouns.iter().map(|n| db1_hash(n)).collect();
-        
+
         for &dbnum in &self.dbnums {
             if let Ok(index) = self.load_index(dbnum) {
                 if index.contains_refno(refno) {
@@ -680,7 +688,7 @@ impl TreeIndexManager {
         let refno = node.refno();
         let noun_hashes: std::collections::HashSet<u32> =
             nouns.iter().map(|n| db1_hash(n)).collect();
-        
+
         for &dbnum in &self.dbnums {
             if let Ok(index) = self.load_index(dbnum) {
                 if index.contains_refno(refno) {
@@ -751,7 +759,8 @@ impl TreeIndexManager {
                 Err(e) => {
                     log::warn!(
                         "[TreeIndexManager] 加载 TreeIndex dbnum={} 失败: {}",
-                        dbnum, e
+                        dbnum,
+                        e
                     );
                 }
             }
@@ -776,7 +785,9 @@ impl TreeIndexManager {
         let index = manager.load_index(dbnum)?;
 
         let parent_u64 = parent.refno();
-        let child_u64s = index.query_children(parent_u64, TreeQueryFilter::default()).await?;
+        let child_u64s = index
+            .query_children(parent_u64, TreeQueryFilter::default())
+            .await?;
 
         let mut out: Vec<SPdmsElement> = Vec::with_capacity(child_u64s.len());
         for child in child_u64s {
@@ -807,8 +818,10 @@ impl TreeIndexManager {
         let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
         let index = manager.load_index(dbnum)?;
 
-        let noun_hashes: std::collections::HashSet<u32> =
-            BRAN_COMPONENT_NOUN_NAMES.iter().map(|n| db1_hash(n)).collect();
+        let noun_hashes: std::collections::HashSet<u32> = BRAN_COMPONENT_NOUN_NAMES
+            .iter()
+            .map(|n| db1_hash(n))
+            .collect();
         let options = TreeQueryOptions {
             include_self: false,
             max_depth: None,
@@ -850,8 +863,6 @@ impl TreeIndexManager {
         false
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

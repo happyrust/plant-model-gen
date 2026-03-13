@@ -1,11 +1,5 @@
 use aios_core::RefnoEnum;
-use axum::{
-    Router,
-    extract::Path,
-    http::StatusCode,
-    response::Json,
-    routing::get,
-};
+use axum::{Router, extract::Path, http::StatusCode, response::Json, routing::get};
 use serde::{Deserialize, Serialize};
 
 pub fn create_pdms_attr_routes() -> Router {

@@ -32,15 +32,15 @@
 //!
 //! 查询条件：`geo_type IN ['Pos', 'DesiPos', 'CatePos']`
 
-use anyhow::Context;
-use aios_core::{GeomInstQuery, RefnoEnum, SurrealQueryExt, model_primary_db};
-use surrealdb::types::SurrealValue;
-use serde::{Deserialize, Serialize};
-use aios_core::prim_geo::basic::TUBI_GEO_HASH;
-use aios_core::shape::pdms_shape::RsVec3;
-use aios_core::rs_surreal::geometry_query::PlantTransform;
-use aios_core::types::PlantAabb;
 use aios_core::ModelHashInst;
+use aios_core::prim_geo::basic::TUBI_GEO_HASH;
+use aios_core::rs_surreal::geometry_query::PlantTransform;
+use aios_core::shape::pdms_shape::RsVec3;
+use aios_core::types::PlantAabb;
+use aios_core::{GeomInstQuery, RefnoEnum, SurrealQueryExt, model_primary_db};
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
+use surrealdb::types::SurrealValue;
 
 #[derive(Serialize, Deserialize, Debug, SurrealValue)]
 struct TubiQueryResult {
@@ -262,7 +262,9 @@ pub async fn query_insts_with_batch(
 }
 
 /// 查询几何实例信息（默认 batch）
-pub async fn query_insts(refnos: &[RefnoEnum], enable_holes: bool) -> anyhow::Result<Vec<GeomInstQuery>> {
+pub async fn query_insts(
+    refnos: &[RefnoEnum],
+    enable_holes: bool,
+) -> anyhow::Result<Vec<GeomInstQuery>> {
     query_insts_with_batch(refnos, enable_holes, None).await
 }
-

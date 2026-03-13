@@ -1,12 +1,12 @@
+use crate::expression_fix::ExpressionFixer;
 use crate::fast_model::query_gm_params;
 use crate::fast_model::{debug_model, debug_model_debug, debug_model_trace};
-use crate::expression_fix::ExpressionFixer;
 use aios_core::SurrealQueryExt;
 use aios_core::consts::WORD_HASH;
 use aios_core::expression::query_cata::{query_axis_params, resolve_cata_comp};
 use aios_core::expression::resolve::{SCOM_INFO_MAP, resolve_axis_param};
 use aios_core::parsed_data::{CateAxisParam, CateGeomsInfo};
-use aios_core::pdms_data::{PlinParam, ScomInfo, GmParam};
+use aios_core::pdms_data::{GmParam, PlinParam, ScomInfo};
 use aios_core::{CataContext, NamedAttrMap, RefU64, RefnoEnum, model_primary_db};
 use anyhow::anyhow;
 use std::collections::{BTreeMap, HashMap};
@@ -214,9 +214,8 @@ pub async fn resolve_desi_comp(
     let scom_info_time = t_scom_info.elapsed().as_millis();
     debug_model_trace!("scom_info: {:?}", &scom_info);
     let t_context = Instant::now();
-    let mut context = aios_core::rs_surreal::resolve::get_or_create_cata_context(
-        desi_refno, is_tubi,
-    ).await?;
+    let mut context =
+        aios_core::rs_surreal::resolve::get_or_create_cata_context(desi_refno, is_tubi).await?;
     let context_time = t_context.elapsed().as_millis();
 
     let t_bind_params = Instant::now();
@@ -286,12 +285,15 @@ pub async fn resolve_desi_comp(
                         let word = db1_dehash(num_value as u32);
                         debug_model_trace!(
                             "      PARA[{}] = {} ⚠️  类型=WORD, dehash='{}'",
-                            i, value, word
+                            i,
+                            value,
+                            word
                         );
                     } else {
                         debug_model_trace!(
                             "      PARA[{}] = {} ⚠️  类型=WORD (无法解析为数字)",
-                            i, value
+                            i,
+                            value
                         );
                     }
                 } else {
@@ -392,7 +394,10 @@ pub async fn resolve_desi_comp(
     // 这有助于快速定位元件库中的表达式错误
     let t_validate = Instant::now();
     if aios_core::is_debug_model_enabled() {
-        let scom_name = scom_info.attr_map.get_as_string("NAME").unwrap_or_else(|| "未知".to_string());
+        let scom_name = scom_info
+            .attr_map
+            .get_as_string("NAME")
+            .unwrap_or_else(|| "未知".to_string());
         validate_scom_expressions(desi_refno, scom_ref, &scom_name, &scom_info);
     }
     let validate_expr_time = t_validate.elapsed().as_millis();
@@ -468,7 +473,7 @@ fn validate_scom_expressions(
     // 如果有错误，记录详细的错误信息
     if !all_errors.is_empty() {
         use crate::fast_model::ModelErrorKind;
-        
+
         for error in &all_errors {
             crate::model_error!(
                 code = "E-EXPR-002",
@@ -487,7 +492,7 @@ fn validate_scom_expressions(
                 error.message
             );
         }
-        
+
         // 这些表达式错误可能非常多，stdout/stderr 会显著拖慢 profile。
         // 需要时可通过以下开关输出：
         // - `--debug-model`（调试单个 refno）或
@@ -546,7 +551,9 @@ fn validate_scom_expressions(
 }
 
 /// 验证单个 GmParam 中的所有表达式
-fn validate_gm_param_expressions(gm: &GmParam) -> Vec<crate::expression_fix::ExpressionValidationError> {
+fn validate_gm_param_expressions(
+    gm: &GmParam,
+) -> Vec<crate::expression_fix::ExpressionValidationError> {
     let gm_refno = gm.refno.to_string();
     let gm_type = &gm.gm_type;
 
@@ -564,34 +571,70 @@ fn validate_gm_param_expressions(gm: &GmParam) -> Vec<crate::expression_fix::Exp
     // 添加数组类型的表达式
     for (i, expr) in gm.diameters.iter().enumerate() {
         // 使用临时 String 存储属性名，避免生命周期问题
-        expressions.push((Box::leak(format!("diameters[{}]", i).into_boxed_str()), expr.as_str()));
+        expressions.push((
+            Box::leak(format!("diameters[{}]", i).into_boxed_str()),
+            expr.as_str(),
+        ));
     }
     for (i, expr) in gm.distances.iter().enumerate() {
-        expressions.push((Box::leak(format!("distances[{}]", i).into_boxed_str()), expr.as_str()));
+        expressions.push((
+            Box::leak(format!("distances[{}]", i).into_boxed_str()),
+            expr.as_str(),
+        ));
     }
     for (i, expr) in gm.shears.iter().enumerate() {
-        expressions.push((Box::leak(format!("shears[{}]", i).into_boxed_str()), expr.as_str()));
+        expressions.push((
+            Box::leak(format!("shears[{}]", i).into_boxed_str()),
+            expr.as_str(),
+        ));
     }
     for (i, expr) in gm.lengths.iter().enumerate() {
-        expressions.push((Box::leak(format!("lengths[{}]", i).into_boxed_str()), expr.as_str()));
+        expressions.push((
+            Box::leak(format!("lengths[{}]", i).into_boxed_str()),
+            expr.as_str(),
+        ));
     }
     for (i, expr) in gm.xyz.iter().enumerate() {
-        expressions.push((Box::leak(format!("xyz[{}]", i).into_boxed_str()), expr.as_str()));
+        expressions.push((
+            Box::leak(format!("xyz[{}]", i).into_boxed_str()),
+            expr.as_str(),
+        ));
     }
     for (i, expr) in gm.frads.iter().enumerate() {
-        expressions.push((Box::leak(format!("frads[{}]", i).into_boxed_str()), expr.as_str()));
+        expressions.push((
+            Box::leak(format!("frads[{}]", i).into_boxed_str()),
+            expr.as_str(),
+        ));
     }
     for (i, vert) in gm.verts.iter().enumerate() {
-        expressions.push((Box::leak(format!("verts[{}].x", i).into_boxed_str()), vert[0].as_str()));
-        expressions.push((Box::leak(format!("verts[{}].y", i).into_boxed_str()), vert[1].as_str()));
-        expressions.push((Box::leak(format!("verts[{}].z", i).into_boxed_str()), vert[2].as_str()));
+        expressions.push((
+            Box::leak(format!("verts[{}].x", i).into_boxed_str()),
+            vert[0].as_str(),
+        ));
+        expressions.push((
+            Box::leak(format!("verts[{}].y", i).into_boxed_str()),
+            vert[1].as_str(),
+        ));
+        expressions.push((
+            Box::leak(format!("verts[{}].z", i).into_boxed_str()),
+            vert[2].as_str(),
+        ));
     }
     for (i, dxy) in gm.dxy.iter().enumerate() {
-        expressions.push((Box::leak(format!("dxy[{}].x", i).into_boxed_str()), dxy[0].as_str()));
-        expressions.push((Box::leak(format!("dxy[{}].y", i).into_boxed_str()), dxy[1].as_str()));
+        expressions.push((
+            Box::leak(format!("dxy[{}].x", i).into_boxed_str()),
+            dxy[0].as_str(),
+        ));
+        expressions.push((
+            Box::leak(format!("dxy[{}].y", i).into_boxed_str()),
+            dxy[1].as_str(),
+        ));
     }
     for (i, axis) in gm.paxises.iter().enumerate() {
-        expressions.push((Box::leak(format!("paxises[{}]", i).into_boxed_str()), axis.as_str()));
+        expressions.push((
+            Box::leak(format!("paxises[{}]", i).into_boxed_str()),
+            axis.as_str(),
+        ));
     }
 
     ExpressionFixer::validate_gm_param_expressions(&gm_refno, gm_type, &expressions)

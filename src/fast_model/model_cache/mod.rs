@@ -1,7 +1,7 @@
 //! [foyer-removal] 桩模块：model_cache 已移除，此处仅提供编译兼容。
 
-pub mod geom_input_cache;
 pub mod cata_resolve_cache;
+pub mod geom_input_cache;
 pub mod mesh;
 pub mod query;
 
@@ -23,7 +23,11 @@ impl ModelCacheContext {
         std::sync::Arc::new(ModelCacheContext)
     }
 
-    pub fn insert_from_shape(&self, _dbnum: u32, _shape_insts: &aios_core::geometry::ShapeInstancesData) {
+    pub fn insert_from_shape(
+        &self,
+        _dbnum: u32,
+        _shape_insts: &aios_core::geometry::ShapeInstancesData,
+    ) {
         // [foyer-removal] 桩实现，不做任何操作
     }
 

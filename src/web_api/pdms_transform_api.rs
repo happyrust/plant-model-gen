@@ -1,18 +1,15 @@
-use aios_core::{RefnoEnum, project_primary_db, SurrealQueryExt, get_named_attmap, get_type_name};
-use surrealdb::types::SurrealValue;
-use axum::{
-    Router,
-    extract::Path,
-    http::StatusCode,
-    response::Json,
-    routing::get,
-};
+use aios_core::{RefnoEnum, SurrealQueryExt, get_named_attmap, get_type_name, project_primary_db};
+use axum::{Router, extract::Path, http::StatusCode, response::Json, routing::get};
 use serde::{Deserialize, Serialize};
+use surrealdb::types::SurrealValue;
 
 pub fn create_pdms_transform_routes() -> Router {
     Router::new()
         .route("/api/pdms/transform/{refno}", get(get_transform))
-        .route("/api/pdms/transform/compute/{refno}", get(compute_transform))
+        .route(
+            "/api/pdms/transform/compute/{refno}",
+            get(compute_transform),
+        )
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -27,7 +24,9 @@ pub struct TransformResponse {
 }
 
 /// 查询元素的变换矩阵和 owner
-async fn get_transform(Path(refno): Path<RefnoEnum>) -> Result<Json<TransformResponse>, StatusCode> {
+async fn get_transform(
+    Path(refno): Path<RefnoEnum>,
+) -> Result<Json<TransformResponse>, StatusCode> {
     let refno_str = refno.to_string();
     let pe_transform_key = refno.to_pe_key().replace("pe:", "pe_transform:");
 
@@ -47,7 +46,10 @@ async fn get_transform(Path(refno): Path<RefnoEnum>) -> Result<Json<TransformRes
         world_trans: Option<serde_json::Value>,
     }
 
-    match project_primary_db().query_take::<Option<TransformQueryResult>>(&sql, 0).await {
+    match project_primary_db()
+        .query_take::<Option<TransformQueryResult>>(&sql, 0)
+        .await
+    {
         Ok(Some(result)) => {
             // 解析变换矩阵
             let world_transform = parse_transform_matrix(result.world_trans);
@@ -61,7 +63,10 @@ async fn get_transform(Path(refno): Path<RefnoEnum>) -> Result<Json<TransformRes
                 owner: Option<String>,
             }
 
-            let owner = match project_primary_db().query_take::<Option<OwnerQueryResult>>(&owner_sql, 0).await {
+            let owner = match project_primary_db()
+                .query_take::<Option<OwnerQueryResult>>(&owner_sql, 0)
+                .await
+            {
                 Ok(Some(result)) => result.owner,
                 _ => None,
             };
@@ -74,24 +79,20 @@ async fn get_transform(Path(refno): Path<RefnoEnum>) -> Result<Json<TransformRes
                 error_message: None,
             }))
         }
-        Ok(None) => {
-            Ok(Json(TransformResponse {
-                success: false,
-                refno: refno_str,
-                world_transform: None,
-                owner: None,
-                error_message: Some("未找到变换矩阵数据".to_string()),
-            }))
-        }
-        Err(e) => {
-            Ok(Json(TransformResponse {
-                success: false,
-                refno: refno_str,
-                world_transform: None,
-                owner: None,
-                error_message: Some(format!("数据库查询失败: {}", e)),
-            }))
-        }
+        Ok(None) => Ok(Json(TransformResponse {
+            success: false,
+            refno: refno_str,
+            world_transform: None,
+            owner: None,
+            error_message: Some("未找到变换矩阵数据".to_string()),
+        })),
+        Err(e) => Ok(Json(TransformResponse {
+            success: false,
+            refno: refno_str,
+            world_transform: None,
+            owner: None,
+            error_message: Some(format!("数据库查询失败: {}", e)),
+        })),
     }
 }
 
@@ -165,19 +166,26 @@ async fn compute_transform(
     }
 
     // 计算 local transform
-    let local_mat = aios_core::transform::get_local_mat4(refno).await.ok().flatten();
+    let local_mat = aios_core::transform::get_local_mat4(refno)
+        .await
+        .ok()
+        .flatten();
     let local_translation = local_mat.map(|m| {
         let t = m.col(3);
         [t.x, t.y, t.z]
     });
 
     // 计算 world transform
-    let world_mat = aios_core::transform::get_world_mat4(refno, false).await.ok().flatten();
+    let world_mat = aios_core::transform::get_world_mat4(refno, false)
+        .await
+        .ok()
+        .flatten();
     let world_translation = world_mat.map(|m| {
         let t = m.col(3);
         [t.x, t.y, t.z]
     });
-    let world_transform = world_mat.map(|m| m.to_cols_array().iter().map(|v| *v).collect::<Vec<f64>>());
+    let world_transform =
+        world_mat.map(|m| m.to_cols_array().iter().map(|v| *v).collect::<Vec<f64>>());
 
     Ok(Json(ComputeTransformResponse {
         success: world_translation.is_some(),
@@ -204,7 +212,7 @@ async fn compute_transform(
 /// - [16个数字]
 fn parse_transform_matrix(trans: Option<serde_json::Value>) -> Option<Vec<f64>> {
     let trans = trans?;
-    
+
     // 处理 { d: [...] } 格式
     if let Some(obj) = trans.as_object() {
         if let Some(d) = obj.get("d") {
@@ -214,7 +222,7 @@ fn parse_transform_matrix(trans: Option<serde_json::Value>) -> Option<Vec<f64>> 
                 }
             }
         }
-        
+
         // 处理 { translation, rotation, scale } 格式
         if let (Some(t), Some(r), Some(s)) = (
             obj.get("translation").and_then(|v| v.as_array()),
@@ -238,19 +246,19 @@ fn parse_transform_matrix(trans: Option<serde_json::Value>) -> Option<Vec<f64>> 
                     s[1].as_f64().unwrap_or(1.0),
                     s[2].as_f64().unwrap_or(1.0),
                 ];
-                
+
                 return Some(compose_transform_matrix(translation, rotation, scale));
             }
         }
     }
-    
+
     // 处理直接数组格式
     if let Some(arr) = trans.as_array() {
         if arr.len() == 16 {
             return Some(arr.iter().filter_map(|v| v.as_f64()).collect());
         }
     }
-    
+
     None
 }
 
@@ -279,20 +287,20 @@ fn compose_transform_matrix(
 
     vec![
         (1.0 - (yy + zz)) * sx, // [0]
-        (xy + wz) * sx,          // [1]
-        (xz - wy) * sx,          // [2]
-        0.0,                      // [3]
-        (xy - wz) * sy,          // [4]
-        (1.0 - (xx + zz)) * sy,  // [5]
-        (yz + wx) * sy,          // [6]
-        0.0,                      // [7]
-        (xz + wy) * sz,          // [8]
-        (yz - wx) * sz,          // [9]
-        (1.0 - (xx + yy)) * sz,  // [10]
-        0.0,                      // [11]
-        x,                        // [12]
-        y,                        // [13]
-        z,                        // [14]
-        1.0,                      // [15]
+        (xy + wz) * sx,         // [1]
+        (xz - wy) * sx,         // [2]
+        0.0,                    // [3]
+        (xy - wz) * sy,         // [4]
+        (1.0 - (xx + zz)) * sy, // [5]
+        (yz + wx) * sy,         // [6]
+        0.0,                    // [7]
+        (xz + wy) * sz,         // [8]
+        (yz - wx) * sz,         // [9]
+        (1.0 - (xx + yy)) * sz, // [10]
+        0.0,                    // [11]
+        x,                      // [12]
+        y,                      // [13]
+        z,                      // [14]
+        1.0,                    // [15]
     ]
 }

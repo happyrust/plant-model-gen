@@ -1,10 +1,10 @@
 use anyhow::Result;
 use axum::{
+    Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
     routing::{get, post, put},
-    Router,
 };
 use chrono::{DateTime, Utc};
 use glam::Vec3;
@@ -16,18 +16,18 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use aios_core::{
+    RefnoEnum,
     room::{
         data_model::{RoomCode, RoomRelationType},
-        monitoring::{get_global_monitor, RoomSystemMetrics},
+        monitoring::{RoomSystemMetrics, get_global_monitor},
         // query_room_panels_by_keywords,  // Removed: not available in aios_core::room
-        room_system_manager::{get_global_manager, RoomSystemManager, SystemOperationResult},
+        room_system_manager::{RoomSystemManager, SystemOperationResult, get_global_manager},
     },
-    RefnoEnum,
 };
 
 use crate::fast_model::{
-    room_model::build_room_panels_relate_for_query, RoomTaskType as WorkerRoomTaskType, RoomWorker,
-    RoomWorkerConfig, RoomWorkerTask, RoomWorkerTaskStatus,
+    RoomTaskType as WorkerRoomTaskType, RoomWorker, RoomWorkerConfig, RoomWorkerTask,
+    RoomWorkerTaskStatus, room_model::build_room_panels_relate_for_query,
 };
 use crate::shared::{
     ProgressHub, ProgressMessage, ProgressMessageBuilder, TaskStatus as HubTaskStatus,

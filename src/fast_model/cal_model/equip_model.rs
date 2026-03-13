@@ -1,6 +1,6 @@
 use crate::fast_model::query_provider;
 use crate::fast_model::utils::save_transforms_to_surreal;
-use aios_core::{RefU64, RefnoEnum, project_primary_db, gen_plant_transform_hash};
+use aios_core::{RefU64, RefnoEnum, gen_plant_transform_hash, project_primary_db};
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
 use aios_core::{query_neareast_along_axis, query_neareast_by_pos_dir};
 
@@ -37,11 +37,8 @@ pub async fn update_cal_equip_wtrans() -> anyhow::Result<()> {
     let mut sql = String::new();
     for refno in equips {
         let world_trans =
-            match crate::fast_model::transform_cache::get_world_transform_cache_first(
-                None,
-                refno,
-            )
-            .await
+            match crate::fast_model::transform_cache::get_world_transform_cache_first(None, refno)
+                .await
             {
                 Ok(transform) => transform.unwrap_or_default(),
                 Err(e) => {
@@ -87,7 +84,10 @@ pub async fn cal_equip_nearest_floor() -> anyhow::Result<()> {
             "SELECT VALUE array::len(->nearest_relate) FROM {} LIMIT 1",
             equip.to_pe_key()
         );
-        let has_nearest: Vec<i64> = project_primary_db().query_take(&has_nearest_sql, 0).await.unwrap_or_default();
+        let has_nearest: Vec<i64> = project_primary_db()
+            .query_take(&has_nearest_sql, 0)
+            .await
+            .unwrap_or_default();
         if has_nearest.first().copied().unwrap_or(0) != 0 {
             continue;
         }
@@ -114,7 +114,10 @@ pub async fn cal_equip_nearest_floor() -> anyhow::Result<()> {
              FROM inst_relate_aabb \
              WHERE refno IN [{pe_keys}] AND aabb_id.d != NONE"
         );
-        let raw_values: Vec<JsonValue> = project_primary_db().query_take(&sql, 0).await.unwrap_or_default();
+        let raw_values: Vec<JsonValue> = project_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .unwrap_or_default();
         let Ok(aabbs) = raw_values
             .into_iter()
             .map(serde_json::from_value)

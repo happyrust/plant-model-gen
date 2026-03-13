@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+use aios_core::Transform;
+use aios_core::geometry::csg::{unit_box_mesh, unit_cylinder_mesh, unit_sphere_mesh};
+use aios_core::mesh_precision::LodMeshSettings;
 use aios_core::shape::pdms_shape::PlantMesh;
 use aios_core::{GeomInstQuery, RefnoEnum};
 use anyhow::{Context, Result, anyhow};
-use aios_core::Transform;
 use chrono;
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -16,10 +18,6 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 use serde_json::Value as JsonValue;
 use std::io::Write;
-use aios_core::geometry::csg::{unit_box_mesh, unit_cylinder_mesh, unit_sphere_mesh};
-use aios_core::mesh_precision::LodMeshSettings;
-
-
 
 /// 清洗节点名称，确保符合 glTF 规范
 ///
@@ -96,8 +94,8 @@ pub struct PrimitiveSegment {
 pub struct GeometryInstance {
     pub geo_hash: String,
     pub geo_transform: DMat4, // 几何体相对于 refno 的局部变换
-    pub index: usize,           // 几何体索引
-    pub unit_flag: bool,        // 是否为单位 mesh
+    pub index: usize,         // 几何体索引
+    pub unit_flag: bool,      // 是否为单位 mesh
 }
 
 /// 元件记录（包含多个几何体）
@@ -106,7 +104,7 @@ pub struct ComponentRecord {
     pub refno: RefnoEnum,
     pub noun: String,
     pub name: Option<String>,
-    pub world_transform: DMat4,  // refno 的世界变换
+    pub world_transform: DMat4, // refno 的世界变换
     pub geometries: Vec<GeometryInstance>,
     /// inst_relate 的 owner refno（例如设备 EQUI、结构 BRAN 等）
     pub owner_refno: Option<RefnoEnum>,
@@ -295,9 +293,9 @@ pub async fn collect_export_data(
         println!("\n🔨 收集实例信息...");
     }
 
-        // 导出阶段不访问 SurrealDB；
-        // - tubing 从几何实例里的 is_tubi 标记拆分
-        // - name 只用 refno（稳定可对齐）
+    // 导出阶段不访问 SurrealDB；
+    // - tubing 从几何实例里的 is_tubi 标记拆分
+    // - name 只用 refno（稳定可对齐）
     let mut components: Vec<ComponentRecord> = Vec::new();
     let mut tubings: Vec<TubiRecord> = Vec::new();
     let mut tubi_refno_counters: HashMap<RefnoEnum, usize> = HashMap::new();
@@ -365,7 +363,11 @@ pub async fn collect_export_data(
 
         if !geometries.is_empty() {
             if verbose {
-                println!("   - comp[{}] AABB: {:?}", components.len(), geom_inst.world_aabb);
+                println!(
+                    "   - comp[{}] AABB: {:?}",
+                    components.len(),
+                    geom_inst.world_aabb
+                );
             }
             components.push(ComponentRecord {
                 refno: geom_inst.refno,
@@ -440,7 +442,7 @@ pub async fn collect_export_data(
     // 默认检查 active_precision.default_lod 级别的 GLB（与本次 mesh 生成/布尔结果写盘保持一致）。
     // 若这里硬编码 L1，会导致“导出/截图读到旧 L1 文件”，从而看起来模型仍不对。
     let default_lod = aios_core::mesh_precision::active_precision().default_lod;
-    
+
     // 确定搜索目录：mesh_dir/lod_L1/
     // 如果 mesh_dir 已经是 lod_XX，则直接使用，否则拼接
     let search_dir = if let Some(dir_name) = mesh_dir.file_name() {
@@ -473,13 +475,17 @@ pub async fn collect_export_data(
         // 构建文件名: {geo_hash}_{lod}.glb
         // 注意：gen_inst_meshes 生成的文件名格式为 {geo_hash}_{lod}.glb
         let filename = format!("{}_{:?}.glb", geo_hash, default_lod);
-        
+
         // 同时也尝试不仅带后缀的文件名 (兼容旧数据)
         let fallback_filename = format!("{}.glb", geo_hash);
 
         let file_exists = existing_files.contains(std::ffi::OsStr::new(&filename));
         let fallback_exists = existing_files.contains(std::ffi::OsStr::new(&fallback_filename));
-        let is_tubi_hash = geo_hash.as_str() == aios_core::prim_geo::basic::TUBI_GEO_HASH.to_string().as_str() || geo_hash.starts_with("t_");
+        let is_tubi_hash = geo_hash.as_str()
+            == aios_core::prim_geo::basic::TUBI_GEO_HASH
+                .to_string()
+                .as_str()
+            || geo_hash.starts_with("t_");
 
         if file_exists || fallback_exists || is_tubi_hash {
             valid_geo_hashes.insert((*geo_hash).clone());
@@ -713,8 +719,7 @@ pub async fn query_inst_relate_batch(
             "#
         );
 
-        let mut chunk_rows: Vec<InstRelateRow> =
-            model_primary_db().query_take(&sql, 0).await?;
+        let mut chunk_rows: Vec<InstRelateRow> = model_primary_db().query_take(&sql, 0).await?;
         rows.append(&mut chunk_rows);
     }
 
@@ -764,8 +769,7 @@ pub async fn query_inst_relate_aabb_batch(
             "#
         );
 
-        let chunk_rows: Vec<InstRelateAabbRow> =
-            model_primary_db().query_take(&sql, 0).await?;
+        let chunk_rows: Vec<InstRelateAabbRow> = model_primary_db().query_take(&sql, 0).await?;
 
         for row in chunk_rows {
             if let Some(hash) = row.aabb_hash {

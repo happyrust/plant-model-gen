@@ -21,14 +21,11 @@ use aios_core::mesh_precision::LodMeshSettings;
 use aios_core::rs_surreal::boolean_query_optimized::query_manifold_boolean_operations_batch_optimized;
 
 use aios_core::{
-
     CataNegGroup, GmGeoData, ManiGeoTransQuery, NegInfo, query_cata_neg_boolean_groups,
-
     query_geom_mesh_data, query_negative_entities_batch,
-
 };
 
-use aios_core::{RefnoEnum, utils::RecordIdExt, model_primary_db};
+use aios_core::{RefnoEnum, model_primary_db, utils::RecordIdExt};
 
 use aios_core::geometry::{EleGeosInfo, EleInstGeosData, GeoBasicType};
 
@@ -36,11 +33,11 @@ use aios_core::geometry::csg::UNIT_MESH_SCALE;
 
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 
-use aios_core::shape::pdms_shape::BrepShapeTrait;
 use crate::fast_model::gen_model::boolean_task::{
     BooleanTask, BooleanTaskType, CataNegBoolTask, InstNegBoolTask, NegEntityData,
 };
 use crate::fast_model::gen_model::sql_file_writer::SqlFileWriter;
+use aios_core::shape::pdms_shape::BrepShapeTrait;
 use async_trait::async_trait;
 
 // InstanceCacheManager 已随 instance_cache 模块移除
@@ -51,33 +48,25 @@ use std::collections::{HashMap, HashSet};
 
 use std::path::{Path, PathBuf};
 
-use std::{fs, io};
 use std::sync::Arc;
+use std::{fs, io};
 
 /// 负实体膨胀量（mm）：消除布尔运算中共面薄片的 epsilon
 /// 每边扩展此值，使负实体略微超出正实体表面，产生干净切割
 const NEG_INFLATE_EPSILON_MM: f64 = 0.5;
 
 async fn filter_out_bran_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
-
     if refnos.is_empty() {
-
         return Ok(Vec::new());
-
     }
 
     let refno_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
 
     let refno_keys = refno_keys.join(",");
 
-    let sql = format!(
-
-        "SELECT value id FROM [{refno_keys}] WHERE noun != 'BRAN'"
-
-    );
+    let sql = format!("SELECT value id FROM [{refno_keys}] WHERE noun != 'BRAN'");
 
     model_primary_db().query_take(&sql, 0).await
-
 }
 
 /// 根据 mesh_id 和当前 LOD 配置构建完整的 mesh 文件路径
@@ -119,7 +108,6 @@ async fn filter_out_bran_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<Refn
 /// ```
 
 fn build_lod_mesh_path(base_dir: &Path, mesh_id: &str) -> PathBuf {
-
     use aios_core::mesh_precision::LodLevel;
 
     let default_lod = aios_core::mesh_precision::active_precision().default_lod;
@@ -129,17 +117,11 @@ fn build_lod_mesh_path(base_dir: &Path, mesh_id: &str) -> PathBuf {
     let mut clean_base = base_dir.to_path_buf();
 
     while let Some(last_component) = clean_base.file_name().and_then(|n| n.to_str()) {
-
         if last_component.starts_with("lod_") {
-
             clean_base.pop();
-
         } else {
-
             break;
-
         }
-
     }
 
     let lod_dir_name = format!("lod_{:?}", default_lod);
@@ -147,7 +129,6 @@ fn build_lod_mesh_path(base_dir: &Path, mesh_id: &str) -> PathBuf {
     let lod_filename = format!("{}_{:?}.glb", mesh_id, default_lod);
 
     clean_base.join(lod_dir_name).join(lod_filename)
-
 }
 
 /// 构建 _m.manifold 布尔运算专用 mesh 文件路径（在 manifold 目录查找）
@@ -182,17 +163,11 @@ fn build_manifold_mesh_path(base_dir: &Path, mesh_id: &str) -> Option<PathBuf> {
 }
 
 fn mesh_base_dir() -> PathBuf {
-
     get_db_option()
-
         .meshes_path
-
         .as_ref()
-
         .map(PathBuf::from)
-
         .unwrap_or_else(|| PathBuf::from("assets/meshes"))
-
 }
 
 // 移除 load_mesh，改用 load_manifold
@@ -224,15 +199,12 @@ fn mesh_base_dir() -> PathBuf {
 #[inline]
 
 fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<ManifoldRust> {
-
     // 对标准单位几何体（1/2/3）强制使用内置几何生成，避免磁盘上被误写/污染的同名 GLB 影响布尔结果。
 
     if matches!(id, "1" | "2" | "3") {
-
         debug_model_debug!("load_manifold: 使用内置 unit mesh: id={}", id);
 
         let unit_mesh = match id {
-
             "1" => unit_box_mesh(),
 
             "2" => unit_cylinder_mesh(&LodMeshSettings::default(), false),
@@ -240,55 +212,42 @@ fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<M
             "3" => unit_sphere_mesh(),
 
             _ => unreachable!(),
-
         };
 
         // 将 Vec3 数组转换为 glam::Vec3 数组
 
-        let vertices: Vec<glam::Vec3> = unit_mesh.vertices.iter()
-
+        let vertices: Vec<glam::Vec3> = unit_mesh
+            .vertices
+            .iter()
             .map(|v| glam::Vec3::new(v[0], v[1], v[2]))
-
             .collect();
 
-        let manifold = ManifoldRust::from_vertices_indices(&vertices, &unit_mesh.indices, mat, more_precision);
+        let manifold =
+            ManifoldRust::from_vertices_indices(&vertices, &unit_mesh.indices, mat, more_precision);
 
         // 复用下面的"空/哨兵"校验逻辑
 
         let mesh = manifold.get_mesh();
 
         if mesh.indices.is_empty() {
-
             return Err(anyhow::anyhow!("单位 Manifold mesh 为空：id={}", id));
-
         }
 
         if let Some(aabb) = mesh.cal_aabb() {
-
             let ext_mag = aabb.extents().magnitude();
 
             if ext_mag.is_finite() && ext_mag < 1e-6 {
-
                 return Err(anyhow::anyhow!(
-
                     "单位 Manifold mesh 可能为空（哨兵 cube）：id={} ext_mag={:.3e}",
-
                     id,
-
                     ext_mag
-
                 ));
-
             }
-
         } else {
-
             return Err(anyhow::anyhow!("单位 Manifold mesh AABB 无效：id={}", id));
-
         }
 
         return Ok(manifold);
-
     }
 
     let base_dir = mesh_base_dir();
@@ -299,10 +258,14 @@ fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<M
         match ManifoldMeshRust::load_from_file(&manifold_path) {
             Ok(raw_mesh) => {
                 if !raw_mesh.vertices.is_empty() && !raw_mesh.indices.is_empty() {
-                    let transformed_verts: Vec<f32> = raw_mesh.vertices.chunks_exact(3)
+                    let transformed_verts: Vec<f32> = raw_mesh
+                        .vertices
+                        .chunks_exact(3)
                         .flat_map(|c| {
                             let pt = mat.transform_point3(glam::DVec3::new(
-                                c[0] as f64, c[1] as f64, c[2] as f64,
+                                c[0] as f64,
+                                c[1] as f64,
+                                c[2] as f64,
                             ));
                             [pt.x as f32, pt.y as f32, pt.z as f32]
                         })
@@ -315,24 +278,19 @@ fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<M
                         Ok(m) => {
                             debug_model_debug!(
                                 "load_manifold: 从 .manifold 加载成功: id={} path={}",
-                                id, manifold_path.display()
+                                id,
+                                manifold_path.display()
                             );
                             return Ok(m);
                         }
                         Err(e) => {
-                            eprintln!(
-                                "[Manifold] .manifold 加载失败: id={} err={}",
-                                id, e
-                            );
+                            eprintln!("[Manifold] .manifold 加载失败: id={} err={}", id, e);
                         }
                     }
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "[Manifold] .manifold 文件读取失败: id={} err={}",
-                    id, e
-                );
+                eprintln!("[Manifold] .manifold 文件读取失败: id={} err={}", id, e);
             }
         }
     }
@@ -378,7 +336,6 @@ fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<M
 #[inline]
 
 pub(crate) fn load_manifold_from_geo_param(
-
     geo_param: &PdmsGeoParam,
 
     geo_hash: u64,
@@ -386,17 +343,16 @@ pub(crate) fn load_manifold_from_geo_param(
     mat: DMat4,
 
     more_precision: bool,
-
 ) -> anyhow::Result<ManifoldRust> {
-
     // 对标准单位几何体（1/2/3）使用内置几何生成
 
     if matches!(geo_hash, 1 | 2 | 3) {
-
-        debug_model_debug!("load_manifold_from_geo_param: 使用内置 unit mesh: geo_hash={}", geo_hash);
+        debug_model_debug!(
+            "load_manifold_from_geo_param: 使用内置 unit mesh: geo_hash={}",
+            geo_hash
+        );
 
         let unit_mesh = match geo_hash {
-
             1 => unit_box_mesh(),
 
             2 => unit_cylinder_mesh(&LodMeshSettings::default(), false),
@@ -404,71 +360,62 @@ pub(crate) fn load_manifold_from_geo_param(
             3 => unit_sphere_mesh(),
 
             _ => unreachable!(),
-
         };
 
-        let manifold = ManifoldRust::from_vertices_indices(&unit_mesh.vertices, &unit_mesh.indices, mat, more_precision);
+        let manifold = ManifoldRust::from_vertices_indices(
+            &unit_mesh.vertices,
+            &unit_mesh.indices,
+            mat,
+            more_precision,
+        );
 
         return validate_manifold_result(manifold, &geo_hash.to_string());
-
     }
 
     // 尝试从 geo_param 直接生成 mesh
 
     let plant_mesh = match geo_param {
-
         PdmsGeoParam::Unknown | PdmsGeoParam::CompoundShape => {
-
             return Err(anyhow::anyhow!(
                 "geo_param 不支持直接生成 manifold: geo_hash={} type={:?}",
                 geo_hash,
                 geo_param.type_name()
             ));
-
         }
 
         _ => {
-
             // 尝试使用 gen_csg_shape 生成
 
             match geo_param.gen_csg_shape_compat() {
-
                 Ok(csg_mesh) => (*csg_mesh.0).clone(),
 
                 Err(e) => {
-
                     return Err(anyhow::anyhow!(
                         "gen_csg_shape 失败: geo_hash={} err={}",
                         geo_hash,
                         e
                     ));
-
                 }
-
             }
-
         }
-
     };
 
     if plant_mesh.vertices.is_empty() || plant_mesh.indices.is_empty() {
-
         return Err(anyhow::anyhow!(
-
             "从 geo_param 生成的 mesh 为空: geo_hash={} type={}",
-
             geo_hash,
-
             geo_param.type_name()
-
         ));
-
     }
 
-    let manifold = ManifoldRust::from_vertices_indices(&plant_mesh.vertices, &plant_mesh.indices, mat, more_precision);
+    let manifold = ManifoldRust::from_vertices_indices(
+        &plant_mesh.vertices,
+        &plant_mesh.indices,
+        mat,
+        more_precision,
+    );
 
     validate_manifold_result(manifold, &geo_hash.to_string())
-
 }
 
 /// 校验 Manifold 结果是否有效
@@ -476,85 +423,56 @@ pub(crate) fn load_manifold_from_geo_param(
 #[inline]
 
 fn validate_manifold_result(manifold: ManifoldRust, id: &str) -> anyhow::Result<ManifoldRust> {
-
     let mesh = manifold.get_mesh();
 
     if mesh.indices.is_empty() {
-
         return Err(anyhow::anyhow!("Manifold mesh 为空: id={}", id));
-
     }
 
     if let Some(aabb) = mesh.cal_aabb() {
-
         let ext_mag = aabb.extents().magnitude();
 
         if ext_mag.is_finite() && ext_mag < 1e-6 {
-
             return Err(anyhow::anyhow!(
-
                 "Manifold mesh 可能为空（哨兵 cube）: id={} ext_mag={:.3e}",
-
                 id,
-
                 ext_mag
-
             ));
-
         }
-
     } else {
-
         return Err(anyhow::anyhow!("Manifold mesh AABB 无效: id={}", id));
-
     }
 
     Ok(manifold)
-
 }
 
 #[inline]
 
 fn log_load_manifold_failed(scene: &str, refno: RefnoEnum, mesh_id: &str, err: &anyhow::Error) {
-
     eprintln!(
-
         "[bool][{}] load_manifold 失败: refno={} mesh_id={} err={}",
-
         scene, refno, mesh_id, err
-
     );
-
 }
 
 #[inline]
 
 fn is_source_level_manifold_error(err: &anyhow::Error) -> bool {
-
     let msg = err.to_string();
 
     msg.contains("Manifold mesh 为空")
-
         || msg.contains("Manifold mesh AABB 无效")
-
         || msg.contains("哨兵 cube")
-
         || msg.contains("No such file or directory")
-
         || msg.contains("(os error 2)")
-
 }
 
 fn ensure_parent_dir(path: &Path) -> io::Result<()> {
-
     if let Some(parent) = path.parent() {
-
         fs::create_dir_all(parent)?;
-
     }
 
     Ok(())
-
 }
 
 /// 标记布尔运算失败
@@ -564,11 +482,9 @@ fn ensure_parent_dir(path: &Path) -> io::Result<()> {
 /// 写入 inst_relate_bool 状态为 Failed
 
 async fn mark_bool_failed(refno: RefnoEnum) -> anyhow::Result<()> {
-
     crate::fast_model::utils::save_inst_relate_bool(refno, None, "Failed", "bool_mesh").await?;
 
     Ok(())
-
 }
 
 /// 更新布尔运算结果到数据库
@@ -578,26 +494,18 @@ async fn mark_bool_failed(refno: RefnoEnum) -> anyhow::Result<()> {
 /// 仅写入 inst_relate_bool（状态 + mesh_id），AABB 已写入 inst_relate_aabb
 
 async fn update_booled_result(
-
     refno: RefnoEnum,
 
     mesh_id: &str,
 
     aabb: Option<parry3d::bounding_volume::Aabb>,
-
 ) -> anyhow::Result<()> {
-
     use dashmap::DashMap;
 
-    
-
     if let Some(aabb) = aabb {
-
         // 使用 hash 格式存储 AABB（与 mesh_generate.rs 保持一致）
 
         let aabb_hash = aios_core::gen_aabb_hash(&aabb);
-
-        
 
         // 保存 AABB 记录到 SurrealDB
 
@@ -607,32 +515,30 @@ async fn update_booled_result(
 
         crate::fast_model::utils::save_aabb_to_surreal(&aabb_map).await;
 
-        
-
         let inst_aabb_map = DashMap::new();
 
         inst_aabb_map.insert(refno, aabb_hash.to_string());
 
         crate::fast_model::utils::save_inst_relate_booled_aabb(&inst_aabb_map, "bool_mesh").await?;
 
-        
-
-        crate::fast_model::utils::save_inst_relate_bool(refno, Some(mesh_id), "Success", "bool_mesh")
-
-            .await?;
-
+        crate::fast_model::utils::save_inst_relate_bool(
+            refno,
+            Some(mesh_id),
+            "Success",
+            "bool_mesh",
+        )
+        .await?;
     } else {
-
-        crate::fast_model::utils::save_inst_relate_bool(refno, Some(mesh_id), "Success", "bool_mesh")
-
-            .await?;
-
+        crate::fast_model::utils::save_inst_relate_bool(
+            refno,
+            Some(mesh_id),
+            "Success",
+            "bool_mesh",
+        )
+        .await?;
     }
 
-    
-
     Ok(())
-
 }
 
 // fn boolean_mesh_path(mesh_id: &str) -> PathBuf {
@@ -642,19 +548,18 @@ async fn update_booled_result(
 // }
 
 fn boolean_glb_path(mesh_id: &str) -> PathBuf {
-
     let mut path = build_lod_mesh_path(&mesh_base_dir(), mesh_id);
 
     path.set_extension("glb");
 
     path
-
 }
 
 /// Manifold 共享顶点 mesh -> 重复顶点 PlantMesh（flat shading）
 
-fn manifold_to_normal_mesh(mesh: aios_core::csg::manifold::ManifoldMeshRust) -> aios_core::shape::pdms_shape::PlantMesh {
-
+fn manifold_to_normal_mesh(
+    mesh: aios_core::csg::manifold::ManifoldMeshRust,
+) -> aios_core::shape::pdms_shape::PlantMesh {
     use aios_core::shape::pdms_shape::PlantMesh;
 
     use glam::Vec3;
@@ -672,22 +577,23 @@ fn manifold_to_normal_mesh(mesh: aios_core::csg::manifold::ManifoldMeshRust) -> 
     out.indices.reserve(tri_count * 3);
 
     let get_v = |idx: u32| -> Vec3 {
-
         let base = idx as usize * 3;
 
         if base + 2 >= mesh.vertices.len() {
-
             return Vec3::ZERO;
-
         }
 
-        Vec3::new(mesh.vertices[base], mesh.vertices[base + 1], mesh.vertices[base + 2])
-
+        Vec3::new(
+            mesh.vertices[base],
+            mesh.vertices[base + 1],
+            mesh.vertices[base + 2],
+        )
     };
 
     for tri in mesh.indices.chunks(3) {
-
-        if tri.len() != 3 { break; }
+        if tri.len() != 3 {
+            break;
+        }
 
         let v0 = get_v(tri[0]);
 
@@ -697,7 +603,11 @@ fn manifold_to_normal_mesh(mesh: aios_core::csg::manifold::ManifoldMeshRust) -> 
 
         let face_n = (v1 - v0).cross(v2 - v0);
 
-        let n = if face_n.length_squared() > 1e-10 { face_n.normalize() } else { Vec3::Y };
+        let n = if face_n.length_squared() > 1e-10 {
+            face_n.normalize()
+        } else {
+            Vec3::Y
+        };
 
         let base = out.vertices.len() as u32;
 
@@ -705,58 +615,46 @@ fn manifold_to_normal_mesh(mesh: aios_core::csg::manifold::ManifoldMeshRust) -> 
 
         out.normals.extend_from_slice(&[n, n, n]);
 
-        out.uvs.extend_from_slice(&[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]);
+        out.uvs
+            .extend_from_slice(&[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]);
 
         out.indices.extend_from_slice(&[base, base + 1, base + 2]);
-
     }
 
     out
-
 }
 
 fn boolean_obj_path(mesh_id: &str) -> PathBuf {
-
     let mut path = build_lod_mesh_path(&mesh_base_dir(), mesh_id);
 
     path.set_extension("obj");
 
     path
-
 }
 
 /// 处理元件库负实体布尔（catalog 级别）
 
 pub async fn apply_cata_neg_boolean_manifold(
-
     refnos: &[RefnoEnum],
 
     replace_exist: bool,
-
 ) -> anyhow::Result<()> {
-
     use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
 
     if refnos.is_empty() {
-
         return Ok(());
-
     }
 
     let filtered_refnos = filter_out_bran_refnos(refnos).await?;
 
     if filtered_refnos.is_empty() {
-
         return Ok(());
-
     }
 
     let params = query_cata_neg_boolean_groups(&filtered_refnos, replace_exist).await?;
 
     if params.is_empty() {
-
         return Ok(());
-
     }
 
     // 对“缺文件/空 mesh”这类源级失败按 geo_hash 去重：
@@ -780,51 +678,34 @@ pub async fn apply_cata_neg_boolean_manifold(
                                      mat: DMat4,
 
                                      more_precision: bool|
-
      -> Option<ManifoldRust> {
-
         if let Some(reason) = source_failed_geo_hashes.get(&geo_hash) {
-
             if source_failed_geo_hashes_warned.insert(geo_hash) {
-
                 eprintln!(
-
                     "[bool][{}] 跳过已知失败几何: refno={} mesh_id={} reason={}",
-
                     scene, refno, geo_hash, reason
-
                 );
-
             }
 
             return None;
-
         }
 
         match load_manifold_from_geo_param(geo_param, geo_hash, mat, more_precision) {
-
             Ok(m) => Some(m),
 
             Err(e) => {
-
                 if is_source_level_manifold_error(&e) {
-
                     source_failed_geo_hashes.insert(geo_hash, e.to_string());
-
                 }
 
                 log_load_manifold_failed(scene, refno, &geo_hash.to_string(), &e);
 
                 None
-
             }
-
         }
-
     };
 
     for g in params {
-
         // 收集当前实例涉及的所有几何，批量查询 mesh 数据
 
         let geom_refnos: Vec<RefnoEnum> = g.boolean_group.iter().flatten().cloned().collect();
@@ -834,25 +715,16 @@ pub async fn apply_cata_neg_boolean_manifold(
         let mut update_sql = String::new();
 
         for bg in g.boolean_group {
-
             let Some(pos) = gms.iter().find(|x| x.geom_refno == bg[0]) else {
-
                 crate::fast_model::utils::save_inst_relate_cata_bool(
-
                     g.refno,
-
                     None,
-
                     "Failed",
-
                     "cata_bool",
-
                 )
-
                 .await;
 
                 continue;
-
             };
 
             let pos_mesh_id = pos.id.to_mesh_id();
@@ -864,51 +736,32 @@ pub async fn apply_cata_neg_boolean_manifold(
             let mut pos_tf = pos.trans.0.clone();
 
             if matches!(pos_geo_hash, 1 | 2 | 3) {
-
                 pos_tf.scale /= aios_core::geometry::csg::UNIT_MESH_SCALE;
-
             }
 
             let mut pos_manifold = match try_load_geo_manifold(
-
                 "cata_pos",
-
                 g.refno,
-
                 &pos.param,
-
                 pos_geo_hash,
-
                 pos_tf.to_matrix().as_dmat4(),
-
                 false,
-
             ) {
-
                 Some(m) => m,
 
                 None => {
-
                     println!("布尔运算失败: 无法加载正实体 manifold, refno: {}", &g.refno);
 
                     crate::fast_model::utils::save_inst_relate_cata_bool(
-
                         g.refno,
-
                         None,
-
                         "Failed",
-
                         "cata_bool",
-
                     )
-
                     .await;
 
                     continue;
-
                 }
-
             };
 
             let mut neg_manifolds = Vec::new();
@@ -916,11 +769,8 @@ pub async fn apply_cata_neg_boolean_manifold(
             let mut neg_load_fail_cnt = 0usize;
 
             for &neg in bg.iter().skip(1) {
-
                 let Some(neg_geo) = gms.iter().find(|x| x.geom_refno == neg) else {
-
                     continue;
-
                 };
 
                 let neg_mesh_id = neg_geo.id.to_mesh_id();
@@ -930,79 +780,50 @@ pub async fn apply_cata_neg_boolean_manifold(
                 let mut neg_tf = neg_geo.trans.0.clone();
 
                 if matches!(neg_geo_hash, 1 | 2 | 3) {
-
                     neg_tf.scale /= aios_core::geometry::csg::UNIT_MESH_SCALE;
-
                 }
 
                 match try_load_geo_manifold(
-
                     "cata_neg",
-
                     g.refno,
-
                     &neg_geo.param,
-
                     neg_geo_hash,
-
                     neg_tf.to_matrix().as_dmat4(),
-
                     true,
-
                 ) {
-
-                    Some(manifold) => neg_manifolds.push(manifold.inflate_from_center(NEG_INFLATE_EPSILON_MM)),
+                    Some(manifold) => {
+                        neg_manifolds.push(manifold.inflate_from_center(NEG_INFLATE_EPSILON_MM))
+                    }
 
                     None => neg_load_fail_cnt += 1,
-
                 }
-
             }
 
             if bg.len() > 1 && neg_manifolds.is_empty() {
-
                 eprintln!(
-
                     "[bool][cata] 布尔跳过：负实体全部不可用，refno={} neg_total={}",
-
                     g.refno,
-
                     bg.len().saturating_sub(1)
-
                 );
 
                 crate::fast_model::utils::save_inst_relate_cata_bool(
-
                     g.refno,
-
                     None,
-
                     "Failed",
-
                     "cata_bool",
-
                 )
-
                 .await;
 
                 continue;
-
             }
 
             if neg_load_fail_cnt > 0 {
-
                 eprintln!(
-
                     "[bool][cata] 部分负实体加载失败（已忽略失败项）: refno={} failed={} loaded={}",
-
                     g.refno,
-
                     neg_load_fail_cnt,
-
                     neg_manifolds.len()
-
                 );
-
             }
 
             // 即使没有负实体，也标记已处理，避免重复计算
@@ -1018,31 +839,19 @@ pub async fn apply_cata_neg_boolean_manifold(
             // 经验：某些模型在默认精度下布尔结果可能退化为 0 三角形，尝试提升精度重算一次。
 
             if !neg_manifolds.is_empty() && final_manifold.get_mesh().indices.is_empty() {
-
                 eprintln!(
-
                     "[bool][cata] ⚠️ 布尔结果为空，尝试 more_precision=true 重算: refno={}",
-
                     g.refno
-
                 );
 
                 if let Ok(pos_hi) = load_manifold_from_geo_param(
-
                     &pos.param,
-
                     pos_geo_hash,
-
                     pos.trans.0.to_matrix().as_dmat4(),
-
                     true,
-
                 ) {
-
                     final_manifold = pos_hi.batch_boolean_subtract(&neg_manifolds);
-
                 }
-
             }
 
             let target_path = boolean_glb_path(&mesh_id);
@@ -1050,19 +859,14 @@ pub async fn apply_cata_neg_boolean_manifold(
             ensure_parent_dir(&target_path)?;
 
             if final_manifold.export_to_glb(&target_path).is_ok() {
-
                 // ========== 步骤 1：创建布尔结果 mesh 记录 ==========
 
                 // 创建 inst_geo 记录，标记为已网格化
 
                 update_sql.push_str(&format!(
-
                     "create inst_geo:⟨{}⟩ set meshed = true, aabb = {};",
-
                     mesh_id,
-
                     &pos.aabb_id.to_raw()
-
                 ));
 
                 // ========== 步骤 2：创建 geo_relate 关联记录 ==========
@@ -1098,22 +902,14 @@ pub async fn apply_cata_neg_boolean_manifold(
                 // geo_type='CatePos' 表示这是布尔运算后的结果（应该导出）
 
                 let relate_sql = format!(
-
                     "INSERT RELATION INTO geo_relate {{ in: {}, id: '{rel_id}', out: inst_geo:⟨{mesh_id}⟩, geom_refno: pe:⟨{geom_refno}⟩, geo_type: 'CatePos', trans: trans:⟨0⟩, visible: true }};",
-
                     &g.inst_info_id.to_raw(),
-
                     rel_id = relation_id,
-
                     mesh_id = mesh_id,
-
                     geom_refno = bg[0],
-
                 );
 
                 update_sql.push_str(&relate_sql);
-
-                
 
                 // ========== 步骤 3：隐藏原始几何记录 ==========
 
@@ -1122,13 +918,9 @@ pub async fn apply_cata_neg_boolean_manifold(
                 // 并设置 visible=false，使其在查询时被排除
 
                 let hide_original_sql = format!(
-
                     "UPDATE {}->geo_relate SET geo_type = 'Compound', visible = false WHERE geom_refno = pe:⟨{}⟩ AND geo_type IN ['Pos','Compound'];",
-
                     &g.inst_info_id.to_raw(),
-
                     bg[0],
-
                 );
 
                 update_sql.push_str(&hide_original_sql);
@@ -1138,175 +930,110 @@ pub async fn apply_cata_neg_boolean_manifold(
                 // 用于 worker 去重与排查
 
                 crate::fast_model::utils::save_inst_relate_cata_bool(
-
                     g.refno,
-
                     Some(&mesh_id),
-
                     "Success",
-
                     "cata_bool",
-
                 )
-
                 .await;
-
             } else {
-
                 crate::fast_model::utils::save_inst_relate_cata_bool(
-
                     g.refno,
-
                     None,
-
                     "Failed",
-
                     "cata_bool",
-
                 )
-
                 .await;
-
             }
-
         }
 
         if !update_sql.is_empty() {
-
             // 仅在 debug_model 下打印 SQL，便于定位 SurrealQL 解析/兼容性问题。
 
             if aios_core::is_debug_model_enabled() {
-
                 let preview = update_sql.chars().take(8000).collect::<String>();
 
                 if update_sql.chars().count() > 8000 {
-
                     debug_model_debug!(
-
                         "[boolean_worker] 将执行 update_sql (len={}):\n{}...\n[truncated]",
-
                         update_sql.len(),
-
                         preview
-
                     );
-
                 } else {
-
                     debug_model_debug!(
-
                         "[boolean_worker] 将执行 update_sql (len={}):\n{}",
-
                         update_sql.len(),
-
                         preview
-
                     );
-
                 }
-
             }
 
             if let Err(e) = model_primary_db().query(update_sql.clone()).await {
-
                 debug_model_warn!(
-
                     "[boolean_worker] 执行 update_sql 失败: {}\nSQL(len={}):\n{}",
-
                     e,
-
                     update_sql.len(),
-
                     update_sql
-
                 );
 
                 return Err(e.into());
-
             }
-
         }
-
     }
 
     debug_model!("元件库的负实体计算{:?}完成", refnos);
 
     Ok(())
-
 }
 
 async fn apply_boolean_for_query(
-
     query: ManiGeoTransQuery,
 
     replace_exist: bool,
-
 ) -> anyhow::Result<()> {
-
-    fn aabb_contains(outer: &parry3d::bounding_volume::Aabb, inner: &parry3d::bounding_volume::Aabb) -> bool {
-
+    fn aabb_contains(
+        outer: &parry3d::bounding_volume::Aabb,
+        inner: &parry3d::bounding_volume::Aabb,
+    ) -> bool {
         outer.mins.x <= inner.mins.x
-
             && outer.mins.y <= inner.mins.y
-
             && outer.mins.z <= inner.mins.z
-
             && outer.maxs.x >= inner.maxs.x
-
             && outer.maxs.y >= inner.maxs.y
-
             && outer.maxs.z >= inner.maxs.z
-
     }
 
-    fn aabb_intersects(a: &parry3d::bounding_volume::Aabb, b: &parry3d::bounding_volume::Aabb) -> bool {
-
+    fn aabb_intersects(
+        a: &parry3d::bounding_volume::Aabb,
+        b: &parry3d::bounding_volume::Aabb,
+    ) -> bool {
         !(a.maxs.x < b.mins.x
-
             || a.mins.x > b.maxs.x
-
             || a.maxs.y < b.mins.y
-
             || a.mins.y > b.maxs.y
-
             || a.maxs.z < b.mins.z
-
             || a.mins.z > b.maxs.z)
-
     }
 
     // 非替换模式下，已有成功记录则跳过
 
     if !replace_exist {
-
         let check_sql = format!(
-
             "select value status from inst_relate_bool:{} limit 1",
-
             query.refno.to_string()
-
         );
 
-        let existing_status: Vec<Option<String>> = model_primary_db().query_take(&check_sql, 0).await?;
+        let existing_status: Vec<Option<String>> =
+            model_primary_db().query_take(&check_sql, 0).await?;
 
         if matches!(
-
-            existing_status
-
-                .first()
-
-                .and_then(|s| s.as_deref()),
-
+            existing_status.first().and_then(|s| s.as_deref()),
             Some("Success")
-
         ) {
-
             debug_model!("跳过已存在的布尔结果: {}", query.refno);
 
             return Ok(());
-
         }
-
     }
 
     // 使用正实体的世界坐标系作为基准坐标系
@@ -1318,17 +1045,14 @@ async fn apply_boolean_for_query(
     // 没有任何负实体关系：不需要产出 bool 结果，也不应写入 Failed（否则会污染 inst_relate_bool）
 
     if query.neg_ts.is_empty() {
-
         debug_model_debug!("跳过布尔：无负实体关系 refno={}", query.refno);
 
         return Ok(());
-
     }
 
     let mut pos_manifolds = Vec::new();
 
     for pos in query.pos_geos.iter() {
-
         let pos_mesh_id = pos.0.to_mesh_id();
 
         // 正实体使用局部变换
@@ -1336,99 +1060,78 @@ async fn apply_boolean_for_query(
         let pos_local_mat = pos.1.to_matrix().as_dmat4();
 
         println!(
-
             "[POS_TRANS_DBG] refno={} mesh={} pos_local_mat:\n  col0=({:.3},{:.3},{:.3})\n  col1=({:.3},{:.3},{:.3})\n  col2=({:.3},{:.3},{:.3})\n  col3=({:.3},{:.3},{:.3})\n  scale=({:.3},{:.3},{:.3})",
-
-            query.refno, pos_mesh_id,
-
-            pos_local_mat.col(0).x, pos_local_mat.col(0).y, pos_local_mat.col(0).z,
-
-            pos_local_mat.col(1).x, pos_local_mat.col(1).y, pos_local_mat.col(1).z,
-
-            pos_local_mat.col(2).x, pos_local_mat.col(2).y, pos_local_mat.col(2).z,
-
-            pos_local_mat.col(3).x, pos_local_mat.col(3).y, pos_local_mat.col(3).z,
-
+            query.refno,
+            pos_mesh_id,
+            pos_local_mat.col(0).x,
+            pos_local_mat.col(0).y,
+            pos_local_mat.col(0).z,
+            pos_local_mat.col(1).x,
+            pos_local_mat.col(1).y,
+            pos_local_mat.col(1).z,
+            pos_local_mat.col(2).x,
+            pos_local_mat.col(2).y,
+            pos_local_mat.col(2).z,
+            pos_local_mat.col(3).x,
+            pos_local_mat.col(3).y,
+            pos_local_mat.col(3).z,
             pos_local_mat.col(0).truncate().length(),
-
             pos_local_mat.col(1).truncate().length(),
-
             pos_local_mat.col(2).truncate().length(),
-
         );
 
-        debug_model_debug!(
-
-            "加载正实体 mesh: {} (应用局部变换)",
-
-            pos_mesh_id
-
-        );
+        debug_model_debug!("加载正实体 mesh: {} (应用局部变换)", pos_mesh_id);
 
         match load_manifold(&pos_mesh_id, pos_local_mat, false) {
-
             Ok(manifold) => pos_manifolds.push(manifold),
 
             Err(e) => log_load_manifold_failed("inst_pos", query.refno, &pos_mesh_id, &e),
-
         }
-
     }
 
     if pos_manifolds.is_empty() {
-
         println!(
-
             "布尔运算失败: 未找到正实体 manifold，refno: {}, 正几何数量={}",
-
             query.refno,
-
             query.pos_geos.len()
-
         );
 
         mark_bool_failed(query.refno).await?;
 
         return Ok(());
-
     }
 
-    let mut pos_manifold = ManifoldRust::batch_boolean(&pos_manifolds, aios_core::csg::manifold::ManifoldOpType::Union);
+    let mut pos_manifold = ManifoldRust::batch_boolean(
+        &pos_manifolds,
+        aios_core::csg::manifold::ManifoldOpType::Union,
+    );
 
     if pos_manifold.get_mesh().indices.is_empty() {
-
         println!(
-
             "布尔运算失败: 正实体 manifold 没有三角形, refno: {}",
-
             query.refno
-
         );
 
         mark_bool_failed(query.refno).await?;
 
         return Ok(());
-
     }
 
     // 调试：打印正实体 AABB
 
     if let Some(pos_aabb) = pos_manifold.get_mesh().cal_aabb() {
-
-        println!("[AABB_DBG] pos refno={} aabb: min=({:.1},{:.1},{:.1}) max=({:.1},{:.1},{:.1}) verts={} tris={}",
-
+        println!(
+            "[AABB_DBG] pos refno={} aabb: min=({:.1},{:.1},{:.1}) max=({:.1},{:.1},{:.1}) verts={} tris={}",
             query.refno,
-
-            pos_aabb.mins.x, pos_aabb.mins.y, pos_aabb.mins.z,
-
-            pos_aabb.maxs.x, pos_aabb.maxs.y, pos_aabb.maxs.z,
-
+            pos_aabb.mins.x,
+            pos_aabb.mins.y,
+            pos_aabb.mins.z,
+            pos_aabb.maxs.x,
+            pos_aabb.maxs.y,
+            pos_aabb.maxs.z,
             pos_manifold.get_mesh().vertices.len() / 3,
-
             pos_manifold.get_mesh().indices.len() / 3,
-
         );
-
     }
 
     // 计算正实体世界坐标系的逆矩阵，用于将负实体转换到正实体的相对坐标系
@@ -1440,19 +1143,16 @@ async fn apply_boolean_for_query(
     let mut neg_load_fail_logged = 0usize;
 
     for (_, _carrier_wt, neg_infos) in query.neg_ts.iter() {
-
         for NegInfo {
-
-            id, geo_local_trans, aabb, carrier_world_trans, ..
-
+            id,
+            geo_local_trans,
+            aabb,
+            carrier_world_trans,
+            ..
         } in neg_infos.iter().cloned()
-
         {
-
             if aabb.is_none() {
-
                 continue;
-
             }
 
             let neg_mesh_id = id.to_mesh_id();
@@ -1464,11 +1164,8 @@ async fn apply_boolean_for_query(
             // 而不是 neg_ts 中的 carrier_wt（可能是虚拟的单位矩阵）
 
             let carrier_world_mat = carrier_world_trans
-
                 .as_ref()
-
                 .map(|t| t.0.to_matrix().as_dmat4())
-
                 .unwrap_or(DMat4::IDENTITY);
 
             // 计算负实体相对于正实体坐标系的变换矩阵
@@ -1484,16 +1181,12 @@ async fn apply_boolean_for_query(
             let mut geo_tf = geo_local_trans.0;
 
             if is_unit_mesh {
-
                 geo_tf.scale /= aios_core::geometry::csg::UNIT_MESH_SCALE;
-
             }
 
             let neg_world_mat = carrier_world_mat * geo_tf.to_matrix().as_dmat4();
 
             let relative_mat = inverse_pos_world * neg_world_mat;
-
-            
 
             // 调试：打印变换矩阵信息
 
@@ -1503,100 +1196,76 @@ async fn apply_boolean_for_query(
 
             println!("  carrier_world: {:?}", carrier_world_mat.col(3));
 
-            println!("  geo_local: {:?}", geo_local_trans.0.to_matrix().as_dmat4().col(3));
+            println!(
+                "  geo_local: {:?}",
+                geo_local_trans.0.to_matrix().as_dmat4().col(3)
+            );
 
             println!("  geo_scale: {:?}", geo_local_trans.0.scale);
 
             if is_unit_mesh {
-
                 println!("  geo_scale_eff(unit/100): {:?}", geo_tf.scale);
-
             }
 
             if let Some(t) = carrier_world_trans.as_ref() {
-
                 println!("  carrier_scale: {:?}", t.0.scale);
-
             }
 
             println!("  relative: {:?}", relative_mat.col(3));
 
             println!(
-
                 "  relative_basis_len: x={:.6} y={:.6} z={:.6}",
-
                 relative_mat.col(0).truncate().length(),
-
                 relative_mat.col(1).truncate().length(),
-
                 relative_mat.col(2).truncate().length(),
-
             );
 
             debug_model_debug!("加载负实体 mesh: {} (相对于正实体坐标系)", neg_mesh_id);
 
             match load_manifold(&neg_mesh_id, relative_mat, true) {
-
                 Ok(manifold) => {
-
                     if let Some(neg_aabb) = manifold.get_mesh().cal_aabb() {
-
-                        println!("[AABB_DBG] neg[{}] id={} aabb: min=({:.1},{:.1},{:.1}) max=({:.1},{:.1},{:.1}) verts={} tris={}",
-
-                            neg_manifolds.len(), neg_mesh_id,
-
-                            neg_aabb.mins.x, neg_aabb.mins.y, neg_aabb.mins.z,
-
-                            neg_aabb.maxs.x, neg_aabb.maxs.y, neg_aabb.maxs.z,
-
+                        println!(
+                            "[AABB_DBG] neg[{}] id={} aabb: min=({:.1},{:.1},{:.1}) max=({:.1},{:.1},{:.1}) verts={} tris={}",
+                            neg_manifolds.len(),
+                            neg_mesh_id,
+                            neg_aabb.mins.x,
+                            neg_aabb.mins.y,
+                            neg_aabb.mins.z,
+                            neg_aabb.maxs.x,
+                            neg_aabb.maxs.y,
+                            neg_aabb.maxs.z,
                             manifold.get_mesh().vertices.len() / 3,
-
                             manifold.get_mesh().indices.len() / 3,
-
                         );
-
                     }
 
                     neg_manifolds.push(manifold.inflate_from_center(NEG_INFLATE_EPSILON_MM));
-
                 }
 
                 Err(e) => {
-
                     // 负实体可能数量很大，简单限流，避免刷屏
 
                     if neg_load_fail_logged < 10 {
-
                         log_load_manifold_failed("inst_neg", query.refno, &neg_mesh_id, &e);
 
                         neg_load_fail_logged += 1;
-
                     }
-
                 }
-
             }
-
         }
-
     }
 
     if neg_manifolds.is_empty() {
-
         println!(
-
             "布尔运算失败: 未找到负实体 manifold，refno: {}, neg 载体数={}",
-
             query.refno,
-
             query.neg_ts.len()
-
         );
 
         mark_bool_failed(query.refno).await?;
 
         return Ok(());
-
     }
 
     // 逐个减去负实体，并在出现“异常清空”时尽量避免把结果整个抹掉：
@@ -1608,7 +1277,6 @@ async fn apply_boolean_for_query(
     let mut final_manifold = pos_manifold.clone();
 
     for (i, neg) in neg_manifolds.iter().enumerate() {
-
         let before = final_manifold.clone();
 
         let before_aabb = before.get_mesh().cal_aabb();
@@ -1618,9 +1286,7 @@ async fn apply_boolean_for_query(
         // 如果当前结果已经是空的，就没必要继续差集了
 
         if before.get_mesh().indices.is_empty() {
-
             break;
-
         }
 
         let mut after = before.clone();
@@ -1628,11 +1294,8 @@ async fn apply_boolean_for_query(
         after.inner = after.inner.difference(&neg.inner);
 
         if after.get_mesh().indices.is_empty() {
-
             match (&before_aabb, &neg_aabb) {
-
                 (Some(before_aabb), Some(neg_aabb)) => {
-
                     let intersects = aabb_intersects(before_aabb, neg_aabb);
 
                     let contains = aabb_contains(neg_aabb, before_aabb);
@@ -1640,45 +1303,31 @@ async fn apply_boolean_for_query(
                     // 差集把结果清空只有在 neg 真实覆盖/包含正实体时才合理；否则认为异常并跳过该 neg。
 
                     if !intersects || !contains {
-
                         eprintln!(
-
                             "[bool][inst] ⚠️ 差集结果被异常清空，跳过该负实体: refno={} neg_idx={} intersects={} contains={}",
-
                             query.refno, i, intersects, contains
-
                         );
 
                         final_manifold = before;
 
                         continue;
-
                     }
-
                 }
 
                 _ => {
-
                     eprintln!(
-
                         "[bool][inst] ⚠️ 差集结果被清空且无法计算 AABB，跳过该负实体: refno={} neg_idx={}",
-
                         query.refno, i
-
                     );
 
                     final_manifold = before;
 
                     continue;
-
                 }
-
             };
-
         }
 
         final_manifold = after;
-
     }
 
     // 额外兜底：如果逐个 subtract 仍退化为空，尝试先 union 再一次 difference，
@@ -1686,15 +1335,11 @@ async fn apply_boolean_for_query(
     // 避免多次 difference 引入的数值/拓扑退化。
 
     if final_manifold.get_mesh().indices.is_empty() {
-
         let pos_aabb = pos_manifold.get_mesh().cal_aabb();
 
         let neg_union = ManifoldRust::batch_boolean(
-
             &neg_manifolds,
-
             aios_core::csg::manifold::ManifoldOpType::Union,
-
         );
 
         let union_aabb = neg_union.get_mesh().cal_aabb();
@@ -1704,97 +1349,62 @@ async fn apply_boolean_for_query(
         union_diff.inner = union_diff.inner.difference(&neg_union.inner);
 
         if union_diff.get_mesh().indices.is_empty() {
-
             match (&pos_aabb, &union_aabb) {
-
                 (Some(pos_aabb), Some(union_aabb)) => {
-
                     if aabb_contains(union_aabb, pos_aabb) {
-
                         final_manifold = union_diff;
-
                     } else {
-
                         eprintln!(
-
                             "[bool][inst] ⚠️ union-diff 清空但 AABB 未包含正体，疑似退化: refno={}",
-
                             query.refno
-
                         );
-
                     }
-
                 }
 
                 _ => {
-
                     eprintln!(
-
                         "[bool][inst] ⚠️ union-diff 清空且无法计算 AABB，保留逐个 subtract 的结果: refno={}",
-
                         query.refno
-
                     );
-
                 }
-
             }
-
         } else {
-
             final_manifold = union_diff;
-
         }
-
     }
 
     // 经验：当差集退化为空时，通常是精度/焊接导致的数值问题；尝试提升正实体加载精度重算一次。
 
     if final_manifold.get_mesh().indices.is_empty() {
-
         eprintln!(
-
             "[bool][inst] ⚠️ 布尔结果为空，尝试 more_precision=true 重算: refno={}",
-
             query.refno
-
         );
 
         let mut pos_hi_manifolds = Vec::new();
 
         for pos in query.pos_geos.iter() {
-
             let pos_mesh_id = pos.0.to_mesh_id();
 
             let pos_local_mat = pos.1.to_matrix().as_dmat4();
 
             if let Ok(m) = load_manifold(&pos_mesh_id, pos_local_mat, true) {
-
                 pos_hi_manifolds.push(m);
-
             }
-
         }
 
         if !pos_hi_manifolds.is_empty() {
-
             let pos_hi = ManifoldRust::batch_boolean(
-
                 &pos_hi_manifolds,
-
                 aios_core::csg::manifold::ManifoldOpType::Union,
-
             );
 
             if !pos_hi.get_mesh().indices.is_empty() {
-
                 // 复用“逐个 subtract + 退化保护 + union-diff 兜底”的逻辑，避免高精度重算时再次退化。
 
                 let mut hi_final = pos_hi.clone();
 
                 for (i, neg) in neg_manifolds.iter().enumerate() {
-
                     let before = hi_final.clone();
 
                     let before_aabb = before.get_mesh().cal_aabb();
@@ -1802,9 +1412,7 @@ async fn apply_boolean_for_query(
                     let neg_aabb = neg.get_mesh().cal_aabb();
 
                     if before.get_mesh().indices.is_empty() {
-
                         break;
-
                     }
 
                     let mut after = before.clone();
@@ -1812,65 +1420,44 @@ async fn apply_boolean_for_query(
                     after.inner = after.inner.difference(&neg.inner);
 
                     if after.get_mesh().indices.is_empty() {
-
                         match (&before_aabb, &neg_aabb) {
-
                             (Some(before_aabb), Some(neg_aabb)) => {
-
                                 let intersects = aabb_intersects(before_aabb, neg_aabb);
 
                                 let contains = aabb_contains(neg_aabb, before_aabb);
 
                                 if !intersects || !contains {
-
                                     eprintln!(
-
                                         "[bool][inst] ⚠️(hi) 差集结果被异常清空，跳过该负实体: refno={} neg_idx={} intersects={} contains={}",
-
                                         query.refno, i, intersects, contains
-
                                     );
 
                                     hi_final = before;
 
                                     continue;
-
                                 }
-
                             }
 
                             _ => {
-
                                 eprintln!(
-
                                     "[bool][inst] ⚠️(hi) 差集结果被清空且无法计算 AABB，跳过该负实体: refno={} neg_idx={}",
-
                                     query.refno, i
-
                                 );
 
                                 hi_final = before;
 
                                 continue;
-
                             }
-
                         };
-
                     }
 
                     hi_final = after;
-
                 }
 
                 if hi_final.get_mesh().indices.is_empty() {
-
                     let neg_union = ManifoldRust::batch_boolean(
-
                         &neg_manifolds,
-
                         aios_core::csg::manifold::ManifoldOpType::Union,
-
                     );
 
                     let mut union_diff = pos_hi.clone();
@@ -1878,42 +1465,27 @@ async fn apply_boolean_for_query(
                     union_diff.inner = union_diff.inner.difference(&neg_union.inner);
 
                     if !union_diff.get_mesh().indices.is_empty() {
-
                         hi_final = union_diff;
-
                     }
-
                 }
 
                 final_manifold = hi_final;
-
             }
-
         }
-
     }
 
     if final_manifold.get_mesh().indices.is_empty() {
-
         println!(
-
             "布尔运算失败: 结果为空（三角形=0）, refno: {} (pos_geos={}, neg_geos={})",
-
             query.refno,
-
             query.pos_geos.len(),
-
             neg_manifolds.len()
-
         );
 
         mark_bool_failed(query.refno).await?;
 
         return Ok(());
-
     }
-
-    
 
     // 统一使用 RefU64 格式（如 17496_106028），不管 sesno 是否为 0
 
@@ -1934,9 +1506,7 @@ async fn apply_boolean_for_query(
     use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
 
     match export_single_mesh_to_glb(&normal_mesh, &target_path) {
-
         Ok(_) => {
-
             let aabb = final_manifold.get_mesh().cal_aabb();
 
             update_booled_result(query.refno, &mesh_id, aabb).await?;
@@ -1944,67 +1514,49 @@ async fn apply_boolean_for_query(
             debug_model!("布尔运算完成: refno={} mesh={}", query.refno, mesh_id);
 
             return Ok(());
-
         }
 
         Err(e) => {
-
-            eprintln!("布尔运算失败: 无法保存结果 mesh, refno: {} err: {}", query.refno, e);
+            eprintln!(
+                "布尔运算失败: 无法保存结果 mesh, refno: {} err: {}",
+                query.refno, e
+            );
 
             mark_bool_failed(query.refno).await
-
         }
-
     }
-
 }
 
 /// 对多个实例进行布尔运算（使用 Manifold，新查询流程）
 
 pub async fn apply_insts_boolean_manifold(
-
     refnos: &[RefnoEnum],
 
     replace_exist: bool,
-
 ) -> anyhow::Result<()> {
-
     if refnos.is_empty() {
-
         return Ok(());
-
     }
 
     let filtered_refnos = filter_out_bran_refnos(refnos).await?;
 
     if filtered_refnos.is_empty() {
-
         return Ok(());
-
     }
 
     if filtered_refnos.len() != refnos.len() {
-
         debug_model_debug!(
-
             "实例布尔：跳过 BRAN 类型实体 {} 个（输入={} 过滤后={}）",
-
             refnos.len().saturating_sub(filtered_refnos.len()),
-
             refnos.len(),
-
             filtered_refnos.len()
-
         );
-
     }
 
     let refnos = filtered_refnos;
 
     if refnos.is_empty() {
-
         return Ok(());
-
     }
 
     // 先用新的批量 API 筛选出存在负实体的实例
@@ -2012,51 +1564,36 @@ pub async fn apply_insts_boolean_manifold(
     let neg_mapping = query_negative_entities_batch(&refnos).await?;
 
     let targets: Vec<RefnoEnum> = neg_mapping
-
         .into_iter()
-
         .filter_map(|(pos, negs)| if negs.is_empty() { None } else { Some(pos) })
-
         .collect();
 
     if targets.is_empty() {
-
         debug_model!("没有需要布尔运算的实例，输入 {} 个", refnos.len());
 
         return Ok(());
-
     }
 
     let queries: Vec<ManiGeoTransQuery> =
-
         query_manifold_boolean_operations_batch_optimized(&targets, replace_exist).await?;
 
     println!(
-
         "布尔任务数量: {} (targets={})",
-
         queries.len(),
-
         targets.len()
-
     );
 
     if queries.is_empty() {
-
         debug_model!("未查询到布尔运算参数，跳过");
 
         return Ok(());
-
     }
 
     for query in queries {
-
         apply_boolean_for_query(query, replace_exist).await?;
-
     }
 
     Ok(())
-
 }
 
 /// 内存任务驱动布尔 worker 执行报告
@@ -2166,10 +1703,7 @@ impl BoolResultWriter for SqlBoolWriter {
         if let Some(aabb) = aabb {
             let aabb_hash = aios_core::gen_aabb_hash(&aabb).to_string();
             let aabb_json = serde_json::to_string(&aabb)?;
-            sqls.push(format!(
-                "UPSERT aabb:⟨{}⟩ SET d = {}",
-                aabb_hash, aabb_json
-            ));
+            sqls.push(format!("UPSERT aabb:⟨{}⟩ SET d = {}", aabb_hash, aabb_json));
             sqls.push(format!(
                 "UPSERT inst_relate_booled_aabb:⟨{}⟩ SET refno = pe:⟨{}⟩, aabb_id = aabb:⟨{}⟩",
                 refno, refno, aabb_hash
@@ -2186,12 +1720,13 @@ impl BoolResultWriter for SqlBoolWriter {
     }
 
     async fn write_inst_failed(&self, refno: RefnoEnum) -> anyhow::Result<()> {
-        self.writer.write_statement(&build_inst_relate_bool_upsert_sql(
-            refno,
-            None,
-            "Failed",
-            "bool_mesh",
-        ))?;
+        self.writer
+            .write_statement(&build_inst_relate_bool_upsert_sql(
+                refno,
+                None,
+                "Failed",
+                "bool_mesh",
+            ))?;
         Ok(())
     }
 
@@ -2240,7 +1775,8 @@ fn build_cata_status_sql(
     source: &str,
 ) -> String {
     let refno_key = refno.to_pe_key();
-    let mut sql = format!("LET $inst_info = (SELECT VALUE out FROM {refno_key}->inst_relate LIMIT 1)[0];");
+    let mut sql =
+        format!("LET $inst_info = (SELECT VALUE out FROM {refno_key}->inst_relate LIMIT 1)[0];");
     sql.push_str(
         "IF $inst_info != NONE { LET $old_ids = SELECT VALUE id FROM inst_relate_cata_bool WHERE in = $inst_info; DELETE $old_ids;",
     );
@@ -2631,7 +2167,10 @@ async fn batch_query_bool_success_refnos(
             "SELECT VALUE in FROM [{}] WHERE status = 'Success'",
             ids.join(",")
         );
-        match model_primary_db().query_take::<Vec<RefnoEnum>>(&sql, 0).await {
+        match model_primary_db()
+            .query_take::<Vec<RefnoEnum>>(&sql, 0)
+            .await
+        {
             Ok(found) => {
                 for r in found {
                     success_set.insert(r);
@@ -2649,7 +2188,10 @@ async fn batch_query_bool_success_refnos(
             "SELECT VALUE in.refno FROM [{}] WHERE status = 'Success'",
             cata_ids.join(",")
         );
-        match model_primary_db().query_take::<Vec<RefnoEnum>>(&cata_sql, 0).await {
+        match model_primary_db()
+            .query_take::<Vec<RefnoEnum>>(&cata_sql, 0)
+            .await
+        {
             Ok(found) => {
                 for r in found {
                     success_set.insert(r);
@@ -2696,12 +2238,18 @@ pub async fn run_bool_worker_from_tasks(
         match batch_query_bool_success_refnos(&tasks).await {
             Ok(set) => {
                 if !set.is_empty() {
-                    println!("[bool_worker/memory] 预查询 DB 已成功 refno 数: {}", set.len());
+                    println!(
+                        "[bool_worker/memory] 预查询 DB 已成功 refno 数: {}",
+                        set.len()
+                    );
                 }
                 set
             }
             Err(e) => {
-                eprintln!("[bool_worker/memory] 预查询 DB 布尔状态失败，降级为仅文件判定: {}", e);
+                eprintln!(
+                    "[bool_worker/memory] 预查询 DB 布尔状态失败，降级为仅文件判定: {}",
+                    e
+                );
                 HashSet::new()
             }
         }
@@ -2801,7 +2349,10 @@ pub async fn run_bool_worker_from_tasks(
                 }
                 Err(e) => {
                     report.failed += 1;
-                    eprintln!("[bool_worker/memory] 任务执行失败: refno={} err={}", refno, e);
+                    eprintln!(
+                        "[bool_worker/memory] 任务执行失败: refno={} err={}",
+                        refno, e
+                    );
                 }
             },
             Err(e) => {
@@ -2815,7 +2366,10 @@ pub async fn run_bool_worker_from_tasks(
     if !assoc_batch.is_empty() {
         if let Some(ref w) = sql_writer {
             if let Err(e) = assoc_batch.write_to_sql_file(w) {
-                eprintln!("[bool_worker/memory] refno_assoc_index 写入 SQL 文件失败: {}", e);
+                eprintln!(
+                    "[bool_worker/memory] refno_assoc_index 写入 SQL 文件失败: {}",
+                    e
+                );
             }
         } else {
             if let Err(e) = assoc_batch.upsert_to_db().await {
@@ -2836,7 +2390,10 @@ pub async fn run_bool_worker_from_tasks(
         report.elapsed_ms
     );
     if !report.skip_reasons.is_empty() {
-        println!("[bool_worker/memory] skipped 原因分布: {:?}", report.skip_reasons);
+        println!(
+            "[bool_worker/memory] skipped 原因分布: {:?}",
+            report.skip_reasons
+        );
     }
 
     Ok(report)
@@ -2851,4 +2408,3 @@ pub async fn run_boolean_worker_from_cache_manager(
 
 pub async fn run_boolean_worker_from_cache(cache_dir: &Path) -> anyhow::Result<usize> { unimplemented!() }
 */
-

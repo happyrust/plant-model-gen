@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use aios_core::pdms_types::{RefU64, RefnoEnum};
 use aios_core::tool::db_tool::db1_dehash;
-use aios_core::{SurrealQueryExt, DBType, project_primary_db};
+use aios_core::{DBType, SurrealQueryExt, project_primary_db};
 use anyhow::{Context, Result};
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;
 
 use crate::fast_model::gen_model::tree_index_manager::{
-    load_index_with_large_stack, TreeIndexManager,
+    TreeIndexManager, load_index_with_large_stack,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -177,7 +177,11 @@ async fn query_pe_names(refnos: &[RefnoEnum], verbose: bool) -> Result<HashMap<R
 /// 数据来源：
 /// - 层级/owner/noun：TreeIndex (.tree)
 /// - name：SurrealDB pe + fn::default_name
-pub async fn export_pdms_tree_parquet(dbnum: u32, output_dir: &Path, verbose: bool) -> Result<PdmsTreeParquetStats> {
+pub async fn export_pdms_tree_parquet(
+    dbnum: u32,
+    output_dir: &Path,
+    verbose: bool,
+) -> Result<PdmsTreeParquetStats> {
     let start = std::time::Instant::now();
     fs::create_dir_all(output_dir)
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
@@ -253,7 +257,11 @@ pub async fn export_pdms_tree_parquet(dbnum: u32, output_dir: &Path, verbose: bo
             .unwrap_or((RefU64(0), 0));
 
         ids.push(ref_u64.0 as i64);
-        parents.push(if owner_u64.0 == 0 { None } else { Some(owner_u64.0 as i64) });
+        parents.push(if owner_u64.0 == 0 {
+            None
+        } else {
+            Some(owner_u64.0 as i64)
+        });
         refno_strs.push(refno.to_string());
         owner_refno_strs.push(if owner_u64.0 == 0 {
             None
@@ -332,7 +340,10 @@ pub async fn export_pdms_tree_parquet(dbnum: u32, output_dir: &Path, verbose: bo
 ///
 /// 说明：后端 e3d children 对 WORL 有特判（直接返回 sites 列表），这里把同样的数据落盘，
 /// 让前端在 Full Parquet Mode 下无需依赖 /api/e3d/*。
-pub async fn export_world_sites_parquet(output_dir: &Path, verbose: bool) -> Result<WorldSitesParquetStats> {
+pub async fn export_world_sites_parquet(
+    output_dir: &Path,
+    verbose: bool,
+) -> Result<WorldSitesParquetStats> {
     let start = std::time::Instant::now();
     fs::create_dir_all(output_dir)
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
@@ -342,125 +353,128 @@ pub async fn export_world_sites_parquet(output_dir: &Path, verbose: bool) -> Res
         RefnoEnum,
         Vec<aios_core::pdms_types::EleTreeNode>,
         Vec<u32>,
-    ) =
-        match async {
-            let db_option = aios_core::get_db_option();
-            let mdb_name = db_option.mdb_name.clone();
-            let world_u64 = aios_core::mdb::get_world_refno(mdb_name.clone()).await?.refno();
-            let world = RefnoEnum::from(world_u64);
+    ) = match async {
+        let db_option = aios_core::get_db_option();
+        let mdb_name = db_option.mdb_name.clone();
+        let world_u64 = aios_core::mdb::get_world_refno(mdb_name.clone())
+            .await?
+            .refno();
+        let world = RefnoEnum::from(world_u64);
 
-            // MDB 的 WORL -> SITE 列表（DESI）
-            let sites = aios_core::get_mdb_world_site_ele_nodes(mdb_name, DBType::DESI).await?;
+        // MDB 的 WORL -> SITE 列表（DESI）
+        let sites = aios_core::get_mdb_world_site_ele_nodes(mdb_name, DBType::DESI).await?;
 
-            // 计算每个 SITE 的 dbnum（用 ref0->dbnum 映射；不要求数据库在线）
-            let mut dbnums_for_sites: Vec<u32> = Vec::with_capacity(sites.len());
-            for ele in &sites {
-                let site_refno = ele.refno;
-                let dbnum = TreeIndexManager::resolve_dbnum_for_refno(site_refno).unwrap_or(0);
-                dbnums_for_sites.push(dbnum);
+        // 计算每个 SITE 的 dbnum（用 ref0->dbnum 映射；不要求数据库在线）
+        let mut dbnums_for_sites: Vec<u32> = Vec::with_capacity(sites.len());
+        for ele in &sites {
+            let site_refno = ele.refno;
+            let dbnum = TreeIndexManager::resolve_dbnum_for_refno(site_refno).unwrap_or(0);
+            dbnums_for_sites.push(dbnum);
+        }
+
+        Ok::<_, anyhow::Error>((world, sites, dbnums_for_sites))
+    }
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            if verbose {
+                println!("⚠️  WORL->SITE 数据库查询失败，回退到离线 tree 扫描模式：{e}");
             }
 
-            Ok::<_, anyhow::Error>((world, sites, dbnums_for_sites))
-        }
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                if verbose {
-                    println!("⚠️  WORL->SITE 数据库查询失败，回退到离线 tree 扫描模式：{e}");
-                }
+            // 离线模式：
+            // - world：使用 0/0 作为合成根节点
+            // - sites：扫描所有 *.tree，找 noun=SITE 且 owner_noun=WORL 的节点
+            let manager = TreeIndexManager::with_default_dir(vec![]);
+            let tree_dir = manager.tree_dir().to_path_buf();
 
-                // 离线模式：
-                // - world：使用 0/0 作为合成根节点
-                // - sites：扫描所有 *.tree，找 noun=SITE 且 owner_noun=WORL 的节点
-                let manager = TreeIndexManager::with_default_dir(vec![]);
-                let tree_dir = manager.tree_dir().to_path_buf();
-
-                let mut dbnums: Vec<u32> = Vec::new();
-                if tree_dir.is_dir() {
-                    for entry in fs::read_dir(&tree_dir)
-                        .with_context(|| format!("读取 tree_dir 失败: {}", tree_dir.display()))?
-                    {
-                        let entry = entry?;
-                        let path = entry.path();
-                        if !path.is_file() {
-                            continue;
-                        }
-                        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                            continue;
-                        };
-                        if let Some(stem) = name.strip_suffix(".tree") {
-                            if let Ok(n) = stem.parse::<u32>() {
-                                dbnums.push(n);
-                            }
-                        }
-                    }
-                }
-                dbnums.sort_unstable();
-                dbnums.dedup();
-
-                let mut sites_lite: Vec<SiteLite> = Vec::new();
-                for dbnum in dbnums.iter().copied() {
-                    let tree_path = tree_dir.join(format!("{dbnum}.tree"));
-                    if !tree_path.is_file() {
+            let mut dbnums: Vec<u32> = Vec::new();
+            if tree_dir.is_dir() {
+                for entry in fs::read_dir(&tree_dir)
+                    .with_context(|| format!("读取 tree_dir 失败: {}", tree_dir.display()))?
+                {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if !path.is_file() {
                         continue;
                     }
-                    let idx = load_index_with_large_stack(&tree_dir, dbnum)
-                        .with_context(|| format!("加载 TreeIndex 失败: {}", tree_path.display()))?;
-
-                    let mut all_u64s = idx.all_refnos();
-                    all_u64s.sort_by_key(|r| r.0);
-
-                    let mut children_count: HashMap<RefU64, u32> = HashMap::new();
-                    for r in &all_u64s {
-                        if let Some(meta) = idx.node_meta(*r) {
-                            if meta.owner.0 != 0 {
-                                *children_count.entry(meta.owner).or_insert(0) += 1;
-                            }
+                    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    if let Some(stem) = name.strip_suffix(".tree") {
+                        if let Ok(n) = stem.parse::<u32>() {
+                            dbnums.push(n);
                         }
                     }
+                }
+            }
+            dbnums.sort_unstable();
+            dbnums.dedup();
 
-                    for r in all_u64s {
-                        let Some(meta) = idx.node_meta(r) else { continue };
-                        let noun = db1_dehash(meta.noun);
-                        if noun != "SITE" {
-                            continue;
-                        }
-                        // 尝试用 owner noun 过滤顶层 SITE（owner=WORL）
-                        let owner_noun = idx
-                            .node_meta(meta.owner)
-                            .map(|m| db1_dehash(m.noun))
-                            .unwrap_or_default();
-                        if owner_noun != "WORL" {
-                            continue;
-                        }
+            let mut sites_lite: Vec<SiteLite> = Vec::new();
+            for dbnum in dbnums.iter().copied() {
+                let tree_path = tree_dir.join(format!("{dbnum}.tree"));
+                if !tree_path.is_file() {
+                    continue;
+                }
+                let idx = load_index_with_large_stack(&tree_dir, dbnum)
+                    .with_context(|| format!("加载 TreeIndex 失败: {}", tree_path.display()))?;
 
-                        let refno = RefnoEnum::from(meta.refno);
-                        let cnt = *children_count.get(&meta.refno).unwrap_or(&0);
-                        sites_lite.push(SiteLite {
-                            refno,
-                            noun: noun.to_string(),
-                            name: refno.to_string(),
-                            children_count: cnt,
-                            dbnum,
-                        });
+                let mut all_u64s = idx.all_refnos();
+                all_u64s.sort_by_key(|r| r.0);
+
+                let mut children_count: HashMap<RefU64, u32> = HashMap::new();
+                for r in &all_u64s {
+                    if let Some(meta) = idx.node_meta(*r) {
+                        if meta.owner.0 != 0 {
+                            *children_count.entry(meta.owner).or_insert(0) += 1;
+                        }
                     }
                 }
 
-                // 构造与 SPdmsElement 形状一致的输出（最小字段集合）
-                // 注意：这里为了复用后续写 parquet 的逻辑，使用 SPdmsElement 的真实类型较麻烦；
-                // 直接在下方写 parquet 时会改用 sites_lite。
+                for r in all_u64s {
+                    let Some(meta) = idx.node_meta(r) else {
+                        continue;
+                    };
+                    let noun = db1_dehash(meta.noun);
+                    if noun != "SITE" {
+                        continue;
+                    }
+                    // 尝试用 owner noun 过滤顶层 SITE（owner=WORL）
+                    let owner_noun = idx
+                        .node_meta(meta.owner)
+                        .map(|m| db1_dehash(m.noun))
+                        .unwrap_or_default();
+                    if owner_noun != "WORL" {
+                        continue;
+                    }
 
-                // 使用合成 world
-                let world = RefnoEnum::from(RefU64(0));
-
-                // 将 sites_lite 转成 SPdmsElement 需要 aios_core 结构体的构造器，这里避免依赖，
-                // 改为用 sites_lite 分支写 parquet（见下方）。
-
-                // 通过返回 Err 标记走离线分支
-                return write_world_sites_offline(output_dir, verbose, start, world, sites_lite);
+                    let refno = RefnoEnum::from(meta.refno);
+                    let cnt = *children_count.get(&meta.refno).unwrap_or(&0);
+                    sites_lite.push(SiteLite {
+                        refno,
+                        noun: noun.to_string(),
+                        name: refno.to_string(),
+                        children_count: cnt,
+                        dbnum,
+                    });
+                }
             }
-        };
+
+            // 构造与 SPdmsElement 形状一致的输出（最小字段集合）
+            // 注意：这里为了复用后续写 parquet 的逻辑，使用 SPdmsElement 的真实类型较麻烦；
+            // 直接在下方写 parquet 时会改用 sites_lite。
+
+            // 使用合成 world
+            let world = RefnoEnum::from(RefU64(0));
+
+            // 将 sites_lite 转成 SPdmsElement 需要 aios_core 结构体的构造器，这里避免依赖，
+            // 改为用 sites_lite 分支写 parquet（见下方）。
+
+            // 通过返回 Err 标记走离线分支
+            return write_world_sites_offline(output_dir, verbose, start, world, sites_lite);
+        }
+    };
 
     let world_id = world.refno().0 as i64;
 
@@ -621,4 +635,3 @@ fn write_world_sites_offline(
         file_name,
     })
 }
-

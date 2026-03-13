@@ -1,5 +1,5 @@
 use aios_core::rs_surreal::query::NounHierarchyItem;
-use aios_core::{RefnoEnum, project_primary_db, SurrealQueryExt};
+use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db};
 use axum::{Router, extract::State, http::StatusCode, response::Json, routing::post};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -208,14 +208,8 @@ async fn query_noun_tree(
         Ok(records) => {
             if let Some(record) = records.first() {
                 let refno = record.refno.unwrap_or(request.root_refno);
-                let name = record
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| "Unknown".to_string());
-                let noun = record
-                    .noun
-                    .clone()
-                    .unwrap_or_else(|| "UNKNOWN".to_string());
+                let name = record.name.clone().unwrap_or_else(|| "Unknown".to_string());
+                let noun = record.noun.clone().unwrap_or_else(|| "UNKNOWN".to_string());
                 let owner = record.owner;
 
                 // 构建树形结构
@@ -287,8 +281,7 @@ async fn build_tree_recursive(
     // 如果还未达到最大深度，查询子节点
     if depth < max_depth {
         let nouns_filter = filter_nouns.clone().unwrap_or_default();
-        let children_query =
-            "SELECT refno, name, noun, owner FROM pe WHERE owner = $owner_refno AND (array::len($nouns) = 0 OR noun IN $nouns) LIMIT 100";
+        let children_query = "SELECT refno, name, noun, owner FROM pe WHERE owner = $owner_refno AND (array::len($nouns) = 0 OR noun IN $nouns) LIMIT 100";
 
         match project_primary_db()
             .query(children_query)
@@ -299,11 +292,9 @@ async fn build_tree_recursive(
             Ok(mut resp) => {
                 let records: Vec<PeRow> = resp.take(0).unwrap_or_default();
                 for record in records {
-                    if let (Some(child_refno), Some(child_name), Some(child_noun)) = (
-                        record.refno,
-                        record.name.as_deref(),
-                        record.noun.as_deref(),
-                    ) {
+                    if let (Some(child_refno), Some(child_name), Some(child_noun)) =
+                        (record.refno, record.name.as_deref(), record.noun.as_deref())
+                    {
                         let child_owner = record.owner;
 
                         // 递归构建子树

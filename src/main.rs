@@ -2064,9 +2064,7 @@ async fn main() -> anyhow::Result<()> {
 
         #[cfg(not(feature = "parquet-export"))]
         if single_dbnum.is_none() {
-            eprintln!(
-                "❌ 错误: parquet-export 特性未启用，请使用 --features parquet-export 编译"
-            );
+            eprintln!("❌ 错误: parquet-export 特性未启用，请使用 --features parquet-export 编译");
             std::process::exit(1);
         }
 
@@ -2178,8 +2176,15 @@ async fn main() -> anyhow::Result<()> {
 
                 let gen_panels_mesh = sub_m.get_flag("gen-panels-mesh");
 
-                return room_compute_mode(keywords, db_nums, refno_root, gen_panels_mesh, verbose, &db_option_ext)
-                    .await;
+                return room_compute_mode(
+                    keywords,
+                    db_nums,
+                    refno_root,
+                    gen_panels_mesh,
+                    verbose,
+                    &db_option_ext,
+                )
+                .await;
             }
             Some(("compute-panel", sub_m)) => {
                 let panel_refno = sub_m.get_one::<String>("panel-refno").unwrap();

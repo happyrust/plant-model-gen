@@ -413,7 +413,7 @@ pub(crate) async fn query_aabb_from_inst_relate_aabb(
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
+pub async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
     db_nums: Option<&[u32]>,
     refno_root: Option<RefnoEnum>,
 ) -> anyhow::Result<usize> {

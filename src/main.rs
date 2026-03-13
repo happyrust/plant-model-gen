@@ -776,6 +776,54 @@ async fn main() -> anyhow::Result<()> {
                 .value_delimiter(',')
                 .num_args(1..),
         )
+        .subcommand(
+            Command::new("spatial")
+                .about("SQLite 空间范围查询与回归验证")
+                .subcommand(
+                    Command::new("query-refno")
+                        .about("以 refno 为中心做空间范围查询，并可校验 expect-refnos / verify-json")
+                        .arg(
+                            Arg::new("refno")
+                                .help("查询中心 refno（如 24381/145019）")
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("distance-mm")
+                                .long("distance-mm")
+                                .help("查询距离，单位毫米；1m 请传 1000")
+                                .default_value("1000"),
+                        )
+                        .arg(
+                            Arg::new("include-self")
+                                .long("include-self")
+                                .help("结果中包含查询 refno 本身")
+                                .action(clap::ArgAction::SetTrue),
+                        )
+                        .arg(
+                            Arg::new("build-spatial")
+                                .long("build-spatial")
+                                .help("查询前先刷新 output/spatial_index.sqlite")
+                                .action(clap::ArgAction::SetTrue),
+                        )
+                        .arg(
+                            Arg::new("expect-refnos")
+                                .long("expect-refnos")
+                                .help("期望命中的 refno（逗号分隔）")
+                                .value_delimiter(',')
+                                .num_args(1..),
+                        )
+                        .arg(
+                            Arg::new("verify-json")
+                                .long("verify-json")
+                                .help("将当前查询结果与给定 JSON 快照做回归校验"),
+                        )
+                        .arg(
+                            Arg::new("write-verify-json")
+                                .long("write-verify-json")
+                                .help("将当前查询结果写入 JSON 快照文件"),
+                        ),
+                ),
+        )
         // ========== 房间计算子命令 ==========
         .subcommand(
             Command::new("room")
@@ -2136,6 +2184,48 @@ async fn main() -> anyhow::Result<()> {
             &db_option_ext,
         )
         .await;
+    }
+
+    // ========== 处理 spatial 子命令 ==========
+    if let Some(spatial_matches) = matches.subcommand_matches("spatial") {
+        use crate::cli_modes::spatial_query_refno_mode;
+
+        match spatial_matches.subcommand() {
+            Some(("query-refno", sub_m)) => {
+                let refno = sub_m.get_one::<String>("refno").unwrap();
+                let distance_mm = sub_m
+                    .get_one::<String>("distance-mm")
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(1000.0);
+                let include_self = sub_m.get_flag("include-self");
+                let build_spatial = sub_m.get_flag("build-spatial");
+                let expect_refnos: Option<Vec<String>> = sub_m
+                    .get_many::<String>("expect-refnos")
+                    .map(|v| v.map(|s| s.to_string()).collect());
+                let verify_json_path = sub_m
+                    .get_one::<String>("verify-json")
+                    .map(PathBuf::from);
+                let write_verify_json_path = sub_m
+                    .get_one::<String>("write-verify-json")
+                    .map(PathBuf::from);
+
+                return spatial_query_refno_mode(
+                    refno,
+                    distance_mm,
+                    include_self,
+                    build_spatial,
+                    expect_refnos,
+                    verify_json_path.as_deref(),
+                    write_verify_json_path.as_deref(),
+                    verbose,
+                )
+                .await;
+            }
+            _ => {
+                println!("请指定 spatial 子命令，使用 --help 查看可用命令");
+                return Ok(());
+            }
+        }
     }
 
     // ========== 处理 room 子命令 ==========

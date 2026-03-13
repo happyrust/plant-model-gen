@@ -646,6 +646,7 @@ fn try_load_projects_from_sqlite() -> Option<Vec<ProjectItem>> {
     let rows = stmt
         .query_map([], |row| {
             let name = get_opt_str(row, "name").unwrap_or_default();
+            let show_dbnum = project_show_dbnum(&name);
             let version = get_opt_str(row, "version");
             let url = get_opt_str(row, "url");
             let env = get_opt_str(row, "env");
@@ -678,7 +679,7 @@ fn try_load_projects_from_sqlite() -> Option<Vec<ProjectItem>> {
                 last_health_check: None,
                 created_at,
                 updated_at,
-                show_dbnum: project_show_dbnum(&name),
+                show_dbnum,
             })
         })
         .ok()?;

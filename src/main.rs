@@ -771,7 +771,10 @@ async fn main() -> anyhow::Result<()> {
                             .help("限定 refno 子树根（如 21491_10000）"))
                         .arg(Arg::new("gen-panels-mesh").long("gen-panels-mesh")
                             .help("预生成缺失面板的几何模型（默认跳过，仅计算空间关系）")
-                            .action(clap::ArgAction::SetTrue)),
+                            .action(clap::ArgAction::SetTrue))
+                        .arg(Arg::new("report-json").long("report-json")
+                            .help("将房间计算阶段耗时与统计写入 JSON 报告")
+                            .value_name("FILE")),
                 )
                 .subcommand(
                     Command::new("compute-panel")
@@ -785,7 +788,10 @@ async fn main() -> anyhow::Result<()> {
                             .num_args(1..))
                         .arg(Arg::new("rebuild-spatial-index").long("rebuild-spatial-index")
                             .help("显式重建本次 panel 计算使用的局部 SQLite 空间索引；默认直接复用现有索引")
-                            .action(clap::ArgAction::SetTrue)),
+                            .action(clap::ArgAction::SetTrue))
+                        .arg(Arg::new("report-json").long("report-json")
+                            .help("将单面板计算阶段耗时与统计写入 JSON 报告")
+                            .value_name("FILE")),
                 )
                 .subcommand(
                     Command::new("rebuild-spatial-index")
@@ -802,7 +808,7 @@ async fn main() -> anyhow::Result<()> {
                             Arg::new("input")
                                 .long("input")
                                 .short('i')
-                                .help("验证 fixture JSON 路径")
+                                .help("验证 fixture JSON 路径（推荐：verification/room_compute_validation.json）")
                                 .required(true)
                                 .value_name("FILE"),
                         ),
@@ -2156,12 +2162,14 @@ async fn main() -> anyhow::Result<()> {
                     });
 
                 let gen_panels_mesh = sub_m.get_flag("gen-panels-mesh");
+                let report_json = sub_m.get_one::<String>("report-json").map(PathBuf::from);
 
                 return room_compute_mode(
                     keywords,
                     db_nums,
                     refno_root,
                     gen_panels_mesh,
+                    report_json,
                     verbose,
                     &db_option_ext,
                 )
@@ -2173,11 +2181,13 @@ async fn main() -> anyhow::Result<()> {
                     .get_many::<String>("expect-refnos")
                     .map(|v| v.map(|s| s.to_string()).collect());
                 let rebuild_spatial_index = sub_m.get_flag("rebuild-spatial-index");
+                let report_json = sub_m.get_one::<String>("report-json").map(PathBuf::from);
 
                 return room_compute_panel_mode(
                     panel_refno,
                     expect_refnos,
                     rebuild_spatial_index,
+                    report_json,
                     verbose,
                     &db_option_ext,
                 )

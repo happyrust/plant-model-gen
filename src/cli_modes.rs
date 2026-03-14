@@ -15,6 +15,7 @@ use aios_database::fast_model::export_model::export_obj::ObjExporter;
 use aios_database::fast_model::export_model::export_room_instances::{
     RoomComputeValidationCase, RoomComputeValidationFixture,
 };
+use aios_database::perf_timer::{PerfReport, PerfTimer};
 use aios_database::options::DbOptionExt;
 // use aios_database::fast_model::export_xkt::XktExporter;
 use aios_database::fast_model::model_exporter::{
@@ -3403,6 +3404,7 @@ pub async fn room_compute_mode(
     db_nums: Option<Vec<u32>>,
     refno_root: Option<RefnoEnum>,
     gen_panels_mesh: bool,
+    report_json: Option<PathBuf>,
     verbose: bool,
     db_option_ext: &DbOptionExt,
 ) -> Result<()> {
@@ -3415,21 +3417,16 @@ pub async fn room_compute_mode(
     #[cfg(feature = "profile")]
     let _root_span = tracing::info_span!("room_compute_mode").entered();
 
-    // 通过环境变量控制 pregen_room_panels_into_model_cache 是否执行
-    // SAFETY: 单线程 CLI 入口，此时尚未启动其他线程
-    unsafe {
-        std::env::set_var(
-            "AIOS_ROOM_PREGEN_PANELS",
-            if gen_panels_mesh { "1" } else { "0" },
-        );
-    }
-
     println!("\n🏠 房间计算模式");
     println!("==========================================");
 
     let start_time = Instant::now();
+    let mut perf_timer = PerfTimer::new("room_compute");
+    perf_timer.mark("parse_cli_args");
 
-    let keywords = room_keywords.unwrap_or_else(|| db_option_ext.get_room_key_word());
+    let keywords = room_keywords
+        .clone()
+        .unwrap_or_else(|| db_option_ext.get_room_key_word());
     println!("   - 房间关键词: {:?}", keywords);
 
     if let Some(ref nums) = db_nums {
@@ -3448,13 +3445,18 @@ pub async fn room_compute_mode(
             "否（使用 --gen-panels-mesh 启用）"
         }
     );
+    if let Some(path) = &report_json {
+        println!("   - JSON 报告: {}", path.display());
+    }
 
     println!("\n📡 初始化数据库连接...");
+    perf_timer.mark("init_surreal");
     init_surreal().await?;
 
     // 前置检查：inst_relate_aabb 是否有数据
     {
         println!("   🔍 检查 inst_relate_aabb 表状态...");
+        perf_timer.mark("check_inst_relate_aabb");
 
         // 方法1: 直接 count，不返回 record 字段，避免 SurrealDB 3.x "Expected any, got record" 问题
         let has_data = match aios_core::SUL_DB
@@ -3514,10 +3516,12 @@ pub async fn room_compute_mode(
     // build_room_relations 内部的 ensure_spatial_index_ready 会从 inst_relate_aabb 表构建空间索引。
 
     println!("\n🔄 开始构建房间关系...");
+    perf_timer.mark("build_room_relations");
 
     let stats = build_room_relations(&db_option_ext.inner, db_nums.as_deref(), refno_root).await?;
 
     let duration = start_time.elapsed();
+    perf_timer.mark("print_summary");
 
     println!("\n🎉 房间计算完成！");
     println!("==========================================");
@@ -3529,6 +3533,19 @@ pub async fn room_compute_mode(
     println!("   - 缓存命中率: {:.2}%", stats.cache_hit_rate * 100.0);
     println!("   - 内存使用: {:.2}MB", stats.memory_usage_mb);
     println!("   - 总耗时: {:.2}s", duration.as_secs_f64());
+
+    let report = RoomComputeCliReport::for_full_compute(
+        &mut perf_timer,
+        stats,
+        &duration,
+        room_keywords.as_deref(),
+        db_nums.as_deref(),
+        refno_root,
+        gen_panels_mesh,
+        &report_json,
+    );
+    print_room_compute_stage_summary(&report);
+    maybe_write_room_compute_report(&report_json, &report)?;
 
     Ok(())
 }
@@ -3543,6 +3560,7 @@ pub async fn room_compute_panel_mode(
     panel_refno_str: &str,
     expect_refnos: Option<Vec<String>>,
     rebuild_spatial_index: bool,
+    report_json: Option<PathBuf>,
     verbose: bool,
     db_option_ext: &DbOptionExt,
 ) -> Result<()> {
@@ -3563,6 +3581,8 @@ pub async fn room_compute_panel_mode(
     println!("==========================================");
 
     let start_time = Instant::now();
+    let mut perf_timer = PerfTimer::new("room_compute_panel");
+    perf_timer.mark("parse_cli_args");
 
     let panel_refno = RefnoEnum::from_str(&panel_refno_str.replace('_', "/"))
         .map_err(|_| anyhow!("无效的面板 refno: {}", panel_refno_str))?;
@@ -3578,10 +3598,15 @@ pub async fn room_compute_panel_mode(
             "复用现有索引"
         }
     );
+    if let Some(path) = &report_json {
+        println!("   - JSON 报告: {}", path.display());
+    }
 
+    perf_timer.mark("ensure_surreal_connected");
     ensure_surreal_connected(db_option_ext).await?;
 
     if rebuild_spatial_index {
+        perf_timer.mark("prepare_generation_targets");
         // ========== 仅在显式指定时才生成模型并重建局部索引 ==========
         let mut extra_gen_refnos: Vec<RefnoEnum> = Vec::new();
         let mut expected_root_refnos: Vec<RefnoEnum> = Vec::new();
@@ -3653,6 +3678,7 @@ pub async fn room_compute_panel_mode(
                 Some(derived_dbnums.clone())
             },
         );
+        perf_timer.mark("generate_panel_models");
         gen_all_geos_data(gen_refnos.clone(), &gen_opt, None, None).await?;
 
         println!("✅ 模型生成完成");
@@ -3669,9 +3695,11 @@ pub async fn room_compute_panel_mode(
     let exclude = HashSet::new();
 
     println!("\n🔄 计算面板 {} 的房间归属...", panel_refno);
+    perf_timer.mark("compute_panel_relations");
     let result = cal_room_refnos_with_options(&mesh_dir, panel_refno, &exclude, options).await?;
 
     let duration = start_time.elapsed();
+    perf_timer.mark("print_summary");
 
     println!("\n🎉 计算完成！");
     println!("==========================================");
@@ -3688,10 +3716,10 @@ pub async fn room_compute_panel_mode(
     }
 
     // 验证期望构件
-    if let Some(expected) = expect_refnos {
+    if let Some(ref expected) = expect_refnos {
         println!("\n📋 期望验证:");
         let mut all_pass = true;
-        for exp_str in &expected {
+        for exp_str in expected {
             let exp = RefnoEnum::from_str(&exp_str.replace('_', "/"))
                 .map_err(|_| anyhow!("无效的期望 refno: {}", exp_str))?;
             if result.contains(&exp) {
@@ -3708,9 +3736,23 @@ pub async fn room_compute_panel_mode(
     }
 
     if !result.is_empty() {
+        perf_timer.mark("save_room_relate");
         save_room_relate(panel_refno, &result, "manual").await?;
         println!("💾 已保存 {} 条房间关系", result.len());
     }
+
+    let within_refnos = result.iter().copied().collect::<Vec<_>>();
+    let report = RoomComputeCliReport::for_single_panel(
+        &mut perf_timer,
+        panel_refno,
+        &within_refnos,
+        expect_refnos.as_deref(),
+        rebuild_spatial_index,
+        &duration,
+        &report_json,
+    );
+    print_room_compute_stage_summary(&report);
+    maybe_write_room_compute_report(&report_json, &report)?;
 
     Ok(())
 }
@@ -3989,6 +4031,7 @@ pub async fn room_compute_mode(
     _db_nums: Option<Vec<u32>>,
     _refno_root: Option<RefnoEnum>,
     _gen_panels_mesh: bool,
+    _report_json: Option<PathBuf>,
     _verbose: bool,
     _db_option_ext: &DbOptionExt,
 ) -> Result<()> {
@@ -4002,6 +4045,7 @@ pub async fn room_compute_panel_mode(
     _panel_refno_str: &str,
     _expect_refnos: Option<Vec<String>>,
     _rebuild_spatial_index: bool,
+    _report_json: Option<PathBuf>,
     _verbose: bool,
     _db_option_ext: &DbOptionExt,
 ) -> Result<()> {
@@ -4068,6 +4112,118 @@ pub async fn export_room_instances_mode(output_dir: Option<PathBuf>, verbose: bo
     println!("     - 面板数: {}", geometries_stats.total_panels);
     println!("     - 耗时: {} ms", geometries_stats.export_time_ms);
 
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RoomComputeCliReport {
+    schema_version: u32,
+    command: String,
+    report_path: Option<String>,
+    total_duration_ms: u128,
+    stats: serde_json::Value,
+    context: serde_json::Value,
+    perf: PerfReport,
+}
+
+impl RoomComputeCliReport {
+    fn for_full_compute(
+        timer: &mut PerfTimer,
+        stats: aios_database::fast_model::RoomBuildStats,
+        duration: &std::time::Duration,
+        room_keywords: Option<&[String]>,
+        db_nums: Option<&[u32]>,
+        refno_root: Option<RefnoEnum>,
+        gen_panels_mesh: bool,
+        report_json: &Option<PathBuf>,
+    ) -> Self {
+        let perf = timer.generate_report(serde_json::json!({
+            "command": "room compute",
+            "report_requested": report_json.is_some(),
+        }));
+        Self {
+            schema_version: 1,
+            command: "room compute".to_string(),
+            report_path: report_json.as_ref().map(|p| p.display().to_string()),
+            total_duration_ms: duration.as_millis(),
+            stats: serde_json::json!({
+                "total_rooms": stats.total_rooms,
+                "total_panels": stats.total_panels,
+                "total_components": stats.total_components,
+                "build_time_ms": stats.build_time_ms,
+                "cache_hit_rate": stats.cache_hit_rate,
+                "memory_usage_mb": stats.memory_usage_mb,
+                "failed_panels": stats.failed_panels,
+                "missing_candidates": stats.missing_candidates,
+            }),
+            context: serde_json::json!({
+                "keywords": room_keywords,
+                "db_nums": db_nums,
+                "refno_root": refno_root.map(|r| r.to_string()),
+                "gen_panels_mesh": gen_panels_mesh,
+            }),
+            perf,
+        }
+    }
+
+    fn for_single_panel(
+        timer: &mut PerfTimer,
+        panel_refno: RefnoEnum,
+        result: &[RefnoEnum],
+        expect_refnos: Option<&[String]>,
+        rebuild_spatial_index: bool,
+        duration: &std::time::Duration,
+        report_json: &Option<PathBuf>,
+    ) -> Self {
+        let perf = timer.generate_report(serde_json::json!({
+            "command": "room compute-panel",
+            "report_requested": report_json.is_some(),
+        }));
+        Self {
+            schema_version: 1,
+            command: "room compute-panel".to_string(),
+            report_path: report_json.as_ref().map(|p| p.display().to_string()),
+            total_duration_ms: duration.as_millis(),
+            stats: serde_json::json!({
+                "panel_refno": panel_refno.to_string(),
+                "hit_refno_count": result.len(),
+                "within_refnos": result.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+            }),
+            context: serde_json::json!({
+                "expect_refnos": expect_refnos,
+                "rebuild_spatial_index": rebuild_spatial_index,
+            }),
+            perf,
+        }
+    }
+}
+
+fn print_room_compute_stage_summary(report: &RoomComputeCliReport) {
+    println!("\n⏱️ 阶段耗时:");
+    for stage in &report.perf.stages {
+        println!(
+            "   - {}: {:.1}ms ({:.1}%)",
+            stage.name, stage.duration_ms, stage.percentage
+        );
+    }
+    println!("   - total: {}ms", report.total_duration_ms);
+}
+
+fn maybe_write_room_compute_report(
+    report_json: &Option<PathBuf>,
+    report: &RoomComputeCliReport,
+) -> Result<()> {
+    let Some(path) = report_json else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create room report dir: {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(report)?;
+    std::fs::write(path, text)
+        .with_context(|| format!("write room report json: {}", path.display()))?;
+    println!("💾 已写入房间计算报告: {}", path.display());
     Ok(())
 }
 

@@ -474,11 +474,11 @@ pub fn generate_single_indextree(target_dbnum: u32) -> anyhow::Result<()> {
 
     println!("🔍 扫描项目目录: {}", project_dir.display());
 
-    // 扫描项目目录下的所有文件，找到匹配的 dbnum
+    // 扫描项目目录下的所有文件，找到匹配的 dbnum（包括子目录）
     let mut found_file: Option<String> = None;
 
-    if let Ok(entries) = fs::read_dir(&project_dir) {
-        for entry in entries.flatten() {
+    fn scan_dir_recursive(dir: &std::path::Path, target_dbnum: u32, found: &mut Option<String>) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)?.flatten() {
             let path = entry.path();
             if path.is_file() {
                 if let Ok(mut file) = fs::File::open(&path) {
@@ -486,15 +486,23 @@ pub fn generate_single_indextree(target_dbnum: u32) -> anyhow::Result<()> {
                     if file.read_exact(&mut buf).is_ok() {
                         let db_info = parse_file_basic_info(&buf);
                         if db_info.dbnum == target_dbnum {
-                            found_file = Some(path.to_string_lossy().to_string());
+                            *found = Some(path.to_string_lossy().to_string());
                             println!("✅ 找到 dbnum={} 的文件: {}", target_dbnum, path.display());
-                            break;
+                            return Ok(());
                         }
                     }
                 }
+            } else if path.is_dir() {
+                scan_dir_recursive(&path, target_dbnum, found)?;
+                if found.is_some() {
+                    return Ok(());
+                }
             }
         }
+        Ok(())
     }
+
+    let _ = scan_dir_recursive(&project_dir, target_dbnum, &mut found_file);
 
     let file_path = found_file
         .ok_or_else(|| anyhow::anyhow!("未找到 dbnum={} 对应的 db 文件", target_dbnum))?;

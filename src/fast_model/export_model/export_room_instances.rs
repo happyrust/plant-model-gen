@@ -30,7 +30,7 @@ pub struct RoomComputeValidationFixture {
     pub test_cases: Vec<RoomComputeValidationCase>,
 }
 
-/// One room validation case from `room_compute_validation.json`.
+/// One room validation case from `verification/room/compute/room_compute_validation.json`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RoomComputeValidationCase {
     pub case_id: String,
@@ -591,7 +591,7 @@ mod tests {
     #[test]
     fn test_load_room_compute_validation_fixture() {
         let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/room_compute_validation.json");
+            .join("verification/room/compute/room_compute_validation.json");
 
         let fixture = RoomComputeValidationFixture::load_from_path(&fixture_path)
             .expect("fixture should load");

@@ -1,19 +1,24 @@
 commands:
-  cargo-version: cd /d D:\work\plant-code\plant-model-gen && cargo --version
-  test: cd /d D:\work\plant-code\plant-model-gen && cargo check --release --bin aios-database
-  room-cli-check-release: cd /d D:\work\plant-code\plant-model-gen && cargo check --release --bin aios-database
-  room-help: cd /d D:\work\plant-code\plant-model-gen && cargo run --bin aios-database -- room --help
-  room-compute-help: cd /d D:\work\plant-code\plant-model-gen && cargo run --bin aios-database -- room compute --help
-  room-compute-panel-help: cd /d D:\work\plant-code\plant-model-gen && cargo run --bin aios-database -- room compute-panel --help
-  room-verify-help: cd /d D:\work\plant-code\plant-model-gen && cargo run --bin aios-database -- room verify-json --help
-  room-rebuild-spatial-index: cd /d D:\work\plant-code\plant-model-gen && cargo run --release --bin aios-database -- room rebuild-spatial-index
-  room-compute-full: cd /d D:\work\plant-code\plant-model-gen && cargo run --release --bin aios-database -- room compute
+  cargo-version: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo --version
+  test: cd /Volumes/DPC/work/plant-model-gen && cargo check --bin aios-database --quiet
+  room-cli-check: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo check --bin aios-database --quiet
+  room-cli-check-release: cd /Volumes/DPC/work/plant-model-gen && cargo check --release --bin aios-database
+  room-help: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room --help
+  room-compute-help: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room compute --help
+  room-compute-panel-help: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room compute-panel --help
+  room-rebuild-spatial-index: cd /Volumes/DPC/work/plant-model-gen && cargo run --release --bin aios-database -- room rebuild-spatial-index
+  room-compute-full: cd /Volumes/DPC/work/plant-model-gen && cargo run --release --bin aios-database -- room compute
+  room-verify-help: cd /Volumes/DPC/work/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json --help
+  room-verify-required-input: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json
+  room-verify-missing-input-file: cd /Volumes/DPC/work/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json --input /tmp/room-verify-missing.json
+  room-verify-fixture: cd /Volumes/DPC/work/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json --input verification/room/compute/room_compute_validation.json
+  room-release-build: cd /Volumes/DPC/work/plant-model-gen && cargo build --release --bin aios-database
 
 services:
   room-cli:
     start: echo "CLI-only mission: no long-running room service to start"
     stop: echo "CLI-only mission: nothing to stop"
-    healthcheck: cd /d D:\work\plant-code\plant-model-gen && cargo run --bin aios-database -- room --help >NUL && echo "room CLI reachable"
+    healthcheck: cd /Volumes/DPC/work/plant-model-gen && cargo run --bin aios-database -- room --help > /dev/null && echo "room CLI reachable"
     depends_on: []
 
   surrealdb:

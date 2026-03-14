@@ -1,0 +1,15 @@
+{
+  "description": "房间计算验证数据集",
+  "test_cases": [
+    {
+      "case_id": "room_540_panel_validation",
+      "description": "验证房间 540 的面板和构件关系",
+      "room_number": "R540",
+      "panel_refno": "24381/35798",
+      "expected_components": [
+        "24381/145019"
+      ],
+      "notes": "基准验证用例"
+    }
+  ]
+}

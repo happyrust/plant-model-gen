@@ -5,7 +5,7 @@ Add a post-compute CLI verifier for room computation results:
 
 ```bash
 aios-database room compute ...
-aios-database room verify-json --input tests/fixtures/room_compute_validation.json
+aios-database room verify-json --input verification/room/compute/room_compute_validation.json
 ```
 
 The verifier is not a compute entrypoint. It inspects persisted post-compute state and compares it against the JSON fixture.
@@ -14,7 +14,7 @@ The verifier is not a compute entrypoint. It inspects persisted post-compute sta
 
 - Room-to-panel membership: persisted room/panel relationships written by `room compute`
 - Expected component membership: persisted room/component relationships written by `room compute`
-- Input contract: `tests/fixtures/room_compute_validation.json`
+- Input contract: `verification/room/compute/room_compute_validation.json`
 
 ## Required Operator Semantics
 
@@ -28,7 +28,7 @@ The verifier is not a compute entrypoint. It inspects persisted post-compute sta
 
 ```bash
 cargo run --bin aios-database -- room compute ...
-cargo run --bin aios-database -- room verify-json --input tests/fixtures/room_compute_validation.json
+cargo run --bin aios-database -- room verify-json --input verification/room/compute/room_compute_validation.json
 ```
 
 Optional rebuild/index repair behavior, if implemented, must be explicit and separate from the default verify-only path.

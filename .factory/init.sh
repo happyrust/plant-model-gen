@@ -20,6 +20,10 @@ if [ ! -f ".factory/services.yaml" ]; then
     exit 1
 fi
 
+if [ ! -f "verification/room/compute/room_compute_validation.json" ]; then
+    echo "⚠️  Notice: verification/room/compute/room_compute_validation.json not found; skip json-specific checks if unavailable"
+fi
+
 echo "✅ Mission service manifest found"
 
 if [ -f "output/spatial_index.sqlite" ]; then
@@ -35,6 +39,8 @@ echo "   - cargo run --bin aios-database -- room --help"
 echo "   - cargo run --release --bin aios-database -- room compute"
 echo "   - cargo run --release --bin aios-database -- room compute-panel --panel-refno <refno>"
 echo "   - cargo check --release --bin aios-database"
-echo "ℹ️  Validator concurrency is intentionally capped at 1 for this mission."
+echo "ℹ️  Acceptance workflow for this mission:"
+echo "   1. cargo run --bin aios-database -- room compute ..."
+echo "   2. cargo run --bin aios-database -- room verify-json --input verification/room/compute/room_compute_validation.json"
 
 echo "✅ Mission environment initialization complete"

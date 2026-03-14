@@ -1044,7 +1044,7 @@ fn verify_room_case(
                                 .component_panels_by_room
                                 .get(&case.room_number)?
                                 .get(&component_refno)?;
-                            if panels.contains(&panel_refno) {
+                            if panels.is_empty() || panels.contains(&panel_refno) {
                                 None
                             } else {
                                 Some(format!(
@@ -1063,7 +1063,11 @@ fn verify_room_case(
                     details.push(format!("缺少期望构件: {}", missing_components.join(", ")));
                     if !stale_panels.is_empty() {
                         details.extend(stale_panels);
-                        RoomVerifyCaseStatus::ScopeMismatch
+                        details.push(
+                            "组件虽然出现在同房间其它 panel 上，但当前 room/panel 已有持久化覆盖；按真实期望不匹配处理，而不是 coverage 缺失"
+                                .to_string(),
+                        );
+                        RoomVerifyCaseStatus::ExpectationMismatch
                     } else {
                         RoomVerifyCaseStatus::ExpectationMismatch
                     }
@@ -1251,18 +1255,34 @@ mod room_verify_tests {
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
     #[test]
-    fn verify_room_case_reports_scope_mismatch_when_component_exists_on_other_panel() {
-        let persisted = make_persisted_relations();
+    fn verify_room_case_reports_expectation_mismatch_when_component_exists_on_other_panel() {
+        let mut persisted = make_persisted_relations();
+        let panel = RefnoEnum::from("24381/35798");
+        let component = RefnoEnum::from("24381/145019");
+        persisted.room_components_by_panel.insert(
+            ("540".to_string(), panel),
+            BTreeSet::new(),
+        );
+        persisted.component_panels_by_room.insert(
+            "540".to_string(),
+            BTreeMap::from([(component, BTreeSet::from([RefnoEnum::from("24381/35799")]))]),
+        );
 
         let outcome = verify_room_case(&make_case(&["24381/145019"]), &persisted)
-            .expect("verification should classify stale panel scope");
+            .expect("verification should classify other-panel component as mismatch");
 
-        assert_eq!(outcome.status, RoomVerifyCaseStatus::ScopeMismatch);
+        assert_eq!(outcome.status, RoomVerifyCaseStatus::ExpectationMismatch);
         assert!(
             outcome
                 .details
                 .iter()
                 .any(|detail| detail.contains("当前挂在其它 panel"))
+        );
+        assert!(
+            outcome
+                .details
+                .iter()
+                .any(|detail| detail.contains("按真实期望不匹配处理"))
         );
     }
 

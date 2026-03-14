@@ -1390,7 +1390,6 @@ pub async fn update_sqlite_spatial_index_from_cache(
     use crate::spatial_index::SqliteSpatialIndex;
     use crate::sqlite_index::{ImportConfig, SqliteAabbIndex};
     use std::fs;
-    use std::path::PathBuf;
     if dbnums.is_empty() {
         return Ok(());
     }
@@ -1424,6 +1423,11 @@ pub async fn update_sqlite_spatial_index_from_cache(
         .get_project_output_dir()
         .join("instances_cache_for_index");
     fs::create_dir_all(&base_out).map_err(|e| anyhow::anyhow!(e))?;
+    let project_output_dir = db_option.get_project_output_dir();
+    let project_instances_dir = project_output_dir.join("instances");
+    let nested_project_instances_dir = project_output_dir
+        .join(&db_option.inner.project_name)
+        .join("instances");
 
     // mesh_lod_tag 仅用于导出侧选择 mesh（用于补齐/计算 AABB）
     let cache_dir = db_option.get_model_cache_dir();
@@ -1434,24 +1438,33 @@ pub async fn update_sqlite_spatial_index_from_cache(
     let mut uniq: BTreeSet<u32> = BTreeSet::new();
     uniq.extend(dbnums.iter().copied());
     for dbnum in uniq {
-        let out_dir = base_out.join(format!("{}", dbnum));
-        fs::create_dir_all(&out_dir).map_err(|e| anyhow::anyhow!(e))?;
+        // 优先复用本轮生成已经落盘的 instances 输出，避免继续依赖已移除的旧 cache contract。
+        let direct_instances_path = project_instances_dir.join(format!("instances_{}.json", dbnum));
+        let nested_instances_path =
+            nested_project_instances_dir.join(format!("instances_{}.json", dbnum));
+        let instances_path = if direct_instances_path.exists() {
+            direct_instances_path
+        } else if nested_instances_path.exists() {
+            nested_instances_path
+        } else {
+            let out_dir = base_out.join(format!("{}", dbnum));
+            fs::create_dir_all(&out_dir).map_err(|e| anyhow::anyhow!(e))?;
 
-        // 1) cache -> instances_{dbnum}.json + aabb.json + trans.json
-        let _ = crate::fast_model::export_model::export_prepack_lod::export_dbnum_instances_json_from_cache(
-            dbnum,
-            &out_dir,
-            &cache_dir,
-            Some(&mesh_dir),
-            Some(mesh_lod_tag.as_str()),
-            false,
-            None,
-            false,
-        )
-        .await?;
+            let _ = crate::fast_model::export_model::export_prepack_lod::export_dbnum_instances_json_from_cache(
+                dbnum,
+                &out_dir,
+                &cache_dir,
+                Some(&mesh_dir),
+                Some(mesh_lod_tag.as_str()),
+                false,
+                None,
+                false,
+            )
+            .await?;
 
-        // 2) instances_{dbnum}.json -> spatial_index.sqlite (RTree)
-        let instances_path = out_dir.join(format!("instances_{}.json", dbnum));
+            out_dir.join(format!("instances_{}.json", dbnum))
+        };
+
         if instances_path.exists() {
             let _ = idx.import_from_instances_json(&instances_path, &ImportConfig::default())?;
         }

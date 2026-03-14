@@ -707,6 +707,7 @@ fn build_room_compute_panel_gen_option(
     gen_opt.inner.gen_model = true;
     gen_opt.inner.gen_mesh = true;
     gen_opt.inner.replace_mesh = Some(true);
+    gen_opt.export_instances = true;
     gen_opt.inner.manual_db_nums = manual_db_nums.map(|mut nums| {
         nums.sort_unstable();
         nums.dedup();
@@ -3587,7 +3588,8 @@ pub async fn room_compute_panel_mode(
     db_option_ext: &DbOptionExt,
 ) -> Result<()> {
     use aios_database::fast_model::room_model::{
-        RoomComputeOptions, cal_room_refnos_with_options, save_room_relate,
+        RoomComputeOptions, cal_room_refnos_with_options,
+        refresh_sqlite_spatial_index_from_inst_relate_aabb, save_room_relate,
     };
     use std::collections::HashSet;
     use std::str::FromStr;
@@ -3704,9 +3706,18 @@ pub async fn room_compute_panel_mode(
         gen_all_geos_data(gen_refnos.clone(), &gen_opt, None, None).await?;
 
         println!("✅ 模型生成完成");
-        println!("\n⚠️  提示：模型已生成，但空间索引未更新。");
-        println!("   如需更新空间索引，请运行：");
-        println!("   cargo run --bin aios-database -- room rebuild-spatial-index");
+        if derived_dbnums.is_empty() {
+            println!("\n⚠️  未能从生成目标推导出数据库编号，跳过 SQLite 空间索引刷新");
+        } else {
+            println!("\n🧱 刷新 SQLite 空间索引: {:?}", derived_dbnums);
+            let inserted = refresh_sqlite_spatial_index_from_inst_relate_aabb(
+                Some(&derived_dbnums),
+                Some(panel_refno),
+            )
+            .await?;
+            println!("   - 已写入索引记录: {}", inserted);
+            println!("✅ SQLite 空间索引刷新完成");
+        }
     } else {
         println!("\n🗃️ 复用现有 SQLite 空间索引，不执行模型生成与局部索引重建");
     }
@@ -3759,7 +3770,13 @@ pub async fn room_compute_panel_mode(
 
     if !result.is_empty() {
         perf_timer.mark("save_room_relate");
-        save_room_relate(panel_refno, &result, "manual").await?;
+        let persisted_room_num = aios_database::fast_model::export_model::export_room_instances::query_room_panel_relations_for_verify()
+            .await?
+            .into_iter()
+            .find(|record| record.panel_refno == panel_refno)
+            .map(|record| record.room_num)
+            .unwrap_or_else(|| "manual".to_string());
+        save_room_relate(panel_refno, &result, &persisted_room_num).await?;
         println!("💾 已保存 {} 条房间关系", result.len());
     }
 
@@ -4254,7 +4271,7 @@ mod tests {
     use super::{
         build_room_compute_panel_calc_options, build_room_compute_panel_gen_option,
         build_room_compute_panel_gen_refnos, build_room_compute_panel_spatial_index_roots,
-        resolve_room_compute_generation_target,
+        derive_room_compute_panel_dbnums, resolve_room_compute_generation_target,
     };
     use aios_core::RefnoEnum;
     use std::str::FromStr;
@@ -4296,11 +4313,22 @@ mod tests {
         let gen_opt =
             build_room_compute_panel_gen_option(&db_option_ext, Some(vec![7997, 8000, 7997]));
 
-        assert!(!gen_opt.export_instances);
+        assert!(gen_opt.export_instances);
         assert_eq!(gen_opt.inner.replace_mesh, Some(true));
         assert!(gen_opt.inner.gen_model);
         assert!(gen_opt.inner.gen_mesh);
         assert_eq!(gen_opt.inner.manual_db_nums, Some(vec![7997, 8000]));
+    }
+
+    #[test]
+    fn test_derive_room_compute_panel_dbnums_sorts_and_dedups() {
+        let dbnums = derive_room_compute_panel_dbnums(&[
+            refno("24381/35798"),
+            refno("24381/145018"),
+            refno("24381/145019"),
+        ]);
+
+        assert_eq!(dbnums, vec![24381]);
     }
 
     #[test]

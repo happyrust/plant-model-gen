@@ -181,6 +181,8 @@ pub mod sqlite_index;
 #[cfg(feature = "sqlite-index")]
 pub mod spatial_index;
 
+pub mod model_relation_store_v3;
+
 #[cfg(all(feature = "sqlite-index", feature = "tonic"))]
 pub mod test_spatial_query;
 

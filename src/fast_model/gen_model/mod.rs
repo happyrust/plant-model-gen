@@ -59,6 +59,7 @@ pub mod loop_model; // LOOP 模型生成
 pub mod manifold_bool; // 布尔运算
 pub mod mesh_generate; // 网格生成
 pub mod pdms_inst; // 实例数据保存
+pub mod pdms_inst_surreal; // SurrealDB 极简存储
 pub mod prim_model; // PRIM 模型生成
 pub mod query; // 查询工具
 pub mod query_compat; // 查询兼容层

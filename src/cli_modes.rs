@@ -1505,7 +1505,9 @@ pub async fn run_regen_model(
     // 4. 确定目标 refnos 并执行生成
     use aios_database::fast_model::gen_all_geos_data;
     let target_refnos = collect_regen_target_refnos(config).await?;
-    aios_database::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen(&target_refnos).await?;
+
+    // 使用 SurrealDB 极简清理（单条 DELETE）
+    aios_database::fast_model::gen_model::pdms_inst_surreal::pre_cleanup_for_regen_surreal(&target_refnos).await?;
 
     // 4.1 从目标 refnos 推导 dbnum，覆盖配置文件中的 manual_db_nums
     if !target_refnos.is_empty() && config.dbnum.is_none() {

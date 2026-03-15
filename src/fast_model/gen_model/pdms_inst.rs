@@ -1251,6 +1251,40 @@ pub async fn save_instance_data_with_options(
         inst_mgr.ngmr_neg_relate_map.len()
     );
 
+    // 聚合数据到 refno_relations 表（极简方案）
+    if replace_exist {
+        use crate::fast_model::gen_model::pdms_inst_surreal::{RefnoRelations, save_refno_relations_surreal};
+        use std::collections::HashMap;
+
+        let mut relations_map: HashMap<u64, RefnoRelations> = HashMap::new();
+
+        // 聚合 inst_info
+        for (refno, info) in &inst_mgr.inst_info_map {
+            let dbnum = *inst_dbnum_map.get(refno).unwrap_or(&0);
+            let rel = relations_map.entry(refno.0).or_insert_with(|| RefnoRelations {
+                refno: refno.0,
+                dbnum,
+                ..Default::default()
+            });
+            rel.inst_ids.push(info.get_inst_key());
+        }
+
+        // 聚合 inst_geos
+        for (_, geos_info) in &inst_mgr.inst_geos_map {
+            for geo in &geos_info.geos {
+                if let Some(rel) = relations_map.get_mut(&geos_info.refno.0) {
+                    rel.geo_hashes.push(geo.hash);
+                }
+            }
+        }
+
+        // 批量保存
+        let relations: Vec<_> = relations_map.into_values().collect();
+        if !relations.is_empty() {
+            save_refno_relations_surreal(&relations).await?;
+        }
+    }
+
     Ok(())
 }
 

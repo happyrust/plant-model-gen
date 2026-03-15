@@ -118,6 +118,7 @@ miniacd = { git = "https://github.com/happyrust/miniacd-fork.git", branch = "mai
 
 #造型功能，先在database测试
 serde_with = { version = "3.14.1", features = ["macros"] }
+bincode = "1.3"
 rayon = "1.10.0"
 indexmap = "2.11.4"
 urlencoding = "2.1.3"

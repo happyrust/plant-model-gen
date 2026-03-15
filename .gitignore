@@ -131,6 +131,7 @@ deploy/
 *.json
 !/Cargo.lock
 !/.vscode/*.json
+!/verification/*.json
 !gen-model.code-workspace
 chrome_trace_*.json
 

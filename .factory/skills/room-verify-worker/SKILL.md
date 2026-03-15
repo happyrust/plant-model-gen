@@ -1,6 +1,6 @@
 ---
 name: room-verify-worker
-description: Implements the Rust CLI post-compute verification flow for `room verify-json`, including shared fixture parsing, persisted-result checks, reporting, and CLI-based validation.
+description: Owns room-compute CLI evidence, JSON reporting, compare/verify flows, and milestone performance or parity validation.
 ---
 
 # room-verify-worker
@@ -9,64 +9,87 @@ NOTE: Startup and cleanup are handled by the mission runner. This skill defines 
 
 ## When to Use This Skill
 
-Use this skill for features that modify the Rust CLI in `plant-model-gen` for the post-compute room verification workflow:
-- adding `room verify-json` under the existing `room` CLI
-- extracting or sharing the JSON fixture contract used by tests and CLI
-- implementing read-only verification helpers over persisted room-compute results
-- improving case-level reporting, summaries, and CLI-based validation flows
+Use this skill for room-compute validation-facing CLI features in `plant-model-gen`, especially when the mission needs evidence rather than another hot-path refactor. Typical examples:
+- stage-level timing and JSON performance reporting for `room compute` and `room compute-panel`
+- read-only compare / verify CLI flows
+- shared fixture or report contracts used by validators
+- persisted-result verification helpers
+- milestone gates that prove parity, fallback behavior, or performance deltas
 
 ## Work Procedure
 
 1. Read the assigned feature, `mission.md`, the mission `AGENTS.md`, and the feature's `fulfills` assertions before editing.
-2. Confirm the command stays post-compute and read-only by default.
-3. Prefer direct CLI validation over adding or relying on test commands:
+2. Confirm whether the feature is:
+   - reporting / observability,
+   - compare / verify CLI,
+   - persisted-result validation, or
+   - milestone-gate evidence.
+3. Preserve read-only-by-default semantics for compare/verify features unless the feature explicitly says otherwise.
+4. Prefer direct CLI validation over broad test suites:
    - help/usage validation
-   - required-argument failure validation
-   - missing-input-file validation
-   - real `room compute -> room verify-json` acceptance when the environment is ready
-4. Implement the smallest Rust changes needed in the CLI and supporting modules.
-5. Reuse persisted result sources; do not satisfy the feature by calling recompute/save paths from verification.
-6. Run the required validators:
-   - `cargo check --bin aios-database --quiet`
-7. Run lightweight CLI smoke checks:
-   - `cargo run --bin aios-database --quiet -- room --help`
-   - `cargo run --bin aios-database --quiet -- room verify-json --help`
-   - `cargo run --bin aios-database --quiet -- room verify-json`
-   - `cargo run --bin aios-database --quiet -- room verify-json --input /tmp/room-verify-missing.json`
-8. If the environment is ready, run the two-step acceptance flow with the provided fixture and report exact outcomes.
-9. Record whether verification remained read-only and whether any limitations came from DB/data availability.
+   - missing/invalid argument validation
+   - report generation validation
+   - compare/parity validation
+   - full `room compute` / `compute-panel` evidence runs only when required by the feature
+5. Implement the smallest Rust CLI or reporting changes needed in the command surface and supporting modules.
+6. Reuse persisted results or report files when the feature is about validation; do not satisfy a read-only feature by recomputing data on the default path.
+7. Run the required validators:
+   - `cargo check --release --bin aios-database`
+8. Run the narrowest relevant CLI smoke checks for the changed surface, such as:
+   - `cargo run --bin aios-database -- room --help`
+   - `cargo run --bin aios-database -- room compute --help`
+   - `cargo run --bin aios-database -- room compute-panel --help`
+   - `cargo run --bin aios-database -- room verify-json --help`
+9. When the feature claims milestone evidence, capture before/after timing or JSON-report deltas and name the exact files or commands used.
+10. Record whether the feature stayed read-only where required and whether any evidence gaps came from DB/data availability.
 
 ## Implementation Guardrails
 
 - Do not implement `verify-json` by calling `room_compute_panel_mode` or recomputation-heavy helpers.
 - Do not write `room_relate` or `room_panel_relate` from the default verification path.
 - Keep rebuild/index repair behavior opt-in and explicit if the feature requires it.
+- Do not claim performance success from logs alone when the feature also promised JSON reporting; capture both.
 - Prefer focused helpers over broad refactors; this repo is already dirty.
 
 ## Example Handoff
 
 ```json
 {
-  "salientSummary": "Added `room verify-json` as a post-compute, read-only CLI verifier for fixture-driven room validation.",
-  "whatWasImplemented": "Wired a new `room verify-json --input <file>` subcommand, extracted the shared fixture contract, added read-only persisted-result verification helpers, and improved per-case/summary reporting.",
-  "whatWasLeftUndone": "Manual acceptance against a real DB was not completed because the local compute scope did not match the provided fixture.",
+  "salientSummary": "Added stage-level JSON reporting plus read-only compare output for the room CLI and used them to produce milestone evidence without changing compute semantics.",
+  "whatWasImplemented": "Updated the room CLI to emit machine-readable stage timing reports for `room compute` and `room compute-panel`, extended the read-only verification surface to produce compare output that can diff expected versus actual results, and wired the report schema so milestone validators can consume consistent before/after evidence. The default compare path remained read-only and did not invoke recompute or write helpers.",
+  "whatWasLeftUndone": "Did not modify the hot-path execution logic itself; this feature only changed evidence and verification surfaces.",
   "verification": {
     "commandsRun": [
       {
-        "command": "cargo check --bin aios-database --quiet",
+        "command": "cargo check --release --bin aios-database",
         "exitCode": 0,
-        "observation": "CLI target compiles after the verification changes."
+        "observation": "Release CLI target compiles after the reporting and compare changes."
       },
       {
-        "command": "cargo run --bin aios-database --quiet -- room verify-json --help",
+        "command": "cargo run --bin aios-database -- room --help",
         "exitCode": 0,
-        "observation": "The new subcommand is visible with the expected flags."
+        "observation": "The room CLI lists the expected verification-facing subcommands and flags."
+      },
+      {
+        "command": "cargo run --bin aios-database -- room verify-json --help",
+        "exitCode": 0,
+        "observation": "The verification command advertises the expected read-only inputs and report flags."
       }
     ],
     "interactiveChecks": []
   },
   "tests": {
-    "added": []
+    "added": [
+      {
+        "file": "src/cli_modes.rs",
+        "cases": [
+          {
+            "name": "room_compare_report_is_read_only_by_default",
+            "verifies": "The compare/report path does not mutate persisted room relations on its default execution path."
+          }
+        ]
+      }
+    ]
   },
   "discoveredIssues": []
 }
@@ -75,5 +98,5 @@ Use this skill for features that modify the Rust CLI in `plant-model-gen` for th
 ## When to Return to Orchestrator
 
 - The feature requires violating read-only-by-default verification semantics.
-- The best implementation path appears to depend on broader runtime/service changes beyond the Rust CLI.
+- The best implementation path appears to depend on broader runtime/service changes beyond the Rust CLI or approved mission boundaries.
 - Validation cannot distinguish missing compute coverage from real mismatches without a product decision.

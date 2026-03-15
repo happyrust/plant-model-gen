@@ -1256,24 +1256,24 @@ pub async fn save_instance_data_with_options(
         use crate::fast_model::gen_model::pdms_inst_surreal::{RefnoRelations, save_refno_relations_surreal};
         use std::collections::HashMap;
 
-        let mut relations_map: HashMap<u64, RefnoRelations> = HashMap::new();
+        let mut relations_map: HashMap<RefnoEnum, RefnoRelations> = HashMap::new();
 
         // 聚合 inst_info
         for (refno, info) in &inst_mgr.inst_info_map {
             let dbnum = *inst_dbnum_map.get(refno).unwrap_or(&0);
-            let rel = relations_map.entry(refno.0).or_insert_with(|| RefnoRelations {
-                refno: refno.0,
+            let rel = relations_map.entry(*refno).or_insert_with(|| RefnoRelations {
+                refno: *refno,
                 dbnum,
                 ..Default::default()
             });
-            rel.inst_ids.push(info.get_inst_key());
+            rel.inst_keys.push(info.get_inst_key());
         }
 
         // 聚合 inst_geos
-        for (_, geos_info) in &inst_mgr.inst_geos_map {
-            for geo in &geos_info.geos {
-                if let Some(rel) = relations_map.get_mut(&geos_info.refno.0) {
-                    rel.geo_hashes.push(geo.hash);
+        for inst_geo_data in inst_mgr.inst_geos_map.values() {
+            for inst in &inst_geo_data.insts {
+                if let Some(rel) = relations_map.get_mut(&inst.refno) {
+                    rel.geo_hashes.push(inst.geo_hash);
                 }
             }
         }

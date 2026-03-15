@@ -2,14 +2,15 @@
 use anyhow::Result;
 use aios_core::{RefnoEnum, model_primary_db};
 use serde::{Deserialize, Serialize};
+use surrealdb_types::SurrealValue;
 use std::collections::HashMap;
 
 /// refno 关联的所有数据（扁平化）
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, SurrealValue)]
 pub struct RefnoRelations {
-    pub refno: u64,
+    pub refno: RefnoEnum,
     pub dbnum: u32,
-    pub inst_ids: Vec<u64>,
+    pub inst_keys: Vec<String>,
     pub geo_hashes: Vec<u64>,
     pub tubi_segments: Vec<Vec<u8>>,
     pub bool_results: Vec<Vec<u8>>,
@@ -35,7 +36,7 @@ pub async fn pre_cleanup_for_regen_surreal(seed_refnos: &[RefnoEnum]) -> Result<
 
     // 2. 构建 refno ID 列表
     let refno_ids = all_refnos.iter()
-        .map(|r| format!("refno_relations:{}", r.0))
+        .map(|r| format!("refno_relations:{}", r.to_pe_key()))
         .collect::<Vec<_>>()
         .join(",");
 
@@ -62,7 +63,7 @@ pub async fn save_refno_relations_surreal(relations: &[RefnoRelations]) -> Resul
     let mut values = Vec::new();
     for rel in relations {
         let json = serde_json::to_string(rel)?;
-        values.push(format!("(refno_relations:{}, {})", rel.refno, json));
+        values.push(format!("(refno_relations:{}, {})", rel.refno.to_pe_key(), json));
     }
 
     let sql = format!(
@@ -81,7 +82,7 @@ pub async fn load_refno_relations_surreal(refnos: &[RefnoEnum]) -> Result<Vec<Re
     }
 
     let refno_ids = refnos.iter()
-        .map(|r| format!("refno_relations:{}", r.0))
+        .map(|r| format!("refno_relations:{}", r.to_pe_key()))
         .collect::<Vec<_>>()
         .join(",");
 

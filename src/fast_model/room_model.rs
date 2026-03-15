@@ -173,16 +173,9 @@ fn resolve_room_calc_env_config(db_option: &DbOption) -> RoomCalcEnvConfig {
                 .join("instance_cache")
         });
 
-    let force_cache = env::var("AIOS_ROOM_FORCE_CACHE")
-        .ok()
-        .and_then(|v| parse_bool(v.trim()))
-        .unwrap_or(true);
-
-    let use_cache = force_cache
-        || env::var("AIOS_ROOM_USE_CACHE")
-            .ok()
-            .and_then(|v| parse_bool(v.trim()))
-            .unwrap_or(true);
+    // 缓存路径已废弃，强制关闭缓存并改用 SurrealDB 查询。
+    let force_cache = false;
+    let use_cache = false;
 
     RoomCalcEnvConfig {
         cache_dir,
@@ -212,29 +205,10 @@ fn get_room_calc_config() -> RoomCalcEnvConfig {
 
     // Fallback: if init_room_calc_config not called, derive reasonable defaults from env
 
-    let cache_dir = env::var("MODEL_CACHE_DIR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("output/instance_cache"));
-
-    let force_cache = env::var("AIOS_ROOM_FORCE_CACHE")
-        .ok()
-        .and_then(|v| parse_bool(v.trim()))
-        .unwrap_or(false);
-
-    let use_cache = force_cache
-        || env::var("AIOS_ROOM_USE_CACHE")
-            .ok()
-            .and_then(|v| parse_bool(v.trim()))
-            .unwrap_or(true);
-
     RoomCalcEnvConfig {
-        cache_dir,
-
-        use_cache,
-
-        force_cache,
+        cache_dir: PathBuf::from("output/instance_cache"),
+        use_cache: false,
+        force_cache: false,
     }
 }
 
@@ -693,128 +667,7 @@ async fn pregen_room_panels_into_model_cache(
 
     room_panel_map: &[(RefnoEnum, String, Vec<RefnoEnum>)],
 ) -> anyhow::Result<()> {
-    // 默认开启；需要禁用时可设置 AIOS_ROOM_PREGEN_PANELS=0。
-
-    if !parse_env_bool("AIOS_ROOM_PREGEN_PANELS", true) {
-        return Ok(());
-    }
-
-    use crate::data_interface::db_meta_manager::db_meta;
-
-    use crate::fast_model::instance_cache::InstanceCacheManager;
-
-    use crate::options::DbOptionExt;
-
-    let mut panels: HashSet<RefnoEnum> = HashSet::new();
-
-    for (_, _, ps) in room_panel_map {
-        for p in ps {
-            panels.insert(*p);
-        }
-    }
-
-    if panels.is_empty() {
-        return Ok(());
-    }
-
-    // 确保 db_meta 已加载，便于 ref0->cache_dbnum 推导。
-
-    db_meta().ensure_loaded().map_err(|e| {
-
-        anyhow::anyhow!(
-
-            "房间计算无法加载 db_meta_info.json（需要 ref0->cache_dbnum 映射以写入 model cache）: {}",
-
-            e
-
-        )
-
-    })?;
-
-    let cache_dir = env::var("MODEL_CACHE_DIR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from("output")
-                .join(db_option.project_name.as_str())
-                .join("instance_cache")
-        });
-
-    let cache = InstanceCacheManager::new(&cache_dir).await?;
-
-    // 按 dbnum 分组
-    let mut groups: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
-    for &p in &panels {
-        let Some(dbnum) = db_meta().get_dbnum_by_refno(p) else {
-            continue;
-        };
-        if dbnum == 0 {
-            continue;
-        }
-        groups.entry(dbnum).or_default().push(p);
-    }
-
-    let mut missing: Vec<RefnoEnum> = Vec::new();
-    for (dbnum, refnos) in groups {
-        for r in refnos {
-            let Some(info) = cache.get_inst_info(dbnum, r).await else {
-                missing.push(r);
-                continue;
-            };
-            // 检查是否有非空几何数据
-            if !info.inst_key.is_empty() {
-                if let Some(geos) = cache.get_inst_geos(dbnum, &info.inst_key).await {
-                    if !geos.geos_data.insts.is_empty() {
-                        continue; // 已找到，不缺失
-                    }
-                }
-            }
-            missing.push(r);
-        }
-    }
-
-    if missing.is_empty() {
-        return Ok(());
-    }
-
-    // 复用既有 model cache 定向生成流程（manual_refnos 路径）。
-
-    // 注意：这里“不把模型写回 SurrealDB(inst_*/geo_*)”，只写 model cache + mesh + sqlite 索引（若启用）。
-
-    let mut opt = DbOptionExt::from(db_option.clone());
-
-    opt.export_instances = false;
-
-    opt.inner.gen_model = true;
-
-    opt.inner.gen_mesh = true;
-
-    opt.inner.enable_sqlite_rtree = true;
-
-    opt.inner.apply_boolean_operation = false;
-
-    opt.inner.replace_mesh = Some(false);
-
-    opt.inner.save_db = Some(false);
-
-    // 手动 refnos 可能跨 dbnum：确保 db_meta 路径与 cache_dir 一致。
-
-    opt.model_cache_dir = Some(cache_dir.to_string_lossy().to_string());
-
-    // 输入数据仍需从 SurrealDB 读取（属性/loops/world_transform 等）。
-
-    aios_core::init_surreal().await?;
-
-    info!(
-        "房间计算：检测到 {} 个 panel 缺失模型数据，开始定向补齐（写 model cache）",
-        missing.len()
-    );
-
-    crate::fast_model::gen_model::gen_all_geos_data(missing.clone(), &opt, None, opt.target_sesno)
-        .await
-        .map_err(|e| anyhow::anyhow!("定向补齐 panel 模型失败: {}", e))?;
-
+    // 缓存功能已停用，直接返回。
     Ok(())
 }
 
@@ -1210,6 +1063,22 @@ async fn build_room_relations_with_cancel_and_overrides(
         });
 
         info!("refno 子树过滤后剩余 {} 个房间", room_panel_map.len());
+    }
+
+    // 预取面板几何：基于粗筛后的面板集合分批查询 SurrealDB，结果放入进程内缓存。
+    {
+        let mut panels: Vec<RefnoEnum> = room_panel_map
+            .iter()
+            .flat_map(|(_, _, ps)| ps.iter().copied())
+            .collect();
+        panels.sort();
+        panels.dedup();
+        if !panels.is_empty() {
+            const PREFETCH_BATCH: usize = 400;
+            for batch in panels.chunks(PREFETCH_BATCH) {
+                let _ = query_insts_for_room_calc(batch, true).await;
+            }
+        }
     }
 
     let exclude_panel_refnos = room_panel_map

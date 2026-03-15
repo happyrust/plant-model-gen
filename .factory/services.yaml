@@ -1,18 +1,24 @@
 commands:
-  test: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo check --bin aios-database --quiet
-  room-cli-check: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo check --bin aios-database --quiet
-  room-help: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room --help
-  room-compute-help: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room compute --help
-  room-verify-help: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json --help
-  room-verify-required-input: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json
-  room-verify-missing-input-file: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json --input /tmp/room-verify-missing.json
-  room-verify-fixture: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json --input tests/fixtures/room_compute_validation.json
-  room-release-build: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo build --release --bin aios-database
+  cargo-version: cd /d D:\work\plant-code\plant-model-gen && cargo --version
+  test: cd /d D:\work\plant-code\plant-model-gen && cargo check --release --bin aios-database
+  room-cli-check-release: cd /d D:\work\plant-code\plant-model-gen && cargo check --release --bin aios-database
+  room-help: cd /d D:\work\plant-code\plant-model-gen && cargo run --bin aios-database -- room --help
+  room-compute-help: cd /d D:\work\plant-code\plant-model-gen && cargo run --bin aios-database -- room compute --help
+  room-compute-panel-help: cd /d D:\work\plant-code\plant-model-gen && cargo run --bin aios-database -- room compute-panel --help
+  room-verify-help: cd /d D:\work\plant-code\plant-model-gen && cargo run --bin aios-database -- room verify-json --help
+  room-rebuild-spatial-index: cd /d D:\work\plant-code\plant-model-gen && cargo run --release --bin aios-database -- room rebuild-spatial-index
+  room-compute-full: cd /d D:\work\plant-code\plant-model-gen && cargo run --release --bin aios-database -- room compute
 
 services:
+  room-cli:
+    start: echo "CLI-only mission: no long-running room service to start"
+    stop: echo "CLI-only mission: nothing to stop"
+    healthcheck: cd /d D:\work\plant-code\plant-model-gen && cargo run --bin aios-database -- room --help >NUL && echo "room CLI reachable"
+    depends_on: []
+
   surrealdb:
-    start: echo "Reuse existing SurrealDB/local DB configuration; do not start a second instance"
-    stop: echo "Do not stop shared SurrealDB from mission automation"
-    healthcheck: (lsof -i :8020 >/dev/null || lsof -i :8009 >/dev/null) && echo "SurrealDB port detected" || echo "SurrealDB port not auto-detected"
+    start: echo "Reuse existing local DB configuration; do not start a second DB instance from mission automation"
+    stop: echo "Do not stop shared DB resources from mission automation"
+    healthcheck: powershell -NoProfile -Command "if (Get-NetTCPConnection -State Listen -LocalPort 8020 -ErrorAction SilentlyContinue) { 'Detected listener on 8020' } else { 'No listener auto-detected on 8020; rely on configured local DB access' }"
     port: 8020
     depends_on: []

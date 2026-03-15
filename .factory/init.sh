@@ -1,10 +1,10 @@
 #!/bin/bash
 set -e
 
-echo "🚀 Initializing room verify-json mission environment..."
+echo "🚀 Initializing room-compute 3x mission environment..."
 
 if [ ! -f "Cargo.toml" ]; then
-    echo "❌ Error: Must run from plant-model-gen repository root"
+    echo "❌ Error: must run from the plant-model-gen repository root"
     exit 1
 fi
 
@@ -15,21 +15,26 @@ fi
 
 echo "✅ Rust toolchain found"
 
-if [ ! -f "tests/fixtures/room_compute_validation.json" ]; then
-    echo "❌ Error: tests/fixtures/room_compute_validation.json not found"
+if [ ! -f ".factory/services.yaml" ]; then
+    echo "❌ Error: .factory/services.yaml not found"
     exit 1
 fi
 
-echo "✅ Validation fixture found"
+echo "✅ Mission service manifest found"
 
-if lsof -i :8020 >/dev/null 2>&1 || lsof -i :8009 >/dev/null 2>&1; then
-    echo "✅ SurrealDB/listening DB port detected"
+if [ -f "output/spatial_index.sqlite" ]; then
+    echo "✅ Existing spatial_index.sqlite detected"
 else
-    echo "⚠️  Warning: SurrealDB port was not auto-detected; mission can still proceed if DB is reachable through configured settings"
+    echo "⚠️  output/spatial_index.sqlite not found yet; the mission may need an explicit rebuild before full validation"
 fi
 
-echo "ℹ️  Acceptance workflow for this mission:"
-echo "   1. cargo run --bin aios-database -- room compute ..."
-echo "   2. cargo run --bin aios-database -- room verify-json --input tests/fixtures/room_compute_validation.json"
+powershell -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory | Format-List" || true
+
+echo "ℹ️  Validation path dry-run guidance:"
+echo "   - cargo run --bin aios-database -- room --help"
+echo "   - cargo run --release --bin aios-database -- room compute"
+echo "   - cargo run --release --bin aios-database -- room compute-panel --panel-refno <refno>"
+echo "   - cargo check --release --bin aios-database"
+echo "ℹ️  Validator concurrency is intentionally capped at 1 for this mission."
 
 echo "✅ Mission environment initialization complete"

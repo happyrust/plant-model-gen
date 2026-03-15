@@ -169,8 +169,7 @@ pub mod profiling;
 
 pub mod shared; // 共享模块（进度广播中心等）
 
-#[cfg(feature = "meili")]
-pub mod meili;
+
 
 #[cfg(feature = "tonic")]
 pub mod grpc_service;

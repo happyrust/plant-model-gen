@@ -2176,7 +2176,7 @@ pub(crate) async fn is_refno_in_panel_by_aabb8(
     ))
 }
 
-/// 单点验证：使用"候选 world AABB 的 27 个关键点投票(>50%)"判断归属。
+/// 单点验证：使用"候选 world AABB 的 8 个关键点投票(>50%)"判断归属。
 
 ///
 
@@ -2610,7 +2610,7 @@ pub async fn cal_room_refnos_with_options(
         }
     }
 
-    // 步骤 4：粗算判定 — 候选 AABB 27 关键点投票 >50% 在 panel mesh 内
+    // 步骤 4：粗算判定 — 候选 AABB 8 关键点投票 >50% 在 panel mesh 内
     // 候选 AABB 优先从 inst_relate_aabb 获取，缺失则跳过。
 
     let coarse_start = Instant::now();
@@ -2985,7 +2985,7 @@ fn are_all_points_in_panel(
 }
 
 /// 从 AABB 提取关键点
-/// 通过环境变量 ROOM_RELATION_KEY_POINTS 控制: "8"(默认) 或 "27"
+/// 通过环境变量 ROOM_RELATION_KEY_POINTS 控制: "27" 或 "8"(默认)
 fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
     let use_full_points = env::var("ROOM_RELATION_KEY_POINTS")
         .map(|v| v == "27")

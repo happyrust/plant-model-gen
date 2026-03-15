@@ -410,7 +410,23 @@ pub async fn export_room_geometries(output_path: &Path, verbose: bool) -> Result
 
         for (_, panel_refno) in panels {
             let panel_instances = build_panel_instances(*panel_refno, &panel_geom_map);
-            let panel_aabb = compute_panel_aabb(*panel_refno, &panel_geom_map);
+            let panel_aabb = panel_geom_map.get(panel_refno).and_then(|geoms| {
+                geoms.iter().find_map(|geom| geom.world_aabb.as_ref()).map(|plant_aabb| {
+                    let inner_aabb = &plant_aabb.0;
+                    AabbJson {
+                        min: [
+                            inner_aabb.mins.x as f64,
+                            inner_aabb.mins.y as f64,
+                            inner_aabb.mins.z as f64,
+                        ],
+                        max: [
+                            inner_aabb.maxs.x as f64,
+                            inner_aabb.maxs.y as f64,
+                            inner_aabb.maxs.z as f64,
+                        ],
+                    }
+                })
+            });
 
             // 合并到房间 AABB
             if let Some(ref p_aabb) = panel_aabb {
@@ -503,41 +519,7 @@ fn build_panel_instances(
         .collect()
 }
 
-/// 计算面板的 AABB
-fn compute_panel_aabb(
-    panel_refno: RefnoEnum,
-    panel_geom_map: &HashMap<RefnoEnum, Vec<&PanelGeomQuery>>,
-) -> Option<AabbJson> {
-    let geoms = panel_geom_map.get(&panel_refno)?;
 
-    let mut result_aabb: Option<AabbJson> = None;
-
-    for geom in geoms {
-        if let Some(ref plant_aabb) = geom.world_aabb {
-            // PlantAabb 是 tuple struct，用 .0 访问内部 Aabb
-            let inner_aabb = &plant_aabb.0;
-            let aabb_json = AabbJson {
-                min: [
-                    inner_aabb.mins.x as f64,
-                    inner_aabb.mins.y as f64,
-                    inner_aabb.mins.z as f64,
-                ],
-                max: [
-                    inner_aabb.maxs.x as f64,
-                    inner_aabb.maxs.y as f64,
-                    inner_aabb.maxs.z as f64,
-                ],
-            };
-
-            result_aabb = Some(match result_aabb {
-                Some(r) => r.merge(&aabb_json),
-                None => aabb_json,
-            });
-        }
-    }
-
-    result_aabb
-}
 
 /// 统一导出入口：同时导出 room_relations.json 和 room_geometries.json
 pub async fn export_room_instances(

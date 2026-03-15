@@ -685,6 +685,8 @@ pub struct RoomComputeOptions {
     refresh_spatial_index: bool,
 
     query_from_cache: bool,
+
+    preload_panel_meshes: bool,
 }
 
 impl Default for RoomComputeOptions {
@@ -701,6 +703,8 @@ impl Default for RoomComputeOptions {
             refresh_spatial_index: true,
 
             query_from_cache: true,
+
+            preload_panel_meshes: true,
         }
     }
 }
@@ -722,6 +726,15 @@ impl RoomComputeOptions {
 
     pub fn query_from_cache_enabled(&self) -> bool {
         self.query_from_cache
+    }
+
+    pub fn with_preload_panel_meshes(mut self, enabled: bool) -> Self {
+        self.preload_panel_meshes = enabled;
+        self
+    }
+
+    pub fn preload_enabled(&self) -> bool {
+        self.preload_panel_meshes
     }
 }
 
@@ -878,6 +891,11 @@ static ENHANCED_GEOMETRY_CACHE: tokio::sync::OnceCell<DashMap<String, Arc<PlantM
 static ENHANCED_TRIMESH_CACHE: tokio::sync::OnceCell<DashMap<String, Arc<TriMesh>>> =
     tokio::sync::OnceCell::const_new();
 
+/// 变换后 TriMesh 缓存（包含世界变换，用于房间计算）
+/// Key: format!("{}_{}_{}_{}_{}_{}", geo_hash, tx, ty, tz, sx, sy)
+static TRANSFORMED_TRIMESH_CACHE: tokio::sync::OnceCell<DashMap<String, Arc<TriMesh>>> =
+    tokio::sync::OnceCell::const_new();
+
 static CACHE_METRICS: CacheMetrics = CacheMetrics::new();
 
 async fn get_enhanced_geometry_cache() -> &'static DashMap<String, Arc<PlantMesh>> {
@@ -890,6 +908,19 @@ async fn get_enhanced_trimesh_cache() -> &'static DashMap<String, Arc<TriMesh>> 
     ENHANCED_TRIMESH_CACHE
         .get_or_init(|| async { DashMap::new() })
         .await
+}
+
+async fn get_transformed_trimesh_cache() -> &'static DashMap<String, Arc<TriMesh>> {
+    TRANSFORMED_TRIMESH_CACHE
+        .get_or_init(|| async { DashMap::new() })
+        .await
+}
+
+fn make_transform_cache_key(geo_hash: &str, transform: &glam::Mat4) -> String {
+    let sx = transform.x_axis.length();
+    let sy = transform.y_axis.length();
+    let sz = transform.z_axis.length();
+    format!("{}_{:.4}_{:.4}_{:.4}", geo_hash, sx, sy, sz)
 }
 
 /// 改进版本的房间关系构建函数
@@ -2625,20 +2656,31 @@ pub async fn cal_room_refnos_with_options(
     }
 
     let mut within_refnos = HashSet::<RefnoEnum>::new();
+    let key_point_start = Instant::now();
+    let key_points_count = candidates.len();
+    let mut aabb_filter_passed = 0;
+    let sample_key_points_len = 8;
+
     for candidate_refno in &candidates {
         let Some(cand_aabb) = candidate_aabb_map.get(candidate_refno) else {
             continue;
         };
         let key_points = extract_aabb_key_points(cand_aabb);
-        if is_geom_in_panel(&key_points, &panel_meshes, inside_tol, &floor_2d) {
+        let panel_aabb_ref = Some(&panel_aabb);
+        if is_geom_in_panel_with_aabb(&key_points, &panel_meshes, inside_tol, &floor_2d, panel_aabb_ref) {
             within_refnos.insert(*candidate_refno);
+            aabb_filter_passed += 1;
         }
     }
 
+    let key_point_elapsed = key_point_start.elapsed();
     debug!(
-        "🧱 粗算完成: 耗时 {:?}, 结果数 {}",
-        coarse_start.elapsed(),
-        within_refnos.len()
+        "🧱 细算完成: 候选{} AABB过滤通过{} 命中{} 耗时{:?} (key_points={})",
+        key_points_count,
+        aabb_filter_passed,
+        within_refnos.len(),
+        key_point_elapsed,
+        sample_key_points_len
     );
 
     info!(
@@ -2676,6 +2718,15 @@ async fn load_geometry_with_enhanced_cache(
 
     let trimesh_cache = get_enhanced_trimesh_cache().await;
 
+    let transformed_cache = get_transformed_trimesh_cache().await;
+
+    let combined_transform = (world_trans * inst.geo_transform).to_matrix();
+    let transform_key = make_transform_cache_key(geo_hash, &combined_transform);
+
+    if let Some(cached) = transformed_cache.get(&transform_key) {
+        return Ok(cached.clone());
+    }
+
     // mesh_dir 可能是基础目录（assets/meshes）或 LOD 子目录（assets/meshes/lod_L1）。
 
     // 这里统一溯源到不含 lod_ 的基础目录，避免拼错路径（例如误用 assets/lod_L1）。
@@ -2706,12 +2757,14 @@ async fn load_geometry_with_enhanced_cache(
 
             let transformed_mesh = transform_tri_mesh(
                 &cached_trimesh,
-                (world_trans * inst.geo_transform).to_matrix(),
+                combined_transform,
             )?;
 
+            let result = Arc::new(transformed_mesh);
+            transformed_cache.insert(transform_key.clone(), result.clone());
             CACHE_METRICS.record_trimesh_hit();
 
-            return Ok(Arc::new(transformed_mesh));
+            return Ok(result);
         }
 
         // 2. 检查 PlantMesh 缓存
@@ -2720,12 +2773,14 @@ async fn load_geometry_with_enhanced_cache(
             // 从缓存的 PlantMesh 构建 TriMesh
 
             if let Some(tri_mesh) = cached_mesh.get_tri_mesh_with_flag(
-                (world_trans * inst.geo_transform).to_matrix(),
+                combined_transform,
                 TriMeshFlags::ORIENTED | TriMeshFlags::MERGE_DUPLICATE_VERTICES,
             ) {
+                let result = Arc::new(tri_mesh);
+                transformed_cache.insert(transform_key.clone(), result.clone());
                 CACHE_METRICS.record_plant_hit();
 
-                return Ok(Arc::new(tri_mesh));
+                return Ok(result);
             }
         }
 
@@ -2929,9 +2984,41 @@ fn are_all_points_in_panel(
         .all(|point| is_point_inside_any_mesh(point, panel_meshes, tolerance_sq, floor_2d))
 }
 
-/// 从 AABB 提取 27 个关键点：8 顶点 + 1 中心 + 6 面中心 + 12 边中点。
-
+/// 从 AABB 提取关键点
+/// 通过环境变量 ROOM_RELATION_KEY_POINTS 控制: "8"(默认) 或 "27"
 fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
+    let use_full_points = env::var("ROOM_RELATION_KEY_POINTS")
+        .map(|v| v == "27")
+        .unwrap_or(false);
+
+    if use_full_points {
+        extract_aabb_key_points_full(aabb)
+    } else {
+        extract_aabb_key_points_fast(aabb)
+    }
+}
+
+/// 快速版本：仅 8 个顶点
+fn extract_aabb_key_points_fast(aabb: &Aabb) -> Vec<Point<Real>> {
+    let min = aabb.mins;
+    let max = aabb.maxs;
+
+    let mut pts = Vec::with_capacity(8);
+
+    pts.push(Point::new(min.x, min.y, min.z));
+    pts.push(Point::new(max.x, min.y, min.z));
+    pts.push(Point::new(max.x, max.y, min.z));
+    pts.push(Point::new(min.x, max.y, min.z));
+    pts.push(Point::new(min.x, min.y, max.z));
+    pts.push(Point::new(max.x, min.y, max.z));
+    pts.push(Point::new(max.x, max.y, max.z));
+    pts.push(Point::new(min.x, max.y, max.z));
+
+    pts
+}
+
+/// 完整版本：27 个关键点（8 顶点 + 1 中心 + 6 面中心 + 12 边中点）
+fn extract_aabb_key_points_full(aabb: &Aabb) -> Vec<Point<Real>> {
     let min = aabb.mins;
 
     let max = aabb.maxs;
@@ -2943,8 +3030,6 @@ fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
     let cz = (min.z + max.z) * 0.5;
 
     let mut pts = Vec::with_capacity(27);
-
-    // 8 corners
 
     pts.push(Point::new(min.x, min.y, min.z));
 
@@ -2962,11 +3047,7 @@ fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
 
     pts.push(Point::new(min.x, max.y, max.z));
 
-    // center
-
     pts.push(Point::new(cx, cy, cz));
-
-    // 6 face centers
 
     pts.push(Point::new(cx, cy, min.z));
 
@@ -2980,10 +3061,6 @@ fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
 
     pts.push(Point::new(max.x, cy, cz));
 
-    // 12 edge midpoints
-
-    // edges along X
-
     pts.push(Point::new(cx, min.y, min.z));
 
     pts.push(Point::new(cx, max.y, min.z));
@@ -2992,8 +3069,6 @@ fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
 
     pts.push(Point::new(cx, max.y, max.z));
 
-    // edges along Y
-
     pts.push(Point::new(min.x, cy, min.z));
 
     pts.push(Point::new(max.x, cy, min.z));
@@ -3001,8 +3076,6 @@ fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
     pts.push(Point::new(min.x, cy, max.z));
 
     pts.push(Point::new(max.x, cy, max.z));
-
-    // edges along Z
 
     pts.push(Point::new(min.x, min.y, cz));
 
@@ -3027,23 +3100,47 @@ fn extract_aabb_key_points(aabb: &Aabb) -> Vec<Point<Real>> {
 
 fn is_geom_in_panel(
     key_points: &[Point<Real>],
-
     panel_meshes: &[Arc<TriMesh>],
-
     tolerance: f32,
-
     floor_2d: &Floor2dConfig,
+) -> bool {
+    is_geom_in_panel_with_aabb(key_points, panel_meshes, tolerance, floor_2d, None)
+}
+
+fn is_geom_in_panel_with_aabb(
+    key_points: &[Point<Real>],
+    panel_meshes: &[Arc<TriMesh>],
+    tolerance: f32,
+    floor_2d: &Floor2dConfig,
+    panel_aabb: Option<&Aabb>,
 ) -> bool {
     if key_points.is_empty() || panel_meshes.is_empty() {
         return false;
     }
 
+    let enable_aabb_prefilter = env::var("ROOM_RELATION_AABB_PREFILTER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+
+    if enable_aabb_prefilter {
+        if let Some(aabb) = panel_aabb {
+            let mut points_in_aabb = 0;
+            for point in key_points {
+                if is_point_in_aabb_with_tolerance(point, aabb, tolerance) {
+                    points_in_aabb += 1;
+                }
+            }
+            let total = key_points.len();
+            let threshold = total / 2 + 1;
+            if points_in_aabb < threshold {
+                return false;
+            }
+        }
+    }
+
     let mut points_inside = 0;
-
     let total_points = key_points.len();
-
     let tolerance_sq = (tolerance as Real).powi(2);
-
     let threshold = total_points / 2 + 1;
 
     for (idx, point) in key_points.iter().enumerate() {
@@ -3063,6 +3160,16 @@ fn is_geom_in_panel(
     }
 
     false
+}
+
+fn is_point_in_aabb_with_tolerance(point: &Point<Real>, aabb: &Aabb, tolerance: f32) -> bool {
+    let tol = tolerance as Real;
+    point.x >= aabb.mins.x - tol
+        && point.x <= aabb.maxs.x + tol
+        && point.y >= aabb.mins.y - tol
+        && point.y <= aabb.maxs.y + tol
+        && point.z >= aabb.mins.z - tol
+        && point.z <= aabb.maxs.z + tol
 }
 
 fn is_point_inside_any_mesh(
@@ -3243,9 +3350,8 @@ fn is_point_in_trimesh_xy(point: &Point<Real>, tri_mesh: &TriMesh, tolerance: Re
 
 /// 对凸形和凹形网格均正确。射线方向采用微偏轴以减少恰好穿过边/顶点的退化情况。
 
+/// 射线投射法判断点是否在封闭网格内
 fn is_point_inside_mesh_raycast(point: &Point<Real>, tri_mesh: &TriMesh) -> bool {
-    // 微偏轴方向：避免恰好与面对齐导致退化
-
     let direction = Vector::new(1.0, 0.31415926, 0.27182818);
 
     let vertices = tri_mesh.vertices();
@@ -3276,7 +3382,7 @@ fn is_point_inside_mesh_raycast(point: &Point<Real>, tri_mesh: &TriMesh) -> bool
         let det = edge1.dot(&h);
 
         if det.abs() < 1e-10 {
-            continue; // 射线与三角面平行
+            continue;
         }
 
         let inv_det = 1.0 / det;

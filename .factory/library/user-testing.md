@@ -60,3 +60,28 @@ This mission validates through the **real CLI surface**, not a browser UI.
 - Cold Rust builds are expensive; the planning dry run needed about 7m46s before `room --help` returned.
 - Repeated validators should try to reuse built artifacts when possible.
 - Missing or stale `spatial_index.sqlite` is a valid blocker if the assertion assumes steady-state reuse.
+- API status may show `database_connected: false` even when connected (check logs)
+- WebSocket updates may have 1-2 second delay (normal)
+- Frontend dev server may need restart after major changes
+
+## CLI Surface: `aios-database room verify-json`
+
+- Test with terminal CLI commands only; do not use browser automation for this milestone.
+- Primary fixture path: `verification/room/compute/room_compute_validation.json`.
+- Service setup: reuse the existing SurrealDB/local DB configuration; do not start or stop a shared instance from validation automation.
+- Healthcheck: `lsof -i :8020` or `lsof -i :8009` should detect an existing DB listener before running validation.
+- Required operator flow: run `room compute ...` first when validating happy-path persisted data, then run `room verify-json --input <file>`.
+- Safe baseline checks that do not require fixture-matching persisted data: `--help`, missing required args, and missing input file.
+
+## Validation Concurrency
+
+- Surface `cli-room-verify-json`: max concurrent validators = 1.
+- Reason: all assertions touch the same shared persisted DB state and the same fixture path; parallel runs could interfere with compute coverage and read-only repeatability evidence.
+
+## Flow Validator Guidance: cli-room-verify-json
+
+- Stay within the shared repository at `/Volumes/DPC/work/plant-code/plant-model-gen`.
+- Do not create or mutate alternate databases, ports, or fixture files unless explicitly assigned.
+- Do not start a second SurrealDB instance and do not stop the shared one.
+- Prefer read-only CLI checks first; if a flow requires `room compute`, treat that compute scope as shared global state and serialize it with other validators.
+- Save command transcripts and any generated evidence under the assigned evidence directory only.

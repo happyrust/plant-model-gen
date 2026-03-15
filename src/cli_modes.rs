@@ -1309,13 +1309,12 @@ async fn rebuild_room_compute_panel_spatial_index(
     root_refnos: &[RefnoEnum],
     verbose: bool,
 ) -> Result<()> {
-    use aios_core::query_insts;
-    use aios_core::{SurrealQueryExt, project_primary_db};
+    use aios_core::{SurrealQueryExt, model_primary_db, project_primary_db};
     use aios_database::fast_model::query_provider::query_multi_descendants_with_self;
-    use aios_database::fast_model::{EXIST_MESH_GEO_HASHES, preload_mesh_cache};
+    use aios_database::fast_model::room_model::refresh_sqlite_spatial_index_from_inst_relate_aabb;
     use aios_database::spatial_index::SqliteSpatialIndex;
     use aios_database::sqlite_index::SqliteAabbIndex;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
     use surrealdb::types::SurrealValue;
 
     if root_refnos.is_empty() {
@@ -1384,13 +1383,6 @@ async fn rebuild_room_compute_panel_spatial_index(
         effective
     };
 
-    preload_mesh_cache();
-    let local_aabb_map: std::collections::HashMap<String, parry3d::bounding_volume::Aabb> =
-        EXIST_MESH_GEO_HASHES
-            .iter()
-            .map(|entry| (entry.key().clone(), *entry.value()))
-            .collect();
-
     println!("🔍 [DEBUG] 展开后的 refnos 数量: {}", expanded_refnos.len());
     if verbose {
         for refno in &expanded_refnos {
@@ -1398,83 +1390,121 @@ async fn rebuild_room_compute_panel_spatial_index(
         }
     }
 
-    let geom_insts = match query_insts(&expanded_refnos, true).await {
-        Ok(insts) => insts,
-        Err(e) => {
-            println!("⚠️ query_insts 失败: {}", e);
-            println!("   回退到直接查询 inst_relate_aabb...");
+    #[derive(Debug, Deserialize, Serialize, SurrealValue)]
+    struct InstRelateAabbQuery {
+        refno: RefnoEnum,
+        noun: Option<String>,
+        aabb: Option<aios_core::types::PlantAabb>,
+    }
 
-            // 回退方案：直接从 inst_relate_aabb 表查询 aabb
-            use aios_core::{SurrealQueryExt, model_primary_db};
-            use serde::Deserialize;
-            use surrealdb::types::SurrealValue;
+    let inserted = refresh_sqlite_spatial_index_from_inst_relate_aabb(None, Some(root_refnos[0]))
+        .await?;
 
-            #[derive(Debug, Deserialize, SurrealValue)]
-            struct InstRelateAabbQuery {
-                #[serde(rename = "in")]
-                refno: RefnoEnum,
-                aabb_id: Option<aios_core::types::PlantAabb>,
-            }
-
-            let refno_strs: Vec<String> = expanded_refnos
-                .iter()
-                .map(|r| format!("inst_relate_aabb:`{}`", r))
-                .collect();
-            let sql = format!(
-                "SELECT in, aabb_id.d as aabb_id FROM [{}]",
-                refno_strs.join(",")
-            );
-
-            let aabb_records: Vec<InstRelateAabbQuery> = model_primary_db()
-                .query_take(&sql, 0)
-                .await
-                .unwrap_or_default();
-
-            println!("   查询到 {} 条 inst_relate_aabb 记录", aabb_records.len());
-
-            // 转换为 GeomInstQuery 格式（只填充必要字段）
-            aabb_records
-                .into_iter()
-                .filter_map(|rec| {
-                    rec.aabb_id.map(|aabb| aios_core::GeomInstQuery {
-                        refno: rec.refno,
-                        owner: rec.refno,
-                        world_trans: aios_core::PlantTransform::default(),
-                        world_aabb: Some(aabb),
-                        insts: Vec::new(),
-                        has_neg: false,
-                    })
-                })
-                .collect()
-        }
-    };
-    println!(
-        "🔍 [DEBUG] query_insts 返回的 GeomInstQuery 数量: {}",
-        geom_insts.len()
-    );
-
-    for (idx, geom_inst) in geom_insts.iter().enumerate() {
-        println!(
-            "   [{}] refno={}, insts.len()={}, has_neg={}, world_aabb={:?}",
-            idx,
-            geom_inst.refno,
-            geom_inst.insts.len(),
-            geom_inst.has_neg,
-            geom_inst.world_aabb.is_some()
+    let pe_keys: Vec<String> = expanded_refnos.iter().map(|r| r.to_pe_key()).collect();
+    let mut noun_map = std::collections::HashMap::new();
+    if !pe_keys.is_empty() {
+        let noun_sql = format!(
+            r#"
+            SELECT id as refno, noun, type::record('inst_relate_aabb', id).aabb_id.d as aabb
+            FROM [{}]
+            "#,
+            pe_keys.join(",")
         );
-        if geom_inst.insts.is_empty() {
-            println!("      ⚠️ 该构件没有 inst 记录（inst_relate 可能缺失）");
+        let rows: Vec<InstRelateAabbQuery> = model_primary_db()
+            .query_take(&noun_sql, 0)
+            .await
+            .unwrap_or_default();
+        for row in rows {
+            if let Some(noun) = row.noun.filter(|value| !value.trim().is_empty()) {
+                noun_map.insert(row.refno.refno().0 as i64, noun);
+            }
         }
     }
 
-    let items =
-        build_room_compute_panel_spatial_index_items(geom_insts, &local_aabb_map, &spec_value_map);
+    let idx = SqliteAabbIndex::open(&idx_path)?;
+    idx.init_schema()?;
+
+    let refno_strs: Vec<String> = expanded_refnos
+        .iter()
+        .map(|r| format!("inst_relate_aabb:`{}`", r))
+        .collect();
+    let mut items = Vec::<(i64, String, i64, f64, f64, f64, f64, f64, f64)>::new();
+    if !refno_strs.is_empty() {
+        let sql = format!(
+            "SELECT in as refno, in.noun as noun, aabb_id.d as aabb FROM [{}]",
+            refno_strs.join(",")
+        );
+        let rows: Vec<InstRelateAabbQuery> = model_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .unwrap_or_default();
+
+        for row in rows {
+            let Some(aabb) = row.aabb.map(|plant_aabb| plant_aabb.0) else {
+                continue;
+            };
+            let id = row.refno.refno().0 as i64;
+            let noun = row
+                .noun
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| noun_map.get(&id).cloned())
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            let spec_value = *spec_value_map.get(&id).unwrap_or(&0);
+            items.push((
+                id,
+                noun,
+                spec_value,
+                aabb.mins.x as f64,
+                aabb.maxs.x as f64,
+                aabb.mins.y as f64,
+                aabb.maxs.y as f64,
+                aabb.mins.z as f64,
+                aabb.maxs.z as f64,
+            ));
+        }
+    }
+
+    let panel_id = root_refnos[0].refno().0 as i64;
+    let has_panel_entry = items.iter().any(|(id, _, _, _, _, _, _, _, _)| *id == panel_id);
+    if !has_panel_entry {
+        let panel_sql = format!(
+            "SELECT in as refno, in.noun as noun, aabb_id.d as aabb FROM inst_relate_aabb:`{}`",
+            root_refnos[0]
+        );
+        let rows: Vec<InstRelateAabbQuery> = model_primary_db()
+            .query_take(&panel_sql, 0)
+            .await
+            .unwrap_or_default();
+        for row in rows {
+            let Some(aabb) = row.aabb.map(|plant_aabb| plant_aabb.0) else {
+                continue;
+            };
+            let noun = row
+                .noun
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "PANE".to_string());
+            items.push((
+                panel_id,
+                noun,
+                *spec_value_map.get(&panel_id).unwrap_or(&0),
+                aabb.mins.x as f64,
+                aabb.maxs.x as f64,
+                aabb.mins.y as f64,
+                aabb.maxs.y as f64,
+                aabb.mins.z as f64,
+                aabb.maxs.z as f64,
+            ));
+        }
+    }
+
+    items.sort_by_key(|(id, _, _, _, _, _, _, _, _)| *id);
+    items.dedup_by_key(|(id, _, _, _, _, _, _, _, _)| *id);
     if verbose {
         println!(
-            "   - 空间索引根节点: {}，展开后节点: {}，本地 AABB 缓存: {}",
+            "   - 空间索引根节点: {}，展开后节点: {}，基础刷新写入: {}",
             root_refnos.len(),
             expanded_refnos.len(),
-            local_aabb_map.len()
+            inserted
         );
     }
     println!("   - 已写入 SQLite 空间索引项: {}", items.len());

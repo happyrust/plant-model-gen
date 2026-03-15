@@ -118,6 +118,9 @@ use dashmap::{DashMap, DashSet};
 
 pub use gen_model::*;
 
+#[cfg(feature = "sqlite-index")]
+pub use gen_model::orchestrator::update_sqlite_spatial_index_from_cache;
+
 // [foyer-removal] CaptureConfig 桩
 use once_cell::sync::OnceCell;
 use std::path::PathBuf;

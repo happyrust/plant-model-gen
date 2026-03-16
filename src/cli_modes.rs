@@ -9,14 +9,14 @@ use aios_core::{DBType, query_mdb_db_nums};
 use aios_database::fast_model::export_glb::GlbExporter;
 use aios_database::fast_model::export_gltf::GltfExporter;
 use aios_database::fast_model::export_gltf::export_gltf_for_refnos;
-use aios_database::fast_model::export_model::export_obj::export_obj_for_refnos;
 use aios_database::fast_model::export_instanced_bundle::export_instanced_bundle_for_refnos;
 use aios_database::fast_model::export_model::export_obj::ObjExporter;
+use aios_database::fast_model::export_model::export_obj::export_obj_for_refnos;
 use aios_database::fast_model::export_model::export_room_instances::{
     RoomComputeValidationCase, RoomComputeValidationFixture,
 };
-use aios_database::perf_timer::{PerfReport, PerfTimer};
 use aios_database::options::DbOptionExt;
+use aios_database::perf_timer::{PerfReport, PerfTimer};
 // use aios_database::fast_model::export_xkt::XktExporter;
 use aios_database::fast_model::model_exporter::{
     CommonExportConfig, ExportStats, GlbExportConfig, GltfExportConfig, ModelExporter,
@@ -1260,10 +1260,9 @@ mod room_verify_tests {
         let mut persisted = make_persisted_relations();
         let panel = RefnoEnum::from("24381/35798");
         let component = RefnoEnum::from("24381/145019");
-        persisted.room_components_by_panel.insert(
-            ("540".to_string(), panel),
-            BTreeSet::new(),
-        );
+        persisted
+            .room_components_by_panel
+            .insert(("540".to_string(), panel), BTreeSet::new());
         persisted.component_panels_by_room.insert(
             "540".to_string(),
             BTreeMap::from([(component, BTreeSet::from([RefnoEnum::from("24381/35799")]))]),
@@ -1397,8 +1396,8 @@ async fn rebuild_room_compute_panel_spatial_index(
         aabb: Option<aios_core::types::PlantAabb>,
     }
 
-    let inserted = refresh_sqlite_spatial_index_from_inst_relate_aabb(None, Some(root_refnos[0]))
-        .await?;
+    let inserted =
+        refresh_sqlite_spatial_index_from_inst_relate_aabb(None, Some(root_refnos[0])).await?;
 
     let pe_keys: Vec<String> = expanded_refnos.iter().map(|r| r.to_pe_key()).collect();
     let mut noun_map = std::collections::HashMap::new();
@@ -1465,7 +1464,9 @@ async fn rebuild_room_compute_panel_spatial_index(
     }
 
     let panel_id = root_refnos[0].refno().0 as i64;
-    let has_panel_entry = items.iter().any(|(id, _, _, _, _, _, _, _, _)| *id == panel_id);
+    let has_panel_entry = items
+        .iter()
+        .any(|(id, _, _, _, _, _, _, _, _)| *id == panel_id);
     if !has_panel_entry {
         let panel_sql = format!(
             "SELECT in as refno, in.noun as noun, aabb_id.d as aabb FROM inst_relate_aabb:`{}`",
@@ -1515,11 +1516,35 @@ async fn rebuild_room_compute_panel_spatial_index(
 
 /// --debug-model 模式：直接生成模型，不清理、不强制 FORCE_REPLACE_MESH。
 /// 增量补充缺失的 inst_geo/mesh/布尔结果。
+struct ScopedEnvVar {
+    key: &'static str,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
 pub async fn run_generate_model(
     config: &ExportConfig,
     db_option_ext: &DbOptionExt,
 ) -> Result<aios_database::fast_model::gen_model::GenModelResult> {
     println!("\n🔧 --debug-model：开始增量生成几何体数据...");
+
+    // 方案 B（CLI 第一阶段）：mesh 状态以本地 glb + aabb_cache.rkyv 为准。
+    let _mesh_state_guard = ScopedEnvVar::set("MESH_STATE_SOURCE", "file");
 
     ensure_surreal_connected(db_option_ext).await?;
 
@@ -1540,9 +1565,8 @@ pub async fn run_regen_model(
     println!("   - 强制开启 replace_mesh、gen_mesh 和 apply_boolean_operation");
 
     // 1. 设置环境变量
-    unsafe {
-        std::env::set_var("FORCE_REPLACE_MESH", "true");
-    }
+    let _force_replace_guard = ScopedEnvVar::set("FORCE_REPLACE_MESH", "true");
+    let _mesh_state_guard = ScopedEnvVar::set("MESH_STATE_SOURCE", "file");
 
     // 2. 构建 override 后的 DbOption（不影响原始配置）
     let mut db_option_override = db_option_ext.clone();
@@ -1557,8 +1581,13 @@ pub async fn run_regen_model(
     use aios_database::fast_model::gen_all_geos_data;
     let target_refnos = collect_regen_target_refnos(config).await?;
 
-    // 使用 SurrealDB 极简清理（单条 DELETE）
-    aios_database::fast_model::gen_model::pdms_inst_surreal::pre_cleanup_for_regen_surreal(&target_refnos).await?;
+    // 先清理 legacy 模型关系（含 inst_relate / geo_relate / tubi_relate），
+    // 再清理 refno_relations 扁平表，避免 regen 后导出仍读到历史 tubi 脏数据。
+    aios_database::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen(&target_refnos).await?;
+    aios_database::fast_model::gen_model::pdms_inst_surreal::pre_cleanup_for_regen_surreal(
+        &target_refnos,
+    )
+    .await?;
 
     // 4.1 从目标 refnos 推导 dbnum，覆盖配置文件中的 manual_db_nums
     if !target_refnos.is_empty() && config.dbnum.is_none() {
@@ -1576,14 +1605,7 @@ pub async fn run_regen_model(
             db_option_override.inner.manual_db_nums = Some(derived_dbnums);
         }
     }
-    let result = gen_all_geos_data(target_refnos, &db_option_override, None, None).await;
-
-    // 5. 清理环境变量（无论成功/失败都执行）
-    unsafe {
-        std::env::remove_var("FORCE_REPLACE_MESH");
-    }
-
-    let gen_result = result?;
+    let gen_result = gen_all_geos_data(target_refnos, &db_option_override, None, None).await?;
     println!("✅ 模型重新生成完成");
     Ok(gen_result)
 }

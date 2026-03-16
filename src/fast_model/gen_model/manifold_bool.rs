@@ -6,6 +6,7 @@
 
 //! 所有布尔运算操作均使用 Manifold 库实现，不再依赖 OpenCASCADE。
 
+use crate::fast_model::gen_model::mesh_state::prime_cached_aabb_for_mesh_ids;
 use crate::fast_model::{debug_model, debug_model_debug, debug_model_warn};
 
 use aios_core::SurrealQueryExt;
@@ -249,6 +250,10 @@ fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<M
 
         return Ok(manifold);
     }
+
+    // file 模式下，布尔执行前先尝试把本地 GLB 的 AABB 预热到 rkyv/内存缓存。
+    // 这一步不改变几何加载路径，只是把运行时状态源统一到 glb + aabb_cache.rkyv。
+    prime_cached_aabb_for_mesh_ids([id]);
 
     let base_dir = mesh_base_dir();
 

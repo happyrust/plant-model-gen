@@ -411,21 +411,24 @@ pub async fn export_room_geometries(output_path: &Path, verbose: bool) -> Result
         for (_, panel_refno) in panels {
             let panel_instances = build_panel_instances(*panel_refno, &panel_geom_map);
             let panel_aabb = panel_geom_map.get(panel_refno).and_then(|geoms| {
-                geoms.iter().find_map(|geom| geom.world_aabb.as_ref()).map(|plant_aabb| {
-                    let inner_aabb = &plant_aabb.0;
-                    AabbJson {
-                        min: [
-                            inner_aabb.mins.x as f64,
-                            inner_aabb.mins.y as f64,
-                            inner_aabb.mins.z as f64,
-                        ],
-                        max: [
-                            inner_aabb.maxs.x as f64,
-                            inner_aabb.maxs.y as f64,
-                            inner_aabb.maxs.z as f64,
-                        ],
-                    }
-                })
+                geoms
+                    .iter()
+                    .find_map(|geom| geom.world_aabb.as_ref())
+                    .map(|plant_aabb| {
+                        let inner_aabb = &plant_aabb.0;
+                        AabbJson {
+                            min: [
+                                inner_aabb.mins.x as f64,
+                                inner_aabb.mins.y as f64,
+                                inner_aabb.mins.z as f64,
+                            ],
+                            max: [
+                                inner_aabb.maxs.x as f64,
+                                inner_aabb.maxs.y as f64,
+                                inner_aabb.maxs.z as f64,
+                            ],
+                        }
+                    })
             });
 
             // 合并到房间 AABB
@@ -518,8 +521,6 @@ fn build_panel_instances(
         })
         .collect()
 }
-
-
 
 /// 统一导出入口：同时导出 room_relations.json 和 room_geometries.json
 pub async fn export_room_instances(

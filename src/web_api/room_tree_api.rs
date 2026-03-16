@@ -7,8 +7,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use aios_core::RefnoEnum;
+use aios_core::{RefnoEnum, SurrealQueryExt, model_primary_db};
 use std::collections::BTreeMap;
+use surrealdb::types::SurrealValue;
 
 use anyhow::anyhow;
 
@@ -78,6 +79,10 @@ pub struct ChildrenQuery {
 
 const ROOM_ROOT_ID: &str = "room-root";
 const ROOM_GROUP_PREFIX: &str = "room-group:";
+const COMP_GROUP_PREFIX: &str = "comp-group:";
+
+/// 目标分组类型（owner 链中命中这些 noun 即分入对应组）
+const GROUP_NOUNS: &[&str] = &["BRAN", "HANG", "EQUI"];
 
 fn room_root_node() -> RoomTreeNodeDto {
     RoomTreeNodeDto {
@@ -95,6 +100,128 @@ fn group_node_id(group: &str) -> String {
 
 fn parse_group_name(id: &str) -> Option<&str> {
     id.strip_prefix(ROOM_GROUP_PREFIX)
+}
+
+/// 构件分组虚拟节点 ID: comp-group:{room_refno}:{group_key}
+fn comp_group_node_id(room_refno: &RefnoEnum, group_key: &str) -> String {
+    format!("{COMP_GROUP_PREFIX}{}:{}", room_refno, group_key)
+}
+
+/// 解析 COMP_GROUP ID → (room_refno, group_key)
+fn parse_comp_group(id: &str) -> Option<(RefnoEnum, String)> {
+    let rest = id.strip_prefix(COMP_GROUP_PREFIX)?;
+    let colon_pos = rest.rfind(':')?;
+    let room_str = &rest[..colon_pos];
+    let group_key = &rest[colon_pos + 1..];
+    let refno = RefnoEnum::from(room_str);
+    if refno.is_valid() {
+        Some((refno, group_key.to_string()))
+    } else {
+        None
+    }
+}
+
+/// 根据 owner 链的 noun 列表判断构件所属分组
+/// 从最近的 owner 开始逐层检查，首个命中 GROUP_NOUNS 的即为分组 key
+fn classify_group(owner_nouns: &[Option<String>]) -> String {
+    for noun in owner_nouns {
+        if let Some(n) = noun {
+            let upper = n.to_uppercase();
+            if GROUP_NOUNS.contains(&upper.as_str()) {
+                return upper;
+            }
+        }
+    }
+    "OTHER".to_string()
+}
+
+/// 构件信息（含分组 key）
+struct RoomComponent {
+    refno: RefnoEnum,
+    noun: String,
+    display_name: String,
+    group_key: String,
+}
+
+/// 根据 room refno 在分组表中查找其 display_name（如 "R301"）。
+async fn find_room_display_name(room_refno: &RefnoEnum) -> anyhow::Result<String> {
+    let map = query_arch_room_groups()
+        .await
+        .map_err(|e| anyhow!("query_arch_room_groups failed: {e}"))?;
+    for (_group, rooms) in &map {
+        if let Some(entry) = rooms.iter().find(|r| r.refno == *room_refno) {
+            return Ok(entry.display_name.clone());
+        }
+    }
+    Err(anyhow!("room refno not found in groups: {room_refno}"))
+}
+
+/// 查询某房间号在 room_relate 中关联的构件列表，含 owner 链 noun 用于分组。
+///
+/// SQL 查询 5 层 owner noun，覆盖 PE→管件→BRAN→PIPE 等多层结构。
+async fn query_room_components(room_num: &str) -> anyhow::Result<Vec<RoomComponent>> {
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct Row {
+        refno: String,
+        noun: Option<String>,
+        name: Option<String>,
+        o1: Option<String>,
+        o2: Option<String>,
+        o3: Option<String>,
+        o4: Option<String>,
+        o5: Option<String>,
+    }
+
+    let sql = format!(
+        "SELECT record::id(out) AS refno, out.noun AS noun, fn::default_full_name(out) AS name, \
+         out.owner.noun AS o1, out.owner.owner.noun AS o2, \
+         out.owner.owner.owner.noun AS o3, out.owner.owner.owner.owner.noun AS o4, \
+         out.owner.owner.owner.owner.owner.noun AS o5 \
+         FROM room_relate WHERE room_num = '{}' LIMIT 5000",
+        room_num.replace('\'', "''")
+    );
+    let rows: Vec<Row> = model_primary_db().query_take(&sql, 0).await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let refno = RefnoEnum::from(r.refno.as_str());
+            if refno.is_valid() {
+                let noun = r.noun.unwrap_or_else(|| "PE".to_string());
+                let name = r.name.unwrap_or_default();
+                let display_name = if name.trim().is_empty() {
+                    refno.to_string()
+                } else {
+                    name
+                };
+                let group_key = classify_group(&[r.o1, r.o2, r.o3, r.o4, r.o5]);
+                Some(RoomComponent {
+                    refno,
+                    noun,
+                    display_name,
+                    group_key,
+                })
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
+/// 查询某房间号在 room_relate 中关联的构件数量。
+async fn query_room_component_count(room_num: &str) -> anyhow::Result<i32> {
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct CountRow {
+        count: i64,
+    }
+
+    let sql = format!(
+        "SELECT count() AS count FROM room_relate WHERE room_num = '{}' GROUP ALL",
+        room_num.replace('\'', "''")
+    );
+
+    let rows: Vec<CountRow> = model_primary_db().query_take(&sql, 0).await?;
+    Ok(rows.first().map(|r| r.count as i32).unwrap_or(0))
 }
 
 async fn query_arch_room_groups() -> anyhow::Result<BTreeMap<String, Vec<RoomEntry>>> {
@@ -204,16 +331,20 @@ pub async fn room_tree_children_core(id: &str, limit: usize) -> anyhow::Result<C
 
         let rooms = map.get(group).cloned().unwrap_or_default();
 
-        let mut children = rooms
-            .into_iter()
-            .map(|room| RoomTreeNodeDto {
+        // P1: 批量查询每个房间的构件数量
+        let mut children = Vec::with_capacity(rooms.len());
+        for room in rooms {
+            let count = query_room_component_count(&room.display_name)
+                .await
+                .unwrap_or(0);
+            children.push(RoomTreeNodeDto {
                 id: RoomTreeNodeId::Refno(room.refno),
                 name: room.display_name,
                 noun: "ROOM".to_string(),
                 owner: Some(RoomTreeNodeId::Str(group_node_id(group))),
-                children_count: Some(0),
-            })
-            .collect::<Vec<_>>();
+                children_count: Some(count),
+            });
+        }
 
         let truncated = children.len() > limit;
         if children.len() > limit {
@@ -223,6 +354,79 @@ pub async fn room_tree_children_core(id: &str, limit: usize) -> anyhow::Result<C
         return Ok(ChildrenResponse {
             success: true,
             parent_id: RoomTreeNodeId::Str(id.to_string()),
+            children,
+            truncated,
+            error_message: None,
+        });
+    }
+
+    // ── 展开 COMP_GROUP（构件分组虚拟节点）→ 返回该组下的构件列表 ──
+    if let Some((room_refno, group_key)) = parse_comp_group(id) {
+        let room_code = find_room_display_name(&room_refno).await?;
+        let components = query_room_components(&room_code)
+            .await
+            .map_err(|e| anyhow!("query_room_components failed: {e}"))?;
+
+        let mut children: Vec<RoomTreeNodeDto> = components
+            .into_iter()
+            .filter(|c| c.group_key == group_key)
+            .map(|c| RoomTreeNodeDto {
+                id: RoomTreeNodeId::Refno(c.refno),
+                name: c.display_name,
+                noun: c.noun,
+                owner: Some(RoomTreeNodeId::Str(id.to_string())),
+                children_count: Some(0), // 叶子
+            })
+            .collect();
+
+        let truncated = children.len() > limit;
+        if children.len() > limit {
+            children.truncate(limit);
+        }
+
+        return Ok(ChildrenResponse {
+            success: true,
+            parent_id: RoomTreeNodeId::Str(id.to_string()),
+            children,
+            truncated,
+            error_message: None,
+        });
+    }
+
+    // ── 展开 ROOM → 返回 COMP_GROUP 分组节点 ──
+    let target = RefnoEnum::from(id);
+    if target.is_valid() {
+        let room_code = find_room_display_name(&target).await?;
+
+        // 查询构件列表并按 group_key 统计
+        let components = query_room_components(&room_code)
+            .await
+            .map_err(|e| anyhow!("query_room_components failed: {e}"))?;
+
+        let mut group_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for c in &components {
+            *group_counts.entry(c.group_key.clone()).or_default() += 1;
+        }
+
+        let mut children: Vec<RoomTreeNodeDto> = group_counts
+            .into_iter()
+            .map(|(gk, cnt)| RoomTreeNodeDto {
+                id: RoomTreeNodeId::Str(comp_group_node_id(&target, &gk)),
+                name: gk.clone(),
+                noun: "COMP_GROUP".to_string(),
+                owner: Some(RoomTreeNodeId::Refno(target)),
+                children_count: Some(cnt as i32),
+            })
+            .collect();
+
+        let truncated = children.len() > limit;
+        if children.len() > limit {
+            children.truncate(limit);
+        }
+
+        return Ok(ChildrenResponse {
+            success: true,
+            parent_id: RoomTreeNodeId::Refno(target),
             children,
             truncated,
             error_message: None,
@@ -253,7 +457,7 @@ pub async fn room_tree_ancestors_core(id: &str) -> anyhow::Result<AncestorsRespo
         });
     }
 
-    // treat as room refno
+    // treat as room refno or component refno
     let target = RefnoEnum::from(id);
     if !target.is_valid() {
         return Err(anyhow!("invalid refno: {id}"));
@@ -263,13 +467,14 @@ pub async fn room_tree_ancestors_core(id: &str) -> anyhow::Result<AncestorsRespo
         .await
         .map_err(|e| anyhow!("query_arch_room_groups failed: {e}"))?;
 
-    for (group, rooms) in map {
+    // 先检查是否为 ROOM refno
+    for (group, rooms) in &map {
         if rooms.iter().any(|r| r.refno == target) {
             return Ok(AncestorsResponse {
                 success: true,
                 ids: vec![
                     RoomTreeNodeId::Refno(target),
-                    RoomTreeNodeId::Str(group_node_id(&group)),
+                    RoomTreeNodeId::Str(group_node_id(group)),
                     RoomTreeNodeId::Str(ROOM_ROOT_ID.to_string()),
                 ],
                 error_message: None,
@@ -277,7 +482,57 @@ pub async fn room_tree_ancestors_core(id: &str) -> anyhow::Result<AncestorsRespo
         }
     }
 
-    Err(anyhow!("room not found in ARCH groups"))
+    // P0: 检查是否为构件 refno（room_relate 的 out 端）
+    // 查询该构件所属的 room_num 和 owner noun，反查房间 refno、group 和 comp_group
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct RoomNumRow {
+        room_num: String,
+        o1: Option<String>,
+        o2: Option<String>,
+        o3: Option<String>,
+        o4: Option<String>,
+        o5: Option<String>,
+    }
+    let sql = format!(
+        "SELECT room_num, out.owner.noun AS o1, out.owner.owner.noun AS o2, \
+         out.owner.owner.owner.noun AS o3, out.owner.owner.owner.owner.noun AS o4, \
+         out.owner.owner.owner.owner.owner.noun AS o5 \
+         FROM room_relate WHERE out = pe:⟨{}⟩ LIMIT 1",
+        target
+    );
+    let rows: Vec<RoomNumRow> = model_primary_db()
+        .query_take(&sql, 0)
+        .await
+        .unwrap_or_default();
+
+    if let Some(row) = rows.first() {
+        let room_num = &row.room_num;
+        let comp_group_key = classify_group(&[
+            row.o1.clone(),
+            row.o2.clone(),
+            row.o3.clone(),
+            row.o4.clone(),
+            row.o5.clone(),
+        ]);
+        // 从 map 中找到该 room_num 对应的房间 refno 和 group
+        for (group, rooms) in &map {
+            if let Some(room_entry) = rooms.iter().find(|r| r.display_name == *room_num) {
+                return Ok(AncestorsResponse {
+                    success: true,
+                    ids: vec![
+                        RoomTreeNodeId::Refno(target), // 构件自身
+                        RoomTreeNodeId::Str(comp_group_node_id(&room_entry.refno, &comp_group_key)), // 分组
+                        RoomTreeNodeId::Refno(room_entry.refno), // 房间
+                        RoomTreeNodeId::Str(group_node_id(group)), // 房间分组
+                        RoomTreeNodeId::Str(ROOM_ROOT_ID.to_string()), // 根
+                    ],
+                    error_message: None,
+                });
+            }
+        }
+    }
+
+    Err(anyhow!("refno not found in room tree: {id}"))
 }
 
 /// 不经 HTTP 层的核心逻辑：按 keyword 搜索房间树（仅返回 ROOM 节点）。

@@ -15030,3 +15030,7 @@ dependencies = [
  "syn 2.0.117",
  "winnow 0.7.14",
 ]
+
+[[patch.unused]]
+name = "aios_core"
+version = "0.3.2"

@@ -245,8 +245,8 @@ tempfile = "3"
 # ═══════════════════════════════════════════════════════════════
 # 本地路径覆盖（联调时取消注释，CI/远程编译时注释掉整个 [patch] block）
 # ═══════════════════════════════════════════════════════════════
-# [patch."https://github.com/happyrust/rs-core.git"]
-# aios_core = { path = "../rs-core" }
+[patch."https://github.com/happyrust/rs-core.git?branch=dev-3.1"]
+aios_core = { path = "../rs-core" }
 
 # [patch."https://github.com/happyrust/pdms-io.git"]
 # pdms_io = { path = "../pdms-io-fork" }

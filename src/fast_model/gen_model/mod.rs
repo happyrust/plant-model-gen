@@ -58,6 +58,7 @@ pub mod inst_query; // inst_relate/geo_relate 查询
 pub mod loop_model; // LOOP 模型生成
 pub mod manifold_bool; // 布尔运算
 pub mod mesh_generate; // 网格生成
+pub mod mesh_state; // mesh 状态源（file/db）
 pub mod pdms_inst; // 实例数据保存
 pub mod pdms_inst_surreal; // SurrealDB 极简存储
 pub mod prim_model; // PRIM 模型生成

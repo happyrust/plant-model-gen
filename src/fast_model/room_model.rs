@@ -2667,7 +2667,13 @@ pub async fn cal_room_refnos_with_options(
         };
         let key_points = extract_aabb_key_points(cand_aabb);
         let panel_aabb_ref = Some(&panel_aabb);
-        if is_geom_in_panel_with_aabb(&key_points, &panel_meshes, inside_tol, &floor_2d, panel_aabb_ref) {
+        if is_geom_in_panel_with_aabb(
+            &key_points,
+            &panel_meshes,
+            inside_tol,
+            &floor_2d,
+            panel_aabb_ref,
+        ) {
             within_refnos.insert(*candidate_refno);
             aabb_filter_passed += 1;
         }
@@ -2755,10 +2761,7 @@ async fn load_geometry_with_enhanced_cache(
 
             // 我们需要应用实例变换
 
-            let transformed_mesh = transform_tri_mesh(
-                &cached_trimesh,
-                combined_transform,
-            )?;
+            let transformed_mesh = transform_tri_mesh(&cached_trimesh, combined_transform)?;
 
             let result = Arc::new(transformed_mesh);
             transformed_cache.insert(transform_key.clone(), result.clone());

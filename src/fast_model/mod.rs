@@ -212,7 +212,24 @@ pub struct AabbCacheEntryV1 {
 pub fn save_aabb_cache_to_disk() {
     let mesh_dir = aios_core::get_db_option().get_meshes_path();
     let cache_path = mesh_dir.join(AABB_CACHE_FILENAME);
-    let tmp_path = mesh_dir.join(format!("{}.tmp", AABB_CACHE_FILENAME));
+    if let Err(e) = std::fs::create_dir_all(&mesh_dir) {
+        eprintln!(
+            "[aabb_cache] 创建缓存目录失败: {} - {}",
+            mesh_dir.display(),
+            e
+        );
+        return;
+    }
+
+    let tmp_path = mesh_dir.join(format!(
+        "{}.{}.{}.tmp",
+        AABB_CACHE_FILENAME,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
 
     let mut entries = Vec::new();
     for kv in EXIST_MESH_GEO_HASHES.iter() {

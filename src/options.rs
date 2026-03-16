@@ -545,11 +545,8 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let defer_db_write = parse_defer_db_write(
-        toml_value
-            .get("defer_db_write")
-            .and_then(|v| v.as_bool()),
-    );
+    let defer_db_write =
+        parse_defer_db_write(toml_value.get("defer_db_write").and_then(|v| v.as_bool()));
 
     let boolean_pipeline_mode = toml_value
         .get("boolean_pipeline_mode")

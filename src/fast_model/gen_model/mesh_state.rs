@@ -17,7 +17,8 @@ pub fn flush_aabb_cache() {
 }
 
 pub fn mesh_exists(geo_hash: u64) -> bool {
-    find_existing_mesh_path(&aios_core::get_db_option().get_meshes_path(), geo_hash).is_some()
+    let key = geo_hash.to_string();
+    EXIST_MESH_GEO_HASHES.contains_key(&key)
 }
 
 pub fn get_cached_or_local_aabb(geo_hash: u64) -> Option<Aabb> {
@@ -25,19 +26,15 @@ pub fn get_cached_or_local_aabb(geo_hash: u64) -> Option<Aabb> {
     get_cached_or_local_aabb_in_dir(&mesh_dir, geo_hash)
 }
 
-pub fn get_cached_or_local_aabb_in_dir(mesh_dir: &Path, geo_hash: u64) -> Option<Aabb> {
-    let mesh_path = find_existing_mesh_path(mesh_dir, geo_hash)?;
+pub fn get_cached_or_local_aabb_in_dir(_mesh_dir: &Path, geo_hash: u64) -> Option<Aabb> {
     let key = geo_hash.to_string();
-    if let Some(cached_aabb) = EXIST_MESH_GEO_HASHES.get(&key) {
-        let cached = *cached_aabb;
-        if is_valid_cached_aabb(&cached) {
-            return Some(cached);
-        }
+    let cached_aabb = EXIST_MESH_GEO_HASHES.get(&key)?;
+    let cached = *cached_aabb;
+    if is_valid_cached_aabb(&cached) {
+        Some(cached)
+    } else {
+        None
     }
-
-    let computed = load_local_mesh_aabb_from_glb(&mesh_path)?;
-    EXIST_MESH_GEO_HASHES.insert(key, computed);
-    Some(computed)
 }
 
 pub fn prime_cached_aabb_for_mesh_ids<'a>(mesh_ids: impl IntoIterator<Item = &'a str>) {

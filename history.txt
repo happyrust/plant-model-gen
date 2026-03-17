@@ -1,5 +1,4 @@
 #V2
-SELECT REFNO AS panel_refno, owner.owner.id AS sbfr_id, owner.owner.owner.id AS frmw_id, owner.owner.owner.NAME AS frmw_name FROM PANE LIMIT 5;
 SELECT REFNO, owner, owner.owner, owner.owner.owner FROM PANE LIMIT 1;
 -- 房间计算查询测试：panel_refno 回归 pe，字段用 pe 风格 (owner)
 -- 连接: surreal sql --endpoint ws://localhost:8020 --namespace 1516 --database AvevaMarineSample -u root -p root --pretty
@@ -99,3 +98,4 @@ SELECT * FROM pe:⟨13246_390709⟩.refno;
 SELECT * FROM pe:⟨13246_390708⟩.refno;
 SELECT * FROM pe:⟨13246_390710⟩.refno;
 SELECT * FROM pe:⟨13246_390681⟩.refno;
+SELECT record::id(id[0]) as refno, record::id(in) as owner, world_trans.d as world_trans, aabb.d as world_aabb, record::id(geo) as geo_hash, id[1] as idx FROM tubi_relate:[pe:24381_88894, 0]..[pe:24381_88894, ..];

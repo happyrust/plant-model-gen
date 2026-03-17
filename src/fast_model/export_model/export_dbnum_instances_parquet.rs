@@ -839,9 +839,9 @@ async fn query_export_insts_local(
                                 out.unit_flag ?? false as unit_flag
                             FROM $parent.out->geo_relate
                             WHERE visible
-                              && (out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
+                              && (out.unit_flag || record::id(out) IN ['1','2','3'] || true)
                               && (trans.d ?? NONE) != NONE
-                              && geo_type IN ['Pos', 'CatePos', 'Compound']
+                              && geo_type IN ['Pos', 'CatePos', 'Compound', 'Neg']
                         ) as insts,
                         false as has_neg
                     FROM [{non_bool_keys}]
@@ -882,9 +882,9 @@ async fn query_export_insts_local(
                             out.unit_flag ?? false as unit_flag
                         FROM $parent.out->geo_relate
                         WHERE visible
-                          && (out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
+                          && (out.unit_flag || record::id(out) IN ['1','2','3'] || true)
                           && (trans.d ?? NONE) != NONE
-                          && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']
+                          && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound', 'Neg']
                     ) as insts,
                     false as has_neg
                 FROM [{inst_relate_keys}]

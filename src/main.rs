@@ -929,6 +929,14 @@ async fn main() -> anyhow::Result<()> {
     // 创建自定义的 DbOptionExt
     let mut db_option_ext = get_db_option_ext_from_path(config_path)?;
 
+    if is_offline {
+        db_option_ext.inner.surrealdb.mode = aios_core::options::DbConnMode::File;
+        println!(
+            "🔧 CLI 覆盖 surrealdb.mode -> {}（db_option_ext）",
+            db_option_ext.inner.surrealdb.mode.as_str()
+        );
+    }
+
     if let Some(lod_str) = matches.get_one::<String>("gen-lod").map(|s| s.as_str()) {
         if let Some(lod) = parse_lod_level(lod_str) {
             println!(

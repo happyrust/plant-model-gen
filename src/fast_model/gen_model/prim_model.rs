@@ -225,7 +225,7 @@ fn insert_prim_result(
 }
 
 /// 如果 batch 达到阈值则发送，返回是否发送成功。
-fn flush_if_needed(
+async fn flush_if_needed(
     shape_insts_data: &mut ShapeInstancesData,
     sender: &flume::Sender<ShapeInstancesData>,
     batch_idx: usize,
@@ -237,16 +237,25 @@ fn flush_if_needed(
             batch_idx,
             shape_insts_data.inst_cnt()
         );
+        let inst_cnt = shape_insts_data.inst_cnt();
+        let send_start = Instant::now();
         sender
-            .send(std::mem::take(shape_insts_data))
+            .send_async(std::mem::take(shape_insts_data))
+            .await
             .map_err(|e| anyhow::anyhow!("send prim shape_insts_data error: {}", e))?;
+        println!(
+            "[producer_batch] producer=prim batch={} flush=threshold inst_cnt={} send_wait_ms={}",
+            batch_idx,
+            inst_cnt,
+            send_start.elapsed().as_millis()
+        );
         *sent_count += 1;
     }
     Ok(())
 }
 
 /// 发送剩余数据。
-fn flush_remaining(
+async fn flush_remaining(
     shape_insts_data: ShapeInstancesData,
     sender: &flume::Sender<ShapeInstancesData>,
     batch_idx: usize,
@@ -258,9 +267,18 @@ fn flush_remaining(
             batch_idx,
             shape_insts_data.inst_cnt()
         );
+        let inst_cnt = shape_insts_data.inst_cnt();
+        let send_start = Instant::now();
         sender
-            .send(shape_insts_data)
+            .send_async(shape_insts_data)
+            .await
             .map_err(|e| anyhow::anyhow!("send last prim shape_insts_data error: {}", e))?;
+        println!(
+            "[producer_batch] producer=prim batch={} flush=final inst_cnt={} send_wait_ms={}",
+            batch_idx,
+            inst_cnt,
+            send_start.elapsed().as_millis()
+        );
         *sent_count += 1;
     }
     Ok(())
@@ -437,10 +455,10 @@ pub async fn gen_prim_geos(
                 );
                 processed_in_batch += 1;
 
-                flush_if_needed(&mut shape_insts_data, &sender, i, &mut sent_count)?;
+                flush_if_needed(&mut shape_insts_data, &sender, i, &mut sent_count).await?;
             }
 
-            flush_remaining(shape_insts_data, &sender, i, &mut sent_count)?;
+            flush_remaining(shape_insts_data, &sender, i, &mut sent_count).await?;
 
             e3d_dbg!(
                 "[gen_prim_geos] 批次 {} 完成: 处理 {}/{} 个, 跳过 {} 个, 发送 {} 次, 耗时 {} ms",

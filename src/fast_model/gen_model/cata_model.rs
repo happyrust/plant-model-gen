@@ -162,6 +162,30 @@ fn log_cata_refno_generated(refno: &RefnoEnum, info: &EleGeosInfo, source: &str)
     );
 }
 
+async fn send_cata_shape_batch(
+    sender: &flume::Sender<ShapeInstancesData>,
+    shape_insts_data: ShapeInstancesData,
+    producer: &str,
+    batch_id: usize,
+    flush: &str,
+) -> anyhow::Result<()> {
+    let inst_cnt = shape_insts_data.inst_cnt();
+    let send_start = Instant::now();
+    sender
+        .send_async(shape_insts_data)
+        .await
+        .map_err(|e| anyhow::anyhow!("send cate shape_insts_data error: {}", e))?;
+    println!(
+        "[producer_batch] producer={} batch={} flush={} inst_cnt={} send_wait_ms={}",
+        producer,
+        batch_id,
+        flush,
+        inst_cnt,
+        send_start.elapsed().as_millis()
+    );
+    Ok(())
+}
+
 fn build_prepared_inst_geos_from_shapes_for_cache(
     shapes: Vec<CateCsgShape>,
 ) -> (Vec<PreparedInstGeo>, bool) {
@@ -1593,12 +1617,15 @@ async fn gen_cata_geos_inner(
                         shape_insts_data.insert_info(ele_refno, geos_info);
 
                         if shape_insts_data.inst_cnt() >= SEND_INST_SIZE {
-
-                            sender
-
-                                .send(std::mem::take(&mut shape_insts_data))
-
-                                .expect("send cate shape_insts_data error");
+                            send_cata_shape_batch(
+                                &sender,
+                                std::mem::take(&mut shape_insts_data),
+                                "cata",
+                                batch_id,
+                                "threshold",
+                            )
+                            .await
+                            .expect("send cate shape_insts_data error");
 
                         }
 
@@ -2431,12 +2458,15 @@ async fn gen_cata_geos_inner(
                                 shape_insts_data.insert_geos_data(inst_key, geos_data);
 
                                 if shape_insts_data.inst_cnt() >= SEND_INST_SIZE {
-
-                                    sender
-
-                                        .send(std::mem::take(&mut shape_insts_data))
-
-                                        .expect("send cate shape_insts_data error");
+                                    send_cata_shape_batch(
+                                        &sender,
+                                        std::mem::take(&mut shape_insts_data),
+                                        "cata",
+                                        batch_id,
+                                        "threshold",
+                                    )
+                                    .await
+                                    .expect("send cate shape_insts_data error");
 
                                 }
 
@@ -3882,11 +3912,15 @@ async fn gen_cata_geos_inner(
 
                     );
 
-                    sender
-
-                        .send(std::mem::take(&mut shape_insts_data))
-
-                        .expect("send cate shape_insts_data error");
+                    send_cata_shape_batch(
+                        &sender,
+                        std::mem::take(&mut shape_insts_data),
+                        "cata",
+                        batch_id,
+                        "threshold",
+                    )
+                    .await
+                    .expect("send cate shape_insts_data error");
 
                 }
 
@@ -3936,11 +3970,15 @@ async fn gen_cata_geos_inner(
 
                 );
 
-                sender
-
-                    .send(shape_insts_data)
-
-                    .expect("send prim shape_insts_data error");
+                send_cata_shape_batch(
+                    &sender,
+                    shape_insts_data,
+                    "cata",
+                    batch_id,
+                    "final",
+                )
+                .await
+                .expect("send cate shape_insts_data error");
 
             } else {
 
@@ -4986,7 +5024,7 @@ async fn gen_cata_geos_inner(
 
                 let dir_ok = current_tubing.is_dir_ok();
 
-                                    let dist_ok = dist > TUBI_TOL;
+                let dist_ok = dist > TUBI_TOL;
 
                 let transform = (if !dir_ok {
                     build_tubi_transform_from_segment(
@@ -6157,9 +6195,7 @@ async fn gen_cata_geos_inner(
         let t_send_data = Instant::now();
 
         if tubi_shape_insts_data.inst_cnt() > 0 {
-            sender
-                .send(tubi_shape_insts_data)
-                .expect("send tubi shape_insts_data failed.");
+            send_cata_shape_batch(&sender, tubi_shape_insts_data, "tubi", 0, "final").await?;
         }
 
         send_data_time = t_send_data.elapsed().as_millis();
@@ -6648,11 +6684,7 @@ pub async fn gen_tubi_from_db(
 }
 
 fn resolve_branch_tail_arrive_refno(branch_refno: RefnoEnum, tref: RefnoEnum) -> RefnoEnum {
-    if tref.is_valid() {
-        tref
-    } else {
-        branch_refno
-    }
+    if tref.is_valid() { tref } else { branch_refno }
 }
 
 #[cfg(test)]

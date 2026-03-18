@@ -2,15 +2,18 @@ use aios_core::{RefnoEnum, model_primary_db};
 /// SurrealDB 极简版：单表存储所有关联数据
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_with::{DisplayFromStr, serde_as};
 use std::collections::HashMap;
 use surrealdb_types::SurrealValue;
 
 /// refno 关联的所有数据（扁平化）
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, Default, SurrealValue)]
 pub struct RefnoRelations {
     pub refno: RefnoEnum,
     pub dbnum: u32,
     pub inst_keys: Vec<String>,
+    #[serde_as(as = "Vec<DisplayFromStr>")]
     pub geo_hashes: Vec<u64>,
     pub tubi_segments: Vec<Vec<u8>>,
     pub bool_results: Vec<Vec<u8>>,
@@ -96,4 +99,37 @@ pub async fn load_refno_relations_surreal(refnos: &[RefnoEnum]) -> Result<Vec<Re
     let results: Vec<RefnoRelations> = model_primary_db().query(&sql).await?.take(0)?;
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RefnoRelations;
+    use aios_core::RefnoEnum;
+    use std::str::FromStr;
+
+    #[test]
+    fn geo_hashes_are_serialized_as_strings_for_surreal_content() {
+        let rel = RefnoRelations {
+            refno: RefnoEnum::from_str("7997/1").unwrap(),
+            dbnum: 7997,
+            inst_keys: vec!["inst-a".to_string()],
+            geo_hashes: vec![12_452_550_876_698_633_064],
+            tubi_segments: vec![],
+            bool_results: vec![],
+            world_matrices: vec![],
+        };
+
+        let value = serde_json::to_value(&rel).unwrap();
+        let geo_hashes = value
+            .get("geo_hashes")
+            .and_then(|v| v.as_array())
+            .expect("geo_hashes should be an array");
+
+        assert_eq!(geo_hashes.len(), 1);
+        assert_eq!(
+            geo_hashes[0].as_str(),
+            Some("12452550876698633064"),
+            "u64 geo_hash 应以字符串写入，避免 Surreal JSON number 解析成 i64 失败"
+        );
+    }
 }

@@ -333,16 +333,18 @@ pub async fn gen_loop_geos(
 
                 if shape_insts_data.inst_cnt() >= SEND_INST_SIZE {
                     sender
-                        .send(std::mem::take(&mut shape_insts_data))
-                        .expect("send loop shape_insts_data error");
+                        .send_async(std::mem::take(&mut shape_insts_data))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("send loop shape_insts_data error"))?;
                     // dbg!("Send loop insts data");
                 }
             }
 
             if shape_insts_data.inst_cnt() > 0 {
                 sender
-                    .send(shape_insts_data)
-                    .expect("send loop shape_insts_data error");
+                    .send_async(shape_insts_data)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("send loop shape_insts_data error"))?;
                 // dbg!("Send last loop insts data");
             }
             Ok::<_, anyhow::Error>(())

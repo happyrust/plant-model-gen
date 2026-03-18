@@ -1594,8 +1594,28 @@ pub async fn apply_insts_boolean_manifold(
         return Ok(());
     }
 
+    let concurrency = resolve_bool_worker_concurrency().min(queries.len().max(1));
+    println!(
+        "[bool_worker/db_legacy] 开始执行实例级布尔: tasks={} concurrency={}",
+        queries.len(),
+        concurrency
+    );
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut join_set = tokio::task::JoinSet::new();
     for query in queries {
-        apply_boolean_for_query(query, replace_exist).await?;
+        let sem = semaphore.clone();
+        join_set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            apply_boolean_for_query(query, replace_exist).await
+        });
+    }
+
+    while let Some(join_result) = join_set.join_next().await {
+        match join_result {
+            Ok(result) => result?,
+            Err(e) => return Err(anyhow::anyhow!("实例级布尔任务 panic: {}", e)),
+        }
     }
 
     Ok(())
@@ -1797,6 +1817,27 @@ fn build_cata_status_sql(
 
 fn bool_result_file_exists(mesh_id: &str) -> bool {
     boolean_glb_path(mesh_id).exists() || boolean_obj_path(mesh_id).exists()
+}
+
+fn default_bool_worker_concurrency() -> usize {
+    num_cpus::get().clamp(2, 12)
+}
+
+fn resolve_bool_worker_concurrency() -> usize {
+    match std::env::var("AIOS_BOOL_WORKER_CONCURRENCY") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            Ok(_) | Err(_) => {
+                eprintln!(
+                    "[bool_worker] 非法 AIOS_BOOL_WORKER_CONCURRENCY='{}'，回退默认并发 {}",
+                    raw,
+                    default_bool_worker_concurrency()
+                );
+                default_bool_worker_concurrency()
+            }
+        },
+        Err(_) => default_bool_worker_concurrency(),
+    }
 }
 
 fn append_cata_update_sql(
@@ -2310,7 +2351,7 @@ pub async fn run_bool_worker_from_tasks(
     }
 
     // 并发执行
-    let concurrency = num_cpus::get().clamp(2, 6);
+    let concurrency = resolve_bool_worker_concurrency().min(executable_tasks.len().max(1));
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
     println!(

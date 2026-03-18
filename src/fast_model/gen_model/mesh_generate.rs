@@ -43,7 +43,7 @@ use aios_core::geometry::ShapeInstancesData;
 use aios_core::query_db;
 use anyhow::anyhow;
 use chrono;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use glam::DMat4;
 use itertools::Itertools;
 use log::info;
@@ -52,11 +52,12 @@ use parry3d::math::Isometry;
 use parse_pdms_db::parse::round_f32;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use surrealdb::types as surrealdb_types;
 use surrealdb::types::SurrealValue;
 
@@ -139,63 +140,47 @@ impl MeshWorkerReport {
     }
 }
 
-/// 有界去重器：HashSet + VecDeque 实现 LRU 式淘汰
+/// 并发安全去重器：基于 DashSet 实现，无需外部锁
 ///
-/// 当容量达到上限时，弹出最早插入的元素以保证内存有上界。
+/// 所有方法均为 `&self`，可在多个 tokio task 间共享而无需 Mutex。
 pub struct RecentGeoDeduper {
-    set: HashSet<u64>,
-    order: VecDeque<u64>,
-    pub capacity: usize,
+    set: DashSet<u64>,
     /// 累计插入（新增）次数
-    pub insert_count: usize,
+    pub insert_count: AtomicUsize,
     /// 累计重复命中次数
-    pub duplicate_count: usize,
-    /// 累计淘汰次数
-    pub evict_count: usize,
+    pub duplicate_count: AtomicUsize,
 }
 
 impl RecentGeoDeduper {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(_capacity: usize) -> Self {
         Self {
-            set: HashSet::with_capacity(capacity.min(65536)),
-            order: VecDeque::with_capacity(capacity.min(65536)),
-            capacity,
-            insert_count: 0,
-            duplicate_count: 0,
-            evict_count: 0,
+            set: DashSet::new(),
+            insert_count: AtomicUsize::new(0),
+            duplicate_count: AtomicUsize::new(0),
         }
     }
 
     /// 尝试插入。返回 true 表示新增（未重复），false 表示重复。
-    pub fn insert(&mut self, value: u64) -> bool {
-        if self.set.contains(&value) {
-            self.duplicate_count += 1;
+    /// 并发安全，无需外部锁。
+    pub fn insert(&self, value: u64) -> bool {
+        if !self.set.insert(value) {
+            self.duplicate_count.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        // 超容量淘汰最早的
-        if self.set.len() >= self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.set.remove(&old);
-                self.evict_count += 1;
-            }
-        }
-        self.set.insert(value);
-        self.order.push_back(value);
-        self.insert_count += 1;
+        self.insert_count.fetch_add(1, Ordering::Relaxed);
         true
     }
 
-    /// 批量预加载已知 ID（不计入 insert_count，自动扩容）
-    pub fn preload(&mut self, ids: impl IntoIterator<Item = u64>) {
+    /// 批量预加载已知 ID（不计入 insert_count）
+    pub fn preload(&self, ids: impl IntoIterator<Item = u64>) {
         for id in ids {
-            if self.set.insert(id) {
-                self.order.push_back(id);
-            }
+            self.set.insert(id);
         }
-        // 扩容以容纳预加载数据 + 后续新增
-        if self.set.len() > self.capacity {
-            self.capacity = self.set.len() + 100_000;
-        }
+    }
+
+    /// 获取当前去重集大小
+    pub fn len(&self) -> usize {
+        self.set.len()
     }
 }
 
@@ -411,7 +396,7 @@ pub fn extract_mesh_tasks(data: &ShapeInstancesData) -> Vec<MeshTask> {
 pub async fn generate_meshes_for_batch(
     tasks: &[MeshTask],
     db_option: &DbOption,
-    deduper: &mut RecentGeoDeduper,
+    deduper: &RecentGeoDeduper,
     aabb_map: &Arc<DashMap<String, Aabb>>,
     pts_json_map: &Arc<DashMap<u64, String>>,
 ) -> HashMap<u64, MeshResult> {
@@ -425,40 +410,38 @@ pub async fn generate_meshes_for_batch(
 
     let mut results = HashMap::new();
     let mut skipped_by_cache = 0usize;
+    let (new_tasks, deduped_hashes) = dedup_classify_tasks(tasks, deduper);
 
-    for task in tasks {
-        // 第一层去重：跨批次内存去重器
-        if !deduper.insert(task.geo_hash) {
-            // 即使 deduper 跳过（增量模式预加载），仍从缓存获取 AABB，
-            // 保证 inst_relate_aabb 在增量模式下也能正确写入。
-            if let Some(cached) = get_cached_or_local_aabb(task.geo_hash) {
-                let h = gen_aabb_hash(&cached);
-                aabb_map.entry(h.to_string()).or_insert(cached);
-                results.insert(
-                    task.geo_hash,
-                    MeshResult {
-                        meshed: true,
-                        bad: false,
-                        aabb_hash: Some(h),
-                        pts_hashes: vec![],
-                    },
-                );
-                skipped_by_cache += 1;
-            } else if mesh_exists(task.geo_hash) {
-                results.insert(
-                    task.geo_hash,
-                    MeshResult {
-                        meshed: true,
-                        bad: false,
-                        aabb_hash: None,
-                        pts_hashes: vec![],
-                    },
-                );
-                skipped_by_cache += 1;
-            }
-            continue;
+    for geo_hash in deduped_hashes {
+        // 第一层去重：跨批次内存去重命中后，仅做缓存/本地文件判断，不再执行 CSG。
+        if let Some(cached) = get_cached_or_local_aabb(geo_hash) {
+            let h = gen_aabb_hash(&cached);
+            aabb_map.entry(h.to_string()).or_insert(cached);
+            results.insert(
+                geo_hash,
+                MeshResult {
+                    meshed: true,
+                    bad: false,
+                    aabb_hash: Some(h),
+                    pts_hashes: vec![],
+                },
+            );
+            skipped_by_cache += 1;
+        } else if mesh_exists(geo_hash) {
+            results.insert(
+                geo_hash,
+                MeshResult {
+                    meshed: true,
+                    bad: false,
+                    aabb_hash: None,
+                    pts_hashes: vec![],
+                },
+            );
+            skipped_by_cache += 1;
         }
+    }
 
+    for task in new_tasks {
         // 第二层去重：检查预加载缓存（EXIST_MESH_GEO_HASHES）
         // 如果该 geo_hash 的 mesh 文件已存在，跳过 CSG 生成；有 AABB 则复用，无则仅标记已完成
         if let Some(cached) = get_cached_or_local_aabb(task.geo_hash) {
@@ -555,6 +538,29 @@ pub async fn generate_meshes_for_batch(
     }
 
     results
+}
+
+/// Phase 1: 使用 deduper 进行分类，避免长时间持锁。
+///
+/// 返回两个集合：
+/// - `new_tasks`: 需要执行 CSG 的任务
+/// - `deduped_hashes`: 本批次内已去重命中的 geo_hash
+pub fn dedup_classify_tasks(
+    tasks: &[MeshTask],
+    deduper: &RecentGeoDeduper,
+) -> (Vec<MeshTask>, HashSet<u64>) {
+    let mut new_tasks = Vec::new();
+    let mut deduped_hashes = HashSet::new();
+
+    for task in tasks {
+        if deduper.insert(task.geo_hash) {
+            new_tasks.push(task.clone());
+        } else {
+            deduped_hashes.insert(task.geo_hash);
+        }
+    }
+
+    (new_tasks, deduped_hashes)
 }
 
 /// 在数据库中生成网格模型并更新包围盒
@@ -1119,7 +1125,7 @@ pub async fn run_mesh_worker_from_channel(
     let pts_json_map: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
     let inst_aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
 
-    let mut deduper = RecentGeoDeduper::new(200_000);
+    let deduper = RecentGeoDeduper::new(200_000);
     let mut report = MeshWorkerReport::new();
     let worker_start = std::time::Instant::now();
 
@@ -1282,10 +1288,16 @@ pub async fn run_mesh_worker_from_channel(
     report.elapsed_ms = worker_start.elapsed().as_millis();
 
     // 打印去重器统计
-    if deduper.evict_count > 0 {
+    let dup = deduper
+        .duplicate_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if dup > 0 {
         println!(
-            "[mesh_worker_channel] 去重器统计: 新增={}, 重复={}, 淘汰={}",
-            deduper.insert_count, deduper.duplicate_count, deduper.evict_count
+            "[mesh_worker_channel] 去重器统计: 新增={}, 重复={}",
+            deduper
+                .insert_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            dup
         );
     }
 
@@ -2369,45 +2381,41 @@ mod tests {
 
     #[test]
     fn test_deduper_basic_insert_and_duplicate() {
-        let mut d = RecentGeoDeduper::new(10);
+        let d = RecentGeoDeduper::new(10);
         assert!(d.insert(1));
         assert!(d.insert(2));
         assert!(!d.insert(1)); // 重复
-        assert_eq!(d.insert_count, 2);
-        assert_eq!(d.duplicate_count, 1);
-        assert_eq!(d.evict_count, 0);
+        assert_eq!(d.insert_count.load(Ordering::Relaxed), 2);
+        assert_eq!(d.duplicate_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
-    fn test_deduper_eviction_at_capacity() {
-        let mut d = RecentGeoDeduper::new(3);
+    fn test_deduper_concurrent_safe() {
+        let d = RecentGeoDeduper::new(0);
+        // DashSet 无容量限制，所有插入均保留（无 LRU 淘汰）
         assert!(d.insert(10));
         assert!(d.insert(20));
         assert!(d.insert(30));
-        // 容量已满，插入 40 应淘汰最早的 10
         assert!(d.insert(40));
-        assert_eq!(d.evict_count, 1);
-        // 10 已被淘汰，再次插入应视为新增
-        assert!(d.insert(10));
-        assert_eq!(d.insert_count, 5);
-        assert_eq!(d.evict_count, 2); // 淘汰了 20
-        // 20 已被淘汰
-        assert!(d.insert(20));
-        assert_eq!(d.evict_count, 3); // 淘汰了 30
+        assert_eq!(d.len(), 4);
+        // 重复插入返回 false
+        assert!(!d.insert(10));
+        assert_eq!(d.duplicate_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
-    fn test_deduper_zero_capacity() {
-        let mut d = RecentGeoDeduper::new(0);
-        // 容量为 0 时每次插入都立即淘汰（边界情况）
-        // insert(1): set.len()=0 >= capacity=0 → 但 order 为空不淘汰 → 插入
-        assert!(d.insert(1));
-        // insert(2): set.len()=1 >= capacity=0 → 淘汰 1 → 插入 2
-        assert!(d.insert(2));
-        assert_eq!(d.evict_count, 1);
-        // 1 已被淘汰，不是重复
-        assert!(d.insert(1));
-        assert_eq!(d.evict_count, 2);
+    fn test_deduper_preload() {
+        let d = RecentGeoDeduper::new(0);
+        d.preload(vec![100, 200, 300]);
+        assert_eq!(d.len(), 3);
+        // preload 的 ID 不计入 insert_count
+        assert_eq!(d.insert_count.load(Ordering::Relaxed), 0);
+        // 尝试插入已 preload 的 ID 应返回 false（重复）
+        assert!(!d.insert(100));
+        assert_eq!(d.duplicate_count.load(Ordering::Relaxed), 1);
+        // 插入新 ID 应成功
+        assert!(d.insert(400));
+        assert_eq!(d.insert_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

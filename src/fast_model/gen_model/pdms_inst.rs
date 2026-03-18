@@ -31,8 +31,12 @@ use crate::fast_model::shared::aabb_apply_transform;
 
 #[inline]
 fn is_refno_assoc_index_enabled() -> bool {
-    // refno_assoc_index 已硬关闭：保留兼容类型，但运行时永远不启用。
-    false
+    true
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SaveInstanceDataReport {
+    pub missing_neg_carriers: Vec<RefnoEnum>,
 }
 
 /// 将 tubi_info 数据写入数据库（可选覆盖）。
@@ -446,7 +450,38 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
 
     let t = std::time::Instant::now();
 
-    // refno_assoc_index 已硬关闭，清理流程始终走 Legacy 路径。
+    if is_refno_assoc_index_enabled() {
+        let index_started = std::time::Instant::now();
+        let summary = super::refno_assoc_index::delete_by_refnos(&all_refnos, CHUNK_SIZE).await?;
+        println!(
+            "[pre_cleanup_for_regen] refno_assoc_index requested_refnos={} indexed_refnos={} cache_miss_refnos={} used_index={} deleted_statements={} inst_relate_ids={} inst_info_ids={} geo_relate_ids={} geo_hashes={} neg_relate_ids={} ngmr_relate_ids={} inst_relate_bool_ids={} inst_relate_cata_bool_ids={} inst_relate_aabb_ids={} tubi_branch_keys={} prefetched_ref0_groups={} overfetched_rows={} elapsed_ms={}",
+            summary.requested_refnos,
+            summary.indexed_refnos,
+            summary.cache_miss_refnos,
+            summary.used_index,
+            summary.deleted_statement_count,
+            summary.inst_relate_ids,
+            summary.inst_info_ids,
+            summary.geo_relate_ids,
+            summary.geo_hashes,
+            summary.neg_relate_ids,
+            summary.ngmr_relate_ids,
+            summary.inst_relate_bool_ids,
+            summary.inst_relate_cata_bool_ids,
+            summary.inst_relate_aabb_ids,
+            summary.tubi_branch_keys,
+            summary.prefetched_ref0_groups,
+            summary.overfetched_rows,
+            index_started.elapsed().as_millis()
+        );
+        if summary.used_index {
+            println!(
+                "[pre_cleanup_for_regen] 清理完成 (refno_assoc_index 模式)，耗时 {} ms",
+                t.elapsed().as_millis()
+            );
+            return Ok(());
+        }
+    }
 
     let refno_dbnum_map = query_refno_dbnum_map(&all_refnos, CHUNK_SIZE).await;
     let mut refnos_by_dbnum: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
@@ -563,8 +598,9 @@ pub async fn save_instance_data_optimize(
     mesh_results: &HashMap<u64, MeshResult>,
     mesh_aabb_map: &DashMap<String, Aabb>,
 ) -> anyhow::Result<()> {
-    save_instance_data_with_options(inst_mgr, replace_exist, mesh_results, mesh_aabb_map, true)
-        .await
+    save_instance_data_with_report(inst_mgr, replace_exist, mesh_results, mesh_aabb_map, true)
+        .await?;
+    Ok(())
 }
 
 pub async fn save_instance_data_with_options(
@@ -574,6 +610,24 @@ pub async fn save_instance_data_with_options(
     mesh_aabb_map: &DashMap<String, Aabb>,
     write_inst_relate_aabb: bool,
 ) -> anyhow::Result<()> {
+    save_instance_data_with_report(
+        inst_mgr,
+        replace_exist,
+        mesh_results,
+        mesh_aabb_map,
+        write_inst_relate_aabb,
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn save_instance_data_with_report(
+    inst_mgr: &ShapeInstancesData,
+    replace_exist: bool,
+    mesh_results: &HashMap<u64, MeshResult>,
+    mesh_aabb_map: &DashMap<String, Aabb>,
+    write_inst_relate_aabb: bool,
+) -> anyhow::Result<SaveInstanceDataReport> {
     debug_model_debug!(
         "save_instance_data_optimize start: inst_info={}, inst_geo_keys={}, tubi_keys={}, replace_exist={}, write_inst_relate_aabb={}",
         inst_mgr.inst_info_map.len(),
@@ -590,6 +644,7 @@ pub async fn save_instance_data_with_options(
     // 本地 SurrealDB 在并发事务较高时更容易出现 “Transaction conflict: Resource busy”，
     // 这里降低并发以提升整体成功率（结合 TransactionBatcher 内部重试）。
     const MAX_CONCURRENT_TX: usize = 2;
+    let mut report = SaveInstanceDataReport::default();
     let mut refno_assoc_batch = if is_refno_assoc_index_enabled() {
         Some(RefnoAssocIndexBatch::default())
     } else {
@@ -675,20 +730,7 @@ pub async fn save_instance_data_with_options(
                     format!("inst_info:⟨{}⟩", inst_geo_data.id()),
                 );
                 batch.add_geo_relate_id(inst_geo_data.refno, format!("geo_relate:⟨{}⟩", relate_id));
-            }
-            if let Some(batch) = refno_assoc_batch.as_mut() {
-                batch.add_inst_info_id(
-                    inst_geo_data.refno,
-                    format!("inst_info:⟨{}⟩", inst_geo_data.id()),
-                );
-                batch.add_geo_relate_id(inst_geo_data.refno, format!("geo_relate:⟨{}⟩", relate_id));
-            }
-            if let Some(batch) = refno_assoc_batch.as_mut() {
-                batch.add_inst_info_id(
-                    inst_geo_data.refno,
-                    format!("inst_info:⟨{}⟩", inst_geo_data.id()),
-                );
-                batch.add_geo_relate_id(inst_geo_data.refno, format!("geo_relate:⟨{}⟩", relate_id));
+                batch.add_geo_hash(inst_geo_data.refno, inst.geo_hash.to_string());
             }
 
             // 收集 Neg 和 CataCrossNeg 类型的 geo_relate 映射
@@ -843,6 +885,12 @@ pub async fn save_instance_data_with_options(
                 loaded
             );
         }
+        report.missing_neg_carriers.extend(
+            missing_carriers
+                .iter()
+                .filter(|neg_refno| !neg_geo_by_carrier.contains_key(neg_refno))
+                .copied(),
+        );
 
         let mut neg_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
         let mut neg_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
@@ -1105,6 +1153,10 @@ pub async fn save_instance_data_with_options(
                 continue;
             }
 
+            if let Some(batch) = refno_assoc_batch.as_mut() {
+                batch.add_tubi_branch_key(info.refno, info.refno.to_pe_key());
+            }
+
             // 收集 aabb 数据（用于 tubi_relate）
             if let Some(aabb) = info.aabb {
                 let aabb_hash = gen_aabb_hash(&aabb);
@@ -1310,7 +1362,10 @@ pub async fn save_instance_data_with_options(
         }
     }
 
-    Ok(())
+    report.missing_neg_carriers.sort_unstable();
+    report.missing_neg_carriers.dedup();
+
+    Ok(report)
 }
 
 pub fn build_inst_relate_aabb_rows(
@@ -1693,81 +1748,202 @@ async fn query_existing_tubi_info_ids(ids: &[String]) -> anyhow::Result<HashSet<
 ///
 /// 此函数在所有阶段（LOOP/CATE/PRIM）完成后、布尔运算前调用，
 /// 从 DB 查询已有的 Neg/CataNeg geo_relate 并补建缺失的 neg_relate。
-pub async fn reconcile_missing_neg_relate(all_refnos: &[RefnoEnum]) -> anyhow::Result<usize> {
+pub async fn reconcile_missing_neg_relate(
+    all_refnos: &[RefnoEnum],
+    candidate_carriers: &[RefnoEnum],
+) -> anyhow::Result<usize> {
     if all_refnos.is_empty() {
         return Ok(0);
     }
-
-    let refno_set: HashSet<RefnoEnum> = all_refnos.iter().copied().collect();
-
-    // 1. 查询当前 batch 中所有 Neg/CataNeg 类型 geo_relate，及其负载体的父元素
-    let pe_list = all_refnos
-        .iter()
-        .map(|r| r.to_pe_key())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        r#"SELECT
-            record::id(id) as gr_id,
-            record::id(geom_refno) as neg_carrier,
-            record::id(geom_refno.owner) as parent_id
-        FROM geo_relate
-        WHERE geo_type IN ['Neg', 'CataNeg']
-          AND geom_refno IN [{pe_list}]"#
-    );
-    let mut response = model_primary_db().query_response(&sql).await?;
-    let neg_geos: Vec<serde_json::Value> = response.take(0)?;
-    if neg_geos.is_empty() {
+    if candidate_carriers.is_empty() {
+        println!(
+            "[reconcile] skip missing neg reconcile: all_refnos={} candidate_carriers=0",
+            all_refnos.len()
+        );
         return Ok(0);
     }
 
-    // 2. 提取信息并检查已存在的 neg_relate
+    let reconcile_started = std::time::Instant::now();
+    let refno_set: HashSet<RefnoEnum> = all_refnos.iter().copied().collect();
+    let candidate_carriers = candidate_carriers
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    // 嵌入式 SurrealDB 在超长 IN 列表 / relation 遍历上容易出现长时间静默等待。
+    // 这里保守降低 chunk，并补进度日志，便于定位到底卡在 query/check/insert 哪一段。
+    const QUERY_CHUNK_SIZE: usize = 200;
+    const CHECK_CHUNK_SIZE: usize = 200;
+    const INSERT_CHUNK_SIZE: usize = 200;
+
     struct NegGeoInfo {
         gr_id: String,
         neg_carrier: String,
         parent_id: String,
     }
-    let mut infos: Vec<NegGeoInfo> = Vec::new();
-    for val in &neg_geos {
-        let gr_id = val
-            .get("gr_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let neg_carrier = val
-            .get("neg_carrier")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let parent_id = val
-            .get("parent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        if gr_id.is_empty() || neg_carrier.is_empty() || parent_id.is_empty() {
-            continue;
+    struct NegGeoCandidate {
+        gr_id: String,
+        neg_carrier: String,
+    }
+    let mut candidates: Vec<NegGeoCandidate> = Vec::new();
+
+    // 1. 分块查询当前 batch 中所有 Neg/CataNeg 类型 geo_relate，避免超长 IN 列表拖垮 Surreal 解析。
+    //    这里先只取 gr_id + neg_carrier，避免在“零命中 chunk”上提前求值 geom_refno.owner。
+    let query_start = std::time::Instant::now();
+    let total_query_chunks = candidate_carriers.len().div_ceil(QUERY_CHUNK_SIZE);
+    println!(
+        "[reconcile] start all_refnos={} candidate_carriers={} query_chunk_size={} check_chunk_size={} insert_chunk_size={}",
+        all_refnos.len(),
+        candidate_carriers.len(),
+        QUERY_CHUNK_SIZE,
+        CHECK_CHUNK_SIZE,
+        INSERT_CHUNK_SIZE
+    );
+    for (chunk_idx, refno_chunk) in candidate_carriers.chunks(QUERY_CHUNK_SIZE).enumerate() {
+        let pe_list = refno_chunk
+            .iter()
+            .map(|r| r.to_pe_key())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            r#"SELECT
+                record::id(id) as gr_id,
+                record::id(geom_refno) as neg_carrier
+            FROM geo_relate
+            WHERE geo_type IN ['Neg', 'CataNeg']
+              AND geom_refno IN [{pe_list}]"#
+        );
+        let mut response = model_primary_db().query_response(&sql).await?;
+        let neg_geos: Vec<serde_json::Value> = response.take(0)?;
+        for val in &neg_geos {
+            let gr_id = val
+                .get("gr_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let neg_carrier = val
+                .get("neg_carrier")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if gr_id.is_empty() || neg_carrier.is_empty() {
+                continue;
+            }
+            candidates.push(NegGeoCandidate { gr_id, neg_carrier });
         }
+        if chunk_idx == 0 || (chunk_idx + 1) % 50 == 0 || chunk_idx + 1 == total_query_chunks {
+            println!(
+                "[reconcile] query chunk {}/{} candidates_so_far={} elapsed_ms={}",
+                chunk_idx + 1,
+                total_query_chunks,
+                candidates.len(),
+                query_start.elapsed().as_millis()
+            );
+        }
+    }
+    if candidates.is_empty() {
+        println!(
+            "[reconcile] no neg geo candidates found query_ms={} total_ms={}",
+            query_start.elapsed().as_millis(),
+            reconcile_started.elapsed().as_millis()
+        );
+        return Ok(0);
+    }
+
+    // 2. 仅对已命中的 neg carrier 点查 owner，避免在全量扫描阶段做昂贵表达式求值。
+    let parent_lookup_start = std::time::Instant::now();
+    let unique_carriers: Vec<String> = candidates
+        .iter()
+        .map(|info| format!("pe:⟨{}⟩", info.neg_carrier))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let total_parent_chunks = unique_carriers.len().div_ceil(CHECK_CHUNK_SIZE);
+    let mut parent_by_carrier: HashMap<String, String> = HashMap::new();
+    for (chunk_idx, carrier_chunk) in unique_carriers.chunks(CHECK_CHUNK_SIZE).enumerate() {
+        let sql = format!(
+            "SELECT record::id(id) as carrier_id, record::id(owner) as parent_id FROM [{}];",
+            carrier_chunk.join(",")
+        );
+        let mut response = model_primary_db().query_response(&sql).await?;
+        let rows: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
+        for row in rows {
+            let carrier_id = row
+                .get("carrier_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let parent_id = row
+                .get("parent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if carrier_id.is_empty() || parent_id.is_empty() {
+                continue;
+            }
+            parent_by_carrier.insert(carrier_id, parent_id);
+        }
+        if chunk_idx == 0 || (chunk_idx + 1) % 50 == 0 || chunk_idx + 1 == total_parent_chunks {
+            println!(
+                "[reconcile] parent-lookup chunk {}/{} resolved_so_far={} elapsed_ms={}",
+                chunk_idx + 1,
+                total_parent_chunks,
+                parent_by_carrier.len(),
+                parent_lookup_start.elapsed().as_millis()
+            );
+        }
+    }
+
+    let mut infos: Vec<NegGeoInfo> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let carrier_id = format!("pe:⟨{}⟩", candidate.neg_carrier);
+        let Some(parent_id) = parent_by_carrier.get(&carrier_id).cloned() else {
+            continue;
+        };
         infos.push(NegGeoInfo {
-            gr_id,
-            neg_carrier,
+            gr_id: candidate.gr_id,
+            neg_carrier: candidate.neg_carrier,
             parent_id,
         });
     }
     if infos.is_empty() {
+        println!(
+            "[reconcile] no carrier parent found candidates={} query_ms={} parent_lookup_ms={} total_ms={}",
+            parent_by_carrier.len(),
+            query_start.elapsed().as_millis(),
+            parent_lookup_start.elapsed().as_millis(),
+            reconcile_started.elapsed().as_millis()
+        );
         return Ok(0);
     }
 
-    let gr_id_list = infos
-        .iter()
-        .map(|r| format!("geo_relate:⟨{}⟩", r.gr_id))
-        .collect::<Vec<_>>()
-        .join(",");
-    let check_sql = format!("SELECT VALUE record::id(in) FROM [{gr_id_list}]->neg_relate");
-    let mut check_resp = model_primary_db().query_response(&check_sql).await?;
-    let existing_vec: Vec<String> = check_resp.take(0).unwrap_or_default();
-    let existing: HashSet<String> = existing_vec.into_iter().collect();
+    // 3. 分块检查已存在的 neg_relate，避免超长 geo_relate id 列表
+    let existing_check_start = std::time::Instant::now();
+    let mut existing: HashSet<String> = HashSet::new();
+    let total_check_chunks = infos.len().div_ceil(CHECK_CHUNK_SIZE);
+    for (chunk_idx, info_chunk) in infos.chunks(CHECK_CHUNK_SIZE).enumerate() {
+        let gr_id_list = info_chunk
+            .iter()
+            .map(|r| format!("geo_relate:⟨{}⟩", r.gr_id))
+            .collect::<Vec<_>>()
+            .join(",");
+        let check_sql = format!("SELECT VALUE record::id(in) FROM [{gr_id_list}]->neg_relate");
+        let mut check_resp = model_primary_db().query_response(&check_sql).await?;
+        let existing_vec: Vec<String> = check_resp.take(0).unwrap_or_default();
+        existing.extend(existing_vec);
+        if chunk_idx == 0 || (chunk_idx + 1) % 50 == 0 || chunk_idx + 1 == total_check_chunks {
+            println!(
+                "[reconcile] existing-check chunk {}/{} existing_so_far={} elapsed_ms={}",
+                chunk_idx + 1,
+                total_check_chunks,
+                existing.len(),
+                existing_check_start.elapsed().as_millis()
+            );
+        }
+    }
 
-    // 3. 创建缺失的 neg_relate
+    // 4. 创建缺失的 neg_relate
     let mut neg_buffer: Vec<String> = Vec::new();
     for info in &infos {
         if existing.contains(&info.gr_id) {
@@ -1789,15 +1965,45 @@ pub async fn reconcile_missing_neg_relate(all_refnos: &[RefnoEnum]) -> anyhow::R
     }
 
     let created = neg_buffer.len();
-    if !neg_buffer.is_empty() {
-        let sql = format!(
-            "INSERT RELATION IGNORE INTO neg_relate [{}];",
-            neg_buffer.join(",")
-        );
-        model_query_response(&sql).await?;
+    if neg_buffer.is_empty() {
         println!(
-            "[reconcile] 补建 {} 条 neg_relate（跨阶段负实体关系）",
-            created
+            "[reconcile] no missing neg_relate to insert infos={} existing={} query_ms={} parent_lookup_ms={} existing_check_ms={} total_ms={}",
+            infos.len(),
+            existing.len(),
+            query_start.elapsed().as_millis(),
+            parent_lookup_start.elapsed().as_millis(),
+            existing_check_start.elapsed().as_millis(),
+            reconcile_started.elapsed().as_millis()
+        );
+    } else {
+        let insert_start = std::time::Instant::now();
+        let total_insert_chunks = neg_buffer.len().div_ceil(INSERT_CHUNK_SIZE);
+        for (chunk_idx, relation_chunk) in neg_buffer.chunks(INSERT_CHUNK_SIZE).enumerate() {
+            let sql = format!(
+                "INSERT RELATION IGNORE INTO neg_relate [{}];",
+                relation_chunk.join(",")
+            );
+            model_query_response(&sql).await?;
+            if chunk_idx == 0 || (chunk_idx + 1) % 50 == 0 || chunk_idx + 1 == total_insert_chunks {
+                println!(
+                    "[reconcile] insert chunk {}/{} created_so_far={} elapsed_ms={}",
+                    chunk_idx + 1,
+                    total_insert_chunks,
+                    ((chunk_idx + 1) * INSERT_CHUNK_SIZE).min(created),
+                    insert_start.elapsed().as_millis()
+                );
+            }
+        }
+        println!(
+            "[reconcile] 补建 {} 条 neg_relate（跨阶段负实体关系） infos={} existing={} query_ms={} parent_lookup_ms={} existing_check_ms={} insert_ms={} total_ms={}",
+            created,
+            infos.len(),
+            existing.len(),
+            query_start.elapsed().as_millis(),
+            parent_lookup_start.elapsed().as_millis(),
+            existing_check_start.elapsed().as_millis(),
+            insert_start.elapsed().as_millis(),
+            reconcile_started.elapsed().as_millis()
         );
     }
 
@@ -2111,6 +2317,14 @@ pub async fn save_instance_data_to_sql_file(
             );
             let relate_id = gen_string_hash(&relate_json);
             geo_relate_buffer.push(format!("{{ {relate_json}, id: '{relate_id}' }}"));
+            if let Some(batch) = refno_assoc_batch.as_mut() {
+                batch.add_inst_info_id(
+                    inst_geo_data.refno,
+                    format!("inst_info:⟨{}⟩", inst_geo_data.id()),
+                );
+                batch.add_geo_relate_id(inst_geo_data.refno, format!("geo_relate:⟨{}⟩", relate_id));
+                batch.add_geo_hash(inst_geo_data.refno, inst.geo_hash.to_string());
+            }
 
             use aios_core::geometry::GeoBasicType;
             let carrier_refno = inst_geo_data.refno;
@@ -2355,6 +2569,14 @@ pub async fn save_instance_data_to_sql_file(
                 inst_relate_buffer.join(",")
             ))?;
             inst_relate_buffer.clear();
+        }
+    }
+
+    if !inst_mgr.inst_tubi_map.is_empty() {
+        for (_key, info) in &inst_mgr.inst_tubi_map {
+            if let Some(batch) = refno_assoc_batch.as_mut() {
+                batch.add_tubi_branch_key(info.refno, info.refno.to_pe_key());
+            }
         }
     }
 

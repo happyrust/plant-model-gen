@@ -26,7 +26,8 @@ use crate::fast_model::mesh_generate::{
     MeshResult, query_existing_meshed_inst_geo_ids, run_boolean_worker,
 };
 use crate::fast_model::pdms_inst::{
-    build_inst_relate_aabb_rows, save_inst_relate_aabb_rows, save_instance_data_with_options,
+    build_inst_relate_aabb_rows, reconcile_missing_neg_relate, save_inst_relate_aabb_rows,
+    save_instance_data_with_report,
 };
 use crate::options::{BooleanPipelineMode, DbOptionExt, MeshFormat};
 use dashmap::DashMap;
@@ -293,10 +294,30 @@ struct InsertHandleReport {
 struct PipelineBatch {
     batch_id: u64,
     shape_insts: Arc<aios_core::geometry::ShapeInstancesData>,
+    batch_started_at: Instant,
 }
 
 #[derive(Debug, Clone)]
 struct BatchMeshOutput {
+    batch_id: u64,
+    shape_insts: Arc<aios_core::geometry::ShapeInstancesData>,
+    mesh_results: HashMap<u64, MeshResult>,
+    mesh_task_count: usize,
+    mesh_cache_hits: usize,
+    mesh_new_generated: usize,
+    mesh_ms: u128,
+    mesh_wait_ms: u128,
+    batch_started_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BaseWriteMetrics {
+    base_wait_ms: u128,
+    base_write_ms: u128,
+}
+
+#[derive(Debug, Clone)]
+struct JoinedBatchOutput {
     batch_id: u64,
     shape_insts: Arc<aios_core::geometry::ShapeInstancesData>,
     mesh_results: HashMap<u64, MeshResult>,
@@ -308,6 +329,67 @@ struct BatchMeshOutput {
     mesh_ms: u128,
     mesh_wait_ms: u128,
     batch_started_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct BatchStageJoiner {
+    pending_mesh_outputs: HashMap<u64, BatchMeshOutput>,
+    pending_base_metrics: HashMap<u64, BaseWriteMetrics>,
+}
+
+impl BatchStageJoiner {
+    fn push_mesh_output(&mut self, batch: BatchMeshOutput) -> Option<JoinedBatchOutput> {
+        let batch_id = batch.batch_id;
+        if let Some(base_metrics) = self.pending_base_metrics.remove(&batch_id) {
+            return Some(Self::join_batch(batch, base_metrics));
+        }
+        self.pending_mesh_outputs.insert(batch_id, batch);
+        None
+    }
+
+    fn push_base_metrics(
+        &mut self,
+        batch_id: u64,
+        base_wait_ms: u128,
+        base_write_ms: u128,
+    ) -> Option<JoinedBatchOutput> {
+        let base_metrics = BaseWriteMetrics {
+            base_wait_ms,
+            base_write_ms,
+        };
+        if let Some(batch) = self.pending_mesh_outputs.remove(&batch_id) {
+            return Some(Self::join_batch(batch, base_metrics));
+        }
+        self.pending_base_metrics.insert(batch_id, base_metrics);
+        None
+    }
+
+    fn join_batch(batch: BatchMeshOutput, base_metrics: BaseWriteMetrics) -> JoinedBatchOutput {
+        JoinedBatchOutput {
+            batch_id: batch.batch_id,
+            shape_insts: batch.shape_insts,
+            mesh_results: batch.mesh_results,
+            mesh_task_count: batch.mesh_task_count,
+            mesh_cache_hits: batch.mesh_cache_hits,
+            mesh_new_generated: batch.mesh_new_generated,
+            base_write_ms: base_metrics.base_write_ms,
+            base_wait_ms: base_metrics.base_wait_ms,
+            mesh_ms: batch.mesh_ms,
+            mesh_wait_ms: batch.mesh_wait_ms,
+            batch_started_at: batch.batch_started_at,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending_mesh_outputs.is_empty() && self.pending_base_metrics.is_empty()
+    }
+
+    fn pending_counts(&self) -> (usize, usize) {
+        (
+            self.pending_mesh_outputs.len(),
+            self.pending_base_metrics.len(),
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -350,6 +432,7 @@ async fn run_batch_sink(
         let batch = PipelineBatch {
             batch_id: batch_cnt,
             shape_insts: Arc::new(shape_insts),
+            batch_started_at: Instant::now(),
         };
 
         {
@@ -363,8 +446,29 @@ async fn run_batch_sink(
         }
 
         bool_accumulator.merge_batch(&batch.shape_insts);
+        let base_send_start = Instant::now();
         base_writer_sender.send_async(batch.clone()).await?;
-        mesh_stage_sender.send_async(batch).await?;
+        let base_send_wait_ms = base_send_start.elapsed().as_millis();
+        if base_send_wait_ms > 0 {
+            println!(
+                "[batch_stage] batch={} stage=sink target=base_writer send_wait_ms={} inst_cnt={}",
+                batch.batch_id,
+                base_send_wait_ms,
+                batch.shape_insts.inst_cnt()
+            );
+        }
+
+        let mesh_send_start = Instant::now();
+        mesh_stage_sender.send_async(batch.clone()).await?;
+        let mesh_send_wait_ms = mesh_send_start.elapsed().as_millis();
+        if mesh_send_wait_ms > 0 {
+            println!(
+                "[batch_stage] batch={} stage=sink target=mesh_stage send_wait_ms={} inst_cnt={}",
+                batch.batch_id,
+                mesh_send_wait_ms,
+                batch.shape_insts.inst_cnt()
+            );
+        }
     }
 
     drop(base_writer_sender);
@@ -382,16 +486,18 @@ async fn run_base_writer(
     replace_exist: bool,
     base_write_semaphore: Arc<Semaphore>,
     mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
+    missing_neg_carriers: Arc<std::sync::Mutex<HashSet<RefnoEnum>>>,
 ) -> anyhow::Result<()> {
     let mut handles = Vec::new();
     while let Ok(batch) = receiver.recv_async().await {
         let semaphore = base_write_semaphore.clone();
         let mesh_aabb_map = mesh_aabb_map.clone();
         let result_sender = result_sender.clone();
+        let missing_neg_carriers = missing_neg_carriers.clone();
         handles.push(tokio::spawn(async move {
             let (permit, wait_ms) = acquire_with_wait(semaphore).await?;
             let base_start = Instant::now();
-            save_instance_data_with_options(
+            let save_report = save_instance_data_with_report(
                 &batch.shape_insts,
                 replace_exist,
                 &HashMap::new(),
@@ -399,11 +505,18 @@ async fn run_base_writer(
                 false,
             )
             .await?;
+            if !save_report.missing_neg_carriers.is_empty() {
+                let mut guard = missing_neg_carriers.lock().unwrap();
+                guard.extend(save_report.missing_neg_carriers.iter().copied());
+            }
             let base_ms = base_start.elapsed().as_millis();
             drop(permit);
             println!(
-                "[batch_stage] batch={} stage=base wait_ms={} base_write_ms={}",
-                batch.batch_id, wait_ms, base_ms
+                "[batch_stage] batch={} stage=base wait_ms={} base_write_ms={} missing_neg_candidates={}",
+                batch.batch_id,
+                wait_ms,
+                base_ms,
+                save_report.missing_neg_carriers.len()
             );
             result_sender
                 .send_async((batch.batch_id, wait_ms, base_ms))
@@ -422,7 +535,6 @@ async fn run_base_writer(
 async fn run_mesh_stage(
     receiver: Receiver<PipelineBatch>,
     output_sender: Sender<BatchMeshOutput>,
-    base_result_receiver: Receiver<(u64, u128, u128)>,
     mesh_compute_semaphore: Arc<Semaphore>,
     db_option: DbOptionExt,
     replace_exist: bool,
@@ -430,41 +542,25 @@ async fn run_mesh_stage(
     mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
     mesh_pts_map: Arc<DashMap<u64, String>>,
 ) -> anyhow::Result<()> {
-    let deduper = Arc::new(tokio::sync::Mutex::new(
-        crate::fast_model::mesh_generate::RecentGeoDeduper::new(200_000),
+    let deduper = Arc::new(crate::fast_model::mesh_generate::RecentGeoDeduper::new(
+        200_000,
     ));
     if gen_mesh && !replace_exist {
         crate::fast_model::preload_mesh_cache();
         let ids = query_existing_meshed_inst_geo_ids();
         let count = ids.len();
-        {
-            let mut deduper_guard = deduper.lock().await;
-            deduper_guard.preload(ids);
-            println!(
-                "[mesh_pipeline] 预加载 {} 个已 meshed inst_geo ID 到去重器 (capacity={})",
-                count, deduper_guard.capacity
-            );
-        }
+        deduper.preload(ids);
+        println!(
+            "[mesh_pipeline] 预加载 {} 个已 meshed inst_geo ID 到去重器 (size={})",
+            count,
+            deduper.len()
+        );
     } else if gen_mesh {
         println!("[mesh_pipeline] replace_exist 模式，跳过去重器预加载，强制重新生成 mesh");
     }
 
     let mut handles = Vec::new();
-    let mut base_metrics = HashMap::new();
     while let Ok(batch) = receiver.recv_async().await {
-        let (base_wait_ms, base_write_ms) =
-            if let Some(metrics) = base_metrics.remove(&batch.batch_id) {
-                metrics
-            } else {
-                loop {
-                    let (result_batch_id, wait_ms, write_ms) =
-                        base_result_receiver.recv_async().await?;
-                    if result_batch_id == batch.batch_id {
-                        break (wait_ms, write_ms);
-                    }
-                    base_metrics.insert(result_batch_id, (wait_ms, write_ms));
-                }
-            };
         let semaphore = mesh_compute_semaphore.clone();
         let deduper = deduper.clone();
         let mesh_aabb_map = mesh_aabb_map.clone();
@@ -472,7 +568,6 @@ async fn run_mesh_stage(
         let output_sender = output_sender.clone();
         let db_option_inner = db_option.inner.clone();
         handles.push(tokio::spawn(async move {
-            let batch_started_at = Instant::now();
             let (permit, wait_ms) = acquire_with_wait(semaphore).await?;
             let mesh_start = Instant::now();
             let tasks = crate::fast_model::mesh_generate::extract_mesh_tasks(&batch.shape_insts);
@@ -483,11 +578,10 @@ async fn run_mesh_stage(
             let mut mesh_new_generated = 0usize;
 
             if gen_mesh && !tasks.is_empty() {
-                let mut deduper_guard = deduper.lock().await;
                 mesh_results = crate::fast_model::mesh_generate::generate_meshes_for_batch(
                     &tasks,
                     &db_option_inner,
-                    &mut deduper_guard,
+                    &deduper,
                     &mesh_aabb_map,
                     &mesh_pts_map,
                 )
@@ -506,6 +600,7 @@ async fn run_mesh_stage(
                 batch.batch_id, wait_ms, mesh_ms, mesh_task_count, mesh_cache_hits, mesh_new_generated
             );
 
+            let output_send_start = Instant::now();
             output_sender
                 .send_async(BatchMeshOutput {
                     batch_id: batch.batch_id,
@@ -514,13 +609,18 @@ async fn run_mesh_stage(
                     mesh_task_count,
                     mesh_cache_hits,
                     mesh_new_generated,
-                    base_write_ms,
-                    base_wait_ms,
                     mesh_ms,
                     mesh_wait_ms: wait_ms,
-                    batch_started_at,
+                    batch_started_at: batch.batch_started_at,
                 })
                 .await?;
+            let output_send_wait_ms = output_send_start.elapsed().as_millis();
+            if output_send_wait_ms > 0 {
+                println!(
+                    "[batch_stage] batch={} stage=mesh_output send_wait_ms={}",
+                    batch.batch_id, output_send_wait_ms
+                );
+            }
             Ok::<(), anyhow::Error>(())
         }));
     }
@@ -534,6 +634,7 @@ async fn run_mesh_stage(
 
 async fn run_inst_aabb_writer(
     receiver: Receiver<BatchMeshOutput>,
+    base_result_receiver: Receiver<(u64, u128, u128)>,
     completion_sender: Sender<BatchCompletion>,
     inst_aabb_semaphore: Arc<Semaphore>,
     mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
@@ -541,62 +642,165 @@ async fn run_inst_aabb_writer(
 ) -> anyhow::Result<()> {
     let skip_inst_relate_aabb = std::env::var_os("AIOS_SKIP_INST_RELATE_AABB").is_some();
     let mut handles = Vec::new();
-    while let Ok(batch) = receiver.recv_async().await {
-        let inst_aabb_semaphore = inst_aabb_semaphore.clone();
-        let mesh_aabb_map = mesh_aabb_map.clone();
-        let mesh_pts_map = mesh_pts_map.clone();
-        let completion_sender = completion_sender.clone();
-        let skip_inst_relate_aabb = skip_inst_relate_aabb;
-        handles.push(tokio::spawn(async move {
-            let (aabb_permit, inst_aabb_wait_ms) = acquire_with_wait(inst_aabb_semaphore).await?;
-            let inst_aabb_start = Instant::now();
-            persist_inst_geo_mesh_results(&batch.mesh_results, &mesh_aabb_map, &mesh_pts_map).await?;
-            if skip_inst_relate_aabb {
-                println!(
-                    "[batch_stage] batch={} stage=inst_aabb skipped=inst_relate_aabb env=AIOS_SKIP_INST_RELATE_AABB",
-                    batch.batch_id
-                );
-            } else {
-                let (aabb_rows_map, inst_relate_aabb_rows) =
-                    build_inst_relate_aabb_rows(&batch.shape_insts, &batch.mesh_results, &mesh_aabb_map)?;
-                save_inst_relate_aabb_rows(&aabb_rows_map, &inst_relate_aabb_rows).await?;
+    let mut joiner = BatchStageJoiner::default();
+    let mut mesh_closed = false;
+    let mut base_closed = false;
+
+    while !mesh_closed || !base_closed {
+        tokio::select! {
+            mesh_result = receiver.recv_async(), if !mesh_closed => {
+                match mesh_result {
+                    Ok(batch) => {
+                        let batch_id = batch.batch_id;
+                        if let Some(batch) = joiner.push_mesh_output(batch) {
+                            let inst_aabb_semaphore = inst_aabb_semaphore.clone();
+                            let mesh_aabb_map = mesh_aabb_map.clone();
+                            let mesh_pts_map = mesh_pts_map.clone();
+                            let completion_sender = completion_sender.clone();
+                            let skip_inst_relate_aabb = skip_inst_relate_aabb;
+                            handles.push(tokio::spawn(async move {
+                                let (aabb_permit, inst_aabb_wait_ms) = acquire_with_wait(inst_aabb_semaphore).await?;
+                                let inst_aabb_start = Instant::now();
+                                persist_inst_geo_mesh_results(&batch.mesh_results, &mesh_aabb_map, &mesh_pts_map).await?;
+                                if skip_inst_relate_aabb {
+                                    println!(
+                                        "[batch_stage] batch={} stage=inst_aabb skipped=inst_relate_aabb env=AIOS_SKIP_INST_RELATE_AABB",
+                                        batch.batch_id
+                                    );
+                                } else {
+                                    let (aabb_rows_map, inst_relate_aabb_rows) =
+                                        build_inst_relate_aabb_rows(&batch.shape_insts, &batch.mesh_results, &mesh_aabb_map)?;
+                                    save_inst_relate_aabb_rows(&aabb_rows_map, &inst_relate_aabb_rows).await?;
+                                }
+                                let inst_aabb_ms = inst_aabb_start.elapsed().as_millis();
+                                drop(aabb_permit);
+
+                                let total_ms = batch.batch_started_at.elapsed().as_millis();
+                                println!(
+                                    "[batch_perf] batch={} base_wait_ms={} base_write_ms={} mesh_wait_ms={} mesh_ms={} inst_aabb_wait_ms={} inst_aabb_ms={} total_ms={} mesh_cache_hit={} mesh_new_generated={} mesh_tasks={}",
+                                    batch.batch_id,
+                                    batch.base_wait_ms,
+                                    batch.base_write_ms,
+                                    batch.mesh_wait_ms,
+                                    batch.mesh_ms,
+                                    inst_aabb_wait_ms,
+                                    inst_aabb_ms,
+                                    total_ms,
+                                    batch.mesh_cache_hits,
+                                    batch.mesh_new_generated,
+                                    batch.mesh_task_count
+                                );
+
+                                completion_sender
+                                    .send_async(BatchCompletion {
+                                        batch_id: batch.batch_id,
+                                        mesh_task_count: batch.mesh_task_count,
+                                        mesh_cache_hits: batch.mesh_cache_hits,
+                                        mesh_new_generated: batch.mesh_new_generated,
+                                        base_write_ms: batch.base_write_ms,
+                                        base_wait_ms: batch.base_wait_ms,
+                                        mesh_ms: batch.mesh_ms,
+                                        mesh_wait_ms: batch.mesh_wait_ms,
+                                        inst_aabb_ms,
+                                        inst_aabb_wait_ms,
+                                        total_ms,
+                                    })
+                                    .await?;
+                                Ok::<(), anyhow::Error>(())
+                            }));
+                        } else {
+                            println!(
+                                "[batch_stage] batch={} stage=join waiting=base_result",
+                                batch_id
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        mesh_closed = true;
+                    }
+                }
             }
-            let inst_aabb_ms = inst_aabb_start.elapsed().as_millis();
-            drop(aabb_permit);
+            base_result = base_result_receiver.recv_async(), if !base_closed => {
+                match base_result {
+                    Ok((batch_id, base_wait_ms, base_write_ms)) => {
+                        if let Some(batch) = joiner.push_base_metrics(batch_id, base_wait_ms, base_write_ms) {
+                            let inst_aabb_semaphore = inst_aabb_semaphore.clone();
+                            let mesh_aabb_map = mesh_aabb_map.clone();
+                            let mesh_pts_map = mesh_pts_map.clone();
+                            let completion_sender = completion_sender.clone();
+                            let skip_inst_relate_aabb = skip_inst_relate_aabb;
+                            handles.push(tokio::spawn(async move {
+                                let (aabb_permit, inst_aabb_wait_ms) = acquire_with_wait(inst_aabb_semaphore).await?;
+                                let inst_aabb_start = Instant::now();
+                                persist_inst_geo_mesh_results(&batch.mesh_results, &mesh_aabb_map, &mesh_pts_map).await?;
+                                if skip_inst_relate_aabb {
+                                    println!(
+                                        "[batch_stage] batch={} stage=inst_aabb skipped=inst_relate_aabb env=AIOS_SKIP_INST_RELATE_AABB",
+                                        batch.batch_id
+                                    );
+                                } else {
+                                    let (aabb_rows_map, inst_relate_aabb_rows) =
+                                        build_inst_relate_aabb_rows(&batch.shape_insts, &batch.mesh_results, &mesh_aabb_map)?;
+                                    save_inst_relate_aabb_rows(&aabb_rows_map, &inst_relate_aabb_rows).await?;
+                                }
+                                let inst_aabb_ms = inst_aabb_start.elapsed().as_millis();
+                                drop(aabb_permit);
 
-            let total_ms = batch.batch_started_at.elapsed().as_millis();
-            println!(
-                "[batch_perf] batch={} base_wait_ms={} base_write_ms={} mesh_wait_ms={} mesh_ms={} inst_aabb_wait_ms={} inst_aabb_ms={} total_ms={} mesh_cache_hit={} mesh_new_generated={} mesh_tasks={}",
-                batch.batch_id,
-                batch.base_wait_ms,
-                batch.base_write_ms,
-                batch.mesh_wait_ms,
-                batch.mesh_ms,
-                inst_aabb_wait_ms,
-                inst_aabb_ms,
-                total_ms,
-                batch.mesh_cache_hits,
-                batch.mesh_new_generated,
-                batch.mesh_task_count
-            );
+                                let total_ms = batch.batch_started_at.elapsed().as_millis();
+                                println!(
+                                    "[batch_perf] batch={} base_wait_ms={} base_write_ms={} mesh_wait_ms={} mesh_ms={} inst_aabb_wait_ms={} inst_aabb_ms={} total_ms={} mesh_cache_hit={} mesh_new_generated={} mesh_tasks={}",
+                                    batch.batch_id,
+                                    batch.base_wait_ms,
+                                    batch.base_write_ms,
+                                    batch.mesh_wait_ms,
+                                    batch.mesh_ms,
+                                    inst_aabb_wait_ms,
+                                    inst_aabb_ms,
+                                    total_ms,
+                                    batch.mesh_cache_hits,
+                                    batch.mesh_new_generated,
+                                    batch.mesh_task_count
+                                );
 
-            completion_sender
-                .send_async(BatchCompletion {
-                    batch_id: batch.batch_id,
-                    mesh_task_count: batch.mesh_task_count,
-                    mesh_cache_hits: batch.mesh_cache_hits,
-                    mesh_new_generated: batch.mesh_new_generated,
-                    base_write_ms: batch.base_write_ms,
-                    base_wait_ms: batch.base_wait_ms,
-                    mesh_ms: batch.mesh_ms,
-                    mesh_wait_ms: batch.mesh_wait_ms,
-                    inst_aabb_ms,
-                    inst_aabb_wait_ms,
-                    total_ms,
-                })
-                .await?;
-            Ok::<(), anyhow::Error>(())
-        }));
+                                completion_sender
+                                    .send_async(BatchCompletion {
+                                        batch_id: batch.batch_id,
+                                        mesh_task_count: batch.mesh_task_count,
+                                        mesh_cache_hits: batch.mesh_cache_hits,
+                                        mesh_new_generated: batch.mesh_new_generated,
+                                        base_write_ms: batch.base_write_ms,
+                                        base_wait_ms: batch.base_wait_ms,
+                                        mesh_ms: batch.mesh_ms,
+                                        mesh_wait_ms: batch.mesh_wait_ms,
+                                        inst_aabb_ms,
+                                        inst_aabb_wait_ms,
+                                        total_ms,
+                                    })
+                                    .await?;
+                                Ok::<(), anyhow::Error>(())
+                            }));
+                        } else {
+                            println!(
+                                "[batch_stage] batch={} stage=join waiting=mesh_output",
+                                batch_id
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        base_closed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !joiner.is_empty() {
+        let (pending_mesh, pending_base) = joiner.pending_counts();
+        return Err(anyhow::anyhow!(
+            "batch stage join 未收敛: pending_mesh_outputs={}, pending_base_metrics={}",
+            pending_mesh,
+            pending_base
+        ));
     }
 
     for handle in handles {
@@ -923,7 +1127,7 @@ async fn process_index_tree_generation(
     let use_surrealdb = db_option.use_surrealdb;
     let defer_db_write = false;
 
-    // Mesh 生成：内联模式，每批次先生成 mesh 再写 DB，消除 UPDATE 竞态
+    // Mesh 生成：生产端只产出 inst batch，mesh/持久化在下游并行阶段完成
     let gen_mesh = db_option.inner.gen_mesh;
 
     // 初始化 Parquet 写入器（默认关闭，通过环境变量显式开启）。
@@ -1002,6 +1206,8 @@ async fn process_index_tree_generation(
     let mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>> =
         Arc::new(DashMap::new());
     let mesh_pts_map: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+    let missing_neg_carriers_for_reconcile: Arc<std::sync::Mutex<HashSet<RefnoEnum>>> =
+        Arc::new(std::sync::Mutex::new(HashSet::new()));
     let base_write_semaphore = Arc::new(Semaphore::new(db_option.get_base_write_concurrency()));
     let mesh_compute_semaphore = Arc::new(Semaphore::new(db_option.get_mesh_compute_concurrency()));
     let inst_aabb_semaphore = Arc::new(Semaphore::new(db_option.get_inst_aabb_write_concurrency()));
@@ -1013,8 +1219,10 @@ async fn process_index_tree_generation(
         flume::bounded::<PipelineBatch>(db_option.get_batch_channel_capacity());
     let (mesh_output_sender, mesh_output_receiver) =
         flume::bounded::<BatchMeshOutput>(db_option.get_batch_channel_capacity());
-    let (completion_sender, completion_receiver) =
-        flume::bounded::<BatchCompletion>(db_option.get_batch_channel_capacity());
+    // completion 仅用于主线程汇总 batch 统计，不参与生产侧背压。
+    // 若这里使用有界通道，run_inst_aabb_writer 内部任务会在 send_async(completion)
+    // 上卡住，而主线程又要等 inst_aabb_handle 退出后才开始 recv，形成尾部自锁。
+    let (completion_sender, completion_receiver) = flume::unbounded::<BatchCompletion>();
 
     let sink_handle = tokio::spawn(run_batch_sink(
         receiver,
@@ -1028,11 +1236,11 @@ async fn process_index_tree_generation(
         replace_exist,
         base_write_semaphore.clone(),
         mesh_aabb_map.clone(),
+        missing_neg_carriers_for_reconcile.clone(),
     ));
     let mesh_stage_handle = tokio::spawn(run_mesh_stage(
         mesh_stage_receiver,
         mesh_output_sender,
-        base_result_receiver,
         mesh_compute_semaphore,
         db_option.clone(),
         replace_exist,
@@ -1042,6 +1250,7 @@ async fn process_index_tree_generation(
     ));
     let inst_aabb_handle = tokio::spawn(run_inst_aabb_writer(
         mesh_output_receiver,
+        base_result_receiver,
         completion_sender,
         inst_aabb_semaphore,
         mesh_aabb_map.clone(),
@@ -1090,10 +1299,20 @@ async fn process_index_tree_generation(
         total_mesh_cache_hits += completion.mesh_cache_hits;
         total_mesh_new_generated += completion.mesh_new_generated;
     }
+    let missing_neg_carriers = {
+        let guard = missing_neg_carriers_for_reconcile.lock().unwrap();
+        let mut carriers = guard.iter().copied().collect::<Vec<_>>();
+        carriers.sort_unstable();
+        carriers
+    };
     let barrier_wait_ms = barrier_wait_start.elapsed().as_millis();
     println!(
-        "[gen_model] batch barrier complete: batches={} barrier_wait_ms={} mesh_cache_hit={} mesh_new_generated={}",
-        completed_batches, barrier_wait_ms, total_mesh_cache_hits, total_mesh_new_generated
+        "[gen_model] batch barrier complete: batches={} barrier_wait_ms={} mesh_cache_hit={} mesh_new_generated={} missing_neg_candidates={}",
+        completed_batches,
+        barrier_wait_ms,
+        total_mesh_cache_hits,
+        total_mesh_new_generated,
+        missing_neg_carriers.len()
     );
     let mut bool_tasks = insert_report.bool_tasks;
     println!(
@@ -1102,7 +1321,7 @@ async fn process_index_tree_generation(
     );
     perf.mark("mesh_generation");
 
-    // 2️⃣ 可选执行 mesh 生成（已通过 mesh_handle 并行处理，此处等待完成）
+    // 2️⃣ 可选执行 mesh 生成（已由并行 mesh stage 完成，此处仅汇总结果）
     if db_option.inner.gen_mesh {
         let mesh_start = Instant::now();
 
@@ -1116,11 +1335,10 @@ async fn process_index_tree_generation(
         all_refnos.extend(prims);
         let mut ran_primary = false;
 
-        // mesh 已在 insert_handle 内联完成，无需额外等待
         ran_primary = gen_mesh;
         if gen_mesh {
             println!(
-                "[gen_model] IndexTree 模式 mesh 内联生成完成，用时 {} ms",
+                "[gen_model] IndexTree 模式 mesh 并行阶段完成，用时 {} ms",
                 mesh_start.elapsed().as_millis()
             );
         }
@@ -1145,10 +1363,7 @@ async fn process_index_tree_generation(
 
         // 3.5️⃣ barrier 后补建跨阶段缺失的 neg_relate（LOOP 阶段发现负实体但 PRIM 阶段才创建 geo_relate）
         if use_surrealdb {
-            if let Err(e) =
-                crate::fast_model::gen_model::pdms_inst::reconcile_missing_neg_relate(&all_refnos)
-                    .await
-            {
+            if let Err(e) = reconcile_missing_neg_relate(&all_refnos, &missing_neg_carriers).await {
                 eprintln!("[gen_model] reconcile_missing_neg_relate 失败: {}", e);
             }
         }
@@ -1541,6 +1756,7 @@ fn initialize_spatial_index() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_route_incremental_when_visible_roots_empty() {
@@ -1565,5 +1781,50 @@ mod tests {
                 .to_string()
                 .contains("SurrealDB 批量写入存在失败任务")
         );
+    }
+
+    fn sample_mesh_output(batch_id: u64) -> BatchMeshOutput {
+        BatchMeshOutput {
+            batch_id,
+            shape_insts: Arc::new(aios_core::geometry::ShapeInstancesData::default()),
+            mesh_results: HashMap::new(),
+            mesh_task_count: 0,
+            mesh_cache_hits: 0,
+            mesh_new_generated: 0,
+            mesh_ms: 17,
+            mesh_wait_ms: 5,
+            batch_started_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn test_batch_stage_joiner_waits_for_base_after_mesh() {
+        let mut joiner = BatchStageJoiner::default();
+        assert!(joiner.push_mesh_output(sample_mesh_output(7)).is_none());
+
+        let ready = joiner
+            .push_base_metrics(7, 11, 13)
+            .expect("base 到达后应完成汇合");
+
+        assert_eq!(ready.batch_id, 7);
+        assert_eq!(ready.base_wait_ms, 11);
+        assert_eq!(ready.base_write_ms, 13);
+        assert_eq!(ready.mesh_ms, 17);
+        assert_eq!(ready.mesh_wait_ms, 5);
+    }
+
+    #[test]
+    fn test_batch_stage_joiner_waits_for_mesh_after_base() {
+        let mut joiner = BatchStageJoiner::default();
+        assert!(joiner.push_base_metrics(9, 3, 4).is_none());
+
+        let ready = joiner
+            .push_mesh_output(sample_mesh_output(9))
+            .expect("mesh 到达后应完成汇合");
+
+        assert_eq!(ready.batch_id, 9);
+        assert_eq!(ready.base_wait_ms, 3);
+        assert_eq!(ready.base_write_ms, 4);
+        assert_eq!(ready.mesh_ms, 17);
     }
 }

@@ -10,6 +10,7 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 use tracing::{info, warn};
 
@@ -316,6 +317,335 @@ impl TaskRow {
     }
 }
 
+fn normalize_record_id_string(raw: String) -> String {
+    raw.rsplit(':').next().unwrap_or(raw.as_str()).to_string()
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Object(map) => map
+            .get("id")
+            .and_then(value_to_string)
+            .or_else(|| map.get("key").and_then(value_to_string))
+            .or_else(|| map.get("value").and_then(value_to_string))
+            .map(normalize_record_id_string),
+        _ => None,
+    }
+}
+
+fn value_to_timestamp_millis(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_u64().and_then(|v| i64::try_from(v).ok())),
+        Value::String(s) => s.parse::<i64>().ok().or_else(|| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.timestamp_millis())
+        }),
+        Value::Object(map) => map
+            .get("$surrealdb::private::sql::Datetime")
+            .and_then(value_to_timestamp_millis)
+            .or_else(|| map.get("datetime").and_then(value_to_timestamp_millis))
+            .or_else(|| map.get("value").and_then(value_to_timestamp_millis)),
+        _ => None,
+    }
+}
+
+fn component_from_value(value: &Value) -> ReviewComponent {
+    let map = value.as_object();
+
+    ReviewComponent {
+        id: map
+            .and_then(|entry| entry.get("id"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        name: map
+            .and_then(|entry| entry.get("name"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        ref_no: map
+            .and_then(|entry| entry.get("ref_no").or_else(|| entry.get("refNo")))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        r#type: map
+            .and_then(|entry| entry.get("type"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+    }
+}
+
+fn attachment_from_value(value: &Value) -> ReviewAttachment {
+    let map = value.as_object();
+
+    ReviewAttachment {
+        id: map
+            .and_then(|entry| entry.get("id"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        name: map
+            .and_then(|entry| entry.get("name"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        url: map
+            .and_then(|entry| entry.get("url"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        size: map
+            .and_then(|entry| entry.get("size"))
+            .and_then(value_to_timestamp_millis),
+        mime_type: map
+            .and_then(|entry| entry.get("mime_type").or_else(|| entry.get("mimeType")))
+            .and_then(value_to_string),
+    }
+}
+
+fn workflow_step_from_value(value: &Value) -> WorkflowStep {
+    let map = value.as_object();
+
+    WorkflowStep {
+        node: map
+            .and_then(|entry| entry.get("node"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        action: map
+            .and_then(|entry| entry.get("action"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        operator_id: map
+            .and_then(|entry| entry.get("operator_id").or_else(|| entry.get("operatorId")))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        operator_name: map
+            .and_then(|entry| {
+                entry
+                    .get("operator_name")
+                    .or_else(|| entry.get("operatorName"))
+            })
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        comment: map
+            .and_then(|entry| entry.get("comment"))
+            .and_then(value_to_string),
+        timestamp: map
+            .and_then(|entry| entry.get("timestamp"))
+            .and_then(value_to_timestamp_millis)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+    }
+}
+
+fn review_task_from_value(value: Value) -> Option<ReviewTask> {
+    if let Ok(row) = serde_json::from_value::<TaskRow>(value.clone()) {
+        return Some(row.to_review_task());
+    }
+
+    let map = value.as_object()?;
+    let checker_id = map
+        .get("checker_id")
+        .or_else(|| map.get("checkerId"))
+        .and_then(value_to_string)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            map.get("reviewer_id")
+                .or_else(|| map.get("reviewerId"))
+                .and_then(value_to_string)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_default();
+    let checker_name = map
+        .get("checker_name")
+        .or_else(|| map.get("checkerName"))
+        .and_then(value_to_string)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            map.get("reviewer_name")
+                .or_else(|| map.get("reviewerName"))
+                .and_then(value_to_string)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_default();
+    let reviewer_id = map
+        .get("reviewer_id")
+        .or_else(|| map.get("reviewerId"))
+        .and_then(value_to_string)
+        .unwrap_or_else(|| checker_id.clone());
+    let reviewer_name = map
+        .get("reviewer_name")
+        .or_else(|| map.get("reviewerName"))
+        .and_then(value_to_string)
+        .unwrap_or_else(|| checker_name.clone());
+    let components = map
+        .get("components")
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().map(component_from_value).collect())
+        .unwrap_or_default();
+    let attachments = map
+        .get("attachments")
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().map(attachment_from_value).collect::<Vec<_>>());
+    let workflow_history = map
+        .get("workflow_history")
+        .or_else(|| map.get("workflowHistory"))
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().map(workflow_step_from_value).collect())
+        .unwrap_or_default();
+
+    Some(ReviewTask {
+        id: map.get("id").and_then(value_to_string).unwrap_or_default(),
+        form_id: map
+            .get("form_id")
+            .or_else(|| map.get("formId"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        title: map
+            .get("title")
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        description: map
+            .get("description")
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        model_name: map
+            .get("model_name")
+            .or_else(|| map.get("modelName"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        status: map
+            .get("status")
+            .and_then(value_to_string)
+            .unwrap_or_else(default_status),
+        priority: map
+            .get("priority")
+            .and_then(value_to_string)
+            .unwrap_or_else(default_priority),
+        requester_id: map
+            .get("requester_id")
+            .or_else(|| map.get("requesterId"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        requester_name: map
+            .get("requester_name")
+            .or_else(|| map.get("requesterName"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        checker_id,
+        checker_name,
+        approver_id: map
+            .get("approver_id")
+            .or_else(|| map.get("approverId"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        approver_name: map
+            .get("approver_name")
+            .or_else(|| map.get("approverName"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        reviewer_id,
+        reviewer_name,
+        components,
+        attachments,
+        review_comment: map
+            .get("review_comment")
+            .or_else(|| map.get("reviewComment"))
+            .and_then(value_to_string),
+        created_at: map
+            .get("created_at")
+            .or_else(|| map.get("createdAt"))
+            .and_then(value_to_timestamp_millis)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+        updated_at: map
+            .get("updated_at")
+            .or_else(|| map.get("updatedAt"))
+            .and_then(value_to_timestamp_millis)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+        due_date: map
+            .get("due_date")
+            .or_else(|| map.get("dueDate"))
+            .and_then(value_to_timestamp_millis),
+        current_node: map
+            .get("current_node")
+            .or_else(|| map.get("currentNode"))
+            .and_then(value_to_string)
+            .unwrap_or_else(default_current_node),
+        workflow_history,
+        return_reason: map
+            .get("return_reason")
+            .or_else(|| map.get("returnReason"))
+            .and_then(value_to_string),
+    })
+}
+
+fn review_tasks_from_values(values: Vec<Value>) -> (Vec<ReviewTask>, usize) {
+    let mut parse_failures = 0;
+    let tasks = values
+        .into_iter()
+        .filter_map(|value| match review_task_from_value(value.clone()) {
+            Some(task) => Some(task),
+            None => {
+                parse_failures += 1;
+                warn!("Skipping unreadable review task row: {}", value);
+                None
+            }
+        })
+        .collect();
+
+    (tasks, parse_failures)
+}
+
+async fn query_review_task_page(
+    where_clause: &str,
+    bindings: &[(&'static str, String)],
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ReviewTask>, surrealdb::Error> {
+    let data_sql = format!(
+        "SELECT * FROM review_tasks {} ORDER BY created_at DESC LIMIT {} START {}",
+        where_clause, limit, offset
+    );
+    let mut q = project_primary_db().query(&data_sql);
+    for (name, value) in bindings {
+        q = q.bind((*name, value.clone()));
+    }
+
+    let mut response = q.await?;
+    let rows: Vec<TaskRow> = response.take(0).unwrap_or_default();
+    Ok(rows.into_iter().map(|row| row.to_review_task()).collect())
+}
+
+async fn recover_review_task_page_with_row_probes(
+    where_clause: &str,
+    bindings: &[(&'static str, String)],
+    offset: i64,
+    limit: i64,
+    total: i64,
+) -> (Vec<ReviewTask>, usize) {
+    let mut recovered = Vec::new();
+    let mut skipped_rows = 0usize;
+    let mut probe_offset = offset.max(0);
+    let probe_end = total.max(0);
+
+    while probe_offset < probe_end && (recovered.len() as i64) < limit.max(0) {
+        match query_review_task_page(where_clause, bindings, 1, probe_offset).await {
+            Ok(mut rows) if !rows.is_empty() => recovered.push(rows.remove(0)),
+            Ok(_) => skipped_rows += 1,
+            Err(error) => {
+                warn!(
+                    "Failed to probe review task row at offset {} during fallback recovery: {}",
+                    probe_offset, error
+                );
+                skipped_rows += 1;
+            }
+        }
+        probe_offset += 1;
+    }
+
+    (recovered, skipped_rows)
+}
+
 fn datetime_to_millis(dt: &Option<surrealdb::types::Datetime>) -> i64 {
     dt.as_ref()
         .map(|d| d.timestamp_millis())
@@ -568,7 +898,7 @@ async fn list_tasks(Query(query): Query<TaskListQuery>) -> impl IntoResponse {
     info!("Listing review tasks");
 
     let mut conditions = vec![];
-    let mut bindings: Vec<(&str, String)> = vec![];
+    let mut bindings: Vec<(&'static str, String)> = vec![];
 
     if let Some(ref status) = query.status {
         if status != "all" {
@@ -612,13 +942,7 @@ async fn list_tasks(Query(query): Query<TaskListQuery>) -> impl IntoResponse {
         "SELECT count() AS total FROM review_tasks {} GROUP ALL",
         where_clause
     );
-    let data_sql = format!(
-        "SELECT * FROM review_tasks {} ORDER BY created_at DESC LIMIT {} START {}",
-        where_clause, limit, offset
-    );
-
-    let combined = format!("{};\n{};", count_sql, data_sql);
-    let mut q = project_primary_db().query(&combined);
+    let mut q = project_primary_db().query(&count_sql);
     for (name, value) in &bindings {
         q = q.bind((*name, value.clone()));
     }
@@ -632,8 +956,34 @@ async fn list_tasks(Query(query): Query<TaskListQuery>) -> impl IntoResponse {
             let count_rows: Vec<CountRow> = response.take(0).unwrap_or_default();
             let total = count_rows.first().map(|r| r.total).unwrap_or(0);
 
-            let rows: Vec<TaskRow> = response.take(1).unwrap_or_default();
-            let tasks: Vec<ReviewTask> = rows.into_iter().map(|r| r.to_review_task()).collect();
+            let mut tasks =
+                match query_review_task_page(&where_clause, &bindings, limit, offset).await {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        warn!("Failed to query review task page: {}", error);
+                        Vec::new()
+                    }
+                };
+            let mut skipped_rows = 0usize;
+
+            if tasks.is_empty() && total > 0 && limit > 1 {
+                warn!(
+                    "Review task page returned empty rows despite total={} (offset={}, limit={}); probing individual rows for recovery",
+                    total, offset, limit
+                );
+                let (recovered_rows, recovered_skips) = recover_review_task_page_with_row_probes(
+                    &where_clause,
+                    &bindings,
+                    offset,
+                    limit,
+                    total,
+                )
+                .await;
+                tasks = recovered_rows;
+                skipped_rows = recovered_skips;
+            }
+
+            let total = total.saturating_sub(skipped_rows as i64);
 
             (
                 StatusCode::OK,
@@ -2988,6 +3338,7 @@ mod tests {
         extract::Extension,
         http::{Request, StatusCode},
     };
+    use serde_json::json;
     use tower::ServiceExt;
 
     use crate::web_api::jwt_auth::TokenClaims;
@@ -3137,6 +3488,104 @@ mod tests {
         assert_eq!(task.status, "draft");
         assert_eq!(task.priority, "medium");
         assert_eq!(task.current_node, "sj");
+    }
+
+    #[test]
+    fn test_review_task_from_value_falls_back_for_legacy_row_shapes() {
+        let raw = json!({
+            "id": { "tb": "review_tasks", "id": "task-legacy-1" },
+            "form_id": "FORM-LEGACY-001",
+            "title": "Legacy Task",
+            "description": "legacy payload",
+            "model_name": "Legacy Model",
+            "status": "submitted",
+            "priority": "medium",
+            "requester_id": "designer_001",
+            "requester_name": "Designer",
+            "checker_id": "user-002",
+            "checker_name": "Reviewer",
+            "approver_id": "manager_001",
+            "approver_name": "Manager",
+            "reviewer_id": "user-002",
+            "reviewer_name": "Reviewer",
+            "components": [
+                {
+                    "id": "comp-1",
+                    "name": "Pipe-1",
+                    "refNo": "17496_248588",
+                    "type": "pipe"
+                }
+            ],
+            "attachments": {
+                "legacy": true
+            },
+            "created_at": "2026-03-18T15:00:00Z",
+            "updated_at": "2026-03-18T15:01:00Z",
+            "current_node": "jd",
+            "workflow_history": "legacy-string-payload"
+        });
+
+        let task = review_task_from_value(raw).expect("legacy row should still normalize");
+
+        assert_eq!(task.id, "task-legacy-1");
+        assert_eq!(task.form_id, "FORM-LEGACY-001");
+        assert_eq!(task.requester_id, "designer_001");
+        assert_eq!(task.checker_id, "user-002");
+        assert_eq!(task.current_node, "jd");
+        assert_eq!(task.workflow_history.len(), 0);
+        assert!(task.created_at > 0);
+        assert!(task.updated_at >= task.created_at);
+    }
+
+    #[test]
+    fn test_review_tasks_from_values_keeps_pages_readable_when_one_row_is_legacy() {
+        let values = vec![
+            json!({
+                "id": { "tb": "review_tasks", "id": "task-good-1" },
+                "title": "Good Task",
+                "description": "ok",
+                "model_name": "Model A",
+                "status": "submitted",
+                "priority": "high",
+                "requester_id": "designer_001",
+                "requester_name": "Designer",
+                "checker_id": "user-002",
+                "checker_name": "Reviewer",
+                "approver_id": "manager_001",
+                "approver_name": "Manager",
+                "created_at": 1773845013517i64,
+                "updated_at": 1773845013518i64,
+                "current_node": "jd",
+                "components": [],
+                "workflow_history": []
+            }),
+            json!({
+                "id": { "tb": "review_tasks", "id": "task-legacy-2" },
+                "title": "Legacy Task",
+                "description": "legacy",
+                "model_name": "Model B",
+                "status": "draft",
+                "priority": "medium",
+                "requester_id": "designer_001",
+                "requester_name": "Designer",
+                "checker_id": "user-002",
+                "checker_name": "Reviewer",
+                "approver_id": "manager_001",
+                "approver_name": "Manager",
+                "created_at": "2026-03-18T15:00:00Z",
+                "updated_at": "2026-03-18T15:01:00Z",
+                "current_node": "sj",
+                "components": [],
+                "workflow_history": "legacy-string-payload"
+            }),
+        ];
+
+        let (tasks, parse_failures) = review_tasks_from_values(values);
+
+        assert_eq!(parse_failures, 0);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "task-good-1");
+        assert_eq!(tasks[1].id, "task-legacy-2");
     }
 
     #[test]

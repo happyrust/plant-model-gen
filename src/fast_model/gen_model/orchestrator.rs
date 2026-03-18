@@ -26,7 +26,8 @@ use crate::fast_model::mesh_generate::{
     MeshResult, query_existing_meshed_inst_geo_ids, run_boolean_worker,
 };
 use crate::fast_model::pdms_inst::{
-    build_inst_relate_aabb_rows, save_inst_relate_aabb_rows, save_instance_data_with_options,
+    build_inst_relate_aabb_rows, reconcile_missing_neg_relate, save_inst_relate_aabb_rows,
+    save_instance_data_with_report,
 };
 use crate::options::{BooleanPipelineMode, DbOptionExt, MeshFormat};
 use dashmap::DashMap;
@@ -485,16 +486,18 @@ async fn run_base_writer(
     replace_exist: bool,
     base_write_semaphore: Arc<Semaphore>,
     mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
+    missing_neg_carriers: Arc<std::sync::Mutex<HashSet<RefnoEnum>>>,
 ) -> anyhow::Result<()> {
     let mut handles = Vec::new();
     while let Ok(batch) = receiver.recv_async().await {
         let semaphore = base_write_semaphore.clone();
         let mesh_aabb_map = mesh_aabb_map.clone();
         let result_sender = result_sender.clone();
+        let missing_neg_carriers = missing_neg_carriers.clone();
         handles.push(tokio::spawn(async move {
             let (permit, wait_ms) = acquire_with_wait(semaphore).await?;
             let base_start = Instant::now();
-            save_instance_data_with_options(
+            let save_report = save_instance_data_with_report(
                 &batch.shape_insts,
                 replace_exist,
                 &HashMap::new(),
@@ -502,11 +505,18 @@ async fn run_base_writer(
                 false,
             )
             .await?;
+            if !save_report.missing_neg_carriers.is_empty() {
+                let mut guard = missing_neg_carriers.lock().unwrap();
+                guard.extend(save_report.missing_neg_carriers.iter().copied());
+            }
             let base_ms = base_start.elapsed().as_millis();
             drop(permit);
             println!(
-                "[batch_stage] batch={} stage=base wait_ms={} base_write_ms={}",
-                batch.batch_id, wait_ms, base_ms
+                "[batch_stage] batch={} stage=base wait_ms={} base_write_ms={} missing_neg_candidates={}",
+                batch.batch_id,
+                wait_ms,
+                base_ms,
+                save_report.missing_neg_carriers.len()
             );
             result_sender
                 .send_async((batch.batch_id, wait_ms, base_ms))
@@ -1196,6 +1206,8 @@ async fn process_index_tree_generation(
     let mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>> =
         Arc::new(DashMap::new());
     let mesh_pts_map: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+    let missing_neg_carriers_for_reconcile: Arc<std::sync::Mutex<HashSet<RefnoEnum>>> =
+        Arc::new(std::sync::Mutex::new(HashSet::new()));
     let base_write_semaphore = Arc::new(Semaphore::new(db_option.get_base_write_concurrency()));
     let mesh_compute_semaphore = Arc::new(Semaphore::new(db_option.get_mesh_compute_concurrency()));
     let inst_aabb_semaphore = Arc::new(Semaphore::new(db_option.get_inst_aabb_write_concurrency()));
@@ -1224,6 +1236,7 @@ async fn process_index_tree_generation(
         replace_exist,
         base_write_semaphore.clone(),
         mesh_aabb_map.clone(),
+        missing_neg_carriers_for_reconcile.clone(),
     ));
     let mesh_stage_handle = tokio::spawn(run_mesh_stage(
         mesh_stage_receiver,
@@ -1286,10 +1299,20 @@ async fn process_index_tree_generation(
         total_mesh_cache_hits += completion.mesh_cache_hits;
         total_mesh_new_generated += completion.mesh_new_generated;
     }
+    let missing_neg_carriers = {
+        let guard = missing_neg_carriers_for_reconcile.lock().unwrap();
+        let mut carriers = guard.iter().copied().collect::<Vec<_>>();
+        carriers.sort_unstable();
+        carriers
+    };
     let barrier_wait_ms = barrier_wait_start.elapsed().as_millis();
     println!(
-        "[gen_model] batch barrier complete: batches={} barrier_wait_ms={} mesh_cache_hit={} mesh_new_generated={}",
-        completed_batches, barrier_wait_ms, total_mesh_cache_hits, total_mesh_new_generated
+        "[gen_model] batch barrier complete: batches={} barrier_wait_ms={} mesh_cache_hit={} mesh_new_generated={} missing_neg_candidates={}",
+        completed_batches,
+        barrier_wait_ms,
+        total_mesh_cache_hits,
+        total_mesh_new_generated,
+        missing_neg_carriers.len()
     );
     let mut bool_tasks = insert_report.bool_tasks;
     println!(
@@ -1340,10 +1363,7 @@ async fn process_index_tree_generation(
 
         // 3.5️⃣ barrier 后补建跨阶段缺失的 neg_relate（LOOP 阶段发现负实体但 PRIM 阶段才创建 geo_relate）
         if use_surrealdb {
-            if let Err(e) =
-                crate::fast_model::gen_model::pdms_inst::reconcile_missing_neg_relate(&all_refnos)
-                    .await
-            {
+            if let Err(e) = reconcile_missing_neg_relate(&all_refnos, &missing_neg_carriers).await {
                 eprintln!("[gen_model] reconcile_missing_neg_relate 失败: {}", e);
             }
         }

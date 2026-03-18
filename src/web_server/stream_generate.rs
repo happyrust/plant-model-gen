@@ -595,8 +595,8 @@ pub async fn api_stream_generate(
                                         // 是否在配置层启用布尔运算（即使请求要求，也尊重 DbOption 开关）
                                         let apply_by_config = db_option.apply_boolean_operation;
                                         if apply_by_config {
-                                            // 布尔运算依赖：必须先有 inst_geo 的 mesh + aabb.d（否则 query_aabb_params 会返回空）
-                                            // 这里按需补齐 mesh，避免依赖 DbOption.gen_mesh（SSE 端点应“边生成边加载”）。
+                                            // 先确保本批次基础 mesh 已就绪。
+                                            // db 模式仍沿用 inst_geo 状态；file 模式则只依赖本地 glb + aabb_cache.rkyv。
                                             let replace_exist =
                                                 req.force_regenerate || db_option.is_replace_mesh();
                                             let meshes_dir = db_option.get_meshes_path();

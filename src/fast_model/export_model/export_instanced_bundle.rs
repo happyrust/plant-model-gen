@@ -619,7 +619,7 @@ pub async fn export_instanced_bundle_for_refnos(
 
             // 2. 检查关键字段 (aabb, world_trans)
             let check_sql = format!(
-                "SELECT in, aabb, world_trans, geo_type, visible, out.meshed as is_meshed FROM [{}]->inst_relate;",
+                "SELECT in, aabb, world_trans, geo_type, visible FROM [{}]->inst_relate;",
                 pe_list
             );
             match aios_core::project_primary_db()
@@ -634,14 +634,13 @@ pub async fn export_instanced_bundle_for_refnos(
                             let has_trans =
                                 rec.get("world_trans").and_then(|v| v.get("d")).is_some();
                             println!(
-                                "     [{}] in={}, aabb={}, trans={}, type={}, vis={}, mesh={}",
+                                "     [{}] in={}, aabb={}, trans={}, type={}, vis={}",
                                 i,
                                 rec.get("in").unwrap_or(&serde_json::json!("?")),
                                 if has_aabb { "OK" } else { "MISSING" },
                                 if has_trans { "OK" } else { "MISSING" },
                                 rec.get("geo_type").unwrap_or(&serde_json::json!("?")),
-                                rec.get("visible").unwrap_or(&serde_json::json!("?")),
-                                rec.get("is_meshed").unwrap_or(&serde_json::json!("?"))
+                                rec.get("visible").unwrap_or(&serde_json::json!("?"))
                             );
                         }
                     }

@@ -7,6 +7,9 @@
 //! - SQLite 空间索引优化支持
 
 use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
+use crate::fast_model::gen_model::mesh_state::{
+    flush_aabb_cache, get_cached_or_local_aabb, mesh_exists, use_file_mesh_state,
+};
 use crate::fast_model::manifold_bool::{
     apply_cata_neg_boolean_manifold, apply_insts_boolean_manifold,
 };
@@ -47,6 +50,7 @@ use log::info;
 use parry3d::bounding_volume::*;
 use parry3d::math::Isometry;
 use parse_pdms_db::parse::round_f32;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
@@ -75,6 +79,19 @@ pub struct MeshWorkerReport {
     pub elapsed_ms: u128,
     /// 是否发生过可恢复降级（DB 写入失败等）
     pub degraded: bool,
+}
+
+#[derive(Debug, Clone)]
+struct InstGeoWorkItem {
+    geo_id: RecordId,
+    refno: Option<RefnoEnum>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[surreal(crate = "surrealdb_types")]
+struct PendingInstGeoRow {
+    refno: Option<RefnoEnum>,
+    geo_id: RecordId,
 }
 
 impl MeshWorkerReport {
@@ -414,25 +431,26 @@ pub async fn generate_meshes_for_batch(
         if !deduper.insert(task.geo_hash) {
             // 即使 deduper 跳过（增量模式预加载），仍从缓存获取 AABB，
             // 保证 inst_relate_aabb 在增量模式下也能正确写入。
-            let mesh_id = task.geo_hash.to_string();
-            if let Some(cached_aabb) = EXIST_MESH_GEO_HASHES.get(&mesh_id) {
-                let cached = *cached_aabb;
-                drop(cached_aabb);
-                let ext_mag = cached.extents().magnitude();
-                let valid = ext_mag > 1e-4 && ext_mag < f32::INFINITY;
-                let aabb_hash = if valid {
-                    let h = gen_aabb_hash(&cached);
-                    aabb_map.entry(h.to_string()).or_insert(cached);
-                    Some(h)
-                } else {
-                    None
-                };
+            if let Some(cached) = get_cached_or_local_aabb(task.geo_hash) {
+                let h = gen_aabb_hash(&cached);
+                aabb_map.entry(h.to_string()).or_insert(cached);
                 results.insert(
                     task.geo_hash,
                     MeshResult {
                         meshed: true,
-                        bad: !valid,
-                        aabb_hash,
+                        bad: false,
+                        aabb_hash: Some(h),
+                        pts_hashes: vec![],
+                    },
+                );
+                skipped_by_cache += 1;
+            } else if mesh_exists(task.geo_hash) {
+                results.insert(
+                    task.geo_hash,
+                    MeshResult {
+                        meshed: true,
+                        bad: false,
+                        aabb_hash: None,
                         pts_hashes: vec![],
                     },
                 );
@@ -441,28 +459,30 @@ pub async fn generate_meshes_for_batch(
             continue;
         }
 
-        let mesh_id = task.geo_hash.to_string();
-
         // 第二层去重：检查预加载缓存（EXIST_MESH_GEO_HASHES）
         // 如果该 geo_hash 的 mesh 文件已存在，跳过 CSG 生成；有 AABB 则复用，无则仅标记已完成
-        if let Some(cached_aabb) = EXIST_MESH_GEO_HASHES.get(&mesh_id) {
-            let cached = *cached_aabb;
-            drop(cached_aabb);
-            let ext_mag = cached.extents().magnitude();
-            let has_valid_aabb = ext_mag > 1e-4 && ext_mag < f32::INFINITY;
-            let aabb_hash = if has_valid_aabb {
-                let h = gen_aabb_hash(&cached);
-                aabb_map.entry(h.to_string()).or_insert(cached);
-                Some(h)
-            } else {
-                None
-            };
+        if let Some(cached) = get_cached_or_local_aabb(task.geo_hash) {
+            let h = gen_aabb_hash(&cached);
+            aabb_map.entry(h.to_string()).or_insert(cached);
             results.insert(
                 task.geo_hash,
                 MeshResult {
                     meshed: true,
                     bad: false,
-                    aabb_hash,
+                    aabb_hash: Some(h),
+                    pts_hashes: vec![],
+                },
+            );
+            skipped_by_cache += 1;
+            continue;
+        }
+        if mesh_exists(task.geo_hash) {
+            results.insert(
+                task.geo_hash,
+                MeshResult {
+                    meshed: true,
+                    bad: false,
+                    aabb_hash: None,
                     pts_hashes: vec![],
                 },
             );
@@ -470,6 +490,7 @@ pub async fn generate_meshes_for_batch(
             continue;
         }
 
+        let mesh_id = task.geo_hash.to_string();
         let geo_type_name = task.geo_param.type_name();
         let profile = precision.profile_for_geo(geo_type_name);
         let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
@@ -702,12 +723,29 @@ LIMIT {remaining};
 }
 
 /// 查询需要生成 mesh 的 inst_geo 记录的 id
-/// 条件：meshed = false, param != NONE, bad != true
+/// db 模式条件：meshed = false, param != NONE, bad != true
+/// file 模式条件：param != NONE, bad != true，再按本地 mesh 存在性过滤
 /// 返回 inst_geo 的 id 列表（geo_hash）
 async fn query_pending_mesh_geo_ids(
     limit: usize,
     replace_exist: bool,
 ) -> anyhow::Result<Vec<RecordId>> {
+    if use_file_mesh_state() {
+        let sql = format!(
+            "SELECT value id FROM inst_geo WHERE param != NONE AND bad != true ORDER BY id LIMIT {}",
+            limit
+        );
+        let ids: Vec<RecordId> = model_primary_db().query_take(&sql, 0).await?;
+        let filtered = if replace_exist {
+            ids
+        } else {
+            ids.into_iter()
+                .filter(|id| !mesh_exists(id.to_mesh_id().parse::<u64>().unwrap_or(0)))
+                .collect()
+        };
+        return Ok(filtered);
+    }
+
     // 注意：这里的查询用于“状态收敛式”的 worker（replace_exist=false）。
     // replace_exist=true 会走“快照遍历”分支，避免反复扫描相同的前 N 条记录。
     let sql = if replace_exist {
@@ -728,6 +766,20 @@ async fn query_pending_mesh_geo_ids(
 
 /// 查询待处理 mesh 的总数（不限制数量）
 async fn query_total_pending_mesh_count(replace_exist: bool) -> anyhow::Result<usize> {
+    if use_file_mesh_state() {
+        let sql = "SELECT value id FROM inst_geo WHERE param != NONE AND bad != true ORDER BY id"
+            .to_string();
+        let ids: Vec<RecordId> = model_primary_db().query_take(&sql, 0).await?;
+        let count = if replace_exist {
+            ids.len()
+        } else {
+            ids.into_iter()
+                .filter(|id| !mesh_exists(id.to_mesh_id().parse::<u64>().unwrap_or(0)))
+                .count()
+        };
+        return Ok(count);
+    }
+
     let sql = if replace_exist {
         "SELECT VALUE count() FROM inst_geo WHERE param != NONE AND bad != true GROUP ALL"
             .to_string()
@@ -761,6 +813,40 @@ async fn snapshot_mesh_geo_ids_for_replace(batch_size: usize) -> anyhow::Result<
     }
 
     Ok(all)
+}
+
+async fn query_candidate_inst_geo_ids_for_refnos(
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<Vec<PendingInstGeoRow>> {
+    if refnos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    const CHUNK_SIZE: usize = 200;
+    let mut rows = Vec::new();
+
+    for chunk in refnos.chunks(CHUNK_SIZE) {
+        let inst_relate_keys = chunk
+            .iter()
+            .map(|refno| refno.to_inst_relate_key())
+            .join(",");
+        let sql = format!(
+            r#"
+            SELECT
+                in as refno,
+                record::id(out) as geo_id
+            FROM [{inst_relate_keys}]
+            WHERE out != NONE
+              AND visible
+              AND out.param != NONE
+              AND out.bad != true;
+            "#
+        );
+        let mut chunk_rows: Vec<PendingInstGeoRow> = model_primary_db().query_take(&sql, 0).await?;
+        rows.append(&mut chunk_rows);
+    }
+
+    Ok(rows)
 }
 
 /// 基于 inst_geo 状态的 Mesh 生成 Worker（已废弃）
@@ -1008,6 +1094,7 @@ pub async fn run_mesh_worker_from_channel(
     sql_writer: Option<Arc<super::sql_file_writer::SqlFileWriter>>,
 ) -> anyhow::Result<MeshWorkerReport> {
     let deferred = sql_writer.is_some();
+    let use_file_state = use_file_mesh_state();
     let mesh_dir = db_option.get_meshes_path();
     if !mesh_dir.exists() {
         std::fs::create_dir_all(&mesh_dir)?;
@@ -1107,7 +1194,9 @@ pub async fn run_mesh_worker_from_channel(
                 }
             };
 
-            update_stmts.push(mesh_result.to_update_sql(&mesh_id));
+            if !use_file_state {
+                update_stmts.push(mesh_result.to_update_sql(&mesh_id));
+            }
             batch_new += 1;
 
             // 检查阈值，满足则立即 flush
@@ -1122,7 +1211,9 @@ pub async fn run_mesh_worker_from_channel(
         }
 
         // batch 结束后 final flush
-        if let Some(ref sw) = sql_writer {
+        if use_file_state {
+            update_stmts.clear();
+        } else if let Some(ref sw) = sql_writer {
             let _ = sw.write_statements(&update_stmts);
             update_stmts.clear();
         } else {
@@ -1142,7 +1233,9 @@ pub async fn run_mesh_worker_from_channel(
     }
 
     // 保存 aabb 和 pts 数据
-    if let Some(ref sw) = sql_writer {
+    if use_file_state {
+        flush_aabb_cache();
+    } else if let Some(ref sw) = sql_writer {
         // defer 模式：将 INSERT IGNORE 写入 .surql 文件
         // aabb
         if !aabb_map.is_empty() {
@@ -1205,7 +1298,7 @@ pub async fn run_mesh_worker_from_channel(
 ///
 /// 扫描需要布尔运算的实例（catalog & 实例级），只执行一次。
 /// 注意：此函数应在 mesh_worker 完成后调用，确保所有 mesh 已生成。
-/// 布尔运算查询会自动过滤掉 mesh 未生成的记录。
+/// file 模式以本地 GLB + aabb_cache.rkyv 为前置状态源；db 模式仍兼容历史查询口径。
 pub async fn run_boolean_worker(db_option: Arc<DbOption>, batch_size: usize) -> anyhow::Result<()> {
     let batch_size = batch_size.max(1);
     let replace_exist = db_option.is_replace_mesh();
@@ -1578,6 +1671,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
     geo_ids: &[RecordId],
     mesh_formats: &[MeshFormat],
 ) -> anyhow::Result<()> {
+    let use_file_state = use_file_mesh_state();
     if geo_ids.is_empty() {
         return Ok(());
     }
@@ -1676,7 +1770,9 @@ pub async fn gen_inst_meshes_by_geo_ids(
     }
 
     // 执行批量更新
-    if !update_sql.is_empty() {
+    if use_file_state {
+        println!("[gen_inst_meshes_by_geo_ids] file 模式：跳过 inst_geo 状态回写");
+    } else if !update_sql.is_empty() {
         println!(
             "[gen_inst_meshes_by_geo_ids] 执行 update_sql ({} bytes)",
             update_sql.len()
@@ -1689,9 +1785,13 @@ pub async fn gen_inst_meshes_by_geo_ids(
         println!("[gen_inst_meshes_by_geo_ids] update_sql 为空，没有需要更新的记录");
     }
 
-    // 保存 aabb 和 pts 数据
-    utils::save_pts_to_surreal(&pts_json_map).await;
-    utils::save_aabb_to_surreal(&aabb_map).await;
+    if use_file_state {
+        flush_aabb_cache();
+    } else {
+        // 保存 aabb 和 pts 数据
+        utils::save_pts_to_surreal(&pts_json_map).await;
+        utils::save_aabb_to_surreal(&aabb_map).await;
+    }
 
     Ok(())
 }
@@ -1710,8 +1810,8 @@ pub async fn gen_inst_meshes_by_geo_ids(
 /// # 侧效与说明
 /// - 并发分批查询 inst_geo 参数并生成网格
 /// - 将网格序列化保存到磁盘（dir/*.mesh）
-/// - 回写 SurrealDB: inst_geo.meshed/aabb/pts 字段，错误则标记 bad=true
-/// - 更新内存缓存 EXIST_MESH_GEO_HASHES；最后批量保存 aabb/pts 到 SurrealDB
+/// - db 模式会回写 SurrealDB: inst_geo.meshed/aabb/pts 字段，错误则标记 bad=true
+/// - file 模式只依赖本地 glb + aabb_cache.rkyv，并更新 EXIST_MESH_GEO_HASHES
 pub async fn gen_inst_meshes(
     dir: &Path,
     precision: &MeshPrecisionSettings,
@@ -1719,12 +1819,18 @@ pub async fn gen_inst_meshes(
     replace_exist: bool,
     mesh_formats: &[MeshFormat],
 ) -> anyhow::Result<()> {
+    let use_file_state = use_file_mesh_state();
     debug_model_debug!(
-        "gen_inst_meshes start: refnos={}, replace_exist={}, dir={}",
+        "gen_inst_meshes start: refnos={}, replace_exist={}, dir={}, mesh_state_source={}",
         refnos.len(),
         replace_exist,
-        dir.display()
+        dir.display(),
+        if use_file_state { "file" } else { "db" }
     );
+
+    if use_file_state {
+        crate::fast_model::preload_mesh_cache();
+    }
     // 每批并发处理的 inst_geo 数量上限，控制单批任务规模
     const PAGE_NUM: usize = 100;
     // 计数/调试用途（目前未外显）
@@ -1762,26 +1868,80 @@ pub async fn gen_inst_meshes(
     // 使用结构化的 query_inst_geo_ids API 查询几何 ID
     // 根据 replace_exist 决定是否跳过已生成或异常的几何：
     // - replace_exist=true：不过滤 aabb/meshed，允许覆盖，但仍过滤 bad
-    // - replace_exist=false：仅选择 aabb 为空、未网格化且非 bad 的几何
-    // 返回包含 geo_id 和 has_neg_relate 字段的结构化结果
-    let inst_geo_ids = match query_inst_geo_ids(refnos, replace_exist).await {
-        Ok(ids) => ids,
-        Err(e) => {
-            debug_model_debug!(
-                "query_inst_geo_ids failed for refnos={:?}: {}. This is normal for objects without geometry (e.g., FLOOR, or pipe tubing).",
-                refnos,
-                e
-            );
-            return Ok(());
+    // - replace_exist=false：旧逻辑只会捞出 aabb 为空的未 meshed 几何。
+    //   对于“GLB 已生成、aabb 已回写、但 meshed 仍为空”的历史数据，需要额外补捞，
+    //   否则这些 geo 会永久卡在未收敛状态，并在某些导出/增量链路里继续被漏掉。
+    let mut inst_geo_targets: Vec<InstGeoWorkItem> = if use_file_state {
+        match query_candidate_inst_geo_ids_for_refnos(refnos).await {
+            Ok(ids) => ids
+                .into_iter()
+                .map(|row| InstGeoWorkItem {
+                    geo_id: row.geo_id,
+                    refno: row.refno,
+                })
+                .collect(),
+            Err(e) => {
+                debug_model_debug!(
+                    "query_candidate_inst_geo_ids_for_refnos failed for refnos={:?}: {}. This is normal for objects without geometry (e.g., FLOOR, or pipe tubing).",
+                    refnos,
+                    e
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        match query_inst_geo_ids(refnos, replace_exist).await {
+            Ok(ids) => ids
+                .into_iter()
+                .map(|row| InstGeoWorkItem {
+                    geo_id: row.geo_id,
+                    refno: row.refno,
+                })
+                .collect(),
+            Err(e) => {
+                debug_model_debug!(
+                    "query_inst_geo_ids failed for refnos={:?}: {}. This is normal for objects without geometry (e.g., FLOOR, or pipe tubing).",
+                    refnos,
+                    e
+                );
+                return Ok(());
+            }
         }
     };
+
+    if use_file_state && !replace_exist {
+        inst_geo_targets.retain(|row| {
+            row.geo_id
+                .to_mesh_id()
+                .parse::<u64>()
+                .ok()
+                .map(|geo_hash| !mesh_exists(geo_hash))
+                .unwrap_or(true)
+        });
+    } else if !replace_exist {
+        let mut stale_rows = query_unmeshed_inst_geo_ids_for_refnos(refnos).await?;
+        if !stale_rows.is_empty() {
+            debug_model_debug!(
+                "gen_inst_meshes supplement stale meshed rows: {}",
+                stale_rows.len()
+            );
+            inst_geo_targets.extend(stale_rows.drain(..).map(|row| InstGeoWorkItem {
+                geo_id: row.geo_id,
+                refno: row.refno,
+            }));
+        }
+    }
+
+    let mut seen_geo_ids = HashSet::new();
+    inst_geo_targets.retain(|row| seen_geo_ids.insert(row.geo_id.to_raw()));
+
     debug_model_debug!(
         "gen_inst_meshes fetched inst_geo_ids: {}",
-        inst_geo_ids.len()
+        inst_geo_targets.len()
     );
-    // println!("inst_geo_ids: {:?}", &inst_geo_ids);
+    // println!("inst_geo_ids: {:?}", &inst_geo_targets);
     // 无可处理对象则直接返回
-    if inst_geo_ids.is_empty() {
+    if inst_geo_targets.is_empty() {
         debug_model_debug!(
             "[WARN] gen_inst_meshes: inst_geo_ids empty for refnos={:?}",
             refnos
@@ -1795,7 +1955,7 @@ pub async fn gen_inst_meshes(
     let inst_aabb_map = Arc::new(DashMap::new());
 
     // 分批并发处理 inst_geo
-    for (chunk_idx, chunk) in inst_geo_ids.chunks(PAGE_NUM).enumerate() {
+    for (chunk_idx, chunk) in inst_geo_targets.chunks(PAGE_NUM).enumerate() {
         debug_model_debug!(
             "gen_inst_meshes chunk {} processing {} inst_geo ids",
             chunk_idx,
@@ -1942,21 +2102,58 @@ pub async fn gen_inst_meshes(
     }
 
     // 用新生成的 aabb 更新内存缓存，避免重复计算
-    for result in inst_geo_ids {
+    for result in inst_geo_targets {
         let h = result.geo_id.to_mesh_id();
         if let Some(aabb) = inst_aabb_map.get(&h) {
             EXIST_MESH_GEO_HASHES.insert(h.clone(), *aabb);
         }
     }
 
-    // 批量持久化点集与 aabb 实体
-    utils::save_pts_to_surreal(&pts_json_map).await;
-    utils::save_aabb_to_surreal(&aabb_map).await;
+    if !use_file_state {
+        // 旧 DB 状态源下，仍需持久化点集与 aabb 实体。
+        utils::save_pts_to_surreal(&pts_json_map).await;
+        utils::save_aabb_to_surreal(&aabb_map).await;
+    }
 
     // 持久化 AABB 缓存到 meshes/aabb_cache.rkyv
-    crate::fast_model::save_aabb_cache_to_disk();
+    flush_aabb_cache();
 
     Ok(())
+}
+
+async fn query_unmeshed_inst_geo_ids_for_refnos(
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<Vec<PendingInstGeoRow>> {
+    if refnos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    const CHUNK_SIZE: usize = 200;
+    let mut rows = Vec::new();
+
+    for chunk in refnos.chunks(CHUNK_SIZE) {
+        let inst_relate_keys = chunk
+            .iter()
+            .map(|refno| refno.to_inst_relate_key())
+            .join(",");
+        let sql = format!(
+            r#"
+            SELECT
+                in as refno,
+                record::id(out) as geo_id
+            FROM [{inst_relate_keys}]
+            WHERE out != NONE
+              AND visible
+              AND out.param != NONE
+              AND out.bad != true
+              AND out.meshed != true;
+            "#
+        );
+        let mut chunk_rows: Vec<PendingInstGeoRow> = model_primary_db().query_take(&sql, 0).await?;
+        rows.append(&mut chunk_rows);
+    }
+
+    Ok(rows)
 }
 
 async fn handle_csg_mesh(

@@ -242,6 +242,25 @@ async fn delete_inst_geo_by_hashes(geo_hashes: &[u64], chunk_size: usize) -> any
     Ok(())
 }
 
+fn parse_inst_geo_hash(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    let normalized = trimmed
+        .strip_prefix("inst_geo:`")
+        .map(|s| s.trim_end_matches('`'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("inst_geo:⟨")
+                .map(|s| s.trim_end_matches('⟩'))
+        })
+        .or_else(|| {
+            trimmed
+                .strip_prefix("inst_geo:")
+                .map(|s| s.trim_matches('`').trim_matches('⟨').trim_matches('⟩'))
+        })
+        .unwrap_or(trimmed);
+    normalized.parse::<u64>().ok()
+}
+
 fn build_delete_inst_relate_by_in_sql(
     refnos: &[RefnoEnum],
     chunk_size: usize,
@@ -470,7 +489,7 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
 
                 let hashes: Vec<u64> = geo_hashes
                     .iter()
-                    .filter_map(|s| s.parse::<u64>().ok())
+                    .filter_map(|s| parse_inst_geo_hash(s))
                     .collect();
 
                 if !hashes.is_empty() {
@@ -544,14 +563,8 @@ pub async fn save_instance_data_optimize(
     mesh_results: &HashMap<u64, MeshResult>,
     mesh_aabb_map: &DashMap<String, Aabb>,
 ) -> anyhow::Result<()> {
-    save_instance_data_with_options(
-        inst_mgr,
-        replace_exist,
-        mesh_results,
-        mesh_aabb_map,
-        true,
-    )
-    .await
+    save_instance_data_with_options(inst_mgr, replace_exist, mesh_results, mesh_aabb_map, true)
+        .await
 }
 
 pub async fn save_instance_data_with_options(
@@ -1148,7 +1161,9 @@ pub async fn save_instance_data_with_options(
     }
 
     // inst_relate_aabb（普通表：refno=pe, aabb_id=aabb），按历史约定延后到 aabb 写入之后执行
-    if write_inst_relate_aabb && (!inst_relate_aabb_chunks.is_empty() || !inst_relate_aabb_buffer.is_empty()) {
+    if write_inst_relate_aabb
+        && (!inst_relate_aabb_chunks.is_empty() || !inst_relate_aabb_buffer.is_empty())
+    {
         let mut inst_aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
 
         // 统一把积累的 chunks + 剩余 buffer 一次性落库
@@ -1181,10 +1196,16 @@ pub async fn save_instance_data_with_options(
             total
         );
         inst_aabb_batcher.finish().await?;
-    } else if !write_inst_relate_aabb && (!inst_relate_aabb_chunks.is_empty() || !inst_relate_aabb_buffer.is_empty()) {
+    } else if !write_inst_relate_aabb
+        && (!inst_relate_aabb_chunks.is_empty() || !inst_relate_aabb_buffer.is_empty())
+    {
         debug_model_debug!(
             "save_instance_data_optimize skip inst_relate_aabb write: {} buffered rows",
-            inst_relate_aabb_chunks.iter().map(|(rows, _)| rows.len()).sum::<usize>() + inst_relate_aabb_buffer.len()
+            inst_relate_aabb_chunks
+                .iter()
+                .map(|(rows, _)| rows.len())
+                .sum::<usize>()
+                + inst_relate_aabb_buffer.len()
         );
     }
 
@@ -1253,7 +1274,9 @@ pub async fn save_instance_data_with_options(
 
     // 聚合数据到 refno_relations 表（极简方案）
     if replace_exist {
-        use crate::fast_model::gen_model::pdms_inst_surreal::{RefnoRelations, save_refno_relations_surreal};
+        use crate::fast_model::gen_model::pdms_inst_surreal::{
+            RefnoRelations, save_refno_relations_surreal,
+        };
         use std::collections::HashMap;
 
         let mut relations_map: HashMap<RefnoEnum, RefnoRelations> = HashMap::new();
@@ -1261,11 +1284,13 @@ pub async fn save_instance_data_with_options(
         // 聚合 inst_info
         for (refno, info) in &inst_mgr.inst_info_map {
             let dbnum = *inst_dbnum_map.get(refno).unwrap_or(&0);
-            let rel = relations_map.entry(*refno).or_insert_with(|| RefnoRelations {
-                refno: *refno,
-                dbnum,
-                ..Default::default()
-            });
+            let rel = relations_map
+                .entry(*refno)
+                .or_insert_with(|| RefnoRelations {
+                    refno: *refno,
+                    dbnum,
+                    ..Default::default()
+                });
             rel.inst_keys.push(info.get_inst_key());
         }
 
@@ -1371,10 +1396,7 @@ pub async fn save_inst_relate_aabb_rows(
     if !inst_relate_aabb_rows.is_empty() {
         let mut inst_aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
         for chunk in inst_relate_aabb_rows.chunks(CHUNK_SIZE) {
-            let statement = format!(
-                "INSERT IGNORE INTO inst_relate_aabb [{}];",
-                chunk.join(",")
-            );
+            let statement = format!("INSERT IGNORE INTO inst_relate_aabb [{}];", chunk.join(","));
             inst_aabb_batcher.push(statement).await?;
         }
         inst_aabb_batcher.finish().await?;

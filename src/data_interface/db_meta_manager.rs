@@ -477,7 +477,11 @@ pub fn generate_single_indextree(target_dbnum: u32) -> anyhow::Result<()> {
     // 扫描项目目录下的所有文件，找到匹配的 dbnum（包括子目录）
     let mut found_file: Option<String> = None;
 
-    fn scan_dir_recursive(dir: &std::path::Path, target_dbnum: u32, found: &mut Option<String>) -> std::io::Result<()> {
+    fn scan_dir_recursive(
+        dir: &std::path::Path,
+        target_dbnum: u32,
+        found: &mut Option<String>,
+    ) -> std::io::Result<()> {
         for entry in fs::read_dir(dir)?.flatten() {
             let path = entry.path();
             if path.is_file() {

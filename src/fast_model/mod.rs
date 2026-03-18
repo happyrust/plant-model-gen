@@ -118,6 +118,9 @@ use dashmap::{DashMap, DashSet};
 
 pub use gen_model::*;
 
+#[cfg(feature = "sqlite-index")]
+pub use gen_model::orchestrator::update_sqlite_spatial_index_from_cache;
+
 // [foyer-removal] CaptureConfig 桩
 use once_cell::sync::OnceCell;
 use std::path::PathBuf;
@@ -209,7 +212,24 @@ pub struct AabbCacheEntryV1 {
 pub fn save_aabb_cache_to_disk() {
     let mesh_dir = aios_core::get_db_option().get_meshes_path();
     let cache_path = mesh_dir.join(AABB_CACHE_FILENAME);
-    let tmp_path = mesh_dir.join(format!("{}.tmp", AABB_CACHE_FILENAME));
+    if let Err(e) = std::fs::create_dir_all(&mesh_dir) {
+        eprintln!(
+            "[aabb_cache] 创建缓存目录失败: {} - {}",
+            mesh_dir.display(),
+            e
+        );
+        return;
+    }
+
+    let tmp_path = mesh_dir.join(format!(
+        "{}.{}.{}.tmp",
+        AABB_CACHE_FILENAME,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
 
     let mut entries = Vec::new();
     for kv in EXIST_MESH_GEO_HASHES.iter() {
@@ -292,33 +312,18 @@ fn load_aabb_cache_from_disk(mesh_dir: &std::path::Path) -> usize {
     count
 }
 
-/// 从 meshes 目录预加载几何网格缓存
+/// 从 `aabb_cache.rkyv` 预加载几何网格缓存
 ///
-/// 优先从 `aabb_cache.rkyv` 读取有效 AABB，再扫描 .glb 文件补充新增 geo_hash。
+/// 以 `aabb_cache.rkyv` 为 mesh 存在性的唯一判据，不再扫描磁盘 GLB 文件。
 pub fn preload_mesh_cache() {
-    use crate::fast_model::mesh_generate::scan_existing_mesh_ids_from_dir;
-
     let mesh_dir = aios_core::get_db_option().get_meshes_path();
 
-    // 优先从 rkyv 缓存读取（含有效 AABB）
+    // 从 rkyv 缓存读取有效 AABB
     let cache_count = load_aabb_cache_from_disk(&mesh_dir);
 
-    // 再扫描目录补充新增的 geo_hash（可能尚未写入 rkyv 缓存）
-    let ids = scan_existing_mesh_ids_from_dir(&mesh_dir);
-    let mut new_count = 0usize;
-    for id in ids {
-        let mesh_id = id.to_string();
-        // or_insert：rkyv 已加载的不覆盖
-        EXIST_MESH_GEO_HASHES.entry(mesh_id).or_insert_with(|| {
-            new_count += 1;
-            Aabb::new_invalid()
-        });
-    }
-
     debug_model!(
-        "✅ 缓存预加载: rkyv={} 条有效 AABB, 目录扫描补充 {} 条（无 AABB）",
+        "✅ 缓存预加载: rkyv={} 条有效 AABB（以 aabb_cache.rkyv 为唯一判据）",
         cache_count,
-        new_count,
     );
 }
 

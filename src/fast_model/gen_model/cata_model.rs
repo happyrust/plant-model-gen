@@ -4886,9 +4886,10 @@ async fn gen_cata_geos_inner(
                         .unwrap_or_default();
                 }
 
-                tref = branch_att
-                    .get_foreign_refno(if is_hang { "TREF" } else { "LSTU" })
-                    .unwrap_or_default();
+                // 末段 tubing 的终点应连接到分支尾端引用（TREF）。
+                // 对 BRAN 使用 LSTU 会把“末端规格引用”误当成“末端连接引用”，
+                // 从而在 LSTU 为空时直接跳过最后一段。
+                tref = branch_att.get_foreign_refno("TREF").unwrap_or_default();
 
                 tdir = branch_transform
                     .to_matrix()
@@ -4985,7 +4986,7 @@ async fn gen_cata_geos_inner(
 
                 let dir_ok = current_tubing.is_dir_ok();
 
-                let dist_ok = dist > TUBI_TOL;
+                                    let dist_ok = dist > TUBI_TOL;
 
                 let transform = (if !dir_ok {
                     build_tubi_transform_from_segment(
@@ -5767,11 +5768,20 @@ async fn gen_cata_geos_inner(
                 }
 
                 if index == len - 1 && !exclude {
+                    let tail_arrive_refno = resolve_branch_tail_arrive_refno(branch_refno, tref);
+                    if !tref.is_valid() {
+                        debug_model!(
+                            "[BRAN_TUBI] branch_refno={} 的 tref 无效，最后一段回退到 branch_refno，leave_refno={}",
+                            branch_refno.to_string(),
+                            current_tubing.leave_refno.to_string()
+                        );
+                    }
+
                     let last_dist = bran_ttube_pt.distance(current_tubing.start_pt);
 
                     current_tubing.end_pt = bran_ttube_pt;
 
-                    current_tubing.arrive_refno = tref;
+                    current_tubing.arrive_refno = tail_arrive_refno;
 
                     current_tubing.desire_arrive_dir = tdir;
 
@@ -6635,4 +6645,36 @@ pub async fn gen_tubi_from_db(
     );
 
     Ok(outcome)
+}
+
+fn resolve_branch_tail_arrive_refno(branch_refno: RefnoEnum, tref: RefnoEnum) -> RefnoEnum {
+    if tref.is_valid() {
+        tref
+    } else {
+        branch_refno
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branch_tail_arrive_refno_prefers_valid_tref() {
+        let branch_refno = RefnoEnum::from("24381/88894");
+        let tref = RefnoEnum::from("24381/88903");
+
+        assert_eq!(resolve_branch_tail_arrive_refno(branch_refno, tref), tref);
+    }
+
+    #[test]
+    fn branch_tail_arrive_refno_falls_back_to_branch_refno_when_tref_invalid() {
+        let branch_refno = RefnoEnum::from("24381/88894");
+        let tref = RefnoEnum::default();
+
+        assert_eq!(
+            resolve_branch_tail_arrive_refno(branch_refno, tref),
+            branch_refno
+        );
+    }
 }

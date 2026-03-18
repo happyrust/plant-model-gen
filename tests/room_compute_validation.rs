@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 fn fixture_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/room_compute_validation.json")
+        .join("verification/room/compute/room_compute_validation.json")
 }
 
 fn load_validation_fixture() -> RoomComputeValidationFixture {

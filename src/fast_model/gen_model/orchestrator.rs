@@ -11,6 +11,7 @@ use crate::fast_model::export_model::export_prepack_lod::export_instances_json_f
 use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_refnos_grouped_by_dbno;
 use crate::fast_model::export_model::export_prepack_lod::export_prepack_lod_for_refnos;
 use crate::fast_model::unit_converter::LengthUnit;
+use crate::fast_model::utils::{save_aabb_to_surreal, save_pts_to_surreal};
 use aios_core::RefnoEnum;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -18,12 +19,12 @@ use std::sync::Arc;
 use std::time::Instant;
 // use crate::fast_model::capture::capture_refnos_if_enabled; // removed on foyer-cache-cleanup
 use crate::data_interface::db_meta_manager::db_meta;
-use crate::fast_model::mesh_generate::{
-    run_boolean_worker,
-    MeshResult, query_existing_meshed_inst_geo_ids,
-};
 use crate::fast_model::gen_model::boolean_task::{BooleanTask, BooleanTaskAccumulator};
 use crate::fast_model::gen_model::manifold_bool::run_bool_worker_from_tasks;
+use crate::fast_model::gen_model::mesh_state::{flush_aabb_cache, use_file_mesh_state};
+use crate::fast_model::mesh_generate::{
+    MeshResult, query_existing_meshed_inst_geo_ids, run_boolean_worker,
+};
 use crate::fast_model::pdms_inst::{
     build_inst_relate_aabb_rows, save_inst_relate_aabb_rows, save_instance_data_with_options,
 };
@@ -404,7 +405,9 @@ async fn run_base_writer(
                 "[batch_stage] batch={} stage=base wait_ms={} base_write_ms={}",
                 batch.batch_id, wait_ms, base_ms
             );
-            result_sender.send_async((batch.batch_id, wait_ms, base_ms)).await?;
+            result_sender
+                .send_async((batch.batch_id, wait_ms, base_ms))
+                .await?;
             Ok::<(), anyhow::Error>(())
         }));
     }
@@ -449,17 +452,19 @@ async fn run_mesh_stage(
     let mut handles = Vec::new();
     let mut base_metrics = HashMap::new();
     while let Ok(batch) = receiver.recv_async().await {
-        let (base_wait_ms, base_write_ms) = if let Some(metrics) = base_metrics.remove(&batch.batch_id) {
-            metrics
-        } else {
-            loop {
-                let (result_batch_id, wait_ms, write_ms) = base_result_receiver.recv_async().await?;
-                if result_batch_id == batch.batch_id {
-                    break (wait_ms, write_ms);
+        let (base_wait_ms, base_write_ms) =
+            if let Some(metrics) = base_metrics.remove(&batch.batch_id) {
+                metrics
+            } else {
+                loop {
+                    let (result_batch_id, wait_ms, write_ms) =
+                        base_result_receiver.recv_async().await?;
+                    if result_batch_id == batch.batch_id {
+                        break (wait_ms, write_ms);
+                    }
+                    base_metrics.insert(result_batch_id, (wait_ms, write_ms));
                 }
-                base_metrics.insert(result_batch_id, (wait_ms, write_ms));
-            }
-        };
+            };
         let semaphore = mesh_compute_semaphore.clone();
         let deduper = deduper.clone();
         let mesh_aabb_map = mesh_aabb_map.clone();
@@ -532,17 +537,20 @@ async fn run_inst_aabb_writer(
     completion_sender: Sender<BatchCompletion>,
     inst_aabb_semaphore: Arc<Semaphore>,
     mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
+    mesh_pts_map: Arc<DashMap<u64, String>>,
 ) -> anyhow::Result<()> {
     let skip_inst_relate_aabb = std::env::var_os("AIOS_SKIP_INST_RELATE_AABB").is_some();
     let mut handles = Vec::new();
     while let Ok(batch) = receiver.recv_async().await {
         let inst_aabb_semaphore = inst_aabb_semaphore.clone();
         let mesh_aabb_map = mesh_aabb_map.clone();
+        let mesh_pts_map = mesh_pts_map.clone();
         let completion_sender = completion_sender.clone();
         let skip_inst_relate_aabb = skip_inst_relate_aabb;
         handles.push(tokio::spawn(async move {
             let (aabb_permit, inst_aabb_wait_ms) = acquire_with_wait(inst_aabb_semaphore).await?;
             let inst_aabb_start = Instant::now();
+            persist_inst_geo_mesh_results(&batch.mesh_results, &mesh_aabb_map, &mesh_pts_map).await?;
             if skip_inst_relate_aabb {
                 println!(
                     "[batch_stage] batch={} stage=inst_aabb skipped=inst_relate_aabb env=AIOS_SKIP_INST_RELATE_AABB",
@@ -598,6 +606,48 @@ async fn run_inst_aabb_writer(
     Ok(())
 }
 
+async fn persist_inst_geo_mesh_results(
+    mesh_results: &HashMap<u64, MeshResult>,
+    mesh_aabb_map: &DashMap<String, parry3d::bounding_volume::Aabb>,
+    mesh_pts_map: &DashMap<u64, String>,
+) -> anyhow::Result<()> {
+    if use_file_mesh_state() {
+        flush_aabb_cache();
+        return Ok(());
+    }
+
+    if mesh_results.is_empty() {
+        return Ok(());
+    }
+
+    // 先落 aabb / pts 实体，再把 inst_geo 指向这些记录，避免引用到尚不存在的实体。
+    save_pts_to_surreal(mesh_pts_map).await;
+    save_aabb_to_surreal(mesh_aabb_map).await;
+
+    let mut update_sql = String::new();
+    for (geo_hash, mesh_result) in mesh_results {
+        update_sql.push_str(&mesh_result.to_update_sql(&geo_hash.to_string()));
+    }
+
+    if update_sql.is_empty() {
+        return Ok(());
+    }
+
+    aios_core::model_primary_db()
+        .query(&update_sql)
+        .await
+        .map_err(|e| {
+            let preview: String = update_sql.chars().take(500).collect();
+            anyhow::anyhow!(
+                "回写 inst_geo mesh 结果失败: error={}, sql_preview={}",
+                e,
+                preview
+            )
+        })?;
+
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct GenModelResult {
     pub success: bool,
@@ -649,9 +699,7 @@ pub async fn gen_all_geos_data(
                         final_incr_updates = Some(sesno_changes);
                     } else {
                         println!("[gen_model] sesno {} 没有发现变更，跳过增量生成", sesno);
-                        return Ok(GenModelResult {
-                            success: false,
-                        });
+                        return Ok(GenModelResult { success: false });
                     }
                 }
 
@@ -868,7 +916,9 @@ async fn process_index_tree_generation(
     // 1️⃣ 生成/更新 inst_relate，并获取分类后的根 refno
     let config = IndexTreeConfig::from_db_option_ext(db_option)
         .map_err(|e| anyhow::anyhow!("配置错误: {}", e))?;
-    let (sender, receiver) = flume::bounded::<aios_core::geometry::ShapeInstancesData>(db_option.get_batch_channel_capacity());
+    let (sender, receiver) = flume::bounded::<aios_core::geometry::ShapeInstancesData>(
+        db_option.get_batch_channel_capacity(),
+    );
     let replace_exist = db_option.inner.is_replace_mesh();
     let use_surrealdb = db_option.use_surrealdb;
     let defer_db_write = false;
@@ -949,16 +999,22 @@ async fn process_index_tree_generation(
         .as_ref()
         .filter(|nums| nums.len() == 1)
         .and_then(|nums| nums.first().copied());
-    let mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>> = Arc::new(DashMap::new());
+    let mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>> =
+        Arc::new(DashMap::new());
     let mesh_pts_map: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
     let base_write_semaphore = Arc::new(Semaphore::new(db_option.get_base_write_concurrency()));
     let mesh_compute_semaphore = Arc::new(Semaphore::new(db_option.get_mesh_compute_concurrency()));
     let inst_aabb_semaphore = Arc::new(Semaphore::new(db_option.get_inst_aabb_write_concurrency()));
-    let (base_writer_sender, base_writer_receiver) = flume::bounded::<PipelineBatch>(db_option.get_batch_channel_capacity());
-    let (base_result_sender, base_result_receiver) = flume::bounded::<(u64, u128, u128)>(db_option.get_batch_channel_capacity());
-    let (mesh_stage_sender, mesh_stage_receiver) = flume::bounded::<PipelineBatch>(db_option.get_batch_channel_capacity());
-    let (mesh_output_sender, mesh_output_receiver) = flume::bounded::<BatchMeshOutput>(db_option.get_batch_channel_capacity());
-    let (completion_sender, completion_receiver) = flume::bounded::<BatchCompletion>(db_option.get_batch_channel_capacity());
+    let (base_writer_sender, base_writer_receiver) =
+        flume::bounded::<PipelineBatch>(db_option.get_batch_channel_capacity());
+    let (base_result_sender, base_result_receiver) =
+        flume::bounded::<(u64, u128, u128)>(db_option.get_batch_channel_capacity());
+    let (mesh_stage_sender, mesh_stage_receiver) =
+        flume::bounded::<PipelineBatch>(db_option.get_batch_channel_capacity());
+    let (mesh_output_sender, mesh_output_receiver) =
+        flume::bounded::<BatchMeshOutput>(db_option.get_batch_channel_capacity());
+    let (completion_sender, completion_receiver) =
+        flume::bounded::<BatchCompletion>(db_option.get_batch_channel_capacity());
 
     let sink_handle = tokio::spawn(run_batch_sink(
         receiver,
@@ -989,6 +1045,7 @@ async fn process_index_tree_generation(
         completion_sender,
         inst_aabb_semaphore,
         mesh_aabb_map.clone(),
+        mesh_pts_map.clone(),
     ));
     println!("⏳ [1/5] 几何体生成 (BRAN/HANG + LOOP/CATE/PRIM)...");
     let categorized = gen_index_tree_geos_optimized(
@@ -1036,10 +1093,7 @@ async fn process_index_tree_generation(
     let barrier_wait_ms = barrier_wait_start.elapsed().as_millis();
     println!(
         "[gen_model] batch barrier complete: batches={} barrier_wait_ms={} mesh_cache_hit={} mesh_new_generated={}",
-        completed_batches,
-        barrier_wait_ms,
-        total_mesh_cache_hits,
-        total_mesh_new_generated
+        completed_batches, barrier_wait_ms, total_mesh_cache_hits, total_mesh_new_generated
     );
     let mut bool_tasks = insert_report.bool_tasks;
     println!(
@@ -1082,9 +1136,7 @@ async fn process_index_tree_generation(
                     "[gen_model] IndexTree 模式已跳过 batch inst_relate_aabb 写入（AIOS_SKIP_INST_RELATE_AABB=1）"
                 );
             } else {
-                println!(
-                    "[gen_model] IndexTree 模式 batch inst_relate_aabb 写入已完成"
-                );
+                println!("[gen_model] IndexTree 模式 batch inst_relate_aabb 写入已完成");
             }
         }
 
@@ -1093,7 +1145,10 @@ async fn process_index_tree_generation(
 
         // 3.5️⃣ barrier 后补建跨阶段缺失的 neg_relate（LOOP 阶段发现负实体但 PRIM 阶段才创建 geo_relate）
         if use_surrealdb {
-            if let Err(e) = crate::fast_model::gen_model::pdms_inst::reconcile_missing_neg_relate(&all_refnos).await {
+            if let Err(e) =
+                crate::fast_model::gen_model::pdms_inst::reconcile_missing_neg_relate(&all_refnos)
+                    .await
+            {
                 eprintln!("[gen_model] reconcile_missing_neg_relate 失败: {}", e);
             }
         }
@@ -1370,9 +1425,7 @@ async fn process_index_tree_generation(
         eprintln!("[perf] 保存 CSV 报告失败: {}", e);
     }
 
-    Ok(GenModelResult {
-        success: true,
-    })
+    Ok(GenModelResult { success: true })
 }
 
 // ============================================================================
@@ -1390,7 +1443,6 @@ pub async fn update_sqlite_spatial_index_from_cache(
     use crate::spatial_index::SqliteSpatialIndex;
     use crate::sqlite_index::{ImportConfig, SqliteAabbIndex};
     use std::fs;
-    use std::path::PathBuf;
     if dbnums.is_empty() {
         return Ok(());
     }
@@ -1424,6 +1476,11 @@ pub async fn update_sqlite_spatial_index_from_cache(
         .get_project_output_dir()
         .join("instances_cache_for_index");
     fs::create_dir_all(&base_out).map_err(|e| anyhow::anyhow!(e))?;
+    let project_output_dir = db_option.get_project_output_dir();
+    let project_instances_dir = project_output_dir.join("instances");
+    let nested_project_instances_dir = project_output_dir
+        .join(&db_option.inner.project_name)
+        .join("instances");
 
     // mesh_lod_tag 仅用于导出侧选择 mesh（用于补齐/计算 AABB）
     let cache_dir = db_option.get_model_cache_dir();
@@ -1434,24 +1491,33 @@ pub async fn update_sqlite_spatial_index_from_cache(
     let mut uniq: BTreeSet<u32> = BTreeSet::new();
     uniq.extend(dbnums.iter().copied());
     for dbnum in uniq {
-        let out_dir = base_out.join(format!("{}", dbnum));
-        fs::create_dir_all(&out_dir).map_err(|e| anyhow::anyhow!(e))?;
+        // 优先复用本轮生成已经落盘的 instances 输出，避免继续依赖已移除的旧 cache contract。
+        let direct_instances_path = project_instances_dir.join(format!("instances_{}.json", dbnum));
+        let nested_instances_path =
+            nested_project_instances_dir.join(format!("instances_{}.json", dbnum));
+        let instances_path = if direct_instances_path.exists() {
+            direct_instances_path
+        } else if nested_instances_path.exists() {
+            nested_instances_path
+        } else {
+            let out_dir = base_out.join(format!("{}", dbnum));
+            fs::create_dir_all(&out_dir).map_err(|e| anyhow::anyhow!(e))?;
 
-        // 1) cache -> instances_{dbnum}.json + aabb.json + trans.json
-        let _ = crate::fast_model::export_model::export_prepack_lod::export_dbnum_instances_json_from_cache(
-            dbnum,
-            &out_dir,
-            &cache_dir,
-            Some(&mesh_dir),
-            Some(mesh_lod_tag.as_str()),
-            false,
-            None,
-            false,
-        )
-        .await?;
+            let _ = crate::fast_model::export_model::export_prepack_lod::export_dbnum_instances_json_from_cache(
+                dbnum,
+                &out_dir,
+                &cache_dir,
+                Some(&mesh_dir),
+                Some(mesh_lod_tag.as_str()),
+                false,
+                None,
+                false,
+            )
+            .await?;
 
-        // 2) instances_{dbnum}.json -> spatial_index.sqlite (RTree)
-        let instances_path = out_dir.join(format!("instances_{}.json", dbnum));
+            out_dir.join(format!("instances_{}.json", dbnum))
+        };
+
         if instances_path.exists() {
             let _ = idx.import_from_instances_json(&instances_path, &ImportConfig::default())?;
         }

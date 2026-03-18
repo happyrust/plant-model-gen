@@ -1,7 +1,7 @@
 {
   "milestone": "verify-core",
-  "round": 1,
-  "status": "fail",
+  "round": 2,
+  "status": "pass",
   "validatorsRun": {
     "test": {
       "passed": true,
@@ -26,34 +26,25 @@
   },
   "reviewsSummary": {
     "total": 2,
-    "passed": 1,
-    "failed": 1,
-    "failedFeatures": [
-      "verify-core-readonly-runner"
-    ]
+    "passed": 2,
+    "failed": 0,
+    "failedFeatures": []
   },
-  "blockingIssues": [
-    {
-      "featureId": "verify-core-readonly-runner",
-      "severity": "blocking",
-      "description": "`src/cli_modes.rs`: `verify_room_case` may classify missing expected components as `ScopeMismatch` when the component exists elsewhere in the room (stale panels non-empty), potentially hiding real expectation mismatches."
-    }
-  ],
+  "blockingIssues": [],
   "appliedUpdates": [],
   "suggestedGuidanceUpdates": [
     {
       "target": "skills",
-      "suggestion": "In room-verify-worker, document Rust `cargo test <filter>` pitfalls and recommend exact invocations to ensure intended tests actually run.",
-      "evidence": "Review verify-core-readonly-runner: worker ran `cargo test room_verify_tests --quiet` but it did not execute the new unit tests (per review sharedStateObservations).",
-      "isSystemic": false
-    },
-    {
-      "target": "skills",
-      "suggestion": "Align feature skill assignment: prefer room-verify-worker for verify-core/CLI validation features instead of backend-worker when the work is primarily room CLI + validation gate.",
-      "evidence": "Review stabilize-verify-core-validator-gate: feature skillName=backend-worker but transcript consulted room-verify-worker; suggests specialization mismatch.",
+      "suggestion": "The feature had to relax `backend-worker` so CLI-only validation is allowed, but the skill still presents web-server-specific implementation examples (`src/web_server/models.rs`, `handlers.rs`) inside the generic procedure. That makes the procedure partially misleading for CLI-focused backend tasks and likely contributed to the worker needing to justify a deviation.",
+      "evidence": ".factory/skills/backend-worker/SKILL.md:25-35 still anchors implementation guidance around `src/web_server/*` even after adding CLI validation language; handoff.skillFeedback for `c2175d33-b819-49cd-8512-502f0379f1c6` reports a procedure deviation because the prior guidance conflicted with this mission.",
       "isSystemic": true
     }
   ],
-  "rejectedObservations": [],
-  "previousRound": null
+  "rejectedObservations": [
+    {
+      "observation": "Prior round suggestion to document Rust `cargo test <filter>` pitfalls in room-verify-worker.",
+      "reason": "not re-raised in the fix-only review set, so it is outside this rerun's accepted observation set"
+    }
+  ],
+  "previousRound": "/Volumes/DPC/work/plant-code/plant-model-gen/.factory/validation/verify-core/scrutiny/synthesis.json"
 }

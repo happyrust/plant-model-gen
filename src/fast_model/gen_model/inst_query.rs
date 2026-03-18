@@ -139,6 +139,9 @@ pub async fn query_insts_with_batch(
             if !non_bool_keys.is_empty() {
                 let non_bool_keys_str = non_bool_keys.join(",");
                 // 直接从 pe_transform 表获取 world_trans（pe.world_trans 已废弃）
+                // 注意：这里不能再依赖 out.meshed 过滤。
+                // BRAN/CATA 里存在“GLB 已生成，但 inst_geo.meshed 尚未回写”的旧数据，
+                // 导出阶段后面还会按真实 mesh 文件存在性再次过滤，提前卡掉会导致实例缺失。
                 let geo_sql = format!(
                     r#"
                     SELECT
@@ -148,7 +151,7 @@ pub async fn query_insts_with_batch(
                         in.world_aabb as world_aabb,
                         (SELECT trans.d as geo_transform, record::id(out) as geo_hash, false as is_tubi, out.unit_flag ?? false as unit_flag
                          FROM $parent.out->geo_relate
-                         WHERE visible && out.meshed
+                         WHERE visible
                            && (trans.d ?? NONE) != NONE
                            && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']) as insts,
                         false as has_neg
@@ -182,7 +185,7 @@ pub async fn query_insts_with_batch(
                     in.world_aabb as world_aabb,
                     (SELECT trans.d as geo_transform, record::id(out) as geo_hash, false as is_tubi, out.unit_flag ?? false as unit_flag
                      FROM $parent.out->geo_relate
-                     WHERE visible && out.meshed
+                     WHERE visible
                        && (trans.d ?? NONE) != NONE
                        && geo_type IN ['Pos', 'Compound']) as insts,
                     false as has_neg

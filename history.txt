@@ -1,9 +1,4 @@
 #V2
-SELECT REFNO AS panel_refno, owner.owner.id AS sbfr_id, owner.owner.owner.id AS frmw_id, owner.owner.owner.NAME AS frmw_name FROM PANE LIMIT 5;
-SELECT REFNO, owner, owner.owner, owner.owner.owner FROM PANE LIMIT 1;
--- 房间计算查询测试：panel_refno 回归 pe，字段用 pe 风格 (owner)
--- 连接: surreal sql --endpoint ws://localhost:8020 --namespace 1516 --database AvevaMarineSample -u root -p root --pretty
--- ========== 前置检查 ==========
 SELECT count() FROM pe WHERE noun = 'PANE' GROUP ALL;
 SELECT count() FROM FRMW WHERE NAME CONTAINS 'ROOM' GROUP ALL;
 -- ========== 方式1：从 PANE 查询，owner 递归2层，REFNO 即 panel 的 pe ==========
@@ -99,3 +94,8 @@ SELECT * FROM pe:⟨13246_390709⟩.refno;
 SELECT * FROM pe:⟨13246_390708⟩.refno;
 SELECT * FROM pe:⟨13246_390710⟩.refno;
 SELECT * FROM pe:⟨13246_390681⟩.refno;
+SELECT record::id(id[0]) as refno, record::id(in) as owner, world_trans.d as world_trans, aabb.d as world_aabb, record::id(geo) as geo_hash, id[1] as idx FROM tubi_relate:[pe:24381_88894, 0]..[pe:24381_88894, ..];
+SELECT count() AS cnt FROM inst_relate WHERE dbnum = 7997 GROUP ALL;
+SELECT id[0] as refno, id[1] as index, in as leave, record::id(aabb) as world_aabb_hash, record::id(world_trans) as world_trans_hash, record::id(geo) as geo_hash, spec_value FROM tubi_relate:[pe:24381_145712, 0]..[pe:24381_145712, ..];
+SELECT owner_type, count() AS cnt FROM inst_relate WHERE dbnum = 7997 GROUP BY owner_type ORDER BY cnt DESC;
+SELECT owner_refno, owner_type, in as refno, in.noun as noun, spec_value as spec_value FROM inst_relate WHERE dbnum = 7997;

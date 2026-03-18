@@ -1,0 +1,15 @@
+{
+  "featureId": "fix-verify-room-case-classification",
+  "reviewedAt": "2026-03-14T18:07:16Z",
+  "commitId": "809de59dd96773e64291b43753e61c725668ee66",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "Reviewed the original verify-json runner diff and the follow-up fix diff. The fix changes `verify_room_case` so cross-panel evidence no longer forces `ScopeMismatch` once the requested room/panel already has persisted coverage, which directly addresses the prior blocking finding without regressing the readonly verify-json flow.",
+    "issues": []
+  },
+  "sharedStateObservations": [],
+  "addressesFailureFrom": "/Volumes/DPC/work/plant-code/plant-model-gen/.factory/validation/verify-core/scrutiny/reviews/verify-core-readonly-runner.json",
+  "summary": "Pass: reviewed prior failure report, both diffs (`06d1add` and `809de59`), the fix handoff, and the fix transcript skeleton. The original blocking misclassification is corrected in `src/cli_modes.rs`, and the updated targeted regression test now covers the branch where the component exists on another panel while the requested room/panel still has persisted coverage."
+}

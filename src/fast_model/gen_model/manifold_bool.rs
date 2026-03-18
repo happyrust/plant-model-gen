@@ -6,6 +6,7 @@
 
 //! 所有布尔运算操作均使用 Manifold 库实现，不再依赖 OpenCASCADE。
 
+use crate::fast_model::gen_model::mesh_state::prime_cached_aabb_for_mesh_ids;
 use crate::fast_model::{debug_model, debug_model_debug, debug_model_warn};
 
 use aios_core::SurrealQueryExt;
@@ -249,6 +250,10 @@ fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<M
 
         return Ok(manifold);
     }
+
+    // file 模式下，布尔执行前先尝试把本地 GLB 的 AABB 预热到 rkyv/内存缓存。
+    // 这一步不改变几何加载路径，只是把运行时状态源统一到 glb + aabb_cache.rkyv。
+    prime_cached_aabb_for_mesh_ids([id]);
 
     let base_dir = mesh_base_dir();
 
@@ -1053,11 +1058,11 @@ async fn apply_boolean_for_query(
     let mut pos_manifolds = Vec::new();
 
     for pos in query.pos_geos.iter() {
-        let pos_mesh_id = pos.0.to_mesh_id();
+        let pos_mesh_id = pos.id.to_mesh_id();
 
         // 正实体使用局部变换
 
-        let pos_local_mat = pos.1.to_matrix().as_dmat4();
+        let pos_local_mat = pos.trans.0.to_matrix().as_dmat4();
 
         println!(
             "[POS_TRANS_DBG] refno={} mesh={} pos_local_mat:\n  col0=({:.3},{:.3},{:.3})\n  col1=({:.3},{:.3},{:.3})\n  col2=({:.3},{:.3},{:.3})\n  col3=({:.3},{:.3},{:.3})\n  scale=({:.3},{:.3},{:.3})",
@@ -1384,9 +1389,9 @@ async fn apply_boolean_for_query(
         let mut pos_hi_manifolds = Vec::new();
 
         for pos in query.pos_geos.iter() {
-            let pos_mesh_id = pos.0.to_mesh_id();
+            let pos_mesh_id = pos.id.to_mesh_id();
 
-            let pos_local_mat = pos.1.to_matrix().as_dmat4();
+            let pos_local_mat = pos.trans.0.to_matrix().as_dmat4();
 
             if let Ok(m) = load_manifold(&pos_mesh_id, pos_local_mat, true) {
                 pos_hi_manifolds.push(m);

@@ -1698,74 +1698,82 @@ pub async fn reconcile_missing_neg_relate(all_refnos: &[RefnoEnum]) -> anyhow::R
         return Ok(0);
     }
 
+    let reconcile_started = std::time::Instant::now();
     let refno_set: HashSet<RefnoEnum> = all_refnos.iter().copied().collect();
+    const QUERY_CHUNK_SIZE: usize = 1000;
+    const CHECK_CHUNK_SIZE: usize = 1000;
+    const INSERT_CHUNK_SIZE: usize = 500;
 
-    // 1. 查询当前 batch 中所有 Neg/CataNeg 类型 geo_relate，及其负载体的父元素
-    let pe_list = all_refnos
-        .iter()
-        .map(|r| r.to_pe_key())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        r#"SELECT
-            record::id(id) as gr_id,
-            record::id(geom_refno) as neg_carrier,
-            record::id(geom_refno.owner) as parent_id
-        FROM geo_relate
-        WHERE geo_type IN ['Neg', 'CataNeg']
-          AND geom_refno IN [{pe_list}]"#
-    );
-    let mut response = model_primary_db().query_response(&sql).await?;
-    let neg_geos: Vec<serde_json::Value> = response.take(0)?;
-    if neg_geos.is_empty() {
-        return Ok(0);
-    }
-
-    // 2. 提取信息并检查已存在的 neg_relate
     struct NegGeoInfo {
         gr_id: String,
         neg_carrier: String,
         parent_id: String,
     }
     let mut infos: Vec<NegGeoInfo> = Vec::new();
-    for val in &neg_geos {
-        let gr_id = val
-            .get("gr_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let neg_carrier = val
-            .get("neg_carrier")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let parent_id = val
-            .get("parent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        if gr_id.is_empty() || neg_carrier.is_empty() || parent_id.is_empty() {
-            continue;
+
+    // 1. 分块查询当前 batch 中所有 Neg/CataNeg 类型 geo_relate，避免超长 IN 列表拖垮 Surreal 解析
+    let query_start = std::time::Instant::now();
+    for refno_chunk in all_refnos.chunks(QUERY_CHUNK_SIZE) {
+        let pe_list = refno_chunk
+            .iter()
+            .map(|r| r.to_pe_key())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            r#"SELECT
+                record::id(id) as gr_id,
+                record::id(geom_refno) as neg_carrier,
+                record::id(geom_refno.owner) as parent_id
+            FROM geo_relate
+            WHERE geo_type IN ['Neg', 'CataNeg']
+              AND geom_refno IN [{pe_list}]"#
+        );
+        let mut response = model_primary_db().query_response(&sql).await?;
+        let neg_geos: Vec<serde_json::Value> = response.take(0)?;
+        for val in &neg_geos {
+            let gr_id = val
+                .get("gr_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let neg_carrier = val
+                .get("neg_carrier")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let parent_id = val
+                .get("parent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if gr_id.is_empty() || neg_carrier.is_empty() || parent_id.is_empty() {
+                continue;
+            }
+            infos.push(NegGeoInfo {
+                gr_id,
+                neg_carrier,
+                parent_id,
+            });
         }
-        infos.push(NegGeoInfo {
-            gr_id,
-            neg_carrier,
-            parent_id,
-        });
     }
     if infos.is_empty() {
         return Ok(0);
     }
 
-    let gr_id_list = infos
-        .iter()
-        .map(|r| format!("geo_relate:⟨{}⟩", r.gr_id))
-        .collect::<Vec<_>>()
-        .join(",");
-    let check_sql = format!("SELECT VALUE record::id(in) FROM [{gr_id_list}]->neg_relate");
-    let mut check_resp = model_primary_db().query_response(&check_sql).await?;
-    let existing_vec: Vec<String> = check_resp.take(0).unwrap_or_default();
-    let existing: HashSet<String> = existing_vec.into_iter().collect();
+    // 2. 分块检查已存在的 neg_relate，避免超长 geo_relate id 列表
+    let existing_check_start = std::time::Instant::now();
+    let mut existing: HashSet<String> = HashSet::new();
+    for info_chunk in infos.chunks(CHECK_CHUNK_SIZE) {
+        let gr_id_list = info_chunk
+            .iter()
+            .map(|r| format!("geo_relate:⟨{}⟩", r.gr_id))
+            .collect::<Vec<_>>()
+            .join(",");
+        let check_sql = format!("SELECT VALUE record::id(in) FROM [{gr_id_list}]->neg_relate");
+        let mut check_resp = model_primary_db().query_response(&check_sql).await?;
+        let existing_vec: Vec<String> = check_resp.take(0).unwrap_or_default();
+        existing.extend(existing_vec);
+    }
 
     // 3. 创建缺失的 neg_relate
     let mut neg_buffer: Vec<String> = Vec::new();
@@ -1790,14 +1798,21 @@ pub async fn reconcile_missing_neg_relate(all_refnos: &[RefnoEnum]) -> anyhow::R
 
     let created = neg_buffer.len();
     if !neg_buffer.is_empty() {
-        let sql = format!(
-            "INSERT RELATION IGNORE INTO neg_relate [{}];",
-            neg_buffer.join(",")
-        );
-        model_query_response(&sql).await?;
+        let insert_start = std::time::Instant::now();
+        for relation_chunk in neg_buffer.chunks(INSERT_CHUNK_SIZE) {
+            let sql = format!(
+                "INSERT RELATION IGNORE INTO neg_relate [{}];",
+                relation_chunk.join(",")
+            );
+            model_query_response(&sql).await?;
+        }
         println!(
-            "[reconcile] 补建 {} 条 neg_relate（跨阶段负实体关系）",
-            created
+            "[reconcile] 补建 {} 条 neg_relate（跨阶段负实体关系） query_ms={} existing_check_ms={} insert_ms={} total_ms={}",
+            created,
+            query_start.elapsed().as_millis(),
+            existing_check_start.elapsed().as_millis(),
+            insert_start.elapsed().as_millis(),
+            reconcile_started.elapsed().as_millis()
         );
     }
 

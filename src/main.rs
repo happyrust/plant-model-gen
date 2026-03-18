@@ -672,10 +672,30 @@ async fn main() -> anyhow::Result<()> {
                 .value_name("JSON_PATH"),
         )
         .arg(
+            Arg::new("import-rvm")
+                .long("import-rvm")
+                .help("Import an RVM file into SQLite relation tables")
+                .value_name("RVM_PATH"),
+        )
+        .arg(
+            Arg::new("import-att")
+                .long("import-att")
+                .help("Optional ATT/TXT files paired with --import-rvm (comma-separated or repeated)")
+                .value_name("ATT_PATHS")
+                .value_delimiter(',')
+                .num_args(1..),
+        )
+        .arg(
             Arg::new("spatial-index-output")
                 .long("spatial-index-output")
                 .help("Output path for SQLite spatial index (default: output/spatial_index.sqlite)")
                 .value_name("SQLITE_PATH"),
+        )
+        .arg(
+            Arg::new("relation-store-output")
+                .long("relation-store-output")
+                .help("Root directory for SQLite relation store output (default: output/model_relations)")
+                .value_name("DIR"),
         )
         .arg(
             Arg::new("export-all-lods")
@@ -855,6 +875,12 @@ async fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .get_matches();
+
+    if let Some(relation_store_root) = matches.get_one::<String>("relation-store-output") {
+        unsafe {
+            std::env::set_var("MODEL_RELATION_STORE_PATH", relation_store_root);
+        }
+    }
 
     // 获取配置文件路径
     let config_path = matches
@@ -2048,6 +2074,31 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| PathBuf::from("output/spatial_index.sqlite"));
 
         return import_spatial_index_mode(Path::new(json_path), &sqlite_path, verbose);
+    }
+
+    if let Some(rvm_path) = matches.get_one::<String>("import-rvm") {
+        use crate::cli_modes::import_rvm_mode;
+
+        let dbnum = matches
+            .get_one::<u32>("dbnum")
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("--import-rvm 需要同时指定 --dbnum"))?;
+        let att_paths: Vec<PathBuf> = matches
+            .get_many::<String>("import-att")
+            .map(|vals| vals.map(PathBuf::from).collect())
+            .unwrap_or_default();
+        let relation_store_root = matches
+            .get_one::<String>("relation-store-output")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("output/model_relations"));
+
+        return import_rvm_mode(
+            Path::new(rvm_path),
+            &att_paths,
+            dbnum,
+            &relation_store_root,
+            verbose,
+        );
     }
 
     if matches.get_flag("export-all-relates") {

@@ -181,6 +181,14 @@ pub mod sqlite_index;
 #[cfg(feature = "sqlite-index")]
 pub mod spatial_index;
 
+pub mod model_relation_store;
+
+#[cfg(feature = "rvm-import")]
+pub mod rvm_import;
+
+#[cfg(feature = "rvm-import")]
+pub mod rvm_obj_export;
+
 // pub mod model_relation_store_v3; // 暂时注释：SQLite 备选方案，当前使用 SurrealDB
 
 #[cfg(all(feature = "sqlite-index", feature = "tonic"))]

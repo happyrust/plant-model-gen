@@ -278,6 +278,58 @@ fn parse_length_unit(unit: &str) -> LengthUnit {
     }
 }
 
+#[cfg(feature = "rvm-import")]
+fn try_export_obj_from_rvm_relation_store(
+    config: &ExportConfig,
+    db_option_ext: &DbOptionExt,
+    dbnum: u32,
+) -> Result<bool> {
+    let relation_store_root = std::env::var("MODEL_RELATION_STORE_PATH")
+        .unwrap_or_else(|_| "output/model_relations".to_string());
+    let relation_db = PathBuf::from(&relation_store_root).join(format!("{}/relations.db", dbnum));
+    if !relation_db.exists() {
+        return Ok(false);
+    }
+
+    let output_file = if let Some(path) = &config.output_path {
+        path.clone()
+    } else {
+        format!(
+            "{}/dbno_{}.obj",
+            db_option_ext.get_project_output_dir().display(),
+            dbnum
+        )
+    };
+
+    let unit_converter = UnitConverter::new(
+        parse_length_unit(&config.source_unit),
+        parse_length_unit(&config.target_unit),
+    );
+
+    let stats = aios_database::rvm_obj_export::export_rvm_obj_from_relation_store(
+        dbnum,
+        Path::new(&relation_store_root),
+        Path::new(&output_file),
+        &unit_converter,
+        config.verbose,
+    )?;
+
+    println!("✅ RVM relation-store OBJ 导出成功: {}", output_file);
+    println!("   - Refno 数量: {}", stats.refno_count);
+    println!("   - 几何数量: {}", stats.geometry_count);
+    println!("   - 输出大小: {} bytes", stats.output_file_size);
+    Ok(true)
+}
+
+#[cfg(not(feature = "rvm-import"))]
+fn try_export_obj_from_rvm_relation_store(
+    _config: &ExportConfig,
+    _db_option_ext: &DbOptionExt,
+    _dbnum: u32,
+) -> Result<bool> {
+    Ok(false)
+}
+
 fn normalize_refno_inputs(refnos: &[String]) -> Result<Vec<RefnoEnum>> {
     let mut parsed = Vec::new();
     for refno in refnos {
@@ -1590,8 +1642,6 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     println!("\n🎯 OBJ 导出模式");
     println!("================");
 
-    ensure_surreal_connected(db_option_ext).await?;
-
     // 如果需要导出 SVG，设置环境变量
     if config.export_svg {
         println!("🎨 启用 SVG 截面导出");
@@ -1612,6 +1662,7 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
 
     // 如果未指定 dbnum 且未提供 refnos，但要求全库导出，则在此处理
     if config.run_all_dbnos && config.dbnum.is_none() && config.refnos_str.is_empty() {
+        ensure_surreal_connected(db_option_ext).await?;
         println!("\n🔁 进入全库 OBJ 导出模式 (MDB 所有 dbnum)");
         let dbnos = query_mdb_db_nums(None, DBType::DESI).await?;
         if dbnos.is_empty() {
@@ -1633,6 +1684,7 @@ pub async fn export_obj_mode(config: ExportConfig, db_option_ext: &DbOptionExt) 
     if config.dbnum.is_some() {
         export_obj_mode_for_db(&config, db_option_ext).await?;
     } else {
+        ensure_surreal_connected(db_option_ext).await?;
         // refno 导出统一走标准 descendants-aware OBJ 导出链路，避免 debug-model 仅导出根节点本体。
         let refnos = normalize_refno_inputs(&config.refnos_str)?;
         for refno in &refnos {
@@ -1668,6 +1720,13 @@ async fn export_obj_mode_for_db(config: &ExportConfig, db_option_ext: &DbOptionE
     let dbnum = config
         .dbnum
         .expect("dbnum required in export_obj_mode_for_db");
+
+    if try_export_obj_from_rvm_relation_store(config, db_option_ext, dbnum)? {
+        return Ok(());
+    }
+
+    ensure_surreal_connected(db_option_ext).await?;
+
     println!("\n🔍 检测到 dbnum 参数: {}", dbnum);
     println!("📊 查询该数据库下的所有 SITE...");
 
@@ -3255,6 +3314,61 @@ pub fn import_spatial_index_mode(
 ) -> Result<()> {
     Err(anyhow!(
         "当前二进制未包含 SQLite 空间索引导入能力，请使用默认方式重新构建 aios-database"
+    ))
+}
+
+#[cfg(feature = "rvm-import")]
+pub fn import_rvm_mode(
+    rvm_path: &Path,
+    att_paths: &[PathBuf],
+    dbnum: u32,
+    relation_store_root: &Path,
+    verbose: bool,
+) -> Result<()> {
+    use aios_database::rvm_import::{RvmImportOptions, import_rvm_to_sqlite};
+
+    println!("\n🗃️ 导入 RVM 到 SQLite 关系表");
+    println!("==========================================");
+    println!("   - RVM 文件: {}", rvm_path.display());
+    println!("   - DBNUM: {}", dbnum);
+    println!("   - 关系库存储根目录: {}", relation_store_root.display());
+    if att_paths.is_empty() {
+        println!("   - ATT 文件: <none>");
+    } else {
+        for att in att_paths {
+            println!("   - ATT 文件: {}", att.display());
+        }
+    }
+
+    let stats = import_rvm_to_sqlite(&RvmImportOptions {
+        dbnum,
+        relation_store_root: relation_store_root.to_path_buf(),
+        rvm_path: rvm_path.to_path_buf(),
+        att_paths: att_paths.to_vec(),
+        verbose,
+    })?;
+
+    println!("\n🎉 RVM 导入完成！");
+    println!("📊 统计信息:");
+    println!("   - File 节点: {}", stats.file_nodes);
+    println!("   - Model 节点: {}", stats.model_nodes);
+    println!("   - Group 节点: {}", stats.group_nodes);
+    println!("   - Geometry 记录: {}", stats.geometry_records);
+    println!("   - 清理旧记录数: {}", stats.cleaned_records);
+
+    Ok(())
+}
+
+#[cfg(not(feature = "rvm-import"))]
+pub fn import_rvm_mode(
+    _rvm_path: &Path,
+    _att_paths: &[PathBuf],
+    _dbnum: u32,
+    _relation_store_root: &Path,
+    _verbose: bool,
+) -> Result<()> {
+    Err(anyhow!(
+        "当前二进制未包含 RVM 导入能力，请使用 --features rvm-import 重新构建 aios-database"
     ))
 }
 

@@ -248,6 +248,7 @@ dependencies = [
  "rusqlite",
  "rust-embed",
  "rust_xlsxwriter",
+ "rvm-rs",
  "serde",
  "serde_json",
  "serde_with",
@@ -10517,6 +10518,20 @@ dependencies = [
  "unicode-ccc 0.4.0",
  "unicode-properties",
  "unicode-script",
+]
+
+[[package]]
+name = "rvm-rs"
+version = "0.1.0"
+dependencies = [
+ "glam 0.30.10",
+ "memmap2",
+ "nom 8.0.0",
+ "regex",
+ "serde",
+ "serde_json",
+ "spade",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

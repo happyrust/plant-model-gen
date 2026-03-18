@@ -81,6 +81,7 @@ surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1", 
 surrealdb-types = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1" }
 pdms_io = { git = "https://github.com/happyrust/pdms-io.git", branch = "dev-3.1" }
 # gen-xkt = { path = "../gen-xkt" }
+rvm-rs = { path = "../rvmparser/rvm-rs", optional = true }
 
 # 通用依赖
 uuid = { version = "1.0", features = ["v4", "serde"], optional = true }
@@ -229,6 +230,7 @@ web_server = [
 ] #Web UI功能
 # duckdb-feature removed - no longer needed
 sqlite-index = ["dep:rusqlite", "dep:tokio-util"] # SQLite RTree 空间索引功能
+rvm-import = ["dep:rvm-rs", "sqlite-index"]
 debug_e3d = []
 meili = ["dep:meilisearch-sdk"]
 # 凸分解：拆分为"运行时（无 miniacd）"与"生成（依赖 miniacd）"两层，避免仅做碰撞/单测时被 pyo3 依赖拖慢/阻塞。

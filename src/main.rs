@@ -66,36 +66,6 @@ fn build_export_config(
 }
 
 #[cfg(not(feature = "gui"))]
-fn should_exit_after_debug_model_generation(
-    debug_model_requested: bool,
-    follow_up_export_requested: bool,
-    grpc_server_requested: bool,
-) -> bool {
-    debug_model_requested && !follow_up_export_requested && !grpc_server_requested
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn pure_debug_model_should_exit_early() {
-        assert!(super::should_exit_after_debug_model_generation(
-            true, false, false
-        ));
-    }
-
-    #[test]
-    fn debug_model_with_follow_up_work_should_not_exit_early() {
-        assert!(!super::should_exit_after_debug_model_generation(
-            true, true, false
-        ));
-        assert!(!super::should_exit_after_debug_model_generation(
-            true, false, true
-        ));
-        assert!(!super::should_exit_after_debug_model_generation(
-            false, false, false
-        ));
-    }
-}
 
 /// 模型生成完成后同步缓存数据到 SurrealDB 的辅助函数
 ///
@@ -321,19 +291,6 @@ async fn main() -> anyhow::Result<()> {
                 .help("Override mesh generation LOD level for this run (L0-L4). Defaults to db_options/DbOption.toml")
                 .value_name("LOD")
                 .value_parser(["L0", "L1", "L2", "L3", "L4"]),
-        )
-        .arg(
-            Arg::new("grpc-server")
-                .long("grpc-server")
-                .help("Start GRPC server")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("grpc-port")
-                .long("grpc-port")
-                .help("GRPC server port")
-                .value_name("PORT")
-                .default_value("50051"),
         )
         .arg(
             Arg::new("debug-model")
@@ -1379,15 +1336,6 @@ async fn main() -> anyhow::Result<()> {
         } else {
             // --debug-model: 增量生成（不清理、不强制 FORCE_REPLACE_MESH）
             let _gen_result = cli_modes::run_generate_model(&gen_config, &db_option_ext).await?;
-
-            if should_exit_after_debug_model_generation(
-                debug_model_requested,
-                follow_up_export_requested,
-                matches.get_flag("grpc-server"),
-            ) {
-                println!("✅ --debug-model 单独执行完成（未请求后续导出/服务启动，流程到此结束）");
-                return Ok(());
-            }
         }
     }
 
@@ -2293,12 +2241,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 如果指定了启动GRPC服务器
-    #[cfg(feature = "grpc")]
-    if matches.get_flag("grpc-server") {
-        return start_grpc_server_mode(&matches, db_option_ext).await;
-    }
-
     // 否则运行正常的应用程序
     run_app(Some(db_option_ext)).await
 }
@@ -2317,7 +2259,7 @@ fn maybe_redirect_stdio_to_log_file() {
 
     // 显式 verbose / 服务模式：不重定向，便于交互调试/观察运行状态。
     // 支持 -v 和 --verbose，避免用户加 -v 后仍被重定向导致终端无输出（看似卡住）。
-    if has_flag("--verbose") || has_flag("-v") || has_flag("--grpc-server") {
+    if has_flag("--verbose") || has_flag("-v") {
         // 允许用户按需设置 AIOS_LOG_TO_CONSOLE=1，把 log::info 也打印到控制台。
         return;
     }

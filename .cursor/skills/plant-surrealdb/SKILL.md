@@ -45,6 +45,11 @@ description: 面向 plant/rs-core/aios-core/gen_model-dev 的 SurrealDB/SurrealQ
 - **replace / 复写注意**：`inst_geo` 若用 `INSERT IGNORE`，则同 id 的旧记录不会被覆盖（包括 `unit_flag`/`param`）
   - ✅ 需要强制重建/切换 unit_flag 时：先点删再插入：`DELETE [inst_geo:123, inst_geo:456]; INSERT IGNORE INTO inst_geo [{...},{...}];`
   - ✅ 典型排错：`--regen-model` 后仍读到旧 `unit_flag=false`，先查 `SELECT id, unit_flag FROM inst_geo:123;` 再确认是否被 IGNORE 了
+- **空结果子查询 = NONE 判断**（常见坑）：用子查询判断「是否存在某记录」时，无记录时子查询返回 `[]`，`[] = NONE` 为 **false**，会错误排除本应保留的行
+  - ❌ 错误：`WHERE (SELECT status FROM $parent.out->inst_relate_cata_bool WHERE status = 'Success' LIMIT 1) = NONE`（无记录时 `[] = NONE` 为 false，全部被过滤）
+  - ✅ 正确：`WHERE (SELECT status FROM $parent.out->inst_relate_cata_bool WHERE status = 'Success' LIMIT 1)[0] = NONE`（无记录时 `[][0]` 为 NONE，`NONE = NONE` 为 true）
+  - 适用场景：`query_pending_cata_boolean`、`query_cata_neg_boolean_groups` 等「排除已有 Success 记录」的过滤逻辑
+  - 若同时存在 rs-core 与 plant-model-gen 中的同类查询，两处均需修复
 
 ## Rust 侧查询约定
 

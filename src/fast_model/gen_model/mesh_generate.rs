@@ -590,7 +590,8 @@ async fn query_pending_cata_boolean(
         String::new()
     } else {
         // 非覆盖模式下：跳过已成功写入 inst_relate_cata_bool 的实例，避免重复计算
-        "AND (SELECT status FROM $parent.out->inst_relate_cata_bool WHERE status = 'Success' LIMIT 1) = NONE"
+        // 子查询无记录时返回 []，[] = NONE 为假；需用 [0] 取首元素，空时 [0] = NONE 为真
+        "AND (SELECT status FROM $parent.out->inst_relate_cata_bool WHERE status = 'Success' LIMIT 1)[0] = NONE"
             .to_string()
     };
 

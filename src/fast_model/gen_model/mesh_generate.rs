@@ -184,63 +184,24 @@ impl RecentGeoDeduper {
     }
 }
 
-/// 扫描 meshes 目录下所有 lod_* 子目录中的 .glb 文件，提取已存在的 geo hash ID
-///
-/// 文件名格式：`{geo_hash}_{LOD}.glb` 或 `{geo_hash}.glb`，提取下划线前（或 `.` 前）的 u64。
-pub fn scan_existing_mesh_ids_from_dir(mesh_dir: &std::path::Path) -> Vec<u64> {
+/// 从已预加载的 AABB 缓存中获取 mesh geo ID（u64），用于预加载去重器。
+/// 不再扫描磁盘上的 glb 文件。
+pub fn query_existing_meshed_inst_geo_ids() -> Vec<u64> {
     let start = std::time::Instant::now();
-    let mut ids = Vec::new();
-
-    if !mesh_dir.exists() {
-        return ids;
-    }
-
-    if let Ok(entries) = std::fs::read_dir(mesh_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with("lod_") {
-                        collect_geo_ids_from_glb_dir(&path, &mut ids);
-                    }
-                }
-            }
-        }
-    }
-
+    let mut ids: Vec<u64> = EXIST_MESH_GEO_HASHES
+        .iter()
+        .filter_map(|kv| kv.key().parse::<u64>().ok())
+        .collect();
+    
     ids.sort_unstable();
     ids.dedup();
 
     debug_model!(
-        "📂 扫描 meshes 目录完成: {} 个唯一 geo hash, 耗时 {} ms (目录: {})",
+        "📂 从 AABB 缓存预加载完成: {} 个唯一 geo hash, 耗时 {} ms",
         ids.len(),
         start.elapsed().as_millis(),
-        mesh_dir.display()
     );
     ids
-}
-
-fn collect_geo_ids_from_glb_dir(dir: &std::path::Path, ids: &mut Vec<u64>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().map_or(false, |e| e == "glb") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                let id_part = stem.split('_').next().unwrap_or(stem);
-                if let Ok(id) = id_part.parse::<u64>() {
-                    ids.push(id);
-                }
-            }
-        }
-    }
-}
-
-/// 启动时扫描 meshes 目录获取已存在的 mesh geo ID（u64），用于预加载去重器
-pub fn query_existing_meshed_inst_geo_ids() -> Vec<u64> {
-    let mesh_dir = get_db_option().get_meshes_path();
-    scan_existing_mesh_ids_from_dir(&mesh_dir)
 }
 
 /// SQL flush 阈值

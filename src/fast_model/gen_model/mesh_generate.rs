@@ -659,27 +659,33 @@ async fn query_pending_inst_boolean(
 
     // 非覆盖模式：过滤掉已成功处理的
     const CHUNK_SIZE: usize = 200;
-    let candidate_keys: Vec<String> = candidates.iter().map(|r| r.to_pe_key()).collect();
+    
+    let candidates_vec: Vec<RefnoEnum> = candidates.iter().copied().collect();
     let mut pending: Vec<RefnoEnum> = Vec::new();
-    for chunk in candidate_keys.chunks(CHUNK_SIZE) {
+
+    for chunk in candidates_vec.chunks(CHUNK_SIZE) {
         if pending.len() >= limit {
             break;
         }
-        let remaining = limit - pending.len();
+
+        let chunk_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
         let sql = format!(
-            r#"
-SELECT VALUE id FROM [{}]
-WHERE (SELECT status FROM inst_relate_bool WHERE refno = $parent.id AND status = 'Success' LIMIT 1) = NONE
-LIMIT {remaining};
-"#,
-            chunk.join(",")
+            "SELECT VALUE refno FROM inst_relate_bool WHERE refno IN [{}] AND status = 'Success';",
+            chunk_keys
         );
 
-        let mut refnos: Vec<RefnoEnum> = model_primary_db()
+        let success_refnos: Vec<RefnoEnum> = model_primary_db()
             .query_take(&sql, 0)
             .await
             .unwrap_or_default();
-        pending.append(&mut refnos);
+            
+        let success_set: HashSet<RefnoEnum> = success_refnos.into_iter().collect();
+
+        for candidate in chunk {
+            if !success_set.contains(candidate) {
+                pending.push(*candidate);
+            }
+        }
     }
 
     pending.truncate(limit);

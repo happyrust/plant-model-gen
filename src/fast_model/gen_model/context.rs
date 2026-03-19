@@ -1,14 +1,6 @@
 use crate::options::DbOptionExt;
 use std::sync::Arc;
 
-/// cache-first 运行模式（model_cache 已移除，仅保留 Direct）
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CacheRunMode {
-    /// 直接模式：所有查询走 SurrealDB
-    Direct,
-    // PrefetchThenGenerate 和 CacheOnly 已随 foyer-cache-cleanup 移除
-}
-
 /// Full Noun / cache-first 运行的阶段标识。
 ///
 /// 约定：
@@ -35,7 +27,6 @@ pub struct NounProcessContext {
     pub db_option: Arc<DbOptionExt>,
     pub batch_size: usize,
     pub batch_concurrency: usize,
-    pub cache_run_mode: CacheRunMode,
     pub gen_stage: GenStage,
 }
 
@@ -51,7 +42,6 @@ impl NounProcessContext {
             db_option,
             batch_size,
             batch_concurrency: batch_concurrency.max(1),
-            cache_run_mode: CacheRunMode::Direct,
             gen_stage: GenStage::Generate,
         }
     }
@@ -62,20 +52,10 @@ impl NounProcessContext {
         cloned
     }
 
-    pub fn with_cache_run_mode(&self, mode: CacheRunMode) -> Self {
-        let mut cloned = self.clone();
-        cloned.cache_run_mode = mode;
-        cloned
-    }
-
-    /// 是否处于“离线生成”阶段：Generate 阶段且非 Direct 模式。
-    ///
-    /// 该判断用于 LOOP/PRIM 的输入缓存消费逻辑：
-    /// - PrefetchThenGenerate: Prefetch 阶段走 DB 预取；Generate 阶段只读 cache
-    /// - CacheOnly: 全程只读 cache（通常直接进入 Generate 阶段）
+    /// 兼容旧调用点：foyer/cache-only 流程已移除，当前始终走 Direct 路径。
+    #[inline]
     pub fn is_offline_generate(&self) -> bool {
-        matches!(self.gen_stage, GenStage::Generate)
-            && !matches!(self.cache_run_mode, CacheRunMode::Direct)
+        false
     }
 
     /// 根据总数计算分批范围
@@ -116,7 +96,6 @@ mod tests {
             db_option: Arc::new(DbOptionExt::from(DbOption::default())),
             batch_size: 100,
             batch_concurrency: 4,
-            cache_run_mode: CacheRunMode::Direct,
             gen_stage: GenStage::Generate,
         };
 

@@ -50,7 +50,7 @@ use aios_core::tool::db_tool::db1_hash;
 /// 说明：
 /// - 这里不尝试“从 ref0 推 dbnum”，必须通过 TreeIndexManager 映射。
 /// - 若某个 refno 无法映射 dbnum：直接返回 Err（避免悄然写错桶）。
-pub(crate) async fn split_shape_instances_by_dbnum(
+pub(crate) fn split_shape_instances_by_dbnum(
     shape_insts: &aios_core::geometry::ShapeInstancesData,
 ) -> anyhow::Result<HashMap<u32, aios_core::geometry::ShapeInstancesData>> {
     use aios_core::geometry::ShapeInstancesData;
@@ -59,7 +59,8 @@ pub(crate) async fn split_shape_instances_by_dbnum(
     let mut missing_by_source: HashMap<&'static str, usize> = HashMap::new();
     let mut missing_refnos: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-    async fn get_dbnum_cached(
+    /// 同步查询 dbnum，内部无 async 操作，无需 async 标记以减少 Future 开销
+    fn get_dbnum_cached(
         refno: RefnoEnum,
         source: &'static str,
         cache: &mut HashMap<RefnoEnum, u32>,
@@ -110,7 +111,6 @@ pub(crate) async fn split_shape_instances_by_dbnum(
             &mut missing_by_source,
             &mut missing_refnos,
         )
-        .await
         else {
             continue;
         };
@@ -130,7 +130,6 @@ pub(crate) async fn split_shape_instances_by_dbnum(
             &mut missing_by_source,
             &mut missing_refnos,
         )
-        .await
         else {
             continue;
         };
@@ -151,7 +150,6 @@ pub(crate) async fn split_shape_instances_by_dbnum(
             &mut missing_by_source,
             &mut missing_refnos,
         )
-        .await
         else {
             continue;
         };
@@ -170,7 +168,6 @@ pub(crate) async fn split_shape_instances_by_dbnum(
             &mut missing_by_source,
             &mut missing_refnos,
         )
-        .await
         else {
             continue;
         };
@@ -187,7 +184,6 @@ pub(crate) async fn split_shape_instances_by_dbnum(
             &mut missing_by_source,
             &mut missing_refnos,
         )
-        .await
         else {
             continue;
         };
@@ -1588,7 +1584,13 @@ async fn process_index_tree_generation(
     // 输出性能摘要到控制台
     perf.print_summary();
 
-    // 保存性能报告为 JSON 和 CSV
+    // 保存性能报告为 JSON 和 CSV（可通过 AIOS_DISABLE_PERF_REPORT=1 禁用）
+    let perf_report_disabled = std::env::var("AIOS_DISABLE_PERF_REPORT")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+
+    if !perf_report_disabled {
     let project_name = if !db_option.inner.project_name.is_empty() {
         db_option.inner.project_name.clone()
     } else {
@@ -1634,6 +1636,7 @@ async fn process_index_tree_generation(
 
     if let Err(e) = perf.save_csv(&csv_path, metadata) {
         eprintln!("[perf] 保存 CSV 报告失败: {}", e);
+    }
     }
 
     Ok(GenModelResult { success: true })

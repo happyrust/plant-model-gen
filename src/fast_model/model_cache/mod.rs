@@ -1,4 +1,5 @@
-//! [foyer-removal] 桩模块：model_cache 已移除，此处仅提供编译兼容。
+//! [foyer-removal] 兼容模块：model_cache 主流程已移除。
+//! 仅保留少量兼容类型/接口（如 cata_resolve_cache）供旧链路复用。
 
 pub mod cata_resolve_cache;
 pub mod geom_input_cache;

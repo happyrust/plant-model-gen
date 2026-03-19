@@ -3,7 +3,8 @@ pub mod gen_model;
 pub use gen_model::cata_model;
 pub mod cata_cache_gen;
 
-// [foyer-removal] 桩模块 —— 提供编译兼容，运行时不应被调用
+// [foyer-removal] 兼容模块：
+// foyer 主缓存流程已移除，但以下模块仍被现有链路复用（如 flush-cache-to-db、cache 生成/回放）。
 pub mod cache_flush;
 pub mod foyer_cache;
 pub mod instance_cache;
@@ -352,6 +353,66 @@ pub fn is_debug_model_errors_only() -> bool {
     DEBUG_MODEL_ERRORS_ONLY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// 启发式判断消息是否包含错误信息（用于 smart_debug 过滤）。
+///
+/// 规则：
+/// - 显式错误前缀优先（如 `[MODEL_ERROR]`、`❌`）
+/// - 中文按高置信错误词匹配（错误/失败/异常/崩溃/致命）
+/// - 英文按词元匹配（error/failed/failure/panic/exception/fatal）
+///
+/// 注意：仍是启发式策略，长期建议迁移到结构化日志级别过滤。
+pub fn is_error_message_heuristic(message: &str) -> bool {
+    let msg = message.trim();
+    if msg.is_empty() {
+        return false;
+    }
+
+    if msg.contains("[MODEL_ERROR]") || msg.contains('❌') {
+        return true;
+    }
+
+    const ZH_TOKENS: &[&str] = &["错误", "失败", "异常", "崩溃", "致命"];
+    if ZH_TOKENS.iter().any(|k| msg.contains(k)) {
+        return true;
+    }
+
+    const EN_TOKENS: &[&str] = &["error", "failed", "failure", "panic", "exception", "fatal"];
+    EN_TOKENS
+        .iter()
+        .any(|token| contains_ascii_token_case_insensitive(msg, token))
+}
+
+fn contains_ascii_token_case_insensitive(message: &str, token: &str) -> bool {
+    message
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|seg| !seg.is_empty())
+        .any(|seg| seg.eq_ignore_ascii_case(token))
+}
+
+#[cfg(test)]
+mod smart_debug_heuristic_tests {
+    use super::is_error_message_heuristic;
+
+    #[test]
+    fn detects_explicit_error_prefixes() {
+        assert!(is_error_message_heuristic("[MODEL_ERROR] code=E-001"));
+        assert!(is_error_message_heuristic("❌ 执行失败"));
+    }
+
+    #[test]
+    fn detects_cn_and_en_error_tokens() {
+        assert!(is_error_message_heuristic("任务执行失败: refno=24381_1"));
+        assert!(is_error_message_heuristic("Boolean worker failed with panic"));
+    }
+
+    #[test]
+    fn ignores_warning_or_non_error_tokens() {
+        assert!(!is_error_message_heuristic("⚠️ 仅提示: 跳过 trace"));
+        assert!(!is_error_message_heuristic("error_code=E001 只是字段输出"));
+        assert!(!is_error_message_heuristic("NoErrorState changed"));
+    }
+}
+
 /// 智能调试宏：在错误日志模式下只输出错误，否则输出所有调试信息
 
 #[macro_export]
@@ -364,19 +425,15 @@ macro_rules! smart_debug_model {
 
             if $crate::fast_model::is_debug_model_errors_only() {
 
-                // 在错误日志模式下，只输出包含错误关键词的信息
-
                 let message = format!($($arg)*);
 
-                if message.contains("错误") || message.contains("失败") || message.contains("Error") || message.contains("error") || message.contains("ERROR") {
+                if $crate::fast_model::is_error_message_heuristic(&message) {
 
                     println!("{}", message);
 
                 }
 
             } else {
-
-                // 正常调试模式，输出所有信息
 
                 println!($($arg)*);
 
@@ -418,13 +475,9 @@ macro_rules! smart_debug_model_debug {
 
             if $crate::fast_model::is_debug_model_errors_only() {
 
-                // 在错误日志模式下，只输出包含错误关键词的信息
-
                 let message = format!($($arg)*);
 
-                if message.contains("错误") || message.contains("失败") || message.contains("Error") || message.contains("error") || message.contains("ERROR") ||
-
-                   message.contains("Failed") || message.contains("failed") || message.contains("❌") || message.contains("⚠️") {
+                if $crate::fast_model::is_error_message_heuristic(&message) {
 
                     $crate::fast_model::debug_model_debug!($($arg)*);
 

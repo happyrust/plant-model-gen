@@ -5218,25 +5218,14 @@ async fn gen_cata_geos_inner(
                             }
 
                             tubi_relates.push(format!(
-
-                        "relate {}->tubi_relate:[{}, {}]->{}  \
-
-                        set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{aabb_hash}⟩,world_trans=trans:⟨{trans_hash}⟩, start_pt=vec3:⟨{start_hash}⟩, end_pt=vec3:⟨{end_hash}⟩, arrive_axis=vec3:⟨{arrive_hash}⟩, leave_axis=vec3:⟨{leave_hash}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
-
-                        current_tubing.leave_refno.to_pe_key(),
-
-                        branch_refno.to_pe_key(),
-
-                        current_tubing.index,
-
-                        current_tubing.arrive_refno.to_pe_key(),
-
-                        current_tubing.tubi_size.to_string(),
-
-                        owner_refno.to_pe_key(),
-
-                        current_tubing.leave_refno.to_pe_key(),
-
+                                "relate {}->tubi_relate:[{}, {}]->{}  set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{aabb_hash}⟩,world_trans=trans:⟨{trans_hash}⟩, start_pt=vec3:⟨{start_hash}⟩, end_pt=vec3:⟨{end_hash}⟩, arrive_axis=vec3:⟨{arrive_hash}⟩, leave_axis=vec3:⟨{leave_hash}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
+                                current_tubing.leave_refno.to_pe_key(),
+                                branch_refno.to_pe_key(),
+                                current_tubing.index,
+                                current_tubing.arrive_refno.to_pe_key(),
+                                current_tubing.tubi_size.to_string(),
+                                owner_refno.to_pe_key(),
+                                current_tubing.leave_refno.to_pe_key(),
                             ));
                         }
 
@@ -5710,25 +5699,14 @@ async fn gen_cata_geos_inner(
 
                                         if enable_surreal_outputs {
                                             let sql = format!(
-
-                                                "relate {}->tubi_relate:[{}, {}]->{}  \
-
-                                        set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{aabb_hash}⟩,world_trans=trans:⟨{trans_hash}⟩, start_pt=vec3:⟨{start_hash}⟩, end_pt=vec3:⟨{end_hash}⟩, arrive_axis=vec3:⟨{arrive_hash}⟩, leave_axis=vec3:⟨{leave_hash}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
-
+                                                "relate {}->tubi_relate:[{}, {}]->{}  set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{aabb_hash}⟩,world_trans=trans:⟨{trans_hash}⟩, start_pt=vec3:⟨{start_hash}⟩, end_pt=vec3:⟨{end_hash}⟩, arrive_axis=vec3:⟨{arrive_hash}⟩, leave_axis=vec3:⟨{leave_hash}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
                                                 current_tubing.leave_refno.to_pe_key(),
-
                                                 branch_refno.to_pe_key(),
-
                                                 current_tubing.index,
-
                                                 current_tubing.arrive_refno.to_pe_key(),
-
                                                 current_tubing.tubi_size.to_string(),
-
                                                 owner_refno.to_pe_key(),
-
                                                 current_tubing.leave_refno.to_pe_key(),
-
                                             );
 
                                             tubi_relates.push(sql);
@@ -6091,26 +6069,15 @@ async fn gen_cata_geos_inner(
                                 }
 
                                 tubi_relates.push(format!(
-
-                                "relate {}->tubi_relate:[{}, {}]->{}  \
-
-                            set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{aabb_hash}⟩,world_trans=trans:⟨{trans_hash}⟩, start_pt=vec3:⟨{start_hash}⟩, end_pt=vec3:⟨{end_hash}⟩, arrive_axis=vec3:⟨{arrive_hash}⟩, leave_axis=vec3:⟨{leave_hash}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
-
-                                current_tubing.leave_refno.to_pe_key(),
-
-                                branch_refno.to_pe_key(),
-
-                                current_tubing.index,
-
-                                current_tubing.arrive_refno.to_pe_key(),
-
-                                current_tubing.tubi_size.to_string(),
-
-                                owner_refno.to_pe_key(),
-
-                                current_tubing.leave_refno.to_pe_key(),
-
-                            ));
+                                    "relate {}->tubi_relate:[{}, {}]->{}  set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{aabb_hash}⟩,world_trans=trans:⟨{trans_hash}⟩, start_pt=vec3:⟨{start_hash}⟩, end_pt=vec3:⟨{end_hash}⟩, arrive_axis=vec3:⟨{arrive_hash}⟩, leave_axis=vec3:⟨{leave_hash}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
+                                    current_tubing.leave_refno.to_pe_key(),
+                                    branch_refno.to_pe_key(),
+                                    current_tubing.index,
+                                    current_tubing.arrive_refno.to_pe_key(),
+                                    current_tubing.tubi_size.to_string(),
+                                    owner_refno.to_pe_key(),
+                                    current_tubing.leave_refno.to_pe_key(),
+                                ));
                             }
 
                             current_tubing.index += 1;

@@ -53,37 +53,7 @@ pub fn prime_cached_aabb_for_mesh_ids<'a>(mesh_ids: impl IntoIterator<Item = &'a
     }
 }
 
-fn find_existing_mesh_path(mesh_dir: &Path, geo_hash: u64) -> Option<PathBuf> {
-    if !mesh_dir.exists() {
-        return None;
-    }
-
-    for lod in ["L0", "L1", "L2", "L3", "L4"] {
-        let path = mesh_dir.join(format!("lod_{lod}/{geo_hash}_{lod}.glb"));
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    None
-}
-
 fn is_valid_cached_aabb(aabb: &Aabb) -> bool {
     let ext_mag = aabb.extents().magnitude();
     ext_mag > 1e-4 && ext_mag < f32::INFINITY
-}
-
-fn load_local_mesh_aabb_from_glb(path: &Path) -> Option<Aabb> {
-    let mesh = crate::fast_model::export_model::import_glb::import_glb_to_mesh(path).ok()?;
-    let mut iter = mesh.vertices.iter();
-    let first = *iter.next()?;
-    let mut min = first;
-    let mut max = first;
-    for v in iter {
-        min = min.min(*v);
-        max = max.max(*v);
-    }
-    Some(Aabb::new(
-        parry3d::math::Point::new(min.x, min.y, min.z),
-        parry3d::math::Point::new(max.x, max.y, max.z),
-    ))
 }

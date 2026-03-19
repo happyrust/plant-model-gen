@@ -1151,15 +1151,10 @@ async fn apply_boolean_for_query(
         for NegInfo {
             id,
             geo_local_trans,
-            aabb,
             carrier_world_trans,
             ..
         } in neg_infos.iter().cloned()
         {
-            if aabb.is_none() {
-                continue;
-            }
-
             let neg_mesh_id = id.to_mesh_id();
 
             let is_unit_mesh = matches!(neg_mesh_id.as_str(), "1" | "2" | "3");

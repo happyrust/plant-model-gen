@@ -1244,12 +1244,11 @@ async fn main() -> anyhow::Result<()> {
     let regen_model_requested = matches.get_flag("regen-model");
     let regen_auto_enabled_defer_db_write = false;
     if regen_model_requested {
-        println!("🔄 检测到 --regen-model 参数，强制开启 replace_mesh 模式");
-        // 与 replace_mesh 配合：强制 mesh_worker 忽略 mesh_sig 缓存，确保本次能看到最新代码/配置效果。
+        println!("🔄 检测到 --regen-model 参数，强制开启 FORCE_REGEN_MESH 模式");
+        // 强制 mesh_worker 忽略 mesh_sig 缓存，确保本次能看到最新代码/配置效果。
         unsafe {
             std::env::set_var("FORCE_REGEN_MESH", "1");
         }
-        db_option_ext.inner.replace_mesh = Some(true);
         // 元件库(cata_neg)/设计型负实体导出依赖布尔结果（CatePos），因此 regen-model 必须开启布尔运算。
         if !db_option_ext.inner.apply_boolean_operation {
             println!("🔄 --regen-model 自动开启 apply_boolean_operation（生成 CatePos 布尔结果）");
@@ -1264,13 +1263,8 @@ async fn main() -> anyhow::Result<()> {
         println!("⚠️ --defer-db-write 已停用，当前版本将忽略该参数并继续在线写库");
     }
 
-    // --debug-model 是增量模式，不应强制 replace_mesh（不清理旧数据）；
-    // 只有 --regen-model 才需要 replace_mesh + pre_cleanup_for_regen。
-    if any_model_requested && !regen_model_requested && db_option_ext.inner.gen_mesh {
-        if db_option_ext.inner.replace_mesh == Some(true) {
-            println!("⚠️ 调试模式检测到 replace_mesh=true（配置/--regen-model），保持不变");
-        }
-    }
+    // --debug-model 是增量模式，不强制覆盖旧数据；
+    // 只有 --regen-model 才需要 pre_cleanup_for_regen。
 
     // 模型导出请求：默认只导出不触发生成；--regen-model 或 --debug-model 前置生成。
     let model_export_requested = matches.get_flag("export-obj")
@@ -1293,7 +1287,7 @@ async fn main() -> anyhow::Result<()> {
         || matches.get_flag("export-world-sites-parquet");
 
     // ========== 执行模型生成 ==========
-    // --regen-model: 清理后重新生成（强制 replace_mesh + FORCE_REGEN_MESH）
+    // --regen-model: 清理后重新生成（强制 FORCE_REGEN_MESH）
     // --debug-model: 直接增量生成（不清理，补充缺失的 inst_geo/mesh/布尔结果）
     let should_generate = regen_model_requested || any_model_requested;
     if should_generate {

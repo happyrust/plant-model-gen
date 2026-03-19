@@ -570,7 +570,7 @@ pub async fn api_stream_generate(
                             {
                                 Ok(_) => {
                                     // 生成 mesh（GLB 强制输出）——保证前端可直接拉取 /files/meshes/lod_L1/{geo_hash}_L1.glb
-                                    let replace_exist = req.force_regenerate || db_option.is_replace_mesh();
+                                    let replace_exist = false; // replace_exist 已废弃
                                     let meshes_dir = db_option.get_meshes_path();
                                     let precision = Arc::new(db_option.mesh_precision().clone());
                                     if let Err(e) = crate::fast_model::mesh_generate::gen_inst_meshes(
@@ -597,8 +597,7 @@ pub async fn api_stream_generate(
                                         if apply_by_config {
                                             // 先确保本批次基础 mesh 已就绪。
                                             // db 模式仍沿用 inst_geo 状态；file 模式则只依赖本地 glb + aabb_cache.rkyv。
-                                            let replace_exist =
-                                                req.force_regenerate || db_option.is_replace_mesh();
+                                            let replace_exist = false; // replace_exist 已废弃
                                             let meshes_dir = db_option.get_meshes_path();
                                             let precision =
                                                 Arc::new(db_option.mesh_precision().clone());

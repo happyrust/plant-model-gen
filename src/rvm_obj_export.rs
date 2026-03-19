@@ -1,5 +1,7 @@
 use crate::fast_model::unit_converter::UnitConverter;
-use aios_core::geometry::csg::{generate_csg_mesh, unit_box_mesh, unit_cylinder_mesh, unit_sphere_mesh};
+use aios_core::geometry::csg::{
+    generate_csg_mesh, unit_box_mesh, unit_cylinder_mesh, unit_sphere_mesh,
+};
 use aios_core::mesh_precision::LodMeshSettings;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::prim_geo::ctorus::CTorus;
@@ -45,10 +47,7 @@ pub fn export_rvm_obj_from_relation_store(
     )?;
 
     let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, Vec<u8>>(1)?,
-        ))
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
     })?;
 
     let mut refnos = BTreeSet::new();
@@ -58,8 +57,8 @@ pub fn export_rvm_obj_from_relation_store(
     for row in rows {
         let (refno, geometry_blob) = row?;
         refnos.insert(refno);
-        let payload: Value = serde_json::from_slice(&geometry_blob)
-            .context("解析 inst_geo.geometry JSON 失败")?;
+        let payload: Value =
+            serde_json::from_slice(&geometry_blob).context("解析 inst_geo.geometry JSON 失败")?;
         if let Some(mesh) = mesh_from_payload(&payload)? {
             merged.merge(&mesh);
             geometry_count += 1;
@@ -165,7 +164,8 @@ fn build_facet_group_mesh(payload: &Value) -> Result<Option<PlantMesh>> {
             }
             mesh.edges.push(Edge::new(vertices.clone()));
             for i in 1..(vertices.len() - 1) {
-                mesh.indices.extend_from_slice(&[base, base + i as u32, base + i as u32 + 1]);
+                mesh.indices
+                    .extend_from_slice(&[base, base + i as u32, base + i as u32 + 1]);
             }
         }
     }
@@ -219,7 +219,10 @@ fn build_pyramid_mesh(payload: &Value) -> Result<Option<PlantMesh>> {
 }
 
 fn build_rectangular_torus_mesh(payload: &Value) -> Result<Option<PlantMesh>> {
-    let Some(detail) = payload.get("detail").and_then(|v| v.get("rectangular_torus")) else {
+    let Some(detail) = payload
+        .get("detail")
+        .and_then(|v| v.get("rectangular_torus"))
+    else {
         return Ok(None);
     };
     let inner_radius = detail
@@ -387,7 +390,8 @@ fn build_generated_param_mesh(
     param: &PdmsGeoParam,
     local_transform: Option<DMat4>,
 ) -> Result<Option<PlantMesh>> {
-    let Some(generated) = generate_csg_mesh(param, &LodMeshSettings::default(), false, false, None) else {
+    let Some(generated) = generate_csg_mesh(param, &LodMeshSettings::default(), false, false, None)
+    else {
         return Ok(None);
     };
     let mesh = if let Some(local_transform) = local_transform {
@@ -403,16 +407,23 @@ fn build_line_mesh(payload: &Value) -> Result<Option<PlantMesh>> {
         return Ok(None);
     };
     let extents = bbox_max - bbox_min;
-    if extents.x.abs() < f32::EPSILON || extents.y.abs() < f32::EPSILON || extents.z.abs() < f32::EPSILON {
+    if extents.x.abs() < f32::EPSILON
+        || extents.y.abs() < f32::EPSILON
+        || extents.z.abs() < f32::EPSILON
+    {
         return Ok(None);
     }
 
     let unit_mesh = unit_cylinder_mesh(&LodMeshSettings::default(), false);
     let local_transform = DMat4::from_translation(DVec3::new(
-            ((bbox_min.x + bbox_max.x) * 0.5) as f64,
-            ((bbox_min.y + bbox_max.y) * 0.5) as f64,
-            bbox_min.z as f64,
-        )) * DMat4::from_scale(DVec3::new(extents.x as f64, extents.y as f64, extents.z as f64));
+        ((bbox_min.x + bbox_max.x) * 0.5) as f64,
+        ((bbox_min.y + bbox_max.y) * 0.5) as f64,
+        bbox_min.z as f64,
+    )) * DMat4::from_scale(DVec3::new(
+        extents.x as f64,
+        extents.y as f64,
+        extents.z as f64,
+    ));
     Ok(Some(unit_mesh.transform_by(&local_transform)))
 }
 
@@ -425,7 +436,10 @@ fn build_cylinder_mesh(payload: &Value) -> Result<Option<PlantMesh>> {
         return Ok(None);
     };
     let extents = bbox_max - bbox_min;
-    if extents.x.abs() < f32::EPSILON || extents.y.abs() < f32::EPSILON || extents.z.abs() < f32::EPSILON {
+    if extents.x.abs() < f32::EPSILON
+        || extents.y.abs() < f32::EPSILON
+        || extents.z.abs() < f32::EPSILON
+    {
         return Ok(None);
     }
 
@@ -434,7 +448,11 @@ fn build_cylinder_mesh(payload: &Value) -> Result<Option<PlantMesh>> {
         ((bbox_min.x + bbox_max.x) * 0.5) as f64,
         ((bbox_min.y + bbox_max.y) * 0.5) as f64,
         bbox_min.z as f64,
-    )) * DMat4::from_scale(DVec3::new(extents.x as f64, extents.y as f64, extents.z as f64));
+    )) * DMat4::from_scale(DVec3::new(
+        extents.x as f64,
+        extents.y as f64,
+        extents.z as f64,
+    ));
     Ok(Some(unit_mesh.transform_by(&local_transform)))
 }
 
@@ -451,12 +469,19 @@ fn build_centered_bbox_mesh(payload: &Value, unit_mesh: PlantMesh) -> Result<Opt
         return Ok(None);
     };
     let extents = bbox_max - bbox_min;
-    if extents.x.abs() < f32::EPSILON || extents.y.abs() < f32::EPSILON || extents.z.abs() < f32::EPSILON {
+    if extents.x.abs() < f32::EPSILON
+        || extents.y.abs() < f32::EPSILON
+        || extents.z.abs() < f32::EPSILON
+    {
         return Ok(None);
     }
     let center = (bbox_min + bbox_max) * 0.5;
     let local_transform = DMat4::from_translation(center.as_dvec3())
-        * DMat4::from_scale(DVec3::new(extents.x as f64, extents.y as f64, extents.z as f64));
+        * DMat4::from_scale(DVec3::new(
+            extents.x as f64,
+            extents.y as f64,
+            extents.z as f64,
+        ));
     Ok(Some(unit_mesh.transform_by(&local_transform)))
 }
 
@@ -486,10 +511,7 @@ fn parse_transform(payload: &Value) -> Result<DMat4> {
         .collect::<Result<Vec<_>>>()?;
 
     Ok(DMat4::from_cols_array(&[
-        m[0], m[1], m[2], 0.0,
-        m[3], m[4], m[5], 0.0,
-        m[6], m[7], m[8], 0.0,
-        t[0], t[1], t[2], 1.0,
+        m[0], m[1], m[2], 0.0, m[3], m[4], m[5], 0.0, m[6], m[7], m[8], 0.0, t[0], t[1], t[2], 1.0,
     ]))
 }
 
@@ -566,5 +588,7 @@ fn value_to_f32(value: &Value) -> Result<f32> {
 }
 
 fn value_to_f64(value: &Value) -> Result<f64> {
-    value.as_f64().ok_or_else(|| anyhow!("JSON 数值字段不是 f64"))
+    value
+        .as_f64()
+        .ok_or_else(|| anyhow!("JSON 数值字段不是 f64"))
 }

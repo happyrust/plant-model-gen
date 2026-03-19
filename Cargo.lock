@@ -10465,6 +10465,7 @@ dependencies = [
 [[package]]
 name = "rvm-rs"
 version = "0.1.0"
+source = "git+https://github.com/happyrust/rvm-rs#45470d2a0ddcabcd1f11958362e6440865bfc24e"
 dependencies = [
  "glam 0.30.10",
  "memmap2",

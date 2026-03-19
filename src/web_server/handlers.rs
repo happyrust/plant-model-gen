@@ -173,6 +173,8 @@ use nalgebra::{Point3, Vector3};
 #[cfg(feature = "sqlite-index")]
 use parry3d::bounding_volume::Aabb;
 #[cfg(feature = "sqlite-index")]
+use rusqlite::OptionalExtension;
+#[cfg(feature = "sqlite-index")]
 use std::str::FromStr;
 
 // 可选：从本地 SQLite 读取项目列表（按 DbOption.toml 配置）
@@ -5962,16 +5964,349 @@ pub async fn api_space_fitting(Json(req): Json<FittingRequest>) -> Json<serde_js
     }))
 }
 
+#[cfg(feature = "sqlite-index")]
+const WALL_DISTANCE_DEFAULT_MAX_CANDIDATES: usize = 20;
+#[cfg(feature = "sqlite-index")]
+const WALL_DISTANCE_DEFAULT_SEARCH_RADIUS_MM: f64 = 5000.0;
+#[cfg(feature = "sqlite-index")]
+const WALL_DISTANCE_MAX_CANDIDATE_CAP: usize = 200;
+
+#[cfg(feature = "sqlite-index")]
+fn parse_wall_distance_source_refno(raw: &str) -> anyhow::Result<RefU64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("source_refno 为空");
+    }
+    if let Ok(parsed) = RefU64::from_str(trimmed) {
+        return Ok(parsed);
+    }
+    let normalized = trimmed.replace('_', "/");
+    if let Ok(parsed) = RefU64::from_str(&normalized) {
+        return Ok(parsed);
+    }
+    anyhow::bail!("source_refno 格式无效: {trimmed}");
+}
+
+#[cfg(feature = "sqlite-index")]
+fn wall_distance_point_to_dto(point: Point3<f32>) -> WallDistancePoint {
+    WallDistancePoint {
+        x: point.x as f64,
+        y: point.y as f64,
+        z: point.z as f64,
+    }
+}
+
+#[cfg(feature = "sqlite-index")]
+fn wall_distance_aabb_to_dto(aabb: &Aabb) -> WallDistanceAabbDto {
+    WallDistanceAabbDto {
+        min: wall_distance_point_to_dto(aabb.mins),
+        max: wall_distance_point_to_dto(aabb.maxs),
+    }
+}
+
+#[cfg(feature = "sqlite-index")]
+fn wall_distance_aabb_distance_mm(a: &Aabb, b: &Aabb) -> f64 {
+    let dx = if a.maxs.x < b.mins.x {
+        b.mins.x - a.maxs.x
+    } else if b.maxs.x < a.mins.x {
+        a.mins.x - b.maxs.x
+    } else {
+        0.0
+    };
+    let dy = if a.maxs.y < b.mins.y {
+        b.mins.y - a.maxs.y
+    } else if b.maxs.y < a.mins.y {
+        a.mins.y - b.maxs.y
+    } else {
+        0.0
+    };
+    let dz = if a.maxs.z < b.mins.z {
+        b.mins.z - a.maxs.z
+    } else if b.maxs.z < a.mins.z {
+        a.mins.z - b.maxs.z
+    } else {
+        0.0
+    };
+    let dx = dx as f64;
+    let dy = dy as f64;
+    let dz = dz as f64;
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+#[cfg(feature = "sqlite-index")]
+fn query_wall_distance_spec_value(
+    index: &SqliteSpatialIndex,
+    refno: RefU64,
+) -> anyhow::Result<Option<i64>> {
+    let conn = rusqlite::Connection::open(index.inner().path())?;
+    let value = conn
+        .query_row(
+            "SELECT spec_value FROM items WHERE id = ?1",
+            [refno.0 as i64],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(value)
+}
+
+#[cfg(feature = "sqlite-index")]
+fn normalize_wall_distance_target_nouns(
+    input: Option<Vec<String>>,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::<String>::new();
+    for raw in input.unwrap_or_default() {
+        let noun = raw.trim().to_uppercase();
+        if !noun.is_empty() {
+            out.insert(noun);
+        }
+    }
+    if out.is_empty() {
+        out.insert("WALL".to_string());
+        out.insert("COLUMN".to_string());
+    }
+    out
+}
+
+#[cfg(feature = "sqlite-index")]
+fn sort_and_truncate_wall_distance_candidates(
+    candidates: &mut Vec<WallDistanceCandidateDto>,
+    max_candidates: usize,
+) {
+    candidates.sort_by(|a, b| {
+        a.distance_mm
+            .partial_cmp(&b.distance_mm)
+            .unwrap_or(Ordering::Equal)
+    });
+    if candidates.len() > max_candidates {
+        candidates.truncate(max_candidates);
+    }
+}
+
 /// 支架定位信息（距墙/定位块）（占位）
 pub async fn api_space_wall_distance(
     Json(req): Json<WallDistanceRequest>,
 ) -> Json<serde_json::Value> {
-    Json(json!({
-        "status":"success",
-        "message":"stub",
-        "data": {"wall_id": null, "distances": {"x":0.0, "y":0.0, "z":0.0}, "chosen_axis": ""},
-        "echo": req
-    }))
+    #[cfg(not(feature = "sqlite-index"))]
+    {
+        return Json(json!({
+            "status": "error",
+            "message": "wall-distance 需要 sqlite-index 特性支持"
+        }));
+    }
+
+    #[cfg(feature = "sqlite-index")]
+    {
+        let target_nouns = normalize_wall_distance_target_nouns(req.target_nouns.clone());
+        let max_candidates = req
+            .max_candidates
+            .unwrap_or(WALL_DISTANCE_DEFAULT_MAX_CANDIDATES)
+            .clamp(1, WALL_DISTANCE_MAX_CANDIDATE_CAP);
+        let search_radius_mm = req
+            .search_radius
+            .unwrap_or(WALL_DISTANCE_DEFAULT_SEARCH_RADIUS_MM)
+            .max(0.0);
+
+        let source_refno = match parse_wall_distance_source_refno(&req.source_refno) {
+            Ok(v) => v,
+            Err(err) => {
+                return Json(json!({
+                    "status": "error",
+                    "message": format!("source_refno 解析失败: {err}")
+                }));
+            }
+        };
+
+        let index = match SqliteSpatialIndex::with_default_path() {
+            Ok(v) => v,
+            Err(err) => {
+                return Json(json!({
+                    "status": "error",
+                    "message": format!("打开 spatial_index.sqlite 失败: {err}")
+                }));
+            }
+        };
+
+        let source_aabb = match index.get_aabb(source_refno) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return Json(json!({
+                    "status": "error",
+                    "message": format!("source_refno 未命中空间索引: {}", source_refno)
+                }));
+            }
+            Err(err) => {
+                return Json(json!({
+                    "status": "error",
+                    "message": format!("读取 source AABB 失败: {err}")
+                }));
+            }
+        };
+
+        let expand = search_radius_mm as f32;
+        let query_aabb = Aabb::new(
+            source_aabb.mins - Vector3::new(expand, expand, expand),
+            source_aabb.maxs + Vector3::new(expand, expand, expand),
+        );
+
+        let candidate_refnos = match index.query_intersect(&query_aabb) {
+            Ok(v) => v,
+            Err(err) => {
+                return Json(json!({
+                    "status": "error",
+                    "message": format!("空间索引查询失败: {err}")
+                }));
+            }
+        };
+
+        let mut candidates = Vec::<WallDistanceCandidateDto>::new();
+        for candidate_refno in candidate_refnos {
+            if candidate_refno == source_refno {
+                continue;
+            }
+
+            let noun = match index.get_noun(candidate_refno) {
+                Ok(Some(v)) => v.trim().to_uppercase(),
+                Ok(None) => continue,
+                Err(_) => continue,
+            };
+            if noun.is_empty() || !target_nouns.contains(&noun) {
+                continue;
+            }
+
+            let candidate_aabb = match index.get_aabb(candidate_refno) {
+                Ok(Some(v)) => v,
+                _ => continue,
+            };
+            let distance_mm = wall_distance_aabb_distance_mm(&source_aabb, &candidate_aabb);
+            if search_radius_mm > 0.0 && distance_mm > search_radius_mm {
+                continue;
+            }
+
+            let spec_value = query_wall_distance_spec_value(&index, candidate_refno)
+                .ok()
+                .flatten();
+            candidates.push(WallDistanceCandidateDto {
+                refno: candidate_refno.to_string(),
+                noun,
+                spec_value,
+                distance_mm,
+                aabb: wall_distance_aabb_to_dto(&candidate_aabb),
+            });
+        }
+
+        sort_and_truncate_wall_distance_candidates(&mut candidates, max_candidates);
+
+        let response = WallDistanceResponseData {
+            source_refno: source_refno.to_string(),
+            source_aabb: wall_distance_aabb_to_dto(&source_aabb),
+            candidates,
+        };
+
+        Json(json!({
+            "status":"success",
+            "data": response
+        }))
+    }
+}
+
+#[cfg(all(test, feature = "sqlite-index"))]
+mod wall_distance_tests {
+    use super::*;
+
+    #[test]
+    fn parse_wall_distance_source_refno_supports_slash_and_underscore() {
+        let slash =
+            parse_wall_distance_source_refno("24381/1001").expect("slash refno should parse");
+        let underscore =
+            parse_wall_distance_source_refno("24381_1001").expect("underscore refno should parse");
+        assert_eq!(slash, underscore);
+        assert!(parse_wall_distance_source_refno("bad-refno").is_err());
+    }
+
+    #[test]
+    fn normalize_wall_distance_target_nouns_uses_default_when_empty() {
+        let defaults = normalize_wall_distance_target_nouns(None);
+        assert!(defaults.contains("WALL"));
+        assert!(defaults.contains("COLUMN"));
+
+        let customized = normalize_wall_distance_target_nouns(Some(vec![
+            " wall ".to_string(),
+            "".to_string(),
+            "column".to_string(),
+            "wall".to_string(),
+        ]));
+        assert_eq!(customized.len(), 2);
+        assert!(customized.contains("WALL"));
+        assert!(customized.contains("COLUMN"));
+    }
+
+    #[test]
+    fn wall_distance_aabb_distance_mm_computes_overlap_and_gap() {
+        let a = Aabb::new(
+            Point3::new(0.0_f32, 0.0_f32, 0.0_f32),
+            Point3::new(1.0_f32, 1.0_f32, 1.0_f32),
+        );
+        let b_overlap = Aabb::new(
+            Point3::new(0.5_f32, 0.5_f32, 0.5_f32),
+            Point3::new(2.0_f32, 2.0_f32, 2.0_f32),
+        );
+        let c_gap = Aabb::new(
+            Point3::new(2.0_f32, 0.0_f32, 0.0_f32),
+            Point3::new(3.0_f32, 1.0_f32, 1.0_f32),
+        );
+
+        assert_eq!(wall_distance_aabb_distance_mm(&a, &b_overlap), 0.0);
+        assert!((wall_distance_aabb_distance_mm(&a, &c_gap) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sort_and_truncate_wall_distance_candidates_orders_and_limits_results() {
+        let dummy_aabb = WallDistanceAabbDto {
+            min: WallDistancePoint {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            max: WallDistancePoint {
+                x: 1.0,
+                y: 1.0,
+                z: 1.0,
+            },
+        };
+        let mut candidates = vec![
+            WallDistanceCandidateDto {
+                refno: "1/1".to_string(),
+                noun: "WALL".to_string(),
+                spec_value: None,
+                distance_mm: 8.0,
+                aabb: dummy_aabb.clone(),
+            },
+            WallDistanceCandidateDto {
+                refno: "1/2".to_string(),
+                noun: "COLUMN".to_string(),
+                spec_value: None,
+                distance_mm: 2.0,
+                aabb: dummy_aabb.clone(),
+            },
+            WallDistanceCandidateDto {
+                refno: "1/3".to_string(),
+                noun: "WALL".to_string(),
+                spec_value: None,
+                distance_mm: 5.0,
+                aabb: dummy_aabb,
+            },
+        ];
+
+        sort_and_truncate_wall_distance_candidates(&mut candidates, 2);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].refno, "1/2");
+        assert_eq!(candidates[1].refno, "1/3");
+
+        let mut empty = Vec::<WallDistanceCandidateDto>::new();
+        sort_and_truncate_wall_distance_candidates(&mut empty, 5);
+        assert!(empty.is_empty());
+    }
 }
 
 /// 与预埋板相对定位（占位）

@@ -2258,7 +2258,7 @@ pub async fn run_bool_worker_from_tasks(
     use super::refno_assoc_index::RefnoAssocIndexBatch;
 
     let started = std::time::Instant::now();
-    let replace_exist = db_option.is_replace_mesh();
+    let replace_exist = false; // replace_exist 已废弃，覆盖模式由 pre_cleanup_for_regen 替代
     let deferred_mode = sql_writer.is_some();
     let writer: Arc<dyn BoolResultWriter> = if let Some(ref w) = sql_writer {
         Arc::new(SqlBoolWriter::new(w.clone()))
@@ -2273,8 +2273,8 @@ pub async fn run_bool_worker_from_tasks(
     };
 
     println!(
-        "[bool_worker/memory] 启动: total={} replace_exist={} defer_db_write={}",
-        report.total, replace_exist, report.deferred_mode
+        "[bool_worker/memory] 启动: total={} defer_db_write={}",
+        report.total, report.deferred_mode
     );
 
     let mut assoc_batch = RefnoAssocIndexBatch::default();

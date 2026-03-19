@@ -178,7 +178,7 @@ pub async fn gen_cata_geos_for_cache(
         });
     }
 
-    let replace_exist = db_option.inner.is_replace_mesh();
+    let replace_exist = false; // replace_exist 已废弃
     let respect_tufl = std::env::var_os("AIOS_RESPECT_TUFL").is_some();
     let concurrency = std::thread::available_parallelism()
         .map(|n| n.get().min(8))

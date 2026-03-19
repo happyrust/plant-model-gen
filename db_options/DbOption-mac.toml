@@ -50,7 +50,8 @@ index_tree_batch_size = 200
 # 可选值: "cate", "loop", "prim" 或具体 noun 名称如 "BRAN", "PANE"
 # 空 vec 表示启用所有类别（默认行为）
 # 房间相关类型: FRMW(框架), SBFR(子框架), PANE(面板)
-# index_tree_enabled_target_types = ["PANE", "BRAN", "HANG"]
+# index_tree_enabled_target_types = ["PANE", "WALL", "GWALL", "GENSEC"]
+# index_tree_enabled_target_types = ["PANE"]
 
 # 排除的 noun 列表
 # 即使类别启用，这里的 noun 也会被过滤掉
@@ -292,7 +293,7 @@ surreal_password = "root"
 
 # SurrealDB 连接配置 (PE/属性/输入数据)
 [surrealdb]
-mode = "file"
+mode = "ws"
 path = "/Volumes/DPC/work/db-data/ams-8020.db"
 
 # SurrealKV 连接配置 (模型数据写入)

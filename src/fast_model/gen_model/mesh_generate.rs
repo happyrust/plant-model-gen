@@ -584,10 +584,7 @@ pub async fn gen_meshes_in_db(
     if refnos.is_empty() {
         return Ok(());
     }
-    let replace_exist = option
-        .as_ref()
-        .map(|x| x.is_replace_mesh())
-        .unwrap_or(false);
+    let replace_exist = false; // replace_exist 已废弃，覆盖模式由 pre_cleanup_for_regen 替代
     // let time = std::time::Instant::now();
     let dir = option
         .as_ref()
@@ -864,7 +861,7 @@ async fn query_candidate_inst_geo_ids_for_refnos(
 #[deprecated(note = "使用 run_mesh_worker_from_channel 替代，避免 DB 轮询")]
 pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> anyhow::Result<()> {
     let batch_size = batch_size.max(1);
-    let replace_exist = db_option.is_replace_mesh();
+    let replace_exist = false; // replace_exist 已废弃
     let mut round = 0usize;
     let mut total_processed = 0usize;
     let mut stalled_rounds = 0usize;
@@ -1313,7 +1310,7 @@ pub async fn run_mesh_worker_from_channel(
 /// file 模式以本地 GLB + aabb_cache.rkyv 为前置状态源；db 模式仍兼容历史查询口径。
 pub async fn run_boolean_worker(db_option: Arc<DbOption>, batch_size: usize) -> anyhow::Result<()> {
     let batch_size = batch_size.max(1);
-    let replace_exist = db_option.is_replace_mesh();
+    let replace_exist = false; // replace_exist 已废弃
     let relation_targets = query_relation_targets_combined().await?;
 
     let start = std::time::Instant::now();
@@ -1374,10 +1371,7 @@ pub async fn booleans_meshes_in_db(
     if refnos.is_empty() {
         return Ok(());
     }
-    let replace_exist = option
-        .as_ref()
-        .map(|x| x.is_replace_mesh())
-        .unwrap_or(false);
+    let replace_exist = false; // replace_exist 已废弃
 
     for chunk in refnos.chunks(100) {
         apply_cata_neg_boolean_manifold(chunk, replace_exist).await?;
@@ -1401,10 +1395,7 @@ pub async fn process_meshes_update_db(
     if refnos.is_empty() {
         return Ok(());
     }
-    let replace_exist = option
-        .as_ref()
-        .map(|x| x.is_replace_mesh())
-        .unwrap_or(false);
+    let replace_exist = false; // replace_exist 已废弃
     let time = std::time::Instant::now();
     let dir = option
         .as_ref()
@@ -1459,10 +1450,7 @@ pub async fn process_meshes_bran(
         return Ok(());
     }
 
-    let replace_exist = option
-        .as_ref()
-        .map(|x| x.is_replace_mesh())
-        .unwrap_or(false);
+    let replace_exist = false; // replace_exist 已废弃
     let time = std::time::Instant::now();
     let dir = option
         .as_ref()
@@ -1536,7 +1524,7 @@ pub async fn process_meshes_update_db_deep(
         }
 
         let precision = &dboption.inner.mesh_precision;
-        let replace_exist = dboption.is_replace_mesh();
+        let replace_exist = false; // replace_exist 已废弃
         let mesh_formats = &dboption.mesh_formats;
         println!("📊 更新模型结点数量: {}", refnos.len());
         let time = std::time::Instant::now();

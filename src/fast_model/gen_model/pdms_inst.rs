@@ -420,9 +420,9 @@ fn build_delete_inst_geo_by_hashes_sql(geo_hashes: &[u64], chunk_size: usize) ->
 /// （此前 DELETE + INSERT IGNORE 在 save_instance_data_optimize 中执行，
 ///   会覆盖 mesh worker 已写入的 meshed=true）。
 pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<()> {
-    if seed_refnos.is_empty() {
-        return Ok(());
-    }
+    // if seed_refnos.is_empty() {
+    return Ok(());
+    // }
 
     const CHUNK_SIZE: usize = 200;
 
@@ -645,6 +645,41 @@ pub async fn save_instance_data_with_report(
     // 这里降低并发以提升整体成功率（结合 TransactionBatcher 内部重试）。
     const MAX_CONCURRENT_TX: usize = 2;
     let mut report = SaveInstanceDataReport::default();
+    let debug_filters: HashSet<String> = std::env::var("AIOS_DEBUG_NEG_RECONCILE")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|item| {
+                    item.trim()
+                        .trim_matches('`')
+                        .trim_matches('⟨')
+                        .trim_matches('⟩')
+                })
+                .filter_map(|item| {
+                    let normalized = item
+                        .strip_prefix("pe:")
+                        .or_else(|| item.strip_prefix("pe:⟨"))
+                        .unwrap_or(item)
+                        .trim_matches('`')
+                        .trim_matches('⟨')
+                        .trim_matches('⟩')
+                        .trim()
+                        .to_string();
+                    if normalized.is_empty() {
+                        None
+                    } else {
+                        Some(normalized)
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let should_debug_neg_write = |carrier: &RefnoEnum, target: &RefnoEnum| -> bool {
+        !debug_filters.is_empty()
+            && (debug_filters.contains(&carrier.to_string())
+                || debug_filters.contains(&target.to_string()))
+    };
+    let mut debug_neg_pairs: Vec<(RefnoEnum, RefnoEnum)> = Vec::new();
     let mut refno_assoc_batch = if is_refno_assoc_index_enabled() {
         Some(RefnoAssocIndexBatch::default())
     } else {
@@ -908,6 +943,13 @@ pub async fn save_instance_data_with_report(
                             neg_refno.to_pe_key(), // 负载体
                             target.to_pe_key(),    // 正实体（被减实体）
                         ));
+                        if should_debug_neg_write(neg_refno, target) {
+                            println!(
+                                "[neg-write-debug] enqueue target={} carrier={} geo_relate_id={}",
+                                target, neg_refno, geo_relate_id
+                            );
+                            debug_neg_pairs.push((*target, *neg_refno));
+                        }
                         if let Some(batch) = refno_assoc_batch.as_mut() {
                             batch.add_neg_relate_id(
                                 *neg_refno,
@@ -916,10 +958,17 @@ pub async fn save_instance_data_with_report(
                         }
 
                         if neg_buffer.len() >= CHUNK_SIZE {
-                            let statement = format!(
-                                "INSERT RELATION IGNORE INTO neg_relate [{}];",
-                                neg_buffer.join(",")
-                            );
+                            let statement = if replace_exist {
+                                format!(
+                                    "INSERT RELATION INTO neg_relate [{}];",
+                                    neg_buffer.join(",")
+                                )
+                            } else {
+                                format!(
+                                    "INSERT RELATION IGNORE INTO neg_relate [{}];",
+                                    neg_buffer.join(",")
+                                )
+                            };
                             neg_batcher.push(statement).await?;
                             neg_buffer.clear();
                         }
@@ -929,14 +978,46 @@ pub async fn save_instance_data_with_report(
         }
 
         if !neg_buffer.is_empty() {
-            let statement = format!(
-                "INSERT RELATION IGNORE INTO neg_relate [{}];",
-                neg_buffer.join(",")
-            );
+            let statement = if replace_exist {
+                format!(
+                    "INSERT RELATION INTO neg_relate [{}];",
+                    neg_buffer.join(",")
+                )
+            } else {
+                format!(
+                    "INSERT RELATION IGNORE INTO neg_relate [{}];",
+                    neg_buffer.join(",")
+                )
+            };
             neg_batcher.push(statement).await?;
         }
 
         neg_batcher.finish().await?;
+        if !debug_neg_pairs.is_empty() {
+            debug_neg_pairs.sort_unstable();
+            debug_neg_pairs.dedup();
+            for (target, carrier) in debug_neg_pairs {
+                let sql = format!(
+                    "SELECT id, record::id(in) AS in_id, record::id(out) AS out_id, record::id(pe) AS pe_id \
+FROM neg_relate WHERE out = {} AND pe = {}",
+                    target.to_pe_key(),
+                    carrier.to_pe_key()
+                );
+                let rows: Vec<serde_json::Value> = model_primary_db()
+                    .query_take(&sql, 0)
+                    .await
+                    .unwrap_or_default();
+                println!(
+                    "[neg-write-debug] post-finish target={} carrier={} rows={}",
+                    target,
+                    carrier,
+                    rows.len()
+                );
+                for row in rows {
+                    println!("[neg-write-debug] row={}", row);
+                }
+            }
+        }
     }
 
     // ngmr_relate - 新结构
@@ -980,10 +1061,17 @@ pub async fn save_instance_data_with_report(
                         }
 
                         if ngmr_buffer.len() >= CHUNK_SIZE {
-                            let statement = format!(
-                                "INSERT RELATION IGNORE INTO ngmr_relate [{}];",
-                                ngmr_buffer.join(",")
-                            );
+                            let statement = if replace_exist {
+                                format!(
+                                    "INSERT RELATION INTO ngmr_relate [{}];",
+                                    ngmr_buffer.join(",")
+                                )
+                            } else {
+                                format!(
+                                    "INSERT RELATION IGNORE INTO ngmr_relate [{}];",
+                                    ngmr_buffer.join(",")
+                                )
+                            };
                             ngmr_batcher.push(statement).await?;
                             ngmr_buffer.clear();
                         }
@@ -993,10 +1081,17 @@ pub async fn save_instance_data_with_report(
         }
 
         if !ngmr_buffer.is_empty() {
-            let statement = format!(
-                "INSERT RELATION IGNORE INTO ngmr_relate [{}];",
-                ngmr_buffer.join(",")
-            );
+            let statement = if replace_exist {
+                format!(
+                    "INSERT RELATION INTO ngmr_relate [{}];",
+                    ngmr_buffer.join(",")
+                )
+            } else {
+                format!(
+                    "INSERT RELATION IGNORE INTO ngmr_relate [{}];",
+                    ngmr_buffer.join(",")
+                )
+            };
             ngmr_batcher.push(statement).await?;
         }
 
@@ -1538,6 +1633,7 @@ impl TransactionBatcher {
             // 同时：SurrealDB 在高并发事务下可能返回 “Transaction conflict: Resource busy”，
             // 官方提示该事务可重试。这里对整块事务做有限次重试 + 退避，尽量避免“部分批次直接丢数据”。
             let mut repaired_inst_relate_aabb_index = false;
+            let mut repaired_neg_relate_index = false;
             let mut attempt: usize = 0;
             let max_retries: usize = 8;
 
@@ -1563,6 +1659,8 @@ impl TransactionBatcher {
                         // 这会导致所有 INSERT 失败并连带回滚同一事务块（inst_relate 也写不进去）。
                         let is_inst_relate_aabb_unique_conflict = es.contains("idx_inst_relate_aabb_refno")
                             && es.contains("already contains");
+                        let is_neg_relate_unique_conflict =
+                            es.contains("unique_neg_relate") && es.contains("already contains");
 
                         if is_inst_relate_aabb_unique_conflict && !repaired_inst_relate_aabb_index {
                             repaired_inst_relate_aabb_index = true;
@@ -1571,6 +1669,17 @@ impl TransactionBatcher {
                             );
                             let repair_sql = "REMOVE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb; \
 DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS refno UNIQUE;";
+                            let _ = model_query_response(repair_sql).await;
+                            continue;
+                        }
+
+                        if is_neg_relate_unique_conflict && !repaired_neg_relate_index {
+                            repaired_neg_relate_index = true;
+                            debug_model_debug!(
+                                "⚠️ [DEBUG] 检测到 neg_relate 唯一索引冲突，尝试重建索引并重试..."
+                            );
+                            let repair_sql = "REMOVE INDEX unique_neg_relate ON TABLE neg_relate; \
+DEFINE INDEX unique_neg_relate ON TABLE neg_relate COLUMNS in, out UNIQUE;";
                             let _ = model_query_response(repair_sql).await;
                             continue;
                         }
@@ -1765,6 +1874,40 @@ pub async fn reconcile_missing_neg_relate(
 
     let reconcile_started = std::time::Instant::now();
     let refno_set: HashSet<RefnoEnum> = all_refnos.iter().copied().collect();
+    let debug_filters: HashSet<String> = std::env::var("AIOS_DEBUG_NEG_RECONCILE")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|item| {
+                    item.trim()
+                        .trim_matches('`')
+                        .trim_matches('⟨')
+                        .trim_matches('⟩')
+                })
+                .filter_map(|item| {
+                    let normalized = item
+                        .strip_prefix("pe:")
+                        .or_else(|| item.strip_prefix("pe:⟨"))
+                        .unwrap_or(item)
+                        .trim_matches('`')
+                        .trim_matches('⟨')
+                        .trim_matches('⟩')
+                        .trim()
+                        .to_string();
+                    if normalized.is_empty() {
+                        None
+                    } else {
+                        Some(normalized)
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let should_debug_reconcile = |carrier: &str, parent: Option<&str>| -> bool {
+        !debug_filters.is_empty()
+            && (debug_filters.contains(carrier)
+                || parent.is_some_and(|pid| debug_filters.contains(pid)))
+    };
     let candidate_carriers = candidate_carriers
         .iter()
         .copied()
@@ -1830,6 +1973,12 @@ pub async fn reconcile_missing_neg_relate(
             if gr_id.is_empty() || neg_carrier.is_empty() {
                 continue;
             }
+            if should_debug_reconcile(&neg_carrier, None) {
+                println!(
+                    "[reconcile-debug] candidate carrier={} gr_id={}",
+                    neg_carrier, gr_id
+                );
+            }
             candidates.push(NegGeoCandidate { gr_id, neg_carrier });
         }
         if chunk_idx == 0 || (chunk_idx + 1) % 50 == 0 || chunk_idx + 1 == total_query_chunks {
@@ -1880,7 +2029,19 @@ pub async fn reconcile_missing_neg_relate(
                 .unwrap_or_default()
                 .to_string();
             if carrier_id.is_empty() || parent_id.is_empty() {
+                if should_debug_reconcile(&carrier_id, Some(&parent_id)) {
+                    println!(
+                        "[reconcile-debug] parent-miss carrier={} parent_id='{}'",
+                        carrier_id, parent_id
+                    );
+                }
                 continue;
+            }
+            if should_debug_reconcile(&carrier_id, Some(&parent_id)) {
+                println!(
+                    "[reconcile-debug] parent-hit carrier={} parent={}",
+                    carrier_id, parent_id
+                );
             }
             parent_by_carrier.insert(carrier_id, parent_id);
         }
@@ -1899,8 +2060,20 @@ pub async fn reconcile_missing_neg_relate(
     for candidate in candidates {
         let carrier_id = format!("pe:⟨{}⟩", candidate.neg_carrier);
         let Some(parent_id) = parent_by_carrier.get(&carrier_id).cloned() else {
+            if should_debug_reconcile(&candidate.neg_carrier, None) {
+                println!(
+                    "[reconcile-debug] candidate-without-parent carrier={} gr_id={}",
+                    candidate.neg_carrier, candidate.gr_id
+                );
+            }
             continue;
         };
+        if should_debug_reconcile(&candidate.neg_carrier, Some(&parent_id)) {
+            println!(
+                "[reconcile-debug] resolved carrier={} parent={} gr_id={}",
+                candidate.neg_carrier, parent_id, candidate.gr_id
+            );
+        }
         infos.push(NegGeoInfo {
             gr_id: candidate.gr_id,
             neg_carrier: candidate.neg_carrier,
@@ -1947,14 +2120,34 @@ pub async fn reconcile_missing_neg_relate(
     let mut neg_buffer: Vec<String> = Vec::new();
     for info in &infos {
         if existing.contains(&info.gr_id) {
+            if should_debug_reconcile(&info.neg_carrier, Some(&info.parent_id)) {
+                println!(
+                    "[reconcile-debug] skip-existing carrier={} parent={} gr_id={}",
+                    info.neg_carrier, info.parent_id, info.gr_id
+                );
+            }
             continue;
         }
         // parent 必须在当前 batch 中（确保只补建本次生成范围内的关系）
         let target: RefnoEnum = match info.parent_id.parse() {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(_) => {
+                if should_debug_reconcile(&info.neg_carrier, Some(&info.parent_id)) {
+                    println!(
+                        "[reconcile-debug] skip-parent-parse carrier={} parent={} gr_id={}",
+                        info.neg_carrier, info.parent_id, info.gr_id
+                    );
+                }
+                continue;
+            }
         };
         if !refno_set.contains(&target) {
+            if should_debug_reconcile(&info.neg_carrier, Some(&info.parent_id)) {
+                println!(
+                    "[reconcile-debug] skip-parent-out-of-batch carrier={} parent={} gr_id={}",
+                    info.neg_carrier, info.parent_id, info.gr_id
+                );
+            }
             continue;
         }
 
@@ -1962,6 +2155,12 @@ pub async fn reconcile_missing_neg_relate(
             "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', pe:⟨{2}⟩], out: pe:⟨{2}⟩, pe: pe:⟨{1}⟩ }}",
             info.gr_id, info.neg_carrier, info.parent_id,
         ));
+        if should_debug_reconcile(&info.neg_carrier, Some(&info.parent_id)) {
+            println!(
+                "[reconcile-debug] enqueue-insert carrier={} parent={} gr_id={}",
+                info.neg_carrier, info.parent_id, info.gr_id
+            );
+        }
     }
 
     let created = neg_buffer.len();

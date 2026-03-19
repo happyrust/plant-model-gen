@@ -1,9 +1,9 @@
+use aios_core::RefnoEnum;
 /// 模型关系数据的 SQLite 集中存储
 ///
 /// 替代分散在 SurrealDB 多表中的关系数据，简化 regen 清理逻辑
 use anyhow::{Context, Result};
-use aios_core::RefnoEnum;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
 /// 按 dbnum 分片的模型关系存储
@@ -23,15 +23,15 @@ impl ModelRelationStore {
         let db_path = self.base_path.join(format!("{}/relations.db", dbnum));
         std::fs::create_dir_all(db_path.parent().unwrap())?;
 
-        let conn = Connection::open(&db_path)
-            .with_context(|| format!("打开 SQLite: {:?}", db_path))?;
+        let conn =
+            Connection::open(&db_path).with_context(|| format!("打开 SQLite: {:?}", db_path))?;
 
         // 性能优化配置
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA cache_size = -64000;
-             PRAGMA temp_store = MEMORY;"
+             PRAGMA temp_store = MEMORY;",
         )?;
 
         self.init_schema(&conn)?;
@@ -82,7 +82,7 @@ impl ModelRelationStore {
                 carrier_refno INTEGER NOT NULL,
                 bool_result BLOB NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_bool_carrier ON inst_relate_bool(carrier_refno);"
+            CREATE INDEX IF NOT EXISTS idx_bool_carrier ON inst_relate_bool(carrier_refno);",
         )?;
         Ok(())
     }
@@ -94,7 +94,8 @@ impl ModelRelationStore {
         }
 
         let conn = self.get_conn(dbnum)?;
-        let refno_list = refnos.iter()
+        let refno_list = refnos
+            .iter()
             .map(|r| r.refno().0.to_string())
             .collect::<Vec<_>>()
             .join(",");
@@ -110,14 +111,20 @@ impl ModelRelationStore {
 
         // 删除 tubi_relate
         let deleted = conn.execute(
-            &format!("DELETE FROM tubi_relate WHERE branch_refno IN ({})", refno_list),
+            &format!(
+                "DELETE FROM tubi_relate WHERE branch_refno IN ({})",
+                refno_list
+            ),
             [],
         )?;
         total_deleted += deleted;
 
         // 删除 inst_relate_bool
         let deleted = conn.execute(
-            &format!("DELETE FROM inst_relate_bool WHERE carrier_refno IN ({})", refno_list),
+            &format!(
+                "DELETE FROM inst_relate_bool WHERE carrier_refno IN ({})",
+                refno_list
+            ),
             [],
         )?;
         total_deleted += deleted;
@@ -138,7 +145,7 @@ impl ModelRelationStore {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR REPLACE INTO inst_relate
                  (dbnum, refno, inst_id, parent_refno, world_matrix)
-                 VALUES (?1, ?2, ?3, ?4, ?5)"
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
 
             for rec in records {
@@ -167,7 +174,7 @@ impl ModelRelationStore {
 
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO geo_relate (inst_id, geo_hash) VALUES (?1, ?2)"
+                "INSERT OR REPLACE INTO geo_relate (inst_id, geo_hash) VALUES (?1, ?2)",
             )?;
 
             for (inst_id, geo_hash) in records {
@@ -221,7 +228,8 @@ impl ModelRelationStore {
         }
 
         let conn = self.get_conn(dbnum)?;
-        let refno_list = refnos.iter()
+        let refno_list = refnos
+            .iter()
             .map(|r| r.refno().0.to_string())
             .collect::<Vec<_>>()
             .join(",");
@@ -231,7 +239,8 @@ impl ModelRelationStore {
             refno_list
         ))?;
 
-        let inst_ids = stmt.query_map([], |row| row.get(0))?
+        let inst_ids = stmt
+            .query_map([], |row| row.get(0))?
             .collect::<Result<Vec<u64>, _>>()?;
 
         Ok(inst_ids)
@@ -241,17 +250,14 @@ impl ModelRelationStore {
     pub fn get_stats(&self, dbnum: u32) -> Result<StoreStats> {
         let conn = self.get_conn(dbnum)?;
 
-        let inst_relate_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM inst_relate", [], |row| row.get(0)
-        )?;
+        let inst_relate_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM inst_relate", [], |row| row.get(0))?;
 
-        let geo_relate_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM geo_relate", [], |row| row.get(0)
-        )?;
+        let geo_relate_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM geo_relate", [], |row| row.get(0))?;
 
-        let inst_geo_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM inst_geo", [], |row| row.get(0)
-        )?;
+        let inst_geo_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM inst_geo", [], |row| row.get(0))?;
 
         Ok(StoreStats {
             inst_relate_count: inst_relate_count as usize,
@@ -290,12 +296,11 @@ pub struct StoreStats {
 }
 
 /// 全局单例
-static GLOBAL_STORE: once_cell::sync::Lazy<ModelRelationStore> =
-    once_cell::sync::Lazy::new(|| {
-        let base_path = std::env::var("MODEL_RELATION_STORE_PATH")
-            .unwrap_or_else(|_| "output/model_relations".to_string());
-        ModelRelationStore::new(base_path)
-    });
+static GLOBAL_STORE: once_cell::sync::Lazy<ModelRelationStore> = once_cell::sync::Lazy::new(|| {
+    let base_path = std::env::var("MODEL_RELATION_STORE_PATH")
+        .unwrap_or_else(|_| "output/model_relations".to_string());
+    ModelRelationStore::new(base_path)
+});
 
 pub fn global_store() -> &'static ModelRelationStore {
     &GLOBAL_STORE

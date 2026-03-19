@@ -1147,7 +1147,7 @@ async fn gen_cata_geos_inner(
 
     // 但 inst_info(ptset) 若已存在仍可复用，以避免重复的元件库几何生成。
 
-    let replace_exist = db_option.inner.is_replace_mesh();
+    let replace_exist = false; // replace_exist 已废弃，覆盖模式由 pre_cleanup_for_regen 替代
 
     let is_bran = branch_map.len() > 0;
 

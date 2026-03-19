@@ -1351,7 +1351,6 @@ async fn execute_room_regenerate(
     }
 
     let mut db_option_clone = db_option_ext.clone();
-    db_option_clone.replace_mesh = Some(request.force_regenerate);
     db_option_clone.gen_mesh = request.gen_mesh;
     db_option_clone.gen_model = true;
     db_option_clone.apply_boolean_operation = request.apply_boolean_operation;

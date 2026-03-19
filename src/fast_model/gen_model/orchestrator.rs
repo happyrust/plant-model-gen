@@ -483,7 +483,6 @@ async fn run_batch_sink(
 async fn run_base_writer(
     receiver: Receiver<PipelineBatch>,
     result_sender: Sender<(u64, u128, u128)>,
-    replace_exist: bool,
     base_write_semaphore: Arc<Semaphore>,
     mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
     missing_neg_carriers: Arc<std::sync::Mutex<HashSet<RefnoEnum>>>,
@@ -499,7 +498,7 @@ async fn run_base_writer(
             let base_start = Instant::now();
             let save_report = save_instance_data_with_report(
                 &batch.shape_insts,
-                replace_exist,
+                false,
                 &HashMap::new(),
                 &mesh_aabb_map,
                 false,
@@ -537,7 +536,6 @@ async fn run_mesh_stage(
     output_sender: Sender<BatchMeshOutput>,
     mesh_compute_semaphore: Arc<Semaphore>,
     db_option: DbOptionExt,
-    replace_exist: bool,
     gen_mesh: bool,
     mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
     mesh_pts_map: Arc<DashMap<u64, String>>,
@@ -545,7 +543,7 @@ async fn run_mesh_stage(
     let deduper = Arc::new(crate::fast_model::mesh_generate::RecentGeoDeduper::new(
         200_000,
     ));
-    if gen_mesh && !replace_exist {
+    if gen_mesh {
         crate::fast_model::preload_mesh_cache();
         let ids = query_existing_meshed_inst_geo_ids();
         let count = ids.len();
@@ -555,8 +553,8 @@ async fn run_mesh_stage(
             count,
             deduper.len()
         );
-    } else if gen_mesh {
-        println!("[mesh_pipeline] replace_exist 模式，跳过去重器预加载，强制重新生成 mesh");
+    } else if !gen_mesh {
+        println!("[mesh_pipeline] gen_mesh 未开启，跳过 mesh 阶段");
     }
 
     let mut handles = Vec::new();
@@ -1123,7 +1121,7 @@ async fn process_index_tree_generation(
     let (sender, receiver) = flume::bounded::<aios_core::geometry::ShapeInstancesData>(
         db_option.get_batch_channel_capacity(),
     );
-    let replace_exist = db_option.inner.is_replace_mesh();
+    let _replace_exist_deprecated = false; // replace_exist 已废弃，由 pre_cleanup_for_regen 替代
     let use_surrealdb = db_option.use_surrealdb;
     let defer_db_write = false;
 
@@ -1233,7 +1231,6 @@ async fn process_index_tree_generation(
     let base_writer_handle = tokio::spawn(run_base_writer(
         base_writer_receiver,
         base_result_sender,
-        replace_exist,
         base_write_semaphore.clone(),
         mesh_aabb_map.clone(),
         missing_neg_carriers_for_reconcile.clone(),
@@ -1243,7 +1240,6 @@ async fn process_index_tree_generation(
         mesh_output_sender,
         mesh_compute_semaphore,
         db_option.clone(),
-        replace_exist,
         gen_mesh,
         mesh_aabb_map.clone(),
         mesh_pts_map.clone(),

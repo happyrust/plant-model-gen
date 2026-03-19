@@ -1,6 +1,6 @@
 /// 极简版性能测试
 use aios_core::RefnoEnum;
-use aios_database::model_relation_store_v3::{global_store_v3, RefnoRelations};
+use aios_database::model_relation_store_v3::{RefnoRelations, global_store_v3};
 use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
@@ -33,14 +33,22 @@ fn main() -> anyhow::Result<()> {
     println!("读取 {} 个 refno...", query_refnos.len());
     let t = Instant::now();
     let loaded = store.load_relations(dbnum, &query_refnos)?;
-    println!("  返回 {} 条，耗时 {} ms\n", loaded.len(), t.elapsed().as_millis());
+    println!(
+        "  返回 {} 条，耗时 {} ms\n",
+        loaded.len(),
+        t.elapsed().as_millis()
+    );
 
     // 4. 批量删除
     let cleanup_refnos: Vec<RefnoEnum> = (100000..110000).map(RefnoEnum).collect();
     println!("删除 {} 个 refno...", cleanup_refnos.len());
     let t = Instant::now();
     let deleted = store.cleanup_by_refnos(dbnum, &cleanup_refnos)?;
-    println!("  删除 {} 条，耗时 {} ms\n", deleted, t.elapsed().as_millis());
+    println!(
+        "  删除 {} 条，耗时 {} ms\n",
+        deleted,
+        t.elapsed().as_millis()
+    );
 
     // 5. 统计
     let count = store.get_stats(dbnum)?;

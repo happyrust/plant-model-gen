@@ -1,11 +1,11 @@
 use crate::model_relation_store::{InstGeoRecord, InstRelateRecord, ModelRelationStore};
-use anyhow::{Context, Result, anyhow};
 use aios_core::pdms_types::{RefU64, RefnoEnum};
+use anyhow::{Context, Result, anyhow};
 use bincode::serialize;
 use glam::{Affine3A, Mat3A, Vec3, Vec3A};
+use rvm_rs::store::Store;
 use rvm_rs::store::geometry::{Geometry, GeometryKind, GeometryType};
 use rvm_rs::store::node::{NodeId, NodeKind};
-use rvm_rs::store::Store;
 use rvm_rs::{parse_att, parse_rvm};
 use serde_json::json;
 use std::collections::VecDeque;
@@ -51,7 +51,9 @@ pub fn import_rvm_to_sqlite(options: &RvmImportOptions) -> Result<RvmImportStats
 
     let relation_store = ModelRelationStore::new(&options.relation_store_root);
     let refnos: Vec<RefnoEnum> = builder.inst_relates.iter().map(|r| r.refno).collect();
-    let cleaned_records = relation_store.cleanup_by_refnos(options.dbnum, &refnos).unwrap_or(0);
+    let cleaned_records = relation_store
+        .cleanup_by_refnos(options.dbnum, &refnos)
+        .unwrap_or(0);
     relation_store.insert_inst_geos(options.dbnum, &builder.inst_geos)?;
     relation_store.insert_inst_relates(options.dbnum, &builder.inst_relates)?;
     relation_store.insert_geo_relates(options.dbnum, &builder.geo_relates)?;
@@ -108,21 +110,24 @@ impl RelationBuilder {
         match &node.kind {
             NodeKind::File(file) => {
                 self.stats.file_nodes += 1;
-                let name = sanitize_name(store.get_string(file.info), format!("file_{}", node_id.0));
+                let name =
+                    sanitize_name(store.get_string(file.info), format!("file_{}", node_id.0));
                 path.push_back(name);
                 self.walk_children(store, node, path, parent_refno, parent_translation)?;
                 path.pop_back();
             }
             NodeKind::Model(model) => {
                 self.stats.model_nodes += 1;
-                let name = sanitize_name(store.get_string(model.name), format!("model_{}", node_id.0));
+                let name =
+                    sanitize_name(store.get_string(model.name), format!("model_{}", node_id.0));
                 path.push_back(name);
                 self.walk_children(store, node, path, parent_refno, parent_translation)?;
                 path.pop_back();
             }
             NodeKind::Group(group) => {
                 self.stats.group_nodes += 1;
-                let name = sanitize_name(store.get_string(group.name), format!("group_{}", node_id.0));
+                let name =
+                    sanitize_name(store.get_string(group.name), format!("group_{}", node_id.0));
                 path.push_back(name.clone());
                 let current_path = join_path(path);
                 let refno = stable_refno(self.dbnum, &current_path, "group");
@@ -154,7 +159,13 @@ impl RelationBuilder {
                         .get_geometry(geometry_id)
                         .ok_or_else(|| anyhow!("无效的几何 ID: {}", geometry_id.0))?;
                     geometry_index += 1;
-                    self.push_geometry(inst_id, &current_path, geometry_index, geometry, world_translation)?;
+                    self.push_geometry(
+                        inst_id,
+                        &current_path,
+                        geometry_index,
+                        geometry,
+                        world_translation,
+                    )?;
                     geometry_link = geometry.next;
                 }
 
@@ -204,7 +215,13 @@ impl RelationBuilder {
         let final_bbox = translate_bbox(geometry.bbox_world, world_translation);
         self.inst_geos.push(InstGeoRecord {
             hash: geo_hash,
-            geometry: encode_geometry_blob(geometry, group_path, geometry_index, world_translation, final_bbox)?,
+            geometry: encode_geometry_blob(
+                geometry,
+                group_path,
+                geometry_index,
+                world_translation,
+                final_bbox,
+            )?,
             aabb_min_x: final_bbox.is_valid().then_some(final_bbox.min.x as f64),
             aabb_min_y: final_bbox.is_valid().then_some(final_bbox.min.y as f64),
             aabb_min_z: final_bbox.is_valid().then_some(final_bbox.min.z as f64),
@@ -228,10 +245,16 @@ fn sanitize_name(raw: &str, fallback: String) -> String {
 }
 
 fn join_path(path: &VecDeque<String>) -> String {
-    path.iter().map(String::as_str).collect::<Vec<_>>().join("/")
+    path.iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
-fn count_group_geometries(mut first: Option<rvm_rs::store::geometry::GeometryId>, store: &Store) -> usize {
+fn count_group_geometries(
+    mut first: Option<rvm_rs::store::geometry::GeometryId>,
+    store: &Store,
+) -> usize {
     let mut count = 0usize;
     while let Some(id) = first {
         count += 1;
@@ -249,7 +272,12 @@ fn stable_refno(dbnum: u32, path: &str, kind: &str) -> RefU64 {
     RefU64::from(((dbnum as u64) << 32) | low as u64)
 }
 
-fn stable_geo_hash(dbnum: u32, group_path: &str, geometry_index: usize, geometry: &Geometry) -> u64 {
+fn stable_geo_hash(
+    dbnum: u32,
+    group_path: &str,
+    geometry_index: usize,
+    geometry: &Geometry,
+) -> u64 {
     let mut hasher = XxHash64::with_seed(0x67_65_6f);
     hasher.write_u32(dbnum);
     hasher.write(group_path.as_bytes());
@@ -392,7 +420,11 @@ fn affine_from_translation(translation: Vec3) -> Affine3A {
 
 fn encode_affine_blob(affine: &Affine3A) -> Result<Vec<u8>> {
     let matrix = matrix3_to_array(&affine.matrix3);
-    let translation = [affine.translation.x, affine.translation.y, affine.translation.z];
+    let translation = [
+        affine.translation.x,
+        affine.translation.y,
+        affine.translation.z,
+    ];
     serialize(&(matrix, translation)).context("序列化 world_matrix 失败")
 }
 

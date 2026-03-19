@@ -758,7 +758,6 @@ fn build_room_compute_panel_gen_option(
     let mut gen_opt = db_option_ext.clone();
     gen_opt.inner.gen_model = true;
     gen_opt.inner.gen_mesh = true;
-    gen_opt.inner.replace_mesh = Some(true);
     gen_opt.export_instances = true;
     gen_opt.inner.manual_db_nums = manual_db_nums.map(|mut nums| {
         nums.sort_unstable();
@@ -1614,7 +1613,7 @@ pub async fn run_regen_model(
     db_option_ext: &DbOptionExt,
 ) -> Result<aios_database::fast_model::gen_model::GenModelResult> {
     println!("\n🔄 --regen-model：开始重新生成几何体数据...");
-    println!("   - 强制开启 replace_mesh、gen_mesh 和 apply_boolean_operation");
+    println!("   - 强制开启 gen_mesh 和 apply_boolean_operation");
 
     // 1. 设置环境变量
     let _force_replace_guard = ScopedEnvVar::set("FORCE_REPLACE_MESH", "true");
@@ -1622,7 +1621,6 @@ pub async fn run_regen_model(
 
     // 2. 构建 override 后的 DbOption（不影响原始配置）
     let mut db_option_override = db_option_ext.clone();
-    db_option_override.inner.replace_mesh = Some(true);
     db_option_override.inner.gen_mesh = true;
     db_option_override.inner.apply_boolean_operation = true;
 
@@ -2988,7 +2986,6 @@ pub async fn export_dbnum_instances_json_mode(
                         let mut db_option_clone = db_option_ext.inner.clone();
                         db_option_clone.manual_db_nums = Some(vec![dbnum]);
                         db_option_clone.gen_mesh = true;
-                        db_option_clone.replace_mesh = Some(true);
 
                         let mut db_option_ext_override = db_option_ext.clone();
                         db_option_ext_override.inner = db_option_clone;
@@ -4480,7 +4477,6 @@ mod tests {
             build_room_compute_panel_gen_option(&db_option_ext, Some(vec![7997, 8000, 7997]));
 
         assert!(gen_opt.export_instances);
-        assert_eq!(gen_opt.inner.replace_mesh, Some(true));
         assert!(gen_opt.inner.gen_model);
         assert!(gen_opt.inner.gen_mesh);
         assert_eq!(gen_opt.inner.manual_db_nums, Some(vec![7997, 8000]));

@@ -1298,12 +1298,50 @@ pub struct FittingRequest {
 /// 距墙/定位块 距离 请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WallDistanceRequest {
+    /// 数据库编号（用于前端显式传递上下文）
     pub dbnum: u32,
-    pub suppo_refno: u64,
-    /// S1 | S2
-    pub suppo_type: String,
+    /// 源构件（管道）refno，兼容 "db_ref" / "db/ref" 格式
+    pub source_refno: String,
+    /// 目标 noun 过滤（默认 WALL + COLUMN）
+    #[serde(default)]
+    pub target_nouns: Option<Vec<String>>,
+    /// 搜索半径（mm）
     #[serde(default)]
     pub search_radius: Option<f64>,
+    /// 后端候选上限（默认 20）
+    #[serde(default)]
+    pub max_candidates: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WallDistancePoint {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WallDistanceAabbDto {
+    pub min: WallDistancePoint,
+    pub max: WallDistancePoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WallDistanceCandidateDto {
+    pub refno: String,
+    pub noun: String,
+    #[serde(default)]
+    pub spec_value: Option<i64>,
+    /// 基于 AABB 的粗筛距离（mm）
+    pub distance_mm: f64,
+    pub aabb: WallDistanceAabbDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WallDistanceResponseData {
+    pub source_refno: String,
+    pub source_aabb: WallDistanceAabbDto,
+    pub candidates: Vec<WallDistanceCandidateDto>,
 }
 
 /// 与预埋板相对定位 请求

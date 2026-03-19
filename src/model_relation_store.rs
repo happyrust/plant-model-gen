@@ -265,6 +265,35 @@ impl ModelRelationStore {
             inst_geo_count: inst_geo_count as usize,
         })
     }
+
+    pub fn query_rvm_root_name(&self, dbnum: u32) -> Result<Option<String>> {
+        let conn = self.get_conn(dbnum)?;
+        let geometry_blob: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT geometry FROM inst_geo ORDER BY hash LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(geometry_blob) = geometry_blob else {
+            return Ok(None);
+        };
+
+        let payload: serde_json::Value = serde_json::from_slice(&geometry_blob)
+            .context("解析 inst_geo.geometry 失败")?;
+        let root_name = payload
+            .get("group_path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.split('/').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        Ok(root_name)
+    }
 }
 
 #[derive(Debug, Clone)]

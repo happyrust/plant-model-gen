@@ -3167,15 +3167,33 @@ pub async fn export_dbnum_instances_parquet_mode(
     root_refno: Option<RefnoEnum>,
 ) -> Result<()> {
     use aios_database::fast_model::export_model::export_dbnum_instances_parquet::export_dbnum_instances_parquet;
+    use aios_database::model_relation_store::global_store;
     use std::sync::Arc;
 
     println!("\n🎯 导出 dbnum 实例数据为 Parquet（多表）");
     println!("====================================");
 
-    // 设置输出目录（按 dbnum 分目录，避免不同库互相覆盖）
     let base_output_dir =
         output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("parquet"));
-    let output_dir = base_output_dir.join(dbnum.to_string());
+    let parquet_name = global_store()
+        .query_rvm_root_name(dbnum)
+        .ok()
+        .flatten()
+        .map(|name| {
+            name.chars()
+                .map(|ch| match ch {
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+                    _ => ch,
+                })
+                .collect::<String>()
+        })
+        .map(|name| name.trim().trim_matches('.').to_string())
+        .filter(|name| !name.is_empty());
+    let output_dir = if let Some(ref parquet_name) = parquet_name {
+        base_output_dir.join("external_rvm").join(parquet_name)
+    } else {
+        base_output_dir.join(dbnum.to_string())
+    };
 
     // 连接数据库
     println!("📡 连接数据库...");
@@ -3206,6 +3224,9 @@ pub async fn export_dbnum_instances_parquet_mode(
     println!("   - 包围盒数量 (aabb): {}", stats.aabb_count);
     println!("   - 总文件大小: {} 字节", stats.total_bytes);
     println!("   - 耗时: {:?}", stats.elapsed);
+    if let Some(ref parquet_name) = parquet_name {
+        println!("   - 外部挂载 RVM 根节点: {}", parquet_name);
+    }
     println!("   - 输出目录: {}", output_dir.display());
 
     Ok(())

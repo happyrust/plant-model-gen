@@ -20,7 +20,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-FRONTEND_PROJECT_DIR="/Volumes/DPC/work/plant-code/plant3d-web"
+# 默认与后端仓库同级目录下的 plant3d-web；可通过 FRONTEND_PROJECT_DIR 覆盖
+if [[ -z "${FRONTEND_PROJECT_DIR:-}" ]]; then
+  _fe_sibling="$BACKEND_PROJECT_DIR/../plant3d-web"
+  if [[ -d "$_fe_sibling" ]]; then
+    FRONTEND_PROJECT_DIR="$(cd "$_fe_sibling" && pwd)"
+  else
+    FRONTEND_PROJECT_DIR="/Volumes/DPC/work/plant-code/plant3d-web"
+  fi
+fi
 
 REMOTE_HOST="${REMOTE_HOST:-123.57.182.243}"
 REMOTE_USER="${REMOTE_USER:-root}"

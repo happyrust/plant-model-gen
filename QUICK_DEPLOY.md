@@ -97,6 +97,7 @@ GITHUB_RUN_ID=12345678 \
 | `REMOTE_USER` | `root` | SSH username |
 | `REMOTE_PASS` | `Happytest123_` | SSH password |
 | `BACKEND_ORIGIN` | `http://127.0.0.1:3100` | Backend URL for nginx proxy |
+| `FRONTEND_PROJECT_DIR` | 自动：`plant-model-gen` 同级目录下的 `plant3d-web` | 前端仓库根目录（覆盖默认路径） |
 
 ## Retry Behavior
 
@@ -106,6 +107,19 @@ All deployment scripts include automatic retry logic with exponential backoff (5
 - Remote health check verification
 
 This handles intermittent SSH auth failures and network instability without manual intervention.
+
+## SurrealDB（图数据）同步到服务器
+
+仅部署 `web_server` 与 `output/` **不会**带上 Surreal 中的 MDB/WORL/pe 等数据。若 `/api/e3d/world-root` 报 `get_world_refno failed`，需要把本地 RocksDB 目录同步到服务器并启动 8020 端口上的 Surreal。
+
+详见 [docs/guides/SURREAL_REMOTE_SYNC.md](docs/guides/SURREAL_REMOTE_SYNC.md)。
+
+- **生产 SurrealKV 改绑 8020 + systemd 固定脚本**：`./shells/apply_surrealdb_8020_remote.sh`
+- **整库 RocksDB rsync**（另一套数据路径）：`./shells/sync_surreal_8020_to_remote.sh`
+
+```bash
+REMOTE_HOST=123.57.182.243 REMOTE_USER=root REMOTE_PASS='...' ./shells/apply_surrealdb_8020_remote.sh
+```
 
 ## Additional Documentation
 

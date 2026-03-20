@@ -1,0 +1,17 @@
+[Unit]
+Description=SurrealDB (surrealkv, bind 8020)
+Documentation=https://surrealdb.com/docs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/root/shells/run_surrealdb_kv_8020.sh
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -281,6 +281,7 @@ dependencies = [
 [[package]]
 name = "aios_core"
 version = "0.3.2"
+source = "git+https://github.com/happyrust/rs-core.git?branch=dev-3.1#ad4d614138e786a39ba8d760a0cf77cfadbe6a2b"
 dependencies = [
  "anyhow",
  "approx",

@@ -16,7 +16,8 @@ use tracing::{info, warn};
 
 use crate::web_api::jwt_auth::{TokenClaims, generate_form_id};
 use crate::web_api::model_center_client::{
-    notify_workflow_delete_async, notify_workflow_sync_async,
+    mark_review_form_deleted, notify_workflow_delete_async, notify_workflow_sync_async,
+    sync_review_form_with_task_status,
 };
 use aios_core::project_primary_db;
 use axum::extract::Extension;
@@ -36,8 +37,14 @@ pub struct CreateTaskRequest {
     pub model_name: String,
     /// 校核人 ID（三段审批第二段，jd 节点负责人）
     pub checker_id: Option<String>,
+    /// 校核人姓名（可选，不传则回退到 checker_id/reviewer_id）
+    #[serde(default)]
+    pub checker_name: Option<String>,
     /// 审核人 ID（三段审批第三段，sh 节点负责人）
     pub approver_id: Option<String>,
+    /// 审核人姓名（可选，不传则回退到 approver_id）
+    #[serde(default)]
+    pub approver_name: Option<String>,
     /// 兼容旧字段：语义等同 checker_id
     #[serde(default)]
     pub reviewer_id: String,
@@ -193,6 +200,40 @@ fn default_current_node() -> String {
 
 fn default_status() -> String {
     "draft".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreateTaskResolvedNames {
+    requester_name: String,
+    checker_name: String,
+    approver_name: String,
+    reviewer_name: String,
+}
+
+fn preferred_name(value: Option<&str>, fallback: &str) -> String {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn resolve_create_task_names(
+    claims: &TokenClaims,
+    request: &CreateTaskRequest,
+    checker_id: &str,
+    approver_id: &str,
+) -> CreateTaskResolvedNames {
+    let requester_name = preferred_name(Some(claims.user_name.as_str()), claims.user_id.as_str());
+    let checker_name = preferred_name(request.checker_name.as_deref(), checker_id);
+    let approver_name = preferred_name(request.approver_name.as_deref(), approver_id);
+
+    CreateTaskResolvedNames {
+        requester_name,
+        checker_name: checker_name.clone(),
+        approver_name,
+        reviewer_name: checker_name,
+    }
 }
 
 /// 任务列表响应
@@ -665,6 +706,25 @@ fn parse_datetime_value(dt: &Option<surrealdb::types::Datetime>) -> i64 {
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
 }
 
+async fn lookup_task_form_id(id: &str) -> Option<String> {
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct TaskFormRow {
+        form_id: Option<String>,
+    }
+
+    let mut resp = project_primary_db()
+        .query("SELECT form_id FROM review_tasks WHERE record::id(id) = $id LIMIT 1")
+        .bind(("id", id.to_string()))
+        .await
+        .ok()?;
+    let rows: Vec<TaskFormRow> = resp.take(0).unwrap_or_default();
+    rows.into_iter()
+        .next()
+        .and_then(|row| row.form_id)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 // ============================================================================
 // Routes
 // ============================================================================
@@ -749,7 +809,6 @@ async fn create_task(
     let now = chrono::Utc::now().to_rfc3339();
 
     let requester_id = claims.user_id.clone();
-    let requester_name = claims.user_id.clone();
 
     let checker_id = request
         .checker_id
@@ -757,6 +816,9 @@ async fn create_task(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| request.reviewer_id.clone());
     let approver_id = request.approver_id.clone().unwrap_or_default();
+    let resolved_names =
+        resolve_create_task_names(&claims, &request, checker_id.as_str(), approver_id.as_str());
+    let requester_name = resolved_names.requester_name.clone();
 
     let form_id = request
         .form_id
@@ -803,11 +865,11 @@ async fn create_task(
         .bind(("requester_id", requester_id.clone()))
         .bind(("requester_name", requester_name.clone()))
         .bind(("checker_id", checker_id.clone()))
-        .bind(("checker_name", checker_id.clone()))
+        .bind(("checker_name", resolved_names.checker_name.clone()))
         .bind(("approver_id", approver_id.clone()))
-        .bind(("approver_name", approver_id.clone()))
+        .bind(("approver_name", resolved_names.approver_name.clone()))
         .bind(("reviewer_id", request.reviewer_id.clone()))
-        .bind(("reviewer_name", checker_id.clone()))
+        .bind(("reviewer_name", resolved_names.reviewer_name.clone()))
         .bind(("components", request.components.clone()))
         .bind(("attachments", request.attachments.clone()))
         .bind((
@@ -844,6 +906,21 @@ async fn create_task(
                     .await;
             }
 
+            if let Err(error) = sync_review_form_with_task_status(
+                form_id.as_str(),
+                Some(request.model_name.as_str()),
+                Some(requester_id.as_str()),
+                "create_task_backfill",
+                "draft",
+            )
+            .await
+            {
+                warn!(
+                    "Failed to sync review_forms after create_task, form_id={}: {}",
+                    form_id, error
+                );
+            }
+
             let task = ReviewTask {
                 id: task_id,
                 form_id: form_id.clone(),
@@ -855,11 +932,11 @@ async fn create_task(
                 requester_id,
                 requester_name,
                 checker_id: checker_id.clone(),
-                checker_name: checker_id.clone(),
+                checker_name: resolved_names.checker_name.clone(),
                 approver_id: approver_id.clone(),
-                approver_name: approver_id.clone(),
+                approver_name: resolved_names.approver_name.clone(),
                 reviewer_id: request.reviewer_id,
-                reviewer_name: checker_id.clone(),
+                reviewer_name: resolved_names.reviewer_name.clone(),
                 components: request.components,
                 attachments: request.attachments,
                 review_comment: None,
@@ -1160,6 +1237,7 @@ async fn update_task(
 /// DELETE /api/review/tasks/:id - 删除任务
 async fn delete_task(Path(id): Path<String>) -> impl IntoResponse {
     info!("Deleting task: {}", id);
+    let form_id = lookup_task_form_id(&id).await;
 
     let cascade_sql = r#"
         DELETE FROM review_records WHERE task_id = $id;
@@ -1176,6 +1254,14 @@ async fn delete_task(Path(id): Path<String>) -> impl IntoResponse {
         .await
     {
         Ok(_) => {
+            if let Some(form_id) = form_id.as_deref() {
+                if let Err(error) = mark_review_form_deleted(form_id).await {
+                    warn!(
+                        "Failed to mark review_form deleted after task deletion, form_id={}: {}",
+                        form_id, error
+                    );
+                }
+            }
             notify_workflow_delete_async(id.clone(), "system".to_string());
             (
                 StatusCode::OK,
@@ -1255,6 +1341,7 @@ async fn update_task_status(
         "Updating task {} status to {}, node to {:?}",
         id, status, target_node
     );
+    let form_id = lookup_task_form_id(&id).await;
 
     let sql = match (&target_node, &comment) {
         (Some(_), Some(_)) => {
@@ -1285,6 +1372,22 @@ async fn update_task_status(
 
     match q.await {
         Ok(_) => {
+            if let Some(form_id) = form_id.as_deref() {
+                if let Err(error) = sync_review_form_with_task_status(
+                    form_id,
+                    None,
+                    None,
+                    "create_task_backfill",
+                    status.as_str(),
+                )
+                .await
+                {
+                    warn!(
+                        "Failed to sync review_forms after status update, form_id={}: {}",
+                        form_id, error
+                    );
+                }
+            }
             let history_sql = r#"
                 CREATE review_history CONTENT {
                     task_id: $task_id,
@@ -2013,7 +2116,7 @@ fn current_user_from_claims(claims: &crate::web_api::jwt_auth::TokenClaims) -> U
         .unwrap_or(User {
             id: claims.user_id.clone(),
             username: claims.user_id.clone(),
-            name: claims.user_id.clone(),
+            name: preferred_name(Some(claims.user_name.as_str()), claims.user_id.as_str()),
             email: format!("{}@example.com", claims.user_id),
             role: map_claim_role_to_user_role(claims.role.as_deref()),
             department: None,
@@ -2272,6 +2375,28 @@ async fn submit_to_next_node(
         );
     }
 
+    if let Some(form_id) = task_row
+        .form_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Err(error) = sync_review_form_with_task_status(
+            form_id,
+            Some(task_row.model_name.as_deref().unwrap_or_default()),
+            Some(task_row.requester_id.as_deref().unwrap_or_default()),
+            "create_task_backfill",
+            next_status,
+        )
+        .await
+        {
+            warn!(
+                "Failed to sync review_forms after submit_to_next_node, form_id={}: {}",
+                form_id, error
+            );
+        }
+    }
+
     // 5. 记录工作流历史
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
@@ -2452,6 +2577,28 @@ async fn return_to_node(
                 error_message: Some(format!("更新任务失败: {}", e)),
             }),
         );
+    }
+
+    if let Some(form_id) = task_row
+        .form_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Err(error) = sync_review_form_with_task_status(
+            form_id,
+            Some(task_row.model_name.as_deref().unwrap_or_default()),
+            Some(task_row.requester_id.as_deref().unwrap_or_default()),
+            "create_task_backfill",
+            next_status,
+        )
+        .await
+        {
+            warn!(
+                "Failed to sync review_forms after return_to_node, form_id={}: {}",
+                form_id, error
+            );
+        }
     }
 
     // 4. 记录工作流历史
@@ -3281,6 +3428,23 @@ async fn import_review_data(Json(request): Json<ImportRequest>) -> impl IntoResp
 
         match result {
             Ok(_) => {
+                if !task.form_id.trim().is_empty() {
+                    if let Err(error) = sync_review_form_with_task_status(
+                        task.form_id.as_str(),
+                        Some(task.model_name.as_str()),
+                        Some(task.requester_id.as_str()),
+                        "import_backfill",
+                        task.status.as_str(),
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Failed to sync review_forms during import, form_id={}: {}",
+                            task.form_id, error
+                        );
+                    }
+                }
+
                 // 同步写入 review_form_model（用于 workflow/sync 汇总）
                 if !task.form_id.trim().is_empty() {
                     for comp in &task.components {
@@ -3488,6 +3652,76 @@ mod tests {
         assert_eq!(task.status, "draft");
         assert_eq!(task.priority, "medium");
         assert_eq!(task.current_node, "sj");
+    }
+
+    #[test]
+    fn test_resolve_create_task_names_prefers_explicit_names_and_claim_user_name() {
+        let claims = TokenClaims {
+            project_id: "project-123".to_string(),
+            user_id: "designer_001".to_string(),
+            user_name: "张设计".to_string(),
+            form_id: "FORM-123".to_string(),
+            role: Some("sj".to_string()),
+            exp: 4_102_444_800,
+            iat: 1_704_067_200,
+        };
+        let request = CreateTaskRequest {
+            title: "Task".to_string(),
+            description: "".to_string(),
+            model_name: "Model".to_string(),
+            checker_id: Some("checker-001".to_string()),
+            checker_name: Some("李校核".to_string()),
+            approver_id: Some("approver-001".to_string()),
+            approver_name: Some("王审核".to_string()),
+            reviewer_id: "reviewer-legacy".to_string(),
+            form_id: None,
+            priority: "medium".to_string(),
+            components: vec![],
+            due_date: None,
+            attachments: None,
+        };
+
+        let names = resolve_create_task_names(&claims, &request, "checker-001", "approver-001");
+
+        assert_eq!(names.requester_name, "张设计");
+        assert_eq!(names.checker_name, "李校核");
+        assert_eq!(names.approver_name, "王审核");
+        assert_eq!(names.reviewer_name, "李校核");
+    }
+
+    #[test]
+    fn test_resolve_create_task_names_falls_back_to_ids_when_names_missing() {
+        let claims = TokenClaims {
+            project_id: "project-123".to_string(),
+            user_id: "designer_001".to_string(),
+            user_name: "".to_string(),
+            form_id: "FORM-123".to_string(),
+            role: Some("sj".to_string()),
+            exp: 4_102_444_800,
+            iat: 1_704_067_200,
+        };
+        let request = CreateTaskRequest {
+            title: "Task".to_string(),
+            description: "".to_string(),
+            model_name: "Model".to_string(),
+            checker_id: Some("checker-001".to_string()),
+            checker_name: Some("".to_string()),
+            approver_id: Some("approver-001".to_string()),
+            approver_name: None,
+            reviewer_id: "reviewer-legacy".to_string(),
+            form_id: None,
+            priority: "medium".to_string(),
+            components: vec![],
+            due_date: None,
+            attachments: None,
+        };
+
+        let names = resolve_create_task_names(&claims, &request, "checker-001", "approver-001");
+
+        assert_eq!(names.requester_name, "designer_001");
+        assert_eq!(names.checker_name, "checker-001");
+        assert_eq!(names.approver_name, "approver-001");
+        assert_eq!(names.reviewer_name, "checker-001");
     }
 
     #[test]
@@ -3699,6 +3933,7 @@ mod tests {
         let claims = TokenClaims {
             project_id: "project-123".to_string(),
             user_id: "reviewer_001".to_string(),
+            user_name: "李审核员".to_string(),
             form_id: "FORM-123".to_string(),
             role: Some("sh".to_string()),
             exp: 4_102_444_800,

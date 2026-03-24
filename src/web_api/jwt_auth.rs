@@ -216,6 +216,9 @@ pub struct TokenClaims {
     pub project_id: String,
     /// 用户ID
     pub user_id: String,
+    /// 用户姓名
+    #[serde(default)]
+    pub user_name: String,
     /// 表单ID
     pub form_id: String,
     /// 角色 (可选)
@@ -243,6 +246,9 @@ pub struct TokenRequest {
     /// 用户ID (新格式使用 username，旧格式使用 user_id)
     #[serde(alias = "username")]
     pub user_id: Option<String>,
+    /// 用户姓名（可选，不传则回退到 user_id）
+    #[serde(alias = "name", alias = "display_name")]
+    pub user_name: Option<String>,
     /// 可选的 form_id，如果不传则自动生成
     pub form_id: Option<String>,
     /// 角色 (可选，用于权限控制)
@@ -319,6 +325,7 @@ pub fn generate_form_id() -> String {
 pub fn create_token(
     project_id: &str,
     user_id: &str,
+    user_name: Option<&str>,
     form_id: &str,
     role: Option<&str>,
 ) -> Result<(String, u64), String> {
@@ -332,6 +339,11 @@ pub fn create_token(
     let claims = TokenClaims {
         project_id: project_id.to_string(),
         user_id: user_id.to_string(),
+        user_name: user_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(user_id)
+            .to_string(),
         form_id: form_id.to_string(),
         role: role.map(|s| s.to_string()),
         exp,
@@ -439,6 +451,7 @@ fn build_debug_claims(config: &ReviewAuthConfig) -> TokenClaims {
     TokenClaims {
         project_id: config.debug_project_id.clone(),
         user_id: config.debug_user_id.clone(),
+        user_name: config.debug_user_id.clone(),
         form_id: "FORM-DEBUG-AUTH-BYPASS".to_string(),
         role: if role.is_empty() {
             None
@@ -620,7 +633,13 @@ async fn get_token(Json(request): Json<TokenRequest>) -> impl IntoResponse {
     let form_id = request.form_id.unwrap_or_else(generate_form_id);
 
     // 生成 token
-    match create_token(&project_id, &user_id, &form_id, validated_role) {
+    match create_token(
+        &project_id,
+        &user_id,
+        request.user_name.as_deref(),
+        &form_id,
+        validated_role,
+    ) {
         Ok((token, expires_at)) => {
             info!("Token generated for user={}, form_id={}", user_id, form_id);
             (
@@ -752,35 +771,44 @@ mod tests {
 
     #[test]
     fn test_create_and_verify_token() {
-        let (token, _exp) = create_token("2410", "kangwp", "FORM-TEST123", None).unwrap();
+        let (token, _exp) = create_token("2410", "kangwp", None, "FORM-TEST123", None).unwrap();
         assert!(!token.is_empty());
 
         let claims = verify_token(&token).unwrap();
         assert_eq!(claims.project_id, "2410");
         assert_eq!(claims.user_id, "kangwp");
+        assert_eq!(claims.user_name, "kangwp");
         assert_eq!(claims.form_id, "FORM-TEST123");
         assert_eq!(claims.role, None);
     }
 
     #[test]
     fn test_create_token_with_role() {
-        let (token, _exp) =
-            create_token("testproject", "testuser", "FORM-TEST123", Some("pz")).unwrap();
+        let (token, _exp) = create_token(
+            "testproject",
+            "testuser",
+            Some("测试用户"),
+            "FORM-TEST123",
+            Some("pz"),
+        )
+        .unwrap();
         assert!(!token.is_empty());
 
         let claims = verify_token(&token).unwrap();
         assert_eq!(claims.project_id, "testproject");
         assert_eq!(claims.user_id, "testuser");
+        assert_eq!(claims.user_name, "测试用户");
         assert_eq!(claims.role, Some("pz".to_string()));
     }
 
     #[test]
     fn test_decode_token_unsafe() {
-        let (token, _exp) = create_token("2410", "kangwp", "FORM-TEST123", None).unwrap();
+        let (token, _exp) = create_token("2410", "kangwp", None, "FORM-TEST123", None).unwrap();
 
         let claims = decode_token_unsafe(&token).unwrap();
         assert_eq!(claims.project_id, "2410");
         assert_eq!(claims.user_id, "kangwp");
+        assert_eq!(claims.user_name, "kangwp");
     }
 
     #[test]
@@ -849,6 +877,7 @@ mod tests {
 
         assert_eq!(claims.project_id, "debug-project");
         assert_eq!(claims.user_id, "debug-user");
+        assert_eq!(claims.user_name, "debug-user");
         assert_eq!(claims.role.as_deref(), Some("sj"));
     }
 
@@ -882,12 +911,25 @@ mod tests {
                 review_auth_middleware,
             ));
 
-        let (token, _) = create_token("1516", "user-002", "FORM-TEST123", Some("jd")).unwrap();
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/claims")
-                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(
+                        AUTHORIZATION,
+                        format!(
+                            "Bearer {}",
+                            create_token(
+                                "1516",
+                                "user-002",
+                                Some("李校对"),
+                                "FORM-TEST123",
+                                Some("jd")
+                            )
+                            .unwrap()
+                            .0
+                        ),
+                    )
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -902,13 +944,15 @@ mod tests {
 
         assert_eq!(claims.project_id, "1516");
         assert_eq!(claims.user_id, "user-002");
+        assert_eq!(claims.user_name, "李校对");
         assert_eq!(claims.role.as_deref(), Some("jd"));
     }
 
     #[tokio::test]
     async fn test_verify_token_handler_rejects_form_id_mismatch() {
         let app = create_jwt_auth_routes();
-        let (token, _) = create_token("project-1", "user-1", "FORM-EXPECTED", Some("sj")).unwrap();
+        let (token, _) =
+            create_token("project-1", "user-1", None, "FORM-EXPECTED", Some("sj")).unwrap();
 
         let response = app
             .oneshot(
@@ -945,7 +989,8 @@ mod tests {
     #[tokio::test]
     async fn test_verify_token_handler_accepts_matching_form_id() {
         let app = create_jwt_auth_routes();
-        let (token, _) = create_token("project-1", "user-1", "FORM-EXPECTED", Some("sj")).unwrap();
+        let (token, _) =
+            create_token("project-1", "user-1", None, "FORM-EXPECTED", Some("sj")).unwrap();
 
         let response = app
             .oneshot(

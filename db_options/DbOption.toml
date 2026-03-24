@@ -231,16 +231,6 @@ frontend_base_url = "http://123.57.182.243"
 # 请求超时时间 (秒)
 timeout_seconds = 30
 
-# ====== 外部校审系统出站调用配置 ======
-# base_url 为空时自动 mock，不会发出实际请求
-[external_review]
-base_url = ""
-cache_preload_path = "/api/cache/preload"
-embed_url_path = "/api/embed-url"
-workflow_delete_path = "/api/workflow/delete"
-auth_secret = "shared-review-secret"
-timeout_seconds = 15
-
 # ====== 校审接口认证配置 ======
 # 本地/联调阶段可临时关闭 JWT 校验；上线前请改回 enabled = true
 [review_auth]

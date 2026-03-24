@@ -77,11 +77,21 @@ pub fn add_export_instance_args(command: Command) -> Command {
 pub fn add_init_project_subcommand(command: Command) -> Command {
     command.subcommand(
         Command::new("init-project")
-            .about("执行项目初始化：先全量扫描生成 DESI indextree，再生成 pe_transform")
+            .about(
+                "项目冷启动推荐入口：① scene_tree（*.tree + db_meta_info.json）② 连库加载 db_meta ③ pe_transform",
+            )
+            .long_about(
+                "顺序固定为：\n\
+                 1) 全量扫描 PDMS，生成 DESI 的 scene_tree（output/<项目>/scene_tree/*.tree）并更新 db_meta_info.json；\n\
+                 2) 连接 SurrealDB，加载 db_meta；\n\
+                 3) 对指定（或全部）DESI dbnum 刷新 pe_transform。\n\
+                 完成后再执行常规模型生成（如带 --dbnum 的全量/增量 gen_model）。\n\
+                 示例：aios-database -c db_options/DbOption-zsy init-project --dbnums 5525",
+            )
             .arg(
                 Arg::new("dbnums")
                     .long("dbnums")
-                    .help("限定需要生成 pe_transform 的 dbnum 列表（逗号分隔）；不传则对扫描到的全部 DESI dbnum 生成")
+                    .help("仅对这些 dbnum 刷新 pe_transform（逗号分隔）；省略则对 db_meta 中全部 DESI dbnum 刷新")
                     .value_name("DBNUMS")
                     .value_delimiter(',')
                     .value_parser(clap::value_parser!(u32))

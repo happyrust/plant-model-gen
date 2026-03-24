@@ -1,14 +1,12 @@
 //! Platform API — PMS ↔ 三维校审平台 interface.
 //!
-//! Handles inbound requests from PMS (embed URL, workflow sync, cache preload,
-//! review deletion) and outbound fire-and-forget notifications back to PMS.
+//! Inbound only: embed URL, workflow sync, cache preload, review soft-delete.
 
 mod auth;
 mod cache_preload;
 pub mod config;
 mod delete_handler;
 mod embed_url;
-pub mod outbound_notify;
 pub mod review_form;
 pub mod types;
 mod workflow_sync;
@@ -18,8 +16,9 @@ mod tests;
 
 use axum::{Router, routing::post};
 
-pub use outbound_notify::notify_workflow_delete_async;
-pub use review_form::{mark_review_form_deleted, sync_review_form_with_task_status};
+pub use review_form::{
+    mark_review_form_deleted, sync_review_form_with_task_status, REVIEW_TASK_ACTIVE_SQL,
+};
 pub use types::derive_review_form_status_from_task_status;
 
 /// Create platform API routes (replaces `create_model_center_routes`).

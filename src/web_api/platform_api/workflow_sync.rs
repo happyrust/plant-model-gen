@@ -1,4 +1,7 @@
 //! Inbound workflow sync handler — PMS calls this when submitting reviews.
+//!
+//! SurrealQL 遵循 plant-surrealdb 技能中的通用约定：列表仅取一列时用 `SELECT VALUE`，
+//! 明确列投影而非 `SELECT *`，并保持与 `review_form::REVIEW_TASK_ACTIVE_SQL` 一致的任务可见性语义。
 
 use axum::{extract::Json, http::StatusCode, response::IntoResponse};
 use surrealdb::types::SurrealValue;
@@ -147,20 +150,20 @@ async fn query_workflow_models(form_id: &str) -> anyhow::Result<Vec<String>> {
     let mut response = project_primary_db()
         .query(
             r#"
-            SELECT model_refno FROM review_form_model
-            WHERE form_id = $form_id
+            SELECT VALUE model_refno FROM review_form_model
+            WHERE form_id = $form_id AND model_refno != NONE
             "#,
         )
         .bind(("form_id", form_id.to_string()))
         .await?;
 
-    #[derive(Debug, serde::Deserialize, SurrealValue)]
-    struct ModelRow {
-        model_refno: Option<String>,
-    }
-
-    let rows: Vec<ModelRow> = response.take(0)?;
-    Ok(rows.into_iter().filter_map(|r| r.model_refno).collect())
+    let rows: Vec<Option<String>> = response.take(0)?;
+    Ok(rows
+        .into_iter()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
 }
 
 async fn query_workflow_opinions(form_id: &str) -> anyhow::Result<Vec<WorkflowOpinion>> {

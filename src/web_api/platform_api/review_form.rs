@@ -1,4 +1,9 @@
 //! Review form (review_forms table) lifecycle management.
+//!
+//! SurrealQL 风格对齐 `.cursor/skills/plant-surrealdb` 中的通用约定：
+//! - 只取标量列表时优先 `SELECT VALUE`；
+//! - 逻辑删除用显式 `(deleted IS NONE OR deleted = false)`（旧行无 `deleted` 视为未删）；
+//! - 能用单次 `UPDATE … WHERE` 完成的不要先 `SELECT` 再写（减少往返）。
 
 use aios_core::project_primary_db;
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
@@ -7,6 +12,9 @@ use crate::web_api::review_api::{ReviewAttachment, ReviewComponent, ReviewTask, 
 use super::types::{
     ReviewForm, ReviewFormRow, derive_review_form_status_from_task_status, review_form_from_row,
 };
+
+/// `review_tasks` 未软删过滤片段（可选 `bool` 字段：勿单独用 `deleted = false` 排除「字段缺失」旧数据）
+pub const REVIEW_TASK_ACTIVE_SQL: &str = "(deleted IS NONE OR deleted = false)";
 
 // ============================================================================
 // Schema
@@ -173,10 +181,6 @@ pub async fn sync_review_form_with_task_status(
 pub async fn mark_review_form_deleted(form_id: &str) -> anyhow::Result<()> {
     ensure_review_forms_schema().await?;
 
-    if get_review_form_by_form_id(form_id).await?.is_none() {
-        return Ok(());
-    }
-
     project_primary_db()
         .query(
             r#"
@@ -193,6 +197,28 @@ pub async fn mark_review_form_deleted(form_id: &str) -> anyhow::Result<()> {
         .bind(("form_id", form_id.to_string()))
         .await?;
 
+    Ok(())
+}
+
+/// PMS 入站删除：主单软删 + 该 `form_id` 下任务软删；不物理删除子表与附件文件。
+pub async fn soft_delete_review_bundle(form_id: &str) -> anyhow::Result<()> {
+    ensure_review_forms_schema().await?;
+
+    project_primary_db()
+        .query(
+            r#"
+            UPDATE review_tasks SET
+                deleted = true,
+                deleted_at = time::now(),
+                updated_at = time::now(),
+                status = 'deleted'
+            WHERE form_id = $form_id
+            "#,
+        )
+        .bind(("form_id", form_id.to_string()))
+        .await?;
+
+    mark_review_form_deleted(form_id).await?;
     Ok(())
 }
 
@@ -234,14 +260,16 @@ pub async fn find_task_by_form_id(form_id: &str) -> anyhow::Result<Option<Review
     }
 
     let mut response = project_primary_db()
-        .query(
+        .query(&format!(
             r#"
             SELECT * FROM review_tasks
             WHERE form_id = $form_id
+              AND {}
             ORDER BY updated_at DESC, created_at DESC
             LIMIT 1
             "#,
-        )
+            REVIEW_TASK_ACTIVE_SQL
+        ))
         .bind(("form_id", form_id.to_string()))
         .await?;
 

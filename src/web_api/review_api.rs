@@ -1,6 +1,9 @@
 //! Review API - 校审管理 API
 //!
 //! 实现提资单、确认记录、评论、附件等完整的 CRUD 操作
+//!
+//! `review_tasks` 软删过滤：凡出现 `(deleted IS NONE OR deleted = false)` 的语句须与
+//! `platform_api::REVIEW_TASK_ACTIVE_SQL` 保持同步（见 plant-surrealdb 技能：可选 bool / 逻辑删除）。
 
 use axum::{
     Router,
@@ -15,10 +18,7 @@ use surrealdb::types::{self as surrealdb_types, SurrealValue};
 use tracing::{info, warn};
 
 use crate::web_api::jwt_auth::{TokenClaims, generate_form_id};
-use crate::web_api::platform_api::{
-    mark_review_form_deleted, notify_workflow_delete_async,
-    sync_review_form_with_task_status,
-};
+use crate::web_api::platform_api::{mark_review_form_deleted, sync_review_form_with_task_status};
 use aios_core::project_primary_db;
 use axum::extract::Extension;
 use std::collections::HashSet;
@@ -974,7 +974,7 @@ async fn create_task(
 async fn list_tasks(Query(query): Query<TaskListQuery>) -> impl IntoResponse {
     info!("Listing review tasks");
 
-    let mut conditions = vec![];
+    let mut conditions: Vec<&'static str> = vec!["(deleted IS NONE OR deleted = false)"];
     let mut bindings: Vec<(&'static str, String)> = vec![];
 
     if let Some(ref status) = query.status {
@@ -1006,11 +1006,7 @@ async fn list_tasks(Query(query): Query<TaskListQuery>) -> impl IntoResponse {
         bindings.push(("reviewer_id", reviewer_id.clone()));
     }
 
-    let where_clause = if conditions.is_empty() {
-        "".to_string()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
+    let where_clause = format!("WHERE {}", conditions.join(" AND "));
 
     let limit = query.limit.unwrap_or(100);
     let offset = query.offset.unwrap_or(0);
@@ -1092,7 +1088,7 @@ async fn get_task(Path(id): Path<String>) -> impl IntoResponse {
     info!("Getting task: {}", id);
 
     // 使用 record::id(id) 提取 key 进行比较
-    let sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id LIMIT 1";
+    let sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
 
     match project_primary_db()
         .query(sql)
@@ -1116,7 +1112,7 @@ async fn get_task(Path(id): Path<String>) -> impl IntoResponse {
                     Json(TaskResponse {
                         success: false,
                         task: None,
-                        error_message: Some(format!("任务不存在: {}", id)),
+                        error_message: Some(format!("任务不存在或已删除: {}", id)),
                     }),
                 )
             }
@@ -1164,7 +1160,7 @@ async fn update_task(
     }
 
     let sql = format!(
-        "UPDATE review_tasks SET {} WHERE record::id(id) = $id",
+        "UPDATE review_tasks SET {} WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)",
         updates.join(", ")
     );
 
@@ -1193,7 +1189,7 @@ async fn update_task(
     match q.await {
         Ok(_) => {
             // 返回更新后的任务
-            let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id";
+            let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)";
             if let Ok(mut resp) = project_primary_db()
                 .query(get_sql)
                 .bind(("id", id.clone()))
@@ -1216,7 +1212,7 @@ async fn update_task(
                 Json(TaskResponse {
                     success: true,
                     task: None,
-                    error_message: None,
+                    error_message: Some("更新成功但无法读取任务（可能已删除）".to_string()),
                 }),
             )
         }
@@ -1234,22 +1230,22 @@ async fn update_task(
     }
 }
 
-/// DELETE /api/review/tasks/:id - 删除任务
+/// DELETE /api/review/tasks/:id - 软删除任务（与 PMS 入站删除一致；不向 PMS 回调）
 async fn delete_task(Path(id): Path<String>) -> impl IntoResponse {
-    info!("Deleting task: {}", id);
+    info!("Soft-deleting task: {}", id);
     let form_id = lookup_task_form_id(&id).await;
 
-    let cascade_sql = r#"
-        DELETE FROM review_records WHERE task_id = $id;
-        DELETE FROM review_workflow_history WHERE task_id = $id;
-        DELETE FROM review_history WHERE task_id = $id;
-        DELETE FROM review_form_model WHERE form_id IN
-            (SELECT VALUE form_id FROM review_tasks WHERE record::id(id) = $id);
-        DELETE [type::record('review_tasks', $id)];
+    let soft_sql = r#"
+        UPDATE review_tasks SET
+            deleted = true,
+            deleted_at = time::now(),
+            updated_at = time::now(),
+            status = 'deleted'
+        WHERE record::id(id) = $id
     "#;
 
     match project_primary_db()
-        .query(cascade_sql)
+        .query(soft_sql)
         .bind(("id", id.clone()))
         .await
     {
@@ -1257,29 +1253,28 @@ async fn delete_task(Path(id): Path<String>) -> impl IntoResponse {
             if let Some(form_id) = form_id.as_deref() {
                 if let Err(error) = mark_review_form_deleted(form_id).await {
                     warn!(
-                        "Failed to mark review_form deleted after task deletion, form_id={}: {}",
+                        "Failed to mark review_form deleted after task soft-delete, form_id={}: {}",
                         form_id, error
                     );
                 }
             }
-            notify_workflow_delete_async(id.clone(), "system".to_string());
             (
                 StatusCode::OK,
                 Json(ActionResponse {
                     success: true,
-                    message: Some("任务及关联数据已删除".to_string()),
+                    message: Some("任务已软删除".to_string()),
                     error_message: None,
                 }),
             )
         }
         Err(e) => {
-            warn!("Failed to delete task: {}", e);
+            warn!("Failed to soft-delete task: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ActionResponse {
                     success: false,
                     message: None,
-                    error_message: Some(format!("删除任务失败: {}", e)),
+                    error_message: Some(format!("软删除任务失败: {}", e)),
                 }),
             )
         }
@@ -1345,16 +1340,16 @@ async fn update_task_status(
 
     let sql = match (&target_node, &comment) {
         (Some(_), Some(_)) => {
-            "UPDATE review_tasks SET status = $status, current_node = $node, review_comment = $comment, updated_at = time::now() WHERE record::id(id) = $id"
+            "UPDATE review_tasks SET status = $status, current_node = $node, review_comment = $comment, updated_at = time::now() WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)"
         }
         (Some(_), None) => {
-            "UPDATE review_tasks SET status = $status, current_node = $node, updated_at = time::now() WHERE record::id(id) = $id"
+            "UPDATE review_tasks SET status = $status, current_node = $node, updated_at = time::now() WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)"
         }
         (None, Some(_)) => {
-            "UPDATE review_tasks SET status = $status, review_comment = $comment, updated_at = time::now() WHERE record::id(id) = $id"
+            "UPDATE review_tasks SET status = $status, review_comment = $comment, updated_at = time::now() WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)"
         }
         (None, None) => {
-            "UPDATE review_tasks SET status = $status, updated_at = time::now() WHERE record::id(id) = $id"
+            "UPDATE review_tasks SET status = $status, updated_at = time::now() WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)"
         }
     };
 
@@ -2237,7 +2232,7 @@ async fn submit_to_next_node(
     );
 
     // 1. 获取当前任务
-    let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id LIMIT 1";
+    let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
     let task_result = project_primary_db()
         .query(get_sql)
         .bind(("id", id.clone()))
@@ -2254,7 +2249,7 @@ async fn submit_to_next_node(
                         Json(ActionResponse {
                             success: false,
                             message: None,
-                            error_message: Some(format!("任务不存在: {}", id)),
+                            error_message: Some(format!("任务不存在或已删除: {}", id)),
                         }),
                     );
                 }
@@ -2355,7 +2350,7 @@ async fn submit_to_next_node(
             status = $status,
             return_reason = NONE,
             updated_at = time::now()
-        WHERE record::id(id) = $id
+        WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)
     "#;
 
     if let Err(e) = project_primary_db()
@@ -2456,7 +2451,7 @@ async fn return_to_node(
     );
 
     // 1. 获取当前任务
-    let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id LIMIT 1";
+    let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
     let task_result = project_primary_db()
         .query(get_sql)
         .bind(("id", id.clone()))
@@ -2473,7 +2468,7 @@ async fn return_to_node(
                         Json(ActionResponse {
                             success: false,
                             message: None,
-                            error_message: Some(format!("任务不存在: {}", id)),
+                            error_message: Some(format!("任务不存在或已删除: {}", id)),
                         }),
                     );
                 }
@@ -2550,7 +2545,7 @@ async fn return_to_node(
             status = $status,
             return_reason = $reason,
             updated_at = time::now()
-        WHERE record::id(id) = $id
+        WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)
     "#;
 
     if let Err(e) = project_primary_db()
@@ -2664,7 +2659,7 @@ async fn get_workflow_history(Path(id): Path<String>) -> impl IntoResponse {
         current_node: Option<String>,
     }
 
-    let get_sql = "SELECT current_node FROM review_tasks WHERE record::id(id) = $id LIMIT 1";
+    let get_sql = "SELECT current_node FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
     let current_node = match project_primary_db()
         .query(get_sql)
         .bind(("id", id.clone()))
@@ -2925,8 +2920,7 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
                 components: Option<Vec<ReviewComponent>>,
             }
 
-            let sql =
-                "SELECT form_id, components FROM review_tasks WHERE record::id(id) = $id LIMIT 1";
+            let sql = "SELECT form_id, components FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
             if let Ok(mut resp) = project_primary_db()
                 .query(sql)
                 .bind(("id", tid.to_string()))
@@ -3163,18 +3157,18 @@ async fn export_review_data(Json(request): Json<ExportRequest>) -> impl IntoResp
     let (sql, use_ids_param) = if let Some(ref ids) = request.task_ids {
         if ids.is_empty() {
             (
-                "SELECT * FROM review_tasks ORDER BY created_at DESC LIMIT 100".to_string(),
+                "SELECT * FROM review_tasks WHERE (deleted IS NONE OR deleted = false) ORDER BY created_at DESC LIMIT 100".to_string(),
                 false,
             )
         } else {
             (
-                "SELECT * FROM review_tasks WHERE record::id(id) IN $task_ids".to_string(),
+                "SELECT * FROM review_tasks WHERE (deleted IS NONE OR deleted = false) AND record::id(id) IN $task_ids".to_string(),
                 true,
             )
         }
     } else {
         (
-            "SELECT * FROM review_tasks ORDER BY created_at DESC LIMIT 100".to_string(),
+            "SELECT * FROM review_tasks WHERE (deleted IS NONE OR deleted = false) ORDER BY created_at DESC LIMIT 100".to_string(),
             false,
         )
     };

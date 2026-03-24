@@ -179,7 +179,12 @@ async fn check_tree_files(
     println!("[precheck] 缺失的数据库: {:?}", missing);
     println!("[precheck] 🔄 开始并行生成缺失的 Tree 文件...");
 
-    println!("[precheck] ⚠️  缺失的 Tree 文件需要通过 PDMS 解析(--parse-db)生成");
+    println!(
+        "[precheck] 💡 推荐先冷启动：aios-database -c <配置无扩展名> init-project --dbnums <...>"
+    );
+    println!(
+        "[precheck]    （顺序：scene_tree → db_meta → pe_transform）；或全量解析：--parse-db"
+    );
 
     stats.tree_generated = 0;
     stats.tree_failed = missing.len();

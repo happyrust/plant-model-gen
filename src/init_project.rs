@@ -16,7 +16,7 @@ pub fn resolve_target_dbnums(
     discovered_dbnums.dedup();
 
     if discovered_dbnums.is_empty() {
-        bail!("全量扫描后未发现任何 DESI dbnum，无法生成 pe_transform");
+        bail!("db_meta 中没有任何 DESI dbnum（请先完成第 1 步 scene_tree / indextree 生成）");
     }
 
     let Some(mut dbnums) = cli_dbnums else {
@@ -56,22 +56,24 @@ pub async fn run_init_project_mode(
         db_option_ext.inner.project_name, db_option_ext.inner.surreal_ns
     );
 
-    println!("🌲 第 1 步：全量扫描并生成 DESI indextree");
-    generate_desi_indextree(true).context("全量扫描生成 DESI indextree 失败")?;
+    println!(
+        "🌲 第 1 步：生成 scene_tree（DESI indextree：output/<项目>/scene_tree/*.tree + db_meta_info.json）"
+    );
+    generate_desi_indextree(true).context("scene_tree / DESI indextree 生成失败")?;
 
-    println!("🔌 第 2 步：连接 Surreal 并加载 db_meta");
+    println!("🔌 第 2 步：连接 SurrealDB 并从磁盘加载 db_meta（校验 scene_tree 元数据）");
     aios_core::init_surreal()
         .await
         .context("初始化 Surreal 连接失败")?;
     db_meta()
         .try_load_default()
-        .context("加载 db_meta_info.json 失败")?;
+        .context("加载 db_meta_info.json 失败（确认第 1 步已写出 scene_tree）")?;
 
     let discovered_dbnums = db_meta().get_all_dbnums();
     let dbnums = resolve_target_dbnums(cli_dbnums, discovered_dbnums)?;
-    println!("🎯 第 3 步目标 dbnums: {:?}", dbnums);
+    println!("🎯 第 3 步：目标 dbnums（将刷新其 pe_transform）: {:?}", dbnums);
 
-    println!("🔄 第 4 步：刷新 pe_transform");
+    println!("🔄 第 4 步：写入/刷新 pe_transform（依赖库中已有 pe 与 scene 数据）");
     let refresh_count = refresh_pe_transform_for_dbnums_compat(&dbnums)
         .await
         .context("刷新 pe_transform 失败")?;

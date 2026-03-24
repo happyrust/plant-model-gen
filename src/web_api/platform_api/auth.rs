@@ -1,17 +1,9 @@
 //! S2S authentication helpers shared across platform API handlers.
 
 use axum::http::StatusCode;
-use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::web_api::jwt_auth::{verify_token, REVIEW_AUTH_CONFIG};
-
-/// SHA256 hex digest.
-pub fn sha256_hex(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    hex::encode(hasher.finalize())
-}
 
 /// Unified S2S token verification: validates JWT when auth is enabled, skips otherwise.
 pub fn verify_s2s_token(

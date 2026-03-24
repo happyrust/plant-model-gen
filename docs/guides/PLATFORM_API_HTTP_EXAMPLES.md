@@ -91,6 +91,5 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/auth/token' \
 ## 代码位置（重构后）
 
 - 路由注册：`src/web_api/platform_api/mod.rs` → `create_platform_api_routes()`
-- 入站处理：`embed_url.rs`、`workflow_sync.rs`、`cache_preload.rs`、`delete_handler.rs`
+- 入站处理：`embed_url.rs`、`workflow_sync.rs`、`cache_preload.rs`、`delete_handler.rs`（删除为软删，无出站回调）
 - 主单据与任务查询：`review_form.rs`
-- 出站通知（可选）：`outbound_notify.rs` + `db_options/DbOption.toml` 的 `[external_review]`

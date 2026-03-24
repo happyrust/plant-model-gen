@@ -43,6 +43,10 @@ jobs:
         run: |
           git config --global url."https://${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
         shell: bash
+
+      - name: Prepare local patch dependencies
+        run: ./shells/prepare_ci_patch_deps.sh
+        shell: bash
       
       - name: Setup git credentials
         run: |

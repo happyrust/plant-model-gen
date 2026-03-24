@@ -47,6 +47,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Prepare local patch dependencies
+        run: ./shells/prepare_ci_patch_deps.sh
+        shell: bash
       
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
@@ -95,6 +99,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Prepare local patch dependencies
+        run: ./shells/prepare_ci_patch_deps.sh
+        shell: bash
       
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2

@@ -247,11 +247,13 @@ strip = "symbols"    # 剥离符号表，减小二进制体积
 tempfile = "3"
 
 # ═══════════════════════════════════════════════════════════════
-# 本地路径覆盖（联调时取消注释，CI/远程编译时注释掉整个 [patch] block）
+# 本地路径覆盖（联调时取消注释，CI/远程编译时注释掉下方两个 [patch] block）
+# 使用 pdms-io-fork 时必须同时 patch rs-core：parse_pdms_db 依赖 path 版 aios_core，
+# 否则会出现两套 aios_core、类型不匹配（E0308）。
 # ═══════════════════════════════════════════════════════════════
-# [patch."https://github.com/happyrust/rs-core.git"]
-# aios_core = { path = "../rs-core" }
+[patch."https://github.com/happyrust/rs-core.git"]
+aios_core = { path = "../rs-core" }
 
-# [patch."https://github.com/happyrust/pdms-io.git"]
-# pdms_io = { path = "../pdms-io-fork" }
-# parse_pdms_db = { path = "../pdms-io-fork/crates/parse_pdms_db" }
+[patch."https://github.com/happyrust/pdms-io.git"]
+pdms_io = { path = "../pdms-io-fork" }
+parse_pdms_db = { path = "../pdms-io-fork/crates/parse_pdms_db" }

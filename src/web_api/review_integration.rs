@@ -115,6 +115,12 @@ pub fn create_review_integration_routes() -> Router {
         .route("/api/review/collision-data", get(get_collision_data))
 }
 
+fn expected_aux_auth() -> (String, String) {
+    let u_code = std::env::var("AUX_DATA_UCODE").unwrap_or_else(|_| "ZY".to_string());
+    let u_key = std::env::var("AUX_DATA_UKEY").unwrap_or_default();
+    (u_code, u_key)
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -126,13 +132,16 @@ async fn get_aux_data(
     // 1. Auth Check
     let u_code = headers.get("UCode").and_then(|v| v.to_str().ok());
     let u_key = headers.get("UKey").and_then(|v| v.to_str().ok());
+    let (expected_ucode, expected_ukey) = expected_aux_auth();
 
-    // Simple mock auth for now (replace with validation against config later)
     if u_code.is_none() || u_key.is_none() {
         warn!("Missing Auth Headers in Aux Data Request");
         return Err(StatusCode::UNAUTHORIZED);
     }
-    // TODO: Validate code/key match secrets
+    if u_code != Some(expected_ucode.as_str()) || u_key != Some(expected_ukey.as_str()) {
+        warn!("Invalid Auth Headers in Aux Data Request");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
 
     info!(
         "Received Aux Data Request: project_id={}, form_id={}",
@@ -229,6 +238,69 @@ fn generate_mock_collisions(refnos: &[String]) -> Vec<CollisionItem> {
             error_status: "pending".to_string(),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, body::Body, http::Request};
+    use tower::ServiceExt;
+
+    fn sample_request_body() -> String {
+        serde_json::json!({
+            "project_id": "2410",
+            "model_refnos": ["24381_1001"],
+            "major": "pipe",
+            "requester_id": "user-001",
+            "page": 1,
+            "page_size": 20,
+            "form_id": "FORM-123"
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_aux_data_rejects_incorrect_auth_headers() {
+        let app: Router = create_review_integration_routes();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/review/aux-data")
+                    .header("content-type", "application/json")
+                    .header("UCode", "WRONG")
+                    .header("UKey", "WRONG")
+                    .body(Body::from(sample_request_body()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_aux_data_accepts_matching_auth_headers() {
+        let app: Router = create_review_integration_routes();
+        let (u_code, u_key) = expected_aux_auth();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/review/aux-data")
+                    .header("content-type", "application/json")
+                    .header("UCode", u_code)
+                    .header("UKey", u_key)
+                    .body(Body::from(sample_request_body()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
 
 // ============================================================================

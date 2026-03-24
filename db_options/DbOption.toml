@@ -237,7 +237,6 @@ timeout_seconds = 30
 base_url = ""
 cache_preload_path = "/api/cache/preload"
 embed_url_path = "/api/embed-url"
-workflow_sync_path = "/api/workflow/sync"
 workflow_delete_path = "/api/workflow/delete"
 auth_secret = "shared-review-secret"
 timeout_seconds = 15

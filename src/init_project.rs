@@ -1,0 +1,85 @@
+use std::collections::HashSet;
+
+use anyhow::{Context, Result, bail};
+
+use crate::data_interface::db_meta;
+use crate::data_interface::db_meta_manager::generate_desi_indextree;
+use crate::options::DbOptionExt;
+use crate::pe_transform_refresh::refresh_pe_transform_for_dbnums_compat;
+
+pub fn resolve_target_dbnums(
+    cli_dbnums: Option<Vec<u32>>,
+    discovered_dbnums: Vec<u32>,
+) -> Result<Vec<u32>> {
+    let mut discovered_dbnums = discovered_dbnums;
+    discovered_dbnums.sort_unstable();
+    discovered_dbnums.dedup();
+
+    if discovered_dbnums.is_empty() {
+        bail!("全量扫描后未发现任何 DESI dbnum，无法生成 pe_transform");
+    }
+
+    let Some(mut dbnums) = cli_dbnums else {
+        return Ok(discovered_dbnums);
+    };
+
+    dbnums.sort_unstable();
+    dbnums.dedup();
+
+    if dbnums.is_empty() {
+        bail!("目标 dbnums 为空，请检查 --dbnums 参数");
+    }
+
+    let discovered_set: HashSet<u32> = discovered_dbnums.iter().copied().collect();
+    let missing_dbnums: Vec<u32> = dbnums
+        .iter()
+        .copied()
+        .filter(|dbnum| !discovered_set.contains(dbnum))
+        .collect();
+    if !missing_dbnums.is_empty() {
+        bail!(
+            "指定的 dbnums 未出现在本次 DESI 扫描结果中: {:?}；可用 dbnums={:?}",
+            missing_dbnums,
+            discovered_dbnums
+        );
+    }
+
+    Ok(dbnums)
+}
+
+pub async fn run_init_project_mode(
+    db_option_ext: DbOptionExt,
+    cli_dbnums: Option<Vec<u32>>,
+) -> Result<()> {
+    println!(
+        "🚀 开始初始化项目: project={} ns={}",
+        db_option_ext.inner.project_name, db_option_ext.inner.surreal_ns
+    );
+
+    println!("🌲 第 1 步：全量扫描并生成 DESI indextree");
+    generate_desi_indextree(true).context("全量扫描生成 DESI indextree 失败")?;
+
+    println!("🔌 第 2 步：连接 Surreal 并加载 db_meta");
+    aios_core::init_surreal()
+        .await
+        .context("初始化 Surreal 连接失败")?;
+    db_meta()
+        .try_load_default()
+        .context("加载 db_meta_info.json 失败")?;
+
+    let discovered_dbnums = db_meta().get_all_dbnums();
+    let dbnums = resolve_target_dbnums(cli_dbnums, discovered_dbnums)?;
+    println!("🎯 第 3 步目标 dbnums: {:?}", dbnums);
+
+    println!("🔄 第 4 步：刷新 pe_transform");
+    let refresh_count = refresh_pe_transform_for_dbnums_compat(&dbnums)
+        .await
+        .context("刷新 pe_transform 失败")?;
+
+    println!(
+        "✅ 项目初始化完成: project={} dbnums={:?} pe_transform_nodes={}",
+        db_option_ext.inner.project_name, dbnums, refresh_count
+    );
+
+    Ok(())
+}

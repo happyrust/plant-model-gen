@@ -40,7 +40,7 @@ pub async fn ensure_pe_transform_for_refnos(refnos: &[RefnoEnum]) -> anyhow::Res
     );
 
     // 调用 aios_core 的刷新函数
-    match aios_core::transform::refresh_pe_transform_for_dbnums(&dbnum_vec).await {
+    match crate::pe_transform_refresh::refresh_pe_transform_for_dbnums_compat(&dbnum_vec).await {
         Ok(count) => {
             log::info!("[precheck] pe_transform 刷新完成，处理 {} 个节点", count);
             Ok(())

@@ -54,7 +54,7 @@ pub mod wizard_template; // 模型实时补齐 + parquet 增量队列
 use crate::web_api::{
     CollisionApiState, E3dTreeApiState, NounHierarchyApiState, SearchApiState,
     SpatialQueryApiState, UploadApiState, create_collision_routes, create_e3d_tree_routes,
-    create_jwt_auth_routes, create_mbd_pipe_routes, create_model_center_routes,
+    create_jwt_auth_routes, create_mbd_pipe_routes, create_platform_api_routes,
     create_noun_hierarchy_routes, create_pdms_attr_routes, create_pdms_model_query_routes,
     create_pipeline_annotation_routes, create_ptset_routes, create_review_api_routes,
     create_review_integration_routes, create_room_tree_routes, create_scene_tree_routes,
@@ -928,7 +928,7 @@ pub async fn start_web_server_with_config(
         .merge(search_routes)
         .merge(upload_routes)
         .merge(create_review_integration_routes())
-        .merge(create_model_center_routes())
+        .merge(create_platform_api_routes())
         .merge(create_jwt_auth_routes())
         .merge(create_review_api_routes())
         .merge(create_scene_tree_routes())

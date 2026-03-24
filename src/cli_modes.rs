@@ -3149,6 +3149,110 @@ pub async fn export_dbnum_instances_json_mode(
     Ok(())
 }
 
+/// 导出 delivery-code 兼容的 V2 格式 instances.json
+///
+/// 内联矩阵 + uniforms，前端可直接加载渲染。
+pub async fn export_dbnum_instances_web_mode(
+    dbnum: u32,
+    verbose: bool,
+    output_override: Option<PathBuf>,
+    db_option_ext: &DbOptionExt,
+    root_refno: Option<RefnoEnum>,
+) -> Result<()> {
+    use aios_database::fast_model::export_model::export_dbnum_instances_web::export_dbnum_instances_web;
+    use std::sync::Arc;
+
+    println!("\n🎯 导出 delivery-code 兼容的 V2 JSON");
+    println!("====================================");
+
+    let output_dir =
+        output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("web_bundle"));
+
+    ensure_surreal_connected(db_option_ext).await?;
+
+    let db_option = Arc::new((**db_option_ext).clone());
+    let stats = export_dbnum_instances_web(
+        dbnum,
+        &output_dir,
+        db_option,
+        verbose,
+        root_refno,
+        None,
+    )
+    .await?;
+
+    println!("\n🎉 V2 导出完成！");
+    println!("📊 统计信息:");
+    println!("   - 输出文件: {}", stats.output_filename);
+    println!("   - BRAN/HANG 分组: {}", stats.bran_group_count);
+    println!("   - EQUI 分组: {}", stats.equi_group_count);
+    println!("   - 未分组: {}", stats.ungrouped_count);
+    println!("   - 构件实例: {}", stats.total_component_instances);
+    println!("   - TUBI 实例: {}", stats.total_tubing_instances);
+    println!("   - 耗时: {:?}", stats.elapsed);
+    Ok(())
+}
+
+/// 导出精简 V3 JSON 格式（矩阵去重 + 可配置变换）
+pub async fn export_dbnum_instances_v3_mode(
+    dbnum: u32,
+    verbose: bool,
+    output_override: Option<PathBuf>,
+    db_option_ext: &DbOptionExt,
+    root_refno: Option<RefnoEnum>,
+    target_unit: Option<String>,
+    apply_rotation: bool,
+) -> Result<()> {
+    use aios_database::fast_model::export_model::export_dbnum_instances_v3::export_dbnum_instances_v3;
+    use aios_database::fast_model::export_model::export_transform_config::ExportTransformConfig;
+    use aios_database::fast_model::unit_converter::LengthUnit;
+    use std::sync::Arc;
+
+    println!("\n🎯 导出精简 V3 JSON（矩阵去重）");
+    println!("====================================");
+
+    let output_dir =
+        output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("v3_bundle"));
+
+    let target = target_unit
+        .as_deref()
+        .and_then(|s| LengthUnit::from_str(s).ok())
+        .unwrap_or(LengthUnit::Millimeter);
+
+    let transform_config = ExportTransformConfig {
+        source_unit: LengthUnit::Millimeter,
+        target_unit: target,
+        apply_rotation,
+        inline_matrices: false,
+    };
+
+    ensure_surreal_connected(db_option_ext).await?;
+
+    let db_option = Arc::new((**db_option_ext).clone());
+    let stats = export_dbnum_instances_v3(
+        dbnum,
+        &output_dir,
+        db_option,
+        verbose,
+        transform_config,
+        root_refno,
+    )
+    .await?;
+
+    println!("\n🎉 V3 导出完成！");
+    println!("📊 统计信息:");
+    println!("   - 输出文件: {}", stats.output_filename);
+    println!("   - BRAN/HANG 分组: {}", stats.bran_group_count);
+    println!("   - EQUI 分组: {}", stats.equi_group_count);
+    println!("   - 未分组: {}", stats.ungrouped_count);
+    println!("   - 构件实例: {}", stats.total_component_instances);
+    println!("   - TUBI 实例: {}", stats.total_tubing_instances);
+    println!("   - transforms 条目: {}", stats.transform_count);
+    println!("   - aabb 条目: {}", stats.aabb_count);
+    println!("   - 耗时: {:?}", stats.elapsed);
+    Ok(())
+}
+
 /// 导出指定 dbnum 的实例数据为多表 Parquet 格式
 ///
 /// 输出文件：

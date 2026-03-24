@@ -10,6 +10,12 @@ pub mod export_obj;
 
 pub mod export_prepack_lod;
 
+pub mod export_dbnum_instances_web;
+
+pub mod export_transform_config;
+
+pub mod export_dbnum_instances_v3;
+
 pub mod export_room_instances;
 
 pub mod export_unit_mesh_glb;

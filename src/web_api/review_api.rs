@@ -15,8 +15,8 @@ use surrealdb::types::{self as surrealdb_types, SurrealValue};
 use tracing::{info, warn};
 
 use crate::web_api::jwt_auth::{TokenClaims, generate_form_id};
-use crate::web_api::model_center_client::{
-    mark_review_form_deleted, notify_workflow_delete_async, notify_workflow_sync_async,
+use crate::web_api::platform_api::{
+    mark_review_form_deleted, notify_workflow_delete_async,
     sync_review_form_with_task_status,
 };
 use aios_core::project_primary_db;
@@ -2422,14 +2422,6 @@ async fn submit_to_next_node(
 
     let from_name = get_node_display_name(&current_node);
 
-    // 6. 异步通知外部系统
-    notify_workflow_sync_async(
-        id.clone(),
-        action_label.to_string(),
-        op_id.to_string(),
-        None,
-    );
-
     if current_node == "pz" {
         (
             StatusCode::OK,
@@ -2639,14 +2631,6 @@ async fn return_to_node(
 
     let from_name = get_node_display_name(&current_node);
     let to_name = get_node_display_name(&request.target_node);
-
-    // 5. 异步通知外部系统
-    notify_workflow_sync_async(
-        id.clone(),
-        "return".to_string(),
-        op_id.to_string(),
-        Some(request.reason.clone()),
-    );
 
     (
         StatusCode::OK,

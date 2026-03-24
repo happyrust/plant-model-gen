@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use once_cell::sync::OnceCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -392,6 +392,41 @@ fn build_indextree_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
         .map_err(Into::into)
 }
 
+pub(crate) fn indextree_project_dir_candidates(
+    project_root: &Path,
+    project_name: &str,
+    project_dir_names: &[String],
+) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+
+    let mut push_candidate = |raw: &str| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        let path = PathBuf::from(trimmed);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            project_root.join(path)
+        };
+
+        let key = path.to_string_lossy().to_string();
+        if seen.insert(key) {
+            candidates.push(path);
+        }
+    };
+
+    push_candidate(project_name);
+    for dir_name in project_dir_names {
+        push_candidate(dir_name);
+    }
+
+    candidates
+}
+
 /// 生成所有 DESI 类型的 indextree 文件
 pub fn generate_desi_indextree(ignore_manual_dbnum: bool) -> anyhow::Result<()> {
     use crate::versioned_db::database::sync_total_async_threaded;
@@ -468,9 +503,23 @@ pub fn generate_single_indextree(target_dbnum: u32) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("解析 {} 失败: {}", config_path, e))?;
 
     let project_name = db_option.project_name.clone();
-    let project_dir = db_option
-        .get_project_path(&project_name)
-        .ok_or_else(|| anyhow::anyhow!("无法获取项目路径"))?;
+    let project_dir_names = db_option.get_project_dir_names().clone();
+    let project_candidates = indextree_project_dir_candidates(
+        Path::new(&db_option.project_path),
+        &project_name,
+        &project_dir_names,
+    );
+    let project_dir = project_candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "无法获取项目路径（project_path={}, project_name={}, project_dirs={:?}）",
+                db_option.project_path,
+                project_name,
+                project_dir_names
+            )
+        })?;
 
     println!("🔍 扫描项目目录: {}", project_dir.display());
 

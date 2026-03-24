@@ -270,7 +270,8 @@ async fn main() -> anyhow::Result<()> {
     // 默认不重定向；-v/--verbose 始终保留控制台输出；AIOS_REDIRECT_STDIO=1 可启用重定向到 logs/。
     maybe_redirect_stdio_to_log_file();
 
-    let matches = aios_database::cli_args::add_export_instance_args(Command::new("aios-database")
+    let matches = aios_database::cli_args::add_init_project_subcommand(
+        aios_database::cli_args::add_export_instance_args(Command::new("aios-database")
         .version("0.1.3")
         .about("AIOS Database Processing Tool")
         .arg(
@@ -830,7 +831,7 @@ async fn main() -> anyhow::Result<()> {
                 .long("offline")
                 .help("Use embedded file mode instead of WebSocket. Auto-kills any running SurrealDB server on the configured port")
                 .action(clap::ArgAction::SetTrue),
-        )
+        ))
         .get_matches();
 
     if let Some(relation_store_root) = matches.get_one::<String>("relation-store-output") {
@@ -1215,6 +1216,13 @@ async fn main() -> anyhow::Result<()> {
         aios_database::init_logging(true);
     }
 
+    if let Some(("init-project", sub_matches)) = matches.subcommand() {
+        let cli_dbnums = sub_matches
+            .get_many::<u32>("dbnums")
+            .map(|values| values.copied().collect());
+        return aios_database::init_project::run_init_project_mode(db_option_ext, cli_dbnums).await;
+    }
+
     // ========== 处理 --gen-all-desi-indextree 参数 ==========
     if matches.get_flag("gen-all-desi-indextree") {
         println!("🔄 生成所有 DESI 类型的 indextree (忽略 manual_db_nums)...");
@@ -1284,7 +1292,9 @@ async fn main() -> anyhow::Result<()> {
         || matches.get_flag("export-parquet")
         || matches.get_flag("export-dbnum-instances")
         || matches.get_flag("export-pdms-tree-parquet")
-        || matches.get_flag("export-world-sites-parquet");
+        || matches.get_flag("export-world-sites-parquet")
+        || matches.get_flag("export-dbnum-instances-web")
+        || matches.get_flag("export-v3");
 
     // ========== 执行模型生成 ==========
     // --regen-model: 清理后重新生成（强制 FORCE_REGEN_MESH）
@@ -1887,6 +1897,100 @@ async fn main() -> anyhow::Result<()> {
         .await;
     }
 
+    // 导出 delivery-code 兼容的 V2 JSON
+    if matches.get_flag("export-dbnum-instances-web") {
+        use crate::cli_modes::export_dbnum_instances_web_mode;
+        use aios_core::pdms_types::RefnoEnum;
+        use std::str::FromStr;
+
+        let dbnum = matches.get_one::<u32>("dbnum").copied();
+        let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
+
+        let root_refno: Option<RefnoEnum> = matches
+            .get_many::<String>("debug-model")
+            .or_else(|| matches.get_many::<String>("root-model"))
+            .and_then(|values| values.into_iter().next())
+            .and_then(|s| {
+                let refno_str = s.replace('_', "/");
+                RefnoEnum::from_str(&refno_str).ok()
+            });
+
+        let dbnum = match dbnum {
+            Some(n) => n,
+            None => {
+                eprintln!("❌ 错误: --export-dbnum-instances-web 需要提供 --dbnum 参数");
+                eprintln!("   例如: cargo run -- --export-dbnum-instances-web --dbnum 1112");
+                std::process::exit(1);
+            }
+        };
+
+        let cli_use_surrealdb = matches.get_flag("use-surrealdb");
+        if cli_use_surrealdb {
+            db_option_ext.use_surrealdb = true;
+        }
+
+        println!("🎯 导出 delivery-code 兼容的 V2 JSON");
+        println!("   - dbnum={}", dbnum);
+        if let Some(ref root) = root_refno {
+            println!("   - root_refno={}（仅子树，输出 instances_web_root_*.json）", root);
+        }
+
+        return export_dbnum_instances_web_mode(
+            dbnum,
+            verbose,
+            export_bundle_dir,
+            &db_option_ext,
+            root_refno,
+        )
+        .await;
+    }
+
+    // 导出精简 V3 JSON（矩阵去重）
+    if matches.get_flag("export-v3") {
+        use crate::cli_modes::export_dbnum_instances_v3_mode;
+        use aios_core::pdms_types::RefnoEnum;
+        use std::str::FromStr;
+
+        let dbnum = matches.get_one::<u32>("dbnum").copied();
+        let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
+        let target_unit = matches.get_one::<String>("v3-target-unit").cloned();
+        let apply_rotation = matches.get_flag("v3-rotate");
+
+        let root_refno: Option<RefnoEnum> = matches
+            .get_many::<String>("debug-model")
+            .or_else(|| matches.get_many::<String>("root-model"))
+            .and_then(|values| values.into_iter().next())
+            .and_then(|s| {
+                let refno_str = s.replace('_', "/");
+                RefnoEnum::from_str(&refno_str).ok()
+            });
+
+        let dbnum = match dbnum {
+            Some(n) => n,
+            None => {
+                eprintln!("❌ 错误: --export-v3 需要提供 --dbnum 参数");
+                eprintln!("   例如: cargo run -- --export-v3 --dbnum 1112");
+                std::process::exit(1);
+            }
+        };
+
+        let cli_use_surrealdb = matches.get_flag("use-surrealdb");
+        if cli_use_surrealdb {
+            db_option_ext.use_surrealdb = true;
+        }
+
+        return export_dbnum_instances_v3_mode(
+            dbnum,
+            verbose,
+            export_bundle_dir,
+            &db_option_ext,
+            root_refno,
+            target_unit,
+            apply_rotation,
+        )
+        .await;
+    }
+
     // 导出 WORL -> SITE 节点列表为 Parquet（Full Parquet Mode 的根节点 children 数据源）
     #[cfg(feature = "parquet-export")]
     if matches.get_flag("export-world-sites-parquet") {
@@ -2229,7 +2333,11 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            let count = aios_core::transform::refresh_pe_transform_for_dbnums(&dbnums).await?;
+            let count =
+                aios_database::pe_transform_refresh::refresh_pe_transform_for_dbnums_compat(
+                    &dbnums,
+                )
+                .await?;
             println!("✅ pe_transform 刷新完成，共处理 {} 个节点", count);
             return Ok(());
         }

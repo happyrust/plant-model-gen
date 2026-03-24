@@ -1,9 +1,4 @@
 #V2
-SELECT count() FROM pe WHERE noun = 'PANE' GROUP ALL;
-SELECT count() FROM FRMW WHERE NAME CONTAINS 'ROOM' GROUP ALL;
--- ========== 方式1：从 PANE 查询，owner 递归2层，REFNO 即 panel 的 pe ==========
-SELECT owner.{2}.id AS frmw_id, array::last(string::split(owner.{2}.NAME, '-')) AS room_num, REFNO AS panel_refno FROM PANE WHERE owner.{2}.NAME CONTAINS 'ROOM' LIMIT 10;
--- ========== 方式2：同上，放宽条件（仅 owner.{2}.NAME 非空）==========
 SELECT owner.{2}.id AS frmw_id, array::last(string::split(owner.{2}.NAME, '-')) AS room_num, REFNO AS panel_refno FROM PANE WHERE owner.{2}.NAME IS NOT NONE LIMIT 10;
 -- ========== 方式3：从 pe 查询（完全用 pe 表）==========
 SELECT id AS panel_refno, owner.{2}.id AS frmw_id, array::last(string::split(owner.{2}.name, '-')) AS room_num FROM pe WHERE noun = 'PANE' AND owner.{2}.name CONTAINS 'ROOM' LIMIT 10;
@@ -99,3 +94,8 @@ SELECT count() AS cnt FROM inst_relate WHERE dbnum = 7997 GROUP ALL;
 SELECT id[0] as refno, id[1] as index, in as leave, record::id(aabb) as world_aabb_hash, record::id(world_trans) as world_trans_hash, record::id(geo) as geo_hash, spec_value FROM tubi_relate:[pe:24381_145712, 0]..[pe:24381_145712, ..];
 SELECT owner_type, count() AS cnt FROM inst_relate WHERE dbnum = 7997 GROUP BY owner_type ORDER BY cnt DESC;
 SELECT owner_refno, owner_type, in as refno, in.noun as noun, spec_value as spec_value FROM inst_relate WHERE dbnum = 7997;
+SELECT VALUE count() FROM pe WHERE dbnum = 5001 GROUP ALL;
+SELECT VALUE refno FROM pe WHERE dbnum = 5001 AND (noun = 'SITE' OR noun = 'WORL') AND owner.refno = NONE;
+SELECT id, form_id, title, model_name, status, requester_name, checker_name, approver_name, created_at, updated_at FROM review_tasks WHERE title = "三维校审单测试" ORDER BY created_at DESC LIMIT 20;
+SELECT id, form_id, model_refno, created_at FROM review_form_model WHERE form_id IN ["FORM-0A514469C5F5", "FORM-ACF6C055965A"] ORDER BY created_at DESC;
+SELECT id, form_id, title, model_name FROM review_tasks WHERE form_id IN ["FORM-0A514469C5F5", "FORM-ACF6C055965A"] LIMIT 20;

@@ -33,8 +33,8 @@ pub use upload_api::{UploadApiState, create_upload_routes};
 pub use version_api::create_version_routes;
 pub mod review_integration;
 pub use review_integration::create_review_integration_routes;
-pub mod model_center_client;
-pub use model_center_client::create_model_center_routes;
+pub mod platform_api;
+pub use platform_api::create_platform_api_routes;
 
 pub mod pdms_model_query_api;
 

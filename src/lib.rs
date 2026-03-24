@@ -142,6 +142,10 @@ pub mod team_data;
 
 pub mod test;
 
+pub mod init_project;
+
+pub mod pe_transform_refresh;
+
 #[cfg(feature = "gui")]
 pub mod gui;
 

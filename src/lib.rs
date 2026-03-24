@@ -654,7 +654,7 @@ async fn run_app_internal(db_option_ext: options::DbOptionExt) -> anyhow::Result
 
     init_logging(db_option_ext.inner.enable_log);
 
-    // 使用 aios_core 统一的数据库初始化函数
+    // 使用 aios_core 统一的数据库初始化函数（file 模式内在连接前会释放冲突端口）
 
     aios_core::initialize_databases(&db_option_ext.inner).await?;
 

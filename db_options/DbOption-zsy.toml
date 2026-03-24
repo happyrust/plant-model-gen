@@ -15,8 +15,8 @@ sync_chunk_size = 10_0000
 project_path = "/Volumes/DPC/work/e3d_models"
 # project_path = "D:/AVEVA/Projects/E3D2.1"
 included_projects = ["YCYK-E3D"]
-# included_projects = ["AvevaMarineSample"]
-project_dirs = ["acw"]
+# 不要填 "acw000" 也不要填不存在的 "acw"（会变成 .../e3d_models/acw 而报错）。
+project_dirs = ["YCYK-E3D"]
 
 mdb_name = "ALL"
 project_name = "YCYK-E3D"
@@ -263,11 +263,10 @@ surreal_user = "root"
 surreal_password = "root"
 
 # ====== SurrealDB 连接配置 (PE/属性/输入数据) ======
-# ws 模式下以 ip/port 为准（与顶层 surreal_port 一致）；未写 port 时默认为 8020
+# file：嵌入式直连 RocksDB 目录（与 web_server.surreal_data_path 同一套数据时，勿再单独 surreal start，否则会 LOCK）。
+# 若要用独立 surreal start，请改 mode = "ws" 并填 ip/port。
 [surrealdb]
-mode = "ws"
-ip = "127.0.0.1"
-port = 8021
+mode = "file"
 path = "/Volumes/DPC/work/db-data/ams-8021.db"
 
 # ====== SurrealKV 连接配置 (模型数据写入) ======

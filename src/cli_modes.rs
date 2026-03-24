@@ -507,9 +507,7 @@ async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
             );
         }
     } else {
-        // 嵌入式 file 模式：先关闭可能占用数据目录的 ws server（RocksDB 排他锁）
-        let port = sdb_cfg.port;
-        kill_process_on_port(port);
+        aios_core::release_standalone_surreal_for_embedded_file(&db_option_ext.inner);
         println!("\n📡 连接数据库（SurrealDB 嵌入式模式）...");
     }
 

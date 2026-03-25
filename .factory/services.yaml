@@ -1,29 +1,25 @@
 commands:
-  cargo-version: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo --version
-  test: cd /Volumes/DPC/work/plant-model-gen && cargo check --bin aios-database --quiet
-  room-cli-check: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo check --bin aios-database --quiet
-  room-cli-check-release: cd /Volumes/DPC/work/plant-model-gen && cargo check --release --bin aios-database
-  room-help: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room --help
-  room-compute-help: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room compute --help
-  room-compute-panel-help: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room compute-panel --help
-  room-rebuild-spatial-index: cd /Volumes/DPC/work/plant-model-gen && cargo run --release --bin aios-database -- room rebuild-spatial-index
-  room-compute-full: cd /Volumes/DPC/work/plant-model-gen && cargo run --release --bin aios-database -- room compute
-  room-verify-help: cd /Volumes/DPC/work/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json --help
-  room-verify-required-input: cd /Volumes/DPC/work/plant-code/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json
-  room-verify-missing-input-file: cd /Volumes/DPC/work/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json --input /tmp/room-verify-missing.json
-  room-verify-fixture: cd /Volumes/DPC/work/plant-model-gen && cargo run --bin aios-database --quiet -- room verify-json --input verification/room/compute/room_compute_validation.json
-  room-release-build: cd /Volumes/DPC/work/plant-model-gen && cargo build --release --bin aios-database
+  install: npm --prefix web_console install
+  build: npm --prefix web_console run build
+  typecheck: cd web_console && npm exec -- vue-tsc --noEmit -p tsconfig.typecheck.json
+  lint: echo "lint skipped (not configured)"
+  test: cargo check --features web_server --bin web_server
+  web-dev: npm --prefix web_console run dev -- --host 127.0.0.1 --port 3110
+  rust-fmt: cargo fmt
+  rust-check-web: cargo check --features web_server --bin web_server
+  web-server-run: WEB_SERVER_PORT=3100 cargo run --features web_server --bin web_server -- --config db_options/DbOption-mac
 
 services:
-  room-cli:
-    start: echo "CLI-only mission: no long-running room service to start"
-    stop: echo "CLI-only mission: nothing to stop"
-    healthcheck: cd /Volumes/DPC/work/plant-model-gen && cargo run --bin aios-database -- room --help > /dev/null && echo "room CLI reachable"
+  web_server:
+    start: WEB_SERVER_PORT=3100 cargo run --features web_server --bin web_server -- --config db_options/DbOption-mac
+    stop: lsof -tiTCP:3100 -sTCP:LISTEN | xargs kill || true
+    healthcheck: curl -sf http://127.0.0.1:3100/api/status > /dev/null && echo "web_server ok"
+    port: 3100
     depends_on: []
 
-  surrealdb:
-    start: echo "Reuse existing local DB configuration; do not start a second DB instance from mission automation"
-    stop: echo "Do not stop shared DB resources from mission automation"
-    healthcheck: powershell -NoProfile -Command "if (Get-NetTCPConnection -State Listen -LocalPort 8020 -ErrorAction SilentlyContinue) { 'Detected listener on 8020' } else { 'No listener auto-detected on 8020; rely on configured local DB access' }"
-    port: 8020
+  web_console_dev:
+    start: npm --prefix web_console run dev -- --host 127.0.0.1 --port 3110
+    stop: lsof -tiTCP:3110 -sTCP:LISTEN | xargs kill || true
+    healthcheck: curl -sf http://127.0.0.1:3110/ > /dev/null && echo "vite ok"
+    port: 3110
     depends_on: []

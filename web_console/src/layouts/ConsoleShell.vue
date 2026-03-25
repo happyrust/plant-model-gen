@@ -47,6 +47,22 @@ const iconMap = {
 
 const drawer = ref(true);
 
+type NavItem = {
+  path: string;
+  group: string;
+  label: string;
+  order: number;
+  icon: (typeof iconMap)[keyof typeof iconMap];
+  ariaLabel: string;
+  itemId: string;
+};
+
+type NavGroup = {
+  group: string;
+  items: NavItem[];
+  headingId: string;
+};
+
 watch(
   mdAndDown,
   (isMobile) => {
@@ -55,7 +71,7 @@ watch(
   { immediate: true },
 );
 
-const groupedNav = computed(() => {
+const groupedNav = computed<NavGroup[]>(() => {
   const routes = appRoutes
     .filter((entry) => typeof entry.path === 'string' && entry.meta?.navGroup && entry.meta?.navLabel)
     .map((entry) => ({
@@ -64,6 +80,8 @@ const groupedNav = computed(() => {
       label: String(entry.meta?.navLabel),
       order: Number(entry.meta?.navOrder || 0),
       icon: iconMap[entry.meta?.navIcon as keyof typeof iconMap] || LayoutDashboardIcon,
+      ariaLabel: `${String(entry.meta?.navGroup)} - ${String(entry.meta?.navLabel)}`,
+      itemId: String(entry.name || entry.path).replace(/[^a-zA-Z0-9_-]/g, '-'),
     }))
     .sort((a, b) => a.order - b.order);
 
@@ -72,6 +90,7 @@ const groupedNav = computed(() => {
     .map((group) => ({
       group,
       items: routes.filter((entry) => entry.group === group),
+      headingId: `console-nav-group-${group.toLowerCase()}`,
     }))
     .filter((entry) => entry.items.length > 0);
 });
@@ -133,31 +152,46 @@ function navigateTo(path: string) {
         </p>
       </div>
 
-      <div class="drawer-groups">
+      <nav class="drawer-groups" aria-label="Console navigation">
         <section v-for="group in primaryGroups" :key="group.group" class="drawer-group">
-          <p class="drawer-group-title">{{ group.group }}</p>
-          <v-list class="drawer-list" density="comfortable" nav>
+          <p :id="group.headingId" class="drawer-group-title">{{ group.group }}</p>
+          <v-list
+            class="drawer-list"
+            density="comfortable"
+            nav
+            :aria-labelledby="group.headingId"
+          >
             <v-list-item
               v-for="item in group.items"
               :key="item.path"
               :active="route.path === item.path || route.path.startsWith(`${item.path}/`)"
               rounded="xl"
               class="drawer-item"
-              link
-              @click="navigateTo(item.path)"
+              :title="item.ariaLabel"
+              :aria-label="item.ariaLabel"
+              :data-nav-item="item.itemId"
+              tag="a"
+              :href="`/console${item.path}`"
+              @click.prevent="navigateTo(item.path)"
             >
               <template #prepend>
-                <component :is="item.icon" class="shell-nav-icon" />
+                <component :is="item.icon" class="shell-nav-icon" aria-hidden="true" />
               </template>
               <v-list-item-title class="drawer-item-title">{{ item.label }}</v-list-item-title>
             </v-list-item>
           </v-list>
         </section>
-      </div>
+      </nav>
 
       <div class="viewer-entry">
-        <button type="button" class="viewer-button" @click="navigateTo('/viewer/preview')">
-          <MonitorSmartphoneIcon class="shell-nav-icon" />
+        <button
+          type="button"
+          class="viewer-button"
+          aria-label="Viewer - Preview placeholder"
+          data-nav-item="viewer-preview"
+          @click="navigateTo('/viewer/preview')"
+        >
+          <MonitorSmartphoneIcon class="shell-nav-icon" aria-hidden="true" />
           <span>Viewer / Preview placeholder</span>
         </button>
       </div>
@@ -185,9 +219,11 @@ function navigateTo(path: string) {
         type="button"
         class="shell-mobile-item"
         :class="{ active: route.path === item.path || route.path.startsWith(`${item.path}/`) }"
+        :aria-label="item.ariaLabel"
+        :data-nav-item="`${item.itemId}-mobile`"
         @click="navigateTo(item.path)"
       >
-        <component :is="item.icon" class="shell-nav-icon" />
+        <component :is="item.icon" class="shell-nav-icon" aria-hidden="true" />
         <span>{{ item.label }}</span>
       </button>
     </nav>

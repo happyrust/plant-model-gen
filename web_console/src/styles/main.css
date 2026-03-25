@@ -170,24 +170,6 @@ input {
   color: var(--muted);
 }
 
-.viewer-entry {
-  margin-top: auto;
-}
-
-.viewer-button {
-  width: 100%;
-  border: 0;
-  border-radius: 18px;
-  padding: 14px 16px;
-  background: linear-gradient(135deg, rgba(15, 108, 91, 0.28), rgba(255, 255, 255, 0.08));
-  color: white;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  cursor: pointer;
-  text-align: left;
-}
-
 .console-app-bar {
   background: rgba(248, 244, 236, 0.9) !important;
   backdrop-filter: blur(18px);
@@ -590,12 +572,31 @@ input {
     right: 14px;
     bottom: 14px;
     display: grid;
+    gap: 12px;
+    padding: 12px;
+    border-radius: 24px;
+    background: rgba(10, 19, 38, 0.94);
+    box-shadow: var(--shadow);
+    z-index: 20;
+  }
+
+  .shell-mobile-group {
+    display: grid;
+    gap: 8px;
+  }
+
+  .shell-mobile-group-title {
+    margin: 0;
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.54);
+  }
+
+  .shell-mobile-grid {
+    display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 10px;
-    padding: 10px;
-    border-radius: 22px;
-    background: rgba(10, 19, 38, 0.92);
-    box-shadow: var(--shadow);
   }
 
   .shell-mobile-item {
@@ -603,12 +604,19 @@ input {
     border-radius: 16px;
     padding: 12px 10px;
     background: transparent;
-    justify-content: center;
+    justify-content: flex-start;
     color: rgba(255, 255, 255, 0.68);
     display: flex;
     align-items: center;
     gap: 10px;
     cursor: pointer;
+    text-align: left;
+    min-height: 48px;
+  }
+
+  .shell-mobile-item span {
+    white-space: normal;
+    line-height: 1.25;
   }
 
   .shell-mobile-item.active {

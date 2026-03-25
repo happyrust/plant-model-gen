@@ -61,6 +61,7 @@ type NavGroup = {
   group: string;
   items: NavItem[];
   headingId: string;
+  mobileHeadingId: string;
 };
 
 watch(
@@ -91,16 +92,22 @@ const groupedNav = computed<NavGroup[]>(() => {
       group,
       items: routes.filter((entry) => entry.group === group),
       headingId: `console-nav-group-${group.toLowerCase()}`,
+      mobileHeadingId: `console-mobile-nav-group-${group.toLowerCase()}`,
     }))
     .filter((entry) => entry.items.length > 0);
 });
 
-const primaryGroups = computed(() => groupedNav.value.filter((group) => group.group !== 'Viewer'));
+const primaryGroups = computed(() => groupedNav.value);
 
-const mobileNav = computed(() =>
-  groupedNav.value.flatMap((group) => group.items).filter((item) =>
-    ['/dashboard', '/projects', '/tasks', '/deployment/sites'].includes(item.path),
-  ),
+const mobileNavPaths = ['/dashboard', '/projects', '/tasks', '/deployment/sites', '/viewer/preview'];
+
+const mobileGroups = computed(() =>
+  groupedNav.value
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => mobileNavPaths.includes(item.path)),
+    }))
+    .filter((group) => group.items.length > 0),
 );
 
 const currentTitle = computed(() => {
@@ -183,18 +190,6 @@ function navigateTo(path: string) {
         </section>
       </nav>
 
-      <div class="viewer-entry">
-        <button
-          type="button"
-          class="viewer-button"
-          aria-label="Viewer - Preview placeholder"
-          data-nav-item="viewer-preview"
-          @click="navigateTo('/viewer/preview')"
-        >
-          <MonitorSmartphoneIcon class="shell-nav-icon" aria-hidden="true" />
-          <span>Viewer / Preview placeholder</span>
-        </button>
-      </div>
     </v-navigation-drawer>
 
     <v-app-bar flat class="console-app-bar">
@@ -212,20 +207,25 @@ function navigateTo(path: string) {
       </div>
     </v-main>
 
-    <nav class="shell-mobile-nav">
-      <button
-        v-for="item in mobileNav"
-        :key="`${item.path}-mobile`"
-        type="button"
-        class="shell-mobile-item"
-        :class="{ active: route.path === item.path || route.path.startsWith(`${item.path}/`) }"
-        :aria-label="item.ariaLabel"
-        :data-nav-item="`${item.itemId}-mobile`"
-        @click="navigateTo(item.path)"
-      >
-        <component :is="item.icon" class="shell-nav-icon" aria-hidden="true" />
-        <span>{{ item.label }}</span>
-      </button>
+    <nav class="shell-mobile-nav" aria-label="Console quick navigation">
+      <section v-for="group in mobileGroups" :key="`${group.group}-mobile`" class="shell-mobile-group">
+        <p :id="group.mobileHeadingId" class="shell-mobile-group-title">{{ group.group }}</p>
+        <div class="shell-mobile-grid" :aria-labelledby="group.mobileHeadingId">
+          <button
+            v-for="item in group.items"
+            :key="`${item.path}-mobile`"
+            type="button"
+            class="shell-mobile-item"
+            :class="{ active: route.path === item.path || route.path.startsWith(`${item.path}/`) }"
+            :aria-label="item.ariaLabel"
+            :data-nav-item="`${item.itemId}-mobile`"
+            @click="navigateTo(item.path)"
+          >
+            <component :is="item.icon" class="shell-nav-icon" aria-hidden="true" />
+            <span>{{ item.label }}</span>
+          </button>
+        </div>
+      </section>
     </nav>
   </v-app>
 </template>

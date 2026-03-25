@@ -1,13 +1,16 @@
 use aios_core::DbOptionSurrealExt;
 use axum::{
     Router,
+    body::Body,
     extract::{Query, State},
     http::{Method, StatusCode, header},
-    response::{Html, Json},
+    response::{Html, Json, Response},
     routing::{delete, get, post, put},
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{Any, CorsLayer};
@@ -39,9 +42,9 @@ pub mod remote_sync_handlers;
 pub mod remote_sync_template;
 pub mod room_api;
 pub mod room_page;
-pub mod site_registry;
 pub mod simple_templates;
 pub mod site_metadata;
+pub mod site_registry;
 pub mod sqlite_spatial_api;
 pub mod sse_handlers; // SSE 事件流处理器
 pub mod stream_generate; // 流式模型生成模块
@@ -56,9 +59,9 @@ pub mod wizard_template; // 模型实时补齐 + parquet 增量队列
 use crate::web_api::{
     CollisionApiState, E3dTreeApiState, NounHierarchyApiState, SearchApiState,
     SpatialQueryApiState, UploadApiState, create_collision_routes, create_e3d_tree_routes,
-    create_jwt_auth_routes, create_mbd_pipe_routes, create_platform_api_routes,
-    create_noun_hierarchy_routes, create_pdms_attr_routes, create_pdms_model_query_routes,
-    create_pipeline_annotation_routes, create_ptset_routes, create_review_api_routes,
+    create_jwt_auth_routes, create_mbd_pipe_routes, create_noun_hierarchy_routes,
+    create_pdms_attr_routes, create_pdms_model_query_routes, create_pipeline_annotation_routes,
+    create_platform_api_routes, create_ptset_routes, create_review_api_routes,
     create_review_integration_routes, create_room_tree_routes, create_scene_tree_routes,
     create_search_routes, create_spatial_query_routes, create_upload_routes, create_version_routes,
 };
@@ -187,7 +190,8 @@ pub async fn start_web_server_with_config(
 
     // 预先初始化 OnceCell，确保配置已加载
     let _ = aios_core::get_db_option();
-    let runtime_site_config = crate::web_server::site_registry::load_web_server_runtime_config(port);
+    let runtime_site_config =
+        crate::web_server::site_registry::load_web_server_runtime_config(port);
 
     // 获取配置并初始化数据库（包括 SurrealDB）
     let db_option = aios_core::get_db_option();
@@ -437,11 +441,18 @@ pub async fn start_web_server_with_config(
             post(incremental_update_handlers::update_incremental_config),
         )
         // 增量更新页面
-        .route("/incremental", get(serve_incremental_update_page))
+        .route(
+            "/incremental",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/sync/incremental").await
+            }),
+        )
         // 同步控制中心
         .route(
             "/sync-control",
-            get(sync_control_handlers::sync_control_page),
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/sync/control").await
+            }),
         )
         .route(
             "/api/sync/start",
@@ -531,7 +542,12 @@ pub async fn start_web_server_with_config(
             get(sync_control_handlers::get_mqtt_server_status),
         )
         // 异地增量环境配置页面 + API
-        .route("/remote-sync", get(remote_sync_handlers::remote_sync_page))
+        .route(
+            "/remote-sync",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/sync/remote").await
+            }),
+        )
         .route(
             "/api/remote-sync/envs",
             get(remote_sync_handlers::list_envs).post(remote_sync_handlers::create_env),
@@ -736,7 +752,12 @@ pub async fn start_web_server_with_config(
             get(handlers::api_export_deployment_site_config),
         )
         // 部署站点管理页面
-        .route("/deployment-sites", get(handlers::deployment_sites_page))
+        .route(
+            "/deployment-sites",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/deployment/sites").await
+            }),
+        )
         // 数据解析向导API
         .route(
             "/api/wizard/scan-directory",
@@ -789,7 +810,12 @@ pub async fn start_web_server_with_config(
             post(handlers::api_sqlite_spatial_rebuild),
         )
         // 空间查询页面
-        .route("/spatial-query", get(handlers::spatial_query_page))
+        .route(
+            "/spatial-query",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/db/sqlite-spatial").await
+            }),
+        )
         // 空间计算 API
         .route(
             "/api/space/suppo-trays",
@@ -832,8 +858,11 @@ pub async fn start_web_server_with_config(
         )
         .route("/api/export/tasks", get(handlers::list_export_tasks))
         .route("/api/export/cleanup", post(handlers::cleanup_export_tasks))
+        .route("/console", get(console_index_page))
+        .route("/console/", get(console_index_page))
         // 静态文件服务
         .nest_service("/static", ServeDir::new("src/web_server/static"))
+        .nest_service("/console/assets", ServeDir::new("web_console/dist/assets"))
         // /files/output 下的静态文件服务（带 instances 兜底）
         //
         // 说明：不能在同一 Router 上同时注册 `/files/output` 的 nest_service 与其子路由，
@@ -883,29 +912,98 @@ pub async fn start_web_server_with_config(
             ServeDir::new("assets/review_attachments"),
         )
         // 主页面
-        .route("/", get(index_page))
-        .route("/dashboard", get(dashboard_page))
-        .route("/config", get(config_page))
-        .route("/tasks", get(tasks_page))
-        .route("/tasks/{id}", get(task_detail_page))
-        .route("/tasks/{id}/logs", get(task_logs_page))
-        .route("/batch-tasks", get(batch_tasks_page))
-        .route("/db-status", get(db_status_page))
-        .route("/wizard", get(wizard_page))
-        .route("/space-tools", get(space_tools_page))
-        .route("/sqlite-spatial", get(handlers::sqlite_spatial_page))
+        .route("/", get(console_root_redirect))
+        .route(
+            "/dashboard",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/dashboard").await
+            }),
+        )
+        .route(
+            "/config",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/settings/config").await
+            }),
+        )
+        .route(
+            "/tasks",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/tasks").await
+            }),
+        )
+        .route(
+            "/tasks/{id}",
+            get(|uri: axum::http::Uri| async move {
+                let task_id = uri.path().trim_start_matches("/tasks/");
+                let task_id = task_id.trim_end_matches('/');
+                redirect_response(&format!("/console/tasks/{}", task_id), uri.query())
+            }),
+        )
+        .route(
+            "/tasks/{id}/logs",
+            get(|uri: axum::http::Uri| async move {
+                let task_id = uri
+                    .path()
+                    .trim_start_matches("/tasks/")
+                    .trim_end_matches("/logs")
+                    .trim_end_matches('/');
+                redirect_response(&format!("/console/tasks/{}/logs", task_id), uri.query())
+            }),
+        )
+        .route(
+            "/batch-tasks",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/tasks/batch").await
+            }),
+        )
+        .route(
+            "/db-status",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/db/status").await
+            }),
+        )
+        .route(
+            "/wizard",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/deployment/wizard").await
+            }),
+        )
+        .route(
+            "/space-tools",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/tools/space-tools").await
+            }),
+        )
+        .route(
+            "/sqlite-spatial",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/db/sqlite-spatial").await
+            }),
+        )
         .route(
             "/database-connection",
-            get(handlers::database_connection_page),
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/settings/database-connection").await
+            }),
         )
         // 桥架支撑检测页面 + API
-        .route("/tray-supports", get(handlers::tray_supports_page))
+        .route(
+            "/tray-supports",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/tools/tray-supports").await
+            }),
+        )
         .route(
             "/api/sqlite-tray-supports/detect",
             post(handlers::api_sqlite_tray_supports_detect),
         )
         // SCTN 测试流程（后台任务 + 进度 + 结果）
-        .route("/sctn-test", get(handlers::sctn_test_page))
+        .route(
+            "/sctn-test",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/tools/sctn-test").await
+            }),
+        )
         .route("/api/sctn-test/run", post(handlers::api_sctn_test_run))
         .route(
             "/api/sctn-test/result/{id}",
@@ -914,13 +1012,21 @@ pub async fn start_web_server_with_config(
         // 空间查询可视化页面
         .route(
             "/spatial-visualization",
-            get(handlers::spatial_visualization_page),
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/db/spatial-visualization").await
+            }),
         )
         // 房间计算管理页面
-        .route("/room-management", get(room_page::room_management_page))
+        .route(
+            "/room-management",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/console/tools/room-management").await
+            }),
+        )
         // WebSocket 路由
         .route("/ws/progress/{task_id}", get(ws::ws_progress_handler))
         .route("/ws/tasks", get(ws::ws_tasks_handler))
+        .fallback(console_history_fallback)
         .with_state(app_state.clone())
         .merge(spatial_query_routes)
         .merge(noun_hierarchy_routes)
@@ -956,7 +1062,8 @@ pub async fn start_web_server_with_config(
 
     let listen_host = runtime_site_config.bind_host.clone();
     let listen_port = runtime_site_config.bind_port;
-    let listener = tokio::net::TcpListener::bind(format!("{}:{}", listen_host, listen_port)).await?;
+    let listener =
+        tokio::net::TcpListener::bind(format!("{}:{}", listen_host, listen_port)).await?;
     web_listen::init_web_listen(listen_host.clone(), listen_port);
     web_listen::init_site_identity(runtime_site_config.clone());
     if let Err(err) = crate::web_server::site_registry::upsert_runtime_site(&runtime_site_config) {
@@ -969,7 +1076,9 @@ pub async fn start_web_server_with_config(
                 heartbeat_runtime.heartbeat_interval_secs,
             ))
             .await;
-            if let Err(err) = crate::web_server::site_registry::upsert_runtime_site(&heartbeat_runtime) {
+            if let Err(err) =
+                crate::web_server::site_registry::upsert_runtime_site(&heartbeat_runtime)
+            {
                 eprintln!("站点心跳续约失败: {}", err);
             }
         }
@@ -1083,4 +1192,107 @@ pub struct CreateTaskRequest {
 #[derive(Deserialize)]
 pub struct UpdateConfigRequest {
     pub config: DatabaseConfig,
+}
+
+const WEB_CONSOLE_DIST_DIR: &str = "web_console/dist";
+const WEB_CONSOLE_INDEX_FILE: &str = "web_console/dist/index.html";
+const CONSOLE_ROUTE_MAPPINGS: &[(&str, &str)] = &[
+    ("/dashboard", "/console/dashboard"),
+    ("/tasks", "/console/tasks"),
+    ("/batch-tasks", "/console/tasks/batch"),
+    ("/deployment-sites", "/console/deployment/sites"),
+    ("/wizard", "/console/deployment/wizard"),
+    ("/sync-control", "/console/sync/control"),
+    ("/remote-sync", "/console/sync/remote"),
+    ("/incremental", "/console/sync/incremental"),
+    ("/db-status", "/console/db/status"),
+    ("/database-status", "/console/db/status"),
+    ("/sqlite-spatial", "/console/db/sqlite-spatial"),
+    ("/spatial-query", "/console/db/sqlite-spatial"),
+    (
+        "/spatial-visualization",
+        "/console/db/spatial-visualization",
+    ),
+    (
+        "/database-connection",
+        "/console/settings/database-connection",
+    ),
+    ("/config", "/console/settings/config"),
+    ("/space-tools", "/console/tools/space-tools"),
+    ("/tray-supports", "/console/tools/tray-supports"),
+    ("/sctn-test", "/console/tools/sctn-test"),
+    ("/room-management", "/console/tools/room-management"),
+];
+
+fn web_console_index_html() -> Option<String> {
+    std::fs::read_to_string(WEB_CONSOLE_INDEX_FILE).ok()
+}
+
+fn is_console_asset_request(path: &str) -> bool {
+    path == "/console" || path.starts_with("/console/")
+}
+
+fn is_excluded_spa_path(path: &str) -> bool {
+    path.starts_with("/api/")
+        || path.starts_with("/files/")
+        || path.starts_with("/static/")
+        || path.starts_with("/assets/")
+        || path.starts_with("/ws/")
+        || path == "/api"
+        || path == "/files"
+        || path == "/static"
+        || path == "/assets"
+        || path == "/ws"
+}
+
+async fn console_index_page() -> Result<Html<String>, StatusCode> {
+    web_console_index_html()
+        .map(Html)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn console_root_redirect() -> Response {
+    redirect_response("/console", None)
+}
+
+async fn console_history_fallback(uri: axum::http::Uri) -> Result<Response, StatusCode> {
+    let path = uri.path();
+    if !is_console_asset_request(path) || is_excluded_spa_path(path) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let relative = path
+        .strip_prefix("/console/")
+        .or_else(|| path.strip_prefix("/console"))
+        .unwrap_or("")
+        .trim_start_matches('/');
+    let local_path = Path::new(WEB_CONSOLE_DIST_DIR).join(relative);
+    if !relative.is_empty() && local_path.exists() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let html = web_console_index_html().ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(html))
+        .unwrap_or_else(|_| Response::new(Body::from(Cow::Borrowed("")))))
+}
+
+fn redirect_response(target: &str, query: Option<&str>) -> Response {
+    let mut location = target.to_string();
+    if let Some(query) = query.filter(|value| !value.is_empty()) {
+        location.push('?');
+        location.push_str(query);
+    }
+
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::LOCATION, location)
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+async fn redirect_legacy_console_path(uri: axum::http::Uri, target: &'static str) -> Response {
+    redirect_response(target, uri.query())
 }

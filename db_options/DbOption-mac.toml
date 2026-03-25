@@ -271,9 +271,17 @@ debug_user_id = "debug-user"
 debug_role = "sj"
 
 # Web Server 配置（3100 与 plant3d-web Vite 代理一致）
+# 外部已 `surreal start` 在 8020 时设为 false，避免二次绑定端口
 [web_server]
 port = 3100
-auto_start_surreal = true
+bind_host = "127.0.0.1"
+site_id = "avevamarinesample-3100"
+site_name = "AvevaMarineSample"
+region = "sjz"
+frontend_url = "http://123.57.182.243"
+public_base_url = "http://127.0.0.1:3100"
+backend_url = "http://127.0.0.1:3100"
+auto_start_surreal = false
 surreal_bin = "surreal"
 surreal_data_path = "/Volumes/DPC/work/db-data/ams-8020.db"
 surreal_bind = "0.0.0.0:8020"
@@ -281,8 +289,11 @@ surreal_user = "root"
 surreal_password = "root"
 
 # SurrealDB 连接配置 (PE/属性/输入数据)
+# ws 模式下使用 ip/port；path 仅作 file 模式数据目录参考
 [surrealdb]
 mode = "ws"
+ip = "127.0.0.1"
+port = 8020
 path = "/Volumes/DPC/work/db-data/ams-8020.db"
 
 # SurrealKV 连接配置 (模型数据写入)

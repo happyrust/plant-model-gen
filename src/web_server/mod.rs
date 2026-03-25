@@ -39,6 +39,7 @@ pub mod remote_sync_handlers;
 pub mod remote_sync_template;
 pub mod room_api;
 pub mod room_page;
+pub mod site_registry;
 pub mod simple_templates;
 pub mod site_metadata;
 pub mod sqlite_spatial_api;
@@ -48,6 +49,7 @@ pub mod sync_control_center;
 pub mod sync_control_handlers;
 pub mod task_creation_handlers;
 pub mod topology_handlers; // 拓扑配置处理器
+pub mod web_listen; // 当前进程 HTTP 监听与站点身份（一 web_server 一站）
 pub mod wizard_handlers;
 pub mod wizard_template; // 模型实时补齐 + parquet 增量队列
 
@@ -185,6 +187,7 @@ pub async fn start_web_server_with_config(
 
     // 预先初始化 OnceCell，确保配置已加载
     let _ = aios_core::get_db_option();
+    let runtime_site_config = crate::web_server::site_registry::load_web_server_runtime_config(port);
 
     // 获取配置并初始化数据库（包括 SurrealDB）
     let db_option = aios_core::get_db_option();
@@ -207,7 +210,7 @@ pub async fn start_web_server_with_config(
 
     // 初始化 SurrealDB 中的 projects 表（若已存在忽略错误）
     crate::web_server::handlers::ensure_projects_schema().await;
-    // 初始化 SurrealDB 中的 deployment_sites 表
+    // 初始化中心站点注册表（SQLite）
     crate::web_server::handlers::ensure_deployment_sites_schema().await;
 
     // 确保 Scene Tree 已初始化
@@ -698,7 +701,10 @@ pub async fn start_web_server_with_config(
             "/api/projects/{id}/healthcheck",
             post(handlers::api_healthcheck_project),
         )
-        // 部署站点管理 API
+        // 部署站点管理 API（一 web_server 进程对应一个运行站点；多站点 = 多进程 + 不同监听 IP/端口）
+        .route("/api/site/identity", get(handlers::api_get_site_identity))
+        // 站点清单（只读；创建/更新仍走 /api/deployment-sites）
+        .route("/api/sites", get(handlers::api_get_deployment_sites))
         .route(
             "/api/deployment-sites/import-dboption",
             post(handlers::api_import_deployment_site_from_dboption),
@@ -721,10 +727,10 @@ pub async fn start_web_server_with_config(
             "/api/deployment-sites/{id}/tasks",
             post(handlers::api_create_deployment_site_task),
         )
-        // .route(
-        //     "/api/deployment-sites/{id}/healthcheck",
-        //     post(handlers::api_healthcheck_deployment_site_post),
-        // )
+        .route(
+            "/api/deployment-sites/{id}/healthcheck",
+            post(handlers::api_healthcheck_deployment_site_post),
+        )
         .route(
             "/api/deployment-sites/{id}/export-config",
             get(handlers::api_export_deployment_site_config),
@@ -948,9 +954,29 @@ pub async fn start_web_server_with_config(
                 .allow_headers(Any),
         );
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    let listen_host = runtime_site_config.bind_host.clone();
+    let listen_port = runtime_site_config.bind_port;
+    let listener = tokio::net::TcpListener::bind(format!("{}:{}", listen_host, listen_port)).await?;
+    web_listen::init_web_listen(listen_host.clone(), listen_port);
+    web_listen::init_site_identity(runtime_site_config.clone());
+    if let Err(err) = crate::web_server::site_registry::upsert_runtime_site(&runtime_site_config) {
+        eprintln!("⚠️  启动时注册当前站点失败: {}", err);
+    }
+    let heartbeat_runtime = runtime_site_config.clone();
+    let heartbeat_handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                heartbeat_runtime.heartbeat_interval_secs,
+            ))
+            .await;
+            if let Err(err) = crate::web_server::site_registry::upsert_runtime_site(&heartbeat_runtime) {
+                eprintln!("站点心跳续约失败: {}", err);
+            }
+        }
+    });
     println!("🚀 Web UI服务器启动成功！");
-    println!("📱 访问地址: http://localhost:{}", port);
+    println!("📱 访问地址: http://localhost:{}", listen_port);
+    println!("🌐 对外后端地址: {}", runtime_site_config.backend_url);
     println!("🎯 功能包括:");
     println!("   - 数据库生成任务管理");
     println!("   - 实时进度监控");
@@ -966,7 +992,15 @@ pub async fn start_web_server_with_config(
     // 也注释掉，避免启动时查询数据库
     // tokio::spawn(crate::web_server::handlers::projects_health_scheduler());
 
-    axum::serve(listener, app).await?;
+    let serve_result = axum::serve(listener, app).await;
+    heartbeat_handle.abort();
+    if let Err(err) = crate::web_server::site_registry::mark_site_status(
+        &runtime_site_config.site_id,
+        DeploymentSiteStatus::Stopped,
+    ) {
+        eprintln!("退出时标记站点停止失败: {}", err);
+    }
+    serve_result?;
     Ok(())
 }
 

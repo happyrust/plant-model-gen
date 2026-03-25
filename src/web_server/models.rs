@@ -366,6 +366,8 @@ pub enum DeploymentSiteStatus {
     Failed,
     /// 已停止
     Stopped,
+    /// 心跳超时 / 当前离线
+    Offline,
 }
 
 impl Default for DeploymentSiteStatus {
@@ -401,6 +403,9 @@ pub struct E3dProjectInfo {
 pub struct DeploymentSite {
     /// SurrealDB 记录 ID
     pub id: Option<String>,
+    /// 站点唯一代号
+    #[serde(default)]
+    pub site_id: String,
     /// 站点名称（唯一）
     pub name: String,
     /// 站点描述
@@ -439,11 +444,41 @@ pub struct DeploymentSite {
     /// 最近健康检查
     #[serde(default)]
     pub last_health_check: Option<String>,
+    /// 区域
+    #[serde(default)]
+    pub region: Option<String>,
+    /// 项目名称（单站点单项目）
+    #[serde(default)]
+    pub project_name: String,
+    /// 项目路径
+    #[serde(default)]
+    pub project_path: Option<String>,
+    /// 项目代号
+    #[serde(default)]
+    pub project_code: Option<u32>,
+    /// 前端地址
+    #[serde(default)]
+    pub frontend_url: Option<String>,
+    /// 后端地址（public_base_url）
+    #[serde(default)]
+    pub backend_url: Option<String>,
+    /// 监听 Host
+    #[serde(default)]
+    pub bind_host: String,
+    /// 监听 Port
+    #[serde(default)]
+    pub bind_port: Option<u16>,
+    /// 最近心跳时间
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
 }
 
 /// 创建部署站点请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentSiteCreateRequest {
+    /// 站点唯一代号
+    #[serde(default)]
+    pub site_id: String,
     /// 站点名称
     pub name: String,
     /// 站点描述
@@ -451,13 +486,41 @@ pub struct DeploymentSiteCreateRequest {
     /// 根目录路径（用于扫描E3D项目）
     pub root_directory: Option<String>,
     /// 选中的项目路径列表
+    #[serde(default)]
     pub selected_projects: Vec<String>,
     /// 数据库配置
     pub config: DatabaseConfig,
+    /// 区域
+    #[serde(default)]
+    pub region: Option<String>,
+    /// 项目名称
+    #[serde(default)]
+    pub project_name: Option<String>,
+    /// 项目路径
+    #[serde(default)]
+    pub project_path: Option<String>,
+    /// 项目代号
+    #[serde(default)]
+    pub project_code: Option<u32>,
+    /// 前端地址
+    #[serde(default)]
+    pub frontend_url: Option<String>,
+    /// 后端地址
+    #[serde(default)]
+    pub backend_url: Option<String>,
+    /// 监听 Host
+    #[serde(default)]
+    pub bind_host: Option<String>,
+    /// 监听 Port
+    #[serde(default)]
+    pub bind_port: Option<u16>,
     /// 环境
     pub env: Option<String>,
     /// 负责人
     pub owner: Option<String>,
+    /// 健康检查地址
+    #[serde(default)]
+    pub health_url: Option<String>,
     /// 标签
     pub tags: Option<serde_json::Value>,
     /// 备注
@@ -482,6 +545,24 @@ pub struct DeploymentSiteImportRequest {
     /// 负责人
     #[serde(default)]
     pub owner: Option<String>,
+    /// 区域
+    #[serde(default)]
+    pub region: Option<String>,
+    /// 站点唯一代号
+    #[serde(default)]
+    pub site_id: Option<String>,
+    /// 前端地址
+    #[serde(default)]
+    pub frontend_url: Option<String>,
+    /// 后端地址
+    #[serde(default)]
+    pub backend_url: Option<String>,
+    /// 监听 Host
+    #[serde(default)]
+    pub bind_host: Option<String>,
+    /// 监听 Port
+    #[serde(default)]
+    pub bind_port: Option<u16>,
     /// 健康检查地址
     #[serde(default)]
     pub health_url: Option<String>,
@@ -496,6 +577,9 @@ pub struct DeploymentSiteImportRequest {
 /// 更新部署站点请求
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeploymentSiteUpdateRequest {
+    /// 站点唯一代号
+    #[serde(default)]
+    pub site_id: Option<String>,
     /// 站点名称
     #[serde(default)]
     pub name: Option<String>,
@@ -520,6 +604,33 @@ pub struct DeploymentSiteUpdateRequest {
     /// 健康检查地址
     #[serde(default)]
     pub health_url: Option<String>,
+    /// 区域
+    #[serde(default)]
+    pub region: Option<String>,
+    /// 项目名称
+    #[serde(default)]
+    pub project_name: Option<String>,
+    /// 项目路径
+    #[serde(default)]
+    pub project_path: Option<String>,
+    /// 项目代号
+    #[serde(default)]
+    pub project_code: Option<u32>,
+    /// 前端地址
+    #[serde(default)]
+    pub frontend_url: Option<String>,
+    /// 后端地址
+    #[serde(default)]
+    pub backend_url: Option<String>,
+    /// 监听 Host
+    #[serde(default)]
+    pub bind_host: Option<String>,
+    /// 监听 Port
+    #[serde(default)]
+    pub bind_port: Option<u16>,
+    /// 最近心跳
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
     /// 标签
     #[serde(default)]
     pub tags: Option<serde_json::Value>,
@@ -543,6 +654,12 @@ pub struct DeploymentSiteQuery {
     /// 环境过滤
     #[serde(default)]
     pub env: Option<String>,
+    /// 区域过滤
+    #[serde(default)]
+    pub region: Option<String>,
+    /// 项目过滤
+    #[serde(default)]
+    pub project_name: Option<String>,
     /// 分页页码
     #[serde(default)]
     pub page: Option<u32>,
@@ -552,6 +669,9 @@ pub struct DeploymentSiteQuery {
     /// 排序方式
     #[serde(default)]
     pub sort: Option<String>, // e.g., "updated_at:desc"
+    /// 心跳 TTL（秒）
+    #[serde(default)]
+    pub registry_ttl_secs: Option<u64>,
 }
 
 /// 部署站点任务配置请求

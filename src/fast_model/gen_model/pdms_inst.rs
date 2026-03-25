@@ -420,9 +420,9 @@ fn build_delete_inst_geo_by_hashes_sql(geo_hashes: &[u64], chunk_size: usize) ->
 /// （此前 DELETE + INSERT IGNORE 在 save_instance_data_optimize 中执行，
 ///   会覆盖 mesh worker 已写入的 meshed=true）。
 pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<()> {
-    // if seed_refnos.is_empty() {
-    return Ok(());
-    // }
+    if seed_refnos.is_empty() {
+        return Ok(());
+    }
 
     const CHUNK_SIZE: usize = 200;
 
@@ -1171,7 +1171,7 @@ FROM neg_relate WHERE out = {} AND pe = {}",
             }
 
             let aabb_row_sql = format!(
-                "{{id: {0}, refno: {1}, aabb_id: aabb:⟨{2}⟩}}",
+                "{{id: {0}, refno: {1}, aabb: aabb:⟨{2}⟩, aabb_id: aabb:⟨{2}⟩}}",
                 key.to_table_key("inst_relate_aabb"),
                 key.to_pe_key(),
                 aabb_hash
@@ -1499,7 +1499,7 @@ pub fn build_inst_relate_aabb_rows(
             }
 
             inst_relate_aabb_rows.push(format!(
-                "{{id: {0}, refno: {1}, aabb_id: aabb:⟨{2}⟩}}",
+                "{{id: {0}, refno: {1}, aabb: aabb:⟨{2}⟩, aabb_id: aabb:⟨{2}⟩}}",
                 key.to_table_key("inst_relate_aabb"),
                 key.to_pe_key(),
                 aabb_hash

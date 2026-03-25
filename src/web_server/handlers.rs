@@ -2271,120 +2271,28 @@ pub async fn create_batch_tasks(
 
 /// 初始化 deployment_sites 表结构
 pub async fn ensure_deployment_sites_schema() {
-    let defines = r#"
-DEFINE TABLE deployment_sites SCHEMALESS;
-DEFINE INDEX idx_deployment_sites_name ON TABLE deployment_sites COLUMNS name UNIQUE;
-"#;
-    let _ = project_primary_db().query(defines).await;
+    if let Err(err) = crate::web_server::site_registry::ensure_registry_schema() {
+        eprintln!("初始化站点注册表失败: {}", err);
+    }
 }
 
 /// 获取部署站点列表
 pub async fn api_get_deployment_sites(
     Query(params): Query<DeploymentSiteQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let per_page = params.per_page.unwrap_or(10).min(100);
-    let page = params.page.unwrap_or(1);
-    let offset = (page - 1) * per_page;
+    let per_page = params.per_page.unwrap_or(10).max(1).min(100);
+    let page = params.page.unwrap_or(1).max(1);
+    let offset = ((page - 1) * per_page) as usize;
 
-    let mut where_clauses = Vec::new();
-
-    if let Some(q) = params.q.as_ref().filter(|s| !s.is_empty()) {
-        let q_esc = q.replace("'", "\\'");
-        where_clauses.push(format!(
-            "(name CONTAINS '{}' OR description CONTAINS '{}' OR owner CONTAINS '{}')",
-            q_esc, q_esc, q_esc
-        ));
-    }
-
-    if let Some(status) = params.status.as_ref().filter(|s| !s.is_empty()) {
-        let status_esc = status.replace("'", "\\'");
-        where_clauses.push(format!("status = '{}'", status_esc));
-    }
-
-    if let Some(owner) = params.owner.as_ref().filter(|s| !s.is_empty()) {
-        let owner_esc = owner.replace("'", "\\'");
-        where_clauses.push(format!("owner = '{}'", owner_esc));
-    }
-
-    if let Some(env) = params.env.as_ref().filter(|s| !s.is_empty()) {
-        let env_esc = env.replace("'", "\\'");
-        where_clauses.push(format!("env = '{}'", env_esc));
-    }
-
-    let where_clause = if where_clauses.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", where_clauses.join(" AND "))
-    };
-
-    let sort_field = match params.sort.as_deref() {
-        Some("name:asc") => "name ASC",
-        Some("name:desc") => "name DESC",
-        Some("created_at:asc") => "created_at ASC",
-        Some("updated_at:asc") => "updated_at ASC",
-        Some("updated_at:desc") => "updated_at DESC",
-        _ => "created_at DESC",
-    };
-
-    let sql = format!(
-        "SELECT *, id as id FROM deployment_sites {} ORDER BY {} LIMIT {} START {}",
-        where_clause, sort_field, per_page, offset
-    );
-
-    let count_sql = format!(
-        "SELECT count() as total FROM deployment_sites {}",
-        where_clause
-    );
-
-    // 只从SQLite获取部署站点数据
-    let mut all_items =
-        match crate::web_server::wizard_handlers::load_deployment_sites_from_sqlite() {
-            Ok(sqlite_sites) => sqlite_sites,
-            Err(e) => {
-                eprintln!("Failed to load deployment sites from SQLite: {}", e);
-                Vec::new()
-            }
-        };
-
-    // 应用过滤和排序
-    if let Some(q) = params.q.as_ref().filter(|s| !s.is_empty()) {
-        let q_lower = q.to_lowercase();
-        all_items.retain(|item| {
-            let name = item["name"].as_str().unwrap_or("").to_lowercase();
-            let desc = item["description"].as_str().unwrap_or("").to_lowercase();
-            let owner = item["owner"].as_str().unwrap_or("").to_lowercase();
-            name.contains(&q_lower) || desc.contains(&q_lower) || owner.contains(&q_lower)
-        });
-    }
-
-    if let Some(status) = params.status.as_ref().filter(|s| !s.is_empty()) {
-        all_items.retain(|item| item["status"].as_str().unwrap_or("") == status);
-    }
-
-    if let Some(env) = params.env.as_ref().filter(|s| !s.is_empty()) {
-        all_items.retain(|item| item["env"].as_str().unwrap_or("") == env);
-    }
-
-    if let Some(owner) = params.owner.as_ref().filter(|s| !s.is_empty()) {
-        all_items.retain(|item| item["owner"].as_str().unwrap_or("") == owner);
-    }
-
-    // 排序
-    match params.sort.as_deref() {
-        Some("name:asc") => all_items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())),
-        Some("name:desc") => all_items.sort_by(|a, b| b["name"].as_str().cmp(&a["name"].as_str())),
-        Some("updated_at:asc") => {
-            all_items.sort_by(|a, b| a["updated_at"].as_str().cmp(&b["updated_at"].as_str()))
-        }
-        _ => all_items.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str())),
-    }
-
-    let total = all_items.len() as u64;
-
-    // 分页
-    let paginated_items: Vec<_> = all_items
+    let items = crate::web_server::site_registry::list_sites(Some(&params))
+        .map_err(|err| {
+            eprintln!("加载站点清单失败: {}", err);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let total = items.len() as u64;
+    let paginated_items: Vec<DeploymentSite> = items
         .into_iter()
-        .skip(offset as usize)
+        .skip(offset)
         .take(per_page as usize)
         .collect();
 
@@ -2395,6 +2303,170 @@ pub async fn api_get_deployment_sites(
         "per_page": per_page,
         "pages": ((total as f64) / (per_page as f64)).ceil() as u64
     })))
+}
+
+/// 当前 web_server 进程身份（监听地址 + 可选环境变量中的站点标识）
+pub async fn api_get_site_identity() -> Json<serde_json::Value> {
+    Json(crate::web_server::web_listen::site_identity_json())
+}
+
+fn slugify_site_id(input: &str, fallback_port: u16) -> String {
+    let normalized = input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if normalized.is_empty() {
+        format!("site-{}", fallback_port)
+    } else {
+        normalized
+    }
+}
+
+fn infer_site_id(
+    site_id: Option<String>,
+    project_name: &str,
+    bind_port: u16,
+) -> String {
+    site_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("{}-{}", slugify_site_id(project_name, bind_port), bind_port))
+}
+
+fn build_single_project_info(
+    project_name: &str,
+    project_path: Option<String>,
+    project_code: Option<u32>,
+) -> Vec<E3dProjectInfo> {
+    let now = SystemTime::now();
+    vec![E3dProjectInfo {
+        name: project_name.to_string(),
+        path: project_path.unwrap_or_default(),
+        project_code,
+        db_file_count: 0,
+        size_bytes: 0,
+        last_modified: now,
+        selected: true,
+        description: None,
+    }]
+}
+
+fn derive_frontend_url_from_backend(backend_url: &str, bind_host: &str) -> String {
+    if let Ok(mut parsed) = reqwest::Url::parse(backend_url) {
+        let _ = parsed.set_port(Some(5173));
+        return parsed.to_string();
+    }
+    let host = if bind_host.trim().is_empty() || bind_host == "0.0.0.0" {
+        "127.0.0.1"
+    } else {
+        bind_host
+    };
+    format!("http://{}:5173", host)
+}
+
+fn build_deployment_site_from_create_request(
+    req: DeploymentSiteCreateRequest,
+) -> Result<DeploymentSite, (StatusCode, Json<serde_json::Value>)> {
+    if req.name.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"站点名称不能为空"})),
+        ));
+    }
+    if req.selected_projects.len() > 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"一个站点只能绑定一个项目"})),
+        ));
+    }
+
+    let mut config = req.config.clone();
+    let project_name = req
+        .project_name
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| config.project_name.clone());
+    let project_path = req
+        .project_path
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| req.selected_projects.first().cloned())
+        .or_else(|| {
+            if config.project_path.trim().is_empty() {
+                None
+            } else {
+                Some(config.project_path.clone())
+            }
+        });
+    let project_code = req.project_code.or(Some(config.project_code)).filter(|value| *value > 0);
+    let bind_host = req
+        .bind_host
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let bind_port = req.bind_port.unwrap_or(3100);
+    let backend_url = req.backend_url.clone().filter(|value| !value.trim().is_empty());
+    let frontend_url = req
+        .frontend_url
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| backend_url.as_ref().map(|value| derive_frontend_url_from_backend(value, &bind_host)));
+    let site_id = infer_site_id(Some(req.site_id.clone()), &project_name, bind_port);
+    let region = req
+        .region
+        .clone()
+        .or_else(|| req.env.clone())
+        .filter(|value| !value.trim().is_empty());
+    let health_url = req.health_url.clone().or_else(|| {
+        backend_url
+            .as_ref()
+            .map(|value| format!("{}/api/health", value.trim_end_matches('/')))
+    });
+
+    config.project_name = project_name.clone();
+    if let Some(path) = project_path.clone() {
+        config.project_path = path;
+    }
+    if let Some(code) = project_code {
+        config.project_code = code;
+    }
+
+    let now = SystemTime::now();
+    Ok(DeploymentSite {
+        id: Some(site_id.clone()),
+        site_id,
+        name: req.name,
+        description: req.description,
+        e3d_projects: build_single_project_info(&project_name, project_path.clone(), project_code),
+        config,
+        status: DeploymentSiteStatus::Configuring,
+        url: backend_url.clone(),
+        health_url,
+        env: req.env.clone().or(region.clone()),
+        owner: req.owner,
+        tags: req.tags,
+        notes: req.notes,
+        created_at: Some(now),
+        updated_at: Some(now),
+        last_health_check: None,
+        region,
+        project_name,
+        project_path,
+        project_code,
+        frontend_url,
+        backend_url,
+        bind_host,
+        bind_port: Some(bind_port),
+        last_seen_at: None,
+    })
 }
 
 /// 从 DbOption.toml 导入配置并创建部署站点
@@ -2433,86 +2505,64 @@ pub async fn api_import_deployment_site_from_dboption(
         )
     })?;
 
-    let mut config = DatabaseConfig::from_db_option(&db_option);
-    // 若配置名称来自 DbOption，保证更精确的描述
-    if let Some(name) = req
-        .name
+    let parsed_toml: Option<toml::Value> = toml::from_str(&raw).ok();
+    let web_server = parsed_toml
         .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
+        .and_then(|value| value.get("web_server"))
+        .and_then(|value| value.as_table());
+    let model_center = parsed_toml
+        .as_ref()
+        .and_then(|value| value.get("model_center"))
+        .and_then(|value| value.as_table());
+
+    let mut config = DatabaseConfig::from_db_option(&db_option);
+    if let Some(name) = req.name.as_ref().filter(|value| !value.trim().is_empty()) {
         config.name = name.to_string();
     }
 
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-    let default_site_name = if let Some(name) = req
-        .name
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        name.to_string()
-    } else if !config.project_name.is_empty() {
-        format!("{}-{}", config.project_name, timestamp)
-    } else {
-        format!("导入站点-{}", timestamp)
-    };
-    let site_name = default_site_name;
-
-    // 检查名称唯一性
-    let check_sql = format!(
-        "SELECT * FROM deployment_sites WHERE name = '{}' LIMIT 1",
-        site_name.replace("'", "\\'")
-    );
-    if let Ok(mut resp) = project_primary_db().query(check_sql).await {
-        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-        if !rows.is_empty() {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(json!({"error":"站点名称已存在"})),
-            ));
-        }
-    }
-
-    let project_code_opt = if config.project_code == 0 {
-        None
-    } else {
-        Some(config.project_code)
-    };
-    let now = SystemTime::now();
-    let base_path = StdPath::new(&config.project_path);
-    let included_projects = if db_option.included_projects.is_empty() {
-        vec![config.project_name.clone()]
-    } else {
-        db_option.included_projects.clone()
-    };
-
-    let e3d_projects: Vec<E3dProjectInfo> = included_projects
-        .into_iter()
-        .filter(|project| !project.trim().is_empty())
-        .map(|project| {
-            let project_path = if StdPath::new(&project).is_absolute() {
-                project.clone()
-            } else if config.project_path.is_empty() {
-                project.clone()
-            } else {
-                base_path.join(&project).to_string_lossy().into_owned()
-            };
-
-            E3dProjectInfo {
-                name: project.clone(),
-                path: project_path,
-                project_code: project_code_opt,
-                db_file_count: 0,
-                size_bytes: 0,
-                last_modified: now,
-                selected: true,
-                description: None,
-            }
+    let bind_port = req.bind_port.or_else(|| {
+        web_server
+            .and_then(|table| table.get("port"))
+            .and_then(|value| value.as_integer())
+            .and_then(|value| u16::try_from(value).ok())
+    }).unwrap_or(3100);
+    let bind_host = req
+        .bind_host
+        .clone()
+        .or_else(|| {
+            web_server
+                .and_then(|table| table.get("bind_host"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
         })
-        .collect();
-
-    let env = req.env.clone().or_else(|| {
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let backend_url = req
+        .backend_url
+        .clone()
+        .or_else(|| {
+            web_server
+                .and_then(|table| table.get("public_base_url"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        })
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", bind_port));
+    let frontend_url = req
+        .frontend_url
+        .clone()
+        .or_else(|| {
+            web_server
+                .and_then(|table| table.get("frontend_url"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        })
+        .or_else(|| {
+            model_center
+                .and_then(|table| table.get("frontend_base_url"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        })
+        .or_else(|| Some(derive_frontend_url_from_backend(&backend_url, &bind_host)));
+    let region = req.region.clone().or_else(|| {
         let trimmed = db_option.location.trim();
         if trimmed.is_empty() {
             None
@@ -2520,173 +2570,100 @@ pub async fn api_import_deployment_site_from_dboption(
             Some(trimmed.to_string())
         }
     });
-
+    let site_name = req
+        .name
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("{}-{}", config.project_name, Local::now().format("%Y%m%d_%H%M%S")));
+    let site_id = infer_site_id(
+        req.site_id.clone().or_else(|| {
+            web_server
+                .and_then(|table| table.get("site_id"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        }),
+        &config.project_name,
+        bind_port,
+    );
+    let health_url = req.health_url.clone().or_else(|| {
+        Some(format!("{}/api/health", backend_url.trim_end_matches('/')))
+    });
+    let project_code = if config.project_code == 0 {
+        None
+    } else {
+        Some(config.project_code)
+    };
+    let project_path = if config.project_path.trim().is_empty() {
+        None
+    } else {
+        Some(config.project_path.clone())
+    };
+    let now = SystemTime::now();
     let site = DeploymentSite {
-        id: None,
-        name: site_name.clone(),
+        id: Some(site_id.clone()),
+        site_id,
+        name: site_name,
         description: req.description.clone(),
-        e3d_projects,
+        e3d_projects: build_single_project_info(&config.project_name, project_path.clone(), project_code),
         config,
         status: DeploymentSiteStatus::Configuring,
-        url: None,
-        health_url: req.health_url.clone(),
-        env,
+        url: Some(backend_url.clone()),
+        health_url,
+        env: req.env.clone().or(region.clone()),
         owner: req.owner.clone(),
         tags: req.tags.clone(),
         notes: req.notes.clone(),
         created_at: Some(now),
         updated_at: Some(now),
         last_health_check: None,
+        region,
+        project_name: db_option.project_name.clone(),
+        project_path,
+        project_code,
+        frontend_url,
+        backend_url: Some(backend_url),
+        bind_host,
+        bind_port: Some(bind_port),
+        last_seen_at: None,
     };
 
-    let site_json = serde_json::to_value(&site).map_err(|_| {
+    let created = crate::web_server::site_registry::create_site(site).map_err(|e| {
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":"序列化失败"})),
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("导入站点失败: {}", e)})),
         )
     })?;
 
-    let sql = format!("CREATE deployment_sites CONTENT {}", site_json);
-    match project_primary_db().query(sql).await {
-        Ok(mut resp) => {
-            let items: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-            if let Some(item) = items.get(0) {
-                Ok(Json(json!({
-                    "status": "success",
-                    "item": item,
-                    "message": format!("已从 {} 导入部署站点", path.display()),
-                })))
-            } else {
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error":"创建失败"})),
-                ))
-            }
-        }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("数据库错误: {}", e)})),
-        )),
-    }
+    Ok(Json(json!({
+        "status": "success",
+        "item": created,
+        "message": format!("已从 {} 导入部署站点", path.display()),
+    })))
 }
 
 /// 创建部署站点
 pub async fn api_create_deployment_site(
     Json(req): Json<DeploymentSiteCreateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if req.name.trim().is_empty() {
-        return Err((
+    let site = build_deployment_site_from_create_request(req)?;
+    let created = crate::web_server::site_registry::create_site(site).map_err(|e| {
+        (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error":"站点名称不能为空"})),
-        ));
-    }
-
-    // 检查名称唯一性（从SQLite检查）
-    if let Ok(sites) = crate::web_server::wizard_handlers::load_deployment_sites_from_sqlite() {
-        if sites.iter().any(|s| {
-            s.get("name")
-                .and_then(|n| n.as_str())
-                .map(|n| n == req.name)
-                .unwrap_or(false)
-        }) {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(json!({"error":"站点名称已存在"})),
-            ));
-        }
-    }
-
-    // 构建E3D项目信息列表
-    let mut e3d_projects = Vec::new();
-    for project_path in &req.selected_projects {
-        if let Ok(metadata) = std::fs::metadata(project_path) {
-            let project_name = std::path::Path::new(project_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("Unknown")
-                .to_string();
-
-            e3d_projects.push(E3dProjectInfo {
-                name: project_name,
-                path: project_path.clone(),
-                project_code: None, // 可以后续解析得到
-                db_file_count: 0,   // 可以后续扫描得到
-                size_bytes: metadata.len(),
-                last_modified: metadata.modified().unwrap_or(std::time::SystemTime::now()),
-                selected: true,
-                description: None,
-            });
-        }
-    }
-
-    let now = std::time::SystemTime::now();
-    let site = DeploymentSite {
-        id: None,
-        name: req.name.clone(),
-        description: req.description,
-        e3d_projects,
-        config: req.config,
-        status: DeploymentSiteStatus::Configuring,
-        url: None,
-        health_url: None,
-        env: req.env,
-        owner: req.owner,
-        tags: req.tags,
-        notes: req.notes,
-        created_at: Some(now),
-        updated_at: Some(now),
-        last_health_check: None,
-    };
-
-    match crate::web_server::wizard_handlers::save_api_deployment_site(&site) {
-        Ok(site_id) => {
-            eprintln!("成功保存站点到 SQLite，ID: {}", site_id);
-
-            match crate::web_server::wizard_handlers::load_deployment_site_by_id_from_sqlite(
-                &site_id,
-            ) {
-                Ok(Some(site_value)) => {
-                    eprintln!("成功从 SQLite 加载站点数据");
-                    Ok(Json(json!({"status":"success","item": site_value})))
-                }
-                Ok(None) => {
-                    eprintln!("警告: 无法从 SQLite 加载刚创建的站点");
-                    Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error":"创建失败: 无法加载创建的站点"})),
-                    ))
-                }
-                Err(e) => {
-                    eprintln!("从 SQLite 加载站点失败: {}", e);
-                    Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": format!("加载站点失败: {}", e)})),
-                    ))
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("保存站点到 SQLite 失败: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("创建失败: {}", e)})),
-            ))
-        }
-    }
+            Json(json!({"error": format!("创建失败: {}", e)})),
+        )
+    })?;
+    Ok(Json(json!({"status":"success","item": created})))
 }
 
 /// 获取单个部署站点详情
 pub async fn api_get_deployment_site(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // 只从SQLite获取部署站点数据
-    match crate::web_server::wizard_handlers::load_deployment_site_by_id_from_sqlite(&id) {
-        Ok(Some(site)) => Ok(Json(site)),
-        Ok(None) => Err(StatusCode::NOT_FOUND),
-        Err(e) => {
-            eprintln!("Failed to load deployment site from SQLite ({}): {}", id, e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+    let site = crate::web_server::site_registry::get_site(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match site {
+        Some(site) => Ok(Json(serde_json::to_value(site).unwrap_or(json!({})))),
+        None => Err(StatusCode::NOT_FOUND),
     }
 }
 
@@ -2695,99 +2672,31 @@ pub async fn api_update_deployment_site(
     Path(id): Path<String>,
     Json(req): Json<DeploymentSiteUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    // 检查名称唯一性（如果要更新名称）
-    if let Some(name) = req.name.as_ref() {
-        if name.trim().is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error":"站点名称不能为空"})),
-            ));
-        }
-        let check_sql = format!(
-            "SELECT * FROM deployment_sites WHERE name = '{}' LIMIT 1",
-            name.replace("'", "\\'")
-        );
-        if let Ok(mut resp) = project_primary_db().query(check_sql).await {
-            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-            if let Some(r) = rows.get(0) {
-                if r["id"].as_str().map(|s| s != id).unwrap_or(true) {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        Json(json!({"error":"站点名称已存在"})),
-                    ));
-                }
-            }
-        }
-    }
-
-    let now = std::time::SystemTime::now();
-    let mut body = json!({
-        "name": req.name,
-        "description": req.description,
-        "config": req.config,
-        "status": req.status.map(|s| match s {
-            DeploymentSiteStatus::Configuring => "Configuring",
-            DeploymentSiteStatus::Deploying => "Deploying",
-            DeploymentSiteStatus::Running => "Running",
-            DeploymentSiteStatus::Failed => "Failed",
-            DeploymentSiteStatus::Stopped => "Stopped",
-        }),
-        "url": req.url,
-        "env": req.env,
-        "owner": req.owner,
-        "tags": req.tags,
-        "notes": req.notes,
-        "updated_at": now.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
-    });
-
-    if let Some(map) = body.as_object_mut() {
-        map.retain(|_, v| !v.is_null());
-    }
-
-    let id_esc = id.replace("'", "\\'");
-    let sql = format!(
-        "UPDATE type::record('{}') MERGE {} RETURN AFTER",
-        id_esc, body
-    );
-
-    match project_primary_db().query(sql).await {
-        Ok(mut resp) => {
-            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-            if let Some(item) = rows.get(0) {
-                Ok(Json(json!({"status":"success","item": item})))
-            } else {
-                Err((StatusCode::NOT_FOUND, Json(json!({"error":"未找到站点"}))))
-            }
-        }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
+    let updated = crate::web_server::site_registry::update_site(&id, &req).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("更新失败: {}", e)})),
-        )),
-    }
+        )
+    })?;
+    Ok(Json(json!({"status":"success","item": updated})))
 }
 
 /// 删除部署站点
 pub async fn api_delete_deployment_site(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // 先尝试从SQLite删除（向导创建的站点）
-    if let Ok(()) = crate::web_server::wizard_handlers::delete_deployment_site_from_sqlite(&id) {
-        return Ok(Json(json!({"status":"success","source":"sqlite"})));
-    }
-
-    // 如果SQLite中没有，则尝试从SurrealDB删除
-    let id_esc = id.replace("'", "\\'");
-    let sql = format!("DELETE type::record('{}') RETURN BEFORE", id_esc);
-
-    match project_primary_db().query(sql).await {
-        Ok(mut resp) => {
-            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-            if rows.is_empty() {
-                return Err(StatusCode::NOT_FOUND);
-            }
-            Ok(Json(json!({"status":"success","source":"surrealdb"})))
+    if let Some(current_site_id) = crate::web_server::web_listen::current_site_id() {
+        if current_site_id == id {
+            return Err(StatusCode::CONFLICT);
         }
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+    match crate::web_server::site_registry::delete_site(&id) {
+        Ok(true) => Ok(Json(json!({"status":"success","source":"sqlite"}))),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(err) => {
+            eprintln!("删除站点失败: {}", err);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 
@@ -2888,39 +2797,20 @@ pub async fn api_browse_deployment_site_directory(
     Path(id): Path<String>,
     Query(query): Query<DeploymentSiteBrowseQuery>,
 ) -> Result<Json<DeploymentSiteBrowseResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let site_json =
-        match crate::web_server::wizard_handlers::load_deployment_site_by_id_from_sqlite(&id) {
-            Ok(Some(site)) => site,
-            Ok(None) => {
-                let sql = format!("SELECT * FROM type::record('{}')", id.replace('\'', "\\'"));
-                match project_primary_db().query(sql).await {
-                    Ok(mut resp) => {
-                        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-                        match rows.into_iter().next() {
-                            Some(site) => site,
-                            None => {
-                                return Err((
-                                    StatusCode::NOT_FOUND,
-                                    Json(json!({"error":"未找到部署站点"})),
-                                ));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({"error": format!("查询站点失败: {}", e)})),
-                        ));
-                    }
-                }
-            }
-            Err(e) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("读取站点失败: {}", e)})),
-                ));
-            }
-        };
+    let site = crate::web_server::site_registry::get_site(&id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("读取站点失败: {}", e)})),
+        )
+    })?;
+    let site_json = site
+        .map(|site| serde_json::to_value(site).unwrap_or(json!({})))
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"未找到部署站点"})),
+            )
+        })?;
 
     let root_path_str = extract_site_root_directory(&site_json).ok_or_else(|| {
         (
@@ -3066,33 +2956,14 @@ pub async fn api_create_deployment_site_task(
     State(state): State<AppState>,
     Json(req): Json<DeploymentSiteTaskRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    // 获取站点信息
-    let site_sql = format!(
-        "SELECT * FROM type::record('{}')",
-        req.site_id.replace("'", "\\'")
-    );
-    let site = match project_primary_db().query(site_sql).await {
-        Ok(mut resp) => {
-            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-            match rows.get(0) {
-                Some(site) => site.clone(),
-                None => return Err((StatusCode::NOT_FOUND, Json(json!({"error":"未找到站点"})))),
-            }
-        }
-        Err(_) => {
-            return Err((
+    let site = crate::web_server::site_registry::get_site(&req.site_id)
+        .map_err(|_| {
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error":"数据库查询失败"})),
-            ));
-        }
-    };
-
-    let site: DeploymentSite = serde_json::from_value(site).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":"站点数据解析失败"})),
-        )
-    })?;
+                Json(json!({"error":"站点查询失败"})),
+            )
+        })?
+        .ok_or((StatusCode::NOT_FOUND, Json(json!({"error":"未找到站点"}))))?;
 
     // 使用站点配置或覆盖配置
     let config = req.config_override.unwrap_or(site.config);
@@ -3124,51 +2995,43 @@ pub async fn api_create_deployment_site_task(
 pub async fn api_healthcheck_deployment_site(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // 向导站点存储在 SQLite 中，优先处理
-    if let Ok(Some(site_value)) =
-        crate::web_server::wizard_handlers::load_deployment_site_by_id_from_sqlite(&id)
-    {
-        let site: DeploymentSite = serde_json::from_value(site_value.clone())
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let site = crate::web_server::site_registry::get_site(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
 
-        let Some(url) = site.health_url.as_ref().or(site.url.as_ref()) else {
-            return Err(StatusCode::BAD_REQUEST);
-        };
+    let Some(url) = site
+        .health_url
+        .as_ref()
+        .or(site.backend_url.as_ref())
+        .or(site.url.as_ref())
+    else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        let res = client.get(url).send().await;
-        let healthy = matches!(res.as_ref().map(|r| r.status().is_success()), Ok(true));
-        let status_str = if healthy { "Running" } else { "Failed" };
-        let now = chrono::Utc::now().to_rfc3339();
+    let res = client.get(url).send().await;
+    let healthy = matches!(res.as_ref().map(|r| r.status().is_success()), Ok(true));
+    let now = chrono::Utc::now().to_rfc3339();
+    let updated = crate::web_server::site_registry::update_health(
+        &id,
+        if healthy {
+            DeploymentSiteStatus::Running
+        } else {
+            DeploymentSiteStatus::Failed
+        },
+        &now,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        if let Err(e) =
-            crate::web_server::wizard_handlers::update_deployment_site_health(&id, status_str, &now)
-        {
-            eprintln!("更新部署站点健康检查失败: {}", e);
-        }
-
-        let updated =
-            crate::web_server::wizard_handlers::load_deployment_site_by_id_from_sqlite(&id)
-                .ok()
-                .flatten()
-                .unwrap_or(site_value);
-
-        return Ok(Json(json!({
-            "status": "success",
-            "healthy": healthy,
-            "item": updated
-        })));
-    }
-
-    // 其他站点走通用项目健康检查
-    match api_healthcheck_project(Path(id.clone())).await {
-        Ok(Json(payload)) => Ok(Json(payload)),
-        Err((status, _)) => Err(status),
-    }
+    Ok(Json(json!({
+        "status": "success",
+        "healthy": healthy,
+        "item": updated
+    })))
 }
 
 /// 部署站点健康检查 (POST版本)
@@ -3187,40 +3050,259 @@ pub async fn api_healthcheck_deployment_site_post(
 pub async fn api_export_deployment_site_config(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if let Ok(Some(site_value)) =
-        crate::web_server::wizard_handlers::load_deployment_site_by_id_from_sqlite(&id)
-    {
-        let name = site_value["name"].as_str().unwrap_or(&id).to_string();
-        let config = site_value["config"].clone();
-        return Ok(Json(json!({
-            "status": "success",
-            "name": name,
-            "config": config
-        })));
-    }
-
-    let id_esc = id.replace("'", "\\'");
-    let sql = format!("SELECT config, name FROM type::record('{}')", id_esc);
-    match project_primary_db().query(sql).await {
-        Ok(mut resp) => {
-            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-            if let Some(row) = rows.get(0) {
-                return Ok(Json(json!({
-                    "status": "success",
-                    "name": row["name"].clone(),
-                    "config": row["config"].clone()
-                })));
-            }
-            Err(StatusCode::NOT_FOUND)
-        }
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-    }
+    let site = crate::web_server::site_registry::get_site(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(json!({
+        "status": "success",
+        "name": site.name,
+        "config": site.config
+    })))
 }
 
-// /// 部署站点管理页面路由处理 (暂时禁用)
-// pub async fn deployment_sites_page() -> Html<String> {
-//     Html(crate::web_server::templates::render_deployment_sites_page())
-// }
+/// 部署站点管理页面
+pub async fn deployment_sites_page() -> Html<String> {
+    let content = r#"
+<div x-data="deploymentSitesApp()" x-init="init()" x-cloak class="space-y-6">
+  <div class="flex items-start justify-between gap-4">
+    <div>
+      <h1 class="text-2xl font-bold text-gray-900"><i class="fas fa-server text-blue-600 mr-2"></i>站点配置中心</h1>
+      <p class="text-sm text-gray-600 mt-1">一个 web_server 进程对应一个站点、一个项目，统一从中心 SQLite 注册表维护。</p>
+    </div>
+    <div class="flex gap-2">
+      <button @click="openImportDialog()" class="px-4 py-2 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 text-sm">
+        <i class="fas fa-file-import mr-1"></i>从 DbOption 导入
+      </button>
+      <button @click="openCreateModal()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm">
+        <i class="fas fa-plus mr-1"></i>新建站点
+      </button>
+    </div>
+  </div>
+
+  <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
+    <div class="grid grid-cols-1 md:grid-cols-5 gap-3">
+      <div class="md:col-span-2">
+        <label for="deployment-sites-search" class="block text-xs text-gray-500 mb-1">搜索</label>
+        <input id="deployment-sites-search" name="deployment_sites_search" x-model="searchQuery" @keydown.enter.prevent="searchSites()" type="text" placeholder="站点名 / 项目 / 代号 / 地址"
+               class="w-full px-3 py-2 border border-gray-300 rounded-lg" />
+      </div>
+      <div>
+        <label for="deployment-sites-status" class="block text-xs text-gray-500 mb-1">状态</label>
+        <select id="deployment-sites-status" name="deployment_sites_status" x-model="statusFilter" @change="filterSites()" class="w-full px-3 py-2 border border-gray-300 rounded-lg">
+          <option value="">全部</option>
+          <option value="Configuring">配置中</option>
+          <option value="Deploying">部署中</option>
+          <option value="Running">运行中</option>
+          <option value="Offline">离线</option>
+          <option value="Failed">失败</option>
+          <option value="Stopped">已停止</option>
+        </select>
+      </div>
+      <div>
+        <label for="deployment-sites-region" class="block text-xs text-gray-500 mb-1">区域</label>
+        <input id="deployment-sites-region" name="deployment_sites_region" x-model="regionFilter" @keydown.enter.prevent="filterSites()" type="text" placeholder="如 sjz"
+               class="w-full px-3 py-2 border border-gray-300 rounded-lg" />
+      </div>
+      <div class="flex items-end gap-2">
+        <button @click="searchSites()" class="flex-1 px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm">查询</button>
+        <button type="button" @click="refreshSites()" aria-label="刷新站点列表" title="刷新站点列表" class="px-3 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 text-sm">
+          <i class="fas fa-rotate-right"></i>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start">
+    <div class="xl:col-span-2 bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+      <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
+        <div class="text-sm font-semibold text-gray-800">站点列表</div>
+        <div class="text-xs text-gray-500" x-text="`共 ${totalItems} 条`"></div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead class="bg-gray-50 text-gray-500">
+            <tr>
+              <th class="px-4 py-3 text-left">站点</th>
+              <th class="px-4 py-3 text-left">区域</th>
+              <th class="px-4 py-3 text-left">项目</th>
+              <th class="px-4 py-3 text-left">前端地址</th>
+              <th class="px-4 py-3 text-left">后端地址</th>
+              <th class="px-4 py-3 text-left">状态</th>
+              <th class="px-4 py-3 text-left">最近心跳</th>
+              <th class="px-4 py-3 text-right">操作</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-gray-100">
+            <template x-if="loading">
+              <tr><td colspan="8" class="px-4 py-10 text-center text-gray-500">正在加载站点列表...</td></tr>
+            </template>
+            <template x-if="!loading && sites.length === 0">
+              <tr><td colspan="8" class="px-4 py-10 text-center text-gray-500">暂无站点数据</td></tr>
+            </template>
+            <template x-for="site in sites" :key="site.site_id || site.id">
+              <tr class="hover:bg-blue-50/40">
+                <td class="px-4 py-3 align-top">
+                  <div class="font-medium text-gray-900" x-text="site.name"></div>
+                  <div class="text-xs text-gray-500 mt-1">
+                    <span x-text="site.site_id || '-'"></span>
+                    <span class="mx-1">·</span>
+                    <span x-text="site.project_code ?? '-'"></span>
+                  </div>
+                </td>
+                <td class="px-4 py-3 align-top" x-text="site.region || site.env || '-'"></td>
+                <td class="px-4 py-3 align-top">
+                  <div class="text-gray-900" x-text="site.project_name || site.config?.project_name || '-'"></div>
+                  <div class="text-xs text-gray-500 mt-1 truncate max-w-[180px]" x-text="site.project_path || site.config?.project_path || '-'"></div>
+                </td>
+                <td class="px-4 py-3 align-top">
+                  <a :href="site.frontend_url || '#'" target="_blank" class="text-blue-600 hover:underline break-all" x-text="site.frontend_url || '-'"></a>
+                </td>
+                <td class="px-4 py-3 align-top">
+                  <a :href="site.backend_url || '#'" target="_blank" class="text-blue-600 hover:underline break-all" x-text="site.backend_url || '-'"></a>
+                </td>
+                <td class="px-4 py-3 align-top">
+                  <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium" :class="getStatusColor(site.status)" x-text="getStatusText(site.status)"></span>
+                </td>
+                <td class="px-4 py-3 align-top text-xs text-gray-500" x-text="formatDate(site.last_seen_at || site.updated_at)"></td>
+                <td class="px-4 py-3 align-top">
+                  <div class="flex justify-end gap-2 text-xs">
+                    <button @click="viewSiteDetail(site)" class="px-2 py-1 rounded border border-gray-300 hover:bg-gray-50">详情</button>
+                    <button @click="editSite(site)" class="px-2 py-1 rounded border border-gray-300 hover:bg-gray-50">编辑</button>
+                    <button @click="copyAddress(site.backend_url)" class="px-2 py-1 rounded border border-gray-300 hover:bg-gray-50">复制</button>
+                    <button @click="refreshSiteStatus(site)" class="px-2 py-1 rounded border border-gray-300 hover:bg-gray-50">检查</button>
+                    <button @click="deleteSite(site)" class="px-2 py-1 rounded border border-red-200 text-red-600 hover:bg-red-50">删除</button>
+                  </div>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-4 space-y-4">
+      <template x-if="selectedSite">
+        <div class="space-y-4">
+          <div>
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <h2 class="text-lg font-semibold text-gray-900" x-text="selectedSite.name"></h2>
+                <p class="text-xs text-gray-500 mt-1" x-text="selectedSite.site_id || '-'"></p>
+              </div>
+              <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium" :class="getStatusColor(selectedSite.status)" x-text="getStatusText(selectedSite.status)"></span>
+            </div>
+          </div>
+
+          <div class="border rounded-lg p-3">
+            <div class="text-sm font-semibold text-gray-800 mb-2">基础配置</div>
+            <dl class="space-y-2 text-sm">
+              <div class="flex justify-between gap-3"><dt class="text-gray-500">站点 ID</dt><dd class="text-gray-900 break-all" x-text="selectedSite.site_id || '-'"></dd></div>
+              <div class="flex justify-between gap-3"><dt class="text-gray-500">站点名称</dt><dd class="text-gray-900" x-text="selectedSite.name || '-'"></dd></div>
+              <div class="flex justify-between gap-3"><dt class="text-gray-500">区域</dt><dd class="text-gray-900" x-text="selectedSite.region || selectedSite.env || '-'"></dd></div>
+              <div class="flex justify-between gap-3"><dt class="text-gray-500">项目</dt><dd class="text-gray-900" x-text="selectedSite.project_name || '-'"></dd></div>
+              <div class="flex justify-between gap-3"><dt class="text-gray-500">代号</dt><dd class="text-gray-900" x-text="selectedSite.project_code ?? '-'"></dd></div>
+            </dl>
+          </div>
+
+          <div class="border rounded-lg p-3">
+            <div class="text-sm font-semibold text-gray-800 mb-2">地址配置</div>
+            <dl class="space-y-2 text-sm">
+              <div><dt class="text-gray-500">前端地址</dt><dd class="text-gray-900 break-all mt-1" x-text="selectedSite.frontend_url || '-'"></dd></div>
+              <div><dt class="text-gray-500">后端地址</dt><dd class="text-gray-900 break-all mt-1" x-text="selectedSite.backend_url || '-'"></dd></div>
+              <div class="flex justify-between gap-3"><dt class="text-gray-500">监听 Host</dt><dd class="text-gray-900" x-text="selectedSite.bind_host || '-'"></dd></div>
+              <div class="flex justify-between gap-3"><dt class="text-gray-500">监听 Port</dt><dd class="text-gray-900" x-text="selectedSite.bind_port ?? '-'"></dd></div>
+            </dl>
+          </div>
+
+          <div class="border rounded-lg p-3">
+            <div class="text-sm font-semibold text-gray-800 mb-2">附加配置</div>
+            <dl class="space-y-2 text-sm">
+              <div class="flex justify-between gap-3"><dt class="text-gray-500">环境</dt><dd class="text-gray-900" x-text="selectedSite.env || '-'"></dd></div>
+              <div class="flex justify-between gap-3"><dt class="text-gray-500">负责人</dt><dd class="text-gray-900" x-text="selectedSite.owner || '-'"></dd></div>
+              <div><dt class="text-gray-500">健康检查地址</dt><dd class="text-gray-900 break-all mt-1" x-text="selectedSite.health_url || '-'"></dd></div>
+              <div><dt class="text-gray-500">备注</dt><dd class="text-gray-900 mt-1 whitespace-pre-wrap" x-text="selectedSite.notes || '-'"></dd></div>
+            </dl>
+          </div>
+
+          <details class="border rounded-lg p-3">
+            <summary class="cursor-pointer text-sm font-semibold text-gray-800">运行配置（DatabaseConfig）</summary>
+            <pre class="mt-3 text-xs bg-gray-50 rounded-lg p-3 overflow-auto" x-text="formatConfig(selectedSite.config)"></pre>
+          </details>
+        </div>
+      </template>
+      <template x-if="!selectedSite">
+        <div class="text-sm text-gray-500 py-16 text-center">请选择左侧一个站点查看配置详情</div>
+      </template>
+    </div>
+  </div>
+
+  <div x-show="showCreateModal" x-cloak class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" style="display:none;">
+    <div class="bg-white rounded-2xl shadow-xl w-full max-w-5xl max-h-[90vh] overflow-hidden">
+      <div class="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
+        <h3 class="text-lg font-semibold text-gray-900" x-text="editingSiteId ? '编辑站点' : '新建站点'"></h3>
+        <button type="button" @click="closeModal()" aria-label="关闭站点表单" title="关闭站点表单" class="text-gray-400 hover:text-gray-600"><i class="fas fa-times"></i></button>
+      </div>
+      <form @submit.prevent="submitSiteForm()" class="overflow-y-auto max-h-[calc(90vh-72px)]">
+        <div class="p-6 space-y-6">
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div><label for="site-form-site-id" class="block text-sm font-medium text-gray-700 mb-1">站点 ID *</label><input id="site-form-site-id" name="site_id" x-model="form.site_id" type="text" required class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+            <div><label for="site-form-name" class="block text-sm font-medium text-gray-700 mb-1">站点名称 *</label><input id="site-form-name" name="name" x-model="form.name" type="text" required class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+            <div><label for="site-form-region" class="block text-sm font-medium text-gray-700 mb-1">区域 *</label><input id="site-form-region" name="region" x-model="form.region" type="text" required class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+            <div><label for="site-form-env" class="block text-sm font-medium text-gray-700 mb-1">环境</label><input id="site-form-env" name="env" x-model="form.env" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+            <div><label for="site-form-project-name" class="block text-sm font-medium text-gray-700 mb-1">项目 *</label><input id="site-form-project-name" name="project_name" x-model="form.project_name" type="text" required class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+            <div><label for="site-form-project-code" class="block text-sm font-medium text-gray-700 mb-1">项目代号 project_code *</label><input id="site-form-project-code" name="project_code" x-model.number="form.project_code" type="number" min="1" required class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+            <div class="md:col-span-2"><label for="site-form-project-path" class="block text-sm font-medium text-gray-700 mb-1">项目路径</label><input id="site-form-project-path" name="project_path" x-model="form.project_path" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+            <div class="md:col-span-2"><label for="site-form-frontend-url" class="block text-sm font-medium text-gray-700 mb-1">前端地址 *</label><input id="site-form-frontend-url" name="frontend_url" x-model="form.frontend_url" type="url" required class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+            <div class="md:col-span-2"><label for="site-form-backend-url" class="block text-sm font-medium text-gray-700 mb-1">后端地址 *</label><input id="site-form-backend-url" name="backend_url" x-model="form.backend_url" type="url" required class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+            <div><label for="site-form-bind-host" class="block text-sm font-medium text-gray-700 mb-1">监听 Host *</label><input id="site-form-bind-host" name="bind_host" x-model="form.bind_host" type="text" required class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+            <div><label for="site-form-bind-port" class="block text-sm font-medium text-gray-700 mb-1">监听 Port *</label><input id="site-form-bind-port" name="bind_port" x-model.number="form.bind_port" type="number" min="1" max="65535" required class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+            <div><label for="site-form-owner" class="block text-sm font-medium text-gray-700 mb-1">负责人</label><input id="site-form-owner" name="owner" x-model="form.owner" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+            <div><label for="site-form-health-url" class="block text-sm font-medium text-gray-700 mb-1">健康检查地址</label><input id="site-form-health-url" name="health_url" x-model="form.health_url" type="url" class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+            <div class="md:col-span-2"><label for="site-form-notes" class="block text-sm font-medium text-gray-700 mb-1">备注</label><textarea id="site-form-notes" name="notes" x-model="form.notes" rows="3" class="w-full px-3 py-2 border border-gray-300 rounded-lg"></textarea></div>
+          </div>
+
+          <details class="border rounded-xl p-4">
+            <summary class="cursor-pointer text-sm font-semibold text-gray-800">高级运行配置（DatabaseConfig）</summary>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+              <div><label for="site-config-name" class="block text-sm font-medium text-gray-700 mb-1">配置名称</label><input id="site-config-name" name="config_name" x-model="form.config.name" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+              <div><label for="site-config-module" class="block text-sm font-medium text-gray-700 mb-1">模块</label><input id="site-config-module" name="config_module" x-model="form.config.module" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+              <div><label for="site-config-mdb-name" class="block text-sm font-medium text-gray-700 mb-1">MDB 名称</label><input id="site-config-mdb-name" name="config_mdb_name" x-model="form.config.mdb_name" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+              <div><label for="site-config-db-type" class="block text-sm font-medium text-gray-700 mb-1">数据库类型</label><input id="site-config-db-type" name="config_db_type" x-model="form.config.db_type" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+              <div><label for="site-config-db-ip" class="block text-sm font-medium text-gray-700 mb-1">数据库 IP</label><input id="site-config-db-ip" name="config_db_ip" x-model="form.config.db_ip" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+              <div><label for="site-config-db-port" class="block text-sm font-medium text-gray-700 mb-1">数据库 Port</label><input id="site-config-db-port" name="config_db_port" x-model="form.config.db_port" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+              <div><label for="site-config-db-user" class="block text-sm font-medium text-gray-700 mb-1">数据库用户</label><input id="site-config-db-user" name="config_db_user" x-model="form.config.db_user" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+              <div><label for="site-config-db-password" class="block text-sm font-medium text-gray-700 mb-1">数据库密码</label><input id="site-config-db-password" name="config_db_password" x-model="form.config.db_password" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+              <div><label for="site-config-mesh-tol-ratio" class="block text-sm font-medium text-gray-700 mb-1">mesh_tol_ratio</label><input id="site-config-mesh-tol-ratio" name="config_mesh_tol_ratio" x-model.number="form.config.mesh_tol_ratio" type="number" step="0.1" class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+              <div><label for="site-config-room-keyword" class="block text-sm font-medium text-gray-700 mb-1">room_keyword</label><input id="site-config-room-keyword" name="config_room_keyword" x-model="form.config.room_keyword" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-lg" /></div>
+            </div>
+          </details>
+        </div>
+        <div class="px-6 py-4 border-t border-gray-200 flex justify-end gap-3 bg-gray-50">
+          <button type="button" @click="closeModal()" class="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-100">取消</button>
+          <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+"#;
+
+    let extra_head = Some(
+        r#"
+        <script src="/static/alpine.min.js" defer></script>
+        <style>[x-cloak] { display: none !important; }</style>
+    "#,
+    );
+    let extra_scripts = Some(r#"<script src="/static/deployment-sites.js"></script>"#);
+
+    Html(crate::web_server::layout::render_layout_with_sidebar(
+        "部署站点管理",
+        Some("deploy-sites"),
+        content,
+        extra_head,
+        extra_scripts,
+    ))
+}
 
 /// 获取系统状态
 pub async fn get_system_status(
@@ -5915,12 +5997,6 @@ pub async fn xkt_test_page() -> Html<String> {
         &html,
     );
     Html(wrapped)
-}
-
-/// 部署站点管理
-pub async fn deployment_sites_page() -> Html<String> {
-    let html = crate::web_server::simple_templates::render_deployment_sites_page_with_sidebar();
-    Html(html)
 }
 
 pub async fn wizard_page() -> Html<String> {

@@ -2,6 +2,7 @@ use axum::{Json, Router, routing::get};
 use serde::Serialize;
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VersionInfo {
     version: String,
     commit: String,

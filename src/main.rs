@@ -66,6 +66,84 @@ fn build_export_config(
 }
 
 #[cfg(not(feature = "gui"))]
+fn parse_cli_refno(refno: &str) -> anyhow::Result<aios_core::pdms_types::RefnoEnum> {
+    use aios_core::pdms_types::RefnoEnum;
+    use std::str::FromStr;
+
+    let normalized = refno.replace('_', "/");
+    RefnoEnum::from_str(&normalized)
+        .map_err(|e| anyhow::anyhow!("解析参考号失败: {} ({})", refno, e))
+}
+
+#[cfg(not(feature = "gui"))]
+fn format_cli_refno(refno: aios_core::pdms_types::RefnoEnum) -> String {
+    refno.to_string().replace('/', "_")
+}
+
+#[cfg(not(feature = "gui"))]
+async fn promote_generation_refnos_to_bran_hang_roots(
+    refnos: &[String],
+    verbose: bool,
+) -> anyhow::Result<Vec<String>> {
+    use aios_database::fast_model::gen_model::query_compat::query_filter_ancestors;
+    use aios_database::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+    use std::collections::{BTreeSet, HashMap};
+
+    const BRAN_HANG_NOUNS: &[&str] = &["BRAN", "HANG"];
+
+    let mut promoted_refnos = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut tree_managers: HashMap<u32, TreeIndexManager> = HashMap::new();
+
+    for input_refno in refnos {
+        let parsed_refno = parse_cli_refno(input_refno)?;
+        let dbnum = TreeIndexManager::resolve_dbnum_for_refno(parsed_refno)?;
+        let manager = tree_managers
+            .entry(dbnum)
+            .or_insert_with(|| TreeIndexManager::with_default_dir(vec![dbnum]));
+        let self_noun = manager
+            .get_noun(parsed_refno)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_uppercase();
+
+        let promoted_refno = if matches!(self_noun.as_str(), "BRAN" | "HANG") {
+            parsed_refno
+        } else {
+            query_filter_ancestors(parsed_refno, BRAN_HANG_NOUNS)
+                .await?
+                .last()
+                .copied()
+                .unwrap_or(parsed_refno)
+        };
+
+        let promoted_refno_str = format_cli_refno(promoted_refno);
+        if promoted_refno != parsed_refno {
+            println!(
+                "🔧 生成目标提升到最近 BRAN/HANG 根: {} -> {}",
+                input_refno, promoted_refno_str
+            );
+        } else if verbose {
+            println!("🔧 生成目标保持原 refno: {}", input_refno);
+        }
+
+        if seen.insert(promoted_refno_str.clone()) {
+            promoted_refnos.push(promoted_refno_str);
+        }
+    }
+
+    if promoted_refnos.len() < refnos.len() {
+        println!(
+            "🔁 生成目标去重完成: 输入 {} 个，提升后 {} 个",
+            refnos.len(),
+            promoted_refnos.len()
+        );
+    }
+
+    Ok(promoted_refnos)
+}
+
+#[cfg(not(feature = "gui"))]
 
 /// 模型生成完成后同步缓存数据到 SurrealDB 的辅助函数
 ///
@@ -1304,7 +1382,7 @@ async fn main() -> anyhow::Result<()> {
         // 确定生成的目标 refnos：优先 debug-model 指定的 refnos，其次 CLI 独立 refno 参数，
         // 再次 dbnum（查询所有 SITE），最后全库模式。
         let gen_refnos_vec: Vec<String> = if let Some(ref refnos) = debug_model_refnos {
-            refnos.clone()
+            promote_generation_refnos_to_bran_hang_roots(refnos, verbose).await?
         } else if let Some(refnos) = matches.get_many::<String>("export-obj-refnos") {
             refnos.map(|s| s.to_string()).collect()
         } else if let Some(refnos) = matches.get_many::<String>("export-glb-refnos") {

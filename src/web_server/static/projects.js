@@ -263,7 +263,7 @@
       const siteName = data.item && (data.item.name || data.item.config?.project_name);
       alert('导入成功' + (siteName ? ': '+siteName : '')); 
       await loadProjects();
-      const newId = data.item && data.item.id;
+      const newId = data.item && (data.item.site_id || data.item.id);
       if (newId) {
         setTimeout(() => {
           viewProjectDetails(encodeURIComponent(newId));
@@ -280,10 +280,64 @@
     try {
       const name = prompt('站点名称'); if(!name) return;
       const env = prompt('环境 (dev/staging/prod/test)', 'dev') || '';
+      const region = prompt('区域', env || 'dev') || '';
+      const projectName = prompt('项目名称', name) || name;
+      const projectCode = Number(prompt('项目代号 project_code', '1516') || '1516');
+      if(!Number.isInteger(projectCode) || projectCode <= 0){
+        alert('project_code 必须为正整数');
+        return;
+      }
+      const frontendUrl = prompt('前端地址', 'http://127.0.0.1:5173') || '';
+      const backendUrl = prompt('后端地址', window.location.origin || 'http://127.0.0.1:3100') || '';
+      const bindHost = prompt('监听 Host', '0.0.0.0') || '0.0.0.0';
+      const bindPort = Number(prompt('监听 Port', window.location.port || '3100') || '3100');
+      if(!Number.isInteger(bindPort) || bindPort <= 0){
+        alert('监听 Port 必须为正整数');
+        return;
+      }
       const owner = prompt('负责人', '站点管理员') || '';
       const description = prompt('描述(可选)', '') || '';
+      const siteId = `${projectName}`.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') + '-' + bindPort;
 
-      const payload = { name, description, env, owner, selected_projects: [], config: { name: name, manual_db_nums: [], project_name: 'AvevaMarineSample', project_code: 1516, mdb_name: 'ALL', module: 'DESI', db_type: 'surrealdb', surreal_ns: 1516, db_ip: 'localhost', db_port: '8009', db_user: 'root', db_password: 'root', gen_model: true, gen_mesh: true, gen_spatial_tree: true, apply_boolean_operation: true, mesh_tol_ratio: 3.0, room_keyword: '-RM' } };
+      const payload = {
+        site_id: siteId,
+        name,
+        description,
+        env,
+        region,
+        owner,
+        project_name: projectName,
+        project_code: projectCode,
+        frontend_url: frontendUrl,
+        backend_url: backendUrl,
+        bind_host: bindHost,
+        bind_port: bindPort,
+        selected_projects: [],
+        config: {
+          name,
+          manual_db_nums: [],
+          manual_refnos: [],
+          project_name: projectName,
+          project_path: '',
+          project_code: projectCode,
+          mdb_name: 'ALL',
+          module: 'DESI',
+          db_type: 'surrealdb',
+          surreal_ns: projectCode,
+          db_ip: 'localhost',
+          db_port: '8009',
+          db_user: 'root',
+          db_password: 'root',
+          gen_model: true,
+          gen_mesh: true,
+          gen_spatial_tree: true,
+          apply_boolean_operation: true,
+          mesh_tol_ratio: 3.0,
+          room_keyword: '-RM',
+          export_json: false,
+          export_parquet: true,
+        }
+      };
       const resp = await fetch('/api/deployment-sites', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)

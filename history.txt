@@ -1,21 +1,4 @@
 #V2
--- ========== 方式2：同上，放宽条件（仅 owner.{2}.NAME 非空）==========
-SELECT owner.{2}.id AS frmw_id, array::last(string::split(owner.{2}.NAME, '-')) AS room_num, REFNO AS panel_refno FROM PANE WHERE owner.{2}.NAME IS NOT NONE LIMIT 10;
--- ========== 方式3：从 pe 查询（pe.owner 须为 record，部分数据可能为 string 会报错）==========
-SELECT id AS panel_refno, owner.{2}.id AS frmw_id, array::last(string::split(owner.{2}.name, '-')) AS room_num FROM pe WHERE noun = 'PANE' AND owner.{2}.name CONTAINS 'ROOM' LIMIT 10;
--- ========== 方式4：使用 LET 批量 ==========
-LET $panel_pes = (SELECT VALUE id FROM pe WHERE noun = 'PANE' LIMIT 5000);
-SELECT REFNO AS panel_refno, owner.{2}.id AS frmw_id, array::last(string::split(owner.{2}.NAME, '-')) AS room_num FROM PANE WHERE REFNO IN $panel_pes AND owner.{2}.NAME IS NOT NONE LIMIT 10;
--- ========== 方式5：显式 owner 链（owner.owner.owner，兼容性更好）==========
-SELECT REFNO AS panel_refno, owner.owner.owner.id AS frmw_id, array::last(string::split(owner.owner.owner.NAME, '-')) AS room_num FROM PANE WHERE owner.owner.owner.NAME IS NOT NONE LIMIT 10;
-SELECT count() AS cnt FROM inst_relate WHERE owner_refno = pe:`24381_145018` GROUP ALL;
-SELECT id, in, out, owner_refno, owner_type FROM inst_relate WHERE in = pe:`24381_145019`;
-SELECT id, visible, array::len(ptset) AS pt_len, tubi_info FROM ONLY inst_info:`6062703271187847688`;
-SELECT id, visible, array::len(ptset) AS pt_len, tubi_info FROM ONLY inst_info:`273164669750072258`;
-SELECT count() AS cnt FROM inst_relate WHERE owner_refno = pe:`24381_145018` GROUP ALL;
-SELECT count() AS cnt FROM tubi_relate:[pe:`24381_145018`, 0]..[pe:`24381_145018`, ..] GROUP ALL;
-SELECT count() AS cnt FROM inst_relate WHERE owner_refno = pe:`24381_145018` GROUP ALL;
-SELECT id, in, out, owner_refno, owner_type FROM inst_relate WHERE in = pe:`24381_145019`;
 SELECT count() AS cnt FROM tubi_relate:[pe:`24381_145018`, 0]..[pe:`24381_145018`, ..] GROUP ALL;
 SELECT dbnum, count() as cnt FROM inst_relate GROUP BY dbnum;
 SELECT dbnum, count FROM dbnum_info_table ORDER BY dbnum;
@@ -99,3 +82,20 @@ SELECT count() AS cnt FROM inst_relate_aabb WHERE aabb = NONE GROUP ALL;
 SELECT id, refno, aabb, aabb_id FROM inst_relate_aabb WHERE aabb = NONE LIMIT 20;
 SELECT * FROM inst_relate_aabb:`30101_2920`;
 INFO FOR TABLE inst_relate_aabb;
+SELECT id, in, dbnum, owner_refno, owner_type FROM inst_relate WHERE in = pe:`21909_10209`;
+SELECT id, refno, aabb, aabb_id FROM inst_relate_aabb WHERE refno = pe:`30101_2920`;
+SELECT count() AS null_dbnum_cnt FROM inst_relate WHERE dbnum = NONE GROUP ALL;
+SELECT form_id FROM review_tasks LIMIT 10;
+SELECT form_id, status FROM review_forms LIMIT 5;
+USE NS `1516` DB `AvevaMarineSample`; SELECT form_id, status, project_id FROM review_forms LIMIT 20;
+SELECT form_id, status FROM review_tasks LIMIT 10;
+SELECT form_id, model_refno FROM review_form_model WHERE form_id = 'FORM-FD8A0352C0AB' LIMIT 10;
+SELECT form_id, author, opinion FROM review_opinion WHERE form_id = 'FORM-FD8A0352C0AB' LIMIT 5;
+SELECT form_id, file_id FROM review_attachment WHERE form_id = 'FORM-FD8A0352C0AB' LIMIT 5;
+SELECT VALUE form_id FROM review_forms WHERE status IS NONE OR status != 'deleted' LIMIT 1;
+SELECT VALUE form_id FROM review_forms LIMIT 3;
+SELECT form_id, status, project_id FROM review_forms WHERE form_id = 'FORM-FD8A0352C0AB' LIMIT 1;
+SELECT form_id, status, project_id FROM review_forms WHERE status = 'active' LIMIT 3;
+SELECT id, noun, owner, NAME, full_name FROM pe:⟨21909/10209⟩;
+SELECT in as refno, out as geo_id, geo_type, visible, trans.d as trans FROM inst_relate:⟨21909/10209⟩->geo_relate;
+SELECT refno, status, mesh_id FROM inst_relate_bool:⟨21909/10209⟩;

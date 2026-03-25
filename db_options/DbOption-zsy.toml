@@ -65,7 +65,7 @@ index_tree_batch_size = 200
 index_tree_debug_limit_per_target_type = 0
 
 # 仅生成/计算与目标构件相关的 dbno，避免全库跑
-manual_db_nums = [5525]
+manual_db_nums = [21909]
 
 # ====== 同步管线辅助配置 ======
 only_sync_sys = false
@@ -254,7 +254,14 @@ debug_role = "sj"
 
 # ====== Web Server 配置（3100 与 plant3d-web Vite 代理一致）======
 [web_server]
-port = 3100
+port = 3101
+bind_host = "127.0.0.1"
+site_id = "ycyk-e3d-3101"
+site_name = "YCYK-E3D Site"
+region = "sjz"
+frontend_url = "http://127.0.0.1:5174"
+public_base_url = "http://127.0.0.1:3101"
+backend_url = "http://127.0.0.1:3101"
 auto_start_surreal = true
 surreal_bin = "surreal"
 surreal_data_path = "/Volumes/DPC/work/db-data/ams-8021.db"
@@ -266,7 +273,9 @@ surreal_password = "root"
 # file：嵌入式直连 RocksDB 目录（与 web_server.surreal_data_path 同一套数据时，勿再单独 surreal start，否则会 LOCK）。
 # 若要用独立 surreal start，请改 mode = "ws" 并填 ip/port。
 [surrealdb]
-mode = "file"
+mode = "ws"
+ip = "127.0.0.1"
+port = 8021
 path = "/Volumes/DPC/work/db-data/ams-8021.db"
 
 # ====== SurrealKV 连接配置 (模型数据写入) ======

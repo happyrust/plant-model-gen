@@ -858,8 +858,8 @@ pub async fn start_web_server_with_config(
         )
         .route("/api/export/tasks", get(handlers::list_export_tasks))
         .route("/api/export/cleanup", post(handlers::cleanup_export_tasks))
-        .route("/console", get(console_index_page))
-        .route("/console/", get(console_index_page))
+        .route("/console", get(console_index_page).head(console_head_page))
+        .route("/console/", get(console_index_page).head(console_head_page))
         // 静态文件服务
         .nest_service("/static", ServeDir::new("src/web_server/static"))
         .nest_service("/console/assets", ServeDir::new("web_console/dist/assets"))
@@ -1249,6 +1249,18 @@ async fn console_index_page() -> Result<Html<String>, StatusCode> {
     web_console_index_html()
         .map(Html)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn console_head_page() -> Result<Response, StatusCode> {
+    if web_console_index_html().is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty())))
 }
 
 async fn console_root_redirect() -> Response {

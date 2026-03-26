@@ -3379,7 +3379,33 @@ async fn gen_cata_geos_inner(
 
                             } = shape;
 
+                            let invalid_shape_trans = csg_shape.get_trans();
+                            let invalid_geo_hash = csg_shape.hash_unit_mesh_params();
+                            let invalid_unit_flag = csg_shape.is_reuse_unit();
+
                             if !csg_shape.check_valid() {
+
+                                crate::model_error!(
+                                    code = "E-GEO-INVALID",
+                                    kind = crate::fast_model::ModelErrorKind::InvalidGeometry,
+                                    stage = "validate_cate_csg_shape",
+                                    refno = ele_refno,
+                                    desc = "Cate CSG shape 校验失败，已跳过",
+                                    "shape_idx={}, geom_refno={}, geo_hash={}, visible={}, is_tubi={}, is_ngmr={}, unit_flag={}, cate_transform={{rot={:?}, trans={:?}, scale={:?}}}, shape_trans={{rot={:?}, trans={:?}, scale={:?}}}",
+                                    shape_idx,
+                                    geom_refno,
+                                    invalid_geo_hash,
+                                    visible,
+                                    is_tubi,
+                                    is_ngmr,
+                                    invalid_unit_flag,
+                                    transform.rotation,
+                                    transform.translation,
+                                    transform.scale,
+                                    invalid_shape_trans.rotation,
+                                    invalid_shape_trans.translation,
+                                    invalid_shape_trans.scale
+                                );
 
                                 debug_model!(
 

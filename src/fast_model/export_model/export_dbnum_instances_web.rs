@@ -14,9 +14,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use aios_core::SurrealQueryExt;
 use aios_core::options::DbOption;
 use aios_core::pdms_types::RefnoEnum;
-use aios_core::SurrealQueryExt;
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use glam::DMat4;
@@ -245,11 +245,7 @@ fn dmat4_to_f32_array(mat: &DMat4) -> Vec<f32> {
 ///
 /// - 非 has_neg: result = world_trans × geo_trans
 /// - has_neg: geo_trans 已包含世界变换信息，直接使用 geo_trans
-fn combine_world_geo_matrix(
-    world_mat: &DMat4,
-    geo_mat: &DMat4,
-    has_neg: bool,
-) -> Vec<f32> {
+fn combine_world_geo_matrix(world_mat: &DMat4, geo_mat: &DMat4, has_neg: bool) -> Vec<f32> {
     let combined = if has_neg {
         *geo_mat
     } else {
@@ -322,22 +318,16 @@ async fn query_tubi_relate_web(
                 let Some(geo_hash) = row.geo_hash else {
                     continue;
                 };
-                let order = row
-                    .index
-                    .and_then(|v| usize::try_from(v).ok())
-                    .unwrap_or(0);
+                let order = row.index.and_then(|v| usize::try_from(v).ok()).unwrap_or(0);
 
-                tubings_map
-                    .entry(*owner_refno)
-                    .or_default()
-                    .push(TubiInfo {
-                        leave_refno: row.leave,
-                        owner_refno: *owner_refno,
-                        order,
-                        geo_hash,
-                        trans_hash: row.world_trans_hash,
-                        spec_value: row.spec_value.unwrap_or(0),
-                    });
+                tubings_map.entry(*owner_refno).or_default().push(TubiInfo {
+                    leave_refno: row.leave,
+                    owner_refno: *owner_refno,
+                    order,
+                    geo_hash,
+                    trans_hash: row.world_trans_hash,
+                    spec_value: row.spec_value.unwrap_or(0),
+                });
             }
         }
     }
@@ -508,10 +498,7 @@ pub async fn export_dbnum_instances_web(
     // 3. 查询几何体实例 hash
     // =========================================================================
     if verbose {
-        println!(
-            "🔍 查询 {} 个 refno 的几何体实例 hash...",
-            in_refnos.len()
-        );
+        println!("🔍 查询 {} 个 refno 的几何体实例 hash...", in_refnos.len());
     }
 
     let mut export_inst_map: HashMap<RefnoEnum, aios_core::ExportInstQuery> = HashMap::new();
@@ -781,9 +768,7 @@ pub async fn export_dbnum_instances_web(
         let world_mat = resolve_mat(&export_inst.world_trans_hash);
         let has_neg = export_inst.has_neg;
 
-        let owner_refno_str = export_inst
-            .owner
-            .to_string();
+        let owner_refno_str = export_inst.owner.to_string();
 
         let mut instances_json: Vec<serde_json::Value> = Vec::new();
         for (geo_idx, inst) in export_inst.insts.iter().enumerate() {
@@ -821,10 +806,7 @@ pub async fn export_dbnum_instances_web(
     // =========================================================================
     let output_filename = match &root_refno {
         Some(root) => {
-            let slug = root
-                .to_string()
-                .replace(['/', '\\'], "_")
-                .replace(' ', "_");
+            let slug = root.to_string().replace(['/', '\\'], "_").replace(' ', "_");
             format!("instances_web_root_{slug}.json")
         }
         None => format!("instances_{dbnum}.json"),
@@ -834,10 +816,7 @@ pub async fn export_dbnum_instances_web(
     root_meta.insert("version".to_string(), json!(2));
     root_meta.insert("generated_at".to_string(), json!(generated_at));
     if let Some(root) = root_refno {
-        root_meta.insert(
-            "export_root_refno".to_string(),
-            json!(root.to_string()),
-        );
+        root_meta.insert("export_root_refno".to_string(), json!(root.to_string()));
     }
     root_meta.insert("names".to_string(), json!(name_table.to_json()));
     root_meta.insert("bran_groups".to_string(), json!(bran_groups_json));
@@ -850,14 +829,19 @@ pub async fn export_dbnum_instances_web(
     std::fs::write(&output_path, &json_str)?;
 
     if verbose {
-        let file_size = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+        let file_size = std::fs::metadata(&output_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
         println!("\n📊 [web] 导出统计:");
         println!("   - BRAN/HANG 分组: {}", bran_groups_json.len());
         println!("   - EQUI 分组: {}", equi_groups_json.len());
         println!("   - 未分组: {}", ungrouped_json.len());
         println!("   - 构件实例: {}", total_component_instances);
         println!("   - TUBI 实例: {}", total_tubing_instances);
-        println!("   - 文件大小: {:.2} MB", file_size as f64 / 1024.0 / 1024.0);
+        println!(
+            "   - 文件大小: {:.2} MB",
+            file_size as f64 / 1024.0 / 1024.0
+        );
         println!("✅ 已写入: {}", output_path.display());
     }
 

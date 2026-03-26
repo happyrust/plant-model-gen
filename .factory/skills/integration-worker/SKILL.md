@@ -14,16 +14,17 @@ Use this skill for features that cross `plant-model-gen` and `plant3d-web`: loca
 ## Work Procedure
 
 1. Read the assigned feature, `mission.md`, `AGENTS.md`, `.factory/services.yaml`, and the feature's `fulfills` assertions before making changes.
-2. Identify exactly which repository owns each part of the change; avoid broad edits in both repos when only one side needs to change.
-3. If the feature changes behavior, add or update automated verification first where practical:
+2. Before using exact-text search, use `ace-tool` first for the initial codebase retrieval pass. Treat `grep`/`rg` only as secondary confirmation tools after `ace-tool`, unless the identifier is already known or the task explicitly requires exhaustive literal matching.
+3. Identify exactly which repository owns each part of the change; avoid broad edits in both repos when only one side needs to change.
+4. If the feature changes behavior, add or update automated verification first where practical:
    - targeted integration tests
    - e2e tests
    - service smoke scripts
-4. Implement the cross-repo changes needed to make the flow work under the mission's local runtime contract (`3100` backend, `3101` frontend).
-5. Prove the same `form_id` lineage across the relevant steps with payload-level evidence, not just screenshots.
-6. Run the relevant backend and frontend validators plus the targeted e2e or smoke flow for this feature.
-7. Manually exercise at least one browser flow when the feature changes end-to-end behavior or role transitions.
-8. Record both success-path and failure-path observations when the feature claims resilience or denial behavior.
+5. Implement the cross-repo changes needed to make the flow work under the mission's local runtime contract (`3100` backend, `3101` frontend).
+6. Prove the same `form_id` lineage across the relevant steps with payload-level evidence, not just screenshots.
+7. Run the relevant backend and frontend validators plus the targeted e2e or smoke flow for this feature.
+8. Manually exercise at least one browser flow when the feature changes end-to-end behavior or role transitions.
+9. Record both success-path and failure-path observations when the feature claims resilience or denial behavior.
 
 ## Example Handoff
 

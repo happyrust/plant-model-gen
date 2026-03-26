@@ -2284,11 +2284,10 @@ pub async fn api_get_deployment_sites(
     let page = params.page.unwrap_or(1).max(1);
     let offset = ((page - 1) * per_page) as usize;
 
-    let items = crate::web_server::site_registry::list_sites(Some(&params))
-        .map_err(|err| {
-            eprintln!("加载站点清单失败: {}", err);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let items = crate::web_server::site_registry::list_sites(Some(&params)).map_err(|err| {
+        eprintln!("加载站点清单失败: {}", err);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let total = items.len() as u64;
     let paginated_items: Vec<DeploymentSite> = items
         .into_iter()
@@ -2330,11 +2329,7 @@ fn slugify_site_id(input: &str, fallback_port: u16) -> String {
     }
 }
 
-fn infer_site_id(
-    site_id: Option<String>,
-    project_name: &str,
-    bind_port: u16,
-) -> String {
+fn infer_site_id(site_id: Option<String>, project_name: &str, bind_port: u16) -> String {
     site_id
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -2406,19 +2401,29 @@ fn build_deployment_site_from_create_request(
                 Some(config.project_path.clone())
             }
         });
-    let project_code = req.project_code.or(Some(config.project_code)).filter(|value| *value > 0);
+    let project_code = req
+        .project_code
+        .or(Some(config.project_code))
+        .filter(|value| *value > 0);
     let bind_host = req
         .bind_host
         .clone()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "0.0.0.0".to_string());
     let bind_port = req.bind_port.unwrap_or(3100);
-    let backend_url = req.backend_url.clone().filter(|value| !value.trim().is_empty());
+    let backend_url = req
+        .backend_url
+        .clone()
+        .filter(|value| !value.trim().is_empty());
     let frontend_url = req
         .frontend_url
         .clone()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| backend_url.as_ref().map(|value| derive_frontend_url_from_backend(value, &bind_host)));
+        .or_else(|| {
+            backend_url
+                .as_ref()
+                .map(|value| derive_frontend_url_from_backend(value, &bind_host))
+        });
     let site_id = infer_site_id(Some(req.site_id.clone()), &project_name, bind_port);
     let region = req
         .region
@@ -2520,12 +2525,15 @@ pub async fn api_import_deployment_site_from_dboption(
         config.name = name.to_string();
     }
 
-    let bind_port = req.bind_port.or_else(|| {
-        web_server
-            .and_then(|table| table.get("port"))
-            .and_then(|value| value.as_integer())
-            .and_then(|value| u16::try_from(value).ok())
-    }).unwrap_or(3100);
+    let bind_port = req
+        .bind_port
+        .or_else(|| {
+            web_server
+                .and_then(|table| table.get("port"))
+                .and_then(|value| value.as_integer())
+                .and_then(|value| u16::try_from(value).ok())
+        })
+        .unwrap_or(3100);
     let bind_host = req
         .bind_host
         .clone()
@@ -2574,7 +2582,13 @@ pub async fn api_import_deployment_site_from_dboption(
         .name
         .clone()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| format!("{}-{}", config.project_name, Local::now().format("%Y%m%d_%H%M%S")));
+        .unwrap_or_else(|| {
+            format!(
+                "{}-{}",
+                config.project_name,
+                Local::now().format("%Y%m%d_%H%M%S")
+            )
+        });
     let site_id = infer_site_id(
         req.site_id.clone().or_else(|| {
             web_server
@@ -2585,9 +2599,10 @@ pub async fn api_import_deployment_site_from_dboption(
         &config.project_name,
         bind_port,
     );
-    let health_url = req.health_url.clone().or_else(|| {
-        Some(format!("{}/api/health", backend_url.trim_end_matches('/')))
-    });
+    let health_url = req
+        .health_url
+        .clone()
+        .or_else(|| Some(format!("{}/api/health", backend_url.trim_end_matches('/'))));
     let project_code = if config.project_code == 0 {
         None
     } else {
@@ -2604,7 +2619,11 @@ pub async fn api_import_deployment_site_from_dboption(
         site_id,
         name: site_name,
         description: req.description.clone(),
-        e3d_projects: build_single_project_info(&config.project_name, project_path.clone(), project_code),
+        e3d_projects: build_single_project_info(
+            &config.project_name,
+            project_path.clone(),
+            project_code,
+        ),
         config,
         status: DeploymentSiteStatus::Configuring,
         url: Some(backend_url.clone()),

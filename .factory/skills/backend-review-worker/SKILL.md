@@ -14,17 +14,18 @@ Use this skill for features in `plant-model-gen` that change review APIs, auth/v
 ## Work Procedure
 
 1. Read the assigned feature, `mission.md`, `AGENTS.md`, and the validation assertions referenced in the feature's `fulfills` list.
-2. Identify the exact backend modules, routes, storage tables/records, and tests that are relevant before editing anything.
-3. Write or extend targeted backend tests first (red). Cover both happy-path and the feature's most important denial/failure branch.
-4. Implement the minimum backend changes required to make those tests pass (green), preserving existing behavior outside the feature scope.
-5. Verify persistence semantics explicitly:
+2. Before using exact-text search, use `ace-tool` first for the initial codebase retrieval pass. Treat `grep`/`rg` only as secondary confirmation tools after `ace-tool`, unless the identifier is already known or the task explicitly requires exhaustive literal matching.
+3. Identify the exact backend modules, routes, storage tables/records, and tests that are relevant before editing anything.
+4. Write or extend targeted backend tests first (red). Cover both happy-path and the feature's most important denial/failure branch.
+5. Implement the minimum backend changes required to make those tests pass (green), preserving existing behavior outside the feature scope.
+6. Verify persistence semantics explicitly:
    - `form_id` lineage
    - `task_id` mapping
    - model reference association
    - workflow state transitions, if applicable
-6. Run focused tests during iteration, then run the backend validators defined in `.factory/services.yaml` for this mission scope.
-7. If the feature affects runtime APIs, manually exercise the relevant endpoint(s) with curl or equivalent and record observed payload behavior.
-8. Do not assume front-end behavior proves backend correctness; capture payload-level evidence in the handoff.
+7. Run focused tests during iteration, then run the backend validators defined in `.factory/services.yaml` for this mission scope.
+8. If the feature affects runtime APIs, manually exercise the relevant endpoint(s) with curl or equivalent and record observed payload behavior.
+9. Do not assume front-end behavior proves backend correctness; capture payload-level evidence in the handoff.
 
 ## Example Handoff
 

@@ -8,8 +8,7 @@ use crate::web_api::jwt_auth::{create_token, generate_form_id, verify_token};
 use super::config::PLATFORM_CONFIG;
 use super::review_form::{ensure_review_form_stub, find_task_by_form_id};
 use super::types::{
-    EmbedLineage, EmbedUrlData, EmbedUrlQuery, EmbedUrlRequest, EmbedUrlResponse,
-    ReviewFormSummary,
+    EmbedLineage, EmbedUrlData, EmbedUrlQuery, EmbedUrlRequest, EmbedUrlResponse, ReviewFormSummary,
 };
 
 pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoResponse {
@@ -132,7 +131,13 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
                     };
                     Some(format!(
                         "{}{}?user_token={}&form_id={}&user_id={}&project_id={}&output_project={}",
-                        base, clean_path, token, form_id, request.user_id, request.project_id, request.project_id
+                        base,
+                        clean_path,
+                        token,
+                        form_id,
+                        request.user_id,
+                        request.project_id,
+                        request.project_id
                     ))
                 }
             };

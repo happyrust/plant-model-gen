@@ -3163,21 +3163,15 @@ pub async fn export_dbnum_instances_web_mode(
     println!("\n🎯 导出 delivery-code 兼容的 V2 JSON");
     println!("====================================");
 
-    let output_dir =
-        output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("web_bundle"));
+    let output_dir = output_override
+        .unwrap_or_else(|| db_option_ext.get_project_output_dir().join("web_bundle"));
 
     ensure_surreal_connected(db_option_ext).await?;
 
     let db_option = Arc::new((**db_option_ext).clone());
-    let stats = export_dbnum_instances_web(
-        dbnum,
-        &output_dir,
-        db_option,
-        verbose,
-        root_refno,
-        None,
-    )
-    .await?;
+    let stats =
+        export_dbnum_instances_web(dbnum, &output_dir, db_option, verbose, root_refno, None)
+            .await?;
 
     println!("\n🎉 V2 导出完成！");
     println!("📊 统计信息:");

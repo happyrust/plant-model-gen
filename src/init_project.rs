@@ -71,7 +71,10 @@ pub async fn run_init_project_mode(
 
     let discovered_dbnums = db_meta().get_all_dbnums();
     let dbnums = resolve_target_dbnums(cli_dbnums, discovered_dbnums)?;
-    println!("🎯 第 3 步：目标 dbnums（将刷新其 pe_transform）: {:?}", dbnums);
+    println!(
+        "🎯 第 3 步：目标 dbnums（将刷新其 pe_transform）: {:?}",
+        dbnums
+    );
 
     println!("🔄 第 4 步：写入/刷新 pe_transform（依赖库中已有 pe 与 scene 数据）");
     let refresh_count = refresh_pe_transform_for_dbnums_compat(&dbnums)

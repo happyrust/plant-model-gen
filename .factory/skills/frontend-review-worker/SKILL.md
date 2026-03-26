@@ -14,13 +14,14 @@ Use this skill for features in `plant3d-web` that change embed-mode entry behavi
 ## Work Procedure
 
 1. Read the assigned feature, `mission.md`, `AGENTS.md`, and the referenced validation assertions before editing.
-2. Inspect the relevant Vue components, composables, stores, API adapters, and any existing tests/e2e coverage for the affected behavior.
-3. Add or extend focused tests first (red): component/store tests for state recovery and UI landing logic; if the feature is viewer-related, add the smallest observable test seam available.
-4. Implement the front-end changes needed to satisfy the feature while preserving existing review flows outside the mission scope.
-5. For role-landing or recovery work, prove a unique UI landing state exists (specific panel, CTA, or visible state), not just a generic page load.
-6. For model-location work, prove the viewer receives the correct model references from task/opinion/attachment context and show what happens on failure.
-7. Run focused front-end tests during iteration, then run the front-end validators from `.factory/services.yaml`.
-8. Manually verify the user-visible flow in a browser when the feature changes navigation, restoration, or viewer behavior.
+2. Before using exact-text search, use `ace-tool` first for the initial codebase retrieval pass. Treat `grep`/`rg` only as secondary confirmation tools after `ace-tool`, unless the identifier is already known or the task explicitly requires exhaustive literal matching.
+3. Inspect the relevant Vue components, composables, stores, API adapters, and any existing tests/e2e coverage for the affected behavior.
+4. Add or extend focused tests first (red): component/store tests for state recovery and UI landing logic; if the feature is viewer-related, add the smallest observable test seam available.
+5. Implement the front-end changes needed to satisfy the feature while preserving existing review flows outside the mission scope.
+6. For role-landing or recovery work, prove a unique UI landing state exists (specific panel, CTA, or visible state), not just a generic page load.
+7. For model-location work, prove the viewer receives the correct model references from task/opinion/attachment context and show what happens on failure.
+8. Run focused front-end tests during iteration, then run the front-end validators from `.factory/services.yaml`.
+9. Manually verify the user-visible flow in a browser when the feature changes navigation, restoration, or viewer behavior.
 
 ## Example Handoff
 

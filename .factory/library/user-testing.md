@@ -1,85 +1,64 @@
 # User Testing
 
-User-testing guidance for the room-compute 3x mission.
-
-This mission validates through the **real CLI surface**, not a browser UI.
+User-testing guidance for the **web console (Vue SPA) migration**.
 
 ---
 
 ## Validation Surface
 
-### CLI Surface
+### Browser surface (primary)
 
-- Primary binary: `aios-database`
-- Primary commands:
-  - `room compute`
-  - `room compute-panel`
-  - `room rebuild-spatial-index`
-  - `room verify-json`
-  - compare / verify CLI flows introduced by the mission
+- URL: `http://127.0.0.1:3100/console`
+- Tool: `agent-browser`
+- What to check:
+  - deep-link refresh (history mode)
+  - navigation drawer grouping + reachability
+  - no uncaught console errors (`agent-browser errors`)
+  - Network has no failed requests (focus on `/console/assets/*` + key `/api/*`)
 
-### Tooling
+### API surface (supporting)
 
-- `cargo`
-- direct CLI invocation
-- log inspection
-- JSON report inspection
+- Tool: `curl`
+- What to check:
+  - `/api/status` basic health
+  - feature-specific `/api/*` endpoints referenced by the SPA
+  - legacy route redirects via `curl -I`
+
+---
 
 ## Validation Concurrency
 
-### CLI Validators
+### Browser validators (agent-browser)
 
-- Max concurrent validators: **1**
+- Max concurrent validators: **2–3**
 
-#### Rationale
+Rationale (planning dry run): machine is 10 cores / 16 GiB; a single agent-browser session adds multiple Chrome / devtools processes. Keep headroom.
 
-- The host has enough CPU and memory for parallel processes, but this mission's CLI validations share stateful resources:
-  - persisted room relations
-  - SQLite coarse-filter artifacts
-  - local DB-backed room-compute inputs
-  - verify-json fixture-driven persisted-state assertions
-- Parallel validators would risk state contamination and misleading compare results.
+### API-only validators (curl)
 
-## Known Quirks
+- Max concurrent validators: **5**
 
-- Cold Rust builds are expensive; the planning dry run needed about 7m46s before `room --help` returned.
-- Repeated validators should try to reuse built artifacts when possible.
-- Missing or stale `spatial_index.sqlite` is a valid blocker if the assertion assumes steady-state reuse.
-- API status may show `database_connected: false` even when connected (check logs)
-- WebSocket updates may have 1-2 second delay (normal)
-- Frontend dev server may need restart after major changes
+---
 
-## CLI Surface: `aios-database room verify-json`
+## Known Quirks / Gotchas
 
-- Test with terminal CLI commands only; do not use browser automation for this milestone.
-- Primary fixture path: `verification/room/compute/room_compute_validation.json`.
-- Service setup: reuse the existing SurrealDB/local DB configuration; do not start or stop a shared instance from validation automation.
-- Healthcheck: `lsof -i :8020` or `lsof -i :8009` should detect an existing DB listener before running validation.
-- Required operator flow: run `room compute ...` first when validating happy-path persisted data, then run `room verify-json --input <file>`.
-- Safe baseline checks that do not require fixture-matching persisted data: `--help`, missing required args, and missing input file.
-- The verifier is read-only by default; any rebuild or recompute behavior must remain explicit and separate from verify-only validation.
+- `agent-browser screenshot` syntax is `agent-browser screenshot <path>` (no `-o`).
+- Some endpoints (e.g. incremental) may be mock/TODO in backend; parity requirements are “UI consistent and no crash” unless the feature explicitly implements real behavior.
+- Port conflicts are common. Always stop by port if needed (see `.factory/services.yaml`).
 
-## Flow Validator Guidance
+## Flow Validator Guidance: browser
 
-### Flow Group: baseline-and-regression-cli
+- Assigned browser validators must stay on `http://127.0.0.1:3100/console*` and only use the local `web_server` on port `3100`.
+- Use a dedicated session name per validator; never use the default browser session.
+- Stay within read/interaction validation boundaries: navigate, reload, click drawer items, inspect console/network, and capture screenshots/evidence. Do not edit application state unless the assigned assertions explicitly require it.
+- Avoid overlapping global-state mutations across concurrent validators. For console-foundation, browser groups are read-mostly and safe to run concurrently when they only navigate and inspect routing/shell behavior.
+- Collect `agent-browser errors --clear` before each flow and `agent-browser errors` after the flow. Save screenshots into the assigned evidence directory.
 
-- Stay within the CLI boundary.
-- Do not open browsers or invent new services.
-- Prefer the narrowest command that proves the assigned assertion.
-- Capture terminal output and any generated JSON report paths.
-- If a flow requires a rebuild or recompute, note it explicitly.
+## Flow Validator Guidance: api
 
-### Flow Group: cli-room-verify-json
+- API validators should target only the local `web_server` at `http://127.0.0.1:3100`.
+- Prefer `curl` for GET/HEAD/POST checks and capture headers/body snippets needed by the assertion evidence.
+- Keep requests scoped to assigned assertions. For console-foundation, API checks are read-only except for harmless non-GET negative tests that verify redirect behavior.
+- API validators may run concurrently as long as they do not mutate shared application state outside their assigned negative-test coverage.
+- Record exact status codes, content types, and redirect `Location` headers in the flow report.
 
-- Stay within the shared repository at `/Volumes/DPC/work/plant-code/plant-model-gen`.
-- Do not create or mutate alternate databases, ports, or fixture files unless explicitly assigned.
-- Do not start a second SurrealDB instance and do not stop the shared one.
-- Prefer read-only CLI checks first; if a flow requires `room compute`, treat that compute scope as shared global state and serialize it with other validators.
-- Save command transcripts and any generated evidence under the assigned evidence directory only.
-
-### Flow Group: final-performance-gate
-
-- Run alone; do not overlap with other validators.
-- Capture before/after JSON reports and timing logs.
-- Record whether the run reused or rebuilt the spatial index.
-- If a cold build dominates runtime, separate build cost from command runtime in the report.

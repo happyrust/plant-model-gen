@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "🚀 Initializing room-compute 3x mission environment..."
+echo "Initializing plant-model-gen console mission environment..."
 
 if [ ! -f "Cargo.toml" ]; then
     echo "❌ Error: must run from the plant-model-gen repository root"
@@ -13,34 +13,34 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "✅ Rust toolchain found"
+echo "Rust toolchain found"
+
+if ! command -v node >/dev/null 2>&1; then
+    echo "❌ Error: Node.js not found"
+    exit 1
+fi
+
+echo "Node.js found"
+
+if [ ! -f "web_console/package.json" ]; then
+    echo "❌ Error: web_console/package.json not found (expected Vue console app)"
+    exit 1
+fi
 
 if [ ! -f ".factory/services.yaml" ]; then
     echo "❌ Error: .factory/services.yaml not found"
     exit 1
 fi
 
-if [ ! -f "verification/room/compute/room_compute_validation.json" ]; then
-    echo "⚠️  Notice: verification/room/compute/room_compute_validation.json not found; skip json-specific checks if unavailable"
+echo "Mission service manifest found"
+
+if [ ! -d "web_console/node_modules" ]; then
+    echo "Note: web_console/node_modules not found yet. Run: npm --prefix web_console install"
 fi
 
-echo "✅ Mission service manifest found"
+echo "Validation guidance:"
+echo "  - No tests / no compiling tests (do not run cargo test or cargo check --tests)"
+echo "  - Rust: cargo fmt; cargo check --features web_server --bin web_server"
+echo "  - UI: start web_server on 3100 and validate /console with agent-browser"
 
-if [ -f "output/spatial_index.sqlite" ]; then
-    echo "✅ Existing spatial_index.sqlite detected"
-else
-    echo "⚠️  output/spatial_index.sqlite not found yet; the mission may need an explicit rebuild before full validation"
-fi
-
-powershell -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory | Format-List" || true
-
-echo "ℹ️  Validation path dry-run guidance:"
-echo "   - cargo run --bin aios-database -- room --help"
-echo "   - cargo run --release --bin aios-database -- room compute"
-echo "   - cargo run --release --bin aios-database -- room compute-panel --panel-refno <refno>"
-echo "   - cargo check --release --bin aios-database"
-echo "ℹ️  Acceptance workflow for this mission:"
-echo "   1. cargo run --bin aios-database -- room compute ..."
-echo "   2. cargo run --bin aios-database -- room verify-json --input verification/room/compute/room_compute_validation.json"
-
-echo "✅ Mission environment initialization complete"
+echo "Initialization complete"

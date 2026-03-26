@@ -3,8 +3,7 @@ use std::path::PathBuf;
 
 #[test]
 fn test_init_project_subcommand_has_dbnums_arg() {
-    let command =
-        crate::cli_args::add_init_project_subcommand(Command::new("aios-database"));
+    let command = crate::cli_args::add_init_project_subcommand(Command::new("aios-database"));
     let sub = command
         .get_subcommands()
         .find(|sub| sub.get_name() == "init-project")
@@ -24,15 +23,14 @@ fn test_resolve_target_dbnums_prefers_cli_values() {
         Some(vec![5016, 21909, 5016]),
         vec![5001, 5016, 21909],
     )
-        .expect("应优先使用 CLI 传入的 dbnums");
+    .expect("应优先使用 CLI 传入的 dbnums");
     assert_eq!(dbnums, vec![5016, 21909]);
 }
 
 #[test]
 fn test_resolve_target_dbnums_uses_all_discovered_dbnums_when_cli_missing() {
-    let dbnums =
-        crate::init_project::resolve_target_dbnums(None, vec![21909, 5016, 21909, 5001])
-            .expect("未传 --dbnums 时应使用扫描得到的全部 dbnums");
+    let dbnums = crate::init_project::resolve_target_dbnums(None, vec![21909, 5016, 21909, 5001])
+        .expect("未传 --dbnums 时应使用扫描得到的全部 dbnums");
     assert_eq!(dbnums, vec![5001, 5016, 21909]);
 }
 
@@ -61,7 +59,5 @@ fn test_indextree_project_dir_candidates_include_project_name_fallback() {
         candidates.first(),
         Some(&PathBuf::from("/Volumes/DPC/work/e3d_models/YCYK-E3D"))
     );
-    assert!(candidates.contains(&PathBuf::from(
-        "/Volumes/DPC/work/e3d_models/SLYK"
-    )));
+    assert!(candidates.contains(&PathBuf::from("/Volumes/DPC/work/e3d_models/SLYK")));
 }

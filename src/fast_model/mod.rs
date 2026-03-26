@@ -402,7 +402,9 @@ mod smart_debug_heuristic_tests {
     #[test]
     fn detects_cn_and_en_error_tokens() {
         assert!(is_error_message_heuristic("任务执行失败: refno=24381_1"));
-        assert!(is_error_message_heuristic("Boolean worker failed with panic"));
+        assert!(is_error_message_heuristic(
+            "Boolean worker failed with panic"
+        ));
     }
 
     #[test]

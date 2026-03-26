@@ -20,9 +20,7 @@ use super::types::{
 // Handler
 // ============================================================================
 
-pub async fn sync_workflow_handler(
-    Json(request): Json<SyncWorkflowRequest>,
-) -> impl IntoResponse {
+pub async fn sync_workflow_handler(Json(request): Json<SyncWorkflowRequest>) -> impl IntoResponse {
     let is_query = request.action.eq_ignore_ascii_case("query");
     let request_start_time = std::time::Instant::now();
 

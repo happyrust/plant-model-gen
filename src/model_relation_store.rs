@@ -280,8 +280,8 @@ impl ModelRelationStore {
             return Ok(None);
         };
 
-        let payload: serde_json::Value = serde_json::from_slice(&geometry_blob)
-            .context("解析 inst_geo.geometry 失败")?;
+        let payload: serde_json::Value =
+            serde_json::from_slice(&geometry_blob).context("解析 inst_geo.geometry 失败")?;
         let root_name = payload
             .get("group_path")
             .and_then(serde_json::Value::as_str)

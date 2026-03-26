@@ -1,101 +1,20 @@
 # Architecture
 
-Architectural notes for the room-compute 3x performance mission.
+Architecture notes for the **web console (Vue SPA) migration**.
 
-## Validation Dry-Run Findings
+## High-level structure
 
-- CLI validation surface is reachable through `cargo run --bin aios-database -- room --help`
-- Cold build cost is high; planning dry run took about 7m46s before showing room subcommands
-- Validation remains CLI-first; no web or extra service surface is part of this mission
+- **Backend:** Rust `web_server` provides `/api/*` and serves the built SPA.
+- **Frontend:** Vue 3 + Vite + Vuetify app under `web_console/`.
 
-## Current Room Compute Pipeline
+## Serving model
 
-Primary code path: `src/fast_model/room_model.rs`
+- SPA entry: `GET /console` and `GET /console/` return `web_console/dist/index.html`.
+- SPA assets: served under `GET /console/assets/*` from `web_console/dist/assets`.
+- History mode: unknown `/console/*` routes return SPA index (history fallback), while non-console prefixes (e.g. `/api/*`) must not be swallowed.
 
-```text
-build_room_relations_with_overrides
-  -> ensure_spatial_index_ready
-  -> build_room_panels_relate_for_query
-  -> query_room_panels_with_tree_index
-  -> query_candidate_rooms
-  -> query_insts_for_room_calc (panel prefetch)
-  -> compute_room_relations_with_cancel
-     -> process_panel_for_room
-        -> cal_room_refnos_with_options
-           -> query panel geom insts
-           -> derive/merge panel AABB
-           -> load transformed panel meshes
-           -> SQLite RTree coarse filter
-           -> batch candidate AABB lookup
-           -> 27-point vote against panel meshes
-  -> save room relations
-```
+## Legacy console migration model
 
-## Mission Architectural Boundaries
+- Legacy HTML routes (e.g. `/tasks`, `/deployment-sites`, `/sync-control`, `/db-status`, ...) are migrated to SPA routes under `/console/*`.
+- Legacy routes are finalized as **30x redirects** to their SPA equivalents (see validation contract mapping table).
 
-- Keep the mission CLI-only.
-- Reuse the existing SQLite coarse filter:
-  - `spatial_index.sqlite`
-  - `inst_relate_aabb`
-  - `inst_relate_booled_aabb`
-- Do not introduce a new service, queue, or daemon.
-- Do not add a new SQLite idx table in Milestone 1 or 2.
-
-## High-ROI Hotspots
-
-### 1. Spatial Index Refresh Coupling
-
-- `ensure_spatial_index_ready()` can dominate steady-state runs if it rebuilds too eagerly.
-- This must be reused or scoped before deeper hot-path work can show its full value.
-
-### 2. Geometry Detail Cache Semantics
-
-- `GEOM_CACHE` currently behaves like a transport buffer rather than a reusable cache because reads remove entries.
-- Repeated lookups need a true shared-cache behavior.
-
-### 3. Panel Hot Path Rebuild Cost
-
-- `cal_room_refnos_with_options()` rebuilds panel state that is often reusable:
-  - merged AABB
-  - transformed meshes
-  - evaluator-ready inputs
-
-### 4. Execution Model Bottleneck
-
-- The current orchestration is mainly room-level concurrent while panel work inside a room remains sequential.
-- `candidate_concurrency` exists in options but is not yet a meaningful execution-model lever.
-
-### 5. Dynamic Detail Query Cost
-
-- The current detail path still relies on dynamic query composition and batching.
-- `inst_mesh_meta` is intended to replace this with a materialized, cache-friendly read path.
-
-## Milestone Intent
-
-### Milestone 1
-
-- establish structured observability
-- add compare/verify evidence
-- decouple spatial index refresh
-- fix cache semantics
-- add prepared panel cache
-- improve panel-aware concurrency
-
-### Milestone 2
-
-- define `inst_mesh_meta`
-- materialize writes
-- integrate batched reads with safe fallback
-- prove normal / bool / TUBI parity
-
-### Milestone 3
-
-- extract prepared candidate evaluator
-- batch candidate execution
-- prove final <= one-third runtime with zero regression
-
-## Correctness Rules
-
-- Bool and TUBI semantics are first-class correctness constraints, not optional edge cases.
-- Every fast path must either preserve semantics exactly or fall back explicitly.
-- Performance success is not enough without compare evidence.

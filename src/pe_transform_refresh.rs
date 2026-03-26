@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 
-use anyhow::{Context, Result};
 use aios_core::rs_surreal::pe_transform::{
     PeTransformEntry, ensure_pe_transform_schema, save_pe_transform_entries,
 };
 use aios_core::transform::get_local_mat4;
 use aios_core::{RefnoEnum, SurrealQueryExt, Transform, get_children_refnos, project_primary_db};
+use anyhow::{Context, Result};
 use glam::DMat4;
 use serde_json::Value;
 
@@ -106,9 +106,9 @@ pub async fn refresh_pe_transform_for_dbnums_compat(dbnums: &[u32]) -> Result<us
                     }
 
                     if entries.len() >= PE_TRANSFORM_BATCH_SIZE {
-                        save_pe_transform_entries(&entries)
-                            .await
-                            .with_context(|| format!("批量写入 pe_transform 失败: dbnum={}", dbnum))?;
+                        save_pe_transform_entries(&entries).await.with_context(|| {
+                            format!("批量写入 pe_transform 失败: dbnum={}", dbnum)
+                        })?;
                         entries.clear();
                         print_progress(dbnum_processed, total_nodes, true);
                         dbnum_last_print = dbnum_processed;
@@ -131,7 +131,10 @@ pub async fn refresh_pe_transform_for_dbnums_compat(dbnums: &[u32]) -> Result<us
 }
 
 async fn query_total_nodes_for_dbnum(dbnum: u32) -> Result<usize> {
-    let sql = format!("SELECT count() AS count FROM pe WHERE dbnum = {} GROUP ALL", dbnum);
+    let sql = format!(
+        "SELECT count() AS count FROM pe WHERE dbnum = {} GROUP ALL",
+        dbnum
+    );
     let rows: Vec<Value> = project_primary_db()
         .query_take(&sql, 0)
         .await
@@ -187,7 +190,11 @@ fn print_progress(processed: usize, total_nodes: usize, saved_batch: bool) {
     } else {
         0
     };
-    let suffix = if saved_batch { " [已保存批次]" } else { "" };
+    let suffix = if saved_batch {
+        " [已保存批次]"
+    } else {
+        ""
+    };
     print!(
         "\r📊 进度: {}/{} ({:3}%){}...",
         processed, total_nodes, percentage, suffix
@@ -217,7 +224,10 @@ mod tests {
 
     #[test]
     fn extract_count_accepts_object_shape() {
-        assert_eq!(extract_count_from_json_value(&json!({"count": 18649})), Some(18649));
+        assert_eq!(
+            extract_count_from_json_value(&json!({"count": 18649})),
+            Some(18649)
+        );
     }
 
     #[test]

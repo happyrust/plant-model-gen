@@ -22,21 +22,22 @@ Do **not** use this skill for `inst_mesh_meta` schema/write/read ownership; that
 ## Work Procedure
 
 1. Read the assigned feature, mission `AGENTS.md`, `validation-contract.md`, and the feature's `fulfills` assertions before editing.
-2. Identify the exact hot path the feature is supposed to change and write down the semantic invariant it must preserve.
-3. Add the smallest reliable failing regression proof first when practical:
+2. Before using exact-text search, use `ace-tool` first for the initial codebase retrieval pass. Treat `grep`/`rg` only as secondary confirmation tools after `ace-tool`, unless the identifier is already known or the task explicitly requires exhaustive literal matching.
+3. Identify the exact hot path the feature is supposed to change and write down the semantic invariant it must preserve.
+4. Add the smallest reliable failing regression proof first when practical:
    - focused Rust regression test, or
    - CLI compare/verify expectation that fails before the change
-4. Implement only the scoped performance change; do not broaden into unrelated cleanup.
-5. Keep the fast path observable:
+5. Implement only the scoped performance change; do not broaden into unrelated cleanup.
+6. Keep the fast path observable:
    - add or preserve stage timing logs
    - emit cache/fallback/concurrency clues when the feature changes those behaviors
-6. Run focused validation first, then the required mission validators:
+7. Run focused validation first, then the required mission validators:
    - `cargo check --release --bin aios-database`
    - targeted CLI help / smoke commands if the feature touches command surfaces
    - the smallest relevant `room compute-panel` or `room compute` validation for the feature
-7. Compare before/after evidence whenever the feature claims a speedup.
-8. Ensure no orphaned processes remain; stop any long-running command you started.
-9. Fill the handoff with exact evidence and any residual risk.
+8. Compare before/after evidence whenever the feature claims a speedup.
+9. Ensure no orphaned processes remain; stop any long-running command you started.
+10. Fill the handoff with exact evidence and any residual risk.
 
 ## Example Handoff
 

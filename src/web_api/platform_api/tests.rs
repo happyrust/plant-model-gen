@@ -10,8 +10,8 @@ use axum::{
 use serde::Deserialize;
 use tower::ServiceExt;
 
-use aios_core::{init_surreal, project_primary_db};
 use crate::web_api::jwt_auth::{create_token, verify_token};
+use aios_core::{init_surreal, project_primary_db};
 
 #[derive(Debug, Deserialize)]
 struct EmbedUrlResponseBody {
@@ -31,7 +31,9 @@ struct EmbedLineageBody {
 
 async fn cleanup_form(form_id: &str) {
     let _ = project_primary_db()
-        .query("LET $ids = SELECT VALUE id FROM review_tasks WHERE form_id = $form_id; DELETE $ids;")
+        .query(
+            "LET $ids = SELECT VALUE id FROM review_tasks WHERE form_id = $form_id; DELETE $ids;",
+        )
         .bind(("form_id", form_id.to_string()))
         .await;
 }
@@ -200,8 +202,7 @@ async fn test_embed_url_returns_existing_task_for_form_id() {
     insert_task_with_form_id(form_id, "user-existing").await;
 
     let app = create_platform_api_routes();
-    let (token, _) =
-        create_token("project-1", "user-existing", None, form_id, Some("jd")).unwrap();
+    let (token, _) = create_token("project-1", "user-existing", None, form_id, Some("jd")).unwrap();
 
     let response = app
         .oneshot(

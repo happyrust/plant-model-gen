@@ -192,7 +192,7 @@ pub fn query_existing_meshed_inst_geo_ids() -> Vec<u64> {
         .iter()
         .filter_map(|kv| kv.key().parse::<u64>().ok())
         .collect();
-    
+
     ids.sort_unstable();
     ids.dedup();
 
@@ -660,7 +660,7 @@ async fn query_pending_inst_boolean(
 
     // 非覆盖模式：过滤掉已成功处理的
     const CHUNK_SIZE: usize = 200;
-    
+
     let candidates_vec: Vec<RefnoEnum> = candidates.iter().copied().collect();
     let mut pending: Vec<RefnoEnum> = Vec::new();
 
@@ -669,7 +669,11 @@ async fn query_pending_inst_boolean(
             break;
         }
 
-        let chunk_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
+        let chunk_keys = chunk
+            .iter()
+            .map(|r| r.to_pe_key())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
             "SELECT VALUE refno FROM inst_relate_bool WHERE refno IN [{}] AND status = 'Success';",
             chunk_keys
@@ -679,7 +683,7 @@ async fn query_pending_inst_boolean(
             .query_take(&sql, 0)
             .await
             .unwrap_or_default();
-            
+
         let success_set: HashSet<RefnoEnum> = success_refnos.into_iter().collect();
 
         for candidate in chunk {

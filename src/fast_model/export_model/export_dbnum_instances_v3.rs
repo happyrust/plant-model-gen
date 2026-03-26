@@ -17,9 +17,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use aios_core::SurrealQueryExt;
 use aios_core::options::DbOption;
 use aios_core::pdms_types::RefnoEnum;
-use aios_core::SurrealQueryExt;
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use glam::DMat4;
@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use surrealdb::types::SurrealValue;
 
-use super::export_transform_config::ExportTransformConfig;
 use super::InstRelateRow;
+use super::export_transform_config::ExportTransformConfig;
 use crate::fast_model::unit_converter::UnitConverter;
 
 // =============================================================================
@@ -240,10 +240,7 @@ pub async fn export_dbnum_instances_v3(
     // 3. 查询几何体实例 hash
     // =========================================================================
     if verbose {
-        println!(
-            "🔍 查询 {} 个 refno 的几何体实例 hash...",
-            in_refnos.len()
-        );
+        println!("🔍 查询 {} 个 refno 的几何体实例 hash...", in_refnos.len());
     }
     let mut export_inst_map: HashMap<RefnoEnum, aios_core::ExportInstQuery> = HashMap::new();
     if !in_refnos.is_empty() {
@@ -331,13 +328,16 @@ pub async fn export_dbnum_instances_v3(
         );
     }
 
-    let unit_converter = UnitConverter::new(
-        transform_config.source_unit,
-        transform_config.target_unit,
-    );
+    let unit_converter =
+        UnitConverter::new(transform_config.source_unit, transform_config.target_unit);
 
     let (trans_map, aabb_map) = tokio::join!(
-        resolve_trans_to_matrices(&trans_hashes, &unit_converter, transform_config.apply_rotation, verbose),
+        resolve_trans_to_matrices(
+            &trans_hashes,
+            &unit_converter,
+            transform_config.apply_rotation,
+            verbose
+        ),
         resolve_aabb(&aabb_hashes, &unit_converter, verbose),
     );
     let trans_map = trans_map?;
@@ -513,10 +513,7 @@ pub async fn export_dbnum_instances_v3(
     // =========================================================================
     let output_filename = match &root_refno {
         Some(root) => {
-            let slug = root
-                .to_string()
-                .replace(['/', '\\'], "_")
-                .replace(' ', "_");
+            let slug = root.to_string().replace(['/', '\\'], "_").replace(' ', "_");
             format!("instances_v3_root_{slug}.json")
         }
         None => format!("instances_v3_{dbnum}.json"),
@@ -553,10 +550,7 @@ pub async fn export_dbnum_instances_v3(
         println!("   - TUBI 实例: {}", total_tubing_instances);
         println!("   - transforms 条目: {}", transforms_json.len());
         println!("   - aabb 条目: {}", aabb_json.len());
-        println!(
-            "   - 文件大小: {:.2} MB",
-            file_size as f64 / 1_048_576.0
-        );
+        println!("   - 文件大小: {:.2} MB", file_size as f64 / 1_048_576.0);
         println!("   - 耗时: {:.2}s", elapsed.as_secs_f64());
         println!("   ✅ 写入: {}", output_path.display());
     }
@@ -578,10 +572,7 @@ pub async fn export_dbnum_instances_v3(
 // SurrealDB 查询函数
 // =============================================================================
 
-async fn query_inst_relate_by_dbnum(
-    dbnum: u32,
-    verbose: bool,
-) -> Result<Vec<InstRelateRow>> {
+async fn query_inst_relate_by_dbnum(dbnum: u32, verbose: bool) -> Result<Vec<InstRelateRow>> {
     if verbose {
         println!(
             "🔍 扫描 inst_relate（索引路径: WHERE dbnum = {}）...",
@@ -652,14 +643,12 @@ async fn query_export_insts(
                 bool_keys = bool_keys_str
             );
 
-            let mut bool_results: Vec<aios_core::ExportInstQuery> =
-                aios_core::project_primary_db()
-                    .query_take(&bool_sql, 0)
-                    .await
-                    .with_context(|| "query_export_insts bool SQL failed")?;
+            let mut bool_results: Vec<aios_core::ExportInstQuery> = aios_core::project_primary_db()
+                .query_take(&bool_sql, 0)
+                .await
+                .with_context(|| "query_export_insts bool SQL failed")?;
 
-            let bool_refnos: HashSet<RefnoEnum> =
-                bool_results.iter().map(|r| r.refno).collect();
+            let bool_refnos: HashSet<RefnoEnum> = bool_results.iter().map(|r| r.refno).collect();
             results.append(&mut bool_results);
 
             let non_bool_keys = chunk
@@ -916,7 +905,9 @@ fn parse_transform_to_dmat4(d: &serde_json::Value) -> Option<DMat4> {
         .unwrap_or(glam::DVec3::ONE);
 
     Some(DMat4::from_scale_rotation_translation(
-        scale, rotation, translation,
+        scale,
+        rotation,
+        translation,
     ))
 }
 

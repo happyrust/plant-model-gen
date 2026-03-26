@@ -3,7 +3,7 @@
 use axum::http::StatusCode;
 use tracing::warn;
 
-use crate::web_api::jwt_auth::{verify_token, REVIEW_AUTH_CONFIG};
+use crate::web_api::jwt_auth::{REVIEW_AUTH_CONFIG, verify_token};
 
 /// Unified S2S token verification: validates JWT when auth is enabled, skips otherwise.
 pub fn verify_s2s_token(

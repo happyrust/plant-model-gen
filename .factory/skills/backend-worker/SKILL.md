@@ -18,26 +18,27 @@ Use this skill for general Rust backend changes in `plant-model-gen` that do not
 ## Work Procedure
 
 1. **Read feature requirements** from features.json
-2. **Choose feature-appropriate validation first**:
+2. Before using exact-text search, use `ace-tool` first for the initial codebase retrieval pass. Treat `grep`/`rg` only as secondary confirmation tools after `ace-tool`, unless the identifier is already known or the task explicitly requires exhaustive literal matching.
+3. **Choose feature-appropriate validation first**:
    - For API/data-flow changes, add or update targeted tests when they are the safest way to prove behavior
    - For CLI workflow features, prefer direct CLI validation over broad `cargo test` gates
    - Do not introduce a broad `cargo test` requirement when the feature's mission or manifest defines a narrower accepted validation path
-3. **Implement changes**:
+4. **Implement changes**:
    - Modify structs in src/web_server/models.rs
    - Thread parameters in src/web_server/handlers.rs
    - Follow existing patterns (Option<T> for new fields)
    - Keep changes minimal and focused
-4. **Run the accepted verification path**:
+5. **Run the accepted verification path**:
    - Use the commands required by the feature, mission manifest, or owning specialized skill
    - If tests are used, keep them targeted rather than broad workspace gates unless the feature explicitly requires the broad run
-5. **Run validators appropriate to the touched surface**:
+6. **Run validators appropriate to the touched surface**:
    - For `web_server` backend changes, use validators such as `cargo check --bin web_server --features web_server`, `cargo fmt --all`, and `cargo clippy --features web_server -- -D warnings` when relevant
    - For CLI-focused features, prefer `cargo check --bin aios-database --quiet` and the required CLI smoke/acceptance commands
-6. **Manual verification**:
+7. **Manual verification**:
    - Use the runtime surface relevant to the feature (for example local API `curl` checks for web work, or direct CLI invocations for command-line work)
    - Check logs/output for the specific behavior your feature changes
-7. **Commit changes** with clear message
-8. **Fill handoff** with all verification details
+8. **Commit changes** with clear message
+9. **Fill handoff** with all verification details
 
 ## Example Handoff
 

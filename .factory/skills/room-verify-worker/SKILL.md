@@ -19,29 +19,30 @@ Use this skill for room-compute validation-facing CLI features in `plant-model-g
 ## Work Procedure
 
 1. Read the assigned feature, `mission.md`, the mission `AGENTS.md`, and the feature's `fulfills` assertions before editing.
-2. Confirm whether the feature is:
+2. Before using exact-text search, use `ace-tool` first for the initial codebase retrieval pass. Treat `grep`/`rg` only as secondary confirmation tools after `ace-tool`, unless the identifier is already known or the task explicitly requires exhaustive literal matching.
+3. Confirm whether the feature is:
    - reporting / observability,
    - compare / verify CLI,
    - persisted-result validation, or
    - milestone-gate evidence.
-3. Preserve read-only-by-default semantics for compare/verify features unless the feature explicitly says otherwise.
-4. Prefer direct CLI validation over broad test suites:
+4. Preserve read-only-by-default semantics for compare/verify features unless the feature explicitly says otherwise.
+5. Prefer direct CLI validation over broad test suites:
    - help/usage validation
    - missing/invalid argument validation
    - report generation validation
    - compare/parity validation
    - full `room compute` / `compute-panel` evidence runs only when required by the feature
-5. Implement the smallest Rust CLI or reporting changes needed in the command surface and supporting modules.
-6. Reuse persisted results or report files when the feature is about validation; do not satisfy a read-only feature by recomputing data on the default path.
-7. Run the required validators:
+6. Implement the smallest Rust CLI or reporting changes needed in the command surface and supporting modules.
+7. Reuse persisted results or report files when the feature is about validation; do not satisfy a read-only feature by recomputing data on the default path.
+8. Run the required validators:
    - `cargo check --release --bin aios-database`
-8. Run the narrowest relevant CLI smoke checks for the changed surface, such as:
+9. Run the narrowest relevant CLI smoke checks for the changed surface, such as:
    - `cargo run --bin aios-database -- room --help`
    - `cargo run --bin aios-database -- room compute --help`
    - `cargo run --bin aios-database -- room compute-panel --help`
    - `cargo run --bin aios-database -- room verify-json --help`
-9. When the feature claims milestone evidence, capture before/after timing or JSON-report deltas and name the exact files or commands used.
-10. Record whether the feature stayed read-only where required and whether any evidence gaps came from DB/data availability.
+10. When the feature claims milestone evidence, capture before/after timing or JSON-report deltas and name the exact files or commands used.
+11. Record whether the feature stayed read-only where required and whether any evidence gaps came from DB/data availability.
 
 ## Implementation Guardrails
 

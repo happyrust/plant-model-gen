@@ -32,16 +32,14 @@ fn parse_time_string(value: Option<String>) -> Option<SystemTime> {
     if raw.is_empty() {
         return None;
     }
-    DateTime::parse_from_rfc3339(&raw)
-        .ok()
-        .and_then(|dt| {
-            let millis = dt.timestamp_millis();
-            if millis < 0 {
-                None
-            } else {
-                Some(UNIX_EPOCH + Duration::from_millis(millis as u64))
-            }
-        })
+    DateTime::parse_from_rfc3339(&raw).ok().and_then(|dt| {
+        let millis = dt.timestamp_millis();
+        if millis < 0 {
+            None
+        } else {
+            Some(UNIX_EPOCH + Duration::from_millis(millis as u64))
+        }
+    })
 }
 
 fn now_rfc3339() -> String {
@@ -97,8 +95,8 @@ fn deployment_sites_sqlite_path() -> String {
 
 fn open_registry() -> Result<Connection> {
     let db_path = deployment_sites_sqlite_path();
-    let conn = Connection::open(&db_path)
-        .with_context(|| format!("打开站点注册表失败: {}", db_path))?;
+    let conn =
+        Connection::open(&db_path).with_context(|| format!("打开站点注册表失败: {}", db_path))?;
     migrate_schema(&conn)?;
     Ok(conn)
 }
@@ -320,9 +318,11 @@ fn load_site_from_row(row: &rusqlite::Row<'_>, ttl_secs: u64) -> rusqlite::Resul
     let config_project_name = config.project_name.clone();
     let config_project_path = config.project_path.clone();
 
-    let mut e3d_projects: Vec<E3dProjectInfo> = serde_json::from_str(&e3d_projects_json).unwrap_or_default();
+    let mut e3d_projects: Vec<E3dProjectInfo> =
+        serde_json::from_str(&e3d_projects_json).unwrap_or_default();
     if e3d_projects.is_empty() {
-        let selected_projects: Vec<String> = serde_json::from_str(&selected_projects_json).unwrap_or_default();
+        let selected_projects: Vec<String> =
+            serde_json::from_str(&selected_projects_json).unwrap_or_default();
         let now = SystemTime::now();
         e3d_projects = selected_projects
             .into_iter()
@@ -347,8 +347,12 @@ fn load_site_from_row(row: &rusqlite::Row<'_>, ttl_secs: u64) -> rusqlite::Resul
     }
 
     if e3d_projects.is_empty() {
-        let fallback_name = project_name.clone().unwrap_or_else(|| config.project_name.clone());
-        let fallback_path = project_path.clone().unwrap_or_else(|| config.project_path.clone());
+        let fallback_name = project_name
+            .clone()
+            .unwrap_or_else(|| config.project_name.clone());
+        let fallback_path = project_path
+            .clone()
+            .unwrap_or_else(|| config.project_path.clone());
         if !fallback_name.trim().is_empty() || !fallback_path.trim().is_empty() {
             e3d_projects.push(E3dProjectInfo {
                 name: if fallback_name.trim().is_empty() {
@@ -368,7 +372,10 @@ fn load_site_from_row(row: &rusqlite::Row<'_>, ttl_secs: u64) -> rusqlite::Resul
     }
 
     let status = site_status_from_str(status_raw.as_deref().unwrap_or("Configuring"));
-    let computed_status = if matches!(status, DeploymentSiteStatus::Stopped | DeploymentSiteStatus::Failed) {
+    let computed_status = if matches!(
+        status,
+        DeploymentSiteStatus::Stopped | DeploymentSiteStatus::Failed
+    ) {
         status
     } else if let Some(last_seen) = last_seen_at.clone() {
         let parsed = parse_time_string(Some(last_seen));
@@ -384,14 +391,12 @@ fn load_site_from_row(row: &rusqlite::Row<'_>, ttl_secs: u64) -> rusqlite::Resul
         status
     };
 
-    let tags = tags_json
-        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+    let tags = tags_json.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
 
-    let project_name_final = normalize_string(
-        project_name.unwrap_or_else(|| config_project_name.clone()),
-    );
-    let project_path_final =
-        normalize_optional_string(project_path).or_else(|| normalize_optional_string(root_directory));
+    let project_name_final =
+        normalize_string(project_name.unwrap_or_else(|| config_project_name.clone()));
+    let project_path_final = normalize_optional_string(project_path)
+        .or_else(|| normalize_optional_string(root_directory));
 
     Ok(DeploymentSite {
         id: Some(id.clone()),
@@ -412,8 +417,11 @@ fn load_site_from_row(row: &rusqlite::Row<'_>, ttl_secs: u64) -> rusqlite::Resul
         last_health_check: normalize_optional_string(last_health_check),
         region: normalize_optional_string(region).or_else(|| normalize_optional_string(env)),
         project_name: project_name_final,
-        project_path: project_path_final.or_else(|| normalize_optional_string(Some(config_project_path))),
-        project_code: project_code.or(Some(config_project_code)).filter(|value| *value > 0),
+        project_path: project_path_final
+            .or_else(|| normalize_optional_string(Some(config_project_path))),
+        project_code: project_code
+            .or(Some(config_project_code))
+            .filter(|value| *value > 0),
         frontend_url: normalize_optional_string(frontend_url),
         backend_url: normalize_optional_string(backend_url),
         bind_host: normalize_string(bind_host.unwrap_or_else(|| "0.0.0.0".to_string())),
@@ -453,7 +461,10 @@ fn validate_site(site: &DeploymentSite, existing_id: Option<&str>) -> Result<()>
 
     let sites = list_sites(None)?;
     for existing in sites {
-        let existing_id_str = existing.id.clone().unwrap_or_else(|| existing.site_id.clone());
+        let existing_id_str = existing
+            .id
+            .clone()
+            .unwrap_or_else(|| existing.site_id.clone());
         if existing_id == Some(existing_id_str.as_str()) {
             continue;
         }
@@ -465,7 +476,10 @@ fn validate_site(site: &DeploymentSite, existing_id: Option<&str>) -> Result<()>
             .as_deref()
             .is_some_and(|v| v == site.backend_url.as_deref().unwrap_or(""))
         {
-            anyhow::bail!("后端地址已存在: {}", site.backend_url.as_deref().unwrap_or(""));
+            anyhow::bail!(
+                "后端地址已存在: {}",
+                site.backend_url.as_deref().unwrap_or("")
+            );
         }
         if existing.bind_host == site.bind_host && existing.bind_port == site.bind_port {
             anyhow::bail!(
@@ -479,7 +493,11 @@ fn validate_site(site: &DeploymentSite, existing_id: Option<&str>) -> Result<()>
     Ok(())
 }
 
-fn upsert_site_internal(conn: &Connection, site: &DeploymentSite, preserve_created_at: Option<String>) -> Result<()> {
+fn upsert_site_internal(
+    conn: &Connection,
+    site: &DeploymentSite,
+    preserve_created_at: Option<String>,
+) -> Result<()> {
     let e3d_projects = derive_e3d_projects(site);
     let selected_projects_json = serde_json::to_string(
         &e3d_projects
@@ -594,16 +612,39 @@ pub fn list_sites(query: Option<&DeploymentSiteQuery>) -> Result<Vec<DeploymentS
                         .map(|value| value.to_string().contains(&ql))
                         .unwrap_or(false)
                     || site.site_id.to_lowercase().contains(&ql)
-                    || site.region.as_deref().unwrap_or("").to_lowercase().contains(&ql)
-                    || site.frontend_url.as_deref().unwrap_or("").to_lowercase().contains(&ql)
-                    || site.backend_url.as_deref().unwrap_or("").to_lowercase().contains(&ql)
+                    || site
+                        .region
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&ql)
+                    || site
+                        .frontend_url
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&ql)
+                    || site
+                        .backend_url
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&ql)
             });
         }
-        if let Some(status) = query.status.as_ref().filter(|value| !value.trim().is_empty()) {
+        if let Some(status) = query
+            .status
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
             let status = status.to_ascii_lowercase();
             items.retain(|site| site_status_to_str(&site.status).eq_ignore_ascii_case(&status));
         }
-        if let Some(owner) = query.owner.as_ref().filter(|value| !value.trim().is_empty()) {
+        if let Some(owner) = query
+            .owner
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
             items.retain(|site| site.owner.as_deref() == Some(owner.as_str()));
         }
         if let Some(env) = query.env.as_ref().filter(|value| !value.trim().is_empty()) {
@@ -612,7 +653,11 @@ pub fn list_sites(query: Option<&DeploymentSiteQuery>) -> Result<Vec<DeploymentS
                     || site.region.as_deref() == Some(env.as_str())
             });
         }
-        if let Some(region) = query.region.as_ref().filter(|value| !value.trim().is_empty()) {
+        if let Some(region) = query
+            .region
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
             items.retain(|site| site.region.as_deref() == Some(region.as_str()));
         }
         if let Some(project_name) = query
@@ -676,7 +721,10 @@ pub fn create_site(mut site: DeploymentSite) -> Result<DeploymentSite> {
     get_site(&site.site_id)?.ok_or_else(|| anyhow!("创建站点后读取失败"))
 }
 
-pub fn update_site(id: &str, req: &super::models::DeploymentSiteUpdateRequest) -> Result<DeploymentSite> {
+pub fn update_site(
+    id: &str,
+    req: &super::models::DeploymentSiteUpdateRequest,
+) -> Result<DeploymentSite> {
     let mut site = get_site(id)?.ok_or_else(|| anyhow!("未找到站点"))?;
     let original_record_id = site.id.clone().unwrap_or_else(|| site.site_id.clone());
     let mut backend_url_changed = false;
@@ -779,7 +827,11 @@ pub fn delete_site(id: &str) -> Result<bool> {
     Ok(changed > 0)
 }
 
-pub fn update_health(site_id: &str, status: DeploymentSiteStatus, timestamp: &str) -> Result<DeploymentSite> {
+pub fn update_health(
+    site_id: &str,
+    status: DeploymentSiteStatus,
+    timestamp: &str,
+) -> Result<DeploymentSite> {
     let conn = open_registry()?;
     conn.execute(
         "UPDATE deployment_sites SET status = ?1, last_health_check = ?2, updated_at = ?2 WHERE id = ?3 OR site_id = ?3",
@@ -812,7 +864,10 @@ pub fn upsert_runtime_site(runtime: &WebServerRuntimeConfig) -> Result<Deploymen
     } else {
         Some(config.project_code)
     };
-    let health_url = Some(format!("{}/api/health", runtime.backend_url.trim_end_matches('/')));
+    let health_url = Some(format!(
+        "{}/api/health",
+        runtime.backend_url.trim_end_matches('/')
+    ));
 
     let mut site = get_site(&runtime.site_id)?.unwrap_or(DeploymentSite {
         id: Some(runtime.site_id.clone()),
@@ -872,7 +927,10 @@ pub fn upsert_runtime_site(runtime: &WebServerRuntimeConfig) -> Result<Deploymen
     site.url = Some(runtime.backend_url.clone());
     site.bind_host = runtime.bind_host.clone();
     site.bind_port = Some(runtime.bind_port);
-    site.health_url = Some(format!("{}/api/health", runtime.backend_url.trim_end_matches('/')));
+    site.health_url = Some(format!(
+        "{}/api/health",
+        runtime.backend_url.trim_end_matches('/')
+    ));
     site.last_seen_at = Some(now_rfc3339());
     site.config = config;
     site.e3d_projects = derive_e3d_projects(&site);
@@ -970,7 +1028,13 @@ pub fn load_web_server_runtime_config(explicit_port: u16) -> WebServerRuntimeCon
             db_option
                 .project_name
                 .chars()
-                .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '-' })
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() {
+                        ch.to_ascii_lowercase()
+                    } else {
+                        '-'
+                    }
+                })
                 .collect::<String>()
                 .trim_matches('-')
                 .to_string()

@@ -22,22 +22,23 @@ Do **not** use this skill for generic panel-hot-path or concurrency-only refacto
 ## Work Procedure
 
 1. Read the assigned feature, mission `AGENTS.md`, `validation-contract.md`, and all `fulfills` assertions before editing.
-2. Write down the semantic mapping you must preserve from the legacy detail path:
+2. Before using exact-text search, use `ace-tool` first for the initial codebase retrieval pass. Treat `grep`/`rg` only as secondary confirmation tools after `ace-tool`, unless the identifier is already known or the task explicitly requires exhaustive literal matching.
+3. Write down the semantic mapping you must preserve from the legacy detail path:
    - normal instances
    - bool results
    - TUBI
-3. Add the smallest parity-first regression proof before implementation when practical.
-4. Implement the schema/write/read/fallback change in small slices:
+4. Add the smallest parity-first regression proof before implementation when practical.
+5. Implement the schema/write/read/fallback change in small slices:
    - schema or record model first
    - write path second
    - read path third
    - fallback / logging last
-5. Keep fallback explicit and observable; never silently downgrade to partial semantics.
-6. Run the required validators for every slice:
+6. Keep fallback explicit and observable; never silently downgrade to partial semantics.
+7. Run the required validators for every slice:
    - `cargo check --release --bin aios-database`
    - the narrowest CLI or compare validation that exercises the changed path
-7. Gather parity evidence, not just compile evidence.
-8. Record coverage statistics, fallback behavior, and any semantic uncertainty in the handoff.
+8. Gather parity evidence, not just compile evidence.
+9. Record coverage statistics, fallback behavior, and any semantic uncertainty in the handoff.
 
 ## Example Handoff
 

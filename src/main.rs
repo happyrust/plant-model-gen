@@ -2010,7 +2010,10 @@ async fn main() -> anyhow::Result<()> {
         println!("🎯 导出 delivery-code 兼容的 V2 JSON");
         println!("   - dbnum={}", dbnum);
         if let Some(ref root) = root_refno {
-            println!("   - root_refno={}（仅子树，输出 instances_web_root_*.json）", root);
+            println!(
+                "   - root_refno={}（仅子树，输出 instances_web_root_*.json）",
+                root
+            );
         }
 
         return export_dbnum_instances_web_mode(

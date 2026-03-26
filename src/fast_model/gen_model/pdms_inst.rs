@@ -16,7 +16,9 @@ use futures::stream::FuturesUnordered;
 use itertools::Itertools;
 use rkyv::vec;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
@@ -32,6 +34,89 @@ use crate::fast_model::shared::aabb_apply_transform;
 #[inline]
 fn is_refno_assoc_index_enabled() -> bool {
     true
+}
+
+const MAX_FAILED_SQL_DUMPS_PER_RUN: usize = 20;
+static FAILED_SQL_DUMP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn infer_failed_sql_stage(query: &str) -> &'static str {
+    if query.contains("INSERT IGNORE INTO inst_relate_aabb") {
+        "inst_relate_aabb"
+    } else if query.contains("INSERT RELATION INTO inst_relate [") {
+        "inst_relate"
+    } else if query.contains("INSERT RELATION INTO geo_relate [") {
+        "geo_relate"
+    } else if query.contains("INSERT IGNORE INTO inst_geo") {
+        "inst_geo"
+    } else if query.contains("INSERT IGNORE INTO inst_info") {
+        "inst_info"
+    } else if query.contains("INSERT IGNORE INTO aabb") {
+        "aabb"
+    } else if query.contains("INSERT IGNORE INTO trans") {
+        "trans"
+    } else if query.contains("INSERT IGNORE INTO vec3") {
+        "vec3"
+    } else if query.contains("INSERT INTO tubi_info") {
+        "tubi_info"
+    } else if query.contains("INSERT RELATION INTO neg_relate [") {
+        "neg_relate"
+    } else {
+        "transaction_batch"
+    }
+}
+
+fn failed_sql_dump_dir() -> PathBuf {
+    let db_option = get_db_option();
+    let project_name = db_option.project_name.trim();
+    let base = if project_name.is_empty() {
+        PathBuf::from("output").join("_unknown_project")
+    } else {
+        PathBuf::from("output").join(project_name)
+    };
+    base.join("diagnostics").join("failed_sql")
+}
+
+fn dump_failed_sql_batch(
+    query: &str,
+    err_msg: &str,
+    attempt: usize,
+    max_retries: usize,
+) -> std::io::Result<Option<PathBuf>> {
+    let dump_idx = FAILED_SQL_DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+    if dump_idx >= MAX_FAILED_SQL_DUMPS_PER_RUN {
+        return Ok(None);
+    }
+
+    let stage = infer_failed_sql_stage(query);
+    let now = chrono::Local::now();
+    let epoch_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dump_dir = failed_sql_dump_dir();
+    std::fs::create_dir_all(&dump_dir)?;
+
+    let file_path = dump_dir.join(format!(
+        "{}_{}_pid{}_{}.surql",
+        now.format("%Y%m%d_%H%M%S"),
+        stage,
+        std::process::id(),
+        epoch_nanos
+    ));
+
+    let payload = format!(
+        "-- generated_at: {}\n-- stage: {}\n-- retries: {}/{}\n-- error: {}\n-- dump_index: {}/{}\n\n{}\n",
+        now.to_rfc3339(),
+        stage,
+        attempt,
+        max_retries,
+        err_msg.replace('\n', " | "),
+        dump_idx + 1,
+        MAX_FAILED_SQL_DUMPS_PER_RUN,
+        query
+    );
+    std::fs::write(&file_path, payload)?;
+    Ok(Some(file_path))
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1109,7 +1194,7 @@ FROM neg_relate WHERE out = {} AND pe = {}",
     let mut inst_relate_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
     let mut inst_relate_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
     let mut inst_relate_aabb_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
-    let mut inst_relate_aabb_ins: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+    let mut inst_relate_aabb_ids: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
     let mut inst_relate_aabb_chunks: Vec<(Vec<String>, Vec<String>)> = Vec::new();
 
     for (key, info) in &inst_mgr.inst_info_map {
@@ -1180,7 +1265,7 @@ FROM neg_relate WHERE out = {} AND pe = {}",
                 batch.add_inst_relate_aabb_id(*key, key.to_table_key("inst_relate_aabb"));
             }
             inst_relate_aabb_buffer.push(aabb_row_sql);
-            inst_relate_aabb_ins.push(key.to_pe_key());
+            inst_relate_aabb_ids.push(key.to_table_key("inst_relate_aabb"));
         }
 
         // inst_relate 不再保存 world_trans；世界变换统一从 pe_transform 获取。
@@ -1210,7 +1295,7 @@ FROM neg_relate WHERE out = {} AND pe = {}",
             if !inst_relate_aabb_buffer.is_empty() {
                 inst_relate_aabb_chunks.push((
                     std::mem::take(&mut inst_relate_aabb_buffer),
-                    std::mem::take(&mut inst_relate_aabb_ins),
+                    std::mem::take(&mut inst_relate_aabb_ids),
                 ));
             }
         }
@@ -1316,15 +1401,17 @@ FROM neg_relate WHERE out = {} AND pe = {}",
         // 统一把积累的 chunks + 剩余 buffer 一次性落库
         let mut total = 0usize;
         macro_rules! flush_pairs {
-            ($rows:expr, $ins:expr) => {{
-                let n = ($ins).len().min(($rows).len());
+            ($rows:expr, $ids:expr) => {{
+                let n = ($ids).len().min(($rows).len());
                 if n > 0 {
                     for idx in (0..n).step_by(CHUNK_SIZE) {
                         let end = (idx + CHUNK_SIZE).min(n);
+                        let delete_stmt = format!("DELETE [{}];", ($ids)[idx..end].join(","));
                         let insert_stmt = format!(
-                            "INSERT IGNORE INTO inst_relate_aabb [{}];",
+                            "INSERT INTO inst_relate_aabb [{}];",
                             ($rows)[idx..end].join(",")
                         );
+                        inst_aabb_batcher.push(delete_stmt).await?;
                         inst_aabb_batcher.push(insert_stmt).await?;
                     }
                     total += n;
@@ -1336,7 +1423,7 @@ FROM neg_relate WHERE out = {} AND pe = {}",
         for (rows, ins) in &inst_relate_aabb_chunks {
             flush_pairs!(rows, ins)?;
         }
-        flush_pairs!(&inst_relate_aabb_buffer, &inst_relate_aabb_ins)?;
+        flush_pairs!(&inst_relate_aabb_buffer, &inst_relate_aabb_ids)?;
 
         debug_model_debug!(
             "save_instance_data_optimize flushing inst_relate_aabb after aabb insert: {}",
@@ -1467,9 +1554,10 @@ pub fn build_inst_relate_aabb_rows(
     inst_mgr: &ShapeInstancesData,
     mesh_results: &HashMap<u64, MeshResult>,
     mesh_aabb_map: &DashMap<String, Aabb>,
-) -> anyhow::Result<(HashMap<u64, String>, Vec<String>)> {
+) -> anyhow::Result<(HashMap<u64, String>, Vec<String>, Vec<String>)> {
     let mut aabb_map: HashMap<u64, String> = HashMap::new();
     let mut inst_relate_aabb_rows: Vec<String> = Vec::new();
+    let mut inst_relate_aabb_ids: Vec<String> = Vec::new();
 
     for (key, info) in &inst_mgr.inst_info_map {
         let resolved_aabb: Option<(u64, Aabb)> = if let Some(aabb) = info.aabb {
@@ -1504,19 +1592,27 @@ pub fn build_inst_relate_aabb_rows(
                 key.to_pe_key(),
                 aabb_hash
             ));
+            inst_relate_aabb_ids.push(key.to_table_key("inst_relate_aabb"));
         }
     }
 
-    Ok((aabb_map, inst_relate_aabb_rows))
+    Ok((aabb_map, inst_relate_aabb_rows, inst_relate_aabb_ids))
 }
 
 pub async fn save_inst_relate_aabb_rows(
     aabb_map: &HashMap<u64, String>,
     inst_relate_aabb_rows: &[String],
+    inst_relate_aabb_ids: &[String],
 ) -> anyhow::Result<()> {
     if aabb_map.is_empty() && inst_relate_aabb_rows.is_empty() {
         return Ok(());
     }
+    anyhow::ensure!(
+        inst_relate_aabb_rows.len() == inst_relate_aabb_ids.len(),
+        "inst_relate_aabb rows/ids 数量不一致: rows={}, ids={}",
+        inst_relate_aabb_rows.len(),
+        inst_relate_aabb_ids.len()
+    );
 
     const CHUNK_SIZE: usize = 100;
     const MAX_TX_STATEMENTS: usize = 5;
@@ -1545,9 +1641,14 @@ pub async fn save_inst_relate_aabb_rows(
 
     if !inst_relate_aabb_rows.is_empty() {
         let mut inst_aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
-        for chunk in inst_relate_aabb_rows.chunks(CHUNK_SIZE) {
-            let statement = format!("INSERT IGNORE INTO inst_relate_aabb [{}];", chunk.join(","));
-            inst_aabb_batcher.push(statement).await?;
+        for (rows, ids) in inst_relate_aabb_rows
+            .chunks(CHUNK_SIZE)
+            .zip(inst_relate_aabb_ids.chunks(CHUNK_SIZE))
+        {
+            let delete_stmt = format!("DELETE [{}];", ids.join(","));
+            let insert_stmt = format!("INSERT INTO inst_relate_aabb [{}];", rows.join(","));
+            inst_aabb_batcher.push(delete_stmt).await?;
+            inst_aabb_batcher.push(insert_stmt).await?;
         }
         inst_aabb_batcher.finish().await?;
     }
@@ -1703,11 +1804,22 @@ DEFINE INDEX unique_neg_relate ON TABLE neg_relate COLUMNS in, out UNIQUE;";
                             e,
                             debug_query
                         );
-                        let file_name = format!("failed_sql_batch_{}.log", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-                        if let Err(write_err) = std::fs::write(&file_name, &debug_query) {
-                            eprintln!("写入失败 SQL 诊断日志至 {} 时出错: {}", file_name, write_err);
-                        } else {
-                            eprintln!("❌ 写入失败超出重试限制，导致失败的 SQL 块已转储至 {}", file_name);
+                        match dump_failed_sql_batch(&debug_query, &es, attempt, max_retries) {
+                            Ok(Some(file_path)) => {
+                                eprintln!(
+                                    "❌ 写入失败超出重试限制，导致失败的 SQL 块已转储至 {}",
+                                    file_path.display()
+                                );
+                            }
+                            Ok(None) => {
+                                eprintln!(
+                                    "❌ 写入失败超出重试限制，但 failed_sql 转储已达到单次运行上限({})，后续仅保留错误输出",
+                                    MAX_FAILED_SQL_DUMPS_PER_RUN
+                                );
+                            }
+                            Err(write_err) => {
+                                eprintln!("写入失败 SQL 诊断文件时出错: {}", write_err);
+                            }
                         }
 
                         return Err(e);
@@ -2677,6 +2789,7 @@ pub async fn save_instance_data_to_sql_file(
     let mut inst_info_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
     let mut inst_relate_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
     let mut inst_relate_aabb_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+    let mut inst_relate_aabb_ids: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
 
     for (key, info) in &inst_mgr.inst_info_map {
         if let Some(batch) = refno_assoc_batch.as_mut() {
@@ -2736,6 +2849,7 @@ pub async fn save_instance_data_to_sql_file(
                 key.to_pe_key(),
                 aabb_hash
             ));
+            inst_relate_aabb_ids.push(key.to_table_key("inst_relate_aabb"));
             if let Some(batch) = refno_assoc_batch.as_mut() {
                 batch.add_inst_relate_aabb_id(*key, key.to_table_key("inst_relate_aabb"));
             }
@@ -2818,12 +2932,14 @@ pub async fn save_instance_data_to_sql_file(
 
     // inst_relate_aabb
     if !inst_relate_aabb_buffer.is_empty() {
-        // 用户要求不做删除：改为仅写入 INSERT IGNORE，
-        // 由唯一键/幂等语义保证重复导入可安全跳过。
-        for chunk in inst_relate_aabb_buffer.chunks(CHUNK_SIZE) {
+        for (rows, ids) in inst_relate_aabb_buffer
+            .chunks(CHUNK_SIZE)
+            .zip(inst_relate_aabb_ids.chunks(CHUNK_SIZE))
+        {
+            writer.write_statement(&format!("DELETE [{}]", ids.join(",")))?;
             writer.write_statement(&format!(
-                "INSERT IGNORE INTO inst_relate_aabb [{}]",
-                chunk.join(",")
+                "INSERT INTO inst_relate_aabb [{}]",
+                rows.join(",")
             ))?;
         }
     }

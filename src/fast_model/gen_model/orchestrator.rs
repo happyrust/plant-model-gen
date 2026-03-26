@@ -110,8 +110,7 @@ pub(crate) fn split_shape_instances_by_dbnum(
             &mut cache,
             &mut missing_by_source,
             &mut missing_refnos,
-        )
-        else {
+        ) else {
             continue;
         };
         out.entry(dbnum)
@@ -129,8 +128,7 @@ pub(crate) fn split_shape_instances_by_dbnum(
             &mut cache,
             &mut missing_by_source,
             &mut missing_refnos,
-        )
-        else {
+        ) else {
             continue;
         };
         out.entry(dbnum)
@@ -149,8 +147,7 @@ pub(crate) fn split_shape_instances_by_dbnum(
             &mut cache,
             &mut missing_by_source,
             &mut missing_refnos,
-        )
-        else {
+        ) else {
             continue;
         };
         out.entry(dbnum)
@@ -167,8 +164,7 @@ pub(crate) fn split_shape_instances_by_dbnum(
             &mut cache,
             &mut missing_by_source,
             &mut missing_refnos,
-        )
-        else {
+        ) else {
             continue;
         };
         out.entry(dbnum)
@@ -183,8 +179,7 @@ pub(crate) fn split_shape_instances_by_dbnum(
             &mut cache,
             &mut missing_by_source,
             &mut missing_refnos,
-        )
-        else {
+        ) else {
             continue;
         };
         out.entry(dbnum)
@@ -662,9 +657,18 @@ async fn run_inst_aabb_writer(
                                         batch.batch_id
                                     );
                                 } else {
-                                    let (aabb_rows_map, inst_relate_aabb_rows) =
+                                    let (
+                                        aabb_rows_map,
+                                        inst_relate_aabb_rows,
+                                        inst_relate_aabb_ids,
+                                    ) =
                                         build_inst_relate_aabb_rows(&batch.shape_insts, &batch.mesh_results, &mesh_aabb_map)?;
-                                    save_inst_relate_aabb_rows(&aabb_rows_map, &inst_relate_aabb_rows).await?;
+                                    save_inst_relate_aabb_rows(
+                                        &aabb_rows_map,
+                                        &inst_relate_aabb_rows,
+                                        &inst_relate_aabb_ids,
+                                    )
+                                    .await?;
                                 }
                                 let inst_aabb_ms = inst_aabb_start.elapsed().as_millis();
                                 drop(aabb_permit);
@@ -733,9 +737,18 @@ async fn run_inst_aabb_writer(
                                         batch.batch_id
                                     );
                                 } else {
-                                    let (aabb_rows_map, inst_relate_aabb_rows) =
+                                    let (
+                                        aabb_rows_map,
+                                        inst_relate_aabb_rows,
+                                        inst_relate_aabb_ids,
+                                    ) =
                                         build_inst_relate_aabb_rows(&batch.shape_insts, &batch.mesh_results, &mesh_aabb_map)?;
-                                    save_inst_relate_aabb_rows(&aabb_rows_map, &inst_relate_aabb_rows).await?;
+                                    save_inst_relate_aabb_rows(
+                                        &aabb_rows_map,
+                                        &inst_relate_aabb_rows,
+                                        &inst_relate_aabb_ids,
+                                    )
+                                    .await?;
                                 }
                                 let inst_aabb_ms = inst_aabb_start.elapsed().as_millis();
                                 drop(aabb_permit);
@@ -1587,56 +1600,61 @@ async fn process_index_tree_generation(
     // 保存性能报告为 JSON 和 CSV（可通过 AIOS_DISABLE_PERF_REPORT=1 禁用）
     let perf_report_disabled = std::env::var("AIOS_DISABLE_PERF_REPORT")
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false);
 
     if !perf_report_disabled {
-    let project_name = if !db_option.inner.project_name.is_empty() {
-        db_option.inner.project_name.clone()
-    } else {
-        "default".to_string()
-    };
-    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let profile_dir = std::path::PathBuf::from("output")
-        .join(&project_name)
-        .join("profile");
+        let project_name = if !db_option.inner.project_name.is_empty() {
+            db_option.inner.project_name.clone()
+        } else {
+            "default".to_string()
+        };
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let profile_dir = std::path::PathBuf::from("output")
+            .join(&project_name)
+            .join("profile");
 
-    // 收集配置元数据
-    let dbnum_tag = db_option
-        .inner
-        .manual_db_nums
-        .as_ref()
-        .and_then(|nums| nums.first().copied())
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "all".to_string());
-    let enabled_nouns = db_option.index_tree_enabled_target_types.clone();
-    let metadata = serde_json::json!({
-        "mode": "index_tree",
-        "project_name": project_name,
-        "dbnum": dbnum_tag,
-        "enabled_nouns": enabled_nouns,
-        "use_surrealdb": db_option.use_surrealdb,
-        "model_cache_write": true,
-        "apply_boolean": db_option.inner.apply_boolean_operation,
-        "gen_mesh": db_option.inner.gen_mesh,
-        "concurrency": db_option.get_index_tree_concurrency(),
-        "batch_size": db_option.get_index_tree_batch_size(),
-    });
-    let json_path = profile_dir.join(format!(
-        "perf_gen_model_index_tree_dbnum_{}_{}.json",
-        dbnum_tag, timestamp
-    ));
-    let csv_path = profile_dir.join(format!(
-        "perf_gen_model_index_tree_dbnum_{}_{}.csv",
-        dbnum_tag, timestamp
-    ));
-    if let Err(e) = perf.save_json(&json_path, metadata.clone()) {
-        eprintln!("[perf] 保存 JSON 报告失败: {}", e);
-    }
+        // 收集配置元数据
+        let dbnum_tag = db_option
+            .inner
+            .manual_db_nums
+            .as_ref()
+            .and_then(|nums| nums.first().copied())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "all".to_string());
+        let enabled_nouns = db_option.index_tree_enabled_target_types.clone();
+        let metadata = serde_json::json!({
+            "mode": "index_tree",
+            "project_name": project_name,
+            "dbnum": dbnum_tag,
+            "enabled_nouns": enabled_nouns,
+            "use_surrealdb": db_option.use_surrealdb,
+            "model_cache_write": true,
+            "apply_boolean": db_option.inner.apply_boolean_operation,
+            "gen_mesh": db_option.inner.gen_mesh,
+            "concurrency": db_option.get_index_tree_concurrency(),
+            "batch_size": db_option.get_index_tree_batch_size(),
+        });
+        let json_path = profile_dir.join(format!(
+            "perf_gen_model_index_tree_dbnum_{}_{}.json",
+            dbnum_tag, timestamp
+        ));
+        let csv_path = profile_dir.join(format!(
+            "perf_gen_model_index_tree_dbnum_{}_{}.csv",
+            dbnum_tag, timestamp
+        ));
+        if let Err(e) = perf.save_json(&json_path, metadata.clone()) {
+            eprintln!("[perf] 保存 JSON 报告失败: {}", e);
+        }
 
-    if let Err(e) = perf.save_csv(&csv_path, metadata) {
-        eprintln!("[perf] 保存 CSV 报告失败: {}", e);
-    }
+        if let Err(e) = perf.save_csv(&csv_path, metadata) {
+            eprintln!("[perf] 保存 CSV 报告失败: {}", e);
+        }
     }
 
     Ok(GenModelResult { success: true })

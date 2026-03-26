@@ -18,23 +18,24 @@ Use this skill for features that modify the Vue 3 frontend (plant3d-web):
 ## Work Procedure
 
 1. **Read feature requirements** from features.json
-2. **Implement changes**:
+2. Before using exact-text search, use `ace-tool` first for the initial codebase retrieval pass. Treat `grep`/`rg` only as secondary confirmation tools after `ace-tool`, unless the identifier is already known or the task explicitly requires exhaustive literal matching.
+3. **Implement changes**:
    - Modify Vue components in src/components/task/
    - Update composables in src/composables/
    - Follow existing patterns (Vuetify components, Composition API)
    - Keep changes minimal and focused
-3. **Run type check**:
+4. **Run type check**:
    - `npm run type-check` - must pass with no errors
-4. **Manual verification with agent-browser or browser**:
+5. **Manual verification with agent-browser or browser**:
    - Start dev server if not running: `npm run dev`
    - Navigate to http://localhost:3101
    - Test all UI interactions described in feature
    - Verify network requests in DevTools
    - Take screenshots of key states
-5. **Build verification**:
+6. **Build verification**:
    - `npm run build-only` - must succeed
-6. **Commit changes** with clear message
-7. **Fill handoff** with all verification details including screenshots
+7. **Commit changes** with clear message
+8. **Fill handoff** with all verification details including screenshots
 
 ## Example Handoff
 

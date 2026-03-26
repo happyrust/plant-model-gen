@@ -347,7 +347,9 @@ pub async fn gen_cata_geos_for_cache(
                 if respect_tufl && !g.shape_visible {
                     continue;
                 }
-                let visible = g.geo_type == GeoBasicType::Pos;
+                // tube_flag=false / shape_visible=false 的 CATE 几何通常是占位/包络体，
+                // 默认不应作为可见实体导出；只有显式包络场景才应单独启用。
+                let visible = g.geo_type == GeoBasicType::Pos && g.shape_visible;
                 geo_insts.push(EleInstGeo {
                     geo_hash: g.geo_hash,
                     refno: g.geom_refno,

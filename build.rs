@@ -11,7 +11,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let build_date = chrono::Utc::now()
-        .format("%Y-%m-%d %H:%M:%S UTC")
+        .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+        .format("%Y-%m-%d %H:%M:%S UTC+8")
         .to_string();
     println!("cargo:rustc-env=BUILD_DATE={}", build_date);
 

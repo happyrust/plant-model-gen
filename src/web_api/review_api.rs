@@ -2067,6 +2067,15 @@ fn build_mock_review_users() -> Vec<User> {
             avatar: None,
         },
         User {
+            id: "PZ".to_string(),
+            username: "PZ".to_string(),
+            name: "PZ批准人".to_string(),
+            email: "pz@company.com".to_string(),
+            role: "manager".to_string(),
+            department: Some("工程部".to_string()),
+            avatar: None,
+        },
+        User {
             id: "admin_001".to_string(),
             username: "admin".to_string(),
             name: "系统管理员".to_string(),
@@ -3812,6 +3821,7 @@ mod tests {
         assert!(ids.contains(&"proofreader_001"));
         assert!(ids.contains(&"reviewer_001"));
         assert!(ids.contains(&"manager_001"));
+        assert!(ids.contains(&"PZ"));
         assert!(ids.contains(&"admin_001"));
     }
 
@@ -3827,11 +3837,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(reviewers.len(), 4);
+        assert_eq!(reviewers.len(), 5);
         assert!(reviewers.iter().all(|user| user.id != "designer_001"));
         assert!(reviewers.iter().any(|user| user.id == "proofreader_001"));
         assert!(reviewers.iter().any(|user| user.id == "reviewer_001"));
         assert!(reviewers.iter().any(|user| user.id == "manager_001"));
+        assert!(reviewers.iter().any(|user| user.id == "PZ"));
         assert!(reviewers.iter().any(|user| user.id == "admin_001"));
     }
 
@@ -3897,12 +3908,52 @@ mod tests {
             .map(|user| user.id.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(payload.users.len(), 4);
+        assert_eq!(payload.users.len(), 5);
         assert!(!ids.contains(&"designer_001"));
         assert!(ids.contains(&"proofreader_001"));
         assert!(ids.contains(&"reviewer_001"));
         assert!(ids.contains(&"manager_001"));
+        assert!(ids.contains(&"PZ"));
         assert!(ids.contains(&"admin_001"));
+    }
+
+    #[tokio::test]
+    async fn test_get_current_user_maps_pz_claim_to_explicit_pz_user() {
+        let app = Router::new().route("/api/users/me", get(get_current_user));
+        let claims = TokenClaims {
+            project_id: "project-123".to_string(),
+            user_id: "PZ".to_string(),
+            user_name: "PZ批准人".to_string(),
+            form_id: "FORM-123".to_string(),
+            role: Some("pz".to_string()),
+            exp: 4_102_444_800,
+            iat: 1_704_067_200,
+        };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/users/me")
+                    .extension(claims)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: UserResponse = serde_json::from_slice(&body).unwrap();
+        let user = payload.user.expect("expected current user payload");
+
+        assert_eq!(user.id, "PZ");
+        assert_eq!(user.username, "PZ");
+        assert_eq!(user.name, "PZ批准人");
+        assert_eq!(user.role, "manager");
+        assert_eq!(user.email, "pz@company.com");
     }
 
     #[tokio::test]

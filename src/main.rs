@@ -1003,9 +1003,23 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // CLI 覆盖：模型生成的 dbnum / noun 类型（无需修改 DbOption.toml）
+    // 注意：refno 的第一段是 ref0，不是 dbnum。若当前是 refno 定向生成/导出，
+    // 则不要把 --dbnum 直接写进 manual_db_nums，真实 dbnum 应从 refno->dbnum 映射推导。
+    let has_refno_scoped_generation = matches.contains_id("debug-model")
+        || matches.contains_id("root-model")
+        || matches.get_many::<String>("export-obj-refnos").is_some()
+        || matches.get_many::<String>("export-glb-refnos").is_some()
+        || matches.get_many::<String>("export-gltf-refnos").is_some();
     if let Some(dbnum) = matches.get_one::<u32>("dbnum").copied() {
-        db_option_ext.inner.manual_db_nums = Some(vec![dbnum]);
-        println!("🔧 CLI 覆盖 manual_db_nums -> [{}]", dbnum);
+        if has_refno_scoped_generation {
+            println!(
+                "ℹ️ 检测到 refno 定向生成/导出，暂不将 --dbnum={} 写入 manual_db_nums；后续将按 refno 映射真实 dbnum",
+                dbnum
+            );
+        } else {
+            db_option_ext.inner.manual_db_nums = Some(vec![dbnum]);
+            println!("🔧 CLI 覆盖 manual_db_nums -> [{}]", dbnum);
+        }
     }
     if let Some(nouns) = matches.get_many::<String>("gen-nouns") {
         let v: Vec<String> = nouns.map(|s| s.to_uppercase()).collect();

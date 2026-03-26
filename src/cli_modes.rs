@@ -342,6 +342,29 @@ fn normalize_refno_inputs(refnos: &[String]) -> Result<Vec<RefnoEnum>> {
     Ok(parsed)
 }
 
+fn derive_dbnums_from_refnos(refnos: &[RefnoEnum]) -> Vec<u32> {
+    use aios_database::data_interface::db_meta_manager::db_meta;
+
+    let _ = db_meta().ensure_loaded();
+    let mut dbnums: Vec<u32> = refnos
+        .iter()
+        .filter_map(|refno| {
+            let dbnum = db_meta().get_dbnum_by_refno(*refno);
+            if dbnum.is_none() {
+                println!(
+                    "⚠️  无法从 db_meta_info.json 解析 refno 对应 dbnum，跳过该 refno: {}",
+                    refno
+                );
+            }
+            dbnum
+        })
+        .filter(|&dbnum| dbnum > 0)
+        .collect();
+    dbnums.sort_unstable();
+    dbnums.dedup();
+    dbnums
+}
+
 /// 关闭占用指定端口的进程（避免 file 模式下 RocksDB 排他锁冲突）。
 ///
 /// - macOS/Linux: 通过 `lsof` 查找占用端口的 PID，再用 `kill -9` 强制终止。
@@ -1599,7 +1622,13 @@ pub async fn run_generate_model(
 
     use aios_database::fast_model::gen_all_geos_data;
     let target_refnos = collect_regen_target_refnos(config).await?;
-    let gen_result = gen_all_geos_data(target_refnos, db_option_ext, None, None).await?;
+    let mut db_option_override = db_option_ext.clone();
+    let derived_dbnums = derive_dbnums_from_refnos(&target_refnos);
+    if !derived_dbnums.is_empty() {
+        println!("   - 从目标 refnos 推导 manual_db_nums: {:?}", derived_dbnums);
+        db_option_override.inner.manual_db_nums = Some(derived_dbnums);
+    }
+    let gen_result = gen_all_geos_data(target_refnos, &db_option_override, None, None).await?;
     println!("✅ 模型增量生成完成");
     Ok(gen_result)
 }
@@ -1638,18 +1667,10 @@ pub async fn run_regen_model(
     .await?;
 
     // 4.1 从目标 refnos 推导 dbnum，覆盖配置文件中的 manual_db_nums
-    if !target_refnos.is_empty() && config.dbnum.is_none() {
-        use aios_database::data_interface::db_meta_manager::db_meta;
-        let _ = db_meta().ensure_loaded();
-        let mut derived_dbnums: Vec<u32> = target_refnos
-            .iter()
-            .filter_map(|r| db_meta().get_dbnum_by_refno(*r))
-            .filter(|&d| d > 0)
-            .collect();
-        derived_dbnums.sort_unstable();
-        derived_dbnums.dedup();
+    if !target_refnos.is_empty() {
+        let derived_dbnums = derive_dbnums_from_refnos(&target_refnos);
         if !derived_dbnums.is_empty() {
-            println!("   - 从 refnos 推导 manual_db_nums: {:?}", derived_dbnums);
+            println!("   - 从目标 refnos 推导 manual_db_nums: {:?}", derived_dbnums);
             db_option_override.inner.manual_db_nums = Some(derived_dbnums);
         }
     }
@@ -1659,11 +1680,19 @@ pub async fn run_regen_model(
 }
 
 /// 根据 ExportConfig 确定需要 regen 的目标 refno 集合。
+/// - 有 refnos → 展开子孙节点（优先级高于 dbnum，避免 ref0 风格数字被误当成 dbnum）
 /// - 有 dbnum → 查询该 dbnum 下所有 SITE
-/// - 有 refnos → 展开子孙节点
 /// - 都没有（全库模式）→ 查询所有 dbnum 的 SITE
 async fn collect_regen_target_refnos(config: &ExportConfig) -> Result<Vec<RefnoEnum>> {
-    if let Some(dbnum) = config.dbnum {
+    if !config.refnos_str.is_empty() {
+        // 按 refnos → 展开子孙
+        let refnos = config.parse_refnos()?;
+        let expanded =
+            collect_export_refnos(&refnos, config.include_descendants, None, config.verbose)
+                .await?;
+        println!("   - regen 目标: {} 个 refno", expanded.len());
+        Ok(expanded)
+    } else if let Some(dbnum) = config.dbnum {
         // 按 dbnum → 查询所有 SITE
         use aios_database::fast_model::query_provider;
         let sites: Vec<RefnoEnum> =
@@ -1677,14 +1706,6 @@ async fn collect_regen_target_refnos(config: &ExportConfig) -> Result<Vec<RefnoE
             sites.len()
         );
         Ok(sites)
-    } else if !config.refnos_str.is_empty() {
-        // 按 refnos → 展开子孙
-        let refnos = config.parse_refnos()?;
-        let expanded =
-            collect_export_refnos(&refnos, config.include_descendants, None, config.verbose)
-                .await?;
-        println!("   - regen 目标: {} 个 refno", expanded.len());
-        Ok(expanded)
     } else if config.run_all_dbnos {
         // 全库模式 → 查询所有 dbnum 的 SITE
         use aios_database::fast_model::query_provider;

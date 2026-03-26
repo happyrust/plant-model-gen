@@ -211,19 +211,20 @@ function navigateTo(path: string) {
       <section v-for="group in mobileGroups" :key="`${group.group}-mobile`" class="shell-mobile-group">
         <p :id="group.mobileHeadingId" class="shell-mobile-group-title">{{ group.group }}</p>
         <div class="shell-mobile-grid" :aria-labelledby="group.mobileHeadingId">
-          <button
+          <a
             v-for="item in group.items"
             :key="`${item.path}-mobile`"
-            type="button"
             class="shell-mobile-item"
             :class="{ active: route.path === item.path || route.path.startsWith(`${item.path}/`) }"
+            :title="item.ariaLabel"
             :aria-label="item.ariaLabel"
             :data-nav-item="`${item.itemId}-mobile`"
-            @click="navigateTo(item.path)"
+            :href="`/console${item.path}`"
+            @click.prevent="navigateTo(item.path)"
           >
             <component :is="item.icon" class="shell-nav-icon" aria-hidden="true" />
             <span>{{ item.label }}</span>
-          </button>
+          </a>
         </div>
       </section>
     </nav>

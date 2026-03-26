@@ -846,6 +846,12 @@ pub async fn export_obj_for_refnos(
         &effective_mesh_dir,
         common_config.verbose,
     )?;
+    maybe_capture_obj_preview(
+        &export_data,
+        output_path,
+        &common_config.unit_converter,
+        &effective_mesh_dir,
+    )?;
 
     println!("✅ 导出完成: {}", output_path);
     if let Ok(metadata) = std::fs::metadata(output_path) {

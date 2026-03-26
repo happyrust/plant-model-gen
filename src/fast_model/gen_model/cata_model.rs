@@ -2094,9 +2094,11 @@ async fn gen_cata_geos_inner(
 
                                     geo_param: g.geo_param.clone(),
 
-                                    visible: geo_type == GeoBasicType::Pos
+                                    visible: (geo_type == GeoBasicType::Pos
 
-                                        || geo_type == GeoBasicType::Compound,
+                                        || geo_type == GeoBasicType::Compound)
+
+                                        && g.shape_visible,
 
                                     is_tubi: g.is_tubi,
 
@@ -3591,9 +3593,11 @@ async fn gen_cata_geos_inner(
 
                                 geo_param,
 
-                                visible: geo_type == GeoBasicType::Pos
+                                visible: (geo_type == GeoBasicType::Pos
 
-                                    || geo_type == GeoBasicType::Compound,
+                                    || geo_type == GeoBasicType::Compound)
+
+                                    && visible,
 
                                 is_tubi,
 

@@ -144,7 +144,9 @@ struct CaptureTriangle {
 
 fn base_capture_view_transforms(extra_views: usize) -> Vec<(Option<String>, DMat4)> {
     let presets = [
-        (60.0f64, -12.0f64, 28.0f64),
+        // 默认首图优先给“验收视角”：让常见阀门/执行器构件更接近正视图，
+        // 避免被斜俯视检查角度误导为“模型方向不对”。
+        (36.0f64, -10.0f64, 180.0f64),
         (60.0, 18.0, 28.0),
         (60.0, -40.0, 28.0),
         (36.0, -10.0, 0.0),

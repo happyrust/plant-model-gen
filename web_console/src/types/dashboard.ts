@@ -13,6 +13,8 @@ export interface MetricCard {
   label: string;
   value: string;
   hint: string;
+  tone?: 'primary' | 'success' | 'warning' | 'danger';
+  trend?: string;
 }
 
 export interface DashboardActivityItem {
@@ -25,4 +27,11 @@ export interface DashboardActivityItem {
   targetName: string;
   actionDesc: string;
   createdAt: string;
+}
+
+export interface DashboardTaskOverview {
+  activeCount: number;
+  queuedCount: number;
+  healthLabel: string;
+  healthDetail: string;
 }

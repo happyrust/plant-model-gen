@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { onMounted } from 'vue';
-import { ArrowUpRightIcon, FolderOpenDotIcon, ActivityIcon, RefreshCwIcon } from 'lucide-vue-next';
+import { ArrowUpRightIcon, RefreshCwIcon, ListTodoIcon, FolderKanbanIcon } from 'lucide-vue-next';
 
 import MetricCard from '@/components/MetricCard.vue';
 import ProjectCard from '@/components/ProjectCard.vue';
 import { useDashboard } from '@/composables/useDashboard';
 
-const { metricCards, activities, recentProjects, loading, errorMessage, lastUpdatedLabel, refresh } = useDashboard();
+const { metricCards, activities, recentProjects, taskOverview, loading, errorMessage, lastUpdatedLabel, refresh } =
+  useDashboard();
 
 onMounted(() => {
   refresh();
@@ -30,18 +31,42 @@ onMounted(() => {
     </section>
 
     <section class="quick-grid">
-      <article class="quick-card accent-blue">
-        <FolderOpenDotIcon class="quick-icon" />
+      <article class="quick-card accent-blue emphasis-card">
+        <div class="quick-icon-shell">
+          <ListTodoIcon class="quick-icon" />
+        </div>
         <div>
-          <h3>模型工程</h3>
-          <p>优先重构项目入口，后续从这里衔接任务页和 Viewer 工作台。</p>
+          <div class="quick-card-head">
+            <h3>任务概览</h3>
+            <span class="quick-pill">{{ taskOverview.healthLabel }}</span>
+          </div>
+          <p>{{ taskOverview.healthDetail }}</p>
+          <dl class="quick-stats">
+            <div>
+              <dt>运行中</dt>
+              <dd>{{ taskOverview.activeCount }}</dd>
+            </div>
+            <div>
+              <dt>排队中</dt>
+              <dd>{{ taskOverview.queuedCount }}</dd>
+            </div>
+          </dl>
         </div>
       </article>
-      <article class="quick-card accent-orange">
-        <ActivityIcon class="quick-icon" />
+      <article class="quick-card accent-orange emphasis-card">
+        <div class="quick-icon-shell">
+          <FolderKanbanIcon class="quick-icon" />
+        </div>
         <div>
-          <h3>运行概览</h3>
-          <p>直接复用 `/api/status` 与 `/api/dashboard/activities`，不再把 fetch 散落在模板脚本里。</p>
+          <div class="quick-card-head">
+            <h3>项目概览</h3>
+            <span class="quick-pill">{{ recentProjects.length }} / 6</span>
+          </div>
+          <p>首页仅展示最近项目，超过 6 个时保持摘要视图，并引导跳转到完整项目页。</p>
+          <RouterLink to="/projects" class="inline-link quick-inline-link">
+            <span>查看全部项目</span>
+            <ArrowUpRightIcon class="small-icon" />
+          </RouterLink>
         </div>
       </article>
     </section>
@@ -60,7 +85,10 @@ onMounted(() => {
             <p class="panel-eyebrow">团队动态</p>
             <h3>最近活动</h3>
           </div>
-          <span class="muted-label">{{ lastUpdatedLabel }}</span>
+          <div class="panel-head-meta">
+            <span class="muted-label">最近更新时间</span>
+            <strong>{{ lastUpdatedLabel }}</strong>
+          </div>
         </div>
         <div class="activity-list">
           <div v-if="activities.length === 0" class="empty-card">暂无动态</div>
@@ -88,7 +116,7 @@ onMounted(() => {
             <h3>最近项目</h3>
           </div>
           <RouterLink to="/projects" class="inline-link">
-            <span>查看全部</span>
+            <span>查看全部项目</span>
             <ArrowUpRightIcon class="small-icon" />
           </RouterLink>
         </div>

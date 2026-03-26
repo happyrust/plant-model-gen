@@ -199,5 +199,5 @@ jobs:
             ln -sfn $RELEASE_DIR $CURRENT_LINK
             echo "Deployed version $VERSION to production"
             
-            sudo systemctl restart plant-model-gen || echo "Service restart skipped"
+            sudo systemctl restart web-server || echo "Service restart skipped"
           ENDSSH

@@ -1,7 +1,9 @@
-use axum::{Json, http::StatusCode};
+use axum::{http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::env;
+
+const DEFAULT_LITEFS_STATUS_URL: &str = "http://localhost:20203/status";
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NodeStatus {
@@ -20,6 +22,12 @@ pub struct LiteFSStatus {
     pub primary: Option<String>,
     pub candidate: bool,
     pub pos: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LiteFsMonitorConfig {
+    enabled: bool,
+    status_url: String,
 }
 
 pub async fn get_node_status() -> Result<Json<Value>, StatusCode> {
@@ -77,7 +85,16 @@ async fn get_primary_url() -> Option<String> {
 }
 
 async fn get_litefs_status() -> Value {
-    match reqwest::get("http://localhost:20203/status").await {
+    let cfg = get_litefs_monitor_config();
+    if !cfg.enabled {
+        return json!({
+            "enabled": false,
+            "status": "disabled",
+            "message": "LiteFS health check disabled"
+        });
+    }
+
+    match reqwest::get(&cfg.status_url).await {
         Ok(resp) => match resp.json::<Value>().await {
             Ok(json) => json,
             Err(e) => json!({"error": format!("Failed to parse LiteFS response: {}", e)}),
@@ -87,20 +104,10 @@ async fn get_litefs_status() -> Value {
 }
 
 fn get_database_path() -> String {
-    use config as cfg;
-
-    let cfg_name =
-        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
-    let cfg_file = format!("{}.toml", cfg_name);
-    if std::path::Path::new(&cfg_file).exists() {
-        if let Ok(builder) = cfg::Config::builder()
-            .add_source(cfg::File::with_name(&cfg_name))
-            .build()
-        {
-            return builder
-                .get_string("deployment_sites_sqlite_path")
-                .unwrap_or_else(|_| "deployment_sites.sqlite".to_string());
-        }
+    if let Some(cfg) = load_db_option_config() {
+        return cfg
+            .get_string("deployment_sites_sqlite_path")
+            .unwrap_or_else(|_| "deployment_sites.sqlite".to_string());
     }
 
     "deployment_sites.sqlite".to_string()
@@ -116,12 +123,18 @@ pub async fn health_check() -> Result<Json<Value>, StatusCode> {
 
     let is_primary = check_if_primary();
     let litefs_status = get_litefs_status().await;
+    let litefs_disabled = litefs_status
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(|status| status == "disabled")
+        .unwrap_or(false);
 
-    let overall_status = if db_status == "healthy" && !litefs_status["error"].is_string() {
-        "ok"
-    } else {
-        "degraded"
-    };
+    let overall_status =
+        if db_status == "healthy" && (litefs_disabled || !litefs_status["error"].is_string()) {
+            "ok"
+        } else {
+            "degraded"
+        };
 
     Ok(Json(json!({
         "status": overall_status,
@@ -134,6 +147,23 @@ pub async fn health_check() -> Result<Json<Value>, StatusCode> {
 
 pub async fn sync_status() -> Result<Json<Value>, StatusCode> {
     let litefs_status = get_litefs_status().await;
+
+    if litefs_status
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(|status| status == "disabled")
+        .unwrap_or(false)
+    {
+        return Ok(Json(json!({
+            "status": "ok",
+            "message": "LiteFS 未启用",
+            "is_primary": check_if_primary(),
+            "primary": Value::Null,
+            "sync_lag_seconds": 0,
+            "litefs": litefs_status,
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        })));
+    }
 
     if litefs_status.get("error").is_some() {
         return Ok(Json(json!({
@@ -179,4 +209,53 @@ fn calculate_sync_lag(status: &Value) -> i64 {
         }
     }
     0
+}
+
+fn get_litefs_monitor_config() -> LiteFsMonitorConfig {
+    let enabled = env::var("LITEFS_HEALTH_ENABLED")
+        .ok()
+        .and_then(|raw| parse_bool_like(&raw))
+        .or_else(|| {
+            load_db_option_config().and_then(|cfg| cfg.get_bool("web_server.litefs_enabled").ok())
+        })
+        .unwrap_or(false);
+
+    let status_url = env::var("LITEFS_STATUS_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            load_db_option_config()
+                .and_then(|cfg| cfg.get_string("web_server.litefs_status_url").ok())
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_LITEFS_STATUS_URL.to_string());
+
+    LiteFsMonitorConfig {
+        enabled,
+        status_url,
+    }
+}
+
+fn load_db_option_config() -> Option<config::Config> {
+    use config as cfg;
+
+    let cfg_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_file = format!("{}.toml", cfg_name);
+    if !std::path::Path::new(&cfg_file).exists() {
+        return None;
+    }
+
+    cfg::Config::builder()
+        .add_source(cfg::File::with_name(&cfg_name))
+        .build()
+        .ok()
+}
+
+fn parse_bool_like(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }

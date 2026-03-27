@@ -248,6 +248,8 @@ surreal_data_path = "D:/backup-dbs/ams-8020.db"
 surreal_bind = "0.0.0.0:8020"
 surreal_user = "root"
 surreal_password = "root"
+litefs_enabled = false
+litefs_status_url = "http://localhost:20203/status"
 
 # ====== SurrealDB 连接配置 (PE/属性/输入数据) ======
 [surrealdb]

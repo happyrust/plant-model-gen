@@ -184,6 +184,7 @@ jobs:
             VERSION="${{ steps.version.outputs.VERSION }}"
             RELEASE_DIR="/opt/plant-model-gen/releases/$VERSION"
             CURRENT_LINK="/opt/plant-model-gen/current"
+            ACTIVE_BIN="/root/web_server"
             
             chmod +x $RELEASE_DIR/web_server
             
@@ -198,6 +199,14 @@ jobs:
             
             ln -sfn $RELEASE_DIR $CURRENT_LINK
             echo "Deployed version $VERSION to production"
+
+            # 当前生产 systemd 仍通过 /root/web_server 启动，需同步覆盖活动二进制，
+            # 避免仅切换 current 软链但实际服务仍跑旧版本。
+            install -m 755 $RELEASE_DIR/web_server $ACTIVE_BIN
+            echo "Updated active binary: $ACTIVE_BIN"
             
-            sudo systemctl restart web-server || echo "Service restart skipped"
+            sudo systemctl restart web-server
+            sleep 5
+            sudo systemctl is-active web-server
+            curl -fsS http://127.0.0.1:3100/api/version
           ENDSSH

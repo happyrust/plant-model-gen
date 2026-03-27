@@ -59,14 +59,21 @@ After deployment completes, verify the services manually:
 # On local machine:
 curl -fsS http://123.57.182.243/
 curl -fsS http://123.57.182.243/api/projects
+curl -fsS http://123.57.182.243/api/version
 
 # On remote server:
 ssh root@123.57.182.243
 systemctl status web-server
 systemctl status nginx
+ls -lh /root/web_server
 curl -fsS http://127.0.0.1:3100/
+curl -fsS http://127.0.0.1:3100/api/version
 curl -fsS http://127.0.0.1:3100/api/projects
 ```
+
+当前生产 `web-server.service` 仍通过 `/root/web_server` 启动，因此 tag/CI 部署除了维护
+`/opt/plant-model-gen/releases/<version>` 与 `current` 软链之外，还必须同步刷新
+`/root/web_server`。否则即便 `current` 已切换，线上进程仍可能继续运行旧二进制。
 
 All of these checks are also run automatically by `deploy_all_with_frontend.sh` with retry logic.
 

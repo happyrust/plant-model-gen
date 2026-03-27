@@ -65,6 +65,7 @@ GITHUB_TAG=<YOUR_TAG> \
 
 The scripts automatically verify:
 - [ ] Systemd service `web-server` is active
+- [ ] Active binary `/root/web_server` has been refreshed from the selected CI artifact
 - [ ] Nginx is active
 - [ ] Health endpoint responds: http://127.0.0.1:8080/
 - [ ] API endpoint responds: http://127.0.0.1:8080/api/projects
@@ -80,14 +81,15 @@ sshpass -p "$REMOTE_PASS" ssh -o StrictHostKeyChecking=no root@123.57.182.243
 # Check service status
 systemctl status web-server
 
+# Confirm the active binary was updated
+ls -lh /root/web_server
+
 # View recent logs
 journalctl -u web-server -n 50
 
 # Test local endpoints
 curl http://127.0.0.1:8080/api/projects
-
-# Check binary info
-ls -lh /root/web_server
+curl http://127.0.0.1:3100/api/version
 ```
 
 ## Rollback (If Needed)

@@ -1625,7 +1625,10 @@ pub async fn run_generate_model(
     let mut db_option_override = db_option_ext.clone();
     let derived_dbnums = derive_dbnums_from_refnos(&target_refnos);
     if !derived_dbnums.is_empty() {
-        println!("   - 从目标 refnos 推导 manual_db_nums: {:?}", derived_dbnums);
+        println!(
+            "   - 从目标 refnos 推导 manual_db_nums: {:?}",
+            derived_dbnums
+        );
         db_option_override.inner.manual_db_nums = Some(derived_dbnums);
     }
     let gen_result = gen_all_geos_data(target_refnos, &db_option_override, None, None).await?;
@@ -1670,7 +1673,10 @@ pub async fn run_regen_model(
     if !target_refnos.is_empty() {
         let derived_dbnums = derive_dbnums_from_refnos(&target_refnos);
         if !derived_dbnums.is_empty() {
-            println!("   - 从目标 refnos 推导 manual_db_nums: {:?}", derived_dbnums);
+            println!(
+                "   - 从目标 refnos 推导 manual_db_nums: {:?}",
+                derived_dbnums
+            );
             db_option_override.inner.manual_db_nums = Some(derived_dbnums);
         }
     }

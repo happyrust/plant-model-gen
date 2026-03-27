@@ -109,7 +109,8 @@ pub struct WorkflowStep {
     pub operator_id: String,     // 操作人ID
     pub operator_name: String,   // 操作人姓名
     pub comment: Option<String>, // 备注
-    pub timestamp: i64,          // 时间戳
+    #[serde(serialize_with = "serialize_beijing_datetime_millis")]
+    pub timestamp: i64, // 时间戳
 }
 
 /// 工作流节点顺序常量
@@ -184,8 +185,11 @@ pub struct ReviewTask {
     pub components: Vec<ReviewComponent>,
     pub attachments: Option<Vec<ReviewAttachment>>,
     pub review_comment: Option<String>,
+    #[serde(serialize_with = "serialize_beijing_datetime_millis")]
     pub created_at: i64,
+    #[serde(serialize_with = "serialize_beijing_datetime_millis")]
     pub updated_at: i64,
+    #[serde(serialize_with = "serialize_optional_beijing_datetime_millis")]
     pub due_date: Option<i64>,
     #[serde(default = "default_current_node")]
     pub current_node: String,
@@ -200,6 +204,43 @@ fn default_current_node() -> String {
 
 fn default_status() -> String {
     "draft".to_string()
+}
+
+pub(crate) fn format_beijing_datetime_millis(millis: i64) -> String {
+    let Some(utc_dt) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis) else {
+        return String::new();
+    };
+    let Some(beijing_offset) = chrono::FixedOffset::east_opt(8 * 3600) else {
+        return String::new();
+    };
+
+    utc_dt
+        .with_timezone(&beijing_offset)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+pub(crate) fn serialize_beijing_datetime_millis<S>(
+    millis: &i64,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&format_beijing_datetime_millis(*millis))
+}
+
+pub(crate) fn serialize_optional_beijing_datetime_millis<S>(
+    millis: &Option<i64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match millis {
+        Some(value) => serializer.serialize_some(&format_beijing_datetime_millis(*value)),
+        None => serializer.serialize_none(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1435,6 +1476,7 @@ async fn get_task_history(Path(id): Path<String>) -> impl IntoResponse {
         user_id: String,
         user_name: String,
         comment: Option<String>,
+        #[serde(serialize_with = "serialize_beijing_datetime_millis")]
         timestamp: i64,
     }
 
@@ -1780,6 +1822,7 @@ pub struct AnnotationComment {
     pub author_role: String,
     pub content: String,
     pub reply_to_id: Option<String>,
+    #[serde(serialize_with = "serialize_beijing_datetime_millis")]
     pub created_at: i64,
 }
 

@@ -16,6 +16,20 @@ use super::types::{
     WorkflowOpinion, normalize_review_form_status,
 };
 
+fn format_beijing_datetime_millis(millis: i64) -> String {
+    let Some(utc_dt) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis) else {
+        return String::new();
+    };
+    let Some(beijing_offset) = chrono::FixedOffset::east_opt(8 * 3600) else {
+        return String::new();
+    };
+
+    utc_dt
+        .with_timezone(&beijing_offset)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
 // ============================================================================
 // Handler
 // ============================================================================
@@ -196,7 +210,10 @@ async fn query_workflow_opinions(form_id: &str) -> anyhow::Result<Vec<WorkflowOp
             order: r.seq_order.unwrap_or(0),
             author: r.author.unwrap_or_default(),
             opinion: r.opinion.unwrap_or_default(),
-            created_at: r.created_at.map(|dt| dt.to_string()).unwrap_or_default(),
+            created_at: r
+                .created_at
+                .map(|dt| format_beijing_datetime_millis(dt.timestamp_millis()))
+                .unwrap_or_default(),
         })
         .collect())
 }

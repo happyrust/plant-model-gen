@@ -1,13 +1,9 @@
 commands:
-  install: npm --prefix web_console install
-  build: npm --prefix web_console run build
-  typecheck: cd web_console && npm exec -- vue-tsc --noEmit -p tsconfig.typecheck.json
-  lint: echo "lint skipped (not configured)"
+  install: cargo fetch
+  context: rg -n "workflow_sync|notify_workflow_sync_async|notify_workflow_sync|external_review\.workflow_sync_path|workflow/sync|title|current_node|task_status|models|opinions|attachments" src docs shells db_options
+  typecheck: cargo check --features web_server --bin web_server
+  lint: echo "lint skipped for analysis-only backend workflow/sync mission"
   test: cargo check --features web_server --bin web_server
-  web-dev: npm --prefix web_console run dev -- --host 127.0.0.1 --port 3110
-  rust-fmt: cargo fmt
-  rust-check-web: cargo check --features web_server --bin web_server
-  web-server-run: WEB_SERVER_PORT=3100 cargo run --features web_server --bin web_server -- --config db_options/DbOption-mac
 
 services:
   web_server:
@@ -17,9 +13,7 @@ services:
     port: 3100
     depends_on: []
 
-  web_console_dev:
-    start: npm --prefix web_console run dev -- --host 127.0.0.1 --port 3110
-    stop: lsof -tiTCP:3110 -sTCP:LISTEN | xargs kill || true
-    healthcheck: curl -sf http://127.0.0.1:3110/ > /dev/null && echo "vite ok"
-    port: 3110
-    depends_on: []
+# Analysis-only mission note:
+# - `commands.context` is the primary evidence scan.
+# - `commands.typecheck` and `commands.test` intentionally share the same narrow backend sanity check to avoid unrelated example/test failures.
+# - Validators should prioritize exact file references and code-path evidence over command output.

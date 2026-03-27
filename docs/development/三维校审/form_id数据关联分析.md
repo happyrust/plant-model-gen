@@ -124,7 +124,7 @@
 | `form_id` | string | 关联的单据 form_id |
 | `model_refnos` | array\<string\> | 关联的模型列表 |
 | `file_id` | string | 文件 ID |
-| `file_type` | string | 类型（markup: 云线, file: 文件） |
+| `file_type` | string | 类型（markup: 云线, file: 文件）；上传 `/api/review/attachments` 时兼容 `type` / `fileType` / `file_type` 三种字段名 |
 | `download_url` | string | 下载地址 |
 | `description` | string | 文件描述 |
 | `file_ext` | string | 文件后缀 |

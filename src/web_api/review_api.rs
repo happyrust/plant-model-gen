@@ -2826,6 +2826,19 @@ pub struct AttachmentUploadResponse {
 async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
     info!("Uploading attachment");
 
+    fn normalize_attachment_file_type(raw: Option<&str>) -> String {
+        let normalized = raw
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|| "file".to_string());
+
+        match normalized.as_str() {
+            "markup" | "file" => normalized,
+            _ => "file".to_string(),
+        }
+    }
+
     let mut task_id: Option<String> = None;
     let mut form_id: Option<String> = None;
     let mut model_refnos: Option<Vec<String>> = None;
@@ -2838,19 +2851,20 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
     // 解析 multipart 表单
     while let Ok(Some(field)) = multipart.next_field().await {
         let name: String = field.name().unwrap_or("").to_string();
+        let field_name = name.trim().to_ascii_lowercase();
 
-        match name.as_str() {
-            "taskId" => {
+        match field_name.as_str() {
+            "taskid" | "task_id" => {
                 if let Ok(text) = field.text().await {
                     task_id = Some(text);
                 }
             }
-            "formId" | "form_id" => {
+            "formid" | "form_id" => {
                 if let Ok(text) = field.text().await {
                     form_id = Some(text);
                 }
             }
-            "modelRefnos" | "model_refnos" => {
+            "modelrefnos" | "model_refnos" => {
                 if let Ok(text) = field.text().await {
                     // 支持 JSON 数组或逗号分隔字符串
                     if let Ok(v) = serde_json::from_str::<Vec<String>>(&text) {
@@ -2865,7 +2879,7 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
                     }
                 }
             }
-            "type" => {
+            "type" | "filetype" | "file_type" => {
                 if let Ok(text) = field.text().await {
                     file_type = Some(text);
                 }
@@ -3018,12 +3032,7 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
         }
     };
 
-    let resolved_file_type = file_type
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "file".to_string());
+    let resolved_file_type = normalize_attachment_file_type(file_type.as_deref());
 
     let resolved_description = description
         .as_ref()

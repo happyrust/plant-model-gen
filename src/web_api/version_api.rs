@@ -11,7 +11,7 @@ pub struct VersionInfo {
 
 async fn get_version() -> Json<VersionInfo> {
     Json(VersionInfo {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: env!("APP_VERSION").to_string(),
         commit: option_env!("GIT_COMMIT").unwrap_or("unknown").to_string(),
         build_date: option_env!("BUILD_DATE").unwrap_or("unknown").to_string(),
     })

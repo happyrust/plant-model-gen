@@ -125,7 +125,10 @@ pub struct SyncWorkflowResponse {
 #[derive(Debug, Serialize, Default)]
 pub struct SyncWorkflowData {
     pub models: Vec<String>,
-    pub opinions: Vec<WorkflowOpinion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    pub records: Vec<WorkflowRecord>,
+    pub annotation_comments: Vec<WorkflowAnnotationComment>,
     pub attachments: Vec<WorkflowAttachment>,
     pub form_exists: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,12 +142,30 @@ pub struct SyncWorkflowData {
 }
 
 #[derive(Debug, Serialize)]
-pub struct WorkflowOpinion {
-    pub model: Vec<String>,
-    pub node: String,
-    pub order: i32,
-    pub author: String,
-    pub opinion: String,
+pub struct WorkflowRecord {
+    pub id: String,
+    pub task_id: String,
+    pub r#type: String,
+    pub annotations: Vec<serde_json::Value>,
+    pub cloud_annotations: Vec<serde_json::Value>,
+    pub rect_annotations: Vec<serde_json::Value>,
+    pub obb_annotations: Vec<serde_json::Value>,
+    pub measurements: Vec<serde_json::Value>,
+    pub note: String,
+    pub confirmed_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkflowAnnotationComment {
+    pub id: String,
+    pub annotation_id: String,
+    pub annotation_type: String,
+    pub author_id: String,
+    pub author_name: String,
+    pub author_role: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_id: Option<String>,
     pub created_at: String,
 }
 
@@ -153,7 +174,10 @@ pub struct WorkflowAttachment {
     pub model: Vec<String>,
     pub id: String,
     pub r#type: String,
+    pub route_url: String,
     pub download_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
     pub description: String,
     pub file_ext: String,
 }

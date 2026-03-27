@@ -40,6 +40,87 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/review/workflow/sync' \
 
 `action` 取值：`query`（只读查询）、`active`、`agree`、`return`、`stop`。
 
+请求字段约束补充：
+
+- `comments` 表示平台流程引擎的当前节点整体审批意见。
+- 模型中心接收该字段用于 workflow 动作上下文，但**不会**在模型中心再次持久化，也**不会**在 `workflow/sync` 响应中回传。
+- 第三方若需要保存流程意见，应继续以平台流程系统自身记录为准。
+
+典型响应（已按“模型批注包 + 路由 URL”语义对齐）：
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "models": ["1001-PIPE", "1002-VALVE"],
+    "task_id": "task-12345678",
+    "records": [
+      {
+        "id": "review_records:abc",
+        "task_id": "task-12345678",
+        "type": "batch",
+        "annotations": [
+          {
+            "id": "anno-text-1",
+            "type": "text",
+            "content": "请补充支吊架说明"
+          }
+        ],
+        "cloud_annotations": [
+          {
+            "id": "anno-cloud-1",
+            "type": "cloud"
+          }
+        ],
+        "rect_annotations": [],
+        "obb_annotations": [],
+        "measurements": [],
+        "note": "模型复核意见汇总",
+        "confirmed_at": "2026-03-27 11:05:18"
+      }
+    ],
+    "annotation_comments": [
+      {
+        "id": "review_comments:def",
+        "annotation_id": "anno-text-1",
+        "annotation_type": "text",
+        "author_id": "kangwp",
+        "author_name": "康某",
+        "author_role": "sj",
+        "content": "该处与土建提资不一致",
+        "reply_to_id": null,
+        "created_at": "2026-03-27 11:05:20"
+      }
+    ],
+    "attachments": [
+      {
+        "model": ["1001-PIPE"],
+        "id": "file-001",
+        "type": "markup",
+        "route_url": "/files/review_attachments/20260327110518_cloud.png",
+        "download_url": "/files/review_attachments/20260327110518_cloud.png",
+        "public_url": "http://127.0.0.1:3100/files/review_attachments/20260327110518_cloud.png",
+        "description": "云线截图",
+        "file_ext": "png"
+      }
+    ],
+    "form_exists": true,
+    "form_status": "active",
+    "task_created": true,
+    "current_node": "jd",
+    "task_status": "reviewing"
+  }
+}
+```
+
+说明：
+
+- `records`：模型侧批注主体，包含文本批注、云线、框选、OBB、测量、备注等结构化数据。
+- `annotation_comments`：挂在具体批注下的评论串。
+- `attachments.route_url`：统一返回可路由拼接的相对路径，第三方拿到域名后可自行拼接。
+- `attachments.public_url`：后端按 `web_server.public_base_url` / `backend_url` 计算出的绝对 URL；若未配置则可能为空。
+
 ---
 
 ## 3. 缓存预加载 `POST /api/review/cache/preload`

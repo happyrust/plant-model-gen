@@ -253,9 +253,9 @@ assert_contains "消息含编制" "$SUBMIT1" "编制"
 echo ""
 
 # ============================================================================
-# 8. PMS workflow/sync active: SJ 意见写入
+# 8. PMS workflow/sync active: 平台 comments 不再由模型中心持久化/回传
 # ============================================================================
-echo -e "${YELLOW}▸ 8. PMS workflow/sync active + SJ 意见写入${NC}"
+echo -e "${YELLOW}▸ 8. PMS workflow/sync active：平台 comments 不落模型中心${NC}"
 
 SYNC3=$(post "/api/review/workflow/sync" "{
     \"form_id\":\"${FORM_ID}\",\"token\":\"${JWT_SJ}\",
@@ -265,11 +265,9 @@ SYNC3=$(post "/api/review/workflow/sync" "{
     \"comments\":\"E2E-设计完成\"}")
 SYNC3_CODE=$(jf "$SYNC3" "code")
 OP_N1=$(jlen "$SYNC3" "data.opinions")
-OP_NODE1=$(jf "$SYNC3" "data.opinions.0.node")
 
 assert_eq "sync code=200" "200" "$SYNC3_CODE"
-assert_eq "1条意见" "1" "$OP_N1"
-assert_eq "意见节点=sj" "sj" "$OP_NODE1"
+assert_eq "opinions 不再回传" "0" "$OP_N1"
 echo ""
 
 # ============================================================================
@@ -290,7 +288,7 @@ SYNC4=$(post "/api/review/workflow/sync" "{
     \"next_step\":{\"assignee_id\":\"SH\",\"name\":\"审核\",\"roles\":\"sh\"},
     \"comments\":\"E2E-校对通过\"}")
 OP_N2=$(jlen "$SYNC4" "data.opinions")
-assert_eq "2条意见(SJ+JH)" "2" "$OP_N2"
+assert_eq "agree 后仍不回传 opinions" "0" "$OP_N2"
 echo ""
 
 # ============================================================================
@@ -310,7 +308,7 @@ SYNC5=$(post "/api/review/workflow/sync" "{
     \"actor\":{\"id\":\"SH\",\"name\":\"审核\",\"roles\":\"sh\"},
     \"comments\":\"E2E-审核通过\"}")
 OP_N3=$(jlen "$SYNC5" "data.opinions")
-assert_eq "3条意见(SJ+JH+SH)" "3" "$OP_N3"
+assert_eq "审核后仍不回传 opinions" "0" "$OP_N3"
 echo ""
 
 # ============================================================================

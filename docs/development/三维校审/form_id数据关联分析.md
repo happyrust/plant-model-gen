@@ -115,7 +115,7 @@
 | `node` | string | 审批节点（sj/jd/sh/pz） |
 | `seq_order` | int | 意见顺序 |
 | `author` | string | 审批人 |
-| `opinion` | string | 意见内容 |
+| `opinion` | string | 历史兼容字段；现行 `workflow/sync` 不再把平台 `comments` 写入这里，也不再作为对外回传事实源 |
 
 #### review_attachment — 附件表
 
@@ -173,7 +173,7 @@
                                           │
                                    推进 review_tasks 状态
                                    记录 review_workflow_history
-                                   返回 models + opinions + attachments
+                                   返回 models + records + annotation_comments + attachments(route_url/public_url)
 ```
 
 ### 4.4 辅助校审数据查询

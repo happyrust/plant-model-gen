@@ -5,8 +5,8 @@
 
 use axum::{extract::Json, http::StatusCode, response::IntoResponse};
 use serde_json::Value;
-use surrealdb::types::SurrealValue;
 use std::{collections::BTreeSet, path::Path, sync::OnceLock};
+use surrealdb::types::SurrealValue;
 use tracing::{info, warn};
 
 use aios_core::project_primary_db;
@@ -37,8 +37,8 @@ fn format_beijing_datetime_millis(millis: i64) -> String {
 fn load_web_public_base_url() -> Option<String> {
     WEB_PUBLIC_BASE_URL
         .get_or_init(|| {
-            let config_name =
-                std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+            let config_name = std::env::var("DB_OPTION_FILE")
+                .unwrap_or_else(|_| "db_options/DbOption".to_string());
             let config_file = format!("{}.toml", config_name);
             if !Path::new(&config_file).exists() {
                 return None;
@@ -277,7 +277,55 @@ async fn query_workflow_attachments(form_id: &str) -> anyhow::Result<Vec<Workflo
         .collect())
 }
 
-async fn query_workflow_records(task_id: &str) -> anyhow::Result<Vec<WorkflowRecord>> {
+async fn query_workflow_records_by_form_id(form_id: &str) -> anyhow::Result<Vec<WorkflowRecord>> {
+    #[derive(Debug, serde::Deserialize, SurrealValue)]
+    struct RecordRow {
+        id: surrealdb::types::RecordId,
+        task_id: Option<String>,
+        r#type: Option<String>,
+        annotations: Option<Vec<Value>>,
+        cloud_annotations: Option<Vec<Value>>,
+        rect_annotations: Option<Vec<Value>>,
+        obb_annotations: Option<Vec<Value>>,
+        measurements: Option<Vec<Value>>,
+        note: Option<String>,
+        confirmed_at: Option<surrealdb::types::Datetime>,
+    }
+
+    let mut response = project_primary_db()
+        .query(
+            r#"
+            SELECT id, task_id, type, annotations, cloud_annotations, rect_annotations, obb_annotations, measurements, note, confirmed_at
+            FROM review_records
+            WHERE form_id = $form_id
+            ORDER BY confirmed_at DESC
+            "#,
+        )
+        .bind(("form_id", form_id.to_string()))
+        .await?;
+
+    let rows: Vec<RecordRow> = response.take(0)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| WorkflowRecord {
+            id: record_id_to_string(row.id),
+            task_id: row.task_id.unwrap_or_default(),
+            r#type: row.r#type.unwrap_or_else(|| "batch".to_string()),
+            annotations: row.annotations.unwrap_or_default(),
+            cloud_annotations: row.cloud_annotations.unwrap_or_default(),
+            rect_annotations: row.rect_annotations.unwrap_or_default(),
+            obb_annotations: row.obb_annotations.unwrap_or_default(),
+            measurements: row.measurements.unwrap_or_default(),
+            note: row.note.unwrap_or_default(),
+            confirmed_at: row
+                .confirmed_at
+                .map(|dt| format_beijing_datetime_millis(dt.timestamp_millis()))
+                .unwrap_or_default(),
+        })
+        .collect())
+}
+
+async fn query_workflow_records_by_task_id(task_id: &str) -> anyhow::Result<Vec<WorkflowRecord>> {
     #[derive(Debug, serde::Deserialize, SurrealValue)]
     struct RecordRow {
         id: surrealdb::types::RecordId,
@@ -356,19 +404,21 @@ async fn query_annotation_comments(
             .await?;
 
         let rows: Vec<CommentRow> = response.take(0)?;
-        comments.extend(rows.into_iter().map(|row| WorkflowAnnotationComment {
-            id: record_id_to_string(row.id),
-            annotation_id: row.annotation_id.unwrap_or_default(),
-            annotation_type: row.annotation_type.unwrap_or_default(),
-            author_id: row.author_id.unwrap_or_default(),
-            author_name: row.author_name.unwrap_or_default(),
-            author_role: row.author_role.unwrap_or_default(),
-            content: row.content.unwrap_or_default(),
-            reply_to_id: row.reply_to_id,
-            created_at: row
-                .created_at
-                .map(|dt| format_beijing_datetime_millis(dt.timestamp_millis()))
-                .unwrap_or_default(),
+        comments.extend(rows.into_iter().map(|row| {
+            WorkflowAnnotationComment {
+                id: record_id_to_string(row.id),
+                annotation_id: row.annotation_id.unwrap_or_default(),
+                annotation_type: row.annotation_type.unwrap_or_default(),
+                author_id: row.author_id.unwrap_or_default(),
+                author_name: row.author_name.unwrap_or_default(),
+                author_role: row.author_role.unwrap_or_default(),
+                content: row.content.unwrap_or_default(),
+                reply_to_id: row.reply_to_id,
+                created_at: row
+                    .created_at
+                    .map(|dt| format_beijing_datetime_millis(dt.timestamp_millis()))
+                    .unwrap_or_default(),
+            }
         }));
     }
 
@@ -383,10 +433,19 @@ async fn query_workflow_data(form_id: &str) -> anyhow::Result<SyncWorkflowData> 
     let review_form = get_review_form_by_form_id(form_id).await.unwrap_or(None);
     let task = find_task_by_form_id(form_id).await.unwrap_or(None);
     let task_id = task.as_ref().map(|t| t.id.clone());
-    let records = if let Some(task_id) = task_id.as_deref() {
-        query_workflow_records(task_id).await.unwrap_or_default()
-    } else {
-        Vec::new()
+    let records = {
+        let by_form = query_workflow_records_by_form_id(form_id)
+            .await
+            .unwrap_or_default();
+        if !by_form.is_empty() {
+            by_form
+        } else if let Some(task_id) = task_id.as_deref() {
+            query_workflow_records_by_task_id(task_id)
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
     };
     let mut annotation_ids = BTreeSet::new();
     for record in &records {

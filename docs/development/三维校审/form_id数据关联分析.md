@@ -63,10 +63,10 @@
                                 │
           ┌─────────┬───────────┼───────────┬──────────────┐
           │         │           │           │              │
-          ▼         ▼           ▼           ▼              ▼
-   review_forms  review_tasks  review_    review_      review_
-   (单据主表)    (提资单/任务)  form_model opinion    attachment
-                               (模型关联)  (审批意见)  (附件/云线)
+          ▼         ▼           ▼           ▼           ▼              ▼
+   review_forms  review_tasks  review_    review_   review_       review_
+   (单据主表)    (提资单/任务)  records    form_model opinion     attachment
+                               (批注/测量) (模型关联) (审批意见)  (附件/云线)
 ```
 
 ### 3.2 各表字段说明
@@ -105,6 +105,21 @@
 |------|------|------|
 | `form_id` | string | 关联的单据 form_id |
 | `model_refno` | string | 模型参考号 |
+
+#### review_records — 已确认批注/测量记录
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `task_id` | string | 任务 ID（兼容历史查询） |
+| `form_id` | string | 关联的单据 form_id；现行保存确认记录时会一并落库 |
+| `type` | string | 当前通常为 `batch` |
+| `annotations` | array | 文本批注等结构化批注 |
+| `cloud_annotations` | array | 云线批注 |
+| `rect_annotations` | array | 矩形批注 |
+| `obb_annotations` | array | OBB 批注 |
+| `measurements` | array | 测量数据 |
+| `note` | string | 确认备注 |
+| `confirmed_at` | datetime | 确认时间 |
 
 #### review_opinion — 审批意见表
 
@@ -173,7 +188,7 @@
                                           │
                                    推进 review_tasks 状态
                                    记录 review_workflow_history
-                                   返回 models + records + annotation_comments + attachments(route_url/public_url)
+                                   按 form_id 聚合返回 models + records + annotation_comments + attachments(route_url/public_url)
 ```
 
 ### 4.4 辅助校审数据查询

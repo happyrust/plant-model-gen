@@ -1555,6 +1555,8 @@ async fn get_task_history(Path(id): Path<String>) -> impl IntoResponse {
 pub struct ConfirmedRecordData {
     pub task_id: String,
     #[serde(default)]
+    pub form_id: Option<String>,
+    #[serde(default)]
     pub r#type: String,
     #[serde(default)]
     pub annotations: Vec<serde_json::Value>,
@@ -1601,12 +1603,41 @@ pub struct ConfirmedRecordWithMeta {
 async fn create_record(Json(request): Json<ConfirmedRecordData>) -> impl IntoResponse {
     info!("Creating confirmed record for task: {}", request.task_id);
 
+    let form_id = request
+        .form_id
+        .clone()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let form_id = match form_id {
+        Some(value) => Some(value),
+        None => lookup_task_form_id(&request.task_id).await,
+    };
+
+    let Some(form_id) = form_id else {
+        warn!(
+            "Failed to resolve form_id for confirmed record: task_id={}",
+            request.task_id
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ConfirmedRecordResponse {
+                success: false,
+                record: None,
+                records: None,
+                error_message: Some(
+                    "保存记录失败：未找到 form_id，确认记录必须与单据 form_id 关联".to_string(),
+                ),
+            }),
+        );
+    };
+
     let record_id = format!("record-{}", uuid::Uuid::new_v4());
 
     let sql = r#"
         CREATE review_records CONTENT {
             id: $id,
             task_id: $task_id,
+            form_id: $form_id,
             type: $type,
             annotations: $annotations,
             cloud_annotations: $cloud_annotations,
@@ -1622,6 +1653,7 @@ async fn create_record(Json(request): Json<ConfirmedRecordData>) -> impl IntoRes
         .query(sql)
         .bind(("id", record_id.clone()))
         .bind(("task_id", request.task_id.clone()))
+        .bind(("form_id", form_id))
         .bind(("type", request.r#type.clone()))
         .bind(("annotations", request.annotations.clone()))
         .bind(("cloud_annotations", request.cloud_annotations.clone()))

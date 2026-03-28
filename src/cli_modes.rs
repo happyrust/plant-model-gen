@@ -1621,6 +1621,15 @@ pub async fn run_generate_model(
     ensure_surreal_connected(db_option_ext).await?;
 
     use aios_database::fast_model::gen_all_geos_data;
+    let refresh_roots = collect_transform_refresh_roots(config).await?;
+    if !refresh_roots.is_empty() {
+        let refreshed =
+            aios_database::pe_transform_refresh::refresh_pe_transform_for_root_refnos_compat(
+                &refresh_roots,
+            )
+            .await?;
+        println!("   - 已刷新子树 pe_transform: {} 个节点", refreshed);
+    }
     let target_refnos = collect_regen_target_refnos(config).await?;
     let mut db_option_override = db_option_ext.clone();
     let derived_dbnums = derive_dbnums_from_refnos(&target_refnos);
@@ -1659,6 +1668,15 @@ pub async fn run_regen_model(
 
     // 4. 确定目标 refnos 并执行生成
     use aios_database::fast_model::gen_all_geos_data;
+    let refresh_roots = collect_transform_refresh_roots(config).await?;
+    if !refresh_roots.is_empty() {
+        let refreshed =
+            aios_database::pe_transform_refresh::refresh_pe_transform_for_root_refnos_compat(
+                &refresh_roots,
+            )
+            .await?;
+        println!("   - 已刷新子树 pe_transform: {} 个节点", refreshed);
+    }
     let target_refnos = collect_regen_target_refnos(config).await?;
 
     // 先清理 legacy 模型关系（含 inst_relate / geo_relate / tubi_relate），
@@ -1730,6 +1748,44 @@ async fn collect_regen_target_refnos(config: &ExportConfig) -> Result<Vec<RefnoE
         Ok(all_sites)
     } else {
         anyhow::bail!("--regen-model 需要指定 refnos、--dbnum 或启用全库模式");
+    }
+}
+
+async fn collect_transform_refresh_roots(config: &ExportConfig) -> Result<Vec<RefnoEnum>> {
+    if !config.refnos_str.is_empty() {
+        let roots = config.parse_refnos()?;
+        println!("   - transform 刷新 roots: {} 个 refno", roots.len());
+        Ok(roots)
+    } else if let Some(dbnum) = config.dbnum {
+        use aios_database::fast_model::query_provider;
+        let sites: Vec<RefnoEnum> =
+            query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
+        if sites.is_empty() {
+            anyhow::bail!("dbnum={} 下未找到任何 SITE，无法刷新 pe_transform", dbnum);
+        }
+        println!(
+            "   - transform 刷新 roots: dbnum={} 下 {} 个 SITE",
+            dbnum,
+            sites.len()
+        );
+        Ok(sites)
+    } else if config.run_all_dbnos {
+        use aios_database::fast_model::query_provider;
+        let dbnos: Vec<u32> = query_mdb_db_nums(None, DBType::DESI).await?;
+        let mut all_sites = Vec::new();
+        for db in &dbnos {
+            let sites: Vec<RefnoEnum> =
+                query_provider::query_by_type(&["SITE"], *db as i32, None).await?;
+            all_sites.extend(sites);
+        }
+        println!(
+            "   - transform 刷新 roots: {} 个 dbnum, 共 {} 个 SITE",
+            dbnos.len(),
+            all_sites.len()
+        );
+        Ok(all_sites)
+    } else {
+        Ok(Vec::new())
     }
 }
 

@@ -1,10 +1,13 @@
 use std::collections::VecDeque;
 
 use aios_core::rs_surreal::pe_transform::{
-    PeTransformEntry, ensure_pe_transform_schema, save_pe_transform_entries,
+    ensure_pe_transform_schema, save_pe_transform_entries, PeTransformEntry,
 };
 use aios_core::transform::get_local_mat4;
-use aios_core::{RefnoEnum, SurrealQueryExt, Transform, get_children_refnos, project_primary_db};
+use aios_core::{
+    get_children_refnos, get_named_attmap, project_primary_db, RefnoEnum, SurrealQueryExt,
+    Transform,
+};
 use anyhow::{Context, Result};
 use glam::DMat4;
 use serde_json::Value;
@@ -130,6 +133,96 @@ pub async fn refresh_pe_transform_for_dbnums_compat(dbnums: &[u32]) -> Result<us
     Ok(total)
 }
 
+pub async fn refresh_pe_transform_for_root_refnos_compat(
+    root_refnos: &[RefnoEnum],
+) -> Result<usize> {
+    ensure_pe_transform_schema()
+        .await
+        .context("初始化 pe_transform schema 失败")?;
+
+    let mut roots = root_refnos.to_vec();
+    roots.sort_unstable_by_key(|refno| refno.to_string());
+    roots.dedup();
+
+    if roots.is_empty() {
+        println!("⚠️  未提供 root refno 列表");
+        return Ok(0);
+    }
+
+    println!("📋 刷新 root_refnos: {:?}", roots);
+
+    let mut entries: Vec<PeTransformEntry> = Vec::with_capacity(PE_TRANSFORM_BATCH_SIZE);
+    let mut total = 0usize;
+
+    for root_refno in roots {
+        let root_local = match get_local_mat4(root_refno).await {
+            Ok(mat) => mat.filter(|m| !m.is_nan()),
+            Err(err) => {
+                eprintln!("⚠️  刷新根节点本地变换失败: {} -> {}", root_refno, err);
+                None
+            }
+        };
+        let root_world = compute_world_mat_from_owner_chain(root_refno)
+            .await
+            .with_context(|| format!("计算 root 世界变换失败: {}", root_refno))?;
+        push_entry(
+            &mut entries,
+            &mut total,
+            root_refno,
+            root_local,
+            Some(root_world),
+        );
+
+        let mut queue: VecDeque<(RefnoEnum, DMat4)> = VecDeque::new();
+        queue.push_back((root_refno, root_world));
+
+        while let Some((parent_refno, parent_world)) = queue.pop_front() {
+            let children = match get_children_refnos(parent_refno).await {
+                Ok(children) => children,
+                Err(err) => {
+                    eprintln!("⚠️  获取子节点失败: {} -> {}", parent_refno, err);
+                    continue;
+                }
+            };
+
+            for child in children {
+                let local_mat = match get_local_mat4(child).await {
+                    Ok(mat) => mat.filter(|m| !m.is_nan()),
+                    Err(err) => {
+                        eprintln!("⚠️  刷新本地变换失败: {} -> {}", child, err);
+                        None
+                    }
+                };
+                let world_mat = match local_mat {
+                    Some(local) => parent_world * local,
+                    None => parent_world,
+                };
+                push_entry(&mut entries, &mut total, child, local_mat, Some(world_mat));
+                queue.push_back((child, world_mat));
+
+                if entries.len() >= PE_TRANSFORM_BATCH_SIZE {
+                    save_pe_transform_entries(&entries).await.with_context(|| {
+                        format!("批量写入 pe_transform 失败: root_refno={}", root_refno)
+                    })?;
+                    entries.clear();
+                }
+            }
+        }
+    }
+
+    if !entries.is_empty() {
+        save_pe_transform_entries(&entries)
+            .await
+            .context("写入最后一批 pe_transform 失败")?;
+    }
+
+    println!(
+        "\r✅ 子树刷新完成！共处理 {} 个节点                    ",
+        total
+    );
+    Ok(total)
+}
+
 async fn query_total_nodes_for_dbnum(dbnum: u32) -> Result<usize> {
     let sql = format!(
         "SELECT count() AS count FROM pe WHERE dbnum = {} GROUP ALL",
@@ -182,6 +275,36 @@ fn dmat4_to_transform_option(matrix: Option<DMat4>) -> Option<Transform> {
         .filter(|mat| !mat.is_nan())
         .map(|mat| Transform::from_matrix(mat.as_mat4()))
         .filter(|transform| transform.is_finite())
+}
+
+async fn compute_world_mat_from_owner_chain(refno: RefnoEnum) -> Result<DMat4> {
+    let mut chain = vec![refno];
+    let mut current = refno;
+
+    loop {
+        let att = get_named_attmap(current)
+            .await
+            .with_context(|| format!("读取属性失败: {}", current))?;
+        let owner = att.get_owner();
+        if owner.is_unset() {
+            break;
+        }
+        chain.push(owner);
+        current = owner;
+    }
+
+    chain.reverse();
+
+    let mut world = DMat4::IDENTITY;
+    for node in chain {
+        let local = get_local_mat4(node)
+            .await
+            .with_context(|| format!("计算局部变换失败: {}", node))?
+            .unwrap_or(DMat4::IDENTITY);
+        world *= local;
+    }
+
+    Ok(world)
 }
 
 fn print_progress(processed: usize, total_nodes: usize, saved_batch: bool) {

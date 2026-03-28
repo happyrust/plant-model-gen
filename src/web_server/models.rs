@@ -322,10 +322,10 @@ impl DatabaseConfig {
             module: opt.module.clone(),
             db_type: "surrealdb".to_string(),
             surreal_ns,
-            db_ip: opt.ip.clone(),
-            db_port: opt.port.clone(),
-            db_user: opt.user.clone(),
-            db_password: opt.password.clone(),
+            db_ip: opt.surreal_ip.clone(),
+            db_port: opt.surreal_port.to_string(),
+            db_user: opt.surreal_user.clone(),
+            db_password: opt.surreal_password.clone(),
             gen_model: opt.gen_model,
             gen_mesh: opt.gen_mesh,
             gen_spatial_tree: opt.gen_spatial_tree,
@@ -337,6 +337,53 @@ impl DatabaseConfig {
             export_json: opt.export_json,
             export_parquet: opt.export_parquet,
         }
+    }
+
+    /// 将 WebServer 运行态配置转换回 core 侧使用的 DbOption。
+    ///
+    /// 说明：
+    /// - 以当前 `aios_core::get_db_option()` 为基底，保留未在 Web 配置中显式暴露的字段；
+    /// - 覆盖当前任务/站点真正关心的运行参数，避免退回到 `DbOption::default()` 的示例项目配置。
+    pub fn to_runtime_db_option(&self) -> DbOption {
+        let mut db_option = aios_core::get_db_option().clone();
+
+        if db_option.pe_chunk == 0 {
+            db_option.pe_chunk = 300;
+        }
+        if db_option.att_chunk == 0 {
+            db_option.att_chunk = 200;
+        }
+
+        db_option.manual_db_nums = if self.manual_db_nums.is_empty() {
+            None
+        } else {
+            Some(self.manual_db_nums.clone())
+        };
+        db_option.gen_model = self.gen_model;
+        db_option.gen_mesh = self.gen_mesh;
+        db_option.gen_spatial_tree = self.gen_spatial_tree;
+        db_option.apply_boolean_operation = self.apply_boolean_operation;
+        db_option.mesh_tol_ratio = Some(self.mesh_tol_ratio as f32);
+        db_option.mdb_name = self.mdb_name.clone();
+        db_option.module = self.module.clone();
+        db_option.project_name = self.project_name.clone();
+        db_option.project_code = self.project_code.to_string();
+        db_option.project_path = self.project_path.clone();
+        db_option.included_projects = vec![self.project_name.clone()];
+        db_option.meshes_path = self.meshes_path.clone();
+        db_option.export_json = self.export_json;
+        db_option.export_parquet = self.export_parquet;
+        db_option.surreal_ns = self.surreal_ns.to_string();
+        db_option.surreal_ip = self.db_ip.clone();
+        db_option.surreal_port = self.db_port.parse::<u16>().unwrap_or(db_option.surreal_port);
+        db_option.surreal_user = self.db_user.clone();
+        db_option.surreal_password = self.db_password.clone();
+        db_option.ip = self.db_ip.clone();
+        db_option.port = self.db_port.clone();
+        db_option.user = self.db_user.clone();
+        db_option.password = self.db_password.clone();
+
+        db_option
     }
 }
 

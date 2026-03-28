@@ -170,8 +170,6 @@ pub async fn start_web_server_with_config(
     port: u16,
     config_file: Option<&str>,
 ) -> anyhow::Result<()> {
-    let app_state = AppState::new();
-
     // 如果指定了配置文件，设置环境变量
     if let Some(config_path) = config_file {
         unsafe {
@@ -179,6 +177,8 @@ pub async fn start_web_server_with_config(
         }
         println!("⚙️  使用配置文件: {}.toml", config_path);
     }
+
+    let app_state = AppState::new();
 
     // 🔧 修复：初始化数据库连接 - 使用统一的 initialize_databases 函数
     println!("🔄 正在初始化数据库连接...");
@@ -195,6 +195,12 @@ pub async fn start_web_server_with_config(
 
     // 获取配置并初始化数据库（包括 SurrealDB）
     let db_option = aios_core::get_db_option();
+    {
+        let mut config_manager = app_state.config_manager.write().await;
+        let runtime_config = DatabaseConfig::from_db_option(&db_option);
+        config_manager.current_config = runtime_config.clone();
+        config_manager.add_template("runtime", runtime_config);
+    }
     match aios_core::initialize_databases(db_option).await {
         Ok(_) => {
             println!("✅ 数据库连接初始化成功");

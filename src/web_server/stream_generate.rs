@@ -2,14 +2,20 @@
 //!
 //! 实现增量模型生成 API，通过 SSE 推送生成进度。
 
+use anyhow::Context;
 use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
 use axum::{
     extract::{Json, Path, Query, State},
-    response::sse::{Event, KeepAlive, Sse},
+    response::{
+        IntoResponse,
+        Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
 use futures::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -228,23 +234,16 @@ async fn filter_geo_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum
         return Ok(Vec::new());
     }
 
-    // 这里的“有几何体”定义与 scene_tree 一致：按 noun 分类判断 has_geo。
-    // 为了避免 N+1，这里批量从 pe 表查询 noun。
-    const CHUNK: usize = 500;
     let mut out: Vec<RefnoEnum> = Vec::new();
 
-    for chunk in refnos.chunks(CHUNK) {
-        let id_list = chunk
-            .iter()
-            .map(|r| r.to_pe_key())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let sql = format!("SELECT id as refno, noun FROM [{id_list}]");
+    for refno in refnos {
+        let pe_key = refno.to_pe_key();
+        let sql = format!("SELECT id as refno, noun FROM {pe_key} LIMIT 1");
         let rows: Vec<PeNounRow> = project_primary_db()
             .query_take(&sql, 0)
             .await
-            .unwrap_or_default();
+            .with_context(|| format!("执行几何节点批量查询失败: {sql}"))?;
+
         for row in rows {
             if row.noun.is_empty() {
                 continue;
@@ -273,12 +272,18 @@ pub async fn filter_missing_inst_relate(refnos: &[RefnoEnum]) -> anyhow::Result<
         return Ok(Vec::new());
     }
 
-    // 使用 aios_core 的 query_insts 检查哪些已经有数据
-    let existing = aios_core::query_insts(refnos, false)
-        .await
-        .unwrap_or_default();
-    let existing_set: std::collections::HashSet<RefnoEnum> =
-        existing.into_iter().map(|inst| inst.refno).collect();
+    let mut existing_set: std::collections::HashSet<RefnoEnum> = std::collections::HashSet::new();
+    for refno in refnos {
+        let pe_key = refno.to_pe_key();
+        let sql = format!("SELECT VALUE in FROM inst_relate WHERE in = {pe_key} LIMIT 1");
+        let existing: Vec<RefnoEnum> = project_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .with_context(|| format!("检查 inst_relate 是否存在失败: {sql}"))?;
+        if !existing.is_empty() {
+            existing_set.insert(*refno);
+        }
+    }
 
     let missing: Vec<RefnoEnum> = refnos
         .iter()
@@ -303,9 +308,33 @@ pub async fn filter_missing_inst_relate(refnos: &[RefnoEnum]) -> anyhow::Result<
 ///
 /// 流式增量生成模型，通过 SSE 推送进度
 pub async fn api_stream_generate(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<StreamGenerateRequest>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Response {
+    let runtime_config = {
+        let config_manager = state.config_manager.read().await;
+        config_manager.current_config.clone()
+    };
+
+    if let Err(e) = aios_core::init_surreal().await {
+        let event = StreamGenerateEvent::Error {
+            message: format!(
+                "初始化流式生成数据库上下文失败: config={} err={e}",
+                runtime_config.name
+            ),
+        };
+        let single_event_stream = stream::once(async move {
+            let sse_event = Event::default()
+                .json_data(&event)
+                .unwrap_or_else(|_| Event::default().data("{\"type\":\"error\",\"message\":\"序列化失败\"}"));
+            Ok::<Event, Infallible>(sse_event)
+        });
+
+        return Sse::new(Box::pin(single_event_stream))
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
+
     // 将请求处理逻辑封装到异步流中
     let event_stream = stream::unfold(
         (req, StreamGenerateState::Init),
@@ -797,7 +826,9 @@ pub async fn api_stream_generate(
         Ok::<_, Infallible>(Event::default().data(json).event("message"))
     });
 
-    Sse::new(event_stream).keep_alive(KeepAlive::default())
+    Sse::new(Box::pin(event_stream))
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -826,7 +857,7 @@ pub async fn api_stream_generate_by_root(
     State(state): State<AppState>,
     Path(refno): Path<String>,
     Query(q): Query<StreamGenerateQuery>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Response {
     let req = StreamGenerateRequest {
         refnos: vec![refno],
         expand_children: q.expand_children,

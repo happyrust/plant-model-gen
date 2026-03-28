@@ -4347,8 +4347,6 @@ async fn execute_real_task(state: AppState, task_id: String) {
     use crate::fast_model::build_room_relations;
     use crate::fast_model::cal_model::{update_cal_bran_component, update_cal_equip};
     use crate::fast_model::gen_all_geos_data;
-    use aios_core::options::DbOption;
-
     use aios_core::init_surreal;
     use std::time::Instant;
 
@@ -4365,37 +4363,8 @@ async fn execute_real_task(state: AppState, task_id: String) {
         }
     };
 
-    // 创建数据库配置
-    let mut db_option = DbOption::default();
-    // DbOption::default() 会将 pe_chunk/att_chunk 初始化为 0，
-    // 而下游 keys.chunks(0) 会 panic，这里补上合理默认值
-    if db_option.pe_chunk == 0 {
-        db_option.pe_chunk = 300;
-    }
-    if db_option.att_chunk == 0 {
-        db_option.att_chunk = 200;
-    }
-    // 若未指定数据库编号，表示处理全部数据库（下游以 None 触发自动枚举）
-    db_option.manual_db_nums = if config.manual_db_nums.is_empty() {
-        None
-    } else {
-        Some(config.manual_db_nums.clone())
-    };
-    db_option.gen_model = config.gen_model;
-    db_option.gen_mesh = config.gen_mesh;
-    db_option.gen_spatial_tree = config.gen_spatial_tree;
-    db_option.apply_boolean_operation = config.apply_boolean_operation;
-    db_option.mesh_tol_ratio = Some(config.mesh_tol_ratio as f32);
-    db_option.mdb_name = config.mdb_name.clone();
-    db_option.module = config.module.clone();
-    db_option.project_name = config.project_name.clone();
-    db_option.project_code = config.project_code.to_string();
-    db_option.project_path = config.project_path.clone();
-    db_option.included_projects = vec![config.project_name.clone()];
-    db_option.meshes_path = config.meshes_path.clone();
-    db_option.export_json = config.export_json;
-    db_option.export_json = config.export_json;
-    db_option.export_parquet = config.export_parquet;
+    // 基于当前任务配置构造真实运行态 DbOption，避免退回到示例项目默认值。
+    let db_option = config.to_runtime_db_option();
     println!(
         "DEBUG: execute_real_task config.export_json={}, db_option.export_json={}",
         config.export_json, db_option.export_json

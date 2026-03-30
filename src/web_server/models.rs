@@ -375,7 +375,10 @@ impl DatabaseConfig {
         db_option.export_parquet = self.export_parquet;
         db_option.surreal_ns = self.surreal_ns.to_string();
         db_option.surreal_ip = self.db_ip.clone();
-        db_option.surreal_port = self.db_port.parse::<u16>().unwrap_or(db_option.surreal_port);
+        db_option.surreal_port = self
+            .db_port
+            .parse::<u16>()
+            .unwrap_or(db_option.surreal_port);
         db_option.surreal_user = self.db_user.clone();
         db_option.surreal_password = self.db_password.clone();
         db_option.ip = self.db_ip.clone();

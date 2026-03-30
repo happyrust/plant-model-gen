@@ -2,11 +2,13 @@ use aios_core::RecordId;
 
 use aios_core::options::DbOption;
 
+use aios_core::pdms_types::VISBILE_GEO_NOUNS;
+
 use aios_core::room::algorithm::*;
 
 use aios_core::shape::pdms_shape::PlantMesh;
 
-use aios_core::{GeomInstQuery, ModelHashInst, RefU64, RefnoEnum, model_primary_db};
+use aios_core::{GeomInstQuery, ModelHashInst, RefU64, RefnoEnum, SurrealQueryExt, model_primary_db};
 
 use dashmap::DashMap;
 
@@ -298,6 +300,182 @@ struct QueryAabbRowRaw {
     aabb: JsonValue,
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[derive(Debug, Deserialize, SurrealValue)]
+struct PeNounRow {
+    refno: RefnoEnum,
+    #[serde(default)]
+    noun: String,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[derive(Debug, Default)]
+struct SpatialIndexRefreshStats {
+    inserted: usize,
+    booled_override: usize,
+    skipped_invalid_aabb: usize,
+    skipped_missing_noun: usize,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn query_visible_geo_refnos_by_dbnums(db_nums: &[u32]) -> anyhow::Result<Vec<RefnoEnum>> {
+    use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+
+    if db_nums.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    info!("[room_model] 开始按 dbnums 从 TreeIndex 收集可见几何 refnos: {:?}", db_nums);
+    let manager = TreeIndexManager::with_default_dir(db_nums.to_vec());
+    let grouped = manager.query_nouns_grouped(&VISBILE_GEO_NOUNS);
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for noun in VISBILE_GEO_NOUNS {
+        if let Some(refnos) = grouped.get(noun) {
+            for &refno in refnos {
+                if refno.is_valid() && seen.insert(refno) {
+                    out.push(refno);
+                }
+            }
+        }
+    }
+
+    out.sort();
+    info!("[room_model] TreeIndex 可见几何收集完成: {} 个 refnos", out.len());
+    Ok(out)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn refresh_sqlite_spatial_index_from_refnos(
+    idx: &SqliteSpatialIndex,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<SpatialIndexRefreshStats> {
+    const BATCH_SIZE: usize = 500;
+
+    let mut stats = SpatialIndexRefreshStats::default();
+    if refnos.is_empty() {
+        return Ok(stats);
+    }
+
+    let total_chunks = (refnos.len() + BATCH_SIZE - 1) / BATCH_SIZE;
+    println!(
+        "[room_model] SQLite AABB scoped 刷新开始: refnos={}, chunks={}",
+        refnos.len(),
+        total_chunks
+    );
+
+    for (chunk_idx, chunk) in refnos.chunks(BATCH_SIZE).enumerate() {
+        let pe_list = chunk
+            .iter()
+            .map(|r| r.to_pe_key())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            r#"
+            SELECT id as refno, noun FROM [{pe_list}] WHERE id != NONE;
+            SELECT refno, aabb_id.d as aabb
+            FROM inst_relate_booled_aabb
+            WHERE refno IN [{pe_list}] AND aabb_id.d != NONE;
+            SELECT refno, aabb_id.d as aabb
+            FROM inst_relate_aabb
+            WHERE refno IN [{pe_list}] AND aabb_id.d != NONE;
+            "#
+        );
+
+        let mut response = model_primary_db().query_response(&sql).await?;
+        let noun_rows: Vec<PeNounRow> = response.take(0)?;
+        let booled_rows: Vec<QueryAabbRowRaw> = response.take(1)?;
+        let raw_rows: Vec<QueryAabbRowRaw> = response.take(2)?;
+
+        let noun_map: HashMap<RefnoEnum, String> = noun_rows
+            .into_iter()
+            .filter(|row| row.refno.is_valid())
+            .map(|row| (row.refno, row.noun))
+            .collect();
+
+        let mut booled_map: HashMap<RefnoEnum, Aabb> = HashMap::new();
+        for row in booled_rows {
+            if !row.refno.is_valid() {
+                continue;
+            }
+            let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
+                stats.skipped_invalid_aabb += 1;
+                continue;
+            };
+            booled_map
+                .entry(row.refno)
+                .and_modify(|acc| *acc = merge_aabb(acc, &aabb))
+                .or_insert(aabb);
+        }
+
+        let mut raw_map: HashMap<RefnoEnum, Aabb> = HashMap::new();
+        for row in raw_rows {
+            if !row.refno.is_valid() {
+                continue;
+            }
+            let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
+                stats.skipped_invalid_aabb += 1;
+                continue;
+            };
+            raw_map
+                .entry(row.refno)
+                .and_modify(|acc| *acc = merge_aabb(acc, &aabb))
+                .or_insert(aabb);
+        }
+
+        let mut batch: Vec<(i64, String, f64, f64, f64, f64, f64, f64)> =
+            Vec::with_capacity(chunk.len());
+
+        for refno in chunk {
+            let Some(noun) = noun_map.get(refno) else {
+                stats.skipped_missing_noun += 1;
+                continue;
+            };
+
+            let selected = if let Some(aabb) = booled_map.get(refno) {
+                stats.booled_override += 1;
+                Some(*aabb)
+            } else {
+                raw_map.get(refno).copied()
+            };
+
+            let Some(aabb) = selected else {
+                continue;
+            };
+
+            batch.push((
+                refno.refno().0 as i64,
+                noun.clone(),
+                aabb.mins.x as f64,
+                aabb.maxs.x as f64,
+                aabb.mins.y as f64,
+                aabb.maxs.y as f64,
+                aabb.mins.z as f64,
+                aabb.maxs.z as f64,
+            ));
+        }
+
+        if !batch.is_empty() {
+            stats.inserted += idx.inner().insert_aabbs_with_items(batch)?;
+        }
+
+        let current = chunk_idx + 1;
+        if current == 1 || current == total_chunks || current % 10 == 0 {
+            println!(
+                "[room_model] SQLite AABB scoped 刷新进度: {}/{}, inserted={}, booled_override={}",
+                current,
+                total_chunks,
+                stats.inserted,
+                stats.booled_override
+            );
+        }
+    }
+
+    Ok(stats)
+}
+
 /// 从 inst_relate_aabb 批量查询 refno -> Aabb 映射。
 /// 优先使用 inst_relate_booled_aabb（布尔运算后的 AABB），
 /// 如果布尔运算后没有对应记录，则回退到 inst_relate_aabb（原始几何 AABB）。
@@ -398,7 +576,6 @@ pub async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
     use crate::data_interface::db_meta;
     use crate::fast_model::query_compat::query_visible_geo_descendants;
 
-    const CHUNK_SIZE: usize = 5000;
     let db_filter: Option<HashSet<u32>> = db_nums.map(|nums| nums.iter().copied().collect());
 
     if db_filter.is_some() {
@@ -410,19 +587,53 @@ pub async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
         })?;
     }
 
-    let refno_filter: Option<HashSet<RefU64>> = if let Some(root) = refno_root {
-        let set = query_visible_geo_descendants(root, true, None)
-            .await?
-            .into_iter()
-            .map(|r| r.refno())
-            .collect::<HashSet<_>>();
-        Some(set)
+    let idx = SqliteSpatialIndex::with_default_path()?;
+    idx.clear()?;
+
+    let scoped_refnos = if refno_root.is_some() || db_nums.is_some() {
+        let mut scoped = if let Some(root) = refno_root {
+            query_visible_geo_descendants(root, true, None).await?
+        } else {
+            query_visible_geo_refnos_by_dbnums(db_nums.unwrap_or(&[])).await?
+        };
+
+        if let Some(filter) = &db_filter {
+            let original = scoped.len();
+            scoped.retain(|refno| match db_meta().get_dbnum_by_refno(*refno) {
+                Some(dbnum) => filter.contains(&dbnum),
+                None => false,
+            });
+            info!(
+                "[room_model] SQLite AABB scoped refnos 收缩: original={} filtered={}",
+                original,
+                scoped.len()
+            );
+        }
+
+        scoped.sort();
+        scoped.dedup();
+        Some(scoped)
     } else {
         None
     };
 
-    let idx = SqliteSpatialIndex::with_default_path()?;
-    idx.clear()?;
+    if let Some(ref scoped_refnos) = scoped_refnos {
+        let stats = refresh_sqlite_spatial_index_from_refnos(&idx, scoped_refnos).await?;
+        info!(
+            "[room_model] SQLite AABB 刷新完成: inserted={}, booled_override={}, skipped_db={}, skipped_refno_root={}, skipped_missing_dbmap={}, skipped_invalid_aabb={}, skipped_missing_noun={}, scope=scoped",
+            stats.inserted,
+            stats.booled_override,
+            0,
+            0,
+            0,
+            stats.skipped_invalid_aabb,
+            stats.skipped_missing_noun
+        );
+        return Ok(stats.inserted);
+    }
+
+    const CHUNK_SIZE: usize = 5000;
+    let refno_filter: Option<HashSet<RefU64>> = None;
 
     // 预加载所有布尔运算后的 AABB（优先级更高）
     let mut booled_aabb_map: HashMap<RefnoEnum, Aabb> = HashMap::new();
@@ -1034,7 +1245,12 @@ async fn build_room_relations_with_cancel_and_overrides(
         if let Some(ref cb) = progress_callback {
             cb(0.02, "正在刷新 SQLite AABB 索引");
         }
+        info!(
+            "[room_model] 开始刷新 SQLite AABB 索引: db_nums={:?}, refno_root={:?}, force_rebuild={}",
+            db_nums, refno_root, force_rebuild
+        );
         ensure_spatial_index_ready(db_nums, refno_root.clone(), force_rebuild).await?;
+        println!("[room_model] SQLite AABB 索引刷新完成");
     }
 
     // 1. 构建房间面板映射关系
@@ -1043,58 +1259,10 @@ async fn build_room_relations_with_cancel_and_overrides(
         cb(0.05, "正在查询房间面板映射关系");
     }
 
-    let mut room_panel_map = build_room_panels_relate_for_query(&room_key_words).await?;
+    let room_panel_map =
+        build_room_panels_relate_for_query_scoped(&room_key_words, db_nums, refno_root).await?;
 
     info!("查询到 {} 个房间面板映射关系", room_panel_map.len());
-
-    // 2. 应用 dbnum 过滤
-
-    if let Some(db_nums) = db_nums {
-        use crate::data_interface::db_meta;
-
-        let _ = db_meta().ensure_loaded();
-
-        let db_num_set: HashSet<u32> = db_nums.iter().copied().collect();
-
-        room_panel_map.retain(|(refno, _, _)| {
-            // ref0 != dbnum，必须通过 db_meta 映射
-
-            match db_meta().get_dbnum_by_refno(*refno) {
-                Some(dbnum) => db_num_set.contains(&dbnum),
-
-                None => {
-                    log::warn!(
-                        "[room_model] 缺少 ref0->dbnum 映射，跳过房间过滤: refno={}",
-                        refno
-                    );
-
-                    false
-                }
-            }
-        });
-
-        info!("dbnum 过滤后剩余 {} 个房间", room_panel_map.len());
-    }
-
-    // 3. 应用 refno 子树过滤
-
-    if let Some(root) = refno_root {
-        use crate::fast_model::query_compat::query_visible_geo_descendants;
-
-        let visible_refnos: HashSet<RefnoEnum> = query_visible_geo_descendants(root, true, None)
-            .await?
-            .into_iter()
-            .collect();
-
-        room_panel_map.retain(|(room_refno, _, panel_refnos)| {
-            // 房间本身在子树内，或者有面板在子树内
-
-            visible_refnos.contains(room_refno)
-                || panel_refnos.iter().any(|p| visible_refnos.contains(p))
-        });
-
-        info!("refno 子树过滤后剩余 {} 个房间", room_panel_map.len());
-    }
 
     // 预取面板几何：基于粗筛后的面板集合分批查询 SurrealDB，结果放入进程内缓存。
     {
@@ -1305,15 +1473,20 @@ async fn compute_room_relations_with_cancel(
         .buffer_unordered(options.concurrency.max(1))
         .map(|res| {
             pb.inc(1);
+            let current = pb.position();
+
+            if current == 1 || current == total_rooms as u64 || current % 10 == 0 {
+                println!("[room_model] 房间归属计算进度: {}/{}", current, total_rooms);
+            }
 
             // 保留原有的 progress_callback 以支持 Web/GRPC
 
             if let Some(ref cb) = progress_callback {
-                let progress = 0.1 + (pb.position() as f32 / total_rooms as f32) * 0.85;
+                let progress = 0.1 + (current as f32 / total_rooms as f32) * 0.85;
 
                 cb(
                     progress,
-                    &format!("已处理 {}/{} 个房间", pb.position(), total_rooms),
+                    &format!("已处理 {}/{} 个房间", current, total_rooms),
                 );
             }
 
@@ -1464,6 +1637,61 @@ pub async fn build_room_panels_relate_for_query(
     build_room_panels_relate_common_with_persist(room_key_word, |_| true, false).await
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn build_room_panels_relate_for_query_scoped(
+    room_key_word: &Vec<String>,
+    db_nums: Option<&[u32]>,
+    refno_root: Option<RefnoEnum>,
+) -> anyhow::Result<Vec<(RefnoEnum, String, Vec<RefnoEnum>)>> {
+    use crate::data_interface::db_meta;
+    use crate::fast_model::query_compat::query_visible_geo_descendants;
+
+    let db_filter = db_nums.map(|nums| nums.iter().copied().collect::<HashSet<u32>>());
+    if db_filter.is_some() {
+        let _ = db_meta().ensure_loaded();
+    }
+
+    let visible_refnos = if let Some(root) = refno_root {
+        Some(
+            query_visible_geo_descendants(root, true, None)
+                .await?
+                .into_iter()
+                .collect::<HashSet<_>>(),
+        )
+    } else {
+        None
+    };
+
+    #[cfg(feature = "project_hd")]
+    return build_room_panels_relate_common_with_persist_scoped(
+        room_key_word,
+        match_room_name_hd,
+        false,
+        db_filter.as_ref(),
+        visible_refnos.as_ref(),
+    )
+    .await;
+
+    #[cfg(feature = "project_hh")]
+    return build_room_panels_relate_common_with_persist_scoped(
+        room_key_word,
+        match_room_name_hh,
+        false,
+        db_filter.as_ref(),
+        visible_refnos.as_ref(),
+    )
+    .await;
+
+    build_room_panels_relate_common_with_persist_scoped(
+        room_key_word,
+        |_| true,
+        false,
+        db_filter.as_ref(),
+        visible_refnos.as_ref(),
+    )
+    .await
+}
+
 /// 改进版本的房间面板关系构建通用函数
 
 async fn build_room_panels_relate_common<F>(
@@ -1495,9 +1723,48 @@ where
     let start_time = Instant::now();
 
     // 优化：使用 TreeIndex 查询房间面板，避免嵌套 SurrealQL
-    let room_groups = query_room_panels_with_tree_index(room_key_word, match_room_fn).await?;
+    let room_groups =
+        query_room_panels_with_tree_index(room_key_word, match_room_fn, None, None).await?;
 
     // 批量创建房间面板关系（分块提交）
+
+    if persist && !room_groups.is_empty() {
+        create_room_panel_relations_batch_chunked(&room_groups).await?;
+    }
+
+    if persist {
+        info!(
+            "房间面板关系构建完成: {} 个关系, 耗时 {:?}",
+            room_groups.len(),
+            start_time.elapsed()
+        );
+    } else {
+        info!(
+            "房间面板映射构建完成(未写入关系): {} 个关系, 耗时 {:?}",
+            room_groups.len(),
+            start_time.elapsed()
+        );
+    }
+
+    Ok(room_groups)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn build_room_panels_relate_common_with_persist_scoped<F>(
+    room_key_word: &Vec<String>,
+    match_room_fn: F,
+    persist: bool,
+    db_filter: Option<&HashSet<u32>>,
+    visible_refnos: Option<&HashSet<RefnoEnum>>,
+) -> anyhow::Result<Vec<(RefnoEnum, String, Vec<RefnoEnum>)>>
+where
+    F: Fn(&str) -> bool + Send + Sync,
+{
+    let start_time = Instant::now();
+
+    let room_groups =
+        query_room_panels_with_tree_index(room_key_word, match_room_fn, db_filter, visible_refnos)
+            .await?;
 
     if persist && !room_groups.is_empty() {
         create_room_panel_relations_batch_chunked(&room_groups).await?;
@@ -1524,6 +1791,8 @@ where
 async fn query_room_panels_with_tree_index<F>(
     room_key_word: &[String],
     match_room_fn: F,
+    db_filter: Option<&HashSet<u32>>,
+    visible_refnos: Option<&HashSet<RefnoEnum>>,
 ) -> anyhow::Result<Vec<(RefnoEnum, String, Vec<RefnoEnum>)>>
 where
     F: Fn(&str) -> bool + Send + Sync,
@@ -1534,13 +1803,17 @@ where
 
     // 1. 查询候选房间（只查房间本身，不查子孙）
     let rooms = query_candidate_rooms(room_key_word).await?;
+    let original_room_count = rooms.len();
+    let rooms = filter_candidate_rooms_by_scope(rooms, match_room_fn, db_filter, visible_refnos)?;
+    println!(
+        "[room_model] 房间面板候选收缩: original={} scoped={}",
+        original_room_count,
+        rooms.len()
+    );
 
     // 2. 按 dbnum 分组；解析失败直接报错，避免静默漏算房间
-    let grouped_by_db = group_candidate_rooms_by_dbnum(
-        rooms,
-        match_room_fn,
-        TreeIndexManager::resolve_dbnum_for_refno,
-    )?;
+    let grouped_by_db =
+        group_candidate_rooms_by_dbnum(rooms, |_| true, TreeIndexManager::resolve_dbnum_for_refno)?;
 
     // 3. 对每个 dbnum 只加载一次 TreeIndex，再批量查询房间面板
     query_grouped_room_panels_with_loader(grouped_by_db, |dbnum, items| {
@@ -1594,6 +1867,19 @@ where
                 .filter(|refno| refno.is_valid())
                 .collect::<Vec<_>>();
 
+            let descendants = if let Some(visible) = visible_refnos {
+                if visible.contains(room_refno) {
+                    descendants
+                } else {
+                    descendants
+                        .into_iter()
+                        .filter(|refno| visible.contains(refno))
+                        .collect::<Vec<_>>()
+                }
+            } else {
+                descendants
+            };
+
             if !descendants.is_empty() {
                 out.push((*room_refno, room_num.clone(), descendants));
             }
@@ -1601,6 +1887,63 @@ where
 
         Ok(out)
     })
+}
+
+fn filter_candidate_rooms_by_scope<F>(
+    rooms: Vec<(RefnoEnum, String)>,
+    match_room_fn: F,
+    db_filter: Option<&HashSet<u32>>,
+    visible_refnos: Option<&HashSet<RefnoEnum>>,
+) -> anyhow::Result<Vec<(RefnoEnum, String)>>
+where
+    F: Fn(&str) -> bool,
+{
+    use crate::data_interface::db_meta;
+
+    let mut skipped_missing_dbmap = 0usize;
+    let mut skipped_by_db = 0usize;
+    let mut skipped_by_refno_root = 0usize;
+
+    let mut out = Vec::with_capacity(rooms.len());
+    for (room_refno, room_num) in rooms {
+        if !room_refno.is_valid() || !match_room_fn(&room_num) {
+            continue;
+        }
+
+        if let Some(filter) = db_filter {
+            match db_meta().get_dbnum_by_refno(room_refno) {
+                Some(dbnum) if filter.contains(&dbnum) => {}
+                Some(_) => {
+                    skipped_by_db += 1;
+                    continue;
+                }
+                None => {
+                    skipped_missing_dbmap += 1;
+                    continue;
+                }
+            }
+        }
+
+        if visible_refnos.is_some() {
+            // refno_root 的语义需要结合 panel 子树结果判断，不能在 room 候选阶段仅凭 room_refno 提前剪掉。
+            // 否则像 FRMW 这类非可见几何房间节点会被误删，导致 scoped 计算得到 0 个房间。
+            skipped_by_refno_root += 0;
+        }
+
+        out.push((room_refno, room_num));
+    }
+
+    if db_filter.is_some() || visible_refnos.is_some() {
+        println!(
+            "[room_model] scoped 房间过滤: kept={}, skipped_db={}, skipped_refno_root={}, skipped_missing_dbmap={}",
+            out.len(),
+            skipped_by_db,
+            skipped_by_refno_root,
+            skipped_missing_dbmap
+        );
+    }
+
+    Ok(out)
 }
 
 fn group_candidate_rooms_by_dbnum<F, R>(

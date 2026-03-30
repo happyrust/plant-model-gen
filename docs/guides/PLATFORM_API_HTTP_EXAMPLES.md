@@ -4,6 +4,13 @@
 
 > 当 `[review_auth].enabled = true` 时，下列接口中带 `token` 的需为有效 JWT（与 `编校审交互接口设计.md` 一致）。
 
+## 相关文档导航
+
+- **Guides 总入口**：`docs/guides/README.md`
+- **workflow/sync 按 form_id 返回 records 的完整测试模拟**：`docs/guides/WORKFLOW_SYNC_FORM_ID_TEST_SIMULATION.md`
+- **reviewer 页面恢复 + Playwright 截图教程**：`docs/guides/WORKFLOW_SYNC_FORM_ID_PLAYWRIGHT_TUTORIAL.md`
+- **PMS mock 展示层联调页**：`docs/guides/PMS_WORKFLOW_SYNC_MOCK_PAGE.md`
+
 ---
 
 ## 1. 嵌入地址 `POST /api/review/embed-url`

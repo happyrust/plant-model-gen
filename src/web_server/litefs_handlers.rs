@@ -1,6 +1,6 @@
-use axum::{http::StatusCode, Json};
+use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::env;
 
 const DEFAULT_LITEFS_STATUS_URL: &str = "http://localhost:20203/status";

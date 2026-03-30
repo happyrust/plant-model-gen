@@ -2,13 +2,12 @@
 //!
 //! 实现增量模型生成 API，通过 SSE 推送生成进度。
 
-use anyhow::Context;
 use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
+use anyhow::Context;
 use axum::{
     extract::{Json, Path, Query, State},
     response::{
-        IntoResponse,
-        Response,
+        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
 };
@@ -324,9 +323,9 @@ pub async fn api_stream_generate(
             ),
         };
         let single_event_stream = stream::once(async move {
-            let sse_event = Event::default()
-                .json_data(&event)
-                .unwrap_or_else(|_| Event::default().data("{\"type\":\"error\",\"message\":\"序列化失败\"}"));
+            let sse_event = Event::default().json_data(&event).unwrap_or_else(|_| {
+                Event::default().data("{\"type\":\"error\",\"message\":\"序列化失败\"}")
+            });
             Ok::<Event, Infallible>(sse_event)
         });
 

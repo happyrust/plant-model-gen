@@ -72,6 +72,12 @@ pub fn add_export_instance_args(command: Command) -> Command {
                 .action(clap::ArgAction::SetTrue)
                 .requires("export-v3"),
         )
+        .arg(
+            Arg::new("merge-v3")
+                .long("merge-v3")
+                .help("Merge all per-dbnum instances_v3_*.json into a single instances_v3.json (no DB needed)")
+                .action(clap::ArgAction::SetTrue),
+        )
 }
 
 pub fn add_init_project_subcommand(command: Command) -> Command {

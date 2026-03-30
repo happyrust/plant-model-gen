@@ -481,7 +481,7 @@ fn kill_pid(pid: &str) -> bool {
 /// - 未启动 → 使用 `[web_server]` 配置自动拉起 SurrealDB 后台进程，等待就绪后再连接
 ///
 /// file 模式下会先关闭可能占用数据目录的 ws server 进程（RocksDB 排他锁）。
-async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
+pub async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()> {
     use aios_core::options::DbConnMode;
 
     let sdb_cfg = db_option_ext.inner.effective_surrealdb();
@@ -3324,6 +3324,39 @@ pub async fn export_dbnum_instances_v3_mode(
     println!("   - TUBI 实例: {}", stats.total_tubing_instances);
     println!("   - transforms 条目: {}", stats.transform_count);
     println!("   - aabb 条目: {}", stats.aabb_count);
+    println!("   - 耗时: {:?}", stats.elapsed);
+    Ok(())
+}
+
+/// 合并 v3_bundle 下所有 per-dbnum JSON 为单个 instances_v3.json
+pub fn merge_v3_instances_mode(
+    verbose: bool,
+    output_override: Option<PathBuf>,
+    db_option_ext: &DbOptionExt,
+) -> Result<()> {
+    use aios_database::fast_model::export_model::export_dbnum_instances_v3::merge_v3_instances;
+
+    let v3_bundle_dir =
+        output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("v3_bundle"));
+
+    println!("\n🔗 合并 V3 per-dbnum JSON → instances_v3.json");
+    println!("====================================");
+    println!("📂 目录: {}", v3_bundle_dir.display());
+
+    let stats = merge_v3_instances(&v3_bundle_dir, verbose)?;
+
+    println!("\n🎉 V3 合并完成！");
+    println!("📊 统计信息:");
+    println!("   - 输入文件数: {}", stats.file_count);
+    println!("   - BRAN/HANG 分组: {}", stats.bran_group_count);
+    println!("   - EQUI 分组: {}", stats.equi_group_count);
+    println!("   - 未分组: {}", stats.ungrouped_count);
+    println!("   - transforms 条目: {}", stats.transform_count);
+    println!("   - aabb 条目: {}", stats.aabb_count);
+    println!(
+        "   - 文件大小: {:.2} MB",
+        stats.output_size_bytes as f64 / 1_048_576.0
+    );
     println!("   - 耗时: {:?}", stats.elapsed);
     Ok(())
 }

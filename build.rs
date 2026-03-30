@@ -21,7 +21,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .map(|value| value.trim().trim_start_matches('v').to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string()));
+        .unwrap_or_else(|| {
+            std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string())
+        });
     println!("cargo:rustc-env=APP_VERSION={}", app_version);
 
     Ok(())

@@ -5,7 +5,7 @@
 use super::tree_index_manager::TreeIndexManager;
 use crate::fast_model::resolve_desi_comp;
 use aios_core::parsed_data::geo_params_data::CateGeoParam::{BoxImplied, TubeImplied};
-use aios_core::pdms_types::CataHashRefnoKV;
+use aios_core::pdms_types::{CataHashRefnoKV, USE_CATE_NOUN_NAMES};
 use aios_core::prim_geo::tubing::TubiSize;
 use aios_core::tool::db_tool::db1_hash;
 use aios_core::tree_query::{TreeIndex, TreeQuery, TreeQueryFilter};
@@ -90,9 +90,19 @@ pub async fn query_tubi_size(
 
 static BRAN_HASH: Lazy<u32> = Lazy::new(|| db1_hash("BRAN"));
 static HANG_HASH: Lazy<u32> = Lazy::new(|| db1_hash("HANG"));
+static CATE_NOUN_HASHES: Lazy<HashSet<u32>> = Lazy::new(|| {
+    USE_CATE_NOUN_NAMES
+        .iter()
+        .map(|noun| db1_hash(noun))
+        .collect()
+});
 
 fn is_bran_or_hang(noun_hash: u32) -> bool {
     noun_hash == *BRAN_HASH || noun_hash == *HANG_HASH
+}
+
+fn is_cate_noun(noun_hash: u32) -> bool {
+    CATE_NOUN_HASHES.contains(&noun_hash)
 }
 
 pub(crate) fn is_valid_cata_hash(cata_hash: &str) -> bool {
@@ -111,6 +121,9 @@ fn insert_cata_hash_refno(
     meta: &aios_core::tree_query::TreeNodeMeta,
 ) {
     if is_bran_or_hang(meta.noun) {
+        return;
+    }
+    if !is_cate_noun(meta.noun) {
         return;
     }
     let refno = RefnoEnum::from(meta.refno);

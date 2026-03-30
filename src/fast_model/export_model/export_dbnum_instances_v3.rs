@@ -604,6 +604,32 @@ async fn query_inst_relate_by_dbnum(dbnum: u32, verbose: bool) -> Result<Vec<Ins
     Ok(rows)
 }
 
+/// 查询 inst_relate 全表（不按 dbnum 过滤）
+async fn query_inst_relate_all(verbose: bool) -> Result<Vec<InstRelateRow>> {
+    if verbose {
+        println!("🔍 扫描 inst_relate 全表...");
+    }
+
+    let sql = r#"
+        SELECT
+            owner_refno,
+            owner_type,
+            in as refno,
+            in.noun as noun,
+            spec_value as spec_value
+        FROM inst_relate
+    "#;
+
+    let mut resp = aios_core::project_primary_db().query(sql).await?;
+    let rows: Vec<InstRelateRow> = resp.take(0)?;
+
+    if verbose {
+        println!("   ✅ inst_relate 全表命中: {} 条", rows.len());
+    }
+
+    Ok(rows)
+}
+
 async fn query_export_insts(
     refnos: &[RefnoEnum],
     enable_holes: bool,
@@ -962,4 +988,209 @@ async fn resolve_aabb(
     }
 
     Ok(result)
+}
+
+// =============================================================================
+// 合并所有 per-dbnum V3 JSON 为单文件
+// =============================================================================
+
+pub struct V3MergeStats {
+    pub file_count: usize,
+    pub bran_group_count: usize,
+    pub equi_group_count: usize,
+    pub ungrouped_count: usize,
+    pub transform_count: usize,
+    pub aabb_count: usize,
+    pub output_size_bytes: u64,
+    pub elapsed: std::time::Duration,
+}
+
+/// 读取 `v3_bundle_dir` 下所有 `instances_v3_<dbnum>.json`，
+/// 合并 transforms/aabb 字典 + 拼接 bran_groups/equi_groups/ungrouped，
+/// 写入 `instances_v3.json`。纯文件操作，无需数据库连接。
+pub fn merge_v3_instances(v3_bundle_dir: &Path, verbose: bool) -> Result<V3MergeStats> {
+    let start = std::time::Instant::now();
+
+    // 1. 扫描 per-dbnum 文件
+    let mut per_dbnum_files: Vec<std::path::PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(v3_bundle_dir)
+        .with_context(|| format!("读取目录失败: {}", v3_bundle_dir.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // 匹配 instances_v3_<digits>.json，排除 root_ 文件和已合并的 instances_v3.json
+        if name_str.starts_with("instances_v3_")
+            && name_str.ends_with(".json")
+            && !name_str.contains("root_")
+            && name_str != "instances_v3.json"
+        {
+            per_dbnum_files.push(entry.path());
+        }
+    }
+    per_dbnum_files.sort();
+
+    if per_dbnum_files.is_empty() {
+        anyhow::bail!(
+            "在 {} 下未找到 instances_v3_<dbnum>.json 文件",
+            v3_bundle_dir.display()
+        );
+    }
+
+    if verbose {
+        println!(
+            "📂 找到 {} 个 per-dbnum V3 JSON 文件",
+            per_dbnum_files.len()
+        );
+    }
+
+    // 2. 逐文件读取并合并
+    let mut merged_transforms: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut merged_aabb: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut merged_bran_groups: Vec<serde_json::Value> = Vec::new();
+    let mut merged_equi_groups: Vec<serde_json::Value> = Vec::new();
+    let mut merged_ungrouped: Vec<serde_json::Value> = Vec::new();
+    let mut first_export_transform: Option<serde_json::Value> = None;
+    let mut dbnums: Vec<u32> = Vec::new();
+    let mut skipped = 0usize;
+
+    for path in &per_dbnum_files {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("读取失败: {}", path.display()))?;
+        let root: serde_json::Value = serde_json::from_str(&content)
+            .with_context(|| format!("JSON 解析失败: {}", path.display()))?;
+
+        let obj = match root.as_object() {
+            Some(o) => o,
+            None => {
+                if verbose {
+                    println!("   ⚠️ 跳过非对象 JSON: {}", path.display());
+                }
+                skipped += 1;
+                continue;
+            }
+        };
+
+        // dbnum
+        if let Some(dbnum) = obj.get("dbnum").and_then(|v| v.as_u64()) {
+            dbnums.push(dbnum as u32);
+        }
+
+        // export_transform（取第一个非空的）
+        if first_export_transform.is_none() {
+            if let Some(et) = obj.get("export_transform") {
+                first_export_transform = Some(et.clone());
+            }
+        }
+
+        // transforms
+        if let Some(transforms) = obj.get("transforms").and_then(|v| v.as_object()) {
+            for (k, v) in transforms {
+                merged_transforms
+                    .entry(k.clone())
+                    .or_insert_with(|| v.clone());
+            }
+        }
+
+        // aabb
+        if let Some(aabb) = obj.get("aabb").and_then(|v| v.as_object()) {
+            for (k, v) in aabb {
+                merged_aabb.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+
+        // bran_groups
+        if let Some(groups) = obj.get("bran_groups").and_then(|v| v.as_array()) {
+            merged_bran_groups.extend(groups.iter().cloned());
+        }
+
+        // equi_groups
+        if let Some(groups) = obj.get("equi_groups").and_then(|v| v.as_array()) {
+            merged_equi_groups.extend(groups.iter().cloned());
+        }
+
+        // ungrouped
+        if let Some(items) = obj.get("ungrouped").and_then(|v| v.as_array()) {
+            merged_ungrouped.extend(items.iter().cloned());
+        }
+
+        if verbose {
+            let fname = path.file_name().unwrap_or_default().to_string_lossy();
+            let t_count = obj
+                .get("transforms")
+                .and_then(|v| v.as_object())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let b_count = obj
+                .get("bran_groups")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let e_count = obj
+                .get("equi_groups")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            println!(
+                "   ✅ {} → trans={}, bran={}, equi={}",
+                fname, t_count, b_count, e_count
+            );
+        }
+    }
+
+    if verbose && skipped > 0 {
+        println!("   ⚠️ 跳过 {} 个无效文件", skipped);
+    }
+
+    // 3. 组装合并后的 JSON
+    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    let merged_json = json!({
+        "version": 3,
+        "format": "json",
+        "generated_at": generated_at,
+        "dbnums": dbnums,
+        "export_transform": first_export_transform.unwrap_or(json!({})),
+        "transforms": merged_transforms,
+        "aabb": merged_aabb,
+        "bran_groups": merged_bran_groups,
+        "equi_groups": merged_equi_groups,
+        "ungrouped": merged_ungrouped,
+    });
+
+    // 4. 写入
+    let output_path = v3_bundle_dir.join("instances_v3.json");
+    let json_str = serde_json::to_string_pretty(&merged_json)?;
+    std::fs::write(&output_path, &json_str)
+        .with_context(|| format!("写入合并文件失败: {}", output_path.display()))?;
+
+    let output_size = std::fs::metadata(&output_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let elapsed = start.elapsed();
+
+    if verbose {
+        println!("\n📊 [v3-merge] 合并统计:");
+        println!("   - 输入文件: {}", per_dbnum_files.len());
+        println!("   - dbnums: {:?}", dbnums);
+        println!("   - transforms 条目: {}", merged_transforms.len());
+        println!("   - aabb 条目: {}", merged_aabb.len());
+        println!("   - BRAN 分组: {}", merged_bran_groups.len());
+        println!("   - EQUI 分组: {}", merged_equi_groups.len());
+        println!("   - 未分组: {}", merged_ungrouped.len());
+        println!("   - 文件大小: {:.2} MB", output_size as f64 / 1_048_576.0);
+        println!("   - 耗时: {:.2}s", elapsed.as_secs_f64());
+        println!("   ✅ 写入: {}", output_path.display());
+    }
+
+    Ok(V3MergeStats {
+        file_count: per_dbnum_files.len(),
+        bran_group_count: merged_bran_groups.len(),
+        equi_group_count: merged_equi_groups.len(),
+        ungrouped_count: merged_ungrouped.len(),
+        transform_count: merged_transforms.len(),
+        aabb_count: merged_aabb.len(),
+        output_size_bytes: output_size,
+        elapsed,
+    })
 }

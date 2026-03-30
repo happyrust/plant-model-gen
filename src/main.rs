@@ -2042,7 +2042,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 导出精简 V3 JSON（矩阵去重）
     if matches.get_flag("export-v3") {
-        use crate::cli_modes::export_dbnum_instances_v3_mode;
+        use crate::cli_modes::{export_dbnum_instances_v3_mode, merge_v3_instances_mode};
         use aios_core::pdms_types::RefnoEnum;
         use std::str::FromStr;
 
@@ -2060,30 +2060,85 @@ async fn main() -> anyhow::Result<()> {
                 RefnoEnum::from_str(&refno_str).ok()
             });
 
-        let dbnum = match dbnum {
-            Some(n) => n,
-            None => {
-                eprintln!("❌ 错误: --export-v3 需要提供 --dbnum 参数");
-                eprintln!("   例如: cargo run -- --export-v3 --dbnum 1112");
-                std::process::exit(1);
-            }
-        };
-
         let cli_use_surrealdb = matches.get_flag("use-surrealdb");
         if cli_use_surrealdb {
             db_option_ext.use_surrealdb = true;
         }
 
-        return export_dbnum_instances_v3_mode(
-            dbnum,
-            verbose,
-            export_bundle_dir,
-            &db_option_ext,
-            root_refno,
-            target_unit,
-            apply_rotation,
-        )
-        .await;
+        if let Some(single_dbnum) = dbnum {
+            // 单 dbnum 模式
+            return export_dbnum_instances_v3_mode(
+                single_dbnum,
+                verbose,
+                export_bundle_dir,
+                &db_option_ext,
+                root_refno,
+                target_unit,
+                apply_rotation,
+            )
+            .await;
+        } else {
+            // 全库模式：导出所有 DESI dbnum 后自动合并
+            println!("\n🔁 全库 V3 导出模式（未指定 --dbnum，自动遍历所有 DESI）");
+            use crate::cli_modes::ensure_surreal_connected;
+            use aios_database::data_interface::db_meta_manager::db_meta;
+            ensure_surreal_connected(&db_option_ext).await?;
+
+            let _ = db_meta().ensure_loaded();
+            let mut dbnos: Vec<u32> = db_meta().get_all_dbnums();
+            dbnos.sort();
+            if dbnos.is_empty() {
+                eprintln!("⚠️ db_meta 未返回任何 dbnum");
+                return Ok(());
+            }
+            println!("📋 共 {} 个 DESI dbnum: {:?}", dbnos.len(), dbnos);
+
+            let bundle_dir = export_bundle_dir
+                .clone()
+                .unwrap_or_else(|| db_option_ext.get_project_output_dir().join("v3_bundle"));
+
+            let mut success_count = 0usize;
+            let mut fail_count = 0usize;
+            for (idx, db) in dbnos.iter().enumerate() {
+                println!("\n━━━ [{}/{}] dbnum={} ━━━", idx + 1, dbnos.len(), db);
+                match export_dbnum_instances_v3_mode(
+                    *db,
+                    verbose,
+                    Some(bundle_dir.clone()),
+                    &db_option_ext,
+                    None,
+                    target_unit.clone(),
+                    apply_rotation,
+                )
+                .await
+                {
+                    Ok(_) => success_count += 1,
+                    Err(e) => {
+                        eprintln!("   ⚠️ dbnum={} 导出失败: {:?}", db, e);
+                        fail_count += 1;
+                    }
+                }
+            }
+
+            println!(
+                "\n📊 全库导出完成: 成功={}, 失败={}",
+                success_count, fail_count
+            );
+
+            // 自动合并
+            println!("\n🔗 自动合并所有 per-dbnum JSON...");
+            merge_v3_instances_mode(verbose, Some(bundle_dir), &db_option_ext)?;
+
+            return Ok(());
+        }
+    }
+
+    // 合并所有 per-dbnum V3 JSON → instances_v3.json
+    if matches.get_flag("merge-v3") {
+        use crate::cli_modes::merge_v3_instances_mode;
+
+        let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
+        return merge_v3_instances_mode(verbose, export_bundle_dir, &db_option_ext);
     }
 
     // 导出 WORL -> SITE 节点列表为 Parquet（Full Parquet Mode 的根节点 children 数据源）

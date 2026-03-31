@@ -36,6 +36,10 @@ async fn cleanup_form(form_id: &str) {
         )
         .bind(("form_id", form_id.to_string()))
         .await;
+    let _ = project_primary_db()
+        .query("DELETE review_forms WHERE form_id = $form_id;")
+        .bind(("form_id", form_id.to_string()))
+        .await;
 }
 
 async fn insert_task_with_form_id(form_id: &str, user_id: &str) {
@@ -111,6 +115,8 @@ async fn test_embed_url_rejects_mismatched_form_id_from_jwt() {
 
 #[tokio::test]
 async fn test_embed_url_accepts_matching_form_id_from_jwt() {
+    let _ = init_surreal().await;
+    cleanup_form("FORM-EXPECTED").await;
     let app = create_platform_api_routes();
     let (token, _) =
         create_token("project-1", "user-1", None, "FORM-EXPECTED", Some("sj")).unwrap();
@@ -161,6 +167,119 @@ async fn test_embed_url_accepts_matching_form_id_from_jwt() {
         .expect("response token");
     assert_eq!(verify_token(response_token).unwrap().user_id, "user-1");
     assert!(data.get("task").is_none() || data.get("task").is_some_and(|v| v.is_null()));
+}
+
+#[tokio::test]
+async fn test_embed_url_includes_role_in_signed_token_when_request_provides_user_role() {
+    let form_id = "FORM-ROLE-REQUEST";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    let app = create_platform_api_routes();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/embed-url")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "user_id": "user-1",
+                        "form_id": form_id,
+                        "extra_parameters": {
+                            "user_role": "jd"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: EmbedUrlResponseBody = serde_json::from_slice(&body).unwrap();
+    let data = payload.data.expect("embed data");
+    let response_token = data
+        .get("token")
+        .and_then(|v| v.as_str())
+        .expect("response token");
+    let claims = verify_token(response_token).unwrap();
+    assert_eq!(claims.role.as_deref(), Some("jd"));
+}
+
+#[tokio::test]
+#[ignore = "requires an initialized review_forms database backing store"]
+async fn test_embed_url_reuses_persisted_form_role_when_followup_request_omits_role() {
+    let form_id = "FORM-ROLE-PERSISTED";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+
+    let app = create_platform_api_routes();
+    let first_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/embed-url")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "user_id": "JH",
+                        "form_id": form_id,
+                        "extra_parameters": {
+                            "user_role": "jd"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    let stored_form = super::review_form::get_review_form_by_form_id(form_id)
+        .await
+        .expect("query review form")
+        .expect("stored review form");
+    assert_eq!(stored_form.role.as_deref(), Some("jd"));
+
+    let second_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/embed-url")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "user_id": "JH",
+                        "form_id": form_id
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: EmbedUrlResponseBody = serde_json::from_slice(&body).unwrap();
+    let data = payload.data.expect("embed data");
+    let response_token = data
+        .get("token")
+        .and_then(|v| v.as_str())
+        .expect("response token");
+    let claims = verify_token(response_token).unwrap();
+    assert_eq!(claims.role.as_deref(), Some("jd"));
 }
 
 #[tokio::test]

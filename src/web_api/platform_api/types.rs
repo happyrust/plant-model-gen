@@ -15,6 +15,8 @@ use crate::web_api::review_api::ReviewTask;
 pub struct EmbedUrlRequest {
     pub project_id: String,
     pub user_id: String,
+    #[serde(default, alias = "user_role")]
+    pub role: Option<String>,
     pub form_id: Option<String>,
     pub token: Option<String>,
     #[serde(default)]
@@ -208,7 +210,9 @@ pub struct DeleteReviewResponse {
 pub struct ReviewForm {
     pub form_id: String,
     pub project_id: String,
+    pub user_id: String,
     pub requester_id: String,
+    pub role: Option<String>,
     pub source: String,
     pub status: String,
     pub task_created: bool,
@@ -224,6 +228,7 @@ pub struct ReviewFormRow {
     pub form_id: Option<String>,
     pub project_id: Option<String>,
     pub user_id: Option<String>,
+    pub role: Option<String>,
     pub requester_id: Option<String>,
     pub source: Option<String>,
     pub status: Option<String>,
@@ -247,7 +252,12 @@ pub fn review_form_from_row(row: ReviewFormRow) -> ReviewForm {
     ReviewForm {
         form_id,
         project_id: row.project_id.unwrap_or_default(),
+        user_id: row.user_id.clone().unwrap_or_default(),
         requester_id: row.requester_id.or(row.user_id).unwrap_or_default(),
+        role: row
+            .role
+            .map(|value| value.trim().to_lowercase())
+            .filter(|value| !value.is_empty()),
         source: row.source.unwrap_or_default(),
         status: row
             .status

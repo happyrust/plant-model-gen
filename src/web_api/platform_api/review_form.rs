@@ -71,9 +71,14 @@ pub async fn ensure_review_form_stub(
     form_id: &str,
     project_id: &str,
     requester_id: &str,
+    requester_role: Option<&str>,
     source: &str,
 ) -> anyhow::Result<ReviewForm> {
     ensure_review_forms_schema().await?;
+    let normalized_role = requester_role
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_lowercase());
 
     if let Some(existing) = get_review_form_by_form_id(form_id).await? {
         if existing.status == "deleted" {
@@ -88,6 +93,7 @@ pub async fn ensure_review_form_stub(
                     project_id = IF string::len(string::trim($project_id)) > 0 THEN $project_id ELSE project_id END,
                     user_id = IF string::len(string::trim($requester_id)) > 0 THEN $requester_id ELSE user_id END,
                     requester_id = IF string::len(string::trim($requester_id)) > 0 THEN $requester_id ELSE requester_id END,
+                    role = IF string::len(string::trim($role)) > 0 THEN $role ELSE role END,
                     source = $source,
                     deleted = false,
                     updated_at = time::now()
@@ -97,6 +103,7 @@ pub async fn ensure_review_form_stub(
             .bind(("form_id", form_id.to_string()))
             .bind(("project_id", project_id.trim().to_string()))
             .bind(("requester_id", requester_id.trim().to_string()))
+            .bind(("role", normalized_role.clone().unwrap_or_default()))
             .bind(("source", source.trim().to_string()))
             .await?;
 
@@ -113,7 +120,7 @@ pub async fn ensure_review_form_stub(
                 project_id: $project_id,
                 user_id: $requester_id,
                 requester_id: $requester_id,
-                role: NONE,
+                role: IF string::len(string::trim($role)) > 0 THEN $role ELSE NONE END,
                 source: $source,
                 status: 'blank',
                 task_created: false,
@@ -127,6 +134,7 @@ pub async fn ensure_review_form_stub(
         .bind(("form_id", form_id.to_string()))
         .bind(("project_id", project_id.trim().to_string()))
         .bind(("requester_id", requester_id.trim().to_string()))
+        .bind(("role", normalized_role.unwrap_or_default()))
         .bind(("source", source.trim().to_string()))
         .await?;
 
@@ -146,6 +154,7 @@ pub async fn sync_review_form_with_task_status(
         form_id,
         project_id.unwrap_or_default(),
         requester_id.unwrap_or_default(),
+        None,
         source,
     )
     .await?;

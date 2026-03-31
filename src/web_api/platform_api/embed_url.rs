@@ -3,7 +3,7 @@
 use axum::{extract::Json, http::StatusCode, response::IntoResponse};
 use tracing::{info, warn};
 
-use crate::web_api::jwt_auth::{create_token, generate_form_id, verify_token};
+use crate::web_api::jwt_auth::{Role, create_token, generate_form_id, verify_token};
 
 use super::config::PLATFORM_CONFIG;
 use super::review_form::{ensure_review_form_stub, find_task_by_form_id};
@@ -17,11 +17,15 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
         request.project_id, request.user_id
     );
 
+    let mut verified_claim_role: Option<String> = None;
     let jwt_claim_form_id = if let Some(ref token) = request.token {
         let token = token.trim();
         if token.split('.').count() == 3 {
             match verify_token(token) {
-                Ok(claims) => Some(claims.form_id),
+                Ok(claims) => {
+                    verified_claim_role = normalize_embed_role(claims.role.as_deref());
+                    Some(claims.form_id)
+                }
                 Err(e) => {
                     warn!("Embed URL JWT verification failed: {}", e);
                     return (
@@ -67,11 +71,28 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
         }
     }
 
+    let requested_role = match resolve_embed_request_role(&request, verified_claim_role.as_deref())
+    {
+        Ok(role) => role,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(EmbedUrlResponse {
+                    code: 400,
+                    message,
+                    data: None,
+                    url: None,
+                }),
+            );
+        }
+    };
+
     let form_id = form_id.unwrap_or_else(generate_form_id);
     let ensured_form = match ensure_review_form_stub(
         &form_id,
         request.project_id.as_str(),
         request.user_id.as_str(),
+        requested_role.as_deref(),
         "pms_embed",
     )
     .await
@@ -104,7 +125,15 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
         }
     };
 
-    match create_token(&request.project_id, &request.user_id, None, &form_id, None) {
+    let resolved_role = requested_role.clone().or_else(|| ensured_form.role.clone());
+
+    match create_token(
+        &request.project_id,
+        &request.user_id,
+        None,
+        &form_id,
+        resolved_role.as_deref(),
+    ) {
         Ok((token, _expires_at)) => {
             let is_reviewer = request
                 .extra_parameters
@@ -185,4 +214,54 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
             )
         }
     }
+}
+
+fn resolve_embed_request_role(
+    request: &EmbedUrlRequest,
+    verified_claim_role: Option<&str>,
+) -> Result<Option<String>, String> {
+    let explicit_role = request
+        .role
+        .as_deref()
+        .or_else(|| extract_role_from_extra_parameters(request, "user_role"))
+        .or_else(|| extract_role_from_extra_parameters(request, "role"));
+
+    if let Some(role) = explicit_role {
+        return validate_embed_role(role);
+    }
+
+    if let Some(role) = verified_claim_role {
+        return validate_embed_role(role);
+    }
+
+    Ok(None)
+}
+
+fn extract_role_from_extra_parameters<'a>(
+    request: &'a EmbedUrlRequest,
+    key: &str,
+) -> Option<&'a str> {
+    request
+        .extra_parameters
+        .as_ref()
+        .and_then(|value| value.get(key))
+        .and_then(|value| value.as_str())
+}
+
+fn validate_embed_role(raw_role: &str) -> Result<Option<String>, String> {
+    let normalized = normalize_embed_role(Some(raw_role));
+    if normalized.is_some() {
+        return Ok(normalized);
+    }
+
+    Err(format!(
+        "Invalid role: '{}'. Valid values are: {:?}",
+        raw_role,
+        Role::valid_values()
+    ))
+}
+
+fn normalize_embed_role(role: Option<&str>) -> Option<String> {
+    let trimmed = role.map(str::trim).filter(|value| !value.is_empty())?;
+    Role::from_str(trimmed).map(|value| value.as_str().to_string())
 }

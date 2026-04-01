@@ -17,6 +17,8 @@ pub struct EmbedUrlRequest {
     pub user_id: String,
     #[serde(default, alias = "user_role")]
     pub role: Option<String>,
+    #[serde(default, alias = "workflowMode")]
+    pub workflow_mode: Option<String>,
     pub form_id: Option<String>,
     pub token: Option<String>,
     #[serde(default)]

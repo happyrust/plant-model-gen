@@ -88,7 +88,7 @@ async fn insert_task_with_form_id(form_id: &str, user_id: &str) {
 async fn test_embed_url_rejects_mismatched_form_id_from_jwt() {
     let app = create_platform_api_routes();
     let (token, _) =
-        create_token("project-1", "user-1", None, "FORM-EXPECTED", Some("sj")).unwrap();
+        create_token("project-1", "user-1", None, "FORM-EXPECTED", Some("sj"), None).unwrap();
 
     let response = app
         .oneshot(
@@ -119,7 +119,7 @@ async fn test_embed_url_accepts_matching_form_id_from_jwt() {
     cleanup_form("FORM-EXPECTED").await;
     let app = create_platform_api_routes();
     let (token, _) =
-        create_token("project-1", "user-1", None, "FORM-EXPECTED", Some("sj")).unwrap();
+        create_token("project-1", "user-1", None, "FORM-EXPECTED", Some("sj"), None).unwrap();
 
     let response = app
         .oneshot(
@@ -286,7 +286,7 @@ async fn test_embed_url_reuses_persisted_form_role_when_followup_request_omits_r
 async fn test_embed_url_rejects_tampered_jwt_even_if_form_id_matches() {
     let app = create_platform_api_routes();
     let (token, _) =
-        create_token("project-1", "user-1", None, "FORM-EXPECTED", Some("sj")).unwrap();
+        create_token("project-1", "user-1", None, "FORM-EXPECTED", Some("sj"), None).unwrap();
     let mut parts = token.split('.').collect::<Vec<_>>();
     parts[2] = "tampered-signature";
     let tampered_token = parts.join(".");
@@ -321,7 +321,8 @@ async fn test_embed_url_returns_existing_task_for_form_id() {
     insert_task_with_form_id(form_id, "user-existing").await;
 
     let app = create_platform_api_routes();
-    let (token, _) = create_token("project-1", "user-existing", None, form_id, Some("jd")).unwrap();
+    let (token, _) =
+        create_token("project-1", "user-existing", None, form_id, Some("jd"), None).unwrap();
 
     let response = app
         .oneshot(

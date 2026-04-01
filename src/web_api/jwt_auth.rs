@@ -3,18 +3,18 @@
 //! Provides JWT token generation, verification, and decoding for API authentication.
 
 use axum::{
-    Router,
     extract::{Json, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::post,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 #[cfg(feature = "web_server")]
 use jsonwebtoken::{
-    Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation, decode, encode,
+    decode, encode, Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation,
 };
 
 // ============================================================================
@@ -205,6 +205,18 @@ impl Role {
     }
 }
 
+pub(crate) fn normalize_workflow_mode(value: Option<&str>) -> Option<String> {
+    let normalized = value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())?;
+
+    match normalized.as_str() {
+        "external" | "manual" | "internal" => Some(normalized),
+        _ => None,
+    }
+}
+
 // ============================================================================
 // JWT Claims
 // ============================================================================
@@ -224,6 +236,9 @@ pub struct TokenClaims {
     /// 角色 (可选)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// 工作流模式 (可选)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_mode: Option<String>,
     /// 过期时间戳 (Unix timestamp)
     pub exp: u64,
     /// 签发时间戳 (Unix timestamp)
@@ -253,6 +268,9 @@ pub struct TokenRequest {
     pub form_id: Option<String>,
     /// 角色 (可选，用于权限控制)
     pub role: Option<String>,
+    /// 工作流模式 (可选，用于前端落点/流转模式判定)
+    #[serde(alias = "workflowMode")]
+    pub workflow_mode: Option<String>,
 }
 
 /// Token 获取响应
@@ -328,6 +346,7 @@ pub fn create_token(
     user_name: Option<&str>,
     form_id: &str,
     role: Option<&str>,
+    workflow_mode: Option<&str>,
 ) -> Result<(String, u64), String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -346,6 +365,7 @@ pub fn create_token(
             .to_string(),
         form_id: form_id.to_string(),
         role: role.map(|s| s.to_string()),
+        workflow_mode: normalize_workflow_mode(workflow_mode),
         exp,
         iat: now,
     };
@@ -458,6 +478,7 @@ fn build_debug_claims(config: &ReviewAuthConfig) -> TokenClaims {
         } else {
             Some(role.to_string())
         },
+        workflow_mode: None,
         exp: now + 365 * 24 * 3600,
         iat: now,
     }
@@ -529,7 +550,7 @@ pub fn require_roles(
             + Send,
     >,
 > + Clone
-+ Send {
+       + Send {
     move |request: Request, next: Next| {
         Box::pin(async move {
             // 从 extensions 获取 claims
@@ -601,8 +622,8 @@ async fn get_token(Json(request): Json<TokenRequest>) -> impl IntoResponse {
     };
 
     info!(
-        "Token request: project_id={}, user_id={}, role={:?}",
-        project_id, user_id, request.role
+        "Token request: project_id={}, user_id={}, role={:?}, workflow_mode={:?}",
+        project_id, user_id, request.role, request.workflow_mode
     );
 
     // 验证 role (如果提供了)
@@ -629,6 +650,31 @@ async fn get_token(Json(request): Json<TokenRequest>) -> impl IntoResponse {
         None
     };
 
+    let validated_workflow_mode = match request
+        .workflow_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => match normalize_workflow_mode(Some(value)) {
+            Some(mode) => Some(mode),
+            None => {
+                warn!("Invalid workflow_mode: {}", value);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(TokenResponse {
+                        code: -1,
+                        message:
+                            "Invalid workflow_mode: valid values are external, manual, internal"
+                                .to_string(),
+                        data: None,
+                    }),
+                );
+            }
+        },
+        None => None,
+    };
+
     // 生成或使用传入的 form_id
     let form_id = request.form_id.unwrap_or_else(generate_form_id);
 
@@ -639,6 +685,7 @@ async fn get_token(Json(request): Json<TokenRequest>) -> impl IntoResponse {
         request.user_name.as_deref(),
         &form_id,
         validated_role,
+        validated_workflow_mode.as_deref(),
     ) {
         Ok((token, expires_at)) => {
             info!("Token generated for user={}, form_id={}", user_id, form_id);
@@ -745,10 +792,10 @@ async fn verify_token_handler(Json(request): Json<VerifyRequest>) -> impl IntoRe
 mod tests {
     use super::*;
     use axum::{
-        Extension, Json, Router,
         http::{Request, StatusCode},
         middleware,
         routing::get,
+        Extension, Json, Router,
     };
     use tower::ServiceExt;
 
@@ -771,7 +818,8 @@ mod tests {
 
     #[test]
     fn test_create_and_verify_token() {
-        let (token, _exp) = create_token("2410", "kangwp", None, "FORM-TEST123", None).unwrap();
+        let (token, _exp) =
+            create_token("2410", "kangwp", None, "FORM-TEST123", None, None).unwrap();
         assert!(!token.is_empty());
 
         let claims = verify_token(&token).unwrap();
@@ -790,6 +838,7 @@ mod tests {
             Some("测试用户"),
             "FORM-TEST123",
             Some("pz"),
+            None,
         )
         .unwrap();
         assert!(!token.is_empty());
@@ -803,7 +852,8 @@ mod tests {
 
     #[test]
     fn test_decode_token_unsafe() {
-        let (token, _exp) = create_token("2410", "kangwp", None, "FORM-TEST123", None).unwrap();
+        let (token, _exp) =
+            create_token("2410", "kangwp", None, "FORM-TEST123", None, None).unwrap();
 
         let claims = decode_token_unsafe(&token).unwrap();
         assert_eq!(claims.project_id, "2410");
@@ -924,7 +974,8 @@ mod tests {
                                 "user-002",
                                 Some("李校对"),
                                 "FORM-TEST123",
-                                Some("jd")
+                                Some("jd"),
+                                None
                             )
                             .unwrap()
                             .0
@@ -951,8 +1002,15 @@ mod tests {
     #[tokio::test]
     async fn test_verify_token_handler_rejects_form_id_mismatch() {
         let app = create_jwt_auth_routes();
-        let (token, _) =
-            create_token("project-1", "user-1", None, "FORM-EXPECTED", Some("sj")).unwrap();
+        let (token, _) = create_token(
+            "project-1",
+            "user-1",
+            None,
+            "FORM-EXPECTED",
+            Some("sj"),
+            None,
+        )
+        .unwrap();
 
         let response = app
             .oneshot(
@@ -989,8 +1047,15 @@ mod tests {
     #[tokio::test]
     async fn test_verify_token_handler_accepts_matching_form_id() {
         let app = create_jwt_auth_routes();
-        let (token, _) =
-            create_token("project-1", "user-1", None, "FORM-EXPECTED", Some("sj")).unwrap();
+        let (token, _) = create_token(
+            "project-1",
+            "user-1",
+            None,
+            "FORM-EXPECTED",
+            Some("sj"),
+            None,
+        )
+        .unwrap();
 
         let response = app
             .oneshot(

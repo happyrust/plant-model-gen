@@ -3,7 +3,9 @@
 use axum::{extract::Json, http::StatusCode, response::IntoResponse};
 use tracing::{info, warn};
 
-use crate::web_api::jwt_auth::{Role, create_token, generate_form_id, verify_token};
+use crate::web_api::jwt_auth::{
+    create_token, generate_form_id, normalize_workflow_mode, verify_token, Role,
+};
 
 use super::config::PLATFORM_CONFIG;
 use super::review_form::{ensure_review_form_stub, find_task_by_form_id};
@@ -18,12 +20,31 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
     );
 
     let mut verified_claim_role: Option<String> = None;
+    let mut verified_claim_workflow_mode: Option<String> = None;
     let jwt_claim_form_id = if let Some(ref token) = request.token {
         let token = token.trim();
         if token.split('.').count() == 3 {
             match verify_token(token) {
                 Ok(claims) => {
+                    if claims.project_id != request.project_id || claims.user_id != request.user_id
+                    {
+                        warn!(
+                            "Embed URL JWT identity mismatch: token project/user={}/{}, request={}/{}",
+                            claims.project_id, claims.user_id, request.project_id, request.user_id
+                        );
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(EmbedUrlResponse {
+                                code: 401,
+                                message: "unauthorized".to_string(),
+                                data: None,
+                                url: None,
+                            }),
+                        );
+                    }
                     verified_claim_role = normalize_embed_role(claims.role.as_deref());
+                    verified_claim_workflow_mode =
+                        normalize_workflow_mode(claims.workflow_mode.as_deref());
                     Some(claims.form_id)
                 }
                 Err(e) => {
@@ -86,6 +107,23 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
             );
         }
     };
+    let requested_workflow_mode = match resolve_embed_request_workflow_mode(
+        &request,
+        verified_claim_workflow_mode.as_deref(),
+    ) {
+        Ok(mode) => mode,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(EmbedUrlResponse {
+                    code: 400,
+                    message,
+                    data: None,
+                    url: None,
+                }),
+            );
+        }
+    };
 
     let form_id = form_id.unwrap_or_else(generate_form_id);
     let ensured_form = match ensure_review_form_stub(
@@ -133,6 +171,7 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
         None,
         &form_id,
         resolved_role.as_deref(),
+        requested_workflow_mode.as_deref(),
     ) {
         Ok((token, _expires_at)) => {
             let is_reviewer = request
@@ -158,16 +197,7 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
                     } else {
                         format!("/{}", path)
                     };
-                    Some(format!(
-                        "{}{}?user_token={}&form_id={}&user_id={}&project_id={}&output_project={}",
-                        base,
-                        clean_path,
-                        token,
-                        form_id,
-                        request.user_id,
-                        request.project_id,
-                        request.project_id
-                    ))
+                    Some(format!("{}{}?user_token={}", base, clean_path, token))
                 }
             };
 
@@ -226,26 +256,63 @@ fn resolve_embed_request_role(
         .or_else(|| extract_role_from_extra_parameters(request, "user_role"))
         .or_else(|| extract_role_from_extra_parameters(request, "role"));
 
-    if let Some(role) = explicit_role {
+    if let Some(role) = verified_claim_role {
+        if let Some(explicit_role) = explicit_role {
+            let validated_explicit = validate_embed_role(explicit_role)?;
+            if validated_explicit.as_deref() != Some(role) {
+                return Err("JWT role mismatch".to_string());
+            }
+        }
         return validate_embed_role(role);
     }
 
-    if let Some(role) = verified_claim_role {
+    if let Some(role) = explicit_role {
         return validate_embed_role(role);
     }
 
     Ok(None)
 }
 
-fn extract_role_from_extra_parameters<'a>(
-    request: &'a EmbedUrlRequest,
-    key: &str,
-) -> Option<&'a str> {
+fn resolve_embed_request_workflow_mode(
+    request: &EmbedUrlRequest,
+    verified_claim_workflow_mode: Option<&str>,
+) -> Result<Option<String>, String> {
+    let explicit = request
+        .workflow_mode
+        .as_deref()
+        .or_else(|| extract_extra_parameter(request, "workflow_mode"))
+        .or_else(|| extract_extra_parameter(request, "workflowMode"));
+
+    if let Some(mode) = verified_claim_workflow_mode {
+        if let Some(explicit_mode) = explicit {
+            let validated_explicit = validate_embed_workflow_mode(explicit_mode)?;
+            if validated_explicit.as_deref() != Some(mode) {
+                return Err("JWT workflow_mode mismatch".to_string());
+            }
+        }
+        return validate_embed_workflow_mode(mode);
+    }
+
+    if let Some(mode) = explicit {
+        return validate_embed_workflow_mode(mode);
+    }
+
+    Ok(None)
+}
+
+fn extract_extra_parameter<'a>(request: &'a EmbedUrlRequest, key: &str) -> Option<&'a str> {
     request
         .extra_parameters
         .as_ref()
         .and_then(|value| value.get(key))
         .and_then(|value| value.as_str())
+}
+
+fn extract_role_from_extra_parameters<'a>(
+    request: &'a EmbedUrlRequest,
+    key: &str,
+) -> Option<&'a str> {
+    extract_extra_parameter(request, key)
 }
 
 fn validate_embed_role(raw_role: &str) -> Result<Option<String>, String> {
@@ -259,6 +326,15 @@ fn validate_embed_role(raw_role: &str) -> Result<Option<String>, String> {
         raw_role,
         Role::valid_values()
     ))
+}
+
+fn validate_embed_workflow_mode(raw_mode: &str) -> Result<Option<String>, String> {
+    let normalized = normalize_workflow_mode(Some(raw_mode));
+    if normalized.is_some() {
+        return Ok(normalized);
+    }
+
+    Err("Invalid workflow_mode: valid values are external, manual, internal".to_string())
 }
 
 fn normalize_embed_role(role: Option<&str>) -> Option<String> {

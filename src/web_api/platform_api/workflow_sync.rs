@@ -10,9 +10,12 @@ use surrealdb::types::SurrealValue;
 use tracing::{info, warn};
 
 use aios_core::project_primary_db;
+use crate::web_api::review_api::ReviewTask;
 
 use super::auth::verify_s2s_token;
-use super::review_form::{find_task_by_form_id, get_review_form_by_form_id};
+use super::review_form::{
+    find_task_by_form_id, get_review_form_by_form_id, sync_review_form_with_task_status,
+};
 use super::types::{
     SyncWorkflowData, SyncWorkflowRequest, SyncWorkflowResponse, WorkflowAnnotationComment,
     WorkflowAttachment, WorkflowRecord, normalize_review_form_status,
@@ -125,13 +128,14 @@ fn extract_annotation_ids(values: &[Value], output: &mut BTreeSet<String>) {
 // ============================================================================
 
 pub async fn sync_workflow_handler(Json(request): Json<SyncWorkflowRequest>) -> impl IntoResponse {
-    let is_query = request.action.eq_ignore_ascii_case("query");
+    let action = request.action.trim().to_lowercase();
+    let is_query = action == "query";
     let request_start_time = std::time::Instant::now();
 
     info!(
         "[WORKFLOW_SYNC] form_id={}, action={}, actor={}/{}{}",
         request.form_id,
-        request.action,
+        action,
         request.actor.id,
         request.actor.roles,
         if is_query { " (query)" } else { "" }
@@ -152,36 +156,111 @@ pub async fn sync_workflow_handler(Json(request): Json<SyncWorkflowRequest>) -> 
         );
     }
 
+    let mut response_next_step = None;
     if !is_query {
-        if let Some(comment) = request
-            .comments
-            .as_ref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-        {
-            info!(
-                "[WORKFLOW_SYNC] 已接收平台流程 comments，但不在模型中心持久化/回传 - form_id={}, actor={}, comment_len={}",
-                request.form_id,
-                request.actor.id,
-                comment.len()
-            );
-        } else {
-            info!(
-                "[WORKFLOW_SYNC] 非 query 动作未携带 comments，按模型批注包只读聚合语义处理 - form_id={}",
-                request.form_id
-            );
+        match action.as_str() {
+            "active" => match apply_workflow_active(&request).await {
+                Ok(next_step) => {
+                    response_next_step = next_step;
+                }
+                Err((status, msg)) => {
+                    warn!(
+                        "[WORKFLOW_SYNC] active 执行失败 - form_id={}, actor={}, reason={}",
+                        request.form_id, request.actor.id, msg
+                    );
+                    return (
+                        status,
+                        Json(SyncWorkflowResponse {
+                            code: status.as_u16() as i32,
+                            message: msg,
+                            data: None,
+                        }),
+                    );
+                }
+            },
+            "agree" => match apply_workflow_agree(&request).await {
+                Ok(next_step) => {
+                    response_next_step = next_step;
+                }
+                Err((status, msg)) => {
+                    warn!(
+                        "[WORKFLOW_SYNC] agree 执行失败 - form_id={}, actor={}, reason={}",
+                        request.form_id, request.actor.id, msg
+                    );
+                    return (
+                        status,
+                        Json(SyncWorkflowResponse {
+                            code: status.as_u16() as i32,
+                            message: msg,
+                            data: None,
+                        }),
+                    );
+                }
+            },
+            "return" => match apply_workflow_return(&request).await {
+                Ok(next_step) => {
+                    response_next_step = next_step;
+                }
+                Err((status, msg)) => {
+                    warn!(
+                        "[WORKFLOW_SYNC] return 执行失败 - form_id={}, actor={}, reason={}",
+                        request.form_id, request.actor.id, msg
+                    );
+                    return (
+                        status,
+                        Json(SyncWorkflowResponse {
+                            code: status.as_u16() as i32,
+                            message: msg,
+                            data: None,
+                        }),
+                    );
+                }
+            },
+            "stop" => match apply_workflow_stop(&request).await {
+                Ok(next_step) => {
+                    response_next_step = next_step;
+                }
+                Err((status, msg)) => {
+                    warn!(
+                        "[WORKFLOW_SYNC] stop 执行失败 - form_id={}, actor={}, reason={}",
+                        request.form_id, request.actor.id, msg
+                    );
+                    return (
+                        status,
+                        Json(SyncWorkflowResponse {
+                            code: status.as_u16() as i32,
+                            message: msg,
+                            data: None,
+                        }),
+                    );
+                }
+            },
+            _ => {
+                let msg = format!("unsupported workflow action: {}", request.action);
+                warn!("[WORKFLOW_SYNC] {}", msg);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(SyncWorkflowResponse {
+                        code: 400,
+                        message: msg,
+                        data: None,
+                    }),
+                );
+            }
         }
     }
 
-    let data = match query_workflow_data(&request.form_id).await {
+    let data = match query_workflow_data(&request.form_id, response_next_step.clone()).await {
         Ok(d) => {
             info!(
-                "[WORKFLOW_SYNC] 数据查询完成 - form_id={}, models={}, records={}, comments={}, attachments={}",
+                "[WORKFLOW_SYNC] 数据查询完成 - form_id={}, models={}, records={}, comments={}, attachments={}, current_node={:?}, next_step={:?}",
                 request.form_id,
                 d.models.len(),
                 d.records.len(),
                 d.annotation_comments.len(),
-                d.attachments.len()
+                d.attachments.len(),
+                d.current_node,
+                d.next_step
             );
             d
         }
@@ -197,7 +276,7 @@ pub async fn sync_workflow_handler(Json(request): Json<SyncWorkflowRequest>) -> 
     info!(
         "[WORKFLOW_SYNC] 完成 - form_id={}, action={}, elapsed_ms={}",
         request.form_id,
-        request.action,
+        action,
         request_start_time.elapsed().as_millis()
     );
 
@@ -209,6 +288,733 @@ pub async fn sync_workflow_handler(Json(request): Json<SyncWorkflowRequest>) -> 
             data: Some(data),
         }),
     )
+}
+
+fn normalize_workflow_node(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
+fn workflow_node_rank(node: &str) -> Option<usize> {
+    match node {
+        "sj" => Some(0),
+        "jd" => Some(1),
+        "sh" => Some(2),
+        "pz" => Some(3),
+        _ => None,
+    }
+}
+
+fn current_node_owner<'a>(task: &'a ReviewTask, current_node: &str) -> (&'a str, &'static str) {
+    match current_node {
+        "sj" => (task.requester_id.trim(), "requester"),
+        "jd" => {
+            let checker_id = task.checker_id.trim();
+            if !checker_id.is_empty() {
+                (checker_id, "checker")
+            } else {
+                (task.reviewer_id.trim(), "reviewer")
+            }
+        }
+        "sh" | "pz" => (task.approver_id.trim(), "approver"),
+        _ => ("", "none"),
+    }
+}
+
+fn workflow_task_status_for_target_node(node: &str) -> &'static str {
+    match node {
+        "jd" => "submitted",
+        "sh" | "pz" => "in_review",
+        "sj" => "draft",
+        _ => "submitted",
+    }
+}
+
+fn assign_review_task_fields(
+    target_node: &str,
+    assignee_id: &str,
+    assignee_name: &str,
+) -> (String, String, String, String, String, String) {
+    let mut checker_id = String::new();
+    let mut checker_name = String::new();
+    let mut reviewer_id = String::new();
+    let mut reviewer_name = String::new();
+    let mut approver_id = String::new();
+    let mut approver_name = String::new();
+
+    match target_node {
+        "jd" => {
+            checker_id = assignee_id.to_string();
+            checker_name = assignee_name.to_string();
+            reviewer_id = assignee_id.to_string();
+            reviewer_name = assignee_name.to_string();
+        }
+        "sh" | "pz" => {
+            approver_id = assignee_id.to_string();
+            approver_name = assignee_name.to_string();
+        }
+        _ => {}
+    }
+
+    (
+        checker_id,
+        checker_name,
+        reviewer_id,
+        reviewer_name,
+        approver_id,
+        approver_name,
+    )
+}
+
+async fn apply_workflow_active(
+    request: &SyncWorkflowRequest,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let next_step = request
+        .next_step
+        .as_ref()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "active 缺少 next_step".to_string()))?;
+
+    let target_node = normalize_workflow_node(&next_step.roles);
+    if target_node.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "active 的 next_step.roles 不能为空".to_string()));
+    }
+
+    let assignee_id = next_step.assignee_id.trim();
+    if assignee_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "active 的 next_step.assignee_id 不能为空".to_string(),
+        ));
+    }
+    let assignee_name = next_step.name.trim();
+
+    let task = find_task_by_form_id(&request.form_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("查询任务失败: {}", error),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("form_id={} 未找到活动 review task", request.form_id),
+            )
+        })?;
+
+    let current_node = normalize_workflow_node(&task.current_node);
+    if current_node != "sj" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "active 仅允许从 sj 发起，当前节点为 {}",
+                if current_node.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    current_node.clone()
+                }
+            ),
+        ));
+    }
+
+    if !task.requester_id.trim().is_empty() && task.requester_id.trim() != request.actor.id.trim() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "active 权限不足：当前请求人 {} 不是编制负责人 {}",
+                request.actor.id.trim(),
+                task.requester_id.trim()
+            ),
+        ));
+    }
+
+    let next_status = workflow_task_status_for_target_node(&target_node);
+    let (
+        checker_id,
+        checker_name,
+        reviewer_id,
+        reviewer_name,
+        approver_id,
+        approver_name,
+    ) = assign_review_task_fields(&target_node, assignee_id, assignee_name);
+
+    let update_sql = r#"
+        UPDATE review_tasks SET
+            current_node = $next_node,
+            status = $status,
+            checker_id = IF string::len(string::trim($checker_id)) > 0 THEN $checker_id ELSE checker_id END,
+            checker_name = IF string::len(string::trim($checker_name)) > 0 THEN $checker_name ELSE checker_name END,
+            reviewer_id = IF string::len(string::trim($reviewer_id)) > 0 THEN $reviewer_id ELSE reviewer_id END,
+            reviewer_name = IF string::len(string::trim($reviewer_name)) > 0 THEN $reviewer_name ELSE reviewer_name END,
+            approver_id = IF string::len(string::trim($approver_id)) > 0 THEN $approver_id ELSE approver_id END,
+            approver_name = IF string::len(string::trim($approver_name)) > 0 THEN $approver_name ELSE approver_name END,
+            return_reason = NONE,
+            updated_at = time::now()
+        WHERE record::id(id) = $task_id AND (deleted IS NONE OR deleted = false)
+    "#;
+
+    project_primary_db()
+        .query(update_sql)
+        .bind(("task_id", task.id.clone()))
+        .bind(("next_node", target_node.clone()))
+        .bind(("status", next_status))
+        .bind(("checker_id", checker_id))
+        .bind(("checker_name", checker_name))
+        .bind(("reviewer_id", reviewer_id))
+        .bind(("reviewer_name", reviewer_name))
+        .bind(("approver_id", approver_id))
+        .bind(("approver_name", approver_name))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("更新 review_tasks 失败: {}", error),
+            )
+        })?;
+
+    let review_form = get_review_form_by_form_id(&request.form_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("查询 review_forms 失败: {}", error),
+            )
+        })?;
+
+    if let Err(error) = sync_review_form_with_task_status(
+        &request.form_id,
+        review_form.as_ref().map(|form| form.project_id.as_str()),
+        Some(task.requester_id.as_str()),
+        "workflow_sync_active",
+        next_status,
+    )
+    .await
+    {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("同步 review_forms 状态失败: {}", error),
+        ));
+    }
+
+    let history_sql = r#"
+        CREATE review_workflow_history CONTENT {
+            task_id: $task_id,
+            node: $from_node,
+            action: 'submit',
+            operator_id: $operator_id,
+            operator_name: $operator_name,
+            comment: $comment,
+            timestamp: time::now()
+        }
+    "#;
+    let history_comment = request
+        .comments
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let _ = project_primary_db()
+        .query(history_sql)
+        .bind(("task_id", task.id))
+        .bind(("from_node", current_node.clone()))
+        .bind(("operator_id", request.actor.id.trim().to_string()))
+        .bind(("operator_name", request.actor.name.trim().to_string()))
+        .bind(("comment", history_comment))
+        .await;
+
+    Ok(Some(target_node))
+}
+
+async fn apply_workflow_return(
+    request: &SyncWorkflowRequest,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let next_step = request
+        .next_step
+        .as_ref()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "return 缺少 next_step".to_string()))?;
+
+    let target_node = normalize_workflow_node(&next_step.roles);
+    if target_node.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "return 的 next_step.roles 不能为空".to_string()));
+    }
+
+    let assignee_id = next_step.assignee_id.trim();
+    if assignee_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "return 的 next_step.assignee_id 不能为空".to_string(),
+        ));
+    }
+    let assignee_name = next_step.name.trim();
+
+    let task = find_task_by_form_id(&request.form_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("查询任务失败: {}", error),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("form_id={} 未找到活动 review task", request.form_id),
+            )
+        })?;
+
+    let current_node = normalize_workflow_node(&task.current_node);
+    if current_node != "jd" && current_node != "sh" && current_node != "pz" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "return 仅允许在 jd/sh/pz 节点执行，当前节点为 {}",
+                if current_node.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    current_node.clone()
+                }
+            ),
+        ));
+    }
+
+    let current_rank = workflow_node_rank(&current_node).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("return 无法识别当前节点 {}", current_node),
+        )
+    })?;
+    let target_rank = workflow_node_rank(&target_node).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("return 无法识别目标节点 {}", target_node),
+        )
+    })?;
+    if target_rank >= current_rank {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "return 目标节点 {} 必须位于当前节点 {} 之前",
+                target_node, current_node
+            ),
+        ));
+    }
+
+    let (owner_id, owner_source) = current_node_owner(&task, &current_node);
+    if !owner_id.is_empty() && owner_id != request.actor.id.trim() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "return 权限不足：当前请求人 {} 不是 {} 节点负责人 {}",
+                request.actor.id.trim(),
+                owner_source,
+                owner_id
+            ),
+        ));
+    }
+
+    let next_status = workflow_task_status_for_target_node(&target_node);
+    let (
+        checker_id,
+        checker_name,
+        reviewer_id,
+        reviewer_name,
+        approver_id,
+        approver_name,
+    ) = assign_review_task_fields(&target_node, assignee_id, assignee_name);
+    let return_reason = request
+        .comments
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "流程已退回".to_string());
+
+    let update_sql = r#"
+        UPDATE review_tasks SET
+            current_node = $next_node,
+            status = $status,
+            checker_id = $checker_id,
+            checker_name = $checker_name,
+            reviewer_id = $reviewer_id,
+            reviewer_name = $reviewer_name,
+            approver_id = $approver_id,
+            approver_name = $approver_name,
+            return_reason = $return_reason,
+            updated_at = time::now()
+        WHERE record::id(id) = $task_id AND (deleted IS NONE OR deleted = false)
+    "#;
+
+    project_primary_db()
+        .query(update_sql)
+        .bind(("task_id", task.id.clone()))
+        .bind(("next_node", target_node.clone()))
+        .bind(("status", next_status))
+        .bind(("checker_id", checker_id))
+        .bind(("checker_name", checker_name))
+        .bind(("reviewer_id", reviewer_id))
+        .bind(("reviewer_name", reviewer_name))
+        .bind(("approver_id", approver_id))
+        .bind(("approver_name", approver_name))
+        .bind(("return_reason", return_reason.clone()))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("更新 review_tasks 失败: {}", error),
+            )
+        })?;
+
+    let review_form = get_review_form_by_form_id(&request.form_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("查询 review_forms 失败: {}", error),
+            )
+        })?;
+
+    if let Err(error) = sync_review_form_with_task_status(
+        &request.form_id,
+        review_form.as_ref().map(|form| form.project_id.as_str()),
+        Some(task.requester_id.as_str()),
+        "workflow_sync_return",
+        next_status,
+    )
+    .await
+    {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("同步 review_forms 状态失败: {}", error),
+        ));
+    }
+
+    let history_sql = r#"
+        CREATE review_workflow_history CONTENT {
+            task_id: $task_id,
+            node: $from_node,
+            action: 'return',
+            operator_id: $operator_id,
+            operator_name: $operator_name,
+            comment: $comment,
+            timestamp: time::now()
+        }
+    "#;
+    let _ = project_primary_db()
+        .query(history_sql)
+        .bind(("task_id", task.id))
+        .bind(("from_node", current_node))
+        .bind(("operator_id", request.actor.id.trim().to_string()))
+        .bind(("operator_name", request.actor.name.trim().to_string()))
+        .bind(("comment", Some(return_reason)))
+        .await;
+
+    Ok(Some(target_node))
+}
+
+async fn apply_workflow_agree(
+    request: &SyncWorkflowRequest,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let task = find_task_by_form_id(&request.form_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("查询任务失败: {}", error),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("form_id={} 未找到活动 review task", request.form_id),
+            )
+        })?;
+
+    let current_node = normalize_workflow_node(&task.current_node);
+    if current_node != "jd" && current_node != "sh" && current_node != "pz" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "agree 仅允许在 jd/sh/pz 节点执行，当前节点为 {}",
+                if current_node.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    current_node.clone()
+                }
+            ),
+        ));
+    }
+
+    let (owner_id, owner_source) = current_node_owner(&task, &current_node);
+    if !owner_id.is_empty() && owner_id != request.actor.id.trim() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "agree 权限不足：当前请求人 {} 不是 {} 节点负责人 {}",
+                request.actor.id.trim(),
+                owner_source,
+                owner_id
+            ),
+        ));
+    }
+
+    let (target_node, next_status, checker_id, checker_name, reviewer_id, reviewer_name, approver_id, approver_name) =
+        if current_node == "pz" {
+            (
+                current_node.clone(),
+                "approved",
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            )
+        } else {
+            let next_step = request
+                .next_step
+                .as_ref()
+                .ok_or_else(|| (StatusCode::BAD_REQUEST, "agree 缺少 next_step".to_string()))?;
+
+            let target_node = normalize_workflow_node(&next_step.roles);
+            if target_node.is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "agree 的 next_step.roles 不能为空".to_string()));
+            }
+
+            let assignee_id = next_step.assignee_id.trim();
+            if assignee_id.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "agree 的 next_step.assignee_id 不能为空".to_string(),
+                ));
+            }
+            let assignee_name = next_step.name.trim();
+            let next_status = workflow_task_status_for_target_node(&target_node);
+            let (
+                checker_id,
+                checker_name,
+                reviewer_id,
+                reviewer_name,
+                approver_id,
+                approver_name,
+            ) = assign_review_task_fields(&target_node, assignee_id, assignee_name);
+            (
+                target_node,
+                next_status,
+                checker_id,
+                checker_name,
+                reviewer_id,
+                reviewer_name,
+                approver_id,
+                approver_name,
+            )
+        };
+
+    let update_sql = r#"
+        UPDATE review_tasks SET
+            current_node = $next_node,
+            status = $status,
+            checker_id = IF string::len(string::trim($checker_id)) > 0 THEN $checker_id ELSE checker_id END,
+            checker_name = IF string::len(string::trim($checker_name)) > 0 THEN $checker_name ELSE checker_name END,
+            reviewer_id = IF string::len(string::trim($reviewer_id)) > 0 THEN $reviewer_id ELSE reviewer_id END,
+            reviewer_name = IF string::len(string::trim($reviewer_name)) > 0 THEN $reviewer_name ELSE reviewer_name END,
+            approver_id = IF string::len(string::trim($approver_id)) > 0 THEN $approver_id ELSE approver_id END,
+            approver_name = IF string::len(string::trim($approver_name)) > 0 THEN $approver_name ELSE approver_name END,
+            return_reason = NONE,
+            updated_at = time::now()
+        WHERE record::id(id) = $task_id AND (deleted IS NONE OR deleted = false)
+    "#;
+
+    project_primary_db()
+        .query(update_sql)
+        .bind(("task_id", task.id.clone()))
+        .bind(("next_node", target_node.clone()))
+        .bind(("status", next_status))
+        .bind(("checker_id", checker_id))
+        .bind(("checker_name", checker_name))
+        .bind(("reviewer_id", reviewer_id))
+        .bind(("reviewer_name", reviewer_name))
+        .bind(("approver_id", approver_id))
+        .bind(("approver_name", approver_name))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("更新 review_tasks 失败: {}", error),
+            )
+        })?;
+
+    let review_form = get_review_form_by_form_id(&request.form_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("查询 review_forms 失败: {}", error),
+            )
+        })?;
+
+    if let Err(error) = sync_review_form_with_task_status(
+        &request.form_id,
+        review_form.as_ref().map(|form| form.project_id.as_str()),
+        Some(task.requester_id.as_str()),
+        "workflow_sync_agree",
+        next_status,
+    )
+    .await
+    {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("同步 review_forms 状态失败: {}", error),
+        ));
+    }
+
+    let history_sql = r#"
+        CREATE review_workflow_history CONTENT {
+            task_id: $task_id,
+            node: $from_node,
+            action: 'approve',
+            operator_id: $operator_id,
+            operator_name: $operator_name,
+            comment: $comment,
+            timestamp: time::now()
+        }
+    "#;
+    let history_comment = request
+        .comments
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let _ = project_primary_db()
+        .query(history_sql)
+        .bind(("task_id", task.id))
+        .bind(("from_node", current_node.clone()))
+        .bind(("operator_id", request.actor.id.trim().to_string()))
+        .bind(("operator_name", request.actor.name.trim().to_string()))
+        .bind(("comment", history_comment))
+        .await;
+
+    if current_node == "pz" {
+        Ok(None)
+    } else {
+        Ok(Some(target_node))
+    }
+}
+
+async fn apply_workflow_stop(
+    request: &SyncWorkflowRequest,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let task = find_task_by_form_id(&request.form_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("查询任务失败: {}", error),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("form_id={} 未找到活动 review task", request.form_id),
+            )
+        })?;
+
+    let current_node = normalize_workflow_node(&task.current_node);
+    if current_node != "jd" && current_node != "sh" && current_node != "pz" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "stop 仅允许在 jd/sh/pz 节点执行，当前节点为 {}",
+                if current_node.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    current_node.clone()
+                }
+            ),
+        ));
+    }
+
+    let (owner_id, owner_source) = current_node_owner(&task, &current_node);
+    if !owner_id.is_empty() && owner_id != request.actor.id.trim() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "stop 权限不足：当前请求人 {} 不是 {} 节点负责人 {}",
+                request.actor.id.trim(),
+                owner_source,
+                owner_id
+            ),
+        ));
+    }
+
+    let stop_reason = request
+        .comments
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "流程已终止".to_string());
+
+    let update_sql = r#"
+        UPDATE review_tasks SET
+            status = 'cancelled',
+            return_reason = $stop_reason,
+            updated_at = time::now()
+        WHERE record::id(id) = $task_id AND (deleted IS NONE OR deleted = false)
+    "#;
+
+    project_primary_db()
+        .query(update_sql)
+        .bind(("task_id", task.id.clone()))
+        .bind(("stop_reason", format!("[stop@{}] {}", current_node, stop_reason)))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("更新 review_tasks 失败: {}", error),
+            )
+        })?;
+
+    let review_form = get_review_form_by_form_id(&request.form_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("查询 review_forms 失败: {}", error),
+            )
+        })?;
+
+    if let Err(error) = sync_review_form_with_task_status(
+        &request.form_id,
+        review_form.as_ref().map(|form| form.project_id.as_str()),
+        Some(task.requester_id.as_str()),
+        "workflow_sync_stop",
+        "cancelled",
+    )
+    .await
+    {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("同步 review_forms 状态失败: {}", error),
+        ));
+    }
+
+    let history_sql = r#"
+        CREATE review_workflow_history CONTENT {
+            task_id: $task_id,
+            node: $from_node,
+            action: 'stop',
+            operator_id: $operator_id,
+            operator_name: $operator_name,
+            comment: $comment,
+            timestamp: time::now()
+        }
+    "#;
+    let _ = project_primary_db()
+        .query(history_sql)
+        .bind(("task_id", task.id))
+        .bind(("from_node", current_node))
+        .bind(("operator_id", request.actor.id.trim().to_string()))
+        .bind(("operator_name", request.actor.name.trim().to_string()))
+        .bind(("comment", Some(stop_reason)))
+        .await;
+
+    Ok(None)
 }
 
 // ============================================================================
@@ -425,7 +1231,10 @@ async fn query_annotation_comments(
     Ok(comments)
 }
 
-async fn query_workflow_data(form_id: &str) -> anyhow::Result<SyncWorkflowData> {
+async fn query_workflow_data(
+    form_id: &str,
+    next_step: Option<String>,
+) -> anyhow::Result<SyncWorkflowData> {
     let models = query_workflow_models(form_id).await.unwrap_or_default();
     let attachments = query_workflow_attachments(form_id)
         .await
@@ -480,5 +1289,6 @@ async fn query_workflow_data(form_id: &str) -> anyhow::Result<SyncWorkflowData> 
         task_created,
         current_node,
         task_status,
+        next_step,
     })
 }

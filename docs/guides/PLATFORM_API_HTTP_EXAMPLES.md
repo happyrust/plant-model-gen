@@ -23,9 +23,18 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/review/embed-url' \
     "user_id": "kangwp",
     "form_id": "FORM-ABC123",
     "token": "<平台签发的 JWT，可选；三段式 JWT 时须与 form_id 一致>",
+    "workflow_mode": "manual",
     "extra_parameters": { "is_reviewer": false }
   }'
 ```
+
+当前正式协议下，返回的公开嵌入 `url` 应只包含：
+
+```text
+...?user_token=<jwt>
+```
+
+`form_id / project_id / user_id / output_project` 仍可出现在 `data` 调试字段里，但不再进入正式路由 URL。
 
 ---
 
@@ -168,11 +177,12 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/auth/token' \
   -d '{
     "username": "kangwp",
     "project": "2410",
-    "role": "sj"
+    "role": "sj",
+    "workflow_mode": "manual"
   }'
 ```
 
-响应中的 `data.token` 与 `data.form_id` 用于后续 `embed-url` / `workflow/sync`。
+响应中的 `data.token` 与 `data.form_id` 用于后续 `embed-url` / `workflow/sync`。`workflow_mode` 会写入 JWT claims，并在 `/api/auth/verify` 返回。
 
 ---
 

@@ -143,6 +143,8 @@ pub struct SyncWorkflowData {
     pub current_node: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -284,19 +286,22 @@ pub fn review_form_from_row(row: ReviewFormRow) -> ReviewForm {
 
 #[cfg(feature = "web_server")]
 pub fn normalize_review_form_status(status: &str) -> String {
-    match status.trim() {
+    match status.trim().to_lowercase().as_str() {
         "draft" => "draft".to_string(),
         "deleted" => "deleted".to_string(),
         "blank" => "blank".to_string(),
+        "cancelled" => "cancelled".to_string(),
+        "approved" => "approved".to_string(),
         _ => "active".to_string(),
     }
 }
 
 #[cfg(feature = "web_server")]
 pub fn derive_review_form_status_from_task_status(task_status: &str) -> String {
-    if task_status.trim().eq_ignore_ascii_case("draft") {
-        "draft".to_string()
-    } else {
-        "active".to_string()
+    match task_status.trim().to_lowercase().as_str() {
+        "draft" => "draft".to_string(),
+        "cancelled" => "cancelled".to_string(),
+        "approved" => "approved".to_string(),
+        _ => "active".to_string(),
     }
 }

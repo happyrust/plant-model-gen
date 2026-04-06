@@ -35,27 +35,27 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 # rustflags = ["-C", "link-args=-Wl,-stack_size,0x1000000"]
 
 
-[unstable]
-codegen-backend = true
+# [unstable]
+# codegen-backend = true
 
 [profile.dev]
-codegen-backend = "cranelift"
+# codegen-backend = "cranelift"
 debug = 1              # 仅行号表，加快编译和链接
 incremental = true     # 显式开启增量编译（dev 默认已开，防止被环境变量覆盖）
 split-debuginfo = "unpacked"  # macOS 关键优化：调试信息不打包，大幅缩短链接时间
                                # Linux 下此选项为默认行为，无负面影响
 
 [profile.dev.package."*"]
-codegen-backend = "llvm"
+# codegen-backend = "llvm"
 #opt-level = 1  # 依赖项轻度优化，减小产物体积加速链接
 
 [profile.test]
 # 单测/集成测试在 Windows + cranelift 下更易触发内存/链接异常；
 # 统一改用 llvm，换稳定与可诊断性。
-codegen-backend = "llvm"
+# codegen-backend = "llvm"
 
 [profile.test.package."*"]
-codegen-backend = "llvm"
+# codegen-backend = "llvm"
 
 # ─── release：加速编译，保留足够运行时性能 ───────────────────────────────────
 # 默认 release: opt-level=3, codegen-units=1, incremental=false

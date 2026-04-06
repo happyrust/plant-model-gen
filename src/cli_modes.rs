@@ -530,7 +530,7 @@ pub async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()>
             );
         }
     } else {
-        aios_core::release_standalone_surreal_for_embedded_file(&db_option_ext.inner);
+        // aios_core::release_standalone_surreal_for_embedded_file(&db_option_ext.inner);
         println!("\n📡 连接数据库（SurrealDB 嵌入式模式）...");
     }
 

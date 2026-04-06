@@ -295,6 +295,46 @@ async fn test_embed_url_accepts_legacy_json_key_role() {
 }
 
 #[tokio::test]
+async fn test_embed_url_jwt_defaults_role_sj_when_workflow_role_omitted() {
+    let form_id = "FORM-DEFAULT-JWT-ROLE";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    let app = create_platform_api_routes();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/embed-url")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "user_id": "user-1",
+                        "form_id": form_id
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: EmbedUrlResponseBody = serde_json::from_slice(&body).unwrap();
+    let data = payload.data.expect("embed data");
+    let response_token = data
+        .get("token")
+        .and_then(|v| v.as_str())
+        .expect("response token");
+    let claims = verify_token(response_token).unwrap();
+    assert_eq!(claims.role.as_deref(), Some("sj"));
+}
+
+#[tokio::test]
 #[ignore = "requires an initialized review_forms database backing store"]
 async fn test_embed_url_reuses_persisted_form_role_when_followup_request_omits_role() {
     let form_id = "FORM-ROLE-PERSISTED";

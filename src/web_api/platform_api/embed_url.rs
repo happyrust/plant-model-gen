@@ -212,13 +212,16 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
     );
 
     let resolved_role = requested_role.clone().or_else(|| ensured_form.role.clone());
+    // plant3d-web `resolveTrustedEmbedIdentity` 要求 JWT claims 含非空 `role`。
+    // 未传 workflow_role 且 review_forms 尚无 role 时，此前会签发无 role 的 JWT，嵌入页报「缺少可信身份声明」。
+    let jwt_workflow_role: &str = resolved_role.as_deref().unwrap_or("sj");
 
     match create_token(
         &request.project_id,
         &request.user_id,
         None,
         &form_id,
-        resolved_role.as_deref(),
+        Some(jwt_workflow_role),
         requested_workflow_mode.as_deref(),
     ) {
         Ok((token, _expires_at)) => {

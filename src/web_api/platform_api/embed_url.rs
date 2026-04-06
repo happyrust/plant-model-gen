@@ -21,11 +21,11 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string());
     info!(
-        "Embed URL request: project_id={}, user_id={}, form_id={:?}, role={:?}, workflow_mode={:?}, has_token={}, extra_parameters={}",
+        "Embed URL request: project_id={}, user_id={}, form_id={:?}, workflow_role={:?}, workflow_mode={:?}, has_token={}, extra_parameters={}",
         request.project_id,
         request.user_id,
         request_form_id,
-        request.role,
+        request.workflow_role,
         request.workflow_mode,
         request.token.as_ref().map(|value| !value.trim().is_empty()).unwrap_or(false),
         summarize_extra_parameters(request.extra_parameters.as_ref())
@@ -317,16 +317,16 @@ fn resolve_embed_request_role(
     verified_claim_role: Option<&str>,
 ) -> Result<Option<String>, String> {
     let explicit_role = request
-        .role
+        .workflow_role
         .as_deref()
-        .or_else(|| extract_role_from_extra_parameters(request, "user_role"))
+        .or_else(|| extract_role_from_extra_parameters(request, "workflow_role"))
         .or_else(|| extract_role_from_extra_parameters(request, "role"));
 
     if let Some(role) = verified_claim_role {
         if let Some(explicit_role) = explicit_role {
             let validated_explicit = validate_embed_role(explicit_role)?;
             if validated_explicit.as_deref() != Some(role) {
-                return Err("JWT role mismatch".to_string());
+                return Err("JWT workflow_role mismatch".to_string());
             }
         }
         return validate_embed_role(role);

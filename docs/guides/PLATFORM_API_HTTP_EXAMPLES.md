@@ -21,12 +21,15 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/review/embed-url' \
   -d '{
     "project_id": "2410",
     "user_id": "kangwp",
+    "workflow_role": "sj",
     "form_id": "FORM-ABC123",
     "token": "<平台签发的 JWT，可选；三段式 JWT 时须与 form_id 一致>",
     "workflow_mode": "manual",
     "extra_parameters": { "is_reviewer": false }
   }'
 ```
+
+`workflow_role`：本单据上为当前用户指定的工作流角色（`sj` / `jd` / `sh` / `pz` / `admin`）。为兼容旧客户端仍接受顶层 JSON 键 `role`；**不再接受** `user_role`。
 
 当前正式协议下，返回的公开嵌入 `url` 应只包含：
 

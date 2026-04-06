@@ -170,7 +170,7 @@ async fn test_embed_url_accepts_matching_form_id_from_jwt() {
 }
 
 #[tokio::test]
-async fn test_embed_url_includes_role_in_signed_token_when_request_provides_user_role() {
+async fn test_embed_url_includes_workflow_role_in_signed_token_when_extra_has_workflow_role() {
     let form_id = "FORM-ROLE-REQUEST";
     let _ = init_surreal().await;
     cleanup_form(form_id).await;
@@ -188,7 +188,7 @@ async fn test_embed_url_includes_role_in_signed_token_when_request_provides_user
                         "user_id": "user-1",
                         "form_id": form_id,
                         "extra_parameters": {
-                            "user_role": "jd"
+                            "workflow_role": "jd"
                         }
                     })
                     .to_string(),
@@ -213,6 +213,88 @@ async fn test_embed_url_includes_role_in_signed_token_when_request_provides_user
 }
 
 #[tokio::test]
+async fn test_embed_url_accepts_workflow_role_field_name() {
+    let form_id = "FORM-WORKFLOW-ROLE-ALIAS";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    let app = create_platform_api_routes();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/embed-url")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "user_id": "user-1",
+                        "form_id": form_id,
+                        "workflow_role": "sh"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: EmbedUrlResponseBody = serde_json::from_slice(&body).unwrap();
+    let data = payload.data.expect("embed data");
+    let response_token = data
+        .get("token")
+        .and_then(|v| v.as_str())
+        .expect("response token");
+    let claims = verify_token(response_token).unwrap();
+    assert_eq!(claims.role.as_deref(), Some("sh"));
+}
+
+#[tokio::test]
+async fn test_embed_url_accepts_legacy_json_key_role() {
+    let form_id = "FORM-LEGACY-ROLE-KEY";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    let app = create_platform_api_routes();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/embed-url")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "user_id": "user-1",
+                        "form_id": form_id,
+                        "role": "pz"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: EmbedUrlResponseBody = serde_json::from_slice(&body).unwrap();
+    let data = payload.data.expect("embed data");
+    let response_token = data
+        .get("token")
+        .and_then(|v| v.as_str())
+        .expect("response token");
+    let claims = verify_token(response_token).unwrap();
+    assert_eq!(claims.role.as_deref(), Some("pz"));
+}
+
+#[tokio::test]
 #[ignore = "requires an initialized review_forms database backing store"]
 async fn test_embed_url_reuses_persisted_form_role_when_followup_request_omits_role() {
     let form_id = "FORM-ROLE-PERSISTED";
@@ -233,7 +315,7 @@ async fn test_embed_url_reuses_persisted_form_role_when_followup_request_omits_r
                         "user_id": "JH",
                         "form_id": form_id,
                         "extra_parameters": {
-                            "user_role": "jd"
+                            "workflow_role": "jd"
                         }
                     })
                     .to_string(),

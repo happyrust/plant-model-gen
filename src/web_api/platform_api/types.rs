@@ -15,8 +15,10 @@ use crate::web_api::review_api::ReviewTask;
 pub struct EmbedUrlRequest {
     pub project_id: String,
     pub user_id: String,
-    #[serde(default, alias = "user_role")]
-    pub role: Option<String>,
+    /// 外部传入的**本单据工作流角色**（`sj` / `jd` / `sh` / `pz` / `admin`），表示在该 `form_id` 下当前用户被指定的流程身份。
+    /// JSON 推荐键名 `workflow_role`；为兼容旧集成仍接受顶层键 `role`。不再接受 `user_role`。
+    #[serde(default, alias = "role")]
+    pub workflow_role: Option<String>,
     #[serde(default, alias = "workflowMode")]
     pub workflow_mode: Option<String>,
     pub form_id: Option<String>,

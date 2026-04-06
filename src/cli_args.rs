@@ -78,6 +78,12 @@ pub fn add_export_instance_args(command: Command) -> Command {
                 .help("Merge all per-dbnum instances_v3_*.json into a single instances_v3.json (no DB needed)")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("export-rvm-semantic-debug")
+                .long("export-rvm-semantic-debug")
+                .help("Export scoped RVM semantic normalization debug JSON from the relation store. Requires --dbnum and --root-refno or --debug-model/--root-model")
+                .action(clap::ArgAction::SetTrue),
+        )
 }
 
 pub fn add_init_project_subcommand(command: Command) -> Command {

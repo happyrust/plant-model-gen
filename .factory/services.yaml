@@ -1,19 +1,20 @@
 commands:
   install: cargo fetch
-  context: rg -n "workflow_sync|notify_workflow_sync_async|notify_workflow_sync|external_review\.workflow_sync_path|workflow/sync|title|current_node|task_status|models|opinions|attachments" src docs shells db_options
+  context: rg -n "export_v3|instances_v3|geometry_manifest|export_prepack_lod|export_instanced_bundle|/api/export|/files/output|/files/meshes|stream_generate" src docs db_options .factory
   typecheck: cargo check --features web_server --bin web_server
-  lint: echo "lint skipped for analysis-only backend workflow/sync mission"
-  test: cargo check --features web_server --bin web_server
+  lint: echo "lint not defined for this mission; use focused cargo check and artifact validation"
+  test: cargo check --features ws,sqlite-index,web_server --bin aios-database
 
 services:
-  web_server:
-    start: WEB_SERVER_PORT=3100 cargo run --features web_server --bin web_server -- --config db_options/DbOption-mac
-    stop: lsof -tiTCP:3100 -sTCP:LISTEN | xargs kill || true
-    healthcheck: curl -sf http://127.0.0.1:3100/api/status > /dev/null && echo "web_server ok"
-    port: 3100
+  surrealdb:
+    start: echo "Reuse existing SurrealDB on 127.0.0.1:8021 for this mission"
+    stop: echo "SurrealDB is shared; do not stop it from this mission"
+    healthcheck: curl -sf http://127.0.0.1:8021/status > /dev/null || echo "shared surrealdb health endpoint unavailable; rely on export connectivity"
+    port: 8021
     depends_on: []
-
-# Analysis-only mission note:
-# - `commands.context` is the primary evidence scan.
-# - `commands.typecheck` and `commands.test` intentionally share the same narrow backend sanity check to avoid unrelated example/test failures.
-# - Validators should prioritize exact file references and code-path evidence over command output.
+  web_server:
+    start: WEB_SERVER_PORT=3200 cargo run --features web_server --bin web_server -- --config db_options/DbOption-zsy
+    stop: lsof -tiTCP:3200 -sTCP:LISTEN | xargs kill || true
+    healthcheck: curl -sf http://127.0.0.1:3200/api/status > /dev/null && echo "web_server ok"
+    port: 3200
+    depends_on: [surrealdb]

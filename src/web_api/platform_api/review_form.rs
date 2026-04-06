@@ -11,7 +11,9 @@ use surrealdb::types::{self as surrealdb_types, SurrealValue};
 use super::types::{
     ReviewForm, ReviewFormRow, derive_review_form_status_from_task_status, review_form_from_row,
 };
-use crate::web_api::review_api::{ReviewAttachment, ReviewComponent, ReviewTask, WorkflowStep};
+use crate::web_api::review_api::{
+    ReviewAttachment, ReviewComponent, ReviewTask, WorkflowStep, hydrate_task_attachments,
+};
 
 /// `review_tasks` 未软删过滤片段（可选 `bool` 字段：勿单独用 `deleted = false` 排除「字段缺失」旧数据）
 pub const REVIEW_TASK_ACTIVE_SQL: &str = "(deleted IS NONE OR deleted = false)";
@@ -283,7 +285,7 @@ pub async fn find_task_by_form_id(form_id: &str) -> anyhow::Result<Option<Review
         .await?;
 
     let rows: Vec<TaskRow> = response.take(0)?;
-    Ok(rows.into_iter().next().map(|row| {
+    let task = rows.into_iter().next().map(|row| {
         let id = match row.id.key {
             surrealdb::types::RecordIdKey::String(value) => value,
             other => format!("{:?}", other),
@@ -327,5 +329,11 @@ pub async fn find_task_by_form_id(form_id: &str) -> anyhow::Result<Option<Review
             workflow_history: row.workflow_history.unwrap_or_default(),
             return_reason: row.return_reason,
         }
-    }))
+    });
+
+    if let Some(task) = task {
+        return Ok(Some(hydrate_task_attachments(task).await));
+    }
+
+    Ok(None)
 }

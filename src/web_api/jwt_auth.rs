@@ -719,20 +719,25 @@ async fn get_token(Json(request): Json<TokenRequest>) -> impl IntoResponse {
 /// 验证 Token
 #[cfg(feature = "web_server")]
 async fn verify_token_handler(Json(request): Json<VerifyRequest>) -> impl IntoResponse {
-    info!("Token verification request");
+    let request_form_id = request
+        .form_id
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    info!(
+        "Token verification request: has_form_id={}, requested_form_id={:?}",
+        request_form_id.is_some(),
+        request_form_id
+    );
 
     match verify_token(&request.token) {
         Ok(claims) => {
-            if let Some(form_id) = request
-                .form_id
-                .as_ref()
-                .map(|value| value.trim())
-                .filter(|value| !value.is_empty())
-            {
+            if let Some(form_id) = request_form_id.as_deref() {
                 if claims.form_id != form_id {
                     warn!(
-                        "Token verification failed: form_id mismatch, expected={}, actual={}",
-                        form_id, claims.form_id
+                        "Token verification failed: request_form_id={}, claims_form_id={}, project_id={}, user_id={}, role={:?}",
+                        form_id, claims.form_id, claims.project_id, claims.user_id, claims.role
                     );
                     return (
                         StatusCode::OK,
@@ -749,8 +754,13 @@ async fn verify_token_handler(Json(request): Json<VerifyRequest>) -> impl IntoRe
                 }
             }
             info!(
-                "Token verified: user_id={}, form_id={}",
-                claims.user_id, claims.form_id
+                "Token verified: request_form_id={:?}, claims_form_id={}, project_id={}, user_id={}, role={:?}, workflow_mode={:?}",
+                request_form_id,
+                claims.form_id,
+                claims.project_id,
+                claims.user_id,
+                claims.role,
+                claims.workflow_mode
             );
             (
                 StatusCode::OK,

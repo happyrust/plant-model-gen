@@ -18,9 +18,13 @@ impl ModelRelationStore {
         }
     }
 
+    pub fn db_dir(&self, dbnum: u32) -> PathBuf {
+        self.base_path.join(format!("{dbnum}"))
+    }
+
     /// 获取指定 dbnum 的连接（懒加载）
     fn get_conn(&self, dbnum: u32) -> Result<Connection> {
-        let db_path = self.base_path.join(format!("{}/relations.db", dbnum));
+        let db_path = self.db_dir(dbnum).join("relations.db");
         std::fs::create_dir_all(db_path.parent().unwrap())?;
 
         let conn =

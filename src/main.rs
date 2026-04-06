@@ -2078,58 +2078,16 @@ async fn main() -> anyhow::Result<()> {
             )
             .await;
         } else {
-            // 全库模式：导出所有 DESI dbnum 后自动合并
-            println!("\n🔁 全库 V3 导出模式（未指定 --dbnum，自动遍历所有 DESI）");
-            use crate::cli_modes::ensure_surreal_connected;
-            use aios_database::data_interface::db_meta_manager::db_meta;
-            ensure_surreal_connected(&db_option_ext).await?;
-
-            let _ = db_meta().ensure_loaded();
-            let mut dbnos: Vec<u32> = db_meta().get_all_dbnums();
-            dbnos.sort();
-            if dbnos.is_empty() {
-                eprintln!("⚠️ db_meta 未返回任何 dbnum");
-                return Ok(());
-            }
-            println!("📋 共 {} 个 DESI dbnum: {:?}", dbnos.len(), dbnos);
-
-            let bundle_dir = export_bundle_dir
-                .clone()
-                .unwrap_or_else(|| db_option_ext.get_project_output_dir().join("v3_bundle"));
-
-            let mut success_count = 0usize;
-            let mut fail_count = 0usize;
-            for (idx, db) in dbnos.iter().enumerate() {
-                println!("\n━━━ [{}/{}] dbnum={} ━━━", idx + 1, dbnos.len(), db);
-                match export_dbnum_instances_v3_mode(
-                    *db,
-                    verbose,
-                    Some(bundle_dir.clone()),
-                    &db_option_ext,
-                    None,
-                    target_unit.clone(),
-                    apply_rotation,
-                )
-                .await
-                {
-                    Ok(_) => success_count += 1,
-                    Err(e) => {
-                        eprintln!("   ⚠️ dbnum={} 导出失败: {:?}", db, e);
-                        fail_count += 1;
-                    }
-                }
-            }
-
-            println!(
-                "\n📊 全库导出完成: 成功={}, 失败={}",
-                success_count, fail_count
-            );
-
-            // 自动合并
-            println!("\n🔗 自动合并所有 per-dbnum JSON...");
-            merge_v3_instances_mode(verbose, Some(bundle_dir), &db_option_ext)?;
-
-            return Ok(());
+            // 全库模式：一次性查 inst_relate 全表直接输出
+            use crate::cli_modes::export_all_instances_v3_mode;
+            return export_all_instances_v3_mode(
+                verbose,
+                export_bundle_dir,
+                &db_option_ext,
+                target_unit,
+                apply_rotation,
+            )
+            .await;
         }
     }
 
@@ -2303,6 +2261,39 @@ async fn main() -> anyhow::Result<()> {
             &relation_store_root,
             verbose,
         );
+    }
+
+    if matches.get_flag("export-rvm-semantic-debug") {
+        use crate::cli_modes::export_rvm_semantic_debug_mode;
+        use aios_core::pdms_types::RefnoEnum;
+        use std::str::FromStr;
+
+        let dbnum = matches
+            .get_one::<u32>("dbnum")
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("--export-rvm-semantic-debug 需要同时指定 --dbnum"))?;
+
+        let root_refno = matches
+            .get_one::<String>("root-refno")
+            .cloned()
+            .or_else(|| {
+                matches
+                    .get_many::<String>("debug-model")
+                    .or_else(|| matches.get_many::<String>("root-model"))
+                    .and_then(|values| values.into_iter().next().cloned())
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--export-rvm-semantic-debug 需要通过 --root-refno 或 --debug-model/--root-model 指定作用域 refno"
+                )
+            })?;
+
+        let normalized_refno = root_refno.replace('_', "/");
+        let root_refno = RefnoEnum::from_str(&normalized_refno)
+            .map_err(|e| anyhow::anyhow!("解析 root refno 失败: {} ({})", normalized_refno, e))?;
+        let output_dir = matches.get_one::<String>("output").map(PathBuf::from);
+
+        return export_rvm_semantic_debug_mode(dbnum, verbose, output_dir, root_refno);
     }
 
     if matches.get_flag("export-all-relates") {

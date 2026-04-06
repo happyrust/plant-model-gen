@@ -1,6 +1,6 @@
 //! Request/Response types for PMS ↔ platform API.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 #[cfg(feature = "web_server")]
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
@@ -11,20 +11,84 @@ use crate::web_api::review_api::ReviewTask;
 // Embed URL
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct EmbedUrlRequest {
     pub project_id: String,
     pub user_id: String,
     /// 外部传入的**本单据工作流角色**（`sj` / `jd` / `sh` / `pz` / `admin`），表示在该 `form_id` 下当前用户被指定的流程身份。
     /// JSON 推荐键名 `workflow_role`；为兼容旧集成仍接受顶层键 `role`。不再接受 `user_role`。
-    #[serde(default, alias = "role")]
     pub workflow_role: Option<String>,
-    #[serde(default, alias = "workflowMode")]
     pub workflow_mode: Option<String>,
     pub form_id: Option<String>,
     pub token: Option<String>,
-    #[serde(default)]
     pub extra_parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbedUrlRequestWire {
+    project_id: String,
+    user_id: String,
+    #[serde(default)]
+    workflow_role: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default, alias = "workflowMode")]
+    workflow_mode: Option<String>,
+    form_id: Option<String>,
+    token: Option<String>,
+    #[serde(default)]
+    extra_parameters: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for EmbedUrlRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = EmbedUrlRequestWire::deserialize(deserializer)?;
+        let workflow_role = merge_embed_request_role_aliases(wire.workflow_role, wire.role)
+            .map_err(D::Error::custom)?;
+
+        Ok(Self {
+            project_id: wire.project_id,
+            user_id: wire.user_id,
+            workflow_role,
+            workflow_mode: wire.workflow_mode,
+            form_id: wire.form_id,
+            token: wire.token,
+            extra_parameters: wire.extra_parameters,
+        })
+    }
+}
+
+fn merge_embed_request_role_aliases(
+    workflow_role: Option<String>,
+    role: Option<String>,
+) -> Result<Option<String>, String> {
+    let workflow_role = normalize_optional_request_value(workflow_role);
+    let role = normalize_optional_request_value(role);
+
+    match (workflow_role, role) {
+        (Some(workflow_role), Some(role)) => {
+            if workflow_role.eq_ignore_ascii_case(role.as_str()) {
+                Ok(Some(workflow_role))
+            } else {
+                Err(format!(
+                    "workflow_role and role mismatch: workflow_role='{}', role='{}'",
+                    workflow_role, role
+                ))
+            }
+        }
+        (Some(workflow_role), None) => Ok(Some(workflow_role)),
+        (None, Some(role)) => Ok(Some(role)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn normalize_optional_request_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[derive(Debug, Serialize)]

@@ -231,14 +231,15 @@ pub struct TokenClaims {
     /// 用户姓名
     #[serde(default)]
     pub user_name: String,
-    /// 表单ID
-    pub form_id: String,
     /// 角色 (可选)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     /// 工作流模式 (可选)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_mode: Option<String>,
+    /// 兼容旧 token：读取时可接收旧的 form_id，但新 token 不再序列化它
+    #[serde(default, alias = "form_id", skip_serializing)]
+    pub legacy_form_id: Option<String>,
     /// 过期时间戳 (Unix timestamp)
     pub exp: u64,
     /// 签发时间戳 (Unix timestamp)
@@ -344,7 +345,6 @@ pub fn create_token(
     project_id: &str,
     user_id: &str,
     user_name: Option<&str>,
-    form_id: &str,
     role: Option<&str>,
     workflow_mode: Option<&str>,
 ) -> Result<(String, u64), String> {
@@ -363,9 +363,9 @@ pub fn create_token(
             .filter(|s| !s.is_empty())
             .unwrap_or(user_id)
             .to_string(),
-        form_id: form_id.to_string(),
         role: role.map(|s| s.to_string()),
         workflow_mode: normalize_workflow_mode(workflow_mode),
+        legacy_form_id: None,
         exp,
         iat: now,
     };
@@ -472,13 +472,13 @@ fn build_debug_claims(config: &ReviewAuthConfig) -> TokenClaims {
         project_id: config.debug_project_id.clone(),
         user_id: config.debug_user_id.clone(),
         user_name: config.debug_user_id.clone(),
-        form_id: "FORM-DEBUG-AUTH-BYPASS".to_string(),
         role: if role.is_empty() {
             None
         } else {
             Some(role.to_string())
         },
         workflow_mode: None,
+        legacy_form_id: None,
         exp: now + 365 * 24 * 3600,
         iat: now,
     }
@@ -683,7 +683,6 @@ async fn get_token(Json(request): Json<TokenRequest>) -> impl IntoResponse {
         &project_id,
         &user_id,
         request.user_name.as_deref(),
-        &form_id,
         validated_role,
         validated_workflow_mode.as_deref(),
     ) {
@@ -726,37 +725,28 @@ async fn verify_token_handler(Json(request): Json<VerifyRequest>) -> impl IntoRe
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string());
     info!(
-        "Token verification request: has_form_id={}, requested_form_id={:?}",
+        "Token verification request: has_form_id_hint={}, requested_form_id_hint={:?}",
         request_form_id.is_some(),
         request_form_id
     );
 
     match verify_token(&request.token) {
         Ok(claims) => {
-            if let Some(form_id) = request_form_id.as_deref() {
-                if claims.form_id != form_id {
-                    warn!(
-                        "Token verification failed: request_form_id={}, claims_form_id={}, project_id={}, user_id={}, role={:?}",
-                        form_id, claims.form_id, claims.project_id, claims.user_id, claims.role
-                    );
-                    return (
-                        StatusCode::OK,
-                        Json(VerifyResponse {
-                            code: 0,
-                            message: "ok".to_string(),
-                            data: Some(VerifyData {
-                                valid: false,
-                                claims: None,
-                                error: Some("form_id mismatch".to_string()),
-                            }),
-                        }),
-                    );
-                }
+            if request_form_id.is_some() {
+                info!(
+                    "Token verification received deprecated form_id hint; ignoring request_form_id={:?}, project_id={}, user_id={}, role={:?}",
+                    request_form_id, claims.project_id, claims.user_id, claims.role
+                );
+            }
+            if let Some(legacy_form_id) = claims.legacy_form_id.as_deref() {
+                warn!(
+                    "Token verification decoded legacy token claim form_id={}, project_id={}, user_id={}; explicit form_id request fields remain authoritative",
+                    legacy_form_id, claims.project_id, claims.user_id
+                );
             }
             info!(
-                "Token verified: request_form_id={:?}, claims_form_id={}, project_id={}, user_id={}, role={:?}, workflow_mode={:?}",
+                "Token verified: request_form_id_hint={:?}, project_id={}, user_id={}, role={:?}, workflow_mode={:?}",
                 request_form_id,
-                claims.form_id,
                 claims.project_id,
                 claims.user_id,
                 claims.role,
@@ -829,14 +819,14 @@ mod tests {
     #[test]
     fn test_create_and_verify_token() {
         let (token, _exp) =
-            create_token("2410", "kangwp", None, "FORM-TEST123", None, None).unwrap();
+            create_token("2410", "kangwp", None, None, None).unwrap();
         assert!(!token.is_empty());
 
         let claims = verify_token(&token).unwrap();
         assert_eq!(claims.project_id, "2410");
         assert_eq!(claims.user_id, "kangwp");
         assert_eq!(claims.user_name, "kangwp");
-        assert_eq!(claims.form_id, "FORM-TEST123");
+        assert_eq!(claims.legacy_form_id, None);
         assert_eq!(claims.role, None);
     }
 
@@ -846,24 +836,66 @@ mod tests {
             "testproject",
             "testuser",
             Some("测试用户"),
-            "FORM-TEST123",
             Some("pz"),
             None,
         )
-        .unwrap();
+      .unwrap();
         assert!(!token.is_empty());
 
         let claims = verify_token(&token).unwrap();
         assert_eq!(claims.project_id, "testproject");
         assert_eq!(claims.user_id, "testuser");
         assert_eq!(claims.user_name, "测试用户");
+        assert_eq!(claims.legacy_form_id, None);
         assert_eq!(claims.role, Some("pz".to_string()));
+    }
+
+    /// 签发后的 JWT **原始 payload** 不得出现 `form_id`（单据维度只走 URL/query，与 PMS 对齐）。
+    #[test]
+    fn test_jwt_payload_json_has_no_form_id_key() {
+        use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+        use base64::Engine;
+
+        let (token, _) = create_token("proj-a", "user-b", Some("N"), Some("sj"), Some("manual")).unwrap();
+        let b64 = token.split('.').nth(1).expect("jwt payload segment");
+        let json_bytes = URL_SAFE_NO_PAD.decode(b64).unwrap_or_else(|_| {
+            let mut padded = b64.to_string();
+            while padded.len() % 4 != 0 {
+                padded.push('=');
+            }
+            URL_SAFE.decode(padded.as_bytes()).expect("jwt payload base64url")
+        });
+        let v: serde_json::Value = serde_json::from_slice(&json_bytes).expect("jwt payload json");
+        let obj = v.as_object().expect("claims object");
+        assert!(
+            !obj.contains_key("form_id"),
+            "user_token (JWT) must not serialize form_id; got keys={:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_token_claims_json_omit_form_id_even_if_legacy_set() {
+        let claims = TokenClaims {
+            project_id: "p".into(),
+            user_id: "u".into(),
+            user_name: "u".into(),
+            role: Some("sj".into()),
+            workflow_mode: Some("manual".into()),
+            legacy_form_id: Some("FORM-LEGACY".into()),
+            exp: 1,
+            iat: 1,
+        };
+        let v = serde_json::to_value(&claims).unwrap();
+        let o = v.as_object().unwrap();
+        assert!(!o.contains_key("form_id"));
+        assert!(!o.contains_key("legacy_form_id"));
     }
 
     #[test]
     fn test_decode_token_unsafe() {
         let (token, _exp) =
-            create_token("2410", "kangwp", None, "FORM-TEST123", None, None).unwrap();
+            create_token("2410", "kangwp", None, None, None).unwrap();
 
         let claims = decode_token_unsafe(&token).unwrap();
         assert_eq!(claims.project_id, "2410");
@@ -983,7 +1015,6 @@ mod tests {
                                 "1516",
                                 "user-002",
                                 Some("李校对"),
-                                "FORM-TEST123",
                                 Some("jd"),
                                 None
                             )
@@ -1010,13 +1041,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verify_token_handler_rejects_form_id_mismatch() {
+    async fn test_verify_token_handler_ignores_form_id_hint_mismatch() {
         let app = create_jwt_auth_routes();
         let (token, _) = create_token(
             "project-1",
             "user-1",
             None,
-            "FORM-EXPECTED",
             Some("sj"),
             None,
         )
@@ -1047,11 +1077,8 @@ mod tests {
         let payload: VerifyResponseBody = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(payload.code, 0);
-        assert_eq!(payload.data.as_ref().map(|data| data.valid), Some(false));
-        assert_eq!(
-            payload.data.as_ref().and_then(|data| data.error.as_deref()),
-            Some("form_id mismatch")
-        );
+        assert_eq!(payload.data.as_ref().map(|data| data.valid), Some(true));
+        assert_eq!(payload.data.as_ref().and_then(|data| data.error.as_deref()), None);
     }
 
     #[tokio::test]
@@ -1061,7 +1088,6 @@ mod tests {
             "project-1",
             "user-1",
             None,
-            "FORM-EXPECTED",
             Some("sj"),
             None,
         )
@@ -1098,8 +1124,8 @@ mod tests {
                 .data
                 .as_ref()
                 .and_then(|data| data.claims.as_ref())
-                .map(|claims| claims.form_id.as_str()),
-            Some("FORM-EXPECTED")
+                .map(|claims| claims.project_id.as_str()),
+            Some("project-1")
         );
     }
 }

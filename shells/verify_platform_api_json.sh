@@ -42,8 +42,36 @@ fi
 echo "   使用 form_id=$FORM_ID"
 
 echo ""
+echo "== 1b) user_token（JWT）payload 不得包含 form_id（仅 URL/query 携带）"
+jwt_payload_json() {
+  python3 - "$1" <<'PY'
+import sys, json, base64
+token = sys.argv[1]
+part = token.split(".")[1]
+pad = (-len(part)) % 4
+if pad:
+    part += "=" * pad
+raw = base64.urlsafe_b64decode(part.encode("ascii"))
+sys.stdout.buffer.write(raw)
+PY
+}
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "!! 未安装 python3，跳过 JWT payload 检查（可运行: cargo test -p aios-database --features web_server test_jwt_payload_json_has_no_form_id_key）"
+elif PAYLOAD_RAW=$(jwt_payload_json "$TOKEN"); then
+  if echo "$PAYLOAD_RAW" | jq -e 'has("form_id")' >/dev/null 2>&1; then
+    echo "!! 验证失败：JWT payload 含 form_id（应仅从 .data.form_id / URL 传递）"
+    echo "$PAYLOAD_RAW" | jq .
+    exit 1
+  fi
+  echo "   OK：payload 无 form_id 键。keys=$(echo "$PAYLOAD_RAW" | jq -c 'keys')"
+else
+  echo "!! JWT payload 解码失败"
+  exit 1
+fi
+
+echo ""
 echo "== 2) POST /api/auth/verify（检查 claims.workflow_mode）"
-VERIFY_RAW=$(jq -n --arg t "$TOKEN" --arg f "$FORM_ID" '{token:$t, form_id:$f}' \
+VERIFY_RAW=$(jq -n --arg t "$TOKEN" '{token:$t}' \
   | curl -sS -X POST "$BASE_URL/api/auth/verify" -H 'Content-Type: application/json' -d @-)
 echo "$VERIFY_RAW" | jq .
 
@@ -54,7 +82,7 @@ if [[ "$VERIFY_WORKFLOW_MODE" != "manual" ]]; then
 fi
 
 echo ""
-echo "== 3) POST /api/review/embed-url（检查公开 URL 是否只含 user_token）"
+echo "== 3) POST /api/review/embed-url（检查公开 URL 保留 form_id，且不回流用户身份字段）"
 EMBED_RAW=$(jq -n \
   --arg p "$(jq -r '.project // .project_id' "$JSON_DIR/auth_token.json")" \
   --arg u "$(jq -r '.username // .user_id' "$JSON_DIR/auth_token.json")" \
@@ -73,9 +101,28 @@ if [[ "$EMBED_URL" != *"user_token="* ]]; then
   echo "!! 验证失败：embed-url 未携带 user_token"
   exit 1
 fi
-if [[ "$EMBED_URL" == *"form_id="* || "$EMBED_URL" == *"project_id="* || "$EMBED_URL" == *"user_id="* || "$EMBED_URL" == *"output_project="* ]]; then
-  echo "!! 验证失败：embed-url 仍包含旧 query 参数 -> $EMBED_URL"
+if [[ "$EMBED_URL" != *"form_id="* ]]; then
+  echo "!! 验证失败：embed-url 未携带 form_id -> $EMBED_URL"
   exit 1
+fi
+if [[ "$EMBED_URL" == *"project_id="* || "$EMBED_URL" == *"user_id="* || "$EMBED_URL" == *"output_project="* ]]; then
+  echo "!! 验证失败：embed-url 仍回流旧身份 query 参数 -> $EMBED_URL"
+  exit 1
+fi
+
+EMBED_TOKEN=$(echo "$EMBED_RAW" | jq -r '.data.token // empty')
+if [[ -n "$EMBED_TOKEN" && "$EMBED_TOKEN" != "null" && "$EMBED_TOKEN" != "$TOKEN" ]]; then
+  echo ""
+  echo "== 3b) embed-url 返回的 JWT payload 同样不得包含 form_id"
+  if command -v python3 >/dev/null 2>&1; then
+    EP=$(jwt_payload_json "$EMBED_TOKEN")
+    if echo "$EP" | jq -e 'has("form_id")' >/dev/null 2>&1; then
+      echo "!! 验证失败：embed JWT 含 form_id"
+      echo "$EP" | jq .
+      exit 1
+    fi
+    echo "   OK：embed token payload 无 form_id"
+  fi
 fi
 
 TMP=$(mktemp)

@@ -3834,8 +3834,9 @@ mod tests {
             project_id: "project-123".to_string(),
             user_id: "designer_001".to_string(),
             user_name: "张设计".to_string(),
-            form_id: "FORM-123".to_string(),
             role: Some("sj".to_string()),
+            workflow_mode: None,
+            legacy_form_id: None,
             exp: 4_102_444_800,
             iat: 1_704_067_200,
         };
@@ -3869,8 +3870,9 @@ mod tests {
             project_id: "project-123".to_string(),
             user_id: "designer_001".to_string(),
             user_name: "".to_string(),
-            form_id: "FORM-123".to_string(),
             role: Some("sj".to_string()),
+            workflow_mode: None,
+            legacy_form_id: None,
             exp: 4_102_444_800,
             iat: 1_704_067_200,
         };
@@ -4111,8 +4113,9 @@ mod tests {
             project_id: "project-123".to_string(),
             user_id: "PZ".to_string(),
             user_name: "PZ批准人".to_string(),
-            form_id: "FORM-123".to_string(),
             role: Some("pz".to_string()),
+            workflow_mode: None,
+            legacy_form_id: None,
             exp: 4_102_444_800,
             iat: 1_704_067_200,
         };
@@ -4150,8 +4153,9 @@ mod tests {
             project_id: "project-123".to_string(),
             user_id: "reviewer_001".to_string(),
             user_name: "李审核员".to_string(),
-            form_id: "FORM-123".to_string(),
             role: Some("sh".to_string()),
+            workflow_mode: None,
+            legacy_form_id: None,
             exp: 4_102_444_800,
             iat: 1_704_067_200,
         };

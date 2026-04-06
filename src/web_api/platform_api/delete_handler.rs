@@ -8,7 +8,7 @@ use super::review_form::soft_delete_review_bundle;
 use super::types::{DeleteReviewRequest, DeleteReviewResponse};
 
 pub async fn delete_review_data(Json(request): Json<DeleteReviewRequest>) -> impl IntoResponse {
-    if let Err((_status, msg)) = verify_s2s_token(&request.token, None) {
+    if let Err((_status, msg)) = verify_s2s_token(&request.token) {
         warn!(
             "[REVIEW_DELETE] Token校验失败 - form_ids={:?}, reason={}",
             request.form_ids, msg

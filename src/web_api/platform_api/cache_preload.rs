@@ -12,7 +12,7 @@ pub async fn preload_cache(Json(request): Json<CachePreloadRequest>) -> impl Int
         request.project_id, request.initiator
     );
 
-    if let Err((_status, msg)) = verify_s2s_token(&request.token, None) {
+    if let Err((_status, msg)) = verify_s2s_token(&request.token) {
         warn!(
             "[CACHE_PRELOAD] Token校验失败 - project_id={}, reason={}",
             request.project_id, msg

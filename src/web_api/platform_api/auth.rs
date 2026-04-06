@@ -6,24 +6,18 @@ use tracing::warn;
 use crate::web_api::jwt_auth::{REVIEW_AUTH_CONFIG, verify_token};
 
 /// Unified S2S token verification: validates JWT when auth is enabled, skips otherwise.
-pub fn verify_s2s_token(
-    token: &str,
-    expected_form_id: Option<&str>,
-) -> Result<(), (StatusCode, String)> {
+pub fn verify_s2s_token(token: &str) -> Result<(), (StatusCode, String)> {
     if !REVIEW_AUTH_CONFIG.enabled {
         return Ok(());
     }
 
     match verify_token(token) {
         Ok(claims) => {
-            if let Some(form_id) = expected_form_id {
-                if claims.form_id != form_id {
-                    warn!(
-                        "S2S JWT form_id mismatch: token={}, request={}",
-                        claims.form_id, form_id
-                    );
-                    return Err((StatusCode::UNAUTHORIZED, "form_id mismatch".to_string()));
-                }
+            if let Some(legacy_form_id) = claims.legacy_form_id.as_deref() {
+                warn!(
+                    "S2S JWT decoded legacy form_id={} for project_id={}, user_id={}; explicit request form_id remains authoritative",
+                    legacy_form_id, claims.project_id, claims.user_id
+                );
             }
             Ok(())
         }

@@ -85,10 +85,10 @@ async fn insert_task_with_form_id(form_id: &str, user_id: &str) {
 }
 
 #[tokio::test]
-async fn test_embed_url_rejects_mismatched_form_id_from_jwt() {
+async fn test_embed_url_ignores_mismatched_form_id_from_jwt() {
     let app = create_platform_api_routes();
     let (token, _) =
-        create_token("project-1", "user-1", None, "FORM-EXPECTED", Some("sj"), None).unwrap();
+        create_token("project-1", "user-1", None, Some("sj"), None).unwrap();
 
     let response = app
         .oneshot(
@@ -110,7 +110,15 @@ async fn test_embed_url_rejects_mismatched_form_id_from_jwt() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: EmbedUrlResponseBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload.code, 200);
+    let data = payload.data.expect("embed data");
+    let query = data.get("query").and_then(|value| value.as_object()).cloned().unwrap_or_default();
+    assert_eq!(query.get("form_id").and_then(|value| value.as_str()), Some("FORM-OTHER"));
 }
 
 #[tokio::test]
@@ -119,7 +127,7 @@ async fn test_embed_url_accepts_matching_form_id_from_jwt() {
     cleanup_form("FORM-EXPECTED").await;
     let app = create_platform_api_routes();
     let (token, _) =
-        create_token("project-1", "user-1", None, "FORM-EXPECTED", Some("sj"), None).unwrap();
+        create_token("project-1", "user-1", None, Some("sj"), None).unwrap();
 
     let response = app
         .oneshot(
@@ -408,7 +416,7 @@ async fn test_embed_url_reuses_persisted_form_role_when_followup_request_omits_r
 async fn test_embed_url_rejects_tampered_jwt_even_if_form_id_matches() {
     let app = create_platform_api_routes();
     let (token, _) =
-        create_token("project-1", "user-1", None, "FORM-EXPECTED", Some("sj"), None).unwrap();
+        create_token("project-1", "user-1", None, Some("sj"), None).unwrap();
     let mut parts = token.split('.').collect::<Vec<_>>();
     parts[2] = "tampered-signature";
     let tampered_token = parts.join(".");
@@ -444,7 +452,7 @@ async fn test_embed_url_returns_existing_task_for_form_id() {
 
     let app = create_platform_api_routes();
     let (token, _) =
-        create_token("project-1", "user-existing", None, form_id, Some("jd"), None).unwrap();
+        create_token("project-1", "user-existing", None, Some("jd"), None).unwrap();
 
     let response = app
         .oneshot(
@@ -519,7 +527,8 @@ async fn test_embed_url_returns_existing_task_for_form_id() {
         .get("token")
         .and_then(|v| v.as_str())
         .expect("response token");
-    assert_eq!(verify_token(response_token).unwrap().form_id, form_id);
+    let token_claims = verify_token(response_token).unwrap();
+    assert_eq!(token_claims.legacy_form_id, None);
 
     cleanup_form(form_id).await;
 }

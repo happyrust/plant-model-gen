@@ -141,7 +141,7 @@ pub async fn sync_workflow_handler(Json(request): Json<SyncWorkflowRequest>) -> 
         if is_query { " (query)" } else { "" }
     );
 
-    if let Err((_status, msg)) = verify_s2s_token(&request.token, Some(&request.form_id)) {
+    if let Err((_status, msg)) = verify_s2s_token(&request.token) {
         warn!(
             "[WORKFLOW_SYNC] Token校验失败 - form_id={}, reason={}",
             request.form_id, msg

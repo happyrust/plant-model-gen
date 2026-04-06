@@ -33,16 +33,15 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
 
     let mut verified_claim_role: Option<String> = None;
     let mut verified_claim_workflow_mode: Option<String> = None;
-    let jwt_claim_form_id = if let Some(ref token) = request.token {
+    if let Some(ref token) = request.token {
         let token = token.trim();
         if token.split('.').count() == 3 {
             match verify_token(token) {
                 Ok(claims) => {
                     info!(
-                        "Embed URL JWT claims verified: project_id={}, user_id={}, form_id={}, role={:?}, workflow_mode={:?}",
+                        "Embed URL JWT claims verified: project_id={}, user_id={}, role={:?}, workflow_mode={:?}",
                         claims.project_id,
                         claims.user_id,
-                        claims.form_id,
                         claims.role,
                         claims.workflow_mode
                     );
@@ -65,7 +64,12 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
                     verified_claim_role = normalize_embed_role(claims.role.as_deref());
                     verified_claim_workflow_mode =
                         normalize_workflow_mode(claims.workflow_mode.as_deref());
-                    Some(claims.form_id)
+                    if let Some(legacy_form_id) = claims.legacy_form_id.as_deref() {
+                        warn!(
+                            "Embed URL JWT contains deprecated form_id={} for request form_id={:?}; explicit request form_id remains authoritative",
+                            legacy_form_id, request_form_id
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!("Embed URL JWT verification failed: {}", e);
@@ -81,42 +85,14 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
                 }
             }
         } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let mut form_id = request_form_id.clone();
-
-    let jwt_claim_form_id_for_log = jwt_claim_form_id.clone();
-    if let Some(jwt_form_id) = jwt_claim_form_id {
-        if let Some(ref req_form_id) = form_id {
-            if req_form_id != &jwt_form_id {
-                warn!(
-                    "Embed URL form_id mismatch before response: request_form_id={}, token_claim_form_id={}",
-                    req_form_id, jwt_form_id
-                );
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(EmbedUrlResponse {
-                        code: 401,
-                        message: "unauthorized".to_string(),
-                        data: None,
-                        url: None,
-                    }),
-                );
-            }
-        } else {
-            form_id = Some(jwt_form_id);
         }
     }
 
     info!(
         "Embed URL lineage resolution: request_form_id={:?}, token_claim_form_id={:?}, resolved_form_id={:?}",
         request_form_id,
-        jwt_claim_form_id_for_log,
-        form_id
+        None::<String>,
+        request_form_id
     );
 
     let requested_role = match resolve_embed_request_role(&request, verified_claim_role.as_deref())
@@ -152,7 +128,7 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
         }
     };
 
-    let form_id = form_id.unwrap_or_else(generate_form_id);
+    let form_id = request_form_id.clone().unwrap_or_else(generate_form_id);
     info!(
         "Embed URL resolved context: form_id={}, requested_role={:?}, requested_workflow_mode={:?}",
         form_id, requested_role, requested_workflow_mode
@@ -220,7 +196,6 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
         &request.project_id,
         &request.user_id,
         None,
-        &form_id,
         Some(jwt_workflow_role),
         requested_workflow_mode.as_deref(),
     ) {
@@ -235,10 +210,10 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
             match decode_token_unsafe(&token) {
                 Ok(generated_claims) => {
                     info!(
-                        "Embed URL token generated: request_form_id={:?}, response_query_form_id={}, token_claim_form_id={}, token_project_id={}, token_user_id={}, token_role={:?}, token_workflow_mode={:?}, token_len={}",
+                        "Embed URL token generated: request_form_id={:?}, response_query_form_id={}, token_claim_form_id={:?}, token_project_id={}, token_user_id={}, token_role={:?}, token_workflow_mode={:?}, token_len={}",
                         request_form_id,
                         form_id,
-                        generated_claims.form_id,
+                        generated_claims.legacy_form_id,
                         generated_claims.project_id,
                         generated_claims.user_id,
                         generated_claims.role,

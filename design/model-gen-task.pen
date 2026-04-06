@@ -1,0 +1,579 @@
+{
+  "version": "2.10",
+  "children": [
+    {
+      "type": "frame",
+      "id": "bi8Au",
+      "x": 0,
+      "y": 0,
+      "name": "Plant3D 模型生成",
+      "clip": true,
+      "width": 420,
+      "fill": "#F4F4F5",
+      "cornerRadius": 12,
+      "layout": "vertical",
+      "gap": 16,
+      "padding": [
+        22,
+        20
+      ],
+      "children": [
+        {
+          "type": "frame",
+          "id": "34rnV",
+          "name": "row1",
+          "width": "fill_container",
+          "justifyContent": "space_between",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "b6975",
+              "name": "t1",
+              "fill": "#18181B",
+              "content": "模型生成",
+              "fontFamily": "Inter",
+              "fontSize": 18,
+              "fontWeight": "600"
+            },
+            {
+              "type": "frame",
+              "id": "syjNB",
+              "name": "badge",
+              "fill": "#E4E4E7",
+              "cornerRadius": 6,
+              "padding": [
+                6,
+                10
+              ],
+              "children": [
+                {
+                  "type": "text",
+                  "id": "FK13j",
+                  "name": "btxt",
+                  "fill": "#52525B",
+                  "content": "对接 gen-model 任务",
+                  "fontFamily": "Inter",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "cx6QL",
+          "name": "stepsRow",
+          "width": "fill_container",
+          "gap": 8,
+          "children": [
+            {
+              "type": "frame",
+              "id": "RVCzb",
+              "name": "st1",
+              "width": "fill_container",
+              "fill": "#2563EB",
+              "cornerRadius": 8,
+              "padding": 10,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "XuUbE",
+                  "name": "st1t",
+                  "fill": "#FFFFFF",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "1 范围",
+                  "textAlign": "center",
+                  "fontFamily": "Inter",
+                  "fontSize": 12,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "rVg9s",
+              "name": "st2",
+              "width": "fill_container",
+              "fill": "#E4E4E7",
+              "cornerRadius": 8,
+              "padding": 10,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "Ta49y",
+                  "name": "st2t",
+                  "fill": "#3F3F46",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "2 选项",
+                  "textAlign": "center",
+                  "fontFamily": "Inter",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "2yDSm",
+              "name": "st3",
+              "width": "fill_container",
+              "fill": "#E4E4E7",
+              "cornerRadius": 8,
+              "padding": 10,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "jFOLN",
+                  "name": "st3t",
+                  "fill": "#3F3F46",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "3 启动",
+                  "textAlign": "center",
+                  "fontFamily": "Inter",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "id": "BCcRD",
+          "name": "scopeH",
+          "fill": "#27272A",
+          "content": "生成范围",
+          "fontFamily": "Inter",
+          "fontSize": 13,
+          "fontWeight": "600"
+        },
+        {
+          "type": "text",
+          "id": "GzMnc",
+          "name": "hint",
+          "fill": "#71717A",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "与当前 TaskCreationWizard 对齐：dbnum / refno / 全量；多 dbnum 将拆成子任务",
+          "lineHeight": 1.45,
+          "fontFamily": "Inter",
+          "fontSize": 12,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "frame",
+          "id": "oiPNR",
+          "name": "card",
+          "width": "fill_container",
+          "fill": "#FFFFFF",
+          "cornerRadius": 10,
+          "layout": "vertical",
+          "gap": 10,
+          "padding": 14,
+          "children": [
+            {
+              "type": "text",
+              "id": "5Il8p",
+              "name": "lbl",
+              "fill": "#3F3F46",
+              "content": "数据库编号（示例）",
+              "fontFamily": "Inter",
+              "fontSize": 12,
+              "fontWeight": "500"
+            },
+            {
+              "type": "frame",
+              "id": "vAghh",
+              "name": "fakeInput",
+              "width": "fill_container",
+              "fill": "#FAFAFA",
+              "cornerRadius": 6,
+              "padding": [
+                10,
+                12
+              ],
+              "children": [
+                {
+                  "type": "text",
+                  "id": "ee0OQ",
+                  "name": "ph",
+                  "fill": "#A1A1AA",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "1516 或 7999, 8000",
+                  "fontFamily": "Inter",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "vzJE2",
+          "name": "card2",
+          "width": "fill_container",
+          "fill": "#FFFFFF",
+          "cornerRadius": 10,
+          "layout": "vertical",
+          "gap": 8,
+          "padding": 14,
+          "children": [
+            {
+              "type": "text",
+              "id": "7FR6z",
+              "name": "lbl2",
+              "fill": "#3F3F46",
+              "content": "参考号（可选）",
+              "fontFamily": "Inter",
+              "fontSize": 12,
+              "fontWeight": "500"
+            },
+            {
+              "type": "frame",
+              "id": "lsITl",
+              "name": "fakeIn2",
+              "width": "fill_container",
+              "fill": "#FAFAFA",
+              "cornerRadius": 6,
+              "padding": [
+                10,
+                12
+              ],
+              "children": [
+                {
+                  "type": "text",
+                  "id": "8oPFu",
+                  "name": "ph2",
+                  "fill": "#A1A1AA",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "24381_145018",
+                  "fontFamily": "Inter",
+                  "fontSize": 13,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "id": "VBBGi",
+          "name": "sec2",
+          "fill": "#27272A",
+          "content": "生成内容",
+          "fontFamily": "Inter",
+          "fontSize": 13,
+          "fontWeight": "600"
+        },
+        {
+          "type": "frame",
+          "id": "Mcbn5",
+          "name": "opts",
+          "width": "fill_container",
+          "fill": "#FFFFFF",
+          "cornerRadius": 10,
+          "layout": "vertical",
+          "gap": 10,
+          "padding": 14,
+          "children": [
+            {
+              "type": "frame",
+              "id": "LsBPl",
+              "name": "o1",
+              "gap": 10,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 4,
+                  "id": "548ex",
+                  "name": "cb1",
+                  "fill": "#2563EB",
+                  "width": 18,
+                  "height": 18
+                },
+                {
+                  "type": "text",
+                  "id": "gtKIO",
+                  "name": "tx1",
+                  "fill": "#3F3F46",
+                  "content": "生成模型（instances / Web bundle）",
+                  "fontFamily": "Inter",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "TlgVV",
+              "name": "o2",
+              "gap": 10,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 4,
+                  "id": "vdpbI",
+                  "name": "cb2",
+                  "fill": "#E4E4E7",
+                  "width": 18,
+                  "height": 18
+                },
+                {
+                  "type": "text",
+                  "id": "fQ2Il",
+                  "name": "tx2",
+                  "fill": "#3F3F46",
+                  "content": "生成网格 mesh",
+                  "fontFamily": "Inter",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "0PeBx",
+              "name": "o3",
+              "gap": 10,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 4,
+                  "id": "szIRy",
+                  "name": "cb3",
+                  "fill": "#E4E4E7",
+                  "width": 18,
+                  "height": 18
+                },
+                {
+                  "type": "text",
+                  "id": "lKh7e",
+                  "name": "tx3",
+                  "fill": "#3F3F46",
+                  "content": "生成空间树",
+                  "fontFamily": "Inter",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "id": "iXcpg",
+          "name": "adv",
+          "fill": "#71717A",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "高级：布尔运算 · mesh 容差 · Web 数据包导出（可折叠）",
+          "lineHeight": 1.4,
+          "fontFamily": "Inter",
+          "fontSize": 11,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "frame",
+          "id": "3Mcll",
+          "name": "status",
+          "width": "fill_container",
+          "fill": "#FEF9C3",
+          "cornerRadius": 8,
+          "padding": 12,
+          "children": [
+            {
+              "type": "text",
+              "id": "OVTPK",
+              "name": "stx",
+              "fill": "#854D0E",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "状态区：排队中 / 运行中 / 失败原因 · POST /api/tasks 后可在任务监视器查看",
+              "lineHeight": 1.35,
+              "fontFamily": "Inter",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "C5a9i",
+          "name": "foot",
+          "width": "fill_container",
+          "gap": 12,
+          "padding": [
+            4,
+            0,
+            0,
+            0
+          ],
+          "justifyContent": "end",
+          "children": [
+            {
+              "type": "frame",
+              "id": "CRR3O",
+              "name": "secBtn",
+              "fill": "#E4E4E7",
+              "cornerRadius": 8,
+              "padding": [
+                10,
+                14
+              ],
+              "children": [
+                {
+                  "type": "text",
+                  "id": "xPltU",
+                  "name": "secBtnT",
+                  "fill": "#3F3F46",
+                  "content": "上一步",
+                  "fontFamily": "Inter",
+                  "fontSize": 13,
+                  "fontWeight": "500"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "o6yLy",
+              "name": "pri",
+              "fill": "#2563EB",
+              "cornerRadius": 8,
+              "padding": [
+                10,
+                18
+              ],
+              "children": [
+                {
+                  "type": "text",
+                  "id": "fETWW",
+                  "name": "priT",
+                  "fill": "#FFFFFF",
+                  "content": "创建并启动",
+                  "fontFamily": "Inter",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "bUczb",
+      "x": 468,
+      "y": 0,
+      "name": "按需显示-交互",
+      "width": 380,
+      "fill": "#FFFFFF",
+      "cornerRadius": 12,
+      "stroke": {
+        "thickness": 1,
+        "fill": "#E4E4E7"
+      },
+      "layout": "vertical",
+      "gap": 14,
+      "padding": 22,
+      "children": [
+        {
+          "type": "text",
+          "id": "0C0t7",
+          "name": "oh",
+          "fill": "#18181B",
+          "content": "路径 B：看图时按需生成",
+          "fontFamily": "Inter",
+          "fontSize": 16,
+          "fontWeight": "600"
+        },
+        {
+          "type": "text",
+          "id": "v7IOa",
+          "name": "os",
+          "fill": "#52525B",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "模型树 eye / Viewer 选 refno → useModelGeneration.showModelByRefno",
+          "lineHeight": 1.45,
+          "fontFamily": "Inter",
+          "fontSize": 12,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "frame",
+          "id": "664HK",
+          "name": "diag",
+          "width": "fill_container",
+          "fill": "#F4F4F5",
+          "cornerRadius": 8,
+          "layout": "vertical",
+          "gap": 8,
+          "padding": 12,
+          "children": [
+            {
+              "type": "text",
+              "id": "Lf2Yu",
+              "name": "d1",
+              "fill": "#3F3F46",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "1）检查本地 instances / parquet",
+              "fontFamily": "Inter",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "4FzbR",
+              "name": "d2",
+              "fill": "#3F3F46",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "2）缺失则触发 modelShowByRefno / SSE 批量",
+              "fontFamily": "Inter",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "DVyla",
+              "name": "d3",
+              "fill": "#3F3F46",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "3）ModelGenerationProgressModal 展示进度",
+              "fontFamily": "Inter",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "id": "FF1dW",
+          "name": "note",
+          "fill": "#71717A",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "设计建议：Ribbon「模型生成」与侧栏入口文案区分 · 批任务 vs 即时加载",
+          "lineHeight": 1.4,
+          "fontFamily": "Inter",
+          "fontSize": 11,
+          "fontWeight": "normal"
+        }
+      ]
+    }
+  ]
+}

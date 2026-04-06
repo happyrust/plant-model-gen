@@ -5,7 +5,7 @@
 - **For local macOS builds (default path):** `cargo install cargo-zigbuild` and [Zig toolchain](https://ziglang.org/download/)
 - **For GitHub artifact/release deploys:** `gh` CLI installed and authenticated
 - **Remote access:** `sshpass` and `rsync` installed locally
-- **Remote credentials:** Default target is `123.57.182.243` (root/Happytest123_) — override via environment variables if needed
+- **Remote credentials:** Target server defaults to `123.57.182.243` (`root`); `REMOTE_PASS` must be supplied explicitly
 
 ## Deploy from Local Build (Default Path)
 
@@ -44,6 +44,27 @@ gh run list --workflow multi-platform-build.yml --status success --limit 5
 # 2. Deploy using the run ID
 BINARY_SOURCE=github-artifact GITHUB_RUN_ID=<RUN_ID> ./shells/deploy_all_with_frontend.sh
 ```
+
+## GitHub Actions 直连 Ubuntu 部署
+
+如需让后端完全由 GitHub CI 直接发布到 Ubuntu，请在仓库 Actions 手动触发 `Deploy Web Server To Ubuntu`。
+
+先配置以下仓库变量与密钥：
+
+- Variables:
+  - `DEPLOY_REMOTE_HOST`
+  - `DEPLOY_REMOTE_USER`（可选，默认 `root`）
+- Secrets:
+  - `DEPLOY_REMOTE_PASS`
+  - `GH_PAT`（若 CI 仍需拉取私有 patch 依赖）
+
+该 workflow 默认使用 `db_options/DbOption-aveva-1600.toml`，并在 Runner 上完成：
+
+1. 构建 Linux `web_server`
+2. 产出并下载同次 artifact
+3. 调用 `deploy_web_server_bundle.sh` 上传二进制、`assets/`、`output/`、`DbOption`
+4. 重启远端 `web-server` systemd
+5. 通过 SSH 验证 `systemctl is-active web-server`、`/api/health`、`/api/projects`
 
 ## Deploy from GitHub Release
 
@@ -102,7 +123,7 @@ GITHUB_RUN_ID=12345678 \
 | `ARTIFACT_NAME` | `linux-x64-release` | Artifact name for GitHub downloads |
 | `REMOTE_HOST` | `123.57.182.243` | Target server IP |
 | `REMOTE_USER` | `root` | SSH username |
-| `REMOTE_PASS` | `Happytest123_` | SSH password |
+| `REMOTE_PASS` | - | SSH password, must be provided explicitly |
 | `BACKEND_ORIGIN` | `http://127.0.0.1:3100` | Backend URL for nginx proxy |
 | `FRONTEND_PROJECT_DIR` | 自动：`plant-model-gen` 同级目录下的 `plant3d-web` | 前端仓库根目录（覆盖默认路径） |
 

@@ -25,7 +25,7 @@ set -euo pipefail
 
 REMOTE_HOST="${REMOTE_HOST:-123.57.182.243}"
 REMOTE_USER="${REMOTE_USER:-root}"
-REMOTE_PASS="${REMOTE_PASS:-Happytest123_}"
+REMOTE_PASS="${REMOTE_PASS:-}"
 SERVICE_NAME="${SERVICE_NAME:-web-server}"
 
 BUILD_BINARY="${BUILD_BINARY:-true}"
@@ -215,6 +215,7 @@ resolve_target_dir() {
 
 need_cmd sshpass
 need_cmd rsync
+[[ -n "$REMOTE_PASS" ]] || { printf 'REMOTE_PASS is required\n' >&2; exit 1; }
 
 [[ -d "$ASSETS_DIR" ]] || { printf 'Missing assets directory: %s\n' "$ASSETS_DIR" >&2; exit 1; }
 [[ -d "$OUTPUT_DIR" ]] || { printf 'Missing output directory: %s\n' "$OUTPUT_DIR" >&2; exit 1; }

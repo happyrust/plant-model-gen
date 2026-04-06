@@ -32,7 +32,7 @@ fi
 
 REMOTE_HOST="${REMOTE_HOST:-123.57.182.243}"
 REMOTE_USER="${REMOTE_USER:-root}"
-REMOTE_PASS="${REMOTE_PASS:-Happytest123_}"
+REMOTE_PASS="${REMOTE_PASS:-}"
 BACKEND_ORIGIN="${BACKEND_ORIGIN:-http://127.0.0.1:3100}"
 
 # Backend deployment options
@@ -92,6 +92,7 @@ retry_with_backoff() {
 need_cmd sshpass
 [[ -x "$BACKEND_SCRIPT" ]] || { printf 'Backend deploy script is missing or not executable: %s\n' "$BACKEND_SCRIPT" >&2; exit 1; }
 [[ -x "$FRONTEND_SCRIPT" ]] || { printf 'Frontend deploy script is missing or not executable: %s\n' "$FRONTEND_SCRIPT" >&2; exit 1; }
+[[ -n "$REMOTE_PASS" ]] || { printf 'REMOTE_PASS is required\n' >&2; exit 1; }
 
 log "Deploying backend (BINARY_SOURCE=$BINARY_SOURCE)"
 REMOTE_HOST="$REMOTE_HOST" \

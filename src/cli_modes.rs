@@ -3328,6 +3328,56 @@ pub async fn export_dbnum_instances_v3_mode(
     Ok(())
 }
 
+/// 全库一次性导出 V3 JSON（查 inst_relate 全表，不按 dbnum 拆分）
+pub async fn export_all_instances_v3_mode(
+    verbose: bool,
+    output_override: Option<PathBuf>,
+    db_option_ext: &DbOptionExt,
+    target_unit: Option<String>,
+    apply_rotation: bool,
+) -> Result<()> {
+    use aios_database::fast_model::export_model::export_dbnum_instances_v3::export_all_instances_v3;
+    use aios_database::fast_model::export_model::export_transform_config::ExportTransformConfig;
+    use aios_database::fast_model::unit_converter::LengthUnit;
+    use std::sync::Arc;
+
+    println!("\n🎯 全库一次性导出 V3 JSON（inst_relate 全表）");
+    println!("====================================");
+
+    let output_dir =
+        output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("v3_bundle"));
+
+    let target = target_unit
+        .as_deref()
+        .and_then(|s| LengthUnit::from_str(s).ok())
+        .unwrap_or(LengthUnit::Millimeter);
+
+    let transform_config = ExportTransformConfig {
+        source_unit: LengthUnit::Millimeter,
+        target_unit: target,
+        apply_rotation,
+        inline_matrices: false,
+    };
+
+    ensure_surreal_connected(db_option_ext).await?;
+
+    let db_option = Arc::new((**db_option_ext).clone());
+    let stats = export_all_instances_v3(&output_dir, db_option, verbose, transform_config).await?;
+
+    println!("\n🎉 V3 全库导出完成！");
+    println!("📊 统计信息:");
+    println!("   - 输出文件: {}", stats.output_filename);
+    println!("   - BRAN/HANG 分组: {}", stats.bran_group_count);
+    println!("   - EQUI 分组: {}", stats.equi_group_count);
+    println!("   - 未分组: {}", stats.ungrouped_count);
+    println!("   - 构件实例: {}", stats.total_component_instances);
+    println!("   - TUBI 实例: {}", stats.total_tubing_instances);
+    println!("   - transforms 条目: {}", stats.transform_count);
+    println!("   - aabb 条目: {}", stats.aabb_count);
+    println!("   - 耗时: {:?}", stats.elapsed);
+    Ok(())
+}
+
 /// 合并 v3_bundle 下所有 per-dbnum JSON 为单个 instances_v3.json
 pub fn merge_v3_instances_mode(
     verbose: bool,
@@ -3358,6 +3408,33 @@ pub fn merge_v3_instances_mode(
         stats.output_size_bytes as f64 / 1_048_576.0
     );
     println!("   - 耗时: {:?}", stats.elapsed);
+    Ok(())
+}
+
+pub fn export_rvm_semantic_debug_mode(
+    dbnum: u32,
+    verbose: bool,
+    output_override: Option<PathBuf>,
+    root_refno: RefnoEnum,
+) -> Result<()> {
+    use aios_database::fast_model::export_model::export_rvm_semantic_debug::export_rvm_semantic_debug;
+
+    println!("\n🎯 导出 RVM semantic debug JSON");
+    println!("====================================");
+
+    let output_dir = output_override.unwrap_or_else(|| PathBuf::from("output/debug_json"));
+    let relation_store_root = std::env::var("MODEL_RELATION_STORE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("output/model_relations"));
+
+    let stats =
+        export_rvm_semantic_debug(dbnum, &relation_store_root, &output_dir, root_refno, verbose)?;
+
+    println!("\n🎉 RVM semantic debug 导出完成！");
+    println!("📊 统计信息:");
+    println!("   - 输出文件: {}", stats.output_filename);
+    println!("   - 构件数量: {}", stats.component_count);
+    println!("   - 几何引用数量: {}", stats.geometry_reference_count);
     Ok(())
 }
 

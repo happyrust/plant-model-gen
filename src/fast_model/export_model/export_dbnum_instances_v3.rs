@@ -607,10 +607,16 @@ async fn query_inst_relate_by_dbnum(dbnum: u32, verbose: bool) -> Result<Vec<Ins
 /// 查询 inst_relate 全表（不按 dbnum 过滤）
 async fn query_inst_relate_all(verbose: bool) -> Result<Vec<InstRelateRow>> {
     if verbose {
-        println!("🔍 扫描 inst_relate 全表...");
+        println!("🔍 分批扫描 inst_relate 全表...");
     }
 
-    let sql = r#"
+    const PAGE_SIZE: usize = 20_000;
+    let mut offset = 0usize;
+    let mut rows = Vec::new();
+
+    loop {
+        let sql = format!(
+            r#"
         SELECT
             owner_refno,
             owner_type,
@@ -618,10 +624,27 @@ async fn query_inst_relate_all(verbose: bool) -> Result<Vec<InstRelateRow>> {
             in.noun as noun,
             spec_value as spec_value
         FROM inst_relate
-    "#;
+        ORDER BY in
+        LIMIT {PAGE_SIZE} START {offset}
+    "#
+        );
 
-    let mut resp = aios_core::project_primary_db().query(sql).await?;
-    let rows: Vec<InstRelateRow> = resp.take(0)?;
+        let batch: Vec<InstRelateRow> = aios_core::project_primary_db().query_take(&sql, 0).await?;
+        if batch.is_empty() {
+            break;
+        }
+
+        if verbose {
+            println!(
+                "   - inst_relate 分页: offset={} 本批={}",
+                offset,
+                batch.len()
+            );
+        }
+
+        offset += PAGE_SIZE;
+        rows.extend(batch);
+    }
 
     if verbose {
         println!("   ✅ inst_relate 全表命中: {} 条", rows.len());
@@ -988,6 +1011,433 @@ async fn resolve_aabb(
     }
 
     Ok(result)
+}
+
+// =============================================================================
+// 全库一次性导出（不按 dbnum 拆分）
+// =============================================================================
+
+/// 一次性查询 inst_relate 全表，直接输出单个 instances_v3.json。
+/// 与 `export_dbnum_instances_v3` 逻辑完全一致，仅数据来源改为全表。
+pub async fn export_all_instances_v3(
+    output_dir: &Path,
+    db_option: Arc<DbOption>,
+    verbose: bool,
+    transform_config: ExportTransformConfig,
+) -> Result<V3ExportStats> {
+    let start_time = std::time::Instant::now();
+    let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+
+    if verbose {
+        println!("🚀 [v3] 全库一次性导出（不按 dbnum 拆分）");
+        if transform_config.needs_unit_conversion() {
+            println!(
+                "   单位转换: {} → {}",
+                transform_config.source_unit.name(),
+                transform_config.target_unit.name()
+            );
+        }
+        if transform_config.apply_rotation {
+            println!("   坐标旋转: Z-up → Y-up");
+        }
+    }
+
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
+
+    // 1. 查询 inst_relate 全表
+    {
+        use crate::data_interface::db_meta;
+        let _ = db_meta().ensure_loaded();
+    }
+
+    let inst_rows = query_inst_relate_all(verbose).await?;
+
+    if verbose {
+        println!("   ✅ inst_relate 记录: {} 条", inst_rows.len());
+    }
+
+    // 2. 按 owner 分组
+    let mut bran_groups: HashMap<RefnoEnum, OwnerGroup> = HashMap::new();
+    let mut equi_groups: HashMap<RefnoEnum, OwnerGroup> = HashMap::new();
+    let mut ungrouped: Vec<UngroupedInfo> = Vec::new();
+    let mut in_refnos: Vec<RefnoEnum> = Vec::new();
+    let mut in_refno_set: HashSet<RefnoEnum> = HashSet::new();
+
+    for row in &inst_rows {
+        let owner_type = row
+            .owner_type
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        let spec_value = row.spec_value.unwrap_or(0);
+
+        if in_refno_set.insert(row.refno) {
+            in_refnos.push(row.refno);
+        }
+
+        match owner_type.as_str() {
+            "BRAN" | "HANG" => {
+                if let Some(owner) = row.owner_refno {
+                    bran_groups
+                        .entry(owner)
+                        .or_insert_with(|| OwnerGroup {
+                            owner_type: owner_type.clone(),
+                            children: Vec::new(),
+                        })
+                        .children
+                        .push(ChildInfo {
+                            refno: row.refno,
+                            noun: row.noun.clone().unwrap_or_default(),
+                            spec_value,
+                        });
+                } else {
+                    ungrouped.push(UngroupedInfo {
+                        refno: row.refno,
+                        noun: row.noun.clone().unwrap_or_default(),
+                    });
+                }
+            }
+            "EQUI" => {
+                if let Some(owner) = row.owner_refno {
+                    equi_groups
+                        .entry(owner)
+                        .or_insert_with(|| OwnerGroup {
+                            owner_type: "EQUI".to_string(),
+                            children: Vec::new(),
+                        })
+                        .children
+                        .push(ChildInfo {
+                            refno: row.refno,
+                            noun: row.noun.clone().unwrap_or_default(),
+                            spec_value,
+                        });
+                } else {
+                    ungrouped.push(UngroupedInfo {
+                        refno: row.refno,
+                        noun: row.noun.clone().unwrap_or_default(),
+                    });
+                }
+            }
+            _ => {
+                ungrouped.push(UngroupedInfo {
+                    refno: row.refno,
+                    noun: row.noun.clone().unwrap_or_default(),
+                });
+            }
+        }
+    }
+
+    // 3. 查询几何体实例 hash
+    if verbose {
+        println!("🔍 查询 {} 个 refno 的几何体实例 hash...", in_refnos.len());
+    }
+    let mut export_inst_map: HashMap<RefnoEnum, aios_core::ExportInstQuery> = HashMap::new();
+    if !in_refnos.is_empty() {
+        match query_export_insts(&in_refnos, true).await {
+            Ok(export_insts) => {
+                for inst in export_insts {
+                    export_inst_map.insert(inst.refno, inst);
+                }
+                if verbose {
+                    println!(
+                        "   ✅ 有几何体的 refno: {}/{}",
+                        export_inst_map.len(),
+                        in_refnos.len()
+                    );
+                }
+            }
+            Err(e) => {
+                if verbose {
+                    println!("   ⚠️ 几何体实例查询失败: {:?}", e);
+                }
+            }
+        }
+    }
+
+    // 4. 查询 tubi_relate
+    let bran_owner_refnos: Vec<RefnoEnum> = bran_groups.keys().copied().collect();
+    if verbose {
+        println!(
+            "🔍 查询 {} 个 BRAN/HANG owner 的 tubi_relate...",
+            bran_owner_refnos.len()
+        );
+    }
+    let tubings_map = query_tubi_relate(&bran_owner_refnos, verbose).await?;
+
+    // 5. 收集所有唯一 trans_hash 和 aabb_hash
+    let mut trans_hashes: HashSet<String> = HashSet::new();
+    let mut aabb_hashes: HashSet<String> = HashSet::new();
+
+    for export_inst in export_inst_map.values() {
+        if let Some(ref h) = export_inst.world_trans_hash {
+            if !h.is_empty() {
+                trans_hashes.insert(h.clone());
+            }
+        }
+        if let Some(ref h) = export_inst.world_aabb_hash {
+            if !h.is_empty() {
+                aabb_hashes.insert(h.clone());
+            }
+        }
+        for inst in &export_inst.insts {
+            if let Some(ref th) = inst.trans_hash {
+                if !th.is_empty() {
+                    trans_hashes.insert(th.clone());
+                }
+            }
+        }
+    }
+    for tubis in tubings_map.values() {
+        for tubi in tubis {
+            if let Some(ref h) = tubi.world_trans_hash {
+                if !h.is_empty() {
+                    trans_hashes.insert(h.clone());
+                }
+            }
+            if let Some(ref h) = tubi.world_aabb_hash {
+                if !h.is_empty() {
+                    aabb_hashes.insert(h.clone());
+                }
+            }
+        }
+    }
+
+    // 6. 批量查询 trans 和 aabb 实际数据
+    if verbose {
+        println!(
+            "🔍 查询 {} 个 trans, {} 个 aabb...",
+            trans_hashes.len(),
+            aabb_hashes.len()
+        );
+    }
+
+    let unit_converter =
+        UnitConverter::new(transform_config.source_unit, transform_config.target_unit);
+
+    let (trans_map, aabb_map) = tokio::join!(
+        resolve_trans_to_matrices(
+            &trans_hashes,
+            &unit_converter,
+            transform_config.apply_rotation,
+            verbose
+        ),
+        resolve_aabb(&aabb_hashes, &unit_converter, verbose),
+    );
+    let trans_map = trans_map?;
+    let aabb_map = aabb_map?;
+
+    if verbose {
+        println!(
+            "   ✅ trans 命中: {}, aabb 命中: {}",
+            trans_map.len(),
+            aabb_map.len()
+        );
+    }
+
+    // 7. 构建 JSON
+    let mut total_component_instances: usize = 0;
+    let mut total_tubing_instances: usize = 0;
+
+    let transforms_json: serde_json::Map<String, serde_json::Value> = trans_map
+        .iter()
+        .map(|(hash, cols)| (hash.clone(), json!(cols)))
+        .collect();
+
+    let aabb_json: serde_json::Map<String, serde_json::Value> = aabb_map
+        .iter()
+        .map(|(hash, vals)| (hash.clone(), json!(vals)))
+        .collect();
+
+    // --- bran_groups ---
+    let mut bran_groups_json: Vec<serde_json::Value> = Vec::new();
+    let mut bran_keys: Vec<RefnoEnum> = bran_groups.keys().copied().collect();
+    bran_keys.sort();
+
+    for owner_refno in &bran_keys {
+        let group = &bran_groups[owner_refno];
+        let mut children_json: Vec<serde_json::Value> = Vec::new();
+
+        for child in &group.children {
+            let export_inst = match export_inst_map.get(&child.refno) {
+                Some(ei) if !ei.insts.is_empty() => ei,
+                _ => continue,
+            };
+
+            let mut geos_json: Vec<serde_json::Value> = Vec::new();
+            for (geo_idx, inst) in export_inst.insts.iter().enumerate() {
+                geos_json.push(json!({
+                    "geo_hash": inst.geo_hash,
+                    "geo_index": geo_idx,
+                    "geo_trans_hash": inst.trans_hash.as_deref().unwrap_or("0"),
+                    "unit_mesh": inst.unit_flag,
+                }));
+                total_component_instances += 1;
+            }
+
+            children_json.push(json!({
+                "refno": child.refno.to_string(),
+                "noun": child.noun,
+                "owner_noun": group.owner_type,
+                "trans_hash": export_inst.world_trans_hash.as_deref().unwrap_or(""),
+                "aabb_hash": export_inst.world_aabb_hash.as_deref().unwrap_or(""),
+                "spec_value": child.spec_value,
+                "has_neg": export_inst.has_neg,
+                "geos": geos_json,
+            }));
+        }
+
+        // TUBI
+        let mut tubings_json: Vec<serde_json::Value> = Vec::new();
+        if let Some(tubis) = tubings_map.get(owner_refno) {
+            for tubi in tubis {
+                tubings_json.push(json!({
+                    "refno": tubi.leave.to_string(),
+                    "owner_refno": owner_refno.to_string(),
+                    "order": tubi.index.unwrap_or(0),
+                    "geo_hash": tubi.geo_hash.as_deref().unwrap_or(""),
+                    "trans_hash": tubi.world_trans_hash.as_deref().unwrap_or(""),
+                    "aabb_hash": tubi.world_aabb_hash.as_deref().unwrap_or(""),
+                    "spec_value": tubi.spec_value.unwrap_or(0),
+                }));
+                total_tubing_instances += 1;
+            }
+        }
+
+        bran_groups_json.push(json!({
+            "refno": owner_refno.to_string(),
+            "noun": group.owner_type,
+            "children": children_json,
+            "tubings": tubings_json,
+        }));
+    }
+
+    // --- equi_groups ---
+    let mut equi_groups_json: Vec<serde_json::Value> = Vec::new();
+    let mut equi_keys: Vec<RefnoEnum> = equi_groups.keys().copied().collect();
+    equi_keys.sort();
+
+    for owner_refno in &equi_keys {
+        let group = &equi_groups[owner_refno];
+        let mut children_json: Vec<serde_json::Value> = Vec::new();
+
+        for child in &group.children {
+            let export_inst = match export_inst_map.get(&child.refno) {
+                Some(ei) if !ei.insts.is_empty() => ei,
+                _ => continue,
+            };
+
+            let mut geos_json: Vec<serde_json::Value> = Vec::new();
+            for (geo_idx, inst) in export_inst.insts.iter().enumerate() {
+                geos_json.push(json!({
+                    "geo_hash": inst.geo_hash,
+                    "geo_index": geo_idx,
+                    "geo_trans_hash": inst.trans_hash.as_deref().unwrap_or("0"),
+                    "unit_mesh": inst.unit_flag,
+                }));
+                total_component_instances += 1;
+            }
+
+            children_json.push(json!({
+                "refno": child.refno.to_string(),
+                "noun": child.noun,
+                "owner_noun": "EQUI",
+                "trans_hash": export_inst.world_trans_hash.as_deref().unwrap_or(""),
+                "aabb_hash": export_inst.world_aabb_hash.as_deref().unwrap_or(""),
+                "spec_value": child.spec_value,
+                "has_neg": export_inst.has_neg,
+                "geos": geos_json,
+            }));
+        }
+
+        equi_groups_json.push(json!({
+            "refno": owner_refno.to_string(),
+            "noun": "EQUI",
+            "children": children_json,
+        }));
+    }
+
+    // --- ungrouped ---
+    let mut ungrouped_json: Vec<serde_json::Value> = Vec::new();
+    for item in &ungrouped {
+        let export_inst = match export_inst_map.get(&item.refno) {
+            Some(ei) if !ei.insts.is_empty() => ei,
+            _ => continue,
+        };
+
+        let mut geos_json: Vec<serde_json::Value> = Vec::new();
+        for (geo_idx, inst) in export_inst.insts.iter().enumerate() {
+            geos_json.push(json!({
+                "geo_hash": inst.geo_hash,
+                "geo_index": geo_idx,
+                "geo_trans_hash": inst.trans_hash.as_deref().unwrap_or("0"),
+                "unit_mesh": inst.unit_flag,
+            }));
+            total_component_instances += 1;
+        }
+
+        ungrouped_json.push(json!({
+            "refno": item.refno.to_string(),
+            "noun": item.noun,
+            "owner_noun": "",
+            "trans_hash": export_inst.world_trans_hash.as_deref().unwrap_or(""),
+            "aabb_hash": export_inst.world_aabb_hash.as_deref().unwrap_or(""),
+            "spec_value": 0,
+            "has_neg": export_inst.has_neg,
+            "geos": geos_json,
+        }));
+    }
+
+    // 8. 组装并写入文件
+    let output_filename = "instances_v3.json".to_string();
+
+    let root_json = json!({
+        "version": 3,
+        "format": "json",
+        "generated_at": generated_at,
+        "scope": "all",
+        "export_transform": transform_config.to_manifest_json(),
+        "transforms": transforms_json,
+        "aabb": aabb_json,
+        "bran_groups": bran_groups_json,
+        "equi_groups": equi_groups_json,
+        "ungrouped": ungrouped_json,
+    });
+
+    let output_path = output_dir.join(&output_filename);
+    let json_str = serde_json::to_string(&root_json)?;
+    std::fs::write(&output_path, &json_str)?;
+
+    let elapsed = start_time.elapsed();
+
+    if verbose {
+        let file_size = std::fs::metadata(&output_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        println!("\n📊 [v3-all] 全库导出统计:");
+        println!("   - BRAN/HANG 分组: {}", bran_groups_json.len());
+        println!("   - EQUI 分组: {}", equi_groups_json.len());
+        println!("   - 未分组: {}", ungrouped_json.len());
+        println!("   - 构件实例: {}", total_component_instances);
+        println!("   - TUBI 实例: {}", total_tubing_instances);
+        println!("   - transforms 条目: {}", transforms_json.len());
+        println!("   - aabb 条目: {}", aabb_json.len());
+        println!("   - 文件大小: {:.2} MB", file_size as f64 / 1_048_576.0);
+        println!("   - 耗时: {:.2}s", elapsed.as_secs_f64());
+        println!("   ✅ 写入: {}", output_path.display());
+    }
+
+    Ok(V3ExportStats {
+        bran_group_count: bran_groups_json.len(),
+        equi_group_count: equi_groups_json.len(),
+        ungrouped_count: ungrouped_json.len(),
+        total_component_instances,
+        total_tubing_instances,
+        transform_count: transforms_json.len(),
+        aabb_count: aabb_json.len(),
+        elapsed,
+        output_filename,
+    })
 }
 
 // =============================================================================

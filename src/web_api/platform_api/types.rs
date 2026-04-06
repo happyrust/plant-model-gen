@@ -15,6 +15,10 @@ use crate::web_api::review_api::ReviewTask;
 pub struct EmbedUrlRequest {
     pub project_id: String,
     pub user_id: String,
+    #[serde(default, alias = "user_role")]
+    pub role: Option<String>,
+    #[serde(default, alias = "workflowMode")]
+    pub workflow_mode: Option<String>,
     pub form_id: Option<String>,
     pub token: Option<String>,
     #[serde(default)]
@@ -139,6 +143,8 @@ pub struct SyncWorkflowData {
     pub current_node: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,7 +214,9 @@ pub struct DeleteReviewResponse {
 pub struct ReviewForm {
     pub form_id: String,
     pub project_id: String,
+    pub user_id: String,
     pub requester_id: String,
+    pub role: Option<String>,
     pub source: String,
     pub status: String,
     pub task_created: bool,
@@ -224,6 +232,7 @@ pub struct ReviewFormRow {
     pub form_id: Option<String>,
     pub project_id: Option<String>,
     pub user_id: Option<String>,
+    pub role: Option<String>,
     pub requester_id: Option<String>,
     pub source: Option<String>,
     pub status: Option<String>,
@@ -247,7 +256,12 @@ pub fn review_form_from_row(row: ReviewFormRow) -> ReviewForm {
     ReviewForm {
         form_id,
         project_id: row.project_id.unwrap_or_default(),
+        user_id: row.user_id.clone().unwrap_or_default(),
         requester_id: row.requester_id.or(row.user_id).unwrap_or_default(),
+        role: row
+            .role
+            .map(|value| value.trim().to_lowercase())
+            .filter(|value| !value.is_empty()),
         source: row.source.unwrap_or_default(),
         status: row
             .status
@@ -272,19 +286,22 @@ pub fn review_form_from_row(row: ReviewFormRow) -> ReviewForm {
 
 #[cfg(feature = "web_server")]
 pub fn normalize_review_form_status(status: &str) -> String {
-    match status.trim() {
+    match status.trim().to_lowercase().as_str() {
         "draft" => "draft".to_string(),
         "deleted" => "deleted".to_string(),
         "blank" => "blank".to_string(),
+        "cancelled" => "cancelled".to_string(),
+        "approved" => "approved".to_string(),
         _ => "active".to_string(),
     }
 }
 
 #[cfg(feature = "web_server")]
 pub fn derive_review_form_status_from_task_status(task_status: &str) -> String {
-    if task_status.trim().eq_ignore_ascii_case("draft") {
-        "draft".to_string()
-    } else {
-        "active".to_string()
+    match task_status.trim().to_lowercase().as_str() {
+        "draft" => "draft".to_string(),
+        "cancelled" => "cancelled".to_string(),
+        "approved" => "approved".to_string(),
+        _ => "active".to_string(),
     }
 }

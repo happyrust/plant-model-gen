@@ -11,7 +11,9 @@ use surrealdb::types::{self as surrealdb_types, SurrealValue};
 use super::types::{
     ReviewForm, ReviewFormRow, derive_review_form_status_from_task_status, review_form_from_row,
 };
-use crate::web_api::review_api::{ReviewAttachment, ReviewComponent, ReviewTask, WorkflowStep};
+use crate::web_api::review_api::{
+    ReviewAttachment, ReviewComponent, ReviewTask, WorkflowStep, hydrate_task_attachments,
+};
 
 /// `review_tasks` 未软删过滤片段（可选 `bool` 字段：勿单独用 `deleted = false` 排除「字段缺失」旧数据）
 pub const REVIEW_TASK_ACTIVE_SQL: &str = "(deleted IS NONE OR deleted = false)";
@@ -71,9 +73,14 @@ pub async fn ensure_review_form_stub(
     form_id: &str,
     project_id: &str,
     requester_id: &str,
+    requester_role: Option<&str>,
     source: &str,
 ) -> anyhow::Result<ReviewForm> {
     ensure_review_forms_schema().await?;
+    let normalized_role = requester_role
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_lowercase());
 
     if let Some(existing) = get_review_form_by_form_id(form_id).await? {
         if existing.status == "deleted" {
@@ -88,6 +95,7 @@ pub async fn ensure_review_form_stub(
                     project_id = IF string::len(string::trim($project_id)) > 0 THEN $project_id ELSE project_id END,
                     user_id = IF string::len(string::trim($requester_id)) > 0 THEN $requester_id ELSE user_id END,
                     requester_id = IF string::len(string::trim($requester_id)) > 0 THEN $requester_id ELSE requester_id END,
+                    role = IF string::len(string::trim($role)) > 0 THEN $role ELSE role END,
                     source = $source,
                     deleted = false,
                     updated_at = time::now()
@@ -97,6 +105,7 @@ pub async fn ensure_review_form_stub(
             .bind(("form_id", form_id.to_string()))
             .bind(("project_id", project_id.trim().to_string()))
             .bind(("requester_id", requester_id.trim().to_string()))
+            .bind(("role", normalized_role.clone().unwrap_or_default()))
             .bind(("source", source.trim().to_string()))
             .await?;
 
@@ -113,7 +122,7 @@ pub async fn ensure_review_form_stub(
                 project_id: $project_id,
                 user_id: $requester_id,
                 requester_id: $requester_id,
-                role: NONE,
+                role: IF string::len(string::trim($role)) > 0 THEN $role ELSE NONE END,
                 source: $source,
                 status: 'blank',
                 task_created: false,
@@ -127,6 +136,7 @@ pub async fn ensure_review_form_stub(
         .bind(("form_id", form_id.to_string()))
         .bind(("project_id", project_id.trim().to_string()))
         .bind(("requester_id", requester_id.trim().to_string()))
+        .bind(("role", normalized_role.unwrap_or_default()))
         .bind(("source", source.trim().to_string()))
         .await?;
 
@@ -146,6 +156,7 @@ pub async fn sync_review_form_with_task_status(
         form_id,
         project_id.unwrap_or_default(),
         requester_id.unwrap_or_default(),
+        None,
         source,
     )
     .await?;
@@ -274,7 +285,7 @@ pub async fn find_task_by_form_id(form_id: &str) -> anyhow::Result<Option<Review
         .await?;
 
     let rows: Vec<TaskRow> = response.take(0)?;
-    Ok(rows.into_iter().next().map(|row| {
+    let task = rows.into_iter().next().map(|row| {
         let id = match row.id.key {
             surrealdb::types::RecordIdKey::String(value) => value,
             other => format!("{:?}", other),
@@ -318,5 +329,11 @@ pub async fn find_task_by_form_id(form_id: &str) -> anyhow::Result<Option<Review
             workflow_history: row.workflow_history.unwrap_or_default(),
             return_reason: row.return_reason,
         }
-    }))
+    });
+
+    if let Some(task) = task {
+        return Ok(Some(hydrate_task_attachments(task).await));
+    }
+
+    Ok(None)
 }

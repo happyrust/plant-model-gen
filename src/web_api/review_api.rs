@@ -486,6 +486,108 @@ fn attachment_from_value(value: &Value) -> ReviewAttachment {
     }
 }
 
+pub(crate) async fn query_review_attachments_by_form_id(
+    form_id: &str,
+) -> Result<Vec<ReviewAttachment>, surrealdb::Error> {
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct AttachmentRow {
+        file_id: Option<String>,
+        download_url: Option<String>,
+        description: Option<String>,
+        file_ext: Option<String>,
+    }
+
+    let mut response = project_primary_db()
+        .query(
+            r#"
+            SELECT file_id, download_url, description, file_ext
+            FROM review_attachment
+            WHERE form_id = $form_id
+            "#,
+        )
+        .bind(("form_id", form_id.to_string()))
+        .await?;
+
+    let rows: Vec<AttachmentRow> = response.take(0).unwrap_or_default();
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let description = row.description.unwrap_or_default();
+            let normalized_name = description.trim();
+            ReviewAttachment {
+                id: row.file_id.unwrap_or_default(),
+                name: if normalized_name.is_empty() {
+                    "未命名附件".to_string()
+                } else {
+                    normalized_name.to_string()
+                },
+                url: row.download_url.unwrap_or_default(),
+                size: None,
+                mime_type: row.file_ext.and_then(|ext| {
+                    let normalized = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+                    match normalized.as_str() {
+                        "png" => Some("image/png".to_string()),
+                        "jpg" | "jpeg" => Some("image/jpeg".to_string()),
+                        "gif" => Some("image/gif".to_string()),
+                        "pdf" => Some("application/pdf".to_string()),
+                        _ => None,
+                    }
+                }),
+            }
+        })
+        .filter(|attachment| !attachment.id.trim().is_empty() || !attachment.url.trim().is_empty())
+        .collect())
+}
+
+pub(crate) async fn hydrate_task_attachments(mut task: ReviewTask) -> ReviewTask {
+    let form_id = task.form_id.trim().to_string();
+    if form_id.is_empty() {
+        return task;
+    }
+
+    let workflow_attachments = match query_review_attachments_by_form_id(&form_id).await {
+        Ok(items) => items,
+        Err(error) => {
+            warn!(
+                "Failed to query review_attachment rows for task={} form_id={}: {}",
+                task.id, form_id, error
+            );
+            Vec::new()
+        }
+    };
+
+    if workflow_attachments.is_empty() {
+        return task;
+    }
+
+    let mut merged = std::collections::BTreeMap::<String, ReviewAttachment>::new();
+
+    for attachment in task.attachments.unwrap_or_default() {
+        let key = if !attachment.id.trim().is_empty() {
+            attachment.id.clone()
+        } else {
+            attachment.url.clone()
+        };
+        if !key.trim().is_empty() {
+            merged.insert(key, attachment);
+        }
+    }
+
+    for attachment in workflow_attachments {
+        let key = if !attachment.id.trim().is_empty() {
+            attachment.id.clone()
+        } else {
+            attachment.url.clone()
+        };
+        if !key.trim().is_empty() {
+            merged.insert(key, attachment);
+        }
+    }
+
+    task.attachments = Some(merged.into_values().collect());
+    task
+}
+
 fn workflow_step_from_value(value: &Value) -> WorkflowStep {
     let map = value.as_object();
 
@@ -1139,11 +1241,12 @@ async fn get_task(Path(id): Path<String>) -> impl IntoResponse {
         Ok(mut response) => {
             let rows: Vec<TaskRow> = response.take(0).unwrap_or_default();
             if let Some(row) = rows.into_iter().next() {
+                let task = hydrate_task_attachments(row.to_review_task()).await;
                 (
                     StatusCode::OK,
                     Json(TaskResponse {
                         success: true,
-                        task: Some(row.to_review_task()),
+                        task: Some(task),
                         error_message: None,
                     }),
                 )

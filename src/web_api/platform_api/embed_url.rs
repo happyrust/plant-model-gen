@@ -3,7 +3,9 @@
 use axum::{extract::Json, http::StatusCode, response::IntoResponse};
 use tracing::{info, warn};
 
-use crate::web_api::jwt_auth::{create_token, generate_form_id, verify_token};
+use crate::web_api::jwt_auth::{
+    create_token, decode_token_unsafe, generate_form_id, normalize_workflow_mode, verify_token, Role,
+};
 
 use super::config::PLATFORM_CONFIG;
 use super::review_form::{ensure_review_form_stub, find_task_by_form_id};
@@ -12,16 +14,59 @@ use super::types::{
 };
 
 pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoResponse {
+    let request_form_id = request
+        .form_id
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
     info!(
-        "Embed URL request: project_id={}, user_id={}",
-        request.project_id, request.user_id
+        "Embed URL request: project_id={}, user_id={}, form_id={:?}, role={:?}, workflow_mode={:?}, has_token={}, extra_parameters={}",
+        request.project_id,
+        request.user_id,
+        request_form_id,
+        request.role,
+        request.workflow_mode,
+        request.token.as_ref().map(|value| !value.trim().is_empty()).unwrap_or(false),
+        summarize_extra_parameters(request.extra_parameters.as_ref())
     );
 
+    let mut verified_claim_role: Option<String> = None;
+    let mut verified_claim_workflow_mode: Option<String> = None;
     let jwt_claim_form_id = if let Some(ref token) = request.token {
         let token = token.trim();
         if token.split('.').count() == 3 {
             match verify_token(token) {
-                Ok(claims) => Some(claims.form_id),
+                Ok(claims) => {
+                    info!(
+                        "Embed URL JWT claims verified: project_id={}, user_id={}, form_id={}, role={:?}, workflow_mode={:?}",
+                        claims.project_id,
+                        claims.user_id,
+                        claims.form_id,
+                        claims.role,
+                        claims.workflow_mode
+                    );
+                    if claims.project_id != request.project_id || claims.user_id != request.user_id
+                    {
+                        warn!(
+                            "Embed URL JWT identity mismatch: token project/user={}/{}, request={}/{}",
+                            claims.project_id, claims.user_id, request.project_id, request.user_id
+                        );
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(EmbedUrlResponse {
+                                code: 401,
+                                message: "unauthorized".to_string(),
+                                data: None,
+                                url: None,
+                            }),
+                        );
+                    }
+                    verified_claim_role = normalize_embed_role(claims.role.as_deref());
+                    verified_claim_workflow_mode =
+                        normalize_workflow_mode(claims.workflow_mode.as_deref());
+                    Some(claims.form_id)
+                }
                 Err(e) => {
                     warn!("Embed URL JWT verification failed: {}", e);
                     return (
@@ -42,16 +87,16 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
         None
     };
 
-    let mut form_id = request
-        .form_id
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+    let mut form_id = request_form_id.clone();
 
+    let jwt_claim_form_id_for_log = jwt_claim_form_id.clone();
     if let Some(jwt_form_id) = jwt_claim_form_id {
         if let Some(ref req_form_id) = form_id {
             if req_form_id != &jwt_form_id {
+                warn!(
+                    "Embed URL form_id mismatch before response: request_form_id={}, token_claim_form_id={}",
+                    req_form_id, jwt_form_id
+                );
                 return (
                     StatusCode::UNAUTHORIZED,
                     Json(EmbedUrlResponse {
@@ -67,11 +112,56 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
         }
     }
 
+    info!(
+        "Embed URL lineage resolution: request_form_id={:?}, token_claim_form_id={:?}, resolved_form_id={:?}",
+        request_form_id,
+        jwt_claim_form_id_for_log,
+        form_id
+    );
+
+    let requested_role = match resolve_embed_request_role(&request, verified_claim_role.as_deref())
+    {
+        Ok(role) => role,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(EmbedUrlResponse {
+                    code: 400,
+                    message,
+                    data: None,
+                    url: None,
+                }),
+            );
+        }
+    };
+    let requested_workflow_mode = match resolve_embed_request_workflow_mode(
+        &request,
+        verified_claim_workflow_mode.as_deref(),
+    ) {
+        Ok(mode) => mode,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(EmbedUrlResponse {
+                    code: 400,
+                    message,
+                    data: None,
+                    url: None,
+                }),
+            );
+        }
+    };
+
     let form_id = form_id.unwrap_or_else(generate_form_id);
+    info!(
+        "Embed URL resolved context: form_id={}, requested_role={:?}, requested_workflow_mode={:?}",
+        form_id, requested_role, requested_workflow_mode
+    );
     let ensured_form = match ensure_review_form_stub(
         &form_id,
         request.project_id.as_str(),
         request.user_id.as_str(),
+        requested_role.as_deref(),
         "pms_embed",
     )
     .await
@@ -84,6 +174,14 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
+            warn!(
+                "Embed URL ensure_review_form_stub failed: form_id={}, project_id={}, user_id={}, status={}, error={}",
+                form_id,
+                request.project_id,
+                request.user_id,
+                status.as_u16(),
+                message
+            );
             return (
                 status,
                 Json(EmbedUrlResponse {
@@ -103,8 +201,26 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
             None
         }
     };
+    info!(
+        "Embed URL form snapshot: form_id={}, form_status={}, task_created={}, existing_task_id={:?}, current_node={:?}, task_status={:?}",
+        ensured_form.form_id,
+        ensured_form.status,
+        ensured_form.task_created,
+        existing_task.as_ref().map(|t| t.id.as_str()),
+        existing_task.as_ref().map(|t| t.current_node.as_str()),
+        existing_task.as_ref().map(|t| t.status.as_str())
+    );
 
-    match create_token(&request.project_id, &request.user_id, None, &form_id, None) {
+    let resolved_role = requested_role.clone().or_else(|| ensured_form.role.clone());
+
+    match create_token(
+        &request.project_id,
+        &request.user_id,
+        None,
+        &form_id,
+        resolved_role.as_deref(),
+        requested_workflow_mode.as_deref(),
+    ) {
         Ok((token, _expires_at)) => {
             let is_reviewer = request
                 .extra_parameters
@@ -113,34 +229,43 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            info!("Generated form_id={}, token_len={}", form_id, token.len());
-
-            let full_url = {
-                let base = PLATFORM_CONFIG
-                    .frontend_base_url
-                    .trim()
-                    .trim_end_matches('/');
-                if base.is_empty() {
-                    None
-                } else {
-                    let path = &PLATFORM_CONFIG.frontend_relative_path;
-                    let clean_path = if path.starts_with('/') {
-                        path.clone()
-                    } else {
-                        format!("/{}", path)
-                    };
-                    Some(format!(
-                        "{}{}?user_token={}&form_id={}&user_id={}&project_id={}&output_project={}",
-                        base,
-                        clean_path,
-                        token,
+            match decode_token_unsafe(&token) {
+                Ok(generated_claims) => {
+                    info!(
+                        "Embed URL token generated: request_form_id={:?}, response_query_form_id={}, token_claim_form_id={}, token_project_id={}, token_user_id={}, token_role={:?}, token_workflow_mode={:?}, token_len={}",
+                        request_form_id,
                         form_id,
-                        request.user_id,
-                        request.project_id,
-                        request.project_id
-                    ))
+                        generated_claims.form_id,
+                        generated_claims.project_id,
+                        generated_claims.user_id,
+                        generated_claims.role,
+                        generated_claims.workflow_mode,
+                        token.len()
+                    );
                 }
-            };
+                Err(error) => {
+                    warn!(
+                        "Embed URL token generated but decode_token_unsafe failed: response_query_form_id={}, error={}",
+                        form_id, error
+                    );
+                }
+            }
+
+            let full_url = build_embed_url(
+                PLATFORM_CONFIG.frontend_base_url.as_str(),
+                PLATFORM_CONFIG.frontend_relative_path.as_str(),
+                token.as_str(),
+                request.project_id.as_str(),
+            );
+            info!(
+                "Embed URL response ready: request_form_id={:?}, response_query_form_id={}, lineage_form_id={}, relative_path={}, has_frontend_base_url={}, url={}",
+                request_form_id,
+                form_id,
+                form_id,
+                PLATFORM_CONFIG.frontend_relative_path,
+                !PLATFORM_CONFIG.frontend_base_url.trim().is_empty(),
+                summarize_url_for_log(full_url.as_deref()).unwrap_or_else(|| "<none>".to_string())
+            );
 
             (
                 StatusCode::OK,
@@ -184,5 +309,219 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
                 }),
             )
         }
+    }
+}
+
+fn resolve_embed_request_role(
+    request: &EmbedUrlRequest,
+    verified_claim_role: Option<&str>,
+) -> Result<Option<String>, String> {
+    let explicit_role = request
+        .role
+        .as_deref()
+        .or_else(|| extract_role_from_extra_parameters(request, "user_role"))
+        .or_else(|| extract_role_from_extra_parameters(request, "role"));
+
+    if let Some(role) = verified_claim_role {
+        if let Some(explicit_role) = explicit_role {
+            let validated_explicit = validate_embed_role(explicit_role)?;
+            if validated_explicit.as_deref() != Some(role) {
+                return Err("JWT role mismatch".to_string());
+            }
+        }
+        return validate_embed_role(role);
+    }
+
+    if let Some(role) = explicit_role {
+        return validate_embed_role(role);
+    }
+
+    Ok(None)
+}
+
+fn resolve_embed_request_workflow_mode(
+    request: &EmbedUrlRequest,
+    verified_claim_workflow_mode: Option<&str>,
+) -> Result<Option<String>, String> {
+    let explicit = request
+        .workflow_mode
+        .as_deref()
+        .or_else(|| extract_extra_parameter(request, "workflow_mode"))
+        .or_else(|| extract_extra_parameter(request, "workflowMode"));
+
+    if let Some(mode) = verified_claim_workflow_mode {
+        if let Some(explicit_mode) = explicit {
+            let validated_explicit = validate_embed_workflow_mode(explicit_mode)?;
+            if validated_explicit.as_deref() != Some(mode) {
+                return Err("JWT workflow_mode mismatch".to_string());
+            }
+        }
+        return validate_embed_workflow_mode(mode);
+    }
+
+    if let Some(mode) = explicit {
+        return validate_embed_workflow_mode(mode);
+    }
+
+    Ok(None)
+}
+
+fn extract_extra_parameter<'a>(request: &'a EmbedUrlRequest, key: &str) -> Option<&'a str> {
+    request
+        .extra_parameters
+        .as_ref()
+        .and_then(|value| value.get(key))
+        .and_then(|value| value.as_str())
+}
+
+fn extract_role_from_extra_parameters<'a>(
+    request: &'a EmbedUrlRequest,
+    key: &str,
+) -> Option<&'a str> {
+    extract_extra_parameter(request, key)
+}
+
+fn summarize_extra_parameters(value: Option<&serde_json::Value>) -> String {
+    let Some(value) = value else {
+        return "None".to_string();
+    };
+
+    match value.as_object() {
+        Some(map) => {
+            let mut items: Vec<String> = map
+                .iter()
+                .map(|(key, nested)| {
+                    let normalized = key.to_lowercase();
+                    if normalized.contains("token")
+                        || normalized.contains("password")
+                        || normalized.ends_with("key")
+                    {
+                        format!("{}=[redacted]", key)
+                    } else {
+                        format!("{}={}", key, summarize_json_value(nested))
+                    }
+                })
+                .collect();
+            items.sort();
+            format!("{{{}}}", items.join(", "))
+        }
+        None => summarize_json_value(value),
+    }
+}
+
+fn summarize_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(v) => v.to_string(),
+        serde_json::Value::Number(v) => v.to_string(),
+        serde_json::Value::String(v) => {
+            if v.len() > 64 {
+                format!("{}…({})", &v[..16], v.len())
+            } else {
+                v.clone()
+            }
+        }
+        serde_json::Value::Array(v) => format!("[array:{}]", v.len()),
+        serde_json::Value::Object(v) => format!("{{object:{}}}", v.len()),
+    }
+}
+
+fn summarize_url_for_log(url: Option<&str>) -> Option<String> {
+    let trimmed = url?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut summarized = trimmed.to_string();
+    if let Some(token_idx) = summarized.find("user_token=") {
+        let tail = &summarized[token_idx + "user_token=".len()..];
+        let token_end = tail.find('&').unwrap_or(tail.len());
+        let token = &tail[..token_end];
+        if !token.is_empty() {
+            let redacted = format!(
+                "{}...({})",
+                token.chars().take(12).collect::<String>(),
+                token.len()
+            );
+            summarized.replace_range(
+                token_idx + "user_token=".len()..token_idx + "user_token=".len() + token_end,
+                &redacted,
+            );
+        }
+    }
+
+    Some(summarized)
+}
+
+fn build_embed_url(
+    base_url: &str,
+    relative_path: &str,
+    token: &str,
+    project_id: &str,
+) -> Option<String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return None;
+    }
+
+    let clean_path = if relative_path.starts_with('/') {
+        relative_path.to_string()
+    } else {
+        format!("/{}", relative_path)
+    };
+    let encoded_token = urlencoding::encode(token);
+    let encoded_project_id = urlencoding::encode(project_id);
+
+    Some(format!(
+        "{}{}?user_token={}&project_id={}&output_project={}",
+        base, clean_path, encoded_token, encoded_project_id, encoded_project_id
+    ))
+}
+
+fn validate_embed_role(raw_role: &str) -> Result<Option<String>, String> {
+    let normalized = normalize_embed_role(Some(raw_role));
+    if normalized.is_some() {
+        return Ok(normalized);
+    }
+
+    Err(format!(
+        "Invalid role: '{}'. Valid values are: {:?}",
+        raw_role,
+        Role::valid_values()
+    ))
+}
+
+fn validate_embed_workflow_mode(raw_mode: &str) -> Result<Option<String>, String> {
+    let normalized = normalize_workflow_mode(Some(raw_mode));
+    if normalized.is_some() {
+        return Ok(normalized);
+    }
+
+    Err("Invalid workflow_mode: valid values are external, manual, internal".to_string())
+}
+
+fn normalize_embed_role(role: Option<&str>) -> Option<String> {
+    let trimmed = role.map(str::trim).filter(|value| !value.is_empty())?;
+    Role::from_str(trimmed).map(|value| value.as_str().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_embed_url;
+
+    #[test]
+    fn build_embed_url_includes_project_scope() {
+        let url = build_embed_url(
+            "https://example.com/",
+            "review/3d-view",
+            "token-123",
+            "Aveva Marine/Sample",
+        )
+        .expect("url");
+
+        assert_eq!(
+            url,
+            "https://example.com/review/3d-view?user_token=token-123&project_id=Aveva%20Marine%2FSample&output_project=Aveva%20Marine%2FSample"
+        );
     }
 }

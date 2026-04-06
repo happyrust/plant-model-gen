@@ -16,6 +16,8 @@ pub mod export_transform_config;
 
 pub mod export_dbnum_instances_v3;
 
+pub mod export_rvm_semantic_debug;
+
 pub mod export_room_instances;
 
 pub mod export_unit_mesh_glb;

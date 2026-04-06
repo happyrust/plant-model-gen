@@ -8,7 +8,9 @@ use aios_core::room::algorithm::*;
 
 use aios_core::shape::pdms_shape::PlantMesh;
 
-use aios_core::{GeomInstQuery, ModelHashInst, RefU64, RefnoEnum, SurrealQueryExt, model_primary_db};
+use aios_core::{
+    GeomInstQuery, ModelHashInst, RefU64, RefnoEnum, SurrealQueryExt, model_primary_db,
+};
 
 use dashmap::DashMap;
 
@@ -325,7 +327,10 @@ async fn query_visible_geo_refnos_by_dbnums(db_nums: &[u32]) -> anyhow::Result<V
         return Ok(Vec::new());
     }
 
-    info!("[room_model] 开始按 dbnums 从 TreeIndex 收集可见几何 refnos: {:?}", db_nums);
+    info!(
+        "[room_model] 开始按 dbnums 从 TreeIndex 收集可见几何 refnos: {:?}",
+        db_nums
+    );
     let manager = TreeIndexManager::with_default_dir(db_nums.to_vec());
     let grouped = manager.query_nouns_grouped(&VISBILE_GEO_NOUNS);
     let mut out = Vec::new();
@@ -342,7 +347,10 @@ async fn query_visible_geo_refnos_by_dbnums(db_nums: &[u32]) -> anyhow::Result<V
     }
 
     out.sort();
-    info!("[room_model] TreeIndex 可见几何收集完成: {} 个 refnos", out.len());
+    info!(
+        "[room_model] TreeIndex 可见几何收集完成: {} 个 refnos",
+        out.len()
+    );
     Ok(out)
 }
 
@@ -465,10 +473,7 @@ async fn refresh_sqlite_spatial_index_from_refnos(
         if current == 1 || current == total_chunks || current % 10 == 0 {
             println!(
                 "[room_model] SQLite AABB scoped 刷新进度: {}/{}, inserted={}, booled_override={}",
-                current,
-                total_chunks,
-                stats.inserted,
-                stats.booled_override
+                current, total_chunks, stats.inserted, stats.booled_override
             );
         }
     }

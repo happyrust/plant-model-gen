@@ -49,6 +49,8 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 ASSETS_DIR="$PROJECT_DIR/assets"
 OUTPUT_DIR="$PROJECT_DIR/output"
 DB_OPTION_FILE="${DB_OPTION_FILE:-$PROJECT_DIR/db_options/DbOption.toml}"
+UPLOAD_ASSETS="${UPLOAD_ASSETS:-auto}"
+UPLOAD_OUTPUT="${UPLOAD_OUTPUT:-auto}"
 
 SSH_OPTS=(
   -o PreferredAuthentications=password
@@ -217,9 +219,33 @@ need_cmd sshpass
 need_cmd rsync
 [[ -n "$REMOTE_PASS" ]] || { printf 'REMOTE_PASS is required\n' >&2; exit 1; }
 
-[[ -d "$ASSETS_DIR" ]] || { printf 'Missing assets directory: %s\n' "$ASSETS_DIR" >&2; exit 1; }
-[[ -d "$OUTPUT_DIR" ]] || { printf 'Missing output directory: %s\n' "$OUTPUT_DIR" >&2; exit 1; }
 [[ -f "$DB_OPTION_FILE" ]] || { printf 'Missing DbOption file: %s\n' "$DB_OPTION_FILE" >&2; exit 1; }
+
+if [[ "$UPLOAD_ASSETS" == "auto" ]]; then
+  if [[ -d "$ASSETS_DIR" ]]; then
+    UPLOAD_ASSETS="true"
+  else
+    UPLOAD_ASSETS="false"
+  fi
+fi
+
+if [[ "$UPLOAD_OUTPUT" == "auto" ]]; then
+  if [[ -d "$OUTPUT_DIR" ]]; then
+    UPLOAD_OUTPUT="true"
+  else
+    UPLOAD_OUTPUT="false"
+  fi
+fi
+
+if [[ "$UPLOAD_ASSETS" == "true" ]] && [[ ! -d "$ASSETS_DIR" ]]; then
+  printf 'Missing assets directory: %s\n' "$ASSETS_DIR" >&2
+  exit 1
+fi
+
+if [[ "$UPLOAD_OUTPUT" == "true" ]] && [[ ! -d "$OUTPUT_DIR" ]]; then
+  printf 'Missing output directory: %s\n' "$OUTPUT_DIR" >&2
+  exit 1
+fi
 
 if [[ -n "$LOCAL_BIN_OVERRIDE" ]]; then
   LOCAL_BIN="$LOCAL_BIN_OVERRIDE"
@@ -364,9 +390,17 @@ run_remote 'set -e; \
   fi; \
   mv '"'"'/root/DbOption.toml.tmp'"'"' '"'"'/root/DbOption.toml'"'"''
 
-upload_tree "$ASSETS_DIR" "$REMOTE_ASSETS_DIR" "assets/"
+if [[ "$UPLOAD_ASSETS" == "true" ]]; then
+  upload_tree "$ASSETS_DIR" "$REMOTE_ASSETS_DIR" "assets/"
+else
+  log "Skipping assets upload (UPLOAD_ASSETS=$UPLOAD_ASSETS, dir=$ASSETS_DIR)"
+fi
 
-upload_tree "$OUTPUT_DIR" "$REMOTE_OUTPUT_DIR" "output/"
+if [[ "$UPLOAD_OUTPUT" == "true" ]]; then
+  upload_tree "$OUTPUT_DIR" "$REMOTE_OUTPUT_DIR" "output/"
+else
+  log "Skipping output upload (UPLOAD_OUTPUT=$UPLOAD_OUTPUT, dir=$OUTPUT_DIR)"
+fi
 
 log "Restarting service with new binary and configuration"
 run_remote "set -e; \

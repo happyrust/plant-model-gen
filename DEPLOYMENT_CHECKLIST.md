@@ -35,14 +35,14 @@ gh release list --repo happyrust/plant-model-gen
 ```bash
 BINARY_SOURCE=github-artifact \
 GITHUB_RUN_ID=<YOUR_RUN_ID> \
-./shells/deploy_all_with_frontend.sh
+./shells/deploy/deploy_all_with_frontend.sh
 ```
 
 **From GitHub Release:**
 ```bash
 BINARY_SOURCE=github-release \
 GITHUB_TAG=<YOUR_TAG> \
-./shells/deploy_all_with_frontend.sh
+./shells/deploy/deploy_all_with_frontend.sh
 ```
 
 ### Deploy Backend Only
@@ -51,14 +51,14 @@ GITHUB_TAG=<YOUR_TAG> \
 ```bash
 BINARY_SOURCE=github-artifact \
 GITHUB_RUN_ID=<YOUR_RUN_ID> \
-./shells/deploy_web_server_bundle.sh
+./shells/deploy/deploy_web_server_bundle.sh
 ```
 
 **From GitHub Release:**
 ```bash
 BINARY_SOURCE=github-release \
 GITHUB_TAG=<YOUR_TAG> \
-./shells/deploy_web_server_bundle.sh
+./shells/deploy/deploy_web_server_bundle.sh
 ```
 
 ## Post-Deployment Verification
@@ -103,7 +103,7 @@ gh run list --workflow multi-platform-build.yml --status success --limit 10
 # Deploy older run
 BINARY_SOURCE=github-artifact \
 GITHUB_RUN_ID=<PREVIOUS_RUN_ID> \
-./shells/deploy_all_with_frontend.sh
+./shells/deploy/deploy_all_with_frontend.sh
 ```
 
 ## Troubleshooting
@@ -115,7 +115,7 @@ GITHUB_RUN_ID=<PREVIOUS_RUN_ID> \
 
 ### "GITHUB_RUN_ID is required"
 - Set the environment variable: `export GITHUB_RUN_ID=12345678`
-- Or inline: `GITHUB_RUN_ID=12345678 ./shells/deploy_...`
+- Or inline: `GITHUB_RUN_ID=12345678 ./shells/deploy/deploy_...`
 
 ### "gh: command not found"
 ```bash

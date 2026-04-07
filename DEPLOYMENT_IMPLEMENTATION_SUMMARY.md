@@ -37,7 +37,7 @@ Implement complete backend deployment pipeline to enable GitHub-built binaries t
 - Enhanced BUILD_INFO.txt metadata
 - Added GitHub Release creation step
 
-### 2. Deploy Script Updates (shells/deploy_web_server_bundle.sh)
+### 2. Deploy Script Updates (shells/deploy/deploy_web_server_bundle.sh)
 
 #### A. GitHub Artifact Download
 - Added `--repo happyrust/plant-model-gen` to `gh run download` command
@@ -61,7 +61,7 @@ Implement complete backend deployment pipeline to enable GitHub-built binaries t
 - File existence validation after download
 - BUILD_INFO.txt integration
 
-### 3. Orchestration Script Updates (shells/deploy_all_with_frontend.sh)
+### 3. Orchestration Script Updates (shells/deploy/deploy_all_with_frontend.sh)
 
 #### A. Environment Variable Support
 - `BINARY_SOURCE`: source selection (local/github-artifact/github-release)
@@ -110,13 +110,13 @@ Created comprehensive deployment documentation:
    - Enhanced BUILD_INFO.txt metadata
    - Added release creation workflow
 
-2. `/Volumes/DPC/work/plant-code/plant-model-gen/shells/deploy_web_server_bundle.sh`
+2. `/Volumes/DPC/work/plant-code/plant-model-gen/shells/deploy/deploy_web_server_bundle.sh`
    - Enhanced GitHub artifact download with repo specification
    - Enhanced GitHub release download with repo specification
    - Added BUILD_INFO.txt display
    - Improved error handling
 
-3. `/Volumes/DPC/work/plant-code/plant-model-gen/shells/deploy_all_with_frontend.sh`
+3. `/Volumes/DPC/work/plant-code/plant-model-gen/shells/deploy/deploy_all_with_frontend.sh`
    - Added GitHub artifact deployment variables
    - Added usage documentation
    - Enhanced logging
@@ -136,8 +136,8 @@ Created comprehensive deployment documentation:
 
 ### Script Syntax Validation
 ```bash
-bash -n shells/deploy_web_server_bundle.sh  # ✓ PASSED
-bash -n shells/deploy_all_with_frontend.sh  # ✓ PASSED
+bash -n shells/deploy/deploy_web_server_bundle.sh  # ✓ PASSED
+bash -n shells/deploy/deploy_all_with_frontend.sh  # ✓ PASSED
 ```
 
 ### YAML Syntax Validation
@@ -154,19 +154,19 @@ python3 -c "import yaml; yaml.safe_load(open('.github/workflows/multi-platform-b
 
 ### 1. Local Build Deployment (Unchanged)
 ```bash
-./shells/deploy_all_with_frontend.sh
+./shells/deploy/deploy_all_with_frontend.sh
 ```
 **Use case:** Development, local testing, GitHub Actions unavailable
 
 ### 2. GitHub Artifact Deployment (NEW)
 ```bash
-BINARY_SOURCE=github-artifact GITHUB_RUN_ID=12345678 ./shells/deploy_all_with_frontend.sh
+BINARY_SOURCE=github-artifact GITHUB_RUN_ID=12345678 ./shells/deploy/deploy_all_with_frontend.sh
 ```
 **Use case:** Deploy from specific CI build, PR testing, build verification
 
 ### 3. GitHub Release Deployment (NEW)
 ```bash
-BINARY_SOURCE=github-release GITHUB_TAG=v1.2.3 ./shells/deploy_all_with_frontend.sh
+BINARY_SOURCE=github-release GITHUB_TAG=v1.2.3 ./shells/deploy/deploy_all_with_frontend.sh
 ```
 **Use case:** Production releases, version-controlled deployments
 
@@ -222,7 +222,7 @@ BINARY_SOURCE=github-release GITHUB_TAG=v1.2.3 ./shells/deploy_all_with_frontend
    
    # Test download (dry-run)
    BINARY_SOURCE=github-artifact GITHUB_RUN_ID=<ID> BUILD_BINARY=false \
-     ./shells/deploy_web_server_bundle.sh || true
+     ./shells/deploy/deploy_web_server_bundle.sh || true
    ```
 
 2. **Verify BUILD_INFO.txt:**
@@ -235,14 +235,14 @@ BINARY_SOURCE=github-release GITHUB_TAG=v1.2.3 ./shells/deploy_all_with_frontend
 3. **Test deployment to staging (if available):**
    ```bash
    REMOTE_HOST=<staging-ip> BINARY_SOURCE=github-artifact GITHUB_RUN_ID=<ID> \
-     ./shells/deploy_all_with_frontend.sh
+     ./shells/deploy/deploy_all_with_frontend.sh
    ```
 
 ### Production Deployment:
 1. Merge this branch to main
 2. Wait for successful CI build on main
 3. Get run ID: `gh run list --branch main --workflow multi-platform-build.yml --limit 1`
-4. Deploy: `BINARY_SOURCE=github-artifact GITHUB_RUN_ID=<ID> ./shells/deploy_all_with_frontend.sh`
+4. Deploy: `BINARY_SOURCE=github-artifact GITHUB_RUN_ID=<ID> ./shells/deploy/deploy_all_with_frontend.sh`
 
 ## Next Steps
 

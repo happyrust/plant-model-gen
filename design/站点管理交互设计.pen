@@ -1,0 +1,1637 @@
+{
+  "version": 1,
+  "name": "站点管理交互设计",
+  "description": "基于 /admin 站点管理文档的完善交互设计",
+  "nodes": [
+    {
+      "id": "main-frame",
+      "type": "frame",
+      "name": "主界面",
+      "x": 0,
+      "y": 0,
+      "width": 1440,
+      "height": 900,
+      "fillColor": "#F5F5F5",
+      "children": [
+        {
+          "id": "header",
+          "type": "frame",
+          "name": "顶部导航栏",
+          "x": 0,
+          "y": 0,
+          "width": 1440,
+          "height": 60,
+          "fillColor": "#1A1A2E",
+          "children": [
+            {
+              "id": "header-title",
+              "type": "text",
+              "content": "🏠 站点管理后台",
+              "x": 20,
+              "y": 18,
+              "fontSize": 18,
+              "fontWeight": "600",
+              "textColor": "#FFFFFF"
+            },
+            {
+              "id": "header-controls",
+              "type": "frame",
+              "name": "顶部控制区",
+              "x": 1000,
+              "y": 12,
+              "width": 420,
+              "height": 36,
+              "layout": "horizontal",
+              "gap": 16,
+              "children": [
+                {
+                  "id": "auto-refresh-toggle",
+                  "type": "frame",
+                  "name": "自动刷新开关",
+                  "width": 120,
+                  "height": 36,
+                  "fillColor": "#2D2D44",
+                  "cornerRadius": 6,
+                  "children": [
+                    {
+                      "id": "toggle-label",
+                      "type": "text",
+                      "content": "自动刷新 ON",
+                      "x": 12,
+                      "y": 9,
+                      "fontSize": 13,
+                      "textColor": "#4ADE80"
+                    }
+                  ]
+                },
+                {
+                  "id": "refresh-btn",
+                  "type": "frame",
+                  "name": "立即刷新按钮",
+                  "width": 90,
+                  "height": 36,
+                  "fillColor": "#3B82F6",
+                  "cornerRadius": 6,
+                  "children": [
+                    {
+                      "id": "refresh-text",
+                      "type": "text",
+                      "content": "🔄 刷新",
+                      "x": 16,
+                      "y": 9,
+                      "fontSize": 13,
+                      "textColor": "#FFFFFF"
+                    }
+                  ]
+                },
+                {
+                  "id": "user-badge",
+                  "type": "frame",
+                  "name": "用户头像",
+                  "width": 100,
+                  "height": 36,
+                  "fillColor": "#2D2D44",
+                  "cornerRadius": 6,
+                  "children": [
+                    {
+                      "id": "user-text",
+                      "type": "text",
+                      "content": "👤 admin",
+                      "x": 16,
+                      "y": 9,
+                      "fontSize": 13,
+                      "textColor": "#FFFFFF"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "sidebar",
+          "type": "frame",
+          "name": "左侧边栏",
+          "x": 0,
+          "y": 60,
+          "width": 280,
+          "height": 840,
+          "fillColor": "#FFFFFF",
+          "children": [
+            {
+              "id": "stats-panel",
+              "type": "frame",
+              "name": "概览统计区",
+              "x": 16,
+              "y": 16,
+              "width": 248,
+              "height": 140,
+              "fillColor": "#F8FAFC",
+              "cornerRadius": 8,
+              "children": [
+                {
+                  "id": "stats-title",
+                  "type": "text",
+                  "content": "📊 概览",
+                  "x": 16,
+                  "y": 12,
+                  "fontSize": 14,
+                  "fontWeight": "600",
+                  "textColor": "#1E293B"
+                },
+                {
+                  "id": "stat-total",
+                  "type": "text",
+                  "content": "总站点: 12",
+                  "x": 16,
+                  "y": 44,
+                  "fontSize": 13,
+                  "textColor": "#64748B"
+                },
+                {
+                  "id": "stat-running",
+                  "type": "text",
+                  "content": "运行中: 8 🟢",
+                  "x": 16,
+                  "y": 68,
+                  "fontSize": 13,
+                  "textColor": "#64748B"
+                },
+                {
+                  "id": "stat-error",
+                  "type": "text",
+                  "content": "异常: 1 🔴",
+                  "x": 16,
+                  "y": 92,
+                  "fontSize": 13,
+                  "textColor": "#64748B"
+                },
+                {
+                  "id": "new-site-btn",
+                  "type": "frame",
+                  "name": "新建站点按钮",
+                  "x": 16,
+                  "y": 116,
+                  "width": 216,
+                  "height": 36,
+                  "fillColor": "#10B981",
+                  "cornerRadius": 6,
+                  "children": [
+                    {
+                      "id": "new-site-text",
+                      "type": "text",
+                      "content": "+ 新建站点",
+                      "x": 64,
+                      "y": 9,
+                      "fontSize": 14,
+                      "fontWeight": "500",
+                      "textColor": "#FFFFFF"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "search-box",
+              "type": "frame",
+              "name": "搜索框",
+              "x": 16,
+              "y": 172,
+              "width": 248,
+              "height": 40,
+              "fillColor": "#F1F5F9",
+              "cornerRadius": 6,
+              "children": [
+                {
+                  "id": "search-placeholder",
+                  "type": "text",
+                  "content": "🔍 搜索站点...",
+                  "x": 12,
+                  "y": 11,
+                  "fontSize": 14,
+                  "textColor": "#94A3B8"
+                }
+              ]
+            },
+            {
+              "id": "site-list",
+              "type": "frame",
+              "name": "站点列表",
+              "x": 16,
+              "y": 224,
+              "width": 248,
+              "height": 600,
+              "children": [
+                {
+                  "id": "site-card-1",
+                  "type": "frame",
+                  "name": "站点卡片-运行中",
+                  "x": 0,
+                  "y": 0,
+                  "width": 248,
+                  "height": 80,
+                  "fillColor": "#FFFFFF",
+                  "strokeColor": "#10B981",
+                  "strokeThickness": 2,
+                  "cornerRadius": 8,
+                  "children": [
+                    {
+                      "id": "card1-badge",
+                      "type": "frame",
+                      "name": "状态徽章",
+                      "x": 12,
+                      "y": 12,
+                      "width": 56,
+                      "height": 20,
+                      "fillColor": "#DCFCE7",
+                      "cornerRadius": 4,
+                      "children": [
+                        {
+                          "id": "card1-badge-text",
+                          "type": "text",
+                          "content": "🏃 运行",
+                          "x": 6,
+                          "y": 3,
+                          "fontSize": 11,
+                          "textColor": "#166534"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "card1-name",
+                      "type": "text",
+                      "content": "AMS-1112",
+                      "x": 76,
+                      "y": 12,
+                      "fontSize": 14,
+                      "fontWeight": "600",
+                      "textColor": "#1E293B"
+                    },
+                    {
+                      "id": "card1-id",
+                      "type": "text",
+                      "content": "ams-1112-8080",
+                      "x": 12,
+                      "y": 36,
+                      "fontSize": 11,
+                      "textColor": "#64748B"
+                    },
+                    {
+                      "id": "card1-ports",
+                      "type": "text",
+                      "content": "8020/8080",
+                      "x": 12,
+                      "y": 54,
+                      "fontSize": 11,
+                      "textColor": "#94A3B8"
+                    },
+                    {
+                      "id": "card1-time",
+                      "type": "text",
+                      "content": "2分钟前",
+                      "x": 180,
+                      "y": 54,
+                      "fontSize": 10,
+                      "textColor": "#94A3B8"
+                    }
+                  ]
+                },
+                {
+                  "id": "site-card-2",
+                  "type": "frame",
+                  "name": "站点卡片-失败",
+                  "x": 0,
+                  "y": 88,
+                  "width": 248,
+                  "height": 80,
+                  "fillColor": "#FFFFFF",
+                  "strokeColor": "#EF4444",
+                  "strokeThickness": 2,
+                  "cornerRadius": 8,
+                  "children": [
+                    {
+                      "id": "card2-badge",
+                      "type": "frame",
+                      "name": "状态徽章",
+                      "x": 12,
+                      "y": 12,
+                      "width": 56,
+                      "height": 20,
+                      "fillColor": "#FEE2E2",
+                      "cornerRadius": 4,
+                      "children": [
+                        {
+                          "id": "card2-badge-text",
+                          "type": "text",
+                          "content": "⚠️ 失败",
+                          "x": 6,
+                          "y": 3,
+                          "fontSize": 11,
+                          "textColor": "#991B1B"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "card2-name",
+                      "type": "text",
+                      "content": "TEST-001",
+                      "x": 76,
+                      "y": 12,
+                      "fontSize": 14,
+                      "fontWeight": "600",
+                      "textColor": "#1E293B"
+                    },
+                    {
+                      "id": "card2-ports",
+                      "type": "text",
+                      "content": "8030/8090",
+                      "x": 12,
+                      "y": 54,
+                      "fontSize": 11,
+                      "textColor": "#94A3B8"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "form-panel",
+          "type": "frame",
+          "name": "表单区",
+          "x": 296,
+          "y": 76,
+          "width": 560,
+          "height": 816,
+          "fillColor": "#FFFFFF",
+          "cornerRadius": 8,
+          "children": [
+            {
+              "id": "form-title",
+              "type": "text",
+              "content": "📝 新建站点",
+              "x": 24,
+              "y": 24,
+              "fontSize": 18,
+              "fontWeight": "600",
+              "textColor": "#1E293B"
+            },
+            {
+              "id": "form-fields",
+              "type": "frame",
+              "name": "表单字段区",
+              "x": 24,
+              "y": 60,
+              "width": 512,
+              "height": 700,
+              "children": [
+                {
+                  "id": "field-name",
+                  "type": "frame",
+                  "name": "项目名字段",
+                  "x": 0,
+                  "y": 0,
+                  "width": 512,
+                  "height": 72,
+                  "children": [
+                    {
+                      "id": "label-name",
+                      "type": "text",
+                      "content": "项目名 *",
+                      "x": 0,
+                      "y": 0,
+                      "fontSize": 14,
+                      "fontWeight": "500",
+                      "textColor": "#374151"
+                    },
+                    {
+                      "id": "input-name",
+                      "type": "frame",
+                      "name": "输入框",
+                      "x": 0,
+                      "y": 24,
+                      "width": 512,
+                      "height": 40,
+                      "fillColor": "#F8FAFC",
+                      "strokeColor": "#E2E8F0",
+                      "strokeThickness": 1,
+                      "cornerRadius": 6,
+                      "children": [
+                        {
+                          "id": "input-name-text",
+                          "type": "text",
+                          "content": "AMS-1112",
+                          "x": 12,
+                          "y": 11,
+                          "fontSize": 14,
+                          "textColor": "#1E293B"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "hint-name",
+                      "type": "text",
+                      "content": "✅ 格式正确",
+                      "x": 0,
+                      "y": 68,
+                      "fontSize": 12,
+                      "textColor": "#10B981"
+                    }
+                  ]
+                },
+                {
+                  "id": "field-code",
+                  "type": "frame",
+                  "name": "项目代号字段",
+                  "x": 0,
+                  "y": 88,
+                  "width": 512,
+                  "height": 72,
+                  "children": [
+                    {
+                      "id": "label-code",
+                      "type": "text",
+                      "content": "项目代号 *",
+                      "x": 0,
+                      "y": 0,
+                      "fontSize": 14,
+                      "fontWeight": "500",
+                      "textColor": "#374151"
+                    },
+                    {
+                      "id": "input-code",
+                      "type": "frame",
+                      "name": "输入框",
+                      "x": 0,
+                      "y": 24,
+                      "width": 512,
+                      "height": 40,
+                      "fillColor": "#F8FAFC",
+                      "strokeColor": "#E2E8F0",
+                      "strokeThickness": 1,
+                      "cornerRadius": 6,
+                      "children": [
+                        {
+                          "id": "input-code-text",
+                          "type": "text",
+                          "content": "1112",
+                          "x": 12,
+                          "y": 11,
+                          "fontSize": 14,
+                          "textColor": "#1E293B"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "hint-code",
+                      "type": "text",
+                      "content": "✅ 有效代号",
+                      "x": 0,
+                      "y": 68,
+                      "fontSize": 12,
+                      "textColor": "#10B981"
+                    }
+                  ]
+                },
+                {
+                  "id": "field-path",
+                  "type": "frame",
+                  "name": "项目路径字段",
+                  "x": 0,
+                  "y": 176,
+                  "width": 512,
+                  "height": 72,
+                  "children": [
+                    {
+                      "id": "label-path",
+                      "type": "text",
+                      "content": "项目路径 *",
+                      "x": 0,
+                      "y": 0,
+                      "fontSize": 14,
+                      "fontWeight": "500",
+                      "textColor": "#374151"
+                    },
+                    {
+                      "id": "input-path",
+                      "type": "frame",
+                      "name": "输入框",
+                      "x": 0,
+                      "y": 24,
+                      "width": 480,
+                      "height": 40,
+                      "fillColor": "#F8FAFC",
+                      "strokeColor": "#E2E8F0",
+                      "strokeThickness": 1,
+                      "cornerRadius": 6,
+                      "children": [
+                        {
+                          "id": "input-path-text",
+                          "type": "text",
+                          "content": "/data/projects/ams1112",
+                          "x": 12,
+                          "y": 11,
+                          "fontSize": 14,
+                          "textColor": "#1E293B"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "btn-browse",
+                      "type": "frame",
+                      "name": "浏览按钮",
+                      "x": 488,
+                      "y": 24,
+                      "width": 24,
+                      "height": 40,
+                      "fillColor": "#E2E8F0",
+                      "cornerRadius": 6,
+                      "children": [
+                        {
+                          "id": "btn-browse-text",
+                          "type": "text",
+                          "content": "📁",
+                          "x": 4,
+                          "y": 10,
+                          "fontSize": 14
+                        }
+                      ]
+                    },
+                    {
+                      "id": "hint-path",
+                      "type": "text",
+                      "content": "⚠️ 路径不存在，请确认后创建",
+                      "x": 0,
+                      "y": 68,
+                      "fontSize": 12,
+                      "textColor": "#F59E0B"
+                    }
+                  ]
+                },
+                {
+                  "id": "field-dbnums",
+                  "type": "frame",
+                  "name": "限制dbnum字段",
+                  "x": 0,
+                  "y": 264,
+                  "width": 512,
+                  "height": 72,
+                  "children": [
+                    {
+                      "id": "label-dbnums",
+                      "type": "text",
+                      "content": "限制 dbnum",
+                      "x": 0,
+                      "y": 0,
+                      "fontSize": 14,
+                      "fontWeight": "500",
+                      "textColor": "#374151"
+                    },
+                    {
+                      "id": "input-dbnums",
+                      "type": "frame",
+                      "name": "输入框",
+                      "x": 0,
+                      "y": 24,
+                      "width": 512,
+                      "height": 40,
+                      "fillColor": "#F8FAFC",
+                      "strokeColor": "#E2E8F0",
+                      "strokeThickness": 1,
+                      "cornerRadius": 6,
+                      "children": [
+                        {
+                          "id": "input-dbnums-text",
+                          "type": "text",
+                          "content": "10,11,12",
+                          "x": 12,
+                          "y": 11,
+                          "fontSize": 14,
+                          "textColor": "#1E293B"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "hint-dbnums",
+                      "type": "text",
+                      "content": "可选，限制解析的 dbnum 范围",
+                      "x": 0,
+                      "y": 68,
+                      "fontSize": 12,
+                      "textColor": "#94A3B8"
+                    }
+                  ]
+                },
+                {
+                  "id": "field-ports",
+                  "type": "frame",
+                  "name": "端口字段组",
+                  "x": 0,
+                  "y": 352,
+                  "width": 512,
+                  "height": 72,
+                  "children": [
+                    {
+                      "id": "label-ports",
+                      "type": "text",
+                      "content": "端口 *",
+                      "x": 0,
+                      "y": 0,
+                      "fontSize": 14,
+                      "fontWeight": "500",
+                      "textColor": "#374151"
+                    },
+                    {
+                      "id": "input-db-port",
+                      "type": "frame",
+                      "name": "数据库端口输入框",
+                      "x": 0,
+                      "y": 24,
+                      "width": 240,
+                      "height": 40,
+                      "fillColor": "#F8FAFC",
+                      "strokeColor": "#E2E8F0",
+                      "strokeThickness": 1,
+                      "cornerRadius": 6,
+                      "children": [
+                        {
+                          "id": "input-db-port-text",
+                          "type": "text",
+                          "content": "8020",
+                          "x": 12,
+                          "y": 11,
+                          "fontSize": 14,
+                          "textColor": "#1E293B"
+                        },
+                        {
+                          "id": "db-port-label",
+                          "type": "text",
+                          "content": "DB端口",
+                          "x": 12,
+                          "y": -20,
+                          "fontSize": 11,
+                          "textColor": "#94A3B8"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "input-web-port",
+                      "type": "frame",
+                      "name": "站点端口输入框",
+                      "x": 272,
+                      "y": 24,
+                      "width": 240,
+                      "height": 40,
+                      "fillColor": "#F8FAFC",
+                      "strokeColor": "#E2E8F0",
+                      "strokeThickness": 1,
+                      "cornerRadius": 6,
+                      "children": [
+                        {
+                          "id": "input-web-port-text",
+                          "type": "text",
+                          "content": "8080",
+                          "x": 12,
+                          "y": 11,
+                          "fontSize": 14,
+                          "textColor": "#1E293B"
+                        },
+                        {
+                          "id": "web-port-label",
+                          "type": "text",
+                          "content": "Web端口",
+                          "x": 12,
+                          "y": -20,
+                          "fontSize": 11,
+                          "textColor": "#94A3B8"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "hint-ports",
+                      "type": "text",
+                      "content": "🔍 检查中... → ✅ 端口可用",
+                      "x": 0,
+                      "y": 68,
+                      "fontSize": 12,
+                      "textColor": "#10B981"
+                    }
+                  ]
+                },
+                {
+                  "id": "field-credentials",
+                  "type": "frame",
+                  "name": "数据库凭据",
+                  "x": 0,
+                  "y": 440,
+                  "width": 512,
+                  "height": 120,
+                  "children": [
+                    {
+                      "id": "label-user",
+                      "type": "text",
+                      "content": "数据库用户",
+                      "x": 0,
+                      "y": 0,
+                      "fontSize": 14,
+                      "fontWeight": "500",
+                      "textColor": "#374151"
+                    },
+                    {
+                      "id": "input-user",
+                      "type": "frame",
+                      "name": "用户输入框",
+                      "x": 0,
+                      "y": 24,
+                      "width": 512,
+                      "height": 40,
+                      "fillColor": "#F8FAFC",
+                      "strokeColor": "#E2E8F0",
+                      "strokeThickness": 1,
+                      "cornerRadius": 6,
+                      "children": [
+                        {
+                          "id": "input-user-text",
+                          "type": "text",
+                          "content": "root",
+                          "x": 12,
+                          "y": 11,
+                          "fontSize": 14,
+                          "textColor": "#1E293B"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "label-password",
+                      "type": "text",
+                      "content": "数据库密码",
+                      "x": 0,
+                      "y": 72,
+                      "fontSize": 14,
+                      "fontWeight": "500",
+                      "textColor": "#374151"
+                    },
+                    {
+                      "id": "input-password",
+                      "type": "frame",
+                      "name": "密码输入框",
+                      "x": 0,
+                      "y": 96,
+                      "width": 512,
+                      "height": 40,
+                      "fillColor": "#F8FAFC",
+                      "strokeColor": "#E2E8F0",
+                      "strokeThickness": 1,
+                      "cornerRadius": 6,
+                      "children": [
+                        {
+                          "id": "input-password-text",
+                          "type": "text",
+                          "content": "••••••••",
+                          "x": 12,
+                          "y": 11,
+                          "fontSize": 14,
+                          "textColor": "#1E293B"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "id": "form-actions",
+                  "type": "frame",
+                  "name": "表单操作按钮",
+                  "x": 0,
+                  "y": 600,
+                  "width": 512,
+                  "height": 44,
+                  "layout": "horizontal",
+                  "gap": 16,
+                  "children": [
+                    {
+                      "id": "btn-save",
+                      "type": "frame",
+                      "name": "保存按钮",
+                      "width": 120,
+                      "height": 44,
+                      "fillColor": "#3B82F6",
+                      "cornerRadius": 6,
+                      "children": [
+                        {
+                          "id": "btn-save-text",
+                          "type": "text",
+                          "content": "💾 保存站点",
+                          "x": 24,
+                          "y": 12,
+                          "fontSize": 14,
+                          "fontWeight": "500",
+                          "textColor": "#FFFFFF"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "btn-cancel",
+                      "type": "frame",
+                      "name": "取消按钮",
+                      "width": 80,
+                      "height": 44,
+                      "fillColor": "#E5E7EB",
+                      "cornerRadius": 6,
+                      "children": [
+                        {
+                          "id": "btn-cancel-text",
+                          "type": "text",
+                          "content": "❌ 取消",
+                          "x": 16,
+                          "y": 12,
+                          "fontSize": 14,
+                          "textColor": "#374151"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "detail-panel",
+          "type": "frame",
+          "name": "详情与日志区",
+          "x": 872,
+          "y": 76,
+          "width": 552,
+          "height": 816,
+          "fillColor": "#FFFFFF",
+          "cornerRadius": 8,
+          "children": [
+            {
+              "id": "action-bar",
+              "type": "frame",
+              "name": "操作按钮栏",
+              "x": 24,
+              "y": 24,
+              "width": 504,
+              "height": 44,
+              "fillColor": "#F8FAFC",
+              "cornerRadius": 6,
+              "children": [
+                {
+                  "id": "btn-parse",
+                  "type": "frame",
+                  "name": "解析按钮",
+                  "x": 12,
+                  "y": 8,
+                  "width": 80,
+                  "height": 28,
+                  "fillColor": "#6366F1",
+                  "cornerRadius": 4,
+                  "children": [
+                    {
+                      "id": "btn-parse-text",
+                      "type": "text",
+                      "content": "🔍 解析",
+                      "x": 16,
+                      "y": 6,
+                      "fontSize": 12,
+                      "textColor": "#FFFFFF"
+                    }
+                  ]
+                },
+                {
+                  "id": "btn-start",
+                  "type": "frame",
+                  "name": "启动按钮",
+                  "x": 100,
+                  "y": 8,
+                  "width": 80,
+                  "height": 28,
+                  "fillColor": "#10B981",
+                  "cornerRadius": 4,
+                  "children": [
+                    {
+                      "id": "btn-start-text",
+                      "type": "text",
+                      "content": "▶ 启动",
+                      "x": 18,
+                      "y": 6,
+                      "fontSize": 12,
+                      "textColor": "#FFFFFF"
+                    }
+                  ]
+                },
+                {
+                  "id": "btn-stop",
+                  "type": "frame",
+                  "name": "停止按钮",
+                  "x": 188,
+                  "y": 8,
+                  "width": 80,
+                  "height": 28,
+                  "fillColor": "#F59E0B",
+                  "cornerRadius": 4,
+                  "children": [
+                    {
+                      "id": "btn-stop-text",
+                      "type": "text",
+                      "content": "⏹ 停止",
+                      "x": 18,
+                      "y": 6,
+                      "fontSize": 12,
+                      "textColor": "#FFFFFF"
+                    }
+                  ]
+                },
+                {
+                  "id": "btn-delete",
+                  "type": "frame",
+                  "name": "删除按钮",
+                  "x": 276,
+                  "y": 8,
+                  "width": 80,
+                  "height": 28,
+                  "fillColor": "#EF4444",
+                  "cornerRadius": 4,
+                  "children": [
+                    {
+                      "id": "btn-delete-text",
+                      "type": "text",
+                      "content": "🗑 删除",
+                      "x": 18,
+                      "y": 6,
+                      "fontSize": 12,
+                      "textColor": "#FFFFFF"
+                    }
+                  ]
+                },
+                {
+                  "id": "btn-health",
+                  "type": "frame",
+                  "name": "健康检查按钮",
+                  "x": 364,
+                  "y": 8,
+                  "width": 100,
+                  "height": 28,
+                  "fillColor": "#8B5CF6",
+                  "cornerRadius": 4,
+                      "children": [
+                        {
+                          "id": "btn-health-text",
+                          "type": "text",
+                          "content": "🏥 健康检查",
+                          "x": 12,
+                          "y": 6,
+                          "fontSize": 12,
+                          "textColor": "#FFFFFF"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "id": "detail-info",
+                  "type": "frame",
+                  "name": "站点详情面板",
+                  "x": 24,
+                  "y": 84,
+                  "width": 504,
+                  "height": 200,
+                  "fillColor": "#F8FAFC",
+                  "cornerRadius": 8,
+                  "children": [
+                    {
+                      "id": "detail-title",
+                      "type": "text",
+                      "content": "📋 站点详情",
+                      "x": 16,
+                      "y": 16,
+                      "fontSize": 14,
+                      "fontWeight": "600",
+                      "textColor": "#1E293B"
+                    },
+                    {
+                      "id": "detail-status-row",
+                      "type": "frame",
+                      "name": "状态行",
+                      "x": 16,
+                      "y": 48,
+                      "width": 472,
+                      "height": 24,
+                      "children": [
+                        {
+                          "id": "detail-status-label",
+                          "type": "text",
+                          "content": "状态:",
+                          "x": 0,
+                          "y": 2,
+                          "fontSize": 13,
+                          "textColor": "#64748B"
+                        },
+                        {
+                          "id": "detail-status-badge",
+                          "type": "frame",
+                          "name": "状态徽章",
+                          "x": 48,
+                          "y": 0,
+                          "width": 80,
+                          "height": 24,
+                          "fillColor": "#FEF3C7",
+                          "cornerRadius": 4,
+                          "children": [
+                            {
+                              "id": "detail-status-text",
+                              "type": "text",
+                              "content": "🟡 解析中",
+                              "x": 8,
+                              "y": 4,
+                              "fontSize": 12,
+                              "textColor": "#92400E"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "id": "detail-ports-row",
+                      "type": "frame",
+                      "name": "端口行",
+                      "x": 16,
+                      "y": 80,
+                      "width": 472,
+                      "height": 20,
+                      "children": [
+                        {
+                          "id": "detail-ports-label",
+                          "type": "text",
+                          "content": "端口:",
+                          "x": 0,
+                          "y": 0,
+                          "fontSize": 13,
+                          "textColor": "#64748B"
+                        },
+                        {
+                          "id": "detail-ports-value",
+                          "type": "text",
+                          "content": "DB: 8020 / Web: 8080",
+                          "x": 48,
+                          "y": 0,
+                          "fontSize": 13,
+                          "fontWeight": "500",
+                          "textColor": "#1E293B"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "detail-pid-row",
+                      "type": "frame",
+                      "name": "PID行",
+                      "x": 16,
+                      "y": 108,
+                      "width": 472,
+                      "height": 20,
+                      "children": [
+                        {
+                          "id": "detail-pid-label",
+                          "type": "text",
+                          "content": "PID:",
+                          "x": 0,
+                          "y": 0,
+                          "fontSize": 13,
+                          "textColor": "#64748B"
+                        },
+                        {
+                          "id": "detail-pid-value",
+                          "type": "text",
+                          "content": "DB: 12345 / Web: 67890",
+                          "x": 48,
+                          "y": 0,
+                          "fontSize": 13,
+                          "fontWeight": "500",
+                          "textColor": "#1E293B"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "detail-url-row",
+                      "type": "frame",
+                      "name": "入口行",
+                      "x": 16,
+                      "y": 136,
+                      "width": 472,
+                      "height": 28,
+                      "children": [
+                        {
+                          "id": "detail-url-label",
+                          "type": "text",
+                          "content": "入口:",
+                          "x": 0,
+                          "y": 0,
+                          "fontSize": 13,
+                          "textColor": "#64748B"
+                        },
+                        {
+                          "id": "detail-url-value",
+                          "type": "frame",
+                          "name": "入口链接",
+                          "x": 48,
+                          "y": -4,
+                          "width": 360,
+                          "height": 28,
+                          "fillColor": "#DBEAFE",
+                          "cornerRadius": 4,
+                          "children": [
+                            {
+                              "id": "detail-url-text",
+                              "type": "text",
+                              "content": "http://127.0.0.1:8080",
+                              "x": 8,
+                              "y": 6,
+                              "fontSize": 12,
+                              "fontFamily": "monospace",
+                              "textColor": "#1D4ED8"
+                            }
+                          ]
+                        },
+                        {
+                          "id": "btn-copy-url",
+                          "type": "frame",
+                          "name": "复制按钮",
+                          "x": 420,
+                          "y": -4,
+                          "width": 44,
+                          "height": 28,
+                          "fillColor": "#E5E7EB",
+                          "cornerRadius": 4,
+                          "children": [
+                            {
+                              "id": "btn-copy-text",
+                              "type": "text",
+                              "content": "📋",
+                              "x": 12,
+                              "y": 4,
+                              "fontSize": 14
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "id": "detail-path-row",
+                      "type": "frame",
+                      "name": "路径行",
+                      "x": 16,
+                      "y": 172,
+                      "width": 472,
+                      "height": 20,
+                      "children": [
+                        {
+                          "id": "detail-path-label",
+                          "type": "text",
+                          "content": "路径:",
+                          "x": 0,
+                          "y": 0,
+                          "fontSize": 13,
+                          "textColor": "#64748B"
+                        },
+                        {
+                          "id": "detail-path-value",
+                          "type": "text",
+                          "content": "/data/projects/ams1112",
+                          "x": 48,
+                          "y": 0,
+                          "fontSize": 12,
+                          "fontFamily": "monospace",
+                          "textColor": "#475569"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "id": "logs-panel",
+                  "type": "frame",
+                  "name": "日志面板",
+                  "x": 24,
+                  "y": 300,
+                  "width": 504,
+                  "height": 492,
+                  "fillColor": "#1E1E2E",
+                  "cornerRadius": 8,
+                  "children": [
+                    {
+                      "id": "logs-header",
+                      "type": "frame",
+                      "name": "日志标签栏",
+                      "x": 0,
+                      "y": 0,
+                      "width": 504,
+                      "height": 40,
+                      "fillColor": "#2D2D44",
+                      "cornerRadius": [8, 8, 0, 0],
+                      "children": [
+                        {
+                          "id": "tab-parse",
+                          "type": "frame",
+                          "name": "解析日志标签",
+                          "x": 8,
+                          "y": 8,
+                          "width": 80,
+                          "height": 24,
+                          "fillColor": "#6366F1",
+                          "cornerRadius": 4,
+                          "children": [
+                            {
+                              "id": "tab-parse-text",
+                              "type": "text",
+                              "content": "解析日志",
+                              "x": 12,
+                              "y": 4,
+                              "fontSize": 12,
+                              "textColor": "#FFFFFF"
+                            }
+                          ]
+                        },
+                        {
+                          "id": "tab-db",
+                          "type": "frame",
+                          "name": "数据库日志标签",
+                          "x": 96,
+                          "y": 8,
+                          "width": 80,
+                          "height": 24,
+                          "children": [
+                            {
+                              "id": "tab-db-text",
+                              "type": "text",
+                              "content": "DB日志",
+                              "x": 16,
+                              "y": 4,
+                              "fontSize": 12,
+                              "textColor": "#94A3B8"
+                            }
+                          ]
+                        },
+                        {
+                          "id": "tab-web",
+                          "type": "frame",
+                          "name": "站点日志标签",
+                          "x": 184,
+                          "y": 8,
+                          "width": 80,
+                          "height": 24,
+                          "children": [
+                            {
+                              "id": "tab-web-text",
+                              "type": "text",
+                              "content": "站点日志",
+                              "x": 16,
+                              "y": 4,
+                              "fontSize": 12,
+                              "textColor": "#94A3B8"
+                            }
+                          ]
+                        },
+                        {
+                          "id": "btn-download-logs",
+                          "type": "frame",
+                          "name": "下载日志按钮",
+                          "x": 420,
+                          "y": 8,
+                          "width": 76,
+                          "height": 24,
+                          "fillColor": "#374151",
+                          "cornerRadius": 4,
+                          "children": [
+                            {
+                              "id": "btn-download-text",
+                              "type": "text",
+                              "content": "📥 下载",
+                              "x": 12,
+                              "y": 4,
+                              "fontSize": 11,
+                              "textColor": "#FFFFFF"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "id": "logs-content",
+                      "type": "frame",
+                      "name": "日志内容区",
+                      "x": 16,
+                      "y": 56,
+                      "width": 472,
+                      "height": 420,
+                      "children": [
+                        {
+                          "id": "log-line-1",
+                          "type": "text",
+                          "content": "[2024-01-15 14:32:01] INFO: Starting parse task...",
+                          "x": 0,
+                          "y": 0,
+                          "fontSize": 11,
+                          "fontFamily": "monospace",
+                          "textColor": "#4ADE80"
+                        },
+                        {
+                          "id": "log-line-2",
+                          "type": "text",
+                          "content": "[2024-01-15 14:32:05] INFO: Loading dbnum list: 10,11,12",
+                          "x": 0,
+                          "y": 18,
+                          "fontSize": 11,
+                          "fontFamily": "monospace",
+                          "textColor": "#4ADE80"
+                        },
+                        {
+                          "id": "log-line-3",
+                          "type": "text",
+                          "content": "[2024-01-15 14:32:10] WARN: Slow read detected in dbnum 11",
+                          "x": 0,
+                          "y": 36,
+                          "fontSize": 11,
+                          "fontFamily": "monospace",
+                          "textColor": "#FBBF24"
+                        },
+                        {
+                          "id": "log-line-4",
+                          "type": "text",
+                          "content": "[2024-01-15 14:32:15] INFO: Processed 150,000 records",
+                          "x": 0,
+                          "y": 54,
+                          "fontSize": 11,
+                          "fontFamily": "monospace",
+                          "textColor": "#4ADE80"
+                        },
+                        {
+                          "id": "log-line-5",
+                          "type": "text",
+                          "content": "[2024-01-15 14:32:20] ERROR: Connection timeout to DB",
+                          "x": 0,
+                          "y": 72,
+                          "fontSize": 11,
+                          "fontFamily": "monospace",
+                          "textColor": "#EF4444"
+                        },
+                        {
+                          "id": "log-line-6",
+                          "type": "text",
+                          "content": "[2024-01-15 14:32:21] INFO: Retrying connection (1/3)...",
+                          "x": 0,
+                          "y": 90,
+                          "fontSize": 11,
+                          "fontFamily": "monospace",
+                          "textColor": "#60A5FA"
+                        },
+                        {
+                          "id": "log-line-7",
+                          "type": "text",
+                          "content": "[2024-01-15 14:32:25] INFO: Parse progress 75% (150K/200K)",
+                          "x": 0,
+                          "y": 108,
+                          "fontSize": 11,
+                          "fontFamily": "monospace",
+                          "textColor": "#4ADE80"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "modal-overlay",
+      "type": "frame",
+      "name": "弹窗遮罩",
+      "x": 0,
+      "y": 0,
+      "width": 1440,
+      "height": 900,
+      "fillColor": "#00000080",
+      "visible": false,
+      "children": [
+        {
+          "id": "confirm-modal",
+          "type": "frame",
+          "name": "确认弹窗",
+          "x": 520,
+          "y": 300,
+          "width": 400,
+          "height": 280,
+          "fillColor": "#FFFFFF",
+          "cornerRadius": 12,
+          "children": [
+            {
+              "id": "modal-icon",
+              "type": "text",
+              "content": "⚠️",
+              "x": 188,
+              "y": 24,
+              "fontSize": 32
+            },
+            {
+              "id": "modal-title",
+              "type": "text",
+              "content": "确认停止站点",
+              "x": 140,
+              "y": 72,
+              "fontSize": 18,
+              "fontWeight": "600",
+              "textColor": "#1E293B"
+            },
+            {
+              "id": "modal-desc",
+              "type": "text",
+              "content": "停止将关闭以下进程:",
+              "x": 24,
+              "y": 108,
+              "fontSize": 14,
+              "textColor": "#64748B"
+            },
+            {
+              "id": "modal-items",
+              "type": "frame",
+              "name": "影响列表",
+              "x": 24,
+              "y": 136,
+              "width": 352,
+              "height": 80,
+              "children": [
+                {
+                  "id": "item-1",
+                  "type": "text",
+                  "content": "• web_server 进程 (PID: 67890)",
+                  "x": 0,
+                  "y": 0,
+                  "fontSize": 13,
+                  "textColor": "#374151"
+                },
+                {
+                  "id": "item-2",
+                  "type": "text",
+                  "content": "• SurrealDB 进程 (PID: 12345)",
+                  "x": 0,
+                  "y": 22,
+                  "fontSize": 13,
+                  "textColor": "#374151"
+                },
+                {
+                  "id": "item-3",
+                  "type": "text",
+                  "content": "• 正在进行的解析任务",
+                  "x": 0,
+                  "y": 44,
+                  "fontSize": 13,
+                  "textColor": "#DC2626"
+                }
+              ]
+            },
+            {
+              "id": "modal-actions",
+              "type": "frame",
+              "name": "弹窗按钮",
+              "x": 24,
+              "y": 228,
+              "width": 352,
+              "height": 44,
+              "layout": "horizontal",
+              "gap": 12,
+              "children": [
+                {
+                  "id": "btn-modal-confirm",
+                  "type": "frame",
+                  "name": "确认按钮",
+                  "width": 100,
+                  "height": 40,
+                  "fillColor": "#EF4444",
+                  "cornerRadius": 6,
+                  "children": [
+                    {
+                      "id": "btn-modal-confirm-text",
+                      "type": "text",
+                      "content": "确认停止",
+                      "x": 20,
+                      "y": 10,
+                      "fontSize": 14,
+                      "fontWeight": "500",
+                      "textColor": "#FFFFFF"
+                    }
+                  ]
+                },
+                {
+                  "id": "btn-modal-cancel",
+                  "type": "frame",
+                  "name": "取消按钮",
+                  "width": 80,
+                  "height": 40,
+                  "fillColor": "#E5E7EB",
+                  "cornerRadius": 6,
+                  "children": [
+                    {
+                      "id": "btn-modal-cancel-text",
+                      "type": "text",
+                      "content": "取消",
+                      "x": 24,
+                      "y": 10,
+                      "fontSize": 14,
+                      "textColor": "#374151"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "toast-container",
+      "type": "frame",
+      "name": "Toast容器",
+      "x": 1140,
+      "y": 80,
+      "width": 280,
+      "height": 200,
+      "children": [
+        {
+          "id": "toast-success",
+          "type": "frame",
+          "name": "成功Toast",
+          "x": 0,
+          "y": 0,
+          "width": 280,
+          "height": 48,
+          "fillColor": "#FFFFFF",
+          "cornerRadius": 8,
+          "children": [
+            {
+              "id": "toast-success-icon",
+              "type": "text",
+              "content": "✅",
+              "x": 12,
+              "y": 12,
+              "fontSize": 20
+            },
+            {
+              "id": "toast-success-text",
+              "type": "text",
+              "content": "站点创建成功！",
+              "x": 44,
+              "y": 14,
+              "fontSize": 14,
+              "fontWeight": "500",
+              "textColor": "#166534"
+            }
+          ]
+        },
+        {
+          "id": "toast-warning",
+          "type": "frame",
+          "name": "警告Toast",
+          "x": 0,
+          "y": 56,
+          "width": 280,
+          "height": 64,
+          "fillColor": "#FFFFFF",
+          "cornerRadius": 8,
+          "children": [
+            {
+              "id": "toast-warning-icon",
+              "type": "text",
+              "content": "⚠️",
+              "x": 12,
+              "y": 12,
+              "fontSize": 20
+            },
+            {
+              "id": "toast-warning-title",
+              "type": "text",
+              "content": "端口已被占用",
+              "x": 44,
+              "y": 10,
+              "fontSize": 14,
+              "fontWeight": "500",
+              "textColor": "#92400E"
+            },
+            {
+              "id": "toast-warning-desc",
+              "type": "text",
+              "content": "建议更换端口或释放占用",
+              "x": 44,
+              "y": 34,
+              "fontSize": 12,
+              "textColor": "#A16207"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

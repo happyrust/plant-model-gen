@@ -9,9 +9,9 @@ on:
         default: 'main'
         type: string
       db_option_file:
-        description: 'Ubuntu 部署使用的 DbOption 文件'
+        description: 'Ubuntu 部署使用的 DbOption 文件（将上传为远端 /root/DbOption.toml）'
         required: true
-        default: 'db_options/DbOption-aveva-1600.toml'
+        default: 'db_options/DbOption-mac.toml'
         type: string
       remote_host:
         description: '覆盖目标服务器地址；留空则取仓库变量 DEPLOY_REMOTE_HOST'
@@ -157,8 +157,8 @@ jobs:
           BUILD_BINARY: 'false'
           LOCAL_BIN_OVERRIDE: ${{ github.workspace }}/ci-artifacts/web_server
         run: |
-          chmod +x ./shells/deploy_web_server_bundle.sh
-          ./shells/deploy_web_server_bundle.sh
+          chmod +x ./shells/deploy/deploy_web_server_bundle.sh
+          ./shells/deploy/deploy_web_server_bundle.sh
 
       - name: Verify remote health via SSH
         env:

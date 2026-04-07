@@ -7,19 +7,19 @@ set -euo pipefail
 # Usage examples:
 #
 # 1. Deploy from local build (default):
-#    ./deploy_all_with_frontend.sh
+#    ./shells/deploy/deploy_all_with_frontend.sh
 #
 # 2. Deploy from GitHub Actions artifact:
-#    BINARY_SOURCE=github-artifact GITHUB_RUN_ID=12345678 ./deploy_all_with_frontend.sh
+#    BINARY_SOURCE=github-artifact GITHUB_RUN_ID=12345678 ./shells/deploy/deploy_all_with_frontend.sh
 #
 # 3. Deploy from GitHub release tag:
-#    BINARY_SOURCE=github-release GITHUB_TAG=v1.0.0 ./deploy_all_with_frontend.sh
+#    BINARY_SOURCE=github-release GITHUB_TAG=v1.0.0 ./shells/deploy/deploy_all_with_frontend.sh
 #
 # 4. Deploy with custom artifact name:
-#    BINARY_SOURCE=github-artifact GITHUB_RUN_ID=12345678 ARTIFACT_NAME=linux-x64-release ./deploy_all_with_frontend.sh
+#    BINARY_SOURCE=github-artifact GITHUB_RUN_ID=12345678 ARTIFACT_NAME=linux-x64-release ./shells/deploy/deploy_all_with_frontend.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BACKEND_PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+BACKEND_PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # 默认与后端仓库同级目录下的 plant3d-web；可通过 FRONTEND_PROJECT_DIR 覆盖
 if [[ -z "${FRONTEND_PROJECT_DIR:-}" ]]; then
   _fe_sibling="$BACKEND_PROJECT_DIR/../plant3d-web"
@@ -42,7 +42,7 @@ GITHUB_RUN_ID="${GITHUB_RUN_ID:-}"
 GITHUB_TAG="${GITHUB_TAG:-}"
 ARTIFACT_NAME="${ARTIFACT_NAME:-linux-x64-release}"
 
-BACKEND_SCRIPT="$BACKEND_PROJECT_DIR/shells/deploy_web_server_bundle.sh"
+BACKEND_SCRIPT="$SCRIPT_DIR/deploy_web_server_bundle.sh"
 FRONTEND_SCRIPT="$FRONTEND_PROJECT_DIR/deploy/deploy_frontend_bundle.sh"
 
 SSH_OPTS=(

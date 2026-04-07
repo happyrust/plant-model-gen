@@ -740,6 +740,169 @@ pub struct DeploymentSiteTaskRequest {
     pub config_override: Option<DatabaseConfig>,
 }
 
+// ================= Managed Admin Sites =================
+
+/// 管理后台站点运行状态
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ManagedSiteStatus {
+    Draft,
+    Parsed,
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+impl Default for ManagedSiteStatus {
+    fn default() -> Self {
+        Self::Draft
+    }
+}
+
+/// 管理后台站点解析状态
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ManagedSiteParseStatus {
+    Pending,
+    Running,
+    Parsed,
+    Failed,
+}
+
+impl Default for ManagedSiteParseStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+/// 管理后台项目站点
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedProjectSite {
+    pub site_id: String,
+    pub project_name: String,
+    pub project_code: u32,
+    pub project_path: String,
+    #[serde(default)]
+    pub manual_db_nums: Vec<u32>,
+    pub config_path: String,
+    pub runtime_dir: String,
+    pub db_data_path: String,
+    pub db_port: u16,
+    pub web_port: u16,
+    pub bind_host: String,
+    pub db_pid: Option<u32>,
+    pub web_pid: Option<u32>,
+    pub parse_pid: Option<u32>,
+    pub status: ManagedSiteStatus,
+    pub parse_status: ManagedSiteParseStatus,
+    pub last_error: Option<String>,
+    pub entry_url: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 创建管理后台项目站点请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateManagedSiteRequest {
+    pub project_name: String,
+    pub project_path: String,
+    pub project_code: u32,
+    #[serde(default)]
+    pub manual_db_nums: Vec<u32>,
+    pub db_port: u16,
+    pub web_port: u16,
+    #[serde(default)]
+    pub bind_host: Option<String>,
+    #[serde(default)]
+    pub db_user: Option<String>,
+    #[serde(default)]
+    pub db_password: Option<String>,
+}
+
+/// 更新管理后台项目站点请求
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UpdateManagedSiteRequest {
+    #[serde(default)]
+    pub project_name: Option<String>,
+    #[serde(default)]
+    pub project_path: Option<String>,
+    #[serde(default)]
+    pub project_code: Option<u32>,
+    #[serde(default)]
+    pub manual_db_nums: Option<Vec<u32>>,
+    #[serde(default)]
+    pub db_port: Option<u16>,
+    #[serde(default)]
+    pub web_port: Option<u16>,
+    #[serde(default)]
+    pub bind_host: Option<String>,
+    #[serde(default)]
+    pub db_user: Option<String>,
+    #[serde(default)]
+    pub db_password: Option<String>,
+}
+
+/// 管理后台站点运行态
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedSiteRuntimeStatus {
+    pub site_id: String,
+    pub status: ManagedSiteStatus,
+    pub parse_status: ManagedSiteParseStatus,
+    pub current_stage: String,
+    pub current_stage_label: String,
+    pub current_stage_detail: Option<String>,
+    pub db_running: bool,
+    pub web_running: bool,
+    pub parse_running: bool,
+    pub db_pid: Option<u32>,
+    pub web_pid: Option<u32>,
+    pub parse_pid: Option<u32>,
+    pub db_port: u16,
+    pub web_port: u16,
+    pub entry_url: Option<String>,
+    pub last_error: Option<String>,
+    pub active_log_kind: Option<String>,
+    pub last_log_at: Option<String>,
+    pub recent_log_source: Option<String>,
+    pub recent_log_at: Option<String>,
+    pub last_key_log: Option<String>,
+    pub last_key_log_source: Option<String>,
+    pub recent_activity: Option<ManagedSiteActivitySummary>,
+}
+
+/// 管理后台最近活动摘要
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedSiteActivitySummary {
+    pub source: String,
+    pub label: String,
+    pub updated_at: Option<String>,
+    pub summary: Option<String>,
+}
+
+/// 管理后台单类日志摘要
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedSiteLogStreamSummary {
+    pub key: String,
+    pub label: String,
+    pub path: String,
+    pub exists: bool,
+    pub has_content: bool,
+    pub updated_at: Option<String>,
+    pub line_count: usize,
+    pub last_line: Option<String>,
+    pub last_key_log: Option<String>,
+}
+
+/// 管理后台日志响应
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedSiteLogsResponse {
+    pub site_id: String,
+    pub parse_log: Vec<String>,
+    pub db_log: Vec<String>,
+    pub web_log: Vec<String>,
+    pub streams: Vec<ManagedSiteLogStreamSummary>,
+}
+
 impl Default for ProjectStatus {
     fn default() -> Self {
         Self::Running

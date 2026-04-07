@@ -19,7 +19,7 @@ BINARY_NAME="${BINARY_NAME:-web_server}"
 FEATURES="${FEATURES:-ws,gen_model,manifold,project_hd,surreal-save,sqlite-index,web_server,parquet-export}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # 二进制路径根据 profile 自动选择
 LOCAL_BIN="${PROJECT_DIR}/target/${TARGET}/${BUILD_PROFILE}/${BINARY_NAME}"
@@ -27,7 +27,15 @@ LOCAL_BIN="${PROJECT_DIR}/target/${TARGET}/${BUILD_PROFILE}/${BINARY_NAME}"
 # 运行时资源目录
 ASSETS_DIR="${PROJECT_DIR}/assets"
 OUTPUT_DIR="${PROJECT_DIR}/output"
-DB_OPTION_FILE="${DB_OPTION_FILE:-${PROJECT_DIR}/db_options/DbOption.toml}"
+DB_OPTION_FILE="${DB_OPTION_FILE:-${PROJECT_DIR}/db_options/DbOption-mac.toml}"
+
+# 与 deploy_web_server_bundle.sh 一致：上传前按环境变量写入 DbOption 路径（apply_dboption_deploy_paths.py）
+: "${REMOTE_PROJECT_PATH:=/root/e3d_models}"
+: "${REMOTE_SURREAL_DATA_PATH:=/root/surreal_data/ams-8020.db}"
+: "${REMOTE_SURREALKV_DATA_PATH:=/root/surreal_data/ams-8020.db.kv}"
+: "${REMOTE_MESHES_PATH:=/root/assets/meshes}"
+: "${REMOTE_SURREAL_SCRIPT_DIR:=/root/resource/surreal}"
+: "${DEPLOY_APPLY_DB_PATH_OVERRIDES:=true}"
 
 # 远端路径
 REMOTE_BIN_NEW="/root/${BINARY_NAME}.new"
@@ -46,7 +54,8 @@ run_remote() {
 # ── [1/7] 本地预检查 ──────────────────────────────────────────────────────────
 echo "[1/7] 本地预检查"
 command -v sshpass >/dev/null || { echo "缺少 sshpass"; exit 1; }
-command -v rsync  >/dev/null || { echo "缺少 rsync";  exit 1; }
+command -v rsync   >/dev/null || { echo "缺少 rsync";   exit 1; }
+command -v python3 >/dev/null || { echo "缺少 python3";  exit 1; }
 [[ -d "${ASSETS_DIR}" ]]     || { echo "缺少 assets 目录: ${ASSETS_DIR}"; exit 1; }
 [[ -f "${DB_OPTION_FILE}" ]] || { echo "缺少配置文件: ${DB_OPTION_FILE}"; exit 1; }
 
@@ -91,9 +100,25 @@ rsync -avz --inplace --chmod=755 -e "${RSYNC_RSH}" \
 
 # ── [5/7] rsync 同步配置和资源目录 ────────────────────────────────────────────
 echo "[5/7] rsync 同步配置和资源"
-# DbOption.toml
+# DbOption.toml（环境变量覆盖路径）
+DB_OPTION_UPLOAD="$(mktemp)"
+cp "${DB_OPTION_FILE}" "${DB_OPTION_UPLOAD}"
+if [[ "${DEPLOY_APPLY_DB_PATH_OVERRIDES}" == "true" ]]; then
+  echo "  按 REMOTE_* 环境变量写入 DbOption 路径后上传"
+  _helper="${SCRIPT_DIR}/apply_dboption_deploy_paths.py"
+  [[ -f "${_helper}" ]] || { echo "缺少 ${_helper}"; exit 1; }
+  _out="$(mktemp)"
+  python3 "${_helper}" "${DB_OPTION_UPLOAD}" "${_out}" \
+    --project-path "${REMOTE_PROJECT_PATH}" \
+    --meshes-path "${REMOTE_MESHES_PATH}" \
+    --surreal-script-dir "${REMOTE_SURREAL_SCRIPT_DIR}" \
+    --surreal-data-path "${REMOTE_SURREAL_DATA_PATH}" \
+    --surrealkv-path "${REMOTE_SURREALKV_DATA_PATH}"
+  mv "${_out}" "${DB_OPTION_UPLOAD}"
+fi
 rsync -avz -e "${RSYNC_RSH}" \
-  "${DB_OPTION_FILE}" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DB_OPTION}"
+  "${DB_OPTION_UPLOAD}" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DB_OPTION}"
+rm -f "${DB_OPTION_UPLOAD}"
 
 # assets/
 rsync -avz --delete -e "${RSYNC_RSH}" \

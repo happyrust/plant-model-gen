@@ -37,6 +37,9 @@ impl Default for MbdPipeSource {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MbdPipeMode {
+    /// 与 plant3d-web 默认视图一致：后台排版优先（查询串为 `layout_first`）
+    #[serde(rename = "layout_first")]
+    LayoutFirst,
     Construction,
     Inspection,
 }
@@ -50,7 +53,7 @@ impl Default for MbdPipeMode {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MbdPipeQuery {
-    /// 语义模式：construction=施工表达（默认），inspection=几何校核
+    /// 语义模式：layout_first=排版优先（与 construction 默认开关一致），construction=施工表达，inspection=几何校核
     pub mode: Option<MbdPipeMode>,
     /// 数据来源：parquet=Parquet 文件（默认），db=SurrealDB，cache=model cache
     pub source: MbdPipeSource,
@@ -146,7 +149,8 @@ struct MbdPipeModeDefaults {
 impl MbdPipeModeDefaults {
     fn for_mode(mode: MbdPipeMode) -> Self {
         match mode {
-            MbdPipeMode::Construction => Self {
+            // layout_first 与 construction 使用同一套几何/标注默认；layout 结果由前端或其它查询参数控制
+            MbdPipeMode::LayoutFirst | MbdPipeMode::Construction => Self {
                 include_dims: true,
                 include_chain_dims: true,
                 include_overall_dim: false,
@@ -2639,6 +2643,31 @@ mod tests {
     fn test_mbd_pipe_mode_inspection_can_deserialize() {
         let mode: MbdPipeMode = serde_json::from_value(json!("inspection")).unwrap();
         assert_eq!(mode, MbdPipeMode::Inspection);
+    }
+
+    #[test]
+    fn test_mbd_pipe_mode_layout_first_can_deserialize() {
+        let mode: MbdPipeMode = serde_json::from_value(json!("layout_first")).unwrap();
+        assert_eq!(mode, MbdPipeMode::LayoutFirst);
+    }
+
+    #[test]
+    fn test_mbd_pipe_query_resolve_layout_first_defaults_match_construction() {
+        let lf = MbdPipeQuery {
+            mode: Some(MbdPipeMode::LayoutFirst),
+            ..Default::default()
+        }
+        .resolve();
+        let cons = MbdPipeQuery {
+            mode: Some(MbdPipeMode::Construction),
+            ..Default::default()
+        }
+        .resolve();
+        assert_eq!(lf.mode, MbdPipeMode::LayoutFirst);
+        assert_eq!(cons.mode, MbdPipeMode::Construction);
+        assert_eq!(lf.include_dims, cons.include_dims);
+        assert_eq!(lf.include_chain_dims, cons.include_chain_dims);
+        assert_eq!(lf.include_welds, cons.include_welds);
     }
 
     #[test]

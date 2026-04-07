@@ -51,6 +51,13 @@ pub async fn run_init_project_mode(
     db_option_ext: DbOptionExt,
     cli_dbnums: Option<Vec<u32>>,
 ) -> Result<()> {
+    let configured_dbnums = db_option_ext
+        .inner
+        .manual_db_nums
+        .clone()
+        .filter(|values| !values.is_empty());
+    let ignore_manual_dbnums = configured_dbnums.is_none();
+
     println!(
         "🚀 开始初始化项目: project={} ns={}",
         db_option_ext.inner.project_name, db_option_ext.inner.surreal_ns
@@ -59,7 +66,7 @@ pub async fn run_init_project_mode(
     println!(
         "🌲 第 1 步：生成 scene_tree（DESI indextree：output/<项目>/scene_tree/*.tree + db_meta_info.json）"
     );
-    generate_desi_indextree(true).context("scene_tree / DESI indextree 生成失败")?;
+    generate_desi_indextree(ignore_manual_dbnums).context("scene_tree / DESI indextree 生成失败")?;
 
     println!("🔌 第 2 步：连接 SurrealDB 并从磁盘加载 db_meta（校验 scene_tree 元数据）");
     aios_core::init_surreal()
@@ -70,7 +77,7 @@ pub async fn run_init_project_mode(
         .context("加载 db_meta_info.json 失败（确认第 1 步已写出 scene_tree）")?;
 
     let discovered_dbnums = db_meta().get_all_dbnums();
-    let dbnums = resolve_target_dbnums(cli_dbnums, discovered_dbnums)?;
+    let dbnums = resolve_target_dbnums(cli_dbnums.or(configured_dbnums), discovered_dbnums)?;
     println!(
         "🎯 第 3 步：目标 dbnums（将刷新其 pe_transform）: {:?}",
         dbnums

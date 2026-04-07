@@ -13,6 +13,7 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use serde_json::Value;
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 use tracing::{info, warn};
@@ -849,23 +850,158 @@ fn parse_datetime_value(dt: &Option<surrealdb::types::Datetime>) -> i64 {
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
 }
 
-async fn lookup_task_form_id(id: &str) -> Option<String> {
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+#[derive(Debug, Clone)]
+struct TaskRecordContext {
+    form_id: String,
+    current_node: String,
+}
+
+async fn lookup_task_record_context(id: &str) -> Option<TaskRecordContext> {
     #[derive(Debug, Deserialize, SurrealValue)]
-    struct TaskFormRow {
+    struct TaskContextRow {
         form_id: Option<String>,
+        current_node: Option<String>,
     }
 
     let mut resp = project_primary_db()
-        .query("SELECT form_id FROM review_tasks WHERE record::id(id) = $id LIMIT 1")
+        .query(
+            "SELECT form_id, current_node FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1",
+        )
         .bind(("id", id.to_string()))
         .await
         .ok()?;
-    let rows: Vec<TaskFormRow> = resp.take(0).unwrap_or_default();
-    rows.into_iter()
-        .next()
-        .and_then(|row| row.form_id)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    let rows: Vec<TaskContextRow> = resp.take(0).unwrap_or_default();
+    let row = rows.into_iter().next()?;
+    let form_id = normalize_optional_string(row.form_id)?;
+    let current_node = normalize_optional_string(row.current_node).unwrap_or_else(default_current_node);
+    Some(TaskRecordContext {
+        form_id,
+        current_node,
+    })
+}
+
+fn record_id_to_string(id: surrealdb::types::RecordId) -> String {
+    match id.key {
+        surrealdb::types::RecordIdKey::String(value) => value,
+        other => format!("{:?}", other),
+    }
+}
+
+fn json_scalar_to_string(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn json_value_sort_key(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let id = map
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let created_at = map
+                .get("createdAt")
+                .or_else(|| map.get("created_at"))
+                .map(json_scalar_to_string)
+                .unwrap_or_default();
+            let kind = map
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            format!("{}|{}|{}|{}", id, created_at, kind, value)
+        }
+        _ => value.to_string(),
+    }
+}
+
+fn normalize_snapshot_json(value: Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            let mut normalized = values
+                .into_iter()
+                .map(normalize_snapshot_json)
+                .collect::<Vec<_>>();
+            if normalized.iter().all(Value::is_string) {
+                normalized.sort_by(|a, b| {
+                    a.as_str()
+                        .unwrap_or_default()
+                        .cmp(b.as_str().unwrap_or_default())
+                });
+            } else if normalized.iter().all(Value::is_object) {
+                normalized.sort_by(|a, b| json_value_sort_key(a).cmp(&json_value_sort_key(b)));
+            }
+            Value::Array(normalized)
+        }
+        Value::Object(map) => {
+            let mut entries = map.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut normalized = serde_json::Map::new();
+            for (key, child) in entries {
+                normalized.insert(key, normalize_snapshot_json(child));
+            }
+            Value::Object(normalized)
+        }
+        other => other,
+    }
+}
+
+fn build_confirmed_record_slot_key(form_id: &str, current_node: &str, operator_id: &str) -> String {
+    format!(
+        "{}::{}::{}",
+        form_id.trim(),
+        current_node.trim(),
+        operator_id.trim()
+    )
+}
+
+fn build_confirmed_record_stable_id(slot_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(slot_key.as_bytes());
+    format!("slot-{}", hex::encode(hasher.finalize()))
+}
+
+fn build_confirmed_record_snapshot_hash(
+    record_type: &str,
+    annotations: &[serde_json::Value],
+    cloud_annotations: &[serde_json::Value],
+    rect_annotations: &[serde_json::Value],
+    obb_annotations: &[serde_json::Value],
+    measurements: &[serde_json::Value],
+    note: &str,
+) -> String {
+    let normalized = normalize_snapshot_json(serde_json::json!({
+        "type": record_type,
+        "annotations": annotations,
+        "cloudAnnotations": cloud_annotations,
+        "rectAnnotations": rect_annotations,
+        "obbAnnotations": obb_annotations,
+        "measurements": measurements,
+        "note": note,
+    }));
+    let serialized = serde_json::to_string(&normalized).unwrap_or_else(|_| normalized.to_string());
+    let mut hasher = Sha256::new();
+    hasher.update(serialized.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+async fn lookup_task_form_id(id: &str) -> Option<String> {
+    lookup_task_record_context(id).await.map(|context| context.form_id)
 }
 
 // ============================================================================
@@ -1692,6 +1828,7 @@ pub struct ConfirmedRecordResponse {
 pub struct ConfirmedRecordWithMeta {
     pub id: String,
     pub task_id: String,
+    pub form_id: String,
     pub r#type: String,
     pub annotations: Vec<serde_json::Value>,
     pub cloud_annotations: Vec<serde_json::Value>,
@@ -1702,23 +1839,52 @@ pub struct ConfirmedRecordWithMeta {
     pub confirmed_at: i64,
 }
 
+#[derive(Debug, Deserialize, SurrealValue)]
+struct ReviewRecordRow {
+    id: surrealdb::types::RecordId,
+    task_id: Option<String>,
+    form_id: Option<String>,
+    r#type: Option<String>,
+    annotations: Option<Vec<serde_json::Value>>,
+    cloud_annotations: Option<Vec<serde_json::Value>>,
+    rect_annotations: Option<Vec<serde_json::Value>>,
+    obb_annotations: Option<Vec<serde_json::Value>>,
+    measurements: Option<Vec<serde_json::Value>>,
+    note: Option<String>,
+    confirmed_at: Option<surrealdb::types::Datetime>,
+    current_node: Option<String>,
+    operator_id: Option<String>,
+    operator_name: Option<String>,
+    slot_key: Option<String>,
+    snapshot_hash: Option<String>,
+}
+
+fn confirmed_record_with_meta_from_row(row: ReviewRecordRow) -> ConfirmedRecordWithMeta {
+    ConfirmedRecordWithMeta {
+        id: record_id_to_string(row.id),
+        task_id: row.task_id.unwrap_or_default(),
+        form_id: row.form_id.unwrap_or_default(),
+        r#type: row.r#type.unwrap_or_else(|| "batch".to_string()),
+        annotations: row.annotations.unwrap_or_default(),
+        cloud_annotations: row.cloud_annotations.unwrap_or_default(),
+        rect_annotations: row.rect_annotations.unwrap_or_default(),
+        obb_annotations: row.obb_annotations.unwrap_or_default(),
+        measurements: row.measurements.unwrap_or_default(),
+        note: row.note.unwrap_or_default(),
+        confirmed_at: parse_datetime_value(&row.confirmed_at),
+    }
+}
+
 /// POST /api/review/records - 保存确认记录
-async fn create_record(Json(request): Json<ConfirmedRecordData>) -> impl IntoResponse {
+async fn create_record(
+    Extension(claims): Extension<TokenClaims>,
+    Json(request): Json<ConfirmedRecordData>,
+) -> impl IntoResponse {
     info!("Creating confirmed record for task: {}", request.task_id);
 
-    let form_id = request
-        .form_id
-        .clone()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let form_id = match form_id {
-        Some(value) => Some(value),
-        None => lookup_task_form_id(&request.task_id).await,
-    };
-
-    let Some(form_id) = form_id else {
+    let Some(task_context) = lookup_task_record_context(&request.task_id).await else {
         warn!(
-            "Failed to resolve form_id for confirmed record: task_id={}",
+            "Failed to resolve task context for confirmed record: task_id={}",
             request.task_id
         );
         return (
@@ -1728,17 +1894,144 @@ async fn create_record(Json(request): Json<ConfirmedRecordData>) -> impl IntoRes
                 record: None,
                 records: None,
                 error_message: Some(
-                    "保存记录失败：未找到 form_id，确认记录必须与单据 form_id 关联".to_string(),
+                    "保存记录失败：未找到当前校审任务，无法解析 form_id 与流程节点".to_string(),
                 ),
             }),
         );
     };
 
-    let record_id = format!("record-{}", uuid::Uuid::new_v4());
+    let operator_id = claims.user_id.trim().to_string();
+    if operator_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ConfirmedRecordResponse {
+                success: false,
+                record: None,
+                records: None,
+                error_message: Some("保存记录失败：当前用户身份无效".to_string()),
+            }),
+        );
+    }
 
-    let sql = r#"
-        CREATE review_records CONTENT {
-            id: $id,
+    let form_id = task_context.form_id;
+    let current_node = task_context.current_node;
+    let operator_name = preferred_name(Some(claims.user_name.as_str()), claims.user_id.as_str());
+    let record_type = if request.r#type.trim().is_empty() {
+        "batch".to_string()
+    } else {
+        request.r#type.trim().to_string()
+    };
+    let note = request.note.trim().to_string();
+    let slot_key = build_confirmed_record_slot_key(&form_id, &current_node, &operator_id);
+    let snapshot_hash = build_confirmed_record_snapshot_hash(
+        &record_type,
+        &request.annotations,
+        &request.cloud_annotations,
+        &request.rect_annotations,
+        &request.obb_annotations,
+        &request.measurements,
+        &note,
+    );
+    let record_id = build_confirmed_record_stable_id(&slot_key);
+
+    let existing_row = match project_primary_db()
+        .query("SELECT * FROM review_records WHERE record::id(id) = $id LIMIT 1")
+        .bind(("id", record_id.clone()))
+        .await
+    {
+        Ok(mut response) => {
+            let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
+            rows.into_iter().next()
+        }
+        Err(e) => {
+            warn!("Failed to query existing confirmed record: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ConfirmedRecordResponse {
+                    success: false,
+                    record: None,
+                    records: None,
+                    error_message: Some(format!("查询已确认记录失败: {}", e)),
+                }),
+            );
+        }
+    };
+
+    if let Some(existing_row) = existing_row {
+        if existing_row.snapshot_hash.as_deref() == Some(snapshot_hash.as_str()) {
+            info!(
+                "Confirmed record no-op: task_id={}, slot_key={}",
+                request.task_id, slot_key
+            );
+            match project_primary_db()
+                .query(
+                    r#"
+                    UPDATE type::record('review_records', $id) MERGE {
+                        task_id: $task_id,
+                        form_id: $form_id,
+                        type: $type,
+                        annotations: $annotations,
+                        cloud_annotations: $cloud_annotations,
+                        rect_annotations: $rect_annotations,
+                        obb_annotations: $obb_annotations,
+                        measurements: $measurements,
+                        note: $note,
+                        current_node: $current_node,
+                        operator_id: $operator_id,
+                        operator_name: $operator_name,
+                        slot_key: $slot_key,
+                        snapshot_hash: $snapshot_hash
+                    } RETURN AFTER
+                    "#,
+                )
+                .bind(("id", record_id.clone()))
+                .bind(("task_id", request.task_id.clone()))
+                .bind(("form_id", form_id.clone()))
+                .bind(("type", record_type.clone()))
+                .bind(("annotations", request.annotations.clone()))
+                .bind(("cloud_annotations", request.cloud_annotations.clone()))
+                .bind(("rect_annotations", request.rect_annotations.clone()))
+                .bind(("obb_annotations", request.obb_annotations.clone()))
+                .bind(("measurements", request.measurements.clone()))
+                .bind(("note", note.clone()))
+                .bind(("current_node", current_node.clone()))
+                .bind(("operator_id", operator_id.clone()))
+                .bind(("operator_name", operator_name.clone()))
+                .bind(("slot_key", slot_key.clone()))
+                .bind(("snapshot_hash", snapshot_hash.clone()))
+                .await
+            {
+                Ok(mut response) => {
+                    let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
+                    let row = rows.into_iter().next().unwrap_or(existing_row);
+                    return (
+                        StatusCode::OK,
+                        Json(ConfirmedRecordResponse {
+                            success: true,
+                            record: Some(confirmed_record_with_meta_from_row(row)),
+                            records: None,
+                            error_message: None,
+                        }),
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to refresh no-op confirmed record context: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ConfirmedRecordResponse {
+                            success: false,
+                            record: None,
+                            records: None,
+                            error_message: Some(format!("更新已确认记录上下文失败: {}", e)),
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    let upsert_sql = r#"
+        UPSERT type::record('review_records', $id) CONTENT {
             task_id: $task_id,
             form_id: $form_id,
             type: $type,
@@ -1748,49 +2041,64 @@ async fn create_record(Json(request): Json<ConfirmedRecordData>) -> impl IntoRes
             obb_annotations: $obb_annotations,
             measurements: $measurements,
             note: $note,
+            current_node: $current_node,
+            operator_id: $operator_id,
+            operator_name: $operator_name,
+            slot_key: $slot_key,
+            snapshot_hash: $snapshot_hash,
             confirmed_at: time::now()
-        }
+        } RETURN AFTER
     "#;
 
     match project_primary_db()
-        .query(sql)
+        .query(upsert_sql)
         .bind(("id", record_id.clone()))
         .bind(("task_id", request.task_id.clone()))
         .bind(("form_id", form_id))
-        .bind(("type", request.r#type.clone()))
+        .bind(("type", record_type))
         .bind(("annotations", request.annotations.clone()))
         .bind(("cloud_annotations", request.cloud_annotations.clone()))
         .bind(("rect_annotations", request.rect_annotations.clone()))
         .bind(("obb_annotations", request.obb_annotations.clone()))
         .bind(("measurements", request.measurements.clone()))
-        .bind(("note", request.note.clone()))
+        .bind(("note", note))
+        .bind(("current_node", current_node))
+        .bind(("operator_id", operator_id))
+        .bind(("operator_name", operator_name))
+        .bind(("slot_key", slot_key))
+        .bind(("snapshot_hash", snapshot_hash))
         .await
     {
-        Ok(_) => {
-            let record = ConfirmedRecordWithMeta {
-                id: record_id,
-                task_id: request.task_id,
-                r#type: request.r#type,
-                annotations: request.annotations,
-                cloud_annotations: request.cloud_annotations,
-                rect_annotations: request.rect_annotations,
-                obb_annotations: request.obb_annotations,
-                measurements: request.measurements,
-                note: request.note,
-                confirmed_at: chrono::Utc::now().timestamp_millis(),
-            };
-            (
-                StatusCode::OK,
-                Json(ConfirmedRecordResponse {
-                    success: true,
-                    record: Some(record),
-                    records: None,
-                    error_message: None,
-                }),
-            )
+        Ok(mut response) => {
+            let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
+            if let Some(row) = rows.into_iter().next() {
+                (
+                    StatusCode::OK,
+                    Json(ConfirmedRecordResponse {
+                        success: true,
+                        record: Some(confirmed_record_with_meta_from_row(row)),
+                        records: None,
+                        error_message: None,
+                    }),
+                )
+            } else {
+                warn!(
+                    "Confirmed record upsert returned empty result: task_id={}, record_id={}",
+                    request.task_id, record_id
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ConfirmedRecordResponse {
+                        success: false,
+                        record: None,
+                        records: None,
+                        error_message: Some("保存记录失败：数据库未返回确认记录".to_string()),
+                    }),
+                )
+            }
         }
         Err(e) => {
-            warn!("Failed to create record: {}", e);
+            warn!("Failed to upsert record: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ConfirmedRecordResponse {
@@ -1808,20 +2116,6 @@ async fn create_record(Json(request): Json<ConfirmedRecordData>) -> impl IntoRes
 async fn get_records_by_task(Path(task_id): Path<String>) -> impl IntoResponse {
     info!("Getting records for task: {}", task_id);
 
-    #[derive(Debug, Deserialize, SurrealValue)]
-    struct RecordRow {
-        id: surrealdb::types::RecordId,
-        task_id: Option<String>,
-        r#type: Option<String>,
-        annotations: Option<Vec<serde_json::Value>>,
-        cloud_annotations: Option<Vec<serde_json::Value>>,
-        rect_annotations: Option<Vec<serde_json::Value>>,
-        obb_annotations: Option<Vec<serde_json::Value>>,
-        measurements: Option<Vec<serde_json::Value>>,
-        note: Option<String>,
-        confirmed_at: Option<surrealdb::types::Datetime>,
-    }
-
     let sql = "SELECT * FROM review_records WHERE task_id = $task_id ORDER BY confirmed_at DESC";
 
     match project_primary_db()
@@ -1830,21 +2124,10 @@ async fn get_records_by_task(Path(task_id): Path<String>) -> impl IntoResponse {
         .await
     {
         Ok(mut response) => {
-            let rows: Vec<RecordRow> = response.take(0).unwrap_or_default();
+            let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
             let records: Vec<ConfirmedRecordWithMeta> = rows
                 .into_iter()
-                .map(|r| ConfirmedRecordWithMeta {
-                    id: format!("{:?}", r.id.key),
-                    task_id: r.task_id.unwrap_or_default(),
-                    r#type: r.r#type.unwrap_or_else(|| "batch".to_string()),
-                    annotations: r.annotations.unwrap_or_default(),
-                    cloud_annotations: r.cloud_annotations.unwrap_or_default(),
-                    rect_annotations: r.rect_annotations.unwrap_or_default(),
-                    obb_annotations: r.obb_annotations.unwrap_or_default(),
-                    measurements: r.measurements.unwrap_or_default(),
-                    note: r.note.unwrap_or_default(),
-                    confirmed_at: parse_datetime_value(&r.confirmed_at),
-                })
+                .map(confirmed_record_with_meta_from_row)
                 .collect();
 
             (
@@ -3444,20 +3727,6 @@ async fn export_review_data(Json(request): Json<ExportRequest>) -> impl IntoResp
     // 可选导出确认记录（按 task_id 过滤）
     let include_records = request.include_records.unwrap_or(false);
     let records: Option<Vec<ConfirmedRecordWithMeta>> = if include_records {
-        #[derive(Debug, Deserialize, SurrealValue)]
-        struct RecordRow {
-            id: surrealdb::types::RecordId,
-            task_id: Option<String>,
-            r#type: Option<String>,
-            annotations: Option<Vec<serde_json::Value>>,
-            cloud_annotations: Option<Vec<serde_json::Value>>,
-            rect_annotations: Option<Vec<serde_json::Value>>,
-            obb_annotations: Option<Vec<serde_json::Value>>,
-            measurements: Option<Vec<serde_json::Value>>,
-            note: Option<String>,
-            confirmed_at: Option<surrealdb::types::Datetime>,
-        }
-
         if task_ids.is_empty() {
             Some(vec![])
         } else {
@@ -3468,21 +3737,10 @@ async fn export_review_data(Json(request): Json<ExportRequest>) -> impl IntoResp
                 .await
             {
                 Ok(mut resp) => {
-                    let rows: Vec<RecordRow> = resp.take(0).unwrap_or_default();
+                    let rows: Vec<ReviewRecordRow> = resp.take(0).unwrap_or_default();
                     Some(
                         rows.into_iter()
-                            .map(|r| ConfirmedRecordWithMeta {
-                                id: format!("{:?}", r.id.key),
-                                task_id: r.task_id.unwrap_or_default(),
-                                r#type: r.r#type.unwrap_or_else(|| "batch".to_string()),
-                                annotations: r.annotations.unwrap_or_default(),
-                                cloud_annotations: r.cloud_annotations.unwrap_or_default(),
-                                rect_annotations: r.rect_annotations.unwrap_or_default(),
-                                obb_annotations: r.obb_annotations.unwrap_or_default(),
-                                measurements: r.measurements.unwrap_or_default(),
-                                note: r.note.unwrap_or_default(),
-                                confirmed_at: parse_datetime_value(&r.confirmed_at),
-                            })
+                            .map(confirmed_record_with_meta_from_row)
                             .collect(),
                     )
                 }

@@ -24,13 +24,13 @@ FILES CHANGED (3)
    - Added BUILD_INFO.txt metadata (features, deploy-ready flag)
    - Added GitHub Release creation on version tags
 
-2. shells/deploy_web_server_bundle.sh
+2. shells/deploy/deploy_web_server_bundle.sh
    - Enhanced artifact download: added --repo flag
    - Enhanced release download: added --repo flag
    - Added BUILD_INFO.txt display during deployment
    - Improved error messages and debugging output
 
-3. shells/deploy_all_with_frontend.sh
+3. shells/deploy/deploy_all_with_frontend.sh
    - Added deployment method environment variables
    - Added inline usage documentation
    - Enhanced logging with deployment source
@@ -73,15 +73,15 @@ FEATURE PARITY ACHIEVED:
 DEPLOYMENT METHODS:
 
   1. Local Build (default, preserved)
-     ./shells/deploy_all_with_frontend.sh
+     ./shells/deploy/deploy_all_with_frontend.sh
 
   2. GitHub Artifact (NEW)
      BINARY_SOURCE=github-artifact GITHUB_RUN_ID=12345678 \
-       ./shells/deploy_all_with_frontend.sh
+       ./shells/deploy/deploy_all_with_frontend.sh
 
   3. GitHub Release (NEW)
      BINARY_SOURCE=github-release GITHUB_TAG=v1.2.3 \
-       ./shells/deploy_all_with_frontend.sh
+       ./shells/deploy/deploy_all_with_frontend.sh
 
 BUILD METADATA:
 
@@ -119,7 +119,7 @@ Before Production Deployment:
 
 3. Test deployment to production
    BINARY_SOURCE=github-artifact GITHUB_RUN_ID=<ID> \
-     ./shells/deploy_all_with_frontend.sh
+     ./shells/deploy/deploy_all_with_frontend.sh
 
 4. Verify service health
    - Automatic: Script performs health checks
@@ -162,8 +162,8 @@ COMMANDS RUN DURING IMPLEMENTATION
 ================================================================================
 
 Syntax Validation:
-  bash -n /Volumes/DPC/work/plant-code/plant-model-gen/shells/deploy_web_server_bundle.sh
-  bash -n /Volumes/DPC/work/plant-code/plant-model-gen/shells/deploy_all_with_frontend.sh
+  bash -n /Volumes/DPC/work/plant-code/plant-model-gen/shells/deploy/deploy_web_server_bundle.sh
+  bash -n /Volumes/DPC/work/plant-code/plant-model-gen/shells/deploy/deploy_all_with_frontend.sh
   python3 -c "import yaml; yaml.safe_load(open('.github/workflows/multi-platform-build.yml'))"
 
 All commands: PASSED ✓

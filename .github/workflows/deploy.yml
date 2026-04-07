@@ -155,7 +155,7 @@ jobs:
         run: |
           mkdir -p deploy/web-server
           cp ./release/web_server deploy/web-server/
-          cp DbOption.toml deploy/web-server/
+          cp db_options/DbOption-mac.toml deploy/web-server/DbOption.toml
           cp -r assets deploy/web-server/ 2>/dev/null || true
           cp -r data deploy/web-server/ 2>/dev/null || true
           cp -r web-test deploy/web-server/ 2>/dev/null || true
@@ -196,7 +196,7 @@ jobs:
         run: |
           mkdir -p deploy/web-server
           cp ./release/web_server.exe deploy/web-server/
-          cp DbOption.toml deploy/web-server/ 2>/dev/null || true
+          cp db_options/DbOption-mac.toml deploy/web-server/DbOption.toml 2>/dev/null || true
           cp -r assets deploy/web-server/ 2>/dev/null || true
           cp -r data deploy/web-server/ 2>/dev/null || true
           cp -r web-test deploy/web-server/ 2>/dev/null || true

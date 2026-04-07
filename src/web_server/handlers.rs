@@ -357,6 +357,72 @@ fn analyze_spatial_error_msg(error_msg: &str) -> (String, Vec<String>) {
 
 // ================= Projects API & Schema =================
 
+/// 将 Surreal 返回的 `id` 字段尽量转为 `table:id` 字符串（兼容字符串或嵌套 JSON）。
+fn json_to_opt_record_id_string(v: &serde_json::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    let obj = v.as_object()?;
+    let tb = obj.get("tb").and_then(|x| x.as_str())?;
+    let idpart = obj.get("id")?;
+    if let Some(s) = idpart.as_str() {
+        return Some(format!("{tb}:{s}"));
+    }
+    if let Some(inner) = idpart.as_object() {
+        if let Some(s) = inner.get("String").and_then(|x| x.as_str()) {
+            return Some(format!("{tb}:{s}"));
+        }
+    }
+    None
+}
+
+/// `table:record_id` 形态（如 `projects:d8o84vhej37zdvt96ag0`），用于识别误写入 `name` 的 Surreal 记录 id。
+fn looks_like_surreal_table_record_id(s: &str) -> bool {
+    let s = s.trim();
+    let Some((table, rest)) = s.split_once(':') else {
+        return false;
+    };
+    if table.is_empty() || rest.is_empty() {
+        return false;
+    }
+    if !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || !rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return false;
+    }
+    true
+}
+
+/// 前端 `output_project` / `/files/output/<name>/` 必须使用人类可读工程名。
+/// 若 DB 误将 `name` 存成记录 id 或与 `id` 相同，则用 DbOption 的 `project_name` / `included_projects` 兜底。
+fn normalize_project_item_output_name(raw_name: &str, record_id: Option<&str>) -> String {
+    let raw_name = raw_name.trim();
+    if raw_name.is_empty() {
+        return String::new();
+    }
+    let mistaken = looks_like_surreal_table_record_id(raw_name)
+        || record_id.is_some_and(|rid| rid == raw_name);
+    if !mistaken {
+        return raw_name.to_string();
+    }
+    let opt = aios_core::get_db_option();
+    let pn = opt.project_name.trim();
+    if !pn.is_empty() {
+        return pn.to_string();
+    }
+    for p in &opt.included_projects {
+        let p = p.trim();
+        if p.is_empty() || looks_like_surreal_table_record_id(p) {
+            continue;
+        }
+        return p.to_string();
+    }
+    if let Some(first) = opt.included_projects.first() {
+        return first.trim().to_string();
+    }
+    raw_name.to_string()
+}
+
 /// 初始化 projects 表结构（若存在则忽略错误）
 pub async fn ensure_projects_schema() {
     let defines = r#"
@@ -512,10 +578,13 @@ pub async fn api_get_projects(
         Ok(mut resp) => {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             for row in rows {
-                let id = row["id"].as_str().map(|s| s.to_string());
+                let id = json_to_opt_record_id_string(&row["id"]);
+                let raw_name = row["name"].as_str().unwrap_or("").to_string();
+                let name = normalize_project_item_output_name(&raw_name, id.as_deref());
+                let show_dbnum = project_show_dbnum(&name);
                 let item = ProjectItem {
                     id,
-                    name: row["name"].as_str().unwrap_or("").to_string(),
+                    name,
                     version: row["version"].as_str().map(|s| s.to_string()),
                     url: row["url"].as_str().map(|s| s.to_string()),
                     env: row["env"].as_str().map(|s| s.to_string()),
@@ -532,7 +601,7 @@ pub async fn api_get_projects(
                     last_health_check: row["last_health_check"].as_str().map(|s| s.to_string()),
                     created_at: row["created_at"].as_str().map(|s| s.to_string()),
                     updated_at: row["updated_at"].as_str().map(|s| s.to_string()),
-                    show_dbnum: project_show_dbnum(row["name"].as_str().unwrap_or("")),
+                    show_dbnum,
                 };
                 if !item.name.is_empty() {
                     items.push(item);

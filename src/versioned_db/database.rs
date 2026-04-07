@@ -18,9 +18,9 @@ use aios_core::tool::hash_tool::hash_str;
 use aios_core::types::*;
 use chrono::Local;
 use dashmap::{DashMap, DashSet};
-use futures::StreamExt;
 use futures::channel::mpsc::unbounded;
 use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use itertools::Itertools;
 use parse_pdms_db::parse::*;
 use pdms_io::io::PdmsIO;
@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::fs;
-use tokio::fs::{File, create_dir_all};
+use tokio::fs::{create_dir_all, File};
 use tokio::io::AsyncReadExt;
 use tokio::sync::OnceCell;
 // use tokio::sync::mpsc::Sender;
@@ -55,7 +55,7 @@ use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::tables::*;
 use crate::versioned_db::db_meta_info;
 use crate::versioned_db::pe::*;
-use crate::versioned_db::tree_export::{TreeNodeMeta, export_tree_file};
+use crate::versioned_db::tree_export::{export_tree_file, TreeNodeMeta};
 
 pub enum SenderJsonsData {
     PEJson(Vec<String>),
@@ -108,6 +108,132 @@ fn resolve_single_indextree_chunk_size(db_option: &DbOption) -> usize {
     env_usize("AIOS_INDEXTREE_SINGLE_CHUNK_SIZE")
         .unwrap_or(db_option.att_chunk as usize)
         .max(1)
+}
+
+const SYSTEM_SYNC_DB_TYPES: &[&str] = &["DICT", "SYST", "GLB", "GLOB"];
+const DEFAULT_DATA_SYNC_DB_TYPES: &[&str] = &["DESI", "CATA"];
+
+fn collect_project_db_files(project_dir: impl AsRef<Path>) -> anyhow::Result<Vec<PathBuf>> {
+    let project_dir = project_dir.as_ref();
+    let mut children_files = {
+        let target_dir = std::fs::read_dir(project_dir)?
+            .into_iter()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                entry.path()
+            })
+            .find(|x| x.is_dir() && x.file_name().unwrap().to_str().unwrap().ends_with("000"))
+            .ok_or_else(|| anyhow::anyhow!("项目目录下未找到 000 数据目录: {}", project_dir.display()))?;
+        std::fs::read_dir(target_dir)?
+            .into_iter()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                entry.path()
+            })
+            .collect::<Vec<PathBuf>>()
+    };
+
+    let mut file_map = HashMap::new();
+    for path in children_files.iter() {
+        let file_name = path.file_stem().unwrap().to_str().unwrap();
+        if let Some(base_name) = file_name.strip_suffix("_0001") {
+            file_map.insert(base_name.to_string(), path.clone());
+        } else if !file_map.contains_key(file_name) {
+            file_map.insert(file_name.to_string(), path.clone());
+        }
+    }
+
+    children_files = file_map.into_values().collect();
+    children_files.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+    Ok(children_files)
+}
+
+fn selected_db_file_names(db_option: &DbOption) -> HashSet<String> {
+    let mut selected = HashSet::new();
+    if let Some(files) = &db_option.included_db_files {
+        for file in files {
+            let trimmed = file.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            selected.insert(trimmed.to_string());
+            if let Some(stem) = Path::new(trimmed)
+                .file_stem()
+                .and_then(|value| value.to_str())
+            {
+                selected.insert(stem.to_string());
+            }
+        }
+    }
+    selected
+}
+
+fn selected_dbnums(db_option: &DbOption) -> HashSet<u32> {
+    db_option
+        .manual_db_nums
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|dbnum| *dbnum > 0)
+        .collect()
+}
+
+fn should_process_sync_file(
+    file_name: &str,
+    dbnum: u32,
+    selected_file_names: &HashSet<String>,
+    selected_dbnums: &HashSet<u32>,
+    force_include: bool,
+) -> bool {
+    if force_include {
+        return true;
+    }
+    if !selected_file_names.is_empty() {
+        return selected_file_names.contains(file_name);
+    }
+    if !selected_dbnums.is_empty() {
+        return selected_dbnums.contains(&dbnum);
+    }
+    true
+}
+
+fn resolve_data_sync_db_types(db_option: &DbOption, project: &str) -> anyhow::Result<Vec<String>> {
+    let selected_file_names = selected_db_file_names(db_option);
+    let selected_dbnums = selected_dbnums(db_option);
+    if selected_file_names.is_empty() && selected_dbnums.is_empty() {
+        return Ok(DEFAULT_DATA_SYNC_DB_TYPES
+            .iter()
+            .map(|value| value.to_string())
+            .collect());
+    }
+
+    let project_dir = db_option
+        .get_project_path(project)
+        .ok_or_else(|| anyhow::anyhow!("项目路径不存在: {}", project))?;
+    let mut db_types = BTreeSet::new();
+    for path in collect_project_db_files(&project_dir)? {
+        let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
+        if file_name.contains('.') {
+            continue;
+        }
+        let mut file = std::fs::File::open(&path)?;
+        let mut buf = [0u8; 60];
+        file.read_exact(&mut buf)?;
+        let db_basic_info = parse_file_basic_info(&buf);
+        if !should_process_sync_file(
+            &file_name,
+            db_basic_info.dbnum,
+            &selected_file_names,
+            &selected_dbnums,
+            false,
+        ) {
+            continue;
+        }
+        if !SYSTEM_SYNC_DB_TYPES.contains(&db_basic_info.db_type.as_str()) {
+            db_types.insert(db_basic_info.db_type);
+        }
+    }
+    Ok(db_types.into_iter().collect())
 }
 
 /// 兼容旧版 pdms_io：缺少 `sync_history` 时降级为 no-op，避免阻塞 web_server 编译。
@@ -300,6 +426,8 @@ where
     for (project_index, project) in db_option.included_projects.iter().enumerate() {
         // 解析时不应该受 debug_model_refnos 影响，只用于模型生成调试
         let debug_refnos: Vec<RefU64> = Vec::new(); // 暂时禁用解析调试模式
+        let data_db_types = resolve_data_sync_db_types(db_option, project)?;
+        let data_db_types_refs = data_db_types.iter().map(String::as_str).collect::<Vec<_>>();
 
         // 统计项目中的文件数量
         let project_dir = db_option.get_project_path(&project).unwrap();
@@ -360,7 +488,7 @@ where
                 &db_option,
                 project,
                 cur_dbno_set,
-                &["DICT", "SYST", "GLB", "GLOB"],
+                SYSTEM_SYNC_DB_TYPES,
                 proj_progress_chunk,
                 &mut progress_callback,
                 project_index + 1,
@@ -386,24 +514,26 @@ where
             continue;
         }
 
-        let cur_dbno_set = dbno_set.clone();
-        match sync_total_async_threaded_with_callback(
-            &db_option,
-            project,
-            cur_dbno_set,
-            &["DESI", "CATA"],
-            proj_progress_chunk,
-            &mut progress_callback,
-            project_index + 1,
-            total_projects,
-        )
-        .await
-        {
-            Ok(_) => {
-                info!("同步数据成功。");
-            }
-            Err(e) => {
-                info!("{}", e.to_string());
+        if !data_db_types_refs.is_empty() {
+            let cur_dbno_set = Arc::new(DashSet::new());
+            match sync_total_async_threaded_with_callback(
+                &db_option,
+                project,
+                cur_dbno_set,
+                &data_db_types_refs,
+                proj_progress_chunk,
+                &mut progress_callback,
+                project_index + 1,
+                total_projects,
+            )
+            .await
+            {
+                Ok(_) => {
+                    info!("同步数据成功。");
+                }
+                Err(e) => {
+                    info!("{}", e.to_string());
+                }
             }
         }
     }
@@ -490,9 +620,11 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
     let proj_progress_chunk = 80 / db_option.included_projects.len();
     // 遍历所有包含的项目
     for project in &db_option.included_projects {
+        let data_db_types = resolve_data_sync_db_types(db_option, project)?;
+        let data_db_types_refs = data_db_types.iter().map(String::as_str).collect::<Vec<_>>();
         // 解析时不应该受 debug_model_refnos 影响，只用于模型生成调试
         let debug_refnos: Vec<RefU64> = Vec::new(); // 暂时禁用解析调试模式
-        //debug 不保存数据，只复杂查看属性值
+                                                    //debug 不保存数据，只复杂查看属性值
         let is_debug = !debug_refnos.is_empty();
         let cur_dbno_set = dbno_set.clone();
         if is_debug || db_option.only_sync_sys || db_option.total_sync {
@@ -501,7 +633,7 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
                 &db_option,
                 project,
                 cur_dbno_set,
-                &["DICT", "SYST", "GLB", "GLOB"],
+                SYSTEM_SYNC_DB_TYPES,
                 // progress_sender,
                 proj_progress_chunk,
             )
@@ -525,25 +657,27 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
         if db_option.only_sync_sys {
             continue;
         }
-        // 第二次调用使用新的 dbno_set，避免被第一次调用的 dbnum 过滤
-        let cur_dbno_set = Arc::new(DashSet::new());
-        match sync_total_async_threaded(
-            &db_option,
-            project,
-            cur_dbno_set,
-            &["DESI", "CATA"],
-            // progress_sender,
-            proj_progress_chunk,
-        )
-        .await
-        {
-            Ok(_) => {
-                // 同步数据成功
-                info!("同步DESI, CATA数据成功。");
-            }
-            Err(e) => {
-                // 同步数据失败，打印错误信息
-                info!("{}", e.to_string());
+        if !data_db_types_refs.is_empty() {
+            // 第二次调用使用新的 dbno_set，避免被第一次调用的 dbnum 过滤
+            let cur_dbno_set = Arc::new(DashSet::new());
+            match sync_total_async_threaded(
+                &db_option,
+                project,
+                cur_dbno_set,
+                &data_db_types_refs,
+                // progress_sender,
+                proj_progress_chunk,
+            )
+            .await
+            {
+                Ok(_) => {
+                    // 同步数据成功
+                    info!("同步数据成功。");
+                }
+                Err(e) => {
+                    // 同步数据失败，打印错误信息
+                    info!("{}", e.to_string());
+                }
             }
         }
     }
@@ -951,6 +1085,9 @@ where
     let is_sync_history = db_option.is_sync_history();
     let is_total_sync = db_option.total_sync;
     let sync_versioned = db_option.sync_versioned.unwrap_or(false);
+    let selected_file_names = selected_db_file_names(db_option);
+    let selected_dbnums = selected_dbnums(db_option);
+    let force_include = is_parse_sys && is_total_sync;
 
     for (file_idx, path) in children_files.into_iter().enumerate() {
         let total_files = total_files; // 仅为语义清晰
@@ -994,6 +1131,27 @@ where
         let db_basic_info = parse_file_basic_info(&buf);
         let db_type = db_basic_info.db_type;
         let dbnum = db_basic_info.dbnum;
+
+        if !should_process_sync_file(
+            &file_name,
+            dbnum,
+            &selected_file_names,
+            &selected_dbnums,
+            force_include,
+        ) {
+            if let Some(cb) = progress_callback.as_mut() {
+                cb(
+                    project.as_str(),
+                    current_project,
+                    total_projects,
+                    file_idx + 1,
+                    total_files,
+                    0,
+                    0,
+                );
+            }
+            continue;
+        }
 
         // 类型过滤
         if !db_types_clone.contains(&db_type) {
@@ -1357,7 +1515,7 @@ pub async fn sync_total_async_threaded(
     let mut is_replace = db_option_arc.replace_dbs; // 是否替换数据库的数据
     let replace_types = db_option_arc.replace_types.clone(); // 获取替换的类型列表
     let b_replace_types = replace_types.is_some(); // 是否存在替换的类型列表
-    // 是否保存到tidb
+                                                   // 是否保存到tidb
     let b_save_mysql = db_option_arc.sync_tidb.unwrap_or(false);
     if b_replace_types {
         is_replace = true;
@@ -1596,6 +1754,9 @@ pub async fn sync_total_async_threaded(
     let is_sync_history = db_option.is_sync_history();
     let is_total_sync = db_option.total_sync;
     let sync_versioned = db_option.sync_versioned.unwrap_or(false);
+    let selected_file_names = selected_db_file_names(db_option);
+    let selected_dbnums = selected_dbnums(db_option);
+    let force_include = is_parse_sys && is_total_sync;
 
     let sender_clone = sender.clone();
     let children_files_len = children_files.len();
@@ -1613,52 +1774,45 @@ pub async fn sync_total_async_threaded(
             let mut time = Instant::now();
             let scan_stage_start = Instant::now();
 
-            // 检查过滤条件
-            let condition1 = is_parse_sys && is_total_sync;
-            let condition2 = db_option_arc.included_db_files.is_none();
-            let condition3 = db_option_arc.included_db_files.as_ref()
-                .map(|v| v.is_empty())
-                .unwrap_or(false);
+            if !is_total_sync {
+                // progress_sender_clone.send(db_file_progress_chunk).await.unwrap();
+            }
+            // dbg!(&file_name);
+            let mut file = File::open(&path).await.unwrap();
+            let mut buf = vec![0u8; 60];
+            file.read_exact(&mut buf).await.unwrap();
+            let db_basic_info = parse_file_basic_info(&buf);
+            let db_type = db_basic_info.db_type;
 
-            if (is_parse_sys && is_total_sync)
-                || db_option_arc.included_db_files.is_none()
-                || condition3
-                || db_option_arc
-                    .included_db_files
-                    .as_ref()
-                    .unwrap()
-                    .contains(&file_name)
+            let dbnum = db_basic_info.dbnum;
+            if !should_process_sync_file(
+                &file_name,
+                dbnum,
+                &selected_file_names,
+                &selected_dbnums,
+                force_include,
+            ) {
+                continue;
+            }
+            //如果不是全部解析，需要检查类型，全部解析一定要解析syst等配置文件数据库
+            if !db_types_clone.contains(&db_type) {
+                continue;
+            }
+            println!("db_type is {db_type}");
+            //保证不重复加载相同dbno的数据
+            if dbno_set.contains(&dbnum) {
+                continue;
+            }
+            // dbg!(dbnum);
+            dbno_set.insert(dbnum);
+            // 如果需要解析的文件列表为空或包含当前文件名,则执行以下代码块
+            info!("path={:?}", &file_name); // 打印文件路径
+            let mut ses_range_map: BTreeMap<i32, Range<u32>> = BTreeMap::new();
+            let mut sesno = 0;
+            let mut sesno_timestamp: Option<i64> = None;
+            // let mut dt = Local::now().naive_local();
             {
-                if !is_total_sync {
-                    // progress_sender_clone.send(db_file_progress_chunk).await.unwrap();
-                }
-                // dbg!(&file_name);
-                let mut file = File::open(&path).await.unwrap();
-                let mut buf = vec![0u8; 60];
-                file.read_exact(&mut buf).await.unwrap();
-                let db_basic_info = parse_file_basic_info(&buf);
-                let db_type = db_basic_info.db_type;
-
-                let dbnum = db_basic_info.dbnum;
-                //如果不是全部解析，需要检查类型，全部解析一定要解析syst等配置文件数据库
-                if !db_types_clone.contains(&db_type) {
-                    continue;
-                }
-                println!("db_type is {db_type}");
-                //保证不重复加载相同dbno的数据
-                if dbno_set.contains(&dbnum) {
-                    continue;
-                }
-                // dbg!(dbnum);
-                dbno_set.insert(dbnum);
-                // 如果需要解析的文件列表为空或包含当前文件名,则执行以下代码块
-                info!("path={:?}", &file_name); // 打印文件路径
-                let mut ses_range_map: BTreeMap<i32, Range<u32>> = BTreeMap::new();
-                let mut sesno = 0;
-                let mut sesno_timestamp: Option<i64> = None;
-                // let mut dt = Local::now().naive_local();
-                {
-                    let mut io = PdmsIO::new(project.as_str(), path.clone(), true);
+                let mut io = PdmsIO::new(project.as_str(), path.clone(), true);
 
                     //打开文件
                     if io.open().is_ok() {
@@ -1998,19 +2152,18 @@ pub async fn sync_total_async_threaded(
                 }
                 let tree_export_ms = tree_export_stage_start.elapsed().as_millis();
 
-                info!(
-                    "解析任务完成 file={} dbnum={} 总耗时={:.3}s 总数量={} [scan={}ms, db_basic={}ms, chunk={}ms, tree_export={}ms, db_meta={}ms]",
-                    file_name,
-                    dbnum,
-                    time.elapsed().as_secs_f32(),
-                    total_cnt,
-                    file_scan_ms,
-                    db_basic_parse_ms,
-                    chunk_parse_ms,
-                    tree_export_ms,
-                    db_meta_update_ms
-                );
-            }
+            info!(
+                "解析任务完成 file={} dbnum={} 总耗时={:.3}s 总数量={} [scan={}ms, db_basic={}ms, chunk={}ms, tree_export={}ms, db_meta={}ms]",
+                file_name,
+                dbnum,
+                time.elapsed().as_secs_f32(),
+                total_cnt,
+                file_scan_ms,
+                db_basic_parse_ms,
+                chunk_parse_ms,
+                tree_export_ms,
+                db_meta_update_ms
+            );
             //单个文件多线程
             // if !handles.is_empty() {
             //     dbg!(handles.len());

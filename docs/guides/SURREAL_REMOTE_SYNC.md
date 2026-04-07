@@ -2,7 +2,7 @@
 
 ## 后端「数据库」指什么
 
-`plant-model-gen` 的 `web_server`（`/api/e3d/*`、图查询等）主要依赖 **SurrealDB**，连接信息来自部署到服务器的 `/root/DbOption.toml`（由 `shells/deploy_web_server_bundle.sh` 上传）。
+`plant-model-gen` 的 `web_server`（`/api/e3d/*`、图查询等）主要依赖 **SurrealDB**，连接信息来自部署到服务器的 `/root/DbOption.toml`（由 `shells/deploy/deploy_web_server_bundle.sh` 上传）。
 
 - **网络访问**：浏览器里 `plant3d-web` 的 `.env.production` 使用 `VITE_SURREAL_URL=ws://<公网IP>:8020`，因此服务器上需要 **Surreal 监听 `0.0.0.0:8020`**（或前面加反代，本文按直连 8020）。
 - **数据落盘**：Mac 上 `DbOption-mac.toml` 使用 RocksDB 存储目录（不是单文件）：
@@ -55,7 +55,7 @@ REMOTE_HOST=123.57.182.243 REMOTE_USER=root REMOTE_PASS='...' \
 
 ## 一键脚本（RocksDB 整库 rsync）
 
-在 **plant-model-gen 仓库根目录**执行（与 `deploy_web_server_bundle.sh` 相同，使用环境变量传密码，勿把密码写进仓库）：
+在 **plant-model-gen 仓库根目录**执行（与 `shells/deploy/deploy_web_server_bundle.sh` 相同，使用环境变量传密码，勿把密码写进仓库）：
 
 ```bash
 # 使用默认本地路径（Mac）
@@ -80,7 +80,7 @@ RESTART_ONLY=1 REMOTE_HOST=... REMOTE_USER=root REMOTE_PASS='...' ./shells/sync_
 ## 与 `DbOption.toml` 的关系
 
 - `web_server` 在同一台机访问 Surreal 时，一般为 `surreal_ip = "127.0.0.1"`、`surreal_port = 8020`。
-- 仓库里的 `db_options/DbOption.toml` 可能仍是 Windows 路径；部署脚本会修正 `surreal_script_dir`。**Surreal 数据路径**若写在 `[surrealdb].path` 且被用于本机嵌入式打开，需与远端实际 rocksdb 路径一致；当前架构以 **独立 `surreal start` + 网络连接** 为主时，关键是 **8020 上有正确数据**。
+- 仓库里的 `db_options/DbOption.toml` / `DbOption-mac.toml` 可能仍是本机路径；部署时由 `shells/deploy/apply_dboption_deploy_paths.py` 按 `REMOTE_PROJECT_PATH`、`REMOTE_SURREAL_DATA_PATH`、`REMOTE_SURREALKV_DATA_PATH`、`REMOTE_MESHES_PATH`、`REMOTE_SURREAL_SCRIPT_DIR` 等写入对应键。**Surreal 数据路径**若写在 `[surrealdb].path` 且用于本机嵌入式打开，需与远端实际 rocksdb 路径一致；当前架构以 **独立 `surreal start` + 网络连接** 为主时，关键是 **8020 上有正确数据**。
 
 ## 体积与耗时
 

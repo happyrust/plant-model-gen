@@ -22,6 +22,20 @@ set -euo pipefail
 #
 # 4. Deploy from GitHub release tag:
 #    BINARY_SOURCE=github-release GITHUB_TAG=v1.0.0 ./deploy_web_server_bundle.sh
+#
+# 5. 仅更新远端配置文件（不上传二进制 / assets / output）：
+#    CONFIG_ONLY=true REMOTE_PASS='...' ./shells/deploy/deploy_web_server_bundle.sh
+#    或 ./shells/deploy/deploy_config_only.sh
+#    默认会 systemctl restart web-server（即重启 web_server 进程以加载新 DbOption）；
+#    设 RESTART_AFTER_CONFIG_ONLY=false 则只写配置不重启。
+#
+# 上传 DbOption 前，默认按环境变量写入远端路径（由 apply_dboption_deploy_paths.py 按 TOML 区块替换键值，无 Mac 路径 sed）：
+#   REMOTE_PROJECT_PATH        默认 /root/e3d_models        → 顶层 project_path
+#   REMOTE_MESHES_PATH         默认 /root/assets/meshes     → 顶层 meshes_path
+#   REMOTE_SURREAL_SCRIPT_DIR  默认 /root/resource/surreal   → 顶层 surreal_script_dir
+#   REMOTE_SURREAL_DATA_PATH   默认 /root/surreal_data/ams-8020.db → [web_server].surreal_data_path、[surrealdb].path
+#   REMOTE_SURREALKV_DATA_PATH 默认 /root/surreal_data/ams-8020.db.kv → [surrealkv].path
+#   DEPLOY_APPLY_DB_PATH_OVERRIDES 默认 true；设为 false 则原样上传 DbOption（不写上述键）
 
 REMOTE_HOST="${REMOTE_HOST:-123.57.182.243}"
 REMOTE_USER="${REMOTE_USER:-root}"
@@ -44,11 +58,12 @@ USE_ZIGBUILD="${USE_ZIGBUILD:-auto}"
 ZIGBUILD_TARGET="${ZIGBUILD_TARGET:-x86_64-unknown-linux-gnu}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+# shells/deploy → 仓库根
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 ASSETS_DIR="$PROJECT_DIR/assets"
 OUTPUT_DIR="$PROJECT_DIR/output"
-DB_OPTION_FILE="${DB_OPTION_FILE:-$PROJECT_DIR/db_options/DbOption.toml}"
+DB_OPTION_FILE="${DB_OPTION_FILE:-$PROJECT_DIR/db_options/DbOption-mac.toml}"
 UPLOAD_ASSETS="${UPLOAD_ASSETS:-auto}"
 UPLOAD_OUTPUT="${UPLOAD_OUTPUT:-auto}"
 
@@ -66,6 +81,16 @@ REMOTE_BIN_BACKUP="/root/${BINARY_NAME}.backup_$(date +%Y%m%d_%H%M%S)"
 REMOTE_ASSETS_DIR="/root/assets"
 REMOTE_OUTPUT_DIR="/root/output"
 REMOTE_DB_OPTION="/root/DbOption.toml"
+
+# 使用 := 以便 CI 传入空字符串时仍回落到默认
+: "${REMOTE_PROJECT_PATH:=/root/e3d_models}"
+: "${REMOTE_SURREAL_DATA_PATH:=/root/surreal_data/ams-8020.db}"
+: "${REMOTE_SURREALKV_DATA_PATH:=/root/surreal_data/ams-8020.db.kv}"
+: "${REMOTE_MESHES_PATH:=/root/assets/meshes}"
+: "${REMOTE_SURREAL_SCRIPT_DIR:=/root/resource/surreal}"
+: "${DEPLOY_APPLY_DB_PATH_OVERRIDES:=true}"
+: "${CONFIG_ONLY:=false}"
+: "${RESTART_AFTER_CONFIG_ONLY:=true}"
 
 log() {
   printf '[deploy-web-server] %s\n' "$*"
@@ -207,6 +232,31 @@ upload_tree() {
   fi
 }
 
+# 按环境变量写入 DbOption 中与部署相关的路径（上传前在本地副本上执行）
+apply_dboption_deploy_paths_from_env() {
+  local f="$1"
+  if [[ "${DEPLOY_APPLY_DB_PATH_OVERRIDES}" != "true" ]]; then
+    log "DEPLOY_APPLY_DB_PATH_OVERRIDES=false: DbOption 保持源文件中的路径"
+    return 0
+  fi
+  need_cmd python3
+  local out helper
+  out="$(mktemp)"
+  helper="$SCRIPT_DIR/apply_dboption_deploy_paths.py"
+  [[ -f "$helper" ]] || {
+    printf 'Missing DbOption path helper: %s\n' "$helper" >&2
+    exit 1
+  }
+  python3 "$helper" "$f" "$out" \
+    --project-path "$REMOTE_PROJECT_PATH" \
+    --meshes-path "$REMOTE_MESHES_PATH" \
+    --surreal-script-dir "$REMOTE_SURREAL_SCRIPT_DIR" \
+    --surreal-data-path "$REMOTE_SURREAL_DATA_PATH" \
+    --surrealkv-path "$REMOTE_SURREALKV_DATA_PATH"
+  mv "$out" "$f"
+  log "DbOption 已按环境变量写入路径: project_path meshes_path surreal_script_dir + [web_server]/[surrealdb]/[surrealkv]"
+}
+
 resolve_target_dir() {
   if [[ -n "$TARGET" ]]; then
     printf '%s\n' "$PROJECT_DIR/target/$TARGET/$BUILD_PROFILE"
@@ -220,6 +270,52 @@ need_cmd rsync
 [[ -n "$REMOTE_PASS" ]] || { printf 'REMOTE_PASS is required\n' >&2; exit 1; }
 
 [[ -f "$DB_OPTION_FILE" ]] || { printf 'Missing DbOption file: %s\n' "$DB_OPTION_FILE" >&2; exit 1; }
+
+if [[ "${CONFIG_ONLY}" == "true" ]]; then
+  log "CONFIG_ONLY: uploading DbOption only -> $REMOTE_DB_OPTION (no binary/assets/output)"
+  DB_OPTION_UPLOAD="$(mktemp)"
+  cp "$DB_OPTION_FILE" "$DB_OPTION_UPLOAD"
+  apply_dboption_deploy_paths_from_env "$DB_OPTION_UPLOAD"
+  REMOTE_DB_OPTION_TMP="/root/DbOption.toml.tmp"
+  if ! run_rsync_file "$DB_OPTION_UPLOAD" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DB_OPTION_TMP"; then
+    log "rsync failed, falling back to SSH streaming for DbOption.toml upload"
+    cat "$DB_OPTION_UPLOAD" | run_remote "cat > '$REMOTE_DB_OPTION_TMP'"
+  fi
+  rm -f "$DB_OPTION_UPLOAD"
+
+  run_remote "set -e; mv /root/DbOption.toml.tmp /root/DbOption.toml"
+
+  if [[ "${RESTART_AFTER_CONFIG_ONLY}" == "true" ]]; then
+    log "Restarting $SERVICE_NAME (web_server binary) to apply DbOption"
+    run_remote "set -e; \
+      systemctl daemon-reload || true; \
+      systemctl restart '$SERVICE_NAME'; \
+      sleep 2; \
+      ok=0; \
+      for i in 1 2 3 4 5; do \
+        if systemctl is-active '$SERVICE_NAME' >/dev/null 2>&1; then \
+          echo 'Service active'; \
+          ok=1; \
+          break; \
+        fi; \
+        echo \"Waiting for service to activate (attempt \$i/5)...\"; \
+        sleep 2; \
+      done; \
+      if [[ \"\$ok\" != \"1\" ]]; then \
+        systemctl status '$SERVICE_NAME' || true; \
+        exit 1; \
+      fi; \
+      if ! pgrep -x web_server >/dev/null 2>&1 && ! pgrep -f '/root/web_server' >/dev/null 2>&1; then \
+        echo 'web_server process not found after restart'; \
+        exit 1; \
+      fi; \
+      echo 'web_server process OK'"
+  else
+    log "RESTART_AFTER_CONFIG_ONLY=false: 未重启服务；请手动 systemctl restart $SERVICE_NAME"
+  fi
+  log "CONFIG_ONLY finished. Remote: $REMOTE_DB_OPTION"
+  exit 0
+fi
 
 if [[ "$UPLOAD_ASSETS" == "auto" ]]; then
   if [[ -d "$ASSETS_DIR" ]]; then
@@ -371,24 +467,18 @@ if ! run_rsync_file --chmod=755 "$LOCAL_BIN" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_
 fi
 
 log "Uploading DbOption.toml"
-# Upload to temp location first, then normalize and move
+DB_OPTION_UPLOAD="$(mktemp)"
+cp "$DB_OPTION_FILE" "$DB_OPTION_UPLOAD"
+apply_dboption_deploy_paths_from_env "$DB_OPTION_UPLOAD"
+# Upload to temp location then atomically replace
 REMOTE_DB_OPTION_TMP="/root/DbOption.toml.tmp"
-if ! run_rsync_file "$DB_OPTION_FILE" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DB_OPTION_TMP"; then
+if ! run_rsync_file "$DB_OPTION_UPLOAD" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DB_OPTION_TMP"; then
   log "rsync failed after retries, falling back to SSH streaming for DbOption.toml upload"
-  cat "$DB_OPTION_FILE" | run_remote "cat > '$REMOTE_DB_OPTION_TMP'"
+  cat "$DB_OPTION_UPLOAD" | run_remote "cat > '$REMOTE_DB_OPTION_TMP'"
 fi
+rm -f "$DB_OPTION_UPLOAD"
 
-# Normalize surreal_script_dir to absolute path if it's relative
-log "Normalizing DbOption.toml paths"
-run_remote 'set -e; \
-  if grep -Eq '"'"'^surreal_script_dir[[:space:]]*=[[:space:]]*"[^"]+"'"'"' '"'"'/root/DbOption.toml.tmp'"'"' 2>/dev/null; then \
-    current_path=$(sed -n '"'"'s|^surreal_script_dir[[:space:]]*=[[:space:]]*"\([^"]*\)"|\1|p'"'"' '"'"'/root/DbOption.toml.tmp'"'"' | head -n 1); \
-    case "$current_path" in \
-      /*) ;; \
-      *) sed -i "s|^surreal_script_dir[[:space:]]*=[[:space:]]*\"[^\"]*\"|surreal_script_dir = \"/root/resource/surreal\"|" '"'"'/root/DbOption.toml.tmp'"'"'; echo '"'"'Normalized surreal_script_dir to absolute path'"'"';; \
-    esac; \
-  fi; \
-  mv '"'"'/root/DbOption.toml.tmp'"'"' '"'"'/root/DbOption.toml'"'"''
+run_remote "set -e; mv /root/DbOption.toml.tmp /root/DbOption.toml"
 
 if [[ "$UPLOAD_ASSETS" == "true" ]]; then
   upload_tree "$ASSETS_DIR" "$REMOTE_ASSETS_DIR" "assets/"

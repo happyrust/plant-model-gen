@@ -13,7 +13,7 @@
 
 ```bash
 # macOS → Linux cross-compilation happens automatically
-./shells/deploy_all_with_frontend.sh
+./shells/deploy/deploy_all_with_frontend.sh
 ```
 
 This is the **verified default workflow** for local development:
@@ -26,13 +26,13 @@ This is the **verified default workflow** for local development:
 ### Backend Only
 
 ```bash
-./shells/deploy_web_server_bundle.sh
+./shells/deploy/deploy_web_server_bundle.sh
 ```
 
 ### Force Native Build (No Cross-Compilation)
 
 ```bash
-USE_ZIGBUILD=false ./shells/deploy_all_with_frontend.sh
+USE_ZIGBUILD=false ./shells/deploy/deploy_all_with_frontend.sh
 ```
 
 ## Deploy from GitHub Actions (CI Artifacts)
@@ -42,7 +42,7 @@ USE_ZIGBUILD=false ./shells/deploy_all_with_frontend.sh
 gh run list --workflow multi-platform-build.yml --status success --limit 5
 
 # 2. Deploy using the run ID
-BINARY_SOURCE=github-artifact GITHUB_RUN_ID=<RUN_ID> ./shells/deploy_all_with_frontend.sh
+BINARY_SOURCE=github-artifact GITHUB_RUN_ID=<RUN_ID> ./shells/deploy/deploy_all_with_frontend.sh
 ```
 
 ## GitHub Actions 直连 Ubuntu 部署
@@ -58,18 +58,18 @@ BINARY_SOURCE=github-artifact GITHUB_RUN_ID=<RUN_ID> ./shells/deploy_all_with_fr
   - `DEPLOY_REMOTE_PASS`
   - `GH_PAT`（若 CI 仍需拉取私有 patch 依赖）
 
-该 workflow 默认使用 `db_options/DbOption-aveva-1600.toml`，并在 Runner 上完成：
+该 workflow 手动触发时默认使用 `db_options/DbOption-mac.toml`（可通过 `db_option_file` 改），并在 Runner 上完成：
 
 1. 构建 Linux `web_server`
 2. 产出并下载同次 artifact
-3. 调用 `deploy_web_server_bundle.sh` 上传二进制、`assets/`、`output/`、`DbOption`
+3. 调用 `shells/deploy/deploy_web_server_bundle.sh` 上传二进制、`assets/`、`output/`、`DbOption`
 4. 重启远端 `web-server` systemd
 5. 通过 SSH 验证 `systemctl is-active web-server`、`/api/health`、`/api/projects`
 
 ## Deploy from GitHub Release
 
 ```bash
-BINARY_SOURCE=github-release GITHUB_TAG=v1.2.3 ./shells/deploy_all_with_frontend.sh
+BINARY_SOURCE=github-release GITHUB_TAG=v1.2.3 ./shells/deploy/deploy_all_with_frontend.sh
 ```
 
 ## Post-Deployment Verification
@@ -108,7 +108,7 @@ REMOTE_USER=your_user \
 REMOTE_PASS='your_password' \
 BINARY_SOURCE=github-artifact \
 GITHUB_RUN_ID=12345678 \
-./shells/deploy_all_with_frontend.sh
+./shells/deploy/deploy_all_with_frontend.sh
 ```
 
 ## Environment Variables Reference

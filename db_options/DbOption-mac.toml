@@ -266,21 +266,22 @@ timeout_seconds = 30
 # 本地/联调阶段可临时关闭 JWT 校验；上线前请改回 enabled = true
 [review_auth]
 enabled = false
-debug_project_id = "debug-project"
+debug_project_id = "AvevaMarineSample"
 debug_user_id = "debug-user"
 debug_role = "sj"
 
-# Web Server 配置（3100 与 plant3d-web Vite 代理一致）
-# 外部已 `surreal start` 在 8020 时设为 false，避免二次绑定端口
+# Web Server（生产：0.0.0.0 才能在公网访问 :3100；云安全组需放行 TCP 3100）
+# 仅本机 + Nginx 反代时改 bind_host = "127.0.0.1"，Postman/外网则走 80/443 不要求直连 3100
+# 外部已 surreal start 在 8020 时 auto_start_surreal = false
 [web_server]
 port = 3100
-bind_host = "127.0.0.1"
+bind_host = "0.0.0.0"
 site_id = "avevamarinesample-3100"
 site_name = "AvevaMarineSample"
 region = "sjz"
 frontend_url = "http://123.57.182.243"
-public_base_url = "http://127.0.0.1:3100"
-backend_url = "http://127.0.0.1:3100"
+public_base_url = "http://123.57.182.243:3100"
+backend_url = "http://123.57.182.243:3100"
 auto_start_surreal = false
 surreal_bin = "surreal"
 surreal_data_path = "/Volumes/DPC/work/db-data/ams-8020.db"

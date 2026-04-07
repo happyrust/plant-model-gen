@@ -5,7 +5,8 @@ use std::process::Stdio;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let matches = Command::new("aios-web-server")
-        .version("0.1.4")
+        // APP_VERSION：build.rs 注入（RELEASE_VERSION 或 CARGO_PKG_VERSION），与 /version 一致
+        .version(env!("APP_VERSION"))
         .about("AIOS Web UI Server")
         .arg(
             Arg::new("config")

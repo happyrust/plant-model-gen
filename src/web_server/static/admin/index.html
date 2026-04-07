@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIOS 管理后台</title>
+    <link rel="stylesheet" href="/admin/static/admin.css">
+</head>
+<body>
+    <div class="admin-shell">
+        <header class="hero-bar">
+            <div class="hero-copy">
+                <p class="eyebrow">ADMIN CONTROL</p>
+                <h1>站点编排后台</h1>
+                <p class="hero-description">集中维护站点配置、解析任务、运行态和日志，不复用 console 的导航与壳层。</p>
+            </div>
+            <div class="hero-tools">
+                <div class="hero-stats">
+                    <article class="stat-chip">
+                        <span class="stat-label">站点总数</span>
+                        <strong id="stat-total-sites">0</strong>
+                    </article>
+                    <article class="stat-chip">
+                        <span class="stat-label">运行中</span>
+                        <strong id="stat-running-sites">0</strong>
+                    </article>
+                    <article class="stat-chip">
+                        <span class="stat-label">异常</span>
+                        <strong id="stat-failed-sites">0</strong>
+                    </article>
+                </div>
+                <div class="toolbar-row">
+                    <button id="refresh-all-btn" class="ghost-button" type="button">立即刷新</button>
+                    <label class="toggle-pill" for="auto-refresh-toggle">
+                        <input id="auto-refresh-toggle" type="checkbox" checked>
+                        <span>自动刷新</span>
+                    </label>
+                </div>
+                <p class="toolbar-note">入口固定给 `/admin`，资源文件位于 `/admin/static/*`。</p>
+            </div>
+        </header>
+
+        <main class="workspace-grid">
+            <section class="panel site-panel" aria-labelledby="site-list-title">
+                <div class="panel-head">
+                    <div>
+                        <p class="panel-kicker">Site List</p>
+                        <h2 id="site-list-title">站点列表</h2>
+                    </div>
+                    <button id="create-site-btn" class="primary-button" type="button">新建站点</button>
+                </div>
+
+                <label class="search-box" for="site-search">
+                    <span>检索</span>
+                    <input id="site-search" type="search" placeholder="按项目名、site_id、路径或端口筛选">
+                </label>
+
+                <div id="list-summary" class="inline-summary">尚未加载站点。</div>
+                <div id="site-list" class="site-list" role="list"></div>
+            </section>
+
+            <section class="panel form-panel" aria-labelledby="form-title">
+                <div class="panel-head">
+                    <div>
+                        <p class="panel-kicker">Editor</p>
+                        <h2 id="form-title">新建站点</h2>
+                    </div>
+                    <div class="panel-actions compact">
+                        <button id="reset-form-btn" class="ghost-button" type="button">重置表单</button>
+                    </div>
+                </div>
+
+                <form id="site-form" class="site-form">
+                    <div class="form-grid">
+                        <label>
+                            <span>项目名</span>
+                            <input id="project-name" name="project_name" type="text" required placeholder="例如：plant-demo">
+                        </label>
+                        <label>
+                            <span>项目代号</span>
+                            <input id="project-code" name="project_code" type="number" min="1" required placeholder="例如：1516">
+                        </label>
+                        <label class="field-span-2">
+                            <span>项目路径</span>
+                            <input id="project-path" name="project_path" type="text" required placeholder="例如：/data/projects/plant-demo">
+                        </label>
+                        <label class="field-span-2">
+                            <span>限制 dbnum</span>
+                            <input id="manual-db-nums" name="manual_db_nums" type="text" placeholder="可选，例如：7612 或 7612,7333">
+                            <small>留空表示不限制，支持单个或逗号分隔多个 dbnum。</small>
+                        </label>
+                        <label>
+                            <span>绑定地址</span>
+                            <input id="bind-host" name="bind_host" type="text" placeholder="默认 127.0.0.1">
+                        </label>
+                        <label>
+                            <span>数据库端口</span>
+                            <input id="db-port" name="db_port" type="number" min="1" max="65535" required placeholder="8009">
+                        </label>
+                        <label>
+                            <span>站点端口</span>
+                            <input id="web-port" name="web_port" type="number" min="1" max="65535" required placeholder="3101">
+                        </label>
+                        <label>
+                            <span>数据库用户</span>
+                            <input id="db-user" name="db_user" type="text" placeholder="留空则沿用默认值">
+                        </label>
+                        <label>
+                            <span>数据库密码</span>
+                            <input id="db-password" name="db_password" type="password" placeholder="编辑时留空表示不改">
+                        </label>
+                    </div>
+
+                    <div class="form-note">
+                        <strong>说明</strong>
+                        <span>选中列表项时为编辑模式；未选中时为新建模式。保存后会刷新详情、运行态和日志面板。</span>
+                    </div>
+
+                    <div class="form-actions">
+                        <button id="save-site-btn" class="primary-button" type="submit">保存站点</button>
+                        <button id="cancel-edit-btn" class="ghost-button" type="button">切回新建</button>
+                    </div>
+                </form>
+            </section>
+
+            <section class="detail-column">
+                <article class="panel detail-panel" aria-labelledby="detail-title">
+                    <div class="panel-head">
+                        <div>
+                            <p class="panel-kicker">Inspector</p>
+                            <h2 id="detail-title">详情面板</h2>
+                        </div>
+                        <div class="panel-actions wrap">
+                            <button id="parse-btn" class="accent-button" type="button">解析</button>
+                            <button id="start-btn" class="primary-button" type="button">启动</button>
+                            <button id="stop-btn" class="ghost-button warm" type="button">停止</button>
+                            <button id="delete-btn" class="danger-button" type="button">删除</button>
+                        </div>
+                    </div>
+
+                    <div id="selection-banner" class="selection-banner empty">未选中站点。请从左侧列表选择，或直接新建。</div>
+                    <section id="status-strip" class="status-strip empty" aria-live="polite">
+                        <div class="status-strip-head">
+                            <div>
+                                <p class="panel-kicker">Live Snapshot</p>
+                                <h3>实时状态</h3>
+                            </div>
+                            <div id="status-strip-badges" class="status-strip-badges"></div>
+                        </div>
+                        <div id="status-strip-summary" class="status-strip-summary empty-state">选择站点后显示解析进度、轮询频率和最新状态。</div>
+                        <div id="status-progress" class="status-progress hidden" aria-hidden="true">
+                            <div id="status-progress-bar" class="status-progress-bar"></div>
+                        </div>
+                        <div id="status-progress-text" class="status-progress-text hidden"></div>
+                    </section>
+
+                    <div class="detail-stack">
+                        <section>
+                            <h3>站点详情</h3>
+                            <div id="detail-grid" class="kv-grid empty-state">暂无详情</div>
+                        </section>
+                        <section>
+                            <h3>运行态</h3>
+                            <div id="runtime-grid" class="runtime-grid empty-state">暂无运行态</div>
+                            <div id="runtime-flags" class="runtime-flags"></div>
+                            <div id="runtime-message" class="runtime-message hidden"></div>
+                        </section>
+                    </div>
+                </article>
+
+                <article class="panel logs-panel" aria-labelledby="logs-title">
+                    <div class="panel-head">
+                        <div>
+                            <p class="panel-kicker">Trace</p>
+                            <h2 id="logs-title">日志面板</h2>
+                        </div>
+                    </div>
+                    <div id="log-tabs" class="log-tabs" role="tablist" aria-label="日志类型"></div>
+                    <div id="log-summary" class="log-summary empty-state">请选择站点后查看日志状态。</div>
+                    <pre id="log-content" class="log-console">请选择站点后查看日志。</pre>
+                </article>
+            </section>
+        </main>
+    </div>
+
+    <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+    <script src="/admin/static/admin.js"></script>
+</body>
+</html>

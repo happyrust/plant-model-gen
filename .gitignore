@@ -115,7 +115,8 @@ accel_tree.bin
 # ═══════════════════════════════════════════════════════════════
 docs.surrealdb.com/
 external/rs-core/
-deploy/
+# 仅忽略仓库根下 deploy/（勿写 deploy/，否则会误匹配 shells/deploy/）
+/deploy/
 
 # ═══════════════════════════════════════════════════════════════
 # Archives

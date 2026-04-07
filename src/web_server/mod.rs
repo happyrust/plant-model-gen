@@ -17,7 +17,9 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use uuid::Uuid;
 
+pub mod admin_handlers;
 pub mod handlers;
+pub mod managed_project_sites;
 pub mod models;
 pub mod ws; // WebSocket 模块
 // pub mod templates; // 暂时禁用，有语法错误
@@ -222,6 +224,9 @@ pub async fn start_web_server_with_config(
     crate::web_server::handlers::ensure_projects_schema().await;
     // 初始化中心站点注册表（SQLite）
     crate::web_server::handlers::ensure_deployment_sites_schema().await;
+    if let Err(err) = crate::web_server::managed_project_sites::ensure_schema() {
+        eprintln!("⚠️ 初始化管理员站点表失败: {}", err);
+    }
 
     // 确保 Scene Tree 已初始化
     println!("🌳 检查 Scene Tree 初始化状态...");
@@ -864,9 +869,15 @@ pub async fn start_web_server_with_config(
         )
         .route("/api/export/tasks", get(handlers::list_export_tasks))
         .route("/api/export/cleanup", post(handlers::cleanup_export_tasks))
+        .route("/admin", get(admin_index_page).head(admin_head_page))
+        .route("/admin/", get(admin_index_page).head(admin_head_page))
         .route("/console", get(console_index_page).head(console_head_page))
         .route("/console/", get(console_index_page).head(console_head_page))
         // 静态文件服务
+        .nest_service(
+            "/admin/static",
+            ServeDir::new("src/web_server/static/admin"),
+        )
         .nest_service("/static", ServeDir::new("src/web_server/static"))
         .nest_service("/console/assets", ServeDir::new("web_console/dist/assets"))
         // /files/output 下的静态文件服务（带 instances 兜底）
@@ -1032,8 +1043,9 @@ pub async fn start_web_server_with_config(
         // WebSocket 路由
         .route("/ws/progress/{task_id}", get(ws::ws_progress_handler))
         .route("/ws/tasks", get(ws::ws_tasks_handler))
-        .fallback(console_history_fallback)
+        .fallback(app_history_fallback)
         .with_state(app_state.clone())
+        .merge(admin_handlers::create_admin_routes())
         .merge(spatial_query_routes)
         .merge(noun_hierarchy_routes)
         .merge(e3d_tree_routes)
@@ -1202,6 +1214,8 @@ pub struct UpdateConfigRequest {
 
 const WEB_CONSOLE_DIST_DIR: &str = "web_console/dist";
 const WEB_CONSOLE_INDEX_FILE: &str = "web_console/dist/index.html";
+const ADMIN_STATIC_DIR: &str = "src/web_server/static/admin";
+const ADMIN_INDEX_FILE: &str = "src/web_server/static/admin/index.html";
 const CONSOLE_ROUTE_MAPPINGS: &[(&str, &str)] = &[
     ("/dashboard", "/console/dashboard"),
     ("/tasks", "/console/tasks"),
@@ -1234,6 +1248,14 @@ fn web_console_index_html() -> Option<String> {
     std::fs::read_to_string(WEB_CONSOLE_INDEX_FILE).ok()
 }
 
+fn admin_index_html() -> Option<String> {
+    std::fs::read_to_string(ADMIN_INDEX_FILE).ok()
+}
+
+fn is_admin_route_request(path: &str) -> bool {
+    path == "/admin" || path.starts_with("/admin/")
+}
+
 fn is_console_asset_request(path: &str) -> bool {
     path == "/console" || path.starts_with("/console/")
 }
@@ -1257,6 +1279,22 @@ async fn console_index_page() -> Result<Html<String>, StatusCode> {
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+async fn admin_index_page() -> Result<Html<String>, StatusCode> {
+    admin_index_html().map(Html).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn admin_head_page() -> Result<Response, StatusCode> {
+    if admin_index_html().is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty())))
+}
+
 async fn console_head_page() -> Result<Response, StatusCode> {
     if web_console_index_html().is_none() {
         return Err(StatusCode::NOT_FOUND);
@@ -1271,6 +1309,34 @@ async fn console_head_page() -> Result<Response, StatusCode> {
 
 async fn console_root_redirect() -> Response {
     redirect_response("/console", None)
+}
+
+async fn admin_history_fallback(uri: axum::http::Uri) -> Result<Response, StatusCode> {
+    let path = uri.path();
+    if !is_admin_route_request(path)
+        || path.starts_with("/admin/static/")
+        || path == "/admin/static"
+        || path == "/admin/api"
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let relative = path
+        .strip_prefix("/admin/")
+        .or_else(|| path.strip_prefix("/admin"))
+        .unwrap_or("")
+        .trim_start_matches('/');
+    let local_path = Path::new(ADMIN_STATIC_DIR).join(relative);
+    if !relative.is_empty() && local_path.exists() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let html = admin_index_html().ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(html))
+        .unwrap_or_else(|_| Response::new(Body::from(Cow::Borrowed("")))))
 }
 
 async fn console_history_fallback(uri: axum::http::Uri) -> Result<Response, StatusCode> {
@@ -1295,6 +1361,13 @@ async fn console_history_fallback(uri: axum::http::Uri) -> Result<Response, Stat
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .body(Body::from(html))
         .unwrap_or_else(|_| Response::new(Body::from(Cow::Borrowed("")))))
+}
+
+async fn app_history_fallback(uri: axum::http::Uri) -> Result<Response, StatusCode> {
+    if let Ok(response) = admin_history_fallback(uri.clone()).await {
+        return Ok(response);
+    }
+    console_history_fallback(uri).await
 }
 
 fn redirect_response(target: &str, query: Option<&str>) -> Response {

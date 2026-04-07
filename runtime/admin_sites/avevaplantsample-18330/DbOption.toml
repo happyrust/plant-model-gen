@@ -1,0 +1,207 @@
+apply_boolean_operation = true
+arangodb_database = "ams"
+arangodb_password = ""
+arangodb_url = "http://127.0.0.1:8529"
+arangodb_user = "root"
+att_chunk = 200
+batch_insert_sql_cnt = 100
+boolean_pipeline_mode = "db_legacy"
+build_cate_relate = false
+debug_print_world_transform = false
+debug_refno_types = [
+    "CATA",
+    "LOOP",
+    "PRIM",
+]
+defer_db_write = false
+enable_index = false
+enable_log = true
+enable_sqlite_rtree = true
+file_server_host = "http://localhost:8082/assets/archives"
+gen_history_model = false
+gen_mesh = true
+gen_model = true
+gen_model_batch_size = 16
+gen_noun_graph = false
+gen_spatial_tree = false
+gen_tree_only = false
+included_projects = ["AvevaPlantSample"]
+incr_sync = false
+index_tree_batch_size = 200
+index_tree_debug_limit_per_target_type = 0
+index_tree_max_concurrent_targets = 6
+ip = "127.0.0.1"
+kv_ip = "localhost"
+kv_port = "8010"
+load_spatial_tree = false
+location = "sjz"
+location_dbs = [251181]
+manual_db_nums = [7009]
+mdb_name = "ALL"
+mesh_tol_ratio = 3.0
+meshes_path = "./assets/meshes"
+module = "DESIGN"
+mqtt_host = "127.0.0.1"
+mqtt_port = 1883
+multi_threads = false
+need_sync_refno_basic = false
+only_rebuild_pdms_element = false
+only_sync_sys = false
+only_update_dbinfo = false
+password = ""
+pe_chunk = 300
+plat_url = ""
+port = "3306"
+project_code = "1516"
+project_dirs = ["AvevaPlantSample"]
+project_name = "AvevaPlantSample"
+project_path = "/Volumes/DPC/work/e3d_models"
+puhua_database_ip = ""
+puhua_database_password = ""
+puhua_database_user = ""
+rebuild_ssc_tree = false
+remote_file_server_hosts = []
+replace_dbs = false
+replace_mesh = false
+reset_mdb_project = false
+room_keyword = "-RM"
+save_db = true
+save_spatial_tree_to_db = false
+server_release_ip = "127.0.0.1:9099"
+sql_threads_number = 10
+surreal_ip = "127.0.0.1"
+surreal_ns = "1516"
+surreal_password = "root"
+surreal_port = 18320
+surreal_script_dir = "../rs-core/resource/surreal"
+surreal_user = "root"
+sync_chunk_size = 100000
+sync_graph_db = true
+sync_history = false
+sync_live = false
+sync_tidb = false
+sync_versioned = false
+total_sync = false
+use_surrealdb = true
+user = "root"
+
+[mesh_precision]
+default_lod = "L1"
+
+[mesh_precision.lod_profiles.L1]
+mesh_tol_ratio = 3.0
+neg_multiplier = 0.3
+polyhedron_fixed_tol = 0.01
+radial_segments = 48
+sphere_subdiv = 32
+sweep_multiplier = 0.1
+
+[mesh_precision.lod_profiles.L1.csg_settings]
+cap_segments = 1
+error_tolerance = 0.002
+height_segments = 3
+max_height_segments = 6
+max_radial_segments = 60
+min_height_segments = 2
+min_radial_segments = 16
+non_scalable_factor = 0.7
+radial_segments = 32
+target_segment_length = 80.0
+
+[mesh_precision.lod_profiles.L2]
+mesh_tol_ratio = 6.0
+neg_multiplier = 0.4
+polyhedron_fixed_tol = 0.02
+radial_segments = 24
+sphere_subdiv = 18
+sweep_multiplier = 0.15
+
+[mesh_precision.lod_profiles.L2.csg_settings]
+cap_segments = 1
+error_tolerance = 0.005
+height_segments = 2
+max_height_segments = 3
+max_radial_segments = 30
+min_height_segments = 1
+min_radial_segments = 12
+non_scalable_factor = 0.8
+radial_segments = 20
+target_segment_length = 140.0
+
+[mesh_precision.lod_profiles.L3]
+mesh_tol_ratio = 10.0
+neg_multiplier = 0.5
+polyhedron_fixed_tol = 0.05
+radial_segments = 16
+sphere_subdiv = 12
+sweep_multiplier = 0.2
+
+[mesh_precision.lod_profiles.L3.csg_settings]
+cap_segments = 1
+error_tolerance = 0.01
+height_segments = 1
+max_height_segments = 2
+max_radial_segments = 18
+min_height_segments = 1
+min_radial_segments = 12
+non_scalable_factor = 0.9
+radial_segments = 12
+target_segment_length = 250.0
+
+[mesh_precision.lod_profiles.L4]
+mesh_tol_ratio = 15.0
+neg_multiplier = 0.6
+polyhedron_fixed_tol = 0.1
+radial_segments = 8
+sphere_subdiv = 8
+sweep_multiplier = 0.3
+
+[mesh_precision.lod_profiles.L4.csg_settings]
+cap_segments = 1
+error_tolerance = 0.02
+height_segments = 1
+max_height_segments = 1
+max_radial_segments = 12
+min_height_segments = 1
+min_radial_segments = 6
+non_scalable_factor = 1.0
+radial_segments = 8
+target_segment_length = 400.0
+
+[model_center]
+base_url = "http://localhost:3000"
+frontend_base_url = "http://123.57.182.243"
+timeout_seconds = 30
+token_secret = "your-shared-secret-key"
+
+[review_auth]
+debug_project_id = "AvevaMarineSample"
+debug_role = "sj"
+debug_user_id = "debug-user"
+enabled = false
+
+[surrealdb]
+ip = "127.0.0.1"
+mode = "ws"
+path = "runtime/admin_sites/avevaplantsample-18330/data/surreal.db"
+port = 18320
+
+[surrealkv]
+deployment_sites_sqlite_path = "runtime/admin_verify/deployment_sites.sqlite"
+enabled = false
+mode = "file"
+path = "runtime/admin_sites/avevaplantsample-18330/data/surreal.db.kv"
+
+[web_server]
+auto_start_surreal = false
+backend_url = "http://127.0.0.1:18330"
+bind_host = "127.0.0.1"
+frontend_url = "http://127.0.0.1:18330"
+port = 18330
+public_base_url = "http://127.0.0.1:18330"
+region = "admin"
+site_id = "avevaplantsample-18330"
+site_name = "AvevaPlantSample"
+surreal_bin = "surreal"
+surreal_bind = "0.0.0.0:18320"
+surreal_data_path = "runtime/admin_sites/avevaplantsample-18330/data/surreal.db"

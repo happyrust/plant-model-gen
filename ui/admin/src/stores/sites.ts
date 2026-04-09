@@ -1,13 +1,24 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { sitesApi } from '@/api/sites'
-import type { Site, SiteStats, SiteCreatePayload, SiteUpdatePayload } from '@/types/site'
+import type {
+  ManagedProjectSite,
+  SiteStats,
+  CreateManagedSiteRequest,
+  UpdateManagedSiteRequest,
+} from '@/types/site'
 
 export const useSitesStore = defineStore('sites', () => {
-  const sites = ref<Site[]>([])
-  const stats = ref<SiteStats>({ total: 0, running: 0, error: 0, pending_parse: 0 })
+  const sites = ref<ManagedProjectSite[]>([])
   const loading = ref(false)
   const error = ref('')
+
+  const stats = computed<SiteStats>(() => ({
+    total: sites.value.length,
+    running: sites.value.filter((s) => s.status === 'Running').length,
+    error: sites.value.filter((s) => s.status === 'Failed').length,
+    pending_parse: sites.value.filter((s) => s.parse_status === 'Pending').length,
+  }))
 
   async function fetchSites() {
     loading.value = true
@@ -21,36 +32,22 @@ export const useSitesStore = defineStore('sites', () => {
     }
   }
 
-  async function fetchStats() {
-    try {
-      stats.value = await sitesApi.stats()
-    } catch {
-      // stats are non-critical; derive from local list as fallback
-      stats.value = {
-        total: sites.value.length,
-        running: sites.value.filter((s) => s.status === 'running').length,
-        error: sites.value.filter((s) => s.status === 'error').length,
-        pending_parse: sites.value.filter((s) => s.status === 'pending').length,
-      }
-    }
-  }
-
-  async function createSite(payload: SiteCreatePayload) {
+  async function createSite(payload: CreateManagedSiteRequest) {
     const site = await sitesApi.create(payload)
     sites.value.push(site)
     return site
   }
 
-  async function updateSite(id: string, payload: SiteUpdatePayload) {
+  async function updateSite(id: string, payload: UpdateManagedSiteRequest) {
     const updated = await sitesApi.update(id, payload)
-    const idx = sites.value.findIndex((s) => s.id === id)
+    const idx = sites.value.findIndex((s) => s.site_id === id)
     if (idx !== -1) sites.value[idx] = updated
     return updated
   }
 
   async function deleteSite(id: string) {
     await sitesApi.delete(id)
-    sites.value = sites.value.filter((s) => s.id !== id)
+    sites.value = sites.value.filter((s) => s.site_id !== id)
   }
 
   async function parseSite(id: string) {
@@ -70,7 +67,7 @@ export const useSitesStore = defineStore('sites', () => {
 
   return {
     sites, stats, loading, error,
-    fetchSites, fetchStats, createSite, updateSite, deleteSite,
+    fetchSites, createSite, updateSite, deleteSite,
     parseSite, startSite, stopSite,
   }
 })

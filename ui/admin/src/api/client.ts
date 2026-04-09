@@ -2,11 +2,15 @@ import { ofetch } from 'ofetch'
 
 const BASE_URL = import.meta.env.VITE_API_BASE ?? ''
 
-export const api = ofetch.create({
+interface ApiEnvelope<T> {
+  success: boolean
+  message: string
+  data: T | null
+}
+
+export const rawApi = ofetch.create({
   baseURL: BASE_URL,
-  headers: {
-    'Content-Type': 'application/json',
-  },
+  headers: { 'Content-Type': 'application/json' },
   onRequest({ options }) {
     const token = localStorage.getItem('admin_token')
     if (token) {
@@ -23,18 +27,30 @@ export const api = ofetch.create({
   },
 })
 
-export function apiGet<T>(url: string, opts?: { query?: Record<string, unknown> }) {
-  return api<T>(url, { method: 'GET', ...opts })
+async function unwrap<T>(promise: Promise<ApiEnvelope<T>>): Promise<T> {
+  const envelope = await promise
+  if (!envelope.success || envelope.data === null) {
+    throw new Error(envelope.message || 'Request failed')
+  }
+  return envelope.data
 }
 
-export function apiPost<T>(url: string, body?: Record<string, unknown>) {
-  return api<T>(url, { method: 'POST', body })
+export function apiGet<T>(url: string, opts?: { query?: Record<string, unknown> }): Promise<T> {
+  return unwrap(rawApi<ApiEnvelope<T>>(url, { method: 'GET', ...opts }))
 }
 
-export function apiPut<T>(url: string, body?: Record<string, unknown>) {
-  return api<T>(url, { method: 'PUT', body })
+export function apiPost<T>(url: string, body?: Record<string, unknown>): Promise<T> {
+  return unwrap(rawApi<ApiEnvelope<T>>(url, { method: 'POST', body }))
 }
 
-export function apiDelete<T>(url: string) {
-  return api<T>(url, { method: 'DELETE' })
+export function apiPut<T>(url: string, body?: Record<string, unknown>): Promise<T> {
+  return unwrap(rawApi<ApiEnvelope<T>>(url, { method: 'PUT', body }))
+}
+
+export function apiDelete<T>(url: string): Promise<T> {
+  return unwrap(rawApi<ApiEnvelope<T>>(url, { method: 'DELETE' }))
+}
+
+export function apiPostRaw<T>(url: string, body?: Record<string, unknown>): Promise<ApiEnvelope<T>> {
+  return rawApi<ApiEnvelope<T>>(url, { method: 'POST', body })
 }

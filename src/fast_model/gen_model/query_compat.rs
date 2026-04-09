@@ -40,6 +40,7 @@ static NEG_GEO_NOUN_HASHES: Lazy<HashSet<u32>> = Lazy::new(|| {
 });
 static BRAN_HASH: Lazy<u32> = Lazy::new(|| db1_hash("BRAN"));
 static HANG_HASH: Lazy<u32> = Lazy::new(|| db1_hash("HANG"));
+const BRAN_HANG_NOUNS: &[&str] = &["BRAN", "HANG"];
 
 async fn load_tree_index_for_refno(refno: RefnoEnum) -> anyhow::Result<Arc<TreeIndex>> {
     let tree_dir = TreeIndexManager::with_default_dir(Vec::new())
@@ -104,6 +105,12 @@ async fn query_children_filtered(
     };
     let children = index.query_children(refno.refno(), filter).await?;
     Ok(children.into_iter().map(RefnoEnum::from).collect())
+}
+
+fn sort_dedup_refnos(mut refnos: Vec<RefnoEnum>) -> Vec<RefnoEnum> {
+    refnos.sort();
+    refnos.dedup();
+    refnos
 }
 
 /// 按类型查询 refno (兼容旧 API)
@@ -249,10 +256,21 @@ pub async fn query_deep_visible_inst_refnos(refno: RefnoEnum) -> anyhow::Result<
     }
 
     if meta.noun == *BRAN_HASH || meta.noun == *HANG_HASH {
-        return query_children_filtered(refno, None).await;
+        return Ok(sort_dedup_refnos(
+            query_children_filtered(refno, None).await?,
+        ));
     }
 
-    query_visible_geo_descendants(refno, true, Some("..")).await
+    let mut out = query_visible_geo_descendants(refno, true, Some("..")).await?;
+    let bran_hang_roots =
+        query_descendants_bfs(refno, build_noun_hashes(BRAN_HANG_NOUNS), true, Some("..")).await?;
+
+    for bran_hang_root in bran_hang_roots {
+        out.push(bran_hang_root);
+        out.extend(query_children_filtered(bran_hang_root, None).await?);
+    }
+
+    Ok(sort_dedup_refnos(out))
 }
 
 /// 查询深度负实例（模型生成路径：TreeIndex）

@@ -9,6 +9,7 @@
 - 完善 web_server 站点模型与注册链路：新增站点身份与配置信息链路（`site_id/site_name/region/project_code/frontend_url/backend_url`）以及 `project_code` 作为站点代号字段。
 - 新增独立站点注册模块 `src/web_server/site_registry.rs`，并统一 `GET /api/sites` 与 `GET /api/deployment-sites` 的清单事实源。
 - 站点配置 CRUD 能力增强：支持从配置文件导入站点、按项目/区域过滤、以及可直接管理站点的 `bind_host/bind_port` 监听信息。
+- 新增任务创建向导原型 `ui/task_wizard.pen`，并补充 `docs/plans/2026-04-09-站点管理功能开发计划.md` 作为站点管理后续开发说明。
 
 ### Changed
 
@@ -24,6 +25,9 @@
 - 新增站点页面可配置区域字段：区域、项目、项目代号、前端地址、后端地址、监听地址与运行配置收敛。
 - 优化 DB 模式和 File 模式下的 mesh 依赖判断逻辑，确保流式生成与强制生成的正确触发。
 - 重构模型生成编排层（`orchestrator`）与相关查询接口，提升查询和并发图组生成的稳定性。
+- 任务创建接口在 `manual_refnos` 非空时自动切换到 `RefnoModelGeneration`，`/api/model/generate-by-refno` 同步透传 noun 过滤与调试限制参数。
+- SQLite 空间查询接口新增 `spec_values` 过滤，并改为先按距离完整排序后再截断返回结果。
+- 房间计算验收基线中的房间编号统一改为 `R540`，与当前数据事实保持一致。
 
 ### Fixed
 
@@ -33,3 +37,5 @@
 - 修复三通元件库表达式 `TWICE PARAM 3` 被错误求值为 `0`，导致 `24381_145582` 一类 `TEE` 丢失支管几何的问题。
 - 补齐 `--debug-model --export-obj` 的 PNG 预览输出，`CaptureConfig` 不再只是打印“自动启用截图”但没有实际文件产出。
 - 修复 `deployment-sites` 页面表单可访问性问题，补齐输入字段 `label/for/id/name` 与按钮可读性文案，降低控制台无障碍告警。
+- 修复 `query_deep_visible_inst_refnos` 与 `/api/e3d/visible-insts` 对 BRAN/HANG 根节点的可见范围判断，避免树上可见但实际不加载。
+- 修复 web_server 任务配置向 `DbOption` 下发时遗漏 `manual_refnos` 的问题，避免 refno 任务退回全库生成。

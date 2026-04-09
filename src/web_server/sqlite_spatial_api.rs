@@ -85,6 +85,8 @@ pub struct SqliteSpatialQueryParams {
     pub max_results: Option<usize>,
     /// noun 过滤（逗号分隔，如 "EQUI,PIPE,TUBI"，空表示不过滤）
     pub nouns: Option<String>,
+    /// 专业过滤（逗号分隔，如 "1,3"，空表示不过滤）
+    pub spec_values: Option<String>,
     /// 是否包含自身（mode=refno 时有效，默认 true）
     pub include_self: Option<bool>,
     /// 查询形状："cube"（默认）| "sphere"（球体，会对结果做距离二次过滤）
@@ -263,6 +265,16 @@ fn parse_noun_filter(nouns: &Option<String>) -> Option<Vec<String>> {
     })
 }
 
+fn parse_spec_value_filter(spec_values: &Option<String>) -> Option<Vec<i64>> {
+    spec_values.as_ref().and_then(|s| {
+        let list: Vec<i64> = s
+            .split(',')
+            .filter_map(|value| value.trim().parse::<i64>().ok())
+            .collect();
+        if list.is_empty() { None } else { Some(list) }
+    })
+}
+
 // ============================================================================
 // Handler：GET /api/sqlite-spatial/query
 // ============================================================================
@@ -307,6 +319,7 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
         .unwrap_or(DEFAULT_MAX_HITS)
         .min(HARD_MAX_HITS);
     let noun_filter = parse_noun_filter(&params.nouns);
+    let spec_value_filter = parse_spec_value_filter(&params.spec_values);
     let include_self = params.include_self.unwrap_or(true);
 
     // 记住 refno 对应的 i64 id（用于 include_self 过滤）
@@ -539,6 +552,12 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
             }
         }
 
+        if let Some(ref filter) = spec_value_filter {
+            if !filter.contains(&spec_value) {
+                continue;
+            }
+        }
+
         let aabb_row: Option<(f32, f32, f32, f32, f32, f32)> = stmt_aabb
             .query_row([id], |r| {
                 Ok((
@@ -585,11 +604,6 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
             aabb,
             distance,
         });
-
-        if results.len() >= max_results {
-            truncated = true;
-            break;
-        }
     }
 
     // 按距离从近到远排序
@@ -599,6 +613,11 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => std::cmp::Ordering::Equal,
     });
+
+    truncated = results.len() > max_results;
+    if results.len() > max_results {
+        results.truncate(max_results);
+    }
 
     SpatialQueryResult {
         success: true,

@@ -1257,7 +1257,7 @@ mod room_verify_tests {
         RoomComputeValidationCase {
             case_id: "case-1".to_string(),
             description: "test".to_string(),
-            room_number: "540".to_string(),
+            room_number: "R540".to_string(),
             panel_refno: "24381/35798".to_string(),
             expected_components: expected_components
                 .iter()
@@ -1274,14 +1274,14 @@ mod room_verify_tests {
         let other_panel = RefnoEnum::from("24381/35799");
 
         let mut room_panels = BTreeMap::new();
-        room_panels.insert("540".to_string(), BTreeSet::from([panel]));
+        room_panels.insert("R540".to_string(), BTreeSet::from([panel]));
 
         let mut room_components_by_panel = BTreeMap::new();
-        room_components_by_panel.insert(("540".to_string(), panel), BTreeSet::from([component]));
+        room_components_by_panel.insert(("R540".to_string(), panel), BTreeSet::from([component]));
 
         let mut component_panels_by_room = BTreeMap::new();
         component_panels_by_room.insert(
-            "540".to_string(),
+            "R540".to_string(),
             BTreeMap::from([(component, BTreeSet::from([other_panel]))]),
         );
 
@@ -1301,7 +1301,7 @@ mod room_verify_tests {
         let panel = RefnoEnum::from("24381/35798");
         let component = RefnoEnum::from("24381/145019");
         persisted.component_panels_by_room.insert(
-            "540".to_string(),
+            "R540".to_string(),
             BTreeMap::from([(component, BTreeSet::from([panel]))]),
         );
 
@@ -1334,9 +1334,9 @@ mod room_verify_tests {
         let component = RefnoEnum::from("24381/145019");
         persisted
             .room_components_by_panel
-            .insert(("540".to_string(), panel), BTreeSet::new());
+            .insert(("R540".to_string(), panel), BTreeSet::new());
         persisted.component_panels_by_room.insert(
-            "540".to_string(),
+            "R540".to_string(),
             BTreeMap::from([(component, BTreeSet::from([RefnoEnum::from("24381/35799")]))]),
         );
 
@@ -1364,7 +1364,7 @@ mod room_verify_tests {
         let mut persisted = make_persisted_relations();
         persisted
             .component_panels_by_room
-            .insert("540".to_string(), BTreeMap::new());
+            .insert("R540".to_string(), BTreeMap::new());
 
         let outcome = verify_room_case(&make_case(&["24381/999999"]), &persisted)
             .expect("verification should classify missing expected component");

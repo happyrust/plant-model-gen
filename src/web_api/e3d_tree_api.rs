@@ -363,6 +363,31 @@ async fn get_visible_insts(
         candidates.push(refno);
     }
 
+    let bran_hang_load_roots: HashSet<RefnoEnum> = if let Ok(dbnum) =
+        crate::fast_model::gen_model::tree_index_manager::TreeIndexManager::resolve_dbnum_for_refno(
+            refno,
+        ) {
+        let manager =
+            crate::fast_model::gen_model::tree_index_manager::TreeIndexManager::with_default_dir(
+                vec![dbnum],
+            );
+        candidates
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                manager
+                    .get_noun(*candidate)
+                    .map(|noun| {
+                        let noun = noun.trim().to_ascii_uppercase();
+                        noun == "BRAN" || noun == "HANG"
+                    })
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
     // 2) 优先用 instances_{dbnum}.json 做“可加载几何”过滤：与前端实际加载数据保持一致。
     //    - 这可以避免 query_deep_visible_inst_refnos 返回“组节点/无几何节点”，导致前端 instances 缺失。
     //    - 若文件不存在，再回退到 inst_relate 的几何实例查询做过滤。
@@ -419,7 +444,9 @@ async fn get_visible_insts(
                     let mut out = Vec::new();
                     for r in candidates.iter().copied() {
                         let key = r.to_string();
-                        let matched = if available.contains(&key) {
+                        let matched = if bran_hang_load_roots.contains(&r) {
+                            true
+                        } else if available.contains(&key) {
                             true
                         } else if key.contains('/') {
                             available.contains(&key.replace('/', "_"))
@@ -458,6 +485,7 @@ async fn get_visible_insts(
         {
             Ok(v) => {
                 let mut out = v.into_iter().map(|q| q.refno).collect::<Vec<_>>();
+                out.extend(bran_hang_load_roots.iter().copied());
                 out.sort();
                 out.dedup();
                 out

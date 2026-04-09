@@ -359,6 +359,11 @@ impl DatabaseConfig {
         } else {
             Some(self.manual_db_nums.clone())
         };
+        db_option.debug_model_refnos = if self.manual_refnos.is_empty() {
+            None
+        } else {
+            Some(self.manual_refnos.clone())
+        };
         db_option.gen_model = self.gen_model;
         db_option.gen_mesh = self.gen_mesh;
         db_option.gen_spatial_tree = self.gen_spatial_tree;

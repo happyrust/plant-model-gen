@@ -1563,7 +1563,16 @@ pub async fn create_task(
     // 允许 manual_db_nums 为空：表示“全部数据库”
     let mut task_manager = state.task_manager.lock().await;
 
-    let mut task = TaskInfo::new(request.name, request.task_type, request.config);
+    let has_manual_refnos = !request.config.manual_refnos.is_empty();
+    let task_type = if matches!(request.task_type.clone(), TaskType::DataGeneration)
+        && has_manual_refnos
+    {
+        TaskType::RefnoModelGeneration
+    } else {
+        request.task_type
+    };
+
+    let mut task = TaskInfo::new(request.name, task_type, request.config);
     // 附加可选元数据（batch_id 等）
     if let Some(metadata) = request.metadata {
         task.metadata = Some(metadata);
@@ -4581,6 +4590,10 @@ async fn execute_real_task(state: AppState, task_id: String) {
         }
         TaskType::RefnoModelGeneration => {
             // 对于基于 Refno 的模型生成任务，直接执行生成流程
+            execute_refno_model_generation(state, task_id, config, db_option).await;
+            return;
+        }
+        TaskType::DataGeneration if !config.manual_refnos.is_empty() => {
             execute_refno_model_generation(state, task_id, config, db_option).await;
             return;
         }
@@ -8115,6 +8128,9 @@ pub async fn api_generate_by_refno(
     config.manual_db_nums = vec![req.db_num];
     config.manual_refnos = req.refnos.clone();
     config.name = format!("Refno模型生成 - DB{}", req.db_num);
+    config.enabled_nouns = req.enabled_nouns.clone();
+    config.excluded_nouns = req.excluded_nouns.clone();
+    config.debug_limit_per_noun_type = req.debug_limit_per_noun_type;
 
     // 应用可选参数覆盖
     if let Some(gen_mesh) = req.gen_mesh {

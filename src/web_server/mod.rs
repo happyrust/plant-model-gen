@@ -17,7 +17,9 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use uuid::Uuid;
 
+pub mod admin_auth_handlers;
 pub mod admin_handlers;
+pub mod admin_task_handlers;
 pub mod handlers;
 pub mod managed_project_sites;
 pub mod models;
@@ -1046,6 +1048,8 @@ pub async fn start_web_server_with_config(
         .fallback(app_history_fallback)
         .with_state(app_state.clone())
         .merge(admin_handlers::create_admin_routes())
+        .merge(admin_auth_handlers::create_admin_auth_routes())
+        .merge(admin_task_handlers::create_admin_task_routes())
         .merge(spatial_query_routes)
         .merge(noun_hierarchy_routes)
         .merge(e3d_tree_routes)

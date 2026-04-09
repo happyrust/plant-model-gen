@@ -49,7 +49,6 @@ pub use room_model::{
     build_room_relations_with_cancel, diagnose_coarse_aabb_intersection,
     rebuild_room_relations_for_rooms, rebuild_room_relations_for_rooms_with_cancel,
     regenerate_room_models_by_keywords, update_room_relations_incremental,
-    update_room_relations_incremental_with_cancel,
 };
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]

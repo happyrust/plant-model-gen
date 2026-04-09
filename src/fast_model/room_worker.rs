@@ -47,8 +47,6 @@ pub enum RoomTaskType {
     RebuildAll,
     /// 重建指定房间关系
     RebuildByRoomNumbers(Vec<String>),
-    /// 增量更新
-    IncrementalUpdate,
 }
 
 /// 任务状态
@@ -380,15 +378,6 @@ impl RoomWorker {
                 )
                 .await
             }
-            RoomTaskType::IncrementalUpdate => {
-                // 增量更新
-                super::room_model::update_room_relations_incremental_with_cancel(
-                    &task.db_option,
-                    Some(cancel_token.clone()),
-                    Some(progress_callback),
-                )
-                .await
-            }
         };
 
         let duration = start_time.elapsed();
@@ -437,6 +426,23 @@ impl RoomWorker {
 mod tests {
     use super::*;
 
+    fn test_db_option() -> DbOption {
+        DbOption::default()
+    }
+
+    fn dummy_stats() -> RoomBuildStats {
+        RoomBuildStats {
+            total_rooms: 0,
+            total_panels: 0,
+            total_components: 0,
+            build_time_ms: 0,
+            cache_hit_rate: 0.0,
+            memory_usage_mb: 0.0,
+            failed_panels: 0,
+            missing_candidates: 0,
+        }
+    }
+
     #[test]
     fn test_config_default() {
         let config = RoomWorkerConfig::default();
@@ -457,16 +463,7 @@ mod tests {
         );
         assert!(
             RoomWorkerTaskStatus::Completed {
-                stats: RoomBuildStats {
-                    total_rooms: 0,
-                    total_panels: 0,
-                    total_components: 0,
-                    build_time_ms: 0,
-                    cache_hit_rate: 0.0,
-                    memory_usage_mb: 0.0,
-                    failed_panels: 0,
-                    missing_candidates: 0,
-                }
+                stats: dummy_stats()
             }
             .is_terminal()
         );
@@ -477,5 +474,122 @@ mod tests {
             .is_terminal()
         );
         assert!(RoomWorkerTaskStatus::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn test_task_type_exhaustive() {
+        let all = RoomTaskType::RebuildAll;
+        let by_rooms = RoomTaskType::RebuildByRoomNumbers(vec!["R101".into()]);
+        assert_ne!(all, by_rooms);
+    }
+
+    #[test]
+    fn test_task_creation_defaults() {
+        let task = RoomWorkerTask::new(
+            "test-1".into(),
+            RoomTaskType::RebuildAll,
+            test_db_option(),
+        );
+        assert_eq!(task.id, "test-1");
+        assert!(matches!(task.status, RoomWorkerTaskStatus::Queued));
+        assert_eq!(task.priority, 100);
+    }
+
+    #[test]
+    fn test_task_with_priority() {
+        let task = RoomWorkerTask::new(
+            "test-2".into(),
+            RoomTaskType::RebuildAll,
+            test_db_option(),
+        )
+        .with_priority(0);
+        assert_eq!(task.priority, 0);
+    }
+
+    #[tokio::test]
+    async fn test_worker_submit_and_queue_length() {
+        let worker = RoomWorker::new(RoomWorkerConfig::default());
+        assert_eq!(worker.queue_len().await, 0);
+
+        let task = RoomWorkerTask::new(
+            "q-1".into(),
+            RoomTaskType::RebuildAll,
+            test_db_option(),
+        );
+        worker.submit_task(task).await;
+        assert_eq!(worker.queue_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_worker_priority_ordering() {
+        let worker = RoomWorker::new(RoomWorkerConfig::default());
+
+        let low = RoomWorkerTask::new(
+            "low".into(),
+            RoomTaskType::RebuildAll,
+            test_db_option(),
+        )
+        .with_priority(200);
+        let high = RoomWorkerTask::new(
+            "high".into(),
+            RoomTaskType::RebuildAll,
+            test_db_option(),
+        )
+        .with_priority(10);
+
+        worker.submit_task(low).await;
+        worker.submit_task(high).await;
+
+        let queue = worker.task_queue.read().await;
+        assert_eq!(queue[0].id, "high", "高优先级任务应排在前面");
+        assert_eq!(queue[1].id, "low");
+    }
+
+    #[tokio::test]
+    async fn test_worker_cancel_queued_task() {
+        let worker = RoomWorker::new(RoomWorkerConfig::default());
+
+        let task = RoomWorkerTask::new(
+            "cancel-me".into(),
+            RoomTaskType::RebuildAll,
+            test_db_option(),
+        );
+        worker.submit_task(task).await;
+        assert_eq!(worker.queue_len().await, 1);
+
+        let cancelled = worker.cancel_task("cancel-me").await;
+        assert!(cancelled, "队列中的任务应能被取消");
+        assert_eq!(worker.queue_len().await, 0);
+
+        let status = worker.get_task_status("cancel-me");
+        assert!(matches!(status, Some(RoomWorkerTaskStatus::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn test_worker_cancel_nonexistent_task() {
+        let worker = RoomWorker::new(RoomWorkerConfig::default());
+        let cancelled = worker.cancel_task("no-such-task").await;
+        assert!(!cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_worker_get_status_queued() {
+        let worker = RoomWorker::new(RoomWorkerConfig::default());
+
+        let task = RoomWorkerTask::new(
+            "status-check".into(),
+            RoomTaskType::RebuildAll,
+            test_db_option(),
+        );
+        worker.submit_task(task).await;
+
+        let status = worker.get_task_status("status-check");
+        assert!(matches!(status, Some(RoomWorkerTaskStatus::Queued)));
+    }
+
+    #[test]
+    fn test_progress_event_subscribe() {
+        let worker = RoomWorker::new(RoomWorkerConfig::default());
+        let _rx = worker.subscribe_progress();
     }
 }

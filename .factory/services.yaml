@@ -1,20 +1,20 @@
 commands:
   install: cargo fetch
-  context: rg -n "export_v3|instances_v3|geometry_manifest|export_prepack_lod|export_instanced_bundle|/api/export|/files/output|/files/meshes|stream_generate" src docs db_options .factory
+  context: rg -n "(/admin|api/admin|managed_project_sites|ManagedSite|admin/static|task_wizard)" src docs ui .factory
   typecheck: cargo check --features web_server --bin web_server
-  lint: echo "lint not defined for this mission; use focused cargo check and artifact validation"
-  test: cargo check --features ws,sqlite-index,web_server --bin aios-database
+  lint: cargo fmt --all -- --check
+  test: echo "Rust tests are forbidden for this mission; validate by running web_server + curl/POST + agent-browser"
 
 services:
   surrealdb:
     start: echo "Reuse existing SurrealDB on 127.0.0.1:8021 for this mission"
-    stop: echo "SurrealDB is shared; do not stop it from this mission"
-    healthcheck: curl -sf http://127.0.0.1:8021/status > /dev/null || echo "shared surrealdb health endpoint unavailable; rely on export connectivity"
+    stop: echo "Shared SurrealDB must not be stopped by this mission"
+    healthcheck: curl -sf http://127.0.0.1:8021/health > /dev/null && echo "surrealdb ok"
     port: 8021
     depends_on: []
   web_server:
-    start: WEB_SERVER_PORT=3200 cargo run --features web_server --bin web_server -- --config db_options/DbOption-zsy
-    stop: lsof -tiTCP:3200 -sTCP:LISTEN | xargs kill || true
-    healthcheck: curl -sf http://127.0.0.1:3200/api/status > /dev/null && echo "web_server ok"
-    port: 3200
+    start: WEB_SERVER_PORT=3333 cargo run --features web_server --bin web_server -- --config db_options/DbOption-zsy.toml
+    stop: lsof -tiTCP:3333 -sTCP:LISTEN | xargs kill || true
+    healthcheck: curl -sf http://127.0.0.1:3333/admin > /dev/null && curl -sf http://127.0.0.1:3333/api/admin/sites > /dev/null && echo "web_server ok"
+    port: 3333
     depends_on: [surrealdb]

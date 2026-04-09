@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "Initializing plant-model-gen RVM delivery prepack mission..."
+echo "Initializing plant-model-gen /admin site-management mission..."
 
 if [ ! -f "Cargo.toml" ]; then
   echo "Error: must run from the plant-model-gen repository root"
@@ -18,22 +18,21 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v agent-browser >/dev/null 2>&1; then
+  echo "Warning: agent-browser not found in PATH; browser validation will be blocked until it is available"
+fi
+
 echo "Primary implementation surfaces:"
-echo "- src/main.rs"
-echo "- src/cli_args.rs"
-echo "- src/cli_modes.rs"
-echo "- src/fast_model/export_model/export_dbnum_instances_v3.rs"
-echo "- src/fast_model/export_model/export_prepack_lod.rs"
-echo "- src/fast_model/export_model/export_instanced_bundle.rs"
-echo "- src/fast_model/export_model/export_glb.rs"
+echo "- src/web_server/static/admin/index.html"
+echo "- src/web_server/static/admin/admin.css"
+echo "- src/web_server/static/admin/admin.js"
+echo "- src/web_server/admin_handlers.rs"
+echo "- src/web_server/managed_project_sites.rs"
+echo "- src/web_server/models.rs"
 echo "- src/web_server/mod.rs"
-echo "- src/web_server/output_instances_files.rs"
-echo "- src/web_server/instance_export.rs"
-echo "- src/web_server/stream_generate.rs"
-echo "- src/bin/web_server.rs"
 
 echo "Mission runtime contract:"
-echo "- Reuse SurrealDB on 127.0.0.1:8021"
-echo "- Run validation web_server on 127.0.0.1:3200"
-echo "- Do not use Rust tests as the primary validation path"
-echo "- Validate with CLI/json evidence and web_server POST/static checks"
+echo "- Reuse shared SurrealDB on 127.0.0.1:8021"
+echo "- Run isolated mission web_server on 127.0.0.1:3333"
+echo "- Keep unrelated 127.0.0.1:3100 and 127.0.0.1:3101 instances untouched"
+echo "- Do not use Rust tests; validate via running web_server + curl/POST + agent-browser"

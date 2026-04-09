@@ -1,26 +1,28 @@
 # Environment
 
-Environment notes for the **web console (Vue SPA) migration mission**.
+Environment notes for the `/admin` site-management mission.
 
-**What belongs here:** platform constraints, validation readiness, local runtime quirks.
-**What does NOT belong here:** exact service start/stop commands (use `.factory/services.yaml`).
-
----
-
-## Machine Snapshot (planning dry run)
+## Machine Snapshot
 
 - OS: darwin 25.3.0
 - CPU cores: 10
 - Memory: 16 GiB
+- Validation dry run observed very low free memory; keep browser validation serial.
 
-## Local runtime assumptions
+## Runtime Assumptions
 
-- Rust `web_server` runs on **3100** (see `.factory/services.yaml`).
-- `WEB_SERVER_PORT=3100` can be used to force the port.
-- Frontend dev server (optional) runs on **3110**.
+- Mission `web_server` must run on `127.0.0.1:3333`.
+- Shared SurrealDB remains on `127.0.0.1:8021` and must not be stopped.
+- Existing `127.0.0.1:3100` and `127.0.0.1:3101` instances are off-limits.
 
-## Mission constraints
+## Constraints
 
-- Do **not** run tests or compile tests (`cargo test`, `cargo check --tests` are forbidden for this mission).
-- Validate via: running `web_server` + `curl`/`post` + `agent-browser`.
+- Do not run Rust tests or compile test targets for this mission.
+- Validate with running `web_server` + `curl`/POST + browser checks.
+- `/console/*` is out of scope.
+- Treat current uncommitted repo changes as the baseline to continue from.
 
+## Validation Readiness
+
+- `agent-browser` is installed and available.
+- The first milestone must fix the isolated 3333 validation environment so `/admin` and `/api/admin/sites` are both reachable from the same mission instance.

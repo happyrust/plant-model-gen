@@ -1,12 +1,11 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { tasksApi } from '@/api/tasks'
-import type { Task, SubTask } from '@/types/task'
+import type { TaskInfo } from '@/types/task'
 
 export const useTasksStore = defineStore('tasks', () => {
-  const tasks = ref<Task[]>([])
-  const currentTask = ref<Task | null>(null)
-  const subtasks = ref<SubTask[]>([])
+  const tasks = ref<TaskInfo[]>([])
+  const currentTask = ref<TaskInfo | null>(null)
   const loading = ref(false)
   const error = ref('')
 
@@ -26,11 +25,7 @@ export const useTasksStore = defineStore('tasks', () => {
     currentTask.value = await tasksApi.get(id)
   }
 
-  async function fetchSubtasks(taskId: string) {
-    subtasks.value = await tasksApi.subtasks(taskId)
-  }
-
-  async function createTask(payload: Partial<Task>) {
+  async function createTask(payload: Record<string, unknown>) {
     const task = await tasksApi.create(payload)
     tasks.value.unshift(task)
     return task
@@ -47,7 +42,7 @@ export const useTasksStore = defineStore('tasks', () => {
   }
 
   return {
-    tasks, currentTask, subtasks, loading, error,
-    fetchTasks, fetchTask, fetchSubtasks, createTask, cancelTask, retryTask,
+    tasks, currentTask, loading, error,
+    fetchTasks, fetchTask, createTask, cancelTask, retryTask,
   }
 })

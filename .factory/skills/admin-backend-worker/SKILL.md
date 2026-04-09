@@ -15,9 +15,14 @@ Use this skill for backend features touching the admin orchestration surface, es
 - `src/web_server/models.rs`
 - `src/web_server/mod.rs`
 
+## Required Skills
+
+- `verification-before-completion` — invoke before claiming the feature is done so the recorded evidence matches the final state.
+- `systematic-debugging` — invoke whenever the isolated `3333` instance, runtime polling, or conflict semantics behave unexpectedly.
+
 ## Work Procedure
 
-1. Read the feature, mission `AGENTS.md`, and the feature's claimed assertions.
+1. Read the feature, mission `AGENTS.md`, `.factory/services.yaml`, and the feature's claimed assertions.
 2. Use `ace-tool` first to locate the exact backend surfaces you need.
 3. Identify whether the feature changes:
    - route reachability
@@ -41,7 +46,41 @@ Use this skill for backend features touching the admin orchestration surface, es
 - Never reuse the unrelated `127.0.0.1:3100` instance as proof for this mission.
 - If you create a validation site, prefer unique ports and clean it up when the feature is done unless the next validator explicitly needs it.
 
-## Return to Orchestrator When
+## Example Handoff
+
+```json
+{
+  "salientSummary": "Stabilized the isolated 3333 admin instance and fixed `/api/admin/sites/{id}/runtime` so unrelated port occupants no longer report the managed site as running.",
+  "whatWasImplemented": "Updated the admin runtime ownership checks and startup path so the isolated mission instance on 127.0.0.1:3333 boots with the intended config, `/api/admin/sites` responds from that same instance, and `/runtime` now requires managed-site ownership evidence instead of treating any listener on the configured port as this site being online.",
+  "whatWasLeftUndone": "",
+  "verification": {
+    "commandsRun": [
+      {
+        "command": "cargo fmt --all",
+        "exitCode": 0,
+        "observation": "Formatting succeeded."
+      },
+      {
+        "command": "cargo check --features web_server --bin web_server",
+        "exitCode": 0,
+        "observation": "web_server compiled successfully."
+      },
+      {
+        "command": "curl -sf http://127.0.0.1:3333/api/admin/sites",
+        "exitCode": 0,
+        "observation": "Returned the expected admin envelope from the isolated mission instance."
+      }
+    ],
+    "interactiveChecks": []
+  },
+  "tests": {
+    "added": []
+  },
+  "discoveredIssues": []
+}
+```
+
+## When to Return to Orchestrator
 
 - The feature requires console/Vue work or broader product decisions outside `/admin`.
 - The isolated `3333` instance cannot expose `/admin` or `/api/admin/*` in a way that matches mission boundaries.

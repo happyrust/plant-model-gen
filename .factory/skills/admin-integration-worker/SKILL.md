@@ -11,6 +11,12 @@ NOTE: Startup and cleanup are handled by `worker-base`. This skill defines the W
 
 Use this skill for features that cross the static `/admin` UI and the Rust admin/runtime backend, especially when the proof requires browser interaction plus API/runtime polling.
 
+## Required Skills
+
+- `agent-browser` — mandatory for the browser side of each end-to-end flow.
+- `verification-before-completion` — invoke before finishing so browser and API evidence match the final implementation.
+- `systematic-debugging` — invoke when browser, runtime, and logs disagree during convergence checks.
+
 ## Work Procedure
 
 1. Read the feature, mission `AGENTS.md`, `.factory/services.yaml`, and the feature's `fulfills` assertions.
@@ -35,7 +41,36 @@ Use this skill for features that cross the static `/admin` UI and the Rust admin
 - API-only proof is insufficient for operator-facing orchestration features.
 - Do not use Rust tests for this mission.
 
-## Return to Orchestrator When
+## Example Handoff
+
+```json
+{
+  "salientSummary": "Closed the create/edit and lifecycle seams between the `/admin` browser shell and the admin runtime APIs on the isolated 3333 instance.",
+  "whatWasImplemented": "Adjusted the browser/API integration so create and edit preserve selection while rehydrating list/detail/runtime/log surfaces from real follow-up reads, and parse/start/stop/delete now converge with the correct busy, success, conflict, and failure states across the status strip, runtime panel, and logs panel.",
+  "whatWasLeftUndone": "",
+  "verification": {
+    "commandsRun": [
+      {
+        "command": "curl -X POST http://127.0.0.1:3333/api/admin/sites/{id}/start",
+        "exitCode": 0,
+        "observation": "Received the expected 202 envelope and confirmed later convergence through runtime/log polling."
+      }
+    ],
+    "interactiveChecks": [
+      {
+        "action": "Used agent-browser to create a site, edit it, start it, stop it, and exercise delete cancel/success/conflict flows.",
+        "observed": "Browser-visible state stayed aligned with `/api/admin/*` payloads and preserved operator context during refresh and diagnostics."
+      }
+    ]
+  },
+  "tests": {
+    "added": []
+  },
+  "discoveredIssues": []
+}
+```
+
+## When to Return to Orchestrator
 
 - The feature would require mission boundary changes (different primary port, new services, console revival).
 - The environment cannot support the required `/admin` browser + API proof on the isolated instance.

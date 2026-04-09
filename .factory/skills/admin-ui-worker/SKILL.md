@@ -15,6 +15,12 @@ Use this skill for features that primarily modify the static admin UI in `plant-
 - `src/web_server/static/admin/admin.js`
 - light route/asset touch-ups only when required to make the static UI reachable
 
+## Required Skills
+
+- `agent-browser` — mandatory for validating the `/admin` browser flows and capturing visual evidence.
+- `verification-before-completion` — invoke before finishing so screenshots and observations reflect the final UI.
+- `systematic-debugging` — invoke if the shell, state transitions, or browser evidence differ from the intended `/admin` workbench behavior.
+
 ## Work Procedure
 
 1. Read the assigned feature, mission `AGENTS.md`, and the assertions listed in the feature's `fulfills` set.
@@ -36,15 +42,36 @@ Use this skill for features that primarily modify the static admin UI in `plant-
 - Do not claim completion from static code inspection alone.
 - Do not use Rust tests for this mission.
 
-## Example Handoff Expectations
+## Example Handoff
 
-Include:
-- exact files changed
-- commands run and exit codes
-- screenshots or browser observations for the required UI states
-- any discovered UX/data-contract mismatch that should return to the orchestrator
+```json
+{
+  "salientSummary": "Realigned the `/admin` workbench shell to the approved local design and added browser-side guardrails for the main operator states.",
+  "whatWasImplemented": "Updated the admin HTML/CSS/JS shell so the page now shows the intended local-workbench header, responsive overview cards, refreshed list/editor/detail layout, and browser-side action guardrails for no-selection, busy-state, and destructive flows while keeping `/admin` as a server-served static page.",
+  "whatWasLeftUndone": "",
+  "verification": {
+    "commandsRun": [
+      {
+        "command": "cargo check --features web_server --bin web_server",
+        "exitCode": 0,
+        "observation": "Rust route wiring still compiles after the incidental admin asset changes."
+      }
+    ],
+    "interactiveChecks": [
+      {
+        "action": "Opened http://127.0.0.1:3333/admin in agent-browser, selected a site, switched log tabs, and triggered refresh.",
+        "observed": "The workbench preserved selection, showed the expected shell structure, and rendered the targeted UI states without leaving `/admin`."
+      }
+    ]
+  },
+  "tests": {
+    "added": []
+  },
+  "discoveredIssues": []
+}
+```
 
-## Return to Orchestrator When
+## When to Return to Orchestrator
 
 - The feature needs backend API semantics that are not yet implemented or are ambiguous.
 - `/admin` would need to become a console/Vue page to proceed.

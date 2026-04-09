@@ -696,7 +696,7 @@ fn save_deployment_site_config(
 }
 
 /// 打开部署站点SQLite数据库
-fn open_deployment_sites_sqlite() -> Result<rusqlite::Connection, Box<dyn std::error::Error>> {
+pub fn open_deployment_sites_sqlite() -> Result<rusqlite::Connection, Box<dyn std::error::Error>> {
     use config as cfg;
 
     // 尝试从配置文件读取SQLite路径，否则使用默认路径

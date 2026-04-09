@@ -21,6 +21,7 @@ use uuid::Uuid;
 pub mod admin_auth_handlers;
 pub mod admin_handlers;
 pub mod admin_registry_handlers;
+pub mod admin_response;
 pub mod admin_task_handlers;
 pub mod handlers;
 pub mod managed_project_sites;
@@ -903,6 +904,10 @@ pub async fn start_web_server_with_config(
             "/admin/static",
             ServeDir::new("src/web_server/static/admin"),
         )
+        .nest_service(
+            "/admin/assets",
+            ServeDir::new("src/web_server/static/admin/assets"),
+        )
         .nest_service("/static", ServeDir::new("src/web_server/static"))
         .nest_service("/console/assets", ServeDir::new("web_console/dist/assets"))
         // /files/output 下的静态文件服务（带 instances 兜底）
@@ -1345,7 +1350,9 @@ async fn admin_history_fallback(uri: axum::http::Uri) -> Result<Response, Status
     let path = uri.path();
     if !is_admin_route_request(path)
         || path.starts_with("/admin/static/")
+        || path.starts_with("/admin/assets/")
         || path == "/admin/static"
+        || path == "/admin/assets"
         || path == "/admin/api"
     {
         return Err(StatusCode::NOT_FOUND);

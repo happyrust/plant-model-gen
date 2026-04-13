@@ -9,6 +9,7 @@ use axum::{
 
 use chrono::{Local, Utc};
 use dashmap::DashMap;
+use glam::DVec3;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -167,6 +168,9 @@ use super::{
 use crate::fast_model::session::{PdmsTimeExtractor, SESSION_STORE};
 #[cfg(feature = "sqlite-index")]
 use crate::spatial_index::SqliteSpatialIndex;
+use aios_core::metadata::spatial_computation::{
+    SuppAnchorKind, compute_supp_panel_offset, resolve_supp_panel,
+};
 use aios_core::project_primary_db;
 #[cfg(feature = "sqlite-index")]
 use nalgebra::{Point3, Vector3};
@@ -1564,13 +1568,12 @@ pub async fn create_task(
     let mut task_manager = state.task_manager.lock().await;
 
     let has_manual_refnos = !request.config.manual_refnos.is_empty();
-    let task_type = if matches!(request.task_type.clone(), TaskType::DataGeneration)
-        && has_manual_refnos
-    {
-        TaskType::RefnoModelGeneration
-    } else {
-        request.task_type
-    };
+    let task_type =
+        if matches!(request.task_type.clone(), TaskType::DataGeneration) && has_manual_refnos {
+            TaskType::RefnoModelGeneration
+        } else {
+            request.task_type
+        };
 
     let mut task = TaskInfo::new(request.name, task_type, request.config);
     // 附加可选元数据（batch_id 等）
@@ -6090,6 +6093,35 @@ pub async fn space_tools_page() -> Html<String> {
     Html(wrapped)
 }
 
+fn build_space_suppo_refno(dbnum: u32, suppo_refno: u64) -> anyhow::Result<RefnoEnum> {
+    let ref1 = u32::try_from(suppo_refno)
+        .map_err(|_| anyhow::anyhow!("suppo_refno 超出 u32 范围: {suppo_refno}"))?;
+    Ok(RefU64::from_two_nums(dbnum, ref1).into())
+}
+
+fn fitting_offset_point_to_dto(point: DVec3) -> FittingOffsetPointDto {
+    FittingOffsetPointDto {
+        x: point.x,
+        y: point.y,
+        z: point.z,
+    }
+}
+
+fn fitting_offset_vector_to_dto(vector: DVec3) -> FittingOffsetVectorDto {
+    FittingOffsetVectorDto {
+        dx: vector.x,
+        dy: vector.y,
+        dz: vector.z,
+    }
+}
+
+fn supp_anchor_kind_to_str(kind: SuppAnchorKind) -> &'static str {
+    match kind {
+        SuppAnchorKind::S1 => "S1",
+        SuppAnchorKind::S2 => "S2",
+    }
+}
+
 /// 支架-桥架识别（占位实现，返回回显数据）
 pub async fn api_space_suppo_trays(Json(req): Json<SuppoTraysRequest>) -> Json<serde_json::Value> {
     Json(json!({
@@ -6100,14 +6132,41 @@ pub async fn api_space_suppo_trays(Json(req): Json<SuppoTraysRequest>) -> Json<s
     }))
 }
 
-/// 预埋板编号识别（占位）
+/// 预埋板编号识别
 pub async fn api_space_fitting(Json(req): Json<FittingRequest>) -> Json<serde_json::Value> {
-    Json(json!({
-        "status":"success",
-        "message":"stub",
-        "data": {"fitting": null, "covered": false, "coverage_ratio": 0.0},
-        "echo": req
-    }))
+    let suppo_refno = match build_space_suppo_refno(req.dbnum, req.suppo_refno) {
+        Ok(value) => value,
+        Err(err) => {
+            return Json(json!({
+                "status": "error",
+                "message": format!("suppo_refno 解析失败: {err}")
+            }));
+        }
+    };
+
+    match resolve_supp_panel(suppo_refno, req.tolerance).await {
+        Ok(Some(panel)) => Json(json!({
+            "status": "success",
+            "data": {
+                "fitting": panel.panel_name,
+                "covered": true,
+                "coverage_ratio": 1.0
+            }
+        })),
+        Ok(None) => Json(json!({
+            "status": "success",
+            "message": "no panel matched",
+            "data": {
+                "fitting": null,
+                "covered": false,
+                "coverage_ratio": 0.0
+            }
+        })),
+        Err(err) => Json(json!({
+            "status": "error",
+            "message": format!("fitting 查询失败: {err}")
+        })),
+    }
 }
 
 #[cfg(feature = "sqlite-index")]
@@ -6455,16 +6514,50 @@ mod wall_distance_tests {
     }
 }
 
-/// 与预埋板相对定位（占位）
+/// 与预埋板相对定位
 pub async fn api_space_fitting_offset(
     Json(req): Json<FittingOffsetRequest>,
 ) -> Json<serde_json::Value> {
-    Json(json!({
-        "status":"success",
-        "message":"stub",
-        "data": {"vector": {"dx":0.0, "dy":0.0, "dz":0.0}, "length": 0.0, "within": false},
-        "echo": req
-    }))
+    let suppo_refno = match build_space_suppo_refno(req.dbnum, req.suppo_refno) {
+        Ok(value) => value,
+        Err(err) => {
+            return Json(json!({
+                "status": "error",
+                "message": format!("suppo_refno 解析失败: {err}")
+            }));
+        }
+    };
+
+    match compute_supp_panel_offset(suppo_refno, req.tolerance).await {
+        Ok(Some(offset)) => {
+            let within = req
+                .tolerance
+                .map(|tolerance| offset.length <= tolerance)
+                .unwrap_or(true);
+            let response = FittingOffsetResponseData {
+                anchor_kind: supp_anchor_kind_to_str(offset.anchor_kind).to_string(),
+                anchor_point: fitting_offset_point_to_dto(offset.anchor_point),
+                panel_refno: offset.panel_refno.refno().to_slash_string(),
+                panel_center: fitting_offset_point_to_dto(offset.panel_center),
+                vector: fitting_offset_vector_to_dto(offset.vector),
+                length: offset.length,
+                within,
+            };
+            Json(json!({
+                "status": "success",
+                "data": response
+            }))
+        }
+        Ok(None) => Json(json!({
+            "status": "success",
+            "message": "no panel matched",
+            "data": null
+        })),
+        Err(err) => Json(json!({
+            "status": "error",
+            "message": format!("fitting-offset 查询失败: {err}")
+        })),
+    }
 }
 
 /// 与钢结构相对定位（占位）

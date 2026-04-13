@@ -966,12 +966,16 @@ pub fn load_web_server_runtime_config(explicit_port: u16) -> WebServerRuntimeCon
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "0.0.0.0".to_string());
 
-    let bind_port = cfg_builder
-        .as_ref()
-        .and_then(|cfg| cfg.get_int("web_server.port").ok())
-        .and_then(|value| u16::try_from(value).ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(explicit_port);
+    let bind_port = if explicit_port > 0 {
+        explicit_port
+    } else {
+        cfg_builder
+            .as_ref()
+            .and_then(|cfg| cfg.get_int("web_server.port").ok())
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(3100)
+    };
 
     let region = cfg_builder
         .as_ref()

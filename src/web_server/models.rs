@@ -1691,6 +1691,31 @@ pub struct FittingOffsetRequest {
     pub tolerance: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FittingOffsetPointDto {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FittingOffsetVectorDto {
+    pub dx: f64,
+    pub dy: f64,
+    pub dz: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FittingOffsetResponseData {
+    pub anchor_kind: String,
+    pub anchor_point: FittingOffsetPointDto,
+    pub panel_refno: String,
+    pub panel_center: FittingOffsetPointDto,
+    pub vector: FittingOffsetVectorDto,
+    pub length: f64,
+    pub within: bool,
+}
+
 /// 与钢结构相对定位 请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteelRelativeRequest {

@@ -4,6 +4,7 @@
 
 ### Added
 
+- `/admin` 新增“中心注册表”页面，并补齐 admin 风格的注册表接口：支持列表/过滤/分页、新建/编辑/删除、`DbOption.toml` 导入、健康检查、配置导出和创建任务。
 - 导出模型查询：增加对 `Neg` (负实体) 的导出支持，并放宽图元节点输出条件确保元素正常输出。
 - 新增工具脚本：`scripts/export_dbnum_parquet_file.sh` 和 `test_ida_mcp.py` 辅助调测。
 - 完善 web_server 站点模型与注册链路：新增站点身份与配置信息链路（`site_id/site_name/region/project_code/frontend_url/backend_url`）以及 `project_code` 作为站点代号字段。
@@ -13,6 +14,7 @@
 
 ### Changed
 
+- 站点管理正式收口到 `/admin`：本机编排使用 `/admin#/sites`，中心注册表使用 `/admin#/registry`，`/deployment-sites` 与 `/console/deployment/sites` 只保留兼容跳转。
 - **平台 API `POST /api/review/embed-url` 请求体**：本单据工作流角色字段由 `role` 更名为 **`workflow_role`**（Rust 侧 `EmbedUrlRequest.workflow_role`）；JSON 仍接受顶层别名 **`role`** 以兼容旧客户端。**不再接受** `user_role`（含 `extra_parameters.user_role`）。JWT claims 内字段名仍为 `role`，未变。详见 `docs/guides/PLATFORM_API_HTTP_EXAMPLES.md`。
 - 调整环境默认配置：`db_options/DbOption.toml` 等修改默认数据库连接模式为 `file`。
 
@@ -31,6 +33,8 @@
 
 ### Fixed
 
+- 修复 admin 管理接口此前只在前端带 token、后端并未校验的问题；现在 `/api/admin/sites`、`/api/admin/tasks` 与 `/api/admin/registry/*` 都要求有效 Bearer token，失效会话会回到登录页。
+- 修复 admin 登录态接口返回不一致的问题：`/api/admin/auth/me` 改为真实读取当前会话，`/api/admin/auth/logout` 返回明确的登出结果，避免前端状态残留。
 - **embed-url**：当请求未带工作流角色且单据库中尚无 `role` 时，签发 JWT 仍写入默认 **`sj`**，避免 plant3d 嵌入页因 claims 缺 `role` 报「缺少可信身份声明」。
 - 调整 OBJ 导出默认首图为更接近正视的验收视角，减少斜俯视角度导致的方向误判。
 - 修复 `--regen-model` 未清理旧 `tubi_relate` 导致 BRAN/HANG 导出时混入历史局部坐标直段的问题。

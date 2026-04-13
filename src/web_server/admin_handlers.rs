@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::web_server::{
+    AppState,
     managed_project_sites as managed_sites,
     models::{
         CreateManagedSiteRequest, ManagedSiteLogsResponse, ManagedSiteRuntimeStatus,
@@ -18,7 +19,7 @@ use crate::web_server::{
 
 type ApiResponse = (StatusCode, Json<Value>);
 
-pub fn create_admin_routes() -> Router {
+pub fn create_admin_routes() -> Router<AppState> {
     Router::new()
         .route("/api/admin/sites", get(list_sites).post(create_site))
         .route(

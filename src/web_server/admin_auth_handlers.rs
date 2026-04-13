@@ -1,14 +1,16 @@
 use axum::{
     Router,
-    extract::Json,
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{Json, Request},
+    http::{HeaderMap, Method, StatusCode, header::AUTHORIZATION},
+    middleware::Next,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::LazyLock;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use uuid::Uuid;
 
@@ -36,6 +38,18 @@ pub fn create_admin_auth_routes() -> Router {
         .route("/api/admin/auth/login", post(login))
         .route("/api/admin/auth/logout", post(logout))
         .route("/api/admin/auth/me", get(me))
+}
+
+pub async fn admin_session_middleware(
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiResponse> {
+    if request.method() == Method::OPTIONS {
+        return Ok(next.run(request).await);
+    }
+
+    require_admin_session(request.headers())?;
+    Ok(next.run(request).await)
 }
 
 async fn login(Json(payload): Json<LoginRequest>) -> impl IntoResponse {
@@ -67,20 +81,90 @@ async fn login(Json(payload): Json<LoginRequest>) -> impl IntoResponse {
     response(StatusCode::OK, true, "登录成功", Some(session))
 }
 
-async fn logout() -> impl IntoResponse {
-    response::<Value>(StatusCode::OK, true, "登出成功", None)
+async fn logout(headers: HeaderMap) -> impl IntoResponse {
+    if let Some(token) = extract_bearer_token(&headers) {
+        if let Ok(mut sessions) = SESSIONS.lock() {
+            cleanup_expired_sessions(&mut sessions);
+            sessions.remove(token);
+        }
+    }
+    response(
+        StatusCode::OK,
+        true,
+        "登出成功",
+        Some(json!({
+            "logged_out": true
+        })),
+    )
 }
 
-async fn me() -> impl IntoResponse {
+async fn me(headers: HeaderMap) -> Response {
+    let session = match require_admin_session(&headers) {
+        Ok(session) => session,
+        Err(err) => return err.into_response(),
+    };
     response(
         StatusCode::OK,
         true,
         "获取用户信息成功",
         Some(json!({
-            "username": "admin",
-            "role": "admin"
+            "username": session.username,
+            "role": session.role
         })),
     )
+    .into_response()
+}
+
+fn require_admin_session(headers: &HeaderMap) -> Result<AdminSession, ApiResponse> {
+    let token = extract_bearer_token(headers)
+        .ok_or_else(|| unauthorized("缺少或无效的 Authorization"))?;
+    validate_session_token(token).map_err(unauthorized)
+}
+
+fn validate_session_token(token: &str) -> Result<AdminSession, String> {
+    let mut sessions = SESSIONS
+        .lock()
+        .map_err(|_| "管理员会话不可用，请稍后重试".to_string())?;
+    cleanup_expired_sessions(&mut sessions);
+    let session = sessions
+        .get(token)
+        .cloned()
+        .ok_or_else(|| "管理员会话不存在或已失效".to_string())?;
+
+    let expires_at = parse_expire_time(&session.expires_at)
+        .ok_or_else(|| "管理员会话过期时间无效".to_string())?;
+    if expires_at <= Utc::now() {
+        sessions.remove(token);
+        return Err("管理员会话已过期".to_string());
+    }
+
+    Ok(session)
+}
+
+fn cleanup_expired_sessions(sessions: &mut HashMap<String, AdminSession>) {
+    let now = Utc::now();
+    sessions.retain(|_, session| {
+        parse_expire_time(&session.expires_at)
+            .map(|expires_at| expires_at > now)
+            .unwrap_or(false)
+    });
+}
+
+fn parse_expire_time(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|time| time.with_timezone(&Utc))
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+fn unauthorized(message: impl Into<String>) -> ApiResponse {
+    response::<Value>(StatusCode::UNAUTHORIZED, false, message, None)
 }
 
 fn response<T>(

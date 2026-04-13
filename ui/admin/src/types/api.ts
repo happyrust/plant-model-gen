@@ -19,11 +19,15 @@ export interface AuthCredentials {
   password: string
 }
 
+export interface AuthUser {
+  username: string
+  role: string
+}
+
 export interface AuthSession {
   token: string
   expires_at: string
-  user: {
-    username: string
-    role: string
-  }
+  username?: string
+  role?: string
+  user?: AuthUser
 }

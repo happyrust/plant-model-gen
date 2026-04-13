@@ -1,5 +1,5 @@
 import { apiGet, apiPost } from './client'
-import type { AuthCredentials, AuthSession } from '@/types/api'
+import type { AuthCredentials, AuthSession, AuthUser } from '@/types/api'
 
 export const authApi = {
   login: (creds: AuthCredentials) =>
@@ -7,5 +7,5 @@ export const authApi = {
 
   logout: () => apiPost('/api/admin/auth/logout'),
 
-  me: () => apiGet<AuthSession['user']>('/api/admin/auth/me'),
+  me: () => apiGet<AuthUser>('/api/admin/auth/me'),
 }

@@ -1,6 +1,8 @@
 import type { RouteRecordRaw } from 'vue-router';
 
 import DashboardView from '@/views/DashboardView.vue';
+import AdminRedirectView from '@/views/AdminRedirectView.vue';
+import CollaborationRedirectView from '@/views/CollaborationRedirectView.vue';
 import PlaceholderView from '@/views/PlaceholderView.vue';
 import ProjectDetailPlaceholderView from '@/views/ProjectDetailPlaceholderView.vue';
 import ProjectsView from '@/views/ProjectsView.vue';
@@ -76,12 +78,12 @@ export const appRoutes: RouteRecordRaw[] = [
   {
     path: '/deployment/sites',
     name: 'deployment-sites',
-    component: PlaceholderView,
+    component: AdminRedirectView,
     props: {
       eyebrow: 'Deployment',
-      title: 'Deployment sites placeholder',
-      description: 'Deployment site management now has a stable `/console` destination for deep links, refresh, and navigation validation.',
-      chips: ['Sites', 'Healthcheck', 'Import'],
+      title: 'Deployment sites redirect',
+      description: 'Deployment site management has moved to `/admin#/registry`, and this route now only preserves old deep links.',
+      chips: ['Admin', 'Redirect'],
     },
     meta: {
       title: 'Deployment Sites',
@@ -130,12 +132,12 @@ export const appRoutes: RouteRecordRaw[] = [
   {
     path: '/sync/remote',
     name: 'sync-remote',
-    component: PlaceholderView,
+    component: CollaborationRedirectView,
     props: {
       eyebrow: 'Sync',
-      title: 'Remote sync placeholder',
-      description: 'Remote sync environment management will land here after the shell migration, preserving deep links for env and site workflows.',
-      chips: ['Envs', 'Sites', 'Runtime'],
+      title: 'Remote sync redirect',
+      description: 'Remote sync management has moved to `/admin/#/collaboration`, and this route now only preserves old deep links.',
+      chips: ['Admin', 'Redirect', 'Collaboration'],
     },
     meta: {
       title: 'Remote Sync',

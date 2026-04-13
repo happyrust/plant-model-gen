@@ -1,6 +1,13 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 
+function normalizeRedirectTarget(value: unknown) {
+  if (typeof value !== 'string' || !value.startsWith('/')) {
+    return '/'
+  }
+  return value
+}
+
 const router = createRouter({
   history: createWebHashHistory('/admin/'),
   routes: [
@@ -20,6 +27,11 @@ const router = createRouter({
           path: 'sites',
           name: 'sites',
           component: () => import('@/views/SitesView.vue'),
+        },
+        {
+          path: 'registry',
+          name: 'registry',
+          component: () => import('@/views/RegistrySitesView.vue'),
         },
         {
           path: 'sites/:id',
@@ -49,10 +61,15 @@ const router = createRouter({
 router.beforeEach((to) => {
   const auth = useAuthStore()
   if (to.meta.requiresAuth && !auth.isAuthenticated) {
-    return { name: 'login' }
+    return {
+      name: 'login',
+      query: {
+        redirect: to.fullPath,
+      },
+    }
   }
   if (to.meta.guest && auth.isAuthenticated) {
-    return { path: '/' }
+    return { path: normalizeRedirectTarget(to.query.redirect) }
   }
 })
 

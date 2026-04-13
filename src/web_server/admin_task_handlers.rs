@@ -10,8 +10,9 @@ use serde_json::{Value, json};
 use std::sync::LazyLock;
 use std::sync::Mutex;
 
-use crate::web_server::models::{
-    TaskInfo, TaskStatus, TaskType, TaskPriority, DatabaseConfig,
+use crate::web_server::{
+    AppState,
+    models::{DatabaseConfig, TaskInfo, TaskPriority, TaskStatus, TaskType},
 };
 
 type ApiResponse = (StatusCode, Json<Value>);
@@ -19,7 +20,7 @@ type ApiResponse = (StatusCode, Json<Value>);
 static TASK_STORE: LazyLock<Mutex<Vec<TaskInfo>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
-pub fn create_admin_task_routes() -> Router {
+pub fn create_admin_task_routes() -> Router<AppState> {
     Router::new()
         .route("/api/admin/tasks", get(list_tasks).post(create_task))
         .route("/api/admin/tasks/{id}", get(get_task))

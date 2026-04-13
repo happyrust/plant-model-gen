@@ -4,6 +4,7 @@ use axum::{
     body::Body,
     extract::{Query, State},
     http::{Method, StatusCode, header},
+    middleware,
     response::{Html, Json, Response},
     routing::{delete, get, post, put},
 };
@@ -19,6 +20,7 @@ use uuid::Uuid;
 
 pub mod admin_auth_handlers;
 pub mod admin_handlers;
+pub mod admin_registry_handlers;
 pub mod admin_task_handlers;
 pub mod handlers;
 pub mod managed_project_sites;
@@ -305,6 +307,15 @@ pub async fn start_web_server_with_config(
     };
     let upload_routes = create_upload_routes(upload_state);
 
+    let admin_api_routes = Router::<AppState>::new()
+        .merge(admin_handlers::create_admin_routes())
+        .merge(admin_registry_handlers::create_admin_registry_routes())
+        .merge(admin_task_handlers::create_admin_task_routes())
+        .route_layer(middleware::from_fn(
+            admin_auth_handlers::admin_session_middleware,
+        ))
+        .with_state(app_state.clone());
+
     let app = Router::new()
         // API路由
         .route("/api/tasks", get(get_tasks).post(create_task))
@@ -558,7 +569,7 @@ pub async fn start_web_server_with_config(
         .route(
             "/remote-sync",
             get(|uri: axum::http::Uri| async move {
-                redirect_legacy_console_path(uri, "/console/sync/remote").await
+                redirect_legacy_console_path(uri, "/admin/#/collaboration").await
             }),
         )
         .route(
@@ -767,9 +778,7 @@ pub async fn start_web_server_with_config(
         // 部署站点管理页面
         .route(
             "/deployment-sites",
-            get(|uri: axum::http::Uri| async move {
-                redirect_legacy_console_path(uri, "/console/deployment/sites").await
-            }),
+            get(admin_registry_redirect),
         )
         // 数据解析向导API
         .route(
@@ -873,6 +882,20 @@ pub async fn start_web_server_with_config(
         .route("/api/export/cleanup", post(handlers::cleanup_export_tasks))
         .route("/admin", get(admin_index_page).head(admin_head_page))
         .route("/admin/", get(admin_index_page).head(admin_head_page))
+        .route("/console/deployment/sites", get(admin_registry_redirect))
+        .route("/console/deployment/sites/", get(admin_registry_redirect))
+        .route(
+            "/console/sync/remote",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/admin/#/collaboration").await
+            }),
+        )
+        .route(
+            "/console/sync/remote/",
+            get(|uri: axum::http::Uri| async move {
+                redirect_legacy_console_path(uri, "/admin/#/collaboration").await
+            }),
+        )
         .route("/console", get(console_index_page).head(console_head_page))
         .route("/console/", get(console_index_page).head(console_head_page))
         // 静态文件服务
@@ -1047,9 +1070,8 @@ pub async fn start_web_server_with_config(
         .route("/ws/tasks", get(ws::ws_tasks_handler))
         .fallback(app_history_fallback)
         .with_state(app_state.clone())
-        .merge(admin_handlers::create_admin_routes())
         .merge(admin_auth_handlers::create_admin_auth_routes())
-        .merge(admin_task_handlers::create_admin_task_routes())
+        .merge(admin_api_routes)
         .merge(spatial_query_routes)
         .merge(noun_hierarchy_routes)
         .merge(e3d_tree_routes)
@@ -1313,6 +1335,10 @@ async fn console_head_page() -> Result<Response, StatusCode> {
 
 async fn console_root_redirect() -> Response {
     redirect_response("/console", None)
+}
+
+async fn admin_registry_redirect() -> Response {
+    redirect_response("/admin/#/registry", None)
 }
 
 async fn admin_history_fallback(uri: axum::http::Uri) -> Result<Response, StatusCode> {

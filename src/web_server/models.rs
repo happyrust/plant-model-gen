@@ -802,8 +802,35 @@ pub struct ManagedProjectSite {
     pub parse_status: ManagedSiteParseStatus,
     pub last_error: Option<String>,
     pub entry_url: Option<String>,
+    pub last_parse_started_at: Option<String>,
+    pub last_parse_finished_at: Option<String>,
+    pub last_parse_duration_ms: Option<u64>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// 管理后台单进程资源信息
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedSiteProcessResource {
+    pub pid: Option<u32>,
+    pub running: bool,
+    pub cpu_usage: Option<f32>,
+    pub memory_bytes: Option<u64>,
+}
+
+/// 管理后台站点资源信息
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedSiteResourceMetrics {
+    pub db_process: ManagedSiteProcessResource,
+    pub web_process: ManagedSiteProcessResource,
+    pub parse_process: ManagedSiteProcessResource,
+    pub runtime_dir_size_bytes: u64,
+    pub data_dir_size_bytes: u64,
+    pub runtime_dir_missing: bool,
+    pub data_dir_missing: bool,
+    pub last_parse_started_at: Option<String>,
+    pub last_parse_finished_at: Option<String>,
+    pub last_parse_duration_ms: Option<u64>,
 }
 
 /// 创建管理后台项目站点请求
@@ -873,6 +900,19 @@ pub struct ManagedSiteRuntimeStatus {
     pub last_key_log: Option<String>,
     pub last_key_log_source: Option<String>,
     pub recent_activity: Option<ManagedSiteActivitySummary>,
+    pub resources: Option<ManagedSiteResourceMetrics>,
+}
+
+/// 管理后台资源摘要
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AdminResourceSummary {
+    pub cpu_usage: Option<f32>,
+    pub memory_usage: Option<f32>,
+    pub disk_usage: Option<f32>,
+    pub admin_runtime_size_bytes: u64,
+    pub managed_data_size_bytes: u64,
+    pub updated_at: String,
+    pub message: Option<String>,
 }
 
 /// 管理后台最近活动摘要
@@ -1615,38 +1655,69 @@ pub struct TaskLogQuery {
 
 // ===== 空间计算交互模型 =====
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SpaceSuppoRefnoInput {
+    Full(String),
+    Legacy(u64),
+}
+
 /// 支架-桥架识别 请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuppoTraysRequest {
-    pub dbnum: u32,
-    pub suppo_refno: u64,
+    #[serde(default)]
+    pub dbnum: Option<u32>,
+    pub suppo_refno: SpaceSuppoRefnoInput,
     #[serde(default)]
     pub tolerance: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuppoTrayDto {
+    pub bran_refno: String,
+    pub tray_section_refno: String,
+    pub support_type: String,
+    pub contact_point: FittingOffsetPointDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuppoTraysResponseData {
+    pub anchor_kind: String,
+    pub trays: Vec<SuppoTrayDto>,
 }
 
 /// 预埋板识别 请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FittingRequest {
-    pub dbnum: u32,
-    pub suppo_refno: u64,
+    #[serde(default)]
+    pub dbnum: Option<u32>,
+    pub suppo_refno: SpaceSuppoRefnoInput,
     #[serde(default)]
     pub tolerance: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FittingResponseData {
+    pub fitting: String,
+    pub panel_refno: String,
+    pub panel_center: FittingOffsetPointDto,
+    pub match_method: String,
+    pub covered: bool,
+    pub coverage_ratio: f64,
 }
 
 /// 距墙/定位块 距离 请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WallDistanceRequest {
-    /// 数据库编号（用于前端显式传递上下文）
-    pub dbnum: u32,
-    /// 源构件（管道）refno，兼容 "db_ref" / "db/ref" 格式
-    pub source_refno: String,
-    /// 目标 noun 过滤（默认 WALL + COLUMN）
+    #[serde(default)]
+    pub dbnum: Option<u32>,
+    pub suppo_refno: SpaceSuppoRefnoInput,
+    #[serde(default)]
+    pub suppo_type: Option<String>,
     #[serde(default)]
     pub target_nouns: Option<Vec<String>>,
-    /// 搜索半径（mm）
     #[serde(default)]
     pub search_radius: Option<f64>,
-    /// 后端候选上限（默认 20）
     #[serde(default)]
     pub max_candidates: Option<usize>,
 }
@@ -1659,34 +1730,37 @@ pub struct WallDistancePoint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WallDistanceAabbDto {
-    pub min: WallDistancePoint,
-    pub max: WallDistancePoint,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WallDistanceCandidateDto {
     pub refno: String,
     pub noun: String,
     #[serde(default)]
     pub spec_value: Option<i64>,
-    /// 基于 AABB 的粗筛距离（mm）
     pub distance_mm: f64,
-    pub aabb: WallDistanceAabbDto,
+    pub closest_point: WallDistancePoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WallDistanceTargetDto {
+    pub refno: String,
+    pub noun: String,
+    pub distance_mm: f64,
+    pub closest_point: WallDistancePoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WallDistanceResponseData {
-    pub source_refno: String,
-    pub source_aabb: WallDistanceAabbDto,
+    pub anchor_kind: String,
+    pub anchor_point: WallDistancePoint,
+    pub target: WallDistanceTargetDto,
     pub candidates: Vec<WallDistanceCandidateDto>,
 }
 
 /// 与预埋板相对定位 请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FittingOffsetRequest {
-    pub dbnum: u32,
-    pub suppo_refno: u64,
+    #[serde(default)]
+    pub dbnum: Option<u32>,
+    pub suppo_refno: SpaceSuppoRefnoInput,
     #[serde(default)]
     pub tolerance: Option<f64>,
 }
@@ -1719,25 +1793,50 @@ pub struct FittingOffsetResponseData {
 /// 与钢结构相对定位 请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteelRelativeRequest {
-    pub dbnum: u32,
-    pub suppo_refno: u64,
-    /// S1 | S2
-    pub suppo_type: String,
+    #[serde(default)]
+    pub dbnum: Option<u32>,
+    pub suppo_refno: SpaceSuppoRefnoInput,
+    /// S1 | S2，可选；缺省时后端自动判断
+    #[serde(default)]
+    pub suppo_type: Option<String>,
     #[serde(default)]
     pub search_radius: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteelRelativeResponseData {
+    pub anchor_kind: String,
+    pub anchor_point: FittingOffsetPointDto,
+    pub steel_refno: String,
+    pub steel_noun: String,
+    pub closest_point: FittingOffsetPointDto,
+    pub vector: FittingOffsetVectorDto,
+    pub length: f64,
+    pub within: bool,
 }
 
 /// 托盘跨度 请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraySpanRequest {
-    pub dbnum: u32,
-    /// 如果缺省则从 suppo_refno 推断其所属托盘
     #[serde(default)]
-    pub tray_id: Option<u64>,
-    #[serde(default)]
-    pub suppo_refno: Option<u64>,
+    pub dbnum: Option<u32>,
+    pub suppo_refno: SpaceSuppoRefnoInput,
     #[serde(default)]
     pub neighbor_window: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraySpanResponseData {
+    pub bran_refno: String,
+    #[serde(default)]
+    pub left_suppo_refno: Option<String>,
+    #[serde(default)]
+    pub right_suppo_refno: Option<String>,
+    #[serde(default)]
+    pub left_distance: Option<f64>,
+    #[serde(default)]
+    pub right_distance: Option<f64>,
+    pub neighbor_window: f64,
 }
 
 // ===== 基于 Refno 的模型生成 =====

@@ -1,12 +1,12 @@
 use aios_core::{
-    RefU64, RefnoEnum, get_children_refnos, get_db_option, get_named_attmap, options::DbOption,
-    query_filter_ancestors,
+    get_children_refnos, get_db_option, get_named_attmap, options::DbOption,
+    query_filter_ancestors, RefU64, RefnoEnum,
 };
 use axum::{
     body::Body,
     extract::{Path, Query, State},
     handler::Handler,
-    http::{HeaderValue, StatusCode, header},
+    http::{header, HeaderValue, StatusCode},
     response::{Html, Json, Response},
 };
 
@@ -159,22 +159,22 @@ pub async fn kill_port_processes_api(
 }
 
 use super::{
-    AppState,
-    CreateTaskRequest,
-    TaskQuery,
-    UpdateConfigRequest,
     // templates::*,  // 暂时禁用
     batch_tasks_template,
     models::*,
     simple_templates::render_database_connection_page,
+    AppState,
+    CreateTaskRequest,
+    TaskQuery,
+    UpdateConfigRequest,
 };
 #[cfg(feature = "sqlite-index")]
 use crate::fast_model::session::{PdmsTimeExtractor, SESSION_STORE};
 #[cfg(feature = "sqlite-index")]
 use crate::spatial_index::SqliteSpatialIndex;
 use aios_core::metadata::spatial_computation::{
-    SuppAnchorKind, compute_supp_panel_offset, compute_supp_span, resolve_supp_anchor,
-    resolve_supp_bran, resolve_supp_panel, resolve_supp_steel, resolve_supp_wall,
+    compute_supp_panel_offset, compute_supp_span, resolve_supp_anchor, resolve_supp_bran,
+    resolve_supp_panel, resolve_supp_steel, resolve_supp_wall, SuppAnchorKind,
 };
 use aios_core::project_primary_db;
 #[cfg(feature = "sqlite-index")]
@@ -454,68 +454,20 @@ pub async fn api_get_projects(
                 items.len()
             );
         }
-        // 过滤
-        if let Some(q) = params.q.as_ref().filter(|s| !s.is_empty()) {
-            let ql = q.to_lowercase();
-            items.retain(|p| {
-                p.name.to_lowercase().contains(&ql)
-                    || p.owner
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase()
-                        .contains(&ql)
-            });
-        }
-        if let Some(status) = params.status.as_ref().filter(|s| !s.is_empty()) {
-            items.retain(|p| matches_status(&p.status, status));
-        }
-        if let Some(owner) = params.owner.as_ref().filter(|s| !s.is_empty()) {
-            items.retain(|p| p.owner.as_deref() == Some(owner.as_str()));
-        }
+        return Ok(Json(build_projects_list_response(items, &params, "sqlite")));
+    }
 
-        // 排序（默认按 updated_at desc，如果存在）
-        let (sort_field, sort_dir) = match params.sort.as_deref() {
-            Some(s) if s.contains(":") => {
-                let mut it = s.splitn(2, ":");
-                (
-                    it.next().unwrap_or("updated_at"),
-                    it.next().unwrap_or("desc"),
-                )
-            }
-            Some(s) => (s, "desc"),
-            None => ("updated_at", "desc"),
-        };
-        let desc = !sort_dir.eq_ignore_ascii_case("asc");
-        items.sort_by(|a, b| {
-            let ord = match sort_field {
-                "name" => a.name.cmp(&b.name),
-                "env" => a.env.cmp(&b.env),
-                "version" => a.version.cmp(&b.version),
-                "updated_at" => a.updated_at.cmp(&b.updated_at),
-                _ => a.updated_at.cmp(&b.updated_at),
-            };
-            if desc { ord.reverse() } else { ord }
-        });
-
-        // 分页
-        let per_page = params.per_page.unwrap_or(20).max(1).min(100) as usize;
-        let page = params.page.unwrap_or(1).max(1) as usize;
-        let total = items.len();
-        let start = (page - 1) * per_page;
-        let end = (start + per_page).min(total);
-        let page_items = if start < total {
-            items[start..end].to_vec()
-        } else {
-            Vec::new()
-        };
-
-        return Ok(Json(serde_json::json!({
-            "items": page_items,
-            "total": total,
-            "page": page,
-            "per_page": per_page,
-            "source": "sqlite",
-        })));
+    let config_items = load_projects_from_config();
+    if !config_items.is_empty() {
+        println!(
+            "📋 [projects] config 快速分支: 查到 {} 条项目",
+            config_items.len()
+        );
+        return Ok(Json(build_projects_list_response(
+            config_items,
+            &params,
+            "config",
+        )));
     }
 
     let mut filters: Vec<String> = Vec::new();
@@ -684,6 +636,76 @@ fn load_projects_from_config() -> Vec<ProjectItem> {
             }
         })
         .collect()
+}
+
+fn build_projects_list_response(
+    mut items: Vec<ProjectItem>,
+    params: &ProjectQuery,
+    source: &str,
+) -> serde_json::Value {
+    if let Some(q) = params.q.as_ref().filter(|s| !s.is_empty()) {
+        let ql = q.to_lowercase();
+        items.retain(|p| {
+            p.name.to_lowercase().contains(&ql)
+                || p.owner
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&ql)
+        });
+    }
+    if let Some(status) = params.status.as_ref().filter(|s| !s.is_empty()) {
+        items.retain(|p| matches_status(&p.status, status));
+    }
+    if let Some(owner) = params.owner.as_ref().filter(|s| !s.is_empty()) {
+        items.retain(|p| p.owner.as_deref() == Some(owner.as_str()));
+    }
+
+    let (sort_field, sort_dir) = match params.sort.as_deref() {
+        Some(s) if s.contains(":") => {
+            let mut it = s.splitn(2, ":");
+            (
+                it.next().unwrap_or("updated_at"),
+                it.next().unwrap_or("desc"),
+            )
+        }
+        Some(s) => (s, "desc"),
+        None => ("updated_at", "desc"),
+    };
+    let desc = !sort_dir.eq_ignore_ascii_case("asc");
+    items.sort_by(|a, b| {
+        let ord = match sort_field {
+            "name" => a.name.cmp(&b.name),
+            "env" => a.env.cmp(&b.env),
+            "version" => a.version.cmp(&b.version),
+            "updated_at" => a.updated_at.cmp(&b.updated_at),
+            _ => a.updated_at.cmp(&b.updated_at),
+        };
+        if desc {
+            ord.reverse()
+        } else {
+            ord
+        }
+    });
+
+    let per_page = params.per_page.unwrap_or(20).max(1).min(100) as usize;
+    let page = params.page.unwrap_or(1).max(1) as usize;
+    let total = items.len();
+    let start = (page - 1) * per_page;
+    let end = (start + per_page).min(total);
+    let page_items = if start < total {
+        items[start..end].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    serde_json::json!({
+        "items": page_items,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "source": source,
+    })
 }
 
 fn project_show_dbnum(project_name: &str) -> Option<u32> {
@@ -1902,7 +1924,7 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
     #[cfg(feature = "sqlite-index")]
     {
         // use crate::spatial_index::SqliteSpatialIndex;
-        use aios_core::{RefU64, RefnoEnum, project_primary_db};
+        use aios_core::{project_primary_db, RefU64, RefnoEnum};
 
         if !SqliteSpatialIndex::is_enabled() {
             return Ok(Json(
@@ -3482,12 +3504,12 @@ pub struct ModelDataResponse {
 pub async fn api_get_instances(
     Query(req): Query<GetInstancesRequest>,
 ) -> Result<Json<ModelDataResponse>, (StatusCode, String)> {
-    use crate::fast_model::export_model::ExportData;
     use crate::fast_model::export_model::export_instanced_bundle::{
         ArchetypeInfo, InstanceInfo, InstancesData, LodLevelInfo,
     };
+    use crate::fast_model::export_model::ExportData;
     use aios_core::mesh_precision::LodLevel;
-    use aios_core::{RefU64, RefnoEnum, query_insts};
+    use aios_core::{query_insts, RefU64, RefnoEnum};
 
     // Parse refnos locally
     use std::str::FromStr;
@@ -4085,7 +4107,7 @@ pub async fn test_tcp_connection(addr: &str) -> bool {
 
 /// 测试SurrealDB数据库功能连接
 pub async fn test_database_functionality() -> (bool, Option<String>) {
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{timeout, Duration};
 
     match timeout(
         Duration::from_secs(5),
@@ -4244,7 +4266,7 @@ pub async fn test_surreal_connection(
     Json(request): Json<SurrealTestRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use aios_core::project_primary_db;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{timeout, Duration};
 
     let connection_url = format!("ws://{}:{}", request.ip, request.port);
 

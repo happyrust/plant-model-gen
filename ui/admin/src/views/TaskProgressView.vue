@@ -25,6 +25,11 @@ onMounted(async () => {
   if (taskId) openDetail(taskId)
 })
 
+async function handleRetry(id: string) {
+  const retried = await tasksStore.retryTask(id)
+  await openDetail(retried.id)
+}
+
 async function openDetail(id: string) {
   await tasksStore.fetchTask(id)
   detailTask.value = tasksStore.currentTask
@@ -118,9 +123,7 @@ const statusConfig: Record<TaskStatus, { class: string; label: string }> = {
             <td class="px-4 py-3 text-muted-foreground">{{ formatDuration(task.actual_duration) }}</td>
             <td class="px-4 py-3 text-right" @click.stop>
               <div class="flex items-center justify-end gap-1">
-                <button v-if="task.status === 'Running'" @click="tasksStore.cancelTask(task.id)"
-                  class="text-xs text-destructive hover:underline px-2 py-1">取消</button>
-                <button v-if="task.status === 'Failed'" @click="tasksStore.retryTask(task.id)"
+                <button v-if="task.status === 'Failed'" @click="handleRetry(task.id)"
                   class="text-xs text-primary hover:underline px-2 py-1">重试</button>
                 <ChevronRight class="h-4 w-4 text-muted-foreground" />
               </div>

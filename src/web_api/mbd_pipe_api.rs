@@ -544,6 +544,83 @@ fn fix_mojibake_utf8_latin1(s: String) -> String {
     }
 }
 
+async fn resolve_effective_branch_refno(input_refno: RefnoEnum) -> anyhow::Result<RefnoEnum> {
+    use aios_core::{SUL_DB, SurrealQueryExt};
+    use serde::{Deserialize, Serialize};
+    use surrealdb::types::SurrealValue;
+
+    #[derive(Debug, Serialize, Deserialize, SurrealValue)]
+    struct BranchRefLinkRow {
+        #[serde(default)]
+        noun: Option<String>,
+        #[serde(default)]
+        href: Option<RefnoEnum>,
+        #[serde(default)]
+        tref: Option<RefnoEnum>,
+        #[serde(default)]
+        owner: Option<RefnoEnum>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, SurrealValue)]
+    struct BranchOwnerRow {
+        #[serde(default)]
+        noun: Option<String>,
+        #[serde(default)]
+        owner: Option<RefnoEnum>,
+    }
+
+    let sql = format!(
+        "SELECT noun, refno.HREF as href, refno.TREF as tref, owner.refno as owner FROM {} LIMIT 1",
+        input_refno.to_pe_key()
+    );
+    let row: Option<BranchRefLinkRow> = SUL_DB.query_take(&sql, 0).await?;
+    let Some(row) = row else {
+        return Ok(input_refno);
+    };
+
+    let noun = row.noun.unwrap_or_default().trim().to_ascii_uppercase();
+    if noun != "HANG" {
+        return Ok(input_refno);
+    }
+
+    async fn promote_via_owner_chain(
+        start_refno: RefnoEnum,
+    ) -> anyhow::Result<Option<RefnoEnum>> {
+        use aios_core::{SUL_DB, SurrealQueryExt};
+
+        let mut current = start_refno;
+        for _ in 0..64 {
+            let sql = format!(
+                "SELECT noun, owner.refno as owner FROM {} LIMIT 1",
+                current.to_pe_key()
+            );
+            let row: Option<BranchOwnerRow> = SUL_DB.query_take(&sql, 0).await?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+
+            let noun = row.noun.unwrap_or_default().trim().to_ascii_uppercase();
+            if matches!(noun.as_str(), "BRAN" | "HANG") {
+                return Ok(Some(current));
+            }
+
+            let Some(owner) = row.owner.filter(|owner| !owner.is_unset()) else {
+                return Ok(None);
+            };
+            current = owner;
+        }
+        Ok(None)
+    }
+
+    for link_refno in [row.href, row.tref, row.owner].into_iter().flatten() {
+        if let Some(candidate) = promote_via_owner_chain(link_refno).await? {
+            return Ok(candidate);
+        }
+    }
+
+    Ok(input_refno)
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct CacheTubiSeg {
@@ -1224,9 +1301,12 @@ async fn get_mbd_pipe(
         }
     }
 
-    // cache-only 约定：当前接口以“输入即 BRAN/HANG refno”为前提，不回退 SurrealDB 做祖先解析。
-    // plant3d-web 的测试路由与面板逻辑也是以分支 refno 为输入。
-    let branch_refno = input_refno_enum.clone();
+    // 兼容 HANG：若输入不是可直接产出 tubi_relate 的 branch root，则尝试沿 HREF/TREF
+    // 指向对象向上解析到最近的 BRAN/HANG 祖先，再统一走现有 BRAN/HANG 主链。
+    let branch_refno = match resolve_effective_branch_refno(input_refno_enum.clone()).await {
+        Ok(v) => v,
+        Err(_) => input_refno_enum.clone(),
+    };
 
     let (segments, mut debug_info) = match query.source {
         MbdPipeSource::Parquet => {
@@ -1348,6 +1428,12 @@ async fn get_mbd_pipe(
     debug_info.inferred_dbnum = debug_info.inferred_dbnum.or(query.dbno);
     debug_info.requested_dbno = query.dbno;
     debug_info.requested_batch_id = query.batch_id.clone();
+    if branch_refno != input_refno_enum {
+        debug_info.notes.push(format!(
+            "effective_branch_refno={} (from input={})",
+            branch_refno, input_refno_enum
+        ));
+    }
 
     match build_mbd_pipe_data_from_segments(
         branch_refno.clone(),

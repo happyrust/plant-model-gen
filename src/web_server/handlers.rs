@@ -1,18 +1,14 @@
-use aios_core::{
-    get_children_refnos, get_db_option, get_named_attmap, options::DbOption,
-    query_filter_ancestors, RefU64, RefnoEnum,
-};
+use aios_core::{RefU64, RefnoEnum, get_db_option, options::DbOption};
 use axum::{
     body::Body,
     extract::{Path, Query, State},
     handler::Handler,
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     response::{Html, Json, Response},
 };
 
 use chrono::{Local, Utc};
 use dashmap::DashMap;
-use glam::DVec3;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -27,7 +23,6 @@ use std::os::unix::process::ExitStatusExt;
 use std::os::windows::process::ExitStatusExt;
 use std::path::{Path as StdPath, PathBuf};
 use std::process::Stdio;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use std::time::{Duration, Instant, SystemTime};
@@ -159,23 +154,19 @@ pub async fn kill_port_processes_api(
 }
 
 use super::{
-    // templates::*,  // 暂时禁用
-    batch_tasks_template,
-    models::*,
-    simple_templates::render_database_connection_page,
     AppState,
     CreateTaskRequest,
     TaskQuery,
     UpdateConfigRequest,
+    // templates::*,  // 暂时禁用
+    batch_tasks_template,
+    models::*,
+    simple_templates::render_database_connection_page,
 };
 #[cfg(feature = "sqlite-index")]
 use crate::fast_model::session::{PdmsTimeExtractor, SESSION_STORE};
 #[cfg(feature = "sqlite-index")]
 use crate::spatial_index::SqliteSpatialIndex;
-use aios_core::metadata::spatial_computation::{
-    compute_supp_panel_offset, compute_supp_span, resolve_supp_anchor, resolve_supp_bran,
-    resolve_supp_panel, resolve_supp_steel, resolve_supp_wall, SuppAnchorKind,
-};
 use aios_core::project_primary_db;
 #[cfg(feature = "sqlite-index")]
 use nalgebra::{Point3, Vector3};
@@ -183,6 +174,8 @@ use nalgebra::{Point3, Vector3};
 use parry3d::bounding_volume::Aabb;
 #[cfg(feature = "sqlite-index")]
 use rusqlite::OptionalExtension;
+#[cfg(feature = "sqlite-index")]
+use std::str::FromStr;
 
 // 可选：从本地 SQLite 读取项目列表（按 DbOption.toml 配置）
 // use rusqlite as _; // 确保依赖已链接 - 暂时禁用
@@ -454,20 +447,68 @@ pub async fn api_get_projects(
                 items.len()
             );
         }
-        return Ok(Json(build_projects_list_response(items, &params, "sqlite")));
-    }
+        // 过滤
+        if let Some(q) = params.q.as_ref().filter(|s| !s.is_empty()) {
+            let ql = q.to_lowercase();
+            items.retain(|p| {
+                p.name.to_lowercase().contains(&ql)
+                    || p.owner
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&ql)
+            });
+        }
+        if let Some(status) = params.status.as_ref().filter(|s| !s.is_empty()) {
+            items.retain(|p| matches_status(&p.status, status));
+        }
+        if let Some(owner) = params.owner.as_ref().filter(|s| !s.is_empty()) {
+            items.retain(|p| p.owner.as_deref() == Some(owner.as_str()));
+        }
 
-    let config_items = load_projects_from_config();
-    if !config_items.is_empty() {
-        println!(
-            "📋 [projects] config 快速分支: 查到 {} 条项目",
-            config_items.len()
-        );
-        return Ok(Json(build_projects_list_response(
-            config_items,
-            &params,
-            "config",
-        )));
+        // 排序（默认按 updated_at desc，如果存在）
+        let (sort_field, sort_dir) = match params.sort.as_deref() {
+            Some(s) if s.contains(":") => {
+                let mut it = s.splitn(2, ":");
+                (
+                    it.next().unwrap_or("updated_at"),
+                    it.next().unwrap_or("desc"),
+                )
+            }
+            Some(s) => (s, "desc"),
+            None => ("updated_at", "desc"),
+        };
+        let desc = !sort_dir.eq_ignore_ascii_case("asc");
+        items.sort_by(|a, b| {
+            let ord = match sort_field {
+                "name" => a.name.cmp(&b.name),
+                "env" => a.env.cmp(&b.env),
+                "version" => a.version.cmp(&b.version),
+                "updated_at" => a.updated_at.cmp(&b.updated_at),
+                _ => a.updated_at.cmp(&b.updated_at),
+            };
+            if desc { ord.reverse() } else { ord }
+        });
+
+        // 分页
+        let per_page = params.per_page.unwrap_or(20).max(1).min(100) as usize;
+        let page = params.page.unwrap_or(1).max(1) as usize;
+        let total = items.len();
+        let start = (page - 1) * per_page;
+        let end = (start + per_page).min(total);
+        let page_items = if start < total {
+            items[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        return Ok(Json(serde_json::json!({
+            "items": page_items,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "source": "sqlite",
+        })));
     }
 
     let mut filters: Vec<String> = Vec::new();
@@ -636,76 +677,6 @@ fn load_projects_from_config() -> Vec<ProjectItem> {
             }
         })
         .collect()
-}
-
-fn build_projects_list_response(
-    mut items: Vec<ProjectItem>,
-    params: &ProjectQuery,
-    source: &str,
-) -> serde_json::Value {
-    if let Some(q) = params.q.as_ref().filter(|s| !s.is_empty()) {
-        let ql = q.to_lowercase();
-        items.retain(|p| {
-            p.name.to_lowercase().contains(&ql)
-                || p.owner
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_lowercase()
-                    .contains(&ql)
-        });
-    }
-    if let Some(status) = params.status.as_ref().filter(|s| !s.is_empty()) {
-        items.retain(|p| matches_status(&p.status, status));
-    }
-    if let Some(owner) = params.owner.as_ref().filter(|s| !s.is_empty()) {
-        items.retain(|p| p.owner.as_deref() == Some(owner.as_str()));
-    }
-
-    let (sort_field, sort_dir) = match params.sort.as_deref() {
-        Some(s) if s.contains(":") => {
-            let mut it = s.splitn(2, ":");
-            (
-                it.next().unwrap_or("updated_at"),
-                it.next().unwrap_or("desc"),
-            )
-        }
-        Some(s) => (s, "desc"),
-        None => ("updated_at", "desc"),
-    };
-    let desc = !sort_dir.eq_ignore_ascii_case("asc");
-    items.sort_by(|a, b| {
-        let ord = match sort_field {
-            "name" => a.name.cmp(&b.name),
-            "env" => a.env.cmp(&b.env),
-            "version" => a.version.cmp(&b.version),
-            "updated_at" => a.updated_at.cmp(&b.updated_at),
-            _ => a.updated_at.cmp(&b.updated_at),
-        };
-        if desc {
-            ord.reverse()
-        } else {
-            ord
-        }
-    });
-
-    let per_page = params.per_page.unwrap_or(20).max(1).min(100) as usize;
-    let page = params.page.unwrap_or(1).max(1) as usize;
-    let total = items.len();
-    let start = (page - 1) * per_page;
-    let end = (start + per_page).min(total);
-    let page_items = if start < total {
-        items[start..end].to_vec()
-    } else {
-        Vec::new()
-    };
-
-    serde_json::json!({
-        "items": page_items,
-        "total": total,
-        "page": page,
-        "per_page": per_page,
-        "source": source,
-    })
 }
 
 fn project_show_dbnum(project_name: &str) -> Option<u32> {
@@ -1593,12 +1564,13 @@ pub async fn create_task(
     let mut task_manager = state.task_manager.lock().await;
 
     let has_manual_refnos = !request.config.manual_refnos.is_empty();
-    let task_type =
-        if matches!(request.task_type.clone(), TaskType::DataGeneration) && has_manual_refnos {
-            TaskType::RefnoModelGeneration
-        } else {
-            request.task_type
-        };
+    let task_type = if matches!(request.task_type.clone(), TaskType::DataGeneration)
+        && has_manual_refnos
+    {
+        TaskType::RefnoModelGeneration
+    } else {
+        request.task_type
+    };
 
     let mut task = TaskInfo::new(request.name, task_type, request.config);
     // 附加可选元数据（batch_id 等）
@@ -1923,8 +1895,11 @@ pub async fn sqlite_spatial_page() -> Result<Html<String>, StatusCode> {
 pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, StatusCode> {
     #[cfg(feature = "sqlite-index")]
     {
-        // use crate::spatial_index::SqliteSpatialIndex;
-        use aios_core::{project_primary_db, RefU64, RefnoEnum};
+        use crate::fast_model::export_model::export_dbnum_instances_parquet::query_distinct_dbnums_from_inst_relate;
+        use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_dbnos;
+        use crate::sqlite_index::ImportConfig;
+        use std::path::PathBuf;
+        use std::sync::Arc;
 
         if !SqliteSpatialIndex::is_enabled() {
             return Ok(Json(
@@ -1947,46 +1922,59 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
             ));
         }
 
-        // 分页扫描 SurrealDB 的 inst_relate，获取 refno 列表
-        let batch: usize = 5000;
-        let mut offset: usize = 0;
+        // 从 SurrealDB 扫描当前存在实例关系的 dbnum，并导出 instances_{dbnum}.json 后导入 SQLite。
         let mut total_processed: usize = 0;
+        let mut exported_dbnums: Vec<u32> = Vec::new();
         let t0 = std::time::Instant::now();
+        let dbnums = match query_distinct_dbnums_from_inst_relate().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Json(
+                    json!({"success": false, "error": format!("扫描 inst_relate 的 dbnum 失败: {}", e)}),
+                ));
+            }
+        };
 
-        loop {
-            // 直接从 pe_transform 表获取 world_trans（inst_relate.world_trans 已废弃）
-            let sql = format!(
-                "SELECT value fn::newest_pe_id(in) FROM inst_relate WHERE type::record(\"pe_transform\", record::id(in)).world_trans.d != none LIMIT {} START {};",
-                batch, offset
-            );
+        if !dbnums.is_empty() {
+            let db_option = Arc::new(aios_core::get_db_option().clone());
+            let output_root = PathBuf::from("output");
+            let mesh_dir = PathBuf::from("assets/meshes");
 
-            let mut resp = match project_primary_db().query(sql).await {
-                Ok(v) => v,
-                Err(e) => {
-                    return Ok(Json(
-                        json!({"success": false, "error": format!("SurrealDB 查询失败: {}", e)}),
-                    ));
-                }
-            };
-
-            let result = match resp.take::<Vec<u64>>(0) {
-                Ok(v) => v,
-                Err(_) => Vec::new(),
-            };
-
-            if result.is_empty() {
-                break;
+            if let Err(e) = export_instances_json_for_dbnos(
+                &dbnums,
+                &mesh_dir,
+                &output_root,
+                db_option.clone(),
+                false,
+            )
+            .await
+            {
+                return Ok(Json(
+                    json!({"success": false, "error": format!("导出 instances.json 失败: {}", e)}),
+                ));
             }
 
-            // 构造 RefnoEnum 列表
-            let refnos: Vec<RefnoEnum> = result
-                .into_iter()
-                .map(|id| RefnoEnum::Refno(RefU64(id)))
-                .collect();
+            let instances_dir = output_root.join(&db_option.project_name).join("instances");
+            let import_cfg = ImportConfig::default();
 
-            // 注：update_inst_relate_aabbs_by_refnos 已移除，AABB 更新由 scene_node 等替代
-            total_processed += refnos.len();
-            offset += batch;
+            for dbnum in dbnums {
+                let instances_path = instances_dir.join(format!("instances_{}.json", dbnum));
+                if !instances_path.exists() {
+                    continue;
+                }
+                match index.inner().import_from_instances_json(&instances_path, &import_cfg) {
+                    Ok(stats) => {
+                        total_processed += stats.total_inserted;
+                        exported_dbnums.push(dbnum);
+                    }
+                    Err(e) => {
+                        return Ok(Json(json!({
+                            "success": false,
+                            "error": format!("导入 {} 失败: {}", instances_path.display(), e),
+                        })));
+                    }
+                }
+            }
         }
 
         // 统计索引中元素数量
@@ -2004,6 +1992,7 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
             "success": true,
             "message": "SQLite 空间索引重建完成",
             "processed_refnos": total_processed,
+            "dbnums": exported_dbnums,
             "index_elements": stats.total_elements,
             "index_type": stats.index_type,
             "elapsed_ms": elapsed.as_millis(),
@@ -3504,12 +3493,12 @@ pub struct ModelDataResponse {
 pub async fn api_get_instances(
     Query(req): Query<GetInstancesRequest>,
 ) -> Result<Json<ModelDataResponse>, (StatusCode, String)> {
+    use crate::fast_model::export_model::ExportData;
     use crate::fast_model::export_model::export_instanced_bundle::{
         ArchetypeInfo, InstanceInfo, InstancesData, LodLevelInfo,
     };
-    use crate::fast_model::export_model::ExportData;
     use aios_core::mesh_precision::LodLevel;
-    use aios_core::{query_insts, RefU64, RefnoEnum};
+    use aios_core::{RefU64, RefnoEnum, query_insts};
 
     // Parse refnos locally
     use std::str::FromStr;
@@ -4107,7 +4096,7 @@ pub async fn test_tcp_connection(addr: &str) -> bool {
 
 /// 测试SurrealDB数据库功能连接
 pub async fn test_database_functionality() -> (bool, Option<String>) {
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     match timeout(
         Duration::from_secs(5),
@@ -4266,7 +4255,7 @@ pub async fn test_surreal_connection(
     Json(request): Json<SurrealTestRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use aios_core::project_primary_db;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     let connection_url = format!("ws://{}:{}", request.ip, request.port);
 
@@ -6118,169 +6107,24 @@ pub async fn space_tools_page() -> Html<String> {
     Html(wrapped)
 }
 
-fn resolve_space_dbnum_for_refno(refno: RefnoEnum) -> anyhow::Result<u32> {
-    let db_meta = crate::data_interface::db_meta_manager::db_meta();
-    db_meta.ensure_loaded()?;
-    db_meta.get_dbnum_by_refno(refno).ok_or_else(|| {
-        anyhow::anyhow!(
-            "无法从 refno 推导 dbnum: {}",
-            refno.refno().to_slash_string()
-        )
-    })
-}
-
-fn build_space_suppo_refno(
-    dbnum: Option<u32>,
-    suppo_refno: &SpaceSuppoRefnoInput,
-) -> anyhow::Result<RefnoEnum> {
-    match suppo_refno {
-        SpaceSuppoRefnoInput::Full(raw) => {
-            let normalized = raw.trim().replace('_', "/").replace(',', "/");
-            if normalized.is_empty() {
-                anyhow::bail!("suppo_refno 不能为空");
-            }
-            let parsed = RefnoEnum::from_str(&normalized)
-                .map_err(|err| anyhow::anyhow!("无效的 suppo_refno '{}': {err}", raw.trim()))?;
-            if let Some(expected_dbnum) = dbnum {
-                let actual_dbnum = resolve_space_dbnum_for_refno(parsed)?;
-                if actual_dbnum != expected_dbnum {
-                    anyhow::bail!(
-                        "suppo_refno 与 dbnum 不一致：refno 映射 dbnum={}, 请求 dbnum={}",
-                        actual_dbnum,
-                        expected_dbnum
-                    );
-                }
-            }
-            Ok(parsed)
-        }
-        SpaceSuppoRefnoInput::Legacy(ref1) => {
-            let dbnum = dbnum.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "当 suppo_refno 只传低位编号时必须同时传 dbnum；建议改传完整 refno，例如 24383/89904"
-                )
-            })?;
-            let ref1 = u32::try_from(*ref1)
-                .map_err(|_| anyhow::anyhow!("suppo_refno 超出 u32 范围: {ref1}"))?;
-            Ok(RefU64::from_two_nums(dbnum, ref1).into())
-        }
-    }
-}
-
-fn fitting_offset_point_to_dto(point: DVec3) -> FittingOffsetPointDto {
-    FittingOffsetPointDto {
-        x: point.x,
-        y: point.y,
-        z: point.z,
-    }
-}
-
-fn fitting_offset_vector_to_dto(vector: DVec3) -> FittingOffsetVectorDto {
-    FittingOffsetVectorDto {
-        dx: vector.x,
-        dy: vector.y,
-        dz: vector.z,
-    }
-}
-
-fn supp_anchor_kind_to_str(kind: SuppAnchorKind) -> &'static str {
-    match kind {
-        SuppAnchorKind::S1 => "S1",
-        SuppAnchorKind::S2 => "S2",
-    }
-}
-
-/// 支架-桥架识别
+/// 支架-桥架识别（占位实现，返回回显数据）
 pub async fn api_space_suppo_trays(Json(req): Json<SuppoTraysRequest>) -> Json<serde_json::Value> {
-    #[cfg(not(feature = "sqlite-index"))]
-    {
-        return Json(json!({
-            "status": "error",
-            "message": "suppo-trays 需要 sqlite-index 特性支持"
-        }));
-    }
-
-    #[cfg(feature = "sqlite-index")]
-    {
-        let suppo_refno = match build_space_suppo_refno(req.dbnum, &req.suppo_refno) {
-            Ok(value) => value,
-            Err(err) => {
-                return Json(json!({
-                    "status": "error",
-                    "message": format!("suppo_refno 解析失败: {err}")
-                }));
-            }
-        };
-        match resolve_suppo_tray_matches(suppo_refno, req.tolerance).await {
-            Ok((anchor_kind, matches)) if matches.is_empty() => Json(json!({
-                "status": "success",
-                "message": "no tray matched",
-                "data": null
-            })),
-            Ok((anchor_kind, matches)) => {
-                let data = SuppoTraysResponseData {
-                    anchor_kind,
-                    trays: matches
-                        .into_iter()
-                        .map(|item| SuppoTrayDto {
-                            bran_refno: item.bran_refno.refno().to_slash_string(),
-                            tray_section_refno: RefnoEnum::from(item.tray_section_refno)
-                                .refno()
-                                .to_slash_string(),
-                            support_type: item.support_type,
-                            contact_point: fitting_offset_point_to_dto(item.contact_point),
-                        })
-                        .collect(),
-                };
-                Json(json!({
-                    "status": "success",
-                    "data": data
-                }))
-            }
-            Err(err) => Json(json!({
-                "status": "error",
-                "message": format!("suppo-trays 查询失败: {err}")
-            })),
-        }
-    }
+    Json(json!({
+        "status":"success",
+        "message":"stub",
+        "data": {"trays": []},
+        "echo": req
+    }))
 }
 
-/// 预埋板编号识别
+/// 预埋板编号识别（占位）
 pub async fn api_space_fitting(Json(req): Json<FittingRequest>) -> Json<serde_json::Value> {
-    let suppo_refno = match build_space_suppo_refno(req.dbnum, &req.suppo_refno) {
-        Ok(value) => value,
-        Err(err) => {
-            return Json(json!({
-                "status": "error",
-                "message": format!("suppo_refno 解析失败: {err}")
-            }));
-        }
-    };
-
-    match resolve_supp_panel(suppo_refno, req.tolerance).await {
-        Ok(Some(panel)) => {
-            let data = FittingResponseData {
-                fitting: panel.panel_name,
-                panel_refno: panel.panel_refno.refno().to_slash_string(),
-                panel_center: fitting_offset_point_to_dto(panel.panel_center_world),
-                match_method: panel.match_method,
-                covered: true,
-                coverage_ratio: 1.0,
-            };
-            Json(json!({
-                "status": "success",
-                "data": data
-            }))
-        }
-        Ok(None) => Json(json!({
-            "status": "success",
-            "message": "no panel matched",
-            "data": null
-        })),
-        Err(err) => Json(json!({
-            "status": "error",
-            "message": format!("fitting 查询失败: {err}")
-        })),
-    }
+    Json(json!({
+        "status":"success",
+        "message":"stub",
+        "data": {"fitting": null, "covered": false, "coverage_ratio": 0.0},
+        "echo": req
+    }))
 }
 
 #[cfg(feature = "sqlite-index")]
@@ -6289,39 +6133,21 @@ const WALL_DISTANCE_DEFAULT_MAX_CANDIDATES: usize = 20;
 const WALL_DISTANCE_DEFAULT_SEARCH_RADIUS_MM: f64 = 5000.0;
 #[cfg(feature = "sqlite-index")]
 const WALL_DISTANCE_MAX_CANDIDATE_CAP: usize = 200;
-#[cfg(feature = "sqlite-index")]
-const STEEL_DISTANCE_DEFAULT_SEARCH_RADIUS_MM: f64 = 3000.0;
-#[cfg(feature = "sqlite-index")]
-const SUPPO_TRAY_DEFAULT_SEARCH_RADIUS_MM: f64 = 1200.0;
-#[cfg(feature = "sqlite-index")]
-const TRAY_SPAN_DEFAULT_SEARCH_RADIUS_MM: f64 = 5000.0;
 
 #[cfg(feature = "sqlite-index")]
-#[derive(Debug, Clone)]
-struct SpatialAabbCandidate {
-    refno: RefU64,
-    noun: String,
-    spec_value: Option<i64>,
-    aabb: Aabb,
-    closest_point: Point3<f32>,
-    distance_mm: f64,
-}
-
-#[cfg(feature = "sqlite-index")]
-#[derive(Debug, Clone)]
-struct SuppoTrayInternalMatch {
-    bran_refno: RefnoEnum,
-    tray_section_refno: RefU64,
-    support_type: String,
-    contact_point: DVec3,
-    aabb: Aabb,
-}
-
-#[cfg(feature = "sqlite-index")]
-#[derive(Debug, Clone)]
-struct SupportNeighborInternal {
-    support_refno: RefnoEnum,
-    anchor_point: DVec3,
+fn parse_wall_distance_source_refno(raw: &str) -> anyhow::Result<RefU64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("source_refno 为空");
+    }
+    if let Ok(parsed) = RefU64::from_str(trimmed) {
+        return Ok(parsed);
+    }
+    let normalized = trimmed.replace('_', "/");
+    if let Ok(parsed) = RefU64::from_str(&normalized) {
+        return Ok(parsed);
+    }
+    anyhow::bail!("source_refno 格式无效: {trimmed}");
 }
 
 #[cfg(feature = "sqlite-index")]
@@ -6334,36 +6160,40 @@ fn wall_distance_point_to_dto(point: Point3<f32>) -> WallDistancePoint {
 }
 
 #[cfg(feature = "sqlite-index")]
-fn dvec3_to_point3(point: DVec3) -> Point3<f32> {
-    Point3::new(point.x as f32, point.y as f32, point.z as f32)
+fn wall_distance_aabb_to_dto(aabb: &Aabb) -> WallDistanceAabbDto {
+    WallDistanceAabbDto {
+        min: wall_distance_point_to_dto(aabb.mins),
+        max: wall_distance_point_to_dto(aabb.maxs),
+    }
 }
 
 #[cfg(feature = "sqlite-index")]
-fn closest_point_on_aabb(aabb: &Aabb, point: Point3<f32>) -> Point3<f32> {
-    Point3::new(
-        point.x.clamp(aabb.mins.x, aabb.maxs.x),
-        point.y.clamp(aabb.mins.y, aabb.maxs.y),
-        point.z.clamp(aabb.mins.z, aabb.maxs.z),
-    )
-}
-
-#[cfg(feature = "sqlite-index")]
-fn distance_point_to_aabb_mm(aabb: &Aabb, point: Point3<f32>) -> (Point3<f32>, f64) {
-    let closest = closest_point_on_aabb(aabb, point);
-    let dx = (point.x - closest.x) as f64;
-    let dy = (point.y - closest.y) as f64;
-    let dz = (point.z - closest.z) as f64;
-    (closest, (dx * dx + dy * dy + dz * dz).sqrt())
-}
-
-#[cfg(feature = "sqlite-index")]
-fn build_query_aabb(anchor: DVec3, radius_mm: f64) -> Aabb {
-    let radius = radius_mm.max(0.0) as f32;
-    let center = dvec3_to_point3(anchor);
-    Aabb::new(
-        center - Vector3::new(radius, radius, radius),
-        center + Vector3::new(radius, radius, radius),
-    )
+fn wall_distance_aabb_distance_mm(a: &Aabb, b: &Aabb) -> f64 {
+    let dx = if a.maxs.x < b.mins.x {
+        b.mins.x - a.maxs.x
+    } else if b.maxs.x < a.mins.x {
+        a.mins.x - b.maxs.x
+    } else {
+        0.0
+    };
+    let dy = if a.maxs.y < b.mins.y {
+        b.mins.y - a.maxs.y
+    } else if b.maxs.y < a.mins.y {
+        a.mins.y - b.maxs.y
+    } else {
+        0.0
+    };
+    let dz = if a.maxs.z < b.mins.z {
+        b.mins.z - a.maxs.z
+    } else if b.maxs.z < a.mins.z {
+        a.mins.z - b.maxs.z
+    } else {
+        0.0
+    };
+    let dx = dx as f64;
+    let dy = dy as f64;
+    let dz = dz as f64;
+    (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
 #[cfg(feature = "sqlite-index")]
@@ -6384,9 +6214,8 @@ fn query_wall_distance_spec_value(
 }
 
 #[cfg(feature = "sqlite-index")]
-fn normalize_target_nouns(
+fn normalize_wall_distance_target_nouns(
     input: Option<Vec<String>>,
-    defaults: &[&str],
 ) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::<String>::new();
     for raw in input.unwrap_or_default() {
@@ -6396,446 +6225,285 @@ fn normalize_target_nouns(
         }
     }
     if out.is_empty() {
-        for noun in defaults {
-            out.insert((*noun).to_string());
-        }
+        out.insert("WALL".to_string());
+        out.insert("COLUMN".to_string());
     }
     out
 }
 
 #[cfg(feature = "sqlite-index")]
-async fn collect_support_subtree_refnos(
-    root: RefnoEnum,
-) -> anyhow::Result<std::collections::HashSet<String>> {
-    let mut seen = std::collections::HashSet::<String>::new();
-    let mut queue = std::collections::VecDeque::from([root]);
-    while let Some(current) = queue.pop_front() {
-        let key = current.refno().to_slash_string();
-        if !seen.insert(key) {
-            continue;
-        }
-        for child in get_children_refnos(current).await? {
-            queue.push_back(child);
-        }
-    }
-    Ok(seen)
-}
-
-async fn collect_support_subtree_refno_values(root: RefnoEnum) -> anyhow::Result<Vec<RefnoEnum>> {
-    let mut seen = std::collections::BTreeSet::<u64>::new();
-    let mut out = Vec::<RefnoEnum>::new();
-    let mut queue = std::collections::VecDeque::from([root]);
-    while let Some(current) = queue.pop_front() {
-        if !seen.insert(current.refno().0) {
-            continue;
-        }
-        out.push(current);
-        for child in get_children_refnos(current).await? {
-            queue.push_back(child);
-        }
-    }
-    Ok(out)
-}
-
-#[cfg(feature = "sqlite-index")]
-fn load_spatial_candidates(
-    index: &SqliteSpatialIndex,
-    anchor_point: DVec3,
-    query_aabb: &Aabb,
-    target_nouns: &std::collections::HashSet<String>,
-    excluded_refnos: Option<&std::collections::HashSet<String>>,
+fn sort_and_truncate_wall_distance_candidates(
+    candidates: &mut Vec<WallDistanceCandidateDto>,
     max_candidates: usize,
-) -> anyhow::Result<Vec<SpatialAabbCandidate>> {
-    let anchor_point = dvec3_to_point3(anchor_point);
-    let mut candidates = Vec::<SpatialAabbCandidate>::new();
-    for candidate_refno in index.query_intersect(query_aabb)? {
-        let refno_key = candidate_refno.to_string();
-        if excluded_refnos
-            .map(|items| items.contains(&refno_key))
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let noun = match index.get_noun(candidate_refno) {
-            Ok(Some(v)) => v.trim().to_uppercase(),
-            _ => continue,
-        };
-        if !target_nouns.contains(&noun) {
-            continue;
-        }
-        let aabb = match index.get_aabb(candidate_refno) {
-            Ok(Some(v)) => v,
-            _ => continue,
-        };
-        let (closest_point, distance_mm) = distance_point_to_aabb_mm(&aabb, anchor_point);
-        let spec_value = query_wall_distance_spec_value(index, candidate_refno)
-            .ok()
-            .flatten();
-        candidates.push(SpatialAabbCandidate {
-            refno: candidate_refno,
-            noun,
-            spec_value,
-            aabb,
-            closest_point,
-            distance_mm,
-        });
-    }
+) {
     candidates.sort_by(|a, b| {
         a.distance_mm
             .partial_cmp(&b.distance_mm)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| a.refno.0.cmp(&b.refno.0))
     });
     if candidates.len() > max_candidates {
         candidates.truncate(max_candidates);
     }
-    Ok(candidates)
-}
-
-#[cfg(feature = "sqlite-index")]
-async fn resolve_suppo_tray_matches(
-    suppo_refno: RefnoEnum,
-    tolerance: Option<f64>,
-) -> anyhow::Result<(String, Vec<SuppoTrayInternalMatch>)> {
-    let anchor = resolve_supp_anchor(suppo_refno).await?;
-    let anchor_kind = supp_anchor_kind_to_str(anchor.kind).to_string();
-    let matches = resolve_supp_bran(suppo_refno, tolerance)
-        .await?
-        .into_iter()
-        .map(|item| SuppoTrayInternalMatch {
-            bran_refno: item.bran_refno,
-            tray_section_refno: item.contact_sctn_refno.refno(),
-            support_type: item.match_method,
-            contact_point: item.contact_point_world,
-            aabb: Aabb::new(
-                dvec3_to_point3(item.contact_point_world),
-                dvec3_to_point3(item.contact_point_world),
-            ),
-        })
-        .collect::<Vec<_>>();
-    Ok((anchor_kind, matches))
-}
-
-#[cfg(feature = "sqlite-index")]
-async fn resolve_same_branch_support_neighbors(
-    suppo_refno: RefnoEnum,
-    bran_refno: RefnoEnum,
-    tray_match: &SuppoTrayInternalMatch,
-    neighbor_window: f64,
-) -> anyhow::Result<Vec<SupportNeighborInternal>> {
-    let current_anchor =
-        aios_core::metadata::spatial_computation::resolve_supp_anchor(suppo_refno).await?;
-    let root_type = get_named_attmap(suppo_refno)
-        .await?
-        .get_type_str()
-        .trim()
-        .to_uppercase();
-    let index = SqliteSpatialIndex::with_default_path()?;
-    let target_nouns = normalize_target_nouns(None, &["SCTN", "PNOD"]);
-    let query_aabb = build_query_aabb(
-        current_anchor.point_world,
-        neighbor_window.max(TRAY_SPAN_DEFAULT_SEARCH_RADIUS_MM),
-    );
-    let excluded_refnos = collect_support_subtree_refnos(suppo_refno).await?;
-    let candidates = load_spatial_candidates(
-        &index,
-        current_anchor.point_world,
-        &query_aabb,
-        &target_nouns,
-        Some(&excluded_refnos),
-        200,
-    )?;
-    let mut dedup = std::collections::BTreeMap::<String, SupportNeighborInternal>::new();
-    for candidate in candidates {
-        let root_candidates =
-            query_filter_ancestors(candidate.refno.into(), &[root_type.as_str()]).await?;
-        let Some(root_refno) = root_candidates.last().copied() else {
-            continue;
-        };
-        if root_refno == suppo_refno {
-            continue;
-        }
-        let tray_matches = resolve_suppo_tray_matches(root_refno, None).await?.1;
-        if !tray_matches
-            .iter()
-            .any(|item| item.bran_refno == bran_refno)
-        {
-            continue;
-        }
-        let neighbor_anchor =
-            match aios_core::metadata::spatial_computation::resolve_supp_anchor(root_refno).await {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-        dedup
-            .entry(root_refno.refno().to_slash_string())
-            .or_insert(SupportNeighborInternal {
-                support_refno: root_refno,
-                anchor_point: neighbor_anchor.point_world,
-            });
-    }
-    let mut out = dedup.into_values().collect::<Vec<_>>();
-    let use_x_axis = (tray_match.aabb.maxs.x - tray_match.aabb.mins.x).abs()
-        >= (tray_match.aabb.maxs.z - tray_match.aabb.mins.z).abs();
-    out.sort_by(|a, b| {
-        let lhs = if use_x_axis {
-            a.anchor_point.x
-        } else {
-            a.anchor_point.z
-        };
-        let rhs = if use_x_axis {
-            b.anchor_point.x
-        } else {
-            b.anchor_point.z
-        };
-        lhs.partial_cmp(&rhs).unwrap_or(Ordering::Equal)
-    });
-    Ok(out)
 }
 
 /// 支架定位信息（距墙/定位块）（占位）
 pub async fn api_space_wall_distance(
     Json(req): Json<WallDistanceRequest>,
 ) -> Json<serde_json::Value> {
-    let suppo_refno = match build_space_suppo_refno(req.dbnum, &req.suppo_refno) {
-        Ok(value) => value,
-        Err(err) => {
-            return Json(json!({
-                "status": "error",
-                "message": format!("suppo_refno 解析失败: {err}")
-            }));
-        }
-    };
-    let target_nouns = normalize_target_nouns(
-        req.target_nouns.clone(),
-        &[
-            "WALL", "STWALL", "GWALL", "CWALL", "CTWALL", "COLUMN", "FIXING",
-        ],
-    )
-    .into_iter()
-    .collect::<Vec<_>>();
-    let max_candidates = req
-        .max_candidates
-        .unwrap_or(WALL_DISTANCE_DEFAULT_MAX_CANDIDATES)
-        .clamp(1, WALL_DISTANCE_MAX_CANDIDATE_CAP);
-    match resolve_supp_wall(
-        suppo_refno,
-        req.search_radius
-            .or(Some(WALL_DISTANCE_DEFAULT_SEARCH_RADIUS_MM)),
-        &target_nouns,
-    )
-    .await
+    #[cfg(not(feature = "sqlite-index"))]
     {
-        Ok(Some(result)) => {
-            let response = WallDistanceResponseData {
-                anchor_kind: supp_anchor_kind_to_str(result.anchor_kind).to_string(),
-                anchor_point: WallDistancePoint {
-                    x: result.anchor_point.x,
-                    y: result.anchor_point.y,
-                    z: result.anchor_point.z,
-                },
-                target: WallDistanceTargetDto {
-                    refno: result.target_refno.refno().to_slash_string(),
-                    noun: result.target_noun,
-                    distance_mm: result.distance_mm,
-                    closest_point: WallDistancePoint {
-                        x: result.closest_point_world.x,
-                        y: result.closest_point_world.y,
-                        z: result.closest_point_world.z,
-                    },
-                },
-                candidates: result
-                    .candidates
-                    .into_iter()
-                    .take(max_candidates)
-                    .map(|candidate| WallDistanceCandidateDto {
-                        refno: candidate.refno.refno().to_slash_string(),
-                        noun: candidate.noun,
-                        spec_value: None,
-                        distance_mm: candidate.distance_mm,
-                        closest_point: WallDistancePoint {
-                            x: candidate.closest_point_world.x,
-                            y: candidate.closest_point_world.y,
-                            z: candidate.closest_point_world.z,
-                        },
-                    })
-                    .collect(),
-            };
-            Json(json!({
-                "status":"success",
-                "data": response
-            }))
-        }
-        Ok(None) => Json(json!({
-            "status": "success",
-            "message": "no wall matched",
-            "data": null
-        })),
-        Err(err) => Json(json!({
+        return Json(json!({
             "status": "error",
-            "message": format!("wall-distance 查询失败: {err}")
-        })),
+            "message": "wall-distance 需要 sqlite-index 特性支持"
+        }));
+    }
+
+    #[cfg(feature = "sqlite-index")]
+    {
+        let target_nouns = normalize_wall_distance_target_nouns(req.target_nouns.clone());
+        let max_candidates = req
+            .max_candidates
+            .unwrap_or(WALL_DISTANCE_DEFAULT_MAX_CANDIDATES)
+            .clamp(1, WALL_DISTANCE_MAX_CANDIDATE_CAP);
+        let search_radius_mm = req
+            .search_radius
+            .unwrap_or(WALL_DISTANCE_DEFAULT_SEARCH_RADIUS_MM)
+            .max(0.0);
+
+        let source_refno = match parse_wall_distance_source_refno(&req.source_refno) {
+            Ok(v) => v,
+            Err(err) => {
+                return Json(json!({
+                    "status": "error",
+                    "message": format!("source_refno 解析失败: {err}")
+                }));
+            }
+        };
+
+        let index = match SqliteSpatialIndex::with_default_path() {
+            Ok(v) => v,
+            Err(err) => {
+                return Json(json!({
+                    "status": "error",
+                    "message": format!("打开 spatial_index.sqlite 失败: {err}")
+                }));
+            }
+        };
+
+        let source_aabb = match index.get_aabb(source_refno) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return Json(json!({
+                    "status": "error",
+                    "message": format!("source_refno 未命中空间索引: {}", source_refno)
+                }));
+            }
+            Err(err) => {
+                return Json(json!({
+                    "status": "error",
+                    "message": format!("读取 source AABB 失败: {err}")
+                }));
+            }
+        };
+
+        let expand = search_radius_mm as f32;
+        let query_aabb = Aabb::new(
+            source_aabb.mins - Vector3::new(expand, expand, expand),
+            source_aabb.maxs + Vector3::new(expand, expand, expand),
+        );
+
+        let candidate_refnos = match index.query_intersect(&query_aabb) {
+            Ok(v) => v,
+            Err(err) => {
+                return Json(json!({
+                    "status": "error",
+                    "message": format!("空间索引查询失败: {err}")
+                }));
+            }
+        };
+
+        let mut candidates = Vec::<WallDistanceCandidateDto>::new();
+        for candidate_refno in candidate_refnos {
+            if candidate_refno == source_refno {
+                continue;
+            }
+
+            let noun = match index.get_noun(candidate_refno) {
+                Ok(Some(v)) => v.trim().to_uppercase(),
+                Ok(None) => continue,
+                Err(_) => continue,
+            };
+            if noun.is_empty() || !target_nouns.contains(&noun) {
+                continue;
+            }
+
+            let candidate_aabb = match index.get_aabb(candidate_refno) {
+                Ok(Some(v)) => v,
+                _ => continue,
+            };
+            let distance_mm = wall_distance_aabb_distance_mm(&source_aabb, &candidate_aabb);
+            if search_radius_mm > 0.0 && distance_mm > search_radius_mm {
+                continue;
+            }
+
+            let spec_value = query_wall_distance_spec_value(&index, candidate_refno)
+                .ok()
+                .flatten();
+            candidates.push(WallDistanceCandidateDto {
+                refno: candidate_refno.to_string(),
+                noun,
+                spec_value,
+                distance_mm,
+                aabb: wall_distance_aabb_to_dto(&candidate_aabb),
+            });
+        }
+
+        sort_and_truncate_wall_distance_candidates(&mut candidates, max_candidates);
+
+        let response = WallDistanceResponseData {
+            source_refno: source_refno.to_string(),
+            source_aabb: wall_distance_aabb_to_dto(&source_aabb),
+            candidates,
+        };
+
+        Json(json!({
+            "status":"success",
+            "data": response
+        }))
     }
 }
 
-/// 与预埋板相对定位
+#[cfg(all(test, feature = "sqlite-index"))]
+mod wall_distance_tests {
+    use super::*;
+
+    #[test]
+    fn parse_wall_distance_source_refno_supports_slash_and_underscore() {
+        let slash =
+            parse_wall_distance_source_refno("24381/1001").expect("slash refno should parse");
+        let underscore =
+            parse_wall_distance_source_refno("24381_1001").expect("underscore refno should parse");
+        assert_eq!(slash, underscore);
+        assert!(parse_wall_distance_source_refno("bad-refno").is_err());
+    }
+
+    #[test]
+    fn normalize_wall_distance_target_nouns_uses_default_when_empty() {
+        let defaults = normalize_wall_distance_target_nouns(None);
+        assert!(defaults.contains("WALL"));
+        assert!(defaults.contains("COLUMN"));
+
+        let customized = normalize_wall_distance_target_nouns(Some(vec![
+            " wall ".to_string(),
+            "".to_string(),
+            "column".to_string(),
+            "wall".to_string(),
+        ]));
+        assert_eq!(customized.len(), 2);
+        assert!(customized.contains("WALL"));
+        assert!(customized.contains("COLUMN"));
+    }
+
+    #[test]
+    fn wall_distance_aabb_distance_mm_computes_overlap_and_gap() {
+        let a = Aabb::new(
+            Point3::new(0.0_f32, 0.0_f32, 0.0_f32),
+            Point3::new(1.0_f32, 1.0_f32, 1.0_f32),
+        );
+        let b_overlap = Aabb::new(
+            Point3::new(0.5_f32, 0.5_f32, 0.5_f32),
+            Point3::new(2.0_f32, 2.0_f32, 2.0_f32),
+        );
+        let c_gap = Aabb::new(
+            Point3::new(2.0_f32, 0.0_f32, 0.0_f32),
+            Point3::new(3.0_f32, 1.0_f32, 1.0_f32),
+        );
+
+        assert_eq!(wall_distance_aabb_distance_mm(&a, &b_overlap), 0.0);
+        assert!((wall_distance_aabb_distance_mm(&a, &c_gap) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sort_and_truncate_wall_distance_candidates_orders_and_limits_results() {
+        let dummy_aabb = WallDistanceAabbDto {
+            min: WallDistancePoint {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            max: WallDistancePoint {
+                x: 1.0,
+                y: 1.0,
+                z: 1.0,
+            },
+        };
+        let mut candidates = vec![
+            WallDistanceCandidateDto {
+                refno: "1/1".to_string(),
+                noun: "WALL".to_string(),
+                spec_value: None,
+                distance_mm: 8.0,
+                aabb: dummy_aabb.clone(),
+            },
+            WallDistanceCandidateDto {
+                refno: "1/2".to_string(),
+                noun: "COLUMN".to_string(),
+                spec_value: None,
+                distance_mm: 2.0,
+                aabb: dummy_aabb.clone(),
+            },
+            WallDistanceCandidateDto {
+                refno: "1/3".to_string(),
+                noun: "WALL".to_string(),
+                spec_value: None,
+                distance_mm: 5.0,
+                aabb: dummy_aabb,
+            },
+        ];
+
+        sort_and_truncate_wall_distance_candidates(&mut candidates, 2);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].refno, "1/2");
+        assert_eq!(candidates[1].refno, "1/3");
+
+        let mut empty = Vec::<WallDistanceCandidateDto>::new();
+        sort_and_truncate_wall_distance_candidates(&mut empty, 5);
+        assert!(empty.is_empty());
+    }
+}
+
+/// 与预埋板相对定位（占位）
 pub async fn api_space_fitting_offset(
     Json(req): Json<FittingOffsetRequest>,
 ) -> Json<serde_json::Value> {
-    let suppo_refno = match build_space_suppo_refno(req.dbnum, &req.suppo_refno) {
-        Ok(value) => value,
-        Err(err) => {
-            return Json(json!({
-                "status": "error",
-                "message": format!("suppo_refno 解析失败: {err}")
-            }));
-        }
-    };
-
-    match compute_supp_panel_offset(suppo_refno, req.tolerance).await {
-        Ok(Some(offset)) => {
-            let within = req
-                .tolerance
-                .map(|tolerance| offset.length <= tolerance)
-                .unwrap_or(true);
-            let response = FittingOffsetResponseData {
-                anchor_kind: supp_anchor_kind_to_str(offset.anchor_kind).to_string(),
-                anchor_point: fitting_offset_point_to_dto(offset.anchor_point),
-                panel_refno: offset.panel_refno.refno().to_slash_string(),
-                panel_center: fitting_offset_point_to_dto(offset.panel_center),
-                vector: fitting_offset_vector_to_dto(offset.vector),
-                length: offset.length,
-                within,
-            };
-            Json(json!({
-                "status": "success",
-                "data": response
-            }))
-        }
-        Ok(None) => Json(json!({
-            "status": "success",
-            "message": "no panel matched",
-            "data": null
-        })),
-        Err(err) => Json(json!({
-            "status": "error",
-            "message": format!("fitting-offset 查询失败: {err}")
-        })),
-    }
+    Json(json!({
+        "status":"success",
+        "message":"stub",
+        "data": {"vector": {"dx":0.0, "dy":0.0, "dz":0.0}, "length": 0.0, "within": false},
+        "echo": req
+    }))
 }
 
-/// 与钢结构相对定位
+/// 与钢结构相对定位（占位）
 pub async fn api_space_steel_relative(
     Json(req): Json<SteelRelativeRequest>,
 ) -> Json<serde_json::Value> {
-    let suppo_refno = match build_space_suppo_refno(req.dbnum, &req.suppo_refno) {
-        Ok(value) => value,
-        Err(err) => {
-            return Json(json!({
-                "status": "error",
-                "message": format!("suppo_refno 解析失败: {err}")
-            }));
-        }
-    };
-    let excluded_refnos = match collect_support_subtree_refno_values(suppo_refno).await {
-        Ok(value) => value,
-        Err(err) => {
-            return Json(json!({
-                "status": "error",
-                "message": format!("支架子树解析失败: {err}")
-            }));
-        }
-    };
-    match resolve_supp_steel(
-        suppo_refno,
-        req.search_radius
-            .or(Some(STEEL_DISTANCE_DEFAULT_SEARCH_RADIUS_MM)),
-        &excluded_refnos,
-    )
-    .await
-    {
-        Ok(Some(result)) => {
-            let within = req
-                .search_radius
-                .map(|value| result.length <= value)
-                .unwrap_or(true);
-            let data = SteelRelativeResponseData {
-                anchor_kind: supp_anchor_kind_to_str(result.anchor_kind).to_string(),
-                anchor_point: fitting_offset_point_to_dto(result.anchor_point),
-                steel_refno: result.steel_refno.refno().to_slash_string(),
-                steel_noun: result.steel_noun,
-                closest_point: fitting_offset_point_to_dto(result.closest_point_world),
-                vector: fitting_offset_vector_to_dto(result.vector),
-                length: result.length,
-                within,
-            };
-            Json(json!({
-                "status": "success",
-                "data": data
-            }))
-        }
-        Ok(None) => Json(json!({
-            "status": "success",
-            "message": "no steel matched",
-            "data": null
-        })),
-        Err(err) => Json(json!({
-            "status": "error",
-            "message": format!("steel-relative 查询失败: {err}")
-        })),
-    }
+    Json(json!({
+        "status":"success",
+        "message":"stub",
+        "data": {"steel_id": null, "vector": {"dx":0.0, "dy":0.0, "dz":0.0}, "length": 0.0},
+        "echo": req
+    }))
 }
 
-/// 托盘跨度（左右）
+/// 托盘跨度（左右）（占位）
 pub async fn api_space_tray_span(Json(req): Json<TraySpanRequest>) -> Json<serde_json::Value> {
-    let suppo_refno = match build_space_suppo_refno(req.dbnum, &req.suppo_refno) {
-        Ok(value) => value,
-        Err(err) => {
-            return Json(json!({
-                "status": "error",
-                "message": format!("suppo_refno 解析失败: {err}")
-            }));
-        }
-    };
-    let window = req.neighbor_window.unwrap_or(500.0).max(0.0);
-    match compute_supp_span(suppo_refno, Some(window)).await {
-        Ok(Some(result))
-            if result.left_suppo_refno.is_none() && result.right_suppo_refno.is_none() =>
-        {
-            Json(json!({
-                "status": "success",
-                "message": "no span matched",
-                "data": null
-            }))
-        }
-        Ok(Some(result)) => {
-            let data = TraySpanResponseData {
-                bran_refno: result.bran_refno.refno().to_slash_string(),
-                left_suppo_refno: result
-                    .left_suppo_refno
-                    .map(|item| item.refno().to_slash_string()),
-                right_suppo_refno: result
-                    .right_suppo_refno
-                    .map(|item| item.refno().to_slash_string()),
-                left_distance: result.left_distance,
-                right_distance: result.right_distance,
-                neighbor_window: result.neighbor_window,
-            };
-            Json(json!({
-                "status": "success",
-                "data": data
-            }))
-        }
-        Ok(None) => Json(json!({
-            "status": "success",
-            "message": "no tray matched",
-            "data": null
-        })),
-        Err(err) => Json(json!({
-            "status": "error",
-            "message": format!("tray-span 查询失败: {err}")
-        })),
-    }
+    Json(json!({
+        "status":"success",
+        "message":"stub",
+        "data": {"left_suppo": null, "right_suppo": null, "span_left": 0.0, "span_right": 0.0, "uniformity_score": 0.0},
+        "echo": req
+    }))
 }
 
 // ===== 桥架支撑检测（SQLite R-Tree） =====

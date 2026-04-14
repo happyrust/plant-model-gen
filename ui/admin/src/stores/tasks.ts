@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { extractErrorMessage } from '@/api/client'
 import { tasksApi } from '@/api/tasks'
 import type { TaskInfo } from '@/types/task'
 
@@ -15,7 +16,7 @@ export const useTasksStore = defineStore('tasks', () => {
     try {
       tasks.value = await tasksApi.list(params)
     } catch (err: unknown) {
-      error.value = err instanceof Error ? err.message : 'Failed to fetch tasks'
+      error.value = extractErrorMessage(err)
     } finally {
       loading.value = false
     }
@@ -37,8 +38,10 @@ export const useTasksStore = defineStore('tasks', () => {
   }
 
   async function retryTask(id: string) {
-    await tasksApi.retry(id)
+    const task = await tasksApi.retry(id)
     await fetchTasks()
+    currentTask.value = task
+    return task
   }
 
   return {

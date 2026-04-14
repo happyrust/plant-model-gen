@@ -826,7 +826,8 @@ async fn main() -> anyhow::Result<()> {
                         .arg(Arg::new("refno-root").long("refno-root")
                             .help("限定 refno 子树根（如 21491_10000）"))
                         .arg(Arg::new("gen-panels-mesh").long("gen-panels-mesh")
-                            .help("预生成缺失面板的几何模型（默认跳过，仅计算空间关系）")
+                            .visible_alias("generate-models")
+                            .help("显式允许为缺失面板预生成几何模型；默认跳过模型生成，仅计算空间关系")
                             .action(clap::ArgAction::SetTrue))
                         .arg(Arg::new("report-json").long("report-json")
                             .help("将房间计算阶段耗时与统计写入 JSON 报告")
@@ -838,12 +839,16 @@ async fn main() -> anyhow::Result<()> {
                         .arg(Arg::new("panel-refno")
                             .help("面板参考号（如 24381/35798）")
                             .required(true))
+                        .arg(Arg::new("generate-models").long("generate-models")
+                            .visible_alias("gen-panels-mesh")
+                            .help("显式允许为 panel 与 expect 对应目标补生成模型；默认跳过模型生成，仅做关系计算")
+                            .action(clap::ArgAction::SetTrue))
                         .arg(Arg::new("expect-refnos").long("expect-refnos")
                             .help("期望命中的构件 refno（逗号分隔），用于验证计算结果")
                             .value_delimiter(',')
                             .num_args(1..))
                         .arg(Arg::new("rebuild-spatial-index").long("rebuild-spatial-index")
-                            .help("显式重建本次 panel 计算使用的局部 SQLite 空间索引；默认直接复用现有索引")
+                            .help("显式重建本次 panel 计算使用的 SQLite 空间索引；默认直接复用现有索引。若局部刷新结果为空，会自动回退为全量重建")
                             .action(clap::ArgAction::SetTrue))
                         .arg(Arg::new("report-json").long("report-json")
                             .help("将单面板计算阶段耗时与统计写入 JSON 报告")
@@ -2423,6 +2428,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Some(("compute-panel", sub_m)) => {
                 let panel_refno = sub_m.get_one::<String>("panel-refno").unwrap();
+                let generate_models = sub_m.get_flag("generate-models");
                 let expect_refnos: Option<Vec<String>> = sub_m
                     .get_many::<String>("expect-refnos")
                     .map(|v| v.map(|s| s.to_string()).collect());
@@ -2431,6 +2437,7 @@ async fn main() -> anyhow::Result<()> {
 
                 return room_compute_panel_mode(
                     panel_refno,
+                    generate_models,
                     expect_refnos,
                     rebuild_spatial_index,
                     report_json,

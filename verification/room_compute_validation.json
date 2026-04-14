@@ -2,14 +2,14 @@
   "description": "房间计算 CLI 验证基线（供 room verify-json 使用）",
   "test_cases": [
     {
-      "case_id": "room-540-panel-24381-35798",
-      "description": "示例基线：房间 540 的 panel 24381/35798 应至少命中构件 24381/145019",
-      "room_number": "R540",
-      "panel_refno": "24381/35798",
+      "case_id": "room-301-panel-24381-34862",
+      "description": "示例基线：房间 301 的 panel 24381/34862 应至少命中构件 24381/99386",
+      "room_number": "R301",
+      "panel_refno": "24381/34862",
       "expected_components": [
-        "24381/145019"
+        "24381/99386"
       ],
-      "notes": "此文件用于 CLI 验证，不依赖 Rust test。请按当前项目数据库中的真实业务基线持续维护；建议先执行 room clean + room compute，再执行 room verify-json。"
+      "notes": "此文件用于 CLI 验证，不依赖 Rust test。当前基线已按 2026-04-12 本地数据库中的真实可复算结果更新；建议先执行 room clean + room compute，再执行 room verify-json。"
     }
   ]
 }

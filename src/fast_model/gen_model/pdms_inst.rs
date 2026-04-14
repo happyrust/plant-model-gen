@@ -365,13 +365,22 @@ fn build_delete_inst_relate_by_in_sql(
             .map(|r| r.to_pe_key())
             .collect::<Vec<_>>()
             .join(",");
+        let relation_ids = chunk
+            .iter()
+            .map(|r| r.to_inst_relate_key())
+            .collect::<Vec<_>>();
+        let delete_by_id_sql = relation_ids
+            .iter()
+            .map(|id| format!("DELETE {id};"))
+            .collect::<Vec<_>>()
+            .join("\n");
         if let Some(dbnum) = dbnum {
             sqls.push(format!(
-                "LET $ids = SELECT VALUE id FROM inst_relate WHERE dbnum = {dbnum} AND in IN [{in_keys}];\nDELETE $ids;"
+                "{delete_by_id_sql}\nLET $ids = SELECT VALUE id FROM inst_relate WHERE dbnum = {dbnum} AND in IN [{in_keys}];\nDELETE $ids;"
             ));
         } else {
             sqls.push(format!(
-                "LET $ids = SELECT VALUE id FROM [{in_keys}]->inst_relate;\nDELETE $ids;"
+                "{delete_by_id_sql}\nLET $ids = SELECT VALUE id FROM [{in_keys}]->inst_relate;\nDELETE $ids;"
             ));
         }
     }
@@ -774,6 +783,9 @@ pub async fn save_instance_data_with_report(
     let mut aabb_map: HashMap<u64, String> = HashMap::new();
     let mut transform_map: HashMap<u64, String> = HashMap::new();
     let inst_refnos: Vec<RefnoEnum> = inst_mgr.inst_info_map.keys().copied().collect();
+    if !inst_refnos.is_empty() {
+        delete_inst_relate_by_in(&inst_refnos, CHUNK_SIZE).await?;
+    }
     let inst_dbnum_map = query_refno_dbnum_map(&inst_refnos, CHUNK_SIZE).await;
     if let Entry::Vacant(entry) = transform_map.entry(0) {
         entry.insert(serde_json::to_string(&Transform::IDENTITY)?);
@@ -1574,6 +1586,13 @@ pub fn build_inst_relate_aabb_rows(
                             });
                         }
                     }
+                } else if let Some(aabb_ref) =
+                    crate::fast_model::EXIST_MESH_GEO_HASHES.get(&inst.geo_hash.to_string())
+                {
+                    union_aabb = Some(match union_aabb {
+                        Some(existing) => existing.merged(&*aabb_ref),
+                        None => *aabb_ref,
+                    });
                 }
             }
             union_aabb.map(|aabb| (gen_aabb_hash(&aabb), aabb))

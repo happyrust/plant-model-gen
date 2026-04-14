@@ -2776,6 +2776,44 @@ pub async fn export_dbnum_instances_json_mode(
     let output_dir =
         output_override.unwrap_or_else(|| db_option_ext.get_project_output_dir().join("instances"));
 
+    async fn export_via_surreal(
+        dbnum: u32,
+        output_dir: &Path,
+        db_option_ext: &DbOptionExt,
+        root_refno: Option<RefnoEnum>,
+        detailed: bool,
+        verbose: bool,
+    ) -> Result<()> {
+        let db_option = Arc::new((**db_option_ext).clone());
+        let stats = export_dbnum_instances_json(
+            dbnum,
+            output_dir,
+            db_option,
+            verbose,
+            None, // 使用默认毫米单位
+            root_refno,
+            detailed,
+        )
+        .await?;
+
+        println!("\n🎉 导出完成！（SurrealDB 路径）");
+        println!("📊 统计信息:");
+        println!("   - BRAN/HANG/EQUI 分组数量: {}", stats.refno_count);
+        println!("   - 子节点数量: {}", stats.descendant_count);
+        println!("   - 几何引用数量: {}", stats.geometry_count);
+        println!("   - 输出文件大小: {} 字节", stats.output_file_size);
+        println!(
+            "   - 变换矩阵数量 (trans): {} (+{})",
+            stats.mesh_files_found, stats.node_count
+        );
+        println!(
+            "   - 包围盒数量 (aabb): {} (+{})",
+            stats.mesh_files_missing, stats.mesh_count
+        );
+        println!("   - 耗时: {:?}", stats.elapsed_time);
+        Ok(())
+    }
+
     if from_cache {
         async fn cache_has_any_tubi(
             cache_dir: &std::path::Path,
@@ -3171,6 +3209,24 @@ pub async fn export_dbnum_instances_json_mode(
                                 return Ok(());
                             }
                             Err(retry_e) => {
+                                let retry_msg = retry_e.to_string();
+                                if retry_msg.contains("缓存中未找到")
+                                    || retry_msg.contains("批次数据")
+                                {
+                                    eprintln!(
+                                        "\n⚠️  cache 导出仍不可用，回退到 SurrealDB 直导：{}",
+                                        retry_msg
+                                    );
+                                    return export_via_surreal(
+                                        dbnum,
+                                        &output_dir,
+                                        db_option_ext,
+                                        root_refno,
+                                        detailed,
+                                        verbose,
+                                    )
+                                    .await;
+                                }
                                 return Err(retry_e);
                             }
                         }
@@ -3182,10 +3238,16 @@ pub async fn export_dbnum_instances_json_mode(
                         "   cargo run --bin aios-database -- --debug-model --dbnum {} --regen-model",
                         dbnum
                     );
-                    return Err(anyhow!(
-                        "dbnum={} 尚未生成模型数据，请先生成后再导出",
-                        dbnum
-                    ));
+                    eprintln!("   当前仓内 instance_cache/cache_flush 为兼容桩时，将自动回退到 SurrealDB 直导。");
+                    return export_via_surreal(
+                        dbnum,
+                        &output_dir,
+                        db_option_ext,
+                        root_refno,
+                        detailed,
+                        verbose,
+                    )
+                    .await;
                 }
                 return Err(e);
             }
@@ -3196,38 +3258,15 @@ pub async fn export_dbnum_instances_json_mode(
     ensure_surreal_connected(db_option_ext).await?;
 
     // 调用导出函数（SurrealDB 路径，内部已包含增量合并 trans/aabb）
-    let db_option = Arc::new((**db_option_ext).clone());
-    let stats = export_dbnum_instances_json(
+    export_via_surreal(
         dbnum,
         &output_dir,
-        db_option,
-        verbose,
-        None, // 使用默认毫米单位
+        db_option_ext,
         root_refno,
         detailed,
+        verbose,
     )
-    .await?;
-
-    // 注：trans/aabb 已在 export_dbnum_instances_json 内部增量合并导出
-    // stats.mesh_files_found = trans 总数, stats.mesh_files_missing = aabb 总数
-    // stats.node_count = 新增 trans 数, stats.mesh_count = 新增 aabb 数
-
-    println!("\n🎉 导出完成！");
-    println!("📊 统计信息:");
-    println!("   - BRAN/HANG/EQUI 分组数量: {}", stats.refno_count);
-    println!("   - 子节点数量: {}", stats.descendant_count);
-    println!("   - 几何引用数量: {}", stats.geometry_count);
-    println!("   - 输出文件大小: {} 字节", stats.output_file_size);
-    println!(
-        "   - 变换矩阵数量 (trans): {} (+{})",
-        stats.mesh_files_found, stats.node_count
-    );
-    println!(
-        "   - 包围盒数量 (aabb): {} (+{})",
-        stats.mesh_files_missing, stats.mesh_count
-    );
-    println!("   - 耗时: {:?}", stats.elapsed_time);
-    Ok(())
+    .await
 }
 
 /// 导出 delivery-code 兼容的 V2 格式 instances.json
@@ -3885,6 +3924,61 @@ async fn build_spatial_index_from_inst_relate(verbose: bool) -> Result<()> {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn restore_full_spatial_index_after_scoped_run(reason: &str, verbose: bool) -> Result<()> {
+    println!("\n🧹 恢复全量 SQLite 空间索引");
+    println!("==========================================");
+    println!("   - 原因: {}", reason);
+    println!("   - 说明: scoped 刷新会改写默认 output/spatial_index.sqlite，命令结束后自动恢复全量索引以避免污染后续计算");
+    build_spatial_index_from_inst_relate(verbose).await?;
+    println!("✅ 已恢复全量 SQLite 空间索引");
+    Ok(())
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn refresh_panel_spatial_index_with_fallback(
+    panel_refno: RefnoEnum,
+    db_nums: Option<&[u32]>,
+    verbose: bool,
+) -> Result<usize> {
+    use aios_database::fast_model::room_model::refresh_sqlite_spatial_index_from_inst_relate_aabb;
+    use std::collections::BTreeSet;
+
+    let inserted =
+        refresh_sqlite_spatial_index_from_inst_relate_aabb(db_nums, Some(panel_refno)).await?;
+    if inserted > 0 {
+        return Ok(inserted);
+    }
+
+    let mut fallback_dbnums: BTreeSet<u32> = db_nums
+        .map(|nums| nums.iter().copied().collect())
+        .unwrap_or_default();
+    if let Some(panel_dbnum) = aios_database::data_interface::db_meta().get_dbnum_by_refno(panel_refno)
+    {
+        fallback_dbnums.insert(panel_dbnum);
+    }
+
+    if !fallback_dbnums.is_empty() {
+        let fallback_vec: Vec<u32> = fallback_dbnums.into_iter().collect();
+        println!(
+            "   ⚠️  局部 SQLite 索引刷新结果为空，自动回退到 dbnum 级索引重建: {:?}",
+            fallback_vec
+        );
+        let dbnum_inserted =
+            refresh_sqlite_spatial_index_from_inst_relate_aabb(Some(&fallback_vec), None).await?;
+        if dbnum_inserted > 0 {
+            return Ok(dbnum_inserted);
+        }
+    }
+
+    println!("   ⚠️  dbnum 级 SQLite 索引刷新仍为空，自动回退到全量索引重建");
+    build_spatial_index_from_inst_relate(verbose).await?;
+    let refreshed_total = aios_database::spatial_index::SqliteSpatialIndex::with_default_path()?
+        .get_stats()?
+        .total_elements;
+    Ok(refreshed_total as usize)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub async fn rebuild_room_spatial_index_mode(verbose: bool) -> Result<()> {
     println!("\n🗃️ 正式重建房间计算 SQLite 空间索引");
     println!("==========================================");
@@ -3934,11 +4028,11 @@ pub async fn room_compute_mode(
         println!("   - refno 子树根: {}", root);
     }
     println!(
-        "   - 预生成面板模型: {}",
+        "   - 缺失面板模型补齐: {}",
         if gen_panels_mesh {
-            "是"
+            "是（显式开启）"
         } else {
-            "否（使用 --gen-panels-mesh 启用）"
+            "否（默认仅计算空间关系；使用 --generate-models / --gen-panels-mesh 显式开启）"
         }
     );
     if let Some(path) = &report_json {
@@ -4014,46 +4108,71 @@ pub async fn room_compute_mode(
     println!("\n🔄 开始构建房间关系...");
     perf_timer.mark("build_room_relations");
 
-    let stats = build_room_relations(&db_option_ext.inner, db_nums.as_deref(), refno_root).await?;
+    let restore_full_index_after_run = db_nums.is_some() || refno_root.is_some();
+    let compute_result: Result<()> = async {
+        let stats =
+            build_room_relations(&db_option_ext.inner, db_nums.as_deref(), refno_root).await?;
 
-    let duration = start_time.elapsed();
-    perf_timer.mark("print_summary");
+        let duration = start_time.elapsed();
+        perf_timer.mark("print_summary");
 
-    println!("\n🎉 房间计算完成！");
-    println!("==========================================");
-    println!("📊 统计信息:");
-    println!("   - 处理房间数: {}", stats.total_rooms);
-    println!("   - 处理面板数: {}", stats.total_panels);
-    println!("   - 处理构件数: {}", stats.total_components);
-    println!("   - 构建耗时: {}ms", stats.build_time_ms);
-    println!("   - 缓存命中率: {:.2}%", stats.cache_hit_rate * 100.0);
-    println!("   - 内存使用: {:.2}MB", stats.memory_usage_mb);
-    println!("   - 总耗时: {:.2}s", duration.as_secs_f64());
+        println!("\n🎉 房间计算完成！");
+        println!("==========================================");
+        println!("📊 统计信息:");
+        println!("   - 处理房间数: {}", stats.total_rooms);
+        println!("   - 处理面板数: {}", stats.total_panels);
+        println!("   - 处理构件数: {}", stats.total_components);
+        println!("   - 构建耗时: {}ms", stats.build_time_ms);
+        println!("   - 缓存命中率: {:.2}%", stats.cache_hit_rate * 100.0);
+        println!("   - 内存使用: {:.2}MB", stats.memory_usage_mb);
+        println!("   - 总耗时: {:.2}s", duration.as_secs_f64());
 
-    let report = RoomComputeCliReport::for_full_compute(
-        &mut perf_timer,
-        stats,
-        &duration,
-        room_keywords.as_deref(),
-        db_nums.as_deref(),
-        refno_root,
-        gen_panels_mesh,
-        &report_json,
-    );
-    print_room_compute_stage_summary(&report);
-    maybe_write_room_compute_report(&report_json, &report)?;
+        let report = RoomComputeCliReport::for_full_compute(
+            &mut perf_timer,
+            stats,
+            &duration,
+            room_keywords.as_deref(),
+            db_nums.as_deref(),
+            refno_root,
+            gen_panels_mesh,
+            &report_json,
+        );
+        print_room_compute_stage_summary(&report);
+        maybe_write_room_compute_report(&report_json, &report)?;
 
-    Ok(())
+        Ok(())
+    }
+    .await;
+
+    if restore_full_index_after_run {
+        let restore_result = restore_full_spatial_index_after_scoped_run(
+            "scoped room compute 结束后恢复默认全量索引",
+            verbose,
+        )
+        .await;
+        match (compute_result, restore_result) {
+            (Ok(_), Ok(_)) => Ok(()),
+            (Err(err), Ok(_)) => Err(err),
+            (Ok(_), Err(restore_err)) => Err(restore_err),
+            (Err(err), Err(restore_err)) => Err(anyhow!(
+                "{}\n另外，恢复全量 SQLite 索引失败: {}",
+                err,
+                restore_err
+            )),
+        }
+    } else {
+        compute_result
+    }
 }
 
 /// 指定单个面板 refno 执行房间计算
 ///
-/// 自动生成所需模型：
-/// - panel refno 本身会被加入增量生成列表
-/// - expect-refnos 会检查 owner noun，若为 BRAN/HANG 则切换到生成 owner 的模型
+/// 默认只做关系计算与可选索引刷新。
+/// 只有显式传 `--generate-models` 时，才会为 panel / expect 对应目标补模型。
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub async fn room_compute_panel_mode(
     panel_refno_str: &str,
+    generate_models: bool,
     expect_refnos: Option<Vec<String>>,
     rebuild_spatial_index: bool,
     report_json: Option<PathBuf>,
@@ -4088,6 +4207,14 @@ pub async fn room_compute_panel_mode(
         println!("   - 期望命中: {:?}", expected);
     }
     println!(
+        "   - 缺失模型补齐: {}",
+        if generate_models {
+            "是（显式开启）"
+        } else {
+            "否（默认仅计算空间关系）"
+        }
+    );
+    println!(
         "   - SQLite 空间索引: {}",
         if rebuild_spatial_index {
             "显式重建局部索引"
@@ -4101,172 +4228,205 @@ pub async fn room_compute_panel_mode(
 
     perf_timer.mark("ensure_surreal_connected");
     ensure_surreal_connected(db_option_ext).await?;
+    let restore_full_index_after_run = generate_models || rebuild_spatial_index;
+    let panel_compute_result: Result<()> = async {
+        if generate_models {
+            perf_timer.mark("prepare_generation_targets");
+            // ========== 仅在显式指定时才生成模型并重建局部索引 ==========
+            let mut extra_gen_refnos: Vec<RefnoEnum> = Vec::new();
+            let mut expected_root_refnos: Vec<RefnoEnum> = Vec::new();
 
-    if rebuild_spatial_index {
-        perf_timer.mark("prepare_generation_targets");
-        // ========== 仅在显式指定时才生成模型并重建局部索引 ==========
-        let mut extra_gen_refnos: Vec<RefnoEnum> = Vec::new();
-        let mut expected_root_refnos: Vec<RefnoEnum> = Vec::new();
+            if let Some(ref expected) = expect_refnos {
+                for exp_str in expected {
+                    let exp = RefnoEnum::from_str(&exp_str.replace('_', "/"))
+                        .map_err(|_| anyhow!("无效的期望 refno: {}", exp_str))?;
+                    expected_root_refnos.push(exp);
+                    extra_gen_refnos.push(exp);
 
+                    let pe = aios_core::rs_surreal::get_pe(exp).await?;
+                    if let Some(pe) = pe {
+                        let noun_upper = pe.noun.to_uppercase();
+                        let target = if noun_upper == "BRAN" || noun_upper == "HANG" {
+                            println!("   📦 {} (noun={}) 直接加入生成列表", exp, noun_upper);
+                            resolve_room_compute_generation_target(exp, &noun_upper, None)
+                        } else {
+                            let owner = pe.get_owner();
+                            let owner_pe = aios_core::rs_surreal::get_pe(owner).await?;
+                            if let Some(owner_pe) = owner_pe {
+                                let owner_noun = owner_pe.noun.to_uppercase();
+                                let resolved = resolve_room_compute_generation_target(
+                                    exp,
+                                    &noun_upper,
+                                    Some((owner, owner_noun.as_str())),
+                                );
+                                if resolved == owner {
+                                    println!(
+                                        "   📦 {} (noun={}) → 切换到 owner {} (noun={})",
+                                        exp, noun_upper, owner, owner_noun
+                                    );
+                                    extra_gen_refnos.push(owner);
+                                } else {
+                                    println!(
+                                        "   📦 {} (noun={}, owner noun={}) 直接加入",
+                                        exp, noun_upper, owner_noun
+                                    );
+                                }
+                                resolved
+                            } else {
+                                exp
+                            }
+                        };
+                        extra_gen_refnos.push(target);
+                    } else {
+                        println!("   ⚠️ {} 未找到 PE 记录，跳过自动生成", exp);
+                    }
+                }
+            }
+
+            let gen_refnos = build_room_compute_panel_gen_refnos(panel_refno, extra_gen_refnos);
+            let derived_dbnums = derive_room_compute_panel_dbnums(&gen_refnos);
+            println!("\n🔨 自动生成模型 ({} 个目标)...", gen_refnos.len());
+            for r in &gen_refnos {
+                println!("   - {}", r);
+            }
+            if !derived_dbnums.is_empty() {
+                println!("   - 关联数据库编号: {:?}", derived_dbnums);
+            }
+
+            use aios_database::fast_model::gen_all_geos_data;
+            aios_core::set_debug_model_enabled(true);
+            let gen_opt = build_room_compute_panel_gen_option(
+                db_option_ext,
+                if derived_dbnums.is_empty() {
+                    None
+                } else {
+                    Some(derived_dbnums.clone())
+                },
+            );
+            perf_timer.mark("generate_panel_models");
+            gen_all_geos_data(gen_refnos.clone(), &gen_opt, None, None).await?;
+
+            println!("✅ 模型生成完成");
+            if derived_dbnums.is_empty() {
+                println!("\n⚠️  未能从生成目标推导出数据库编号，跳过 SQLite 空间索引刷新");
+            } else {
+                println!("\n🧱 刷新 SQLite 空间索引: {:?}", derived_dbnums);
+                let inserted = refresh_panel_spatial_index_with_fallback(
+                    panel_refno,
+                    Some(&derived_dbnums),
+                    verbose,
+                )
+                .await?;
+                println!("   - 已写入索引记录: {}", inserted);
+                println!("✅ SQLite 空间索引刷新完成");
+            }
+        } else if rebuild_spatial_index {
+            println!("\n🧱 显式刷新 SQLite 空间索引（不生成模型）...");
+            perf_timer.mark("refresh_spatial_index_only");
+            let inserted =
+                refresh_panel_spatial_index_with_fallback(panel_refno, None, verbose).await?;
+            println!("   - 已写入索引记录: {}", inserted);
+            println!("✅ SQLite 空间索引刷新完成");
+        } else {
+            println!("\n🗃️ 复用现有 SQLite 空间索引，不执行模型生成与局部索引重建");
+        }
+
+        // ========== 执行房间计算（复用刚刚构建的最小 SQLite 空间索引） ==========
+        let mesh_dir = db_option_ext.inner.get_meshes_path();
+        let options = build_room_compute_panel_calc_options();
+        let exclude = HashSet::new();
+
+        println!("\n🔄 计算面板 {} 的房间归属...", panel_refno);
+        perf_timer.mark("compute_panel_relations");
+        let result =
+            cal_room_refnos_with_options(&mesh_dir, panel_refno, &exclude, options).await?;
+
+        let duration = start_time.elapsed();
+        perf_timer.mark("print_summary");
+
+        println!("\n🎉 计算完成！");
+        println!("==========================================");
+        println!("   - 面板: {}", panel_refno);
+        println!("   - 命中构件数: {}", result.len());
+        println!("   - 耗时: {:.2}s", duration.as_secs_f64());
+
+        if verbose || result.len() <= 50 {
+            for r in &result {
+                println!("   - {}", r);
+            }
+        } else {
+            println!("   (构件过多，使用 --verbose 查看全部)");
+        }
+
+        // 验证期望构件
         if let Some(ref expected) = expect_refnos {
+            println!("\n📋 期望验证:");
+            let mut all_pass = true;
             for exp_str in expected {
                 let exp = RefnoEnum::from_str(&exp_str.replace('_', "/"))
                     .map_err(|_| anyhow!("无效的期望 refno: {}", exp_str))?;
-                expected_root_refnos.push(exp);
-                extra_gen_refnos.push(exp);
-
-                let pe = aios_core::rs_surreal::get_pe(exp).await?;
-                if let Some(pe) = pe {
-                    let noun_upper = pe.noun.to_uppercase();
-                    let target = if noun_upper == "BRAN" || noun_upper == "HANG" {
-                        println!("   📦 {} (noun={}) 直接加入生成列表", exp, noun_upper);
-                        resolve_room_compute_generation_target(exp, &noun_upper, None)
-                    } else {
-                        let owner = pe.get_owner();
-                        let owner_pe = aios_core::rs_surreal::get_pe(owner).await?;
-                        if let Some(owner_pe) = owner_pe {
-                            let owner_noun = owner_pe.noun.to_uppercase();
-                            let resolved = resolve_room_compute_generation_target(
-                                exp,
-                                &noun_upper,
-                                Some((owner, owner_noun.as_str())),
-                            );
-                            if resolved == owner {
-                                println!(
-                                    "   📦 {} (noun={}) → 切换到 owner {} (noun={})",
-                                    exp, noun_upper, owner, owner_noun
-                                );
-                                extra_gen_refnos.push(owner);
-                            } else {
-                                println!(
-                                    "   📦 {} (noun={}, owner noun={}) 直接加入",
-                                    exp, noun_upper, owner_noun
-                                );
-                            }
-                            resolved
-                        } else {
-                            exp
-                        }
-                    };
-                    extra_gen_refnos.push(target);
+                if result.contains(&exp) {
+                    println!("  ✅ {} — 命中", exp);
                 } else {
-                    println!("   ⚠️ {} 未找到 PE 记录，跳过自动生成", exp);
+                    println!("  ❌ {} — 未命中", exp);
+                    all_pass = false;
                 }
             }
-        }
-
-        let gen_refnos = build_room_compute_panel_gen_refnos(panel_refno, extra_gen_refnos);
-        let derived_dbnums = derive_room_compute_panel_dbnums(&gen_refnos);
-        println!("\n🔨 自动生成模型 ({} 个目标)...", gen_refnos.len());
-        for r in &gen_refnos {
-            println!("   - {}", r);
-        }
-        if !derived_dbnums.is_empty() {
-            println!("   - 关联数据库编号: {:?}", derived_dbnums);
-        }
-
-        use aios_database::fast_model::gen_all_geos_data;
-        aios_core::set_debug_model_enabled(true);
-        let gen_opt = build_room_compute_panel_gen_option(
-            db_option_ext,
-            if derived_dbnums.is_empty() {
-                None
-            } else {
-                Some(derived_dbnums.clone())
-            },
-        );
-        perf_timer.mark("generate_panel_models");
-        gen_all_geos_data(gen_refnos.clone(), &gen_opt, None, None).await?;
-
-        println!("✅ 模型生成完成");
-        if derived_dbnums.is_empty() {
-            println!("\n⚠️  未能从生成目标推导出数据库编号，跳过 SQLite 空间索引刷新");
-        } else {
-            println!("\n🧱 刷新 SQLite 空间索引: {:?}", derived_dbnums);
-            let inserted = refresh_sqlite_spatial_index_from_inst_relate_aabb(
-                Some(&derived_dbnums),
-                Some(panel_refno),
-            )
-            .await?;
-            println!("   - 已写入索引记录: {}", inserted);
-            println!("✅ SQLite 空间索引刷新完成");
-        }
-    } else {
-        println!("\n🗃️ 复用现有 SQLite 空间索引，不执行模型生成与局部索引重建");
-    }
-
-    // ========== 执行房间计算（复用刚刚构建的最小 SQLite 空间索引） ==========
-    let mesh_dir = db_option_ext.inner.get_meshes_path();
-    let options = build_room_compute_panel_calc_options();
-    let exclude = HashSet::new();
-
-    println!("\n🔄 计算面板 {} 的房间归属...", panel_refno);
-    perf_timer.mark("compute_panel_relations");
-    let result = cal_room_refnos_with_options(&mesh_dir, panel_refno, &exclude, options).await?;
-
-    let duration = start_time.elapsed();
-    perf_timer.mark("print_summary");
-
-    println!("\n🎉 计算完成！");
-    println!("==========================================");
-    println!("   - 面板: {}", panel_refno);
-    println!("   - 命中构件数: {}", result.len());
-    println!("   - 耗时: {:.2}s", duration.as_secs_f64());
-
-    if verbose || result.len() <= 50 {
-        for r in &result {
-            println!("   - {}", r);
-        }
-    } else {
-        println!("   (构件过多，使用 --verbose 查看全部)");
-    }
-
-    // 验证期望构件
-    if let Some(ref expected) = expect_refnos {
-        println!("\n📋 期望验证:");
-        let mut all_pass = true;
-        for exp_str in expected {
-            let exp = RefnoEnum::from_str(&exp_str.replace('_', "/"))
-                .map_err(|_| anyhow!("无效的期望 refno: {}", exp_str))?;
-            if result.contains(&exp) {
-                println!("  ✅ {} — 命中", exp);
-            } else {
-                println!("  ❌ {} — 未命中", exp);
-                all_pass = false;
+            if !all_pass {
+                anyhow::bail!("期望验证失败：部分构件未命中");
             }
+            println!("  ✅ 全部验证通过");
         }
-        if !all_pass {
-            anyhow::bail!("期望验证失败：部分构件未命中");
+
+        if !result.is_empty() {
+            perf_timer.mark("save_room_relate");
+            let persisted_room_num = aios_database::fast_model::export_model::export_room_instances::query_room_panel_relations_for_verify()
+                .await?
+                .into_iter()
+                .find(|record| record.panel_refno == panel_refno)
+                .map(|record| record.room_num)
+                .unwrap_or_else(|| "manual".to_string());
+            save_room_relate(panel_refno, &result, &persisted_room_num).await?;
+            println!("💾 已保存 {} 条房间关系", result.len());
         }
-        println!("  ✅ 全部验证通过");
+
+        let within_refnos = result.iter().copied().collect::<Vec<_>>();
+        let report = RoomComputeCliReport::for_single_panel(
+            &mut perf_timer,
+            panel_refno,
+            &within_refnos,
+            expect_refnos.as_deref(),
+            generate_models,
+            rebuild_spatial_index,
+            &duration,
+            &report_json,
+        );
+        print_room_compute_stage_summary(&report);
+        maybe_write_room_compute_report(&report_json, &report)?;
+
+        Ok(())
     }
+    .await;
 
-    if !result.is_empty() {
-        perf_timer.mark("save_room_relate");
-        let persisted_room_num = aios_database::fast_model::export_model::export_room_instances::query_room_panel_relations_for_verify()
-            .await?
-            .into_iter()
-            .find(|record| record.panel_refno == panel_refno)
-            .map(|record| record.room_num)
-            .unwrap_or_else(|| "manual".to_string());
-        save_room_relate(panel_refno, &result, &persisted_room_num).await?;
-        println!("💾 已保存 {} 条房间关系", result.len());
+    if restore_full_index_after_run {
+        let restore_result = restore_full_spatial_index_after_scoped_run(
+            "compute-panel 局部索引刷新结束后恢复默认全量索引",
+            verbose,
+        )
+        .await;
+        match (panel_compute_result, restore_result) {
+            (Ok(_), Ok(_)) => Ok(()),
+            (Err(err), Ok(_)) => Err(err),
+            (Ok(_), Err(restore_err)) => Err(restore_err),
+            (Err(err), Err(restore_err)) => Err(anyhow!(
+                "{}\n另外，恢复全量 SQLite 索引失败: {}",
+                err,
+                restore_err
+            )),
+        }
+    } else {
+        panel_compute_result
     }
-
-    let within_refnos = result.iter().copied().collect::<Vec<_>>();
-    let report = RoomComputeCliReport::for_single_panel(
-        &mut perf_timer,
-        panel_refno,
-        &within_refnos,
-        expect_refnos.as_deref(),
-        rebuild_spatial_index,
-        &duration,
-        &report_json,
-    );
-    print_room_compute_stage_summary(&report);
-    maybe_write_room_compute_report(&report_json, &report)?;
-
-    Ok(())
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -4555,6 +4715,7 @@ pub async fn room_compute_mode(
 #[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
 pub async fn room_compute_panel_mode(
     _panel_refno_str: &str,
+    _generate_models: bool,
     _expect_refnos: Option<Vec<String>>,
     _rebuild_spatial_index: bool,
     _report_json: Option<PathBuf>,
@@ -4683,6 +4844,7 @@ impl RoomComputeCliReport {
         panel_refno: RefnoEnum,
         result: &[RefnoEnum],
         expect_refnos: Option<&[String]>,
+        generate_models: bool,
         rebuild_spatial_index: bool,
         duration: &std::time::Duration,
         report_json: &Option<PathBuf>,
@@ -4703,6 +4865,7 @@ impl RoomComputeCliReport {
             }),
             context: serde_json::json!({
                 "expect_refnos": expect_refnos,
+                "generate_models": generate_models,
                 "rebuild_spatial_index": rebuild_spatial_index,
             }),
             perf,

@@ -76,6 +76,7 @@ if ($RefnoRoot) {
 }
 Write-Host "Keywords: $($Keywords -join ',')"
 Write-Host "DryRun  : $DryRun"
+Write-Host "Mode    : $(if ($GenPanelsMesh) { 'compute + explicit panel mesh generation' } else { 'relations-only compute (default)' })"
 
 if (-not $SkipClean) {
     Invoke-RoomCli -SubCommand @("room", "clean")

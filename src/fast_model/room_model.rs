@@ -128,7 +128,7 @@ async fn ensure_spatial_index_ready(
     db_nums: Option<&[u32]>,
     refno_root: Option<RefnoEnum>,
     force: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let requested_scope = SpatialIndexScope::from_filters(db_nums, refno_root);
 
     if !force && requested_scope == SpatialIndexScope::Full {
@@ -137,13 +137,10 @@ async fn ensure_spatial_index_ready(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if known_scope == Some(SpatialIndexScope::Full) {
             if let Ok(idx) = SqliteSpatialIndex::with_default_path() {
-                if idx
-                    .get_stats()
-                    .map(|stats| stats.total_elements)
-                    .unwrap_or(0)
-                    > 0
-                {
-                    return Ok(());
+                if let Ok(stats) = idx.get_stats() {
+                    if stats.total_elements > 0 {
+                        return Ok(stats.total_elements as usize);
+                    }
                 }
             }
         }
@@ -165,7 +162,7 @@ async fn ensure_spatial_index_ready(
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
     }
-    result.map(|_| ())
+    result
 }
 
 /// Resolve room calc config from env vars (read-only) and DbOption defaults.
@@ -319,6 +316,9 @@ struct SpatialIndexRefreshStats {
     skipped_missing_noun: usize,
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+const SPATIAL_INDEX_UNKNOWN_NOUN: &str = "__UNKNOWN__";
+
 #[cfg(all(
     not(target_arch = "wasm32"),
     feature = "sqlite-index",
@@ -453,7 +453,7 @@ async fn refresh_sqlite_spatial_index_from_refnos(
     idx: &SqliteSpatialIndex,
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<SpatialIndexRefreshStats> {
-    const BATCH_SIZE: usize = 500;
+    const BATCH_SIZE: usize = 2000;
 
     let mut stats = SpatialIndexRefreshStats::default();
     if refnos.is_empty() {
@@ -488,7 +488,20 @@ async fn refresh_sqlite_spatial_index_from_refnos(
         );
 
         let mut response = model_primary_db().query_response(&sql).await?;
-        let inst_rows = query_inst_relate_batch(chunk, false, false).await?;
+        let inst_sql = format!(
+            r#"
+            SELECT
+                owner_refno,
+                owner_type,
+                in as refno,
+                in.noun as noun,
+                NONE as name,
+                spec_value
+            FROM [{pe_list}]->inst_relate
+            WHERE in != NONE
+            "#
+        );
+        let inst_rows: Vec<InstRelateRow> = model_primary_db().query_take(&inst_sql, 0).await?;
         let inst_map: HashMap<RefnoEnum, InstRelateRow> = inst_rows
             .into_iter()
             .filter(|row| row.refno.is_valid())
@@ -531,20 +544,16 @@ async fn refresh_sqlite_spatial_index_from_refnos(
             Vec::with_capacity(chunk.len());
 
         for refno in chunk {
-            let Some(inst_row) = inst_map.get(refno) else {
-                stats.skipped_missing_noun += 1;
-                continue;
-            };
+            let inst_row = inst_map.get(refno);
             let noun = inst_row
-                .noun
-                .as_deref()
+                .and_then(|row| row.noun.as_deref())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            let Some(noun) = noun else {
-                stats.skipped_missing_noun += 1;
-                continue;
-            };
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    stats.skipped_missing_noun += 1;
+                    SPATIAL_INDEX_UNKNOWN_NOUN.to_string()
+                });
 
             let selected = if let Some(aabb) = booled_map.get(refno) {
                 stats.booled_override += 1;
@@ -557,7 +566,11 @@ async fn refresh_sqlite_spatial_index_from_refnos(
                 continue;
             };
 
-            let spec_value = spec_resolver.resolve_for_row(inst_row).await?;
+            let spec_value = if let Some(inst_row) = inst_row {
+                spec_resolver.resolve_for_row(inst_row).await?
+            } else {
+                0
+            };
             batch_with_spec.push((
                 refno.refno().0 as i64,
                 noun,
@@ -582,6 +595,212 @@ async fn refresh_sqlite_spatial_index_from_refnos(
             println!(
                 "[room_model] SQLite AABB scoped 刷新进度: {}/{}, inserted={}, booled_override={}",
                 current, total_chunks, stats.inserted, stats.booled_override
+            );
+        }
+    }
+
+    Ok(stats)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn query_inst_relate_rows_by_dbnums(db_nums: &[u32]) -> anyhow::Result<Vec<InstRelateRow>> {
+    if db_nums.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let dbnum_list = db_nums.iter().map(u32::to_string).join(", ");
+    let sql = format!(
+        r#"
+        SELECT
+            owner_refno,
+            owner_type,
+            in as refno,
+            in.noun as noun,
+            NONE as name,
+            spec_value
+        FROM inst_relate
+        WHERE dbnum IN [{dbnum_list}]
+        "#
+    );
+    let rows: Vec<InstRelateRow> = model_primary_db().query_take(&sql, 0).await?;
+    Ok(rows)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn query_aabb_rows_by_dbnums(
+    table_name: &str,
+    db_nums: &[u32],
+    page_size: usize,
+) -> anyhow::Result<Vec<QueryAabbRowRaw>> {
+    if db_nums.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let dbnum_list = db_nums.iter().map(u32::to_string).join(", ");
+    let mut offset = 0usize;
+    let mut rows = Vec::new();
+    let mut page = 0usize;
+
+    loop {
+        let sql = format!(
+            "SELECT refno, aabb_id.d as aabb \
+             FROM {table_name} \
+             WHERE refno.dbnum IN [{dbnum_list}] AND aabb_id.d != NONE \
+             ORDER BY refno \
+             LIMIT {page_size} START {offset}"
+        );
+        let mut batch: Vec<QueryAabbRowRaw> = model_primary_db().query_take(&sql, 0).await?;
+        if batch.is_empty() {
+            break;
+        }
+
+        page += 1;
+        offset += batch.len();
+        rows.append(&mut batch);
+    }
+
+    if !rows.is_empty() {
+        info!(
+            "[room_model] {} 按 dbnum={:?} 直扫命中 {} 条 AABB 记录 (page_size={})",
+            table_name,
+            db_nums,
+            rows.len(),
+            page_size
+        );
+    }
+
+    Ok(rows)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn refresh_sqlite_spatial_index_from_dbnums(
+    idx: &SqliteSpatialIndex,
+    db_nums: &[u32],
+) -> anyhow::Result<SpatialIndexRefreshStats> {
+    const PAGE_SIZE: usize = 10_000;
+    const INSERT_BATCH_SIZE: usize = 5_000;
+
+    let mut stats = SpatialIndexRefreshStats::default();
+    if db_nums.is_empty() {
+        return Ok(stats);
+    }
+
+    let inst_rows = query_inst_relate_rows_by_dbnums(db_nums).await?;
+    let inst_map: HashMap<RefnoEnum, InstRelateRow> = inst_rows
+        .into_iter()
+        .filter(|row| row.refno.is_valid())
+        .map(|row| (row.refno, row))
+        .collect();
+
+    let booled_rows = query_aabb_rows_by_dbnums("inst_relate_booled_aabb", db_nums, PAGE_SIZE).await?;
+    let raw_rows = query_aabb_rows_by_dbnums("inst_relate_aabb", db_nums, PAGE_SIZE).await?;
+
+    let mut booled_map: HashMap<RefnoEnum, Aabb> = HashMap::new();
+    for row in booled_rows {
+        if !row.refno.is_valid() {
+            continue;
+        }
+        let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
+            stats.skipped_invalid_aabb += 1;
+            continue;
+        };
+        booled_map
+            .entry(row.refno)
+            .and_modify(|acc| *acc = merge_aabb(acc, &aabb))
+            .or_insert(aabb);
+    }
+
+    let mut raw_map: HashMap<RefnoEnum, Aabb> = HashMap::new();
+    for row in raw_rows {
+        if !row.refno.is_valid() {
+            continue;
+        }
+        let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
+            stats.skipped_invalid_aabb += 1;
+            continue;
+        };
+        raw_map
+            .entry(row.refno)
+            .and_modify(|acc| *acc = merge_aabb(acc, &aabb))
+            .or_insert(aabb);
+    }
+
+    let mut all_refnos: Vec<RefnoEnum> = raw_map.keys().copied().collect();
+    for refno in booled_map.keys().copied() {
+        if !raw_map.contains_key(&refno) {
+            all_refnos.push(refno);
+        }
+    }
+    all_refnos.sort();
+    all_refnos.dedup();
+
+    println!(
+        "[room_model] SQLite AABB dbnum 刷新开始: dbnums={:?}, refnos={}, insert_batches={}",
+        db_nums,
+        all_refnos.len(),
+        (all_refnos.len() + INSERT_BATCH_SIZE - 1) / INSERT_BATCH_SIZE
+    );
+
+    let mut spec_resolver = SpatialIndexSpecResolver::new()?;
+
+    for (batch_idx, chunk) in all_refnos.chunks(INSERT_BATCH_SIZE).enumerate() {
+        let mut batch_with_spec: Vec<(i64, String, i64, f64, f64, f64, f64, f64, f64)> =
+            Vec::with_capacity(chunk.len());
+
+        for refno in chunk {
+            let inst_row = inst_map.get(refno);
+            let noun = inst_row
+                .and_then(|row| row.noun.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    stats.skipped_missing_noun += 1;
+                    SPATIAL_INDEX_UNKNOWN_NOUN.to_string()
+                });
+
+            let selected = if let Some(aabb) = booled_map.get(refno) {
+                stats.booled_override += 1;
+                Some(*aabb)
+            } else {
+                raw_map.get(refno).copied()
+            };
+
+            let Some(aabb) = selected else {
+                continue;
+            };
+
+            let spec_value = if let Some(inst_row) = inst_row {
+                spec_resolver.resolve_for_row(inst_row).await?
+            } else {
+                0
+            };
+
+            batch_with_spec.push((
+                refno.refno().0 as i64,
+                noun,
+                spec_value,
+                aabb.mins.x as f64,
+                aabb.maxs.x as f64,
+                aabb.mins.y as f64,
+                aabb.maxs.y as f64,
+                aabb.mins.z as f64,
+                aabb.maxs.z as f64,
+            ));
+        }
+
+        if !batch_with_spec.is_empty() {
+            stats.inserted += idx
+                .inner()
+                .insert_aabbs_with_items_and_spec_values(batch_with_spec)?;
+        }
+
+        let current = batch_idx + 1;
+        let total_batches = (all_refnos.len() + INSERT_BATCH_SIZE - 1) / INSERT_BATCH_SIZE;
+        if current == 1 || current == total_batches || current % 5 == 0 {
+            println!(
+                "[room_model] SQLite AABB dbnum 刷新进度: {}/{}, inserted={}, booled_override={}",
+                current, total_batches, stats.inserted, stats.booled_override
             );
         }
     }
@@ -700,6 +919,23 @@ pub async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
 
     let idx = SqliteSpatialIndex::with_default_path()?;
     idx.clear()?;
+
+    if refno_root.is_none() {
+        if let Some(nums) = db_nums {
+            let stats = refresh_sqlite_spatial_index_from_dbnums(&idx, nums).await?;
+            info!(
+                "[room_model] SQLite AABB 刷新完成: inserted={}, booled_override={}, skipped_db={}, skipped_refno_root={}, skipped_missing_dbmap={}, skipped_invalid_aabb={}, skipped_missing_noun={}, scope=dbnums",
+                stats.inserted,
+                stats.booled_override,
+                0,
+                0,
+                0,
+                stats.skipped_invalid_aabb,
+                stats.skipped_missing_noun
+            );
+            return Ok(stats.inserted);
+        }
+    }
 
     let scoped_refnos = if refno_root.is_some() || db_nums.is_some() {
         let mut scoped = if let Some(root) = refno_root {
@@ -850,21 +1086,21 @@ pub async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
                 continue;
             };
 
-            let Some(inst_row) = inst_map.get(&row.refno) else {
-                skipped_missing_noun += 1;
-                continue;
-            };
+            let inst_row = inst_map.get(&row.refno);
             let noun = inst_row
-                .noun
-                .as_deref()
+                .and_then(|inst_row| inst_row.noun.as_deref())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            let Some(noun) = noun else {
-                skipped_missing_noun += 1;
-                continue;
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    skipped_missing_noun += 1;
+                    SPATIAL_INDEX_UNKNOWN_NOUN.to_string()
+                });
+            let spec_value = if let Some(inst_row) = inst_row {
+                spec_resolver.resolve_for_row(inst_row).await?
+            } else {
+                0
             };
-            let spec_value = spec_resolver.resolve_for_row(inst_row).await?;
 
             batch.push((
                 ref_u64.0 as i64,
@@ -895,6 +1131,85 @@ pub async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
         skipped_missing_noun
     );
     Ok(total_inserted)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn count_inst_relate_aabb_rows_for_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<usize> {
+    if refnos.is_empty() {
+        return Ok(0);
+    }
+
+    const CHUNK_SIZE: usize = 2000;
+    let mut total = 0usize;
+
+    for chunk in refnos.chunks(CHUNK_SIZE) {
+        let ids = chunk.iter().map(RefnoEnum::to_pe_key).join(",");
+        let sql = format!(
+            "SELECT VALUE count() FROM inst_relate_aabb WHERE refno IN [{ids}] AND aabb_id.d != NONE GROUP ALL"
+        );
+        let counts: Vec<usize> = model_primary_db().query_take(&sql, 0).await?;
+        total += counts.into_iter().next().unwrap_or(0);
+    }
+
+    Ok(total)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn preflight_room_compute_aabb_count(
+    db_nums: Option<&[u32]>,
+    refno_root: Option<RefnoEnum>,
+) -> anyhow::Result<usize> {
+    use crate::fast_model::query_compat::query_visible_geo_descendants;
+
+    if let Some(root) = refno_root {
+        let refnos = query_visible_geo_descendants(root, true, None).await?;
+        if refnos.is_empty() {
+            anyhow::bail!(
+                "房间计算前置失败：refno_root={} 下未找到任何可见构件，已停止后续 room 关系写入",
+                root
+            );
+        }
+
+        let count = count_inst_relate_aabb_rows_for_refnos(&refnos).await?;
+        if count == 0 {
+            anyhow::bail!(
+                "房间计算前置失败：refno_root={} 作用域内未找到 inst_relate_aabb 数据，已停止后续 room 关系写入",
+                root
+            );
+        }
+        return Ok(count);
+    }
+
+    if let Some(nums) = db_nums {
+        let dbnum_list = nums.iter().map(u32::to_string).join(", ");
+        let sql = format!(
+            "SELECT VALUE count() FROM inst_relate_aabb WHERE refno.dbnum IN [{dbnum_list}] AND aabb_id.d != NONE GROUP ALL"
+        );
+        let counts: Vec<usize> = model_primary_db().query_take(&sql, 0).await?;
+        let count = counts.into_iter().next().unwrap_or(0);
+        if count == 0 {
+            anyhow::bail!(
+                "房间计算前置失败：db_nums={:?} 作用域内未找到 inst_relate_aabb 数据，已停止后续 room 关系写入",
+                nums
+            );
+        }
+        return Ok(count);
+    }
+
+    let counts: Vec<usize> = model_primary_db()
+        .query_take(
+            "SELECT VALUE count() FROM inst_relate_aabb WHERE aabb_id.d != NONE GROUP ALL",
+            0,
+        )
+        .await?;
+    let count = counts.into_iter().next().unwrap_or(0);
+    if count == 0 {
+        anyhow::bail!(
+            "房间计算前置失败：inst_relate_aabb 当前为空，需先补齐 AABB 数据后再执行 room compute"
+        );
+    }
+
+    Ok(count)
 }
 
 /// 房间关系构建统计信息
@@ -1381,6 +1696,11 @@ async fn build_room_relations_with_cancel_and_overrides(
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
     {
+        let source_aabb_count = preflight_room_compute_aabb_count(db_nums, refno_root).await?;
+        info!(
+            "[room_model] 房间计算前置检查通过: inst_relate_aabb_count={}, db_nums={:?}, refno_root={:?}",
+            source_aabb_count, db_nums, refno_root
+        );
         if let Some(ref cb) = progress_callback {
             cb(0.02, "正在刷新 SQLite AABB 索引");
         }
@@ -1388,8 +1708,13 @@ async fn build_room_relations_with_cancel_and_overrides(
             "[room_model] 开始刷新 SQLite AABB 索引: db_nums={:?}, refno_root={:?}, force_rebuild={}",
             db_nums, refno_root, force_rebuild
         );
-        ensure_spatial_index_ready(db_nums, refno_root.clone(), force_rebuild).await?;
-        println!("[room_model] SQLite AABB 索引刷新完成");
+        let inserted = ensure_spatial_index_ready(db_nums, refno_root.clone(), force_rebuild).await?;
+        if inserted == 0 {
+            anyhow::bail!(
+                "房间计算前置失败：SQLite AABB 索引刷新结果为空，已停止后续 room 关系写入"
+            );
+        }
+        println!("[room_model] SQLite AABB 索引刷新完成: inserted={inserted}");
     }
 
     // 1. 构建房间面板映射关系

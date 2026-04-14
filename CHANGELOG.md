@@ -11,6 +11,8 @@
 - 新增独立站点注册模块 `src/web_server/site_registry.rs`，并统一 `GET /api/sites` 与 `GET /api/deployment-sites` 的清单事实源。
 - 站点配置 CRUD 能力增强：支持从配置文件导入站点、按项目/区域过滤、以及可直接管理站点的 `bind_host/bind_port` 监听信息。
 - 新增任务创建向导原型 `ui/task_wizard.pen`，并补充 `docs/plans/2026-04-09-站点管理功能开发计划.md` 作为站点管理后续开发说明。
+- 新增 `src/web_server/admin_response.rs`，归纳管理端接口的响应结构以便复用。
+- 补充管理员模块教程 `docs/guides/ADMIN_MODULE_TUTORIAL.md`；补充 Room Compute CLI 校验说明 `ROOM_COMPUTE_CLI_VALIDATION.md`，并提供 `scripts/verify-room-compute.ps1` 与 `verification/room_compute_validation.json` 作为校验脚本与参考数据。
 
 ### Changed
 
@@ -30,6 +32,9 @@
 - 任务创建接口在 `manual_refnos` 非空时自动切换到 `RefnoModelGeneration`，`/api/model/generate-by-refno` 同步透传 noun 过滤与调试限制参数。
 - SQLite 空间查询接口新增 `spec_values` 过滤，并改为先按距离完整排序后再截断返回结果。
 - 房间计算验收基线中的房间编号统一改为 `R540`，与当前数据事实保持一致。
+- 增强后台管理模块：完善管理端登录鉴权与任务创建/进度相关 API 及后端处理逻辑（涉及 `admin_auth_handlers`、`admin_task_handlers`、`handlers`、`models`、`room_api`、`mbd_pipe_api`、`main`、`cli_modes` 等）。
+- 管理端前端（`ui/admin`）：更新鉴权与任务相关 API 客户端、状态存储及任务向导与进度视图。
+- 同步更新内置管理端静态资源。
 
 ### Fixed
 

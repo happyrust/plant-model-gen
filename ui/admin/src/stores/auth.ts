@@ -1,14 +1,8 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { authApi } from '@/api/auth'
-import type { AuthCredentials, AuthSession, AuthUser } from '@/types/api'
-
-function resolveSessionUser(session: AuthSession): AuthUser {
-  return {
-    username: session.user?.username ?? session.username ?? '',
-    role: session.user?.role ?? session.role ?? '',
-  }
-}
+import { extractErrorMessage } from '@/api/client'
+import type { AuthCredentials } from '@/types/api'
 
 export const useAuthStore = defineStore('auth', () => {
   const token = ref(localStorage.getItem('admin_token') ?? '')
@@ -24,15 +18,12 @@ export const useAuthStore = defineStore('auth', () => {
     loginError.value = ''
     try {
       const session = await authApi.login(creds)
-      const user = resolveSessionUser(session)
       token.value = session.token
-      username.value = user.username
-      role.value = user.role
+      username.value = session.user.username
+      role.value = session.user.role
       localStorage.setItem('admin_token', session.token)
     } catch (err: unknown) {
-      const message =
-        err instanceof Error ? err.message : 'Login failed'
-      loginError.value = message
+      loginError.value = extractErrorMessage(err)
       throw err
     } finally {
       loading.value = false
@@ -58,6 +49,8 @@ export const useAuthStore = defineStore('auth', () => {
       role.value = user.role
     } catch {
       token.value = ''
+      username.value = ''
+      role.value = ''
       localStorage.removeItem('admin_token')
     }
   }

@@ -27,6 +27,13 @@
 2. `room compute`
 3. `room verify-json`
 
+说明：
+
+- `room compute` 默认只计算 `room_panel_relate / room_relate`
+- 不会隐式触发模型生成
+- 若确需为缺失面板补模型，必须显式传 `-GenPanelsMesh`
+- 若使用 `--db-nums` / `--refno-root` 做 scoped 计算，命令结束后会自动恢复默认全量 `output/spatial_index.sqlite`，避免污染后续查询
+
 默认 fixture：
 
 ```text
@@ -63,7 +70,7 @@ verification/room_compute_validation.json
 - `-SkipVerify`
   - 不做 JSON 校验
 - `-GenPanelsMesh`
-  - 预生成缺失面板 mesh
+  - 显式允许为缺失面板预生成 mesh；默认关闭
 - `-Release`
   - 使用 `cargo run --release`
 - `-DryRun`
@@ -89,11 +96,30 @@ cargo run --bin aios-database --features ws,sqlite-index,web_server -- room clea
 cargo run --bin aios-database --features ws,sqlite-index,web_server -- room compute --keywords -RM,-ROOM --db-nums 24383
 ```
 
+如需显式补齐缺失面板模型后再计算：
+
+```powershell
+cargo run --bin aios-database --features ws,sqlite-index,web_server -- room compute --keywords -RM,-ROOM --db-nums 24383 --generate-models
+```
+
 #### 按 refno 子树
 
 ```powershell
 cargo run --bin aios-database --features ws,sqlite-index,web_server -- room compute --keywords -RM,-ROOM --refno-root 24383_83477
 ```
+
+#### 单面板计算
+
+```powershell
+cargo run --bin aios-database --features ws,sqlite-index,web_server -- room compute-panel 24381/35798 --expect-refnos 24381/145019
+```
+
+说明：
+
+- `room compute-panel` 默认也只做关系计算
+- `--rebuild-spatial-index` 只刷新索引，不会隐式生成模型；若局部刷新结果为空，会自动回退为全量索引重建
+- 只有显式传 `--generate-models`（兼容别名 `--gen-panels-mesh`）才允许补模型
+- `compute-panel` 若执行了局部索引刷新，命令结束后会自动恢复默认全量 `output/spatial_index.sqlite`
 
 ### 3. 用 JSON fixture 校验
 
@@ -118,11 +144,11 @@ cargo run --bin aios-database --features ws,sqlite-index,web_server -- room expo
   "description": "房间计算 CLI 验证基线",
   "test_cases": [
     {
-      "case_id": "room-540-panel-24381-35798",
+      "case_id": "room-301-panel-24381-34862",
       "description": "示例说明",
-      "room_number": "540",
-      "panel_refno": "24381/35798",
-      "expected_components": ["24381/145019"],
+      "room_number": "R301",
+      "panel_refno": "24381/34862",
+      "expected_components": ["24381/99386"],
       "notes": "可选说明"
     }
   ]
@@ -165,6 +191,9 @@ cargo run --bin aios-database --features ws,sqlite-index,web_server -- room expo
    - `-DbNums`
    - 或 `-RefnoRoot`
    - 或者显式 `-SkipCompute`
+4. `room compute` 默认是“只算关系”模式
+   - 不会隐式调用模型生成
+   - 只有显式传 `-GenPanelsMesh` / `--generate-models` 才允许补模型
 
 ---
 

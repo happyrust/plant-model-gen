@@ -701,7 +701,7 @@ pub async fn query_inst_relate_batch(
             .join(", ");
 
         let name_field = if include_name {
-            "fn::default_full_name(in) as name,"
+            "if in != NONE { fn::default_full_name(in) } else { NONE } as name,"
         } else {
             "NONE as name,"
         };
@@ -716,6 +716,7 @@ pub async fn query_inst_relate_batch(
                 {name_field}
                 spec_value
             FROM [{pe_list}]->inst_relate
+            WHERE in != NONE
             "#
         );
 

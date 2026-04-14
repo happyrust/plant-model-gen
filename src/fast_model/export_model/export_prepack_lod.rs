@@ -3662,15 +3662,21 @@ pub async fn export_dbnum_instances_json(
 
     let mut all_refnos: Vec<RefnoEnum> = if let Some(root) = root_refno {
         if let Ok(ref _tree_index) = tree_index_result {
-            // TreeIndex 可用：使用 query_compat 中基于 TreeIndex 的可见子孙查询
-
-            use crate::fast_model::query_compat::query_visible_geo_descendants;
+            // 与 web/v3/parquet 导出保持一致：
+            // root_refno 模式优先按“深度可见实例”收集子树，而不是只抓可见几何节点。
+            // 这样 BRAN/HANG 根在导出 instances.json 时不会意外得到空集合。
+            use crate::fast_model::query_compat::query_deep_visible_inst_refnos;
 
             if verbose {
-                println!("🔍 查询 {} 的 visible 子孙节点（TreeIndex）...", root);
+                println!("🔍 查询 {} 的可见实例节点（TreeIndex）...", root);
             }
 
-            query_visible_geo_descendants(root, true, Some("..")).await?
+            let mut list = query_deep_visible_inst_refnos(root).await?;
+            if !list.contains(&root) {
+                list.push(root);
+            }
+            list.sort_by_key(|r| r.to_string());
+            list
         } else {
             // TreeIndex 不可用：直接从 inst_relate 查询该 owner 的子节点
 

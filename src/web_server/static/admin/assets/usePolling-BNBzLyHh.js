@@ -1,1 +1,0 @@
-import{j as e,z as t}from"./client-DjwZqTbi.js";function n(n,r=3e4){let i=t(!1),a=null;function o(){i.value||(i.value=!0,a=setInterval(n,r))}function s(){i.value=!1,a&&=(clearInterval(a),null)}function c(e){return s(),r=e,o(),i}return e(s),{active:i,start:o,stop:s,setInterval:c}}export{n as t};

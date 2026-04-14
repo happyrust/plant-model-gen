@@ -1132,6 +1132,7 @@ pub async fn start_web_server_with_config(
             }
         }
     });
+    admin_auth_handlers::start_session_cleanup_timer();
     println!("🚀 Web UI服务器启动成功！");
     println!("📱 访问地址: http://localhost:{}", listen_port);
     println!("🌐 对外后端地址: {}", runtime_site_config.backend_url);

@@ -26,7 +26,8 @@ use aios_core::{
 };
 
 use crate::fast_model::{
-    RoomTaskType as WorkerRoomTaskType, RoomWorker, RoomWorkerConfig, RoomWorkerTask,
+    RoomBuildStats, RoomTaskType as WorkerRoomTaskType, RoomWorker, RoomWorkerConfig,
+    RoomWorkerTask,
     RoomWorkerTaskStatus, room_model::build_room_panels_relate_for_query,
 };
 use crate::shared::{
@@ -201,7 +202,10 @@ pub struct CreateRoomTaskRequest {
 /// 房间查询请求
 #[derive(Debug, Deserialize)]
 pub struct RoomQueryRequest {
-    pub point: [f64; 3], // [x, y, z]
+    pub point: Option<[f64; 3]>, // [x, y, z]
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub z: Option<f64>,
     pub tolerance: Option<f64>,
     pub max_results: Option<usize>,
 }
@@ -228,6 +232,7 @@ pub struct RoomQueryResponse {
     pub panel_refno: Option<u64>,
     pub confidence: Option<f64>,
     pub query_time_ms: f64,
+    pub error: Option<String>,
 }
 
 /// 批量房间查询响应
@@ -283,6 +288,17 @@ pub async fn create_room_task(
     State(state): State<RoomApiState>,
     Json(request): Json<CreateRoomTaskRequest>,
 ) -> Result<Json<RoomComputeTask>, StatusCode> {
+    let worker_task_type = match &request.task_type {
+        RoomTaskType::RebuildRelations => WorkerRoomTaskType::RebuildAll,
+        _ => {
+            warn!(
+                "⚠️ create_room_task 尚未接入任务类型: {:?}",
+                request.task_type
+            );
+            return Err(StatusCode::NOT_IMPLEMENTED);
+        }
+    };
+
     let task_id = Uuid::new_v4().to_string();
     let task = RoomComputeTask {
         id: task_id.clone(),
@@ -305,12 +321,6 @@ pub async fn create_room_task(
     // 在 ProgressHub 中注册任务
     state.progress_hub.register(task_id.clone());
     info!("📋 房间计算任务已注册到 ProgressHub: {}", task_id);
-
-    // 提交到 RoomWorker
-    let worker_task_type = match request.task_type.clone() {
-        RoomTaskType::RebuildRelations => WorkerRoomTaskType::RebuildAll,
-        _ => WorkerRoomTaskType::RebuildAll, // 默认回退，或者根据需要扩展
-    };
 
     let db_option = aios_core::get_db_option();
     let worker_task = RoomWorkerTask::new(task_id.clone(), worker_task_type, db_option.clone());
@@ -338,12 +348,10 @@ pub async fn get_task_status(
     State(state): State<RoomApiState>,
     Path(task_id): Path<String>,
 ) -> Result<Json<RoomComputeTask>, StatusCode> {
-    let task_manager = state.task_manager.read().await;
-
-    if let Some(task) = task_manager.active_tasks.get(&task_id) {
-        Ok(Json(task.clone()))
+    if let Some(task) = sync_task_with_worker_status(&state, &task_id).await {
+        Ok(Json(task))
     } else {
-        // 检查历史记录
+        let task_manager = state.task_manager.read().await;
         if let Some(task) = task_manager.task_history.iter().find(|t| t.id == task_id) {
             Ok(Json(task.clone()))
         } else {
@@ -357,10 +365,17 @@ pub async fn query_room_by_point(
     Query(request): Query<RoomQueryRequest>,
 ) -> Result<Json<RoomQueryResponse>, StatusCode> {
     let start_time = std::time::Instant::now();
+    let point_values = if let Some(point) = request.point {
+        point
+    } else if let (Some(x), Some(y), Some(z)) = (request.x, request.y, request.z) {
+        [x, y, z]
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
     let point = Vec3::new(
-        request.point[0] as f32,
-        request.point[1] as f32,
-        request.point[2] as f32,
+        point_values[0] as f32,
+        point_values[1] as f32,
+        point_values[2] as f32,
     );
 
     // 使用 aios-core 的真实房间查询方法
@@ -398,18 +413,12 @@ pub async fn query_room_by_point(
         }
     };
 
-    // 如果不支持 SQLite 特性，回退到占位符实现
+    // 当前构建未接入真实查询后端时，明确失败，禁止返回占位结果。
     #[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite")))]
     let query_result = {
-        warn!("SQLite 特性未启用，使用占位符实现");
-        let room_number = format!("ROOM_{}", (request.point[0] as i32).abs() % 1000);
-        (
-            true,
-            Some(room_number),
-            Some(123_456_789u64),
-            Some(0.50),
-            None::<String>,
-        )
+        let error = room_query_backend_unavailable_message();
+        warn!("{}", error);
+        (false, None, None, None, Some(error))
     };
 
     let (success, room_number, panel_refno, confidence, error_msg) = query_result;
@@ -433,6 +442,7 @@ pub async fn query_room_by_point(
         panel_refno,
         confidence,
         query_time_ms: query_time,
+        error: error_msg,
     }))
 }
 
@@ -489,6 +499,7 @@ pub async fn batch_query_rooms(
                         panel_refno,
                         confidence,
                         query_time_ms: query_time,
+                        error: None,
                     });
                 }
 
@@ -506,6 +517,7 @@ pub async fn batch_query_rooms(
                         panel_refno: None,
                         confidence: None,
                         query_time_ms: 0.0,
+                        error: Some(format!("查询失败: {}", e)),
                     })
                     .collect();
                 (false, results)
@@ -513,27 +525,25 @@ pub async fn batch_query_rooms(
         }
     };
 
-    // 如果不支持 SQLite 特性，回退到占位符实现
+    // 当前构建未接入真实查询后端时，明确失败，禁止返回占位结果。
     #[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite")))]
     let batch_result = {
-        warn!("SQLite 特性未启用，使用占位符批量查询实现");
+        let error = room_query_backend_unavailable_message();
+        warn!("{}", error);
         let mut results = Vec::new();
 
-        for point_array in &request.points {
-            let query_start = std::time::Instant::now();
-            let room_number = format!("ROOM_{}", (point_array[0] as i32).abs() % 1000);
-            let query_time = query_start.elapsed().as_millis() as f64;
-
+        for _point_array in &request.points {
             results.push(RoomQueryResponse {
-                success: true,
-                room_number: Some(room_number),
-                panel_refno: Some(123_000_000u64),
-                confidence: Some(0.50),
-                query_time_ms: query_time,
+                success: false,
+                room_number: None,
+                panel_refno: None,
+                confidence: None,
+                query_time_ms: 0.0,
+                error: Some(error.clone()),
             });
         }
 
-        (true, results)
+        (false, results)
     };
 
     let (success, results) = batch_result;
@@ -598,9 +608,7 @@ pub async fn get_room_system_status(
     let monitor = get_global_monitor().await;
     let metrics = monitor.get_current_metrics().await;
 
-    // 获取活跃任务数
-    let task_manager = state.task_manager.read().await;
-    let active_tasks = task_manager.active_tasks.len();
+    let active_tasks = state.room_worker.active_count() + state.room_worker.queue_len().await;
 
     // 获取缓存状态
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
@@ -640,7 +648,9 @@ pub async fn get_room_system_status(
         1.0 // 没有查询时默认为正常
     };
 
-    let system_health = if total_queries > 0 && success_rate > 0.8 {
+    let system_health = if total_queries == 0 && active_tasks == 0 {
+        "空闲".to_string()
+    } else if total_queries > 0 && success_rate > 0.8 {
         "正常".to_string()
     } else if success_rate > 0.5 {
         "警告".to_string()
@@ -758,12 +768,131 @@ async fn update_task_status(state: &RoomApiState, task: &RoomComputeTask) {
 async fn move_task_to_history(state: &RoomApiState, task: RoomComputeTask) {
     let mut task_manager = state.task_manager.write().await;
     task_manager.active_tasks.remove(&task.id);
-    task_manager.task_history.push(task);
+    push_task_to_history(&mut task_manager, task);
+}
 
-    // 限制历史记录数量
-    if task_manager.task_history.len() > 100 {
-        task_manager.task_history.remove(0);
+fn room_query_backend_unavailable_message() -> String {
+    "当前构建未启用真实房间查询后端（缺少 aios_core/sqlite）；已禁用占位返回，请改用支持该后端的构建或直接走 CLI 校验".to_string()
+}
+
+fn room_compute_result_from_stats(stats: &RoomBuildStats) -> RoomComputeResult {
+    RoomComputeResult {
+        success: true,
+        processed_count: stats.total_components,
+        error_count: 0,
+        warnings: vec![],
+        errors: vec![],
+        statistics: RoomStatistics {
+            total_rooms: stats.total_rooms,
+            total_panels: stats.total_panels,
+            total_relations: stats.total_components,
+            room_types: HashMap::new(),
+            avg_confidence: if stats.total_components > 0 { 1.0 } else { 0.0 },
+        },
+        duration_ms: stats.build_time_ms,
     }
+}
+
+fn failed_room_compute_result(error_message: String) -> RoomComputeResult {
+    RoomComputeResult {
+        success: false,
+        processed_count: 0,
+        error_count: 1,
+        warnings: vec![],
+        errors: vec![error_message],
+        statistics: RoomStatistics {
+            total_rooms: 0,
+            total_panels: 0,
+            total_relations: 0,
+            room_types: HashMap::new(),
+            avg_confidence: 0.0,
+        },
+        duration_ms: 0,
+    }
+}
+
+fn apply_worker_status_to_task(task: &mut RoomComputeTask, worker_status: &RoomWorkerTaskStatus) {
+    task.updated_at = Utc::now();
+
+    match worker_status {
+        RoomWorkerTaskStatus::Queued => {
+            task.status = TaskStatus::Pending;
+            task.progress = 0.0;
+            task.message = "任务已进入队列，等待 RoomWorker 执行".to_string();
+        }
+        RoomWorkerTaskStatus::Running { progress, stage } => {
+            task.status = TaskStatus::Running;
+            task.progress = (progress.clamp(0.0, 1.0) * 100.0).round();
+            task.message = format!("任务执行中: {}", stage);
+        }
+        RoomWorkerTaskStatus::Completed { stats } => {
+            task.status = TaskStatus::Completed;
+            task.progress = 100.0;
+            task.message = format!(
+                "任务完成: 房间={}, 面板={}, 构件={}",
+                stats.total_rooms, stats.total_panels, stats.total_components
+            );
+            task.result = Some(room_compute_result_from_stats(stats));
+        }
+        RoomWorkerTaskStatus::Failed { error } => {
+            task.status = TaskStatus::Failed;
+            task.progress = 0.0;
+            task.message = format!("任务失败: {}", error);
+            task.result = Some(failed_room_compute_result(error.clone()));
+        }
+        RoomWorkerTaskStatus::Cancelled => {
+            task.status = TaskStatus::Cancelled;
+            task.progress = 0.0;
+            task.message = "任务已取消".to_string();
+            task.result = Some(failed_room_compute_result("任务已取消".to_string()));
+        }
+    }
+}
+
+fn push_task_to_history(task_manager: &mut RoomTaskManager, task: RoomComputeTask) {
+    if let Some(existing) = task_manager.task_history.iter_mut().find(|t| t.id == task.id) {
+        *existing = task;
+    } else {
+        task_manager.task_history.push(task);
+    }
+
+    if task_manager.task_history.len() > 100 {
+        let remove_count = task_manager.task_history.len() - 100;
+        task_manager.task_history.drain(0..remove_count);
+    }
+}
+
+async fn sync_task_with_worker_status(
+    state: &RoomApiState,
+    task_id: &str,
+) -> Option<RoomComputeTask> {
+    let worker_status = state.room_worker.get_task_status(task_id)?;
+    let mut task_manager = state.task_manager.write().await;
+
+    if let Some(task) = task_manager.active_tasks.get_mut(task_id) {
+        apply_worker_status_to_task(task, &worker_status);
+        let snapshot = task.clone();
+        let is_terminal = matches!(
+            worker_status,
+            RoomWorkerTaskStatus::Completed { .. }
+                | RoomWorkerTaskStatus::Failed { .. }
+                | RoomWorkerTaskStatus::Cancelled
+        );
+        let snapshot_for_history = snapshot.clone();
+        let _ = task;
+        if is_terminal {
+            task_manager.active_tasks.remove(task_id);
+            push_task_to_history(&mut task_manager, snapshot_for_history);
+        }
+        return Some(snapshot);
+    }
+
+    if let Some(task) = task_manager.task_history.iter_mut().find(|t| t.id == task_id) {
+        apply_worker_status_to_task(task, &worker_status);
+        return Some(task.clone());
+    }
+
+    None
 }
 
 // 实现具体的任务执行函数
@@ -1669,6 +1798,7 @@ pub async fn cancel_room_task(
     } else {
         warn!("⚠️ 无法取消任务: {}", task_id);
     }
+    let _ = sync_task_with_worker_status(&state, &task_id).await;
     Ok(Json(success))
 }
 
@@ -1722,7 +1852,8 @@ mod tests {
 /// {
 ///   "room_keywords": ["-RM", "-ROOM"],  // 可选
 ///   "db_nums": [1112, 1113],            // 可选
-///   "force_rebuild": false              // 可选，默认 false
+///   "force_rebuild": false,             // 可选，默认 false
+///   "generate_models": false            // 可选，默认 false；true 时请改用 /api/room/regenerate-models
 /// }
 /// ```
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
@@ -1739,6 +1870,19 @@ pub async fn compute_room_relations_sync(
         info!("   - 数据库编号: {:?}", nums);
     }
     info!("   - 强制重建: {}", request.force_rebuild);
+    info!("   - 允许生成模型: {}", request.generate_models);
+
+    if request.generate_models {
+        return Ok(Json(crate::web_server::models::RoomComputeSyncResponse {
+            success: false,
+            message: "当前 /api/room/compute 默认只计算房间关系；如需补生成模型，请显式调用 /api/room/regenerate-models".to_string(),
+            total_rooms: 0,
+            total_panels: 0,
+            total_components: 0,
+            build_time_ms: 0,
+            cache_hit_rate: 0.0,
+        }));
+    }
 
     let db_option = aios_core::get_db_option();
 

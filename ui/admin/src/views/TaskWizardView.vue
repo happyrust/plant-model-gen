@@ -39,12 +39,11 @@ const wizardTaskTypes: TaskType[] = [
   'ParsePdmsData',
   'DataGeneration',
   'FullGeneration',
-  'MeshGeneration',
-  'SpatialTreeGeneration',
-  'RefnoModelGeneration',
-  'DataExport',
-  'ModelExport',
 ]
+
+const canProceedStepOne = computed(() =>
+  !!taskName.value.trim() && !!selectedSiteId.value
+)
 
 function nextStep() {
   if (step.value < 3) step.value++
@@ -126,13 +125,14 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
       </div>
 
       <div class="space-y-2">
-        <label class="text-sm font-medium">关联站点</label>
+        <label class="text-sm font-medium">关联站点 *</label>
         <select v-model="selectedSiteId" :class="inputClass">
-          <option value="">不关联</option>
+          <option value="" disabled>请选择站点</option>
           <option v-for="s in sitesStore.sites" :key="s.site_id" :value="s.site_id">
             {{ s.project_name }} ({{ s.site_id }})
           </option>
         </select>
+        <p class="text-xs text-muted-foreground">admin 任务必须绑定一个已创建站点。</p>
       </div>
 
       <div class="space-y-2">
@@ -211,7 +211,7 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
         <div class="text-muted-foreground">名称</div><div>{{ taskName }}</div>
         <div class="text-muted-foreground">类型</div><div>{{ getTaskTypeLabel(taskType) }}</div>
         <div class="text-muted-foreground">优先级</div><div>{{ PRIORITY_LABELS[taskPriority] }}</div>
-        <div class="text-muted-foreground">关联站点</div><div>{{ selectedSite?.project_name ?? '无' }}</div>
+        <div class="text-muted-foreground">关联站点</div><div>{{ selectedSite?.project_name ?? '-' }}</div>
         <div class="text-muted-foreground">生成模型</div><div>{{ genModel ? '是' : '否' }}</div>
         <div class="text-muted-foreground">生成网格</div><div>{{ genMesh ? '是' : '否' }}</div>
         <div class="text-muted-foreground">空间树</div><div>{{ genSpatialTree ? '是' : '否' }}</div>
@@ -224,7 +224,7 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
         </template>
       </div>
       <div class="border-t border-border pt-3 text-sm text-muted-foreground">
-        确认后将创建任务并加入队列。
+        确认后将立即提交站点动作，并在任务列表中按站点运行状态持续对账。
       </div>
     </div>
 
@@ -235,11 +235,11 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
         上一步
       </button>
       <div v-else />
-      <button v-if="step < 3" @click="nextStep" :disabled="!taskName"
+      <button v-if="step < 3" @click="nextStep" :disabled="!canProceedStepOne"
         class="inline-flex h-9 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow hover:bg-primary/90 transition-colors disabled:pointer-events-none disabled:opacity-50">
         下一步
       </button>
-      <button v-else @click="handleSubmit" :disabled="submitting"
+      <button v-else @click="handleSubmit" :disabled="submitting || !canProceedStepOne"
         class="inline-flex h-9 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow hover:bg-primary/90 transition-colors disabled:pointer-events-none disabled:opacity-50">
         {{ submitting ? '创建中...' : '确认创建' }}
       </button>

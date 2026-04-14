@@ -2108,6 +2108,9 @@ pub struct RoomComputeSyncRequest {
     /// 是否强制重建（默认 false）
     #[serde(default)]
     pub force_rebuild: bool,
+    /// 是否允许在房间计算前补生成模型（默认 false，建议改走 /api/room/regenerate-models）
+    #[serde(default)]
+    pub generate_models: bool,
 }
 
 /// 同步房间计算响应

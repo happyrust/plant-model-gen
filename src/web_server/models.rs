@@ -780,6 +780,35 @@ impl Default for ManagedSiteParseStatus {
     }
 }
 
+/// 管理后台站点风险等级
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ManagedSiteRiskLevel {
+    #[default]
+    Normal,
+    Warning,
+    Critical,
+}
+
+/// 管理后台解析健康状态
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ManagedSiteParseHealthStatus {
+    Normal,
+    Warning,
+    Critical,
+    #[default]
+    Unknown,
+}
+
+/// 管理后台解析健康摘要
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedSiteParseHealth {
+    pub status: ManagedSiteParseHealthStatus,
+    pub label: String,
+    pub detail: Option<String>,
+}
+
 /// 管理后台项目站点
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ManagedProjectSite {
@@ -805,6 +834,10 @@ pub struct ManagedProjectSite {
     pub last_parse_started_at: Option<String>,
     pub last_parse_finished_at: Option<String>,
     pub last_parse_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub risk_level: ManagedSiteRiskLevel,
+    #[serde(default)]
+    pub risk_reasons: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -901,6 +934,11 @@ pub struct ManagedSiteRuntimeStatus {
     pub last_key_log_source: Option<String>,
     pub recent_activity: Option<ManagedSiteActivitySummary>,
     pub resources: Option<ManagedSiteResourceMetrics>,
+    pub risk_level: ManagedSiteRiskLevel,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub parse_health: ManagedSiteParseHealth,
 }
 
 /// 管理后台资源摘要
@@ -911,6 +949,9 @@ pub struct AdminResourceSummary {
     pub disk_usage: Option<f32>,
     pub admin_runtime_size_bytes: u64,
     pub managed_data_size_bytes: u64,
+    pub risk_level: ManagedSiteRiskLevel,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub updated_at: String,
     pub message: Option<String>,
 }

@@ -3,18 +3,24 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, SystemTime};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use parse_pdms_db::parse::parse_file_basic_info;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
+use sysinfo::{
+    CpuRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System,
+};
 use tokio::process::Command;
 
 use super::models::{
-    CreateManagedSiteRequest, DatabaseConfig, ManagedProjectSite, ManagedSiteActivitySummary,
-    ManagedSiteLogStreamSummary, ManagedSiteLogsResponse, ManagedSiteParseStatus,
+    AdminResourceSummary, CreateManagedSiteRequest, DatabaseConfig, ManagedProjectSite,
+    ManagedSiteActivitySummary, ManagedSiteLogStreamSummary, ManagedSiteLogsResponse,
+    ManagedSiteParseHealth, ManagedSiteParseHealthStatus, ManagedSiteParseStatus,
+    ManagedSiteProcessResource, ManagedSiteResourceMetrics, ManagedSiteRiskLevel,
     ManagedSiteRuntimeStatus, ManagedSiteStatus, UpdateManagedSiteRequest,
 };
 
@@ -22,6 +28,18 @@ const DEFAULT_SQLITE_PATH: &str = "deployment_sites.sqlite";
 const TABLE_NAME: &str = "managed_project_sites";
 const ADMIN_RUNTIME_ROOT: &str = "runtime/admin_sites";
 const LOG_LINES_LIMIT: usize = 120;
+const MACHINE_WARNING_CPU: f32 = 85.0;
+const MACHINE_CRITICAL_CPU: f32 = 95.0;
+const MACHINE_WARNING_MEMORY: f32 = 80.0;
+const MACHINE_CRITICAL_MEMORY: f32 = 90.0;
+const MACHINE_WARNING_DISK: f32 = 85.0;
+const MACHINE_CRITICAL_DISK: f32 = 95.0;
+const PROCESS_WARNING_CPU: f32 = 70.0;
+const PROCESS_CRITICAL_CPU: f32 = 90.0;
+const PROCESS_WARNING_MEMORY_BYTES: u64 = 1536 * 1024 * 1024;
+const PROCESS_CRITICAL_MEMORY_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+const PARSE_WARNING_DURATION_MS: u64 = 10 * 60 * 1000;
+const PARSE_CRITICAL_DURATION_MS: u64 = 30 * 60 * 1000;
 
 #[derive(Debug, Clone)]
 struct LogSnapshot {
@@ -36,6 +54,22 @@ struct LogSnapshot {
     line_count: usize,
     last_line: Option<String>,
     last_key_log: Option<String>,
+}
+
+#[derive(Debug)]
+struct ResourceSampler {
+    system: System,
+    warmed_up: bool,
+}
+
+fn resource_sampler() -> &'static Mutex<ResourceSampler> {
+    static SAMPLER: OnceLock<Mutex<ResourceSampler>> = OnceLock::new();
+    SAMPLER.get_or_init(|| {
+        Mutex::new(ResourceSampler {
+            system: System::new(),
+            warmed_up: false,
+        })
+    })
 }
 
 fn now_rfc3339() -> String {
@@ -93,6 +127,9 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
             entry_url TEXT,
             db_user TEXT,
             db_password TEXT,
+            last_parse_started_at TEXT,
+            last_parse_finished_at TEXT,
+            last_parse_duration_ms INTEGER,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -110,6 +147,42 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
         conn.execute(
             &format!(
                 "ALTER TABLE {table} ADD COLUMN manual_db_nums TEXT NOT NULL DEFAULT '[]'",
+                table = TABLE_NAME
+            ),
+            [],
+        )?;
+    }
+    if !columns
+        .iter()
+        .any(|column| column == "last_parse_started_at")
+    {
+        conn.execute(
+            &format!(
+                "ALTER TABLE {table} ADD COLUMN last_parse_started_at TEXT",
+                table = TABLE_NAME
+            ),
+            [],
+        )?;
+    }
+    if !columns
+        .iter()
+        .any(|column| column == "last_parse_finished_at")
+    {
+        conn.execute(
+            &format!(
+                "ALTER TABLE {table} ADD COLUMN last_parse_finished_at TEXT",
+                table = TABLE_NAME
+            ),
+            [],
+        )?;
+    }
+    if !columns
+        .iter()
+        .any(|column| column == "last_parse_duration_ms")
+    {
+        conn.execute(
+            &format!(
+                "ALTER TABLE {table} ADD COLUMN last_parse_duration_ms INTEGER",
                 table = TABLE_NAME
             ),
             [],
@@ -580,6 +653,13 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedProjectSite> 
         parse_status: parse_status_from_str(&row.get::<_, String>("parse_status")?),
         last_error: row.get("last_error")?,
         entry_url: row.get("entry_url")?,
+        last_parse_started_at: row.get("last_parse_started_at")?,
+        last_parse_finished_at: row.get("last_parse_finished_at")?,
+        last_parse_duration_ms: row
+            .get::<_, Option<i64>>("last_parse_duration_ms")?
+            .map(|value| value as u64),
+        risk_level: ManagedSiteRiskLevel::Normal,
+        risk_reasons: Vec::new(),
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -672,6 +752,7 @@ pub fn get_site(site_id: &str) -> Result<Option<ManagedProjectSite>> {
     let mut site = load_site_with_conn(&conn, site_id)?;
     if let Some(item) = site.as_mut() {
         refresh_site(item);
+        annotate_site_risk(item);
     }
     Ok(site)
 }
@@ -689,6 +770,7 @@ pub fn list_sites() -> Result<Vec<ManagedProjectSite>> {
         refresh_site(&mut site);
         items.push(site);
     }
+    annotate_sites_risks(&mut items);
     Ok(items)
 }
 
@@ -704,8 +786,9 @@ fn persist_site(
                 site_id, project_name, project_code, project_path, config_path, runtime_dir,
                 manual_db_nums, db_data_path, db_port, web_port, bind_host, db_pid, web_pid, parse_pid,
                 status, parse_status, last_error, entry_url, db_user, db_password,
+                last_parse_started_at, last_parse_finished_at, last_parse_duration_ms,
                 created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             table = TABLE_NAME
         ),
         params![
@@ -729,6 +812,9 @@ fn persist_site(
             &site.entry_url,
             db_user,
             db_password,
+            &site.last_parse_started_at,
+            &site.last_parse_finished_at,
+            site.last_parse_duration_ms.map(|value| value as i64),
             &site.created_at,
             &site.updated_at,
         ],
@@ -772,6 +858,11 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
         parse_status: ManagedSiteParseStatus::Pending,
         last_error: None,
         entry_url: Some(format!("http://127.0.0.1:{}", req.web_port)),
+        last_parse_started_at: None,
+        last_parse_finished_at: None,
+        last_parse_duration_ms: None,
+        risk_level: ManagedSiteRiskLevel::Normal,
+        risk_reasons: Vec::new(),
         created_at: created_at.clone(),
         updated_at: created_at,
     };
@@ -857,6 +948,9 @@ pub fn update_runtime(
     parse_pid: Option<Option<u32>>,
     last_error: Option<Option<String>>,
     entry_url: Option<Option<String>>,
+    last_parse_started_at: Option<Option<String>>,
+    last_parse_finished_at: Option<Option<String>>,
+    last_parse_duration_ms: Option<Option<u64>>,
 ) -> Result<()> {
     let conn = open_db()?;
     let mut site = load_site_with_conn(&conn, site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
@@ -881,6 +975,15 @@ pub fn update_runtime(
     if let Some(value) = entry_url {
         site.entry_url = value;
     }
+    if let Some(value) = last_parse_started_at {
+        site.last_parse_started_at = value;
+    }
+    if let Some(value) = last_parse_finished_at {
+        site.last_parse_finished_at = value;
+    }
+    if let Some(value) = last_parse_duration_ms {
+        site.last_parse_duration_ms = value;
+    }
     site.updated_at = now_rfc3339();
     let (db_user, db_password) = load_credentials(&conn, site_id)?;
     persist_site(&conn, &site, &db_user, &db_password)
@@ -892,6 +995,472 @@ fn repo_root() -> Result<PathBuf> {
 
 fn current_exe_path() -> Result<PathBuf> {
     std::env::current_exe().context("获取当前 web_server 可执行文件失败")
+}
+
+fn with_resource_sampler<R>(target_pids: &[u32], handler: impl FnOnce(bool, &System) -> R) -> R {
+    let mut sampler = resource_sampler()
+        .lock()
+        .expect("resource sampler lock poisoned");
+    let cpu_ready = sampler.warmed_up;
+    sampler
+        .system
+        .refresh_memory_specifics(MemoryRefreshKind::everything());
+    sampler
+        .system
+        .refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
+    let pids = target_pids
+        .iter()
+        .copied()
+        .map(Pid::from_u32)
+        .collect::<Vec<_>>();
+    if pids.is_empty() {
+        sampler.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_memory().with_cpu(),
+        );
+    } else {
+        sampler.system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&pids),
+            true,
+            ProcessRefreshKind::nothing().with_memory().with_cpu(),
+        );
+    }
+    sampler.warmed_up = true;
+    handler(cpu_ready, &sampler.system)
+}
+
+fn path_size_bytes(path: &Path) -> u64 {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return 0,
+    };
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    if !metadata.is_dir() {
+        return 0;
+    }
+    fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| path_size_bytes(&entry.path()))
+        .sum()
+}
+
+fn site_data_dir(site: &ManagedProjectSite) -> PathBuf {
+    let path = PathBuf::from(&site.db_data_path);
+    if path.is_dir() {
+        return path;
+    }
+    path.parent().map(Path::to_path_buf).unwrap_or(path)
+}
+
+fn disk_usage_for_path(path: &Path) -> Option<f32> {
+    let disks = Disks::new_with_refreshed_list();
+    let best_disk = disks.list().iter().fold(None, |best, disk| {
+        if !path.starts_with(disk.mount_point()) {
+            return best;
+        }
+        let depth = disk.mount_point().components().count();
+        match best {
+            Some((best_depth, usage)) if best_depth >= depth => Some((best_depth, usage)),
+            _ => {
+                let total = disk.total_space();
+                let usage = if total == 0 {
+                    0.0
+                } else {
+                    ((total.saturating_sub(disk.available_space())) as f32 / total as f32) * 100.0
+                };
+                Some((depth, usage))
+            }
+        }
+    });
+    best_disk.map(|(_, usage)| usage)
+}
+
+fn build_process_resource(
+    pid: Option<u32>,
+    running: bool,
+    system: &System,
+    cpu_ready: bool,
+) -> ManagedSiteProcessResource {
+    let mut resource = ManagedSiteProcessResource {
+        pid,
+        running,
+        cpu_usage: None,
+        memory_bytes: None,
+    };
+    let Some(pid_value) = pid else {
+        return resource;
+    };
+    let Some(process) = system.process(Pid::from_u32(pid_value)) else {
+        return resource;
+    };
+    resource.memory_bytes = Some(process.memory());
+    if cpu_ready {
+        resource.cpu_usage = Some(process.cpu_usage());
+    }
+    resource
+}
+
+fn risk_score(level: &ManagedSiteRiskLevel) -> u8 {
+    match level {
+        ManagedSiteRiskLevel::Normal => 0,
+        ManagedSiteRiskLevel::Warning => 1,
+        ManagedSiteRiskLevel::Critical => 2,
+    }
+}
+
+fn promote_risk(level: &mut ManagedSiteRiskLevel, candidate: ManagedSiteRiskLevel) {
+    if risk_score(&candidate) > risk_score(level) {
+        *level = candidate;
+    }
+}
+
+fn format_duration_label(duration_ms: u64) -> String {
+    if duration_ms < 1_000 {
+        return format!("{} ms", duration_ms);
+    }
+    let seconds = duration_ms / 1_000;
+    if seconds < 60 {
+        return format!("{} 秒", seconds);
+    }
+    let minutes = seconds / 60;
+    let remain_seconds = seconds % 60;
+    if minutes < 60 {
+        return format!("{} 分 {} 秒", minutes, remain_seconds);
+    }
+    let hours = minutes / 60;
+    let remain_minutes = minutes % 60;
+    format!("{} 小时 {} 分", hours, remain_minutes)
+}
+
+fn evaluate_machine_risk(
+    cpu_usage: Option<f32>,
+    memory_usage: Option<f32>,
+    disk_usage: Option<f32>,
+) -> (ManagedSiteRiskLevel, Vec<String>) {
+    let mut risk_level = ManagedSiteRiskLevel::Normal;
+    let mut warnings = Vec::new();
+
+    if let Some(value) = cpu_usage {
+        if value >= MACHINE_CRITICAL_CPU {
+            promote_risk(&mut risk_level, ManagedSiteRiskLevel::Critical);
+            warnings.push("CPU 占用过高".to_string());
+        } else if value >= MACHINE_WARNING_CPU {
+            promote_risk(&mut risk_level, ManagedSiteRiskLevel::Warning);
+            warnings.push("CPU 占用过高".to_string());
+        }
+    }
+
+    if let Some(value) = memory_usage {
+        if value >= MACHINE_CRITICAL_MEMORY {
+            promote_risk(&mut risk_level, ManagedSiteRiskLevel::Critical);
+            warnings.push("内存占用过高".to_string());
+        } else if value >= MACHINE_WARNING_MEMORY {
+            promote_risk(&mut risk_level, ManagedSiteRiskLevel::Warning);
+            warnings.push("内存占用过高".to_string());
+        }
+    }
+
+    if let Some(value) = disk_usage {
+        if value >= MACHINE_CRITICAL_DISK {
+            promote_risk(&mut risk_level, ManagedSiteRiskLevel::Critical);
+            warnings.push("磁盘空间紧张".to_string());
+        } else if value >= MACHINE_WARNING_DISK {
+            promote_risk(&mut risk_level, ManagedSiteRiskLevel::Warning);
+            warnings.push("磁盘空间紧张".to_string());
+        }
+    }
+
+    (risk_level, warnings)
+}
+
+fn build_site_resource_metrics(
+    site: &ManagedProjectSite,
+    db_running: bool,
+    web_running: bool,
+    parse_running: bool,
+    system: &System,
+    cpu_ready: bool,
+) -> ManagedSiteResourceMetrics {
+    let runtime_dir = PathBuf::from(&site.runtime_dir);
+    let data_dir = site_data_dir(site);
+
+    ManagedSiteResourceMetrics {
+        db_process: build_process_resource(site.db_pid, db_running, system, cpu_ready),
+        web_process: build_process_resource(site.web_pid, web_running, system, cpu_ready),
+        parse_process: build_process_resource(site.parse_pid, parse_running, system, cpu_ready),
+        runtime_dir_size_bytes: path_size_bytes(&runtime_dir),
+        data_dir_size_bytes: path_size_bytes(&data_dir),
+        runtime_dir_missing: !runtime_dir.exists(),
+        data_dir_missing: !data_dir.exists(),
+        last_parse_started_at: site.last_parse_started_at.clone(),
+        last_parse_finished_at: site.last_parse_finished_at.clone(),
+        last_parse_duration_ms: site.last_parse_duration_ms,
+    }
+}
+
+fn collect_site_resource_metrics(
+    site: &ManagedProjectSite,
+    db_running: bool,
+    web_running: bool,
+    parse_running: bool,
+) -> ManagedSiteResourceMetrics {
+    let tracked_pids = [site.db_pid, site.web_pid, site.parse_pid]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    with_resource_sampler(&tracked_pids, |cpu_ready, system| {
+        build_site_resource_metrics(site, db_running, web_running, parse_running, system, cpu_ready)
+    })
+}
+
+fn evaluate_parse_health(
+    site: &ManagedProjectSite,
+    resources: &ManagedSiteResourceMetrics,
+) -> ManagedSiteParseHealth {
+    if site.parse_status == ManagedSiteParseStatus::Failed {
+        return ManagedSiteParseHealth {
+            status: ManagedSiteParseHealthStatus::Critical,
+            label: "解析失败".to_string(),
+            detail: site
+                .last_error
+                .clone()
+                .or_else(|| Some("最近一次解析执行失败".to_string())),
+        };
+    }
+
+    if site.parse_status == ManagedSiteParseStatus::Running {
+        return ManagedSiteParseHealth {
+            status: ManagedSiteParseHealthStatus::Unknown,
+            label: "解析进行中".to_string(),
+            detail: resources
+                .last_parse_started_at
+                .as_ref()
+                .map(|value| format!("开始于 {}", value)),
+        };
+    }
+
+    if let Some(duration_ms) = resources.last_parse_duration_ms {
+        if duration_ms >= PARSE_CRITICAL_DURATION_MS {
+            return ManagedSiteParseHealth {
+                status: ManagedSiteParseHealthStatus::Critical,
+                label: "解析耗时过长".to_string(),
+                detail: Some(format!("最近一次解析耗时 {}", format_duration_label(duration_ms))),
+            };
+        }
+        if duration_ms >= PARSE_WARNING_DURATION_MS {
+            return ManagedSiteParseHealth {
+                status: ManagedSiteParseHealthStatus::Warning,
+                label: "解析耗时偏长".to_string(),
+                detail: Some(format!("最近一次解析耗时 {}", format_duration_label(duration_ms))),
+            };
+        }
+        return ManagedSiteParseHealth {
+            status: ManagedSiteParseHealthStatus::Normal,
+            label: "解析正常".to_string(),
+            detail: Some(format!("最近一次解析耗时 {}", format_duration_label(duration_ms))),
+        };
+    }
+
+    if site.parse_status == ManagedSiteParseStatus::Pending {
+        return ManagedSiteParseHealth {
+            status: ManagedSiteParseHealthStatus::Unknown,
+            label: "暂无解析记录".to_string(),
+            detail: None,
+        };
+    }
+
+    if site.parse_status == ManagedSiteParseStatus::Parsed {
+        return ManagedSiteParseHealth {
+            status: ManagedSiteParseHealthStatus::Normal,
+            label: "解析正常".to_string(),
+            detail: None,
+        };
+    }
+
+    ManagedSiteParseHealth {
+        status: ManagedSiteParseHealthStatus::Unknown,
+        label: "暂无解析记录".to_string(),
+        detail: None,
+    }
+}
+
+fn apply_process_risk(
+    label: &str,
+    process: &ManagedSiteProcessResource,
+    risk_level: &mut ManagedSiteRiskLevel,
+    warnings: &mut Vec<String>,
+) {
+    if !process.running {
+        return;
+    }
+
+    if let Some(cpu_usage) = process.cpu_usage {
+        if cpu_usage >= PROCESS_CRITICAL_CPU {
+            promote_risk(risk_level, ManagedSiteRiskLevel::Critical);
+            warnings.push(format!("{} 进程 CPU 占用过高", label));
+        } else if cpu_usage >= PROCESS_WARNING_CPU {
+            promote_risk(risk_level, ManagedSiteRiskLevel::Warning);
+            warnings.push(format!("{} 进程 CPU 占用过高", label));
+        }
+    }
+
+    if let Some(memory_bytes) = process.memory_bytes {
+        if memory_bytes >= PROCESS_CRITICAL_MEMORY_BYTES {
+            promote_risk(risk_level, ManagedSiteRiskLevel::Critical);
+            warnings.push(format!("{} 进程内存占用过高", label));
+        } else if memory_bytes >= PROCESS_WARNING_MEMORY_BYTES {
+            promote_risk(risk_level, ManagedSiteRiskLevel::Warning);
+            warnings.push(format!("{} 进程内存占用过高", label));
+        }
+    }
+}
+
+fn evaluate_site_risk(
+    site: &ManagedProjectSite,
+    resources: &ManagedSiteResourceMetrics,
+) -> (ManagedSiteRiskLevel, Vec<String>, ManagedSiteParseHealth) {
+    let mut risk_level = ManagedSiteRiskLevel::Normal;
+    let mut warnings = Vec::new();
+
+    if site.status == ManagedSiteStatus::Failed {
+        promote_risk(&mut risk_level, ManagedSiteRiskLevel::Critical);
+        warnings.push("站点当前状态失败".to_string());
+    }
+
+    apply_process_risk("DB", &resources.db_process, &mut risk_level, &mut warnings);
+    apply_process_risk("Web", &resources.web_process, &mut risk_level, &mut warnings);
+    apply_process_risk("Parse", &resources.parse_process, &mut risk_level, &mut warnings);
+
+    if site.parse_status == ManagedSiteParseStatus::Failed {
+        promote_risk(&mut risk_level, ManagedSiteRiskLevel::Critical);
+        warnings.push("Parse 最近一次执行失败".to_string());
+    } else if let Some(duration_ms) = resources.last_parse_duration_ms {
+        if duration_ms >= PARSE_CRITICAL_DURATION_MS {
+            promote_risk(&mut risk_level, ManagedSiteRiskLevel::Critical);
+            warnings.push("Parse 最近耗时过长".to_string());
+        } else if duration_ms >= PARSE_WARNING_DURATION_MS {
+            promote_risk(&mut risk_level, ManagedSiteRiskLevel::Warning);
+            warnings.push("Parse 最近耗时过长".to_string());
+        }
+    }
+
+    if resources.runtime_dir_missing
+        && matches!(site.status, ManagedSiteStatus::Starting | ManagedSiteStatus::Running)
+    {
+        promote_risk(&mut risk_level, ManagedSiteRiskLevel::Warning);
+        warnings.push("运行目录缺失".to_string());
+    }
+
+    if resources.data_dir_missing
+        && matches!(
+            site.status,
+            ManagedSiteStatus::Starting | ManagedSiteStatus::Running | ManagedSiteStatus::Parsed
+        )
+    {
+        promote_risk(&mut risk_level, ManagedSiteRiskLevel::Warning);
+        warnings.push("数据目录缺失".to_string());
+    }
+
+    let parse_health = evaluate_parse_health(site, resources);
+    (risk_level, warnings, parse_health)
+}
+
+fn annotate_site_risk(site: &mut ManagedProjectSite) {
+    let db_running = pid_running(site.db_pid) || port_in_use("127.0.0.1", site.db_port);
+    let web_running = pid_running(site.web_pid) || port_in_use("127.0.0.1", site.web_port);
+    let parse_running = pid_running(site.parse_pid);
+    let resources = collect_site_resource_metrics(site, db_running, web_running, parse_running);
+    let (risk_level, risk_reasons, _) = evaluate_site_risk(site, &resources);
+    site.risk_level = risk_level;
+    site.risk_reasons = risk_reasons;
+}
+
+fn annotate_sites_risks(sites: &mut [ManagedProjectSite]) {
+    let runtime_states = sites
+        .iter()
+        .map(|site| {
+            (
+                pid_running(site.db_pid) || port_in_use("127.0.0.1", site.db_port),
+                pid_running(site.web_pid) || port_in_use("127.0.0.1", site.web_port),
+                pid_running(site.parse_pid),
+            )
+        })
+        .collect::<Vec<_>>();
+    let tracked_pids = sites
+        .iter()
+        .flat_map(|site| [site.db_pid, site.web_pid, site.parse_pid])
+        .flatten()
+        .collect::<Vec<_>>();
+
+    with_resource_sampler(&tracked_pids, |cpu_ready, system| {
+        for (site, (db_running, web_running, parse_running)) in
+            sites.iter_mut().zip(runtime_states.into_iter())
+        {
+            let resources = build_site_resource_metrics(
+                site,
+                db_running,
+                web_running,
+                parse_running,
+                system,
+                cpu_ready,
+            );
+            let (risk_level, risk_reasons, _) = evaluate_site_risk(site, &resources);
+            site.risk_level = risk_level;
+            site.risk_reasons = risk_reasons;
+        }
+    });
+}
+
+pub fn resource_summary() -> Result<AdminResourceSummary> {
+    let conn = open_db()?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT * FROM {table} ORDER BY updated_at DESC",
+        table = TABLE_NAME
+    ))?;
+    let rows = stmt.query_map([], row_to_site)?;
+    let mut sites = Vec::new();
+    for row in rows {
+        sites.push(row?);
+    }
+
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let admin_runtime_root = runtime_root();
+    let managed_data_size_bytes = sites
+        .iter()
+        .map(|site| path_size_bytes(Path::new(&site.db_data_path)))
+        .sum();
+
+    Ok(with_resource_sampler(&[], |cpu_ready, system| {
+        let cpu_usage = cpu_ready.then_some(system.global_cpu_usage());
+        let memory_usage = {
+            let total = system.total_memory();
+            if total == 0 {
+                None
+            } else {
+                Some((system.used_memory() as f32 / total as f32) * 100.0)
+            }
+        };
+        let disk_usage = disk_usage_for_path(&current_dir);
+        let (risk_level, warnings) = evaluate_machine_risk(cpu_usage, memory_usage, disk_usage);
+        AdminResourceSummary {
+            cpu_usage,
+            memory_usage,
+            disk_usage,
+            admin_runtime_size_bytes: path_size_bytes(&admin_runtime_root),
+            managed_data_size_bytes,
+            risk_level,
+            warnings,
+            updated_at: now_rfc3339(),
+            message: None,
+        }
+    }))
 }
 
 #[cfg(unix)]
@@ -997,7 +1566,11 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
         .strip_suffix(".toml")
         .map(|value| value.to_string())
         .unwrap_or_else(|| config_path.to_string_lossy().to_string());
-    let single_dbnum = (site.manual_db_nums.len() == 1).then_some(site.manual_db_nums[0]);
+    let single_dbnum = site
+        .manual_db_nums
+        .first()
+        .copied()
+        .filter(|_| site.manual_db_nums.len() == 1);
     let (stdout, stderr) = open_log_file(&parse_log_path(&site.site_id))?;
     let repo = repo_root()?;
     let mut command = if should_run_aios_database_from_source(&repo) {
@@ -1037,6 +1610,8 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
 
+    let parse_started_at = now_rfc3339();
+    let parse_started_instant = Instant::now();
     let mut child = command.spawn().context("启动解析进程失败")?;
     let pid = child.id();
     update_runtime(
@@ -1048,9 +1623,14 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
         Some(pid),
         Some(None),
         None,
+        Some(Some(parse_started_at)),
+        Some(None),
+        Some(None),
     )?;
 
     let exit = child.wait().await.context("等待解析进程失败")?;
+    let parse_finished_at = now_rfc3339();
+    let parse_duration_ms = parse_started_instant.elapsed().as_millis() as u64;
     if exit.success() {
         update_runtime(
             &site.site_id,
@@ -1061,6 +1641,9 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
             Some(None),
             Some(None),
             None,
+            None,
+            Some(Some(parse_finished_at)),
+            Some(Some(parse_duration_ms)),
         )?;
     } else {
         update_runtime(
@@ -1072,6 +1655,9 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
             Some(None),
             Some(Some(format!("解析失败，退出码: {:?}", exit.code()))),
             None,
+            None,
+            Some(Some(parse_finished_at)),
+            Some(Some(parse_duration_ms)),
         )?;
     }
     Ok(())
@@ -1142,6 +1728,9 @@ async fn ensure_site_db_started(
         None,
         Some(None),
         None,
+        None,
+        None,
+        None,
     )?;
     if !wait_for_port(site.db_port, 30, 500).await {
         let _ = kill_pid(db_pid).await;
@@ -1162,6 +1751,9 @@ async fn run_parse_pipeline(site_id: String) -> Result<()> {
             None,
             None,
             Some(None),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -1190,6 +1782,9 @@ async fn run_start_pipeline(site_id: String) -> Result<()> {
         None,
         Some(None),
         None,
+        None,
+        None,
+        None,
     )?;
 
     let site = get_site(&site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
@@ -1205,6 +1800,9 @@ async fn run_start_pipeline(site_id: String) -> Result<()> {
                     None,
                     None,
                     Some(None),
+                    None,
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -1226,6 +1824,9 @@ async fn run_start_pipeline(site_id: String) -> Result<()> {
         None,
         Some(None),
         Some(Some(format!("http://127.0.0.1:{}", site.web_port))),
+        None,
+        None,
+        None,
     )?;
     let status_url = format!("http://127.0.0.1:{}/api/status", site.web_port);
     if !wait_for_http_ok(&status_url, 40, 500).await {
@@ -1237,6 +1838,9 @@ async fn run_start_pipeline(site_id: String) -> Result<()> {
                 None,
                 None,
                 Some(None),
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1255,6 +1859,9 @@ async fn run_start_pipeline(site_id: String) -> Result<()> {
         Some(None),
         Some(None),
         Some(Some(format!("http://127.0.0.1:{}", site.web_port))),
+        None,
+        None,
+        None,
     )?;
     Ok(())
 }
@@ -1276,6 +1883,9 @@ pub async fn start_site(site_id: String) -> Result<()> {
         None,
         Some(None),
         None,
+        None,
+        None,
+        None,
     )?;
     tokio::spawn(async move {
         if let Err(err) = run_start_pipeline(site_id.clone()).await {
@@ -1287,6 +1897,9 @@ pub async fn start_site(site_id: String) -> Result<()> {
                 None,
                 Some(None),
                 Some(Some(err.to_string())),
+                None,
+                None,
+                None,
                 None,
             );
         }
@@ -1309,6 +1922,9 @@ pub async fn parse_site(site_id: String) -> Result<()> {
                 None,
                 Some(None),
                 Some(Some(err.to_string())),
+                None,
+                None,
+                None,
                 None,
             );
         }
@@ -1347,6 +1963,9 @@ pub async fn stop_site(site_id: &str) -> Result<ManagedProjectSite> {
         None,
         None,
         None,
+        None,
+        None,
+        None,
     )?;
     if let Some(pid) = site.web_pid {
         kill_pid(pid).await?;
@@ -1371,6 +1990,9 @@ pub async fn stop_site(site_id: &str) -> Result<ManagedProjectSite> {
         Some(None),
         Some(None),
         Some(None),
+        None,
+        None,
+        None,
         None,
     )?;
     get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))
@@ -1405,6 +2027,7 @@ pub fn runtime_status(site_id: &str) -> Result<ManagedSiteRuntimeStatus> {
     let db_running = pid_running(site.db_pid) || port_in_use("127.0.0.1", site.db_port);
     let web_running = pid_running(site.web_pid) || port_in_use("127.0.0.1", site.web_port);
     let parse_running = pid_running(site.parse_pid);
+    let resources = collect_site_resource_metrics(&site, db_running, web_running, parse_running);
     let snapshots = collect_log_snapshots(site_id);
     let parse_snapshot = snapshots.iter().find(|snapshot| snapshot.key == "parse");
     let db_snapshot = snapshots.iter().find(|snapshot| snapshot.key == "db");
@@ -1446,6 +2069,8 @@ pub fn runtime_status(site_id: &str) -> Result<ManagedSiteRuntimeStatus> {
         web_snapshot.and_then(|snapshot| snapshot.last_key_log.clone()),
     );
 
+    let (risk_level, warnings, parse_health) = evaluate_site_risk(&site, &resources);
+
     Ok(ManagedSiteRuntimeStatus {
         site_id: site.site_id,
         status: site.status,
@@ -1470,6 +2095,10 @@ pub fn runtime_status(site_id: &str) -> Result<ManagedSiteRuntimeStatus> {
         last_key_log,
         last_key_log_source,
         recent_activity,
+        resources: Some(resources),
+        risk_level,
+        warnings,
+        parse_health,
     })
 }
 
@@ -1511,17 +2140,15 @@ fn strip_ansi_codes(line: &str) -> String {
 }
 
 fn last_non_empty_line(lines: &[String]) -> Option<String> {
-    lines.iter()
-        .rev()
-        .find_map(|line| {
-            let normalized = strip_ansi_codes(line);
-            let trimmed = normalized.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        })
+    lines.iter().rev().find_map(|line| {
+        let normalized = strip_ansi_codes(line);
+        let trimmed = normalized.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 fn summarize_log_line(key: &str, line: Option<&str>) -> Option<String> {
@@ -1612,7 +2239,9 @@ fn log_snapshot(key: &'static str, label: &'static str, path: PathBuf) -> LogSna
         0
     };
     let has_content = line_count > 0 || lines.iter().any(|line| !line.trim().is_empty());
-    let updated_at = fs::metadata(&path).ok().and_then(|meta| meta.modified().ok());
+    let updated_at = fs::metadata(&path)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
     let updated_at_rfc3339 = updated_at.map(system_time_to_rfc3339);
     let last_line = last_non_empty_line(&lines);
     let last_key_log = lines
@@ -1705,7 +2334,11 @@ fn current_stage(
         return (
             "failed".to_string(),
             "失败".to_string(),
-            site.last_error.clone().or(parse_detail).or(db_detail).or(web_detail),
+            site.last_error
+                .clone()
+                .or(parse_detail)
+                .or(db_detail)
+                .or(web_detail),
         );
     }
     if matches!(site.status, ManagedSiteStatus::Stopped) {

@@ -227,6 +227,10 @@ pub async fn admin_auth_middleware(request: Request<Body>, next: Next) -> Respon
     }
 }
 
+pub async fn admin_session_middleware(request: Request<Body>, next: Next) -> Response {
+    admin_auth_middleware(request, next).await
+}
+
 async fn login(Json(payload): Json<LoginRequest>) -> impl IntoResponse {
     if !admin_auth_configured() {
         log_admin_auth_unavailable();

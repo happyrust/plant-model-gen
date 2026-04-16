@@ -2,13 +2,20 @@
 import { useRouter } from 'vue-router'
 import { useSitesStore } from '@/stores/sites'
 import type { ManagedProjectSite, ManagedSiteRiskLevel } from '@/types/site'
-import { Eye, ExternalLink, Play, RefreshCw, Square, Trash2 } from 'lucide-vue-next'
+import { Eye, ExternalLink, Loader2, Play, RefreshCw, Square, Trash2 } from 'lucide-vue-next'
 import { statusLabelMap, statusClassMap, parseStatusClass as getParseStatusClass, isSiteBusy } from './site-status'
 
 const props = defineProps<{ sites: ManagedProjectSite[]; loading: boolean }>()
 
 const router = useRouter()
 const sitesStore = useSitesStore()
+
+function isPending(siteId: string) {
+  return sitesStore.isSiteActionPending(siteId)
+}
+function pendingAction(siteId: string) {
+  return sitesStore.getSiteAction(siteId)
+}
 
 const riskConfig: Record<ManagedSiteRiskLevel, { class: string; label: string }> = {
   normal: { class: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200', label: '正常' },
@@ -113,7 +120,13 @@ function openViewer(site: ManagedProjectSite) {
             </div>
           </td>
           <td class="px-4 py-3 text-right align-top" @click.stop>
-            <div class="flex items-center justify-end gap-1">
+            <div v-if="isPending(site.site_id)" class="flex items-center justify-end gap-2">
+              <Loader2 class="h-4 w-4 animate-spin text-muted-foreground" />
+              <span class="text-xs text-muted-foreground">
+                {{ pendingAction(site.site_id) === 'start' ? '启动中' : pendingAction(site.site_id) === 'stop' ? '停止中' : pendingAction(site.site_id) === 'parse' ? '解析中' : '处理中' }}
+              </span>
+            </div>
+            <div v-else class="flex items-center justify-end gap-1">
               <button
                 v-if="canStart(site)"
                 @click="sitesStore.startSite(site.site_id)"

@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref, computed, reactive } from 'vue'
 import { sitesApi } from '@/api/sites'
 import type {
   ManagedProjectSite,
@@ -8,10 +8,13 @@ import type {
   UpdateManagedSiteRequest,
 } from '@/types/site'
 
+export type SiteAction = 'parse' | 'start' | 'stop' | 'delete'
+
 export const useSitesStore = defineStore('sites', () => {
   const sites = ref<ManagedProjectSite[]>([])
   const loading = ref(false)
   const error = ref('')
+  const pendingActions = reactive(new Map<string, SiteAction>())
 
   const stats = computed<SiteStats>(() => ({
     total: sites.value.length,
@@ -19,6 +22,24 @@ export const useSitesStore = defineStore('sites', () => {
     error: sites.value.filter((s) => s.status === 'Failed').length,
     pending_parse: sites.value.filter((s) => s.parse_status === 'Pending').length,
   }))
+
+  function getSiteAction(siteId: string): SiteAction | undefined {
+    return pendingActions.get(siteId)
+  }
+
+  function isSiteActionPending(siteId: string): boolean {
+    return pendingActions.has(siteId)
+  }
+
+  async function withAction(siteId: string, action: SiteAction, fn: () => Promise<void>) {
+    if (pendingActions.has(siteId)) return
+    pendingActions.set(siteId, action)
+    try {
+      await fn()
+    } finally {
+      pendingActions.delete(siteId)
+    }
+  }
 
   async function fetchSites() {
     loading.value = true
@@ -46,27 +67,36 @@ export const useSitesStore = defineStore('sites', () => {
   }
 
   async function deleteSite(id: string) {
-    await sitesApi.delete(id)
-    sites.value = sites.value.filter((s) => s.site_id !== id)
+    await withAction(id, 'delete', async () => {
+      await sitesApi.delete(id)
+      sites.value = sites.value.filter((s) => s.site_id !== id)
+    })
   }
 
   async function parseSite(id: string) {
-    await sitesApi.parse(id)
-    await fetchSites()
+    await withAction(id, 'parse', async () => {
+      await sitesApi.parse(id)
+      await fetchSites()
+    })
   }
 
   async function startSite(id: string) {
-    await sitesApi.start(id)
-    await fetchSites()
+    await withAction(id, 'start', async () => {
+      await sitesApi.start(id)
+      await fetchSites()
+    })
   }
 
   async function stopSite(id: string) {
-    await sitesApi.stop(id)
-    await fetchSites()
+    await withAction(id, 'stop', async () => {
+      await sitesApi.stop(id)
+      await fetchSites()
+    })
   }
 
   return {
     sites, stats, loading, error,
+    pendingActions, getSiteAction, isSiteActionPending,
     fetchSites, createSite, updateSite, deleteSite,
     parseSite, startSite, stopSite,
   }

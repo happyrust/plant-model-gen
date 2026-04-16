@@ -5,19 +5,19 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, post, put},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::web_server::{
-    AppState, admin_task_handlers, handlers,
+    AppState, admin_task_handlers,
+    admin_response::{self, ApiResponse},
+    handlers,
     models::{
         DatabaseConfig, DeploymentSiteCreateRequest, DeploymentSiteImportRequest,
         DeploymentSiteQuery, DeploymentSiteTaskRequest, DeploymentSiteUpdateRequest,
         TaskInfo,
     },
 };
-
-type ApiResponse = (StatusCode, Json<Value>);
 
 #[derive(Debug, Deserialize)]
 pub struct AdminRegistryTaskRequest {
@@ -61,22 +61,22 @@ pub fn create_admin_registry_routes() -> Router<AppState> {
 
 async fn list_sites(Query(params): Query<DeploymentSiteQuery>) -> impl IntoResponse {
     match handlers::api_get_deployment_sites(Query(params)).await {
-        Ok(Json(value)) => ok("获取注册表站点列表成功", value),
-        Err(status) => status_error(status, "获取注册表站点列表失败"),
+        Ok(Json(value)) => admin_response::ok("获取注册表站点列表成功", value),
+        Err(status) => admin_response::response::<Value>(status, false, "获取注册表站点列表失败", None),
     }
 }
 
 async fn create_site(Json(payload): Json<DeploymentSiteCreateRequest>) -> impl IntoResponse {
     match handlers::api_create_deployment_site(Json(payload)).await {
-        Ok(Json(value)) => ok_created("创建注册表站点成功", unwrap_item_or_value(value)),
-        Err((status, Json(value))) => proxy_error(status, value, "创建注册表站点失败"),
+        Ok(Json(value)) => admin_response::accepted("创建注册表站点成功", unwrap_item_or_value(value)),
+        Err((status, Json(value))) => extract_proxy_error(status, value, "创建注册表站点失败"),
     }
 }
 
 async fn get_site(Path(site_id): Path<String>) -> impl IntoResponse {
     match handlers::api_get_deployment_site(Path(site_id)).await {
-        Ok(Json(value)) => ok("获取注册表站点详情成功", value),
-        Err(status) => status_error(status, "获取注册表站点详情失败"),
+        Ok(Json(value)) => admin_response::ok("获取注册表站点详情成功", value),
+        Err(status) => admin_response::response::<Value>(status, false, "获取注册表站点详情失败", None),
     }
 }
 
@@ -85,21 +85,15 @@ async fn update_site(
     Json(payload): Json<DeploymentSiteUpdateRequest>,
 ) -> impl IntoResponse {
     match handlers::api_update_deployment_site(Path(site_id), Json(payload)).await {
-        Ok(Json(value)) => ok("更新注册表站点成功", unwrap_item_or_value(value)),
-        Err((status, Json(value))) => proxy_error(status, value, "更新注册表站点失败"),
+        Ok(Json(value)) => admin_response::ok("更新注册表站点成功", unwrap_item_or_value(value)),
+        Err((status, Json(value))) => extract_proxy_error(status, value, "更新注册表站点失败"),
     }
 }
 
 async fn delete_site(Path(site_id): Path<String>) -> impl IntoResponse {
     match handlers::api_delete_deployment_site(Path(site_id.clone())).await {
-        Ok(_) => ok(
-            "删除注册表站点成功",
-            json!({
-                "site_id": site_id,
-                "deleted": true
-            }),
-        ),
-        Err(status) => status_error(status, "删除注册表站点失败"),
+        Ok(_) => admin_response::ok("删除注册表站点成功", json!({"site_id": site_id, "deleted": true})),
+        Err(status) => admin_response::response::<Value>(status, false, "删除注册表站点失败", None),
     }
 }
 
@@ -107,22 +101,22 @@ async fn import_site_from_dboption(
     payload: Option<Json<DeploymentSiteImportRequest>>,
 ) -> impl IntoResponse {
     match handlers::api_import_deployment_site_from_dboption(payload).await {
-        Ok(Json(value)) => ok_created("导入注册表站点成功", unwrap_item_or_value(value)),
-        Err((status, Json(value))) => proxy_error(status, value, "导入注册表站点失败"),
+        Ok(Json(value)) => admin_response::accepted("导入注册表站点成功", unwrap_item_or_value(value)),
+        Err((status, Json(value))) => extract_proxy_error(status, value, "导入注册表站点失败"),
     }
 }
 
 async fn healthcheck_site(Path(site_id): Path<String>) -> impl IntoResponse {
     match handlers::api_healthcheck_deployment_site_post(Path(site_id), None).await {
-        Ok(Json(value)) => ok("站点健康检查完成", value),
-        Err((status, Json(value))) => proxy_error(status, value, "站点健康检查失败"),
+        Ok(Json(value)) => admin_response::ok("站点健康检查完成", value),
+        Err((status, Json(value))) => extract_proxy_error(status, value, "站点健康检查失败"),
     }
 }
 
 async fn export_site_config(Path(site_id): Path<String>) -> impl IntoResponse {
     match handlers::api_export_deployment_site_config(Path(site_id)).await {
-        Ok(Json(value)) => ok("导出站点配置成功", value),
-        Err(status) => status_error(status, "导出站点配置失败"),
+        Ok(Json(value)) => admin_response::ok("导出站点配置成功", value),
+        Err(status) => admin_response::response::<Value>(status, false, "导出站点配置失败", None),
     }
 }
 
@@ -172,9 +166,9 @@ async fn create_site_task(
             unified_task.site_label = site_label;
             admin_task_handlers::insert_task(unified_task);
 
-            ok("创建注册表任务成功", sanitize_task_response(value))
+            admin_response::ok("创建注册表任务成功", sanitize_task_response(value))
         }
-        Err((status, Json(value))) => proxy_error(status, value, "创建注册表任务失败"),
+        Err((status, Json(value))) => extract_proxy_error(status, value, "创建注册表任务失败"),
     }
 }
 
@@ -192,48 +186,11 @@ fn unwrap_item_or_value(value: Value) -> Value {
     value.get("item").cloned().unwrap_or(value)
 }
 
-fn ok<T>(message: impl Into<String>, data: T) -> ApiResponse
-where
-    T: Serialize,
-{
-    response(StatusCode::OK, true, message, Some(data))
-}
-
-fn ok_created<T>(message: impl Into<String>, data: T) -> ApiResponse
-where
-    T: Serialize,
-{
-    response(StatusCode::CREATED, true, message, Some(data))
-}
-
-fn status_error(status: StatusCode, fallback_message: &str) -> ApiResponse {
-    response::<Value>(status, false, fallback_message, None)
-}
-
-fn proxy_error(status: StatusCode, value: Value, fallback_message: &str) -> ApiResponse {
+fn extract_proxy_error(status: StatusCode, value: Value, fallback_message: &str) -> ApiResponse {
     let message = value
         .get("error")
         .and_then(Value::as_str)
         .or_else(|| value.get("message").and_then(Value::as_str))
         .unwrap_or(fallback_message);
-    response::<Value>(status, false, message, None)
-}
-
-fn response<T>(
-    status: StatusCode,
-    success: bool,
-    message: impl Into<String>,
-    data: Option<T>,
-) -> ApiResponse
-where
-    T: Serialize,
-{
-    (
-        status,
-        Json(json!({
-            "success": success,
-            "message": message.into(),
-            "data": data
-        })),
-    )
+    admin_response::response::<Value>(status, false, message, None)
 }

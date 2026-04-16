@@ -99,6 +99,7 @@ fn open_db() -> Result<Connection> {
     let db_path = sqlite_path();
     let conn = Connection::open(&db_path)
         .with_context(|| format!("打开管理员站点数据库失败: {}", db_path))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
     ensure_schema_with_conn(&conn)?;
     Ok(conn)
 }
@@ -1042,19 +1043,33 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
     Ok(site)
 }
 
-pub fn update_runtime(
-    site_id: &str,
-    status: Option<ManagedSiteStatus>,
-    parse_status: Option<ManagedSiteParseStatus>,
-    db_pid: Option<Option<u32>>,
-    web_pid: Option<Option<u32>>,
-    parse_pid: Option<Option<u32>>,
-    last_error: Option<Option<String>>,
-    entry_url: Option<Option<String>>,
-    last_parse_started_at: Option<Option<String>>,
-    last_parse_finished_at: Option<Option<String>>,
-    last_parse_duration_ms: Option<Option<u64>>,
-) -> Result<()> {
+#[derive(Default)]
+pub struct RuntimeUpdate {
+    pub status: Option<ManagedSiteStatus>,
+    pub parse_status: Option<ManagedSiteParseStatus>,
+    pub db_pid: Option<Option<u32>>,
+    pub web_pid: Option<Option<u32>>,
+    pub parse_pid: Option<Option<u32>>,
+    pub last_error: Option<Option<String>>,
+    pub entry_url: Option<Option<String>>,
+    pub last_parse_started_at: Option<Option<String>>,
+    pub last_parse_finished_at: Option<Option<String>>,
+    pub last_parse_duration_ms: Option<Option<u64>>,
+}
+
+pub fn update_runtime(site_id: &str, update: RuntimeUpdate) -> Result<()> {
+    let RuntimeUpdate {
+        status,
+        parse_status,
+        db_pid,
+        web_pid,
+        parse_pid,
+        last_error,
+        entry_url,
+        last_parse_started_at,
+        last_parse_finished_at,
+        last_parse_duration_ms,
+    } = update;
     let conn = open_db()?;
     let mut site = load_site_with_conn(&conn, site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
     if let Some(value) = status {
@@ -1579,7 +1594,24 @@ fn pid_running(pid: Option<u32>) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn pid_running(pid: Option<u32>) -> bool {
+    let Some(pid) = pid else {
+        return false;
+    };
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/NH", "/FO", "CSV"])
+        .output();
+    match output {
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            text.contains(&pid.to_string())
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn pid_running(pid: Option<u32>) -> bool {
     let _ = pid;
     false
@@ -1600,7 +1632,20 @@ async fn process_ids_on_port(port: u16) -> Result<Vec<u32>> {
             .collect::<Vec<_>>();
         Ok(ids)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let output = Command::new("cmd")
+            .args(["/C", &format!("netstat -ano | findstr :{} | findstr LISTENING", port)])
+            .output()
+            .await
+            .context("读取端口进程失败")?;
+        let ids = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().last()?.trim().parse::<u32>().ok())
+            .collect::<Vec<_>>();
+        Ok(ids)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = port;
         Ok(Vec::new())
@@ -1739,51 +1784,40 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
     let parse_started_instant = Instant::now();
     let mut child = command.spawn().context("启动解析进程失败")?;
     let pid = child.id();
-    update_runtime(
-        &site.site_id,
-        Some(ManagedSiteStatus::Draft),
-        Some(ManagedSiteParseStatus::Running),
-        None,
-        None,
-        Some(pid),
-        Some(None),
-        None,
-        Some(Some(parse_started_at)),
-        Some(None),
-        Some(None),
-    )?;
+    update_runtime(&site.site_id, RuntimeUpdate {
+        status: Some(ManagedSiteStatus::Draft),
+        parse_status: Some(ManagedSiteParseStatus::Running),
+        parse_pid: Some(pid),
+        last_error: Some(None),
+        last_parse_started_at: Some(Some(parse_started_at)),
+        last_parse_finished_at: Some(None),
+        last_parse_duration_ms: Some(None),
+        ..Default::default()
+    })?;
 
     let exit = child.wait().await.context("等待解析进程失败")?;
     let parse_finished_at = now_rfc3339();
     let parse_duration_ms = parse_started_instant.elapsed().as_millis() as u64;
     if exit.success() {
-        update_runtime(
-            &site.site_id,
-            Some(ManagedSiteStatus::Parsed),
-            Some(ManagedSiteParseStatus::Parsed),
-            None,
-            None,
-            Some(None),
-            Some(None),
-            None,
-            None,
-            Some(Some(parse_finished_at)),
-            Some(Some(parse_duration_ms)),
-        )?;
+        update_runtime(&site.site_id, RuntimeUpdate {
+            status: Some(ManagedSiteStatus::Parsed),
+            parse_status: Some(ManagedSiteParseStatus::Parsed),
+            parse_pid: Some(None),
+            last_error: Some(None),
+            last_parse_finished_at: Some(Some(parse_finished_at)),
+            last_parse_duration_ms: Some(Some(parse_duration_ms)),
+            ..Default::default()
+        })?;
     } else {
-        update_runtime(
-            &site.site_id,
-            Some(ManagedSiteStatus::Failed),
-            Some(ManagedSiteParseStatus::Failed),
-            None,
-            None,
-            Some(None),
-            Some(Some(format!("解析失败，退出码: {:?}", exit.code()))),
-            None,
-            None,
-            Some(Some(parse_finished_at)),
-            Some(Some(parse_duration_ms)),
-        )?;
+        update_runtime(&site.site_id, RuntimeUpdate {
+            status: Some(ManagedSiteStatus::Failed),
+            parse_status: Some(ManagedSiteParseStatus::Failed),
+            parse_pid: Some(None),
+            last_error: Some(Some(format!("解析失败，退出码: {:?}", exit.code()))),
+            last_parse_finished_at: Some(Some(parse_finished_at)),
+            last_parse_duration_ms: Some(Some(parse_duration_ms)),
+            ..Default::default()
+        })?;
     }
     Ok(())
 }
@@ -1844,19 +1878,12 @@ async fn ensure_site_db_started(
     }
 
     let db_pid = spawn_db_process(site).await?;
-    update_runtime(
-        &site.site_id,
-        Some(status),
-        None,
-        Some(Some(db_pid)),
-        None,
-        None,
-        Some(None),
-        None,
-        None,
-        None,
-        None,
-    )?;
+    update_runtime(&site.site_id, RuntimeUpdate {
+        status: Some(status),
+        db_pid: Some(Some(db_pid)),
+        last_error: Some(None),
+        ..Default::default()
+    })?;
     if !wait_for_port(site.db_port, 30, 500).await {
         let _ = kill_pid(db_pid).await;
         bail!("SurrealDB 未在端口 {} 成功启动", site.db_port);
@@ -1871,19 +1898,10 @@ async fn run_parse_pipeline(site_id: String) -> Result<()> {
 
     if let Some(db_pid) = started_db_pid {
         let _ = kill_pid(db_pid).await;
-        let _ = update_runtime(
-            &site_id,
-            None,
-            None,
-            Some(None),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let _ = update_runtime(&site_id, RuntimeUpdate {
+            db_pid: Some(None),
+            ..Default::default()
+        });
     }
 
     parse_result
@@ -1891,26 +1909,18 @@ async fn run_parse_pipeline(site_id: String) -> Result<()> {
 
 async fn run_start_pipeline(site_id: String) -> Result<()> {
     let site = get_site(&site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
-    if port_in_use("127.0.0.1", site.web_port) {
-        bail!("站点端口 {} 已被占用", site.web_port);
-    }
+    let conn = open_db()?;
+    assert_port_available(&conn, Some(&site_id), site.db_port, site.web_port)?;
+    drop(conn);
 
     if site.parse_status == ManagedSiteParseStatus::Running {
         bail!("解析任务仍在运行，请稍后再启动站点");
     }
-    update_runtime(
-        &site_id,
-        Some(ManagedSiteStatus::Starting),
-        None,
-        None,
-        None,
-        None,
-        Some(None),
-        None,
-        None,
-        None,
-        None,
-    )?;
+    update_runtime(&site_id, RuntimeUpdate {
+        status: Some(ManagedSiteStatus::Starting),
+        last_error: Some(None),
+        ..Default::default()
+    })?;
 
     let site = get_site(&site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
     let db_pid = ensure_site_db_started(&site, ManagedSiteStatus::Starting).await?;
@@ -1920,74 +1930,48 @@ async fn run_start_pipeline(site_id: String) -> Result<()> {
         if let Err(err) = spawn_parse_process(site_id.clone()).await {
             if let Some(pid) = db_pid {
                 let _ = kill_pid(pid).await;
-                let _ = update_runtime(
-                    &site_id,
-                    None,
-                    None,
-                    Some(None),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                );
             }
+            let _ = update_runtime(&site_id, RuntimeUpdate {
+                status: Some(ManagedSiteStatus::Failed),
+                parse_status: Some(ManagedSiteParseStatus::Failed),
+                db_pid: Some(None),
+                last_error: Some(Some(format!("启动解析失败: {err}"))),
+                ..Default::default()
+            });
             return Err(err);
         }
     }
 
     let site = get_site(&site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
     let web_pid = spawn_web_process(&site).await?;
-    update_runtime(
-        &site_id,
-        Some(ManagedSiteStatus::Starting),
-        None,
-        None,
-        Some(Some(web_pid)),
-        None,
-        Some(None),
-        Some(Some(format!("http://127.0.0.1:{}", site.web_port))),
-        None,
-        None,
-        None,
-    )?;
+    update_runtime(&site_id, RuntimeUpdate {
+        status: Some(ManagedSiteStatus::Starting),
+        web_pid: Some(Some(web_pid)),
+        last_error: Some(None),
+        entry_url: Some(Some(format!("http://127.0.0.1:{}", site.web_port))),
+        ..Default::default()
+    })?;
     let status_url = format!("http://127.0.0.1:{}/api/status", site.web_port);
     if !wait_for_http_ok(&status_url, 40, 500).await {
         let _ = kill_pid(web_pid).await;
         if let Some(pid) = db_pid {
             let _ = kill_pid(pid).await;
-            let _ = update_runtime(
-                &site_id,
-                None,
-                None,
-                Some(None),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            );
+            let _ = update_runtime(&site_id, RuntimeUpdate {
+                db_pid: Some(None),
+                ..Default::default()
+            });
         }
         bail!("项目站点未在 {} 启动成功", status_url);
     }
 
-    update_runtime(
-        &site_id,
-        Some(ManagedSiteStatus::Running),
-        Some(ManagedSiteParseStatus::Parsed),
-        None,
-        None,
-        Some(None),
-        Some(None),
-        Some(Some(format!("http://127.0.0.1:{}", site.web_port))),
-        None,
-        None,
-        None,
-    )?;
+    update_runtime(&site_id, RuntimeUpdate {
+        status: Some(ManagedSiteStatus::Running),
+        parse_status: Some(ManagedSiteParseStatus::Parsed),
+        parse_pid: Some(None),
+        last_error: Some(None),
+        entry_url: Some(Some(format!("http://127.0.0.1:{}", site.web_port))),
+        ..Default::default()
+    })?;
     Ok(())
 }
 
@@ -1999,34 +1983,19 @@ pub async fn start_site(site_id: String) -> Result<()> {
     ) {
         bail!("站点已在运行中");
     }
-    update_runtime(
-        &site_id,
-        Some(ManagedSiteStatus::Starting),
-        None,
-        None,
-        None,
-        None,
-        Some(None),
-        None,
-        None,
-        None,
-        None,
-    )?;
+    update_runtime(&site_id, RuntimeUpdate {
+        status: Some(ManagedSiteStatus::Starting),
+        last_error: Some(None),
+        ..Default::default()
+    })?;
     tokio::spawn(async move {
         if let Err(err) = run_start_pipeline(site_id.clone()).await {
-            let _ = update_runtime(
-                &site_id,
-                Some(ManagedSiteStatus::Failed),
-                None,
-                None,
-                None,
-                Some(None),
-                Some(Some(err.to_string())),
-                None,
-                None,
-                None,
-                None,
-            );
+            let _ = update_runtime(&site_id, RuntimeUpdate {
+                status: Some(ManagedSiteStatus::Failed),
+                parse_pid: Some(None),
+                last_error: Some(Some(err.to_string())),
+                ..Default::default()
+            });
         }
     });
     Ok(())
@@ -2039,19 +2008,13 @@ pub async fn parse_site(site_id: String) -> Result<()> {
     }
     tokio::spawn(async move {
         if let Err(err) = run_parse_pipeline(site_id.clone()).await {
-            let _ = update_runtime(
-                &site_id,
-                Some(ManagedSiteStatus::Failed),
-                Some(ManagedSiteParseStatus::Failed),
-                None,
-                None,
-                Some(None),
-                Some(Some(err.to_string())),
-                None,
-                None,
-                None,
-                None,
-            );
+            let _ = update_runtime(&site_id, RuntimeUpdate {
+                status: Some(ManagedSiteStatus::Failed),
+                parse_status: Some(ManagedSiteParseStatus::Failed),
+                parse_pid: Some(None),
+                last_error: Some(Some(err.to_string())),
+                ..Default::default()
+            });
         }
     });
     Ok(())
@@ -2074,24 +2037,29 @@ async fn kill_pid(pid: u32) -> Result<()> {
                 .await;
         }
     }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string()])
+            .output()
+            .await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        if pid_running(Some(pid)) {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .output()
+                .await;
+        }
+    }
     Ok(())
 }
 
 pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
     let site = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
-    update_runtime(
-        site_id,
-        Some(ManagedSiteStatus::Stopping),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )?;
+    update_runtime(site_id, RuntimeUpdate {
+        status: Some(ManagedSiteStatus::Stopping),
+        ..Default::default()
+    })?;
     if let Some(pid) = site.web_pid {
         kill_pid(pid).await?;
     }
@@ -2121,19 +2089,14 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
             ));
         }
         let conflict_msg = reasons.join("; ");
-        update_runtime(
-            site_id,
-            Some(ManagedSiteStatus::Failed),
-            None,
-            Some(None),
-            Some(None),
-            Some(None),
-            Some(Some(format!("端口冲突: {}", conflict_msg))),
-            None,
-            None,
-            None,
-            None,
-        )?;
+        update_runtime(site_id, RuntimeUpdate {
+            status: Some(ManagedSiteStatus::Failed),
+            db_pid: Some(None),
+            web_pid: Some(None),
+            parse_pid: Some(None),
+            last_error: Some(Some(format!("端口冲突: {}", conflict_msg))),
+            ..Default::default()
+        })?;
         let updated = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
         return Ok(StopSiteResult {
             site: updated,
@@ -2143,19 +2106,14 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
         });
     }
 
-    update_runtime(
-        site_id,
-        Some(ManagedSiteStatus::Stopped),
-        None,
-        Some(None),
-        Some(None),
-        Some(None),
-        Some(None),
-        None,
-        None,
-        None,
-        None,
-    )?;
+    update_runtime(site_id, RuntimeUpdate {
+        status: Some(ManagedSiteStatus::Stopped),
+        db_pid: Some(None),
+        web_pid: Some(None),
+        parse_pid: Some(None),
+        last_error: Some(None),
+        ..Default::default()
+    })?;
     let updated = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
     Ok(StopSiteResult {
         site: updated,

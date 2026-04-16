@@ -16,6 +16,7 @@ import { useSitesStore } from '@/stores/sites'
 import SiteDetailHeader from '@/components/sites/SiteDetailHeader.vue'
 import SiteRuntimeCards from '@/components/sites/SiteRuntimeCards.vue'
 import SiteLogSummaryPanel from '@/components/sites/SiteLogSummaryPanel.vue'
+import SiteRecentActivityPanel from '@/components/sites/SiteRecentActivityPanel.vue'
 import SiteConfigSections from '@/components/sites/SiteConfigSections.vue'
 import type {
   ManagedProjectSite,
@@ -241,6 +242,8 @@ onMounted(async () => {
 
     <div v-if="activeTab === 'overview'" class="space-y-4">
       <SiteRuntimeCards :site="site" :runtime="runtime" />
+
+      <SiteRecentActivityPanel :runtime="runtime" />
 
       <div class="rounded-lg border p-5" :class="riskTone.card">
         <div class="mb-4 flex items-center gap-2">

@@ -632,9 +632,9 @@ pub async fn start_web_server_with_config(
             "/api/remote-sync/runtime/stop",
             post(remote_sync_handlers::stop_runtime),
         )
-        // .route("/api/remote-sync/envs/{id}/test-mqtt", post(remote_sync_handlers::test_mqtt_env))
-        // .route("/api/remote-sync/envs/{id}/test-http", post(remote_sync_handlers::test_http_env))
-        // .route("/api/remote-sync/sites/{id}/test-http", post(remote_sync_handlers::test_http_site))
+        .route("/api/remote-sync/envs/{id}/test-mqtt", post(remote_sync_handlers::test_mqtt_env))
+        .route("/api/remote-sync/envs/{id}/test-http", post(remote_sync_handlers::test_http_env))
+        .route("/api/remote-sync/sites/{id}/test-http", post(remote_sync_handlers::test_http_site))
         .route(
             "/api/remote-sync/runtime/status",
             get(remote_sync_handlers::runtime_status),

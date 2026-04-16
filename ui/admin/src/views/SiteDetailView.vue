@@ -16,6 +16,7 @@ import { useSitesStore } from '@/stores/sites'
 import SiteDetailHeader from '@/components/sites/SiteDetailHeader.vue'
 import SiteRuntimeCards from '@/components/sites/SiteRuntimeCards.vue'
 import SiteLogSummaryPanel from '@/components/sites/SiteLogSummaryPanel.vue'
+import SiteConfigSections from '@/components/sites/SiteConfigSections.vue'
 import type {
   ManagedProjectSite,
   ManagedSiteLogsResponse,
@@ -403,29 +404,6 @@ onMounted(async () => {
       </div>
     </div>
 
-    <div v-else class="space-y-4">
-      <div v-if="site" class="rounded-lg border border-border bg-card p-6">
-        <h3 class="text-lg font-medium mb-4">站点配置</h3>
-        <div class="grid grid-cols-2 gap-y-3 text-sm">
-          <div class="text-muted-foreground">项目名称</div><div>{{ site.project_name }}</div>
-          <div class="text-muted-foreground">项目代码</div><div>{{ site.project_code }}</div>
-          <div class="text-muted-foreground">项目路径</div><div class="break-all">{{ site.project_path }}</div>
-          <div class="text-muted-foreground">DB 端口</div><div>{{ site.db_port }}</div>
-          <div class="text-muted-foreground">Web 端口</div><div>{{ site.web_port }}</div>
-          <div class="text-muted-foreground">绑定地址</div><div>{{ site.bind_host || '0.0.0.0' }}</div>
-          <div class="text-muted-foreground">对外访问地址</div>
-          <div>{{ site.public_base_url || '未配置（仅本机地址）' }}</div>
-          <div class="text-muted-foreground">关联工程</div>
-          <div>{{ site.associated_project || site.project_name }} <span v-if="!site.associated_project" class="text-xs text-muted-foreground">(默认)</span></div>
-          <div class="text-muted-foreground">手动 DB Nums</div>
-          <div>{{ site.manual_db_nums.length ? site.manual_db_nums.join(', ') : '自动检测' }}</div>
-          <div class="text-muted-foreground">配置路径</div><div class="break-all">{{ site.config_path }}</div>
-          <div class="text-muted-foreground">运行目录</div><div class="break-all">{{ site.runtime_dir }}</div>
-          <div class="text-muted-foreground">数据目录</div><div class="break-all">{{ site.db_data_path }}</div>
-          <div class="text-muted-foreground">创建时间</div><div>{{ site.created_at }}</div>
-          <div class="text-muted-foreground">更新时间</div><div>{{ site.updated_at }}</div>
-        </div>
-      </div>
-    </div>
+    <SiteConfigSections v-else-if="site" :site="site" />
   </div>
 </template>

@@ -134,66 +134,72 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
           </div>
 
           <!-- Form -->
-          <form class="flex-1 overflow-auto px-6 py-4 space-y-4" @submit.prevent="handleSubmit">
-            <div class="space-y-2">
-              <label class="text-sm font-medium">项目名称 *</label>
-              <input v-model="form.project_name" type="text" required placeholder="例：AvevaMarineSample" :class="inputClass" />
-            </div>
-
-            <div class="space-y-2">
-              <label class="text-sm font-medium">项目路径 *</label>
-              <input v-model="form.project_path" type="text" required placeholder="/path/to/e3d_models" :class="inputClass" />
-            </div>
-
-            <div class="grid grid-cols-2 gap-4">
+          <form class="flex-1 overflow-auto px-6 py-4 space-y-6" @submit.prevent="handleSubmit">
+            <fieldset class="space-y-3">
+              <legend class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">项目信息</legend>
+              <div class="space-y-2">
+                <label class="text-sm font-medium">项目名称 *</label>
+                <input v-model="form.project_name" type="text" required placeholder="例：AvevaMarineSample" :class="inputClass" />
+              </div>
+              <div class="space-y-2">
+                <label class="text-sm font-medium">项目路径 *</label>
+                <input v-model="form.project_path" type="text" required placeholder="/path/to/e3d_models" :class="inputClass" />
+              </div>
               <div class="space-y-2">
                 <label class="text-sm font-medium">项目代码 *</label>
                 <input v-model.number="form.project_code" type="number" required min="1" :class="inputClass" />
               </div>
               <div class="space-y-2">
+                <label class="text-sm font-medium">关联工程 <span class="text-muted-foreground">(可选)</span></label>
+                <input v-model="form.associated_project" type="text" :placeholder="form.project_name || '默认使用项目名称'" :class="inputClass" />
+                <p class="text-xs text-muted-foreground">打开 Viewer 时自动切换到的工程名</p>
+              </div>
+            </fieldset>
+
+            <fieldset class="space-y-3">
+              <legend class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">运行配置</legend>
+              <div class="grid grid-cols-2 gap-4">
+                <div class="space-y-2">
+                  <label class="text-sm font-medium">DB 端口 *</label>
+                  <input v-model.number="form.db_port" type="number" required min="1" max="65535" :class="inputClass" />
+                </div>
+                <div class="space-y-2">
+                  <label class="text-sm font-medium">Web 端口 *</label>
+                  <input v-model.number="form.web_port" type="number" required min="1" max="65535" :class="inputClass" />
+                </div>
+              </div>
+              <div class="space-y-2">
                 <label class="text-sm font-medium">绑定地址</label>
                 <input v-model="form.bind_host" type="text" placeholder="0.0.0.0" :class="inputClass" />
               </div>
-            </div>
-
-            <div class="grid grid-cols-2 gap-4">
               <div class="space-y-2">
-                <label class="text-sm font-medium">DB 端口 *</label>
-                <input v-model.number="form.db_port" type="number" required min="1" max="65535" :class="inputClass" />
+                <label class="text-sm font-medium">对外访问地址 <span class="text-muted-foreground">(可选)</span></label>
+                <input v-model="form.public_base_url" type="text" placeholder="http://example.com:3100" :class="inputClass" />
+                <p class="text-xs text-muted-foreground">反代或外网访问地址，不填则使用本机地址</p>
               </div>
+            </fieldset>
+
+            <fieldset class="space-y-3">
+              <legend class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">解析范围</legend>
               <div class="space-y-2">
-                <label class="text-sm font-medium">Web 端口 *</label>
-                <input v-model.number="form.web_port" type="number" required min="1" max="65535" :class="inputClass" />
+                <label class="text-sm font-medium">手动 DB Nums <span class="text-muted-foreground">(可选，逗号分隔)</span></label>
+                <input v-model="manualDbNumsStr" type="text" placeholder="7997, 7998, 7999" :class="inputClass" />
               </div>
-            </div>
+            </fieldset>
 
-            <div class="space-y-2">
-              <label class="text-sm font-medium">对外访问地址 <span class="text-muted-foreground">(可选)</span></label>
-              <input v-model="form.public_base_url" type="text" placeholder="http://example.com:3100" :class="inputClass" />
-              <p class="text-xs text-muted-foreground">反代或外网访问地址，不填则默认使用本机地址</p>
-            </div>
-
-            <div class="space-y-2">
-              <label class="text-sm font-medium">关联工程 <span class="text-muted-foreground">(可选)</span></label>
-              <input v-model="form.associated_project" type="text" :placeholder="form.project_name || '默认使用项目名称'" :class="inputClass" />
-              <p class="text-xs text-muted-foreground">打开 Viewer 时自动切换到的工程名，不填则使用项目名称</p>
-            </div>
-
-            <div class="space-y-2">
-              <label class="text-sm font-medium">手动 DB Nums <span class="text-muted-foreground">(可选，逗号分隔)</span></label>
-              <input v-model="manualDbNumsStr" type="text" placeholder="7997, 7998, 7999" :class="inputClass" />
-            </div>
-
-            <div v-if="!isEditing" class="grid grid-cols-2 gap-4">
-              <div class="space-y-2">
-                <label class="text-sm font-medium">DB 用户名</label>
-                <input v-model="form.db_user" type="text" placeholder="root" :class="inputClass" />
+            <fieldset v-if="!isEditing" class="space-y-3">
+              <legend class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">数据库凭据</legend>
+              <div class="grid grid-cols-2 gap-4">
+                <div class="space-y-2">
+                  <label class="text-sm font-medium">DB 用户名</label>
+                  <input v-model="form.db_user" type="text" placeholder="root" :class="inputClass" />
+                </div>
+                <div class="space-y-2">
+                  <label class="text-sm font-medium">DB 密码</label>
+                  <input v-model="form.db_password" type="password" placeholder="root" :class="inputClass" />
+                </div>
               </div>
-              <div class="space-y-2">
-                <label class="text-sm font-medium">DB 密码</label>
-                <input v-model="form.db_password" type="password" placeholder="root" :class="inputClass" />
-              </div>
-            </div>
+            </fieldset>
 
             <div v-if="error" class="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
               {{ error }}

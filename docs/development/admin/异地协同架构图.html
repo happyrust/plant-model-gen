@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>异地协同 (Remote Sync) 系统架构</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #020617;
+      color: #e2e8f0;
+      font-family: 'JetBrains Mono', monospace;
+      min-height: 100vh;
+      padding: 32px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .header .dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: #22d3ee;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    .header h1 {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+    .subtitle {
+      font-size: 11px;
+      color: #64748b;
+      margin-bottom: 24px;
+    }
+    .diagram-container {
+      border: 1px solid #1e293b;
+      border-radius: 12px;
+      overflow: hidden;
+      background: #0f172a;
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-top: 24px;
+    }
+    .card {
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 10px;
+      padding: 16px;
+    }
+    .card-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .card-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+    }
+    .card-dot.cyan { background: #22d3ee; }
+    .card-dot.emerald { background: #34d399; }
+    .card-dot.violet { background: #a78bfa; }
+    .card h3 {
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .card ul {
+      list-style: none;
+      font-size: 9px;
+      color: #94a3b8;
+      line-height: 1.8;
+    }
+    .footer {
+      margin-top: 20px;
+      font-size: 8px;
+      color: #475569;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="dot"></div>
+    <h1>异地协同 (Remote Sync) 系统架构</h1>
+  </div>
+  <div class="subtitle">plant-model-gen · /admin/#/collaboration · 2026-04-16</div>
+
+  <div class="diagram-container">
+    <svg viewBox="0 0 1100 750" xmlns="http://www.w3.org/2000/svg" font-family="'JetBrains Mono', monospace">
+      <!-- Background grid -->
+      <defs>
+        <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+          <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+        </pattern>
+        <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#64748b" />
+        </marker>
+        <marker id="arrowhead-cyan" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#22d3ee" />
+        </marker>
+        <marker id="arrowhead-rose" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#fb7185" />
+        </marker>
+        <marker id="arrowhead-orange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#fb923c" />
+        </marker>
+      </defs>
+      <rect width="1100" height="750" fill="url(#grid)"/>
+
+      <!-- ===== Connection Arrows (drawn first, behind boxes) ===== -->
+
+      <!-- Frontend → API Layer -->
+      <line x1="370" y1="210" x2="370" y2="250" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line x1="700" y1="210" x2="700" y2="250" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+      <!-- API → Pinia Store -->
+      <line x1="540" y1="290" x2="540" y2="310" stroke="#64748b" stroke-width="1" stroke-dasharray="4,4"/>
+
+      <!-- Pinia → Backend API -->
+      <line x1="540" y1="290" x2="540" y2="360" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrowhead-cyan)"/>
+
+      <!-- Backend Handlers → SQLite -->
+      <line x1="300" y1="510" x2="300" y2="580" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+      <!-- Backend Runtime → MQTT -->
+      <line x1="630" y1="510" x2="750" y2="580" stroke="#fb923c" stroke-width="1.5" marker-end="url(#arrowhead-orange)"/>
+
+      <!-- Backend Runtime → Watcher -->
+      <line x1="580" y1="510" x2="580" y2="580" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+      <!-- Remote Sites → MQTT -->
+      <line x1="980" y1="420" x2="850" y2="580" stroke="#fb7185" stroke-width="1.5" stroke-dasharray="4,4" marker-end="url(#arrowhead-rose)"/>
+
+      <!-- Remote Sites → File Download -->
+      <line x1="980" y1="440" x2="750" y2="630" stroke="#fb7185" stroke-width="1.5" stroke-dasharray="4,4" marker-end="url(#arrowhead-rose)"/>
+
+      <!-- Watcher → SurrealDB -->
+      <line x1="580" y1="650" x2="400" y2="700" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+      <!-- DbOption arrow -->
+      <line x1="460" y1="510" x2="460" y2="580" stroke="#fbbf24" stroke-width="1" stroke-dasharray="4,4"/>
+
+      <!-- ===== Frontend Layer ===== -->
+      <!-- Region boundary -->
+      <rect x="30" y="30" width="890" height="200" rx="12" fill="none" stroke="#22d3ee" stroke-width="1" stroke-dasharray="8,4"/>
+      <text x="50" y="55" fill="#22d3ee" font-size="10" font-weight="600">前端 · Vue 3 + Pinia + TypeScript</text>
+
+      <!-- Workbench View -->
+      <rect x="50" y="70" width="180" height="60" rx="6" fill="#0f172a"/>
+      <rect x="50" y="70" width="180" height="60" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+      <text x="140" y="95" fill="white" font-size="10" font-weight="600" text-anchor="middle">CollaborationWorkbench</text>
+      <text x="140" y="115" fill="#94a3b8" font-size="8" text-anchor="middle">主视图 · 路由入口</text>
+
+      <!-- Left Panel components -->
+      <rect x="250" y="70" width="140" height="60" rx="6" fill="#0f172a"/>
+      <rect x="250" y="70" width="140" height="60" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+      <text x="320" y="95" fill="white" font-size="10" font-weight="600" text-anchor="middle">GroupListPane</text>
+      <text x="320" y="115" fill="#94a3b8" font-size="8" text-anchor="middle">协同组列表</text>
+
+      <!-- Header + Overview -->
+      <rect x="410" y="70" width="150" height="60" rx="6" fill="#0f172a"/>
+      <rect x="410" y="70" width="150" height="60" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+      <text x="485" y="95" fill="white" font-size="10" font-weight="600" text-anchor="middle">DetailHeader</text>
+      <text x="485" y="115" fill="#94a3b8" font-size="8" text-anchor="middle">状态 + 运行控制</text>
+
+      <!-- Sites + Insights -->
+      <rect x="580" y="70" width="140" height="60" rx="6" fill="#0f172a"/>
+      <rect x="580" y="70" width="140" height="60" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+      <text x="650" y="95" fill="white" font-size="10" font-weight="600" text-anchor="middle">Sites + Insights</text>
+      <text x="650" y="115" fill="#94a3b8" font-size="8" text-anchor="middle">站点卡片 · 洞察面板</text>
+
+      <!-- Logs -->
+      <rect x="740" y="70" width="140" height="60" rx="6" fill="#0f172a"/>
+      <rect x="740" y="70" width="140" height="60" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+      <text x="810" y="95" fill="white" font-size="10" font-weight="600" text-anchor="middle">LogsPanel</text>
+      <text x="810" y="115" fill="#94a3b8" font-size="8" text-anchor="middle">同步日志 · 筛选</text>
+
+      <!-- Pinia Store -->
+      <rect x="160" y="150" width="340" height="55" rx="6" fill="#0f172a"/>
+      <rect x="160" y="150" width="340" height="55" rx="6" fill="rgba(8, 51, 68, 0.3)" stroke="#22d3ee" stroke-width="1"/>
+      <text x="330" y="175" fill="#22d3ee" font-size="10" font-weight="500" text-anchor="middle">useCollaborationStore (Pinia)</text>
+      <text x="330" y="192" fill="#94a3b8" font-size="8" text-anchor="middle">envs · sites · logs · stats · diagnostics · runtime</text>
+
+      <!-- API Client -->
+      <rect x="520" y="150" width="280" height="55" rx="6" fill="#0f172a"/>
+      <rect x="520" y="150" width="280" height="55" rx="6" fill="rgba(8, 51, 68, 0.3)" stroke="#22d3ee" stroke-width="1"/>
+      <text x="660" y="175" fill="#22d3ee" font-size="10" font-weight="500" text-anchor="middle">collaborationApi (API Client)</text>
+      <text x="660" y="192" fill="#94a3b8" font-size="8" text-anchor="middle">/api/remote-sync/* · rawApi + assertSuccess</text>
+
+      <!-- ===== HTTP/API Boundary ===== -->
+      <rect x="30" y="245" width="890" height="30" rx="4" fill="rgba(251, 146, 60, 0.15)" stroke="#fb923c" stroke-width="1"/>
+      <text x="475" y="265" fill="#fb923c" font-size="9" font-weight="600" text-anchor="middle">HTTP API · /api/remote-sync/*</text>
+
+      <!-- ===== Backend Layer ===== -->
+      <rect x="30" y="290" width="890" height="240" rx="12" fill="none" stroke="#34d399" stroke-width="1" stroke-dasharray="8,4"/>
+      <text x="50" y="315" fill="#34d399" font-size="10" font-weight="600">后端 · Rust / Axum · web_server</text>
+
+      <!-- Handler modules -->
+      <rect x="60" y="330" width="220" height="170" rx="6" fill="#0f172a"/>
+      <rect x="60" y="330" width="220" height="170" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+      <text x="170" y="355" fill="white" font-size="10" font-weight="600" text-anchor="middle">remote_sync_handlers</text>
+      <text x="170" y="375" fill="#94a3b8" font-size="8" text-anchor="middle">Env CRUD · Site CRUD</text>
+      <text x="170" y="390" fill="#94a3b8" font-size="8" text-anchor="middle">Logs · Stats · Metadata</text>
+      <text x="170" y="405" fill="#94a3b8" font-size="8" text-anchor="middle">Diagnostics (MQTT/HTTP)</text>
+      <text x="170" y="420" fill="#94a3b8" font-size="8" text-anchor="middle">Import from DbOption</text>
+      <text x="170" y="435" fill="#94a3b8" font-size="8" text-anchor="middle">Apply config</text>
+      <text x="170" y="455" fill="#94a3b8" font-size="8" text-anchor="middle">File proxy serve</text>
+      <text x="170" y="475" fill="#94a3b8" font-size="8" text-anchor="middle">Activate / Stop runtime</text>
+
+      <!-- Runtime module -->
+      <rect x="300" y="330" width="220" height="170" rx="6" fill="#0f172a"/>
+      <rect x="300" y="330" width="220" height="170" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+      <text x="410" y="355" fill="white" font-size="10" font-weight="600" text-anchor="middle">remote_runtime</text>
+      <text x="410" y="380" fill="#94a3b8" font-size="8" text-anchor="middle">RuntimeState (global singleton)</text>
+      <text x="410" y="400" fill="#94a3b8" font-size="8" text-anchor="middle">├ env_id</text>
+      <text x="410" y="415" fill="#94a3b8" font-size="8" text-anchor="middle">├ AiosDBManager</text>
+      <text x="410" y="430" fill="#94a3b8" font-size="8" text-anchor="middle">├ watcher_handle</text>
+      <text x="410" y="445" fill="#94a3b8" font-size="8" text-anchor="middle">└ mqtt_handle</text>
+      <text x="410" y="470" fill="#34d399" font-size="8" text-anchor="middle">start_runtime() / stop_runtime()</text>
+      <text x="410" y="487" fill="#94a3b8" font-size="7" text-anchor="middle">RwLock&lt;Option&lt;RuntimeState&gt;&gt;</text>
+
+      <!-- Sync control -->
+      <rect x="540" y="330" width="190" height="85" rx="6" fill="#0f172a"/>
+      <rect x="540" y="330" width="190" height="85" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+      <text x="635" y="355" fill="white" font-size="10" font-weight="600" text-anchor="middle">sync_control</text>
+      <text x="635" y="375" fill="#94a3b8" font-size="8" text-anchor="middle">文件下载触发</text>
+      <text x="635" y="390" fill="#94a3b8" font-size="8" text-anchor="middle">delta_clone_remotes</text>
+      <text x="635" y="405" fill="#94a3b8" font-size="8" text-anchor="middle">SyncE3dFileMsg 处理</text>
+
+      <!-- Topology + Metadata -->
+      <rect x="540" y="430" width="190" height="70" rx="6" fill="#0f172a"/>
+      <rect x="540" y="430" width="190" height="70" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+      <text x="635" y="455" fill="white" font-size="10" font-weight="600" text-anchor="middle">site_metadata</text>
+      <text x="635" y="475" fill="#94a3b8" font-size="8" text-anchor="middle">远端元数据拉取 · 缓存</text>
+      <text x="635" y="490" fill="#94a3b8" font-size="8" text-anchor="middle">MetadataSource 策略</text>
+
+      <!-- Topology -->
+      <rect x="750" y="330" width="155" height="55" rx="6" fill="#0f172a"/>
+      <rect x="750" y="330" width="155" height="55" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+      <text x="827" y="355" fill="white" font-size="10" font-weight="600" text-anchor="middle">topology</text>
+      <text x="827" y="375" fill="#94a3b8" font-size="8" text-anchor="middle">拓扑配置读写</text>
+
+      <!-- ===== External: Remote Sites ===== -->
+      <rect x="940" y="310" width="140" height="160" rx="6" fill="#0f172a"/>
+      <rect x="940" y="310" width="140" height="160" rx="6" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5" stroke-dasharray="4,4"/>
+      <text x="1010" y="340" fill="#fb7185" font-size="10" font-weight="600" text-anchor="middle">远端站点</text>
+      <text x="1010" y="365" fill="#94a3b8" font-size="8" text-anchor="middle">北京站 / 上海站</text>
+      <text x="1010" y="385" fill="#94a3b8" font-size="8" text-anchor="middle">独立 web_server</text>
+      <text x="1010" y="405" fill="#94a3b8" font-size="8" text-anchor="middle">独立 SurrealDB</text>
+      <text x="1010" y="425" fill="#94a3b8" font-size="8" text-anchor="middle">PDMS 数据变更</text>
+      <text x="1010" y="450" fill="#fb7185" font-size="8" text-anchor="middle">MQTT 广播</text>
+      <text x="1010" y="465" fill="#fb7185" font-size="8" text-anchor="middle">HTTP 文件服务</text>
+
+      <!-- ===== Data Layer ===== -->
+      <rect x="30" y="555" width="890" height="175" rx="12" fill="none" stroke="#a78bfa" stroke-width="1" stroke-dasharray="8,4"/>
+      <text x="50" y="578" fill="#a78bfa" font-size="10" font-weight="600">数据层 · 存储与中间件</text>
+
+      <!-- SQLite -->
+      <rect x="60" y="590" width="200" height="70" rx="6" fill="#0f172a"/>
+      <rect x="60" y="590" width="200" height="70" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+      <text x="160" y="615" fill="white" font-size="10" font-weight="600" text-anchor="middle">SQLite</text>
+      <text x="160" y="633" fill="#94a3b8" font-size="8" text-anchor="middle">remote_sync_envs</text>
+      <text x="160" y="648" fill="#94a3b8" font-size="8" text-anchor="middle">remote_sync_sites · _logs</text>
+
+      <!-- DbOption -->
+      <rect x="280" y="590" width="180" height="70" rx="6" fill="#0f172a"/>
+      <rect x="280" y="590" width="180" height="70" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+      <text x="370" y="615" fill="white" font-size="10" font-weight="600" text-anchor="middle">DbOption.toml</text>
+      <text x="370" y="633" fill="#94a3b8" font-size="8" text-anchor="middle">mqtt_host · mqtt_port</text>
+      <text x="370" y="648" fill="#94a3b8" font-size="8" text-anchor="middle">file_server · location</text>
+
+      <!-- PdmsWatcher -->
+      <rect x="480" y="590" width="180" height="70" rx="6" fill="#0f172a"/>
+      <rect x="480" y="590" width="180" height="70" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+      <text x="570" y="615" fill="white" font-size="10" font-weight="600" text-anchor="middle">PdmsWatcher</text>
+      <text x="570" y="633" fill="#94a3b8" font-size="8" text-anchor="middle">增量文件监听</text>
+      <text x="570" y="648" fill="#94a3b8" font-size="8" text-anchor="middle">async_watch loop</text>
+
+      <!-- MQTT Broker -->
+      <rect x="680" y="590" width="160" height="70" rx="6" fill="#0f172a"/>
+      <rect x="680" y="590" width="160" height="70" rx="6" fill="rgba(251, 146, 60, 0.3)" stroke="#fb923c" stroke-width="1.5"/>
+      <text x="760" y="615" fill="white" font-size="10" font-weight="600" text-anchor="middle">MQTT Broker</text>
+      <text x="760" y="633" fill="#94a3b8" font-size="8" text-anchor="middle">SyncE3dFileMsg</text>
+      <text x="760" y="648" fill="#94a3b8" font-size="8" text-anchor="middle">增量通知订阅</text>
+
+      <!-- SurrealDB -->
+      <rect x="220" y="680" width="240" height="40" rx="6" fill="#0f172a"/>
+      <rect x="220" y="680" width="240" height="40" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+      <text x="340" y="705" fill="white" font-size="10" font-weight="600" text-anchor="middle">SurrealDB (本地实例)</text>
+
+      <!-- Legend -->
+      <g transform="translate(60, 730)">
+        <rect x="0" y="0" width="8" height="8" rx="2" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1"/>
+        <text x="14" y="8" fill="#94a3b8" font-size="7">Frontend</text>
+        <rect x="80" y="0" width="8" height="8" rx="2" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="94" y="8" fill="#94a3b8" font-size="7">Backend</text>
+        <rect x="155" y="0" width="8" height="8" rx="2" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="169" y="8" fill="#94a3b8" font-size="7">Database</text>
+        <rect x="240" y="0" width="8" height="8" rx="2" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1"/>
+        <text x="254" y="8" fill="#94a3b8" font-size="7">Config</text>
+        <rect x="305" y="0" width="8" height="8" rx="2" fill="rgba(251, 146, 60, 0.3)" stroke="#fb923c" stroke-width="1"/>
+        <text x="319" y="8" fill="#94a3b8" font-size="7">Message Bus</text>
+        <rect x="400" y="0" width="8" height="8" rx="2" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1" stroke-dasharray="2,2"/>
+        <text x="414" y="8" fill="#94a3b8" font-size="7">External</text>
+      </g>
+    </svg>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-dot cyan"></div>
+        <h3>前端架构</h3>
+      </div>
+      <ul>
+        <li>• Vue 3 + Composition API + Pinia</li>
+        <li>• 8 个协同组件 · 1 个 Store</li>
+        <li>• 左右分栏 Master-Detail 布局</li>
+        <li>• 概览指标 · 站点卡片 · 洞察面板 · 日志表</li>
+        <li>• 实时诊断 MQTT/HTTP 连通性</li>
+        <li>• 运行时激活/停止/配置应用</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div class="card-dot emerald"></div>
+        <h3>后端核心</h3>
+      </div>
+      <ul>
+        <li>• Rust / Axum · 30+ API 端点</li>
+        <li>• SQLite 持久化 · LiteFS 支持</li>
+        <li>• 全局单例 RuntimeState (RwLock)</li>
+        <li>• PdmsWatcher 文件监听</li>
+        <li>• MQTT 订阅 + 指数退避重连</li>
+        <li>• 站点元数据 HTTP/缓存/本地三级回退</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div class="card-dot violet"></div>
+        <h3>数据同步流</h3>
+      </div>
+      <ul>
+        <li>• 远端 PDMS 变更 → MQTT 广播</li>
+        <li>• 本地 subscriber 接收 SyncE3dFileMsg</li>
+        <li>• HTTP 下载增量文件 (delta_clone)</li>
+        <li>• PdmsWatcher 检测 → SurrealDB 更新</li>
+        <li>• 同步日志记录 · 日/流向统计</li>
+        <li>• 支持 push/pull/upload/download 四向</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="footer">
+    plant-model-gen · Remote Sync Architecture · Generated 2026-04-16
+  </div>
+</body>
+</html>

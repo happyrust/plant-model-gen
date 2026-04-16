@@ -951,27 +951,35 @@ export const useCollaborationStore = defineStore("collaboration", () => {
       }
     }
 
-    await Promise.all(
-      sites.value.map(async (site) => {
-        try {
-          const response = await collaborationApi.testSiteHttp(site.id)
-          if (selectedEnvId.value !== envId) {
-            return
-          }
-          siteDiagnosticsById.value[site.id] = {
-            siteId: site.id,
-            siteName: site.name,
-            check: normalizeDiagnosticCheck(response, "站点诊断失败"),
-          }
-        } catch (error) {
-          siteDiagnosticsById.value[site.id] = {
-            siteId: site.id,
-            siteName: site.name,
-            check: diagnosticFromError(error, "站点诊断失败"),
-          }
-        }
-      }),
-    )
+    const CONCURRENCY_LIMIT = 5
+    const siteQueue = [...sites.value]
+    const runBatch = async () => {
+      while (siteQueue.length > 0) {
+        const batch = siteQueue.splice(0, CONCURRENCY_LIMIT)
+        await Promise.all(
+          batch.map(async (site) => {
+            try {
+              const response = await collaborationApi.testSiteHttp(site.id)
+              if (selectedEnvId.value !== envId) {
+                return
+              }
+              siteDiagnosticsById.value[site.id] = {
+                siteId: site.id,
+                siteName: site.name,
+                check: normalizeDiagnosticCheck(response, "站点诊断失败"),
+              }
+            } catch (error) {
+              siteDiagnosticsById.value[site.id] = {
+                siteId: site.id,
+                siteName: site.name,
+                check: diagnosticFromError(error, "站点诊断失败"),
+              }
+            }
+          }),
+        )
+      }
+    }
+    await runBatch()
 
     diagnosing.value = false
   }

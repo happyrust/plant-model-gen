@@ -352,7 +352,8 @@ pub async fn start_web_server_with_config(
     let admin_api_routes = Router::<AppState>::new()
         .merge(admin_stateless_routes)
         .merge(admin_registry_handlers::create_admin_registry_routes())
-        .with_state(app_state.clone());
+        .with_state(app_state.clone())
+        .merge(remote_sync_handlers::create_remote_sync_routes());
 
     let app = Router::new()
         // API路由
@@ -603,88 +604,12 @@ pub async fn start_web_server_with_config(
             "/api/sync/mqtt/status",
             get(sync_control_handlers::get_mqtt_server_status),
         )
-        // 异地增量环境配置页面 + API
+        // 异地增量环境 — 旧入口兼容跳转（API 路由已迁入 admin_stateless_routes 统一认证）
         .route(
             "/remote-sync",
             get(|uri: axum::http::Uri| async move {
                 redirect_legacy_console_path(uri, "/admin/#/collaboration").await
             }),
-        )
-        .route(
-            "/api/remote-sync/envs",
-            get(remote_sync_handlers::list_envs).post(remote_sync_handlers::create_env),
-        )
-        .route(
-            "/api/remote-sync/envs/{id}",
-            get(remote_sync_handlers::get_env)
-                .put(remote_sync_handlers::update_env)
-                .delete(remote_sync_handlers::delete_env),
-        )
-        .route(
-            "/api/remote-sync/envs/{id}/apply",
-            post(remote_sync_handlers::apply_env),
-        )
-        .route(
-            "/api/remote-sync/envs/{id}/activate",
-            post(remote_sync_handlers::activate_env),
-        )
-        .route(
-            "/api/remote-sync/runtime/stop",
-            post(remote_sync_handlers::stop_runtime),
-        )
-        .route("/api/remote-sync/envs/{id}/test-mqtt", post(remote_sync_handlers::test_mqtt_env))
-        .route("/api/remote-sync/envs/{id}/test-http", post(remote_sync_handlers::test_http_env))
-        .route("/api/remote-sync/sites/{id}/test-http", post(remote_sync_handlers::test_http_site))
-        .route(
-            "/api/remote-sync/runtime/status",
-            get(remote_sync_handlers::runtime_status),
-        )
-        .route(
-            "/api/remote-sync/runtime/config",
-            get(remote_sync_handlers::runtime_config),
-        )
-        .route(
-            "/api/remote-sync/envs/import-from-dboption",
-            post(remote_sync_handlers::import_env_from_dboption),
-        )
-        .route(
-            "/api/remote-sync/logs",
-            get(remote_sync_handlers::list_logs),
-        )
-        .route(
-            "/api/remote-sync/stats/daily",
-            get(remote_sync_handlers::daily_stats),
-        )
-        .route(
-            "/api/remote-sync/stats/flows",
-            get(remote_sync_handlers::flow_stats),
-        )
-        .route(
-            "/api/remote-sync/envs/{id}/sites",
-            get(remote_sync_handlers::list_sites).post(remote_sync_handlers::create_site),
-        )
-        .route(
-            "/api/remote-sync/sites/{id}",
-            put(remote_sync_handlers::update_site).delete(remote_sync_handlers::delete_site),
-        )
-        .route(
-            "/api/remote-sync/sites/{id}/metadata",
-            get(remote_sync_handlers::get_site_metadata),
-        )
-        .route(
-            "/api/remote-sync/sites/{id}/files/{*path}",
-            get(remote_sync_handlers::serve_site_files),
-        )
-        // 拓扑配置 API
-        .route(
-            "/api/remote-sync/topology",
-            get(topology_handlers::get_topology)
-                .post(topology_handlers::save_topology)
-                .delete(topology_handlers::delete_topology),
-        )
-        .route(
-            "/api/remote-sync/sites/{id}/files",
-            get(remote_sync_handlers::serve_site_files_root),
         )
         // LiteFS 节点状态和健康检查 API
         .route("/api/node-status", get(litefs_handlers::get_node_status))

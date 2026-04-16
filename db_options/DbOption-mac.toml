@@ -103,13 +103,16 @@ kv_port = "8010"
 
 
 #mqtt 事件 ip
-mqtt_host = "127.0.0.1"
+mqtt_host = "localhost"
+
 
 
 mqtt_port = 1883
 
 
-location = "sjz"
+
+location = "site-a"
+
 
 
 location_dbs = [251181]
@@ -120,7 +123,8 @@ server_release_ip = "127.0.0.1:9099"
 
 # hash文件的站点
 remote_file_server_hosts = []
-file_server_host = "http://localhost:8082/assets/archives"
+file_server_host = "http://localhost:3100"
+
 
 surreal_script_dir = "../rs-core/resource/surreal"
 

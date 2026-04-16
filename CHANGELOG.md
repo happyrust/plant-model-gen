@@ -4,6 +4,13 @@
 
 ### Added
 
+- 异地协同 remote-sync API 路由从 `mod.rs` 提取到 `remote_sync_handlers::create_remote_sync_routes()`，统一纳入 `admin_api_routes` 认证链路。
+- `open_sqlite()` 使用 `std::sync::Once` 守卫，确保 SQLite schema 仅初始化一次。
+- remote-sync 所有 `map_err` 增加 `eprintln!` 错误日志输出，便于问题排查。
+- 站点诊断批量请求新增并发限制（每批 5 个），避免大量站点时一次性并发过高。
+- 新增异地协同架构文档、admin 系统审核总结、本机站点编排架构文档。
+- 新增 `scripts/test-remote-sync.sh` 测试脚本。
+
 - `/admin` 站点管理新增"关联工程"字段（`associated_project`），支持持久化到 SQLite 并在新建/编辑站点时设置；打开 Viewer 时优先用该字段，未设置则回退到项目名称。
 - `/admin/#/collaboration` 异地协同工作台正式注册路由，AppHeader 导航栏新增「异地协同」入口。
 - 新增 `site-status.ts` 集中管理站点状态 label/color/busy/error 判断规则，供列表页和详情页统一使用。

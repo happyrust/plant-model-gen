@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { AlertTriangle, Cpu, FolderKanban, HardDrive, MemoryStick, Server, Activity, CircleAlert } from 'lucide-vue-next'
+import { AlertTriangle, CircleAlert, Cpu, FolderKanban, HardDrive, MemoryStick, RefreshCw, Server, Activity } from 'lucide-vue-next'
 import { sitesApi } from '@/api/sites'
 import { usePolling } from '@/composables/usePolling'
 import SiteDataTable from '@/components/sites/SiteDataTable.vue'
@@ -231,6 +231,19 @@ onMounted(async () => {
         </div>
         <div class="mt-2 text-2xl font-bold text-destructive">{{ siteStats.error }}</div>
       </div>
+    </div>
+
+    <div v-if="sitesStore.error" class="rounded-lg border border-destructive/50 bg-destructive/5 px-4 py-3 flex items-center justify-between">
+      <div class="flex items-center gap-2 text-sm text-destructive">
+        <CircleAlert class="h-4 w-4 shrink-0" />
+        <span>{{ sitesStore.error }}</span>
+      </div>
+      <button
+        @click="fetchPageData"
+        class="inline-flex h-8 items-center gap-1.5 rounded-md border border-destructive/30 px-3 text-xs font-medium text-destructive hover:bg-destructive/10 transition-colors"
+      >
+        <RefreshCw class="h-3.5 w-3.5" /> 重试
+      </button>
     </div>
 
     <section class="space-y-3">

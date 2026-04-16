@@ -2,7 +2,7 @@
 import { useRouter } from 'vue-router'
 import { useSitesStore } from '@/stores/sites'
 import type { ManagedProjectSite, ManagedSiteRiskLevel } from '@/types/site'
-import { Eye, ExternalLink, Loader2, Play, RefreshCw, Square, Trash2 } from 'lucide-vue-next'
+import { Eye, ExternalLink, FolderPlus, Loader2, Play, RefreshCw, Square, Trash2 } from 'lucide-vue-next'
 import { statusLabelMap, statusClassMap, parseStatusClass as getParseStatusClass, isSiteBusy } from './site-status'
 
 const props = defineProps<{ sites: ManagedProjectSite[]; loading: boolean }>()
@@ -49,11 +49,22 @@ function openViewer(site: ManagedProjectSite) {
 
 <template>
   <div class="rounded-lg border border-border">
-    <div v-if="loading && props.sites.length === 0" class="p-8 text-center text-muted-foreground">
-      加载中...
+    <div v-if="loading && props.sites.length === 0" class="p-10">
+      <div class="space-y-3">
+        <div v-for="i in 3" :key="i" class="flex gap-4 animate-pulse">
+          <div class="h-5 w-40 rounded bg-muted"></div>
+          <div class="h-5 w-20 rounded bg-muted"></div>
+          <div class="h-5 w-16 rounded bg-muted"></div>
+          <div class="h-5 w-24 rounded bg-muted"></div>
+          <div class="flex-1"></div>
+          <div class="h-5 w-28 rounded bg-muted"></div>
+        </div>
+      </div>
     </div>
-    <div v-else-if="props.sites.length === 0" class="p-8 text-center text-muted-foreground">
-      暂无站点，点击右上角创建
+    <div v-else-if="props.sites.length === 0" class="p-10 text-center">
+      <FolderPlus class="mx-auto h-10 w-10 text-muted-foreground/40" />
+      <p class="mt-3 text-sm font-medium text-muted-foreground">还没有站点</p>
+      <p class="mt-1 text-xs text-muted-foreground">点击右上角「新建站点」开始创建第一个站点</p>
     </div>
     <table v-else class="w-full text-sm">
       <thead>

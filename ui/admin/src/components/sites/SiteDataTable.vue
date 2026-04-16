@@ -53,11 +53,8 @@ function openViewer(site: ManagedProjectSite) {
         <tr class="border-b border-border bg-muted/50">
           <th class="px-4 py-3 text-left font-medium text-muted-foreground">项目名称</th>
           <th class="px-4 py-3 text-left font-medium text-muted-foreground">状态</th>
-          <th class="px-4 py-3 text-left font-medium text-muted-foreground">解析</th>
+          <th class="px-4 py-3 text-left font-medium text-muted-foreground">端口</th>
           <th class="px-4 py-3 text-left font-medium text-muted-foreground">风险</th>
-          <th class="px-4 py-3 text-left font-medium text-muted-foreground">DB 端口</th>
-          <th class="px-4 py-3 text-left font-medium text-muted-foreground">Web 端口</th>
-          <th class="px-4 py-3 text-left font-medium text-muted-foreground">项目代码</th>
           <th class="px-4 py-3 text-right font-medium text-muted-foreground">操作</th>
         </tr>
       </thead>
@@ -71,16 +68,37 @@ function openViewer(site: ManagedProjectSite) {
           <td class="px-4 py-3 align-top">
             <div class="font-medium">{{ site.project_name }}</div>
             <div class="text-xs text-muted-foreground">{{ site.site_id }}</div>
+            <a
+              v-if="site.entry_url && site.status === 'Running'"
+              :href="site.public_entry_url || site.entry_url"
+              target="_blank"
+              rel="noreferrer"
+              class="mt-1 inline-flex items-center gap-1 text-xs text-primary hover:underline"
+              @click.stop
+            >
+              {{ site.public_entry_url || site.entry_url }}
+              <ExternalLink class="h-3 w-3" />
+            </a>
+            <div v-if="site.last_error" class="mt-1 max-w-[280px] truncate text-xs text-destructive" :title="site.last_error">
+              {{ site.last_error }}
+            </div>
           </td>
           <td class="px-4 py-3 align-top">
-            <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium" :class="statusClassMap[site.status]">
-              {{ statusLabelMap[site.status] ?? site.status }}
-            </span>
+            <div class="flex items-center gap-1.5">
+              <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium" :class="statusClassMap[site.status]">
+                {{ statusLabelMap[site.status] ?? site.status }}
+              </span>
+              <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium" :class="getParseStatusClass(site.parse_status)">
+                {{ site.parse_status }}
+              </span>
+            </div>
           </td>
           <td class="px-4 py-3 align-top">
-            <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium" :class="getParseStatusClass(site.parse_status)">
-              {{ site.parse_status }}
-            </span>
+            <div class="font-mono text-xs text-muted-foreground">
+              <span title="DB 端口">D:{{ site.db_port }}</span>
+              <span class="mx-1">·</span>
+              <span title="Web 端口">W:{{ site.web_port }}</span>
+            </div>
           </td>
           <td class="px-4 py-3 align-top">
             <span
@@ -90,13 +108,10 @@ function openViewer(site: ManagedProjectSite) {
             >
               {{ riskConfig[site.risk_level]?.label ?? site.risk_level }}
             </span>
-            <div class="mt-1 max-w-[240px] truncate text-xs text-muted-foreground" :title="site.risk_reasons.join('；') || '当前无明显风险'">
+            <div v-if="riskSummary(site) !== '当前无明显风险'" class="mt-1 max-w-[200px] truncate text-xs text-muted-foreground" :title="site.risk_reasons.join('；')">
               {{ riskSummary(site) }}
             </div>
           </td>
-          <td class="px-4 py-3 font-mono text-muted-foreground align-top">{{ site.db_port }}</td>
-          <td class="px-4 py-3 font-mono text-muted-foreground align-top">{{ site.web_port }}</td>
-          <td class="px-4 py-3 text-muted-foreground align-top">{{ site.project_code }}</td>
           <td class="px-4 py-3 text-right align-top" @click.stop>
             <div class="flex items-center justify-end gap-1">
               <button

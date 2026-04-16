@@ -6,6 +6,7 @@ import { usePolling } from '@/composables/usePolling'
 import SiteDataTable from '@/components/sites/SiteDataTable.vue'
 import SiteDrawer from '@/components/sites/SiteDrawer.vue'
 import SiteToolbar from '@/components/sites/SiteToolbar.vue'
+import SiteWorkbenchHeader from '@/components/sites/SiteWorkbenchHeader.vue'
 import { useSitesStore } from '@/stores/sites'
 import { matchesQuickFilter, computeStats, type QuickFilter } from '@/components/sites/site-status'
 import type { AdminResourceSummary, ManagedSiteRiskLevel } from '@/types/site'
@@ -18,6 +19,8 @@ const searchQuery = ref('')
 const statusFilter = ref('')
 const riskFilter = ref<ManagedSiteRiskLevel | ''>('')
 const activeQuickFilter = ref<QuickFilter>('all')
+const lastRefresh = ref<string | null>(null)
+const refreshing = ref(false)
 const resourceSummary = ref<AdminResourceSummary | null>(null)
 const resourceLoading = ref(false)
 const resourceError = ref('')
@@ -172,7 +175,10 @@ async function fetchResourceSummary() {
 }
 
 async function fetchPageData() {
+  refreshing.value = true
   await Promise.allSettled([sitesStore.fetchSites(), fetchResourceSummary()])
+  lastRefresh.value = new Date().toISOString()
+  refreshing.value = false
 }
 
 const { start: startPolling } = usePolling(async () => {
@@ -187,10 +193,13 @@ onMounted(async () => {
 
 <template>
   <div class="space-y-6">
-    <div>
-      <h2 class="text-2xl font-semibold tracking-tight">站点管理</h2>
-      <p class="text-sm text-muted-foreground">管理和监控所有项目站点</p>
-    </div>
+    <SiteWorkbenchHeader
+      :total="siteStats.total"
+      :filtered="filteredSites.length"
+      :last-refresh="lastRefresh"
+      :refreshing="refreshing"
+      @refresh="fetchPageData"
+    />
     <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
       <div class="rounded-lg border border-border bg-card p-4">
         <div class="flex items-center justify-between">

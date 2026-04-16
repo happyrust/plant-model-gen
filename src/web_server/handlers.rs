@@ -6119,24 +6119,62 @@ pub async fn space_tools_page() -> Html<String> {
     Html(wrapped)
 }
 
-/// 支架-桥架识别（占位实现，返回回显数据）
-pub async fn api_space_suppo_trays(Json(req): Json<SuppoTraysRequest>) -> Json<serde_json::Value> {
-    Json(json!({
-        "status":"success",
-        "message":"stub",
-        "data": {"trays": []},
-        "echo": req
-    }))
+fn parse_space_suppo_refno(input: &SpaceSuppoRefnoInput) -> Result<RefnoEnum, String> {
+    let raw = match input {
+        SpaceSuppoRefnoInput::Full(s) => s.trim().replace('_', "/"),
+        SpaceSuppoRefnoInput::Legacy(n) => format!("0/{n}"),
+    };
+    RefnoEnum::from_str(&raw).map_err(|_| format!("suppo_refno 格式非法: {raw}"))
 }
 
-/// 预埋板编号识别（占位）
+fn dvec3_to_point(v: glam::DVec3) -> serde_json::Value {
+    json!({"x": v.x, "y": v.y, "z": v.z})
+}
+
+fn dvec3_to_vector(v: glam::DVec3) -> serde_json::Value {
+    json!({"dx": v.x, "dy": v.y, "dz": v.z})
+}
+
+pub async fn api_space_suppo_trays(Json(req): Json<SuppoTraysRequest>) -> Json<serde_json::Value> {
+    let refno = match parse_space_suppo_refno(&req.suppo_refno) {
+        Ok(r) => r,
+        Err(msg) => return Json(json!({"status":"error","message":msg})),
+    };
+    match aios_core::metadata::spatial_computation::resolve_supp_bran(refno, req.tolerance).await {
+        Ok(matches) => {
+            let trays: Vec<serde_json::Value> = matches.iter().map(|m| json!({
+                "bran_refno": m.bran_refno.to_string(),
+                "bran_name": m.bran_name,
+                "tray_section_refno": m.contact_sctn_refno.to_string(),
+                "support_type": m.match_method,
+                "contact_point": dvec3_to_point(m.contact_point_world),
+            })).collect();
+            Json(json!({"status":"success","data":{"anchor_kind":"auto","trays":trays}}))
+        }
+        Err(err) => Json(json!({"status":"error","message":format!("{err:#}")})),
+    }
+}
+
 pub async fn api_space_fitting(Json(req): Json<FittingRequest>) -> Json<serde_json::Value> {
-    Json(json!({
-        "status":"success",
-        "message":"stub",
-        "data": {"fitting": null, "covered": false, "coverage_ratio": 0.0},
-        "echo": req
-    }))
+    let refno = match parse_space_suppo_refno(&req.suppo_refno) {
+        Ok(r) => r,
+        Err(msg) => return Json(json!({"status":"error","message":msg})),
+    };
+    match aios_core::metadata::spatial_computation::resolve_supp_panel(refno, req.tolerance).await {
+        Ok(Some(panel)) => Json(json!({
+            "status":"success",
+            "data":{
+                "fitting": panel.panel_name,
+                "panel_refno": panel.panel_refno.to_string(),
+                "panel_center": dvec3_to_point(panel.panel_center_world),
+                "match_method": panel.match_method,
+                "covered": false,
+                "coverage_ratio": 0.0,
+            }
+        })),
+        Ok(None) => Json(json!({"status":"success","data":null,"message":"未匹配到预埋板"})),
+        Err(err) => Json(json!({"status":"error","message":format!("{err:#}")})),
+    }
 }
 
 #[cfg(feature = "sqlite-index")]
@@ -6488,38 +6526,77 @@ mod wall_distance_tests {
     }
 }
 
-/// 与预埋板相对定位（占位）
 pub async fn api_space_fitting_offset(
     Json(req): Json<FittingOffsetRequest>,
 ) -> Json<serde_json::Value> {
-    Json(json!({
-        "status":"success",
-        "message":"stub",
-        "data": {"vector": {"dx":0.0, "dy":0.0, "dz":0.0}, "length": 0.0, "within": false},
-        "echo": req
-    }))
+    let refno = match parse_space_suppo_refno(&req.suppo_refno) {
+        Ok(r) => r,
+        Err(msg) => return Json(json!({"status":"error","message":msg})),
+    };
+    match aios_core::metadata::spatial_computation::compute_supp_panel_offset(refno, req.tolerance).await {
+        Ok(Some(offset)) => Json(json!({
+            "status":"success",
+            "data":{
+                "anchor_kind": format!("{:?}", offset.anchor_kind),
+                "anchor_point": dvec3_to_point(offset.anchor_point),
+                "panel_refno": offset.panel_refno.to_string(),
+                "panel_center": dvec3_to_point(offset.panel_center),
+                "vector": dvec3_to_vector(offset.vector),
+                "length": offset.length,
+                "within": offset.length <= req.tolerance.unwrap_or(50.0),
+            }
+        })),
+        Ok(None) => Json(json!({"status":"success","data":null,"message":"未匹配到预埋板偏移"})),
+        Err(err) => Json(json!({"status":"error","message":format!("{err:#}")})),
+    }
 }
 
-/// 与钢结构相对定位（占位）
 pub async fn api_space_steel_relative(
     Json(req): Json<SteelRelativeRequest>,
 ) -> Json<serde_json::Value> {
-    Json(json!({
-        "status":"success",
-        "message":"stub",
-        "data": {"steel_id": null, "vector": {"dx":0.0, "dy":0.0, "dz":0.0}, "length": 0.0},
-        "echo": req
-    }))
+    let refno = match parse_space_suppo_refno(&req.suppo_refno) {
+        Ok(r) => r,
+        Err(msg) => return Json(json!({"status":"error","message":msg})),
+    };
+    match aios_core::metadata::spatial_computation::resolve_supp_steel(refno, req.search_radius, &[]).await {
+        Ok(Some(steel)) => Json(json!({
+            "status":"success",
+            "data":{
+                "anchor_kind": format!("{:?}", steel.anchor_kind),
+                "anchor_point": dvec3_to_point(steel.anchor_point),
+                "steel_refno": steel.steel_refno.to_string(),
+                "steel_noun": steel.steel_noun,
+                "closest_point": dvec3_to_point(steel.closest_point_world),
+                "vector": dvec3_to_vector(steel.vector),
+                "length": steel.length,
+                "within": steel.length <= req.search_radius.unwrap_or(8000.0),
+            }
+        })),
+        Ok(None) => Json(json!({"status":"success","data":null,"message":"未找到附近钢结构"})),
+        Err(err) => Json(json!({"status":"error","message":format!("{err:#}")})),
+    }
 }
 
-/// 托盘跨度（左右）（占位）
 pub async fn api_space_tray_span(Json(req): Json<TraySpanRequest>) -> Json<serde_json::Value> {
-    Json(json!({
-        "status":"success",
-        "message":"stub",
-        "data": {"left_suppo": null, "right_suppo": null, "span_left": 0.0, "span_right": 0.0, "uniformity_score": 0.0},
-        "echo": req
-    }))
+    let refno = match parse_space_suppo_refno(&req.suppo_refno) {
+        Ok(r) => r,
+        Err(msg) => return Json(json!({"status":"error","message":msg})),
+    };
+    match aios_core::metadata::spatial_computation::compute_supp_span(refno, req.neighbor_window).await {
+        Ok(Some(span)) => Json(json!({
+            "status":"success",
+            "data":{
+                "bran_refno": span.bran_refno.to_string(),
+                "left_suppo_refno": span.left_suppo_refno.map(|r| r.to_string()),
+                "right_suppo_refno": span.right_suppo_refno.map(|r| r.to_string()),
+                "left_distance": span.left_distance,
+                "right_distance": span.right_distance,
+                "neighbor_window": span.neighbor_window,
+            }
+        })),
+        Ok(None) => Json(json!({"status":"success","data":null,"message":"未找到有效跨度"})),
+        Err(err) => Json(json!({"status":"error","message":format!("{err:#}")})),
+    }
 }
 
 // ===== 桥架支撑检测（SQLite R-Tree） =====

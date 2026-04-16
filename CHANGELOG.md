@@ -6,10 +6,22 @@
 
 - `/admin` 站点管理新增"关联工程"字段（`associated_project`），支持持久化到 SQLite 并在新建/编辑站点时设置；打开 Viewer 时优先用该字段，未设置则回退到项目名称。
 - `/admin/#/collaboration` 异地协同工作台正式注册路由，AppHeader 导航栏新增「异地协同」入口。
+- 新增 `site-status.ts` 集中管理站点状态 label/color/busy/error 判断规则，供列表页和详情页统一使用。
+- 站点工具栏新增 quick filter chips（全部 / 运行中 / 处理中 / 异常 / 待解析），一键筛选快速聚焦。
+- 总览页统计卡改为 4 张业务卡（总站点 / 运行中 / 处理中 / 异常），替代旧 SiteStatsCards。
+- 新增 `SiteWorkbenchHeader` 组件（标题/副标题/刷新按钮/最近刷新时间/当前结果数）。
+- 站点列表项目名列新增入口地址链接和错误摘要行，合并 DB/Web 端口为一列，提升信息密度。
+- 新增 `SiteDetailHeader` 组件（状态徽标 + 统一按钮禁用 + Viewer 入口）。
+- 新增 `SiteRuntimeCards` 组件（当前阶段/数据库/Web 服务/解析 4 张运行态卡片）。
+- 新增 `SiteLogSummaryPanel` 组件（每个 stream 展示行数/更新时间/关键日志摘要）。
+- 新增 `SiteConfigSections` 组件（项目信息/运行配置/路径信息/时间信息 4 个结构化分区）。
 
 ### Changed
 
 - `/admin` 注册表页改造：`DbOption 导入` 改用对话框替代 `window.prompt`，`删除` 改用确认对话框替代 `window.confirm`，`创建任务` 改为跳转到任务向导页面；后端地址列新增复制按钮，编辑按钮改用 Pencil 图标。
+- `SiteDrawer` 抽屉表单重组为 4 个 fieldset 分组（项目信息 / 运行配置 / 解析范围 / 数据库凭据），提升表单可读性。
+- `SiteDataTable` 状态徽标和按钮禁用规则统一使用 `site-status.ts`，不再各组件内联定义。
+- 删除不再使用的 `SiteStatsCards` 组件（已被总览页内联统计卡替代）。
 
 ### Fixed
 

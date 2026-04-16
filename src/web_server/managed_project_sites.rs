@@ -188,6 +188,30 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    if !columns
+        .iter()
+        .any(|column| column == "public_base_url")
+    {
+        conn.execute(
+            &format!(
+                "ALTER TABLE {table} ADD COLUMN public_base_url TEXT",
+                table = TABLE_NAME
+            ),
+            [],
+        )?;
+    }
+    if !columns
+        .iter()
+        .any(|column| column == "associated_project")
+    {
+        conn.execute(
+            &format!(
+                "ALTER TABLE {table} ADD COLUMN associated_project TEXT",
+                table = TABLE_NAME
+            ),
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -549,10 +573,23 @@ fn build_site_config(
     set_toml_string(web_server, "site_id", site.site_id.clone());
     set_toml_string(web_server, "site_name", site.project_name.clone());
     set_toml_string(web_server, "region", "admin");
-    let entry_url = format!("http://127.0.0.1:{}", site.web_port);
-    set_toml_string(web_server, "frontend_url", entry_url.clone());
-    set_toml_string(web_server, "public_base_url", entry_url.clone());
-    set_toml_string(web_server, "backend_url", entry_url.clone());
+    let local_url = format!("http://127.0.0.1:{}", site.web_port);
+    let public_url = site
+        .public_base_url
+        .as_ref()
+        .map(|u| u.trim_end_matches('/').to_string())
+        .or_else(|| {
+            let h = site.bind_host.trim();
+            if !h.is_empty() && h != "0.0.0.0" && h != "127.0.0.1" && h != "localhost" {
+                Some(format!("http://{}:{}", h, site.web_port))
+            } else {
+                None
+            }
+        });
+    let effective_url = public_url.as_deref().unwrap_or(&local_url);
+    set_toml_string(web_server, "frontend_url", effective_url);
+    set_toml_string(web_server, "public_base_url", effective_url);
+    set_toml_string(web_server, "backend_url", local_url);
     set_toml_bool(web_server, "auto_start_surreal", false);
     set_toml_string(web_server, "surreal_bin", "surreal");
     set_toml_string(web_server, "surreal_data_path", site.db_data_path.clone());
@@ -627,7 +664,34 @@ fn write_site_files(site: &ManagedProjectSite, db_user: &str, db_password: &str)
     Ok(())
 }
 
+fn derive_entry_urls(
+    web_port: u16,
+    bind_host: &str,
+    public_base_url: &Option<String>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let local = format!("http://127.0.0.1:{}", web_port);
+    let public = public_base_url
+        .as_ref()
+        .map(|url| url.trim_end_matches('/').to_string())
+        .or_else(|| {
+            let h = bind_host.trim();
+            if !h.is_empty() && h != "0.0.0.0" && h != "127.0.0.1" && h != "localhost" {
+                Some(format!("http://{}:{}", h, web_port))
+            } else {
+                None
+            }
+        });
+    let entry = public.clone().unwrap_or_else(|| local.clone());
+    (Some(local), public, Some(entry))
+}
+
 fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedProjectSite> {
+    let web_port = row.get::<_, i64>("web_port")? as u16;
+    let bind_host: String = row.get("bind_host")?;
+    let public_base_url: Option<String> = row.get("public_base_url").unwrap_or(None);
+    let associated_project: Option<String> = row.get("associated_project").unwrap_or(None);
+    let (local_entry_url, public_entry_url, entry_url) =
+        derive_entry_urls(web_port, &bind_host, &public_base_url);
     Ok(ManagedProjectSite {
         site_id: row.get("site_id")?,
         project_name: row.get("project_name")?,
@@ -638,8 +702,10 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedProjectSite> 
         runtime_dir: row.get("runtime_dir")?,
         db_data_path: row.get("db_data_path")?,
         db_port: row.get::<_, i64>("db_port")? as u16,
-        web_port: row.get::<_, i64>("web_port")? as u16,
-        bind_host: row.get("bind_host")?,
+        web_port,
+        bind_host,
+        public_base_url,
+        associated_project,
         db_pid: row
             .get::<_, Option<i64>>("db_pid")?
             .map(|value| value as u32),
@@ -652,7 +718,9 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedProjectSite> 
         status: status_from_str(&row.get::<_, String>("status")?),
         parse_status: parse_status_from_str(&row.get::<_, String>("parse_status")?),
         last_error: row.get("last_error")?,
-        entry_url: row.get("entry_url")?,
+        entry_url,
+        local_entry_url,
+        public_entry_url,
         last_parse_started_at: row.get("last_parse_started_at")?,
         last_parse_finished_at: row.get("last_parse_finished_at")?,
         last_parse_duration_ms: row
@@ -784,11 +852,13 @@ fn persist_site(
         &format!(
             "INSERT OR REPLACE INTO {table} (
                 site_id, project_name, project_code, project_path, config_path, runtime_dir,
-                manual_db_nums, db_data_path, db_port, web_port, bind_host, db_pid, web_pid, parse_pid,
+                manual_db_nums, db_data_path, db_port, web_port, bind_host, public_base_url,
+                associated_project,
+                db_pid, web_pid, parse_pid,
                 status, parse_status, last_error, entry_url, db_user, db_password,
                 last_parse_started_at, last_parse_finished_at, last_parse_duration_ms,
                 created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
             table = TABLE_NAME
         ),
         params![
@@ -803,6 +873,8 @@ fn persist_site(
             site.db_port as i64,
             site.web_port as i64,
             &site.bind_host,
+            &site.public_base_url,
+            &site.associated_project,
             site.db_pid.map(|value| value as i64),
             site.web_pid.map(|value| value as i64),
             site.parse_pid.map(|value| value as i64),
@@ -839,6 +911,15 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
     let site_id = infer_site_id(&req.project_name, req.web_port);
     let created_at = now_rfc3339();
     let bind_host = normalize_host(req.bind_host);
+    let public_base_url = req
+        .public_base_url
+        .filter(|v| !v.trim().is_empty());
+    let associated_project = req
+        .associated_project
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.trim().to_string());
+    let (local_entry_url, public_entry_url, entry_url) =
+        derive_entry_urls(req.web_port, &bind_host, &public_base_url);
     let site = ManagedProjectSite {
         site_id: site_id.clone(),
         project_name: req.project_name.trim().to_string(),
@@ -851,13 +932,17 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
         db_port: req.db_port,
         web_port: req.web_port,
         bind_host,
+        public_base_url,
+        associated_project,
         db_pid: None,
         web_pid: None,
         parse_pid: None,
         status: ManagedSiteStatus::Draft,
         parse_status: ManagedSiteParseStatus::Pending,
         last_error: None,
-        entry_url: Some(format!("http://127.0.0.1:{}", req.web_port)),
+        entry_url,
+        local_entry_url,
+        public_entry_url,
         last_parse_started_at: None,
         last_parse_finished_at: None,
         last_parse_duration_ms: None,
@@ -915,6 +1000,20 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
     if let Some(value) = req.bind_host.filter(|value| !value.trim().is_empty()) {
         site.bind_host = value.trim().to_string();
     }
+    if let Some(value) = req.public_base_url {
+        site.public_base_url = if value.trim().is_empty() {
+            None
+        } else {
+            Some(value.trim().to_string())
+        };
+    }
+    if let Some(value) = req.associated_project {
+        site.associated_project = if value.trim().is_empty() {
+            None
+        } else {
+            Some(value.trim().to_string())
+        };
+    }
     if let Some(value) = req.db_port {
         site.db_port = value;
     }
@@ -922,7 +1021,11 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
         site.web_port = value;
     }
     site.updated_at = now_rfc3339();
-    site.entry_url = Some(format!("http://127.0.0.1:{}", site.web_port));
+    let (local_entry_url, public_entry_url, entry_url) =
+        derive_entry_urls(site.web_port, &site.bind_host, &site.public_base_url);
+    site.entry_url = entry_url;
+    site.local_entry_url = local_entry_url;
+    site.public_entry_url = public_entry_url;
     site.status = ManagedSiteStatus::Draft;
     site.parse_status = ManagedSiteParseStatus::Pending;
     site.db_pid = None;
@@ -1504,6 +1607,28 @@ async fn process_ids_on_port(port: u16) -> Result<Vec<u32>> {
     }
 }
 
+fn collect_port_pids_sync(port: u16) -> Vec<u32> {
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("lsof -ti tcp:{} 2>/dev/null || true", port))
+            .output();
+        match output {
+            Ok(out) => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse::<u32>().ok())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = port;
+        Vec::new()
+    }
+}
+
 fn aios_database_binary() -> Result<Option<PathBuf>> {
     let current = current_exe_path()?;
     let parent = current
@@ -1952,7 +2077,7 @@ async fn kill_pid(pid: u32) -> Result<()> {
     Ok(())
 }
 
-pub async fn stop_site(site_id: &str) -> Result<ManagedProjectSite> {
+pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
     let site = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
     update_runtime(
         site_id,
@@ -1976,12 +2101,48 @@ pub async fn stop_site(site_id: &str) -> Result<ManagedProjectSite> {
     if let Some(pid) = site.parse_pid {
         kill_pid(pid).await?;
     }
-    for pid in process_ids_on_port(site.web_port).await? {
-        kill_pid(pid).await?;
+
+    let web_conflict_pids = process_ids_on_port(site.web_port).await.unwrap_or_default();
+    let db_conflict_pids = process_ids_on_port(site.db_port).await.unwrap_or_default();
+    let has_conflict = !web_conflict_pids.is_empty() || !db_conflict_pids.is_empty();
+
+    if has_conflict {
+        let mut reasons = Vec::new();
+        if !web_conflict_pids.is_empty() {
+            reasons.push(format!(
+                "web 端口 {} 被外部进程占用 (PIDs: {:?})",
+                site.web_port, web_conflict_pids
+            ));
+        }
+        if !db_conflict_pids.is_empty() {
+            reasons.push(format!(
+                "db 端口 {} 被外部进程占用 (PIDs: {:?})",
+                site.db_port, db_conflict_pids
+            ));
+        }
+        let conflict_msg = reasons.join("; ");
+        update_runtime(
+            site_id,
+            Some(ManagedSiteStatus::Failed),
+            None,
+            Some(None),
+            Some(None),
+            Some(None),
+            Some(Some(format!("端口冲突: {}", conflict_msg))),
+            None,
+            None,
+            None,
+            None,
+        )?;
+        let updated = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
+        return Ok(StopSiteResult {
+            site: updated,
+            conflict: true,
+            web_conflict_pids,
+            db_conflict_pids,
+        });
     }
-    for pid in process_ids_on_port(site.db_port).await? {
-        kill_pid(pid).await?;
-    }
+
     update_runtime(
         site_id,
         Some(ManagedSiteStatus::Stopped),
@@ -1995,7 +2156,20 @@ pub async fn stop_site(site_id: &str) -> Result<ManagedProjectSite> {
         None,
         None,
     )?;
-    get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))
+    let updated = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
+    Ok(StopSiteResult {
+        site: updated,
+        conflict: false,
+        web_conflict_pids: Vec::new(),
+        db_conflict_pids: Vec::new(),
+    })
+}
+
+pub struct StopSiteResult {
+    pub site: ManagedProjectSite,
+    pub conflict: bool,
+    pub web_conflict_pids: Vec<u32>,
+    pub db_conflict_pids: Vec<u32>,
 }
 
 pub fn delete_site(site_id: &str) -> Result<bool> {
@@ -2069,7 +2243,34 @@ pub fn runtime_status(site_id: &str) -> Result<ManagedSiteRuntimeStatus> {
         web_snapshot.and_then(|snapshot| snapshot.last_key_log.clone()),
     );
 
-    let (risk_level, warnings, parse_health) = evaluate_site_risk(&site, &resources);
+    let (risk_level, mut warnings, parse_health) = evaluate_site_risk(&site, &resources);
+
+    let managed_db_pids: Vec<u32> = site.db_pid.into_iter().collect();
+    let managed_web_pids: Vec<u32> = site.web_pid.into_iter().collect();
+    let db_port_pids = collect_port_pids_sync(site.db_port);
+    let web_port_pids = collect_port_pids_sync(site.web_port);
+    let db_conflict_pids: Vec<u32> = db_port_pids
+        .into_iter()
+        .filter(|pid| !managed_db_pids.contains(pid))
+        .collect();
+    let web_conflict_pids: Vec<u32> = web_port_pids
+        .into_iter()
+        .filter(|pid| !managed_web_pids.contains(pid))
+        .collect();
+    let db_port_conflict = !db_conflict_pids.is_empty();
+    let web_port_conflict = !web_conflict_pids.is_empty();
+    if db_port_conflict {
+        warnings.push(format!(
+            "db 端口 {} 被外部进程占用 (PIDs: {:?})",
+            site.db_port, db_conflict_pids
+        ));
+    }
+    if web_port_conflict {
+        warnings.push(format!(
+            "web 端口 {} 被外部进程占用 (PIDs: {:?})",
+            site.web_port, web_conflict_pids
+        ));
+    }
 
     Ok(ManagedSiteRuntimeStatus {
         site_id: site.site_id,
@@ -2087,6 +2288,12 @@ pub fn runtime_status(site_id: &str) -> Result<ManagedSiteRuntimeStatus> {
         db_port: site.db_port,
         web_port: site.web_port,
         entry_url: site.entry_url,
+        local_entry_url: site.local_entry_url,
+        public_entry_url: site.public_entry_url,
+        db_port_conflict,
+        web_port_conflict,
+        db_conflict_pids,
+        web_conflict_pids,
         last_error: site.last_error,
         active_log_kind,
         last_log_at,

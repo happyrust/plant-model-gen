@@ -74,7 +74,13 @@ watch(
 
 const groupedNav = computed<NavGroup[]>(() => {
   const routes = appRoutes
-    .filter((entry) => typeof entry.path === 'string' && entry.meta?.navGroup && entry.meta?.navLabel)
+    .filter(
+      (entry) =>
+        typeof entry.path === 'string' &&
+        entry.meta?.navGroup &&
+        entry.meta?.navLabel &&
+        !entry.meta?.navHidden,
+    )
     .map((entry) => ({
       path: String(entry.path),
       group: String(entry.meta?.navGroup),
@@ -99,7 +105,7 @@ const groupedNav = computed<NavGroup[]>(() => {
 
 const primaryGroups = computed(() => groupedNav.value);
 
-const mobileNavPaths = ['/dashboard', '/projects', '/tasks', '/deployment/sites', '/viewer/preview'];
+const mobileNavPaths = ['/dashboard', '/projects', '/tasks', '/viewer/preview'];
 
 const mobileGroups = computed(() =>
   groupedNav.value

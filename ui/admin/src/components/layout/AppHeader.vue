@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
-import { Server, ListTodo, LogOut, DatabaseBackup } from 'lucide-vue-next'
+import { Server, ListTodo, LogOut, DatabaseBackup, Network } from 'lucide-vue-next'
 
 const route = useRoute()
 const router = useRouter()
@@ -11,6 +11,7 @@ const auth = useAuthStore()
 const navItems = [
   { path: '/sites', label: '站点管理', icon: Server },
   { path: '/registry', label: '中心注册表', icon: DatabaseBackup },
+  { path: '/collaboration', label: '异地协同', icon: Network },
   { path: '/tasks', label: '任务管理', icon: ListTodo },
 ]
 

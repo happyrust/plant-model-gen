@@ -4,7 +4,8 @@ use axum::{extract::Json, http::StatusCode, response::IntoResponse};
 use tracing::{info, warn};
 
 use crate::web_api::jwt_auth::{
-    create_token, decode_token_unsafe, generate_form_id, normalize_workflow_mode, verify_token, Role,
+    Role, create_token, decode_token_unsafe, generate_form_id, normalize_workflow_mode,
+    verify_token,
 };
 
 use super::config::PLATFORM_CONFIG;
@@ -27,7 +28,11 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
         request_form_id,
         request.workflow_role,
         request.workflow_mode,
-        request.token.as_ref().map(|value| !value.trim().is_empty()).unwrap_or(false),
+        request
+            .token
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
         summarize_extra_parameters(request.extra_parameters.as_ref())
     );
 
@@ -40,10 +45,7 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
                 Ok(claims) => {
                     info!(
                         "Embed URL JWT claims verified: project_id={}, user_id={}, role={:?}, workflow_mode={:?}",
-                        claims.project_id,
-                        claims.user_id,
-                        claims.role,
-                        claims.workflow_mode
+                        claims.project_id, claims.user_id, claims.role, claims.workflow_mode
                     );
                     if claims.project_id != request.project_id || claims.user_id != request.user_id
                     {
@@ -90,9 +92,7 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
 
     info!(
         "Embed URL lineage resolution: request_form_id={:?}, token_claim_form_id={:?}, resolved_form_id={:?}",
-        request_form_id,
-        None::<String>,
-        request_form_id
+        request_form_id, None::<String>, request_form_id
     );
 
     let requested_role = match resolve_embed_request_role(&request, verified_claim_role.as_deref())

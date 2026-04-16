@@ -1,5 +1,6 @@
 import { apiGet, apiPost, apiPut, apiDelete, apiPostRaw } from './client'
 import type {
+  AdminResourceSummary,
   ManagedProjectSite,
   ManagedSiteRuntimeStatus,
   ManagedSiteLogsResponse,
@@ -8,6 +9,8 @@ import type {
 } from '@/types/site'
 
 export const sitesApi = {
+  resourceSummary: () => apiGet<AdminResourceSummary>('/api/admin/resources/summary'),
+
   list: () => apiGet<ManagedProjectSite[]>('/api/admin/sites'),
 
   get: (id: string) => apiGet<ManagedProjectSite>(`/api/admin/sites/${id}`),

@@ -9,8 +9,8 @@ use std::{collections::BTreeSet, path::Path, sync::OnceLock};
 use surrealdb::types::SurrealValue;
 use tracing::{info, warn};
 
-use aios_core::project_primary_db;
 use crate::web_api::review_api::ReviewTask;
+use aios_core::project_primary_db;
 
 use super::auth::verify_s2s_token;
 use super::review_form::{
@@ -375,7 +375,10 @@ async fn apply_workflow_active(
 
     let target_node = normalize_workflow_node(&next_step.roles);
     if target_node.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "active 的 next_step.roles 不能为空".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "active 的 next_step.roles 不能为空".to_string(),
+        ));
     }
 
     let assignee_id = next_step.assignee_id.trim();
@@ -429,14 +432,8 @@ async fn apply_workflow_active(
     }
 
     let next_status = workflow_task_status_for_target_node(&target_node);
-    let (
-        checker_id,
-        checker_name,
-        reviewer_id,
-        reviewer_name,
-        approver_id,
-        approver_name,
-    ) = assign_review_task_fields(&target_node, assignee_id, assignee_name);
+    let (checker_id, checker_name, reviewer_id, reviewer_name, approver_id, approver_name) =
+        assign_review_task_fields(&target_node, assignee_id, assignee_name);
 
     let update_sql = r#"
         UPDATE review_tasks SET
@@ -534,7 +531,10 @@ async fn apply_workflow_return(
 
     let target_node = normalize_workflow_node(&next_step.roles);
     if target_node.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "return 的 next_step.roles 不能为空".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "return 的 next_step.roles 不能为空".to_string(),
+        ));
     }
 
     let assignee_id = next_step.assignee_id.trim();
@@ -612,14 +612,8 @@ async fn apply_workflow_return(
     }
 
     let next_status = workflow_task_status_for_target_node(&target_node);
-    let (
-        checker_id,
-        checker_name,
-        reviewer_id,
-        reviewer_name,
-        approver_id,
-        approver_name,
-    ) = assign_review_task_fields(&target_node, assignee_id, assignee_name);
+    let (checker_id, checker_name, reviewer_id, reviewer_name, approver_id, approver_name) =
+        assign_review_task_fields(&target_node, assignee_id, assignee_name);
     let return_reason = request
         .comments
         .as_ref()
@@ -755,57 +749,62 @@ async fn apply_workflow_agree(
         ));
     }
 
-    let (target_node, next_status, checker_id, checker_name, reviewer_id, reviewer_name, approver_id, approver_name) =
-        if current_node == "pz" {
-            (
-                current_node.clone(),
-                "approved",
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            )
-        } else {
-            let next_step = request
-                .next_step
-                .as_ref()
-                .ok_or_else(|| (StatusCode::BAD_REQUEST, "agree 缺少 next_step".to_string()))?;
+    let (
+        target_node,
+        next_status,
+        checker_id,
+        checker_name,
+        reviewer_id,
+        reviewer_name,
+        approver_id,
+        approver_name,
+    ) = if current_node == "pz" {
+        (
+            current_node.clone(),
+            "approved",
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    } else {
+        let next_step = request
+            .next_step
+            .as_ref()
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "agree 缺少 next_step".to_string()))?;
 
-            let target_node = normalize_workflow_node(&next_step.roles);
-            if target_node.is_empty() {
-                return Err((StatusCode::BAD_REQUEST, "agree 的 next_step.roles 不能为空".to_string()));
-            }
+        let target_node = normalize_workflow_node(&next_step.roles);
+        if target_node.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "agree 的 next_step.roles 不能为空".to_string(),
+            ));
+        }
 
-            let assignee_id = next_step.assignee_id.trim();
-            if assignee_id.is_empty() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "agree 的 next_step.assignee_id 不能为空".to_string(),
-                ));
-            }
-            let assignee_name = next_step.name.trim();
-            let next_status = workflow_task_status_for_target_node(&target_node);
-            let (
-                checker_id,
-                checker_name,
-                reviewer_id,
-                reviewer_name,
-                approver_id,
-                approver_name,
-            ) = assign_review_task_fields(&target_node, assignee_id, assignee_name);
-            (
-                target_node,
-                next_status,
-                checker_id,
-                checker_name,
-                reviewer_id,
-                reviewer_name,
-                approver_id,
-                approver_name,
-            )
-        };
+        let assignee_id = next_step.assignee_id.trim();
+        if assignee_id.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "agree 的 next_step.assignee_id 不能为空".to_string(),
+            ));
+        }
+        let assignee_name = next_step.name.trim();
+        let next_status = workflow_task_status_for_target_node(&target_node);
+        let (checker_id, checker_name, reviewer_id, reviewer_name, approver_id, approver_name) =
+            assign_review_task_fields(&target_node, assignee_id, assignee_name);
+        (
+            target_node,
+            next_status,
+            checker_id,
+            checker_name,
+            reviewer_id,
+            reviewer_name,
+            approver_id,
+            approver_name,
+        )
+    };
 
     let update_sql = r#"
         UPDATE review_tasks SET
@@ -961,7 +960,10 @@ async fn apply_workflow_stop(
     project_primary_db()
         .query(update_sql)
         .bind(("task_id", task.id.clone()))
-        .bind(("stop_reason", format!("[stop@{}] {}", current_node, stop_reason)))
+        .bind((
+            "stop_reason",
+            format!("[stop@{}] {}", current_node, stop_reason),
+        ))
         .await
         .map_err(|error| {
             (

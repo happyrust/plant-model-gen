@@ -19,8 +19,8 @@ export const useAuthStore = defineStore('auth', () => {
     try {
       const session = await authApi.login(creds)
       token.value = session.token
-      username.value = session.user.username
-      role.value = session.user.role
+      username.value = session.user?.username ?? ''
+      role.value = session.user?.role ?? ''
       localStorage.setItem('admin_token', session.token)
     } catch (err: unknown) {
       loginError.value = extractErrorMessage(err)
@@ -45,8 +45,8 @@ export const useAuthStore = defineStore('auth', () => {
     if (!token.value) return
     try {
       const user = await authApi.me()
-      username.value = user.username
-      role.value = user.role
+      username.value = user?.username ?? ''
+      role.value = user?.role ?? ''
     } catch {
       token.value = ''
       username.value = ''

@@ -83,6 +83,11 @@ pub fn cleanup_old_tasks() {
     }
 }
 
+pub fn insert_task(task: TaskInfo) {
+    let site_id = task.site_id.clone();
+    let _ = save_task(&task, site_id.as_deref());
+}
+
 pub fn create_admin_task_routes() -> Router {
     if let Err(e) = ensure_admin_tasks_table() {
         eprintln!("⚠️ Failed to init admin_tasks table: {e}");
@@ -463,7 +468,7 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<StoredAdminTask> {
         .unwrap_or_default();
 
     Ok(StoredAdminTask {
-        site_id,
+        site_id: site_id.clone(),
         task: TaskInfo {
             id,
             name,
@@ -482,6 +487,8 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<StoredAdminTask> {
             estimated_duration: None,
             actual_duration: compute_actual_duration(started_at, completed_at),
             metadata: None,
+            site_id,
+            site_label: None,
         },
     })
 }

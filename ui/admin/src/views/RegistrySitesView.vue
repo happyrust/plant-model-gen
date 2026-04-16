@@ -4,10 +4,12 @@ import { useRouter } from 'vue-router'
 import {
   ArrowLeft,
   ArrowRight,
+  ClipboardCopy,
   ExternalLink,
   FileCog,
   FileDown,
   HeartPulse,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
@@ -30,9 +32,21 @@ const sitesStore = useSitesStore()
 const searchQuery = ref('')
 const statusFilter = ref('')
 const regionFilter = ref('')
+const ownerFilter = ref('')
+const envFilter = ref('')
+const projectNameFilter = ref('')
+const sortFilter = ref('')
 const drawerOpen = ref(false)
 const editingSiteId = ref<string | null>(null)
 const feedback = ref<{ tone: FeedbackTone; message: string } | null>(null)
+
+const importDialogOpen = ref(false)
+const importPath = ref('db_options/DbOption.toml')
+const importLoading = ref(false)
+const importError = ref('')
+
+const deleteTarget = ref<RegistrySite | null>(null)
+const deleteLoading = ref(false)
 
 const { start: startPolling } = usePolling(async () => {
   await refreshAll({ silent: true })
@@ -97,6 +111,10 @@ async function applyFilters() {
       q: searchQuery.value.trim() || undefined,
       status: statusFilter.value || undefined,
       region: regionFilter.value.trim() || undefined,
+      owner: ownerFilter.value.trim() || undefined,
+      env: envFilter.value.trim() || undefined,
+      project_name: projectNameFilter.value.trim() || undefined,
+      sort: sortFilter.value || undefined,
       page: 1,
     })
   } catch (err: unknown) {
@@ -121,21 +139,24 @@ async function handleDrawerSaved() {
   setFeedback('success', '注册表站点已保存')
 }
 
-async function handleImport() {
-  const path = window.prompt(
-    '请输入 DbOption.toml 路径',
-    'db_options/DbOption.toml',
-  )
-  if (path === null) {
-    return
-  }
+function openImportDialog() {
+  importPath.value = 'db_options/DbOption.toml'
+  importError.value = ''
+  importDialogOpen.value = true
+}
 
+async function confirmImport() {
+  importLoading.value = true
+  importError.value = ''
   try {
-    await registryStore.importSite({ path: path.trim() || 'db_options/DbOption.toml' })
+    await registryStore.importSite({ path: importPath.value.trim() || 'db_options/DbOption.toml' })
+    importDialogOpen.value = false
     await refreshAll({ silent: true })
     setFeedback('success', '已从 DbOption 导入注册表站点')
   } catch (err: unknown) {
-    setFeedback('error', err instanceof Error ? err.message : '导入注册表站点失败')
+    importError.value = err instanceof Error ? err.message : '导入注册表站点失败'
+  } finally {
+    importLoading.value = false
   }
 }
 
@@ -153,28 +174,8 @@ async function handleHealthcheck(site: RegistrySite) {
   }
 }
 
-async function handleCreateTask(site: RegistrySite) {
-  const taskName = window.prompt(
-    '请输入任务名称',
-    `${site.name} - ParsePdmsData`,
-  )
-  if (taskName === null) {
-    return
-  }
-
-  try {
-    const result = await registryStore.createTask(site.site_id, {
-      task_name: taskName.trim() || `${site.name} - ParsePdmsData`,
-      task_type: 'ParsePdmsData',
-      priority: 'Normal',
-    })
-    setFeedback(
-      'success',
-      `${result.message || '任务创建成功'}（${result.task_id}）`,
-    )
-  } catch (err: unknown) {
-    setFeedback('error', err instanceof Error ? err.message : '创建任务失败')
-  }
+function handleCreateTask(site: RegistrySite) {
+  router.push({ path: '/tasks/new', query: { site_id: site.site_id, site_label: site.name } })
 }
 
 async function handleExport(site: RegistrySite) {
@@ -196,18 +197,29 @@ async function handleExport(site: RegistrySite) {
   }
 }
 
-async function handleDelete(site: RegistrySite) {
-  const confirmed = window.confirm(`确认删除注册表站点「${site.name}」吗？`)
-  if (!confirmed) {
-    return
-  }
+function openDeleteConfirm(site: RegistrySite) {
+  deleteTarget.value = site
+}
 
+async function confirmDelete() {
+  if (!deleteTarget.value) return
+  deleteLoading.value = true
   try {
-    await registryStore.deleteSite(site.site_id)
-    setFeedback('success', `${site.name} 已删除`)
+    const name = deleteTarget.value.name
+    await registryStore.deleteSite(deleteTarget.value.site_id)
+    deleteTarget.value = null
+    setFeedback('success', `${name} 已删除`)
   } catch (err: unknown) {
     setFeedback('error', err instanceof Error ? err.message : '删除注册表站点失败')
+    deleteTarget.value = null
+  } finally {
+    deleteLoading.value = false
   }
+}
+
+function copyToClipboard(text: string) {
+  navigator.clipboard.writeText(text)
+  setFeedback('info', '已复制到剪贴板')
 }
 
 async function changePage(nextPage: number) {
@@ -258,7 +270,7 @@ onMounted(async () => {
         </button>
         <button
           class="inline-flex h-9 items-center gap-2 rounded-md border border-input px-4 text-sm font-medium hover:bg-accent transition-colors"
-          @click="handleImport"
+          @click="openImportDialog"
         >
           <FileCog class="h-4 w-4" />
           从 DbOption 导入
@@ -396,16 +408,24 @@ onMounted(async () => {
               </div>
             </td>
             <td class="px-4 py-3">
-              <a
-                v-if="site.backend_url"
-                :href="site.backend_url"
-                target="_blank"
-                rel="noreferrer"
-                class="inline-flex items-center gap-1 text-primary hover:underline"
-              >
-                <span>{{ site.backend_url }}</span>
-                <ExternalLink class="h-3.5 w-3.5" />
-              </a>
+              <div v-if="site.backend_url" class="flex items-center gap-1">
+                <a
+                  :href="site.backend_url"
+                  target="_blank"
+                  rel="noreferrer"
+                  class="inline-flex items-center gap-1 text-primary hover:underline"
+                >
+                  <span>{{ site.backend_url }}</span>
+                  <ExternalLink class="h-3.5 w-3.5" />
+                </a>
+                <button
+                  class="inline-flex h-6 w-6 items-center justify-center rounded hover:bg-accent transition-colors"
+                  title="复制地址"
+                  @click.stop="copyToClipboard(site.backend_url)"
+                >
+                  <ClipboardCopy class="h-3 w-3 text-muted-foreground" />
+                </button>
+              </div>
               <div v-else class="text-muted-foreground">-</div>
             </td>
             <td class="px-4 py-3">
@@ -450,12 +470,12 @@ onMounted(async () => {
                   title="编辑"
                   @click="openEditDrawer(site.site_id)"
                 >
-                  <ExternalLink class="h-4 w-4" />
+                  <Pencil class="h-4 w-4" />
                 </button>
                 <button
                   class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-accent transition-colors"
                   title="删除"
-                  @click="handleDelete(site)"
+                  @click="openDeleteConfirm(site)"
                 >
                   <Trash2 class="h-4 w-4 text-destructive" />
                 </button>
@@ -497,5 +517,57 @@ onMounted(async () => {
       @close="drawerOpen = false"
       @saved="handleDrawerSaved"
     />
+
+    <Teleport to="body">
+      <div v-if="importDialogOpen" class="fixed inset-0 z-50 flex items-center justify-center">
+        <div class="absolute inset-0 bg-black/50" @click="importDialogOpen = false" />
+        <div class="relative w-full max-w-md rounded-lg border border-border bg-background p-6 shadow-xl">
+          <h3 class="text-lg font-semibold mb-4">从 DbOption 导入</h3>
+          <div class="space-y-3">
+            <input
+              v-model="importPath"
+              type="text"
+              placeholder="db_options/DbOption.toml"
+              class="flex h-10 w-full rounded-md border border-input bg-transparent px-3 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            />
+            <div v-if="importError" class="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+              {{ importError }}
+            </div>
+          </div>
+          <div class="mt-4 flex justify-end gap-3">
+            <button
+              class="inline-flex h-9 items-center rounded-md border border-input bg-transparent px-4 text-sm font-medium hover:bg-accent transition-colors"
+              @click="importDialogOpen = false"
+            >取消</button>
+            <button
+              class="inline-flex h-9 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow hover:bg-primary/90 transition-colors disabled:opacity-50"
+              :disabled="importLoading"
+              @click="confirmImport"
+            >{{ importLoading ? '导入中...' : '导入' }}</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div v-if="deleteTarget" class="fixed inset-0 z-50 flex items-center justify-center">
+        <div class="absolute inset-0 bg-black/50" @click="deleteTarget = null" />
+        <div class="relative w-full max-w-sm rounded-lg border border-border bg-background p-6 shadow-xl">
+          <h3 class="text-lg font-semibold mb-2">确认删除</h3>
+          <p class="text-sm text-muted-foreground">确认删除注册表站点「{{ deleteTarget.name }}」吗？此操作不可撤销。</p>
+          <div class="mt-4 flex justify-end gap-3">
+            <button
+              class="inline-flex h-9 items-center rounded-md border border-input bg-transparent px-4 text-sm font-medium hover:bg-accent transition-colors"
+              @click="deleteTarget = null"
+            >取消</button>
+            <button
+              class="inline-flex h-9 items-center rounded-md bg-destructive px-4 text-sm font-medium text-destructive-foreground shadow hover:bg-destructive/90 transition-colors disabled:opacity-50"
+              :disabled="deleteLoading"
+              @click="confirmDelete"
+            >{{ deleteLoading ? '删除中...' : '删除' }}</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>

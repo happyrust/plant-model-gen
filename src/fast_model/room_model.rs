@@ -9,7 +9,7 @@ use aios_core::room::algorithm::*;
 use aios_core::shape::pdms_shape::PlantMesh;
 
 use aios_core::{
-    model_primary_db, GeomInstQuery, ModelHashInst, RefU64, RefnoEnum, SurrealQueryExt,
+    GeomInstQuery, ModelHashInst, RefU64, RefnoEnum, SurrealQueryExt, model_primary_db,
 };
 
 use dashmap::DashMap;
@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-use crate::fast_model::export_model::{query_inst_relate_batch, InstRelateRow};
+use crate::fast_model::export_model::{InstRelateRow, query_inst_relate_batch};
 
 #[cfg(all(
     not(target_arch = "wasm32"),
@@ -1536,11 +1536,7 @@ impl CacheMetrics {
 
         let total = hits + misses;
 
-        if total == 0.0 {
-            0.0
-        } else {
-            hits / total
-        }
+        if total == 0.0 { 0.0 } else { hits / total }
     }
 }
 
@@ -5558,7 +5554,6 @@ pub async fn update_room_relations_incremental(
     update_room_relations_incremental_original(refnos).await
 }
 
-
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
 pub async fn rebuild_room_relations_for_rooms_with_cancel(
@@ -6211,9 +6206,10 @@ mod regression_tests {
 
         assert!(err.to_string().contains("24383_83477"));
         assert!(err.to_string().contains("missing dbnum"));
-        assert!(err
-            .to_string()
-            .contains("[ROOM_TREE_INDEX_DBNUM_RESOLVE_FAILED]"));
+        assert!(
+            err.to_string()
+                .contains("[ROOM_TREE_INDEX_DBNUM_RESOLVE_FAILED]")
+        );
     }
 
     #[test]

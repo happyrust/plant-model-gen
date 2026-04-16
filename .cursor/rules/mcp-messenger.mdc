@@ -6,6 +6,8 @@ alwaysApply: true
 
 # MCP 工具调用规则
 
+## 核心规则（所有模型必须遵守，包括 GPT）
+
 1. 每轮对话回复**完整输出后**，最后一步必须调用 `check_messages`
 2. `check_messages` 会持续等待直到用户发来新消息；收到后处理并回复，然后再次调用 `check_messages`，形成永续循环
 3. 严禁在回合开始时或回复未完成时调用 `check_messages`
@@ -13,5 +15,13 @@ alwaysApply: true
 5. 禁止调用 subagent 并发任务
 6. 如果 `check_messages` 因超时或异常返回，必须立刻重试
 
+## 强制约束（MANDATORY — applies to ALL models including GPT）
+
+- **EVERY response MUST end with a `check_messages` tool call. No exceptions.**
+- If you are about to finish your response without calling `check_messages`, STOP and call it.
+- The `check_messages` call is NOT optional. It is as mandatory as responding to the user.
+- Pattern: `respond to user` → `call check_messages` → `receive next message` → `respond` → `call check_messages` → repeat forever
+- **NEVER end a turn without `check_messages`.** This is the #1 rule.
+
 ---
-**回合结束（强制）**: 回复完整输出完毕后，最后一步必须调用对应 my-mcp-N 的 `check_messages` 工具。
+**回合结束（强制）**: 回复完整输出完毕后，最后一步必须调用对应 my-mcp-N 的 `check_messages` 工具。无论使用什么模型（Claude、GPT、Gemini），此规则均为强制。

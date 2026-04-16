@@ -334,6 +334,7 @@ dependencies = [
  "regex",
  "rkyv 0.8.15",
  "rstar 0.11.0 (git+https://github.com/happyrust/rstar)",
+ "rusqlite",
  "serde",
  "serde_derive",
  "serde_json",

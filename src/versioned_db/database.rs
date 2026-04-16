@@ -18,9 +18,9 @@ use aios_core::tool::hash_tool::hash_str;
 use aios_core::types::*;
 use chrono::Local;
 use dashmap::{DashMap, DashSet};
+use futures::StreamExt;
 use futures::channel::mpsc::unbounded;
 use futures::stream::FuturesUnordered;
-use futures::StreamExt;
 use itertools::Itertools;
 use parse_pdms_db::parse::*;
 use pdms_io::io::PdmsIO;
@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::fs;
-use tokio::fs::{create_dir_all, File};
+use tokio::fs::{File, create_dir_all};
 use tokio::io::AsyncReadExt;
 use tokio::sync::OnceCell;
 // use tokio::sync::mpsc::Sender;
@@ -55,7 +55,7 @@ use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::tables::*;
 use crate::versioned_db::db_meta_info;
 use crate::versioned_db::pe::*;
-use crate::versioned_db::tree_export::{export_tree_file, TreeNodeMeta};
+use crate::versioned_db::tree_export::{TreeNodeMeta, export_tree_file};
 
 pub enum SenderJsonsData {
     PEJson(Vec<String>),
@@ -123,7 +123,9 @@ fn collect_project_db_files(project_dir: impl AsRef<Path>) -> anyhow::Result<Vec
                 entry.path()
             })
             .find(|x| x.is_dir() && x.file_name().unwrap().to_str().unwrap().ends_with("000"))
-            .ok_or_else(|| anyhow::anyhow!("项目目录下未找到 000 数据目录: {}", project_dir.display()))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("项目目录下未找到 000 数据目录: {}", project_dir.display())
+            })?;
         std::fs::read_dir(target_dir)?
             .into_iter()
             .map(|entry| {
@@ -624,7 +626,7 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
         let data_db_types_refs = data_db_types.iter().map(String::as_str).collect::<Vec<_>>();
         // 解析时不应该受 debug_model_refnos 影响，只用于模型生成调试
         let debug_refnos: Vec<RefU64> = Vec::new(); // 暂时禁用解析调试模式
-                                                    //debug 不保存数据，只复杂查看属性值
+        //debug 不保存数据，只复杂查看属性值
         let is_debug = !debug_refnos.is_empty();
         let cur_dbno_set = dbno_set.clone();
         if is_debug || db_option.only_sync_sys || db_option.total_sync {
@@ -1515,7 +1517,7 @@ pub async fn sync_total_async_threaded(
     let mut is_replace = db_option_arc.replace_dbs; // 是否替换数据库的数据
     let replace_types = db_option_arc.replace_types.clone(); // 获取替换的类型列表
     let b_replace_types = replace_types.is_some(); // 是否存在替换的类型列表
-                                                   // 是否保存到tidb
+    // 是否保存到tidb
     let b_save_mysql = db_option_arc.sync_tidb.unwrap_or(false);
     if b_replace_types {
         is_replace = true;

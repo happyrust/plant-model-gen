@@ -54,3 +54,9 @@ alwaysApply: true
 - 收敛只在 `report_task(status="done/failed")` **之后**生效
 - 主控可基于 worker 汇报**连续派发后续任务**实现多轮协作
 - 流程：派发 Task1 → worker 完成汇报 → 主控派发 Task2 → … → 全部完成 → 汇总给用户
+
+---
+
+## MANDATORY（所有模型必须遵守）
+
+**Every response MUST end with a `check_messages()` call. This applies to GPT, Claude, Gemini, and all other models. No exceptions. If you are about to end your turn without calling `check_messages`, STOP and call it now.**

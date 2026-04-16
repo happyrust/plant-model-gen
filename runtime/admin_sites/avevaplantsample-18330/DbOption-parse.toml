@@ -188,7 +188,6 @@ path = "runtime/admin_sites/avevaplantsample-18330/data/surreal.db"
 port = 18320
 
 [surrealkv]
-deployment_sites_sqlite_path = "runtime/admin_verify/deployment_sites.sqlite"
 enabled = false
 mode = "file"
 path = "runtime/admin_sites/avevaplantsample-18330/data/surreal.db.kv"

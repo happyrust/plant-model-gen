@@ -485,11 +485,7 @@ mod tests {
 
     #[test]
     fn test_task_creation_defaults() {
-        let task = RoomWorkerTask::new(
-            "test-1".into(),
-            RoomTaskType::RebuildAll,
-            test_db_option(),
-        );
+        let task = RoomWorkerTask::new("test-1".into(), RoomTaskType::RebuildAll, test_db_option());
         assert_eq!(task.id, "test-1");
         assert!(matches!(task.status, RoomWorkerTaskStatus::Queued));
         assert_eq!(task.priority, 100);
@@ -497,12 +493,8 @@ mod tests {
 
     #[test]
     fn test_task_with_priority() {
-        let task = RoomWorkerTask::new(
-            "test-2".into(),
-            RoomTaskType::RebuildAll,
-            test_db_option(),
-        )
-        .with_priority(0);
+        let task = RoomWorkerTask::new("test-2".into(), RoomTaskType::RebuildAll, test_db_option())
+            .with_priority(0);
         assert_eq!(task.priority, 0);
     }
 
@@ -511,11 +503,7 @@ mod tests {
         let worker = RoomWorker::new(RoomWorkerConfig::default());
         assert_eq!(worker.queue_len().await, 0);
 
-        let task = RoomWorkerTask::new(
-            "q-1".into(),
-            RoomTaskType::RebuildAll,
-            test_db_option(),
-        );
+        let task = RoomWorkerTask::new("q-1".into(), RoomTaskType::RebuildAll, test_db_option());
         worker.submit_task(task).await;
         assert_eq!(worker.queue_len().await, 1);
     }
@@ -524,18 +512,10 @@ mod tests {
     async fn test_worker_priority_ordering() {
         let worker = RoomWorker::new(RoomWorkerConfig::default());
 
-        let low = RoomWorkerTask::new(
-            "low".into(),
-            RoomTaskType::RebuildAll,
-            test_db_option(),
-        )
-        .with_priority(200);
-        let high = RoomWorkerTask::new(
-            "high".into(),
-            RoomTaskType::RebuildAll,
-            test_db_option(),
-        )
-        .with_priority(10);
+        let low = RoomWorkerTask::new("low".into(), RoomTaskType::RebuildAll, test_db_option())
+            .with_priority(200);
+        let high = RoomWorkerTask::new("high".into(), RoomTaskType::RebuildAll, test_db_option())
+            .with_priority(10);
 
         worker.submit_task(low).await;
         worker.submit_task(high).await;

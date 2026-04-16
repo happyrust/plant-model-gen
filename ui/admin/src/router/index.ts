@@ -53,6 +53,11 @@ const router = createRouter({
           name: 'task-detail',
           component: () => import('@/views/TaskProgressView.vue'),
         },
+        {
+          path: 'collaboration',
+          name: 'collaboration',
+          component: () => import('@/views/CollaborationWorkbenchView.vue'),
+        },
       ],
     },
   ],

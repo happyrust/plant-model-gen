@@ -4,6 +4,22 @@
 
 ### Added
 
+- `/admin` 站点管理新增"关联工程"字段（`associated_project`），支持持久化到 SQLite 并在新建/编辑站点时设置；打开 Viewer 时优先用该字段，未设置则回退到项目名称。
+- `/admin/#/collaboration` 异地协同工作台正式注册路由，AppHeader 导航栏新增「异地协同」入口。
+
+### Changed
+
+- `/admin` 注册表页改造：`DbOption 导入` 改用对话框替代 `window.prompt`，`删除` 改用确认对话框替代 `window.confirm`，`创建任务` 改为跳转到任务向导页面；后端地址列新增复制按钮，编辑按钮改用 Pencil 图标。
+
+### Fixed
+
+- 修复 `/admin` 注册表页导入/删除操作因函数名不匹配（`handleImport` → `openImportDialog`、`handleDelete` → `openDeleteConfirm`）导致点击无响应的问题。
+- 修复 `auth.ts` 中 `session.user` / `user` 可能为 `undefined` 的 TypeScript 严格检查错误。
+- 修复 `SiteDataTable.vue` 和 `SiteDetailView.vue` 中 `window.open` / `navigator.clipboard` 在 Vue 模板作用域中不可访问的 TypeScript 错误，改为组件方法调用。
+- Admin 前端通过 `vue-tsc` 类型检查，0 错误。
+
+### Previously Added
+
 - `/admin` 新增“中心注册表”页面，并补齐 admin 风格的注册表接口：支持列表/过滤/分页、新建/编辑/删除、`DbOption.toml` 导入、健康检查、配置导出和创建任务。
 - 导出模型查询：增加对 `Neg` (负实体) 的导出支持，并放宽图元节点输出条件确保元素正常输出。
 - 新增工具脚本：`scripts/export_dbnum_parquet_file.sh` 和 `test_ida_mcp.py` 辅助调测。
@@ -16,7 +32,7 @@
 
 ### Changed
 
-- 站点管理正式收口到 `/admin`：本机编排使用 `/admin#/sites`，中心注册表使用 `/admin#/registry`，`/deployment-sites` 与 `/console/deployment/sites` 只保留兼容跳转。
+- `/admin` 后台入口继续收口：本机编排使用 `/admin/#/sites`，中心注册表使用 `/admin/#/registry`，异地协同使用 `/admin/#/collaboration`；`/deployment-sites`、`/console/deployment/sites`、`/remote-sync` 与 `/console/sync/remote` 只保留兼容跳转。
 - **平台 API `POST /api/review/embed-url` 请求体**：本单据工作流角色字段由 `role` 更名为 **`workflow_role`**（Rust 侧 `EmbedUrlRequest.workflow_role`）；JSON 仍接受顶层别名 **`role`** 以兼容旧客户端。**不再接受** `user_role`（含 `extra_parameters.user_role`）。JWT claims 内字段名仍为 `role`，未变。详见 `docs/guides/PLATFORM_API_HTTP_EXAMPLES.md`。
 - 调整环境默认配置：`db_options/DbOption.toml` 等修改默认数据库连接模式为 `file`。
 

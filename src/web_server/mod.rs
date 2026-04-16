@@ -208,30 +208,63 @@ pub async fn start_web_server_with_config(
         config_manager.current_config = runtime_config.clone();
         config_manager.add_template("runtime", runtime_config);
     }
-    match aios_core::initialize_databases(db_option).await {
-        Ok(_) => {
-            println!("✅ 数据库连接初始化成功");
-        }
-        Err(e) => {
-            let error_msg = e.to_string();
-            eprintln!("❌ 数据库初始化失败: {}", error_msg);
-            eprintln!("💡 请确保:");
-            eprintln!("   1. {}.toml 文件在当前目录", config_name);
-            eprintln!("   2. SurrealDB 服务运行在配置的端口 (默认 8020)");
-            eprintln!("   3. 配置文件中的连接信息正确");
-            eprintln!("   配置信息: {}", db_option.connection_summary());
-            // 不直接返回错误，允许 web-server 继续启动（某些功能可能不需要数据库）
-            eprintln!("⚠️ 警告: 数据库连接失败，某些功能可能不可用");
+    if db_option.effective_surrealdb().mode == aios_core::options::DbConnMode::Ws {
+        match aios_core::connect_surdb(
+            &db_option.surrealdb_conn_str(),
+            &db_option.surreal_ns,
+            &db_option.project_name,
+            &db_option.surreal_user,
+            &db_option.surreal_password,
+        )
+        .await
+        {
+            Ok(_) => {
+                println!("✅ 数据库基础连接已就绪");
+            }
+            Err(e) if e.to_string().contains("Already connected") => {
+                println!("⚠️ 数据库基础连接已存在，沿用当前连接");
+            }
+            Err(e) => {
+                eprintln!("⚠️ 数据库基础连接失败，后续将继续后台重试: {}", e);
+            }
         }
     }
+    if let Err(e) =
+        aios_core::use_ns_db_compat(&aios_core::SUL_DB, &db_option.surreal_ns, &db_option.project_name)
+            .await
+    {
+        eprintln!("⚠️ 数据库命名空间切换失败，后续将继续后台重试: {}", e);
+    }
+    let config_name_for_init = config_name.clone();
+    tokio::spawn(async move {
+        match aios_core::initialize_databases(db_option).await {
+            Ok(_) => {
+                println!("✅ 数据库连接初始化成功");
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                eprintln!("❌ 数据库初始化失败: {}", error_msg);
+                eprintln!("💡 请确保:");
+                eprintln!("   1. {}.toml 文件在当前目录", config_name_for_init);
+                eprintln!("   2. SurrealDB 服务运行在配置的端口 (默认 8020)");
+                eprintln!("   3. 配置文件中的连接信息正确");
+                eprintln!("   配置信息: {}", db_option.connection_summary());
+                // 不直接返回错误，允许 web-server 继续启动（某些功能可能不需要数据库）
+                eprintln!("⚠️ 警告: 数据库连接失败，某些功能可能不可用");
+            }
+        }
+    });
+    println!("🛰️ 数据库初始化已转为后台执行，Web 服务优先开始监听");
 
-    // 初始化 SurrealDB 中的 projects 表（若已存在忽略错误）
-    crate::web_server::handlers::ensure_projects_schema().await;
-    // 初始化中心站点注册表（SQLite）
-    crate::web_server::handlers::ensure_deployment_sites_schema().await;
-    if let Err(err) = crate::web_server::managed_project_sites::ensure_schema() {
-        eprintln!("⚠️ 初始化管理员站点表失败: {}", err);
-    }
+    // 不让启动期的项目/站点建表阻塞主服务监听；
+    // 这些表初始化异常或卡住时，应降级为后台任务，避免 /api 与 /files 整体 502。
+    tokio::spawn(async move {
+        crate::web_server::handlers::ensure_projects_schema().await;
+        crate::web_server::handlers::ensure_deployment_sites_schema().await;
+        if let Err(err) = crate::web_server::managed_project_sites::ensure_schema() {
+            eprintln!("⚠️ 初始化管理员站点表失败: {}", err);
+        }
+    });
 
     // 确保 Scene Tree 已初始化
     println!("🌳 检查 Scene Tree 初始化状态...");
@@ -308,13 +341,17 @@ pub async fn start_web_server_with_config(
     };
     let upload_routes = create_upload_routes(upload_state);
 
-    let admin_api_routes = Router::<AppState>::new()
+    let admin_stateless_routes: Router<AppState> = Router::new()
         .merge(admin_handlers::create_admin_routes())
-        .merge(admin_registry_handlers::create_admin_registry_routes())
         .merge(admin_task_handlers::create_admin_task_routes())
         .route_layer(middleware::from_fn(
             admin_auth_handlers::admin_session_middleware,
         ))
+        .with_state(());
+
+    let admin_api_routes = Router::<AppState>::new()
+        .merge(admin_stateless_routes)
+        .merge(admin_registry_handlers::create_admin_registry_routes())
         .with_state(app_state.clone());
 
     let app = Router::new()
@@ -777,10 +814,7 @@ pub async fn start_web_server_with_config(
             get(handlers::api_export_deployment_site_config),
         )
         // 部署站点管理页面
-        .route(
-            "/deployment-sites",
-            get(admin_registry_redirect),
-        )
+        .route("/deployment-sites", get(admin_registry_redirect))
         // 数据解析向导API
         .route(
             "/api/wizard/scan-directory",

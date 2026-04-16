@@ -13,8 +13,8 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 use tracing::{info, warn};
 
@@ -884,7 +884,8 @@ async fn lookup_task_record_context(id: &str) -> Option<TaskRecordContext> {
     let rows: Vec<TaskContextRow> = resp.take(0).unwrap_or_default();
     let row = rows.into_iter().next()?;
     let form_id = normalize_optional_string(row.form_id)?;
-    let current_node = normalize_optional_string(row.current_node).unwrap_or_else(default_current_node);
+    let current_node =
+        normalize_optional_string(row.current_node).unwrap_or_else(default_current_node);
     Some(TaskRecordContext {
         form_id,
         current_node,
@@ -911,19 +912,13 @@ fn json_scalar_to_string(value: &Value) -> String {
 fn json_value_sort_key(value: &Value) -> String {
     match value {
         Value::Object(map) => {
-            let id = map
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let id = map.get("id").and_then(Value::as_str).unwrap_or_default();
             let created_at = map
                 .get("createdAt")
                 .or_else(|| map.get("created_at"))
                 .map(json_scalar_to_string)
                 .unwrap_or_default();
-            let kind = map
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let kind = map.get("kind").and_then(Value::as_str).unwrap_or_default();
             format!("{}|{}|{}|{}", id, created_at, kind, value)
         }
         _ => value.to_string(),
@@ -1001,7 +996,9 @@ fn build_confirmed_record_snapshot_hash(
 }
 
 async fn lookup_task_form_id(id: &str) -> Option<String> {
-    lookup_task_record_context(id).await.map(|context| context.form_id)
+    lookup_task_record_context(id)
+        .await
+        .map(|context| context.form_id)
 }
 
 // ============================================================================

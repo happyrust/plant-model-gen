@@ -28,6 +28,8 @@ const form = ref<CreateManagedSiteRequest>({
   db_port: 8020,
   web_port: 8080,
   bind_host: '0.0.0.0',
+  public_base_url: '',
+  associated_project: '',
   db_user: 'root',
   db_password: 'root',
 })
@@ -52,6 +54,8 @@ watch(() => props.open, async (open) => {
         db_port: s.db_port,
         web_port: s.web_port,
         bind_host: s.bind_host || '0.0.0.0',
+        public_base_url: s.public_base_url || '',
+        associated_project: s.associated_project || '',
       }
       manualDbNumsStr.value = s.manual_db_nums.join(', ')
     } catch (e) {
@@ -67,6 +71,8 @@ watch(() => props.open, async (open) => {
       db_port: 8020,
       web_port: 8080,
       bind_host: '0.0.0.0',
+      public_base_url: '',
+      associated_project: '',
       db_user: 'root',
       db_password: 'root',
     }
@@ -159,6 +165,18 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
                 <label class="text-sm font-medium">Web 端口 *</label>
                 <input v-model.number="form.web_port" type="number" required min="1" max="65535" :class="inputClass" />
               </div>
+            </div>
+
+            <div class="space-y-2">
+              <label class="text-sm font-medium">对外访问地址 <span class="text-muted-foreground">(可选)</span></label>
+              <input v-model="form.public_base_url" type="text" placeholder="http://example.com:3100" :class="inputClass" />
+              <p class="text-xs text-muted-foreground">反代或外网访问地址，不填则默认使用本机地址</p>
+            </div>
+
+            <div class="space-y-2">
+              <label class="text-sm font-medium">关联工程 <span class="text-muted-foreground">(可选)</span></label>
+              <input v-model="form.associated_project" type="text" :placeholder="form.project_name || '默认使用项目名称'" :class="inputClass" />
+              <p class="text-xs text-muted-foreground">打开 Viewer 时自动切换到的工程名，不填则使用项目名称</p>
             </div>
 
             <div class="space-y-2">

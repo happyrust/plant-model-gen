@@ -13,6 +13,15 @@ export type ManagedSiteParseStatus =
   | 'Parsed'
   | 'Failed'
 
+export type ManagedSiteRiskLevel = 'normal' | 'warning' | 'critical'
+export type ManagedSiteParseHealthStatus = ManagedSiteRiskLevel | 'unknown'
+
+export interface ManagedSiteParseHealth {
+  status: ManagedSiteParseHealthStatus
+  label: string
+  detail: string | null
+}
+
 export interface ManagedProjectSite {
   site_id: string
   project_name: string
@@ -25,6 +34,8 @@ export interface ManagedProjectSite {
   db_port: number
   web_port: number
   bind_host: string
+  public_base_url?: string | null
+  associated_project?: string | null
   db_pid: number | null
   web_pid: number | null
   parse_pid: number | null
@@ -32,8 +43,35 @@ export interface ManagedProjectSite {
   parse_status: ManagedSiteParseStatus
   last_error: string | null
   entry_url: string | null
+  local_entry_url?: string | null
+  public_entry_url?: string | null
+  last_parse_started_at?: string | null
+  last_parse_finished_at?: string | null
+  last_parse_duration_ms?: number | null
+  risk_level: ManagedSiteRiskLevel
+  risk_reasons: string[]
   created_at: string
   updated_at: string
+}
+
+export interface ManagedSiteProcessResource {
+  pid: number | null
+  running: boolean
+  cpu_usage: number | null
+  memory_bytes: number | null
+}
+
+export interface ManagedSiteResourceMetrics {
+  db_process: ManagedSiteProcessResource
+  web_process: ManagedSiteProcessResource
+  parse_process: ManagedSiteProcessResource
+  runtime_dir_size_bytes: number
+  data_dir_size_bytes: number
+  runtime_dir_missing: boolean
+  data_dir_missing: boolean
+  last_parse_started_at: string | null
+  last_parse_finished_at: string | null
+  last_parse_duration_ms: number | null
 }
 
 export interface ManagedSiteRuntimeStatus {
@@ -52,6 +90,12 @@ export interface ManagedSiteRuntimeStatus {
   db_port: number
   web_port: number
   entry_url: string | null
+  local_entry_url?: string | null
+  public_entry_url?: string | null
+  db_port_conflict?: boolean
+  web_port_conflict?: boolean
+  db_conflict_pids?: number[]
+  web_conflict_pids?: number[]
   last_error: string | null
   active_log_kind: string | null
   last_log_at: string | null
@@ -60,6 +104,22 @@ export interface ManagedSiteRuntimeStatus {
   last_key_log: string | null
   last_key_log_source: string | null
   recent_activity: ManagedSiteActivitySummary | null
+  resources: ManagedSiteResourceMetrics | null
+  risk_level: ManagedSiteRiskLevel
+  warnings: string[]
+  parse_health: ManagedSiteParseHealth
+}
+
+export interface AdminResourceSummary {
+  cpu_usage: number | null
+  memory_usage: number | null
+  disk_usage: number | null
+  admin_runtime_size_bytes: number
+  managed_data_size_bytes: number
+  risk_level: ManagedSiteRiskLevel
+  warnings: string[]
+  updated_at: string
+  message: string | null
 }
 
 export interface ManagedSiteActivitySummary {
@@ -97,6 +157,8 @@ export interface CreateManagedSiteRequest {
   db_port: number
   web_port: number
   bind_host?: string
+  public_base_url?: string
+  associated_project?: string
   db_user?: string
   db_password?: string
 }
@@ -109,6 +171,8 @@ export interface UpdateManagedSiteRequest {
   db_port?: number
   web_port?: number
   bind_host?: string
+  public_base_url?: string
+  associated_project?: string
   db_user?: string
   db_password?: string
 }

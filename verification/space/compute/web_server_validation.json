@@ -1,0 +1,173 @@
+{
+  "description": "RUS-233 支架空间计算 web_server JSON 回归基线（RUS-229 / RUS-230 / RUS-231 / RUS-232）",
+  "test_cases": [
+    {
+      "case_id": "rus-231-fitting-24383-89904",
+      "issue": "RUS-231",
+      "description": "支吊架 24383/89904 应命中对应预埋板 1RS02TT0265P(25688/47628)",
+      "endpoint": "/api/space/fitting",
+      "request": {
+        "suppo_refno": "24383/89904"
+      },
+      "expect": {
+        "status": "success",
+        "data_null": false,
+        "equals": {
+          "data.panel_refno": "25688/47628",
+          "data.fitting": "1RS02TT0265P",
+          "data.match_method": "direct_contact",
+          "data.covered": true
+        },
+        "approx": {
+          "data.coverage_ratio": {
+            "value": 1.0,
+            "tolerance": 0.000001
+          }
+        }
+      }
+    },
+    {
+      "case_id": "rus-230-fitting-offset-24383-88342",
+      "issue": "RUS-230",
+      "description": "支架与预埋板相对定位应返回 issue 样例中的偏移向量",
+      "endpoint": "/api/space/fitting-offset",
+      "request": {
+        "suppo_refno": "24383/88342"
+      },
+      "expect": {
+        "status": "success",
+        "data_null": false,
+        "equals": {
+          "data.anchor_kind": "S2"
+        },
+        "approx": {
+          "data.vector.dx": {
+            "value": 501.0625,
+            "tolerance": 0.01
+          },
+          "data.vector.dy": {
+            "value": -174.7295,
+            "tolerance": 0.01
+          },
+          "data.vector.dz": {
+            "value": 122.0,
+            "tolerance": 0.000001
+          }
+        },
+        "gt": {
+          "data.length": 0.0
+        }
+      }
+    },
+    {
+      "case_id": "rus-230-fitting-offset-no-panel-17496-172026",
+      "issue": "RUS-230",
+      "description": "无对应预埋板时应返回 success + data=null，而不是错误偏移值",
+      "endpoint": "/api/space/fitting-offset",
+      "request": {
+        "suppo_refno": "17496/172026"
+      },
+      "expect": {
+        "status": "success",
+        "message": "no panel matched",
+        "data_null": true
+      }
+    },
+    {
+      "case_id": "rus-229-wall-distance-s2-24383-88342",
+      "issue": "RUS-229",
+      "description": "S2 近墙样例应返回 S2 anchor 和最近 GWALL",
+      "endpoint": "/api/space/wall-distance",
+      "request": {
+        "suppo_refno": "24383/88342",
+        "suppo_type": "S2",
+        "search_radius": 5000
+      },
+      "expect": {
+        "status": "success",
+        "data_null": false,
+        "equals": {
+          "data.anchor_kind": "S2",
+          "data.target.noun": "GWALL",
+          "data.target.refno": "17496/118997"
+        },
+        "gt": {
+          "data.target.distance_mm": 0.0
+        }
+      }
+    },
+    {
+      "case_id": "rus-229-wall-distance-s1-15207-2636",
+      "issue": "RUS-229",
+      "description": "S1 样例应返回 S1 anchor，并能给出最近墙/定位块结果",
+      "endpoint": "/api/space/wall-distance",
+      "request": {
+        "suppo_refno": "15207/2636",
+        "suppo_type": "S1",
+        "search_radius": 5000
+      },
+      "expect": {
+        "status": "success",
+        "data_null": false,
+        "equals": {
+          "data.anchor_kind": "S1"
+        },
+        "gt": {
+          "data.target.distance_mm": 0.0
+        }
+      }
+    },
+    {
+      "case_id": "rus-232-tray-span-24383-87412-baseline",
+      "issue": "RUS-232",
+      "description": "当前已稳定的托盘跨度基线：24383/87412 应返回同一 BRAN 下左右支架",
+      "endpoint": "/api/space/tray-span",
+      "request": {
+        "suppo_refno": "24383/87412",
+        "neighbor_window": 5000
+      },
+      "expect": {
+        "status": "success",
+        "data_null": false,
+        "equals": {
+          "data.bran_refno": "24383/100128",
+          "data.left_suppo_refno": "24383/87389",
+          "data.right_suppo_refno": "24383/87433"
+        },
+        "gt": {
+          "data.left_distance": 0.0,
+          "data.right_distance": 0.0
+        }
+      }
+    },
+    {
+      "case_id": "rus-232-tray-span-24383-86525-issue-target",
+      "issue": "RUS-232",
+      "description": "issue 样例要求 24383/86525 返回 [1100.0, 1600.0]；当前先保留为已知差距 case",
+      "endpoint": "/api/space/tray-span",
+      "request": {
+        "suppo_refno": "24383/86525",
+        "neighbor_window": 5000
+      },
+      "expected_failure": true,
+      "expected_failure_reason": "当前响应仍是 no tray matched，尚未满足 issue 样例 [1100.0, 1600.0]",
+      "expect": {
+        "status": "success",
+        "data_null": false,
+        "approx": {
+          "data.left_distance": {
+            "value": 1100.0,
+            "tolerance": 0.01
+          },
+          "data.right_distance": {
+            "value": 1600.0,
+            "tolerance": 0.01
+          }
+        },
+        "gt": {
+          "data.neighbor_window": 0.0
+        }
+      }
+    }
+  ]
+}

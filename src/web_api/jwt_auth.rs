@@ -3,18 +3,18 @@
 //! Provides JWT token generation, verification, and decoding for API authentication.
 
 use axum::{
+    Router,
     extract::{Json, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::IntoResponse,
     routing::post,
-    Router,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 #[cfg(feature = "web_server")]
 use jsonwebtoken::{
-    decode, encode, Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation,
+    Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation, decode, encode,
 };
 
 // ============================================================================
@@ -550,7 +550,7 @@ pub fn require_roles(
             + Send,
     >,
 > + Clone
-       + Send {
++ Send {
     move |request: Request, next: Next| {
         Box::pin(async move {
             // 从 extensions 获取 claims
@@ -792,10 +792,10 @@ async fn verify_token_handler(Json(request): Json<VerifyRequest>) -> impl IntoRe
 mod tests {
     use super::*;
     use axum::{
+        Extension, Json, Router,
         http::{Request, StatusCode},
         middleware,
         routing::get,
-        Extension, Json, Router,
     };
     use tower::ServiceExt;
 
@@ -818,8 +818,7 @@ mod tests {
 
     #[test]
     fn test_create_and_verify_token() {
-        let (token, _exp) =
-            create_token("2410", "kangwp", None, None, None).unwrap();
+        let (token, _exp) = create_token("2410", "kangwp", None, None, None).unwrap();
         assert!(!token.is_empty());
 
         let claims = verify_token(&token).unwrap();
@@ -839,7 +838,7 @@ mod tests {
             Some("pz"),
             None,
         )
-      .unwrap();
+        .unwrap();
         assert!(!token.is_empty());
 
         let claims = verify_token(&token).unwrap();
@@ -853,17 +852,20 @@ mod tests {
     /// 签发后的 JWT **原始 payload** 不得出现 `form_id`（单据维度只走 URL/query，与 PMS 对齐）。
     #[test]
     fn test_jwt_payload_json_has_no_form_id_key() {
-        use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
         use base64::Engine;
+        use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 
-        let (token, _) = create_token("proj-a", "user-b", Some("N"), Some("sj"), Some("manual")).unwrap();
+        let (token, _) =
+            create_token("proj-a", "user-b", Some("N"), Some("sj"), Some("manual")).unwrap();
         let b64 = token.split('.').nth(1).expect("jwt payload segment");
         let json_bytes = URL_SAFE_NO_PAD.decode(b64).unwrap_or_else(|_| {
             let mut padded = b64.to_string();
             while padded.len() % 4 != 0 {
                 padded.push('=');
             }
-            URL_SAFE.decode(padded.as_bytes()).expect("jwt payload base64url")
+            URL_SAFE
+                .decode(padded.as_bytes())
+                .expect("jwt payload base64url")
         });
         let v: serde_json::Value = serde_json::from_slice(&json_bytes).expect("jwt payload json");
         let obj = v.as_object().expect("claims object");
@@ -894,8 +896,7 @@ mod tests {
 
     #[test]
     fn test_decode_token_unsafe() {
-        let (token, _exp) =
-            create_token("2410", "kangwp", None, None, None).unwrap();
+        let (token, _exp) = create_token("2410", "kangwp", None, None, None).unwrap();
 
         let claims = decode_token_unsafe(&token).unwrap();
         assert_eq!(claims.project_id, "2410");
@@ -1011,15 +1012,9 @@ mod tests {
                         AUTHORIZATION,
                         format!(
                             "Bearer {}",
-                            create_token(
-                                "1516",
-                                "user-002",
-                                Some("李校对"),
-                                Some("jd"),
-                                None
-                            )
-                            .unwrap()
-                            .0
+                            create_token("1516", "user-002", Some("李校对"), Some("jd"), None)
+                                .unwrap()
+                                .0
                         ),
                     )
                     .body(axum::body::Body::empty())
@@ -1043,14 +1038,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_token_handler_ignores_form_id_hint_mismatch() {
         let app = create_jwt_auth_routes();
-        let (token, _) = create_token(
-            "project-1",
-            "user-1",
-            None,
-            Some("sj"),
-            None,
-        )
-        .unwrap();
+        let (token, _) = create_token("project-1", "user-1", None, Some("sj"), None).unwrap();
 
         let response = app
             .oneshot(
@@ -1078,20 +1066,16 @@ mod tests {
 
         assert_eq!(payload.code, 0);
         assert_eq!(payload.data.as_ref().map(|data| data.valid), Some(true));
-        assert_eq!(payload.data.as_ref().and_then(|data| data.error.as_deref()), None);
+        assert_eq!(
+            payload.data.as_ref().and_then(|data| data.error.as_deref()),
+            None
+        );
     }
 
     #[tokio::test]
     async fn test_verify_token_handler_accepts_matching_form_id() {
         let app = create_jwt_auth_routes();
-        let (token, _) = create_token(
-            "project-1",
-            "user-1",
-            None,
-            Some("sj"),
-            None,
-        )
-        .unwrap();
+        let (token, _) = create_token("project-1", "user-1", None, Some("sj"), None).unwrap();
 
         let response = app
             .oneshot(

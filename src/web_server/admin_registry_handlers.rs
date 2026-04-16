@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::web_server::{
-    AppState, handlers,
+    AppState, admin_task_handlers, handlers,
     models::{
         DatabaseConfig, DeploymentSiteCreateRequest, DeploymentSiteImportRequest,
         DeploymentSiteQuery, DeploymentSiteTaskRequest, DeploymentSiteUpdateRequest,
+        TaskInfo,
     },
 };
 
@@ -32,7 +33,10 @@ pub struct AdminRegistryTaskRequest {
 
 pub fn create_admin_registry_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/admin/registry/sites", get(list_sites).post(create_site))
+        .route(
+            "/api/admin/registry/sites",
+            get(list_sites).post(create_site),
+        )
         .route(
             "/api/admin/registry/sites/{id}",
             get(get_site).put(update_site).delete(delete_site),
@@ -127,18 +131,49 @@ async fn create_site_task(
     Path(site_id): Path<String>,
     Json(payload): Json<AdminRegistryTaskRequest>,
 ) -> impl IntoResponse {
+    let task_type = payload
+        .task_type
+        .unwrap_or(crate::web_server::models::TaskType::ParsePdmsData);
     let request = DeploymentSiteTaskRequest {
-        site_id,
-        task_type: payload
-            .task_type
-            .unwrap_or(crate::web_server::models::TaskType::ParsePdmsData),
-        task_name: payload.task_name,
-        priority: payload.priority,
-        config_override: payload.config_override,
+        site_id: site_id.clone(),
+        task_type: task_type.clone(),
+        task_name: payload.task_name.clone(),
+        priority: payload.priority.clone(),
+        config_override: payload.config_override.clone(),
     };
 
     match handlers::api_create_deployment_site_task(State(state), Json(request)).await {
-        Ok(Json(value)) => ok("创建注册表任务成功", sanitize_task_response(value)),
+        Ok(Json(value)) => {
+            let site_label = value
+                .get("site_label")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let task_id = value
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let task_name = payload
+                .task_name
+                .clone()
+                .unwrap_or_else(|| format!("registry-{:?}", task_type));
+            let config = payload
+                .config_override
+                .unwrap_or_default();
+            let mut unified_task = TaskInfo::new_with_priority(
+                task_name,
+                task_type,
+                config,
+                payload.priority.unwrap_or_default(),
+            );
+            if let Some(tid) = &task_id {
+                unified_task.id = tid.clone();
+            }
+            unified_task.site_id = Some(site_id);
+            unified_task.site_label = site_label;
+            admin_task_handlers::insert_task(unified_task);
+
+            ok("创建注册表任务成功", sanitize_task_response(value))
+        }
         Err((status, Json(value))) => proxy_error(status, value, "创建注册表任务失败"),
     }
 }

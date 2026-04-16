@@ -66,7 +66,8 @@ pub async fn run_init_project_mode(
     println!(
         "🌲 第 1 步：生成 scene_tree（DESI indextree：output/<项目>/scene_tree/*.tree + db_meta_info.json）"
     );
-    generate_desi_indextree(ignore_manual_dbnums).context("scene_tree / DESI indextree 生成失败")?;
+    generate_desi_indextree(ignore_manual_dbnums)
+        .context("scene_tree / DESI indextree 生成失败")?;
 
     println!("🔌 第 2 步：连接 SurrealDB 并从磁盘加载 db_meta（校验 scene_tree 元数据）");
     aios_core::init_surreal()

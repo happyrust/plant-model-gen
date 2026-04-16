@@ -134,7 +134,9 @@ pub fn export_rvm_semantic_debug(
             duplicate_component_ids += 1;
         }
 
-        let owner_refno = row.parent_refno.map(|owner| RefnoEnum::Refno(owner).to_string());
+        let owner_refno = row
+            .parent_refno
+            .map(|owner| RefnoEnum::Refno(owner).to_string());
         let owner_noun = row
             .parent_refno
             .and_then(|owner| component_by_refno.get(&RefnoEnum::Refno(owner)))
@@ -205,16 +207,22 @@ pub fn export_rvm_semantic_debug(
 
     fs::create_dir_all(output_dir)
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
-    let slug = root_refno_string.replace(['/', '\\'], "_").replace(' ', "_");
+    let slug = root_refno_string
+        .replace(['/', '\\'], "_")
+        .replace(' ', "_");
     let output_filename = format!("rvm_semantic_debug_root_{slug}.json");
     let output_path = output_dir.join(&output_filename);
-    let payload = serde_json::to_string_pretty(&artifact).context("序列化 semantic debug JSON 失败")?;
+    let payload =
+        serde_json::to_string_pretty(&artifact).context("序列化 semantic debug JSON 失败")?;
     fs::write(&output_path, payload)
         .with_context(|| format!("写入 semantic debug 文件失败: {}", output_path.display()))?;
 
     if verbose {
         println!("✅ 写入 semantic debug: {}", output_path.display());
-        println!("   - scoped components: {}", artifact.summary.component_count);
+        println!(
+            "   - scoped components: {}",
+            artifact.summary.component_count
+        );
         println!(
             "   - unique geo hashes: {}",
             artifact.summary.unique_geometry_hash_count
@@ -287,13 +295,14 @@ fn build_geo_relate_map(geo_relates: Vec<(u64, u64)>) -> HashMap<u64, Vec<u64>> 
 fn build_inst_geo_map(inst_geos: Vec<InstGeoRecord>) -> HashMap<u64, GeometryBlob> {
     let mut map = HashMap::new();
     for row in inst_geos {
-        let parsed = serde_json::from_slice::<GeometryBlob>(&row.geometry).unwrap_or(GeometryBlob {
-            group_path: None,
-            geometry_index: None,
-            kind: None,
-            geo_type: None,
-            bbox_world: None,
-        });
+        let parsed =
+            serde_json::from_slice::<GeometryBlob>(&row.geometry).unwrap_or(GeometryBlob {
+                group_path: None,
+                geometry_index: None,
+                kind: None,
+                geo_type: None,
+                bbox_world: None,
+            });
         map.insert(row.hash, parsed);
     }
     map
@@ -320,11 +329,11 @@ impl RelationStoreReader for ModelRelationStore {
             Ok(ComponentRow {
                 refno: RefnoEnum::from(refno_raw.as_str()),
                 inst_id: row.get(1)?,
-                parent_refno: parent_raw
-                    .as_deref()
-                    .and_then(parse_refu64),
+                parent_refno: parent_raw.as_deref().and_then(parse_refu64),
                 noun: row.get(3)?,
-                name: row.get::<_, Option<String>>(4)?.and_then(normalize_optional_string),
+                name: row
+                    .get::<_, Option<String>>(4)?
+                    .and_then(normalize_optional_string),
             })
         })?;
 
@@ -336,7 +345,8 @@ impl RelationStoreReader for ModelRelationStore {
         let db_path = relation_db_path(self, dbnum);
         let conn = rusqlite::Connection::open(&db_path)
             .with_context(|| format!("打开关系库失败: {}", db_path.display()))?;
-        let mut stmt = conn.prepare("SELECT inst_id, geo_hash FROM geo_relate ORDER BY inst_id, geo_hash")?;
+        let mut stmt =
+            conn.prepare("SELECT inst_id, geo_hash FROM geo_relate ORDER BY inst_id, geo_hash")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)

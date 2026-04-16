@@ -3466,8 +3466,13 @@ pub fn export_rvm_semantic_debug_mode(
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("output/model_relations"));
 
-    let stats =
-        export_rvm_semantic_debug(dbnum, &relation_store_root, &output_dir, root_refno, verbose)?;
+    let stats = export_rvm_semantic_debug(
+        dbnum,
+        &relation_store_root,
+        &output_dir,
+        root_refno,
+        verbose,
+    )?;
 
     println!("\n🎉 RVM semantic debug 导出完成！");
     println!("📊 统计信息:");

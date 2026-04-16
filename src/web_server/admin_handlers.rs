@@ -12,13 +12,14 @@ use crate::web_server::{
     admin_response::{self, ApiResponse},
     managed_project_sites as managed_sites,
     models::{
-        CreateManagedSiteRequest, ManagedSiteLogsResponse, ManagedSiteRuntimeStatus,
-        UpdateManagedSiteRequest,
+        AdminResourceSummary, CreateManagedSiteRequest, ManagedSiteLogsResponse,
+        ManagedSiteRuntimeStatus, UpdateManagedSiteRequest,
     },
 };
 
 pub fn create_admin_routes() -> Router {
     Router::new()
+        .route("/api/admin/resources/summary", get(get_resource_summary))
         .route("/api/admin/sites", get(list_sites).post(create_site))
         .route(
             "/api/admin/sites/{id}",
@@ -37,6 +38,15 @@ pub async fn list_sites() -> impl IntoResponse {
         Ok(sites) => admin_response::ok("获取站点列表成功", sites),
         Err(err) => admin_response::managed_error(err.to_string()),
     }
+}
+
+pub async fn get_resource_summary() -> impl IntoResponse {
+    let summary = managed_sites::resource_summary().unwrap_or_else(|err| AdminResourceSummary {
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        message: Some(err.to_string()),
+        ..AdminResourceSummary::default()
+    });
+    admin_response::ok("获取资源摘要成功", summary)
 }
 
 pub async fn create_site(Json(payload): Json<CreateManagedSiteRequest>) -> impl IntoResponse {
@@ -102,7 +112,13 @@ pub async fn start_site(Path(site_id): Path<String>) -> impl IntoResponse {
 
 pub async fn stop_site(Path(site_id): Path<String>) -> impl IntoResponse {
     match managed_sites::stop_site(&site_id).await {
-        Ok(site) => admin_response::ok("停止站点成功", site),
+        Ok(result) if result.conflict => admin_response::conflict(
+            format!(
+                "受管进程已停止，但端口仍被外部进程占用: web={:?} db={:?}",
+                result.web_conflict_pids, result.db_conflict_pids
+            ),
+        ),
+        Ok(result) => admin_response::ok("停止站点成功", result.site),
         Err(err) => admin_response::managed_error(err.to_string()),
     }
 }

@@ -7,7 +7,7 @@ use axum::{
 use rusqlite::{OptionalExtension, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{convert::TryFrom, io::ErrorKind, path::PathBuf};
+use std::{convert::TryFrom, io::ErrorKind, path::PathBuf, time::Instant};
 use tokio::time::{Duration, timeout};
 use tokio::{fs, net::TcpStream};
 use uuid::Uuid;
@@ -501,16 +501,49 @@ pub async fn delete_site(
 // ===== 应用到运行时（写入 DbOption.toml） =====
 
 pub async fn apply_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let conn = open_sqlite().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut stmt = conn
+    let conn = match open_sqlite() {
+        Ok(conn) => conn,
+        Err(e) => {
+            return Ok(action_failed(
+                format!("打开协同组存储失败: {}", e),
+                serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
+            ));
+        }
+    };
+    let mut stmt = match conn
         .prepare("SELECT name, mqtt_host, mqtt_port, file_server_host, location, location_dbs FROM remote_sync_envs WHERE id = ?1 LIMIT 1")
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut rows = stmt
-        .query(rusqlite::params![id])
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            return Ok(action_failed(
+                format!("读取协同组失败: {}", e),
+                serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
+            ));
+        }
+    };
+    let mut rows = match stmt.query(rusqlite::params![id.clone()]) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return Ok(action_failed(
+                format!("查询协同组失败: {}", e),
+                serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
+            ));
+        }
+    };
     let row = match rows.next() {
         Ok(Some(r)) => r,
-        _ => return Err(StatusCode::NOT_FOUND),
+        Ok(None) => {
+            return Ok(action_failed(
+                "协同组不存在",
+                serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
+            ));
+        }
+        Err(e) => {
+            return Ok(action_failed(
+                format!("读取协同组失败: {}", e),
+                serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
+            ));
+        }
     };
 
     let mqtt_host: Option<String> = row.get(1).ok();
@@ -524,14 +557,21 @@ pub async fn apply_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>
     let cfg_file = format!("{}.toml", cfg_name);
     let path = std::path::Path::new(&cfg_file);
     if !path.exists() {
-        return Ok(Json(json!({
-            "status":"warning",
-            "message":format!("{} 不存在，已跳过写入。请手动创建或在工程配置页生成。", cfg_file),
-        })));
+        return Ok(action_failed(
+            format!("{} 不存在，无法写入当前配置。", cfg_file),
+            serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
+        ));
     }
 
-    let mut content =
-        std::fs::read_to_string(path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) => {
+            return Ok(action_failed(
+                format!("读取当前配置失败: {}", e),
+                serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
+            ));
+        }
+    };
 
     // 替换/插入字符串键
     fn set_str(content: &mut String, key: &str, val: &str) {
@@ -606,169 +646,365 @@ pub async fn apply_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>
         }
     }
 
-    std::fs::write(path, content).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Err(e) = std::fs::write(path, content) {
+        return Ok(action_failed(
+            format!("写入当前配置失败: {}", e),
+            serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
+        ));
+    }
 
-    Ok(Json(json!({
-        "status":"success",
-        "message":"已写入配置文件。部分运行期组件需重启或重新加载配置后生效。",
-        "hint":"如需启用 watcher/MQTT，请在配置中打开 sync_live 或重启 CLI 任务。"
-    })))
+    Ok(action_success(
+        "已写入配置文件。部分运行期组件需重启或重新加载配置后生效。",
+        serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
+    ))
 }
 
 /// 激活环境（即时生效）：写入 DbOption.toml 并在 WebUI 进程内重启 watcher + MQTT
 pub async fn activate_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>, StatusCode> {
     // 先复用 apply_env 的写入逻辑
-    let _ = apply_env(Path(id.clone())).await?;
+    let _ = match apply_env(Path(id.clone())).await {
+        Ok(response) => response,
+        Err(status) => {
+            return Ok(action_failed(
+                format!("写入当前配置失败: {}", status),
+                serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
+            ));
+        }
+    };
 
     // 停止当前运行态
     crate::web_server::remote_runtime::stop_runtime().await;
     // 启动新的运行态（使用最新 DbOption）
     match crate::web_server::remote_runtime::start_runtime(id.clone()).await {
-        Ok(_) => Ok(Json(json!({
-            "status":"success",
-            "message":"已写入配置文件并启动 watcher + MQTT 订阅。",
-            "env_id": id,
-        }))),
-        Err(e) => Ok(Json(json!({
-            "status":"error",
-            "message": format!("启动运行态失败: {}", e),
-        }))),
+        Ok(_) => Ok(action_success(
+            "已写入配置文件并启动 watcher + MQTT 订阅。",
+            serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
+        )),
+        Err(e) => Ok(action_failed(
+            format!("启动运行态失败: {}", e),
+            serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
+        )),
     }
 }
 
 /// 停止运行时（终止 watcher + MQTT）
 pub async fn stop_runtime() -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::remote_runtime::REMOTE_RUNTIME;
+    let current_env_id = REMOTE_RUNTIME
+        .read()
+        .await
+        .as_ref()
+        .map(|state| state.env_id.clone());
     crate::web_server::remote_runtime::stop_runtime().await;
-    Ok(Json(
-        json!({"status":"success","message":"已停止运行时 watcher + MQTT"}),
+    Ok(action_success(
+        "已停止运行时 watcher + MQTT",
+        serde_json::Map::from_iter([("env_id".to_string(), json!(current_env_id))]),
     ))
+}
+
+fn checked_at_now() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn action_response(
+    status: &str,
+    message: impl Into<String>,
+    extras: serde_json::Map<String, serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let mut payload = serde_json::Map::from_iter([
+        ("status".to_string(), json!(status)),
+        ("message".to_string(), json!(message.into())),
+    ]);
+    payload.extend(extras);
+    Json(serde_json::Value::Object(payload))
+}
+
+fn action_success(
+    message: impl Into<String>,
+    extras: serde_json::Map<String, serde_json::Value>,
+) -> Json<serde_json::Value> {
+    action_response("success", message, extras)
+}
+
+fn action_failed(
+    message: impl Into<String>,
+    extras: serde_json::Map<String, serde_json::Value>,
+) -> Json<serde_json::Value> {
+    action_response("failed", message, extras)
+}
+
+fn ok_diagnostic(
+    message: impl Into<String>,
+    extras: serde_json::Map<String, serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let mut payload = serde_json::Map::from_iter([
+        ("status".to_string(), json!("success")),
+        ("message".to_string(), json!(message.into())),
+        ("checked_at".to_string(), json!(checked_at_now())),
+    ]);
+    payload.extend(extras);
+    Json(serde_json::Value::Object(payload))
+}
+
+fn failed_diagnostic(
+    message: impl Into<String>,
+    extras: serde_json::Map<String, serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let mut payload = serde_json::Map::from_iter([
+        ("status".to_string(), json!("failed")),
+        ("message".to_string(), json!(message.into())),
+        ("checked_at".to_string(), json!(checked_at_now())),
+    ]);
+    payload.extend(extras);
+    Json(serde_json::Value::Object(payload))
 }
 
 /// 测试环境 MQTT 连接（TCP 可达性）
 pub async fn test_mqtt_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let conn = open_sqlite().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut stmt = conn
-        .prepare("SELECT mqtt_host, mqtt_port FROM remote_sync_envs WHERE id = ?1 LIMIT 1")
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut rows = stmt
-        .query(rusqlite::params![id])
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let row = match rows.next() {
-        Ok(Some(r)) => r,
-        _ => return Err(StatusCode::NOT_FOUND),
+    let (host, port) = {
+        let conn = open_sqlite().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut stmt = conn
+            .prepare("SELECT mqtt_host, mqtt_port FROM remote_sync_envs WHERE id = ?1 LIMIT 1")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut rows = stmt
+            .query(rusqlite::params![id])
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let row = match rows.next() {
+            Ok(Some(r)) => r,
+            _ => return Err(StatusCode::NOT_FOUND),
+        };
+        let host: String = row
+            .get::<_, Option<String>>(0)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let port = row
+            .get::<_, Option<i64>>(1)
+            .ok()
+            .flatten()
+            .and_then(|v| u16::try_from(v).ok());
+        (host, port)
     };
-    let host: String = row
-        .get::<_, Option<String>>(0)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let port: u16 = row
-        .get::<_, Option<i64>>(1)
-        .ok()
-        .flatten()
-        .map(|v| v as u16)
-        .unwrap_or(1883);
     if host.is_empty() {
-        return Ok(Json(json!({"status":"error","message":"未配置 mqtt_host"})));
+        return Ok(failed_diagnostic(
+            "未配置 mqtt_host",
+            serde_json::Map::new(),
+        ));
     }
+    let Some(port) = port else {
+        return Ok(failed_diagnostic(
+            "未配置 mqtt_port",
+            serde_json::Map::new(),
+        ));
+    };
 
     let addr = format!("{}:{}", host, port);
+    let start = Instant::now();
     let result = timeout(
         Duration::from_secs(3),
         tokio::net::TcpStream::connect(&addr),
     )
     .await;
     match result {
-        Ok(Ok(_)) => Ok(Json(
-            json!({"status":"success","message":"MQTT 连接可达","addr": addr}),
+        Ok(Ok(_)) => Ok(ok_diagnostic(
+            "MQTT 连接可达",
+            serde_json::Map::from_iter([
+                ("addr".to_string(), json!(addr)),
+                (
+                    "latency_ms".to_string(),
+                    json!(start.elapsed().as_millis() as u64),
+                ),
+            ]),
         )),
-        Ok(Err(e)) => Ok(Json(
-            json!({"status":"error","message": format!("连接失败: {}", e), "addr": addr}),
+        Ok(Err(e)) => Ok(failed_diagnostic(
+            format!("连接失败: {}", e),
+            serde_json::Map::from_iter([("addr".to_string(), json!(addr))]),
         )),
-        Err(_) => Ok(Json(
-            json!({"status":"error","message":"连接超时","addr": addr}),
+        Err(_) => Ok(failed_diagnostic(
+            "连接超时",
+            serde_json::Map::from_iter([("addr".to_string(), json!(addr))]),
         )),
     }
 }
 
 /// 测试环境文件服务地址（HTTP 可达性）
 pub async fn test_http_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let conn = open_sqlite().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut stmt = conn
-        .prepare("SELECT file_server_host FROM remote_sync_envs WHERE id = ?1 LIMIT 1")
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut rows = stmt
-        .query(rusqlite::params![id])
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let row = match rows.next() {
-        Ok(Some(r)) => r,
-        _ => return Err(StatusCode::NOT_FOUND),
+    let url: String = {
+        let conn = open_sqlite().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut stmt = conn
+            .prepare("SELECT file_server_host FROM remote_sync_envs WHERE id = ?1 LIMIT 1")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut rows = stmt
+            .query(rusqlite::params![id])
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let row = match rows.next() {
+            Ok(Some(r)) => r,
+            _ => return Err(StatusCode::NOT_FOUND),
+        };
+        row.get::<_, Option<String>>(0)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
     };
-    let url: String = row
-        .get::<_, Option<String>>(0)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
     if url.is_empty() {
-        return Ok(Json(
-            json!({"status":"error","message":"未配置 file_server_host"}),
+        return Ok(failed_diagnostic(
+            "未配置 file_server_host",
+            serde_json::Map::new(),
+        ));
+    }
+
+    if site_metadata::is_local_path_hint(&url) {
+        let path = site_metadata::normalize_local_base(&url);
+        let start = Instant::now();
+        return match fs::metadata(&path).await {
+            Ok(_) => Ok(ok_diagnostic(
+                "本地文件服务目录可达",
+                serde_json::Map::from_iter([
+                    ("url".to_string(), json!(path.to_string_lossy().to_string())),
+                    (
+                        "latency_ms".to_string(),
+                        json!(start.elapsed().as_millis() as u64),
+                    ),
+                ]),
+            )),
+            Err(err) => Ok(failed_diagnostic(
+                format!("本地文件服务目录不可达: {}", err),
+                serde_json::Map::from_iter([(
+                    "url".to_string(),
+                    json!(path.to_string_lossy().to_string()),
+                )]),
+            )),
+        };
+    }
+
+    if !site_metadata::is_http_url(&url) {
+        return Ok(failed_diagnostic(
+            "file_server_host 既不是 HTTP 地址也不是本地路径",
+            serde_json::Map::from_iter([("url".to_string(), json!(url))]),
         ));
     }
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(5))
         .build()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let start = Instant::now();
     match client.get(&url).send().await {
-        Ok(resp) => Ok(Json(json!({
-            "status":"success",
-            "message":"HTTP 可达",
-            "url": url,
-            "code": resp.status().as_u16(),
-        }))),
-        Err(e) => Ok(Json(
-            json!({"status":"error","message": format!("请求失败: {}", e), "url": url}),
+        Ok(resp) => {
+            let status = resp.status();
+            let extras = serde_json::Map::from_iter([
+                ("url".to_string(), json!(url)),
+                ("code".to_string(), json!(status.as_u16())),
+                (
+                    "latency_ms".to_string(),
+                    json!(start.elapsed().as_millis() as u64),
+                ),
+            ]);
+            if status.is_success() {
+                Ok(ok_diagnostic("文件服务可达", extras))
+            } else {
+                Ok(failed_diagnostic(
+                    format!("文件服务返回异常状态: {}", status),
+                    extras,
+                ))
+            }
+        }
+        Err(e) => Ok(failed_diagnostic(
+            format!("请求失败: {}", e),
+            serde_json::Map::from_iter([("url".to_string(), json!(url))]),
         )),
     }
 }
 
-/// 测试外部站点 HTTP Host
+/// 测试外部站点 metadata.json 可达性
 pub async fn test_http_site(
     Path(site_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let conn = open_sqlite().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut stmt = conn
-        .prepare("SELECT http_host FROM remote_sync_sites WHERE id = ?1 LIMIT 1")
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut rows = stmt
-        .query(rusqlite::params![site_id])
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let row = match rows.next() {
-        Ok(Some(r)) => r,
-        _ => return Err(StatusCode::NOT_FOUND),
+    let info = load_site_info(&conn, &site_id)?;
+    drop(conn);
+
+    let url = info
+        .site_host
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            info.env_file_host
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+        });
+    let Some(url) = url else {
+        return Ok(failed_diagnostic(
+            "未配置可用的站点 HTTP 地址",
+            serde_json::Map::new(),
+        ));
     };
-    let url: String = row
-        .get::<_, Option<String>>(0)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    if url.is_empty() {
-        return Ok(Json(json!({"status":"error","message":"未配置 http_host"})));
+
+    if site_metadata::is_local_path_hint(&url) {
+        let metadata_path =
+            site_metadata::metadata_file_path(&site_metadata::normalize_local_base(&url));
+        let start = Instant::now();
+        return match fs::metadata(&metadata_path).await {
+            Ok(_) => Ok(ok_diagnostic(
+                "metadata.json 可达",
+                serde_json::Map::from_iter([
+                    (
+                        "url".to_string(),
+                        json!(metadata_path.to_string_lossy().to_string()),
+                    ),
+                    ("code".to_string(), json!(200)),
+                    (
+                        "latency_ms".to_string(),
+                        json!(start.elapsed().as_millis() as u64),
+                    ),
+                ]),
+            )),
+            Err(err) => Ok(failed_diagnostic(
+                format!("metadata.json 不可达: {}", err),
+                serde_json::Map::from_iter([(
+                    "url".to_string(),
+                    json!(metadata_path.to_string_lossy().to_string()),
+                )]),
+            )),
+        };
     }
 
+    if !site_metadata::is_http_url(&url) {
+        return Ok(failed_diagnostic(
+            "http_host 既不是 HTTP 地址也不是本地路径",
+            serde_json::Map::from_iter([("url".to_string(), json!(url))]),
+        ));
+    }
+
+    let metadata_url = site_metadata::metadata_url(&url);
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(5))
         .build()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match client.get(&url).send().await {
-        Ok(resp) => Ok(Json(json!({
-            "status":"success",
-            "message":"HTTP 可达",
-            "url": url,
-            "code": resp.status().as_u16(),
-        }))),
-        Err(e) => Ok(Json(
-            json!({"status":"error","message": format!("请求失败: {}", e), "url": url}),
+    let start = Instant::now();
+    match client.get(&metadata_url).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let extras = serde_json::Map::from_iter([
+                ("url".to_string(), json!(metadata_url)),
+                ("code".to_string(), json!(status.as_u16())),
+                (
+                    "latency_ms".to_string(),
+                    json!(start.elapsed().as_millis() as u64),
+                ),
+            ]);
+            if status.is_success() {
+                Ok(ok_diagnostic("metadata.json 可达", extras))
+            } else {
+                Ok(failed_diagnostic(
+                    format!("metadata.json 返回异常状态: {}", status),
+                    extras,
+                ))
+            }
+        }
+        Err(e) => Ok(failed_diagnostic(
+            format!("请求失败: {}", e),
+            serde_json::Map::from_iter([("url".to_string(), json!(metadata_url))]),
         )),
     }
 }
@@ -794,17 +1030,104 @@ pub async fn runtime_status() -> Result<Json<serde_json::Value>, StatusCode> {
 
 /// 运行时 DbOption 简要配置（只读）
 pub async fn runtime_config() -> Result<Json<serde_json::Value>, StatusCode> {
+    fn normalize_text(value: Option<String>) -> Option<String> {
+        value.and_then(|item| {
+            let trimmed = item.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    }
+
+    fn parse_root_value(content: &str, key: &str) -> Option<String> {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') || trimmed.starts_with('[') {
+                continue;
+            }
+            if trimmed.starts_with(key) && trimmed.contains('=') {
+                return trimmed
+                    .split_once('=')
+                    .map(|(_, value)| value.trim().to_string());
+            }
+        }
+        None
+    }
+
+    fn parse_string_value(content: &str, key: &str) -> Option<String> {
+        let raw = parse_root_value(content, key)?;
+        let trimmed = raw.trim();
+        if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+            return normalize_text(Some(trimmed[1..trimmed.len() - 1].to_string()));
+        }
+        normalize_text(Some(trimmed.to_string()))
+    }
+
+    fn parse_u16_value(content: &str, key: &str) -> Option<u16> {
+        parse_root_value(content, key)?.trim().parse::<u16>().ok()
+    }
+
+    fn parse_bool_value(content: &str, key: &str) -> Option<bool> {
+        match parse_root_value(content, key)?.trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn parse_u32_array_value(content: &str, key: &str) -> Option<Vec<u32>> {
+        let raw = parse_root_value(content, key)?;
+        let trimmed = raw.trim();
+        if !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+            return None;
+        }
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if inner.trim().is_empty() {
+            return Some(Vec::new());
+        }
+        Some(
+            inner
+                .split(',')
+                .filter_map(|item| item.trim().parse::<u32>().ok())
+                .collect(),
+        )
+    }
+
+    let cfg_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_file = format!("{}.toml", cfg_name);
+
     let opt = aios_core::get_db_option();
-    let lf: Option<Vec<u32>> = opt.location_dbs.clone();
+    let fallback_location_dbs: Vec<u32> = opt.location_dbs.clone().unwrap_or_default();
+
+    let mut mqtt_host = normalize_text(Some(opt.mqtt_host.clone()));
+    let mut mqtt_port = Some(opt.mqtt_port);
+    let mut file_server_host = normalize_text(Some(opt.file_server_host.clone()));
+    let mut location = normalize_text(Some(opt.location.clone()));
+    let mut location_dbs = fallback_location_dbs;
+    let mut sync_live = opt.sync_live.unwrap_or(false);
+
+    if let Ok(content) = std::fs::read_to_string(&cfg_file) {
+        mqtt_host = parse_string_value(&content, "mqtt_host").or(mqtt_host);
+        mqtt_port = parse_u16_value(&content, "mqtt_port").or(mqtt_port);
+        file_server_host = parse_string_value(&content, "file_server_host").or(file_server_host);
+        location = parse_string_value(&content, "location").or(location);
+        location_dbs = parse_u32_array_value(&content, "location_dbs").unwrap_or(location_dbs);
+        sync_live = parse_bool_value(&content, "sync_live").unwrap_or(sync_live);
+    }
+
     Ok(Json(json!({
         "status":"success",
+        "source": cfg_file,
         "config": {
-            "mqtt_host": opt.mqtt_host,
-            "mqtt_port": opt.mqtt_port,
-            "file_server_host": opt.file_server_host,
-            "location": opt.location,
-            "location_dbs": lf,
-            "sync_live": opt.sync_live.unwrap_or(false),
+            "mqtt_host": mqtt_host,
+            "mqtt_port": mqtt_port,
+            "file_server_host": file_server_host,
+            "location": location,
+            "location_dbs": location_dbs,
+            "sync_live": sync_live,
         }
     })))
 }
@@ -812,7 +1135,15 @@ pub async fn runtime_config() -> Result<Json<serde_json::Value>, StatusCode> {
 /// 从配置文件导入/生成一个环境
 pub async fn import_env_from_dboption() -> Result<Json<serde_json::Value>, StatusCode> {
     let opt = aios_core::get_db_option();
-    let conn = open_sqlite().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let conn = match open_sqlite() {
+        Ok(conn) => conn,
+        Err(e) => {
+            return Ok(action_failed(
+                format!("打开协同组存储失败: {}", e),
+                serde_json::Map::from_iter([("id".to_string(), serde_json::Value::Null)]),
+            ));
+        }
+    };
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let name = format!(
@@ -825,11 +1156,11 @@ pub async fn import_env_from_dboption() -> Result<Json<serde_json::Value>, Statu
             .collect::<Vec<_>>()
             .join(",")
     });
-    let _ = conn.execute(
+    if let Err(e) = conn.execute(
         "INSERT INTO remote_sync_envs (id, name, mqtt_host, mqtt_port, file_server_host, location, location_dbs, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
         rusqlite::params![
-            id,
+            id.clone(),
             name,
             opt.mqtt_host,
             (opt.mqtt_port as i64),
@@ -838,8 +1169,16 @@ pub async fn import_env_from_dboption() -> Result<Json<serde_json::Value>, Statu
             location_dbs_str,
             now,
         ],
-    );
-    Ok(Json(json!({"status":"success","id": id})))
+    ) {
+        return Ok(action_failed(
+            format!("从当前配置导入协同组失败: {}", e),
+            serde_json::Map::from_iter([("id".to_string(), json!(id))]),
+        ));
+    }
+    Ok(action_success(
+        "已从当前配置导入协同组",
+        serde_json::Map::from_iter([("id".to_string(), json!(id))]),
+    ))
 }
 
 #[derive(Debug, Deserialize)]

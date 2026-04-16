@@ -91,6 +91,7 @@ export const appRoutes: RouteRecordRaw[] = [
       navLabel: 'Sites',
       navIcon: 'deployment',
       navOrder: 40,
+      navHidden: true,
     },
   },
   {
@@ -145,6 +146,7 @@ export const appRoutes: RouteRecordRaw[] = [
       navLabel: 'Remote Sync',
       navIcon: 'remote',
       navOrder: 51,
+      navHidden: true,
     },
   },
   {

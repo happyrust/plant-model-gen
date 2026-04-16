@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 
+const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
 
@@ -13,7 +14,10 @@ const rememberMe = ref(false)
 async function handleSubmit() {
   try {
     await auth.login({ username: username.value, password: password.value })
-    router.push('/')
+    const redirect = typeof route.query.redirect === 'string' && route.query.redirect.startsWith('/')
+      ? route.query.redirect
+      : '/'
+    router.replace(redirect)
   } catch {
     // error is handled by the store
   }

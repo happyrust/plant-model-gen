@@ -73,6 +73,12 @@ pub struct TaskInfo {
     /// 元数据（用于存储额外信息，如 bundle_url）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// 关联的注册表站点 ID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_id: Option<String>,
+    /// 关联的站点显示名称
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_label: Option<String>,
 }
 
 /// 任务类型
@@ -824,6 +830,10 @@ pub struct ManagedProjectSite {
     pub db_port: u16,
     pub web_port: u16,
     pub bind_host: String,
+    #[serde(default)]
+    pub public_base_url: Option<String>,
+    #[serde(default)]
+    pub associated_project: Option<String>,
     pub db_pid: Option<u32>,
     pub web_pid: Option<u32>,
     pub parse_pid: Option<u32>,
@@ -831,6 +841,8 @@ pub struct ManagedProjectSite {
     pub parse_status: ManagedSiteParseStatus,
     pub last_error: Option<String>,
     pub entry_url: Option<String>,
+    pub local_entry_url: Option<String>,
+    pub public_entry_url: Option<String>,
     pub last_parse_started_at: Option<String>,
     pub last_parse_finished_at: Option<String>,
     pub last_parse_duration_ms: Option<u64>,
@@ -879,6 +891,10 @@ pub struct CreateManagedSiteRequest {
     #[serde(default)]
     pub bind_host: Option<String>,
     #[serde(default)]
+    pub public_base_url: Option<String>,
+    #[serde(default)]
+    pub associated_project: Option<String>,
+    #[serde(default)]
     pub db_user: Option<String>,
     #[serde(default)]
     pub db_password: Option<String>,
@@ -901,6 +917,10 @@ pub struct UpdateManagedSiteRequest {
     pub web_port: Option<u16>,
     #[serde(default)]
     pub bind_host: Option<String>,
+    #[serde(default)]
+    pub public_base_url: Option<String>,
+    #[serde(default)]
+    pub associated_project: Option<String>,
     #[serde(default)]
     pub db_user: Option<String>,
     #[serde(default)]
@@ -925,6 +945,16 @@ pub struct ManagedSiteRuntimeStatus {
     pub db_port: u16,
     pub web_port: u16,
     pub entry_url: Option<String>,
+    pub local_entry_url: Option<String>,
+    pub public_entry_url: Option<String>,
+    #[serde(default)]
+    pub db_port_conflict: bool,
+    #[serde(default)]
+    pub web_port_conflict: bool,
+    #[serde(default)]
+    pub db_conflict_pids: Vec<u32>,
+    #[serde(default)]
+    pub web_conflict_pids: Vec<u32>,
     pub last_error: Option<String>,
     pub active_log_kind: Option<String>,
     pub last_log_at: Option<String>,
@@ -1609,6 +1639,8 @@ impl TaskInfo {
             estimated_duration: None,
             actual_duration: None,
             metadata: None,
+            site_id: None,
+            site_label: None,
         }
     }
 
@@ -1752,6 +1784,8 @@ pub struct FittingResponseData {
 pub struct WallDistanceRequest {
     #[serde(default)]
     pub dbnum: Option<u32>,
+    #[serde(default)]
+    pub source_refno: String,
     pub suppo_refno: SpaceSuppoRefnoInput,
     #[serde(default)]
     pub suppo_type: Option<String>,
@@ -1771,6 +1805,12 @@ pub struct WallDistancePoint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WallDistanceAabbDto {
+    pub min: WallDistancePoint,
+    pub max: WallDistancePoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WallDistanceCandidateDto {
     pub refno: String,
     pub noun: String,
@@ -1778,6 +1818,8 @@ pub struct WallDistanceCandidateDto {
     pub spec_value: Option<i64>,
     pub distance_mm: f64,
     pub closest_point: WallDistancePoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aabb: Option<WallDistanceAabbDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1790,9 +1832,16 @@ pub struct WallDistanceTargetDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WallDistanceResponseData {
-    pub anchor_kind: String,
-    pub anchor_point: WallDistancePoint,
-    pub target: WallDistanceTargetDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_refno: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_aabb: Option<WallDistanceAabbDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_point: Option<WallDistancePoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<WallDistanceTargetDto>,
     pub candidates: Vec<WallDistanceCandidateDto>,
 }
 

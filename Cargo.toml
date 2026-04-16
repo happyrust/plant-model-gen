@@ -219,7 +219,7 @@ web_server = [
     "parquet-export",
 ] #Web UI功能
 
-sqlite-index = ["dep:rusqlite", "dep:tokio-util"] # SQLite RTree 空间索引功能
+sqlite-index = ["dep:rusqlite", "dep:tokio-util", "aios_core/sqlite"] # SQLite RTree 空间索引功能
 rvm-import = ["dep:rvm-rs", "sqlite-index"]
 debug_e3d = []
 

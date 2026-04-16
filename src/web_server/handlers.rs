@@ -1687,6 +1687,8 @@ pub async fn restart_task(
             estimated_duration: old_task.estimated_duration,
             actual_duration: None,
             metadata: None,
+            site_id: old_task.site_id.clone(),
+            site_label: old_task.site_label.clone(),
         };
 
         new_task.add_log(LogLevel::Info, format!("基于任务 {} 重新创建", id));
@@ -3121,6 +3123,7 @@ pub async fn api_healthcheck_deployment_site(
     else {
         return Err(StatusCode::BAD_REQUEST);
     };
+    let checked_url = url.clone();
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -3128,7 +3131,13 @@ pub async fn api_healthcheck_deployment_site(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let res = client.get(url).send().await;
-    let healthy = matches!(res.as_ref().map(|r| r.status().is_success()), Ok(true));
+    let (healthy, status_code, error_detail) = match &res {
+        Ok(resp) => {
+            let code = resp.status().as_u16();
+            (resp.status().is_success(), Some(code), None)
+        }
+        Err(err) => (false, None, Some(err.to_string())),
+    };
     let now = chrono::Utc::now().to_rfc3339();
     let updated = crate::web_server::site_registry::update_health(
         &id,
@@ -3144,6 +3153,9 @@ pub async fn api_healthcheck_deployment_site(
     Ok(Json(json!({
         "status": "success",
         "healthy": healthy,
+        "checked_url": checked_url,
+        "status_code": status_code,
+        "error_detail": error_detail,
         "item": updated
     })))
 }
@@ -6354,15 +6366,19 @@ pub async fn api_space_wall_distance(
                 noun,
                 spec_value,
                 distance_mm,
-                aabb: wall_distance_aabb_to_dto(&candidate_aabb),
+                closest_point: wall_distance_point_to_dto(candidate_aabb.mins),
+                aabb: Some(wall_distance_aabb_to_dto(&candidate_aabb)),
             });
         }
 
         sort_and_truncate_wall_distance_candidates(&mut candidates, max_candidates);
 
         let response = WallDistanceResponseData {
-            source_refno: source_refno.to_string(),
-            source_aabb: wall_distance_aabb_to_dto(&source_aabb),
+            source_refno: Some(source_refno.to_string()),
+            source_aabb: Some(wall_distance_aabb_to_dto(&source_aabb)),
+            anchor_kind: None,
+            anchor_point: None,
+            target: None,
             candidates,
         };
 

@@ -1,3 +1,4 @@
+use aios_core::tool::db_tool::db1_dehash;
 use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
 use axum::{
     Router,
@@ -7,10 +8,13 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::Arc;
 use surrealdb::types::SurrealValue;
+
+use crate::data_interface::db_meta_manager::db_meta;
+use crate::fast_model::gen_model::tree_index_manager::{TreeIndexManager, load_index_with_large_stack};
 
 #[derive(Clone)]
 pub struct E3dTreeApiState {
@@ -141,33 +145,41 @@ async fn get_world_root(
     let db_option = aios_core::get_db_option();
     let mdb_name = db_option.mdb_name.clone();
 
-    let world = match aios_core::mdb::get_world_refno(mdb_name).await {
-        Ok(r) => r.refno(),
-        Err(e) => {
-            return Ok(Json(NodeResponse {
-                success: false,
-                node: None,
-                error_message: Some(format!("get_world_refno failed: {e}")),
-            }));
-        }
+    let (world, world_error) = match aios_core::mdb::get_world_refno(mdb_name).await {
+        Ok(r) => (r.refno(), None),
+        Err(e) => match resolve_offline_world_refno() {
+            Some(refno) => (refno.refno(), Some(format!("get_world_refno failed: {e}"))),
+            None => {
+                return Ok(Json(NodeResponse {
+                    success: false,
+                    node: None,
+                    error_message: Some(format!("get_world_refno failed: {e}")),
+                }));
+            }
+        },
     };
 
     // pe 表可能不包含 WORL/SITE 数据；因此这里优先返回可用的根 refno + noun。
     let node = match query_node(world.into()).await {
-        Ok(Some(n)) => Some(n),
+        Ok(Some(mut n)) => {
+            if let Some(children_count) = try_offline_world_children_count(RefnoEnum::from(world)) {
+                n.children_count = Some(children_count);
+            }
+            Some(n)
+        }
         Ok(None) | Err(_) => Some(TreeNodeDto {
             refno: world.into(),
             name: "*".to_string(),
             noun: "WORL".to_string(),
             owner: None,
-            children_count: None,
+            children_count: try_offline_world_children_count(RefnoEnum::from(world)),
         }),
     };
 
     Ok(Json(NodeResponse {
         success: true,
         node,
-        error_message: None,
+        error_message: world_error,
     }))
 }
 
@@ -203,29 +215,28 @@ async fn get_children(
 
     let parent_type = get_type_name(parent_refno).await;
 
-    let mut children: Vec<TreeNodeDto> = if parent_type == "WORL" {
+    let mut children: Vec<TreeNodeDto> = if parent_type == "WORL" || is_offline_world_refno(parent_refno)
+    {
         let db_option = aios_core::get_db_option();
         let mdb_name = db_option.mdb_name.clone();
 
-        let mut eles = aios_core::get_mdb_world_site_ele_nodes(mdb_name, aios_core::DBType::DESI)
-            .await
-            .unwrap_or_default();
-        eles.into_iter()
-            .map(|mut ele| {
-                ele.owner = parent_refno;
-                TreeNodeDto {
-                    refno: ele.refno,
-                    name: ele.name,
-                    noun: ele.noun,
-                    owner: Some(parent_refno),
-                    children_count: Some(i32::from(ele.children_count)),
-                }
-            })
-            .collect()
+        match aios_core::get_mdb_world_site_ele_nodes(mdb_name, aios_core::DBType::DESI).await {
+            Ok(eles) if !eles.is_empty() => eles
+                .into_iter()
+                .map(|mut ele| {
+                    ele.owner = parent_refno;
+                    TreeNodeDto {
+                        refno: ele.refno,
+                        name: ele.name,
+                        noun: ele.noun,
+                        owner: Some(parent_refno),
+                        children_count: Some(i32::from(ele.children_count)),
+                    }
+                })
+                .collect(),
+            _ => offline_world_children(parent_refno),
+        }
     } else {
-        // 层级查询统一走 indextree（TreeIndex）；name 可从 SurrealDB（输入数据源）读取。
-        use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
-
         match TreeIndexManager::resolve_dbnum_for_refno(parent_refno) {
             Ok(dbnum) => {
                 let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
@@ -271,6 +282,169 @@ async fn get_children(
         truncated,
         error_message: None,
     }))
+}
+
+fn resolve_offline_world_refno() -> Option<RefnoEnum> {
+    let db_option = aios_core::get_db_option();
+    if let Some(dbnum) = db_option
+        .manual_db_nums
+        .as_ref()
+        .and_then(|dbnums| dbnums.first().copied())
+    {
+        return Some(RefnoEnum::from(RefU64((dbnum as u64) << 32)));
+    }
+
+    let _ = db_meta().ensure_loaded();
+    let mut dbnums = db_meta().get_all_dbnums();
+    if dbnums.is_empty() {
+        return None;
+    }
+    dbnums.sort_unstable();
+    dbnums.dedup();
+    dbnums
+        .into_iter()
+        .next()
+        .map(|dbnum| RefnoEnum::from(RefU64((dbnum as u64) << 32)))
+}
+
+fn is_offline_world_refno(refno: RefnoEnum) -> bool {
+    resolve_offline_world_refno()
+        .map(|world| world == refno)
+        .unwrap_or(false)
+}
+
+fn try_offline_world_children_count(world_refno: RefnoEnum) -> Option<i32> {
+    let children = offline_world_children(world_refno);
+    Some(children.len() as i32)
+}
+
+fn offline_world_children(parent_refno: RefnoEnum) -> Vec<TreeNodeDto> {
+    let tree_dir = TreeIndexManager::with_default_dir(vec![])
+        .tree_dir()
+        .to_path_buf();
+    let mut out = offline_world_children_from_index(parent_refno, &tree_dir);
+    if !out.is_empty() {
+        return out;
+    }
+    out = offline_world_children_by_scan(parent_refno, &tree_dir);
+    out.sort_by_key(|node| node.refno.refno().0);
+    out
+}
+
+fn offline_world_children_from_index(
+    parent_refno: RefnoEnum,
+    tree_dir: &std::path::Path,
+) -> Vec<TreeNodeDto> {
+    let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(parent_refno) else {
+        return Vec::new();
+    };
+    let Ok(index) = load_index_with_large_stack(tree_dir, dbnum) else {
+        return Vec::new();
+    };
+    if !index.contains_refno(parent_refno.refno()) {
+        return Vec::new();
+    }
+
+    let mut child_counts: HashMap<RefU64, i32> = HashMap::new();
+    for refno in index.all_refnos() {
+        if let Some(meta) = index.node_meta(refno) {
+            if meta.owner.0 != 0 {
+                *child_counts.entry(meta.owner).or_insert(0) += 1;
+            }
+        }
+    }
+
+    index
+        .all_refnos()
+        .into_iter()
+        .filter_map(|child| {
+            let meta = index.node_meta(child)?;
+            if meta.owner != parent_refno.refno() {
+                return None;
+            }
+            let noun = db1_dehash(meta.noun);
+            Some(TreeNodeDto {
+                refno: RefnoEnum::from(child),
+                name: RefnoEnum::from(child).to_string(),
+                noun: noun.to_string(),
+                owner: Some(parent_refno),
+                children_count: Some(*child_counts.get(&child).unwrap_or(&0)),
+            })
+        })
+        .collect()
+}
+
+fn offline_world_children_by_scan(
+    parent_refno: RefnoEnum,
+    tree_dir: &std::path::Path,
+) -> Vec<TreeNodeDto> {
+    let wanted_dbnum = TreeIndexManager::resolve_dbnum_for_refno(parent_refno).ok();
+    let mut dbnums: Vec<u32> = Vec::new();
+    if let Ok(entries) = fs::read_dir(tree_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".tree") else {
+                continue;
+            };
+            let Ok(dbnum) = stem.parse::<u32>() else {
+                continue;
+            };
+            if wanted_dbnum.is_none() || wanted_dbnum == Some(dbnum) {
+                dbnums.push(dbnum);
+            }
+        }
+    }
+    dbnums.sort_unstable();
+    dbnums.dedup();
+
+    let mut out = Vec::new();
+    for dbnum in dbnums {
+        let Ok(index) = load_index_with_large_stack(tree_dir, dbnum) else {
+            continue;
+        };
+
+        let mut child_counts: HashMap<RefU64, i32> = HashMap::new();
+        for refno in index.all_refnos() {
+            if let Some(meta) = index.node_meta(refno) {
+                if meta.owner.0 != 0 {
+                    *child_counts.entry(meta.owner).or_insert(0) += 1;
+                }
+            }
+        }
+
+        for refno in index.all_refnos() {
+            let Some(meta) = index.node_meta(refno) else {
+                continue;
+            };
+            let noun = db1_dehash(meta.noun);
+            if noun != "SITE" {
+                continue;
+            }
+            let owner_noun = index
+                .node_meta(meta.owner)
+                .map(|owner| db1_dehash(owner.noun))
+                .unwrap_or_default();
+            if owner_noun != "WORL" {
+                continue;
+            }
+
+            out.push(TreeNodeDto {
+                refno: RefnoEnum::from(meta.refno),
+                name: RefnoEnum::from(meta.refno).to_string(),
+                noun: noun.to_string(),
+                owner: Some(parent_refno),
+                children_count: Some(*child_counts.get(&meta.refno).unwrap_or(&0)),
+            });
+        }
+    }
+
+    out
 }
 
 async fn get_ancestors(

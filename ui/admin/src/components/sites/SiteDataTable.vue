@@ -1,23 +1,14 @@
 <script setup lang="ts">
 import { useRouter } from 'vue-router'
 import { useSitesStore } from '@/stores/sites'
-import type { ManagedProjectSite, ManagedSiteRiskLevel, ManagedSiteStatus } from '@/types/site'
+import type { ManagedProjectSite, ManagedSiteRiskLevel } from '@/types/site'
 import { Eye, ExternalLink, Play, RefreshCw, Square, Trash2 } from 'lucide-vue-next'
+import { statusLabelMap, statusClassMap, parseStatusClass as getParseStatusClass, isSiteBusy } from './site-status'
 
 const props = defineProps<{ sites: ManagedProjectSite[]; loading: boolean }>()
 
 const router = useRouter()
 const sitesStore = useSitesStore()
-
-const statusConfig: Record<ManagedSiteStatus, { class: string; label: string }> = {
-  Draft: { class: 'bg-muted text-muted-foreground', label: '草稿' },
-  Parsed: { class: 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200', label: '已解析' },
-  Starting: { class: 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200', label: '启动中' },
-  Running: { class: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200', label: '运行中' },
-  Stopping: { class: 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200', label: '停止中' },
-  Stopped: { class: 'bg-muted text-muted-foreground', label: '已停止' },
-  Failed: { class: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200', label: '失败' },
-}
 
 const riskConfig: Record<ManagedSiteRiskLevel, { class: string; label: string }> = {
   normal: { class: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200', label: '正常' },
@@ -26,26 +17,19 @@ const riskConfig: Record<ManagedSiteRiskLevel, { class: string; label: string }>
 }
 
 function canStart(site: ManagedProjectSite) {
-  return ['Stopped', 'Parsed', 'Failed', 'Draft'].includes(site.status)
+  return !isSiteBusy(site) && ['Stopped', 'Parsed', 'Failed', 'Draft'].includes(site.status)
 }
 function canStop(site: ManagedProjectSite) {
   return site.status === 'Running'
 }
 function canParse(site: ManagedProjectSite) {
-  if (site.parse_status === 'Running') return false
-  return ['Starting', 'Stopping'].includes(site.status) === false
+  return !isSiteBusy(site)
 }
 function canDelete(site: ManagedProjectSite) {
-  return ['Running', 'Starting', 'Stopping'].includes(site.status) === false
+  return !isSiteBusy(site) && site.status !== 'Running'
 }
 function riskSummary(site: ManagedProjectSite) {
   return site.risk_reasons[0] ?? '当前无明显风险'
-}
-function parseStatusClass(site: ManagedProjectSite) {
-  if (site.parse_status === 'Parsed') return 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
-  if (site.parse_status === 'Running') return 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200'
-  if (site.parse_status === 'Failed') return 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
-  return 'bg-muted text-muted-foreground'
 }
 function openDetail(siteId: string) {
   router.push({ path: '/sites/' + siteId })
@@ -89,12 +73,12 @@ function openViewer(site: ManagedProjectSite) {
             <div class="text-xs text-muted-foreground">{{ site.site_id }}</div>
           </td>
           <td class="px-4 py-3 align-top">
-            <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium" :class="statusConfig[site.status]?.class">
-              {{ statusConfig[site.status]?.label ?? site.status }}
+            <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium" :class="statusClassMap[site.status]">
+              {{ statusLabelMap[site.status] ?? site.status }}
             </span>
           </td>
           <td class="px-4 py-3 align-top">
-            <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium" :class="parseStatusClass(site)">
+            <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium" :class="getParseStatusClass(site.parse_status)">
               {{ site.parse_status }}
             </span>
           </td>

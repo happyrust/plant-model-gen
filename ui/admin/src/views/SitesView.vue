@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { AlertTriangle, Cpu, FolderKanban, HardDrive, MemoryStick } from 'lucide-vue-next'
+import { AlertTriangle, Cpu, FolderKanban, HardDrive, MemoryStick, Server, Activity, CircleAlert } from 'lucide-vue-next'
 import { sitesApi } from '@/api/sites'
 import { usePolling } from '@/composables/usePolling'
 import SiteDataTable from '@/components/sites/SiteDataTable.vue'
 import SiteDrawer from '@/components/sites/SiteDrawer.vue'
-import SiteStatsCards from '@/components/sites/SiteStatsCards.vue'
 import SiteToolbar from '@/components/sites/SiteToolbar.vue'
 import { useSitesStore } from '@/stores/sites'
+import { matchesQuickFilter, computeStats, type QuickFilter } from '@/components/sites/site-status'
 import type { AdminResourceSummary, ManagedSiteRiskLevel } from '@/types/site'
 
 const sitesStore = useSitesStore()
@@ -17,12 +17,18 @@ const editingSiteId = ref<string | null>(null)
 const searchQuery = ref('')
 const statusFilter = ref('')
 const riskFilter = ref<ManagedSiteRiskLevel | ''>('')
+const activeQuickFilter = ref<QuickFilter>('all')
 const resourceSummary = ref<AdminResourceSummary | null>(null)
 const resourceLoading = ref(false)
 const resourceError = ref('')
 
+const siteStats = computed(() => computeStats(sitesStore.sites))
+
 const filteredSites = computed(() => {
   let list = sitesStore.sites
+  if (activeQuickFilter.value !== 'all') {
+    list = list.filter((s) => matchesQuickFilter(s, activeQuickFilter.value))
+  }
   if (searchQuery.value) {
     const q = searchQuery.value.toLowerCase()
     list = list.filter((s) =>
@@ -111,6 +117,10 @@ function handleFilter(search: string, status: string, risk: string) {
   riskFilter.value = (risk as ManagedSiteRiskLevel | '') || ''
 }
 
+function handleQuickFilter(filter: QuickFilter) {
+  activeQuickFilter.value = filter
+}
+
 function handleDrawerSaved() {
   drawerOpen.value = false
   editingSiteId.value = null
@@ -181,7 +191,38 @@ onMounted(async () => {
       <h2 class="text-2xl font-semibold tracking-tight">站点管理</h2>
       <p class="text-sm text-muted-foreground">管理和监控所有项目站点</p>
     </div>
-    <SiteStatsCards :stats="sitesStore.stats" />
+    <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+      <div class="rounded-lg border border-border bg-card p-4">
+        <div class="flex items-center justify-between">
+          <span class="text-sm text-muted-foreground">总站点</span>
+          <Server class="h-4 w-4 text-muted-foreground" />
+        </div>
+        <div class="mt-2 text-2xl font-bold">{{ siteStats.total }}</div>
+        <div class="mt-1 text-xs text-muted-foreground">当前结果 {{ filteredSites.length }} 条</div>
+      </div>
+      <div class="rounded-lg border border-border bg-card p-4">
+        <div class="flex items-center justify-between">
+          <span class="text-sm text-muted-foreground">运行中</span>
+          <Activity class="h-4 w-4 text-green-600" />
+        </div>
+        <div class="mt-2 text-2xl font-bold text-green-600">{{ siteStats.running }}</div>
+      </div>
+      <div class="rounded-lg border border-border bg-card p-4">
+        <div class="flex items-center justify-between">
+          <span class="text-sm text-muted-foreground">处理中</span>
+          <Cpu class="h-4 w-4 text-amber-600" />
+        </div>
+        <div class="mt-2 text-2xl font-bold text-amber-600">{{ siteStats.busy }}</div>
+        <div class="mt-1 text-xs text-muted-foreground">启动/停止/解析中</div>
+      </div>
+      <div class="rounded-lg border border-border bg-card p-4">
+        <div class="flex items-center justify-between">
+          <span class="text-sm text-muted-foreground">异常</span>
+          <CircleAlert class="h-4 w-4 text-destructive" />
+        </div>
+        <div class="mt-2 text-2xl font-bold text-destructive">{{ siteStats.error }}</div>
+      </div>
+    </div>
 
     <section class="space-y-3">
       <div class="flex items-center justify-between">
@@ -222,7 +263,7 @@ onMounted(async () => {
       </div>
     </section>
 
-    <SiteToolbar @open-drawer="openCreateDrawer" @filter="handleFilter" />
+    <SiteToolbar @open-drawer="openCreateDrawer" @filter="handleFilter" @quick-filter="handleQuickFilter" />
     <SiteDataTable :sites="filteredSites" :loading="sitesStore.loading" />
     <SiteDrawer
       :open="drawerOpen"

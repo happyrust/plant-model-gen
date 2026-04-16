@@ -3,21 +3,19 @@ import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   AlertTriangle,
-  ArrowLeft,
   Database,
-  ExternalLink,
   FolderArchive,
   Globe,
   HardDrive,
-  Play,
-  RefreshCw,
   ShieldAlert,
-  Square,
   TimerReset,
 } from 'lucide-vue-next'
 import { sitesApi } from '@/api/sites'
 import { usePolling } from '@/composables/usePolling'
 import { useSitesStore } from '@/stores/sites'
+import SiteDetailHeader from '@/components/sites/SiteDetailHeader.vue'
+import SiteRuntimeCards from '@/components/sites/SiteRuntimeCards.vue'
+import SiteLogSummaryPanel from '@/components/sites/SiteLogSummaryPanel.vue'
 import type {
   ManagedProjectSite,
   ManagedSiteLogsResponse,
@@ -216,48 +214,16 @@ onMounted(async () => {
 
 <template>
   <div class="space-y-6">
-    <div class="flex items-center gap-4">
-      <button
-        @click="router.push({ path: '/sites' })"
-        class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-accent transition-colors"
-      >
-        <ArrowLeft class="h-4 w-4" />
-      </button>
-      <div v-if="site">
-        <h2 class="text-2xl font-semibold tracking-tight">{{ site.project_name }}</h2>
-        <p class="text-sm text-muted-foreground">{{ site.site_id }} · {{ site.status }}</p>
-      </div>
-      <div v-if="site" class="ml-auto flex gap-2">
-        <button
-          v-if="['Stopped', 'Parsed', 'Failed', 'Draft'].includes(site.status)"
-          @click="sitesStore.startSite(site.site_id).then(fetchAll)"
-          class="inline-flex h-9 items-center gap-2 rounded-md bg-green-600 px-4 text-sm font-medium text-white shadow hover:bg-green-700 transition-colors"
-        >
-          <Play class="h-4 w-4" /> 启动
-        </button>
-        <button
-          v-if="site.status === 'Running'"
-          @click="sitesStore.stopSite(site.site_id).then(fetchAll)"
-          class="inline-flex h-9 items-center gap-2 rounded-md bg-amber-600 px-4 text-sm font-medium text-white shadow hover:bg-amber-700 transition-colors"
-        >
-          <Square class="h-4 w-4" /> 停止
-        </button>
-        <button
-          @click="sitesStore.parseSite(siteId).then(fetchAll)"
-          :disabled="site.parse_status === 'Running'"
-          class="inline-flex h-9 items-center gap-2 rounded-md border border-input bg-transparent px-4 text-sm font-medium shadow-sm hover:bg-accent transition-colors disabled:opacity-50"
-        >
-          <RefreshCw class="h-4 w-4" /> 解析
-        </button>
-        <button
-          v-if="site.status === 'Running'"
-          @click="openViewer()"
-          class="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow hover:bg-primary/90 transition-colors"
-        >
-          <ExternalLink class="h-4 w-4" /> 打开 Viewer
-        </button>
-      </div>
-    </div>
+    <SiteDetailHeader
+      :site="site"
+      :viewer-url="viewerUrl()"
+      @back="router.push({ path: '/sites' })"
+      @start="sitesStore.startSite(siteId).then(fetchAll)"
+      @stop="sitesStore.stopSite(siteId).then(fetchAll)"
+      @parse="sitesStore.parseSite(siteId).then(fetchAll)"
+      @refresh="fetchAll"
+      @open-viewer="openViewer()"
+    />
 
     <div class="flex gap-2 border-b border-border">
       <button
@@ -273,34 +239,7 @@ onMounted(async () => {
     </div>
 
     <div v-if="activeTab === 'overview'" class="space-y-4">
-      <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        <div class="rounded-lg border border-border bg-card p-4">
-          <div class="text-sm text-muted-foreground">站点状态</div>
-          <div class="mt-1 text-lg font-semibold">{{ runtime?.current_stage_label ?? site?.status ?? '-' }}</div>
-          <div v-if="runtime?.current_stage_detail" class="text-xs text-muted-foreground mt-1">{{ runtime.current_stage_detail }}</div>
-        </div>
-        <div class="rounded-lg border border-border bg-card p-4">
-          <div class="text-sm text-muted-foreground">数据库</div>
-          <div class="mt-1 text-lg font-semibold" :class="runtime?.db_running ? 'text-green-600' : 'text-muted-foreground'">
-            {{ runtime?.db_running ? '运行中' : '未启动' }}
-          </div>
-          <div class="text-xs text-muted-foreground mt-1">PID: {{ runtime?.db_pid ?? '-' }} / 端口: {{ site?.db_port }}</div>
-        </div>
-        <div class="rounded-lg border border-border bg-card p-4">
-          <div class="text-sm text-muted-foreground">Web 服务</div>
-          <div class="mt-1 text-lg font-semibold" :class="runtime?.web_running ? 'text-green-600' : 'text-muted-foreground'">
-            {{ runtime?.web_running ? '运行中' : '未启动' }}
-          </div>
-          <div class="text-xs text-muted-foreground mt-1">PID: {{ runtime?.web_pid ?? '-' }} / 端口: {{ site?.web_port }}</div>
-        </div>
-        <div class="rounded-lg border border-border bg-card p-4">
-          <div class="text-sm text-muted-foreground">解析状态</div>
-          <div class="mt-1 text-lg font-semibold" :class="runtime?.parse_running ? 'text-blue-600' : 'text-muted-foreground'">
-            {{ site?.parse_status ?? '-' }}
-          </div>
-          <div v-if="runtime?.parse_running" class="text-xs text-blue-600 mt-1">解析进行中...</div>
-        </div>
-      </div>
+      <SiteRuntimeCards :site="site" :runtime="runtime" />
 
       <div class="rounded-lg border p-5" :class="riskTone.card">
         <div class="mb-4 flex items-center gap-2">
@@ -440,6 +379,8 @@ onMounted(async () => {
           <div v-if="!runtime.public_entry_url" class="text-xs text-amber-600 mt-1">仅本机地址，未配置 public_base_url</div>
         </div>
       </div>
+
+      <SiteLogSummaryPanel v-if="logsData?.streams" :streams="logsData.streams" />
 
       <div class="rounded-lg border border-border bg-card">
         <div class="flex items-center gap-2 border-b border-border px-4 py-2">

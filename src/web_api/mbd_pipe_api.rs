@@ -271,6 +271,10 @@ pub struct MbdPipeData {
     pub stats: MbdPipeStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_info: Option<MbdPipeDebugInfo>,
+    /// 仅当 `mode=layout_first` 时填充：由 `aios_core::mbd::BranchCalculator::solve_branch`
+    /// + `assemble_prelaid_out` 产出的排版结果，前端 `renderLaidOutLinearDims` 消费。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_result: Option<aios_core::mbd::LayoutResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2375,7 +2379,7 @@ async fn build_mbd_pipe_data_from_segments(
         bends_count: output.bends.len(),
     };
 
-    Ok(MbdPipeData {
+    let mut data = MbdPipeData {
         input_refno: branch_refno.to_string(),
         branch_refno: branch_refno.to_string(),
         branch_name,
@@ -2390,7 +2394,221 @@ async fn build_mbd_pipe_data_from_segments(
         bends: output.bends,
         stats,
         debug_info: query.debug.then_some(debug_info),
-    })
+        layout_result: None,
+    };
+
+    if matches!(query.mode, MbdPipeMode::LayoutFirst) {
+        data.layout_result = Some(compute_branch_layout_result(query, &data));
+    }
+
+    Ok(data)
+}
+
+/// 把后端的 `MbdPipeData` 子集喂给 `aios_core::mbd::BranchCalculator`，产出完整 `LayoutResult`。
+///
+/// 单位：所有输入/输出均为 **毫米（mm）**，与 `mbd_pipe_api` 的原始坐标空间一致。
+fn compute_branch_layout_result(
+    query: &ResolvedMbdPipeQuery,
+    data: &MbdPipeData,
+) -> aios_core::mbd::LayoutResult {
+    use aios_core::mbd::iso_extras::{BendInput, SlopeInput, TagInput, WeldInput};
+    use aios_core::mbd::iso_params::{BranchContext, IsoParams, SegmentInput};
+    use aios_core::mbd::{BranchCalculator, LayoutRequest, SolveBranchInput};
+    use glam::Vec3;
+
+    let od_by_segment: HashMap<String, f32> = data
+        .segments
+        .iter()
+        .filter_map(|s| s.outside_diameter.map(|od| (s.id.clone(), od)))
+        .collect();
+    let default_od = od_by_segment.values().copied().next().unwrap_or(100.0);
+
+    let iso_params = IsoParams {
+        min_slope: query.min_slope,
+        max_slope: query.max_slope,
+        consider_pre_next_dir: true,
+        look_angle: 60.0,
+        cheight: 100.0,
+        em4_mode: true,
+    };
+    let context = BranchContext {
+        branch_refno: data.branch_refno.clone(),
+        bran_volume_center: estimate_bran_volume_center(&data.segments),
+        dim_times: 1,
+    };
+
+    let linear_dims: Vec<SegmentInput> = data
+        .dims
+        .iter()
+        .map(|d| {
+            let start = Vec3::from_array(d.start);
+            let end = Vec3::from_array(d.end);
+            let owner_id = d
+                .layout_hint
+                .as_ref()
+                .and_then(|h| h.owner_segment_id.clone())
+                .unwrap_or_default();
+            let od = od_by_segment.get(&owner_id).copied().unwrap_or(default_od);
+            let pipe_dir = normalized_dir_or_x(end - start);
+            SegmentInput {
+                id: d.id.clone(),
+                kind: serde_value_as_str(&serde_json::to_value(d.kind).ok())
+                    .unwrap_or_else(|| "segment".to_string()),
+                start,
+                end,
+                pipe_dir,
+                od,
+                text: d.text.clone(),
+                isoline_index: d.seq.map(|s| s as usize),
+            }
+        })
+        .collect();
+
+    let cut_tubis: Vec<SegmentInput> = data
+        .cut_tubis
+        .iter()
+        .map(|c| {
+            let start = Vec3::from_array(c.start);
+            let end = Vec3::from_array(c.end);
+            let od = od_by_segment
+                .get(&c.segment_id)
+                .copied()
+                .unwrap_or(default_od);
+            let pipe_dir = normalized_dir_or_x(end - start);
+            SegmentInput {
+                id: c.id.clone(),
+                kind: "cut_tubi".to_string(),
+                start,
+                end,
+                pipe_dir,
+                od,
+                text: c.text.clone(),
+                isoline_index: None,
+            }
+        })
+        .collect();
+
+    let slopes: Vec<SlopeInput> = data
+        .slopes
+        .iter()
+        .map(|s| SlopeInput {
+            id: s.id.clone(),
+            tubi_start: Vec3::from_array(s.start),
+            tubi_end: Vec3::from_array(s.end),
+            slope: s.slope,
+            od: default_od,
+            text: s.text.clone(),
+        })
+        .collect();
+
+    let welds: Vec<WeldInput> = data
+        .welds
+        .iter()
+        .map(|w| WeldInput {
+            id: w.id.clone(),
+            position: Vec3::from_array(w.position),
+            label: w.label.clone(),
+            is_shop: w.is_shop,
+            subtitle: None,
+        })
+        .collect();
+
+    let tags: Vec<TagInput> = data
+        .tags
+        .iter()
+        .map(|t| TagInput {
+            id: t.id.clone(),
+            position: Vec3::from_array(t.position),
+            text: t.text.clone(),
+        })
+        .collect();
+
+    let bends: Vec<BendInput> = data
+        .bends
+        .iter()
+        .map(|b| BendInput {
+            id: b.id.clone(),
+            vertex: Vec3::from_array(b.work_point),
+            face_center_1: b.face_center_1.map(Vec3::from_array),
+            face_center_2: b.face_center_2.map(Vec3::from_array),
+            angle_deg: b.angle,
+            od: default_od,
+            face_texts: [None, None],
+            angle_text: format_bend_angle_text(b.angle),
+        })
+        .collect();
+
+    let sections = BranchCalculator::solve_branch(SolveBranchInput {
+        context: &context,
+        params: &iso_params,
+        linear_dims: &linear_dims,
+        cut_tubis: &cut_tubis,
+        slopes: &slopes,
+        welds: &welds,
+        tags: &tags,
+        bends: &bends,
+    });
+
+    let request = LayoutRequest {
+        mode: aios_core::mbd::BranchLayoutMode::LayoutFirst,
+        include_chain_dims: query.include_chain_dims,
+        include_overall_dim: query.include_overall_dim,
+        include_port_dims: query.include_port_dims,
+        include_welds: query.include_welds,
+        include_slopes: query.include_slopes,
+        include_bends: query.include_bends,
+        include_cut_tubis: query.include_cut_tubis,
+        include_tags: query.include_tags,
+        include_fittings: query.include_fittings,
+        look_angle: None,
+        consider_pre_next_dir: true,
+        ignore_line: false,
+        auto_text_scale: true,
+        min_text_scale: 0.75,
+        allow_layer_split: true,
+    };
+
+    BranchCalculator::assemble_prelaid_out(&request, sections)
+}
+
+fn normalized_dir_or_x(v: glam::Vec3) -> glam::Vec3 {
+    let d = v.normalize_or_zero();
+    if d.length_squared() < 1e-6 {
+        glam::Vec3::X
+    } else {
+        d
+    }
+}
+
+fn serde_value_as_str(v: &Option<serde_json::Value>) -> Option<String> {
+    v.as_ref()
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+}
+
+fn format_bend_angle_text(angle: Option<f32>) -> String {
+    angle
+        .map(|a| format!("{a:.1}°"))
+        .unwrap_or_default()
+}
+
+/// 粗略估计分支 volume 中心：取所有段 arrive/leave 的平均（忽略 None）。
+/// 对应 PML `var !volume volume $!branname; !pos1.midpoint(!pos2)` 的简化版本。
+fn estimate_bran_volume_center(segments: &[MbdPipeSegmentDto]) -> glam::Vec3 {
+    use glam::Vec3;
+    let mut sum = Vec3::ZERO;
+    let mut count = 0f32;
+    for s in segments {
+        if let Some(a) = s.arrive {
+            sum += Vec3::from_array(a);
+            count += 1.0;
+        }
+        if let Some(l) = s.leave {
+            sum += Vec3::from_array(l);
+            count += 1.0;
+        }
+    }
+    if count > 0.0 { sum / count } else { Vec3::ZERO }
 }
 
 /// 核心 MBD 数据生成逻辑（不依赖 axum，可被 API handler 和批量导出共用）
@@ -2972,6 +3190,7 @@ mod tests {
             bends: Vec::new(),
             stats: MbdPipeStats::default(),
             debug_info: Some(MbdPipeDebugInfo::default()),
+            layout_result: None,
         };
         let json = serde_json::to_value(data).expect("data serialize");
         assert!(json.get("cut_tubis").is_some());

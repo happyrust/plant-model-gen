@@ -4,6 +4,13 @@
 
 ### Added
 
+- 新增 `scripts/test-admin-deployment.ps1`：Admin 站点端到端部署回归脚本，覆盖登录 / 建站 / 解析 / 启动 / 健康检查 / 停站 / 清理 9 个步骤，默认针对 `AvevaPlantSample + aps7011_0001` 场景，支持 `-SkipCleanup` 与 `ADMIN_USER/ADMIN_PASS` 环境变量。
+- 新增 `.memory/.gitkeep` 与 `.memory/2026-04-17.md`：沉淀 E3D 3.1 F&M state 补丁、PML modLoadMethod、jmp-self / spawn+suspend 等逆向调试日志，便于跨会话衔接。
+
+### Changed
+
+- 精简 `.cursor/rules/mcp-messenger.mdc` 与 `.cursor/rules/my-mcp.mdc` 中的重复强约束段落，仅保留"回合结束必须调用 `check_messages`"等核心条款，避免多模型规则冗余。
+
 - 异地协同 remote-sync API 路由从 `mod.rs` 提取到 `remote_sync_handlers::create_remote_sync_routes()`，统一纳入 `admin_api_routes` 认证链路。
 - `open_sqlite()` 使用 `std::sync::Once` 守卫，确保 SQLite schema 仅初始化一次。
 - remote-sync 所有 `map_err` 增加 `eprintln!` 错误日志输出，便于问题排查。

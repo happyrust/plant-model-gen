@@ -642,6 +642,9 @@ struct CacheTubiSeg {
     arrive_axis: Option<Vec3>,
     /// leave 端口轴线点（可选；来自 EleGeosInfo.leave_axis_pt）
     leave_axis: Option<Vec3>,
+    /// 外径（mm）。对应 PML `aod of $!tubi`。从 pe.aod 或 pe.attrs.AOD 取；
+    /// 不存在时 None，由 `compute_branch_layout_result` 回退到 default_od=229。
+    outside_diameter: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -849,7 +852,7 @@ impl<'a> BranchMeasurementPlanner<'a> {
                 leave: Some([seg.end.x, seg.end.y, seg.end.z]),
                 length: seg.start.distance(seg.end),
                 straight_length: seg.start.distance(seg.end),
-                outside_diameter: None,
+                outside_diameter: seg.outside_diameter,
                 bore: None,
             })
             .collect()
@@ -1671,6 +1674,7 @@ async fn fetch_tubi_segments_from_parquet_with_debug(
             end,
             arrive_axis: None,
             leave_axis: None,
+            outside_diameter: None,
         });
     }
 
@@ -1837,6 +1841,7 @@ async fn fetch_tubi_segments_from_cache_with_debug(
                 end,
                 arrive_axis: tubi_data.arrive_axis_pt.map(Vec3::from),
                 leave_axis: tubi_data.leave_axis_pt.map(Vec3::from),
+                outside_diameter: None,
             },
         );
     }
@@ -1880,12 +1885,19 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
         pub leave_axis: Option<RsVec3>,
         #[serde(default)]
         pub index: Option<i64>,
+        /// 外径（mm），通常存在 TUBI 元件的 pe.aod 或 pe.attrs.AOD；
+        /// 任一缺失则回退到 `compute_branch_layout_result` 的 default_od。
+        #[serde(default)]
+        pub aod: Option<f32>,
     }
 
     let mut debug = MbdPipeDebugInfo::default();
     debug.notes.push("source=db".to_string());
 
     let pe_key = branch_refno.to_pe_key();
+    // Stage B.2: 顺便试探 TUBI 元件的外径。tubi_relate.in 是 record reference (pe:...),
+    // 直接 `in.aod` 走 record join，O(1) 命中，pe 不存在该字段时返回 NONE → Option<f32>=None。
+    // 不命中时由 `compute_branch_layout_result` 的 default_od=229 兜住。
     let sql = format!(
         r#"
         SELECT
@@ -1897,7 +1909,8 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
             end_pt.d as end_pt,
             arrive_axis.d as arrive_axis,
             leave_axis.d as leave_axis,
-            id[1] as index
+            id[1] as index,
+            in.aod as aod
         FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
         "#
     );
@@ -1934,6 +1947,7 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
             end,
             arrive_axis: row.arrive_axis.map(|p| p.0),
             leave_axis: row.leave_axis.map(|p| p.0),
+            outside_diameter: row.aod,
         });
     }
 
@@ -1943,6 +1957,13 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
         ao.cmp(&bo)
             .then_with(|| a.refno.to_string().cmp(&b.refno.to_string()))
     });
+
+    let found_aod = segs.iter().filter(|s| s.outside_diameter.is_some()).count();
+    debug.notes.push(format!(
+        "tubi_aod_found={}/{}",
+        found_aod,
+        segs.len()
+    ));
 
     Ok((segs, debug))
 }
@@ -2905,6 +2926,7 @@ mod tests {
             end: Vec3::new(10.0, 0.0, 0.0),
             arrive_axis: Some(Vec3::new(9.0, 0.0, 0.0)),
             leave_axis: Some(Vec3::new(1.0, 0.0, 0.0)),
+            outside_diameter: None,
         };
 
         let (a, b) = segment_port_points(&seg);
@@ -2922,6 +2944,7 @@ mod tests {
             end: Vec3::new(5.0, 0.0, 0.0),
             arrive_axis: None,
             leave_axis: None,
+            outside_diameter: None,
         };
 
         let (a, b) = segment_port_points(&seg);
@@ -3057,6 +3080,7 @@ mod tests {
                     end: Vec3::new(100.0, 0.0, 0.0),
                     arrive_axis: None,
                     leave_axis: None,
+                    outside_diameter: None,
                 },
                 CacheTubiSeg {
                     refno: RefnoEnum::from("1_2"),
@@ -3066,6 +3090,7 @@ mod tests {
                     end: Vec3::new(220.0, 0.0, 0.0),
                     arrive_axis: None,
                     leave_axis: None,
+                    outside_diameter: None,
                 },
             ],
         );
@@ -3101,6 +3126,7 @@ mod tests {
                 end: Vec3::new(100.0, 0.0, 0.0),
                 arrive_axis: None,
                 leave_axis: None,
+                outside_diameter: None,
             }],
         );
         let fittings = vec![

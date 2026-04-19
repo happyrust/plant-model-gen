@@ -4,6 +4,7 @@
 
 ### Added
 
+- 新增 `docs/plans/2026-04-19-admin-站点部署整改计划.md`：对 admin 站点部署功能进行全链路审核（后端编排、前端状态机、安全默认值、Viewer 联动），输出 5 阶段整改计划（P0 安全收口 / P0 状态机加固 / P1 部署解耦 / P1 Viewer URL / P1 可观测性）、9 项回归矩阵及长期演进路线。
 - 新增 `scripts/test-admin-deployment.ps1`：Admin 站点端到端部署回归脚本，覆盖登录 / 建站 / 解析 / 启动 / 健康检查 / 停站 / 清理 9 个步骤，默认针对 `AvevaPlantSample + aps7011_0001` 场景，支持 `-SkipCleanup` 与 `ADMIN_USER/ADMIN_PASS` 环境变量。
 - 新增 `.memory/.gitkeep` 与 `.memory/2026-04-17.md`：沉淀 E3D 3.1 F&M state 补丁、PML modLoadMethod、jmp-self / spawn+suspend 等逆向调试日志，便于跨会话衔接。
 

@@ -975,21 +975,11 @@ impl<'a> BranchMeasurementPlanner<'a> {
                 .iter()
                 .map(|seg| seg.start.distance(seg.end))
                 .sum();
-            let ends: Vec<(Vec3, Vec3)> = self
-                .topology
-                .segments
-                .iter()
-                .map(|s| (s.start, s.end))
-                .collect();
-            let chain_pts = build_chain_points_from_ends(&ends, &weld_joints);
-            let (a, b) = if chain_pts.len() >= 2 {
-                (chain_pts[0], chain_pts[chain_pts.len() - 1])
-            } else {
-                (
-                    self.topology.segments[0].start,
-                    self.topology.segments[0].end,
-                )
-            };
+            // 总长对应 PML `hpos of branname → tpos of branname`：取首段起点到末段终点，
+            // 不走 weld_joints 链条（即使 weld_joints 为空、或者段间坐标不严格相连，也能稳定产出）。
+            let first_seg = &self.topology.segments[0];
+            let last_seg = &self.topology.segments[self.topology.segments.len() - 1];
+            let (a, b) = (first_seg.start, last_seg.end);
             if total >= self.query.dim_min_length {
                 dims.push(MbdDimDto {
                     id: format!("dim:overall:{}", self.topology.branch_refno),
@@ -2209,8 +2199,13 @@ fn build_chain_points_from_ends(ends: &[(Vec3, Vec3)], weld_joints: &[WeldJoint]
     }
 
     if weld_joints.is_empty() {
+        // 无焊口时仍然需要走整条 branch 的首尾而不是只报第一段：对应 PML 对 overall
+        // 尺寸 "hpos of branname → tpos of branname" 的语义。多段情况下取首段起点和末段终点。
         out.push(ends[0].0);
-        out.push(ends[0].1);
+        for pair in ends.iter().skip(1) {
+            out.push(pair.0);
+        }
+        out.push(ends[ends.len() - 1].1);
         return out;
     }
 
@@ -2421,7 +2416,15 @@ fn compute_branch_layout_result(
         .iter()
         .filter_map(|s| s.outside_diameter.map(|od| (s.id.clone(), od)))
         .collect();
-    let default_od = od_by_segment.values().copied().next().unwrap_or(100.0);
+    // 若 segment 未携带 outside_diameter（B.2 之前普遍如此），用 DN200 常见 OD=229mm 作为兜底，
+    // 以满足 PML `offset = od + 1.2*cheight*(n-1)` 第一层 offset 不会坍缩到 100mm。
+    // B.2 补齐真实 OD 后，大多数段会直接命中 od_by_segment，此分支只在 surreal 查不到时触发。
+    const DEFAULT_OD_MM: f32 = 229.0;
+    let default_od = od_by_segment
+        .values()
+        .copied()
+        .next()
+        .unwrap_or(DEFAULT_OD_MM);
 
     let iso_params = IsoParams {
         min_slope: query.min_slope,

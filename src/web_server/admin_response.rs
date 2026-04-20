@@ -58,16 +58,29 @@ where
 pub fn classify_error_status(message: &str) -> StatusCode {
     if message.contains("不存在") {
         StatusCode::NOT_FOUND
-    } else if message.contains("不能为空") || message.contains("必须大于") {
+    } else if message.contains("不能为空")
+        || message.contains("必须大于")
+        || message.contains("格式不正确")
+        || message.contains("无效")
+    {
         StatusCode::BAD_REQUEST
     } else if message.contains("运行中")
         || message.contains("正在运行")
         || message.contains("已在运行中")
+        || message.contains("启动中")
+        || message.contains("停止中")
+        || message.contains("解析中")
+        || message.contains("解析任务正在运行")
+        || message.contains("请稍后再启动")
+        || message.contains("请先停止站点")
+        || message.contains("无需停止")
+        || message.contains("未在运行中")
         || message.contains("不能删除")
         || message.contains("不能修改配置")
         || message.contains("已被站点")
         || message.contains("已被当前机器")
         || message.contains("已被占用")
+        || message.contains("端口冲突")
         || message.contains("端口")
     {
         StatusCode::CONFLICT

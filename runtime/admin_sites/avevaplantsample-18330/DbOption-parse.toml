@@ -25,7 +25,10 @@ gen_model_batch_size = 16
 gen_noun_graph = false
 gen_spatial_tree = false
 gen_tree_only = false
-included_db_files = ["aps7009"]
+included_db_files = [
+    "aps7009",
+    "apssys",
+]
 included_projects = ["AvevaPlantSample"]
 incr_sync = false
 index_tree_batch_size = 200
@@ -188,6 +191,7 @@ path = "runtime/admin_sites/avevaplantsample-18330/data/surreal.db"
 port = 18320
 
 [surrealkv]
+deployment_sites_sqlite_path = "runtime/admin_verify/deployment_sites.sqlite"
 enabled = false
 mode = "file"
 path = "runtime/admin_sites/avevaplantsample-18330/data/surreal.db.kv"

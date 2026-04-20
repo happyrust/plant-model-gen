@@ -2,7 +2,10 @@
 
 面向 PMS 后端调用 `plant-model-gen`（`web_server`）时的手工/联调示例。默认假设服务在 `http://127.0.0.1:3100`（以 `DbOption.toml` 中 `[web_server]` 为准）。
 
-> 当 `[review_auth].enabled = true` 时，下列接口中带 `token` 的需为有效 JWT（与 `编校审交互接口设计.md` 一致）。
+> PMS 入站接口统一走 `[platform_auth]`：
+> - `enabled = true` 时，`token` 必须是可通过后端验签的 JWT
+> - `enabled = false` 时，`token` 必须与 `platform_auth.debug_token` 完全一致
+> - `review_auth.enabled` 只影响浏览器侧 `/api/review/*`，不再决定 PMS S2S 是否放行
 
 ## 相关文档导航
 
@@ -23,7 +26,7 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/review/embed-url' \
     "user_id": "kangwp",
     "workflow_role": "sj",
     "form_id": "FORM-ABC123",
-    "token": "<平台签发的 JWT，可选；三段式 JWT 时须与 form_id 一致>",
+    "token": "<PMS 入站 S2S token；由 [platform_auth] 控制，必填>",
     "workflow_mode": "manual",
     "extra_parameters": { "is_reviewer": false }
   }'
@@ -41,14 +44,87 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/review/embed-url' \
 
 ---
 
-## 2. 校审流程同步（送审/审批）`POST /api/review/workflow/sync`
+## 2. 流程预校验 `POST /api/review/workflow/verify`
+
+`verify` 与 `workflow/sync` 使用**完全相同**的请求体；推荐调用顺序固定为：
+
+```text
+verify -> sync
+```
+
+`verify` 只做预判，不写 `review_tasks / review_forms / review_workflow_history`，也不触发任何异步通知。
+
+```bash
+curl -sS -X POST 'http://127.0.0.1:3100/api/review/workflow/verify' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "form_id": "FORM-ABC123",
+    "token": "<PMS 入站 S2S token>",
+    "action": "agree",
+    "actor": { "id": "liubo", "name": "刘某", "roles": "jd" },
+    "next_step": { "assignee_id": "wangsh", "name": "王某", "roles": "sh" },
+    "comments": "校核通过"
+  }'
+```
+
+典型响应（放行）：
+
+```json
+{
+  "code": 200,
+  "message": "ok",
+  "data": {
+    "passed": true,
+    "action": "agree",
+    "current_node": "jd",
+    "task_status": "submitted",
+    "next_step": "sh",
+    "reason": "验证通过，可继续流转",
+    "recommended_action": "proceed"
+  }
+}
+```
+
+典型响应（预校验拦截，但请求体合法）：
+
+```json
+{
+  "code": 200,
+  "message": "存在待确认批注，请逐条确认后再继续",
+  "error_code": "ANNOTATION_CHECK_FAILED",
+  "annotation_check": {
+    "passed": false,
+    "recommended_action": "block",
+    "current_node": "jd"
+  },
+  "data": {
+    "passed": false,
+    "action": "agree",
+    "current_node": "jd",
+    "task_status": "submitted",
+    "next_step": "sh",
+    "reason": "存在待确认批注，请逐条确认后再继续",
+    "recommended_action": "block"
+  }
+}
+```
+
+说明：
+
+- `HTTP 200 + passed=false`：表示请求体合法，但当前不允许流转。
+- `HTTP 400 / 404`：表示请求缺字段、目标节点非法、`form_id` 不存在等硬错误。
+- `HTTP 401`：S2S token 不合法。
+
+---
+
+## 3. 校审流程同步（送审/审批）`POST /api/review/workflow/sync`
 
 ```bash
 curl -sS -X POST 'http://127.0.0.1:3100/api/review/workflow/sync' \
   -H 'Content-Type: application/json' \
   -d '{
     "form_id": "FORM-ABC123",
-    "token": "<JWT，与 form_id 一致>",
+    "token": "<PMS 入站 S2S token>",
     "action": "active",
     "actor": { "id": "kangwp", "name": "康某", "roles": "sj" },
     "next_step": { "assignee_id": "liubo", "name": "刘某", "roles": "jd" },
@@ -59,13 +135,25 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/review/workflow/sync' \
 
 `action` 取值：`query`（只读查询）、`active`、`agree`、`return`、`stop`。
 
+正式接入顺序应为：
+
+```text
+workflow/verify -> workflow/sync
+```
+
+其中：
+
+- `workflow/verify`：只校验，不落库；
+- `workflow/sync`：真正写入并返回最新聚合快照；
+- 即使调用方跳过 `verify`，`workflow/sync` 仍会做同一套强校验。
+
 请求字段约束补充：
 
 - `comments` 表示平台流程引擎的当前节点整体审批意见。
 - 模型中心接收该字段用于 workflow 动作上下文，但**不会**在模型中心再次持久化，也**不会**在 `workflow/sync` 响应中回传。
 - 第三方若需要保存流程意见，应继续以平台流程系统自身记录为准。
 
-典型响应（已按“模型批注包 + 路由 URL”语义对齐）：
+典型响应（`action=query` 成功时）：
 
 ```json
 {
@@ -139,6 +227,7 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/review/workflow/sync' \
 - `annotation_comments`：挂在具体批注下的评论串。
 - `attachments.route_url`：统一返回可路由拼接的相对路径，第三方拿到域名后可自行拼接。
 - `attachments.public_url`：后端按 `web_server.public_base_url` / `backend_url` 计算出的绝对 URL；若未配置则可能为空。
+- 任一核心聚合查询报错时，接口直接返回非 200，`data = null`，不会再回“空成功”。
 
 ---
 
@@ -150,7 +239,7 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/review/cache/preload' \
   -d '{
     "project_id": "2410",
     "initiator": "kangwp",
-    "token": "<JWT>"
+    "token": "<PMS 入站 S2S token>"
   }'
 ```
 
@@ -164,9 +253,36 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/review/delete' \
   -d '{
     "form_ids": ["FORM-ABC123", "FORM-456"],
     "operator_id": "kangwp",
-    "token": "<JWT>"
+    "token": "<PMS 入站 S2S token>"
   }'
 ```
+
+典型成功响应：
+
+```json
+{
+  "code": 200,
+  "message": "ok",
+  "results": [
+    {
+      "form_id": "FORM-ABC123",
+      "success": true,
+      "message": "已清理 review 主链"
+    },
+    {
+      "form_id": "FORM-456",
+      "success": true,
+      "message": "已清理 review 主链"
+    }
+  ]
+}
+```
+
+删除范围：
+
+- 软删：`review_forms`、`review_tasks`
+- 物理删除：`review_form_model`、`review_records`、`review_attachment`、`review_workflow_history`、附件物理文件
+- **不会删除 `review_comments`**
 
 ---
 
@@ -192,5 +308,5 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/auth/token' \
 ## 代码位置（重构后）
 
 - 路由注册：`src/web_api/platform_api/mod.rs` → `create_platform_api_routes()`
-- 入站处理：`embed_url.rs`、`workflow_sync.rs`、`cache_preload.rs`、`delete_handler.rs`（删除为软删，无出站回调）
+- 入站处理：`embed_url.rs`、`workflow_sync.rs`、`cache_preload.rs`、`delete_handler.rs`（PMS S2S 统一走 `platform_auth`）
 - 主单据与任务查询：`review_form.rs`

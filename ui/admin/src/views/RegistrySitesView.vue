@@ -17,6 +17,7 @@ import {
 } from 'lucide-vue-next'
 
 import RegistrySiteDrawer from '@/components/registry/RegistrySiteDrawer.vue'
+import RegistryTaskDialog from '@/components/registry/RegistryTaskDialog.vue'
 import { findLinkedLocalSite, getRegistryStatusLabel } from '@/lib/registry'
 import { usePolling } from '@/composables/usePolling'
 import { useRegistryStore } from '@/stores/registry'
@@ -47,6 +48,7 @@ const importError = ref('')
 
 const deleteTarget = ref<RegistrySite | null>(null)
 const deleteLoading = ref(false)
+const taskTarget = ref<RegistrySite | null>(null)
 
 const { start: startPolling } = usePolling(async () => {
   await refreshAll({ silent: true })
@@ -175,7 +177,7 @@ async function handleHealthcheck(site: RegistrySite) {
 }
 
 function handleCreateTask(site: RegistrySite) {
-  router.push({ path: '/tasks/new', query: { site_id: site.site_id, site_label: site.name } })
+  taskTarget.value = site
 }
 
 async function handleExport(site: RegistrySite) {
@@ -236,6 +238,11 @@ async function changePage(nextPage: number) {
 
 function openLocalSite(siteId: string) {
   router.push(`/sites/${siteId}`)
+}
+
+function handleTaskCreated(payload: { taskId: string; message: string; siteName: string }) {
+  taskTarget.value = null
+  setFeedback('success', `${payload.siteName}：${payload.message}（${payload.taskId}）`)
 }
 
 onMounted(async () => {
@@ -516,6 +523,13 @@ onMounted(async () => {
       :site-id="editingSiteId"
       @close="drawerOpen = false"
       @saved="handleDrawerSaved"
+    />
+
+    <RegistryTaskDialog
+      :open="!!taskTarget"
+      :site="taskTarget"
+      @close="taskTarget = null"
+      @created="handleTaskCreated"
     />
 
     <Teleport to="body">

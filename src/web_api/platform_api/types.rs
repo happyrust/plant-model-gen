@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 #[cfg(feature = "web_server")]
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 
+use super::annotation_check::AnnotationCheckResult;
 use crate::web_api::review_api::ReviewTask;
 
 // ============================================================================
@@ -190,6 +191,35 @@ pub struct SyncWorkflowResponse {
     pub code: i32,
     pub message: String,
     pub data: Option<SyncWorkflowData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation_check: Option<AnnotationCheckResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerifyWorkflowResponse {
+    pub code: i32,
+    pub message: String,
+    pub data: Option<VerifyWorkflowData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation_check: Option<AnnotationCheckResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerifyWorkflowData {
+    pub passed: bool,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<String>,
+    pub reason: String,
+    pub recommended_action: String,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -268,6 +298,14 @@ pub struct DeleteReviewRequest {
 #[derive(Debug, Serialize)]
 pub struct DeleteReviewResponse {
     pub code: i32,
+    pub message: String,
+    pub results: Vec<DeleteReviewResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteReviewResult {
+    pub form_id: String,
+    pub success: bool,
     pub message: String,
 }
 

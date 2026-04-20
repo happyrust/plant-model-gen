@@ -10,6 +10,7 @@ import {
   ShieldAlert,
   TimerReset,
 } from 'lucide-vue-next'
+import { extractErrorMessage } from '@/api/client'
 import { sitesApi } from '@/api/sites'
 import { usePolling } from '@/composables/usePolling'
 import { useSitesStore } from '@/stores/sites'
@@ -18,6 +19,8 @@ import SiteRuntimeCards from '@/components/sites/SiteRuntimeCards.vue'
 import SiteLogSummaryPanel from '@/components/sites/SiteLogSummaryPanel.vue'
 import SiteRecentActivityPanel from '@/components/sites/SiteRecentActivityPanel.vue'
 import SiteConfigSections from '@/components/sites/SiteConfigSections.vue'
+import SiteDrawer from '@/components/sites/SiteDrawer.vue'
+import { buildViewerUrl } from '@/lib/viewer'
 import type {
   ManagedProjectSite,
   ManagedSiteLogsResponse,
@@ -33,11 +36,16 @@ const sitesStore = useSitesStore()
 const site = ref<ManagedProjectSite | null>(null)
 const runtime = ref<ManagedSiteRuntimeStatus | null>(null)
 const logsData = ref<ManagedSiteLogsResponse | null>(null)
+const siteError = ref('')
+const runtimeError = ref('')
+const logsError = ref('')
 const activeTab = ref<'overview' | 'deploy'>('overview')
 const activeLogTab = ref<'parse' | 'db' | 'web'>('parse')
+const drawerOpen = ref(false)
 
 const siteId = computed(() => String(route.params.id ?? ''))
 const resources = computed(() => runtime.value?.resources ?? null)
+const actionError = computed(() => sitesStore.getSiteActionError(siteId.value))
 
 const selectedLogs = computed(() => {
   if (logsData.value === null) return []
@@ -80,10 +88,23 @@ async function fetchAll() {
   const id = siteId.value
   try {
     site.value = await sitesApi.get(id)
+    siteError.value = ''
+  } catch (err: unknown) {
+    siteError.value = extractErrorMessage(err)
+  }
+
+  try {
     runtime.value = await sitesApi.runtime(id)
+    runtimeError.value = ''
+  } catch (err: unknown) {
+    runtimeError.value = extractErrorMessage(err)
+  }
+
+  try {
     logsData.value = await sitesApi.logs(id)
-  } catch {
-    // partial failure is acceptable
+    logsError.value = ''
+  } catch (err: unknown) {
+    logsError.value = extractErrorMessage(err)
   }
 }
 
@@ -192,14 +213,50 @@ function processValueTone(label: string, kind: 'cpu' | 'memory') {
 
 function viewerUrl() {
   const s = site.value
-  if (!s?.web_port) return null
-  const project = encodeURIComponent(s.associated_project || s.project_name)
-  return `http://localhost:3101/?backendPort=${s.web_port}&output_project=${project}`
+  if (!s) return null
+  return buildViewerUrl(s)
 }
 
 function openViewer() {
   const url = viewerUrl()
   if (url) window.open(url, '_blank')
+}
+
+function openEditDrawer() {
+  if (!site.value) return
+  drawerOpen.value = true
+}
+
+function handleDrawerSaved() {
+  drawerOpen.value = false
+  void fetchAll()
+}
+
+async function handleStart() {
+  try {
+    await sitesStore.startSite(siteId.value)
+    await fetchAll()
+  } catch {
+    // 错误已写入 store，页面横幅会显示
+  }
+}
+
+async function handleStop() {
+  try {
+    await sitesStore.stopSite(siteId.value)
+    await fetchAll()
+  } catch {
+    // 错误已写入 store，页面横幅会显示
+  }
+}
+
+async function handleParse() {
+  try {
+    await sitesStore.parseSite(siteId.value)
+    await fetchAll()
+  } catch {
+    // 错误已写入 store，页面横幅会显示
+  }
 }
 
 function copyText(text: string) {
@@ -220,12 +277,27 @@ onMounted(async () => {
       :site="site"
       :viewer-url="viewerUrl()"
       @back="router.push({ path: '/sites' })"
-      @start="sitesStore.startSite(siteId).then(fetchAll)"
-      @stop="sitesStore.stopSite(siteId).then(fetchAll)"
-      @parse="sitesStore.parseSite(siteId).then(fetchAll)"
+      @start="handleStart"
+      @stop="handleStop"
+      @parse="handleParse"
       @refresh="fetchAll"
       @open-viewer="openViewer()"
+      @edit="openEditDrawer"
     />
+
+    <div
+      v-if="siteError"
+      class="rounded-lg border border-destructive/50 bg-destructive/5 px-4 py-3 text-sm text-destructive"
+    >
+      站点信息加载失败：{{ siteError }}
+    </div>
+
+    <div
+      v-if="actionError"
+      class="rounded-lg border border-destructive/50 bg-destructive/5 px-4 py-3 text-sm text-destructive"
+    >
+      最近操作失败：{{ actionError.message }}
+    </div>
 
     <div class="flex gap-2 border-b border-border">
       <button
@@ -241,6 +313,13 @@ onMounted(async () => {
     </div>
 
     <div v-if="activeTab === 'overview'" class="space-y-4">
+      <div
+        v-if="runtimeError"
+        class="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-3 text-sm text-amber-700 dark:text-amber-300"
+      >
+        运行状态加载失败：{{ runtimeError }}
+      </div>
+
       <SiteRuntimeCards :site="site" :runtime="runtime" />
 
       <SiteRecentActivityPanel :runtime="runtime" />
@@ -384,6 +463,13 @@ onMounted(async () => {
         </div>
       </div>
 
+      <div
+        v-if="logsError"
+        class="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-3 text-sm text-amber-700 dark:text-amber-300"
+      >
+        日志加载失败：{{ logsError }}
+      </div>
+
       <SiteLogSummaryPanel v-if="logsData?.streams" :streams="logsData.streams" />
 
       <div class="rounded-lg border border-border bg-card">
@@ -408,5 +494,12 @@ onMounted(async () => {
     </div>
 
     <SiteConfigSections v-else-if="site" :site="site" />
+
+    <SiteDrawer
+      :open="drawerOpen"
+      :site-id="siteId"
+      @close="drawerOpen = false"
+      @saved="handleDrawerSaved"
+    />
   </div>
 </template>

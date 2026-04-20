@@ -3,12 +3,27 @@
 use axum::http::StatusCode;
 use tracing::warn;
 
-use crate::web_api::jwt_auth::{REVIEW_AUTH_CONFIG, verify_token};
+use crate::web_api::jwt_auth::{PLATFORM_AUTH_CONFIG, verify_token};
 
-/// Unified S2S token verification: validates JWT when auth is enabled, skips otherwise.
+/// Unified S2S token verification: validates JWT when auth is enabled;
+/// disabled mode still requires exact debug_token match.
 pub fn verify_s2s_token(token: &str) -> Result<(), (StatusCode, String)> {
-    if !REVIEW_AUTH_CONFIG.enabled {
-        return Ok(());
+    if !PLATFORM_AUTH_CONFIG.enabled {
+        let expected = PLATFORM_AUTH_CONFIG.debug_token.trim();
+        if expected.is_empty() {
+            warn!("platform_auth.enabled=false 但未配置 debug_token，拒绝 S2S 请求");
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "platform auth debug_token 未配置".to_string(),
+            ));
+        }
+
+        if token.trim() == expected {
+            return Ok(());
+        }
+
+        warn!("S2S debug_token 不匹配");
+        return Err((StatusCode::UNAUTHORIZED, "invalid debug_token".to_string()));
     }
 
     match verify_token(token) {

@@ -29,6 +29,26 @@ struct EmbedLineageBody {
     status: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct VerifyWorkflowResponseBody {
+    code: i32,
+    message: String,
+    data: Option<VerifyWorkflowDataBody>,
+    error_code: Option<String>,
+    annotation_check: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VerifyWorkflowDataBody {
+    passed: bool,
+    action: String,
+    current_node: Option<String>,
+    task_status: Option<String>,
+    next_step: Option<String>,
+    reason: String,
+    recommended_action: String,
+}
+
 async fn cleanup_form(form_id: &str) {
     let _ = project_primary_db()
         .query(
@@ -82,6 +102,102 @@ async fn insert_task_with_form_id(form_id: &str, user_id: &str) {
         .bind(("current_node", "jd".to_string()))
         .await
         .expect("seed review task");
+}
+
+async fn insert_task_seed(
+    form_id: &str,
+    requester_id: &str,
+    checker_id: &str,
+    approver_id: &str,
+    current_node: &str,
+    status: &str,
+) {
+    let _ = init_surreal().await;
+    let _ = cleanup_form(form_id).await;
+    project_primary_db()
+        .query(
+            r#"
+            CREATE ONLY review_tasks SET
+                id = $id,
+                form_id = $form_id,
+                title = $title,
+                description = $description,
+                model_name = $model_name,
+                status = $status,
+                priority = 'medium',
+                requester_id = $requester_id,
+                requester_name = $requester_id,
+                checker_id = $checker_id,
+                checker_name = $checker_id,
+                approver_id = $approver_id,
+                approver_name = $approver_id,
+                reviewer_id = $checker_id,
+                reviewer_name = $checker_id,
+                components = [],
+                attachments = NONE,
+                current_node = $current_node,
+                workflow_history = [],
+                created_at = time::now(),
+                updated_at = time::now()
+            "#,
+        )
+        .bind(("id", format!("task-{}", form_id.to_lowercase())))
+        .bind(("form_id", form_id.to_string()))
+        .bind(("title", format!("Task for {form_id}")))
+        .bind(("description", "seeded verify task".to_string()))
+        .bind(("model_name", "demo-model".to_string()))
+        .bind(("status", status.to_string()))
+        .bind(("requester_id", requester_id.to_string()))
+        .bind(("checker_id", checker_id.to_string()))
+        .bind(("approver_id", approver_id.to_string()))
+        .bind(("current_node", current_node.to_string()))
+        .await
+        .expect("seed verify task");
+}
+
+async fn insert_pending_review_record(task_id: &str, form_id: &str) {
+    project_primary_db()
+        .query(
+            r#"
+            CREATE review_records CONTENT {
+                id: $id,
+                task_id: $task_id,
+                form_id: $form_id,
+                type: "batch",
+                annotations: [
+                    {
+                        id: "ann-verify-pending-1",
+                        annotationType: "text",
+                        text: "待确认批注",
+                        refnos: ["24381/145018"],
+                        reviewState: {
+                            resolutionStatus: "fixed",
+                            decisionStatus: "pending",
+                            updatedAt: 1710000000000,
+                            updatedByName: "SJ",
+                            updatedByRole: "sj"
+                        }
+                    }
+                ],
+                cloud_annotations: [],
+                rect_annotations: [],
+                obb_annotations: [],
+                measurements: [],
+                note: "seed pending annotation",
+                current_node: "jd",
+                operator_id: "SJ",
+                operator_name: "SJ",
+                slot_key: "slot-verify-pending",
+                snapshot_hash: "hash-verify-pending",
+                confirmed_at: time::now()
+            }
+            "#,
+        )
+        .bind(("id", format!("record-{}", form_id.to_lowercase())))
+        .bind(("task_id", task_id.to_string()))
+        .bind(("form_id", form_id.to_string()))
+        .await
+        .expect("seed pending review record");
 }
 
 #[tokio::test]
@@ -494,12 +610,10 @@ async fn test_embed_url_returns_existing_task_for_form_id() {
     let lineage: EmbedLineageBody =
         serde_json::from_value(data.get("lineage").cloned().expect("lineage")).unwrap();
     assert_eq!(lineage.form_id, form_id);
-    assert!(
-        lineage
-            .task_id
-            .as_deref()
-            .is_some_and(|task_id| task_id.starts_with("task-form-db-backed-existing"))
-    );
+    assert!(lineage
+        .task_id
+        .as_deref()
+        .is_some_and(|task_id| task_id.starts_with("task-form-db-backed-existing")));
     assert_eq!(lineage.current_node.as_deref(), Some("jd"));
     assert_eq!(lineage.status.as_deref(), Some("in_review"));
     let task = data
@@ -521,17 +635,503 @@ async fn test_embed_url_returns_existing_task_for_form_id() {
         task.get("status").and_then(|v| v.as_str()),
         Some("in_review")
     );
-    assert!(
-        task.get("id")
-            .and_then(|v| v.as_str())
-            .is_some_and(|id| id.starts_with("task-form-db-backed-existing"))
-    );
+    assert!(task
+        .get("id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|id| id.starts_with("task-form-db-backed-existing")));
     let response_token = data
         .get("token")
         .and_then(|v| v.as_str())
         .expect("response token");
     let token_claims = verify_token(response_token).unwrap();
     assert_eq!(token_claims.legacy_form_id, None);
+
+    cleanup_form(form_id).await;
+}
+
+#[tokio::test]
+async fn test_workflow_verify_rejects_unauthorized_token() {
+    let app = create_platform_api_routes();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/workflow/verify")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "form_id": "FORM-VERIFY-UNAUTH",
+                        "token": "invalid-token",
+                        "action": "active",
+                        "actor": {
+                            "id": "SJ",
+                            "name": "SJ",
+                            "roles": "sj"
+                        },
+                        "next_step": {
+                            "assignee_id": "JH",
+                            "name": "JH",
+                            "roles": "jd"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload.code, 401);
+    assert_eq!(payload.message, "unauthorized");
+    assert!(payload.data.is_none());
+}
+
+#[tokio::test]
+async fn test_workflow_verify_rejects_unsupported_action() {
+    let app = create_platform_api_routes();
+    let (token, _) = create_token("project-1", "SJ", None, Some("sj"), None).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/workflow/verify")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "form_id": "FORM-VERIFY-BAD-ACTION",
+                        "token": token,
+                        "action": "query",
+                        "actor": {
+                            "id": "SJ",
+                            "name": "SJ",
+                            "roles": "sj"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload.code, 400);
+    assert!(payload.message.contains("verify 不支持 action=query"));
+}
+
+#[tokio::test]
+async fn test_workflow_verify_active_requires_next_step() {
+    let form_id = "FORM-VERIFY-MISSING-NEXT";
+    let _ = init_surreal().await;
+    insert_task_seed(form_id, "SJ", "JH", "SH", "sj", "draft").await;
+    let app = create_platform_api_routes();
+    let (token, _) = create_token("project-1", "SJ", None, Some("sj"), None).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/workflow/verify")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "form_id": form_id,
+                        "token": token,
+                        "action": "active",
+                        "actor": {
+                            "id": "SJ",
+                            "name": "SJ",
+                            "roles": "sj"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload.code, 400);
+    assert!(payload.message.contains("active 缺少 next_step"));
+
+    cleanup_form(form_id).await;
+}
+
+#[tokio::test]
+async fn test_workflow_verify_blank_form_without_task_returns_soft_block() {
+    let form_id = "FORM-VERIFY-BLANK-NO-TASK";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    super::review_form::ensure_review_form_stub(form_id, "project-1", "SJ", Some("sj"), "pms")
+        .await
+        .expect("seed blank review form");
+    let app = create_platform_api_routes();
+    let (token, _) = create_token("project-1", "SJ", None, Some("sj"), None).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/workflow/verify")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "form_id": form_id,
+                        "token": token,
+                        "action": "active",
+                        "actor": {
+                            "id": "SJ",
+                            "name": "SJ",
+                            "roles": "sj"
+                        },
+                        "next_step": {
+                            "assignee_id": "JH",
+                            "name": "JH",
+                            "roles": "jd"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload.code, 200);
+    let data = payload.data.expect("verify data");
+    assert!(!data.passed);
+    assert_eq!(data.action, "active");
+    assert_eq!(data.current_node.as_deref(), Some("sj"));
+    assert_eq!(data.task_status.as_deref(), Some("blank"));
+    assert_eq!(data.recommended_action, "block");
+    assert!(data.reason.contains("尚未创建活动 review task"));
+
+    cleanup_form(form_id).await;
+}
+
+#[tokio::test]
+async fn test_workflow_verify_active_on_non_sj_node_returns_soft_block() {
+    let form_id = "FORM-VERIFY-ACTIVE-NON-SJ";
+    let _ = init_surreal().await;
+    insert_task_seed(form_id, "SJ", "JH", "SH", "jd", "submitted").await;
+    let app = create_platform_api_routes();
+    let (token, _) = create_token("project-1", "JH", None, Some("jd"), None).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/workflow/verify")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "form_id": form_id,
+                        "token": token,
+                        "action": "active",
+                        "actor": {
+                            "id": "JH",
+                            "name": "JH",
+                            "roles": "jd"
+                        },
+                        "next_step": {
+                            "assignee_id": "JH",
+                            "name": "JH",
+                            "roles": "jd"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload.code, 200);
+    let data = payload.data.expect("verify data");
+    assert!(!data.passed);
+    assert_eq!(data.action, "active");
+    assert_eq!(data.current_node.as_deref(), Some("jd"));
+    assert_eq!(data.task_status.as_deref(), Some("submitted"));
+    assert_eq!(data.next_step.as_deref(), Some("jd"));
+    assert_eq!(data.recommended_action, "block");
+    assert!(data.reason.contains("active 仅允许从 sj 发起"));
+
+    let task_after = super::review_form::find_task_by_form_id(form_id)
+        .await
+        .expect("query task after verify")
+        .expect("task after verify");
+    assert_eq!(task_after.current_node, "jd");
+    assert_eq!(task_after.status, "submitted");
+
+    cleanup_form(form_id).await;
+}
+
+#[tokio::test]
+async fn test_workflow_verify_missing_form_returns_404() {
+    let form_id = "FORM-VERIFY-FORM-NOT-FOUND";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    let app = create_platform_api_routes();
+    let (token, _) = create_token("project-1", "SJ", None, Some("sj"), None).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/workflow/verify")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "form_id": form_id,
+                        "token": token,
+                        "action": "active",
+                        "actor": {
+                            "id": "SJ",
+                            "name": "SJ",
+                            "roles": "sj"
+                        },
+                        "next_step": {
+                            "assignee_id": "JH",
+                            "name": "JH",
+                            "roles": "jd"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload.code, 404);
+    assert!(payload.data.is_none());
+    assert!(payload.message.contains("未找到 review form"));
+}
+
+#[tokio::test]
+async fn test_workflow_verify_agree_terminal_task_returns_soft_block() {
+    let form_id = "FORM-VERIFY-AGREE-TERMINAL";
+    let _ = init_surreal().await;
+    insert_task_seed(form_id, "SJ", "JH", "SH", "pz", "approved").await;
+    let app = create_platform_api_routes();
+    let (token, _) = create_token("project-1", "PZ", None, Some("pz"), None).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/workflow/verify")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "form_id": form_id,
+                        "token": token,
+                        "action": "agree",
+                        "actor": {
+                            "id": "PZ",
+                            "name": "PZ",
+                            "roles": "pz"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload.code, 200);
+    let data = payload.data.expect("verify data");
+    assert!(!data.passed);
+    assert_eq!(data.action, "agree");
+    assert_eq!(data.current_node.as_deref(), Some("pz"));
+    assert_eq!(data.task_status.as_deref(), Some("approved"));
+    assert_eq!(data.recommended_action, "block");
+    assert!(data.reason.contains("当前单据已处于终态 approved"));
+
+    let task_after = super::review_form::find_task_by_form_id(form_id)
+        .await
+        .expect("query task after verify")
+        .expect("task after verify");
+    assert_eq!(task_after.current_node, "pz");
+    assert_eq!(task_after.status, "approved");
+
+    cleanup_form(form_id).await;
+}
+
+#[tokio::test]
+async fn test_workflow_verify_agree_returns_annotation_gate_block_without_mutation() {
+    let form_id = "FORM-VERIFY-ANNOTATION-BLOCK";
+    let _ = init_surreal().await;
+    insert_task_seed(form_id, "SJ", "JH", "SH", "jd", "submitted").await;
+    let task = super::review_form::find_task_by_form_id(form_id)
+        .await
+        .expect("query task")
+        .expect("seeded task");
+    insert_pending_review_record(&task.id, form_id).await;
+
+    let app = create_platform_api_routes();
+    let (token, _) = create_token("project-1", "JH", None, Some("jd"), None).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/workflow/verify")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "form_id": form_id,
+                        "token": token,
+                        "action": "agree",
+                        "actor": {
+                            "id": "JH",
+                            "name": "JH",
+                            "roles": "jd"
+                        },
+                        "next_step": {
+                            "assignee_id": "SH",
+                            "name": "SH",
+                            "roles": "sh"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload.code, 200);
+    assert_eq!(
+        payload.error_code.as_deref(),
+        Some("ANNOTATION_CHECK_FAILED")
+    );
+    let data = payload.data.expect("verify data");
+    assert!(!data.passed);
+    assert_eq!(data.action, "agree");
+    assert_eq!(data.current_node.as_deref(), Some("jd"));
+    assert_eq!(data.task_status.as_deref(), Some("submitted"));
+    assert_eq!(data.next_step.as_deref(), Some("sh"));
+    assert_eq!(data.recommended_action, "block");
+    assert!(data.reason.contains("待确认批注"));
+    let annotation_check = payload.annotation_check.expect("annotation_check");
+    assert_eq!(
+        annotation_check
+            .get("current_node")
+            .and_then(|value| value.as_str()),
+        Some("jd")
+    );
+
+    let task_after = super::review_form::find_task_by_form_id(form_id)
+        .await
+        .expect("query task after verify")
+        .expect("task after verify");
+    assert_eq!(task_after.current_node, "jd");
+    assert_eq!(task_after.status, "submitted");
+
+    cleanup_form(form_id).await;
+}
+
+#[tokio::test]
+async fn test_workflow_verify_pass_does_not_mutate_task_state() {
+    let form_id = "FORM-VERIFY-PASS-NO-MUTATION";
+    let _ = init_surreal().await;
+    insert_task_seed(form_id, "SJ", "JH", "SH", "sj", "draft").await;
+    let app = create_platform_api_routes();
+    let (token, _) = create_token("project-1", "SJ", None, Some("sj"), None).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/workflow/verify")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "form_id": form_id,
+                        "token": token,
+                        "action": "active",
+                        "actor": {
+                            "id": "SJ",
+                            "name": "SJ",
+                            "roles": "sj"
+                        },
+                        "next_step": {
+                            "assignee_id": "JH",
+                            "name": "JH",
+                            "roles": "jd"
+                        },
+                        "comments": "送审"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload.code, 200);
+    let data = payload.data.expect("verify data");
+    assert!(data.passed);
+    assert_eq!(data.action, "active");
+    assert_eq!(data.current_node.as_deref(), Some("sj"));
+    assert_eq!(data.task_status.as_deref(), Some("draft"));
+    assert_eq!(data.next_step.as_deref(), Some("jd"));
+    assert_eq!(data.recommended_action, "proceed");
+
+    let task_after = super::review_form::find_task_by_form_id(form_id)
+        .await
+        .expect("query task after verify")
+        .expect("task after verify");
+    assert_eq!(task_after.current_node, "sj");
+    assert_eq!(task_after.status, "draft");
 
     cleanup_form(form_id).await;
 }

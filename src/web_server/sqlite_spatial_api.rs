@@ -761,6 +761,7 @@ mod tests {
                 maxz: Some(1.5),
                 max_results: None,
                 nouns: None,
+                spec_values: None,
                 include_self: None,
                 shape: None,
             };
@@ -812,6 +813,7 @@ mod tests {
                 maxz: Some(1.5),
                 max_results: None,
                 nouns: None,
+                spec_values: None,
                 include_self: None,
                 shape: None,
             };

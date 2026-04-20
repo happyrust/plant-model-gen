@@ -2,6 +2,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
+    middleware,
     response::IntoResponse,
     routing::{delete, get, post, put},
 };
@@ -9,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::web_server::{
-    AppState, admin_task_handlers,
+    AppState, admin_auth_handlers, admin_task_handlers,
     admin_response::{self, ApiResponse},
     handlers,
     models::{
@@ -57,6 +58,7 @@ pub fn create_admin_registry_routes() -> Router<AppState> {
             "/api/admin/registry/sites/{id}/tasks",
             post(create_site_task),
         )
+        .layer(middleware::from_fn(admin_auth_handlers::admin_auth_middleware))
 }
 
 async fn list_sites(Query(params): Query<DeploymentSiteQuery>) -> impl IntoResponse {

@@ -6497,21 +6497,36 @@ mod wall_distance_tests {
                 noun: "WALL".to_string(),
                 spec_value: None,
                 distance_mm: 8.0,
-                aabb: dummy_aabb.clone(),
+                closest_point: WallDistancePoint {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                aabb: Some(dummy_aabb.clone()),
             },
             WallDistanceCandidateDto {
                 refno: "1/2".to_string(),
                 noun: "COLUMN".to_string(),
                 spec_value: None,
                 distance_mm: 2.0,
-                aabb: dummy_aabb.clone(),
+                closest_point: WallDistancePoint {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                aabb: Some(dummy_aabb.clone()),
             },
             WallDistanceCandidateDto {
                 refno: "1/3".to_string(),
                 noun: "WALL".to_string(),
                 spec_value: None,
                 distance_mm: 5.0,
-                aabb: dummy_aabb,
+                closest_point: WallDistancePoint {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                aabb: Some(dummy_aabb),
             },
         ];
 

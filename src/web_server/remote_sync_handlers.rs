@@ -6,12 +6,19 @@ use axum::{
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post, put, delete as axum_delete},
 };
+use once_cell::sync::Lazy;
 use rusqlite::{OptionalExtension, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{convert::TryFrom, io::ErrorKind, path::PathBuf, time::Instant};
+use std::{
+    convert::TryFrom,
+    io::{ErrorKind, Write},
+    path::{Path as FsPath, PathBuf},
+    time::Instant,
+};
 use tokio::time::{Duration, timeout};
 use tokio::{fs, net::TcpStream};
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::web_server::admin_response;
@@ -155,6 +162,17 @@ pub async fn remote_sync_page() -> Html<String> {
 }
 
 static SCHEMA_INITIALIZED: std::sync::Once = std::sync::Once::new();
+static REMOTE_SYNC_CONFIG_LOCK: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
+const LOCAL_FILE_SERVER_PLACEHOLDER: &str = "local://file_server_host";
+
+#[derive(Debug)]
+struct RemoteSyncRuntimeConfigUpdate {
+    mqtt_host: Option<String>,
+    mqtt_port: Option<u16>,
+    file_server_host: Option<String>,
+    location: Option<String>,
+    location_dbs: Vec<u32>,
+}
 
 fn resolve_db_path() -> String {
     use config as cfg;
@@ -270,6 +288,191 @@ pub fn open_sqlite() -> Result<rusqlite::Connection, Box<dyn std::error::Error>>
     }
 
     Ok(conn)
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value.and_then(|item| {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn parse_u32_csv(value: Option<String>) -> Vec<u32> {
+    value.unwrap_or_default()
+        .split(|c| c == ',' || c == ' ')
+        .filter_map(|token| token.trim().parse::<u32>().ok())
+        .collect()
+}
+
+fn load_env_runtime_config_update(env_id: &str) -> Result<RemoteSyncRuntimeConfigUpdate, String> {
+    let conn = open_sqlite().map_err(|e| format!("打开协同组存储失败: {}", e))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT mqtt_host, mqtt_port, file_server_host, location, location_dbs
+             FROM remote_sync_envs
+             WHERE id = ?1
+             LIMIT 1",
+        )
+        .map_err(|e| format!("读取协同组失败: {}", e))?;
+
+    stmt.query_row(rusqlite::params![env_id], |row| {
+        Ok(RemoteSyncRuntimeConfigUpdate {
+            mqtt_host: normalize_optional_text(row.get::<_, Option<String>>(0)?),
+            mqtt_port: row
+                .get::<_, Option<i64>>(1)?
+                .and_then(|value| u16::try_from(value).ok()),
+            file_server_host: normalize_optional_text(row.get::<_, Option<String>>(2)?),
+            location: normalize_optional_text(row.get::<_, Option<String>>(3)?),
+            location_dbs: parse_u32_csv(row.get::<_, Option<String>>(4)?),
+        })
+    })
+    .optional()
+    .map_err(|e| format!("读取协同组失败: {}", e))?
+    .ok_or_else(|| "协同组不存在".to_string())
+}
+
+fn find_first_section_offset(content: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for segment in content.split_inclusive('\n') {
+        if segment.trim().starts_with('[') {
+            return Some(offset);
+        }
+        offset += segment.len();
+    }
+    None
+}
+
+fn find_root_key_line_range(content: &str, key: &str) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    for segment in content.split_inclusive('\n') {
+        let trimmed = segment.trim();
+        if trimmed.starts_with('[') {
+            break;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            offset += segment.len();
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix(key) {
+            if rest.trim_start().starts_with('=') {
+                return Some((offset, offset + segment.len()));
+            }
+        }
+        offset += segment.len();
+    }
+    None
+}
+
+fn replace_or_insert_root_line(content: &mut String, key: &str, line: Option<String>) {
+    if let Some((start, end)) = find_root_key_line_range(content, key) {
+        match line {
+            Some(next_line) => {
+                let replacement = if next_line.ends_with('\n') {
+                    next_line
+                } else {
+                    format!("{}\n", next_line)
+                };
+                content.replace_range(start..end, &replacement);
+            }
+            None => {
+                content.replace_range(start..end, "");
+            }
+        }
+        return;
+    }
+
+    let Some(next_line) = line else {
+        return;
+    };
+    let insert_at = find_first_section_offset(content).unwrap_or(content.len());
+    let prefix = if insert_at > 0 && !content[..insert_at].ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    };
+    let suffix = if next_line.ends_with('\n') { "" } else { "\n" };
+    content.insert_str(insert_at, &format!("{}{}{}", prefix, next_line, suffix));
+}
+
+fn escape_toml_basic_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn set_root_string_key(content: &mut String, key: &str, value: Option<&str>) {
+    let rendered = format!(
+        r#"{key} = "{}""#,
+        escape_toml_basic_string(value.unwrap_or_default())
+    );
+    replace_or_insert_root_line(content, key, Some(rendered));
+}
+
+fn set_root_number_key<T: std::fmt::Display>(content: &mut String, key: &str, value: Option<T>) {
+    replace_or_insert_root_line(content, key, value.map(|number| format!("{key} = {number}")));
+}
+
+fn set_root_u32_array_key(content: &mut String, key: &str, values: &[u32]) {
+    let joined = values
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    replace_or_insert_root_line(content, key, Some(format!("{key} = [{}]", joined)));
+}
+
+fn atomic_write_config(path: &FsPath, content: &str) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| FsPath::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("DbOption.toml");
+    let temp_path = parent.join(format!(".{}.{}.tmp", file_name, Uuid::new_v4()));
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let _ = std::fs::set_permissions(&temp_path, metadata.permissions());
+        }
+        std::fs::rename(&temp_path, path)?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!("写入当前配置失败: {}", err));
+    }
+    Ok(())
+}
+
+fn write_env_to_runtime_config(env_id: &str) -> Result<(), String> {
+    let update = load_env_runtime_config_update(env_id)?;
+    let cfg_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_file = format!("{}.toml", cfg_name);
+    let path = FsPath::new(&cfg_file);
+    if !path.exists() {
+        return Err(format!("{} 不存在，无法写入当前配置。", cfg_file));
+    }
+
+    let mut content =
+        std::fs::read_to_string(path).map_err(|e| format!("读取当前配置失败: {}", e))?;
+
+    set_root_string_key(&mut content, "mqtt_host", update.mqtt_host.as_deref());
+    set_root_number_key(&mut content, "mqtt_port", update.mqtt_port);
+    set_root_string_key(
+        &mut content,
+        "file_server_host",
+        update.file_server_host.as_deref(),
+    );
+    set_root_string_key(&mut content, "location", update.location.as_deref());
+    set_root_u32_array_key(&mut content, "location_dbs", &update.location_dbs);
+
+    atomic_write_config(path, &content)
 }
 
 // ===== Envs =====
@@ -521,11 +724,23 @@ fn validate_http_host(host: &Option<String>) -> Result<(), String> {
     if h.is_empty() {
         return Ok(());
     }
-    if h.contains(' ') || h.contains('\n') {
+    if h.chars().any(char::is_whitespace) {
         return Err("http_host 不能包含空格或换行".into());
     }
-    if !h.starts_with("http://") && !h.starts_with("https://") && !h.contains(':') && !h.contains('.') {
-        return Err(format!("http_host 格式不合法: {}", h));
+    if h.starts_with('/') || h.starts_with("./") || h.starts_with("../") {
+        return Err("http_host 只允许 HTTP/HTTPS 地址".into());
+    }
+    if h.starts_with("file://") {
+        return Err("http_host 不支持 file:// 本地路径".into());
+    }
+
+    let parsed = reqwest::Url::parse(h).map_err(|_| "http_host 格式不合法，仅支持 HTTP/HTTPS 地址".to_string())?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("http_host 格式不合法，仅支持 HTTP/HTTPS 地址".into()),
+    }
+    if parsed.host_str().map(|value| value.trim().is_empty()).unwrap_or(true) {
+        return Err("http_host 缺少主机名".into());
     }
     Ok(())
 }
@@ -668,176 +883,28 @@ pub async fn delete_site(
 // ===== 应用到运行时（写入 DbOption.toml） =====
 
 pub async fn apply_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let conn = match open_sqlite() {
-        Ok(conn) => conn,
-        Err(e) => {
-            return Ok(action_failed(
-                format!("打开协同组存储失败: {}", e),
-                serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
-            ));
-        }
-    };
-    let mut stmt = match conn
-        .prepare("SELECT name, mqtt_host, mqtt_port, file_server_host, location, location_dbs FROM remote_sync_envs WHERE id = ?1 LIMIT 1")
-    {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            return Ok(action_failed(
-                format!("读取协同组失败: {}", e),
-                serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
-            ));
-        }
-    };
-    let mut rows = match stmt.query(rusqlite::params![id.clone()]) {
-        Ok(rows) => rows,
-        Err(e) => {
-            return Ok(action_failed(
-                format!("查询协同组失败: {}", e),
-                serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
-            ));
-        }
-    };
-    let row = match rows.next() {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return Ok(action_failed(
-                "协同组不存在",
-                serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
-            ));
-        }
-        Err(e) => {
-            return Ok(action_failed(
-                format!("读取协同组失败: {}", e),
-                serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
-            ));
-        }
-    };
-
-    let mqtt_host: Option<String> = row.get(1).ok();
-    let mqtt_port_opt: Option<i64> = row.get(2).ok().flatten();
-    let file_server_host: Option<String> = row.get(3).ok();
-    let location: Option<String> = row.get(4).ok();
-    let location_dbs: Option<String> = row.get(5).ok();
-
-    let cfg_name =
-        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
-    let cfg_file = format!("{}.toml", cfg_name);
-    let path = std::path::Path::new(&cfg_file);
-    if !path.exists() {
-        return Ok(action_failed(
-            format!("{} 不存在，无法写入当前配置。", cfg_file),
+    let _guard = REMOTE_SYNC_CONFIG_LOCK.lock().await;
+    match write_env_to_runtime_config(&id) {
+        Ok(()) => Ok(action_success(
+            "已写入配置文件。部分运行期组件需重启或重新加载配置后生效。",
             serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
-        ));
-    }
-
-    let mut content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) => {
-            return Ok(action_failed(
-                format!("读取当前配置失败: {}", e),
-                serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
-            ));
-        }
-    };
-
-    // 替换/插入字符串键
-    fn set_str(content: &mut String, key: &str, val: &str) {
-        let line = format!("{} = \"{}\"", key, val);
-        let re = regex_like_find(content, key);
-        if let Some((start, end)) = re {
-            content.replace_range(start..end, &format!("{}\n", line));
-        } else {
-            content.push_str(&format!("\n{}\n", line));
-        }
-    }
-    // 替换/插入数值键
-    fn set_num<T: std::fmt::Display>(content: &mut String, key: &str, v: T) {
-        let line = format!("{} = {}", key, v);
-        let re = regex_like_find(content, key);
-        if let Some((start, end)) = re {
-            content.replace_range(start..end, &format!("{}\n", line));
-        } else {
-            content.push_str(&format!("\n{}\n", line));
-        }
-    }
-    // 替换/插入数组键（u32 列表）
-    fn set_u32_array(content: &mut String, key: &str, vals: &[u32]) {
-        let joined = vals
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let line = format!("{} = [{}]", key, joined);
-        let re = regex_like_find(content, key);
-        if let Some((start, end)) = re {
-            content.replace_range(start..end, &format!("{}\n", line));
-        } else {
-            content.push_str(&format!("\n{}\n", line));
-        }
-    }
-    // 在不引入正则依赖的前提下，做一个简单的 key 定位（行级）
-    fn regex_like_find(s: &str, key: &str) -> Option<(usize, usize)> {
-        let mut off = 0usize;
-        for line in s.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with(key) && trimmed.contains('=') {
-                let start = off;
-                let end = off + line.len();
-                return Some((start, end));
-            }
-            off += line.len() + 1; // +1 for newline
-        }
-        None
-    }
-
-    if let Some(h) = mqtt_host.as_deref() {
-        set_str(&mut content, "mqtt_host", h);
-    }
-    if let Some(p) = mqtt_port_opt {
-        set_num(&mut content, "mqtt_port", p);
-    }
-    if let Some(fs) = file_server_host.as_deref() {
-        set_str(&mut content, "file_server_host", fs);
-    }
-    if let Some(loc) = location.as_deref() {
-        set_str(&mut content, "location", loc);
-    }
-
-    if let Some(dbs_str) = location_dbs.as_deref() {
-        let vals: Vec<u32> = dbs_str
-            .split(|c| c == ',' || c == ' ')
-            .filter_map(|t| t.trim().parse::<u32>().ok())
-            .collect();
-        if !vals.is_empty() {
-            set_u32_array(&mut content, "location_dbs", &vals);
-        }
-    }
-
-    if let Err(e) = std::fs::write(path, content) {
-        return Ok(action_failed(
-            format!("写入当前配置失败: {}", e),
+        )),
+        Err(message) => Ok(action_failed(
+            message,
             serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
-        ));
+        )),
     }
-
-    Ok(action_success(
-        "已写入配置文件。部分运行期组件需重启或重新加载配置后生效。",
-        serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
-    ))
 }
 
 /// 激活环境（即时生效）：写入 DbOption.toml 并在 WebUI 进程内重启 watcher + MQTT
 pub async fn activate_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>, StatusCode> {
-    // 先复用 apply_env 的写入逻辑
-    let _ = match apply_env(Path(id.clone())).await {
-        Ok(response) => response,
-        Err(status) => {
-            return Ok(action_failed(
-                format!("写入当前配置失败: {}", status),
-                serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
-            ));
-        }
-    };
+    let _guard = REMOTE_SYNC_CONFIG_LOCK.lock().await;
+    if let Err(message) = write_env_to_runtime_config(&id) {
+        return Ok(action_failed(
+            message,
+            serde_json::Map::from_iter([("env_id".to_string(), json!(id))]),
+        ));
+    }
 
     // 停止当前运行态
     crate::web_server::remote_runtime::stop_runtime().await;
@@ -1027,7 +1094,7 @@ pub async fn test_http_env(Path(id): Path<String>) -> Result<Json<serde_json::Va
             Ok(_) => Ok(ok_diagnostic(
                 "本地文件服务目录可达",
                 serde_json::Map::from_iter([
-                    ("url".to_string(), json!(path.to_string_lossy().to_string())),
+                    ("url".to_string(), json!(LOCAL_FILE_SERVER_PLACEHOLDER)),
                     (
                         "latency_ms".to_string(),
                         json!(start.elapsed().as_millis() as u64),
@@ -1038,7 +1105,7 @@ pub async fn test_http_env(Path(id): Path<String>) -> Result<Json<serde_json::Va
                 format!("本地文件服务目录不可达: {}", err),
                 serde_json::Map::from_iter([(
                     "url".to_string(),
-                    json!(path.to_string_lossy().to_string()),
+                    json!(LOCAL_FILE_SERVER_PLACEHOLDER),
                 )]),
             )),
         };
@@ -1094,52 +1161,23 @@ pub async fn test_http_site(
     let url = info
         .site_host
         .clone()
-        .filter(|value| !value.trim().is_empty())
+        .filter(|value| site_metadata::is_http_url(value))
         .or_else(|| {
             info.env_file_host
                 .clone()
-                .filter(|value| !value.trim().is_empty())
+                .filter(|value| site_metadata::is_http_url(value))
         });
     let Some(url) = url else {
         return Ok(failed_diagnostic(
-            "未配置可用的站点 HTTP 地址",
+            "未配置可用的 HTTP/HTTPS 站点地址",
             serde_json::Map::new(),
         ));
     };
 
-    if site_metadata::is_local_path_hint(&url) {
-        let metadata_path =
-            site_metadata::metadata_file_path(&site_metadata::normalize_local_base(&url));
-        let start = Instant::now();
-        return match fs::metadata(&metadata_path).await {
-            Ok(_) => Ok(ok_diagnostic(
-                "metadata.json 可达",
-                serde_json::Map::from_iter([
-                    (
-                        "url".to_string(),
-                        json!(metadata_path.to_string_lossy().to_string()),
-                    ),
-                    ("code".to_string(), json!(200)),
-                    (
-                        "latency_ms".to_string(),
-                        json!(start.elapsed().as_millis() as u64),
-                    ),
-                ]),
-            )),
-            Err(err) => Ok(failed_diagnostic(
-                format!("metadata.json 不可达: {}", err),
-                serde_json::Map::from_iter([(
-                    "url".to_string(),
-                    json!(metadata_path.to_string_lossy().to_string()),
-                )]),
-            )),
-        };
-    }
-
     if !site_metadata::is_http_url(&url) {
         return Ok(failed_diagnostic(
-            "http_host 既不是 HTTP 地址也不是本地路径",
-            serde_json::Map::from_iter([("url".to_string(), json!(url))]),
+            "http_host 只允许 HTTP/HTTPS 地址",
+            serde_json::Map::new(),
         ));
     }
 
@@ -1209,12 +1247,18 @@ pub async fn runtime_config() -> Result<Json<serde_json::Value>, StatusCode> {
     }
 
     fn parse_root_value(content: &str, key: &str) -> Option<String> {
-        for line in content.lines() {
-            let trimmed = line.trim();
+        for segment in content.split_inclusive('\n') {
+            let trimmed = segment.trim();
             if trimmed.starts_with('#') || trimmed.starts_with('[') {
+                if trimmed.starts_with('[') {
+                    break;
+                }
                 continue;
             }
-            if trimmed.starts_with(key) && trimmed.contains('=') {
+            if let Some(rest) = trimmed.strip_prefix(key) {
+                if !rest.trim_start().starts_with('=') {
+                    continue;
+                }
                 return trimmed
                     .split_once('=')
                     .map(|(_, value)| value.trim().to_string());
@@ -1910,16 +1954,10 @@ fn load_site_info(conn: &rusqlite::Connection, site_id: &str) -> Result<SiteInfo
 }
 
 fn resolve_local_base(info: &SiteInfo) -> Option<PathBuf> {
-    info.site_host
+    info.env_file_host
         .as_deref()
         .filter(site_metadata::is_local_path_hint_ref)
         .map(site_metadata::normalize_local_base)
-        .or_else(|| {
-            info.env_file_host
-                .as_deref()
-                .filter(site_metadata::is_local_path_hint_ref)
-                .map(site_metadata::normalize_local_base)
-        })
 }
 
 fn fill_metadata_defaults(metadata: &mut SiteMetadataFile, info: &SiteInfo) {

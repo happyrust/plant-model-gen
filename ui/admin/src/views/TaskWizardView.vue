@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
+import { extractErrorMessage } from '@/api/client'
 import { useTasksStore } from '@/stores/tasks'
 import { useSitesStore } from '@/stores/sites'
 import type { TaskType, TaskPriority, DatabaseConfig } from '@/types/task'
@@ -12,6 +13,7 @@ const sitesStore = useSitesStore()
 
 const step = ref(1)
 const submitting = ref(false)
+const submitError = ref('')
 
 const taskName = ref('')
 const taskType = ref<TaskType>('ParsePdmsData')
@@ -77,6 +79,7 @@ function buildConfig(): Partial<DatabaseConfig> {
 
 async function handleSubmit() {
   submitting.value = true
+  submitError.value = ''
   try {
     await tasksStore.createTask({
       task_name: taskName.value,
@@ -86,6 +89,8 @@ async function handleSubmit() {
       config_override: buildConfig(),
     })
     router.push({ name: 'tasks' })
+  } catch (err: unknown) {
+    submitError.value = extractErrorMessage(err)
   } finally {
     submitting.value = false
   }
@@ -101,6 +106,13 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
     <div>
       <h2 class="text-2xl font-semibold tracking-tight">创建任务</h2>
       <p class="text-sm text-muted-foreground">按步骤配置任务参数</p>
+    </div>
+
+    <div
+      v-if="submitError"
+      class="rounded-lg border border-destructive/50 bg-destructive/5 px-4 py-3 text-sm text-destructive"
+    >
+      {{ submitError }}
     </div>
 
     <!-- Stepper -->

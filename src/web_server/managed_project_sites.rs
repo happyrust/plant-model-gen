@@ -40,6 +40,7 @@ const PROCESS_WARNING_MEMORY_BYTES: u64 = 1536 * 1024 * 1024;
 const PROCESS_CRITICAL_MEMORY_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const PARSE_WARNING_DURATION_MS: u64 = 10 * 60 * 1000;
 const PARSE_CRITICAL_DURATION_MS: u64 = 30 * 60 * 1000;
+const ADMIN_PARSE_REQUIRED_SYSTEM_DB_TYPES: &[&str] = &["SYST"];
 
 #[derive(Debug, Clone)]
 struct LogSnapshot {
@@ -294,16 +295,28 @@ fn normalize_host(host: Option<String>) -> String {
         .unwrap_or_else(|| "127.0.0.1".to_string())
 }
 
-fn normalize_db_user(user: Option<String>) -> String {
+fn require_db_user(user: Option<String>) -> Result<String> {
     user.map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "root".to_string())
+        .ok_or_else(|| anyhow!("数据库用户名不能为空"))
 }
 
-fn normalize_db_password(password: Option<String>) -> String {
+fn require_db_password(password: Option<String>) -> Result<String> {
     password
         .map(|value| value.trim().to_string())
-        .unwrap_or_else(|| "root".to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("数据库密码不能为空"))
+}
+
+fn normalize_optional_db_user(user: Option<String>) -> Option<String> {
+    user.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_optional_db_password(password: Option<String>) -> Option<String> {
+    password
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn normalize_manual_db_nums(values: Vec<u32>) -> Vec<u32> {
@@ -459,6 +472,45 @@ fn find_db_file_name_for_dbnum(root: &Path, target_dbnum: u32) -> Result<Option<
     Ok(None)
 }
 
+fn collect_db_file_names_for_types(
+    root: &Path,
+    target_types: &[&str],
+    file_names: &mut Vec<String>,
+) -> Result<()> {
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("读取目录失败: {}", root.display()))?
+        .flatten()
+    {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_db_file_names_for_types(&path, target_types, file_names)?;
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if file_name.contains('.') {
+            continue;
+        }
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let mut buf = [0u8; 60];
+        if file.read_exact(&mut buf).is_err() {
+            continue;
+        }
+        let db_info = parse_file_basic_info(&buf);
+        if target_types.contains(&db_info.db_type.as_str()) {
+            file_names.push(file_name.to_string());
+        }
+    }
+    Ok(())
+}
+
 fn resolve_included_db_files(site: &ManagedProjectSite) -> Result<Vec<String>> {
     if site.manual_db_nums.is_empty() {
         return Ok(Vec::new());
@@ -470,6 +522,11 @@ fn resolve_included_db_files(site: &ManagedProjectSite) -> Result<Vec<String>> {
         .ok_or_else(|| anyhow!("项目路径不存在: {}", site.project_path))?;
 
     let mut file_names = Vec::new();
+    collect_db_file_names_for_types(
+        &project_root,
+        ADMIN_PARSE_REQUIRED_SYSTEM_DB_TYPES,
+        &mut file_names,
+    )?;
     for dbnum in &site.manual_db_nums {
         let file_name = find_db_file_name_for_dbnum(&project_root, *dbnum)?
             .ok_or_else(|| anyhow!("项目路径下未找到 dbnum={} 对应的 db 文件", dbnum))?;
@@ -597,7 +654,7 @@ fn build_site_config(
     set_toml_string(
         web_server,
         "surreal_bind",
-        format!("0.0.0.0:{}", site.db_port),
+        format!("127.0.0.1:{}", site.db_port),
     );
     web_server.remove("surreal_user");
     web_server.remove("surreal_password");
@@ -769,6 +826,36 @@ fn refresh_site(site: &mut ManagedProjectSite) {
             site.status = ManagedSiteStatus::Draft;
         }
     }
+}
+
+fn site_db_running(site: &ManagedProjectSite) -> bool {
+    pid_running(site.db_pid) || port_in_use("127.0.0.1", site.db_port)
+}
+
+fn site_web_running(site: &ManagedProjectSite) -> bool {
+    pid_running(site.web_pid) || port_in_use("127.0.0.1", site.web_port)
+}
+
+fn site_parse_running(site: &ManagedProjectSite) -> bool {
+    pid_running(site.parse_pid)
+}
+
+fn site_has_active_processes(site: &ManagedProjectSite) -> bool {
+    site_db_running(site) || site_web_running(site) || site_parse_running(site)
+}
+
+fn record_site_error(
+    site_id: &str,
+    message: impl Into<String>,
+    status: Option<ManagedSiteStatus>,
+    parse_status: Option<ManagedSiteParseStatus>,
+) {
+    let _ = update_runtime(site_id, RuntimeUpdate {
+        status,
+        parse_status,
+        last_error: Some(Some(message.into())),
+        ..Default::default()
+    });
 }
 
 fn assert_port_available(
@@ -952,8 +1039,8 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
         created_at: created_at.clone(),
         updated_at: created_at,
     };
-    let db_user = normalize_db_user(req.db_user);
-    let db_password = normalize_db_password(req.db_password);
+    let db_user = require_db_user(req.db_user)?;
+    let db_password = require_db_password(req.db_password)?;
     write_site_files(&site, &db_user, &db_password)?;
     persist_site(&conn, &site, &db_user, &db_password)?;
     Ok(site)
@@ -979,10 +1066,13 @@ fn load_credentials(conn: &Connection, site_id: &str) -> Result<(String, String)
 pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<ManagedProjectSite> {
     let conn = open_db()?;
     let mut site = load_site_with_conn(&conn, site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
-    if matches!(
-        site.status,
-        ManagedSiteStatus::Running | ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
-    ) {
+    if site.parse_status == ManagedSiteParseStatus::Running
+        || site_has_active_processes(&site)
+        || matches!(
+            site.status,
+            ManagedSiteStatus::Running | ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
+        )
+    {
         bail!("站点运行中，不能修改配置");
     }
 
@@ -999,7 +1089,7 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
         site.manual_db_nums = normalize_manual_db_nums(value);
     }
     if let Some(value) = req.bind_host.filter(|value| !value.trim().is_empty()) {
-        site.bind_host = value.trim().to_string();
+        site.bind_host = normalize_host(Some(value));
     }
     if let Some(value) = req.public_base_url {
         site.public_base_url = if value.trim().is_empty() {
@@ -1036,8 +1126,14 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
 
     assert_port_available(&conn, Some(site_id), site.db_port, site.web_port)?;
     let (stored_db_user, stored_db_password) = load_credentials(&conn, site_id)?;
-    let db_user = normalize_db_user(req.db_user.or(Some(stored_db_user)));
-    let db_password = normalize_db_password(req.db_password.or(Some(stored_db_password)));
+    if matches!(req.db_user.as_ref(), Some(value) if value.trim().is_empty()) {
+        bail!("数据库用户名不能为空");
+    }
+    if matches!(req.db_password.as_ref(), Some(value) if value.trim().is_empty()) {
+        bail!("数据库密码不能为空");
+    }
+    let db_user = normalize_optional_db_user(req.db_user).unwrap_or(stored_db_user);
+    let db_password = normalize_optional_db_password(req.db_password).unwrap_or(stored_db_password);
     write_site_files(&site, &db_user, &db_password)?;
     persist_site(&conn, &site, &db_user, &db_password)?;
     Ok(site)
@@ -1729,6 +1825,8 @@ async fn wait_for_http_ok(url: &str, attempts: usize, delay_ms: u64) -> bool {
 async fn spawn_parse_process(site_id: String) -> Result<()> {
     let conn = open_db()?;
     let site = load_site_with_conn(&conn, &site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
+    let (db_user, db_password) = load_credentials(&conn, &site.site_id)?;
+    write_site_files(&site, &db_user, &db_password)?;
     let config_path = parse_config_path(&site.site_id);
     let config_no_ext = config_path
         .to_string_lossy()
@@ -1743,7 +1841,14 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
         .filter(|_| site.manual_db_nums.len() == 1);
     let (stdout, stderr) = open_log_file(&parse_log_path(&site.site_id))?;
     let repo = repo_root()?;
-    let mut command = if should_run_aios_database_from_source(&repo) {
+    let mut command = if let Some(binary) = aios_database_binary()? {
+        let mut cmd = Command::new(binary);
+        cmd.arg("-c").arg(config_no_ext);
+        if let Some(dbnum) = single_dbnum {
+            cmd.arg("--dbnum").arg(dbnum.to_string());
+        }
+        cmd
+    } else if should_run_aios_database_from_source(&repo) {
         let mut cmd = Command::new("cargo");
         cmd.arg("run")
             .arg("--bin")
@@ -1751,13 +1856,6 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
             .arg("--")
             .arg("-c")
             .arg(config_no_ext);
-        if let Some(dbnum) = single_dbnum {
-            cmd.arg("--dbnum").arg(dbnum.to_string());
-        }
-        cmd
-    } else if let Some(binary) = aios_database_binary()? {
-        let mut cmd = Command::new(binary);
-        cmd.arg("-c").arg(config_no_ext);
         if let Some(dbnum) = single_dbnum {
             cmd.arg("--dbnum").arg(dbnum.to_string());
         }
@@ -1836,7 +1934,7 @@ async fn spawn_db_process(site: &ManagedProjectSite) -> Result<u32> {
         .arg("--pass")
         .arg(&db_password)
         .arg("--bind")
-        .arg(format!("0.0.0.0:{}", site.db_port))
+        .arg(format!("127.0.0.1:{}", site.db_port))
         .arg(format!("rocksdb://{}", site.db_data_path))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -1979,9 +2077,25 @@ pub async fn start_site(site_id: String) -> Result<()> {
     let site = get_site(&site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
     if matches!(
         site.status,
-        ManagedSiteStatus::Running | ManagedSiteStatus::Starting
+        ManagedSiteStatus::Running | ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
     ) {
-        bail!("站点已在运行中");
+        let message = if site.status == ManagedSiteStatus::Stopping {
+            "站点停止中，请稍后再启动".to_string()
+        } else {
+            "站点已在运行中".to_string()
+        };
+        record_site_error(&site_id, message.clone(), Some(site.status.clone()), None);
+        bail!(message);
+    }
+    if site.parse_status == ManagedSiteParseStatus::Running {
+        let message = "解析任务仍在运行，请稍后再启动站点".to_string();
+        record_site_error(
+            &site_id,
+            message.clone(),
+            Some(site.status.clone()),
+            Some(ManagedSiteParseStatus::Running),
+        );
+        bail!(message);
     }
     update_runtime(&site_id, RuntimeUpdate {
         status: Some(ManagedSiteStatus::Starting),
@@ -2004,7 +2118,28 @@ pub async fn start_site(site_id: String) -> Result<()> {
 pub async fn parse_site(site_id: String) -> Result<()> {
     let site = get_site(&site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
     if site.parse_status == ManagedSiteParseStatus::Running {
-        bail!("解析任务正在运行");
+        let message = "解析任务正在运行".to_string();
+        record_site_error(
+            &site_id,
+            message.clone(),
+            Some(site.status.clone()),
+            Some(ManagedSiteParseStatus::Running),
+        );
+        bail!(message);
+    }
+    if matches!(
+        site.status,
+        ManagedSiteStatus::Running | ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
+    ) {
+        let message = match site.status {
+            ManagedSiteStatus::Running => "站点运行中，请先停止站点再解析",
+            ManagedSiteStatus::Starting => "站点启动中，请先停止站点再解析",
+            ManagedSiteStatus::Stopping => "站点停止中，请稍后再解析",
+            _ => "当前状态不能执行解析",
+        }
+        .to_string();
+        record_site_error(&site_id, message.clone(), Some(site.status.clone()), None);
+        bail!(message);
     }
     tokio::spawn(async move {
         if let Err(err) = run_parse_pipeline(site_id.clone()).await {
@@ -2056,8 +2191,19 @@ async fn kill_pid(pid: u32) -> Result<()> {
 
 pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
     let site = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
+    let can_stop = matches!(
+        site.status,
+        ManagedSiteStatus::Running | ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
+    ) || site.parse_status == ManagedSiteParseStatus::Running
+        || site_has_active_processes(&site);
+    if !can_stop {
+        let message = "站点未在运行中，无需停止".to_string();
+        record_site_error(site_id, message.clone(), Some(site.status.clone()), None);
+        bail!(message);
+    }
     update_runtime(site_id, RuntimeUpdate {
         status: Some(ManagedSiteStatus::Stopping),
+        last_error: Some(None),
         ..Default::default()
     })?;
     if let Some(pid) = site.web_pid {
@@ -2108,6 +2254,11 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
 
     update_runtime(site_id, RuntimeUpdate {
         status: Some(ManagedSiteStatus::Stopped),
+        parse_status: Some(if site.parse_status == ManagedSiteParseStatus::Running {
+            ManagedSiteParseStatus::Pending
+        } else {
+            site.parse_status.clone()
+        }),
         db_pid: Some(None),
         web_pid: Some(None),
         parse_pid: Some(None),
@@ -2132,11 +2283,18 @@ pub struct StopSiteResult {
 
 pub fn delete_site(site_id: &str) -> Result<bool> {
     if let Some(site) = get_site(site_id)? {
-        if matches!(
-            site.status,
-            ManagedSiteStatus::Running | ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
-        ) {
-            bail!("站点运行中，不能删除");
+        if site_has_active_processes(&site)
+            || matches!(
+                site.status,
+                ManagedSiteStatus::Running
+                    | ManagedSiteStatus::Starting
+                    | ManagedSiteStatus::Stopping
+            )
+            || site.parse_status == ManagedSiteParseStatus::Running
+        {
+            let message = "站点运行中，不能删除".to_string();
+            record_site_error(site_id, message.clone(), Some(site.status.clone()), None);
+            bail!(message);
         }
     } else {
         return Ok(false);

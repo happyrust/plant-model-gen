@@ -159,3 +159,5 @@ target_check
 # Release build artifacts
 release-build/
 target-debug-24381/
+.cursor/rules/*.bak.*
+.memory/

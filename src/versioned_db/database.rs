@@ -1089,7 +1089,7 @@ where
     let sync_versioned = db_option.sync_versioned.unwrap_or(false);
     let selected_file_names = selected_db_file_names(db_option);
     let selected_dbnums = selected_dbnums(db_option);
-    let force_include = is_parse_sys && is_total_sync;
+    let force_include = is_parse_sys && is_total_sync && selected_file_names.is_empty();
 
     for (file_idx, path) in children_files.into_iter().enumerate() {
         let total_files = total_files; // 仅为语义清晰
@@ -1758,7 +1758,7 @@ pub async fn sync_total_async_threaded(
     let sync_versioned = db_option.sync_versioned.unwrap_or(false);
     let selected_file_names = selected_db_file_names(db_option);
     let selected_dbnums = selected_dbnums(db_option);
-    let force_include = is_parse_sys && is_total_sync;
+    let force_include = is_parse_sys && is_total_sync && selected_file_names.is_empty();
 
     let sender_clone = sender.clone();
     let children_files_len = children_files.len();

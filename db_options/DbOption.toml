@@ -239,6 +239,12 @@ debug_project_id = "debug-project"
 debug_user_id = "debug-user"
 debug_role = "sj"
 
+# ====== PMS 入站 S2S 认证配置 ======
+# 仅影响 embed-url / workflow/sync / delete / cache/preload；与 review_auth 分离
+[platform_auth]
+enabled = true
+debug_token = ""
+
 # ====== Web Server 配置（3100 与 plant3d-web Vite 代理一致）======
 [web_server]
 port = 3100

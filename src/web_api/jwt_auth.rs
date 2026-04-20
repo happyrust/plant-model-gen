@@ -30,6 +30,15 @@ pub struct JwtConfig {
     pub expiration_hours: u64,
 }
 
+/// PMS 入站 S2S 认证配置
+#[derive(Clone, Debug)]
+pub struct PlatformAuthConfig {
+    /// 是否启用真实 JWT 校验
+    pub enabled: bool,
+    /// 关闭真实校验时允许的调试 token；为空则仍拒绝
+    pub debug_token: String,
+}
+
 /// 校审接口认证配置
 #[derive(Clone, Debug)]
 pub struct ReviewAuthConfig {
@@ -43,12 +52,33 @@ pub struct ReviewAuthConfig {
     pub debug_role: String,
 }
 
+const DEFAULT_JWT_SECRET: &str = "default-jwt-secret-key";
+
+fn warn_if_default_jwt_secret(secret: &str) {
+    if secret == DEFAULT_JWT_SECRET {
+        warn!(
+            "JWT_SECRET 命中默认密钥 default-jwt-secret-key；生产和联调环境都不能依赖默认密钥，请尽快改为独立密钥"
+        );
+    }
+}
+
 impl Default for JwtConfig {
     fn default() -> Self {
+        let secret =
+            std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_JWT_SECRET.to_string());
+        warn_if_default_jwt_secret(&secret);
         Self {
-            secret: std::env::var("JWT_SECRET")
-                .unwrap_or_else(|_| "default-jwt-secret-key".to_string()),
+            secret,
             expiration_hours: 24,
+        }
+    }
+}
+
+impl Default for PlatformAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            debug_token: String::new(),
         }
     }
 }
@@ -109,15 +139,33 @@ impl JwtConfig {
     /// 从配置文件加载
     pub fn from_config_file() -> Self {
         if let Some(config) = load_config() {
+            let secret = config
+                .get_string("model_center.token_secret")
+                .unwrap_or_else(|_| DEFAULT_JWT_SECRET.to_string());
+            warn_if_default_jwt_secret(&secret);
             return Self {
-                secret: config
-                    .get_string("model_center.token_secret")
-                    .unwrap_or_else(|_| "default-jwt-secret-key".to_string()),
+                secret,
                 expiration_hours: config
                     .get_int("model_center.token_expiration_hours")
                     .unwrap_or(24) as u64,
             };
         }
+        Self::default()
+    }
+}
+
+impl PlatformAuthConfig {
+    /// 从配置文件加载
+    pub fn from_config_file() -> Self {
+        if let Some(config) = load_config() {
+            return Self {
+                enabled: config.get_bool("platform_auth.enabled").unwrap_or(true),
+                debug_token: config
+                    .get_string("platform_auth.debug_token")
+                    .unwrap_or_default(),
+            };
+        }
+
         Self::default()
     }
 }
@@ -324,6 +372,7 @@ pub struct VerifyData {
 
 lazy_static::lazy_static! {
     static ref JWT_CONFIG: JwtConfig = JwtConfig::from_config_file();
+    pub static ref PLATFORM_AUTH_CONFIG: PlatformAuthConfig = PlatformAuthConfig::from_config_file();
     pub static ref REVIEW_AUTH_CONFIG: ReviewAuthConfig = ReviewAuthConfig::from_config_file();
 }
 
@@ -509,7 +558,13 @@ pub async fn review_auth_middleware(
         request.extensions_mut().insert(claims);
     } else {
         let claims = extract_bearer_token(request.headers())
-            .and_then(|token| decode_token_unsafe(token).ok())
+            .and_then(|token| match decode_token_unsafe(token) {
+                Ok(claims) => Some(claims),
+                Err(error) => {
+                    warn!("JWT decode without verification failed in debug mode: {}", error);
+                    None
+                }
+            })
             .unwrap_or_else(|| build_debug_claims(&config));
         request.extensions_mut().insert(claims);
     }

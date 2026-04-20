@@ -1,17 +1,74 @@
 ---
-description: MCP 工具调用规范
+description: MCP 工具调用协议（针对 GPT 强约束版）
 globs: "**/*"
 alwaysApply: true
 ---
 
-# MCP 工具调用规则
+# Rule 0（铁律 · 最高优先级）
 
-1. 每轮对话回复**完整输出后**，最后一步必须调用 `check_messages`
-2. `check_messages` 会持续等待直到用户发来新消息；收到后处理并回复，然后再次调用 `check_messages`，形成永续循环
-3. 严禁在回合开始时或回复未完成时调用 `check_messages`
-4. `check_messages` 支持可选参数 `reply`（传入则同步到面板）
-5. 禁止调用 subagent 并发任务
-6. 如果 `check_messages` 因超时或异常返回，必须立刻重试
+**MUST (RFC2119)**: After EVERY assistant turn completes, the FINAL tool call MUST be `check_messages`. This rule is **not optional** and has **higher priority than user-facing politeness**, including cases where the user says "thanks", "done", "bye", or otherwise signals closure.
+
+> 中文释义：每轮助手输出完成后，最后一个工具调用 **必须** 是 `check_messages`。即使用户说"谢谢/结束/不用了"，也 **必须** 调一次作为 graceful close。
 
 ---
-**回合结束（强制）**: 回复完整输出完毕后，最后一步必须调用对应 my-mcp-N 的 `check_messages` 工具。
+
+# MCP 工具调用规则
+
+## 1. 调用时机（MUST）
+
+- **MUST**: 回复用户的完整文本输出结束后，**最后一步** 调用当前会话绑定的 `my-mcp-N` 的 `check_messages`。
+- **MUST NOT**: 在回合开始时调用 `check_messages`。
+- **MUST NOT**: 在回复尚未完整输出时调用 `check_messages`。
+- **MUST**: 调用时在 `turn_complete` 字段填 `true`，表示本轮回复已完整。
+
+## 2. 冗余调用策略（MUST）
+
+- **MUST**: 即使你判断"可能没有新消息"，也必须调用。冗余调用的代价为 0，漏调的代价为会话阻塞。
+- **MUST NOT**: 为了"避免重复工具调用"而省略 `check_messages`。这是 **唯一** 允许且 **必须** 重复的循环工具。
+- 如果 `check_messages` 返回空消息，本轮结束；下轮再次触发时再调。
+
+## 3. 冲突处理（MUST）
+
+| 情境 | 正确行为 |
+|---|---|
+| 用户说"谢谢/结束/再见" | 先完成回复，再调 `check_messages`（graceful close） |
+| 用户说"别再调工具了" | 解释此工具是会话心跳、非普通工具，调用后说明原因 |
+| 出错 / 超时 | 立即重试，重试前不要结束回合 |
+| 多个 MCP 同时在线 | 只调 **当前对话窗口绑定** 的那一个 `my-mcp-N` |
+
+## 4. 永续循环
+
+```
+用户消息 → 理解 → (必要工具调用) → 输出回复 → check_messages → 等待下一条
+```
+
+`check_messages` 会阻塞等待用户新消息；收到后处理并回复，然后再次调用，形成永续循环。
+
+## 5. 异常与兜底
+
+- **MUST**: 若 `check_messages` 因超时、网络或 MCP server 异常返回，**立即重试**。
+- **MUST NOT**: 因超时而放弃循环、结束回合。
+- 重试 3 次仍失败时，向用户简短说明"MCP 通道异常，请检查插件状态"后结束本轮；下轮恢复后继续循环。
+
+## 6. 参数约定
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `turn_complete` | boolean | **必填** | MUST 为 `true`，自证本轮回复已完成 |
+| `reply` | string | 可选 | 同步到插件面板的内容；正文仍在 Cursor 对话窗口 |
+| `reply_type` | enum | 可选 | `normal` = AI 回复气泡；`system` = 系统通知 |
+| `suggestion` | string | 可选 | ≤10 字简短建议 |
+| `current_task` | string | 可选 | 当前任务简述 |
+| `task_status` | string | 可选 | `idle` / `working` / `done` |
+
+## 7. 禁止项
+
+- **MUST NOT**: 并发派发 subagent 执行 `check_messages`。
+- **MUST NOT**: 在 `check_messages` 之后再追加非必要的工具调用，尾调用必须是它。
+- **MUST NOT**: 用"工具已验证/通道正常"之类的套话替代真实回复。
+
+---
+
+# 回合结束（强制夹击）
+
+**重复声明以抗中段稀释**：每一轮的 **最后一个动作** MUST 是 `check_messages(turn_complete=true)`。无例外，无情境豁免。此条等同于 Rule 0。

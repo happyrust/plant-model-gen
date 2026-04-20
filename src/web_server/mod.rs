@@ -353,7 +353,11 @@ pub async fn start_web_server_with_config(
         .merge(admin_stateless_routes)
         .merge(admin_registry_handlers::create_admin_registry_routes())
         .with_state(app_state.clone())
-        .merge(remote_sync_handlers::create_remote_sync_routes());
+        .merge(
+            remote_sync_handlers::create_remote_sync_routes().route_layer(middleware::from_fn(
+                admin_auth_handlers::admin_session_middleware,
+            )),
+        );
 
     let app = Router::new()
         // API路由
@@ -1062,6 +1066,7 @@ pub async fn start_web_server_with_config(
                     Method::GET,
                     Method::POST,
                     Method::PUT,
+                    Method::PATCH,
                     Method::DELETE,
                     Method::OPTIONS,
                 ])

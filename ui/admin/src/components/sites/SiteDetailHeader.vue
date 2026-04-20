@@ -1,7 +1,14 @@
 <script setup lang="ts">
-import { ArrowLeft, ExternalLink, Loader2, Play, RefreshCw, Square } from 'lucide-vue-next'
+import { ArrowLeft, ExternalLink, Loader2, Pencil, Play, RefreshCw, Square } from 'lucide-vue-next'
 import type { ManagedProjectSite } from '@/types/site'
-import { statusLabelMap, statusClassMap, isSiteBusy } from './site-status'
+import {
+  canEditSite,
+  canParseSite,
+  canStartSite,
+  canStopSite,
+  statusLabelMap,
+  statusClassMap,
+} from './site-status'
 import { useSitesStore } from '@/stores/sites'
 
 const props = defineProps<{
@@ -30,17 +37,20 @@ defineEmits<{
   parse: []
   refresh: []
   openViewer: []
+  edit: []
 }>()
 
 function canStart() {
-  const s = props.site
-  return s && !isSiteBusy(s) && ['Stopped', 'Parsed', 'Failed', 'Draft'].includes(s.status)
+  return props.site ? canStartSite(props.site) : false
 }
 function canStop() {
-  return props.site?.status === 'Running'
+  return props.site ? canStopSite(props.site) : false
 }
 function canParse() {
-  return props.site && !isSiteBusy(props.site)
+  return props.site ? canParseSite(props.site) : false
+}
+function canEdit() {
+  return props.site ? canEditSite(props.site) : false
 }
 </script>
 
@@ -76,6 +86,13 @@ function canParse() {
           title="刷新"
         >
           <RefreshCw class="h-4 w-4" />
+        </button>
+        <button
+          v-if="canEdit()"
+          @click="$emit('edit')"
+          class="inline-flex h-9 items-center gap-2 rounded-md border border-input bg-transparent px-3 text-sm font-medium hover:bg-accent transition-colors"
+        >
+          <Pencil class="h-4 w-4" /> 编辑
         </button>
         <button
           v-if="canParse()"

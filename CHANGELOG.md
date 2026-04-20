@@ -4,6 +4,14 @@
 
 ### Added
 
+- **批注流转门禁后端（V1）**：新增 `POST /api/review/annotations/check`，统一按已确认的 `text/cloud/rect` 批注快照计算 `open / pending_review / approved / rejected`，为 `sj/jd/sh/pz` 返回 `passed` 与 `recommendedAction`。
+  - `sj` 阻塞条件：存在 `open` 或 `rejected`。
+  - `jd/sh/pz` 阻塞条件：存在 `open/pending_review/rejected`，并按规则区分 `return` 与 `block`。
+  - 接口默认接受 `task_id` 为主，`form_id` 仅作兜底。
+  - `wont_fix+agreed` 按通过处理；`OBB` 与未确认草稿不参与判定。
+- **提交强校验**：`POST /api/review/tasks/{id}/submit` 与 `workflow/sync` 的 `agree` 路径统一接入 annotation check，失败返回 `409` 与 `ANNOTATION_CHECK_FAILED`，并返回完整 `annotation_check`。
+  - `return` 路径不受阻断影响。
+
 - 新增 `docs/plans/2026-04-19-admin-站点部署整改计划.md`：对 admin 站点部署功能进行全链路审核（后端编排、前端状态机、安全默认值、Viewer 联动），输出 5 阶段整改计划（P0 安全收口 / P0 状态机加固 / P1 部署解耦 / P1 Viewer URL / P1 可观测性）、9 项回归矩阵及长期演进路线。
 - 新增 `scripts/test-admin-deployment.ps1`：Admin 站点端到端部署回归脚本，覆盖登录 / 建站 / 解析 / 启动 / 健康检查 / 停站 / 清理 9 个步骤，默认针对 `AvevaPlantSample + aps7011_0001` 场景，支持 `-SkipCleanup` 与 `ADMIN_USER/ADMIN_PASS` 环境变量。
 - 新增 `.memory/.gitkeep` 与 `.memory/2026-04-17.md`：沉淀 E3D 3.1 F&M state 补丁、PML modLoadMethod、jmp-self / spawn+suspend 等逆向调试日志，便于跨会话衔接。

@@ -12,16 +12,163 @@ use tracing::{info, warn};
 use crate::web_api::review_api::ReviewTask;
 use aios_core::project_primary_db;
 
+use super::annotation_check::{
+    build_annotation_check_context, evaluate_annotation_check, AnnotationCheckOptions,
+    AnnotationCheckResult,
+};
 use super::auth::verify_s2s_token;
 use super::review_form::{
     find_task_by_form_id, get_review_form_by_form_id, sync_review_form_with_task_status,
 };
 use super::types::{
-    SyncWorkflowData, SyncWorkflowRequest, SyncWorkflowResponse, WorkflowAnnotationComment,
-    WorkflowAttachment, WorkflowRecord, normalize_review_form_status,
+    normalize_review_form_status, SyncWorkflowData, SyncWorkflowRequest, SyncWorkflowResponse,
+    VerifyWorkflowData, VerifyWorkflowResponse, WorkflowAnnotationComment, WorkflowAttachment,
+    WorkflowRecord,
 };
 
 static WEB_PUBLIC_BASE_URL: OnceLock<Option<String>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowMutationKind {
+    Active,
+    Agree,
+    Return,
+    Stop,
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowValidatedNextStep {
+    target_node: String,
+    assignee_id: String,
+    assignee_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowMutationPrecheck {
+    task: ReviewTask,
+    current_node: String,
+    task_status: String,
+    next_step: Option<WorkflowValidatedNextStep>,
+}
+
+struct WorkflowSyncActionError {
+    status: StatusCode,
+    message: String,
+    error_code: Option<String>,
+    annotation_check: Option<AnnotationCheckResult>,
+    verify_current_node: Option<String>,
+    verify_task_status: Option<String>,
+    verify_next_step: Option<String>,
+    verify_recommended_action: Option<String>,
+}
+
+impl WorkflowSyncActionError {
+    fn plain(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            error_code: None,
+            annotation_check: None,
+            verify_current_node: None,
+            verify_task_status: None,
+            verify_next_step: None,
+            verify_recommended_action: None,
+        }
+    }
+
+    fn blocked(
+        status: StatusCode,
+        message: impl Into<String>,
+        current_node: Option<String>,
+        task_status: Option<String>,
+        next_step: Option<String>,
+        recommended_action: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            error_code: None,
+            annotation_check: None,
+            verify_current_node: current_node,
+            verify_task_status: task_status,
+            verify_next_step: next_step,
+            verify_recommended_action: Some(recommended_action.into()),
+        }
+    }
+
+    fn annotation_check_failed(
+        result: AnnotationCheckResult,
+        current_node: Option<String>,
+        task_status: Option<String>,
+        next_step: Option<String>,
+    ) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: result.message.clone(),
+            error_code: Some("ANNOTATION_CHECK_FAILED".to_string()),
+            annotation_check: Some(result.clone()),
+            verify_current_node: current_node,
+            verify_task_status: task_status,
+            verify_next_step: next_step,
+            verify_recommended_action: Some(
+                map_verify_recommended_action(&result.recommended_action).to_string(),
+            ),
+        }
+    }
+
+    fn into_sync_response(self) -> (StatusCode, Json<SyncWorkflowResponse>) {
+        (
+            self.status,
+            Json(SyncWorkflowResponse {
+                code: self.status.as_u16() as i32,
+                message: self.message,
+                data: None,
+                error_code: self.error_code,
+                annotation_check: self.annotation_check,
+            }),
+        )
+    }
+
+    fn into_verify_response(self, action: &str) -> (StatusCode, Json<VerifyWorkflowResponse>) {
+        if self.should_soft_block_for_verify() {
+            return (
+                StatusCode::OK,
+                Json(VerifyWorkflowResponse {
+                    code: 200,
+                    message: self.message.clone(),
+                    data: Some(VerifyWorkflowData {
+                        passed: false,
+                        action: action.to_string(),
+                        current_node: self.verify_current_node,
+                        task_status: self.verify_task_status,
+                        next_step: self.verify_next_step,
+                        reason: self.message,
+                        recommended_action: self
+                            .verify_recommended_action
+                            .unwrap_or_else(|| "block".to_string()),
+                    }),
+                    error_code: self.error_code,
+                    annotation_check: self.annotation_check,
+                }),
+            );
+        }
+
+        (
+            self.status,
+            Json(VerifyWorkflowResponse {
+                code: self.status.as_u16() as i32,
+                message: self.message,
+                data: None,
+                error_code: self.error_code,
+                annotation_check: self.annotation_check,
+            }),
+        )
+    }
+
+    fn should_soft_block_for_verify(&self) -> bool {
+        matches!(self.status, StatusCode::FORBIDDEN | StatusCode::CONFLICT)
+    }
+}
 
 fn format_beijing_datetime_millis(millis: i64) -> String {
     let Some(utc_dt) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis) else {
@@ -124,8 +271,70 @@ fn extract_annotation_ids(values: &[Value], output: &mut BTreeSet<String>) {
 }
 
 // ============================================================================
-// Handler
+// Handler / preflight
 // ============================================================================
+
+pub async fn verify_workflow_handler(
+    Json(request): Json<SyncWorkflowRequest>,
+) -> impl IntoResponse {
+    let action = request.action.trim().to_lowercase();
+    let request_start_time = std::time::Instant::now();
+
+    info!(
+        "[WORKFLOW_VERIFY] form_id={}, action={}, actor={}/{}",
+        request.form_id, action, request.actor.id, request.actor.roles
+    );
+
+    if let Err((_status, msg)) = verify_s2s_token(&request.token) {
+        warn!(
+            "[WORKFLOW_VERIFY] Token校验失败 - form_id={}, reason={}",
+            request.form_id, msg
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(VerifyWorkflowResponse {
+                code: 401,
+                message: "unauthorized".to_string(),
+                data: None,
+                error_code: None,
+                annotation_check: None,
+            }),
+        );
+    }
+
+    let kind = match parse_workflow_mutation_kind(&request.action) {
+        Ok(kind) => kind,
+        Err(error) => return error.into_verify_response(&action),
+    };
+
+    let result = match validate_workflow_mutation(&request, kind).await {
+        Ok(precheck) => (
+            StatusCode::OK,
+            Json(VerifyWorkflowResponse {
+                code: 200,
+                message: "ok".to_string(),
+                data: Some(build_verify_data(
+                    &action,
+                    &precheck,
+                    "验证通过，可继续流转",
+                    "proceed",
+                )),
+                error_code: None,
+                annotation_check: None,
+            }),
+        ),
+        Err(error) => error.into_verify_response(&action),
+    };
+
+    info!(
+        "[WORKFLOW_VERIFY] 完成 - form_id={}, action={}, elapsed_ms={}",
+        request.form_id,
+        action,
+        request_start_time.elapsed().as_millis()
+    );
+
+    result
+}
 
 pub async fn sync_workflow_handler(Json(request): Json<SyncWorkflowRequest>) -> impl IntoResponse {
     let action = request.action.trim().to_lowercase();
@@ -152,103 +361,40 @@ pub async fn sync_workflow_handler(Json(request): Json<SyncWorkflowRequest>) -> 
                 code: 401,
                 message: "unauthorized".to_string(),
                 data: None,
+                error_code: None,
+                annotation_check: None,
             }),
         );
     }
 
-    let mut response_next_step = None;
-    if !is_query {
-        match action.as_str() {
-            "active" => match apply_workflow_active(&request).await {
-                Ok(next_step) => {
-                    response_next_step = next_step;
-                }
-                Err((status, msg)) => {
-                    warn!(
-                        "[WORKFLOW_SYNC] active 执行失败 - form_id={}, actor={}, reason={}",
-                        request.form_id, request.actor.id, msg
-                    );
-                    return (
-                        status,
-                        Json(SyncWorkflowResponse {
-                            code: status.as_u16() as i32,
-                            message: msg,
-                            data: None,
-                        }),
-                    );
-                }
-            },
-            "agree" => match apply_workflow_agree(&request).await {
-                Ok(next_step) => {
-                    response_next_step = next_step;
-                }
-                Err((status, msg)) => {
-                    warn!(
-                        "[WORKFLOW_SYNC] agree 执行失败 - form_id={}, actor={}, reason={}",
-                        request.form_id, request.actor.id, msg
-                    );
-                    return (
-                        status,
-                        Json(SyncWorkflowResponse {
-                            code: status.as_u16() as i32,
-                            message: msg,
-                            data: None,
-                        }),
-                    );
-                }
-            },
-            "return" => match apply_workflow_return(&request).await {
-                Ok(next_step) => {
-                    response_next_step = next_step;
-                }
-                Err((status, msg)) => {
-                    warn!(
-                        "[WORKFLOW_SYNC] return 执行失败 - form_id={}, actor={}, reason={}",
-                        request.form_id, request.actor.id, msg
-                    );
-                    return (
-                        status,
-                        Json(SyncWorkflowResponse {
-                            code: status.as_u16() as i32,
-                            message: msg,
-                            data: None,
-                        }),
-                    );
-                }
-            },
-            "stop" => match apply_workflow_stop(&request).await {
-                Ok(next_step) => {
-                    response_next_step = next_step;
-                }
-                Err((status, msg)) => {
-                    warn!(
-                        "[WORKFLOW_SYNC] stop 执行失败 - form_id={}, actor={}, reason={}",
-                        request.form_id, request.actor.id, msg
-                    );
-                    return (
-                        status,
-                        Json(SyncWorkflowResponse {
-                            code: status.as_u16() as i32,
-                            message: msg,
-                            data: None,
-                        }),
-                    );
-                }
-            },
-            _ => {
-                let msg = format!("unsupported workflow action: {}", request.action);
-                warn!("[WORKFLOW_SYNC] {}", msg);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(SyncWorkflowResponse {
-                        code: 400,
-                        message: msg,
-                        data: None,
-                    }),
+    let response_next_step = if is_query {
+        None
+    } else {
+        let kind = match parse_workflow_mutation_kind(&request.action) {
+            Ok(kind) => kind,
+            Err(error) => return error.into_sync_response(),
+        };
+        let precheck = match validate_workflow_mutation(&request, kind).await {
+            Ok(precheck) => precheck,
+            Err(error) => {
+                warn!(
+                    "[WORKFLOW_SYNC] {} 执行失败 - form_id={}, actor={}, reason={}",
+                    action, request.form_id, request.actor.id, error.message
                 );
+                return error.into_sync_response();
+            }
+        };
+        match apply_workflow_mutation(&request, kind, &precheck).await {
+            Ok(next_step) => next_step,
+            Err(error) => {
+                warn!(
+                    "[WORKFLOW_SYNC] {} 执行失败 - form_id={}, actor={}, reason={}",
+                    action, request.form_id, request.actor.id, error.message
+                );
+                return error.into_sync_response();
             }
         }
-    }
+    };
 
     let data = match query_workflow_data(&request.form_id, response_next_step.clone()).await {
         Ok(d) => {
@@ -269,7 +415,16 @@ pub async fn sync_workflow_handler(Json(request): Json<SyncWorkflowRequest>) -> 
                 "[WORKFLOW_SYNC] 数据查询失败 - form_id={}, error={}",
                 request.form_id, e
             );
-            SyncWorkflowData::default()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncWorkflowResponse {
+                    code: 500,
+                    message: format!("workflow data query failed: {}", e),
+                    data: None,
+                    error_code: None,
+                    annotation_check: None,
+                }),
+            );
         }
     };
 
@@ -286,11 +441,36 @@ pub async fn sync_workflow_handler(Json(request): Json<SyncWorkflowRequest>) -> 
             code: 200,
             message: "success".to_string(),
             data: Some(data),
+            error_code: None,
+            annotation_check: None,
         }),
     )
 }
 
+fn parse_workflow_mutation_kind(
+    action: &str,
+) -> Result<WorkflowMutationKind, WorkflowSyncActionError> {
+    match action.trim().to_lowercase().as_str() {
+        "active" => Ok(WorkflowMutationKind::Active),
+        "agree" => Ok(WorkflowMutationKind::Agree),
+        "return" => Ok(WorkflowMutationKind::Return),
+        "stop" => Ok(WorkflowMutationKind::Stop),
+        "query" => Err(WorkflowSyncActionError::plain(
+            StatusCode::BAD_REQUEST,
+            "verify 不支持 action=query".to_string(),
+        )),
+        _ => Err(WorkflowSyncActionError::plain(
+            StatusCode::BAD_REQUEST,
+            format!("unsupported workflow action: {}", action),
+        )),
+    }
+}
+
 fn normalize_workflow_node(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
+fn normalize_task_status(raw: &str) -> String {
     raw.trim().to_lowercase()
 }
 
@@ -365,50 +545,208 @@ fn assign_review_task_fields(
     )
 }
 
-async fn apply_workflow_active(
+fn map_verify_recommended_action(raw: &str) -> &'static str {
+    match raw.trim().to_lowercase().as_str() {
+        "submit" | "proceed" => "proceed",
+        "return" => "return",
+        _ => "block",
+    }
+}
+
+fn build_verify_data(
+    action: &str,
+    precheck: &WorkflowMutationPrecheck,
+    reason: impl Into<String>,
+    recommended_action: &str,
+) -> VerifyWorkflowData {
+    VerifyWorkflowData {
+        passed: true,
+        action: action.to_string(),
+        current_node: Some(precheck.current_node.clone()),
+        task_status: Some(precheck.task_status.clone()),
+        next_step: precheck
+            .next_step
+            .as_ref()
+            .map(|step| step.target_node.clone()),
+        reason: reason.into(),
+        recommended_action: recommended_action.to_string(),
+    }
+}
+
+async fn load_task_for_workflow(form_id: &str) -> Result<ReviewTask, WorkflowSyncActionError> {
+    if let Some(task) = find_task_by_form_id(form_id).await.map_err(|error| {
+        WorkflowSyncActionError::plain(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("查询任务失败: {}", error),
+        )
+    })? {
+        return Ok(task);
+    }
+
+    let form = get_review_form_by_form_id(form_id).await.map_err(|error| {
+        WorkflowSyncActionError::plain(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("查询主单据失败: {}", error),
+        )
+    })?;
+
+    let Some(form) = form else {
+        return Err(WorkflowSyncActionError::plain(
+            StatusCode::NOT_FOUND,
+            format!("form_id={} 未找到 review form", form_id),
+        ));
+    };
+
+    let form_status = normalize_review_form_status(&form.status);
+    let message = if form_status == "deleted" {
+        format!("form_id={} 对应主单据已删除，不可继续流转", form_id)
+    } else if form.task_created {
+        format!(
+            "form_id={} 当前主单据状态为 {}，但未找到活动 review task",
+            form_id, form_status
+        )
+    } else {
+        format!(
+            "form_id={} 当前主单据状态为 {}，尚未创建活动 review task",
+            form_id, form_status
+        )
+    };
+
+    Err(WorkflowSyncActionError::blocked(
+        StatusCode::CONFLICT,
+        message,
+        form.role.clone(),
+        Some(form_status),
+        None,
+        "block",
+    ))
+}
+
+fn resolve_required_next_step(
     request: &SyncWorkflowRequest,
-) -> Result<Option<String>, (StatusCode, String)> {
-    let next_step = request
-        .next_step
-        .as_ref()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "active 缺少 next_step".to_string()))?;
+    action_label: &str,
+) -> Result<WorkflowValidatedNextStep, WorkflowSyncActionError> {
+    let next_step = request.next_step.as_ref().ok_or_else(|| {
+        WorkflowSyncActionError::plain(
+            StatusCode::BAD_REQUEST,
+            format!("{} 缺少 next_step", action_label),
+        )
+    })?;
 
     let target_node = normalize_workflow_node(&next_step.roles);
     if target_node.is_empty() {
-        return Err((
+        return Err(WorkflowSyncActionError::plain(
             StatusCode::BAD_REQUEST,
-            "active 的 next_step.roles 不能为空".to_string(),
+            format!("{} 的 next_step.roles 不能为空", action_label),
         ));
     }
 
-    let assignee_id = next_step.assignee_id.trim();
+    let assignee_id = next_step.assignee_id.trim().to_string();
     if assignee_id.is_empty() {
-        return Err((
+        return Err(WorkflowSyncActionError::plain(
             StatusCode::BAD_REQUEST,
-            "active 的 next_step.assignee_id 不能为空".to_string(),
+            format!("{} 的 next_step.assignee_id 不能为空", action_label),
         ));
     }
-    let assignee_name = next_step.name.trim();
 
-    let task = find_task_by_form_id(&request.form_id)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("查询任务失败: {}", error),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("form_id={} 未找到活动 review task", request.form_id),
-            )
-        })?;
+    Ok(WorkflowValidatedNextStep {
+        target_node,
+        assignee_id,
+        assignee_name: next_step.name.trim().to_string(),
+    })
+}
 
-    let current_node = normalize_workflow_node(&task.current_node);
-    if current_node != "sj" {
-        return Err((
+fn ensure_task_not_terminal(
+    task: &ReviewTask,
+    current_node: &str,
+    next_step: Option<String>,
+) -> Result<(), WorkflowSyncActionError> {
+    let task_status = normalize_task_status(&task.status);
+    if task_status == "approved" || task_status == "cancelled" {
+        return Err(WorkflowSyncActionError::blocked(
+            StatusCode::CONFLICT,
+            format!(
+                "当前单据已处于终态 {}，不可继续流转",
+                if task_status == "approved" {
+                    "approved"
+                } else {
+                    "cancelled"
+                }
+            ),
+            Some(current_node.to_string()),
+            Some(task_status),
+            next_step,
+            "block",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_owner_matches(
+    action_label: &str,
+    task: &ReviewTask,
+    current_node: &str,
+    actor_id: &str,
+    next_step: Option<String>,
+) -> Result<(), WorkflowSyncActionError> {
+    let (owner_id, owner_source) = current_node_owner(task, current_node);
+    if !owner_id.is_empty() && owner_id != actor_id.trim() {
+        return Err(WorkflowSyncActionError::blocked(
+            StatusCode::FORBIDDEN,
+            format!(
+                "{} 权限不足：当前请求人 {} 不是 {} 节点负责人 {}",
+                action_label,
+                actor_id.trim(),
+                owner_source,
+                owner_id
+            ),
+            Some(current_node.to_string()),
+            Some(normalize_task_status(&task.status)),
+            next_step,
+            "block",
+        ));
+    }
+    Ok(())
+}
+
+fn expected_agree_next_node(current_node: &str) -> Option<&'static str> {
+    match current_node {
+        "jd" => Some("sh"),
+        "sh" => Some("pz"),
+        _ => None,
+    }
+}
+
+async fn validate_workflow_mutation(
+    request: &SyncWorkflowRequest,
+    kind: WorkflowMutationKind,
+) -> Result<WorkflowMutationPrecheck, WorkflowSyncActionError> {
+    match kind {
+        WorkflowMutationKind::Active => validate_workflow_active(request).await,
+        WorkflowMutationKind::Agree => validate_workflow_agree(request).await,
+        WorkflowMutationKind::Return => validate_workflow_return(request).await,
+        WorkflowMutationKind::Stop => validate_workflow_stop(request).await,
+    }
+}
+
+async fn validate_workflow_active(
+    request: &SyncWorkflowRequest,
+) -> Result<WorkflowMutationPrecheck, WorkflowSyncActionError> {
+    let next_step = resolve_required_next_step(request, "active")?;
+    if next_step.target_node != "jd" {
+        return Err(WorkflowSyncActionError::plain(
             StatusCode::BAD_REQUEST,
+            format!("active 目标节点必须是 jd，收到 {}", next_step.target_node),
+        ));
+    }
+
+    let task = load_task_for_workflow(&request.form_id).await?;
+    let current_node = normalize_workflow_node(&task.current_node);
+    ensure_task_not_terminal(&task, &current_node, Some(next_step.target_node.clone()))?;
+
+    if current_node != "sj" {
+        return Err(WorkflowSyncActionError::blocked(
+            StatusCode::CONFLICT,
             format!(
                 "active 仅允许从 sj 发起，当前节点为 {}",
                 if current_node.is_empty() {
@@ -417,23 +755,267 @@ async fn apply_workflow_active(
                     current_node.clone()
                 }
             ),
+            Some(current_node.clone()),
+            Some(normalize_task_status(&task.status)),
+            Some(next_step.target_node.clone()),
+            "block",
         ));
     }
 
-    if !task.requester_id.trim().is_empty() && task.requester_id.trim() != request.actor.id.trim() {
-        return Err((
-            StatusCode::FORBIDDEN,
+    ensure_owner_matches(
+        "active",
+        &task,
+        &current_node,
+        &request.actor.id,
+        Some(next_step.target_node.clone()),
+    )?;
+
+    let annotation_check = evaluate_annotation_check(
+        &build_annotation_check_context(
+            task.id.clone(),
+            task.form_id.clone(),
+            task.current_node.clone(),
+        ),
+        AnnotationCheckOptions {
+            current_node: Some(current_node.clone()),
+            intent: Some("submit_next".to_string()),
+            included_types: None,
+        },
+    )
+    .await
+    .map_err(|(status, message)| WorkflowSyncActionError::plain(status, message))?;
+    if !annotation_check.passed {
+        return Err(WorkflowSyncActionError::annotation_check_failed(
+            annotation_check,
+            Some(current_node.clone()),
+            Some(normalize_task_status(&task.status)),
+            Some(next_step.target_node.clone()),
+        ));
+    }
+
+    Ok(WorkflowMutationPrecheck {
+        task_status: normalize_task_status(&task.status),
+        task,
+        current_node,
+        next_step: Some(next_step),
+    })
+}
+
+async fn validate_workflow_return(
+    request: &SyncWorkflowRequest,
+) -> Result<WorkflowMutationPrecheck, WorkflowSyncActionError> {
+    let next_step = resolve_required_next_step(request, "return")?;
+    let task = load_task_for_workflow(&request.form_id).await?;
+    let current_node = normalize_workflow_node(&task.current_node);
+    ensure_task_not_terminal(&task, &current_node, Some(next_step.target_node.clone()))?;
+
+    if current_node != "jd" && current_node != "sh" && current_node != "pz" {
+        return Err(WorkflowSyncActionError::blocked(
+            StatusCode::CONFLICT,
             format!(
-                "active 权限不足：当前请求人 {} 不是编制负责人 {}",
-                request.actor.id.trim(),
-                task.requester_id.trim()
+                "return 仅允许在 jd/sh/pz 节点执行，当前节点为 {}",
+                if current_node.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    current_node.clone()
+                }
+            ),
+            Some(current_node.clone()),
+            Some(normalize_task_status(&task.status)),
+            Some(next_step.target_node.clone()),
+            "block",
+        ));
+    }
+
+    let current_rank = workflow_node_rank(&current_node).ok_or_else(|| {
+        WorkflowSyncActionError::plain(
+            StatusCode::BAD_REQUEST,
+            format!("return 无法识别当前节点 {}", current_node),
+        )
+    })?;
+    let target_rank = workflow_node_rank(&next_step.target_node).ok_or_else(|| {
+        WorkflowSyncActionError::plain(
+            StatusCode::BAD_REQUEST,
+            format!("return 无法识别目标节点 {}", next_step.target_node),
+        )
+    })?;
+    if target_rank >= current_rank {
+        return Err(WorkflowSyncActionError::plain(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "return 目标节点 {} 必须位于当前节点 {} 之前",
+                next_step.target_node, current_node
             ),
         ));
     }
 
-    let next_status = workflow_task_status_for_target_node(&target_node);
+    ensure_owner_matches(
+        "return",
+        &task,
+        &current_node,
+        &request.actor.id,
+        Some(next_step.target_node.clone()),
+    )?;
+
+    Ok(WorkflowMutationPrecheck {
+        task_status: normalize_task_status(&task.status),
+        task,
+        current_node,
+        next_step: Some(next_step),
+    })
+}
+
+async fn validate_workflow_agree(
+    request: &SyncWorkflowRequest,
+) -> Result<WorkflowMutationPrecheck, WorkflowSyncActionError> {
+    let task = load_task_for_workflow(&request.form_id).await?;
+    let current_node = normalize_workflow_node(&task.current_node);
+    let requested_next_step = request
+        .next_step
+        .as_ref()
+        .map(|step| normalize_workflow_node(&step.roles))
+        .filter(|value| !value.is_empty());
+    ensure_task_not_terminal(&task, &current_node, requested_next_step.clone())?;
+
+    if current_node != "jd" && current_node != "sh" && current_node != "pz" {
+        return Err(WorkflowSyncActionError::blocked(
+            StatusCode::CONFLICT,
+            format!(
+                "agree 仅允许在 jd/sh/pz 节点执行，当前节点为 {}",
+                if current_node.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    current_node.clone()
+                }
+            ),
+            Some(current_node.clone()),
+            Some(normalize_task_status(&task.status)),
+            requested_next_step.clone(),
+            "block",
+        ));
+    }
+
+    ensure_owner_matches(
+        "agree",
+        &task,
+        &current_node,
+        &request.actor.id,
+        requested_next_step.clone(),
+    )?;
+
+    let next_step = if current_node == "pz" {
+        None
+    } else {
+        let next_step = resolve_required_next_step(request, "agree")?;
+        let expected_node = expected_agree_next_node(&current_node).unwrap_or_default();
+        if next_step.target_node != expected_node {
+            return Err(WorkflowSyncActionError::plain(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "agree 从 {} 仅允许推进到 {}，收到 {}",
+                    current_node, expected_node, next_step.target_node
+                ),
+            ));
+        }
+        Some(next_step)
+    };
+
+    let annotation_check = evaluate_annotation_check(
+        &build_annotation_check_context(
+            task.id.clone(),
+            task.form_id.clone(),
+            task.current_node.clone(),
+        ),
+        AnnotationCheckOptions {
+            current_node: Some(current_node.clone()),
+            intent: Some("submit_next".to_string()),
+            included_types: None,
+        },
+    )
+    .await
+    .map_err(|(status, message)| WorkflowSyncActionError::plain(status, message))?;
+    if !annotation_check.passed {
+        return Err(WorkflowSyncActionError::annotation_check_failed(
+            annotation_check,
+            Some(current_node.clone()),
+            Some(normalize_task_status(&task.status)),
+            next_step.as_ref().map(|step| step.target_node.clone()),
+        ));
+    }
+
+    Ok(WorkflowMutationPrecheck {
+        task_status: normalize_task_status(&task.status),
+        task,
+        current_node,
+        next_step,
+    })
+}
+
+async fn validate_workflow_stop(
+    request: &SyncWorkflowRequest,
+) -> Result<WorkflowMutationPrecheck, WorkflowSyncActionError> {
+    let task = load_task_for_workflow(&request.form_id).await?;
+    let current_node = normalize_workflow_node(&task.current_node);
+    ensure_task_not_terminal(&task, &current_node, None)?;
+
+    if current_node != "jd" && current_node != "sh" && current_node != "pz" {
+        return Err(WorkflowSyncActionError::blocked(
+            StatusCode::CONFLICT,
+            format!(
+                "stop 仅允许在 jd/sh/pz 节点执行，当前节点为 {}",
+                if current_node.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    current_node.clone()
+                }
+            ),
+            Some(current_node.clone()),
+            Some(normalize_task_status(&task.status)),
+            None,
+            "block",
+        ));
+    }
+
+    ensure_owner_matches("stop", &task, &current_node, &request.actor.id, None)?;
+
+    Ok(WorkflowMutationPrecheck {
+        task_status: normalize_task_status(&task.status),
+        task,
+        current_node,
+        next_step: None,
+    })
+}
+
+async fn apply_workflow_mutation(
+    request: &SyncWorkflowRequest,
+    kind: WorkflowMutationKind,
+    precheck: &WorkflowMutationPrecheck,
+) -> Result<Option<String>, WorkflowSyncActionError> {
+    match kind {
+        WorkflowMutationKind::Active => apply_workflow_active(request, precheck).await,
+        WorkflowMutationKind::Agree => apply_workflow_agree(request, precheck).await,
+        WorkflowMutationKind::Return => apply_workflow_return(request, precheck).await,
+        WorkflowMutationKind::Stop => apply_workflow_stop(request, precheck).await,
+    }
+}
+
+async fn apply_workflow_active(
+    request: &SyncWorkflowRequest,
+    precheck: &WorkflowMutationPrecheck,
+) -> Result<Option<String>, WorkflowSyncActionError> {
+    let task = &precheck.task;
+    let current_node = precheck.current_node.clone();
+    let next_step = precheck
+        .next_step
+        .as_ref()
+        .expect("active precheck requires next_step");
+    let next_status = workflow_task_status_for_target_node(&next_step.target_node);
     let (checker_id, checker_name, reviewer_id, reviewer_name, approver_id, approver_name) =
-        assign_review_task_fields(&target_node, assignee_id, assignee_name);
+        assign_review_task_fields(
+            &next_step.target_node,
+            &next_step.assignee_id,
+            &next_step.assignee_name,
+        );
 
     let update_sql = r#"
         UPDATE review_tasks SET
@@ -453,7 +1035,7 @@ async fn apply_workflow_active(
     project_primary_db()
         .query(update_sql)
         .bind(("task_id", task.id.clone()))
-        .bind(("next_node", target_node.clone()))
+        .bind(("next_node", next_step.target_node.clone()))
         .bind(("status", next_status))
         .bind(("checker_id", checker_id))
         .bind(("checker_name", checker_name))
@@ -463,7 +1045,7 @@ async fn apply_workflow_active(
         .bind(("approver_name", approver_name))
         .await
         .map_err(|error| {
-            (
+            WorkflowSyncActionError::plain(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("更新 review_tasks 失败: {}", error),
             )
@@ -472,7 +1054,7 @@ async fn apply_workflow_active(
     let review_form = get_review_form_by_form_id(&request.form_id)
         .await
         .map_err(|error| {
-            (
+            WorkflowSyncActionError::plain(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("查询 review_forms 失败: {}", error),
             )
@@ -487,7 +1069,7 @@ async fn apply_workflow_active(
     )
     .await
     {
-        return Err((
+        return Err(WorkflowSyncActionError::plain(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("同步 review_forms 状态失败: {}", error),
         ));
@@ -511,109 +1093,33 @@ async fn apply_workflow_active(
         .filter(|value| !value.is_empty());
     let _ = project_primary_db()
         .query(history_sql)
-        .bind(("task_id", task.id))
-        .bind(("from_node", current_node.clone()))
+        .bind(("task_id", task.id.clone()))
+        .bind(("from_node", current_node))
         .bind(("operator_id", request.actor.id.trim().to_string()))
         .bind(("operator_name", request.actor.name.trim().to_string()))
         .bind(("comment", history_comment))
         .await;
 
-    Ok(Some(target_node))
+    Ok(Some(next_step.target_node.clone()))
 }
 
 async fn apply_workflow_return(
     request: &SyncWorkflowRequest,
-) -> Result<Option<String>, (StatusCode, String)> {
-    let next_step = request
+    precheck: &WorkflowMutationPrecheck,
+) -> Result<Option<String>, WorkflowSyncActionError> {
+    let task = &precheck.task;
+    let current_node = precheck.current_node.clone();
+    let next_step = precheck
         .next_step
         .as_ref()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "return 缺少 next_step".to_string()))?;
-
-    let target_node = normalize_workflow_node(&next_step.roles);
-    if target_node.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "return 的 next_step.roles 不能为空".to_string(),
-        ));
-    }
-
-    let assignee_id = next_step.assignee_id.trim();
-    if assignee_id.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "return 的 next_step.assignee_id 不能为空".to_string(),
-        ));
-    }
-    let assignee_name = next_step.name.trim();
-
-    let task = find_task_by_form_id(&request.form_id)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("查询任务失败: {}", error),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("form_id={} 未找到活动 review task", request.form_id),
-            )
-        })?;
-
-    let current_node = normalize_workflow_node(&task.current_node);
-    if current_node != "jd" && current_node != "sh" && current_node != "pz" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "return 仅允许在 jd/sh/pz 节点执行，当前节点为 {}",
-                if current_node.is_empty() {
-                    "<empty>".to_string()
-                } else {
-                    current_node.clone()
-                }
-            ),
-        ));
-    }
-
-    let current_rank = workflow_node_rank(&current_node).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("return 无法识别当前节点 {}", current_node),
-        )
-    })?;
-    let target_rank = workflow_node_rank(&target_node).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("return 无法识别目标节点 {}", target_node),
-        )
-    })?;
-    if target_rank >= current_rank {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "return 目标节点 {} 必须位于当前节点 {} 之前",
-                target_node, current_node
-            ),
-        ));
-    }
-
-    let (owner_id, owner_source) = current_node_owner(&task, &current_node);
-    if !owner_id.is_empty() && owner_id != request.actor.id.trim() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            format!(
-                "return 权限不足：当前请求人 {} 不是 {} 节点负责人 {}",
-                request.actor.id.trim(),
-                owner_source,
-                owner_id
-            ),
-        ));
-    }
-
-    let next_status = workflow_task_status_for_target_node(&target_node);
+        .expect("return precheck requires next_step");
+    let next_status = workflow_task_status_for_target_node(&next_step.target_node);
     let (checker_id, checker_name, reviewer_id, reviewer_name, approver_id, approver_name) =
-        assign_review_task_fields(&target_node, assignee_id, assignee_name);
+        assign_review_task_fields(
+            &next_step.target_node,
+            &next_step.assignee_id,
+            &next_step.assignee_name,
+        );
     let return_reason = request
         .comments
         .as_ref()
@@ -639,7 +1145,7 @@ async fn apply_workflow_return(
     project_primary_db()
         .query(update_sql)
         .bind(("task_id", task.id.clone()))
-        .bind(("next_node", target_node.clone()))
+        .bind(("next_node", next_step.target_node.clone()))
         .bind(("status", next_status))
         .bind(("checker_id", checker_id))
         .bind(("checker_name", checker_name))
@@ -650,7 +1156,7 @@ async fn apply_workflow_return(
         .bind(("return_reason", return_reason.clone()))
         .await
         .map_err(|error| {
-            (
+            WorkflowSyncActionError::plain(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("更新 review_tasks 失败: {}", error),
             )
@@ -659,7 +1165,7 @@ async fn apply_workflow_return(
     let review_form = get_review_form_by_form_id(&request.form_id)
         .await
         .map_err(|error| {
-            (
+            WorkflowSyncActionError::plain(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("查询 review_forms 失败: {}", error),
             )
@@ -674,7 +1180,7 @@ async fn apply_workflow_return(
     )
     .await
     {
-        return Err((
+        return Err(WorkflowSyncActionError::plain(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("同步 review_forms 状态失败: {}", error),
         ));
@@ -693,62 +1199,22 @@ async fn apply_workflow_return(
     "#;
     let _ = project_primary_db()
         .query(history_sql)
-        .bind(("task_id", task.id))
+        .bind(("task_id", task.id.clone()))
         .bind(("from_node", current_node))
         .bind(("operator_id", request.actor.id.trim().to_string()))
         .bind(("operator_name", request.actor.name.trim().to_string()))
         .bind(("comment", Some(return_reason)))
         .await;
 
-    Ok(Some(target_node))
+    Ok(Some(next_step.target_node.clone()))
 }
 
 async fn apply_workflow_agree(
     request: &SyncWorkflowRequest,
-) -> Result<Option<String>, (StatusCode, String)> {
-    let task = find_task_by_form_id(&request.form_id)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("查询任务失败: {}", error),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("form_id={} 未找到活动 review task", request.form_id),
-            )
-        })?;
-
-    let current_node = normalize_workflow_node(&task.current_node);
-    if current_node != "jd" && current_node != "sh" && current_node != "pz" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "agree 仅允许在 jd/sh/pz 节点执行，当前节点为 {}",
-                if current_node.is_empty() {
-                    "<empty>".to_string()
-                } else {
-                    current_node.clone()
-                }
-            ),
-        ));
-    }
-
-    let (owner_id, owner_source) = current_node_owner(&task, &current_node);
-    if !owner_id.is_empty() && owner_id != request.actor.id.trim() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            format!(
-                "agree 权限不足：当前请求人 {} 不是 {} 节点负责人 {}",
-                request.actor.id.trim(),
-                owner_source,
-                owner_id
-            ),
-        ));
-    }
-
+    precheck: &WorkflowMutationPrecheck,
+) -> Result<Option<String>, WorkflowSyncActionError> {
+    let task = &precheck.task;
+    let current_node = precheck.current_node.clone();
     let (
         target_node,
         next_status,
@@ -770,32 +1236,19 @@ async fn apply_workflow_agree(
             String::new(),
         )
     } else {
-        let next_step = request
+        let next_step = precheck
             .next_step
             .as_ref()
-            .ok_or_else(|| (StatusCode::BAD_REQUEST, "agree 缺少 next_step".to_string()))?;
-
-        let target_node = normalize_workflow_node(&next_step.roles);
-        if target_node.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "agree 的 next_step.roles 不能为空".to_string(),
-            ));
-        }
-
-        let assignee_id = next_step.assignee_id.trim();
-        if assignee_id.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "agree 的 next_step.assignee_id 不能为空".to_string(),
-            ));
-        }
-        let assignee_name = next_step.name.trim();
-        let next_status = workflow_task_status_for_target_node(&target_node);
+            .expect("agree precheck requires next_step before pz");
+        let next_status = workflow_task_status_for_target_node(&next_step.target_node);
         let (checker_id, checker_name, reviewer_id, reviewer_name, approver_id, approver_name) =
-            assign_review_task_fields(&target_node, assignee_id, assignee_name);
+            assign_review_task_fields(
+                &next_step.target_node,
+                &next_step.assignee_id,
+                &next_step.assignee_name,
+            );
         (
-            target_node,
+            next_step.target_node.clone(),
             next_status,
             checker_id,
             checker_name,
@@ -834,7 +1287,7 @@ async fn apply_workflow_agree(
         .bind(("approver_name", approver_name))
         .await
         .map_err(|error| {
-            (
+            WorkflowSyncActionError::plain(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("更新 review_tasks 失败: {}", error),
             )
@@ -843,7 +1296,7 @@ async fn apply_workflow_agree(
     let review_form = get_review_form_by_form_id(&request.form_id)
         .await
         .map_err(|error| {
-            (
+            WorkflowSyncActionError::plain(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("查询 review_forms 失败: {}", error),
             )
@@ -858,7 +1311,7 @@ async fn apply_workflow_agree(
     )
     .await
     {
-        return Err((
+        return Err(WorkflowSyncActionError::plain(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("同步 review_forms 状态失败: {}", error),
         ));
@@ -882,7 +1335,7 @@ async fn apply_workflow_agree(
         .filter(|value| !value.is_empty());
     let _ = project_primary_db()
         .query(history_sql)
-        .bind(("task_id", task.id))
+        .bind(("task_id", task.id.clone()))
         .bind(("from_node", current_node.clone()))
         .bind(("operator_id", request.actor.id.trim().to_string()))
         .bind(("operator_name", request.actor.name.trim().to_string()))
@@ -898,50 +1351,10 @@ async fn apply_workflow_agree(
 
 async fn apply_workflow_stop(
     request: &SyncWorkflowRequest,
-) -> Result<Option<String>, (StatusCode, String)> {
-    let task = find_task_by_form_id(&request.form_id)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("查询任务失败: {}", error),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("form_id={} 未找到活动 review task", request.form_id),
-            )
-        })?;
-
-    let current_node = normalize_workflow_node(&task.current_node);
-    if current_node != "jd" && current_node != "sh" && current_node != "pz" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "stop 仅允许在 jd/sh/pz 节点执行，当前节点为 {}",
-                if current_node.is_empty() {
-                    "<empty>".to_string()
-                } else {
-                    current_node.clone()
-                }
-            ),
-        ));
-    }
-
-    let (owner_id, owner_source) = current_node_owner(&task, &current_node);
-    if !owner_id.is_empty() && owner_id != request.actor.id.trim() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            format!(
-                "stop 权限不足：当前请求人 {} 不是 {} 节点负责人 {}",
-                request.actor.id.trim(),
-                owner_source,
-                owner_id
-            ),
-        ));
-    }
-
+    precheck: &WorkflowMutationPrecheck,
+) -> Result<Option<String>, WorkflowSyncActionError> {
+    let task = &precheck.task;
+    let current_node = precheck.current_node.clone();
     let stop_reason = request
         .comments
         .as_ref()
@@ -966,7 +1379,7 @@ async fn apply_workflow_stop(
         ))
         .await
         .map_err(|error| {
-            (
+            WorkflowSyncActionError::plain(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("更新 review_tasks 失败: {}", error),
             )
@@ -975,7 +1388,7 @@ async fn apply_workflow_stop(
     let review_form = get_review_form_by_form_id(&request.form_id)
         .await
         .map_err(|error| {
-            (
+            WorkflowSyncActionError::plain(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("查询 review_forms 失败: {}", error),
             )
@@ -990,7 +1403,7 @@ async fn apply_workflow_stop(
     )
     .await
     {
-        return Err((
+        return Err(WorkflowSyncActionError::plain(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("同步 review_forms 状态失败: {}", error),
         ));
@@ -1009,7 +1422,7 @@ async fn apply_workflow_stop(
     "#;
     let _ = project_primary_db()
         .query(history_sql)
-        .bind(("task_id", task.id))
+        .bind(("task_id", task.id.clone()))
         .bind(("from_node", current_node))
         .bind(("operator_id", request.actor.id.trim().to_string()))
         .bind(("operator_name", request.actor.name.trim().to_string()))
@@ -1237,23 +1650,17 @@ async fn query_workflow_data(
     form_id: &str,
     next_step: Option<String>,
 ) -> anyhow::Result<SyncWorkflowData> {
-    let models = query_workflow_models(form_id).await.unwrap_or_default();
-    let attachments = query_workflow_attachments(form_id)
-        .await
-        .unwrap_or_default();
-    let review_form = get_review_form_by_form_id(form_id).await.unwrap_or(None);
-    let task = find_task_by_form_id(form_id).await.unwrap_or(None);
+    let models = query_workflow_models(form_id).await?;
+    let attachments = query_workflow_attachments(form_id).await?;
+    let review_form = get_review_form_by_form_id(form_id).await?;
+    let task = find_task_by_form_id(form_id).await?;
     let task_id = task.as_ref().map(|t| t.id.clone());
     let records = {
-        let by_form = query_workflow_records_by_form_id(form_id)
-            .await
-            .unwrap_or_default();
+        let by_form = query_workflow_records_by_form_id(form_id).await?;
         if !by_form.is_empty() {
             by_form
         } else if let Some(task_id) = task_id.as_deref() {
-            query_workflow_records_by_task_id(task_id)
-                .await
-                .unwrap_or_default()
+            query_workflow_records_by_task_id(task_id).await?
         } else {
             Vec::new()
         }
@@ -1268,9 +1675,7 @@ async fn query_workflow_data(
     let annotation_comments = if annotation_ids.is_empty() {
         Vec::new()
     } else {
-        query_annotation_comments(&annotation_ids.into_iter().collect::<Vec<_>>())
-            .await
-            .unwrap_or_default()
+        query_annotation_comments(&annotation_ids.into_iter().collect::<Vec<_>>()).await?
     };
     let task_created = Some(task.is_some());
     let current_node = task.as_ref().map(|t| t.current_node.clone());

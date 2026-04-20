@@ -2,10 +2,24 @@
 import { useRouter } from 'vue-router'
 import { useSitesStore } from '@/stores/sites'
 import type { ManagedProjectSite, ManagedSiteRiskLevel } from '@/types/site'
-import { Eye, ExternalLink, FolderPlus, Loader2, Play, RefreshCw, Square, Trash2 } from 'lucide-vue-next'
-import { statusLabelMap, statusClassMap, parseStatusClass as getParseStatusClass, isSiteBusy } from './site-status'
+import { Eye, ExternalLink, FolderPlus, Loader2, Pencil, Play, RefreshCw, Square, Trash2 } from 'lucide-vue-next'
+import {
+  canDeleteSite,
+  canEditSite,
+  canParseSite,
+  canStartSite,
+  canStopSite,
+  parseStatusClass as getParseStatusClass,
+  statusClassMap,
+  statusLabelMap,
+} from './site-status'
+import { buildViewerUrl } from '@/lib/viewer'
 
 const props = defineProps<{ sites: ManagedProjectSite[]; loading: boolean }>()
+
+const emit = defineEmits<{
+  'edit-site': [siteId: string]
+}>()
 
 const router = useRouter()
 const sitesStore = useSitesStore()
@@ -23,17 +37,16 @@ const riskConfig: Record<ManagedSiteRiskLevel, { class: string; label: string }>
   critical: { class: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200', label: '严重' },
 }
 
-function canStart(site: ManagedProjectSite) {
-  return !isSiteBusy(site) && ['Stopped', 'Parsed', 'Failed', 'Draft'].includes(site.status)
-}
-function canStop(site: ManagedProjectSite) {
-  return site.status === 'Running'
-}
-function canParse(site: ManagedProjectSite) {
-  return !isSiteBusy(site)
-}
-function canDelete(site: ManagedProjectSite) {
-  return !isSiteBusy(site) && site.status !== 'Running'
+const canStart = canStartSite
+const canStop = canStopSite
+const canParse = canParseSite
+const canDelete = canDeleteSite
+const canEdit = canEditSite
+function confirmDelete(site: ManagedProjectSite) {
+  const confirmed = window.confirm(`确定删除站点「${site.project_name}」吗？此操作不可撤销。`)
+  if (confirmed) {
+    void handleDelete(site.site_id)
+  }
 }
 function riskSummary(site: ManagedProjectSite) {
   return site.risk_reasons[0] ?? '当前无明显风险'
@@ -42,8 +55,40 @@ function openDetail(siteId: string) {
   router.push({ path: '/sites/' + siteId })
 }
 function openViewer(site: ManagedProjectSite) {
-  const project = encodeURIComponent(site.associated_project || site.project_name)
-  window.open(`http://localhost:3101/?backendPort=${site.web_port}&output_project=${project}`, '_blank')
+  const url = buildViewerUrl(site)
+  if (url) window.open(url, '_blank')
+}
+
+async function handleStart(siteId: string) {
+  try {
+    await sitesStore.startSite(siteId)
+  } catch {
+    // 错误已写入 store
+  }
+}
+
+async function handleStop(siteId: string) {
+  try {
+    await sitesStore.stopSite(siteId)
+  } catch {
+    // 错误已写入 store
+  }
+}
+
+async function handleParse(siteId: string) {
+  try {
+    await sitesStore.parseSite(siteId)
+  } catch {
+    // 错误已写入 store
+  }
+}
+
+async function handleDelete(siteId: string) {
+  try {
+    await sitesStore.deleteSite(siteId)
+  } catch {
+    // 错误已写入 store
+  }
 }
 </script>
 
@@ -140,7 +185,7 @@ function openViewer(site: ManagedProjectSite) {
             <div v-else class="flex items-center justify-end gap-1">
               <button
                 v-if="canStart(site)"
-                @click="sitesStore.startSite(site.site_id)"
+                @click="handleStart(site.site_id)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
                 title="启动"
               >
@@ -148,7 +193,7 @@ function openViewer(site: ManagedProjectSite) {
               </button>
               <button
                 v-if="canStop(site)"
-                @click="sitesStore.stopSite(site.site_id)"
+                @click="handleStop(site.site_id)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
                 title="停止"
               >
@@ -156,14 +201,14 @@ function openViewer(site: ManagedProjectSite) {
               </button>
               <button
                 v-if="canParse(site)"
-                @click="sitesStore.parseSite(site.site_id)"
+                @click="handleParse(site.site_id)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
                 title="解析"
               >
                 <RefreshCw class="h-3.5 w-3.5" />
               </button>
               <button
-                v-if="site.status === 'Running'"
+                v-if="site.status === 'Running' && buildViewerUrl(site)"
                 @click="openViewer(site)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
                 :title="`打开 Viewer (${site.associated_project || site.project_name})`"
@@ -178,8 +223,16 @@ function openViewer(site: ManagedProjectSite) {
                 <ExternalLink class="h-3.5 w-3.5" />
               </button>
               <button
+                v-if="canEdit(site)"
+                @click="emit('edit-site', site.site_id)"
+                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
+                title="编辑配置"
+              >
+                <Pencil class="h-3.5 w-3.5" />
+              </button>
+              <button
                 v-if="canDelete(site)"
-                @click="sitesStore.deleteSite(site.site_id)"
+                @click="confirmDelete(site)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
                 title="删除"
               >

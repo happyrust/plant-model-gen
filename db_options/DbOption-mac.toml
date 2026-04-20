@@ -274,6 +274,12 @@ debug_project_id = "AvevaMarineSample"
 debug_user_id = "debug-user"
 debug_role = "sj"
 
+# PMS 入站 S2S 认证配置
+# 只控制 embed-url / workflow/sync / delete / cache/preload；不会跟着 review_auth 一起放开
+[platform_auth]
+enabled = true
+debug_token = ""
+
 # Web Server（生产：0.0.0.0 才能在公网访问 :3100；云安全组需放行 TCP 3100）
 # 仅本机 + Nginx 反代时改 bind_host = "127.0.0.1"，Postman/外网则走 80/443 不要求直连 3100
 # 外部已 surreal start 在 8020 时 auto_start_surreal = false

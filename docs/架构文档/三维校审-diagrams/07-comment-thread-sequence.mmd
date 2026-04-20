@@ -1,0 +1,49 @@
+sequenceDiagram
+  autonumber
+  actor U as 当前用户
+  participant TS as useToolStore<br/>(批注 + comments + reviewState)
+  participant RCT as ReviewCommentsTimeline.vue
+  participant API as reviewApi.ts
+  participant RA as review_api.rs
+  participant DB as SurrealDB
+
+  Note over U,TS: 选中一条批注 (text/cloud/rect/obb) + annotationId
+
+  RCT->>API: reviewCommentGetByAnnotation(id, type)
+  API->>RA: GET /api/review/comments/by-annotation/{id}?type=...
+  RA->>DB: SELECT review_comments<br/>WHERE annotation_id=$id [AND annotation_type=$type]<br/>ORDER BY created_at ASC
+  RA-->>API: CommentResponse
+  API-->>RCT: comments[]
+  RCT->>TS: setAnnotationComments(type, id, comments) (覆盖本地)
+
+  alt 发表新评论 / 回复
+    U->>RCT: 输入 content [+ replyToId]
+    RCT->>API: reviewCommentCreate({author, content, replyToId})
+    API->>RA: POST /api/review/comments
+    RA->>DB: CREATE review_comments<br/>created_at=time::now()
+    RA-->>API: CommentResponse
+    API-->>RCT: comment
+    RCT->>TS: addCommentToAnnotation (乐观合并/fallback)
+  end
+
+  alt 处理动作 (设计: fixed / wont_fix)
+    U->>RCT: 点击「已修改」或「不需解决」
+    RCT->>TS: applyAnnotationReviewAction(action=fixed|wont_fix)
+    TS->>TS: 更新 reviewState<br/>(resolutionStatus + history)
+    Note over TS: 当前仅改写本地 annotation.reviewState<br/>未通过独立接口持久化,<br/>最终由 review_records 快照带走
+  end
+
+  alt 决定动作 (校对/审核: agree / reject)
+    U->>RCT: 点击「同意」或「驳回」
+    RCT->>TS: applyAnnotationReviewAction(action=agree|reject)
+    TS->>TS: 更新 decisionStatus<br/>(pending→agreed/rejected)
+  end
+
+  alt 更新严重度 (severity)
+    U->>RCT: 选择 suggestion/normal/severe/critical 或清空
+    RCT->>API: annotationSeverityUpdate(id, type, severity)
+    API->>RA: PATCH /api/review/annotations/{id}/severity?type=...
+    RA-->>API: 桩实现: 仅校验参数 + 回显<br/>(未入库, 当前靠批注 JSON 快照持久化)
+  end
+
+  Note right of DB: 实时 WebSocket (规划中):<br/>comment_added / record_saved 广播到 /ws/review/user/{userId}

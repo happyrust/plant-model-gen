@@ -1,0 +1,19 @@
+flowchart TD
+  A["用户在三维场景确认:<br/>批注/测量/云线/矩形/OBB + note"] --> B["POST /api/review/records"]
+  B --> C{"lookup_task_record_context<br/>根据 task_id 取 form_id / current_node"}
+  C -->|not found| X1[["400 Bad Request<br/>无法解析任务"]]
+  C -->|found| D["构造 slot_key =<br/>sha256(form_id / current_node / operator_id)"]
+  D --> E["构造 stable record_id<br/>review_records:id from slot_key"]
+  E --> F["构造 snapshot_hash<br/>sha256(type + annotations + ... + note)"]
+  F --> G["SELECT review_records<br/>WHERE record::id(id)=$id LIMIT 1"]
+  G -->|"存在且 snapshot_hash 相同"| H["No-op:<br/>MERGE context 后原样返回"]
+  G -->|"不存在 OR hash 变化"| I["UPSERT review_records CONTENT<br/>task_id, form_id, type, annotations ...<br/>current_node, operator_*, slot_key,<br/>snapshot_hash, confirmed_at"]
+  I --> J["RETURN AFTER 返回新快照"]
+  H --> K[["ConfirmedRecordResponse"]]
+  J --> K
+  K --> L["useReviewStore.loadConfirmedRecords<br/>+ confirmedRecordsRestorer 场景还原"]
+
+  classDef warn fill:#fff7ed,stroke:#ea580c,color:#7c2d12;
+  classDef ok fill:#ecfdf5,stroke:#047857,color:#064e3b;
+  class X1 warn;
+  class H,J,K,L ok;

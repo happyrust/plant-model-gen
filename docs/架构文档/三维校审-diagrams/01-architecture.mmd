@@ -1,0 +1,60 @@
+flowchart TB
+  subgraph Actor["用户侧 (浏览器)"]
+    SJ["设计人员 (sj)"]
+    JD["校对人员 (jd)"]
+    SH["审核人员 (sh)"]
+    PZ["批准人员 (pz)"]
+  end
+
+  subgraph Frontend["前端 plant3d-web (Vue 3 + Three.js/xeokit)"]
+    IRP["InitiateReviewPanel.vue<br/>发起校审"]
+    RP["ReviewPanel.vue<br/>校审主面板"]
+    TRD["TaskReviewDetail.vue<br/>任务详情/工作流时间线"]
+    RCT["ReviewCommentsTimeline.vue<br/>批注对话"]
+    WSB["WorkflowStepBar / Submit/Return Dialog<br/>流转交互"]
+    API["reviewApi.ts + useReviewStore<br/>JWT/WS/状态"]
+  end
+
+  subgraph Backend["后端 plant-model-gen (Rust + Axum)"]
+    JWT["jwt_auth.rs<br/>TokenClaims + middleware"]
+    RA["review_api.rs<br/>CRUD · 工作流 · 评论 · 附件"]
+    RI["review_integration.rs<br/>碰撞/辅助数据"]
+    PA["platform_api/*.rs<br/>PMS 入站 (embed/workflow/delete/cache)"]
+  end
+
+  subgraph Storage["数据层"]
+    DB[("SurrealDB<br/>review_tasks / review_records<br/>review_comments / review_workflow_history<br/>review_attachments / review_forms")]
+    FS[["assets/review_attachments<br/>(静态文件)"]]
+  end
+
+  subgraph External["外部系统"]
+    PMS["PMS 提资平台<br/>(S2S + embed-url)"]
+    COLL["碰撞/质量/OT 数据源"]
+  end
+
+  SJ --> IRP
+  JD --> RP
+  SH --> RP
+  PZ --> RP
+  SJ --> TRD
+  JD --> TRD
+
+  IRP --> API
+  RP --> API
+  TRD --> API
+  RCT --> API
+  WSB --> API
+
+  API -- "Bearer JWT<br/>HTTP /api/review/*" --> RA
+  API -- "HTTP /api/review/{aux,collision}-data" --> RI
+  API -- "HTTP /api/review/{embed-url,workflow/sync,delete,cache/preload}" --> PA
+  API -. "WebSocket /ws/review/*<br/>(客户端已实现,后端规划中)" .- RA
+
+  RA --> JWT
+  PA --> JWT
+  RA --> DB
+  PA --> DB
+  RI --> COLL
+  RA --> FS
+  PMS -- "S2S token" --> PA
+  PMS -- "iframe embed" --> Frontend

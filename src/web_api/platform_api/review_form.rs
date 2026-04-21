@@ -6,6 +6,7 @@
 //! - 能用单次 `UPDATE … WHERE` 完成的不要先 `SELECT` 再写（减少往返）。
 
 use aios_core::project_primary_db;
+use std::fs;
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 
 use super::types::{
@@ -211,9 +212,107 @@ pub async fn mark_review_form_deleted(form_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// PMS 入站删除：主单软删 + 该 `form_id` 下任务软删；不物理删除子表与附件文件。
+#[derive(Debug, serde::Deserialize, SurrealValue)]
+struct ReviewAttachmentDeleteRow {
+    file_id: Option<String>,
+    file_ext: Option<String>,
+}
+
+async fn query_review_task_ids_by_form_id(form_id: &str) -> anyhow::Result<Vec<String>> {
+    #[derive(Debug, serde::Deserialize, SurrealValue)]
+    struct ReviewTaskIdRow {
+        id: surrealdb_types::RecordId,
+    }
+
+    let mut response = project_primary_db()
+        .query(
+            r#"
+            SELECT id FROM review_tasks
+            WHERE form_id = $form_id
+            "#,
+        )
+        .bind(("form_id", form_id.to_string()))
+        .await?;
+
+    let rows: Vec<ReviewTaskIdRow> = response.take(0)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| match row.id.key {
+            surrealdb_types::RecordIdKey::String(value) => value,
+            other => format!("{:?}", other),
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect())
+}
+
+async fn query_review_attachment_delete_rows(
+    form_id: &str,
+) -> anyhow::Result<Vec<ReviewAttachmentDeleteRow>> {
+    let mut response = project_primary_db()
+        .query(
+            r#"
+            SELECT file_id, file_ext FROM review_attachment
+            WHERE form_id = $form_id
+            "#,
+        )
+        .bind(("form_id", form_id.to_string()))
+        .await?;
+
+    Ok(response.take(0)?)
+}
+
+fn remove_review_attachment_file(file_id: &str, file_ext: Option<&str>) -> anyhow::Result<()> {
+    let file_id = file_id.trim();
+    if file_id.is_empty() {
+        return Ok(());
+    }
+
+    let upload_dir = std::path::Path::new("assets/review_attachments");
+    let mut candidates = Vec::new();
+
+    if let Some(ext) = file_ext
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_start_matches('.').to_ascii_lowercase())
+    {
+        candidates.push(upload_dir.join(format!("{}.{}", file_id, ext)));
+    }
+
+    for ext in ["png", "jpg", "jpeg", "gif", "pdf", "bin"] {
+        let path = upload_dir.join(format!("{}.{}", file_id, ext));
+        if !candidates.iter().any(|candidate| candidate == &path) {
+            candidates.push(path);
+        }
+    }
+
+    for candidate in candidates {
+        if !candidate.exists() {
+            continue;
+        }
+
+        match fs::remove_file(&candidate) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                anyhow::bail!("删除附件文件失败 {}: {}", candidate.display(), error);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// PMS 入站删除：主单软删 + 清理 form 主链 + 关联 review_comments + severity。
 pub async fn soft_delete_review_bundle(form_id: &str) -> anyhow::Result<()> {
     ensure_review_forms_schema().await?;
+    let review_form = get_review_form_by_form_id(form_id).await?;
+    if review_form.is_none() {
+        anyhow::bail!("form_id={} 不存在", form_id);
+    }
+
+    let task_ids = query_review_task_ids_by_form_id(form_id).await?;
+    let attachments = query_review_attachment_delete_rows(form_id).await?;
 
     project_primary_db()
         .query(
@@ -230,6 +329,75 @@ pub async fn soft_delete_review_bundle(form_id: &str) -> anyhow::Result<()> {
         .await?;
 
     mark_review_form_deleted(form_id).await?;
+
+    project_primary_db()
+        .query(
+            r#"
+            LET $ids = SELECT VALUE id FROM review_form_model WHERE form_id = $form_id;
+            DELETE $ids;
+            "#,
+        )
+        .bind(("form_id", form_id.to_string()))
+        .await?;
+
+    // 清理关联 review_comments + severity（在删除 review_records 之前提取 annotation_ids）
+    project_primary_db()
+        .query(
+            r#"
+            LET $records = SELECT annotations, cloud_annotations, rect_annotations, obb_annotations
+                FROM review_records WHERE form_id = $form_id;
+            LET $anno_ids = array::distinct(array::flatten([
+                array::flatten($records.annotations.*.id ?? []),
+                array::flatten($records.cloud_annotations.*.id ?? []),
+                array::flatten($records.rect_annotations.*.id ?? []),
+                array::flatten($records.obb_annotations.*.id ?? [])
+            ]));
+            DELETE review_comments WHERE annotation_id IN $anno_ids;
+            DELETE review_annotation_severity WHERE annotation_id IN $anno_ids;
+            "#,
+        )
+        .bind(("form_id", form_id.to_string()))
+        .await?;
+
+    project_primary_db()
+        .query(
+            r#"
+            LET $ids = SELECT VALUE id FROM review_records WHERE form_id = $form_id;
+            DELETE $ids;
+            "#,
+        )
+        .bind(("form_id", form_id.to_string()))
+        .await?;
+
+    if !task_ids.is_empty() {
+        project_primary_db()
+            .query(
+                r#"
+                LET $ids = SELECT VALUE id FROM review_workflow_history WHERE task_id IN $task_ids;
+                DELETE $ids;
+                "#,
+            )
+            .bind(("task_ids", task_ids))
+            .await?;
+    }
+
+    for attachment in &attachments {
+        remove_review_attachment_file(
+            attachment.file_id.as_deref().unwrap_or_default(),
+            attachment.file_ext.as_deref(),
+        )?;
+    }
+
+    project_primary_db()
+        .query(
+            r#"
+            LET $ids = SELECT VALUE id FROM review_attachment WHERE form_id = $form_id;
+            DELETE $ids;
+            "#,
+        )
+        .bind(("form_id", form_id.to_string()))
+        .await?;
+
     Ok(())
 }
 

@@ -271,6 +271,10 @@ pub struct MbdPipeData {
     pub stats: MbdPipeStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_info: Option<MbdPipeDebugInfo>,
+    /// 仅当 `mode=layout_first` 时填充：由 `aios_core::mbd::BranchCalculator::solve_branch`
+    /// + `assemble_prelaid_out` 产出的排版结果，前端 `renderLaidOutLinearDims` 消费。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_result: Option<aios_core::mbd::LayoutResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -638,6 +642,9 @@ struct CacheTubiSeg {
     arrive_axis: Option<Vec3>,
     /// leave 端口轴线点（可选；来自 EleGeosInfo.leave_axis_pt）
     leave_axis: Option<Vec3>,
+    /// 外径（mm）。对应 PML `aod of $!tubi`。从 pe.aod 或 pe.attrs.AOD 取；
+    /// 不存在时 None，由 `compute_branch_layout_result` 回退到 default_od=229。
+    outside_diameter: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -845,7 +852,7 @@ impl<'a> BranchMeasurementPlanner<'a> {
                 leave: Some([seg.end.x, seg.end.y, seg.end.z]),
                 length: seg.start.distance(seg.end),
                 straight_length: seg.start.distance(seg.end),
-                outside_diameter: None,
+                outside_diameter: seg.outside_diameter,
                 bore: None,
             })
             .collect()
@@ -971,21 +978,11 @@ impl<'a> BranchMeasurementPlanner<'a> {
                 .iter()
                 .map(|seg| seg.start.distance(seg.end))
                 .sum();
-            let ends: Vec<(Vec3, Vec3)> = self
-                .topology
-                .segments
-                .iter()
-                .map(|s| (s.start, s.end))
-                .collect();
-            let chain_pts = build_chain_points_from_ends(&ends, &weld_joints);
-            let (a, b) = if chain_pts.len() >= 2 {
-                (chain_pts[0], chain_pts[chain_pts.len() - 1])
-            } else {
-                (
-                    self.topology.segments[0].start,
-                    self.topology.segments[0].end,
-                )
-            };
+            // 总长对应 PML `hpos of branname → tpos of branname`：取首段起点到末段终点，
+            // 不走 weld_joints 链条（即使 weld_joints 为空、或者段间坐标不严格相连，也能稳定产出）。
+            let first_seg = &self.topology.segments[0];
+            let last_seg = &self.topology.segments[self.topology.segments.len() - 1];
+            let (a, b) = (first_seg.start, last_seg.end);
             if total >= self.query.dim_min_length {
                 dims.push(MbdDimDto {
                     id: format!("dim:overall:{}", self.topology.branch_refno),
@@ -1677,6 +1674,7 @@ async fn fetch_tubi_segments_from_parquet_with_debug(
             end,
             arrive_axis: None,
             leave_axis: None,
+            outside_diameter: None,
         });
     }
 
@@ -1843,6 +1841,7 @@ async fn fetch_tubi_segments_from_cache_with_debug(
                 end,
                 arrive_axis: tubi_data.arrive_axis_pt.map(Vec3::from),
                 leave_axis: tubi_data.leave_axis_pt.map(Vec3::from),
+                outside_diameter: None,
             },
         );
     }
@@ -1886,12 +1885,19 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
         pub leave_axis: Option<RsVec3>,
         #[serde(default)]
         pub index: Option<i64>,
+        /// 外径（mm），通常存在 TUBI 元件的 pe.aod 或 pe.attrs.AOD；
+        /// 任一缺失则回退到 `compute_branch_layout_result` 的 default_od。
+        #[serde(default)]
+        pub aod: Option<f32>,
     }
 
     let mut debug = MbdPipeDebugInfo::default();
     debug.notes.push("source=db".to_string());
 
     let pe_key = branch_refno.to_pe_key();
+    // Stage B.2: 顺便试探 TUBI 元件的外径。tubi_relate.in 是 record reference (pe:...),
+    // 直接 `in.aod` 走 record join，O(1) 命中，pe 不存在该字段时返回 NONE → Option<f32>=None。
+    // 不命中时由 `compute_branch_layout_result` 的 default_od=229 兜住。
     let sql = format!(
         r#"
         SELECT
@@ -1903,7 +1909,8 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
             end_pt.d as end_pt,
             arrive_axis.d as arrive_axis,
             leave_axis.d as leave_axis,
-            id[1] as index
+            id[1] as index,
+            in.aod as aod
         FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
         "#
     );
@@ -1940,6 +1947,7 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
             end,
             arrive_axis: row.arrive_axis.map(|p| p.0),
             leave_axis: row.leave_axis.map(|p| p.0),
+            outside_diameter: row.aod,
         });
     }
 
@@ -1949,6 +1957,13 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
         ao.cmp(&bo)
             .then_with(|| a.refno.to_string().cmp(&b.refno.to_string()))
     });
+
+    let found_aod = segs.iter().filter(|s| s.outside_diameter.is_some()).count();
+    debug.notes.push(format!(
+        "tubi_aod_found={}/{}",
+        found_aod,
+        segs.len()
+    ));
 
     Ok((segs, debug))
 }
@@ -2205,8 +2220,13 @@ fn build_chain_points_from_ends(ends: &[(Vec3, Vec3)], weld_joints: &[WeldJoint]
     }
 
     if weld_joints.is_empty() {
+        // 无焊口时仍然需要走整条 branch 的首尾而不是只报第一段：对应 PML 对 overall
+        // 尺寸 "hpos of branname → tpos of branname" 的语义。多段情况下取首段起点和末段终点。
         out.push(ends[0].0);
-        out.push(ends[0].1);
+        for pair in ends.iter().skip(1) {
+            out.push(pair.0);
+        }
+        out.push(ends[ends.len() - 1].1);
         return out;
     }
 
@@ -2375,7 +2395,7 @@ async fn build_mbd_pipe_data_from_segments(
         bends_count: output.bends.len(),
     };
 
-    Ok(MbdPipeData {
+    let mut data = MbdPipeData {
         input_refno: branch_refno.to_string(),
         branch_refno: branch_refno.to_string(),
         branch_name,
@@ -2390,7 +2410,229 @@ async fn build_mbd_pipe_data_from_segments(
         bends: output.bends,
         stats,
         debug_info: query.debug.then_some(debug_info),
-    })
+        layout_result: None,
+    };
+
+    if matches!(query.mode, MbdPipeMode::LayoutFirst) {
+        data.layout_result = Some(compute_branch_layout_result(query, &data));
+    }
+
+    Ok(data)
+}
+
+/// 把后端的 `MbdPipeData` 子集喂给 `aios_core::mbd::BranchCalculator`，产出完整 `LayoutResult`。
+///
+/// 单位：所有输入/输出均为 **毫米（mm）**，与 `mbd_pipe_api` 的原始坐标空间一致。
+fn compute_branch_layout_result(
+    query: &ResolvedMbdPipeQuery,
+    data: &MbdPipeData,
+) -> aios_core::mbd::LayoutResult {
+    use aios_core::mbd::iso_extras::{BendInput, SlopeInput, TagInput, WeldInput};
+    use aios_core::mbd::iso_params::{BranchContext, IsoParams, SegmentInput};
+    use aios_core::mbd::{BranchCalculator, LayoutRequest, SolveBranchInput};
+    use glam::Vec3;
+
+    let od_by_segment: HashMap<String, f32> = data
+        .segments
+        .iter()
+        .filter_map(|s| s.outside_diameter.map(|od| (s.id.clone(), od)))
+        .collect();
+    // 若 segment 未携带 outside_diameter（B.2 之前普遍如此），用 DN200 常见 OD=229mm 作为兜底，
+    // 以满足 PML `offset = od + 1.2*cheight*(n-1)` 第一层 offset 不会坍缩到 100mm。
+    // B.2 补齐真实 OD 后，大多数段会直接命中 od_by_segment，此分支只在 surreal 查不到时触发。
+    const DEFAULT_OD_MM: f32 = 229.0;
+    let default_od = od_by_segment
+        .values()
+        .copied()
+        .next()
+        .unwrap_or(DEFAULT_OD_MM);
+
+    let iso_params = IsoParams {
+        min_slope: query.min_slope,
+        max_slope: query.max_slope,
+        consider_pre_next_dir: true,
+        look_angle: 60.0,
+        cheight: 100.0,
+        em4_mode: true,
+    };
+    let context = BranchContext {
+        branch_refno: data.branch_refno.clone(),
+        bran_volume_center: estimate_bran_volume_center(&data.segments),
+        dim_times: 1,
+    };
+
+    let linear_dims: Vec<SegmentInput> = data
+        .dims
+        .iter()
+        .map(|d| {
+            let start = Vec3::from_array(d.start);
+            let end = Vec3::from_array(d.end);
+            let owner_id = d
+                .layout_hint
+                .as_ref()
+                .and_then(|h| h.owner_segment_id.clone())
+                .unwrap_or_default();
+            let od = od_by_segment.get(&owner_id).copied().unwrap_or(default_od);
+            let pipe_dir = normalized_dir_or_x(end - start);
+            SegmentInput {
+                id: d.id.clone(),
+                kind: serde_value_as_str(&serde_json::to_value(d.kind).ok())
+                    .unwrap_or_else(|| "segment".to_string()),
+                start,
+                end,
+                pipe_dir,
+                od,
+                text: d.text.clone(),
+                isoline_index: d.seq.map(|s| s as usize),
+            }
+        })
+        .collect();
+
+    let cut_tubis: Vec<SegmentInput> = data
+        .cut_tubis
+        .iter()
+        .map(|c| {
+            let start = Vec3::from_array(c.start);
+            let end = Vec3::from_array(c.end);
+            let od = od_by_segment
+                .get(&c.segment_id)
+                .copied()
+                .unwrap_or(default_od);
+            let pipe_dir = normalized_dir_or_x(end - start);
+            SegmentInput {
+                id: c.id.clone(),
+                kind: "cut_tubi".to_string(),
+                start,
+                end,
+                pipe_dir,
+                od,
+                text: c.text.clone(),
+                isoline_index: None,
+            }
+        })
+        .collect();
+
+    let slopes: Vec<SlopeInput> = data
+        .slopes
+        .iter()
+        .map(|s| SlopeInput {
+            id: s.id.clone(),
+            tubi_start: Vec3::from_array(s.start),
+            tubi_end: Vec3::from_array(s.end),
+            slope: s.slope,
+            od: default_od,
+            text: s.text.clone(),
+        })
+        .collect();
+
+    let welds: Vec<WeldInput> = data
+        .welds
+        .iter()
+        .map(|w| WeldInput {
+            id: w.id.clone(),
+            position: Vec3::from_array(w.position),
+            label: w.label.clone(),
+            is_shop: w.is_shop,
+            subtitle: None,
+        })
+        .collect();
+
+    let tags: Vec<TagInput> = data
+        .tags
+        .iter()
+        .map(|t| TagInput {
+            id: t.id.clone(),
+            position: Vec3::from_array(t.position),
+            text: t.text.clone(),
+        })
+        .collect();
+
+    let bends: Vec<BendInput> = data
+        .bends
+        .iter()
+        .map(|b| BendInput {
+            id: b.id.clone(),
+            vertex: Vec3::from_array(b.work_point),
+            face_center_1: b.face_center_1.map(Vec3::from_array),
+            face_center_2: b.face_center_2.map(Vec3::from_array),
+            angle_deg: b.angle,
+            od: default_od,
+            face_texts: [None, None],
+            angle_text: format_bend_angle_text(b.angle),
+        })
+        .collect();
+
+    let sections = BranchCalculator::solve_branch(SolveBranchInput {
+        context: &context,
+        params: &iso_params,
+        linear_dims: &linear_dims,
+        cut_tubis: &cut_tubis,
+        slopes: &slopes,
+        welds: &welds,
+        tags: &tags,
+        bends: &bends,
+    });
+
+    let request = LayoutRequest {
+        mode: aios_core::mbd::BranchLayoutMode::LayoutFirst,
+        include_chain_dims: query.include_chain_dims,
+        include_overall_dim: query.include_overall_dim,
+        include_port_dims: query.include_port_dims,
+        include_welds: query.include_welds,
+        include_slopes: query.include_slopes,
+        include_bends: query.include_bends,
+        include_cut_tubis: query.include_cut_tubis,
+        include_tags: query.include_tags,
+        include_fittings: query.include_fittings,
+        look_angle: None,
+        consider_pre_next_dir: true,
+        ignore_line: false,
+        auto_text_scale: true,
+        min_text_scale: 0.75,
+        allow_layer_split: true,
+    };
+
+    BranchCalculator::assemble_prelaid_out(&request, sections)
+}
+
+fn normalized_dir_or_x(v: glam::Vec3) -> glam::Vec3 {
+    let d = v.normalize_or_zero();
+    if d.length_squared() < 1e-6 {
+        glam::Vec3::X
+    } else {
+        d
+    }
+}
+
+fn serde_value_as_str(v: &Option<serde_json::Value>) -> Option<String> {
+    v.as_ref()
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+}
+
+fn format_bend_angle_text(angle: Option<f32>) -> String {
+    angle
+        .map(|a| format!("{a:.1}°"))
+        .unwrap_or_default()
+}
+
+/// 粗略估计分支 volume 中心：取所有段 arrive/leave 的平均（忽略 None）。
+/// 对应 PML `var !volume volume $!branname; !pos1.midpoint(!pos2)` 的简化版本。
+fn estimate_bran_volume_center(segments: &[MbdPipeSegmentDto]) -> glam::Vec3 {
+    use glam::Vec3;
+    let mut sum = Vec3::ZERO;
+    let mut count = 0f32;
+    for s in segments {
+        if let Some(a) = s.arrive {
+            sum += Vec3::from_array(a);
+            count += 1.0;
+        }
+        if let Some(l) = s.leave {
+            sum += Vec3::from_array(l);
+            count += 1.0;
+        }
+    }
+    if count > 0.0 { sum / count } else { Vec3::ZERO }
 }
 
 /// 核心 MBD 数据生成逻辑（不依赖 axum，可被 API handler 和批量导出共用）
@@ -2684,6 +2926,7 @@ mod tests {
             end: Vec3::new(10.0, 0.0, 0.0),
             arrive_axis: Some(Vec3::new(9.0, 0.0, 0.0)),
             leave_axis: Some(Vec3::new(1.0, 0.0, 0.0)),
+            outside_diameter: None,
         };
 
         let (a, b) = segment_port_points(&seg);
@@ -2701,6 +2944,7 @@ mod tests {
             end: Vec3::new(5.0, 0.0, 0.0),
             arrive_axis: None,
             leave_axis: None,
+            outside_diameter: None,
         };
 
         let (a, b) = segment_port_points(&seg);
@@ -2836,6 +3080,7 @@ mod tests {
                     end: Vec3::new(100.0, 0.0, 0.0),
                     arrive_axis: None,
                     leave_axis: None,
+                    outside_diameter: None,
                 },
                 CacheTubiSeg {
                     refno: RefnoEnum::from("1_2"),
@@ -2845,6 +3090,7 @@ mod tests {
                     end: Vec3::new(220.0, 0.0, 0.0),
                     arrive_axis: None,
                     leave_axis: None,
+                    outside_diameter: None,
                 },
             ],
         );
@@ -2880,6 +3126,7 @@ mod tests {
                 end: Vec3::new(100.0, 0.0, 0.0),
                 arrive_axis: None,
                 leave_axis: None,
+                outside_diameter: None,
             }],
         );
         let fittings = vec![
@@ -2972,6 +3219,7 @@ mod tests {
             bends: Vec::new(),
             stats: MbdPipeStats::default(),
             debug_info: Some(MbdPipeDebugInfo::default()),
+            layout_result: None,
         };
         let json = serde_json::to_value(data).expect("data serialize");
         assert!(json.get("cut_tubis").is_some());

@@ -1,0 +1,24 @@
+stateDiagram-v2
+  direction LR
+  [*] --> OpenPending: 设计人员创建批注<br/>resolutionStatus=open<br/>decisionStatus=pending
+
+  OpenPending --> FixedPending: 设计标记 fixed<br/>resolutionStatus=fixed
+  OpenPending --> WontFixPending: 设计标记 wont_fix<br/>resolutionStatus=wont_fix
+
+  FixedPending --> FixedAgreed: 校对/审核 agree
+  FixedPending --> FixedRejected: 校对/审核 reject
+  WontFixPending --> WontFixAgreed: 校对/审核 agree
+  WontFixPending --> WontFixRejected: 校对/审核 reject
+
+  FixedRejected --> OpenPending: 设计重新处理
+  WontFixRejected --> OpenPending: 设计重新处理
+
+  FixedAgreed --> [*]
+  WontFixAgreed --> [*]
+
+  note right of OpenPending
+    action=fixed/wont_fix 由设计
+    action=agree/reject 由校对/审核
+    严重度独立存储:
+    suggestion/normal/severe/critical
+  end note

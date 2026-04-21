@@ -44,6 +44,40 @@ export function isSiteBusy(site: ManagedProjectSite): boolean {
   )
 }
 
+export function canStartSite(site: ManagedProjectSite): boolean {
+  return (
+    site.parse_status !== 'Running' &&
+    !isSiteBusy(site) &&
+    ['Stopped', 'Parsed', 'Failed', 'Draft'].includes(site.status)
+  )
+}
+
+export function canStopSite(site: ManagedProjectSite): boolean {
+  return (
+    site.status === 'Running' ||
+    site.status === 'Starting' ||
+    site.parse_status === 'Running'
+  )
+}
+
+export function canParseSite(site: ManagedProjectSite): boolean {
+  return (
+    !isSiteBusy(site) &&
+    site.status !== 'Running'
+  )
+}
+
+export function canDeleteSite(site: ManagedProjectSite): boolean {
+  return (
+    !isSiteBusy(site) &&
+    site.status !== 'Running'
+  )
+}
+
+export function canEditSite(site: ManagedProjectSite): boolean {
+  return canDeleteSite(site)
+}
+
 export function isSiteError(site: ManagedProjectSite): boolean {
   return site.status === 'Failed' || !!site.last_error
 }

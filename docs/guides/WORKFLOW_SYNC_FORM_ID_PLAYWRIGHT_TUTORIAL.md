@@ -116,9 +116,15 @@ Content-Type: application/json
 {
   "project_id": "AvevaMarineSample",
   "user_id": "SJ",
-  "form_id": "FORM-EXAMPLE-1234567890AB"
+  "form_id": "FORM-EXAMPLE-1234567890AB",
+  "token": "<PMS 入站 S2S token>"
 }
 ```
+
+说明：
+
+- `token` 走 `[platform_auth]`
+- `review_auth.enabled = false` 不会让该接口自动放开
 
 ### 预期
 
@@ -456,9 +462,21 @@ Content-Type: application/json
 ```json
 {
   "code": 200,
-  "message": "ok"
+  "message": "ok",
+  "results": [
+    {
+      "form_id": "FORM-EXAMPLE-1234567890AB",
+      "success": true,
+      "message": "已清理 review 主链"
+    }
+  ]
 }
 ```
+
+清理范围：
+
+- 会清 `review_form_model / review_records / review_attachment / review_workflow_history / 附件文件`
+- **不会清 `review_comments`**
 
 ---
 

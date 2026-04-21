@@ -4,18 +4,21 @@
 
 ## 1. form_id 的生成与确定
 
-`form_id` 在 `POST /api/review/embed-url` 调用时确定，有三种来源（按优先级）：
+`form_id` 在 `POST /api/review/embed-url` 调用时确定，有两种来源（按优先级）：
 
 | 优先级 | 来源 | 说明 |
 |--------|------|------|
 | 1 | `EmbedUrlRequest.form_id` | 外部系统直传，用于恢复已有单据 |
-| 2 | JWT token claims 中的 `form_id` | 解码传入的 token 获取 |
-| 3 | `generate_form_id()` 自动生成 | 格式 `FORM-XXXXXXXXXXXX`（12 位大写十六进制） |
+| 2 | `generate_form_id()` 自动生成 | 格式 `FORM-XXXXXXXXXXXX`（12 位大写十六进制） |
 
 确定后，`form_id` 会：
 - 通过 `ensure_review_form_stub` 写入 `review_forms` 表
-- 嵌入新签发的 JWT payload
 - 作为 `data.query.form_id` 和 `data.lineage.form_id` 返回给调用方
+
+补充说明：
+
+- `EmbedUrlRequest.token` 现在只作为 PMS 入站 S2S 认证使用，走 `[platform_auth]`
+- 新签发给浏览器的 `user_token` 不再依赖旧的 `form_id` claim 做身份恢复
 
 ## 2. embed-url 响应结构
 
@@ -160,7 +163,7 @@
 
 ```
 平台 ──POST /api/review/embed-url──► 模型中心
-     { project_id, user_id, token? }
+     { project_id, user_id, token }
                                      │
                               生成/确认 form_id
                               写入 review_forms
@@ -206,12 +209,14 @@
 平台 ──POST /api/review/delete──► 模型中心
      { form_ids: [...], operator_id, token }
                                      │
-                              删除 review_forms
-                              删除 review_tasks
+                              软删 review_forms
+                              软删 review_tasks
                               删除 review_form_model
-                              删除 review_opinion
+                              删除 review_records
                               删除 review_attachment
+                              删除 review_workflow_history
                               删除附件文件
+                              保留 review_comments
 ```
 
 ## 5. 结论
@@ -221,13 +226,14 @@
 - **唯一性**：`review_forms` 表上有 UNIQUE 索引
 - **稳定性**：一旦创建不会变化，跨 open/save/submit/read 保持一致
 - **全覆盖**：直接关联 5 张核心表，间接关联 workflow_history
-- **跨系统**：JWT 中携带、URL 参数传递、S2S 接口流转均使用同一 `form_id`
+- **跨系统**：嵌入 URL query、`review_*` 数据表、PMS S2S 请求都围绕同一 `form_id`
 
 ### 注意事项
 
 1. `review_workflow_history` 使用 `task_id` 而非直接使用 `form_id`，查询历史需先通过 `review_tasks.form_id` 获取 `task_id`
-2. `.surql` 定义文件中表名为单数（`review_form`），运行时代码使用复数（`review_forms`），以 Rust 代码 `ensure_review_forms_schema()` 为准
-3. 遗留的 ArangoDB `threed_review` / `review_data` 集合与新 SurrealDB 系统独立，互不关联
+2. 当前删除闭环不会清理 `review_comments`；因为评论只有 `annotation_id / annotation_type`，还没有 `form_id / task_id`
+3. `.surql` 定义文件中表名为单数（`review_form`），运行时代码使用复数（`review_forms`），以 Rust 代码 `ensure_review_forms_schema()` 为准
+4. 遗留的 ArangoDB `threed_review` / `review_data` 集合与新 SurrealDB 系统独立，互不关联
 
 ## 6. 源码参考
 

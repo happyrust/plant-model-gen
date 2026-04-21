@@ -114,6 +114,11 @@ function openCreateDrawer() {
   drawerOpen.value = true
 }
 
+function openEditDrawer(siteId: string) {
+  editingSiteId.value = siteId
+  drawerOpen.value = true
+}
+
 function handleFilter(search: string, status: string, risk: string) {
   searchQuery.value = search
   statusFilter.value = status
@@ -246,6 +251,24 @@ onMounted(async () => {
       </button>
     </div>
 
+    <div
+      v-if="sitesStore.latestActionError"
+      class="rounded-lg border border-destructive/50 bg-destructive/5 px-4 py-3 flex items-center justify-between gap-3"
+    >
+      <div class="flex items-center gap-2 text-sm text-destructive">
+        <CircleAlert class="h-4 w-4 shrink-0" />
+        <span>
+          {{ sitesStore.latestActionError.siteId }}：{{ sitesStore.latestActionError.message }}
+        </span>
+      </div>
+      <button
+        class="inline-flex h-8 items-center gap-1.5 rounded-md border border-destructive/30 px-3 text-xs font-medium text-destructive hover:bg-destructive/10 transition-colors"
+        @click="sitesStore.clearSiteActionError(sitesStore.latestActionError.siteId)"
+      >
+        关闭
+      </button>
+    </div>
+
     <section class="space-y-3">
       <div class="flex items-center justify-between">
         <div>
@@ -286,7 +309,7 @@ onMounted(async () => {
     </section>
 
     <SiteToolbar @open-drawer="openCreateDrawer" @filter="handleFilter" @quick-filter="handleQuickFilter" />
-    <SiteDataTable :sites="filteredSites" :loading="sitesStore.loading" />
+    <SiteDataTable :sites="filteredSites" :loading="sitesStore.loading" @edit-site="openEditDrawer" />
     <SiteDrawer
       :open="drawerOpen"
       :site-id="editingSiteId"

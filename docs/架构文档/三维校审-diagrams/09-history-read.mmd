@@ -1,0 +1,31 @@
+flowchart LR
+  subgraph Task["任务级历史"]
+    A1["TaskReviewDetail<br/>/ useReviewStore"]
+    A1 -->|reviewTaskGetWorkflow| A2["GET /api/review/tasks/{id}/workflow"]
+    A2 --> A3["review_workflow_history<br/>ORDER BY timestamp ASC"]
+    A3 --> A4["WorkflowStep 列表<br/>action=submit/return/approve/reject"]
+  end
+
+  subgraph Legacy["旧版审核历史 API"]
+    B1["useReviewStore.loadReviewHistory"]
+    B1 -->|reviewTaskGetHistory| B2["GET /api/review/tasks/{id}/history"]
+    B2 --> B3["review_workflow_history<br/>DESC (向后兼容)"]
+    B3 --> B4["ReviewHistoryItem<br/>映射到 created/submitted/in_review/...)"]
+  end
+
+  subgraph Record["确认记录快照"]
+    C1["ReviewPanel 'ConfirmedRecordsSection'"]
+    C1 -->|reviewRecordGetByTaskId| C2["GET /api/review/records/by-task/{taskId}"]
+    C2 --> C3["review_records<br/>ORDER BY confirmed_at DESC"]
+    C3 --> C4["ConfirmedRecordWithMeta[]<br/>恢复场景 + 节点+操作人+slot_key"]
+  end
+
+  subgraph Annot["批注对话历史"]
+    D1["ReviewCommentsTimeline"]
+    D1 -->|reviewCommentGetByAnnotation| D2["GET /api/review/comments/by-annotation/{id}?type=..."]
+    D2 --> D3["review_comments<br/>按 reply_to_id 构成对话树"]
+    D3 --> D4["TimelineItem:<br/>comment + annotationReviewEvent 交织"]
+  end
+
+  classDef group fill:#f5f3ff,stroke:#6d28d9,color:#1e1b4b;
+  class Task,Legacy,Record,Annot group;

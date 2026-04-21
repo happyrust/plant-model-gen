@@ -1,0 +1,51 @@
+flowchart TB
+  subgraph UI["Vue 组件树 (plant3d-web/src/components/review/)"]
+    direction TB
+    InitPanel["InitiateReviewPanel.vue<br/>(设计人员发起)"]
+    ReviewPanel["ReviewPanel.vue<br/>(主面板-包含 Tab)"]
+    TaskReviewDetail["TaskReviewDetail.vue<br/>(任务详情弹窗)"]
+    ReviewerList["ReviewerTaskList.vue<br/>(校对/审核/批准收件箱)"]
+    ResubmitList["ResubmissionTaskList.vue<br/>(设计再提交列表)"]
+
+    subgraph PanelChildren["ReviewPanel 内嵌子组件"]
+      WorkflowStepBar["WorkflowStepBar.vue<br/>4 节点步骤条"]
+      SubmitDialog["WorkflowSubmitDialog.vue"]
+      ReturnDialog["WorkflowReturnDialog.vue"]
+      CommentsTimeline["ReviewCommentsTimeline.vue<br/>批注对话 + 处理动作"]
+      AuxData["ReviewAuxData.vue<br/>碰撞/质量/OT"]
+      DataSync["ReviewDataSync.vue<br/>导入导出"]
+      Sections["sections/<br/>TaskContextSection<br/>ConfirmedRecordsSection<br/>DataSyncSection<br/>AuxiliaryDataSection"]
+      CollisionList["CollisionResultList.vue"]
+    end
+  end
+
+  subgraph Stores["Composable Stores (src/composables)"]
+    useReviewStore["useReviewStore.ts<br/>currentTask + confirmedRecords<br/>reviewHistory + WS"]
+    useToolStore["useToolStore.ts<br/>annotations + comments + reviewState"]
+    useUserStore["useUserStore.ts<br/>currentUser + reviewTasks<br/>createReviewTask / submit / return"]
+    useViewerContext["useViewerContext<br/>三维查看器接入"]
+  end
+
+  subgraph APIs["API 层 (src/api + composables)"]
+    reviewApi["reviewApi.ts<br/>(Bearer JWT + fetchJson)"]
+    WorkflowMode["workflowMode.ts<br/>嵌入模式识别"]
+    EmbedLanding["embedRoleLanding.ts<br/>角色落点"]
+    AttachmentFlow["reviewAttachmentFlow.ts"]
+  end
+
+  InitPanel --> useUserStore
+  InitPanel --> useReviewStore
+  ReviewPanel --> useReviewStore
+  ReviewPanel --> useToolStore
+  ReviewPanel --> useUserStore
+  ReviewPanel -- 内嵌 --> PanelChildren
+  CommentsTimeline --> useToolStore
+  CommentsTimeline --> reviewApi
+  TaskReviewDetail --> reviewApi
+  TaskReviewDetail --> useUserStore
+  ReviewerList --> useUserStore
+  ResubmitList --> useUserStore
+
+  useReviewStore --> reviewApi
+  useUserStore --> reviewApi
+  reviewApi -- HTTP --> Backend[["Axum 后端"]]

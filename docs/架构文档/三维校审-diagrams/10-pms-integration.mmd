@@ -1,0 +1,34 @@
+sequenceDiagram
+  autonumber
+  actor PM as PMS 提资平台
+  participant PA as platform_api<br/>(embed_url / workflow_sync / delete / cache_preload)
+  participant RA as review_api.rs<br/>(sync_review_form_with_task_status)
+  participant Frontend as plant3d-web<br/>(iframe embed)
+  participant DB as SurrealDB
+
+  Note over PM,PA: 1) 入口: 生成嵌入校审 URL
+  PM->>PA: POST /api/review/embed-url<br/>{project_id, user_id, form_id?, role}
+  PA->>PA: create_token(JWT, exp, role, workflow_mode)
+  PA-->>PM: { url, token, relative_path, query{form_id} }
+  PM->>Frontend: iframe src = ${url}?user_token=...&form_id=...
+
+  Note over PM,PA: 2) PMS 驱动工作流 (无需人工操作 UI)
+  PM->>PA: POST /api/review/workflow/sync<br/>{form_id, token(S2S), action: active/agree/return, actor}
+  PA->>PA: verify_s2s_token
+  alt action=query
+    PA->>DB: 聚合查询 (records + comments + attachments + form 状态)
+    PA-->>PM: SyncWorkflowResponse<br/>{title, models, taskId, records,<br/>annotationComments, attachments, currentNode, taskStatus}
+  else action=active/agree/return
+    PA->>DB: 更新 review_forms 状态<br/>(归并到 review_tasks workflow)
+    PA->>RA: sync_review_form_with_task_status<br/>(写回 review_forms)
+    PA-->>PM: next_step 或错误
+  end
+
+  Note over PM,PA: 3) 预热缓存 (待进入时)
+  PM->>PA: POST /api/review/cache/preload<br/>{project_id, initiator}
+  PA-->>PM: task_id 返回
+
+  Note over PM,PA: 4) 删除/清理
+  PM->>PA: POST /api/review/delete<br/>(按 form_id 软删)
+  PA->>RA: mark_review_form_deleted
+  PA->>DB: UPDATE review_forms/tasks SET deleted=true

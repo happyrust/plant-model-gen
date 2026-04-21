@@ -1,0 +1,112 @@
+erDiagram
+  REVIEW_TASKS ||--o{ REVIEW_RECORDS : "has"
+  REVIEW_TASKS ||--o{ REVIEW_WORKFLOW_HISTORY : "audits"
+  REVIEW_TASKS ||--o{ REVIEW_ATTACHMENTS : "binds"
+  REVIEW_TASKS ||--o{ REVIEW_FORM_MODEL : "links refnos"
+  REVIEW_TASKS }o--|| REVIEW_FORMS : "form_id aligns with PMS"
+  REVIEW_RECORDS }o--|| ANNOTATION_INLINE : "embeds (JSON)"
+  REVIEW_COMMENTS }o..|| ANNOTATION_INLINE : "threaded by annotation_id+type"
+  REVIEW_COMMENTS ||--o{ REVIEW_COMMENTS : "reply_to_id"
+
+  REVIEW_TASKS {
+    string id PK "task-<uuid>"
+    string form_id UK "对齐 PMS 单据号"
+    string title
+    string description
+    string model_name
+    string status "draft/submitted/in_review/approved/rejected/cancelled"
+    string priority "low/medium/high/urgent"
+    string requester_id FK
+    string requester_name
+    string checker_id FK "jd 节点负责人"
+    string approver_id FK "sh/pz 节点负责人"
+    string reviewer_id "deprecated"
+    string current_node "sj/jd/sh/pz"
+    array components "ReviewComponent[]"
+    array attachments "可选内嵌快照"
+    string return_reason
+    datetime created_at
+    datetime updated_at
+    datetime due_date
+    bool deleted "软删除 = true"
+  }
+
+  REVIEW_RECORDS {
+    string id PK "uuid (stable, slot_key 派生)"
+    string task_id FK
+    string form_id
+    string type "batch"
+    array annotations "text 批注 JSON"
+    array cloud_annotations "云线 JSON"
+    array rect_annotations "矩形/OBB 面 JSON"
+    array obb_annotations "OBB 三维框 JSON"
+    array measurements "测量 JSON"
+    string note
+    string current_node
+    string operator_id FK
+    string operator_name
+    string slot_key "(form_id, current_node, operator_id)"
+    string snapshot_hash "幂等去重"
+    datetime confirmed_at
+  }
+
+  REVIEW_COMMENTS {
+    string id PK "comment-<uuid>"
+    string annotation_id "批注本地 id"
+    string annotation_type "text/cloud/rect/obb"
+    string author_id FK
+    string author_name
+    string author_role "sj/jd/sh/pz"
+    string content
+    string reply_to_id FK "自引用"
+    datetime created_at
+  }
+
+  REVIEW_WORKFLOW_HISTORY {
+    string id PK
+    string task_id FK
+    string node "sj/jd/sh/pz"
+    string action "submit/return/approve/reject"
+    string operator_id
+    string operator_name
+    string comment
+    datetime timestamp
+  }
+
+  REVIEW_ATTACHMENTS {
+    string id PK
+    string task_id FK
+    string form_id
+    array model_refnos
+    string file_type
+    string name
+    string url
+    int size
+    string mime_type
+    string description
+    datetime uploaded_at
+  }
+
+  REVIEW_FORM_MODEL {
+    string id PK
+    string form_id FK
+    string model_refno
+    datetime created_at
+  }
+
+  REVIEW_FORMS {
+    string form_id PK "PMS 同步的单据"
+    string model_name
+    string initiator_id
+    string status "derive 自 task"
+    datetime updated_at
+  }
+
+  ANNOTATION_INLINE {
+    string id
+    string annotationType "text/cloud/rect/obb"
+    string severity "suggestion/normal/severe/critical"
+    object reviewState "resolutionStatus+decisionStatus+history"
+    array comments "冗余,前端态"
+    object geometry "position/points/bbox/..."
+  }

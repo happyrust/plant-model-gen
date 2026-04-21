@@ -5,9 +5,9 @@ use tracing::{info, warn};
 
 use crate::web_api::jwt_auth::{
     Role, create_token, decode_token_unsafe, generate_form_id, normalize_workflow_mode,
-    verify_token,
 };
 
+use super::auth::verify_s2s_token;
 use super::config::PLATFORM_CONFIG;
 use super::review_form::{ensure_review_form_stub, find_task_by_form_id};
 use super::types::{
@@ -36,67 +36,38 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
         summarize_extra_parameters(request.extra_parameters.as_ref())
     );
 
-    let mut verified_claim_role: Option<String> = None;
-    let mut verified_claim_workflow_mode: Option<String> = None;
-    if let Some(ref token) = request.token {
-        let token = token.trim();
-        if token.split('.').count() == 3 {
-            match verify_token(token) {
-                Ok(claims) => {
-                    info!(
-                        "Embed URL JWT claims verified: project_id={}, user_id={}, role={:?}, workflow_mode={:?}",
-                        claims.project_id, claims.user_id, claims.role, claims.workflow_mode
-                    );
-                    if claims.project_id != request.project_id || claims.user_id != request.user_id
-                    {
-                        warn!(
-                            "Embed URL JWT identity mismatch: token project/user={}/{}, request={}/{}",
-                            claims.project_id, claims.user_id, request.project_id, request.user_id
-                        );
-                        return (
-                            StatusCode::UNAUTHORIZED,
-                            Json(EmbedUrlResponse {
-                                code: 401,
-                                message: "unauthorized".to_string(),
-                                data: None,
-                                url: None,
-                            }),
-                        );
-                    }
-                    verified_claim_role = normalize_embed_role(claims.role.as_deref());
-                    verified_claim_workflow_mode =
-                        normalize_workflow_mode(claims.workflow_mode.as_deref());
-                    if let Some(legacy_form_id) = claims.legacy_form_id.as_deref() {
-                        warn!(
-                            "Embed URL JWT contains deprecated form_id={} for request form_id={:?}; explicit request form_id remains authoritative",
-                            legacy_form_id, request_form_id
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!("Embed URL JWT verification failed: {}", e);
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        Json(EmbedUrlResponse {
-                            code: 401,
-                            message: "unauthorized".to_string(),
-                            data: None,
-                            url: None,
-                        }),
-                    );
-                }
-            }
-        } else {
-        }
+    let inbound_token = request
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    if let Err((_status, msg)) = verify_s2s_token(inbound_token) {
+        warn!(
+            "Embed URL S2S token verification failed: project_id={}, user_id={}, reason={}",
+            request.project_id, request.user_id, msg
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(EmbedUrlResponse {
+                code: 401,
+                message: "unauthorized".to_string(),
+                data: None,
+                url: None,
+            }),
+        );
     }
+    info!(
+        "Embed URL S2S token accepted: project_id={}, user_id={}",
+        request.project_id, request.user_id
+    );
 
     info!(
         "Embed URL lineage resolution: request_form_id={:?}, token_claim_form_id={:?}, resolved_form_id={:?}",
         request_form_id, None::<String>, request_form_id
     );
 
-    let requested_role = match resolve_embed_request_role(&request, verified_claim_role.as_deref())
-    {
+    let requested_role = match resolve_embed_request_role(&request, None) {
         Ok(role) => role,
         Err(message) => {
             return (
@@ -110,10 +81,7 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
             );
         }
     };
-    let requested_workflow_mode = match resolve_embed_request_workflow_mode(
-        &request,
-        verified_claim_workflow_mode.as_deref(),
-    ) {
+    let requested_workflow_mode = match resolve_embed_request_workflow_mode(&request, None) {
         Ok(mode) => mode,
         Err(message) => {
             return (

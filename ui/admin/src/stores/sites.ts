@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed, reactive } from 'vue'
+import { extractErrorMessage } from '@/api/client'
 import { sitesApi } from '@/api/sites'
 import type {
   ManagedProjectSite,
@@ -9,12 +10,19 @@ import type {
 } from '@/types/site'
 
 export type SiteAction = 'parse' | 'start' | 'stop' | 'delete'
+export interface SiteActionError {
+  siteId: string
+  action: SiteAction
+  message: string
+}
 
 export const useSitesStore = defineStore('sites', () => {
   const sites = ref<ManagedProjectSite[]>([])
   const loading = ref(false)
   const error = ref('')
   const pendingActions = reactive(new Map<string, SiteAction>())
+  const actionErrors = reactive(new Map<string, SiteActionError>())
+  const latestActionError = ref<SiteActionError | null>(null)
 
   const stats = computed<SiteStats>(() => ({
     total: sites.value.length,
@@ -31,11 +39,29 @@ export const useSitesStore = defineStore('sites', () => {
     return pendingActions.has(siteId)
   }
 
+  function getSiteActionError(siteId: string): SiteActionError | undefined {
+    return actionErrors.get(siteId)
+  }
+
+  function clearSiteActionError(siteId: string) {
+    actionErrors.delete(siteId)
+    if (latestActionError.value?.siteId === siteId) {
+      latestActionError.value = null
+    }
+  }
+
   async function withAction(siteId: string, action: SiteAction, fn: () => Promise<void>) {
     if (pendingActions.has(siteId)) return
     pendingActions.set(siteId, action)
+    clearSiteActionError(siteId)
     try {
       await fn()
+    } catch (err: unknown) {
+      const message = extractErrorMessage(err)
+      const payload = { siteId, action, message }
+      actionErrors.set(siteId, payload)
+      latestActionError.value = payload
+      throw err
     } finally {
       pendingActions.delete(siteId)
     }
@@ -96,7 +122,8 @@ export const useSitesStore = defineStore('sites', () => {
 
   return {
     sites, stats, loading, error,
-    pendingActions, getSiteAction, isSiteActionPending,
+    pendingActions, actionErrors, latestActionError,
+    getSiteAction, isSiteActionPending, getSiteActionError, clearSiteActionError,
     fetchSites, createSite, updateSite, deleteSite,
     parseSite, startSite, stopSite,
   }

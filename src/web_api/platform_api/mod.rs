@@ -2,6 +2,7 @@
 //!
 //! Inbound only: embed URL, workflow sync, cache preload, review soft-delete.
 
+pub mod annotation_check;
 mod auth;
 mod cache_preload;
 pub mod config;
@@ -26,8 +27,16 @@ pub fn create_platform_api_routes() -> Router {
     Router::new()
         .route("/api/review/embed-url", post(embed_url::get_embed_url))
         .route(
+            "/api/review/annotations/check",
+            post(annotation_check::check_annotations_handler),
+        )
+        .route(
             "/api/review/workflow/sync",
             post(workflow_sync::sync_workflow_handler),
+        )
+        .route(
+            "/api/review/workflow/verify",
+            post(workflow_sync::verify_workflow_handler),
         )
         .route(
             "/api/review/delete",

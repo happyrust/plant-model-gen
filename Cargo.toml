@@ -159,6 +159,8 @@ rusqlite = { version = "0.33", features = ["bundled"], optional = true }
 indicatif = "0.18.1"
 rust_xlsxwriter = "0.91.0"
 
+libc = "0.2"
+
 [features]
 default = [
     "ws",

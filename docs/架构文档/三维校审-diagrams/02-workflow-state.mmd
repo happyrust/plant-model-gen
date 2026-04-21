@@ -1,0 +1,42 @@
+stateDiagram-v2
+  direction LR
+  [*] --> draft_sj : 设计人员创建 (status=draft, current_node=sj)
+
+  draft_sj --> submitted_jd : submit<br/>sj→jd (status=submitted)
+  submitted_jd --> draft_sj : return<br/>jd→sj (reason 必填)
+
+  submitted_jd --> in_review_sh : submit<br/>jd→sh (status=in_review)
+  in_review_sh --> draft_sj : return<br/>sh→sj
+  in_review_sh --> submitted_jd : return<br/>sh→jd
+
+  in_review_sh --> in_review_pz : submit<br/>sh→pz (status=in_review)
+  in_review_pz --> draft_sj : return<br/>pz→sj
+  in_review_pz --> submitted_jd : return<br/>pz→jd
+  in_review_pz --> in_review_sh : return<br/>pz→sh
+
+  in_review_pz --> approved : submit (批准完成)<br/>status=approved, action=approve
+
+  approved --> [*]
+
+  draft_sj --> cancelled : cancel
+  submitted_jd --> cancelled : cancel
+  in_review_sh --> cancelled : cancel
+  in_review_pz --> cancelled : cancel
+  cancelled --> [*]
+
+  note right of draft_sj
+    权限: requester_id
+    显示: 编制
+  end note
+  note right of submitted_jd
+    权限: checker_id / reviewer_id
+    显示: 校对
+  end note
+  note right of in_review_sh
+    权限: approver_id
+    显示: 审核
+  end note
+  note right of in_review_pz
+    权限: approver_id
+    显示: 批准
+  end note

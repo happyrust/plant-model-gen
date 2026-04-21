@@ -1,0 +1,36 @@
+sequenceDiagram
+  autonumber
+  actor R as 当前节点负责人<br/>(jd/sh/pz)
+  participant UI as ReviewPanel<br/>+ WorkflowSubmitDialog/WorkflowReturnDialog
+  participant API as reviewApi.ts
+  participant RA as review_api.rs
+  participant PA as platform_api
+  participant DB as SurrealDB
+
+  alt 提交到下一节点 (submit)
+    R->>UI: 点击「同意并提交」<br/>填写备注(可选)
+    UI->>API: reviewTaskSubmitToNext(id, comment)
+    API->>RA: POST /api/review/tasks/{id}/submit
+    RA->>DB: 读取 review_tasks<br/>WHERE record::id(id) = $id AND (!deleted)
+    RA->>RA: 权限校验:<br/>sj→requester_id<br/>jd→checker_id OR reviewer_id<br/>sh/pz→approver_id
+    RA->>RA: get_next_node(sj→jd→sh→pz)<br/>若为 pz 则 action=approve
+    RA->>DB: UPDATE current_node=next<br/>status=submitted/in_review/approved<br/>return_reason=NONE
+    RA->>PA: sync_review_form_with_task_status
+    RA->>DB: CREATE review_workflow_history<br/>(action=submit 或 approve)
+    RA-->>UI: ActionResponse
+  else 驳回到指定节点 (return)
+    R->>UI: 打开 WorkflowReturnDialog<br/>选择目标节点 + 驳回原因(必填)
+    UI->>API: reviewTaskReturn(id, targetNode, reason)
+    API->>RA: POST /api/review/tasks/{id}/return
+    RA->>DB: 读取 review_tasks
+    RA->>RA: 权限校验 + can_return_to(curr→target)<br/>仅允许向前序节点驳回
+    RA->>DB: UPDATE current_node=target<br/>status (draft/submitted/in_review)<br/>return_reason=reason
+    RA->>PA: sync_review_form_with_task_status
+    RA->>DB: CREATE review_workflow_history<br/>(action=return, comment=reason)
+    RA-->>UI: ActionResponse
+  end
+
+  UI->>API: reviewTaskGetWorkflow(id) 刷新时间线
+  API->>RA: GET /api/review/tasks/{id}/workflow
+  RA->>DB: SELECT review_workflow_history<br/>ORDER BY timestamp ASC
+  RA-->>UI: WorkflowHistoryResponse

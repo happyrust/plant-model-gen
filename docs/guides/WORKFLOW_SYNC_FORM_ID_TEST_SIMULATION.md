@@ -52,6 +52,7 @@
 | `POST /api/review/embed-url` | 获取或恢复 `form_id`，并签发 JWT |
 | `POST /api/review/tasks` | 创建校审任务，并把任务与 `form_id` 绑定 |
 | `POST /api/review/records` | 保存校审确认记录（批注 / 云线 / 测量 / 备注） |
+| `POST /api/review/workflow/verify` | 对 `active / agree / return / stop` 做正式预校验，不写库 |
 | `POST /api/review/workflow/sync` | 送审 / 查询时按 `form_id` 聚合返回 records 等数据 |
 | `POST /api/review/delete` | 清理测试单据 |
 
@@ -88,15 +89,20 @@
 2. 使用 form_id 创建 review task
 3. 模拟校对/校核人员在校审面板保存一批确认记录
    -> POST /api/review/records
-4. 送审时调用 workflow/sync
+4. 外部流程驱动先调用 workflow/verify
+   -> POST /api/review/workflow/verify
+   -> 只检查是否允许流转，不写 review_tasks / review_forms
+5. 仅当 verify 通过时，再调用 workflow/sync
+   -> POST /api/review/workflow/sync
+6. 用 workflow/sync?action=query 回读 form_id 聚合快照
    -> POST /api/review/workflow/sync { form_id, token, action=query }
-5. 断言返回 records 中包含：
+7. 断言返回 records 中包含：
    - annotations
    - cloud_annotations
    - measurements
    - note
-6. 用 Surreal CLI + JSON 直查 review_records，验证 form_id 真实落库
-7. 调用 /api/review/delete 清理测试数据
+8. 用 Surreal CLI + JSON 直查 review_records，验证 form_id 真实落库
+9. 调用 /api/review/delete 清理测试数据
 ```
 
 ---
@@ -112,6 +118,10 @@
 - 数据库可用
 - 不使用 Rust `test`
 - 通过真实 HTTP POST/GET 验证
+- PMS 入站接口统一按 `[platform_auth]` 校验
+  - `platform_auth.enabled = true`：请求里的 `token` 必须是可验签 JWT
+  - `platform_auth.enabled = false`：请求里的 `token` 必须与 `platform_auth.debug_token` 完全相等
+- `review_auth.enabled = false` 只影响浏览器侧 `/api/review/*`，不会让 `embed-url / workflow/sync / delete` 自动放开
 
 ### 5.2 生产环境
 
@@ -144,9 +154,15 @@ Content-Type: application/json
 {
   "project_id": "AvevaMarineSample",
   "user_id": "SJ",
-  "form_id": "FORM-EXAMPLE-1234567890AB"
+  "form_id": "FORM-EXAMPLE-1234567890AB",
+  "token": "<PMS 入站 S2S token>"
 }
 ```
+
+说明：
+
+- 这里的 `token` 走 `[platform_auth]`
+- 它不是浏览器侧 `Authorization: Bearer <JWT>`
 
 #### 预期
 
@@ -290,7 +306,7 @@ Content-Type: application/json
 
 {
   "form_id": "FORM-EXAMPLE-1234567890AB",
-  "token": "<token>",
+  "token": "<PMS 入站 S2S token>",
   "action": "query",
   "actor": {
     "id": "SJ",
@@ -314,6 +330,14 @@ Content-Type: application/json
 - `data.task_created`
 - `data.current_node`
 - `data.task_status`
+
+支持动作集合固定为：
+
+- `query`
+- `active`
+- `agree`
+- `return`
+- `stop`
 
 其中 `data.records[0]` 应该包含：
 
@@ -395,9 +419,25 @@ Content-Type: application/json
 ```json
 {
   "code": 200,
-  "message": "ok"
+  "message": "ok",
+  "results": [
+    {
+      "form_id": "FORM-EXAMPLE-1234567890AB",
+      "success": true,
+      "message": "已清理 review 主链"
+    }
+  ]
 }
 ```
+
+删除范围说明：
+
+- 会清 `review_form_model`
+- 会清 `review_records`
+- 会清 `review_attachment`
+- 会清 `review_workflow_history`
+- 会删除 `assets/review_attachments/*` 物理文件
+- **不会清 `review_comments`**
 
 ---
 
@@ -446,7 +486,14 @@ Content-Type: application/json
 ```json
 {
   "code": 200,
-  "message": "ok"
+  "message": "ok",
+  "results": [
+    {
+      "form_id": "FORM-LIVE-5BE7A4EF5F39",
+      "success": true,
+      "message": "已清理 review 主链"
+    }
+  ]
 }
 ```
 

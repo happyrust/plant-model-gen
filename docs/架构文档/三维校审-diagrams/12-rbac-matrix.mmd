@@ -1,0 +1,39 @@
+flowchart LR
+  subgraph Roles["角色 → 能做什么 (RBAC 矩阵)"]
+    direction TB
+    sj["编制 (sj)<br/>requester_id 匹配"]
+    jd["校对 (jd)<br/>checker_id 或 reviewer_id 匹配"]
+    sh["审核 (sh)<br/>approver_id 匹配"]
+    pz["批准 (pz)<br/>approver_id 匹配"]
+  end
+
+  subgraph Ops["关键操作 (后端强校验)"]
+    create["创建提资单<br/>POST /tasks"]
+    submitSj["submit sj→jd"]
+    submitJd["submit jd→sh"]
+    submitSh["submit sh→pz"]
+    submitPz["submit pz (批准完成)"]
+    retJd["return jd→sj"]
+    retSh["return sh→sj/jd"]
+    retPz["return pz→sj/jd/sh"]
+    annotAct["批注处理: fixed/wont_fix<br/>(设计)"]
+    annotDec["批注决定: agree/reject<br/>(校对/审核/批准)"]
+  end
+
+  sj --> create
+  sj --> submitSj
+  sj --> annotAct
+  jd --> submitJd
+  jd --> retJd
+  jd --> annotDec
+  sh --> submitSh
+  sh --> retSh
+  sh --> annotDec
+  pz --> submitPz
+  pz --> retPz
+  pz --> annotDec
+
+  classDef role fill:#ecfdf5,stroke:#065f46,color:#064e3b;
+  classDef op fill:#eff6ff,stroke:#1d4ed8,color:#1e3a8a;
+  class sj,jd,sh,pz role;
+  class create,submitSj,submitJd,submitSh,submitPz,retJd,retSh,retPz,annotAct,annotDec op;

@@ -9,7 +9,7 @@ use axum::{
     Router,
     extract::{Json, Multipart, Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,14 @@ use surrealdb::types::{self as surrealdb_types, SurrealValue};
 use tracing::{info, warn};
 
 use crate::web_api::jwt_auth::{TokenClaims, generate_form_id};
-use crate::web_api::platform_api::{mark_review_form_deleted, sync_review_form_with_task_status};
+use crate::web_api::platform_api::{
+    annotation_check::{
+        AnnotationCheckOptions, annotation_check_failed_response, build_annotation_check_context,
+        evaluate_annotation_check,
+    },
+    mark_review_form_deleted,
+    sync_review_form_with_task_status,
+};
 use aios_core::project_primary_db;
 use axum::extract::Extension;
 use std::collections::HashSet;
@@ -865,6 +872,10 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 struct TaskRecordContext {
     form_id: String,
     current_node: String,
+    requester_id: String,
+    checker_id: String,
+    reviewer_id: String,
+    approver_id: String,
 }
 
 async fn lookup_task_record_context(id: &str) -> Option<TaskRecordContext> {
@@ -872,11 +883,15 @@ async fn lookup_task_record_context(id: &str) -> Option<TaskRecordContext> {
     struct TaskContextRow {
         form_id: Option<String>,
         current_node: Option<String>,
+        requester_id: Option<String>,
+        checker_id: Option<String>,
+        reviewer_id: Option<String>,
+        approver_id: Option<String>,
     }
 
     let mut resp = project_primary_db()
         .query(
-            "SELECT form_id, current_node FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1",
+            "SELECT form_id, current_node, requester_id, checker_id, reviewer_id, approver_id FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1",
         )
         .bind(("id", id.to_string()))
         .await
@@ -889,7 +904,58 @@ async fn lookup_task_record_context(id: &str) -> Option<TaskRecordContext> {
     Some(TaskRecordContext {
         form_id,
         current_node,
+        requester_id: normalize_optional_string(row.requester_id).unwrap_or_default(),
+        checker_id: normalize_optional_string(row.checker_id).unwrap_or_default(),
+        reviewer_id: normalize_optional_string(row.reviewer_id).unwrap_or_default(),
+        approver_id: normalize_optional_string(row.approver_id).unwrap_or_default(),
     })
+}
+
+fn current_node_owner_for_task_row<'a>(task: &'a TaskRow, current_node: &str) -> (&'a str, &'static str) {
+    match current_node {
+        "sj" => (
+            task.requester_id.as_deref().map(str::trim).unwrap_or_default(),
+            "requester",
+        ),
+        "jd" => {
+            let checker_id = task.checker_id.as_deref().map(str::trim).unwrap_or_default();
+            if !checker_id.is_empty() {
+                (checker_id, "checker")
+            } else {
+                (
+                    task.reviewer_id
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or_default(),
+                    "reviewer",
+                )
+            }
+        }
+        "sh" | "pz" => (
+            task.approver_id.as_deref().map(str::trim).unwrap_or_default(),
+            "approver",
+        ),
+        _ => ("", "none"),
+    }
+}
+
+fn current_node_owner_for_task_context<'a>(
+    context: &'a TaskRecordContext,
+    current_node: &str,
+) -> (&'a str, &'static str) {
+    match current_node {
+        "sj" => (context.requester_id.trim(), "requester"),
+        "jd" => {
+            let checker_id = context.checker_id.trim();
+            if !checker_id.is_empty() {
+                (checker_id, "checker")
+            } else {
+                (context.reviewer_id.trim(), "reviewer")
+            }
+        }
+        "sh" | "pz" => (context.approver_id.trim(), "approver"),
+        _ => ("", "none"),
+    }
 }
 
 fn record_id_to_string(id: surrealdb::types::RecordId) -> String {
@@ -1049,6 +1115,12 @@ pub fn create_review_api_routes() -> Router {
         .route(
             "/api/review/comments/item/{comment_id}",
             delete(delete_comment),
+        )
+        // 批注严重度（问题严重程度，与评论并列但语义不同）
+        // 当前为桩实现：仅校验参数并回显，暂不落库；前端失败时走本地 fallback。
+        .route(
+            "/api/review/annotations/{annotation_id}/severity",
+            patch(update_annotation_severity),
         )
         // 附件 API
         .route("/api/review/attachments", post(upload_attachment))
@@ -1569,28 +1641,40 @@ async fn start_review(Path(id): Path<String>) -> impl IntoResponse {
 
 /// POST /api/review/tasks/:id/approve - 通过审核（兼容旧 API，映射到 approved + pz 节点）
 async fn approve_task(
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<String>,
     Json(request): Json<ReviewActionRequest>,
 ) -> impl IntoResponse {
-    update_task_status(
-        id,
-        "approved".to_string(),
-        Some("pz".to_string()),
-        request.comment,
+    submit_to_next_node(
+        Extension(claims),
+        Path(id),
+        Json(SubmitToNextRequest {
+            comment: request.comment,
+            operator_id: None,
+            operator_name: None,
+        }),
     )
     .await
 }
 
 /// POST /api/review/tasks/:id/reject - 驳回审核（兼容旧 API，驳回到 sj 节点）
 async fn reject_task(
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<String>,
     Json(request): Json<ReviewActionRequest>,
 ) -> impl IntoResponse {
-    update_task_status(
-        id,
-        "rejected".to_string(),
-        Some("sj".to_string()),
-        request.comment,
+    return_to_node(
+        Extension(claims),
+        Path(id),
+        Json(ReturnRequest {
+            target_node: "sj".to_string(),
+            reason: request
+                .comment
+                .or(request.reason)
+                .unwrap_or_else(|| "驳回".to_string()),
+            operator_id: None,
+            operator_name: None,
+        }),
     )
     .await
 }
@@ -1910,8 +1994,38 @@ async fn create_record(
         );
     }
 
+    let current_node = task_context.current_node.clone();
+    let (owner_id, owner_source) =
+        current_node_owner_for_task_context(&task_context, &current_node);
+    if owner_id.is_empty() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ConfirmedRecordResponse {
+                success: false,
+                record: None,
+                records: None,
+                error_message: Some(format!(
+                    "保存记录失败：当前「{}」节点未配置负责人",
+                    get_node_display_name(&current_node)
+                )),
+            }),
+        );
+    }
+    if owner_id != operator_id {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ConfirmedRecordResponse {
+                success: false,
+                record: None,
+                records: None,
+                error_message: Some(format!(
+                    "保存记录失败：当前用户 {} 不是 {} 节点负责人 {}",
+                    operator_id, owner_source, owner_id
+                )),
+            }),
+        );
+    }
     let form_id = task_context.form_id;
-    let current_node = task_context.current_node;
     let operator_name = preferred_name(Some(claims.user_name.as_str()), claims.user_id.as_str());
     let record_type = if request.r#type.trim().is_empty() {
         "batch".to_string()
@@ -2270,8 +2384,18 @@ pub struct CommentQuery {
 }
 
 /// POST /api/review/comments - 添加评论
-async fn create_comment(Json(request): Json<CreateCommentRequest>) -> impl IntoResponse {
+async fn create_comment(
+    Extension(claims): Extension<TokenClaims>,
+    Json(request): Json<CreateCommentRequest>,
+) -> impl IntoResponse {
     info!("Creating comment for annotation: {}", request.annotation_id);
+
+    let author_id = claims.user_id.clone();
+    let author_name = claims.user_name.clone();
+    let author_role = claims
+        .role
+        .clone()
+        .unwrap_or_else(|| request.author_role.clone());
 
     let comment_id = format!("comment-{}", uuid::Uuid::new_v4());
 
@@ -2294,9 +2418,9 @@ async fn create_comment(Json(request): Json<CreateCommentRequest>) -> impl IntoR
         .bind(("id", comment_id.clone()))
         .bind(("annotation_id", request.annotation_id.clone()))
         .bind(("annotation_type", request.annotation_type.clone()))
-        .bind(("author_id", request.author_id.clone()))
-        .bind(("author_name", request.author_name.clone()))
-        .bind(("author_role", request.author_role.clone()))
+        .bind(("author_id", author_id.clone()))
+        .bind(("author_name", author_name.clone()))
+        .bind(("author_role", author_role.clone()))
         .bind(("content", request.content.clone()))
         .bind(("reply_to_id", request.reply_to_id.clone()))
         .await
@@ -2306,9 +2430,9 @@ async fn create_comment(Json(request): Json<CreateCommentRequest>) -> impl IntoR
                 id: comment_id,
                 annotation_id: request.annotation_id,
                 annotation_type: request.annotation_type,
-                author_id: request.author_id,
-                author_name: request.author_name,
-                author_role: request.author_role,
+                author_id,
+                author_name,
+                author_role,
                 content: request.content,
                 reply_to_id: request.reply_to_id,
                 created_at: chrono::Utc::now().timestamp_millis(),
@@ -2414,6 +2538,65 @@ async fn get_comments_by_annotation(
     }
 }
 
+/// PATCH /api/review/comments/item/:comment_id - 编辑评论（仅作者本人）
+async fn edit_comment(
+    Extension(claims): Extension<TokenClaims>,
+    Path(comment_id): Path<String>,
+    Json(body): Json<EditCommentRequest>,
+) -> impl IntoResponse {
+    info!("Editing comment: {}", comment_id);
+
+    let sql = r#"
+        LET $comment = SELECT * FROM type::record('review_comments', $id);
+        IF $comment[0].author_id != $author_id {
+            THROW "仅评论作者本人可编辑";
+        };
+        UPDATE type::record('review_comments', $id) SET
+            content = $content,
+            updated_at = time::now()
+    "#;
+
+    match project_primary_db()
+        .query(sql)
+        .bind(("id", comment_id.clone()))
+        .bind(("author_id", claims.user_id.clone()))
+        .bind(("content", body.content.clone()))
+        .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ActionResponse {
+                success: true,
+                message: Some("评论已更新".to_string()),
+                error_message: None,
+            }),
+        ),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("仅评论作者本人可编辑") {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            warn!("Failed to edit comment {}: {}", comment_id, msg);
+            (
+                status,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(msg),
+                }),
+            )
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditCommentRequest {
+    pub content: String,
+}
+
 /// DELETE /api/review/comments/:comment_id - 删除评论
 async fn delete_comment(Path(comment_id): Path<String>) -> impl IntoResponse {
     info!("Deleting comment: {}", comment_id);
@@ -2441,6 +2624,133 @@ async fn delete_comment(Path(comment_id): Path<String>) -> impl IntoResponse {
                     success: false,
                     message: None,
                     error_message: Some(format!("删除评论失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+// ============================================================================
+// Handlers - 批注严重度（桩实现，仅回显）
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct AnnotationSeverityTypeQuery {
+    /// 批注类型：text | cloud | rect | obb
+    pub r#type: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnnotationSeverityBody {
+    /// `suggestion` | `normal` | `severe` | `critical` | null（null 清空）
+    #[serde(default)]
+    pub severity: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnnotationSeverityResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+fn is_valid_annotation_type(t: &str) -> bool {
+    matches!(t, "text" | "cloud" | "rect" | "obb")
+}
+
+fn is_valid_annotation_severity(s: &str) -> bool {
+    matches!(s, "suggestion" | "normal" | "severe" | "critical")
+}
+
+/// PATCH /api/review/annotations/{annotation_id}/severity?type=...
+///
+/// 持久化到 `review_annotation_severity` 表（UPSERT 语义）。
+/// (annotation_id, annotation_type) 作为复合键，severity 为 null 时清空。
+async fn update_annotation_severity(
+    Path(annotation_id): Path<String>,
+    Query(query): Query<AnnotationSeverityTypeQuery>,
+    Json(body): Json<AnnotationSeverityBody>,
+) -> impl IntoResponse {
+    info!(
+        "PATCH /api/review/annotations/{}/severity type={} severity={:?}",
+        annotation_id, query.r#type, body.severity
+    );
+
+    if !is_valid_annotation_type(&query.r#type) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AnnotationSeverityResponse {
+                success: false,
+                severity: None,
+                updated_at: None,
+                error_message: Some(format!(
+                    "非法的批注类型: {}（仅支持 text|cloud|rect|obb）",
+                    query.r#type
+                )),
+            }),
+        );
+    }
+
+    if let Some(ref s) = body.severity {
+        if !is_valid_annotation_severity(s) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AnnotationSeverityResponse {
+                    success: false,
+                    severity: None,
+                    updated_at: None,
+                    error_message: Some(format!(
+                        "非法的严重度: {}（仅支持 suggestion|normal|severe|critical，或 null 清空）",
+                        s
+                    )),
+                }),
+            );
+        }
+    }
+
+    let record_id = format!("{}:{}", annotation_id, query.r#type);
+    let sql = r#"
+        UPSERT review_annotation_severity:[$annotation_id, $annotation_type] CONTENT {
+            annotation_id: $annotation_id,
+            annotation_type: $annotation_type,
+            severity: $severity,
+            updated_at: time::now()
+        }
+    "#;
+
+    match project_primary_db()
+        .query(sql)
+        .bind(("annotation_id", annotation_id.clone()))
+        .bind(("annotation_type", query.r#type.clone()))
+        .bind(("severity", body.severity.clone()))
+        .await
+    {
+        Ok(_) => {
+            let updated_at = chrono::Utc::now().timestamp_millis();
+            info!("Severity persisted for {} ({})", record_id, body.severity.as_deref().unwrap_or("null"));
+            (
+                StatusCode::OK,
+                Json(AnnotationSeverityResponse {
+                    success: true,
+                    severity: body.severity,
+                    updated_at: Some(updated_at),
+                    error_message: None,
+                }),
+            )
+        }
+        Err(e) => {
+            warn!("Failed to persist severity for {}: {}", record_id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AnnotationSeverityResponse {
+                    success: false,
+                    severity: None,
+                    updated_at: None,
+                    error_message: Some(format!("保存严重度失败: {}", e)),
                 }),
             )
         }
@@ -2692,7 +3002,7 @@ async fn submit_to_next_node(
     Extension(claims): Extension<TokenClaims>,
     Path(id): Path<String>,
     Json(request): Json<SubmitToNextRequest>,
-) -> impl IntoResponse {
+) -> Response {
     info!(
         "Submitting task {} to next node, operator={}",
         id, claims.user_id
@@ -2718,7 +3028,8 @@ async fn submit_to_next_node(
                             message: None,
                             error_message: Some(format!("任务不存在或已删除: {}", id)),
                         }),
-                    );
+                    )
+                        .into_response();
                 }
             }
         }
@@ -2730,7 +3041,8 @@ async fn submit_to_next_node(
                     message: None,
                     error_message: Some(format!("查询任务失败: {}", e)),
                 }),
-            );
+            )
+                .into_response();
         }
     };
 
@@ -2741,18 +3053,8 @@ async fn submit_to_next_node(
 
     // 1.1 权限校验：检查当前用户是否为本节点负责人
     let operator_user = &claims.user_id;
-    let has_permission = match current_node.as_str() {
-        "sj" => task_row.requester_id.as_deref() == Some(operator_user),
-        "jd" => {
-            task_row.checker_id.as_deref() == Some(operator_user)
-                || task_row.reviewer_id.as_deref() == Some(operator_user)
-        }
-        "sh" => task_row.approver_id.as_deref() == Some(operator_user),
-        "pz" => task_row.approver_id.as_deref() == Some(operator_user),
-        _ => false,
-    };
-
-    if !has_permission {
+    let (owner_id, _) = current_node_owner_for_task_row(&task_row, &current_node);
+    if owner_id.is_empty() || owner_id != operator_user {
         return (
             StatusCode::FORBIDDEN,
             Json(ActionResponse {
@@ -2764,7 +3066,43 @@ async fn submit_to_next_node(
                     get_node_display_name(&current_node)
                 )),
             }),
-        );
+        )
+            .into_response();
+    }
+
+    let annotation_check = match evaluate_annotation_check(
+        &build_annotation_check_context(
+            id.clone(),
+            task_row.form_id.clone().unwrap_or_default(),
+            current_node.clone(),
+        ),
+        AnnotationCheckOptions {
+            current_node: Some(current_node.clone()),
+            intent: Some("submit_next".to_string()),
+            included_types: None,
+        },
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err((status, message)) => {
+            return (
+                status,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(message),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if !annotation_check.passed {
+        return (
+            StatusCode::CONFLICT,
+            Json(annotation_check_failed_response(annotation_check)),
+        )
+            .into_response();
     }
 
     // 2. 操作人信息
@@ -2805,7 +3143,8 @@ async fn submit_to_next_node(
                         message: None,
                         error_message: Some("当前已是最后节点，无法继续提交".to_string()),
                     }),
-                );
+                )
+                    .into_response();
             }
         }
     };
@@ -2834,7 +3173,8 @@ async fn submit_to_next_node(
                 message: None,
                 error_message: Some(format!("更新任务失败: {}", e)),
             }),
-        );
+        )
+            .into_response();
     }
 
     if let Some(form_id) = task_row
@@ -2893,6 +3233,7 @@ async fn submit_to_next_node(
                 error_message: None,
             }),
         )
+            .into_response()
     } else {
         let to_name = get_node_display_name(&next_node_str);
         (
@@ -2903,6 +3244,7 @@ async fn submit_to_next_node(
                 error_message: None,
             }),
         )
+            .into_response()
     }
 }
 
@@ -2960,16 +3302,8 @@ async fn return_to_node(
 
     // 1.1 权限校验
     let operator_user = &claims.user_id;
-    let has_permission = match current_node.as_str() {
-        "jd" => {
-            task_row.checker_id.as_deref() == Some(operator_user)
-                || task_row.reviewer_id.as_deref() == Some(operator_user)
-        }
-        "sh" | "pz" => task_row.approver_id.as_deref() == Some(operator_user),
-        _ => false,
-    };
-
-    if !has_permission {
+    let (owner_id, _) = current_node_owner_for_task_row(&task_row, &current_node);
+    if owner_id.is_empty() || owner_id != operator_user {
         return (
             StatusCode::FORBIDDEN,
             Json(ActionResponse {

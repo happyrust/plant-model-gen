@@ -2,7 +2,7 @@
 import { ref, watch, computed } from 'vue'
 import { useSitesStore } from '@/stores/sites'
 import { sitesApi } from '@/api/sites'
-import type { CreateManagedSiteRequest, ManagedProjectSite } from '@/types/site'
+import type { CreateManagedSiteRequest, ManagedProjectSite, UpdateManagedSiteRequest } from '@/types/site'
 import { X } from 'lucide-vue-next'
 
 const props = defineProps<{
@@ -27,11 +27,11 @@ const form = ref<CreateManagedSiteRequest>({
   manual_db_nums: [],
   db_port: 8020,
   web_port: 8080,
-  bind_host: '0.0.0.0',
+  bind_host: '127.0.0.1',
   public_base_url: '',
   associated_project: '',
-  db_user: 'root',
-  db_password: 'root',
+  db_user: '',
+  db_password: '',
 })
 
 const manualDbNumsStr = ref('')
@@ -39,12 +39,12 @@ const manualDbNumsStr = ref('')
 const isEditing = computed(() => !!props.siteId)
 const title = computed(() => isEditing.value ? '编辑站点' : '新建站点')
 
-watch(() => props.open, async (open) => {
+watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
   if (!open) return
   error.value = ''
-  if (props.siteId) {
+  if (siteId) {
     try {
-      existingSite.value = await sitesApi.get(props.siteId)
+      existingSite.value = await sitesApi.get(siteId)
       const s = existingSite.value
       form.value = {
         project_name: s.project_name,
@@ -53,9 +53,11 @@ watch(() => props.open, async (open) => {
         manual_db_nums: s.manual_db_nums,
         db_port: s.db_port,
         web_port: s.web_port,
-        bind_host: s.bind_host || '0.0.0.0',
+        bind_host: s.bind_host || '127.0.0.1',
         public_base_url: s.public_base_url || '',
         associated_project: s.associated_project || '',
+        db_user: '',
+        db_password: '',
       }
       manualDbNumsStr.value = s.manual_db_nums.join(', ')
     } catch (e) {
@@ -70,11 +72,11 @@ watch(() => props.open, async (open) => {
       manual_db_nums: [],
       db_port: 8020,
       web_port: 8080,
-      bind_host: '0.0.0.0',
+      bind_host: '127.0.0.1',
       public_base_url: '',
       associated_project: '',
-      db_user: 'root',
-      db_password: 'root',
+      db_user: '',
+      db_password: '',
     }
     manualDbNumsStr.value = ''
   }
@@ -93,9 +95,18 @@ async function handleSubmit() {
   parseDbNums()
   try {
     if (isEditing.value && props.siteId) {
-      await sitesStore.updateSite(props.siteId, form.value)
+      const payload: UpdateManagedSiteRequest = {
+        ...form.value,
+        db_user: form.value.db_user?.trim() ? form.value.db_user.trim() : undefined,
+        db_password: form.value.db_password?.trim() ? form.value.db_password.trim() : undefined,
+      }
+      await sitesStore.updateSite(props.siteId, payload)
     } else {
-      await sitesStore.createSite(form.value)
+      await sitesStore.createSite({
+        ...form.value,
+        db_user: form.value.db_user?.trim() || '',
+        db_password: form.value.db_password?.trim() || '',
+      })
     }
     emit('saved')
   } catch (e) {
@@ -170,7 +181,8 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
               </div>
               <div class="space-y-2">
                 <label class="text-sm font-medium">绑定地址</label>
-                <input v-model="form.bind_host" type="text" placeholder="0.0.0.0" :class="inputClass" />
+                <input v-model="form.bind_host" type="text" placeholder="127.0.0.1" :class="inputClass" />
+                <p class="text-xs text-muted-foreground">默认只监听本机，避免把管理数据库直接暴露到外网</p>
               </div>
               <div class="space-y-2">
                 <label class="text-sm font-medium">对外访问地址 <span class="text-muted-foreground">(可选)</span></label>
@@ -187,18 +199,31 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
               </div>
             </fieldset>
 
-            <fieldset v-if="!isEditing" class="space-y-3">
+            <fieldset class="space-y-3">
               <legend class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">数据库凭据</legend>
               <div class="grid grid-cols-2 gap-4">
                 <div class="space-y-2">
-                  <label class="text-sm font-medium">DB 用户名</label>
-                  <input v-model="form.db_user" type="text" placeholder="root" :class="inputClass" />
+                  <label class="text-sm font-medium">DB 用户名{{ isEditing ? '（可选）' : ' *' }}</label>
+                  <input
+                    v-model="form.db_user"
+                    type="text"
+                    :placeholder="isEditing ? '留空则保留当前用户名' : '请输入数据库用户名'"
+                    :class="inputClass"
+                  />
                 </div>
                 <div class="space-y-2">
-                  <label class="text-sm font-medium">DB 密码</label>
-                  <input v-model="form.db_password" type="password" placeholder="root" :class="inputClass" />
+                  <label class="text-sm font-medium">DB 密码{{ isEditing ? '（可选）' : ' *' }}</label>
+                  <input
+                    v-model="form.db_password"
+                    type="password"
+                    :placeholder="isEditing ? '留空则保留当前密码' : '请输入数据库密码'"
+                    :class="inputClass"
+                  />
                 </div>
               </div>
+              <p class="text-xs text-muted-foreground">
+                {{ isEditing ? '编辑时留空表示沿用当前凭据。' : '不再自动写入默认 root/root，请显式填写。' }}
+              </p>
             </fieldset>
 
             <div v-if="error" class="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
@@ -212,7 +237,12 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
               class="inline-flex h-9 items-center rounded-md border border-input bg-transparent px-4 text-sm font-medium shadow-sm hover:bg-accent transition-colors">
               取消
             </button>
-            <button @click="handleSubmit" :disabled="saving || !form.project_name || !form.project_path"
+            <button
+              @click="handleSubmit"
+              :disabled="saving
+                || !form.project_name
+                || !form.project_path
+                || (!isEditing && (!form.db_user?.trim() || !form.db_password?.trim()))"
               class="inline-flex h-9 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow hover:bg-primary/90 transition-colors disabled:pointer-events-none disabled:opacity-50">
               {{ saving ? '保存中...' : '保存' }}
             </button>

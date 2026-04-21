@@ -1,0 +1,35 @@
+sequenceDiagram
+  autonumber
+  actor SJ as 设计人员 (sj)
+  participant UI as InitiateReviewPanel<br/>+ useReviewStore
+  participant API as reviewApi.ts
+  participant MW as jwt_auth::review_auth_middleware
+  participant RA as review_api.rs
+  participant PA as platform_api::review_form
+  participant DB as SurrealDB
+
+  Note over SJ,UI: 在三维场景中圈选构件、标注、上传附件
+  SJ->>UI: 填写提资单<br/>(title/modelName/checker/approver/components/due)
+  UI->>API: reviewTaskCreate(request)
+  API->>MW: POST /api/review/tasks<br/>Authorization: Bearer <JWT>
+  MW->>MW: verify_token + claims 注入
+  MW->>RA: Extension(TokenClaims) + JSON
+  RA->>RA: resolve_create_task_names<br/>generate_form_id (若缺省)
+  RA->>DB: CREATE ONLY review_tasks<br/>status=draft, current_node=sj
+  DB-->>RA: ok
+  RA->>DB: CREATE review_form_model for 每个 refno
+  RA->>PA: sync_review_form_with_task_status<br/>(create_task_backfill, status=draft)
+  PA->>DB: UPSERT review_forms
+  RA-->>API: TaskResponse { success, task }
+
+  UI->>API: reviewTaskSubmitToNext(task.id, "发起提资")
+  API->>MW: POST /api/review/tasks/{id}/submit
+  MW->>RA: claims + id
+  RA->>DB: SELECT review_tasks WHERE id
+  RA->>RA: 权限校验: current_node=sj 需 requester_id == user_id
+  RA->>DB: UPDATE current_node=jd, status=submitted, return_reason=NONE
+  RA->>PA: sync_review_form_with_task_status(status=submitted)
+  RA->>DB: CREATE review_workflow_history<br/>(node=sj, action=submit)
+  RA-->>API: ActionResponse<br/>"已从「编制」提交到「校对」"
+  API-->>UI: 刷新 currentTask
+  UI-->>SJ: Toast + 工作流步骤条推进

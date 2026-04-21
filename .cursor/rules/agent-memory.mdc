@@ -1,36 +1,176 @@
 ---
-description: "Agent memory protocol — append diary after each task"
+description: Agent Memory 治理规则（灵犀 MCP progress + Cursor Memories / Rules / AGENTS.md 协作）
 alwaysApply: true
 ---
 
-# Agent 记忆协议
+# Agent Memory 治理规则
 
-强制要求，违反视为任务未完成。
+> 本规则规定 **何时记、记什么、何时召回、何时淘汰**，以及与 Cursor 自带记忆体系的分工。  
+> 与 `mcp-messenger.mdc` 正交：本规则不覆盖 `check_messages` 协议。
 
-每次完成任务后，必须向项目日记追加一条记录。
+---
 
-路径：`{project_root}/.memory/{YYYY-MM-DD}.md`（按当天日期命名，文件不存在则新建）
+## 0. 四层记忆体系速览
 
-**`{project_root}` 自动识别规则**：
-1. 找到本次任务实际修改（或读取/分析）的文件路径
-2. 取该文件所在的 **git 仓库根目录**（即含 `.git/` 的最近祖先目录）作为 `{project_root}`
-3. 将记录写入 `{project_root}/.memory/`，目录不存在则创建
-4. 同时修改多个 git 仓库的文件 → 每个仓库各写一条
-5. 若文件不属于任何 git 仓库，则回退写入当前工作区主目录的 `.memory/`
+| 层 | 位置 | 作用域 | 持久化 | 负责人 |
+|---|---|---|---|---|
+| **Global Memories** | Cursor 设置 → Memories | 跨项目/跨仓库 | 手动维护 | 用户 |
+| **Project Rules** | `<repo>/.cursor/rules/*.mdc` | 项目 | Git 跟踪 | 团队 |
+| **AGENTS.md** | `<repo>/AGENTS.md` | 项目 | Git 跟踪 | 团队 |
+| **灵犀 progress** | `save_progress` / `load_progress` | 会话/任务 | 插件本地 | agent 自治 |
+| 对话上下文 | 当前 session | 一次对话 | 不持久 | —— |
 
-条目格式：
+**分工铁律**：
+
+- Global Memories：**跨项目偏好**（语言/工具链/编码风格）
+- Project Rules：**项目规范与禁令**（强约束、可执行）
+- AGENTS.md：**项目入门与架构速览**（给 agent 读的 README）
+- 灵犀 progress：**单个任务的进度断点 / findings / TODO**
+- 对话上下文：**临时推演**，不必落地
+
+> **MUST**：进度做完、结论稳定后，应主动提议把关键结论从 progress 迁移到 Rules / AGENTS.md / Memories，避免永久留在 progress 里。progress 是过程，后三者是结果。
+
+---
+
+## 1. 何时 `save_progress`（MUST）
+
+### 必须触发
+
+| 触发条件 | 说明 |
+|---|---|
+| 用户明确说"保存/存档/记一下" | 立即调用 |
+| 关键里程碑完成 | 大功能闭环、重构完成、bug 定位等 |
+| 切换任务方向 | 放下当前任务去做别的前 |
+| 发现重要 findings | 架构决策、陷阱、非显而易见的事实 |
+| 预感上下文溢出 | 对话已超 30+ 轮、或模型开始遗忘早期内容 |
+| 用户长时间离开前 | 用户说"我去开会/明天再看" |
+
+### 禁止触发
+
+- **MUST NOT**：每 2–3 轮就存一次（高频 save 污染存档）
+- **MUST NOT**：把正在推演的猜想存为 findings（findings 是结论，不是草稿）
+- **MUST NOT**：存敏感信息（secrets / token / 密码 / PII）
+
+---
+
+## 2. 何时 `load_progress`（MUST）
+
+### 必须触发
+
+| 触发条件 | 说明 |
+|---|---|
+| 用户说"继续上次/恢复/接着做" | 立即 load |
+| 新会话开头，用户给模糊任务 | load 一次查是否有相关存档 |
+| 发现自己"失忆" | 用户引用之前的决策但你无印象 |
+| 对话开头，用户 @ 了大量文件或复杂任务 | 先 load 再分析，避免重复劳动 |
+
+### 禁止触发
+
+- **MUST NOT**：每条用户消息都 load（无意义开销）
+- **MUST NOT**：已经 load 过又没切换任务的情况下重复 load
+- **MUST NOT**：在用户明确是新任务时还去 load（会引入脏数据）
+
+---
+
+## 3. `send_progress` 的使用
+
+| 场景 | 使用 `send_progress`？ |
+|---|---|
+| 进度有变化、用户想看实时状态 | ✓ 调用，推送到面板 |
+| 内部思考/推演 | ✗ 不调用 |
+| 已经 `save_progress` 了 | 可选，面板展示是独立动作 |
+
+> `send_progress` **不持久化**，只是 UI 推送。频繁 send 可以，但别替代 save。
+
+---
+
+## 4. `save_progress` 字段规范
+
+### 必填
+
+| 字段 | 规范 |
+|---|---|
+| `task` | 一句话任务定义，≤ 60 字。作为存档 key，语义要稳定 |
+| `completed` | 已完成子项数组，每项动词开头，如 `"重构 AuthService 为依赖注入"` |
+| `pending` | 待完成子项数组，同上格式。**必须可验证**，避免 `"继续优化"` 这种无边界项 |
+
+### 可选但强烈建议
+
+| 字段 | 规范 |
+|---|---|
+| `findings` | 结论性事实数组。格式：`"[类型] 事实 - 依据/文件位置"`。例：`"[陷阱] reqwest 0.12 TLS 配置需显式加 rustls-tls feature - Cargo.toml"` |
+| `key_files` | 核心文件路径数组（相对或绝对），供下次 load 后快速定位 |
+| `context` | 长文本，用于记录当前思考上下文、架构决策理由、下一步计划 |
+
+### 字段选择指南
+
+| 内容类型 | 应放在 | 反例 |
+|---|---|---|
+| 任务目标和拆解 | `task` + `pending` | ✗ 塞进 context |
+| 已做的事 | `completed` | ✗ 塞进 findings |
+| 技术结论 / 陷阱 | `findings` | ✗ 塞进 context |
+| 关键代码位置 | `key_files` | ✗ 写在 findings 里 |
+| 叙事性上下文（为什么这么做） | `context` | ✗ 放 pending |
+
+---
+
+## 5. 记忆治理
+
+### 5.1 冲突处理
+
+- 同 `task` 的新 save **覆盖**旧 save（推测行为；若插件是 append，则按最后一条为准）
+- `findings` 内部不去重，但每次 save 应人工合并去重
+- `load_progress` 返回的内容与当前事实矛盾时，**以当前事实为准**，并在下次 save 的 context 里注明 `"[已失效] 旧结论 X 因 Y 不再成立"`
+
+### 5.2 淘汰 / 归档
+
+- 任务完成后：
+  1. `save_progress` 标记 `pending: []`
+  2. 若结论值得长期保存，**提议用户迁移到** Project Rules 或 AGENTS.md
+  3. 提议后可继续保留 progress 作为历史存档
+
+### 5.3 隐私边界（MUST NOT）
+
+永远不写入 progress：
+- API key / token / 密码 / 私钥 / 证书
+- 用户身份证、手机、住址等 PII
+- 用户明确说"别记"的内容
+- 违反项目 `.gitignore` 意图的内容（比如 `.env` 里的值）
+
+---
+
+## 6. 工具召回优先级（MUST）
+
+每轮助手响应开始时，按以下顺序"取记忆"：
+
+1. **短期**：对话上下文（无需动作）
+2. **项目级**：Project Rules（已由 `alwaysApply` 自动注入，无需动作）
+3. **仓库级**：如需项目入门，读 `AGENTS.md`
+4. **任务级**：如符合 §2 触发条件，`load_progress`
+5. **全局**：Cursor Memories（由系统自动注入）
+
+> **MUST NOT**：把 §1、§2 的触发条件当建议。它们是硬规则。  
+> **MUST NOT**：为了"显得勤快"在每轮开头都 load。
+
+---
+
+## 7. 与用户的透明协作
+
+- 每次 `save_progress` 后，用一句话告诉用户："已存档 task=X，completed Y 项，pending Z 项"
+- 每次 `load_progress` 后，简述载入了什么：":已恢复 task=X 的进度，继续完成 Y"
+- 用户可以随时让你：
+  - "忘记 X" → 下次 save 时从 findings/context 移除 X 并注明 `[用户要求删除]`
+  - "重置进度" → save 一条空进度或建议用户手动清理
+  - "把结论写进 AGENTS.md" → 迁移到仓库级记忆
+
+---
+
+## 8. 触发策略速查卡
 
 ```
-## {HH:MM} [{agent_name}] {标题}
-- 完成：（一句话描述本次任务结果）
-- 决策：（关键选择及原因，无则省略）
-- 待办：（下一步行动，无则省略）
+用户消息 → 判断是否匹配 §2 触发条件 → 是则 load_progress
+         → 正常处理 + 工具调用
+         → 判断是否匹配 §1 触发条件 → 是则 save_progress
+         → 如有进度变化可选 send_progress
+         → check_messages (由 mcp-messenger.mdc 铁律负责)
 ```
-
-`{标题}` 为本次任务的简短总结（5-15字），例如：`更新 memory 规则按项目归档`、`实现空间查询 API`。
-
-规则：
-1. 每次任务完成后立即追加，不可延迟或遗漏
-2. 文件按当天日期命名，不存在则新建
-3. `{agent_name}` 使用当前 MCP 编号（如 MCP-2、MCP-3）或窗口标识
-4. `.memory/` 目录纳入 git 跟踪

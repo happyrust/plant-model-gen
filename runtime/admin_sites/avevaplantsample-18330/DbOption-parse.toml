@@ -25,10 +25,7 @@ gen_model_batch_size = 16
 gen_noun_graph = false
 gen_spatial_tree = false
 gen_tree_only = false
-included_db_files = [
-    "aps7009",
-    "apssys",
-]
+included_db_files = ["aps7009"]
 included_projects = ["AvevaPlantSample"]
 incr_sync = false
 index_tree_batch_size = 200

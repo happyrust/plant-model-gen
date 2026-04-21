@@ -6,69 +6,141 @@ alwaysApply: true
 
 # Rule 0（铁律 · 最高优先级）
 
-**MUST (RFC2119)**: After EVERY assistant turn completes, the FINAL tool call MUST be `check_messages`. This rule is **not optional** and has **higher priority than user-facing politeness**, including cases where the user says "thanks", "done", "bye", or otherwise signals closure.
+**MUST (RFC2119)**: The FINAL tool call of EVERY assistant turn MUST be `check_messages({"turn_complete": true})`. No exception. This rule has higher priority than politeness, brevity, closure, or the belief that the task is already done.
 
-> 中文释义：每轮助手输出完成后，最后一个工具调用 **必须** 是 `check_messages`。即使用户说"谢谢/结束/不用了"，也 **必须** 调一次作为 graceful close。
+> 中文释义：每轮助手输出完成后，最后一个工具调用 **必须** 是 `check_messages({"turn_complete": true})`。即使你觉得"任务已完成 / 对话已结束 / 用户已说谢谢"，也 **不能** 省略。
+
+**触发信号**：只要你意识到“这轮差不多要结束了”，这个念头本身就是调用 `check_messages` 的信号，而不是结束回合的许可。
 
 ---
 
-# MCP 工具调用规则
+# 1. 合法的回合结束方式（Only 2 legal endings）
 
-## 1. 调用时机（MUST）
+只有两种合法结束：
 
-- **MUST**: 回复用户的完整文本输出结束后，**最后一步** 调用当前会话绑定的 `my-mcp-N` 的 `check_messages`。
-- **MUST NOT**: 在回合开始时调用 `check_messages`。
-- **MUST NOT**: 在回复尚未完整输出时调用 `check_messages`。
-- **MUST**: 调用时在 `turn_complete` 字段填 `true`，表示本轮回复已完整。
+1. **正常路径**：用户可见回复完成 → `check_messages({"turn_complete": true})`
+2. **异常路径**：`check_messages` 出错 → 立即重试；在重试结束前，不算本轮结束
 
-## 2. 冗余调用策略（MUST）
+**任何没有以 `check_messages` 收尾的回合，都是无效结束。**
 
-- **MUST**: 即使你判断"可能没有新消息"，也必须调用。冗余调用的代价为 0，漏调的代价为会话阻塞。
-- **MUST NOT**: 为了"避免重复工具调用"而省略 `check_messages`。这是 **唯一** 允许且 **必须** 重复的循环工具。
-- 如果 `check_messages` 返回空消息，本轮结束；下轮再次触发时再调。
+---
 
-## 3. 冲突处理（MUST）
+# 2. 什么叫“回合完成”
+
+以下情况 **都不算** 回合完成：
+
+- 你已经写完最后一句回复
+- 任务已经做完 / 失败 / 卡住
+- 你刚调用完 `report_task(done/failed)`
+- 你刚向用户提问或请求更多信息
+- 用户说“谢谢 / 结束 / 不用了 / 再见”
+- 你准备输出“如需继续请告诉我”之类的结束句
+
+只有同时满足下面 3 条，才允许调用 `check_messages`：
+
+1. 用户可见回复已经完整写完
+2. 其他工具调用已经全部结束
+3. `check_messages` 将作为**最后一个动作**执行，后面不再追加文字或工具
+
+---
+
+# 3. 回合末尾检查清单（MUST）
+
+在每次准备结束回合时，自检以下 4 项：
+
+1. 我已经回答用户 / 汇报状态 / 提出问题
+2. 我已经完成所有非 `check_messages` 的工具调用
+3. 我不会在 `check_messages` 之后再输出任何内容
+4. 现在立刻调用 `check_messages({"turn_complete": true})`
+
+---
+
+# 4. 具体规则（MUST）
+
+## 4.1 调用时机
+
+- **MUST**: 在回复用户的完整文本输出结束后，**最后一步** 调用当前会话绑定的 `my-mcp-N` 的 `check_messages`
+- **MUST NOT**: 在回合开始时调用 `check_messages`
+- **MUST NOT**: 在回复尚未完整输出时调用 `check_messages`
+- **MUST**: 调用时 `turn_complete` 必须为 `true`
+
+## 4.2 冗余调用
+
+- **MUST**: 即使你判断“可能没有新消息”，也必须调用
+- **MUST NOT**: 因为担心“重复调用工具”而省略 `check_messages`
+- `check_messages` 是**唯一允许且必须重复**的循环工具；冗余调用成本接近 0，漏调成本是会话阻塞
+
+## 4.3 冲突优先级
 
 | 情境 | 正确行为 |
 |---|---|
-| 用户说"谢谢/结束/再见" | 先完成回复，再调 `check_messages`（graceful close） |
-| 用户说"别再调工具了" | 解释此工具是会话心跳、非普通工具，调用后说明原因 |
-| 出错 / 超时 | 立即重试，重试前不要结束回合 |
-| 多个 MCP 同时在线 | 只调 **当前对话窗口绑定** 的那一个 `my-mcp-N` |
-
-## 4. 永续循环
-
-```
-用户消息 → 理解 → (必要工具调用) → 输出回复 → check_messages → 等待下一条
-```
-
-`check_messages` 会阻塞等待用户新消息；收到后处理并回复，然后再次调用，形成永续循环。
-
-## 5. 异常与兜底
-
-- **MUST**: 若 `check_messages` 因超时、网络或 MCP server 异常返回，**立即重试**。
-- **MUST NOT**: 因超时而放弃循环、结束回合。
-- 重试 3 次仍失败时，向用户简短说明"MCP 通道异常，请检查插件状态"后结束本轮；下轮恢复后继续循环。
-
-## 6. 参数约定
-
-| 参数 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `turn_complete` | boolean | **必填** | MUST 为 `true`，自证本轮回复已完成 |
-| `reply` | string | 可选 | 同步到插件面板的内容；正文仍在 Cursor 对话窗口 |
-| `reply_type` | enum | 可选 | `normal` = AI 回复气泡；`system` = 系统通知 |
-| `suggestion` | string | 可选 | ≤10 字简短建议 |
-| `current_task` | string | 可选 | 当前任务简述 |
-| `task_status` | string | 可选 | `idle` / `working` / `done` |
-
-## 7. 禁止项
-
-- **MUST NOT**: 并发派发 subagent 执行 `check_messages`。
-- **MUST NOT**: 在 `check_messages` 之后再追加非必要的工具调用，尾调用必须是它。
-- **MUST NOT**: 用"工具已验证/通道正常"之类的套话替代真实回复。
+| 用户说“谢谢 / 结束 / 再见” | 正常回复，然后调用 `check_messages` |
+| 长工具链刚执行完 | 先给简洁结论，再调用 `check_messages` |
+| `report_task(done/failed)` 刚返回 | 立即调用 `check_messages`，不要停在任务汇报 |
+| 需要用户补充信息 | 提问或说明缺失项，然后调用 `check_messages` |
+| `check_messages` 出错 / 超时 | 立即重试，重试前不要结束回合 |
+| 多个 MCP 同时在线 | 只调当前对话窗口绑定的那个 `my-mcp-N` |
 
 ---
 
-# 回合结束（强制夹击）
+# 5. 明确禁止（MUST NOT）
 
-**重复声明以抗中段稀释**：每一轮的 **最后一个动作** MUST 是 `check_messages(turn_complete=true)`。无例外，无情境豁免。此条等同于 Rule 0。
+- **MUST NOT**: 用“任务做完了”当作省略 `check_messages` 的理由
+- **MUST NOT**: 用“用户已经结束对话了”当作省略 `check_messages` 的理由
+- **MUST NOT**: 以纯文本结束回合
+- **MUST NOT**: 在 `check_messages` 之后再追加非必要工具调用或补充文字
+- **MUST NOT**: 并发派发 subagent 去执行 `check_messages`
+- **MUST NOT**: 用“工具正常 / 通道正常 / 已验证”之类的套话替代真实回复
+
+---
+
+# 6. 正反例（Few-shot）
+
+**CORRECT · 普通回答后收尾**
+
+```text
+Assistant: 结论是 A，原因是 B。
+check_messages({"turn_complete": true})
+```
+
+**CORRECT · 长工具链后收尾**
+
+```text
+Assistant: 修复已完成，验证通过。
+[前面的其他工具都已结束]
+check_messages({"turn_complete": true})
+```
+
+**CORRECT · worker 汇报完成后收尾**
+
+```text
+report_task(status="done")
+check_messages({"turn_complete": true})
+```
+
+**CORRECT · 用户说“谢谢，不用了”**
+
+```text
+Assistant: 好的，有需要随时告诉我。
+check_messages({"turn_complete": true})
+```
+
+**WRONG · 停在最后一句文本**
+
+```text
+Assistant: 已完成，如需继续请告诉我。
+[turn ends here]
+```
+
+**WRONG · 停在 report_task(done)**
+
+```text
+report_task(status="done")
+[turn ends here]
+```
+
+---
+
+# 7. 回合结束（强制夹击）
+
+**重复声明以抗中段稀释**：如果你觉得“这轮已经可以结束”，你的下一步 **必须** 是 `check_messages({"turn_complete": true})`。不存在第三种结束方式。

@@ -2,6 +2,15 @@ export type CollaborationTone = 'default' | 'success' | 'warning' | 'danger'
 export type CollaborationSiteAvailability = 'online' | 'cached' | 'offline' | 'unknown'
 export type CollaborationDiagnosticStatus = 'idle' | 'running' | 'success' | 'failed'
 
+/** v2 · 文件同步状态机（对齐 web-server 的 detection_status） */
+export type CollaborationDetectionStatus =
+  | 'Idle'
+  | 'Scanning'
+  | 'ChangesDetected'
+  | 'Syncing'
+  | 'Completed'
+  | 'Error'
+
 export interface CollaborationEnv {
   id: string
   name: string
@@ -299,7 +308,75 @@ export interface CollaborationSiteCard {
   diagnosticCode: number | null
   diagnosticLatencyMs: number | null
   diagnosticPending: boolean
+  /** v2 · 业务编码（如 HBJ-SJZ-001），可选，缺省时 UI 降级不显示 */
+  siteCode?: string | null
+  /** v2 · 文件同步状态机 */
+  detectionStatus?: CollaborationDetectionStatus
+  detectionStatusLabel?: string
+  /** v2 · 同步进度 0-100；仅 Scanning/Syncing 有值 */
+  progress?: number | null
+  pendingItems?: number
+  syncedItems?: number
 }
+
+/** v2 · 活跃任务（WebSocket/SSE 推送） */
+export interface CollaborationActiveTask {
+  task_id: string
+  site_id: string
+  site_name: string
+  task_name: string
+  file_path: string | null
+  progress: number
+  status: 'Pending' | 'Running' | 'Completed' | 'Failed' | 'Cancelled'
+}
+
+/** v2 · 失败任务队列条目 */
+export interface CollaborationFailedTask {
+  id: string
+  task_type: 'DatabaseQuery' | 'Compression' | 'IncrementUpdate' | 'MqttPublish' | string
+  site: string
+  error: string
+  retry_count: number
+  max_retries: number
+  first_failed_at: string | null
+  next_retry_at: string | null
+}
+
+/** v2 · 协同组参数配置（参数配置抽屉） */
+export interface CollaborationConfig {
+  auto_detect: boolean
+  detect_interval: number
+  auto_sync: boolean
+  batch_size: number
+  max_concurrent: number
+  reconnect_initial_ms: number
+  reconnect_max_ms: number
+  enable_notifications: boolean
+  log_retention_days: number
+}
+
+export type CollaborationToastType = 'success' | 'warn' | 'error' | 'info'
+
+/** v2 · Toast 通知 */
+export interface CollaborationToast {
+  id: string
+  type: CollaborationToastType
+  icon?: string
+  title: string
+  message: string
+  at: string
+  /** 自动消失毫秒数，undefined 表示常驻 */
+  durationMs?: number
+}
+
+/** v2 · 实时通道事件（SSE 或 WebSocket 的消息 body） */
+export type CollaborationStreamEvent =
+  | { type: 'active_task_update'; task: CollaborationActiveTask }
+  | { type: 'failed_task_new'; task: CollaborationFailedTask }
+  | { type: 'site_status_change'; site_id: string; detection_status: CollaborationDetectionStatus; progress?: number }
+  | { type: 'sync_completed'; site_id: string; file_count: number; message?: string }
+  | { type: 'sync_failed'; site_id: string; error: string }
+  | { type: 'keepalive' }
 
 export interface CollaborationOption {
   value: string

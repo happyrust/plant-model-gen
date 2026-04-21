@@ -2,6 +2,8 @@ import { computed, ref } from "vue"
 import { defineStore } from "pinia"
 import { collaborationApi } from "@/api/collaboration"
 import type {
+  CollaborationActiveTask,
+  CollaborationConfig,
   CollaborationControlMessage,
   CollaborationDailyStat,
   CollaborationDiagnosticCheck,
@@ -10,6 +12,7 @@ import type {
   CollaborationEnv,
   CollaborationEnvDiagnostics,
   CollaborationEffectiveStateSummary,
+  CollaborationFailedTask,
   CollaborationFlowStat,
   CollaborationGroupListItem,
   CollaborationInsightsSummary,
@@ -24,6 +27,7 @@ import type {
   CollaborationSiteDiagnostics,
   CollaborationSiteMetadataResponse,
   CollaborationSiteMetadataState,
+  CollaborationToast,
   CollaborationTone,
   CreateCollaborationEnvRequest,
   CreateCollaborationSiteRequest,
@@ -37,6 +41,19 @@ const DEFAULT_LOG_FILTERS: CollaborationLogFilters = {
   direction: "",
   target_site: "",
   keyword: "",
+}
+
+/** v2 · 参数配置默认值（与 v0.4 原型 MOCK_CONFIG 一致） */
+const DEFAULT_COLLAB_CONFIG: CollaborationConfig = {
+  auto_detect: true,
+  detect_interval: 30,
+  auto_sync: false,
+  batch_size: 10,
+  max_concurrent: 3,
+  reconnect_initial_ms: 1000,
+  reconnect_max_ms: 30000,
+  enable_notifications: true,
+  log_retention_days: 30,
 }
 
 const LOG_STATUS_OPTIONS: CollaborationOption[] = [
@@ -297,6 +314,146 @@ export const useCollaborationStore = defineStore("collaboration", () => {
   })
 
   const logFilters = ref<CollaborationLogFilters>({ ...DEFAULT_LOG_FILTERS })
+
+  // ────────────────────────────────────────────────────────────────
+  // v2 · 为 collaboration-v2 原型迁入铺路。下列 state 默认为空/未连接，
+  //   由 Phase 5-9 的新组件和 Phase 9 的实时通道填充。
+  //   保持对现有视图零影响——没有组件读取就没有副作用。
+  // ────────────────────────────────────────────────────────────────
+  const activeTasks = ref<CollaborationActiveTask[]>([])
+  const failedTasks = ref<CollaborationFailedTask[]>([])
+  const realtimeConnected = ref(false)
+  const collabConfig = ref<CollaborationConfig>({ ...DEFAULT_COLLAB_CONFIG })
+  const collabConfigLoading = ref(false)
+  const collabConfigSaving = ref(false)
+  const toasts = ref<CollaborationToast[]>([])
+
+  function pushToast(t: Omit<CollaborationToast, "id" | "at"> & { id?: string; at?: string }) {
+    const next: CollaborationToast = {
+      id: t.id ?? `tst_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+      at: t.at ?? "刚刚",
+      type: t.type,
+      icon: t.icon,
+      title: t.title,
+      message: t.message,
+      durationMs: t.durationMs,
+    }
+    toasts.value = [next, ...toasts.value].slice(0, 6)
+    if (next.durationMs && next.durationMs > 0) {
+      window.setTimeout(() => dismissToast(next.id), next.durationMs)
+    }
+    return next.id
+  }
+
+  function dismissToast(id: string) {
+    toasts.value = toasts.value.filter((t) => t.id !== id)
+  }
+
+  /** ROADMAP M2 · 真实 API 已就绪 (remote_sync_handlers.rs) */
+  async function fetchActiveTasks(envId?: string): Promise<void> {
+    try {
+      activeTasks.value = await collaborationApi.listActiveTasks(envId ?? selectedEnvId.value ?? undefined)
+    } catch (err) {
+      console.error("fetchActiveTasks failed", err)
+    }
+  }
+  async function fetchFailedTasks(params: { envId?: string; status?: "pending" | "exhausted" } = {}): Promise<void> {
+    try {
+      failedTasks.value = await collaborationApi.listFailedTasks({
+        envId: params.envId ?? selectedEnvId.value ?? undefined,
+        status: params.status,
+      })
+    } catch (err) {
+      console.error("fetchFailedTasks failed", err)
+    }
+  }
+  async function retryFailedTask(id: string): Promise<void> {
+    try {
+      await collaborationApi.retryFailedTask(id)
+      await fetchFailedTasks()
+    } catch (err) {
+      console.error("retryFailedTask failed", err)
+      pushToast({
+        type: "error",
+        icon: "!",
+        title: "重试失败",
+        message: err instanceof Error ? err.message : String(err),
+        durationMs: 6000,
+      })
+    }
+  }
+  async function cleanupExhaustedFailedTasks(): Promise<void> {
+    try {
+      const result = await collaborationApi.cleanupFailedTasks({
+        envId: selectedEnvId.value ?? undefined,
+        exhausted: true,
+      })
+      await fetchFailedTasks()
+      pushToast({
+        type: "success",
+        icon: "✓",
+        title: "已清理已耗尽任务",
+        message: `清理 ${(result as { cleaned?: number } | undefined)?.cleaned ?? 0} 条`,
+        durationMs: 4000,
+      })
+    } catch (err) {
+      console.error("cleanupExhaustedFailedTasks failed", err)
+    }
+  }
+  async function fetchCollabConfig(): Promise<void> {
+    const envId = selectedEnvId.value
+    if (!envId) return
+    collabConfigLoading.value = true
+    try {
+      const raw = await collaborationApi.getEnvConfig(envId)
+      collabConfig.value = {
+        auto_detect: Boolean(raw.auto_detect),
+        detect_interval: Number(raw.detect_interval ?? 30),
+        auto_sync: Boolean(raw.auto_sync),
+        batch_size: Number(raw.batch_size ?? 10),
+        max_concurrent: Number(raw.max_concurrent ?? 3),
+        reconnect_initial_ms: Number(raw.reconnect_initial_ms ?? 1000),
+        reconnect_max_ms: Number(raw.reconnect_max_ms ?? 30000),
+        enable_notifications: Boolean(raw.enable_notifications),
+        log_retention_days: Number(raw.log_retention_days ?? 30),
+      }
+    } catch (err) {
+      console.error("fetchCollabConfig failed", err)
+    } finally {
+      collabConfigLoading.value = false
+    }
+  }
+  async function saveCollabConfig(next: CollaborationConfig): Promise<void> {
+    const envId = selectedEnvId.value
+    if (!envId) {
+      collabConfig.value = { ...next }
+      return
+    }
+    collabConfigSaving.value = true
+    try {
+      await collaborationApi.updateEnvConfig(envId, next)
+      collabConfig.value = { ...next }
+      pushToast({
+        type: "success",
+        icon: "✓",
+        title: "参数已保存",
+        message: `env ${envId} · ${new Date().toLocaleTimeString()}`,
+        durationMs: 4000,
+      })
+    } catch (err) {
+      console.error("saveCollabConfig failed", err)
+      pushToast({
+        type: "error",
+        icon: "!",
+        title: "保存失败",
+        message: err instanceof Error ? err.message : String(err),
+        durationMs: 6000,
+      })
+      throw err
+    } finally {
+      collabConfigSaving.value = false
+    }
+  }
 
   const selectedEnv = computed(() => {
     return envs.value.find((env) => env.id === selectedEnvId.value) ?? null
@@ -1205,5 +1362,21 @@ export const useCollaborationStore = defineStore("collaboration", () => {
     deleteSite,
     setLogFilters,
     pollCurrentSelection,
+    // v2 additions (stub state + actions; Phase 5-9 will populate)
+    activeTasks,
+    failedTasks,
+    realtimeConnected,
+    collabConfig,
+    collabConfigLoading,
+    collabConfigSaving,
+    toasts,
+    pushToast,
+    dismissToast,
+    fetchActiveTasks,
+    fetchFailedTasks,
+    retryFailedTask,
+    cleanupExhaustedFailedTasks,
+    fetchCollabConfig,
+    saveCollabConfig,
   }
 })

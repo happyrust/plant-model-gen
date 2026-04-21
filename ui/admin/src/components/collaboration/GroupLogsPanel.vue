@@ -104,6 +104,46 @@ function displayError(log: CollaborationLogRecord) {
   if (!isLongError(message) || isExpanded(log.id)) return message
   return message.slice(0, 160) + '...'
 }
+
+function highlightText(text: string | null | undefined): string {
+  if (!text) return ''
+  const keyword = props.filters.keyword.trim()
+  if (!keyword) return escapeHtml(text)
+  const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return escapeHtml(text).replace(
+    new RegExp(`(${escaped})`, 'gi'),
+    '<mark class="rounded bg-yellow-200/60 px-0.5 dark:bg-yellow-500/30">$1</mark>',
+  )
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+function exportCSV() {
+  const header = '时间,状态,方向,目标站点,任务ID,文件路径,记录数,大小,错误\n'
+  const rows = filteredLogs.value.map((l) => {
+    const esc = (s: string | null | undefined) => `"${(s ?? '').replace(/"/g, '""')}"`
+    return [
+      esc(formatDateTime(l.created_at)),
+      esc(l.status),
+      esc(l.direction),
+      esc(l.target_site),
+      esc(l.task_id),
+      esc(l.file_path),
+      l.record_count ?? '',
+      l.file_size ?? '',
+      esc(l.error_message),
+    ].join(',')
+  }).join('\n')
+  const blob = new Blob(['\ufeff' + header + rows], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `sync-logs-${new Date().toISOString().slice(0, 10)}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
+}
 </script>
 
 <template>
@@ -148,6 +188,13 @@ function displayError(log: CollaborationLogRecord) {
             @input="emit('updateFilters', { keyword: ($event.target as HTMLInputElement).value })"
           />
         </div>
+        <button
+          class="mt-2 flex h-9 items-center gap-1.5 rounded-md border border-input bg-background px-3 text-sm font-medium text-muted-foreground transition-colors hover:border-primary hover:text-foreground lg:mt-0"
+          @click="exportCSV"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          导出 CSV
+        </button>
       </div>
     </div>
 
@@ -208,15 +255,12 @@ function displayError(log: CollaborationLogRecord) {
                 >
                   {{ log.status }}
                 </span>
-                <span class="text-sm font-medium text-foreground">
-                  {{ log.target_site || '未命名站点' }}
-                </span>
+                <span class="text-sm font-medium text-foreground" v-html="highlightText(log.target_site || '未命名站点')" />
                 <span class="text-xs text-muted-foreground">{{ log.direction || '未知方向' }}</span>
-                <span v-if="log.task_id" class="text-xs text-muted-foreground">任务 {{ log.task_id }}</span>
+                <span v-if="log.task_id" class="text-xs text-muted-foreground" v-html="'任务 ' + highlightText(log.task_id)" />
               </div>
-              <div class="mt-2 break-all font-mono text-xs text-muted-foreground">
-                {{ log.file_path || log.notes || '无文件路径' }}
-              </div>
+              <div class="mt-2 break-all font-mono text-xs text-muted-foreground" v-html="highlightText(log.file_path || log.notes || '无文件路径')" />
+
               <div class="mt-3 text-xs text-muted-foreground">
                 {{ recordSummary(log) }}
               </div>

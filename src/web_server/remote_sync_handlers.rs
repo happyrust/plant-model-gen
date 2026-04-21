@@ -3,15 +3,19 @@ use axum::{
     body::Body,
     extract::{OriginalUri, Path, Query},
     http::{Request, StatusCode, Uri},
-    response::{Html, IntoResponse, Json, Response},
+    response::{Html, IntoResponse, Json, Response, sse::{Event, KeepAlive, Sse}},
     routing::{get, post, put, delete as axum_delete},
 };
+use futures::stream::StreamExt;
+use once_cell::sync::Lazy;
 use rusqlite::{OptionalExtension, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{convert::TryFrom, io::ErrorKind, path::PathBuf, time::Instant};
+use std::{convert::Infallible, convert::TryFrom, io::ErrorKind, path::PathBuf, time::Instant};
+use tokio::sync::broadcast;
 use tokio::time::{Duration, timeout};
 use tokio::{fs, net::TcpStream};
+use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
 use crate::web_server::admin_response;
@@ -19,6 +23,43 @@ use crate::web_server::site_metadata::{self, CachedMetadata, MetadataSource, Sit
 use crate::web_server::topology_handlers;
 use tower::ServiceExt;
 use tower_http::services::ServeDir;
+
+// ── M3 B5 · Remote-Sync SSE 广播通道 ──
+pub static REMOTE_SYNC_EVENT_TX: Lazy<broadcast::Sender<RemoteSyncEvent>> = Lazy::new(|| {
+    let (tx, _) = broadcast::channel(256);
+    tx
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum RemoteSyncEvent {
+    #[serde(rename = "active_task_update")]
+    ActiveTaskUpdate { task: serde_json::Value },
+    #[serde(rename = "failed_task_new")]
+    FailedTaskNew { task: serde_json::Value },
+    #[serde(rename = "site_status_change")]
+    SiteStatusChange {
+        site_id: String,
+        detection_status: String,
+        progress: Option<f64>,
+    },
+    #[serde(rename = "sync_completed")]
+    SyncCompleted {
+        site_id: String,
+        file_count: u32,
+    },
+    #[serde(rename = "sync_failed")]
+    SyncFailed {
+        site_id: String,
+        error: String,
+    },
+    #[serde(rename = "keepalive")]
+    Keepalive,
+}
+
+pub fn emit_remote_sync_event(event: RemoteSyncEvent) {
+    let _ = REMOTE_SYNC_EVENT_TX.send(event);
+}
 
 pub fn create_remote_sync_routes() -> Router {
     Router::new()
@@ -62,6 +103,25 @@ pub fn create_remote_sync_routes() -> Router {
                 .delete(topology_handlers::delete_topology),
         )
         .route("/api/remote-sync/sites/{id}/files", get(serve_site_files_root))
+        // v2 · ROADMAP M2 · 任务队列
+        .route("/api/remote-sync/tasks/active", get(list_active_tasks))
+        .route("/api/remote-sync/tasks/{id}/abort", post(abort_active_task))
+        // v2 · ROADMAP M2 · 失败任务
+        .route(
+            "/api/remote-sync/tasks/failed",
+            get(list_failed_tasks).delete(cleanup_failed_tasks),
+        )
+        .route(
+            "/api/remote-sync/tasks/failed/{id}/retry",
+            post(retry_failed_task),
+        )
+        // v2 · ROADMAP M2 · 协同组参数配置
+        .route(
+            "/api/remote-sync/envs/{id}/config",
+            get(get_env_config).put(update_env_config),
+        )
+        // v2 · ROADMAP M3 B5 · SSE 实时事件流
+        .route("/api/remote-sync/events/stream", get(remote_sync_events_stream))
 }
 
 /// 远程增量环境
@@ -244,6 +304,79 @@ fn run_schema_migration(conn: &rusqlite::Connection) -> Result<(), Box<dyn std::
         "CREATE INDEX IF NOT EXISTS idx_remote_sync_logs_status ON remote_sync_logs(status)",
         rusqlite::params![],
     )?;
+
+    // ────────────────────────────────────────────────────────────────
+    // v2 · 对应 design/collaboration-v2/ROADMAP.md 的 M2 B4。
+    //   tasks: 实时活跃任务（WebSocket/SSE 推送源）
+    //   failed_tasks: 失败任务队列（可重试 + 自动耗尽）
+    //   env_config: 协同组级参数配置（自动检测 / 并发 / 重连 等）
+    // ────────────────────────────────────────────────────────────────
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS remote_sync_tasks (
+            task_id TEXT PRIMARY KEY,
+            env_id TEXT NOT NULL,
+            site_id TEXT,
+            site_name TEXT,
+            task_name TEXT NOT NULL,
+            file_path TEXT,
+            progress REAL DEFAULT 0,
+            status TEXT NOT NULL,
+            started_at TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(env_id) REFERENCES remote_sync_envs(id) ON DELETE CASCADE
+        )",
+        rusqlite::params![],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_remote_sync_tasks_env ON remote_sync_tasks(env_id)",
+        rusqlite::params![],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_remote_sync_tasks_status ON remote_sync_tasks(status)",
+        rusqlite::params![],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS remote_sync_failed_tasks (
+            id TEXT PRIMARY KEY,
+            task_type TEXT NOT NULL,
+            env_id TEXT NOT NULL,
+            site_id TEXT,
+            site_name TEXT,
+            error TEXT NOT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 5,
+            first_failed_at TEXT NOT NULL,
+            next_retry_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(env_id) REFERENCES remote_sync_envs(id) ON DELETE CASCADE
+        )",
+        rusqlite::params![],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_remote_sync_failed_tasks_env ON remote_sync_failed_tasks(env_id)",
+        rusqlite::params![],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS remote_sync_env_config (
+            env_id TEXT PRIMARY KEY,
+            auto_detect INTEGER NOT NULL DEFAULT 1,
+            detect_interval INTEGER NOT NULL DEFAULT 30,
+            auto_sync INTEGER NOT NULL DEFAULT 0,
+            batch_size INTEGER NOT NULL DEFAULT 10,
+            max_concurrent INTEGER NOT NULL DEFAULT 3,
+            reconnect_initial_ms INTEGER NOT NULL DEFAULT 1000,
+            reconnect_max_ms INTEGER NOT NULL DEFAULT 30000,
+            enable_notifications INTEGER NOT NULL DEFAULT 1,
+            log_retention_days INTEGER NOT NULL DEFAULT 30,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(env_id) REFERENCES remote_sync_envs(id) ON DELETE CASCADE
+        )",
+        rusqlite::params![],
+    )?;
+
     Ok(())
 }
 
@@ -2069,3 +2202,561 @@ pub async fn delete_all_sites() -> anyhow::Result<()> {
     conn.execute("DELETE FROM remote_sync_sites", [])?;
     Ok(())
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// v2 · ROADMAP M2 · Task Queue / Failed Tasks / Env Config
+// 契约见 design/collaboration-v2/ROADMAP.md 和 ui/admin/src/types/collaboration.ts
+// ═══════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSyncActiveTask {
+    pub task_id: String,
+    pub env_id: String,
+    pub site_id: Option<String>,
+    pub site_name: Option<String>,
+    pub task_name: String,
+    pub file_path: Option<String>,
+    pub progress: f64,
+    pub status: String,
+    pub started_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSyncFailedTask {
+    pub id: String,
+    pub task_type: String,
+    pub env_id: String,
+    pub site_id: Option<String>,
+    pub site_name: Option<String>,
+    pub site: String,
+    pub error: String,
+    pub retry_count: i64,
+    pub max_retries: i64,
+    pub first_failed_at: String,
+    pub next_retry_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSyncEnvConfig {
+    pub auto_detect: bool,
+    pub detect_interval: i64,
+    pub auto_sync: bool,
+    pub batch_size: i64,
+    pub max_concurrent: i64,
+    pub reconnect_initial_ms: i64,
+    pub reconnect_max_ms: i64,
+    pub enable_notifications: bool,
+    pub log_retention_days: i64,
+}
+
+impl Default for RemoteSyncEnvConfig {
+    fn default() -> Self {
+        Self {
+            auto_detect: true,
+            detect_interval: 30,
+            auto_sync: false,
+            batch_size: 10,
+            max_concurrent: 3,
+            reconnect_initial_ms: 1000,
+            reconnect_max_ms: 30000,
+            enable_notifications: true,
+            log_retention_days: 30,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListActiveTasksQuery {
+    pub env_id: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListFailedTasksQuery {
+    pub env_id: Option<String>,
+    pub status: Option<String>,
+    pub exhausted: Option<bool>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CleanupFailedTasksQuery {
+    pub exhausted: Option<bool>,
+    pub env_id: Option<String>,
+}
+
+// ────────────────────────────────────────────────────────────────
+// B1 · Active Task APIs
+// ────────────────────────────────────────────────────────────────
+
+pub async fn list_active_tasks(
+    Query(params): Query<ListActiveTasksQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let conn = open_sqlite().map_err(|e| {
+        eprintln!("[list_active_tasks] open_sqlite failed: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "数据库连接失败" })),
+        )
+    })?;
+
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
+    let (query, bind_env) = match &params.env_id {
+        Some(_) => (
+            "SELECT task_id, env_id, site_id, site_name, task_name, file_path, progress, status, started_at, updated_at
+             FROM remote_sync_tasks WHERE env_id = ?1 ORDER BY updated_at DESC LIMIT ?2"
+                .to_string(),
+            true,
+        ),
+        None => (
+            "SELECT task_id, env_id, site_id, site_name, task_name, file_path, progress, status, started_at, updated_at
+             FROM remote_sync_tasks ORDER BY updated_at DESC LIMIT ?1"
+                .to_string(),
+            false,
+        ),
+    };
+
+    let mut stmt = conn.prepare(&query).map_err(|e| {
+        eprintln!("[list_active_tasks] prepare failed: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "查询准备失败" })),
+        )
+    })?;
+
+    let rows: Vec<RemoteSyncActiveTask> = if bind_env {
+        stmt.query_map(rusqlite::params![params.env_id.as_ref().unwrap(), limit], map_active_row)
+    } else {
+        stmt.query_map(rusqlite::params![limit], map_active_row)
+    }
+    .map_err(|e| {
+        eprintln!("[list_active_tasks] query_map failed: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "查询失败" })),
+        )
+    })?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    Ok(Json(
+        json!({ "status": "success", "items": rows, "total": rows.len() }),
+    ))
+}
+
+fn map_active_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteSyncActiveTask> {
+    Ok(RemoteSyncActiveTask {
+        task_id: row.get(0)?,
+        env_id: row.get(1)?,
+        site_id: row.get(2)?,
+        site_name: row.get(3)?,
+        task_name: row.get(4)?,
+        file_path: row.get(5)?,
+        progress: row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+        status: row.get(7)?,
+        started_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+pub async fn abort_active_task(
+    Path(task_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let conn = open_sqlite().map_err(|e| {
+        eprintln!("[abort_active_task] open_sqlite failed: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "数据库连接失败" })),
+        )
+    })?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let affected = conn
+        .execute(
+            "UPDATE remote_sync_tasks SET status = 'Cancelled', updated_at = ?1 WHERE task_id = ?2",
+            rusqlite::params![now, task_id],
+        )
+        .map_err(|e| {
+            eprintln!("[abort_active_task] update failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "更新失败" })),
+            )
+        })?;
+    if affected == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "任务不存在" })),
+        ));
+    }
+    Ok(Json(
+        json!({ "status": "success", "task_id": task_id, "new_status": "Cancelled" }),
+    ))
+}
+
+// ────────────────────────────────────────────────────────────────
+// B2 · Failed Task APIs
+// ────────────────────────────────────────────────────────────────
+
+pub async fn list_failed_tasks(
+    Query(params): Query<ListFailedTasksQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let conn = open_sqlite().map_err(|e| {
+        eprintln!("[list_failed_tasks] open_sqlite failed: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "数据库连接失败" })),
+        )
+    })?;
+
+    let limit = params.limit.unwrap_or(100).clamp(1, 500);
+
+    let mut clauses: Vec<String> = Vec::new();
+    let mut binds: Vec<SqlValue> = Vec::new();
+    if let Some(env_id) = &params.env_id {
+        clauses.push("env_id = ?".into());
+        binds.push(SqlValue::Text(env_id.clone()));
+    }
+    match params.status.as_deref() {
+        Some("pending") => clauses.push("retry_count < max_retries".into()),
+        Some("exhausted") => clauses.push("retry_count >= max_retries".into()),
+        _ => {}
+    }
+    if params.exhausted == Some(true) && !clauses.iter().any(|c| c.contains("retry_count")) {
+        clauses.push("retry_count >= max_retries".into());
+    }
+
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    let sql = format!(
+        "SELECT id, task_type, env_id, site_id, site_name, error, retry_count, max_retries,
+         first_failed_at, next_retry_at, created_at, updated_at
+         FROM remote_sync_failed_tasks{} ORDER BY updated_at DESC LIMIT ?",
+        where_sql
+    );
+
+    binds.push(SqlValue::Integer(limit));
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| {
+        eprintln!("[list_failed_tasks] prepare failed: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "查询准备失败" })),
+        )
+    })?;
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = binds
+        .iter()
+        .map(|v| v as &dyn rusqlite::ToSql)
+        .collect();
+
+    let rows: Vec<RemoteSyncFailedTask> = stmt
+        .query_map(param_refs.as_slice(), map_failed_row)
+        .map_err(|e| {
+            eprintln!("[list_failed_tasks] query_map failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "查询失败" })),
+            )
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(Json(
+        json!({ "status": "success", "items": rows, "total": rows.len() }),
+    ))
+}
+
+fn map_failed_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteSyncFailedTask> {
+    let site_name: Option<String> = row.get(4)?;
+    let site_id: Option<String> = row.get(3)?;
+    Ok(RemoteSyncFailedTask {
+        id: row.get(0)?,
+        task_type: row.get(1)?,
+        env_id: row.get(2)?,
+        site: site_name
+            .clone()
+            .or_else(|| site_id.clone())
+            .unwrap_or_else(|| "-".to_string()),
+        site_id,
+        site_name,
+        error: row.get(5)?,
+        retry_count: row.get(6)?,
+        max_retries: row.get(7)?,
+        first_failed_at: row.get(8)?,
+        next_retry_at: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+pub async fn retry_failed_task(
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let conn = open_sqlite().map_err(|e| {
+        eprintln!("[retry_failed_task] open_sqlite failed: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "数据库连接失败" })),
+        )
+    })?;
+    let existing: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT retry_count, max_retries FROM remote_sync_failed_tasks WHERE id = ?1",
+            rusqlite::params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| {
+            eprintln!("[retry_failed_task] query failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "查询失败" })),
+            )
+        })?;
+
+    let (retry_count, max_retries) = existing.ok_or((
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": "失败任务不存在" })),
+    ))?;
+
+    if retry_count >= max_retries {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "已耗尽重试次数，不能再触发重试",
+                "retry_count": retry_count,
+                "max_retries": max_retries
+            })),
+        ));
+    }
+
+    let now = chrono::Utc::now();
+    let next_retry = now + chrono::Duration::seconds(60);
+    let now_str = now.to_rfc3339();
+    let next_str = next_retry.to_rfc3339();
+
+    conn.execute(
+        "UPDATE remote_sync_failed_tasks
+         SET retry_count = retry_count + 1, next_retry_at = ?2, updated_at = ?3
+         WHERE id = ?1",
+        rusqlite::params![id, next_str, now_str],
+    )
+    .map_err(|e| {
+        eprintln!("[retry_failed_task] update failed: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "更新失败" })),
+        )
+    })?;
+
+    Ok(Json(json!({
+        "status": "success",
+        "id": id,
+        "retry_count": retry_count + 1,
+        "max_retries": max_retries,
+        "next_retry_at": next_str
+    })))
+}
+
+pub async fn cleanup_failed_tasks(
+    Query(params): Query<CleanupFailedTasksQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let conn = open_sqlite().map_err(|e| {
+        eprintln!("[cleanup_failed_tasks] open_sqlite failed: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "数据库连接失败" })),
+        )
+    })?;
+
+    let only_exhausted = params.exhausted.unwrap_or(true);
+    let affected = match (&params.env_id, only_exhausted) {
+        (Some(env_id), true) => conn.execute(
+            "DELETE FROM remote_sync_failed_tasks WHERE env_id = ?1 AND retry_count >= max_retries",
+            rusqlite::params![env_id],
+        ),
+        (Some(env_id), false) => conn.execute(
+            "DELETE FROM remote_sync_failed_tasks WHERE env_id = ?1",
+            rusqlite::params![env_id],
+        ),
+        (None, true) => conn.execute(
+            "DELETE FROM remote_sync_failed_tasks WHERE retry_count >= max_retries",
+            rusqlite::params![],
+        ),
+        (None, false) => conn.execute("DELETE FROM remote_sync_failed_tasks", rusqlite::params![]),
+    }
+    .map_err(|e| {
+        eprintln!("[cleanup_failed_tasks] delete failed: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "清理失败" })),
+        )
+    })?;
+
+    Ok(Json(
+        json!({ "status": "success", "cleaned": affected }),
+    ))
+}
+
+// ────────────────────────────────────────────────────────────────
+// B3 · Env Config APIs
+// ────────────────────────────────────────────────────────────────
+
+pub async fn get_env_config(
+    Path(env_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let conn = open_sqlite().map_err(|e| {
+        eprintln!("[get_env_config] open_sqlite failed: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "数据库连接失败" })),
+        )
+    })?;
+
+    let cfg: Option<RemoteSyncEnvConfig> = conn
+        .query_row(
+            "SELECT auto_detect, detect_interval, auto_sync, batch_size, max_concurrent,
+                    reconnect_initial_ms, reconnect_max_ms, enable_notifications, log_retention_days
+             FROM remote_sync_env_config WHERE env_id = ?1",
+            rusqlite::params![env_id],
+            |row| {
+                Ok(RemoteSyncEnvConfig {
+                    auto_detect: row.get::<_, i64>(0)? != 0,
+                    detect_interval: row.get(1)?,
+                    auto_sync: row.get::<_, i64>(2)? != 0,
+                    batch_size: row.get(3)?,
+                    max_concurrent: row.get(4)?,
+                    reconnect_initial_ms: row.get(5)?,
+                    reconnect_max_ms: row.get(6)?,
+                    enable_notifications: row.get::<_, i64>(7)? != 0,
+                    log_retention_days: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| {
+            eprintln!("[get_env_config] query failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "查询失败" })),
+            )
+        })?;
+
+    let cfg = cfg.unwrap_or_default();
+    Ok(Json(serde_json::to_value(&cfg).unwrap_or_default()))
+}
+
+pub async fn update_env_config(
+    Path(env_id): Path<String>,
+    Json(cfg): Json<RemoteSyncEnvConfig>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let conn = open_sqlite().map_err(|e| {
+        eprintln!("[update_env_config] open_sqlite failed: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "数据库连接失败" })),
+        )
+    })?;
+
+    let env_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM remote_sync_envs WHERE id = ?1",
+            rusqlite::params![env_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|e| {
+            eprintln!("[update_env_config] env lookup failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "查询失败" })),
+            )
+        })?
+        .unwrap_or(false);
+
+    if !env_exists {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "协同组不存在" })),
+        ));
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO remote_sync_env_config
+         (env_id, auto_detect, detect_interval, auto_sync, batch_size, max_concurrent,
+          reconnect_initial_ms, reconnect_max_ms, enable_notifications, log_retention_days, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(env_id) DO UPDATE SET
+           auto_detect = excluded.auto_detect,
+           detect_interval = excluded.detect_interval,
+           auto_sync = excluded.auto_sync,
+           batch_size = excluded.batch_size,
+           max_concurrent = excluded.max_concurrent,
+           reconnect_initial_ms = excluded.reconnect_initial_ms,
+           reconnect_max_ms = excluded.reconnect_max_ms,
+           enable_notifications = excluded.enable_notifications,
+           log_retention_days = excluded.log_retention_days,
+           updated_at = excluded.updated_at",
+        rusqlite::params![
+            env_id,
+            if cfg.auto_detect { 1 } else { 0 },
+            cfg.detect_interval,
+            if cfg.auto_sync { 1 } else { 0 },
+            cfg.batch_size,
+            cfg.max_concurrent,
+            cfg.reconnect_initial_ms,
+            cfg.reconnect_max_ms,
+            if cfg.enable_notifications { 1 } else { 0 },
+            cfg.log_retention_days,
+            now,
+        ],
+    )
+    .map_err(|e| {
+        eprintln!("[update_env_config] upsert failed: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "写入配置失败" })),
+        )
+    })?;
+
+    Ok(Json(json!({ "status": "success", "env_id": env_id })))
+}
+
+// ── M3 B5 · SSE 事件流 handler ──
+
+/// GET /api/remote-sync/events/stream
+///
+/// 返回 Server-Sent Events 流，前端 useCollaborationStream.ts 消费。
+/// 事件类型：active_task_update / failed_task_new / site_status_change /
+///           sync_completed / sync_failed / keepalive
+async fn remote_sync_events_stream() -> Sse<impl futures::stream::Stream<Item = Result<Event, Infallible>>> {
+    let rx = REMOTE_SYNC_EVENT_TX.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|result| async move {
+        match result {
+            Ok(event) => match serde_json::to_string(&event) {
+                Ok(json) => Some(Ok::<_, Infallible>(Event::default().data(json).event("message"))),
+                Err(e) => {
+                    eprintln!("[remote_sync_sse] serialize error: {}", e);
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!("[remote_sync_sse] broadcast recv error: {}", e);
+                None
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    )
+}
+

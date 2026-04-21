@@ -1,9 +1,12 @@
 import { rawApi } from "./client"
 import type {
   CollaborationActionResult,
+  CollaborationActiveTask,
+  CollaborationConfig,
   CollaborationDailyStat,
   CollaborationDiagnosticResponse,
   CollaborationEnv,
+  CollaborationFailedTask,
   CollaborationFlowStat,
   CollaborationLogsResult,
   CollaborationRuntimeConfig,
@@ -241,5 +244,72 @@ export const collaborationApi = {
       method: "DELETE",
     })
     return assertSuccess(response, "删除协同组失败")
+  },
+
+  // ROADMAP · M2 · v2 后端扩展
+
+  async listActiveTasks(envId?: string) {
+    const qs = envId ? `?env_id=${encodeURIComponent(envId)}` : ""
+    const response = await rawApi<LegacyListResponse<CollaborationActiveTask>>(
+      "/api/remote-sync/tasks/active" + qs,
+      { method: "GET" },
+    )
+    return assertSuccess(response, "加载活跃任务失败").items ?? []
+  },
+
+  async abortActiveTask(taskId: string) {
+    const response = await rawApi<LegacyStatusResponse>(
+      "/api/remote-sync/tasks/" + taskId + "/abort",
+      { method: "POST" },
+    )
+    return assertSuccess(response, "中止任务失败")
+  },
+
+  async listFailedTasks(params: { envId?: string; status?: "pending" | "exhausted" } = {}) {
+    const qs: string[] = []
+    if (params.envId) qs.push("env_id=" + encodeURIComponent(params.envId))
+    if (params.status) qs.push("status=" + params.status)
+    const search = qs.length ? "?" + qs.join("&") : ""
+    const response = await rawApi<LegacyListResponse<CollaborationFailedTask>>(
+      "/api/remote-sync/tasks/failed" + search,
+      { method: "GET" },
+    )
+    return assertSuccess(response, "加载失败任务失败").items ?? []
+  },
+
+  async retryFailedTask(id: string) {
+    const response = await rawApi<LegacyStatusResponse>(
+      "/api/remote-sync/tasks/failed/" + id + "/retry",
+      { method: "POST" },
+    )
+    return assertSuccess(response, "重试失败任务失败")
+  },
+
+  async cleanupFailedTasks(params: { envId?: string; exhausted?: boolean } = {}) {
+    const qs: string[] = []
+    if (params.envId) qs.push("env_id=" + encodeURIComponent(params.envId))
+    if (params.exhausted != null) qs.push("exhausted=" + String(params.exhausted))
+    const search = qs.length ? "?" + qs.join("&") : ""
+    const response = await rawApi<LegacyStatusResponse & { cleaned?: number }>(
+      "/api/remote-sync/tasks/failed" + search,
+      { method: "DELETE" },
+    )
+    return assertSuccess(response, "清理失败任务失败")
+  },
+
+  async getEnvConfig(envId: string) {
+    const response = await rawApi<CollaborationConfig>(
+      "/api/remote-sync/envs/" + envId + "/config",
+      { method: "GET" },
+    )
+    return response
+  },
+
+  async updateEnvConfig(envId: string, config: CollaborationConfig) {
+    const response = await rawApi<LegacyStatusResponse>(
+      "/api/remote-sync/envs/" + envId + "/config",
+      { method: "PUT", body: config as unknown as Record<string, unknown> },
+    )
+    return assertSuccess(response, "保存参数配置失败")
   },
 }

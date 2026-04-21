@@ -1,0 +1,829 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=1440,initial-scale=1" />
+<title>异地协同 · v2 · Hi-Fi 原型</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,500;0,700;1,500&family=JetBrains+Mono:wght@400;500&family=Noto+Serif+SC:wght@500;700&display=swap" rel="stylesheet">
+
+<script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.0/babel.min.js"></script>
+
+<style>
+:root{
+  --bg:#FAFAF7;
+  --ink-900:#0F172A;
+  --ink-700:#334155;
+  --ink-500:#64748B;
+  --ink-400:#94A3B8;
+  --ink-300:#CBD5E1;
+  --line:#E6E4DE;
+  --line-soft:#EFEDE7;
+  --brand:#1F3A68;
+  --brand-strong:#152846;
+  --brand-soft:#E8EDF3;
+  --ok:oklch(0.68 0.14 150);
+  --ok-bg:oklch(0.96 0.04 150);
+  --warn:oklch(0.72 0.16 75);
+  --warn-bg:oklch(0.96 0.05 80);
+  --bad:oklch(0.62 0.20 25);
+  --bad-bg:oklch(0.96 0.04 25);
+  --radius:10px;
+  --font-display:"EB Garamond","Noto Serif SC","Source Serif Pro",serif;
+  --font-body:-apple-system,"Segoe UI","PingFang SC",system-ui,sans-serif;
+  --font-mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--ink-900);font-family:var(--font-body);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+.mono,.ic-tbl .mono,.ic-grp-row3 .m,.ic-meta-time,.ic-log-filters input,.ic-drw-kv dd.mono{font-variant-numeric:tabular-nums;font-feature-settings:"tnum"}
+
+/* === 指挥条 === */
+.ic-cmdbar{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:20px;height:60px;padding:0 28px;background:var(--bg);border-bottom:1px solid var(--line)}
+.ic-crumb{display:flex;align-items:center;gap:10px;color:var(--ink-500);font-size:13px}
+.ic-crumb .curr{color:var(--ink-900);font-weight:500}
+.ic-crumb .sep{color:var(--ink-300)}
+.ic-statuspill{display:inline-flex;align-items:center;gap:8px;padding:4px 12px 4px 10px;border-radius:999px;font-size:12px;font-weight:500;letter-spacing:.01em}
+.ic-statuspill .dot{width:8px;height:8px;border-radius:999px;background:currentColor}
+.ic-statuspill.ok{background:var(--ok-bg);color:var(--ok)}
+.ic-statuspill.warn{background:var(--warn-bg);color:var(--warn)}
+.ic-statuspill.bad{background:var(--bad-bg);color:var(--bad)}
+.ic-cmdbar-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.ic-meta-time{color:var(--ink-400);font-size:12px;font-family:var(--font-mono)}
+.ic-btn{height:34px;display:inline-flex;align-items:center;gap:7px;padding:0 14px;border-radius:8px;font-size:13px;font-weight:500;border:1px solid var(--line);background:#fff;color:var(--ink-700);cursor:pointer;transition:border-color .15s,background .15s}
+.ic-btn:hover{border-color:var(--ink-400)}
+.ic-btn-primary{background:var(--brand);color:#fff;border-color:var(--brand)}
+.ic-btn-primary:hover{background:var(--brand-strong);border-color:var(--brand-strong)}
+.ic-btn-more{width:34px;justify-content:center;padding:0}
+.ic-menu{position:absolute;top:46px;right:28px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:6px;min-width:180px;box-shadow:0 8px 24px rgba(15,23,42,.08);z-index:20}
+.ic-menu-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:6px;font-size:13px;color:var(--ink-700);cursor:pointer}
+.ic-menu-item:hover{background:var(--brand-soft);color:var(--brand)}
+.ic-menu-item.danger{color:var(--bad)}
+.ic-menu-item.danger:hover{background:var(--bad-bg)}
+.ic-menu-sep{height:1px;background:var(--line);margin:4px 6px}
+
+/* === 整体 2 列布局 === */
+.ic-shell{display:grid;grid-template-columns:320px 1fr;min-height:calc(100vh - 60px)}
+.ic-sidebar{border-right:1px solid var(--line);padding:20px 16px;background:#FCFBF8}
+.ic-main{padding:22px 28px 80px 28px;min-width:0}
+
+/* === 左栏 协同组 === */
+.ic-side-title{font-family:var(--font-body);font-size:13px;font-weight:500;color:var(--ink-500);text-transform:uppercase;letter-spacing:.1em;margin:0 0 12px 4px}
+.ic-side-search{display:flex;align-items:center;gap:8px;padding:0 10px;height:34px;border:1px solid var(--line);border-radius:8px;background:#fff;margin-bottom:8px}
+.ic-side-search input{flex:1;border:0;outline:0;font-size:13px;background:transparent;color:var(--ink-900)}
+.ic-side-actions{display:flex;gap:6px;margin:6px 0 14px}
+.ic-side-actions .ic-btn{flex:1;height:32px;padding:0 10px;font-size:12px}
+.ic-grp-list{display:flex;flex-direction:column;gap:6px}
+.ic-grp{position:relative;display:block;padding:12px 12px 11px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer;transition:border-color .15s,background .15s}
+.ic-grp:hover{border-color:var(--ink-300)}
+.ic-grp.active{border-color:var(--brand);background:var(--brand-soft)}
+.ic-grp-row1{display:flex;align-items:center;gap:8px}
+.ic-grp-name{font-weight:500;color:var(--ink-900);font-size:13.5px}
+.ic-grp-stamp{margin-left:auto;font-family:var(--font-mono);font-size:10.5px;color:var(--ink-500);letter-spacing:.05em;padding:2px 6px;border:1px dashed var(--ink-300);border-radius:4px;transform:rotate(-1.5deg)}
+.ic-grp.active .ic-grp-stamp{color:var(--brand);border-color:var(--brand)}
+.ic-grp-loc{margin-top:4px;font-size:12px;color:var(--ink-500)}
+.ic-grp-row3{margin-top:9px;display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--ink-400)}
+.ic-grp-row3 .m{font-family:var(--font-mono);font-size:10.5px}
+
+/* === 右主区 === */
+.ic-hero{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:20px}
+.ic-hero h1{font-family:var(--font-display);font-weight:500;font-size:40px;line-height:1.05;margin:0;letter-spacing:-.02em}
+.ic-hero h1 em{font-style:italic;color:var(--brand);font-weight:500}
+.ic-hero p{margin:8px 0 0;color:var(--ink-500);font-size:13.5px;max-width:560px}
+.ic-hero-meta{display:flex;flex-direction:column;align-items:flex-end;gap:4px;color:var(--ink-500);font-size:12.5px}
+.ic-hero-meta strong{color:var(--ink-900);font-weight:500;font-size:16px;font-family:var(--font-mono)}
+
+/* === 4 指标薄卡 === */
+.ic-kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}
+.ic-kpi{border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px;background:#fff}
+.ic-kpi .k{font-size:11.5px;color:var(--ink-500);letter-spacing:.04em;text-transform:uppercase}
+.ic-kpi .v{font-family:var(--font-display);font-size:28px;font-weight:500;margin-top:6px;letter-spacing:-.01em}
+.ic-kpi .d{font-size:11.5px;color:var(--ink-500);margin-top:4px}
+.ic-kpi.v-ok .v{color:var(--ok)}
+.ic-kpi.v-warn .v{color:var(--warn)}
+.ic-kpi.v-bad .v{color:var(--bad)}
+
+/* === Tabs === */
+.ic-tabs{display:flex;align-items:flex-end;gap:28px;border-bottom:1px solid var(--line);margin-bottom:20px;padding-left:4px}
+.ic-tab{position:relative;padding:9px 0 11px;font-size:13.5px;color:var(--ink-500);cursor:pointer;font-weight:500;letter-spacing:.01em;border:0;background:transparent}
+.ic-tab:hover{color:var(--ink-700)}
+.ic-tab.active{color:var(--ink-900)}
+.ic-tab.active::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;background:var(--brand);border-radius:2px 2px 0 0}
+.ic-tab .cnt{margin-left:6px;font-size:11.5px;color:var(--ink-400);font-family:var(--font-mono)}
+.ic-panel{border:1px solid var(--line);border-radius:12px;background:#fff;padding:22px 24px}
+
+/* === 拓扑 Tab === */
+.ic-topo-top{display:flex;align-items:center;gap:16px;margin-bottom:14px}
+.ic-topo-top h2{font-family:var(--font-body);font-weight:500;font-size:17px;margin:0;color:var(--ink-900);letter-spacing:-.005em}
+.ic-topo-top h2 em{font-style:normal;color:var(--ink-500);font-weight:400;margin-left:2px}
+.ic-topo-ctrl{margin-left:auto;display:flex;gap:6px}
+.ic-segctl{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#FCFBF8}
+.ic-segctl button{padding:6px 12px;border:0;background:transparent;font-size:12.5px;color:var(--ink-500);cursor:pointer}
+.ic-segctl button.on{background:#fff;color:var(--ink-900);box-shadow:inset 0 0 0 1px var(--brand)}
+.ic-topo-layout{display:grid;grid-template-columns:1fr 340px;gap:20px}
+.ic-topo-canvas{position:relative;border:1px solid var(--line-soft);border-radius:10px;background:
+  linear-gradient(#FCFBF8, #FCFBF8),
+  repeating-linear-gradient(0deg, transparent 0 47px, rgba(15,23,42,.035) 47px 48px),
+  repeating-linear-gradient(90deg, transparent 0 47px, rgba(15,23,42,.035) 47px 48px);
+  background-blend-mode:normal,multiply,multiply;
+  height:460px;overflow:hidden}
+.ic-topo-svg{position:absolute;inset:0;width:100%;height:100%}
+.ic-node{cursor:pointer;transition:filter .2s}
+.ic-node:hover{filter:drop-shadow(0 4px 10px rgba(31,58,104,.22))}
+.ic-node-box{fill:#fff;stroke:var(--ink-300);stroke-width:1}
+.ic-node.self .ic-node-box{stroke:var(--brand);stroke-width:1.5;fill:var(--brand-soft)}
+.ic-node.selected .ic-node-box{stroke:var(--brand);stroke-width:2}
+.ic-node.bad .ic-node-box{stroke:var(--bad);fill:var(--bad-bg)}
+.ic-node.warn .ic-node-box{stroke:var(--warn);fill:var(--warn-bg)}
+.ic-node-label{font-family:var(--font-body);font-size:13px;font-weight:500;fill:var(--ink-900);text-anchor:middle}
+.ic-node-sub{font-family:var(--font-mono);font-size:11px;fill:var(--ink-700);text-anchor:middle}
+.ic-node-stamp{font-family:var(--font-mono);font-size:10px;fill:var(--ink-500);text-anchor:middle;letter-spacing:.15em}
+.ic-node.self .ic-node-label{fill:var(--brand-strong)}
+.ic-node.self .ic-node-sub{fill:var(--brand)}
+
+.ic-flow{fill:none;stroke-linecap:round}
+.ic-flow.ok{stroke:var(--ok);stroke-width:2.5}
+.ic-flow.warn{stroke:var(--warn);stroke-width:2.5}
+.ic-flow.bad{stroke:var(--bad);stroke-width:2.5;stroke-dasharray:6 5}
+.ic-flow-label{font-family:var(--font-mono);font-size:10px;fill:var(--ink-700)}
+
+.ic-topo-detail{border:1px solid var(--line-soft);border-radius:10px;padding:18px;background:#FCFBF8;display:flex;flex-direction:column}
+.ic-topo-detail .h{font-family:var(--font-display);font-size:18px;font-weight:500;margin:0 0 10px}
+.ic-topo-detail .meta{display:flex;align-items:center;gap:8px;margin-bottom:14px;font-size:12px;color:var(--ink-500)}
+.ic-topo-detail .kv{display:grid;grid-template-columns:76px 1fr;gap:6px 12px;font-size:12.5px;color:var(--ink-700)}
+.ic-topo-detail .kv dt{color:var(--ink-500)}
+.ic-topo-detail .kv dd{margin:0;font-family:var(--font-mono);font-size:11.5px;word-break:break-all}
+.ic-topo-detail .diag{margin-top:auto;border-top:1px dashed var(--line);padding-top:12px;font-size:12px;color:var(--ink-500)}
+.ic-topo-detail .diag strong{color:var(--ok);font-weight:500}
+
+.ic-topo-legend{display:flex;gap:16px;margin-top:12px;padding-left:4px;font-size:11.5px;color:var(--ink-500)}
+.ic-topo-legend span{display:inline-flex;align-items:center;gap:6px}
+.ic-topo-legend i{display:inline-block;width:18px;height:2px;border-radius:2px}
+.ic-topo-legend i.ok{background:var(--ok)}
+.ic-topo-legend i.warn{background:var(--warn)}
+.ic-topo-legend i.bad{background:repeating-linear-gradient(90deg,var(--bad) 0 4px,transparent 4px 8px);height:2px}
+
+/* === 站点 Tab (表格) === */
+.ic-tbl{width:100%;border-collapse:collapse;font-size:13px}
+.ic-tbl thead th{text-align:left;padding:11px 14px;font-weight:500;color:var(--ink-500);font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--line)}
+.ic-tbl tbody td{padding:13px 14px;border-bottom:1px solid var(--line-soft);vertical-align:middle}
+.ic-tbl tbody tr:hover{background:#FCFBF8;cursor:pointer}
+.ic-tbl tbody tr.active{background:var(--brand-soft)}
+.ic-tbl .role{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:11px;background:var(--line-soft);color:var(--ink-700);font-weight:500}
+.ic-tbl .role.master{background:var(--brand-soft);color:var(--brand)}
+.ic-tbl .mono{font-family:var(--font-mono);font-size:11.5px;color:var(--ink-700)}
+.ic-row-act{display:flex;gap:6px;justify-content:flex-end}
+.ic-row-act .ic-btn{height:28px;padding:0 10px;font-size:12px}
+
+/* === 洞察 Tab === */
+.ic-insight-row{display:grid;grid-template-columns:2fr 1fr;gap:20px;margin-top:18px}
+.ic-chart{height:260px;border:1px dashed var(--line);border-radius:10px;padding:14px;background:#FCFBF8;position:relative}
+.ic-chart-title{font-size:12.5px;color:var(--ink-500);margin-bottom:8px}
+.ic-chart-stage{height:200px;display:flex;align-items:flex-end;gap:4px}
+.ic-chart-stage .bar{flex:1;display:flex;flex-direction:column-reverse;border-radius:2px 2px 0 0;overflow:hidden}
+.ic-chart-stage .bar .f{background:var(--bad)}
+.ic-chart-stage .bar .s{background:var(--ok)}
+.ic-chart-axis{display:flex;gap:4px;margin-top:6px;font-family:var(--font-mono);font-size:10px;color:var(--ink-400)}
+.ic-chart-axis span{flex:1;text-align:center}
+.ic-ins-list{border:1px solid var(--line-soft);border-radius:10px;overflow:hidden}
+.ic-ins-list .h{padding:10px 14px;border-bottom:1px solid var(--line);font-size:12.5px;color:var(--ink-500);background:#FCFBF8;display:flex;align-items:center;justify-content:space-between}
+.ic-ins-list ul{list-style:none;margin:0;padding:0}
+.ic-ins-list li{padding:11px 14px;border-bottom:1px solid var(--line-soft);font-size:12.5px}
+.ic-ins-list li:last-child{border-bottom:0}
+.ic-ins-list .ttl{display:flex;align-items:center;gap:8px}
+.ic-ins-list .ttl b{font-weight:500;color:var(--ink-900)}
+.ic-ins-list .sub{color:var(--ink-500);margin-top:3px;font-size:11.5px;font-family:var(--font-mono)}
+.ic-ins-list .pill{margin-left:auto;font-size:11px;color:var(--bad);background:var(--bad-bg);padding:2px 8px;border-radius:999px}
+
+/* === 日志 Tab === */
+.ic-log-filters{display:grid;grid-template-columns:120px 120px 160px 1fr 100px;gap:8px;margin-bottom:12px}
+.ic-log-filters select,.ic-log-filters input{height:32px;border:1px solid var(--line);border-radius:8px;background:#fff;padding:0 10px;font-size:12.5px;color:var(--ink-900);outline:none}
+.ic-log-filters select:focus,.ic-log-filters input:focus{border-color:var(--brand)}
+.ic-log-badge{display:inline-flex;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:500}
+.ic-log-badge.ok{background:var(--ok-bg);color:var(--ok)}
+.ic-log-badge.warn{background:var(--warn-bg);color:var(--warn)}
+.ic-log-badge.bad{background:var(--bad-bg);color:var(--bad)}
+.ic-log-err{margin-top:6px;padding:6px 10px;background:var(--bad-bg);color:var(--bad);border-radius:6px;font-family:var(--font-mono);font-size:11px}
+.ic-log-pager{display:flex;align-items:center;justify-content:space-between;margin-top:14px;font-size:12px;color:var(--ink-500)}
+.ic-log-pager .pg{display:flex;gap:6px}
+
+/* === 站点详情抽屉 === */
+.ic-scrim{position:fixed;inset:0;background:rgba(15,23,42,.32);z-index:40;opacity:0;pointer-events:none;transition:opacity .22s ease}
+.ic-scrim.on{opacity:1;pointer-events:auto}
+.ic-drawer{position:fixed;top:0;right:0;height:100vh;width:560px;max-width:94vw;background:var(--bg);z-index:50;border-left:1px solid var(--line);box-shadow:-24px 0 48px -16px rgba(15,23,42,.14);transform:translateX(100%);transition:transform .24s cubic-bezier(.32,.72,0,1);display:flex;flex-direction:column}
+.ic-drawer.on{transform:translateX(0)}
+.ic-drw-hdr{display:flex;align-items:flex-start;gap:14px;padding:20px 24px 16px;border-bottom:1px solid var(--line)}
+.ic-drw-hdr .ti{flex:1;min-width:0}
+.ic-drw-hdr h3{font-family:var(--font-display);font-weight:500;font-size:24px;margin:0;letter-spacing:-.01em;line-height:1.2}
+.ic-drw-hdr h3 em{font-style:italic;color:var(--brand)}
+.ic-drw-hdr .loc{margin-top:4px;color:var(--ink-500);font-size:12.5px}
+.ic-drw-hdr .loc code{font-family:var(--font-mono);font-size:11.5px;color:var(--ink-700);background:var(--line-soft);padding:1px 6px;border-radius:4px}
+.ic-drw-close{height:32px;width:32px;border:1px solid var(--line);border-radius:8px;background:#fff;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;color:var(--ink-500)}
+.ic-drw-close:hover{border-color:var(--ink-400);color:var(--ink-900)}
+.ic-drw-body{flex:1;overflow:auto;padding:6px 24px 80px}
+.ic-drw-sec{margin-top:22px}
+.ic-drw-sec .sh{display:flex;align-items:center;gap:10px;font-size:11.5px;color:var(--ink-500);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
+.ic-drw-sec .sh::after{content:"";flex:1;height:1px;background:var(--line)}
+.ic-drw-card{border:1px solid var(--line);border-radius:10px;background:#fff;padding:14px 16px}
+.ic-drw-kv{display:grid;grid-template-columns:96px 1fr;gap:10px 16px;font-size:12.5px}
+.ic-drw-kv dt{color:var(--ink-500)}
+.ic-drw-kv dd{margin:0;color:var(--ink-900);word-break:break-all}
+.ic-drw-kv dd.mono{font-family:var(--font-mono);font-size:12px}
+.ic-drw-meta-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.ic-drw-meta-grid .m{border:1px solid var(--line);border-radius:10px;background:#fff;padding:12px 14px}
+.ic-drw-meta-grid .m .lb{font-size:11px;color:var(--ink-500);letter-spacing:.04em;text-transform:uppercase}
+.ic-drw-meta-grid .m .vl{font-family:var(--font-display);font-size:22px;font-weight:500;margin-top:4px;letter-spacing:-.01em}
+.ic-drw-diags{display:flex;flex-direction:column;gap:8px}
+.ic-drw-diag{display:grid;grid-template-columns:84px 1fr auto;align-items:center;gap:10px;border:1px solid var(--line);border-radius:8px;background:#fff;padding:10px 14px;font-size:12.5px}
+.ic-drw-diag .t{font-family:var(--font-mono);color:var(--ink-500);font-size:11.5px}
+.ic-drw-diag .m{color:var(--ink-700)}
+.ic-drw-diag .ms{font-family:var(--font-mono);font-size:11px;color:var(--ink-500)}
+.ic-drw-foot{border-top:1px solid var(--line);background:var(--bg);padding:14px 24px;display:flex;gap:10px;position:sticky;bottom:0}
+.ic-drw-foot .ic-btn{height:36px;padding:0 16px;font-size:13px}
+.ic-drw-foot .sp{flex:1}
+
+/* === 工具 === */
+.ic-scroll-hint{text-align:center;color:var(--ink-400);font-size:11px;margin-top:26px;font-family:var(--font-mono);letter-spacing:.2em}
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script type="text/babel" data-type="module">
+const {useState,useMemo} = React;
+
+/* ============ Mock 数据 (类型对齐 ui/admin/src/types/collaboration.ts) ============ */
+const MOCK_ENVS = [
+  {id:"env1",name:"华北主协同组",location:"冀·sjz",mqtt_summary:"mqtt://10.20.5.11:1883",site_count:4,updated:"2m ago",active:true,tone:"ok",status:"运行中"},
+  {id:"env2",name:"华东协同组",location:"沪·sh",mqtt_summary:"mqtt://10.30.6.22:1883",site_count:3,updated:"14m ago",active:false,tone:"warn",status:"未激活"},
+  {id:"env3",name:"华南协同组",location:"粤·gz",mqtt_summary:"mqtt://10.40.7.33:1883",site_count:5,updated:"1h ago",active:false,tone:"bad",status:"连接异常"},
+];
+
+const MOCK_SITES = [
+  {id:"s1",name:"本站 (sjz)",location:"冀·石家庄",role:"self",http:"http://127.0.0.1:7997",dbnums:"7997,8001",avail:"online",avail_label:"在线",diag:{ok:true,ms:38,at:"2m ago",msg:"HTTP 200 / MQTT connected"},files:482,records:121_834,notes:"本地主站 · 负责接收所有 Peer 推送",meta_source:"本地直读",latest_at:"10:42:18"},
+  {id:"s2",name:"北京站",location:"京·bj",role:"peer",http:"http://10.20.5.41:7997",dbnums:"8002",avail:"online",avail_label:"在线",diag:{ok:true,ms:64,at:"3m ago",msg:"HTTP 200"},files:211,records:54_102,notes:"北京工厂 · 每小时 push 增量到本站",meta_source:"远端 HTTP 直连",latest_at:"10:38:55"},
+  {id:"s3",name:"上海站",location:"沪·sh",role:"peer",http:"http://10.30.5.51:7997",dbnums:"8003",avail:"cached",avail_label:"缓存中",diag:{ok:false,ms:null,at:"12m ago",msg:"连接超时,使用缓存元数据"},files:180,records:42_987,notes:"上海工厂 · 元数据降级中 (使用 12m 前缓存)",meta_source:"本地缓存 (降级)",latest_at:"10:29:41"},
+  {id:"s4",name:"广州站",location:"粤·gz",role:"peer",http:"http://10.40.6.22:7997",dbnums:"8004",avail:"offline",avail_label:"离线",diag:{ok:false,ms:null,at:"18m ago",msg:"HTTP 500 · file server 异常"},files:143,records:33_421,notes:"广州工厂 · file server 持续 5xx,需人工介入",meta_source:"本地缓存 (离线)",latest_at:"09:58:02"},
+];
+
+const MOCK_DIAG_HISTORY = {
+  s1:[{at:"10:42:18",ok:true, ms:38, msg:"HTTP 200 / MQTT connected"},{at:"10:27:18",ok:true, ms:41, msg:"HTTP 200"},{at:"10:12:18",ok:true, ms:44, msg:"HTTP 200"}],
+  s2:[{at:"10:39:02",ok:true, ms:64, msg:"HTTP 200"},{at:"10:24:02",ok:true, ms:71, msg:"HTTP 200"},{at:"10:09:02",ok:false,ms:null,msg:"connection reset"}],
+  s3:[{at:"10:30:44",ok:false,ms:null,msg:"dial tcp 10.30.5.51:7997: i/o timeout"},{at:"10:15:44",ok:false,ms:null,msg:"i/o timeout"},{at:"10:00:44",ok:true, ms:89, msg:"HTTP 200"}],
+  s4:[{at:"10:24:08",ok:false,ms:null,msg:"HTTP 500 · internal server error"},{at:"10:09:08",ok:false,ms:null,msg:"HTTP 500"},{at:"09:54:08",ok:false,ms:null,msg:"HTTP 502"}],
+};
+
+const MOCK_FLOWS = [
+  {from:"s1",to:"s2",direction:"push",total:128,failed:0,tone:"ok",label:"push · 128"},
+  {from:"s1",to:"s3",direction:"push",total:64,failed:6,tone:"warn",label:"push · 64 (6 fail)"},
+  {from:"s2",to:"s1",direction:"pull",total:88,failed:0,tone:"ok",label:"pull · 88"},
+  {from:"s4",to:"s1",direction:"pull",total:22,failed:22,tone:"bad",label:"pull · 22 (all fail)"},
+];
+
+const MOCK_TREND = [
+  {d:"04-08",s:72,f:2},{d:"04-09",s:80,f:3},{d:"04-10",s:64,f:1},
+  {d:"04-11",s:95,f:5},{d:"04-12",s:88,f:2},{d:"04-13",s:101,f:7},
+  {d:"04-14",s:76,f:3},{d:"04-15",s:112,f:4},{d:"04-16",s:93,f:2},
+  {d:"04-17",s:120,f:6},{d:"04-18",s:118,f:10},{d:"04-19",s:140,f:8},
+  {d:"04-20",s:132,f:4},{d:"04-21",s:108,f:2},
+];
+
+const MOCK_LOGS = [
+  {id:"l1",at:"2026-04-21 10:42:18",status:"completed",direction:"push",target:"北京站",task:"T-8821",path:"/inc/2026-04-21/delta-0042.surql",size:"482 KB",records:"1 284",err:null},
+  {id:"l2",at:"2026-04-21 10:41:57",status:"failed",direction:"pull",target:"广州站",task:"T-8820",path:"/inc/2026-04-21/delta-0041.surql",size:"-",records:"-",err:"ConnectionError: dial tcp 10.40.6.22:7997: i/o timeout"},
+  {id:"l3",at:"2026-04-21 10:40:13",status:"completed",direction:"push",target:"上海站",task:"T-8819",path:"/inc/2026-04-21/delta-0040.surql",size:"1.2 MB",records:"3 812",err:null},
+  {id:"l4",at:"2026-04-21 10:37:02",status:"failed",direction:"pull",target:"广州站",task:"T-8818",path:"/inc/2026-04-21/delta-0039.surql",size:"-",records:"-",err:"ConnectionError: dial tcp 10.40.6.22:7997: i/o timeout"},
+  {id:"l5",at:"2026-04-21 10:35:44",status:"completed",direction:"pull",target:"北京站",task:"T-8817",path:"/inc/2026-04-21/delta-0038.surql",size:"318 KB",records:"892",err:null},
+  {id:"l6",at:"2026-04-21 10:33:21",status:"running",direction:"push",target:"北京站",task:"T-8822",path:"/inc/2026-04-21/delta-0043.surql",size:"-",records:"-",err:null},
+];
+
+/* ============ 节点坐标（拓扑手工定位，放射状） ============ */
+const NODE_POS = {
+  s1:{x:380,y:195,w:180,h:90},
+  s2:{x:630,y:70, w:170,h:80},
+  s3:{x:650,y:320,w:170,h:80},
+  s4:{x:120,y:320,w:170,h:80},
+};
+
+/* ============ 顶部指挥条 ============ */
+function CmdBar({env,onMenuToggle,menuOpen}){
+  return (
+    <div className="ic-cmdbar">
+      <div className="ic-crumb">
+        <span>异地协同</span>
+        <span className="sep">/</span>
+        <span className="curr">{env.name}</span>
+      </div>
+      <span className={`ic-statuspill ${env.tone}`}>
+        <span className="dot"/>
+        {env.status}
+      </span>
+      <div className="ic-cmdbar-right">
+        <span className="ic-meta-time">最近同步 10:42:18</span>
+        <button className="ic-btn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+          诊断
+        </button>
+        <button className="ic-btn ic-btn-primary">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15A9 9 0 0 1 5.64 18.36L1 14"/></svg>
+          同步
+        </button>
+        <button className="ic-btn ic-btn-more" onClick={onMenuToggle} title="更多">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>
+        </button>
+      </div>
+      {menuOpen && (
+        <div className="ic-menu">
+          <div className="ic-menu-item">刷新</div>
+          <div className="ic-menu-item">应用配置</div>
+          <div className="ic-menu-item">停止运行时</div>
+          <div className="ic-menu-sep"/>
+          <div className="ic-menu-item">编辑协同组</div>
+          <div className="ic-menu-item danger">删除协同组</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============ 左栏 协同组列表 ============ */
+function Sidebar({envs,selectedId,onSelect}){
+  return (
+    <aside className="ic-sidebar">
+      <h2 className="ic-side-title">协同组</h2>
+      <div className="ic-side-search">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#94A3B8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input placeholder="搜索协同组…" />
+      </div>
+      <div className="ic-side-actions">
+        <button className="ic-btn">+ 新建</button>
+        <button className="ic-btn">导入配置</button>
+      </div>
+      <div className="ic-grp-list">
+        {envs.map(env => (
+          <div key={env.id}
+            className={`ic-grp ${selectedId===env.id?'active':''}`}
+            onClick={()=>onSelect(env.id)}>
+            <div className="ic-grp-row1">
+              <span className="ic-grp-name">{env.name}</span>
+              <span className="ic-grp-stamp">{env.location}</span>
+            </div>
+            <div className="ic-grp-loc">{env.mqtt_summary}</div>
+            <div className="ic-grp-row3">
+              <span>站点 {env.site_count}</span>
+              <span className="m">更新 {env.updated}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </aside>
+  );
+}
+
+/* ============ Tab 1: 拓扑 ============ */
+function TopologyTab(){
+  const [selected,setSelected] = useState("s1");
+  const [tf,setTf] = useState("24h");
+  const [dir,setDir] = useState("all");
+  const selSite = MOCK_SITES.find(s => s.id===selected);
+
+  function arrowPath(fromId,toId){
+    const a = NODE_POS[fromId], b = NODE_POS[toId];
+    const ax = a.x + a.w/2, ay = a.y + a.h/2;
+    const bx = b.x + b.w/2, by = b.y + b.h/2;
+    const mx = (ax+bx)/2, my = (ay+by)/2 - 12;
+    return `M ${ax} ${ay} Q ${mx} ${my} ${bx} ${by}`;
+  }
+
+  return (
+    <>
+      <div className="ic-topo-top">
+        <h2>拓扑 · <em>4 节点</em></h2>
+        <div className="ic-topo-ctrl">
+          <span className="ic-segctl">
+            {["1h","24h","7d"].map(v=>(
+              <button key={v} className={tf===v?"on":""} onClick={()=>setTf(v)}>{v}</button>
+            ))}
+          </span>
+          <span className="ic-segctl">
+            {[{v:"all",l:"全部"},{v:"push",l:"push"},{v:"pull",l:"pull"}].map(o=>(
+              <button key={o.v} className={dir===o.v?"on":""} onClick={()=>setDir(o.v)}>{o.l}</button>
+            ))}
+          </span>
+          <button className="ic-btn" style={{height:30,padding:'0 12px',fontSize:12}}>刷新</button>
+        </div>
+      </div>
+
+      <div className="ic-topo-layout">
+        <div className="ic-topo-canvas">
+          <svg className="ic-topo-svg" viewBox="0 0 900 480" preserveAspectRatio="xMidYMid meet">
+            <defs>
+              <marker id="arrow-ok" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="oklch(0.68 0.14 150)"/></marker>
+              <marker id="arrow-warn" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="oklch(0.72 0.16 75)"/></marker>
+              <marker id="arrow-bad" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="oklch(0.62 0.20 25)"/></marker>
+            </defs>
+
+            {/* flows */}
+            {MOCK_FLOWS.filter(f => dir==="all"||f.direction===dir).map((f,i)=>{
+              const a = NODE_POS[f.from], b = NODE_POS[f.to];
+              const mx = ((a.x+a.w/2)+(b.x+b.w/2))/2;
+              const my = ((a.y+a.h/2)+(b.y+b.h/2))/2 - 18;
+              return (
+                <g key={i}>
+                  <path className={`ic-flow ${f.tone}`} d={arrowPath(f.from,f.to)} markerEnd={`url(#arrow-${f.tone})`}/>
+                  <text className="ic-flow-label" x={mx} y={my} textAnchor="middle">{f.label}</text>
+                </g>
+              );
+            })}
+
+            {/* nodes */}
+            {MOCK_SITES.map(s => {
+              const p = NODE_POS[s.id];
+              const tone = s.avail==="online"?"":s.avail==="cached"?"warn":"bad";
+              const isSelf = s.role==="self";
+              const isSel = selected===s.id;
+              const statusDotColor = s.avail==="online"?"var(--ok)":s.avail==="cached"?"var(--warn)":"var(--bad)";
+              return (
+                <g key={s.id}
+                   className={`ic-node ${tone} ${isSelf?'self':''} ${isSel?'selected':''}`}
+                   onClick={()=>setSelected(s.id)}
+                   transform={`translate(${p.x} ${p.y})`}>
+                  <rect className="ic-node-box" width={p.w} height={p.h} rx="12"/>
+                  <circle cx={14} cy={16} r={4} fill={statusDotColor}/>
+                  <text className="ic-node-label" x={p.w/2} y={32}>{s.name}</text>
+                  <text className="ic-node-sub"   x={p.w/2} y={52}>{s.http.replace('http://','')}</text>
+                  <line x1={20} y1={p.h-22} x2={p.w-20} y2={p.h-22} stroke="var(--line)" strokeWidth={1}/>
+                  <text className="ic-node-stamp" x={p.w/2} y={p.h-8}>{s.location}</text>
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+
+        <div className="ic-topo-detail">
+          <h3 className="h">{selSite.name}</h3>
+          <div className="meta">
+            <span className={`ic-statuspill ${selSite.diag.ok?'ok':(selSite.avail==='cached'?'warn':'bad')}`}><span className="dot"/>{selSite.avail_label}</span>
+            <span className={`ic-log-badge ${selSite.role==='self'?'ok':'warn'}`} style={{background:'var(--brand-soft)',color:'var(--brand)'}}>{selSite.role==='self'?'本站 · Master':'Peer'}</span>
+          </div>
+          <dl className="kv">
+            <dt>HTTP</dt><dd>{selSite.http}</dd>
+            <dt>dbnums</dt><dd>{selSite.dbnums}</dd>
+            <dt>文件数</dt><dd>{selSite.files.toLocaleString()}</dd>
+            <dt>记录数</dt><dd>{selSite.records.toLocaleString()}</dd>
+            <dt>备注</dt><dd style={{fontFamily:'var(--font-body)',fontSize:12}}>{selSite.notes}</dd>
+          </dl>
+          <div className="diag">
+            <div>最近诊断 · <strong style={{color: selSite.diag.ok?'var(--ok)':'var(--bad)'}}>{selSite.diag.ok?'成功':'失败'}</strong> · {selSite.diag.at}{selSite.diag.ms&&` · ${selSite.diag.ms}ms`}</div>
+            <div style={{marginTop:4,fontFamily:'var(--font-mono)',fontSize:11,color:selSite.diag.ok?'var(--ink-500)':'var(--bad)'}}>{selSite.diag.msg}</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="ic-topo-legend">
+        <span><i className="ok"/>正常同步</span>
+        <span><i className="warn"/>部分失败</span>
+        <span><i className="bad"/>全部失败</span>
+        <span style={{marginLeft:'auto',color:'var(--ink-400)'}}>数据源 <code>/api/remote-sync/stats/flows</code> + <code>/envs/:id/sites</code></span>
+      </div>
+    </>
+  );
+}
+
+/* ============ Tab 2: 站点 ============ */
+function SiteDrawer({siteId,onClose}){
+  const site = siteId ? MOCK_SITES.find(s => s.id===siteId) : null;
+  const history = siteId ? (MOCK_DIAG_HISTORY[siteId] || []) : [];
+
+  React.useEffect(()=>{
+    if(!siteId) return;
+    const onKey = e => { if(e.key==="Escape") onClose(); };
+    document.addEventListener("keydown", onKey);
+    return ()=>document.removeEventListener("keydown", onKey);
+  },[siteId,onClose]);
+
+  return (
+    <>
+      <div className={`ic-scrim ${siteId?'on':''}`} onClick={onClose}/>
+      <aside className={`ic-drawer ${siteId?'on':''}`}>
+        {site && (
+          <>
+            <div className="ic-drw-hdr">
+              <div className="ti">
+                <h3><em>{site.name}</em></h3>
+                <div className="loc">{site.location} · <code>{site.http}</code></div>
+                <div style={{display:'flex',gap:8,marginTop:10}}>
+                  <span className={`ic-statuspill ${site.diag.ok?'ok':(site.avail==='cached'?'warn':'bad')}`}><span className="dot"/>{site.avail_label}</span>
+                  <span className={`role ${site.role==='self'?'master':''}`} style={{display:'inline-flex',alignItems:'center',padding:'2px 8px',borderRadius:4,fontSize:11,background:site.role==='self'?'var(--brand-soft)':'var(--line-soft)',color:site.role==='self'?'var(--brand)':'var(--ink-700)',fontWeight:500}}>
+                    {site.role==='self'?'本站 · Master':'Peer'}
+                  </span>
+                </div>
+              </div>
+              <button className="ic-drw-close" onClick={onClose} aria-label="关闭">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+            </div>
+
+            <div className="ic-drw-body">
+              <div className="ic-drw-sec">
+                <div className="sh">连接配置</div>
+                <div className="ic-drw-card">
+                  <dl className="ic-drw-kv">
+                    <dt>HTTP</dt><dd className="mono">{site.http}</dd>
+                    <dt>dbnums</dt><dd className="mono">{site.dbnums}</dd>
+                    <dt>区域</dt><dd>{site.location}</dd>
+                    <dt>备注</dt><dd>{site.notes}</dd>
+                  </dl>
+                </div>
+              </div>
+
+              <div className="ic-drw-sec">
+                <div className="sh">元数据状态</div>
+                <div className="ic-drw-meta-grid">
+                  <div className="m"><div className="lb">文件数</div><div className="vl">{site.files.toLocaleString()}</div></div>
+                  <div className="m"><div className="lb">总记录数</div><div className="vl">{site.records.toLocaleString()}</div></div>
+                  <div className="m"><div className="lb">最近更新</div><div className="vl" style={{fontSize:16}}>{site.latest_at}</div></div>
+                </div>
+                <div style={{marginTop:10,fontSize:12,color:'var(--ink-500)'}}>
+                  元数据来源：<strong style={{color:'var(--ink-900)',fontWeight:500}}>{site.meta_source}</strong>
+                </div>
+              </div>
+
+              <div className="ic-drw-sec">
+                <div className="sh">诊断历史 · 最近 3 次</div>
+                <div className="ic-drw-diags">
+                  {history.map((h,i)=>(
+                    <div key={i} className="ic-drw-diag">
+                      <span className="t">{h.at}</span>
+                      <span className="m"><span className={`ic-log-badge ${h.ok?'ok':'bad'}`} style={{marginRight:8}}>{h.ok?'ok':'fail'}</span>{h.msg}</span>
+                      <span className="ms">{h.ms!=null?`${h.ms}ms`:'—'}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="ic-drw-sec">
+                <div className="sh">危险操作</div>
+                <div className="ic-drw-card" style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:14}}>
+                  <div>
+                    <div style={{fontWeight:500}}>从协同组删除此站点</div>
+                    <div style={{color:'var(--ink-500)',fontSize:12,marginTop:3}}>删除后不会影响远端站点数据，只会解除协同关系。</div>
+                  </div>
+                  <button className="ic-btn" style={{color:'var(--bad)',borderColor:'var(--bad)'}}>删除</button>
+                </div>
+              </div>
+            </div>
+
+            <div className="ic-drw-foot">
+              <button className="ic-btn">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                立即诊断
+              </button>
+              <div className="sp"/>
+              <button className="ic-btn" onClick={onClose}>关闭</button>
+              <button className="ic-btn ic-btn-primary">保存修改</button>
+            </div>
+          </>
+        )}
+      </aside>
+    </>
+  );
+}
+
+function SitesTab(){
+  const [openSite,setOpenSite] = useState(()=>{
+    const sub = getInitialSub();
+    return MOCK_SITES.some(s=>s.id===sub) ? sub : null;
+  });
+  return (
+    <>
+      <div className="ic-topo-top">
+        <h2>站点 · <em>{MOCK_SITES.length} 个</em></h2>
+        <div className="ic-topo-ctrl">
+          <button className="ic-btn" style={{height:30,padding:'0 12px',fontSize:12}}>+ 新增站点</button>
+          <button className="ic-btn" style={{height:30,padding:'0 12px',fontSize:12}}>批量诊断</button>
+        </div>
+      </div>
+      <table className="ic-tbl">
+        <thead><tr>
+          <th style={{width:'26%'}}>站点</th><th>角色</th><th>健康度</th><th>最近同步</th><th>HTTP</th><th style={{textAlign:'right'}}>操作</th>
+        </tr></thead>
+        <tbody>
+          {MOCK_SITES.map(s => (
+            <tr key={s.id} className={openSite===s.id?'active':''} onClick={()=>setOpenSite(s.id)}>
+              <td>
+                <div style={{fontWeight:500}}>{s.name}</div>
+                <div style={{color:'var(--ink-500)',fontSize:11.5,marginTop:2}}>{s.location} · dbnums <span className="mono">{s.dbnums}</span></div>
+              </td>
+              <td><span className={`role ${s.role==='self'?'master':''}`}>{s.role==='self'?'本站':'Peer'}</span></td>
+              <td><span className={`ic-statuspill ${s.diag.ok?'ok':(s.avail==='cached'?'warn':'bad')}`}><span className="dot"/>{s.avail_label}</span></td>
+              <td>
+                <div className="mono">{s.diag.at}</div>
+                <div style={{color:'var(--ink-500)',fontSize:11.5,marginTop:2}}>{s.diag.ok?`HTTP 200 · ${s.diag.ms}ms`:(s.diag.msg.slice(0,28)+'…')}</div>
+              </td>
+              <td className="mono">{s.http}</td>
+              <td>
+                <div className="ic-row-act" onClick={e=>e.stopPropagation()}>
+                  <button className="ic-btn">测试</button>
+                  <button className="ic-btn" onClick={()=>setOpenSite(s.id)}>编辑</button>
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div style={{marginTop:14,color:'var(--ink-500)',fontSize:12}}>点击行 / 编辑 → 右侧抽屉打开，可查看连接、元数据、诊断历史；按 ESC 或点遮罩关闭。</div>
+
+      <SiteDrawer siteId={openSite} onClose={()=>setOpenSite(null)}/>
+    </>
+  );
+}
+
+/* ============ Tab 3: 洞察 ============ */
+function InsightsTab(){
+  const max = Math.max(...MOCK_TREND.map(d => d.s+d.f));
+  return (
+    <>
+      <div className="ic-topo-top"><h2>洞察 · <em>近 14 天</em></h2></div>
+
+      <div className="ic-kpis">
+        <div className="ic-kpi v-ok"><div className="k">7 天同步量</div><div className="v">746</div><div className="d">14 天累计 1 408 · ↑ 6.8%</div></div>
+        <div className="ic-kpi v-ok"><div className="k">成功率</div><div className="v">94.6%</div><div className="d">成功 1 332 · 失败 76</div></div>
+        <div className="ic-kpi"><div className="k">总记录 / 流量</div><div className="v">4.32m</div><div className="d">累计 18.7 GB</div></div>
+        <div className="ic-kpi v-bad"><div className="k">告警</div><div className="v">3</div><div className="d">广州站连续 22 次失败</div></div>
+      </div>
+
+      <div className="ic-insight-row">
+        <div className="ic-chart">
+          <div className="ic-chart-title">每日成功 (oklch green) / 失败 (oklch rose) 堆叠</div>
+          <div className="ic-chart-stage">
+            {MOCK_TREND.map(d => (
+              <div key={d.d} className="bar" style={{height:'100%'}}>
+                <div className="f" style={{height:`${(d.f/max)*100}%`}} title={`失败 ${d.f}`}/>
+                <div className="s" style={{height:`${(d.s/max)*100}%`}} title={`成功 ${d.s}`}/>
+              </div>
+            ))}
+          </div>
+          <div className="ic-chart-axis">
+            {MOCK_TREND.map(d => <span key={d.d}>{d.d.slice(3)}</span>)}
+          </div>
+        </div>
+        <div className="ic-ins-list">
+          <div className="h">失败流向 Top 3<span style={{color:'var(--bad)'}}>共 3</span></div>
+          <ul>
+            <li>
+              <div className="ttl"><b>广州站 · pull</b> <span className="pill">22 fail</span></div>
+              <div className="sub">file server 异常 · 累计 22/22</div>
+            </li>
+            <li>
+              <div className="ttl"><b>上海站 · push</b> <span className="pill">6 fail</span></div>
+              <div className="sub">部分文件 404 · 元数据不一致</div>
+            </li>
+            <li>
+              <div className="ttl"><b>北京站 · pull</b> <span className="pill">2 fail</span></div>
+              <div className="sub">偶发 timeout · 可忽略</div>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/* ============ Tab 4: 日志 ============ */
+function LogsTab(){
+  const [q,setQ] = useState("");
+  const [status,setStatus] = useState("all");
+  const filtered = useMemo(() => MOCK_LOGS.filter(l =>
+    (status==="all"||l.status===status) &&
+    (!q||(l.target+l.path+l.task+(l.err||'')).toLowerCase().includes(q.toLowerCase()))
+  ),[q,status]);
+
+  return (
+    <>
+      <div className="ic-topo-top"><h2>日志 · <em>{filtered.length}/{MOCK_LOGS.length}</em></h2>
+        <div className="ic-topo-ctrl"><span style={{fontSize:12,color:'var(--ink-400)'}}>筛选条件已同步到 URL · ?status=&q=</span></div>
+      </div>
+
+      <div className="ic-log-filters">
+        <select value={status} onChange={e=>setStatus(e.target.value)}>
+          <option value="all">所有状态</option>
+          <option value="completed">completed</option>
+          <option value="failed">failed</option>
+          <option value="running">running</option>
+        </select>
+        <select><option>所有方向</option><option>push</option><option>pull</option></select>
+        <select><option>所有目标站点</option><option>北京站</option><option>上海站</option><option>广州站</option></select>
+        <input placeholder="关键词 (task / path / target / error)" value={q} onChange={e=>setQ(e.target.value)}/>
+        <button className="ic-btn">导出 CSV</button>
+      </div>
+
+      <table className="ic-tbl">
+        <thead><tr>
+          <th style={{width:155}}>时间</th><th style={{width:90}}>状态</th><th style={{width:76}}>方向</th><th>目标 · 路径</th><th style={{width:82}}>记录</th><th style={{width:80}}>大小</th>
+        </tr></thead>
+        <tbody>
+          {filtered.map(l=>(
+            <tr key={l.id}>
+              <td className="mono">{l.at}</td>
+              <td><span className={`ic-log-badge ${l.status==='completed'?'ok':l.status==='failed'?'bad':'warn'}`}>{l.status}</span></td>
+              <td className="mono">{l.direction}</td>
+              <td>
+                <div><b style={{fontWeight:500}}>{l.target}</b> · <span style={{color:'var(--ink-500)',fontSize:12}}>task {l.task}</span></div>
+                <div className="mono" style={{fontSize:11,color:'var(--ink-500)',marginTop:2}}>{l.path}</div>
+                {l.err && <div className="ic-log-err">{l.err}</div>}
+              </td>
+              <td className="mono">{l.records}</td>
+              <td className="mono">{l.size}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <div className="ic-log-pager">
+        <span>显示 1 – {filtered.length} · 总 {MOCK_LOGS.length} 条</span>
+        <div className="pg">
+          <button className="ic-btn" disabled style={{opacity:.5}}>‹ 上一页</button>
+          <button className="ic-btn">下一页 ›</button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/* ============ App 壳 ============ */
+const VALID_TABS = ["topo","sites","insight","logs"];
+function parseHash(){
+  const raw = (typeof location!=="undefined" && location.hash || "").replace(/^#/,"");
+  const [t, sub] = raw.split(":");
+  return { tab: VALID_TABS.includes(t) ? t : "topo", sub: sub || null };
+}
+function getInitialTab(){ return parseHash().tab; }
+function getInitialSub(){ return parseHash().sub; }
+
+function App(){
+  const [selectedEnv,setSelectedEnv] = useState("env1");
+  const [tab,setTab] = useState(getInitialTab);
+  const [menuOpen,setMenuOpen] = useState(false);
+  React.useEffect(()=>{
+    const onHash = () => setTab(getInitialTab());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  },[]);
+  function pickTab(k){ setTab(k); location.hash = k; }
+  const env = MOCK_ENVS.find(e=>e.id===selectedEnv);
+  const TABS = [
+    {k:"topo",label:"拓扑",cnt:MOCK_SITES.length},
+    {k:"sites",label:"站点",cnt:MOCK_SITES.length},
+    {k:"insight",label:"洞察"},
+    {k:"logs",label:"日志",cnt:MOCK_LOGS.length},
+  ];
+  return (
+    <>
+      <CmdBar env={env} menuOpen={menuOpen} onMenuToggle={()=>setMenuOpen(v=>!v)} />
+      <div className="ic-shell">
+        <Sidebar envs={MOCK_ENVS} selectedId={selectedEnv} onSelect={id=>{setSelectedEnv(id);setMenuOpen(false)}} />
+        <main className="ic-main" onClick={()=>menuOpen&&setMenuOpen(false)}>
+
+          {/* Hero */}
+          <section className="ic-hero">
+            <div>
+              <h1><em>{env.name}</em></h1>
+              <p>多站点 PDMS 增量数据跨地同步 · 以拓扑视角审视 <em style={{fontStyle:'normal',color:'var(--brand)'}}>谁在同谁</em> 和异常集中区。</p>
+            </div>
+            <div className="ic-hero-meta">
+              <span>运行 <strong>38h 12m</strong></span>
+              <span>文件服务 <strong>http://10.20.5.11:8443</strong></span>
+              <span>区域 DB <strong>7997 · 8001</strong></span>
+            </div>
+          </section>
+
+          {/* Tabs */}
+          <div className="ic-tabs">
+            {TABS.map(t=>(
+              <button key={t.k} className={`ic-tab ${tab===t.k?'active':''}`} onClick={()=>pickTab(t.k)}>
+                {t.label}{t.cnt!=null && <span className="cnt">{t.cnt}</span>}
+              </button>
+            ))}
+          </div>
+
+          <div className="ic-panel">
+            {tab==="topo"    && <TopologyTab/>}
+            {tab==="sites"   && <SitesTab/>}
+            {tab==="insight" && <InsightsTab/>}
+            {tab==="logs"    && <LogsTab/>}
+          </div>
+
+        </main>
+      </div>
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("app")).render(<App/>);
+</script>
+</body>
+</html>

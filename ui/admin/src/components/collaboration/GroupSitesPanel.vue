@@ -1,14 +1,42 @@
 <script setup lang="ts">
-import { Activity, PenLine, Plus, Trash2 } from 'lucide-vue-next'
+import { computed, ref } from 'vue'
+import { Activity, ArrowUpDown, PenLine, Plus, Trash2 } from 'lucide-vue-next'
 import { formatDateTime } from '@/lib/collaboration'
 import type { CollaborationSiteAvailability, CollaborationSiteCard, CollaborationTone } from '@/types/collaboration'
 
-defineProps<{
+type SortKey = 'name' | 'availability' | 'role' | 'fileCount' | null
+
+const props = defineProps<{
   items: CollaborationSiteCard[]
   loading: boolean
   error: string
   actionDisabled?: boolean
 }>()
+
+const sortKey = ref<SortKey>(null)
+const sortDir = ref<'asc' | 'desc'>('asc')
+
+function toggleSort(key: SortKey) {
+  if (sortKey.value === key) {
+    sortDir.value = sortDir.value === 'asc' ? 'desc' : 'asc'
+  } else {
+    sortKey.value = key
+    sortDir.value = 'asc'
+  }
+}
+
+const sortedItems = computed(() => {
+  if (!sortKey.value) return props.items
+  const k = sortKey.value
+  const m = sortDir.value === 'asc' ? 1 : -1
+  return [...props.items].sort((a, b) => {
+    if (k === 'name') return m * (a.name || '').localeCompare(b.name || '')
+    if (k === 'availability') return m * (a.availability || '').localeCompare(b.availability || '')
+    if (k === 'role') return m * (a.roleLabel || '').localeCompare(b.roleLabel || '')
+    if (k === 'fileCount') return m * ((a.fileCount || 0) - (b.fileCount || 0))
+    return 0
+  })
+})
 
 const emit = defineEmits<{
   create: []
@@ -60,6 +88,18 @@ function diagnosticClass(tone: CollaborationTone) {
           新增站点
         </button>
       </div>
+      <div class="mt-3 flex flex-wrap gap-1.5">
+        <button
+          v-for="opt in ([['name','名称'],['availability','健康度'],['role','角色'],['fileCount','文件数']] as const)"
+          :key="opt[0]"
+          class="inline-flex h-7 items-center gap-1 rounded-md border border-input bg-background px-2 text-xs transition-colors hover:bg-accent"
+          :class="sortKey === opt[0] ? 'border-primary text-primary' : 'text-muted-foreground'"
+          @click="toggleSort(opt[0])"
+        >
+          {{ opt[1] }}
+          <span v-if="sortKey === opt[0]" class="text-[10px]">{{ sortDir === 'asc' ? '↑' : '↓' }}</span>
+        </button>
+      </div>
     </div>
 
     <div class="p-5">
@@ -87,7 +127,7 @@ function diagnosticClass(tone: CollaborationTone) {
 
       <div v-else class="grid gap-4 md:grid-cols-2">
         <article
-          v-for="item in items"
+          v-for="item in sortedItems"
           :key="item.id"
           class="rounded-xl border border-border bg-background p-4"
         >

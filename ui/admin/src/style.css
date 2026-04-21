@@ -35,6 +35,55 @@
     --sidebar-accent-foreground: 240 5.9% 10%;
     --sidebar-border: 220 13% 91%;
     --sidebar-ring: 217.2 91.2% 59.8%;
+
+    /* ──────────────────────────────────────────────────────────────
+       Collaboration v2 design tokens (opt-in via .collab-v2 wrapper)
+       Source: design/collaboration-v2/README.md
+       Do not use outside 异地协同 module until promoted.
+       ────────────────────────────────────────────────────────────── */
+    --collab-bg:         #FAFAF7;
+    --collab-ink-900:    #0F172A;
+    --collab-ink-700:    #334155;
+    --collab-ink-500:    #64748B;
+    --collab-ink-400:    #94A3B8;
+    --collab-ink-300:    #CBD5E1;
+    --collab-line:       #E6E4DE;
+    --collab-line-soft:  #EFEDE7;
+    --collab-brand:      #1F3A68;
+    --collab-brand-strong: #152846;
+    --collab-brand-soft: #E8EDF3;
+    --collab-ok:    oklch(0.68 0.14 150);
+    --collab-ok-bg: oklch(0.96 0.04 150);
+    --collab-warn:    oklch(0.72 0.16 75);
+    --collab-warn-bg: oklch(0.96 0.05 80);
+    --collab-bad:    oklch(0.62 0.20 25);
+    --collab-bad-bg: oklch(0.96 0.04 25);
+    --collab-radius: 10px;
+    --collab-font-display: "EB Garamond","Noto Serif SC","Source Serif Pro",serif;
+    --collab-font-body: -apple-system,"Segoe UI","PingFang SC",system-ui,sans-serif;
+    --collab-font-mono: "JetBrains Mono",ui-monospace,Menlo,monospace;
+  }
+
+  /* Collaboration v2 · 暗色主题覆盖 (工业感，不是 GitHub dark slop) */
+  .dark,
+  [data-theme="dark"] {
+    --collab-bg:         #0D1117;
+    --collab-ink-900:    #E6EDF3;
+    --collab-ink-700:    #B1BAC4;
+    --collab-ink-500:    #7D8590;
+    --collab-ink-400:    #656D76;
+    --collab-ink-300:    #3D444D;
+    --collab-line:       #30363D;
+    --collab-line-soft:  #21262D;
+    --collab-brand:      #7AA2E3;
+    --collab-brand-strong: #A9C4F2;
+    --collab-brand-soft: #1B2A46;
+    --collab-ok:    oklch(0.78 0.16 150);
+    --collab-ok-bg: oklch(0.24 0.06 150);
+    --collab-warn:    oklch(0.82 0.17 75);
+    --collab-warn-bg: oklch(0.28 0.08 75);
+    --collab-bad:    oklch(0.72 0.22 25);
+    --collab-bad-bg: oklch(0.26 0.09 25);
   }
 
   .dark {

@@ -4,6 +4,25 @@
 
 ### Added
 
+- `design/collaboration-v2/index.html` **Hi-Fi 原型 5 轮 24 项 UI 完善**（1267→1866 行 +47%）：
+  - R1: 左栏搜索过滤、拓扑诊断历史/关联任务、洞察图表 tooltip、Pending/Running 区分、空状态 UI、Tab fadeIn 动画、表格行指示条
+  - R2: SVG 流向动画粒子（ok/warn 沿路径运动）、实时模拟引擎（3s 进度自增+完成 toast）、配置保存 Toast+删除确认弹窗、响应式 3 级断点+hamburger、日志关键词高亮
+  - R3: 站点表格 5 列排序、KPI sparkline 趋势线、日志行展开详情+CSV Blob 导出、拓扑全屏模式+节点 hover tooltip、新增站点 Modal 表单、focus-visible 无障碍
+  - R4: Toast 5s 自动消失+进度条+hover 暂停、协同组切换 Hero 数据联动、拓扑节点拖拽重定位+重置、SVG ProgressRing 进度环组件
+  - R5: usePersist localStorage 偏好持久化、?键快捷键面板（1-4/D/N）、节点 dimmed 聚焦效果、bad 流向脉冲闪烁动画
+  - 5 份开发计划文档（UI_POLISH_PLAN R1–R5.md）
+
+- `/admin/#/collaboration` **异地协同 v2 UI 里程碑 M1** 上线：
+  - 4-Tab 壳（拓扑 / 站点 / 洞察 / 日志），URL hash 同步 `#topo` `#sites` `#insight` `#logs`
+  - 新增 `CollaborationTopologyPanel.vue`：放射状拓扑可视化，节点内嵌 5 态 chip（Idle/Scanning/ChangesDetected/Syncing/Completed/Error），支持 `siteCode` 角标与 `progress` bar
+  - 新增 `CollaborationActiveTasks.vue`：日志 Tab 顶部「进行中任务」条，含进度条与 `Running` / `Pending` chip
+  - 新增 `CollaborationFailedTasks.vue`：洞察 Tab 底部「失败任务队列」，含 `retry_count/max_retries` 与重试 / 清理已耗尽操作
+  - 新增 `CollaborationConfigDrawer.vue`：右侧参数配置抽屉，4 分组 · 9 项（自动化 / 吞吐并发 / 连接重连 / 通知日志）
+  - 指挥条新增 `ONLINE / 轮询模式` 实时连接徽标（由 `useCollaborationStore.realtimeConnected` 驱动；Phase 9 接入 SSE 后生效）
+  - `types/collaboration.ts` 追加 `CollaborationDetectionStatus` / `CollaborationActiveTask` / `CollaborationFailedTask` / `CollaborationConfig` / `CollaborationToast` / `CollaborationStreamEvent` 6 个类型；`CollaborationSiteCard` 可选追加 `siteCode` / `detectionStatus` / `progress` / `pendingItems` / `syncedItems`
+  - `stores/collaboration.ts` 追加 `activeTasks` / `failedTasks` / `realtimeConnected` / `collabConfig` / `toasts` 等 state，`pushToast` / `dismissToast` / `fetchActiveTasks` / `fetchFailedTasks` / `retryFailedTask` / `cleanupExhaustedFailedTasks` / `fetchCollabConfig` / `saveCollabConfig` 8 个 action（Phase 9 后端就绪后填充实现）
+  - `style.css` 追加 `--collab-*` design token 命名空间（含 `[data-theme="dark"]` 暗色覆盖），工业感配色避开紫渐变 AI slop
+  - 设计产出归档在 `design/collaboration-v2/`（原型 HTML · README · GAP_ANALYSIS · DEVELOPMENT_PLAN · ROADMAP · 7 张 Playwright 截图）
 - 新增 `docs/plans/2026-04-19-admin-站点部署整改计划.md`：对 admin 站点部署功能进行全链路审核（后端编排、前端状态机、安全默认值、Viewer 联动），输出 5 阶段整改计划（P0 安全收口 / P0 状态机加固 / P1 部署解耦 / P1 Viewer URL / P1 可观测性）、9 项回归矩阵及长期演进路线。
 - 新增 `scripts/test-admin-deployment.ps1`：Admin 站点端到端部署回归脚本，覆盖登录 / 建站 / 解析 / 启动 / 健康检查 / 停站 / 清理 9 个步骤，默认针对 `AvevaPlantSample + aps7011_0001` 场景，支持 `-SkipCleanup` 与 `ADMIN_USER/ADMIN_PASS` 环境变量。
 - 新增 `.memory/.gitkeep` 与 `.memory/2026-04-17.md`：沉淀 E3D 3.1 F&M state 补丁、PML modLoadMethod、jmp-self / spawn+suspend 等逆向调试日志，便于跨会话衔接。

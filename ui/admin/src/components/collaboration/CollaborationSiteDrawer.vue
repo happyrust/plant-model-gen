@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { X } from 'lucide-vue-next'
 import type { CollaborationSite, CreateCollaborationSiteRequest } from '@/types/collaboration'
 
@@ -16,6 +16,12 @@ const emit = defineEmits<{
 
 const saving = ref(false)
 const error = ref('')
+
+function onEscape(e: KeyboardEvent) {
+  if (e.key === 'Escape' && props.open && !saving.value) emit('close')
+}
+onMounted(() => document.addEventListener('keydown', onEscape))
+onUnmounted(() => document.removeEventListener('keydown', onEscape))
 
 const form = ref({
   name: '',

@@ -42,6 +42,13 @@ GITHUB_RUN_ID="${GITHUB_RUN_ID:-}"
 GITHUB_TAG="${GITHUB_TAG:-}"
 ARTIFACT_NAME="${ARTIFACT_NAME:-linux-x64-release}"
 
+# plant-collab-monitor 独立前端（异地协同专业监控台）
+# 默认和后端仓库同级目录下的 plant-collab-monitor；可用 COLLAB_MONITOR_DIR 覆盖
+# 若不需要同步部署可设置 SKIP_COLLAB_MONITOR=true
+COLLAB_MONITOR_DIR="${COLLAB_MONITOR_DIR:-$BACKEND_PROJECT_DIR/../plant-collab-monitor}"
+COLLAB_MONITOR_REMOTE_PATH="${COLLAB_MONITOR_REMOTE_PATH:-/var/www/plant-collab-monitor}"
+SKIP_COLLAB_MONITOR="${SKIP_COLLAB_MONITOR:-false}"
+
 BACKEND_SCRIPT="$SCRIPT_DIR/deploy_web_server_bundle.sh"
 FRONTEND_SCRIPT="$FRONTEND_PROJECT_DIR/deploy/deploy_frontend_bundle.sh"
 
@@ -108,6 +115,37 @@ REMOTE_HOST="$REMOTE_HOST" \
 log "Deploying frontend"
 REMOTE_HOST="$REMOTE_HOST" REMOTE_USER="$REMOTE_USER" REMOTE_PASS="$REMOTE_PASS" BACKEND_ORIGIN="$BACKEND_ORIGIN" \
   "$FRONTEND_SCRIPT"
+
+# ── 部署 plant-collab-monitor（异地协同专业监控台）──────────────────────────────
+# 产出 dist/ 后用 rsync 同步到远程 /var/www/plant-collab-monitor/。
+# Nginx 反代示例见 shells/deploy/nginx-plant-collab-monitor.conf.example。
+if [[ "$SKIP_COLLAB_MONITOR" != "true" ]]; then
+  if [[ -d "$COLLAB_MONITOR_DIR" && -f "$COLLAB_MONITOR_DIR/package.json" ]]; then
+    log "Building plant-collab-monitor at $COLLAB_MONITOR_DIR"
+    (
+      cd "$COLLAB_MONITOR_DIR"
+      if [[ -f package-lock.json ]]; then
+        npm ci --no-audit --no-fund
+      else
+        npm install --no-audit --no-fund
+      fi
+      npm run build
+    )
+
+    log "Syncing plant-collab-monitor dist to $REMOTE_HOST:$COLLAB_MONITOR_REMOTE_PATH"
+    sshpass -p "$REMOTE_PASS" ssh "${SSH_OPTS[@]}" "$REMOTE_USER@$REMOTE_HOST" \
+      "mkdir -p '$COLLAB_MONITOR_REMOTE_PATH'"
+    sshpass -p "$REMOTE_PASS" rsync -az --delete \
+      -e "ssh ${SSH_OPTS[*]}" \
+      "$COLLAB_MONITOR_DIR/dist/" \
+      "$REMOTE_USER@$REMOTE_HOST:$COLLAB_MONITOR_REMOTE_PATH/"
+    log "plant-collab-monitor synced"
+  else
+    log "⚠️  COLLAB_MONITOR_DIR ($COLLAB_MONITOR_DIR) not found, skipping plant-collab-monitor"
+  fi
+else
+  log "SKIP_COLLAB_MONITOR=true, skipping plant-collab-monitor build & deploy"
+fi
 
 log "Verifying remote health"
 run_ssh_with_retry() {

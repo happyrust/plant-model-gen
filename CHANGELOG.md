@@ -4,6 +4,30 @@
 
 ### Added
 
+- **异地协同前端独立 + API 汇总（2026-04-22 · feat/collab-api-consolidation 分支）**：把 `D:\work\plant-code\web-server` 的异地协同专业监控 UI 剥离为独立仓库 `D:\work\plant-code\plant-collab-monitor`（Vue 3.5 + Vite 5.4 + Naive UI 2.40 + Tailwind 3.4），后端 API 汇入 plant-model-gen 作为单一源。
+  - Phase 1 代码层（7 commit）：
+    - `site_config_handlers.rs` 完全迁入（7 路由，路径 env 化）
+    - `mqtt_monitor_handlers.rs` 完全迁入（5 基础路由）
+    - `sync_control_handlers` 追加 MQTT 订阅/主从控制 7 简化 stub 端点（Phase 1.3a）
+    - `remote_sync_handlers`（101KB）与 `sync_control_center` 保留 plant 版为主，web-server 独有 handler 通过子 phase 按需补齐
+    - `deployment_sites.sqlite` schema 对齐：`src/web_server/collab_migrations.rs::ensure_collab_schema` 幂等追加 `remote_sync_sites.master_mqtt_host/port/location` 3 列 + 新建 `node_config` 表
+    - `fix(mbd)`: 给 `mbd_pipe_api::compute_branch_layout_result` 与唯一 caller 加 `#[cfg(feature = "mbd-iso")]` gate，解除 `cargo run --features web_server` 被 rs-core 未完工 `iso_extras/iso_params/SolveBranchInput` 阻塞的问题（未开启时 `layout_result` 降级为 None）
+  - Phase 2 新前端仓库 plant-collab-monitor（5 commit）：
+    - vite 脚手架 + TypeScript strict + Pinia + vue-router 11 路由 + Naive UI 主题
+    - axios 类型化 API 层（`syncApi`/`remoteSyncApi`/`mqttApi`/`siteConfigApi`）
+    - 完整移植 web-server/frontend 的 7 核心组件 + 2 charts + 5 composables + 11 视图
+    - `vite.config.ts` proxy `/api /ws /files /static → VITE_API_TARGET`（默认 `http://127.0.0.1:3100`）
+    - `vue-tsc -b` 0 error；`vite build` 7.61s 成功（408 KB gzipped）
+  - Phase 3 端到端冒烟：8 关键 endpoint 6 个直接 200，2 个 `/api/remote-sync/*` 返回 503 属 admin 鉴权保护（deny by design，不是 bug）
+  - Phase 4 文档与部署：
+    - `docs/architecture/异地协同API汇总清单.md`：81 个端点按 6 大功能域分组，每条标注状态（NEW/merge/stub/plant）
+    - `shells/deploy/nginx-plant-collab-monitor.conf.example`：Nginx 反代示例（`/monitor/` SPA + `/api/` proxy + `/ws/` upgrade + SSE 友好）
+    - `shells/deploy/deploy_all_with_frontend.sh` 追加 `plant-collab-monitor` 构建 + rsync 步骤（可用 `SKIP_COLLAB_MONITOR=true` 跳过）
+    - `plant-collab-monitor/README.md` 完整定位/技术栈/环境变量/结构/部署/限制
+    - `web-server/MIGRATION_NOTICE.md` 向旧仓库用户说明迁移路径
+  - 4 张规划 diagram（`design/collab-consolidation/`）：架构总览 · API 迁移 swimlane · 同步时序 · Roadmap 甘特
+  - 计划/执行清单：`docs/plans/2026-04-22-异地协同前端独立与API汇总计划.md`、`2026-04-22-phase-1-execution-checklist.md`、`2026-04-22-phase-3-phase-4-execution-checklist.md`、`2026-04-22-m1-smoke-test-result.md`
+
 - `design/collaboration-v2/index.html` **Hi-Fi 原型 5 轮 24 项 UI 完善**（1267→1866 行 +47%）：
   - R1: 左栏搜索过滤、拓扑诊断历史/关联任务、洞察图表 tooltip、Pending/Running 区分、空状态 UI、Tab fadeIn 动画、表格行指示条
   - R2: SVG 流向动画粒子（ok/warn 沿路径运动）、实时模拟引擎（3s 进度自增+完成 toast）、配置保存 Toast+删除确认弹窗、响应式 3 级断点+hamburger、日志关键词高亮

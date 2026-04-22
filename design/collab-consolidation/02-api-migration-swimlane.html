@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>异地协同 · API 迁移泳道图</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#faf7f2;--paper-2:#f5f1e9;--ink:#1c1917;--muted:#52534e;
+    --soft:#94928c;--rule:rgba(28,25,23,0.12);
+    --accent:#b5523a;--accent-tint:rgba(181,82,58,0.10);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:48px 32px 64px;background:var(--paper);color:var(--ink);
+    font-family:'Geist','PingFang SC',sans-serif;font-size:14px;line-height:1.55}
+  .wrap{max-width:1160px;margin:0 auto}
+  .eyebrow{font-family:'Geist Mono',monospace;font-size:10px;letter-spacing:0.24em;
+    text-transform:uppercase;color:var(--muted);margin:0 0 12px}
+  h1{font-family:'Instrument Serif',serif;font-weight:400;font-size:40px;
+    line-height:1.1;margin:0 0 8px;letter-spacing:-0.01em}
+  .sub{color:var(--muted);margin:0 0 36px;max-width:720px}
+  .diagram{background:var(--paper-2);border:1px solid var(--rule);border-radius:8px;
+    padding:24px;overflow-x:auto}
+  .diagram svg{display:block;margin:0 auto}
+  .footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--rule);
+    color:var(--soft);font-family:'Geist Mono',monospace;font-size:10px;letter-spacing:0.08em}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="eyebrow">Collaboration · API Migration · Swimlane</p>
+  <h1>14 个 Rust 文件 · 三种迁移方式</h1>
+  <p class="sub">按 <code>plant-model-gen</code> 现状把 <code>web-server</code> 的异地协同源码分为三类：<strong>NEW</strong>（全新加入）、<strong>MERGE</strong>（双向合并）、<strong>ALIGN</strong>（对齐补齐）。文件大小以 web-server 侧为基准。</p>
+
+  <div class="diagram">
+<svg viewBox="0 0 1120 720" width="1120" height="720" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(28,25,23,0.07)"/>
+    </pattern>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#52534e"/>
+    </marker>
+    <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#b5523a"/>
+    </marker>
+  </defs>
+
+  <rect width="100%" height="100%" fill="#f5f1e9"/>
+  <rect width="100%" height="100%" fill="url(#dots)" opacity="0.5"/>
+
+  <!-- Source column indicator -->
+  <text x="140" y="40" fill="#52534e" font-family="'Geist Mono',monospace" font-size="10" letter-spacing="0.18em" text-anchor="middle">FROM · web-server</text>
+  <text x="980" y="40" fill="#52534e" font-family="'Geist Mono',monospace" font-size="10" letter-spacing="0.18em" text-anchor="middle">TO · plant-model-gen</text>
+
+  <line x1="32" y1="52" x2="1088" y2="52" stroke="rgba(28,25,23,0.10)" stroke-width="0.8"/>
+
+  <!-- Lane backgrounds -->
+  <!-- NEW lane -->
+  <rect x="32" y="80" width="1056" height="168" rx="6" fill="rgba(181,82,58,0.05)" stroke="rgba(181,82,58,0.35)" stroke-width="1" stroke-dasharray="4,3"/>
+  <!-- MERGE lane -->
+  <rect x="32" y="268" width="1056" height="224" rx="6" fill="rgba(28,25,23,0.03)" stroke="rgba(28,25,23,0.25)" stroke-width="1"/>
+  <!-- ALIGN lane -->
+  <rect x="32" y="512" width="1056" height="120" rx="6" fill="rgba(28,25,23,0.02)" stroke="rgba(28,25,23,0.20)" stroke-width="1"/>
+
+  <!-- Lane labels -->
+  <rect x="48" y="92" width="64" height="16" rx="2" fill="transparent" stroke="rgba(181,82,58,0.65)" stroke-width="0.8"/>
+  <text x="80" y="104" fill="#b5523a" font-family="'Geist Mono',monospace" font-size="8" letter-spacing="0.14em" text-anchor="middle">NEW</text>
+  <text x="120" y="104" fill="rgba(181,82,58,0.85)" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.10em">plant-model-gen 缺失，全新复制</text>
+
+  <rect x="48" y="280" width="64" height="16" rx="2" fill="transparent" stroke="rgba(82,83,78,0.65)" stroke-width="0.8"/>
+  <text x="80" y="292" fill="#52534e" font-family="'Geist Mono',monospace" font-size="8" letter-spacing="0.14em" text-anchor="middle">MERGE</text>
+  <text x="120" y="292" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.10em">双侧都有，diff 后合并 handler</text>
+
+  <rect x="48" y="524" width="64" height="16" rx="2" fill="transparent" stroke="rgba(82,83,78,0.50)" stroke-width="0.8"/>
+  <text x="80" y="536" fill="rgba(82,83,78,0.85)" font-family="'Geist Mono',monospace" font-size="8" letter-spacing="0.14em" text-anchor="middle">ALIGN</text>
+  <text x="120" y="536" fill="rgba(82,83,78,0.85)" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.10em">plant 已有或更大，补齐关键函数</text>
+
+  <!-- ============ NEW LANE ITEMS (2 files) ============ -->
+  <!-- site_config_handlers.rs -->
+  <rect x="180" y="130" width="220" height="72" rx="6" fill="#f5f1e9"/>
+  <rect x="180" y="130" width="220" height="72" rx="6" fill="rgba(181,82,58,0.10)" stroke="#b5523a" stroke-width="1.2"/>
+  <rect x="188" y="138" width="44" height="12" rx="2" fill="transparent" stroke="rgba(181,82,58,0.55)" stroke-width="0.8"/>
+  <text x="210" y="147" fill="rgba(181,82,58,0.95)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">NEW</text>
+  <text x="290" y="170" fill="#1c1917" font-family="'Geist',sans-serif" font-size="12" font-weight="600" text-anchor="middle">site_config_handlers.rs</text>
+  <text x="290" y="188" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">39 KB · 7 handler</text>
+
+  <!-- mqtt_monitor_handlers.rs -->
+  <rect x="440" y="130" width="220" height="72" rx="6" fill="#f5f1e9"/>
+  <rect x="440" y="130" width="220" height="72" rx="6" fill="rgba(181,82,58,0.10)" stroke="#b5523a" stroke-width="1.2"/>
+  <rect x="448" y="138" width="44" height="12" rx="2" fill="transparent" stroke="rgba(181,82,58,0.55)" stroke-width="0.8"/>
+  <text x="470" y="147" fill="rgba(181,82,58,0.95)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">NEW</text>
+  <text x="550" y="170" fill="#1c1917" font-family="'Geist',sans-serif" font-size="12" font-weight="600" text-anchor="middle">mqtt_monitor_handlers.rs</text>
+  <text x="550" y="188" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">27 KB · 13 handler</text>
+
+  <!-- bin/ (optional) -->
+  <rect x="700" y="130" width="248" height="72" rx="6" fill="#f5f1e9"/>
+  <rect x="700" y="130" width="248" height="72" rx="6" fill="rgba(28,25,23,0.03)" stroke="rgba(28,25,23,0.25)" stroke-width="1" stroke-dasharray="4,3"/>
+  <rect x="708" y="138" width="56" height="12" rx="2" fill="transparent" stroke="rgba(82,83,78,0.45)" stroke-width="0.8"/>
+  <text x="736" y="147" fill="rgba(82,83,78,0.80)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">OPT·BIN</text>
+  <text x="824" y="170" fill="#1c1917" font-family="'Geist',sans-serif" font-size="12" font-weight="600" text-anchor="middle">remote_sync_smoke_test · init_test_db</text>
+  <text x="824" y="188" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">3 binary · 可选迁入</text>
+
+  <!-- ============ MERGE LANE ITEMS (3 files) ============ -->
+  <!-- sync_control_center.rs -->
+  <rect x="180" y="320" width="260" height="72" rx="6" fill="#f5f1e9"/>
+  <rect x="180" y="320" width="260" height="72" rx="6" fill="#ffffff" stroke="#1c1917" stroke-width="1"/>
+  <rect x="188" y="328" width="60" height="12" rx="2" fill="transparent" stroke="rgba(28,25,23,0.40)" stroke-width="0.8"/>
+  <text x="218" y="337" fill="rgba(28,25,23,0.80)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">CORE</text>
+  <text x="310" y="360" fill="#1c1917" font-family="'Geist',sans-serif" font-size="12" font-weight="600" text-anchor="middle">sync_control_center.rs</text>
+  <text x="310" y="378" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">54 KB (web) vs 44 KB (plant)</text>
+
+  <!-- sync_control_handlers.rs -->
+  <rect x="480" y="320" width="260" height="72" rx="6" fill="#f5f1e9"/>
+  <rect x="480" y="320" width="260" height="72" rx="6" fill="#ffffff" stroke="#1c1917" stroke-width="1"/>
+  <rect x="488" y="328" width="72" height="12" rx="2" fill="transparent" stroke="rgba(28,25,23,0.40)" stroke-width="0.8"/>
+  <text x="524" y="337" fill="rgba(28,25,23,0.80)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">HANDLER</text>
+  <text x="610" y="360" fill="#1c1917" font-family="'Geist',sans-serif" font-size="12" font-weight="600" text-anchor="middle">sync_control_handlers.rs</text>
+  <text x="610" y="378" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">72 KB (web) vs 29 KB (plant) · Δ +43K</text>
+
+  <!-- incremental_update_handlers.rs -->
+  <rect x="780" y="320" width="292" height="72" rx="6" fill="#f5f1e9"/>
+  <rect x="780" y="320" width="292" height="72" rx="6" fill="#ffffff" stroke="#1c1917" stroke-width="1"/>
+  <rect x="788" y="328" width="72" height="12" rx="2" fill="transparent" stroke="rgba(28,25,23,0.40)" stroke-width="0.8"/>
+  <text x="824" y="337" fill="rgba(28,25,23,0.80)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">HANDLER</text>
+  <text x="926" y="360" fill="#1c1917" font-family="'Geist',sans-serif" font-size="12" font-weight="600" text-anchor="middle">incremental_update_handlers.rs</text>
+  <text x="926" y="378" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">35 KB vs 10 KB · Δ +25K</text>
+
+  <!-- remote_sync_handlers.rs (reverse merge - FOCAL) -->
+  <rect x="180" y="408" width="340" height="72" rx="6" fill="#f5f1e9"/>
+  <rect x="180" y="408" width="340" height="72" rx="6" fill="rgba(181,82,58,0.10)" stroke="#b5523a" stroke-width="1.2"/>
+  <rect x="188" y="416" width="88" height="12" rx="2" fill="transparent" stroke="rgba(181,82,58,0.55)" stroke-width="0.8"/>
+  <text x="232" y="425" fill="rgba(181,82,58,0.95)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">REVERSE·MERGE</text>
+  <text x="350" y="446" fill="#1c1917" font-family="'Geist',sans-serif" font-size="12" font-weight="600" text-anchor="middle">remote_sync_handlers.rs</text>
+  <text x="350" y="464" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">94 KB (web) vs 101 KB (plant) · plant 为主</text>
+
+  <!-- data_interface/increment_manager.rs -->
+  <rect x="560" y="408" width="320" height="72" rx="6" fill="#f5f1e9"/>
+  <rect x="560" y="408" width="320" height="72" rx="6" fill="#ffffff" stroke="#1c1917" stroke-width="1"/>
+  <rect x="568" y="416" width="52" height="12" rx="2" fill="transparent" stroke="rgba(28,25,23,0.40)" stroke-width="0.8"/>
+  <text x="594" y="425" fill="rgba(28,25,23,0.80)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">CORE</text>
+  <text x="720" y="446" fill="#1c1917" font-family="'Geist',sans-serif" font-size="12" font-weight="600" text-anchor="middle">data_interface/increment_manager.rs</text>
+  <text x="720" y="464" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">file watcher · MQTT poll · compress</text>
+
+  <!-- ============ ALIGN LANE ITEMS (4 files) ============ -->
+  <!-- remote_runtime.rs -->
+  <rect x="180" y="550" width="180" height="60" rx="6" fill="#f5f1e9"/>
+  <rect x="180" y="550" width="180" height="60" rx="6" fill="rgba(28,25,23,0.05)" stroke="#52534e" stroke-width="1"/>
+  <text x="270" y="578" fill="#1c1917" font-family="'Geist',sans-serif" font-size="11" font-weight="600" text-anchor="middle">remote_runtime.rs</text>
+  <text x="270" y="594" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">7K vs 3K · 补齐</text>
+
+  <!-- remote_sync_template.rs -->
+  <rect x="380" y="550" width="180" height="60" rx="6" fill="#f5f1e9"/>
+  <rect x="380" y="550" width="180" height="60" rx="6" fill="rgba(28,25,23,0.05)" stroke="#52534e" stroke-width="1"/>
+  <text x="470" y="578" fill="#1c1917" font-family="'Geist',sans-serif" font-size="11" font-weight="600" text-anchor="middle">remote_sync_template.rs</text>
+  <text x="470" y="594" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">27K · 一致</text>
+
+  <!-- site_metadata.rs -->
+  <rect x="580" y="550" width="160" height="60" rx="6" fill="#f5f1e9"/>
+  <rect x="580" y="550" width="160" height="60" rx="6" fill="rgba(28,25,23,0.05)" stroke="#52534e" stroke-width="1"/>
+  <text x="660" y="578" fill="#1c1917" font-family="'Geist',sans-serif" font-size="11" font-weight="600" text-anchor="middle">site_metadata.rs</text>
+  <text x="660" y="594" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">7K · 一致</text>
+
+  <!-- sse_handlers.rs -->
+  <rect x="760" y="550" width="160" height="60" rx="6" fill="#f5f1e9"/>
+  <rect x="760" y="550" width="160" height="60" rx="6" fill="rgba(28,25,23,0.05)" stroke="#52534e" stroke-width="1"/>
+  <text x="840" y="578" fill="#1c1917" font-family="'Geist',sans-serif" font-size="11" font-weight="600" text-anchor="middle">sse_handlers.rs</text>
+  <text x="840" y="594" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">7K · 一致</text>
+
+  <!-- Summary box at right -->
+  <rect x="940" y="548" width="140" height="64" rx="6" fill="#ffffff" stroke="rgba(28,25,23,0.25)" stroke-width="1"/>
+  <text x="1010" y="568" fill="#52534e" font-family="'Geist Mono',monospace" font-size="8" letter-spacing="0.14em" text-anchor="middle">TOTAL</text>
+  <text x="1010" y="588" fill="#1c1917" font-family="'Geist',sans-serif" font-size="16" font-weight="600" text-anchor="middle">~820 KB</text>
+  <text x="1010" y="604" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">14 files · 40+ route</text>
+
+  <!-- Legend strip -->
+  <line x1="32" y1="654" x2="1088" y2="654" stroke="rgba(28,25,23,0.10)" stroke-width="0.8"/>
+  <text x="32" y="674" fill="#52534e" font-family="'Geist Mono',monospace" font-size="8" letter-spacing="0.14em">LEGEND</text>
+
+  <rect x="120" y="668" width="14" height="10" rx="2" fill="rgba(181,82,58,0.10)" stroke="#b5523a" stroke-width="1"/>
+  <text x="140" y="676" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.06em">FOCAL · 重点 (2 new + 1 reverse-merge)</text>
+
+  <rect x="440" y="668" width="14" height="10" rx="2" fill="#ffffff" stroke="#1c1917" stroke-width="1"/>
+  <text x="460" y="676" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.06em">Core / Handler · 正向合并</text>
+
+  <rect x="710" y="668" width="14" height="10" rx="2" fill="rgba(28,25,23,0.05)" stroke="#52534e" stroke-width="1"/>
+  <text x="730" y="676" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.06em">ALIGN · 补齐或一致</text>
+
+  <rect x="920" y="668" width="14" height="10" rx="2" fill="rgba(28,25,23,0.03)" stroke="rgba(28,25,23,0.25)" stroke-width="1" stroke-dasharray="3,2"/>
+  <text x="940" y="676" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.06em">OPTIONAL</text>
+
+</svg>
+  </div>
+
+  <p class="footer">design/collab-consolidation/02-api-migration-swimlane.html · plant-model-gen · 2026-04-22</p>
+</div>
+</body>
+</html>

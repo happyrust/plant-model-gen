@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>异地协同 · 前端独立 + API 汇总 · 架构图</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#faf7f2;
+    --paper-2:#f5f1e9;
+    --ink:#1c1917;
+    --muted:#52534e;
+    --soft:#94928c;
+    --rule:rgba(28,25,23,0.12);
+    --accent:#b5523a;
+    --accent-tint:rgba(181,82,58,0.10);
+    --link:#1a70c7;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    padding:48px 32px 64px;
+    background:var(--paper);
+    color:var(--ink);
+    font-family:'Geist','PingFang SC',sans-serif;
+    font-size:14px;
+    line-height:1.55;
+  }
+  .wrap{max-width:1100px;margin:0 auto}
+  .eyebrow{
+    font-family:'Geist Mono',monospace;
+    font-size:10px;
+    letter-spacing:0.24em;
+    text-transform:uppercase;
+    color:var(--muted);
+    margin:0 0 12px;
+  }
+  h1{
+    font-family:'Instrument Serif',serif;
+    font-weight:400;
+    font-size:40px;
+    line-height:1.1;
+    margin:0 0 8px;
+    letter-spacing:-0.01em;
+  }
+  .sub{
+    color:var(--muted);
+    margin:0 0 36px;
+    max-width:700px;
+  }
+  .diagram{
+    background:var(--paper-2);
+    border:1px solid var(--rule);
+    border-radius:8px;
+    padding:24px;
+    overflow-x:auto;
+  }
+  .diagram svg{display:block;margin:0 auto}
+  .footer{
+    margin-top:40px;
+    padding-top:16px;
+    border-top:1px solid var(--rule);
+    color:var(--soft);
+    font-family:'Geist Mono',monospace;
+    font-size:10px;
+    letter-spacing:0.08em;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="eyebrow">Collaboration · Migration · Architecture</p>
+  <h1>异地协同 · 前端独立 + API 汇总</h1>
+  <p class="sub">把 <code>web-server</code> 里的专业监控 UI 剥离为独立前端项目，同时把相关后端 API 汇总到 <code>plant-model-gen</code>，形成 <em>单一后端 · 双前端</em> 的协同形态。</p>
+
+  <div class="diagram">
+<svg viewBox="0 0 1040 620" width="1040" height="620" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architecture">
+  <defs>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(28,25,23,0.08)"/>
+    </pattern>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#52534e"/>
+    </marker>
+    <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#b5523a"/>
+    </marker>
+    <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#1a70c7"/>
+    </marker>
+  </defs>
+
+  <rect width="100%" height="100%" fill="#f5f1e9"/>
+  <rect width="100%" height="100%" fill="url(#dots)" opacity="0.5"/>
+
+  <!-- Column headers -->
+  <text x="160" y="40" fill="#52534e" font-family="'Geist Mono',monospace" font-size="10" letter-spacing="0.18em" text-anchor="middle">SOURCE · LEGACY</text>
+  <text x="520" y="40" fill="#52534e" font-family="'Geist Mono',monospace" font-size="10" letter-spacing="0.18em" text-anchor="middle">BACKEND · CONSOLIDATED</text>
+  <text x="880" y="40" fill="#52534e" font-family="'Geist Mono',monospace" font-size="10" letter-spacing="0.18em" text-anchor="middle">FRONTEND · DUAL</text>
+
+  <line x1="32" y1="52" x2="1008" y2="52" stroke="rgba(28,25,23,0.10)" stroke-width="0.8"/>
+
+  <!-- ==== ARROWS FIRST (z-order) ==== -->
+
+  <!-- API migration: web-server → plant-model-gen -->
+  <path d="M 280 220 Q 400 220 400 260 Q 400 300 440 300" fill="none" stroke="#b5523a" stroke-width="1.6" marker-end="url(#arrow-accent)"/>
+  <rect x="320" y="248" width="80" height="14" rx="2" fill="#f5f1e9"/>
+  <text x="360" y="258" fill="#b5523a" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.08em" text-anchor="middle">API MIGRATE</text>
+
+  <!-- UI extract: web-server/frontend → plant-collab-monitor -->
+  <path d="M 280 420 Q 600 420 600 380 Q 600 360 800 360" fill="none" stroke="#b5523a" stroke-width="1.6" marker-end="url(#arrow-accent)" stroke-dasharray="5,4"/>
+  <rect x="540" y="402" width="90" height="14" rx="2" fill="#f5f1e9"/>
+  <text x="585" y="412" fill="#b5523a" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.08em" text-anchor="middle">UI EXTRACT</text>
+
+  <!-- plant-model-gen backend → plant-collab-monitor (API consume) -->
+  <path d="M 640 300 Q 720 300 720 340 Q 720 360 800 360" fill="none" stroke="#1a70c7" stroke-width="1.4" marker-end="url(#arrow-link)"/>
+  <rect x="680" y="320" width="70" height="14" rx="2" fill="#f5f1e9"/>
+  <text x="715" y="330" fill="#1a70c7" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.08em" text-anchor="middle">HTTP · SSE</text>
+
+  <!-- plant-model-gen backend → admin embedded -->
+  <path d="M 640 260 Q 720 260 720 200 Q 720 180 800 180" fill="none" stroke="#52534e" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <rect x="696" y="192" width="50" height="14" rx="2" fill="#f5f1e9"/>
+  <text x="721" y="202" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.08em" text-anchor="middle">EMBED</text>
+
+  <!-- plant-model-gen → shared data -->
+  <path d="M 540 360 L 540 440" fill="none" stroke="#52534e" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <rect x="522" y="392" width="38" height="14" rx="2" fill="#f5f1e9"/>
+  <text x="541" y="402" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.08em" text-anchor="middle">R/W</text>
+
+  <!-- shared data → both frontends (virtual via API) -->
+  <path d="M 620 480 Q 760 480 880 480 L 880 420" fill="none" stroke="rgba(28,25,23,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+
+  <!-- ==== NODES ==== -->
+
+  <!-- web-server (backend legacy) -->
+  <rect x="88" y="180" width="200" height="80" rx="6" fill="#f5f1e9"/>
+  <rect x="88" y="180" width="200" height="80" rx="6" fill="rgba(28,25,23,0.03)" stroke="rgba(28,25,23,0.30)" stroke-width="1" stroke-dasharray="4,3"/>
+  <rect x="96" y="186" width="52" height="12" rx="2" fill="transparent" stroke="rgba(28,25,23,0.40)" stroke-width="0.8"/>
+  <text x="122" y="195" fill="rgba(28,25,23,0.65)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">LEGACY</text>
+  <text x="188" y="225" fill="#1c1917" font-family="'Geist',sans-serif" font-size="13" font-weight="600" text-anchor="middle">web-server · 后端</text>
+  <text x="188" y="244" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">14 handlers · 820 KB</text>
+
+  <!-- web-server/frontend (frontend legacy) -->
+  <rect x="88" y="380" width="200" height="80" rx="6" fill="#f5f1e9"/>
+  <rect x="88" y="380" width="200" height="80" rx="6" fill="rgba(28,25,23,0.03)" stroke="rgba(28,25,23,0.30)" stroke-width="1" stroke-dasharray="4,3"/>
+  <rect x="96" y="386" width="52" height="12" rx="2" fill="transparent" stroke="rgba(28,25,23,0.40)" stroke-width="0.8"/>
+  <text x="122" y="395" fill="rgba(28,25,23,0.65)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">LEGACY</text>
+  <text x="188" y="425" fill="#1c1917" font-family="'Geist',sans-serif" font-size="13" font-weight="600" text-anchor="middle">web-server · frontend</text>
+  <text x="188" y="444" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">Vue3 · 11 views · Naive UI</text>
+
+  <!-- plant-model-gen (FOCAL) -->
+  <rect x="440" y="240" width="200" height="120" rx="6" fill="#f5f1e9"/>
+  <rect x="440" y="240" width="200" height="120" rx="6" fill="rgba(181,82,58,0.10)" stroke="#b5523a" stroke-width="1.2"/>
+  <rect x="448" y="246" width="64" height="12" rx="2" fill="transparent" stroke="rgba(181,82,58,0.55)" stroke-width="0.8"/>
+  <text x="480" y="255" fill="rgba(181,82,58,0.9)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">BACKEND</text>
+  <text x="540" y="288" fill="#1c1917" font-family="'Geist',sans-serif" font-size="14" font-weight="600" text-anchor="middle">plant-model-gen</text>
+  <text x="540" y="307" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">单一 API 源 · Rust + Axum</text>
+  <line x1="456" y1="320" x2="624" y2="320" stroke="rgba(181,82,58,0.30)" stroke-width="0.8"/>
+  <text x="540" y="336" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">40+ endpoints</text>
+  <text x="540" y="350" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">SSE · WebSocket · MQTT</text>
+
+  <!-- shared data store -->
+  <rect x="432" y="440" width="216" height="72" rx="6" fill="#f5f1e9"/>
+  <rect x="432" y="440" width="216" height="72" rx="6" fill="rgba(28,25,23,0.05)" stroke="#52534e" stroke-width="1"/>
+  <rect x="440" y="446" width="32" height="12" rx="2" fill="transparent" stroke="rgba(82,83,78,0.50)" stroke-width="0.8"/>
+  <text x="456" y="455" fill="rgba(82,83,78,0.85)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">STORE</text>
+  <text x="540" y="480" fill="#1c1917" font-family="'Geist',sans-serif" font-size="13" font-weight="600" text-anchor="middle">Shared Data</text>
+  <text x="540" y="498" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">SurrealDB · SQLite · MQTT</text>
+
+  <!-- admin collaboration (embedded, secondary) -->
+  <rect x="800" y="140" width="184" height="84" rx="6" fill="#f5f1e9"/>
+  <rect x="800" y="140" width="184" height="84" rx="6" fill="rgba(28,25,23,0.05)" stroke="#52534e" stroke-width="1"/>
+  <rect x="808" y="146" width="56" height="12" rx="2" fill="transparent" stroke="rgba(82,83,78,0.50)" stroke-width="0.8"/>
+  <text x="836" y="155" fill="rgba(82,83,78,0.85)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">ADMIN</text>
+  <text x="892" y="185" fill="#1c1917" font-family="'Geist',sans-serif" font-size="13" font-weight="600" text-anchor="middle">/admin/#/collaboration</text>
+  <text x="892" y="203" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">轻量入口 · 4 Tab · v2</text>
+  <text x="892" y="216" fill="#94928c" font-family="'Geist Mono',monospace" font-size="8" letter-spacing="0.05em" text-anchor="middle">collaboration-v2 · 推进中</text>
+
+  <!-- plant-collab-monitor (FOCAL) -->
+  <rect x="800" y="320" width="184" height="100" rx="6" fill="#f5f1e9"/>
+  <rect x="800" y="320" width="184" height="100" rx="6" fill="rgba(181,82,58,0.10)" stroke="#b5523a" stroke-width="1.2"/>
+  <rect x="808" y="326" width="52" height="12" rx="2" fill="transparent" stroke="rgba(181,82,58,0.55)" stroke-width="0.8"/>
+  <text x="834" y="335" fill="rgba(181,82,58,0.9)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">NEW</text>
+  <text x="892" y="362" fill="#1c1917" font-family="'Geist',sans-serif" font-size="13" font-weight="600" text-anchor="middle">plant-collab-monitor</text>
+  <text x="892" y="380" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">专业监控台 · 11 views</text>
+  <line x1="816" y1="390" x2="968" y2="390" stroke="rgba(181,82,58,0.30)" stroke-width="0.8"/>
+  <text x="892" y="405" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">独立 SPA · vite dev 3200</text>
+
+  <!-- Legend strip -->
+  <line x1="32" y1="548" x2="1008" y2="548" stroke="rgba(28,25,23,0.10)" stroke-width="0.8"/>
+  <text x="32" y="568" fill="#52534e" font-family="'Geist Mono',monospace" font-size="8" letter-spacing="0.14em">LEGEND</text>
+
+  <rect x="120" y="562" width="14" height="10" rx="2" fill="rgba(181,82,58,0.10)" stroke="#b5523a" stroke-width="1"/>
+  <text x="140" y="570" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.06em">FOCAL · 本次交付</text>
+
+  <rect x="290" y="562" width="14" height="10" rx="2" fill="rgba(28,25,23,0.05)" stroke="#52534e" stroke-width="1"/>
+  <text x="310" y="570" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.06em">关联 · 已有</text>
+
+  <rect x="420" y="562" width="14" height="10" rx="2" fill="rgba(28,25,23,0.03)" stroke="rgba(28,25,23,0.30)" stroke-width="1" stroke-dasharray="3,2"/>
+  <text x="440" y="570" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.06em">LEGACY · 源头</text>
+
+  <line x1="550" y1="567" x2="584" y2="567" stroke="#b5523a" stroke-width="1.6" marker-end="url(#arrow-accent)"/>
+  <text x="592" y="570" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.06em">迁移 / 剥离</text>
+
+  <line x1="680" y1="567" x2="714" y2="567" stroke="#1a70c7" stroke-width="1.4" marker-end="url(#arrow-link)"/>
+  <text x="722" y="570" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.06em">API 调用</text>
+
+  <line x1="800" y1="567" x2="834" y2="567" stroke="#52534e" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <text x="842" y="570" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.06em">内嵌 / 数据</text>
+
+</svg>
+  </div>
+
+  <p class="footer">design/collab-consolidation/01-architecture.html · plant-model-gen · 2026-04-22</p>
+</div>
+</body>
+</html>

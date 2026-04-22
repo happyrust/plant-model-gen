@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>异地协同 · 实施路线时间轴</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#faf7f2;--paper-2:#f5f1e9;--ink:#1c1917;--muted:#52534e;
+    --soft:#94928c;--rule:rgba(28,25,23,0.12);
+    --accent:#b5523a;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:48px 32px 64px;background:var(--paper);color:var(--ink);
+    font-family:'Geist','PingFang SC',sans-serif;font-size:14px;line-height:1.55}
+  .wrap{max-width:1200px;margin:0 auto}
+  .eyebrow{font-family:'Geist Mono',monospace;font-size:10px;letter-spacing:0.24em;
+    text-transform:uppercase;color:var(--muted);margin:0 0 12px}
+  h1{font-family:'Instrument Serif',serif;font-weight:400;font-size:40px;
+    line-height:1.1;margin:0 0 8px;letter-spacing:-0.01em}
+  .sub{color:var(--muted);margin:0 0 36px;max-width:760px}
+  .diagram{background:var(--paper-2);border:1px solid var(--rule);border-radius:8px;
+    padding:24px;overflow-x:auto}
+  .diagram svg{display:block;margin:0 auto}
+  .footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--rule);
+    color:var(--soft);font-family:'Geist Mono',monospace;font-size:10px;letter-spacing:0.08em}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="eyebrow">Collaboration · Delivery Roadmap</p>
+  <h1>12–14 小时 · 5 阶段交付</h1>
+  <p class="sub">Phase 0 准备 → Phase 1 API 汇入 → Phase 2 新前端脚手架 → Phase 3 联通验证 → Phase 4 文档部署。关键里程碑：P1 末 plant-model-gen 提供完整 API；P2 末新前端可跑；P3 末端到端闭环。</p>
+
+  <div class="diagram">
+<svg viewBox="0 0 1200 520" width="1200" height="520" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(28,25,23,0.07)"/>
+    </pattern>
+  </defs>
+
+  <rect width="100%" height="100%" fill="#f5f1e9"/>
+  <rect width="100%" height="100%" fill="url(#dots)" opacity="0.5"/>
+
+  <!-- ============ Timeline axis ============ -->
+  <!-- Total budget: 14h. Grid: 120px per 2h, starting at x=120, ending x=1160. Axis at y=264 -->
+  <line x1="120" y1="264" x2="1160" y2="264" stroke="rgba(28,25,23,0.50)" stroke-width="1.2"/>
+
+  <!-- Tick marks at 0, 2, 4, 6, 8, 10, 12, 14 hours -->
+  <!-- 0h x=120, 14h x=1120 -->
+  <g font-family="'Geist Mono',monospace" font-size="9" fill="#52534e" letter-spacing="0.08em">
+    <line x1="120" y1="260" x2="120" y2="272" stroke="#52534e" stroke-width="1"/>
+    <text x="120" y="288" text-anchor="middle">0h</text>
+
+    <line x1="264" y1="260" x2="264" y2="272" stroke="#52534e" stroke-width="1"/>
+    <text x="264" y="288" text-anchor="middle">2h</text>
+
+    <line x1="408" y1="260" x2="408" y2="272" stroke="#52534e" stroke-width="1"/>
+    <text x="408" y="288" text-anchor="middle">4h</text>
+
+    <line x1="552" y1="260" x2="552" y2="272" stroke="#52534e" stroke-width="1"/>
+    <text x="552" y="288" text-anchor="middle">6h</text>
+
+    <line x1="696" y1="260" x2="696" y2="272" stroke="#52534e" stroke-width="1"/>
+    <text x="696" y="288" text-anchor="middle">8h</text>
+
+    <line x1="840" y1="260" x2="840" y2="272" stroke="#52534e" stroke-width="1"/>
+    <text x="840" y="288" text-anchor="middle">10h</text>
+
+    <line x1="984" y1="260" x2="984" y2="272" stroke="#52534e" stroke-width="1"/>
+    <text x="984" y="288" text-anchor="middle">12h</text>
+
+    <line x1="1120" y1="260" x2="1120" y2="272" stroke="#52534e" stroke-width="1"/>
+    <text x="1120" y="288" text-anchor="middle">14h</text>
+  </g>
+
+  <!-- Axis label -->
+  <text x="60" y="268" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.08em" text-anchor="middle">ELAPSED</text>
+
+  <!-- ============ Phase bars (above axis) ============ -->
+
+  <!-- Phase 0 · 准备 (0h-1h = 72px wide at x=120) -->
+  <rect x="120" y="192" width="72" height="44" rx="6" fill="rgba(28,25,23,0.05)" stroke="#52534e" stroke-width="1"/>
+  <text x="156" y="210" fill="#1c1917" font-family="'Geist',sans-serif" font-size="11" font-weight="600" text-anchor="middle">P0</text>
+  <text x="156" y="226" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">1h</text>
+
+  <!-- Phase 1 · API 汇入 (1h-6h = 360px wide) — FOCAL -->
+  <rect x="192" y="176" width="360" height="76" rx="6" fill="rgba(181,82,58,0.10)" stroke="#b5523a" stroke-width="1.2"/>
+  <rect x="200" y="184" width="52" height="12" rx="2" fill="transparent" stroke="rgba(181,82,58,0.55)" stroke-width="0.8"/>
+  <text x="226" y="193" fill="rgba(181,82,58,0.95)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">FOCAL</text>
+  <text x="372" y="214" fill="#1c1917" font-family="'Geist',sans-serif" font-size="12" font-weight="600" text-anchor="middle">Phase 1 · API 汇入 plant-model-gen</text>
+  <text x="372" y="234" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">5h · 14 files · 40+ route</text>
+
+  <!-- Phase 2 · 新前端项目 (6h-10h = 288px wide) — FOCAL -->
+  <rect x="552" y="176" width="288" height="76" rx="6" fill="rgba(181,82,58,0.10)" stroke="#b5523a" stroke-width="1.2"/>
+  <rect x="560" y="184" width="52" height="12" rx="2" fill="transparent" stroke="rgba(181,82,58,0.55)" stroke-width="0.8"/>
+  <text x="586" y="193" fill="rgba(181,82,58,0.95)" font-family="'Geist Mono',monospace" font-size="7" letter-spacing="0.08em" text-anchor="middle">FOCAL</text>
+  <text x="696" y="214" fill="#1c1917" font-family="'Geist',sans-serif" font-size="12" font-weight="600" text-anchor="middle">Phase 2 · plant-collab-monitor</text>
+  <text x="696" y="234" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">4h · vite 脚手架 + 11 视图移植</text>
+
+  <!-- Phase 3 · 联通验证 (10h-12h = 144px wide) -->
+  <rect x="840" y="192" width="144" height="44" rx="6" fill="#ffffff" stroke="#1c1917" stroke-width="1"/>
+  <text x="912" y="210" fill="#1c1917" font-family="'Geist',sans-serif" font-size="11" font-weight="600" text-anchor="middle">P3 · 联通验证</text>
+  <text x="912" y="226" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">2h · 11 视图截屏</text>
+
+  <!-- Phase 4 · 文档部署 (12h-14h) -->
+  <rect x="984" y="192" width="136" height="44" rx="6" fill="#ffffff" stroke="#1c1917" stroke-width="1"/>
+  <text x="1052" y="210" fill="#1c1917" font-family="'Geist',sans-serif" font-size="11" font-weight="600" text-anchor="middle">P4 · 文档部署</text>
+  <text x="1052" y="226" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">2h · README + 脚本</text>
+
+  <!-- ============ Milestones (below axis) ============ -->
+
+  <!-- Milestone M1: Phase 1 end (API ready) -->
+  <circle cx="552" cy="264" r="5" fill="#b5523a"/>
+  <line x1="552" y1="270" x2="552" y2="316" stroke="#b5523a" stroke-width="1" stroke-dasharray="3,2"/>
+  <rect x="440" y="320" width="224" height="52" rx="6" fill="#f5f1e9"/>
+  <rect x="440" y="320" width="224" height="52" rx="6" fill="rgba(181,82,58,0.10)" stroke="#b5523a" stroke-width="1.2"/>
+  <text x="552" y="340" fill="#1c1917" font-family="'Geist',sans-serif" font-size="11" font-weight="600" text-anchor="middle">M1 · API 就绪</text>
+  <text x="552" y="356" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">curl 冒烟通过</text>
+  <text x="552" y="368" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">40+ endpoint 注册</text>
+
+  <!-- Milestone M2: Phase 2 end (frontend running) -->
+  <circle cx="840" cy="264" r="5" fill="#b5523a"/>
+  <line x1="840" y1="270" x2="840" y2="316" stroke="#b5523a" stroke-width="1" stroke-dasharray="3,2"/>
+  <rect x="728" y="320" width="224" height="52" rx="6" fill="#f5f1e9"/>
+  <rect x="728" y="320" width="224" height="52" rx="6" fill="rgba(181,82,58,0.10)" stroke="#b5523a" stroke-width="1.2"/>
+  <text x="840" y="340" fill="#1c1917" font-family="'Geist',sans-serif" font-size="11" font-weight="600" text-anchor="middle">M2 · 前端可跑</text>
+  <text x="840" y="356" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">vite dev 3200 起</text>
+  <text x="840" y="368" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">Dashboard 可见</text>
+
+  <!-- Milestone M3: End -->
+  <circle cx="1120" cy="264" r="5" fill="#1c1917"/>
+  <line x1="1120" y1="270" x2="1120" y2="316" stroke="#52534e" stroke-width="1" stroke-dasharray="3,2"/>
+  <rect x="1008" y="320" width="144" height="52" rx="6" fill="#f5f1e9"/>
+  <rect x="1008" y="320" width="144" height="52" rx="6" fill="#ffffff" stroke="#1c1917" stroke-width="1"/>
+  <text x="1080" y="340" fill="#1c1917" font-family="'Geist',sans-serif" font-size="11" font-weight="600" text-anchor="middle">M3 · 端到端闭环</text>
+  <text x="1080" y="356" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">部署脚本 ready</text>
+
+  <!-- Milestone M0: Kickoff -->
+  <circle cx="192" cy="264" r="5" fill="#52534e"/>
+  <line x1="192" y1="270" x2="192" y2="316" stroke="#52534e" stroke-width="1" stroke-dasharray="3,2"/>
+  <rect x="80" y="320" width="224" height="52" rx="6" fill="#f5f1e9"/>
+  <rect x="80" y="320" width="224" height="52" rx="6" fill="rgba(28,25,23,0.05)" stroke="#52534e" stroke-width="1"/>
+  <text x="192" y="340" fill="#1c1917" font-family="'Geist',sans-serif" font-size="11" font-weight="600" text-anchor="middle">M0 · Kickoff</text>
+  <text x="192" y="356" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">feature branch 建立</text>
+  <text x="192" y="368" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" text-anchor="middle">plant-collab-monitor 新仓库</text>
+
+  <!-- ============ Section header ============ -->
+  <text x="60" y="80" fill="#52534e" font-family="'Geist Mono',monospace" font-size="10" letter-spacing="0.18em">PHASES · ABOVE</text>
+  <text x="60" y="104" fill="#52534e" font-family="'Geist Mono',monospace" font-size="10" letter-spacing="0.18em">MILESTONES · BELOW</text>
+  <line x1="32" y1="120" x2="1168" y2="120" stroke="rgba(28,25,23,0.10)" stroke-width="0.8"/>
+
+  <text x="600" y="148" fill="#1c1917" font-family="'Instrument Serif',serif" font-style="italic" font-size="14" text-anchor="middle" opacity="0.75">P1 + P2 占总时长 64%，是价值最密的两段</text>
+
+  <!-- ============ Legend ============ -->
+  <line x1="32" y1="426" x2="1168" y2="426" stroke="rgba(28,25,23,0.10)" stroke-width="0.8"/>
+  <text x="32" y="446" fill="#52534e" font-family="'Geist Mono',monospace" font-size="8" letter-spacing="0.14em">LEGEND</text>
+
+  <rect x="120" y="440" width="14" height="10" rx="2" fill="rgba(181,82,58,0.10)" stroke="#b5523a" stroke-width="1"/>
+  <text x="140" y="448" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.06em">FOCAL Phase / Milestone</text>
+
+  <rect x="340" y="440" width="14" height="10" rx="2" fill="#ffffff" stroke="#1c1917" stroke-width="1"/>
+  <text x="360" y="448" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.06em">辅助 Phase</text>
+
+  <rect x="500" y="440" width="14" height="10" rx="2" fill="rgba(28,25,23,0.05)" stroke="#52534e" stroke-width="1"/>
+  <text x="520" y="448" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.06em">准备 / Kickoff</text>
+
+  <circle cx="662" cy="445" r="4" fill="#b5523a"/>
+  <text x="676" y="448" fill="#52534e" font-family="'Geist Mono',monospace" font-size="9" letter-spacing="0.06em">关键里程碑</text>
+
+</svg>
+  </div>
+
+  <p class="footer">design/collab-consolidation/04-roadmap-timeline.html · plant-model-gen · 2026-04-22</p>
+</div>
+</body>
+</html>

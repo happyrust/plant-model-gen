@@ -1,0 +1,78 @@
+# Nginx 反代示例 · plant-collab-monitor
+#
+# 部署位置：复制到 /etc/nginx/conf.d/plant-collab-monitor.conf 并 reload
+# 依赖：
+#   - dist/ 产物路径：/var/www/plant-collab-monitor/
+#   - plant-model-gen 后端监听：127.0.0.1:3100（与 db_options/DbOption.toml 一致）
+#
+# 目标效果：
+#   - https://<host>/monitor/            -> plant-collab-monitor SPA 首页
+#   - https://<host>/api/*               -> 代理到 plant-model-gen 后端
+#   - https://<host>/ws/*                -> WebSocket 升级代理到后端
+#   - https://<host>/files/*             -> 文件代理
+
+# 与已有 /admin/ 不冲突，两者可并存
+
+server {
+    listen       443 ssl http2;
+    server_name  your-domain.example.com;
+
+    ssl_certificate      /etc/ssl/your-domain.pem;
+    ssl_certificate_key  /etc/ssl/your-domain.key;
+
+    # SPA 静态
+    location /monitor/ {
+        alias /var/www/plant-collab-monitor/;
+        try_files $uri $uri/ /monitor/index.html;
+        add_header Cache-Control "no-cache" always;
+    }
+
+    # 资源缓存（hashed 文件名，强缓存）
+    location ~* ^/monitor/assets/.*\.(js|css|woff2?|ttf|svg|png|jpe?g|gif)$ {
+        alias /var/www/plant-collab-monitor/;
+        try_files $uri =404;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+    }
+
+    # API 代理到 plant-model-gen
+    location /api/ {
+        proxy_pass         http://127.0.0.1:3100/api/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+        # SSE（/api/sync/events/stream）
+        proxy_buffering    off;
+    }
+
+    # WebSocket 升级
+    location /ws/ {
+        proxy_pass         http://127.0.0.1:3100/ws/;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+        proxy_set_header   Host              $host;
+        proxy_read_timeout 3600s;
+    }
+
+    # 文件代理
+    location /files/ {
+        proxy_pass         http://127.0.0.1:3100/files/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+    }
+
+    # 访问日志
+    access_log /var/log/nginx/plant-collab-monitor.access.log;
+    error_log  /var/log/nginx/plant-collab-monitor.error.log warn;
+}
+
+# HTTP 自动跳转（可选）
+server {
+    listen      80;
+    server_name your-domain.example.com;
+    return 301  https://$host$request_uri;
+}

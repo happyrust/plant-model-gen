@@ -50,6 +50,7 @@ pub mod remote_sync_template;
 pub mod room_api;
 pub mod room_page;
 pub mod simple_templates;
+pub mod site_config_handlers;
 pub mod site_metadata;
 pub mod site_registry;
 pub mod sqlite_spatial_api;
@@ -520,6 +521,32 @@ pub async fn start_web_server_with_config(
             get(|uri: axum::http::Uri| async move {
                 redirect_legacy_console_path(uri, "/console/sync/control").await
             }),
+        )
+        // ===== 站点配置 (Phase 1.1 · 从 web-server 迁入) =====
+        .route(
+            "/api/site-config",
+            get(site_config_handlers::get_site_config),
+        )
+        .route("/api/site/info", get(site_config_handlers::get_site_info))
+        .route(
+            "/api/site-config/save",
+            post(site_config_handlers::save_site_config),
+        )
+        .route(
+            "/api/site-config/validate",
+            post(site_config_handlers::validate_site_config),
+        )
+        .route(
+            "/api/site-config/reload",
+            post(site_config_handlers::reload_site_config),
+        )
+        .route(
+            "/api/site-config/restart",
+            post(site_config_handlers::restart_server),
+        )
+        .route(
+            "/api/site-config/server-ip",
+            get(site_config_handlers::get_server_ip),
         )
         .route(
             "/api/sync/start",

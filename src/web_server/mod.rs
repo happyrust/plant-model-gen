@@ -29,6 +29,7 @@ pub mod models;
 pub mod ws; // WebSocket 模块
 // pub mod templates; // 暂时禁用，有语法错误
 pub mod batch_tasks_template;
+pub mod collab_migrations;
 pub mod dashboard_handlers;
 pub mod database_diagnostics;
 pub mod database_status_handlers;
@@ -188,6 +189,9 @@ pub async fn start_web_server_with_config(
     }
 
     let app_state = AppState::new();
+
+    // Phase 1.6 · 异地协同 schema 幂等迁移（确保 remote_sync_sites.master_* 列与 node_config 表就位）
+    collab_migrations::ensure_collab_schema();
 
     // 🔧 修复：初始化数据库连接 - 使用统一的 initialize_databases 函数
     println!("🔄 正在初始化数据库连接...");

@@ -42,6 +42,7 @@ pub mod instance_export;
 pub mod layout;
 pub mod litefs_handlers;
 pub mod model_runtime;
+pub mod mqtt_monitor_handlers;
 pub mod output_instances_files;
 pub mod parquet_compact_worker;
 pub mod remote_runtime;
@@ -521,6 +522,27 @@ pub async fn start_web_server_with_config(
             get(|uri: axum::http::Uri| async move {
                 redirect_legacy_console_path(uri, "/console/sync/control").await
             }),
+        )
+        // ===== MQTT 节点监控 (Phase 1.2 · 从 web-server 迁入) =====
+        .route(
+            "/api/mqtt/nodes",
+            get(mqtt_monitor_handlers::get_mqtt_nodes_status),
+        )
+        .route(
+            "/api/mqtt/nodes/{location}",
+            delete(mqtt_monitor_handlers::remove_mqtt_node),
+        )
+        .route(
+            "/api/mqtt/nodes/client-unsubscribed",
+            post(mqtt_monitor_handlers::client_unsubscribed),
+        )
+        .route(
+            "/api/mqtt/messages",
+            get(mqtt_monitor_handlers::get_message_delivery_status),
+        )
+        .route(
+            "/api/mqtt/messages/{message_id}",
+            get(mqtt_monitor_handlers::get_message_delivery_detail),
         )
         // ===== 站点配置 (Phase 1.1 · 从 web-server 迁入) =====
         .route(

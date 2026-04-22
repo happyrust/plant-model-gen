@@ -203,6 +203,10 @@ kv-rocksdb = [
 ] # 嵌入式 RocksDB 后端，默认不编译以加快构建
 project_hd = []
 project_hh = []
+# mbd-iso: 当 rs-core (`aios_core::mbd`) 暴露 `iso_extras` / `iso_params` / `SolveBranchInput`
+# 这几个 in-progress 模块后再开启。未开启时 `mbd_pipe_api::compute_branch_layout_result` 不参与
+# 编译, MBD 数据里的 `layout_result` 字段会降级为 None。
+mbd-iso = []
 profile = ["dep:tracing-chrome"] #性能分析，包含tracing功能
 web_server = [
     "dep:axum",

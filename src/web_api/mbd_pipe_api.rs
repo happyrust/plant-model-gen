@@ -2413,8 +2413,15 @@ async fn build_mbd_pipe_data_from_segments(
         layout_result: None,
     };
 
+    #[cfg(feature = "mbd-iso")]
     if matches!(query.mode, MbdPipeMode::LayoutFirst) {
         data.layout_result = Some(compute_branch_layout_result(query, &data));
+    }
+    #[cfg(not(feature = "mbd-iso"))]
+    {
+        let _ = &query.mode;
+        // mbd-iso feature 未开启: layout_result 降级为 None,
+        // 等 rs-core 的 iso_extras / iso_params 模块就位后开启 feature 恢复。
     }
 
     Ok(data)
@@ -2423,6 +2430,11 @@ async fn build_mbd_pipe_data_from_segments(
 /// 把后端的 `MbdPipeData` 子集喂给 `aios_core::mbd::BranchCalculator`，产出完整 `LayoutResult`。
 ///
 /// 单位：所有输入/输出均为 **毫米（mm）**，与 `mbd_pipe_api` 的原始坐标空间一致。
+///
+/// 本函数依赖 `aios_core::mbd` 的 `iso_extras` / `iso_params` / `SolveBranchInput`
+/// 三个尚未在 rs-core 里暴露的模块/类型，因此整体由 `mbd-iso` feature 控制，
+/// 未开启时函数不参与编译（caller 处也会跳过赋值）。
+#[cfg(feature = "mbd-iso")]
 fn compute_branch_layout_result(
     query: &ResolvedMbdPipeQuery,
     data: &MbdPipeData,

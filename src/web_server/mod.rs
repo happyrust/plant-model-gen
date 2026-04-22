@@ -544,6 +544,35 @@ pub async fn start_web_server_with_config(
             "/api/mqtt/messages/{message_id}",
             get(mqtt_monitor_handlers::get_message_delivery_detail),
         )
+        // ===== MQTT 订阅与主从控制 (Phase 1.3a · 简化 stub) =====
+        .route(
+            "/api/mqtt/broker/logs",
+            get(sync_control_handlers::get_mqtt_broker_logs_api),
+        )
+        .route(
+            "/api/mqtt/subscription/start",
+            post(sync_control_handlers::start_mqtt_subscription_api),
+        )
+        .route(
+            "/api/mqtt/subscription/stop",
+            post(sync_control_handlers::stop_mqtt_subscription_api),
+        )
+        .route(
+            "/api/mqtt/subscription/clear-master-config",
+            post(sync_control_handlers::clear_master_config_api),
+        )
+        .route(
+            "/api/mqtt/subscription/status",
+            get(sync_control_handlers::get_mqtt_subscription_status),
+        )
+        .route(
+            "/api/mqtt/node/set-master",
+            post(sync_control_handlers::set_as_master_node),
+        )
+        .route(
+            "/api/mqtt/node/set-client",
+            post(sync_control_handlers::set_as_client_node),
+        )
         // ===== 站点配置 (Phase 1.1 · 从 web-server 迁入) =====
         .route(
             "/api/site-config",

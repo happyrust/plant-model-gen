@@ -486,7 +486,7 @@ pub async fn remove_mqtt_node(
         })))
     } else {
         // 从节点：取消订阅并清除主节点配置
-        // TODO(Phase 1.3): 迁入 sync_control_handlers::clear_master_config_internal 后恢复完整逻辑
+        use crate::web_server::sync_control_handlers::clear_master_config_internal;
 
         // 获取主节点的 HTTP 地址（用于通知）
         let master_http_host = get_master_http_host(&current_location);
@@ -501,11 +501,13 @@ pub async fn remove_mqtt_node(
             }
         }
 
-        // 清除主节点配置（stub）
-        log::warn!(
-            "⚠️  [mqtt-monitor] clear_master_config_internal 尚未迁入, 主节点配置未清除 (location={})",
-            location
-        );
+        // 清除主节点配置
+        if let Err(e) = clear_master_config_internal().await {
+            return Ok(Json(json!({
+                "status": "error",
+                "message": format!("清除主节点配置失败: {}", e)
+            })));
+        }
         
         // 从 MQTT_NODES 中移除
         let mut nodes = MQTT_NODES.write().await;

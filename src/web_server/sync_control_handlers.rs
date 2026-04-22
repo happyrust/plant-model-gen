@@ -901,3 +901,170 @@ pub async fn get_sync_metrics_history(
         "history": history
     })))
 }
+
+// ============================================================================
+// Phase 1.3a · MQTT 订阅与主从节点控制 (简化 stub)
+//
+// 完整实现位于 web-server/src/web_server/sync_control_handlers.rs L483-L1600，
+// 依赖 check_is_master_node / get_available_master_nodes / SYNC_EVENT_TX 等
+// helper 以及 sse_handlers::SyncEvent::MqttSubscriptionStatusChanged variant。
+// 本轮先以简化版保证 API 可应答合法 JSON，真实逻辑待 Phase 1.3b 或 Phase 5 回填。
+// ============================================================================
+
+#[derive(Debug, Deserialize, Default)]
+pub struct StartSubscriptionRequest {
+    #[serde(default)]
+    pub master_location: Option<String>,
+    #[serde(default)]
+    pub master_mqtt_host: Option<String>,
+    #[serde(default)]
+    pub master_mqtt_port: Option<u16>,
+    #[serde(default)]
+    pub env_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetNodeRequest {
+    #[serde(default)]
+    pub location: Option<String>,
+}
+
+/// GET /api/mqtt/broker/logs — 简化: 返回空日志
+pub async fn get_mqtt_broker_logs_api(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // TODO(Phase 后续): 接入 sync_control_center::get_mqtt_broker_logs
+    Ok(Json(json!({
+        "status": "success",
+        "logs": [],
+        "count": 0
+    })))
+}
+
+/// POST /api/mqtt/subscription/start — 简化: 直接 start_runtime
+pub async fn start_mqtt_subscription_api(
+    _state: State<AppState>,
+    request: Option<Json<StartSubscriptionRequest>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::remote_runtime;
+
+    let request = request.map(|Json(r)| r).unwrap_or_default();
+    let env_id = request.env_id.unwrap_or_else(|| "default".to_string());
+
+    {
+        let guard = remote_runtime::REMOTE_RUNTIME.read().await;
+        if guard.is_some() {
+            return Ok(Json(json!({
+                "status": "error",
+                "message": "MQTT 订阅已经在运行中"
+            })));
+        }
+    }
+
+    match remote_runtime::start_runtime(env_id).await {
+        Ok(_) => Ok(Json(json!({
+            "status": "success",
+            "message": "MQTT 订阅已启动 (简化模式)"
+        }))),
+        Err(e) => Ok(Json(json!({
+            "status": "error",
+            "message": format!("启动失败: {}", e)
+        }))),
+    }
+}
+
+/// POST /api/mqtt/subscription/stop
+pub async fn stop_mqtt_subscription_api(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::remote_runtime;
+
+    let mut guard = remote_runtime::REMOTE_RUNTIME.write().await;
+    if guard.is_some() {
+        *guard = None;
+        Ok(Json(json!({
+            "status": "success",
+            "message": "MQTT 订阅已停止"
+        })))
+    } else {
+        Ok(Json(json!({
+            "status": "error",
+            "message": "MQTT 订阅未在运行"
+        })))
+    }
+}
+
+/// 内部 helper：清除当前站点的主节点配置（供 mqtt_monitor_handlers::remove_mqtt_node 调用）
+pub async fn clear_master_config_internal() -> anyhow::Result<()> {
+    use aios_core::get_db_option;
+
+    let location = get_db_option().location.clone();
+    let conn = rusqlite::Connection::open("deployment_sites.sqlite")?;
+    conn.execute(
+        "UPDATE remote_sync_sites \
+            SET master_location = NULL, master_mqtt_host = NULL, master_mqtt_port = NULL, updated_at = datetime('now') \
+          WHERE location = ?1",
+        rusqlite::params![location],
+    )?;
+    Ok(())
+}
+
+/// POST /api/mqtt/subscription/clear-master-config
+pub async fn clear_master_config_api(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match clear_master_config_internal().await {
+        Ok(_) => Ok(Json(json!({
+            "status": "success",
+            "message": "主节点配置已清除"
+        }))),
+        Err(e) => Ok(Json(json!({
+            "status": "error",
+            "message": format!("清除失败: {}", e)
+        }))),
+    }
+}
+
+/// GET /api/mqtt/subscription/status
+pub async fn get_mqtt_subscription_status(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::remote_runtime;
+
+    let is_running = remote_runtime::REMOTE_RUNTIME.read().await.is_some();
+    let location = aios_core::get_db_option().location.clone();
+
+    Ok(Json(json!({
+        "status": "success",
+        "is_running": is_running,
+        "is_server_running": false,
+        "location": location,
+        "subscribed_topics": ["Sync/E3d"],
+    })))
+}
+
+/// POST /api/mqtt/node/set-master
+pub async fn set_as_master_node(
+    _state: State<AppState>,
+    Json(_req): Json<SetNodeRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // TODO(Phase 后续): 写入 DbOption.toml 与 deployment_sites.sqlite 的主节点标识
+    log::warn!("⚠️  [mqtt] set_as_master_node 尚未接入完整实现");
+    Ok(Json(json!({
+        "status": "success",
+        "message": "已标记为主节点 (简化模式, 需手动重启生效)"
+    })))
+}
+
+/// POST /api/mqtt/node/set-client
+pub async fn set_as_client_node(
+    _state: State<AppState>,
+    Json(_req): Json<SetNodeRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // TODO(Phase 后续): 写入 DbOption.toml 与 deployment_sites.sqlite 的从节点标识
+    log::warn!("⚠️  [mqtt] set_as_client_node 尚未接入完整实现");
+    Ok(Json(json!({
+        "status": "success",
+        "message": "已标记为从节点 (简化模式, 需手动重启生效)"
+    })))
+}

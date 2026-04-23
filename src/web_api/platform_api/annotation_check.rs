@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::web_api::jwt_auth::{REVIEW_AUTH_CONFIG, ReviewAuthConfig, verify_token};
+use crate::web_api::review_db::review_primary_db;
 use axum::{
     Json,
     http::{HeaderMap, StatusCode},
@@ -8,8 +10,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
-use crate::web_api::jwt_auth::{REVIEW_AUTH_CONFIG, ReviewAuthConfig, verify_token};
-use aios_core::project_primary_db;
 
 use super::{auth::verify_s2s_token, review_form::find_task_by_form_id};
 
@@ -245,7 +245,10 @@ fn authenticate_annotation_check(
         return verify_s2s_token(token);
     }
 
-    Err((StatusCode::UNAUTHORIZED, "缺少有效的校审身份凭证".to_string()))
+    Err((
+        StatusCode::UNAUTHORIZED,
+        "缺少有效的校审身份凭证".to_string(),
+    ))
 }
 
 pub async fn resolve_annotation_check_context(
@@ -283,14 +286,16 @@ pub async fn resolve_annotation_check_context(
             }
             Ok(task_context)
         }
-        (Some(task_id), None) => find_annotation_check_task_by_id(task_id)
-            .await?
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    format!("task_id={} 未找到活动 review task", task_id),
-                )
-            }),
+        (Some(task_id), None) => {
+            find_annotation_check_task_by_id(task_id)
+                .await?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!("task_id={} 未找到活动 review task", task_id),
+                    )
+                })
+        }
         (None, Some(form_id)) => {
             let task = find_task_by_form_id(form_id)
                 .await
@@ -550,7 +555,7 @@ async fn load_effective_annotations(
         ORDER BY confirmed_at ASC
     "#;
 
-    let mut response = project_primary_db()
+    let mut response = review_primary_db()
         .query(query_sql)
         .bind(("task_id", context.task_id.clone()))
         .await
@@ -734,7 +739,7 @@ async fn find_annotation_check_task_by_id(
         LIMIT 1
     "#;
 
-    let mut response = project_primary_db()
+    let mut response = review_primary_db()
         .query(query_sql)
         .bind(("id", task_id.to_string()))
         .await

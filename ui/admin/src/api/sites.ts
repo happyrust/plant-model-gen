@@ -4,7 +4,9 @@ import type {
   ManagedProjectSite,
   ManagedSiteRuntimeStatus,
   ManagedSiteLogsResponse,
+  ManagedSiteParsePlan,
   CreateManagedSiteRequest,
+  PreviewManagedSiteParsePlanRequest,
   UpdateManagedSiteRequest,
 } from '@/types/site'
 
@@ -17,6 +19,12 @@ export const sitesApi = {
 
   create: (payload: CreateManagedSiteRequest) =>
     apiPost<ManagedProjectSite>('/api/admin/sites', payload as unknown as Record<string, unknown>),
+
+  previewParsePlan: (payload: PreviewManagedSiteParsePlanRequest) =>
+    apiPost<ManagedSiteParsePlan>(
+      '/api/admin/sites/preview-parse-plan',
+      payload as unknown as Record<string, unknown>,
+    ),
 
   update: (id: string, payload: UpdateManagedSiteRequest) =>
     apiPut<ManagedProjectSite>(`/api/admin/sites/${id}`, payload as unknown as Record<string, unknown>),

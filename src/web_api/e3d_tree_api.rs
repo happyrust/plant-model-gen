@@ -14,7 +14,9 @@ use std::sync::Arc;
 use surrealdb::types::SurrealValue;
 
 use crate::data_interface::db_meta_manager::db_meta;
-use crate::fast_model::gen_model::tree_index_manager::{TreeIndexManager, load_index_with_large_stack};
+use crate::fast_model::gen_model::tree_index_manager::{
+    TreeIndexManager, load_index_with_large_stack,
+};
 
 #[derive(Clone)]
 pub struct E3dTreeApiState {
@@ -215,60 +217,60 @@ async fn get_children(
 
     let parent_type = get_type_name(parent_refno).await;
 
-    let mut children: Vec<TreeNodeDto> = if parent_type == "WORL" || is_offline_world_refno(parent_refno)
-    {
-        let db_option = aios_core::get_db_option();
-        let mdb_name = db_option.mdb_name.clone();
+    let mut children: Vec<TreeNodeDto> =
+        if parent_type == "WORL" || is_offline_world_refno(parent_refno) {
+            let db_option = aios_core::get_db_option();
+            let mdb_name = db_option.mdb_name.clone();
 
-        match aios_core::get_mdb_world_site_ele_nodes(mdb_name, aios_core::DBType::DESI).await {
-            Ok(eles) if !eles.is_empty() => eles
-                .into_iter()
-                .map(|mut ele| {
-                    ele.owner = parent_refno;
-                    TreeNodeDto {
-                        refno: ele.refno,
-                        name: ele.name,
-                        noun: ele.noun,
-                        owner: Some(parent_refno),
-                        children_count: Some(i32::from(ele.children_count)),
-                    }
-                })
-                .collect(),
-            _ => offline_world_children(parent_refno),
-        }
-    } else {
-        match TreeIndexManager::resolve_dbnum_for_refno(parent_refno) {
-            Ok(dbnum) => {
-                let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-                let child_refnos = manager.query_children(parent_refno);
-
-                let mut out: Vec<TreeNodeDto> = Vec::with_capacity(child_refnos.len());
-                for (idx, r) in child_refnos.iter().enumerate() {
-                    let noun = manager.get_noun(*r).unwrap_or_default();
-                    let mut name = crate::fast_model::query_provider::get_pe(*r)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|pe| pe.name)
-                        .unwrap_or_default();
-                    // 与 fn::default_name 一致：name 为空时生成 "{noun} {order+1}"
-                    if name.trim().is_empty() {
-                        name = format!("{} {}", noun, idx + 1);
-                    }
-                    let children_count = manager.query_children(*r).len() as i32;
-                    out.push(TreeNodeDto {
-                        refno: *r,
-                        name,
-                        noun,
-                        owner: Some(parent_refno),
-                        children_count: Some(children_count),
-                    });
-                }
-                out
+            match aios_core::get_mdb_world_site_ele_nodes(mdb_name, aios_core::DBType::DESI).await {
+                Ok(eles) if !eles.is_empty() => eles
+                    .into_iter()
+                    .map(|mut ele| {
+                        ele.owner = parent_refno;
+                        TreeNodeDto {
+                            refno: ele.refno,
+                            name: ele.name,
+                            noun: ele.noun,
+                            owner: Some(parent_refno),
+                            children_count: Some(i32::from(ele.children_count)),
+                        }
+                    })
+                    .collect(),
+                _ => offline_world_children(parent_refno),
             }
-            Err(_) => Vec::new(),
-        }
-    };
+        } else {
+            match TreeIndexManager::resolve_dbnum_for_refno(parent_refno) {
+                Ok(dbnum) => {
+                    let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+                    let child_refnos = manager.query_children(parent_refno);
+
+                    let mut out: Vec<TreeNodeDto> = Vec::with_capacity(child_refnos.len());
+                    for (idx, r) in child_refnos.iter().enumerate() {
+                        let noun = manager.get_noun(*r).unwrap_or_default();
+                        let mut name = crate::fast_model::query_provider::get_pe(*r)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|pe| pe.name)
+                            .unwrap_or_default();
+                        // 与 fn::default_name 一致：name 为空时生成 "{noun} {order+1}"
+                        if name.trim().is_empty() {
+                            name = format!("{} {}", noun, idx + 1);
+                        }
+                        let children_count = manager.query_children(*r).len() as i32;
+                        out.push(TreeNodeDto {
+                            refno: *r,
+                            name,
+                            noun,
+                            owner: Some(parent_refno),
+                            children_count: Some(children_count),
+                        });
+                    }
+                    out
+                }
+                Err(_) => Vec::new(),
+            }
+        };
 
     let truncated = (children.len() as i32) > limit;
     if children.len() > limit as usize {

@@ -7,19 +7,19 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use rusqlite::Row;
 use futures_util::FutureExt;
+use rusqlite::Row;
 use std::panic::AssertUnwindSafe;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::web_server::admin_auth_handlers::admin_auth_middleware;
 use crate::web_server::admin_response;
+use crate::web_server::managed_project_sites;
 use crate::web_server::models::{
     DatabaseConfig, ErrorDetails, LogEntry, LogLevel, ManagedSiteParseStatus,
     ManagedSiteRuntimeStatus, ManagedSiteStatus, TaskInfo, TaskPriority, TaskProgress, TaskStatus,
     TaskType,
 };
-use crate::web_server::managed_project_sites;
 use crate::web_server::wizard_handlers::open_deployment_sites_sqlite;
 
 const TABLE_NAME: &str = "admin_tasks";
@@ -237,8 +237,10 @@ fn apply_config_overrides(config: &mut DatabaseConfig, overrides: &serde_json::V
             config.mesh_tol_ratio = v;
         }
         if let Some(v) = obj.get("manual_db_nums").and_then(|v| v.as_array()) {
-            config.manual_db_nums =
-                v.iter().filter_map(|n| n.as_u64().map(|n| n as u32)).collect();
+            config.manual_db_nums = v
+                .iter()
+                .filter_map(|n| n.as_u64().map(|n| n as u32))
+                .collect();
         }
         if let Some(v) = obj.get("manual_refnos").and_then(|v| v.as_array()) {
             config.manual_refnos = v
@@ -402,7 +404,9 @@ async fn dispatch_admin_task(task_id: String) {
                 Err(e) => Err(e.to_string()),
             }
         }
-        (_, Some(_)) => Err("当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration".into()),
+        (_, Some(_)) => {
+            Err("当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration".into())
+        }
         (_, None) => Err("创建 admin 任务必须指定 site_id".into()),
     };
 
@@ -499,12 +503,19 @@ fn reconcile_task_record(
     if !is_supported_admin_task_type(&stored.task.task_type) {
         return Ok(stored);
     }
-    if !matches!(stored.task.status, TaskStatus::Running | TaskStatus::Pending) {
+    if !matches!(
+        stored.task.status,
+        TaskStatus::Running | TaskStatus::Pending
+    ) {
         return Ok(stored);
     }
 
     let Some(site_id) = stored.site_id.clone() else {
-        mark_task_failed(&mut stored.task, "缺少关联站点", "任务缺少 site_id，无法对账运行状态");
+        mark_task_failed(
+            &mut stored.task,
+            "缺少关联站点",
+            "任务缺少 site_id，无法对账运行状态",
+        );
         save_task(&stored.task, None)?;
         return Ok(stored);
     };
@@ -527,7 +538,10 @@ fn apply_runtime_to_task(task: &mut TaskInfo, runtime: &ManagedSiteRuntimeStatus
     match task.task_type {
         TaskType::ParsePdmsData => {
             if runtime.parse_status == ManagedSiteParseStatus::Failed
-                || runtime.last_error.as_deref().is_some_and(|value| !value.trim().is_empty())
+                || runtime
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
             {
                 let message = runtime
                     .last_error
@@ -544,7 +558,10 @@ fn apply_runtime_to_task(task: &mut TaskInfo, runtime: &ManagedSiteRuntimeStatus
         }
         TaskType::DataGeneration | TaskType::FullGeneration => {
             if runtime.status == ManagedSiteStatus::Failed
-                || runtime.last_error.as_deref().is_some_and(|value| !value.trim().is_empty())
+                || runtime
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
             {
                 let message = runtime
                     .last_error

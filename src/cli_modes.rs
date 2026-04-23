@@ -2786,13 +2786,8 @@ pub async fn export_dbnum_instances_json_mode(
     ) -> Result<()> {
         let db_option = Arc::new((**db_option_ext).clone());
         let stats = export_dbnum_instances_json(
-            dbnum,
-            output_dir,
-            db_option,
-            verbose,
-            None, // 使用默认毫米单位
-            root_refno,
-            detailed,
+            dbnum, output_dir, db_option, verbose, None, // 使用默认毫米单位
+            root_refno, detailed,
         )
         .await?;
 
@@ -3238,7 +3233,9 @@ pub async fn export_dbnum_instances_json_mode(
                         "   cargo run --bin aios-database -- --debug-model --dbnum {} --regen-model",
                         dbnum
                     );
-                    eprintln!("   当前仓内 instance_cache/cache_flush 为兼容桩时，将自动回退到 SurrealDB 直导。");
+                    eprintln!(
+                        "   当前仓内 instance_cache/cache_flush 为兼容桩时，将自动回退到 SurrealDB 直导。"
+                    );
                     return export_via_surreal(
                         dbnum,
                         &output_dir,
@@ -3933,7 +3930,9 @@ async fn restore_full_spatial_index_after_scoped_run(reason: &str, verbose: bool
     println!("\n🧹 恢复全量 SQLite 空间索引");
     println!("==========================================");
     println!("   - 原因: {}", reason);
-    println!("   - 说明: scoped 刷新会改写默认 output/spatial_index.sqlite，命令结束后自动恢复全量索引以避免污染后续计算");
+    println!(
+        "   - 说明: scoped 刷新会改写默认 output/spatial_index.sqlite，命令结束后自动恢复全量索引以避免污染后续计算"
+    );
     build_spatial_index_from_inst_relate(verbose).await?;
     println!("✅ 已恢复全量 SQLite 空间索引");
     Ok(())
@@ -3957,7 +3956,8 @@ async fn refresh_panel_spatial_index_with_fallback(
     let mut fallback_dbnums: BTreeSet<u32> = db_nums
         .map(|nums| nums.iter().copied().collect())
         .unwrap_or_default();
-    if let Some(panel_dbnum) = aios_database::data_interface::db_meta().get_dbnum_by_refno(panel_refno)
+    if let Some(panel_dbnum) =
+        aios_database::data_interface::db_meta().get_dbnum_by_refno(panel_refno)
     {
         fallback_dbnums.insert(panel_dbnum);
     }

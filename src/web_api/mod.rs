@@ -42,6 +42,8 @@ pub mod pdms_model_query_api;
 pub mod review_api;
 #[cfg(feature = "web_server")]
 pub use review_api::create_review_api_routes;
+#[cfg(feature = "web_server")]
+pub mod review_db;
 
 #[cfg(feature = "web_server")]
 pub mod jwt_auth;

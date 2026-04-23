@@ -1,9 +1,9 @@
 use axum::{
-    Router,
     extract::{Json, Path},
     middleware,
     response::IntoResponse,
     routing::{delete, get, post, put},
+    Router,
 };
 use serde_json::json;
 
@@ -13,7 +13,7 @@ use crate::web_server::{
     managed_project_sites as managed_sites,
     models::{
         AdminResourceSummary, CreateManagedSiteRequest, ManagedSiteLogsResponse,
-        ManagedSiteRuntimeStatus, UpdateManagedSiteRequest,
+        ManagedSiteRuntimeStatus, PreviewManagedSiteParsePlanRequest, UpdateManagedSiteRequest,
     },
 };
 
@@ -21,6 +21,10 @@ pub fn create_admin_routes() -> Router {
     Router::new()
         .route("/api/admin/resources/summary", get(get_resource_summary))
         .route("/api/admin/sites", get(list_sites).post(create_site))
+        .route(
+            "/api/admin/sites/preview-parse-plan",
+            post(preview_parse_plan),
+        )
         .route(
             "/api/admin/sites/{id}",
             get(get_site).put(update_site).delete(delete_site),
@@ -57,6 +61,15 @@ pub async fn create_site(Json(payload): Json<CreateManagedSiteRequest>) -> impl 
             "创建站点成功",
             Some(site),
         ),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+pub async fn preview_parse_plan(
+    Json(payload): Json<PreviewManagedSiteParsePlanRequest>,
+) -> impl IntoResponse {
+    match managed_sites::preview_parse_plan(payload) {
+        Ok(plan) => admin_response::ok("获取解析预览成功", plan),
         Err(err) => admin_response::managed_error(err.to_string()),
     }
 }
@@ -112,12 +125,10 @@ pub async fn start_site(Path(site_id): Path<String>) -> impl IntoResponse {
 
 pub async fn stop_site(Path(site_id): Path<String>) -> impl IntoResponse {
     match managed_sites::stop_site(&site_id).await {
-        Ok(result) if result.conflict => admin_response::conflict(
-            format!(
-                "受管进程已停止，但端口仍被外部进程占用: web={:?} db={:?}",
-                result.web_conflict_pids, result.db_conflict_pids
-            ),
-        ),
+        Ok(result) if result.conflict => admin_response::conflict(format!(
+            "受管进程已停止，但端口仍被外部进程占用: web={:?} db={:?}",
+            result.web_conflict_pids, result.db_conflict_pids
+        )),
         Ok(result) => admin_response::ok("停止站点成功", result.site),
         Err(err) => admin_response::managed_error(err.to_string()),
     }

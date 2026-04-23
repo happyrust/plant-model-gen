@@ -10,13 +10,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::web_server::{
-    AppState, admin_auth_handlers, admin_task_handlers,
+    AppState, admin_auth_handlers,
     admin_response::{self, ApiResponse},
-    handlers,
+    admin_task_handlers, handlers,
     models::{
         DatabaseConfig, DeploymentSiteCreateRequest, DeploymentSiteImportRequest,
-        DeploymentSiteQuery, DeploymentSiteTaskRequest, DeploymentSiteUpdateRequest,
-        TaskInfo,
+        DeploymentSiteQuery, DeploymentSiteTaskRequest, DeploymentSiteUpdateRequest, TaskInfo,
     },
 };
 
@@ -58,19 +57,25 @@ pub fn create_admin_registry_routes() -> Router<AppState> {
             "/api/admin/registry/sites/{id}/tasks",
             post(create_site_task),
         )
-        .layer(middleware::from_fn(admin_auth_handlers::admin_auth_middleware))
+        .layer(middleware::from_fn(
+            admin_auth_handlers::admin_auth_middleware,
+        ))
 }
 
 async fn list_sites(Query(params): Query<DeploymentSiteQuery>) -> impl IntoResponse {
     match handlers::api_get_deployment_sites(Query(params)).await {
         Ok(Json(value)) => admin_response::ok("获取注册表站点列表成功", value),
-        Err(status) => admin_response::response::<Value>(status, false, "获取注册表站点列表失败", None),
+        Err(status) => {
+            admin_response::response::<Value>(status, false, "获取注册表站点列表失败", None)
+        }
     }
 }
 
 async fn create_site(Json(payload): Json<DeploymentSiteCreateRequest>) -> impl IntoResponse {
     match handlers::api_create_deployment_site(Json(payload)).await {
-        Ok(Json(value)) => admin_response::accepted("创建注册表站点成功", unwrap_item_or_value(value)),
+        Ok(Json(value)) => {
+            admin_response::accepted("创建注册表站点成功", unwrap_item_or_value(value))
+        }
         Err((status, Json(value))) => extract_proxy_error(status, value, "创建注册表站点失败"),
     }
 }
@@ -78,7 +83,9 @@ async fn create_site(Json(payload): Json<DeploymentSiteCreateRequest>) -> impl I
 async fn get_site(Path(site_id): Path<String>) -> impl IntoResponse {
     match handlers::api_get_deployment_site(Path(site_id)).await {
         Ok(Json(value)) => admin_response::ok("获取注册表站点详情成功", value),
-        Err(status) => admin_response::response::<Value>(status, false, "获取注册表站点详情失败", None),
+        Err(status) => {
+            admin_response::response::<Value>(status, false, "获取注册表站点详情失败", None)
+        }
     }
 }
 
@@ -94,7 +101,10 @@ async fn update_site(
 
 async fn delete_site(Path(site_id): Path<String>) -> impl IntoResponse {
     match handlers::api_delete_deployment_site(Path(site_id.clone())).await {
-        Ok(_) => admin_response::ok("删除注册表站点成功", json!({"site_id": site_id, "deleted": true})),
+        Ok(_) => admin_response::ok(
+            "删除注册表站点成功",
+            json!({"site_id": site_id, "deleted": true}),
+        ),
         Err(status) => admin_response::response::<Value>(status, false, "删除注册表站点失败", None),
     }
 }
@@ -103,7 +113,9 @@ async fn import_site_from_dboption(
     payload: Option<Json<DeploymentSiteImportRequest>>,
 ) -> impl IntoResponse {
     match handlers::api_import_deployment_site_from_dboption(payload).await {
-        Ok(Json(value)) => admin_response::accepted("导入注册表站点成功", unwrap_item_or_value(value)),
+        Ok(Json(value)) => {
+            admin_response::accepted("导入注册表站点成功", unwrap_item_or_value(value))
+        }
         Err((status, Json(value))) => extract_proxy_error(status, value, "导入注册表站点失败"),
     }
 }
@@ -152,9 +164,7 @@ async fn create_site_task(
                 .task_name
                 .clone()
                 .unwrap_or_else(|| format!("registry-{:?}", task_type));
-            let config = payload
-                .config_override
-                .unwrap_or_default();
+            let config = payload.config_override.unwrap_or_default();
             let mut unified_task = TaskInfo::new_with_priority(
                 task_name,
                 task_type,

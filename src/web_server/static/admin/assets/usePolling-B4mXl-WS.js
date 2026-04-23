@@ -1,0 +1,1 @@
+import{G as e,I as t}from"./client-BJMWLCVY.js";function n(n,r=3e4){let i=e(!1),a=null;function o(){i.value||(i.value=!0,a=setInterval(n,r))}function s(){i.value=!1,a&&=(clearInterval(a),null)}function c(e){return s(),r=e,o(),i}return t(s),{active:i,start:o,stop:s,setInterval:c}}export{n as t};

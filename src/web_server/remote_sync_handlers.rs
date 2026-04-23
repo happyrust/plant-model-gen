@@ -4,14 +4,21 @@ use axum::{
     extract::{OriginalUri, Path, Query},
     http::{Request, StatusCode, Uri},
     response::{Html, IntoResponse, Json, Response, sse::{Event, KeepAlive, Sse}},
-    routing::{get, post, put, delete as axum_delete},
+    routing::{delete as axum_delete, get, post, put},
 };
 use futures::stream::StreamExt;
 use once_cell::sync::Lazy;
 use rusqlite::{OptionalExtension, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{convert::Infallible, convert::TryFrom, io::ErrorKind, path::PathBuf, time::Instant};
+use std::{
+    convert::Infallible,
+    convert::TryFrom,
+    io::{ErrorKind, Write},
+    path::{Path as FsPath, PathBuf},
+    time::Instant,
+};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::broadcast;
 use tokio::time::{Duration, timeout};
 use tokio::{fs, net::TcpStream};
@@ -63,10 +70,7 @@ pub fn emit_remote_sync_event(event: RemoteSyncEvent) {
 
 pub fn create_remote_sync_routes() -> Router {
     Router::new()
-        .route(
-            "/api/remote-sync/envs",
-            get(list_envs).post(create_env),
-        )
+        .route("/api/remote-sync/envs", get(list_envs).post(create_env))
         .route(
             "/api/remote-sync/envs/{id}",
             get(get_env).put(update_env).delete(delete_env),
@@ -76,7 +80,10 @@ pub fn create_remote_sync_routes() -> Router {
         .route("/api/remote-sync/runtime/stop", post(stop_runtime))
         .route("/api/remote-sync/envs/{id}/test-mqtt", post(test_mqtt_env))
         .route("/api/remote-sync/envs/{id}/test-http", post(test_http_env))
-        .route("/api/remote-sync/sites/{id}/test-http", post(test_http_site))
+        .route(
+            "/api/remote-sync/sites/{id}/test-http",
+            post(test_http_site),
+        )
         .route("/api/remote-sync/runtime/status", get(runtime_status))
         .route("/api/remote-sync/runtime/config", get(runtime_config))
         .route(
@@ -94,15 +101,24 @@ pub fn create_remote_sync_routes() -> Router {
             "/api/remote-sync/sites/{id}",
             put(update_site).delete(delete_site),
         )
-        .route("/api/remote-sync/sites/{id}/metadata", get(get_site_metadata))
-        .route("/api/remote-sync/sites/{id}/files/{*path}", get(serve_site_files))
+        .route(
+            "/api/remote-sync/sites/{id}/metadata",
+            get(get_site_metadata),
+        )
+        .route(
+            "/api/remote-sync/sites/{id}/files/{*path}",
+            get(serve_site_files),
+        )
         .route(
             "/api/remote-sync/topology",
             get(topology_handlers::get_topology)
                 .post(topology_handlers::save_topology)
                 .delete(topology_handlers::delete_topology),
         )
-        .route("/api/remote-sync/sites/{id}/files", get(serve_site_files_root))
+        .route(
+            "/api/remote-sync/sites/{id}/files",
+            get(serve_site_files_root),
+        )
         // v2 · ROADMAP M2 · 任务队列
         .route("/api/remote-sync/tasks/active", get(list_active_tasks))
         .route("/api/remote-sync/tasks/{id}/abort", post(abort_active_task))
@@ -428,7 +444,8 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 }
 
 fn parse_u32_csv(value: Option<String>) -> Vec<u32> {
-    value.unwrap_or_default()
+    value
+        .unwrap_or_default()
         .split(|c| c == ',' || c == ' ')
         .filter_map(|token| token.trim().parse::<u32>().ok())
         .collect()
@@ -537,7 +554,11 @@ fn set_root_string_key(content: &mut String, key: &str, value: Option<&str>) {
 }
 
 fn set_root_number_key<T: std::fmt::Display>(content: &mut String, key: &str, value: Option<T>) {
-    replace_or_insert_root_line(content, key, value.map(|number| format!("{key} = {number}")));
+    replace_or_insert_root_line(
+        content,
+        key,
+        value.map(|number| format!("{key} = {number}")),
+    );
 }
 
 fn set_root_u32_array_key(content: &mut String, key: &str, values: &[u32]) {
@@ -712,12 +733,10 @@ pub async fn get_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>, 
             eprintln!("get_env: SQL prepare 失败: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    let mut rows = stmt
-        .query(rusqlite::params![id])
-        .map_err(|e| {
-            eprintln!("get_env: 查询失败: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let mut rows = stmt.query(rusqlite::params![id]).map_err(|e| {
+        eprintln!("get_env: 查询失败: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     if let Some(row) = rows.next().map_err(|e| {
         eprintln!("get_env: 行读取失败: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -792,7 +811,9 @@ pub async fn update_env(
 pub async fn delete_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>, StatusCode> {
     // 如果正在运行的协同组正是要删除的，先停止运行时
     {
-        let guard = crate::web_server::remote_runtime::REMOTE_RUNTIME.read().await;
+        let guard = crate::web_server::remote_runtime::REMOTE_RUNTIME
+            .read()
+            .await;
         if let Some(state) = guard.as_ref() {
             if state.env_id == id {
                 drop(guard);
@@ -860,12 +881,17 @@ fn validate_http_host(host: &Option<String>) -> Result<(), String> {
         return Err("http_host 不支持 file:// 本地路径".into());
     }
 
-    let parsed = reqwest::Url::parse(h).map_err(|_| "http_host 格式不合法，仅支持 HTTP/HTTPS 地址".to_string())?;
+    let parsed = reqwest::Url::parse(h)
+        .map_err(|_| "http_host 格式不合法，仅支持 HTTP/HTTPS 地址".to_string())?;
     match parsed.scheme() {
         "http" | "https" => {}
         _ => return Err("http_host 格式不合法，仅支持 HTTP/HTTPS 地址".into()),
     }
-    if parsed.host_str().map(|value| value.trim().is_empty()).unwrap_or(true) {
+    if parsed
+        .host_str()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+    {
         return Err("http_host 缺少主机名".into());
     }
     Ok(())
@@ -1122,13 +1148,20 @@ fn failed_diagnostic(
 /// 测试环境 MQTT 连接（TCP 可达性）
 pub async fn test_mqtt_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>, StatusCode> {
     let (host, port) = {
-        let conn = open_sqlite().map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+        let conn = open_sqlite().map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
         let mut stmt = conn
             .prepare("SELECT mqtt_host, mqtt_port FROM remote_sync_envs WHERE id = ?1 LIMIT 1")
-            .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
-        let mut rows = stmt
-            .query(rusqlite::params![id])
-            .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+            .map_err(|e| {
+                eprintln!("remote_sync: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let mut rows = stmt.query(rusqlite::params![id]).map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
         let row = match rows.next() {
             Ok(Some(r)) => r,
             _ => return Err(StatusCode::NOT_FOUND),
@@ -1190,13 +1223,20 @@ pub async fn test_mqtt_env(Path(id): Path<String>) -> Result<Json<serde_json::Va
 /// 测试环境文件服务地址（HTTP 可达性）
 pub async fn test_http_env(Path(id): Path<String>) -> Result<Json<serde_json::Value>, StatusCode> {
     let url: String = {
-        let conn = open_sqlite().map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+        let conn = open_sqlite().map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
         let mut stmt = conn
             .prepare("SELECT file_server_host FROM remote_sync_envs WHERE id = ?1 LIMIT 1")
-            .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
-        let mut rows = stmt
-            .query(rusqlite::params![id])
-            .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+            .map_err(|e| {
+                eprintln!("remote_sync: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let mut rows = stmt.query(rusqlite::params![id]).map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
         let row = match rows.next() {
             Ok(Some(r)) => r,
             _ => return Err(StatusCode::NOT_FOUND),
@@ -1247,7 +1287,10 @@ pub async fn test_http_env(Path(id): Path<String>) -> Result<Json<serde_json::Va
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     let start = Instant::now();
     match client.get(&url).send().await {
         Ok(resp) => {
@@ -1280,7 +1323,10 @@ pub async fn test_http_env(Path(id): Path<String>) -> Result<Json<serde_json::Va
 pub async fn test_http_site(
     Path(site_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let conn = open_sqlite().map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let conn = open_sqlite().map_err(|e| {
+        eprintln!("remote_sync: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let info = load_site_info(&conn, &site_id)?;
     drop(conn);
 
@@ -1311,7 +1357,10 @@ pub async fn test_http_site(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     let start = Instant::now();
     match client.get(&metadata_url).send().await {
         Ok(resp) => {
@@ -1535,7 +1584,10 @@ pub struct LogQueryParams {
 pub async fn list_logs(
     Query(params): Query<LogQueryParams>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let conn = open_sqlite().map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let conn = open_sqlite().map_err(|e| {
+        eprintln!("remote_sync: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let limit = params.limit.unwrap_or(50).min(500);
     let offset = params.offset.unwrap_or(0);
@@ -1586,12 +1638,18 @@ pub async fn list_logs(
     let count_sql = format!("SELECT COUNT(*) FROM remote_sync_logs{}", where_clause);
     let total: i64 = conn
         .prepare(&count_sql)
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?
+        .map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .query_row(
             rusqlite::params_from_iter(values.clone().into_iter()),
             |row| row.get(0),
         )
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let mut list_params = values.clone();
     list_params.push(SqlValue::Integer(limit as i64));
@@ -1607,9 +1665,10 @@ pub async fn list_logs(
         where_clause
     );
 
-    let mut stmt = conn
-        .prepare(&list_sql)
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let mut stmt = conn.prepare(&list_sql).map_err(|e| {
+        eprintln!("remote_sync: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let rows = stmt
         .query_map(rusqlite::params_from_iter(list_params.into_iter()), |row| {
             Ok(RemoteSyncLogRecord {
@@ -1640,11 +1699,17 @@ pub async fn list_logs(
                 updated_at: row.get(16)?,
             })
         })
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let mut items = Vec::new();
     for row in rows {
-        items.push(row.map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?);
+        items.push(row.map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?);
     }
 
     Ok(Json(json!({
@@ -1666,7 +1731,10 @@ pub struct DailyStatsQuery {
 pub async fn daily_stats(
     Query(params): Query<DailyStatsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let conn = open_sqlite().map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let conn = open_sqlite().map_err(|e| {
+        eprintln!("remote_sync: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let days = params.days.unwrap_or(7).max(1).min(90);
     let start_time = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
@@ -1702,9 +1770,10 @@ pub async fn daily_stats(
 
     values.push(SqlValue::Integer(days as i64));
 
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let mut stmt = conn.prepare(&sql).map_err(|e| {
+        eprintln!("remote_sync: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let rows = stmt
         .query_map(rusqlite::params_from_iter(values.into_iter()), |row| {
             Ok(json!({
@@ -1716,11 +1785,17 @@ pub async fn daily_stats(
                 "total_bytes": row.get::<_, i64>(5).unwrap_or(0),
             }))
         })
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let mut items = Vec::new();
     for row in rows {
-        items.push(row.map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?);
+        items.push(row.map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?);
     }
 
     Ok(Json(json!({
@@ -1738,7 +1813,10 @@ pub struct FlowStatsQuery {
 pub async fn flow_stats(
     Query(params): Query<FlowStatsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let conn = open_sqlite().map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let conn = open_sqlite().map_err(|e| {
+        eprintln!("remote_sync: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let limit = params.limit.unwrap_or(20).max(1).min(200);
 
@@ -1775,9 +1853,10 @@ pub async fn flow_stats(
 
     values.push(SqlValue::Integer(limit as i64));
 
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let mut stmt = conn.prepare(&sql).map_err(|e| {
+        eprintln!("remote_sync: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let rows = stmt
         .query_map(rusqlite::params_from_iter(values.into_iter()), |row| {
             Ok(json!({
@@ -1791,11 +1870,17 @@ pub async fn flow_stats(
                 "total_bytes": row.get::<_, i64>(7).unwrap_or(0),
             }))
         })
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let mut items = Vec::new();
     for row in rows {
-        items.push(row.map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?);
+        items.push(row.map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?);
     }
 
     Ok(Json(json!({
@@ -1872,7 +1957,10 @@ async fn serve_site_files_impl(
     original_uri: Uri,
     mut req: Request<Body>,
 ) -> Result<Response, StatusCode> {
-    let conn = open_sqlite().map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let conn = open_sqlite().map_err(|e| {
+        eprintln!("remote_sync: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let info = load_site_info(&conn, &site_id)?;
     drop(conn);
 
@@ -1889,15 +1977,16 @@ async fn serve_site_files_impl(
         new_path.push('?');
         new_path.push_str(query);
     }
-    let new_uri: Uri = new_path
-        .parse()
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let new_uri: Uri = new_path.parse().map_err(|e| {
+        eprintln!("remote_sync: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     *req.uri_mut() = new_uri;
 
-    let response = service
-        .oneshot(req)
-        .await
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let response = service.oneshot(req).await.map_err(|e| {
+        eprintln!("remote_sync: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     Ok(response.map(Body::new))
 }
 
@@ -1906,7 +1995,10 @@ async fn load_site_metadata(
     refresh: bool,
     cache_only: bool,
 ) -> Result<MetadataLoadContext, StatusCode> {
-    let conn = open_sqlite().map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let conn = open_sqlite().map_err(|e| {
+        eprintln!("remote_sync: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let info = load_site_info(&conn, site_id)?;
     drop(conn);
 
@@ -2039,7 +2131,10 @@ async fn load_site_metadata(
 fn load_site_info(conn: &rusqlite::Connection, site_id: &str) -> Result<SiteInfo, StatusCode> {
     let mut stmt_site = conn
         .prepare("SELECT env_id, name, http_host FROM remote_sync_sites WHERE id = ?1 LIMIT 1")
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     let site_row = stmt_site
         .query_row([site_id], |row| {
             Ok((
@@ -2049,7 +2144,10 @@ fn load_site_info(conn: &rusqlite::Connection, site_id: &str) -> Result<SiteInfo
             ))
         })
         .optional()
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     let (env_id, site_name, site_host) = match site_row {
         Some(row) => row,
         None => return Err(StatusCode::NOT_FOUND),
@@ -2057,13 +2155,19 @@ fn load_site_info(conn: &rusqlite::Connection, site_id: &str) -> Result<SiteInfo
 
     let mut stmt_env = conn
         .prepare("SELECT name, file_server_host FROM remote_sync_envs WHERE id = ?1 LIMIT 1")
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     let env_row = stmt_env
         .query_row([env_id.as_str()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })
         .optional()
-        .map_err(|e| { eprintln!("remote_sync: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| {
+            eprintln!("remote_sync: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     let (env_name, env_file_host) = match env_row {
         Some((name, host)) => (Some(name), host),
         None => (None, None),

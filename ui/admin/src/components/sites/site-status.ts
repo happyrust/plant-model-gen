@@ -1,4 +1,9 @@
-import type { ManagedProjectSite, ManagedSiteStatus, ManagedSiteParseStatus } from '@/types/site'
+import type {
+  ManagedProjectSite,
+  ManagedSiteParsePlan,
+  ManagedSiteParseStatus,
+  ManagedSiteStatus,
+} from '@/types/site'
 
 export type QuickFilter = 'all' | 'running' | 'busy' | 'error' | 'pending_parse'
 
@@ -34,6 +39,22 @@ export function parseStatusClass(status: ManagedSiteParseStatus): string {
   if (status === 'Running') return 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200'
   if (status === 'Failed') return 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
   return 'bg-muted text-muted-foreground'
+}
+
+export function parsePlanClass(plan?: ManagedSiteParsePlan | null): string {
+  if (plan?.mode === 'FastReparse') {
+    return 'bg-cyan-100 text-cyan-800 dark:bg-cyan-900 dark:text-cyan-200'
+  }
+  if (plan?.mode === 'RebuildSystem') {
+    return 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200'
+  }
+  if (plan?.mode === 'Selective') {
+    return 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200'
+  }
+  if (plan?.mode === 'Bootstrap') {
+    return 'bg-violet-100 text-violet-800 dark:bg-violet-900 dark:text-violet-200'
+  }
+  return 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200'
 }
 
 export function isSiteBusy(site: ManagedProjectSite): boolean {

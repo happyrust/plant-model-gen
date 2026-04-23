@@ -64,8 +64,7 @@ fn warn_if_default_jwt_secret(secret: &str) {
 
 impl Default for JwtConfig {
     fn default() -> Self {
-        let secret =
-            std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_JWT_SECRET.to_string());
+        let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_JWT_SECRET.to_string());
         warn_if_default_jwt_secret(&secret);
         Self {
             secret,
@@ -561,7 +560,10 @@ pub async fn review_auth_middleware(
             .and_then(|token| match decode_token_unsafe(token) {
                 Ok(claims) => Some(claims),
                 Err(error) => {
-                    warn!("JWT decode without verification failed in debug mode: {}", error);
+                    warn!(
+                        "JWT decode without verification failed in debug mode: {}",
+                        error
+                    );
                     None
                 }
             })

@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-04-23
+
+### Added
+
+- 异地协同 v2 远程同步 SSE 实时事件流（M3 B5）：`RemoteSyncEvent` broadcast channel + `/api/remote-sync/events/stream` SSE handler
+- 异地协同 v2 任务队列 API（M2）：活跃任务列表 / 中止、失败任务列表 / 重试 / 清理、协同组参数配置 CRUD
+- `review_db.rs`：三维校审数据层独立模块
+- Admin 站点管理增强：`SiteDrawer` 抽屉详情、`SiteDetailView` 站点详情页、`SiteConfigSections` 配置分区、`parse-db-types.ts` 数据库类型解析
+- Admin 前端全量重构产物更新（新 hash 静态资源替换旧资源）
+- 平台 API 增强：`annotation_check` 批注校验、`review_form` 审核表单、`workflow_sync` 流程同步
+
+### Changed
+
+- `remote_sync_handlers.rs` 合并 SSE 广播 + 原子文件写入 + AsyncMutex 配置锁，解决 stash 合并冲突
+- `managed_project_sites.rs` 站点生命周期管理加固
+- `e3d_tree_api.rs` / `mbd_pipe_api.rs` / `review_api.rs` / `jwt_auth.rs` 接口优化
+- `handlers.rs` / `admin_handlers.rs` / `admin_task_handlers.rs` / `admin_registry_handlers.rs` 路由与鉴权增强
+- `room_model.rs` / `room_api.rs` 模型计算优化
+- `cli_modes.rs` 命令行模式扩展
+
 ## Unreleased
 
 ### Added

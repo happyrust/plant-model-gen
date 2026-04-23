@@ -20,6 +20,8 @@ import SiteLogSummaryPanel from '@/components/sites/SiteLogSummaryPanel.vue'
 import SiteRecentActivityPanel from '@/components/sites/SiteRecentActivityPanel.vue'
 import SiteConfigSections from '@/components/sites/SiteConfigSections.vue'
 import SiteDrawer from '@/components/sites/SiteDrawer.vue'
+import { matchParsePreset, parseDbTypeLabelMap, splitParseDbTypes } from '@/components/sites/parse-db-types'
+import { parsePlanClass } from '@/components/sites/site-status'
 import { buildViewerUrl } from '@/lib/viewer'
 import type {
   ManagedProjectSite,
@@ -46,6 +48,12 @@ const drawerOpen = ref(false)
 const siteId = computed(() => String(route.params.id ?? ''))
 const resources = computed(() => runtime.value?.resources ?? null)
 const actionError = computed(() => sitesStore.getSiteActionError(siteId.value))
+const parsePlan = computed(() => runtime.value?.parse_plan ?? site.value?.parse_plan ?? null)
+const groupedParseDbTypes = computed(() => splitParseDbTypes(site.value?.parse_db_types ?? []))
+const matchedPreset = computed(() => matchParsePreset(
+  site.value?.parse_db_types ?? [],
+  site.value?.force_rebuild_system_db ?? false,
+))
 
 const selectedLogs = computed(() => {
   if (logsData.value === null) return []
@@ -321,6 +329,84 @@ onMounted(async () => {
       </div>
 
       <SiteRuntimeCards :site="site" :runtime="runtime" />
+
+      <div v-if="parsePlan" class="rounded-lg border border-border bg-card p-5">
+        <div class="mb-4 flex items-center gap-2">
+          <TimerReset class="h-4 w-4 text-muted-foreground" />
+          <h3 class="text-base font-medium">解析计划</h3>
+        </div>
+        <div class="space-y-4 text-sm">
+          <div class="flex flex-wrap items-center gap-3">
+            <span
+              class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
+              :class="parsePlanClass(parsePlan)"
+            >
+              {{ parsePlan.label }}
+            </span>
+            <span class="text-muted-foreground">
+              {{
+                parsePlan.mode === 'RebuildSystem'
+                  ? '会重新解析系统数据'
+                  : parsePlan.includes_system_db_files
+                    ? '会补齐系统数据'
+                    : '只重解析目标数据'
+              }}
+            </span>
+          </div>
+          <div class="text-muted-foreground">{{ parsePlan.detail }}</div>
+          <div class="rounded-lg border border-border/60 bg-background p-4">
+            <div class="text-xs text-muted-foreground">模型数据</div>
+            <div v-if="groupedParseDbTypes.model.length" class="mt-2 flex flex-wrap gap-2">
+              <span
+                v-for="type in groupedParseDbTypes.model"
+                :key="type"
+                class="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs"
+              >
+                {{ parseDbTypeLabelMap[type] || type }}
+              </span>
+            </div>
+            <div v-else class="mt-2 text-sm text-muted-foreground">未单独限制</div>
+          </div>
+          <div class="rounded-lg border border-border/60 bg-background p-4">
+            <div class="text-xs text-muted-foreground">系统数据</div>
+            <div v-if="groupedParseDbTypes.system.length" class="mt-2 flex flex-wrap gap-2">
+              <span
+                v-for="type in groupedParseDbTypes.system"
+                :key="type"
+                class="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs"
+              >
+                {{ parseDbTypeLabelMap[type] || type }}
+              </span>
+            </div>
+            <div v-else class="mt-2 text-sm text-muted-foreground">未单独限制</div>
+          </div>
+          <div v-if="site" class="rounded-lg border border-border/60 bg-background p-4">
+            <div class="text-xs text-muted-foreground">系统库策略</div>
+            <div class="mt-2 text-sm">
+              {{ site.force_rebuild_system_db ? '强制重建 SYST' : '优先复用已解析 SYST' }}
+            </div>
+          </div>
+          <div class="rounded-lg border border-border/60 bg-background p-4">
+            <div class="text-xs text-muted-foreground">常用预设</div>
+            <div class="mt-2 text-sm">
+              {{ matchedPreset?.label || '自定义组合' }}
+            </div>
+          </div>
+          <div class="rounded-lg border border-border/60 bg-background p-4">
+            <div class="text-xs text-muted-foreground">当前解析文件</div>
+            <div v-if="parsePlan.included_db_files.length" class="mt-2 flex flex-wrap gap-2">
+              <span
+                v-for="file in parsePlan.included_db_files"
+                :key="file"
+                class="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs"
+              >
+                {{ file }}
+              </span>
+            </div>
+            <div v-else class="mt-2 text-sm text-muted-foreground">按项目配置做全量解析</div>
+          </div>
+        </div>
+      </div>
 
       <SiteRecentActivityPanel :runtime="runtime" />
 

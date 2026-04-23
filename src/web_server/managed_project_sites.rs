@@ -18,10 +18,10 @@ use std::process::Stdio;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use parse_pdms_db::parse::parse_file_basic_info;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 use sysinfo::{
     CpuRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System,
@@ -32,9 +32,10 @@ use tokio::task;
 use super::models::{
     AdminResourceSummary, CreateManagedSiteRequest, DatabaseConfig, ManagedProjectSite,
     ManagedSiteActivitySummary, ManagedSiteLogStreamSummary, ManagedSiteLogsResponse,
-    ManagedSiteParseHealth, ManagedSiteParseHealthStatus, ManagedSiteParseStatus,
-    ManagedSiteProcessResource, ManagedSiteResourceMetrics, ManagedSiteRiskLevel,
-    ManagedSiteRuntimeStatus, ManagedSiteStatus, UpdateManagedSiteRequest,
+    ManagedSiteParseHealth, ManagedSiteParseHealthStatus, ManagedSiteParsePlan,
+    ManagedSiteParsePlanMode, ManagedSiteParseStatus, ManagedSiteProcessResource,
+    ManagedSiteResourceMetrics, ManagedSiteRiskLevel, ManagedSiteRuntimeStatus, ManagedSiteStatus,
+    PreviewManagedSiteParsePlanRequest, UpdateManagedSiteRequest,
 };
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -57,7 +58,9 @@ const PROCESS_WARNING_MEMORY_BYTES: u64 = 1536 * 1024 * 1024;
 const PROCESS_CRITICAL_MEMORY_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const PARSE_WARNING_DURATION_MS: u64 = 10 * 60 * 1000;
 const PARSE_CRITICAL_DURATION_MS: u64 = 30 * 60 * 1000;
-const ADMIN_PARSE_REQUIRED_SYSTEM_DB_TYPES: &[&str] = &["SYST"];
+const DEFAULT_PARSE_DB_TYPES: &[&str] = &["SYST", "DESI"];
+const SUPPORTED_PARSE_DB_TYPES: &[&str] = &["SYST", "DESI", "CATA", "DICT", "GLB", "GLOB"];
+const REPARSE_REUSE_DB_TYPES: &[&str] = &["SYST"];
 
 // 运行时等待/杀进程超时。
 const WAIT_PORT_ATTEMPTS: usize = 30;
@@ -73,7 +76,7 @@ const SCAN_MAX_FILES: usize = 200_000;
 const PATH_SIZE_CACHE_TTL_MS: u64 = 60_000;
 
 // Schema 版本号：每次迁移 +1。
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 4;
 
 // ─── Global state (opt-in, interior mutability) ─────────────────────────────
 
@@ -119,9 +122,9 @@ fn shared_conn() -> &'static Mutex<Connection> {
         let conn = Connection::open(&path).unwrap_or_else(|err| {
             panic!("打开管理员站点数据库失败 ({path}): {err}");
         });
-        if let Err(err) = conn
-            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")
-        {
+        if let Err(err) = conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+        ) {
             tracing::warn!("初始化 SQLite pragma 失败: {err}");
         }
         if let Err(err) = ensure_schema_with_conn(&conn) {
@@ -399,6 +402,47 @@ fn manual_db_nums_from_json(raw: Option<String>) -> Vec<u32> {
         .unwrap_or_default()
 }
 
+fn default_parse_db_types() -> Vec<String> {
+    DEFAULT_PARSE_DB_TYPES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect()
+}
+
+fn normalize_parse_db_types(values: Vec<String>) -> Vec<String> {
+    let mut values = values
+        .into_iter()
+        .map(|value| value.trim().to_ascii_uppercase())
+        .filter(|value| SUPPORTED_PARSE_DB_TYPES.contains(&value.as_str()))
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn parse_db_types_to_json(values: &[String]) -> Result<String> {
+    Ok(serde_json::to_string(values)?)
+}
+
+fn parse_db_types_from_json(raw: Option<String>) -> Vec<String> {
+    match raw {
+        Some(value) => serde_json::from_str::<Vec<String>>(&value)
+            .map(normalize_parse_db_types)
+            .unwrap_or_default(),
+        None => default_parse_db_types(),
+    }
+}
+
+fn normalize_force_rebuild_system_db(
+    force_rebuild_system_db: bool,
+    parse_db_types: &[String],
+) -> bool {
+    force_rebuild_system_db
+        && parse_db_types
+            .iter()
+            .any(|value| REPARSE_REUSE_DB_TYPES.contains(&value.as_str()))
+}
+
 // ─── Enum / string conversions ──────────────────────────────────────────────
 
 fn status_to_str(status: &ManagedSiteStatus) -> &'static str {
@@ -556,8 +600,14 @@ fn scan_db_file_name(
         }
         let path = entry.path();
         if path.is_dir() {
-            if scan_db_file_name(&path, target_dbnum, target_types, depth + 1, visited, file_names)?
-            {
+            if scan_db_file_name(
+                &path,
+                target_dbnum,
+                target_types,
+                depth + 1,
+                visited,
+                file_names,
+            )? {
                 return Ok(true);
             }
             continue;
@@ -598,7 +648,14 @@ fn scan_db_file_name(
 fn find_db_file_name_for_dbnum(root: &Path, target_dbnum: u32) -> Result<Option<String>> {
     let mut visited = 0usize;
     let mut file_names = Vec::with_capacity(1);
-    scan_db_file_name(root, Some(target_dbnum), None, 0, &mut visited, &mut file_names)?;
+    scan_db_file_name(
+        root,
+        Some(target_dbnum),
+        None,
+        0,
+        &mut visited,
+        &mut file_names,
+    )?;
     Ok(file_names.into_iter().next())
 }
 
@@ -614,14 +671,29 @@ fn collect_db_file_names_for_types(
 
 fn should_include_system_db_files(site: &ManagedProjectSite) -> bool {
     if site.parse_status != ManagedSiteParseStatus::Parsed {
-        return true;
+        let db_path = Path::new(&site.db_data_path);
+        return !(site.last_parse_finished_at.is_some() && db_path.exists());
     }
     let db_path = Path::new(&site.db_data_path);
     !db_path.exists()
 }
 
+fn configured_parse_db_types(site: &ManagedProjectSite) -> Vec<String> {
+    normalize_parse_db_types(site.parse_db_types.clone())
+}
+
+fn force_rebuild_system_db_enabled(site: &ManagedProjectSite) -> bool {
+    let parse_db_types = configured_parse_db_types(site);
+    normalize_force_rebuild_system_db(site.force_rebuild_system_db, &parse_db_types)
+}
+
+fn parse_scope_enabled(site: &ManagedProjectSite) -> bool {
+    !site.manual_db_nums.is_empty() || !configured_parse_db_types(site).is_empty()
+}
+
 fn resolve_included_db_files(site: &ManagedProjectSite) -> Result<Vec<String>> {
-    if site.manual_db_nums.is_empty() {
+    let parse_db_types = configured_parse_db_types(site);
+    if site.manual_db_nums.is_empty() && parse_db_types.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -631,15 +703,55 @@ fn resolve_included_db_files(site: &ManagedProjectSite) -> Result<Vec<String>> {
         .ok_or_else(|| anyhow!("项目路径不存在: {}", site.project_path))?;
 
     let mut file_names = Vec::new();
-    let include_system = should_include_system_db_files(site);
-    tracing::debug!(site = %site.site_id, include_system, "resolve_included_db_files");
-    if include_system {
-        collect_db_file_names_for_types(
-            &project_root,
-            ADMIN_PARSE_REQUIRED_SYSTEM_DB_TYPES,
-            &mut file_names,
-        )?;
+    let selected_non_system_types = parse_db_types
+        .iter()
+        .filter(|value| !REPARSE_REUSE_DB_TYPES.contains(&value.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let has_other_targets =
+        !site.manual_db_nums.is_empty() || !selected_non_system_types.is_empty();
+    let force_rebuild_system_db = force_rebuild_system_db_enabled(site);
+
+    let include_reuse_types = parse_db_types
+        .iter()
+        .any(|value| REPARSE_REUSE_DB_TYPES.contains(&value.as_str()))
+        && (force_rebuild_system_db || should_include_system_db_files(site) || !has_other_targets);
+
+    tracing::debug!(
+        site = %site.site_id,
+        include_reuse_types,
+        force_rebuild_system_db,
+        parse_db_types = ?parse_db_types,
+        manual_db_nums = ?site.manual_db_nums,
+        "resolve_included_db_files"
+    );
+
+    if include_reuse_types {
+        let reuse_refs = parse_db_types
+            .iter()
+            .filter(|value| REPARSE_REUSE_DB_TYPES.contains(&value.as_str()))
+            .map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        collect_db_file_names_for_types(&project_root, &reuse_refs, &mut file_names)?;
     }
+
+    let include_desi_by_type =
+        parse_db_types.iter().any(|value| value == "DESI") && site.manual_db_nums.is_empty();
+    if include_desi_by_type {
+        collect_db_file_names_for_types(&project_root, &["DESI"], &mut file_names)?;
+    }
+
+    let extra_type_refs = parse_db_types
+        .iter()
+        .filter(|value| {
+            value.as_str() != "DESI" && !REPARSE_REUSE_DB_TYPES.contains(&value.as_str())
+        })
+        .map(|value| value.as_str())
+        .collect::<Vec<_>>();
+    if !extra_type_refs.is_empty() {
+        collect_db_file_names_for_types(&project_root, &extra_type_refs, &mut file_names)?;
+    }
+
     for dbnum in &site.manual_db_nums {
         let file_name = find_db_file_name_for_dbnum(&project_root, *dbnum)?
             .ok_or_else(|| anyhow!("项目路径下未找到 dbnum={} 对应的 db 文件", dbnum))?;
@@ -648,6 +760,175 @@ fn resolve_included_db_files(site: &ManagedProjectSite) -> Result<Vec<String>> {
     file_names.sort();
     file_names.dedup();
     Ok(file_names)
+}
+
+fn read_parse_config_included_db_files(site_id: &str) -> Vec<String> {
+    let path = parse_config_path(site_id);
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
+        return Vec::new();
+    };
+    value
+        .get("included_db_files")
+        .and_then(|entry| entry.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(|value| value.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn build_parse_plan_target_summary(
+    site: &ManagedProjectSite,
+    included_db_files: &[String],
+) -> String {
+    if !included_db_files.is_empty() {
+        return included_db_files.join(", ");
+    }
+    if site.manual_db_nums.is_empty() {
+        return "按项目配置全量解析".to_string();
+    }
+    let db_nums = site
+        .manual_db_nums
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    format!("dbnum={}", db_nums.join(", "))
+}
+
+fn is_system_db_file(file_name: &str) -> bool {
+    file_name.to_ascii_lowercase().contains("sys")
+}
+
+fn data_target_summary(site: &ManagedProjectSite, included_db_files: &[String]) -> String {
+    let data_files = included_db_files
+        .iter()
+        .filter(|file_name| !is_system_db_file(file_name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if data_files.is_empty() {
+        return "仅系统库".to_string();
+    }
+    build_parse_plan_target_summary(site, &data_files)
+}
+
+fn build_parse_type_summary(site: &ManagedProjectSite) -> String {
+    let parse_db_types = configured_parse_db_types(site);
+    if parse_db_types.is_empty() {
+        return "未额外勾选类型".to_string();
+    }
+    parse_db_types.join(", ")
+}
+
+fn build_parse_plan_with_files(
+    site: &ManagedProjectSite,
+    included_db_files: Vec<String>,
+) -> ManagedSiteParsePlan {
+    let parse_type_summary = build_parse_type_summary(site);
+    let parse_scope_enabled = parse_scope_enabled(site);
+    let force_rebuild_system_db = force_rebuild_system_db_enabled(site);
+    let selected_reuse_types = configured_parse_db_types(site)
+        .iter()
+        .any(|value| REPARSE_REUSE_DB_TYPES.contains(&value.as_str()));
+    let needs_bootstrap_system_db = should_include_system_db_files(site);
+
+    if !parse_scope_enabled {
+        let detail = if included_db_files.is_empty() {
+            "当前没有限制 db 文件，解析时会按项目配置做全量解析。".to_string()
+        } else {
+            format!(
+                "当前按配置解析这些文件：{}。",
+                build_parse_plan_target_summary(site, &included_db_files)
+            )
+        };
+        return ManagedSiteParsePlan {
+            mode: ManagedSiteParsePlanMode::Full,
+            label: "全量解析".to_string(),
+            detail,
+            includes_system_db_files: true,
+            included_db_files,
+        };
+    }
+
+    let includes_system_db_files = if included_db_files.is_empty() {
+        selected_reuse_types && (needs_bootstrap_system_db || force_rebuild_system_db)
+    } else {
+        included_db_files
+            .iter()
+            .any(|file_name| is_system_db_file(file_name))
+    };
+    let target_summary = build_parse_plan_target_summary(site, &included_db_files);
+    let data_target_summary = data_target_summary(site, &included_db_files);
+
+    if includes_system_db_files {
+        if force_rebuild_system_db && !needs_bootstrap_system_db {
+            ManagedSiteParsePlan {
+                mode: ManagedSiteParsePlanMode::RebuildSystem,
+                label: "重建系统库".to_string(),
+                detail: format!(
+                    "已勾选类型：{}。已开启强制重建系统库，本次会重新解析 SYST，再解析目标文件：{}。",
+                    parse_type_summary, data_target_summary
+                ),
+                includes_system_db_files,
+                included_db_files,
+            }
+        } else {
+            ManagedSiteParsePlan {
+                mode: ManagedSiteParsePlanMode::Bootstrap,
+                label: "首次解析".to_string(),
+                detail: format!(
+                    "已勾选类型：{}。本次会补齐系统数据，再解析目标文件：{}。",
+                    parse_type_summary, data_target_summary
+                ),
+                includes_system_db_files,
+                included_db_files,
+            }
+        }
+    } else if selected_reuse_types
+        && needs_bootstrap_system_db == false
+        && force_rebuild_system_db == false
+        && (site.manual_db_nums.len() > 0 || !included_db_files.is_empty())
+    {
+        ManagedSiteParsePlan {
+            mode: ManagedSiteParsePlanMode::FastReparse,
+            label: "快速重解析".to_string(),
+            detail: format!(
+                "已勾选类型：{}。本次复用已解析的 SYST，只解析当前目标：{}。",
+                parse_type_summary, target_summary
+            ),
+            includes_system_db_files,
+            included_db_files,
+        }
+    } else {
+        ManagedSiteParsePlan {
+            mode: ManagedSiteParsePlanMode::Selective,
+            label: "按范围解析".to_string(),
+            detail: format!(
+                "已勾选类型：{}。本次按当前范围解析：{}。",
+                parse_type_summary, target_summary
+            ),
+            includes_system_db_files,
+            included_db_files,
+        }
+    }
+}
+
+fn build_parse_plan(site: &ManagedProjectSite) -> ManagedSiteParsePlan {
+    build_parse_plan_with_files(site, read_parse_config_included_db_files(&site.site_id))
+}
+
+fn annotate_site_parse_plan(site: &mut ManagedProjectSite) {
+    site.parse_plan = build_parse_plan(site);
+}
+
+fn annotate_sites_parse_plans(sites: &mut [ManagedProjectSite]) {
+    for site in sites.iter_mut() {
+        annotate_site_parse_plan(site);
+    }
 }
 
 // ─── TOML helpers ───────────────────────────────────────────────────────────
@@ -825,8 +1106,13 @@ fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
             tracing::warn!("降权 {} 失败: {err}", tmp.display());
         }
     }
-    fs::rename(&tmp, path)
-        .with_context(|| format!("重命名临时文件失败: {} -> {}", tmp.display(), path.display()))?;
+    fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "重命名临时文件失败: {} -> {}",
+            tmp.display(),
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -842,6 +1128,8 @@ fn write_site_files(site: &ManagedProjectSite, db_user: &str, db_password: &str)
         "project_code": site.project_code,
         "project_path": site.project_path,
         "manual_db_nums": site.manual_db_nums,
+        "parse_db_types": site.parse_db_types,
+        "force_rebuild_system_db": site.force_rebuild_system_db,
         "db_port": site.db_port,
         "web_port": site.web_port,
         "entry_url": site.entry_url,
@@ -887,6 +1175,12 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedProjectSite> 
         project_code: row.get::<_, i64>("project_code")? as u32,
         project_path: row.get("project_path")?,
         manual_db_nums: manual_db_nums_from_json(row.get("manual_db_nums")?),
+        parse_db_types: parse_db_types_from_json(row.get("parse_db_types").unwrap_or(None)),
+        force_rebuild_system_db: row
+            .get::<_, Option<i64>>("force_rebuild_system_db")
+            .unwrap_or(None)
+            .unwrap_or(0)
+            != 0,
         config_path: row.get("config_path")?,
         runtime_dir: row.get("runtime_dir")?,
         db_data_path: row.get("db_data_path")?,
@@ -915,6 +1209,7 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedProjectSite> 
         last_parse_duration_ms: row
             .get::<_, Option<i64>>("last_parse_duration_ms")?
             .map(|value| value as u64),
+        parse_plan: ManagedSiteParsePlan::default(),
         risk_level: ManagedSiteRiskLevel::Normal,
         risk_reasons: Vec::new(),
         created_at: row.get("created_at")?,
@@ -933,6 +1228,8 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
             project_code INTEGER NOT NULL,
             project_path TEXT NOT NULL,
             manual_db_nums TEXT NOT NULL DEFAULT '[]',
+            parse_db_types TEXT NOT NULL DEFAULT '["SYST","DESI"]',
+            force_rebuild_system_db INTEGER NOT NULL DEFAULT 0,
             config_path TEXT NOT NULL,
             runtime_dir TEXT NOT NULL,
             db_data_path TEXT NOT NULL,
@@ -987,6 +1284,16 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
         current_version = 2;
         conn.pragma_update(None, "user_version", current_version as i64)?;
     }
+    if current_version < 3 {
+        ensure_column_exists(conn, "parse_db_types")?;
+        current_version = 3;
+        conn.pragma_update(None, "user_version", current_version as i64)?;
+    }
+    if current_version < 4 {
+        ensure_column_exists(conn, "force_rebuild_system_db")?;
+        current_version = 4;
+        conn.pragma_update(None, "user_version", current_version as i64)?;
+    }
     debug_assert!(current_version <= SCHEMA_VERSION);
     Ok(())
 }
@@ -1001,6 +1308,8 @@ fn ensure_column_exists(conn: &Connection, column: &str) -> Result<()> {
         let column_type = match column {
             "last_parse_duration_ms" => "INTEGER",
             "manual_db_nums" => "TEXT NOT NULL DEFAULT '[]'",
+            "parse_db_types" => "TEXT NOT NULL DEFAULT '[\"SYST\",\"DESI\"]'",
+            "force_rebuild_system_db" => "INTEGER NOT NULL DEFAULT 0",
             _ => "TEXT",
         };
         conn.execute(
@@ -1039,13 +1348,13 @@ fn persist_site_with_conn(
         &format!(
             "INSERT OR REPLACE INTO {table} (
                 site_id, project_name, project_code, project_path, config_path, runtime_dir,
-                manual_db_nums, db_data_path, db_port, web_port, bind_host, public_base_url,
+                manual_db_nums, parse_db_types, force_rebuild_system_db, db_data_path, db_port, web_port, bind_host, public_base_url,
                 associated_project,
                 db_pid, web_pid, parse_pid,
                 status, parse_status, last_error, entry_url, db_user, db_password,
                 last_parse_started_at, last_parse_finished_at, last_parse_duration_ms,
                 created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
             table = TABLE_NAME
         ),
         params![
@@ -1056,6 +1365,8 @@ fn persist_site_with_conn(
             &site.config_path,
             &site.runtime_dir,
             manual_db_nums_to_json(&site.manual_db_nums)?,
+            parse_db_types_to_json(&site.parse_db_types)?,
+            if site.force_rebuild_system_db { 1i64 } else { 0i64 },
             &site.db_data_path,
             site.db_port as i64,
             site.web_port as i64,
@@ -1081,10 +1392,7 @@ fn persist_site_with_conn(
     Ok(())
 }
 
-fn load_credentials_with_conn(
-    conn: &Connection,
-    site_id: &str,
-) -> Result<(String, String)> {
+fn load_credentials_with_conn(conn: &Connection, site_id: &str) -> Result<(String, String)> {
     let sql = format!(
         "SELECT db_user, db_password FROM {table} WHERE site_id = ?1",
         table = TABLE_NAME
@@ -1099,6 +1407,19 @@ fn load_credentials_with_conn(
     })
     .optional()?
     .ok_or_else(|| anyhow!("站点不存在"))
+}
+
+fn load_site_and_credentials(site_id: &str) -> Result<(ManagedProjectSite, String, String)> {
+    with_conn(|conn| {
+        let site = load_site_with_conn(conn, site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
+        let (db_user, db_password) = load_credentials_with_conn(conn, site_id)?;
+        Ok((site, db_user, db_password))
+    })
+}
+
+fn rewrite_site_files_from_storage(site_id: &str) -> Result<()> {
+    let (site, db_user, db_password) = load_site_and_credentials(site_id)?;
+    write_site_files(&site, &db_user, &db_password)
 }
 
 fn assert_port_available_with_conn(
@@ -1143,6 +1464,7 @@ pub fn get_site(site_id: &str) -> Result<Option<ManagedProjectSite>> {
     let mut site = with_conn(|conn| load_site_with_conn(conn, site_id))?;
     if let Some(item) = site.as_mut() {
         *item = derive_runtime_state(item.clone());
+        annotate_site_parse_plan(item);
         annotate_site_risk(item);
     }
     Ok(site)
@@ -1164,6 +1486,7 @@ pub fn list_sites() -> Result<Vec<ManagedProjectSite>> {
     for item in items.iter_mut() {
         *item = derive_runtime_state(item.clone());
     }
+    annotate_sites_parse_plans(&mut items);
     annotate_sites_risks(&mut items);
     Ok(items)
 }
@@ -1206,12 +1529,18 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
     let db_user = require_db_user(req.db_user)?;
     let db_password = require_db_password(req.db_password)?;
 
+    let parse_db_types = normalize_parse_db_types(req.parse_db_types);
     let site = ManagedProjectSite {
         site_id: site_id.clone(),
         project_name: req.project_name.trim().to_string(),
         project_code: req.project_code,
         project_path: canonical_path.to_string_lossy().to_string(),
         manual_db_nums: normalize_manual_db_nums(req.manual_db_nums),
+        force_rebuild_system_db: normalize_force_rebuild_system_db(
+            req.force_rebuild_system_db,
+            &parse_db_types,
+        ),
+        parse_db_types,
         config_path: config_path(&site_id).to_string_lossy().to_string(),
         runtime_dir: site_runtime_dir(&site_id).to_string_lossy().to_string(),
         db_data_path: db_data_path(&site_id).to_string_lossy().to_string(),
@@ -1232,6 +1561,7 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
         last_parse_started_at: None,
         last_parse_finished_at: None,
         last_parse_duration_ms: None,
+        parse_plan: ManagedSiteParsePlan::default(),
         risk_level: ManagedSiteRiskLevel::Normal,
         risk_reasons: Vec::new(),
         created_at: created_at.clone(),
@@ -1252,7 +1582,118 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
         return Err(err);
     }
 
+    let mut site = site;
+    annotate_site_parse_plan(&mut site);
     Ok(site)
+}
+
+fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<ManagedProjectSite> {
+    let project_name = req.project_name.trim();
+    if project_name.is_empty() {
+        bail!("项目名不能为空");
+    }
+    let project_path = req.project_path.trim();
+    if project_path.is_empty() {
+        bail!("项目路径不能为空");
+    }
+    if req.web_port == 0 {
+        bail!("站点端口不能为空");
+    }
+
+    let canonical_path = canonical_project_path(project_path)?;
+    let parse_db_types = normalize_parse_db_types(req.parse_db_types);
+    let force_rebuild_system_db =
+        normalize_force_rebuild_system_db(req.force_rebuild_system_db, &parse_db_types);
+
+    let mut site = if let Some(site_id) = req
+        .site_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在: {}", site_id))?
+    } else {
+        let site_id = infer_site_id(project_name, req.web_port);
+        let bind_host = normalize_host(req.bind_host.clone());
+        let public_base_url = req
+            .public_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        let associated_project = req
+            .associated_project
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        let (local_entry_url, public_entry_url, entry_url) =
+            derive_entry_urls(req.web_port, &bind_host, &public_base_url);
+
+        ManagedProjectSite {
+            site_id: site_id.clone(),
+            project_name: project_name.to_string(),
+            project_code: 0,
+            project_path: canonical_path.to_string_lossy().to_string(),
+            manual_db_nums: Vec::new(),
+            parse_db_types: Vec::new(),
+            force_rebuild_system_db: false,
+            config_path: config_path(&site_id).to_string_lossy().to_string(),
+            runtime_dir: site_runtime_dir(&site_id).to_string_lossy().to_string(),
+            db_data_path: db_data_path(&site_id).to_string_lossy().to_string(),
+            db_port: 0,
+            web_port: req.web_port,
+            bind_host,
+            public_base_url,
+            associated_project,
+            db_pid: None,
+            web_pid: None,
+            parse_pid: None,
+            status: ManagedSiteStatus::Draft,
+            parse_status: ManagedSiteParseStatus::Pending,
+            last_error: None,
+            entry_url,
+            local_entry_url,
+            public_entry_url,
+            last_parse_started_at: None,
+            last_parse_finished_at: None,
+            last_parse_duration_ms: None,
+            parse_plan: ManagedSiteParsePlan::default(),
+            risk_level: ManagedSiteRiskLevel::Normal,
+            risk_reasons: Vec::new(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        }
+    };
+
+    site.project_name = project_name.to_string();
+    site.project_path = canonical_path.to_string_lossy().to_string();
+    site.manual_db_nums = normalize_manual_db_nums(req.manual_db_nums);
+    site.parse_db_types = parse_db_types;
+    site.force_rebuild_system_db = force_rebuild_system_db;
+    site.web_port = req.web_port;
+    site.bind_host = normalize_host(req.bind_host);
+    site.public_base_url = req
+        .public_base_url
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    site.associated_project = req
+        .associated_project
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let (local_entry_url, public_entry_url, entry_url) =
+        derive_entry_urls(site.web_port, &site.bind_host, &site.public_base_url);
+    site.entry_url = entry_url;
+    site.local_entry_url = local_entry_url;
+    site.public_entry_url = public_entry_url;
+    site.parse_plan = ManagedSiteParsePlan::default();
+    Ok(site)
+}
+
+pub fn preview_parse_plan(req: PreviewManagedSiteParsePlanRequest) -> Result<ManagedSiteParsePlan> {
+    let site = build_preview_site(req)?;
+    let included_db_files = resolve_included_db_files(&site)?;
+    Ok(build_parse_plan_with_files(&site, included_db_files))
 }
 
 pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<ManagedProjectSite> {
@@ -1287,6 +1728,12 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
     if let Some(value) = req.manual_db_nums {
         site.manual_db_nums = normalize_manual_db_nums(value);
     }
+    if let Some(value) = req.parse_db_types {
+        site.parse_db_types = normalize_parse_db_types(value);
+    }
+    if let Some(value) = req.force_rebuild_system_db {
+        site.force_rebuild_system_db = value;
+    }
     if let Some(value) = req.bind_host.filter(|value| !value.trim().is_empty()) {
         site.bind_host = normalize_host(Some(value));
     }
@@ -1319,6 +1766,8 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
     }
     let db_user = normalize_optional_db_user(req.db_user).unwrap_or(stored_db_user);
     let db_password = normalize_optional_db_password(req.db_password).unwrap_or(stored_db_password);
+    site.force_rebuild_system_db =
+        normalize_force_rebuild_system_db(site.force_rebuild_system_db, &site.parse_db_types);
 
     site.updated_at = now_rfc3339();
     let (local_entry_url, public_entry_url, entry_url) =
@@ -1340,6 +1789,7 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
     })?;
 
     write_site_files(&site, &db_user, &db_password)?;
+    annotate_site_parse_plan(&mut site);
     Ok(site)
 }
 
@@ -1767,7 +2217,14 @@ fn collect_site_resource_metrics(
         .collect::<Vec<_>>();
 
     with_resource_sampler(&tracked_pids, |cpu_ready, system| {
-        build_site_resource_metrics(site, db_running, web_running, parse_running, system, cpu_ready)
+        build_site_resource_metrics(
+            site,
+            db_running,
+            web_running,
+            parse_running,
+            system,
+            cpu_ready,
+        )
     })
 }
 
@@ -1802,20 +2259,29 @@ fn evaluate_parse_health(
             return ManagedSiteParseHealth {
                 status: ManagedSiteParseHealthStatus::Critical,
                 label: "解析耗时过长".to_string(),
-                detail: Some(format!("最近一次解析耗时 {}", format_duration_label(duration_ms))),
+                detail: Some(format!(
+                    "最近一次解析耗时 {}",
+                    format_duration_label(duration_ms)
+                )),
             };
         }
         if duration_ms >= PARSE_WARNING_DURATION_MS {
             return ManagedSiteParseHealth {
                 status: ManagedSiteParseHealthStatus::Warning,
                 label: "解析耗时偏长".to_string(),
-                detail: Some(format!("最近一次解析耗时 {}", format_duration_label(duration_ms))),
+                detail: Some(format!(
+                    "最近一次解析耗时 {}",
+                    format_duration_label(duration_ms)
+                )),
             };
         }
         return ManagedSiteParseHealth {
             status: ManagedSiteParseHealthStatus::Normal,
             label: "解析正常".to_string(),
-            detail: Some(format!("最近一次解析耗时 {}", format_duration_label(duration_ms))),
+            detail: Some(format!(
+                "最近一次解析耗时 {}",
+                format_duration_label(duration_ms)
+            )),
         };
     }
 
@@ -1886,8 +2352,18 @@ fn evaluate_site_risk(
     }
 
     apply_process_risk("DB", &resources.db_process, &mut risk_level, &mut warnings);
-    apply_process_risk("Web", &resources.web_process, &mut risk_level, &mut warnings);
-    apply_process_risk("Parse", &resources.parse_process, &mut risk_level, &mut warnings);
+    apply_process_risk(
+        "Web",
+        &resources.web_process,
+        &mut risk_level,
+        &mut warnings,
+    );
+    apply_process_risk(
+        "Parse",
+        &resources.parse_process,
+        &mut risk_level,
+        &mut warnings,
+    );
 
     if site.parse_status == ManagedSiteParseStatus::Failed {
         promote_risk(&mut risk_level, ManagedSiteRiskLevel::Critical);
@@ -1903,7 +2379,10 @@ fn evaluate_site_risk(
     }
 
     if resources.runtime_dir_missing
-        && matches!(site.status, ManagedSiteStatus::Starting | ManagedSiteStatus::Running)
+        && matches!(
+            site.status,
+            ManagedSiteStatus::Starting | ManagedSiteStatus::Running
+        )
     {
         promote_risk(&mut risk_level, ManagedSiteRiskLevel::Warning);
         warnings.push("运行目录缺失".to_string());
@@ -2217,14 +2696,7 @@ async fn kill_pid(pid: u32) -> Result<()> {
 async fn spawn_parse_process(site_id: String) -> Result<()> {
     let (site, db_user, db_password) = task::spawn_blocking({
         let site_id = site_id.clone();
-        move || -> Result<_> {
-            with_conn(|conn| {
-                let site = load_site_with_conn(conn, &site_id)?
-                    .ok_or_else(|| anyhow!("站点不存在"))?;
-                let (u, p) = load_credentials_with_conn(conn, &site.site_id)?;
-                Ok((site, u, p))
-            })
-        }
+        move || load_site_and_credentials(&site_id)
     })
     .await
     .context("加载站点凭据失败 (join error)")??;
@@ -2317,6 +2789,12 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
                 ..Default::default()
             },
         )?;
+        task::spawn_blocking({
+            let site_id = site.site_id.clone();
+            move || rewrite_site_files_from_storage(&site_id)
+        })
+        .await
+        .context("刷新解析配置失败 (join error)")??;
     } else {
         update_runtime(
             &site.site_id,
@@ -2904,6 +3382,7 @@ pub fn runtime_status(site_id: &str) -> Result<ManagedSiteRuntimeStatus> {
         site_id: site.site_id,
         status: site.status,
         parse_status: site.parse_status,
+        parse_plan: site.parse_plan,
         current_stage,
         current_stage_label,
         current_stage_detail,
@@ -3321,9 +3800,6 @@ mod tests {
     #[test]
     fn strip_ansi_codes_removes_csi_and_osc() {
         assert_eq!(strip_ansi_codes("\u{1b}[31mhello\u{1b}[0m"), "hello");
-        assert_eq!(
-            strip_ansi_codes("\u{1b}]0;title\u{7}body"),
-            "body"
-        );
+        assert_eq!(strip_ansi_codes("\u{1b}]0;title\u{7}body"), "body");
     }
 }

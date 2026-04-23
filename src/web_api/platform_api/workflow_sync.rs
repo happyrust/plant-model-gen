@@ -10,20 +10,20 @@ use surrealdb::types::SurrealValue;
 use tracing::{info, warn};
 
 use crate::web_api::review_api::ReviewTask;
-use aios_core::project_primary_db;
+use crate::web_api::review_db::review_primary_db;
 
 use super::annotation_check::{
-    build_annotation_check_context, evaluate_annotation_check, AnnotationCheckOptions,
-    AnnotationCheckResult,
+    AnnotationCheckOptions, AnnotationCheckResult, build_annotation_check_context,
+    evaluate_annotation_check,
 };
 use super::auth::verify_s2s_token;
 use super::review_form::{
     find_task_by_form_id, get_review_form_by_form_id, sync_review_form_with_task_status,
 };
 use super::types::{
-    normalize_review_form_status, SyncWorkflowData, SyncWorkflowRequest, SyncWorkflowResponse,
-    VerifyWorkflowData, VerifyWorkflowResponse, WorkflowAnnotationComment, WorkflowAttachment,
-    WorkflowRecord,
+    SyncWorkflowData, SyncWorkflowRequest, SyncWorkflowResponse, VerifyWorkflowData,
+    VerifyWorkflowResponse, WorkflowAnnotationComment, WorkflowAttachment, WorkflowRecord,
+    normalize_review_form_status,
 };
 
 static WEB_PUBLIC_BASE_URL: OnceLock<Option<String>> = OnceLock::new();
@@ -1032,7 +1032,7 @@ async fn apply_workflow_active(
         WHERE record::id(id) = $task_id AND (deleted IS NONE OR deleted = false)
     "#;
 
-    project_primary_db()
+    review_primary_db()
         .query(update_sql)
         .bind(("task_id", task.id.clone()))
         .bind(("next_node", next_step.target_node.clone()))
@@ -1091,7 +1091,7 @@ async fn apply_workflow_active(
         .as_ref()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let _ = project_primary_db()
+    let _ = review_primary_db()
         .query(history_sql)
         .bind(("task_id", task.id.clone()))
         .bind(("from_node", current_node))
@@ -1142,7 +1142,7 @@ async fn apply_workflow_return(
         WHERE record::id(id) = $task_id AND (deleted IS NONE OR deleted = false)
     "#;
 
-    project_primary_db()
+    review_primary_db()
         .query(update_sql)
         .bind(("task_id", task.id.clone()))
         .bind(("next_node", next_step.target_node.clone()))
@@ -1197,7 +1197,7 @@ async fn apply_workflow_return(
             timestamp: time::now()
         }
     "#;
-    let _ = project_primary_db()
+    let _ = review_primary_db()
         .query(history_sql)
         .bind(("task_id", task.id.clone()))
         .bind(("from_node", current_node))
@@ -1274,7 +1274,7 @@ async fn apply_workflow_agree(
         WHERE record::id(id) = $task_id AND (deleted IS NONE OR deleted = false)
     "#;
 
-    project_primary_db()
+    review_primary_db()
         .query(update_sql)
         .bind(("task_id", task.id.clone()))
         .bind(("next_node", target_node.clone()))
@@ -1333,7 +1333,7 @@ async fn apply_workflow_agree(
         .as_ref()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let _ = project_primary_db()
+    let _ = review_primary_db()
         .query(history_sql)
         .bind(("task_id", task.id.clone()))
         .bind(("from_node", current_node.clone()))
@@ -1370,7 +1370,7 @@ async fn apply_workflow_stop(
         WHERE record::id(id) = $task_id AND (deleted IS NONE OR deleted = false)
     "#;
 
-    project_primary_db()
+    review_primary_db()
         .query(update_sql)
         .bind(("task_id", task.id.clone()))
         .bind((
@@ -1420,7 +1420,7 @@ async fn apply_workflow_stop(
             timestamp: time::now()
         }
     "#;
-    let _ = project_primary_db()
+    let _ = review_primary_db()
         .query(history_sql)
         .bind(("task_id", task.id.clone()))
         .bind(("from_node", current_node))
@@ -1437,7 +1437,7 @@ async fn apply_workflow_stop(
 // ============================================================================
 
 async fn query_workflow_models(form_id: &str) -> anyhow::Result<Vec<String>> {
-    let mut response = project_primary_db()
+    let mut response = review_primary_db()
         .query(
             r#"
             SELECT VALUE model_refno FROM review_form_model
@@ -1457,7 +1457,7 @@ async fn query_workflow_models(form_id: &str) -> anyhow::Result<Vec<String>> {
 }
 
 async fn query_workflow_attachments(form_id: &str) -> anyhow::Result<Vec<WorkflowAttachment>> {
-    let mut response = project_primary_db()
+    let mut response = review_primary_db()
         .query(
             r#"
             SELECT model_refnos, file_id, file_type, download_url, description, file_ext
@@ -1513,7 +1513,7 @@ async fn query_workflow_records_by_form_id(form_id: &str) -> anyhow::Result<Vec<
         confirmed_at: Option<surrealdb::types::Datetime>,
     }
 
-    let mut response = project_primary_db()
+    let mut response = review_primary_db()
         .query(
             r#"
             SELECT id, task_id, type, annotations, cloud_annotations, rect_annotations, obb_annotations, measurements, note, confirmed_at
@@ -1561,7 +1561,7 @@ async fn query_workflow_records_by_task_id(task_id: &str) -> anyhow::Result<Vec<
         confirmed_at: Option<surrealdb::types::Datetime>,
     }
 
-    let mut response = project_primary_db()
+    let mut response = review_primary_db()
         .query(
             r#"
             SELECT id, task_id, type, annotations, cloud_annotations, rect_annotations, obb_annotations, measurements, note, confirmed_at
@@ -1612,7 +1612,7 @@ async fn query_annotation_comments(
 
     let mut comments = Vec::new();
     for annotation_id in annotation_ids {
-        let mut response = project_primary_db()
+        let mut response = review_primary_db()
             .query(
                 r#"
                 SELECT id, annotation_id, annotation_type, author_id, author_name, author_role, content, reply_to_id, created_at

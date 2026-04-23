@@ -67,7 +67,8 @@ use crate::web_api::{
     CollisionApiState, E3dTreeApiState, NounHierarchyApiState, SearchApiState,
     SpatialQueryApiState, UploadApiState, create_collision_routes, create_e3d_tree_routes,
     create_jwt_auth_routes, create_mbd_pipe_routes, create_noun_hierarchy_routes,
-    create_pdms_attr_routes, create_pdms_model_query_routes, create_pipeline_annotation_routes,
+    create_pdms_attr_routes, create_pdms_model_query_routes, create_pdms_transform_routes,
+    create_pipeline_annotation_routes,
     create_platform_api_routes, create_ptset_routes, create_review_api_routes,
     create_review_integration_routes, create_room_tree_routes, create_scene_tree_routes,
     create_search_routes, create_spatial_query_routes, create_upload_routes, create_version_routes,
@@ -229,16 +230,32 @@ pub async fn start_web_server_with_config(
             }
         }
     }
-    if let Err(e) =
-        aios_core::use_ns_db_compat(&aios_core::SUL_DB, &db_option.surreal_ns, &db_option.project_name)
-            .await
+    if let Err(e) = aios_core::use_ns_db_compat(
+        &aios_core::SUL_DB,
+        &db_option.surreal_ns,
+        &db_option.project_name,
+    )
+    .await
     {
         eprintln!("⚠️ 数据库命名空间切换失败，后续将继续后台重试: {}", e);
     }
+    if let Err(error) = crate::web_api::review_db::init_review_primary_db(&db_option).await {
+        eprintln!(
+            "⚠️ review 专用数据库连接初始化失败，后续校审接口可能不可用: {}",
+            error
+        );
+    }
     let config_name_for_init = config_name.clone();
+    let startup_ns = db_option.surreal_ns.clone();
+    let startup_db = db_option.project_name.clone();
     tokio::spawn(async move {
         match aios_core::initialize_databases(db_option).await {
             Ok(_) => {
+                if let Err(error) =
+                    aios_core::use_ns_db_compat(&aios_core::SUL_DB, &startup_ns, &startup_db).await
+                {
+                    eprintln!("⚠️ 数据库初始化成功，但最终命名空间切换失败: {}", error);
+                }
                 println!("✅ 数据库连接初始化成功");
             }
             Err(e) => {
@@ -1047,6 +1064,7 @@ pub async fn start_web_server_with_config(
         .merge(pdms_attr_routes)
         .merge(ptset_routes)
         .merge(pdms_model_query_routes)
+        .merge(create_pdms_transform_routes())
         .merge(room_routes)
         .merge(collision_routes)
         .merge(search_routes)

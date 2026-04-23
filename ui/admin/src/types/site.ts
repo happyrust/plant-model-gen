@@ -15,11 +15,20 @@ export type ManagedSiteParseStatus =
 
 export type ManagedSiteRiskLevel = 'normal' | 'warning' | 'critical'
 export type ManagedSiteParseHealthStatus = ManagedSiteRiskLevel | 'unknown'
+export type ManagedSiteParsePlanMode = 'Full' | 'Bootstrap' | 'RebuildSystem' | 'Selective' | 'FastReparse'
 
 export interface ManagedSiteParseHealth {
   status: ManagedSiteParseHealthStatus
   label: string
   detail: string | null
+}
+
+export interface ManagedSiteParsePlan {
+  mode: ManagedSiteParsePlanMode
+  label: string
+  detail: string
+  includes_system_db_files: boolean
+  included_db_files: string[]
 }
 
 export interface ManagedProjectSite {
@@ -28,6 +37,8 @@ export interface ManagedProjectSite {
   project_code: number
   project_path: string
   manual_db_nums: number[]
+  parse_db_types: string[]
+  force_rebuild_system_db: boolean
   config_path: string
   runtime_dir: string
   db_data_path: string
@@ -48,6 +59,7 @@ export interface ManagedProjectSite {
   last_parse_started_at?: string | null
   last_parse_finished_at?: string | null
   last_parse_duration_ms?: number | null
+  parse_plan: ManagedSiteParsePlan
   risk_level: ManagedSiteRiskLevel
   risk_reasons: string[]
   created_at: string
@@ -78,6 +90,7 @@ export interface ManagedSiteRuntimeStatus {
   site_id: string
   status: ManagedSiteStatus
   parse_status: ManagedSiteParseStatus
+  parse_plan: ManagedSiteParsePlan
   current_stage: string
   current_stage_label: string
   current_stage_detail: string | null
@@ -154,6 +167,8 @@ export interface CreateManagedSiteRequest {
   project_path: string
   project_code: number
   manual_db_nums?: number[]
+  parse_db_types?: string[]
+  force_rebuild_system_db?: boolean
   db_port: number
   web_port: number
   bind_host?: string
@@ -168,6 +183,8 @@ export interface UpdateManagedSiteRequest {
   project_path?: string
   project_code?: number
   manual_db_nums?: number[]
+  parse_db_types?: string[]
+  force_rebuild_system_db?: boolean
   db_port?: number
   web_port?: number
   bind_host?: string
@@ -175,6 +192,19 @@ export interface UpdateManagedSiteRequest {
   associated_project?: string
   db_user?: string
   db_password?: string
+}
+
+export interface PreviewManagedSiteParsePlanRequest {
+  site_id?: string
+  project_name: string
+  project_path: string
+  manual_db_nums?: number[]
+  parse_db_types?: string[]
+  force_rebuild_system_db?: boolean
+  web_port: number
+  bind_host?: string
+  public_base_url?: string
+  associated_project?: string
 }
 
 export interface SiteStats {

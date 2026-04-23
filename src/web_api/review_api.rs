@@ -7,7 +7,7 @@
 
 use axum::{
     Router,
-    extract::{Json, Multipart, Path, Query, State},
+    extract::{Json, Multipart, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
@@ -24,10 +24,9 @@ use crate::web_api::platform_api::{
         AnnotationCheckOptions, annotation_check_failed_response, build_annotation_check_context,
         evaluate_annotation_check,
     },
-    mark_review_form_deleted,
-    sync_review_form_with_task_status,
+    mark_review_form_deleted, sync_review_form_with_task_status,
 };
-use aios_core::project_primary_db;
+use crate::web_api::review_db::review_primary_db;
 use axum::extract::Extension;
 use std::collections::HashSet;
 
@@ -505,7 +504,7 @@ pub(crate) async fn query_review_attachments_by_form_id(
         file_ext: Option<String>,
     }
 
-    let mut response = project_primary_db()
+    let mut response = review_primary_db()
         .query(
             r#"
             SELECT file_id, download_url, description, file_ext
@@ -798,7 +797,7 @@ async fn query_review_task_page(
         "SELECT * FROM review_tasks {} ORDER BY created_at DESC LIMIT {} START {}",
         where_clause, limit, offset
     );
-    let mut q = project_primary_db().query(&data_sql);
+    let mut q = review_primary_db().query(&data_sql);
     for (name, value) in bindings {
         q = q.bind((*name, value.clone()));
     }
@@ -889,7 +888,7 @@ async fn lookup_task_record_context(id: &str) -> Option<TaskRecordContext> {
         approver_id: Option<String>,
     }
 
-    let mut resp = project_primary_db()
+    let mut resp = review_primary_db()
         .query(
             "SELECT form_id, current_node, requester_id, checker_id, reviewer_id, approver_id FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1",
         )
@@ -911,14 +910,24 @@ async fn lookup_task_record_context(id: &str) -> Option<TaskRecordContext> {
     })
 }
 
-fn current_node_owner_for_task_row<'a>(task: &'a TaskRow, current_node: &str) -> (&'a str, &'static str) {
+fn current_node_owner_for_task_row<'a>(
+    task: &'a TaskRow,
+    current_node: &str,
+) -> (&'a str, &'static str) {
     match current_node {
         "sj" => (
-            task.requester_id.as_deref().map(str::trim).unwrap_or_default(),
+            task.requester_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default(),
             "requester",
         ),
         "jd" => {
-            let checker_id = task.checker_id.as_deref().map(str::trim).unwrap_or_default();
+            let checker_id = task
+                .checker_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default();
             if !checker_id.is_empty() {
                 (checker_id, "checker")
             } else {
@@ -932,7 +941,10 @@ fn current_node_owner_for_task_row<'a>(task: &'a TaskRow, current_node: &str) ->
             }
         }
         "sh" | "pz" => (
-            task.approver_id.as_deref().map(str::trim).unwrap_or_default(),
+            task.approver_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default(),
             "approver",
         ),
         _ => ("", "none"),
@@ -1074,6 +1086,45 @@ async fn lookup_task_form_id(id: &str) -> Option<String> {
 pub fn create_review_api_routes() -> Router {
     use crate::web_api::jwt_auth::{REVIEW_AUTH_CONFIG, review_auth_middleware};
     use axum::middleware;
+    async fn ensure_review_db_context(
+        request: Request,
+        next: axum::middleware::Next,
+    ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+        let db_option = aios_core::get_db_option();
+        if let Err(error) = aios_core::use_ns_db_compat(
+            &aios_core::SUL_DB,
+            &db_option.surreal_ns,
+            &db_option.project_name,
+        )
+        .await
+        {
+            warn!(
+                "review api db context ensure failed: ns={}, db={}, error={}",
+                db_option.surreal_ns, db_option.project_name, error
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "code": 500,
+                    "message": format!("数据库上下文切换失败: {}", error),
+                })),
+            ));
+        }
+        if let Err(error) = crate::web_api::review_db::ensure_review_primary_db_context().await {
+            warn!(
+                "review api primary db context ensure failed: ns={}, db={}, error={}",
+                db_option.surreal_ns, db_option.project_name, error
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "code": 500,
+                    "message": format!("校审数据库上下文切换失败: {}", error),
+                })),
+            ));
+        }
+        Ok(next.run(request).await)
+    }
 
     Router::new()
         // 提资单 CRUD
@@ -1140,6 +1191,7 @@ pub fn create_review_api_routes() -> Router {
             REVIEW_AUTH_CONFIG.clone(),
             review_auth_middleware,
         ))
+        .layer(middleware::from_fn(ensure_review_db_context))
 }
 
 // ============================================================================
@@ -1202,7 +1254,7 @@ async fn create_task(
             updated_at = time::now()
     "#;
 
-    let result = project_primary_db()
+    let result = review_primary_db()
         .query(sql)
         .bind(("id", task_id.clone()))
         .bind(("form_id", form_id.clone()))
@@ -1240,7 +1292,7 @@ async fn create_task(
                 if refno.is_empty() || !seen_refnos.insert(refno.to_string()) {
                     continue;
                 }
-                let _ = project_primary_db()
+                let _ = review_primary_db()
                     .query(
                         r#"
                         CREATE ONLY review_form_model SET
@@ -1363,7 +1415,7 @@ async fn list_tasks(Query(query): Query<TaskListQuery>) -> impl IntoResponse {
         "SELECT count() AS total FROM review_tasks {} GROUP ALL",
         where_clause
     );
-    let mut q = project_primary_db().query(&count_sql);
+    let mut q = review_primary_db().query(&count_sql);
     for (name, value) in &bindings {
         q = q.bind((*name, value.clone()));
     }
@@ -1438,7 +1490,7 @@ async fn get_task(Path(id): Path<String>) -> impl IntoResponse {
     // 使用 record::id(id) 提取 key 进行比较
     let sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
 
-    match project_primary_db()
+    match review_primary_db()
         .query(sql)
         .bind(("id", id.clone()))
         .await
@@ -1513,7 +1565,7 @@ async fn update_task(
         updates.join(", ")
     );
 
-    let mut q = project_primary_db().query(&sql).bind(("id", id.clone()));
+    let mut q = review_primary_db().query(&sql).bind(("id", id.clone()));
 
     if let Some(ref title) = request.title {
         q = q.bind(("title", title.clone()));
@@ -1539,7 +1591,7 @@ async fn update_task(
         Ok(_) => {
             // 返回更新后的任务
             let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)";
-            if let Ok(mut resp) = project_primary_db()
+            if let Ok(mut resp) = review_primary_db()
                 .query(get_sql)
                 .bind(("id", id.clone()))
                 .await
@@ -1593,7 +1645,7 @@ async fn delete_task(Path(id): Path<String>) -> impl IntoResponse {
         WHERE record::id(id) = $id
     "#;
 
-    match project_primary_db()
+    match review_primary_db()
         .query(soft_sql)
         .bind(("id", id.clone()))
         .await
@@ -1714,7 +1766,7 @@ async fn update_task_status(
         }
     };
 
-    let mut q = project_primary_db()
+    let mut q = review_primary_db()
         .query(sql)
         .bind(("id", id.clone()))
         .bind(("status", status.clone()));
@@ -1754,7 +1806,7 @@ async fn update_task_status(
                     timestamp: time::now()
                 }
             "#;
-            let _ = project_primary_db()
+            let _ = review_primary_db()
                 .query(history_sql)
                 .bind(("task_id", id))
                 .bind(("action", status.clone()))
@@ -1822,7 +1874,7 @@ async fn get_task_history(Path(id): Path<String>) -> impl IntoResponse {
     let sql =
         "SELECT * FROM review_workflow_history WHERE task_id = $task_id ORDER BY timestamp DESC";
 
-    match project_primary_db()
+    match review_primary_db()
         .query(sql)
         .bind(("task_id", id.clone()))
         .await
@@ -2045,7 +2097,7 @@ async fn create_record(
     );
     let record_id = build_confirmed_record_stable_id(&slot_key);
 
-    let existing_row = match project_primary_db()
+    let existing_row = match review_primary_db()
         .query("SELECT * FROM review_records WHERE record::id(id) = $id LIMIT 1")
         .bind(("id", record_id.clone()))
         .await
@@ -2074,7 +2126,7 @@ async fn create_record(
                 "Confirmed record no-op: task_id={}, slot_key={}",
                 request.task_id, slot_key
             );
-            match project_primary_db()
+            match review_primary_db()
                 .query(
                     r#"
                     UPDATE type::record('review_records', $id) MERGE {
@@ -2161,7 +2213,7 @@ async fn create_record(
         } RETURN AFTER
     "#;
 
-    match project_primary_db()
+    match review_primary_db()
         .query(upsert_sql)
         .bind(("id", record_id.clone()))
         .bind(("task_id", request.task_id.clone()))
@@ -2229,7 +2281,7 @@ async fn get_records_by_task(Path(task_id): Path<String>) -> impl IntoResponse {
 
     let sql = "SELECT * FROM review_records WHERE task_id = $task_id ORDER BY confirmed_at DESC";
 
-    match project_primary_db()
+    match review_primary_db()
         .query(sql)
         .bind(("task_id", task_id))
         .await
@@ -2272,11 +2324,7 @@ async fn delete_record(Path(record_id): Path<String>) -> impl IntoResponse {
 
     let sql = "DELETE [type::record('review_records', $id)]";
 
-    match project_primary_db()
-        .query(sql)
-        .bind(("id", record_id))
-        .await
-    {
+    match review_primary_db().query(sql).bind(("id", record_id)).await {
         Ok(_) => (
             StatusCode::OK,
             Json(ActionResponse {
@@ -2308,7 +2356,7 @@ async fn clear_records_by_task(Path(task_id): Path<String>) -> impl IntoResponse
         DELETE $ids;
     "#;
 
-    match project_primary_db()
+    match review_primary_db()
         .query(sql)
         .bind(("task_id", task_id))
         .await
@@ -2413,7 +2461,7 @@ async fn create_comment(
         }
     "#;
 
-    match project_primary_db()
+    match review_primary_db()
         .query(sql)
         .bind(("id", comment_id.clone()))
         .bind(("annotation_id", request.annotation_id.clone()))
@@ -2488,7 +2536,7 @@ async fn get_comments_by_annotation(
         "SELECT * FROM review_comments WHERE annotation_id = $annotation_id ORDER BY created_at ASC"
     };
 
-    let mut q = project_primary_db()
+    let mut q = review_primary_db()
         .query(sql)
         .bind(("annotation_id", annotation_id));
     if let Some(ref t) = query.r#type {
@@ -2556,7 +2604,7 @@ async fn edit_comment(
             updated_at = time::now()
     "#;
 
-    match project_primary_db()
+    match review_primary_db()
         .query(sql)
         .bind(("id", comment_id.clone()))
         .bind(("author_id", claims.user_id.clone()))
@@ -2603,7 +2651,7 @@ async fn delete_comment(Path(comment_id): Path<String>) -> impl IntoResponse {
 
     let sql = "DELETE [type::record('review_comments', $id)]";
 
-    match project_primary_db()
+    match review_primary_db()
         .query(sql)
         .bind(("id", comment_id))
         .await
@@ -2722,7 +2770,7 @@ async fn update_annotation_severity(
         }
     "#;
 
-    match project_primary_db()
+    match review_primary_db()
         .query(sql)
         .bind(("annotation_id", annotation_id.clone()))
         .bind(("annotation_type", query.r#type.clone()))
@@ -2731,7 +2779,11 @@ async fn update_annotation_severity(
     {
         Ok(_) => {
             let updated_at = chrono::Utc::now().timestamp_millis();
-            info!("Severity persisted for {} ({})", record_id, body.severity.as_deref().unwrap_or("null"));
+            info!(
+                "Severity persisted for {} ({})",
+                record_id,
+                body.severity.as_deref().unwrap_or("null")
+            );
             (
                 StatusCode::OK,
                 Json(AnnotationSeverityResponse {
@@ -3010,7 +3062,7 @@ async fn submit_to_next_node(
 
     // 1. 获取当前任务
     let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
-    let task_result = project_primary_db()
+    let task_result = review_primary_db()
         .query(get_sql)
         .bind(("id", id.clone()))
         .await;
@@ -3159,7 +3211,7 @@ async fn submit_to_next_node(
         WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)
     "#;
 
-    if let Err(e) = project_primary_db()
+    if let Err(e) = review_primary_db()
         .query(update_sql)
         .bind(("id", id.clone()))
         .bind(("next_node", next_node_str.clone()))
@@ -3212,7 +3264,7 @@ async fn submit_to_next_node(
         }
     "#;
 
-    let _ = project_primary_db()
+    let _ = review_primary_db()
         .query(history_sql)
         .bind(("task_id", id.clone()))
         .bind(("from_node", current_node.clone()))
@@ -3261,7 +3313,7 @@ async fn return_to_node(
 
     // 1. 获取当前任务
     let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
-    let task_result = project_primary_db()
+    let task_result = review_primary_db()
         .query(get_sql)
         .bind(("id", id.clone()))
         .await;
@@ -3349,7 +3401,7 @@ async fn return_to_node(
         WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)
     "#;
 
-    if let Err(e) = project_primary_db()
+    if let Err(e) = review_primary_db()
         .query(update_sql)
         .bind(("id", id.clone()))
         .bind(("target_node", request.target_node.clone()))
@@ -3416,7 +3468,7 @@ async fn return_to_node(
         }
     "#;
 
-    let _ = project_primary_db()
+    let _ = review_primary_db()
         .query(history_sql)
         .bind(("task_id", id.clone()))
         .bind(("from_node", current_node.clone()))
@@ -3461,7 +3513,7 @@ async fn get_workflow_history(Path(id): Path<String>) -> impl IntoResponse {
     }
 
     let get_sql = "SELECT current_node FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
-    let current_node = match project_primary_db()
+    let current_node = match review_primary_db()
         .query(get_sql)
         .bind(("id", id.clone()))
         .await
@@ -3516,7 +3568,7 @@ async fn get_workflow_history(Path(id): Path<String>) -> impl IntoResponse {
         ORDER BY timestamp ASC
     "#;
 
-    let history = match project_primary_db()
+    let history = match review_primary_db()
         .query(history_sql)
         .bind(("task_id", id.clone()))
         .await
@@ -3736,7 +3788,7 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
             }
 
             let sql = "SELECT form_id, components FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
-            if let Ok(mut resp) = project_primary_db()
+            if let Ok(mut resp) = review_primary_db()
                 .query(sql)
                 .bind(("id", tid.to_string()))
                 .await
@@ -3805,7 +3857,7 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
         }
     "#;
 
-    if let Err(e) = project_primary_db()
+    if let Err(e) = review_primary_db()
         .query(insert_sql)
         .bind(("form_id", resolved_form_id))
         .bind(("model_refnos", resolved_model_refnos))
@@ -3862,7 +3914,7 @@ async fn delete_attachment(Path(attachment_id): Path<String>) -> impl IntoRespon
 
     // 优先使用 DB 中记录的 file_ext
     let mut db_ext: Option<String> = None;
-    if let Ok(mut resp) = project_primary_db()
+    if let Ok(mut resp) = review_primary_db()
         .query("SELECT file_ext FROM review_attachment WHERE file_id = $file_id LIMIT 1")
         .bind(("file_id", attachment_id.clone()))
         .await
@@ -3902,7 +3954,7 @@ async fn delete_attachment(Path(attachment_id): Path<String>) -> impl IntoRespon
         }
     }
 
-    let _ = project_primary_db()
+    let _ = review_primary_db()
         .query(
             r#"
             LET $ids = SELECT VALUE id FROM review_attachment WHERE file_id = $file_id;
@@ -3983,7 +4035,7 @@ async fn export_review_data(Json(request): Json<ExportRequest>) -> impl IntoResp
         )
     };
 
-    let mut q = project_primary_db().query(&sql);
+    let mut q = review_primary_db().query(&sql);
     if use_ids_param {
         q = q.bind(("task_ids", request.task_ids.clone().unwrap_or_default()));
     }
@@ -4027,7 +4079,7 @@ async fn export_review_data(Json(request): Json<ExportRequest>) -> impl IntoResp
         }
 
         let sql = "SELECT * FROM review_comments ORDER BY created_at ASC LIMIT 10000";
-        match project_primary_db().query(sql).await {
+        match review_primary_db().query(sql).await {
             Ok(mut resp) => {
                 let rows: Vec<CommentRow> = resp.take(0).unwrap_or_default();
                 Some(
@@ -4062,7 +4114,7 @@ async fn export_review_data(Json(request): Json<ExportRequest>) -> impl IntoResp
             Some(vec![])
         } else {
             let sql = "SELECT * FROM review_records WHERE task_id IN $task_ids ORDER BY confirmed_at ASC LIMIT 10000";
-            match project_primary_db()
+            match review_primary_db()
                 .query(sql)
                 .bind(("task_ids", task_ids))
                 .await
@@ -4127,7 +4179,7 @@ async fn import_review_data(Json(request): Json<ImportRequest>) -> impl IntoResp
     for task in request.tasks {
         // 检查任务是否已存在
         let check_sql = "SELECT id FROM review_tasks WHERE record::id(id) = $id";
-        let exists = match project_primary_db()
+        let exists = match review_primary_db()
             .query(check_sql)
             .bind(("id", task.id.clone()))
             .await
@@ -4173,7 +4225,7 @@ async fn import_review_data(Json(request): Json<ImportRequest>) -> impl IntoResp
                 updated_at = time::now()"#
         };
 
-        let result = project_primary_db()
+        let result = review_primary_db()
             .query(sql)
             .bind(("id", task.id.clone()))
             .bind(("form_id", task.form_id.clone()))
@@ -4214,7 +4266,7 @@ async fn import_review_data(Json(request): Json<ImportRequest>) -> impl IntoResp
                         if comp.ref_no.trim().is_empty() {
                             continue;
                         }
-                        let _ = project_primary_db()
+                        let _ = review_primary_db()
                             .query(
                                 r#"
                                 CREATE ONLY review_form_model SET

@@ -24,6 +24,10 @@
 
 ### Added
 
+- **PDMS 变换修复后续硬化（M3/M4）**：
+  - 新增 `docs/plans/2026-04-24-pdms-hardening-m3-m5-implementation-plan.md`，在 M2 已完成的基线上把剩余工作收敛到 M3/M4/M5，并记录本轮实际执行结果
+  - 新增 `scripts/verify_pdms_console_api.ps1`，覆盖 `transform` / `transform/compute` / `ui-attr` / `ptset` / `type-info` / `children` 六条 PDMS 控制台相关接口；在本机 `http://127.0.0.1:3100` 上验证 6/6 通过（其中 `q ptset` 标记为路由可达但当前 refno 无 ptset 数据）
+
 - **异地协同前端独立 + API 汇总（2026-04-22 · feat/collab-api-consolidation 分支）**：把 `D:\work\plant-code\web-server` 的异地协同专业监控 UI 剥离为独立仓库 `D:\work\plant-code\plant-collab-monitor`（Vue 3.5 + Vite 5.4 + Naive UI 2.40 + Tailwind 3.4），后端 API 汇入 plant-model-gen 作为单一源。
   - Phase 1 代码层（7 commit）：
     - `site_config_handlers.rs` 完全迁入（7 路由，路径 env 化）
@@ -73,6 +77,7 @@
 
 ### Changed
 
+- 联动 `plant3d-web/src/api/genModelPdmsAttrApi.ts`：`404 + 空 body` 时抛出带 URL 的结构化错误，提示后端可能未挂载对应 API；`5xx` 同时输出 `console.error` 便于排查
 - 精简 `.cursor/rules/mcp-messenger.mdc` 与 `.cursor/rules/my-mcp.mdc` 中的重复强约束段落，仅保留"回合结束必须调用 `check_messages`"等核心条款，避免多模型规则冗余。
 
 - 异地协同 remote-sync API 路由从 `mod.rs` 提取到 `remote_sync_handlers::create_remote_sync_routes()`，统一纳入 `admin_api_routes` 认证链路。

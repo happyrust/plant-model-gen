@@ -68,13 +68,9 @@ pub mod wizard_template; // 模型实时补齐 + parquet 增量队列
 
 use crate::web_api::{
     CollisionApiState, E3dTreeApiState, NounHierarchyApiState, SearchApiState,
-    SpatialQueryApiState, UploadApiState, create_collision_routes, create_e3d_tree_routes,
-    create_jwt_auth_routes, create_mbd_pipe_routes, create_noun_hierarchy_routes,
-    create_pdms_attr_routes, create_pdms_model_query_routes, create_pdms_transform_routes,
-    create_pipeline_annotation_routes,
-    create_platform_api_routes, create_ptset_routes, create_review_api_routes,
-    create_review_integration_routes, create_room_tree_routes, create_scene_tree_routes,
-    create_search_routes, create_spatial_query_routes, create_upload_routes, create_version_routes,
+    SpatialQueryApiState, UploadApiState, assemble_stateless_web_api_routes,
+    create_collision_routes, create_e3d_tree_routes, create_noun_hierarchy_routes,
+    create_search_routes, create_spatial_query_routes, create_upload_routes,
 };
 use handlers::*;
 use models::*;
@@ -314,20 +310,12 @@ pub async fn start_web_server_with_config(
     };
     let e3d_tree_routes = create_e3d_tree_routes(e3d_tree_state);
 
-    // 初始化 Room 树 API（ARCH 房间分组树）
-    let room_tree_routes = create_room_tree_routes();
-
-    let pdms_attr_routes = create_pdms_attr_routes();
-
-    // PDMS 变换矩阵查询 API（/api/pdms/transform/{refno}、/api/pdms/transform/compute/{refno}）
-    // 供 plant3d-web 控制台 `q pos` / `q ori` / `q pos wrt owner` / `q ori wrt owner` 使用
-    let pdms_transform_routes = create_pdms_transform_routes();
-
-    // 初始化 Ptset API
-    let ptset_routes = create_ptset_routes();
-
-    // PDMS 模型查询辅助 API（type-info / children），用于前端在无 SurrealDB WS 连接时仍能应用 BRAN/HANG 规则
-    let pdms_model_query_routes = create_pdms_model_query_routes();
+    // 所有"无状态" web_api 路由（room_tree / pdms_attr / pdms_transform / ptset /
+    // pdms_model_query / review_integration / platform_api / jwt_auth / review_api /
+    // scene_tree / mbd_pipe / pipeline_annotation(nest) / version(nest)）
+    // 统一交给 assemble_stateless_web_api_routes 装配，避免新增路由忘记 .merge() 的静默遗漏
+    // （历史教训：2026-04-23 pdms_transform 漏挂载，详见 docs/plans/2026-04-23-*）
+    let stateless_web_api_routes = assemble_stateless_web_api_routes();
 
     let room_worker = room_api::init_room_worker();
     let room_api_state = room_api::RoomApiState {
@@ -1130,23 +1118,12 @@ pub async fn start_web_server_with_config(
         .merge(spatial_query_routes)
         .merge(noun_hierarchy_routes)
         .merge(e3d_tree_routes)
-        .merge(room_tree_routes)
-        .merge(pdms_attr_routes)
-        .merge(pdms_transform_routes)
-        .merge(ptset_routes)
-        .merge(pdms_model_query_routes)
         .merge(room_routes)
         .merge(collision_routes)
         .merge(search_routes)
         .merge(upload_routes)
-        .merge(create_review_integration_routes())
-        .merge(create_platform_api_routes())
-        .merge(create_jwt_auth_routes())
-        .merge(create_review_api_routes())
-        .merge(create_scene_tree_routes())
-        .merge(create_mbd_pipe_routes())
-        .nest("/api/pipeline", create_pipeline_annotation_routes())
-        .nest("/api", create_version_routes())
+        // 一次性合并所有无状态 web_api 路由（含 nest 前缀），见 web_api::assemble_stateless_web_api_routes
+        .merge(stateless_web_api_routes)
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

@@ -48,5 +48,35 @@ pub mod jwt_auth;
 #[cfg(feature = "web_server")]
 pub use jwt_auth::create_jwt_auth_routes;
 
+/// 一次性装配所有"无状态" web_api 路由（含 nest 前缀）。
+///
+/// 设计目的：消除 `web_server::start_web_server_with_config` 里"新增路由必须手动
+/// import + let + .merge()"的重复装配，避免类似 2026-04-23 `pdms_transform` 漏挂载
+/// 导致前端 `q pos` / `q ori` 全报 404 的问题再次发生（详见
+/// `docs/plans/2026-04-23-pdms-transform-route-missing-registration-fix.md`）。
+///
+/// 约束：仅收纳**无状态**（`Router<()>`）的 `create_*_routes()`；带 state 的路由
+/// （collision / e3d_tree / noun_hierarchy / spatial_query / search / upload / room_api）
+/// 仍由 `web_server/mod.rs` 在拿到对应 state 后单独挂载。
+///
+/// merge 顺序保持与历史 `web_server/mod.rs` 完全一致（含 nest 前缀），便于 diff 审阅。
+#[cfg(feature = "web_server")]
+pub fn assemble_stateless_web_api_routes() -> axum::Router {
+    axum::Router::new()
+        .merge(create_room_tree_routes())
+        .merge(create_pdms_attr_routes())
+        .merge(create_pdms_transform_routes())
+        .merge(create_ptset_routes())
+        .merge(create_pdms_model_query_routes())
+        .merge(create_review_integration_routes())
+        .merge(create_platform_api_routes())
+        .merge(create_jwt_auth_routes())
+        .merge(create_review_api_routes())
+        .merge(create_scene_tree_routes())
+        .merge(create_mbd_pipe_routes())
+        .nest("/api/pipeline", create_pipeline_annotation_routes())
+        .nest("/api", create_version_routes())
+}
+
 #[cfg(test)]
 mod tests;

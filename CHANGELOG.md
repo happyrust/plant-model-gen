@@ -83,6 +83,7 @@
 
 ### Fixed
 
+- **修复 `plant3d-web` 控制台 `q pos` / `q ori` / `q pos wrt owner` / `q ori wrt owner` 四条命令永远返回 `Failed to query transform: Error: HTTP 404 Not Found` 的问题（2026-04-23）**：`src/web_api/pdms_transform_api.rs` 完整定义了 `create_pdms_transform_routes()`（涵盖 `/api/pdms/transform/{refno}` 与 `/api/pdms/transform/compute/{refno}` 两条路由），`src/web_api/mod.rs` 也已 `pub use`，但 `src/web_server/mod.rs` 的装配段漏了 `use` / `let` / `.merge()` 三处，导致 Axum 根本没挂载该路由前缀，所有请求命中默认 fallback 返回 404。本次补齐三处装配；`scripts/verify_fixing_position.ps1` 重新跑通（世界坐标误差 0.006mm，< 1.0mm 容差），线上调用 `GET /api/pdms/transform/24381_145018` 返回 200 + `success=true`。同步落盘问题复盘 `docs/plans/2026-04-23-pdms-transform-route-missing-registration-fix.md`、后续硬化计划 `docs/plans/2026-04-23-pdms-transform-followup-hardening-plan.md` 与 M1+M2 执行清单 `docs/plans/2026-04-23-pdms-transform-m1-m2-execution-checklist.md`，后续将通过引入 `assemble_all_web_api_routes` 聚合装配函数、`fetchJson` 对 404 的诊断性增强、PDMS 控制台命令冷烟脚本等五个里程碑彻底消除同类"新增路由忘记 merge"的静默遗漏风险。
 - 修复 `/admin` 注册表页导入/删除操作因函数名不匹配（`handleImport` → `openImportDialog`、`handleDelete` → `openDeleteConfirm`）导致点击无响应的问题。
 - 修复 `auth.ts` 中 `session.user` / `user` 可能为 `undefined` 的 TypeScript 严格检查错误。
 - 修复 `SiteDataTable.vue` 和 `SiteDetailView.vue` 中 `window.open` / `navigator.clipboard` 在 Vue 模板作用域中不可访问的 TypeScript 错误，改为组件方法调用。

@@ -232,16 +232,32 @@ pub async fn start_web_server_with_config(
             }
         }
     }
-    if let Err(e) =
-        aios_core::use_ns_db_compat(&aios_core::SUL_DB, &db_option.surreal_ns, &db_option.project_name)
-            .await
+    if let Err(e) = aios_core::use_ns_db_compat(
+        &aios_core::SUL_DB,
+        &db_option.surreal_ns,
+        &db_option.project_name,
+    )
+    .await
     {
         eprintln!("⚠️ 数据库命名空间切换失败，后续将继续后台重试: {}", e);
     }
+    if let Err(error) = crate::web_api::review_db::init_review_primary_db(&db_option).await {
+        eprintln!(
+            "⚠️ review 专用数据库连接初始化失败，后续校审接口可能不可用: {}",
+            error
+        );
+    }
     let config_name_for_init = config_name.clone();
+    let startup_ns = db_option.surreal_ns.clone();
+    let startup_db = db_option.project_name.clone();
     tokio::spawn(async move {
         match aios_core::initialize_databases(db_option).await {
             Ok(_) => {
+                if let Err(error) =
+                    aios_core::use_ns_db_compat(&aios_core::SUL_DB, &startup_ns, &startup_db).await
+                {
+                    eprintln!("⚠️ 数据库初始化成功，但最终命名空间切换失败: {}", error);
+                }
                 println!("✅ 数据库连接初始化成功");
             }
             Err(e) => {

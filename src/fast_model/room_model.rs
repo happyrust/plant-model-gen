@@ -692,7 +692,8 @@ async fn refresh_sqlite_spatial_index_from_dbnums(
         .map(|row| (row.refno, row))
         .collect();
 
-    let booled_rows = query_aabb_rows_by_dbnums("inst_relate_booled_aabb", db_nums, PAGE_SIZE).await?;
+    let booled_rows =
+        query_aabb_rows_by_dbnums("inst_relate_booled_aabb", db_nums, PAGE_SIZE).await?;
     let raw_rows = query_aabb_rows_by_dbnums("inst_relate_aabb", db_nums, PAGE_SIZE).await?;
 
     let mut booled_map: HashMap<RefnoEnum, Aabb> = HashMap::new();
@@ -1704,7 +1705,8 @@ async fn build_room_relations_with_cancel_and_overrides(
             "[room_model] 开始刷新 SQLite AABB 索引: db_nums={:?}, refno_root={:?}, force_rebuild={}",
             db_nums, refno_root, force_rebuild
         );
-        let inserted = ensure_spatial_index_ready(db_nums, refno_root.clone(), force_rebuild).await?;
+        let inserted =
+            ensure_spatial_index_ready(db_nums, refno_root.clone(), force_rebuild).await?;
         if inserted == 0 {
             anyhow::bail!(
                 "房间计算前置失败：SQLite AABB 索引刷新结果为空，已停止后续 room 关系写入"

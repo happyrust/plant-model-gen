@@ -6,6 +6,7 @@ import {
   canParseSite,
   canStartSite,
   canStopSite,
+  parsePlanClass,
   statusLabelMap,
   statusClassMap,
 } from './site-status'
@@ -73,6 +74,17 @@ function canEdit() {
         </span>
       </div>
       <p class="text-sm text-muted-foreground truncate">{{ site.site_id }}</p>
+      <div v-if="site.parse_plan?.label" class="mt-2 flex flex-wrap items-center gap-2">
+        <span
+          class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
+          :class="parsePlanClass(site.parse_plan)"
+        >
+          {{ site.parse_plan.label }}
+        </span>
+        <span class="max-w-[680px] truncate text-xs text-muted-foreground" :title="site.parse_plan.detail">
+          {{ site.parse_plan.detail }}
+        </span>
+      </div>
     </div>
     <div v-if="site" class="flex items-center gap-2 shrink-0">
       <div v-if="isPending()" class="flex items-center gap-2 text-sm text-muted-foreground">

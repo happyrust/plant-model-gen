@@ -18,8 +18,7 @@ use crate::web_server::wizard_handlers::open_deployment_sites_sqlite;
 
 const SESSIONS_TABLE: &str = "admin_sessions";
 const USERS_TABLE: &str = "admin_users";
-const ADMIN_AUTH_UNAVAILABLE_MESSAGE: &str =
-    "管理员凭据未配置，请先设置 ADMIN_USER 与 ADMIN_PASS";
+const ADMIN_AUTH_UNAVAILABLE_MESSAGE: &str = "管理员凭据未配置，请先设置 ADMIN_USER 与 ADMIN_PASS";
 
 static ADMIN_AUTH_LOG_ONCE: Once = Once::new();
 

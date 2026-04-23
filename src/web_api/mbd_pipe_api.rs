@@ -587,9 +587,7 @@ async fn resolve_effective_branch_refno(input_refno: RefnoEnum) -> anyhow::Resul
         return Ok(input_refno);
     }
 
-    async fn promote_via_owner_chain(
-        start_refno: RefnoEnum,
-    ) -> anyhow::Result<Option<RefnoEnum>> {
+    async fn promote_via_owner_chain(start_refno: RefnoEnum) -> anyhow::Result<Option<RefnoEnum>> {
         use aios_core::{SUL_DB, SurrealQueryExt};
 
         let mut current = start_refno;
@@ -1959,11 +1957,9 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
     });
 
     let found_aod = segs.iter().filter(|s| s.outside_diameter.is_some()).count();
-    debug.notes.push(format!(
-        "tubi_aod_found={}/{}",
-        found_aod,
-        segs.len()
-    ));
+    debug
+        .notes
+        .push(format!("tubi_aod_found={}/{}", found_aod, segs.len()));
 
     Ok((segs, debug))
 }
@@ -2617,15 +2613,11 @@ fn normalized_dir_or_x(v: glam::Vec3) -> glam::Vec3 {
 }
 
 fn serde_value_as_str(v: &Option<serde_json::Value>) -> Option<String> {
-    v.as_ref()
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
+    v.as_ref().and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
 fn format_bend_angle_text(angle: Option<f32>) -> String {
-    angle
-        .map(|a| format!("{a:.1}°"))
-        .unwrap_or_default()
+    angle.map(|a| format!("{a:.1}°")).unwrap_or_default()
 }
 
 /// 粗略估计分支 volume 中心：取所有段 arrive/leave 的平均（忽略 None）。

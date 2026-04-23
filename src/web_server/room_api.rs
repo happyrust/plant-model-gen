@@ -27,8 +27,7 @@ use aios_core::{
 
 use crate::fast_model::{
     RoomBuildStats, RoomTaskType as WorkerRoomTaskType, RoomWorker, RoomWorkerConfig,
-    RoomWorkerTask,
-    RoomWorkerTaskStatus, room_model::build_room_panels_relate_for_query,
+    RoomWorkerTask, RoomWorkerTaskStatus, room_model::build_room_panels_relate_for_query,
 };
 use crate::shared::{
     ProgressHub, ProgressMessage, ProgressMessageBuilder, TaskStatus as HubTaskStatus,
@@ -850,7 +849,11 @@ fn apply_worker_status_to_task(task: &mut RoomComputeTask, worker_status: &RoomW
 }
 
 fn push_task_to_history(task_manager: &mut RoomTaskManager, task: RoomComputeTask) {
-    if let Some(existing) = task_manager.task_history.iter_mut().find(|t| t.id == task.id) {
+    if let Some(existing) = task_manager
+        .task_history
+        .iter_mut()
+        .find(|t| t.id == task.id)
+    {
         *existing = task;
     } else {
         task_manager.task_history.push(task);
@@ -887,7 +890,11 @@ async fn sync_task_with_worker_status(
         return Some(snapshot);
     }
 
-    if let Some(task) = task_manager.task_history.iter_mut().find(|t| t.id == task_id) {
+    if let Some(task) = task_manager
+        .task_history
+        .iter_mut()
+        .find(|t| t.id == task_id)
+    {
         apply_worker_status_to_task(task, &worker_status);
         return Some(task.clone());
     }

@@ -815,6 +815,29 @@ pub struct ManagedSiteParseHealth {
     pub detail: Option<String>,
 }
 
+/// 管理后台当前解析计划模式
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ManagedSiteParsePlanMode {
+    #[default]
+    Full,
+    Bootstrap,
+    RebuildSystem,
+    Selective,
+    FastReparse,
+}
+
+/// 管理后台当前解析计划摘要
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedSiteParsePlan {
+    pub mode: ManagedSiteParsePlanMode,
+    pub label: String,
+    pub detail: String,
+    #[serde(default)]
+    pub includes_system_db_files: bool,
+    #[serde(default)]
+    pub included_db_files: Vec<String>,
+}
+
 /// 管理后台项目站点
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ManagedProjectSite {
@@ -824,6 +847,10 @@ pub struct ManagedProjectSite {
     pub project_path: String,
     #[serde(default)]
     pub manual_db_nums: Vec<u32>,
+    #[serde(default)]
+    pub parse_db_types: Vec<String>,
+    #[serde(default)]
+    pub force_rebuild_system_db: bool,
     pub config_path: String,
     pub runtime_dir: String,
     pub db_data_path: String,
@@ -846,6 +873,8 @@ pub struct ManagedProjectSite {
     pub last_parse_started_at: Option<String>,
     pub last_parse_finished_at: Option<String>,
     pub last_parse_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub parse_plan: ManagedSiteParsePlan,
     #[serde(default)]
     pub risk_level: ManagedSiteRiskLevel,
     #[serde(default)]
@@ -886,6 +915,10 @@ pub struct CreateManagedSiteRequest {
     pub project_code: u32,
     #[serde(default)]
     pub manual_db_nums: Vec<u32>,
+    #[serde(default)]
+    pub parse_db_types: Vec<String>,
+    #[serde(default)]
+    pub force_rebuild_system_db: bool,
     pub db_port: u16,
     pub web_port: u16,
     #[serde(default)]
@@ -912,6 +945,10 @@ pub struct UpdateManagedSiteRequest {
     #[serde(default)]
     pub manual_db_nums: Option<Vec<u32>>,
     #[serde(default)]
+    pub parse_db_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub force_rebuild_system_db: Option<bool>,
+    #[serde(default)]
     pub db_port: Option<u16>,
     #[serde(default)]
     pub web_port: Option<u16>,
@@ -927,12 +964,36 @@ pub struct UpdateManagedSiteRequest {
     pub db_password: Option<String>,
 }
 
+/// 管理后台解析计划预览请求
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PreviewManagedSiteParsePlanRequest {
+    #[serde(default)]
+    pub site_id: Option<String>,
+    pub project_name: String,
+    pub project_path: String,
+    #[serde(default)]
+    pub manual_db_nums: Vec<u32>,
+    #[serde(default)]
+    pub parse_db_types: Vec<String>,
+    #[serde(default)]
+    pub force_rebuild_system_db: bool,
+    pub web_port: u16,
+    #[serde(default)]
+    pub bind_host: Option<String>,
+    #[serde(default)]
+    pub public_base_url: Option<String>,
+    #[serde(default)]
+    pub associated_project: Option<String>,
+}
+
 /// 管理后台站点运行态
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ManagedSiteRuntimeStatus {
     pub site_id: String,
     pub status: ManagedSiteStatus,
     pub parse_status: ManagedSiteParseStatus,
+    #[serde(default)]
+    pub parse_plan: ManagedSiteParsePlan,
     pub current_stage: String,
     pub current_stage_label: String,
     pub current_stage_detail: Option<String>,

@@ -1564,13 +1564,12 @@ pub async fn create_task(
     let mut task_manager = state.task_manager.lock().await;
 
     let has_manual_refnos = !request.config.manual_refnos.is_empty();
-    let task_type = if matches!(request.task_type.clone(), TaskType::DataGeneration)
-        && has_manual_refnos
-    {
-        TaskType::RefnoModelGeneration
-    } else {
-        request.task_type
-    };
+    let task_type =
+        if matches!(request.task_type.clone(), TaskType::DataGeneration) && has_manual_refnos {
+            TaskType::RefnoModelGeneration
+        } else {
+            request.task_type
+        };
 
     let mut task = TaskInfo::new(request.name, task_type, request.config);
     // 附加可选元数据（batch_id 等）
@@ -1964,7 +1963,10 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
                 if !instances_path.exists() {
                     continue;
                 }
-                match index.inner().import_from_instances_json(&instances_path, &import_cfg) {
+                match index
+                    .inner()
+                    .import_from_instances_json(&instances_path, &import_cfg)
+                {
                     Ok(stats) => {
                         total_processed += stats.total_inserted;
                         exported_dbnums.push(dbnum);
@@ -6142,13 +6144,18 @@ pub async fn api_space_suppo_trays(Json(req): Json<SuppoTraysRequest>) -> Json<s
     };
     match aios_core::metadata::spatial_computation::resolve_supp_bran(refno, req.tolerance).await {
         Ok(matches) => {
-            let trays: Vec<serde_json::Value> = matches.iter().map(|m| json!({
-                "bran_refno": m.bran_refno.to_string(),
-                "bran_name": m.bran_name,
-                "tray_section_refno": m.contact_sctn_refno.to_string(),
-                "support_type": m.match_method,
-                "contact_point": dvec3_to_point(m.contact_point_world),
-            })).collect();
+            let trays: Vec<serde_json::Value> = matches
+                .iter()
+                .map(|m| {
+                    json!({
+                        "bran_refno": m.bran_refno.to_string(),
+                        "bran_name": m.bran_name,
+                        "tray_section_refno": m.contact_sctn_refno.to_string(),
+                        "support_type": m.match_method,
+                        "contact_point": dvec3_to_point(m.contact_point_world),
+                    })
+                })
+                .collect();
             Json(json!({"status":"success","data":{"anchor_kind":"auto","trays":trays}}))
         }
         Err(err) => Json(json!({"status":"error","message":format!("{err:#}")})),
@@ -6548,7 +6555,9 @@ pub async fn api_space_fitting_offset(
         Ok(r) => r,
         Err(msg) => return Json(json!({"status":"error","message":msg})),
     };
-    match aios_core::metadata::spatial_computation::compute_supp_panel_offset(refno, req.tolerance).await {
+    match aios_core::metadata::spatial_computation::compute_supp_panel_offset(refno, req.tolerance)
+        .await
+    {
         Ok(Some(offset)) => Json(json!({
             "status":"success",
             "data":{
@@ -6573,7 +6582,13 @@ pub async fn api_space_steel_relative(
         Ok(r) => r,
         Err(msg) => return Json(json!({"status":"error","message":msg})),
     };
-    match aios_core::metadata::spatial_computation::resolve_supp_steel(refno, req.search_radius, &[]).await {
+    match aios_core::metadata::spatial_computation::resolve_supp_steel(
+        refno,
+        req.search_radius,
+        &[],
+    )
+    .await
+    {
         Ok(Some(steel)) => Json(json!({
             "status":"success",
             "data":{
@@ -6597,7 +6612,9 @@ pub async fn api_space_tray_span(Json(req): Json<TraySpanRequest>) -> Json<serde
         Ok(r) => r,
         Err(msg) => return Json(json!({"status":"error","message":msg})),
     };
-    match aios_core::metadata::spatial_computation::compute_supp_span(refno, req.neighbor_window).await {
+    match aios_core::metadata::spatial_computation::compute_supp_span(refno, req.neighbor_window)
+        .await
+    {
         Ok(Some(span)) => Json(json!({
             "status":"success",
             "data":{

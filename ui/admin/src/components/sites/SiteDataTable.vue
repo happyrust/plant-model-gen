@@ -9,6 +9,7 @@ import {
   canParseSite,
   canStartSite,
   canStopSite,
+  parsePlanClass as getParsePlanClass,
   parseStatusClass as getParseStatusClass,
   statusClassMap,
   statusLabelMap,
@@ -147,13 +148,24 @@ async function handleDelete(siteId: string) {
             </div>
           </td>
           <td class="px-4 py-3 align-top">
-            <div class="flex items-center gap-1.5">
+            <div class="flex flex-wrap items-center gap-1.5">
               <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium" :class="statusClassMap[site.status]">
                 {{ statusLabelMap[site.status] ?? site.status }}
               </span>
               <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium" :class="getParseStatusClass(site.parse_status)">
                 {{ site.parse_status }}
               </span>
+            </div>
+            <div v-if="site.parse_plan?.label" class="mt-2 space-y-1">
+              <span
+                class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
+                :class="getParsePlanClass(site.parse_plan)"
+              >
+                {{ site.parse_plan.label }}
+              </span>
+              <div class="max-w-[260px] truncate text-xs text-muted-foreground" :title="site.parse_plan.detail">
+                {{ site.parse_plan.detail }}
+              </div>
             </div>
           </td>
           <td class="px-4 py-3 align-top">

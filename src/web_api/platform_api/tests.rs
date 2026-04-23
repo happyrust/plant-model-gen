@@ -610,10 +610,12 @@ async fn test_embed_url_returns_existing_task_for_form_id() {
     let lineage: EmbedLineageBody =
         serde_json::from_value(data.get("lineage").cloned().expect("lineage")).unwrap();
     assert_eq!(lineage.form_id, form_id);
-    assert!(lineage
-        .task_id
-        .as_deref()
-        .is_some_and(|task_id| task_id.starts_with("task-form-db-backed-existing")));
+    assert!(
+        lineage
+            .task_id
+            .as_deref()
+            .is_some_and(|task_id| task_id.starts_with("task-form-db-backed-existing"))
+    );
     assert_eq!(lineage.current_node.as_deref(), Some("jd"));
     assert_eq!(lineage.status.as_deref(), Some("in_review"));
     let task = data
@@ -635,10 +637,11 @@ async fn test_embed_url_returns_existing_task_for_form_id() {
         task.get("status").and_then(|v| v.as_str()),
         Some("in_review")
     );
-    assert!(task
-        .get("id")
-        .and_then(|v| v.as_str())
-        .is_some_and(|id| id.starts_with("task-form-db-backed-existing")));
+    assert!(
+        task.get("id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| id.starts_with("task-form-db-backed-existing"))
+    );
     let response_token = data
         .get("token")
         .and_then(|v| v.as_str())

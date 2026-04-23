@@ -5,9 +5,10 @@
 //! - 逻辑删除用显式 `(deleted IS NONE OR deleted = false)`（旧行无 `deleted` 视为未删）；
 //! - 能用单次 `UPDATE … WHERE` 完成的不要先 `SELECT` 再写（减少往返）。
 
-use aios_core::project_primary_db;
+use crate::web_api::review_db::{ensure_review_primary_db_context, review_primary_db};
 use std::fs;
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
+use tracing::warn;
 
 use super::types::{
     ReviewForm, ReviewFormRow, derive_review_form_status_from_task_status, review_form_from_row,
@@ -24,7 +25,12 @@ pub const REVIEW_TASK_ACTIVE_SQL: &str = "(deleted IS NONE OR deleted = false)";
 // ============================================================================
 
 async fn ensure_review_forms_schema() -> anyhow::Result<()> {
-    project_primary_db()
+    ensure_review_primary_db_context().await?;
+    if let Err(error) = review_primary_db().query("INFO FOR DB").await {
+        warn!("ensure_review_forms_schema INFO FOR DB failed: {}", error);
+        return Err(error.into());
+    }
+    review_primary_db()
         .query(
             r#"
             DEFINE TABLE IF NOT EXISTS review_forms SCHEMAFULL;
@@ -43,7 +49,11 @@ async fn ensure_review_forms_schema() -> anyhow::Result<()> {
             DEFINE INDEX IF NOT EXISTS idx_form_id ON TABLE review_forms FIELDS form_id UNIQUE;
             "#,
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            warn!("ensure_review_forms_schema DEFINE failed: {}", error);
+            error
+        })?;
     Ok(())
 }
 
@@ -54,7 +64,15 @@ async fn ensure_review_forms_schema() -> anyhow::Result<()> {
 pub async fn get_review_form_by_form_id(form_id: &str) -> anyhow::Result<Option<ReviewForm>> {
     ensure_review_forms_schema().await?;
 
-    let mut response = project_primary_db()
+    if let Err(error) = review_primary_db().query("INFO FOR DB").await {
+        warn!(
+            "get_review_form_by_form_id INFO FOR DB failed: form_id={}, error={}",
+            form_id, error
+        );
+        return Err(error.into());
+    }
+
+    let mut response = review_primary_db()
         .query(
             r#"
             SELECT * FROM review_forms
@@ -64,7 +82,14 @@ pub async fn get_review_form_by_form_id(form_id: &str) -> anyhow::Result<Option<
             "#,
         )
         .bind(("form_id", form_id.to_string()))
-        .await?;
+        .await
+        .map_err(|error| {
+            warn!(
+                "get_review_form_by_form_id SELECT failed: form_id={}, error={}",
+                form_id, error
+            );
+            error
+        })?;
 
     let rows: Vec<ReviewFormRow> = response.take(0)?;
     Ok(rows.into_iter().next().map(review_form_from_row))
@@ -88,7 +113,7 @@ pub async fn ensure_review_form_stub(
             anyhow::bail!("form_id={} 对应主单据已删除，禁止重新打开", form_id);
         }
 
-        project_primary_db()
+        review_primary_db()
             .query(
                 r#"
                 UPDATE review_forms
@@ -108,14 +133,21 @@ pub async fn ensure_review_form_stub(
             .bind(("requester_id", requester_id.trim().to_string()))
             .bind(("role", normalized_role.clone().unwrap_or_default()))
             .bind(("source", source.trim().to_string()))
-            .await?;
+            .await
+            .map_err(|error| {
+                warn!(
+                    "ensure_review_form_stub UPDATE failed: form_id={}, error={}",
+                    form_id, error
+                );
+                error
+            })?;
 
         return get_review_form_by_form_id(form_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("form_id={} 主单据更新后读取失败", form_id));
     }
 
-    project_primary_db()
+    review_primary_db()
         .query(
             r#"
             CREATE review_forms CONTENT {
@@ -139,7 +171,14 @@ pub async fn ensure_review_form_stub(
         .bind(("requester_id", requester_id.trim().to_string()))
         .bind(("role", normalized_role.unwrap_or_default()))
         .bind(("source", source.trim().to_string()))
-        .await?;
+        .await
+        .map_err(|error| {
+            warn!(
+                "ensure_review_form_stub CREATE failed: form_id={}, error={}",
+                form_id, error
+            );
+            error
+        })?;
 
     get_review_form_by_form_id(form_id)
         .await?
@@ -163,7 +202,7 @@ pub async fn sync_review_form_with_task_status(
     .await?;
 
     let form_status = derive_review_form_status_from_task_status(task_status);
-    project_primary_db()
+    review_primary_db()
         .query(
             r#"
             UPDATE review_forms
@@ -193,7 +232,7 @@ pub async fn sync_review_form_with_task_status(
 pub async fn mark_review_form_deleted(form_id: &str) -> anyhow::Result<()> {
     ensure_review_forms_schema().await?;
 
-    project_primary_db()
+    review_primary_db()
         .query(
             r#"
             UPDATE review_forms
@@ -224,7 +263,7 @@ async fn query_review_task_ids_by_form_id(form_id: &str) -> anyhow::Result<Vec<S
         id: surrealdb_types::RecordId,
     }
 
-    let mut response = project_primary_db()
+    let mut response = review_primary_db()
         .query(
             r#"
             SELECT id FROM review_tasks
@@ -249,7 +288,7 @@ async fn query_review_task_ids_by_form_id(form_id: &str) -> anyhow::Result<Vec<S
 async fn query_review_attachment_delete_rows(
     form_id: &str,
 ) -> anyhow::Result<Vec<ReviewAttachmentDeleteRow>> {
-    let mut response = project_primary_db()
+    let mut response = review_primary_db()
         .query(
             r#"
             SELECT file_id, file_ext FROM review_attachment
@@ -314,7 +353,7 @@ pub async fn soft_delete_review_bundle(form_id: &str) -> anyhow::Result<()> {
     let task_ids = query_review_task_ids_by_form_id(form_id).await?;
     let attachments = query_review_attachment_delete_rows(form_id).await?;
 
-    project_primary_db()
+    review_primary_db()
         .query(
             r#"
             UPDATE review_tasks SET
@@ -330,7 +369,7 @@ pub async fn soft_delete_review_bundle(form_id: &str) -> anyhow::Result<()> {
 
     mark_review_form_deleted(form_id).await?;
 
-    project_primary_db()
+    review_primary_db()
         .query(
             r#"
             LET $ids = SELECT VALUE id FROM review_form_model WHERE form_id = $form_id;
@@ -341,7 +380,7 @@ pub async fn soft_delete_review_bundle(form_id: &str) -> anyhow::Result<()> {
         .await?;
 
     // 清理关联 review_comments + severity（在删除 review_records 之前提取 annotation_ids）
-    project_primary_db()
+    review_primary_db()
         .query(
             r#"
             LET $records = SELECT annotations, cloud_annotations, rect_annotations, obb_annotations
@@ -359,7 +398,7 @@ pub async fn soft_delete_review_bundle(form_id: &str) -> anyhow::Result<()> {
         .bind(("form_id", form_id.to_string()))
         .await?;
 
-    project_primary_db()
+    review_primary_db()
         .query(
             r#"
             LET $ids = SELECT VALUE id FROM review_records WHERE form_id = $form_id;
@@ -370,7 +409,7 @@ pub async fn soft_delete_review_bundle(form_id: &str) -> anyhow::Result<()> {
         .await?;
 
     if !task_ids.is_empty() {
-        project_primary_db()
+        review_primary_db()
             .query(
                 r#"
                 LET $ids = SELECT VALUE id FROM review_workflow_history WHERE task_id IN $task_ids;
@@ -388,7 +427,7 @@ pub async fn soft_delete_review_bundle(form_id: &str) -> anyhow::Result<()> {
         )?;
     }
 
-    project_primary_db()
+    review_primary_db()
         .query(
             r#"
             LET $ids = SELECT VALUE id FROM review_attachment WHERE form_id = $form_id;
@@ -438,7 +477,7 @@ pub async fn find_task_by_form_id(form_id: &str) -> anyhow::Result<Option<Review
         value.map(|dt| dt.timestamp_millis())
     }
 
-    let mut response = project_primary_db()
+    let mut response = review_primary_db()
         .query(&format!(
             r#"
             SELECT * FROM review_tasks

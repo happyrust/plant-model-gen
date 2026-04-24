@@ -358,6 +358,32 @@ fn normalize_host(host: Option<String>) -> String {
         .unwrap_or_else(|| "127.0.0.1".to_string())
 }
 
+/// 在写入 DB 之前对 `bind_host` 做安全校验。
+///
+/// - `0.0.0.0` 默认拒绝（公网暴露风险）
+/// - `AIOS_ALLOW_PUBLIC_BIND=1` / `=true` 时放行，便于需要内网/跨机部署的场景
+///
+/// 设计动机：继 `normalize_host` 在空值时默认 `127.0.0.1` 之后，为"用户显式传
+/// 0.0.0.0 也要兜一下"补第二道保险（PDMS Hardening 续篇：admin 站点安全收口，
+/// 详见 `docs/plans/2026-04-24-admin-site-security-hardening-plan.md`）。
+fn assert_bind_host_safe(host: &str) -> Result<()> {
+    let trimmed = host.trim();
+    if trimmed == "0.0.0.0" && !env_allow_public_bind() {
+        bail!(
+            "bind_host=0.0.0.0 会将站点暴露到所有网络接口。\
+             请改用 127.0.0.1 或具体的内网地址；\
+             如确需公网绑定，请设置 AIOS_ALLOW_PUBLIC_BIND=1 并自行承担风险。"
+        );
+    }
+    Ok(())
+}
+
+fn env_allow_public_bind() -> bool {
+    std::env::var("AIOS_ALLOW_PUBLIC_BIND")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn require_db_user(user: Option<String>) -> Result<String> {
     user.map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -369,6 +395,48 @@ fn require_db_password(password: Option<String>) -> Result<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("数据库密码不能为空"))
+}
+
+/// 常见弱凭据黑名单（小写比较）；后续可按需扩展。
+const WEAK_CREDENTIAL_PAIRS: &[(&str, &str)] = &[
+    ("root", "root"),
+    ("admin", "admin"),
+    ("admin", "123456"),
+    ("root", "123456"),
+    ("test", "test"),
+];
+
+fn env_allow_weak_db_creds() -> bool {
+    std::env::var("AIOS_ALLOW_WEAK_DB_CREDS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// 拒绝常见弱凭据；允许通过 `AIOS_ALLOW_WEAK_DB_CREDS=1` 逃生（开发/测试兼容）。
+///
+/// 约束理由：站点 SurrealDB 的 `user/password` 会以明文写入 per-site 配置，
+/// 若误填 `root/root` 会导致站点 DB 对任意连接者可读写。SiteDrawer.vue 从
+/// 2026-04-21 起已经取消默认 root/root 预填，但后端仍然只校验"非空"，
+/// 手写或脚本化提交仍可能绕过；本函数在 `create_site` / `update_site` 两处
+/// 统一兜一层硬拒绝。
+fn assert_db_credentials_strong(user: &str, password: &str) -> Result<()> {
+    if env_allow_weak_db_creds() {
+        return Ok(());
+    }
+    let u = user.trim().to_ascii_lowercase();
+    let p = password.trim().to_ascii_lowercase();
+    for (weak_u, weak_p) in WEAK_CREDENTIAL_PAIRS {
+        if u == *weak_u && p == *weak_p {
+            bail!(
+                "数据库凭据过于简单（{}/{}）。\
+                 请使用更复杂的用户名/密码；如仅用于本地开发，\
+                 可设置 AIOS_ALLOW_WEAK_DB_CREDS=1 临时放行。",
+                user,
+                password,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn normalize_optional_db_user(user: Option<String>) -> Option<String> {
@@ -1516,6 +1584,7 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
     let site_id = infer_site_id(&req.project_name, req.web_port);
     let created_at = now_rfc3339();
     let bind_host = normalize_host(req.bind_host);
+    assert_bind_host_safe(&bind_host)?;
     let public_base_url = req
         .public_base_url
         .filter(|v| !v.trim().is_empty())
@@ -1528,6 +1597,7 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
         derive_entry_urls(req.web_port, &bind_host, &public_base_url);
     let db_user = require_db_user(req.db_user)?;
     let db_password = require_db_password(req.db_password)?;
+    assert_db_credentials_strong(&db_user, &db_password)?;
 
     let parse_db_types = normalize_parse_db_types(req.parse_db_types);
     let site = ManagedProjectSite {
@@ -1735,6 +1805,8 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
         site.force_rebuild_system_db = value;
     }
     if let Some(value) = req.bind_host.filter(|value| !value.trim().is_empty()) {
+        let value = value.trim().to_string();
+        assert_bind_host_safe(&value)?;
         site.bind_host = normalize_host(Some(value));
     }
     if let Some(value) = req.public_base_url {
@@ -1766,6 +1838,7 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
     }
     let db_user = normalize_optional_db_user(req.db_user).unwrap_or(stored_db_user);
     let db_password = normalize_optional_db_password(req.db_password).unwrap_or(stored_db_password);
+    assert_db_credentials_strong(&db_user, &db_password)?;
     site.force_rebuild_system_db =
         normalize_force_rebuild_system_db(site.force_rebuild_system_db, &site.parse_db_types);
 

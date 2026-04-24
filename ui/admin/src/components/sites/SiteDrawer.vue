@@ -61,6 +61,24 @@ const manualDbNumsStr = ref('')
 const isEditing = computed(() => !!props.siteId)
 const title = computed(() => isEditing.value ? '编辑站点' : '新建站点')
 
+const WEAK_CREDENTIAL_SET = new Set([
+  'root/root',
+  'admin/admin',
+  'admin/123456',
+  'root/123456',
+  'test/test',
+])
+
+const weakCredentialsWarning = computed<string | null>(() => {
+  const user = (form.value.db_user || '').trim().toLowerCase()
+  const password = (form.value.db_password || '').trim().toLowerCase()
+  if (!user || !password) return null
+  if (WEAK_CREDENTIAL_SET.has(`${user}/${password}`)) {
+    return '检测到常见弱凭据（root/root、admin/admin 等）。后端会拒绝此组合；本地开发可设置 AIOS_ALLOW_WEAK_DB_CREDS=1 临时放行。'
+  }
+  return null
+})
+
 function parseManualDbNumsInput(value: string) {
   return value
     .split(/[,\s]+/)
@@ -527,6 +545,12 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
               <p class="text-xs text-muted-foreground">
                 {{ isEditing ? '编辑时留空表示沿用当前凭据。' : '不再自动写入默认 root/root，请显式填写。' }}
               </p>
+              <div
+                v-if="weakCredentialsWarning"
+                class="rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+              >
+                {{ weakCredentialsWarning }}
+              </div>
             </fieldset>
 
             <div v-if="error" class="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">

@@ -241,6 +241,8 @@ pub struct SyncWorkflowData {
     pub task_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_step: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation_states: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]

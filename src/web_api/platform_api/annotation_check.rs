@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::web_api::jwt_auth::{REVIEW_AUTH_CONFIG, ReviewAuthConfig, verify_token};
+use crate::web_api::review_annotation_state::load_annotation_states_by_task;
 use crate::web_api::review_db::review_primary_db;
 use axum::{
     Json,
@@ -599,7 +600,68 @@ async fn load_effective_annotations(
         }
     }
 
+    overlay_independent_states(context, &mut annotations, &annotation_index).await;
+
     Ok(annotations)
+}
+
+/// Overlay states from the independent `review_annotation_states` table onto
+/// the annotations collected from `review_records`. If an independent state
+/// exists for a given annotation, it takes precedence over the embedded
+/// `reviewState` from records; otherwise the embedded value is kept as fallback.
+async fn overlay_independent_states(
+    context: &AnnotationCheckContext,
+    annotations: &mut [EffectiveAnnotation],
+    annotation_index: &HashMap<String, usize>,
+) {
+    let states = match load_annotation_states_by_task(&context.form_id, &context.task_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "overlay_independent_states: failed to load states, falling back to embedded: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    for state in states {
+        let key = &state.annotation_id;
+        if let Some(&idx) = annotation_index.get(key) {
+            let anno = &mut annotations[idx];
+            anno.state = classify_from_independent_state(
+                &state.resolution_status,
+                &state.decision_status,
+            );
+            anno.updated_at = Some(state.updated_at);
+            if !state.updated_by_name.is_empty() {
+                anno.updated_by_name = Some(state.updated_by_name.clone());
+            }
+            if !state.updated_by_role.is_empty() {
+                anno.updated_by_role = Some(state.updated_by_role.clone());
+            }
+            if state.note.is_some() {
+                anno.note = state.note.clone();
+            }
+        }
+    }
+}
+
+fn classify_from_independent_state(
+    resolution_status: &str,
+    decision_status: &str,
+) -> AnnotationGateState {
+    match decision_status {
+        "agreed" => AnnotationGateState::Approved,
+        "rejected" => AnnotationGateState::Rejected,
+        _ => {
+            if matches!(resolution_status, "fixed" | "wont_fix") {
+                AnnotationGateState::PendingReview
+            } else {
+                AnnotationGateState::Open
+            }
+        }
+    }
 }
 
 fn build_effective_annotation(

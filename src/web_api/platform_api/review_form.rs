@@ -398,6 +398,15 @@ pub async fn soft_delete_review_bundle(form_id: &str) -> anyhow::Result<()> {
         .bind(("form_id", form_id.to_string()))
         .await?;
 
+    crate::web_api::review_annotation_state::delete_annotation_states_by_form_id(form_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                "soft_delete_review_bundle: failed to clean review_annotation_states for form_id={}: {}",
+                form_id, e
+            );
+        });
+
     review_primary_db()
         .query(
             r#"

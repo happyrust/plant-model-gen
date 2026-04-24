@@ -43,6 +43,10 @@ pub mod review_api;
 #[cfg(feature = "web_server")]
 pub use review_api::create_review_api_routes;
 #[cfg(feature = "web_server")]
+pub mod review_annotation_state;
+#[cfg(feature = "web_server")]
+pub use review_annotation_state::create_annotation_state_routes;
+#[cfg(feature = "web_server")]
 pub mod review_db;
 
 #[cfg(feature = "web_server")]
@@ -74,6 +78,7 @@ pub fn assemble_stateless_web_api_routes() -> axum::Router {
         .merge(create_platform_api_routes())
         .merge(create_jwt_auth_routes())
         .merge(create_review_api_routes())
+        .merge(create_annotation_state_routes())
         .merge(create_scene_tree_routes())
         .merge(create_mbd_pipe_routes())
         .nest("/api/pipeline", create_pipeline_annotation_routes())

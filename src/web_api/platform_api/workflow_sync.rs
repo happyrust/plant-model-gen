@@ -9,6 +9,7 @@ use std::{collections::BTreeSet, path::Path, sync::OnceLock};
 use surrealdb::types::SurrealValue;
 use tracing::{info, warn};
 
+use crate::web_api::review_annotation_state::load_annotation_states_by_task;
 use crate::web_api::review_api::ReviewTask;
 use crate::web_api::review_db::review_primary_db;
 
@@ -1617,7 +1618,7 @@ async fn query_annotation_comments(
                 r#"
                 SELECT id, annotation_id, annotation_type, author_id, author_name, author_role, content, reply_to_id, created_at
                 FROM review_comments
-                WHERE annotation_id = $annotation_id
+                WHERE annotation_id = $annotation_id AND (deleted IS NONE OR deleted = false)
                 ORDER BY created_at ASC
                 "#,
             )
@@ -1685,6 +1686,21 @@ async fn query_workflow_data(
         .as_ref()
         .map(|form| normalize_review_form_status(form.status.as_str()));
 
+    let annotation_states = if let Some(ref tid) = task_id {
+        match load_annotation_states_by_task(form_id, tid).await {
+            Ok(states) if !states.is_empty() => {
+                let json_states: Vec<serde_json::Value> = states
+                    .into_iter()
+                    .filter_map(|s| serde_json::to_value(s).ok())
+                    .collect();
+                Some(json_states)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     Ok(SyncWorkflowData {
         models,
         task_id,
@@ -1697,5 +1713,6 @@ async fn query_workflow_data(
         current_node,
         task_status,
         next_step,
+        annotation_states,
     })
 }

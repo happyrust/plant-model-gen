@@ -26,6 +26,7 @@ use crate::web_api::platform_api::{
     },
     mark_review_form_deleted, sync_review_form_with_task_status,
 };
+use crate::web_api::review_annotation_state::sync_annotation_states_from_snapshot;
 use crate::web_api::review_db::review_primary_db;
 use axum::extract::Extension;
 use std::collections::HashSet;
@@ -1165,7 +1166,7 @@ pub fn create_review_api_routes() -> Router {
         )
         .route(
             "/api/review/comments/item/{comment_id}",
-            delete(delete_comment),
+            delete(delete_comment).patch(edit_comment),
         )
         // 批注严重度（问题严重程度，与评论并列但语义不同）
         // 当前为桩实现：仅校验参数并回显，暂不落库；前端失败时走本地 fallback。
@@ -2213,6 +2214,12 @@ async fn create_record(
         } RETURN AFTER
     "#;
 
+    let sync_form_id = form_id.clone();
+    let sync_node = current_node.clone();
+    let sync_operator_id = operator_id.clone();
+    let sync_operator_name = operator_name.clone();
+    let sync_role = claims.role.clone().unwrap_or_default();
+
     match review_primary_db()
         .query(upsert_sql)
         .bind(("id", record_id.clone()))
@@ -2235,6 +2242,19 @@ async fn create_record(
         Ok(mut response) => {
             let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
             if let Some(row) = rows.into_iter().next() {
+                sync_annotation_states_from_snapshot(
+                    &sync_form_id,
+                    &request.task_id,
+                    &sync_node,
+                    &sync_operator_id,
+                    &sync_operator_name,
+                    &sync_role,
+                    &request.annotations,
+                    &request.cloud_annotations,
+                    &request.rect_annotations,
+                )
+                .await;
+
                 (
                     StatusCode::OK,
                     Json(ConfirmedRecordResponse {
@@ -2413,6 +2433,14 @@ pub struct CreateCommentRequest {
     pub author_role: String,
     pub content: String,
     pub reply_to_id: Option<String>,
+    #[serde(default)]
+    pub form_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub workflow_node: Option<String>,
+    #[serde(default)]
+    pub review_round: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2429,6 +2457,8 @@ pub struct CommentResponse {
 #[derive(Debug, Deserialize)]
 pub struct CommentQuery {
     pub r#type: Option<String>,
+    pub form_id: Option<String>,
+    pub task_id: Option<String>,
 }
 
 /// POST /api/review/comments - 添加评论
@@ -2447,6 +2477,16 @@ async fn create_comment(
 
     let comment_id = format!("comment-{}", uuid::Uuid::new_v4());
 
+    let form_id = request.form_id.as_deref().unwrap_or("").trim().to_string();
+    let task_id = request.task_id.as_deref().unwrap_or("").trim().to_string();
+    let workflow_node = request
+        .workflow_node
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let review_round = request.review_round.unwrap_or(0);
+
     let sql = r#"
         CREATE review_comments CONTENT {
             id: $id,
@@ -2457,6 +2497,10 @@ async fn create_comment(
             author_role: $author_role,
             content: $content,
             reply_to_id: $reply_to_id,
+            form_id: $form_id,
+            task_id: $task_id,
+            workflow_node: $workflow_node,
+            review_round: $review_round,
             created_at: time::now()
         }
     "#;
@@ -2471,6 +2515,10 @@ async fn create_comment(
         .bind(("author_role", author_role.clone()))
         .bind(("content", request.content.clone()))
         .bind(("reply_to_id", request.reply_to_id.clone()))
+        .bind(("form_id", form_id))
+        .bind(("task_id", task_id))
+        .bind(("workflow_node", workflow_node))
+        .bind(("review_round", review_round))
         .await
     {
         Ok(_) => {
@@ -2530,17 +2578,47 @@ async fn get_comments_by_annotation(
         created_at: Option<surrealdb::types::Datetime>,
     }
 
-    let sql = if query.r#type.is_some() {
-        "SELECT * FROM review_comments WHERE annotation_id = $annotation_id AND annotation_type = $type ORDER BY created_at ASC"
-    } else {
-        "SELECT * FROM review_comments WHERE annotation_id = $annotation_id ORDER BY created_at ASC"
-    };
+    let mut conditions = vec!["annotation_id = $annotation_id".to_string()];
+    conditions.push("(deleted IS NONE OR deleted = false)".to_string());
+    if query.r#type.is_some() {
+        conditions.push("annotation_type = $type".to_string());
+    }
+    if query
+        .form_id
+        .as_ref()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        conditions.push("form_id = $form_id".to_string());
+    }
+    if query
+        .task_id
+        .as_ref()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        conditions.push("task_id = $task_id".to_string());
+    }
+    let sql = format!(
+        "SELECT * FROM review_comments WHERE {} ORDER BY created_at ASC",
+        conditions.join(" AND ")
+    );
 
     let mut q = review_primary_db()
-        .query(sql)
+        .query(&sql)
         .bind(("annotation_id", annotation_id));
     if let Some(ref t) = query.r#type {
         q = q.bind(("type", t.clone()));
+    }
+    if let Some(ref fid) = query.form_id {
+        let fid = fid.trim();
+        if !fid.is_empty() {
+            q = q.bind(("form_id", fid.to_string()));
+        }
+    }
+    if let Some(ref tid) = query.task_id {
+        let tid = tid.trim();
+        if !tid.is_empty() {
+            q = q.bind(("task_id", tid.to_string()));
+        }
     }
 
     match q.await {
@@ -2645,15 +2723,82 @@ pub struct EditCommentRequest {
     pub content: String,
 }
 
-/// DELETE /api/review/comments/:comment_id - 删除评论
-async fn delete_comment(Path(comment_id): Path<String>) -> impl IntoResponse {
-    info!("Deleting comment: {}", comment_id);
+/// DELETE /api/review/comments/:comment_id - 软删除评论（仅作者或管理员）
+async fn delete_comment(
+    Extension(claims): Extension<TokenClaims>,
+    Path(comment_id): Path<String>,
+) -> impl IntoResponse {
+    info!("Soft-deleting comment: {}", comment_id);
 
-    let sql = "DELETE [type::record('review_comments', $id)]";
+    let user_id = claims.user_id.trim().to_string();
+    let is_admin = claims
+        .role
+        .as_deref()
+        .map(|r| r.eq_ignore_ascii_case("admin"))
+        .unwrap_or(false);
+
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct CommentOwnerRow {
+        author_id: Option<String>,
+    }
+
+    let lookup_sql = "SELECT author_id FROM type::record('review_comments', $id)";
+    let owner = match review_primary_db()
+        .query(lookup_sql)
+        .bind(("id", comment_id.clone()))
+        .await
+    {
+        Ok(mut response) => {
+            let rows: Vec<CommentOwnerRow> = response.take(0).unwrap_or_default();
+            rows.into_iter().next()
+        }
+        Err(e) => {
+            warn!("Failed to look up comment {} for delete: {}", comment_id, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("查询评论失败: {}", e)),
+                }),
+            );
+        }
+    };
+
+    let Some(owner) = owner else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some("评论不存在".to_string()),
+            }),
+        );
+    };
+
+    let author_id = owner.author_id.unwrap_or_default();
+    if !is_admin && author_id != user_id {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some("仅评论作者或管理员可删除".to_string()),
+            }),
+        );
+    }
+
+    let sql = r#"
+        UPDATE type::record('review_comments', $id) SET
+            deleted = true,
+            deleted_at = time::now(),
+            deleted_by = $user_id
+    "#;
 
     match review_primary_db()
         .query(sql)
-        .bind(("id", comment_id))
+        .bind(("id", comment_id.clone()))
+        .bind(("user_id", user_id))
         .await
     {
         Ok(_) => (
@@ -2665,7 +2810,7 @@ async fn delete_comment(Path(comment_id): Path<String>) -> impl IntoResponse {
             }),
         ),
         Err(e) => {
-            warn!("Failed to delete comment: {}", e);
+            warn!("Failed to soft-delete comment {}: {}", comment_id, e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ActionResponse {

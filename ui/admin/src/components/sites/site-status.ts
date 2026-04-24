@@ -133,6 +133,18 @@ export const quickFilterOptions: { value: QuickFilter; label: string }[] = [
   { value: 'pending_parse', label: '待解析' },
 ]
 
+/**
+ * 动作的中文短标签，供错误提示里拼接（例如 "解析失败：..."）使用。
+ *
+ * 与 `stores/sites.ts::SiteAction` 一一对应；新增动作时两处保持同步。
+ */
+export const siteActionLabelMap = {
+  parse: '解析',
+  start: '启动',
+  stop: '停止',
+  delete: '删除',
+} as const satisfies Record<'parse' | 'start' | 'stop' | 'delete', string>
+
 export interface SiteStatsExtended {
   total: number
   running: number

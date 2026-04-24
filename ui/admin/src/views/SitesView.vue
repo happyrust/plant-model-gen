@@ -8,7 +8,7 @@ import SiteDrawer from '@/components/sites/SiteDrawer.vue'
 import SiteToolbar from '@/components/sites/SiteToolbar.vue'
 import SiteWorkbenchHeader from '@/components/sites/SiteWorkbenchHeader.vue'
 import { useSitesStore } from '@/stores/sites'
-import { matchesQuickFilter, computeStats, type QuickFilter } from '@/components/sites/site-status'
+import { matchesQuickFilter, computeStats, siteActionLabelMap, type QuickFilter } from '@/components/sites/site-status'
 import type { AdminResourceSummary, ManagedSiteRiskLevel } from '@/types/site'
 
 const sitesStore = useSitesStore()
@@ -258,7 +258,8 @@ onMounted(async () => {
       <div class="flex items-center gap-2 text-sm text-destructive">
         <CircleAlert class="h-4 w-4 shrink-0" />
         <span>
-          {{ sitesStore.latestActionError.siteId }}：{{ sitesStore.latestActionError.message }}
+          <strong>{{ sitesStore.latestActionError.siteId }}</strong>
+          {{ siteActionLabelMap[sitesStore.latestActionError.action] }}失败：{{ sitesStore.latestActionError.message }}
         </span>
       </div>
       <button

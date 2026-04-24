@@ -21,7 +21,7 @@ import SiteRecentActivityPanel from '@/components/sites/SiteRecentActivityPanel.
 import SiteConfigSections from '@/components/sites/SiteConfigSections.vue'
 import SiteDrawer from '@/components/sites/SiteDrawer.vue'
 import { matchParsePreset, parseDbTypeLabelMap, splitParseDbTypes } from '@/components/sites/parse-db-types'
-import { parsePlanClass } from '@/components/sites/site-status'
+import { parsePlanClass, siteActionLabelMap } from '@/components/sites/site-status'
 import { buildViewerUrl } from '@/lib/viewer'
 import type {
   ManagedProjectSite,
@@ -302,9 +302,21 @@ onMounted(async () => {
 
     <div
       v-if="actionError"
-      class="rounded-lg border border-destructive/50 bg-destructive/5 px-4 py-3 text-sm text-destructive"
+      class="rounded-lg border border-destructive/50 bg-destructive/5 px-4 py-3 flex items-start justify-between gap-3"
     >
-      最近操作失败：{{ actionError.message }}
+      <div class="flex items-start gap-2 text-sm text-destructive">
+        <AlertTriangle class="h-4 w-4 mt-0.5 shrink-0" />
+        <span>
+          <strong>{{ siteActionLabelMap[actionError.action] }}失败：</strong>
+          {{ actionError.message }}
+        </span>
+      </div>
+      <button
+        class="inline-flex h-7 items-center gap-1 rounded-md border border-destructive/30 px-2.5 text-xs font-medium text-destructive hover:bg-destructive/10 transition-colors"
+        @click="sitesStore.clearSiteActionError(siteId)"
+      >
+        关闭
+      </button>
     </div>
 
     <div class="flex gap-2 border-b border-border">

@@ -62,6 +62,11 @@ pub fn classify_error_status(message: &str) -> StatusCode {
         || message.contains("必须大于")
         || message.contains("格式不正确")
         || message.contains("无效")
+        // P2 硬化（2026-04-24）新增错误分类：走参数级 400，便于前端区分
+        // "参数非法" vs "状态冲突"（409）
+        || message.contains("凭据过于简单")
+        || message.contains("会将站点暴露")
+        || message.contains("AIOS_ALLOW_")
     {
         StatusCode::BAD_REQUEST
     } else if message.contains("运行中")

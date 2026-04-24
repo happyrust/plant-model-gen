@@ -110,16 +110,26 @@
 
 ---
 
-### P4：错误反馈增强（0.5天）
+### P4：错误反馈增强（0.5天）✅ 已完成 2026-04-24
 
 **问题**（来自 `2026-04-21-next-iteration-plan` P2）：动作失败后用户看不到原因。
 
-**方案**：
-- `sites.ts` store 增加动作级错误状态
-- `SiteDetailView.vue` 增加 toast/banner 展示失败原因
-- 后端 `admin_handlers.rs` 细化错误码
+**基线复核**：
+- `stores/sites.ts` 早已具备 `pendingActions`/`actionErrors`/`latestActionError` + `withAction` 包装 + `clearSiteActionError`
+- `SitesView.vue` 已有带 dismiss 的全局 banner
+- `admin_response::classify_error_status` 已按中文关键词把错误映射成 404/400/409/500
+- 真 gap 仅剩：详情页 banner **没 dismiss**、banner **没标注哪个动作失败**、P2 新加的"弱凭据/0.0.0.0"未进入 400 分类
 
-**验收**：刻意触发各类错误场景，前端均能显示可理解的错误信息
+**落地**：
+- 后端 `admin_response.rs::classify_error_status`：把 `凭据过于简单`、`会将站点暴露`、`AIOS_ALLOW_` 归入 `BAD_REQUEST`（400），与"状态冲突"（409）明确分层
+- 前端 `components/sites/site-status.ts`：新增 `siteActionLabelMap`（parse=解析/start=启动/stop=停止/delete=删除）
+- 前端 `views/SiteDetailView.vue`：actionError banner 改为"**&lt;动作&gt;失败：&lt;message&gt;**"+ 图标 + dismiss 按钮
+- 前端 `views/SitesView.vue`：全局 banner 加动作标签，与详情页文案一致
+
+**验收**：
+- `cargo check --bin web_server --features web_server` → `10.67s, 0 errors`
+- `npx vue-tsc --noEmit -p tsconfig.app.json`（`ui/admin`）→ `0 errors`
+- 运行时冒烟（待手动）：刻意用 `root/root` 提交 → 400 + 详情页显示"保存失败" / "创建失败"；刻意对 Running 站点点"解析" → 409 + 详情页显示"解析失败：解析任务正在运行"
 
 ---
 

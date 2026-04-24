@@ -91,15 +91,22 @@
 
 ---
 
-### P3：Viewer URL 配置化（0.5天）
+### P3：Viewer URL 配置化（0.5天）✅ 已完成 2026-04-24
 
 **问题**（来自 `2026-04-21-next-iteration-plan` P1）：`localhost:3101` 硬编码。
 
-**方案**：
-- `SiteDataTable.vue`/`SiteDetailView.vue` 中 Viewer URL 改为读取环境变量 `VIEWER_BASE_URL` 或 admin 配置项
-- 保留 `backendPort/backend + output_project` query 协议不变
+**方案**（实际落地版本）：
+- 后端 `admin_handlers.rs` 新增 `GET /api/admin/app-config`，从 `AIOS_VIEWER_BASE_URL` 环境变量解析 `viewer_base_url`，走 `admin_auth_middleware`
+- 前端新增 `ui/admin/src/lib/app-config.ts`：
+  - 模块级 `configRef` 缓存 + `loadAppConfig()` 幂等（失败自动清掉 promise，登录成功后可再试）
+  - `resolveViewerBaseUrl()`: `runtime (API)` → `Vite env VITE_VIEWER_BASE` → `null`
+- `lib/viewer.ts::buildViewerUrl` 改用 `resolveViewerBaseUrl()`，query 协议（`backendPort/backend/output_project`）不变
+- `main.ts` 启动期 fire-and-forget `loadAppConfig()`；`stores/auth.ts::login` 登录成功后再触发一次（覆盖启动期 401 场景）
 
-**验收**：修改环境变量后 Viewer 链接正确变化
+**验收**：
+- `cargo check --bin web_server --features web_server` → `25.67s, 0 errors`
+- `npx vue-tsc --noEmit -p tsconfig.app.json`（`ui/admin`）→ `0 errors`
+- 运行时：`AIOS_VIEWER_BASE_URL=http://foo:9999 cargo run --bin web_server ...` 启动后，admin 列表页 Viewer 按钮会指向 `http://foo:9999/?backendPort=...`；清掉 env 后刷新页面，按钮消失（待手动验证）
 
 ---
 

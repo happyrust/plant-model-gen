@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { authApi } from '@/api/auth'
 import { extractErrorMessage } from '@/api/client'
+import { loadAppConfig } from '@/lib/app-config'
 import type { AuthCredentials } from '@/types/api'
 
 export const useAuthStore = defineStore('auth', () => {
@@ -22,6 +23,8 @@ export const useAuthStore = defineStore('auth', () => {
       username.value = session.user?.username ?? ''
       role.value = session.user?.role ?? ''
       localStorage.setItem('admin_token', session.token)
+      // 登录成功后再试一次 app-config（main.ts 启动期往往会 401 失败）。
+      void loadAppConfig()
     } catch (err: unknown) {
       loginError.value = extractErrorMessage(err)
       throw err

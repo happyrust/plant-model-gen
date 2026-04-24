@@ -5,6 +5,7 @@ use axum::{
     routing::{delete, get, post, put},
     Router,
 };
+use serde::Serialize;
 use serde_json::json;
 
 use crate::web_server::{
@@ -20,6 +21,7 @@ use crate::web_server::{
 pub fn create_admin_routes() -> Router {
     Router::new()
         .route("/api/admin/resources/summary", get(get_resource_summary))
+        .route("/api/admin/app-config", get(get_app_config))
         .route("/api/admin/sites", get(list_sites).post(create_site))
         .route(
             "/api/admin/sites/preview-parse-plan",
@@ -37,6 +39,29 @@ pub fn create_admin_routes() -> Router {
         .layer(middleware::from_fn(admin_auth_middleware))
 }
 
+/// Admin 前端在启动时一次性拉取的"运行期可配置"项。
+///
+/// 取舍：不把这些字段做进每个站点的 DB 行里（与具体站点解耦），也不做进前端
+/// Vite build-time env（避免改基础址必须重出前端构建），而是由 web_server 进程
+/// 从环境变量解析后按需发布给前端。
+#[derive(Debug, Serialize, Default)]
+pub struct AdminAppConfig {
+    /// Viewer 三维看图页面的基础 URL，形如 `https://viewer.example.com` 或
+    /// `http://localhost:3101`。空值 / None 表示未配置，前端应隐藏 Viewer 按钮。
+    ///
+    /// 来源：`AIOS_VIEWER_BASE_URL` 环境变量（优先级 1）。未来若接入 admin
+    /// 配置项或 DB 存储，扩展此 resolver 即可，不需要改动前端。
+    pub viewer_base_url: Option<String>,
+}
+
+fn resolve_admin_app_config() -> AdminAppConfig {
+    let viewer_base_url = std::env::var("AIOS_VIEWER_BASE_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty());
+    AdminAppConfig { viewer_base_url }
+}
+
 pub async fn list_sites() -> impl IntoResponse {
     match managed_sites::list_sites() {
         Ok(sites) => admin_response::ok("获取站点列表成功", sites),
@@ -51,6 +76,10 @@ pub async fn get_resource_summary() -> impl IntoResponse {
         ..AdminResourceSummary::default()
     });
     admin_response::ok("获取资源摘要成功", summary)
+}
+
+pub async fn get_app_config() -> impl IntoResponse {
+    admin_response::ok("获取应用配置成功", resolve_admin_app_config())
 }
 
 pub async fn create_site(Json(payload): Json<CreateManagedSiteRequest>) -> impl IntoResponse {

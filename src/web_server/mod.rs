@@ -71,6 +71,7 @@ use crate::web_api::{
     SpatialQueryApiState, UploadApiState, assemble_stateless_web_api_routes,
     create_collision_routes, create_e3d_tree_routes, create_noun_hierarchy_routes,
     create_search_routes, create_spatial_query_routes, create_upload_routes,
+    stateless_web_api_route_paths,
 };
 use handlers::*;
 use models::*;
@@ -171,6 +172,65 @@ impl ConfigManager {
 /// 启动Web UI服务器
 pub async fn start_web_server(port: u16) -> anyhow::Result<()> {
     start_web_server_with_config(port, None).await
+}
+
+/// 启动时打印"已注册路由清单"，便于"某个接口是否挂载"这类排障。
+///
+/// 触发条件：debug build 默认打印；release build 仅在 `AIOS_PRINT_ROUTES=1` 时打印。
+///
+/// 来源：
+/// - stateless 部分来自 [`stateless_web_api_route_paths`]，与
+///   [`assemble_stateless_web_api_routes`] 同步维护
+/// - stateful 部分列出已知前缀（`search` / `upload` / `collision` / `e3d_tree` /
+///   `noun_hierarchy` / `spatial_query` / `room_api` 等）与本文件手写注册的核心
+///   段（`/api/tasks`、`/api/model/*`、`/api/surreal/*` 等），不做完整枚举
+///
+/// 设计动机：继 2026-04-23 `pdms_transform` 漏挂载事件之后，为启动期可观测性
+/// 补一道"写完路由后能被看到"的护栏（PDMS Hardening M5，详见
+/// `docs/plans/2026-04-24-pdms-hardening-m3-m5-implementation-plan.md`）。
+fn maybe_print_registered_routes() {
+    let should_print =
+        cfg!(debug_assertions) || std::env::var("AIOS_PRINT_ROUTES").ok().as_deref() == Some("1");
+    if !should_print {
+        return;
+    }
+
+    println!("[web_server] registered routes (stateless web_api)");
+    for path in stateless_web_api_route_paths() {
+        println!("  {}", path);
+    }
+
+    println!("[web_server] registered routes (stateful web_api prefixes)");
+    for prefix in [
+        "/api/spatial/*        (spatial_query_api — 需 SpatialQueryApiState)",
+        "/api/noun-hierarchy/* (noun_hierarchy_api — 需 NounHierarchyApiState)",
+        "/api/e3d/*            (e3d_tree_api — 需 E3dTreeApiState)",
+        "/api/room/*           (room_api — 需 RoomApiState)",
+        "/api/collision/*      (collision_api — 需 CollisionApiState)",
+        "/api/search/pdms      (search_api — 需 SearchApiState)",
+        "/api/upload/*         (upload_api — 需 UploadApiState)",
+    ] {
+        println!("  {}", prefix);
+    }
+
+    println!("[web_server] registered routes (main router, manual in web_server/mod.rs)");
+    for prefix in [
+        "/api/tasks*           (任务管理：创建/列表/进度/结果)",
+        "/api/model/*          (模型生成 / 查询 / Parquet 导出)",
+        "/api/surreal/*        (SurrealDB 连接 / 状态 / 查询)",
+        "/api/database/*       (数据库状态与诊断)",
+        "/api/incremental/*    (增量更新 / parquet 增量队列)",
+        "/api/sctn-test/*      (SCTN 测试流程)",
+        "/ws/progress/{task_id} (WebSocket 进度)",
+        "/ws/tasks             (WebSocket 任务事件)",
+        "/admin/*              (管理端 UI + API，需 admin 会话)",
+        "/console/*            (控制台 UI 页面)",
+    ] {
+        println!("  {}", prefix);
+    }
+    println!(
+        "[web_server] route list above is maintained manually; toggle via AIOS_PRINT_ROUTES=1 (debug build prints by default)"
+    );
 }
 
 pub async fn start_web_server_with_config(
@@ -1178,6 +1238,7 @@ pub async fn start_web_server_with_config(
         }
     });
     admin_auth_handlers::start_session_cleanup_timer();
+    maybe_print_registered_routes();
     println!("🚀 Web UI服务器启动成功！");
     println!("📱 访问地址: http://localhost:{}", listen_port);
     println!("🌐 对外后端地址: {}", runtime_site_config.backend_url);

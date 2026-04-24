@@ -264,4 +264,33 @@ Expected: type-check 通过
 
 ### 下一步
 
-- 继续执行 `M5`：在 `src/web_api/mod.rs` / `src/web_server/mod.rs` 增加启动期路由清单打印
+- ~继续执行 `M5`：在 `src/web_api/mod.rs` / `src/web_server/mod.rs` 增加启动期路由清单打印~ → 已完成，见下
+
+## M5 执行记录（2026-04-24，补录）
+
+### 已完成
+
+- `src/web_api/mod.rs` 新增 `pub fn stateless_web_api_route_paths() -> Vec<&'static str>`（`#[cfg(feature = "web_server")]`）
+  - 与 `assemble_stateless_web_api_routes()` 同步维护，覆盖 room-tree / pdms_attr / pdms_transform / ptset / pdms_model_query / review_integration / platform_api / jwt_auth / review_api / scene_tree / mbd_pipe / pipeline_annotation（nested `/api/pipeline`）/ version（nested `/api`）
+  - 格式 `METHOD  /path/{param}`（METHOD 左对齐 7 格，便于裸 `println!` 对齐）
+  - 包含 PDMS 5 条关键路径：`/api/pdms/transform/{refno}` / `/api/pdms/transform/compute/{refno}` / `/api/pdms/ui-attr/{refno}` / `/api/pdms/type-info` / `/api/pdms/children`
+- `src/web_server/mod.rs` 新增 `fn maybe_print_registered_routes()`
+  - 开关：`cfg!(debug_assertions) || AIOS_PRINT_ROUTES == "1"`
+  - 在 `admin_auth_handlers::start_session_cleanup_timer()` 之后、`axum::serve()` 之前打印
+  - 分三段：stateless web_api / stateful web_api prefixes / main router manual prefixes
+  - stateful 部分列出前缀与其所需 state（`spatial_query` / `noun_hierarchy` / `e3d_tree` / `room_api` / `collision` / `search` / `upload`）
+  - main router 部分列出前缀（`/api/tasks*` / `/api/model/*` / `/api/surreal/*` / `/api/database/*` / `/api/incremental/*` / `/ws/*` / `/admin/*` / `/console/*`）
+
+### 已执行验证
+
+- `cargo check --bin web_server --features web_server`
+  - 结果：`Finished dev profile [unoptimized + debuginfo] target(s) in 53.44s`（零错误；告警均为 `pdms_io` 子项目既有未使用项，与本轮无关）
+- 未执行 `cargo build --bin web_server --features web_server`：本机 `target\debug\web_server.exe` 被一个运行中的 web_server 进程（PID 27112）持有文件句柄，`cargo build` 报 `failed to remove file ... 拒绝访问`。为避免意外打断用户的本地服务，使用 `cargo check` 先做编译验证。
+- 未执行 `cargo run --bin web_server --features web_server`：同上；待用户停掉占用进程或切换到独立目标目录后，再执行并核对实际启动日志中的 `[web_server] registered routes` 段落。
+
+### 剩余事项
+
+- 运行时验证：需要在本机可 rebuild 后启动 web_server（`AIOS_PRINT_ROUTES=1` 或 debug build），核对启动日志包含：
+  - `[web_server] registered routes (stateless web_api)`
+  - `GET    /api/pdms/transform/{refno}` / `GET    /api/pdms/transform/compute/{refno}` / `GET    /api/pdms/ui-attr/{refno}` / `GET    /api/pdms/type-info` / `GET    /api/pdms/children`
+- 维护约定：后续若修改 `assemble_stateless_web_api_routes()` 新增/删除路由，必须同步 `stateless_web_api_route_paths()`。

@@ -80,5 +80,100 @@ pub fn assemble_stateless_web_api_routes() -> axum::Router {
         .nest("/api", create_version_routes())
 }
 
+/// 与 [`assemble_stateless_web_api_routes`] 同步维护的静态路由路径清单。
+///
+/// 目的：让 `web_server` 在启动前能够打印"已注册的 stateless 路由"，配合
+/// `AIOS_PRINT_ROUTES=1`（release）或默认 debug 打印，快速回答"某个接口是否挂载"
+/// 这一问题，继 2026-04-23 `pdms_transform` 漏挂载事件之后形成第二道护栏。
+///
+/// 维护约定：每当修改 [`assemble_stateless_web_api_routes`] 或底层 `create_*_routes()`
+/// 新增/删除路由时，必须同步这里的清单；顺序尽量与 `assemble_stateless_web_api_routes`
+/// 的 `.merge()` 次序保持一致，便于审阅。
+///
+/// 返回值形如 `"GET  /api/pdms/transform/{refno}"`，`METHOD` 左对齐 5 格以便裸
+/// `println!` 对齐；`{param}` 占位符和底层 axum `Path<...>` 一致。
+#[cfg(feature = "web_server")]
+pub fn stateless_web_api_route_paths() -> Vec<&'static str> {
+    vec![
+        // room_tree_api
+        "GET    /api/room-tree/root",
+        "GET    /api/room-tree/children/{id}",
+        "GET    /api/room-tree/ancestors/{id}",
+        "POST   /api/room-tree/search",
+        // pdms_attr_api
+        "GET    /api/pdms/ui-attr/{refno}",
+        // pdms_transform_api
+        "GET    /api/pdms/transform/{refno}",
+        "GET    /api/pdms/transform/compute/{refno}",
+        // ptset_api
+        "GET    /api/pdms/ptset/{refno}",
+        "POST   /api/pdms/ptset/batch-query",
+        // pdms_model_query_api
+        "GET    /api/pdms/type-info",
+        "GET    /api/pdms/children",
+        // review_integration
+        "POST   /api/review/aux-data",
+        "GET    /api/review/collision-data",
+        // platform_api
+        "POST   /api/review/embed-url",
+        "POST   /api/review/annotations/check",
+        "POST   /api/review/workflow/sync",
+        "POST   /api/review/workflow/verify",
+        "POST   /api/review/delete",
+        "POST   /api/review/cache/preload",
+        // jwt_auth
+        "POST   /api/auth/token",
+        "POST   /api/auth/verify",
+        // review_api — tasks
+        "POST   /api/review/tasks",
+        "GET    /api/review/tasks",
+        "GET    /api/review/tasks/{id}",
+        "PATCH  /api/review/tasks/{id}",
+        "DELETE /api/review/tasks/{id}",
+        "POST   /api/review/tasks/{id}/start-review",
+        "POST   /api/review/tasks/{id}/approve",
+        "POST   /api/review/tasks/{id}/reject",
+        "POST   /api/review/tasks/{id}/cancel",
+        "GET    /api/review/tasks/{id}/history",
+        "POST   /api/review/tasks/{id}/submit",
+        "POST   /api/review/tasks/{id}/return",
+        "GET    /api/review/tasks/{id}/workflow",
+        // review_api — records
+        "POST   /api/review/records",
+        "GET    /api/review/records/by-task/{task_id}",
+        "DELETE /api/review/records/item/{record_id}",
+        "DELETE /api/review/records/clear-task/{task_id}",
+        // review_api — comments
+        "POST   /api/review/comments",
+        "GET    /api/review/comments/by-annotation/{annotation_id}",
+        "DELETE /api/review/comments/item/{comment_id}",
+        "PATCH  /api/review/annotations/{annotation_id}/severity",
+        // review_api — attachments
+        "POST   /api/review/attachments",
+        "DELETE /api/review/attachments/{attachment_id}",
+        // review_api — sync
+        "POST   /api/review/sync/export",
+        "POST   /api/review/sync/import",
+        // review_api — users
+        "GET    /api/users",
+        "GET    /api/users/me",
+        "GET    /api/users/reviewers",
+        // scene_tree_api
+        "POST   /api/scene-tree/init",
+        "POST   /api/scene-tree/init/{dbnum}",
+        "POST   /api/scene-tree/init-by-root/{refno}",
+        "GET    /api/scene-tree/{refno}/leaves",
+        "GET    /api/scene-tree/{refno}/children",
+        "GET    /api/scene-tree/{refno}/ancestors",
+        // mbd_pipe_api
+        "GET    /api/mbd/pipe/{refno}",
+        "POST   /api/mbd/generate",
+        // pipeline_annotation_api (nested under /api/pipeline)
+        "GET    /api/pipeline/annotation/{refno}",
+        // version_api (nested under /api)
+        "GET    /api/version",
+    ]
+}
+
 #[cfg(test)]
 mod tests;

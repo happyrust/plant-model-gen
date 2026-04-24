@@ -1,0 +1,1266 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>站点管理 · Flow Demo</title>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --background: #FFFFFF;
+      --foreground: #0A0A0B;
+      --card: #FFFFFF;
+      --card-foreground: #0A0A0B;
+      --muted: #F4F4F5;
+      --muted-foreground: #71717A;
+      --accent: #F4F4F5;
+      --accent-foreground: #18181B;
+      --primary: #18181B;
+      --primary-foreground: #FAFAFA;
+      --secondary: #F4F4F5;
+      --secondary-foreground: #18181B;
+      --destructive: #DC2626;
+      --destructive-foreground: #FAFAFA;
+      --border: #E4E4E7;
+      --border-soft: #F0F0F2;
+      --input: #E4E4E7;
+      --ring: #0A0A0B;
+      --color-success: #DCFCE7;
+      --color-success-foreground: #166534;
+      --color-success-strong: #16A34A;
+      --color-warning: #FEF3C7;
+      --color-warning-foreground: #92400E;
+      --color-warning-strong: #D97706;
+      --color-error: #FEE2E2;
+      --color-error-foreground: #991B1B;
+      --color-error-strong: #DC2626;
+      --color-info: #DBEAFE;
+      --color-info-foreground: #1E40AF;
+      --color-info-strong: #2563EB;
+      --color-cyan: #CFFAFE;
+      --color-cyan-foreground: #155E75;
+      --color-violet: #EDE9FE;
+      --color-violet-foreground: #5B21B6;
+      --color-slate: #F1F5F9;
+      --color-slate-foreground: #334155;
+      --font-primary: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Consolas, monospace;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font-family: var(--font-primary);
+      color: var(--foreground);
+      background: #FAFAFA;
+      font-feature-settings: "cv02", "cv11", "ss01";
+      -webkit-font-smoothing: antialiased;
+      min-height: 100vh;
+      text-rendering: optimizeLegibility;
+    }
+    button { font-family: inherit; cursor: pointer; border: 0; padding: 0; background: transparent; color: inherit; }
+    input, select { font-family: inherit; color: inherit; }
+    a { color: inherit; text-decoration: none; }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #D4D4D8; border-radius: 999px; border: 2px solid #FAFAFA; }
+    ::-webkit-scrollbar-thumb:hover { background: #A1A1AA; }
+
+    /* -- Stage auto-scale letterbox, fixes 1440 design on smaller screens -- */
+    .stage-viewport {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background: #0A0A0B;
+      overflow: auto;
+    }
+    .stage-content {
+      width: 1440px;
+      min-height: 900px;
+      transform-origin: top center;
+      background: #FAFAFA;
+      box-shadow: 0 20px 60px -30px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.06);
+    }
+
+    /* -- Utility classes -- */
+    .icon { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+    .spin { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .chip {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 3px 10px; border-radius: 999px;
+      font-size: 11px; font-weight: 500; line-height: 1.4;
+      white-space: nowrap;
+    }
+    .btn { display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 16px; border-radius: 6px; font-size: 13px; font-weight: 500; transition: background 0.14s ease, box-shadow 0.14s ease, color 0.14s ease; line-height: 1; }
+    .btn:disabled, .btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary { background: var(--primary); color: var(--primary-foreground); }
+    .btn-primary:hover:not(:disabled) { background: #27272A; }
+    .btn-outline { background: var(--background); color: var(--foreground); box-shadow: inset 0 0 0 1px var(--input); }
+    .btn-outline:hover:not(:disabled) { background: var(--accent); }
+    .btn-destructive { background: var(--color-error-strong); color: #fff; }
+    .btn-destructive:hover:not(:disabled) { background: #B91C1C; }
+    .btn-warning { background: var(--color-warning-strong); color: #fff; }
+    .btn-warning:hover:not(:disabled) { background: #B45309; }
+    .btn-success { background: var(--color-success-strong); color: #fff; }
+    .btn-success:hover:not(:disabled) { background: #15803D; }
+    .btn-ghost { color: var(--foreground); }
+    .btn-ghost:hover:not(:disabled) { background: var(--accent); }
+    .icon-btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 28px; height: 28px; border-radius: 6px;
+      color: var(--muted-foreground);
+      transition: background 0.14s ease, color 0.14s ease;
+    }
+    .icon-btn:hover:not(:disabled) { background: var(--accent); color: var(--foreground); }
+    .icon-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+    .input {
+      display: flex; align-items: center; width: 100%;
+      height: 36px; padding: 0 12px; border-radius: 6px;
+      background: var(--background);
+      box-shadow: inset 0 0 0 1px var(--input);
+      font-size: 14px; color: var(--foreground);
+      transition: box-shadow 0.14s ease;
+    }
+    .input:focus-within, .input:focus { outline: none; box-shadow: inset 0 0 0 1.5px var(--ring); }
+    .input input { width: 100%; background: transparent; border: 0; outline: none; font-size: 14px; color: inherit; }
+    .input input::placeholder { color: var(--muted-foreground); }
+
+    .card { background: var(--card); box-shadow: inset 0 0 0 1px var(--border); border-radius: 8px; }
+    .card-soft { background: var(--background); box-shadow: inset 0 0 0 1px var(--border-soft); border-radius: 8px; }
+    .section-title { font-size: 18px; font-weight: 500; color: var(--foreground); margin: 0; }
+    .section-subtitle { font-size: 13px; color: var(--muted-foreground); margin: 0; }
+
+    /* Drawer */
+    .drawer-overlay {
+      position: fixed; inset: 0; background: rgba(10,10,11,0.5);
+      animation: fadeIn 0.18s ease;
+      z-index: 40;
+    }
+    @keyframes fadeIn { from { opacity: 0; } }
+    .drawer-panel {
+      position: fixed; top: 0; right: 0; bottom: 0;
+      width: 520px; max-width: 95vw;
+      background: var(--card);
+      box-shadow: -8px 0 48px -12px rgba(0,0,0,0.15);
+      display: flex; flex-direction: column;
+      animation: slideIn 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+      z-index: 41;
+    }
+    @keyframes slideIn { from { transform: translateX(100%); } }
+
+    /* Dialog */
+    .dialog-overlay {
+      position: fixed; inset: 0;
+      background: rgba(10,10,11,0.5);
+      display: grid; place-items: center;
+      animation: fadeIn 0.15s ease;
+      z-index: 50;
+    }
+    .dialog-panel {
+      width: 460px; max-width: 92vw;
+      background: var(--card); border-radius: 12px;
+      box-shadow: 0 20px 60px -12px rgba(0,0,0,0.25);
+      animation: dialogIn 0.18s cubic-bezier(0.32, 0.72, 0, 1);
+    }
+    @keyframes dialogIn { from { opacity: 0; transform: scale(0.94) translateY(8px); } }
+
+    /* Toast */
+    .toast-layer {
+      position: fixed; bottom: 24px; right: 24px;
+      display: flex; flex-direction: column; gap: 8px;
+      z-index: 60; pointer-events: none;
+    }
+    .toast-card {
+      min-width: 280px; max-width: 360px;
+      background: var(--card); border-radius: 8px;
+      padding: 12px 14px; gap: 10px;
+      display: flex; align-items: flex-start;
+      box-shadow: 0 12px 40px -12px rgba(0,0,0,0.2), inset 0 0 0 1px var(--border);
+      pointer-events: auto;
+      animation: toastIn 0.2s cubic-bezier(0.32, 0.72, 0, 1);
+    }
+    @keyframes toastIn { from { opacity: 0; transform: translateY(8px); } }
+
+    /* Devtools */
+    .devtools {
+      position: fixed; right: 16px; bottom: 16px;
+      background: rgba(10,10,11,0.92); color: #FAFAFA;
+      border-radius: 10px; padding: 10px 12px;
+      font-size: 11px; font-family: var(--font-mono);
+      display: flex; flex-direction: column; gap: 6px;
+      box-shadow: 0 8px 32px -8px rgba(0,0,0,0.4);
+      z-index: 70; pointer-events: auto;
+    }
+    .devtools strong { text-transform: uppercase; letter-spacing: 0.06em; color: #A1A1AA; font-weight: 500; }
+    .devtools button {
+      color: #FAFAFA;
+      padding: 3px 8px; border-radius: 999px;
+      font-family: var(--font-mono); font-size: 11px;
+      background: rgba(255,255,255,0.1);
+      transition: background 0.14s ease;
+    }
+    .devtools button.on { background: #FAFAFA; color: #0A0A0B; }
+    .devtools button:hover:not(.on) { background: rgba(255,255,255,0.18); }
+
+    /* Table row hover */
+    .row { transition: background 0.12s ease; }
+    .row:hover { background: rgba(244,244,245,0.7); cursor: pointer; }
+    .row:hover .row-actions { opacity: 1; }
+
+    /* Skeleton */
+    .skeleton {
+      background: linear-gradient(90deg, #F4F4F5 0%, #E4E4E7 50%, #F4F4F5 100%);
+      background-size: 200% 100%;
+      animation: shimmer 1.4s linear infinite;
+      border-radius: 6px;
+    }
+    @keyframes shimmer { to { background-position: -200% 0; } }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18.2.0/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+
+  <script type="text/babel" data-presets="env,react">
+  const { useState, useReducer, useEffect, useRef, useMemo, Fragment } = React;
+
+  /* =========================================================================
+     Icon library — inline lucide SVG path data
+     ========================================================================= */
+  const ICONS = {
+    "refresh-cw": ["M3 12a9 9 0 0 1 15-6.7L21 8","M21 3v5h-5","M21 12a9 9 0 0 1-15 6.7L3 16","M8 16H3v5"],
+    server: ["M5 2h14a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Z","M5 14h14a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2Z","M6 6h.01","M6 18h.01"],
+    activity: ["M22 12h-4l-3 9L9 3l-3 9H2"],
+    cpu: ["M4 4h16v16H4z","M9 9h6v6H9z","M9 2v2","M15 2v2","M9 20v2","M15 20v2","M2 9h2","M2 15h2","M20 9h2","M20 15h2"],
+    "circle-alert": ["M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z","M12 8v4","M12 16h.01"],
+    "triangle-alert": ["m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z","M12 9v4","M12 17h.01"],
+    "memory-stick": ["M6 19v-3","M10 19v-3","M14 19v-3","M18 19v-3","M8 11V9","M16 11V9","M12 11V9","M2 15h20","M2 7a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v1.1a2 2 0 0 0 0 3.837V17a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-5.1a2 2 0 0 0 0-3.837Z"],
+    "hard-drive": ["M22 12H2","M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11Z","M6 16h.01","M10 16h.01"],
+    "folder-kanban": ["M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z","M8 10v4","M12 10v2","M16 10v6"],
+    search: ["m21 21-4.34-4.34","M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14Z"],
+    "chevron-down": ["m6 9 6 6 6-6"],
+    plus: ["M5 12h14","M12 5v14"],
+    square: ["M3 3h18v18H3z"],
+    play: ["M6 3 20 12 6 21Z"],
+    eye: ["M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z","M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"],
+    "external-link": ["M15 3h6v6","M10 14 21 3","M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"],
+    pencil: ["M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z","m15 5 4 4"],
+    "trash-2": ["M3 6h18","M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6","M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2","M10 11v6","M14 11v6"],
+    x: ["M18 6 6 18","m6 6 12 12"],
+    check: ["M20 6 9 17l-5-5"],
+    loader: ["M12 2v4","m16.2 7.8 2.9-2.9","M18 12h4","m16.2 16.2 2.9 2.9","M12 18v4","m4.9 19.1 2.9-2.9","M2 12h4","m4.9 4.9 2.9 2.9"],
+    "arrow-left": ["m12 19-7-7 7-7","M19 12H5"],
+    "shield-check": ["M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z","m9 12 2 2 4-4"],
+    "shield-alert": ["M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z","M12 8v4","M12 16h.01"],
+    "timer-reset": ["M10 2h4","M12 14v-4","M4 13a8 8 0 0 1 8-7 8 8 0 1 1-5.3 14L4 17.6","M9 17H4v5"],
+    database: ["M5 5a7 3 0 1 0 14 0A7 3 0 1 0 5 5","M5 5v14a7 3 0 0 0 14 0V5","M5 12a7 3 0 0 0 14 0"],
+    globe: ["M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Z","M12 2a14.5 14.5 0 0 0-4 10 14.5 14.5 0 0 0 4 10","M12 2a14.5 14.5 0 0 1 4 10 14.5 14.5 0 0 1-4 10","M2 12h20"],
+    "folder-archive": ["M16 20h2a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L7.6 3.9A2 2 0 0 0 5.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h2","M12 11v10","M9 17h6"],
+    "folder-plus": ["M12 11v6","M9 14h6","M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"],
+    "log-in": ["M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4","M10 17l5-5-5-5","M15 12H3"],
+    copy: ["M16 4h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2","M9 2h6a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1Z"],
+    "bug-play": ["m8 2 1.88 1.88","M14.12 3.88 16 2","M9 7.13v-1a3.003 3.003 0 1 1 6 0v1","M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v1.3","M6.53 9C4.6 8.8 3 7.1 3 5","M6 13H2","M3 21c0-2.1 1.7-3.9 3.8-4","M20.97 5c0 2.1-1.6 3.8-3.5 4","m15 21 5-3-5-3z"],
+    octagon: ["M15.9 2.1H8.1a2 2 0 0 0-1.4.6L2.6 6.7a2 2 0 0 0-.6 1.4v7.8a2 2 0 0 0 .6 1.4l4.1 4.1a2 2 0 0 0 1.4.6h7.8a2 2 0 0 0 1.4-.6l4.1-4.1a2 2 0 0 0 .6-1.4V8.1a2 2 0 0 0-.6-1.4l-4.1-4.1a2 2 0 0 0-1.4-.6z"],
+  };
+
+  const Icon = ({ name, size = 16, color = "currentColor", strokeWidth = 2, className = "", style = {} }) => {
+    const paths = ICONS[name];
+    if (!paths) return <span className="icon" style={{ width: size, height: size, ...style }}>?</span>;
+    return (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke={color}
+        strokeWidth={strokeWidth}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className={`icon ${className}`}
+        style={style}
+      >
+        {paths.map((d, i) => <path key={i} d={d} />)}
+      </svg>
+    );
+  };
+
+  /* =========================================================================
+     Mock data + reducers
+     ========================================================================= */
+  const STATUS_LABEL = {
+    Draft: "草稿",
+    Parsed: "已解析",
+    Starting: "启动中",
+    Running: "运行中",
+    Stopping: "停止中",
+    Stopped: "已停止",
+    Failed: "失败",
+  };
+
+  const STATUS_TONE = {
+    Running: "success",
+    Starting: "warning",
+    Stopping: "warning",
+    Stopped: "slate",
+    Parsed: "info",
+    Failed: "error",
+    Draft: "muted",
+  };
+
+  const PARSE_STATUS_LABEL = {
+    Pending: "待解析",
+    Running: "解析中",
+    Parsed: "已解析",
+    Failed: "解析失败",
+  };
+
+  const PARSE_STATUS_TONE = {
+    Parsed: "success",
+    Running: "info",
+    Failed: "error",
+    Pending: "muted",
+  };
+
+  const PARSE_PLAN_TONE = {
+    FastReparse: "cyan",
+    RebuildSystem: "warning",
+    Selective: "info",
+    Bootstrap: "violet",
+    Default: "slate",
+  };
+
+  const PARSE_PLAN_LABEL = {
+    FastReparse: "快速重解析",
+    RebuildSystem: "重建系统",
+    Selective: "选择性解析",
+    Bootstrap: "初次解析",
+  };
+
+  const RISK_TONE = { normal: "success", warning: "warning", critical: "error" };
+  const RISK_LABEL = { normal: "正常", warning: "警告", critical: "严重" };
+
+  const chipStyle = (tone) => {
+    const bg = `var(--color-${tone})`;
+    const fg = `var(--color-${tone}-foreground)`;
+    if (tone === "slate" || tone === "muted") return { background: "var(--muted)", color: "var(--muted-foreground)" };
+    return { background: bg, color: fg };
+  };
+
+  const nowIso = () => new Date().toISOString();
+  const fmtTime = (iso) => {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "—";
+    return d.toLocaleTimeString("zh-CN", { hour12: false });
+  };
+  const fmtDuration = (ms) => {
+    if (ms == null) return "—";
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s} 秒`;
+    const m = Math.floor(s / 60);
+    return `${m} 分 ${s % 60} 秒`;
+  };
+  const fmtBytes = (n) => {
+    if (!n || n <= 0) return "0 B";
+    const units = ["B","KB","MB","GB","TB"];
+    let size = n, i = 0;
+    while (size >= 1024 && i < units.length - 1) { size /= 1024; i += 1; }
+    return `${size >= 10 || i === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[i]}`;
+  };
+
+  const SEED_SITES = [
+    {
+      site_id: "site-aveva-plant-18330",
+      project_name: "AvevaPlantSample-18330",
+      project_path: "/data/plants/aveva/18330/e3d_models",
+      project_code: 18330,
+      associated_project: "AvevaPlantSample",
+      db_port: 8020,
+      web_port: 8080,
+      bind_host: "0.0.0.0",
+      public_base_url: "http://plant.example.com:8080",
+      db_user: "plantadmin",
+      manual_db_nums: [7997, 7998, 7999],
+      parse_db_types: ["DESI","SYST"],
+      force_rebuild_system_db: false,
+      status: "Running",
+      parse_status: "Parsed",
+      parse_plan: { mode: "FastReparse", label: "快速重解析", detail: "仅更新设计库 · 跳过系统库重建", included_db_files: ["CADDB-7997.dwg","CADDB-7998.dwg"] },
+      risk_level: "normal",
+      risk_reasons: [],
+      started_at: new Date(Date.now() - 2.5 * 3600 * 1000).toISOString(),
+      last_parse_finished_at: new Date(Date.now() - 15 * 60 * 1000).toISOString(),
+      last_parse_duration_ms: 12 * 60 * 1000 + 42 * 1000,
+      runtime_dir_bytes: 482 * 1024 * 1024,
+      data_dir_bytes: 8.4 * 1024 * 1024 * 1024,
+      log_bytes: 142 * 1024 * 1024,
+      entry_url: "http://plant.example.com:8080",
+      local_entry_url: "http://127.0.0.1:8080",
+      last_error: null,
+    },
+    {
+      site_id: "site-kronos-refinery-22901",
+      project_name: "KronosRefineryModel-22901",
+      project_path: "/data/plants/kronos/22901/e3d_models",
+      project_code: 22901,
+      associated_project: "KronosRefinery",
+      db_port: 8021,
+      web_port: 8081,
+      bind_host: "127.0.0.1",
+      public_base_url: "",
+      db_user: "plantadmin",
+      manual_db_nums: [],
+      parse_db_types: ["DESI","SYST","CATA"],
+      force_rebuild_system_db: false,
+      status: "Stopped",
+      parse_status: "Parsed",
+      parse_plan: { mode: "Selective", label: "选择性解析", detail: "解析 DESI + SYST + CATA", included_db_files: [] },
+      risk_level: "normal",
+      risk_reasons: [],
+      started_at: null,
+      last_parse_finished_at: new Date(Date.now() - 6 * 3600 * 1000).toISOString(),
+      last_parse_duration_ms: 18 * 60 * 1000 + 17 * 1000,
+      runtime_dir_bytes: 420 * 1024 * 1024,
+      data_dir_bytes: 12 * 1024 * 1024 * 1024,
+      log_bytes: 88 * 1024 * 1024,
+      entry_url: null,
+      local_entry_url: null,
+      last_error: null,
+    },
+    {
+      site_id: "site-halide-chem-13440",
+      project_name: "HalideChemical-13440",
+      project_path: "/data/plants/halide/13440/e3d_models",
+      project_code: 13440,
+      associated_project: "HalideChem",
+      db_port: 8022,
+      web_port: 8082,
+      bind_host: "127.0.0.1",
+      public_base_url: "",
+      db_user: "plantadmin",
+      manual_db_nums: [7501],
+      parse_db_types: ["DESI","PROP","SYST"],
+      force_rebuild_system_db: false,
+      status: "Stopped",
+      parse_status: "Running",
+      parse_plan: { mode: "Selective", label: "选择性解析", detail: "重新解析 DESI + PROP", included_db_files: ["CADDB-7501.dwg"] },
+      risk_level: "warning",
+      risk_reasons: ["磁盘占用接近阈值 88%"],
+      started_at: null,
+      last_parse_finished_at: null,
+      last_parse_duration_ms: null,
+      runtime_dir_bytes: 210 * 1024 * 1024,
+      data_dir_bytes: 6.2 * 1024 * 1024 * 1024,
+      log_bytes: 64 * 1024 * 1024,
+      entry_url: null,
+      local_entry_url: null,
+      last_error: null,
+    },
+    {
+      site_id: "site-petrochem-pipeline-08872",
+      project_name: "PetrochemPipeline-08872",
+      project_path: "/data/plants/petrochem/08872/e3d_models",
+      project_code: 8872,
+      associated_project: "PetrochemPipeline",
+      db_port: 8023,
+      web_port: 8083,
+      bind_host: "127.0.0.1",
+      public_base_url: "",
+      db_user: "plantadmin",
+      manual_db_nums: [],
+      parse_db_types: ["DESI","SYST","DICT","CATA"],
+      force_rebuild_system_db: true,
+      status: "Failed",
+      parse_status: "Failed",
+      parse_plan: { mode: "RebuildSystem", label: "重建系统", detail: "重新解析系统 + 设计库", included_db_files: [] },
+      risk_level: "critical",
+      risk_reasons: ["解析失败: 未找到 OLE storage 流","已连续失败 3 次"],
+      started_at: null,
+      last_parse_finished_at: new Date(Date.now() - 2 * 3600 * 1000).toISOString(),
+      last_parse_duration_ms: 1.5 * 60 * 1000,
+      runtime_dir_bytes: 60 * 1024 * 1024,
+      data_dir_bytes: 1.1 * 1024 * 1024 * 1024,
+      log_bytes: 24 * 1024 * 1024,
+      entry_url: null,
+      local_entry_url: null,
+      last_error: "解析失败：未找到 OLE storage 流 (sector 0x42 校验失败)",
+    },
+    {
+      site_id: "site-draft-offshore-31028",
+      project_name: "DraftOffshorePlatform-31028",
+      project_path: "/data/plants/offshore/31028/e3d_models",
+      project_code: 31028,
+      associated_project: "OffshorePlatform",
+      db_port: 8024,
+      web_port: 8084,
+      bind_host: "127.0.0.1",
+      public_base_url: "",
+      db_user: "plantadmin",
+      manual_db_nums: [],
+      parse_db_types: ["DESI","SYST"],
+      force_rebuild_system_db: false,
+      status: "Draft",
+      parse_status: "Pending",
+      parse_plan: { mode: "Bootstrap", label: "初次解析", detail: "首次解析 · 尚未运行", included_db_files: [] },
+      risk_level: "normal",
+      risk_reasons: [],
+      started_at: null,
+      last_parse_finished_at: null,
+      last_parse_duration_ms: null,
+      runtime_dir_bytes: 0,
+      data_dir_bytes: 0,
+      log_bytes: 0,
+      entry_url: null,
+      local_entry_url: null,
+      last_error: null,
+    },
+  ];
+
+  const SEED_LOGS = {
+    parse: [
+      "[14:29:23] INFO  parse_db_file: starting parse of CADDB-7997",
+      "[14:29:24] DEBUG loading OLE storage header (sector size 512)",
+      "[14:29:45] INFO  resolved 12 842 references in 20.3s",
+      "[14:30:15] DEBUG normalizing element names (batch 1/4)",
+      "[14:38:02] INFO  geometry: 38 412 entities parsed",
+      "[14:42:05] INFO  parse_complete in 762s · 1 warning",
+    ],
+    db: [
+      "[14:27:03] INFO  surreal-db bound on 0.0.0.0:8020",
+      "[14:27:04] INFO  applying schema migrations (version 42 → 44)",
+      "[14:27:09] INFO  ready · 1 842 tables · 112 344 definitions",
+    ],
+    web: [
+      "[14:27:10] INFO  web server bound on 0.0.0.0:8080",
+      "[14:27:11] INFO  serving /viewer from embedded assets",
+      "[14:28:44] INFO  GET /api/projects 200 · 34ms",
+      "[14:32:08] INFO  GET /viewer 200 · 12ms",
+    ],
+  };
+
+  /* --------- reducer --------- */
+  const initialState = () => ({
+    route: "list",
+    detailSiteId: null,
+    drawer: { open: false, mode: "create", siteId: null },
+    dialog: null,
+    toast: null,
+    quickFilter: "all",
+    search: "",
+    statusFilter: "",
+    riskFilter: "",
+    detailTab: "overview",
+    logTab: "parse",
+    resourceRisk: "normal",
+    sites: SEED_SITES.map((s) => ({ ...s })),
+    pendingActions: {},
+    lastRefresh: nowIso(),
+  });
+
+  const reducer = (state, action) => {
+    switch (action.type) {
+      case "OPEN_DRAWER":
+        return { ...state, drawer: { open: true, mode: action.mode || "create", siteId: action.siteId || null } };
+      case "CLOSE_DRAWER":
+        return { ...state, drawer: { ...state.drawer, open: false } };
+      case "SAVE_SITE": {
+        if (action.mode === "edit") {
+          return {
+            ...state,
+            sites: state.sites.map((s) => (s.site_id === action.site.site_id ? { ...s, ...action.site } : s)),
+            drawer: { ...state.drawer, open: false },
+            toast: { tone: "success", message: `站点「${action.site.project_name}」已保存` },
+          };
+        }
+        return {
+          ...state,
+          sites: [...state.sites, action.site],
+          drawer: { ...state.drawer, open: false },
+          toast: { tone: "success", message: `新站点「${action.site.project_name}」已创建` },
+        };
+      }
+      case "OPEN_DIALOG":
+        return { ...state, dialog: action.dialog };
+      case "CLOSE_DIALOG":
+        return { ...state, dialog: null };
+      case "CONFIRM_DELETE": {
+        const site = state.sites.find((s) => s.site_id === action.siteId);
+        return {
+          ...state,
+          sites: state.sites.filter((s) => s.site_id !== action.siteId),
+          dialog: null,
+          route: "list",
+          detailSiteId: null,
+          toast: { tone: "warning", message: `站点「${site?.project_name}」已删除 · 运行目录已回收 ${fmtBytes(site?.runtime_dir_bytes || 0)}` },
+        };
+      }
+      case "START_PENDING":
+        return {
+          ...state,
+          pendingActions: { ...state.pendingActions, [action.siteId]: action.action },
+        };
+      case "END_PENDING": {
+        const next = { ...state.pendingActions };
+        delete next[action.siteId];
+        let toast = null;
+        let sites = state.sites;
+        if (action.action === "start") {
+          sites = sites.map((s) =>
+            s.site_id === action.siteId ? { ...s, status: "Running", started_at: nowIso(), last_error: null, entry_url: `http://plant.example.com:${s.web_port}`, local_entry_url: `http://127.0.0.1:${s.web_port}` } : s
+          );
+          toast = { tone: "success", message: "启动成功 · Viewer 已就绪" };
+        } else if (action.action === "stop") {
+          sites = sites.map((s) => (s.site_id === action.siteId ? { ...s, status: "Stopped", started_at: null, entry_url: null, local_entry_url: null } : s));
+          toast = { tone: "success", message: "已停止 · 端口释放" };
+        } else if (action.action === "parse") {
+          sites = sites.map((s) => (s.site_id === action.siteId ? { ...s, parse_status: "Parsed", last_parse_finished_at: nowIso(), last_parse_duration_ms: 12 * 60 * 1000 + 42 * 1000 } : s));
+          toast = { tone: "success", message: "解析完成 · 12m 42s 处理 38 412 个实体" };
+        }
+        return { ...state, pendingActions: next, sites, toast };
+      }
+      case "FAIL_ACTION": {
+        const next = { ...state.pendingActions };
+        delete next[action.siteId];
+        const sites = state.sites.map((s) => (s.site_id === action.siteId ? { ...s, status: action.action === "start" ? "Failed" : s.status, last_error: action.message } : s));
+        return { ...state, pendingActions: next, sites, toast: { tone: "error", message: action.message } };
+      }
+      case "HIDE_TOAST":
+        return { ...state, toast: null };
+      case "SET_QUICK_FILTER":
+        return { ...state, quickFilter: action.filter };
+      case "SET_SEARCH":
+        return { ...state, search: action.value };
+      case "SET_STATUS_FILTER":
+        return { ...state, statusFilter: action.value };
+      case "SET_RISK_FILTER":
+        return { ...state, riskFilter: action.value };
+      case "OPEN_DETAIL":
+        return { ...state, route: "detail", detailSiteId: action.siteId, detailTab: "overview" };
+      case "BACK_TO_LIST":
+        return { ...state, route: "list", detailSiteId: null };
+      case "SET_DETAIL_TAB":
+        return { ...state, detailTab: action.tab };
+      case "SET_LOG_TAB":
+        return { ...state, logTab: action.tab };
+      case "SET_RESOURCE_RISK":
+        return { ...state, resourceRisk: action.risk };
+      case "REFRESH":
+        return { ...state, lastRefresh: nowIso() };
+      default:
+        return state;
+    }
+  };
+
+  /* =========================================================================
+     Small reusable components
+     ========================================================================= */
+  const Chip = ({ tone = "slate", children, style }) => (
+    <span className="chip" style={{ ...chipStyle(tone), ...style }}>{children}</span>
+  );
+
+  const StrongChip = ({ tone = "success", children }) => {
+    const colors = {
+      success: { bg: "var(--color-success-strong)", fg: "#fff" },
+      warning: { bg: "var(--color-warning-strong)", fg: "#fff" },
+      error: { bg: "var(--color-error-strong)", fg: "#fff" },
+      info: { bg: "var(--color-info-strong)", fg: "#fff" },
+    };
+    const c = colors[tone] || colors.success;
+    return <span className="chip" style={{ background: c.bg, color: c.fg }}>{children}</span>;
+  };
+
+  const Divider = ({ vertical, style }) => (
+    <span style={{ display: "inline-block", background: "var(--border)", width: vertical ? 1 : "100%", height: vertical ? "100%" : 1, ...style }} />
+  );
+
+  /* =========================================================================
+     WorkbenchHeader
+     ========================================================================= */
+  const WorkbenchHeader = ({ total, filtered, lastRefresh, onRefresh }) => (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16 }}>
+      <div>
+        <h1 style={{ margin: 0, fontSize: 24, fontWeight: 600, letterSpacing: -0.3 }}>站点管理</h1>
+        <p style={{ margin: "4px 0 0", color: "var(--muted-foreground)", fontSize: 14 }}>本机多站点编排工作台</p>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+        <div style={{ color: "var(--muted-foreground)", fontSize: 12 }}>最近刷新 <span style={{ fontFamily: "var(--font-mono)", color: "var(--foreground)" }}>{fmtTime(lastRefresh)}</span></div>
+        <div style={{ color: "var(--muted-foreground)", fontSize: 12 }}>{filtered === total ? `共 ${total} 个站点` : `${filtered} / ${total} 个站点`}</div>
+        <button className="btn btn-outline" onClick={onRefresh}>
+          <Icon name="refresh-cw" size={14} /> 刷新
+        </button>
+      </div>
+    </div>
+  );
+
+  /* =========================================================================
+     StatsGrid
+     ========================================================================= */
+  const StatCard = ({ label, value, hint, icon, tone = "foreground" }) => {
+    const valueColor = tone === "foreground" ? "var(--foreground)"
+      : tone === "success" ? "var(--color-success-strong)"
+      : tone === "warning" ? "var(--color-warning-strong)"
+      : tone === "error" ? "var(--color-error-strong)"
+      : "var(--foreground)";
+    const iconColor = tone === "foreground" ? "var(--muted-foreground)" : valueColor;
+    return (
+      <div className="card" style={{ padding: 20, display: "flex", flexDirection: "column", gap: 8 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ color: "var(--muted-foreground)", fontSize: 14 }}>{label}</span>
+          <Icon name={icon} size={16} color={iconColor} />
+        </div>
+        <div style={{ fontSize: 28, fontWeight: 600, color: valueColor, lineHeight: 1 }}>{value}</div>
+        {hint && <div style={{ fontSize: 12, color: "var(--muted-foreground)" }}>{hint}</div>}
+      </div>
+    );
+  };
+
+  const StatsGrid = ({ stats, filteredCount }) => (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 16 }}>
+      <StatCard label="总站点" value={stats.total} hint={`当前结果 ${filteredCount} 条`} icon="server" />
+      <StatCard label="运行中" value={stats.running} hint="Viewer 可即时打开" icon="activity" tone="success" />
+      <StatCard label="处理中" value={stats.busy} hint="启动 / 停止 / 解析中" icon="cpu" tone="warning" />
+      <StatCard label="异常" value={stats.error} hint={stats.error > 0 ? "请优先处理" : "暂无异常"} icon="circle-alert" tone={stats.error > 0 ? "error" : "foreground"} />
+    </div>
+  );
+
+  /* =========================================================================
+     ResourceSection
+     ========================================================================= */
+  const RISK_BANNER = {
+    normal: { title: "机器资源风险：正常", detail: "CPU / 内存 / 磁盘 均在阈值内，当前没有明显资源风险。", tone: "success", icon: "shield-check" },
+    warning: { title: "机器资源风险：警告", detail: "磁盘占用接近阈值 88%，建议清理历史日志或暂停非核心解析。", tone: "warning", icon: "triangle-alert" },
+    critical: { title: "机器资源风险：严重", detail: "CPU 92% · 磁盘 95% 已超过阈值。建议立刻停止非关键站点并清理数据目录。", tone: "error", icon: "shield-alert" },
+  };
+
+  const RiskBanner = ({ risk }) => {
+    const cfg = RISK_BANNER[risk] || RISK_BANNER.normal;
+    const bg = `var(--color-${cfg.tone})`;
+    const border = `var(--color-${cfg.tone}-strong)`;
+    const fg = `var(--color-${cfg.tone}-foreground)`;
+    return (
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 12, padding: "12px 16px", borderRadius: 8, background: bg, boxShadow: `inset 0 0 0 1px ${border}` }}>
+        <Icon name={cfg.icon} size={18} color={fg} />
+        <div>
+          <div style={{ color: fg, fontSize: 14, fontWeight: 500 }}>{cfg.title}</div>
+          <div style={{ color: fg, fontSize: 13, marginTop: 2 }}>{cfg.detail}</div>
+        </div>
+      </div>
+    );
+  };
+
+  const ResourceCard = ({ label, value, hint, icon, tone = "foreground" }) => {
+    const valueColor = tone === "error" ? "var(--color-error-strong)" : tone === "warning" ? "var(--color-warning-strong)" : "var(--foreground)";
+    const iconColor = tone === "foreground" ? "var(--muted-foreground)" : valueColor;
+    return (
+      <div className="card" style={{ padding: 16, display: "flex", flexDirection: "column", gap: 8 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ color: "var(--muted-foreground)", fontSize: 14 }}>{label}</span>
+          <Icon name={icon} size={16} color={iconColor} />
+        </div>
+        <div style={{ fontSize: 24, fontWeight: 600, color: valueColor, lineHeight: 1 }}>{value}</div>
+        <div style={{ fontSize: 12, color: tone === "error" ? "var(--color-error-strong)" : "var(--muted-foreground)" }}>{hint}</div>
+      </div>
+    );
+  };
+
+  const RESOURCE_DATA = {
+    normal: {
+      cpu: { value: "42%", hint: "更新时间 14:27" },
+      memory: { value: "63%", hint: "当前机器内存占用" },
+      disk: { value: "71%", hint: "当前运行目录所在磁盘" },
+      data: { value: "124 GB", hint: "admin 运行目录 3.2 GB" },
+    },
+    warning: {
+      cpu: { value: "58%", hint: "更新时间 14:27" },
+      memory: { value: "72%", hint: "接近阈值 75%", tone: "warning" },
+      disk: { value: "88%", hint: "超过阈值 3%", tone: "warning" },
+      data: { value: "162 GB", hint: "admin 运行目录 4.1 GB" },
+    },
+    critical: {
+      cpu: { value: "92%", hint: "超过阈值 7%", tone: "error" },
+      memory: { value: "84%", hint: "超过阈值 9%", tone: "error" },
+      disk: { value: "95%", hint: "超过阈值 5%", tone: "error" },
+      data: { value: "198 GB", hint: "admin 运行目录 5.3 GB" },
+    },
+  };
+
+  const ResourceSection = ({ risk }) => {
+    const d = RESOURCE_DATA[risk] || RESOURCE_DATA.normal;
+    return (
+      <section style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+          <div>
+            <h2 className="section-title">机器资源概览</h2>
+            <p className="section-subtitle" style={{ marginTop: 2 }}>跟随列表页刷新节奏更新，不影响站点列表</p>
+          </div>
+        </div>
+        <RiskBanner risk={risk} />
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 16 }}>
+          <ResourceCard label="CPU" value={d.cpu.value} hint={d.cpu.hint} icon="cpu" tone={d.cpu.tone} />
+          <ResourceCard label="内存" value={d.memory.value} hint={d.memory.hint} icon="memory-stick" tone={d.memory.tone} />
+          <ResourceCard label="磁盘" value={d.disk.value} hint={d.disk.hint} icon="hard-drive" tone={d.disk.tone} />
+          <ResourceCard label="管理数据目录" value={d.data.value} hint={d.data.hint} icon="folder-kanban" />
+        </div>
+      </section>
+    );
+  };
+
+  /* =========================================================================
+     SiteToolbar
+     ========================================================================= */
+  const QUICK_FILTERS = [
+    { key: "all", label: "全部" },
+    { key: "running", label: "运行中" },
+    { key: "busy", label: "处理中" },
+    { key: "error", label: "异常" },
+    { key: "pending_parse", label: "待解析" },
+  ];
+
+  const SiteToolbar = ({ quickFilter, onQuickFilter, search, onSearch, statusFilter, onStatusFilter, riskFilter, onRiskFilter, onNew }) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {QUICK_FILTERS.map((q) => {
+          const active = quickFilter === q.key;
+          return (
+            <button
+              key={q.key}
+              onClick={() => onQuickFilter(q.key)}
+              className="chip"
+              style={{
+                padding: "4px 12px", cursor: "pointer", transition: "background 0.14s ease",
+                background: active ? "var(--primary)" : "var(--muted)",
+                color: active ? "var(--primary-foreground)" : "var(--muted-foreground)",
+                boxShadow: active ? "0 1px 3px rgba(0,0,0,0.18)" : "none",
+                fontSize: 12, fontWeight: 500,
+              }}
+            >{q.label}</button>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+        <label className="input" style={{ flex: 1, minWidth: 240 }}>
+          <Icon name="search" size={16} color="var(--muted-foreground)" style={{ marginRight: 8 }} />
+          <input value={search} placeholder="搜索项目名称或 site_id..." onChange={(e) => onSearch(e.target.value)} />
+        </label>
+        <select className="input" style={{ width: 140 }} value={statusFilter} onChange={(e) => onStatusFilter(e.target.value)}>
+          <option value="">所有状态</option>
+          <option value="Running">运行中</option>
+          <option value="Stopped">已停止</option>
+          <option value="Failed">失败</option>
+          <option value="Draft">草稿</option>
+          <option value="Parsed">已解析</option>
+        </select>
+        <select className="input" style={{ width: 140 }} value={riskFilter} onChange={(e) => onRiskFilter(e.target.value)}>
+          <option value="">全部风险</option>
+          <option value="warning">仅警告</option>
+          <option value="critical">仅严重</option>
+        </select>
+        <button className="btn btn-primary" onClick={onNew}>
+          <Icon name="plus" size={14} /> 新建站点
+        </button>
+      </div>
+    </div>
+  );
+
+  /* =========================================================================
+     SiteDataTable
+     ========================================================================= */
+  const canStart = (s, pending) => !pending && s.parse_status !== "Running" && ["Stopped","Parsed","Failed","Draft"].includes(s.status);
+  const canStop = (s, pending) => !pending && (s.status === "Running" || s.status === "Starting" || s.parse_status === "Running");
+  const canParse = (s, pending) => !pending && s.status !== "Running" && s.parse_status !== "Running";
+  const canEdit = (s, pending) => !pending && s.status !== "Running" && s.parse_status !== "Running";
+  const canDelete = canEdit;
+
+  const ActionButton = ({ tooltip, icon, color, disabled, onClick }) => (
+    <button className="icon-btn" disabled={disabled} title={tooltip} onClick={(e) => { e.stopPropagation(); onClick && onClick(); }}>
+      <Icon name={icon} size={14} color={disabled ? "var(--muted-foreground)" : color || "currentColor"} />
+    </button>
+  );
+
+  const SiteRow = ({ site, pending, onOpenDetail, onStart, onStop, onParse, onEdit, onDelete, onViewer }) => (
+    <tr className="row" onClick={() => onOpenDetail(site.site_id)} style={{ borderBottom: "1px solid var(--border-soft)" }}>
+      <td style={{ padding: "14px 16px", verticalAlign: "top" }}>
+        <div style={{ fontWeight: 500 }}>{site.project_name}</div>
+        <div style={{ fontSize: 12, fontFamily: "var(--font-mono)", color: "var(--muted-foreground)", marginTop: 2 }}>{site.site_id}</div>
+        {site.status === "Running" && site.entry_url && (
+          <a href={site.entry_url} onClick={(e) => e.stopPropagation()} target="_blank" rel="noreferrer" style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 12, fontFamily: "var(--font-mono)", color: "var(--color-info-strong)", marginTop: 4 }}>
+            {site.entry_url} <Icon name="external-link" size={11} />
+          </a>
+        )}
+        {site.last_error && (
+          <div style={{ maxWidth: 280, marginTop: 4, fontSize: 12, color: "var(--destructive)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={site.last_error}>
+            {site.last_error}
+          </div>
+        )}
+      </td>
+      <td style={{ padding: "14px 16px", verticalAlign: "top" }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          <Chip tone={STATUS_TONE[site.status]}>{STATUS_LABEL[site.status]}</Chip>
+          <Chip tone={PARSE_STATUS_TONE[site.parse_status]}>{PARSE_STATUS_LABEL[site.parse_status]}</Chip>
+        </div>
+        {site.parse_plan?.label && (
+          <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+            <Chip tone={PARSE_PLAN_TONE[site.parse_plan.mode] || "slate"}>{site.parse_plan.label}</Chip>
+            <div style={{ maxWidth: 260, fontSize: 12, color: "var(--muted-foreground)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={site.parse_plan.detail}>{site.parse_plan.detail}</div>
+          </div>
+        )}
+      </td>
+      <td style={{ padding: "14px 16px", verticalAlign: "top", fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--muted-foreground)" }}>
+        <div>D:{site.db_port} · W:{site.web_port}</div>
+      </td>
+      <td style={{ padding: "14px 16px", verticalAlign: "top" }}>
+        <Chip tone={RISK_TONE[site.risk_level]}>{RISK_LABEL[site.risk_level]}</Chip>
+        {site.risk_reasons?.[0] && (
+          <div style={{ maxWidth: 200, fontSize: 12, marginTop: 4, color: "var(--muted-foreground)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={site.risk_reasons.join("；")}>
+            {site.risk_reasons[0]}
+          </div>
+        )}
+      </td>
+      <td style={{ padding: "14px 16px", textAlign: "right", verticalAlign: "top" }} onClick={(e) => e.stopPropagation()}>
+        {pending ? (
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 6, color: "var(--muted-foreground)", fontSize: 12 }}>
+            <Icon name="loader" size={14} className="spin" />
+            {pending === "start" ? "启动中" : pending === "stop" ? "停止中" : "解析中"}
+          </div>
+        ) : (
+          <div className="row-actions" style={{ display: "inline-flex", gap: 4, opacity: 0.85, transition: "opacity 0.15s ease" }}>
+            {canStart(site, pending) && <ActionButton tooltip="启动" icon="play" color="var(--color-success-strong)" onClick={() => onStart(site.site_id)} />}
+            {canStop(site, pending) && <ActionButton tooltip="停止" icon="square" color="var(--color-warning-strong)" onClick={() => onStop(site.site_id)} />}
+            {canParse(site, pending) && <ActionButton tooltip="解析" icon="refresh-cw" onClick={() => onParse(site.site_id)} />}
+            {site.status === "Running" && <ActionButton tooltip="打开 Viewer" icon="eye" color="var(--color-info-strong)" onClick={() => onViewer(site)} />}
+            <ActionButton tooltip="详情" icon="external-link" onClick={() => onOpenDetail(site.site_id)} />
+            {canEdit(site, pending) && <ActionButton tooltip="编辑" icon="pencil" onClick={() => onEdit(site.site_id)} />}
+            {canDelete(site, pending) && <ActionButton tooltip="删除" icon="trash-2" color="var(--destructive)" onClick={() => onDelete(site.site_id)} />}
+          </div>
+        )}
+      </td>
+    </tr>
+  );
+
+  const SiteDataTable = ({ sites, pendingActions, onOpenDetail, onStart, onStop, onParse, onEdit, onDelete, onViewer, empty }) => (
+    <div className="card" style={{ overflow: "hidden" }}>
+      {sites.length === 0 ? (
+        <div style={{ padding: 80, display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
+          <div style={{ width: 72, height: 72, borderRadius: 999, background: "var(--muted)", display: "grid", placeItems: "center" }}>
+            <Icon name="folder-plus" size={32} color="var(--muted-foreground)" />
+          </div>
+          <div style={{ fontWeight: 500, fontSize: 16 }}>{empty?.title || "当前筛选结果为空"}</div>
+          <div style={{ color: "var(--muted-foreground)", fontSize: 13, textAlign: "center", maxWidth: 440 }}>{empty?.detail || "试着清除筛选条件或导入新的站点。"}</div>
+          {empty?.action}
+        </div>
+      ) : (
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+          <thead>
+            <tr style={{ background: "var(--muted)", borderBottom: "1px solid var(--border)" }}>
+              <th style={{ padding: "12px 16px", textAlign: "left", fontSize: 12, fontWeight: 500, color: "var(--muted-foreground)", width: 280 }}>项目名称</th>
+              <th style={{ padding: "12px 16px", textAlign: "left", fontSize: 12, fontWeight: 500, color: "var(--muted-foreground)" }}>状态</th>
+              <th style={{ padding: "12px 16px", textAlign: "left", fontSize: 12, fontWeight: 500, color: "var(--muted-foreground)", width: 160 }}>端口</th>
+              <th style={{ padding: "12px 16px", textAlign: "left", fontSize: 12, fontWeight: 500, color: "var(--muted-foreground)", width: 160 }}>风险</th>
+              <th style={{ padding: "12px 16px", textAlign: "right", fontSize: 12, fontWeight: 500, color: "var(--muted-foreground)", width: 260 }}>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sites.map((site) => (
+              <SiteRow
+                key={site.site_id}
+                site={site}
+                pending={pendingActions[site.site_id]}
+                onOpenDetail={onOpenDetail}
+                onStart={onStart}
+                onStop={onStop}
+                onParse={onParse}
+                onEdit={onEdit}
+                onDelete={onDelete}
+                onViewer={onViewer}
+              />
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+
+  /* =========================================================================
+     SitesView
+     ========================================================================= */
+  const computeStats = (sites) => {
+    const total = sites.length;
+    let running = 0, busy = 0, error = 0, pending_parse = 0;
+    sites.forEach((s) => {
+      if (s.status === "Running") running += 1;
+      if (s.status === "Starting" || s.status === "Stopping" || s.parse_status === "Running") busy += 1;
+      if (s.status === "Failed" || s.last_error) error += 1;
+      if (s.parse_status === "Pending" && s.status !== "Running" && s.status !== "Starting") pending_parse += 1;
+    });
+    return { total, running, busy, error, pending_parse };
+  };
+
+  const matchesQuick = (s, f) => {
+    switch (f) {
+      case "all": return true;
+      case "running": return s.status === "Running";
+      case "busy": return s.status === "Starting" || s.status === "Stopping" || s.parse_status === "Running";
+      case "error": return s.status === "Failed" || !!s.last_error;
+      case "pending_parse": return s.parse_status === "Pending" && s.status !== "Running";
+      default: return true;
+    }
+  };
+
+  const filterSites = (sites, { quickFilter, search, statusFilter, riskFilter }) => {
+    let list = sites;
+    if (quickFilter !== "all") list = list.filter((s) => matchesQuick(s, quickFilter));
+    if (search) {
+      const q = search.toLowerCase();
+      list = list.filter((s) => s.project_name.toLowerCase().includes(q) || s.site_id.toLowerCase().includes(q));
+    }
+    if (statusFilter) list = list.filter((s) => s.status === statusFilter);
+    if (riskFilter) list = list.filter((s) => s.risk_level === riskFilter);
+    return list;
+  };
+
+  const SitesView = ({ state, dispatch, onStart, onStop, onParse, onViewer }) => {
+    const stats = useMemo(() => computeStats(state.sites), [state.sites]);
+    const filtered = useMemo(() => filterSites(state.sites, state), [state.sites, state.quickFilter, state.search, state.statusFilter, state.riskFilter]);
+
+    const emptyState = state.sites.length === 0
+      ? { title: "还没有站点", detail: "首次进入工作台没有管理过的站点。导入第一个项目，平台会自动分配端口、解析 DESI / SYST 并生成 Viewer 链接。", action: <button className="btn btn-primary" onClick={() => dispatch({ type: "OPEN_DRAWER", mode: "create" })}><Icon name="plus" size={14} /> 新建第一个站点</button> }
+      : filtered.length === 0
+      ? { title: "当前筛选结果为空", detail: "试着清除筛选条件或搜索其他关键字。", action: <button className="btn btn-outline" onClick={() => { dispatch({ type: "SET_QUICK_FILTER", filter: "all" }); dispatch({ type: "SET_SEARCH", value: "" }); dispatch({ type: "SET_STATUS_FILTER", value: "" }); dispatch({ type: "SET_RISK_FILTER", value: "" }); }}>清除筛选</button> }
+      : null;
+
+    return (
+      <div style={{ padding: 32, display: "flex", flexDirection: "column", gap: 24 }}>
+        <WorkbenchHeader
+          total={stats.total}
+          filtered={filtered.length}
+          lastRefresh={state.lastRefresh}
+          onRefresh={() => dispatch({ type: "REFRESH" })}
+        />
+        <StatsGrid stats={stats} filteredCount={filtered.length} />
+        <ResourceSection risk={state.resourceRisk} />
+        <SiteToolbar
+          quickFilter={state.quickFilter}
+          onQuickFilter={(f) => dispatch({ type: "SET_QUICK_FILTER", filter: f })}
+          search={state.search}
+          onSearch={(v) => dispatch({ type: "SET_SEARCH", value: v })}
+          statusFilter={state.statusFilter}
+          onStatusFilter={(v) => dispatch({ type: "SET_STATUS_FILTER", value: v })}
+          riskFilter={state.riskFilter}
+          onRiskFilter={(v) => dispatch({ type: "SET_RISK_FILTER", value: v })}
+          onNew={() => dispatch({ type: "OPEN_DRAWER", mode: "create" })}
+        />
+        <SiteDataTable
+          sites={filtered}
+          pendingActions={state.pendingActions}
+          empty={emptyState}
+          onOpenDetail={(id) => dispatch({ type: "OPEN_DETAIL", siteId: id })}
+          onStart={onStart}
+          onStop={onStop}
+          onParse={onParse}
+          onEdit={(id) => dispatch({ type: "OPEN_DRAWER", mode: "edit", siteId: id })}
+          onDelete={(id) => dispatch({ type: "OPEN_DIALOG", dialog: { type: "delete", siteId: id } })}
+          onViewer={onViewer}
+        />
+      </div>
+    );
+  };
+
+  /* =========================================================================
+     Toast
+     ========================================================================= */
+  const Toast = ({ toast, onClose }) => {
+    useEffect(() => {
+      if (!toast) return;
+      const t = setTimeout(onClose, 3200);
+      return () => clearTimeout(t);
+    }, [toast, onClose]);
+    if (!toast) return null;
+    const iconName = toast.tone === "success" ? "shield-check" : toast.tone === "error" ? "circle-alert" : "triangle-alert";
+    const color = toast.tone === "success" ? "var(--color-success-strong)" : toast.tone === "error" ? "var(--color-error-strong)" : "var(--color-warning-strong)";
+    return (
+      <div className="toast-layer">
+        <div className="toast-card">
+          <Icon name={iconName} size={18} color={color} style={{ marginTop: 1 }} />
+          <div style={{ flex: 1, fontSize: 13 }}>{toast.message}</div>
+          <button className="icon-btn" onClick={onClose} style={{ width: 22, height: 22 }}>
+            <Icon name="x" size={12} />
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  /* =========================================================================
+     Devtools (risk switcher)
+     ========================================================================= */
+  const Devtools = ({ risk, onRisk, onReset }) => (
+    <div className="devtools">
+      <div><strong>Devtools</strong> · 仅演示用</div>
+      <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+        <span style={{ color: "#A1A1AA" }}>机器风险</span>
+        {["normal","warning","critical"].map((k) => (
+          <button key={k} className={risk === k ? "on" : ""} onClick={() => onRisk(k)}>{RISK_LABEL[k]}</button>
+        ))}
+      </div>
+      <button onClick={onReset} style={{ background: "rgba(220,38,38,0.22)" }}>重置数据</button>
+    </div>
+  );
+
+  /* =========================================================================
+     App (Phase A + B + partial E — list + toasts + devtools wired)
+     Drawer / Detail / Dialog — placeholders until Phase C + D + E fully landed.
+     ========================================================================= */
+  const App = () => {
+    const [state, dispatch] = useReducer(reducer, null, initialState);
+
+    /* scale stage to viewport */
+    const contentRef = useRef(null);
+    useEffect(() => {
+      const handle = () => {
+        const el = contentRef.current;
+        if (!el) return;
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const design = 1440;
+        const scale = Math.min(vw / design, vh / 900, 1);
+        el.style.transform = `scale(${scale})`;
+        el.style.width = `${design}px`;
+      };
+      handle();
+      window.addEventListener("resize", handle);
+      return () => window.removeEventListener("resize", handle);
+    }, []);
+
+    /* mock async actions */
+    const runAction = (siteId, action, { willFail, delay = 1500 } = {}) => {
+      if (state.pendingActions[siteId]) return;
+      dispatch({ type: "START_PENDING", siteId, action });
+      setTimeout(() => {
+        if (willFail) {
+          dispatch({ type: "FAIL_ACTION", siteId, action, message: `${action === "start" ? "启动" : action === "stop" ? "停止" : "解析"}失败：端口 ${state.sites.find((s) => s.site_id === siteId)?.web_port} 被占用 (PID 42198)` });
+        } else {
+          dispatch({ type: "END_PENDING", siteId, action });
+        }
+      }, delay);
+    };
+
+    const onStart = (siteId, e) => runAction(siteId, "start", { willFail: e?.shiftKey });
+    const onStop = (siteId) => runAction(siteId, "stop");
+    const onParse = (siteId) => runAction(siteId, "parse", { delay: 2200 });
+    const onViewer = (site) => {
+      dispatch({ type: "HIDE_TOAST" });
+      setTimeout(() => dispatch({ type: "REFRESH" }), 0);
+      alert(`演示原型 · 这里会打开 Viewer：\n${site.entry_url || site.local_entry_url}`);
+    };
+
+    const currentSite = state.sites.find((s) => s.site_id === state.detailSiteId);
+
+    return (
+      <div className="stage-viewport">
+        <div className="stage-content" ref={contentRef}>
+          {state.route === "list" && (
+            <SitesView state={state} dispatch={dispatch} onStart={onStart} onStop={onStop} onParse={onParse} onViewer={onViewer} />
+          )}
+          {state.route === "detail" && currentSite && (
+            <DetailPlaceholder site={currentSite} state={state} dispatch={dispatch} onStart={onStart} onStop={onStop} onParse={onParse} onViewer={onViewer} />
+          )}
+        </div>
+        {state.drawer.open && <DrawerPlaceholder state={state} dispatch={dispatch} />}
+        {state.dialog?.type === "delete" && <DeleteDialogImpl state={state} dispatch={dispatch} />}
+        <Toast toast={state.toast} onClose={() => dispatch({ type: "HIDE_TOAST" })} />
+        <Devtools
+          risk={state.resourceRisk}
+          onRisk={(r) => dispatch({ type: "SET_RESOURCE_RISK", risk: r })}
+          onReset={() => { if (confirm("重置所有演示数据？")) window.location.reload(); }}
+        />
+      </div>
+    );
+  };
+
+  /* =========================================================================
+     Placeholder components (filled in next phases).
+     ========================================================================= */
+  const DrawerPlaceholder = ({ state, dispatch }) => (
+    <Fragment>
+      <div className="drawer-overlay" onClick={() => dispatch({ type: "CLOSE_DRAWER" })} />
+      <div className="drawer-panel">
+        <div style={{ padding: 24, display: "flex", justifyContent: "space-between", borderBottom: "1px solid var(--border)" }}>
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 18 }}>{state.drawer.mode === "edit" ? "编辑站点" : "新建站点"}</div>
+            <div style={{ color: "var(--muted-foreground)", fontSize: 13, marginTop: 4 }}>Phase C 即将补充完整表单</div>
+          </div>
+          <button className="icon-btn" onClick={() => dispatch({ type: "CLOSE_DRAWER" })}><Icon name="x" size={16} /></button>
+        </div>
+        <div style={{ padding: 24, color: "var(--muted-foreground)", fontSize: 13 }}>
+          待填充：项目信息 / 运行配置 / 解析范围 / 数据库凭据（将在下个阶段补齐）。
+        </div>
+      </div>
+    </Fragment>
+  );
+
+  const DetailPlaceholder = ({ site, dispatch }) => (
+    <div style={{ padding: 32, display: "flex", flexDirection: "column", gap: 24 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+        <button className="icon-btn" style={{ width: 32, height: 32 }} onClick={() => dispatch({ type: "BACK_TO_LIST" })}>
+          <Icon name="arrow-left" size={16} />
+        </button>
+        <div style={{ flex: 1 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <h1 style={{ margin: 0, fontSize: 24, fontWeight: 600 }}>{site.project_name}</h1>
+            <Chip tone={STATUS_TONE[site.status]}>{STATUS_LABEL[site.status]}</Chip>
+          </div>
+          <div style={{ color: "var(--muted-foreground)", fontSize: 13, fontFamily: "var(--font-mono)" }}>{site.site_id}</div>
+        </div>
+      </div>
+      <div className="card" style={{ padding: 32, color: "var(--muted-foreground)", fontSize: 13 }}>
+        Phase D 将在此补齐运行概览 / 配置信息 Tab（Runtime 卡 / 解析计划 / 风险摘要 / 进程资源 / 日志面板）。
+      </div>
+    </div>
+  );
+
+  const DeleteDialogImpl = ({ state, dispatch }) => {
+    const site = state.sites.find((s) => s.site_id === state.dialog.siteId);
+    if (!site) return null;
+    return (
+      <div className="dialog-overlay" onClick={() => dispatch({ type: "CLOSE_DIALOG" })}>
+        <div className="dialog-panel" onClick={(e) => e.stopPropagation()} style={{ padding: 24, display: "flex", flexDirection: "column", gap: 16 }}>
+          <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+            <div style={{ width: 40, height: 40, borderRadius: 999, background: "var(--color-error)", display: "grid", placeItems: "center" }}>
+              <Icon name="trash-2" size={20} color="var(--color-error-strong)" />
+            </div>
+            <div>
+              <div style={{ fontWeight: 600, fontSize: 18 }}>删除站点</div>
+              <div style={{ color: "var(--muted-foreground)", fontSize: 12 }}>此操作不可撤销，请确认后继续</div>
+            </div>
+          </div>
+          <div style={{ fontSize: 14, color: "var(--foreground)", lineHeight: 1.5 }}>
+            确定删除站点「<strong>{site.project_name}</strong>」吗？
+            <br /><br />
+            该站点的运行目录 ({fmtBytes(site.runtime_dir_bytes)})、解析数据 ({fmtBytes(site.data_dir_bytes)})、日志文件 ({fmtBytes(site.log_bytes)}) 将一同移除。
+          </div>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <button className="btn btn-outline" onClick={() => dispatch({ type: "CLOSE_DIALOG" })}>取消</button>
+            <button className="btn btn-destructive" onClick={() => dispatch({ type: "CONFIRM_DELETE", siteId: site.site_id })}>
+              <Icon name="trash-2" size={14} /> 确认删除
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  /* =========================================================================
+     Mount
+     ========================================================================= */
+  ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>

@@ -162,15 +162,48 @@ cargo run --bin web_server --features web_server
 - 验证：`cargo check --lib` → `0.68s, 0 errors`
 - 提交：rs-core `9b85cb05 chore(aios_db_mgr): remove legacy AiosDBMgr (migration Phase 4 last mile)` · 3 files · -398
 
-### Task 2：2026-04-24 Sprint 运行时冒烟（待执行）
+### Task 2：2026-04-24 Sprint 运行时冒烟 ✅
 
-需要用户授权停掉 PID 27112 的 web_server.exe 后执行。预期操作序列：
+用户 2026-04-25 授权后执行：停 PID 27112 → `cargo build --bin web_server --features web_server`（1m 22s 通过）→ 两次带不同 env 启动。
 
-1. `Stop-Process -Id 27112 -Force` （用户授权）
-2. `cargo build --bin web_server --features web_server`（在 plant-model-gen 目录）
-3. `$env:AIOS_PRINT_ROUTES='1'; cargo run --bin web_server --features web_server`
-4. 查看启动日志中 `[web_server] registered routes (stateless web_api)` 段落
-5. 在另一终端按 Step 3/4/5 里的 Invoke-RestMethod 序列跑 P2/P3/P4 smoke，把 HTTP 状态码与 UI banner 观察补回来
+**M5 启动日志核对**：
+```
+[web_server] registered routes (stateless web_api)
+  GET    /api/room-tree/root
+  ...
+  GET    /api/pdms/ui-attr/{refno}
+  GET    /api/pdms/transform/{refno}
+  GET    /api/pdms/transform/compute/{refno}
+  GET    /api/pdms/ptset/{refno}
+  POST   /api/pdms/ptset/batch-query
+  GET    /api/pdms/type-info
+  GET    /api/pdms/children
+  ...
+[web_server] registered routes (stateful web_api prefixes)
+  /api/spatial/* ...
+  ...
+[web_server] registered routes (main router, manual in web_server/mod.rs)
+  /api/tasks* ...
+  ...
+```
+全三段打印正常，PDMS 5 条关键路径齐全。
+
+**P2 + P3 + P4 HTTP smoke**（env：`AIOS_ALLOW_PUBLIC_BIND=1` + `AIOS_VIEWER_BASE_URL=http://viewer.example.com:9999` + `ADMIN_USER=smokeadmin` + `ADMIN_PASS=Smok3pw!aB`）：
+
+| # | 请求 | 预期 | 实际 |
+|---|------|------|------|
+| 1 | `POST /api/admin/sites` w/ `db_user=root&db_password=root` | 400 "凭据过于简单" | **HTTP 400** "数据库凭据过于简单（root/root）。请使用更复杂的用户名/密码；如仅用于本地开发，可设置 AIOS_ALLOW_WEAK_DB_CREDS=1 临时放行。" ✅ |
+| 2 | `POST /api/admin/sites` w/ `bind_host=0.0.0.0` **and env AIOS_ALLOW_PUBLIC_BIND=1** | 201 (env 放行) | **HTTP 201**, site_id=`smoketest2-13202` ✅ |
+| 3 | `POST /api/admin/sites` normal valid path (db_user=gooduser, strongpw, 127.0.0.1) | 201 | **HTTP 201**, site_id=`smoketest3-13203` ✅ |
+| 4 | `POST /api/admin/sites` dup db_port=18002 | 409 端口冲突（P4 分类） | **HTTP 409** "数据库端口 18002 已被站点 smoketest2-13202 使用" ✅ |
+| 5 | `GET /api/admin/app-config` | `viewer_base_url = "http://viewer.example.com:9999"` | **200** `{"viewer_base_url":"http://viewer.example.com:9999"}` ✅ |
+| 6 | `POST /api/admin/sites` w/ `bind_host=0.0.0.0`，**无 AIOS_ALLOW_PUBLIC_BIND**（重启后） | 400 "0.0.0.0 会将站点暴露" | **HTTP 400** "bind_host=0.0.0.0 会将站点暴露到所有网络接口。请改用 127.0.0.1 或具体的内网地址；如确需公网绑定，请设置 AIOS_ALLOW_PUBLIC_BIND=1 并自行承担风险。" ✅ |
+
+**清理**：两个 smoke 站点 `smoketest2-13202` / `smoketest3-13203` 已通过 `DELETE /api/admin/sites/{id}` 清理干净；web_server 进程已停。
+
+**未覆盖**（受限于 headless 环境）：
+- **P4 UI banner 观察**：amber 警示条 / 详情页"XXX失败：..."格式的 banner 需要浏览器实操，本 session 无法验证；后端 400/409 文案已确认正确
+- **P3 Viewer 按钮 href**：前端 `/api/admin/app-config` 拉到 `viewer_base_url` 后 `buildViewerUrl` 的实际输出需要浏览器观察；后端 API payload 已确认正确
 
 ### Task 3：修 plant-model-gen `npm run type-check`（未执行）
 

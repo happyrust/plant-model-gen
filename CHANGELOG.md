@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-04-24
+
+### Fixed
+
+- **控制台 Q POS / Q ORI 失效修复**：`src/web_api/pdms_transform_api.rs::get_transform` 增加实时计算兜底路径。原有实现硬依赖 `pe_transform` 缓存表，当缓存未写入或被刷新时 `Q POS` / `Q ORI` / `Q POS WRT OWNER` / `Q ORI WRT OWNER` 全链路失效；现在缓存 miss 时自动回退到 `aios_core::transform::get_world_mat4` 实时计算世界矩阵，并通过 `log::info!` 输出 `pe_transform cache miss for <refno>, falling back to compute` 便于排查。`TransformResponse` 结构保持不变，前端无需改动。
+
+### Changed
+
+- **`get_transform` 重构**：抽出 `query_owner`（pe 表查询 + `get_named_attmap` 双重兜底）与 `compute_world_transform_fallback`（`get_world_mat4` 包装）两个 helper，消除原先嵌套 `match` + 重复 owner 查询的冗余；错误场景下也会尽量返回 owner，方便前端展示。
+
+### Docs
+
+- `docs/plans/2026-04-23-console-q-pos-transform-fallback.md`：Q POS 失效根因分析与 P0/P1 双阶段修复方案。
+- `docs/plans/2026-04-24-cross-repo-next-phase.md`：跨 plant3d-web / plant-model-gen 的下一阶段开发计划（CUTOVER + Q POS Fallback + Admin 站点整改）。
+- `design/site-admin-flow-demo/PLAN.md` + `index.html`：Admin 站点管理完整交互流程 Hi-Fi 原型（含方案与可运行页面）。
+- `ui/界面设计/admin/站点管理.pen`：站点管理 Pencil 设计稿。
+
 ## 2026-04-23
 
 ### Added

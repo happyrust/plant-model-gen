@@ -1,5 +1,6 @@
 use aios_core::{RefnoEnum, SurrealQueryExt, get_named_attmap, get_type_name, project_primary_db};
 use axum::{Router, extract::Path, http::StatusCode, response::Json, routing::get};
+use log::info;
 use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;
 
@@ -23,77 +24,113 @@ pub struct TransformResponse {
     pub error_message: Option<String>,
 }
 
+/// 查询 owner refno（先走 SurrealDB pe 表，失败则通过 attmap 兜底）
+async fn query_owner(refno: RefnoEnum) -> Option<String> {
+    let owner_sql = format!(
+        "SELECT record::id(owner ?? id) as owner FROM {}",
+        refno.to_pe_key()
+    );
+
+    #[derive(Deserialize, SurrealValue)]
+    struct OwnerQueryResult {
+        owner: Option<String>,
+    }
+
+    if let Ok(Some(result)) = project_primary_db()
+        .query_take::<Option<OwnerQueryResult>>(&owner_sql, 0)
+        .await
+    {
+        if result.owner.is_some() {
+            return result.owner;
+        }
+    }
+
+    if let Ok(att) = get_named_attmap(refno).await {
+        let owner = att.get_owner();
+        if owner != refno {
+            return Some(owner.to_string());
+        }
+    }
+    None
+}
+
+/// 实时计算世界变换矩阵（复用 compute_transform 的核心逻辑）
+async fn compute_world_transform_fallback(refno: RefnoEnum) -> Option<Vec<f64>> {
+    let world_mat = aios_core::transform::get_world_mat4(refno, false)
+        .await
+        .ok()
+        .flatten()?;
+    Some(
+        world_mat
+            .to_cols_array()
+            .iter()
+            .copied()
+            .collect::<Vec<f64>>(),
+    )
+}
+
 /// 查询元素的变换矩阵和 owner
+///
+/// 快速路径：从 pe_transform 缓存表读取。
+/// 兜底路径：缓存不可用时通过 aios_core::transform::get_world_mat4 实时计算。
 async fn get_transform(
     Path(refno): Path<RefnoEnum>,
 ) -> Result<Json<TransformResponse>, StatusCode> {
     let refno_str = refno.to_string();
     let pe_transform_key = refno.to_pe_key().replace("pe:", "pe_transform:");
 
-    // 查询 pe_transform 获取 world_trans
-    let sql = format!(
-        r#"
-        SELECT 
-            world_trans.d as world_trans
-        FROM {}
-        WHERE world_trans != none
-        "#,
-        pe_transform_key
-    );
-
     #[derive(Deserialize, SurrealValue)]
     struct TransformQueryResult {
         world_trans: Option<serde_json::Value>,
     }
 
-    match project_primary_db()
+    let sql = format!(
+        "SELECT world_trans.d as world_trans FROM {} WHERE world_trans != none",
+        pe_transform_key
+    );
+
+    let cached = project_primary_db()
         .query_take::<Option<TransformQueryResult>>(&sql, 0)
         .await
-    {
-        Ok(Some(result)) => {
-            // 解析变换矩阵
-            let world_transform = parse_transform_matrix(result.world_trans);
-            let owner_sql = format!(
-                "SELECT record::id(owner ?? id) as owner FROM {}",
-                refno.to_pe_key()
-            );
+        .ok()
+        .flatten()
+        .and_then(|r| parse_transform_matrix(r.world_trans));
 
-            #[derive(Deserialize, SurrealValue)]
-            struct OwnerQueryResult {
-                owner: Option<String>,
-            }
-
-            let owner = match project_primary_db()
-                .query_take::<Option<OwnerQueryResult>>(&owner_sql, 0)
-                .await
-            {
-                Ok(Some(result)) => result.owner,
-                _ => None,
-            };
-
-            Ok(Json(TransformResponse {
-                success: true,
-                refno: refno_str,
-                world_transform,
-                owner,
-                error_message: None,
-            }))
-        }
-        Ok(None) => Ok(Json(TransformResponse {
-            success: false,
+    if let Some(world_transform) = cached {
+        let owner = query_owner(refno).await;
+        return Ok(Json(TransformResponse {
+            success: true,
             refno: refno_str,
-            world_transform: None,
-            owner: None,
-            error_message: Some("未找到变换矩阵数据".to_string()),
-        })),
-        Err(e) => Ok(Json(TransformResponse {
-            success: false,
-            refno: refno_str,
-            world_transform: None,
-            owner: None,
-            error_message: Some(format!("数据库查询失败: {}", e)),
-        })),
+            world_transform: Some(world_transform),
+            owner,
+            error_message: None,
+        }));
     }
+
+    info!(
+        "[pdms_transform] pe_transform cache miss for {}, falling back to compute",
+        refno_str
+    );
+
+    if let Some(world_transform) = compute_world_transform_fallback(refno).await {
+        let owner = query_owner(refno).await;
+        return Ok(Json(TransformResponse {
+            success: true,
+            refno: refno_str,
+            world_transform: Some(world_transform),
+            owner,
+            error_message: None,
+        }));
+    }
+
+    let owner = query_owner(refno).await;
+    Ok(Json(TransformResponse {
+        success: false,
+        refno: refno_str,
+        world_transform: None,
+        owner,
+        error_message: Some("缓存与实时计算均无法获取世界变换矩阵".to_string()),
+    }))
 }
 
 /// 实时计算变换的响应

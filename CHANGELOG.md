@@ -1,5 +1,52 @@
 # Changelog
 
+## 2026-04-26
+
+### Added
+
+- **异地协同 Sprint B 后端 stub 收口（G6/G7 共 4 个 Phase 提交）**：完成跨仓 `plant-collab-monitor` 前端依赖的全部 MQTT/订阅类后端补齐，关闭 G6 全部 7 子项，G7 = B6 reload 落最小可用版。
+  - **Phase 8（B1 + B3 + B7，commit `94bc86e`）**：
+    - **B1**：`src/web_server/sync_control_handlers.rs::set_as_master_node` / `set_as_client_node` 由 `log::warn!` stub 升级为真实写盘。复用 `mqtt_monitor_handlers::ensure_node_config_table()`（schema：`location TEXT PK / is_master BOOLEAN / updated_at TEXT`），`INSERT OR REPLACE` 写入 `node_config`，下次 `subscription/status` 立即返回 `is_master_node: true/false`。前端 `MqttNodesView` 主从切换按钮真正生效。
+    - **B3**：`get_mqtt_subscription_status` 字段补齐 5 项（`is_master_node` / `node_role` / `connection_status` / `master_info` / `mqtt_server_port`），与前端期望对齐；`is_master_node` 通过 `mqtt_monitor_handlers::check_is_master_node` 实时计算。
+    - **B7**：新建 `shells/smoke-collab-api.sh` 后端冒烟脚本，覆盖站点配置 / 同步引擎 / MQTT 订阅 / 异地协同 4 域 16 endpoint，自动化 curl 输出 `✓ / WARN / ✗` 表格 + 字段命中校验，集成 CI 即可保证后端零回归。
+  - **Phase 9（B2 broker logs ring-buffer，commit `c3a38ce`）**：
+    - `src/web_server/mqtt_monitor_handlers.rs` 新增内存型 broker 事件日志：`BrokerLogEntry { timestamp, level, event, location, message }` + `BROKER_LOG_CAPACITY = 200` + `MQTT_BROKER_LOGS = Arc<RwLock<VecDeque<BrokerLogEntry>>>`，仅进程内 + 不持久化（与持久化 SQLite 日志正交，专供 broker 实时面板）。
+    - `push_broker_log(level, event, location, message)` helper 注入 6 处事件时机：节点首次上线 / 离线恢复 / 心跳超时翻转 / ConnAck 状态切换 / set_master / set_client / 订阅启停 / 清主配置。
+    - `get_mqtt_broker_logs_api` 升级支持 `?limit=N`（默认 200，上限 200），返回 `{ status, count, capacity, logs }`，按时间倒序最新在前。
+    - `shells/smoke-collab-api.sh` 增加 `?limit=10` + `set_master` 字段命中校验。
+  - **Phase 12（B4 SSE `MqttSubscriptionStatusChanged` 事件后端推送，commit `5463e41`）**：
+    - `src/web_server/sse_handlers.rs::SyncEvent` 新增变体 `MqttSubscriptionStatusChanged { is_running, is_master_node, location, timestamp }`，字段口径与 `GET /api/mqtt/subscription/status` 完全对齐，前端可零差量解析直接 reload。
+    - `sync_control_handlers.rs` 新增 `pub(crate) async fn push_subscription_status_event(location)` helper，内部读 `REMOTE_RUNTIME` + `mqtt_monitor_handlers::check_is_master_node` 计算最新状态后通过 `SYNC_EVENT_TX` 广播。
+    - 4 处推送注入：`set_as_master_node` / `set_as_client_node` / `start_mqtt_subscription_api` / `stop_mqtt_subscription_api` 成功路径。
+    - `shells/smoke-collab-api.sh` 新增 `check_sse` 函数 + `[4/5] SSE 实时事件流` 块（`curl -m 2 -H "Accept: text/event-stream"` 检查 `/api/sync/events/stream` 200）。
+    - 跨仓 `plant-collab-monitor/src/views/LogsView.vue` 已订阅 `/api/sync/events/stream` 自动 prepend，本次后端推送对其零改动即可生效。
+  - **Phase 11（B6 `reload_site_config` diff + 分类响应，commit `2286cd2`）**：
+    - **核查结论**：原 plan §1.B6 假设的 `aios_core::set_db_option_from_file` API **不存在**；`aios_core::get_db_option` 实际为 `OnceCell::get_or_init`，全局静态不可变；想真正热替换 DbOption 必须改 rs-core OnceCell → `RwLock<Arc<DbOption>>`，属跨仓改动。本 Phase 落实最小可用版：字段变更检测 + 分类响应 + 用户告知。
+    - `src/web_server/site_config_handlers.rs::reload_site_config` 重写：读 `${DB_OPTION_FILE}.toml` → `toml::from_str` → `DbOption` → 与当前 `aios_core::get_db_option()` 通过 `serde_json` 做字段级 diff → 按 `HOT_RELOADABLE_KEYS` 白名单分流到 `hot_changed_keys` / `static_changed_keys`。
+    - `HOT_RELOADABLE_KEYS` 白名单 12 字段：`enable_log` / `mesh_tol_ratio` / `gen_model` / `gen_spatial_tree` / `load_spatial_tree` / `apply_boolean_operation` / `build_cate_relate` / `sync_chunk_size` / `parse_channel_capacity` / `parse_mode` / `incr_sync` / `total_sync`。
+    - 返回 `{ status, message, hot_changed_keys, static_changed_keys, requires_restart, actions }`，`actions` ∈ `{ "no_change", "log_only", "manual_restart_required", "read_failed", "parse_failed" }`。文件错 / 解析错走 `status: "error"` 但 HTTP 仍 200，便于前端 SettingsView 统一渲染。
+
+### Docs
+
+- `docs/plans/2026-04-26-sprint-b-plan.md`：异地协同 Sprint B 后端 stub 收口主计划，含 7 子任务（B1-B7）拆解、6 Phase 时间线、风险表与执行节奏；本次记录 4 Phase 落地（Phase 8/9/11/12，剩 Phase 10 = B5 graceful shutdown / Phase 11-Plus = B6 真热加载 / Phase 12-Plus = B4 跨仓前端联调 / Phase 7-Plus = 后端联调验收报告）。
+- `docs/plans/2026-04-26-sprint-b-phase11-b6-reload.md`：Phase 11 子计划，含背景核查结论、A 方案设计、HOT_RELOADABLE_KEYS 白名单设计、6 场景验收表与升级路径（rs-core OnceCell → RwLock<Arc<DbOption>>）。
+
+## 2026-04-25
+
+### Added
+
+- **`/api/admin/app-config` 运行时可配置 viewer base url（commit `9e9a676`）**：在 admin 端新增运行时可配置端点，前端无需重新构建即可切换 plant3d viewer 的 base URL，便于多环境部署（dev / stage / prod 同一份 admin 资产）。
+
+### Changed
+
+- **Admin action-error feedback 强化（commit `8b1f74d`）**：操作失败响应增加 `label` + `dismiss` 字段；新加的客户端校验器（弱密码 / 公网绑定）走 HTTP 400 而非通用 500，前端可据此精准提示。
+- **Admin 站点新建 / 更新拒弱密码 + 拒公网 0.0.0.0 绑定（commit `a8de78e`）**：服务端在 `/api/admin/sites` POST/PUT 入口增加白名单校验，弱凭据（短密码 / 默认弱口令）与公网监听（`0.0.0.0` / 全 0 host）一律 400；前端 SiteForm 同步显示中文错误提示。
+- **web_server 启动时打印已注册路由（PDMS Hardening M5，commit `79ebcf8`）**：main 启动期遍历 `Router` 输出全部路由前缀到 stdout，便于排查 "新增 handler 但忘记 merge" 的静默 404 问题。
+
+### Docs
+
+- `docs/plans/2026-04-25-tech-debt-cleanup-plan.md`（commit `01b8d60` + `19e7cc8`）：技术债清理计划，覆盖 AiosDBMgr 迁移 Phase 4 基线审计与执行结论；同文件追加 Task 2（M5/P2/P3/P4 runtime 冒烟）实际执行结果（路由打印 / strong-creds guard 弱密码 400 + 公网绑定 400 + AIOS_ALLOW_PUBLIC_BIND=1 escape hatch / `/api/admin/app-config` viewer URL / 错误分类 409）。
+
 ## 2026-04-24
 
 ### Fixed

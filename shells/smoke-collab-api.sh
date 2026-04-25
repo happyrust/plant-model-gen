@@ -82,6 +82,25 @@ check() {
   fi
 }
 
+# 单独的 SSE 通道连接性校验（B4 · 流式接口不能用普通 check）
+#
+# curl -m 2 在 2s 后超时返回（exit 28），但 %{http_code} 只要服务端发送过响应头
+# 就会被填充为对应状态码。预期 200。
+check_sse() {
+  local path="$1"
+  local code
+  code=$(curl -s -o /dev/null -m 2 -w "%{http_code}" \
+    -H "Accept: text/event-stream" "$BASE$path" 2>/dev/null || echo "000")
+
+  if [[ "$code" =~ ^2 ]]; then
+    pass=$((pass + 1))
+    printf "  ${green}✓${reset} %-7s %-50s %s %s\n" "GET" "$path" "OK" "(SSE $code)"
+  else
+    fail=$((fail + 1))
+    printf "  ${red}✗${reset} %-7s %-50s %s\n" "GET" "$path" "FAIL($code)"
+  fi
+}
+
 echo "──────────────────────────────────────────────────────────────"
 echo "  异地协同后端 API 冒烟 · BASE=$BASE"
 echo "──────────────────────────────────────────────────────────────"
@@ -101,7 +120,7 @@ check GET  /api/sync/config                     "2.."
 check GET  /api/sync/metrics                    "2.."
 
 echo
-echo "[3/4] MQTT 节点 / 订阅"
+echo "[3/5] MQTT 节点 / 订阅"
 check GET  /api/mqtt/nodes                      "2.." "summary"
 check GET  /api/mqtt/messages                   "2.."
 check GET  /api/mqtt/subscription/status        "200" "is_master_node"
@@ -113,7 +132,13 @@ check GET  /api/mqtt/subscription/status        "200" "is_master_node"
 check GET  /api/mqtt/broker/logs?limit=10       "200" "set_master"
 
 echo
-echo "[4/4] 异地协同 (admin-gated · 503/401/403 视为预期)"
+echo "[4/5] SSE 实时事件流 (B4)"
+# B4 验证：SSE 通道可建立。前一步 set-client/set-master 已触发
+# MqttSubscriptionStatusChanged 事件，前端 LogsView 订阅后可见。
+check_sse /api/sync/events/stream
+
+echo
+echo "[5/5] 异地协同 (admin-gated · 503/401/403 视为预期)"
 check GET  /api/remote-sync/envs                "2..|503|401|403"
 check GET  /api/remote-sync/topology            "2..|503|401|403"
 check GET  /api/remote-sync/runtime/status      "2..|503|401|403"

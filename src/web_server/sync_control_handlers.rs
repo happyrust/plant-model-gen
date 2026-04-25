@@ -966,6 +966,33 @@ pub async fn get_mqtt_broker_logs_api(
     })))
 }
 
+/// B4 helper：推送 `MqttSubscriptionStatusChanged` 事件
+///
+/// 字段计算口径与 `GET /api/mqtt/subscription/status` 完全一致，前端
+/// `LogsView` / `MqttNodesView` 收到事件后可直接 reload 状态而无需差量解析。
+///
+/// 调用方：set_as_master_node / set_as_client_node / start_mqtt_subscription_api
+/// / stop_mqtt_subscription_api 操作成功后立即触发。
+pub(crate) async fn push_subscription_status_event(location: String) {
+    use crate::web_server::mqtt_monitor_handlers;
+    use crate::web_server::remote_runtime;
+
+    let is_running = remote_runtime::REMOTE_RUNTIME.read().await.is_some();
+    let db_path = mqtt_monitor_handlers::get_node_config_db_path();
+    let is_master_node = mqtt_monitor_handlers::check_is_master_node(&location, &db_path);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+
+    let _ = SYNC_EVENT_TX.send(SyncEvent::MqttSubscriptionStatusChanged {
+        is_running,
+        is_master_node,
+        location,
+        timestamp,
+    });
+}
+
 /// POST /api/mqtt/subscription/start — 简化: 直接 start_runtime
 pub async fn start_mqtt_subscription_api(
     _state: State<AppState>,
@@ -997,6 +1024,7 @@ pub async fn start_mqtt_subscription_api(
                 format!("MQTT 订阅已启动（env={}，简化模式）", env_id),
             )
             .await;
+            push_subscription_status_event(location.clone()).await;
             Ok(Json(json!({
                 "status": "success",
                 "message": "MQTT 订阅已启动 (简化模式)"
@@ -1037,6 +1065,7 @@ pub async fn stop_mqtt_subscription_api(
             "MQTT 订阅已停止",
         )
         .await;
+        push_subscription_status_event(location.clone()).await;
         Ok(Json(json!({
             "status": "success",
             "message": "MQTT 订阅已停止"
@@ -1173,6 +1202,7 @@ pub async fn set_as_master_node(
                 format!("{} 已标记为主节点（node_config 写入成功）", location),
             )
             .await;
+            push_subscription_status_event(location.clone()).await;
             Ok(Json(json!({
                 "status": "success",
                 "message": format!("已标记 {} 为主节点", location),
@@ -1221,6 +1251,7 @@ pub async fn set_as_client_node(
                 format!("{} 已标记为从节点（node_config 写入成功）", location),
             )
             .await;
+            push_subscription_status_event(location.clone()).await;
             Ok(Json(json!({
                 "status": "success",
                 "message": format!("已标记 {} 为从节点", location),

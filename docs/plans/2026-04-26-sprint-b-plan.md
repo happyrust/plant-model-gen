@@ -76,16 +76,25 @@
 
 **估时**：30 min
 
-### B4 · `MqttSubscriptionStatusChanged` SSE 事件（G6）
+### B4 · `MqttSubscriptionStatusChanged` SSE 事件（G6）✅ Phase 12 完成
 
 **位置**：`src/web_server/sse_handlers.rs` 已有 SyncEvent 枚举
 
-**改造方案**：
-- 新增 `SyncEvent::MqttSubscriptionStatusChanged { is_running, is_master_node, location }`
-- B1 / B3 / start/stop_mqtt_subscription_api 操作完成时通过 `SYNC_EVENT_TX` 推送
-- 前端 LogsView SSE 已订阅 `/api/sync/events/stream`，收到事件后自动 reload
+**已落地**（commit Phase 12）：
+- `sse_handlers.rs` `SyncEvent` 新增变体 `MqttSubscriptionStatusChanged { is_running, is_master_node, location, timestamp }`
+  - 字段口径与 `GET /api/mqtt/subscription/status` 完全一致
+- `sync_control_handlers.rs` 新增 `pub(crate) async fn push_subscription_status_event(location)` helper
+  - 内部读 `REMOTE_RUNTIME` + `mqtt_monitor_handlers::check_is_master_node` 计算最新状态
+  - 通过 `SYNC_EVENT_TX.send(...)` 广播
+- 4 处推送注入：
+  - `set_as_master_node`（success）
+  - `set_as_client_node`（success）
+  - `start_mqtt_subscription_api`（success）
+  - `stop_mqtt_subscription_api`（success）
+- `shells/smoke-collab-api.sh` 增加 `check_sse` 函数 + `[4/5] SSE 实时事件流` 块，验证 `/api/sync/events/stream` 200
+- 前端 `plant-collab-monitor/src/views/LogsView.vue` 已订阅 `/api/sync/events/stream` 自动 prepend，无需改动
 
-**估时**：1d
+**估时**：实际 ~1.5h（含 cargo check 增量编译 ~38s）
 
 ### B5 · site-config save 自动 graceful restart（G7）
 
@@ -159,13 +168,14 @@
 | Day | Phase | 任务 | 状态 |
 |-----|-------|------|------|
 | **D1** | Phase 8 | B1 + B3 + B7 | ✅ 完成（commit `94bc86e`） |
-| **D2** | Phase 9 | B2 broker logs ring-buffer | ✅ 完成（本会话） |
-| D3-D4 | Phase 10 | B5 graceful shutdown（main.rs 重构） | 待 |
-| D5 | Phase 11 | B6 reload 最小版 | 待 |
-| D6-D7 | Phase 12 | B4 SSE 事件推送 + 跨仓前端联调 | 待 |
+| **D2** | Phase 9 | B2 broker logs ring-buffer | ✅ 完成（commit `c3a38ce`） |
+| **D3** | Phase 12 | B4 SSE 事件推送（后端侧） | ✅ 完成（本会话） |
+| D4-D5 | Phase 10 | B5 graceful shutdown（main.rs 重构） | 待 |
+| D6 | Phase 11 | B6 reload 最小版 | 待 |
+| D7 | Phase 12-Plus | B4 跨仓前端联调（MqttNodesView 订阅 SSE 自动 reload） | 待 |
 | D8 | Phase 7-Plus | 后端联调验收报告 | 待（依赖前述） |
 
-**累计**：~8 人天，已完成 2/6 Phase（本仓 plant-model-gen 范畴）。
+**累计**：~8 人天，已完成 3/6 Phase（本仓 plant-model-gen 范畴）。
 
 ---
 
@@ -228,8 +238,20 @@
   └─ 9.6 git commit Phase 9                                  [ 5 min]
 ```
 
-### Phase 10-12 后续会话推进
+### Phase 12 ✅ 完成（本会话）
+
+```
+[Phase 12 完成]
+  ├─ 12.1 sse_handlers.rs 加 SyncEvent::MqttSubscriptionStatusChanged   [10 min]
+  ├─ 12.2 sync_control_handlers.rs 加 push_subscription_status_event   [10 min]
+  ├─ 12.3 4 处推送注入(set_master/set_client/start/stop)                 [15 min]
+  ├─ 12.4 smoke-collab-api.sh 加 check_sse + [4/5] SSE 块                [10 min]
+  ├─ 12.5 cargo check --features web_server (增量 ~38s)                  [ 1 min]
+  └─ 12.6 git commit Phase 12                                            [ 5 min]
+```
+
+### Phase 10-11 / 12-Plus 后续会话推进
 
 - Phase 10 = B5 graceful shutdown（涉及 main.rs + AppState 重构，工作量 2d）
 - Phase 11 = B6 reload 最小版（依赖 `aios_core::set_db_option_from_file`，0.5-1d）
-- Phase 12 = B4 SSE 事件推送（涉及跨仓 plant-collab-monitor 联调，1d）
+- Phase 12-Plus = B4 跨仓前端联调（MqttNodesView 订阅 SSE 自动 reload `subscription/status`，0.5d）

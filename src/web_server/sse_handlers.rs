@@ -94,6 +94,20 @@ pub enum SyncEvent {
         message: String,
         timestamp: String,
     },
+    /// MQTT 订阅 / 主从角色状态变更（B4）
+    ///
+    /// 触发时机：
+    /// - `set_as_master_node` / `set_as_client_node` 写盘成功
+    /// - `start_mqtt_subscription_api` / `stop_mqtt_subscription_api` 成功
+    ///
+    /// 字段含义与 `GET /api/mqtt/subscription/status` 对齐，便于前端
+    /// `MqttNodesView` / `LogsView` 收到事件后直接 reload 状态。
+    MqttSubscriptionStatusChanged {
+        is_running: bool,
+        is_master_node: bool,
+        location: String,
+        timestamp: String,
+    },
 }
 
 impl SyncEvent {

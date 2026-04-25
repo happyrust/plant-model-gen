@@ -642,6 +642,54 @@ pub async fn client_unsubscribed(
     })))
 }
 
+/// 获取 deployment_sites.sqlite 的实际路径（优先读 DbOption.toml::deployment_sites_sqlite_path，否则用默认）
+pub(crate) fn get_node_config_db_path() -> String {
+    if std::path::Path::new("DbOption.toml").exists() {
+        config::Config::builder()
+            .add_source(config::File::with_name("DbOption"))
+            .build()
+            .ok()
+            .and_then(|b| b.get_string("deployment_sites_sqlite_path").ok())
+            .unwrap_or_else(|| "deployment_sites.sqlite".to_string())
+    } else {
+        "deployment_sites.sqlite".to_string()
+    }
+}
+
+/// 确保 node_config 表存在（schema：location PK + is_master + updated_at）
+pub(crate) fn ensure_node_config_table(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS node_config (
+            location TEXT PRIMARY KEY,
+            is_master BOOLEAN NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// 设置当前节点的主/从标识（写 node_config 表，UPSERT 语义）
+pub(crate) fn set_node_master_flag(
+    location: &str,
+    is_master: bool,
+    db_path: &str,
+) -> rusqlite::Result<()> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    ensure_node_config_table(&conn)?;
+    conn.execute(
+        "INSERT INTO node_config(location, is_master, updated_at) VALUES (?1, ?2, datetime('now'))
+         ON CONFLICT(location) DO UPDATE SET is_master = excluded.is_master, updated_at = datetime('now')",
+        rusqlite::params![location, is_master as i32],
+    )?;
+    Ok(())
+}
+
+/// 检查指定 location 是否为主节点（pub(crate) 供其它 web_server 模块使用）
+pub(crate) fn check_is_master_node(location: &str, db_path: &str) -> bool {
+    check_is_master_node_internal(location, db_path)
+}
+
 // 辅助函数：检查是否为主节点（内部使用）
 fn check_is_master_node_internal(location: &str, db_path: &str) -> bool {
     let conn = match rusqlite::Connection::open(db_path) {
@@ -649,14 +697,9 @@ fn check_is_master_node_internal(location: &str, db_path: &str) -> bool {
         Err(_) => return false,
     };
 
-    let _ = conn.execute(
-        "CREATE TABLE IF NOT EXISTS node_config (
-            location TEXT PRIMARY KEY,
-            is_master BOOLEAN NOT NULL DEFAULT 0,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )",
-        [],
-    );
+    if ensure_node_config_table(&conn).is_err() {
+        return false;
+    }
 
     conn.query_row(
         "SELECT is_master FROM node_config WHERE location = ?1",

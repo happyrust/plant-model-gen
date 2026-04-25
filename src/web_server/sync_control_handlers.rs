@@ -1026,45 +1026,116 @@ pub async fn clear_master_config_api(
 }
 
 /// GET /api/mqtt/subscription/status
+///
+/// 返回字段（与跨仓 plant-collab-monitor `MqttNodesView.vue` 期望对齐）：
+/// - `is_running`：MQTT 订阅 runtime 是否在跑
+/// - `is_server_running`：MQTT broker 是否在跑（占位 false，B4 接入真值）
+/// - `mqtt_server_port`：broker 端口（占位 1883）
+/// - `location`：当前站点 location
+/// - `is_master_node` / `node_role`：来自 `node_config` 表（B1 写入）
+/// - `connection_status`：connected / disconnected
+/// - `master_info`：当前从节点订阅的 master 信息（仅 client 节点）
+/// - `subscribed_topics`：订阅 topic 列表
 pub async fn get_mqtt_subscription_status(
     _state: State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::mqtt_monitor_handlers;
     use crate::web_server::remote_runtime;
 
     let is_running = remote_runtime::REMOTE_RUNTIME.read().await.is_some();
     let location = aios_core::get_db_option().location.clone();
 
+    let db_path = mqtt_monitor_handlers::get_node_config_db_path();
+    let is_master_node = mqtt_monitor_handlers::check_is_master_node(&location, &db_path);
+    let node_role = if is_master_node { "master" } else { "client" };
+
+    // master_info 仅对 client 节点有意义；当前简化为 None，后续可调用
+    // mqtt_monitor_handlers::get_subscribed_master_info（目前仍是私有函数，B4 时再开放）
+    let master_info: Option<serde_json::Value> = None;
+
+    let connection_status = if is_running { "connected" } else { "disconnected" };
+
     Ok(Json(json!({
         "status": "success",
         "is_running": is_running,
+        "is_subscription_running": is_running,
         "is_server_running": false,
+        "mqtt_server_port": 1883,
         "location": location,
+        "is_master_node": is_master_node,
+        "node_role": node_role,
+        "connection_status": connection_status,
+        "master_info": master_info,
         "subscribed_topics": ["Sync/E3d"],
     })))
 }
 
 /// POST /api/mqtt/node/set-master
+///
+/// 写 `node_config` 表（schema 与 mqtt_monitor_handlers::ensure_node_config_table 一致）。
+/// 不写 DbOption.toml（DbOption 中无 is_master 字段，location 由部署期固定）。
+/// 操作完成后下次 `subscription/status` 即返回 is_master_node=true。
 pub async fn set_as_master_node(
     _state: State<AppState>,
-    Json(_req): Json<SetNodeRequest>,
+    Json(req): Json<SetNodeRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO(Phase 后续): 写入 DbOption.toml 与 deployment_sites.sqlite 的主节点标识
-    log::warn!("⚠️  [mqtt] set_as_master_node 尚未接入完整实现");
-    Ok(Json(json!({
-        "status": "success",
-        "message": "已标记为主节点 (简化模式, 需手动重启生效)"
-    })))
+    use crate::web_server::mqtt_monitor_handlers;
+
+    let location = req
+        .location
+        .unwrap_or_else(|| aios_core::get_db_option().location.clone());
+
+    let db_path = mqtt_monitor_handlers::get_node_config_db_path();
+    match mqtt_monitor_handlers::set_node_master_flag(&location, true, &db_path) {
+        Ok(_) => {
+            log::info!("✅ [mqtt] {} 已标记为主节点（写入 node_config）", location);
+            Ok(Json(json!({
+                "status": "success",
+                "message": format!("已标记 {} 为主节点", location),
+                "location": location,
+                "is_master_node": true,
+            })))
+        }
+        Err(e) => {
+            log::error!("❌ [mqtt] set_as_master_node 写盘失败: {}", e);
+            Ok(Json(json!({
+                "status": "error",
+                "message": format!("写入主节点标识失败: {}", e),
+            })))
+        }
+    }
 }
 
 /// POST /api/mqtt/node/set-client
+///
+/// 与 `set_as_master_node` 对偶；将 `is_master` 写为 false。
 pub async fn set_as_client_node(
     _state: State<AppState>,
-    Json(_req): Json<SetNodeRequest>,
+    Json(req): Json<SetNodeRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO(Phase 后续): 写入 DbOption.toml 与 deployment_sites.sqlite 的从节点标识
-    log::warn!("⚠️  [mqtt] set_as_client_node 尚未接入完整实现");
-    Ok(Json(json!({
-        "status": "success",
-        "message": "已标记为从节点 (简化模式, 需手动重启生效)"
-    })))
+    use crate::web_server::mqtt_monitor_handlers;
+
+    let location = req
+        .location
+        .unwrap_or_else(|| aios_core::get_db_option().location.clone());
+
+    let db_path = mqtt_monitor_handlers::get_node_config_db_path();
+    match mqtt_monitor_handlers::set_node_master_flag(&location, false, &db_path) {
+        Ok(_) => {
+            log::info!("✅ [mqtt] {} 已标记为从节点（写入 node_config）", location);
+            Ok(Json(json!({
+                "status": "success",
+                "message": format!("已标记 {} 为从节点", location),
+                "location": location,
+                "is_master_node": false,
+            })))
+        }
+        Err(e) => {
+            log::error!("❌ [mqtt] set_as_client_node 写盘失败: {}", e);
+            Ok(Json(json!({
+                "status": "error",
+                "message": format!("写入从节点标识失败: {}", e),
+            })))
+        }
+    }
 }

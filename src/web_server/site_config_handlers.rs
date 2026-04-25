@@ -385,23 +385,154 @@ pub async fn restart_server(
     })))
 }
 
-/// 重载站点配置（热重载可更新项），并按需重启运行态组件
+/// 「理论上可热改」的 DbOption 字段白名单（B6 · Phase 11）
 ///
-/// TODO(Phase 后续): 迁入 web-server 的 `config_reload_manager` 模块与
-///   `sync_control_center::get_location` 函数后恢复完整实现。
-///   当前 stub 仅清空 `aios_core` 全局 DbOption 缓存，提示用户手动重启以生效。
+/// 标记规则：不影响已建立的连接 / 已加载的索引 / 已订阅的 MQTT 的字段。
+///
+/// ⚠️ 本 Phase 11 (最小可用版) 不真正应用这些字段——`aios_core::get_db_option`
+/// 内部为 `OnceCell::get_or_init`，不可变。白名单仅用于响应分类提示
+/// 「这些不一定要重启」vs「这些一定要重启」。
+///
+/// 后续 rs-core 改动将 OnceCell → RwLock<Arc<DbOption>> 后，
+/// 即可一键升级为真正的热加载（详见 docs/plans/2026-04-26-sprint-b-phase11-b6-reload.md §6）。
+///
+/// ⚠️ 注：此白名单需与 `aios_core::options::DbOption` 字段定义保持同步，
+/// 新增字段时按是否影响运行态决定是否纳入。
+const HOT_RELOADABLE_KEYS: &[&str] = &[
+    "enable_log",
+    "mesh_tol_ratio",
+    "gen_model",
+    "gen_spatial_tree",
+    "load_spatial_tree",
+    "apply_boolean_operation",
+    "build_cate_relate",
+    "sync_chunk_size",
+    "parse_channel_capacity",
+    "parse_mode",
+    "incr_sync",
+    "total_sync",
+];
+
+/// 字段级 diff（hot vs static）
+///
+/// 通过 serde_json 做 key-by-key 比较；任一字段值变化按 HOT_RELOADABLE_KEYS
+/// 白名单分流到 hot / static 两组。
+fn diff_db_option(
+    current: &aios_core::options::DbOption,
+    new: &aios_core::options::DbOption,
+) -> (Vec<String>, Vec<String>) {
+    let cur_v = serde_json::to_value(current).unwrap_or(json!({}));
+    let new_v = serde_json::to_value(new).unwrap_or(json!({}));
+    let cur_obj = cur_v.as_object().cloned().unwrap_or_default();
+    let new_obj = new_v.as_object().cloned().unwrap_or_default();
+
+    let mut hot = Vec::new();
+    let mut stat = Vec::new();
+    let all_keys: std::collections::BTreeSet<_> =
+        cur_obj.keys().chain(new_obj.keys()).cloned().collect();
+
+    for k in all_keys {
+        if cur_obj.get(&k) != new_obj.get(&k) {
+            if HOT_RELOADABLE_KEYS.contains(&k.as_str()) {
+                hot.push(k);
+            } else {
+                stat.push(k);
+            }
+        }
+    }
+    (hot, stat)
+}
+
+/// 重载站点配置（B6 · Phase 11 最小可用版）
+///
+/// 行为：重新读 `${DB_OPTION_FILE}.toml` → 解析 → 与当前内存 `DbOption` 做字段 diff
+/// → 返回 hot / static 分类清单 + `requires_restart` 标志。
+///
+/// **本版本不真正应用配置变更**——`aios_core::get_db_option` 为 OnceCell，
+/// 全局静态不可变。本端点的语义是「字段变更检测 + 用户告知」，让前端
+/// SettingsView 能清楚展示「我改了哪些字段、哪些必须重启」。
+///
+/// 升级路径见 `docs/plans/2026-04-26-sprint-b-phase11-b6-reload.md §6`。
 #[cfg(feature = "web_server")]
 pub async fn reload_site_config(
     _state: State<crate::web_server::AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    log::warn!("⚠️  [站点配置] reload 采用最小实现：未接入 config_reload_manager，请手动重启");
+    let toml_path = get_db_option_path();
+
+    // 1. 读文件
+    let content = match fs::read_to_string(&toml_path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("❌ [站点配置] reload 读取 {} 失败: {}", toml_path, e);
+            return Ok(Json(json!({
+                "status": "error",
+                "message": format!("读取 {} 失败: {}", toml_path, e),
+                "hot_changed_keys": [],
+                "static_changed_keys": [],
+                "requires_restart": false,
+                "actions": ["read_failed"],
+            })));
+        }
+    };
+
+    // 2. 解析 toml → DbOption
+    let new_option: aios_core::options::DbOption = match toml::from_str(&content) {
+        Ok(o) => o,
+        Err(e) => {
+            log::error!("❌ [站点配置] reload 解析 {} 失败: {}", toml_path, e);
+            return Ok(Json(json!({
+                "status": "error",
+                "message": format!("解析 {} 失败: {}", toml_path, e),
+                "hot_changed_keys": [],
+                "static_changed_keys": [],
+                "requires_restart": false,
+                "actions": ["parse_failed"],
+            })));
+        }
+    };
+
+    // 3. 字段 diff
+    let current = aios_core::get_db_option();
+    let (hot_changed, static_changed) = diff_db_option(current, &new_option);
+
+    let requires_restart = !static_changed.is_empty();
+    let no_change = hot_changed.is_empty() && static_changed.is_empty();
+
+    let actions: Vec<&str> = if no_change {
+        vec!["no_change"]
+    } else if requires_restart {
+        vec!["manual_restart_required"]
+    } else {
+        vec!["log_only"]
+    };
+
+    let message = if no_change {
+        "配置文件与当前运行时完全一致，无需操作".to_string()
+    } else if requires_restart {
+        format!(
+            "检测到 {} 项静态字段变更（需重启）+ {} 项可热改字段；当前版本统一以重启生效",
+            static_changed.len(),
+            hot_changed.len()
+        )
+    } else {
+        format!(
+            "检测到 {} 项可热改字段；当前版本仍需手动重启才能真正生效（OnceCell 限制）",
+            hot_changed.len()
+        )
+    };
+
+    log::info!(
+        "ℹ️  [站点配置] reload diff: hot={:?} static={:?} requires_restart={}",
+        hot_changed, static_changed, requires_restart
+    );
+
     Ok(Json(json!({
         "status": "success",
-        "message": "配置已落盘，热重载机制尚未接入，请手动重启服务器以使配置生效",
-        "hot_changed_keys": [],
-        "static_changed_keys": [],
-        "requires_restart": true,
-        "actions": ["manual_restart_required"],
+        "message": message,
+        "hot_changed_keys": hot_changed,
+        "static_changed_keys": static_changed,
+        "requires_restart": requires_restart,
+        "actions": actions,
     })))
 }
 

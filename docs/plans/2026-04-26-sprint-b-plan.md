@@ -108,18 +108,26 @@
 
 **估时**：2d
 
-### B6 · `reload_site_config` 真实现（G7）
+### B6 · `reload_site_config` 真实现（G7）✅ Phase 11 完成
 
 **位置**：`src/web_server/site_config_handlers.rs:388-406`
 
-**现状**：纯 stub。`config_reload_manager` 模块在仓库中**不存在**。
+**核查结论**（本会话）：plan §1.B6 假设的 `aios_core::set_db_option_from_file` **不存在**；`get_db_option()` 是 `OnceCell::get_or_init`，全局静态不可变；想真热重载必须改 rs-core。
 
-**改造方案 A（最小可用）**：
-- 重新加载 `aios_core::set_db_option_from_file()` 把 toml 解析后写回全局 DbOption
-- 不重启 mqtt 订阅 / sync runtime（让用户手动重启获取热改）
-- 返回 `hot_changed_keys: ["mesh_tol_ratio", "gen_*"]`，`requires_restart: true` for 其他 key
+**已落地**（commit Phase 11，遵循 `docs/plans/2026-04-26-sprint-b-phase11-b6-reload.md`）：
+- 新增常量 `HOT_RELOADABLE_KEYS`（12 字段白名单：enable_log / mesh_tol_ratio / gen_* / sync_chunk_size 等）
+- 新增 `diff_db_option(current, new)` 用 `serde_json::to_value` 做字段级 diff
+- `reload_site_config` 重写：
+  - 读 `${DB_OPTION_FILE}.toml` → toml::from_str → DbOption
+  - 与当前 `aios_core::get_db_option()` diff
+  - 返回 `{ status, hot_changed_keys, static_changed_keys, requires_restart, actions, message }`
+  - actions ∈ { "no_change", "log_only", "manual_restart_required", "read_failed", "parse_failed" }
+- **本版本不真正应用配置变更**（OnceCell 限制）；语义为「字段变更检测 + 用户告知」
+- 文件错/解析错走 `status: "error"`，HTTP 200 兼顾前端 UX
 
-**估时**：1d（最小版 0.5d）
+**升级路径**：rs-core OnceCell → RwLock<Arc<DbOption>> 后，hot_changed 非空时调 `set_db_option_from_file()`，actions 升级为 `["hot_reloaded"]`。属跨仓改动，留独立会话。
+
+**估时**：实际 ~30 min（较 plan 0.5-1d 缩短，因不动 rs-core）
 
 ### B7 · 后端冒烟脚本（B/C 共同退出条件）
 
@@ -169,13 +177,14 @@
 |-----|-------|------|------|
 | **D1** | Phase 8 | B1 + B3 + B7 | ✅ 完成（commit `94bc86e`） |
 | **D2** | Phase 9 | B2 broker logs ring-buffer | ✅ 完成（commit `c3a38ce`） |
-| **D3** | Phase 12 | B4 SSE 事件推送（后端侧） | ✅ 完成（本会话） |
+| **D3** | Phase 12 | B4 SSE 事件推送（后端侧） | ✅ 完成（commit `5463e41`） |
+| **D3** | Phase 11 | B6 reload 最小版（diff + 分类响应） | ✅ 完成（本会话） |
 | D4-D5 | Phase 10 | B5 graceful shutdown（main.rs 重构） | 待 |
-| D6 | Phase 11 | B6 reload 最小版 | 待 |
-| D7 | Phase 12-Plus | B4 跨仓前端联调（MqttNodesView 订阅 SSE 自动 reload） | 待 |
+| D6 | Phase 12-Plus | B4 跨仓前端联调（MqttNodesView 订阅 SSE 自动 reload） | 待 |
+| D7 | Phase 11-Plus | B6 真热加载（rs-core OnceCell → RwLock，跨仓改动） | 待 |
 | D8 | Phase 7-Plus | 后端联调验收报告 | 待（依赖前述） |
 
-**累计**：~8 人天，已完成 3/6 Phase（本仓 plant-model-gen 范畴）。
+**累计**：~8 人天，已完成 4/7 Phase（本仓 plant-model-gen 范畴）。
 
 ---
 
@@ -241,7 +250,7 @@
 ### Phase 12 ✅ 完成（本会话）
 
 ```
-[Phase 12 完成]
+[Phase 12 完成 · commit 5463e41]
   ├─ 12.1 sse_handlers.rs 加 SyncEvent::MqttSubscriptionStatusChanged   [10 min]
   ├─ 12.2 sync_control_handlers.rs 加 push_subscription_status_event   [10 min]
   ├─ 12.3 4 处推送注入(set_master/set_client/start/stop)                 [15 min]
@@ -250,8 +259,19 @@
   └─ 12.6 git commit Phase 12                                            [ 5 min]
 ```
 
-### Phase 10-11 / 12-Plus 后续会话推进
+### Phase 11 ✅ 完成（本会话）
+
+```
+[Phase 11 完成]
+  ├─ 11.0 写 docs/plans/2026-04-26-sprint-b-phase11-b6-reload.md (子计划)  [10 min]
+  ├─ 11.1 site_config_handlers.rs 加 HOT_RELOADABLE_KEYS + diff_db_option   [10 min]
+  ├─ 11.2 重写 reload_site_config (读 toml + diff + 分类返回)                [15 min]
+  ├─ 11.3 cargo check --features web_server (增量 ~14s)                     [ 1 min]
+  └─ 11.4 git commit Phase 11                                                [ 5 min]
+```
+
+### Phase 10 / 11-Plus / 12-Plus 后续会话推进
 
 - Phase 10 = B5 graceful shutdown（涉及 main.rs + AppState 重构，工作量 2d）
-- Phase 11 = B6 reload 最小版（依赖 `aios_core::set_db_option_from_file`，0.5-1d）
+- Phase 11-Plus = B6 真热加载（rs-core OnceCell → RwLock<Arc<DbOption>>，跨仓改动需独立会话）
 - Phase 12-Plus = B4 跨仓前端联调（MqttNodesView 订阅 SSE 自动 reload `subscription/status`，0.5d）

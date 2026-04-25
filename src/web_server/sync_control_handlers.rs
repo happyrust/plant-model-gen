@@ -929,15 +929,40 @@ pub struct SetNodeRequest {
     pub location: Option<String>,
 }
 
-/// GET /api/mqtt/broker/logs — 简化: 返回空日志
+/// GET /api/mqtt/broker/logs
+///
+/// 读取进程内 ring-buffer（容量 200）的 MQTT broker 操作日志。
+///
+/// Query：
+/// - `limit`：返回最近 N 条（默认 200，上限 200）
+///
+/// 响应：
+/// ```json
+/// { "status": "success",
+///   "count": 12,
+///   "capacity": 200,
+///   "logs": [{ "timestamp": "...", "level": "info", "event": "set_master",
+///             "location": "BJ", "message": "..." }, ...] }
+/// ```
 pub async fn get_mqtt_broker_logs_api(
     _state: State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO(Phase 后续): 接入 sync_control_center::get_mqtt_broker_logs
+    use crate::web_server::mqtt_monitor_handlers;
+
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(mqtt_monitor_handlers::BROKER_LOG_CAPACITY)
+        .min(mqtt_monitor_handlers::BROKER_LOG_CAPACITY);
+
+    let logs = mqtt_monitor_handlers::read_broker_logs(Some(limit)).await;
+
     Ok(Json(json!({
         "status": "success",
-        "logs": [],
-        "count": 0
+        "count": logs.len(),
+        "capacity": mqtt_monitor_handlers::BROKER_LOG_CAPACITY,
+        "logs": logs,
     })))
 }
 
@@ -946,10 +971,12 @@ pub async fn start_mqtt_subscription_api(
     _state: State<AppState>,
     request: Option<Json<StartSubscriptionRequest>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::mqtt_monitor_handlers;
     use crate::web_server::remote_runtime;
 
     let request = request.map(|Json(r)| r).unwrap_or_default();
     let env_id = request.env_id.unwrap_or_else(|| "default".to_string());
+    let location = aios_core::get_db_option().location.clone();
 
     {
         let guard = remote_runtime::REMOTE_RUNTIME.read().await;
@@ -961,15 +988,33 @@ pub async fn start_mqtt_subscription_api(
         }
     }
 
-    match remote_runtime::start_runtime(env_id).await {
-        Ok(_) => Ok(Json(json!({
-            "status": "success",
-            "message": "MQTT 订阅已启动 (简化模式)"
-        }))),
-        Err(e) => Ok(Json(json!({
-            "status": "error",
-            "message": format!("启动失败: {}", e)
-        }))),
+    match remote_runtime::start_runtime(env_id.clone()).await {
+        Ok(_) => {
+            mqtt_monitor_handlers::push_broker_log(
+                "info",
+                "subscription_started",
+                Some(&location),
+                format!("MQTT 订阅已启动（env={}，简化模式）", env_id),
+            )
+            .await;
+            Ok(Json(json!({
+                "status": "success",
+                "message": "MQTT 订阅已启动 (简化模式)"
+            })))
+        }
+        Err(e) => {
+            mqtt_monitor_handlers::push_broker_log(
+                "error",
+                "subscription_failed",
+                Some(&location),
+                format!("MQTT 订阅启动失败（env={}）: {}", env_id, e),
+            )
+            .await;
+            Ok(Json(json!({
+                "status": "error",
+                "message": format!("启动失败: {}", e)
+            })))
+        }
     }
 }
 
@@ -977,11 +1022,21 @@ pub async fn start_mqtt_subscription_api(
 pub async fn stop_mqtt_subscription_api(
     _state: State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::mqtt_monitor_handlers;
     use crate::web_server::remote_runtime;
 
+    let location = aios_core::get_db_option().location.clone();
     let mut guard = remote_runtime::REMOTE_RUNTIME.write().await;
     if guard.is_some() {
         *guard = None;
+        drop(guard);
+        mqtt_monitor_handlers::push_broker_log(
+            "info",
+            "subscription_stopped",
+            Some(&location),
+            "MQTT 订阅已停止",
+        )
+        .await;
         Ok(Json(json!({
             "status": "success",
             "message": "MQTT 订阅已停止"
@@ -1013,15 +1068,37 @@ pub async fn clear_master_config_internal() -> anyhow::Result<()> {
 pub async fn clear_master_config_api(
     _state: State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::mqtt_monitor_handlers;
+
+    let location = aios_core::get_db_option().location.clone();
+
     match clear_master_config_internal().await {
-        Ok(_) => Ok(Json(json!({
-            "status": "success",
-            "message": "主节点配置已清除"
-        }))),
-        Err(e) => Ok(Json(json!({
-            "status": "error",
-            "message": format!("清除失败: {}", e)
-        }))),
+        Ok(_) => {
+            mqtt_monitor_handlers::push_broker_log(
+                "info",
+                "clear_master_config",
+                Some(&location),
+                "已清除当前站点的主节点订阅配置",
+            )
+            .await;
+            Ok(Json(json!({
+                "status": "success",
+                "message": "主节点配置已清除"
+            })))
+        }
+        Err(e) => {
+            mqtt_monitor_handlers::push_broker_log(
+                "error",
+                "clear_master_config",
+                Some(&location),
+                format!("清除主节点配置失败: {}", e),
+            )
+            .await;
+            Ok(Json(json!({
+                "status": "error",
+                "message": format!("清除失败: {}", e)
+            })))
+        }
     }
 }
 
@@ -1089,6 +1166,13 @@ pub async fn set_as_master_node(
     match mqtt_monitor_handlers::set_node_master_flag(&location, true, &db_path) {
         Ok(_) => {
             log::info!("✅ [mqtt] {} 已标记为主节点（写入 node_config）", location);
+            mqtt_monitor_handlers::push_broker_log(
+                "info",
+                "set_master",
+                Some(&location),
+                format!("{} 已标记为主节点（node_config 写入成功）", location),
+            )
+            .await;
             Ok(Json(json!({
                 "status": "success",
                 "message": format!("已标记 {} 为主节点", location),
@@ -1098,6 +1182,13 @@ pub async fn set_as_master_node(
         }
         Err(e) => {
             log::error!("❌ [mqtt] set_as_master_node 写盘失败: {}", e);
+            mqtt_monitor_handlers::push_broker_log(
+                "error",
+                "set_master",
+                Some(&location),
+                format!("set_as_master_node 写盘失败: {}", e),
+            )
+            .await;
             Ok(Json(json!({
                 "status": "error",
                 "message": format!("写入主节点标识失败: {}", e),
@@ -1123,6 +1214,13 @@ pub async fn set_as_client_node(
     match mqtt_monitor_handlers::set_node_master_flag(&location, false, &db_path) {
         Ok(_) => {
             log::info!("✅ [mqtt] {} 已标记为从节点（写入 node_config）", location);
+            mqtt_monitor_handlers::push_broker_log(
+                "info",
+                "set_client",
+                Some(&location),
+                format!("{} 已标记为从节点（node_config 写入成功）", location),
+            )
+            .await;
             Ok(Json(json!({
                 "status": "success",
                 "message": format!("已标记 {} 为从节点", location),
@@ -1132,6 +1230,13 @@ pub async fn set_as_client_node(
         }
         Err(e) => {
             log::error!("❌ [mqtt] set_as_client_node 写盘失败: {}", e);
+            mqtt_monitor_handlers::push_broker_log(
+                "error",
+                "set_client",
+                Some(&location),
+                format!("set_as_client_node 写盘失败: {}", e),
+            )
+            .await;
             Ok(Json(json!({
                 "status": "error",
                 "message": format!("写入从节点标识失败: {}", e),

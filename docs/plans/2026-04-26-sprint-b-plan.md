@@ -36,18 +36,30 @@
 
 **估时**：30 min
 
-### B2 · `get_mqtt_broker_logs_api`（G6）
+### B2 · `get_mqtt_broker_logs_api`（G6）✅ Phase 9 完成
 
-**位置**：`src/web_server/sync_control_handlers.rs:932-942`
+**位置**：`src/web_server/sync_control_handlers.rs` + `src/web_server/mqtt_monitor_handlers.rs`
 
-**现状**：返回空数组。前端 MqttNodesView "查看日志"永远空。
+**已落地**（commit Phase 9）：
+- `mqtt_monitor_handlers.rs` 新增：
+  - `BrokerLogEntry { timestamp, level, event, location, message }`
+  - `BROKER_LOG_CAPACITY = 200`
+  - `MQTT_BROKER_LOGS: Arc<RwLock<VecDeque<BrokerLogEntry>>>`
+  - `push_broker_log(level, event, location, message)` helper
+  - `read_broker_logs(limit)` helper（按时间倒序，最新在前）
+- 注入 push_broker_log 时机：
+  - `update_node_heartbeat` 节点首次上线 / 离线恢复
+  - `check_offline_nodes` 节点心跳超时（仅 online→offline 翻转）
+  - `update_subscription_status` ConnAck 状态切换
+  - `set_as_master_node` / `set_as_client_node` 写盘成功/失败
+  - `start_mqtt_subscription_api` / `stop_mqtt_subscription_api`
+  - `clear_master_config_api` 清主配置
+- `get_mqtt_broker_logs_api` 改造：
+  - 支持 `?limit=N`（默认 200，上限 200）
+  - 返回 `{ status, count, capacity, logs }`
+- `shells/smoke-collab-api.sh` 增加 `?limit=10` + `set_master` 字段命中校验
 
-**改造方案**：
-- 简化路径：在 `mqtt_monitor_handlers.rs` 模块内开 ring-buffer（`Arc<RwLock<VecDeque<LogEntry>>>` cap=200）
-- 关键 mqtt 操作（节点上下线/订阅状态变化）push 一条日志
-- `get_mqtt_broker_logs_api` 读 buffer 返回
-
-**估时**：1d（简化版 0.5d）
+**估时**：实际 ~1.5h（含编辑+cargo check）
 
 ### B3 · `get_mqtt_subscription_status` 字段补齐（G6）
 
@@ -144,16 +156,16 @@
 
 ## 3. 完整 Sprint B 时间线（理想节奏）
 
-| Day | 任务 |
-|-----|------|
-| **D1** Phase 8 | B1 + B3 + B7（本会话） |
-| D2 | B2 broker logs ring-buffer |
-| D3-D4 | B5 graceful shutdown（涉及 main.rs 重构） |
-| D5 | B6 reload 最小版 |
-| D6-D7 | B4 SSE 事件推送 + 跨仓前端联调 |
-| D8 | Phase 7-Plus 后端联调验收报告 |
+| Day | Phase | 任务 | 状态 |
+|-----|-------|------|------|
+| **D1** | Phase 8 | B1 + B3 + B7 | ✅ 完成（commit `94bc86e`） |
+| **D2** | Phase 9 | B2 broker logs ring-buffer | ✅ 完成（本会话） |
+| D3-D4 | Phase 10 | B5 graceful shutdown（main.rs 重构） | 待 |
+| D5 | Phase 11 | B6 reload 最小版 | 待 |
+| D6-D7 | Phase 12 | B4 SSE 事件推送 + 跨仓前端联调 | 待 |
+| D8 | Phase 7-Plus | 后端联调验收报告 | 待（依赖前述） |
 
-**累计**：~8 人天
+**累计**：~8 人天，已完成 2/6 Phase（本仓 plant-model-gen 范畴）。
 
 ---
 
@@ -191,15 +203,33 @@
 
 ---
 
-## 6. 立即执行（Phase 8）
+## 6. 立即执行节奏
+
+### Phase 8 ✅ 完成
 
 ```
-[Phase 8 开始]
-  │
+[Phase 8 完成 · commit 94bc86e]
   ├─ 8.1 B1 set_as_master/client 改造          [30 min]
   ├─ 8.2 B3 subscription/status 字段补齐       [20 min]
   ├─ 8.3 B7 smoke-collab-api.sh                [30 min]
   ├─ 8.4 cargo check --features web_server     [5-10 min]
   └─ 8.5 git commit Phase 8                    [ 5 min]
-[Phase 8 完成 · ~1.5h（含编译时长）]
 ```
+
+### Phase 9 ✅ 完成（本会话）
+
+```
+[Phase 9 完成]
+  ├─ 9.1 mqtt_monitor_handlers.rs 加 ring-buffer + helper   [20 min]
+  ├─ 9.2 注入 push_broker_log（6 处时机）                    [30 min]
+  ├─ 9.3 sync_control_handlers::get_mqtt_broker_logs_api    [10 min]
+  ├─ 9.4 smoke-collab-api.sh 增加 broker/logs 校验           [ 5 min]
+  ├─ 9.5 cargo check --features web_server (增量 ~30s)      [ 1 min]
+  └─ 9.6 git commit Phase 9                                  [ 5 min]
+```
+
+### Phase 10-12 后续会话推进
+
+- Phase 10 = B5 graceful shutdown（涉及 main.rs + AppState 重构，工作量 2d）
+- Phase 11 = B6 reload 最小版（依赖 `aios_core::set_db_option_from_file`，0.5-1d）
+- Phase 12 = B4 SSE 事件推送（涉及跨仓 plant-collab-monitor 联调，1d）

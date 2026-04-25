@@ -105,10 +105,12 @@ echo "[3/4] MQTT 节点 / 订阅"
 check GET  /api/mqtt/nodes                      "2.." "summary"
 check GET  /api/mqtt/messages                   "2.."
 check GET  /api/mqtt/subscription/status        "200" "is_master_node"
-check GET  /api/mqtt/broker/logs                "2.."
+check GET  /api/mqtt/broker/logs                "200" "capacity"
 check POST /api/mqtt/node/set-client            "200" "is_master_node"
 check POST /api/mqtt/node/set-master            "200" "is_master_node"
 check GET  /api/mqtt/subscription/status        "200" "is_master_node"
+# B2 验证：set-master/set-client 之后应至少 push 2 条 broker log
+check GET  /api/mqtt/broker/logs?limit=10       "200" "set_master"
 
 echo
 echo "[4/4] 异地协同 (admin-gated · 503/401/403 视为预期)"

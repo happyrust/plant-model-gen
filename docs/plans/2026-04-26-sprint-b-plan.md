@@ -178,13 +178,13 @@
 | **D1** | Phase 8 | B1 + B3 + B7 | ✅ 完成（commit `94bc86e`） |
 | **D2** | Phase 9 | B2 broker logs ring-buffer | ✅ 完成（commit `c3a38ce`） |
 | **D3** | Phase 12 | B4 SSE 事件推送（后端侧） | ✅ 完成（commit `5463e41`） |
-| **D3** | Phase 11 | B6 reload 最小版（diff + 分类响应） | ✅ 完成（本会话） |
-| D4-D5 | Phase 10 | B5 graceful shutdown（main.rs 重构） | 待 |
-| D6 | Phase 12-Plus | B4 跨仓前端联调（MqttNodesView 订阅 SSE 自动 reload） | 待 |
-| D7 | Phase 11-Plus | B6 真热加载（rs-core OnceCell → RwLock，跨仓改动） | 待 |
-| D8 | Phase 7-Plus | 后端联调验收报告 | 待（依赖前述） |
+| **D3** | Phase 11 | B6 reload 最小版（diff + 分类响应） | ✅ 完成（commit `2286cd2`） |
+| **D3** | Phase 12-Plus | B4 跨仓前端联调（MqttNodesView 订阅 SSE 自动 reload） | ✅ 完成（plant-collab-monitor commit `e9aab96`） |
+| **D3** | Phase 7-Plus | 后端联调验收报告（4 Phase 全实测） | ✅ 完成（本会话） |
+| D4-D5 | Phase 10 | B5 graceful shutdown（main.rs 重构） | 待（需独立会话） |
+| D6 | Phase 11-Plus | B6 真热加载（rs-core OnceCell → RwLock，跨仓改动） | 待（跨仓） |
 
-**累计**：~8 人天，已完成 4/7 Phase（本仓 plant-model-gen 范畴）。
+**累计**：~8 人天，已完成 6/7 Phase（本仓 plant-model-gen 范畴 + 跨仓 1 个）。仅 Phase 10 / Phase 11-Plus 留待后续。
 
 ---
 

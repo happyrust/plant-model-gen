@@ -11,7 +11,7 @@ import {
   TimerReset,
 } from 'lucide-vue-next'
 import { extractErrorMessage } from '@/api/client'
-import { sitesApi } from '@/api/sites'
+import { sitesApi, type ManagedSiteLogKind } from '@/api/sites'
 import { usePolling } from '@/composables/usePolling'
 import { useSitesStore } from '@/stores/sites'
 import SiteDetailHeader from '@/components/sites/SiteDetailHeader.vue'
@@ -42,8 +42,40 @@ const siteError = ref('')
 const runtimeError = ref('')
 const logsError = ref('')
 const activeTab = ref<'overview' | 'deploy'>('overview')
-const activeLogTab = ref<'parse' | 'db' | 'web'>('parse')
+const activeLogTab = ref<ManagedSiteLogKind>('parse')
 const drawerOpen = ref(false)
+const downloadPending = ref(false)
+const downloadError = ref('')
+
+// D5 / Sprint D · 修 G13：分页尾部日志 + 全量下载
+//
+// 旧版直接用 logsData.parse_log/db_log/web_log（后端硬编码 LOG_LINES_LIMIT=120 行，
+// 无加载更多、无下载入口）；新版按 tab 单独 fetch tailLog，limit 从 200 起步，
+// 用户点"加载更多"按 2 倍递增至上限 5000；下载走 Authorization 头 + blob 路径。
+const LOG_LIMIT_INITIAL = 200
+const LOG_LIMIT_MAX = 5000
+
+interface DetailLogState {
+  lines: string[]
+  total: number
+  limit: number
+  truncated: boolean
+  loading: boolean
+}
+
+const emptyLogState = (): DetailLogState => ({
+  lines: [],
+  total: 0,
+  limit: LOG_LIMIT_INITIAL,
+  truncated: false,
+  loading: false,
+})
+
+const detailLogs = ref<Record<ManagedSiteLogKind, DetailLogState>>({
+  parse: emptyLogState(),
+  db: emptyLogState(),
+  web: emptyLogState(),
+})
 
 const siteId = computed(() => String(route.params.id ?? ''))
 const resources = computed(() => runtime.value?.resources ?? null)
@@ -55,12 +87,8 @@ const matchedPreset = computed(() => matchParsePreset(
   site.value?.force_rebuild_system_db ?? false,
 ))
 
-const selectedLogs = computed(() => {
-  if (logsData.value === null) return []
-  if (activeLogTab.value === 'parse') return logsData.value.parse_log
-  if (activeLogTab.value === 'db') return logsData.value.db_log
-  return logsData.value.web_log
-})
+const selectedLogState = computed(() => detailLogs.value[activeLogTab.value])
+const selectedLogs = computed(() => selectedLogState.value.lines)
 
 const processCards = computed(() => [
   {
@@ -113,6 +141,76 @@ async function fetchAll() {
     logsError.value = ''
   } catch (err: unknown) {
     logsError.value = extractErrorMessage(err)
+  }
+
+  // 跟随当前 tab 刷新一次详情日志（保留用户已"加载更多"的 limit）
+  await fetchKindLog(activeLogTab.value)
+}
+
+async function fetchKindLog(kind: ManagedSiteLogKind, overrideLimit?: number) {
+  const cur = detailLogs.value[kind]
+  const limit = Math.min(overrideLimit ?? cur.limit ?? LOG_LIMIT_INITIAL, LOG_LIMIT_MAX)
+  cur.loading = true
+  try {
+    const r = await sitesApi.tailLog(siteId.value, kind, limit)
+    detailLogs.value[kind] = {
+      lines: r.lines,
+      total: r.total_lines,
+      limit: r.limit,
+      truncated: r.truncated,
+      loading: false,
+    }
+    logsError.value = ''
+  } catch (err: unknown) {
+    detailLogs.value[kind].loading = false
+    logsError.value = extractErrorMessage(err)
+  }
+}
+
+function onLogTabChange(tab: ManagedSiteLogKind) {
+  activeLogTab.value = tab
+  if (detailLogs.value[tab].lines.length === 0 && !detailLogs.value[tab].loading) {
+    void fetchKindLog(tab)
+  }
+}
+
+async function loadMoreLog() {
+  const kind = activeLogTab.value
+  const cur = detailLogs.value[kind]
+  const next = Math.min(cur.limit * 2, LOG_LIMIT_MAX)
+  if (next === cur.limit) return
+  await fetchKindLog(kind, next)
+}
+
+async function downloadLog() {
+  const kind = activeLogTab.value
+  downloadPending.value = true
+  downloadError.value = ''
+  try {
+    const token = localStorage.getItem('admin_token')
+    const url = sitesApi.logDownloadUrl(siteId.value, kind)
+    const resp = await fetch(url, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+    if (!resp.ok) {
+      throw new Error(`下载失败 (HTTP ${resp.status})`)
+    }
+    const blob = await resp.blob()
+    const cd = resp.headers.get('content-disposition') ?? ''
+    const m = /filename="([^"]+)"/.exec(cd)
+    const filename = m?.[1] ?? `${siteId.value}-${kind}.log`
+    const objUrl = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = objUrl
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(objUrl), 0)
+  } catch (err: unknown) {
+    downloadError.value = err instanceof Error ? err.message : '下载失败'
+  } finally {
+    downloadPending.value = false
   }
 }
 
@@ -581,19 +679,46 @@ onMounted(async () => {
       <SiteLogSummaryPanel v-if="logsData?.streams" :streams="logsData.streams" />
 
       <div class="rounded-lg border border-border bg-card">
-        <div class="flex items-center gap-2 border-b border-border px-4 py-2">
-          <button
-            v-for="tab in (['parse', 'db', 'web'] as const)"
-            :key="tab"
-            @click="activeLogTab = tab"
-            class="rounded-md px-3 py-1 text-xs font-medium transition-colors"
-            :class="activeLogTab === tab ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:text-foreground'"
-          >
-            {{ tab === 'parse' ? '解析日志' : tab === 'db' ? 'DB 日志' : 'Web 日志' }}
-          </button>
+        <div class="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-2">
+          <div class="flex flex-wrap items-center gap-2">
+            <button
+              v-for="tab in (['parse', 'db', 'web'] as const)"
+              :key="tab"
+              @click="onLogTabChange(tab)"
+              class="rounded-md px-3 py-1 text-xs font-medium transition-colors"
+              :class="activeLogTab === tab ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:text-foreground'"
+            >
+              {{ tab === 'parse' ? '解析日志' : tab === 'db' ? 'DB 日志' : 'Web 日志' }}
+            </button>
+            <span class="text-xs text-muted-foreground">
+              {{ selectedLogState.loading
+                ? '加载中...'
+                : `显示 ${selectedLogState.lines.length} / ${selectedLogState.total} 行（limit ${selectedLogState.limit}）` }}
+            </span>
+          </div>
+          <div class="flex items-center gap-2">
+            <button
+              v-if="selectedLogState.truncated && selectedLogState.limit < 5000"
+              :disabled="selectedLogState.loading"
+              @click="loadMoreLog"
+              class="inline-flex h-7 items-center rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+            >
+              加载更多
+            </button>
+            <button
+              :disabled="downloadPending || selectedLogState.total === 0"
+              @click="downloadLog"
+              class="inline-flex h-7 items-center rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+            >
+              {{ downloadPending ? '下载中...' : '下载完整日志' }}
+            </button>
+          </div>
+        </div>
+        <div v-if="downloadError" class="border-b border-destructive/40 bg-destructive/5 px-4 py-2 text-xs text-destructive">
+          {{ downloadError }}
         </div>
         <div class="max-h-80 overflow-auto p-4">
-          <div v-if="selectedLogs.length === 0" class="text-sm text-muted-foreground text-center py-4">暂无日志</div>
+          <div v-if="selectedLogs.length === 0 && !selectedLogState.loading" class="text-sm text-muted-foreground text-center py-4">暂无日志</div>
           <div v-else class="font-mono text-xs leading-relaxed space-y-0.5">
             <div v-for="(line, i) in selectedLogs" :key="i" class="whitespace-pre-wrap break-all">{{ line }}</div>
           </div>

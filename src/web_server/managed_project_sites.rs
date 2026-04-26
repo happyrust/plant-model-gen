@@ -3799,6 +3799,85 @@ fn current_stage(
     )
 }
 
+/// 单条日志类别的尾部读取（D5 / Sprint D · 修 G13）
+///
+/// 返回 `{ lines, total_lines, returned_lines, truncated }`：
+/// - `lines`：文件最后 `limit` 行（按文件出现顺序，旧 → 新）
+/// - `total_lines`：文件实际总行数
+/// - `returned_lines`：本次返回行数
+/// - `truncated`：当 `total_lines > returned_lines` 时为 true
+///
+/// 路径：runtime/admin_sites/<site_id>/logs/<kind>.log
+/// `kind` 必须是 "parse" / "db" / "web"。
+pub fn tail_log(site_id: &str, kind: &str, limit: usize) -> Result<TailLogResponse> {
+    let _ = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
+    let path = log_file_path(site_id, kind)?;
+    let limit = limit.clamp(1, 5000);
+    let (total_lines, lines) = read_tail_with_total(&path, limit);
+    Ok(TailLogResponse {
+        kind: kind.to_string(),
+        path: path.to_string_lossy().to_string(),
+        total_lines,
+        returned_lines: lines.len(),
+        truncated: total_lines > lines.len(),
+        limit,
+        lines,
+    })
+}
+
+/// 单条日志类别的完整路径（D5 · 全量下载用）
+pub fn full_log_path(site_id: &str, kind: &str) -> Result<PathBuf> {
+    let _ = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
+    log_file_path(site_id, kind)
+}
+
+fn log_file_path(site_id: &str, kind: &str) -> Result<PathBuf> {
+    match kind {
+        "parse" | "db" | "web" => {}
+        other => bail!("非法日志类型: {} (必须为 parse / db / web)", other),
+    }
+    let safe_id = sanitize_site_id_for_path(site_id);
+    let mut p = PathBuf::from(ADMIN_RUNTIME_ROOT);
+    p.push(safe_id);
+    p.push("logs");
+    p.push(format!("{}.log", kind));
+    Ok(p)
+}
+
+fn read_tail_with_total(path: &Path, limit: usize) -> (usize, Vec<String>) {
+    let file = match OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(_) => return (0, Vec::new()),
+    };
+    let reader = BufReader::new(file);
+    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+    let total = lines.len();
+    if total <= limit {
+        (total, lines)
+    } else {
+        let tail = lines[total - limit..].to_vec();
+        (total, tail)
+    }
+}
+
+fn sanitize_site_id_for_path(site_id: &str) -> String {
+    site_id
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' })
+        .collect()
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct TailLogResponse {
+    pub kind: String,
+    pub path: String,
+    pub total_lines: usize,
+    pub returned_lines: usize,
+    pub truncated: bool,
+    pub limit: usize,
+    pub lines: Vec<String>,
+}
+
 pub fn logs(site_id: &str) -> Result<ManagedSiteLogsResponse> {
     let site = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
     let snapshots = collect_log_snapshots(site_id);

@@ -1,12 +1,15 @@
 use axum::{
+    body::Body,
     extract::{Json, Path, Query},
+    http::{header, StatusCode},
     middleware,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 
 use crate::web_server::{
     admin_auth_handlers::admin_auth_middleware,
@@ -38,6 +41,14 @@ pub fn create_admin_routes() -> Router {
         .route("/api/admin/sites/{id}/restart", post(restart_site))
         .route("/api/admin/sites/{id}/runtime", get(get_site_runtime))
         .route("/api/admin/sites/{id}/logs", get(get_site_logs))
+        .route(
+            "/api/admin/sites/{id}/logs/{kind}",
+            get(get_site_log_kind),
+        )
+        .route(
+            "/api/admin/sites/{id}/logs/{kind}/download",
+            get(download_site_log),
+        )
         .layer(middleware::from_fn(admin_auth_middleware))
 }
 
@@ -230,6 +241,76 @@ pub async fn get_site_logs(Path(site_id): Path<String>) -> impl IntoResponse {
         Ok(logs) => logs_ok(logs),
         Err(err) => admin_response::managed_error(err.to_string()),
     }
+}
+
+/// 单条日志类别的分页尾部查询（D5 / Sprint D · 修 G13）
+///
+/// `GET /api/admin/sites/{id}/logs/{kind}?limit=N`
+/// - `kind` ∈ parse / db / web
+/// - `limit` 默认 200，上限 5000；超出会被钳制
+/// - 响应包含 `total_lines` 与 `truncated` 让前端决定是否展示「加载更多」
+#[derive(Debug, Deserialize)]
+pub struct LogsTailQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+pub async fn get_site_log_kind(
+    Path((site_id, kind)): Path<(String, String)>,
+    Query(params): Query<LogsTailQuery>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(200);
+    match managed_sites::tail_log(&site_id, &kind, limit) {
+        Ok(payload) => admin_response::ok("获取日志尾部成功", payload),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+/// 单条日志类别的全量下载（D5）
+///
+/// `GET /api/admin/sites/{id}/logs/{kind}/download`
+/// - 直接以 `text/plain; charset=utf-8` + `Content-Disposition: attachment` 响应
+/// - 文件名格式 `<site_id>-<kind>-<UTC>.log`，便于一次性归档
+/// - 大文件场景：当前一次性读入内存；后续若需流式可改 axum::body::Body::from_stream
+pub async fn download_site_log(Path((site_id, kind)): Path<(String, String)>) -> Response {
+    let path = match managed_sites::full_log_path(&site_id, &kind) {
+        Ok(p) => p,
+        Err(err) => {
+            return admin_response::managed_error(err.to_string()).into_response();
+        }
+    };
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("日志文件不存在: {}", path.display()),
+            )
+                .into_response();
+        }
+    };
+    let mut buf = Vec::new();
+    if let Err(err) = file.read_to_end(&mut buf).await {
+        return admin_response::managed_error(format!("读取日志文件失败: {}", err))
+            .into_response();
+    }
+    let filename = format!(
+        "{}-{}-{}.log",
+        site_id,
+        kind,
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .body(Body::from(buf))
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "构造下载响应失败").into_response()
+        })
 }
 
 fn runtime_ok(runtime: ManagedSiteRuntimeStatus) -> ApiResponse {

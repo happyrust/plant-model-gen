@@ -3,7 +3,7 @@ import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useSitesStore } from '@/stores/sites'
 import type { ManagedProjectSite, ManagedSiteRiskLevel } from '@/types/site'
-import { ArrowDown, ArrowUp, ArrowUpDown, Eye, ExternalLink, FolderPlus, Loader2, Pencil, Play, RefreshCw, RotateCcw, Square, Trash2 } from 'lucide-vue-next'
+import { ArrowDown, ArrowUp, ArrowUpDown, Copy, Eye, ExternalLink, FolderPlus, Loader2, Pencil, Play, RefreshCw, RotateCcw, Square, Trash2 } from 'lucide-vue-next'
 import {
   canDeleteSite,
   canEditSite,
@@ -86,6 +86,7 @@ const sortedSites = computed(() => {
 
 const emit = defineEmits<{
   'edit-site': [siteId: string]
+  'clone-site': [siteId: string]
 }>()
 
 const router = useRouter()
@@ -354,6 +355,13 @@ async function handleParse(siteId: string) {
                 title="编辑配置"
               >
                 <Pencil class="h-3.5 w-3.5" />
+              </button>
+              <button
+                @click="emit('clone-site', site.site_id)"
+                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
+                title="克隆站点（端口自动 +1，需重填凭据）"
+              >
+                <Copy class="h-3.5 w-3.5" />
               </button>
               <button
                 v-if="canDelete(site)"

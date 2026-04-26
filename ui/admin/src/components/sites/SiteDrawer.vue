@@ -23,6 +23,17 @@ import { X } from 'lucide-vue-next'
 const props = defineProps<{
   open: boolean
   siteId: string | null
+  /**
+   * D6 / Sprint D · 修 G14：克隆站点模式
+   *
+   * 开启后从 `siteId` 拉取既有站点配置，但**保持创建语义**：
+   * - 标题为「克隆站点」
+   * - project_name 自动加 ` (副本)` 后缀
+   * - db_port / web_port 各 +1（避免立刻撞端口）
+   * - 凭据强制清空，必须重填
+   * - 提交走 createSite 而非 updateSite
+   */
+  clone?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -142,8 +153,12 @@ const form = ref<CreateManagedSiteRequest>({
 
 const manualDbNumsStr = ref('')
 
-const isEditing = computed(() => !!props.siteId)
-const title = computed(() => isEditing.value ? '编辑站点' : '新建站点')
+const isEditing = computed(() => !!props.siteId && !props.clone)
+const isCloning = computed(() => !!props.siteId && !!props.clone)
+const title = computed(() => {
+  if (isCloning.value) return '克隆站点'
+  return isEditing.value ? '编辑站点' : '新建站点'
+})
 
 const WEAK_CREDENTIAL_SET = new Set([
   'root/root',
@@ -182,15 +197,17 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
     try {
       existingSite.value = await sitesApi.get(siteId)
       const s = existingSite.value
+      const cloning = props.clone === true
       form.value = {
-        project_name: s.project_name,
+        project_name: cloning ? `${s.project_name} (副本)` : s.project_name,
         project_path: s.project_path,
         project_code: s.project_code,
         manual_db_nums: s.manual_db_nums,
         parse_db_types: s.parse_db_types?.length ? [...s.parse_db_types] : [...DEFAULT_PARSE_DB_TYPES],
         force_rebuild_system_db: s.force_rebuild_system_db ?? false,
-        db_port: s.db_port,
-        web_port: s.web_port,
+        // 克隆模式下端口 +1 避免立刻撞端口；用户仍可手动修改
+        db_port: cloning ? s.db_port + 1 : s.db_port,
+        web_port: cloning ? s.web_port + 1 : s.web_port,
         bind_host: s.bind_host || '127.0.0.1',
         public_base_url: s.public_base_url || '',
         associated_project: s.associated_project || '',
@@ -198,6 +215,10 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
         db_password: '',
       }
       manualDbNumsStr.value = s.manual_db_nums.join(', ')
+      // 克隆模式下不保留 existingSite，避免抽屉展示「正在编辑某 site」徽标
+      if (cloning) {
+        existingSite.value = null
+      }
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Failed to load site'
     }
@@ -351,6 +372,7 @@ async function handleSubmit() {
     form.value.force_rebuild_system_db = false
   }
   try {
+    // 克隆模式走 create 路径（不是 update），保持新建语义
     if (isEditing.value && props.siteId) {
       const payload: UpdateManagedSiteRequest = {
         ...form.value,

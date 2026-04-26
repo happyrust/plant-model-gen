@@ -15,6 +15,7 @@ const sitesStore = useSitesStore()
 
 const drawerOpen = ref(false)
 const editingSiteId = ref<string | null>(null)
+const cloningSiteId = ref<string | null>(null)
 const searchQuery = ref('')
 const statusFilter = ref('')
 const riskFilter = ref<ManagedSiteRiskLevel | ''>('')
@@ -111,11 +112,20 @@ const resourceRiskBanner = computed(() => {
 
 function openCreateDrawer() {
   editingSiteId.value = null
+  cloningSiteId.value = null
   drawerOpen.value = true
 }
 
 function openEditDrawer(siteId: string) {
   editingSiteId.value = siteId
+  cloningSiteId.value = null
+  drawerOpen.value = true
+}
+
+// D6 / Sprint D · 修 G14：从既有站点克隆配置
+function openCloneDrawer(siteId: string) {
+  cloningSiteId.value = siteId
+  editingSiteId.value = null
   drawerOpen.value = true
 }
 
@@ -132,6 +142,7 @@ function handleQuickFilter(filter: QuickFilter) {
 function handleDrawerSaved() {
   drawerOpen.value = false
   editingSiteId.value = null
+  cloningSiteId.value = null
   void fetchPageData()
 }
 
@@ -310,11 +321,17 @@ onMounted(async () => {
     </section>
 
     <SiteToolbar @open-drawer="openCreateDrawer" @filter="handleFilter" @quick-filter="handleQuickFilter" />
-    <SiteDataTable :sites="filteredSites" :loading="sitesStore.loading" @edit-site="openEditDrawer" />
+    <SiteDataTable
+      :sites="filteredSites"
+      :loading="sitesStore.loading"
+      @edit-site="openEditDrawer"
+      @clone-site="openCloneDrawer"
+    />
     <SiteDrawer
       :open="drawerOpen"
-      :site-id="editingSiteId"
-      @close="drawerOpen = false"
+      :site-id="cloningSiteId ?? editingSiteId"
+      :clone="cloningSiteId !== null"
+      @close="drawerOpen = false; editingSiteId = null; cloningSiteId = null"
       @saved="handleDrawerSaved"
     />
   </div>

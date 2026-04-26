@@ -108,6 +108,44 @@ pub enum SyncEvent {
         location: String,
         timestamp: String,
     },
+    /// Admin 站点状态变更快照（D1 / Sprint D · 修 G7/G8）
+    ///
+    /// 触发时机（`managed_project_sites::update_runtime` 单事务写盘成功后注入，
+    /// 保证 start/stop/parse/restart 全路径无遗漏）：
+    /// - `start_site` Starting / Running / Failed
+    /// - `stop_site` Stopping / Stopped / Failed
+    /// - `restart_site`（= stop + start，自动覆盖）
+    /// - `parse_site` Running / Done / Failed
+    /// - `update_site` 元数据更新
+    ///
+    /// 前端 `useAdminSitesStream` 收到后按 `site_id` 在 `sites.ts` store 中
+    /// patch 对应 site 的 status / parse_status / last_error 等字段，避免全量
+    /// `fetchSites()` 刷列表的开销与潜在 race condition。
+    AdminSiteSnapshot {
+        site_id: String,
+        project_name: Option<String>,
+        status: String,
+        parse_status: String,
+        last_error: Option<String>,
+        timestamp: String,
+    },
+    /// Admin 站点新增（D1 / Sprint D · 修 G8）
+    ///
+    /// 触发时机：`POST /api/admin/sites` 写盘成功后立即推送。
+    /// 前端列表页 `SitesView` 收到后将新 site append 到 `sites.value`。
+    AdminSiteCreated {
+        site_id: String,
+        project_name: String,
+        timestamp: String,
+    },
+    /// Admin 站点删除（D1 / Sprint D · 修 G8）
+    ///
+    /// 触发时机：`DELETE /api/admin/sites/{id}` 成功后立即推送。
+    /// 前端列表页 `SitesView` 收到后将对应 site 从 `sites.value` 中移除。
+    AdminSiteDeleted {
+        site_id: String,
+        timestamp: String,
+    },
 }
 
 impl SyncEvent {
@@ -215,6 +253,68 @@ pub async fn test_sse_handler() -> impl IntoResponse {
             )
         }
     }
+}
+
+// ─── D1 / Sprint D · admin sites SSE push helpers ──────────────────────────
+//
+// 设计：helper 接受原始字符串 / Option，不直接依赖 `managed_project_sites`
+// 的具体类型，避免该模块（已 3679 行）与 SSE 层产生类型耦合。调用方负责
+// 通过 `status_to_str` / `parse_status_to_str` 把 enum 转字符串。
+//
+// 容错：broadcast 在无订阅者时 `send` 返回 Err，这里统一 `.ok()` 丢弃，
+// 与现有 `push_subscription_status_event` 风格一致。
+//
+// 调用方：`managed_project_sites::update_runtime` (snapshot) /
+//        `admin_handlers::create_site` (created) /
+//        `admin_handlers::delete_site` (deleted)
+
+/// 当前 UNIX 秒时间戳（字符串），与现有 SyncEvent 字段口径一致
+fn now_unix_secs_string() -> String {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
+}
+
+/// 推送 admin 站点状态快照事件（D1 / 修 G7/G8）
+///
+/// 参数：
+/// - `site_id` / `project_name` / `status` / `parse_status` / `last_error`
+///   字段含义与 `GET /api/admin/sites/{id}` 响应对齐；
+/// - `status` / `parse_status` 已经是序列化后的字符串（如 "Running"），
+///   调用方使用 `status_to_str` 转换。
+pub fn push_admin_site_snapshot(
+    site_id: &str,
+    project_name: Option<&str>,
+    status: &str,
+    parse_status: &str,
+    last_error: Option<&str>,
+) {
+    let _ = SYNC_EVENT_TX.send(SyncEvent::AdminSiteSnapshot {
+        site_id: site_id.to_string(),
+        project_name: project_name.map(String::from),
+        status: status.to_string(),
+        parse_status: parse_status.to_string(),
+        last_error: last_error.map(String::from),
+        timestamp: now_unix_secs_string(),
+    });
+}
+
+/// 推送 admin 站点创建事件（D1 / 修 G8）
+pub fn push_admin_site_created(site_id: &str, project_name: &str) {
+    let _ = SYNC_EVENT_TX.send(SyncEvent::AdminSiteCreated {
+        site_id: site_id.to_string(),
+        project_name: project_name.to_string(),
+        timestamp: now_unix_secs_string(),
+    });
+}
+
+/// 推送 admin 站点删除事件（D1 / 修 G8）
+pub fn push_admin_site_deleted(site_id: &str) {
+    let _ = SYNC_EVENT_TX.send(SyncEvent::AdminSiteDeleted {
+        site_id: site_id.to_string(),
+        timestamp: now_unix_secs_string(),
+    });
 }
 
 #[cfg(test)]

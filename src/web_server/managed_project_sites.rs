@@ -1654,6 +1654,10 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
 
     let mut site = site;
     annotate_site_parse_plan(&mut site);
+
+    // D1 / Sprint D · 修 G8：写盘 + 落磁盘均成功后立即广播 admin 站点新增事件
+    crate::web_server::sse_handlers::push_admin_site_created(&site.site_id, &site.project_name);
+
     Ok(site)
 }
 
@@ -1863,6 +1867,17 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
 
     write_site_files(&site, &db_user, &db_password)?;
     annotate_site_parse_plan(&mut site);
+
+    // D1 / Sprint D · 修 G8：元数据更新成功后广播 admin 站点快照事件
+    // （update_site 内部不走 update_runtime，所以单独注入）
+    crate::web_server::sse_handlers::push_admin_site_snapshot(
+        &site.site_id,
+        Some(&site.project_name),
+        status_to_str(&site.status),
+        parse_status_to_str(&site.parse_status),
+        site.last_error.as_deref(),
+    );
+
     Ok(site)
 }
 
@@ -1894,7 +1909,7 @@ pub fn update_runtime(site_id: &str, update: RuntimeUpdate) -> Result<()> {
         last_parse_duration_ms,
     } = update;
 
-    with_tx(|conn| {
+    let updated_site = with_tx(|conn| {
         let mut site = load_site_with_conn(conn, site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
         if let Some(value) = status {
             site.status = value;
@@ -1928,8 +1943,21 @@ pub fn update_runtime(site_id: &str, update: RuntimeUpdate) -> Result<()> {
         }
         site.updated_at = now_rfc3339();
         let (db_user, db_password) = load_credentials_with_conn(conn, site_id)?;
-        persist_site_with_conn(conn, &site, &db_user, &db_password)
-    })
+        persist_site_with_conn(conn, &site, &db_user, &db_password)?;
+        Ok(site)
+    })?;
+
+    // D1 / Sprint D · 修 G7/G8：事务 commit 成功后立即广播 admin 站点快照事件
+    // 覆盖 start/stop/parse/restart 全路径（这些 action 都最终走 update_runtime）
+    crate::web_server::sse_handlers::push_admin_site_snapshot(
+        &updated_site.site_id,
+        Some(&updated_site.project_name),
+        status_to_str(&updated_site.status),
+        parse_status_to_str(&updated_site.parse_status),
+        updated_site.last_error.as_deref(),
+    );
+
+    Ok(())
 }
 
 fn record_site_error(
@@ -3406,6 +3434,13 @@ pub fn delete_site(site_id: &str) -> Result<bool> {
             );
         }
     }
+
+    // D1 / Sprint D · 修 G8：仅当 SQLite 真正删除了一行时广播 deleted 事件
+    // （changed == 0 表示站点不存在，无需通知前端）
+    if changed > 0 {
+        crate::web_server::sse_handlers::push_admin_site_deleted(site_id);
+    }
+
     Ok(changed > 0)
 }
 

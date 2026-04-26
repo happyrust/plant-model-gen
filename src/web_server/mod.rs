@@ -85,6 +85,20 @@ pub struct AppState {
     pub config_manager: Arc<RwLock<ConfigManager>>,
     /// 进度广播中心（用于 WebSocket 和 gRPC）
     pub progress_hub: Arc<crate::shared::ProgressHub>,
+    /// Graceful shutdown 触发通道（B5 / Phase 10）。
+    ///
+    /// 持有方：`mod.rs::start_web_server_with_config` 在 axum 启动前用
+    /// `tokio::sync::oneshot::channel` 创建一对 sender/receiver，把 sender
+    /// 放到这里、receiver 喂给 `axum::serve(...).with_graceful_shutdown(...)`。
+    ///
+    /// 触发点：`site_config_handlers::save_site_config` /
+    /// `site_config_handlers::restart_server` 收到请求并写盘成功后，
+    /// 调用 `shutdown_tx.lock().await.take()` 拿走 sender 并 `send(())`，
+    /// 进入 graceful shutdown：5s 内停止接受新请求，已有连接处理完成后退出。
+    ///
+    /// 配套：进程级 supervisor（systemd / nssm / pm2）需在 main 退出后自动拉起，
+    /// 由此实现"改完配置自重启"的体验。
+    pub shutdown_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 /// 任务管理器
@@ -159,6 +173,7 @@ impl AppState {
             task_manager: Arc::new(Mutex::new(task_manager)),
             config_manager: Arc::new(RwLock::new(config_manager)),
             progress_hub: Arc::new(crate::shared::ProgressHub::default()),
+            shutdown_tx: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -1257,7 +1272,26 @@ pub async fn start_web_server_with_config(
     // 也注释掉，避免启动时查询数据库
     // tokio::spawn(crate::web_server::handlers::projects_health_scheduler());
 
-    let serve_result = axum::serve(listener, app).await;
+    // B5 / Phase 10 · graceful shutdown 接入点
+    //
+    // 创建 oneshot 通道：sender 放进 AppState，可由
+    // `site_config_handlers::save_site_config` 等处理器在写盘成功后取走并触发；
+    // receiver 交给 `axum::serve(...).with_graceful_shutdown(...)`，触发后
+    // axum 立即停止接受新连接，已建立连接走完 in-flight 请求再退出。
+    //
+    // 真正的"自动重启"由进程级 supervisor 接力（systemd / nssm / pm2 等），
+    // 详见 `docs/plans/2026-04-26-site-admin-next-steps.md §4`。
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut slot = app_state.shutdown_tx.lock().await;
+        *slot = Some(shutdown_tx);
+    }
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+            println!("📴 收到 graceful shutdown 信号，停止接受新请求；in-flight 请求处理完成后进程退出");
+        })
+        .await;
     heartbeat_handle.abort();
     if let Err(err) = crate::web_server::site_registry::mark_site_status(
         &runtime_site_config.site_id,

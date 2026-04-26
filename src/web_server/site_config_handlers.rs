@@ -349,14 +349,25 @@ pub async fn save_site_config(
                 }
             }
             
-            // TODO(Phase 后续): 接入 plant-model-gen 的 graceful shutdown 机制以实现自动重启
-            // 当前 AppState 没有 shutdown_tx 字段，暂以日志提示用户手动重启
-            let _ = &state;
-            log::warn!("⚠️  [站点配置] 配置已保存，请手动重启 web_server 以使新配置生效");
+            // B5 / Phase 10 · 触发 graceful shutdown，由进程级 supervisor 拉起新进程。
+            //
+            // sender 由 `mod.rs::start_web_server_with_config` 在启动 axum 前
+            // 写入；这里 take 一次就消耗掉，多次 save 期间只有第一次生效，避免
+            // 重复 send 导致 panic（oneshot::Sender::send 是 self）。
+            //
+            // shutdown 触发后 axum 不再接受新连接，本响应仍能正常返回（同一连接
+            // 已建立），随后 in-flight 请求处理完毕，进程退出，supervisor 拉起。
+            let triggered = trigger_graceful_shutdown(&state).await;
+            let message = if triggered {
+                "配置已保存到 SQLite 和 DbOption.toml；已触发 graceful shutdown，supervisor 将自动重启 web_server 以使新配置生效"
+            } else {
+                "配置已保存到 SQLite 和 DbOption.toml，但 graceful shutdown 已被触发过或未启用，请手动重启服务器"
+            };
 
             Ok(Json(json!({
                 "status": "success",
-                "message": "配置已保存到 SQLite 和 DbOption.toml，请手动重启服务器以使新配置生效"
+                "graceful_shutdown_triggered": triggered,
+                "message": message,
             })))
         }
         Err(e) => {
@@ -369,20 +380,54 @@ pub async fn save_site_config(
     }
 }
 
-/// 重启服务器
+/// 重启服务器（B5 / Phase 10 · 真实 graceful shutdown 触发）
+///
+/// 调用流程：
+/// 1. take 走 `AppState::shutdown_tx` 中的 oneshot sender
+/// 2. `send(())` 通知 `axum::serve(...).with_graceful_shutdown(...)`
+/// 3. axum 停接新连接，in-flight 请求（包含本次响应）走完后进程退出
+/// 4. 进程级 supervisor（systemd / nssm / pm2）自动拉起新进程
+///
+/// 与 `save_site_config` 内置触发的区别：本端点是"无变更前提下手动 restart"，
+/// 用于热更新代码 / 升级配置之外的运维动作（如清缓存、重连后端服务）。
 #[cfg(feature = "web_server")]
 pub async fn restart_server(
     state: State<crate::web_server::AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO(Phase 后续): 接入 plant-model-gen 的 graceful shutdown 机制
-    // 当前 AppState 没有 shutdown_tx 字段，暂以日志提示
-    let _ = &state;
-    log::warn!("⚠️  [站点配置] 收到 restart 请求，但运行时重启机制尚未接入，请手动重启");
-
+    let triggered = trigger_graceful_shutdown(&state).await;
+    let message = if triggered {
+        "已触发 graceful shutdown，supervisor 将拉起新进程；本响应返回后立即进入退出流程"
+    } else {
+        "graceful shutdown sender 不存在或已被触发，请手动重启服务器"
+    };
     Ok(Json(json!({
         "status": "success",
-        "message": "服务器将在1秒后重启"
+        "graceful_shutdown_triggered": triggered,
+        "message": message,
     })))
+}
+
+/// 触发 graceful shutdown，返回是否真正触发（false = 已被触发过或未启用）。
+///
+/// 仅在写盘等"改变运行时事实"的成功路径上调用。take 走 sender 后立即 send，
+/// 失败（receiver 已关闭）只记日志、不报错，让上层成功路径不被基础设施异常拖死。
+async fn trigger_graceful_shutdown(state: &State<crate::web_server::AppState>) -> bool {
+    let mut slot = state.shutdown_tx.lock().await;
+    if let Some(tx) = slot.take() {
+        match tx.send(()) {
+            Ok(()) => {
+                log::warn!("📴 [站点配置] 已触发 graceful shutdown，supervisor 将拉起新进程");
+                true
+            }
+            Err(()) => {
+                log::warn!("📴 [站点配置] graceful shutdown receiver 已关闭，无法触发");
+                false
+            }
+        }
+    } else {
+        log::warn!("📴 [站点配置] graceful shutdown sender 不存在（可能已被触发或未启用）");
+        false
+    }
 }
 
 /// 「理论上可热改」的 DbOption 字段白名单（B6 · Phase 11）
@@ -412,6 +457,20 @@ const HOT_RELOADABLE_KEYS: &[&str] = &[
     "incr_sync",
     "total_sync",
 ];
+
+/// 「文件值与运行时永远不一致」的字段白名单（C3 · 修 G3 baseline 误报）
+///
+/// 这些字段在 `aios_core::get_db_option()` 内部会被环境变量覆盖（如
+/// `SURREAL_CONN_MODE` / `SURREAL_CONN_IP` / `SURREAL_CONN_PORT` 影响 `surrealdb`），
+/// 因此运行时副本与 TOML 文件原值天然不一致。
+///
+/// 在 reload diff 时把这类字段单独归到 `static_changed_keys_env`，避免它们
+/// 把 baseline（用户没有人为改动）也错报成「需要重启」。
+///
+/// 触发 `requires_restart` 仅看 `static_changed_keys_user` 是否非空。
+///
+/// ⚠️ 注：扩展时同步 `rs-core/src/lib.rs` 中 env override 的字段列表。
+const ENV_OVERRIDABLE_KEYS: &[&str] = &["surrealdb"];
 
 /// 字段级 diff（hot vs static）
 ///
@@ -495,10 +554,20 @@ pub async fn reload_site_config(
     let current = aios_core::get_db_option();
     let (hot_changed, static_changed) = diff_db_option(current, &new_option);
 
-    let requires_restart = !static_changed.is_empty();
-    let no_change = hot_changed.is_empty() && static_changed.is_empty();
+    // C3 · 修 G3 baseline 误报：把 static_changed 拆成 user / env 两组。
+    //
+    // env 覆盖字段（如 `surrealdb`）会因 `aios_core::get_db_option()` 内部 env override
+    // 让运行时副本永远 ≠ 文件副本，**与用户是否改了 TOML 无关**。这部分不应触发
+    // requires_restart，否则用户每次 reload 都会看到误报「需要重启」。
+    let (static_changed_env, static_changed_user): (Vec<String>, Vec<String>) = static_changed
+        .iter()
+        .cloned()
+        .partition(|k| ENV_OVERRIDABLE_KEYS.contains(&k.as_str()));
 
-    let actions: Vec<&str> = if no_change {
+    let requires_restart = !static_changed_user.is_empty();
+    let no_user_change = hot_changed.is_empty() && static_changed_user.is_empty();
+
+    let actions: Vec<&str> = if no_user_change {
         vec!["no_change"]
     } else if requires_restart {
         vec!["manual_restart_required"]
@@ -506,13 +575,25 @@ pub async fn reload_site_config(
         vec!["log_only"]
     };
 
-    let message = if no_change {
-        "配置文件与当前运行时完全一致，无需操作".to_string()
+    let message = if no_user_change {
+        if static_changed_env.is_empty() {
+            "配置文件与当前运行时完全一致，无需操作".to_string()
+        } else {
+            format!(
+                "配置文件与当前运行时一致（{} 项 env 覆盖字段除外，属预期差异）",
+                static_changed_env.len()
+            )
+        }
     } else if requires_restart {
         format!(
-            "检测到 {} 项静态字段变更（需重启）+ {} 项可热改字段；当前版本统一以重启生效",
-            static_changed.len(),
-            hot_changed.len()
+            "检测到 {} 项用户改动的静态字段（需重启）+ {} 项可热改字段{}；当前版本统一以重启生效",
+            static_changed_user.len(),
+            hot_changed.len(),
+            if static_changed_env.is_empty() {
+                String::new()
+            } else {
+                format!("（另 {} 项 env 覆盖字段已忽略）", static_changed_env.len())
+            }
         )
     } else {
         format!(
@@ -522,15 +603,22 @@ pub async fn reload_site_config(
     };
 
     log::info!(
-        "ℹ️  [站点配置] reload diff: hot={:?} static={:?} requires_restart={}",
-        hot_changed, static_changed, requires_restart
+        "ℹ️  [站点配置] reload diff: hot={:?} static_user={:?} static_env={:?} requires_restart={}",
+        hot_changed,
+        static_changed_user,
+        static_changed_env,
+        requires_restart
     );
 
     Ok(Json(json!({
         "status": "success",
         "message": message,
         "hot_changed_keys": hot_changed,
+        // 向后兼容：保留 user + env 合并后的 static_changed_keys
         "static_changed_keys": static_changed,
+        // C3 · 修 G3 baseline 误报：新增分类字段
+        "static_changed_keys_user": static_changed_user,
+        "static_changed_keys_env": static_changed_env,
         "requires_restart": requires_restart,
         "actions": actions,
     })))

@@ -16,6 +16,15 @@ export interface SiteActionError {
   message: string
 }
 
+// D3 / Sprint D · 批量操作类型
+export type SiteBulkAction = 'start' | 'stop' | 'restart' | 'parse' | 'delete'
+
+export interface SiteBulkResult {
+  total: number
+  ok: number
+  failed: { siteId: string; message: string }[]
+}
+
 export const useSitesStore = defineStore('sites', () => {
   const sites = ref<ManagedProjectSite[]>([])
   const loading = ref(false)
@@ -127,11 +136,52 @@ export const useSitesStore = defineStore('sites', () => {
     })
   }
 
+  /**
+   * D3 / Sprint D · 批量操作
+   *
+   * 串行调用每个 site 的对应单条 action，避免一次过载（站点启动占用机器资源
+   * 较多，并发会撞 CPU/内存阈值）。返回 `{ ok, failed: [{siteId, message}] }`。
+   *
+   * 各 site 的 pending 状态由 withAction 单独管理，UI 上仍按行显示 spinner。
+   */
+  async function bulkAction(siteIds: string[], action: SiteBulkAction): Promise<SiteBulkResult> {
+    const result: SiteBulkResult = { total: siteIds.length, ok: 0, failed: [] }
+    for (const siteId of siteIds) {
+      try {
+        switch (action) {
+          case 'start':
+            await startSite(siteId)
+            break
+          case 'stop':
+            await stopSite(siteId)
+            break
+          case 'restart':
+            await restartSite(siteId)
+            break
+          case 'parse':
+            await parseSite(siteId)
+            break
+          case 'delete':
+            await deleteSite(siteId)
+            break
+        }
+        result.ok += 1
+      } catch (err: unknown) {
+        result.failed.push({
+          siteId,
+          message: err instanceof Error ? err.message : '未知错误',
+        })
+      }
+    }
+    return result
+  }
+
   return {
     sites, stats, loading, error,
     pendingActions, actionErrors, latestActionError,
     getSiteAction, isSiteActionPending, getSiteActionError, clearSiteActionError,
     fetchSites, createSite, updateSite, deleteSite,
     parseSite, startSite, stopSite, restartSite,
+    bulkAction,
   }
 })

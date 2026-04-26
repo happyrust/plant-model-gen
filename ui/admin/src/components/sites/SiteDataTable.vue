@@ -19,7 +19,11 @@ import {
 import { buildViewerUrl } from '@/lib/viewer'
 import SiteDeleteDialog from './SiteDeleteDialog.vue'
 
-const props = defineProps<{ sites: ManagedProjectSite[]; loading: boolean }>()
+const props = defineProps<{
+  sites: ManagedProjectSite[]
+  loading: boolean
+  selected?: string[]
+}>()
 
 // D6 / Sprint D · 修 G15：表头点击排序
 //
@@ -87,7 +91,43 @@ const sortedSites = computed(() => {
 const emit = defineEmits<{
   'edit-site': [siteId: string]
   'clone-site': [siteId: string]
+  'update-selection': [siteIds: string[]]
 }>()
+
+// D3 / Sprint D · 批量操作多选
+//
+// 选中的 site_id 集由父组件 (SitesView) 持有，本组件通过 v-model-like
+// 协议（props.selected + emit('update-selection')）保持双向同步。
+const selectedSet = computed(() => new Set(props.selected ?? []))
+
+const allVisibleSelected = computed(() => {
+  const visible = sortedSites.value
+  return visible.length > 0 && visible.every((s) => selectedSet.value.has(s.site_id))
+})
+
+const someVisibleSelected = computed(() => {
+  const visible = sortedSites.value
+  return visible.some((s) => selectedSet.value.has(s.site_id))
+})
+
+function toggleRowSelection(siteId: string, checked: boolean) {
+  const next = new Set(selectedSet.value)
+  if (checked) next.add(siteId)
+  else next.delete(siteId)
+  emit('update-selection', [...next])
+}
+
+function toggleAllVisible(checked: boolean) {
+  const visible = sortedSites.value.map((s) => s.site_id)
+  if (checked) {
+    const next = new Set(selectedSet.value)
+    visible.forEach((id) => next.add(id))
+    emit('update-selection', [...next])
+  } else {
+    const visibleSet = new Set(visible)
+    emit('update-selection', [...selectedSet.value].filter((id) => !visibleSet.has(id)))
+  }
+}
 
 const router = useRouter()
 const sitesStore = useSitesStore()
@@ -205,6 +245,17 @@ async function handleParse(siteId: string) {
     <table v-else class="w-full text-sm">
       <thead>
         <tr class="border-b border-border bg-muted/50">
+          <th class="w-10 px-3 py-3 text-left font-medium text-muted-foreground">
+            <input
+              type="checkbox"
+              class="h-4 w-4 cursor-pointer rounded border-input"
+              :checked="allVisibleSelected"
+              :indeterminate="someVisibleSelected && !allVisibleSelected"
+              :title="allVisibleSelected ? '取消全选' : '全选当前可见站点'"
+              @change="toggleAllVisible(($event.target as HTMLInputElement).checked)"
+              @click.stop
+            />
+          </th>
           <th class="px-4 py-3 text-left font-medium text-muted-foreground">
             <button type="button" class="inline-flex items-center gap-1 hover:text-foreground transition-colors" @click="toggleSort('project_name')">
               项目名称 <component :is="sortIcon('project_name')" class="h-3.5 w-3.5" />
@@ -233,8 +284,17 @@ async function handleParse(siteId: string) {
           v-for="site in sortedSites"
           :key="site.site_id"
           class="border-b border-border last:border-0 hover:bg-muted/30 transition-colors cursor-pointer"
+          :class="selectedSet.has(site.site_id) ? 'bg-accent/20' : ''"
           @click="openDetail(site.site_id)"
         >
+          <td class="w-10 px-3 py-3 align-top" @click.stop>
+            <input
+              type="checkbox"
+              class="h-4 w-4 cursor-pointer rounded border-input"
+              :checked="selectedSet.has(site.site_id)"
+              @change="toggleRowSelection(site.site_id, ($event.target as HTMLInputElement).checked)"
+            />
+          </td>
           <td class="px-4 py-3 align-top">
             <div class="font-medium">{{ site.project_name }}</div>
             <div class="text-xs text-muted-foreground">{{ site.site_id }}</div>

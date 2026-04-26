@@ -1488,7 +1488,7 @@ async fn trigger_async_parquet_export(dbnum: u32) -> anyhow::Result<()> {
     }
 
     let result = async {
-        let db_option = Arc::new(aios_core::get_db_option().clone());
+        let db_option = aios_core::get_db_option();
         let project_name = &db_option.project_name;
 
         let output_dir = if project_name.is_empty() {

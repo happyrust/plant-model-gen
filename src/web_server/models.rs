@@ -351,7 +351,7 @@ impl DatabaseConfig {
     /// - 以当前 `aios_core::get_db_option()` 为基底，保留未在 Web 配置中显式暴露的字段；
     /// - 覆盖当前任务/站点真正关心的运行参数，避免退回到 `DbOption::default()` 的示例项目配置。
     pub fn to_runtime_db_option(&self) -> DbOption {
-        let mut db_option = aios_core::get_db_option().clone();
+        let mut db_option = (*aios_core::get_db_option()).clone();
 
         if db_option.pe_chunk == 0 {
             db_option.pe_chunk = 300;

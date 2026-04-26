@@ -398,7 +398,7 @@ impl From<DbOption> for DbOptionExt {
 /// 获取扩展的数据库选项
 pub fn get_db_option_ext() -> DbOptionExt {
     let db_option = aios_core::get_db_option();
-    let db_option_ext = DbOptionExt::from(db_option.clone());
+    let db_option_ext = DbOptionExt::from((*db_option).clone());
     if let Err(e) = validate_data_source_mode(db_option_ext.use_surrealdb) {
         panic!("DbOptionExt 数据源模式校验失败: {}", e);
     }

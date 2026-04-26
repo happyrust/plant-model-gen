@@ -507,18 +507,17 @@ fn diff_db_option(
 /// 行为：重新读 `${DB_OPTION_FILE}.toml` → 解析 → 与当前内存 `DbOption` 做字段 diff
 /// → 返回 hot / static 分类清单 + `requires_restart` 标志。
 ///
-/// **本版本不真正应用配置变更**——`aios_core::get_db_option` 为 OnceCell，
-/// 全局静态不可变。本端点的语义是「字段变更检测 + 用户告知」，让前端
-/// SettingsView 能清楚展示「我改了哪些字段、哪些必须重启」。
+/// 重新加载配置文件并应用变更。
 ///
-/// 升级路径见 `docs/plans/2026-04-26-sprint-b-phase11-b6-reload.md §6`。
+/// - hot 字段变更 → `aios_core::set_db_option_from_file()` 真正热加载
+/// - static 字段变更 → 触发 graceful shutdown（如可用）或提示手动重启
+/// - 无变更 → 提示无需操作
 #[cfg(feature = "web_server")]
 pub async fn reload_site_config(
-    _state: State<crate::web_server::AppState>,
+    state: State<crate::web_server::AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let toml_path = get_db_option_path();
 
-    // 1. 读文件
     let content = match fs::read_to_string(&toml_path) {
         Ok(c) => c,
         Err(e) => {
@@ -534,7 +533,6 @@ pub async fn reload_site_config(
         }
     };
 
-    // 2. 解析 toml → DbOption
     let new_option: aios_core::options::DbOption = match toml::from_str(&content) {
         Ok(o) => o,
         Err(e) => {
@@ -550,15 +548,9 @@ pub async fn reload_site_config(
         }
     };
 
-    // 3. 字段 diff
     let current = aios_core::get_db_option();
-    let (hot_changed, static_changed) = diff_db_option(current, &new_option);
+    let (hot_changed, static_changed) = diff_db_option(&current, &new_option);
 
-    // C3 · 修 G3 baseline 误报：把 static_changed 拆成 user / env 两组。
-    //
-    // env 覆盖字段（如 `surrealdb`）会因 `aios_core::get_db_option()` 内部 env override
-    // 让运行时副本永远 ≠ 文件副本，**与用户是否改了 TOML 无关**。这部分不应触发
-    // requires_restart，否则用户每次 reload 都会看到误报「需要重启」。
     let (static_changed_env, static_changed_user): (Vec<String>, Vec<String>) = static_changed
         .iter()
         .cloned()
@@ -567,26 +559,29 @@ pub async fn reload_site_config(
     let requires_restart = !static_changed_user.is_empty();
     let no_user_change = hot_changed.is_empty() && static_changed_user.is_empty();
 
-    let actions: Vec<&str> = if no_user_change {
-        vec!["no_change"]
-    } else if requires_restart {
-        vec!["manual_restart_required"]
-    } else {
-        vec!["log_only"]
-    };
-
-    let message = if no_user_change {
-        if static_changed_env.is_empty() {
+    let (actions, message) = if no_user_change {
+        let msg = if static_changed_env.is_empty() {
             "配置文件与当前运行时完全一致，无需操作".to_string()
         } else {
             format!(
                 "配置文件与当前运行时一致（{} 项 env 覆盖字段除外，属预期差异）",
                 static_changed_env.len()
             )
-        }
+        };
+        (vec!["no_change"], msg)
     } else if requires_restart {
-        format!(
-            "检测到 {} 项用户改动的静态字段（需重启）+ {} 项可热改字段{}；当前版本统一以重启生效",
+        let triggered = if let Some(tx) = state.shutdown_tx.lock().await.take() {
+            tx.send(()).is_ok()
+        } else {
+            false
+        };
+        let acts = if triggered {
+            vec!["graceful_shutdown_triggered", "supervisor_will_restart"]
+        } else {
+            vec!["manual_restart_required"]
+        };
+        let msg = format!(
+            "检测到 {} 项静态字段变更（需重启）+ {} 项热改字段{}",
             static_changed_user.len(),
             hot_changed.len(),
             if static_changed_env.is_empty() {
@@ -594,29 +589,44 @@ pub async fn reload_site_config(
             } else {
                 format!("（另 {} 项 env 覆盖字段已忽略）", static_changed_env.len())
             }
-        )
+        );
+        (acts, msg)
     } else {
-        format!(
-            "检测到 {} 项可热改字段；当前版本仍需手动重启才能真正生效（OnceCell 限制）",
-            hot_changed.len()
-        )
+        match aios_core::set_db_option_from_file() {
+            Ok(_) => {
+                log::info!("✅ [站点配置] 热加载成功，hot_changed_keys = {:?}", hot_changed);
+                let msg = format!(
+                    "已热加载 {} 项字段变更，无需重启",
+                    hot_changed.len()
+                );
+                (vec!["hot_reloaded"], msg)
+            }
+            Err(e) => {
+                log::error!("❌ [站点配置] 热加载失败: {}", e);
+                let msg = format!(
+                    "检测到 {} 项热改字段但加载失败: {}；旧配置保持不变",
+                    hot_changed.len(),
+                    e
+                );
+                (vec!["hot_reload_failed"], msg)
+            }
+        }
     };
 
     log::info!(
-        "ℹ️  [站点配置] reload diff: hot={:?} static_user={:?} static_env={:?} requires_restart={}",
+        "ℹ️  [站点配置] reload diff: hot={:?} static_user={:?} static_env={:?} requires_restart={} actions={:?}",
         hot_changed,
         static_changed_user,
         static_changed_env,
-        requires_restart
+        requires_restart,
+        actions
     );
 
     Ok(Json(json!({
         "status": "success",
         "message": message,
         "hot_changed_keys": hot_changed,
-        // 向后兼容：保留 user + env 合并后的 static_changed_keys
         "static_changed_keys": static_changed,
-        // C3 · 修 G3 baseline 误报：新增分类字段
         "static_changed_keys_user": static_changed_user,
         "static_changed_keys_env": static_changed_env,
         "requires_restart": requires_restart,

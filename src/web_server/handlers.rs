@@ -1937,7 +1937,7 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
         };
 
         if !dbnums.is_empty() {
-            let db_option = Arc::new(aios_core::get_db_option().clone());
+            let db_option = aios_core::get_db_option();
             let output_root = PathBuf::from("output");
             let mesh_dir = PathBuf::from("assets/meshes");
 
@@ -8907,7 +8907,7 @@ pub async fn api_show_by_refno(
 
     // 4. 获取 DbOption
     let db_option = aios_core::get_db_option();
-    let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
+    let db_option_ext = crate::options::DbOptionExt::from((*db_option).clone());
 
     // 5. 调用生成函数
     let result =

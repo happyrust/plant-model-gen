@@ -322,7 +322,7 @@ pub async fn create_room_task(
     info!("📋 房间计算任务已注册到 ProgressHub: {}", task_id);
 
     let db_option = aios_core::get_db_option();
-    let worker_task = RoomWorkerTask::new(task_id.clone(), worker_task_type, db_option.clone());
+    let worker_task = RoomWorkerTask::new(task_id.clone(), worker_task_type, (*db_option).clone());
     state.room_worker.submit_task(worker_task).await;
 
     // 发布初始进度消息
@@ -1678,7 +1678,7 @@ pub async fn rebuild_room_relations_only(
     let worker_task = RoomWorkerTask::new(
         task_id.clone(),
         build_rebuild_relations_worker_task_type(request.room_numbers.clone()),
-        db_option.clone(),
+        (*db_option).clone(),
     );
     state.room_worker.submit_task(worker_task).await;
 

@@ -326,7 +326,7 @@ pub async fn start_web_server_with_config(
     let startup_ns = db_option.surreal_ns.clone();
     let startup_db = db_option.project_name.clone();
     tokio::spawn(async move {
-        match aios_core::initialize_databases(db_option).await {
+        match aios_core::initialize_databases(&db_option).await {
             Ok(_) => {
                 if let Err(error) =
                     aios_core::use_ns_db_compat(&aios_core::SUL_DB, &startup_ns, &startup_db).await

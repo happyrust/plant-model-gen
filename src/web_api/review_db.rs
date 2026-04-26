@@ -45,7 +45,7 @@ pub async fn init_review_primary_db(db_option: &DbOption) -> Result<()> {
 
 pub async fn ensure_review_primary_db_context() -> Result<()> {
     if REVIEW_PRIMARY_DB.get().is_none() {
-        init_review_primary_db(aios_core::get_db_option()).await?;
+        init_review_primary_db(&aios_core::get_db_option()).await?;
     }
 
     let db_option = aios_core::get_db_option();

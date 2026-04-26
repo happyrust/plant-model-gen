@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useSitesStore } from '@/stores/sites'
 import type { ManagedProjectSite, ManagedSiteRiskLevel } from '@/types/site'
@@ -16,6 +17,7 @@ import {
   statusLabelMap,
 } from './site-status'
 import { buildViewerUrl } from '@/lib/viewer'
+import SiteDeleteDialog from './SiteDeleteDialog.vue'
 
 const props = defineProps<{ sites: ManagedProjectSite[]; loading: boolean }>()
 
@@ -45,10 +47,31 @@ const canParse = canParseSite
 const canRestart = canRestartSite
 const canDelete = canDeleteSite
 const canEdit = canEditSite
+
+// D2 / Sprint D · 修 G9：用 hi-fi 弹框替代 window.confirm
+const deleteTarget = ref<ManagedProjectSite | null>(null)
+const deletePending = ref(false)
+
 function confirmDelete(site: ManagedProjectSite) {
-  const confirmed = window.confirm(`确定删除站点「${site.project_name}」吗？此操作不可撤销。`)
-  if (confirmed) {
-    void handleDelete(site.site_id)
+  deleteTarget.value = site
+}
+
+function cancelDelete() {
+  if (deletePending.value) return
+  deleteTarget.value = null
+}
+
+async function executeDelete() {
+  const site = deleteTarget.value
+  if (!site || deletePending.value) return
+  deletePending.value = true
+  try {
+    await sitesStore.deleteSite(site.site_id)
+    deleteTarget.value = null
+  } catch {
+    // 错误已写入 store，弹框保持打开方便用户重试或关闭
+  } finally {
+    deletePending.value = false
   }
 }
 function riskSummary(site: ManagedProjectSite) {
@@ -94,13 +117,6 @@ async function handleParse(siteId: string) {
   }
 }
 
-async function handleDelete(siteId: string) {
-  try {
-    await sitesStore.deleteSite(siteId)
-  } catch {
-    // 错误已写入 store
-  }
-}
 </script>
 
 <template>
@@ -273,5 +289,12 @@ async function handleDelete(siteId: string) {
         </tr>
       </tbody>
     </table>
+    <SiteDeleteDialog
+      :open="deleteTarget !== null"
+      :site="deleteTarget"
+      :pending="deletePending"
+      @cancel="cancelDelete"
+      @confirm="executeDelete"
+    />
   </div>
 </template>

@@ -2,7 +2,38 @@
 
 ## 2026-04-26
 
-### Added
+### Added — Sprint C 站点管理后端 stub 收口 + Sprint D 体验优化
+
+> 上游文档：`docs/plans/2026-04-26-site-admin-next-steps.md`（4 Sprint backlog 计划）+ `docs/plans/2026-04-26-sprint-c-verification-report.md`（Sprint C 后端联调验收报告，5/6 全实测通过）。
+
+#### Sprint C · 后端关键修复（5/6 任务，C2 跨仓改 rs-core 留独立会话）
+
+- **C1 graceful shutdown 上线（B5 / Phase 10，commit `26ffc5f`）**：
+  - `web_server::AppState` 新增 `shutdown_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<()>>>>`，启动 axum 前创建 oneshot 通道，sender 写入 state，receiver 喂给 `axum::serve(...).with_graceful_shutdown(...)`。
+  - `site_config_handlers::save_site_config` / `restart_server` 在写盘 / 收到请求后调 `trigger_graceful_shutdown(&state)` 触发 graceful 退出，由进程级 supervisor（systemd / nssm / pm2）拉起新进程；返回新字段 `graceful_shutdown_triggered: bool` + 文案区分「已触发 / 未启用」。
+  - 实测验收（HTTP）：POST `/api/site-config/restart` → `graceful_shutdown_triggered: true` + 8 秒内进程退出（exit code 0），axum / handler 双日志均打印。
+- **C3 reload baseline 误报修复（同 commit `26ffc5f`）**：新增 `ENV_OVERRIDABLE_KEYS = &["surrealdb"]` 白名单，`reload_site_config` 把 `static_changed` 拆成 `static_changed_keys_user` + `static_changed_keys_env`；`requires_restart` 仅看 user 是否非空。响应保留旧字段 `static_changed_keys`（合并）向后兼容，新增 `_user` / `_env` 分类字段。验收：baseline 现在返回 `actions: ["no_change"]`（之前永远报 `manual_restart_required`，因 `surrealdb` 受 `SURREAL_CONN_*` env 覆盖）。
+- **C4 `/api/remote-sync/*` admin auth 失效根因修复（commit `16b8f39`）**：root cause 是 axum 0.8 在 `Router<()>.merge` 进 `Router<AppState>` 后，外层 `.route_layer(middleware::from_fn(...))` 偶发不生效；修复为把 `admin_auth_middleware` 内移到 `create_remote_sync_routes()` 末尾用 `.layer(...)` 注入（与 `admin_handlers` / `admin_registry_handlers` 风格一致）。验收：未鉴权 GET `/api/remote-sync/envs` 现返回 503 + 标准未授权消息（之前实测 200）。
+- **C5 SSE `MqttSubscriptionStatusChanged` 漏首事件防护（commit `5ab958d`）**：`sse_handlers::sync_events_handler` 在 broadcast subscribe 之后、live 流之前**立即** emit 一条「当前 MQTT 订阅状态快照」（复用 `push_subscription_status_event` 字段口径，从本地 `node_config` SQLite + `REMOTE_RUNTIME` 计算）。即使 BroadcastStream 在 listener 与 sender 几乎同时漏掉首条 broadcast 事件，前端仍能从 snapshot 拿到正确状态。验收：`curl -N` 进流即收到 `data: {"type":"MqttSubscriptionStatusChanged",...}`，**无须任何前置 set_master/set_client 操作**。
+- **C6 `/api/admin/sites/{id}/restart` 端点 + 前端重启按钮（commit `1402968`）**：`managed_project_sites::restart_site` 串联 `stop_site` → `tokio::time::sleep(500ms)` → `start_site`，stop 检测到端口冲突时 bail 并展示外部 PIDs；前端 `SiteDataTable` 行 action + `SiteDetailHeader` 头部加「重启」按钮（仅 Running 时可见），`SiteAction` 联合类型与 `siteActionLabelMap` 同步加 `restart` 标签，`canRestartSite` 守卫 + pending label「重启中」。
+- **Sprint C 后端联调验收报告（commit `61e1a69`）**：`docs/plans/2026-04-26-sprint-c-verification-report.md`，按 plant-model-gen `AGENTS.md` 规范用真后端 + curl/PowerShell 验证 6 个端点 + smoke 脚本 20/20 PASS。已知偏差：smoke 脚本期望 `2..|503|401|403` 容忍度过高（建议改 `503|401|403`）；本机无 supervisor 故 C1 进程退出后未自动拉起；C6 完整业务路径需配 ADMIN_USER/ADMIN_PASS 后再跑（端点路由层已通过 503 验证存在）。
+
+#### Sprint D · 站点管理体验优化（6/6 任务）
+
+- **D2 hi-fi 删除弹框（commit `b6d129b`）**：新增 `ui/admin/src/components/sites/SiteDeleteDialog.vue` 替代 `window.confirm`，弹框含项目名 echo + site_id 复制按钮 + 危险色主键 + Esc/遮罩取消，UX 与 `design/site-admin-flow-demo/PLAN.md §5 Phase E` 对齐。
+- **D4 端口冲突前端预检 + `/api/admin/ports/check`（commit `111234d`）**：后端 `managed_project_sites::process_ids_on_port` 改 `pub(crate)`；新增 `GET /api/admin/ports/check?port=&host=` 端点（admin auth 拦截，host 仅作 echo）。前端 `SiteDrawer.vue` db_port / web_port `@blur` 时调用，inline 三态提示（空闲 / 占用+PIDs / 失败），编辑模式下与既有端口一致时跳过预检。
+- **D5 日志分页尾部 + 全量下载（commit `5e61e41`）**：后端新增 2 个端点：`GET /api/admin/sites/{id}/logs/{kind}?limit=N` 返回最后 N 行（钳制 1-5000）+ `total_lines` / `truncated` 字段；`GET /api/admin/sites/{id}/logs/{kind}/download` 走 `text/plain` + `Content-Disposition: attachment` 触发浏览器下载（filename 含 site_id / kind / UTC 时间戳）。前端 `SiteDetailView.vue` 详情页"加载更多"按钮（limit ×2 至 5000）+ "下载完整日志"按钮（fetch + Authorization Bearer + blob + a.click，**避开浏览器原生 navigate 丢 token 的问题**）。
+- **D6.1 详情 tab URL 持久化（commit `4438fda`）**：`SiteDetailView` `activeTab` 通过 `route.query.tab` 双向同步（`watch` flush:'post' 防回环），刷新页面 / 分享链接均保留 tab 选择。
+- **D6.2 列表表头点击排序（commit `97a6f56`）**：`SiteDataTable` 4 列（项目名称 / 状态 / 端口 / 风险）支持点击排序，asc/desc 翻转 + 显示排序图标，纯前端排序不动后端；风险列按 `normal < warning < critical` 自然顺序。
+- **D6.3 克隆站点（commit `f9684ec`）**：`SiteDrawer` 新增 `clone: boolean` prop；克隆模式下从既有 site 拉取数据但保持创建语义——project_name 自动加 `(副本)` 后缀、db_port / web_port 各 +1、清空凭据强制重填、提交走 createSite。`SitesView` 加 `cloningSiteId` 状态，`SiteDataTable` 行 action 加「克隆」按钮（Copy 图标）。
+- **D3 批量操作（commit `2fd1c37`）**：`sitesStore` 新增 `bulkAction(siteIds, action)`，串行调用每条 site 的对应单条 action，避免一次过载机器（站点启动 CPU/内存高，并发会撞阈值）；返回 `{ total, ok, failed: [{ siteId, message }] }`。`SiteDataTable` 加多选 checkbox（表头全选 + 行级），`SitesView` 加批量工具条（启动 / 停止 / 重启 / 解析 / 删除 5 个动作 + 进度提示 + 完成 banner，失败的 site 保留勾选便于重试）；批量删除走 `window.confirm` 预警提示（单条删除仍走 hi-fi 弹框）。
+
+### Docs
+
+- **`docs/plans/2026-04-26-site-admin-next-steps.md`（commit `cbade5e`）**：248 行计划文档，覆盖三套「站点」系统盘点（admin sites / deployment-sites / site-config）、25 项 gap 按 P0–P3 风险分级、4 个 Sprint backlog（C/D/E/F 共 ~17 dev-days）、立即落地点（C1 + C3）实施步骤、风险与不做的事。
+- **`docs/plans/2026-04-26-sprint-c-verification-report.md`（commit `61e1a69`）**：Sprint C 5/6 任务后端联调验收报告，含验收方法（按 AGENTS.md 用真后端 + curl）、启动状态、6 个验收项的命令与实际响应、已知偏差与后续计划。
+
+### Added — 异地协同 Sprint B 后端 stub 收口（先于 Sprint C 完成，记录在前）
 
 - **异地协同 Sprint B 后端 stub 收口（G6/G7 共 4 个 Phase 提交）**：完成跨仓 `plant-collab-monitor` 前端依赖的全部 MQTT/订阅类后端补齐，关闭 G6 全部 7 子项，G7 = B6 reload 落最小可用版。
   - **Phase 8（B1 + B3 + B7，commit `94bc86e`）**：

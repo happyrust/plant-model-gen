@@ -10,8 +10,27 @@ import type {
   UpdateManagedSiteRequest,
 } from '@/types/site'
 
+export interface PortCheckResult {
+  port: number
+  host: string | null
+  in_use: boolean
+  pids: number[]
+}
+
 export const sitesApi = {
   resourceSummary: () => apiGet<AdminResourceSummary>('/api/admin/resources/summary'),
+
+  /**
+   * D4 / Sprint D · 端口占用预检
+   *
+   * Drawer 的 db_port / web_port onBlur 时调用，<300ms 反馈是否被本机
+   * 其他进程占用，避免提交后才暴露冲突。
+   */
+  checkPort: (port: number, host?: string) => {
+    const params = new URLSearchParams({ port: String(port) })
+    if (host) params.set('host', host)
+    return apiGet<PortCheckResult>(`/api/admin/ports/check?${params.toString()}`)
+  },
 
   list: () => apiGet<ManagedProjectSite[]>('/api/admin/sites'),
 

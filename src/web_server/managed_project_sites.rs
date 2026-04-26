@@ -2663,7 +2663,15 @@ async fn wait_for_http_ok(url: &str, attempts: usize, delay_ms: u64) -> bool {
 
 // ─── Port helpers ───────────────────────────────────────────────────────────
 
-async fn process_ids_on_port(port: u16) -> Result<Vec<u32>> {
+/// 列出占用指定端口的进程 PID 列表。
+///
+/// 实现：Unix 走 `lsof -i:PORT -sTCP:LISTEN`，Windows 走
+/// `netstat -ano` + 过滤 `LISTENING`。返回空 Vec 表示端口未被占用（或
+/// 占用进程已退出）。
+///
+/// `pub(crate)` 是为了让 `admin_handlers::ports_check` 端点（D4）复用，
+/// 避免在多处重复实现端口探测逻辑。
+pub(crate) async fn process_ids_on_port(port: u16) -> Result<Vec<u32>> {
     #[cfg(unix)]
     {
         let output = Command::new("lsof")

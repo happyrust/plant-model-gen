@@ -40,6 +40,90 @@ const previewPlan = ref<ManagedSiteParsePlan | null>(null)
 let previewTimer: ReturnType<typeof setTimeout> | null = null
 let previewRequestSeq = 0
 
+// D4 / Sprint D · 修 G12：端口冲突前端预检
+//
+// Drawer 提交前 onBlur 调 /api/admin/ports/check，给用户立即反馈端口是否
+// 已被本机其他进程占用。提示是软警告（不阻断提交，因为：
+//   1. 编辑既有站点时端口可能本来就归这个站点的子进程，自我冲突属正常
+//   2. 后端创建/启动会再次校验，是真正的 source of truth）。
+type PortFieldKey = 'db_port' | 'web_port'
+type PortStatus =
+  | { state: 'idle' }
+  | { state: 'checking' }
+  | { state: 'available' }
+  | { state: 'in_use'; pids: number[] }
+  | { state: 'error'; message: string }
+
+const portStatuses = ref<Record<PortFieldKey, PortStatus>>({
+  db_port: { state: 'idle' },
+  web_port: { state: 'idle' },
+})
+const portCheckSeq: Record<PortFieldKey, number> = {
+  db_port: 0,
+  web_port: 0,
+}
+
+async function checkPortField(field: PortFieldKey) {
+  const port = field === 'db_port' ? form.value.db_port : form.value.web_port
+  if (!port || port < 1 || port > 65535) {
+    portStatuses.value[field] = { state: 'idle' }
+    return
+  }
+  // 编辑模式下，如端口与既有 site 一致，跳过预检（自己占自己不算冲突）
+  if (existingSite.value) {
+    const stored = field === 'db_port' ? existingSite.value.db_port : existingSite.value.web_port
+    if (stored === port) {
+      portStatuses.value[field] = { state: 'idle' }
+      return
+    }
+  }
+  const seq = ++portCheckSeq[field]
+  portStatuses.value[field] = { state: 'checking' }
+  try {
+    const result = await sitesApi.checkPort(port, form.value.bind_host?.trim() || undefined)
+    if (seq !== portCheckSeq[field]) return
+    if (result.in_use) {
+      portStatuses.value[field] = { state: 'in_use', pids: result.pids }
+    } else {
+      portStatuses.value[field] = { state: 'available' }
+    }
+  } catch (e) {
+    if (seq !== portCheckSeq[field]) return
+    portStatuses.value[field] = {
+      state: 'error',
+      message: e instanceof Error ? e.message : '端口探测失败',
+    }
+  }
+}
+
+function portStatusLabel(status: PortStatus): string {
+  switch (status.state) {
+    case 'idle':
+      return ''
+    case 'checking':
+      return '端口探测中...'
+    case 'available':
+      return '端口空闲，可用'
+    case 'in_use':
+      return `端口已被本机进程占用 (PIDs: ${status.pids.join(', ')})`
+    case 'error':
+      return `端口探测失败：${status.message}`
+  }
+}
+
+function portStatusClass(status: PortStatus): string {
+  switch (status.state) {
+    case 'available':
+      return 'text-emerald-600 dark:text-emerald-400'
+    case 'in_use':
+      return 'text-amber-600 dark:text-amber-400'
+    case 'error':
+      return 'text-destructive'
+    default:
+      return 'text-muted-foreground'
+  }
+}
+
 const form = ref<CreateManagedSiteRequest>({
   project_name: '',
   project_path: '',
@@ -90,6 +174,10 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
   if (!open) return
   error.value = ''
   previewError.value = ''
+  portStatuses.value = {
+    db_port: { state: 'idle' },
+    web_port: { state: 'idle' },
+  }
   if (siteId) {
     try {
       existingSite.value = await sitesApi.get(siteId)
@@ -341,11 +429,41 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
               <div class="grid grid-cols-2 gap-4">
                 <div class="space-y-2">
                   <label class="text-sm font-medium">DB 端口 *</label>
-                  <input v-model.number="form.db_port" type="number" required min="1" max="65535" :class="inputClass" />
+                  <input
+                    v-model.number="form.db_port"
+                    type="number"
+                    required
+                    min="1"
+                    max="65535"
+                    :class="inputClass"
+                    @blur="checkPortField('db_port')"
+                  />
+                  <p
+                    v-if="portStatuses.db_port.state !== 'idle'"
+                    class="text-xs"
+                    :class="portStatusClass(portStatuses.db_port)"
+                  >
+                    {{ portStatusLabel(portStatuses.db_port) }}
+                  </p>
                 </div>
                 <div class="space-y-2">
                   <label class="text-sm font-medium">Web 端口 *</label>
-                  <input v-model.number="form.web_port" type="number" required min="1" max="65535" :class="inputClass" />
+                  <input
+                    v-model.number="form.web_port"
+                    type="number"
+                    required
+                    min="1"
+                    max="65535"
+                    :class="inputClass"
+                    @blur="checkPortField('web_port')"
+                  />
+                  <p
+                    v-if="portStatuses.web_port.state !== 'idle'"
+                    class="text-xs"
+                    :class="portStatusClass(portStatuses.web_port)"
+                  >
+                    {{ portStatusLabel(portStatuses.web_port) }}
+                  </p>
                 </div>
               </div>
               <div class="space-y-2">

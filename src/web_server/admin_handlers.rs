@@ -1,11 +1,11 @@
 use axum::{
-    extract::{Json, Path},
+    extract::{Json, Path, Query},
     middleware,
     response::IntoResponse,
     routing::{delete, get, post, put},
     Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::web_server::{
@@ -22,6 +22,7 @@ pub fn create_admin_routes() -> Router {
     Router::new()
         .route("/api/admin/resources/summary", get(get_resource_summary))
         .route("/api/admin/app-config", get(get_app_config))
+        .route("/api/admin/ports/check", get(check_port))
         .route("/api/admin/sites", get(list_sites).post(create_site))
         .route(
             "/api/admin/sites/preview-parse-plan",
@@ -81,6 +82,45 @@ pub async fn get_resource_summary() -> impl IntoResponse {
 
 pub async fn get_app_config() -> impl IntoResponse {
     admin_response::ok("获取应用配置成功", resolve_admin_app_config())
+}
+
+/// 端口占用预检（D4 / Sprint D · 修 G12）
+///
+/// 给前端 `SiteDrawer` 的端口字段 onBlur 校验用，**仅在 admin 鉴权后** 暴露。
+/// 复用 `managed_project_sites::process_ids_on_port` 探测 PID 列表，规避
+/// "前端啥都没说，提交才报冲突"的尴尬期。
+///
+/// 行为：
+/// - `port == 0` 视为非法，返回 400-style error
+/// - 端口空闲：`{ in_use: false, pids: [] }`
+/// - 端口占用：`{ in_use: true, pids: [...] }`
+/// - host 仅作 echo，不参与判定（同一进程 bind 0.0.0.0 会与 127.0.0.1 冲突）
+#[derive(Debug, Deserialize)]
+pub struct PortCheckQuery {
+    pub port: u16,
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+pub async fn check_port(Query(params): Query<PortCheckQuery>) -> impl IntoResponse {
+    if params.port == 0 {
+        return admin_response::managed_error("port 参数不能为 0".to_string());
+    }
+    let pids = match crate::web_server::managed_project_sites::process_ids_on_port(params.port)
+        .await
+    {
+        Ok(pids) => pids,
+        Err(err) => return admin_response::managed_error(err.to_string()),
+    };
+    admin_response::ok(
+        "端口探测完成",
+        json!({
+            "port": params.port,
+            "host": params.host,
+            "in_use": !pids.is_empty(),
+            "pids": pids,
+        }),
+    )
 }
 
 pub async fn create_site(Json(payload): Json<CreateManagedSiteRequest>) -> impl IntoResponse {

@@ -3208,6 +3208,32 @@ pub async fn parse_site(site_id: String) -> Result<()> {
     Ok(())
 }
 
+/// 重启站点（C6 / Sprint C · 修 G10）
+///
+/// 串联 `stop_site` → 短暂等待 → `start_site`，作为单个原子化的"重启"动作
+/// 暴露给 admin 前端，避免用户手动两步操作期间的状态尴尬期
+/// （Stopping → Stopped → Starting）。
+///
+/// 实现要点：
+/// - stop 阶段如发生端口冲突（外部进程占用），直接 bail，由前端展示原因
+/// - stop 与 start 之间留 500ms 缓冲，让进程组完全退出 + socket TIME_WAIT
+///   清理一部分；端口完全可用的兜底由 `start_site` 内部的 `WAIT_PORT_ATTEMPTS`
+///   （30 次 × 500ms）承担
+/// - start 失败后状态会被 `start_site` spawn 的内部错误路径写为 Failed，
+///   外部调用方只需关注函数返回的 Result
+pub async fn restart_site(site_id: &str) -> Result<()> {
+    let stop_result = stop_site(site_id).await?;
+    if stop_result.conflict {
+        bail!(
+            "停止站点时检测到端口冲突（web={:?} db={:?}），无法继续重启；请先排查外部占用",
+            stop_result.web_conflict_pids,
+            stop_result.db_conflict_pids
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    start_site(site_id.to_string()).await
+}
+
 pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
     // 注：stop_site 不持 lock_op()——std::sync::MutexGuard 无法跨 await 持有，
     // 而 create/update/delete 都有 `site_has_active_processes` 的状态校验兜底，

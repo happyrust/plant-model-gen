@@ -258,6 +258,15 @@ async function handleStop() {
   }
 }
 
+async function handleRestart() {
+  try {
+    await sitesStore.restartSite(siteId.value)
+    await fetchAll()
+  } catch {
+    // 错误已写入 store，页面横幅会显示
+  }
+}
+
 async function handleParse() {
   try {
     await sitesStore.parseSite(siteId.value)
@@ -287,6 +296,7 @@ onMounted(async () => {
       @back="router.push({ path: '/sites' })"
       @start="handleStart"
       @stop="handleStop"
+      @restart="handleRestart"
       @parse="handleParse"
       @refresh="fetchAll"
       @open-viewer="openViewer()"

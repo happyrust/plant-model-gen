@@ -9,7 +9,7 @@ import type {
   UpdateManagedSiteRequest,
 } from '@/types/site'
 
-export type SiteAction = 'parse' | 'start' | 'stop' | 'delete'
+export type SiteAction = 'parse' | 'start' | 'stop' | 'restart' | 'delete'
 export interface SiteActionError {
   siteId: string
   action: SiteAction
@@ -120,11 +120,18 @@ export const useSitesStore = defineStore('sites', () => {
     })
   }
 
+  async function restartSite(id: string) {
+    await withAction(id, 'restart', async () => {
+      await sitesApi.restart(id)
+      await fetchSites()
+    })
+  }
+
   return {
     sites, stats, loading, error,
     pendingActions, actionErrors, latestActionError,
     getSiteAction, isSiteActionPending, getSiteActionError, clearSiteActionError,
     fetchSites, createSite, updateSite, deleteSite,
-    parseSite, startSite, stopSite,
+    parseSite, startSite, stopSite, restartSite,
   }
 })

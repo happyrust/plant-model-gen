@@ -2,11 +2,12 @@
 import { useRouter } from 'vue-router'
 import { useSitesStore } from '@/stores/sites'
 import type { ManagedProjectSite, ManagedSiteRiskLevel } from '@/types/site'
-import { Eye, ExternalLink, FolderPlus, Loader2, Pencil, Play, RefreshCw, Square, Trash2 } from 'lucide-vue-next'
+import { Eye, ExternalLink, FolderPlus, Loader2, Pencil, Play, RefreshCw, RotateCcw, Square, Trash2 } from 'lucide-vue-next'
 import {
   canDeleteSite,
   canEditSite,
   canParseSite,
+  canRestartSite,
   canStartSite,
   canStopSite,
   parsePlanClass as getParsePlanClass,
@@ -41,6 +42,7 @@ const riskConfig: Record<ManagedSiteRiskLevel, { class: string; label: string }>
 const canStart = canStartSite
 const canStop = canStopSite
 const canParse = canParseSite
+const canRestart = canRestartSite
 const canDelete = canDeleteSite
 const canEdit = canEditSite
 function confirmDelete(site: ManagedProjectSite) {
@@ -71,6 +73,14 @@ async function handleStart(siteId: string) {
 async function handleStop(siteId: string) {
   try {
     await sitesStore.stopSite(siteId)
+  } catch {
+    // 错误已写入 store
+  }
+}
+
+async function handleRestart(siteId: string) {
+  try {
+    await sitesStore.restartSite(siteId)
   } catch {
     // 错误已写入 store
   }
@@ -191,7 +201,7 @@ async function handleDelete(siteId: string) {
             <div v-if="isPending(site.site_id)" class="flex items-center justify-end gap-2">
               <Loader2 class="h-4 w-4 animate-spin text-muted-foreground" />
               <span class="text-xs text-muted-foreground">
-                {{ pendingAction(site.site_id) === 'start' ? '启动中' : pendingAction(site.site_id) === 'stop' ? '停止中' : pendingAction(site.site_id) === 'parse' ? '解析中' : '处理中' }}
+                {{ pendingAction(site.site_id) === 'start' ? '启动中' : pendingAction(site.site_id) === 'stop' ? '停止中' : pendingAction(site.site_id) === 'restart' ? '重启中' : pendingAction(site.site_id) === 'parse' ? '解析中' : '处理中' }}
               </span>
             </div>
             <div v-else class="flex items-center justify-end gap-1">
@@ -210,6 +220,14 @@ async function handleDelete(siteId: string) {
                 title="停止"
               >
                 <Square class="h-3.5 w-3.5 text-amber-600" />
+              </button>
+              <button
+                v-if="canRestart(site)"
+                @click="handleRestart(site.site_id)"
+                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
+                title="重启"
+              >
+                <RotateCcw class="h-3.5 w-3.5 text-blue-600" />
               </button>
               <button
                 v-if="canParse(site)"

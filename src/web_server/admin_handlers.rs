@@ -34,6 +34,7 @@ pub fn create_admin_routes() -> Router {
         .route("/api/admin/sites/{id}/parse", post(parse_site))
         .route("/api/admin/sites/{id}/start", post(start_site))
         .route("/api/admin/sites/{id}/stop", post(stop_site))
+        .route("/api/admin/sites/{id}/restart", post(restart_site))
         .route("/api/admin/sites/{id}/runtime", get(get_site_runtime))
         .route("/api/admin/sites/{id}/logs", get(get_site_logs))
         .layer(middleware::from_fn(admin_auth_middleware))
@@ -159,6 +160,20 @@ pub async fn stop_site(Path(site_id): Path<String>) -> impl IntoResponse {
             result.web_conflict_pids, result.db_conflict_pids
         )),
         Ok(result) => admin_response::ok("停止站点成功", result.site),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+/// 重启站点（C6 / Sprint C · 修 G10）
+///
+/// 提交一个 stop → start 的串联任务并立即返回 202 Accepted；后端实际状态
+/// 翻转通过 `/api/admin/sites/{id}/runtime` 轮询或 SSE（Sprint D · D1）感知。
+pub async fn restart_site(Path(site_id): Path<String>) -> impl IntoResponse {
+    match managed_sites::restart_site(&site_id).await {
+        Ok(()) => admin_response::accepted(
+            "已提交重启任务",
+            json!({ "site_id": site_id, "action": "restart" }),
+        ),
         Err(err) => admin_response::managed_error(err.to_string()),
     }
 }

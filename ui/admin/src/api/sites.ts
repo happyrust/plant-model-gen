@@ -40,6 +40,9 @@ export const sitesApi = {
   stop: (id: string) =>
     apiPost<ManagedProjectSite>(`/api/admin/sites/${id}/stop`),
 
+  restart: (id: string) =>
+    apiPostRaw<{ site_id: string; action: string }>(`/api/admin/sites/${id}/restart`),
+
   runtime: (id: string) =>
     apiGet<ManagedSiteRuntimeStatus>(`/api/admin/sites/${id}/runtime`),
 

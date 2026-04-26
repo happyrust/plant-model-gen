@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ArrowLeft, ExternalLink, Loader2, Pencil, Play, RefreshCw, Square } from 'lucide-vue-next'
+import { ArrowLeft, ExternalLink, Loader2, Pencil, Play, RefreshCw, RotateCcw, Square } from 'lucide-vue-next'
 import type { ManagedProjectSite } from '@/types/site'
 import {
   canEditSite,
   canParseSite,
+  canRestartSite,
   canStartSite,
   canStopSite,
   parsePlanClass,
@@ -27,6 +28,7 @@ function actionLabel() {
   const action = sitesStore.getSiteAction(props.site.site_id)
   if (action === 'start') return '启动中...'
   if (action === 'stop') return '停止中...'
+  if (action === 'restart') return '重启中...'
   if (action === 'parse') return '解析中...'
   return '处理中...'
 }
@@ -35,6 +37,7 @@ defineEmits<{
   back: []
   start: []
   stop: []
+  restart: []
   parse: []
   refresh: []
   openViewer: []
@@ -46,6 +49,9 @@ function canStart() {
 }
 function canStop() {
   return props.site ? canStopSite(props.site) : false
+}
+function canRestart() {
+  return props.site ? canRestartSite(props.site) : false
 }
 function canParse() {
   return props.site ? canParseSite(props.site) : false
@@ -126,6 +132,14 @@ function canEdit() {
           class="inline-flex h-9 items-center gap-2 rounded-md bg-amber-600 px-4 text-sm font-medium text-white shadow hover:bg-amber-700 transition-colors"
         >
           <Square class="h-4 w-4" /> 停止
+        </button>
+        <button
+          v-if="canRestart()"
+          @click="$emit('restart')"
+          class="inline-flex h-9 items-center gap-2 rounded-md border border-input bg-transparent px-3 text-sm font-medium hover:bg-accent transition-colors"
+          title="重启（先停后启）"
+        >
+          <RotateCcw class="h-4 w-4" /> 重启
         </button>
         <button
           v-if="site.status === 'Running' && viewerUrl"

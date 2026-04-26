@@ -61,6 +61,7 @@
 
 - `docs/plans/2026-04-26-sprint-b-plan.md`：异地协同 Sprint B 后端 stub 收口主计划，含 7 子任务（B1-B7）拆解、6 Phase 时间线、风险表与执行节奏；本次记录 4 Phase 落地（Phase 8/9/11/12，剩 Phase 10 = B5 graceful shutdown / Phase 11-Plus = B6 真热加载 / Phase 12-Plus = B4 跨仓前端联调 / Phase 7-Plus = 后端联调验收报告）。
 - `docs/plans/2026-04-26-sprint-b-phase11-b6-reload.md`：Phase 11 子计划，含背景核查结论、A 方案设计、HOT_RELOADABLE_KEYS 白名单设计、6 场景验收表与升级路径（rs-core OnceCell → RwLock<Arc<DbOption>>）。
+- **`remote-collaboration-architecture.svg`（仓库根新增）**：1400×840 异地协同架构总览图（SVG，纯文本可 diff），呈现 Plant3D Web + plant-model-gen + 空间定位 + 模块化校审的「远程多角色协同闭环」分层视图，作为 Sprint B/C 异地协同链路的可视化文档资产，配合 `docs/plans/2026-04-26-sprint-b-plan.md` 与 `docs/plans/2026-04-26-sprint-c-verification-report.md` 使用，便于跨仓评审与新成员入门。
 
 ## 2026-04-25
 

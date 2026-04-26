@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::{fs, path::Path as FsPath, time::SystemTime};
 
 use crate::web_server::AppState;
 
@@ -65,6 +66,16 @@ pub struct ChangedFile {
     pub db_num: Option<u32>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveFile {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub modified: Option<String>,
+    pub dbnum: Option<u32>,
+    pub sesno: Option<u32>,
+}
+
 /// 变更类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -72,6 +83,98 @@ pub enum ChangeType {
     Added,
     Modified,
     Deleted,
+}
+
+fn system_time_to_rfc3339(time: SystemTime) -> String {
+    DateTime::<Utc>::from(time).to_rfc3339()
+}
+
+fn digit_runs(input: &str) -> Vec<u32> {
+    let mut runs = Vec::new();
+    let mut current = String::new();
+
+    for ch in input.chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            if let Ok(value) = current.parse::<u32>() {
+                runs.push(value);
+            }
+            current.clear();
+        }
+    }
+
+    if !current.is_empty() {
+        if let Ok(value) = current.parse::<u32>() {
+            runs.push(value);
+        }
+    }
+
+    runs
+}
+
+fn infer_dbnum(file_stem: &str) -> Option<u32> {
+    digit_runs(file_stem)
+        .into_iter()
+        .find(|value| *value >= 1000)
+}
+
+fn infer_sesno(file_stem: &str, dbnum: Option<u32>) -> Option<u32> {
+    digit_runs(file_stem)
+        .into_iter()
+        .filter(|value| Some(*value) != dbnum)
+        .next_back()
+}
+
+/// 列出本地已生成的 CBA 归档包，供 collab monitor 的归档页面展示与下载。
+pub async fn list_incremental_archives() -> Result<Json<serde_json::Value>, StatusCode> {
+    let archive_dir = FsPath::new("assets/archives");
+    let mut files = Vec::new();
+
+    if archive_dir.exists() {
+        let entries = fs::read_dir(archive_dir).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let name = match path.file_name().and_then(|name| name.to_str()) {
+                Some(name) if name.to_ascii_lowercase().ends_with(".cba") => name.to_string(),
+                _ => continue,
+            };
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("");
+            let dbnum = infer_dbnum(stem);
+
+            files.push(ArchiveFile {
+                path: format!("/assets/archives/{}", name),
+                name,
+                size: metadata.len(),
+                modified: metadata.modified().ok().map(system_time_to_rfc3339),
+                dbnum,
+                sesno: infer_sesno(stem, dbnum),
+            });
+        }
+    }
+
+    files.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    Ok(Json(json!({
+        "success": true,
+        "files": files,
+    })))
 }
 
 /// 获取所有部署站点的增量更新状态

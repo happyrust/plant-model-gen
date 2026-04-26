@@ -2,6 +2,17 @@
 
 ## 2026-04-26
 
+### Added — 异地协同归档列表 API（本次提交）
+
+> 为 `plant-collab-monitor` Phase 7-Plus 真实浏览器联调补齐 `/archives` 页面所需后端接口。
+
+- 新增 `GET /api/incremental/archives`，扫描本地 `assets/archives/*.cba`。
+- 返回前端已使用的 `{ success: true, files: [...] }` 结构。
+- 文件项包含 `name`、`path`、`size`、`modified`、`dbnum`、`sesno`。
+- `path` 指向已有静态服务 `/assets/archives/{name}`，下载链路复用现有 `ServeDir::new("assets/archives")`。
+- 当目录不存在或暂无 `.cba` 文件时返回空数组而非 404，避免前端 `/archives` 页面产生 console error。
+- 验证：`cargo check --bin web_server --features web_server` 通过；`cargo build --bin web_server --features web_server` 通过；前端 `npm run smoke:phase7-plus` 通过。
+
 ### Added — Sprint C 站点管理后端 stub 收口 + Sprint D 体验优化
 
 > 上游文档：`docs/plans/2026-04-26-site-admin-next-steps.md`（4 Sprint backlog 计划）+ `docs/plans/2026-04-26-sprint-c-verification-report.md`（Sprint C 后端联调验收报告，5/6 全实测通过）。

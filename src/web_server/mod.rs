@@ -596,6 +596,10 @@ pub async fn start_web_server_with_config(
             "/api/incremental/config",
             post(incremental_update_handlers::update_incremental_config),
         )
+        .route(
+            "/api/incremental/archives",
+            get(incremental_update_handlers::list_incremental_archives),
+        )
         // 增量更新页面
         .route(
             "/incremental",

@@ -13,6 +13,7 @@ import {
 import { extractErrorMessage } from '@/api/client'
 import { sitesApi, type ManagedSiteLogKind } from '@/api/sites'
 import { usePolling } from '@/composables/usePolling'
+import { useAdminSitesStream } from '@/composables/useAdminSitesStream'
 import { useSitesStore } from '@/stores/sites'
 import SiteDetailHeader from '@/components/sites/SiteDetailHeader.vue'
 import SiteRuntimeCards from '@/components/sites/SiteRuntimeCards.vue'
@@ -392,6 +393,39 @@ async function handleParse() {
 function copyText(text: string) {
   navigator.clipboard.writeText(text)
 }
+
+// D1 / Sprint D · 修 G7：详情页接入 SSE 实时化
+//
+// 状态字段（status / parse_status / last_error / project_name）由 SSE
+// AdminSiteSnapshot 即时推送 patch，避免 10s polling 才能看到状态翻转。
+// 资源指标（runtime.resources）+ 日志（logs）仍走 polling，等 D1 后续
+// Phase 加 AdminSiteResource 事件后再剥离。
+//
+// 仅响应当前路由 site_id 的事件；其他 site 的 snapshot 直接 ignore。
+useAdminSitesStream({
+  callbacks: {
+    onSnapshot: (payload) => {
+      if (payload.site_id !== siteId.value) return
+      if (!site.value) return
+      site.value = {
+        ...site.value,
+        project_name: payload.project_name ?? site.value.project_name,
+        status: payload.status as ManagedProjectSite['status'],
+        parse_status: payload.parse_status as ManagedProjectSite['parse_status'],
+        last_error: payload.last_error ?? null,
+      }
+      // runtime（资源 + pid）仍由 10s polling 刷新；SSE 仅负责状态字段 patch
+    },
+    onDeleted: (payload) => {
+      if (payload.site_id !== siteId.value) return
+      // 当前详情页对应的 site 被删除（极少见，通常用户在另一个 tab 删除），
+      // 跳回列表页。
+      void router.replace({ path: '/sites' })
+    },
+    // 重连成功时由 SitesView 的 onConnect 触发 fetchSites，
+    // 详情页只关心当前 site，重连后 polling 自然会拉到最新值。
+  },
+})
 
 const { start: startPolling } = usePolling(fetchAll, 10000)
 

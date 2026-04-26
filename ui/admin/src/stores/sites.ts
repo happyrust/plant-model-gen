@@ -7,7 +7,14 @@ import type {
   SiteStats,
   CreateManagedSiteRequest,
   UpdateManagedSiteRequest,
+  ManagedSiteStatus,
+  ManagedSiteParseStatus,
 } from '@/types/site'
+import type {
+  AdminSiteSnapshotPayload,
+  AdminSiteCreatedPayload,
+  AdminSiteDeletedPayload,
+} from '@/composables/useAdminSitesStream'
 
 export type SiteAction = 'parse' | 'start' | 'stop' | 'restart' | 'delete'
 export interface SiteActionError {
@@ -108,6 +115,67 @@ export const useSitesStore = defineStore('sites', () => {
     })
   }
 
+  // ─── D1 / Sprint D · SSE patcher（修 G7/G8） ─────────────────────────────
+  //
+  // 前端订阅 `/api/sync/events` 后，把 admin 站点事件按 site_id patch 到
+  // 本地 `sites.value` 中，避免每次状态变更都全量 `fetchSites()`。
+  //
+  // 设计取舍：
+  // - `AdminSiteSnapshot` → 仅 patch 已知字段（status/parse_status/last_error/project_name），
+  //   事件未携带的字段（runtime_dir / risk_level / created_at 等）保留旧值；
+  // - `AdminSiteCreated` → payload 仅 site_id + project_name，缺少 db_port / status 等
+  //   完整字段，调用方应直接 fetchSites() 拉完整列表（一次性轻量 GET），
+  //   本 patcher 不构造不完整的 site 对象避免 UI 闪烁；
+  // - `AdminSiteDeleted` → 直接 filter 掉，幂等。
+  //
+  // 重连成功后调用方应调一次 fetchSites() 兜底，弥补断流期间漏掉的事件。
+
+  /**
+   * 按 site_id patch 现有 site 的局部字段（D1 SSE handler）
+   *
+   * 命中：仅当 site 已存在于 `sites.value` 时 patch；
+   * 未命中：silent ignore（极少出现，通常说明 SSE 在 fetchSites 之前到达，
+   * 下次 fetchSites 自然会补上）。
+   */
+  function patchSiteSnapshot(payload: AdminSiteSnapshotPayload) {
+    const idx = sites.value.findIndex((s) => s.site_id === payload.site_id)
+    if (idx === -1) return
+    const current = sites.value[idx]
+    sites.value.splice(idx, 1, {
+      ...current,
+      project_name: payload.project_name ?? current.project_name,
+      status: payload.status as ManagedSiteStatus,
+      parse_status: payload.parse_status as ManagedSiteParseStatus,
+      last_error: payload.last_error ?? null,
+    })
+  }
+
+  /**
+   * `AdminSiteCreated` 事件处理（D1 SSE handler）
+   *
+   * payload 字段不足以构造完整 site，触发轻量级全量 fetchSites。
+   * 多次连续 created（批量创建）会去抖到一次（fetchSites 内部已有 loading 标志）。
+   */
+  async function handleSiteCreated(_payload: AdminSiteCreatedPayload) {
+    await fetchSites()
+  }
+
+  /**
+   * `AdminSiteDeleted` 事件处理（D1 SSE handler）
+   */
+  function handleSiteDeleted(payload: AdminSiteDeletedPayload) {
+    sites.value = sites.value.filter((s) => s.site_id !== payload.site_id)
+  }
+
+  /**
+   * SSE 重连成功兜底（D1 SSE handler）
+   *
+   * 断流期间可能漏掉的事件由这一次全量 fetchSites 补回；幂等。
+   */
+  async function refreshOnReconnect() {
+    await fetchSites()
+  }
+
   async function parseSite(id: string) {
     await withAction(id, 'parse', async () => {
       await sitesApi.parse(id)
@@ -183,5 +251,6 @@ export const useSitesStore = defineStore('sites', () => {
     fetchSites, createSite, updateSite, deleteSite,
     parseSite, startSite, stopSite, restartSite,
     bulkAction,
+    patchSiteSnapshot, handleSiteCreated, handleSiteDeleted, refreshOnReconnect,
   }
 })

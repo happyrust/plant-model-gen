@@ -7,7 +7,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use futures::stream::{Stream, StreamExt};
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::time::SystemTime;
@@ -125,29 +125,27 @@ impl SyncEvent {
 ///
 /// GET /api/sync/events
 ///
-/// 返回 Server-Sent Events 流，实时推送同步事件
+/// 返回 Server-Sent Events 流，实时推送同步事件。
+///
+/// C5 · 修 G5 BroadcastStream 漏首事件：
+/// 在 broadcast subscribe 之后、live 流开始之前，**立即**用一条
+/// "MQTT 订阅状态快照"作为首事件喂给前端。即使 sender 端在 listener
+/// 真正进入 await 之前就 send 完导致 broadcast lag、漏掉首条事件，
+/// 前端也能从这条 snapshot 拿到当前正确状态，整体仍是最终一致的。
 pub async fn sync_events_handler() -> impl IntoResponse {
-    // 订阅事件广播通道
     let rx = SYNC_EVENT_TX.subscribe();
 
-    // 将 broadcast receiver 转换为 Stream
-    let stream = BroadcastStream::new(rx);
-
-    // 转换为 SSE 事件流
-    let event_stream = stream.filter_map(|result| async move {
+    let live_stream = BroadcastStream::new(rx).filter_map(|result| async move {
         match result {
-            Ok(event) => {
-                // 序列化事件为 JSON
-                match serde_json::to_string(&event) {
-                    Ok(json) => Some(Ok::<_, Infallible>(
-                        Event::default().data(json).event("message"),
-                    )),
-                    Err(e) => {
-                        eprintln!("Failed to serialize SSE event: {}", e);
-                        None
-                    }
+            Ok(event) => match serde_json::to_string(&event) {
+                Ok(json) => Some(Ok::<_, Infallible>(
+                    Event::default().data(json).event("message"),
+                )),
+                Err(e) => {
+                    eprintln!("Failed to serialize SSE event: {}", e);
+                    None
                 }
-            }
+            },
             Err(e) => {
                 eprintln!("SSE broadcast error: {}", e);
                 None
@@ -155,8 +153,44 @@ pub async fn sync_events_handler() -> impl IntoResponse {
         }
     });
 
-    // 返回 SSE 响应
+    let initial_event = build_initial_mqtt_status_snapshot()
+        .await
+        .and_then(|event| serde_json::to_string(&event).ok())
+        .map(|json| Ok::<_, Infallible>(Event::default().data(json).event("message")));
+    let initial_stream = stream::iter(initial_event.into_iter());
+
+    let event_stream = initial_stream.chain(live_stream);
     Sse::new(event_stream).keep_alive(KeepAlive::default())
+}
+
+/// C5 · 构造"当前 MQTT 订阅状态快照"事件，复用 push_subscription_status_event
+/// 的字段计算口径（is_running / is_master_node / location / timestamp）。
+///
+/// 失败（拿不到 location 等）时返回 None，调用方略过初始事件即可，
+/// 不影响 live 流。
+async fn build_initial_mqtt_status_snapshot() -> Option<SyncEvent> {
+    use crate::web_server::{mqtt_monitor_handlers, remote_runtime};
+
+    let db_option = aios_core::get_db_option();
+    let location = db_option.location.trim().to_string();
+    if location.is_empty() {
+        return None;
+    }
+
+    let is_running = remote_runtime::REMOTE_RUNTIME.read().await.is_some();
+    let db_path = mqtt_monitor_handlers::get_node_config_db_path();
+    let is_master_node = mqtt_monitor_handlers::check_is_master_node(&location, &db_path);
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+
+    Some(SyncEvent::MqttSubscriptionStatusChanged {
+        is_running,
+        is_master_node,
+        location,
+        timestamp,
+    })
 }
 
 /// 测试 SSE 连接的处理器

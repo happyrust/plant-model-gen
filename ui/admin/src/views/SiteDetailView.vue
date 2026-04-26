@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   AlertTriangle,
@@ -41,7 +41,22 @@ const logsData = ref<ManagedSiteLogsResponse | null>(null)
 const siteError = ref('')
 const runtimeError = ref('')
 const logsError = ref('')
-const activeTab = ref<'overview' | 'deploy'>('overview')
+type DetailTab = 'overview' | 'deploy'
+
+// D6 / Sprint D · 修 G16：tab 状态持久化到 URL `?tab=overview|deploy`
+//
+// 旧版 activeTab 仅保存在组件 ref，刷新页面回到「运行概览」；新版从 URL query
+// 取初值并双向同步，刷新 / 分享链接都能保留 tab 选择。
+const initialTab: DetailTab = route.query.tab === 'deploy' ? 'deploy' : 'overview'
+const activeTab = ref<DetailTab>(initialTab)
+
+watch(activeTab, (next) => {
+  if (route.query.tab === next) return
+  void router.replace({
+    path: route.path,
+    query: { ...route.query, tab: next },
+  })
+}, { flush: 'post' })
 const activeLogTab = ref<ManagedSiteLogKind>('parse')
 const drawerOpen = ref(false)
 const downloadPending = ref(false)

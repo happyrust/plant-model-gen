@@ -63,7 +63,11 @@ export interface AdminSitesStreamOptions {
   callbacks?: AdminSitesStreamCallbacks
 }
 
-const DEFAULT_URL = '/api/sync/events'
+// 后端 SSE 端点（mod.rs L760 注册）：
+//   GET /api/sync/events/stream  → sse_handlers::sync_events_handler
+// 注意：`/api/sync/events`（不带 /stream）是 polling list endpoint，
+// 形如 `{ events: [], status: "success", timestamp: ... }`，并非 SSE 流。
+const DEFAULT_URL = '/api/sync/events/stream'
 const DEFAULT_RECONNECT_INITIAL = 1000
 const DEFAULT_RECONNECT_MAX = 30000
 

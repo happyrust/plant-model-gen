@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useSitesStore } from '@/stores/sites'
 import type { ManagedProjectSite, ManagedSiteRiskLevel } from '@/types/site'
-import { Eye, ExternalLink, FolderPlus, Loader2, Pencil, Play, RefreshCw, RotateCcw, Square, Trash2 } from 'lucide-vue-next'
+import { ArrowDown, ArrowUp, ArrowUpDown, Eye, ExternalLink, FolderPlus, Loader2, Pencil, Play, RefreshCw, RotateCcw, Square, Trash2 } from 'lucide-vue-next'
 import {
   canDeleteSite,
   canEditSite,
@@ -20,6 +20,69 @@ import { buildViewerUrl } from '@/lib/viewer'
 import SiteDeleteDialog from './SiteDeleteDialog.vue'
 
 const props = defineProps<{ sites: ManagedProjectSite[]; loading: boolean }>()
+
+// D6 / Sprint D · 修 G15：表头点击排序
+//
+// 默认按 updated_at desc（与后端 list_sites 顺序一致）；点击表头切换 column 与
+// 升降序，再次点同一列在 asc <-> desc 之间翻转。纯前端排序，不动后端。
+type SortColumn = 'project_name' | 'status' | 'web_port' | 'risk_level'
+type SortDir = 'asc' | 'desc'
+
+const RISK_RANK: Record<ManagedSiteRiskLevel, number> = {
+  normal: 0,
+  warning: 1,
+  critical: 2,
+}
+
+const sortColumn = ref<SortColumn | null>(null)
+const sortDir = ref<SortDir>('asc')
+
+function toggleSort(column: SortColumn) {
+  if (sortColumn.value === column) {
+    sortDir.value = sortDir.value === 'asc' ? 'desc' : 'asc'
+    return
+  }
+  sortColumn.value = column
+  sortDir.value = 'asc'
+}
+
+function sortIcon(column: SortColumn) {
+  if (sortColumn.value !== column) return ArrowUpDown
+  return sortDir.value === 'asc' ? ArrowUp : ArrowDown
+}
+
+const sortedSites = computed(() => {
+  if (sortColumn.value === null) return props.sites
+  const column = sortColumn.value
+  const factor = sortDir.value === 'asc' ? 1 : -1
+  const arr = [...props.sites]
+  arr.sort((a, b) => {
+    let av: number | string
+    let bv: number | string
+    switch (column) {
+      case 'project_name':
+        av = a.project_name.toLowerCase()
+        bv = b.project_name.toLowerCase()
+        break
+      case 'status':
+        av = a.status
+        bv = b.status
+        break
+      case 'web_port':
+        av = a.web_port
+        bv = b.web_port
+        break
+      case 'risk_level':
+        av = RISK_RANK[a.risk_level] ?? 0
+        bv = RISK_RANK[b.risk_level] ?? 0
+        break
+    }
+    if (av < bv) return -1 * factor
+    if (av > bv) return 1 * factor
+    return 0
+  })
+  return arr
+})
 
 const emit = defineEmits<{
   'edit-site': [siteId: string]
@@ -141,16 +204,32 @@ async function handleParse(siteId: string) {
     <table v-else class="w-full text-sm">
       <thead>
         <tr class="border-b border-border bg-muted/50">
-          <th class="px-4 py-3 text-left font-medium text-muted-foreground">项目名称</th>
-          <th class="px-4 py-3 text-left font-medium text-muted-foreground">状态</th>
-          <th class="px-4 py-3 text-left font-medium text-muted-foreground">端口</th>
-          <th class="px-4 py-3 text-left font-medium text-muted-foreground">风险</th>
+          <th class="px-4 py-3 text-left font-medium text-muted-foreground">
+            <button type="button" class="inline-flex items-center gap-1 hover:text-foreground transition-colors" @click="toggleSort('project_name')">
+              项目名称 <component :is="sortIcon('project_name')" class="h-3.5 w-3.5" />
+            </button>
+          </th>
+          <th class="px-4 py-3 text-left font-medium text-muted-foreground">
+            <button type="button" class="inline-flex items-center gap-1 hover:text-foreground transition-colors" @click="toggleSort('status')">
+              状态 <component :is="sortIcon('status')" class="h-3.5 w-3.5" />
+            </button>
+          </th>
+          <th class="px-4 py-3 text-left font-medium text-muted-foreground">
+            <button type="button" class="inline-flex items-center gap-1 hover:text-foreground transition-colors" @click="toggleSort('web_port')">
+              端口 <component :is="sortIcon('web_port')" class="h-3.5 w-3.5" />
+            </button>
+          </th>
+          <th class="px-4 py-3 text-left font-medium text-muted-foreground">
+            <button type="button" class="inline-flex items-center gap-1 hover:text-foreground transition-colors" @click="toggleSort('risk_level')">
+              风险 <component :is="sortIcon('risk_level')" class="h-3.5 w-3.5" />
+            </button>
+          </th>
           <th class="px-4 py-3 text-right font-medium text-muted-foreground">操作</th>
         </tr>
       </thead>
       <tbody>
         <tr
-          v-for="site in props.sites"
+          v-for="site in sortedSites"
           :key="site.site_id"
           class="border-b border-border last:border-0 hover:bg-muted/30 transition-colors cursor-pointer"
           @click="openDetail(site.site_id)"

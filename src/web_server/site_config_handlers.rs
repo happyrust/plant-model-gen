@@ -349,14 +349,25 @@ pub async fn save_site_config(
                 }
             }
             
-            // TODO(Phase 后续): 接入 plant-model-gen 的 graceful shutdown 机制以实现自动重启
-            // 当前 AppState 没有 shutdown_tx 字段，暂以日志提示用户手动重启
-            let _ = &state;
-            log::warn!("⚠️  [站点配置] 配置已保存，请手动重启 web_server 以使新配置生效");
+            // B5 / Phase 10 · 触发 graceful shutdown，由进程级 supervisor 拉起新进程。
+            //
+            // sender 由 `mod.rs::start_web_server_with_config` 在启动 axum 前
+            // 写入；这里 take 一次就消耗掉，多次 save 期间只有第一次生效，避免
+            // 重复 send 导致 panic（oneshot::Sender::send 是 self）。
+            //
+            // shutdown 触发后 axum 不再接受新连接，本响应仍能正常返回（同一连接
+            // 已建立），随后 in-flight 请求处理完毕，进程退出，supervisor 拉起。
+            let triggered = trigger_graceful_shutdown(&state).await;
+            let message = if triggered {
+                "配置已保存到 SQLite 和 DbOption.toml；已触发 graceful shutdown，supervisor 将自动重启 web_server 以使新配置生效"
+            } else {
+                "配置已保存到 SQLite 和 DbOption.toml，但 graceful shutdown 已被触发过或未启用，请手动重启服务器"
+            };
 
             Ok(Json(json!({
                 "status": "success",
-                "message": "配置已保存到 SQLite 和 DbOption.toml，请手动重启服务器以使新配置生效"
+                "graceful_shutdown_triggered": triggered,
+                "message": message,
             })))
         }
         Err(e) => {
@@ -369,39 +380,257 @@ pub async fn save_site_config(
     }
 }
 
-/// 重启服务器
+/// 重启服务器（B5 / Phase 10 · 真实 graceful shutdown 触发）
+///
+/// 调用流程：
+/// 1. take 走 `AppState::shutdown_tx` 中的 oneshot sender
+/// 2. `send(())` 通知 `axum::serve(...).with_graceful_shutdown(...)`
+/// 3. axum 停接新连接，in-flight 请求（包含本次响应）走完后进程退出
+/// 4. 进程级 supervisor（systemd / nssm / pm2）自动拉起新进程
+///
+/// 与 `save_site_config` 内置触发的区别：本端点是"无变更前提下手动 restart"，
+/// 用于热更新代码 / 升级配置之外的运维动作（如清缓存、重连后端服务）。
 #[cfg(feature = "web_server")]
 pub async fn restart_server(
     state: State<crate::web_server::AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO(Phase 后续): 接入 plant-model-gen 的 graceful shutdown 机制
-    // 当前 AppState 没有 shutdown_tx 字段，暂以日志提示
-    let _ = &state;
-    log::warn!("⚠️  [站点配置] 收到 restart 请求，但运行时重启机制尚未接入，请手动重启");
-
+    let triggered = trigger_graceful_shutdown(&state).await;
+    let message = if triggered {
+        "已触发 graceful shutdown，supervisor 将拉起新进程；本响应返回后立即进入退出流程"
+    } else {
+        "graceful shutdown sender 不存在或已被触发，请手动重启服务器"
+    };
     Ok(Json(json!({
         "status": "success",
-        "message": "服务器将在1秒后重启"
+        "graceful_shutdown_triggered": triggered,
+        "message": message,
     })))
 }
 
-/// 重载站点配置（热重载可更新项），并按需重启运行态组件
+/// 触发 graceful shutdown，返回是否真正触发（false = 已被触发过或未启用）。
 ///
-/// TODO(Phase 后续): 迁入 web-server 的 `config_reload_manager` 模块与
-///   `sync_control_center::get_location` 函数后恢复完整实现。
-///   当前 stub 仅清空 `aios_core` 全局 DbOption 缓存，提示用户手动重启以生效。
+/// 仅在写盘等"改变运行时事实"的成功路径上调用。take 走 sender 后立即 send，
+/// 失败（receiver 已关闭）只记日志、不报错，让上层成功路径不被基础设施异常拖死。
+async fn trigger_graceful_shutdown(state: &State<crate::web_server::AppState>) -> bool {
+    let mut slot = state.shutdown_tx.lock().await;
+    if let Some(tx) = slot.take() {
+        match tx.send(()) {
+            Ok(()) => {
+                log::warn!("📴 [站点配置] 已触发 graceful shutdown，supervisor 将拉起新进程");
+                true
+            }
+            Err(()) => {
+                log::warn!("📴 [站点配置] graceful shutdown receiver 已关闭，无法触发");
+                false
+            }
+        }
+    } else {
+        log::warn!("📴 [站点配置] graceful shutdown sender 不存在（可能已被触发或未启用）");
+        false
+    }
+}
+
+/// 「理论上可热改」的 DbOption 字段白名单（B6 · Phase 11）
+///
+/// 标记规则：不影响已建立的连接 / 已加载的索引 / 已订阅的 MQTT 的字段。
+///
+/// ⚠️ 本 Phase 11 (最小可用版) 不真正应用这些字段——`aios_core::get_db_option`
+/// 内部为 `OnceCell::get_or_init`，不可变。白名单仅用于响应分类提示
+/// 「这些不一定要重启」vs「这些一定要重启」。
+///
+/// 后续 rs-core 改动将 OnceCell → RwLock<Arc<DbOption>> 后，
+/// 即可一键升级为真正的热加载（详见 docs/plans/2026-04-26-sprint-b-phase11-b6-reload.md §6）。
+///
+/// ⚠️ 注：此白名单需与 `aios_core::options::DbOption` 字段定义保持同步，
+/// 新增字段时按是否影响运行态决定是否纳入。
+const HOT_RELOADABLE_KEYS: &[&str] = &[
+    "enable_log",
+    "mesh_tol_ratio",
+    "gen_model",
+    "gen_spatial_tree",
+    "load_spatial_tree",
+    "apply_boolean_operation",
+    "build_cate_relate",
+    "sync_chunk_size",
+    "parse_channel_capacity",
+    "parse_mode",
+    "incr_sync",
+    "total_sync",
+];
+
+/// 「文件值与运行时永远不一致」的字段白名单（C3 · 修 G3 baseline 误报）
+///
+/// 这些字段在 `aios_core::get_db_option()` 内部会被环境变量覆盖（如
+/// `SURREAL_CONN_MODE` / `SURREAL_CONN_IP` / `SURREAL_CONN_PORT` 影响 `surrealdb`），
+/// 因此运行时副本与 TOML 文件原值天然不一致。
+///
+/// 在 reload diff 时把这类字段单独归到 `static_changed_keys_env`，避免它们
+/// 把 baseline（用户没有人为改动）也错报成「需要重启」。
+///
+/// 触发 `requires_restart` 仅看 `static_changed_keys_user` 是否非空。
+///
+/// ⚠️ 注：扩展时同步 `rs-core/src/lib.rs` 中 env override 的字段列表。
+const ENV_OVERRIDABLE_KEYS: &[&str] = &["surrealdb"];
+
+/// 字段级 diff（hot vs static）
+///
+/// 通过 serde_json 做 key-by-key 比较；任一字段值变化按 HOT_RELOADABLE_KEYS
+/// 白名单分流到 hot / static 两组。
+fn diff_db_option(
+    current: &aios_core::options::DbOption,
+    new: &aios_core::options::DbOption,
+) -> (Vec<String>, Vec<String>) {
+    let cur_v = serde_json::to_value(current).unwrap_or(json!({}));
+    let new_v = serde_json::to_value(new).unwrap_or(json!({}));
+    let cur_obj = cur_v.as_object().cloned().unwrap_or_default();
+    let new_obj = new_v.as_object().cloned().unwrap_or_default();
+
+    let mut hot = Vec::new();
+    let mut stat = Vec::new();
+    let all_keys: std::collections::BTreeSet<_> =
+        cur_obj.keys().chain(new_obj.keys()).cloned().collect();
+
+    for k in all_keys {
+        if cur_obj.get(&k) != new_obj.get(&k) {
+            if HOT_RELOADABLE_KEYS.contains(&k.as_str()) {
+                hot.push(k);
+            } else {
+                stat.push(k);
+            }
+        }
+    }
+    (hot, stat)
+}
+
+/// 重载站点配置（B6 · Phase 11 最小可用版）
+///
+/// 行为：重新读 `${DB_OPTION_FILE}.toml` → 解析 → 与当前内存 `DbOption` 做字段 diff
+/// → 返回 hot / static 分类清单 + `requires_restart` 标志。
+///
+/// 重新加载配置文件并应用变更。
+///
+/// - hot 字段变更 → `aios_core::set_db_option_from_file()` 真正热加载
+/// - static 字段变更 → 触发 graceful shutdown（如可用）或提示手动重启
+/// - 无变更 → 提示无需操作
 #[cfg(feature = "web_server")]
 pub async fn reload_site_config(
-    _state: State<crate::web_server::AppState>,
+    state: State<crate::web_server::AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    log::warn!("⚠️  [站点配置] reload 采用最小实现：未接入 config_reload_manager，请手动重启");
+    let toml_path = get_db_option_path();
+
+    let content = match fs::read_to_string(&toml_path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("❌ [站点配置] reload 读取 {} 失败: {}", toml_path, e);
+            return Ok(Json(json!({
+                "status": "error",
+                "message": format!("读取 {} 失败: {}", toml_path, e),
+                "hot_changed_keys": [],
+                "static_changed_keys": [],
+                "requires_restart": false,
+                "actions": ["read_failed"],
+            })));
+        }
+    };
+
+    let new_option: aios_core::options::DbOption = match toml::from_str(&content) {
+        Ok(o) => o,
+        Err(e) => {
+            log::error!("❌ [站点配置] reload 解析 {} 失败: {}", toml_path, e);
+            return Ok(Json(json!({
+                "status": "error",
+                "message": format!("解析 {} 失败: {}", toml_path, e),
+                "hot_changed_keys": [],
+                "static_changed_keys": [],
+                "requires_restart": false,
+                "actions": ["parse_failed"],
+            })));
+        }
+    };
+
+    let current = aios_core::get_db_option();
+    let (hot_changed, static_changed) = diff_db_option(&current, &new_option);
+
+    let (static_changed_env, static_changed_user): (Vec<String>, Vec<String>) = static_changed
+        .iter()
+        .cloned()
+        .partition(|k| ENV_OVERRIDABLE_KEYS.contains(&k.as_str()));
+
+    let requires_restart = !static_changed_user.is_empty();
+    let no_user_change = hot_changed.is_empty() && static_changed_user.is_empty();
+
+    let (actions, message) = if no_user_change {
+        let msg = if static_changed_env.is_empty() {
+            "配置文件与当前运行时完全一致，无需操作".to_string()
+        } else {
+            format!(
+                "配置文件与当前运行时一致（{} 项 env 覆盖字段除外，属预期差异）",
+                static_changed_env.len()
+            )
+        };
+        (vec!["no_change"], msg)
+    } else if requires_restart {
+        let triggered = if let Some(tx) = state.shutdown_tx.lock().await.take() {
+            tx.send(()).is_ok()
+        } else {
+            false
+        };
+        let acts = if triggered {
+            vec!["graceful_shutdown_triggered", "supervisor_will_restart"]
+        } else {
+            vec!["manual_restart_required"]
+        };
+        let msg = format!(
+            "检测到 {} 项静态字段变更（需重启）+ {} 项热改字段{}",
+            static_changed_user.len(),
+            hot_changed.len(),
+            if static_changed_env.is_empty() {
+                String::new()
+            } else {
+                format!("（另 {} 项 env 覆盖字段已忽略）", static_changed_env.len())
+            }
+        );
+        (acts, msg)
+    } else {
+        match aios_core::set_db_option_from_file() {
+            Ok(_) => {
+                log::info!("✅ [站点配置] 热加载成功，hot_changed_keys = {:?}", hot_changed);
+                let msg = format!(
+                    "已热加载 {} 项字段变更，无需重启",
+                    hot_changed.len()
+                );
+                (vec!["hot_reloaded"], msg)
+            }
+            Err(e) => {
+                log::error!("❌ [站点配置] 热加载失败: {}", e);
+                let msg = format!(
+                    "检测到 {} 项热改字段但加载失败: {}；旧配置保持不变",
+                    hot_changed.len(),
+                    e
+                );
+                (vec!["hot_reload_failed"], msg)
+            }
+        }
+    };
+
+    log::info!(
+        "ℹ️  [站点配置] reload diff: hot={:?} static_user={:?} static_env={:?} requires_restart={} actions={:?}",
+        hot_changed,
+        static_changed_user,
+        static_changed_env,
+        requires_restart,
+        actions
+    );
+
     Ok(Json(json!({
         "status": "success",
-        "message": "配置已落盘，热重载机制尚未接入，请手动重启服务器以使配置生效",
-        "hot_changed_keys": [],
-        "static_changed_keys": [],
-        "requires_restart": true,
-        "actions": ["manual_restart_required"],
+        "message": message,
+        "hot_changed_keys": hot_changed,
+        "static_changed_keys": static_changed,
+        "static_changed_keys_user": static_changed_user,
+        "static_changed_keys_env": static_changed_env,
+        "requires_restart": requires_restart,
+        "actions": actions,
     })))
 }
 

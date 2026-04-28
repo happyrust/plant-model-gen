@@ -435,7 +435,7 @@ pub async fn api_stream_generate(
 
                             if !neg_missing.is_empty() {
                                 let db_option = aios_core::get_db_option();
-                                let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
+                                let db_option_ext = crate::options::DbOptionExt::from((*db_option).clone());
                                 if let Err(e) = crate::fast_model::gen_all_geos_data(
                                     neg_missing,
                                     &db_option_ext,
@@ -555,7 +555,7 @@ pub async fn api_stream_generate(
 
                         // 调用模型生成（本批次可能为空：全部 skipped）
                         let db_option = aios_core::get_db_option();
-                        let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
+                        let db_option_ext = crate::options::DbOptionExt::from((*db_option).clone());
 
                         if to_generate_in_batch.is_empty() {
                             let progress =
@@ -647,7 +647,7 @@ pub async fn api_stream_generate(
 
                                             if let Err(e) =
                                                 crate::fast_model::mesh_generate::booleans_meshes_in_db(
-                                                    Some(std::sync::Arc::new(db_option.clone())),
+                                                    Some(db_option.clone()),
                                                     &batch_all,
                                                 )
                                                 .await
@@ -771,7 +771,7 @@ pub async fn api_stream_generate(
                             &root_refnos,
                             &mesh_dir,
                             std::path::Path::new("output"),
-                            Arc::new(db_option.clone()),
+                            db_option.clone(),
                             false,
                         )
                         .await
@@ -780,7 +780,7 @@ pub async fn api_stream_generate(
                             &root_refnos,
                             &mesh_dir,
                             std::path::Path::new("output"),
-                            Arc::new(db_option.clone()),
+                            db_option.clone(),
                             false,
                         )
                         .await

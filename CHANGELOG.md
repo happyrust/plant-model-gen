@@ -1,5 +1,95 @@
 # Changelog
 
+## 2026-04-26
+
+### Added — 异地协同归档列表 API（本次提交）
+
+> 为 `plant-collab-monitor` Phase 7-Plus 真实浏览器联调补齐 `/archives` 页面所需后端接口。
+
+- 新增 `GET /api/incremental/archives`，扫描本地 `assets/archives/*.cba`。
+- 返回前端已使用的 `{ success: true, files: [...] }` 结构。
+- 文件项包含 `name`、`path`、`size`、`modified`、`dbnum`、`sesno`。
+- `path` 指向已有静态服务 `/assets/archives/{name}`，下载链路复用现有 `ServeDir::new("assets/archives")`。
+- 当目录不存在或暂无 `.cba` 文件时返回空数组而非 404，避免前端 `/archives` 页面产生 console error。
+- 验证：`cargo check --bin web_server --features web_server` 通过；`cargo build --bin web_server --features web_server` 通过；前端 `npm run smoke:phase7-plus` 通过。
+
+### Added — Sprint C 站点管理后端 stub 收口 + Sprint D 体验优化
+
+> 上游文档：`docs/plans/2026-04-26-site-admin-next-steps.md`（4 Sprint backlog 计划）+ `docs/plans/2026-04-26-sprint-c-verification-report.md`（Sprint C 后端联调验收报告，5/6 全实测通过）。
+
+#### Sprint C · 后端关键修复（5/6 任务，C2 跨仓改 rs-core 留独立会话）
+
+- **C1 graceful shutdown 上线（B5 / Phase 10，commit `26ffc5f`）**：
+  - `web_server::AppState` 新增 `shutdown_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<()>>>>`，启动 axum 前创建 oneshot 通道，sender 写入 state，receiver 喂给 `axum::serve(...).with_graceful_shutdown(...)`。
+  - `site_config_handlers::save_site_config` / `restart_server` 在写盘 / 收到请求后调 `trigger_graceful_shutdown(&state)` 触发 graceful 退出，由进程级 supervisor（systemd / nssm / pm2）拉起新进程；返回新字段 `graceful_shutdown_triggered: bool` + 文案区分「已触发 / 未启用」。
+  - 实测验收（HTTP）：POST `/api/site-config/restart` → `graceful_shutdown_triggered: true` + 8 秒内进程退出（exit code 0），axum / handler 双日志均打印。
+- **C3 reload baseline 误报修复（同 commit `26ffc5f`）**：新增 `ENV_OVERRIDABLE_KEYS = &["surrealdb"]` 白名单，`reload_site_config` 把 `static_changed` 拆成 `static_changed_keys_user` + `static_changed_keys_env`；`requires_restart` 仅看 user 是否非空。响应保留旧字段 `static_changed_keys`（合并）向后兼容，新增 `_user` / `_env` 分类字段。验收：baseline 现在返回 `actions: ["no_change"]`（之前永远报 `manual_restart_required`，因 `surrealdb` 受 `SURREAL_CONN_*` env 覆盖）。
+- **C4 `/api/remote-sync/*` admin auth 失效根因修复（commit `16b8f39`）**：root cause 是 axum 0.8 在 `Router<()>.merge` 进 `Router<AppState>` 后，外层 `.route_layer(middleware::from_fn(...))` 偶发不生效；修复为把 `admin_auth_middleware` 内移到 `create_remote_sync_routes()` 末尾用 `.layer(...)` 注入（与 `admin_handlers` / `admin_registry_handlers` 风格一致）。验收：未鉴权 GET `/api/remote-sync/envs` 现返回 503 + 标准未授权消息（之前实测 200）。
+- **C5 SSE `MqttSubscriptionStatusChanged` 漏首事件防护（commit `5ab958d`）**：`sse_handlers::sync_events_handler` 在 broadcast subscribe 之后、live 流之前**立即** emit 一条「当前 MQTT 订阅状态快照」（复用 `push_subscription_status_event` 字段口径，从本地 `node_config` SQLite + `REMOTE_RUNTIME` 计算）。即使 BroadcastStream 在 listener 与 sender 几乎同时漏掉首条 broadcast 事件，前端仍能从 snapshot 拿到正确状态。验收：`curl -N` 进流即收到 `data: {"type":"MqttSubscriptionStatusChanged",...}`，**无须任何前置 set_master/set_client 操作**。
+- **C6 `/api/admin/sites/{id}/restart` 端点 + 前端重启按钮（commit `1402968`）**：`managed_project_sites::restart_site` 串联 `stop_site` → `tokio::time::sleep(500ms)` → `start_site`，stop 检测到端口冲突时 bail 并展示外部 PIDs；前端 `SiteDataTable` 行 action + `SiteDetailHeader` 头部加「重启」按钮（仅 Running 时可见），`SiteAction` 联合类型与 `siteActionLabelMap` 同步加 `restart` 标签，`canRestartSite` 守卫 + pending label「重启中」。
+- **Sprint C 后端联调验收报告（commit `61e1a69`）**：`docs/plans/2026-04-26-sprint-c-verification-report.md`，按 plant-model-gen `AGENTS.md` 规范用真后端 + curl/PowerShell 验证 6 个端点 + smoke 脚本 20/20 PASS。已知偏差：smoke 脚本期望 `2..|503|401|403` 容忍度过高（建议改 `503|401|403`）；本机无 supervisor 故 C1 进程退出后未自动拉起；C6 完整业务路径需配 ADMIN_USER/ADMIN_PASS 后再跑（端点路由层已通过 503 验证存在）。
+
+#### Sprint D · 站点管理体验优化（6/6 任务）
+
+- **D2 hi-fi 删除弹框（commit `b6d129b`）**：新增 `ui/admin/src/components/sites/SiteDeleteDialog.vue` 替代 `window.confirm`，弹框含项目名 echo + site_id 复制按钮 + 危险色主键 + Esc/遮罩取消，UX 与 `design/site-admin-flow-demo/PLAN.md §5 Phase E` 对齐。
+- **D4 端口冲突前端预检 + `/api/admin/ports/check`（commit `111234d`）**：后端 `managed_project_sites::process_ids_on_port` 改 `pub(crate)`；新增 `GET /api/admin/ports/check?port=&host=` 端点（admin auth 拦截，host 仅作 echo）。前端 `SiteDrawer.vue` db_port / web_port `@blur` 时调用，inline 三态提示（空闲 / 占用+PIDs / 失败），编辑模式下与既有端口一致时跳过预检。
+- **D5 日志分页尾部 + 全量下载（commit `5e61e41`）**：后端新增 2 个端点：`GET /api/admin/sites/{id}/logs/{kind}?limit=N` 返回最后 N 行（钳制 1-5000）+ `total_lines` / `truncated` 字段；`GET /api/admin/sites/{id}/logs/{kind}/download` 走 `text/plain` + `Content-Disposition: attachment` 触发浏览器下载（filename 含 site_id / kind / UTC 时间戳）。前端 `SiteDetailView.vue` 详情页"加载更多"按钮（limit ×2 至 5000）+ "下载完整日志"按钮（fetch + Authorization Bearer + blob + a.click，**避开浏览器原生 navigate 丢 token 的问题**）。
+- **D6.1 详情 tab URL 持久化（commit `4438fda`）**：`SiteDetailView` `activeTab` 通过 `route.query.tab` 双向同步（`watch` flush:'post' 防回环），刷新页面 / 分享链接均保留 tab 选择。
+- **D6.2 列表表头点击排序（commit `97a6f56`）**：`SiteDataTable` 4 列（项目名称 / 状态 / 端口 / 风险）支持点击排序，asc/desc 翻转 + 显示排序图标，纯前端排序不动后端；风险列按 `normal < warning < critical` 自然顺序。
+- **D6.3 克隆站点（commit `f9684ec`）**：`SiteDrawer` 新增 `clone: boolean` prop；克隆模式下从既有 site 拉取数据但保持创建语义——project_name 自动加 `(副本)` 后缀、db_port / web_port 各 +1、清空凭据强制重填、提交走 createSite。`SitesView` 加 `cloningSiteId` 状态，`SiteDataTable` 行 action 加「克隆」按钮（Copy 图标）。
+- **D3 批量操作（commit `2fd1c37`）**：`sitesStore` 新增 `bulkAction(siteIds, action)`，串行调用每条 site 的对应单条 action，避免一次过载机器（站点启动 CPU/内存高，并发会撞阈值）；返回 `{ total, ok, failed: [{ siteId, message }] }`。`SiteDataTable` 加多选 checkbox（表头全选 + 行级），`SitesView` 加批量工具条（启动 / 停止 / 重启 / 解析 / 删除 5 个动作 + 进度提示 + 完成 banner，失败的 site 保留勾选便于重试）；批量删除走 `window.confirm` 预警提示（单条删除仍走 hi-fi 弹框）。
+
+### Docs
+
+- **`docs/plans/2026-04-26-site-admin-next-steps.md`（commit `cbade5e`）**：248 行计划文档，覆盖三套「站点」系统盘点（admin sites / deployment-sites / site-config）、25 项 gap 按 P0–P3 风险分级、4 个 Sprint backlog（C/D/E/F 共 ~17 dev-days）、立即落地点（C1 + C3）实施步骤、风险与不做的事。
+- **`docs/plans/2026-04-26-sprint-c-verification-report.md`（commit `61e1a69`）**：Sprint C 5/6 任务后端联调验收报告，含验收方法（按 AGENTS.md 用真后端 + curl）、启动状态、6 个验收项的命令与实际响应、已知偏差与后续计划。
+
+### Added — 异地协同 Sprint B 后端 stub 收口（先于 Sprint C 完成，记录在前）
+
+- **异地协同 Sprint B 后端 stub 收口（G6/G7 共 4 个 Phase 提交）**：完成跨仓 `plant-collab-monitor` 前端依赖的全部 MQTT/订阅类后端补齐，关闭 G6 全部 7 子项，G7 = B6 reload 落最小可用版。
+  - **Phase 8（B1 + B3 + B7，commit `94bc86e`）**：
+    - **B1**：`src/web_server/sync_control_handlers.rs::set_as_master_node` / `set_as_client_node` 由 `log::warn!` stub 升级为真实写盘。复用 `mqtt_monitor_handlers::ensure_node_config_table()`（schema：`location TEXT PK / is_master BOOLEAN / updated_at TEXT`），`INSERT OR REPLACE` 写入 `node_config`，下次 `subscription/status` 立即返回 `is_master_node: true/false`。前端 `MqttNodesView` 主从切换按钮真正生效。
+    - **B3**：`get_mqtt_subscription_status` 字段补齐 5 项（`is_master_node` / `node_role` / `connection_status` / `master_info` / `mqtt_server_port`），与前端期望对齐；`is_master_node` 通过 `mqtt_monitor_handlers::check_is_master_node` 实时计算。
+    - **B7**：新建 `shells/smoke-collab-api.sh` 后端冒烟脚本，覆盖站点配置 / 同步引擎 / MQTT 订阅 / 异地协同 4 域 16 endpoint，自动化 curl 输出 `✓ / WARN / ✗` 表格 + 字段命中校验，集成 CI 即可保证后端零回归。
+  - **Phase 9（B2 broker logs ring-buffer，commit `c3a38ce`）**：
+    - `src/web_server/mqtt_monitor_handlers.rs` 新增内存型 broker 事件日志：`BrokerLogEntry { timestamp, level, event, location, message }` + `BROKER_LOG_CAPACITY = 200` + `MQTT_BROKER_LOGS = Arc<RwLock<VecDeque<BrokerLogEntry>>>`，仅进程内 + 不持久化（与持久化 SQLite 日志正交，专供 broker 实时面板）。
+    - `push_broker_log(level, event, location, message)` helper 注入 6 处事件时机：节点首次上线 / 离线恢复 / 心跳超时翻转 / ConnAck 状态切换 / set_master / set_client / 订阅启停 / 清主配置。
+    - `get_mqtt_broker_logs_api` 升级支持 `?limit=N`（默认 200，上限 200），返回 `{ status, count, capacity, logs }`，按时间倒序最新在前。
+    - `shells/smoke-collab-api.sh` 增加 `?limit=10` + `set_master` 字段命中校验。
+  - **Phase 12（B4 SSE `MqttSubscriptionStatusChanged` 事件后端推送，commit `5463e41`）**：
+    - `src/web_server/sse_handlers.rs::SyncEvent` 新增变体 `MqttSubscriptionStatusChanged { is_running, is_master_node, location, timestamp }`，字段口径与 `GET /api/mqtt/subscription/status` 完全对齐，前端可零差量解析直接 reload。
+    - `sync_control_handlers.rs` 新增 `pub(crate) async fn push_subscription_status_event(location)` helper，内部读 `REMOTE_RUNTIME` + `mqtt_monitor_handlers::check_is_master_node` 计算最新状态后通过 `SYNC_EVENT_TX` 广播。
+    - 4 处推送注入：`set_as_master_node` / `set_as_client_node` / `start_mqtt_subscription_api` / `stop_mqtt_subscription_api` 成功路径。
+    - `shells/smoke-collab-api.sh` 新增 `check_sse` 函数 + `[4/5] SSE 实时事件流` 块（`curl -m 2 -H "Accept: text/event-stream"` 检查 `/api/sync/events/stream` 200）。
+    - 跨仓 `plant-collab-monitor/src/views/LogsView.vue` 已订阅 `/api/sync/events/stream` 自动 prepend，本次后端推送对其零改动即可生效。
+  - **Phase 11（B6 `reload_site_config` diff + 分类响应，commit `2286cd2`）**：
+    - **核查结论**：原 plan §1.B6 假设的 `aios_core::set_db_option_from_file` API **不存在**；`aios_core::get_db_option` 实际为 `OnceCell::get_or_init`，全局静态不可变；想真正热替换 DbOption 必须改 rs-core OnceCell → `RwLock<Arc<DbOption>>`，属跨仓改动。本 Phase 落实最小可用版：字段变更检测 + 分类响应 + 用户告知。
+    - `src/web_server/site_config_handlers.rs::reload_site_config` 重写：读 `${DB_OPTION_FILE}.toml` → `toml::from_str` → `DbOption` → 与当前 `aios_core::get_db_option()` 通过 `serde_json` 做字段级 diff → 按 `HOT_RELOADABLE_KEYS` 白名单分流到 `hot_changed_keys` / `static_changed_keys`。
+    - `HOT_RELOADABLE_KEYS` 白名单 12 字段：`enable_log` / `mesh_tol_ratio` / `gen_model` / `gen_spatial_tree` / `load_spatial_tree` / `apply_boolean_operation` / `build_cate_relate` / `sync_chunk_size` / `parse_channel_capacity` / `parse_mode` / `incr_sync` / `total_sync`。
+    - 返回 `{ status, message, hot_changed_keys, static_changed_keys, requires_restart, actions }`，`actions` ∈ `{ "no_change", "log_only", "manual_restart_required", "read_failed", "parse_failed" }`。文件错 / 解析错走 `status: "error"` 但 HTTP 仍 200，便于前端 SettingsView 统一渲染。
+
+### Docs
+
+- `docs/plans/2026-04-26-sprint-b-plan.md`：异地协同 Sprint B 后端 stub 收口主计划，含 7 子任务（B1-B7）拆解、6 Phase 时间线、风险表与执行节奏；本次记录 4 Phase 落地（Phase 8/9/11/12，剩 Phase 10 = B5 graceful shutdown / Phase 11-Plus = B6 真热加载 / Phase 12-Plus = B4 跨仓前端联调 / Phase 7-Plus = 后端联调验收报告）。
+- `docs/plans/2026-04-26-sprint-b-phase11-b6-reload.md`：Phase 11 子计划，含背景核查结论、A 方案设计、HOT_RELOADABLE_KEYS 白名单设计、6 场景验收表与升级路径（rs-core OnceCell → RwLock<Arc<DbOption>>）。
+- **`remote-collaboration-architecture.svg`（仓库根新增）**：1400×840 异地协同架构总览图（SVG，纯文本可 diff），呈现 Plant3D Web + plant-model-gen + 空间定位 + 模块化校审的「远程多角色协同闭环」分层视图，作为 Sprint B/C 异地协同链路的可视化文档资产，配合 `docs/plans/2026-04-26-sprint-b-plan.md` 与 `docs/plans/2026-04-26-sprint-c-verification-report.md` 使用，便于跨仓评审与新成员入门。
+
+## 2026-04-25
+
+### Added
+
+- **`/api/admin/app-config` 运行时可配置 viewer base url（commit `9e9a676`）**：在 admin 端新增运行时可配置端点，前端无需重新构建即可切换 plant3d viewer 的 base URL，便于多环境部署（dev / stage / prod 同一份 admin 资产）。
+
+### Changed
+
+- **Admin action-error feedback 强化（commit `8b1f74d`）**：操作失败响应增加 `label` + `dismiss` 字段；新加的客户端校验器（弱密码 / 公网绑定）走 HTTP 400 而非通用 500，前端可据此精准提示。
+- **Admin 站点新建 / 更新拒弱密码 + 拒公网 0.0.0.0 绑定（commit `a8de78e`）**：服务端在 `/api/admin/sites` POST/PUT 入口增加白名单校验，弱凭据（短密码 / 默认弱口令）与公网监听（`0.0.0.0` / 全 0 host）一律 400；前端 SiteForm 同步显示中文错误提示。
+- **web_server 启动时打印已注册路由（PDMS Hardening M5，commit `79ebcf8`）**：main 启动期遍历 `Router` 输出全部路由前缀到 stdout，便于排查 "新增 handler 但忘记 merge" 的静默 404 问题。
+
+### Docs
+
+- `docs/plans/2026-04-25-tech-debt-cleanup-plan.md`（commit `01b8d60` + `19e7cc8`）：技术债清理计划，覆盖 AiosDBMgr 迁移 Phase 4 基线审计与执行结论；同文件追加 Task 2（M5/P2/P3/P4 runtime 冒烟）实际执行结果（路由打印 / strong-creds guard 弱密码 400 + 公网绑定 400 + AIOS_ALLOW_PUBLIC_BIND=1 escape hatch / `/api/admin/app-config` viewer URL / 错误分类 409）。
+
 ## 2026-04-24
 
 ### Fixed
@@ -40,6 +130,10 @@
 ## Unreleased
 
 ### Added
+
+- **PDMS 变换修复后续硬化（M3/M4）**：
+  - 新增 `docs/plans/2026-04-24-pdms-hardening-m3-m5-implementation-plan.md`，在 M2 已完成的基线上把剩余工作收敛到 M3/M4/M5，并记录本轮实际执行结果
+  - 新增 `scripts/verify_pdms_console_api.ps1`，覆盖 `transform` / `transform/compute` / `ui-attr` / `ptset` / `type-info` / `children` 六条 PDMS 控制台相关接口；在本机 `http://127.0.0.1:3100` 上验证 6/6 通过（其中 `q ptset` 标记为路由可达但当前 refno 无 ptset 数据）
 
 - **异地协同前端独立 + API 汇总（2026-04-22 · feat/collab-api-consolidation 分支）**：把 `D:\work\plant-code\web-server` 的异地协同专业监控 UI 剥离为独立仓库 `D:\work\plant-code\plant-collab-monitor`（Vue 3.5 + Vite 5.4 + Naive UI 2.40 + Tailwind 3.4），后端 API 汇入 plant-model-gen 作为单一源。
   - Phase 1 代码层（7 commit）：
@@ -90,6 +184,7 @@
 
 ### Changed
 
+- 联动 `plant3d-web/src/api/genModelPdmsAttrApi.ts`：`404 + 空 body` 时抛出带 URL 的结构化错误，提示后端可能未挂载对应 API；`5xx` 同时输出 `console.error` 便于排查
 - 精简 `.cursor/rules/mcp-messenger.mdc` 与 `.cursor/rules/my-mcp.mdc` 中的重复强约束段落，仅保留"回合结束必须调用 `check_messages`"等核心条款，避免多模型规则冗余。
 
 - 异地协同 remote-sync API 路由从 `mod.rs` 提取到 `remote_sync_handlers::create_remote_sync_routes()`，统一纳入 `admin_api_routes` 认证链路。

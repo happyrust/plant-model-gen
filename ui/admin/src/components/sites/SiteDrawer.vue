@@ -23,6 +23,17 @@ import { X } from 'lucide-vue-next'
 const props = defineProps<{
   open: boolean
   siteId: string | null
+  /**
+   * D6 / Sprint D · 修 G14：克隆站点模式
+   *
+   * 开启后从 `siteId` 拉取既有站点配置，但**保持创建语义**：
+   * - 标题为「克隆站点」
+   * - project_name 自动加 ` (副本)` 后缀
+   * - db_port / web_port 各 +1（避免立刻撞端口）
+   * - 凭据强制清空，必须重填
+   * - 提交走 createSite 而非 updateSite
+   */
+  clone?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -39,6 +50,90 @@ const previewError = ref('')
 const previewPlan = ref<ManagedSiteParsePlan | null>(null)
 let previewTimer: ReturnType<typeof setTimeout> | null = null
 let previewRequestSeq = 0
+
+// D4 / Sprint D · 修 G12：端口冲突前端预检
+//
+// Drawer 提交前 onBlur 调 /api/admin/ports/check，给用户立即反馈端口是否
+// 已被本机其他进程占用。提示是软警告（不阻断提交，因为：
+//   1. 编辑既有站点时端口可能本来就归这个站点的子进程，自我冲突属正常
+//   2. 后端创建/启动会再次校验，是真正的 source of truth）。
+type PortFieldKey = 'db_port' | 'web_port'
+type PortStatus =
+  | { state: 'idle' }
+  | { state: 'checking' }
+  | { state: 'available' }
+  | { state: 'in_use'; pids: number[] }
+  | { state: 'error'; message: string }
+
+const portStatuses = ref<Record<PortFieldKey, PortStatus>>({
+  db_port: { state: 'idle' },
+  web_port: { state: 'idle' },
+})
+const portCheckSeq: Record<PortFieldKey, number> = {
+  db_port: 0,
+  web_port: 0,
+}
+
+async function checkPortField(field: PortFieldKey) {
+  const port = field === 'db_port' ? form.value.db_port : form.value.web_port
+  if (!port || port < 1 || port > 65535) {
+    portStatuses.value[field] = { state: 'idle' }
+    return
+  }
+  // 编辑模式下，如端口与既有 site 一致，跳过预检（自己占自己不算冲突）
+  if (existingSite.value) {
+    const stored = field === 'db_port' ? existingSite.value.db_port : existingSite.value.web_port
+    if (stored === port) {
+      portStatuses.value[field] = { state: 'idle' }
+      return
+    }
+  }
+  const seq = ++portCheckSeq[field]
+  portStatuses.value[field] = { state: 'checking' }
+  try {
+    const result = await sitesApi.checkPort(port, form.value.bind_host?.trim() || undefined)
+    if (seq !== portCheckSeq[field]) return
+    if (result.in_use) {
+      portStatuses.value[field] = { state: 'in_use', pids: result.pids }
+    } else {
+      portStatuses.value[field] = { state: 'available' }
+    }
+  } catch (e) {
+    if (seq !== portCheckSeq[field]) return
+    portStatuses.value[field] = {
+      state: 'error',
+      message: e instanceof Error ? e.message : '端口探测失败',
+    }
+  }
+}
+
+function portStatusLabel(status: PortStatus): string {
+  switch (status.state) {
+    case 'idle':
+      return ''
+    case 'checking':
+      return '端口探测中...'
+    case 'available':
+      return '端口空闲，可用'
+    case 'in_use':
+      return `端口已被本机进程占用 (PIDs: ${status.pids.join(', ')})`
+    case 'error':
+      return `端口探测失败：${status.message}`
+  }
+}
+
+function portStatusClass(status: PortStatus): string {
+  switch (status.state) {
+    case 'available':
+      return 'text-emerald-600 dark:text-emerald-400'
+    case 'in_use':
+      return 'text-amber-600 dark:text-amber-400'
+    case 'error':
+      return 'text-destructive'
+    default:
+      return 'text-muted-foreground'
+  }
+}
 
 const form = ref<CreateManagedSiteRequest>({
   project_name: '',
@@ -58,8 +153,30 @@ const form = ref<CreateManagedSiteRequest>({
 
 const manualDbNumsStr = ref('')
 
-const isEditing = computed(() => !!props.siteId)
-const title = computed(() => isEditing.value ? '编辑站点' : '新建站点')
+const isEditing = computed(() => !!props.siteId && !props.clone)
+const isCloning = computed(() => !!props.siteId && !!props.clone)
+const title = computed(() => {
+  if (isCloning.value) return '克隆站点'
+  return isEditing.value ? '编辑站点' : '新建站点'
+})
+
+const WEAK_CREDENTIAL_SET = new Set([
+  'root/root',
+  'admin/admin',
+  'admin/123456',
+  'root/123456',
+  'test/test',
+])
+
+const weakCredentialsWarning = computed<string | null>(() => {
+  const user = (form.value.db_user || '').trim().toLowerCase()
+  const password = (form.value.db_password || '').trim().toLowerCase()
+  if (!user || !password) return null
+  if (WEAK_CREDENTIAL_SET.has(`${user}/${password}`)) {
+    return '检测到常见弱凭据（root/root、admin/admin 等）。后端会拒绝此组合；本地开发可设置 AIOS_ALLOW_WEAK_DB_CREDS=1 临时放行。'
+  }
+  return null
+})
 
 function parseManualDbNumsInput(value: string) {
   return value
@@ -72,19 +189,25 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
   if (!open) return
   error.value = ''
   previewError.value = ''
+  portStatuses.value = {
+    db_port: { state: 'idle' },
+    web_port: { state: 'idle' },
+  }
   if (siteId) {
     try {
       existingSite.value = await sitesApi.get(siteId)
       const s = existingSite.value
+      const cloning = props.clone === true
       form.value = {
-        project_name: s.project_name,
+        project_name: cloning ? `${s.project_name} (副本)` : s.project_name,
         project_path: s.project_path,
         project_code: s.project_code,
         manual_db_nums: s.manual_db_nums,
         parse_db_types: s.parse_db_types?.length ? [...s.parse_db_types] : [...DEFAULT_PARSE_DB_TYPES],
         force_rebuild_system_db: s.force_rebuild_system_db ?? false,
-        db_port: s.db_port,
-        web_port: s.web_port,
+        // 克隆模式下端口 +1 避免立刻撞端口；用户仍可手动修改
+        db_port: cloning ? s.db_port + 1 : s.db_port,
+        web_port: cloning ? s.web_port + 1 : s.web_port,
         bind_host: s.bind_host || '127.0.0.1',
         public_base_url: s.public_base_url || '',
         associated_project: s.associated_project || '',
@@ -92,6 +215,10 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
         db_password: '',
       }
       manualDbNumsStr.value = s.manual_db_nums.join(', ')
+      // 克隆模式下不保留 existingSite，避免抽屉展示「正在编辑某 site」徽标
+      if (cloning) {
+        existingSite.value = null
+      }
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Failed to load site'
     }
@@ -245,6 +372,7 @@ async function handleSubmit() {
     form.value.force_rebuild_system_db = false
   }
   try {
+    // 克隆模式走 create 路径（不是 update），保持新建语义
     if (isEditing.value && props.siteId) {
       const payload: UpdateManagedSiteRequest = {
         ...form.value,
@@ -323,11 +451,41 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
               <div class="grid grid-cols-2 gap-4">
                 <div class="space-y-2">
                   <label class="text-sm font-medium">DB 端口 *</label>
-                  <input v-model.number="form.db_port" type="number" required min="1" max="65535" :class="inputClass" />
+                  <input
+                    v-model.number="form.db_port"
+                    type="number"
+                    required
+                    min="1"
+                    max="65535"
+                    :class="inputClass"
+                    @blur="checkPortField('db_port')"
+                  />
+                  <p
+                    v-if="portStatuses.db_port.state !== 'idle'"
+                    class="text-xs"
+                    :class="portStatusClass(portStatuses.db_port)"
+                  >
+                    {{ portStatusLabel(portStatuses.db_port) }}
+                  </p>
                 </div>
                 <div class="space-y-2">
                   <label class="text-sm font-medium">Web 端口 *</label>
-                  <input v-model.number="form.web_port" type="number" required min="1" max="65535" :class="inputClass" />
+                  <input
+                    v-model.number="form.web_port"
+                    type="number"
+                    required
+                    min="1"
+                    max="65535"
+                    :class="inputClass"
+                    @blur="checkPortField('web_port')"
+                  />
+                  <p
+                    v-if="portStatuses.web_port.state !== 'idle'"
+                    class="text-xs"
+                    :class="portStatusClass(portStatuses.web_port)"
+                  >
+                    {{ portStatusLabel(portStatuses.web_port) }}
+                  </p>
                 </div>
               </div>
               <div class="space-y-2">
@@ -527,6 +685,12 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
               <p class="text-xs text-muted-foreground">
                 {{ isEditing ? '编辑时留空表示沿用当前凭据。' : '不再自动写入默认 root/root，请显式填写。' }}
               </p>
+              <div
+                v-if="weakCredentialsWarning"
+                class="rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+              >
+                {{ weakCredentialsWarning }}
+              </div>
             </fieldset>
 
             <div v-if="error" class="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">

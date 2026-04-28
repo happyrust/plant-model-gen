@@ -677,17 +677,17 @@ async fn query_export_insts(
                 SELECT
                     refno,
                     refno.owner as owner,
-                    (if type::record("inst_relate_aabb", record::id(refno)).aabb_id != NONE {{
+                    (if refno != NONE && type::record("inst_relate_aabb", record::id(refno)).aabb_id != NONE {{
                         record::id(type::record("inst_relate_aabb", record::id(refno)).aabb_id)
                     }} else {{ None }}) as world_aabb_hash,
-                    (if type::record("pe_transform", record::id(refno)).world_trans != NONE {{
+                    (if refno != NONE && type::record("pe_transform", record::id(refno)).world_trans != NONE {{
                         record::id(type::record("pe_transform", record::id(refno)).world_trans)
                     }} else {{ None }}) as world_trans_hash,
                     [{{ "geo_hash": mesh_id, "trans_hash": "0", "unit_flag": false }}] as insts,
                     true as has_neg
                 FROM [{bool_keys}]
                 WHERE status = 'Success'
-                  AND type::record("pe_transform", record::id(refno)).world_trans.d != NONE
+                  AND refno != NONE
                 "#,
                 bool_keys = bool_keys_str
             );
@@ -713,25 +713,26 @@ async fn query_export_insts(
                     SELECT
                         in as refno,
                         in.owner ?? in as owner,
-                        (if type::record("inst_relate_aabb", record::id(in)).aabb_id != NONE {{
-                            record::id(type::record("inst_relate_aabb", record::id(in)).aabb_id)
+                        (if id != NONE && type::record("inst_relate_aabb", record::id(id)).aabb_id != NONE {{
+                            record::id(type::record("inst_relate_aabb", record::id(id)).aabb_id)
                         }} else {{ None }}) as world_aabb_hash,
-                        (if type::record("pe_transform", record::id(in)).world_trans != NONE {{
-                            record::id(type::record("pe_transform", record::id(in)).world_trans)
+                        (if id != NONE && type::record("pe_transform", record::id(id)).world_trans != NONE {{
+                            record::id(type::record("pe_transform", record::id(id)).world_trans)
                         }} else {{ None }}) as world_trans_hash,
                         (
                             SELECT
-                                record::id(trans) as trans_hash,
-                                record::id(out) as geo_hash,
+                                (if trans != NONE {{ record::id(trans) }} else {{ None }}) as trans_hash,
+                                (if out != NONE {{ record::id(out) }} else {{ None }}) as geo_hash,
                                 out.unit_flag ?? false as unit_flag
                             FROM $parent.out->geo_relate
                             WHERE visible
                               && (trans.d ?? NONE) != NONE
+                              && (out.d ?? NONE) != NONE
                               && geo_type IN ['Pos', 'CatePos', 'Compound', 'Neg']
                         ) as insts,
                         false as has_neg
                     FROM [{non_bool_keys}]
-                    WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE
+                    WHERE in != NONE
                     "#,
                     non_bool_keys = non_bool_keys_str
                 );
@@ -755,25 +756,26 @@ async fn query_export_insts(
                 SELECT
                     in as refno,
                     in.owner ?? in as owner,
-                    (if type::record("inst_relate_aabb", record::id(in)).aabb_id != NONE {{
-                        record::id(type::record("inst_relate_aabb", record::id(in)).aabb_id)
+                    (if id != NONE && type::record("inst_relate_aabb", record::id(id)).aabb_id != NONE {{
+                        record::id(type::record("inst_relate_aabb", record::id(id)).aabb_id)
                     }} else {{ None }}) as world_aabb_hash,
-                    (if type::record("pe_transform", record::id(in)).world_trans != NONE {{
-                        record::id(type::record("pe_transform", record::id(in)).world_trans)
+                    (if id != NONE && type::record("pe_transform", record::id(id)).world_trans != NONE {{
+                        record::id(type::record("pe_transform", record::id(id)).world_trans)
                     }} else {{ None }}) as world_trans_hash,
                     (
                         SELECT
-                            record::id(trans) as trans_hash,
-                            record::id(out) as geo_hash,
+                            (if trans != NONE {{ record::id(trans) }} else {{ None }}) as trans_hash,
+                            (if out != NONE {{ record::id(out) }} else {{ None }}) as geo_hash,
                             out.unit_flag ?? false as unit_flag
                         FROM $parent.out->geo_relate
                         WHERE visible
                           && (trans.d ?? NONE) != NONE
+                          && (out.d ?? NONE) != NONE
                           && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound', 'Neg']
                     ) as insts,
                     false as has_neg
                 FROM [{keys}]
-                WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE
+                WHERE in != NONE
                 "#,
                 keys = keys_str
             );
@@ -787,6 +789,7 @@ async fn query_export_insts(
         }
     }
 
+    results.retain(|row| row.has_neg || row.world_trans_hash.is_some());
     Ok(results)
 }
 
@@ -813,7 +816,10 @@ async fn query_tubi_relate(
                     record::id(world_trans) as world_trans_hash,
                     record::id(geo) as geo_hash,
                     spec_value
-                FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
+                FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..]
+                WHERE aabb != NONE
+                  AND world_trans != NONE
+                  AND geo != NONE;
                 "#,
             ));
         }

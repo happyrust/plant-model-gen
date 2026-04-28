@@ -1,0 +1,197 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 840" width="1400" height="840">
+<style>text{font-family:"Microsoft YaHei","PingFang SC",Arial,sans-serif;fill:#111827}.title{font-size:30px;font-weight:800}.subtitle{font-size:14px;fill:#6b7280}.layer-title{font-size:17px;font-weight:700}.node-title{font-size:15px;font-weight:700}.node-text{font-size:12px;fill:#4b5563}.small{font-size:11px;fill:#6b7280}.flow-label{font-size:12px;font-weight:700}.icon{font-size:16px;font-weight:800;fill:#111827}</style>
+<defs>
+<filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#0f172a" flood-opacity="0.12"/></filter>
+<marker id="arrow-blue" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#2563eb"/></marker>
+<marker id="arrow-green" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#16a34a"/></marker>
+<marker id="arrow-purple" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#9333ea"/></marker>
+<marker id="arrow-orange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#ea580c"/></marker>
+</defs>
+<rect width="1400" height="840" fill="#ffffff"/>
+<rect x="28" y="24" width="1344" height="792" rx="26" fill="#f8fafc" stroke="#e5e7eb"/>
+<text x="64" y="70" class="title" text-anchor="start">异地协同架构</text>
+<text x="64" y="98" class="subtitle" text-anchor="start">Plant3D Web + plant-model-gen + 空间定位 + 模块化校审的远程多角色协同闭环</text>
+<g transform="translate(64,130)">
+<rect width="255" height="580" rx="20" fill="#ffffff" stroke="#d1d5db" stroke-width="1.5" filter="url(#shadow)"/>
+<rect x="18" y="18" width="219" height="44" rx="13" fill="#eff6ff" stroke="#bfdbfe"/>
+<text x="34" y="47" class="layer-title" text-anchor="start">1. 异地用户层</text>
+</g>
+<g transform="translate(369,130)">
+<rect width="315" height="580" rx="20" fill="#ffffff" stroke="#d1d5db" stroke-width="1.5" filter="url(#shadow)"/>
+<rect x="18" y="18" width="279" height="44" rx="13" fill="#eff6ff" stroke="#bfdbfe"/>
+<text x="34" y="47" class="layer-title" text-anchor="start">2. 前端协同层：Plant3D Web</text>
+</g>
+<g transform="translate(734,130)">
+<rect width="315" height="580" rx="20" fill="#ffffff" stroke="#d1d5db" stroke-width="1.5" filter="url(#shadow)"/>
+<rect x="18" y="18" width="279" height="44" rx="13" fill="#eff6ff" stroke="#bfdbfe"/>
+<text x="34" y="47" class="layer-title" text-anchor="start">3. 服务层：plant-model-gen</text>
+</g>
+<g transform="translate(1099,130)">
+<rect width="245" height="580" rx="20" fill="#ffffff" stroke="#d1d5db" stroke-width="1.5" filter="url(#shadow)"/>
+<rect x="18" y="18" width="209" height="44" rx="13" fill="#eff6ff" stroke="#bfdbfe"/>
+<text x="34" y="47" class="layer-title" text-anchor="start">4. 数据与集成层</text>
+</g>
+<g transform="translate(92,222)">
+<rect width="199" height="72" rx="14" fill="#f0fdf4" stroke="#bbf7d0" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#bbf7d0" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">设</text>
+<text x="64" y="31" class="node-title" text-anchor="start">设计人员</text>
+<text x="64" y="53" class="node-text" text-anchor="start">办公室 A / 浏览器</text>
+</g>
+<g transform="translate(92,314)">
+<rect width="199" height="72" rx="14" fill="#fff7ed" stroke="#fed7aa" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#fed7aa" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">校</text>
+<text x="64" y="31" class="node-title" text-anchor="start">校核人员</text>
+<text x="64" y="53" class="node-text" text-anchor="start">办公室 B / 远程</text>
+</g>
+<g transform="translate(92,406)">
+<rect width="199" height="72" rx="14" fill="#faf5ff" stroke="#e9d5ff" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#e9d5ff" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">审</text>
+<text x="64" y="31" class="node-title" text-anchor="start">审定人员</text>
+<text x="64" y="53" class="node-text" text-anchor="start">审批 / 状态流转</text>
+</g>
+<g transform="translate(92,498)">
+<rect width="199" height="72" rx="14" fill="#f0fdfa" stroke="#99f6e4" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#99f6e4" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">管</text>
+<text x="64" y="31" class="node-title" text-anchor="start">项目经理</text>
+<text x="64" y="53" class="node-text" text-anchor="start">进度 / 闭环追踪</text>
+</g>
+<g transform="translate(92,612)">
+<rect width="199" height="54" rx="14" fill="#f9fafb" stroke="#e5e7eb" stroke-width="1.5"/>
+<text x="18" y="31" class="node-title" text-anchor="start">统一入口</text>
+<text x="18" y="53" class="node-text" text-anchor="start">HTTPS / SSO / 权限</text>
+</g>
+<g transform="translate(395,222)">
+<rect width="263" height="72" rx="14" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#bfdbfe" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">3D</text>
+<text x="64" y="31" class="node-title" text-anchor="start">三维模型查看器</text>
+<text x="64" y="53" class="node-text" text-anchor="start">加载模型、视图、剖切、漫游</text>
+</g>
+<g transform="translate(395,314)">
+<rect width="263" height="72" rx="14" fill="#f0fdf4" stroke="#bbf7d0" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#bbf7d0" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">选</text>
+<text x="64" y="31" class="node-title" text-anchor="start">构件选择与高亮</text>
+<text x="64" y="53" class="node-text" text-anchor="start">selectedRefno、属性、可见集</text>
+</g>
+<g transform="translate(395,406)">
+<rect width="263" height="72" rx="14" fill="#fff7ed" stroke="#fed7aa" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#fed7aa" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">房</text>
+<text x="64" y="31" class="node-title" text-anchor="start">空间定位</text>
+<text x="64" y="53" class="node-text" text-anchor="start">楼层 / 房间 / 构件关系</text>
+</g>
+<g transform="translate(395,498)">
+<rect width="263" height="72" rx="14" fill="#faf5ff" stroke="#e9d5ff" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#e9d5ff" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">审</text>
+<text x="64" y="31" class="node-title" text-anchor="start">模块化校审面板</text>
+<text x="64" y="53" class="node-text" text-anchor="start">按空间 / 专业 / 类型组织工作集</text>
+</g>
+<g transform="translate(395,590)">
+<rect width="263" height="72" rx="14" fill="#f0fdfa" stroke="#99f6e4" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#99f6e4" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">尺</text>
+<text x="64" y="31" class="node-title" text-anchor="start">尺寸标注与屏幕适配</text>
+<text x="64" y="53" class="node-text" text-anchor="start">worldPerPixel、相机方向联动</text>
+</g>
+<g transform="translate(760,222)">
+<rect width="263" height="72" rx="14" fill="#fff7ed" stroke="#fed7aa" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#fed7aa" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">API</text>
+<text x="64" y="31" class="node-title" text-anchor="start">/api/room/query</text>
+<text x="64" y="53" class="node-text" text-anchor="start">按点 / AABB 查询房间归属</text>
+</g>
+<g transform="translate(760,314)">
+<rect width="263" height="72" rx="14" fill="#faf5ff" stroke="#e9d5ff" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#e9d5ff" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">流</text>
+<text x="64" y="31" class="node-title" text-anchor="start">Review Task 校审任务</text>
+<text x="64" y="53" class="node-text" text-anchor="start">任务组件、状态、角色流转</text>
+</g>
+<g transform="translate(760,406)">
+<rect width="263" height="72" rx="14" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#bfdbfe" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">模</text>
+<text x="64" y="31" class="node-title" text-anchor="start">模型 / 构件属性接口</text>
+<text x="64" y="53" class="node-text" text-anchor="start">refno、属性、几何索引</text>
+</g>
+<g transform="translate(760,498)">
+<rect width="263" height="72" rx="14" fill="#f0fdf4" stroke="#bbf7d0" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#bbf7d0" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">权</text>
+<text x="64" y="31" class="node-title" text-anchor="start">权限与会话</text>
+<text x="64" y="53" class="node-text" text-anchor="start">角色、可见范围、审查动作</text>
+</g>
+<g transform="translate(760,590)">
+<rect width="263" height="72" rx="14" fill="#f9fafb" stroke="#d1d5db" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#d1d5db" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">同</text>
+<text x="64" y="31" class="node-title" text-anchor="start">协同事件同步</text>
+<text x="64" y="53" class="node-text" text-anchor="start">批注、状态、在线感知</text>
+</g>
+<g transform="translate(1123,222)">
+<rect width="197" height="72" rx="14" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#bfdbfe" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">DB</text>
+<text x="64" y="31" class="node-title" text-anchor="start">SurrealDB</text>
+<text x="64" y="53" class="node-text" text-anchor="start">工程数据 / 关系查询</text>
+</g>
+<g transform="translate(1123,314)">
+<rect width="197" height="72" rx="14" fill="#f0fdf4" stroke="#bbf7d0" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#bbf7d0" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">几</text>
+<text x="64" y="31" class="node-title" text-anchor="start">模型文件</text>
+<text x="64" y="53" class="node-text" text-anchor="start">几何 / 空间索引</text>
+</g>
+<g transform="translate(1123,406)">
+<rect width="197" height="72" rx="14" fill="#fff7ed" stroke="#fed7aa" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#fed7aa" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">P</text>
+<text x="64" y="31" class="node-title" text-anchor="start">PMS</text>
+<text x="64" y="53" class="node-text" text-anchor="start">项目管理 / 外部流程</text>
+</g>
+<g transform="translate(1123,498)">
+<rect width="197" height="72" rx="14" fill="#faf5ff" stroke="#e9d5ff" stroke-width="1.5"/>
+<circle cx="32" cy="36" r="18" fill="#e9d5ff" opacity="0.22"/>
+<text x="32" y="42" class="icon" text-anchor="middle">档</text>
+<text x="64" y="31" class="node-title" text-anchor="start">审查记录</text>
+<text x="64" y="53" class="node-text" text-anchor="start">批注 / 附件 / 历史</text>
+</g>
+<g transform="translate(1123,612)">
+<rect width="197" height="54" rx="14" fill="#f9fafb" stroke="#e5e7eb" stroke-width="1.5"/>
+<text x="18" y="31" class="node-title" text-anchor="start">持久化与追溯</text>
+<text x="18" y="53" class="node-text" text-anchor="start">模型、任务、结论闭环</text>
+</g>
+<path d="M319 420 L369 420" stroke="#2563eb" stroke-width="2.4" fill="none" marker-end="url(#arrow-blue)"/>
+<rect x="300.0" y="393.0" width="96" height="22" rx="6" fill="#ffffff" opacity="0.95"/>
+<text x="348.0" y="409.0" class="flow-label" text-anchor="middle" fill="#2563eb">浏览访问</text>
+<path d="M684 442 L734 258" stroke="#2563eb" stroke-width="2.4" fill="none" marker-end="url(#arrow-blue)"/>
+<rect x="665.0" y="323.0" width="96" height="22" rx="6" fill="#ffffff" opacity="0.95"/>
+<text x="713.0" y="339.0" class="flow-label" text-anchor="middle" fill="#2563eb">空间查询</text>
+<path d="M734 350 L684 442" stroke="#16a34a" stroke-width="2.4" fill="none" marker-end="url(#arrow-green)"/>
+<rect x="665.0" y="369.0" width="96" height="22" rx="6" fill="#ffffff" opacity="0.95"/>
+<text x="713.0" y="385.0" class="flow-label" text-anchor="middle" fill="#16a34a">返回房间</text>
+<path d="M1049 350 L1099 350" stroke="#16a34a" stroke-width="2.4" fill="none" marker-end="url(#arrow-green)"/>
+<rect x="1030.0" y="323.0" width="96" height="22" rx="6" fill="#ffffff" opacity="0.95"/>
+<text x="1078.0" y="339.0" class="flow-label" text-anchor="middle" fill="#16a34a">读写数据</text>
+<path d="M1049 442 L1099 442" stroke="#ea580c" stroke-width="2.4" fill="none" marker-end="url(#arrow-orange)"/>
+<rect x="1030.0" y="415.0" width="96" height="22" rx="6" fill="#ffffff" opacity="0.95"/>
+<text x="1078.0" y="431.0" class="flow-label" text-anchor="middle" fill="#ea580c">外部流程</text>
+<path d="M1049 626 C1080 626 1080 700 1020 700 L520 700 C470 700 470 626 395 626" stroke="#9333ea" stroke-width="2.2" fill="none" marker-end="url(#arrow-purple)" stroke-dasharray="6 4"/>
+<rect x="735" y="684" width="136" height="22" rx="6" fill="#ffffff" opacity="0.95"/>
+<text x="803" y="700" class="flow-label" text-anchor="middle" fill="#9333ea">实时事件同步</text>
+<g transform="translate(506,724)"><rect width="520" height="54" rx="27" fill="#111827" opacity="0.96"/></g>
+<text x="532" y="747" class="node-title" text-anchor="start" fill="#ffffff">主流程</text>
+<text x="532" y="768" class="small" text-anchor="start" fill="#d1d5db">选中构件 → 空间定位 → 组织校审工作集 → 多角色批注/审核 → 状态同步与归档</text>
+<g transform="translate(64,734)"><rect width="388" height="58" rx="16" fill="#ffffff" stroke="#d1d5db"/></g>
+<text x="82" y="759" class="node-title" text-anchor="start">关键能力</text>
+<text x="82" y="779" class="small" text-anchor="start">统一空间模块包 · 按空间过滤模型 · 校审工作集 · 屏幕自适应尺寸标注 · 审查闭环</text>
+<g transform="translate(1099,734)"><rect width="245" height="58" rx="16" fill="#ffffff" stroke="#d1d5db"/><line x1="18" y1="18" x2="54" y2="18" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/><line x1="18" y1="40" x2="54" y2="40" stroke="#9333ea" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow-purple)"/></g>
+<text x="1163" y="756" class="small" text-anchor="start">请求 / 主流程</text>
+<text x="1163" y="778" class="small" text-anchor="start">异步事件 / 实时同步</text>
+</svg>

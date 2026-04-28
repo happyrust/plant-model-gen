@@ -81,6 +81,22 @@ export function canStopSite(site: ManagedProjectSite): boolean {
   )
 }
 
+/**
+ * 重启动作仅在站点处于稳定运行态时暴露。
+ *
+ * 设计取舍：
+ * - 不允许在 Starting / Stopping / Failed 时点重启，以免和正在进行的状态机
+ *   动作叠加（C6 后端实现内部串联 stop→start，前端只该在状态稳定时触发）
+ * - 解析进行中也禁止：parse 在 Running 站点上才有意义，重启会强制中断
+ */
+export function canRestartSite(site: ManagedProjectSite): boolean {
+  return (
+    site.status === 'Running' &&
+    site.parse_status !== 'Running' &&
+    !isSiteBusy(site)
+  )
+}
+
 export function canParseSite(site: ManagedProjectSite): boolean {
   return (
     !isSiteBusy(site) &&
@@ -132,6 +148,19 @@ export const quickFilterOptions: { value: QuickFilter; label: string }[] = [
   { value: 'error', label: '异常' },
   { value: 'pending_parse', label: '待解析' },
 ]
+
+/**
+ * 动作的中文短标签，供错误提示里拼接（例如 "解析失败：..."）使用。
+ *
+ * 与 `stores/sites.ts::SiteAction` 一一对应；新增动作时两处保持同步。
+ */
+export const siteActionLabelMap = {
+  parse: '解析',
+  start: '启动',
+  stop: '停止',
+  restart: '重启',
+  delete: '删除',
+} as const satisfies Record<'parse' | 'start' | 'stop' | 'restart' | 'delete', string>
 
 export interface SiteStatsExtended {
   total: number

@@ -71,6 +71,7 @@ use crate::web_api::{
     SpatialQueryApiState, UploadApiState, assemble_stateless_web_api_routes,
     create_collision_routes, create_e3d_tree_routes, create_noun_hierarchy_routes,
     create_search_routes, create_spatial_query_routes, create_upload_routes,
+    stateless_web_api_route_paths,
 };
 use handlers::*;
 use models::*;
@@ -84,6 +85,20 @@ pub struct AppState {
     pub config_manager: Arc<RwLock<ConfigManager>>,
     /// 进度广播中心（用于 WebSocket 和 gRPC）
     pub progress_hub: Arc<crate::shared::ProgressHub>,
+    /// Graceful shutdown 触发通道（B5 / Phase 10）。
+    ///
+    /// 持有方：`mod.rs::start_web_server_with_config` 在 axum 启动前用
+    /// `tokio::sync::oneshot::channel` 创建一对 sender/receiver，把 sender
+    /// 放到这里、receiver 喂给 `axum::serve(...).with_graceful_shutdown(...)`。
+    ///
+    /// 触发点：`site_config_handlers::save_site_config` /
+    /// `site_config_handlers::restart_server` 收到请求并写盘成功后，
+    /// 调用 `shutdown_tx.lock().await.take()` 拿走 sender 并 `send(())`，
+    /// 进入 graceful shutdown：5s 内停止接受新请求，已有连接处理完成后退出。
+    ///
+    /// 配套：进程级 supervisor（systemd / nssm / pm2）需在 main 退出后自动拉起，
+    /// 由此实现"改完配置自重启"的体验。
+    pub shutdown_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 /// 任务管理器
@@ -158,6 +173,7 @@ impl AppState {
             task_manager: Arc::new(Mutex::new(task_manager)),
             config_manager: Arc::new(RwLock::new(config_manager)),
             progress_hub: Arc::new(crate::shared::ProgressHub::default()),
+            shutdown_tx: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -171,6 +187,65 @@ impl ConfigManager {
 /// 启动Web UI服务器
 pub async fn start_web_server(port: u16) -> anyhow::Result<()> {
     start_web_server_with_config(port, None).await
+}
+
+/// 启动时打印"已注册路由清单"，便于"某个接口是否挂载"这类排障。
+///
+/// 触发条件：debug build 默认打印；release build 仅在 `AIOS_PRINT_ROUTES=1` 时打印。
+///
+/// 来源：
+/// - stateless 部分来自 [`stateless_web_api_route_paths`]，与
+///   [`assemble_stateless_web_api_routes`] 同步维护
+/// - stateful 部分列出已知前缀（`search` / `upload` / `collision` / `e3d_tree` /
+///   `noun_hierarchy` / `spatial_query` / `room_api` 等）与本文件手写注册的核心
+///   段（`/api/tasks`、`/api/model/*`、`/api/surreal/*` 等），不做完整枚举
+///
+/// 设计动机：继 2026-04-23 `pdms_transform` 漏挂载事件之后，为启动期可观测性
+/// 补一道"写完路由后能被看到"的护栏（PDMS Hardening M5，详见
+/// `docs/plans/2026-04-24-pdms-hardening-m3-m5-implementation-plan.md`）。
+fn maybe_print_registered_routes() {
+    let should_print =
+        cfg!(debug_assertions) || std::env::var("AIOS_PRINT_ROUTES").ok().as_deref() == Some("1");
+    if !should_print {
+        return;
+    }
+
+    println!("[web_server] registered routes (stateless web_api)");
+    for path in stateless_web_api_route_paths() {
+        println!("  {}", path);
+    }
+
+    println!("[web_server] registered routes (stateful web_api prefixes)");
+    for prefix in [
+        "/api/spatial/*        (spatial_query_api — 需 SpatialQueryApiState)",
+        "/api/noun-hierarchy/* (noun_hierarchy_api — 需 NounHierarchyApiState)",
+        "/api/e3d/*            (e3d_tree_api — 需 E3dTreeApiState)",
+        "/api/room/*           (room_api — 需 RoomApiState)",
+        "/api/collision/*      (collision_api — 需 CollisionApiState)",
+        "/api/search/pdms      (search_api — 需 SearchApiState)",
+        "/api/upload/*         (upload_api — 需 UploadApiState)",
+    ] {
+        println!("  {}", prefix);
+    }
+
+    println!("[web_server] registered routes (main router, manual in web_server/mod.rs)");
+    for prefix in [
+        "/api/tasks*           (任务管理：创建/列表/进度/结果)",
+        "/api/model/*          (模型生成 / 查询 / Parquet 导出)",
+        "/api/surreal/*        (SurrealDB 连接 / 状态 / 查询)",
+        "/api/database/*       (数据库状态与诊断)",
+        "/api/incremental/*    (增量更新 / parquet 增量队列)",
+        "/api/sctn-test/*      (SCTN 测试流程)",
+        "/ws/progress/{task_id} (WebSocket 进度)",
+        "/ws/tasks             (WebSocket 任务事件)",
+        "/admin/*              (管理端 UI + API，需 admin 会话)",
+        "/console/*            (控制台 UI 页面)",
+    ] {
+        println!("  {}", prefix);
+    }
+    println!(
+        "[web_server] route list above is maintained manually; toggle via AIOS_PRINT_ROUTES=1 (debug build prints by default)"
+    );
 }
 
 pub async fn start_web_server_with_config(
@@ -251,7 +326,7 @@ pub async fn start_web_server_with_config(
     let startup_ns = db_option.surreal_ns.clone();
     let startup_db = db_option.project_name.clone();
     tokio::spawn(async move {
-        match aios_core::initialize_databases(db_option).await {
+        match aios_core::initialize_databases(&db_option).await {
             Ok(_) => {
                 if let Err(error) =
                     aios_core::use_ns_db_compat(&aios_core::SUL_DB, &startup_ns, &startup_db).await
@@ -368,11 +443,10 @@ pub async fn start_web_server_with_config(
         .merge(admin_stateless_routes)
         .merge(admin_registry_handlers::create_admin_registry_routes())
         .with_state(app_state.clone())
-        .merge(
-            remote_sync_handlers::create_remote_sync_routes().route_layer(middleware::from_fn(
-                admin_auth_handlers::admin_session_middleware,
-            )),
-        );
+        // C4 · 修 G6：remote-sync routes 的 admin auth middleware 现已在
+        // `create_remote_sync_routes()` 内部用 `.layer(...)` 注入（与其他
+        // admin 路由风格一致），此处无需再外层 `.route_layer(...)`。
+        .merge(remote_sync_handlers::create_remote_sync_routes());
 
     let app = Router::new()
         // API路由
@@ -521,6 +595,10 @@ pub async fn start_web_server_with_config(
         .route(
             "/api/incremental/config",
             post(incremental_update_handlers::update_incremental_config),
+        )
+        .route(
+            "/api/incremental/archives",
+            get(incremental_update_handlers::list_incremental_archives),
         )
         // 增量更新页面
         .route(
@@ -1178,6 +1256,7 @@ pub async fn start_web_server_with_config(
         }
     });
     admin_auth_handlers::start_session_cleanup_timer();
+    maybe_print_registered_routes();
     println!("🚀 Web UI服务器启动成功！");
     println!("📱 访问地址: http://localhost:{}", listen_port);
     println!("🌐 对外后端地址: {}", runtime_site_config.backend_url);
@@ -1196,7 +1275,26 @@ pub async fn start_web_server_with_config(
     // 也注释掉，避免启动时查询数据库
     // tokio::spawn(crate::web_server::handlers::projects_health_scheduler());
 
-    let serve_result = axum::serve(listener, app).await;
+    // B5 / Phase 10 · graceful shutdown 接入点
+    //
+    // 创建 oneshot 通道：sender 放进 AppState，可由
+    // `site_config_handlers::save_site_config` 等处理器在写盘成功后取走并触发；
+    // receiver 交给 `axum::serve(...).with_graceful_shutdown(...)`，触发后
+    // axum 立即停止接受新连接，已建立连接走完 in-flight 请求再退出。
+    //
+    // 真正的"自动重启"由进程级 supervisor 接力（systemd / nssm / pm2 等），
+    // 详见 `docs/plans/2026-04-26-site-admin-next-steps.md §4`。
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut slot = app_state.shutdown_tx.lock().await;
+        *slot = Some(shutdown_tx);
+    }
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+            println!("📴 收到 graceful shutdown 信号，停止接受新请求；in-flight 请求处理完成后进程退出");
+        })
+        .await;
     heartbeat_handle.abort();
     if let Err(err) = crate::web_server::site_registry::mark_site_status(
         &runtime_site_config.site_id,

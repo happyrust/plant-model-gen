@@ -9,7 +9,7 @@ use once_cell::sync::Lazy;
 use rusqlite;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -101,6 +101,79 @@ static HTTP_HEALTH_CACHE: Lazy<Arc<RwLock<HashMap<String, HealthCheckCache>>>> =
 /// HTTP 健康检查缓存有效期（秒）
 const HEALTH_CHECK_CACHE_TTL: i64 = 30;
 
+// ============================================================================
+// Sprint B · B2: MQTT broker 操作日志 ring-buffer
+//
+// 把 MQTT 关键操作（节点上下线、主从切换、订阅启停、清主配置）落到一个进程内
+// ring-buffer，供 GET /api/mqtt/broker/logs 读取。容量固定为 200 条，溢出后
+// FIFO 淘汰；不持久化，进程重启即清空（业务上 broker logs 仅用于运维巡检，
+// 不需要回溯历史）。
+// ============================================================================
+
+/// MQTT broker 操作日志条目
+#[derive(Debug, Clone, Serialize)]
+pub struct BrokerLogEntry {
+    /// ISO8601 时间戳（UTC, RFC3339）
+    pub timestamp: String,
+    /// 日志级别：info / warn / error
+    pub level: String,
+    /// 事件名（与前端徽章/筛选保持一致）：
+    /// `set_master` / `set_client` / `subscription_started` / `subscription_stopped`
+    /// / `clear_master_config` / `node_online` / `node_offline` / `subscription_failed`
+    pub event: String,
+    /// 涉及的站点 location（可空，例如全局事件）
+    pub location: Option<String>,
+    /// 人类可读消息
+    pub message: String,
+}
+
+/// ring-buffer 容量上限（条数）
+pub(crate) const BROKER_LOG_CAPACITY: usize = 200;
+
+/// 全局 MQTT broker 操作日志 ring-buffer
+pub static MQTT_BROKER_LOGS: Lazy<Arc<RwLock<VecDeque<BrokerLogEntry>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(VecDeque::with_capacity(BROKER_LOG_CAPACITY))));
+
+/// 向 MQTT broker 日志 ring-buffer push 一条记录（FIFO 淘汰）
+///
+/// 调用方：
+/// - `update_node_heartbeat`：节点首次上线
+/// - `check_offline_nodes`：节点心跳超时
+/// - `update_subscription_status`：订阅 ConnAck/异常
+/// - `set_node_master_flag`：主从切换写盘
+/// - `start_mqtt_subscription_api` / `stop_mqtt_subscription_api`
+/// - `clear_master_config_internal`
+pub async fn push_broker_log(
+    level: &str,
+    event: &str,
+    location: Option<&str>,
+    message: impl Into<String>,
+) {
+    let entry = BrokerLogEntry {
+        timestamp: Utc::now().to_rfc3339(),
+        level: level.to_string(),
+        event: event.to_string(),
+        location: location.map(|s| s.to_string()),
+        message: message.into(),
+    };
+    let mut buf = MQTT_BROKER_LOGS.write().await;
+    if buf.len() >= BROKER_LOG_CAPACITY {
+        buf.pop_front();
+    }
+    buf.push_back(entry);
+}
+
+/// 读取 broker 日志（按时间倒序，最新在前），可选 limit
+pub async fn read_broker_logs(limit: Option<usize>) -> Vec<BrokerLogEntry> {
+    let buf = MQTT_BROKER_LOGS.read().await;
+    let mut entries: Vec<BrokerLogEntry> = buf.iter().cloned().collect();
+    entries.reverse();
+    if let Some(n) = limit {
+        entries.truncate(n);
+    }
+    entries
+}
+
 /// 更新节点心跳（由 MQTT 客户端定期调用）
 pub async fn update_node_heartbeat(
     location: String,
@@ -109,7 +182,13 @@ pub async fn update_node_heartbeat(
 ) {
     let mut nodes = MQTT_NODES.write().await;
 
+    let mut newly_online = false;
+    let mut recovered_from_offline = false;
+
     if let Some(node) = nodes.get_mut(&location) {
+        if !node.is_online {
+            recovered_from_offline = true;
+        }
         // 更新已有节点
         node.last_heartbeat = Utc::now();
         node.is_online = true;
@@ -117,11 +196,12 @@ pub async fn update_node_heartbeat(
         node.broker_connected_sub = Some(true);
     } else {
         // 新增节点
+        newly_online = true;
         nodes.insert(
             location.clone(),
             MqttNodeStatus {
-                location,
-                node_name,
+                location: location.clone(),
+                node_name: node_name.clone(),
                 is_online: true,
                 last_heartbeat: Utc::now(),
                 subscribed_topics,
@@ -134,24 +214,49 @@ pub async fn update_node_heartbeat(
             },
         );
     }
+    drop(nodes);
+
+    if newly_online {
+        push_broker_log(
+            "info",
+            "node_online",
+            Some(&location),
+            format!("节点 {} ({}) 首次上线", location, node_name),
+        )
+        .await;
+    } else if recovered_from_offline {
+        push_broker_log(
+            "info",
+            "node_online",
+            Some(&location),
+            format!("节点 {} 心跳恢复在线", location),
+        )
+        .await;
+    }
 }
 
 /// 更新订阅连接是否成功（用于 ConnAck 或异常时标记为未连接）
 pub async fn update_subscription_status(location: String, node_name: String, connected: bool) {
     let mut nodes = MQTT_NODES.write().await;
 
+    let mut state_changed = false;
+
     if let Some(node) = nodes.get_mut(&location) {
+        if node.is_online != connected {
+            state_changed = true;
+        }
         node.broker_connected_sub = Some(connected);
         node.is_online = connected;
         if connected {
             node.last_heartbeat = Utc::now();
         }
     } else {
+        state_changed = true;
         nodes.insert(
             location.clone(),
             MqttNodeStatus {
-                location,
-                node_name,
+                location: location.clone(),
+                node_name: node_name.clone(),
                 is_online: connected,
                 last_heartbeat: Utc::now(),
                 subscribed_topics: Vec::new(),
@@ -162,6 +267,24 @@ pub async fn update_subscription_status(location: String, node_name: String, con
                 broker_connected_sub: Some(connected),
             },
         );
+    }
+    drop(nodes);
+
+    if state_changed {
+        let (lvl, evt, msg) = if connected {
+            (
+                "info",
+                "subscription_connected",
+                format!("节点 {} ({}) 订阅 ConnAck", location, node_name),
+            )
+        } else {
+            (
+                "warn",
+                "subscription_failed",
+                format!("节点 {} ({}) 订阅断开/ConnAck 失败", location, node_name),
+            )
+        };
+        push_broker_log(lvl, evt, Some(&location), msg).await;
     }
 }
 
@@ -220,15 +343,32 @@ pub async fn record_message_sent(
 }
 
 /// 检查并标记离线节点（定期调用）
+///
+/// 仅在节点状态从 online → offline 翻转时记录一条 broker log，避免重复日志。
 pub async fn check_offline_nodes(timeout_secs: i64) {
-    let mut nodes = MQTT_NODES.write().await;
-    let now = Utc::now();
+    let mut transitions: Vec<(String, i64)> = Vec::new();
 
-    for node in nodes.values_mut() {
-        let elapsed = now.signed_duration_since(node.last_heartbeat).num_seconds();
-        if elapsed > timeout_secs {
-            node.is_online = false;
+    {
+        let mut nodes = MQTT_NODES.write().await;
+        let now = Utc::now();
+
+        for node in nodes.values_mut() {
+            let elapsed = now.signed_duration_since(node.last_heartbeat).num_seconds();
+            if elapsed > timeout_secs && node.is_online {
+                node.is_online = false;
+                transitions.push((node.location.clone(), elapsed));
+            }
         }
+    }
+
+    for (loc, elapsed) in transitions {
+        push_broker_log(
+            "warn",
+            "node_offline",
+            Some(&loc),
+            format!("节点 {} 心跳超时 {}s（阈值 {}s）", loc, elapsed, timeout_secs),
+        )
+        .await;
     }
 }
 
@@ -642,6 +782,58 @@ pub async fn client_unsubscribed(
     })))
 }
 
+/// 获取 deployment_sites.sqlite 的实际路径（优先读 DbOption.toml::deployment_sites_sqlite_path，否则用默认）
+pub(crate) fn get_node_config_db_path() -> String {
+    if std::path::Path::new("DbOption.toml").exists() {
+        config::Config::builder()
+            .add_source(config::File::with_name("DbOption"))
+            .build()
+            .ok()
+            .and_then(|b| b.get_string("deployment_sites_sqlite_path").ok())
+            .unwrap_or_else(|| "deployment_sites.sqlite".to_string())
+    } else {
+        "deployment_sites.sqlite".to_string()
+    }
+}
+
+/// 确保 node_config 表存在（schema：location PK + is_master + updated_at）
+pub(crate) fn ensure_node_config_table(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS node_config (
+            location TEXT PRIMARY KEY,
+            is_master BOOLEAN NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// 设置当前节点的主/从标识（写 node_config 表，UPSERT 语义）
+///
+/// 只负责落盘；调用方（sync_control_handlers::set_as_master_node /
+/// set_as_client_node）负责往 broker logs 推送结果，保证 `set_master` /
+/// `set_client` 事件与 `node_config` 写盘事实强一致。
+pub(crate) fn set_node_master_flag(
+    location: &str,
+    is_master: bool,
+    db_path: &str,
+) -> rusqlite::Result<()> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    ensure_node_config_table(&conn)?;
+    conn.execute(
+        "INSERT INTO node_config(location, is_master, updated_at) VALUES (?1, ?2, datetime('now'))
+         ON CONFLICT(location) DO UPDATE SET is_master = excluded.is_master, updated_at = datetime('now')",
+        rusqlite::params![location, is_master as i32],
+    )?;
+    Ok(())
+}
+
+/// 检查指定 location 是否为主节点（pub(crate) 供其它 web_server 模块使用）
+pub(crate) fn check_is_master_node(location: &str, db_path: &str) -> bool {
+    check_is_master_node_internal(location, db_path)
+}
+
 // 辅助函数：检查是否为主节点（内部使用）
 fn check_is_master_node_internal(location: &str, db_path: &str) -> bool {
     let conn = match rusqlite::Connection::open(db_path) {
@@ -649,14 +841,9 @@ fn check_is_master_node_internal(location: &str, db_path: &str) -> bool {
         Err(_) => return false,
     };
 
-    let _ = conn.execute(
-        "CREATE TABLE IF NOT EXISTS node_config (
-            location TEXT PRIMARY KEY,
-            is_master BOOLEAN NOT NULL DEFAULT 0,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )",
-        [],
-    );
+    if ensure_node_config_table(&conn).is_err() {
+        return false;
+    }
 
     conn.query_row(
         "SELECT is_master FROM node_config WHERE location = ?1",

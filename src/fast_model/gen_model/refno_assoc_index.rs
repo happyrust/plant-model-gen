@@ -522,7 +522,16 @@ pub async fn build_delete_sql_by_refnos(
         return Ok(Some(Vec::new()));
     }
 
-    let loaded = load_assoc_rows(refnos, chunk_size).await?;
+    let loaded = match load_assoc_rows(refnos, chunk_size).await {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!(
+                "[refno_assoc_index] 加载索引失败，回退 Legacy 清理: {}",
+                error
+            );
+            return Ok(None);
+        }
+    };
     if loaded.rows.len() != refnos.len() {
         return Ok(None);
     }
@@ -560,7 +569,34 @@ pub async fn delete_by_refnos(
         return Ok(RefnoAssocDeleteSummary::default());
     }
 
-    let loaded = load_assoc_rows(refnos, chunk_size).await?;
+    let loaded = match load_assoc_rows(refnos, chunk_size).await {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!(
+                "[refno_assoc_index] 加载索引失败，回退 Legacy 清理: {}",
+                error
+            );
+            return Ok(RefnoAssocDeleteSummary {
+                used_index: false,
+                deleted_statement_count: 0,
+                indexed_refnos: 0,
+                requested_refnos: refnos.len(),
+                cache_miss_refnos: refnos.len(),
+                prefetched_ref0_groups: 0,
+                overfetched_rows: 0,
+                inst_relate_ids: 0,
+                inst_info_ids: 0,
+                geo_relate_ids: 0,
+                geo_hashes: 0,
+                neg_relate_ids: 0,
+                ngmr_relate_ids: 0,
+                inst_relate_bool_ids: 0,
+                inst_relate_cata_bool_ids: 0,
+                inst_relate_aabb_ids: 0,
+                tubi_branch_keys: 0,
+            });
+        }
+    };
     if loaded.rows.len() != refnos.len() {
         return Ok(RefnoAssocDeleteSummary {
             used_index: false,

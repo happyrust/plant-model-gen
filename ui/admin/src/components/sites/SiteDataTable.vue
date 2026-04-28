@@ -1,12 +1,14 @@
 <script setup lang="ts">
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useSitesStore } from '@/stores/sites'
 import type { ManagedProjectSite, ManagedSiteRiskLevel } from '@/types/site'
-import { Eye, ExternalLink, FolderPlus, Loader2, Pencil, Play, RefreshCw, Square, Trash2 } from 'lucide-vue-next'
+import { ArrowDown, ArrowUp, ArrowUpDown, Copy, Eye, ExternalLink, FolderPlus, Loader2, Pencil, Play, RefreshCw, RotateCcw, Square, Trash2 } from 'lucide-vue-next'
 import {
   canDeleteSite,
   canEditSite,
   canParseSite,
+  canRestartSite,
   canStartSite,
   canStopSite,
   parsePlanClass as getParsePlanClass,
@@ -15,12 +17,117 @@ import {
   statusLabelMap,
 } from './site-status'
 import { buildViewerUrl } from '@/lib/viewer'
+import SiteDeleteDialog from './SiteDeleteDialog.vue'
 
-const props = defineProps<{ sites: ManagedProjectSite[]; loading: boolean }>()
+const props = defineProps<{
+  sites: ManagedProjectSite[]
+  loading: boolean
+  selected?: string[]
+}>()
+
+// D6 / Sprint D · 修 G15：表头点击排序
+//
+// 默认按 updated_at desc（与后端 list_sites 顺序一致）；点击表头切换 column 与
+// 升降序，再次点同一列在 asc <-> desc 之间翻转。纯前端排序，不动后端。
+type SortColumn = 'project_name' | 'status' | 'web_port' | 'risk_level'
+type SortDir = 'asc' | 'desc'
+
+const RISK_RANK: Record<ManagedSiteRiskLevel, number> = {
+  normal: 0,
+  warning: 1,
+  critical: 2,
+}
+
+const sortColumn = ref<SortColumn | null>(null)
+const sortDir = ref<SortDir>('asc')
+
+function toggleSort(column: SortColumn) {
+  if (sortColumn.value === column) {
+    sortDir.value = sortDir.value === 'asc' ? 'desc' : 'asc'
+    return
+  }
+  sortColumn.value = column
+  sortDir.value = 'asc'
+}
+
+function sortIcon(column: SortColumn) {
+  if (sortColumn.value !== column) return ArrowUpDown
+  return sortDir.value === 'asc' ? ArrowUp : ArrowDown
+}
+
+const sortedSites = computed(() => {
+  if (sortColumn.value === null) return props.sites
+  const column = sortColumn.value
+  const factor = sortDir.value === 'asc' ? 1 : -1
+  const arr = [...props.sites]
+  arr.sort((a, b) => {
+    let av: number | string
+    let bv: number | string
+    switch (column) {
+      case 'project_name':
+        av = a.project_name.toLowerCase()
+        bv = b.project_name.toLowerCase()
+        break
+      case 'status':
+        av = a.status
+        bv = b.status
+        break
+      case 'web_port':
+        av = a.web_port
+        bv = b.web_port
+        break
+      case 'risk_level':
+        av = RISK_RANK[a.risk_level] ?? 0
+        bv = RISK_RANK[b.risk_level] ?? 0
+        break
+    }
+    if (av < bv) return -1 * factor
+    if (av > bv) return 1 * factor
+    return 0
+  })
+  return arr
+})
 
 const emit = defineEmits<{
   'edit-site': [siteId: string]
+  'clone-site': [siteId: string]
+  'update-selection': [siteIds: string[]]
 }>()
+
+// D3 / Sprint D · 批量操作多选
+//
+// 选中的 site_id 集由父组件 (SitesView) 持有，本组件通过 v-model-like
+// 协议（props.selected + emit('update-selection')）保持双向同步。
+const selectedSet = computed(() => new Set(props.selected ?? []))
+
+const allVisibleSelected = computed(() => {
+  const visible = sortedSites.value
+  return visible.length > 0 && visible.every((s) => selectedSet.value.has(s.site_id))
+})
+
+const someVisibleSelected = computed(() => {
+  const visible = sortedSites.value
+  return visible.some((s) => selectedSet.value.has(s.site_id))
+})
+
+function toggleRowSelection(siteId: string, checked: boolean) {
+  const next = new Set(selectedSet.value)
+  if (checked) next.add(siteId)
+  else next.delete(siteId)
+  emit('update-selection', [...next])
+}
+
+function toggleAllVisible(checked: boolean) {
+  const visible = sortedSites.value.map((s) => s.site_id)
+  if (checked) {
+    const next = new Set(selectedSet.value)
+    visible.forEach((id) => next.add(id))
+    emit('update-selection', [...next])
+  } else {
+    const visibleSet = new Set(visible)
+    emit('update-selection', [...selectedSet.value].filter((id) => !visibleSet.has(id)))
+  }
+}
 
 const router = useRouter()
 const sitesStore = useSitesStore()
@@ -41,12 +148,34 @@ const riskConfig: Record<ManagedSiteRiskLevel, { class: string; label: string }>
 const canStart = canStartSite
 const canStop = canStopSite
 const canParse = canParseSite
+const canRestart = canRestartSite
 const canDelete = canDeleteSite
 const canEdit = canEditSite
+
+// D2 / Sprint D · 修 G9：用 hi-fi 弹框替代 window.confirm
+const deleteTarget = ref<ManagedProjectSite | null>(null)
+const deletePending = ref(false)
+
 function confirmDelete(site: ManagedProjectSite) {
-  const confirmed = window.confirm(`确定删除站点「${site.project_name}」吗？此操作不可撤销。`)
-  if (confirmed) {
-    void handleDelete(site.site_id)
+  deleteTarget.value = site
+}
+
+function cancelDelete() {
+  if (deletePending.value) return
+  deleteTarget.value = null
+}
+
+async function executeDelete() {
+  const site = deleteTarget.value
+  if (!site || deletePending.value) return
+  deletePending.value = true
+  try {
+    await sitesStore.deleteSite(site.site_id)
+    deleteTarget.value = null
+  } catch {
+    // 错误已写入 store，弹框保持打开方便用户重试或关闭
+  } finally {
+    deletePending.value = false
   }
 }
 function riskSummary(site: ManagedProjectSite) {
@@ -76,6 +205,14 @@ async function handleStop(siteId: string) {
   }
 }
 
+async function handleRestart(siteId: string) {
+  try {
+    await sitesStore.restartSite(siteId)
+  } catch {
+    // 错误已写入 store
+  }
+}
+
 async function handleParse(siteId: string) {
   try {
     await sitesStore.parseSite(siteId)
@@ -84,13 +221,6 @@ async function handleParse(siteId: string) {
   }
 }
 
-async function handleDelete(siteId: string) {
-  try {
-    await sitesStore.deleteSite(siteId)
-  } catch {
-    // 错误已写入 store
-  }
-}
 </script>
 
 <template>
@@ -115,20 +245,56 @@ async function handleDelete(siteId: string) {
     <table v-else class="w-full text-sm">
       <thead>
         <tr class="border-b border-border bg-muted/50">
-          <th class="px-4 py-3 text-left font-medium text-muted-foreground">项目名称</th>
-          <th class="px-4 py-3 text-left font-medium text-muted-foreground">状态</th>
-          <th class="px-4 py-3 text-left font-medium text-muted-foreground">端口</th>
-          <th class="px-4 py-3 text-left font-medium text-muted-foreground">风险</th>
+          <th class="w-10 px-3 py-3 text-left font-medium text-muted-foreground">
+            <input
+              type="checkbox"
+              class="h-4 w-4 cursor-pointer rounded border-input"
+              :checked="allVisibleSelected"
+              :indeterminate="someVisibleSelected && !allVisibleSelected"
+              :title="allVisibleSelected ? '取消全选' : '全选当前可见站点'"
+              @change="toggleAllVisible(($event.target as HTMLInputElement).checked)"
+              @click.stop
+            />
+          </th>
+          <th class="px-4 py-3 text-left font-medium text-muted-foreground">
+            <button type="button" class="inline-flex items-center gap-1 hover:text-foreground transition-colors" @click="toggleSort('project_name')">
+              项目名称 <component :is="sortIcon('project_name')" class="h-3.5 w-3.5" />
+            </button>
+          </th>
+          <th class="px-4 py-3 text-left font-medium text-muted-foreground">
+            <button type="button" class="inline-flex items-center gap-1 hover:text-foreground transition-colors" @click="toggleSort('status')">
+              状态 <component :is="sortIcon('status')" class="h-3.5 w-3.5" />
+            </button>
+          </th>
+          <th class="px-4 py-3 text-left font-medium text-muted-foreground">
+            <button type="button" class="inline-flex items-center gap-1 hover:text-foreground transition-colors" @click="toggleSort('web_port')">
+              端口 <component :is="sortIcon('web_port')" class="h-3.5 w-3.5" />
+            </button>
+          </th>
+          <th class="px-4 py-3 text-left font-medium text-muted-foreground">
+            <button type="button" class="inline-flex items-center gap-1 hover:text-foreground transition-colors" @click="toggleSort('risk_level')">
+              风险 <component :is="sortIcon('risk_level')" class="h-3.5 w-3.5" />
+            </button>
+          </th>
           <th class="px-4 py-3 text-right font-medium text-muted-foreground">操作</th>
         </tr>
       </thead>
       <tbody>
         <tr
-          v-for="site in props.sites"
+          v-for="site in sortedSites"
           :key="site.site_id"
           class="border-b border-border last:border-0 hover:bg-muted/30 transition-colors cursor-pointer"
+          :class="selectedSet.has(site.site_id) ? 'bg-accent/20' : ''"
           @click="openDetail(site.site_id)"
         >
+          <td class="w-10 px-3 py-3 align-top" @click.stop>
+            <input
+              type="checkbox"
+              class="h-4 w-4 cursor-pointer rounded border-input"
+              :checked="selectedSet.has(site.site_id)"
+              @change="toggleRowSelection(site.site_id, ($event.target as HTMLInputElement).checked)"
+            />
+          </td>
           <td class="px-4 py-3 align-top">
             <div class="font-medium">{{ site.project_name }}</div>
             <div class="text-xs text-muted-foreground">{{ site.site_id }}</div>
@@ -191,7 +357,7 @@ async function handleDelete(siteId: string) {
             <div v-if="isPending(site.site_id)" class="flex items-center justify-end gap-2">
               <Loader2 class="h-4 w-4 animate-spin text-muted-foreground" />
               <span class="text-xs text-muted-foreground">
-                {{ pendingAction(site.site_id) === 'start' ? '启动中' : pendingAction(site.site_id) === 'stop' ? '停止中' : pendingAction(site.site_id) === 'parse' ? '解析中' : '处理中' }}
+                {{ pendingAction(site.site_id) === 'start' ? '启动中' : pendingAction(site.site_id) === 'stop' ? '停止中' : pendingAction(site.site_id) === 'restart' ? '重启中' : pendingAction(site.site_id) === 'parse' ? '解析中' : '处理中' }}
               </span>
             </div>
             <div v-else class="flex items-center justify-end gap-1">
@@ -210,6 +376,14 @@ async function handleDelete(siteId: string) {
                 title="停止"
               >
                 <Square class="h-3.5 w-3.5 text-amber-600" />
+              </button>
+              <button
+                v-if="canRestart(site)"
+                @click="handleRestart(site.site_id)"
+                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
+                title="重启"
+              >
+                <RotateCcw class="h-3.5 w-3.5 text-blue-600" />
               </button>
               <button
                 v-if="canParse(site)"
@@ -243,6 +417,13 @@ async function handleDelete(siteId: string) {
                 <Pencil class="h-3.5 w-3.5" />
               </button>
               <button
+                @click="emit('clone-site', site.site_id)"
+                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
+                title="克隆站点（端口自动 +1，需重填凭据）"
+              >
+                <Copy class="h-3.5 w-3.5" />
+              </button>
+              <button
                 v-if="canDelete(site)"
                 @click="confirmDelete(site)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
@@ -255,5 +436,12 @@ async function handleDelete(siteId: string) {
         </tr>
       </tbody>
     </table>
+    <SiteDeleteDialog
+      :open="deleteTarget !== null"
+      :site="deleteTarget"
+      :pending="deletePending"
+      @cancel="cancelDelete"
+      @confirm="executeDelete"
+    />
   </div>
 </template>

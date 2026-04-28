@@ -1,14 +1,21 @@
 use aios_core::parsed_data::CateAxisParam;
-use aios_core::shape::pdms_shape::RsVec3;
 use aios_core::vec3_pool::{CateAxisParamCompact, decompress_ptset};
 use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db};
-use axum::{Router, extract::Path, extract::Query, http::StatusCode, response::Json, routing::get};
+use axum::{
+    Json, Router,
+    extract::{Path, Query, rejection::JsonRejection},
+    http::StatusCode,
+    routing::{get, post},
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use surrealdb::types::{self as surrealdb_types, SurrealValue};
+use std::str::FromStr;
+use surrealdb::types::SurrealValue;
 
 pub fn create_ptset_routes() -> Router {
-    Router::new().route("/api/pdms/ptset/{refno}", get(get_ptset_by_refno))
+    Router::new()
+        .route("/api/pdms/ptset/{refno}", get(get_ptset_by_refno))
+        .route("/api/pdms/ptset/batch-query", post(post_ptset_batch_query))
 }
 
 // 定义用于接收压缩格式 ptset 的结构
@@ -75,7 +82,7 @@ pub struct PtsetResponse {
 }
 
 /// 单位信息
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PtsetUnitInfo {
     /// 源单位（后端数据单位）
     pub source_unit: String,
@@ -94,103 +101,235 @@ pub struct PtsetQuery {
     pub batch_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PtsetBatchQueryRequest {
+    pub refnos: Vec<String>,
+    pub dbno: Option<u32>,
+    pub batch_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PtsetBatchItemResult {
+    pub input_refno: String,
+    pub refno: Option<String>,
+    pub success: bool,
+    pub ptset: Vec<PtsetPoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub world_transform: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    pub unit_info: Option<PtsetUnitInfo>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PtsetBatchQueryResponse {
+    pub success: bool,
+    pub results: Vec<PtsetBatchItemResult>,
+    pub total_count: usize,
+    pub success_count: usize,
+    pub failed_count: usize,
+}
+
+#[derive(Debug)]
+struct PtsetLookupResult {
+    success: bool,
+    refno: String,
+    ptset: Vec<PtsetPoint>,
+    world_transform: Option<Vec<f64>>,
+    batch_id: Option<String>,
+    unit_info: Option<PtsetUnitInfo>,
+    error_message: Option<String>,
+}
+
+impl From<PtsetLookupResult> for PtsetResponse {
+    fn from(value: PtsetLookupResult) -> Self {
+        Self {
+            success: value.success,
+            refno: value.refno,
+            ptset: value.ptset,
+            world_transform: value.world_transform,
+            batch_id: value.batch_id,
+            unit_info: value.unit_info,
+            error_message: value.error_message,
+        }
+    }
+}
+
 /// 从 inst_info 表查询 ptset 数据
 async fn get_ptset_by_refno(
     Path(refno): Path<RefnoEnum>,
     Query(query): Query<PtsetQuery>,
 ) -> Result<Json<PtsetResponse>, StatusCode> {
+    let result = query_ptset(refno, query.dbno, query.batch_id.as_deref()).await;
+    Ok(Json(result.into()))
+}
+
+async fn post_ptset_batch_query(
+    request: Result<Json<PtsetBatchQueryRequest>, JsonRejection>,
+) -> Result<Json<PtsetBatchQueryResponse>, StatusCode> {
+    let Json(request) = request.map_err(|_| StatusCode::BAD_REQUEST)?;
+    let PtsetBatchQueryRequest {
+        refnos,
+        dbno,
+        batch_id,
+    } = request;
+
+    let mut results = Vec::with_capacity(refnos.len());
+    let mut success_count = 0usize;
+
+    for input_refno in refnos {
+        let item = match parse_batch_refno(&input_refno) {
+            Ok(refno) => {
+                let lookup = query_ptset(refno, dbno, batch_id.as_deref()).await;
+                lookup_to_batch_item(input_refno, lookup)
+            }
+            Err(error) => PtsetBatchItemResult {
+                input_refno,
+                refno: None,
+                success: false,
+                ptset: vec![],
+                world_transform: None,
+                batch_id: None,
+                unit_info: None,
+                error_message: Some(format!("无效的 refno: {error}")),
+            },
+        };
+
+        if item.success {
+            success_count += 1;
+        }
+        results.push(item);
+    }
+
+    let total_count = results.len();
+    let failed_count = total_count.saturating_sub(success_count);
+
+    Ok(Json(PtsetBatchQueryResponse {
+        success: true,
+        results,
+        total_count,
+        success_count,
+        failed_count,
+    }))
+}
+
+async fn query_ptset(
+    refno: RefnoEnum,
+    dbno: Option<u32>,
+    batch_id: Option<&str>,
+) -> PtsetLookupResult {
     let refno_str = refno.to_string();
 
-    // 1) 优先从 model instance_cache 按需读取（与模型 instances.json 同源）
-    //    - 若传入 dbno/batch_id：按“截至 batch 的最新快照”查找
-    //    - 若未传：尝试推导 dbno 并回退到 latest batch
-    if let Ok(Some((ptset_points, world_transform, snapshot_batch_id))) =
-        try_get_ptset_from_cache(refno, query.dbno, query.batch_id.as_deref()).await
-    {
-        if !ptset_points.is_empty() {
-            return Ok(Json(PtsetResponse {
-                success: true,
-                refno: refno_str,
-                ptset: ptset_points,
-                world_transform: Some(world_transform),
-                batch_id: Some(snapshot_batch_id),
-                // 当前约定：ptset 坐标与模型原始单位一致（mm）
-                unit_info: Some(PtsetUnitInfo {
-                    source_unit: "mm".to_string(),
-                    target_unit: "mm".to_string(),
-                    conversion_factor: 1.0,
-                }),
-                error_message: None,
-            }));
+    let db_lookup = query_ptset_from_db(&refno_str).await;
+    if db_lookup.success {
+        return db_lookup;
+    }
+
+    // 真源优先走 SurrealDB；仅在 DB 明确“无 ptset 数据”时尝试读取 cache 作为兼容兜底。
+    if matches!(db_lookup.error_message.as_deref(), Some("未找到 ptset 数据")) {
+        if let Ok(Some((ptset_points, world_transform, snapshot_batch_id))) =
+            try_get_ptset_from_cache(refno, dbno, batch_id).await
+        {
+            if !ptset_points.is_empty() {
+                return PtsetLookupResult {
+                    success: true,
+                    refno: refno_str,
+                    ptset: ptset_points,
+                    world_transform: Some(world_transform),
+                    batch_id: Some(snapshot_batch_id),
+                    unit_info: Some(default_ptset_unit_info()),
+                    error_message: None,
+                };
+            }
         }
     }
 
-    // 使用 SurrealDB 的关系查询语法：
-    // inst_relate:24383_84631->inst_info 返回关联的 inst_info 记录
-    let sql = format!(
-        "SELECT ptset FROM inst_relate:{}->inst_info",
-        refno.to_string()
-    );
+    db_lookup
+}
 
-    // 使用 query_take 获取压缩格式的 ptset 数据
+async fn query_ptset_from_db(refno_str: &str) -> PtsetLookupResult {
+    let sql = format!("SELECT ptset FROM inst_relate:{}->inst_info", refno_str);
+
     let query_result: Option<CompressedPtsetQueryResult> =
         match project_primary_db().query_take(&sql, 0).await {
             Ok(result) => result,
-            Err(e) => {
-                return Ok(Json(PtsetResponse {
-                    success: false,
-                    refno: refno_str,
-                    ptset: vec![],
-                    world_transform: None,
-                    batch_id: None,
-                    unit_info: None,
-                    error_message: Some(format!("数据库查询失败: {}", e)),
-                }));
+            Err(error) => {
+                return failure_lookup_result(
+                    refno_str.to_string(),
+                    format!("数据库查询失败: {error}"),
+                );
             }
         };
 
-    // 处理查询结果：解压缩 ptset 数据
-    let ptset_points: Vec<PtsetPoint> = match query_result {
-        Some(result) => {
-            if let Some(compacts) = result.ptset {
-                // 解压缩
-                let params = decompress_ptset(&compacts);
-                params
-                    .into_iter()
-                    .map(|param| PtsetPoint::from(&param))
-                    .collect()
-            } else {
-                vec![]
-            }
-        }
-        None => vec![],
-    };
+    let ptset_points = query_result
+        .and_then(|result| result.ptset)
+        .map(|compacts| decompress_ptset(&compacts))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|param| PtsetPoint::from(&param))
+        .collect::<Vec<_>>();
 
     if !ptset_points.is_empty() {
-        Ok(Json(PtsetResponse {
+        PtsetLookupResult {
             success: true,
-            refno: refno_str,
+            refno: refno_str.to_string(),
             ptset: ptset_points,
             world_transform: None,
             batch_id: None,
-            unit_info: Some(PtsetUnitInfo {
-                source_unit: "mm".to_string(),
-                target_unit: "mm".to_string(),
-                conversion_factor: 1.0,
-            }),
+            unit_info: Some(default_ptset_unit_info()),
             error_message: None,
-        }))
+        }
     } else {
-        Ok(Json(PtsetResponse {
-            success: false,
-            refno: refno_str,
-            ptset: vec![],
-            world_transform: None,
-            batch_id: None,
-            unit_info: None,
-            error_message: Some("未找到 ptset 数据".to_string()),
-        }))
+        failure_lookup_result(refno_str.to_string(), "未找到 ptset 数据".to_string())
     }
+}
+
+fn lookup_to_batch_item(input_refno: String, lookup: PtsetLookupResult) -> PtsetBatchItemResult {
+    PtsetBatchItemResult {
+        input_refno,
+        refno: Some(lookup.refno),
+        success: lookup.success,
+        ptset: lookup.ptset,
+        world_transform: lookup.world_transform,
+        batch_id: lookup.batch_id,
+        unit_info: lookup.unit_info,
+        error_message: lookup.error_message,
+    }
+}
+
+fn failure_lookup_result(refno: String, error_message: String) -> PtsetLookupResult {
+    PtsetLookupResult {
+        success: false,
+        refno,
+        ptset: vec![],
+        world_transform: None,
+        batch_id: None,
+        unit_info: None,
+        error_message: Some(error_message),
+    }
+}
+
+fn default_ptset_unit_info() -> PtsetUnitInfo {
+    PtsetUnitInfo {
+        source_unit: "mm".to_string(),
+        target_unit: "mm".to_string(),
+        conversion_factor: 1.0,
+    }
+}
+
+fn parse_batch_refno(raw: &str) -> Result<RefnoEnum, String> {
+    let normalized = raw.trim().replace('_', "/");
+    let parts: Vec<&str> = normalized.split('/').collect();
+    if parts.len() != 2 || parts.iter().any(|part| part.trim().is_empty()) {
+        return Err("格式应为 dbnum_refno 或 dbnum/refno".to_string());
+    }
+
+    if parts[0].parse::<u32>().is_err() || parts[1].parse::<u32>().is_err() {
+        return Err("格式应为 dbnum_refno 或 dbnum/refno".to_string());
+    }
+
+    RefnoEnum::from_str(&normalized).map_err(|error| error.to_string())
 }
 
 async fn try_get_ptset_from_cache(
@@ -218,7 +357,7 @@ async fn try_get_ptset_from_cache(
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("output/instance_cache"));
+        .unwrap_or_else(default_model_cache_dir);
 
     let cache = InstanceCacheManager::new(&cache_dir).await?;
 
@@ -248,4 +387,12 @@ async fn try_get_ptset_from_cache(
     let world_transform: Vec<f64> = m.iter().map(|v| *v as f64).collect();
 
     Ok(Some((points, world_transform, snapshot_id)))
+}
+
+fn default_model_cache_dir() -> PathBuf {
+    let project_cache_dir = PathBuf::from("output/AvevaMarineSample/instance_cache");
+    if project_cache_dir.exists() {
+        return project_cache_dir;
+    }
+    PathBuf::from("output/instance_cache")
 }

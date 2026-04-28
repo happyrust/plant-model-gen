@@ -282,7 +282,7 @@ pub async fn collect_export_data(
     _refnos: &[RefnoEnum],
     mesh_dir: &Path,
     verbose: bool,
-    _bran_roots: Option<&[RefnoEnum]>,
+    bran_roots: Option<&[RefnoEnum]>,
     tubi_use_inst_world_only: bool,
 ) -> Result<ExportData> {
     if verbose {
@@ -381,6 +381,38 @@ pub async fn collect_export_data(
                 spec_value: None,
                 has_neg: geom_inst.has_neg,
                 aabb: geom_inst.world_aabb,
+            });
+        }
+    }
+
+    if let Some(bran_roots) = bran_roots {
+        let tubi_insts = aios_core::query_tubi_insts_by_brans(bran_roots).await?;
+        if verbose && !tubi_insts.is_empty() {
+            println!("   - 从 BRAN/HANG 查询到 {} 条 TUBI 实例", tubi_insts.len());
+        }
+
+        for tubi in tubi_insts {
+            let idx = tubi_refno_counters.entry(tubi.refno).or_insert(0);
+            let seg_index = *idx;
+            *idx += 1;
+
+            let tubi_name = if seg_index == 0 {
+                format!("TUBI_{}", tubi.refno)
+            } else {
+                format!("TUBI_{}_{}", tubi.refno, seg_index + 1)
+            };
+
+            tubings.push(TubiRecord {
+                refno: tubi.refno,
+                owner_refno: tubi.leave,
+                geo_hash: tubi.geo_hash,
+                transform: tubi.world_trans.to_matrix().as_dmat4(),
+                index: seg_index,
+                name: tubi_name,
+                spec_value: tubi.spec_value,
+                aabb: tubi.world_aabb,
+                world_aabb_hash: None,
+                world_trans_hash: None,
             });
         }
     }

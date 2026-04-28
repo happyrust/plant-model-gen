@@ -358,6 +358,32 @@ fn normalize_host(host: Option<String>) -> String {
         .unwrap_or_else(|| "127.0.0.1".to_string())
 }
 
+/// 在写入 DB 之前对 `bind_host` 做安全校验。
+///
+/// - `0.0.0.0` 默认拒绝（公网暴露风险）
+/// - `AIOS_ALLOW_PUBLIC_BIND=1` / `=true` 时放行，便于需要内网/跨机部署的场景
+///
+/// 设计动机：继 `normalize_host` 在空值时默认 `127.0.0.1` 之后，为"用户显式传
+/// 0.0.0.0 也要兜一下"补第二道保险（PDMS Hardening 续篇：admin 站点安全收口，
+/// 详见 `docs/plans/2026-04-24-admin-site-security-hardening-plan.md`）。
+fn assert_bind_host_safe(host: &str) -> Result<()> {
+    let trimmed = host.trim();
+    if trimmed == "0.0.0.0" && !env_allow_public_bind() {
+        bail!(
+            "bind_host=0.0.0.0 会将站点暴露到所有网络接口。\
+             请改用 127.0.0.1 或具体的内网地址；\
+             如确需公网绑定，请设置 AIOS_ALLOW_PUBLIC_BIND=1 并自行承担风险。"
+        );
+    }
+    Ok(())
+}
+
+fn env_allow_public_bind() -> bool {
+    std::env::var("AIOS_ALLOW_PUBLIC_BIND")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn require_db_user(user: Option<String>) -> Result<String> {
     user.map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -369,6 +395,48 @@ fn require_db_password(password: Option<String>) -> Result<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("数据库密码不能为空"))
+}
+
+/// 常见弱凭据黑名单（小写比较）；后续可按需扩展。
+const WEAK_CREDENTIAL_PAIRS: &[(&str, &str)] = &[
+    ("root", "root"),
+    ("admin", "admin"),
+    ("admin", "123456"),
+    ("root", "123456"),
+    ("test", "test"),
+];
+
+fn env_allow_weak_db_creds() -> bool {
+    std::env::var("AIOS_ALLOW_WEAK_DB_CREDS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// 拒绝常见弱凭据；允许通过 `AIOS_ALLOW_WEAK_DB_CREDS=1` 逃生（开发/测试兼容）。
+///
+/// 约束理由：站点 SurrealDB 的 `user/password` 会以明文写入 per-site 配置，
+/// 若误填 `root/root` 会导致站点 DB 对任意连接者可读写。SiteDrawer.vue 从
+/// 2026-04-21 起已经取消默认 root/root 预填，但后端仍然只校验"非空"，
+/// 手写或脚本化提交仍可能绕过；本函数在 `create_site` / `update_site` 两处
+/// 统一兜一层硬拒绝。
+fn assert_db_credentials_strong(user: &str, password: &str) -> Result<()> {
+    if env_allow_weak_db_creds() {
+        return Ok(());
+    }
+    let u = user.trim().to_ascii_lowercase();
+    let p = password.trim().to_ascii_lowercase();
+    for (weak_u, weak_p) in WEAK_CREDENTIAL_PAIRS {
+        if u == *weak_u && p == *weak_p {
+            bail!(
+                "数据库凭据过于简单（{}/{}）。\
+                 请使用更复杂的用户名/密码；如仅用于本地开发，\
+                 可设置 AIOS_ALLOW_WEAK_DB_CREDS=1 临时放行。",
+                user,
+                password,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn normalize_optional_db_user(user: Option<String>) -> Option<String> {
@@ -1516,6 +1584,7 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
     let site_id = infer_site_id(&req.project_name, req.web_port);
     let created_at = now_rfc3339();
     let bind_host = normalize_host(req.bind_host);
+    assert_bind_host_safe(&bind_host)?;
     let public_base_url = req
         .public_base_url
         .filter(|v| !v.trim().is_empty())
@@ -1528,6 +1597,7 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
         derive_entry_urls(req.web_port, &bind_host, &public_base_url);
     let db_user = require_db_user(req.db_user)?;
     let db_password = require_db_password(req.db_password)?;
+    assert_db_credentials_strong(&db_user, &db_password)?;
 
     let parse_db_types = normalize_parse_db_types(req.parse_db_types);
     let site = ManagedProjectSite {
@@ -1584,6 +1654,10 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
 
     let mut site = site;
     annotate_site_parse_plan(&mut site);
+
+    // D1 / Sprint D · 修 G8：写盘 + 落磁盘均成功后立即广播 admin 站点新增事件
+    crate::web_server::sse_handlers::push_admin_site_created(&site.site_id, &site.project_name);
+
     Ok(site)
 }
 
@@ -1735,6 +1809,8 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
         site.force_rebuild_system_db = value;
     }
     if let Some(value) = req.bind_host.filter(|value| !value.trim().is_empty()) {
+        let value = value.trim().to_string();
+        assert_bind_host_safe(&value)?;
         site.bind_host = normalize_host(Some(value));
     }
     if let Some(value) = req.public_base_url {
@@ -1766,6 +1842,7 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
     }
     let db_user = normalize_optional_db_user(req.db_user).unwrap_or(stored_db_user);
     let db_password = normalize_optional_db_password(req.db_password).unwrap_or(stored_db_password);
+    assert_db_credentials_strong(&db_user, &db_password)?;
     site.force_rebuild_system_db =
         normalize_force_rebuild_system_db(site.force_rebuild_system_db, &site.parse_db_types);
 
@@ -1790,6 +1867,17 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
 
     write_site_files(&site, &db_user, &db_password)?;
     annotate_site_parse_plan(&mut site);
+
+    // D1 / Sprint D · 修 G8：元数据更新成功后广播 admin 站点快照事件
+    // （update_site 内部不走 update_runtime，所以单独注入）
+    crate::web_server::sse_handlers::push_admin_site_snapshot(
+        &site.site_id,
+        Some(&site.project_name),
+        status_to_str(&site.status),
+        parse_status_to_str(&site.parse_status),
+        site.last_error.as_deref(),
+    );
+
     Ok(site)
 }
 
@@ -1821,7 +1909,7 @@ pub fn update_runtime(site_id: &str, update: RuntimeUpdate) -> Result<()> {
         last_parse_duration_ms,
     } = update;
 
-    with_tx(|conn| {
+    let updated_site = with_tx(|conn| {
         let mut site = load_site_with_conn(conn, site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
         if let Some(value) = status {
             site.status = value;
@@ -1855,8 +1943,21 @@ pub fn update_runtime(site_id: &str, update: RuntimeUpdate) -> Result<()> {
         }
         site.updated_at = now_rfc3339();
         let (db_user, db_password) = load_credentials_with_conn(conn, site_id)?;
-        persist_site_with_conn(conn, &site, &db_user, &db_password)
-    })
+        persist_site_with_conn(conn, &site, &db_user, &db_password)?;
+        Ok(site)
+    })?;
+
+    // D1 / Sprint D · 修 G7/G8：事务 commit 成功后立即广播 admin 站点快照事件
+    // 覆盖 start/stop/parse/restart 全路径（这些 action 都最终走 update_runtime）
+    crate::web_server::sse_handlers::push_admin_site_snapshot(
+        &updated_site.site_id,
+        Some(&updated_site.project_name),
+        status_to_str(&updated_site.status),
+        parse_status_to_str(&updated_site.parse_status),
+        updated_site.last_error.as_deref(),
+    );
+
+    Ok(())
 }
 
 fn record_site_error(
@@ -2590,7 +2691,15 @@ async fn wait_for_http_ok(url: &str, attempts: usize, delay_ms: u64) -> bool {
 
 // ─── Port helpers ───────────────────────────────────────────────────────────
 
-async fn process_ids_on_port(port: u16) -> Result<Vec<u32>> {
+/// 列出占用指定端口的进程 PID 列表。
+///
+/// 实现：Unix 走 `lsof -i:PORT -sTCP:LISTEN`，Windows 走
+/// `netstat -ano` + 过滤 `LISTENING`。返回空 Vec 表示端口未被占用（或
+/// 占用进程已退出）。
+///
+/// `pub(crate)` 是为了让 `admin_handlers::ports_check` 端点（D4）复用，
+/// 避免在多处重复实现端口探测逻辑。
+pub(crate) async fn process_ids_on_port(port: u16) -> Result<Vec<u32>> {
     #[cfg(unix)]
     {
         let output = Command::new("lsof")
@@ -3135,6 +3244,32 @@ pub async fn parse_site(site_id: String) -> Result<()> {
     Ok(())
 }
 
+/// 重启站点（C6 / Sprint C · 修 G10）
+///
+/// 串联 `stop_site` → 短暂等待 → `start_site`，作为单个原子化的"重启"动作
+/// 暴露给 admin 前端，避免用户手动两步操作期间的状态尴尬期
+/// （Stopping → Stopped → Starting）。
+///
+/// 实现要点：
+/// - stop 阶段如发生端口冲突（外部进程占用），直接 bail，由前端展示原因
+/// - stop 与 start 之间留 500ms 缓冲，让进程组完全退出 + socket TIME_WAIT
+///   清理一部分；端口完全可用的兜底由 `start_site` 内部的 `WAIT_PORT_ATTEMPTS`
+///   （30 次 × 500ms）承担
+/// - start 失败后状态会被 `start_site` spawn 的内部错误路径写为 Failed，
+///   外部调用方只需关注函数返回的 Result
+pub async fn restart_site(site_id: &str) -> Result<()> {
+    let stop_result = stop_site(site_id).await?;
+    if stop_result.conflict {
+        bail!(
+            "停止站点时检测到端口冲突（web={:?} db={:?}），无法继续重启；请先排查外部占用",
+            stop_result.web_conflict_pids,
+            stop_result.db_conflict_pids
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    start_site(site_id.to_string()).await
+}
+
 pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
     // 注：stop_site 不持 lock_op()——std::sync::MutexGuard 无法跨 await 持有，
     // 而 create/update/delete 都有 `site_has_active_processes` 的状态校验兜底，
@@ -3299,6 +3434,13 @@ pub fn delete_site(site_id: &str) -> Result<bool> {
             );
         }
     }
+
+    // D1 / Sprint D · 修 G8：仅当 SQLite 真正删除了一行时广播 deleted 事件
+    // （changed == 0 表示站点不存在，无需通知前端）
+    if changed > 0 {
+        crate::web_server::sse_handlers::push_admin_site_deleted(site_id);
+    }
+
     Ok(changed > 0)
 }
 
@@ -3690,6 +3832,85 @@ fn current_stage(
         "待处理".to_string(),
         parse_detail.or(db_detail).or(web_detail),
     )
+}
+
+/// 单条日志类别的尾部读取（D5 / Sprint D · 修 G13）
+///
+/// 返回 `{ lines, total_lines, returned_lines, truncated }`：
+/// - `lines`：文件最后 `limit` 行（按文件出现顺序，旧 → 新）
+/// - `total_lines`：文件实际总行数
+/// - `returned_lines`：本次返回行数
+/// - `truncated`：当 `total_lines > returned_lines` 时为 true
+///
+/// 路径：runtime/admin_sites/<site_id>/logs/<kind>.log
+/// `kind` 必须是 "parse" / "db" / "web"。
+pub fn tail_log(site_id: &str, kind: &str, limit: usize) -> Result<TailLogResponse> {
+    let _ = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
+    let path = log_file_path(site_id, kind)?;
+    let limit = limit.clamp(1, 5000);
+    let (total_lines, lines) = read_tail_with_total(&path, limit);
+    Ok(TailLogResponse {
+        kind: kind.to_string(),
+        path: path.to_string_lossy().to_string(),
+        total_lines,
+        returned_lines: lines.len(),
+        truncated: total_lines > lines.len(),
+        limit,
+        lines,
+    })
+}
+
+/// 单条日志类别的完整路径（D5 · 全量下载用）
+pub fn full_log_path(site_id: &str, kind: &str) -> Result<PathBuf> {
+    let _ = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
+    log_file_path(site_id, kind)
+}
+
+fn log_file_path(site_id: &str, kind: &str) -> Result<PathBuf> {
+    match kind {
+        "parse" | "db" | "web" => {}
+        other => bail!("非法日志类型: {} (必须为 parse / db / web)", other),
+    }
+    let safe_id = sanitize_site_id_for_path(site_id);
+    let mut p = PathBuf::from(ADMIN_RUNTIME_ROOT);
+    p.push(safe_id);
+    p.push("logs");
+    p.push(format!("{}.log", kind));
+    Ok(p)
+}
+
+fn read_tail_with_total(path: &Path, limit: usize) -> (usize, Vec<String>) {
+    let file = match OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(_) => return (0, Vec::new()),
+    };
+    let reader = BufReader::new(file);
+    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+    let total = lines.len();
+    if total <= limit {
+        (total, lines)
+    } else {
+        let tail = lines[total - limit..].to_vec();
+        (total, tail)
+    }
+}
+
+fn sanitize_site_id_for_path(site_id: &str) -> String {
+    site_id
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' })
+        .collect()
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct TailLogResponse {
+    pub kind: String,
+    pub path: String,
+    pub total_lines: usize,
+    pub returned_lines: usize,
+    pub truncated: bool,
+    pub limit: usize,
+    pub lines: Vec<String>,
 }
 
 pub fn logs(site_id: &str) -> Result<ManagedSiteLogsResponse> {

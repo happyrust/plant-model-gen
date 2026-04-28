@@ -1,20 +1,42 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { AlertTriangle, CircleAlert, Cpu, FolderKanban, HardDrive, MemoryStick, RefreshCw, Server, Activity } from 'lucide-vue-next'
+import { AlertTriangle, CircleAlert, Cpu, FolderKanban, HardDrive, MemoryStick, Play, RadioTower, RefreshCw, RotateCcw, Server, Square, Activity, Trash2, X } from 'lucide-vue-next'
 import { sitesApi } from '@/api/sites'
 import { usePolling } from '@/composables/usePolling'
+import { useAdminSitesStream } from '@/composables/useAdminSitesStream'
 import SiteDataTable from '@/components/sites/SiteDataTable.vue'
 import SiteDrawer from '@/components/sites/SiteDrawer.vue'
 import SiteToolbar from '@/components/sites/SiteToolbar.vue'
 import SiteWorkbenchHeader from '@/components/sites/SiteWorkbenchHeader.vue'
-import { useSitesStore } from '@/stores/sites'
-import { matchesQuickFilter, computeStats, type QuickFilter } from '@/components/sites/site-status'
+import { useSitesStore, type SiteBulkAction } from '@/stores/sites'
+import { matchesQuickFilter, computeStats, siteActionLabelMap, type QuickFilter } from '@/components/sites/site-status'
 import type { AdminResourceSummary, ManagedSiteRiskLevel } from '@/types/site'
 
 const sitesStore = useSitesStore()
 
 const drawerOpen = ref(false)
 const editingSiteId = ref<string | null>(null)
+const cloningSiteId = ref<string | null>(null)
+
+// D3 / Sprint D · 批量操作
+//
+// 选中的 site_id 集 + 当前 in-flight 批量动作（用于禁用按钮 + 显示进度）。
+const selectedSiteIds = ref<string[]>([])
+const bulkInFlight = ref<SiteBulkAction | null>(null)
+const bulkSummary = ref<{
+  action: SiteBulkAction
+  total: number
+  ok: number
+  failed: { siteId: string; message: string }[]
+} | null>(null)
+
+const bulkActionLabel: Record<SiteBulkAction, string> = {
+  start: '启动',
+  stop: '停止',
+  restart: '重启',
+  parse: '解析',
+  delete: '删除',
+}
 const searchQuery = ref('')
 const statusFilter = ref('')
 const riskFilter = ref<ManagedSiteRiskLevel | ''>('')
@@ -111,11 +133,20 @@ const resourceRiskBanner = computed(() => {
 
 function openCreateDrawer() {
   editingSiteId.value = null
+  cloningSiteId.value = null
   drawerOpen.value = true
 }
 
 function openEditDrawer(siteId: string) {
   editingSiteId.value = siteId
+  cloningSiteId.value = null
+  drawerOpen.value = true
+}
+
+// D6 / Sprint D · 修 G14：从既有站点克隆配置
+function openCloneDrawer(siteId: string) {
+  cloningSiteId.value = siteId
+  editingSiteId.value = null
   drawerOpen.value = true
 }
 
@@ -132,7 +163,40 @@ function handleQuickFilter(filter: QuickFilter) {
 function handleDrawerSaved() {
   drawerOpen.value = false
   editingSiteId.value = null
+  cloningSiteId.value = null
   void fetchPageData()
+}
+
+function handleSelectionChange(siteIds: string[]) {
+  selectedSiteIds.value = siteIds
+}
+
+function clearSelection() {
+  selectedSiteIds.value = []
+}
+
+async function handleBulkAction(action: SiteBulkAction) {
+  if (bulkInFlight.value !== null || selectedSiteIds.value.length === 0) return
+  if (action === 'delete') {
+    const confirmed = window.confirm(
+      `确认对选中的 ${selectedSiteIds.value.length} 个站点执行批量删除？此操作不可撤销。`,
+    )
+    if (!confirmed) return
+  }
+  bulkInFlight.value = action
+  bulkSummary.value = null
+  try {
+    const targets = [...selectedSiteIds.value]
+    const result = await sitesStore.bulkAction(targets, action)
+    bulkSummary.value = { action, ...result }
+    if (result.failed.length === 0) {
+      // 全部成功才清掉选择，方便用户接着批量操作；失败保留勾选便于排查
+      selectedSiteIds.value = []
+    }
+    await fetchPageData()
+  } finally {
+    bulkInFlight.value = null
+  }
 }
 
 function formatPercent(value?: number | null) {
@@ -186,9 +250,26 @@ async function fetchPageData() {
   refreshing.value = false
 }
 
+// D1 / Sprint D · 修 G7/G8：SSE 实时化 + 60s 兜底刷新
+//
+// 取消原 30s 列表 polling 的强依赖，改为以 SSE 增量推送为主：
+//   - status / parse_status / last_error / project_name 的变更由 patchSnapshot 局部 patch
+//   - 列表 created / deleted 由 SSE handler 直接驱动
+//   - polling 延长到 60s 仅作为「SSE 漏事件 / 资源指标兜底刷新」用途
+//
+// 资源指标（resourceSummary）暂不走 SSE（D1 Phase 不在范围），由 60s 兜底刷新触发。
+const { realtimeConnected, reconnectAttempt } = useAdminSitesStream({
+  callbacks: {
+    onSnapshot: (payload) => sitesStore.patchSiteSnapshot(payload),
+    onCreated: (payload) => { void sitesStore.handleSiteCreated(payload) },
+    onDeleted: (payload) => sitesStore.handleSiteDeleted(payload),
+    onConnect: () => { void sitesStore.refreshOnReconnect() },
+  },
+})
+
 const { start: startPolling } = usePolling(async () => {
   await fetchPageData()
-}, 30000)
+}, 60000)
 
 onMounted(async () => {
   await fetchPageData()
@@ -205,6 +286,29 @@ onMounted(async () => {
       :refreshing="refreshing"
       @refresh="fetchPageData"
     />
+
+    <!-- D1 / Sprint D · SSE 实时连接徽标（修 G7/G8） -->
+    <div class="flex items-center justify-end -mt-2">
+      <div
+        class="inline-flex h-7 items-center gap-1.5 rounded-full px-3 text-xs font-medium"
+        :class="realtimeConnected
+          ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
+          : reconnectAttempt > 0
+            ? 'bg-amber-500/10 text-amber-700 dark:text-amber-400'
+            : 'bg-muted text-muted-foreground'"
+        :title="realtimeConnected
+          ? '已订阅 /api/sync/events，状态变更将实时推送'
+          : reconnectAttempt > 0
+            ? `SSE 断流，正在指数退避重连（第 ${reconnectAttempt} 次）`
+            : 'SSE 未连接，列表依赖 60s 兜底刷新'"
+      >
+        <RadioTower class="h-3.5 w-3.5" />
+        <span v-if="realtimeConnected">实时已连接</span>
+        <span v-else-if="reconnectAttempt > 0">重连中 #{{ reconnectAttempt }}</span>
+        <span v-else>实时未连接</span>
+      </div>
+    </div>
+
     <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
       <div class="rounded-lg border border-border bg-card p-4">
         <div class="flex items-center justify-between">
@@ -258,7 +362,8 @@ onMounted(async () => {
       <div class="flex items-center gap-2 text-sm text-destructive">
         <CircleAlert class="h-4 w-4 shrink-0" />
         <span>
-          {{ sitesStore.latestActionError.siteId }}：{{ sitesStore.latestActionError.message }}
+          <strong>{{ sitesStore.latestActionError.siteId }}</strong>
+          {{ siteActionLabelMap[sitesStore.latestActionError.action] }}失败：{{ sitesStore.latestActionError.message }}
         </span>
       </div>
       <button
@@ -309,11 +414,91 @@ onMounted(async () => {
     </section>
 
     <SiteToolbar @open-drawer="openCreateDrawer" @filter="handleFilter" @quick-filter="handleQuickFilter" />
-    <SiteDataTable :sites="filteredSites" :loading="sitesStore.loading" @edit-site="openEditDrawer" />
+
+    <div
+      v-if="selectedSiteIds.length > 0"
+      class="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-primary/30 bg-primary/5 px-4 py-3"
+    >
+      <div class="text-sm">
+        已选中 <strong>{{ selectedSiteIds.length }}</strong> 个站点
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
+        <button
+          :disabled="bulkInFlight !== null"
+          @click="handleBulkAction('start')"
+          class="inline-flex h-8 items-center gap-1.5 rounded-md bg-green-600 px-3 text-xs font-medium text-white shadow hover:bg-green-700 transition-colors disabled:pointer-events-none disabled:opacity-50"
+        >
+          <Play class="h-3.5 w-3.5" /> 批量启动
+        </button>
+        <button
+          :disabled="bulkInFlight !== null"
+          @click="handleBulkAction('stop')"
+          class="inline-flex h-8 items-center gap-1.5 rounded-md bg-amber-600 px-3 text-xs font-medium text-white shadow hover:bg-amber-700 transition-colors disabled:pointer-events-none disabled:opacity-50"
+        >
+          <Square class="h-3.5 w-3.5" /> 批量停止
+        </button>
+        <button
+          :disabled="bulkInFlight !== null"
+          @click="handleBulkAction('restart')"
+          class="inline-flex h-8 items-center gap-1.5 rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+        >
+          <RotateCcw class="h-3.5 w-3.5" /> 批量重启
+        </button>
+        <button
+          :disabled="bulkInFlight !== null"
+          @click="handleBulkAction('parse')"
+          class="inline-flex h-8 items-center gap-1.5 rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+        >
+          <RefreshCw class="h-3.5 w-3.5" /> 批量解析
+        </button>
+        <button
+          :disabled="bulkInFlight !== null"
+          @click="handleBulkAction('delete')"
+          class="inline-flex h-8 items-center gap-1.5 rounded-md border border-destructive/30 bg-transparent px-3 text-xs font-medium text-destructive hover:bg-destructive/10 transition-colors disabled:pointer-events-none disabled:opacity-50"
+        >
+          <Trash2 class="h-3.5 w-3.5" /> 批量删除
+        </button>
+        <button
+          :disabled="bulkInFlight !== null"
+          @click="clearSelection"
+          class="inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-xs text-muted-foreground hover:bg-accent transition-colors"
+        >
+          <X class="h-3.5 w-3.5" /> 取消选择
+        </button>
+      </div>
+      <div v-if="bulkInFlight !== null" class="w-full text-xs text-muted-foreground">
+        正在批量{{ bulkActionLabel[bulkInFlight] }}站点（串行执行，请稍候...）
+      </div>
+    </div>
+
+    <div
+      v-if="bulkSummary"
+      class="rounded-lg border px-4 py-3 text-sm"
+      :class="bulkSummary.failed.length === 0 ? 'border-emerald-500/40 bg-emerald-500/5' : 'border-amber-500/40 bg-amber-500/5'"
+    >
+      <div class="font-medium">
+        批量{{ bulkActionLabel[bulkSummary.action] }}完成：成功 {{ bulkSummary.ok }} / 共 {{ bulkSummary.total }}{{ bulkSummary.failed.length > 0 ? `，失败 ${bulkSummary.failed.length} 项` : '' }}
+      </div>
+      <ul v-if="bulkSummary.failed.length > 0" class="mt-2 space-y-1 text-xs text-amber-700 dark:text-amber-300">
+        <li v-for="f in bulkSummary.failed" :key="f.siteId">
+          <code class="font-mono">{{ f.siteId }}</code>：{{ f.message }}
+        </li>
+      </ul>
+    </div>
+
+    <SiteDataTable
+      :sites="filteredSites"
+      :loading="sitesStore.loading"
+      :selected="selectedSiteIds"
+      @edit-site="openEditDrawer"
+      @clone-site="openCloneDrawer"
+      @update-selection="handleSelectionChange"
+    />
     <SiteDrawer
       :open="drawerOpen"
-      :site-id="editingSiteId"
-      @close="drawerOpen = false"
+      :site-id="cloningSiteId ?? editingSiteId"
+      :clone="cloningSiteId !== null"
+      @close="drawerOpen = false; editingSiteId = null; cloningSiteId = null"
       @saved="handleDrawerSaved"
     />
   </div>

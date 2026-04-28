@@ -1937,7 +1937,7 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
         };
 
         if !dbnums.is_empty() {
-            let db_option = Arc::new(aios_core::get_db_option().clone());
+            let db_option = aios_core::get_db_option();
             let output_root = PathBuf::from("output");
             let mesh_dir = PathBuf::from("assets/meshes");
 
@@ -8858,9 +8858,27 @@ pub async fn api_show_by_refno(
         }
     };
 
-    // 查询所有 refnos (包括 visible)
-    // 这里我们先使用前端传递的 refno 列表，实际上应该展开 visible
-    // 暂时保持逻辑，使用 parsed_refnos 作为目标
+    // 查询所有可见实例 refno。BRAN/HANG 等容器节点自身通常没有几何体，
+    // 需要展开到其下可显示子节点后再生成和导出。
+    let mut generation_refnos = parsed_refnos.clone();
+    for refno in &parsed_refnos {
+        match crate::fast_model::query_compat::query_deep_visible_inst_refnos(*refno).await {
+            Ok(visible_refnos) => {
+                generation_refnos.extend(visible_refnos);
+            }
+            Err(e) => {
+                warn!(
+                    "[ShowByRefno] 展开可见实例失败 refno={}, 回退原始 refno: {}",
+                    refno, e
+                );
+            }
+        }
+    }
+    generation_refnos.sort();
+    generation_refnos.dedup();
+    if generation_refnos.is_empty() {
+        generation_refnos = parsed_refnos.clone();
+    }
 
     // 3.1 如果 regen_model=true，删除旧数据并强制重新生成
     if req.regen_model {
@@ -8868,31 +8886,32 @@ pub async fn api_show_by_refno(
 
         // 删除旧的 inst_relate 记录
         if let Err(e) =
-            aios_core::rs_surreal::inst::delete_inst_relate_cascade(&parsed_refnos, 50).await
+            aios_core::rs_surreal::inst::delete_inst_relate_cascade(&generation_refnos, 50).await
         {
             warn!("[ShowByRefno] 删除旧的 inst_relate 失败: {}, 继续生成", e);
         } else {
             info!(
                 "[ShowByRefno] 已删除 {} 个 refno 的旧 inst_relate 数据",
-                parsed_refnos.len()
+                generation_refnos.len()
             );
         }
     }
 
-    // 直接使用所有 parsed_refnos 进行生成，生成逻辑内部会自动跳过已存在的数据
+    // 使用展开后的可见实例进行生成，生成逻辑内部会自动跳过已存在的数据。
     info!(
-        "[ShowByRefno] 查询到 dbno: {}, 准备生成 {} 个 refno",
+        "[ShowByRefno] 查询到 dbno: {}, 请求 {} 个 refno, 展开后准备生成 {} 个 refno",
         dbno,
-        parsed_refnos.len()
+        parsed_refnos.len(),
+        generation_refnos.len()
     );
 
     // 4. 获取 DbOption
     let db_option = aios_core::get_db_option();
-    let db_option_ext = crate::options::DbOptionExt::from(db_option.clone());
+    let db_option_ext = crate::options::DbOptionExt::from((*db_option).clone());
 
     // 5. 调用生成函数
     let result =
-        crate::fast_model::gen_all_geos_data(parsed_refnos.clone(), &db_option_ext, None, None)
+        crate::fast_model::gen_all_geos_data(generation_refnos.clone(), &db_option_ext, None, None)
             .await;
 
     match result {
@@ -8908,6 +8927,7 @@ pub async fn api_show_by_refno(
                     message: format!("{} 个模型已生成并同步到数据库", parsed_refnos.len()),
                     metadata: Some(serde_json::json!({
                         "refno_count": parsed_refnos.len(),
+                        "generation_refno_count": generation_refnos.len(),
                         "dbno": dbno,
                     })),
                     parquet_files: None,
@@ -8925,7 +8945,7 @@ pub async fn api_show_by_refno(
                 std::path::PathBuf::from(format!("output/temp-models/{}", temp_task_id));
 
             let bundle_result = crate::web_server::instance_export::export_model_bundle_with_dbno(
-                &parsed_refnos,
+                &generation_refnos,
                 &temp_task_id,
                 &bundle_output_dir,
                 &mesh_dir,
@@ -8949,6 +8969,7 @@ pub async fn api_show_by_refno(
                         message: format!("{} 个模型生成成功", parsed_refnos.len()),
                         metadata: Some(serde_json::json!({
                             "refno_count": parsed_refnos.len(),
+                            "generation_refno_count": generation_refnos.len(),
                             "dbno": dbno,
                             "temp_id": temp_task_id
                         })),

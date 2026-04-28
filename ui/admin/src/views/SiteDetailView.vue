@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   AlertTriangle,
@@ -11,8 +11,9 @@ import {
   TimerReset,
 } from 'lucide-vue-next'
 import { extractErrorMessage } from '@/api/client'
-import { sitesApi } from '@/api/sites'
+import { sitesApi, type ManagedSiteLogKind } from '@/api/sites'
 import { usePolling } from '@/composables/usePolling'
+import { useAdminSitesStream } from '@/composables/useAdminSitesStream'
 import { useSitesStore } from '@/stores/sites'
 import SiteDetailHeader from '@/components/sites/SiteDetailHeader.vue'
 import SiteRuntimeCards from '@/components/sites/SiteRuntimeCards.vue'
@@ -21,7 +22,7 @@ import SiteRecentActivityPanel from '@/components/sites/SiteRecentActivityPanel.
 import SiteConfigSections from '@/components/sites/SiteConfigSections.vue'
 import SiteDrawer from '@/components/sites/SiteDrawer.vue'
 import { matchParsePreset, parseDbTypeLabelMap, splitParseDbTypes } from '@/components/sites/parse-db-types'
-import { parsePlanClass } from '@/components/sites/site-status'
+import { parsePlanClass, siteActionLabelMap } from '@/components/sites/site-status'
 import { buildViewerUrl } from '@/lib/viewer'
 import type {
   ManagedProjectSite,
@@ -41,9 +42,56 @@ const logsData = ref<ManagedSiteLogsResponse | null>(null)
 const siteError = ref('')
 const runtimeError = ref('')
 const logsError = ref('')
-const activeTab = ref<'overview' | 'deploy'>('overview')
-const activeLogTab = ref<'parse' | 'db' | 'web'>('parse')
+type DetailTab = 'overview' | 'deploy'
+
+// D6 / Sprint D · 修 G16：tab 状态持久化到 URL `?tab=overview|deploy`
+//
+// 旧版 activeTab 仅保存在组件 ref，刷新页面回到「运行概览」；新版从 URL query
+// 取初值并双向同步，刷新 / 分享链接都能保留 tab 选择。
+const initialTab: DetailTab = route.query.tab === 'deploy' ? 'deploy' : 'overview'
+const activeTab = ref<DetailTab>(initialTab)
+
+watch(activeTab, (next) => {
+  if (route.query.tab === next) return
+  void router.replace({
+    path: route.path,
+    query: { ...route.query, tab: next },
+  })
+}, { flush: 'post' })
+const activeLogTab = ref<ManagedSiteLogKind>('parse')
 const drawerOpen = ref(false)
+const downloadPending = ref(false)
+const downloadError = ref('')
+
+// D5 / Sprint D · 修 G13：分页尾部日志 + 全量下载
+//
+// 旧版直接用 logsData.parse_log/db_log/web_log（后端硬编码 LOG_LINES_LIMIT=120 行，
+// 无加载更多、无下载入口）；新版按 tab 单独 fetch tailLog，limit 从 200 起步，
+// 用户点"加载更多"按 2 倍递增至上限 5000；下载走 Authorization 头 + blob 路径。
+const LOG_LIMIT_INITIAL = 200
+const LOG_LIMIT_MAX = 5000
+
+interface DetailLogState {
+  lines: string[]
+  total: number
+  limit: number
+  truncated: boolean
+  loading: boolean
+}
+
+const emptyLogState = (): DetailLogState => ({
+  lines: [],
+  total: 0,
+  limit: LOG_LIMIT_INITIAL,
+  truncated: false,
+  loading: false,
+})
+
+const detailLogs = ref<Record<ManagedSiteLogKind, DetailLogState>>({
+  parse: emptyLogState(),
+  db: emptyLogState(),
+  web: emptyLogState(),
+})
 
 const siteId = computed(() => String(route.params.id ?? ''))
 const resources = computed(() => runtime.value?.resources ?? null)
@@ -55,12 +103,8 @@ const matchedPreset = computed(() => matchParsePreset(
   site.value?.force_rebuild_system_db ?? false,
 ))
 
-const selectedLogs = computed(() => {
-  if (logsData.value === null) return []
-  if (activeLogTab.value === 'parse') return logsData.value.parse_log
-  if (activeLogTab.value === 'db') return logsData.value.db_log
-  return logsData.value.web_log
-})
+const selectedLogState = computed(() => detailLogs.value[activeLogTab.value])
+const selectedLogs = computed(() => selectedLogState.value.lines)
 
 const processCards = computed(() => [
   {
@@ -113,6 +157,76 @@ async function fetchAll() {
     logsError.value = ''
   } catch (err: unknown) {
     logsError.value = extractErrorMessage(err)
+  }
+
+  // 跟随当前 tab 刷新一次详情日志（保留用户已"加载更多"的 limit）
+  await fetchKindLog(activeLogTab.value)
+}
+
+async function fetchKindLog(kind: ManagedSiteLogKind, overrideLimit?: number) {
+  const cur = detailLogs.value[kind]
+  const limit = Math.min(overrideLimit ?? cur.limit ?? LOG_LIMIT_INITIAL, LOG_LIMIT_MAX)
+  cur.loading = true
+  try {
+    const r = await sitesApi.tailLog(siteId.value, kind, limit)
+    detailLogs.value[kind] = {
+      lines: r.lines,
+      total: r.total_lines,
+      limit: r.limit,
+      truncated: r.truncated,
+      loading: false,
+    }
+    logsError.value = ''
+  } catch (err: unknown) {
+    detailLogs.value[kind].loading = false
+    logsError.value = extractErrorMessage(err)
+  }
+}
+
+function onLogTabChange(tab: ManagedSiteLogKind) {
+  activeLogTab.value = tab
+  if (detailLogs.value[tab].lines.length === 0 && !detailLogs.value[tab].loading) {
+    void fetchKindLog(tab)
+  }
+}
+
+async function loadMoreLog() {
+  const kind = activeLogTab.value
+  const cur = detailLogs.value[kind]
+  const next = Math.min(cur.limit * 2, LOG_LIMIT_MAX)
+  if (next === cur.limit) return
+  await fetchKindLog(kind, next)
+}
+
+async function downloadLog() {
+  const kind = activeLogTab.value
+  downloadPending.value = true
+  downloadError.value = ''
+  try {
+    const token = localStorage.getItem('admin_token')
+    const url = sitesApi.logDownloadUrl(siteId.value, kind)
+    const resp = await fetch(url, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+    if (!resp.ok) {
+      throw new Error(`下载失败 (HTTP ${resp.status})`)
+    }
+    const blob = await resp.blob()
+    const cd = resp.headers.get('content-disposition') ?? ''
+    const m = /filename="([^"]+)"/.exec(cd)
+    const filename = m?.[1] ?? `${siteId.value}-${kind}.log`
+    const objUrl = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = objUrl
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(objUrl), 0)
+  } catch (err: unknown) {
+    downloadError.value = err instanceof Error ? err.message : '下载失败'
+  } finally {
+    downloadPending.value = false
   }
 }
 
@@ -258,6 +372,15 @@ async function handleStop() {
   }
 }
 
+async function handleRestart() {
+  try {
+    await sitesStore.restartSite(siteId.value)
+    await fetchAll()
+  } catch {
+    // 错误已写入 store，页面横幅会显示
+  }
+}
+
 async function handleParse() {
   try {
     await sitesStore.parseSite(siteId.value)
@@ -270,6 +393,39 @@ async function handleParse() {
 function copyText(text: string) {
   navigator.clipboard.writeText(text)
 }
+
+// D1 / Sprint D · 修 G7：详情页接入 SSE 实时化
+//
+// 状态字段（status / parse_status / last_error / project_name）由 SSE
+// AdminSiteSnapshot 即时推送 patch，避免 10s polling 才能看到状态翻转。
+// 资源指标（runtime.resources）+ 日志（logs）仍走 polling，等 D1 后续
+// Phase 加 AdminSiteResource 事件后再剥离。
+//
+// 仅响应当前路由 site_id 的事件；其他 site 的 snapshot 直接 ignore。
+useAdminSitesStream({
+  callbacks: {
+    onSnapshot: (payload) => {
+      if (payload.site_id !== siteId.value) return
+      if (!site.value) return
+      site.value = {
+        ...site.value,
+        project_name: payload.project_name ?? site.value.project_name,
+        status: payload.status as ManagedProjectSite['status'],
+        parse_status: payload.parse_status as ManagedProjectSite['parse_status'],
+        last_error: payload.last_error ?? null,
+      }
+      // runtime（资源 + pid）仍由 10s polling 刷新；SSE 仅负责状态字段 patch
+    },
+    onDeleted: (payload) => {
+      if (payload.site_id !== siteId.value) return
+      // 当前详情页对应的 site 被删除（极少见，通常用户在另一个 tab 删除），
+      // 跳回列表页。
+      void router.replace({ path: '/sites' })
+    },
+    // 重连成功时由 SitesView 的 onConnect 触发 fetchSites，
+    // 详情页只关心当前 site，重连后 polling 自然会拉到最新值。
+  },
+})
 
 const { start: startPolling } = usePolling(fetchAll, 10000)
 
@@ -287,6 +443,7 @@ onMounted(async () => {
       @back="router.push({ path: '/sites' })"
       @start="handleStart"
       @stop="handleStop"
+      @restart="handleRestart"
       @parse="handleParse"
       @refresh="fetchAll"
       @open-viewer="openViewer()"
@@ -302,9 +459,21 @@ onMounted(async () => {
 
     <div
       v-if="actionError"
-      class="rounded-lg border border-destructive/50 bg-destructive/5 px-4 py-3 text-sm text-destructive"
+      class="rounded-lg border border-destructive/50 bg-destructive/5 px-4 py-3 flex items-start justify-between gap-3"
     >
-      最近操作失败：{{ actionError.message }}
+      <div class="flex items-start gap-2 text-sm text-destructive">
+        <AlertTriangle class="h-4 w-4 mt-0.5 shrink-0" />
+        <span>
+          <strong>{{ siteActionLabelMap[actionError.action] }}失败：</strong>
+          {{ actionError.message }}
+        </span>
+      </div>
+      <button
+        class="inline-flex h-7 items-center gap-1 rounded-md border border-destructive/30 px-2.5 text-xs font-medium text-destructive hover:bg-destructive/10 transition-colors"
+        @click="sitesStore.clearSiteActionError(siteId)"
+      >
+        关闭
+      </button>
     </div>
 
     <div class="flex gap-2 border-b border-border">
@@ -559,19 +728,46 @@ onMounted(async () => {
       <SiteLogSummaryPanel v-if="logsData?.streams" :streams="logsData.streams" />
 
       <div class="rounded-lg border border-border bg-card">
-        <div class="flex items-center gap-2 border-b border-border px-4 py-2">
-          <button
-            v-for="tab in (['parse', 'db', 'web'] as const)"
-            :key="tab"
-            @click="activeLogTab = tab"
-            class="rounded-md px-3 py-1 text-xs font-medium transition-colors"
-            :class="activeLogTab === tab ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:text-foreground'"
-          >
-            {{ tab === 'parse' ? '解析日志' : tab === 'db' ? 'DB 日志' : 'Web 日志' }}
-          </button>
+        <div class="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-2">
+          <div class="flex flex-wrap items-center gap-2">
+            <button
+              v-for="tab in (['parse', 'db', 'web'] as const)"
+              :key="tab"
+              @click="onLogTabChange(tab)"
+              class="rounded-md px-3 py-1 text-xs font-medium transition-colors"
+              :class="activeLogTab === tab ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:text-foreground'"
+            >
+              {{ tab === 'parse' ? '解析日志' : tab === 'db' ? 'DB 日志' : 'Web 日志' }}
+            </button>
+            <span class="text-xs text-muted-foreground">
+              {{ selectedLogState.loading
+                ? '加载中...'
+                : `显示 ${selectedLogState.lines.length} / ${selectedLogState.total} 行（limit ${selectedLogState.limit}）` }}
+            </span>
+          </div>
+          <div class="flex items-center gap-2">
+            <button
+              v-if="selectedLogState.truncated && selectedLogState.limit < 5000"
+              :disabled="selectedLogState.loading"
+              @click="loadMoreLog"
+              class="inline-flex h-7 items-center rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+            >
+              加载更多
+            </button>
+            <button
+              :disabled="downloadPending || selectedLogState.total === 0"
+              @click="downloadLog"
+              class="inline-flex h-7 items-center rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+            >
+              {{ downloadPending ? '下载中...' : '下载完整日志' }}
+            </button>
+          </div>
+        </div>
+        <div v-if="downloadError" class="border-b border-destructive/40 bg-destructive/5 px-4 py-2 text-xs text-destructive">
+          {{ downloadError }}
         </div>
         <div class="max-h-80 overflow-auto p-4">
-          <div v-if="selectedLogs.length === 0" class="text-sm text-muted-foreground text-center py-4">暂无日志</div>
+          <div v-if="selectedLogs.length === 0 && !selectedLogState.loading" class="text-sm text-muted-foreground text-center py-4">暂无日志</div>
           <div v-else class="font-mono text-xs leading-relaxed space-y-0.5">
             <div v-for="(line, i) in selectedLogs" :key="i" class="whitespace-pre-wrap break-all">{{ line }}</div>
           </div>

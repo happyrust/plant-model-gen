@@ -30,15 +30,14 @@ pub async fn export_model_bundle_with_dbno(
     fs::create_dir_all(output_dir).context(format!("创建输出目录失败: {:?}", output_dir))?;
 
     // Get database option
-    let db_option = get_db_option();
-    let db_option_arc = Arc::new(db_option.clone());
+    let db_option_arc = get_db_option();
 
     // 导出 bundle 并获取 ExportData
     let export_data = export_instanced_bundle_for_refnos(
         refnos,
         mesh_dir,
         output_dir,
-        db_option_arc,
+        db_option_arc.clone(),
         true, // verbose
     )
     .await?;
@@ -46,7 +45,7 @@ pub async fn export_model_bundle_with_dbno(
     // 如果提供了 dbno 且有数据，则根据配置写入 Parquet 用于持久化
     if let Some(db_num) = dbno {
         // 检查配置是否启用 Parquet 导出 (默认为 true)
-        let export_parquet = db_option.export_parquet;
+        let export_parquet = db_option_arc.export_parquet;
 
         if export_parquet && export_data.total_instances > 0 {
             println!("📦 正在写入 Parquet 增量缓存 (dbno={})...", db_num);

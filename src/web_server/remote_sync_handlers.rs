@@ -3,6 +3,7 @@ use axum::{
     body::Body,
     extract::{OriginalUri, Path, Query},
     http::{Request, StatusCode, Uri},
+    middleware,
     response::{Html, IntoResponse, Json, Response, sse::{Event, KeepAlive, Sse}},
     routing::{delete as axum_delete, get, post, put},
 };
@@ -138,6 +139,13 @@ pub fn create_remote_sync_routes() -> Router {
         )
         // v2 · ROADMAP M3 B5 · SSE 实时事件流
         .route("/api/remote-sync/events/stream", get(remote_sync_events_stream))
+        // C4 · 修 G6：把 admin auth middleware 挪到此处统一注入，避免外层
+        // `.route_layer` 在 axum 0.8 merge 路径下偶发不生效。
+        // 注入风格与 `admin_handlers::create_admin_routes` /
+        // `admin_registry_handlers::create_admin_registry_routes` 保持一致。
+        .layer(middleware::from_fn(
+            crate::web_server::admin_auth_handlers::admin_auth_middleware,
+        ))
 }
 
 /// 远程增量环境

@@ -392,14 +392,31 @@ async fn query_refno_dbnum_map(refnos: &[RefnoEnum], chunk_size: usize) -> HashM
         return HashMap::new();
     }
 
-    let mut refno_by_rid: HashMap<String, RefnoEnum> = HashMap::with_capacity(refnos.len());
     let mut dbnum_map: HashMap<RefnoEnum, u32> = HashMap::with_capacity(refnos.len());
+    let db_meta = crate::data_interface::db_meta_manager::db_meta();
+    let _ = db_meta.ensure_loaded();
+    let mut missing_refnos = Vec::new();
     for &refno in refnos {
-        refno_by_rid.insert(format!("{}", refno.refno()), refno);
-        dbnum_map.insert(refno, 0);
+        let dbnum = db_meta
+            .get_dbnum_by_refno(refno)
+            .or_else(|| crate::fast_model::db_meta_cache::get_dbnum_for_refno(refno))
+            .unwrap_or(0);
+        if dbnum == 0 {
+            missing_refnos.push(refno);
+        }
+        dbnum_map.insert(refno, dbnum);
     }
 
-    for chunk in refnos.chunks(chunk_size.max(1)) {
+    if missing_refnos.is_empty() {
+        return dbnum_map;
+    }
+
+    let mut refno_by_rid: HashMap<String, RefnoEnum> = HashMap::with_capacity(missing_refnos.len());
+    for &refno in &missing_refnos {
+        refno_by_rid.insert(format!("{}", refno.refno()), refno);
+    }
+
+    for chunk in missing_refnos.chunks(chunk_size.max(1)) {
         let ids = chunk
             .iter()
             .map(|r| r.to_pe_key())
@@ -592,7 +609,13 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
 
     // 限制最大并发数，以防止对单一 SurrealDB 底层施加过大连接压力
     use futures::stream::{self, StreamExt};
-    let limit_concurrency = 16;
+    let limit_concurrency = if get_db_option().effective_surrealdb().mode
+        == aios_core::options::DbConnMode::Ws
+    {
+        4
+    } else {
+        16
+    };
 
     let mut chunks: Vec<(u32, Vec<RefnoEnum>)> = Vec::new();
     for (dbnum, refs) in refnos_by_dbnum {

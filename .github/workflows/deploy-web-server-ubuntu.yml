@@ -31,6 +31,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUSTC_WRAPPER: ""
+  # rs-core still contains #![feature(let_chains)] although let_chains is stable;
+  # stable Rust is required here because latest nightly breaks ethnum 1.5.2.
+  RUSTC_BOOTSTRAP: "1"
   BUILD_FEATURES: ws,gen_model,manifold,project_hd,surreal-save,sqlite-index,web_server,parquet-export
 
 jobs:

@@ -3,7 +3,7 @@
 //! 目标：为 plant3d-web 提供“管道 MBD 标注”所需的结构化数据（段/尺寸/焊缝/坡度）。
 //! 说明：本接口采用“后端提供语义点位 + 前端做屏幕布局/避让”的分层方式，便于渐进式对齐 MBD(PML)。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Mutex;
 
@@ -98,6 +98,9 @@ pub struct MbdPipeQuery {
     pub include_bends: Option<bool>,
     /// 弯头标注模式：workpoint（中心线交点，默认）/ facecenter（端面中心）
     pub bend_mode: MbdBendMode,
+    /// Phase 8: V2 直算开关。true 时走 `build_mbd_v2_pipe_data_direct`，
+    /// 从 SurrealDB 直接构建 V2 数据而不经过 V1 generate_mbd_data。默认 false。
+    pub v2_direct: bool,
 }
 
 impl Default for MbdPipeQuery {
@@ -127,6 +130,7 @@ impl Default for MbdPipeQuery {
             include_weld_nouns: false,
             include_bends: None,
             bend_mode: MbdBendMode::default(),
+            v2_direct: false,
         }
     }
 }
@@ -501,6 +505,7 @@ pub struct MbdPipeDebugInfo {
 pub fn create_mbd_pipe_routes() -> Router {
     Router::new()
         .route("/api/mbd/pipe/{refno}", get(get_mbd_pipe))
+        .route("/api/mbd/v2/pipe/{refno}", get(get_mbd_pipe_v2))
         .route("/api/mbd/generate", post(post_generate_mbd))
 }
 
@@ -511,6 +516,263 @@ fn json_utf8<T: Serialize>(value: T) -> Response {
         HeaderValue::from_static("application/json; charset=utf-8"),
     );
     res
+}
+
+async fn ensure_mbd_surreal_context() -> anyhow::Result<()> {
+    let db_option = aios_core::get_db_option();
+    if aios_core::use_ns_db_compat(
+        &aios_core::SUL_DB,
+        &db_option.surreal_ns,
+        &db_option.project_name,
+    )
+    .await
+    .is_ok()
+    {
+        return Ok(());
+    }
+    match aios_core::connect_surdb(
+        &db_option.surrealdb_conn_str(),
+        &db_option.surreal_ns,
+        &db_option.project_name,
+        &db_option.surreal_user,
+        &db_option.surreal_password,
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(e) if e.to_string().contains("Already connected") => {}
+        Err(e) => return Err(e.into()),
+    }
+    aios_core::use_ns_db_compat(
+        &aios_core::SUL_DB,
+        &db_option.surreal_ns,
+        &db_option.project_name,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn mbd_query_take<T>(sql: impl AsRef<str>, index: usize) -> anyhow::Result<T>
+where
+    T: surrealdb::types::SurrealValue,
+    usize: surrealdb::opt::QueryResult<T>,
+{
+    use aios_core::{SUL_DB, SurrealQueryExt};
+
+    let db_option = aios_core::get_db_option();
+    let sql = format!(
+        "USE NS `{}` DB `{}`;\n{}",
+        db_option.surreal_ns,
+        db_option.project_name,
+        sql.as_ref()
+    );
+    SUL_DB.query_take(&sql, index + 1).await
+}
+
+async fn get_mbd_pipe_v2(
+    Path(refno): Path<String>,
+    Query(query): Query<MbdPipeQuery>,
+) -> impl IntoResponse {
+    use aios_core::mbd::v2::{
+        MbdV2PipelineContext, MbdV2Response, build_mbd_v2_pipe_data, build_mbd_v2_pipe_data_direct,
+    };
+
+    let input_refno_enum = match refno.parse::<RefnoEnum>() {
+        Ok(v) => v,
+        Err(e) => {
+            return json_utf8(MbdV2Response {
+                success: false,
+                error_message: Some(format!("无效的 refno: {e}")),
+                data: None,
+            });
+        }
+    };
+
+    let branch_refno = match resolve_effective_branch_refno(input_refno_enum.clone()).await {
+        Ok(v) => v,
+        Err(_) => input_refno_enum.clone(),
+    };
+
+    if query.v2_direct {
+        return get_mbd_pipe_v2_direct(input_refno_enum, branch_refno).await;
+    }
+
+    let v2_query = mbd_v2_layout_query(query);
+    let mut data = match generate_mbd_data(branch_refno.clone(), &v2_query).await {
+        Ok(v) => v,
+        Err(e) => {
+            return json_utf8(MbdV2Response {
+                success: false,
+                error_message: Some(format!("生成 V2 管道标注失败: {e}")),
+                data: None,
+            });
+        }
+    };
+    data.input_refno = input_refno_enum.to_string();
+
+    let Some(layout) = data.layout_result.as_ref() else {
+        return json_utf8(MbdV2Response {
+            success: false,
+            error_message: Some(
+                "V2 管道标注需要 layout_result；请确认 web_server 已启用 mbd-iso feature"
+                    .to_string(),
+            ),
+            data: None,
+        });
+    };
+
+    let ctx = MbdV2PipelineContext {
+        input_refno: input_refno_enum.to_string(),
+        branch_refno: data.branch_refno.clone(),
+        branch_attrs: branch_attrs_to_mbd_v2_map(&data.branch_attrs),
+        ..MbdV2PipelineContext::production_defaults()
+    };
+    let v2_data = build_mbd_v2_pipe_data(layout, &ctx);
+
+    json_utf8(MbdV2Response {
+        success: true,
+        error_message: None,
+        data: Some(v2_data),
+    })
+}
+
+/// V2 直算路径（Phase 8）：从 SurrealDB 直接构建 V2 数据，不经过 V1 generate_mbd_data。
+///
+/// 当前是 scaffold，复用 `fetch_tubi_segments_from_surreal_with_debug` 获取管段数据，
+/// 转换为 `BranchQueryResult` 后调用 `build_mbd_v2_pipe_data_direct`。
+async fn get_mbd_pipe_v2_direct(
+    input_refno_enum: RefnoEnum,
+    branch_refno: RefnoEnum,
+) -> Response {
+    use aios_core::mbd::v2::{
+        BranchMember, BranchQueryResult, MbdV2PipelineContext, MbdV2Response,
+        build_mbd_v2_pipe_data_direct,
+    };
+
+    let (segments, _debug) =
+        match fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await {
+            Ok(v) => v,
+            Err(e) => {
+                return json_utf8(MbdV2Response {
+                    success: false,
+                    error_message: Some(format!("V2 直算查询失败: {e}")),
+                    data: None,
+                });
+            }
+        };
+
+    let members: Vec<BranchMember> = segments
+        .iter()
+        .enumerate()
+        .filter_map(|(i, seg)| {
+            let start = [seg.start.x, seg.start.y, seg.start.z];
+            let end = [seg.end.x, seg.end.y, seg.end.z];
+            if (start[0] - end[0]).abs() < 1e-6
+                && (start[1] - end[1]).abs() < 1e-6
+                && (start[2] - end[2]).abs() < 1e-6
+            {
+                return None;
+            }
+            Some(BranchMember {
+                refno: seg.refno.to_string(),
+                owner_refno: branch_refno.to_string(),
+                start,
+                end,
+                arrive_axis: seg
+                    .arrive_axis
+                    .map(|a| [a.x, a.y, a.z]),
+                leave_axis: seg
+                    .leave_axis
+                    .map(|a| [a.x, a.y, a.z]),
+                arrive_refno: seg.arrive_refno.as_ref().map(|r| r.to_string()),
+                order: seg.order.unwrap_or(i as u32),
+                outside_diameter: seg.outside_diameter,
+                arrive_noun: None,
+            })
+        })
+        .collect();
+
+    let mut qr = BranchQueryResult {
+        members,
+        ..Default::default()
+    };
+    qr.compute_bbox_center();
+
+    let (_, branch_attrs) = match try_fill_branch_name_and_attrs(branch_refno.clone()).await {
+        Ok(v) => v,
+        Err(_) => (branch_refno.to_string(), BranchAttrsDto::default()),
+    };
+
+    let ctx = MbdV2PipelineContext {
+        input_refno: input_refno_enum.to_string(),
+        branch_refno: branch_refno.to_string(),
+        branch_attrs: branch_attrs_to_mbd_v2_map(&branch_attrs),
+        ..MbdV2PipelineContext::production_defaults()
+    };
+
+    let v2_data = build_mbd_v2_pipe_data_direct(&qr, &ctx);
+
+    json_utf8(MbdV2Response {
+        success: true,
+        error_message: None,
+        data: Some(v2_data),
+    })
+}
+
+fn mbd_v2_layout_query(mut query: MbdPipeQuery) -> MbdPipeQuery {
+    query.mode = Some(MbdPipeMode::LayoutFirst);
+    query.source = MbdPipeSource::Db;
+    // V2 的 layout_first 只把“链式尺寸”作为主尺寸输出。
+    //
+    // PML isoDim 的 mainDim 会跳过 TUBI 本体，只按 Head/Tail/管件/焊口等关键点生成
+    // 链式尺寸；这里的 `include_dims=true` 会把每段 tubi 几何长度也作为普通尺寸输出，
+    // 与链式尺寸和切管长度重复，真实页面会叠成一团。
+    query.include_dims = Some(false);
+    query.include_chain_dims = Some(true);
+    // 当前 LayoutResult 只能表达单条直线尺寸；折线 BRAN 的 overall 是路径总长，
+    // 不能用“首尾直连”的一条 linear_dim 表达，先关闭，避免显示 43135 但几何跨度很短。
+    query.include_overall_dim = Some(false);
+    query.include_port_dims = Some(true);
+    query.include_welds = Some(true);
+    query.include_slopes = Some(true);
+    query.include_bends = Some(true);
+    query.include_cut_tubis = Some(true);
+    query.include_fittings = Some(true);
+    query.include_tags = Some(true);
+    query.include_layout_hints = Some(true);
+    query.include_branch_attrs = true;
+    query.include_weld_nouns = true;
+    query
+}
+
+fn branch_attrs_to_mbd_v2_map(attrs: &BranchAttrsDto) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    macro_rules! insert_opt {
+        ($field:ident, $key:literal) => {
+            if let Some(value) = attrs.$field.as_ref() {
+                out.insert($key.to_string(), value.clone());
+            }
+        };
+    }
+    insert_opt!(duty, "DUTY");
+    insert_opt!(pspec, "PSPEC");
+    insert_opt!(rccm, "RCCM");
+    insert_opt!(clean, "CLEAN");
+    insert_opt!(temp, "TEMP");
+    if let Some(value) = attrs.pressure {
+        out.insert("PRESSURE".to_string(), value.to_string());
+    }
+    insert_opt!(ispec, "ISPEC");
+    if let Some(value) = attrs.insuthick {
+        out.insert("INSUTHICK".to_string(), value.to_string());
+    }
+    insert_opt!(tspec, "TSPEC");
+    insert_opt!(swgd, "SWGD");
+    insert_opt!(drawnum, "DRAWNUM");
+    insert_opt!(rev, "REV");
+    insert_opt!(status, "STATUS");
+    insert_opt!(fluid, "FLUID");
+    out
 }
 
 /// 尝试修复“UTF-8 被当作 Latin1 解码后又按 UTF-8 输出”的常见乱码（如：`æ°` → `新`）。
@@ -573,11 +835,13 @@ async fn resolve_effective_branch_refno(input_refno: RefnoEnum) -> anyhow::Resul
         owner: Option<RefnoEnum>,
     }
 
+    ensure_mbd_surreal_context().await?;
+
     let sql = format!(
         "SELECT noun, refno.HREF as href, refno.TREF as tref, owner.refno as owner FROM {} LIMIT 1",
         input_refno.to_pe_key()
     );
-    let row: Option<BranchRefLinkRow> = SUL_DB.query_take(&sql, 0).await?;
+    let row: Option<BranchRefLinkRow> = mbd_query_take(&sql, 0).await?;
     let Some(row) = row else {
         return Ok(input_refno);
     };
@@ -596,7 +860,7 @@ async fn resolve_effective_branch_refno(input_refno: RefnoEnum) -> anyhow::Resul
                 "SELECT noun, owner.refno as owner FROM {} LIMIT 1",
                 current.to_pe_key()
             );
-            let row: Option<BranchOwnerRow> = SUL_DB.query_take(&sql, 0).await?;
+            let row: Option<BranchOwnerRow> = mbd_query_take(&sql, 0).await?;
             let Some(row) = row else {
                 return Ok(None);
             };
@@ -938,34 +1202,76 @@ impl<'a> BranchMeasurementPlanner<'a> {
         }
 
         if self.query.include_chain_dims {
-            let ends: Vec<(Vec3, Vec3)> = self
-                .topology
-                .segments
-                .iter()
-                .map(|s| (s.start, s.end))
-                .collect();
-            let chain_pts = build_chain_points_from_ends(&ends, &weld_joints);
             let group_id = Some(format!("chain:{}", self.topology.branch_refno));
-            for i in 0..chain_pts.len().saturating_sub(1) {
-                let a = chain_pts[i];
-                let b = chain_pts[i + 1];
-                let length = a.distance(b);
-                if length < self.query.dim_min_length {
-                    continue;
+            if weld_joints.is_empty() {
+                // 没有可合并的焊口时，不能把“下一段 start”当作上一段 chain 的终点。
+                // 24381_145712 这类带弯头/异径件的 BRAN 会因此把尺寸线斜拉到错误端口。
+                // 此时 chain 语义退化为按有序 TUBI 段逐段标注，但仍归入 chain 分组，
+                // 避免前端再显示一套重复的 raw segment。
+                for (i, seg) in self.topology.segments.iter().enumerate() {
+                    let a = seg.start;
+                    let b = seg.end;
+                    let length = a.distance(b);
+                    if length < self.query.dim_min_length {
+                        continue;
+                    }
+                    dims.push(MbdDimDto {
+                        id: format!("dim:chain:{}:{i}", self.topology.branch_refno),
+                        kind: MbdDimKind::Chain,
+                        group_id: group_id.clone(),
+                        seq: Some(i as u32),
+                        start: a.to_array(),
+                        end: b.to_array(),
+                        length,
+                        text: format_dim_length_text_mm(length),
+                        layout_hint: self.query.include_layout_hints.then(|| {
+                            AnnotationLayoutPlanner::linear_hint(
+                                self.topology,
+                                a,
+                                b,
+                                "chain",
+                                1,
+                                None,
+                            )
+                        }),
+                    });
                 }
-                dims.push(MbdDimDto {
-                    id: format!("dim:chain:{}:{i}", self.topology.branch_refno),
-                    kind: MbdDimKind::Chain,
-                    group_id: group_id.clone(),
-                    seq: Some(i as u32),
-                    start: a.to_array(),
-                    end: b.to_array(),
-                    length,
-                    text: format_dim_length_text_mm(length),
-                    layout_hint: self.query.include_layout_hints.then(|| {
-                        AnnotationLayoutPlanner::linear_hint(self.topology, a, b, "chain", 1, None)
-                    }),
-                });
+            } else {
+                let ends: Vec<(Vec3, Vec3)> = self
+                    .topology
+                    .segments
+                    .iter()
+                    .map(|s| (s.start, s.end))
+                    .collect();
+                let chain_pts = build_chain_points_from_ends(&ends, &weld_joints);
+                for i in 0..chain_pts.len().saturating_sub(1) {
+                    let a = chain_pts[i];
+                    let b = chain_pts[i + 1];
+                    let length = a.distance(b);
+                    if length < self.query.dim_min_length {
+                        continue;
+                    }
+                    dims.push(MbdDimDto {
+                        id: format!("dim:chain:{}:{i}", self.topology.branch_refno),
+                        kind: MbdDimKind::Chain,
+                        group_id: group_id.clone(),
+                        seq: Some(i as u32),
+                        start: a.to_array(),
+                        end: b.to_array(),
+                        length,
+                        text: format_dim_length_text_mm(length),
+                        layout_hint: self.query.include_layout_hints.then(|| {
+                            AnnotationLayoutPlanner::linear_hint(
+                                self.topology,
+                                a,
+                                b,
+                                "chain",
+                                1,
+                                None,
+                            )
+                        }),
+                    });
+                }
             }
         }
 
@@ -1050,6 +1356,7 @@ impl<'a> BranchMeasurementPlanner<'a> {
         }
         let mut welds = Vec::new();
         let mut field_idx = 0usize;
+        let mut shop_idx = 0usize;
         for i in 0..self.topology.segments.len().saturating_sub(1) {
             let seg1 = &self.topology.segments[i];
             let seg2 = &self.topology.segments[i + 1];
@@ -1057,14 +1364,23 @@ impl<'a> BranchMeasurementPlanner<'a> {
             if dist >= self.query.weld_merge_threshold {
                 continue;
             }
-            field_idx += 1;
             let position = midpoint(p1, p2);
+
+            let is_shop = self.infer_weld_is_shop(seg1, seg2, position);
+            let label = if is_shop {
+                shop_idx += 1;
+                format!("A{shop_idx}")
+            } else {
+                field_idx += 1;
+                format!("M{field_idx}")
+            };
+
             welds.push(MbdWeldDto {
                 id: format!("weld:{}:{i}", self.topology.branch_refno),
                 position: position.to_array(),
                 weld_type: MbdWeldType::Butt,
-                is_shop: false,
-                label: format!("M{field_idx}"),
+                is_shop,
+                label,
                 left_refno: seg1.refno.to_string(),
                 right_refno: seg2.refno.to_string(),
                 layout_hint: self.query.include_layout_hints.then(|| {
@@ -1073,6 +1389,31 @@ impl<'a> BranchMeasurementPlanner<'a> {
             });
         }
         welds
+    }
+
+    /// 推断焊缝类型：车间焊（shop/A）或现场焊（field/M）。
+    ///
+    /// 启发式规则（对齐 PDMS `isoWeldText` 的判定逻辑）：
+    /// - 如果焊接点处有管件（fitting），则该焊口属于管件的出厂焊缝 → 车间焊
+    /// - 如果两侧都是直管段（TUBI），且无管件 → 现场焊
+    fn infer_weld_is_shop(
+        &self,
+        _seg1: &CacheTubiSeg,
+        _seg2: &CacheTubiSeg,
+        weld_pos: Vec3,
+    ) -> bool {
+        if !self.query.include_weld_nouns {
+            return false;
+        }
+
+        let threshold = self.query.weld_merge_threshold * 2.0;
+        for fitting in self.fitting_elements {
+            let dist = fitting.anchor_point.distance(weld_pos);
+            if dist < threshold {
+                return true;
+            }
+        }
+        false
     }
 
     fn build_slopes(&self) -> Vec<MbdSlopeDto> {
@@ -1863,7 +2204,7 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
     use serde::{Deserialize, Serialize};
     use surrealdb::types::SurrealValue;
 
-    aios_core::init_surreal().await?;
+    ensure_mbd_surreal_context().await?;
 
     #[derive(Serialize, Deserialize, Debug, SurrealValue)]
     struct TubiRelateRow {
@@ -1913,7 +2254,7 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
         "#
     );
 
-    let rows: Vec<TubiRelateRow> = SUL_DB.query_take(&sql, 0).await?;
+    let rows: Vec<TubiRelateRow> = mbd_query_take(&sql, 0).await?;
     if rows.is_empty() {
         anyhow::bail!(
             "tubi_relate 无结果（branch_refno={} pe_key={}）",
@@ -2012,7 +2353,7 @@ async fn fetch_bend_elements_for_branch(
 
     let sql = build_branch_child_element_query(&pe_key, &["BEND", "ELBO"]);
 
-    let rows: Vec<BendRow> = match SUL_DB.query_take(&sql, 0).await {
+    let rows: Vec<BendRow> = match mbd_query_take(&sql, 0).await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[mbd-pipe] fetch_bend_elements 查询失败: {e}");
@@ -2089,7 +2430,7 @@ async fn fetch_discrete_fitting_elements_for_branch(
     let pe_key = branch_refno.to_pe_key();
     let sql = build_branch_child_element_query(&pe_key, &["TEE", "OLET", "FLAN", "FLNG"]);
 
-    let rows: Vec<FittingRow> = match SUL_DB.query_take(&sql, 0).await {
+    let rows: Vec<FittingRow> = match mbd_query_take(&sql, 0).await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[mbd-pipe] fetch_discrete_fitting_elements 查询失败: {e}");
@@ -2600,7 +2941,103 @@ fn compute_branch_layout_result(
         allow_layer_split: true,
     };
 
-    BranchCalculator::assemble_prelaid_out(&request, sections)
+    let mut layout = BranchCalculator::assemble_prelaid_out(&request, sections);
+    apply_linear_dim_suppression_hints(&mut layout, data);
+    suppress_invalid_straight_overall_dims(&mut layout);
+    layout
+}
+
+#[cfg(feature = "mbd-iso")]
+fn apply_linear_dim_suppression_hints(
+    layout: &mut aios_core::mbd::LayoutResult,
+    data: &MbdPipeData,
+) {
+    let suppress_by_id: HashMap<String, String> = data
+        .dims
+        .iter()
+        .filter_map(|dim| {
+            dim.layout_hint
+                .as_ref()
+                .and_then(|hint| hint.suppress_reason.clone())
+                .map(|reason| (dim.id.clone(), reason))
+        })
+        .collect();
+
+    let mut to_suppress: Vec<(String, String)> = Vec::new();
+    for dim in &mut layout.linear_dims {
+        if let Some(reason) = suppress_by_id.get(&dim.id) {
+            dim.visible = false;
+            dim.suppressed_reason = Some(reason.clone());
+            to_suppress.push((dim.id.clone(), reason.clone()));
+        }
+    }
+    for (id, reason) in to_suppress {
+        push_suppressed_item_once(layout, &id, "linear_dim", &reason);
+    }
+    layout.stats.suppressed_count = layout.suppressed_items.len();
+}
+
+#[cfg(feature = "mbd-iso")]
+fn suppress_invalid_straight_overall_dims(layout: &mut aios_core::mbd::LayoutResult) {
+    let mut to_suppress: Vec<(String, &'static str)> = Vec::new();
+    for dim in &layout.linear_dims {
+        if dim.kind != "overall" || !dim.visible {
+            continue;
+        }
+        let start = Vec3::from_array(dim.start);
+        let end = Vec3::from_array(dim.end);
+        let straight = start.distance(end);
+        let text_len = parse_dim_text_mm(&dim.text);
+        if let Some(text_len) = text_len {
+            if text_len > straight * 1.5 && text_len - straight > 1000.0 {
+                to_suppress.push((
+                    dim.id.clone(),
+                    "overall_path_length_not_single_straight_dim",
+                ));
+            }
+        }
+    }
+
+    for (id, reason) in to_suppress {
+        if let Some(dim) = layout.linear_dims.iter_mut().find(|dim| dim.id == id) {
+            dim.visible = false;
+            dim.suppressed_reason = Some(reason.to_string());
+        }
+        push_suppressed_item_once(layout, &id, "linear_dim", reason);
+    }
+    layout.stats.suppressed_count = layout.suppressed_items.len();
+}
+
+#[cfg(feature = "mbd-iso")]
+fn push_suppressed_item_once(
+    layout: &mut aios_core::mbd::LayoutResult,
+    id: &str,
+    kind: &str,
+    reason: &str,
+) {
+    if layout
+        .suppressed_items
+        .iter()
+        .any(|item| item.id == id && item.kind == kind && item.reason == reason)
+    {
+        return;
+    }
+    layout
+        .suppressed_items
+        .push(aios_core::mbd::SuppressedItem {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            reason: reason.to_string(),
+        });
+}
+
+#[cfg(feature = "mbd-iso")]
+fn parse_dim_text_mm(text: &str) -> Option<f32> {
+    let normalized = text
+        .chars()
+        .filter(|ch| ch.is_ascii_digit() || *ch == '.' || *ch == '-')
+        .collect::<String>();
+    normalized.parse::<f32>().ok()
 }
 
 fn normalized_dir_or_x(v: glam::Vec3) -> glam::Vec3 {
@@ -2644,6 +3081,7 @@ pub async fn generate_mbd_data(
     branch_refno: RefnoEnum,
     query: &MbdPipeQuery,
 ) -> anyhow::Result<MbdPipeData> {
+    ensure_mbd_surreal_context().await?;
     let query = query.resolve();
     let (segments, mut debug_info) =
         fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await?;
@@ -2706,7 +3144,7 @@ async fn collect_bran_refnos_for_scope(scope: &MbdExportScope) -> anyhow::Result
     match scope {
         MbdExportScope::ByDbnum(dbnum) => {
             let sql = "SELECT value id FROM pe WHERE noun IN ['BRAN', 'HANG']";
-            let all_refnos: Vec<RefnoEnum> = SUL_DB.query_take(sql, 0).await?;
+            let all_refnos: Vec<RefnoEnum> = mbd_query_take(sql, 0).await?;
 
             let db_meta = crate::data_interface::db_meta_manager::db_meta();
             db_meta.ensure_loaded()?;
@@ -2733,7 +3171,7 @@ async fn collect_bran_refnos_for_scope(scope: &MbdExportScope) -> anyhow::Result
         }
         MbdExportScope::AllDbnums => {
             let sql = "SELECT value id FROM pe WHERE noun IN ['BRAN', 'HANG']";
-            let all_refnos: Vec<RefnoEnum> = SUL_DB.query_take(sql, 0).await?;
+            let all_refnos: Vec<RefnoEnum> = mbd_query_take(sql, 0).await?;
             Ok(all_refnos)
         }
     }

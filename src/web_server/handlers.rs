@@ -168,6 +168,7 @@ use crate::fast_model::session::{PdmsTimeExtractor, SESSION_STORE};
 #[cfg(feature = "sqlite-index")]
 use crate::spatial_index::SqliteSpatialIndex;
 use aios_core::project_primary_db;
+use aios_core::rs_surreal::SurrealQueryExt;
 #[cfg(feature = "sqlite-index")]
 use nalgebra::{Point3, Vector3};
 #[cfg(feature = "sqlite-index")]
@@ -574,7 +575,7 @@ pub async fn api_get_projects(
     let mut items: Vec<ProjectItem> = Vec::new();
     let mut total: usize = 0;
 
-    match project_primary_db().query(sql).await {
+    match project_primary_db().query_response(&sql).await {
         Ok(mut resp) => {
             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
             for row in rows {
@@ -608,12 +609,19 @@ pub async fn api_get_projects(
                 }
             }
         }
-        Err(_) => {}
+        Err(e) => {
+            log::warn!("[projects] SurrealDB 查询失败 (将走 config fallback): {e}");
+        }
     }
 
-    if let Ok(mut resp) = project_primary_db().query(count_sql).await {
-        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-        total = rows.get(0).and_then(|r| r["total"].as_u64()).unwrap_or(0) as usize;
+    match project_primary_db().query_response(&count_sql).await {
+        Ok(mut resp) => {
+            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+            total = rows.get(0).and_then(|r| r["total"].as_u64()).unwrap_or(0) as usize;
+        }
+        Err(e) => {
+            log::warn!("[projects] SurrealDB 计数查询失败: {e}");
+        }
     }
 
     println!(

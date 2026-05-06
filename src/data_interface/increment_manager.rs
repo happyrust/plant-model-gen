@@ -23,6 +23,7 @@ use pdms_io::sync::compress::{CompressOptions, execute_compress};
 // use pdms_io::sync::compress::{execute_compress, CompressOptions};
 use pdms_io::watch::PdmsWatcher;
 use petgraph::visit::Walker;
+#[cfg(feature = "mqtt")]
 use rumqttc::QoS;
 use serde::{Deserialize, Serialize};
 use tokio::fs::create_dir_all;
@@ -32,6 +33,7 @@ use crate::data_interface::increment_record::IncrGeoUpdateLog;
 use crate::data_interface::interface::PdmsDataInterface;
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::*;
+#[cfg(feature = "mqtt")]
 use crate::mqtt_service::SyncE3dFileMsg;
 #[cfg(feature = "web_server")]
 use crate::web_server::{

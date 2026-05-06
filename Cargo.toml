@@ -44,8 +44,8 @@ polars = { version = "0.46", default-features = false, optional = true, features
     "is_in",
 ] }
 
-# MQTT 服务器和客户端
-rumqttc = "0.25.0"
+# MQTT 服务器和客户端（仅在 mqtt feature 启用时编译）
+rumqttc = { version = "0.25.0", optional = true }
 # rumqttd = "0.19" # 暂时注释掉，rumqttd 需要单独的项目
 
 # 实时通信（axum-extra 需要和 axum 版本匹配）
@@ -53,7 +53,7 @@ rumqttc = "0.25.0"
 futures-util = "0.3"
 regex = "1.12.1"
 nom = "8"
-calamine = "0.31.0"
+calamine = { version = "0.31.0", optional = true }
 #sled = "0.34.7"
 derive_more = { version = "1.0.0", features = ["deref", "deref_mut"] }
 bitflags = "2.9.4"
@@ -157,22 +157,45 @@ rusqlite = { version = "0.33", features = ["bundled"], optional = true }
 # DuckDB removed - backend no longer uses this feature
 
 indicatif = "0.18.1"
-rust_xlsxwriter = "0.91.0"
+rust_xlsxwriter = { version = "0.91.0", optional = true }
 
 libc = "0.2"
 
+# ═══════════════════════════════════════════════════════════════
+# Features 重组 (2026-05)
+# ─────────────────────────────────────────────────────────────
+# 设计原则：按"业务能力"切片，而不是按 library 切片。
+#   review          三维校审最小必要集（default）
+#   review-rocksdb  review + kv-rocksdb（需要 RocksDB 持久化时用）
+#   web_server      基础 Web HTTP 服务（axum + 周边，不带业务扩展）
+#   gen_model       模型几何生成开关（aios_core 转发）
+#   parquet-export  Parquet 列式导出（拉 polars/arrow/ethnum，重）
+#   mbd-pipe        MBD 管线读 parquet（mbd_pipe_api.rs，依赖 parquet-export）
+#   excel-export    Excel 数据导出（data_to_excel，已弃用但保留 hook）
+#   kv-rocksdb      RocksDB 嵌入后端（C++ 编译重）
+#   full            完整产物，等价旧 default+web_server+parquet-export 行为
+# 历史 default 行为请用 `--features full` 复现。
+# ═══════════════════════════════════════════════════════════════
 [features]
-default = [
+default = ["review"]
+
+# 三维校审最小必要集
+# 不含：polars / arrow / parquet / ethnum / RocksDB（C++ 编译重）
+# SurrealDB 默认走 kv-mem 后端，校审验证够用
+# gen_model 在 web_api 中被 ptset / e3d_tree / spatial_query / scene_tree 等路由间接需要，
+# 但它本身只是项目内代码开关，不会拉外部重型依赖。
+review = [
     "ws",
     "gen_model",
-    "sqlite-index",
     "manifold",
-    "kv-rocksdb",
     "project_hd",
     "surreal-save",
-    "parquet-export",
     "sqlite-index",
+    "web_server",
 ]
+
+# 如校审场景需要 RocksDB 持久化，用 `--features review-rocksdb`
+review-rocksdb = ["review", "kv-rocksdb"]
 
 # Parquet/Polars 数据导出（编译较重，日常开发可不启用）
 parquet-export = [
@@ -181,6 +204,29 @@ parquet-export = [
     "dep:arrow-schema",
     "dep:polars",
 ]
+
+# MBD 管线读 parquet（web_api/mbd_pipe_api.rs）
+mbd-pipe = ["parquet-export", "mbd-iso"]
+
+# Excel 数据导出（data_to_excel/，目前模块已注释，保留 hook）
+excel-export = ["dep:rust_xlsxwriter"]
+
+# Excel name-config / spec 表加载（calamine）
+# 同时启用 aios_core 内部的 ssc_setting / material::dq Excel 入口，
+# 否则那些 fn 会返回 "spec-loader feature not enabled" 错误。
+spec-loader = ["dep:calamine", "aios_core/spec-loader"]
+
+# 完整产物：等价旧 default+web_server 行为
+full = [
+    "review",
+    "kv-rocksdb",
+    "parquet-export",
+    "mbd-pipe",
+    "excel-export",
+    "spec-loader",
+    "mqtt",
+]
+
 # gui = ["dep:gpui-component", "dep:gpui", "dep:story"]
 console = ["ws", "gen_model", "manifold", "project_hd", "mqtt"]
 # grpc = ["dep:tonic", "dep:prost", "dep:tonic-reflection", "dep:tokio-util", "dep:jsonwebtoken", "dep:rstar"]  #GRPC服务功能
@@ -189,7 +235,7 @@ local = []
 ws = []
 debug_obj_export = []
 debug_expr = ["aios_core/debug_expr"]
-mqtt = []
+mqtt = ["dep:rumqttc"]
 viewer = []                           #是否开启视图
 gen_model = ["aios_core/gen_model"]
 manifold = ["aios_core/manifold"]
@@ -203,26 +249,26 @@ kv-rocksdb = [
 ] # 嵌入式 RocksDB 后端，默认不编译以加快构建
 project_hd = []
 project_hh = []
-# mbd-iso: 当 rs-core (`aios_core::mbd`) 暴露 `iso_extras` / `iso_params` / `SolveBranchInput`
-# 这几个 in-progress 模块后再开启。未开启时 `mbd_pipe_api::compute_branch_layout_result` 不参与
-# 编译, MBD 数据里的 `layout_result` 字段会降级为 None。
+# mbd-iso: 启用 rs-core (`aios_core::mbd`) 的 branch-level solver。
+# V1 的 `layout_result` 与 V2 `/api/mbd/v2/pipe/{refno}` 都依赖它。
+# 未开启时 MBD 数据里的 `layout_result` 字段会降级为 None，V2 API 会返回失败。
 mbd-iso = []
 profile = ["dep:tracing-chrome"] #性能分析，包含tracing功能
+
+# Web HTTP 服务（axum + 周边）。仅基础能力，不带 parquet/mbd 等业务扩展。
 web_server = [
     "dep:axum",
+    "dep:axum-extra",
     "dep:tower",
     "dep:tower-http",
     "dep:sysinfo",
-    "dep:axum-extra",
     "dep:tokio-util",
     "dep:rusqlite",
-    "aios_core/web_server",
-    "gen_model",
     "dep:jsonwebtoken",
-    "sqlite-index",
     "dep:reqwest",
     "dep:uuid",
-    "parquet-export",
+    "aios_core/web_server",
+    "sqlite-index",
 ] #Web UI功能
 
 sqlite-index = ["dep:rusqlite", "dep:tokio-util", "aios_core/sqlite"] # SQLite RTree 空间索引功能

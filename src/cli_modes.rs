@@ -17,6 +17,7 @@ use aios_database::fast_model::export_model::export_room_instances::{
 };
 use aios_database::options::DbOptionExt;
 use aios_database::perf_timer::{PerfReport, PerfTimer};
+use parry3d::bounding_volume::BoundingVolume;
 // use aios_database::fast_model::export_xkt::XktExporter;
 use aios_database::fast_model::model_exporter::{
     CommonExportConfig, ExportStats, GlbExportConfig, GltfExportConfig, ModelExporter,
@@ -2670,10 +2671,21 @@ pub async fn export_all_relates_mode(
     println!("✅ 数据库连接成功");
 
     // 加载名称配置（如果提供了路径）
-    let name_config = if let Some(path) = name_config_path {
-        Some(NameConfig::load_from_excel(&path)?)
-    } else {
-        None
+    let name_config = match name_config_path {
+        Some(path) => {
+            #[cfg(feature = "spec-loader")]
+            {
+                Some(NameConfig::load_from_excel(&path)?)
+            }
+            #[cfg(not(feature = "spec-loader"))]
+            {
+                anyhow::bail!(
+                    "name-config Excel 加载需要 spec-loader feature，path={}",
+                    path.display()
+                )
+            }
+        }
+        None => None,
     };
 
     // 调用导出函数（通过 Deref 访问内部的 DbOption）
@@ -2721,10 +2733,21 @@ pub async fn export_all_parquet_mode(
     println!("✅ 数据库连接成功");
 
     // 加载名称配置（如果提供了路径）
-    let name_config = if let Some(path) = name_config_path {
-        Some(NameConfig::load_from_excel(&path)?)
-    } else {
-        None
+    let name_config = match name_config_path {
+        Some(path) => {
+            #[cfg(feature = "spec-loader")]
+            {
+                Some(NameConfig::load_from_excel(&path)?)
+            }
+            #[cfg(not(feature = "spec-loader"))]
+            {
+                anyhow::bail!(
+                    "name-config Excel 加载需要 spec-loader feature，path={}",
+                    path.display()
+                )
+            }
+        }
+        None => None,
     };
 
     // 调用导出函数（通过 Deref 访问内部的 DbOption）
@@ -4553,6 +4576,50 @@ pub fn verify_spatial_query_snapshot_file(
     ))
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn resolve_spatial_query_target_aabb(
+    spatial_index: &aios_database::spatial_index::SqliteSpatialIndex,
+    query_refno: RefU64,
+    query_refno_display: &str,
+) -> Result<parry3d::bounding_volume::Aabb> {
+    if let Some(aabb) = spatial_index.get_aabb(query_refno)? {
+        return Ok(aabb);
+    }
+
+    let parsed_refno = RefnoEnum::from_str(&canonicalize_refno_str(query_refno_display))
+        .map_err(|_| anyhow!("解析参考号失败: {}", query_refno_display))?;
+    let child_refnos =
+        aios_database::fast_model::gen_model::query_compat::query_deep_visible_inst_refnos(
+            parsed_refno,
+        )
+        .await
+        .with_context(|| format!("查询 {} 的可见子构件失败", query_refno_display))?;
+
+    let mut out: Option<parry3d::bounding_volume::Aabb> = None;
+    for child_refno in child_refnos {
+        let child_refno_key = canonicalize_refno_str(&child_refno.to_string());
+        let Some(child_id) = aios_database::sqlite_index::refno_str_to_i64(&child_refno_key) else {
+            continue;
+        };
+        let Some(child_aabb) = spatial_index.get_aabb(RefU64(child_id as u64))? else {
+            continue;
+        };
+
+        if let Some(current) = &mut out {
+            current.merge(&child_aabb);
+        } else {
+            out = Some(child_aabb);
+        }
+    }
+
+    out.ok_or_else(|| {
+        anyhow!(
+            "未找到指定 refno 的 AABB: {}，且可见子构件也没有可用 AABB",
+            query_refno_display
+        )
+    })
+}
+
 /// 基于 refno 的 SQLite 空间范围查询，并可用 expect-refnos / verify-json 做回归验证。
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub async fn spatial_query_refno_mode(
@@ -4597,9 +4664,9 @@ pub async fn spatial_query_refno_mode(
         SqliteSpatialIndex::default_path().display()
     );
 
-    let target_aabb = spatial_index
-        .get_aabb(query_refno)?
-        .ok_or_else(|| anyhow!("未找到指定 refno 的 AABB: {}", query_refno_display))?;
+    let target_aabb =
+        resolve_spatial_query_target_aabb(&spatial_index, query_refno, &query_refno_display)
+            .await?;
 
     let query_aabb = Aabb::new(
         [

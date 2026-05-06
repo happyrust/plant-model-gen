@@ -1087,7 +1087,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ========== MBD JSON 预生成 ==========
-    #[cfg(feature = "web_server")]
+    #[cfg(feature = "mbd-pipe")]
     if matches.get_flag("export-mbd") || matches.get_one::<String>("export-mbd-refno").is_some() {
         use aios_database::web_api::{MbdExportScope, export_mbd_json_batch, get_mbd_output_dir};
 

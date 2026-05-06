@@ -5,7 +5,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(feature = "spec-loader")]
+use anyhow::Context;
+#[cfg(feature = "spec-loader")]
 use calamine::{DataType, Reader, Xlsx, open_workbook};
 
 /// 名称映射配置
@@ -27,6 +30,9 @@ impl NameConfig {
     /// - D 列（索引 3）: PID对象
     /// - I 列（索引 8）: 三维模型节点
     /// - 第一行为表头，从第二行开始读取数据
+    ///
+    /// 仅在启用 `spec-loader` feature 时可用。
+    #[cfg(feature = "spec-loader")]
     pub fn load_from_excel<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         println!("📖 加载名称配置文件: {}", path.display());

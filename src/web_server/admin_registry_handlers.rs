@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query},
     http::StatusCode,
     middleware,
     response::IntoResponse,
@@ -15,9 +15,11 @@ use crate::web_server::{
     admin_task_handlers, handlers,
     models::{
         DatabaseConfig, DeploymentSiteCreateRequest, DeploymentSiteImportRequest,
-        DeploymentSiteQuery, DeploymentSiteTaskRequest, DeploymentSiteUpdateRequest, TaskInfo,
+        DeploymentSiteQuery, DeploymentSiteUpdateRequest,
     },
 };
+
+const REDACTED_SECRET: &str = "********";
 
 #[derive(Debug, Deserialize)]
 pub struct AdminRegistryTaskRequest {
@@ -64,7 +66,9 @@ pub fn create_admin_registry_routes() -> Router<AppState> {
 
 async fn list_sites(Query(params): Query<DeploymentSiteQuery>) -> impl IntoResponse {
     match handlers::api_get_deployment_sites(Query(params)).await {
-        Ok(Json(value)) => admin_response::ok("获取注册表站点列表成功", value),
+        Ok(Json(value)) => {
+            admin_response::ok("获取注册表站点列表成功", redact_registry_value(value))
+        }
         Err(status) => {
             admin_response::response::<Value>(status, false, "获取注册表站点列表失败", None)
         }
@@ -73,16 +77,19 @@ async fn list_sites(Query(params): Query<DeploymentSiteQuery>) -> impl IntoRespo
 
 async fn create_site(Json(payload): Json<DeploymentSiteCreateRequest>) -> impl IntoResponse {
     match handlers::api_create_deployment_site(Json(payload)).await {
-        Ok(Json(value)) => {
-            admin_response::accepted("创建注册表站点成功", unwrap_item_or_value(value))
-        }
+        Ok(Json(value)) => admin_response::accepted(
+            "创建注册表站点成功",
+            redact_registry_value(unwrap_item_or_value(value)),
+        ),
         Err((status, Json(value))) => extract_proxy_error(status, value, "创建注册表站点失败"),
     }
 }
 
 async fn get_site(Path(site_id): Path<String>) -> impl IntoResponse {
     match handlers::api_get_deployment_site(Path(site_id)).await {
-        Ok(Json(value)) => admin_response::ok("获取注册表站点详情成功", value),
+        Ok(Json(value)) => {
+            admin_response::ok("获取注册表站点详情成功", redact_registry_value(value))
+        }
         Err(status) => {
             admin_response::response::<Value>(status, false, "获取注册表站点详情失败", None)
         }
@@ -94,7 +101,10 @@ async fn update_site(
     Json(payload): Json<DeploymentSiteUpdateRequest>,
 ) -> impl IntoResponse {
     match handlers::api_update_deployment_site(Path(site_id), Json(payload)).await {
-        Ok(Json(value)) => admin_response::ok("更新注册表站点成功", unwrap_item_or_value(value)),
+        Ok(Json(value)) => admin_response::ok(
+            "更新注册表站点成功",
+            redact_registry_value(unwrap_item_or_value(value)),
+        ),
         Err((status, Json(value))) => extract_proxy_error(status, value, "更新注册表站点失败"),
     }
 }
@@ -102,8 +112,8 @@ async fn update_site(
 async fn delete_site(Path(site_id): Path<String>) -> impl IntoResponse {
     match handlers::api_delete_deployment_site(Path(site_id.clone())).await {
         Ok(_) => admin_response::ok(
-            "删除注册表站点成功",
-            json!({"site_id": site_id, "deleted": true}),
+            "已移除注册表记录，未删除项目或运行数据目录",
+            json!({"site_id": site_id, "deleted": true, "removed_registry_record": true, "deleted_runtime_data": false}),
         ),
         Err(status) => admin_response::response::<Value>(status, false, "删除注册表站点失败", None),
     }
@@ -113,74 +123,60 @@ async fn import_site_from_dboption(
     payload: Option<Json<DeploymentSiteImportRequest>>,
 ) -> impl IntoResponse {
     match handlers::api_import_deployment_site_from_dboption(payload).await {
-        Ok(Json(value)) => {
-            admin_response::accepted("导入注册表站点成功", unwrap_item_or_value(value))
-        }
+        Ok(Json(value)) => admin_response::accepted(
+            "导入注册表站点成功",
+            redact_registry_value(unwrap_item_or_value(value)),
+        ),
         Err((status, Json(value))) => extract_proxy_error(status, value, "导入注册表站点失败"),
     }
 }
 
 async fn healthcheck_site(Path(site_id): Path<String>) -> impl IntoResponse {
     match handlers::api_healthcheck_deployment_site_post(Path(site_id), None).await {
-        Ok(Json(value)) => admin_response::ok("站点健康检查完成", value),
+        Ok(Json(value)) => admin_response::ok("站点健康检查完成", redact_registry_value(value)),
         Err((status, Json(value))) => extract_proxy_error(status, value, "站点健康检查失败"),
     }
 }
 
 async fn export_site_config(Path(site_id): Path<String>) -> impl IntoResponse {
     match handlers::api_export_deployment_site_config(Path(site_id)).await {
-        Ok(Json(value)) => admin_response::ok("导出站点配置成功", value),
+        Ok(Json(value)) => admin_response::ok("导出站点配置成功", redact_registry_value(value)),
         Err(status) => admin_response::response::<Value>(status, false, "导出站点配置失败", None),
     }
 }
 
 async fn create_site_task(
-    State(state): State<AppState>,
     Path(site_id): Path<String>,
     Json(payload): Json<AdminRegistryTaskRequest>,
 ) -> impl IntoResponse {
+    let site = match crate::web_server::site_registry::get_site(&site_id) {
+        Ok(Some(site)) => site,
+        Ok(None) => return admin_response::not_found(format!("站点不存在: {}", site_id)),
+        Err(err) => return admin_response::server_error(format!("站点查询失败: {}", err)),
+    };
     let task_type = payload
         .task_type
         .unwrap_or(crate::web_server::models::TaskType::ParsePdmsData);
-    let request = DeploymentSiteTaskRequest {
-        site_id: site_id.clone(),
-        task_type: task_type.clone(),
-        task_name: payload.task_name.clone(),
-        priority: payload.priority.clone(),
-        config_override: payload.config_override.clone(),
-    };
+    let task_name = payload
+        .task_name
+        .unwrap_or_else(|| format!("{} - {:?}", site.name, task_type));
+    let config = payload.config_override.unwrap_or(site.config);
 
-    match handlers::api_create_deployment_site_task(State(state), Json(request)).await {
-        Ok(Json(value)) => {
-            let site_label = value
-                .get("site_label")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let task_id = value
-                .get("task_id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let task_name = payload
-                .task_name
-                .clone()
-                .unwrap_or_else(|| format!("registry-{:?}", task_type));
-            let config = payload.config_override.unwrap_or_default();
-            let mut unified_task = TaskInfo::new_with_priority(
-                task_name,
-                task_type,
-                config,
-                payload.priority.unwrap_or_default(),
-            );
-            if let Some(tid) = &task_id {
-                unified_task.id = tid.clone();
-            }
-            unified_task.site_id = Some(site_id);
-            unified_task.site_label = site_label;
-            admin_task_handlers::insert_task(unified_task);
-
-            admin_response::ok("创建注册表任务成功", sanitize_task_response(value))
-        }
-        Err((status, Json(value))) => extract_proxy_error(status, value, "创建注册表任务失败"),
+    match admin_task_handlers::create_and_dispatch_site_task(
+        site.site_id.clone(),
+        task_name,
+        task_type,
+        payload.priority.unwrap_or_default(),
+        config,
+    ) {
+        Ok(task) => admin_response::accepted(
+            "创建注册表任务成功",
+            sanitize_task_response(json!({
+                "task_id": task.id,
+                "message": "任务已提交，等待站点状态更新",
+            })),
+        ),
+        Err(message) => admin_response::bad_request(message),
     }
 }
 
@@ -196,6 +192,34 @@ fn sanitize_task_response(value: Value) -> Value {
 
 fn unwrap_item_or_value(value: Value) -> Value {
     value.get("item").cloned().unwrap_or(value)
+}
+
+fn redact_registry_value(mut value: Value) -> Value {
+    redact_secret_fields(&mut value);
+    value
+}
+
+fn redact_secret_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, nested) in object.iter_mut() {
+                if matches!(
+                    key.as_str(),
+                    "db_password" | "password" | "surreal_password"
+                ) {
+                    *nested = Value::String(REDACTED_SECRET.to_string());
+                } else {
+                    redact_secret_fields(nested);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_secret_fields(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn extract_proxy_error(status: StatusCode, value: Value, fallback_message: &str) -> ApiResponse {

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cmp::Ordering;
 use std::fs;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -1897,10 +1897,7 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
     #[cfg(feature = "sqlite-index")]
     {
         use crate::fast_model::export_model::export_dbnum_instances_parquet::query_distinct_dbnums_from_inst_relate;
-        use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_dbnos;
-        use crate::sqlite_index::ImportConfig;
-        use std::path::PathBuf;
-        use std::sync::Arc;
+        use crate::fast_model::room_model::refresh_sqlite_spatial_index_from_inst_relate_aabb;
 
         if !SqliteSpatialIndex::is_enabled() {
             return Ok(Json(
@@ -1923,7 +1920,8 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
             ));
         }
 
-        // 从 SurrealDB 扫描当前存在实例关系的 dbnum，并导出 instances_{dbnum}.json 后导入 SQLite。
+        // 从 SurrealDB 扫描当前存在实例关系的 dbnum，并按 dbnum 刷新 SQLite。
+        // 刷新路径会额外做层级 AABB 聚合，补齐 BRAN/HANG/PIPE 等中间节点空间占位。
         let mut total_processed: usize = 0;
         let mut exported_dbnums: Vec<u32> = Vec::new();
         let t0 = std::time::Instant::now();
@@ -1937,46 +1935,16 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
         };
 
         if !dbnums.is_empty() {
-            let db_option = aios_core::get_db_option();
-            let output_root = PathBuf::from("output");
-            let mesh_dir = PathBuf::from("assets/meshes");
-
-            if let Err(e) = export_instances_json_for_dbnos(
-                &dbnums,
-                &mesh_dir,
-                &output_root,
-                db_option.clone(),
-                false,
-            )
-            .await
-            {
-                return Ok(Json(
-                    json!({"success": false, "error": format!("导出 instances.json 失败: {}", e)}),
-                ));
-            }
-
-            let instances_dir = output_root.join(&db_option.project_name).join("instances");
-            let import_cfg = ImportConfig::default();
-
-            for dbnum in dbnums {
-                let instances_path = instances_dir.join(format!("instances_{}.json", dbnum));
-                if !instances_path.exists() {
-                    continue;
+            match refresh_sqlite_spatial_index_from_inst_relate_aabb(Some(&dbnums), None).await {
+                Ok(count) => {
+                    total_processed = count;
+                    exported_dbnums = dbnums;
                 }
-                match index
-                    .inner()
-                    .import_from_instances_json(&instances_path, &import_cfg)
-                {
-                    Ok(stats) => {
-                        total_processed += stats.total_inserted;
-                        exported_dbnums.push(dbnum);
-                    }
-                    Err(e) => {
-                        return Ok(Json(json!({
-                            "success": false,
-                            "error": format!("导入 {} 失败: {}", instances_path.display(), e),
-                        })));
-                    }
+                Err(e) => {
+                    return Ok(Json(json!({
+                        "success": false,
+                        "error": format!("刷新 SQLite 空间索引失败: {}", e),
+                    })));
                 }
             }
         }
@@ -2403,9 +2371,200 @@ pub async fn api_get_deployment_sites(
     })))
 }
 
+fn redact_public_deployment_site_value(value: &mut serde_json::Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("config");
+        object.remove("e3d_projects");
+        object.remove("project_path");
+        object.remove("owner");
+    }
+}
+
+fn public_deployment_site(site: DeploymentSite) -> serde_json::Value {
+    let mut value = serde_json::to_value(site).unwrap_or_else(|_| json!({}));
+    redact_public_deployment_site_value(&mut value);
+    value
+}
+
+/// 公开站点列表：只提供运行态发现所需字段，避免泄漏 `DatabaseConfig` 中的凭据。
+pub async fn api_get_public_deployment_sites(
+    Query(params): Query<DeploymentSiteQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let Json(mut value) = api_get_deployment_sites(Query(params)).await?;
+    if let Some(items) = value
+        .get_mut("items")
+        .and_then(|items| items.as_array_mut())
+    {
+        for item in items {
+            redact_public_deployment_site_value(item);
+        }
+    }
+    Ok(Json(value))
+}
+
+/// 公开站点详情：与公开列表同样脱敏；完整配置只允许走 admin registry API。
+pub async fn api_get_public_deployment_site(
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let site = crate::web_server::site_registry::get_site(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match site {
+        Some(site) => Ok(Json(public_deployment_site(site))),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
 /// 当前 web_server 进程身份（监听地址 + 可选环境变量中的站点标识）
 pub async fn api_get_site_identity() -> Json<serde_json::Value> {
     Json(crate::web_server::web_listen::site_identity_json())
+}
+
+fn registry_error(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(json!({ "error": message.into() })))
+}
+
+fn parse_configured_roots(var_name: &str) -> Vec<PathBuf> {
+    std::env::var(var_name)
+        .ok()
+        .into_iter()
+        .flat_map(|raw| {
+            raw.split([';', ','])
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn default_dboption_import_roots() -> Result<Vec<PathBuf>, (StatusCode, Json<serde_json::Value>)> {
+    let current_dir = std::env::current_dir().map_err(|err| {
+        registry_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("读取当前工作目录失败: {}", err),
+        )
+    })?;
+    let cfg_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let cfg_path = PathBuf::from(format!("{}.toml", cfg_name));
+    let mut roots = vec![
+        current_dir.join("db_options"),
+        current_dir.join("runtime/admin_sites"),
+    ];
+    if let Some(parent) = cfg_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        roots.push(parent.to_path_buf());
+    }
+    Ok(roots)
+}
+
+fn resolve_dboption_import_path(
+    raw_path: Option<&str>,
+) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    let path = raw_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("db_options/DbOption.toml"));
+    let canonical = fs::canonicalize(&path).map_err(|_| {
+        registry_error(
+            StatusCode::NOT_FOUND,
+            format!("配置文件不存在或不可访问: {}", path.display()),
+        )
+    })?;
+
+    let mut roots = parse_configured_roots("AIOS_DBOPTION_IMPORT_ROOTS");
+    if roots.is_empty() {
+        roots = default_dboption_import_roots()?;
+    }
+
+    for root in roots {
+        let Ok(canonical_root) = fs::canonicalize(&root) else {
+            continue;
+        };
+        if canonical.starts_with(&canonical_root) {
+            return Ok(canonical);
+        }
+    }
+
+    Err(registry_error(
+        StatusCode::FORBIDDEN,
+        format!(
+            "DbOption 导入路径不在允许目录内: {}；可通过 AIOS_DBOPTION_IMPORT_ROOTS 配置允许根目录",
+            canonical.display()
+        ),
+    ))
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn is_blocked_healthcheck_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(addr) => {
+            let octets = addr.octets();
+            addr.is_unspecified()
+                || addr.is_loopback()
+                || addr.is_private()
+                || addr.is_link_local()
+                || addr.is_broadcast()
+                || addr.is_multicast()
+                || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 64)
+        }
+        IpAddr::V6(addr) => {
+            let segments = addr.segments();
+            addr.is_unspecified()
+                || addr.is_loopback()
+                || addr.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn validate_healthcheck_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|err| format!("URL 格式无效: {}", err))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("健康检查 URL 只允许 http/https".to_string());
+    }
+    if parsed.username() != "" || parsed.password().is_some() {
+        return Err("健康检查 URL 不允许携带用户名或密码".to_string());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "健康检查 URL 缺少 host".to_string())?;
+    let allow_private = env_flag("AIOS_ALLOW_PRIVATE_HEALTHCHECK_URLS");
+    if !allow_private {
+        let normalized_host = host.trim_end_matches('.').to_ascii_lowercase();
+        if normalized_host == "localhost" || normalized_host.ends_with(".localhost") {
+            return Err(
+                "健康检查 URL 默认不允许访问 localhost；如确需内网探活，请显式设置 AIOS_ALLOW_PRIVATE_HEALTHCHECK_URLS=1"
+                    .to_string(),
+            );
+        }
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if !allow_private && is_blocked_healthcheck_ip(ip) {
+            return Err(
+                "健康检查 URL 默认不允许访问 loopback/private/link-local/multicast 地址；如确需内网探活，请显式设置 AIOS_ALLOW_PRIVATE_HEALTHCHECK_URLS=1"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn slugify_site_id(input: &str, fallback_port: u16) -> String {
@@ -2464,6 +2623,21 @@ fn derive_frontend_url_from_backend(backend_url: &str, bind_host: &str) -> Strin
         bind_host
     };
     format!("http://{}:5173", host)
+}
+
+fn validate_optional_healthcheck_url(
+    value: Option<&str>,
+    field: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if let Some(url) = value.filter(|url| !url.trim().is_empty()) {
+        validate_healthcheck_url(url).map_err(|err| {
+            registry_error(
+                StatusCode::BAD_REQUEST,
+                format!("{} 不可用于健康检查: {}", field, err),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn build_deployment_site_from_create_request(
@@ -2534,6 +2708,10 @@ fn build_deployment_site_from_create_request(
             .as_ref()
             .map(|value| format!("{}/api/health", value.trim_end_matches('/')))
     });
+    validate_optional_healthcheck_url(
+        health_url.as_deref().or(backend_url.as_deref()),
+        "health_url",
+    )?;
 
     config.project_name = project_name.clone();
     if let Some(path) = project_path.clone() {
@@ -2578,22 +2756,7 @@ pub async fn api_import_deployment_site_from_dboption(
     payload: Option<Json<DeploymentSiteImportRequest>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let req = payload.map(|Json(v)| v).unwrap_or_default();
-    let path = req
-        .path
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("db_options/DbOption.toml"));
-
-    if !path.exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": format!("配置文件不存在: {}", path.display())
-            })),
-        ));
-    }
+    let path = resolve_dboption_import_path(req.path.as_deref())?;
 
     let raw = fs::read_to_string(&path).map_err(|e| {
         (
@@ -2702,6 +2865,10 @@ pub async fn api_import_deployment_site_from_dboption(
         .health_url
         .clone()
         .or_else(|| Some(format!("{}/api/health", backend_url.trim_end_matches('/'))));
+    validate_optional_healthcheck_url(
+        health_url.as_deref().or(Some(backend_url.as_str())),
+        "health_url",
+    )?;
     let project_code = if config.project_code == 0 {
         None
     } else {
@@ -2790,6 +2957,9 @@ pub async fn api_update_deployment_site(
     Path(id): Path<String>,
     Json(req): Json<DeploymentSiteUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_optional_healthcheck_url(req.health_url.as_deref(), "health_url")?;
+    validate_optional_healthcheck_url(req.backend_url.as_deref(), "backend_url")?;
+    validate_optional_healthcheck_url(req.url.as_deref(), "url")?;
     let updated = crate::web_server::site_registry::update_site(&id, &req).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -3126,9 +3296,14 @@ pub async fn api_healthcheck_deployment_site(
         return Err(StatusCode::BAD_REQUEST);
     };
     let checked_url = url.clone();
+    if let Err(err) = validate_healthcheck_url(&checked_url) {
+        eprintln!("拒绝执行不安全的部署站点健康检查 URL: {}", err);
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 

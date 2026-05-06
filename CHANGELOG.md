@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-05-06
+
+### Fixed — APS 站点部署运行验证与安全收敛
+
+> 针对 `AvevaPlantSample`（APS）站点部署链路完成真实 `web_server` 运行验证，并修复验证中暴露的公开列表、任务响应和旧入口兼容问题。
+
+- 注册表创建任务统一走 admin task 持久化与 dispatch 链路，避免双 task id / 双状态源导致任务不执行。
+- 旧静态 `deployment-sites.js` 写接口迁移到 `/api/admin/registry/*`，并携带 `admin_token` Bearer 认证。
+- 公开 `/api/deployment-sites` 修复 `total>0` 但 `items=[]` 的问题，同时保持 `config/project_path/owner/e3d_projects` 不对外暴露。
+- admin registry 与 admin tasks 响应递归脱敏 `db_password/password/surreal_password`，避免 APS 配置密码出现在接口响应中。
+- admin task id 限制为 ASCII URL-safe 字符，修复包含中文配置名时任务详情 URL 查询不稳定的问题。
+- `managed_project_sites` 默认要求 `admin_allowed_project_roots`，默认配置补充 `D:/AVEVA/Projects` 白名单；本地 APS smoke 通过 `/api/health`、站点身份、公开列表、admin 登录、registry 探活、任务创建与详情查询。
+
 ## 2026-04-26
 
 ### Added — 异地协同归档列表 API（本次提交）

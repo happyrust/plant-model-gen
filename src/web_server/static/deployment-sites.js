@@ -209,6 +209,22 @@ function deploymentSitesApp() {
             return params;
         },
 
+        adminHeaders() {
+            const headers = { 'Content-Type': 'application/json' };
+            const token = window.localStorage?.getItem('admin_token');
+            if (token) {
+                headers.Authorization = `Bearer ${token}`;
+            }
+            return headers;
+        },
+
+        unwrapEnvelope(data) {
+            if (data && typeof data === 'object' && Object.prototype.hasOwnProperty.call(data, 'data')) {
+                return data.data || {};
+            }
+            return data || {};
+        },
+
         async readJsonSafe(response) {
             const text = await response.text();
             if (!text) {
@@ -235,11 +251,13 @@ function deploymentSitesApp() {
             this.loading = true;
             const previousSelectedId = this.siteKey(this.selectedSite);
             try {
-                const response = await fetch(`/api/deployment-sites?${this.buildQueryParams().toString()}`);
+                const response = await fetch(`/api/admin/registry/sites?${this.buildQueryParams().toString()}`, {
+                    headers: this.adminHeaders(),
+                });
                 if (!response.ok) {
                     throw new Error(await this.extractError(response, '加载站点列表失败'));
                 }
-                const data = await this.readJsonSafe(response);
+                const data = this.unwrapEnvelope(await this.readJsonSafe(response));
                 this.sites = Array.isArray(data.items) ? data.items.map((site) => this.normalizeSite(site)) : [];
                 this.totalItems = Number(data.total || this.sites.length || 0);
                 this.totalPages = Number(data.pages || 1);
@@ -317,16 +335,16 @@ function deploymentSitesApp() {
             if (region.trim()) payload.region = region.trim();
 
             try {
-                const response = await fetch('/api/deployment-sites/import-dboption', {
+                const response = await fetch('/api/admin/registry/import-dboption', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: this.adminHeaders(),
                     body: JSON.stringify(payload),
                 });
                 if (!response.ok) {
                     throw new Error(await this.extractError(response, '导入站点失败'));
                 }
-                const data = await this.readJsonSafe(response);
-                const item = data?.item ? this.normalizeSite(data.item) : null;
+                const data = this.unwrapEnvelope(await this.readJsonSafe(response));
+                const item = data ? this.normalizeSite(data) : null;
                 await this.loadSites();
                 if (item) {
                     this.selectedSite = item;
@@ -345,11 +363,13 @@ function deploymentSitesApp() {
                 return;
             }
             try {
-                const response = await fetch(`/api/deployment-sites/${encodeURIComponent(siteId)}`);
+                const response = await fetch(`/api/admin/registry/sites/${encodeURIComponent(siteId)}`, {
+                    headers: this.adminHeaders(),
+                });
                 if (!response.ok) {
                     throw new Error(await this.extractError(response, '加载站点详情失败'));
                 }
-                const data = await this.readJsonSafe(response);
+                const data = this.unwrapEnvelope(await this.readJsonSafe(response));
                 this.selectedSite = this.normalizeSite(data);
             } catch (error) {
                 console.error('加载站点详情失败:', error);
@@ -373,19 +393,19 @@ function deploymentSitesApp() {
                 const payload = this.buildPayload();
                 const editingId = this.editingSiteId;
                 const url = editingId
-                    ? `/api/deployment-sites/${encodeURIComponent(editingId)}`
-                    : '/api/deployment-sites';
+                    ? `/api/admin/registry/sites/${encodeURIComponent(editingId)}`
+                    : '/api/admin/registry/sites';
                 const method = editingId ? 'PUT' : 'POST';
                 const response = await fetch(url, {
                     method,
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: this.adminHeaders(),
                     body: JSON.stringify(payload),
                 });
                 if (!response.ok) {
                     throw new Error(await this.extractError(response, editingId ? '更新站点失败' : '创建站点失败'));
                 }
-                const data = await this.readJsonSafe(response);
-                const item = data?.item ? this.normalizeSite(data.item) : null;
+                const data = this.unwrapEnvelope(await this.readJsonSafe(response));
+                const item = data ? this.normalizeSite(data) : null;
                 this.closeModal();
                 await this.loadSites();
                 if (item) {
@@ -409,8 +429,9 @@ function deploymentSitesApp() {
                 return;
             }
             try {
-                const response = await fetch(`/api/deployment-sites/${encodeURIComponent(siteId)}`, {
+                const response = await fetch(`/api/admin/registry/sites/${encodeURIComponent(siteId)}`, {
                     method: 'DELETE',
+                    headers: this.adminHeaders(),
                 });
                 if (!response.ok) {
                     if (response.status === 409) {
@@ -436,15 +457,15 @@ function deploymentSitesApp() {
                 return;
             }
             try {
-                const response = await fetch(`/api/deployment-sites/${encodeURIComponent(siteId)}/healthcheck`, {
+                const response = await fetch(`/api/admin/registry/sites/${encodeURIComponent(siteId)}/healthcheck`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: this.adminHeaders(),
                     body: JSON.stringify({}),
                 });
                 if (!response.ok) {
                     throw new Error(await this.extractError(response, '站点探活失败'));
                 }
-                const data = await this.readJsonSafe(response);
+                const data = this.unwrapEnvelope(await this.readJsonSafe(response));
                 await this.loadSites();
                 if (this.selectedSite && this.siteKey(this.selectedSite) === siteId) {
                     this.selectedSite = this.normalizeSite(data?.item || this.selectedSite);

@@ -13,6 +13,7 @@ sync_chunk_size = 10_0000
 
 # ====== 项目设置 ======
 project_path = "D:/AVEVA/Projects/E3D2.1"
+admin_allowed_project_roots = ["D:/AVEVA/Projects"]
 #project_path = "/Volumes/DPC/work/e3d_models"
 included_projects = ["AvevaMarineSample", "AvevaCatalogue", "SCB", "ZDJ"]
 # included_projects = ["AvevaMarineSample"]

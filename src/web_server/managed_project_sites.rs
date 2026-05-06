@@ -18,10 +18,10 @@ use std::process::Stdio;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use parse_pdms_db::parse::parse_file_basic_info;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 use sysinfo::{
     CpuRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System,
@@ -243,10 +243,19 @@ fn admin_allow_cargo_fallback() -> bool {
         .unwrap_or(false)
 }
 
+fn admin_allow_any_project_path() -> bool {
+    if let Ok(value) = std::env::var("AIOS_ADMIN_ALLOW_ANY_PROJECT_PATH") {
+        return matches!(value.trim(), "1" | "true" | "yes" | "on");
+    }
+    load_config_builder()
+        .and_then(|builder| builder.get_bool("admin_allow_any_project_path").ok())
+        .unwrap_or(false)
+}
+
 /// 规范化并校验 `project_path`：
 /// - 绝对化 + `canonicalize`（解符号链接）；
 /// - 若配置了白名单，拒绝不在白名单下的路径；
-/// - 若未配置白名单，记录 warn 放行（保持向后兼容）。
+/// - 若未配置白名单，仅在显式开启兼容开关时放行。
 fn canonical_project_path(raw: &str) -> Result<PathBuf> {
     let path = PathBuf::from(raw);
     if path.as_os_str().is_empty() {
@@ -256,8 +265,14 @@ fn canonical_project_path(raw: &str) -> Result<PathBuf> {
         .with_context(|| format!("项目路径无法访问或不存在: {}", path.display()))?;
     let roots = admin_allowed_project_roots();
     if roots.is_empty() {
+        if !admin_allow_any_project_path() {
+            bail!(
+                "未配置 admin_allowed_project_roots，拒绝 project_path={}；如需兼容旧行为，请显式设置 AIOS_ADMIN_ALLOW_ANY_PROJECT_PATH=1",
+                canonical.display()
+            );
+        }
         tracing::warn!(
-            "未配置 admin_allowed_project_roots，放行 project_path={}（生产环境请配置白名单）",
+            "未配置 admin_allowed_project_roots，因显式兼容开关放行 project_path={}（生产环境请配置白名单）",
             canonical.display()
         );
         return Ok(canonical);
@@ -1119,11 +1134,17 @@ fn build_site_config(
     set_toml_string(surrealdb, "mode", "ws");
     set_toml_string(surrealdb, "ip", "127.0.0.1");
     set_toml_integer(surrealdb, "port", site.db_port as i64);
-    set_toml_string(surrealdb, "path", site.db_data_path.clone());
+    set_toml_string(surrealdb, "user", db_user.to_string());
+    set_toml_string(surrealdb, "password", db_password.to_string());
+    set_toml_string(surrealdb, "path", site.db_data_path.replace('\\', "/"));
 
     let surrealkv = ensure_table(table, "surrealkv");
     set_toml_bool(surrealkv, "enabled", false);
-    set_toml_string(surrealkv, "path", format!("{}.kv", site.db_data_path));
+    set_toml_string(
+        surrealkv,
+        "path",
+        format!("{}.kv", site.db_data_path.replace('\\', "/")),
+    );
 
     Ok(toml::to_string_pretty(&value)?)
 }
@@ -3898,7 +3919,13 @@ fn read_tail_with_total(path: &Path, limit: usize) -> (usize, Vec<String>) {
 fn sanitize_site_id_for_path(site_id: &str) -> String {
     site_id
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 

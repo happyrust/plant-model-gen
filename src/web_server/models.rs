@@ -1653,12 +1653,14 @@ impl TaskInfo {
         let counter = TASK_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
         let site_part = site_name
             .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .map(|c| c.to_ascii_lowercase())
             .take(20)
             .collect::<String>();
         let task_part = task_name
             .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .map(|c| c.to_ascii_lowercase())
             .take(20)
             .collect::<String>();
 

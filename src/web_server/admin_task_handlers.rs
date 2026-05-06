@@ -9,6 +9,8 @@ use axum::{
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use rusqlite::Row;
+use serde::Serialize;
+use serde_json::Value;
 use std::panic::AssertUnwindSafe;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -88,6 +90,37 @@ pub fn insert_task(task: TaskInfo) {
     let _ = save_task(&task, site_id.as_deref());
 }
 
+pub fn create_and_dispatch_site_task(
+    site_id: String,
+    task_name: String,
+    task_type: TaskType,
+    priority: TaskPriority,
+    config: DatabaseConfig,
+) -> Result<TaskInfo, String> {
+    if !is_supported_admin_task_type(&task_type) {
+        return Err("当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration".to_string());
+    }
+
+    let site_id = normalize_site_id(Some(site_id))
+        .ok_or_else(|| "创建 admin 任务必须指定 site_id".to_string())?;
+    let mut task = TaskInfo::new_with_priority(task_name, task_type, config, priority);
+    task.site_id = Some(site_id.clone());
+    mark_task_running(&mut task, ADMIN_TASK_SUBMITTED_STEP, 10.0);
+
+    save_task(&task, Some(site_id.as_str())).map_err(|e| format!("保存任务失败: {e}"))?;
+    let task_id = task.id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = AssertUnwindSafe(dispatch_admin_task(task_id.clone()))
+            .catch_unwind()
+            .await
+        {
+            eprintln!("❌ dispatch_admin_task({task_id}) panicked: {e:?}");
+        }
+    });
+
+    Ok(task)
+}
+
 pub fn create_admin_task_routes() -> Router {
     if let Err(e) = ensure_admin_tasks_table() {
         eprintln!("⚠️ Failed to init admin_tasks table: {e}");
@@ -103,14 +136,14 @@ pub fn create_admin_task_routes() -> Router {
 
 async fn list_tasks() -> impl IntoResponse {
     match load_all_tasks() {
-        Ok(tasks) => admin_response::ok("获取任务列表成功", tasks),
+        Ok(tasks) => admin_response::ok("获取任务列表成功", redact_task_response(tasks)),
         Err(e) => admin_response::server_error(format!("读取任务列表失败: {e}")),
     }
 }
 
 async fn get_task(Path(task_id): Path<String>) -> impl IntoResponse {
     match load_task_by_id(&task_id) {
-        Ok(Some(task)) => admin_response::ok("获取任务详情成功", task),
+        Ok(Some(task)) => admin_response::ok("获取任务详情成功", redact_task_response(task)),
         Ok(None) => admin_response::not_found(format!("任务不存在: {task_id}")),
         Err(e) => admin_response::server_error(format!("读取任务失败: {e}")),
     }
@@ -163,7 +196,12 @@ async fn create_task(Json(payload): Json<CreateTaskRequest>) -> impl IntoRespons
                     eprintln!("❌ dispatch_admin_task({task_id}) panicked: {e:?}");
                 }
             });
-            admin_response::response(StatusCode::CREATED, true, "创建任务成功", Some(task))
+            admin_response::response(
+                StatusCode::CREATED,
+                true,
+                "创建任务成功",
+                Some(redact_task_response(task)),
+            )
         }
         Err(e) => admin_response::server_error(format!("保存任务失败: {e}")),
     }
@@ -207,7 +245,7 @@ async fn retry_task(Path(task_id): Path<String>) -> impl IntoResponse {
                         StatusCode::CREATED,
                         true,
                         "重试任务成功",
-                        Some(retried),
+                        Some(redact_task_response(retried)),
                     )
                 }
                 Err(e) => admin_response::server_error(format!("保存重试任务失败: {e}")),
@@ -254,6 +292,35 @@ fn apply_config_overrides(config: &mut DatabaseConfig, overrides: &serde_json::V
         if let Some(v) = obj.get("export_parquet").and_then(|v| v.as_bool()) {
             config.export_parquet = v;
         }
+    }
+}
+
+fn redact_task_response<T: Serialize>(value: T) -> Value {
+    let mut value = serde_json::to_value(value).unwrap_or(Value::Null);
+    redact_secret_fields(&mut value);
+    value
+}
+
+fn redact_secret_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, nested) in object.iter_mut() {
+                if matches!(
+                    key.as_str(),
+                    "db_password" | "password" | "surreal_password"
+                ) {
+                    *nested = Value::String("********".to_string());
+                } else {
+                    redact_secret_fields(nested);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_secret_fields(item);
+            }
+        }
+        _ => {}
     }
 }
 

@@ -24,6 +24,7 @@ use glam::Vec3;
 use itertools::Itertools;
 use parry3d::bounding_volume::BoundingVolume;
 use pdms_io::watch::PdmsWatcher;
+#[cfg(feature = "mqtt")]
 use rumqttc::AsyncClient;
 #[cfg(feature = "sql")]
 use sqlx::{MySql, Pool, Row};
@@ -51,6 +52,7 @@ pub struct AiosDBManager {
 
     pub watcher: Arc<PdmsWatcher>,
 
+    #[cfg(feature = "mqtt")]
     pub mqtt_client: Arc<AsyncClient>,
 
     ///所有元素的tree

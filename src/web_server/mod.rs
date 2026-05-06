@@ -45,6 +45,7 @@ pub mod litefs_handlers;
 pub mod model_runtime;
 pub mod mqtt_monitor_handlers;
 pub mod output_instances_files;
+#[cfg(feature = "parquet-export")]
 pub mod parquet_compact_worker;
 pub mod remote_runtime;
 pub mod remote_sync_handlers;
@@ -370,15 +371,17 @@ pub async fn start_web_server_with_config(
         }
     }
 
-    // 启动 Parquet compact worker
-    let compact_worker_config = parquet_compact_worker::CompactWorkerConfig {
-        scan_interval_secs: 30,
-        min_incremental_count: 50,
-        output_dir: "output".to_string(),
-    };
-    let _compact_worker_handle =
-        parquet_compact_worker::start_compact_worker(compact_worker_config);
-    println!("🔄 Parquet compact worker 已启动 (每 30 秒扫描一次)");
+    #[cfg(feature = "parquet-export")]
+    {
+        let compact_worker_config = parquet_compact_worker::CompactWorkerConfig {
+            scan_interval_secs: 30,
+            min_incremental_count: 50,
+            output_dir: "output".to_string(),
+        };
+        let _compact_worker_handle =
+            parquet_compact_worker::start_compact_worker(compact_worker_config);
+        println!("🔄 Parquet compact worker 已启动 (每 30 秒扫描一次)");
+    }
     model_runtime::ensure_runtime_started();
     println!("🔄 Model runtime worker 已启动");
 
@@ -1292,7 +1295,9 @@ pub async fn start_web_server_with_config(
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.await;
-            println!("📴 收到 graceful shutdown 信号，停止接受新请求；in-flight 请求处理完成后进程退出");
+            println!(
+                "📴 收到 graceful shutdown 信号，停止接受新请求；in-flight 请求处理完成后进程退出"
+            );
         })
         .await;
     heartbeat_handle.abort();

@@ -1894,7 +1894,7 @@ pub async fn sqlite_spatial_page() -> Result<Html<String>, StatusCode> {
 
 /// SQLite 空间索引 – 重建API
 pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, StatusCode> {
-    #[cfg(feature = "sqlite-index")]
+    #[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
     {
         use crate::fast_model::export_model::export_dbnum_instances_parquet::query_distinct_dbnums_from_inst_relate;
         use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_dbnos;
@@ -2002,10 +2002,10 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
             "elapsed_ms": elapsed.as_millis(),
         })))
     }
-    #[cfg(not(feature = "sqlite-index"))]
+    #[cfg(not(all(feature = "sqlite-index", feature = "parquet-export")))]
     {
         Ok(Json(
-            json!({"success": false, "error": "编译未启用 sqlite-index 特性"}),
+            json!({"success": false, "error": "编译未启用 sqlite-index 或 parquet-export 特性"}),
         ))
     }
 }
@@ -8936,52 +8936,69 @@ pub async fn api_show_by_refno(
 
             info!("[ShowByRefno] 模型生成完成，开始导出增量 Parquet");
 
-            // 6. 导出 Parquet (增量)
-            let mesh_dir = aios_core::get_db_option().get_meshes_path();
+            #[cfg(not(feature = "parquet-export"))]
+            {
+                let _ = generation_refnos;
+                return Err((
+                    StatusCode::NOT_IMPLEMENTED,
+                    "parquet-export feature 未启用，无法导出 Parquet".to_string(),
+                ));
+            }
 
-            // 生成临时任务 ID 用于导出路径隔离
-            let temp_task_id = format!("temp_{}", Uuid::new_v4().simple());
-            let bundle_output_dir =
-                std::path::PathBuf::from(format!("output/temp-models/{}", temp_task_id));
+            #[cfg(feature = "parquet-export")]
+            {
+                // 6. 导出 Parquet (增量)
+                let mesh_dir = aios_core::get_db_option().get_meshes_path();
 
-            let bundle_result = crate::web_server::instance_export::export_model_bundle_with_dbno(
-                &generation_refnos,
-                &temp_task_id,
-                &bundle_output_dir,
-                &mesh_dir,
-                Some(dbno),
-            )
-            .await;
+                // 生成临时任务 ID 用于导出路径隔离
+                let temp_task_id = format!("temp_{}", Uuid::new_v4().simple());
+                let bundle_output_dir =
+                    std::path::PathBuf::from(format!("output/temp-models/{}", temp_task_id));
 
-            match bundle_result {
-                Ok(_path) => {
-                    info!("[ShowByRefno] 增量 Parquet 导出成功，dbno: {}", dbno);
+                let bundle_result =
+                    crate::web_server::instance_export::export_model_bundle_with_dbno(
+                        &generation_refnos,
+                        &temp_task_id,
+                        &bundle_output_dir,
+                        &mesh_dir,
+                        Some(dbno),
+                    )
+                    .await;
 
-                    // 获取最新文件列表
-                    let pm = crate::fast_model::export_model::parquet_writer::ParquetManager::new(
-                        "assets",
-                    );
-                    let files = pm.list_parquet_files(dbno, None).unwrap_or_default();
+                match bundle_result {
+                    Ok(_path) => {
+                        info!("[ShowByRefno] 增量 Parquet 导出成功，dbno: {}", dbno);
 
-                    Ok(Json(ShowByRefnoResponse {
-                        success: true,
-                        bundle_url: Some(format!("/files/output/temp-models/{}/", temp_task_id)),
-                        message: format!("{} 个模型生成成功", parsed_refnos.len()),
-                        metadata: Some(serde_json::json!({
-                            "refno_count": parsed_refnos.len(),
-                            "generation_refno_count": generation_refnos.len(),
-                            "dbno": dbno,
-                            "temp_id": temp_task_id
-                        })),
-                        parquet_files: Some(files),
-                    }))
-                }
-                Err(e) => {
-                    error!("[ShowByRefno] Parquet 导出失败: {}", e);
-                    Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("模型生成成功但导出失败: {}", e),
-                    ))
+                        // 获取最新文件列表
+                        let pm =
+                            crate::fast_model::export_model::parquet_writer::ParquetManager::new(
+                                "assets",
+                            );
+                        let files = pm.list_parquet_files(dbno, None).unwrap_or_default();
+
+                        Ok(Json(ShowByRefnoResponse {
+                            success: true,
+                            bundle_url: Some(format!(
+                                "/files/output/temp-models/{}/",
+                                temp_task_id
+                            )),
+                            message: format!("{} 个模型生成成功", parsed_refnos.len()),
+                            metadata: Some(serde_json::json!({
+                                "refno_count": parsed_refnos.len(),
+                                "generation_refno_count": generation_refnos.len(),
+                                "dbno": dbno,
+                                "temp_id": temp_task_id
+                            })),
+                            parquet_files: Some(files),
+                        }))
+                    }
+                    Err(e) => {
+                        error!("[ShowByRefno] Parquet 导出失败: {}", e);
+                        Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("模型生成成功但导出失败: {}", e),
+                        ))
+                    }
                 }
             }
         }
@@ -9004,6 +9021,7 @@ pub struct ListFilesQuery {
     pub file_type: Option<String>,
 }
 
+#[cfg(feature = "parquet-export")]
 pub async fn api_list_parquet_files(
     Path(dbno): Path<u32>,
     Query(query): Query<ListFilesQuery>,
@@ -9019,6 +9037,17 @@ pub async fn api_list_parquet_files(
             format!("获取文件列表失败: {}", e),
         )),
     }
+}
+
+#[cfg(not(feature = "parquet-export"))]
+pub async fn api_list_parquet_files(
+    Path(_dbno): Path<u32>,
+    Query(_query): Query<ListFilesQuery>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        "parquet-export feature 未启用".to_string(),
+    ))
 }
 
 /// Scene Tree 文件响应

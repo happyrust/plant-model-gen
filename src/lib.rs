@@ -161,6 +161,7 @@ pub mod scene_tree;
 
 pub mod versioned_db;
 
+#[cfg(feature = "mqtt")]
 pub mod mqtt_service;
 
 pub mod options;

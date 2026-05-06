@@ -25,7 +25,9 @@ use pdms_io::sync::clone::{CloneOptions, execute_clone};
 // use pdms_io::sync::clone::{execute_clone, CloneOptions};
 use pdms_io::watch::PdmsWatcher;
 use rayon::prelude::*;
+#[cfg(feature = "mqtt")]
 use rumqttc::Event::Incoming;
+#[cfg(feature = "mqtt")]
 use rumqttc::{Packet, QoS};
 #[cfg(feature = "sql")]
 use sqlx::pool::PoolOptions;
@@ -37,6 +39,7 @@ use crate::consts::*;
 use crate::data_interface::interface::PdmsDataInterface;
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::defines::CACHED_MDB_SITE_MAP;
+#[cfg(feature = "mqtt")]
 use crate::mqtt_service::{SyncE3dFileMsg, new_mqtt_inst};
 
 pub const TUBI_TOL: f32 = 1.0f32;
@@ -155,6 +158,7 @@ impl AiosDBManager {
         Ok(f.await?)
     }
 
+    #[cfg(feature = "mqtt")]
     pub async fn demo_mqtt_requests() {
         let mut mqtt_inst = new_mqtt_inst("test-1");
         let client = mqtt_inst.client.clone();
@@ -440,14 +444,15 @@ impl AiosDBManager {
             dbg!(watcher.headers.len());
             dbg!(watcher.file_name_full_path_map.len());
         }
-        let mut mqtt_inst = new_mqtt_inst(&format!(
-            "{}-{}-pub",
-            db_option.location.as_str(),
-            db_option.project_code
-        ));
-        let mqtt_client = Arc::new(mqtt_inst.client);
         #[cfg(feature = "mqtt")]
-        tokio::task::spawn(async move {
+        let mqtt_client = {
+            let mut mqtt_inst = new_mqtt_inst(&format!(
+                "{}-{}-pub",
+                db_option.location.as_str(),
+                db_option.project_code
+            ));
+            let mqtt_client = Arc::new(mqtt_inst.client);
+            tokio::task::spawn(async move {
             loop {
                 let event = mqtt_inst.el.poll().await;
                 match event {
@@ -490,6 +495,8 @@ impl AiosDBManager {
                 }
             }
         });
+            mqtt_client
+        };
         let mut mgr = AiosDBManager {
             #[cfg(feature = "sql")]
             project_map,
@@ -498,6 +505,7 @@ impl AiosDBManager {
             project_path: dir,
             db_option: db_option.clone(),
             watcher: Arc::new(watcher),
+            #[cfg(feature = "mqtt")]
             mqtt_client,
             rtree: None,
         };

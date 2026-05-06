@@ -1,5 +1,6 @@
 pub mod collision_api;
 pub mod e3d_tree_api;
+#[cfg(feature = "mbd-pipe")]
 pub mod mbd_pipe_api;
 pub mod noun_hierarchy_api;
 pub mod pdms_attr_api;
@@ -15,10 +16,15 @@ pub mod version_api;
 
 pub use collision_api::{CollisionApiState, create_collision_routes};
 pub use e3d_tree_api::{E3dTreeApiState, create_e3d_tree_routes};
+#[cfg(feature = "mbd-pipe")]
 pub use mbd_pipe_api::{
     MbdExportScope, MbdExportStats, create_mbd_pipe_routes, export_mbd_json_batch,
     generate_mbd_data, get_mbd_output_dir,
 };
+#[cfg(all(feature = "web_server", not(feature = "mbd-pipe")))]
+pub fn create_mbd_pipe_routes() -> axum::Router {
+    axum::Router::new()
+}
 pub use noun_hierarchy_api::{NounHierarchyApiState, create_noun_hierarchy_routes};
 pub use pdms_attr_api::create_pdms_attr_routes;
 pub use pdms_model_query_api::create_pdms_model_query_routes;
@@ -152,6 +158,7 @@ pub fn stateless_web_api_route_paths() -> Vec<&'static str> {
         "POST   /api/review/comments",
         "GET    /api/review/comments/by-annotation/{annotation_id}",
         "DELETE /api/review/comments/item/{comment_id}",
+        "PATCH  /api/review/annotations/{annotation_id}",
         "PATCH  /api/review/annotations/{annotation_id}/severity",
         // review_api — attachments
         "POST   /api/review/attachments",
@@ -172,6 +179,7 @@ pub fn stateless_web_api_route_paths() -> Vec<&'static str> {
         "GET    /api/scene-tree/{refno}/ancestors",
         // mbd_pipe_api
         "GET    /api/mbd/pipe/{refno}",
+        "GET    /api/mbd/v2/pipe/{refno}",
         "POST   /api/mbd/generate",
         // pipeline_annotation_api (nested under /api/pipeline)
         "GET    /api/pipeline/annotation/{refno}",

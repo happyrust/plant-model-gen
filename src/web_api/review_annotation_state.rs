@@ -132,22 +132,6 @@ pub fn create_annotation_state_routes() -> Router {
         request: Request,
         next: middleware::Next,
     ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-        let db_option = aios_core::get_db_option();
-        if let Err(error) = aios_core::use_ns_db_compat(
-            &aios_core::SUL_DB,
-            &db_option.surreal_ns,
-            &db_option.project_name,
-        )
-        .await
-        {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "code": 500,
-                    "message": format!("数据库上下文切换失败: {}", error),
-                })),
-            ));
-        }
         if let Err(error) = ensure_review_primary_db_context().await {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,

@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Result, anyhow};
 use once_cell::sync::OnceCell;
 use surrealdb::Surreal;
@@ -7,6 +9,7 @@ use surrealdb::opt::auth::Root;
 use aios_core::options::{DbConnMode, DbOption};
 
 static REVIEW_PRIMARY_DB: OnceCell<Surreal<Client>> = OnceCell::new();
+static REVIEW_DB_CONTEXT_SET: AtomicBool = AtomicBool::new(false);
 
 pub async fn init_review_primary_db(db_option: &DbOption) -> Result<()> {
     if REVIEW_PRIMARY_DB.get().is_some() {
@@ -40,12 +43,18 @@ pub async fn init_review_primary_db(db_option: &DbOption) -> Result<()> {
     aios_core::use_ns_db_compat(&db, &db_option.surreal_ns, &db_option.project_name).await?;
 
     let _ = REVIEW_PRIMARY_DB.set(db);
+    REVIEW_DB_CONTEXT_SET.store(true, Ordering::Release);
     Ok(())
 }
 
 pub async fn ensure_review_primary_db_context() -> Result<()> {
     if REVIEW_PRIMARY_DB.get().is_none() {
         init_review_primary_db(&aios_core::get_db_option()).await?;
+        return Ok(());
+    }
+
+    if REVIEW_DB_CONTEXT_SET.load(Ordering::Acquire) {
+        return Ok(());
     }
 
     let db_option = aios_core::get_db_option();
@@ -56,7 +65,12 @@ pub async fn ensure_review_primary_db_context() -> Result<()> {
     )
     .await?;
 
+    REVIEW_DB_CONTEXT_SET.store(true, Ordering::Release);
     Ok(())
+}
+
+pub fn reset_review_db_context_flag() {
+    REVIEW_DB_CONTEXT_SET.store(false, Ordering::Release);
 }
 
 pub fn review_primary_db() -> &'static Surreal<Client> {

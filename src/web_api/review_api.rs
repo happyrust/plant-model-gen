@@ -30,6 +30,7 @@ use crate::web_api::review_annotation_state::sync_annotation_states_from_snapsho
 use crate::web_api::review_db::review_primary_db;
 use axum::extract::Extension;
 use std::collections::HashSet;
+use tokio::time::{Duration, timeout};
 
 // ============================================================================
 // Request/Response Types
@@ -1091,27 +1092,8 @@ pub fn create_review_api_routes() -> Router {
         request: Request,
         next: axum::middleware::Next,
     ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-        let db_option = aios_core::get_db_option();
-        if let Err(error) = aios_core::use_ns_db_compat(
-            &aios_core::SUL_DB,
-            &db_option.surreal_ns,
-            &db_option.project_name,
-        )
-        .await
-        {
-            warn!(
-                "review api db context ensure failed: ns={}, db={}, error={}",
-                db_option.surreal_ns, db_option.project_name, error
-            );
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "code": 500,
-                    "message": format!("数据库上下文切换失败: {}", error),
-                })),
-            ));
-        }
         if let Err(error) = crate::web_api::review_db::ensure_review_primary_db_context().await {
+            let db_option = aios_core::get_db_option();
             warn!(
                 "review api primary db context ensure failed: ns={}, db={}, error={}",
                 db_option.surreal_ns, db_option.project_name, error
@@ -1293,33 +1275,55 @@ async fn create_task(
                 if refno.is_empty() || !seen_refnos.insert(refno.to_string()) {
                     continue;
                 }
-                let _ = review_primary_db()
-                    .query(
-                        r#"
-                        CREATE ONLY review_form_model SET
-                            form_id = $form_id,
-                            model_refno = $model_refno,
-                            created_at = time::now()
-                        "#,
-                    )
-                    .bind(("form_id", form_id.clone()))
-                    .bind(("model_refno", refno.to_string()))
-                    .await;
+                match timeout(
+                    Duration::from_secs(2),
+                    review_primary_db()
+                        .query(
+                            r#"
+                            CREATE ONLY review_form_model SET
+                                form_id = $form_id,
+                                model_refno = $model_refno,
+                                created_at = time::now()
+                            "#,
+                        )
+                        .bind(("form_id", form_id.clone()))
+                        .bind(("model_refno", refno.to_string())),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => warn!(
+                        "Failed to backfill review_form_model after create_task, form_id={}, refno={}: {}",
+                        form_id, refno, error
+                    ),
+                    Err(_) => warn!(
+                        "Timed out backfilling review_form_model after create_task, form_id={}, refno={}",
+                        form_id, refno
+                    ),
+                }
             }
 
-            if let Err(error) = sync_review_form_with_task_status(
-                form_id.as_str(),
-                Some(request.model_name.as_str()),
-                Some(requester_id.as_str()),
-                "create_task_backfill",
-                "draft",
+            match timeout(
+                Duration::from_secs(2),
+                sync_review_form_with_task_status(
+                    form_id.as_str(),
+                    Some(request.model_name.as_str()),
+                    Some(requester_id.as_str()),
+                    "create_task_backfill",
+                    "draft",
+                ),
             )
             .await
             {
-                warn!(
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(
                     "Failed to sync review_forms after create_task, form_id={}: {}",
                     form_id, error
-                );
+                ),
+                Err(_) => warn!(
+                    "Timed out syncing review_forms after create_task, form_id={}",
+                    form_id
+                ),
             }
 
             let task = ReviewTask {

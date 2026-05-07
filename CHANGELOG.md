@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-05-08
+
+### Added — RUS-239 驳回任务批量重新流转 API
+
+> 解决设计人员驳回任务长期卡在 sj/draft 无法重新流转的问题（21 条历史遗留任务）。
+
+- 新增 `GET /api/review/tasks/returned`：查询所有处于 `current_node=sj, status=draft` 的驳回任务列表，返回 task_id、form_id、title、return_reason 等关键字段。
+- 新增 `POST /api/review/tasks/batch-reactivate`：批量将驳回任务从 `sj/draft` 推进到 `jd/submitted`，支持指定目标校核人 `target_checker_id` / `target_checker_name`，仅更新满足 `current_node=sj AND status=draft` 条件的任务。
+- 两个端点均走 review auth 中间件保护，遵循现有 JWT 认证链路。
+- 关联 Linear Issue：RUS-239（驳回后重新流转）。
+
 ## 2026-04-26
 
 ### Added — 异地协同归档列表 API（本次提交）

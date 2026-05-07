@@ -1647,6 +1647,19 @@ async fn query_annotation_comments(
     Ok(comments)
 }
 
+/// 当 `review_tasks` 因数据问题对同一 form_id 出现多条记录时，从 `records`（已按
+/// `confirmed_at DESC` 排序）中取最近一条非空的 `task_id` 作为「记录主导任务」。
+///
+/// 调用方用这个值把响应里的 `data.task_id` 对齐到真正承载批注血缘的那条任务，
+/// 避免出现 `data.task_id != records[].task_id` 的不自洽响应。
+fn dominant_records_task_id(records: &[WorkflowRecord]) -> Option<String> {
+    records
+        .iter()
+        .map(|record| record.task_id.trim())
+        .find(|task_id| !task_id.is_empty())
+        .map(str::to_string)
+}
+
 async fn query_workflow_data(
     form_id: &str,
     next_step: Option<String>,
@@ -1655,16 +1668,37 @@ async fn query_workflow_data(
     let attachments = query_workflow_attachments(form_id).await?;
     let review_form = get_review_form_by_form_id(form_id).await?;
     let task = find_task_by_form_id(form_id).await?;
-    let task_id = task.as_ref().map(|t| t.id.clone());
+    let active_task_id = task.as_ref().map(|t| t.id.clone());
     let records = {
         let by_form = query_workflow_records_by_form_id(form_id).await?;
         if !by_form.is_empty() {
             by_form
-        } else if let Some(task_id) = task_id.as_deref() {
+        } else if let Some(task_id) = active_task_id.as_deref() {
             query_workflow_records_by_task_id(task_id).await?
         } else {
             Vec::new()
         }
+    };
+    // 对齐 data.task_id 与 records 血缘：当 review_tasks 出现 form_id 维度的重复
+    // （例如返工后重新建空任务），active task 与 records 真实承载者会分裂。
+    // 这里以 records 为准，保证响应自洽；保留 current_node / task_status 仍来自
+    // active task —— 它描述的是当前 form 在工作流里的位置，不应被旧任务覆盖。
+    let task_id = match (dominant_records_task_id(&records), active_task_id.clone()) {
+        (Some(records_dominant), Some(active)) if records_dominant != active => {
+            warn!(
+                "[WORKFLOW_SYNC] form_id={} 检测到 review_tasks 重复：active={}, records 主导任务={}; 响应 data.task_id 对齐 records 主导任务以保持血缘自洽。建议数据治理：合并/删除空任务 active",
+                form_id, active, records_dominant
+            );
+            Some(records_dominant)
+        }
+        (Some(records_dominant), None) => {
+            warn!(
+                "[WORKFLOW_SYNC] form_id={} 无 active review_task 但 review_records 有数据 (主导任务={}); 响应 data.task_id 回填到 records 主导任务",
+                form_id, records_dominant
+            );
+            Some(records_dominant)
+        }
+        _ => active_task_id.clone(),
     };
     let mut annotation_ids = BTreeSet::new();
     for record in &records {
@@ -1715,4 +1749,61 @@ async fn query_workflow_data(
         next_step,
         annotation_states,
     })
+}
+
+#[cfg(test)]
+mod dominant_records_task_id_tests {
+    use super::{WorkflowRecord, dominant_records_task_id};
+
+    fn record_with_task_id(task_id: &str) -> WorkflowRecord {
+        WorkflowRecord {
+            id: format!("rec-{}", task_id),
+            task_id: task_id.to_string(),
+            r#type: "batch".to_string(),
+            annotations: Vec::new(),
+            cloud_annotations: Vec::new(),
+            rect_annotations: Vec::new(),
+            obb_annotations: Vec::new(),
+            measurements: Vec::new(),
+            note: String::new(),
+            confirmed_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn returns_none_for_empty() {
+        assert_eq!(dominant_records_task_id(&[]), None);
+    }
+
+    #[test]
+    fn picks_first_non_empty_in_desc_order() {
+        // Records are ORDER BY confirmed_at DESC, so head 是最近确认的批注。
+        let records = vec![
+            record_with_task_id("task-c3f25"),
+            record_with_task_id("task-c3f25"),
+        ];
+        assert_eq!(
+            dominant_records_task_id(&records),
+            Some("task-c3f25".to_string())
+        );
+    }
+
+    #[test]
+    fn skips_empty_task_id_rows() {
+        // 兜底场景：旧数据行 task_id 为空，应跳过到下一条。
+        let records = vec![
+            record_with_task_id("   "),
+            record_with_task_id("task-real"),
+        ];
+        assert_eq!(
+            dominant_records_task_id(&records),
+            Some("task-real".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_when_all_empty() {
+        let records = vec![record_with_task_id(""), record_with_task_id("  ")];
+        assert_eq!(dominant_records_task_id(&records), None);
+    }
 }

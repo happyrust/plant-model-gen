@@ -1151,9 +1151,9 @@ async fn gen_cata_geos_inner(
 
     let is_bran = branch_map.len() > 0;
 
-    // use_surrealdb=false 时：不应构造/写入 inst_* / tubi_relate 等 SurrealDB 侧输出（仅走 foyer cache）。
-
-    let enable_surreal_outputs = db_option.use_surrealdb;
+    // drain-only 压测只消费 ShapeInstancesData，不应在 CATA 生成阶段直接写 tubi_relate 依赖表。
+    let enable_surreal_outputs =
+        db_option.use_surrealdb && db_option.model_writer_mode.writes_to_surreal();
 
     // tubi_info 收集容器: 组合键 "{cata_hash}_{arrive}_{leave}" -> TubiInfoData
 

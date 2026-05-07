@@ -21,6 +21,7 @@ use std::time::Instant;
 use crate::data_interface::db_meta_manager::db_meta;
 use crate::fast_model::gen_model::boolean_task::{BooleanTask, BooleanTaskAccumulator};
 use crate::fast_model::gen_model::manifold_bool::run_bool_worker_from_tasks;
+use crate::fast_model::gen_model::model_writer::run_drain_only_sink;
 use crate::fast_model::gen_model::mesh_state::{flush_aabb_cache, use_file_mesh_state};
 use crate::fast_model::mesh_generate::{
     MeshResult, query_existing_meshed_inst_geo_ids, run_boolean_worker,
@@ -29,7 +30,7 @@ use crate::fast_model::pdms_inst::{
     build_inst_relate_aabb_rows, reconcile_missing_neg_relate, save_inst_relate_aabb_rows,
     save_instance_data_with_report,
 };
-use crate::options::{BooleanPipelineMode, DbOptionExt, MeshFormat};
+use crate::options::{BooleanPipelineMode, DbOptionExt, MeshFormat, ModelWriterMode};
 use dashmap::DashMap;
 use flume::{Receiver, Sender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -975,9 +976,19 @@ pub async fn gen_all_geos_data(
         db_option.get_index_tree_concurrency(),
         db_option.get_index_tree_batch_size()
     );
+    db_option
+        .validate_model_writer_features()
+        .map_err(IndexTreeError::Other)?;
+    println!(
+        "[gen_model] 模型写入后端: {}",
+        db_option.model_writer_mode.as_str()
+    );
 
     // ✅ SurrealDB 写入侧初始化：仅在 use_surrealdb=true 时需要。
-    if db_option.use_surrealdb && !db_option.defer_db_write {
+    if db_option.use_surrealdb
+        && !db_option.defer_db_write
+        && db_option.model_writer_mode.writes_to_surreal()
+    {
         if let Err(e) = aios_core::rs_surreal::inst::init_model_tables().await {
             eprintln!("[gen_model] ❌ 初始化 inst_relate 表结构失败: {}", e);
 
@@ -1133,6 +1144,40 @@ async fn process_index_tree_generation(
     let _replace_exist_deprecated = false; // replace_exist 已废弃，由 pre_cleanup_for_regen 替代
     let use_surrealdb = db_option.use_surrealdb;
     let defer_db_write = false;
+
+    if db_option.model_writer_mode == ModelWriterMode::DrainOnly {
+        println!(
+            "[model-writer:drain-only] 启动压测消费端：生成 batch 真实运行，但跳过 SurrealDB 写入、mesh stage、AABB 回写和 boolean"
+        );
+        let drain_handle = tokio::spawn(run_drain_only_sink(receiver));
+        println!("⏳ [1/2] 几何体生成 (BRAN/HANG + LOOP/CATE/PRIM)...");
+        let _categorized = gen_index_tree_geos_optimized(
+            Arc::new(db_option.clone()),
+            &config,
+            sender.clone(),
+            seed_roots,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("IndexTree 生成失败: {}", e))?;
+        println!(
+            "✅ [1/2] 几何体生成完成, 用时 {}ms",
+            full_start.elapsed().as_millis()
+        );
+        println!("⏳ [2/2] drain-only 消费剩余 batch...");
+        drop(sender);
+        let drain_stats = drain_handle
+            .await
+            .map_err(|e| anyhow::anyhow!("drain-only sink 任务异常退出: {}", e))?
+            .map_err(IndexTreeError::Other)?;
+        drain_stats.print_summary();
+        println!(
+            "✅ [2/2] drain-only 完成, 总用时 {}ms",
+            full_start.elapsed().as_millis()
+        );
+        perf.mark("drain_only_complete");
+        perf.end_current();
+        return Ok(GenModelResult { success: true });
+    }
 
     // Mesh 生成：生产端只产出 inst batch，mesh/持久化在下游并行阶段完成
     let gen_mesh = db_option.inner.gen_mesh;
@@ -1587,6 +1632,42 @@ async fn process_index_tree_generation(
             .await
             {
                 eprintln!("[instances] IndexTree 导出失败: {}", e);
+            }
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+    {
+        if db_option.inner.enable_sqlite_rtree {
+            let mut sqlite_dbnums: Vec<u32> =
+                if let Some(nums) = db_option.inner.manual_db_nums.clone() {
+                    nums
+                } else {
+                    touched_dbnums_vec.clone()
+                };
+            if let Some(exclude_nums) = &db_option.inner.exclude_db_nums {
+                let exclude: HashSet<u32> = exclude_nums.iter().copied().collect();
+                sqlite_dbnums.retain(|dbnum| !exclude.contains(dbnum));
+            }
+            sqlite_dbnums.sort_unstable();
+            sqlite_dbnums.dedup();
+
+            if sqlite_dbnums.is_empty() {
+                println!("[sqlite-index] 跳过刷新：本轮未触达 dbnum");
+            } else {
+                println!(
+                    "[sqlite-index] 模型生成后刷新空间索引并聚合中间节点 AABB: dbnums={:?}",
+                    sqlite_dbnums
+                );
+                match crate::fast_model::room_model::refresh_sqlite_spatial_index_from_inst_relate_aabb(
+                    Some(&sqlite_dbnums),
+                    None,
+                )
+                .await
+                {
+                    Ok(count) => println!("[sqlite-index] 空间索引刷新完成: inserted={count}"),
+                    Err(err) => eprintln!("[sqlite-index] 空间索引刷新失败: {err:#}"),
+                }
             }
         }
     }

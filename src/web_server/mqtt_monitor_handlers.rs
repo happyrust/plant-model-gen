@@ -366,14 +366,17 @@ pub async fn check_offline_nodes(timeout_secs: i64) {
             "warn",
             "node_offline",
             Some(&loc),
-            format!("节点 {} 心跳超时 {}s（阈值 {}s）", loc, elapsed, timeout_secs),
+            format!(
+                "节点 {} 心跳超时 {}s（阈值 {}s）",
+                loc, elapsed, timeout_secs
+            ),
         )
         .await;
     }
 }
 
 /// API: 获取所有 MQTT 节点状态
-/// 
+///
 /// 对于从节点：只显示订阅的主节点信息，不显示自己和其他站点
 /// 对于主节点：显示所有已连接的从节点
 pub async fn get_mqtt_nodes_status(
@@ -410,35 +413,40 @@ pub async fn get_mqtt_nodes_status(
         let all_sites = remote_sync_handlers::list_all_sites()
             .await
             .unwrap_or_default();
-        
+
         // 获取 MQTT 节点状态（用于获取已连接节点的实时信息）
         let mqtt_nodes = MQTT_NODES.read().await;
-        
+
         for site in &all_sites {
             let site_location = site.location.clone().unwrap_or_default();
             if site_location.is_empty() {
                 continue;
             }
-            
+
             // 检查是否为主节点
             let is_master = check_is_master_node_internal(&site_location, &db_path);
-            
+
             // 检查是否在 MQTT_NODES 中（已连接）
             let mqtt_node = mqtt_nodes.get(&site_location);
-            
+
             // 判断在线状态：优先使用 MQTT 连接状态，否则使用 HTTP 健康检查
-            let (is_online, messages_received, last_heartbeat, has_mqtt_subscription) = 
+            let (is_online, messages_received, last_heartbeat, has_mqtt_subscription) =
                 if let Some(node) = mqtt_node {
-                    (node.is_online, node.messages_received, Some(node.last_heartbeat), true)
+                    (
+                        node.is_online,
+                        node.messages_received,
+                        Some(node.last_heartbeat),
+                        true,
+                    )
                 } else {
                     // 通过 HTTP 健康检查判断是否在线
                     let online = check_site_http_status(site.http_host.as_deref()).await;
                     (online, 0, None, false)
                 };
-            
+
             // 标记是否为当前站点
             let is_current = site_location == current_location;
-            
+
             all_nodes.push(json!({
                 "location": site_location,
                 "node_name": format!("{}", site.name),
@@ -460,10 +468,12 @@ pub async fn get_mqtt_nodes_status(
     } else {
         // 从节点：只显示订阅的主节点信息
         // get_subscribed_master_info 现在只返回有效的 master_location（不为 'unknown' 或 NULL）
-        if let Some((master_location, master_host, master_port)) = get_subscribed_master_info(&current_location) {
+        if let Some((master_location, master_host, master_port)) =
+            get_subscribed_master_info(&current_location)
+        {
             // 检查主节点是否在线
             let is_online = check_master_online(&master_location, &master_host).await;
-            
+
             all_nodes.push(json!({
                 "location": master_location.clone(),
                 "node_name": format!("主节点-{}", master_location),
@@ -505,9 +515,9 @@ pub async fn get_mqtt_nodes_status(
 /// 获取从节点订阅的主节点信息
 fn get_subscribed_master_info(current_location: &str) -> Option<(String, String, u16)> {
     use crate::web_server::remote_sync_handlers;
-    
+
     let conn = remote_sync_handlers::open_sqlite().ok()?;
-    
+
     // 查询当前站点配置的主节点信息（使用 master_location 字段）
     // 注意：如果 master_location 为 NULL，返回 None，不返回 'unknown'
     conn.query_row(
@@ -523,14 +533,23 @@ fn get_subscribed_master_info(current_location: &str) -> Option<(String, String,
             // 如果 master_location 为 NULL 或 'unknown'，返回 None
             if let Some(loc) = master_location {
                 if loc.is_empty() || loc == "unknown" {
-                    return Err(rusqlite::Error::InvalidColumnType(0, "master_location".to_string(), rusqlite::types::Type::Text));
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        0,
+                        "master_location".to_string(),
+                        rusqlite::types::Type::Text,
+                    ));
                 }
                 Ok((loc, host, port as u16))
             } else {
-                Err(rusqlite::Error::InvalidColumnType(0, "master_location".to_string(), rusqlite::types::Type::Null))
+                Err(rusqlite::Error::InvalidColumnType(
+                    0,
+                    "master_location".to_string(),
+                    rusqlite::types::Type::Null,
+                ))
             }
         },
-    ).ok()
+    )
+    .ok()
 }
 
 /// 检查主节点是否在线
@@ -538,28 +557,32 @@ async fn check_master_online(master_location: &str, master_host: &str) -> bool {
     // 先检查 MQTT_NODES 中是否有（这只会在从节点连接到主节点并收到心跳时才会出现）
     let is_online = {
         let mqtt_nodes = MQTT_NODES.read().await;
-        mqtt_nodes.get(master_location)
+        mqtt_nodes
+            .get(master_location)
             .map(|n| n.is_online)
             .unwrap_or(false)
     };
-    
+
     if is_online {
         return true;
     }
-    
+
     // 尝试 HTTP 检查
     use crate::web_server::remote_sync_handlers;
     let all_sites = remote_sync_handlers::list_all_sites()
         .await
         .unwrap_or_default();
-    
+
     // 优先使用站点配置中的 http_host
-    if let Some(site) = all_sites.iter().find(|s| s.location.as_ref().map(|l| l.as_str()) == Some(master_location)) {
+    if let Some(site) = all_sites
+        .iter()
+        .find(|s| s.location.as_ref().map(|l| l.as_str()) == Some(master_location))
+    {
         if let Some(ref http_host) = site.http_host {
             return check_site_http_status(Some(http_host)).await;
         }
     }
-    
+
     // 尝试直接从 master_host 构建 HTTP URL 检查
     // master_host 格式可能是: "198.18.0.1:1883" 或 "198.18.0.1"
     let http_url = if master_host.contains(":1883") {
@@ -571,27 +594,32 @@ async fn check_master_online(master_location: &str, master_host: &str) -> bool {
     } else {
         format!("http://{}:8080", master_host)
     };
-    
+
     let result = check_site_http_status(Some(&http_url)).await;
     if !result {
-        log::warn!("主节点 {} HTTP 健康检查失败: {} (从 master_host {} 构建)", master_location, http_url, master_host);
+        log::warn!(
+            "主节点 {} HTTP 健康检查失败: {} (从 master_host {} 构建)",
+            master_location,
+            http_url,
+            master_host
+        );
     }
     result
 }
 
 /// API: 删除/移除 MQTT 节点
-/// 
+///
 /// 对于从节点：取消订阅主节点并清除配置，同时通知主节点
 /// 对于主节点：从监控列表和数据库中移除指定节点
 pub async fn remove_mqtt_node(
     axum::extract::Path(location): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use aios_core::get_db_option;
     use crate::web_server::remote_sync_handlers;
-    
+    use aios_core::get_db_option;
+
     let db_option = get_db_option();
     let current_location = db_option.location.clone();
-    
+
     // 获取数据库路径
     let db_path = if std::path::Path::new("DbOption.toml").exists() {
         config::Config::builder()
@@ -603,14 +631,14 @@ pub async fn remove_mqtt_node(
     } else {
         "deployment_sites.sqlite".to_string()
     };
-    
+
     let is_current_master = check_is_master_node_internal(&current_location, &db_path);
-    
+
     if is_current_master {
         // 主节点：从 MQTT_NODES 和数据库中移除节点
         let mut nodes = MQTT_NODES.write().await;
         nodes.remove(&location);
-        
+
         // 同时从数据库中删除站点记录
         if let Ok(conn) = remote_sync_handlers::open_sqlite() {
             let _ = conn.execute(
@@ -619,7 +647,7 @@ pub async fn remove_mqtt_node(
             );
             log::info!("主节点：已从数据库中删除站点 {}", location);
         }
-        
+
         Ok(Json(json!({
             "status": "success",
             "message": format!("已从监控列表中移除节点: {}", location)
@@ -648,17 +676,17 @@ pub async fn remove_mqtt_node(
                 "message": format!("清除主节点配置失败: {}", e)
             })));
         }
-        
+
         // 从 MQTT_NODES 中移除
         let mut nodes = MQTT_NODES.write().await;
         nodes.remove(&location);
         drop(nodes);
-        
+
         // 通知主节点：从节点已取消订阅
         if let Some(master_host) = master_http_host {
             notify_master_unsubscribe(&master_host, &current_location).await;
         }
-        
+
         Ok(Json(json!({
             "status": "success",
             "message": format!("已取消订阅主节点: {}", location)
@@ -669,17 +697,19 @@ pub async fn remove_mqtt_node(
 /// 获取主节点的 HTTP 地址
 fn get_master_http_host(current_location: &str) -> Option<String> {
     use crate::web_server::remote_sync_handlers;
-    
+
     let conn = remote_sync_handlers::open_sqlite().ok()?;
-    
+
     // 查询主节点的 http_host（通过 master_mqtt_host 关联）
     // 首先获取当前站点配置的 master_mqtt_host
-    let master_mqtt_host: Option<String> = conn.query_row(
-        "SELECT master_mqtt_host FROM remote_sync_sites WHERE location = ?1",
-        rusqlite::params![current_location],
-        |row| row.get(0),
-    ).ok();
-    
+    let master_mqtt_host: Option<String> = conn
+        .query_row(
+            "SELECT master_mqtt_host FROM remote_sync_sites WHERE location = ?1",
+            rusqlite::params![current_location],
+            |row| row.get(0),
+        )
+        .ok();
+
     if let Some(mqtt_host) = master_mqtt_host {
         // 尝试从 mqtt_host 构建 http_host（假设 HTTP 端口是 8080）
         let http_host = if mqtt_host.contains(":1883") {
@@ -691,24 +721,24 @@ fn get_master_http_host(current_location: &str) -> Option<String> {
         } else {
             format!("{}:8080", mqtt_host)
         };
-        
+
         // 添加 http:// 前缀
         let http_url = if http_host.starts_with("http") {
             http_host
         } else {
             format!("http://{}", http_host)
         };
-        
+
         return Some(http_url);
     }
-    
+
     None
 }
 
 /// 通知主节点：从节点已取消订阅
 async fn notify_master_unsubscribe(master_host: &str, client_location: &str) {
     let url = format!("{}/api/mqtt/nodes/client-unsubscribed", master_host);
-    
+
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -719,8 +749,9 @@ async fn notify_master_unsubscribe(master_host: &str, client_location: &str) {
             return;
         }
     };
-    
-    match client.post(&url)
+
+    match client
+        .post(&url)
         .json(&json!({
             "client_location": client_location
         }))
@@ -729,7 +760,11 @@ async fn notify_master_unsubscribe(master_host: &str, client_location: &str) {
     {
         Ok(resp) => {
             if resp.status().is_success() {
-                log::info!("已通知主节点 {} 从节点 {} 取消订阅", master_host, client_location);
+                log::info!(
+                    "已通知主节点 {} 从节点 {} 取消订阅",
+                    master_host,
+                    client_location
+                );
             } else {
                 log::warn!("通知主节点失败: HTTP {}", resp.status());
             }
@@ -745,37 +780,40 @@ pub async fn client_unsubscribed(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use crate::web_server::remote_sync_handlers;
-    
-    let client_location = payload.get("client_location")
+
+    let client_location = payload
+        .get("client_location")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    
+
     if client_location.is_empty() {
         return Ok(Json(json!({
             "status": "error",
             "message": "缺少 client_location 参数"
         })));
     }
-    
+
     log::info!("收到从节点 {} 取消订阅的通知", client_location);
-    
+
     // 从 MQTT_NODES 中移除
     let mut nodes = MQTT_NODES.write().await;
     nodes.remove(client_location);
     drop(nodes);
-    
+
     // 从数据库中删除站点记录
     if let Ok(conn) = remote_sync_handlers::open_sqlite() {
-        let deleted = conn.execute(
-            "DELETE FROM remote_sync_sites WHERE location = ?1",
-            rusqlite::params![client_location],
-        ).unwrap_or(0);
-        
+        let deleted = conn
+            .execute(
+                "DELETE FROM remote_sync_sites WHERE location = ?1",
+                rusqlite::params![client_location],
+            )
+            .unwrap_or(0);
+
         if deleted > 0 {
             log::info!("已从数据库中删除站点 {}", client_location);
         }
     }
-    
+
     Ok(Json(json!({
         "status": "success",
         "message": format!("已处理从节点 {} 取消订阅", client_location)
@@ -861,7 +899,7 @@ pub async fn check_site_http_status(http_host: Option<&str>) -> bool {
     };
 
     let host_key = host.trim_end_matches('/').to_string();
-    
+
     // 检查缓存
     {
         let cache = HTTP_HEALTH_CACHE.read().await;
@@ -889,10 +927,13 @@ pub async fn check_site_http_status(http_host: Option<&str>) -> bool {
     // 更新缓存
     {
         let mut cache = HTTP_HEALTH_CACHE.write().await;
-        cache.insert(host_key, HealthCheckCache {
-            is_online,
-            checked_at: Utc::now(),
-        });
+        cache.insert(
+            host_key,
+            HealthCheckCache {
+                is_online,
+                checked_at: Utc::now(),
+            },
+        );
     }
 
     is_online

@@ -227,7 +227,10 @@ async fn query_ptset(
     }
 
     // 真源优先走 SurrealDB；仅在 DB 明确“无 ptset 数据”时尝试读取 cache 作为兼容兜底。
-    if matches!(db_lookup.error_message.as_deref(), Some("未找到 ptset 数据")) {
+    if matches!(
+        db_lookup.error_message.as_deref(),
+        Some("未找到 ptset 数据")
+    ) {
         if let Ok(Some((ptset_points, world_transform, snapshot_batch_id))) =
             try_get_ptset_from_cache(refno, dbno, batch_id).await
         {

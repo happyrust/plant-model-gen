@@ -32,7 +32,12 @@ export const registryApi = {
     ),
 
   delete: (id: string) =>
-    apiDelete<{ site_id: string; deleted: boolean }>(`/api/admin/registry/sites/${id}`),
+    apiDelete<{
+      site_id: string
+      deleted: boolean
+      removed_registry_record: boolean
+      deleted_runtime_data: boolean
+    }>(`/api/admin/registry/sites/${id}`),
 
   importDbOption: (payload: RegistrySiteImportPayload) =>
     apiPost<RegistrySite>(

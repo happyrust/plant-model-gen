@@ -308,16 +308,48 @@ struct QueryAabbRowRaw {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[derive(Debug, Clone)]
+struct SpatialAggregateNodeInfo {
+    owner: Option<RefnoEnum>,
+    noun: String,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[derive(Debug, Default)]
+struct SpatialAggregateStats {
+    nodes: usize,
+    branch_nodes: usize,
+    tubi_rows: usize,
+    estimated_tubi_rows: usize,
+    skipped_tree_dbnums: usize,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 #[derive(Debug, Default)]
 struct SpatialIndexRefreshStats {
     inserted: usize,
     booled_override: usize,
     skipped_invalid_aabb: usize,
     skipped_missing_noun: usize,
+    aggregate_nodes: usize,
+    branch_aggregate_nodes: usize,
+    tubi_rows: usize,
+    estimated_tubi_rows: usize,
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 const SPATIAL_INDEX_UNKNOWN_NOUN: &str = "__UNKNOWN__";
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+const SPATIAL_AGGREGATE_NOUNS: &[&str] = &[
+    "BRAN", "HANG", "PIPE", "EQUI", "STRU", "FRMW", "SBFR", "ZONE",
+];
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+const SPATIAL_BRANCH_NOUNS: &[&str] = &["BRAN", "HANG"];
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+const DEFAULT_TUBI_OD_MM: f32 = 229.0;
 
 #[cfg(all(
     not(target_arch = "wasm32"),
@@ -673,6 +705,356 @@ async fn query_aabb_rows_by_dbnums(
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn is_spatial_aggregate_noun(noun: &str) -> bool {
+    SPATIAL_AGGREGATE_NOUNS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(noun.trim()))
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn is_spatial_branch_noun(noun: &str) -> bool {
+    SPATIAL_BRANCH_NOUNS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(noun.trim()))
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn merge_aabb_into(map: &mut HashMap<RefnoEnum, Aabb>, refno: RefnoEnum, aabb: Aabb) {
+    map.entry(refno)
+        .and_modify(|acc| *acc = merge_aabb(acc, &aabb))
+        .or_insert(aabb);
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn load_spatial_aggregate_node_infos_by_dbnums(
+    db_nums: &[u32],
+) -> anyhow::Result<(
+    HashMap<RefnoEnum, SpatialAggregateNodeInfo>,
+    SpatialAggregateStats,
+)> {
+    use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+    use aios_core::tool::db_tool::db1_dehash;
+
+    let mut infos = HashMap::new();
+    let mut stats = SpatialAggregateStats::default();
+    let manager = TreeIndexManager::with_default_dir(db_nums.to_vec());
+
+    for &dbnum in db_nums {
+        let index = match manager.load_index(dbnum) {
+            Ok(index) => index,
+            Err(err) => {
+                stats.skipped_tree_dbnums += 1;
+                warn!(
+                    "[room_model] 空间聚合跳过 dbnum={}：TreeIndex 加载失败: {}",
+                    dbnum, err
+                );
+                continue;
+            }
+        };
+
+        for ref_u64 in index.all_refnos() {
+            let Some(meta) = index.node_meta(ref_u64) else {
+                continue;
+            };
+            let refno = RefnoEnum::from(ref_u64);
+            if !refno.is_valid() {
+                continue;
+            }
+            let owner = {
+                let owner = RefnoEnum::from(meta.owner);
+                if owner.is_valid() && owner != refno {
+                    Some(owner)
+                } else {
+                    None
+                }
+            };
+            infos.insert(
+                refno,
+                SpatialAggregateNodeInfo {
+                    owner,
+                    noun: db1_dehash(meta.noun),
+                },
+            );
+        }
+    }
+
+    Ok((infos, stats))
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn estimate_tubi_aabb_from_segment(start: Vec3, end: Vec3, aod: Option<f32>) -> Option<Aabb> {
+    if !(start.x.is_finite()
+        && start.y.is_finite()
+        && start.z.is_finite()
+        && end.x.is_finite()
+        && end.y.is_finite()
+        && end.z.is_finite())
+    {
+        return None;
+    }
+
+    let od = aod
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_TUBI_OD_MM);
+    let radius = od * 0.5;
+    Some(Aabb::new(
+        [
+            start.x.min(end.x) - radius,
+            start.y.min(end.y) - radius,
+            start.z.min(end.z) - radius,
+        ]
+        .into(),
+        [
+            start.x.max(end.x) + radius,
+            start.y.max(end.y) + radius,
+            start.z.max(end.z) + radius,
+        ]
+        .into(),
+    ))
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn query_branch_tubi_aggregate_aabbs(
+    branch_refnos: &[RefnoEnum],
+    real_aabb_map: &HashMap<RefnoEnum, Aabb>,
+) -> anyhow::Result<(HashMap<RefnoEnum, Aabb>, usize, usize)> {
+    use aios_core::rs_surreal::geometry_query::PlantTransform;
+    use aios_core::shape::pdms_shape::RsVec3;
+
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct TubiAabbRow {
+        owner_refno: RefnoEnum,
+        leave_refno: RefnoEnum,
+        #[serde(default)]
+        aabb: JsonValue,
+        #[serde(default)]
+        world_trans: Option<PlantTransform>,
+        #[serde(default)]
+        start_pt: Option<RsVec3>,
+        #[serde(default)]
+        end_pt: Option<RsVec3>,
+        #[serde(default)]
+        aod: Option<f32>,
+    }
+
+    let mut out: HashMap<RefnoEnum, Aabb> = HashMap::new();
+    let mut tubi_rows = 0usize;
+    let mut estimated_rows = 0usize;
+
+    for branch_refno in branch_refnos {
+        let pe_key = branch_refno.to_pe_key();
+        let sql = format!(
+            r#"
+            SELECT
+                id[0] as owner_refno,
+                in as leave_refno,
+                aabb.d as aabb,
+                world_trans.d as world_trans,
+                start_pt.d as start_pt,
+                end_pt.d as end_pt,
+                in.aod as aod
+            FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
+            "#
+        );
+
+        let rows: Vec<TubiAabbRow> = match model_primary_db().query_take(&sql, 0).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!(
+                    "[room_model] BRAN/HANG TUBI AABB 查询失败: branch={} err={}",
+                    branch_refno, err
+                );
+                continue;
+            }
+        };
+
+        for row in rows {
+            if !row.owner_refno.is_valid() {
+                continue;
+            }
+            tubi_rows += 1;
+
+            let selected = real_aabb_map
+                .get(&row.leave_refno)
+                .copied()
+                .or_else(|| parse_inst_relate_aabb(&row.aabb))
+                .or_else(|| {
+                    let start = row.start_pt.map(|p| p.0).or_else(|| {
+                        row.world_trans
+                            .as_ref()
+                            .map(|t| t.to_matrix().transform_point3(Vec3::ZERO))
+                    })?;
+                    let end = row.end_pt.map(|p| p.0).or_else(|| {
+                        row.world_trans
+                            .as_ref()
+                            .map(|t| t.to_matrix().transform_point3(Vec3::Z))
+                    })?;
+                    estimated_rows += 1;
+                    estimate_tubi_aabb_from_segment(start, end, row.aod)
+                });
+
+            if let Some(aabb) = selected {
+                merge_aabb_into(&mut out, row.owner_refno, aabb);
+            }
+        }
+    }
+
+    Ok((out, tubi_rows, estimated_rows))
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn build_spatial_aggregate_aabbs_by_dbnums(
+    db_nums: &[u32],
+    real_aabb_map: &HashMap<RefnoEnum, Aabb>,
+) -> anyhow::Result<(
+    HashMap<RefnoEnum, Aabb>,
+    HashMap<RefnoEnum, SpatialAggregateNodeInfo>,
+    SpatialAggregateStats,
+)> {
+    let (node_infos, mut stats) = load_spatial_aggregate_node_infos_by_dbnums(db_nums)?;
+    if node_infos.is_empty() {
+        return Ok((HashMap::new(), node_infos, stats));
+    }
+
+    let mut aggregate_map: HashMap<RefnoEnum, Aabb> = HashMap::new();
+
+    let branch_refnos: Vec<RefnoEnum> = node_infos
+        .iter()
+        .filter_map(|(refno, info)| {
+            if is_spatial_branch_noun(&info.noun) {
+                Some(*refno)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let (branch_aabbs, tubi_rows, estimated_tubi_rows) =
+        query_branch_tubi_aggregate_aabbs(&branch_refnos, real_aabb_map).await?;
+    stats.tubi_rows = tubi_rows;
+    stats.estimated_tubi_rows = estimated_tubi_rows;
+    stats.branch_nodes = branch_aabbs.len();
+
+    for (refno, aabb) in &branch_aabbs {
+        if !real_aabb_map.contains_key(refno) {
+            merge_aabb_into(&mut aggregate_map, *refno, *aabb);
+        }
+    }
+
+    for (source_refno, source_aabb) in real_aabb_map.iter().chain(branch_aabbs.iter()) {
+        let mut current = *source_refno;
+        let mut visited = HashSet::new();
+
+        loop {
+            let Some(info) = node_infos.get(&current) else {
+                break;
+            };
+            let Some(parent) = info.owner else {
+                break;
+            };
+            if !visited.insert(parent) {
+                break;
+            }
+
+            if let Some(parent_info) = node_infos.get(&parent) {
+                if is_spatial_aggregate_noun(&parent_info.noun)
+                    && !real_aabb_map.contains_key(&parent)
+                {
+                    merge_aabb_into(&mut aggregate_map, parent, *source_aabb);
+                }
+            }
+            current = parent;
+        }
+    }
+
+    stats.nodes = aggregate_map.len();
+    Ok((aggregate_map, node_infos, stats))
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn save_spatial_aggregate_aabbs_by_dbnums(
+    db_nums: &[u32],
+    aggregate_map: &HashMap<RefnoEnum, Aabb>,
+    node_infos: &HashMap<RefnoEnum, SpatialAggregateNodeInfo>,
+) -> anyhow::Result<()> {
+    if db_nums.is_empty() {
+        return Ok(());
+    }
+
+    let dbnum_list = db_nums.iter().map(u32::to_string).join(", ");
+    model_primary_db()
+        .query(&format!(
+            "DELETE FROM inst_relate_agg_aabb WHERE refno.dbnum IN [{dbnum_list}];"
+        ))
+        .await?;
+
+    if aggregate_map.is_empty() {
+        return Ok(());
+    }
+
+    let mut refnos: Vec<RefnoEnum> = aggregate_map.keys().copied().collect();
+    refnos.sort();
+
+    for chunk in refnos.chunks(200) {
+        let mut statements = Vec::with_capacity(chunk.len() * 2);
+
+        for refno in chunk {
+            let Some(aabb) = aggregate_map.get(refno) else {
+                continue;
+            };
+            let hash = aios_core::gen_aabb_hash(aabb);
+            let aabb_json = serde_json::to_string(aabb)?;
+            let refno_str = refno.to_string();
+            let refno_key = refno.to_pe_key();
+            let noun = node_infos
+                .get(refno)
+                .map(|info| info.noun.as_str())
+                .unwrap_or(SPATIAL_INDEX_UNKNOWN_NOUN)
+                .replace('\'', "''");
+            let source = if is_spatial_branch_noun(&noun) {
+                "branch_tubi"
+            } else {
+                "hierarchy"
+            };
+
+            statements.push(format!("UPSERT aabb:⟨{hash}⟩ SET d = {aabb_json}"));
+            statements.push(format!(
+                "UPSERT inst_relate_agg_aabb:⟨{refno_str}⟩ SET refno = {refno_key}, aabb_id = aabb:⟨{hash}⟩, noun = '{noun}', source = '{source}', updated_at = time::now()"
+            ));
+        }
+
+        if !statements.is_empty() {
+            model_primary_db()
+                .query(&(statements.join(";\n") + ";"))
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+async fn query_spatial_index_refresh_dbnums() -> anyhow::Result<Vec<u32>> {
+    let sql = r#"
+        SELECT VALUE array::distinct(dbnum) FROM inst_relate GROUP ALL;
+        SELECT VALUE array::distinct(refno.dbnum) FROM inst_relate_aabb WHERE aabb_id.d != NONE GROUP ALL;
+    "#;
+    let mut response = model_primary_db().query_response(sql).await?;
+    let inst_dbnums: Vec<Vec<i64>> = response.take(0).unwrap_or_default();
+    let aabb_dbnums: Vec<Vec<i64>> = response.take(1).unwrap_or_default();
+
+    let mut dbnums: Vec<u32> = inst_dbnums
+        .into_iter()
+        .chain(aabb_dbnums)
+        .flatten()
+        .filter_map(|value| u32::try_from(value).ok())
+        .collect();
+    dbnums.sort_unstable();
+    dbnums.dedup();
+    Ok(dbnums)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 async fn refresh_sqlite_spatial_index_from_dbnums(
     idx: &SqliteSpatialIndex,
     db_nums: &[u32],
@@ -726,9 +1108,22 @@ async fn refresh_sqlite_spatial_index_from_dbnums(
             .or_insert(aabb);
     }
 
-    let mut all_refnos: Vec<RefnoEnum> = raw_map.keys().copied().collect();
-    for refno in booled_map.keys().copied() {
-        if !raw_map.contains_key(&refno) {
+    let mut real_aabb_map = raw_map.clone();
+    for (refno, aabb) in &booled_map {
+        real_aabb_map.insert(*refno, *aabb);
+    }
+
+    let (aggregate_map, aggregate_node_infos, aggregate_stats) =
+        build_spatial_aggregate_aabbs_by_dbnums(db_nums, &real_aabb_map).await?;
+    save_spatial_aggregate_aabbs_by_dbnums(db_nums, &aggregate_map, &aggregate_node_infos).await?;
+    stats.aggregate_nodes = aggregate_stats.nodes;
+    stats.branch_aggregate_nodes = aggregate_stats.branch_nodes;
+    stats.tubi_rows = aggregate_stats.tubi_rows;
+    stats.estimated_tubi_rows = aggregate_stats.estimated_tubi_rows;
+
+    let mut all_refnos: Vec<RefnoEnum> = real_aabb_map.keys().copied().collect();
+    for refno in aggregate_map.keys().copied() {
+        if !real_aabb_map.contains_key(&refno) {
             all_refnos.push(refno);
         }
     }
@@ -736,9 +1131,12 @@ async fn refresh_sqlite_spatial_index_from_dbnums(
     all_refnos.dedup();
 
     println!(
-        "[room_model] SQLite AABB dbnum 刷新开始: dbnums={:?}, refnos={}, insert_batches={}",
+        "[room_model] SQLite AABB dbnum 刷新开始: dbnums={:?}, refnos={}, aggregate_nodes={}, branch_nodes={}, tubi_rows={}, insert_batches={}",
         db_nums,
         all_refnos.len(),
+        stats.aggregate_nodes,
+        stats.branch_aggregate_nodes,
+        stats.tubi_rows,
         (all_refnos.len() + INSERT_BATCH_SIZE - 1) / INSERT_BATCH_SIZE
     );
 
@@ -752,6 +1150,11 @@ async fn refresh_sqlite_spatial_index_from_dbnums(
             let inst_row = inst_map.get(refno);
             let noun = inst_row
                 .and_then(|row| row.noun.as_deref())
+                .or_else(|| {
+                    aggregate_node_infos
+                        .get(refno)
+                        .map(|info| info.noun.as_str())
+                })
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
@@ -763,8 +1166,10 @@ async fn refresh_sqlite_spatial_index_from_dbnums(
             let selected = if let Some(aabb) = booled_map.get(refno) {
                 stats.booled_override += 1;
                 Some(*aabb)
+            } else if let Some(aabb) = raw_map.get(refno) {
+                Some(*aabb)
             } else {
-                raw_map.get(refno).copied()
+                aggregate_map.get(refno).copied()
             };
 
             let Some(aabb) = selected else {
@@ -888,6 +1293,37 @@ pub(crate) async fn query_aabb_from_inst_relate_aabb(
         }
     }
 
+    let missing_agg: Vec<String> = refnos
+        .iter()
+        .filter(|r| !map.contains_key(r))
+        .map(|r| r.to_pe_key())
+        .collect();
+
+    if !missing_agg.is_empty() {
+        let missing_ids = missing_agg.join(",");
+        let aggregate_sql = format!(
+            "SELECT refno, aabb_id.d as aabb FROM inst_relate_agg_aabb WHERE refno IN [{missing_ids}] AND aabb_id.d != NONE"
+        );
+        let rows: Vec<QueryAabbRowRaw> = match model_primary_db().query(&aggregate_sql).await {
+            Ok(mut response) => response.take(0).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+
+        for row in rows {
+            if !row.refno.is_valid() {
+                skipped_refno += 1;
+                continue;
+            }
+            let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
+                skipped_aabb += 1;
+                continue;
+            };
+            map.entry(row.refno)
+                .and_modify(|acc| *acc = merge_aabb(acc, &aabb))
+                .or_insert(aabb);
+        }
+    }
+
     if debug_query {
         println!(
             "[room_debug] query_aabb: booled={} fallback={} skipped_refno={} skipped_aabb={} map_size={}",
@@ -925,9 +1361,13 @@ pub async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
         if let Some(nums) = db_nums {
             let stats = refresh_sqlite_spatial_index_from_dbnums(&idx, nums).await?;
             info!(
-                "[room_model] SQLite AABB 刷新完成: inserted={}, booled_override={}, skipped_db={}, skipped_refno_root={}, skipped_missing_dbmap={}, skipped_invalid_aabb={}, skipped_missing_noun={}, scope=dbnums",
+                "[room_model] SQLite AABB 刷新完成: inserted={}, booled_override={}, aggregate_nodes={}, branch_nodes={}, tubi_rows={}, estimated_tubi_rows={}, skipped_db={}, skipped_refno_root={}, skipped_missing_dbmap={}, skipped_invalid_aabb={}, skipped_missing_noun={}, scope=dbnums",
                 stats.inserted,
                 stats.booled_override,
+                stats.aggregate_nodes,
+                stats.branch_aggregate_nodes,
+                stats.tubi_rows,
+                stats.estimated_tubi_rows,
                 0,
                 0,
                 0,
@@ -935,6 +1375,26 @@ pub async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
                 stats.skipped_missing_noun
             );
             return Ok(stats.inserted);
+        } else {
+            let nums = query_spatial_index_refresh_dbnums().await?;
+            if !nums.is_empty() {
+                let stats = refresh_sqlite_spatial_index_from_dbnums(&idx, &nums).await?;
+                info!(
+                    "[room_model] SQLite AABB 刷新完成: inserted={}, booled_override={}, aggregate_nodes={}, branch_nodes={}, tubi_rows={}, estimated_tubi_rows={}, skipped_db={}, skipped_refno_root={}, skipped_missing_dbmap={}, skipped_invalid_aabb={}, skipped_missing_noun={}, scope=all_dbnums",
+                    stats.inserted,
+                    stats.booled_override,
+                    stats.aggregate_nodes,
+                    stats.branch_aggregate_nodes,
+                    stats.tubi_rows,
+                    stats.estimated_tubi_rows,
+                    0,
+                    0,
+                    0,
+                    stats.skipped_invalid_aabb,
+                    stats.skipped_missing_noun
+                );
+                return Ok(stats.inserted);
+            }
         }
     }
 
@@ -1325,11 +1785,35 @@ fn append_room_calc_missing_refnos(
 )]
 #[allow(unused_variables)]
 async fn pregen_room_panels_into_model_cache(
-    _db_option: &DbOption,
-    _room_panel_map: &[(RefnoEnum, String, Vec<RefnoEnum>)],
+    db_option: &DbOption,
+    room_panel_map: &[(RefnoEnum, String, Vec<RefnoEnum>)],
+    db_nums: Option<&[u32]>,
 ) -> anyhow::Result<()> {
-    // 已停用：面板几何现在通过 query_insts_for_room_calc 按需预取。
-    // 保留此函数签名作为预生成钩子——若未来需要在房间计算前批量缓存面板模型，在此处实现。
+    let mut panel_refnos = room_panel_map
+        .iter()
+        .flat_map(|(_, _, panels)| panels.iter().copied())
+        .collect::<Vec<_>>();
+    panel_refnos.sort();
+    panel_refnos.dedup();
+
+    if panel_refnos.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        "[room_model] 显式预生成房间面板模型: panels={}, db_nums={:?}",
+        panel_refnos.len(),
+        db_nums
+    );
+
+    let mut gen_option = crate::options::DbOptionExt::from(db_option.clone());
+    gen_option.gen_model = true;
+    gen_option.gen_mesh = true;
+    if let Some(nums) = db_nums {
+        gen_option.manual_db_nums = Some(nums.to_vec());
+    }
+
+    crate::fast_model::gen_model::gen_all_geos_data(panel_refnos, &gen_option, None, None).await?;
     Ok(())
 }
 
@@ -1615,6 +2099,18 @@ pub async fn build_room_relations(
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+pub async fn build_room_relations_with_model_generation(
+    db_option: &DbOption,
+    db_nums: Option<&[u32]>,
+    refno_root: Option<RefnoEnum>,
+) -> anyhow::Result<RoomBuildStats> {
+    build_room_relations_with_cancel_and_overrides(
+        db_option, db_nums, refno_root, None, true, true, None, None,
+    )
+    .await
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 pub async fn build_room_relations_with_overrides(
     db_option: &DbOption,
     db_nums: Option<&[u32]>,
@@ -1628,6 +2124,7 @@ pub async fn build_room_relations_with_overrides(
         refno_root,
         room_keywords_override,
         force_rebuild,
+        false,
         None,
         None,
     )
@@ -1655,6 +2152,7 @@ pub async fn build_room_relations_with_cancel(
         refno_root,
         None,
         true,
+        false,
         cancel_token,
         progress_callback,
     )
@@ -1668,6 +2166,7 @@ async fn build_room_relations_with_cancel_and_overrides(
     refno_root: Option<RefnoEnum>,
     room_keywords_override: Option<&[String]>,
     force_rebuild: bool,
+    generate_missing_panel_models: bool,
     cancel_token: Option<CancellationToken>,
     progress_callback: Option<Box<dyn Fn(f32, &str) + Send + Sync>>,
 ) -> anyhow::Result<RoomBuildStats> {
@@ -1755,7 +2254,23 @@ async fn build_room_relations_with_cancel_and_overrides(
         feature = "sqlite-index",
         feature = "gen_model"
     ))]
-    pregen_room_panels_into_model_cache(db_option, &room_panel_map).await?;
+    if generate_missing_panel_models {
+        if let Some(ref cb) = progress_callback {
+            cb(0.10, "正在预生成缺失面板模型");
+        }
+        pregen_room_panels_into_model_cache(db_option, &room_panel_map, db_nums).await?;
+
+        if let Some(ref cb) = progress_callback {
+            cb(0.15, "正在刷新模型生成后的 SQLite AABB 索引");
+        }
+        let inserted = ensure_spatial_index_ready(db_nums, refno_root.clone(), true).await?;
+        if inserted == 0 {
+            anyhow::bail!(
+                "房间计算前置失败：模型预生成后 SQLite AABB 索引刷新结果为空，已停止后续 room 关系写入"
+            );
+        }
+        println!("[room_model] 模型预生成后 SQLite AABB 索引刷新完成: inserted={inserted}");
+    }
 
     if let Some(ref token) = cancel_token {
         if token.is_cancelled() {
@@ -3136,7 +3651,7 @@ pub async fn cal_room_refnos_with_options(
 
         let tmp = vec![(RefnoEnum::default(), String::new(), vec![panel_refno])];
 
-        if let Err(e) = pregen_room_panels_into_model_cache(&db_opt, &tmp).await {
+        if let Err(e) = pregen_room_panels_into_model_cache(&db_opt, &tmp, None).await {
             warn!(
                 "房间计算自动补齐 panel 模型失败: panel={}, err={}",
                 panel_refno, e
@@ -5639,13 +6154,6 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
         .flat_map(|(_, _, panels)| panels.clone())
         .collect();
 
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        feature = "sqlite-index",
-        feature = "gen_model"
-    ))]
-    pregen_room_panels_into_model_cache(db_option, &room_panel_map).await?;
-
     let panels_to_delete: Vec<PanelRoom> = room_panel_map
         .iter()
         .flat_map(|(_, room_num, panels)| {
@@ -6068,13 +6576,6 @@ pub async fn rebuild_room_relations_for_rooms(
         .collect();
 
     CACHE_METRICS.reset();
-
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        feature = "sqlite-index",
-        feature = "gen_model"
-    ))]
-    pregen_room_panels_into_model_cache(db_option, &room_panel_map).await?;
 
     let panels_to_delete: Vec<PanelRoom> = room_panel_map
         .iter()

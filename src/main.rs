@@ -326,7 +326,7 @@ use aios_core::{DBType, init_surreal, query_mdb_db_nums};
 #[cfg(feature = "gui")]
 use aios_database::gui;
 #[cfg(not(feature = "gui"))]
-use aios_database::options::{MeshFormat, get_db_option_ext_from_path};
+use aios_database::options::{MeshFormat, ModelWriterMode, get_db_option_ext_from_path};
 #[cfg(not(feature = "gui"))]
 use aios_database::run_app;
 #[cfg(not(feature = "gui"))]
@@ -637,6 +637,13 @@ async fn main() -> anyhow::Result<()> {
                 .long("gen-dry-run")
                 .help("Dry run: only collect refnos and log, skip geometry generation and DB writes. Use to verify refnos are processed (e.g. grep 24381_145019)")
                 .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("model-writer")
+                .long("model-writer")
+                .help("Model writer backend: surreal writes to SurrealDB; drain-only consumes generated batches for throughput testing without persistence")
+                .value_name("WRITER")
+                .value_parser(["surreal", "drain-only"]),
         )
         .arg(
             Arg::new("export-parquet-after-gen")
@@ -1048,6 +1055,20 @@ async fn main() -> anyhow::Result<()> {
         db_option_ext.gen_model_dry_run = true;
         println!("🔧 模型生成空跑模式: 仅收集 refno 并记录日志，跳过几何生成与 DB 写入");
     }
+    if let Some(writer) = matches.get_one::<String>("model-writer") {
+        db_option_ext.model_writer_mode = match writer.as_str() {
+            "drain-only" => ModelWriterMode::DrainOnly,
+            _ => ModelWriterMode::Surreal,
+        };
+        println!(
+            "🔧 模型写入后端: {}",
+            db_option_ext.model_writer_mode.as_str()
+        );
+        if db_option_ext.model_writer_mode == ModelWriterMode::DrainOnly {
+            println!("🔧 drain-only 压测模式: 生成几何 batch，仅消费统计，不写 SurrealDB");
+        }
+    }
+    db_option_ext.validate_model_writer_features()?;
     if matches.get_flag("export-parquet-after-gen") {
         db_option_ext.export_parquet_after_gen = true;
         println!("🔧 模型生成完成后将自动导出 Parquet（按 manual_db_nums）");

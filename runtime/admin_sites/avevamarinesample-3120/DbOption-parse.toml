@@ -1,0 +1,483 @@
+apply_boolean_operation = true
+att_chunk = 200
+batch_insert_sql_cnt = 100
+boolean_pipeline_mode = "db_legacy"
+build_cate_relate = false
+debug_print_world_transform = false
+debug_refno_types = [
+    "CATA",
+    "LOOP",
+    "PRIM",
+]
+defer_db_write = false
+enable_index = false
+enable_log = true
+enable_sqlite_rtree = true
+file_server_host = "http://localhost:8082/assets/archives"
+gen_history_model = false
+gen_mesh = true
+gen_model = true
+gen_model_batch_size = 16
+gen_spatial_tree = true
+gen_tree_only = false
+included_db_files = [
+    "ams1112_0001",
+    "ams1112_0001 copy",
+    "ams1112_0001 copy 3",
+    "ams1112_0001 copy 4",
+    "ams1112_0001-new",
+    "ams1112_0001-test",
+    "ams1112_0001_old",
+    "ams251000_0001",
+    "ams251001_0001",
+    "ams251002_0001",
+    "ams251005_0001",
+    "ams251006_0001",
+    "ams251007_0001",
+    "ams251008_0001",
+    "ams251009_0001",
+    "ams251010_0001",
+    "ams251011_0001",
+    "ams251012_0001",
+    "ams251013_0001",
+    "ams251014_0001",
+    "ams251015_0001",
+    "ams251016_0001",
+    "ams251017_0001",
+    "ams251018_0001",
+    "ams251019_0001",
+    "ams251020_0001",
+    "ams251021_0001",
+    "ams251022_0001",
+    "ams251028_0001",
+    "ams251029_0001",
+    "ams251030_0001",
+    "ams251031_0001",
+    "ams251032_0001",
+    "ams251033_0001",
+    "ams251037_0001",
+    "ams251038_0001",
+    "ams251039_0001",
+    "ams251040_0001",
+    "ams251041_0001",
+    "ams251042_0001",
+    "ams251044_0001",
+    "ams251045_0001",
+    "ams251046_0001",
+    "ams251050_0001",
+    "ams251054_0001",
+    "ams251064_0001",
+    "ams251065_0001",
+    "ams251066_0001",
+    "ams251067_0001",
+    "ams251068_0001",
+    "ams251069_0001",
+    "ams251070_0001",
+    "ams251071_0001",
+    "ams251072_0001",
+    "ams251073_0001",
+    "ams251074_0001",
+    "ams251075_0001",
+    "ams251076_0001",
+    "ams251077_0001",
+    "ams251078_0001",
+    "ams251079_0001",
+    "ams251080_0001",
+    "ams251081_0001",
+    "ams251082_0001",
+    "ams251083_0001",
+    "ams251084_0001",
+    "ams251085_0001",
+    "ams251086_0001",
+    "ams251087_0001",
+    "ams251088_0001",
+    "ams251089_0001",
+    "ams251090_0001",
+    "ams251091_0001",
+    "ams251092_0001",
+    "ams251093_0001",
+    "ams251094_0001",
+    "ams251095_0001",
+    "ams251096_0001",
+    "ams251097_0001",
+    "ams251098_0001",
+    "ams251099_0001",
+    "ams251100_0001",
+    "ams251101_0001",
+    "ams251102_0001",
+    "ams251103_0001",
+    "ams251104_0001",
+    "ams251105_0001",
+    "ams251106_0001",
+    "ams251107_0001",
+    "ams251108_0001",
+    "ams251109_0001",
+    "ams251110_0001",
+    "ams251111_0001",
+    "ams251112_0001",
+    "ams251113_0001",
+    "ams251114_0001",
+    "ams251115_0001",
+    "ams251116_0001",
+    "ams251117_0001",
+    "ams251118_0001",
+    "ams251119_0001",
+    "ams251120_0001",
+    "ams251121_0001",
+    "ams251122_0001",
+    "ams251123_0001",
+    "ams251124_0001",
+    "ams251125_0001",
+    "ams251126_0001",
+    "ams251127_0001",
+    "ams251128_0001",
+    "ams251129_0001",
+    "ams251130_0001",
+    "ams251131_0001",
+    "ams251132_0001",
+    "ams251133_0001",
+    "ams251134_0001",
+    "ams251135_0001",
+    "ams251136_0001",
+    "ams251137_0001",
+    "ams251138_0001",
+    "ams251139_0001",
+    "ams251140_0001",
+    "ams251141_0001",
+    "ams251142_0001",
+    "ams251143_0001",
+    "ams251144_0001",
+    "ams251145_0001",
+    "ams251146_0001",
+    "ams251147_0001",
+    "ams251148_0001",
+    "ams251149_0001",
+    "ams251150_0001",
+    "ams251151_0001",
+    "ams251152_0001",
+    "ams251153_0001",
+    "ams251154_0001",
+    "ams251155_0001",
+    "ams251156_0001",
+    "ams251157_0001",
+    "ams251158_0001",
+    "ams251159_0001",
+    "ams251160_0001",
+    "ams251161_0001",
+    "ams251162_0001",
+    "ams251163_0001",
+    "ams251164_0001",
+    "ams251165_0001",
+    "ams251166_0001",
+    "ams251167_0001",
+    "ams251168_0001",
+    "ams251169_0001",
+    "ams251170_0001",
+    "ams251171_0001",
+    "ams251172_0001",
+    "ams251173_0001",
+    "ams251174_0001",
+    "ams251175_0001",
+    "ams251176_0001",
+    "ams251177_0001",
+    "ams251178_0001",
+    "ams251179_0001",
+    "ams251180_0001",
+    "ams251181_0001",
+    "ams251182_0001",
+    "ams251183_0001",
+    "ams251184_0001",
+    "ams251185_0001",
+    "ams251186_0001",
+    "ams251187_0001",
+    "ams251188_0001",
+    "ams251189_0001",
+    "ams251190_0001",
+    "ams251191_0001",
+    "ams251192_0001",
+    "ams251193_0001",
+    "ams251194_0001",
+    "ams251195_0001",
+    "ams251196_0001",
+    "ams251197_0001",
+    "ams251198_0001",
+    "ams251199_0001",
+    "ams251200_0001",
+    "ams251201_0001",
+    "ams251202_0001",
+    "ams251203_0001",
+    "ams251248_0001",
+    "ams251249_0001",
+    "ams251250_0001",
+    "ams251251_0001",
+    "ams251252_0001",
+    "ams251253_0001",
+    "ams251254_0001",
+    "ams251255_0001",
+    "ams251256_0001",
+    "ams251257_0001",
+    "ams251258_0001",
+    "ams251259_0001",
+    "ams251260_0001",
+    "ams251261_0001",
+    "ams251262_0001",
+    "ams251263_0001",
+    "ams251264_0001",
+    "ams251265_0001",
+    "ams251266_0001",
+    "ams251267_0001",
+    "ams251268_0001",
+    "ams251269_0001",
+    "ams251270_0001",
+    "ams251271_0001",
+    "ams251272_0001",
+    "ams251273_0001",
+    "ams251274_0001",
+    "ams251275_0001",
+    "ams251276_0001",
+    "ams251277_0001",
+    "ams251278_0001",
+    "ams251279_0001",
+    "ams251280_0001",
+    "ams251281_0001",
+    "ams251282_0001",
+    "ams251283_0001",
+    "ams251284_0001",
+    "ams251285_0001",
+    "ams251286_0001",
+    "ams251287_0001",
+    "ams251288_0001",
+    "ams251289_0001",
+    "ams251290_0001",
+    "ams251291_0001",
+    "ams251292_0001",
+    "ams251293_0001",
+    "ams251294_0001",
+    "ams251295_0001",
+    "ams251296_0001",
+    "ams251297_0001",
+    "ams251298_0001",
+    "ams251299_0001",
+    "ams251300_0001",
+    "ams251301_0001",
+    "ams251302_0001",
+    "ams251303_0001",
+    "ams251304_0001",
+    "ams251305_0001",
+    "ams251306_0001",
+    "ams251307_0001",
+    "ams251308_0001",
+    "ams251309_0001",
+    "ams251310_0001",
+    "ams251311_0001",
+    "ams251312_0001",
+    "ams251313_0001",
+    "ams251314_0001",
+    "ams251315_0001",
+    "ams251316_0001",
+    "ams251317_0001",
+    "ams251318_0001",
+    "ams251319_0001",
+    "ams251320_0001",
+    "ams251321_0001",
+    "ams251322_0001",
+    "ams251323_0001",
+    "ams251324_0001",
+    "ams251325_0001",
+    "ams251326_0001",
+    "ams251327_0001",
+    "ams251328_0001",
+    "ams251329_0001",
+    "ams251330_0001",
+    "ams251331_0001",
+    "ams251332_0001",
+    "ams251333_0001",
+    "ams251451_0001",
+    "ams251452_0001",
+    "ams251453_0001",
+    "ams3001",
+    "ams3002",
+    "ams7324_0001",
+    "ams7326_0001",
+    "ams7327_0001",
+    "ams7329_0001",
+    "ams7330_0001",
+    "ams7331_0001",
+    "ams7332_0001",
+    "ams7333_0001",
+    "ams7334_0001",
+    "ams7350_0001",
+    "ams7352_0001",
+    "ams7353_0001",
+    "ams7354_0001",
+    "ams7356_0001",
+    "ams7741_0001",
+    "ams7997_0001",
+    "ams7998_0001",
+    "ams7999_0001",
+    "ams8000_0001",
+    "amssys",
+]
+included_projects = ["AvevaMarineSample"]
+incr_sync = false
+index_tree_batch_size = 200
+index_tree_debug_limit_per_target_type = 0
+index_tree_max_concurrent_targets = 6
+ip = "127.0.0.1"
+load_spatial_tree = false
+location = "sjz"
+location_dbs = [251181]
+manual_db_nums = []
+mdb_name = "ALL"
+mesh_tol_ratio = 3.0
+meshes_path = "./assets/meshes"
+module = "DESI"
+mqtt_host = "127.0.0.1"
+mqtt_port = 1883
+need_sync_refno_basic = false
+only_rebuild_pdms_element = false
+only_sync_sys = false
+only_update_dbinfo = false
+password = ""
+pe_chunk = 300
+port = "3306"
+project_code = "1516"
+project_dirs = ["AvevaMarineSample"]
+project_name = "AvevaMarineSample"
+project_path = '\\?\D:\AVEVA\Projects\E3D2.1'
+puhua_database_ip = ""
+puhua_database_password = ""
+puhua_database_user = ""
+rebuild_ssc_tree = false
+remote_file_server_hosts = []
+replace_dbs = false
+replace_mesh = false
+reset_mdb_project = false
+room_key_word = ["-RM"]
+save_db = true
+save_spatial_tree_to_db = false
+sql_threads_number = 50
+surreal_ip = "127.0.0.1"
+surreal_ns = "1516"
+surreal_password = "root"
+surreal_port = 8021
+surreal_script_dir = "../rs-core/resource/surreal"
+surreal_user = "root"
+sync_chunk_size = 100000
+sync_graph_db = true
+sync_history = false
+sync_live = false
+sync_tidb = false
+sync_versioned = false
+total_sync = true
+user = "root"
+
+[mesh_precision]
+default_lod = "L1"
+
+[mesh_precision.lod_profiles.L1]
+mesh_tol_ratio = 3.0
+neg_multiplier = 0.3
+polyhedron_fixed_tol = 0.01
+radial_segments = 48
+sphere_subdiv = 32
+sweep_multiplier = 0.1
+
+[mesh_precision.lod_profiles.L1.csg_settings]
+cap_segments = 1
+error_tolerance = 0.002
+height_segments = 3
+max_height_segments = 6
+max_radial_segments = 60
+min_height_segments = 2
+min_radial_segments = 16
+non_scalable_factor = 0.7
+radial_segments = 32
+target_segment_length = 80.0
+
+[mesh_precision.lod_profiles.L2]
+mesh_tol_ratio = 6.0
+neg_multiplier = 0.4
+polyhedron_fixed_tol = 0.02
+radial_segments = 24
+sphere_subdiv = 18
+sweep_multiplier = 0.15
+
+[mesh_precision.lod_profiles.L2.csg_settings]
+cap_segments = 1
+error_tolerance = 0.005
+height_segments = 2
+max_height_segments = 3
+max_radial_segments = 30
+min_height_segments = 1
+min_radial_segments = 12
+non_scalable_factor = 0.8
+radial_segments = 20
+target_segment_length = 140.0
+
+[mesh_precision.lod_profiles.L3]
+mesh_tol_ratio = 10.0
+neg_multiplier = 0.5
+polyhedron_fixed_tol = 0.05
+radial_segments = 16
+sphere_subdiv = 12
+sweep_multiplier = 0.2
+
+[mesh_precision.lod_profiles.L3.csg_settings]
+cap_segments = 1
+error_tolerance = 0.01
+height_segments = 1
+max_height_segments = 2
+max_radial_segments = 18
+min_height_segments = 1
+min_radial_segments = 12
+non_scalable_factor = 0.9
+radial_segments = 12
+target_segment_length = 250.0
+
+[mesh_precision.lod_profiles.L4]
+mesh_tol_ratio = 15.0
+neg_multiplier = 0.6
+polyhedron_fixed_tol = 0.1
+radial_segments = 8
+sphere_subdiv = 8
+sweep_multiplier = 0.3
+
+[mesh_precision.lod_profiles.L4.csg_settings]
+cap_segments = 1
+error_tolerance = 0.02
+height_segments = 1
+max_height_segments = 1
+max_radial_segments = 12
+min_height_segments = 1
+min_radial_segments = 6
+non_scalable_factor = 1.0
+radial_segments = 8
+target_segment_length = 400.0
+
+[model_center]
+base_url = "http://localhost:3000"
+frontend_base_url = "http://123.57.182.243"
+timeout_seconds = 30
+token_secret = "your-shared-secret-key"
+
+[platform_auth]
+debug_token = ""
+enabled = true
+
+[review_auth]
+debug_project_id = "debug-project"
+debug_role = "sj"
+debug_user_id = "debug-user"
+enabled = false
+
+[surrealdb]
+ip = "127.0.0.1"
+mode = "ws"
+path = 'runtime/admin_sites\avevamarinesample-3120\data\surreal.db'
+port = 8021
+
+[surrealkv]
+enabled = false
+mode = "file"
+path = 'runtime/admin_sites\avevamarinesample-3120\data\surreal.db.kv'

@@ -210,9 +210,9 @@ async function confirmDelete() {
     const name = deleteTarget.value.name
     await registryStore.deleteSite(deleteTarget.value.site_id)
     deleteTarget.value = null
-    setFeedback('success', `${name} 已删除`)
+    setFeedback('success', `${name} 已从注册表移除，项目与运行数据目录未删除`)
   } catch (err: unknown) {
-    setFeedback('error', err instanceof Error ? err.message : '删除注册表站点失败')
+    setFeedback('error', err instanceof Error ? err.message : '移除注册表记录失败')
     deleteTarget.value = null
   } finally {
     deleteLoading.value = false
@@ -481,7 +481,7 @@ onMounted(async () => {
                 </button>
                 <button
                   class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-accent transition-colors"
-                  title="删除"
+                  title="移除注册记录"
                   @click="openDeleteConfirm(site)"
                 >
                   <Trash2 class="h-4 w-4 text-destructive" />
@@ -567,8 +567,10 @@ onMounted(async () => {
       <div v-if="deleteTarget" class="fixed inset-0 z-50 flex items-center justify-center">
         <div class="absolute inset-0 bg-black/50" @click="deleteTarget = null" />
         <div class="relative w-full max-w-sm rounded-lg border border-border bg-background p-6 shadow-xl">
-          <h3 class="text-lg font-semibold mb-2">确认删除</h3>
-          <p class="text-sm text-muted-foreground">确认删除注册表站点「{{ deleteTarget.name }}」吗？此操作不可撤销。</p>
+          <h3 class="text-lg font-semibold mb-2">确认移除注册记录</h3>
+          <p class="text-sm text-muted-foreground">
+            确认从注册表移除「{{ deleteTarget.name }}」吗？此操作不会删除项目目录或运行数据目录。
+          </p>
           <div class="mt-4 flex justify-end gap-3">
             <button
               class="inline-flex h-9 items-center rounded-md border border-input bg-transparent px-4 text-sm font-medium hover:bg-accent transition-colors"
@@ -578,7 +580,7 @@ onMounted(async () => {
               class="inline-flex h-9 items-center rounded-md bg-destructive px-4 text-sm font-medium text-destructive-foreground shadow hover:bg-destructive/90 transition-colors disabled:opacity-50"
               :disabled="deleteLoading"
               @click="confirmDelete"
-            >{{ deleteLoading ? '删除中...' : '删除' }}</button>
+            >{{ deleteLoading ? '移除中...' : '移除注册记录' }}</button>
           </div>
         </div>
       </div>

@@ -332,6 +332,7 @@ impl SqliteAabbIndex {
                     "BRAN" | "HANG" if config.bran_fine => {
                         Self::extract_children_aabbs_merged(group, &mut aabb_map, &mut stats);
                         Self::extract_tubings_aabbs_merged(group, &mut aabb_map, &mut stats);
+                        Self::extract_group_parts_owner_aabb_merged(group, &mut aabb_map);
                     }
                     _ => {}
                 }
@@ -349,7 +350,7 @@ impl SqliteAabbIndex {
             if !aabb_items.is_empty() {
                 self.insert_aabbs_with_items_and_spec_values(aabb_items)?;
             }
-            stats.total_inserted = stats.equi_count + stats.children_count + stats.tubings_count;
+            stats.total_inserted = stats.unique_count;
             return Ok(stats);
         }
 
@@ -513,6 +514,7 @@ impl SqliteAabbIndex {
 
             // BRAN/HANG fine：children + tubings
             if matches!(owner_noun, "BRAN" | "HANG") && config.bran_fine {
+                let mut owner_merged: Option<(f64, f64, f64, f64, f64, f64)> = None;
                 if let Some(children) = group.get("children").and_then(|v| v.as_array()) {
                     for child in children {
                         let r = child.get("refno").and_then(|v| v.as_str()).unwrap_or("");
@@ -526,6 +528,7 @@ impl SqliteAabbIndex {
                         else {
                             continue;
                         };
+                        merge_bounds(&mut owner_merged, (minx, maxx, miny, maxy, minz, maxz));
                         if seen.insert(id) {
                             stats.unique_count += 1;
                         }
@@ -563,6 +566,7 @@ impl SqliteAabbIndex {
                         else {
                             continue;
                         };
+                        merge_bounds(&mut owner_merged, (minx, maxx, miny, maxy, minz, maxz));
                         if seen.insert(id) {
                             stats.unique_count += 1;
                         }
@@ -582,6 +586,32 @@ impl SqliteAabbIndex {
                         if buf.len() >= CHUNK {
                             flush(self, &mut buf)?;
                         }
+                    }
+                }
+
+                if let (Some(owner_id), Some((minx, maxx, miny, maxy, minz, maxz))) =
+                    (refno_str_to_i64(owner_refno), owner_merged)
+                {
+                    let spec_value = group
+                        .get("spec_value")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    if seen.insert(owner_id) {
+                        stats.unique_count += 1;
+                    }
+                    buf.push((
+                        owner_id,
+                        owner_noun.to_string(),
+                        spec_value,
+                        minx,
+                        maxx,
+                        miny,
+                        maxy,
+                        minz,
+                        maxz,
+                    ));
+                    if buf.len() >= CHUNK {
+                        flush(self, &mut buf)?;
                     }
                 }
             }
@@ -621,7 +651,7 @@ impl SqliteAabbIndex {
 
         flush(self, &mut buf)?;
 
-        stats.total_inserted = stats.equi_count + stats.children_count + stats.tubings_count;
+        stats.total_inserted = stats.unique_count;
         Ok(stats)
     }
 
@@ -702,6 +732,60 @@ impl SqliteAabbIndex {
                     stats.tubings_count += 1;
                 }
             }
+        }
+    }
+
+    fn extract_group_parts_owner_aabb_merged(
+        group: &serde_json::Value,
+        map: &mut std::collections::HashMap<i64, (String, i64, f64, f64, f64, f64, f64, f64)>,
+    ) {
+        let Some(owner_refno) = group["owner_refno"].as_str() else {
+            return;
+        };
+        let Some(owner_id) = refno_str_to_i64(owner_refno) else {
+            return;
+        };
+        let owner_noun = group["owner_noun"].as_str().unwrap_or("").to_string();
+        let spec_value = group["spec_value"].as_i64().unwrap_or(0);
+        let mut merged: Option<(f64, f64, f64, f64, f64, f64)> = None;
+
+        let mut merge_part = |item: (i64, String, i64, f64, f64, f64, f64, f64, f64)| {
+            let (_, _, _, minx, maxx, miny, maxy, minz, maxz) = item;
+            match &mut merged {
+                Some(acc) => {
+                    acc.0 = acc.0.min(minx);
+                    acc.1 = acc.1.max(maxx);
+                    acc.2 = acc.2.min(miny);
+                    acc.3 = acc.3.max(maxy);
+                    acc.4 = acc.4.min(minz);
+                    acc.5 = acc.5.max(maxz);
+                }
+                None => merged = Some((minx, maxx, miny, maxy, minz, maxz)),
+            }
+        };
+
+        if let Some(children) = group["children"].as_array() {
+            for child in children {
+                if let Some(item) = Self::extract_element_aabb(child) {
+                    merge_part(item);
+                }
+            }
+        }
+        if let Some(tubings) = group["tubings"].as_array() {
+            for tubi in tubings {
+                if let Some(item) = Self::extract_element_aabb(tubi) {
+                    merge_part(item);
+                }
+            }
+        }
+
+        if let Some((minx, maxx, miny, maxy, minz, maxz)) = merged {
+            Self::merge_aabb(
+                map,
+                (
+                    owner_id, owner_noun, spec_value, minx, maxx, miny, maxy, minz, maxz,
+                ),
+            );
         }
     }
 

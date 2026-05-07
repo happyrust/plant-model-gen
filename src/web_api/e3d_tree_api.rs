@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::Arc;
+use tokio::time::{Duration, timeout};
 use surrealdb::types::SurrealValue;
 
 use crate::data_interface::db_meta_manager::db_meta;
@@ -147,18 +148,37 @@ async fn get_world_root(
     let db_option = aios_core::get_db_option();
     let mdb_name = db_option.mdb_name.clone();
 
-    let (world, world_error) = match aios_core::mdb::get_world_refno(mdb_name).await {
-        Ok(r) => (r.refno(), None),
-        Err(e) => match resolve_offline_world_refno() {
-            Some(refno) => (refno.refno(), Some(format!("get_world_refno failed: {e}"))),
-            None => {
-                return Ok(Json(NodeResponse {
-                    success: false,
-                    node: None,
-                    error_message: Some(format!("get_world_refno failed: {e}")),
-                }));
-            }
-        },
+    let (world, world_error) = if let Some(refno) = resolve_offline_world_refno() {
+        (refno.refno(), None)
+    } else {
+        let world_query =
+            timeout(Duration::from_secs(2), aios_core::mdb::get_world_refno(mdb_name)).await;
+        match world_query {
+            Ok(Ok(r)) => (r.refno(), None),
+            Ok(Err(e)) => match resolve_offline_world_refno() {
+                Some(refno) => (refno.refno(), Some(format!("get_world_refno failed: {e}"))),
+                None => {
+                    return Ok(Json(NodeResponse {
+                        success: false,
+                        node: None,
+                        error_message: Some(format!("get_world_refno failed: {e}")),
+                    }));
+                }
+            },
+            Err(_) => match resolve_offline_world_refno() {
+                Some(refno) => (
+                    refno.refno(),
+                    Some("get_world_refno timed out; using offline world refno".to_string()),
+                ),
+                None => {
+                    return Ok(Json(NodeResponse {
+                        success: false,
+                        node: None,
+                        error_message: Some("get_world_refno timed out".to_string()),
+                    }));
+                }
+            },
+        }
     };
 
     // pe 表可能不包含 WORL/SITE 数据；因此这里优先返回可用的根 refno + noun。

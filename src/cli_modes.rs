@@ -1680,13 +1680,18 @@ pub async fn run_regen_model(
     }
     let target_refnos = collect_regen_target_refnos(config).await?;
 
-    // 先清理 legacy 模型关系（含 inst_relate / geo_relate / tubi_relate），
-    // 再清理 refno_relations 扁平表，避免 regen 后导出仍读到历史 tubi 脏数据。
-    aios_database::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen(&target_refnos).await?;
-    aios_database::fast_model::gen_model::pdms_inst_surreal::pre_cleanup_for_regen_surreal(
-        &target_refnos,
-    )
-    .await?;
+    if db_option_override.model_writer_mode.writes_to_surreal() {
+        // 先清理 legacy 模型关系（含 inst_relate / geo_relate / tubi_relate），
+        // 再清理 refno_relations 扁平表，避免 regen 后导出仍读到历史 tubi 脏数据。
+        aios_database::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen(&target_refnos)
+            .await?;
+        aios_database::fast_model::gen_model::pdms_inst_surreal::pre_cleanup_for_regen_surreal(
+            &target_refnos,
+        )
+        .await?;
+    } else {
+        println!("   - drain-only 压测模式：跳过 regen cleanup，避免删除现有 SurrealDB 模型数据");
+    }
 
     // 4.1 从目标 refnos 推导 dbnum，覆盖配置文件中的 manual_db_nums
     if !target_refnos.is_empty() {
@@ -4026,7 +4031,10 @@ pub async fn room_compute_mode(
     verbose: bool,
     db_option_ext: &DbOptionExt,
 ) -> Result<()> {
-    use aios_database::fast_model::{RoomBuildStats, build_room_relations};
+    use aios_database::fast_model::{
+        RoomBuildStats, build_room_relations,
+        room_model::build_room_relations_with_model_generation,
+    };
     use std::time::Instant;
 
     #[cfg(feature = "profile")]
@@ -4138,8 +4146,16 @@ pub async fn room_compute_mode(
 
     let restore_full_index_after_run = db_nums.is_some() || refno_root.is_some();
     let compute_result: Result<()> = async {
-        let stats =
-            build_room_relations(&db_option_ext.inner, db_nums.as_deref(), refno_root).await?;
+        let stats = if gen_panels_mesh {
+            build_room_relations_with_model_generation(
+                &db_option_ext.inner,
+                db_nums.as_deref(),
+                refno_root,
+            )
+            .await?
+        } else {
+            build_room_relations(&db_option_ext.inner, db_nums.as_deref(), refno_root).await?
+        };
 
         let duration = start_time.elapsed();
         perf_timer.mark("print_summary");

@@ -22,6 +22,10 @@ fn default_regen_delete_mode() -> RegenDeleteMode {
     RegenDeleteMode::Legacy
 }
 
+fn default_model_writer_mode() -> ModelWriterMode {
+    ModelWriterMode::Surreal
+}
+
 fn default_batch_channel_capacity() -> usize {
     100
 }
@@ -47,6 +51,15 @@ fn parse_regen_delete_mode(raw: Option<&str>) -> RegenDeleteMode {
     }
 }
 
+fn parse_model_writer_mode(raw: Option<&str>) -> ModelWriterMode {
+    match raw.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(mode) if mode == "drain-only" || mode == "drain_only" || mode == "drain" => {
+            ModelWriterMode::DrainOnly
+        }
+        Some(_) | None => ModelWriterMode::Surreal,
+    }
+}
+
 /// 校验数据源模式是否符合当前固定策略。
 ///
 /// 当前策略：输入数据固定读取 SurrealDB。
@@ -62,7 +75,7 @@ pub fn validate_data_source_mode(use_surrealdb: bool) -> anyhow::Result<()> {
 }
 
 /// 生成的网格模型格式
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MeshFormat {
     /// 原始二进制 PdmsMesh 格式 (.mesh)
@@ -76,6 +89,35 @@ pub enum MeshFormat {
 impl Default for MeshFormat {
     fn default() -> Self {
         Self::PdmsMesh
+    }
+}
+
+/// 模型生成结果写入后端。
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelWriterMode {
+    /// 写回 SurrealDB 模型表，保持当前默认行为。
+    Surreal,
+    /// 只消费生成端 batch 并输出统计，不持久化，用于压测生成吞吐。
+    DrainOnly,
+}
+
+impl Default for ModelWriterMode {
+    fn default() -> Self {
+        Self::Surreal
+    }
+}
+
+impl ModelWriterMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Surreal => "surreal",
+            Self::DrainOnly => "drain-only",
+        }
+    }
+
+    pub fn writes_to_surreal(&self) -> bool {
+        matches!(self, Self::Surreal)
     }
 }
 
@@ -206,6 +248,10 @@ pub struct DbOptionExt {
     /// 布尔运算执行模式
     #[serde(default = "default_boolean_pipeline_mode")]
     pub boolean_pipeline_mode: BooleanPipelineMode,
+
+    /// 模型写入后端：surreal 写库，drain-only 仅消费统计。
+    #[serde(default = "default_model_writer_mode")]
+    pub model_writer_mode: ModelWriterMode,
 
     /// regen-model 删旧模式。
     ///
@@ -360,6 +406,22 @@ impl DbOptionExt {
     pub fn get_db_meta_info_path(&self) -> std::path::PathBuf {
         self.get_scene_tree_dir().join("db_meta_info.json")
     }
+
+    pub fn validate_model_writer_features(&self) -> anyhow::Result<()> {
+        match self.model_writer_mode {
+            ModelWriterMode::Surreal if !cfg!(feature = "write-to-surrealdb") => {
+                anyhow::bail!(
+                    "model_writer=surreal 需要编译 feature `write-to-surrealdb`；请使用 --features \"review\" 或显式加入 write-to-surrealdb"
+                )
+            }
+            ModelWriterMode::DrainOnly if !cfg!(feature = "model-writer-drain") => {
+                anyhow::bail!(
+                    "model_writer=drain-only 需要编译 feature `model-writer-drain`；例如 --features \"review,model-writer-drain\""
+                )
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 impl From<DbOption> for DbOptionExt {
@@ -384,6 +446,7 @@ impl From<DbOption> for DbOptionExt {
             model_cache_dir: None,
             defer_db_write: false,
             boolean_pipeline_mode: BooleanPipelineMode::DbLegacy,
+            model_writer_mode: ModelWriterMode::Surreal,
             regen_delete_mode: RegenDeleteMode::Legacy,
             enable_db_backfill: false,
             gen_model_dry_run: false,
@@ -557,6 +620,13 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         })
         .unwrap_or(BooleanPipelineMode::DbLegacy);
 
+    let model_writer_mode = parse_model_writer_mode(
+        toml_value
+            .get("model_writer")
+            .or_else(|| toml_value.get("model_writer_mode"))
+            .and_then(|v| v.as_str()),
+    );
+
     let regen_delete_mode =
         parse_regen_delete_mode(toml_value.get("regen_delete_mode").and_then(|v| v.as_str()));
 
@@ -620,6 +690,7 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         model_cache_dir,
         defer_db_write,
         boolean_pipeline_mode,
+        model_writer_mode,
         regen_delete_mode,
         enable_db_backfill,
         gen_model_dry_run,
@@ -641,6 +712,10 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
     println!(
         "   - LOD profiles 数量: {}",
         db_option_ext.inner.mesh_precision.lod_profiles.len()
+    );
+    println!(
+        "   - model_writer: {}",
+        db_option_ext.model_writer_mode.as_str()
     );
     if !db_option_ext.index_tree_enabled_target_types.is_empty() {
         println!(

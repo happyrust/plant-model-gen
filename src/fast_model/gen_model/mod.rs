@@ -47,6 +47,7 @@ pub mod utilities; // 预检查协调器
 
 // Mesh 处理
 pub mod mesh_processing;
+pub mod model_writer;
 
 // 从 fast_model 根目录迁入的模型生成管线模块
 pub mod boolean_backfill; // 布尔任务 DB 补齐（enable_db_backfill）

@@ -132,9 +132,9 @@ pub async fn get_site_info(
     _state: State<crate::web_server::AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use aios_core::get_db_option;
-    
+
     let db_option = get_db_option();
-    
+
     // 返回站点基本信息，格式与前端期望的一致
     Ok(Json(json!({
         "file_server_host": db_option.file_server_host,
@@ -317,9 +317,13 @@ pub async fn save_site_config(
     Json(config): Json<SiteConfig>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     log::info!("📝 [站点配置] 开始保存配置...");
-    log::info!("📝 [站点配置] 收到的配置: location={}, mqtt_host={}, location_dbs={:?}", 
-        config.location, config.mqtt_host, config.location_dbs);
-    
+    log::info!(
+        "📝 [站点配置] 收到的配置: location={}, mqtt_host={}, location_dbs={:?}",
+        config.location,
+        config.mqtt_host,
+        config.location_dbs
+    );
+
     // 1. 先保存到 SQLite
     if let Err(e) = save_config_to_sqlite(&config) {
         log::error!("❌ [站点配置] 保存到 SQLite 失败: {}", e);
@@ -334,21 +338,26 @@ pub async fn save_site_config(
     match write_config(&config) {
         Ok(_) => {
             log::info!("✅ [站点配置] 已保存到 DbOption.toml");
-            
+
             // 验证保存结果：重新读取 TOML 文件
             if let Ok(content) = std::fs::read_to_string(&get_db_option_path()) {
                 if let Ok(toml_value) = toml::from_str::<toml::Value>(&content) {
-                    let saved_location = toml_value.get("location")
+                    let saved_location = toml_value
+                        .get("location")
                         .and_then(|v| v.as_str())
                         .unwrap_or("(未找到)");
-                    let saved_mqtt_host = toml_value.get("mqtt_host")
+                    let saved_mqtt_host = toml_value
+                        .get("mqtt_host")
                         .and_then(|v| v.as_str())
                         .unwrap_or("(未找到)");
-                    log::info!("🔍 [站点配置] 验证保存结果: location={}, mqtt_host={}", 
-                        saved_location, saved_mqtt_host);
+                    log::info!(
+                        "🔍 [站点配置] 验证保存结果: location={}, mqtt_host={}",
+                        saved_location,
+                        saved_mqtt_host
+                    );
                 }
             }
-            
+
             // B5 / Phase 10 · 触发 graceful shutdown，由进程级 supervisor 拉起新进程。
             //
             // sender 由 `mod.rs::start_web_server_with_config` 在启动 axum 前
@@ -594,11 +603,11 @@ pub async fn reload_site_config(
     } else {
         match aios_core::set_db_option_from_file() {
             Ok(_) => {
-                log::info!("✅ [站点配置] 热加载成功，hot_changed_keys = {:?}", hot_changed);
-                let msg = format!(
-                    "已热加载 {} 项字段变更，无需重启",
-                    hot_changed.len()
+                log::info!(
+                    "✅ [站点配置] 热加载成功，hot_changed_keys = {:?}",
+                    hot_changed
                 );
+                let msg = format!("已热加载 {} 项字段变更，无需重启", hot_changed.len());
                 (vec!["hot_reloaded"], msg)
             }
             Err(e) => {
@@ -695,35 +704,39 @@ fn read_config() -> anyhow::Result<SiteConfig> {
         if let Ok(toml_value) = toml::from_str::<toml::Value>(&content) {
             // 辅助函数：从 TOML 值中获取字符串
             let get_string = |key: &str| -> String {
-                toml_value.get(key)
+                toml_value
+                    .get(key)
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_default()
             };
-            
+
             // 辅助函数：从 TOML 值中获取整数
             let get_u16 = |key: &str, default: u16| -> u16 {
-                toml_value.get(key)
+                toml_value
+                    .get(key)
                     .and_then(|v| v.as_integer())
                     .map(|i| i as u16)
                     .unwrap_or(default)
             };
-            
+
             // 辅助函数：从 TOML 值中获取布尔值
             let get_bool = |key: &str| -> bool {
-                toml_value.get(key)
+                toml_value
+                    .get(key)
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false)
             };
-            
+
             // 辅助函数：从 TOML 值中获取浮点数 (f32)
             let get_f32 = |key: &str, default: f32| -> f32 {
-                toml_value.get(key)
+                toml_value
+                    .get(key)
                     .and_then(|v| v.as_float())
                     .map(|f| f as f32)
                     .unwrap_or(default)
             };
-            
+
             // 读取 included_projects 数组
             let included_projects = if let Some(array) = toml_value
                 .get("included_projects")
@@ -736,24 +749,22 @@ fn read_config() -> anyhow::Result<SiteConfig> {
             } else {
                 Vec::new()
             };
-            
+
             // 读取 location_dbs 数组
-            let location_dbs = if let Some(array) = toml_value
-                .get("location_dbs")
-                .and_then(|v| v.as_array())
-            {
-                array
-                    .iter()
-                    .filter_map(|v| {
-                        v.as_integer()
-                            .map(|i| i as u32)
-                            .or_else(|| v.as_str().and_then(|s| s.parse::<u32>().ok()))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            
+            let location_dbs =
+                if let Some(array) = toml_value.get("location_dbs").and_then(|v| v.as_array()) {
+                    array
+                        .iter()
+                        .filter_map(|v| {
+                            v.as_integer()
+                                .map(|i| i as u32)
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<u32>().ok()))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
             // 读取 sync_push_db_types 数组
             let sync_push_db_types = if let Some(array) = toml_value
                 .get("sync_push_db_types")
@@ -766,13 +777,17 @@ fn read_config() -> anyhow::Result<SiteConfig> {
             } else {
                 vec!["DESI".to_string()]
             };
-            
+
             // 构建配置对象（直接从 TOML 文件读取，不使用缓存）
             let location = get_string("location");
             let mqtt_host = get_string("mqtt_host");
-            log::debug!("📖 [站点配置] 从 TOML 读取: location={}, mqtt_host={}, location_dbs={:?}", 
-                location, mqtt_host, location_dbs);
-            
+            log::debug!(
+                "📖 [站点配置] 从 TOML 读取: location={}, mqtt_host={}, location_dbs={:?}",
+                location,
+                mqtt_host,
+                location_dbs
+            );
+
             config_from_toml = Some(SiteConfig {
                 project_path: get_string("project_path"),
                 included_projects,
@@ -801,9 +816,12 @@ fn read_config() -> anyhow::Result<SiteConfig> {
             });
         }
     }
-    
+
     // 用于后续逻辑的变量
-    let location_dbs = config_from_toml.as_ref().map(|c| c.location_dbs.clone()).unwrap_or_default();
+    let location_dbs = config_from_toml
+        .as_ref()
+        .map(|c| c.location_dbs.clone())
+        .unwrap_or_default();
 
     // 如果 DbOption.toml 中有配置且 location_dbs 不为空，优先使用
     if let Some(ref config) = config_from_toml {

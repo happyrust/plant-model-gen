@@ -35,24 +35,25 @@ const routeEnvId = computed(() => {
   return typeof value === 'string' ? value : null
 })
 
-function readHashTab(hash: string): WorkbenchTab {
-  const raw = (hash || '').replace(/^#/, '')
-  return (VALID_TABS as string[]).includes(raw) ? (raw as WorkbenchTab) : 'topo'
+function readRouteTab(value: unknown): WorkbenchTab {
+  return typeof value === 'string' && (VALID_TABS as string[]).includes(value) ? (value as WorkbenchTab) : 'topo'
 }
 
-const activeTab = ref<WorkbenchTab>(readHashTab(typeof location !== 'undefined' ? location.hash : ''))
+const activeTab = ref<WorkbenchTab>(readRouteTab(route.query.tab))
 
 function pickTab(k: WorkbenchTab) {
   activeTab.value = k
-  if (typeof location !== 'undefined' && location.hash !== `#${k}`) {
-    location.hash = k
+  if (readRouteTab(route.query.tab) === k) {
+    return
   }
-}
 
-if (typeof window !== 'undefined') {
-  window.addEventListener('hashchange', () => {
-    activeTab.value = readHashTab(location.hash)
-  })
+  const query = { ...route.query }
+  if (k === 'topo') {
+    delete query.tab
+  } else {
+    query.tab = k
+  }
+  void router.replace({ query })
 }
 
 const envDrawerOpen = ref(false)
@@ -107,6 +108,13 @@ watch(routeEnvId, async (nextEnvId) => {
   if (!collaboration.envs.length) return
   await collaboration.selectEnv(nextEnvId)
 })
+
+watch(
+  () => route.query.tab,
+  (nextTab) => {
+    activeTab.value = readRouteTab(nextTab)
+  },
+)
 
 watch(
   () => collaboration.selectedEnvId,

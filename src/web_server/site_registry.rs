@@ -13,6 +13,7 @@ use super::models::{
 const DEFAULT_SQLITE_PATH: &str = "deployment_sites.sqlite";
 pub const DEFAULT_REGISTRY_TTL_SECS: u64 = 120;
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+const REDACTED_SECRET_PLACEHOLDER: &str = "********";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebServerRuntimeConfig {
@@ -59,6 +60,13 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 
 fn normalize_string(value: impl Into<String>) -> String {
     value.into().trim().to_string()
+}
+
+fn is_redacted_secret_placeholder(value: &str) -> bool {
+    matches!(
+        value.trim(),
+        REDACTED_SECRET_PLACEHOLDER | "<redacted>" | "REDACTED" | "__REDACTED__"
+    )
 }
 
 fn derive_frontend_url_from_backend(backend_url: &str, bind_host: &str) -> String {
@@ -743,7 +751,11 @@ pub fn update_site(
         site.description = normalize_optional_string(Some(description.clone()));
     }
     if let Some(config) = req.config.as_ref() {
-        site.config = config.clone();
+        let mut next_config = config.clone();
+        if is_redacted_secret_placeholder(&next_config.db_password) {
+            next_config.db_password = site.config.db_password.clone();
+        }
+        site.config = next_config;
     }
     if let Some(status) = req.status.as_ref() {
         site.status = status.clone();

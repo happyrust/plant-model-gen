@@ -190,6 +190,7 @@ review = [
     "manifold",
     "project_hd",
     "surreal-save",
+    "write-to-surrealdb",
     "sqlite-index",
     "web_server",
 ]
@@ -241,6 +242,8 @@ gen_model = ["aios_core/gen_model"]
 manifold = ["aios_core/manifold"]
 # debug_parse = ["pdms_io/debug_parse"]  # 暂时禁用以避免冲突
 surreal-save = []
+write-to-surrealdb = []
+model-writer-drain = []
 test = ["aios_core/test"]
 mem-kv-save = ["aios_core/mem-kv-save"] #额外保存PE数据到内存KV数据库
 kv-rocksdb = [

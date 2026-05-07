@@ -143,12 +143,8 @@ async fn query_realtime_instance_entries(
     enable_holes: bool,
 ) -> anyhow::Result<HashMap<String, Vec<serde_json::Value>>> {
     let mesh_dir = aios_core::get_db_option().get_meshes_path();
-    let geom_insts = aios_core::rs_surreal::inst::query_insts_with_batch(
-        refnos,
-        enable_holes,
-        Some(50),
-    )
-    .await?;
+    let geom_insts =
+        aios_core::rs_surreal::inst::query_insts_with_batch(refnos, enable_holes, Some(50)).await?;
     let export_data = crate::fast_model::export_model::collect_export_data(
         geom_insts,
         refnos,

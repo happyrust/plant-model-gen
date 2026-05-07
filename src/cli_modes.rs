@@ -1683,12 +1683,16 @@ pub async fn run_regen_model(
     if db_option_override.model_writer_mode.writes_to_surreal() {
         // 先清理 legacy 模型关系（含 inst_relate / geo_relate / tubi_relate），
         // 再清理 refno_relations 扁平表，避免 regen 后导出仍读到历史 tubi 脏数据。
-        aios_database::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen(&target_refnos)
+        let model_writer = aios_database::fast_model::gen_model::model_writer::create_model_writer(
+            &db_option_override,
+        )?;
+        model_writer
+            .cleanup(
+                aios_database::fast_model::gen_model::model_writer::CleanupRequest {
+                    seed_refnos: &target_refnos,
+                },
+            )
             .await?;
-        aios_database::fast_model::gen_model::pdms_inst_surreal::pre_cleanup_for_regen_surreal(
-            &target_refnos,
-        )
-        .await?;
     } else {
         println!("   - drain-only 压测模式：跳过 regen cleanup，避免删除现有 SurrealDB 模型数据");
     }

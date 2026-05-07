@@ -409,16 +409,18 @@ impl DbOptionExt {
 
     pub fn validate_model_writer_features(&self) -> anyhow::Result<()> {
         match self.model_writer_mode {
-            ModelWriterMode::Surreal if !cfg!(feature = "write-to-surrealdb") => {
+            ModelWriterMode::Surreal
+                if !cfg!(any(
+                    feature = "write-to-surrealdb",
+                    feature = "surreal-save"
+                )) =>
+            {
                 anyhow::bail!(
-                    "model_writer=surreal 需要编译 feature `write-to-surrealdb`；请使用 --features \"review\" 或显式加入 write-to-surrealdb"
+                    "model_writer=surreal 需要编译 feature `surreal-save` 或 `write-to-surrealdb`；请使用 mission cargo check feature 集或 --features \"review\""
                 )
             }
-            ModelWriterMode::DrainOnly if !cfg!(feature = "model-writer-drain") => {
-                anyhow::bail!(
-                    "model_writer=drain-only 需要编译 feature `model-writer-drain`；例如 --features \"review,model-writer-drain\""
-                )
-            }
+            // drain-only is a non-persistent throughput sink and does not need a storage feature.
+            ModelWriterMode::DrainOnly => Ok(()),
             _ => Ok(()),
         }
     }

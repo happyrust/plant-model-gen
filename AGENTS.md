@@ -8,4 +8,6 @@ alwaysApply: true
  针对 aios-database，使用 cli + json的方式去测试验证。
 
 ## 部署目标服务器 
-服务器是123.57.182.243      ssh 的账号密码是 root    Happytest123_
+- 服务器：`123.57.182.243`
+- SSH 用户：`root`
+- SSH 密码：仅通过环境变量 / CI Secrets 提供（禁止写入仓库）

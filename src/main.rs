@@ -326,7 +326,10 @@ use aios_core::{DBType, init_surreal, query_mdb_db_nums};
 #[cfg(feature = "gui")]
 use aios_database::gui;
 #[cfg(not(feature = "gui"))]
-use aios_database::options::{MeshFormat, ModelWriterMode, get_db_option_ext_from_path};
+use aios_database::options::{
+    MeshFormat, ModelWriterMode, get_db_option_ext_from_path, parse_transform_compare_backends,
+    parse_transform_read_backend, parse_transform_write_backend,
+};
 #[cfg(not(feature = "gui"))]
 use aios_database::run_app;
 #[cfg(not(feature = "gui"))]
@@ -897,6 +900,48 @@ async fn main() -> anyhow::Result<()> {
                 .value_delimiter(',')
                 .num_args(1..),
         )
+        .arg(
+            Arg::new("transform-write-backend")
+                .long("transform-write-backend")
+                .help("pe_transform 写入后端: surreal|parquet|ducklake|dual")
+                .value_name("BACKEND"),
+        )
+        .arg(
+            Arg::new("transform-read-backend")
+                .long("transform-read-backend")
+                .help("pe_transform 读取后端: auto|surreal|parquet|ducklake|rkyv|memory")
+                .value_name("BACKEND"),
+        )
+        .arg(
+            Arg::new("transform-compare-backends")
+                .long("transform-compare-backends")
+                .help("pe_transform 对比读取后端，逗号分隔，例如 surreal,parquet")
+                .value_name("BACKENDS"),
+        )
+        .arg(
+            Arg::new("transform-parquet-dir")
+                .long("transform-parquet-dir")
+                .help("pe_transform Parquet 输出/读取目录")
+                .value_name("DIR"),
+        )
+        .arg(
+            Arg::new("transform-ducklake-metadata")
+                .long("transform-ducklake-metadata")
+                .help("DuckLake metadata.ducklake 路径")
+                .value_name("FILE"),
+        )
+        .arg(
+            Arg::new("transform-ducklake-data-path")
+                .long("transform-ducklake-data-path")
+                .help("DuckLake data path 目录")
+                .value_name("DIR"),
+        )
+        .arg(
+            Arg::new("clear-transform-before-refresh")
+                .long("clear-transform-before-refresh")
+                .help("刷新前清理目标 dbnum 的历史 pe_transform，用于对比实验")
+                .action(clap::ArgAction::SetTrue),
+        )
         // ========== MBD JSON 预生成 ==========
         .arg(
             Arg::new("export-mbd")
@@ -1069,6 +1114,48 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     db_option_ext.validate_model_writer_features()?;
+    if let Some(backend) = matches.get_one::<String>("transform-write-backend") {
+        db_option_ext.transform_write_backend = parse_transform_write_backend(Some(backend));
+        println!(
+            "🔧 pe_transform 写入后端: {}",
+            db_option_ext.transform_write_backend.as_str()
+        );
+    }
+    if let Some(backend) = matches.get_one::<String>("transform-read-backend") {
+        db_option_ext.transform_read_backend = parse_transform_read_backend(Some(backend));
+        println!(
+            "🔧 pe_transform 读取后端: {}",
+            db_option_ext.transform_read_backend.as_str()
+        );
+    }
+    if let Some(backends) = matches.get_one::<String>("transform-compare-backends") {
+        db_option_ext.transform_compare_backends =
+            parse_transform_compare_backends(Some(backends));
+        let labels = db_option_ext
+            .transform_compare_backends
+            .iter()
+            .map(|backend| backend.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("🔧 pe_transform 对比后端: {}", labels);
+    }
+    if let Some(dir) = matches.get_one::<String>("transform-parquet-dir") {
+        db_option_ext.transform_parquet_dir = Some(dir.clone());
+        println!("🔧 pe_transform Parquet 目录: {}", dir);
+    }
+    if let Some(path) = matches.get_one::<String>("transform-ducklake-metadata") {
+        db_option_ext.transform_ducklake_metadata = Some(path.clone());
+        println!("🔧 pe_transform DuckLake metadata: {}", path);
+    }
+    if let Some(path) = matches.get_one::<String>("transform-ducklake-data-path") {
+        db_option_ext.transform_ducklake_data_path = Some(path.clone());
+        println!("🔧 pe_transform DuckLake data path: {}", path);
+    }
+    if matches.get_flag("clear-transform-before-refresh") {
+        db_option_ext.clear_transform_before_refresh = true;
+        println!("🔧 pe_transform 刷新前将清理目标 dbnum 历史数据");
+    }
+    db_option_ext.validate_transform_store_features()?;
     if matches.get_flag("export-parquet-after-gen") {
         db_option_ext.export_parquet_after_gen = true;
         println!("🔧 模型生成完成后将自动导出 Parquet（按 manual_db_nums）");
@@ -2505,12 +2592,43 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
+            if db_option_ext.clear_transform_before_refresh {
+                let cleared =
+                    aios_database::pe_transform_store::clear_pe_transform_for_dbnums(&dbnums)
+                        .await?;
+                println!(
+                    "🧹 已清理历史 pe_transform: dbnums={:?}, refnos={}",
+                    dbnums, cleared
+                );
+            }
+
             let count =
-                aios_database::pe_transform_refresh::refresh_pe_transform_for_dbnums_compat(
+                aios_database::pe_transform_refresh::refresh_pe_transform_for_dbnums(
                     &dbnums,
+                    &db_option_ext,
                 )
                 .await?;
             println!("✅ pe_transform 刷新完成，共处理 {} 个节点", count);
+            if !db_option_ext.transform_compare_backends.is_empty() {
+                let stats =
+                    aios_database::pe_transform_store::compare_backends_for_dbnums(
+                        &db_option_ext,
+                        &dbnums,
+                    )
+                    .await?;
+                println!("📊 pe_transform backend 对比结果:");
+                for stat in stats {
+                    println!(
+                        "   - {}: loaded={} missing={} mismatched={} max_delta={:.6} elapsed_ms={}",
+                        stat.backend.as_str(),
+                        stat.loaded,
+                        stat.missing,
+                        stat.mismatched,
+                        stat.max_delta,
+                        stat.elapsed_ms
+                    );
+                }
+            }
             return Ok(());
         }
     }

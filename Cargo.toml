@@ -206,6 +206,11 @@ parquet-export = [
     "dep:polars",
 ]
 
+# pe_transform 持久化后端（用于刷新/对比，不改变默认 SurrealDB 路径）
+transform-store-parquet = ["parquet-export"]
+transform-store-ducklake = ["transform-store-parquet"]
+transform-store-compare = []
+
 # MBD 管线读 parquet（web_api/mbd_pipe_api.rs）
 mbd-pipe = ["parquet-export", "mbd-iso"]
 
@@ -313,3 +318,25 @@ aios_core = { path = "../rs-core" }
 [patch."https://github.com/happyrust/pdms-io.git"]
 pdms_io = { path = "../pdms-io-fork" }
 parse_pdms_db = { path = "../pdms-io-fork/crates/parse_pdms_db" }
+
+[patch."https://github.com/happyrust/indextree"]
+indextree = { path = "../../../indextree/indextree" }
+
+[patch."https://github.com/happyrust/miniacd-fork.git"]
+miniacd = { path = "../../../miniacd" }
+
+[patch."https://github.com/happyrust/rvm-rs"]
+rvm-rs = { path = "../../../rvmparser/rvm-rs" }
+
+[patch."https://gitee.com/happydpc/surrealdb"]
+surrealdb = { path = "../../../surrealdb/surrealdb" }
+surrealdb-types = { path = "../../../surrealdb/surrealdb/types" }
+
+[patch."https://github.com/happyrust/calamine"]
+calamine = { path = "../../../calamine-mirror" }
+
+[patch."https://github.com/happyrust/cavalier_contours"]
+cavalier_contours = { path = "../../../cavalier_contours/cavalier_contours" }
+
+[patch."https://github.com/happyrust/id_tree"]
+id_tree = { path = "../../../id_tree-mirror" }

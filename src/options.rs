@@ -26,6 +26,14 @@ fn default_model_writer_mode() -> ModelWriterMode {
     ModelWriterMode::Surreal
 }
 
+fn default_transform_write_backend() -> TransformWriteBackend {
+    TransformWriteBackend::Surreal
+}
+
+fn default_transform_read_backend() -> TransformReadBackend {
+    TransformReadBackend::Auto
+}
+
 fn default_batch_channel_capacity() -> usize {
     100
 }
@@ -58,6 +66,36 @@ fn parse_model_writer_mode(raw: Option<&str>) -> ModelWriterMode {
         }
         Some(_) | None => ModelWriterMode::Surreal,
     }
+}
+
+pub fn parse_transform_write_backend(raw: Option<&str>) -> TransformWriteBackend {
+    match raw.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(mode) if mode == "parquet" => TransformWriteBackend::Parquet,
+        Some(mode) if mode == "ducklake" => TransformWriteBackend::DuckLake,
+        Some(mode) if mode == "dual" => TransformWriteBackend::Dual,
+        Some(_) | None => TransformWriteBackend::Surreal,
+    }
+}
+
+pub fn parse_transform_read_backend(raw: Option<&str>) -> TransformReadBackend {
+    match raw.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(mode) if mode == "surreal" => TransformReadBackend::Surreal,
+        Some(mode) if mode == "parquet" => TransformReadBackend::Parquet,
+        Some(mode) if mode == "ducklake" => TransformReadBackend::DuckLake,
+        Some(mode) if mode == "rkyv" => TransformReadBackend::Rkyv,
+        Some(mode) if mode == "memory" => TransformReadBackend::Memory,
+        Some(_) | None => TransformReadBackend::Auto,
+    }
+}
+
+pub fn parse_transform_compare_backends(raw: Option<&str>) -> Vec<TransformReadBackend> {
+    raw.map(|s| {
+        s.split(',')
+            .map(|part| parse_transform_read_backend(Some(part)))
+            .filter(|backend| *backend != TransformReadBackend::Auto)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// 校验数据源模式是否符合当前固定策略。
@@ -118,6 +156,88 @@ impl ModelWriterMode {
 
     pub fn writes_to_surreal(&self) -> bool {
         matches!(self, Self::Surreal)
+    }
+}
+
+/// pe_transform 刷新结果写入后端。
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransformWriteBackend {
+    /// 写入 SurrealDB pe_transform，保持当前默认行为。
+    Surreal,
+    /// 写入独立 pe_transform Parquet 文件。
+    Parquet,
+    /// 写入 Parquet 后生成/执行 DuckLake 注册。
+    DuckLake,
+    /// 双写 SurrealDB + Parquet/DuckLake，用于对比。
+    Dual,
+}
+
+impl Default for TransformWriteBackend {
+    fn default() -> Self {
+        Self::Surreal
+    }
+}
+
+impl TransformWriteBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Surreal => "surreal",
+            Self::Parquet => "parquet",
+            Self::DuckLake => "ducklake",
+            Self::Dual => "dual",
+        }
+    }
+
+    pub fn writes_to_surreal(&self) -> bool {
+        matches!(self, Self::Surreal | Self::Dual)
+    }
+
+    pub fn writes_to_parquet(&self) -> bool {
+        matches!(self, Self::Parquet | Self::DuckLake | Self::Dual)
+    }
+
+    pub fn uses_ducklake(&self) -> bool {
+        matches!(self, Self::DuckLake)
+    }
+}
+
+/// pe_transform 读取/对比后端。
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransformReadBackend {
+    Auto,
+    Surreal,
+    Parquet,
+    DuckLake,
+    Rkyv,
+    Memory,
+}
+
+impl Default for TransformReadBackend {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl TransformReadBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Surreal => "surreal",
+            Self::Parquet => "parquet",
+            Self::DuckLake => "ducklake",
+            Self::Rkyv => "rkyv",
+            Self::Memory => "memory",
+        }
+    }
+
+    pub fn needs_parquet_feature(&self) -> bool {
+        matches!(self, Self::Parquet | Self::DuckLake)
+    }
+
+    pub fn needs_ducklake_feature(&self) -> bool {
+        matches!(self, Self::DuckLake)
     }
 }
 
@@ -252,6 +372,34 @@ pub struct DbOptionExt {
     /// 模型写入后端：surreal 写库，drain-only 仅消费统计。
     #[serde(default = "default_model_writer_mode")]
     pub model_writer_mode: ModelWriterMode,
+
+    /// pe_transform 刷新结果写入后端。
+    #[serde(default = "default_transform_write_backend")]
+    pub transform_write_backend: TransformWriteBackend,
+
+    /// pe_transform cache miss / 对比读取后端。
+    #[serde(default = "default_transform_read_backend")]
+    pub transform_read_backend: TransformReadBackend,
+
+    /// pe_transform 对比模式中的读取后端列表。
+    #[serde(default)]
+    pub transform_compare_backends: Vec<TransformReadBackend>,
+
+    /// pe_transform Parquet 输出目录，默认 output/{project_name}/pe_transform.
+    #[serde(default)]
+    pub transform_parquet_dir: Option<String>,
+
+    /// DuckLake metadata.ducklake 路径。
+    #[serde(default)]
+    pub transform_ducklake_metadata: Option<String>,
+
+    /// DuckLake 数据文件根目录。
+    #[serde(default)]
+    pub transform_ducklake_data_path: Option<String>,
+
+    /// 刷新前是否清理目标 dbnum 的历史 pe_transform。
+    #[serde(default)]
+    pub clear_transform_before_refresh: bool,
 
     /// regen-model 删旧模式。
     ///
@@ -392,6 +540,32 @@ impl DbOptionExt {
         self.get_project_output_dir().join("instance_cache")
     }
 
+    /// 获取 pe_transform Parquet 输出目录。
+    pub fn get_transform_parquet_dir(&self) -> std::path::PathBuf {
+        self.transform_parquet_dir
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| self.get_project_output_dir().join("pe_transform"))
+    }
+
+    pub fn get_transform_ducklake_metadata_path(&self) -> std::path::PathBuf {
+        self.transform_ducklake_metadata
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                self.get_project_output_dir()
+                    .join("ducklake")
+                    .join("metadata.ducklake")
+            })
+    }
+
+    pub fn get_transform_ducklake_data_path(&self) -> std::path::PathBuf {
+        self.transform_ducklake_data_path
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| self.get_project_output_dir().join("ducklake").join("data"))
+    }
+
     /// 获取 scene_tree 目录，默认为 output/{project_name}/scene_tree
     pub fn get_scene_tree_dir(&self) -> std::path::PathBuf {
         self.get_project_output_dir().join("scene_tree")
@@ -422,6 +596,41 @@ impl DbOptionExt {
             _ => Ok(()),
         }
     }
+
+    pub fn validate_transform_store_features(&self) -> anyhow::Result<()> {
+        let parquet_requested = self.transform_write_backend.writes_to_parquet()
+            || self.transform_read_backend.needs_parquet_feature()
+            || self
+                .transform_compare_backends
+                .iter()
+                .any(TransformReadBackend::needs_parquet_feature);
+        if parquet_requested && !cfg!(feature = "transform-store-parquet") {
+            anyhow::bail!(
+                "pe_transform parquet/ducklake 后端需要编译 feature `transform-store-parquet`；例如 --features \"review,transform-store-parquet\""
+            );
+        }
+
+        let ducklake_requested = self.transform_write_backend.uses_ducklake()
+            || self.transform_read_backend.needs_ducklake_feature()
+            || self
+                .transform_compare_backends
+                .iter()
+                .any(TransformReadBackend::needs_ducklake_feature);
+        if ducklake_requested && !cfg!(feature = "transform-store-ducklake") {
+            anyhow::bail!(
+                "pe_transform ducklake 后端需要编译 feature `transform-store-ducklake`；例如 --features \"review,transform-store-ducklake\""
+            );
+        }
+
+        if !self.transform_compare_backends.is_empty() && !cfg!(feature = "transform-store-compare")
+        {
+            anyhow::bail!(
+                "pe_transform compare 模式需要编译 feature `transform-store-compare`；例如 --features \"review,transform-store-parquet,transform-store-compare\""
+            );
+        }
+
+        Ok(())
+    }
 }
 
 impl From<DbOption> for DbOptionExt {
@@ -447,6 +656,13 @@ impl From<DbOption> for DbOptionExt {
             defer_db_write: false,
             boolean_pipeline_mode: BooleanPipelineMode::DbLegacy,
             model_writer_mode: ModelWriterMode::Surreal,
+            transform_write_backend: TransformWriteBackend::Surreal,
+            transform_read_backend: TransformReadBackend::Auto,
+            transform_compare_backends: Vec::new(),
+            transform_parquet_dir: None,
+            transform_ducklake_metadata: None,
+            transform_ducklake_data_path: None,
+            clear_transform_before_refresh: false,
             regen_delete_mode: RegenDeleteMode::Legacy,
             enable_db_backfill: false,
             gen_model_dry_run: false,
@@ -627,6 +843,55 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
             .and_then(|v| v.as_str()),
     );
 
+    let transform_write_backend = parse_transform_write_backend(
+        toml_value
+            .get("transform_write_backend")
+            .and_then(|v| v.as_str()),
+    );
+
+    let transform_read_backend = parse_transform_read_backend(
+        toml_value
+            .get("transform_read_backend")
+            .and_then(|v| v.as_str()),
+    );
+
+    let transform_compare_backends = toml_value
+        .get("transform_compare_backends")
+        .and_then(|v| {
+            if let Some(arr) = v.as_array() {
+                Some(
+                    arr.iter()
+                        .filter_map(|item| item.as_str())
+                        .map(|item| parse_transform_read_backend(Some(item)))
+                        .filter(|backend| *backend != TransformReadBackend::Auto)
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                v.as_str().map(|s| parse_transform_compare_backends(Some(s)))
+            }
+        })
+        .unwrap_or_default();
+
+    let transform_parquet_dir = toml_value
+        .get("transform_parquet_dir")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let transform_ducklake_metadata = toml_value
+        .get("transform_ducklake_metadata")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let transform_ducklake_data_path = toml_value
+        .get("transform_ducklake_data_path")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let clear_transform_before_refresh = toml_value
+        .get("clear_transform_before_refresh")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let regen_delete_mode =
         parse_regen_delete_mode(toml_value.get("regen_delete_mode").and_then(|v| v.as_str()));
 
@@ -691,6 +956,13 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         defer_db_write,
         boolean_pipeline_mode,
         model_writer_mode,
+        transform_write_backend,
+        transform_read_backend,
+        transform_compare_backends,
+        transform_parquet_dir,
+        transform_ducklake_metadata,
+        transform_ducklake_data_path,
+        clear_transform_before_refresh,
         regen_delete_mode,
         enable_db_backfill,
         gen_model_dry_run,
@@ -702,6 +974,9 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
 
     validate_data_source_mode(db_option_ext.use_surrealdb)
         .map_err(|e| anyhow::anyhow!("配置文件 {} 数据源模式非法: {}", config_file, e))?;
+    db_option_ext
+        .validate_transform_store_features()
+        .map_err(|e| anyhow::anyhow!("配置文件 {} transform backend 配置非法: {}", config_file, e))?;
 
     // 打印加载的配置
     println!("📋 加载的配置:");
@@ -716,6 +991,14 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
     println!(
         "   - model_writer: {}",
         db_option_ext.model_writer_mode.as_str()
+    );
+    println!(
+        "   - transform_write_backend: {}",
+        db_option_ext.transform_write_backend.as_str()
+    );
+    println!(
+        "   - transform_read_backend: {}",
+        db_option_ext.transform_read_backend.as_str()
     );
     if !db_option_ext.index_tree_enabled_target_types.is_empty() {
         println!(

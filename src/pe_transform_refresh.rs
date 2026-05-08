@@ -1,8 +1,6 @@
 use std::collections::VecDeque;
 
-use aios_core::rs_surreal::pe_transform::{
-    PeTransformEntry, ensure_pe_transform_schema, save_pe_transform_entries,
-};
+use aios_core::rs_surreal::pe_transform::{PeTransformEntry, ensure_pe_transform_schema};
 use aios_core::transform::get_local_mat4;
 use aios_core::{
     RefnoEnum, SurrealQueryExt, Transform, get_children_refnos, get_named_attmap,
@@ -12,9 +10,19 @@ use anyhow::{Context, Result};
 use glam::DMat4;
 use serde_json::Value;
 
+use crate::options::{DbOptionExt, get_db_option_ext};
+
 const PE_TRANSFORM_BATCH_SIZE: usize = 500;
 
 pub async fn refresh_pe_transform_for_dbnums_compat(dbnums: &[u32]) -> Result<usize> {
+    let db_option = get_db_option_ext();
+    refresh_pe_transform_for_dbnums(dbnums, &db_option).await
+}
+
+pub async fn refresh_pe_transform_for_dbnums(
+    dbnums: &[u32],
+    db_option: &DbOptionExt,
+) -> Result<usize> {
     ensure_pe_transform_schema()
         .await
         .context("初始化 pe_transform schema 失败")?;
@@ -110,12 +118,9 @@ pub async fn refresh_pe_transform_for_dbnums_compat(dbnums: &[u32]) -> Result<us
                     }
 
                     if entries.len() >= PE_TRANSFORM_BATCH_SIZE {
-                        save_pe_transform_entries(&entries).await.with_context(|| {
-                            format!("批量写入 pe_transform 失败: dbnum={}", dbnum)
-                        })?;
-                        total_primed += crate::fast_model::gen_model::transform_cache::prime_global_transform_cache_from_pe_entries(
-                            &entries,
-                        );
+                        flush_entries(db_option, &mut entries, &mut total_primed)
+                            .await
+                            .with_context(|| format!("批量写入 pe_transform 失败: dbnum={}", dbnum))?;
                         entries.clear();
                         print_progress(dbnum_processed, total_nodes, true);
                         dbnum_last_print = dbnum_processed;
@@ -128,12 +133,9 @@ pub async fn refresh_pe_transform_for_dbnums_compat(dbnums: &[u32]) -> Result<us
     }
 
     if !entries.is_empty() {
-        save_pe_transform_entries(&entries)
+        flush_entries(db_option, &mut entries, &mut total_primed)
             .await
             .context("写入最后一批 pe_transform 失败")?;
-        total_primed += crate::fast_model::gen_model::transform_cache::prime_global_transform_cache_from_pe_entries(
-            &entries,
-        );
     }
 
     println!(
@@ -145,6 +147,14 @@ pub async fn refresh_pe_transform_for_dbnums_compat(dbnums: &[u32]) -> Result<us
 
 pub async fn refresh_pe_transform_for_root_refnos_compat(
     root_refnos: &[RefnoEnum],
+) -> Result<usize> {
+    let db_option = get_db_option_ext();
+    refresh_pe_transform_for_root_refnos(root_refnos, &db_option).await
+}
+
+pub async fn refresh_pe_transform_for_root_refnos(
+    root_refnos: &[RefnoEnum],
+    db_option: &DbOptionExt,
 ) -> Result<usize> {
     ensure_pe_transform_schema()
         .await
@@ -212,12 +222,11 @@ pub async fn refresh_pe_transform_for_root_refnos_compat(
                 queue.push_back((child, world_mat));
 
                 if entries.len() >= PE_TRANSFORM_BATCH_SIZE {
-                    save_pe_transform_entries(&entries).await.with_context(|| {
-                        format!("批量写入 pe_transform 失败: root_refno={}", root_refno)
-                    })?;
-                    total_primed += crate::fast_model::gen_model::transform_cache::prime_global_transform_cache_from_pe_entries(
-                        &entries,
-                    );
+                    flush_entries(db_option, &mut entries, &mut total_primed)
+                        .await
+                        .with_context(|| {
+                            format!("批量写入 pe_transform 失败: root_refno={}", root_refno)
+                        })?;
                     entries.clear();
                 }
             }
@@ -225,12 +234,9 @@ pub async fn refresh_pe_transform_for_root_refnos_compat(
     }
 
     if !entries.is_empty() {
-        save_pe_transform_entries(&entries)
+        flush_entries(db_option, &mut entries, &mut total_primed)
             .await
             .context("写入最后一批 pe_transform 失败")?;
-        total_primed += crate::fast_model::gen_model::transform_cache::prime_global_transform_cache_from_pe_entries(
-            &entries,
-        );
     }
 
     println!(
@@ -238,6 +244,19 @@ pub async fn refresh_pe_transform_for_root_refnos_compat(
         total, total_primed
     );
     Ok(total)
+}
+
+async fn flush_entries(
+    db_option: &DbOptionExt,
+    entries: &mut Vec<PeTransformEntry>,
+    total_primed: &mut usize,
+) -> Result<()> {
+    crate::pe_transform_store::save_entries_with_backend(db_option, entries).await?;
+    *total_primed +=
+        crate::fast_model::gen_model::transform_cache::prime_global_transform_cache_from_pe_entries(
+            entries,
+        );
+    Ok(())
 }
 
 async fn query_total_nodes_for_dbnum(dbnum: u32) -> Result<usize> {

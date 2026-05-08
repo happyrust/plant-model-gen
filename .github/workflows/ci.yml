@@ -35,6 +35,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "gen-model-check"
+
+      - name: Disable sccache wrapper
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+        shell: bash
       
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -81,6 +85,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "gen-model-${{ matrix.os }}"
+
+      - name: Disable sccache wrapper
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+        shell: bash
       
       # Linux 依赖
       - name: Install Linux dependencies

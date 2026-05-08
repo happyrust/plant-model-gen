@@ -1,11 +1,11 @@
 use axum::{
+    Router,
     body::Body,
     extract::{Json, Path, Query},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
-    Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -41,10 +41,7 @@ pub fn create_admin_routes() -> Router {
         .route("/api/admin/sites/{id}/restart", post(restart_site))
         .route("/api/admin/sites/{id}/runtime", get(get_site_runtime))
         .route("/api/admin/sites/{id}/logs", get(get_site_logs))
-        .route(
-            "/api/admin/sites/{id}/logs/{kind}",
-            get(get_site_log_kind),
-        )
+        .route("/api/admin/sites/{id}/logs/{kind}", get(get_site_log_kind))
         .route(
             "/api/admin/sites/{id}/logs/{kind}/download",
             get(download_site_log),
@@ -117,12 +114,11 @@ pub async fn check_port(Query(params): Query<PortCheckQuery>) -> impl IntoRespon
     if params.port == 0 {
         return admin_response::managed_error("port 参数不能为 0".to_string());
     }
-    let pids = match crate::web_server::managed_project_sites::process_ids_on_port(params.port)
-        .await
-    {
-        Ok(pids) => pids,
-        Err(err) => return admin_response::managed_error(err.to_string()),
-    };
+    let pids =
+        match crate::web_server::managed_project_sites::process_ids_on_port(params.port).await {
+            Ok(pids) => pids,
+            Err(err) => return admin_response::managed_error(err.to_string()),
+        };
     admin_response::ok(
         "端口探测完成",
         json!({
@@ -291,8 +287,7 @@ pub async fn download_site_log(Path((site_id, kind)): Path<(String, String)>) ->
     };
     let mut buf = Vec::new();
     if let Err(err) = file.read_to_end(&mut buf).await {
-        return admin_response::managed_error(format!("读取日志文件失败: {}", err))
-            .into_response();
+        return admin_response::managed_error(format!("读取日志文件失败: {}", err)).into_response();
     }
     let filename = format!(
         "{}-{}-{}.log",
@@ -308,9 +303,7 @@ pub async fn download_site_log(Path((site_id, kind)): Path<(String, String)>) ->
             format!("attachment; filename=\"{}\"", filename),
         )
         .body(Body::from(buf))
-        .unwrap_or_else(|_| {
-            (StatusCode::INTERNAL_SERVER_ERROR, "构造下载响应失败").into_response()
-        })
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "构造下载响应失败").into_response())
 }
 
 fn runtime_ok(runtime: ManagedSiteRuntimeStatus) -> ApiResponse {

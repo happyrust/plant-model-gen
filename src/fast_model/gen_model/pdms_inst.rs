@@ -609,13 +609,12 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
 
     // 限制最大并发数，以防止对单一 SurrealDB 底层施加过大连接压力
     use futures::stream::{self, StreamExt};
-    let limit_concurrency = if get_db_option().effective_surrealdb().mode
-        == aios_core::options::DbConnMode::Ws
-    {
-        4
-    } else {
-        16
-    };
+    let limit_concurrency =
+        if get_db_option().effective_surrealdb().mode == aios_core::options::DbConnMode::Ws {
+            4
+        } else {
+            16
+        };
 
     let mut chunks: Vec<(u32, Vec<RefnoEnum>)> = Vec::new();
     for (dbnum, refs) in refnos_by_dbnum {

@@ -59,7 +59,7 @@ alwaysApply: true
 
 ## 4.1 调用时机
 
-- **MUST**: 在回复用户的完整文本输出结束后，**最后一步** 调用当前会话绑定的 `my-mcp-N` 的 `check_messages`
+- **MUST**: 在回复用户的完整文本输出结束后，**最后一步** 调用当前会话绑定的 `best-mcp-N` 的 `check_messages`
 - **MUST NOT**: 在回合开始时调用 `check_messages`
 - **MUST NOT**: 在回复尚未完整输出时调用 `check_messages`
 - **MUST**: 调用时 `turn_complete` 必须为 `true`
@@ -79,7 +79,7 @@ alwaysApply: true
 | `report_task(done/failed)` 刚返回 | 立即调用 `check_messages`，不要停在任务汇报 |
 | 需要用户补充信息 | 提问或说明缺失项，然后调用 `check_messages` |
 | `check_messages` 出错 / 超时 | 立即重试，重试前不要结束回合 |
-| 多个 MCP 同时在线 | 只调当前对话窗口绑定的那个 `my-mcp-N` |
+| 多个 MCP 同时在线 | 只调当前对话窗口绑定的那个 `best-mcp-N` |
 
 ## 4.4 处理 `check_messages` 的返回值（极重要）
 

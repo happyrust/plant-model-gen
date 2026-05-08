@@ -1159,7 +1159,11 @@ pub async fn get_mqtt_subscription_status(
     // mqtt_monitor_handlers::get_subscribed_master_info（目前仍是私有函数，B4 时再开放）
     let master_info: Option<serde_json::Value> = None;
 
-    let connection_status = if is_running { "connected" } else { "disconnected" };
+    let connection_status = if is_running {
+        "connected"
+    } else {
+        "disconnected"
+    };
 
     Ok(Json(json!({
         "status": "success",

@@ -629,10 +629,8 @@ async fn overlay_independent_states(
         let key = &state.annotation_id;
         if let Some(&idx) = annotation_index.get(key) {
             let anno = &mut annotations[idx];
-            anno.state = classify_from_independent_state(
-                &state.resolution_status,
-                &state.decision_status,
-            );
+            anno.state =
+                classify_from_independent_state(&state.resolution_status, &state.decision_status);
             anno.updated_at = Some(state.updated_at);
             if !state.updated_by_name.is_empty() {
                 anno.updated_by_name = Some(state.updated_by_name.clone());

@@ -8,12 +8,11 @@
 //! - `query`：按 `form_id + task_id` 批量查询批注状态，供前端恢复和门禁使用。
 
 use axum::{
-    Json,
+    Json, Router,
     extract::{Extension, Query},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -196,9 +195,7 @@ async fn apply_annotation_state(
             Json(ApplyAnnotationStateResponse {
                 success: false,
                 state: None,
-                error_message: Some(
-                    "formId, taskId, annotationId 均不能为空".to_string(),
-                ),
+                error_message: Some("formId, taskId, annotationId 均不能为空".to_string()),
             }),
         );
     }
@@ -223,10 +220,7 @@ async fn apply_annotation_state(
             Json(ApplyAnnotationStateResponse {
                 success: false,
                 state: None,
-                error_message: Some(format!(
-                    "不支持的 annotationType: {}",
-                    annotation_type
-                )),
+                error_message: Some(format!("不支持的 annotationType: {}", annotation_type)),
             }),
         );
     }
@@ -239,10 +233,7 @@ async fn apply_annotation_state(
                 Json(ApplyAnnotationStateResponse {
                     success: false,
                     state: None,
-                    error_message: Some(format!(
-                        "task_id={} 未找到活动 review task",
-                        task_id
-                    )),
+                    error_message: Some(format!("task_id={} 未找到活动 review task", task_id)),
                 }),
             );
         }
@@ -286,10 +277,7 @@ async fn apply_annotation_state(
             Json(ApplyAnnotationStateResponse {
                 success: false,
                 state: None,
-                error_message: Some(format!(
-                    "任务状态为 {}，禁止写入批注状态",
-                    task_status
-                )),
+                error_message: Some(format!("任务状态为 {}，禁止写入批注状态", task_status)),
             }),
         );
     }
@@ -348,7 +336,9 @@ async fn apply_annotation_state(
     });
 
     let existing = match review_primary_db()
-        .query("SELECT * FROM review_annotation_states WHERE record::id(id) = $composite_id LIMIT 1")
+        .query(
+            "SELECT * FROM review_annotation_states WHERE record::id(id) = $composite_id LIMIT 1",
+        )
         .bind(("composite_id", composite_id.clone()))
         .await
     {
@@ -429,9 +419,7 @@ async fn apply_annotation_state(
                     Json(ApplyAnnotationStateResponse {
                         success: false,
                         state: None,
-                        error_message: Some(
-                            "写入批注状态后数据库未返回结果".to_string(),
-                        ),
+                        error_message: Some("写入批注状态后数据库未返回结果".to_string()),
                     }),
                 ),
             }
@@ -557,10 +545,7 @@ fn validate_action_permission(
             if matches!(role.as_str(), "designer" | "sj" | "") {
                 Ok(())
             } else {
-                Err(format!(
-                    "角色 {} 不允许执行 {} 操作",
-                    role, action
-                ))
+                Err(format!("角色 {} 不允许执行 {} 操作", role, action))
             }
         }
         "agree" | "reject" => {
@@ -570,10 +555,7 @@ fn validate_action_permission(
             ) {
                 Ok(())
             } else {
-                Err(format!(
-                    "角色 {} 不允许执行 {} 操作",
-                    role, action
-                ))
+                Err(format!("角色 {} 不允许执行 {} 操作", role, action))
             }
         }
         _ => Err(format!("未知操作: {}", action)),
@@ -613,11 +595,7 @@ async fn compute_review_round(task_id: &str) -> Result<u32, String> {
         .map_err(|e| format!("计算 review_round 失败: {}", e))?;
 
     let rows: Vec<ReturnCountRow> = response.take(0).unwrap_or_default();
-    let return_count = rows
-        .into_iter()
-        .next()
-        .and_then(|r| r.count)
-        .unwrap_or(0);
+    let return_count = rows.into_iter().next().and_then(|r| r.count).unwrap_or(0);
     Ok(return_count + 1)
 }
 
@@ -629,12 +607,8 @@ fn state_view_from_row(row: AnnotationStateRow) -> AnnotationStateView {
         annotation_type: row.annotation_type.unwrap_or_default(),
         workflow_node: row.workflow_node.unwrap_or_else(|| "sj".to_string()),
         review_round: row.review_round.unwrap_or(1),
-        resolution_status: row
-            .resolution_status
-            .unwrap_or_else(|| "open".to_string()),
-        decision_status: row
-            .decision_status
-            .unwrap_or_else(|| "pending".to_string()),
+        resolution_status: row.resolution_status.unwrap_or_else(|| "open".to_string()),
+        decision_status: row.decision_status.unwrap_or_else(|| "pending".to_string()),
         note: row.note.filter(|s| !s.is_empty()),
         updated_by_id: row.updated_by_id.unwrap_or_default(),
         updated_by_name: row.updated_by_name.unwrap_or_default(),
@@ -682,9 +656,7 @@ pub async fn sync_annotation_states_from_snapshot(
                 continue;
             };
 
-            let review_state = item
-                .get("reviewState")
-                .or_else(|| item.get("review_state"));
+            let review_state = item.get("reviewState").or_else(|| item.get("review_state"));
 
             let Some(review_state) = review_state else {
                 continue;
@@ -758,7 +730,8 @@ pub async fn load_annotation_states_by_task(
     form_id: &str,
     task_id: &str,
 ) -> Result<Vec<AnnotationStateView>, String> {
-    let sql = "SELECT * FROM review_annotation_states WHERE form_id = $form_id AND task_id = $task_id";
+    let sql =
+        "SELECT * FROM review_annotation_states WHERE form_id = $form_id AND task_id = $task_id";
 
     let mut response = review_primary_db()
         .query(sql)
@@ -781,9 +754,6 @@ pub async fn delete_annotation_states_by_form_id(form_id: &str) -> Result<(), St
         .await
         .map_err(|e| format!("删除批注状态失败: {}", e))?;
 
-    info!(
-        "Deleted annotation states for form_id={}",
-        form_id
-    );
+    info!("Deleted annotation states for form_id={}", form_id);
     Ok(())
 }

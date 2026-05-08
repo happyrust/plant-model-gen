@@ -18,10 +18,10 @@ use std::process::Stdio;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use parse_pdms_db::parse::parse_file_basic_info;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 use sysinfo::{
     CpuRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System,
@@ -2703,7 +2703,7 @@ pub(crate) async fn process_ids_on_port(port: u16) -> Result<Vec<u32>> {
     #[cfg(unix)]
     {
         let output = Command::new("lsof")
-            .args(["-nP", "-ti", &format!("tcp:{port}")])
+            .args(["-nP", "-ti", &format!("tcp:{port}"), "-sTCP:LISTEN"])
             .output()
             .await
             .context("读取端口进程失败")?;
@@ -2739,7 +2739,7 @@ fn collect_port_pids_sync(port: u16) -> Vec<u32> {
     #[cfg(unix)]
     {
         let output = std::process::Command::new("lsof")
-            .args(["-nP", "-ti", &format!("tcp:{port}")])
+            .args(["-nP", "-ti", &format!("tcp:{port}"), "-sTCP:LISTEN"])
             .output();
         match output {
             Ok(out) => String::from_utf8_lossy(&out.stdout)
@@ -3898,7 +3898,13 @@ fn read_tail_with_total(path: &Path, limit: usize) -> (usize, Vec<String>) {
 fn sanitize_site_id_for_path(site_id: &str) -> String {
     site_id
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 

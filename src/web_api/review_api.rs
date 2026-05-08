@@ -259,12 +259,62 @@ struct CreateTaskResolvedNames {
     reviewer_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreateTaskResolvedAssignees {
+    checker_id: String,
+    reviewer_id: String,
+    approver_id: String,
+}
+
 fn preferred_name(value: Option<&str>, fallback: &str) -> String {
     value
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(fallback)
         .to_string()
+}
+
+fn resolve_create_task_human_code_field(
+    field_name: &str,
+    value: Option<&str>,
+) -> Result<String, String> {
+    let trimmed = value.map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
+        format!("{field_name} 缺少 PMS HumanCode，不能使用旧内部默认账号")
+    })?;
+
+    let valid = trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-')
+        && trimmed
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_uppercase())
+            .unwrap_or(false);
+
+    if valid {
+        Ok(trimmed.to_string())
+    } else {
+        Err(format!(
+            "{field_name} 必须是 PMS HumanCode，不能使用旧内部账号: {trimmed}"
+        ))
+    }
+}
+
+fn resolve_create_task_assignees(
+    request: &CreateTaskRequest,
+) -> Result<CreateTaskResolvedAssignees, String> {
+    let checker_id = resolve_create_task_human_code_field(
+        "checker_id",
+        request.checker_id.as_deref().or(Some(request.reviewer_id.as_str())),
+    )?;
+    let approver_id =
+        resolve_create_task_human_code_field("approver_id", request.approver_id.as_deref())?;
+
+    Ok(CreateTaskResolvedAssignees {
+        reviewer_id: checker_id.clone(),
+        checker_id,
+        approver_id,
+    })
 }
 
 fn resolve_create_task_names(
@@ -1292,12 +1342,22 @@ async fn create_task(
 
     let requester_id = claims.user_id.clone();
 
-    let checker_id = request
-        .checker_id
-        .clone()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| request.reviewer_id.clone());
-    let approver_id = request.approver_id.clone().unwrap_or_default();
+    let assignees = match resolve_create_task_assignees(&request) {
+        Ok(assignees) => assignees,
+        Err(message) => {
+            warn!("Rejecting review task create request: {}", message);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(TaskResponse {
+                    success: false,
+                    task: None,
+                    error_message: Some(message),
+                }),
+            );
+        }
+    };
+    let checker_id = assignees.checker_id.clone();
+    let approver_id = assignees.approver_id.clone();
     let resolved_names =
         resolve_create_task_names(&claims, &request, checker_id.as_str(), approver_id.as_str());
     let requester_name = resolved_names.requester_name.clone();
@@ -1350,7 +1410,7 @@ async fn create_task(
         .bind(("checker_name", resolved_names.checker_name.clone()))
         .bind(("approver_id", approver_id.clone()))
         .bind(("approver_name", resolved_names.approver_name.clone()))
-        .bind(("reviewer_id", request.reviewer_id.clone()))
+        .bind(("reviewer_id", assignees.reviewer_id.clone()))
         .bind(("reviewer_name", resolved_names.reviewer_name.clone()))
         .bind(("components", request.components.clone()))
         .bind(("attachments", request.attachments.clone()))
@@ -1417,7 +1477,7 @@ async fn create_task(
                 checker_name: resolved_names.checker_name.clone(),
                 approver_id: approver_id.clone(),
                 approver_name: resolved_names.approver_name.clone(),
-                reviewer_id: request.reviewer_id,
+                reviewer_id: assignees.reviewer_id,
                 reviewer_name: resolved_names.reviewer_name.clone(),
                 components: request.components,
                 attachments: request.attachments,
@@ -3435,57 +3495,39 @@ pub struct UserListQuery {
 fn build_mock_review_users() -> Vec<User> {
     vec![
         User {
-            id: "designer_001".to_string(),
-            username: "designer".to_string(),
+            id: "SJ".to_string(),
+            username: "SJ".to_string(),
             name: "王设计师".to_string(),
-            email: "designer@company.com".to_string(),
+            email: "sj@company.com".to_string(),
             role: "designer".to_string(),
             department: Some("设计部".to_string()),
             avatar: None,
         },
         User {
-            id: "proofreader_001".to_string(),
-            username: "proofreader".to_string(),
+            id: "JH".to_string(),
+            username: "JH".to_string(),
             name: "张校对员".to_string(),
-            email: "proofreader@company.com".to_string(),
+            email: "jh@company.com".to_string(),
             role: "proofreader".to_string(),
             department: Some("质量部".to_string()),
             avatar: None,
         },
         User {
-            id: "reviewer_001".to_string(),
-            username: "reviewer".to_string(),
+            id: "SH".to_string(),
+            username: "SH".to_string(),
             name: "李审核员".to_string(),
-            email: "reviewer@company.com".to_string(),
+            email: "sh@company.com".to_string(),
             role: "reviewer".to_string(),
             department: Some("技术部".to_string()),
             avatar: None,
         },
         User {
-            id: "manager_001".to_string(),
-            username: "manager".to_string(),
-            name: "陈经理".to_string(),
-            email: "manager@company.com".to_string(),
-            role: "manager".to_string(),
-            department: Some("工程部".to_string()),
-            avatar: None,
-        },
-        User {
             id: "PZ".to_string(),
             username: "PZ".to_string(),
-            name: "PZ批准人".to_string(),
+            name: "陈经理".to_string(),
             email: "pz@company.com".to_string(),
             role: "manager".to_string(),
             department: Some("工程部".to_string()),
-            avatar: None,
-        },
-        User {
-            id: "admin_001".to_string(),
-            username: "admin".to_string(),
-            name: "系统管理员".to_string(),
-            email: "admin@company.com".to_string(),
-            role: "admin".to_string(),
-            department: Some("信息技术部".to_string()),
             avatar: None,
         },
     ]
@@ -3496,10 +3538,10 @@ fn default_mock_user() -> User {
         .into_iter()
         .find(|user| user.role == "designer")
         .unwrap_or(User {
-            id: "designer_001".to_string(),
-            username: "designer".to_string(),
+            id: "SJ".to_string(),
+            username: "SJ".to_string(),
             name: "王设计师".to_string(),
-            email: "designer@company.com".to_string(),
+            email: "sj@company.com".to_string(),
             role: "designer".to_string(),
             department: Some("设计部".to_string()),
             avatar: None,
@@ -5306,6 +5348,65 @@ mod tests {
         assert_eq!(names.reviewer_name, "checker-001");
     }
 
+    fn create_task_request_for_assignee_tests(
+        checker_id: Option<&str>,
+        reviewer_id: &str,
+        approver_id: Option<&str>,
+    ) -> CreateTaskRequest {
+        CreateTaskRequest {
+            title: "Task".to_string(),
+            description: "".to_string(),
+            model_name: "Model".to_string(),
+            checker_id: checker_id.map(str::to_string),
+            checker_name: None,
+            approver_id: approver_id.map(str::to_string),
+            approver_name: None,
+            reviewer_id: reviewer_id.to_string(),
+            form_id: None,
+            priority: "medium".to_string(),
+            components: vec![],
+            due_date: None,
+            attachments: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_create_task_assignees_accepts_human_codes() {
+        let request = create_task_request_for_assignee_tests(Some("JH"), "", Some("SH"));
+
+        let assignees = resolve_create_task_assignees(&request).expect("HumanCode assignees pass");
+
+        assert_eq!(assignees.checker_id, "JH");
+        assert_eq!(assignees.reviewer_id, "JH");
+        assert_eq!(assignees.approver_id, "SH");
+    }
+
+    #[test]
+    fn test_resolve_create_task_assignees_rejects_legacy_internal_ids() {
+        let checker_request =
+            create_task_request_for_assignee_tests(Some("proofreader_001"), "", Some("SH"));
+        let checker_error = resolve_create_task_assignees(&checker_request).unwrap_err();
+        assert!(checker_error.contains("checker_id"));
+        assert!(checker_error.contains("PMS HumanCode"));
+
+        let approver_request =
+            create_task_request_for_assignee_tests(Some("JH"), "", Some("manager_001"));
+        let approver_error = resolve_create_task_assignees(&approver_request).unwrap_err();
+        assert!(approver_error.contains("approver_id"));
+        assert!(approver_error.contains("PMS HumanCode"));
+    }
+
+    #[test]
+    fn test_resolve_create_task_assignees_rejects_missing_required_assignees() {
+        let checker_request = create_task_request_for_assignee_tests(None, "", Some("SH"));
+        let checker_error = resolve_create_task_assignees(&checker_request).unwrap_err();
+        assert!(checker_error.contains("checker_id"));
+
+        let approver_request = create_task_request_for_assignee_tests(Some("JH"), "", None);
+        let approver_error = resolve_create_task_assignees(&approver_request).unwrap_err();
+        assert!(approver_error.contains("approver_id"));
+    }
+
     #[test]
     fn test_review_task_from_value_falls_back_for_legacy_row_shapes() {
         let raw = json!({
@@ -5412,12 +5513,14 @@ mod tests {
             .map(|user| user.id.as_str())
             .collect::<Vec<_>>();
 
-        assert!(ids.contains(&"designer_001"));
-        assert!(ids.contains(&"proofreader_001"));
-        assert!(ids.contains(&"reviewer_001"));
-        assert!(ids.contains(&"manager_001"));
+        assert!(ids.contains(&"SJ"));
+        assert!(ids.contains(&"JH"));
+        assert!(ids.contains(&"SH"));
         assert!(ids.contains(&"PZ"));
-        assert!(ids.contains(&"admin_001"));
+        assert!(!ids.contains(&"designer_001"));
+        assert!(!ids.contains(&"proofreader_001"));
+        assert!(!ids.contains(&"reviewer_001"));
+        assert!(!ids.contains(&"manager_001"));
     }
 
     #[test]
@@ -5432,21 +5535,19 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(reviewers.len(), 5);
-        assert!(reviewers.iter().all(|user| user.id != "designer_001"));
-        assert!(reviewers.iter().any(|user| user.id == "proofreader_001"));
-        assert!(reviewers.iter().any(|user| user.id == "reviewer_001"));
-        assert!(reviewers.iter().any(|user| user.id == "manager_001"));
+        assert_eq!(reviewers.len(), 3);
+        assert!(reviewers.iter().all(|user| user.id != "SJ"));
+        assert!(reviewers.iter().any(|user| user.id == "JH"));
+        assert!(reviewers.iter().any(|user| user.id == "SH"));
         assert!(reviewers.iter().any(|user| user.id == "PZ"));
-        assert!(reviewers.iter().any(|user| user.id == "admin_001"));
     }
 
     #[test]
     fn test_default_mock_user_matches_frontend_designer_contract() {
         let user = default_mock_user();
 
-        assert_eq!(user.id, "designer_001");
-        assert_eq!(user.username, "designer");
+        assert_eq!(user.id, "SJ");
+        assert_eq!(user.username, "SJ");
         assert_eq!(user.role, "designer");
     }
 
@@ -5472,14 +5573,14 @@ mod tests {
         let payload: UserResponse = serde_json::from_slice(&body).unwrap();
         let user = payload.user.expect("expected current user payload");
 
-        assert_eq!(user.id, "designer_001");
-        assert_eq!(user.username, "designer");
+        assert_eq!(user.id, "SJ");
+        assert_eq!(user.username, "SJ");
         assert_eq!(user.role, "designer");
     }
 
     #[tokio::test]
     async fn test_get_reviewers_returns_only_review_capable_users() {
-        let app = create_review_api_routes();
+        let app = Router::new().route("/api/users/reviewers", get(get_reviewers));
 
         let response = app
             .oneshot(
@@ -5503,13 +5604,14 @@ mod tests {
             .map(|user| user.id.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(payload.users.len(), 5);
+        assert_eq!(payload.users.len(), 3);
         assert!(!ids.contains(&"designer_001"));
-        assert!(ids.contains(&"proofreader_001"));
-        assert!(ids.contains(&"reviewer_001"));
-        assert!(ids.contains(&"manager_001"));
+        assert!(!ids.contains(&"proofreader_001"));
+        assert!(!ids.contains(&"reviewer_001"));
+        assert!(!ids.contains(&"manager_001"));
+        assert!(ids.contains(&"JH"));
+        assert!(ids.contains(&"SH"));
         assert!(ids.contains(&"PZ"));
-        assert!(ids.contains(&"admin_001"));
     }
 
     #[tokio::test]
@@ -5547,7 +5649,7 @@ mod tests {
 
         assert_eq!(user.id, "PZ");
         assert_eq!(user.username, "PZ");
-        assert_eq!(user.name, "PZ批准人");
+        assert_eq!(user.name, "陈经理");
         assert_eq!(user.role, "manager");
         assert_eq!(user.email, "pz@company.com");
     }
@@ -5557,7 +5659,7 @@ mod tests {
         let app = Router::new().route("/api/users/me", get(get_current_user));
         let claims = TokenClaims {
             project_id: "project-123".to_string(),
-            user_id: "reviewer_001".to_string(),
+            user_id: "SH".to_string(),
             user_name: "李审核员".to_string(),
             role: Some("sh".to_string()),
             workflow_mode: None,
@@ -5585,10 +5687,10 @@ mod tests {
         let payload: UserResponse = serde_json::from_slice(&body).unwrap();
         let user = payload.user.expect("expected current user payload");
 
-        assert_eq!(user.id, "reviewer_001");
-        assert_eq!(user.username, "reviewer");
+        assert_eq!(user.id, "SH");
+        assert_eq!(user.username, "SH");
         assert_eq!(user.name, "李审核员");
         assert_eq!(user.role, "reviewer");
-        assert_eq!(user.email, "reviewer@company.com");
+        assert_eq!(user.email, "sh@company.com");
     }
 }

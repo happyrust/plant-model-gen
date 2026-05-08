@@ -4,7 +4,10 @@ use axum::{
     extract::{OriginalUri, Path, Query},
     http::{Request, StatusCode, Uri},
     middleware,
-    response::{Html, IntoResponse, Json, Response, sse::{Event, KeepAlive, Sse}},
+    response::{
+        Html, IntoResponse, Json, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{delete as axum_delete, get, post, put},
 };
 use futures::stream::StreamExt;
@@ -52,15 +55,9 @@ pub enum RemoteSyncEvent {
         progress: Option<f64>,
     },
     #[serde(rename = "sync_completed")]
-    SyncCompleted {
-        site_id: String,
-        file_count: u32,
-    },
+    SyncCompleted { site_id: String, file_count: u32 },
     #[serde(rename = "sync_failed")]
-    SyncFailed {
-        site_id: String,
-        error: String,
-    },
+    SyncFailed { site_id: String, error: String },
     #[serde(rename = "keepalive")]
     Keepalive,
 }
@@ -138,7 +135,10 @@ pub fn create_remote_sync_routes() -> Router {
             get(get_env_config).put(update_env_config),
         )
         // v2 · ROADMAP M3 B5 · SSE 实时事件流
-        .route("/api/remote-sync/events/stream", get(remote_sync_events_stream))
+        .route(
+            "/api/remote-sync/events/stream",
+            get(remote_sync_events_stream),
+        )
         // C4 · 修 G6：把 admin auth middleware 挪到此处统一注入，避免外层
         // `.route_layer` 在 axum 0.8 merge 路径下偶发不生效。
         // 注入风格与 `admin_handlers::create_admin_routes` /
@@ -2471,7 +2471,10 @@ pub async fn list_active_tasks(
     })?;
 
     let rows: Vec<RemoteSyncActiveTask> = if bind_env {
-        stmt.query_map(rusqlite::params![params.env_id.as_ref().unwrap(), limit], map_active_row)
+        stmt.query_map(
+            rusqlite::params![params.env_id.as_ref().unwrap(), limit],
+            map_active_row,
+        )
     } else {
         stmt.query_map(rusqlite::params![limit], map_active_row)
     }
@@ -2593,10 +2596,8 @@ pub async fn list_failed_tasks(
         )
     })?;
 
-    let param_refs: Vec<&dyn rusqlite::ToSql> = binds
-        .iter()
-        .map(|v| v as &dyn rusqlite::ToSql)
-        .collect();
+    let param_refs: Vec<&dyn rusqlite::ToSql> =
+        binds.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
 
     let rows: Vec<RemoteSyncFailedTask> = stmt
         .query_map(param_refs.as_slice(), map_failed_row)
@@ -2742,9 +2743,7 @@ pub async fn cleanup_failed_tasks(
         )
     })?;
 
-    Ok(Json(
-        json!({ "status": "success", "cleaned": affected }),
-    ))
+    Ok(Json(json!({ "status": "success", "cleaned": affected })))
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -2879,12 +2878,15 @@ pub async fn update_env_config(
 /// 返回 Server-Sent Events 流，前端 useCollaborationStream.ts 消费。
 /// 事件类型：active_task_update / failed_task_new / site_status_change /
 ///           sync_completed / sync_failed / keepalive
-async fn remote_sync_events_stream() -> Sse<impl futures::stream::Stream<Item = Result<Event, Infallible>>> {
+async fn remote_sync_events_stream()
+-> Sse<impl futures::stream::Stream<Item = Result<Event, Infallible>>> {
     let rx = REMOTE_SYNC_EVENT_TX.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|result| async move {
         match result {
             Ok(event) => match serde_json::to_string(&event) {
-                Ok(json) => Some(Ok::<_, Infallible>(Event::default().data(json).event("message"))),
+                Ok(json) => Some(Ok::<_, Infallible>(
+                    Event::default().data(json).event("message"),
+                )),
                 Err(e) => {
                     eprintln!("[remote_sync_sse] serialize error: {}", e);
                     None
@@ -2902,4 +2904,3 @@ async fn remote_sync_events_stream() -> Sse<impl futures::stream::Stream<Item = 
             .text("keepalive"),
     )
 }
-

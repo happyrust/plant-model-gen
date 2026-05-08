@@ -66,6 +66,15 @@ BINARY_SOURCE=github-artifact GITHUB_RUN_ID=<RUN_ID> ./shells/deploy/deploy_all_
 4. 重启远端 `web-server` systemd
 5. 通过 SSH 验证 `systemctl is-active web-server`、`/api/health`、`/api/projects`
 
+### 前端（plant3d-web）GitHub Actions 部署
+
+前端仓库 `plant3d-web` 提供 `Deploy Frontend To Ubuntu` workflow（`.github/workflows/deploy-ubuntu.yml`），同样使用：
+
+- Variables: `DEPLOY_REMOTE_HOST` / `DEPLOY_REMOTE_USER`（可选）/ `DEPLOY_PATH`（可选）/ `SERVER_NAME`（可选）/ `BACKEND_ORIGIN`（可选）
+- Secrets: `DEPLOY_REMOTE_PASS`
+
+建议部署顺序：**先跑后端 `Deploy Web Server To Ubuntu`，再跑前端 `Deploy Frontend To Ubuntu`**（或者本地直接跑 `./shells/deploy/deploy_all_with_frontend.sh` 一次性部署）。
+
 ## Deploy from GitHub Release
 
 ```bash

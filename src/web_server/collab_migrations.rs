@@ -93,7 +93,9 @@ pub fn ensure_collab_schema() {
                         col, col_type
                     );
                     match conn.execute(&ddl, []) {
-                        Ok(_) => log::info!("✅ [collab-migrate] 已追加列 remote_sync_sites.{}", col),
+                        Ok(_) => {
+                            log::info!("✅ [collab-migrate] 已追加列 remote_sync_sites.{}", col)
+                        }
                         Err(e) => log::warn!(
                             "⚠️  [collab-migrate] 追加列 remote_sync_sites.{} 失败: {}",
                             col,
@@ -120,5 +122,8 @@ pub fn ensure_collab_schema() {
         log::debug!("✓ [collab-migrate] node_config 表就绪");
     }
 
-    log::info!("🎯 [collab-migrate] 异地协同 schema 对齐完成 (path={})", db_path);
+    log::info!(
+        "🎯 [collab-migrate] 异地协同 schema 对齐完成 (path={})",
+        db_path
+    );
 }

@@ -640,10 +640,7 @@ async fn get_mbd_pipe_v2(
 ///
 /// 当前是 scaffold，复用 `fetch_tubi_segments_from_surreal_with_debug` 获取管段数据，
 /// 转换为 `BranchQueryResult` 后调用 `build_mbd_v2_pipe_data_direct`。
-async fn get_mbd_pipe_v2_direct(
-    input_refno_enum: RefnoEnum,
-    branch_refno: RefnoEnum,
-) -> Response {
+async fn get_mbd_pipe_v2_direct(input_refno_enum: RefnoEnum, branch_refno: RefnoEnum) -> Response {
     use aios_core::mbd::v2::{
         BranchMember, BranchQueryResult, MbdV2PipelineContext, MbdV2Response,
         build_mbd_v2_pipe_data_direct,
@@ -678,12 +675,8 @@ async fn get_mbd_pipe_v2_direct(
                 owner_refno: branch_refno.to_string(),
                 start,
                 end,
-                arrive_axis: seg
-                    .arrive_axis
-                    .map(|a| [a.x, a.y, a.z]),
-                leave_axis: seg
-                    .leave_axis
-                    .map(|a| [a.x, a.y, a.z]),
+                arrive_axis: seg.arrive_axis.map(|a| [a.x, a.y, a.z]),
+                leave_axis: seg.leave_axis.map(|a| [a.x, a.y, a.z]),
                 arrive_refno: seg.arrive_refno.as_ref().map(|r| r.to_string()),
                 order: seg.order.unwrap_or(i as u32),
                 outside_diameter: seg.outside_diameter,

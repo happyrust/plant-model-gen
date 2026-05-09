@@ -1,6 +1,6 @@
+use crate::fast_model::export_instanced_bundle::export_instanced_bundle_for_refnos;
 #[cfg(feature = "parquet-export")]
 use crate::fast_model::export_model::parquet_writer::ParquetManager;
-use crate::fast_model::export_instanced_bundle::export_instanced_bundle_for_refnos;
 use aios_core::{RefnoEnum, get_db_option};
 use anyhow::{Context, Result};
 use std::fs;

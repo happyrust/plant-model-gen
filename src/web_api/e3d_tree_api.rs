@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::Arc;
-use tokio::time::{Duration, timeout};
 use surrealdb::types::SurrealValue;
+use tokio::time::{Duration, timeout};
 
 use crate::data_interface::db_meta_manager::db_meta;
 use crate::fast_model::gen_model::tree_index_manager::{
@@ -151,8 +151,11 @@ async fn get_world_root(
     let (world, world_error) = if let Some(refno) = resolve_offline_world_refno() {
         (refno.refno(), None)
     } else {
-        let world_query =
-            timeout(Duration::from_secs(2), aios_core::mdb::get_world_refno(mdb_name)).await;
+        let world_query = timeout(
+            Duration::from_secs(2),
+            aios_core::mdb::get_world_refno(mdb_name),
+        )
+        .await;
         match world_query {
             Ok(Ok(r)) => (r.refno(), None),
             Ok(Err(e)) => match resolve_offline_world_refno() {

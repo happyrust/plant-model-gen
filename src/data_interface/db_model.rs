@@ -453,48 +453,48 @@ impl AiosDBManager {
             ));
             let mqtt_client = Arc::new(mqtt_inst.client);
             tokio::task::spawn(async move {
-            loop {
-                let event = mqtt_inst.el.poll().await;
-                match event {
-                    Ok(event) => match event {
-                        rumqttc::Event::Incoming(Packet::Publish(_)) => {
-                            // Currently unused, but we can subscribe to topics to get messages here
-                        }
-                        rumqttc::Event::Incoming(Packet::ConnAck(_)) => {
-                            // Connection was established. Notify the client to send all discovery messages
-                            // info!("Connected to MQTT broker.");
+                loop {
+                    let event = mqtt_inst.el.poll().await;
+                    match event {
+                        Ok(event) => match event {
+                            rumqttc::Event::Incoming(Packet::Publish(_)) => {
+                                // Currently unused, but we can subscribe to topics to get messages here
+                            }
+                            rumqttc::Event::Incoming(Packet::ConnAck(_)) => {
+                                // Connection was established. Notify the client to send all discovery messages
+                                // info!("Connected to MQTT broker.");
 
-                            //判断MQTT_CONNECT_STATUS,如果为false,则发送连接成功的消息,修改为true
-                            let mut mqtt_connect_status = MQTT_CONNECT_STATUS.lock().await;
-                            if mqtt_connect_status.is_none() {
-                                *mqtt_connect_status = Some(true);
-                                info!("Init connected to MQTT broker.");
-                            } else {
-                                if !(*mqtt_connect_status).unwrap() {
+                                //判断MQTT_CONNECT_STATUS,如果为false,则发送连接成功的消息,修改为true
+                                let mut mqtt_connect_status = MQTT_CONNECT_STATUS.lock().await;
+                                if mqtt_connect_status.is_none() {
                                     *mqtt_connect_status = Some(true);
-                                    info!("Connected to MQTT broker.");
+                                    info!("Init connected to MQTT broker.");
+                                } else {
+                                    if !(*mqtt_connect_status).unwrap() {
+                                        *mqtt_connect_status = Some(true);
+                                        info!("Connected to MQTT broker.");
+                                    }
                                 }
                             }
-                        }
-                        _ => {}
-                    },
-                    Err(e) => {
-                        let mut mqtt_connect_status = MQTT_CONNECT_STATUS.lock().await;
-                        if mqtt_connect_status.is_none() {
-                            *mqtt_connect_status = Some(false);
-                            error!("Init MQTT Connection error encountered: {}", e);
-                        } else {
-                            if (*mqtt_connect_status).unwrap() {
+                            _ => {}
+                        },
+                        Err(e) => {
+                            let mut mqtt_connect_status = MQTT_CONNECT_STATUS.lock().await;
+                            if mqtt_connect_status.is_none() {
                                 *mqtt_connect_status = Some(false);
-                                error!("MQTT Connection error encountered: {}", e);
+                                error!("Init MQTT Connection error encountered: {}", e);
+                            } else {
+                                if (*mqtt_connect_status).unwrap() {
+                                    *mqtt_connect_status = Some(false);
+                                    error!("MQTT Connection error encountered: {}", e);
+                                }
                             }
-                        }
 
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
                     }
                 }
-            }
-        });
+            });
             mqtt_client
         };
         let mut mgr = AiosDBManager {

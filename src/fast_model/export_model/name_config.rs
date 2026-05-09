@@ -5,9 +5,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::Result;
 #[cfg(feature = "spec-loader")]
 use anyhow::Context;
+use anyhow::Result;
 #[cfg(feature = "spec-loader")]
 use calamine::{DataType, Reader, Xlsx, open_workbook};
 

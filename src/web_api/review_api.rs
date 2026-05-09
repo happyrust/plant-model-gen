@@ -1186,7 +1186,24 @@ async fn create_task(
     Extension(claims): Extension<TokenClaims>,
     Json(request): Json<CreateTaskRequest>,
 ) -> impl IntoResponse {
-    info!("Creating review task: title={}", request.title);
+    let started = std::time::Instant::now();
+    let request_form_id_hint = request
+        .form_id
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "<auto>".to_string());
+    info!(
+        "[REVIEW_API.create_task] start form_id_hint={} actor_id={} actor_role={:?} title={} components={} reviewer_id={} checker_id={:?} approver_id={:?}",
+        request_form_id_hint,
+        claims.user_id,
+        claims.role,
+        request.title,
+        request.components.len(),
+        request.reviewer_id,
+        request.checker_id.as_deref().unwrap_or(""),
+        request.approver_id.as_deref().unwrap_or(""),
+    );
 
     let task_id = format!("task-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
@@ -1203,6 +1220,11 @@ async fn create_task(
         resolve_create_task_names(&claims, &request, checker_id.as_str(), approver_id.as_str());
     let requester_name = resolved_names.requester_name.clone();
 
+    let form_id_was_provided = request
+        .form_id
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
     let form_id = request
         .form_id
         .as_ref()
@@ -1210,6 +1232,86 @@ async fn create_task(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(generate_form_id);
+
+    // form_id 唯一性兜底：调用方显式传了 form_id 时（PMS 嵌入态、外部流程驱动），
+    // 若已有非 deleted 的 review_task 关联同一 form_id，直接返回该 task 并复用，
+    // 避免在 SJ 驳回回到 sj 节点后重复 createReviewTask 累积重复 task 数据
+    // （bug-resubmit-creates-duplicate-task simulator 场景）。
+    // 同时给 review_workflow_history 写一条 action='resubmit' 事件，保持 form_id 全生命周期可追溯。
+    if form_id_was_provided {
+        match review_primary_db()
+            .query(
+                "SELECT * FROM review_tasks WHERE form_id = $form_id AND (deleted IS NONE OR deleted = false) ORDER BY created_at ASC LIMIT 1",
+            )
+            .bind(("form_id", form_id.clone()))
+            .await
+        {
+            Ok(mut resp) => {
+                let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
+                if let Some(row) = rows.into_iter().next() {
+                    let existing = row.to_review_task();
+                    info!(
+                        "[REVIEW_API.create_task] DEDUP_REUSE form_id={} existing_task_id={} existing_node={} existing_status={} actor_id={} elapsed_ms={} reason=同 form_id 已存在非删除 task，复用现有 task 不新建",
+                        form_id,
+                        existing.id,
+                        existing.current_node,
+                        existing.status,
+                        claims.user_id,
+                        started.elapsed().as_millis()
+                    );
+                    let history_sql = r#"
+                        CREATE review_workflow_history CONTENT {
+                            task_id: $task_id,
+                            form_id: $form_id,
+                            node: $from_node,
+                            target_node: $target_node,
+                            action: 'resubmit',
+                            actor_id: $actor_id,
+                            actor_role: $actor_role,
+                            actor_name: $actor_name,
+                            source: $source,
+                            comment: $comment,
+                            created_at: time::now()
+                        }
+                    "#;
+                    let actor_role_resubmit = claims
+                        .role
+                        .as_ref()
+                        .map(|r| r.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let _ = review_primary_db()
+                        .query(history_sql)
+                        .bind(("task_id", existing.id.clone()))
+                        .bind(("form_id", Some(form_id.clone())))
+                        .bind(("from_node", existing.current_node.clone()))
+                        .bind(("target_node", Some("jd".to_string())))
+                        .bind(("actor_id", claims.user_id.clone()))
+                        .bind(("actor_role", actor_role_resubmit))
+                        .bind(("actor_name", requester_name.clone()))
+                        .bind(("source", "plant3d-internal".to_string()))
+                        .bind(("comment", Some("再次发起编校审（form_id 复用）".to_string())))
+                        .await;
+                    return (
+                        StatusCode::OK,
+                        Json(TaskResponse {
+                            success: true,
+                            task: Some(existing),
+                            error_message: None,
+                        }),
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "[REVIEW_API.create_task] DEDUP_QUERY_FAIL form_id={} actor_id={} elapsed_ms={} reason={}（继续走 CREATE 路径，不阻塞调用方）",
+                    form_id,
+                    claims.user_id,
+                    started.elapsed().as_millis(),
+                    e
+                );
+            }
+        }
+    }
 
     let sql = r#"
         CREATE ONLY review_tasks SET
@@ -1267,7 +1369,13 @@ async fn create_task(
     match result {
         Ok(_response) => {
             // CREATE 成功，无需解析响应（避免 datetime 反序列化问题）
-            info!("Created task: {}", task_id);
+            info!(
+                "[REVIEW_API.create_task] OK task_id={} form_id={} actor_id={} elapsed_ms={}",
+                task_id,
+                form_id,
+                claims.user_id,
+                started.elapsed().as_millis()
+            );
 
             let mut seen_refnos = HashSet::new();
             for comp in &request.components {
@@ -1362,7 +1470,13 @@ async fn create_task(
             )
         }
         Err(e) => {
-            warn!("Failed to create task: {}", e);
+            warn!(
+                "[REVIEW_API.create_task] FAIL form_id={} actor_id={} elapsed_ms={} reason={}",
+                form_id,
+                claims.user_id,
+                started.elapsed().as_millis(),
+                e
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(TaskResponse {
@@ -1542,7 +1656,17 @@ async fn update_task(
     Path(id): Path<String>,
     Json(request): Json<UpdateTaskRequest>,
 ) -> impl IntoResponse {
-    info!("Updating task: {}", id);
+    let started = std::time::Instant::now();
+    info!(
+        "[REVIEW_API.update_task] start task_id={} fields_set=[title={} description={} priority={} components={} due_date={} attachments={}]",
+        id,
+        request.title.is_some(),
+        request.description.is_some(),
+        request.priority.is_some(),
+        request.components.is_some(),
+        request.due_date.is_some(),
+        request.attachments.is_some(),
+    );
 
     let mut updates = vec!["updated_at = time::now()"];
 
@@ -1603,16 +1727,30 @@ async fn update_task(
             {
                 let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
                 if let Some(row) = rows.into_iter().next() {
+                    let task = row.to_review_task();
+                    info!(
+                        "[REVIEW_API.update_task] OK task_id={} form_id={} status={} current_node={} elapsed_ms={}",
+                        id,
+                        task.form_id,
+                        task.status,
+                        task.current_node,
+                        started.elapsed().as_millis()
+                    );
                     return (
                         StatusCode::OK,
                         Json(TaskResponse {
                             success: true,
-                            task: Some(row.to_review_task()),
+                            task: Some(task),
                             error_message: None,
                         }),
                     );
                 }
             }
+            warn!(
+                "[REVIEW_API.update_task] OK_BUT_LOST task_id={} elapsed_ms={} reason=updated但读取失败",
+                id,
+                started.elapsed().as_millis()
+            );
             (
                 StatusCode::OK,
                 Json(TaskResponse {
@@ -1623,7 +1761,12 @@ async fn update_task(
             )
         }
         Err(e) => {
-            warn!("Failed to update task: {}", e);
+            warn!(
+                "[REVIEW_API.update_task] FAIL task_id={} elapsed_ms={} reason={}",
+                id,
+                started.elapsed().as_millis(),
+                e
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(TaskResponse {
@@ -1638,7 +1781,8 @@ async fn update_task(
 
 /// DELETE /api/review/tasks/:id - 软删除任务（与 PMS 入站删除一致；不向 PMS 回调）
 async fn delete_task(Path(id): Path<String>) -> impl IntoResponse {
-    info!("Soft-deleting task: {}", id);
+    let started = std::time::Instant::now();
+    info!("[REVIEW_API.delete_task] start task_id={}", id);
     let form_id = lookup_task_form_id(&id).await;
 
     let soft_sql = r#"
@@ -1659,11 +1803,17 @@ async fn delete_task(Path(id): Path<String>) -> impl IntoResponse {
             if let Some(form_id) = form_id.as_deref() {
                 if let Err(error) = mark_review_form_deleted(form_id).await {
                     warn!(
-                        "Failed to mark review_form deleted after task soft-delete, form_id={}: {}",
-                        form_id, error
+                        "[REVIEW_API.delete_task] WARN form_sync_failed task_id={} form_id={} reason={}",
+                        id, form_id, error
                     );
                 }
             }
+            info!(
+                "[REVIEW_API.delete_task] OK task_id={} form_id={:?} elapsed_ms={}",
+                id,
+                form_id.as_deref().unwrap_or(""),
+                started.elapsed().as_millis()
+            );
             (
                 StatusCode::OK,
                 Json(ActionResponse {
@@ -1674,7 +1824,13 @@ async fn delete_task(Path(id): Path<String>) -> impl IntoResponse {
             )
         }
         Err(e) => {
-            warn!("Failed to soft-delete task: {}", e);
+            warn!(
+                "[REVIEW_API.delete_task] FAIL task_id={} form_id={:?} elapsed_ms={} reason={}",
+                id,
+                form_id.as_deref().unwrap_or(""),
+                started.elapsed().as_millis(),
+                e
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ActionResponse {
@@ -1750,9 +1906,13 @@ async fn update_task_status(
     target_node: Option<String>,
     comment: Option<String>,
 ) -> (StatusCode, Json<ActionResponse>) {
+    let started = std::time::Instant::now();
     info!(
-        "Updating task {} status to {}, node to {:?}",
-        id, status, target_node
+        "[REVIEW_API.update_task_status] start task_id={} new_status={} target_node={:?} comment_len={}",
+        id,
+        status,
+        target_node,
+        comment.as_deref().map(|s| s.len()).unwrap_or(0)
     );
     let form_id = lookup_task_form_id(&id).await;
 
@@ -1804,19 +1964,33 @@ async fn update_task_status(
             let history_sql = r#"
                 CREATE review_history CONTENT {
                     task_id: $task_id,
+                    form_id: $form_id,
                     action: $action,
                     user_id: 'system',
                     user_name: '系统',
+                    source: 'plant3d-internal',
                     comment: $comment,
-                    timestamp: time::now()
+                    timestamp: time::now(),
+                    created_at: time::now()
                 }
             "#;
+            let log_task_id = id.clone();
             let _ = review_primary_db()
                 .query(history_sql)
                 .bind(("task_id", id))
+                .bind(("form_id", form_id.clone()))
                 .bind(("action", status.clone()))
                 .bind(("comment", comment))
                 .await;
+
+            info!(
+                "[REVIEW_API.update_task_status] OK task_id={} form_id={:?} new_status={} target_node={:?} elapsed_ms={}",
+                log_task_id,
+                form_id.as_deref().unwrap_or(""),
+                status,
+                target_node,
+                started.elapsed().as_millis()
+            );
 
             (
                 StatusCode::OK,
@@ -1828,7 +2002,15 @@ async fn update_task_status(
             )
         }
         Err(e) => {
-            warn!("Failed to update task status: {}", e);
+            warn!(
+                "[REVIEW_API.update_task_status] FAIL task_id={} form_id={:?} new_status={} target_node={:?} elapsed_ms={} reason={}",
+                id,
+                form_id.as_deref().unwrap_or(""),
+                status,
+                target_node,
+                started.elapsed().as_millis(),
+                e
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ActionResponse {
@@ -2587,18 +2769,10 @@ async fn get_comments_by_annotation(
     if query.r#type.is_some() {
         conditions.push("annotation_type = $type".to_string());
     }
-    if query
-        .form_id
-        .as_ref()
-        .is_some_and(|s| !s.trim().is_empty())
-    {
+    if query.form_id.as_ref().is_some_and(|s| !s.trim().is_empty()) {
         conditions.push("form_id = $form_id".to_string());
     }
-    if query
-        .task_id
-        .as_ref()
-        .is_some_and(|s| !s.trim().is_empty())
-    {
+    if query.task_id.as_ref().is_some_and(|s| !s.trim().is_empty()) {
         conditions.push("task_id = $task_id".to_string());
     }
     let sql = format!(
@@ -3204,9 +3378,13 @@ async fn submit_to_next_node(
     Path(id): Path<String>,
     Json(request): Json<SubmitToNextRequest>,
 ) -> Response {
+    let started = std::time::Instant::now();
     info!(
-        "Submitting task {} to next node, operator={}",
-        id, claims.user_id
+        "[REVIEW_API.submit_to_next_node] start task_id={} actor_id={} actor_role={:?} comment_len={}",
+        id,
+        claims.user_id,
+        claims.role,
+        request.comment.as_deref().map(|s| s.len()).unwrap_or(0),
     );
 
     // 1. 获取当前任务
@@ -3222,6 +3400,12 @@ async fn submit_to_next_node(
             match rows.into_iter().next() {
                 Some(row) => row,
                 None => {
+                    warn!(
+                        "[REVIEW_API.submit_to_next_node] FAIL task_id={} actor_id={} elapsed_ms={} reason=task_not_found",
+                        id,
+                        claims.user_id,
+                        started.elapsed().as_millis()
+                    );
                     return (
                         StatusCode::NOT_FOUND,
                         Json(ActionResponse {
@@ -3235,6 +3419,13 @@ async fn submit_to_next_node(
             }
         }
         Err(e) => {
+            warn!(
+                "[REVIEW_API.submit_to_next_node] FAIL task_id={} actor_id={} elapsed_ms={} reason=query_task_error: {}",
+                id,
+                claims.user_id,
+                started.elapsed().as_millis(),
+                e
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ActionResponse {
@@ -3256,6 +3447,15 @@ async fn submit_to_next_node(
     let operator_user = &claims.user_id;
     let (owner_id, _) = current_node_owner_for_task_row(&task_row, &current_node);
     if owner_id.is_empty() || owner_id != operator_user {
+        warn!(
+            "[REVIEW_API.submit_to_next_node] FAIL task_id={} form_id={:?} actor_id={} current_node={} owner_id={} elapsed_ms={} reason=permission_denied",
+            id,
+            task_row.form_id.as_deref().unwrap_or(""),
+            operator_user,
+            current_node,
+            owner_id,
+            started.elapsed().as_millis()
+        );
         return (
             StatusCode::FORBIDDEN,
             Json(ActionResponse {
@@ -3367,6 +3567,16 @@ async fn submit_to_next_node(
         .bind(("status", next_status))
         .await
     {
+        warn!(
+            "[REVIEW_API.submit_to_next_node] FAIL task_id={} form_id={:?} actor_id={} current_node={} next_node={} elapsed_ms={} reason=update_task_db_error: {}",
+            id,
+            task_row.form_id.as_deref().unwrap_or(""),
+            claims.user_id,
+            current_node,
+            next_node_str,
+            started.elapsed().as_millis(),
+            e
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ActionResponse {
@@ -3400,30 +3610,54 @@ async fn submit_to_next_node(
         }
     }
 
-    // 5. 记录工作流历史
+    // 5. 记录工作流历史 — schema 对齐：actor_id/actor_role/actor_name/source/created_at/target_node
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,
+            form_id: $form_id,
             node: $from_node,
+            target_node: $target_node,
             action: $action,
-            operator_id: $operator_id,
-            operator_name: $operator_name,
+            actor_id: $actor_id,
+            actor_role: $actor_role,
+            actor_name: $actor_name,
+            source: $source,
             comment: $comment,
-            timestamp: time::now()
+            created_at: time::now()
         }
     "#;
-
+    let actor_role = claims
+        .role
+        .as_ref()
+        .map(|r| r.trim().to_string())
+        .filter(|s| !s.is_empty());
     let _ = review_primary_db()
         .query(history_sql)
         .bind(("task_id", id.clone()))
+        .bind(("form_id", task_row.form_id.clone()))
         .bind(("from_node", current_node.clone()))
+        .bind(("target_node", Some(next_node_str.clone())))
         .bind(("action", action_label.to_string()))
-        .bind(("operator_id", op_id.to_string()))
-        .bind(("operator_name", op_name.to_string()))
+        .bind(("actor_id", op_id.to_string()))
+        .bind(("actor_role", actor_role))
+        .bind(("actor_name", op_name.to_string()))
+        .bind(("source", "plant3d-internal".to_string()))
         .bind(("comment", request.comment))
         .await;
 
     let from_name = get_node_display_name(&current_node);
+
+    info!(
+        "[REVIEW_API.submit_to_next_node] OK task_id={} form_id={:?} actor_id={} from_node={} to_node={} new_status={} action_label={} elapsed_ms={}",
+        id,
+        task_row.form_id.as_deref().unwrap_or(""),
+        claims.user_id,
+        current_node,
+        next_node_str,
+        next_status,
+        action_label,
+        started.elapsed().as_millis()
+    );
 
     if current_node == "pz" {
         (
@@ -3455,9 +3689,14 @@ async fn return_to_node(
     Path(id): Path<String>,
     Json(request): Json<ReturnRequest>,
 ) -> impl IntoResponse {
+    let started = std::time::Instant::now();
     info!(
-        "Returning task {} to node {}, operator={}",
-        id, request.target_node, claims.user_id
+        "[REVIEW_API.return_to_node] start task_id={} target_node={} actor_id={} actor_role={:?} reason_len={}",
+        id,
+        request.target_node,
+        claims.user_id,
+        claims.role,
+        request.reason.len()
     );
 
     // 1. 获取当前任务
@@ -3473,6 +3712,13 @@ async fn return_to_node(
             match rows.into_iter().next() {
                 Some(row) => row,
                 None => {
+                    warn!(
+                        "[REVIEW_API.return_to_node] FAIL task_id={} target_node={} actor_id={} elapsed_ms={} reason=task_not_found",
+                        id,
+                        request.target_node,
+                        claims.user_id,
+                        started.elapsed().as_millis()
+                    );
                     return (
                         StatusCode::NOT_FOUND,
                         Json(ActionResponse {
@@ -3485,6 +3731,14 @@ async fn return_to_node(
             }
         }
         Err(e) => {
+            warn!(
+                "[REVIEW_API.return_to_node] FAIL task_id={} target_node={} actor_id={} elapsed_ms={} reason=query_task_error: {}",
+                id,
+                request.target_node,
+                claims.user_id,
+                started.elapsed().as_millis(),
+                e
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ActionResponse {
@@ -3505,6 +3759,16 @@ async fn return_to_node(
     let operator_user = &claims.user_id;
     let (owner_id, _) = current_node_owner_for_task_row(&task_row, &current_node);
     if owner_id.is_empty() || owner_id != operator_user {
+        warn!(
+            "[REVIEW_API.return_to_node] FAIL task_id={} form_id={:?} target_node={} actor_id={} current_node={} owner_id={} elapsed_ms={} reason=permission_denied",
+            id,
+            task_row.form_id.as_deref().unwrap_or(""),
+            request.target_node,
+            operator_user,
+            current_node,
+            owner_id,
+            started.elapsed().as_millis()
+        );
         return (
             StatusCode::FORBIDDEN,
             Json(ActionResponse {
@@ -3523,6 +3787,15 @@ async fn return_to_node(
     if !can_return_to(&current_node, &request.target_node) {
         let from_name = get_node_display_name(&current_node);
         let to_name = get_node_display_name(&request.target_node);
+        warn!(
+            "[REVIEW_API.return_to_node] FAIL task_id={} form_id={:?} actor_id={} current_node={} target_node={} elapsed_ms={} reason=invalid_target_transition",
+            id,
+            task_row.form_id.as_deref().unwrap_or(""),
+            claims.user_id,
+            current_node,
+            request.target_node,
+            started.elapsed().as_millis()
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(ActionResponse {
@@ -3558,6 +3831,16 @@ async fn return_to_node(
         .bind(("reason", request.reason.clone()))
         .await
     {
+        warn!(
+            "[REVIEW_API.return_to_node] FAIL task_id={} form_id={:?} actor_id={} from_node={} target_node={} elapsed_ms={} reason=update_task_db_error: {}",
+            id,
+            task_row.form_id.as_deref().unwrap_or(""),
+            claims.user_id,
+            current_node,
+            request.target_node,
+            started.elapsed().as_millis(),
+            e
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ActionResponse {
@@ -3608,26 +3891,49 @@ async fn return_to_node(
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,
+            form_id: $form_id,
             node: $from_node,
+            target_node: $target_node,
             action: 'return',
-            operator_id: $operator_id,
-            operator_name: $operator_name,
+            actor_id: $actor_id,
+            actor_role: $actor_role,
+            actor_name: $actor_name,
+            source: $source,
             comment: $comment,
-            timestamp: time::now()
+            created_at: time::now()
         }
     "#;
-
+    let actor_role_return = claims
+        .role
+        .as_ref()
+        .map(|r| r.trim().to_string())
+        .filter(|s| !s.is_empty());
     let _ = review_primary_db()
         .query(history_sql)
         .bind(("task_id", id.clone()))
+        .bind(("form_id", task_row.form_id.clone()))
         .bind(("from_node", current_node.clone()))
-        .bind(("operator_id", op_id.to_string()))
-        .bind(("operator_name", op_name.to_string()))
+        .bind(("target_node", Some(request.target_node.clone())))
+        .bind(("actor_id", op_id.to_string()))
+        .bind(("actor_role", actor_role_return))
+        .bind(("actor_name", op_name.to_string()))
+        .bind(("source", "plant3d-internal".to_string()))
         .bind(("comment", Some(request.reason.clone())))
         .await;
 
     let from_name = get_node_display_name(&current_node);
     let to_name = get_node_display_name(&request.target_node);
+
+    info!(
+        "[REVIEW_API.return_to_node] OK task_id={} form_id={:?} actor_id={} from_node={} target_node={} new_status={} elapsed_ms={}",
+        id,
+        task_row.form_id.as_deref().unwrap_or(""),
+        claims.user_id,
+        current_node,
+        request.target_node,
+        next_status,
+        started.elapsed().as_millis()
+    );
 
     (
         StatusCode::OK,

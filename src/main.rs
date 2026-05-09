@@ -1401,8 +1401,6 @@ async fn main() -> anyhow::Result<()> {
         || matches.contains_id("export-glb-refnos")
         || matches.contains_id("export-gltf-refnos")
         || (any_model_requested && capture_dir.is_some());
-    let follow_up_export_requested =
-        model_export_requested || matches.get_flag("export-parquet-after-gen");
     let any_export_requested = model_export_requested
         || matches.get_flag("export-all-parquet")
         || matches.get_flag("export-all-relates")
@@ -1412,6 +1410,7 @@ async fn main() -> anyhow::Result<()> {
         || matches.get_flag("export-pdms-tree-parquet")
         || matches.get_flag("export-world-sites-parquet")
         || matches.get_flag("export-dbnum-instances-web")
+        || matches.get_flag("export-parquet-after-gen")
         || matches.get_flag("export-v3");
 
     // ========== 执行模型生成 ==========
@@ -1458,6 +1457,10 @@ async fn main() -> anyhow::Result<()> {
         } else {
             // --debug-model: 增量生成（不清理、不强制 FORCE_REPLACE_MESH）
             let _gen_result = cli_modes::run_generate_model(&gen_config, &db_option_ext).await?;
+            if !any_export_requested {
+                println!("✅ 模型生成单独执行完成（未请求导出，流程到此结束）");
+                return Ok(());
+            }
         }
     }
 

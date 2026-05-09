@@ -623,28 +623,7 @@ pub async fn api_stream_generate(
                                         // 是否在配置层启用布尔运算（即使请求要求，也尊重 DbOption 开关）
                                         let apply_by_config = db_option.apply_boolean_operation;
                                         if apply_by_config {
-                                            // 先确保本批次基础 mesh 已就绪。
-                                            // db 模式仍沿用 inst_geo 状态；file 模式则只依赖本地 glb + aabb_cache.rkyv。
-                                            let replace_exist = false; // replace_exist 已废弃
-                                            let meshes_dir = db_option.get_meshes_path();
-                                            let precision =
-                                                Arc::new(db_option.mesh_precision().clone());
-                                            if let Err(e) =
-                                                crate::fast_model::mesh_generate::gen_inst_meshes(
-                                                    &meshes_dir,
-                                                    &precision,
-                                                    &batch_all,
-                                                    replace_exist,
-                                                    &[crate::options::MeshFormat::PdmsMesh],
-                                                )
-                                                .await
-                                            {
-                                                warn!(
-                                                    "[StreamGenerate] 批次 {} 生成 mesh 失败(继续推进): {}",
-                                                    batch_index, e
-                                                );
-                                            }
-
+                                            // 前面已为本批次准备基础 mesh；这里直接进入布尔运算，避免重复生成同一批次 mesh。
                                             if let Err(e) =
                                                 crate::fast_model::mesh_generate::booleans_meshes_in_db(
                                                     Some(db_option.clone()),

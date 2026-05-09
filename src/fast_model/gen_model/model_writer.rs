@@ -1,8 +1,16 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aios_core::RefnoEnum;
 use aios_core::geometry::ShapeInstancesData;
+use dashmap::DashMap;
+use parry3d::bounding_volume::Aabb;
 
-#[derive(Debug, Default)]
+use crate::fast_model::pdms_inst::save_instance_data_with_report;
+use crate::options::ModelWriterMode;
+
+#[derive(Debug, Default, Clone)]
 pub struct DrainOnlyStats {
     pub batches: usize,
     pub instances: usize,
@@ -27,11 +35,7 @@ impl DrainOnlyStats {
             .values()
             .map(|geos| geos.insts.len())
             .sum::<usize>();
-        self.neg_relations += batch
-            .neg_relate_map
-            .values()
-            .map(Vec::len)
-            .sum::<usize>();
+        self.neg_relations += batch.neg_relate_map.values().map(Vec::len).sum::<usize>();
         self.ngmr_relations += batch
             .ngmr_neg_relate_map
             .values()
@@ -55,26 +59,206 @@ impl DrainOnlyStats {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct ModelWriteBatchReport {
+    pub missing_neg_carriers: Vec<RefnoEnum>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ModelWriterFinishReport {
+    pub writer_name: &'static str,
+    pub drain_only_stats: Option<DrainOnlyStats>,
+}
+
+#[async_trait::async_trait]
+pub trait ModelWriter: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    fn writes_to_surreal(&self) -> bool;
+
+    fn runs_downstream_pipeline(&self) -> bool;
+
+    /// Called once before worker tasks start.
+    async fn prepare(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// May be called concurrently by multiple base-writer workers.
+    async fn write_batch(
+        &self,
+        batch: &ShapeInstancesData,
+    ) -> anyhow::Result<ModelWriteBatchReport>;
+
+    /// Called once after all worker tasks finish.
+    async fn finish(&self) -> anyhow::Result<ModelWriterFinishReport> {
+        Ok(ModelWriterFinishReport {
+            writer_name: self.name(),
+            drain_only_stats: None,
+        })
+    }
+}
+
+pub struct SurrealModelWriter {
+    mesh_aabb_map: Arc<DashMap<String, Aabb>>,
+    missing_neg_carriers: Arc<Mutex<HashSet<RefnoEnum>>>,
+}
+
+impl SurrealModelWriter {
+    pub fn new(
+        mesh_aabb_map: Arc<DashMap<String, Aabb>>,
+        missing_neg_carriers: Arc<Mutex<HashSet<RefnoEnum>>>,
+    ) -> Self {
+        Self {
+            mesh_aabb_map,
+            missing_neg_carriers,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelWriter for SurrealModelWriter {
+    fn name(&self) -> &'static str {
+        "surreal"
+    }
+
+    fn writes_to_surreal(&self) -> bool {
+        true
+    }
+
+    fn runs_downstream_pipeline(&self) -> bool {
+        true
+    }
+
+    async fn write_batch(
+        &self,
+        batch: &ShapeInstancesData,
+    ) -> anyhow::Result<ModelWriteBatchReport> {
+        let save_report = save_instance_data_with_report(
+            batch,
+            false,
+            &HashMap::new(),
+            &self.mesh_aabb_map,
+            false,
+        )
+        .await?;
+        if !save_report.missing_neg_carriers.is_empty() {
+            let mut guard = self
+                .missing_neg_carriers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("missing_neg_carriers mutex poisoned"))?;
+            guard.extend(save_report.missing_neg_carriers.iter().copied());
+        }
+        Ok(ModelWriteBatchReport {
+            missing_neg_carriers: save_report.missing_neg_carriers,
+        })
+    }
+}
+
+pub struct DrainOnlyWriter {
+    started: Instant,
+    stats: Mutex<DrainOnlyStats>,
+}
+
+impl DrainOnlyWriter {
+    pub fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            stats: Mutex::new(DrainOnlyStats::default()),
+        }
+    }
+}
+
+impl Default for DrainOnlyWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelWriter for DrainOnlyWriter {
+    fn name(&self) -> &'static str {
+        "drain-only"
+    }
+
+    fn writes_to_surreal(&self) -> bool {
+        false
+    }
+
+    fn runs_downstream_pipeline(&self) -> bool {
+        false
+    }
+
+    async fn write_batch(
+        &self,
+        batch: &ShapeInstancesData,
+    ) -> anyhow::Result<ModelWriteBatchReport> {
+        let progress = {
+            let mut stats = self
+                .stats
+                .lock()
+                .map_err(|_| anyhow::anyhow!("drain-only stats mutex poisoned"))?;
+            stats.add_batch(batch);
+            if stats.batches % 100 == 0 {
+                Some((stats.batches, stats.instances, stats.geo_instances))
+            } else {
+                None
+            }
+        };
+
+        if let Some((batches, instances, geo_instances)) = progress {
+            println!(
+                "[model-writer:drain-only] drained batches={} instances={} geo_instances={} elapsed_ms={}",
+                batches,
+                instances,
+                geo_instances,
+                self.started.elapsed().as_millis()
+            );
+        }
+
+        Ok(ModelWriteBatchReport::default())
+    }
+
+    async fn finish(&self) -> anyhow::Result<ModelWriterFinishReport> {
+        let mut stats = self
+            .stats
+            .lock()
+            .map_err(|_| anyhow::anyhow!("drain-only stats mutex poisoned"))?
+            .clone();
+        stats.elapsed = self.started.elapsed();
+        Ok(ModelWriterFinishReport {
+            writer_name: self.name(),
+            drain_only_stats: Some(stats),
+        })
+    }
+}
+
+pub fn create_model_writer(
+    mode: ModelWriterMode,
+    mesh_aabb_map: Arc<DashMap<String, Aabb>>,
+    missing_neg_carriers: Arc<Mutex<HashSet<RefnoEnum>>>,
+) -> Arc<dyn ModelWriter> {
+    match mode {
+        ModelWriterMode::Surreal => {
+            Arc::new(SurrealModelWriter::new(mesh_aabb_map, missing_neg_carriers))
+        }
+        ModelWriterMode::DrainOnly => Arc::new(DrainOnlyWriter::new()),
+    }
+}
+
+pub async fn run_model_writer_sink(
+    receiver: flume::Receiver<ShapeInstancesData>,
+    writer: Arc<dyn ModelWriter>,
+) -> anyhow::Result<ModelWriterFinishReport> {
+    writer.prepare().await?;
+    while let Ok(batch) = receiver.recv_async().await {
+        writer.write_batch(&batch).await?;
+    }
+    writer.finish().await
+}
+
 pub async fn run_drain_only_sink(
     receiver: flume::Receiver<ShapeInstancesData>,
 ) -> anyhow::Result<DrainOnlyStats> {
-    let started = Instant::now();
-    let mut stats = DrainOnlyStats::default();
-
-    while let Ok(batch) = receiver.recv_async().await {
-        stats.add_batch(&batch);
-
-        if stats.batches % 100 == 0 {
-            println!(
-                "[model-writer:drain-only] drained batches={} instances={} geo_instances={} elapsed_ms={}",
-                stats.batches,
-                stats.instances,
-                stats.geo_instances,
-                started.elapsed().as_millis()
-            );
-        }
-    }
-
-    stats.elapsed = started.elapsed();
-    Ok(stats)
+    let report = run_model_writer_sink(receiver, Arc::new(DrainOnlyWriter::new())).await?;
+    Ok(report.drain_only_stats.unwrap_or_default())
 }

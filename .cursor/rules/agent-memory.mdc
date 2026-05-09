@@ -1,5 +1,5 @@
 ---
-description: Agent Memory 治理规则（灵犀 MCP progress + Cursor Memories / Rules / AGENTS.md 协作）
+description: Agent Memory 治理规则（Best MCP progress + Cursor Memories / Rules / AGENTS.md 协作）
 alwaysApply: true
 ---
 
@@ -17,7 +17,7 @@ alwaysApply: true
 | **Global Memories** | Cursor 设置 → Memories | 跨项目/跨仓库 | 手动维护 | 用户 |
 | **Project Rules** | `<repo>/.cursor/rules/*.mdc` | 项目 | Git 跟踪 | 团队 |
 | **AGENTS.md** | `<repo>/AGENTS.md` | 项目 | Git 跟踪 | 团队 |
-| **灵犀 progress** | `save_progress` / `load_progress` | 会话/任务 | 插件本地 | agent 自治 |
+| **Best MCP progress** | `save_progress` / `load_progress` | 会话/任务 | 插件本地 | agent 自治 |
 | 对话上下文 | 当前 session | 一次对话 | 不持久 | —— |
 
 **分工铁律**：
@@ -25,7 +25,7 @@ alwaysApply: true
 - Global Memories：**跨项目偏好**（语言/工具链/编码风格）
 - Project Rules：**项目规范与禁令**（强约束、可执行）
 - AGENTS.md：**项目入门与架构速览**（给 agent 读的 README）
-- 灵犀 progress：**单个任务的进度断点 / findings / TODO**
+- Best MCP progress：**单个任务的进度断点 / findings / TODO**
 - 对话上下文：**临时推演**，不必落地
 
 > **MUST**：进度做完、结论稳定后，应主动提议把关键结论从 progress 迁移到 Rules / AGENTS.md / Memories，避免永久留在 progress 里。progress 是过程，后三者是结果。

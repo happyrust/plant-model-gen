@@ -211,6 +211,11 @@ parquet-export = [
     "dep:polars",
 ]
 
+# pe_transform 持久化后端（用于刷新/对比，不改变默认 SurrealDB 路径）
+transform-store-parquet = ["parquet-export"]
+transform-store-ducklake = ["transform-store-parquet"]
+transform-store-compare = []
+
 # MBD 管线读 parquet（web_api/mbd_pipe_api.rs）
 mbd-pipe = ["parquet-export", "mbd-iso"]
 

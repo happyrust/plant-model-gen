@@ -9,7 +9,7 @@ use futures::StreamExt;
 use tokio::sync::Mutex;
 
 use crate::data_interface::db_meta_manager::db_meta;
-use crate::options::DbOptionExt;
+use crate::options::{DbOptionExt, TransformReadBackend};
 
 use super::transform_rkyv_cache::{self, LoadedTransformDbnum};
 
@@ -217,20 +217,17 @@ impl TransformCacheManager {
     }
 }
 
-static GLOBAL_TRANSFORM_CACHE: OnceLock<TransformCacheManager> = OnceLock::new();
+pub(crate) static GLOBAL_TRANSFORM_CACHE: OnceLock<TransformCacheManager> = OnceLock::new();
 static DBNUM_LOAD_LOCKS: OnceLock<DashMap<u32, Arc<Mutex<()>>>> = OnceLock::new();
 
 pub fn init_global_transform_cache() {
     let _ = GLOBAL_TRANSFORM_CACHE.get_or_init(TransformCacheManager::new);
 }
 
-/// Prime the model-generation transform cache with values that were just refreshed
-/// into `pe_transform`.
+/// 用刚刷新出的 pe_transform entries 预热模型生成阶段的内存 transform_cache。
 ///
-/// Generation paths refresh `pe_transform` immediately before calling
-/// `gen_all_geos_data`. Without this bridge, the next cache-first lookup can load
-/// an older rkyv snapshot and redo DB/legacy fallback work even though fresh
-/// transforms are already available in this process.
+/// 这样 `refresh_pe_transform -> gen_all_geos_data` 的同进程路径不会再先加载旧 rkyv
+/// snapshot 或重复走 DB/legacy fallback。
 pub fn prime_global_transform_cache_from_pe_entries(entries: &[PeTransformEntry]) -> usize {
     if entries.is_empty() {
         return 0;
@@ -252,11 +249,11 @@ pub fn prime_global_transform_cache_from_pe_entries(entries: &[PeTransformEntry]
         };
 
         let mut primed = false;
-        if let Some(world) = entry.world.clone() {
+        if let Some(world) = entry.world {
             cache.insert_world_transform(dbnum, entry.refno, world);
             primed = true;
         }
-        if let Some(local) = entry.local.clone() {
+        if let Some(local) = entry.local {
             cache.insert_local_transform(dbnum, entry.refno, local);
             primed = true;
         }
@@ -267,9 +264,6 @@ pub fn prime_global_transform_cache_from_pe_entries(entries: &[PeTransformEntry]
         }
     }
 
-    // Mark touched dbnums as loaded for this process. The refreshed subtree is
-    // authoritative for the imminent generation run; misses still fall back to
-    // batch pe_transform queries instead of an older rkyv snapshot.
     for dbnum in touched_dbnums {
         cache.loaded_dbnums.insert(dbnum);
     }
@@ -696,7 +690,7 @@ pub async fn get_world_transforms_cache_first_batch(
         return Ok(out);
     }
 
-    let queried = transform_rkyv_cache::query_world_transforms_from_pe_transform(&misses).await?;
+    let queried = query_world_transforms_from_configured_store(db_option, &misses).await?;
     let mut still_missing: HashSet<RefnoEnum> = misses.iter().copied().collect();
 
     for (refno, world) in queried {
@@ -763,7 +757,25 @@ pub async fn get_local_transforms_cache_first_batch(
         return Ok(out);
     }
 
-    let mut stream = futures::stream::iter(misses.iter().copied().map(|refno| async move {
+    let mut local_from_store = query_local_transforms_from_configured_store(db_option, &misses)
+        .await
+        .unwrap_or_default();
+    let local_store_hits: HashSet<RefnoEnum> = local_from_store.keys().copied().collect();
+    for (refno, local) in local_from_store.drain() {
+        out.insert(refno, local.clone());
+        if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
+            if let Some(&dbnum) = dbnum_map.get(&refno) {
+                cache.insert_local_transform(dbnum, refno, local);
+            }
+        }
+    }
+
+    let compute_misses = misses
+        .into_iter()
+        .filter(|refno| !local_store_hits.contains(refno))
+        .collect::<Vec<_>>();
+
+    let mut stream = futures::stream::iter(compute_misses.iter().copied().map(|refno| async move {
         let local = aios_core::transform::get_local_mat4(refno)
             .await
             .ok()
@@ -785,6 +797,50 @@ pub async fn get_local_transforms_cache_first_batch(
     }
 
     Ok(out)
+}
+
+async fn query_world_transforms_from_configured_store(
+    db_option: Option<&DbOptionExt>,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<HashMap<RefnoEnum, Transform>> {
+    let backend = db_option
+        .map(|option| option.transform_read_backend)
+        .unwrap_or(TransformReadBackend::Auto);
+    if matches!(backend, TransformReadBackend::Auto | TransformReadBackend::Surreal) {
+        return transform_rkyv_cache::query_world_transforms_from_pe_transform(refnos).await;
+    }
+
+    let Some(db_option) = db_option else {
+        return transform_rkyv_cache::query_world_transforms_from_pe_transform(refnos).await;
+    };
+    let entries = crate::pe_transform_store::load_entries_with_backend(db_option, backend, refnos)
+        .await?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| entry.world.map(|world| (entry.refno, world)))
+        .collect())
+}
+
+async fn query_local_transforms_from_configured_store(
+    db_option: Option<&DbOptionExt>,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<HashMap<RefnoEnum, Transform>> {
+    let backend = db_option
+        .map(|option| option.transform_read_backend)
+        .unwrap_or(TransformReadBackend::Auto);
+    if matches!(backend, TransformReadBackend::Auto | TransformReadBackend::Surreal) {
+        return Ok(HashMap::new());
+    }
+
+    let Some(db_option) = db_option else {
+        return Ok(HashMap::new());
+    };
+    let entries = crate::pe_transform_store::load_entries_with_backend(db_option, backend, refnos)
+        .await?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| entry.local.map(|local| (entry.refno, local)))
+        .collect())
 }
 
 #[cfg(test)]

@@ -308,7 +308,7 @@ dependencies = [
  "gltf",
  "hash32 1.0.0",
  "hexasphere",
- "id_tree 1.8.0 (git+https://github.com/happyrust/id_tree)",
+ "id_tree 1.8.0",
  "indexmap 2.13.0",
  "indextree",
  "itertools 0.14.0",
@@ -1900,7 +1900,6 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 [[package]]
 name = "calamine"
 version = "0.26.1"
-source = "git+https://github.com/happyrust/calamine#f35ae176fa9f763851b236f7166e38a884efc8d6"
 dependencies = [
  "atoi_simd",
  "byteorder",
@@ -1993,7 +1992,6 @@ dependencies = [
 [[package]]
 name = "cavalier_contours"
 version = "0.4.0"
-source = "git+https://github.com/happyrust/cavalier_contours#d2d0db137836b672bf7493c047425a146aeb9266"
 dependencies = [
  "num-traits",
  "serde",
@@ -4420,7 +4418,6 @@ version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f3901269ec6d4f6068d3f09e5f02f995bd076398dcd1dfec407cd230b02d11b"
 dependencies = [
- "earcutr",
  "float_next_after",
  "geo-types",
  "geographiclib-rs",
@@ -4432,7 +4429,6 @@ dependencies = [
  "rstar 0.12.2",
  "serde",
  "sif-itree",
- "spade",
 ]
 
 [[package]]
@@ -5720,8 +5716,6 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 [[package]]
 name = "id_tree"
 version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcd9db8dd5be8bde5a2624ed4b2dfb74368fe7999eb9c4940fd3ca344b61071a"
 dependencies = [
  "serde",
  "serde_derive",
@@ -5731,7 +5725,8 @@ dependencies = [
 [[package]]
 name = "id_tree"
 version = "1.8.0"
-source = "git+https://github.com/happyrust/id_tree#483f2ec03fc107b9195a8c2be6dec5532891b507"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bcd9db8dd5be8bde5a2624ed4b2dfb74368fe7999eb9c4940fd3ca344b61071a"
 dependencies = [
  "serde",
  "serde_derive",
@@ -5837,7 +5832,6 @@ dependencies = [
 [[package]]
 name = "indextree"
 version = "4.7.4"
-source = "git+https://github.com/happyrust/indextree?branch=main#2416dca00df8f928a6fee492702cb5224482a4ba"
 dependencies = [
  "indextree-macros",
  "rkyv 0.8.15",
@@ -5846,7 +5840,6 @@ dependencies = [
 [[package]]
 name = "indextree-macros"
 version = "0.1.3"
-source = "git+https://github.com/happyrust/indextree?branch=main#2416dca00df8f928a6fee492702cb5224482a4ba"
 dependencies = [
  "either",
  "itertools 0.14.0",
@@ -6794,7 +6787,6 @@ dependencies = [
 [[package]]
 name = "miniacd"
 version = "0.1.3"
-source = "git+https://github.com/happyrust/miniacd-fork.git?branch=main#89bc858829e77529772ad82a46f011a8f4f9d7fa"
 dependencies = [
  "ahash 0.8.12",
  "glamx",
@@ -10541,7 +10533,6 @@ dependencies = [
 [[package]]
 name = "rvm-rs"
 version = "0.1.0"
-source = "git+https://github.com/happyrust/rvm-rs#45470d2a0ddcabcd1f11958362e6440865bfc24e"
 dependencies = [
  "glam 0.30.10",
  "memmap2",
@@ -11517,7 +11508,6 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "surrealdb"
 version = "3.1.0-alpha"
-source = "git+https://gitee.com/happydpc/surrealdb?branch=dev-3.1#bc5694400663deab463629d12cceadbb2d31ea30"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -11587,7 +11577,6 @@ dependencies = [
 [[package]]
 name = "surrealdb-core"
 version = "3.1.0-alpha"
-source = "git+https://gitee.com/happydpc/surrealdb?branch=dev-3.1#bc5694400663deab463629d12cceadbb2d31ea30"
 dependencies = [
  "addr",
  "affinitypool",
@@ -11782,7 +11771,6 @@ dependencies = [
 [[package]]
 name = "surrealdb-protocol"
 version = "0.7.0"
-source = "git+https://gitee.com/happydpc/surrealdb?branch=dev-3.1#bc5694400663deab463629d12cceadbb2d31ea30"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11790,7 +11778,7 @@ dependencies = [
  "chrono",
  "flatbuffers",
  "futures",
- "geo 0.32.0",
+ "geo 0.31.0",
  "http-body-util",
  "prost",
  "prost-types",
@@ -11840,7 +11828,6 @@ dependencies = [
 [[package]]
 name = "surrealdb-types"
 version = "3.1.0-alpha"
-source = "git+https://gitee.com/happydpc/surrealdb?branch=dev-3.1#bc5694400663deab463629d12cceadbb2d31ea30"
 dependencies = [
  "anyhow",
  "bytes",
@@ -11892,7 +11879,6 @@ dependencies = [
 [[package]]
 name = "surrealdb-types-derive"
 version = "3.1.0-alpha"
-source = "git+https://gitee.com/happydpc/surrealdb?branch=dev-3.1#bc5694400663deab463629d12cceadbb2d31ea30"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -27,7 +27,9 @@ use crate::web_api::platform_api::{
     mark_review_form_deleted, sync_review_form_with_task_status,
 };
 use crate::web_api::review_annotation_state::sync_annotation_states_from_snapshot;
-use crate::web_api::review_db::{fresh_review_db, review_primary_db};
+use crate::web_api::review_db::{
+    ensure_review_workflow_history_schema, fresh_review_db, review_primary_db,
+};
 use axum::extract::Extension;
 use std::collections::HashSet;
 use tokio::time::{Duration, timeout};
@@ -1400,6 +1402,12 @@ async fn create_task(
                         claims.user_id,
                         started.elapsed().as_millis()
                     );
+                    if let Err(e) = ensure_review_workflow_history_schema().await {
+                        warn!(
+                            "[REVIEW_API.create_task] ensure_review_workflow_history_schema 失败：{}（继续写入，但 history 可能丢失）",
+                            e
+                        );
+                    }
                     let history_sql = r#"
                         CREATE review_workflow_history CONTENT {
                             task_id: $task_id,
@@ -2131,6 +2139,12 @@ async fn update_task_status(
                         form_id, error
                     );
                 }
+            }
+            if let Err(e) = ensure_review_workflow_history_schema().await {
+                warn!(
+                    "[REVIEW_API.update_task_status] ensure_review_workflow_history_schema 失败：{}（继续写入，但 history 可能丢失）",
+                    e
+                );
             }
             let history_sql = r#"
                 CREATE review_history CONTENT {
@@ -4264,6 +4278,12 @@ async fn submit_to_next_node(
     }
 
     // 5. 记录工作流历史 — schema 对齐：actor_id/actor_role/actor_name/source/created_at/target_node
+    if let Err(e) = ensure_review_workflow_history_schema().await {
+        warn!(
+            "[REVIEW_API.submit_to_next_node] ensure_review_workflow_history_schema 失败：{}（继续写入，但 history 可能丢失）",
+            e
+        );
+    }
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,
@@ -4541,6 +4561,12 @@ async fn return_to_node(
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or(op_id);
+    if let Err(e) = ensure_review_workflow_history_schema().await {
+        warn!(
+            "[REVIEW_API.return_to_node] ensure_review_workflow_history_schema 失败：{}（继续写入，但 history 可能丢失）",
+            e
+        );
+    }
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,

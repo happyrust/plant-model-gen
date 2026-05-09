@@ -11,7 +11,9 @@ use tracing::{info, warn};
 
 use crate::web_api::review_annotation_state::load_annotation_states_by_task;
 use crate::web_api::review_api::ReviewTask;
-use crate::web_api::review_db::{fresh_review_db, review_primary_db};
+use crate::web_api::review_db::{
+    ensure_review_workflow_history_schema, fresh_review_db, review_primary_db,
+};
 
 use super::annotation_check::{
     AnnotationCheckOptions, AnnotationCheckResult, build_annotation_check_context,
@@ -1401,6 +1403,12 @@ async fn apply_workflow_active(
         ));
     }
 
+    if let Err(e) = ensure_review_workflow_history_schema().await {
+        warn!(
+            "[WORKFLOW_SYNC.active] ensure_review_workflow_history_schema 失败：{}（继续走旧字段写入）",
+            e
+        );
+    }
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,
@@ -1512,6 +1520,12 @@ async fn apply_workflow_return(
         ));
     }
 
+    if let Err(e) = ensure_review_workflow_history_schema().await {
+        warn!(
+            "[WORKFLOW_SYNC.return] ensure_review_workflow_history_schema 失败：{}（继续走旧字段写入）",
+            e
+        );
+    }
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,
@@ -1643,6 +1657,12 @@ async fn apply_workflow_agree(
         ));
     }
 
+    if let Err(e) = ensure_review_workflow_history_schema().await {
+        warn!(
+            "[WORKFLOW_SYNC.agree] ensure_review_workflow_history_schema 失败：{}（继续走旧字段写入）",
+            e
+        );
+    }
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,
@@ -1735,6 +1755,12 @@ async fn apply_workflow_stop(
         ));
     }
 
+    if let Err(e) = ensure_review_workflow_history_schema().await {
+        warn!(
+            "[WORKFLOW_SYNC.stop] ensure_review_workflow_history_schema 失败：{}（继续走旧字段写入）",
+            e
+        );
+    }
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,

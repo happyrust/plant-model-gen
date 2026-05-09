@@ -318,25 +318,3 @@ aios_core = { path = "../rs-core" }
 [patch."https://github.com/happyrust/pdms-io.git"]
 pdms_io = { path = "../pdms-io-fork" }
 parse_pdms_db = { path = "../pdms-io-fork/crates/parse_pdms_db" }
-
-[patch."https://github.com/happyrust/indextree"]
-indextree = { path = "../../../indextree/indextree" }
-
-[patch."https://github.com/happyrust/miniacd-fork.git"]
-miniacd = { path = "../../../miniacd" }
-
-[patch."https://github.com/happyrust/rvm-rs"]
-rvm-rs = { path = "../../../rvmparser/rvm-rs" }
-
-[patch."https://gitee.com/happydpc/surrealdb"]
-surrealdb = { path = "../../../surrealdb/surrealdb" }
-surrealdb-types = { path = "../../../surrealdb/surrealdb/types" }
-
-[patch."https://github.com/happyrust/calamine"]
-calamine = { path = "../../../calamine-mirror" }
-
-[patch."https://github.com/happyrust/cavalier_contours"]
-cavalier_contours = { path = "../../../cavalier_contours/cavalier_contours" }
-
-[patch."https://github.com/happyrust/id_tree"]
-id_tree = { path = "../../../id_tree-mirror" }

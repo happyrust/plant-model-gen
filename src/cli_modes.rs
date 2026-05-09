@@ -1680,22 +1680,17 @@ pub async fn run_regen_model(
     }
     let target_refnos = collect_regen_target_refnos(config).await?;
 
-    if db_option_override.model_writer_mode.writes_to_surreal() {
-        // 先清理 legacy 模型关系（含 inst_relate / geo_relate / tubi_relate），
-        // 再清理 refno_relations 扁平表，避免 regen 后导出仍读到历史 tubi 脏数据。
-        let model_writer = aios_database::fast_model::gen_model::model_writer::create_model_writer(
-            &db_option_override,
-        )?;
-        model_writer
-            .cleanup(
-                aios_database::fast_model::gen_model::model_writer::CleanupRequest {
-                    seed_refnos: &target_refnos,
-                },
-            )
-            .await?;
-    } else {
-        println!("   - drain-only 压测模式：跳过 regen cleanup，避免删除现有 SurrealDB 模型数据");
-    }
+    // 统一走 trait：DrainOnly backend 的 cleanup 是 NoOp，确保压测模式不会误删数据；
+    // Surreal backend 内部仍按既有顺序清理 legacy 模型关系 + refno_relations 扁平表。
+    let model_writer =
+        aios_database::fast_model::gen_model::model_writer::create_model_writer(&db_option_override)?;
+    model_writer
+        .cleanup(
+            aios_database::fast_model::gen_model::model_writer::CleanupRequest {
+                seed_refnos: &target_refnos,
+            },
+        )
+        .await?;
 
     // 4.1 从目标 refnos 推导 dbnum，覆盖配置文件中的 manual_db_nums
     if !target_refnos.is_empty() {

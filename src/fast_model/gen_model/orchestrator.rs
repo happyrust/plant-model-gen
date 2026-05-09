@@ -21,9 +21,10 @@ use crate::data_interface::db_meta_manager::db_meta;
 use crate::fast_model::gen_model::boolean_task::{BooleanTask, BooleanTaskAccumulator};
 use crate::fast_model::gen_model::model_writer::{
     BaseInstanceBatch, BooleanBridgeRequest, FinalizeRequest, InstRelateAabbBatch, MeshResultBatch,
-    ModelWriteBackend, ModelWriterContext, ReconcileRequest, create_model_writer,
+    ModelWriterBackend, ModelWriterContext, ReconcileRequest, create_model_writer,
     run_drain_only_sink,
 };
+use crate::fast_model::gen_model::mesh_state::use_file_mesh_state;
 use crate::fast_model::mesh_generate::{MeshResult, query_existing_meshed_inst_geo_ids};
 use crate::options::{BooleanPipelineMode, DbOptionExt, MeshFormat, ModelWriterMode};
 use dashmap::DashMap;
@@ -473,7 +474,7 @@ async fn run_base_writer(
     base_write_semaphore: Arc<Semaphore>,
     mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
     missing_neg_carriers: Arc<std::sync::Mutex<HashSet<RefnoEnum>>>,
-    model_writer: Arc<dyn ModelWriteBackend>,
+    model_writer: Arc<dyn ModelWriterBackend>,
 ) -> anyhow::Result<()> {
     let mut handles = Vec::new();
     while let Ok(batch) = receiver.recv_async().await {
@@ -505,7 +506,7 @@ async fn run_base_writer(
                 batch.batch_id,
                 wait_ms,
                 base_ms,
-                save_report.missing_neg_carriers.len()
+                save_report.missing_neg_count
             );
             result_sender
                 .send_async((batch.batch_id, wait_ms, base_ms))
@@ -627,7 +628,7 @@ async fn run_inst_aabb_writer(
     inst_aabb_semaphore: Arc<Semaphore>,
     mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
     mesh_pts_map: Arc<DashMap<u64, String>>,
-    model_writer: Arc<dyn ModelWriteBackend>,
+    model_writer: Arc<dyn ModelWriterBackend>,
 ) -> anyhow::Result<()> {
     let skip_inst_relate_aabb = std::env::var_os("AIOS_SKIP_INST_RELATE_AABB").is_some();
     let mut handles = Vec::new();
@@ -657,6 +658,7 @@ async fn run_inst_aabb_writer(
                                         mesh_results: &batch.mesh_results,
                                         mesh_aabb_map: &mesh_aabb_map,
                                         mesh_pts_map: &mesh_pts_map,
+                                        file_mesh_state: use_file_mesh_state(),
                                     })
                                     .await?;
                                 if skip_inst_relate_aabb {
@@ -741,6 +743,7 @@ async fn run_inst_aabb_writer(
                                         mesh_results: &batch.mesh_results,
                                         mesh_aabb_map: &mesh_aabb_map,
                                         mesh_pts_map: &mesh_pts_map,
+                                        file_mesh_state: use_file_mesh_state(),
                                     })
                                     .await?;
                                 if skip_inst_relate_aabb {
@@ -949,17 +952,12 @@ pub async fn gen_all_geos_data(
         db_option.model_writer_mode.as_str()
     );
 
-    let model_writer = if db_option.model_writer_mode == ModelWriterMode::DrainOnly {
-        None
-    } else {
-        let writer = create_model_writer(db_option).map_err(IndexTreeError::Other)?;
-        let writer_context = ModelWriterContext::from_db_option(db_option);
-        writer
-            .init(&writer_context)
-            .await
-            .map_err(IndexTreeError::Other)?;
-        Some(writer)
-    };
+    let model_writer = create_model_writer(db_option).map_err(IndexTreeError::Other)?;
+    let writer_context = ModelWriterContext::from_db_option(db_option);
+    model_writer
+        .init(&writer_context)
+        .await
+        .map_err(IndexTreeError::Other)?;
 
     // =========================
     // LOOP/PRIM 输入缓存初始化（按环境变量启用）
@@ -1068,7 +1066,7 @@ async fn process_index_tree_generation(
     db_option: &DbOptionExt,
     _target_sesno: Option<u32>,
     time: Instant,
-    model_writer: Option<Arc<dyn ModelWriteBackend>>,
+    model_writer: Arc<dyn ModelWriterBackend>,
 ) -> Result<GenModelResult> {
     let mut perf = crate::perf_timer::PerfTimer::new("index_tree_generation");
     perf.mark("init");
@@ -1141,16 +1139,23 @@ async fn process_index_tree_generation(
             full_start.elapsed().as_millis()
         );
         perf.mark("drain_only_complete");
+
+        let total_batches = drain_stats.batches as u64;
+        let completed_batches = drain_stats.batches;
+        model_writer
+            .finalize(FinalizeRequest {
+                total_batches,
+                completed_batches,
+                mesh_cache_hits: 0,
+                mesh_new_generated: 0,
+                missing_neg_candidates: 0,
+            })
+            .await
+            .map_err(IndexTreeError::Other)?;
+
         perf.end_current();
         return Ok(GenModelResult { success: true });
     }
-
-    let model_writer = model_writer.ok_or_else(|| {
-        IndexTreeError::Other(anyhow::anyhow!(
-            "active model writer backend was not initialized for mode={}",
-            db_option.model_writer_mode.as_str()
-        ))
-    })?;
 
     // Mesh 生成：生产端只产出 inst batch，mesh/持久化在下游并行阶段完成
     let gen_mesh = db_option.inner.gen_mesh;
@@ -1426,8 +1431,6 @@ async fn process_index_tree_generation(
                             mode: BooleanPipelineMode::DbLegacy,
                             db_option: Arc::new(db_option.inner.clone()),
                             bool_tasks: Vec::new(),
-                            use_surrealdb,
-                            defer_db_write,
                         })
                         .await
                         .map_err(IndexTreeError::Other)?;
@@ -1477,8 +1480,6 @@ async fn process_index_tree_generation(
                                 mode: BooleanPipelineMode::MemoryTasks,
                                 db_option: Arc::new(db_option.inner.clone()),
                                 bool_tasks: std::mem::take(&mut bool_tasks),
-                                use_surrealdb,
-                                defer_db_write,
                             })
                             .await
                             .map_err(IndexTreeError::Other)?;

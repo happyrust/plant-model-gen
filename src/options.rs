@@ -408,6 +408,7 @@ impl DbOptionExt {
     }
 
     pub fn validate_model_writer_features(&self) -> anyhow::Result<()> {
+        // 1) feature flag 守卫：编译期 feature 集不匹配 → 拒绝
         match self.model_writer_mode {
             ModelWriterMode::Surreal
                 if !cfg!(any(
@@ -420,9 +421,18 @@ impl DbOptionExt {
                 )
             }
             // drain-only is a non-persistent throughput sink and does not need a storage feature.
-            ModelWriterMode::DrainOnly => Ok(()),
-            _ => Ok(()),
+            ModelWriterMode::DrainOnly => return Ok(()),
+            _ => {}
         }
+
+        // 2) 运行时配置组合守卫：Surreal backend 必须配 use_surrealdb=true
+        if matches!(self.model_writer_mode, ModelWriterMode::Surreal) && !self.use_surrealdb {
+            anyhow::bail!(
+                "model_writer=surreal 要求 use_surrealdb=true；当前 use_surrealdb=false 是非法组合（早期拒绝以避免空跑 perf init / pre_check）"
+            );
+        }
+
+        Ok(())
     }
 }
 

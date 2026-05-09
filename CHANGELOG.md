@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-05-09
+
+### Fixed — surrealdb 依赖 URL 统一 + origin/main 同步合并
+
+> 修复跨仓库 surrealdb 依赖来源不一致导致的 `T: SurrealValue` trait bound 不满足问题：rs-core 走 `https://github.com/happyrust/surrealdb`，而本仓 / `pdms-io-fork` 走 `https://gitee.com/happydpc/surrealdb`，cargo 解析后会拉两份独立的 `surrealdb_types` crate 实例，`SurrealValue` 派生与下游消费方位于不同 trait 路径下，触发 147 个 E0277。
+
+- `Cargo.toml`：`surrealdb` 与 `surrealdb-types` git 源由 `https://gitee.com/happydpc/surrealdb` → `https://github.com/happyrust/surrealdb`（`branch = "dev-3.1"`），与 `aios_core` / rs-core / `pdms-io-fork` 保持一致。
+- 同步：将 `origin/main` 合并入本地 `main`（冲突自动按 `-Xtheirs` 处理，主要落在 `src/web_server/static/admin/assets/*` vite 构建产物），并把 `feat/collab-api-consolidation` 的 5 个 ahead commit FF 进 main。
+- 验证：`cargo check`（4m 27s）、`cargo run --bin web_server`（13m 16s，含 aws-lc-sys 全量编译）通过；`/api/version` `/api/users` `/api/database/status` 全部 200。
+
 ## 2026-05-06
 
 ### Fixed — APS 站点部署运行验证与安全收敛

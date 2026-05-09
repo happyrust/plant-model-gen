@@ -64,12 +64,12 @@ parry3d = { version = "0.25.0", features = ["serde-serialize"] }
 parry2d = { version = "0.25.0", features = ["serde-serialize"] }
 parse_pdms_db = { git = "https://github.com/happyrust/pdms-io.git", branch = "dev-3.1" }
 aios_core = { git = "https://github.com/happyrust/rs-core.git", branch = "dev-3.1" }
-surrealdb = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1", default-features = false, features = [
+surrealdb = { git = "https://github.com/happyrust/surrealdb", branch = "dev-3.1", default-features = false, features = [
     "protocol-ws",
     "kv-mem",
 ] }
 # surrealdb-types 需要显式引入：SurrealValue derive 宏默认使用 ::surrealdb_types 路径
-surrealdb-types = { git = "https://gitee.com/happydpc/surrealdb", branch = "dev-3.1" }
+surrealdb-types = { git = "https://github.com/happyrust/surrealdb", branch = "dev-3.1" }
 pdms_io = { git = "https://github.com/happyrust/pdms-io.git", branch = "dev-3.1" }
 # gen-xkt = { path = "../gen-xkt" }
 rvm-rs = { git = "https://github.com/happyrust/rvm-rs", optional = true }

@@ -42,11 +42,24 @@ struct VerifyWorkflowResponseBody {
 struct VerifyWorkflowDataBody {
     passed: bool,
     action: String,
+    block_code: Option<String>,
     current_node: Option<String>,
     task_status: Option<String>,
     next_step: Option<String>,
+    actor_id: Option<String>,
+    owner_id: Option<String>,
+    owner_source: Option<String>,
+    expected_next_node: Option<String>,
+    requested_next_step: Option<VerifyWorkflowNextStepBody>,
     reason: String,
     recommended_action: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct VerifyWorkflowNextStepBody {
+    assignee_id: String,
+    name: String,
+    roles: String,
 }
 
 async fn cleanup_form(form_id: &str) {
@@ -999,6 +1012,71 @@ async fn test_workflow_verify_agree_terminal_task_returns_soft_block() {
 }
 
 #[tokio::test]
+async fn test_workflow_verify_agree_owner_mismatch_returns_structured_diagnostics() {
+    let form_id = "FORM-VERIFY-OWNER-MISMATCH";
+    let _ = init_surreal().await;
+    insert_task_seed(form_id, "SJ", "JH", "SH", "jd", "submitted").await;
+    let app = create_platform_api_routes();
+    let (token, _) = create_token("project-1", "SH", None, Some("sh"), None).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/workflow/verify")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "form_id": form_id,
+                        "token": token,
+                        "action": "agree",
+                        "actor": {
+                            "id": "SH",
+                            "name": "SH",
+                            "roles": "sh"
+                        },
+                        "next_step": {
+                            "assignee_id": "SH",
+                            "name": "SH",
+                            "roles": "sh"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload.code, 200);
+    let data = payload.data.expect("verify data");
+    assert!(!data.passed);
+    assert_eq!(data.action, "agree");
+    assert_eq!(data.block_code.as_deref(), Some("OWNER_MISMATCH"));
+    assert_eq!(data.current_node.as_deref(), Some("jd"));
+    assert_eq!(data.task_status.as_deref(), Some("submitted"));
+    assert_eq!(data.next_step.as_deref(), Some("sh"));
+    assert_eq!(data.actor_id.as_deref(), Some("SH"));
+    assert_eq!(data.owner_id.as_deref(), Some("JH"));
+    assert_eq!(data.owner_source.as_deref(), Some("checker"));
+    assert_eq!(data.expected_next_node.as_deref(), Some("sh"));
+    let requested_next_step = data
+        .requested_next_step
+        .expect("requested next step diagnostics");
+    assert_eq!(requested_next_step.assignee_id, "SH");
+    assert_eq!(requested_next_step.name, "SH");
+    assert_eq!(requested_next_step.roles, "sh");
+    assert_eq!(data.recommended_action, "block");
+
+    cleanup_form(form_id).await;
+}
+
+#[tokio::test]
 async fn test_workflow_verify_agree_returns_annotation_gate_block_without_mutation() {
     let form_id = "FORM-VERIFY-ANNOTATION-BLOCK";
     let _ = init_surreal().await;
@@ -1054,9 +1132,20 @@ async fn test_workflow_verify_agree_returns_annotation_gate_block_without_mutati
     let data = payload.data.expect("verify data");
     assert!(!data.passed);
     assert_eq!(data.action, "agree");
+    assert_eq!(data.block_code.as_deref(), Some("ANNOTATION_CHECK_FAILED"));
     assert_eq!(data.current_node.as_deref(), Some("jd"));
     assert_eq!(data.task_status.as_deref(), Some("submitted"));
     assert_eq!(data.next_step.as_deref(), Some("sh"));
+    assert_eq!(data.actor_id.as_deref(), Some("JH"));
+    assert_eq!(data.owner_id.as_deref(), Some("JH"));
+    assert_eq!(data.owner_source.as_deref(), Some("checker"));
+    assert_eq!(data.expected_next_node.as_deref(), Some("sh"));
+    let requested_next_step = data
+        .requested_next_step
+        .expect("requested next step diagnostics");
+    assert_eq!(requested_next_step.assignee_id, "SH");
+    assert_eq!(requested_next_step.name, "SH");
+    assert_eq!(requested_next_step.roles, "sh");
     assert_eq!(data.recommended_action, "block");
     assert!(data.reason.contains("待确认批注"));
     let annotation_check = payload.annotation_check.expect("annotation_check");

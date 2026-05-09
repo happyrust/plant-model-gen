@@ -1,14 +1,14 @@
 ---
-description: 灵犀 MCP 多会话业务协作规则
+description: Best MCP 多会话业务协作规则
 alwaysApply: true
 ---
 
-# 灵犀 MCP 业务协作规则
+# Best MCP 业务协作规则
 
 > **本规则只讲业务协作**（主控/worker、任务派发、收敛）。  
 > **`check_messages` 的调用协议由 `mcp-messenger.mdc` 统一规定，此处不重复。**
 
-侧栏可「添加/删除会话」管理通道（最多 **999** 路）。点击 **「开始配置」** 时，仅按**当前侧栏会话列表**在本工作区 `mcp.json` 写入对应的 **my-mcp-N**；**增删会话后必须再次配置**，否则 Cursor 里 MCP 列表与插件不一致。每个 Cursor 对话窗口只绑定其中一个 **my-mcp-N**。
+侧栏可「添加/删除会话」管理通道（最多 **999** 路）。点击 **「开始配置」** 时，仅按**当前侧栏会话列表**在本工作区 `mcp.json` 写入对应的 **best-mcp-N**；**增删会话后必须再次配置**，否则 Cursor 里 MCP 列表与插件不一致。每个 Cursor 对话窗口只绑定其中一个 **best-mcp-N**。
 
 ---
 

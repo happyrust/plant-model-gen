@@ -5,9 +5,10 @@
 //! - 逻辑删除用显式 `(deleted IS NONE OR deleted = false)`（旧行无 `deleted` 视为未删）；
 //! - 能用单次 `UPDATE … WHERE` 完成的不要先 `SELECT` 再写（减少往返）。
 
-use crate::web_api::review_db::{ensure_review_primary_db_context, review_primary_db};
+use crate::web_api::review_db::{fresh_review_db, review_primary_db};
 use std::fs;
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
+use tokio::sync::OnceCell;
 use tracing::warn;
 
 use super::types::{
@@ -24,13 +25,12 @@ pub const REVIEW_TASK_ACTIVE_SQL: &str = "(deleted IS NONE OR deleted = false)";
 // Schema
 // ============================================================================
 
-async fn ensure_review_forms_schema() -> anyhow::Result<()> {
-    ensure_review_primary_db_context().await?;
-    if let Err(error) = review_primary_db().query("INFO FOR DB").await {
-        warn!("ensure_review_forms_schema INFO FOR DB failed: {}", error);
-        return Err(error.into());
-    }
-    review_primary_db()
+/// schema DDL 进程级单次成功守卫，避免每次 create/submit/sync 重跑 DEFINE 触发 SurrealDB schema 锁竞争。
+static REVIEW_FORMS_SCHEMA_READY: OnceCell<()> = OnceCell::const_new();
+
+async fn ensure_review_forms_schema_inner() -> anyhow::Result<()> {
+    let db = fresh_review_db().await?;
+    db
         .query(
             r#"
             DEFINE TABLE IF NOT EXISTS review_forms SCHEMAFULL;
@@ -57,6 +57,13 @@ async fn ensure_review_forms_schema() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn ensure_review_forms_schema() -> anyhow::Result<()> {
+    REVIEW_FORMS_SCHEMA_READY
+        .get_or_try_init(|| async { ensure_review_forms_schema_inner().await })
+        .await?;
+    Ok(())
+}
+
 // ============================================================================
 // CRUD
 // ============================================================================
@@ -64,15 +71,8 @@ async fn ensure_review_forms_schema() -> anyhow::Result<()> {
 pub async fn get_review_form_by_form_id(form_id: &str) -> anyhow::Result<Option<ReviewForm>> {
     ensure_review_forms_schema().await?;
 
-    if let Err(error) = review_primary_db().query("INFO FOR DB").await {
-        warn!(
-            "get_review_form_by_form_id INFO FOR DB failed: form_id={}, error={}",
-            form_id, error
-        );
-        return Err(error.into());
-    }
-
-    let mut response = review_primary_db()
+    let db = fresh_review_db().await?;
+    let mut response = db
         .query(
             r#"
             SELECT * FROM review_forms
@@ -486,7 +486,8 @@ pub async fn find_task_by_form_id(form_id: &str) -> anyhow::Result<Option<Review
         value.map(|dt| dt.timestamp_millis())
     }
 
-    let mut response = review_primary_db()
+    let db = fresh_review_db().await?;
+    let mut response = db
         .query(&format!(
             r#"
             SELECT * FROM review_tasks

@@ -54,7 +54,7 @@
   - `docs/plans/2026-04-23-pdms-transform-route-missing-registration-fix.md`
   - 本计划本身
 - 推送到当前开发分支
-- 部署机 `123.57.182.243` 拉最新分支并重启 web_server（使用 `root / Happytest123_`）
+- 部署机 `123.57.182.243` 拉最新分支并重启 web_server（使用 `root`；密码通过 `REMOTE_PASS` / secret 提供）
 - 用户端 `plant3d-web` 控制台在生产环境跑一遍 `q pos`/`q ori`
 
 **完成判定**：部署机上 `curl http://127.0.0.1:3100/api/pdms/transform/<refno>` 返回 200，且 plant3d-web 控制台不再出现该 404。

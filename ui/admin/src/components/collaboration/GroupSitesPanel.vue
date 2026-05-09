@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { Activity, ArrowUpDown, PenLine, Plus, Trash2 } from 'lucide-vue-next'
+import { Activity, PenLine, Plus, Trash2 } from 'lucide-vue-next'
 import { formatDateTime } from '@/lib/collaboration'
 import type { CollaborationSiteAvailability, CollaborationSiteCard, CollaborationTone } from '@/types/collaboration'
 

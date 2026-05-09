@@ -2724,7 +2724,7 @@ pub(crate) async fn process_ids_on_port(port: u16) -> Result<Vec<u32>> {
     #[cfg(unix)]
     {
         let output = Command::new("lsof")
-            .args(["-nP", "-ti", &format!("tcp:{port}")])
+            .args(["-nP", "-ti", &format!("tcp:{port}"), "-sTCP:LISTEN"])
             .output()
             .await
             .context("读取端口进程失败")?;
@@ -2760,7 +2760,7 @@ fn collect_port_pids_sync(port: u16) -> Vec<u32> {
     #[cfg(unix)]
     {
         let output = std::process::Command::new("lsof")
-            .args(["-nP", "-ti", &format!("tcp:{port}")])
+            .args(["-nP", "-ti", &format!("tcp:{port}"), "-sTCP:LISTEN"])
             .output();
         match output {
             Ok(out) => String::from_utf8_lossy(&out.stdout)

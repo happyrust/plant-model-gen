@@ -50,14 +50,14 @@
 - [ ] 在 Git Bash / WSL / mac terminal 跑：
   ```bash
   cd <repo>
-  REMOTE_PASS='Happytest123_' ./shells/deploy/deploy_web_server_bundle.sh
+  REMOTE_PASS='***' ./shells/deploy/deploy_web_server_bundle.sh
   ```
 - [ ] 观察脚本输出，等到 `systemctl restart web-server` 成功
 - [ ] 远端 `systemctl status web-server` 显示 active (running)
 
 **方案 B（纯 SSH 手动 · 耗时但透明）**
 
-- [ ] `ssh root@123.57.182.243`（`Happytest123_`）
+- [ ] `ssh root@123.57.182.243`（密码通过 `REMOTE_PASS` / secret 提供）
 - [ ] `cd /opt/plant-model-gen`（以实际部署目录为准）
 - [ ] `git fetch origin feat/collab-api-consolidation`
 - [ ] `git checkout feat/collab-api-consolidation && git pull --ff-only`

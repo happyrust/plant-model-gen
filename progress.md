@@ -1,26 +1,49 @@
-# 站点部署功能修复进度
+# pe_transform 后端重构进度
 
-## 2026-05-06
+## 2026-05-08
 
-- 已完成 review-only 审查，确认 P1/P2 风险点。
-- 已建立 `task_plan.md`、`findings.md`、`progress.md` 作为本轮修复记录。
-- 已新增 `admin_task_handlers::create_and_dispatch_site_task`，注册表创建任务改为单一 admin task id，并立即 dispatch。
-- 已将旧 `static/deployment-sites.js` 的站点管理写接口改到 `/api/admin/registry/*`，并补充 `localStorage.admin_token` Authorization header。
-- 已在 `db_options/DbOption.toml` 增加 `admin_allowed_project_roots = ["D:/AVEVA/Projects"]`，匹配新的项目路径白名单默认值。
-- `ReadLints` 检查本轮 Rust/JS 修改文件：无 linter errors。
-- `cargo check --bin web_server --features web_server` 通过；输出仅包含 `pdms-io-fork`/`parse_pdms_db` 既有 warnings。
-- 已将 `feat/collab-api-consolidation` fast-forward 合入 `origin/main` 最新提交 `bc5715e` 并推送到远端。
-- 开始第二轮：复审合并后的站点部署实现，并准备运行 APS 相关 `web_server` 做 HTTP 验证。
-- 旧 APS 18330 已按用户要求中止；当前源码版 APS 使用 `target-aps-current` 重新编译并在 18330 启动成功。
-- APS 首轮 smoke 暴露公开站点列表 `items=[]`、admin task 响应泄漏 `db_password`、非 ASCII task id 详情查询不稳三个问题。
-- 已修复 `handlers::api_get_public_deployment_sites`，避免 JSON 往返反序列化导致公开列表清空。
-- 已修复 `TaskInfo::generate_task_id`，任务 ID 限制为 ASCII URL-safe 字符。
-- 已修复 `admin_task_handlers` 响应脱敏，task 列表/详情/创建/重试不再返回真实 `db_password/password/surreal_password`。
-- 修复后 `ReadLints` 检查本轮 Rust 修改文件：无 linter errors。
-- 修复后 APS HTTP smoke 通过：`/api/health` 200；公开 `/api/deployment-sites` 返回 4 条且无 `config/project_path`；admin 登录成功；admin registry 列表/探活密码脱敏；创建 `DataGeneration` 任务返回 ASCII task id，任务详情可查询且密码脱敏。该任务因站点已运行而进入 `Failed`，符合运行态保护。
-- 已执行下一步计划：把 APS smoke 口径收敛为公开接口字段、admin 脱敏、任务创建/详情三类回归点。
-- 敏感信息回归脚本第一次执行因 PowerShell 字符串转义错误失败，未触发有效断言；已改用 `[char]34` 构造字段名后重跑成功。
-- 最终敏感信息回归结果：公开站点响应不包含真实密码、不包含 `config`、不包含 `project_path`；admin registry 响应不包含真实密码且包含 `********`；admin tasks 响应不包含真实密码且包含 `********`。
-- 当前 APS 新版仍在 `127.0.0.1:18330` 运行；`target-aps-current/` 为本轮生成的独立编译目录，仍未清理。
-- 最终工程收敛：`CARGO_TARGET_DIR=target-aps-current cargo check --bin web_server --features web_server` 通过，用时约 8m01s；仅有 `pdms-io-fork` / `parse_pdms_db` 既有 warning。
-- 已复查本轮核心 diff：`admin_task_handlers.rs`、`models.rs`、`handlers.rs` 与计划记录文件包含 APS 修复；其中 `handlers.rs` 同时包含合并前既有未提交改动，后续提交时需按变更来源拆分/确认。
+- 已安装 `planning-with-files`：
+  - Cursor 项目安装到主工作区 `D:/work/plant-code/plant-model-gen/.cursor/skills/planning-with-files`。
+  - Cursor worktree 同步到 `.worktrees/pe-transform-backends/.cursor/skills/planning-with-files`。
+  - Codex 个人安装到 `C:/Users/dpc/.codex/skills/planning-with-files`，并新增全局 hooks。
+  - `C:/Users/dpc/.codex/config.toml` 已启用 `[features] codex_hooks = true`。
+- 已创建 worktree：`D:/work/plant-code/plant-model-gen/.worktrees/pe-transform-backends`，分支 `feat/pe-transform-backends`，基于 `f0aedb6`。
+- 已完成首轮代码发现，确认重构核心入口：`Cargo.toml` features、`options.rs` feature 校验、`pe_transform_refresh.rs` batch 写入、`transform_cache.rs`/`transform_rkyv_cache.rs` 读取链路。
+- 已创建本轮 planning files：`task_plan.md`、`findings.md`、`progress.md`。
+- `codex --version` 返回 `codex-cli 0.129.0`；`codex features list` 显示当前 CLI 的 hook feature 名为 `hooks` 且已启用，因此 `config.toml` 同时保留 `codex_hooks = true` 和 `hooks = true` 以兼容文档与当前 CLI。
+- 已按用户补充要求更新方案：首轮对比固定刷新 `dbnum=7997`，且对比前必须清理历史 `pe_transform` 数据。
+- 已实现 transform backend 配置面：`transform-store-parquet`、`transform-store-ducklake`、`transform-store-compare` features；`transform_write_backend`、`transform_read_backend`、`transform_compare_backends`、Parquet/DuckLake 路径和 `clear_transform_before_refresh` 配置/CLI。
+- 已新增 `src/pe_transform_store.rs`：封装 `PeTransformSink` / `PeTransformSource`，默认 SurrealDB sink/source，Parquet sink/source（feature-gated），DuckLake 注册 SQL 脚本生成，dbnum 历史 `pe_transform` 清理，对比统计。
+- 已修改 `src/pe_transform_refresh.rs`：batch flush 改走统一 backend，并在写入后 prime `transform_cache`。
+- 已修改 `src/fast_model/gen_model/transform_cache.rs`：生成阶段 cache miss 可按 `transform_read_backend` 从 Parquet/DuckLake source 读取 local/world 并写回内存；默认 `auto/surreal` 仍走旧 SurrealDB 查询/计算路径。
+- 已修改 `src/main.rs`：`--refresh-transform` 支持清理历史数据、选择写入/读取 backend、输出 compare stats。
+- 静态验证：`ReadLints` 检查本轮修改文件无 linter errors；`git diff --check` 通过。
+- 阻塞：当前 PowerShell 中 `cargo --version` 失败（`cargo` not recognized），尚未执行 `cargo check` 和真实 `--refresh-transform 7997` 验证。
+- 2026-05-08 运行对比/profile 前环境检查：
+  - `cargo` / `rustc` / `rustup` 均不在当前 PowerShell `PATH`，`C:/Users/dpc/.cargo/bin/cargo.exe` 不存在。
+  - `duckdb` / `surreal` 命令均不在当前 `PATH`。
+  - `Get-NetTCPConnection -LocalPort 8020` 未返回监听连接。
+  - worktree 内没有现成 `aios-database.exe`，无法运行包含本轮改动的新 CLI。
+- 待工具链恢复后的首个真实验证命令建议：
+  - `cargo check --bin aios-database --features "review,transform-store-parquet,transform-store-compare"`
+  - `cargo run --bin aios-database --features "review,transform-store-parquet,transform-store-compare" -- -c db_options/DbOption-cli --refresh-transform 7997 --clear-transform-before-refresh --transform-write-backend dual --transform-compare-backends surreal,parquet`
+- 已按 planning-with-files 补充下一步详细开发方案到 `task_plan.md`：
+  - Phase 8：恢复 Cargo/SurrealDB/DuckDB 验证环境。
+  - Phase 9：编译收敛并修复最小错误。
+  - Phase 10：执行 `7997` 清理、刷新、双写、SurrealDB vs Parquet 对比。
+  - Phase 11：profile 清理、计算、写入、prime、读取、compare 各阶段耗时。
+  - Phase 12：验证 DuckLake 注册脚本和 snapshot/表行数。
+  - Phase 13：输出最终对比表并完成交付记录。
+- 用户指定 Rust 路径后，已用 `D:/Rust/.cargo/bin` 识别到 `cargo 1.97.0-nightly` 与 `rustc 1.97.0-nightly`。
+- 首次在线 `cargo check` 卡在 `happyrust/indextree` git 更新；改为离线后发现多个 git 依赖缺本地缓存。
+- 已在 `Cargo.toml` 增加本地 patch，复用本机仓库：
+  - `indextree -> D:/work/plant-code/indextree/indextree`
+  - `miniacd -> D:/work/plant-code/miniacd`
+  - `rvm-rs -> D:/work/plant-code/rvmparser/rvm-rs`
+  - `surrealdb/surrealdb-types -> D:/work/plant-code/surrealdb/...`
+  - `calamine -> D:/work/plant-code/calamine-mirror`
+  - `cavalier_contours -> D:/work/plant-code/cavalier_contours/cavalier_contours`
+  - `id_tree -> D:/work/plant-code/id_tree-mirror`
+- 当前 `cargo check` 阻塞在 `rs-core` 的 `ploop-rs = { git = "https://github.com/happyrust/rust-ploop-processor", branch = "1.0" }`；本机 `D:/work/plant-code` 下未找到 `rust-ploop-processor` / `ploop` 对应本地仓库，在线更新也长时间无输出。
+- 已停止本轮卡住的 `cargo check` 进程；保留了一个非本轮启动的 `cargo test ... parse_real_files ...` 进程未处理。
+- `git diff --check` 通过；planning 文件 lints 无错误。

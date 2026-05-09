@@ -1,17 +1,27 @@
-# 站点部署功能发现
+# pe_transform 后端重构发现
 
-## 2026-05-06 审查发现
+## 2026-05-08 Discovery
 
-- `admin_registry_handlers::create_site_task` 当前先调用 `handlers::api_create_deployment_site_task`，再写入 `admin_task_handlers::insert_task`，产生两个 task id/状态源；`insert_task` 只保存不 dispatch。
-- `/api/deployment-sites` 在 `mod.rs` 已收敛为公开只读，但 `static/deployment-sites.js` 仍 POST `/api/deployment-sites/{id}/healthcheck`。
-- `managed_project_sites::canonical_project_path` 现在默认要求 `admin_allowed_project_roots`，否则需显式设置 `AIOS_ADMIN_ALLOW_ANY_PROJECT_PATH=1` 或 `admin_allow_any_project_path=true`。
-- 注册表 admin API 已对 `db_password/password/surreal_password` 做响应脱敏；`site_registry::update_site` 已保留占位密码对应的旧真实密码。
+- `Cargo.toml` 已有 `parquet-export` feature，负责引入 `parquet`、`arrow-array`、`arrow-schema`、`polars`；新增 transform Parquet 能力应考虑复用或拆出更轻的 `transform-store-parquet`。
+- `options.rs::validate_model_writer_features` 已有清晰的 feature 校验模式，可复用于 transform backend，例如未启用 `transform-store-ducklake` 时禁止 `--transform-read-backend ducklake`。
+- `pe_transform_refresh.rs` 当前直接调用 `save_pe_transform_entries(&entries)` 批量写 SurrealDB，是插入 `PeTransformSink` / dual-write 的主要入口。
+- `transform_cache.rs` 和 `transform_rkyv_cache.rs` 当前读取链路是 rkyv/内存优先，miss 后从 SurrealDB `pe_transform` 查询；新增 source 应保持最终统一 prime 到内存 cache。
+- `fast_model/export_model/export_dbnum_instances_parquet.rs` 已有 `transforms.parquet`，但它表达的是唯一 transform hash 到矩阵，不是 `refno -> local/world transform` 的 PE 映射，不能直接替代 `pe_transform` 表。
+- DuckLake 支持 `ATTACH 'ducklake:metadata.ducklake' AS lake (DATA_PATH 'data/')` 后建表写入，也支持先写外部 Parquet 再 `CALL ducklake_add_data_files(...)` 注册。
+- DuckLake partitioning 支持 `ALTER TABLE ... SET PARTITIONED BY (...)`，首版建议按 `project_name, dbnum` 分区，避免按 refno 产生过多小文件和目录。
+- 首轮测试样本已由用户指定为 `dbnum=7997`。
+- 对比前必须清理历史 `pe_transform`，否则 SurrealDB 旧数据可能和新刷新的 Parquet/DuckLake 数据混在一起，导致矩阵一致性和加载耗时结论失真。
+- 当前实现中 `dual` 写入表示 SurrealDB + Parquet 双写；DuckLake 首版通过 `transform-store-ducklake` 生成注册 SQL 脚本，不直接引入 Rust DuckDB/DuckLake 运行时。
+- `transform_read_backend=ducklake` 当前先复用 Parquet source 读取文件内容；DuckLake 原生 time-travel 查询需要后续接入 DuckDB/DuckLake CLI 或 Rust binding。
+- 当前环境 `cargo` 不在 PATH，无法做 Rust 编译校验；后续必须在 Rust 工具链可用环境补跑 `cargo check`，再跑真实 `--refresh-transform 7997` 流程。
+- 本轮无法产出真实耗时 profile：缺少 Rust 工具链、DuckDB/Surreal CLI，且 8020 端口未检测到数据库监听；表格只能记录待测项和当前阻塞状态。
 
-## 2026-05-06 APS 运行验证发现
+## 2026-05-08 Next-Step Findings
 
-- 旧 APS 进程 `18330` 使用旧构建，admin 健康检查响应仍暴露 `config.db_password`；不能代表当前源码验证结果。
-- 当前源码版启动前需要同步本地 `rs-core dev-3.1`，否则 `plant-model-gen` 最新 main 引用的 MBD V2 direct API 编译失败。
-- `/api/deployment-sites` 公开列表曾返回 `total=4` 但 `items=[]`，原因是公开列表对已经序列化的 `DeploymentSite` 再反序列化，`SystemTime` 自定义序列化后无法回读；已改为直接在 JSON value 上移除敏感字段。
-- admin task 响应曾暴露 `config.db_password`；已对 task 列表、详情、创建、重试响应做递归密钥脱敏。
-- admin task id 曾允许非 ASCII 字符进入 URL path，导致包含中文配置名的 task id 难以稳定详情查询；已限制为 ASCII URL-safe 片段。
-- APS 当前源码版 `18330` smoke 通过：`/api/health`、`/api/site/identity`、公开站点列表、admin 登录、admin registry 清单/健康检查、任务创建与详情查询均可用；DataGeneration 对已运行站点返回失败状态属于运行态保护。
+- 下一步不应继续扩大功能面；优先把当前 worktree 主体实现编译收敛，再做 `7997` 的 SurrealDB/Parquet 对比。
+- 首轮 profile 表必须区分“计算 transform”和“存储/读取 backend”两类耗时，否则无法判断 Parquet/DuckLake 是否真正改善预热阶段。
+- `dual` 写入的验收对象是 SurrealDB baseline 与 Parquet 文件一致性；DuckLake 首轮只验证注册脚本和 metadata 管理，不承诺原生读取性能。
+- 对比表的核心列应固定为：`Backend | Write Time | Read Time | Loaded | Missing | Mismatched | Max Delta | Notes`。
+- 如果 Parquet 出现 missing，优先排查分区路径和递归扫描；如果出现 mismatched，优先按 refno 抽样比较 local/world 矩阵展开列。
+- 指定 `D:/Rust/.cargo/bin` 后 Rust 工具链可用；当前真正阻塞不再是 cargo 缺失，而是 `rs-core` 的 `rust-ploop-processor` git 依赖无法在线更新且本机没有本地副本。
+- 为了使后续 `cargo check` 可继续，需要二选一：提供 `D:/work/plant-code/rust-ploop-processor/ploop-rs` 本地仓库并加 patch，或恢复访问 `https://github.com/happyrust/rust-ploop-processor`。

@@ -28,6 +28,7 @@ pub async fn refresh_pe_transform_for_dbnums_compat(dbnums: &[u32]) -> Result<us
 
     let mut entries: Vec<PeTransformEntry> = Vec::with_capacity(PE_TRANSFORM_BATCH_SIZE);
     let mut total = 0usize;
+    let mut total_primed = 0usize;
 
     for dbnum in dbnums {
         let total_nodes = match query_total_nodes_for_dbnum(*dbnum).await {
@@ -112,6 +113,9 @@ pub async fn refresh_pe_transform_for_dbnums_compat(dbnums: &[u32]) -> Result<us
                         save_pe_transform_entries(&entries).await.with_context(|| {
                             format!("批量写入 pe_transform 失败: dbnum={}", dbnum)
                         })?;
+                        total_primed += crate::fast_model::gen_model::transform_cache::prime_global_transform_cache_from_pe_entries(
+                            &entries,
+                        );
                         entries.clear();
                         print_progress(dbnum_processed, total_nodes, true);
                         dbnum_last_print = dbnum_processed;
@@ -127,9 +131,15 @@ pub async fn refresh_pe_transform_for_dbnums_compat(dbnums: &[u32]) -> Result<us
         save_pe_transform_entries(&entries)
             .await
             .context("写入最后一批 pe_transform 失败")?;
+        total_primed += crate::fast_model::gen_model::transform_cache::prime_global_transform_cache_from_pe_entries(
+            &entries,
+        );
     }
 
-    println!("\r✅ 完成！共处理 {} 个节点                    ", total);
+    println!(
+        "\r✅ 完成！共处理 {} 个节点，预热 transform_cache {} 个节点                    ",
+        total, total_primed
+    );
     Ok(total)
 }
 
@@ -153,6 +163,7 @@ pub async fn refresh_pe_transform_for_root_refnos_compat(
 
     let mut entries: Vec<PeTransformEntry> = Vec::with_capacity(PE_TRANSFORM_BATCH_SIZE);
     let mut total = 0usize;
+    let mut total_primed = 0usize;
 
     for root_refno in roots {
         let root_local = match get_local_mat4(root_refno).await {
@@ -204,6 +215,9 @@ pub async fn refresh_pe_transform_for_root_refnos_compat(
                     save_pe_transform_entries(&entries).await.with_context(|| {
                         format!("批量写入 pe_transform 失败: root_refno={}", root_refno)
                     })?;
+                    total_primed += crate::fast_model::gen_model::transform_cache::prime_global_transform_cache_from_pe_entries(
+                        &entries,
+                    );
                     entries.clear();
                 }
             }
@@ -214,11 +228,14 @@ pub async fn refresh_pe_transform_for_root_refnos_compat(
         save_pe_transform_entries(&entries)
             .await
             .context("写入最后一批 pe_transform 失败")?;
+        total_primed += crate::fast_model::gen_model::transform_cache::prime_global_transform_cache_from_pe_entries(
+            &entries,
+        );
     }
 
     println!(
-        "\r✅ 子树刷新完成！共处理 {} 个节点                    ",
-        total
+        "\r✅ 子树刷新完成！共处理 {} 个节点，预热 transform_cache {} 个节点                    ",
+        total, total_primed
     );
     Ok(total)
 }

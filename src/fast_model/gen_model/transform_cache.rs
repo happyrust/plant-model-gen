@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
+use aios_core::rs_surreal::pe_transform::PeTransformEntry;
 use aios_core::{RefnoEnum, Transform};
 use dashmap::mapref::entry::Entry;
 use dashmap::{DashMap, DashSet};
@@ -221,6 +222,59 @@ static DBNUM_LOAD_LOCKS: OnceLock<DashMap<u32, Arc<Mutex<()>>>> = OnceLock::new(
 
 pub fn init_global_transform_cache() {
     let _ = GLOBAL_TRANSFORM_CACHE.get_or_init(TransformCacheManager::new);
+}
+
+/// Prime the model-generation transform cache with values that were just refreshed
+/// into `pe_transform`.
+///
+/// Generation paths refresh `pe_transform` immediately before calling
+/// `gen_all_geos_data`. Without this bridge, the next cache-first lookup can load
+/// an older rkyv snapshot and redo DB/legacy fallback work even though fresh
+/// transforms are already available in this process.
+pub fn prime_global_transform_cache_from_pe_entries(entries: &[PeTransformEntry]) -> usize {
+    if entries.is_empty() {
+        return 0;
+    }
+
+    init_global_transform_cache();
+    let _ = db_meta().ensure_loaded();
+
+    let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() else {
+        return 0;
+    };
+
+    let mut primed_refnos = HashSet::new();
+    let mut touched_dbnums = HashSet::new();
+
+    for entry in entries {
+        let Some(dbnum) = db_meta().get_dbnum_by_refno(entry.refno) else {
+            continue;
+        };
+
+        let mut primed = false;
+        if let Some(world) = entry.world.clone() {
+            cache.insert_world_transform(dbnum, entry.refno, world);
+            primed = true;
+        }
+        if let Some(local) = entry.local.clone() {
+            cache.insert_local_transform(dbnum, entry.refno, local);
+            primed = true;
+        }
+
+        if primed {
+            primed_refnos.insert(entry.refno);
+            touched_dbnums.insert(dbnum);
+        }
+    }
+
+    // Mark touched dbnums as loaded for this process. The refreshed subtree is
+    // authoritative for the imminent generation run; misses still fall back to
+    // batch pe_transform queries instead of an older rkyv snapshot.
+    for dbnum in touched_dbnums {
+        cache.loaded_dbnums.insert(dbnum);
+    }
+
+    primed_refnos.len()
 }
 
 fn dbnum_load_locks() -> &'static DashMap<u32, Arc<Mutex<()>>> {

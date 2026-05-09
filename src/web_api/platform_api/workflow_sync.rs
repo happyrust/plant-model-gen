@@ -11,21 +11,23 @@ use tracing::{info, warn};
 
 use crate::web_api::review_annotation_state::load_annotation_states_by_task;
 use crate::web_api::review_api::ReviewTask;
-use crate::web_api::review_db::review_primary_db;
+use crate::web_api::review_db::{fresh_review_db, review_primary_db};
 
 use super::annotation_check::{
     AnnotationCheckOptions, AnnotationCheckResult, build_annotation_check_context,
     evaluate_annotation_check,
 };
-use super::auth::verify_s2s_token;
+use super::auth::{verify_s2s_token, verify_s2s_token_with_claims};
 use super::review_form::{
     find_task_by_form_id, get_review_form_by_form_id, sync_review_form_with_task_status,
 };
 use super::types::{
     SyncWorkflowData, SyncWorkflowRequest, SyncWorkflowResponse, VerifyWorkflowData,
-    VerifyWorkflowResponse, WorkflowAnnotationComment, WorkflowAttachment, WorkflowRecord,
+    WorkflowActor, WorkflowVerifyNextStepDiagnostic, VerifyWorkflowResponse,
+    WorkflowAnnotationComment, WorkflowAttachment, WorkflowNextStep, WorkflowRecord,
     normalize_review_form_status,
 };
+use crate::web_api::jwt_auth::TokenClaims;
 
 static WEB_PUBLIC_BASE_URL: OnceLock<Option<String>> = OnceLock::new();
 
@@ -61,6 +63,12 @@ struct WorkflowSyncActionError {
     verify_task_status: Option<String>,
     verify_next_step: Option<String>,
     verify_recommended_action: Option<String>,
+    verify_block_code: Option<String>,
+    verify_actor_id: Option<String>,
+    verify_owner_id: Option<String>,
+    verify_owner_source: Option<String>,
+    verify_expected_next_node: Option<String>,
+    verify_requested_next_step: Option<WorkflowVerifyNextStepDiagnostic>,
 }
 
 impl WorkflowSyncActionError {
@@ -74,6 +82,12 @@ impl WorkflowSyncActionError {
             verify_task_status: None,
             verify_next_step: None,
             verify_recommended_action: None,
+            verify_block_code: None,
+            verify_actor_id: None,
+            verify_owner_id: None,
+            verify_owner_source: None,
+            verify_expected_next_node: None,
+            verify_requested_next_step: None,
         }
     }
 
@@ -94,6 +108,12 @@ impl WorkflowSyncActionError {
             verify_task_status: task_status,
             verify_next_step: next_step,
             verify_recommended_action: Some(recommended_action.into()),
+            verify_block_code: None,
+            verify_actor_id: None,
+            verify_owner_id: None,
+            verify_owner_source: None,
+            verify_expected_next_node: None,
+            verify_requested_next_step: None,
         }
     }
 
@@ -114,7 +134,31 @@ impl WorkflowSyncActionError {
             verify_recommended_action: Some(
                 map_verify_recommended_action(&result.recommended_action).to_string(),
             ),
+            verify_block_code: Some("ANNOTATION_CHECK_FAILED".to_string()),
+            verify_actor_id: None,
+            verify_owner_id: None,
+            verify_owner_source: None,
+            verify_expected_next_node: None,
+            verify_requested_next_step: None,
         }
+    }
+
+    fn with_verify_diagnostics(
+        mut self,
+        block_code: impl Into<String>,
+        actor_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        owner_source: impl Into<String>,
+        expected_next_node: Option<String>,
+        requested_next_step: Option<WorkflowVerifyNextStepDiagnostic>,
+    ) -> Self {
+        self.verify_block_code = Some(block_code.into());
+        self.verify_actor_id = Some(actor_id.into());
+        self.verify_owner_id = Some(owner_id.into());
+        self.verify_owner_source = Some(owner_source.into());
+        self.verify_expected_next_node = expected_next_node;
+        self.verify_requested_next_step = requested_next_step;
+        self
     }
 
     fn into_sync_response(self) -> (StatusCode, Json<SyncWorkflowResponse>) {
@@ -140,9 +184,15 @@ impl WorkflowSyncActionError {
                     data: Some(VerifyWorkflowData {
                         passed: false,
                         action: action.to_string(),
+                        block_code: self.verify_block_code.clone().or(self.error_code.clone()),
                         current_node: self.verify_current_node,
                         task_status: self.verify_task_status,
                         next_step: self.verify_next_step,
+                        actor_id: self.verify_actor_id,
+                        owner_id: self.verify_owner_id,
+                        owner_source: self.verify_owner_source,
+                        expected_next_node: self.verify_expected_next_node,
+                        requested_next_step: self.verify_requested_next_step,
                         reason: self.message,
                         recommended_action: self
                             .verify_recommended_action
@@ -275,33 +325,92 @@ fn extract_annotation_ids(values: &[Value], output: &mut BTreeSet<String>) {
 // Handler / preflight
 // ============================================================================
 
+/// 缺省 actor 时用 token claims 推导一个 [`WorkflowActor`]。
+///
+/// debug_token 模式（`PLATFORM_AUTH_CONFIG.enabled = false`）下 claims 为 `None`，
+/// 此时如果请求体也没带 actor，则返回 BAD_REQUEST 让调用方显式传。
+fn fill_actor_from_claims(
+    request: &mut SyncWorkflowRequest,
+    claims: Option<TokenClaims>,
+) -> Result<(), (StatusCode, String)> {
+    if request.actor.is_some() {
+        return Ok(());
+    }
+    let c = claims.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "actor required when token has no JWT claims (debug_token mode)".to_string(),
+        )
+    })?;
+    let role = c.role.clone().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "token claims missing role; cannot infer actor".to_string(),
+        )
+    })?;
+    let name = if c.user_name.trim().is_empty() {
+        c.user_id.clone()
+    } else {
+        c.user_name.clone()
+    };
+    request.actor = Some(WorkflowActor {
+        id: c.user_id,
+        name,
+        roles: role,
+    });
+    Ok(())
+}
+
 pub async fn verify_workflow_handler(
-    Json(request): Json<SyncWorkflowRequest>,
+    Json(mut request): Json<SyncWorkflowRequest>,
 ) -> impl IntoResponse {
     let action = request.action.trim().to_lowercase();
     let request_start_time = std::time::Instant::now();
 
-    info!(
-        "[WORKFLOW_VERIFY] form_id={}, action={}, actor={}/{}",
-        request.form_id, action, request.actor.id, request.actor.roles
-    );
+    let claims = match verify_s2s_token_with_claims(&request.token) {
+        Ok(claims) => claims,
+        Err((_status, msg)) => {
+            warn!(
+                "[WORKFLOW_VERIFY] Token校验失败 - form_id={}, reason={}",
+                request.form_id, msg
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(VerifyWorkflowResponse {
+                    code: 401,
+                    message: "unauthorized".to_string(),
+                    data: None,
+                    error_code: None,
+                    annotation_check: None,
+                }),
+            );
+        }
+    };
 
-    if let Err((_status, msg)) = verify_s2s_token(&request.token) {
+    if let Err((status, msg)) = fill_actor_from_claims(&mut request, claims) {
         warn!(
-            "[WORKFLOW_VERIFY] Token校验失败 - form_id={}, reason={}",
+            "[WORKFLOW_VERIFY] actor 解析失败 - form_id={}, reason={}",
             request.form_id, msg
         );
         return (
-            StatusCode::UNAUTHORIZED,
+            status,
             Json(VerifyWorkflowResponse {
-                code: 401,
-                message: "unauthorized".to_string(),
+                code: status.as_u16() as i32,
+                message: msg,
                 data: None,
-                error_code: None,
+                error_code: Some("ACTOR_REQUIRED".to_string()),
                 annotation_check: None,
             }),
         );
     }
+
+    info!(
+        "[WORKFLOW_VERIFY] form_id={}, action={}, actor={}/{}",
+        request.form_id,
+        action,
+        request.actor().id,
+        request.actor().roles
+    );
 
     let kind = match parse_workflow_mutation_kind(&request.action) {
         Ok(kind) => kind,
@@ -337,36 +446,58 @@ pub async fn verify_workflow_handler(
     result
 }
 
-pub async fn sync_workflow_handler(Json(request): Json<SyncWorkflowRequest>) -> impl IntoResponse {
+pub async fn sync_workflow_handler(
+    Json(mut request): Json<SyncWorkflowRequest>,
+) -> impl IntoResponse {
     let action = request.action.trim().to_lowercase();
     let is_query = action == "query";
     let request_start_time = std::time::Instant::now();
+
+    let claims = match verify_s2s_token_with_claims(&request.token) {
+        Ok(claims) => claims,
+        Err((_status, msg)) => {
+            warn!(
+                "[WORKFLOW_SYNC] Token校验失败 - form_id={}, reason={}",
+                request.form_id, msg
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(SyncWorkflowResponse {
+                    code: 401,
+                    message: "unauthorized".to_string(),
+                    data: None,
+                    error_code: None,
+                    annotation_check: None,
+                }),
+            );
+        }
+    };
+
+    if let Err((status, msg)) = fill_actor_from_claims(&mut request, claims) {
+        warn!(
+            "[WORKFLOW_SYNC] actor 解析失败 - form_id={}, reason={}",
+            request.form_id, msg
+        );
+        return (
+            status,
+            Json(SyncWorkflowResponse {
+                code: status.as_u16() as i32,
+                message: msg,
+                data: None,
+                error_code: Some("ACTOR_REQUIRED".to_string()),
+                annotation_check: None,
+            }),
+        );
+    }
 
     info!(
         "[WORKFLOW_SYNC] form_id={}, action={}, actor={}/{}{}",
         request.form_id,
         action,
-        request.actor.id,
-        request.actor.roles,
+        request.actor().id,
+        request.actor().roles,
         if is_query { " (query)" } else { "" }
     );
-
-    if let Err((_status, msg)) = verify_s2s_token(&request.token) {
-        warn!(
-            "[WORKFLOW_SYNC] Token校验失败 - form_id={}, reason={}",
-            request.form_id, msg
-        );
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(SyncWorkflowResponse {
-                code: 401,
-                message: "unauthorized".to_string(),
-                data: None,
-                error_code: None,
-                annotation_check: None,
-            }),
-        );
-    }
 
     let response_next_step = if is_query {
         None
@@ -380,7 +511,7 @@ pub async fn sync_workflow_handler(Json(request): Json<SyncWorkflowRequest>) -> 
             Err(error) => {
                 warn!(
                     "[WORKFLOW_SYNC] {} 执行失败 - form_id={}, actor={}, reason={}",
-                    action, request.form_id, request.actor.id, error.message
+                    action, request.form_id, request.actor().id, error.message
                 );
                 return error.into_sync_response();
             }
@@ -390,7 +521,7 @@ pub async fn sync_workflow_handler(Json(request): Json<SyncWorkflowRequest>) -> 
             Err(error) => {
                 warn!(
                     "[WORKFLOW_SYNC] {} 执行失败 - form_id={}, actor={}, reason={}",
-                    action, request.form_id, request.actor.id, error.message
+                    action, request.form_id, request.actor().id, error.message
                 );
                 return error.into_sync_response();
             }
@@ -485,6 +616,22 @@ fn workflow_node_rank(node: &str) -> Option<usize> {
     }
 }
 
+fn normalize_pms_human_code(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed.to_ascii_uppercase();
+    if normalized
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
 fn current_node_owner<'a>(task: &'a ReviewTask, current_node: &str) -> (&'a str, &'static str) {
     match current_node {
         "sj" => (task.requester_id.trim(), "requester"),
@@ -563,14 +710,101 @@ fn build_verify_data(
     VerifyWorkflowData {
         passed: true,
         action: action.to_string(),
+        block_code: None,
         current_node: Some(precheck.current_node.clone()),
         task_status: Some(precheck.task_status.clone()),
         next_step: precheck
             .next_step
             .as_ref()
             .map(|step| step.target_node.clone()),
+        actor_id: None,
+        owner_id: None,
+        owner_source: None,
+        expected_next_node: None,
+        requested_next_step: None,
         reason: reason.into(),
         recommended_action: recommended_action.to_string(),
+    }
+}
+
+fn workflow_next_step_diagnostic(
+    next_step: Option<&WorkflowNextStep>,
+) -> Option<WorkflowVerifyNextStepDiagnostic> {
+    next_step.map(|step| WorkflowVerifyNextStepDiagnostic {
+        assignee_id: step.assignee_id.trim().to_string(),
+        name: step.name.trim().to_string(),
+        roles: step.roles.trim().to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WorkflowRecord, dominant_records_task_id, normalize_pms_human_code};
+
+    #[test]
+    fn normalize_pms_human_code_accepts_real_pms_style_ids() {
+        assert_eq!(normalize_pms_human_code(" JH "), Some("JH".to_string()));
+        assert_eq!(normalize_pms_human_code("sh"), Some("SH".to_string()));
+        assert_eq!(normalize_pms_human_code("USER-01"), Some("USER-01".to_string()));
+    }
+
+    #[test]
+    fn normalize_pms_human_code_rejects_internal_account_ids() {
+        assert_eq!(normalize_pms_human_code("proofreader_001"), None);
+        assert_eq!(normalize_pms_human_code("reviewer_001"), None);
+        assert_eq!(normalize_pms_human_code(""), None);
+    }
+
+    fn record_with_task_id(task_id: &str) -> WorkflowRecord {
+        WorkflowRecord {
+            id: format!("rec-{}", task_id),
+            task_id: task_id.to_string(),
+            r#type: "batch".to_string(),
+            annotations: Vec::new(),
+            cloud_annotations: Vec::new(),
+            rect_annotations: Vec::new(),
+            obb_annotations: Vec::new(),
+            measurements: Vec::new(),
+            note: String::new(),
+            confirmed_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn dominant_records_task_id_returns_none_for_empty() {
+        assert_eq!(dominant_records_task_id(&[]), None);
+    }
+
+    #[test]
+    fn dominant_records_task_id_picks_first_non_empty_in_desc_order() {
+        // Records are ORDER BY confirmed_at DESC, so head 是最近确认的批注。
+        let records = vec![
+            record_with_task_id("task-c3f25"),
+            record_with_task_id("task-c3f25"),
+        ];
+        assert_eq!(
+            dominant_records_task_id(&records),
+            Some("task-c3f25".to_string())
+        );
+    }
+
+    #[test]
+    fn dominant_records_task_id_skips_empty_task_id_rows() {
+        // 兜底场景：旧数据行 task_id 为空，应跳过到下一条。
+        let records = vec![
+            record_with_task_id("   "),
+            record_with_task_id("task-real"),
+        ];
+        assert_eq!(
+            dominant_records_task_id(&records),
+            Some("task-real".to_string())
+        );
+    }
+
+    #[test]
+    fn dominant_records_task_id_returns_none_when_all_empty() {
+        let records = vec![record_with_task_id(""), record_with_task_id("  ")];
+        assert_eq!(dominant_records_task_id(&records), None);
     }
 }
 
@@ -642,7 +876,16 @@ fn resolve_required_next_step(
         ));
     }
 
-    let assignee_id = next_step.assignee_id.trim().to_string();
+    let assignee_id = normalize_pms_human_code(&next_step.assignee_id).ok_or_else(|| {
+        WorkflowSyncActionError::plain(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} 的 next_step.assignee_id 不是合法 PMS HumanCode: {}",
+                action_label,
+                next_step.assignee_id.trim()
+            ),
+        )
+    })?;
     if assignee_id.is_empty() {
         return Err(WorkflowSyncActionError::plain(
             StatusCode::BAD_REQUEST,
@@ -689,22 +932,81 @@ fn ensure_owner_matches(
     current_node: &str,
     actor_id: &str,
     next_step: Option<String>,
+    expected_next_node: Option<String>,
+    requested_next_step: Option<WorkflowVerifyNextStepDiagnostic>,
 ) -> Result<(), WorkflowSyncActionError> {
     let (owner_id, owner_source) = current_node_owner(task, current_node);
-    if !owner_id.is_empty() && owner_id != actor_id.trim() {
+    if owner_id.is_empty() {
+        return Ok(());
+    }
+
+    let owner_human_code = normalize_pms_human_code(owner_id).ok_or_else(|| {
+        WorkflowSyncActionError::blocked(
+            StatusCode::FORBIDDEN,
+            format!(
+                "{} 权限校验失败：{} 节点负责人 {} 不是合法 PMS HumanCode",
+                action_label, owner_source, owner_id
+            ),
+            Some(current_node.to_string()),
+            Some(normalize_task_status(&task.status)),
+            next_step.clone(),
+            "block",
+        )
+        .with_verify_diagnostics(
+            "INVALID_OWNER_ID",
+            actor_id.trim(),
+            owner_id,
+            owner_source,
+            expected_next_node.clone(),
+            requested_next_step.clone(),
+        )
+    })?;
+
+    let actor_human_code = normalize_pms_human_code(actor_id).ok_or_else(|| {
+        WorkflowSyncActionError::blocked(
+            StatusCode::FORBIDDEN,
+            format!(
+                "{} 权限校验失败：当前请求人 {} 不是合法 PMS HumanCode",
+                action_label,
+                actor_id.trim()
+            ),
+            Some(current_node.to_string()),
+            Some(normalize_task_status(&task.status)),
+            next_step.clone(),
+            "block",
+        )
+        .with_verify_diagnostics(
+            "INVALID_ACTOR_ID",
+            actor_id.trim(),
+            owner_human_code.clone(),
+            owner_source,
+            expected_next_node.clone(),
+            requested_next_step.clone(),
+        )
+    })?;
+
+    if owner_human_code != actor_human_code {
         return Err(WorkflowSyncActionError::blocked(
             StatusCode::FORBIDDEN,
             format!(
                 "{} 权限不足：当前请求人 {} 不是 {} 节点负责人 {}",
                 action_label,
-                actor_id.trim(),
+                actor_human_code,
                 owner_source,
-                owner_id
+                owner_human_code
             ),
             Some(current_node.to_string()),
             Some(normalize_task_status(&task.status)),
             next_step,
             "block",
+        )
+        .with_verify_diagnostics(
+            "OWNER_MISMATCH",
+            actor_human_code,
+            owner_human_code,
+            owner_source,
+            expected_next_node,
+            requested_next_step,
         ));
     }
     Ok(())
@@ -767,8 +1069,10 @@ async fn validate_workflow_active(
         "active",
         &task,
         &current_node,
-        &request.actor.id,
+        &request.actor().id,
         Some(next_step.target_node.clone()),
+        Some(next_step.target_node.clone()),
+        workflow_next_step_diagnostic(request.next_step.as_ref()),
     )?;
 
     let annotation_check = evaluate_annotation_check(
@@ -854,8 +1158,10 @@ async fn validate_workflow_return(
         "return",
         &task,
         &current_node,
-        &request.actor.id,
+        &request.actor().id,
         Some(next_step.target_node.clone()),
+        Some(next_step.target_node.clone()),
+        workflow_next_step_diagnostic(request.next_step.as_ref()),
     )?;
 
     Ok(WorkflowMutationPrecheck {
@@ -900,8 +1206,10 @@ async fn validate_workflow_agree(
         "agree",
         &task,
         &current_node,
-        &request.actor.id,
+        &request.actor().id,
         requested_next_step.clone(),
+        expected_agree_next_node(&current_node).map(str::to_string),
+        workflow_next_step_diagnostic(request.next_step.as_ref()),
     )?;
 
     let next_step = if current_node == "pz" {
@@ -936,11 +1244,20 @@ async fn validate_workflow_agree(
     .await
     .map_err(|(status, message)| WorkflowSyncActionError::plain(status, message))?;
     if !annotation_check.passed {
+        let (owner_id, owner_source) = current_node_owner(&task, &current_node);
         return Err(WorkflowSyncActionError::annotation_check_failed(
             annotation_check,
             Some(current_node.clone()),
             Some(normalize_task_status(&task.status)),
             next_step.as_ref().map(|step| step.target_node.clone()),
+        )
+        .with_verify_diagnostics(
+            "ANNOTATION_CHECK_FAILED",
+            request.actor().id.trim(),
+            owner_id,
+            owner_source,
+            expected_agree_next_node(&current_node).map(str::to_string),
+            workflow_next_step_diagnostic(request.next_step.as_ref()),
         ));
     }
 
@@ -977,7 +1294,15 @@ async fn validate_workflow_stop(
         ));
     }
 
-    ensure_owner_matches("stop", &task, &current_node, &request.actor.id, None)?;
+    ensure_owner_matches(
+        "stop",
+        &task,
+        &current_node,
+        &request.actor().id,
+        None,
+        None,
+        None,
+    )?;
 
     Ok(WorkflowMutationPrecheck {
         task_status: normalize_task_status(&task.status),
@@ -1096,8 +1421,8 @@ async fn apply_workflow_active(
         .query(history_sql)
         .bind(("task_id", task.id.clone()))
         .bind(("from_node", current_node))
-        .bind(("operator_id", request.actor.id.trim().to_string()))
-        .bind(("operator_name", request.actor.name.trim().to_string()))
+        .bind(("operator_id", request.actor().id.trim().to_string()))
+        .bind(("operator_name", request.actor().name.trim().to_string()))
         .bind(("comment", history_comment))
         .await;
 
@@ -1202,8 +1527,8 @@ async fn apply_workflow_return(
         .query(history_sql)
         .bind(("task_id", task.id.clone()))
         .bind(("from_node", current_node))
-        .bind(("operator_id", request.actor.id.trim().to_string()))
-        .bind(("operator_name", request.actor.name.trim().to_string()))
+        .bind(("operator_id", request.actor().id.trim().to_string()))
+        .bind(("operator_name", request.actor().name.trim().to_string()))
         .bind(("comment", Some(return_reason)))
         .await;
 
@@ -1338,8 +1663,8 @@ async fn apply_workflow_agree(
         .query(history_sql)
         .bind(("task_id", task.id.clone()))
         .bind(("from_node", current_node.clone()))
-        .bind(("operator_id", request.actor.id.trim().to_string()))
-        .bind(("operator_name", request.actor.name.trim().to_string()))
+        .bind(("operator_id", request.actor().id.trim().to_string()))
+        .bind(("operator_name", request.actor().name.trim().to_string()))
         .bind(("comment", history_comment))
         .await;
 
@@ -1425,8 +1750,8 @@ async fn apply_workflow_stop(
         .query(history_sql)
         .bind(("task_id", task.id.clone()))
         .bind(("from_node", current_node))
-        .bind(("operator_id", request.actor.id.trim().to_string()))
-        .bind(("operator_name", request.actor.name.trim().to_string()))
+        .bind(("operator_id", request.actor().id.trim().to_string()))
+        .bind(("operator_name", request.actor().name.trim().to_string()))
         .bind(("comment", Some(stop_reason)))
         .await;
 
@@ -1438,7 +1763,8 @@ async fn apply_workflow_stop(
 // ============================================================================
 
 async fn query_workflow_models(form_id: &str) -> anyhow::Result<Vec<String>> {
-    let mut response = review_primary_db()
+    let db = fresh_review_db().await?;
+    let mut response = db
         .query(
             r#"
             SELECT VALUE model_refno FROM review_form_model
@@ -1458,7 +1784,8 @@ async fn query_workflow_models(form_id: &str) -> anyhow::Result<Vec<String>> {
 }
 
 async fn query_workflow_attachments(form_id: &str) -> anyhow::Result<Vec<WorkflowAttachment>> {
-    let mut response = review_primary_db()
+    let db = fresh_review_db().await?;
+    let mut response = db
         .query(
             r#"
             SELECT model_refnos, file_id, file_type, download_url, description, file_ext
@@ -1514,7 +1841,8 @@ async fn query_workflow_records_by_form_id(form_id: &str) -> anyhow::Result<Vec<
         confirmed_at: Option<surrealdb::types::Datetime>,
     }
 
-    let mut response = review_primary_db()
+    let db = fresh_review_db().await?;
+    let mut response = db
         .query(
             r#"
             SELECT id, task_id, type, annotations, cloud_annotations, rect_annotations, obb_annotations, measurements, note, confirmed_at
@@ -1562,7 +1890,8 @@ async fn query_workflow_records_by_task_id(task_id: &str) -> anyhow::Result<Vec<
         confirmed_at: Option<surrealdb::types::Datetime>,
     }
 
-    let mut response = review_primary_db()
+    let db = fresh_review_db().await?;
+    let mut response = db
         .query(
             r#"
             SELECT id, task_id, type, annotations, cloud_annotations, rect_annotations, obb_annotations, measurements, note, confirmed_at
@@ -1613,7 +1942,8 @@ async fn query_annotation_comments(
 
     let mut comments = Vec::new();
     for annotation_id in annotation_ids {
-        let mut response = review_primary_db()
+        let db = fresh_review_db().await?;
+        let mut response = db
             .query(
                 r#"
                 SELECT id, annotation_id, annotation_type, author_id, author_name, author_role, content, reply_to_id, created_at
@@ -1647,6 +1977,19 @@ async fn query_annotation_comments(
     Ok(comments)
 }
 
+/// 当 `review_tasks` 因数据问题对同一 form_id 出现多条记录时，从 `records`（已按
+/// `confirmed_at DESC` 排序）中取最近一条非空的 `task_id` 作为「记录主导任务」。
+///
+/// 调用方用这个值把响应里的 `data.task_id` 对齐到真正承载批注血缘的那条任务，
+/// 避免出现 `data.task_id != records[].task_id` 的不自洽响应。
+fn dominant_records_task_id(records: &[WorkflowRecord]) -> Option<String> {
+    records
+        .iter()
+        .map(|record| record.task_id.trim())
+        .find(|task_id| !task_id.is_empty())
+        .map(str::to_string)
+}
+
 async fn query_workflow_data(
     form_id: &str,
     next_step: Option<String>,
@@ -1655,16 +1998,37 @@ async fn query_workflow_data(
     let attachments = query_workflow_attachments(form_id).await?;
     let review_form = get_review_form_by_form_id(form_id).await?;
     let task = find_task_by_form_id(form_id).await?;
-    let task_id = task.as_ref().map(|t| t.id.clone());
+    let active_task_id = task.as_ref().map(|t| t.id.clone());
     let records = {
         let by_form = query_workflow_records_by_form_id(form_id).await?;
         if !by_form.is_empty() {
             by_form
-        } else if let Some(task_id) = task_id.as_deref() {
+        } else if let Some(task_id) = active_task_id.as_deref() {
             query_workflow_records_by_task_id(task_id).await?
         } else {
             Vec::new()
         }
+    };
+    // 对齐 data.task_id 与 records 血缘：当 review_tasks 出现 form_id 维度的重复
+    // （例如返工后重新建空任务），active task 与 records 真实承载者会分裂。
+    // 这里以 records 为准，保证响应自洽；保留 current_node / task_status 仍来自
+    // active task —— 它描述的是当前 form 在工作流里的位置，不应被旧任务覆盖。
+    let task_id = match (dominant_records_task_id(&records), active_task_id.clone()) {
+        (Some(records_dominant), Some(active)) if records_dominant != active => {
+            warn!(
+                "[WORKFLOW_SYNC] form_id={} 检测到 review_tasks 重复：active={}, records 主导任务={}; 响应 data.task_id 对齐 records 主导任务以保持血缘自洽。建议数据治理：合并/删除空任务 active",
+                form_id, active, records_dominant
+            );
+            Some(records_dominant)
+        }
+        (Some(records_dominant), None) => {
+            warn!(
+                "[WORKFLOW_SYNC] form_id={} 无 active review_task 但 review_records 有数据 (主导任务={}); 响应 data.task_id 回填到 records 主导任务",
+                form_id, records_dominant
+            );
+            Some(records_dominant)
+        }
+        _ => active_task_id.clone(),
     };
     let mut annotation_ids = BTreeSet::new();
     for record in &records {

@@ -27,7 +27,7 @@ use crate::web_api::platform_api::{
     mark_review_form_deleted, sync_review_form_with_task_status,
 };
 use crate::web_api::review_annotation_state::sync_annotation_states_from_snapshot;
-use crate::web_api::review_db::review_primary_db;
+use crate::web_api::review_db::{fresh_review_db, review_primary_db};
 use axum::extract::Extension;
 use std::collections::HashSet;
 use tokio::time::{Duration, timeout};
@@ -260,12 +260,62 @@ struct CreateTaskResolvedNames {
     reviewer_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreateTaskResolvedAssignees {
+    checker_id: String,
+    reviewer_id: String,
+    approver_id: String,
+}
+
 fn preferred_name(value: Option<&str>, fallback: &str) -> String {
     value
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(fallback)
         .to_string()
+}
+
+fn resolve_create_task_human_code_field(
+    field_name: &str,
+    value: Option<&str>,
+) -> Result<String, String> {
+    let trimmed = value.map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
+        format!("{field_name} 缺少 PMS HumanCode，不能使用旧内部默认账号")
+    })?;
+
+    let valid = trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-')
+        && trimmed
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_uppercase())
+            .unwrap_or(false);
+
+    if valid {
+        Ok(trimmed.to_string())
+    } else {
+        Err(format!(
+            "{field_name} 必须是 PMS HumanCode，不能使用旧内部账号: {trimmed}"
+        ))
+    }
+}
+
+fn resolve_create_task_assignees(
+    request: &CreateTaskRequest,
+) -> Result<CreateTaskResolvedAssignees, String> {
+    let checker_id = resolve_create_task_human_code_field(
+        "checker_id",
+        request.checker_id.as_deref().or(Some(request.reviewer_id.as_str())),
+    )?;
+    let approver_id =
+        resolve_create_task_human_code_field("approver_id", request.approver_id.as_deref())?;
+
+    Ok(CreateTaskResolvedAssignees {
+        reviewer_id: checker_id.clone(),
+        checker_id,
+        approver_id,
+    })
 }
 
 fn resolve_create_task_names(
@@ -355,7 +405,11 @@ struct TaskRow {
     review_comment: Option<String>,
     created_at: Option<surrealdb::types::Datetime>,
     updated_at: Option<surrealdb::types::Datetime>,
-    due_date: Option<surrealdb::types::Datetime>,
+    /// Historical writes stored RFC3339 strings (see `create_task` /
+    /// `update_task`), while newer rows may store native `time::*` datetime.
+    /// Accept the dynamic SurrealDB `Value` here so deserialization does not
+    /// fail the entire page when a single legacy row carries a string.
+    due_date: Option<surrealdb_types::Value>,
     current_node: Option<String>,
     workflow_history: Option<Vec<WorkflowStep>>,
     return_reason: Option<String>,
@@ -400,7 +454,7 @@ impl TaskRow {
             review_comment: self.review_comment,
             created_at: datetime_to_millis(&self.created_at),
             updated_at: datetime_to_millis(&self.updated_at),
-            due_date: self.due_date.map(|dt| datetime_to_millis(&Some(dt))),
+            due_date: flexible_value_to_millis(self.due_date.as_ref()),
             current_node: self.current_node.unwrap_or_else(default_current_node),
             workflow_history: self.workflow_history.unwrap_or_default(),
             return_reason: self.return_reason,
@@ -794,20 +848,39 @@ async fn query_review_task_page(
     bindings: &[(&'static str, String)],
     limit: i64,
     offset: i64,
-) -> Result<Vec<ReviewTask>, surrealdb::Error> {
+) -> anyhow::Result<Vec<ReviewTask>> {
+    let db = fresh_review_db().await?;
     let data_sql = format!(
         "SELECT * FROM review_tasks {} ORDER BY created_at DESC LIMIT {} START {}",
         where_clause, limit, offset
     );
-    let mut q = review_primary_db().query(&data_sql);
+    let mut q = db.query(&data_sql);
     for (name, value) in bindings {
         q = q.bind((*name, value.clone()));
     }
 
     let mut response = q.await?;
-    let rows: Vec<TaskRow> = response.take(0).unwrap_or_default();
+    let rows: Vec<TaskRow> = match response.take(0) {
+        Ok(rows) => rows,
+        Err(deser_err) => {
+            warn!(
+                "Failed to deserialize review_tasks page (limit={}, offset={}): {}",
+                limit, offset, deser_err
+            );
+            Vec::new()
+        }
+    };
     Ok(rows.into_iter().map(|row| row.to_review_task()).collect())
 }
+
+/// Maximum number of single-row probes allowed when the bulk page query returns
+/// zero rows but `count()` reports rows exist. The fallback is a defensive net
+/// against partial-deserialize edge cases — historically it was bounded by
+/// `total`, which collapsed under large datasets (e.g. 200+ rows triggered
+/// 200+ serial ws queries, exhausting the SurrealDB ws channel and dead-locking
+/// every subsequent /api/review/* request). Capping the probe count keeps the
+/// recovery cheap even when deserialization is broken.
+const REVIEW_TASK_FALLBACK_PROBE_CAP: i64 = 50;
 
 async fn recover_review_task_page_with_row_probes(
     where_clause: &str,
@@ -820,8 +893,13 @@ async fn recover_review_task_page_with_row_probes(
     let mut skipped_rows = 0usize;
     let mut probe_offset = offset.max(0);
     let probe_end = total.max(0);
+    let max_probe_count = limit.max(0).min(REVIEW_TASK_FALLBACK_PROBE_CAP);
+    let probe_budget_end = probe_offset.saturating_add(max_probe_count);
 
-    while probe_offset < probe_end && (recovered.len() as i64) < limit.max(0) {
+    while probe_offset < probe_end
+        && probe_offset < probe_budget_end
+        && (recovered.len() as i64) < max_probe_count
+    {
         match query_review_task_page(where_clause, bindings, 1, probe_offset).await {
             Ok(mut rows) if !rows.is_empty() => recovered.push(rows.remove(0)),
             Ok(_) => skipped_rows += 1,
@@ -831,9 +909,17 @@ async fn recover_review_task_page_with_row_probes(
                     probe_offset, error
                 );
                 skipped_rows += 1;
+                break;
             }
         }
         probe_offset += 1;
+    }
+
+    if probe_offset < probe_end && (recovered.len() as i64) >= max_probe_count {
+        warn!(
+            "Review task fallback recovery hit probe cap {} (total={}, requested_limit={}); returning partial page to avoid ws channel exhaustion",
+            max_probe_count, total, limit
+        );
     }
 
     (recovered, skipped_rows)
@@ -843,6 +929,38 @@ fn datetime_to_millis(dt: &Option<surrealdb::types::Datetime>) -> i64 {
     dt.as_ref()
         .map(|d| d.timestamp_millis())
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
+}
+
+/// Converts a dynamic SurrealDB `Value` into millis-since-epoch, accepting
+/// both native `Datetime` (current writers) and RFC3339 strings (legacy
+/// writers in `create_task` / `update_task`).
+fn flexible_value_to_millis(value: Option<&surrealdb_types::Value>) -> Option<i64> {
+    match value? {
+        surrealdb_types::Value::None | surrealdb_types::Value::Null => None,
+        surrealdb_types::Value::Datetime(dt) => Some(dt.timestamp_millis()),
+        surrealdb_types::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                chrono::DateTime::parse_from_rfc3339(trimmed)
+                    .ok()
+                    .map(|dt| dt.timestamp_millis())
+            }
+        }
+        surrealdb_types::Value::Number(n) => match n {
+            surrealdb_types::Number::Int(i) => Some(*i),
+            surrealdb_types::Number::Float(f) => Some(*f as i64),
+            surrealdb_types::Number::Decimal(d) => d.to_string().parse::<i64>().ok(),
+        },
+        other => {
+            warn!(
+                "flexible_value_to_millis: unsupported variant for due_date-like field: {:?}",
+                other
+            );
+            None
+        }
+    }
 }
 
 fn parse_datetime(s: &Option<String>) -> i64 {
@@ -1150,8 +1268,12 @@ pub fn create_review_api_routes() -> Router {
             "/api/review/comments/item/{comment_id}",
             delete(delete_comment).patch(edit_comment),
         )
+        // 批注轻量字段（表格内联编辑）
+        .route(
+            "/api/review/annotations/{annotation_id}",
+            patch(update_annotation_basic_fields),
+        )
         // 批注严重度（问题严重程度，与评论并列但语义不同）
-        // 当前为桩实现：仅校验参数并回显，暂不落库；前端失败时走本地 fallback。
         .route(
             "/api/review/annotations/{annotation_id}/severity",
             patch(update_annotation_severity),
@@ -1161,6 +1283,15 @@ pub fn create_review_api_routes() -> Router {
         .route(
             "/api/review/attachments/{attachment_id}",
             delete(delete_attachment),
+        )
+        // 驳回重新流转
+        .route(
+            "/api/review/tasks/returned",
+            get(list_returned_tasks),
+        )
+        .route(
+            "/api/review/tasks/batch-reactivate",
+            post(batch_reactivate_tasks),
         )
         // 同步 API
         .route("/api/review/sync/export", post(export_review_data))
@@ -1193,12 +1324,22 @@ async fn create_task(
 
     let requester_id = claims.user_id.clone();
 
-    let checker_id = request
-        .checker_id
-        .clone()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| request.reviewer_id.clone());
-    let approver_id = request.approver_id.clone().unwrap_or_default();
+    let assignees = match resolve_create_task_assignees(&request) {
+        Ok(assignees) => assignees,
+        Err(message) => {
+            warn!("Rejecting review task create request: {}", message);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(TaskResponse {
+                    success: false,
+                    task: None,
+                    error_message: Some(message),
+                }),
+            );
+        }
+    };
+    let checker_id = assignees.checker_id.clone();
+    let approver_id = assignees.approver_id.clone();
     let resolved_names =
         resolve_create_task_names(&claims, &request, checker_id.as_str(), approver_id.as_str());
     let requester_name = resolved_names.requester_name.clone();
@@ -1251,7 +1392,7 @@ async fn create_task(
         .bind(("checker_name", resolved_names.checker_name.clone()))
         .bind(("approver_id", approver_id.clone()))
         .bind(("approver_name", resolved_names.approver_name.clone()))
-        .bind(("reviewer_id", request.reviewer_id.clone()))
+        .bind(("reviewer_id", assignees.reviewer_id.clone()))
         .bind(("reviewer_name", resolved_names.reviewer_name.clone()))
         .bind(("components", request.components.clone()))
         .bind(("attachments", request.attachments.clone()))
@@ -1340,7 +1481,7 @@ async fn create_task(
                 checker_name: resolved_names.checker_name.clone(),
                 approver_id: approver_id.clone(),
                 approver_name: resolved_names.approver_name.clone(),
-                reviewer_id: request.reviewer_id,
+                reviewer_id: assignees.reviewer_id,
                 reviewer_name: resolved_names.reviewer_name.clone(),
                 components: request.components,
                 attachments: request.attachments,
@@ -1420,7 +1561,22 @@ async fn list_tasks(Query(query): Query<TaskListQuery>) -> impl IntoResponse {
         "SELECT count() AS total FROM review_tasks {} GROUP ALL",
         where_clause
     );
-    let mut q = review_primary_db().query(&count_sql);
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect fresh review db for task list: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(TaskListResponse {
+                    success: false,
+                    tasks: vec![],
+                    total: 0,
+                    error_message: Some(format!("获取任务列表失败: {}", e)),
+                }),
+            );
+        }
+    };
+    let mut q = db.query(&count_sql);
     for (name, value) in &bindings {
         q = q.bind((*name, value.clone()));
     }
@@ -1495,7 +1651,22 @@ async fn get_task(Path(id): Path<String>) -> impl IntoResponse {
     // 使用 record::id(id) 提取 key 进行比较
     let sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
 
-    match review_primary_db()
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect fresh review db for task detail: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(TaskResponse {
+                    success: false,
+                    task: None,
+                    error_message: Some(format!("获取任务失败: {}", e)),
+                }),
+            );
+        }
+    };
+
+    match db
         .query(sql)
         .bind(("id", id.clone()))
         .await
@@ -1879,7 +2050,22 @@ async fn get_task_history(Path(id): Path<String>) -> impl IntoResponse {
     let sql =
         "SELECT * FROM review_workflow_history WHERE task_id = $task_id ORDER BY timestamp DESC";
 
-    match review_primary_db()
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect fresh review db for task history: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(HistoryResponse {
+                    success: false,
+                    history: vec![],
+                    error_message: Some(format!("获取历史失败: {}", e)),
+                }),
+            );
+        }
+    };
+
+    match db
         .query(sql)
         .bind(("task_id", id.clone()))
         .await
@@ -2305,7 +2491,23 @@ async fn get_records_by_task(Path(task_id): Path<String>) -> impl IntoResponse {
 
     let sql = "SELECT * FROM review_records WHERE task_id = $task_id ORDER BY confirmed_at DESC";
 
-    match review_primary_db()
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect fresh review db for records: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ConfirmedRecordResponse {
+                    success: false,
+                    record: None,
+                    records: None,
+                    error_message: Some(format!("获取记录失败: {}", e)),
+                }),
+            );
+        }
+    };
+
+    match db
         .query(sql)
         .bind(("task_id", task_id))
         .await
@@ -2587,18 +2789,10 @@ async fn get_comments_by_annotation(
     if query.r#type.is_some() {
         conditions.push("annotation_type = $type".to_string());
     }
-    if query
-        .form_id
-        .as_ref()
-        .is_some_and(|s| !s.trim().is_empty())
-    {
+    if query.form_id.as_ref().is_some_and(|s| !s.trim().is_empty()) {
         conditions.push("form_id = $form_id".to_string());
     }
-    if query
-        .task_id
-        .as_ref()
-        .is_some_and(|s| !s.trim().is_empty())
-    {
+    if query.task_id.as_ref().is_some_and(|s| !s.trim().is_empty()) {
         conditions.push("task_id = $task_id".to_string());
     }
     let sql = format!(
@@ -2606,7 +2800,22 @@ async fn get_comments_by_annotation(
         conditions.join(" AND ")
     );
 
-    let mut q = review_primary_db()
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect fresh review db for comments: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(CommentResponse {
+                    success: false,
+                    comment: None,
+                    comments: None,
+                    error_message: Some(format!("获取评论失败: {}", e)),
+                }),
+            );
+        }
+    };
+    let mut q = db
         .query(&sql)
         .bind(("annotation_id", annotation_id));
     if let Some(ref t) = query.r#type {
@@ -2828,7 +3037,7 @@ async fn delete_comment(
 }
 
 // ============================================================================
-// Handlers - 批注严重度（桩实现，仅回显）
+// Handlers - 批注轻量字段 / 错误标记
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -2838,10 +3047,15 @@ pub struct AnnotationSeverityTypeQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AnnotationSeverityBody {
-    /// `suggestion` | `normal` | `severe` | `critical` | null（null 清空）
+    /// `principle` | `general` | `drawing` | null（null 清空）
     #[serde(default)]
     pub severity: Option<String>,
+    #[serde(default)]
+    pub form_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2860,13 +3074,258 @@ fn is_valid_annotation_type(t: &str) -> bool {
 }
 
 fn is_valid_annotation_severity(s: &str) -> bool {
-    matches!(s, "suggestion" | "normal" | "severe" | "critical")
+    matches!(s, "principle" | "general" | "drawing")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotationBasicFieldsBody {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub form_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnnotationBasicFieldsResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+fn normalize_optional_scope(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn patch_annotation_array<F>(items: &mut [Value], annotation_id: &str, apply: &mut F) -> bool
+where
+    F: FnMut(&mut serde_json::Map<String, Value>) -> bool,
+{
+    let mut changed = false;
+    for item in items {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let Some(id) = obj.get("id").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if id == annotation_id {
+            changed |= apply(obj);
+        }
+    }
+    changed
+}
+
+async fn patch_annotation_records<F>(
+    annotation_id: &str,
+    annotation_type: &str,
+    form_id: Option<String>,
+    task_id: Option<String>,
+    mut apply: F,
+) -> Result<usize, String>
+where
+    F: FnMut(&mut serde_json::Map<String, Value>) -> bool,
+{
+    if form_id.is_none() && task_id.is_none() {
+        return Err("formId/taskId 至少需要提供一个".to_string());
+    }
+
+    let mut filters = Vec::new();
+    if task_id.is_some() {
+        filters.push("task_id = $task_id");
+    }
+    if form_id.is_some() {
+        filters.push("form_id = $form_id");
+    }
+    let sql = format!(
+        "SELECT * FROM review_records WHERE {} ORDER BY confirmed_at DESC",
+        filters.join(" AND ")
+    );
+
+    let mut query = review_primary_db().query(sql);
+    if let Some(task_id) = task_id.as_ref() {
+        query = query.bind(("task_id", task_id.clone()));
+    }
+    if let Some(form_id) = form_id.as_ref() {
+        query = query.bind(("form_id", form_id.clone()));
+    }
+
+    let mut response = query
+        .await
+        .map_err(|error| format!("查询确认记录失败: {}", error))?;
+    let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
+
+    let mut updated = 0usize;
+    for row in rows {
+        let record_id = record_id_to_string(row.id);
+        let mut annotations = row.annotations.unwrap_or_default();
+        let mut cloud_annotations = row.cloud_annotations.unwrap_or_default();
+        let mut rect_annotations = row.rect_annotations.unwrap_or_default();
+        let mut obb_annotations = row.obb_annotations.unwrap_or_default();
+
+        let changed = match annotation_type {
+            "text" => patch_annotation_array(&mut annotations, annotation_id, &mut apply),
+            "cloud" => patch_annotation_array(&mut cloud_annotations, annotation_id, &mut apply),
+            "rect" => patch_annotation_array(&mut rect_annotations, annotation_id, &mut apply),
+            "obb" => patch_annotation_array(&mut obb_annotations, annotation_id, &mut apply),
+            _ => false,
+        };
+        if !changed {
+            continue;
+        }
+
+        let update_sql = r#"
+            UPDATE type::record('review_records', $id) SET
+                annotations = $annotations,
+                cloud_annotations = $cloud_annotations,
+                rect_annotations = $rect_annotations,
+                obb_annotations = $obb_annotations
+        "#;
+        review_primary_db()
+            .query(update_sql)
+            .bind(("id", record_id))
+            .bind(("annotations", annotations))
+            .bind(("cloud_annotations", cloud_annotations))
+            .bind(("rect_annotations", rect_annotations))
+            .bind(("obb_annotations", obb_annotations))
+            .await
+            .map_err(|error| format!("更新确认记录失败: {}", error))?;
+        updated += 1;
+    }
+
+    Ok(updated)
+}
+
+/// PATCH /api/review/annotations/{annotation_id}?type=...
+///
+/// 只更新标题/描述，不修改几何字段。
+async fn update_annotation_basic_fields(
+    Path(annotation_id): Path<String>,
+    Query(query): Query<AnnotationSeverityTypeQuery>,
+    Json(body): Json<AnnotationBasicFieldsBody>,
+) -> impl IntoResponse {
+    if !is_valid_annotation_type(&query.r#type) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AnnotationBasicFieldsResponse {
+                success: false,
+                title: None,
+                description: None,
+                updated_at: None,
+                error_message: Some(format!(
+                    "非法的批注类型: {}（仅支持 text|cloud|rect|obb）",
+                    query.r#type
+                )),
+            }),
+        );
+    }
+
+    let title = match body.title {
+        Some(value) => {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AnnotationBasicFieldsResponse {
+                        success: false,
+                        title: None,
+                        description: None,
+                        updated_at: None,
+                        error_message: Some("标题不能为空".to_string()),
+                    }),
+                );
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+    let description = body.description.map(|value| value.trim().to_string());
+
+    if title.is_none() && description.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AnnotationBasicFieldsResponse {
+                success: false,
+                title: None,
+                description: None,
+                updated_at: None,
+                error_message: Some("没有可更新的字段".to_string()),
+            }),
+        );
+    }
+
+    let form_id = normalize_optional_scope(&body.form_id);
+    let task_id = normalize_optional_scope(&body.task_id);
+    let title_for_patch = title.clone();
+    let description_for_patch = description.clone();
+
+    match patch_annotation_records(
+        annotation_id.trim(),
+        query.r#type.trim(),
+        form_id,
+        task_id,
+        move |obj| {
+            let mut changed = false;
+            if let Some(title) = title_for_patch.as_ref() {
+                if obj.get("title").and_then(Value::as_str) != Some(title.as_str()) {
+                    obj.insert("title".to_string(), Value::String(title.clone()));
+                    changed = true;
+                }
+            }
+            if let Some(description) = description_for_patch.as_ref() {
+                if obj.get("description").and_then(Value::as_str) != Some(description.as_str()) {
+                    obj.insert(
+                        "description".to_string(),
+                        Value::String(description.clone()),
+                    );
+                    changed = true;
+                }
+            }
+            changed
+        },
+    )
+    .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(AnnotationBasicFieldsResponse {
+                success: true,
+                title,
+                description,
+                updated_at: Some(chrono::Utc::now().timestamp_millis()),
+                error_message: None,
+            }),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AnnotationBasicFieldsResponse {
+                success: false,
+                title: None,
+                description: None,
+                updated_at: None,
+                error_message: Some(error),
+            }),
+        ),
+    }
 }
 
 /// PATCH /api/review/annotations/{annotation_id}/severity?type=...
 ///
-/// 持久化到 `review_annotation_severity` 表（UPSERT 语义）。
-/// (annotation_id, annotation_type) 作为复合键，severity 为 null 时清空。
+/// 持久化到 `review_annotation_severity` 表，并同步当前 form/task 的确认记录 JSON。
 async fn update_annotation_severity(
     Path(annotation_id): Path<String>,
     Query(query): Query<AnnotationSeverityTypeQuery>,
@@ -2901,7 +3360,7 @@ async fn update_annotation_severity(
                     severity: None,
                     updated_at: None,
                     error_message: Some(format!(
-                        "非法的严重度: {}（仅支持 suggestion|normal|severe|critical，或 null 清空）",
+                        "非法的严重度: {}（仅支持 principle|general|drawing，或 null 清空）",
                         s
                     )),
                 }),
@@ -2909,9 +3368,19 @@ async fn update_annotation_severity(
         }
     }
 
-    let record_id = format!("{}:{}", annotation_id, query.r#type);
+    let form_id = normalize_optional_scope(&body.form_id);
+    let task_id = normalize_optional_scope(&body.task_id);
+    let record_id = format!(
+        "{}:{}:{}:{}",
+        form_id.as_deref().unwrap_or_default(),
+        task_id.as_deref().unwrap_or_default(),
+        annotation_id,
+        query.r#type
+    );
     let sql = r#"
-        UPSERT review_annotation_severity:[$annotation_id, $annotation_type] CONTENT {
+        UPSERT review_annotation_severity:[$form_id, $task_id, $annotation_id, $annotation_type] CONTENT {
+            form_id: $form_id,
+            task_id: $task_id,
             annotation_id: $annotation_id,
             annotation_type: $annotation_type,
             severity: $severity,
@@ -2921,12 +3390,42 @@ async fn update_annotation_severity(
 
     match review_primary_db()
         .query(sql)
+        .bind(("form_id", form_id.clone().unwrap_or_default()))
+        .bind(("task_id", task_id.clone().unwrap_or_default()))
         .bind(("annotation_id", annotation_id.clone()))
         .bind(("annotation_type", query.r#type.clone()))
         .bind(("severity", body.severity.clone()))
         .await
     {
         Ok(_) => {
+            let severity_for_patch = body.severity.clone();
+            if let Err(error) = patch_annotation_records(
+                annotation_id.trim(),
+                query.r#type.trim(),
+                form_id,
+                task_id,
+                move |obj| {
+                    let previous = obj.get("severity").and_then(Value::as_str);
+                    match severity_for_patch.as_ref() {
+                        Some(severity) if previous != Some(severity.as_str()) => {
+                            obj.insert("severity".to_string(), Value::String(severity.clone()));
+                            true
+                        }
+                        None if obj.contains_key("severity") => {
+                            obj.remove("severity");
+                            true
+                        }
+                        _ => false,
+                    }
+                },
+            )
+            .await
+            {
+                warn!(
+                    "Severity persisted but review_records patch failed for {}: {}",
+                    record_id, error
+                );
+            }
             let updated_at = chrono::Utc::now().timestamp_millis();
             info!(
                 "Severity persisted for {} ({})",
@@ -3000,57 +3499,39 @@ pub struct UserListQuery {
 fn build_mock_review_users() -> Vec<User> {
     vec![
         User {
-            id: "designer_001".to_string(),
-            username: "designer".to_string(),
+            id: "SJ".to_string(),
+            username: "SJ".to_string(),
             name: "王设计师".to_string(),
-            email: "designer@company.com".to_string(),
+            email: "sj@company.com".to_string(),
             role: "designer".to_string(),
             department: Some("设计部".to_string()),
             avatar: None,
         },
         User {
-            id: "proofreader_001".to_string(),
-            username: "proofreader".to_string(),
+            id: "JH".to_string(),
+            username: "JH".to_string(),
             name: "张校对员".to_string(),
-            email: "proofreader@company.com".to_string(),
+            email: "jh@company.com".to_string(),
             role: "proofreader".to_string(),
             department: Some("质量部".to_string()),
             avatar: None,
         },
         User {
-            id: "reviewer_001".to_string(),
-            username: "reviewer".to_string(),
+            id: "SH".to_string(),
+            username: "SH".to_string(),
             name: "李审核员".to_string(),
-            email: "reviewer@company.com".to_string(),
+            email: "sh@company.com".to_string(),
             role: "reviewer".to_string(),
             department: Some("技术部".to_string()),
             avatar: None,
         },
         User {
-            id: "manager_001".to_string(),
-            username: "manager".to_string(),
-            name: "陈经理".to_string(),
-            email: "manager@company.com".to_string(),
-            role: "manager".to_string(),
-            department: Some("工程部".to_string()),
-            avatar: None,
-        },
-        User {
             id: "PZ".to_string(),
             username: "PZ".to_string(),
-            name: "PZ批准人".to_string(),
+            name: "陈经理".to_string(),
             email: "pz@company.com".to_string(),
             role: "manager".to_string(),
             department: Some("工程部".to_string()),
-            avatar: None,
-        },
-        User {
-            id: "admin_001".to_string(),
-            username: "admin".to_string(),
-            name: "系统管理员".to_string(),
-            email: "admin@company.com".to_string(),
-            role: "admin".to_string(),
-            department: Some("信息技术部".to_string()),
             avatar: None,
         },
     ]
@@ -3061,10 +3542,10 @@ fn default_mock_user() -> User {
         .into_iter()
         .find(|user| user.role == "designer")
         .unwrap_or(User {
-            id: "designer_001".to_string(),
-            username: "designer".to_string(),
+            id: "SJ".to_string(),
+            username: "SJ".to_string(),
             name: "王设计师".to_string(),
-            email: "designer@company.com".to_string(),
+            email: "sj@company.com".to_string(),
             role: "designer".to_string(),
             department: Some("设计部".to_string()),
             avatar: None,
@@ -3095,6 +3576,170 @@ fn current_user_from_claims(claims: &crate::web_api::jwt_auth::TokenClaims) -> U
             department: None,
             avatar: None,
         })
+}
+
+// ============================================================================
+// Handlers - 驳回任务批量重新流转
+// ============================================================================
+
+/// GET /api/review/tasks/returned — 列出处于 sj/draft 状态的驳回任务
+async fn list_returned_tasks() -> impl IntoResponse {
+    let sql = r#"
+        SELECT record::id(id) AS id, form_id, title, status, current_node,
+               requester_id, requester_name, checker_id, checker_name,
+               return_reason, updated_at
+        FROM review_tasks
+        WHERE (deleted IS NONE OR deleted = false)
+          AND current_node = 'sj'
+          AND status = 'draft'
+        ORDER BY updated_at DESC
+    "#;
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect review db for returned tasks: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "message": format!("数据库连接失败: {}", e),
+                    "tasks": [],
+                })),
+            );
+        }
+    };
+
+    match db.query(sql).await {
+        Ok(mut response) => {
+            let rows: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
+            info!("[RETURNED_TASKS] 查询到 {} 条驳回任务", rows.len());
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    "count": rows.len(),
+                    "tasks": rows,
+                })),
+            )
+        }
+        Err(e) => {
+            warn!("Failed to query returned tasks: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "message": format!("查询驳回任务失败: {}", e),
+                    "tasks": [],
+                })),
+            )
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchReactivateRequest {
+    task_ids: Vec<String>,
+    target_checker_id: Option<String>,
+    target_checker_name: Option<String>,
+}
+
+/// POST /api/review/tasks/batch-reactivate — 批量将 sj/draft 任务推进到 jd/submitted
+async fn batch_reactivate_tasks(
+    Json(request): Json<BatchReactivateRequest>,
+) -> impl IntoResponse {
+    if request.task_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "message": "task_ids 不能为空",
+                "results": [],
+            })),
+        );
+    }
+
+    info!(
+        "[BATCH_REACTIVATE] 批量重新流转 {} 条任务",
+        request.task_ids.len()
+    );
+
+    let update_sql = r#"
+        UPDATE review_tasks SET
+            current_node = 'jd',
+            status = 'submitted',
+            checker_id = IF string::len(string::trim($checker_id)) > 0 THEN $checker_id ELSE checker_id END,
+            checker_name = IF string::len(string::trim($checker_name)) > 0 THEN $checker_name ELSE checker_name END,
+            reviewer_id = IF string::len(string::trim($checker_id)) > 0 THEN $checker_id ELSE reviewer_id END,
+            reviewer_name = IF string::len(string::trim($checker_name)) > 0 THEN $checker_name ELSE reviewer_name END,
+            return_reason = NONE,
+            updated_at = time::now()
+        WHERE record::id(id) = $task_id
+          AND (deleted IS NONE OR deleted = false)
+          AND current_node = 'sj'
+          AND status = 'draft'
+    "#;
+
+    let checker_id = request.target_checker_id.unwrap_or_default();
+    let checker_name = request.target_checker_name.unwrap_or_default();
+
+    let mut results = Vec::new();
+    let mut success_count = 0usize;
+    let mut skip_count = 0usize;
+
+    for task_id in &request.task_ids {
+        let trimmed = task_id.trim();
+        if trimmed.is_empty() {
+            skip_count += 1;
+            continue;
+        }
+
+        match review_primary_db()
+            .query(update_sql)
+            .bind(("task_id", trimmed.to_string()))
+            .bind(("checker_id", checker_id.clone()))
+            .bind(("checker_name", checker_name.clone()))
+            .await
+        {
+            Ok(_) => {
+                info!("[BATCH_REACTIVATE] 任务 {} 已推进到 jd/submitted", trimmed);
+                results.push(serde_json::json!({
+                    "task_id": trimmed,
+                    "status": "reactivated",
+                }));
+                success_count += 1;
+            }
+            Err(e) => {
+                warn!("[BATCH_REACTIVATE] 任务 {} 推进失败: {}", trimmed, e);
+                results.push(serde_json::json!({
+                    "task_id": trimmed,
+                    "status": "failed",
+                    "error": format!("{}", e),
+                }));
+            }
+        }
+    }
+
+    info!(
+        "[BATCH_REACTIVATE] 完成: success={}, skipped={}, total={}",
+        success_count,
+        skip_count,
+        request.task_ids.len()
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "message": format!(
+                "批量重新流转完成: {} 成功, {} 跳过, {} 总计",
+                success_count, skip_count, request.task_ids.len()
+            ),
+            "success_count": success_count,
+            "skip_count": skip_count,
+            "results": results,
+        })),
+    )
 }
 
 /// GET /api/users - 获取用户列表
@@ -3661,8 +4306,25 @@ async fn get_workflow_history(Path(id): Path<String>) -> impl IntoResponse {
         current_node: Option<String>,
     }
 
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect fresh review db for workflow history: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(WorkflowHistoryResponse {
+                    success: false,
+                    current_node: String::new(),
+                    current_node_name: String::new(),
+                    history: vec![],
+                    error_message: Some(format!("查询任务失败: {}", e)),
+                }),
+            );
+        }
+    };
+
     let get_sql = "SELECT current_node FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
-    let current_node = match review_primary_db()
+    let current_node = match db
         .query(get_sql)
         .bind(("id", id.clone()))
         .await
@@ -3717,7 +4379,7 @@ async fn get_workflow_history(Path(id): Path<String>) -> impl IntoResponse {
         ORDER BY timestamp ASC
     "#;
 
-    let history = match review_primary_db()
+    let history = match db
         .query(history_sql)
         .bind(("task_id", id.clone()))
         .await
@@ -4690,6 +5352,65 @@ mod tests {
         assert_eq!(names.reviewer_name, "checker-001");
     }
 
+    fn create_task_request_for_assignee_tests(
+        checker_id: Option<&str>,
+        reviewer_id: &str,
+        approver_id: Option<&str>,
+    ) -> CreateTaskRequest {
+        CreateTaskRequest {
+            title: "Task".to_string(),
+            description: "".to_string(),
+            model_name: "Model".to_string(),
+            checker_id: checker_id.map(str::to_string),
+            checker_name: None,
+            approver_id: approver_id.map(str::to_string),
+            approver_name: None,
+            reviewer_id: reviewer_id.to_string(),
+            form_id: None,
+            priority: "medium".to_string(),
+            components: vec![],
+            due_date: None,
+            attachments: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_create_task_assignees_accepts_human_codes() {
+        let request = create_task_request_for_assignee_tests(Some("JH"), "", Some("SH"));
+
+        let assignees = resolve_create_task_assignees(&request).expect("HumanCode assignees pass");
+
+        assert_eq!(assignees.checker_id, "JH");
+        assert_eq!(assignees.reviewer_id, "JH");
+        assert_eq!(assignees.approver_id, "SH");
+    }
+
+    #[test]
+    fn test_resolve_create_task_assignees_rejects_legacy_internal_ids() {
+        let checker_request =
+            create_task_request_for_assignee_tests(Some("proofreader_001"), "", Some("SH"));
+        let checker_error = resolve_create_task_assignees(&checker_request).unwrap_err();
+        assert!(checker_error.contains("checker_id"));
+        assert!(checker_error.contains("PMS HumanCode"));
+
+        let approver_request =
+            create_task_request_for_assignee_tests(Some("JH"), "", Some("manager_001"));
+        let approver_error = resolve_create_task_assignees(&approver_request).unwrap_err();
+        assert!(approver_error.contains("approver_id"));
+        assert!(approver_error.contains("PMS HumanCode"));
+    }
+
+    #[test]
+    fn test_resolve_create_task_assignees_rejects_missing_required_assignees() {
+        let checker_request = create_task_request_for_assignee_tests(None, "", Some("SH"));
+        let checker_error = resolve_create_task_assignees(&checker_request).unwrap_err();
+        assert!(checker_error.contains("checker_id"));
+
+        let approver_request = create_task_request_for_assignee_tests(Some("JH"), "", None);
+        let approver_error = resolve_create_task_assignees(&approver_request).unwrap_err();
+        assert!(approver_error.contains("approver_id"));
+    }
+
     #[test]
     fn test_review_task_from_value_falls_back_for_legacy_row_shapes() {
         let raw = json!({
@@ -4796,12 +5517,14 @@ mod tests {
             .map(|user| user.id.as_str())
             .collect::<Vec<_>>();
 
-        assert!(ids.contains(&"designer_001"));
-        assert!(ids.contains(&"proofreader_001"));
-        assert!(ids.contains(&"reviewer_001"));
-        assert!(ids.contains(&"manager_001"));
+        assert!(ids.contains(&"SJ"));
+        assert!(ids.contains(&"JH"));
+        assert!(ids.contains(&"SH"));
         assert!(ids.contains(&"PZ"));
-        assert!(ids.contains(&"admin_001"));
+        assert!(!ids.contains(&"designer_001"));
+        assert!(!ids.contains(&"proofreader_001"));
+        assert!(!ids.contains(&"reviewer_001"));
+        assert!(!ids.contains(&"manager_001"));
     }
 
     #[test]
@@ -4816,21 +5539,19 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(reviewers.len(), 5);
-        assert!(reviewers.iter().all(|user| user.id != "designer_001"));
-        assert!(reviewers.iter().any(|user| user.id == "proofreader_001"));
-        assert!(reviewers.iter().any(|user| user.id == "reviewer_001"));
-        assert!(reviewers.iter().any(|user| user.id == "manager_001"));
+        assert_eq!(reviewers.len(), 3);
+        assert!(reviewers.iter().all(|user| user.id != "SJ"));
+        assert!(reviewers.iter().any(|user| user.id == "JH"));
+        assert!(reviewers.iter().any(|user| user.id == "SH"));
         assert!(reviewers.iter().any(|user| user.id == "PZ"));
-        assert!(reviewers.iter().any(|user| user.id == "admin_001"));
     }
 
     #[test]
     fn test_default_mock_user_matches_frontend_designer_contract() {
         let user = default_mock_user();
 
-        assert_eq!(user.id, "designer_001");
-        assert_eq!(user.username, "designer");
+        assert_eq!(user.id, "SJ");
+        assert_eq!(user.username, "SJ");
         assert_eq!(user.role, "designer");
     }
 
@@ -4856,14 +5577,14 @@ mod tests {
         let payload: UserResponse = serde_json::from_slice(&body).unwrap();
         let user = payload.user.expect("expected current user payload");
 
-        assert_eq!(user.id, "designer_001");
-        assert_eq!(user.username, "designer");
+        assert_eq!(user.id, "SJ");
+        assert_eq!(user.username, "SJ");
         assert_eq!(user.role, "designer");
     }
 
     #[tokio::test]
     async fn test_get_reviewers_returns_only_review_capable_users() {
-        let app = create_review_api_routes();
+        let app = Router::new().route("/api/users/reviewers", get(get_reviewers));
 
         let response = app
             .oneshot(
@@ -4887,13 +5608,14 @@ mod tests {
             .map(|user| user.id.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(payload.users.len(), 5);
+        assert_eq!(payload.users.len(), 3);
         assert!(!ids.contains(&"designer_001"));
-        assert!(ids.contains(&"proofreader_001"));
-        assert!(ids.contains(&"reviewer_001"));
-        assert!(ids.contains(&"manager_001"));
+        assert!(!ids.contains(&"proofreader_001"));
+        assert!(!ids.contains(&"reviewer_001"));
+        assert!(!ids.contains(&"manager_001"));
+        assert!(ids.contains(&"JH"));
+        assert!(ids.contains(&"SH"));
         assert!(ids.contains(&"PZ"));
-        assert!(ids.contains(&"admin_001"));
     }
 
     #[tokio::test]
@@ -4931,7 +5653,7 @@ mod tests {
 
         assert_eq!(user.id, "PZ");
         assert_eq!(user.username, "PZ");
-        assert_eq!(user.name, "PZ批准人");
+        assert_eq!(user.name, "陈经理");
         assert_eq!(user.role, "manager");
         assert_eq!(user.email, "pz@company.com");
     }
@@ -4941,7 +5663,7 @@ mod tests {
         let app = Router::new().route("/api/users/me", get(get_current_user));
         let claims = TokenClaims {
             project_id: "project-123".to_string(),
-            user_id: "reviewer_001".to_string(),
+            user_id: "SH".to_string(),
             user_name: "李审核员".to_string(),
             role: Some("sh".to_string()),
             workflow_mode: None,
@@ -4969,10 +5691,10 @@ mod tests {
         let payload: UserResponse = serde_json::from_slice(&body).unwrap();
         let user = payload.user.expect("expected current user payload");
 
-        assert_eq!(user.id, "reviewer_001");
-        assert_eq!(user.username, "reviewer");
+        assert_eq!(user.id, "SH");
+        assert_eq!(user.username, "SH");
         assert_eq!(user.name, "李审核员");
         assert_eq!(user.role, "reviewer");
-        assert_eq!(user.email, "reviewer@company.com");
+        assert_eq!(user.email, "sh@company.com");
     }
 }

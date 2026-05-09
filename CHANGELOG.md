@@ -1,17 +1,15 @@
 # Changelog
 
-## 2026-05-06
+## 2026-05-08
 
-### Fixed — APS 站点部署运行验证与安全收敛
+### Added — RUS-239 驳回任务批量重新流转 API
 
-> 针对 `AvevaPlantSample`（APS）站点部署链路完成真实 `web_server` 运行验证，并修复验证中暴露的公开列表、任务响应和旧入口兼容问题。
+> 解决设计人员驳回任务长期卡在 sj/draft 无法重新流转的问题（21 条历史遗留任务）。
 
-- 注册表创建任务统一走 admin task 持久化与 dispatch 链路，避免双 task id / 双状态源导致任务不执行。
-- 旧静态 `deployment-sites.js` 写接口迁移到 `/api/admin/registry/*`，并携带 `admin_token` Bearer 认证。
-- 公开 `/api/deployment-sites` 修复 `total>0` 但 `items=[]` 的问题，同时保持 `config/project_path/owner/e3d_projects` 不对外暴露。
-- admin registry 与 admin tasks 响应递归脱敏 `db_password/password/surreal_password`，避免 APS 配置密码出现在接口响应中。
-- admin task id 限制为 ASCII URL-safe 字符，修复包含中文配置名时任务详情 URL 查询不稳定的问题。
-- `managed_project_sites` 默认要求 `admin_allowed_project_roots`，默认配置补充 `D:/AVEVA/Projects` 白名单；本地 APS smoke 通过 `/api/health`、站点身份、公开列表、admin 登录、registry 探活、任务创建与详情查询。
+- 新增 `GET /api/review/tasks/returned`：查询所有处于 `current_node=sj, status=draft` 的驳回任务列表，返回 task_id、form_id、title、return_reason 等关键字段。
+- 新增 `POST /api/review/tasks/batch-reactivate`：批量将驳回任务从 `sj/draft` 推进到 `jd/submitted`，支持指定目标校核人 `target_checker_id` / `target_checker_name`，仅更新满足 `current_node=sj AND status=draft` 条件的任务。
+- 两个端点均走 review auth 中间件保护，遵循现有 JWT 认证链路。
+- 关联 Linear Issue：RUS-239（驳回后重新流转）。
 
 ## 2026-04-26
 

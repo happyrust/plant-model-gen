@@ -3,11 +3,17 @@
 use axum::http::StatusCode;
 use tracing::warn;
 
-use crate::web_api::jwt_auth::{PLATFORM_AUTH_CONFIG, verify_token};
+use crate::web_api::jwt_auth::{PLATFORM_AUTH_CONFIG, TokenClaims, verify_token};
 
-/// Unified S2S token verification: validates JWT when auth is enabled;
-/// disabled mode still requires exact debug_token match.
-pub fn verify_s2s_token(token: &str) -> Result<(), (StatusCode, String)> {
+/// Unified S2S token verification with claims returned.
+///
+/// 当 `PLATFORM_AUTH_CONFIG.enabled = false` 走 debug_token 路径，没有真正的 JWT
+/// claims 可解，此时返回 `Ok(None)`；JWT 模式下返回 `Ok(Some(claims))`。
+/// 调用方在 JWT 模式下可以从 claims 取出 `user_id` / `role` 等做身份推导，
+/// 避免请求体重复携带 actor 字段。
+pub fn verify_s2s_token_with_claims(
+    token: &str,
+) -> Result<Option<TokenClaims>, (StatusCode, String)> {
     if !PLATFORM_AUTH_CONFIG.enabled {
         let expected = PLATFORM_AUTH_CONFIG.debug_token.trim();
         if expected.is_empty() {
@@ -19,7 +25,7 @@ pub fn verify_s2s_token(token: &str) -> Result<(), (StatusCode, String)> {
         }
 
         if token.trim() == expected {
-            return Ok(());
+            return Ok(None);
         }
 
         warn!("S2S debug_token 不匹配");
@@ -34,11 +40,20 @@ pub fn verify_s2s_token(token: &str) -> Result<(), (StatusCode, String)> {
                     legacy_form_id, claims.project_id, claims.user_id
                 );
             }
-            Ok(())
+            Ok(Some(claims))
         }
         Err(e) => {
             warn!("S2S JWT verification failed: {}", e);
             Err((StatusCode::UNAUTHORIZED, format!("invalid token: {}", e)))
         }
     }
+}
+
+/// Unified S2S token verification: validates JWT when auth is enabled;
+/// disabled mode still requires exact debug_token match.
+///
+/// 该函数是 [`verify_s2s_token_with_claims`] 的薄包装，丢弃 claims，
+/// 用于不需要身份信息的场景。需要 actor / role 推导的调用方请改用前者。
+pub fn verify_s2s_token(token: &str) -> Result<(), (StatusCode, String)> {
+    verify_s2s_token_with_claims(token).map(|_| ())
 }

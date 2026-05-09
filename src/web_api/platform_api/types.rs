@@ -166,21 +166,56 @@ pub struct SyncWorkflowRequest {
     pub form_id: String,
     pub token: String,
     pub action: String,
-    pub actor: WorkflowActor,
+    /// 调用人。**新合同下可省**：
+    /// 当请求体不带 `actor` 时，handler 会从 JWT token claims 推（`user_id`/`role`/`user_name`）。
+    /// 旧调用方仍可显式传 `actor` 兜底（debug_token 模式必须显式传）。
+    #[serde(default)]
+    pub actor: Option<WorkflowActor>,
+    /// 下一节点信息。**新合同下可省**：
+    /// `active`/`agree(非 pz)` 时 handler 会按 `current_node + action` 自动推；
+    /// `return` 应改用 [`SyncWorkflowRequest::target_node`] 仅传目标节点；
+    /// `stop` / `agree(pz)` 不需要。
     pub next_step: Option<WorkflowNextStep>,
+    /// `return` 动作的目标节点（`sj` / `jd` / `sh`）。
+    /// 与 `next_step.roles` 二选一；同时存在时以 `target_node` 为准。
+    #[serde(default)]
+    pub target_node: Option<String>,
     pub comments: Option<String>,
     pub metadata: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct WorkflowActor {
     pub id: String,
+    /// 调用人显示名。可省，缺省时 handler 用 `id` 兜底（或从 token claims 取 `user_name`）。
+    #[serde(default)]
     pub name: String,
     pub roles: String,
 }
 
+impl SyncWorkflowRequest {
+    /// 已被 handler 解析后的有效 actor。
+    ///
+    /// handler 必须在 token 校验后立即调用 [`fill_actor_from_claims`] 把 actor
+    /// 填好（来自请求体 / 来自 JWT claims），后续代码只能通过此 method 读取。
+    /// 直接读取 `self.actor: Option<WorkflowActor>` 字段是为反序列化与 [`fill_actor_from_claims`]
+    /// 保留的，业务路径上属于编程错误。
+    pub(crate) fn actor(&self) -> &WorkflowActor {
+        self.actor
+            .as_ref()
+            .expect("SyncWorkflowRequest::actor() called before fill_actor_from_claims")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct WorkflowNextStep {
+    pub assignee_id: String,
+    pub name: String,
+    pub roles: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowVerifyNextStepDiagnostic {
     pub assignee_id: String,
     pub name: String,
     pub roles: String,
@@ -213,11 +248,23 @@ pub struct VerifyWorkflowData {
     pub passed: bool,
     pub action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub current_node: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_step: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_next_node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_next_step: Option<WorkflowVerifyNextStepDiagnostic>,
     pub reason: String,
     pub recommended_action: String,
 }

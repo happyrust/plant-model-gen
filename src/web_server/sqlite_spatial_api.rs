@@ -12,11 +12,14 @@
 //! - `GET /api/sqlite-spatial/query` - 按 refno 或 bbox 查询周边构件
 //! - `GET /api/sqlite-spatial/stats` - 获取索引统计与健康信息
 
+use aios_core::RefnoEnum;
 use axum::{extract::Query, response::Json};
-use parry3d::bounding_volume::Aabb;
+use parry3d::bounding_volume::{Aabb, BoundingVolume};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 
 use crate::sqlite_index::{SqliteAabbIndex, i64_to_refno_str, refno_str_to_i64};
@@ -81,8 +84,12 @@ pub struct SqliteSpatialQueryParams {
     pub maxx: Option<f32>,
     pub maxy: Option<f32>,
     pub maxz: Option<f32>,
-    /// 最大返回数量（默认 5000，硬上限 10000）
+    /// 兼容旧参数：未传 per_page 时作为每页数量使用（默认 5000，硬上限 10000）
     pub max_results: Option<usize>,
+    /// 分页页码，从 1 开始
+    pub page: Option<usize>,
+    /// 每页数量（硬上限 10000）
+    pub per_page: Option<usize>,
     /// noun 过滤（逗号分隔，如 "EQUI,PIPE,TUBI"，空表示不过滤）
     pub nouns: Option<String>,
     /// 专业过滤（逗号分隔，如 "1,3"，空表示不过滤）
@@ -97,9 +104,24 @@ pub struct SqliteSpatialQueryParams {
 pub struct SpatialQueryResult {
     pub success: bool,
     pub results: Option<Vec<SpatialQueryResultItem>>,
-    /// 是否因 max_results 截断
+    /// 是否还有更多结果；兼容旧字段名
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
+    /// 本次查询完整命中数量
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_count: Option<usize>,
+    /// 当前页返回数量
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub returned_count: Option<usize>,
+    /// 当前页码
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<usize>,
+    /// 当前每页数量
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_page: Option<usize>,
+    /// 是否还有下一页
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_more: Option<bool>,
     /// 实际查询使用的 AABB（便于调试）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_bbox: Option<AabbDto>,
@@ -275,6 +297,62 @@ fn parse_spec_value_filter(spec_values: &Option<String>) -> Option<Vec<i64>> {
     })
 }
 
+fn error_spatial_query_result(
+    error: impl Into<String>,
+    query_bbox: Option<AabbDto>,
+) -> SpatialQueryResult {
+    SpatialQueryResult {
+        success: false,
+        results: None,
+        truncated: None,
+        total_count: None,
+        returned_count: None,
+        page: None,
+        per_page: None,
+        has_more: None,
+        query_bbox,
+        error: Some(error.into()),
+    }
+}
+
+fn resolve_pagination(params: &SqliteSpatialQueryParams) -> (usize, usize) {
+    let page = params.page.unwrap_or(1).max(1);
+    let raw_per_page = params
+        .per_page
+        .or(params.max_results)
+        .unwrap_or(DEFAULT_MAX_HITS);
+    let per_page = raw_per_page.clamp(1, HARD_MAX_HITS);
+    (page, per_page)
+}
+
+fn success_spatial_query_result(
+    results: Vec<SpatialQueryResultItem>,
+    total_count: usize,
+    page: usize,
+    per_page: usize,
+    query_bbox: Option<AabbDto>,
+) -> SpatialQueryResult {
+    let returned_count = results.len();
+    let end = page
+        .saturating_sub(1)
+        .saturating_mul(per_page)
+        .saturating_add(returned_count);
+    let has_more = end < total_count;
+
+    SpatialQueryResult {
+        success: true,
+        results: Some(results),
+        truncated: Some(has_more),
+        total_count: Some(total_count),
+        returned_count: Some(returned_count),
+        page: Some(page),
+        per_page: Some(per_page),
+        has_more: Some(has_more),
+        query_bbox,
+        error: None,
+    }
+}
+
 // ============================================================================
 // Handler：GET /api/sqlite-spatial/query
 // ============================================================================
@@ -283,43 +361,117 @@ fn parse_spec_value_filter(spec_values: &Option<String>) -> Option<Vec<i64>> {
 pub async fn api_sqlite_spatial_query(
     Query(params): Query<SqliteSpatialQueryParams>,
 ) -> Json<SpatialQueryResult> {
+    let fallback_refno_ids = match query_refno_visible_inst_ids_for_fallback(&params).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            return Json(error_spatial_query_result(e, None));
+        }
+    };
+
     // 将 SQLite 阻塞 I/O 放入 blocking 线程池
-    let result = tokio::task::spawn_blocking(move || do_spatial_query(params)).await;
+    let result =
+        tokio::task::spawn_blocking(move || do_spatial_query(params, fallback_refno_ids)).await;
     match result {
         Ok(r) => Json(r),
-        Err(e) => Json(SpatialQueryResult {
-            success: false,
-            results: None,
-            truncated: None,
-            query_bbox: None,
-            error: Some(format!("internal error: {}", e)),
-        }),
+        Err(e) => Json(error_spatial_query_result(
+            format!("internal error: {}", e),
+            None,
+        )),
     }
 }
 
-fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
+async fn query_refno_visible_inst_ids_for_fallback(
+    params: &SqliteSpatialQueryParams,
+) -> Result<Option<Vec<i64>>, String> {
+    if parse_mode(params) != "refno" {
+        return Ok(None);
+    }
+
+    let refno = params.refno.as_deref().unwrap_or("").trim();
+    let Some(id) = refno_str_to_i64(refno) else {
+        return Ok(None);
+    };
+
+    let cached = get_cached_index()?;
+    let conn = Connection::open(&cached.path)
+        .map_err(|e| format!("open sqlite connection failed: {}", e))?;
+    if query_aabb_row(&conn, id)
+        .map_err(|e| format!("query refno aabb failed: {}", e))?
+        .is_some()
+    {
+        return Ok(None);
+    }
+
+    let normalized = refno.replace('_', "/");
+    let parsed_refno = RefnoEnum::from_str(&normalized)
+        .map_err(|e| format!("invalid refno format (expected dbnum_refno): {}", e))?;
+    let mut ids = crate::fast_model::query_compat::query_deep_visible_inst_refnos(parsed_refno)
+        .await
+        .map_err(|e| format!("query visible insts for refno fallback failed: {}", e))?
+        .into_iter()
+        .filter_map(|child| refno_str_to_i64(&child.to_string().replace('/', "_")))
+        .collect::<Vec<_>>();
+
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(ids))
+    }
+}
+
+fn query_aabb_row(
+    conn: &Connection,
+    id: i64,
+) -> rusqlite::Result<Option<(f32, f32, f32, f32, f32, f32)>> {
+    conn.query_row(
+        "SELECT min_x, min_y, min_z, max_x, max_y, max_z FROM aabb_index WHERE id = ?1",
+        [id],
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        },
+    )
+    .optional()
+}
+
+fn aabb_from_row(minx: f32, miny: f32, minz: f32, maxx: f32, maxy: f32, maxz: f32) -> Aabb {
+    Aabb::new([minx, miny, minz].into(), [maxx, maxy, maxz].into())
+}
+
+fn query_aabbs_for_ids(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<Aabb>> {
+    let mut out = Vec::new();
+    for id in ids {
+        let Some((minx, miny, minz, maxx, maxy, maxz)) = query_aabb_row(conn, *id)? else {
+            continue;
+        };
+        out.push(aabb_from_row(minx, miny, minz, maxx, maxy, maxz));
+    }
+    Ok(out)
+}
+
+fn do_spatial_query(
+    params: SqliteSpatialQueryParams,
+    fallback_refno_ids: Option<Vec<i64>>,
+) -> SpatialQueryResult {
     let cached = match get_cached_index() {
         Ok(c) => c,
         Err(e) => {
-            return SpatialQueryResult {
-                success: false,
-                results: None,
-                truncated: None,
-                query_bbox: None,
-                error: Some(format!("{}. 请先运行 import-spatial-index 构建索引。", e)),
-            };
+            return error_spatial_query_result(
+                format!("{}. 请先运行 import-spatial-index 构建索引。", e),
+                None,
+            );
         }
     };
-    let idx = &cached.idx;
 
     let mode = parse_mode(&params);
-    let distance = params.distance.unwrap_or(DEFAULT_DISTANCE);
-    let max_results = params
-        .max_results
-        .unwrap_or(DEFAULT_MAX_HITS)
-        .min(HARD_MAX_HITS);
-    let noun_filter = parse_noun_filter(&params.nouns);
-    let spec_value_filter = parse_spec_value_filter(&params.spec_values);
     let include_self = params.include_self.unwrap_or(true);
 
     // 记住 refno 对应的 i64 id（用于 include_self 过滤）
@@ -350,167 +502,230 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
                     && r > 0.0
                     && r <= MAX_QUERY_RADIUS)
                 {
-                    return SpatialQueryResult {
-                        success: false,
-                        results: None,
-                        truncated: None,
-                        query_bbox: None,
-                        error: Some(format!(
+                    return error_spatial_query_result(
+                        format!(
                             "invalid position or radius (must be 0 < radius <= {} mm)",
                             MAX_QUERY_RADIUS
-                        )),
-                    };
+                        ),
+                        None,
+                    );
                 }
-                Aabb::new([x - r, y - r, z - r].into(), [x + r, y + r, z + r].into())
+                return query_by_target_aabbs(
+                    params,
+                    cached,
+                    vec![Aabb::new([x, y, z].into(), [x, y, z].into())],
+                    r,
+                    self_id,
+                );
             }
             _ => {
-                return SpatialQueryResult {
-                    success: false,
-                    results: None,
-                    truncated: None,
-                    query_bbox: None,
-                    error: Some("missing position parameters (x, y, z, radius)".to_string()),
-                };
+                return error_spatial_query_result(
+                    "missing position parameters (x, y, z, radius)",
+                    None,
+                );
             }
         }
     } else if mode == "refno" {
         let refno = params.refno.as_deref().unwrap_or("").trim();
         if refno.is_empty() {
-            return SpatialQueryResult {
-                success: false,
-                results: None,
-                truncated: None,
-                query_bbox: None,
-                error: Some("missing refno".to_string()),
-            };
+            return error_spatial_query_result("missing refno", None);
         }
         let Some(id) = refno_str_to_i64(refno) else {
-            return SpatialQueryResult {
-                success: false,
-                results: None,
-                truncated: None,
-                query_bbox: None,
-                error: Some("invalid refno format (expected dbnum_refno)".to_string()),
-            };
+            return error_spatial_query_result("invalid refno format (expected dbnum_refno)", None);
         };
         // 查询该 refno 的 bbox（使用独立连接避免长期占用）
         let conn = match Connection::open(&cached.path) {
             Ok(c) => c,
             Err(e) => {
-                return SpatialQueryResult {
-                    success: false,
-                    results: None,
-                    truncated: None,
-                    query_bbox: None,
-                    error: Some(format!("open sqlite connection failed: {}", e)),
-                };
+                return error_spatial_query_result(
+                    format!("open sqlite connection failed: {}", e),
+                    None,
+                );
             }
         };
-        let row: Option<(f32, f32, f32, f32, f32, f32)> = conn
-            .query_row(
-                "SELECT min_x, min_y, min_z, max_x, max_y, max_z FROM aabb_index WHERE id = ?1",
-                [id],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                },
-            )
-            .optional()
-            .unwrap_or(None);
+        let row = query_aabb_row(&conn, id).unwrap_or(None);
         let Some((minx, miny, minz, maxx, maxy, maxz)) = row else {
-            return SpatialQueryResult {
-                success: true,
-                results: Some(vec![]),
-                truncated: Some(false),
-                query_bbox: None,
-                error: None,
-            };
+            if let Some(ids) = fallback_refno_ids.as_deref() {
+                match query_aabbs_for_ids(&conn, ids) {
+                    Ok(aabbs) if !aabbs.is_empty() => {
+                        let distance = normalized_distance(params.distance);
+                        return query_by_target_aabbs(params, cached, aabbs, distance, self_id);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        return error_spatial_query_result(
+                            format!("query fallback aabb failed: {}", e),
+                            None,
+                        );
+                    }
+                }
+            }
+            return empty_spatial_query_result(&params);
         };
-        Aabb::new([minx, miny, minz].into(), [maxx, maxy, maxz].into())
+        aabb_from_row(minx, miny, minz, maxx, maxy, maxz)
     } else {
         match aabb_from_bbox_params(&params) {
             Ok(v) => v,
             Err(e) => {
-                return SpatialQueryResult {
-                    success: false,
-                    results: None,
-                    truncated: None,
-                    query_bbox: None,
-                    error: Some(e),
-                };
+                return error_spatial_query_result(e, None);
             }
         }
     };
 
-    let query_aabb = expand_aabb(base_aabb, distance);
-    let query_bbox_dto = aabb_to_dto(&query_aabb);
+    let distance = normalized_distance(params.distance);
+    query_by_target_aabbs(params, cached, vec![base_aabb], distance, self_id)
+}
 
-    // 计算查询中心点（用于距离计算）
-    let query_center_x = (query_aabb.mins.x + query_aabb.maxs.x) * 0.5;
-    let query_center_y = (query_aabb.mins.y + query_aabb.maxs.y) * 0.5;
-    let query_center_z = (query_aabb.mins.z + query_aabb.maxs.z) * 0.5;
+fn empty_spatial_query_result(params: &SqliteSpatialQueryParams) -> SpatialQueryResult {
+    let (page, per_page) = resolve_pagination(params);
+    SpatialQueryResult {
+        success: true,
+        results: Some(vec![]),
+        truncated: Some(false),
+        total_count: Some(0),
+        returned_count: Some(0),
+        page: Some(page),
+        per_page: Some(per_page),
+        has_more: Some(false),
+        query_bbox: None,
+        error: None,
+    }
+}
 
-    // 球体模式：用于二次距离过滤
+fn normalized_distance(distance: Option<f32>) -> f32 {
+    let distance = distance.unwrap_or(DEFAULT_DISTANCE);
+    if distance.is_finite() && distance > 0.0 {
+        distance
+    } else {
+        DEFAULT_DISTANCE
+    }
+}
+
+fn min_axis_gap(a_min: f32, a_max: f32, b_min: f32, b_max: f32) -> f32 {
+    if a_max < b_min {
+        b_min - a_max
+    } else if b_max < a_min {
+        a_min - b_max
+    } else {
+        0.0
+    }
+}
+
+fn aabb_min_distance(a: &Aabb, b: &Aabb) -> f32 {
+    let dx = min_axis_gap(a.mins.x, a.maxs.x, b.mins.x, b.maxs.x);
+    let dy = min_axis_gap(a.mins.y, a.maxs.y, b.mins.y, b.maxs.y);
+    let dz = min_axis_gap(a.mins.z, a.maxs.z, b.mins.z, b.maxs.z);
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn min_distance_to_targets(candidate: &Aabb, targets: &[Aabb]) -> f32 {
+    targets
+        .iter()
+        .map(|target| aabb_min_distance(candidate, target))
+        .fold(f32::INFINITY, f32::min)
+}
+
+fn refno_db_prefix(refno: Option<&str>) -> Option<String> {
+    let normalized = refno?.trim().replace('/', "_");
+    let dbnum = normalized.split('_').next()?.trim();
+    if dbnum.is_empty() {
+        None
+    } else {
+        Some(format!("{}_", dbnum))
+    }
+}
+
+fn preferred_db_rank(item: &SpatialQueryResultItem, preferred_db_prefix: &Option<String>) -> u8 {
+    match preferred_db_prefix {
+        Some(prefix) if item.refno.starts_with(prefix) => 0,
+        Some(_) => 1,
+        None => 0,
+    }
+}
+
+fn query_ids_for_regions(
+    cached: &CachedIndex,
+    target_aabbs: &[Aabb],
+    distance: f32,
+) -> Result<(Vec<i64>, Option<Aabb>), String> {
+    let mut ids = HashSet::new();
+    let mut query_union: Option<Aabb> = None;
+
+    for target in target_aabbs {
+        let query_aabb = expand_aabb((*target).clone(), distance);
+        if let Some(current) = &mut query_union {
+            current.merge(&query_aabb);
+        } else {
+            query_union = Some(query_aabb.clone());
+        }
+
+        let hits = cached
+            .idx
+            .query_intersect(
+                query_aabb.mins.x as f64,
+                query_aabb.maxs.x as f64,
+                query_aabb.mins.y as f64,
+                query_aabb.maxs.y as f64,
+                query_aabb.mins.z as f64,
+                query_aabb.maxs.z as f64,
+            )
+            .map_err(|e| format!("query_intersect failed: {}", e))?;
+        ids.extend(hits);
+    }
+
+    let mut ids = ids.into_iter().collect::<Vec<_>>();
+    ids.sort_unstable();
+    Ok((ids, query_union))
+}
+
+fn query_by_target_aabbs(
+    params: SqliteSpatialQueryParams,
+    cached: &CachedIndex,
+    target_aabbs: Vec<Aabb>,
+    search_distance: f32,
+    self_id: Option<i64>,
+) -> SpatialQueryResult {
+    let (page, per_page) = resolve_pagination(&params);
+    let noun_filter = parse_noun_filter(&params.nouns);
+    let spec_value_filter = parse_spec_value_filter(&params.spec_values);
+    let preferred_db_prefix = refno_db_prefix(params.refno.as_deref());
+
+    if target_aabbs.is_empty() {
+        return success_spatial_query_result(vec![], 0, page, per_page, None);
+    }
+
+    // 球体模式：使用候选 AABB 到目标 AABB/点的最小距离做二次过滤。
     let is_sphere = params
         .shape
         .as_deref()
         .unwrap_or("cube")
         .eq_ignore_ascii_case("sphere");
-    let sphere_radius = (query_aabb.maxs.x - query_aabb.mins.x)
-        .max((query_aabb.maxs.y - query_aabb.mins.y).max(query_aabb.maxs.z - query_aabb.mins.z))
-        * 0.5;
-    let sphere_radius_sq = sphere_radius * sphere_radius;
-
-    let ids = match idx.query_intersect(
-        query_aabb.mins.x as f64,
-        query_aabb.maxs.x as f64,
-        query_aabb.mins.y as f64,
-        query_aabb.maxs.y as f64,
-        query_aabb.mins.z as f64,
-        query_aabb.maxs.z as f64,
-    ) {
+    let (ids, query_aabb) = match query_ids_for_regions(cached, &target_aabbs, search_distance) {
         Ok(v) => v,
         Err(e) => {
-            return SpatialQueryResult {
-                success: false,
-                results: None,
-                truncated: None,
-                query_bbox: Some(query_bbox_dto),
-                error: Some(format!("query_intersect failed: {}", e)),
-            };
+            return error_spatial_query_result(e, None);
         }
     };
+    let query_bbox_dto = query_aabb.as_ref().map(aabb_to_dto);
 
     // 打开连接获取 noun 和 aabb 信息（使用 prepared statements 批量查询）
     let conn = match Connection::open(&cached.path) {
         Ok(c) => c,
         Err(e) => {
-            return SpatialQueryResult {
-                success: false,
-                results: None,
-                truncated: None,
-                query_bbox: Some(query_bbox_dto),
-                error: Some(format!("open sqlite connection failed: {}", e)),
-            };
+            return error_spatial_query_result(
+                format!("open sqlite connection failed: {}", e),
+                query_bbox_dto.clone(),
+            );
         }
     };
 
     let mut stmt_item = match conn.prepare("SELECT noun, spec_value FROM items WHERE id = ?1") {
         Ok(s) => s,
         Err(e) => {
-            return SpatialQueryResult {
-                success: false,
-                results: None,
-                truncated: None,
-                query_bbox: Some(query_bbox_dto),
-                error: Some(format!("prepare item stmt failed: {}", e)),
-            };
+            return error_spatial_query_result(
+                format!("prepare item stmt failed: {}", e),
+                query_bbox_dto.clone(),
+            );
         }
     };
     let mut stmt_aabb = match conn
@@ -518,18 +733,14 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
     {
         Ok(s) => s,
         Err(e) => {
-            return SpatialQueryResult {
-                success: false,
-                results: None,
-                truncated: None,
-                query_bbox: Some(query_bbox_dto),
-                error: Some(format!("prepare aabb stmt failed: {}", e)),
-            };
+            return error_spatial_query_result(
+                format!("prepare aabb stmt failed: {}", e),
+                query_bbox_dto.clone(),
+            );
         }
     };
 
     let mut results: Vec<SpatialQueryResultItem> = Vec::with_capacity(ids.len().min(1024));
-    let mut truncated = false;
 
     for id in ids {
         // include_self 过滤
@@ -572,22 +783,16 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
             .optional()
             .unwrap_or(None);
 
-        // 计算距离（AABB 中心到查询中心的欧氏距离）
+        // 计算候选 AABB 到目标 AABB/点的最小距离，避免长模型因中心点较远被误排除。
         let distance = if let Some((minx, miny, minz, maxx, maxy, maxz)) = aabb_row {
-            let cx = (minx + maxx) * 0.5;
-            let cy = (miny + maxy) * 0.5;
-            let cz = (minz + maxz) * 0.5;
-            let dx = cx - query_center_x;
-            let dy = cy - query_center_y;
-            let dz = cz - query_center_z;
-            let dist_sq = dx * dx + dy * dy + dz * dz;
+            let candidate_aabb = aabb_from_row(minx, miny, minz, maxx, maxy, maxz);
+            let min_distance = min_distance_to_targets(&candidate_aabb, &target_aabbs);
 
-            // 球体模式：基于距离做精确过滤
-            if is_sphere && dist_sq > sphere_radius_sq {
+            if is_sphere && min_distance > search_distance {
                 continue;
             }
 
-            Some(dist_sq.sqrt())
+            Some(min_distance)
         } else {
             None
         };
@@ -606,26 +811,32 @@ fn do_spatial_query(params: SqliteSpatialQueryParams) -> SpatialQueryResult {
         });
     }
 
-    // 按距离从近到远排序
+    // 按真实最小距离从近到远排序；距离相同按 refno 稳定排序。
     results.sort_by(|a, b| match (a.distance, b.distance) {
-        (Some(da), Some(db)) => da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal),
+        (Some(da), Some(db)) => da
+            .partial_cmp(&db)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                preferred_db_rank(a, &preferred_db_prefix)
+                    .cmp(&preferred_db_rank(b, &preferred_db_prefix))
+            })
+            .then_with(|| a.refno.cmp(&b.refno)),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
+        (None, None) => preferred_db_rank(a, &preferred_db_prefix)
+            .cmp(&preferred_db_rank(b, &preferred_db_prefix))
+            .then_with(|| a.refno.cmp(&b.refno)),
     });
 
-    truncated = results.len() > max_results;
-    if results.len() > max_results {
-        results.truncate(max_results);
-    }
+    let total_count = results.len();
+    let offset = page.saturating_sub(1).saturating_mul(per_page);
+    let page_results = if offset >= total_count {
+        Vec::new()
+    } else {
+        results.into_iter().skip(offset).take(per_page).collect()
+    };
 
-    SpatialQueryResult {
-        success: true,
-        results: Some(results),
-        truncated: Some(truncated),
-        query_bbox: Some(query_bbox_dto),
-        error: None,
-    }
+    success_spatial_query_result(page_results, total_count, page, per_page, query_bbox_dto)
 }
 
 // ============================================================================
@@ -760,12 +971,14 @@ mod tests {
                 maxy: Some(1.5),
                 maxz: Some(1.5),
                 max_results: None,
+                page: None,
+                per_page: None,
                 nouns: None,
                 spec_values: None,
                 include_self: None,
                 shape: None,
             };
-            do_spatial_query(params)
+            do_spatial_query(params, None)
         });
         assert!(resp.success);
         let items = resp.results.unwrap_or_default();
@@ -812,12 +1025,14 @@ mod tests {
                 maxy: Some(1.5),
                 maxz: Some(1.5),
                 max_results: None,
+                page: None,
+                per_page: None,
                 nouns: None,
                 spec_values: None,
                 include_self: None,
                 shape: None,
             };
-            do_spatial_query(params)
+            do_spatial_query(params, None)
         });
         assert!(resp.success);
         let items = resp.results.unwrap_or_default();

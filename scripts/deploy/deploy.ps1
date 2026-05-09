@@ -46,6 +46,8 @@ param(
 
     [switch]$NoPush,
     [switch]$SkipVerify,
+    [switch]$StrictBranch,
+    [switch]$NoGh,
     [int]$Timeout = 1800
 )
 
@@ -73,6 +75,8 @@ $argsList = @($pyScript)
 $argsList += "--repo"; $argsList += $Repo
 if ($NoPush) { $argsList += "--no-push" }
 if ($SkipVerify) { $argsList += "--skip-verify" }
+if ($StrictBranch) { $argsList += "--strict-branch" }
+if ($NoGh) { $argsList += "--no-gh" }
 $argsList += "--timeout"; $argsList += "$Timeout"
 
 Write-Host "========================================" -ForegroundColor Magenta

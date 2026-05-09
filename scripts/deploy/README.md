@@ -12,19 +12,41 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ 1. 检查 git 工作区 / 当前分支匹配预期                                      │
-│ 2. 记录远端产物 mtime 基线（/root/web_server, /var/www/plant3d-web/...）  │
-│ 3. git push origin <branch> → GitHub Actions Deploy workflow 自动触发     │
-│ 4. 轮询远端产物 mtime，直到所有 artifact 都比基线新（CI 完成）             │
-│ 5. 健康检查：                                                              │
+│ 1. 检查 git 工作区 / 当前分支                                             │
+│ 2. 记录远端产物 mtime 基线（/root/web_server, /var/www/plant3d-web/...) │
+│ 3. git push origin <branch> 把代码推到 GitHub                              │
+│ 4. 触发 GitHub Actions workflow_dispatch deploy workflow：                │
+│    - 优先：gh workflow run（gh CLI 已登录） + gh run watch 直到完成        │
+│    - 兜底：打印 GitHub UI Run workflow 链接 + git_ref 让用户手动触发       │
+│ 5. 轮询远端产物 mtime，验证 CI 已经替换 binary / dist                      │
+│ 6. 健康检查：                                                              │
 │    - backend: curl http://localhost:3100/api/review/workflow/sync (query) │
 │    - frontend: curl http://123.57.182.243/version.json + index.html       │
 │    - systemd: systemctl is-active web-server.service                      │
-│ 6. 输出 JSON summary                                                       │
+│ 7. 输出 JSON summary                                                       │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-不依赖 GitHub CLI（gh），纯 SSH（paramiko）+ git 命令实现。
+### 关于 GitHub CLI（gh）
+
+deploy workflow 是 `workflow_dispatch` 手动触发模式（push 不会自动启动 CI）。
+脚本支持两种触发方式：
+
+- **自动模式（gh 已登录）**：`gh workflow run <workflow.yml> --ref <branch> -f git_ref=<branch>` 触发，
+  然后 `gh run watch` 阻塞到 run completed。整个过程无人工。
+- **手动模式（gh 不可用 / 未登录 / 传 `-NoGh`）**：脚本输出 GitHub Actions URL + git_ref 提示，
+  用户去 UI 手动点 Run workflow，脚本继续轮询远端 mtime 等 CI 完成。
+
+**安装并登录 gh**（推荐，全自动一键部署）：
+
+```powershell
+winget install --id GitHub.cli
+# 重启 PowerShell 让 PATH 生效
+gh auth login          # 浏览器交互登录
+# 或：用 PAT（至少 repo + workflow scope）
+echo "ghp_xxx..." | gh auth login --hostname github.com --with-token
+gh auth status         # 验证
+```
 
 ## 前置条件
 
@@ -35,6 +57,7 @@ pip install paramiko
 GitHub 端：
 - 仓库已配置好 Deploy to Ubuntu workflow（参考 `/root/setup-deploy-server.sh`）
 - 本地 git 能 push 到 origin（已配置 SSH key 或 GitHub Token）
+- 推荐：`gh` CLI 已 `gh auth login` 登录，token 含 `repo` + `workflow` scope
 
 SSH 端：
 - 默认用户/密码已写在脚本中（与 setup-deploy-server.sh 一致）

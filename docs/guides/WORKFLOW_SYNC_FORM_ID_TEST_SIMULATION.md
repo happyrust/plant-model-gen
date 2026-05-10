@@ -52,7 +52,7 @@
 | `POST /api/review/embed-url` | 获取或恢复 `form_id`，并签发 JWT |
 | `POST /api/review/tasks` | 创建校审任务，并把任务与 `form_id` 绑定 |
 | `POST /api/review/records` | 保存校审确认记录（批注 / 云线 / 测量 / 备注） |
-| `POST /api/review/workflow/verify` | 对 `active / agree / return / stop` 做正式预校验，不写库 |
+| `POST /api/review/workflow/verify` | 仅消费 `form_id + token + action`，对 `active / agree / return / stop` 做正式预校验，不写库；`next_step` 等其他字段在 verify 路径会被静默忽略 |
 | `POST /api/review/workflow/sync` | 送审 / 查询时按 `form_id` 聚合返回 records 等数据 |
 | `POST /api/review/delete` | 清理测试单据 |
 
@@ -90,8 +90,9 @@
 3. 模拟校对/校核人员在校审面板保存一批确认记录
    -> POST /api/review/records
 4. 外部流程驱动先调用 workflow/verify
-   -> POST /api/review/workflow/verify
-   -> 只检查是否允许流转，不写 review_tasks / review_forms
+   -> POST /api/review/workflow/verify { form_id, token, action }
+   -> 只检查是否允许流转（节点合法性 + owner + 按 action 分化的 annotation 门）
+   -> 不写 review_tasks / review_forms
 5. 仅当 verify 通过时，再调用 workflow/sync
    -> POST /api/review/workflow/sync
 6. 用 workflow/sync?action=query 回读 form_id 聚合快照

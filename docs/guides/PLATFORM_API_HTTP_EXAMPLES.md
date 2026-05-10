@@ -46,7 +46,19 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/review/embed-url' \
 
 ## 2. 流程预校验 `POST /api/review/workflow/verify`
 
-`verify` 与 `workflow/sync` 使用**完全相同**的请求体；推荐调用顺序固定为：
+`verify` 与 `workflow/sync` 共用 [`SyncWorkflowRequest`] 类型，但**消费的字段完全不同**：
+
+| 字段 | verify | sync |
+|---|---|---|
+| `form_id` / `token` / `action` | 必读 | 必读 |
+| `actor` | 仅 debug_token 模式必填；其他场景 handler 自动从 token claims 推 | 同 verify |
+| `next_step` | **静默忽略**——传也不会被读 | active/agree(非pz)/return 必填；stop/agree(pz) 可省 |
+| `comments` | 静默忽略 | 落 `review_workflow_history.comment` |
+| `metadata` | 静默忽略（保留兼容） | 静默忽略 |
+
+也就是说，**生产链路下 verify 的最小请求体只需要 `form_id + token + action` 三个字段**。
+
+推荐调用顺序：
 
 ```text
 verify -> sync
@@ -54,20 +66,32 @@ verify -> sync
 
 `verify` 只做预判，不写 `review_tasks / review_forms / review_workflow_history`，也不触发任何异步通知。
 
+### 2.1 检查矩阵（按 action）
+
+| action | 允许的 current_node | annotation 要求 | 不满足时 recommended_action |
+|---|---|---|---|
+| `active` | 仅 `sj` | 所有批注都被回复（`open == 0`） | `block` |
+| `agree` | `jd` / `sh` / `pz` | `open == 0 && rejected == 0 && pending == 0` | `return`（有 rejected）/ `block`（仅 pending） |
+| `return` | `jd` / `sh` / `pz` | 至少 1 条 `open` 或 `rejected`（"有问题才能驳回"） | `block`（"无问题批注，不允许驳回"） |
+| `stop` | `jd` / `sh` / `pz` | 不做 annotation_check | — |
+
+任何业务规则触发的阻断都走「软阻断」：`HTTP 200 + passed=false + 结构化诊断`。
+
+### 2.2 最小请求体示例
+
 ```bash
 curl -sS -X POST 'http://127.0.0.1:3100/api/review/workflow/verify' \
   -H 'Content-Type: application/json' \
   -d '{
     "form_id": "FORM-ABC123",
     "token": "<PMS 入站 S2S token>",
-    "action": "agree",
-    "actor": { "id": "liubo", "name": "刘某", "roles": "jd" },
-    "next_step": { "assignee_id": "wangsh", "name": "王某", "roles": "sh" },
-    "comments": "校核通过"
+    "action": "agree"
   }'
 ```
 
-典型响应（放行）：
+兼容历史调用方携带 `actor` / `next_step` 也无错误，handler 会按表 2.1 静默忽略 `next_step`。
+
+### 2.3 典型响应（放行）
 
 ```json
 {
@@ -85,12 +109,37 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/review/workflow/verify' \
 }
 ```
 
-典型响应（预校验拦截，但请求体合法）：
+### 2.4 典型响应（软阻断·有 rejected 批注）
 
 ```json
 {
   "code": 200,
-  "message": "存在待确认批注，请逐条确认后再继续",
+  "message": "存在已驳回批注，请改走驳回流程",
+  "error_code": "ANNOTATION_CHECK_FAILED",
+  "annotation_check": {
+    "passed": false,
+    "recommended_action": "return",
+    "current_node": "jd"
+  },
+  "data": {
+    "passed": false,
+    "action": "agree",
+    "block_code": "ANNOTATION_CHECK_FAILED",
+    "current_node": "jd",
+    "task_status": "submitted",
+    "next_step": "sh",
+    "reason": "存在已驳回批注，请改走驳回流程",
+    "recommended_action": "return"
+  }
+}
+```
+
+### 2.5 典型响应（软阻断·无问题批注却要 return）
+
+```json
+{
+  "code": 200,
+  "message": "无未处理或被驳回的批注，不允许驳回",
   "error_code": "ANNOTATION_CHECK_FAILED",
   "annotation_check": {
     "passed": false,
@@ -99,21 +148,23 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/review/workflow/verify' \
   },
   "data": {
     "passed": false,
-    "action": "agree",
+    "action": "return",
+    "block_code": "ANNOTATION_CHECK_FAILED",
     "current_node": "jd",
     "task_status": "submitted",
-    "next_step": "sh",
-    "reason": "存在待确认批注，请逐条确认后再继续",
+    "reason": "无未处理或被驳回的批注，不允许驳回",
     "recommended_action": "block"
   }
 }
 ```
 
-说明：
+### 2.6 状态码语义
 
-- `HTTP 200 + passed=false`：表示请求体合法，但当前不允许流转。
-- `HTTP 400 / 404`：表示请求缺字段、目标节点非法、`form_id` 不存在等硬错误。
-- `HTTP 401`：S2S token 不合法。
+- `HTTP 200 + passed=false`：业务规则阻断（节点不匹配 / 批注门未通过 / owner 不一致 / 终态等）
+- `HTTP 400`：action 不可识别、解析失败等格式错
+- `HTTP 404`：`form_id` 没有对应单据
+- `HTTP 401`：token 不合法
+- `HTTP 500`：DB 异常
 
 ---
 
@@ -143,15 +194,24 @@ workflow/verify -> workflow/sync
 
 其中：
 
-- `workflow/verify`：只校验，不落库；
-- `workflow/sync`：真正写入并返回最新聚合快照；
-- 即使调用方跳过 `verify`，`workflow/sync` 仍会做同一套强校验。
+- `workflow/verify`：只校验，不落库；接口形态见 §2
+- `workflow/sync`：真正写入并返回最新聚合快照
+- 即使调用方跳过 `verify`，`workflow/sync` 仍会做同一套强校验，包括 §2.1 的 annotation 矩阵
 
 请求字段约束补充：
 
-- `comments` 表示平台流程引擎的当前节点整体审批意见。
-- 模型中心接收该字段用于 workflow 动作上下文，但**不会**在模型中心再次持久化，也**不会**在 `workflow/sync` 响应中回传。
-- 第三方若需要保存流程意见，应继续以平台流程系统自身记录为准。
+- `comments`：平台流程引擎当前节点的整体审批意见，写入 `review_workflow_history.comment`，但**不会**在 `workflow/sync` 响应中回传。
+- `next_step`：sync 路径下 `active` / `agree(非 pz)` / `return` 必填；`stop` 与 `agree(pz)` 可省。verify 路径忽略此字段，详见 §2。
+- `metadata`：当前未被任何代码读取，保留兼容。
+
+annotation 检查在 sync 路径与 verify 完全一致：
+
+- `active`：sj 节点 `open == 0`
+- `agree`：jd/sh/pz 节点 `open == 0 && rejected == 0 && pending == 0`
+- `return`：jd/sh/pz 节点至少 1 条 `open` 或 `rejected`（"无问题批注，不允许驳回"）
+- `stop`：不做 annotation_check
+
+不满足时返 `HTTP 409 + error_code = "ANNOTATION_CHECK_FAILED"` + `annotation_check` 诊断字段。
 
 典型响应（`action=query` 成功时）：
 

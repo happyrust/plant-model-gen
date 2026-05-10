@@ -169,48 +169,97 @@ async fn insert_task_seed(
 }
 
 async fn insert_pending_review_record(task_id: &str, form_id: &str) {
+    insert_review_record_with_state(
+        task_id,
+        form_id,
+        "ann-verify-pending-1",
+        "待确认批注",
+        Some("fixed"),
+        Some("pending"),
+        "verify-pending",
+    )
+    .await;
+}
+
+/// 通用批注种子辅助：按给定 (resolution_status, decision_status) 生成单条
+/// text 批注，由 `classify_annotation_state` 决定最终 gate 状态：
+/// - `decision_status = "agreed"` → Approved
+/// - `decision_status = "rejected"` → Rejected
+/// - `resolution_status = "fixed" | "wont_fix"` 且 decision_status 非 agreed/rejected → PendingReview
+/// - 其他（含完全没传 reviewState）→ Open
+#[allow(clippy::too_many_arguments)]
+async fn insert_review_record_with_state(
+    task_id: &str,
+    form_id: &str,
+    annotation_id: &str,
+    annotation_text: &str,
+    resolution_status: Option<&str>,
+    decision_status: Option<&str>,
+    record_label: &str,
+) {
+    let review_state_json = match (resolution_status, decision_status) {
+        (None, None) => "NONE".to_string(),
+        _ => format!(
+            r#"{{
+                resolutionStatus: {res},
+                decisionStatus: {dec},
+                updatedAt: 1710000000000,
+                updatedByName: "SJ",
+                updatedByRole: "sj"
+            }}"#,
+            res = resolution_status
+                .map(|v| format!("\"{}\"", v))
+                .unwrap_or_else(|| "NONE".to_string()),
+            dec = decision_status
+                .map(|v| format!("\"{}\"", v))
+                .unwrap_or_else(|| "NONE".to_string()),
+        ),
+    };
+
+    let sql = format!(
+        r#"
+        CREATE review_records CONTENT {{
+            id: $id,
+            task_id: $task_id,
+            form_id: $form_id,
+            type: "batch",
+            annotations: [
+                {{
+                    id: $annotation_id,
+                    annotationType: "text",
+                    text: $annotation_text,
+                    refnos: ["24381/145018"],
+                    reviewState: {review_state}
+                }}
+            ],
+            cloud_annotations: [],
+            rect_annotations: [],
+            obb_annotations: [],
+            measurements: [],
+            note: $record_label,
+            current_node: "jd",
+            operator_id: "SJ",
+            operator_name: "SJ",
+            slot_key: $slot_key,
+            snapshot_hash: $snapshot_hash,
+            confirmed_at: time::now()
+        }}
+        "#,
+        review_state = review_state_json,
+    );
+
     project_primary_db()
-        .query(
-            r#"
-            CREATE review_records CONTENT {
-                id: $id,
-                task_id: $task_id,
-                form_id: $form_id,
-                type: "batch",
-                annotations: [
-                    {
-                        id: "ann-verify-pending-1",
-                        annotationType: "text",
-                        text: "待确认批注",
-                        refnos: ["24381/145018"],
-                        reviewState: {
-                            resolutionStatus: "fixed",
-                            decisionStatus: "pending",
-                            updatedAt: 1710000000000,
-                            updatedByName: "SJ",
-                            updatedByRole: "sj"
-                        }
-                    }
-                ],
-                cloud_annotations: [],
-                rect_annotations: [],
-                obb_annotations: [],
-                measurements: [],
-                note: "seed pending annotation",
-                current_node: "jd",
-                operator_id: "SJ",
-                operator_name: "SJ",
-                slot_key: "slot-verify-pending",
-                snapshot_hash: "hash-verify-pending",
-                confirmed_at: time::now()
-            }
-            "#,
-        )
-        .bind(("id", format!("record-{}", form_id.to_lowercase())))
+        .query(sql)
+        .bind(("id", format!("record-{}-{}", form_id.to_lowercase(), record_label)))
         .bind(("task_id", task_id.to_string()))
         .bind(("form_id", form_id.to_string()))
+        .bind(("annotation_id", annotation_id.to_string()))
+        .bind(("annotation_text", annotation_text.to_string()))
+        .bind(("record_label", format!("seed {}", record_label)))
+        .bind(("slot_key", format!("slot-{}", record_label)))
+        .bind(("snapshot_hash", format!("hash-{}", record_label)))
         .await
-        .expect("seed pending review record");
+        .expect("seed review record with state");
 }
 
 #[tokio::test]
@@ -1224,6 +1273,564 @@ async fn test_workflow_verify_pass_does_not_mutate_task_state() {
         .expect("task after verify");
     assert_eq!(task_after.current_node, "sj");
     assert_eq!(task_after.status, "draft");
+
+    cleanup_form(form_id).await;
+}
+
+// ============================================================================
+// v3 §3.6: action-aware annotation gate + verify 路径瘦身覆盖
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct SyncWorkflowResponseBody {
+    code: i32,
+    message: String,
+    error_code: Option<String>,
+    annotation_check: Option<serde_json::Value>,
+}
+
+async fn seed_task_with_record(
+    form_id: &str,
+    current_node: &str,
+    status: &str,
+    annotation_id: &str,
+    annotation_text: &str,
+    resolution_status: Option<&str>,
+    decision_status: Option<&str>,
+    record_label: &str,
+) {
+    let _ = init_surreal().await;
+    insert_task_seed(form_id, "SJ", "JH", "SH", current_node, status).await;
+    let task = super::review_form::find_task_by_form_id(form_id)
+        .await
+        .expect("query task")
+        .expect("seeded task");
+    insert_review_record_with_state(
+        &task.id,
+        form_id,
+        annotation_id,
+        annotation_text,
+        resolution_status,
+        decision_status,
+        record_label,
+    )
+    .await;
+}
+
+async fn post_verify(form_id: &str, token: &str, body: serde_json::Value) -> (StatusCode, Vec<u8>) {
+    let app = create_platform_api_routes();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/workflow/verify")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let _ = (form_id, token); // 留给调用方装填 body 的占位参数。
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, bytes)
+}
+
+// 3.6.1 active + sj 节点 + 1 条 open 批注 → soft block "未处理批注"
+#[tokio::test]
+async fn test_verify_active_blocks_when_open_exists() {
+    let form_id = "FORM-V3-ACTIVE-OPEN";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    seed_task_with_record(
+        form_id,
+        "sj",
+        "draft",
+        "ann-open-1",
+        "未回复批注",
+        None,
+        None,
+        "v3-active-open",
+    )
+    .await;
+    let (token, _) = create_token("project-1", "SJ", None, Some("sj"), None).unwrap();
+
+    let (status, bytes) = post_verify(
+        form_id,
+        &token,
+        serde_json::json!({
+            "form_id": form_id,
+            "token": token,
+            "action": "active"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&bytes).unwrap();
+    let data = payload.data.expect("verify data");
+    assert!(!data.passed);
+    assert_eq!(data.action, "active");
+    assert_eq!(data.recommended_action, "block");
+    assert!(data.reason.contains("未处理批注"));
+
+    cleanup_form(form_id).await;
+}
+
+// 3.6.2 active + sj + 仅有"被回复过"的批注（pending/approved/rejected） → pass
+#[tokio::test]
+async fn test_verify_active_passes_with_only_replied_annotations() {
+    let form_id = "FORM-V3-ACTIVE-REPLIED";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    insert_task_seed(form_id, "SJ", "JH", "SH", "sj", "draft").await;
+    let task = super::review_form::find_task_by_form_id(form_id)
+        .await
+        .expect("query task")
+        .expect("seeded task");
+    insert_review_record_with_state(
+        &task.id,
+        form_id,
+        "ann-pending",
+        "已修复待确认",
+        Some("fixed"),
+        Some("pending"),
+        "v3-active-replied-pending",
+    )
+    .await;
+    insert_review_record_with_state(
+        &task.id,
+        form_id,
+        "ann-approved",
+        "已通过",
+        Some("fixed"),
+        Some("agreed"),
+        "v3-active-replied-approved",
+    )
+    .await;
+    insert_review_record_with_state(
+        &task.id,
+        form_id,
+        "ann-rejected",
+        "被驳回",
+        Some("fixed"),
+        Some("rejected"),
+        "v3-active-replied-rejected",
+    )
+    .await;
+    let (token, _) = create_token("project-1", "SJ", None, Some("sj"), None).unwrap();
+
+    let (status, bytes) = post_verify(
+        form_id,
+        &token,
+        serde_json::json!({
+            "form_id": form_id,
+            "token": token,
+            "action": "active"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&bytes).unwrap();
+    let data = payload.data.expect("verify data");
+    assert!(data.passed);
+    assert_eq!(data.action, "active");
+    assert_eq!(data.recommended_action, "proceed");
+
+    cleanup_form(form_id).await;
+}
+
+// 3.6.3 agree + jd + 仅 pending → block "待确认批注"
+#[tokio::test]
+async fn test_verify_agree_blocks_on_pending() {
+    let form_id = "FORM-V3-AGREE-PENDING";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    seed_task_with_record(
+        form_id,
+        "jd",
+        "submitted",
+        "ann-pending-only",
+        "待确认",
+        Some("fixed"),
+        Some("pending"),
+        "v3-agree-pending",
+    )
+    .await;
+    let (token, _) = create_token("project-1", "JH", None, Some("jd"), None).unwrap();
+
+    let (status, bytes) = post_verify(
+        form_id,
+        &token,
+        serde_json::json!({
+            "form_id": form_id,
+            "token": token,
+            "action": "agree"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&bytes).unwrap();
+    let data = payload.data.expect("verify data");
+    assert!(!data.passed);
+    assert_eq!(data.action, "agree");
+    assert_eq!(data.recommended_action, "block");
+    assert!(data.reason.contains("待确认批注"));
+
+    cleanup_form(form_id).await;
+}
+
+// 3.6.4 agree + jd + rejected → recommend "return"
+#[tokio::test]
+async fn test_verify_agree_recommends_return_when_rejected() {
+    let form_id = "FORM-V3-AGREE-REJECTED";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    seed_task_with_record(
+        form_id,
+        "jd",
+        "submitted",
+        "ann-rejected-1",
+        "已驳回的批注",
+        Some("fixed"),
+        Some("rejected"),
+        "v3-agree-rejected",
+    )
+    .await;
+    let (token, _) = create_token("project-1", "JH", None, Some("jd"), None).unwrap();
+
+    let (status, bytes) = post_verify(
+        form_id,
+        &token,
+        serde_json::json!({
+            "form_id": form_id,
+            "token": token,
+            "action": "agree"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&bytes).unwrap();
+    let data = payload.data.expect("verify data");
+    assert!(!data.passed);
+    assert_eq!(data.action, "agree");
+    assert_eq!(data.recommended_action, "return");
+
+    cleanup_form(form_id).await;
+}
+
+// 3.6.5 return + jd + 仅 approved → block "无问题批注"
+#[tokio::test]
+async fn test_verify_return_blocks_when_no_problem() {
+    let form_id = "FORM-V3-RETURN-NOPROB";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    seed_task_with_record(
+        form_id,
+        "jd",
+        "submitted",
+        "ann-approved-only",
+        "已通过批注",
+        Some("fixed"),
+        Some("agreed"),
+        "v3-return-noprob",
+    )
+    .await;
+    let (token, _) = create_token("project-1", "JH", None, Some("jd"), None).unwrap();
+
+    let (status, bytes) = post_verify(
+        form_id,
+        &token,
+        serde_json::json!({
+            "form_id": form_id,
+            "token": token,
+            "action": "return"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&bytes).unwrap();
+    let data = payload.data.expect("verify data");
+    assert!(!data.passed);
+    assert_eq!(data.action, "return");
+    assert_eq!(data.recommended_action, "block");
+    assert!(data.reason.contains("不允许驳回"));
+
+    cleanup_form(form_id).await;
+}
+
+// 3.6.6 return + jd + 1 条 open 批注 → pass
+#[tokio::test]
+async fn test_verify_return_passes_with_open_or_rejected() {
+    let form_id = "FORM-V3-RETURN-PASS";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    seed_task_with_record(
+        form_id,
+        "jd",
+        "submitted",
+        "ann-open-prob",
+        "未回复有问题",
+        None,
+        None,
+        "v3-return-pass",
+    )
+    .await;
+    let (token, _) = create_token("project-1", "JH", None, Some("jd"), None).unwrap();
+
+    let (status, bytes) = post_verify(
+        form_id,
+        &token,
+        serde_json::json!({
+            "form_id": form_id,
+            "token": token,
+            "action": "return"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&bytes).unwrap();
+    let data = payload.data.expect("verify data");
+    assert!(data.passed);
+    assert_eq!(data.action, "return");
+    assert_eq!(data.recommended_action, "proceed");
+
+    cleanup_form(form_id).await;
+}
+
+// 3.6.7 stop + jd + 即使有 pending 批注也通过（stop 不查 annotation）
+#[tokio::test]
+async fn test_verify_stop_passes_without_annotation_check() {
+    let form_id = "FORM-V3-STOP-PASS";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    seed_task_with_record(
+        form_id,
+        "jd",
+        "submitted",
+        "ann-still-pending",
+        "强行终止",
+        Some("fixed"),
+        Some("pending"),
+        "v3-stop-pass",
+    )
+    .await;
+    let (token, _) = create_token("project-1", "JH", None, Some("jd"), None).unwrap();
+
+    let (status, bytes) = post_verify(
+        form_id,
+        &token,
+        serde_json::json!({
+            "form_id": form_id,
+            "token": token,
+            "action": "stop"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&bytes).unwrap();
+    let data = payload.data.expect("verify data");
+    assert!(data.passed);
+    assert_eq!(data.action, "stop");
+    assert_eq!(data.recommended_action, "proceed");
+
+    cleanup_form(form_id).await;
+}
+
+// 3.6.8 verify 路径完全忽略 next_step：传与不传结果一致
+#[tokio::test]
+async fn test_verify_ignores_next_step_field() {
+    let form_id = "FORM-V3-IGNORE-NEXTSTEP";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    seed_task_with_record(
+        form_id,
+        "jd",
+        "submitted",
+        "ann-open-ignore",
+        "open 批注",
+        None,
+        None,
+        "v3-ignore-nextstep",
+    )
+    .await;
+    let (token, _) = create_token("project-1", "JH", None, Some("jd"), None).unwrap();
+
+    // 故意传一个非法 next_step（roles=WRONG，不是 sj/jd/sh/pz），如果 verify
+    // 真的读了 next_step，会因为 roles 解析失败或 rank 不识别报错。
+    let (status, bytes) = post_verify(
+        form_id,
+        &token,
+        serde_json::json!({
+            "form_id": form_id,
+            "token": token,
+            "action": "return",
+            "next_step": {
+                "assignee_id": "BOGUS",
+                "name": "WRONG",
+                "roles": "WRONG"
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let payload: VerifyWorkflowResponseBody = serde_json::from_slice(&bytes).unwrap();
+    let data = payload.data.expect("verify data");
+    assert!(data.passed, "verify must ignore next_step");
+    assert_eq!(data.action, "return");
+    assert_eq!(data.recommended_action, "proceed");
+
+    cleanup_form(form_id).await;
+}
+
+// 3.6.9 sync return + 仅 approved 批注 → 409 + ANNOTATION_CHECK_FAILED
+#[tokio::test]
+async fn test_sync_return_blocks_without_problem_annotation() {
+    let form_id = "FORM-V3-SYNC-RETURN-NOPROB";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    seed_task_with_record(
+        form_id,
+        "jd",
+        "submitted",
+        "ann-only-approved",
+        "全部已通过",
+        Some("fixed"),
+        Some("agreed"),
+        "v3-sync-return-noprob",
+    )
+    .await;
+    let (token, _) = create_token("project-1", "JH", None, Some("jd"), None).unwrap();
+
+    let app = create_platform_api_routes();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/workflow/sync")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "form_id": form_id,
+                        "token": token,
+                        "action": "return",
+                        "actor": { "id": "JH", "name": "JH", "roles": "jd" },
+                        "next_step": { "assignee_id": "SJ", "name": "SJ", "roles": "sj" }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: SyncWorkflowResponseBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload.code, 409);
+    assert_eq!(
+        payload.error_code.as_deref(),
+        Some("ANNOTATION_CHECK_FAILED")
+    );
+    assert!(payload.message.contains("不允许驳回") || payload.message.contains("无未处理"));
+    let annotation_check = payload.annotation_check.expect("annotation_check");
+    assert_eq!(
+        annotation_check
+            .get("recommended_action")
+            .and_then(|v| v.as_str()),
+        Some("block")
+    );
+
+    let task_after = super::review_form::find_task_by_form_id(form_id)
+        .await
+        .expect("query task after sync return")
+        .expect("task after sync return");
+    assert_eq!(task_after.current_node, "jd");
+    assert_eq!(task_after.status, "submitted");
+
+    cleanup_form(form_id).await;
+}
+
+// 3.6.10 sync 路径 actor.name 兜底：仅传 id 时 DB 落 operator_name == id
+#[tokio::test]
+async fn test_sync_actor_name_default_falls_back_to_id() {
+    let form_id = "FORM-V3-ACTOR-NAME-FALLBACK";
+    let _ = init_surreal().await;
+    cleanup_form(form_id).await;
+    insert_task_seed(form_id, "SJ", "JH", "SH", "sj", "draft").await;
+    let task = super::review_form::find_task_by_form_id(form_id)
+        .await
+        .expect("seed task")
+        .expect("seed task");
+    let task_id = task.id.clone();
+
+    let (token, _) = create_token("project-1", "SJ", None, Some("sj"), None).unwrap();
+
+    let app = create_platform_api_routes();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review/workflow/sync")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "form_id": form_id,
+                        "token": token,
+                        "action": "active",
+                        // actor 显式传，但 name 字段缺失（serde default → ""）
+                        "actor": { "id": "SJ", "roles": "sj" },
+                        "next_step": { "assignee_id": "JH", "name": "JH", "roles": "jd" }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    use surrealdb::types::SurrealValue;
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct HistoryRow {
+        operator_id: Option<String>,
+        operator_name: Option<String>,
+    }
+
+    let mut response = project_primary_db()
+        .query(
+            r#"
+            SELECT operator_id, operator_name
+            FROM review_workflow_history
+            WHERE task_id = $task_id
+            ORDER BY timestamp DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(("task_id", task_id))
+        .await
+        .expect("query workflow history");
+    let rows: Vec<HistoryRow> = response.take(0).expect("take history rows");
+    let row = rows.into_iter().next().expect("at least one history row");
+    assert_eq!(row.operator_id.as_deref(), Some("SJ"));
+    assert_eq!(
+        row.operator_name.as_deref(),
+        Some("SJ"),
+        "operator_name 应当从空串兜底为 actor.id"
+    );
 
     cleanup_form(form_id).await;
 }

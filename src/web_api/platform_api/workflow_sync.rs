@@ -16,8 +16,8 @@ use crate::web_api::review_db::{
 };
 
 use super::annotation_check::{
-    AnnotationCheckOptions, AnnotationCheckResult, build_annotation_check_context,
-    evaluate_annotation_check,
+    AnnotationCheckIntent, AnnotationCheckOptions, AnnotationCheckResult,
+    build_annotation_check_context, evaluate_annotation_check,
 };
 use super::auth::{verify_s2s_token, verify_s2s_token_with_claims};
 use super::review_form::{
@@ -54,6 +54,17 @@ struct WorkflowMutationPrecheck {
     current_node: String,
     task_status: String,
     next_step: Option<WorkflowValidatedNextStep>,
+}
+
+/// verify 路径专用 precheck —— 不读 next_step，仅承载 (task, current_node,
+/// task_status, intent) 用于响应字段填充。
+#[derive(Debug, Clone)]
+struct WorkflowVerifyPrecheck {
+    task: ReviewTask,
+    current_node: String,
+    task_status: String,
+    /// 来自 action 的 annotation_check intent；`stop` 为 None。
+    intent: Option<AnnotationCheckIntent>,
 }
 
 struct WorkflowSyncActionError {
@@ -327,15 +338,23 @@ fn extract_annotation_ids(values: &[Value], output: &mut BTreeSet<String>) {
 // Handler / preflight
 // ============================================================================
 
-/// 缺省 actor 时用 token claims 推导一个 [`WorkflowActor`]。
+/// 把 [`SyncWorkflowRequest::actor`] 规范化为下游可直接用的形式。
 ///
-/// debug_token 模式（`PLATFORM_AUTH_CONFIG.enabled = false`）下 claims 为 `None`，
-/// 此时如果请求体也没带 actor，则返回 BAD_REQUEST 让调用方显式传。
+/// 两条路径：
+/// - 显式传 `actor`：保留 `id` / `roles`，仅当 `name` 为空时用 `id` 兜底。
+/// - 未传 `actor`：从 JWT [`TokenClaims`] 推导 `id` / `roles` / `name`；
+///   `name` 优先取 `user_name`，user_name 空再用 `user_id`。
+///
+/// debug_token 模式（`PLATFORM_AUTH_CONFIG.enabled = false`）下 claims 为
+/// `None`；此时若请求体也没带 actor 则返回 BAD_REQUEST，要求调用方显式传。
 fn fill_actor_from_claims(
     request: &mut SyncWorkflowRequest,
     claims: Option<TokenClaims>,
 ) -> Result<(), (StatusCode, String)> {
-    if request.actor.is_some() {
+    if let Some(actor) = request.actor.as_mut() {
+        if actor.name.trim().is_empty() {
+            actor.name = actor.id.trim().to_string();
+        }
         return Ok(());
     }
     let c = claims.ok_or_else(|| {
@@ -363,6 +382,22 @@ fn fill_actor_from_claims(
     Ok(())
 }
 
+/// `POST /api/review/workflow/verify`
+///
+/// 仅消费 `form_id` + `token` + `action` 三个语义入参（actor 自动从 token claims
+/// 推；`next_step` / `target_node` / `comments` / `metadata` 字段被静默忽略，
+/// 仅 sync 路径会消费）。
+///
+/// verify 不写库；语义为：
+///
+/// 1. token + actor + action 合法性
+/// 2. 加载 form 对应活动 task；终态拒绝
+/// 3. action 与 current_node 匹配（active 仅 sj；agree/return/stop 仅 jd/sh/pz）
+/// 4. owner 校验：actor.id == 当前节点负责人
+/// 5. annotation_check 按 action 分化（active=ActiveSubmit / agree=AgreeAdvance
+///    / return=ReturnReject / stop 跳过）
+///
+/// 任意业务阻断走 soft block：返 200 OK + `passed=false` + 结构化诊断。
 pub async fn verify_workflow_handler(
     Json(mut request): Json<SyncWorkflowRequest>,
 ) -> impl IntoResponse {
@@ -416,26 +451,41 @@ pub async fn verify_workflow_handler(
 
     let kind = match parse_workflow_mutation_kind(&request.action) {
         Ok(kind) => kind,
-        Err(error) => return error.into_verify_response(&action),
+        Err(error) => {
+            warn!(
+                "[WORKFLOW_VERIFY] action 解析失败 - form_id={}, action={}, reason={}",
+                request.form_id, action, error.message
+            );
+            return error.into_verify_response(&action);
+        }
     };
 
-    let result = match validate_workflow_mutation(&request, kind).await {
+    let result = match validate_workflow_for_verify(&request, kind).await {
         Ok(precheck) => (
             StatusCode::OK,
             Json(VerifyWorkflowResponse {
                 code: 200,
                 message: "ok".to_string(),
-                data: Some(build_verify_data(
+                data: Some(build_verify_pass_data(
                     &action,
+                    kind,
                     &precheck,
                     "验证通过，可继续流转",
-                    "proceed",
                 )),
                 error_code: None,
                 annotation_check: None,
             }),
         ),
-        Err(error) => error.into_verify_response(&action),
+        Err(error) => {
+            warn!(
+                "[WORKFLOW_VERIFY] {} 校验失败 - form_id={}, actor={}, reason={}",
+                action,
+                request.form_id,
+                request.actor().id,
+                error.message
+            );
+            error.into_verify_response(&action)
+        }
     };
 
     info!(
@@ -446,6 +496,177 @@ pub async fn verify_workflow_handler(
     );
 
     result
+}
+
+/// verify 路径用的 action → annotation_check intent 映射。
+fn verify_action_intent(kind: WorkflowMutationKind) -> Option<AnnotationCheckIntent> {
+    match kind {
+        WorkflowMutationKind::Active => Some(AnnotationCheckIntent::ActiveSubmit),
+        WorkflowMutationKind::Agree => Some(AnnotationCheckIntent::AgreeAdvance),
+        WorkflowMutationKind::Return => Some(AnnotationCheckIntent::ReturnReject),
+        WorkflowMutationKind::Stop => None,
+    }
+}
+
+fn workflow_action_label(kind: WorkflowMutationKind) -> &'static str {
+    match kind {
+        WorkflowMutationKind::Active => "active",
+        WorkflowMutationKind::Agree => "agree",
+        WorkflowMutationKind::Return => "return",
+        WorkflowMutationKind::Stop => "stop",
+    }
+}
+
+/// verify 路径下 action 在 current_node 上是否合法。
+fn ensure_action_allowed_on_node(
+    kind: WorkflowMutationKind,
+    current_node: &str,
+) -> Result<(), WorkflowSyncActionError> {
+    let allowed = match kind {
+        WorkflowMutationKind::Active => current_node == "sj",
+        WorkflowMutationKind::Agree
+        | WorkflowMutationKind::Return
+        | WorkflowMutationKind::Stop => matches!(current_node, "jd" | "sh" | "pz"),
+    };
+    if allowed {
+        return Ok(());
+    }
+
+    let label = workflow_action_label(kind);
+    let displayed_node = if current_node.is_empty() {
+        "<empty>".to_string()
+    } else {
+        current_node.to_string()
+    };
+    let message = match kind {
+        WorkflowMutationKind::Active => {
+            format!("active 仅允许从 sj 发起，当前节点为 {}", displayed_node)
+        }
+        WorkflowMutationKind::Agree
+        | WorkflowMutationKind::Return
+        | WorkflowMutationKind::Stop => format!(
+            "{} 仅允许在 jd/sh/pz 节点执行，当前节点为 {}",
+            label, displayed_node
+        ),
+    };
+    Err(WorkflowSyncActionError::blocked(
+        StatusCode::CONFLICT,
+        message,
+        Some(current_node.to_string()),
+        None,
+        None,
+        "block",
+    ))
+}
+
+/// 静态推算 verify 响应里的 `expected_next_node`。仅诊断字段，不影响 sync。
+fn verify_expected_next_node(
+    kind: WorkflowMutationKind,
+    current_node: &str,
+) -> Option<String> {
+    match (kind, current_node) {
+        (WorkflowMutationKind::Active, "sj") => Some("jd".to_string()),
+        (WorkflowMutationKind::Agree, "jd") => Some("sh".to_string()),
+        (WorkflowMutationKind::Agree, "sh") => Some("pz".to_string()),
+        _ => None,
+    }
+}
+
+/// verify-only validator —— 与 sync 路径的 `validate_workflow_mutation` 平行。
+///
+/// 不读 `request.next_step` / `request.target_node`；不写库。
+async fn validate_workflow_for_verify(
+    request: &SyncWorkflowRequest,
+    kind: WorkflowMutationKind,
+) -> Result<WorkflowVerifyPrecheck, WorkflowSyncActionError> {
+    let task = load_task_for_workflow(&request.form_id).await?;
+    let current_node = normalize_workflow_node(&task.current_node);
+    let task_status = normalize_task_status(&task.status);
+    let expected_next_node = verify_expected_next_node(kind, &current_node);
+
+    ensure_task_not_terminal(&task, &current_node, None)?;
+    ensure_action_allowed_on_node(kind, &current_node)?;
+
+    ensure_owner_matches(
+        workflow_action_label(kind),
+        &task,
+        &current_node,
+        &request.actor().id,
+        None,
+        expected_next_node.clone(),
+        None,
+    )?;
+
+    let intent = verify_action_intent(kind);
+    if let Some(intent_value) = intent {
+        let context = build_annotation_check_context(
+            task.id.clone(),
+            task.form_id.clone(),
+            task.current_node.clone(),
+        );
+        let result = evaluate_annotation_check(
+            &context,
+            AnnotationCheckOptions {
+                current_node: Some(current_node.clone()),
+                intent: Some(intent_value.as_str().to_string()),
+                included_types: None,
+            },
+        )
+        .await
+        .map_err(|(status, message)| WorkflowSyncActionError::plain(status, message))?;
+        if !result.passed {
+            let (owner_id, owner_source) = current_node_owner(&task, &current_node);
+            return Err(WorkflowSyncActionError::annotation_check_failed(
+                result,
+                Some(current_node.clone()),
+                Some(task_status.clone()),
+                None,
+            )
+            .with_verify_diagnostics(
+                "ANNOTATION_CHECK_FAILED",
+                request.actor().id.trim(),
+                owner_id,
+                owner_source,
+                expected_next_node.clone(),
+                None,
+            ));
+        }
+    }
+
+    Ok(WorkflowVerifyPrecheck {
+        task,
+        current_node,
+        task_status,
+        intent,
+    })
+}
+
+/// verify 通过时构造 `VerifyWorkflowData`。诊断字段 `next_step`/`expected_next_node`
+/// 来自静态推算，不依赖客户端请求体。
+fn build_verify_pass_data(
+    action: &str,
+    kind: WorkflowMutationKind,
+    precheck: &WorkflowVerifyPrecheck,
+    reason: impl Into<String>,
+) -> VerifyWorkflowData {
+    let next_step = verify_expected_next_node(kind, &precheck.current_node);
+    let _ = &precheck.task; // 仅保留所有权一致性，task 字段未来可能用于扩展诊断。
+    let _ = precheck.intent; // 当前 pass 路径不输出 intent；future-proof。
+    VerifyWorkflowData {
+        passed: true,
+        action: action.to_string(),
+        block_code: None,
+        current_node: Some(precheck.current_node.clone()),
+        task_status: Some(precheck.task_status.clone()),
+        next_step,
+        actor_id: None,
+        owner_id: None,
+        owner_source: None,
+        expected_next_node: None,
+        requested_next_step: None,
+        reason: reason.into(),
+        recommended_action: "proceed".to_string(),
+    }
 }
 
 pub async fn sync_workflow_handler(
@@ -700,32 +921,6 @@ fn map_verify_recommended_action(raw: &str) -> &'static str {
         "submit" | "proceed" => "proceed",
         "return" => "return",
         _ => "block",
-    }
-}
-
-fn build_verify_data(
-    action: &str,
-    precheck: &WorkflowMutationPrecheck,
-    reason: impl Into<String>,
-    recommended_action: &str,
-) -> VerifyWorkflowData {
-    VerifyWorkflowData {
-        passed: true,
-        action: action.to_string(),
-        block_code: None,
-        current_node: Some(precheck.current_node.clone()),
-        task_status: Some(precheck.task_status.clone()),
-        next_step: precheck
-            .next_step
-            .as_ref()
-            .map(|step| step.target_node.clone()),
-        actor_id: None,
-        owner_id: None,
-        owner_source: None,
-        expected_next_node: None,
-        requested_next_step: None,
-        reason: reason.into(),
-        recommended_action: recommended_action.to_string(),
     }
 }
 
@@ -1085,7 +1280,7 @@ async fn validate_workflow_active(
         ),
         AnnotationCheckOptions {
             current_node: Some(current_node.clone()),
-            intent: Some("submit_next".to_string()),
+            intent: Some(AnnotationCheckIntent::ActiveSubmit.as_str().to_string()),
             included_types: None,
         },
     )
@@ -1166,6 +1361,38 @@ async fn validate_workflow_return(
         workflow_next_step_diagnostic(request.next_step.as_ref()),
     )?;
 
+    let annotation_check = evaluate_annotation_check(
+        &build_annotation_check_context(
+            task.id.clone(),
+            task.form_id.clone(),
+            task.current_node.clone(),
+        ),
+        AnnotationCheckOptions {
+            current_node: Some(current_node.clone()),
+            intent: Some(AnnotationCheckIntent::ReturnReject.as_str().to_string()),
+            included_types: None,
+        },
+    )
+    .await
+    .map_err(|(status, message)| WorkflowSyncActionError::plain(status, message))?;
+    if !annotation_check.passed {
+        let (owner_id, owner_source) = current_node_owner(&task, &current_node);
+        return Err(WorkflowSyncActionError::annotation_check_failed(
+            annotation_check,
+            Some(current_node.clone()),
+            Some(normalize_task_status(&task.status)),
+            Some(next_step.target_node.clone()),
+        )
+        .with_verify_diagnostics(
+            "ANNOTATION_CHECK_FAILED",
+            request.actor().id.trim(),
+            owner_id,
+            owner_source,
+            Some(next_step.target_node.clone()),
+            workflow_next_step_diagnostic(request.next_step.as_ref()),
+        ));
+    }
+
     Ok(WorkflowMutationPrecheck {
         task_status: normalize_task_status(&task.status),
         task,
@@ -1239,7 +1466,7 @@ async fn validate_workflow_agree(
         ),
         AnnotationCheckOptions {
             current_node: Some(current_node.clone()),
-            intent: Some("submit_next".to_string()),
+            intent: Some(AnnotationCheckIntent::AgreeAdvance.as_str().to_string()),
             included_types: None,
         },
     )

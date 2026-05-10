@@ -161,33 +161,53 @@ pub struct CachePreloadResponse {
 // Workflow Sync
 // ============================================================================
 
+/// PMS ↔ 平台双向工作流同步请求体。
+///
+/// 同时承载 `/workflow/verify`（干跑）与 `/workflow/sync`（落库）两条 endpoint。
+/// 二者对字段的消费方式不同：
+///
+/// | 字段 | verify | sync |
+/// |---|---|---|
+/// | `form_id` / `token` / `action` | **必读** | **必读** |
+/// | `actor` | 仅 debug_token 模式必填；其他场景从 token claims 推 | 同 verify |
+/// | `next_step` | **静默忽略** | active/agree(非pz)/return 必填；stop/agree(pz) 可省 |
+/// | `comments` | 静默忽略 | 落 `review_workflow_history.comment` |
+/// | `metadata` | 静默忽略 | 静默忽略（保留兼容） |
+///
+/// 即 verify 在生产链路下的最小契约只需要 `form_id` + `token` + `action`。
 #[derive(Debug, Deserialize)]
 pub struct SyncWorkflowRequest {
     pub form_id: String,
     pub token: String,
     pub action: String,
-    /// 调用人。**新合同下可省**：
-    /// 当请求体不带 `actor` 时，handler 会从 JWT token claims 推（`user_id`/`role`/`user_name`）。
-    /// 旧调用方仍可显式传 `actor` 兜底（debug_token 模式必须显式传）。
+    /// 调用人。当请求体不带 `actor` 时，handler 会从 JWT token claims 推
+    /// （`user_id` / `role` / `user_name`）。debug_token 模式
+    /// （`PLATFORM_AUTH_CONFIG.enabled = false`，claims 为 None）下必须显式传，
+    /// 否则 400。
     #[serde(default)]
     pub actor: Option<WorkflowActor>,
-    /// 下一节点信息。**新合同下可省**：
-    /// `active`/`agree(非 pz)` 时 handler 会按 `current_node + action` 自动推；
-    /// `return` 应改用 [`SyncWorkflowRequest::target_node`] 仅传目标节点；
-    /// `stop` / `agree(pz)` 不需要。
+    /// 下一节点信息。**仅 sync 路径消费**；verify 路径会静默忽略。
+    ///
+    /// sync 路径：`active` / `agree(非 pz)` / `return` 必填；`stop` 与
+    /// `agree(pz)` 可省。结构必须包含合法 PMS HumanCode 形式的 `assignee_id`，
+    /// 因为 sync 的 apply 阶段要把 assignee 写进 `review_tasks.checker_id` /
+    /// `approver_id` 等字段。
     pub next_step: Option<WorkflowNextStep>,
-    /// `return` 动作的目标节点（`sj` / `jd` / `sh`）。
-    /// 与 `next_step.roles` 二选一；同时存在时以 `target_node` 为准。
-    #[serde(default)]
-    pub target_node: Option<String>,
+    /// 流程动作意见。仅 sync 消费，写入 `review_workflow_history.comment`，
+    /// 不在响应回传。
     pub comments: Option<String>,
+    /// 透传给 PMS 的扩展数据。当前未被任何代码读取，保留兼容；
+    /// 如需扩展请明确字段名而不是塞进 metadata。
     pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct WorkflowActor {
     pub id: String,
-    /// 调用人显示名。可省，缺省时 handler 用 `id` 兜底（或从 token claims 取 `user_name`）。
+    /// 调用人显示名。`#[serde(default)]` 允许 JSON 不传时填空字符串。
+    /// handler 兜底规则：
+    /// - 显式传 actor 但 `name` 空 → handler 用 `id` 填充
+    /// - 从 JWT claims 推 → 优先 `user_name`，user_name 空再用 `user_id`
     #[serde(default)]
     pub name: String,
     pub roles: String,

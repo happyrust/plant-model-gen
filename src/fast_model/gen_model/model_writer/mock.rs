@@ -49,10 +49,7 @@ impl ModelWriterBackend for RecordingBackend {
     }
 
     async fn cleanup(&self, request: CleanupRequest<'_>) -> anyhow::Result<()> {
-        self.record(format!(
-            "cleanup:seed_refnos={}",
-            request.seed_refnos.len()
-        ));
+        self.record(format!("cleanup:seed_refnos={}", request.seed_refnos.len()));
         Ok(())
     }
 

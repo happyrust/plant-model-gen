@@ -26,8 +26,7 @@ pub use drain_only::{DrainOnlyModelWriterBackend, DrainOnlyStats, run_drain_only
 #[cfg(feature = "model-writer-mock")]
 pub use mock::RecordingBackend;
 pub use parquet::{
-    CanonicalParquetBatchSummary, CanonicalParquetTableSummary, CanonicalParquetWriter,
-    CanonicalParquetWriterConfig,
+    CanonicalParquetTableSummary, CanonicalParquetWriter, CanonicalParquetWriterConfig,
 };
 pub use surreal::SurrealModelWriterBackend;
 

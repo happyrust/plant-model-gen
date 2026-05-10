@@ -32,10 +32,12 @@ pub struct CanonicalParquetBatchSummary {
     pub backend: &'static str,
     pub format: &'static str,
     pub limitation: &'static str,
+    pub summary_path: String,
     pub project_name: String,
     pub dbnum: u32,
     pub batch_id: u64,
     pub raw_root: String,
+    pub total_rows: usize,
     pub tables: Vec<CanonicalParquetTableSummary>,
 }
 
@@ -149,17 +151,21 @@ impl CanonicalParquetWriter {
             &batch.refno_assoc_index,
         )?);
 
+        let summary_path = self.summary_file_path(batch_id);
+        let total_rows = tables.iter().map(|table| table.rows).sum();
         let summary = CanonicalParquetBatchSummary {
             backend: "parquet-canonical",
             format: "jsonl-fallback",
             limitation: "typed parquet materialization is intentionally deferred; this scaffold preserves canonical table boundaries and row counts",
+            summary_path: stable_path_string(&summary_path),
             project_name: self.config.project_name.clone(),
             dbnum: self.config.dbnum,
             batch_id,
-            raw_root: raw_root.display().to_string(),
+            raw_root: stable_path_string(&raw_root),
+            total_rows,
             tables,
         };
-        self.write_summary(batch_id, &summary)?;
+        self.write_summary(&summary_path, &summary)?;
         Ok(summary)
     }
 
@@ -175,19 +181,9 @@ impl CanonicalParquetWriter {
         Ok(CanonicalParquetTableSummary {
             table: table.as_str(),
             rows: rows.len(),
-            path: path.display().to_string(),
+            path: stable_path_string(&path),
             limitation: table.phase1_limitation(),
         })
-    }
-
-    fn write_empty_table<T: Serialize>(
-        &self,
-        raw_root: &Path,
-        table: CanonicalRawTable,
-        batch_id: u64,
-        rows: &[T],
-    ) -> anyhow::Result<CanonicalParquetTableSummary> {
-        self.write_table(raw_root, table, batch_id, rows)
     }
 
     fn table_file_path(&self, raw_root: &Path, table: CanonicalRawTable, batch_id: u64) -> PathBuf {
@@ -198,30 +194,42 @@ impl CanonicalParquetWriter {
             .join(format!("batch_{batch_id}.jsonl"))
     }
 
-    fn write_summary(
-        &self,
-        batch_id: u64,
-        summary: &CanonicalParquetBatchSummary,
-    ) -> anyhow::Result<()> {
-        let summary_dir = self
-            .config
+    pub fn summary_file_path(&self, batch_id: u64) -> PathBuf {
+        self.config
             .output_dir
             .join("model_writer_storage")
             .join("summary")
             .join(format!("project_name={}", self.config.project_name))
-            .join(format!("dbnum={}", self.config.dbnum));
-        fs::create_dir_all(&summary_dir).with_context(|| {
+            .join(format!("dbnum={}", self.config.dbnum))
+            .join(format!("batch_{batch_id}.json"))
+    }
+
+    fn write_summary(
+        &self,
+        path: &Path,
+        summary: &CanonicalParquetBatchSummary,
+    ) -> anyhow::Result<()> {
+        let summary_dir = path.parent().with_context(|| {
+            format!(
+                "failed to determine canonical parquet summary dir for {}",
+                path.display()
+            )
+        })?;
+        fs::create_dir_all(summary_dir).with_context(|| {
             format!(
                 "failed to create canonical parquet summary dir {}",
                 summary_dir.display()
             )
         })?;
-        let path = summary_dir.join(format!("batch_{batch_id}.json"));
-        let file = File::create(&path)
+        let file = File::create(path)
             .with_context(|| format!("failed to create summary file {}", path.display()))?;
         serde_json::to_writer_pretty(BufWriter::new(file), summary)
             .with_context(|| format!("failed to write summary file {}", path.display()))
     }
+}
+
+fn stable_path_string(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 fn write_json_lines<T: Serialize>(path: &Path, rows: &[T]) -> anyhow::Result<()> {

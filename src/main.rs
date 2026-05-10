@@ -1014,6 +1014,31 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if let Some(("model-writer", model_writer_matches)) = matches.subcommand() {
+        if let Some(("validate-canonical-parquet", sub_matches)) = model_writer_matches.subcommand()
+        {
+            let output_dir = sub_matches
+                .get_one::<String>("output")
+                .map(PathBuf::from)
+                .expect("required by clap");
+            let project_name = sub_matches
+                .get_one::<String>("project-name")
+                .map(String::as_str)
+                .unwrap_or("canonical-validation");
+            let dbnum = sub_matches.get_one::<u32>("dbnum").copied().unwrap_or(0);
+            let batch_id = sub_matches.get_one::<u64>("batch-id").copied().unwrap_or(1);
+
+            let report = cli_modes::validate_canonical_parquet_writer_mode(
+                &output_dir,
+                project_name,
+                dbnum,
+                batch_id,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
+    }
+
     // 获取配置文件路径
     let config_path = matches
         .get_one::<String>("config")
@@ -1464,31 +1489,6 @@ async fn main() -> anyhow::Result<()> {
             .get_many::<u32>("dbnums")
             .map(|values| values.copied().collect());
         return aios_database::init_project::run_init_project_mode(db_option_ext, cli_dbnums).await;
-    }
-
-    if let Some(("model-writer", model_writer_matches)) = matches.subcommand() {
-        if let Some(("validate-canonical-parquet", sub_matches)) = model_writer_matches.subcommand()
-        {
-            let output_dir = sub_matches
-                .get_one::<String>("output")
-                .map(PathBuf::from)
-                .expect("required by clap");
-            let project_name = sub_matches
-                .get_one::<String>("project-name")
-                .map(String::as_str)
-                .unwrap_or("canonical-validation");
-            let dbnum = sub_matches.get_one::<u32>("dbnum").copied().unwrap_or(0);
-            let batch_id = sub_matches.get_one::<u64>("batch-id").copied().unwrap_or(1);
-
-            let report = cli_modes::validate_canonical_parquet_writer_mode(
-                &output_dir,
-                project_name,
-                dbnum,
-                batch_id,
-            )?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            return Ok(());
-        }
     }
 
     // ========== 处理 --gen-all-desi-indextree 参数 ==========

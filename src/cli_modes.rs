@@ -272,6 +272,9 @@ impl ExportConfig {
 
 #[derive(Debug, serde::Serialize)]
 pub struct CanonicalParquetValidationReport {
+    pub backend: &'static str,
+    pub format: &'static str,
+    pub limitation: &'static str,
     pub status: &'static str,
     pub summary_path: String,
     pub raw_root: String,
@@ -302,22 +305,18 @@ pub fn validate_canonical_parquet_writer_mode(
         dbnum,
     });
     let summary = writer.write_raw_batch(batch_id, &batch)?;
-    let summary_path = output_dir
-        .join("model_writer_storage")
-        .join("summary")
-        .join(format!("project_name={project_name}"))
-        .join(format!("dbnum={dbnum}"))
-        .join(format!("batch_{batch_id}.json"));
-    let total_rows = summary.tables.iter().map(|table| table.rows).sum();
 
     Ok(CanonicalParquetValidationReport {
+        backend: summary.backend,
+        format: summary.format,
+        limitation: summary.limitation,
         status: "ok",
-        summary_path: summary_path.display().to_string(),
+        summary_path: summary.summary_path,
         raw_root: summary.raw_root,
         project_name: summary.project_name,
         dbnum: summary.dbnum,
         batch_id: summary.batch_id,
-        total_rows,
+        total_rows: summary.total_rows,
         tables: summary.tables,
     })
 }

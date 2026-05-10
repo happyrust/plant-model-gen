@@ -102,7 +102,7 @@ async fn test_room_worker_rebuild_all_task() -> anyhow::Result<()> {
     let task = RoomWorkerTask::new(
         "test-rebuild-all".to_string(),
         RoomTaskType::RebuildAll,
-        db_option.clone(),
+        (*db_option).clone(),
     );
 
     let task_id = worker.submit_task(task).await;

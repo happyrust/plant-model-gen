@@ -329,7 +329,7 @@ pub async fn evaluate_annotation_check(
     context: &AnnotationCheckContext,
     options: AnnotationCheckOptions,
 ) -> Result<AnnotationCheckResult, (StatusCode, String)> {
-    validate_annotation_check_intent(options.intent.as_deref())?;
+    let intent = parse_annotation_check_intent(options.intent.as_deref())?;
     let included_types = resolve_included_types(options.included_types.as_deref())?;
     let current_node = resolve_effective_current_node(context, options.current_node.as_deref())?;
     let annotations = load_effective_annotations(context, &included_types).await?;
@@ -349,7 +349,7 @@ pub async fn evaluate_annotation_check(
 
     let blockers = build_annotation_check_blockers(&annotations);
     let (passed, recommended_action, message) =
-        evaluate_annotation_gate_decision(&current_node, &summary)?;
+        evaluate_annotation_gate_decision(&current_node, intent, &summary)?;
 
     Ok(AnnotationCheckResult {
         passed,
@@ -361,16 +361,56 @@ pub async fn evaluate_annotation_check(
     })
 }
 
-fn validate_annotation_check_intent(intent: Option<&str>) -> Result<(), (StatusCode, String)> {
-    let normalized = intent.unwrap_or("submit_next").trim().to_lowercase();
-    if normalized.is_empty() || normalized == "submit_next" {
-        return Ok(());
-    }
+/// Annotation gate 的 action-aware 检查策略。
+///
+/// 与 `SyncWorkflowRequest::action` 一一对应，由 verify/sync handler 把当前
+/// action 翻译成 intent 后传入。`SubmitNext` 是历史调用方（独立 annotation_check
+/// HTTP endpoint）使用的「按 current_node 自动推荐」语义，等价于 v3 之前的
+/// 唯一行为，仅作向后兼容保留。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationCheckIntent {
+    /// `action = "active"`：sj 节点送审，要求所有批注都已被回复（open == 0）。
+    /// 允许 pending / approved / rejected 共存——"回复过"即可。
+    ActiveSubmit,
+    /// `action = "agree"`：jd/sh/pz 节点通过到下一节点，要求 0 open / 0 rejected /
+    /// 0 pending。出现 rejected 时 recommended_action = "return"，出现 pending
+    /// 但无 open/rejected 时 recommended_action = "block"。
+    AgreeAdvance,
+    /// `action = "return"`：jd/sh/pz 节点驳回，要求 (open + rejected) >= 1。
+    /// 全部 approved / pending 时拒绝驳回（"无问题批注，不允许驳回"）。
+    ReturnReject,
+    /// 历史 `intent = "submit_next"`：按 current_node 推荐（行为同 v3 之前）。
+    /// 仅 `/api/review/annotations/check` HTTP endpoint 与未指定 intent 的旧调用
+    /// 走这条；workflow verify/sync 内部不再使用。
+    SubmitNext,
+}
 
-    Err((
-        StatusCode::BAD_REQUEST,
-        format!("不支持的 annotation check intent: {}", normalized),
-    ))
+impl AnnotationCheckIntent {
+    /// HTTP wire 上的字符串值。与 `parse_annotation_check_intent` 反向对齐。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnnotationCheckIntent::ActiveSubmit => "active_submit",
+            AnnotationCheckIntent::AgreeAdvance => "agree_advance",
+            AnnotationCheckIntent::ReturnReject => "return_reject",
+            AnnotationCheckIntent::SubmitNext => "submit_next",
+        }
+    }
+}
+
+fn parse_annotation_check_intent(
+    intent: Option<&str>,
+) -> Result<AnnotationCheckIntent, (StatusCode, String)> {
+    let normalized = intent.unwrap_or("submit_next").trim().to_lowercase();
+    match normalized.as_str() {
+        "" | "submit_next" => Ok(AnnotationCheckIntent::SubmitNext),
+        "active_submit" => Ok(AnnotationCheckIntent::ActiveSubmit),
+        "agree_advance" => Ok(AnnotationCheckIntent::AgreeAdvance),
+        "return_reject" => Ok(AnnotationCheckIntent::ReturnReject),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            format!("不支持的 annotation check intent: {}", other),
+        )),
+    }
 }
 
 fn resolve_included_types(
@@ -449,12 +489,143 @@ fn is_supported_workflow_node(node: &str) -> bool {
 
 fn evaluate_annotation_gate_decision(
     current_node: &str,
+    intent: AnnotationCheckIntent,
     summary: &AnnotationCheckSummary,
 ) -> Result<(bool, &'static str, String), (StatusCode, String)> {
+    if !is_supported_workflow_node(current_node) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("annotation check 暂不支持节点: {}", current_node),
+        ));
+    }
+
     let has_open = summary.open > 0;
     let has_pending_review = summary.pending_review > 0;
     let has_rejected = summary.rejected > 0;
 
+    match intent {
+        AnnotationCheckIntent::ActiveSubmit => evaluate_active_submit_gate(
+            current_node,
+            has_open,
+        ),
+        AnnotationCheckIntent::AgreeAdvance => evaluate_agree_advance_gate(
+            current_node,
+            has_open,
+            has_pending_review,
+            has_rejected,
+        ),
+        AnnotationCheckIntent::ReturnReject => evaluate_return_reject_gate(
+            current_node,
+            has_open,
+            has_rejected,
+        ),
+        AnnotationCheckIntent::SubmitNext => {
+            evaluate_submit_next_gate(current_node, has_open, has_pending_review, has_rejected)
+        }
+    }
+}
+
+/// `active`：仅 sj 可发起；要求所有批注都被回复（`open == 0`）。
+/// 允许 pending / approved / rejected 共存——"回复过"即可。
+fn evaluate_active_submit_gate(
+    current_node: &str,
+    has_open: bool,
+) -> Result<(bool, &'static str, String), (StatusCode, String)> {
+    if current_node != "sj" {
+        return Ok((
+            false,
+            "block",
+            format!(
+                "active 仅允许从 sj 发起，当前节点为 {}",
+                current_node
+            ),
+        ));
+    }
+    if has_open {
+        return Ok((
+            false,
+            "block",
+            "存在未处理批注，请逐条回复后再提交".to_string(),
+        ));
+    }
+    Ok((true, "submit", "批注检查通过，可以继续提交".to_string()))
+}
+
+/// `agree`：仅 jd/sh/pz 可执行；要求 0 open / 0 rejected / 0 pending。
+fn evaluate_agree_advance_gate(
+    current_node: &str,
+    has_open: bool,
+    has_pending_review: bool,
+    has_rejected: bool,
+) -> Result<(bool, &'static str, String), (StatusCode, String)> {
+    if !matches!(current_node, "jd" | "sh" | "pz") {
+        return Ok((
+            false,
+            "block",
+            format!(
+                "agree 仅允许在 jd/sh/pz 节点执行，当前节点为 {}",
+                current_node
+            ),
+        ));
+    }
+    if has_rejected {
+        return Ok((
+            false,
+            "return",
+            "存在已驳回批注，请改走驳回流程".to_string(),
+        ));
+    }
+    if has_open {
+        return Ok((
+            false,
+            "block",
+            "存在未处理批注，请逐条处理后再继续".to_string(),
+        ));
+    }
+    if has_pending_review {
+        return Ok((
+            false,
+            "block",
+            "存在待确认批注，请逐条确认后再继续".to_string(),
+        ));
+    }
+    Ok((true, "submit", "批注检查通过，可以继续流转".to_string()))
+}
+
+/// `return`：仅 jd/sh/pz 可执行；要求至少一条 open 或 rejected 批注作为驳回理由。
+fn evaluate_return_reject_gate(
+    current_node: &str,
+    has_open: bool,
+    has_rejected: bool,
+) -> Result<(bool, &'static str, String), (StatusCode, String)> {
+    if !matches!(current_node, "jd" | "sh" | "pz") {
+        return Ok((
+            false,
+            "block",
+            format!(
+                "return 仅允许在 jd/sh/pz 节点执行，当前节点为 {}",
+                current_node
+            ),
+        ));
+    }
+    if !has_open && !has_rejected {
+        return Ok((
+            false,
+            "block",
+            "无未处理或被驳回的批注，不允许驳回".to_string(),
+        ));
+    }
+    Ok((true, "return", "存在待处理批注，可以驳回".to_string()))
+}
+
+/// 历史 `submit_next` 语义：按 current_node 自动推荐。仅独立 annotation_check
+/// HTTP endpoint 与未指定 intent 的旧调用走这条；workflow verify/sync 内部不再使用。
+fn evaluate_submit_next_gate(
+    current_node: &str,
+    has_open: bool,
+    has_pending_review: bool,
+    has_rejected: bool,
+) -> Result<(bool, &'static str, String), (StatusCode, String)> {
     match current_node {
         "sj" => {
             if has_open || has_rejected {
@@ -826,5 +997,237 @@ fn record_id_to_string(record_id: surrealdb_types::RecordId) -> String {
     match record_id.key {
         surrealdb_types::RecordIdKey::String(value) => value,
         other => format!("{:?}", other),
+    }
+}
+
+#[cfg(test)]
+mod gate_decision_tests {
+    use super::{
+        AnnotationCheckIntent, AnnotationCheckSummary, evaluate_annotation_gate_decision,
+        parse_annotation_check_intent,
+    };
+
+    fn summary(open: usize, pending: usize, approved: usize, rejected: usize) -> AnnotationCheckSummary {
+        AnnotationCheckSummary {
+            total: open + pending + approved + rejected,
+            open,
+            pending_review: pending,
+            approved,
+            rejected,
+        }
+    }
+
+    // ---------- intent 解析 ----------
+
+    #[test]
+    fn parse_intent_default_and_aliases() {
+        assert_eq!(
+            parse_annotation_check_intent(None).unwrap(),
+            AnnotationCheckIntent::SubmitNext
+        );
+        assert_eq!(
+            parse_annotation_check_intent(Some("submit_next")).unwrap(),
+            AnnotationCheckIntent::SubmitNext
+        );
+        assert_eq!(
+            parse_annotation_check_intent(Some("ACTIVE_SUBMIT")).unwrap(),
+            AnnotationCheckIntent::ActiveSubmit
+        );
+        assert_eq!(
+            parse_annotation_check_intent(Some(" agree_advance ")).unwrap(),
+            AnnotationCheckIntent::AgreeAdvance
+        );
+        assert_eq!(
+            parse_annotation_check_intent(Some("return_reject")).unwrap(),
+            AnnotationCheckIntent::ReturnReject
+        );
+    }
+
+    #[test]
+    fn parse_intent_rejects_unknown() {
+        let err = parse_annotation_check_intent(Some("foo")).unwrap_err();
+        assert!(err.1.contains("foo"));
+    }
+
+    // ---------- ActiveSubmit ----------
+
+    #[test]
+    fn active_submit_requires_sj_node() {
+        let summary = summary(0, 0, 0, 0);
+        let (passed, action, msg) =
+            evaluate_annotation_gate_decision("jd", AnnotationCheckIntent::ActiveSubmit, &summary)
+                .unwrap();
+        assert!(!passed);
+        assert_eq!(action, "block");
+        assert!(msg.contains("active 仅允许从 sj 发起"));
+    }
+
+    #[test]
+    fn active_submit_blocks_when_open_exists() {
+        // sj 节点有 1 个 open 批注 → 还没回复，禁止提交
+        let summary = summary(1, 0, 0, 0);
+        let (passed, action, msg) =
+            evaluate_annotation_gate_decision("sj", AnnotationCheckIntent::ActiveSubmit, &summary)
+                .unwrap();
+        assert!(!passed);
+        assert_eq!(action, "block");
+        assert!(msg.contains("未处理批注"));
+    }
+
+    #[test]
+    fn active_submit_passes_with_only_replied_states() {
+        // sj 节点：open=0，其他状态共存全部允许（pending/approved/rejected）
+        let summary = summary(0, 1, 1, 1);
+        let (passed, action, _msg) =
+            evaluate_annotation_gate_decision("sj", AnnotationCheckIntent::ActiveSubmit, &summary)
+                .unwrap();
+        assert!(passed);
+        assert_eq!(action, "submit");
+    }
+
+    #[test]
+    fn active_submit_passes_with_empty_summary() {
+        let summary = summary(0, 0, 0, 0);
+        let (passed, action, _msg) =
+            evaluate_annotation_gate_decision("sj", AnnotationCheckIntent::ActiveSubmit, &summary)
+                .unwrap();
+        assert!(passed);
+        assert_eq!(action, "submit");
+    }
+
+    // ---------- AgreeAdvance ----------
+
+    #[test]
+    fn agree_advance_requires_review_node() {
+        let summary = summary(0, 0, 0, 0);
+        let (passed, _action, msg) =
+            evaluate_annotation_gate_decision("sj", AnnotationCheckIntent::AgreeAdvance, &summary)
+                .unwrap();
+        assert!(!passed);
+        assert!(msg.contains("agree 仅允许在 jd/sh/pz"));
+    }
+
+    #[test]
+    fn agree_advance_recommends_return_when_rejected() {
+        // jd 节点有 rejected → 应当 return 而不是 agree
+        let summary = summary(0, 0, 0, 1);
+        let (passed, action, msg) =
+            evaluate_annotation_gate_decision("jd", AnnotationCheckIntent::AgreeAdvance, &summary)
+                .unwrap();
+        assert!(!passed);
+        assert_eq!(action, "return");
+        assert!(msg.contains("已驳回"));
+    }
+
+    #[test]
+    fn agree_advance_blocks_on_open() {
+        let summary = summary(1, 0, 0, 0);
+        let (passed, action, _msg) =
+            evaluate_annotation_gate_decision("sh", AnnotationCheckIntent::AgreeAdvance, &summary)
+                .unwrap();
+        assert!(!passed);
+        assert_eq!(action, "block");
+    }
+
+    #[test]
+    fn agree_advance_blocks_on_pending() {
+        let summary = summary(0, 1, 0, 0);
+        let (passed, action, msg) =
+            evaluate_annotation_gate_decision("sh", AnnotationCheckIntent::AgreeAdvance, &summary)
+                .unwrap();
+        assert!(!passed);
+        assert_eq!(action, "block");
+        assert!(msg.contains("待确认批注"));
+    }
+
+    #[test]
+    fn agree_advance_passes_with_clean_state() {
+        let summary = summary(0, 0, 3, 0);
+        let (passed, action, _msg) =
+            evaluate_annotation_gate_decision("pz", AnnotationCheckIntent::AgreeAdvance, &summary)
+                .unwrap();
+        assert!(passed);
+        assert_eq!(action, "submit");
+    }
+
+    // ---------- ReturnReject ----------
+
+    #[test]
+    fn return_reject_requires_review_node() {
+        let summary = summary(1, 0, 0, 0);
+        let (passed, _action, msg) =
+            evaluate_annotation_gate_decision("sj", AnnotationCheckIntent::ReturnReject, &summary)
+                .unwrap();
+        assert!(!passed);
+        assert!(msg.contains("return 仅允许在 jd/sh/pz"));
+    }
+
+    #[test]
+    fn return_reject_blocks_when_no_problem_annotation() {
+        // jd 节点全是 approved/pending → 没理由驳回
+        let summary = summary(0, 1, 2, 0);
+        let (passed, action, msg) =
+            evaluate_annotation_gate_decision("jd", AnnotationCheckIntent::ReturnReject, &summary)
+                .unwrap();
+        assert!(!passed);
+        assert_eq!(action, "block");
+        assert!(msg.contains("不允许驳回"));
+    }
+
+    #[test]
+    fn return_reject_passes_with_open_annotation() {
+        let summary = summary(1, 0, 0, 0);
+        let (passed, action, _msg) =
+            evaluate_annotation_gate_decision("jd", AnnotationCheckIntent::ReturnReject, &summary)
+                .unwrap();
+        assert!(passed);
+        assert_eq!(action, "return");
+    }
+
+    #[test]
+    fn return_reject_passes_with_rejected_annotation() {
+        let summary = summary(0, 0, 0, 1);
+        let (passed, action, _msg) =
+            evaluate_annotation_gate_decision("sh", AnnotationCheckIntent::ReturnReject, &summary)
+                .unwrap();
+        assert!(passed);
+        assert_eq!(action, "return");
+    }
+
+    // ---------- SubmitNext 向后兼容 ----------
+
+    #[test]
+    fn submit_next_keeps_legacy_sj_semantics() {
+        // 旧语义：sj 节点 open 或 rejected 都阻断
+        let summary = summary(0, 0, 0, 1);
+        let (passed, action, _msg) =
+            evaluate_annotation_gate_decision("sj", AnnotationCheckIntent::SubmitNext, &summary)
+                .unwrap();
+        assert!(!passed);
+        assert_eq!(action, "block");
+    }
+
+    #[test]
+    fn submit_next_keeps_legacy_review_node_semantics() {
+        let summary = summary(1, 0, 0, 0);
+        let (passed, action, _msg) =
+            evaluate_annotation_gate_decision("jd", AnnotationCheckIntent::SubmitNext, &summary)
+                .unwrap();
+        assert!(!passed);
+        assert_eq!(action, "return");
+    }
+
+    // ---------- 节点合法性 ----------
+
+    #[test]
+    fn unknown_node_returns_bad_request() {
+        let summary = summary(0, 0, 0, 0);
+        let err = evaluate_annotation_gate_decision(
+            "unknown",
+            AnnotationCheckIntent::SubmitNext,
+            &summary,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 }

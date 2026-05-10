@@ -18,6 +18,7 @@ macro_rules! e3d_dbg {
 
 // 核心模块
 pub mod cache_miss_report; // IndexTree cache-first 缺失报告（output/<project>/cache_miss_report.json）
+pub mod canonical_records; // Phase 1 canonical raw writer boundary
 pub mod categorized_refnos;
 pub mod config; // 配置管理 (Phase 2)
 pub mod context; // 处理上下文

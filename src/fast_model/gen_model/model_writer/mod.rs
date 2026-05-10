@@ -12,14 +12,23 @@ use super::manifold_bool::BoolWorkerReport;
 use super::mesh_generate::MeshResult;
 use crate::options::{BooleanPipelineMode, DbOptionExt, ModelWriterMode};
 
+pub use super::canonical_records::{
+    CanonicalRawBatch, CanonicalRawPlanner, CanonicalRawRowCounts, CanonicalRawTable,
+};
+
 mod drain_only;
 #[cfg(feature = "model-writer-mock")]
 mod mock;
+mod parquet;
 mod surreal;
 
 pub use drain_only::{DrainOnlyModelWriterBackend, DrainOnlyStats, run_drain_only_sink};
 #[cfg(feature = "model-writer-mock")]
 pub use mock::RecordingBackend;
+pub use parquet::{
+    CanonicalParquetBatchSummary, CanonicalParquetTableSummary, CanonicalParquetWriter,
+    CanonicalParquetWriterConfig,
+};
 pub use surreal::SurrealModelWriterBackend;
 
 #[derive(Debug, Clone)]

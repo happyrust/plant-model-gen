@@ -15,6 +15,10 @@ use aios_database::fast_model::export_model::export_obj::export_obj_for_refnos;
 use aios_database::fast_model::export_model::export_room_instances::{
     RoomComputeValidationCase, RoomComputeValidationFixture,
 };
+use aios_database::fast_model::gen_model::model_writer::{
+    CanonicalParquetTableSummary, CanonicalParquetWriter, CanonicalParquetWriterConfig,
+    CanonicalRawPlanner,
+};
 use aios_database::options::DbOptionExt;
 use aios_database::perf_timer::{PerfReport, PerfTimer};
 use parry3d::bounding_volume::BoundingVolume;
@@ -264,6 +268,58 @@ impl ExportConfig {
         println!("   - 全库导出: {}", self.run_all_dbnos);
         println!("   - 按 SITE 拆分: {}", self.split_by_site);
     }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CanonicalParquetValidationReport {
+    pub status: &'static str,
+    pub summary_path: String,
+    pub raw_root: String,
+    pub project_name: String,
+    pub dbnum: u32,
+    pub batch_id: u64,
+    pub total_rows: usize,
+    pub tables: Vec<CanonicalParquetTableSummary>,
+}
+
+/// Non-production CLI validation entry for the canonical raw planner plus the
+/// canonical Parquet(JSONL fallback) writer scaffold.
+///
+/// This intentionally builds an empty `ShapeInstancesData` fixture and never
+/// enters the default `gen_model`/SurrealDB writer path.
+pub fn validate_canonical_parquet_writer_mode(
+    output_dir: &Path,
+    project_name: &str,
+    dbnum: u32,
+    batch_id: u64,
+) -> Result<CanonicalParquetValidationReport> {
+    let shape_insts = aios_core::geometry::ShapeInstancesData::default();
+    let planner = CanonicalRawPlanner;
+    let batch = planner.plan_shape_instances(&shape_insts);
+    let writer = CanonicalParquetWriter::new(CanonicalParquetWriterConfig {
+        output_dir: output_dir.to_path_buf(),
+        project_name: project_name.to_string(),
+        dbnum,
+    });
+    let summary = writer.write_raw_batch(batch_id, &batch)?;
+    let summary_path = output_dir
+        .join("model_writer_storage")
+        .join("summary")
+        .join(format!("project_name={project_name}"))
+        .join(format!("dbnum={dbnum}"))
+        .join(format!("batch_{batch_id}.json"));
+    let total_rows = summary.tables.iter().map(|table| table.rows).sum();
+
+    Ok(CanonicalParquetValidationReport {
+        status: "ok",
+        summary_path: summary_path.display().to_string(),
+        raw_root: summary.raw_root,
+        project_name: summary.project_name,
+        dbnum: summary.dbnum,
+        batch_id: summary.batch_id,
+        total_rows,
+        tables: summary.tables,
+    })
 }
 
 fn parse_length_unit(unit: &str) -> LengthUnit {
@@ -1682,8 +1738,9 @@ pub async fn run_regen_model(
 
     // 统一走 trait：DrainOnly backend 的 cleanup 是 NoOp，确保压测模式不会误删数据；
     // Surreal backend 内部仍按既有顺序清理 legacy 模型关系 + refno_relations 扁平表。
-    let model_writer =
-        aios_database::fast_model::gen_model::model_writer::create_model_writer(&db_option_override)?;
+    let model_writer = aios_database::fast_model::gen_model::model_writer::create_model_writer(
+        &db_option_override,
+    )?;
     model_writer
         .cleanup(
             aios_database::fast_model::gen_model::model_writer::CleanupRequest {

@@ -210,7 +210,17 @@ pub struct RawInstRelateAabbRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawRefnoAssocIndexRecord {
     pub refno: String,
-    pub associated_records: Vec<String>,
+    pub inst_relate_ids: Vec<String>,
+    pub inst_info_ids: Vec<String>,
+    pub geo_relate_ids: Vec<String>,
+    pub geo_hashes: Vec<String>,
+    pub neg_relate_ids: Vec<String>,
+    pub ngmr_relate_ids: Vec<String>,
+    pub inst_relate_aabb_ids: Vec<String>,
+    pub tubi_branch_keys: Vec<String>,
+    pub pending_phase2_inst_relate_bool_ids: Vec<String>,
+    pub pending_phase2_inst_relate_cata_bool_ids: Vec<String>,
+    pub unsupported_inst_relate_booled_aabb_ids: Vec<String>,
     pub limitation: Option<String>,
 }
 
@@ -267,8 +277,8 @@ impl CanonicalRawPlanner {
         let mut aabb_by_hash: HashMap<u64, String> = HashMap::new();
         let mut trans_by_hash: HashMap<u64, String> = HashMap::new();
         let mut vec3_by_hash: HashMap<u64, String> = HashMap::new();
-        let mut neg_geo_by_carrier: HashMap<String, Vec<u64>> = HashMap::new();
-        let mut ngmr_geo_by_key: HashMap<(String, String), Vec<u64>> = HashMap::new();
+        let mut neg_geo_by_carrier: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+        let mut ngmr_geo_by_key: HashMap<(String, String), Vec<(u64, String)>> = HashMap::new();
 
         for (refno, info) in &shape_insts.inst_info_map {
             let refno_s = refno.to_string();
@@ -377,13 +387,13 @@ impl CanonicalRawPlanner {
                         neg_geo_by_carrier
                             .entry(inst_geo_data.refno.to_string())
                             .or_default()
-                            .push(relation_id);
+                            .push((relation_id, inst.refno.to_pe_key()));
                     }
                     GeoBasicType::CataCrossNeg => {
                         ngmr_geo_by_key
                             .entry((inst_geo_data.refno.to_string(), inst.refno.to_string()))
                             .or_default()
-                            .push(relation_id);
+                            .push((relation_id, inst.refno.to_pe_key()));
                     }
                     _ => {}
                 }
@@ -393,10 +403,14 @@ impl CanonicalRawPlanner {
         for (target, carriers) in &shape_insts.neg_relate_map {
             for carrier in carriers {
                 let carrier_key = carrier.to_string();
-                let geo_relate_ids = neg_geo_by_carrier
+                let matching_geo_relates = neg_geo_by_carrier
                     .get(&carrier_key)
                     .cloned()
                     .unwrap_or_default();
+                let geo_relate_ids = matching_geo_relates
+                    .iter()
+                    .map(|(relation_id, _)| *relation_id)
+                    .collect::<Vec<_>>();
                 batch.neg_relate.push(RawDependencyRelateRecord {
                     carrier_refno: carrier_key,
                     target_refno: target.to_string(),
@@ -414,7 +428,11 @@ impl CanonicalRawPlanner {
         for (target, ngmrs) in &shape_insts.ngmr_neg_relate_map {
             for (carrier, geom_refno) in ngmrs {
                 let key = (carrier.to_string(), geom_refno.to_string());
-                let geo_relate_ids = ngmr_geo_by_key.get(&key).cloned().unwrap_or_default();
+                let matching_geo_relates = ngmr_geo_by_key.get(&key).cloned().unwrap_or_default();
+                let geo_relate_ids = matching_geo_relates
+                    .iter()
+                    .map(|(relation_id, _)| *relation_id)
+                    .collect::<Vec<_>>();
                 batch.ngmr_relate.push(RawDependencyRelateRecord {
                     carrier_refno: carrier.to_string(),
                     target_refno: target.to_string(),
@@ -471,21 +489,92 @@ impl CanonicalRawPlanner {
 
         for refno in shape_insts.inst_info_map.keys() {
             let refno_s = refno.to_string();
-            let mut associated_records = Vec::new();
-            associated_records.push(refno.to_inst_relate_key());
-            if shape_insts
+            let inst_ids = shape_insts
                 .inst_geos_map
                 .values()
-                .any(|geos| geos.refno == *refno)
-            {
-                associated_records.push(refno.to_pe_key());
-            }
-            if shape_insts.inst_tubi_map.contains_key(refno) {
-                associated_records.push(format!("tubi:{}", refno.to_pe_key()));
-            }
+                .filter(|geos| geos.refno == *refno)
+                .map(|geos| geos.id())
+                .collect::<Vec<_>>();
+            let inst_info_ids = shape_insts
+                .inst_info_map
+                .get(refno)
+                .map(|info| vec![format!("inst_info:⟨{}⟩", info.id_str())])
+                .unwrap_or_default();
+            let geo_relate_ids = batch
+                .geo_relate
+                .iter()
+                .filter(|row| inst_ids.iter().any(|inst_id| inst_id == &row.inst_id))
+                .map(|row| format!("geo_relate:⟨{}⟩", row.relation_id))
+                .collect::<Vec<_>>();
+            let geo_hashes = shape_insts
+                .inst_geos_map
+                .values()
+                .filter(|geos| geos.refno == *refno)
+                .flat_map(|geos| geos.insts.iter().map(|inst| inst.geo_hash.to_string()))
+                .collect::<Vec<_>>();
+            let neg_relate_ids = neg_geo_by_carrier
+                .get(&refno_s)
+                .into_iter()
+                .flatten()
+                .flat_map(|(relation_id, _)| {
+                    shape_insts
+                        .neg_relate_map
+                        .iter()
+                        .filter(|(_, carriers)| carriers.iter().any(|carrier| carrier == refno))
+                        .map(move |(target, _)| {
+                            format!("neg_relate:['{}',{}]", relation_id, target.to_pe_key())
+                        })
+                })
+                .collect::<Vec<_>>();
+            let ngmr_relate_ids = ngmr_geo_by_key
+                .iter()
+                .filter(|((carrier, _), _)| carrier == &refno_s)
+                .flat_map(|((_, geom_refno), geo_relates)| {
+                    geo_relates.iter().flat_map(move |(relation_id, _)| {
+                        shape_insts
+                            .ngmr_neg_relate_map
+                            .iter()
+                            .filter_map(move |(target, ngmrs)| {
+                                ngmrs
+                                    .iter()
+                                    .any(|(carrier, geom)| {
+                                        carrier == refno && geom.to_string() == *geom_refno
+                                    })
+                                    .then(|| {
+                                        format!(
+                                            "ngmr_relate:['{}',{}]",
+                                            relation_id,
+                                            target.to_pe_key()
+                                        )
+                                    })
+                            })
+                    })
+                })
+                .collect::<Vec<_>>();
+            let inst_relate_aabb_ids = batch
+                .inst_relate_aabb
+                .iter()
+                .filter(|row| row.refno == refno_s)
+                .map(|row| row.relation_id.clone())
+                .collect::<Vec<_>>();
+            let tubi_branch_keys = shape_insts
+                .inst_tubi_map
+                .get(refno)
+                .map(|tubi| vec![tubi.refno.to_pe_key()])
+                .unwrap_or_default();
             batch.refno_assoc_index.push(RawRefnoAssocIndexRecord {
                 refno: refno_s,
-                associated_records,
+                inst_relate_ids: vec![refno.to_inst_relate_key()],
+                inst_info_ids,
+                geo_relate_ids,
+                geo_hashes,
+                neg_relate_ids,
+                ngmr_relate_ids,
+                inst_relate_aabb_ids,
+                tubi_branch_keys,
+                pending_phase2_inst_relate_bool_ids: vec![format!("inst_relate_bool:⟨{}⟩", refno)],
+                pending_phase2_inst_relate_cata_bool_ids: Vec::new(),
+                unsupported_inst_relate_booled_aabb_ids: Vec::new(),
                 limitation: CanonicalRawTable::RawRefnoAssocIndex
                     .phase1_limitation()
                     .map(str::to_owned),

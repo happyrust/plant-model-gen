@@ -460,38 +460,52 @@ pub async fn verify_workflow_handler(
         }
     };
 
-    let result = match validate_workflow_for_verify(&request, kind).await {
-        Ok(precheck) => (
-            StatusCode::OK,
-            Json(VerifyWorkflowResponse {
-                code: 200,
-                message: "ok".to_string(),
-                data: Some(build_verify_pass_data(
-                    &action,
-                    kind,
-                    &precheck,
-                    "验证通过，可继续流转",
-                )),
-                error_code: None,
-                annotation_check: None,
-            }),
-        ),
-        Err(error) => {
-            warn!(
-                "[WORKFLOW_VERIFY] {} 校验失败 - form_id={}, actor={}, reason={}",
-                action,
-                request.form_id,
-                request.actor().id,
-                error.message
-            );
-            error.into_verify_response(&action)
-        }
-    };
+    let (result, outcome_passed, outcome_block_code, outcome_reason) =
+        match validate_workflow_for_verify(&request, kind).await {
+            Ok(precheck) => {
+                let response = (
+                    StatusCode::OK,
+                    Json(VerifyWorkflowResponse {
+                        code: 200,
+                        message: "ok".to_string(),
+                        data: Some(build_verify_pass_data(
+                            &action,
+                            kind,
+                            &precheck,
+                            "验证通过，可继续流转",
+                        )),
+                        error_code: None,
+                        annotation_check: None,
+                    }),
+                );
+                (response, true, None::<String>, "ok".to_string())
+            }
+            Err(error) => {
+                let block_code = error
+                    .verify_block_code
+                    .clone()
+                    .or_else(|| error.error_code.clone());
+                let reason = error.message.clone();
+                warn!(
+                    "[WORKFLOW_VERIFY] {} 校验失败 - form_id={}, actor={}, block_code={}, reason={}",
+                    action,
+                    request.form_id,
+                    request.actor().id,
+                    block_code.as_deref().unwrap_or("-"),
+                    reason
+                );
+                let response = error.into_verify_response(&action);
+                (response, false, block_code, reason)
+            }
+        };
 
     info!(
-        "[WORKFLOW_VERIFY] 完成 - form_id={}, action={}, elapsed_ms={}",
+        "[WORKFLOW_VERIFY] 完成 - form_id={}, action={}, passed={}, block_code={}, reason={}, elapsed_ms={}",
         request.form_id,
         action,
+        outcome_passed,
+        outcome_block_code.as_deref().unwrap_or("-"),
+        outcome_reason,
         request_start_time.elapsed().as_millis()
     );
 
@@ -1268,7 +1282,10 @@ async fn validate_workflow_active(
         &current_node,
         &request.actor().id,
         Some(next_step.target_node.clone()),
-        Some(next_step.target_node.clone()),
+        // active 的「期望下一节点」由契约固定为 jd（active 路径前面已校验
+        // next_step.target_node == "jd"），与请求体值无关；区别于 agree 由
+        // current_node 推算，return 由调用方指定。
+        Some("jd".to_string()),
         workflow_next_step_diagnostic(request.next_step.as_ref()),
     )?;
 

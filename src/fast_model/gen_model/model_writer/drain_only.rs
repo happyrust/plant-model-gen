@@ -168,7 +168,6 @@ impl ModelWriterBackend for DrainOnlyModelWriterBackend {
         Ok(WriteBaseReport {
             batch_id: batch.batch_id,
             missing_neg_count: 0,
-            missing_neg_carriers: Vec::new(),
         })
     }
 

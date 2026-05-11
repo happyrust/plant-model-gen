@@ -20,6 +20,8 @@
 
 use async_trait::async_trait;
 
+use aios_core::RefnoEnum;
+
 use super::{
     BaseInstanceBatch, BooleanBridgeReport, BooleanBridgeRequest, CleanupRequest, FinalizeRequest,
     FinalizeSummary, InstRelateAabbBatch, MeshResultBatch, ModelWriterBackend, ModelWriterContext,
@@ -271,6 +273,41 @@ impl ModelWriterBackend for CompareModelWriterBackend {
             })?;
         self.log("inst_relate_aabb", "batch_done", &batch_id.to_string());
         Ok(())
+    }
+
+    async fn take_missing_neg_carriers(&self) -> anyhow::Result<Vec<RefnoEnum>> {
+        // primary 为准（与所有其他报告字段保持一致）。candidate 也 drain 一次以
+        // 保证后续生命周期对称；差异落到 diff log（candidate 通常为空/近似）。
+        let primary = self
+            .primary
+            .take_missing_neg_carriers()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "compare primary({}) take_missing_neg_carriers failed: {}",
+                    self.primary.name(),
+                    e
+                )
+            })?;
+        let candidate = self
+            .candidate
+            .take_missing_neg_carriers()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "compare candidate({}) take_missing_neg_carriers failed: {}",
+                    self.candidate.name(),
+                    e
+                )
+            })?;
+        if primary.len() != candidate.len() {
+            self.log(
+                "take_missing_neg_diff",
+                "len",
+                &format!("primary={} candidate={}", primary.len(), candidate.len()),
+            );
+        }
+        Ok(primary)
     }
 
     async fn reconcile_missing_neg(&self, request: ReconcileRequest<'_>) -> anyhow::Result<usize> {

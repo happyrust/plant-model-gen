@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
+use aios_core::RefnoEnum;
 use aios_core::error::init_save_database_error;
 use aios_core::model_primary_db;
 use anyhow::Context;
@@ -23,6 +24,9 @@ use crate::options::BooleanPipelineMode;
 #[derive(Debug, Default)]
 pub struct SurrealModelWriterBackend {
     context: OnceLock<ModelWriterContext>,
+    /// v3 Phase F.1: 累积每 batch 收集到的 missing_neg_carriers，
+    /// orchestrator 通过 `take_missing_neg_carriers` 一次性 drain。
+    missing_neg_carriers: Mutex<Vec<RefnoEnum>>,
 }
 
 #[async_trait]
@@ -90,6 +94,13 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
         .await
         .with_context(|| format!("model_writer surreal base batch {} failed", batch.batch_id))?;
         let missing_neg_count = report.missing_neg_carriers.len();
+        if !report.missing_neg_carriers.is_empty() {
+            let mut guard = self
+                .missing_neg_carriers
+                .lock()
+                .expect("missing_neg_carriers mutex poisoned");
+            guard.extend(report.missing_neg_carriers.iter().copied());
+        }
         println!(
             "[model-writer:surreal] stage=base batch={} done missing_neg_candidates={}",
             batch.batch_id, missing_neg_count
@@ -97,8 +108,16 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
         Ok(WriteBaseReport {
             batch_id: batch.batch_id,
             missing_neg_count,
-            missing_neg_carriers: report.missing_neg_carriers,
         })
+    }
+
+    async fn take_missing_neg_carriers(&self) -> anyhow::Result<Vec<RefnoEnum>> {
+        let mut guard = self
+            .missing_neg_carriers
+            .lock()
+            .expect("missing_neg_carriers mutex poisoned");
+        let drained = std::mem::take(&mut *guard);
+        Ok(drained)
     }
 
     async fn persist_mesh_results(&self, batch: MeshResultBatch<'_>) -> anyhow::Result<()> {

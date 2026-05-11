@@ -65,17 +65,27 @@ impl ModelWriterBackend for RecordingBackend {
             batch.replace_exist,
             batch.write_inst_relate_aabb
         ));
-        let missing_neg_carriers = self
+        // v3 Phase F.1: injected carriers are no longer returned per-batch.
+        // The verify binary now drains them via `take_missing_neg_carriers`.
+        let missing_neg_count = self
             .injected_missing_neg
             .lock()
             .expect("recording lock")
-            .clone();
-        let missing_neg_count = missing_neg_carriers.len();
+            .len();
         Ok(WriteBaseReport {
             batch_id: batch.batch_id,
             missing_neg_count,
-            missing_neg_carriers,
         })
+    }
+
+    async fn take_missing_neg_carriers(&self) -> anyhow::Result<Vec<RefnoEnum>> {
+        self.record("take_missing_neg_carriers");
+        let mut guard = self
+            .injected_missing_neg
+            .lock()
+            .expect("recording lock");
+        let drained = std::mem::take(&mut *guard);
+        Ok(drained)
     }
 
     async fn persist_mesh_results(&self, batch: MeshResultBatch<'_>) -> anyhow::Result<()> {

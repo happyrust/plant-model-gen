@@ -95,14 +95,39 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if base_report.missing_neg_count != injected_carriers.len()
-        || base_report.missing_neg_carriers.len() != injected_carriers.len()
-    {
+    if base_report.missing_neg_count != injected_carriers.len() {
         eprintln!(
-            "[verify] FAIL: injected missing_neg not honored: count={} carriers={} expected={}",
+            "[verify] FAIL: injected missing_neg count not honored: got={} expected={}",
             base_report.missing_neg_count,
-            base_report.missing_neg_carriers.len(),
             injected_carriers.len()
+        );
+        return ExitCode::from(4);
+    }
+    // v3 Phase F.1: drain via the new trait method instead of pulling from WriteBaseReport.
+    let drained_carriers = match backend.take_missing_neg_carriers().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[verify] FAIL: take_missing_neg_carriers: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+    if drained_carriers.len() != injected_carriers.len() {
+        eprintln!(
+            "[verify] FAIL: take_missing_neg_carriers drained {} entries, expected {}",
+            drained_carriers.len(),
+            injected_carriers.len()
+        );
+        return ExitCode::from(4);
+    }
+    // 第二次调用必须返回空（drain 幂等）
+    let drained_again = backend
+        .take_missing_neg_carriers()
+        .await
+        .expect("second take");
+    if !drained_again.is_empty() {
+        eprintln!(
+            "[verify] FAIL: take_missing_neg_carriers not idempotent: second drain returned {} entries",
+            drained_again.len()
         );
         return ExitCode::from(4);
     }
@@ -178,6 +203,8 @@ async fn main() -> ExitCode {
         "init:", // second init recorded — mock 应记录两次
         "cleanup:",
         "write_base_batch:",
+        "take_missing_neg_carriers", // v3 Phase F.1: 两次 drain（第一次拿到注入值，第二次返回空）
+        "take_missing_neg_carriers",
         "persist_mesh_results:",
         "write_inst_relate_aabb:",
         "reconcile_missing_neg:",
@@ -212,6 +239,7 @@ async fn main() -> ExitCode {
         "init",
         "cleanup",
         "write_base_batch",
+        "take_missing_neg_carriers",
         "persist_mesh_results",
         "write_inst_relate_aabb",
         "reconcile_missing_neg",
@@ -484,6 +512,10 @@ async fn main() -> ExitCode {
         eprintln!("[verify] FAIL: compare write_inst_relate_aabb: {}", e);
         return ExitCode::from(7);
     }
+    if let Err(e) = compare_wrapper.take_missing_neg_carriers().await {
+        eprintln!("[verify] FAIL: compare take_missing_neg_carriers: {}", e);
+        return ExitCode::from(7);
+    }
     if let Err(e) = compare_wrapper
         .reconcile_missing_neg(ReconcileRequest {
             all_refnos: &[],
@@ -543,6 +575,8 @@ async fn main() -> ExitCode {
         "reconcile_missing_neg",
         "run_boolean_bridge",
         "finalize",
+        // compare wrapper 也 fan-out take_missing_neg_carriers
+        "take_missing_neg_carriers",
     ];
     for method in &required_compare_methods {
         if !compare_primary_methods.iter().any(|m| m == method) {

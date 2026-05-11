@@ -255,9 +255,10 @@
 | B | B.2 接入 create_model_writer 工厂 | complete | 2026-05-12 | commit `0d91b496`，ModelWriterMode::Parquet + DbOptionExt 字段 + validate 守卫 + CLI flags `--parquet-output-root` / `--parquet-dbnum` |
 | B | B.3 Verify binary 加 Parquet 路径 | complete | 2026-05-12 | commit `a8ce553f`，exit code 6 = parquet path fail；13 canonical raw 表 + summary JSON 全部落盘断言 |
 | B | B.4 B 阶段 PR | complete | 2026-05-12 | PR #14: https://github.com/happyrust/plant-model-gen/pull/14；`cargo check --features review` + `verify_model_writer_trait` 均 PASS |
-| C | C.1 BackendSelection 枚举 + DbOption | pending | — | — |
-| C | C.2 Orchestrator compare 路径 | pending | — | — |
-| C | C.3 C 阶段 PR | pending | — | — |
+| C | C.1 CompareModelWriterBackend wrapper | complete | 2026-05-12 | commit `2401268b`，trait 装饰器模式（zero-touch orchestrator），fail-fast；primary/candidate diff log policy；compare.rs +390 |
+| C | C.2 Factory + DbOption + CLI 接入 | complete | 2026-05-12 | commit `fb79afa8`，`model_writer_compare_with: Option<ModelWriterMode>`，validate 2c 守卫（拒 self-compare / drain-only / missing output_root），`--model-writer-compare-with` CLI |
+| C | C.3 Verify binary compare 路径 | complete | 2026-05-12 | commit `3300ed7d`，exit code 7 = compare wrapper fail；primary (mock) snapshot 校验 + candidate (parquet) 13 表落盘断言 |
+| C | C 阶段 PR | complete | 2026-05-12 | PR #15: https://github.com/happyrust/plant-model-gen/pull/15 （base = Phase B 分支，stack PR） |
 | D | D.1 DuckLakeModelWriterBackend 骨架 | pending | — | feature `ducklake` 守门 |
 | D | D.2 D 阶段 PR | pending | — | — |
 | E | E.1 validate-model-writer CLI umbrella | pending | — | — |

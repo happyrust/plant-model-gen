@@ -351,6 +351,8 @@ fn fill_actor_from_claims(
     request: &mut SyncWorkflowRequest,
     claims: Option<TokenClaims>,
 ) -> Result<(), (StatusCode, String)> {
+    request.workflow_mode = claims.as_ref().and_then(|claims| claims.workflow_mode.clone());
+
     if let Some(actor) = request.actor.as_mut() {
         if actor.name.trim().is_empty() {
             actor.name = actor.id.trim().to_string();
@@ -380,6 +382,10 @@ fn fill_actor_from_claims(
         roles: role,
     });
     Ok(())
+}
+
+fn is_external_workflow(request: &SyncWorkflowRequest) -> bool {
+    !matches!(request.workflow_mode.as_deref(), Some("manual" | "internal"))
 }
 
 /// `POST /api/review/workflow/verify`
@@ -609,6 +615,7 @@ async fn validate_workflow_for_verify(
         None,
         expected_next_node.clone(),
         None,
+        is_external_workflow(request),
     )?;
 
     let intent = verify_action_intent(kind);
@@ -950,7 +957,31 @@ fn workflow_next_step_diagnostic(
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkflowRecord, dominant_records_task_id, normalize_pms_human_code};
+    use super::{
+        WorkflowRecord, dominant_records_task_id, normalize_pms_human_code,
+        resolve_required_next_step,
+    };
+    use super::super::types::{SyncWorkflowRequest, WorkflowNextStep};
+
+    fn sync_request_with_next_step(
+        assignee_id: &str,
+        workflow_mode: Option<&str>,
+    ) -> SyncWorkflowRequest {
+        SyncWorkflowRequest {
+            form_id: "FORM-EXTERNAL-FLOW".to_string(),
+            token: "token".to_string(),
+            action: "active".to_string(),
+            actor: None,
+            next_step: Some(WorkflowNextStep {
+                assignee_id: assignee_id.to_string(),
+                name: "外部负责人".to_string(),
+                roles: "jd".to_string(),
+            }),
+            comments: None,
+            metadata: None,
+            workflow_mode: workflow_mode.map(str::to_string),
+        }
+    }
 
     #[test]
     fn normalize_pms_human_code_accepts_real_pms_style_ids() {
@@ -964,6 +995,33 @@ mod tests {
         assert_eq!(normalize_pms_human_code("proofreader_001"), None);
         assert_eq!(normalize_pms_human_code("reviewer_001"), None);
         assert_eq!(normalize_pms_human_code(""), None);
+    }
+
+    #[test]
+    fn external_workflow_next_step_preserves_raw_assignee_id() {
+        let request = sync_request_with_next_step("proofreader_001", Some("external"));
+
+        let next_step =
+            resolve_required_next_step(&request, "active", true).expect("external raw id passes");
+
+        assert_eq!(next_step.assignee_id, "proofreader_001");
+        assert_eq!(next_step.target_node, "jd");
+    }
+
+    #[test]
+    fn missing_workflow_mode_defaults_to_external_semantics() {
+        let request = sync_request_with_next_step("proofreader_001", None);
+
+        assert!(super::is_external_workflow(&request));
+    }
+
+    #[test]
+    fn internal_workflow_next_step_still_rejects_non_human_code() {
+        let request = sync_request_with_next_step("proofreader_001", Some("manual"));
+
+        let error = resolve_required_next_step(&request, "active", false).unwrap_err();
+
+        assert!(error.message.contains("PMS HumanCode"));
     }
 
     fn record_with_task_id(task_id: &str) -> WorkflowRecord {
@@ -1071,6 +1129,7 @@ async fn load_task_for_workflow(form_id: &str) -> Result<ReviewTask, WorkflowSyn
 fn resolve_required_next_step(
     request: &SyncWorkflowRequest,
     action_label: &str,
+    external_workflow: bool,
 ) -> Result<WorkflowValidatedNextStep, WorkflowSyncActionError> {
     let next_step = request.next_step.as_ref().ok_or_else(|| {
         WorkflowSyncActionError::plain(
@@ -1087,16 +1146,20 @@ fn resolve_required_next_step(
         ));
     }
 
-    let assignee_id = normalize_pms_human_code(&next_step.assignee_id).ok_or_else(|| {
-        WorkflowSyncActionError::plain(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "{} 的 next_step.assignee_id 不是合法 PMS HumanCode: {}",
-                action_label,
-                next_step.assignee_id.trim()
-            ),
-        )
-    })?;
+    let assignee_id = if external_workflow {
+        next_step.assignee_id.trim().to_string()
+    } else {
+        normalize_pms_human_code(&next_step.assignee_id).ok_or_else(|| {
+            WorkflowSyncActionError::plain(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{} 的 next_step.assignee_id 不是合法 PMS HumanCode: {}",
+                    action_label,
+                    next_step.assignee_id.trim()
+                ),
+            )
+        })?
+    };
     if assignee_id.is_empty() {
         return Err(WorkflowSyncActionError::plain(
             StatusCode::BAD_REQUEST,
@@ -1145,7 +1208,12 @@ fn ensure_owner_matches(
     next_step: Option<String>,
     expected_next_node: Option<String>,
     requested_next_step: Option<WorkflowVerifyNextStepDiagnostic>,
+    external_workflow: bool,
 ) -> Result<(), WorkflowSyncActionError> {
+    if external_workflow {
+        return Ok(());
+    }
+
     let (owner_id, owner_source) = current_node_owner(task, current_node);
     if owner_id.is_empty() {
         return Ok(());
@@ -1246,7 +1314,8 @@ async fn validate_workflow_mutation(
 async fn validate_workflow_active(
     request: &SyncWorkflowRequest,
 ) -> Result<WorkflowMutationPrecheck, WorkflowSyncActionError> {
-    let next_step = resolve_required_next_step(request, "active")?;
+    let external_workflow = is_external_workflow(request);
+    let next_step = resolve_required_next_step(request, "active", external_workflow)?;
     if next_step.target_node != "jd" {
         return Err(WorkflowSyncActionError::plain(
             StatusCode::BAD_REQUEST,
@@ -1287,6 +1356,7 @@ async fn validate_workflow_active(
         // current_node 推算，return 由调用方指定。
         Some("jd".to_string()),
         workflow_next_step_diagnostic(request.next_step.as_ref()),
+        external_workflow,
     )?;
 
     let annotation_check = evaluate_annotation_check(
@@ -1323,7 +1393,8 @@ async fn validate_workflow_active(
 async fn validate_workflow_return(
     request: &SyncWorkflowRequest,
 ) -> Result<WorkflowMutationPrecheck, WorkflowSyncActionError> {
-    let next_step = resolve_required_next_step(request, "return")?;
+    let external_workflow = is_external_workflow(request);
+    let next_step = resolve_required_next_step(request, "return", external_workflow)?;
     let task = load_task_for_workflow(&request.form_id).await?;
     let current_node = normalize_workflow_node(&task.current_node);
     ensure_task_not_terminal(&task, &current_node, Some(next_step.target_node.clone()))?;
@@ -1376,6 +1447,7 @@ async fn validate_workflow_return(
         Some(next_step.target_node.clone()),
         Some(next_step.target_node.clone()),
         workflow_next_step_diagnostic(request.next_step.as_ref()),
+        external_workflow,
     )?;
 
     let annotation_check = evaluate_annotation_check(
@@ -1421,6 +1493,7 @@ async fn validate_workflow_return(
 async fn validate_workflow_agree(
     request: &SyncWorkflowRequest,
 ) -> Result<WorkflowMutationPrecheck, WorkflowSyncActionError> {
+    let external_workflow = is_external_workflow(request);
     let task = load_task_for_workflow(&request.form_id).await?;
     let current_node = normalize_workflow_node(&task.current_node);
     let requested_next_step = request
@@ -1456,12 +1529,13 @@ async fn validate_workflow_agree(
         requested_next_step.clone(),
         expected_agree_next_node(&current_node).map(str::to_string),
         workflow_next_step_diagnostic(request.next_step.as_ref()),
+        external_workflow,
     )?;
 
     let next_step = if current_node == "pz" {
         None
     } else {
-        let next_step = resolve_required_next_step(request, "agree")?;
+        let next_step = resolve_required_next_step(request, "agree", external_workflow)?;
         let expected_node = expected_agree_next_node(&current_node).unwrap_or_default();
         if next_step.target_node != expected_node {
             return Err(WorkflowSyncActionError::plain(
@@ -1518,6 +1592,7 @@ async fn validate_workflow_agree(
 async fn validate_workflow_stop(
     request: &SyncWorkflowRequest,
 ) -> Result<WorkflowMutationPrecheck, WorkflowSyncActionError> {
+    let external_workflow = is_external_workflow(request);
     let task = load_task_for_workflow(&request.form_id).await?;
     let current_node = normalize_workflow_node(&task.current_node);
     ensure_task_not_terminal(&task, &current_node, None)?;
@@ -1548,6 +1623,7 @@ async fn validate_workflow_stop(
         None,
         None,
         None,
+        external_workflow,
     )?;
 
     Ok(WorkflowMutationPrecheck {

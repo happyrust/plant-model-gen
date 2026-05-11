@@ -11,7 +11,6 @@ use crate::fast_model::export_model::export_prepack_lod::export_instances_json_f
 use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_refnos_grouped_by_dbno;
 use crate::fast_model::export_model::export_prepack_lod::export_prepack_lod_for_refnos;
 use crate::fast_model::unit_converter::LengthUnit;
-use crate::fast_model::utils::{save_aabb_to_surreal, save_pts_to_surreal};
 use aios_core::RefnoEnum;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -20,18 +19,12 @@ use std::time::Instant;
 // use crate::fast_model::capture::capture_refnos_if_enabled; // removed on foyer-cache-cleanup
 use crate::data_interface::db_meta_manager::db_meta;
 use crate::fast_model::gen_model::boolean_task::{BooleanTask, BooleanTaskAccumulator};
-use crate::fast_model::gen_model::manifold_bool::run_bool_worker_from_tasks;
-use crate::fast_model::gen_model::mesh_state::{flush_aabb_cache, use_file_mesh_state};
 use crate::fast_model::gen_model::model_writer::{
-    ModelWriter, ModelWriterFinishReport, create_model_writer, run_model_writer_sink,
+    BooleanBridgeRequest, ModelWriterBackend, ModelWriterFinishReport, create_model_writer,
+    run_model_writer_sink,
 };
-use crate::fast_model::mesh_generate::{
-    MeshResult, query_existing_meshed_inst_geo_ids, run_boolean_worker,
-};
-use crate::fast_model::pdms_inst::{
-    build_inst_relate_aabb_rows, reconcile_missing_neg_relate, save_inst_relate_aabb_rows,
-};
-use crate::options::{BooleanPipelineMode, DbOptionExt, MeshFormat, ModelWriterMode};
+use crate::fast_model::mesh_generate::{MeshResult, query_existing_meshed_inst_geo_ids};
+use crate::options::{DbOptionExt, MeshFormat, ModelWriterMode};
 use dashmap::DashMap;
 use flume::{Receiver, Sender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -478,12 +471,26 @@ async fn run_base_writer(
     result_sender: Sender<(u64, u128, u128)>,
     base_write_semaphore: Arc<Semaphore>,
     worker_count: usize,
-    model_writer: Arc<dyn ModelWriter>,
+    model_writer: Arc<dyn ModelWriterBackend>,
 ) -> anyhow::Result<ModelWriterFinishReport> {
     let mut handles = Vec::new();
     let worker_count = worker_count.max(1);
     println!("[batch_stage] stage=base worker_pool={}", worker_count);
-    model_writer.prepare().await?;
+    let cleanup_report = model_writer.cleanup().await?;
+    println!(
+        "[model-writer:{}] stage={} status={:?} skipped_reason={:?}",
+        model_writer.name(),
+        cleanup_report.stage,
+        cleanup_report.status,
+        cleanup_report.skipped_reason
+    );
+    let init_report = model_writer.init().await?;
+    println!(
+        "[model-writer:{}] stage={} status={:?}",
+        model_writer.name(),
+        init_report.stage,
+        init_report.status
+    );
     for worker_id in 0..worker_count {
         let receiver = receiver.clone();
         let semaphore = base_write_semaphore.clone();
@@ -493,7 +500,7 @@ async fn run_base_writer(
             while let Ok(batch) = receiver.recv_async().await {
                 let (permit, wait_ms) = acquire_with_wait(semaphore.clone()).await?;
                 let base_start = Instant::now();
-                let write_report = model_writer.write_batch(&batch.shape_insts).await?;
+                let write_report = model_writer.write_base_batch(&batch.shape_insts).await?;
                 let base_ms = base_start.elapsed().as_millis();
                 drop(permit);
                 println!(
@@ -515,7 +522,7 @@ async fn run_base_writer(
     for handle in handles {
         handle.await.map_err(|e| anyhow::anyhow!(e))??;
     }
-    let finish_report = model_writer.finish().await?;
+    let finish_report = model_writer.finalize().await?;
     drop(result_sender);
     Ok(finish_report)
 }
@@ -631,27 +638,27 @@ async fn process_inst_aabb_batch(
     mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
     mesh_pts_map: Arc<DashMap<u64, String>>,
     completion_sender: Sender<BatchCompletion>,
+    model_writer: Arc<dyn ModelWriterBackend>,
     skip_inst_relate_aabb: bool,
     worker_id: usize,
 ) -> anyhow::Result<()> {
     let (aabb_permit, inst_aabb_wait_ms) = acquire_with_wait(inst_aabb_semaphore).await?;
     let inst_aabb_start = Instant::now();
-    persist_inst_geo_mesh_results(&batch.mesh_results, &mesh_aabb_map, &mesh_pts_map).await?;
-    if skip_inst_relate_aabb {
-        println!(
-            "[batch_stage] batch={} stage=inst_aabb worker={} skipped=inst_relate_aabb env=AIOS_SKIP_INST_RELATE_AABB",
-            batch.batch_id, worker_id
-        );
-    } else {
-        let (aabb_rows_map, inst_relate_aabb_rows, inst_relate_aabb_ids) =
-            build_inst_relate_aabb_rows(&batch.shape_insts, &batch.mesh_results, &mesh_aabb_map)?;
-        save_inst_relate_aabb_rows(
-            &aabb_rows_map,
-            &inst_relate_aabb_rows,
-            &inst_relate_aabb_ids,
+    let mesh_report = model_writer
+        .persist_mesh_results(&batch.mesh_results, &mesh_aabb_map, &mesh_pts_map)
+        .await?;
+    let inst_report = model_writer
+        .persist_inst_relate_aabb(
+            &batch.shape_insts,
+            &batch.mesh_results,
+            &mesh_aabb_map,
+            skip_inst_relate_aabb,
         )
         .await?;
-    }
+    println!(
+        "[batch_stage] batch={} stage=writer_backend worker={} mesh_persist={:?} inst_relate_aabb={:?}",
+        batch.batch_id, worker_id, mesh_report.status, inst_report.status
+    );
     let inst_aabb_ms = inst_aabb_start.elapsed().as_millis();
     drop(aabb_permit);
 
@@ -698,6 +705,7 @@ async fn run_inst_aabb_writer(
     worker_count: usize,
     mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
     mesh_pts_map: Arc<DashMap<u64, String>>,
+    model_writer: Arc<dyn ModelWriterBackend>,
 ) -> anyhow::Result<()> {
     let skip_inst_relate_aabb = std::env::var_os("AIOS_SKIP_INST_RELATE_AABB").is_some();
     let worker_count = worker_count.max(1);
@@ -713,6 +721,7 @@ async fn run_inst_aabb_writer(
         let mesh_aabb_map = mesh_aabb_map.clone();
         let mesh_pts_map = mesh_pts_map.clone();
         let completion_sender = completion_sender.clone();
+        let model_writer = model_writer.clone();
         handles.push(tokio::spawn(async move {
             while let Ok(batch) = joined_receiver.recv_async().await {
                 process_inst_aabb_batch(
@@ -721,6 +730,7 @@ async fn run_inst_aabb_writer(
                     mesh_aabb_map.clone(),
                     mesh_pts_map.clone(),
                     completion_sender.clone(),
+                    model_writer.clone(),
                     skip_inst_relate_aabb,
                     worker_id,
                 )
@@ -790,48 +800,6 @@ async fn run_inst_aabb_writer(
         handle.await.map_err(|e| anyhow::anyhow!(e))??;
     }
     drop(completion_sender);
-    Ok(())
-}
-
-async fn persist_inst_geo_mesh_results(
-    mesh_results: &HashMap<u64, MeshResult>,
-    mesh_aabb_map: &DashMap<String, parry3d::bounding_volume::Aabb>,
-    mesh_pts_map: &DashMap<u64, String>,
-) -> anyhow::Result<()> {
-    if use_file_mesh_state() {
-        flush_aabb_cache();
-        return Ok(());
-    }
-
-    if mesh_results.is_empty() {
-        return Ok(());
-    }
-
-    // 先落 aabb / pts 实体，再把 inst_geo 指向这些记录，避免引用到尚不存在的实体。
-    save_pts_to_surreal(mesh_pts_map).await;
-    save_aabb_to_surreal(mesh_aabb_map).await;
-
-    let mut update_sql = String::new();
-    for (geo_hash, mesh_result) in mesh_results {
-        update_sql.push_str(&mesh_result.to_update_sql(&geo_hash.to_string()));
-    }
-
-    if update_sql.is_empty() {
-        return Ok(());
-    }
-
-    aios_core::model_primary_db()
-        .query(&update_sql)
-        .await
-        .map_err(|e| {
-            let preview: String = update_sql.chars().take(500).collect();
-            anyhow::anyhow!(
-                "回写 inst_geo mesh 结果失败: error={}, sql_preview={}",
-                e,
-                preview
-            )
-        })?;
-
     Ok(())
 }
 
@@ -1130,10 +1098,16 @@ async fn process_index_tree_generation(
             Arc::new(std::sync::Mutex::new(HashSet::new())),
         );
         println!(
-            "[gen_model] ModelWriter={} writes_to_surreal={}",
+            "[gen_model] ModelWriter={} writes_to_surreal={} runs_downstream_pipeline={}",
             drain_writer.name(),
-            drain_writer.writes_to_surreal()
+            drain_writer.writes_to_surreal(),
+            drain_writer.runs_downstream_pipeline()
         );
+        if drain_writer.runs_downstream_pipeline() {
+            return Err(IndexTreeError::Other(anyhow::anyhow!(
+                "drain-only 快速路径要求 backend.runs_downstream_pipeline=false"
+            )));
+        }
         let drain_handle = tokio::spawn(run_model_writer_sink(receiver, drain_writer));
         println!("⏳ [1/2] 几何体生成 (BRAN/HANG + LOOP/CATE/PRIM)...");
         let _categorized = gen_index_tree_geos_optimized(
@@ -1253,13 +1227,14 @@ async fn process_index_tree_generation(
         missing_neg_carriers_for_reconcile.clone(),
     );
     println!(
-        "[gen_model] ModelWriter={} writes_to_surreal={}",
+        "[gen_model] ModelWriter={} writes_to_surreal={} runs_downstream_pipeline={}",
         base_model_writer.name(),
-        base_model_writer.writes_to_surreal()
+        base_model_writer.writes_to_surreal(),
+        base_model_writer.runs_downstream_pipeline()
     );
-    if !base_model_writer.writes_to_surreal() {
+    if !base_model_writer.runs_downstream_pipeline() {
         return Err(IndexTreeError::Other(anyhow::anyhow!(
-            "ModelWriter={} 不支持 SurrealDB 后处理路径；请使用 drain-only 专用路径或实现对应后处理",
+            "ModelWriter={} 不支持完整下游模型后处理路径；请使用 drain-only 专用路径或实现对应后处理",
             base_model_writer.name()
         )));
     }
@@ -1290,7 +1265,7 @@ async fn process_index_tree_generation(
         base_result_sender,
         base_write_semaphore.clone(),
         db_option.get_base_write_concurrency(),
-        base_model_writer,
+        base_model_writer.clone(),
     ));
     let mesh_stage_handle = tokio::spawn(run_mesh_stage(
         mesh_stage_receiver,
@@ -1310,6 +1285,7 @@ async fn process_index_tree_generation(
         db_option.get_inst_aabb_write_concurrency(),
         mesh_aabb_map.clone(),
         mesh_pts_map.clone(),
+        base_model_writer.clone(),
     ));
     println!("⏳ [1/5] 几何体生成 (BRAN/HANG + LOOP/CATE/PRIM)...");
     let categorized = gen_index_tree_geos_optimized(
@@ -1423,8 +1399,19 @@ async fn process_index_tree_generation(
 
         // 3.5️⃣ barrier 后补建跨阶段缺失的 neg_relate（LOOP 阶段发现负实体但 PRIM 阶段才创建 geo_relate）
         if use_surrealdb {
-            if let Err(e) = reconcile_missing_neg_relate(&all_refnos, &missing_neg_carriers).await {
-                eprintln!("[gen_model] reconcile_missing_neg_relate 失败: {}", e);
+            match base_model_writer
+                .reconcile_missing_neg_relations(&all_refnos, &missing_neg_carriers)
+                .await
+            {
+                Ok(report) => {
+                    println!(
+                        "[gen_model] ModelWriter missing_neg_reconcile: status={:?} item_count={} skipped_reason={:?}",
+                        report.status, report.item_count, report.skipped_reason
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[gen_model] missing_neg_reconcile 失败: {}", e);
+                }
             }
         }
 
@@ -1445,85 +1432,29 @@ async fn process_index_tree_generation(
                 insert_report.batch_cnt
             );
 
-            // model_cache boolean worker 已移除（foyer-cache-cleanup）
-            match db_option.boolean_pipeline_mode {
-                BooleanPipelineMode::DbLegacy => {
-                    if use_surrealdb && !defer_db_write {
-                        if let Err(e) =
-                            run_boolean_worker(Arc::new(db_option.inner.clone()), 100).await
-                        {
-                            eprintln!("[gen_model] IndexTree 布尔运算失败（db_legacy）: {}", e);
-                        }
-                    } else {
-                        println!(
-                            "[gen_model] boolean_pipeline_mode=db_legacy，当前模式不满足执行条件（use_surrealdb={} defer_db_write={}）",
-                            use_surrealdb, defer_db_write
-                        );
-                    }
+            match base_model_writer
+                .run_boolean_bridge(BooleanBridgeRequest {
+                    mode: db_option.boolean_pipeline_mode.clone(),
+                    db_option: Arc::new(db_option.inner.clone()),
+                    use_surrealdb,
+                    defer_db_write,
+                    enable_db_backfill: db_option.enable_db_backfill,
+                    bool_tasks: std::mem::take(&mut bool_tasks),
+                })
+                .await
+            {
+                Ok(report) => {
+                    println!(
+                        "[gen_model] ModelWriter boolean_bridge 完成: total={} success={} failed={} skipped={} skipped_reason={:?}",
+                        report.total,
+                        report.success,
+                        report.failed,
+                        report.skipped,
+                        report.skipped_reason
+                    );
                 }
-                BooleanPipelineMode::MemoryTasks => {
-                    // 模式组合合法性守卫：MemoryTasks 至少需要一种写入通道
-                    if !use_surrealdb {
-                        eprintln!(
-                            "[gen_model] boolean_pipeline_mode=memory_tasks 非法：use_surrealdb=false，无写入通道，跳过布尔"
-                        );
-                    } else if bool_tasks.is_empty() {
-                        println!(
-                            "[gen_model] boolean_pipeline_mode=memory_tasks，但没有可执行布尔任务"
-                        );
-                    } else {
-                        // T7: DB backfill — 补齐内存中缺失的 cata 任务
-                        if db_option.enable_db_backfill {
-                            match super::boolean_backfill::backfill_cata_tasks_from_db(
-                                &mut bool_tasks,
-                                use_surrealdb,
-                            )
-                            .await
-                            {
-                                Ok(count) if count > 0 => {
-                                    println!(
-                                        "[gen_model] DB backfill 补齐了 {} 个 cata 布尔任务，当前总数 {}",
-                                        count,
-                                        bool_tasks.len()
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "[gen_model] DB backfill 失败（非致命，继续执行）: {}",
-                                        e
-                                    );
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        match run_bool_worker_from_tasks(
-                            std::mem::take(&mut bool_tasks),
-                            Arc::new(db_option.inner.clone()),
-                            None,
-                        )
-                        .await
-                        {
-                            Ok(report) => {
-                                println!(
-                                    "[gen_model] memory bool worker 完成: total={} cata={} inst={} success={} failed={} skipped={} defer={}",
-                                    report.total,
-                                    report.cata_cnt,
-                                    report.inst_cnt,
-                                    report.success,
-                                    report.failed,
-                                    report.skipped,
-                                    report.deferred_mode
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "[gen_model] IndexTree 布尔运算失败（memory_tasks）: {}",
-                                    e
-                                );
-                            }
-                        }
-                    }
+                Err(e) => {
+                    eprintln!("[gen_model] IndexTree 布尔运算失败: {}", e);
                 }
             }
 

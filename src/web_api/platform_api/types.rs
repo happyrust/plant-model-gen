@@ -189,9 +189,8 @@ pub struct SyncWorkflowRequest {
     /// 下一节点信息。**仅 sync 路径消费**；verify 路径会静默忽略。
     ///
     /// sync 路径：`active` / `agree(非 pz)` / `return` 必填；`stop` 与
-    /// `agree(pz)` 可省。结构必须包含合法 PMS HumanCode 形式的 `assignee_id`，
-    /// 因为 sync 的 apply 阶段要把 assignee 写进 `review_tasks.checker_id` /
-    /// `approver_id` 等字段。
+    /// `agree(pz)` 可省。internal/manual 模式下 `assignee_id` 按 PMS HumanCode 校验；
+    /// external 模式下它是外部流程身份，平台原样保存。
     pub next_step: Option<WorkflowNextStep>,
     /// 流程动作意见。仅 sync 消费，写入 `review_workflow_history.comment`，
     /// 不在响应回传。
@@ -199,6 +198,9 @@ pub struct SyncWorkflowRequest {
     /// 透传给 PMS 的扩展数据。当前未被任何代码读取，保留兼容；
     /// 如需扩展请明确字段名而不是塞进 metadata。
     pub metadata: Option<serde_json::Value>,
+    /// 从 JWT claims 注入，不从请求体读取。external 模式下平台只透传外部流程身份。
+    #[serde(skip)]
+    pub(crate) workflow_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -43,6 +43,7 @@ pub mod instance_export;
 pub mod layout;
 pub mod litefs_handlers;
 pub mod model_runtime;
+pub mod model_writer_verify;
 pub mod mqtt_monitor_handlers;
 pub mod output_instances_files;
 #[cfg(feature = "parquet-export")]
@@ -491,6 +492,10 @@ pub async fn start_web_server_with_config(
         .route(
             "/api/model/stream-generate-by-root/{refno}",
             get(stream_generate::api_stream_generate_by_root),
+        )
+        .route(
+            "/api/model/writer-verify",
+            post(model_writer_verify::api_model_writer_verify),
         )
         // 实时查库返回实例数据（用于 parquet miss 回填）
         .route(

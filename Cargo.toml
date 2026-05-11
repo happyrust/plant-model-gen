@@ -14,6 +14,11 @@ path = "src/bin/web_server.rs"
 required-features = ["web_server"]
 
 [[bin]]
+name = "verify_model_writer_trait"
+path = "src/bin/verify_model_writer_trait.rs"
+required-features = ["model-writer-mock"]
+
+[[bin]]
 name = "aios-database"
 path = "src/main.rs"
 # `cargo test` 默认会为 bin 也构建 `--test` harness；该工程 bin 依赖重且在 Windows 下易引发链接/内存异常。
@@ -248,7 +253,8 @@ manifold = ["aios_core/manifold"]
 # debug_parse = ["pdms_io/debug_parse"]  # 暂时禁用以避免冲突
 surreal-save = []
 write-to-surrealdb = []
-model-writer-drain = []
+# Mock backend：仅供 trait 契约验证 binary 使用，不进 release。
+model-writer-mock = []
 test = ["aios_core/test"]
 mem-kv-save = ["aios_core/mem-kv-save"] #额外保存PE数据到内存KV数据库
 kv-rocksdb = [

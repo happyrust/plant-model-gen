@@ -15,6 +15,10 @@ use aios_database::fast_model::export_model::export_obj::export_obj_for_refnos;
 use aios_database::fast_model::export_model::export_room_instances::{
     RoomComputeValidationCase, RoomComputeValidationFixture,
 };
+use aios_database::fast_model::gen_model::model_writer::{
+    CanonicalParquetTableSummary, CanonicalParquetWriter, CanonicalParquetWriterConfig,
+    CanonicalRawPlanner,
+};
 use aios_database::options::DbOptionExt;
 use aios_database::perf_timer::{PerfReport, PerfTimer};
 use parry3d::bounding_volume::BoundingVolume;
@@ -264,6 +268,57 @@ impl ExportConfig {
         println!("   - 全库导出: {}", self.run_all_dbnos);
         println!("   - 按 SITE 拆分: {}", self.split_by_site);
     }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CanonicalParquetValidationReport {
+    pub backend: &'static str,
+    pub format: &'static str,
+    pub limitation: &'static str,
+    pub status: &'static str,
+    pub summary_path: String,
+    pub raw_root: String,
+    pub project_name: String,
+    pub dbnum: u32,
+    pub batch_id: u64,
+    pub total_rows: usize,
+    pub tables: Vec<CanonicalParquetTableSummary>,
+}
+
+/// Non-production CLI validation entry for the canonical raw planner plus the
+/// canonical Parquet(JSONL fallback) writer scaffold.
+///
+/// This intentionally builds an empty `ShapeInstancesData` fixture and never
+/// enters the default `gen_model`/SurrealDB writer path.
+pub fn validate_canonical_parquet_writer_mode(
+    output_dir: &Path,
+    project_name: &str,
+    dbnum: u32,
+    batch_id: u64,
+) -> Result<CanonicalParquetValidationReport> {
+    let shape_insts = aios_core::geometry::ShapeInstancesData::default();
+    let planner = CanonicalRawPlanner;
+    let batch = planner.plan_shape_instances(&shape_insts);
+    let writer = CanonicalParquetWriter::new(CanonicalParquetWriterConfig {
+        output_dir: output_dir.to_path_buf(),
+        project_name: project_name.to_string(),
+        dbnum,
+    });
+    let summary = writer.write_raw_batch(batch_id, &batch)?;
+
+    Ok(CanonicalParquetValidationReport {
+        backend: summary.backend,
+        format: summary.format,
+        limitation: summary.limitation,
+        status: "ok",
+        summary_path: summary.summary_path,
+        raw_root: summary.raw_root,
+        project_name: summary.project_name,
+        dbnum: summary.dbnum,
+        batch_id: summary.batch_id,
+        total_rows: summary.total_rows,
+        tables: summary.tables,
+    })
 }
 
 fn parse_length_unit(unit: &str) -> LengthUnit {
@@ -1680,18 +1735,27 @@ pub async fn run_regen_model(
     }
     let target_refnos = collect_regen_target_refnos(config).await?;
 
-    if db_option_override.model_writer_mode.writes_to_surreal() {
-        // 先清理 legacy 模型关系（含 inst_relate / geo_relate / tubi_relate），
-        // 再清理 refno_relations 扁平表，避免 regen 后导出仍读到历史 tubi 脏数据。
-        aios_database::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen(&target_refnos)
-            .await?;
-        aios_database::fast_model::gen_model::pdms_inst_surreal::pre_cleanup_for_regen_surreal(
-            &target_refnos,
+    // 统一走 trait：DrainOnly backend 的 cleanup 是 NoOp，确保压测模式不会误删数据；
+    // Surreal backend 内部仍按既有顺序清理 legacy 模型关系 + refno_relations 扁平表。
+    //
+    // Lifecycle 契约：init → cleanup → ... → finalize。
+    // SurrealDB 侧 `init_model_tables` 走 DEFINE TABLE 语义，幂等可重复调；保留 init
+    // 是为了让未来需要 init 副作用的 backend（Parquet/DuckLake/...）不会被静默绕过。
+    let model_writer = aios_database::fast_model::gen_model::model_writer::create_model_writer(
+        &db_option_override,
+    )?;
+    let writer_context =
+        aios_database::fast_model::gen_model::model_writer::ModelWriterContext::from_db_option(
+            &db_option_override,
+        );
+    model_writer.init(&writer_context).await?;
+    model_writer
+        .cleanup(
+            aios_database::fast_model::gen_model::model_writer::CleanupRequest {
+                seed_refnos: &target_refnos,
+            },
         )
         .await?;
-    } else {
-        println!("   - drain-only 压测模式：跳过 regen cleanup，避免删除现有 SurrealDB 模型数据");
-    }
 
     // 4.1 从目标 refnos 推导 dbnum，覆盖配置文件中的 manual_db_nums
     if !target_refnos.is_empty() {

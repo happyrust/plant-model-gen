@@ -202,7 +202,7 @@ hot path 上每个 batch 都过 `Pin<Box<dyn Future>>`，nightly 已支持原生
 
 #### N4. `name()` 仅在 `finalize` 用一次
 
-可改为 `const NAME: &'static str`，让实现自存常量。**对应 Task**：T5.2。
+可改为 `const NAME: &'static str`，让实现自存常量。**对应 Task**：~~T5.2~~（**Skipped 2026-05-11**：trait 通过 `Arc<dyn ModelWriterBackend>` 走 vtable 调用，关联 const 不进 vtable，调不到。method 形式必须保留；保留 fn 形式 + const 双轨纯粹冗余。）
 
 #### N5. SQL 拼接缺显式 sanitize 层
 
@@ -227,8 +227,11 @@ let report = pdms_inst::save_instance_data_with_report(..., &mesh_results, ...).
 |---|---|---|
 | `RecordingBackend` 是否进 release 编译？ | (a) `#[cfg(test)]`<br>(b) feature flag `model-writer-mock` | **b**：方便用 binary 验证而不需 cargo test |
 | trait 命名最终值 | (a) `ModelWriterBackend`<br>(b) `ModelWriter`<br>(c) 保持 `ModelWriteBackend` | **a**：与 `ModelWriterMode` 对齐 |
-| DrainOnly 是否完全删除独立的 `run_drain_only_sink`？ | (a) 删，逻辑搬进 backend<br>(b) 保留，作为 backend 内部子流程 | **a**：彻底统一 |
+| DrainOnly 是否完全删除独立的 `run_drain_only_sink`？ | (a) 删，逻辑搬进 backend<br>(b) 保留，作为 backend 内部子流程 | **~~a~~ b**（2026-05-11 修订，详见下条 DrainOnly baseline 用途） |
 | `BooleanBridgeRequest::db_option` 是否也精简掉？ | (a) 保留，因为 boolean worker 真要用 DbOption<br>(b) 改为 trait method 注入更小的 BridgeContext | T3.2 配套讨论，倾向 **a**（短期保留） |
+| DrainOnly 快速路径去留？（2026-05-11 二期审核新增） | (a) 删快速路径让主管线统一跑<br>(b) 保留快速路径 + 锁死 trait 中间方法不被路由 | **b**（2026-05-11 用户拍板）：DrainOnly 的用途是「跳过所有持久化、仅跑生产端与调度，作为 baseline 对比不同 backend 的 IO 写入耗时」。删快速路径会让 baseline 包含 mesh/aabb 调度开销，失去对比意义。代码侧通过 module doc + 函数体 invariant 注释锁定语义 |
+| `WriteBaseReport.missing_neg_carriers` 是否拆为独立 trait 方法？（2026-05-11 二期审核新增） | (a) 现状保留 + 仅删 `#[non_exhaustive]` 噪声<br>(b) 拆 `take_missing_neg_carriers()` trait method | **a** 短期（本 PR 范围），**b** 移到 Phase 5 backlog（侵入面大于本 PR 收益） |
+| `parquet.rs` 是否进 trait 工厂？（2026-05-11 二期审核新增） | (a) 现状文件 sink，不实现 trait<br>(b) 实现 trait + 加入 `create_model_writer` 工厂 | **a** 短期：与 docs/development/model-writer-storage Phase 1 共识一致，本轮只加位置说明，**b** 留 Phase 5 |
 
 ## 4. 新增发现（开干后追加）
 

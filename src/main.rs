@@ -771,6 +771,45 @@ async fn main() -> anyhow::Result<()> {
                 .num_args(1..),
         )
         .subcommand(
+            Command::new("model-writer")
+                .about("Model writer storage validation utilities")
+                .subcommand(
+                    Command::new("validate-canonical-parquet")
+                        .about("Validate CanonicalRawPlanner + CanonicalParquetWriter with an empty ShapeInstancesData fixture")
+                        .arg(
+                            Arg::new("output")
+                                .long("output")
+                                .short('o')
+                                .help("Output directory for JSONL table files and batch summary")
+                                .required(true)
+                                .value_name("DIR"),
+                        )
+                        .arg(
+                            Arg::new("project-name")
+                                .long("project-name")
+                                .help("Project name partition to write")
+                                .default_value("canonical-validation")
+                                .value_name("NAME"),
+                        )
+                        .arg(
+                            Arg::new("dbnum")
+                                .long("dbnum")
+                                .help("Dbnum partition to write")
+                                .default_value("0")
+                                .value_parser(clap::value_parser!(u32))
+                                .value_name("DBNUM"),
+                        )
+                        .arg(
+                            Arg::new("batch-id")
+                                .long("batch-id")
+                                .help("Batch id to write")
+                                .default_value("1")
+                                .value_parser(clap::value_parser!(u64))
+                                .value_name("ID"),
+                        ),
+                ),
+        )
+        .subcommand(
             Command::new("spatial")
                 .about("SQLite 空间范围查询与回归验证")
                 .subcommand(
@@ -975,6 +1014,31 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if let Some(("model-writer", model_writer_matches)) = matches.subcommand() {
+        if let Some(("validate-canonical-parquet", sub_matches)) = model_writer_matches.subcommand()
+        {
+            let output_dir = sub_matches
+                .get_one::<String>("output")
+                .map(PathBuf::from)
+                .expect("required by clap");
+            let project_name = sub_matches
+                .get_one::<String>("project-name")
+                .map(String::as_str)
+                .unwrap_or("canonical-validation");
+            let dbnum = sub_matches.get_one::<u32>("dbnum").copied().unwrap_or(0);
+            let batch_id = sub_matches.get_one::<u64>("batch-id").copied().unwrap_or(1);
+
+            let report = cli_modes::validate_canonical_parquet_writer_mode(
+                &output_dir,
+                project_name,
+                dbnum,
+                batch_id,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
+    }
+
     // 获取配置文件路径
     let config_path = matches
         .get_one::<String>("config")
@@ -1129,8 +1193,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     if let Some(backends) = matches.get_one::<String>("transform-compare-backends") {
-        db_option_ext.transform_compare_backends =
-            parse_transform_compare_backends(Some(backends));
+        db_option_ext.transform_compare_backends = parse_transform_compare_backends(Some(backends));
         let labels = db_option_ext
             .transform_compare_backends
             .iter()
@@ -2602,20 +2665,18 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let count =
-                aios_database::pe_transform_refresh::refresh_pe_transform_for_dbnums(
-                    &dbnums,
-                    &db_option_ext,
-                )
-                .await?;
+            let count = aios_database::pe_transform_refresh::refresh_pe_transform_for_dbnums(
+                &dbnums,
+                &db_option_ext,
+            )
+            .await?;
             println!("✅ pe_transform 刷新完成，共处理 {} 个节点", count);
             if !db_option_ext.transform_compare_backends.is_empty() {
-                let stats =
-                    aios_database::pe_transform_store::compare_backends_for_dbnums(
-                        &db_option_ext,
-                        &dbnums,
-                    )
-                    .await?;
+                let stats = aios_database::pe_transform_store::compare_backends_for_dbnums(
+                    &db_option_ext,
+                    &dbnums,
+                )
+                .await?;
                 println!("📊 pe_transform backend 对比结果:");
                 for stat in stats {
                     println!(

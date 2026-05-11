@@ -582,19 +582,31 @@ impl DbOptionExt {
     }
 
     pub fn validate_model_writer_features(&self) -> anyhow::Result<()> {
+        // 1) feature flag 守卫：编译期 feature 集不匹配 → 拒绝
         match self.model_writer_mode {
-            ModelWriterMode::Surreal if !cfg!(feature = "write-to-surrealdb") => {
+            ModelWriterMode::Surreal
+                if !cfg!(any(
+                    feature = "write-to-surrealdb",
+                    feature = "surreal-save"
+                )) =>
+            {
                 anyhow::bail!(
-                    "model_writer=surreal 需要编译 feature `write-to-surrealdb`；请使用 --features \"review\" 或显式加入 write-to-surrealdb"
+                    "model_writer=surreal 需要编译 feature `surreal-save` 或 `write-to-surrealdb`；请使用 mission cargo check feature 集或 --features \"review\""
                 )
             }
-            ModelWriterMode::DrainOnly if !cfg!(feature = "model-writer-drain") => {
-                anyhow::bail!(
-                    "model_writer=drain-only 需要编译 feature `model-writer-drain`；例如 --features \"review,model-writer-drain\""
-                )
-            }
-            _ => Ok(()),
+            // drain-only is a non-persistent throughput sink and does not need a storage feature.
+            ModelWriterMode::DrainOnly => return Ok(()),
+            _ => {}
         }
+
+        // 2) 运行时配置组合守卫：Surreal backend 必须配 use_surrealdb=true
+        if matches!(self.model_writer_mode, ModelWriterMode::Surreal) && !self.use_surrealdb {
+            anyhow::bail!(
+                "model_writer=surreal 要求 use_surrealdb=true；当前 use_surrealdb=false 是非法组合（早期拒绝以避免空跑 perf init / pre_check）"
+            );
+        }
+
+        Ok(())
     }
 
     pub fn validate_transform_store_features(&self) -> anyhow::Result<()> {

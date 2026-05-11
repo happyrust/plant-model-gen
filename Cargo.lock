@@ -257,8 +257,8 @@ dependencies = [
  "simplelog",
  "smol_str 0.3.6",
  "strum 0.27.2",
- "surrealdb 3.1.0-alpha (git+https://gitee.com/happydpc/surrealdb?branch=dev-3.1)",
- "surrealdb-types 3.1.0-alpha (git+https://gitee.com/happydpc/surrealdb?branch=dev-3.1)",
+ "surrealdb",
+ "surrealdb-types",
  "sysinfo 0.37.2",
  "tempfile",
  "thiserror 1.0.69",
@@ -308,7 +308,7 @@ dependencies = [
  "gltf",
  "hash32 1.0.0",
  "hexasphere",
- "id_tree 1.8.0",
+ "id_tree 1.8.0 (git+https://github.com/happyrust/id_tree)",
  "indexmap 2.13.0",
  "indextree",
  "itertools 0.14.0",
@@ -346,8 +346,8 @@ dependencies = [
  "spade",
  "strum 0.27.2",
  "strum_macros 0.27.2",
- "surrealdb 3.1.0-alpha (git+https://github.com/happyrust/surrealdb?branch=dev-3.1)",
- "surrealdb-types 3.1.0-alpha (git+https://github.com/happyrust/surrealdb?branch=dev-3.1)",
+ "surrealdb",
+ "surrealdb-types",
  "thiserror 1.0.69",
  "tokio",
  "toml 0.8.23",
@@ -1900,6 +1900,7 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 [[package]]
 name = "calamine"
 version = "0.26.1"
+source = "git+https://github.com/happyrust/calamine#f35ae176fa9f763851b236f7166e38a884efc8d6"
 dependencies = [
  "atoi_simd",
  "byteorder",
@@ -1992,6 +1993,7 @@ dependencies = [
 [[package]]
 name = "cavalier_contours"
 version = "0.4.0"
+source = "git+https://github.com/happyrust/cavalier_contours#d2d0db137836b672bf7493c047425a146aeb9266"
 dependencies = [
  "num-traits",
  "serde",
@@ -5716,6 +5718,8 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 [[package]]
 name = "id_tree"
 version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bcd9db8dd5be8bde5a2624ed4b2dfb74368fe7999eb9c4940fd3ca344b61071a"
 dependencies = [
  "serde",
  "serde_derive",
@@ -5725,8 +5729,7 @@ dependencies = [
 [[package]]
 name = "id_tree"
 version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcd9db8dd5be8bde5a2624ed4b2dfb74368fe7999eb9c4940fd3ca344b61071a"
+source = "git+https://github.com/happyrust/id_tree#483f2ec03fc107b9195a8c2be6dec5532891b507"
 dependencies = [
  "serde",
  "serde_derive",
@@ -5832,6 +5835,7 @@ dependencies = [
 [[package]]
 name = "indextree"
 version = "4.7.4"
+source = "git+https://github.com/happyrust/indextree?branch=main#2416dca00df8f928a6fee492702cb5224482a4ba"
 dependencies = [
  "indextree-macros",
  "rkyv 0.8.15",
@@ -5840,6 +5844,7 @@ dependencies = [
 [[package]]
 name = "indextree-macros"
 version = "0.1.3"
+source = "git+https://github.com/happyrust/indextree?branch=main#2416dca00df8f928a6fee492702cb5224482a4ba"
 dependencies = [
  "either",
  "itertools 0.14.0",
@@ -6787,6 +6792,7 @@ dependencies = [
 [[package]]
 name = "miniacd"
 version = "0.1.3"
+source = "git+https://github.com/happyrust/miniacd-fork.git?branch=main#89bc858829e77529772ad82a46f011a8f4f9d7fa"
 dependencies = [
  "ahash 0.8.12",
  "glamx",
@@ -10533,6 +10539,7 @@ dependencies = [
 [[package]]
 name = "rvm-rs"
 version = "0.1.0"
+source = "git+https://github.com/happyrust/rvm-rs#45470d2a0ddcabcd1f11958362e6440865bfc24e"
 dependencies = [
  "glam 0.30.10",
  "memmap2",
@@ -11508,40 +11515,6 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "surrealdb"
 version = "3.1.0-alpha"
-dependencies = [
- "anyhow",
- "async-channel 2.5.0",
- "boxcar",
- "chrono",
- "futures",
- "getrandom 0.3.4",
- "indexmap 2.13.0",
- "js-sys",
- "path-clean",
- "ring",
- "rustls-pki-types",
- "semver",
- "serde",
- "serde_json",
- "surrealdb-core 3.1.0-alpha (git+https://gitee.com/happydpc/surrealdb?branch=dev-3.1)",
- "surrealdb-types 3.1.0-alpha (git+https://gitee.com/happydpc/surrealdb?branch=dev-3.1)",
- "surrealdb-types-derive 3.1.0-alpha (git+https://gitee.com/happydpc/surrealdb?branch=dev-3.1)",
- "tokio",
- "tokio-tungstenite",
- "tokio-tungstenite-wasm",
- "tokio-util",
- "tracing",
- "url",
- "uuid",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasmtimer",
- "web-sys",
-]
-
-[[package]]
-name = "surrealdb"
-version = "3.1.0-alpha"
 source = "git+https://github.com/happyrust/surrealdb?branch=dev-3.1#9ab864392bd5a49c5d05da3528d5c9890d2126f9"
 dependencies = [
  "anyhow",
@@ -11558,9 +11531,9 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "surrealdb-core 3.1.0-alpha (git+https://github.com/happyrust/surrealdb?branch=dev-3.1)",
- "surrealdb-types 3.1.0-alpha (git+https://github.com/happyrust/surrealdb?branch=dev-3.1)",
- "surrealdb-types-derive 3.1.0-alpha (git+https://github.com/happyrust/surrealdb?branch=dev-3.1)",
+ "surrealdb-core",
+ "surrealdb-types",
+ "surrealdb-types-derive",
  "tokio",
  "tokio-tungstenite",
  "tokio-tungstenite-wasm",
@@ -11572,95 +11545,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasmtimer",
  "web-sys",
-]
-
-[[package]]
-name = "surrealdb-core"
-version = "3.1.0-alpha"
-dependencies = [
- "addr",
- "affinitypool",
- "ahash 0.8.12",
- "ammonia",
- "anyhow",
- "argon2",
- "async-channel 2.5.0",
- "async-stream",
- "async-trait",
- "base64 0.22.1",
- "bcrypt",
- "blake3",
- "bytes",
- "chrono",
- "ciborium",
- "dashmap 6.1.0",
- "deunicode",
- "dmp",
- "ext-sort",
- "fastnum",
- "fst",
- "futures",
- "fuzzy-matcher",
- "geo 0.32.0",
- "geo-types",
- "getrandom 0.3.4",
- "headers",
- "hex",
- "http",
- "humantime",
- "ipnet",
- "jsonwebtoken 10.3.0",
- "lexicmp",
- "md-5",
- "mime",
- "ndarray",
- "ndarray-stats",
- "num-traits",
- "num_cpus",
- "object_store",
- "parking_lot",
- "path-clean",
- "pbkdf2",
- "phf 0.13.1",
- "pin-project-lite",
- "quick_cache",
- "radix_trie",
- "rand 0.8.5",
- "rayon",
- "reblessive",
- "regex",
- "revision",
- "ring",
- "roaring",
- "rust-stemmers",
- "rust_decimal",
- "scrypt",
- "semver",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "storekey",
- "strsim 0.11.1",
- "subtle",
- "surrealdb-protocol 0.7.0 (git+https://gitee.com/happydpc/surrealdb?branch=dev-3.1)",
- "surrealdb-rocksdb",
- "surrealdb-types 3.1.0-alpha (git+https://gitee.com/happydpc/surrealdb?branch=dev-3.1)",
- "surrealmx",
- "sysinfo 0.37.2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "ulid",
- "unicase",
- "url",
- "uuid",
- "vart",
- "wasm-bindgen-futures",
- "wasmtimer",
- "web-time",
 ]
 
 [[package]]
@@ -11733,9 +11617,9 @@ dependencies = [
  "storekey",
  "strsim 0.11.1",
  "subtle",
- "surrealdb-protocol 0.7.0 (git+https://github.com/happyrust/surrealdb?branch=dev-3.1)",
+ "surrealdb-protocol",
  "surrealdb-rocksdb",
- "surrealdb-types 3.1.0-alpha (git+https://github.com/happyrust/surrealdb?branch=dev-3.1)",
+ "surrealdb-types",
  "surrealmx",
  "sysinfo 0.37.2",
  "tempfile",
@@ -11766,29 +11650,6 @@ dependencies = [
  "libz-sys",
  "lz4-sys",
  "zstd-sys",
-]
-
-[[package]]
-name = "surrealdb-protocol"
-version = "0.7.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "chrono",
- "flatbuffers",
- "futures",
- "geo 0.31.0",
- "http-body-util",
- "prost",
- "prost-types",
- "rust_decimal",
- "semver",
- "serde",
- "serde_json",
- "tonic",
- "tonic-prost",
- "uuid",
 ]
 
 [[package]]
@@ -11828,32 +11689,6 @@ dependencies = [
 [[package]]
 name = "surrealdb-types"
 version = "3.1.0-alpha"
-dependencies = [
- "anyhow",
- "bytes",
- "castaway",
- "chrono",
- "flatbuffers",
- "geo 0.32.0",
- "hex",
- "http",
- "papaya",
- "rand 0.8.5",
- "regex",
- "rstest",
- "rust_decimal",
- "serde",
- "serde_json",
- "surrealdb-protocol 0.7.0 (git+https://gitee.com/happydpc/surrealdb?branch=dev-3.1)",
- "surrealdb-types-derive 3.1.0-alpha (git+https://gitee.com/happydpc/surrealdb?branch=dev-3.1)",
- "tracing",
- "ulid",
- "uuid",
-]
-
-[[package]]
-name = "surrealdb-types"
-version = "3.1.0-alpha"
 source = "git+https://github.com/happyrust/surrealdb?branch=dev-3.1#9ab864392bd5a49c5d05da3528d5c9890d2126f9"
 dependencies = [
  "anyhow",
@@ -11870,19 +11705,10 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
- "surrealdb-protocol 0.7.0 (git+https://github.com/happyrust/surrealdb?branch=dev-3.1)",
- "surrealdb-types-derive 3.1.0-alpha (git+https://github.com/happyrust/surrealdb?branch=dev-3.1)",
+ "surrealdb-protocol",
+ "surrealdb-types-derive",
  "ulid",
  "uuid",
-]
-
-[[package]]
-name = "surrealdb-types-derive"
-version = "3.1.0-alpha"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]

@@ -399,9 +399,9 @@ git -C .worktrees/model-persistence-trait log --oneline feat/collab-api-consolid
 
 **Steps**：调研 nightly 支持度，对比 dyn trait + 性能开销，评估是否值得在 hot path 上做。**输出**：评估报告归档到 `docs/plans/2026-05-09-model-write-trait-followup/n3-async-fn-evaluation.md`。
 
-#### Task 5.2 — `name()` 改 `const NAME`（N4）
+#### Task 5.2 — ~~`name()` 改 `const NAME`（N4）~~ **Cancelled 2026-05-11**
 
-**Steps**：trait 改为关联常量，所有实现改用 `const NAME: &'static str = "..."`。
+trait 通过 `Arc<dyn ModelWriterBackend>` 走 vtable 调用，关联 const 不进 vtable，无法替代 method。保留 method 形式即可，无需独立 Phase 5 立项。
 
 #### Task 5.3 — 清理 `write_base_batch` 空 mesh_results 包袱（N6）
 

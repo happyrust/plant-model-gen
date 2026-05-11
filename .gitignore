@@ -166,3 +166,6 @@ history.txt
 # 本地测试产物 / 计划草稿
 artifacts/
 .cursor/plans/
+*.msg-*.txt
+.msg-*.txt
+*.pr-body.md

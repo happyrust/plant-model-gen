@@ -473,15 +473,17 @@ async fn run_base_writer(
     result_sender: Sender<(u64, u128, u128)>,
     base_write_semaphore: Arc<Semaphore>,
     mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
-    missing_neg_carriers: Arc<std::sync::Mutex<HashSet<RefnoEnum>>>,
     model_writer: Arc<dyn ModelWriterBackend>,
 ) -> anyhow::Result<()> {
+    // v3 Phase F.1: missing_neg_carriers no longer flows through a shared
+    // Mutex<HashSet>; the backend owns its own accumulator and the main
+    // routine drains it once via `take_missing_neg_carriers()` after every
+    // batch has been written.
     let mut handles = Vec::new();
     while let Ok(batch) = receiver.recv_async().await {
         let semaphore = base_write_semaphore.clone();
         let mesh_aabb_map = mesh_aabb_map.clone();
         let result_sender = result_sender.clone();
-        let missing_neg_carriers = missing_neg_carriers.clone();
         let model_writer = model_writer.clone();
         handles.push(tokio::spawn(async move {
             let (permit, wait_ms) = acquire_with_wait(semaphore).await?;
@@ -495,10 +497,6 @@ async fn run_base_writer(
                     write_inst_relate_aabb: false,
                 })
                 .await?;
-            if !save_report.missing_neg_carriers.is_empty() {
-                let mut guard = missing_neg_carriers.lock().unwrap();
-                guard.extend(save_report.missing_neg_carriers.iter().copied());
-            }
             let base_ms = base_start.elapsed().as_millis();
             drop(permit);
             println!(
@@ -1248,8 +1246,9 @@ async fn process_index_tree_generation(
     let mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>> =
         Arc::new(DashMap::new());
     let mesh_pts_map: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
-    let missing_neg_carriers_for_reconcile: Arc<std::sync::Mutex<HashSet<RefnoEnum>>> =
-        Arc::new(std::sync::Mutex::new(HashSet::new()));
+    // v3 Phase F.1: missing_neg_carriers 由 backend 内部 Mutex 自管理，
+    // 不再走 orchestrator 共享的 Arc<Mutex<HashSet>>；在 reconcile 前调
+    // `take_missing_neg_carriers()` 一次性 drain。
     let base_write_semaphore = Arc::new(Semaphore::new(db_option.get_base_write_concurrency()));
     let mesh_compute_semaphore = Arc::new(Semaphore::new(db_option.get_mesh_compute_concurrency()));
     let inst_aabb_semaphore = Arc::new(Semaphore::new(db_option.get_inst_aabb_write_concurrency()));
@@ -1277,7 +1276,6 @@ async fn process_index_tree_generation(
         base_result_sender,
         base_write_semaphore.clone(),
         mesh_aabb_map.clone(),
-        missing_neg_carriers_for_reconcile.clone(),
         model_writer.clone(),
     ));
     let mesh_stage_handle = tokio::spawn(run_mesh_stage(
@@ -1341,12 +1339,13 @@ async fn process_index_tree_generation(
         total_mesh_cache_hits += completion.mesh_cache_hits;
         total_mesh_new_generated += completion.mesh_new_generated;
     }
-    let missing_neg_carriers = {
-        let guard = missing_neg_carriers_for_reconcile.lock().unwrap();
-        let mut carriers = guard.iter().copied().collect::<Vec<_>>();
-        carriers.sort_unstable();
-        carriers
-    };
+    // v3 Phase F.1: drain backend-internal carriers via the trait method.
+    let mut missing_neg_carriers = model_writer
+        .take_missing_neg_carriers()
+        .await
+        .map_err(IndexTreeError::Other)?;
+    missing_neg_carriers.sort_unstable();
+    missing_neg_carriers.dedup();
     let barrier_wait_ms = barrier_wait_start.elapsed().as_millis();
     println!(
         "[gen_model] batch barrier complete: batches={} barrier_wait_ms={} mesh_cache_hit={} mesh_new_generated={} missing_neg_candidates={}",

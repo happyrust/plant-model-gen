@@ -162,19 +162,15 @@ impl From<BoolWorkerReport> for BooleanBridgeReport {
 
 /// `write_base_batch` 的对外 report，不耦合具体 backend 内部类型。
 ///
-/// 字段名 `missing_neg_carriers` 与历史 `pdms_inst::SaveInstanceDataReport` 保持兼容，
-/// 让 orchestrator 调用代码改动量为 0。
+/// v3 Phase F.1 起：`missing_neg_carriers` 字段被拆为独立 trait 方法
+/// `ModelWriterBackend::take_missing_neg_carriers`。本 report 只保留
+/// **每 batch 的统计计数**（`missing_neg_count`）；调用方在所有 batch 写完
+/// 后通过 trait 方法一次性 drain backend 内部累积的 carriers，不再把
+/// `Vec<RefnoEnum>` 暴露在 batch 级 report 上。
 #[derive(Debug, Clone, Default)]
 pub struct WriteBaseReport {
     pub batch_id: u64,
     pub missing_neg_count: usize,
-    /// 历史调用方需要的 `RefnoEnum` 集合，由 backend 在写 base batch 时收集。
-    ///
-    /// 这是 trait 接口里唯一仍带 `aios_core::RefnoEnum` 的字段，等同于把
-    /// "missing-neg 收集" 语义抬到 trait 层。P5 backlog (`T5.1`) 计划把这个字段
-    /// 拆为独立 trait 方法 `take_missing_neg_carriers(&self) -> Vec<RefnoEnum>`，
-    /// 让 backend 决定是否暴露 carriers；当前先保留以减少本 PR 的接口侵入面。
-    pub missing_neg_carriers: Vec<RefnoEnum>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -211,6 +207,17 @@ pub trait ModelWriterBackend: Send + Sync {
     async fn write_inst_relate_aabb(&self, batch: InstRelateAabbBatch<'_>) -> anyhow::Result<()>;
 
     async fn reconcile_missing_neg(&self, request: ReconcileRequest<'_>) -> anyhow::Result<usize>;
+
+    /// Drain backend-internal "missing neg carrier" accumulator collected
+    /// across all `write_base_batch` calls. v3 Phase F.1 moves this out of
+    /// `WriteBaseReport` so the trait stops leaking `Vec<RefnoEnum>` per batch.
+    ///
+    /// Default impl returns an empty Vec; backends that participate in
+    /// `reconcile_missing_neg` should override to drain their internal state.
+    /// Idempotent: calling twice should return empty the second time.
+    async fn take_missing_neg_carriers(&self) -> anyhow::Result<Vec<RefnoEnum>> {
+        Ok(Vec::new())
+    }
 
     async fn run_boolean_bridge(
         &self,

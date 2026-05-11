@@ -261,9 +261,9 @@
 | C | C 阶段 PR | complete | 2026-05-12 | PR #15: https://github.com/happyrust/plant-model-gen/pull/15 （base = Phase B 分支，stack PR） |
 | D | D.1 DuckLakeModelWriterBackend 骨架 | complete | 2026-05-12 | commit `88071608`，feature `ducklake = []`，trait 8 方法全 `bail!`，工厂 cfg 守门；ModelWriterMode::DuckLake + parse + validate 守卫 |
 | D | D.2 D 阶段 PR | complete | 2026-05-12 | PR #16: https://github.com/happyrust/plant-model-gen/pull/16；`cargo check --features review` + `cargo check --features review,ducklake` 均 PASS |
-| E | E.1 validate-model-writer CLI umbrella | pending | — | — |
-| E | E.2 SQL parity scripts | pending | — | 13 张 Phase 1 表 × 2 个 SQL |
-| E | E.3 E 阶段 PR | pending | — | — |
+| E | E.1 diff-summary CLI | complete | 2026-05-12 | commit `023eb327`，`aios-database model-writer diff-summary --left ... --right ...` + `--fail-on-diff` 退出码 2；smoke：match→exit 0、diff→exit 2 |
+| E | E.2 SQL parity scripts | complete | 2026-05-12 | commit `10dcba4d`，13 张 Phase 1 表 × 2 SQL = 26 文件 + README + 维护脚本 _gen_sql.ps1（DuckDB read_json_auto，v4 换 read_parquet 一行改） |
+| E | E.3 E 阶段 PR | complete | 2026-05-12 | PR #17: https://github.com/happyrust/plant-model-gen/pull/17 |
 | F | F.1 take_missing_neg_carriers 拆 trait | pending | — | — |
 | F | F.2 BridgeContext 抽出 | pending | — | — |
 | F | F.3 F 阶段 PR | pending | — | small × 2 |

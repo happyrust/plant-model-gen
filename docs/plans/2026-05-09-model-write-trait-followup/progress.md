@@ -264,6 +264,6 @@
 | E | E.1 diff-summary CLI | complete | 2026-05-12 | commit `023eb327`，`aios-database model-writer diff-summary --left ... --right ...` + `--fail-on-diff` 退出码 2；smoke：match→exit 0、diff→exit 2 |
 | E | E.2 SQL parity scripts | complete | 2026-05-12 | commit `10dcba4d`，13 张 Phase 1 表 × 2 SQL = 26 文件 + README + 维护脚本 _gen_sql.ps1（DuckDB read_json_auto，v4 换 read_parquet 一行改） |
 | E | E.3 E 阶段 PR | complete | 2026-05-12 | PR #17: https://github.com/happyrust/plant-model-gen/pull/17 |
-| F | F.1 take_missing_neg_carriers 拆 trait | pending | — | — |
-| F | F.2 BridgeContext 抽出 | pending | — | — |
-| F | F.3 F 阶段 PR | pending | — | small × 2 |
+| F | F.1 take_missing_neg_carriers 拆 trait | complete | 2026-05-12 | commit `f276256c` + `c8c0f5fe`，trait 加 default-empty method；删 WriteBaseReport.missing_neg_carriers + orchestrator Arc<Mutex<HashSet>>；verify binary 加 drain 幂等断言；PR #18 |
+| F | F.2 BridgeContext 抽出 | in_progress | — | — |
+| F | F.3 F 阶段 PR | pending | — | F.1 已独立 PR #18；F.2 待立 |

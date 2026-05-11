@@ -1440,7 +1440,6 @@ async fn process_index_tree_generation(
                     let report = model_writer
                         .run_boolean_bridge(BooleanBridgeRequest {
                             mode: BooleanPipelineMode::DbLegacy,
-                            db_option: Arc::new(db_option.inner.clone()),
                             bool_tasks: Vec::new(),
                         })
                         .await
@@ -1489,7 +1488,6 @@ async fn process_index_tree_generation(
                         let report = model_writer
                             .run_boolean_bridge(BooleanBridgeRequest {
                                 mode: BooleanPipelineMode::MemoryTasks,
-                                db_option: Arc::new(db_option.inner.clone()),
                                 bool_tasks: std::mem::take(&mut bool_tasks),
                             })
                             .await

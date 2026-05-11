@@ -46,6 +46,11 @@ pub struct ModelWriterContext {
     pub use_surrealdb: bool,
     pub defer_db_write: bool,
     pub mode: ModelWriterMode,
+    /// v3 Phase F.2: the underlying `DbOption` is now cached on init so
+    /// `BooleanBridgeRequest` no longer has to ship it on every call.
+    /// Backends that need a `DbOption` (currently only Surreal's boolean
+    /// worker) pull it from the context they cached during `init`.
+    pub db_option: Arc<aios_core::options::DbOption>,
 }
 
 impl ModelWriterContext {
@@ -55,6 +60,7 @@ impl ModelWriterContext {
             use_surrealdb: db_option.use_surrealdb,
             defer_db_write: db_option.defer_db_write,
             mode: db_option.model_writer_mode,
+            db_option: Arc::new(db_option.inner.clone()),
         }
     }
 }
@@ -95,11 +101,12 @@ pub struct ReconcileRequest<'a> {
 
 pub struct BooleanBridgeRequest {
     pub mode: BooleanPipelineMode,
-    // TODO(P5): replace with a minimal BridgeContext to remove DbOption coupling
-    // from the trait surface. See findings.md §3 (decision: keep short-term).
-    pub db_option: Arc<aios_core::options::DbOption>,
     pub bool_tasks: Vec<BooleanTask>,
 }
+
+// v3 Phase F.2 (completed): the previous `db_option: Arc<DbOption>` field has
+// been removed. Backends that need a `DbOption` for the boolean worker pull it
+// from `ModelWriterContext::db_option` cached during `init`.
 
 #[derive(Debug, Clone)]
 pub struct BooleanBridgeReport {

@@ -57,6 +57,7 @@ async fn main() -> ExitCode {
         use_surrealdb: true,
         defer_db_write: false,
         mode: ModelWriterMode::Surreal,
+        db_option: Arc::new(aios_core::options::DbOption::default()),
     };
 
     let shape_insts = ShapeInstancesData::default();
@@ -183,7 +184,6 @@ async fn main() -> ExitCode {
     if let Err(e) = backend
         .run_boolean_bridge(BooleanBridgeRequest {
             mode: BooleanPipelineMode::DbLegacy,
-            db_option: Arc::new(aios_core::options::DbOption::default()),
             bool_tasks: Vec::new(),
         })
         .await
@@ -287,6 +287,7 @@ async fn main() -> ExitCode {
         use_surrealdb: false,
         defer_db_write: false,
         mode: ModelWriterMode::Parquet,
+        db_option: Arc::new(aios_core::options::DbOption::default()),
     };
 
     if let Err(e) = parquet_backend.init(&parquet_ctx).await {
@@ -371,7 +372,6 @@ async fn main() -> ExitCode {
     let parquet_bool_report = match parquet_backend
         .run_boolean_bridge(BooleanBridgeRequest {
             mode: BooleanPipelineMode::DbLegacy,
-            db_option: Arc::new(aios_core::options::DbOption::default()),
             bool_tasks: Vec::new(),
         })
         .await
@@ -455,6 +455,7 @@ async fn main() -> ExitCode {
         use_surrealdb: false,
         defer_db_write: false,
         mode: ModelWriterMode::Parquet,
+        db_option: Arc::new(aios_core::options::DbOption::default()),
     };
     if compare_wrapper.name() != "compare" {
         eprintln!(
@@ -529,7 +530,6 @@ async fn main() -> ExitCode {
     if let Err(e) = compare_wrapper
         .run_boolean_bridge(BooleanBridgeRequest {
             mode: BooleanPipelineMode::DbLegacy,
-            db_option: Arc::new(aios_core::options::DbOption::default()),
             bool_tasks: Vec::new(),
         })
         .await

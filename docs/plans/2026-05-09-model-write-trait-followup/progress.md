@@ -235,14 +235,14 @@
 
 ### Phase 总览
 
-| Phase | 名称 | 独立 PR 分支 | 状态 |
-|---|---|---|---|
-| A | v2 残留 cleanup | （progress 同步 → PR #11；mission docs → `docs/model-writer-storage-mission`） | in_progress |
-| B | Parquet trait 化 | `feat/parquet-model-writer-backend` | pending |
-| C | Orchestrator backend selection + compare | `feat/model-writer-compare-mode` | pending |
-| D | DuckLake backend 骨架 | `feat/ducklake-backend-skeleton` | pending |
-| E | CLI + SQL validation 全套 | `feat/model-writer-validation-cli` | pending |
-| F | P5 backlog 收口 | 2 个 small PR | pending |
+| Phase | 名称 | 独立 PR 分支 | 状态 | PR |
+|---|---|---|---|---|
+| A | v2 残留 cleanup | progress 同步 + mission docs PR | complete | #11 (incr) + #13 |
+| B | Parquet trait 化 | `feat/parquet-model-writer-backend` | complete | #14 |
+| C | Orchestrator backend selection + compare | `feat/model-writer-compare-mode` | complete | #15 |
+| D | DuckLake backend 骨架 | `feat/ducklake-backend-skeleton` | complete | #16 |
+| E | CLI + SQL validation 全套 | `feat/model-writer-validation-cli` | complete | #17 |
+| F | P5 backlog 收口 | 2 个 small PR | complete | #18 + #19 |
 
 ### v3 milestones
 
@@ -265,5 +265,5 @@
 | E | E.2 SQL parity scripts | complete | 2026-05-12 | commit `10dcba4d`，13 张 Phase 1 表 × 2 SQL = 26 文件 + README + 维护脚本 _gen_sql.ps1（DuckDB read_json_auto，v4 换 read_parquet 一行改） |
 | E | E.3 E 阶段 PR | complete | 2026-05-12 | PR #17: https://github.com/happyrust/plant-model-gen/pull/17 |
 | F | F.1 take_missing_neg_carriers 拆 trait | complete | 2026-05-12 | commit `f276256c` + `c8c0f5fe`，trait 加 default-empty method；删 WriteBaseReport.missing_neg_carriers + orchestrator Arc<Mutex<HashSet>>；verify binary 加 drain 幂等断言；PR #18 |
-| F | F.2 BridgeContext 抽出 | in_progress | — | — |
-| F | F.3 F 阶段 PR | pending | — | F.1 已独立 PR #18；F.2 待立 |
+| F | F.2 BridgeContext 抽出 | complete | 2026-05-12 | commit `738c31b2`：把 `Arc<DbOption>` 从 `BooleanBridgeRequest` 拿掉，改由 `ModelWriterContext::db_option` 在 init 时缓存；surreal `run_boolean_bridge` 从 cached ctx 取 db_option；orchestrator 两处构造点简化；trait 接口面再减一字段 |
+| F | F.3 F 阶段 PR | complete | 2026-05-12 | F.1 PR #18 + F.2 PR #19: https://github.com/happyrust/plant-model-gen/pull/19 |

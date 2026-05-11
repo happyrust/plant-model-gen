@@ -27,9 +27,10 @@ mod surreal;
 pub use drain_only::{DrainOnlyModelWriterBackend, DrainOnlyStats, run_drain_only_sink};
 #[cfg(feature = "model-writer-mock")]
 pub use mock::RecordingBackend;
-// Canonical raw sink scaffold (not a ModelWriterBackend impl; not in factory).
+// Canonical raw sink scaffold + v3 Phase B ModelWriterBackend impl (file-oriented).
 pub use parquet::{
     CanonicalParquetTableSummary, CanonicalParquetWriter, CanonicalParquetWriterConfig,
+    ParquetModelWriterBackend,
 };
 pub use surreal::SurrealModelWriterBackend;
 
@@ -217,6 +218,22 @@ pub fn create_model_writer(db_option: &DbOptionExt) -> anyhow::Result<Arc<dyn Mo
     let backend: Arc<dyn ModelWriterBackend> = match db_option.model_writer_mode {
         ModelWriterMode::Surreal => Arc::new(SurrealModelWriterBackend::default()),
         ModelWriterMode::DrainOnly => Arc::new(DrainOnlyModelWriterBackend::default()),
+        ModelWriterMode::Parquet => {
+            let output_root = db_option
+                .parquet_model_writer_output_root
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "model_writer=parquet requires `parquet_model_writer_output_root` to be set in DbOptionExt"
+                    )
+                })?;
+            Arc::new(ParquetModelWriterBackend::with_dbnum(
+                std::path::PathBuf::from(output_root),
+                db_option
+                    .parquet_model_writer_dbnum
+                    .unwrap_or(ParquetModelWriterBackend::DEFAULT_DBNUM),
+            ))
+        }
     };
     println!(
         "[model-writer] factory selected primary={} mirror=none fail_fast=true",

@@ -64,6 +64,7 @@ fn parse_model_writer_mode(raw: Option<&str>) -> ModelWriterMode {
         Some(mode) if mode == "drain-only" || mode == "drain_only" || mode == "drain" => {
             ModelWriterMode::DrainOnly
         }
+        Some(mode) if mode == "parquet" => ModelWriterMode::Parquet,
         Some(_) | None => ModelWriterMode::Surreal,
     }
 }
@@ -138,6 +139,10 @@ pub enum ModelWriterMode {
     Surreal,
     /// 只消费生成端 batch 并输出统计，不持久化，用于压测生成吞吐。
     DrainOnly,
+    /// File-oriented backend：通过 `CanonicalRawPlanner` 把 batch 转 canonical
+    /// raw records，落 JSONL（Phase 1 fallback）到 `parquet_model_writer_output_root`
+    /// 指定的目录。typed Parquet 物化推迟到 v4。
+    Parquet,
 }
 
 impl Default for ModelWriterMode {
@@ -151,6 +156,7 @@ impl ModelWriterMode {
         match self {
             Self::Surreal => "surreal",
             Self::DrainOnly => "drain-only",
+            Self::Parquet => "parquet",
         }
     }
 
@@ -369,9 +375,21 @@ pub struct DbOptionExt {
     #[serde(default = "default_boolean_pipeline_mode")]
     pub boolean_pipeline_mode: BooleanPipelineMode,
 
-    /// 模型写入后端：surreal 写库，drain-only 仅消费统计。
+    /// 模型写入后端：surreal 写库，drain-only 仅消费统计，parquet 落 JSONL canonical raw 文件。
     #[serde(default = "default_model_writer_mode")]
     pub model_writer_mode: ModelWriterMode,
+
+    /// `model_writer_mode=parquet` 时使用的输出根目录。
+    /// 实际 layout 为 `<root>/model_writer_storage/raw/<table>/project_name=<project>/dbnum=<dbnum>/batch_<id>.jsonl`，
+    /// 与 mission 05-parquet-writer.md §Layout 保持一致。
+    #[serde(default)]
+    pub parquet_model_writer_output_root: Option<String>,
+
+    /// `model_writer_mode=parquet` 时使用的 dbnum 维度。
+    /// 当前 gen-model 流程不天然携带 dbnum，默认 0；v4 把 dbnum 拉进
+    /// `ModelWriterContext` 后从 context 取值。
+    #[serde(default)]
+    pub parquet_model_writer_dbnum: Option<u32>,
 
     /// pe_transform 刷新结果写入后端。
     #[serde(default = "default_transform_write_backend")]
@@ -596,6 +614,8 @@ impl DbOptionExt {
             }
             // drain-only is a non-persistent throughput sink and does not need a storage feature.
             ModelWriterMode::DrainOnly => return Ok(()),
+            // parquet 走文件系统，无需 storage feature；但需要 output_root 配置（运行时守卫见下方 2b）。
+            ModelWriterMode::Parquet => {}
             _ => {}
         }
 
@@ -604,6 +624,20 @@ impl DbOptionExt {
             anyhow::bail!(
                 "model_writer=surreal 要求 use_surrealdb=true；当前 use_surrealdb=false 是非法组合（早期拒绝以避免空跑 perf init / pre_check）"
             );
+        }
+
+        // 2b) Parquet backend 必须配 parquet_model_writer_output_root
+        if matches!(self.model_writer_mode, ModelWriterMode::Parquet) {
+            let root = self
+                .parquet_model_writer_output_root
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            if root.is_none() {
+                anyhow::bail!(
+                    "model_writer=parquet 要求 parquet_model_writer_output_root 非空；请在 DbOption 设置目标目录（参考 mission 05-parquet-writer.md §Layout）"
+                );
+            }
         }
 
         Ok(())
@@ -668,6 +702,8 @@ impl From<DbOption> for DbOptionExt {
             defer_db_write: false,
             boolean_pipeline_mode: BooleanPipelineMode::DbLegacy,
             model_writer_mode: ModelWriterMode::Surreal,
+            parquet_model_writer_output_root: None,
+            parquet_model_writer_dbnum: None,
             transform_write_backend: TransformWriteBackend::Surreal,
             transform_read_backend: TransformReadBackend::Auto,
             transform_compare_backends: Vec::new(),
@@ -946,6 +982,16 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let parquet_model_writer_output_root = toml_value
+        .get("parquet_model_writer_output_root")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let parquet_model_writer_dbnum = toml_value
+        .get("parquet_model_writer_dbnum")
+        .and_then(|v| v.as_integer())
+        .and_then(|v| u32::try_from(v).ok());
+
     // 构建 DbOptionExt
     let db_option_ext = DbOptionExt {
         inner: db_option,
@@ -968,6 +1014,8 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         defer_db_write,
         boolean_pipeline_mode,
         model_writer_mode,
+        parquet_model_writer_output_root,
+        parquet_model_writer_dbnum,
         transform_write_backend,
         transform_read_backend,
         transform_compare_backends,

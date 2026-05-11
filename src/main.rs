@@ -644,9 +644,21 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("model-writer")
                 .long("model-writer")
-                .help("Model writer backend: surreal writes to SurrealDB; drain-only consumes generated batches for throughput testing without persistence")
+                .help("Model writer backend: surreal writes to SurrealDB; drain-only consumes generated batches for throughput testing without persistence; parquet emits canonical raw JSONL under parquet-output-root")
                 .value_name("WRITER")
-                .value_parser(["surreal", "drain-only"]),
+                .value_parser(["surreal", "drain-only", "parquet"]),
+        )
+        .arg(
+            Arg::new("parquet-output-root")
+                .long("parquet-output-root")
+                .help("Output root for model_writer=parquet (mission 05-parquet-writer §Layout). Files land under <root>/model_writer_storage/raw/...")
+                .value_name("PATH"),
+        )
+        .arg(
+            Arg::new("parquet-dbnum")
+                .long("parquet-dbnum")
+                .help("dbnum dimension for model_writer=parquet (defaults to 0 if omitted)")
+                .value_name("DBNUM"),
         )
         .arg(
             Arg::new("export-parquet-after-gen")
@@ -1167,15 +1179,35 @@ async fn main() -> anyhow::Result<()> {
     if let Some(writer) = matches.get_one::<String>("model-writer") {
         db_option_ext.model_writer_mode = match writer.as_str() {
             "drain-only" => ModelWriterMode::DrainOnly,
+            "parquet" => ModelWriterMode::Parquet,
             _ => ModelWriterMode::Surreal,
         };
         println!(
             "🔧 模型写入后端: {}",
             db_option_ext.model_writer_mode.as_str()
         );
-        if db_option_ext.model_writer_mode == ModelWriterMode::DrainOnly {
-            println!("🔧 drain-only 压测模式: 生成几何 batch，仅消费统计，不写 SurrealDB");
+        match db_option_ext.model_writer_mode {
+            ModelWriterMode::DrainOnly => {
+                println!("🔧 drain-only 压测模式: 生成几何 batch，仅消费统计，不写 SurrealDB");
+            }
+            ModelWriterMode::Parquet => {
+                println!(
+                    "🔧 parquet 模式: canonical raw records 落 JSONL，到 parquet_model_writer_output_root（mission 05 §Layout）"
+                );
+            }
+            ModelWriterMode::Surreal => {}
         }
+    }
+    if let Some(root) = matches.get_one::<String>("parquet-output-root") {
+        db_option_ext.parquet_model_writer_output_root = Some(root.clone());
+        println!("🔧 parquet model-writer output_root: {}", root);
+    }
+    if let Some(dbnum_raw) = matches.get_one::<String>("parquet-dbnum") {
+        let dbnum = dbnum_raw
+            .parse::<u32>()
+            .map_err(|e| anyhow::anyhow!("parquet-dbnum 必须是 u32，传入 `{dbnum_raw}`: {e}"))?;
+        db_option_ext.parquet_model_writer_dbnum = Some(dbnum);
+        println!("🔧 parquet model-writer dbnum: {}", dbnum);
     }
     db_option_ext.validate_model_writer_features()?;
     if let Some(backend) = matches.get_one::<String>("transform-write-backend") {

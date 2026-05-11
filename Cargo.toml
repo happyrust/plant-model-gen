@@ -253,7 +253,6 @@ manifold = ["aios_core/manifold"]
 # debug_parse = ["pdms_io/debug_parse"]  # 暂时禁用以避免冲突
 surreal-save = []
 write-to-surrealdb = []
-model-writer-drain = []
 # Mock backend：仅供 trait 契约验证 binary 使用，不进 release。
 model-writer-mock = []
 test = ["aios_core/test"]

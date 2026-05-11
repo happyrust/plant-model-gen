@@ -644,9 +644,9 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("model-writer")
                 .long("model-writer")
-                .help("Model writer backend: surreal writes to SurrealDB; drain-only consumes generated batches for throughput testing without persistence; parquet emits canonical raw JSONL under parquet-output-root")
+                .help("Model writer backend: surreal writes to SurrealDB; drain-only consumes generated batches for throughput testing without persistence; parquet emits canonical raw JSONL under parquet-output-root; ducklake is a v3 Phase D skeleton (requires --features ducklake build, all trait methods bail until v4)")
                 .value_name("WRITER")
-                .value_parser(["surreal", "drain-only", "parquet"]),
+                .value_parser(["surreal", "drain-only", "parquet", "ducklake"]),
         )
         .arg(
             Arg::new("parquet-output-root")
@@ -663,9 +663,9 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("model-writer-compare-with")
                 .long("model-writer-compare-with")
-                .help("v3 Phase C compare mode: dual-write to candidate backend (surreal|parquet). Fail-fast on any candidate write failure (mission 03 §Error handling). drain-only is NOT a valid candidate.")
+                .help("v3 Phase C compare mode: dual-write to candidate backend (surreal|parquet|ducklake). Fail-fast on any candidate write failure (mission 03 §Error handling). drain-only is NOT a valid candidate. ducklake requires --features ducklake build.")
                 .value_name("BACKEND")
-                .value_parser(["surreal", "parquet"]),
+                .value_parser(["surreal", "parquet", "ducklake"]),
         )
         .arg(
             Arg::new("export-parquet-after-gen")
@@ -1187,6 +1187,7 @@ async fn main() -> anyhow::Result<()> {
         db_option_ext.model_writer_mode = match writer.as_str() {
             "drain-only" => ModelWriterMode::DrainOnly,
             "parquet" => ModelWriterMode::Parquet,
+            "ducklake" => ModelWriterMode::DuckLake,
             _ => ModelWriterMode::Surreal,
         };
         println!(
@@ -1200,6 +1201,11 @@ async fn main() -> anyhow::Result<()> {
             ModelWriterMode::Parquet => {
                 println!(
                     "🔧 parquet 模式: canonical raw records 落 JSONL，到 parquet_model_writer_output_root（mission 05 §Layout）"
+                );
+            }
+            ModelWriterMode::DuckLake => {
+                println!(
+                    "🔧 ducklake 模式: v3 Phase D 占位骨架（需 --features ducklake 编译），所有 trait 方法 bail!；真实写入留 v4（mission 04-ducklake-writer.md）"
                 );
             }
             ModelWriterMode::Surreal => {}
@@ -1220,9 +1226,10 @@ async fn main() -> anyhow::Result<()> {
         let candidate = match candidate_raw.as_str() {
             "surreal" => ModelWriterMode::Surreal,
             "parquet" => ModelWriterMode::Parquet,
+            "ducklake" => ModelWriterMode::DuckLake,
             other => {
                 return Err(anyhow::anyhow!(
-                    "model-writer-compare-with 不支持值 `{other}`（仅 surreal | parquet）"
+                    "model-writer-compare-with 不支持值 `{other}`（仅 surreal | parquet | ducklake）"
                 ));
             }
         };

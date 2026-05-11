@@ -65,6 +65,9 @@ fn parse_model_writer_mode(raw: Option<&str>) -> ModelWriterMode {
             ModelWriterMode::DrainOnly
         }
         Some(mode) if mode == "parquet" => ModelWriterMode::Parquet,
+        Some(mode) if mode == "ducklake" || mode == "duck-lake" || mode == "duck_lake" => {
+            ModelWriterMode::DuckLake
+        }
         Some(_) | None => ModelWriterMode::Surreal,
     }
 }
@@ -143,6 +146,10 @@ pub enum ModelWriterMode {
     /// raw records，落 JSONL（Phase 1 fallback）到 `parquet_model_writer_output_root`
     /// 指定的目录。typed Parquet 物化推迟到 v4。
     Parquet,
+    /// DuckLake target backend per mission docs/04-ducklake-writer.md。
+    /// v3 仅占位骨架（需 `--features ducklake` 编译），所有 trait 方法 `bail!`；
+    /// 真实写入实装留 v4。未启 feature 时工厂直接拒绝。
+    DuckLake,
 }
 
 impl Default for ModelWriterMode {
@@ -157,6 +164,7 @@ impl ModelWriterMode {
             Self::Surreal => "surreal",
             Self::DrainOnly => "drain-only",
             Self::Parquet => "parquet",
+            Self::DuckLake => "ducklake",
         }
     }
 
@@ -628,6 +636,13 @@ impl DbOptionExt {
             ModelWriterMode::DrainOnly => return Ok(()),
             // parquet 走文件系统，无需 storage feature；但需要 output_root 配置（运行时守卫见下方 2b）。
             ModelWriterMode::Parquet => {}
+            // ducklake feature 检查（v3 Phase D：仅 feature-gated 骨架）。
+            ModelWriterMode::DuckLake if !cfg!(feature = "ducklake") => {
+                anyhow::bail!(
+                    "model_writer=ducklake 需要 --features ducklake 编译；v3 Phase D 仅占位骨架，真实写入留 v4（mission docs/04-ducklake-writer.md）"
+                )
+            }
+            ModelWriterMode::DuckLake => {}
             _ => {}
         }
 
@@ -1040,6 +1055,7 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
             "surreal" => Some(ModelWriterMode::Surreal),
             "parquet" => Some(ModelWriterMode::Parquet),
+            "ducklake" | "duck-lake" | "duck_lake" => Some(ModelWriterMode::DuckLake),
             // drain-only is intentionally excluded (baseline sink, not a candidate writer);
             // unknown values fall through to None.
             _ => None,

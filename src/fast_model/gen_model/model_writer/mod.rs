@@ -20,6 +20,8 @@ pub use super::canonical_records::{
 
 mod compare;
 mod drain_only;
+#[cfg(feature = "ducklake")]
+mod ducklake;
 #[cfg(feature = "model-writer-mock")]
 mod mock;
 mod parquet;
@@ -27,6 +29,8 @@ mod surreal;
 
 pub use compare::CompareModelWriterBackend;
 pub use drain_only::{DrainOnlyModelWriterBackend, DrainOnlyStats, run_drain_only_sink};
+#[cfg(feature = "ducklake")]
+pub use ducklake::DuckLakeModelWriterBackend;
 #[cfg(feature = "model-writer-mock")]
 pub use mock::RecordingBackend;
 // Canonical raw sink scaffold + v3 Phase B ModelWriterBackend impl (file-oriented).
@@ -240,6 +244,18 @@ fn build_single_backend(
                     .parquet_model_writer_dbnum
                     .unwrap_or(ParquetModelWriterBackend::DEFAULT_DBNUM),
             ))
+        }
+        ModelWriterMode::DuckLake => {
+            #[cfg(feature = "ducklake")]
+            {
+                Arc::new(DuckLakeModelWriterBackend::new())
+            }
+            #[cfg(not(feature = "ducklake"))]
+            {
+                anyhow::bail!(
+                    "model_writer=ducklake requires --features ducklake build (v3 Phase D skeleton, real implementation lands in v4 per mission docs/04-ducklake-writer.md)"
+                )
+            }
         }
     };
     Ok(backend)

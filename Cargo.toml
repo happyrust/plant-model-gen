@@ -255,6 +255,10 @@ surreal-save = []
 write-to-surrealdb = []
 # Mock backend：仅供 trait 契约验证 binary 使用，不进 release。
 model-writer-mock = []
+# v3 Phase D：DuckLake backend skeleton。仅为 v4 真实实装预留 trait 接口面 +
+# 工厂分支。当前实现全部 `bail!("not yet implemented")`，不引入 duckdb crate
+# 依赖。启用方式：`cargo check --features ducklake`。默认不开启，避免污染生产构建。
+ducklake = []
 test = ["aios_core/test"]
 mem-kv-save = ["aios_core/mem-kv-save"] #额外保存PE数据到内存KV数据库
 kv-rocksdb = [

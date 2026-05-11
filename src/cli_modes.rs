@@ -1737,9 +1737,18 @@ pub async fn run_regen_model(
 
     // 统一走 trait：DrainOnly backend 的 cleanup 是 NoOp，确保压测模式不会误删数据；
     // Surreal backend 内部仍按既有顺序清理 legacy 模型关系 + refno_relations 扁平表。
+    //
+    // Lifecycle 契约：init → cleanup → ... → finalize。
+    // SurrealDB 侧 `init_model_tables` 走 DEFINE TABLE 语义，幂等可重复调；保留 init
+    // 是为了让未来需要 init 副作用的 backend（Parquet/DuckLake/...）不会被静默绕过。
     let model_writer = aios_database::fast_model::gen_model::model_writer::create_model_writer(
         &db_option_override,
     )?;
+    let writer_context =
+        aios_database::fast_model::gen_model::model_writer::ModelWriterContext::from_db_option(
+            &db_option_override,
+        );
+    model_writer.init(&writer_context).await?;
     model_writer
         .cleanup(
             aios_database::fast_model::gen_model::model_writer::CleanupRequest {

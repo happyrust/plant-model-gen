@@ -259,8 +259,8 @@
 | C | C.2 Factory + DbOption + CLI 接入 | complete | 2026-05-12 | commit `fb79afa8`，`model_writer_compare_with: Option<ModelWriterMode>`，validate 2c 守卫（拒 self-compare / drain-only / missing output_root），`--model-writer-compare-with` CLI |
 | C | C.3 Verify binary compare 路径 | complete | 2026-05-12 | commit `3300ed7d`，exit code 7 = compare wrapper fail；primary (mock) snapshot 校验 + candidate (parquet) 13 表落盘断言 |
 | C | C 阶段 PR | complete | 2026-05-12 | PR #15: https://github.com/happyrust/plant-model-gen/pull/15 （base = Phase B 分支，stack PR） |
-| D | D.1 DuckLakeModelWriterBackend 骨架 | pending | — | feature `ducklake` 守门 |
-| D | D.2 D 阶段 PR | pending | — | — |
+| D | D.1 DuckLakeModelWriterBackend 骨架 | complete | 2026-05-12 | commit `88071608`，feature `ducklake = []`，trait 8 方法全 `bail!`，工厂 cfg 守门；ModelWriterMode::DuckLake + parse + validate 守卫 |
+| D | D.2 D 阶段 PR | complete | 2026-05-12 | PR #16: https://github.com/happyrust/plant-model-gen/pull/16；`cargo check --features review` + `cargo check --features review,ducklake` 均 PASS |
 | E | E.1 validate-model-writer CLI umbrella | pending | — | — |
 | E | E.2 SQL parity scripts | pending | — | 13 张 Phase 1 表 × 2 个 SQL |
 | E | E.3 E 阶段 PR | pending | — | — |

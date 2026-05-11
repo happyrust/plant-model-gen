@@ -15,19 +15,24 @@
 //!   3 — snapshot 顺序不符
 //!   4 — 注入值未被 backend 返回
 //!   5 — 二次 init / cleanup-without-init 安全性断言失败
+//!   6 — Parquet backend 端到端路径失败（v3 Phase B）
 
 #![cfg(feature = "model-writer-mock")]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aios_core::RefnoEnum;
 use aios_core::geometry::ShapeInstancesData;
+use aios_database::fast_model::gen_model::canonical_records::CanonicalRawTable;
 use aios_database::fast_model::gen_model::mesh_generate::MeshResult;
 use aios_database::fast_model::gen_model::model_writer::{
     BaseInstanceBatch, BooleanBridgeRequest, CleanupRequest, FinalizeRequest, InstRelateAabbBatch,
-    MeshResultBatch, ModelWriterBackend, ModelWriterContext, ReconcileRequest, RecordingBackend,
+    MeshResultBatch, ModelWriterBackend, ModelWriterContext, ParquetModelWriterBackend,
+    ReconcileRequest, RecordingBackend,
 };
 use aios_database::options::{BooleanPipelineMode, ModelWriterMode};
 use dashmap::DashMap;
@@ -230,13 +235,184 @@ async fn main() -> ExitCode {
         return ExitCode::from(5);
     }
 
+    // ================================================================
+    // v3 Phase B：Parquet backend 端到端路径
+    // 走完整 8 个 trait 方法，校验 13 张 canonical raw 表的 JSONL 文件
+    // 都在 mission 05 §Layout 描述的位置出现。
+    // ================================================================
+    let parquet_root = temp_subdir("verify-parquet-backend");
+    if let Err(e) = std::fs::create_dir_all(&parquet_root) {
+        eprintln!(
+            "[verify] FAIL: cannot create temp parquet root {}: {}",
+            parquet_root.display(),
+            e
+        );
+        return ExitCode::from(6);
+    }
+    let parquet_dbnum: u32 = 0;
+    let parquet_backend: Arc<dyn ModelWriterBackend> = Arc::new(
+        ParquetModelWriterBackend::with_dbnum(parquet_root.clone(), parquet_dbnum),
+    );
+    let parquet_ctx = ModelWriterContext {
+        project_name: "verify-parquet".to_string(),
+        use_surrealdb: false,
+        defer_db_write: false,
+        mode: ModelWriterMode::Parquet,
+    };
+
+    if let Err(e) = parquet_backend.init(&parquet_ctx).await {
+        eprintln!("[verify] FAIL: parquet init: {}", e);
+        return ExitCode::from(6);
+    }
+    if let Err(e) = parquet_backend
+        .cleanup(CleanupRequest { seed_refnos: &[] })
+        .await
+    {
+        eprintln!("[verify] FAIL: parquet cleanup: {}", e);
+        return ExitCode::from(6);
+    }
+    let parquet_base_report = match parquet_backend
+        .write_base_batch(BaseInstanceBatch {
+            batch_id: 1,
+            shape_insts: &shape_insts,
+            mesh_aabb_map: &mesh_aabb_map,
+            replace_exist: false,
+            write_inst_relate_aabb: false,
+        })
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[verify] FAIL: parquet write_base_batch: {}", e);
+            return ExitCode::from(6);
+        }
+    };
+    if parquet_base_report.batch_id != 1 || parquet_base_report.missing_neg_count != 0 {
+        eprintln!(
+            "[verify] FAIL: parquet write_base_batch unexpected report batch_id={} missing_neg_count={}",
+            parquet_base_report.batch_id, parquet_base_report.missing_neg_count
+        );
+        return ExitCode::from(6);
+    }
+    if let Err(e) = parquet_backend
+        .persist_mesh_results(MeshResultBatch {
+            batch_id: 1,
+            mesh_results: &mesh_results,
+            mesh_aabb_map: &mesh_aabb_map,
+            mesh_pts_map: &mesh_pts_map,
+            file_mesh_state: false,
+        })
+        .await
+    {
+        eprintln!("[verify] FAIL: parquet persist_mesh_results: {}", e);
+        return ExitCode::from(6);
+    }
+    if let Err(e) = parquet_backend
+        .write_inst_relate_aabb(InstRelateAabbBatch {
+            batch_id: 1,
+            shape_insts: &shape_insts,
+            mesh_results: &mesh_results,
+            mesh_aabb_map: &mesh_aabb_map,
+        })
+        .await
+    {
+        eprintln!("[verify] FAIL: parquet write_inst_relate_aabb: {}", e);
+        return ExitCode::from(6);
+    }
+    let parquet_inserted = match parquet_backend
+        .reconcile_missing_neg(ReconcileRequest {
+            all_refnos: &[],
+            candidate_carriers: &[],
+        })
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[verify] FAIL: parquet reconcile_missing_neg: {}", e);
+            return ExitCode::from(6);
+        }
+    };
+    if parquet_inserted != 0 {
+        eprintln!(
+            "[verify] FAIL: parquet reconcile expected 0 (approximate semantic), got {}",
+            parquet_inserted
+        );
+        return ExitCode::from(6);
+    }
+    let parquet_bool_report = match parquet_backend
+        .run_boolean_bridge(BooleanBridgeRequest {
+            mode: BooleanPipelineMode::DbLegacy,
+            db_option: Arc::new(aios_core::options::DbOption::default()),
+            bool_tasks: Vec::new(),
+        })
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[verify] FAIL: parquet run_boolean_bridge: {}", e);
+            return ExitCode::from(6);
+        }
+    };
+    if parquet_bool_report.pipeline != "parquet" {
+        eprintln!(
+            "[verify] FAIL: parquet boolean bridge expected pipeline=`parquet`, got `{}`",
+            parquet_bool_report.pipeline
+        );
+        return ExitCode::from(6);
+    }
+    if let Err(e) = parquet_backend.finalize(FinalizeRequest::default()).await {
+        eprintln!("[verify] FAIL: parquet finalize: {}", e);
+        return ExitCode::from(6);
+    }
+
+    // 校验 13 张 canonical raw 表的 JSONL 文件路径
+    let raw_root = parquet_root.join("model_writer_storage").join("raw");
+    for table in CanonicalRawTable::all_phase1() {
+        let jsonl = raw_root
+            .join(table.as_str())
+            .join(format!("project_name={}", parquet_ctx.project_name))
+            .join(format!("dbnum={}", parquet_dbnum))
+            .join("batch_1.jsonl");
+        if !jsonl.exists() {
+            eprintln!(
+                "[verify] FAIL: parquet expected JSONL not found for table `{}`: {}",
+                table.as_str(),
+                jsonl.display()
+            );
+            return ExitCode::from(6);
+        }
+    }
+    // summary 文件也应存在
+    let summary_path = parquet_root
+        .join("model_writer_storage")
+        .join("summary")
+        .join(format!("project_name={}", parquet_ctx.project_name))
+        .join(format!("dbnum={}", parquet_dbnum))
+        .join("batch_1.json");
+    if !summary_path.exists() {
+        eprintln!(
+            "[verify] FAIL: parquet summary JSON not found: {}",
+            summary_path.display()
+        );
+        return ExitCode::from(6);
+    }
+
     println!(
-        "[verify] PASS — 9 个 trait 调用按预期记录（含二次 init），注入值 reconcile={} missing_neg={} 均被 honored",
+        "[verify] PASS — 9 个 trait 调用按预期记录（含二次 init），注入值 reconcile={} missing_neg={} 均被 honored；Parquet backend 13 张 canonical raw 表 + 1 份 summary JSON 全部落盘，输出根 = {}",
         INJECTED_RECONCILE,
-        injected_carriers.len()
+        injected_carriers.len(),
+        parquet_root.display()
     );
     for (idx, line) in snapshot.iter().enumerate() {
         println!("  [{}] {}", idx + 1, line);
     }
     ExitCode::SUCCESS
+}
+
+fn temp_subdir(label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("aios-{label}-{nanos}"))
 }

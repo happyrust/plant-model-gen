@@ -248,13 +248,13 @@
 
 | Phase | Task | Status | 完成时间 | 备注 |
 |---|---|---|---|---|
-| A | A.1 审查 + 处置 3 文件 | complete (local) | 2026-05-12 | mock.rs / options.rs CRLF 噪声 checkout；commit `29fa19ab` 含 progress.md + v3-plan.md；push 待用户授权 |
-| A | A.2 mission docs docs-only PR | commit-ready | 2026-05-12 | 新 worktree `.worktrees/docs-mission`，新分支 `docs/model-writer-storage-mission`，commit `a6beb555` 9 文件 +477；push + `gh pr create` 待用户授权 |
+| A | A.1 审查 + 处置 3 文件 | complete | 2026-05-12 | mock.rs / options.rs CRLF 噪声 checkout；commit `29fa19ab` + `58844c88` pushed to `feat/model-persistence-trait`，PR #11 自动 pick up |
+| A | A.2 mission docs docs-only PR | complete | 2026-05-12 | 分支 `docs/model-writer-storage-mission` commit `a6beb555` pushed；PR #13: https://github.com/happyrust/plant-model-gen/pull/13 |
 | A | A.3 rebase origin/main | deferred | — | PR #11 review 中，force-push 会让评论失效；推迟到 PR #11 合并阶段处理（GH UI merge --rebase 或合并前再 rebase） |
-| B | B.1 ParquetModelWriterBackend 骨架 | pending | — | — |
-| B | B.2 接入 create_model_writer 工厂 | pending | — | — |
-| B | B.3 Verify binary 加 Parquet 路径 | pending | — | — |
-| B | B.4 B 阶段 PR | pending | — | — |
+| B | B.1 ParquetModelWriterBackend 骨架 | complete | 2026-05-12 | commit `e93c559b`，parquet.rs +515/-262，含 8 个 trait 方法 + module doc 重写 |
+| B | B.2 接入 create_model_writer 工厂 | complete | 2026-05-12 | commit `0d91b496`，ModelWriterMode::Parquet + DbOptionExt 字段 + validate 守卫 + CLI flags `--parquet-output-root` / `--parquet-dbnum` |
+| B | B.3 Verify binary 加 Parquet 路径 | complete | 2026-05-12 | commit `a8ce553f`，exit code 6 = parquet path fail；13 canonical raw 表 + summary JSON 全部落盘断言 |
+| B | B.4 B 阶段 PR | complete | 2026-05-12 | PR #14: https://github.com/happyrust/plant-model-gen/pull/14；`cargo check --features review` + `verify_model_writer_trait` 均 PASS |
 | C | C.1 BackendSelection 枚举 + DbOption | pending | — | — |
 | C | C.2 Orchestrator compare 路径 | pending | — | — |
 | C | C.3 C 阶段 PR | pending | — | — |

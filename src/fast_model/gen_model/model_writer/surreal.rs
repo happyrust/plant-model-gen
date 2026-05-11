@@ -239,11 +239,14 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
                 "init not called before run_boolean_bridge",
             ));
         };
+        // v3 Phase F.2: db_option pulled from cached context (was an
+        // explicit field on BooleanBridgeRequest before).
+        let db_option = ctx.db_option.clone();
         match request.mode {
             BooleanPipelineMode::DbLegacy => {
                 if ctx.use_surrealdb && !ctx.defer_db_write {
                     println!("[model-writer:surreal] stage=boolean_bridge pipeline=db_legacy");
-                    run_boolean_worker(request.db_option, 100)
+                    run_boolean_worker(db_option, 100)
                         .await
                         .context("model_writer surreal db_legacy boolean bridge failed")?;
                     Ok(BooleanBridgeReport::db_legacy_executed())
@@ -267,10 +270,9 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
                     "[model-writer:surreal] stage=boolean_bridge pipeline=memory_tasks total_tasks={}",
                     request.bool_tasks.len()
                 );
-                let report =
-                    run_bool_worker_from_tasks(request.bool_tasks, request.db_option, None)
-                        .await
-                        .context("model_writer surreal memory_tasks boolean bridge failed")?;
+                let report = run_bool_worker_from_tasks(request.bool_tasks, db_option, None)
+                    .await
+                    .context("model_writer surreal memory_tasks boolean bridge failed")?;
                 Ok(report.into())
             }
         }

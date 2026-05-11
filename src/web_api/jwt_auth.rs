@@ -525,7 +525,7 @@ fn build_debug_claims(config: &ReviewAuthConfig) -> TokenClaims {
         } else {
             Some(role.to_string())
         },
-        workflow_mode: None,
+        workflow_mode: Some("internal".to_string()),
         legacy_form_id: None,
         exp: now + 365 * 24 * 3600,
         iat: now,

@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-05-11
+
+### Added — External Workflow Mode 默认模式 + 加固优化
+
+> 外部流程驱动模式（external workflow mode）现在是默认行为：token 中不带 `workflow_mode` 时自动按 external 处理，平台对 `assignee_id` 等外部流程身份只做透传，不再翻译成内部 PMS HumanCode 语义。
+
+#### 核心变更
+
+- `create_task`：external 模式下 `checker_id` / `approver_id` 原样保存，不做 HumanCode 校验；内部模式的 form_id 草稿可延迟写入负责人。
+- `workflow/sync`：从 JWT claims 注入 `workflow_mode`（`#[serde(skip)]`），external 模式跳过 `ensure_owner_matches` 和 `normalize_pms_human_code`。
+- 默认值：`workflow_mode` 为 None 时按 external 处理，与前端 `resolveWorkflowMode()` 默认值对齐。
+
+#### 加固优化
+
+- **安全**：debug_token 模式（`PLATFORM_AUTH_CONFIG.enabled = false`）下 `workflow_mode` 强制设为 `internal`，避免本地调试意外跳过校验。
+- **代码质量**：`resolve_create_task_assignees` 的双 bool 参数改为 `AssigneeValidation` enum（`External` / `InternalDeferred` / `InternalStrict`），消除语义不清的参数组合。
+- **防御日志**：`is_external_workflow` 对不在白名单内的 `workflow_mode` 值打 warn 日志。
+- **审计说明**：`create_record` 的 owner 校验有意保留不放宽，注释说明理由（记录归属需要审计完整性）。
+
+#### 测试
+
+- 新增单元测试：`external_workflow_next_step_preserves_raw_assignee_id`、`missing_workflow_mode_defaults_to_external_semantics`、`internal_workflow_next_step_still_rejects_non_human_code`、`external_workflow_return_preserves_raw_assignee_id`、`unexpected_workflow_mode_treated_as_external`、`debug_token_none_claims_sets_internal_mode`。
+- `review_api.rs` 新增 4 个 assignee 解析测试覆盖 deferred / external / legacy 组合。
+- Ubuntu 部署后 E2E 全流程通过：创建→送审→JD agree→SH 驳回→SJ 修复→重新 active→JD agree→SH agree→PZ 批准（`FORM-PMS-E2E-20260511174250`，7 条历史记录）。
+
 ## 2026-05-09
 
 ### Fixed — surrealdb 依赖 URL 统一 + origin/main 同步合并

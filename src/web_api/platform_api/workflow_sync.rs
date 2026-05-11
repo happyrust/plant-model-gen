@@ -351,7 +351,10 @@ fn fill_actor_from_claims(
     request: &mut SyncWorkflowRequest,
     claims: Option<TokenClaims>,
 ) -> Result<(), (StatusCode, String)> {
-    request.workflow_mode = claims.as_ref().and_then(|claims| claims.workflow_mode.clone());
+    request.workflow_mode = match &claims {
+        Some(c) => c.workflow_mode.clone(),
+        None => Some("internal".to_string()),
+    };
 
     if let Some(actor) = request.actor.as_mut() {
         if actor.name.trim().is_empty() {
@@ -385,7 +388,17 @@ fn fill_actor_from_claims(
 }
 
 fn is_external_workflow(request: &SyncWorkflowRequest) -> bool {
-    !matches!(request.workflow_mode.as_deref(), Some("manual" | "internal"))
+    match request.workflow_mode.as_deref() {
+        Some("manual" | "internal") => false,
+        Some("external") | None => true,
+        Some(other) => {
+            tracing::warn!(
+                "[WORKFLOW_SYNC] unexpected workflow_mode={:?}, treating as external",
+                other
+            );
+            true
+        }
+    }
 }
 
 /// `POST /api/review/workflow/verify`
@@ -1022,6 +1035,29 @@ mod tests {
         let error = resolve_required_next_step(&request, "active", false).unwrap_err();
 
         assert!(error.message.contains("PMS HumanCode"));
+    }
+
+    #[test]
+    fn external_workflow_return_preserves_raw_assignee_id() {
+        let request = sync_request_with_next_step("reviewer_ext_99", Some("external"));
+
+        let next_step =
+            resolve_required_next_step(&request, "return", true).expect("external return passes");
+
+        assert_eq!(next_step.assignee_id, "reviewer_ext_99");
+    }
+
+    #[test]
+    fn unexpected_workflow_mode_treated_as_external() {
+        let request = sync_request_with_next_step("actor_x", Some("typo_mode"));
+        assert!(super::is_external_workflow(&request));
+    }
+
+    #[test]
+    fn debug_token_none_claims_sets_internal_mode() {
+        let mut request = sync_request_with_next_step("JH", None);
+        request.workflow_mode = Some("internal".to_string());
+        assert!(!super::is_external_workflow(&request));
     }
 
     fn record_with_task_id(task_id: &str) -> WorkflowRecord {

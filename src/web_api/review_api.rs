@@ -269,6 +269,13 @@ struct CreateTaskResolvedAssignees {
     approver_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssigneeValidation {
+    External,
+    InternalDeferred,
+    InternalStrict,
+}
+
 fn preferred_name(value: Option<&str>, fallback: &str) -> String {
     value
         .map(str::trim)
@@ -338,10 +345,9 @@ fn resolve_create_task_external_field(value: Option<&str>) -> String {
 
 fn resolve_create_task_assignees(
     request: &CreateTaskRequest,
-    allow_deferred_assignees: bool,
-    external_workflow: bool,
+    validation: AssigneeValidation,
 ) -> Result<CreateTaskResolvedAssignees, String> {
-    if external_workflow {
+    if validation == AssigneeValidation::External {
         let checker_id = resolve_create_task_external_field(
             request
                 .checker_id
@@ -357,15 +363,16 @@ fn resolve_create_task_assignees(
         });
     }
 
+    let allow_deferred = validation == AssigneeValidation::InternalDeferred;
     let checker_id = resolve_create_task_human_code_or_defer(
         "checker_id",
         request.checker_id.as_deref().or(Some(request.reviewer_id.as_str())),
-        allow_deferred_assignees,
+        allow_deferred,
     )?;
     let approver_id = resolve_create_task_human_code_or_defer(
         "approver_id",
         request.approver_id.as_deref(),
-        allow_deferred_assignees,
+        allow_deferred,
     )?;
 
     Ok(CreateTaskResolvedAssignees {
@@ -1403,12 +1410,17 @@ async fn create_task(
         .as_ref()
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
-    let external_workflow = !matches!(claims.workflow_mode.as_deref(), Some("manual" | "internal"));
+    let assignee_validation = if !matches!(claims.workflow_mode.as_deref(), Some("manual" | "internal")) {
+        AssigneeValidation::External
+    } else if form_id_was_provided {
+        AssigneeValidation::InternalDeferred
+    } else {
+        AssigneeValidation::InternalStrict
+    };
 
     let assignees = match resolve_create_task_assignees(
         &request,
-        form_id_was_provided,
-        external_workflow,
+        assignee_validation,
     ) {
         Ok(assignees) => assignees,
         Err(message) => {
@@ -2511,6 +2523,10 @@ async fn create_record(
             }),
         );
     }
+    // NOTE: owner match is intentionally NOT relaxed for external workflow mode.
+    // Review records represent confirmed model-level data (annotations, measurements),
+    // and their authorship must match the node owner for audit trail integrity.
+    // External workflow relaxation only applies to workflow/sync flow transitions.
     if owner_id != operator_id {
         return (
             StatusCode::FORBIDDEN,
@@ -5780,7 +5796,7 @@ mod tests {
         let request = create_task_request_for_assignee_tests(Some("JH"), "", Some("SH"));
 
         let assignees =
-            resolve_create_task_assignees(&request, false, false).expect("HumanCode assignees pass");
+            resolve_create_task_assignees(&request, AssigneeValidation::InternalStrict).expect("HumanCode assignees pass");
 
         assert_eq!(assignees.checker_id, "JH");
         assert_eq!(assignees.reviewer_id, "JH");
@@ -5792,14 +5808,14 @@ mod tests {
         let checker_request =
             create_task_request_for_assignee_tests(Some("proofreader_001"), "", Some("SH"));
         let checker_error =
-            resolve_create_task_assignees(&checker_request, false, false).unwrap_err();
+            resolve_create_task_assignees(&checker_request, AssigneeValidation::InternalStrict).unwrap_err();
         assert!(checker_error.contains("checker_id"));
         assert!(checker_error.contains("PMS HumanCode"));
 
         let approver_request =
             create_task_request_for_assignee_tests(Some("JH"), "", Some("manager_001"));
         let approver_error =
-            resolve_create_task_assignees(&approver_request, false, false).unwrap_err();
+            resolve_create_task_assignees(&approver_request, AssigneeValidation::InternalStrict).unwrap_err();
         assert!(approver_error.contains("approver_id"));
         assert!(approver_error.contains("PMS HumanCode"));
     }
@@ -5808,12 +5824,12 @@ mod tests {
     fn test_resolve_create_task_assignees_rejects_missing_required_assignees() {
         let checker_request = create_task_request_for_assignee_tests(None, "", Some("SH"));
         let checker_error =
-            resolve_create_task_assignees(&checker_request, false, false).unwrap_err();
+            resolve_create_task_assignees(&checker_request, AssigneeValidation::InternalStrict).unwrap_err();
         assert!(checker_error.contains("checker_id"));
 
         let approver_request = create_task_request_for_assignee_tests(Some("JH"), "", None);
         let approver_error =
-            resolve_create_task_assignees(&approver_request, false, false).unwrap_err();
+            resolve_create_task_assignees(&approver_request, AssigneeValidation::InternalStrict).unwrap_err();
         assert!(approver_error.contains("approver_id"));
     }
 
@@ -5821,7 +5837,7 @@ mod tests {
     fn test_resolve_create_task_assignees_defers_missing_form_id_draft_assignees() {
         let request = create_task_request_for_assignee_tests(None, "", None);
 
-        let assignees = resolve_create_task_assignees(&request, true, false)
+        let assignees = resolve_create_task_assignees(&request, AssigneeValidation::InternalDeferred)
             .expect("form_id draft can defer next-node assignees");
 
         assert_eq!(assignees.checker_id, "");
@@ -5834,7 +5850,7 @@ mod tests {
         let request =
             create_task_request_for_assignee_tests(Some("proofreader_001"), "", Some("SH"));
 
-        let assignees = resolve_create_task_assignees(&request, true, false)
+        let assignees = resolve_create_task_assignees(&request, AssigneeValidation::InternalDeferred)
             .expect("form_id draft can ignore legacy placeholder assignees");
 
         assert_eq!(assignees.checker_id, "");
@@ -5850,7 +5866,7 @@ mod tests {
             Some("manager_001"),
         );
 
-        let assignees = resolve_create_task_assignees(&request, true, true)
+        let assignees = resolve_create_task_assignees(&request, AssigneeValidation::External)
             .expect("external workflow treats assignees as pass-through data");
 
         assert_eq!(assignees.checker_id, "proofreader_001");

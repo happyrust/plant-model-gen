@@ -99,3 +99,115 @@
 1. 用户确认 `findings.md §3` 待回答问题的最终选项（特别是 trait 命名、mock backend 启用方式）。
 2. 主仓 `feat/collab-api-consolidation` 工作区现有 `model_writer.rs` 未提交改动需要收口（提交或 stash），避免与 P4 rebase 冲突时混淆。
 3. 上述两点确认后，从 Task 1.1 开始按顺序实施。
+
+---
+
+## 2026-05-11 二期审核 + v2 收口
+
+> 触发：用户 2026-05-11 直接要求"审核当前 worktree 的 ModelWriteTrait 的实现"。
+> 审核结果：2 Critical / 5 Warning / 6 Note；plannotator v1 计划被退回 (DrainOnly 用途说明)，v2 已 approved。
+> 存档：`C:\Users\dpc\.plannotator\plans\2026-05-11-142958-modelwriterbackend-trait-v2-approved.md`
+
+### 自 b060860 以来的实际 HEAD 漂移（progress 同步）
+
+2026-05-09 P4 task 完成后，worktree 又进了 5 个 commit，进入文档目录 `docs/development/model-writer-storage/` 描述的 canonical raw boundary 阶段：
+
+| Commit | Title |
+|---|---|
+| `bf4bef80` | fix: resolve merge artifacts in workflow_sync, review_db, and remove stale patch blocks |
+| `f3c5750e` | Merge branch 'main' into feat/model-persistence-trait |
+| `a27d0685` | fix(deps): repair SurrealDB lock source |
+| `80fcc7eb` | Fix canonical raw record compilation |
+| `366cb275` | feat(model-writer): complete canonical raw coverage |
+| `04dbd9c3` | feat(model-writer): harden canonical validation CLI（当前 HEAD） |
+
+### 二期审核新发现（与 findings.md §4 联动）
+
+| 等级 | ID | 简述 | 修复 Task |
+|---|---|---|---|
+| Critical | C-A | `cli_modes::run_regen_model` 调 `cleanup` 但漏 `init`，违反 trait lifecycle 契约 | T1.1 |
+| Critical | C-B | DrainOnly 主管线快速路径绕过 trait 的 6 个中间方法，trait 化收益未真正兑现 — 用户拍板：保留快速路径作为 baseline | T1.2 |
+| Warning | W-A | `BooleanBridgeReport::skipped` 日志标签硬编码 `[model-writer:surreal]` 被多 backend 共用 | T2.1 |
+| Warning | W-B | `SurrealRecordKey::new` `starts_with` 分支会产出两种格式 record id | T2.2 |
+| Warning | W-C | `WriteBaseReport.missing_neg_carriers` 仍泄漏 `Vec<RefnoEnum>`；`#[non_exhaustive]` 实际无效 | T2.3 + P5 backlog |
+| Warning | W-D | `parquet.rs::CanonicalParquetWriter` 不实现 trait 却放在 `model_writer/` 顶层 | T2.4 |
+| Warning | W-E | `BooleanBridgeRequest::db_option` 仍暴露 `Arc<DbOption>` | T2.5（仅 TODO 标记）+ P5 backlog |
+| Note | N-1 | Cargo.toml `model-writer-drain` feature 死代码 | T3.1 |
+| Note | N-2 | mock backend 的 `injected_*` 字段未被 verify binary 使用 | T3.2 |
+| Note | N-3 | verify binary 只断言调用顺序前缀，强度不足 | T3.2 |
+| Note | N-4 | trait `name()` 改 const，dyn vtable 上不可行 → cancelled | T3.3 |
+| Note | N-5 | DrainOnly stats Mutex → atomic（性能优化） | P5 backlog |
+| Note | N-6 | `BooleanBridgeReport::skipped` 顺手 IO 违反构造器纯净 | 与 T2.1 合并 |
+
+### Decisions（不可逆架构约定）
+
+- **DrainOnly = baseline 模式**：跳过所有持久化、只跑生产端 + 调度，用于对比不同 backend 的写入耗时。`orchestrator.rs` 的快速路径 + `drain_only.rs` 中 6 个中间方法的"未路由" invariant 必须同时保留；只能整体改，不能拆。
+- **`WriteBaseReport.missing_neg_carriers` 短期保留**：拆 `take_missing_neg_carriers()` 推到 P5。
+- **`BooleanBridgeRequest::db_option` 短期保留**：抽 `BridgeContext` 推到 P5。
+- **`parquet.rs` 短期不接 trait 工厂**：与 docs/development/model-writer-storage Phase 1 共识一致，本轮只加位置说明。
+
+### P1 完成（2026-05-11）
+
+- **T1.1** cli_modes.rs:1738~1761 补 `init` 调用（包含 ModelWriterContext::from_db_option 注入）；添加 lifecycle 契约注释。`init_model_tables` 走 DEFINE TABLE 语义，幂等无副作用。
+- **T1.2** drain_only.rs 顶部加 module doc 锁定 DrainOnly baseline 架构 invariant；6 个中间方法函数体顶部各加 `architectural-invariant` 单行注释；orchestrator.rs:1112 快速路径上方加 9 行 `[arch]` 注释 + 重构前置条件。findings.md §3 表格新增 DrainOnly baseline 决策条目。
+
+### P2 完成（2026-05-11）
+
+- **T2.1** mod.rs:120-122 `BooleanBridgeReport::skipped` 把 `[model-writer:surreal]` 改为 `[model-writer:{pipeline}]`。
+- **T2.2** surreal.rs:284-308 `SurrealRecordKey::new` 删 `starts_with` 分支，白名单去 `:`；统一输出 `table:⟨raw_key⟩`。
+- **T2.3** mod.rs:155-167 删 `#[non_exhaustive]`，给 `missing_neg_carriers` 加 `///` doc 说明 P5 拆分计划。
+- **T2.4** parquet.rs:1 加 12 行 module doc；mod.rs:14, 28-31 加位置标注 (`Canonical raw record types & planner` / `Canonical raw sink scaffold`)。
+- **T2.5** mod.rs:88-89 给 `BooleanBridgeRequest::db_option` 加 `TODO(P5)` 注释。
+
+### P3 完成（2026-05-11）
+
+- **T3.1** Cargo.toml:256 删 `model-writer-drain = []`。`rg "model-writer-drain"` 仅在历史文档 `p2-implementation-guide.md:16` 一处残留（不动）。
+- **T3.2** verify binary 重写：
+  - 注入 `injected_reconcile_inserted=42` 和 `injected_missing_neg=vec![default, default]`，验证返回值精确匹配。
+  - 二次 `init` 安全断言（exit 5）。
+  - cleanup-without-init 安全断言（mock 路径，对应历史 cli_modes 残留场景）。
+  - snapshot 长度从 8 改为 9（含两次 init），并加"反例 — snapshot 不能含未预期方法名"硬检查。
+  - exit code 拓展：0 PASS / 1 trait err / 2 调用计数 / 3 顺序/反例 / 4 注入未被 honor / 5 二次 init 不安全。
+- **T3.3** findings.md N-4 标记 `Skipped 2026-05-11`，理由：dyn vtable 不能放 const。task_plan T5.2 标 `Cancelled 2026-05-11`。
+
+### P4 进行中（2026-05-11）
+
+- **T4.1** progress.md 同步至本节。
+- **T4.2** `git checkout -- src/options.rs` 清掉纯 CRLF/LF 噪声。其余 8 个文件都是真实改动，CRLF warning 由 git commit 时自动转换。
+- **T4.3 / T4.4** 等用户确认后再执行（按计划 v2 commit 分片 + push + gh pr create）。
+
+### Canonical raw boundary（平行工作流，不在本 PR 范围）
+
+- `src/fast_model/gen_model/canonical_records.rs`（新增 587L）
+- `src/fast_model/gen_model/model_writer/parquet.rs`（新增 254L，已加位置说明）
+- `docs/development/model-writer-storage/{00..08}-*.md`（9 文件 mission docs，untracked）
+
+未来 Phase 5 把 parquet.rs 升级为真正的 `ModelWriterBackend` 时与该 mission 合流。
+
+### Phase 进度表（二期）
+
+| Phase | Task | Status | 完成时间 | 备注 |
+|---|---|---|---|---|
+| P1 | T1.1 run_regen_model 补 init | complete | 2026-05-11 | cli_modes.rs:1743-1761；注释明确 lifecycle 契约 |
+| P1 | T1.2 DrainOnly baseline 文档/代码锁定 | complete | 2026-05-11 | drain_only.rs module doc + 6 个 invariant 注释；orchestrator.rs 9 行 [arch] 注释；findings.md §3 新增决策行 |
+| P2 | T2.1 skipped 日志去硬编码 | complete | 2026-05-11 | mod.rs:120-122 |
+| P2 | T2.2 SurrealRecordKey 去分支 | complete | 2026-05-11 | surreal.rs:284-308，白名单去 `:` |
+| P2 | T2.3 WriteBaseReport 去 non_exhaustive | complete | 2026-05-11 | mod.rs:155-167 |
+| P2 | T2.4 parquet.rs 位置说明 | complete | 2026-05-11 | parquet.rs:1 + mod.rs:14, 28-31 |
+| P2 | T2.5 BooleanBridgeRequest TODO | complete | 2026-05-11 | mod.rs:88-89 |
+| P3 | T3.1 删 model-writer-drain 死 feature | complete | 2026-05-11 | Cargo.toml |
+| P3 | T3.2 verify binary 增强 | complete | 2026-05-11 | 新增 INJECTED_RECONCILE、二次 init、cleanup-without-init、反例检查；exit code 拓展为 0-5 |
+| P3 | T3.3 N-4 / T5.2 Skipped | complete | 2026-05-11 | findings + task_plan 同步 |
+| P4 | T4.1 progress.md 同步 | complete | 2026-05-11 | 本节 |
+| P4 | T4.2 清 CRLF 噪声 | complete | 2026-05-11 | options.rs 还原；其余文件靠 git autocrlf 处理 |
+| P4 | T4.3 commit 分片 | pending | — | 待用户授权 |
+| P4 | T4.4 push + gh pr create | pending | — | 待用户授权 |
+
+### 验证记录（二期）
+
+| 时间 | 验证类型 | 命令 | 结果 |
+|---|---|---|---|
+| 2026-05-11 | IDE Lint | `ReadLints` × 8 个改动文件 | 无 lint 错误 |
+| 2026-05-11 | grep `model-writer-drain` in src/ | 死 feature 检查 | 0 命中（仅 p2-implementation-guide.md 历史文档残留） |
+| 2026-05-11 | grep `Option<Arc<dyn ModelWriterBackend>` | trait Option 化残留 | 0 命中 |
+| 2026-05-11 | Cargo build + Trait 契约 (verify binary) | `pwsh -NoProfile -File verify-mock.ps1` | 待跑（依赖本机 NASM 环境，P4 push 前补） |

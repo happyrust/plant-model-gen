@@ -1,3 +1,18 @@
+//! DrainOnly backend = baseline mode.
+//!
+//! Architecture invariant: when `ModelWriterMode::DrainOnly` is selected, the
+//! orchestrator takes the fast path (`run_drain_only_sink`) and only routes
+//! `init` + `finalize` through this trait impl. The middle six methods —
+//! `cleanup` / `write_base_batch` / `persist_mesh_results` /
+//! `write_inst_relate_aabb` / `reconcile_missing_neg` / `run_boolean_bridge` —
+//! exist as defensive scaffolding for the mock/verify binary and any future
+//! callsite that wants to drive the trait directly. They are intentionally
+//! **not** consumed by the production pipeline so that DrainOnly stays a clean
+//! "skip all persistence" baseline for measuring write-backend timing across
+//! Surreal / Parquet / DuckLake. Do not refactor the orchestrator to route
+//! these six methods without re-validating that the baseline IO-skip semantic
+//! is preserved (see `orchestrator.rs` `DrainOnly` fast-path comment).
+
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -123,6 +138,8 @@ impl ModelWriterBackend for DrainOnlyModelWriterBackend {
     }
 
     async fn cleanup(&self, request: CleanupRequest<'_>) -> anyhow::Result<()> {
+        // architectural-invariant: not called by orchestrator main pipeline
+        // when ModelWriterMode::DrainOnly is selected (baseline fast path).
         // Drain-only 是非持久化压测 sink，禁止删除任何现有数据；此处仅记录意图。
         println!(
             "[model-writer:drain-only] stage=cleanup noop seed_refnos={}",
@@ -135,6 +152,8 @@ impl ModelWriterBackend for DrainOnlyModelWriterBackend {
         &self,
         batch: BaseInstanceBatch<'_>,
     ) -> anyhow::Result<WriteBaseReport> {
+        // architectural-invariant: not called by orchestrator main pipeline
+        // when ModelWriterMode::DrainOnly is selected (baseline fast path).
         {
             let mut stats = self.stats.lock().expect("drain-only stats lock");
             stats.add_batch(batch.shape_insts);
@@ -154,6 +173,8 @@ impl ModelWriterBackend for DrainOnlyModelWriterBackend {
     }
 
     async fn persist_mesh_results(&self, batch: MeshResultBatch<'_>) -> anyhow::Result<()> {
+        // architectural-invariant: not called by orchestrator main pipeline
+        // when ModelWriterMode::DrainOnly is selected (baseline fast path).
         let count = batch.mesh_results.len();
         {
             let mut stats = self.stats.lock().expect("drain-only stats lock");
@@ -168,6 +189,8 @@ impl ModelWriterBackend for DrainOnlyModelWriterBackend {
     }
 
     async fn write_inst_relate_aabb(&self, batch: InstRelateAabbBatch<'_>) -> anyhow::Result<()> {
+        // architectural-invariant: not called by orchestrator main pipeline
+        // when ModelWriterMode::DrainOnly is selected (baseline fast path).
         {
             let mut stats = self.stats.lock().expect("drain-only stats lock");
             stats.inst_relate_aabb_batches += 1;
@@ -182,6 +205,8 @@ impl ModelWriterBackend for DrainOnlyModelWriterBackend {
     }
 
     async fn reconcile_missing_neg(&self, request: ReconcileRequest<'_>) -> anyhow::Result<usize> {
+        // architectural-invariant: not called by orchestrator main pipeline
+        // when ModelWriterMode::DrainOnly is selected (baseline fast path).
         println!(
             "[model-writer:drain-only] stage=reconcile_missing_neg noop all_refnos={} candidate_carriers={}",
             request.all_refnos.len(),
@@ -194,6 +219,8 @@ impl ModelWriterBackend for DrainOnlyModelWriterBackend {
         &self,
         request: BooleanBridgeRequest,
     ) -> anyhow::Result<BooleanBridgeReport> {
+        // architectural-invariant: not called by orchestrator main pipeline
+        // when ModelWriterMode::DrainOnly is selected (baseline fast path).
         println!(
             "[model-writer:drain-only] stage=boolean_bridge noop mode={:?} bool_tasks={}",
             request.mode,

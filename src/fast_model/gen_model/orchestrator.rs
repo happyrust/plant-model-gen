@@ -1109,6 +1109,18 @@ async fn process_index_tree_generation(
     let use_surrealdb = db_option.use_surrealdb;
     let defer_db_write = false;
 
+    // [arch] DrainOnly fast path = baseline mode.
+    //
+    // 由用户拍板（2026-05-11，docs/plans/2026-05-09-model-write-trait-followup/
+    // findings.md §3）：DrainOnly 用途是「跳过所有持久化、仅跑生产端与调度，作为
+    // baseline 对比不同 backend 的 IO 写入耗时」。本分支主动绕过 base_writer /
+    // mesh_stage / inst_aabb_writer 三个并行 stage，只把 trait 的 init+finalize
+    // 路由进来；DrainOnly backend 的中间六个方法在生产路径上**故意不会被走到**，
+    // 详见 `model_writer/drain_only.rs` 顶部 module doc。
+    //
+    // 重构本分支前必须：(1) 把 baseline 用途显式迁移到主管线（DrainOnly backend
+    // 中间方法 NoOp 让主管线 IO 失活）；(2) 跑一次同 dbnum 的 drain-only 模式确认
+    // 总耗时与既有基线一致；(3) 同步更新 drain_only.rs / findings.md。
     if db_option.model_writer_mode == ModelWriterMode::DrainOnly {
         println!(
             "[model-writer:drain-only] 启动压测消费端：生成 batch 真实运行，但跳过 SurrealDB 写入、mesh stage、AABB 回写和 boolean"

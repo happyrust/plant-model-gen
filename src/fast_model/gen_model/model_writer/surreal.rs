@@ -276,9 +276,13 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
 
 /// SurrealDB record id 的安全包装。
 ///
-/// 构造时强制 ASCII alphanum + `:` / `_` / `-`，禁止任意 String，避免
-/// SQL 拼接被外部输入污染。当前 record id 来源是内部 mesh hash，
-/// 该约束**不会**拒绝合法 key；如需扩展字符集（如 UTF-8 哈希），改这里。
+/// 构造时强制 ASCII alphanum + `_` / `-`（注意：`:` 被排除以确保 raw_key
+/// **不能**包含表前缀），禁止任意 String，避免 SQL 拼接被外部输入污染。
+/// 当前 record id 来源是内部 mesh hash，该约束**不会**拒绝合法 key；如需
+/// 扩展字符集（如 UTF-8 哈希），改这里。
+///
+/// 输出统一为 `table:⟨raw_key⟩` 形式（SurrealDB escaped record id 语法），
+/// 避免不同分支产出 `table:raw_key` 与 `table:⟨raw_key⟩` 两种格式不一致。
 struct SurrealRecordKey(String);
 
 impl SurrealRecordKey {
@@ -286,18 +290,12 @@ impl SurrealRecordKey {
         anyhow::ensure!(
             raw_key
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-')),
-            "SurrealRecordKey rejects non-ASCII raw_key for table {}: {:?}",
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')),
+            "SurrealRecordKey rejects raw_key (must be ASCII alphanum / `_` / `-`, no `:`) for table {}: {:?}",
             table,
             raw_key
         );
-        let prefix = format!("{}:", table);
-        let id = if raw_key.starts_with(&prefix) {
-            raw_key.to_string()
-        } else {
-            format!("{}⟨{}⟩", prefix, raw_key)
-        };
-        Ok(Self(id))
+        Ok(Self(format!("{}:⟨{}⟩", table, raw_key)))
     }
 
     fn as_str(&self) -> &str {

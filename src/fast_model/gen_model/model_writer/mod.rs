@@ -12,6 +12,8 @@ use super::manifold_bool::BoolWorkerReport;
 use super::mesh_generate::MeshResult;
 use crate::options::{BooleanPipelineMode, DbOptionExt, ModelWriterMode};
 
+// Canonical raw record types & planner; sits below trait backends (parallel
+// canonical raw boundary work, see docs/development/model-writer-storage/).
 pub use super::canonical_records::{
     CanonicalRawBatch, CanonicalRawPlanner, CanonicalRawRowCounts, CanonicalRawTable,
 };
@@ -25,6 +27,7 @@ mod surreal;
 pub use drain_only::{DrainOnlyModelWriterBackend, DrainOnlyStats, run_drain_only_sink};
 #[cfg(feature = "model-writer-mock")]
 pub use mock::RecordingBackend;
+// Canonical raw sink scaffold (not a ModelWriterBackend impl; not in factory).
 pub use parquet::{
     CanonicalParquetTableSummary, CanonicalParquetWriter, CanonicalParquetWriterConfig,
 };
@@ -85,6 +88,8 @@ pub struct ReconcileRequest<'a> {
 
 pub struct BooleanBridgeRequest {
     pub mode: BooleanPipelineMode,
+    // TODO(P5): replace with a minimal BridgeContext to remove DbOption coupling
+    // from the trait surface. See findings.md §3 (decision: keep short-term).
     pub db_option: Arc<aios_core::options::DbOption>,
     pub bool_tasks: Vec<BooleanTask>,
 }
@@ -117,8 +122,8 @@ impl BooleanBridgeReport {
 
     pub(crate) fn skipped(pipeline: &'static str, total: usize, reason: &str) -> Self {
         println!(
-            "[model-writer:surreal] stage=boolean_bridge skipped pipeline={} reason={} total={}",
-            pipeline, reason, total
+            "[model-writer:{}] stage=boolean_bridge skipped pipeline={} reason={} total={}",
+            pipeline, pipeline, reason, total
         );
         Self {
             pipeline,
@@ -153,10 +158,15 @@ impl From<BoolWorkerReport> for BooleanBridgeReport {
 /// 字段名 `missing_neg_carriers` 与历史 `pdms_inst::SaveInstanceDataReport` 保持兼容，
 /// 让 orchestrator 调用代码改动量为 0。
 #[derive(Debug, Clone, Default)]
-#[non_exhaustive]
 pub struct WriteBaseReport {
     pub batch_id: u64,
     pub missing_neg_count: usize,
+    /// 历史调用方需要的 `RefnoEnum` 集合，由 backend 在写 base batch 时收集。
+    ///
+    /// 这是 trait 接口里唯一仍带 `aios_core::RefnoEnum` 的字段，等同于把
+    /// "missing-neg 收集" 语义抬到 trait 层。P5 backlog (`T5.1`) 计划把这个字段
+    /// 拆为独立 trait 方法 `take_missing_neg_carriers(&self) -> Vec<RefnoEnum>`，
+    /// 让 backend 决定是否暴露 carriers；当前先保留以减少本 PR 的接口侵入面。
     pub missing_neg_carriers: Vec<RefnoEnum>,
 }
 

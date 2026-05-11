@@ -1,3 +1,12 @@
+//! Phase 1 canonical raw sink scaffold. **NOT a `ModelWriterBackend` impl.**
+//!
+//! 与 `surreal.rs` / `drain_only.rs` 不同，本文件不实现 trait、也不进 `create_model_writer`
+//! 工厂。它属于 `docs/development/model-writer-storage/` 描述的"canonical raw boundary"
+//! 平行工作流：在 trait backend 之下、`canonical_records.rs` 之上承担文件 sink 角色，
+//! 当前阶段输出 JSON Lines 以保留 layout，后续 Phase 5 才考虑升级为 typed Parquet 并
+//! 接入 trait 工厂。位置放在 `model_writer/` 是为了未来收口顺手；若让人困惑，可移到
+//! `canonical_records/` 子目录。
+
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};

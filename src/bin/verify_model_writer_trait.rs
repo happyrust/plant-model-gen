@@ -16,6 +16,7 @@
 //!   4 — 注入值未被 backend 返回
 //!   5 — 二次 init / cleanup-without-init 安全性断言失败
 //!   6 — Parquet backend 端到端路径失败（v3 Phase B）
+//!   7 — Compare wrapper 端到端路径失败（v3 Phase C）
 
 #![cfg(feature = "model-writer-mock")]
 
@@ -30,9 +31,9 @@ use aios_core::geometry::ShapeInstancesData;
 use aios_database::fast_model::gen_model::canonical_records::CanonicalRawTable;
 use aios_database::fast_model::gen_model::mesh_generate::MeshResult;
 use aios_database::fast_model::gen_model::model_writer::{
-    BaseInstanceBatch, BooleanBridgeRequest, CleanupRequest, FinalizeRequest, InstRelateAabbBatch,
-    MeshResultBatch, ModelWriterBackend, ModelWriterContext, ParquetModelWriterBackend,
-    ReconcileRequest, RecordingBackend,
+    BaseInstanceBatch, BooleanBridgeRequest, CleanupRequest, CompareModelWriterBackend,
+    FinalizeRequest, InstRelateAabbBatch, MeshResultBatch, ModelWriterBackend, ModelWriterContext,
+    ParquetModelWriterBackend, ReconcileRequest, RecordingBackend,
 };
 use aios_database::options::{BooleanPipelineMode, ModelWriterMode};
 use dashmap::DashMap;
@@ -397,11 +398,168 @@ async fn main() -> ExitCode {
         return ExitCode::from(6);
     }
 
+    // ================================================================
+    // v3 Phase C：Compare wrapper 端到端路径
+    // Primary = RecordingBackend，Candidate = ParquetModelWriterBackend；
+    // 校验：(1) wrapper 所有 8 方法都成功；(2) primary 收到完整调用链；
+    //       (3) candidate 13 张 raw 表落盘；(4) wrapper.name() 仍是 "compare"。
+    // ================================================================
+    let compare_root = temp_subdir("verify-compare-wrapper");
+    if let Err(e) = std::fs::create_dir_all(&compare_root) {
+        eprintln!(
+            "[verify] FAIL: cannot create temp compare root {}: {}",
+            compare_root.display(),
+            e
+        );
+        return ExitCode::from(7);
+    }
+    let compare_primary_concrete = Arc::new(RecordingBackend::default());
+    let compare_primary: Arc<dyn ModelWriterBackend> = compare_primary_concrete.clone();
+    let compare_candidate: Arc<dyn ModelWriterBackend> = Arc::new(
+        ParquetModelWriterBackend::with_dbnum(compare_root.clone(), 0),
+    );
+    let compare_wrapper: Arc<dyn ModelWriterBackend> = Arc::new(CompareModelWriterBackend::new(
+        compare_primary.clone(),
+        compare_candidate.clone(),
+    ));
+    let compare_ctx = ModelWriterContext {
+        project_name: "verify-compare".to_string(),
+        use_surrealdb: false,
+        defer_db_write: false,
+        mode: ModelWriterMode::Parquet,
+    };
+    if compare_wrapper.name() != "compare" {
+        eprintln!(
+            "[verify] FAIL: compare wrapper name expected `compare`, got `{}`",
+            compare_wrapper.name()
+        );
+        return ExitCode::from(7);
+    }
+    if let Err(e) = compare_wrapper.init(&compare_ctx).await {
+        eprintln!("[verify] FAIL: compare init: {}", e);
+        return ExitCode::from(7);
+    }
+    if let Err(e) = compare_wrapper
+        .cleanup(CleanupRequest { seed_refnos: &[] })
+        .await
+    {
+        eprintln!("[verify] FAIL: compare cleanup: {}", e);
+        return ExitCode::from(7);
+    }
+    if let Err(e) = compare_wrapper
+        .write_base_batch(BaseInstanceBatch {
+            batch_id: 1,
+            shape_insts: &shape_insts,
+            mesh_aabb_map: &mesh_aabb_map,
+            replace_exist: false,
+            write_inst_relate_aabb: false,
+        })
+        .await
+    {
+        eprintln!("[verify] FAIL: compare write_base_batch: {}", e);
+        return ExitCode::from(7);
+    }
+    if let Err(e) = compare_wrapper
+        .persist_mesh_results(MeshResultBatch {
+            batch_id: 1,
+            mesh_results: &mesh_results,
+            mesh_aabb_map: &mesh_aabb_map,
+            mesh_pts_map: &mesh_pts_map,
+            file_mesh_state: false,
+        })
+        .await
+    {
+        eprintln!("[verify] FAIL: compare persist_mesh_results: {}", e);
+        return ExitCode::from(7);
+    }
+    if let Err(e) = compare_wrapper
+        .write_inst_relate_aabb(InstRelateAabbBatch {
+            batch_id: 1,
+            shape_insts: &shape_insts,
+            mesh_results: &mesh_results,
+            mesh_aabb_map: &mesh_aabb_map,
+        })
+        .await
+    {
+        eprintln!("[verify] FAIL: compare write_inst_relate_aabb: {}", e);
+        return ExitCode::from(7);
+    }
+    if let Err(e) = compare_wrapper
+        .reconcile_missing_neg(ReconcileRequest {
+            all_refnos: &[],
+            candidate_carriers: &[],
+        })
+        .await
+    {
+        eprintln!("[verify] FAIL: compare reconcile_missing_neg: {}", e);
+        return ExitCode::from(7);
+    }
+    if let Err(e) = compare_wrapper
+        .run_boolean_bridge(BooleanBridgeRequest {
+            mode: BooleanPipelineMode::DbLegacy,
+            db_option: Arc::new(aios_core::options::DbOption::default()),
+            bool_tasks: Vec::new(),
+        })
+        .await
+    {
+        eprintln!("[verify] FAIL: compare run_boolean_bridge: {}", e);
+        return ExitCode::from(7);
+    }
+    if let Err(e) = compare_wrapper.finalize(FinalizeRequest::default()).await {
+        eprintln!("[verify] FAIL: compare finalize: {}", e);
+        return ExitCode::from(7);
+    }
+
+    // 校验 candidate 也产出了 13 张 canonical raw 表（compare wrapper 必须双写）
+    let compare_raw_root = compare_root.join("model_writer_storage").join("raw");
+    for table in CanonicalRawTable::all_phase1() {
+        let jsonl = compare_raw_root
+            .join(table.as_str())
+            .join(format!("project_name={}", compare_ctx.project_name))
+            .join(format!("dbnum={}", 0u32))
+            .join("batch_1.jsonl");
+        if !jsonl.exists() {
+            eprintln!(
+                "[verify] FAIL: compare candidate missing JSONL for `{}`: {}",
+                table.as_str(),
+                jsonl.display()
+            );
+            return ExitCode::from(7);
+        }
+    }
+
+    // 校验 primary（RecordingBackend）也收到全套调用
+    let compare_primary_methods: Vec<String> = compare_primary_concrete
+        .snapshot()
+        .iter()
+        .map(|line| line.split(':').next().unwrap_or("").to_string())
+        .collect();
+    let required_compare_methods = [
+        "init",
+        "cleanup",
+        "write_base_batch",
+        "persist_mesh_results",
+        "write_inst_relate_aabb",
+        "reconcile_missing_neg",
+        "run_boolean_bridge",
+        "finalize",
+    ];
+    for method in &required_compare_methods {
+        if !compare_primary_methods.iter().any(|m| m == method) {
+            eprintln!(
+                "[verify] FAIL: compare primary missed routed call `{}` (snapshot={:?})",
+                method, compare_primary_methods
+            );
+            return ExitCode::from(7);
+        }
+    }
+
     println!(
-        "[verify] PASS — 9 个 trait 调用按预期记录（含二次 init），注入值 reconcile={} missing_neg={} 均被 honored；Parquet backend 13 张 canonical raw 表 + 1 份 summary JSON 全部落盘，输出根 = {}",
+        "[verify] PASS — 9 个 trait 调用按预期记录（含二次 init），注入值 reconcile={} missing_neg={} 均被 honored；Parquet backend 13 张 canonical raw 表 + 1 份 summary JSON 全部落盘，输出根 = {}；Compare wrapper 双写到 primary + candidate 共 13 张 raw 表全部落盘，输出根 = {}",
         INJECTED_RECONCILE,
         injected_carriers.len(),
-        parquet_root.display()
+        parquet_root.display(),
+        compare_root.display()
     );
     for (idx, line) in snapshot.iter().enumerate() {
         println!("  [{}] {}", idx + 1, line);

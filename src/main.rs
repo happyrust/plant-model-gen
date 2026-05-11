@@ -661,6 +661,13 @@ async fn main() -> anyhow::Result<()> {
                 .value_name("DBNUM"),
         )
         .arg(
+            Arg::new("model-writer-compare-with")
+                .long("model-writer-compare-with")
+                .help("v3 Phase C compare mode: dual-write to candidate backend (surreal|parquet). Fail-fast on any candidate write failure (mission 03 §Error handling). drain-only is NOT a valid candidate.")
+                .value_name("BACKEND")
+                .value_parser(["surreal", "parquet"]),
+        )
+        .arg(
             Arg::new("export-parquet-after-gen")
                 .long("export-parquet-after-gen")
                 .help("After model generation, automatically export Parquet for each dbnum in manual_db_nums (instances/tubings/transforms/aabb)")
@@ -1208,6 +1215,23 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("parquet-dbnum 必须是 u32，传入 `{dbnum_raw}`: {e}"))?;
         db_option_ext.parquet_model_writer_dbnum = Some(dbnum);
         println!("🔧 parquet model-writer dbnum: {}", dbnum);
+    }
+    if let Some(candidate_raw) = matches.get_one::<String>("model-writer-compare-with") {
+        let candidate = match candidate_raw.as_str() {
+            "surreal" => ModelWriterMode::Surreal,
+            "parquet" => ModelWriterMode::Parquet,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "model-writer-compare-with 不支持值 `{other}`（仅 surreal | parquet）"
+                ));
+            }
+        };
+        db_option_ext.model_writer_compare_with = Some(candidate);
+        println!(
+            "🔧 model-writer compare mode 已启用: primary={} candidate={} fail_fast=true",
+            db_option_ext.model_writer_mode.as_str(),
+            candidate.as_str()
+        );
     }
     db_option_ext.validate_model_writer_features()?;
     if let Some(backend) = matches.get_one::<String>("transform-write-backend") {

@@ -391,6 +391,18 @@ pub struct DbOptionExt {
     #[serde(default)]
     pub parquet_model_writer_dbnum: Option<u32>,
 
+    /// Compare 模式 candidate backend：当 Some 时构造
+    /// `CompareModelWriterBackend(primary=model_writer_mode, candidate=this)`
+    /// 让 orchestrator 在不修改调用点的情况下完成双写 + 行级 diff 日志。
+    /// 失败语义遵循 mission `03-writer-architecture.md` §Error handling
+    /// （fail fast，禁止静默回退）。
+    ///
+    /// 约束：
+    /// - 不允许等于 primary（自我比较无意义）
+    /// - 不允许 `drain-only`（DrainOnly 是 baseline sink，非 candidate writer）
+    #[serde(default)]
+    pub model_writer_compare_with: Option<ModelWriterMode>,
+
     /// pe_transform 刷新结果写入后端。
     #[serde(default = "default_transform_write_backend")]
     pub transform_write_backend: TransformWriteBackend,
@@ -640,6 +652,35 @@ impl DbOptionExt {
             }
         }
 
+        // 2c) compare_with 合法性早期拒绝（mission 03 §Error handling: fail fast）
+        if let Some(candidate) = self.model_writer_compare_with {
+            if candidate == self.model_writer_mode {
+                anyhow::bail!(
+                    "model_writer_compare_with={} 与 model_writer={} 一致；移除 compare_with 或换不同后端",
+                    candidate.as_str(),
+                    self.model_writer_mode.as_str()
+                );
+            }
+            if matches!(candidate, ModelWriterMode::DrainOnly) {
+                anyhow::bail!(
+                    "model_writer_compare_with=drain-only 不被支持：DrainOnly 是 baseline 模式而非 candidate writer（mission docs/05 + v2 invariant）"
+                );
+            }
+            // candidate=parquet 需要 output_root；复用 2b 守卫语义
+            if matches!(candidate, ModelWriterMode::Parquet) {
+                let root = self
+                    .parquet_model_writer_output_root
+                    .as_ref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty());
+                if root.is_none() {
+                    anyhow::bail!(
+                        "model_writer_compare_with=parquet 要求 parquet_model_writer_output_root 非空"
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -704,6 +745,7 @@ impl From<DbOption> for DbOptionExt {
             model_writer_mode: ModelWriterMode::Surreal,
             parquet_model_writer_output_root: None,
             parquet_model_writer_dbnum: None,
+            model_writer_compare_with: None,
             transform_write_backend: TransformWriteBackend::Surreal,
             transform_read_backend: TransformReadBackend::Auto,
             transform_compare_backends: Vec::new(),
@@ -992,6 +1034,17 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_integer())
         .and_then(|v| u32::try_from(v).ok());
 
+    let model_writer_compare_with = toml_value
+        .get("model_writer_compare_with")
+        .and_then(|v| v.as_str())
+        .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "surreal" => Some(ModelWriterMode::Surreal),
+            "parquet" => Some(ModelWriterMode::Parquet),
+            // drain-only is intentionally excluded (baseline sink, not a candidate writer);
+            // unknown values fall through to None.
+            _ => None,
+        });
+
     // 构建 DbOptionExt
     let db_option_ext = DbOptionExt {
         inner: db_option,
@@ -1016,6 +1069,7 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         model_writer_mode,
         parquet_model_writer_output_root,
         parquet_model_writer_dbnum,
+        model_writer_compare_with,
         transform_write_backend,
         transform_read_backend,
         transform_compare_backends,

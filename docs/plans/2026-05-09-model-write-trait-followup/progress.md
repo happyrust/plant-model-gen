@@ -200,8 +200,8 @@
 | P3 | T3.3 N-4 / T5.2 Skipped | complete | 2026-05-11 | findings + task_plan 同步 |
 | P4 | T4.1 progress.md 同步 | complete | 2026-05-11 | 本节 |
 | P4 | T4.2 清 CRLF 噪声 | complete | 2026-05-11 | options.rs 还原；其余文件靠 git autocrlf 处理 |
-| P4 | T4.3 commit 分片 | pending | — | 待用户授权 |
-| P4 | T4.4 push + gh pr create | pending | — | 待用户授权 |
+| P4 | T4.3 commit 分片 | complete | 2026-05-11 | 5 commit: b4d93ca0 / c8faec3d / c63ea11e / 9678510c / 8bb69632 |
+| P4 | T4.4 push + gh pr create | complete | 2026-05-11 | https://github.com/happyrust/plant-model-gen/pull/11 |
 
 ### 验证记录（二期）
 
@@ -211,3 +211,58 @@
 | 2026-05-11 | grep `model-writer-drain` in src/ | 死 feature 检查 | 0 命中（仅 p2-implementation-guide.md 历史文档残留） |
 | 2026-05-11 | grep `Option<Arc<dyn ModelWriterBackend>` | trait Option 化残留 | 0 命中 |
 | 2026-05-11 | Cargo build + Trait 契约 (verify binary) | `pwsh -NoProfile -File verify-mock.ps1` | 待跑（依赖本机 NASM 环境，P4 push 前补） |
+
+---
+
+## 2026-05-12 v3 启动（plannotator approved）
+
+> 触发：用户 2026-05-12 直接要求 "继续使用 plannotator 规划 worktree model-persistence-trait 的实现进度"，AI 输出 v3 计划提交 plannotator，approved。
+> 存档：`C:\Users\dpc\.plannotator\plans\2026-05-11-014336-worktree-model-persistence-tra-approved.md`
+> 本地副本：`docs/plans/2026-05-09-model-write-trait-followup/v3-plan.md`
+
+### v3 目标
+
+在 v2 (PR #11) 落地的 trait abstraction 基础上，把 Parquet writer 升级为真正的 `ModelWriterBackend`，落地 orchestrator 多 backend 选择 + compare 模式，使 mission docs Phase 2 真正可用；同时清理 v2 残留的 worktree 脏文件与 9 份 untracked mission docs，按节奏拆分独立 PR。
+
+### v3 架构 invariants（沿用 v2 + 新增 4 条）
+
+新增 4 条：
+
+- Parquet writer 是 "file-oriented backend"，不替代 SurrealDB（mission 05）
+- DuckLake writer 在 v3 不实装，仅 feature-gated 骨架（trait impl 全 `bail!`），真正实装留 v4
+- compare 模式遵循 "fail fast, no silent fallback"
+- SurrealDB Cargo source 必须保持 `github.com/happyrust/surrealdb`
+
+### Phase 总览
+
+| Phase | 名称 | 独立 PR 分支 | 状态 |
+|---|---|---|---|
+| A | v2 残留 cleanup | （progress 同步 → PR #11；mission docs → `docs/model-writer-storage-mission`） | in_progress |
+| B | Parquet trait 化 | `feat/parquet-model-writer-backend` | pending |
+| C | Orchestrator backend selection + compare | `feat/model-writer-compare-mode` | pending |
+| D | DuckLake backend 骨架 | `feat/ducklake-backend-skeleton` | pending |
+| E | CLI + SQL validation 全套 | `feat/model-writer-validation-cli` | pending |
+| F | P5 backlog 收口 | 2 个 small PR | pending |
+
+### v3 milestones
+
+| Phase | Task | Status | 完成时间 | 备注 |
+|---|---|---|---|---|
+| A | A.1 审查 + 处置 3 文件 | in_progress | 2026-05-12 | mock.rs / options.rs CRLF 噪声已 checkout；progress.md + v3-plan.md 准备 commit |
+| A | A.2 mission docs docs-only PR | pending | — | 待 A.1 push 后启动 |
+| A | A.3 rebase origin/main | pending | — | 待 A.2 完成 |
+| B | B.1 ParquetModelWriterBackend 骨架 | pending | — | — |
+| B | B.2 接入 create_model_writer 工厂 | pending | — | — |
+| B | B.3 Verify binary 加 Parquet 路径 | pending | — | — |
+| B | B.4 B 阶段 PR | pending | — | — |
+| C | C.1 BackendSelection 枚举 + DbOption | pending | — | — |
+| C | C.2 Orchestrator compare 路径 | pending | — | — |
+| C | C.3 C 阶段 PR | pending | — | — |
+| D | D.1 DuckLakeModelWriterBackend 骨架 | pending | — | feature `ducklake` 守门 |
+| D | D.2 D 阶段 PR | pending | — | — |
+| E | E.1 validate-model-writer CLI umbrella | pending | — | — |
+| E | E.2 SQL parity scripts | pending | — | 13 张 Phase 1 表 × 2 个 SQL |
+| E | E.3 E 阶段 PR | pending | — | — |
+| F | F.1 take_missing_neg_carriers 拆 trait | pending | — | — |
+| F | F.2 BridgeContext 抽出 | pending | — | — |
+| F | F.3 F 阶段 PR | pending | — | small × 2 |

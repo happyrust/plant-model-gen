@@ -321,6 +321,162 @@ pub fn validate_canonical_parquet_writer_mode(
     })
 }
 
+// ====================================================================
+//  v3 Phase E: diff-summary — compare two Parquet model-writer summary
+//  JSON files (e.g. primary surreal export vs candidate parquet output,
+//  or two parquet runs across dbnums). Emits a structured JSON report
+//  that downstream SQL parity scripts can cross-reference.
+// ====================================================================
+
+#[derive(Debug, serde::Deserialize)]
+struct SummaryShape {
+    backend: Option<String>,
+    format: Option<String>,
+    project_name: Option<String>,
+    dbnum: Option<u32>,
+    batch_id: Option<u64>,
+    total_rows: Option<usize>,
+    tables: Option<Vec<SummaryTableShape>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SummaryTableShape {
+    table: Option<String>,
+    rows: Option<usize>,
+    path: Option<String>,
+    limitation: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SummaryDiffReport {
+    pub status: &'static str,
+    pub left: SummaryDiffSide,
+    pub right: SummaryDiffSide,
+    pub total_rows_diff: i64,
+    pub tables_with_diff: usize,
+    pub tables: Vec<SummaryTableDiff>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SummaryDiffSide {
+    pub path: String,
+    pub backend: Option<String>,
+    pub format: Option<String>,
+    pub project_name: Option<String>,
+    pub dbnum: Option<u32>,
+    pub batch_id: Option<u64>,
+    pub total_rows: Option<usize>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SummaryTableDiff {
+    pub table: String,
+    pub left_rows: Option<usize>,
+    pub right_rows: Option<usize>,
+    pub delta: i64,
+    pub left_path: Option<String>,
+    pub right_path: Option<String>,
+    pub left_limitation: Option<String>,
+    pub right_limitation: Option<String>,
+}
+
+/// Diff two canonical Parquet writer summary JSON files. Both inputs come from
+/// `CanonicalParquetWriter::write_raw_batch` (mission 07 §2a). Designed to be
+/// run from the `model-writer diff-summary` CLI for Phase E parity checks.
+pub fn diff_canonical_parquet_summary(
+    left_path: &Path,
+    right_path: &Path,
+) -> Result<SummaryDiffReport> {
+    let left: SummaryShape = read_summary(left_path)
+        .with_context(|| format!("failed to read --left {}", left_path.display()))?;
+    let right: SummaryShape = read_summary(right_path)
+        .with_context(|| format!("failed to read --right {}", right_path.display()))?;
+
+    let left_total = left.total_rows.unwrap_or(0) as i64;
+    let right_total = right.total_rows.unwrap_or(0) as i64;
+
+    let mut by_table: std::collections::BTreeMap<String, (Option<&SummaryTableShape>, Option<&SummaryTableShape>)> =
+        std::collections::BTreeMap::new();
+    if let Some(rows) = left.tables.as_ref() {
+        for row in rows {
+            if let Some(name) = row.table.as_ref() {
+                by_table.entry(name.clone()).or_insert((None, None)).0 = Some(row);
+            }
+        }
+    }
+    if let Some(rows) = right.tables.as_ref() {
+        for row in rows {
+            if let Some(name) = row.table.as_ref() {
+                by_table.entry(name.clone()).or_insert((None, None)).1 = Some(row);
+            }
+        }
+    }
+
+    let mut tables = Vec::with_capacity(by_table.len());
+    let mut tables_with_diff = 0usize;
+    for (name, (l, r)) in by_table {
+        let left_rows = l.and_then(|t| t.rows);
+        let right_rows = r.and_then(|t| t.rows);
+        let delta = (right_rows.unwrap_or(0) as i64) - (left_rows.unwrap_or(0) as i64);
+        if delta != 0 || left_rows.is_none() != right_rows.is_none() {
+            tables_with_diff += 1;
+        }
+        tables.push(SummaryTableDiff {
+            table: name,
+            left_rows,
+            right_rows,
+            delta,
+            left_path: l.and_then(|t| t.path.clone()),
+            right_path: r.and_then(|t| t.path.clone()),
+            left_limitation: l.and_then(|t| t.limitation.clone()),
+            right_limitation: r.and_then(|t| t.limitation.clone()),
+        });
+    }
+
+    let status = if tables_with_diff == 0 && left_total == right_total {
+        "match"
+    } else {
+        "diff"
+    };
+
+    Ok(SummaryDiffReport {
+        status,
+        left: SummaryDiffSide {
+            path: stable_path_string(left_path),
+            backend: left.backend,
+            format: left.format,
+            project_name: left.project_name,
+            dbnum: left.dbnum,
+            batch_id: left.batch_id,
+            total_rows: left.total_rows,
+        },
+        right: SummaryDiffSide {
+            path: stable_path_string(right_path),
+            backend: right.backend,
+            format: right.format,
+            project_name: right.project_name,
+            dbnum: right.dbnum,
+            batch_id: right.batch_id,
+            total_rows: right.total_rows,
+        },
+        total_rows_diff: right_total - left_total,
+        tables_with_diff,
+        tables,
+    })
+}
+
+fn read_summary(path: &Path) -> Result<SummaryShape> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("read summary file {}", path.display()))?;
+    let parsed: SummaryShape = serde_json::from_str(&content)
+        .with_context(|| format!("parse summary JSON {}", path.display()))?;
+    Ok(parsed)
+}
+
+fn stable_path_string(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
 fn parse_length_unit(unit: &str) -> LengthUnit {
     match unit.to_lowercase().as_str() {
         "mm" => LengthUnit::Millimeter,

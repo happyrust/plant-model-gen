@@ -791,7 +791,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .subcommand(
             Command::new("model-writer")
-                .about("Model writer storage validation utilities")
+                .about("Model writer storage validation utilities (v3 Phase E)")
                 .subcommand(
                     Command::new("validate-canonical-parquet")
                         .about("Validate CanonicalRawPlanner + CanonicalParquetWriter with an empty ShapeInstancesData fixture")
@@ -825,6 +825,32 @@ async fn main() -> anyhow::Result<()> {
                                 .default_value("1")
                                 .value_parser(clap::value_parser!(u64))
                                 .value_name("ID"),
+                        ),
+                )
+                .subcommand(
+                    Command::new("diff-summary")
+                        .about("v3 Phase E: diff two canonical Parquet writer summary JSON files (table row counts + limitations). Used for compare-mode parity checks without re-running gen-model.")
+                        .arg(
+                            Arg::new("left")
+                                .long("left")
+                                .short('l')
+                                .help("Path to the LEFT summary JSON file (e.g. baseline run)")
+                                .required(true)
+                                .value_name("PATH"),
+                        )
+                        .arg(
+                            Arg::new("right")
+                                .long("right")
+                                .short('r')
+                                .help("Path to the RIGHT summary JSON file (e.g. candidate run)")
+                                .required(true)
+                                .value_name("PATH"),
+                        )
+                        .arg(
+                            Arg::new("fail-on-diff")
+                                .long("fail-on-diff")
+                                .help("Exit with code 2 when status == \"diff\" (default: always exit 0 and print the JSON report)")
+                                .action(clap::ArgAction::SetTrue),
                         ),
                 ),
         )
@@ -1054,6 +1080,23 @@ async fn main() -> anyhow::Result<()> {
                 batch_id,
             )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
+        if let Some(("diff-summary", sub_matches)) = model_writer_matches.subcommand() {
+            let left = sub_matches
+                .get_one::<String>("left")
+                .map(PathBuf::from)
+                .expect("required by clap");
+            let right = sub_matches
+                .get_one::<String>("right")
+                .map(PathBuf::from)
+                .expect("required by clap");
+            let fail_on_diff = sub_matches.get_flag("fail-on-diff");
+            let report = cli_modes::diff_canonical_parquet_summary(&left, &right)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if fail_on_diff && report.status == "diff" {
+                std::process::exit(2);
+            }
             return Ok(());
         }
     }

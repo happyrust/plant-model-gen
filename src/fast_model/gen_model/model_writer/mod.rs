@@ -18,12 +18,14 @@ pub use super::canonical_records::{
     CanonicalRawBatch, CanonicalRawPlanner, CanonicalRawRowCounts, CanonicalRawTable,
 };
 
+mod compare;
 mod drain_only;
 #[cfg(feature = "model-writer-mock")]
 mod mock;
 mod parquet;
 mod surreal;
 
+pub use compare::CompareModelWriterBackend;
 pub use drain_only::{DrainOnlyModelWriterBackend, DrainOnlyStats, run_drain_only_sink};
 #[cfg(feature = "model-writer-mock")]
 pub use mock::RecordingBackend;
@@ -214,8 +216,13 @@ pub trait ModelWriterBackend: Send + Sync {
     async fn finalize(&self, request: FinalizeRequest) -> anyhow::Result<FinalizeSummary>;
 }
 
-pub fn create_model_writer(db_option: &DbOptionExt) -> anyhow::Result<Arc<dyn ModelWriterBackend>> {
-    let backend: Arc<dyn ModelWriterBackend> = match db_option.model_writer_mode {
+/// Build a single backend instance for the given mode. Used both for the
+/// primary backend and (when configured) for the compare-mode candidate.
+fn build_single_backend(
+    db_option: &DbOptionExt,
+    mode: ModelWriterMode,
+) -> anyhow::Result<Arc<dyn ModelWriterBackend>> {
+    let backend: Arc<dyn ModelWriterBackend> = match mode {
         ModelWriterMode::Surreal => Arc::new(SurrealModelWriterBackend::default()),
         ModelWriterMode::DrainOnly => Arc::new(DrainOnlyModelWriterBackend::default()),
         ModelWriterMode::Parquet => {
@@ -235,9 +242,42 @@ pub fn create_model_writer(db_option: &DbOptionExt) -> anyhow::Result<Arc<dyn Mo
             ))
         }
     };
+    Ok(backend)
+}
+
+pub fn create_model_writer(db_option: &DbOptionExt) -> anyhow::Result<Arc<dyn ModelWriterBackend>> {
+    let primary = build_single_backend(db_option, db_option.model_writer_mode)?;
+
+    // v3 Phase C: compare mode dual-write wrapper.
+    if let Some(candidate_mode) = db_option.model_writer_compare_with {
+        if candidate_mode == db_option.model_writer_mode {
+            anyhow::bail!(
+                "model_writer_compare_with={} duplicates primary model_writer_mode={}; remove compare_with or pick a different backend",
+                candidate_mode.as_str(),
+                db_option.model_writer_mode.as_str()
+            );
+        }
+        if matches!(candidate_mode, ModelWriterMode::DrainOnly) {
+            anyhow::bail!(
+                "model_writer_compare_with=drain-only is not supported: DrainOnly is a baseline sink, not a candidate writer (mission docs/05 + v2 invariant)"
+            );
+        }
+        let candidate = build_single_backend(db_option, candidate_mode)?;
+        let wrapper = Arc::new(CompareModelWriterBackend::new(
+            primary.clone(),
+            candidate.clone(),
+        ));
+        println!(
+            "[model-writer] factory selected primary={} mirror={} fail_fast=true wrapper=compare",
+            primary.name(),
+            candidate.name()
+        );
+        return Ok(wrapper);
+    }
+
     println!(
         "[model-writer] factory selected primary={} mirror=none fail_fast=true",
-        backend.name()
+        primary.name()
     );
-    Ok(backend)
+    Ok(primary)
 }

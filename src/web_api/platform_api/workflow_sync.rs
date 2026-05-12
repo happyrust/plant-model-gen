@@ -512,6 +512,43 @@ pub async fn verify_workflow_handler(
                 );
                 (response, true, None::<String>, "ok".to_string())
             }
+            Err(error)
+                if kind == WorkflowMutationKind::Active
+                    && error
+                        .verify_task_status
+                        .as_deref()
+                        .map_or(false, |s| s == "blank") =>
+            {
+                info!(
+                    "[WORKFLOW_VERIFY] active on blank form - form_id={}, 放行（尚未创建 task）",
+                    request.form_id
+                );
+                let response = (
+                    StatusCode::OK,
+                    Json(VerifyWorkflowResponse {
+                        code: 200,
+                        message: "ok".to_string(),
+                        data: Some(VerifyWorkflowData {
+                            passed: true,
+                            action: "active".to_string(),
+                            block_code: None,
+                            current_node: None,
+                            task_status: Some("blank".to_string()),
+                            next_step: Some("jd".to_string()),
+                            actor_id: None,
+                            owner_id: None,
+                            owner_source: None,
+                            expected_next_node: Some("jd".to_string()),
+                            requested_next_step: None,
+                            reason: "表单尚未创建 task，active 可继续".to_string(),
+                            recommended_action: "proceed".to_string(),
+                        }),
+                        error_code: None,
+                        annotation_check: None,
+                    }),
+                );
+                (response, true, None::<String>, "blank_passthrough".to_string())
+            }
             Err(error) => {
                 let block_code = error
                     .verify_block_code

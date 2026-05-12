@@ -4,9 +4,16 @@
 //! 明确列投影而非 `SELECT *`，并保持与 `review_form::REVIEW_TASK_ACTIVE_SQL` 一致的任务可见性语义。
 
 use axum::{extract::Json, http::StatusCode, response::IntoResponse};
+use serde::Deserialize;
 use serde_json::Value;
 use std::{collections::BTreeSet, path::Path, sync::OnceLock};
 use surrealdb::types::SurrealValue;
+
+#[derive(Deserialize, SurrealValue)]
+struct UpdateHitRow {
+    #[allow(dead_code)]
+    id: surrealdb::types::RecordId,
+}
 use tracing::{info, warn};
 
 use crate::web_api::review_annotation_state::load_annotation_states_by_task;
@@ -993,7 +1000,7 @@ fn workflow_next_step_diagnostic(
 }
 
 fn ensure_workflow_task_update_hit(
-    updated_rows: Vec<Value>,
+    updated_rows: Vec<UpdateHitRow>,
     precheck: &WorkflowMutationPrecheck,
     next_step: Option<String>,
 ) -> Result<(), WorkflowSyncActionError> {
@@ -1851,7 +1858,7 @@ async fn apply_workflow_active(
                 format!("更新 review_tasks 失败: {}", error),
             )
         })?;
-    let updated_rows: Vec<Value> = response.take(0).map_err(|error| {
+    let updated_rows: Vec<UpdateHitRow> = response.take(0).map_err(|error| {
         WorkflowSyncActionError::plain(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("解析 review_tasks 更新结果失败: {}", error),
@@ -1980,7 +1987,7 @@ async fn apply_workflow_return(
                 format!("更新 review_tasks 失败: {}", error),
             )
         })?;
-    let updated_rows: Vec<Value> = response.take(0).map_err(|error| {
+    let updated_rows: Vec<UpdateHitRow> = response.take(0).map_err(|error| {
         WorkflowSyncActionError::plain(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("解析 review_tasks 更新结果失败: {}", error),
@@ -2129,7 +2136,7 @@ async fn apply_workflow_agree(
                 format!("更新 review_tasks 失败: {}", error),
             )
         })?;
-    let updated_rows: Vec<Value> = response.take(0).map_err(|error| {
+    let updated_rows: Vec<UpdateHitRow> = response.take(0).map_err(|error| {
         WorkflowSyncActionError::plain(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("解析 review_tasks 更新结果失败: {}", error),
@@ -2239,7 +2246,7 @@ async fn apply_workflow_stop(
                 format!("更新 review_tasks 失败: {}", error),
             )
         })?;
-    let updated_rows: Vec<Value> = response.take(0).map_err(|error| {
+    let updated_rows: Vec<UpdateHitRow> = response.take(0).map_err(|error| {
         WorkflowSyncActionError::plain(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("解析 review_tasks 更新结果失败: {}", error),

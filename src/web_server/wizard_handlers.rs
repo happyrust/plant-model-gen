@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::web_server::AppState;
 use crate::web_server::models::*;
@@ -760,10 +760,15 @@ pub fn open_deployment_sites_sqlite() -> Result<rusqlite::Connection, Box<dyn st
             completed_at TEXT,
             progress_percentage REAL DEFAULT 0.0,
             current_step TEXT,
+            progress_json TEXT,
             logs_json TEXT DEFAULT '[]'
         )",
         rusqlite::params![],
     )?;
+    let _ = conn.execute(
+        "ALTER TABLE wizard_tasks ADD COLUMN progress_json TEXT",
+        rusqlite::params![],
+    );
 
     Ok(conn)
 }
@@ -778,12 +783,10 @@ fn save_task_to_sqlite(
     let config_json = serde_json::to_string(&task.config)?;
     let wizard_config_json = wizard_config.map(|wc| serde_json::to_string(wc).unwrap_or_default());
     let logs_json = serde_json::to_string(&task.logs)?;
+    let progress_json = serde_json::to_string(&task.progress)?;
     let priority_str = format!("{:?}", task.priority);
     let status_str = format!("{:?}", task.status);
     let task_type_str = format!("{:?}", task.task_type);
-
-    // 简化时间处理 - 使用当前时间
-    let created_at = chrono::Utc::now().to_rfc3339();
 
     let progress_percentage = task.progress.percentage as f64;
     let current_step = Some(task.progress.current_step.as_str());
@@ -792,8 +795,8 @@ fn save_task_to_sqlite(
         "INSERT OR REPLACE INTO wizard_tasks (
             id, name, task_type, status, config_json, wizard_config_json, 
             priority, created_at, updated_at, started_at, completed_at,
-            progress_percentage, current_step, logs_json
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            progress_percentage, current_step, progress_json, logs_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         rusqlite::params![
             task.id,
             task.name,
@@ -802,17 +805,104 @@ fn save_task_to_sqlite(
             config_json,
             wizard_config_json,
             priority_str,
-            created_at,
+            system_time_to_rfc3339(Some(task.created_at)),
             chrono::Utc::now().to_rfc3339(),
-            None::<String>, // started_at
-            None::<String>, // completed_at
+            system_time_to_rfc3339(task.started_at),
+            system_time_to_rfc3339(task.completed_at),
             progress_percentage,
             current_step,
+            progress_json,
             logs_json
         ],
     )?;
 
     Ok(())
+}
+
+pub fn persist_task_progress_to_sqlite(task: &TaskInfo) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = open_deployment_sites_sqlite()?;
+
+    let logs_json = serde_json::to_string(&task.logs)?;
+    let progress_json = serde_json::to_string(&task.progress)?;
+    let status_str = format!("{:?}", task.status);
+
+    let updated = conn.execute(
+        "UPDATE wizard_tasks
+         SET status = ?1,
+             updated_at = ?2,
+             started_at = ?3,
+             completed_at = ?4,
+             progress_percentage = ?5,
+             current_step = ?6,
+             progress_json = ?7,
+             logs_json = ?8
+         WHERE id = ?9",
+        rusqlite::params![
+            status_str,
+            chrono::Utc::now().to_rfc3339(),
+            system_time_to_rfc3339(task.started_at),
+            system_time_to_rfc3339(task.completed_at),
+            task.progress.percentage as f64,
+            task.progress.current_step,
+            progress_json,
+            logs_json,
+            task.id
+        ],
+    )?;
+
+    if updated == 0 {
+        save_task_to_sqlite(task, None)?;
+    }
+
+    Ok(())
+}
+
+fn system_time_to_rfc3339(time: Option<SystemTime>) -> Option<String> {
+    time.map(|value| {
+        let datetime: chrono::DateTime<chrono::Utc> = value.into();
+        datetime.to_rfc3339()
+    })
+}
+
+fn rfc3339_to_system_time(value: Option<String>) -> Option<SystemTime> {
+    value
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+        .map(|datetime| {
+            UNIX_EPOCH + Duration::from_millis(datetime.timestamp_millis().max(0) as u64)
+        })
+}
+
+fn task_type_from_str(value: &str) -> TaskType {
+    match value {
+        "DataGeneration" => TaskType::DataGeneration,
+        "SpatialTreeGeneration" => TaskType::SpatialTreeGeneration,
+        "FullGeneration" => TaskType::FullGeneration,
+        "MeshGeneration" => TaskType::MeshGeneration,
+        "ParsePdmsData" => TaskType::ParsePdmsData,
+        "DataParsingWizard" => TaskType::DataParsingWizard,
+        "RefnoModelGeneration" => TaskType::RefnoModelGeneration,
+        "ModelExport" => TaskType::ModelExport,
+        _ => TaskType::Custom(value.to_string()),
+    }
+}
+
+fn task_status_from_str(value: &str) -> TaskStatus {
+    match value {
+        "Running" => TaskStatus::Running,
+        "Completed" => TaskStatus::Completed,
+        "Failed" => TaskStatus::Failed,
+        "Cancelled" => TaskStatus::Cancelled,
+        _ => TaskStatus::Pending,
+    }
+}
+
+fn task_priority_from_str(value: Option<String>) -> TaskPriority {
+    match value.as_deref() {
+        Some("Low") => TaskPriority::Low,
+        Some("High") => TaskPriority::High,
+        Some("Urgent") => TaskPriority::Urgent,
+        _ => TaskPriority::Normal,
+    }
 }
 
 /// 浏览目录结构
@@ -968,7 +1058,7 @@ pub fn restore_tasks_from_sqlite() -> Vec<TaskInfo> {
     let mut stmt = match conn.prepare(
         "SELECT id, name, task_type, status, config_json, wizard_config_json, 
          priority, created_at, started_at, completed_at, progress_percentage, 
-         current_step, logs_json FROM wizard_tasks WHERE status IN ('Pending', 'Running')",
+         current_step, logs_json, progress_json FROM wizard_tasks WHERE status IN ('Pending', 'Running')",
     ) {
         Ok(s) => s,
         Err(_) => return tasks,
@@ -977,20 +1067,36 @@ pub fn restore_tasks_from_sqlite() -> Vec<TaskInfo> {
     let task_iter = match stmt.query_map(rusqlite::params![], |row: &rusqlite::Row| {
         let id: String = row.get(0)?;
         let name: String = row.get(1)?;
-        let _task_type_str: String = row.get(2)?;
-        let _status_str: String = row.get(3)?;
+        let task_type_str: String = row.get(2)?;
+        let status_str: String = row.get(3)?;
         let config_json: String = row.get(4)?;
+        let priority_str: Option<String> = row.get(6)?;
+        let created_at: Option<String> = row.get(7)?;
+        let started_at: Option<String> = row.get(8)?;
+        let completed_at: Option<String> = row.get(9)?;
         let progress_percentage: Option<f64> = row.get(10)?;
         let current_step: Option<String> = row.get(11)?;
         let logs_json: String = row.get(12)?;
+        let progress_json: Option<String> = row.get(13)?;
 
         // 解析配置
         if let Ok(config) = serde_json::from_str::<DatabaseConfig>(&config_json) {
-            let mut task = TaskInfo::new(name, TaskType::DataParsingWizard, config);
+            let mut task = TaskInfo::new(name, task_type_from_str(&task_type_str), config);
             task.id = id;
+            task.status = task_status_from_str(&status_str);
+            task.priority = task_priority_from_str(priority_str);
+            if let Some(created_at) = rfc3339_to_system_time(created_at) {
+                task.created_at = created_at;
+            }
+            task.started_at = rfc3339_to_system_time(started_at);
+            task.completed_at = rfc3339_to_system_time(completed_at);
 
             // 设置进度
-            if let Some(percentage) = progress_percentage {
+            if let Some(progress_json) = progress_json {
+                if let Ok(progress) = serde_json::from_str::<TaskProgress>(&progress_json) {
+                    task.progress = progress;
+                }
+            } else if let Some(percentage) = progress_percentage {
                 task.progress = TaskProgress {
                     current_step: current_step.unwrap_or_default(),
                     total_steps: 1,

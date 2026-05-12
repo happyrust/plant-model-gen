@@ -284,6 +284,9 @@ fn dbnum_load_lock(dbnum: u32) -> Arc<Mutex<()>> {
 
 /// 清空全局 transform 缓存（分批生成时在批次间调用）。
 pub fn clear_global_transform_cache() -> usize {
+    if let Some(locks) = DBNUM_LOAD_LOCKS.get() {
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
     GLOBAL_TRANSFORM_CACHE
         .get()
         .map(|mgr| mgr.clear())
@@ -703,12 +706,22 @@ pub async fn get_world_transforms_cache_first_batch(
         }
     }
 
-    for refno in still_missing {
-        if let Ok(Some(world)) = aios_core::get_world_transform(refno).await {
-            out.insert(refno, world.clone());
-            if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
-                if let Some(&dbnum) = dbnum_map.get(&refno) {
-                    cache.insert_world_transform(dbnum, refno, world);
+    if !still_missing.is_empty() {
+        let still_missing_vec: Vec<RefnoEnum> = still_missing.into_iter().collect();
+        let mut stream =
+            futures::stream::iter(still_missing_vec.into_iter().map(|refno| async move {
+                let world = aios_core::get_world_transform(refno).await.ok().flatten();
+                (refno, world)
+            }))
+            .buffer_unordered(64);
+
+        while let Some((refno, world)) = stream.next().await {
+            if let Some(world) = world {
+                out.insert(refno, world.clone());
+                if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
+                    if let Some(&dbnum) = dbnum_map.get(&refno) {
+                        cache.insert_world_transform(dbnum, refno, world);
+                    }
                 }
             }
         }
@@ -775,15 +788,16 @@ pub async fn get_local_transforms_cache_first_batch(
         .filter(|refno| !local_store_hits.contains(refno))
         .collect::<Vec<_>>();
 
-    let mut stream = futures::stream::iter(compute_misses.iter().copied().map(|refno| async move {
-        let local = aios_core::transform::get_local_mat4(refno)
-            .await
-            .ok()
-            .flatten()
-            .and_then(transform_from_dmat4);
-        (refno, local)
-    }))
-    .buffer_unordered(64);
+    let mut stream =
+        futures::stream::iter(compute_misses.iter().copied().map(|refno| async move {
+            let local = aios_core::transform::get_local_mat4(refno)
+                .await
+                .ok()
+                .flatten()
+                .and_then(transform_from_dmat4);
+            (refno, local)
+        }))
+        .buffer_unordered(64);
 
     while let Some((refno, local)) = stream.next().await {
         if let Some(local) = local {
@@ -806,15 +820,18 @@ async fn query_world_transforms_from_configured_store(
     let backend = db_option
         .map(|option| option.transform_read_backend)
         .unwrap_or(TransformReadBackend::Auto);
-    if matches!(backend, TransformReadBackend::Auto | TransformReadBackend::Surreal) {
+    if matches!(
+        backend,
+        TransformReadBackend::Auto | TransformReadBackend::Surreal
+    ) {
         return transform_rkyv_cache::query_world_transforms_from_pe_transform(refnos).await;
     }
 
     let Some(db_option) = db_option else {
         return transform_rkyv_cache::query_world_transforms_from_pe_transform(refnos).await;
     };
-    let entries = crate::pe_transform_store::load_entries_with_backend(db_option, backend, refnos)
-        .await?;
+    let entries =
+        crate::pe_transform_store::load_entries_with_backend(db_option, backend, refnos).await?;
     Ok(entries
         .into_iter()
         .filter_map(|entry| entry.world.map(|world| (entry.refno, world)))
@@ -828,15 +845,18 @@ async fn query_local_transforms_from_configured_store(
     let backend = db_option
         .map(|option| option.transform_read_backend)
         .unwrap_or(TransformReadBackend::Auto);
-    if matches!(backend, TransformReadBackend::Auto | TransformReadBackend::Surreal) {
+    if matches!(
+        backend,
+        TransformReadBackend::Auto | TransformReadBackend::Surreal
+    ) {
         return Ok(HashMap::new());
     }
 
     let Some(db_option) = db_option else {
         return Ok(HashMap::new());
     };
-    let entries = crate::pe_transform_store::load_entries_with_backend(db_option, backend, refnos)
-        .await?;
+    let entries =
+        crate::pe_transform_store::load_entries_with_backend(db_option, backend, refnos).await?;
     Ok(entries
         .into_iter()
         .filter_map(|entry| entry.local.map(|local| (entry.refno, local)))

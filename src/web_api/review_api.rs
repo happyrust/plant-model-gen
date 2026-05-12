@@ -302,13 +302,13 @@ fn resolve_create_task_human_code_field(
     field_name: &str,
     value: Option<&str>,
 ) -> Result<String, String> {
-    let trimmed = value.map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
-        format!("{field_name} 缺少 PMS HumanCode，不能使用旧内部默认账号")
-    })?;
+    let trimmed = value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{field_name} 缺少 PMS HumanCode，不能使用旧内部默认账号"))?;
 
-    normalize_create_task_human_code(trimmed).ok_or_else(|| {
-        format!("{field_name} 必须是 PMS HumanCode，不能使用旧内部账号: {trimmed}")
-    })
+    normalize_create_task_human_code(trimmed)
+        .ok_or_else(|| format!("{field_name} 必须是 PMS HumanCode，不能使用旧内部账号: {trimmed}"))
 }
 
 fn resolve_create_task_human_code_or_defer(
@@ -366,7 +366,10 @@ fn resolve_create_task_assignees(
     let allow_deferred = validation == AssigneeValidation::InternalDeferred;
     let checker_id = resolve_create_task_human_code_or_defer(
         "checker_id",
-        request.checker_id.as_deref().or(Some(request.reviewer_id.as_str())),
+        request
+            .checker_id
+            .as_deref()
+            .or(Some(request.reviewer_id.as_str())),
         allow_deferred,
     )?;
     let approver_id = resolve_create_task_human_code_or_defer(
@@ -1349,10 +1352,7 @@ pub fn create_review_api_routes() -> Router {
             delete(delete_attachment),
         )
         // 驳回重新流转
-        .route(
-            "/api/review/tasks/returned",
-            get(list_returned_tasks),
-        )
+        .route("/api/review/tasks/returned", get(list_returned_tasks))
         .route(
             "/api/review/tasks/batch-reactivate",
             post(batch_reactivate_tasks),
@@ -1410,18 +1410,16 @@ async fn create_task(
         .as_ref()
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
-    let assignee_validation = if !matches!(claims.workflow_mode.as_deref(), Some("manual" | "internal")) {
-        AssigneeValidation::External
-    } else if form_id_was_provided {
-        AssigneeValidation::InternalDeferred
-    } else {
-        AssigneeValidation::InternalStrict
-    };
+    let assignee_validation =
+        if !matches!(claims.workflow_mode.as_deref(), Some("manual" | "internal")) {
+            AssigneeValidation::External
+        } else if form_id_was_provided {
+            AssigneeValidation::InternalDeferred
+        } else {
+            AssigneeValidation::InternalStrict
+        };
 
-    let assignees = match resolve_create_task_assignees(
-        &request,
-        assignee_validation,
-    ) {
+    let assignees = match resolve_create_task_assignees(&request, assignee_validation) {
         Ok(assignees) => assignees,
         Err(message) => {
             warn!("Rejecting review task create request: {}", message);
@@ -1861,11 +1859,7 @@ async fn get_task(Path(id): Path<String>) -> impl IntoResponse {
         }
     };
 
-    match db
-        .query(sql)
-        .bind(("id", id.clone()))
-        .await
-    {
+    match db.query(sql).bind(("id", id.clone())).await {
         Ok(mut response) => {
             let rows: Vec<TaskRow> = response.take(0).unwrap_or_default();
             if let Some(row) = rows.into_iter().next() {
@@ -2334,11 +2328,7 @@ async fn get_task_history(Path(id): Path<String>) -> impl IntoResponse {
         }
     };
 
-    match db
-        .query(sql)
-        .bind(("task_id", id.clone()))
-        .await
-    {
+    match db.query(sql).bind(("task_id", id.clone())).await {
         Ok(mut response) => {
             let rows: Vec<HistoryRow> = response.take(0).unwrap_or_default();
             let history: Vec<HistoryItem> = rows
@@ -2780,11 +2770,7 @@ async fn get_records_by_task(Path(task_id): Path<String>) -> impl IntoResponse {
         }
     };
 
-    match db
-        .query(sql)
-        .bind(("task_id", task_id))
-        .await
-    {
+    match db.query(sql).bind(("task_id", task_id)).await {
         Ok(mut response) => {
             let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
             let records: Vec<ConfirmedRecordWithMeta> = rows
@@ -3088,9 +3074,7 @@ async fn get_comments_by_annotation(
             );
         }
     };
-    let mut q = db
-        .query(&sql)
-        .bind(("annotation_id", annotation_id));
+    let mut q = db.query(&sql).bind(("annotation_id", annotation_id));
     if let Some(ref t) = query.r#type {
         q = q.bind(("type", t.clone()));
     }
@@ -3918,9 +3902,7 @@ struct BatchReactivateRequest {
 }
 
 /// POST /api/review/tasks/batch-reactivate — 批量将 sj/draft 任务推进到 jd/submitted
-async fn batch_reactivate_tasks(
-    Json(request): Json<BatchReactivateRequest>,
-) -> impl IntoResponse {
+async fn batch_reactivate_tasks(Json(request): Json<BatchReactivateRequest>) -> impl IntoResponse {
     if request.task_ids.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -4726,7 +4708,10 @@ async fn get_workflow_history(Path(id): Path<String>) -> impl IntoResponse {
     let db = match fresh_review_db().await {
         Ok(db) => db,
         Err(e) => {
-            warn!("Failed to connect fresh review db for workflow history: {}", e);
+            warn!(
+                "Failed to connect fresh review db for workflow history: {}",
+                e
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(WorkflowHistoryResponse {
@@ -4741,11 +4726,7 @@ async fn get_workflow_history(Path(id): Path<String>) -> impl IntoResponse {
     };
 
     let get_sql = "SELECT current_node FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
-    let current_node = match db
-        .query(get_sql)
-        .bind(("id", id.clone()))
-        .await
-    {
+    let current_node = match db.query(get_sql).bind(("id", id.clone())).await {
         Ok(mut resp) => {
             let rows: Vec<CurrentNodeRow> = resp.take(0).unwrap_or_default();
             match rows.into_iter().next() {
@@ -4796,11 +4777,7 @@ async fn get_workflow_history(Path(id): Path<String>) -> impl IntoResponse {
         ORDER BY timestamp ASC
     "#;
 
-    let history = match db
-        .query(history_sql)
-        .bind(("task_id", id.clone()))
-        .await
-    {
+    let history = match db.query(history_sql).bind(("task_id", id.clone())).await {
         Ok(mut resp) => {
             let rows: Vec<WorkflowRow> = resp.take(0).unwrap_or_default();
             rows.into_iter()
@@ -5795,8 +5772,8 @@ mod tests {
     fn test_resolve_create_task_assignees_accepts_human_codes() {
         let request = create_task_request_for_assignee_tests(Some("JH"), "", Some("SH"));
 
-        let assignees =
-            resolve_create_task_assignees(&request, AssigneeValidation::InternalStrict).expect("HumanCode assignees pass");
+        let assignees = resolve_create_task_assignees(&request, AssigneeValidation::InternalStrict)
+            .expect("HumanCode assignees pass");
 
         assert_eq!(assignees.checker_id, "JH");
         assert_eq!(assignees.reviewer_id, "JH");
@@ -5808,14 +5785,16 @@ mod tests {
         let checker_request =
             create_task_request_for_assignee_tests(Some("proofreader_001"), "", Some("SH"));
         let checker_error =
-            resolve_create_task_assignees(&checker_request, AssigneeValidation::InternalStrict).unwrap_err();
+            resolve_create_task_assignees(&checker_request, AssigneeValidation::InternalStrict)
+                .unwrap_err();
         assert!(checker_error.contains("checker_id"));
         assert!(checker_error.contains("PMS HumanCode"));
 
         let approver_request =
             create_task_request_for_assignee_tests(Some("JH"), "", Some("manager_001"));
         let approver_error =
-            resolve_create_task_assignees(&approver_request, AssigneeValidation::InternalStrict).unwrap_err();
+            resolve_create_task_assignees(&approver_request, AssigneeValidation::InternalStrict)
+                .unwrap_err();
         assert!(approver_error.contains("approver_id"));
         assert!(approver_error.contains("PMS HumanCode"));
     }
@@ -5824,12 +5803,14 @@ mod tests {
     fn test_resolve_create_task_assignees_rejects_missing_required_assignees() {
         let checker_request = create_task_request_for_assignee_tests(None, "", Some("SH"));
         let checker_error =
-            resolve_create_task_assignees(&checker_request, AssigneeValidation::InternalStrict).unwrap_err();
+            resolve_create_task_assignees(&checker_request, AssigneeValidation::InternalStrict)
+                .unwrap_err();
         assert!(checker_error.contains("checker_id"));
 
         let approver_request = create_task_request_for_assignee_tests(Some("JH"), "", None);
         let approver_error =
-            resolve_create_task_assignees(&approver_request, AssigneeValidation::InternalStrict).unwrap_err();
+            resolve_create_task_assignees(&approver_request, AssigneeValidation::InternalStrict)
+                .unwrap_err();
         assert!(approver_error.contains("approver_id"));
     }
 
@@ -5837,8 +5818,9 @@ mod tests {
     fn test_resolve_create_task_assignees_defers_missing_form_id_draft_assignees() {
         let request = create_task_request_for_assignee_tests(None, "", None);
 
-        let assignees = resolve_create_task_assignees(&request, AssigneeValidation::InternalDeferred)
-            .expect("form_id draft can defer next-node assignees");
+        let assignees =
+            resolve_create_task_assignees(&request, AssigneeValidation::InternalDeferred)
+                .expect("form_id draft can defer next-node assignees");
 
         assert_eq!(assignees.checker_id, "");
         assert_eq!(assignees.reviewer_id, "");
@@ -5850,8 +5832,9 @@ mod tests {
         let request =
             create_task_request_for_assignee_tests(Some("proofreader_001"), "", Some("SH"));
 
-        let assignees = resolve_create_task_assignees(&request, AssigneeValidation::InternalDeferred)
-            .expect("form_id draft can ignore legacy placeholder assignees");
+        let assignees =
+            resolve_create_task_assignees(&request, AssigneeValidation::InternalDeferred)
+                .expect("form_id draft can ignore legacy placeholder assignees");
 
         assert_eq!(assignees.checker_id, "");
         assert_eq!(assignees.reviewer_id, "");

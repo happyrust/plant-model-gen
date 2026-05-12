@@ -867,7 +867,8 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
                         .collect::<Vec<_>>(),
                 )
             } else {
-                v.as_str().map(|s| parse_transform_compare_backends(Some(s)))
+                v.as_str()
+                    .map(|s| parse_transform_compare_backends(Some(s)))
             }
         })
         .unwrap_or_default();
@@ -976,7 +977,9 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .map_err(|e| anyhow::anyhow!("配置文件 {} 数据源模式非法: {}", config_file, e))?;
     db_option_ext
         .validate_transform_store_features()
-        .map_err(|e| anyhow::anyhow!("配置文件 {} transform backend 配置非法: {}", config_file, e))?;
+        .map_err(|e| {
+            anyhow::anyhow!("配置文件 {} transform backend 配置非法: {}", config_file, e)
+        })?;
 
     // 打印加载的配置
     println!("📋 加载的配置:");

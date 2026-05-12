@@ -69,13 +69,7 @@ pub async fn refresh_pe_transform_for_dbnums(
         for root_refno in roots {
             let mut queue: VecDeque<(RefnoEnum, DMat4)> = VecDeque::new();
 
-            let local_mat = match get_local_mat4(root_refno).await {
-                Ok(mat) => mat.filter(|m| !m.is_nan()),
-                Err(err) => {
-                    eprintln!("⚠️  刷新根节点本地变换失败: {} -> {}", root_refno, err);
-                    None
-                }
-            };
+            let local_mat = get_sanitized_local_mat4(root_refno).await;
             let world_mat = local_mat.unwrap_or(DMat4::IDENTITY);
             push_entry(
                 &mut entries,
@@ -97,13 +91,7 @@ pub async fn refresh_pe_transform_for_dbnums(
                 };
 
                 for child in children {
-                    let local_mat = match get_local_mat4(child).await {
-                        Ok(mat) => mat.filter(|m| !m.is_nan()),
-                        Err(err) => {
-                            eprintln!("⚠️  刷新本地变换失败: {} -> {}", child, err);
-                            None
-                        }
-                    };
+                    let local_mat = get_sanitized_local_mat4(child).await;
                     let world_mat = match local_mat {
                         Some(local) => parent_world * local,
                         None => parent_world,
@@ -120,7 +108,9 @@ pub async fn refresh_pe_transform_for_dbnums(
                     if entries.len() >= PE_TRANSFORM_BATCH_SIZE {
                         flush_entries(db_option, &mut entries, &mut total_primed)
                             .await
-                            .with_context(|| format!("批量写入 pe_transform 失败: dbnum={}", dbnum))?;
+                            .with_context(|| {
+                                format!("批量写入 pe_transform 失败: dbnum={}", dbnum)
+                            })?;
                         entries.clear();
                         print_progress(dbnum_processed, total_nodes, true);
                         dbnum_last_print = dbnum_processed;
@@ -176,13 +166,7 @@ pub async fn refresh_pe_transform_for_root_refnos(
     let mut total_primed = 0usize;
 
     for root_refno in roots {
-        let root_local = match get_local_mat4(root_refno).await {
-            Ok(mat) => mat.filter(|m| !m.is_nan()),
-            Err(err) => {
-                eprintln!("⚠️  刷新根节点本地变换失败: {} -> {}", root_refno, err);
-                None
-            }
-        };
+        let root_local = get_sanitized_local_mat4(root_refno).await;
         let root_world = compute_world_mat_from_owner_chain(root_refno)
             .await
             .with_context(|| format!("计算 root 世界变换失败: {}", root_refno))?;
@@ -207,13 +191,7 @@ pub async fn refresh_pe_transform_for_root_refnos(
             };
 
             for child in children {
-                let local_mat = match get_local_mat4(child).await {
-                    Ok(mat) => mat.filter(|m| !m.is_nan()),
-                    Err(err) => {
-                        eprintln!("⚠️  刷新本地变换失败: {} -> {}", child, err);
-                        None
-                    }
-                };
+                let local_mat = get_sanitized_local_mat4(child).await;
                 let world_mat = match local_mat {
                     Some(local) => parent_world * local,
                     None => parent_world,
@@ -306,11 +284,24 @@ fn push_entry(
     *total += 1;
 }
 
+fn sanitize_dmat4(matrix: Option<DMat4>) -> Option<DMat4> {
+    matrix.filter(|mat| !mat.is_nan())
+}
+
 fn dmat4_to_transform_option(matrix: Option<DMat4>) -> Option<Transform> {
-    matrix
-        .filter(|mat| !mat.is_nan())
+    sanitize_dmat4(matrix)
         .map(|mat| Transform::from_matrix(mat.as_mat4()))
         .filter(|transform| transform.is_finite())
+}
+
+async fn get_sanitized_local_mat4(refno: RefnoEnum) -> Option<DMat4> {
+    match get_local_mat4(refno).await {
+        Ok(mat) => sanitize_dmat4(mat),
+        Err(err) => {
+            eprintln!("⚠️  获取本地变换失败: {} -> {}", refno, err);
+            None
+        }
+    }
 }
 
 async fn compute_world_mat_from_owner_chain(refno: RefnoEnum) -> Result<DMat4> {

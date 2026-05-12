@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "aios-database"
-version = "0.3.2"
+version = "0.3.23"
 dependencies = [
  "aios_core",
  "anyhow",

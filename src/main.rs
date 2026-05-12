@@ -1129,8 +1129,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     if let Some(backends) = matches.get_one::<String>("transform-compare-backends") {
-        db_option_ext.transform_compare_backends =
-            parse_transform_compare_backends(Some(backends));
+        db_option_ext.transform_compare_backends = parse_transform_compare_backends(Some(backends));
         let labels = db_option_ext
             .transform_compare_backends
             .iter()
@@ -2602,20 +2601,18 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let count =
-                aios_database::pe_transform_refresh::refresh_pe_transform_for_dbnums(
-                    &dbnums,
-                    &db_option_ext,
-                )
-                .await?;
+            let count = aios_database::pe_transform_refresh::refresh_pe_transform_for_dbnums(
+                &dbnums,
+                &db_option_ext,
+            )
+            .await?;
             println!("✅ pe_transform 刷新完成，共处理 {} 个节点", count);
             if !db_option_ext.transform_compare_backends.is_empty() {
-                let stats =
-                    aios_database::pe_transform_store::compare_backends_for_dbnums(
-                        &db_option_ext,
-                        &dbnums,
-                    )
-                    .await?;
+                let stats = aios_database::pe_transform_store::compare_backends_for_dbnums(
+                    &db_option_ext,
+                    &dbnums,
+                )
+                .await?;
                 println!("📊 pe_transform backend 对比结果:");
                 for stat in stats {
                     println!(

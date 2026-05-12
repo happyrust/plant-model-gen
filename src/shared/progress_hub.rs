@@ -134,6 +134,18 @@ impl ProgressHub {
         sender.subscribe()
     }
 
+    /// 用已持久化的最新进度重新填充任务状态。
+    pub fn restore_state(&self, message: ProgressMessage) -> broadcast::Receiver<ProgressMessage> {
+        let task_id = message.task_id.clone();
+        let sender = self
+            .channels
+            .entry(task_id.clone())
+            .or_insert_with(|| broadcast::channel(self.buffer_size).0)
+            .clone();
+        self.task_states.insert(task_id, message);
+        sender.subscribe()
+    }
+
     /// 订阅任务进度
     ///
     /// 与 `register` 的区别：

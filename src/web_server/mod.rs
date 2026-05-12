@@ -164,20 +164,42 @@ impl AppState {
 
         // 创建任务管理器并恢复之前保存的任务
         let mut task_manager = TaskManager::default();
+        let progress_hub = Arc::new(crate::shared::ProgressHub::default());
 
         // 从SQLite恢复任务
         let restored_tasks = wizard_handlers::restore_tasks_from_sqlite();
         for task in restored_tasks {
+            progress_hub.restore_state(progress_message_from_task(&task));
             task_manager.active_tasks.insert(task.id.clone(), task);
         }
 
         Self {
             task_manager: Arc::new(Mutex::new(task_manager)),
             config_manager: Arc::new(RwLock::new(config_manager)),
-            progress_hub: Arc::new(crate::shared::ProgressHub::default()),
+            progress_hub,
             shutdown_tx: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
+}
+
+fn progress_message_from_task(task: &TaskInfo) -> crate::shared::ProgressMessage {
+    crate::shared::ProgressMessageBuilder::new(task.id.clone())
+        .status(match task.status {
+            TaskStatus::Pending => crate::shared::TaskStatus::Pending,
+            TaskStatus::Running => crate::shared::TaskStatus::Running,
+            TaskStatus::Completed => crate::shared::TaskStatus::Completed,
+            TaskStatus::Failed => crate::shared::TaskStatus::Failed,
+            TaskStatus::Cancelled => crate::shared::TaskStatus::Cancelled,
+        })
+        .percentage(task.progress.percentage)
+        .step(
+            task.progress.current_step.clone(),
+            task.progress.current_step_number,
+            task.progress.total_steps,
+        )
+        .items(task.progress.processed_items, task.progress.total_items)
+        .message(task.progress.current_step.clone())
+        .build()
 }
 
 impl ConfigManager {

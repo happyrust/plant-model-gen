@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use aios_core::rs_surreal::pe_transform::{
-    PeTransformEntry, save_pe_transform_entries,
-};
+use aios_core::rs_surreal::pe_transform::{PeTransformEntry, save_pe_transform_entries};
 use aios_core::{RefnoEnum, SUL_DB, SurrealQueryExt};
 use anyhow::{Context, Result};
 
@@ -85,10 +83,7 @@ pub async fn clear_pe_transform_for_dbnums(dbnums: &[u32]) -> Result<usize> {
         total: usize,
     }
 
-    let count: Option<CountRow> = SUL_DB
-        .query_take(&count_sql, 0)
-        .await
-        .unwrap_or(None);
+    let count: Option<CountRow> = SUL_DB.query_take(&count_sql, 0).await.unwrap_or(None);
     let total = count.map(|c| c.total).unwrap_or(0);
 
     if total == 0 {
@@ -209,6 +204,14 @@ async fn load_entries_from_surreal(refnos: &[RefnoEnum]) -> Result<Vec<PeTransfo
     const CHUNK: usize = 500;
     let mut out = Vec::with_capacity(refnos.len());
 
+    if refnos.len() > CHUNK * 10 {
+        log::info!(
+            "[pe_transform_store] loading {} entries from surreal in {} chunks",
+            refnos.len(),
+            (refnos.len() + CHUNK - 1) / CHUNK
+        );
+    }
+
     for chunk in refnos.chunks(CHUNK) {
         let ids = chunk
             .iter()
@@ -220,10 +223,7 @@ async fn load_entries_from_surreal(refnos: &[RefnoEnum]) -> Result<Vec<PeTransfo
              world_trans.d AS world_trans FROM {}",
             ids
         );
-        let rows: Vec<PeTransformSurrealRow> = SUL_DB
-            .query_take(&sql, 0)
-            .await
-            .unwrap_or_default();
+        let rows: Vec<PeTransformSurrealRow> = SUL_DB.query_take(&sql, 0).await.unwrap_or_default();
 
         for row in rows {
             let Some(refno) = row.refno else { continue };
@@ -266,12 +266,11 @@ fn save_entries_to_parquet(db_option: &DbOptionExt, entries: &[PeTransformEntry]
 
     let mut merged = if let Some(ref mut old) = existing_df {
         let mut stacked = old.vstack(&new_df)?;
-        stacked
-            .unique::<&[String], &String>(
-                Some(&["refno".to_string()]),
-                UniqueKeepStrategy::Last,
-                None,
-            )?
+        stacked.unique::<&[String], &String>(
+            Some(&["refno".to_string()]),
+            UniqueKeepStrategy::Last,
+            None,
+        )?
     } else {
         new_df
     };
@@ -296,7 +295,9 @@ fn load_entries_from_parquet(
     use polars::prelude::*;
     use std::collections::HashSet;
 
-    let path = db_option.get_transform_parquet_dir().join("pe_transform.parquet");
+    let path = db_option
+        .get_transform_parquet_dir()
+        .join("pe_transform.parquet");
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -364,12 +365,8 @@ fn dataframe_to_entries(
         }
 
         let refno = RefnoEnum::from(refno_str);
-        let local: Option<Transform> = local_col
-            .get(i)
-            .and_then(|s| serde_json::from_str(s).ok());
-        let world: Option<Transform> = world_col
-            .get(i)
-            .and_then(|s| serde_json::from_str(s).ok());
+        let local: Option<Transform> = local_col.get(i).and_then(|s| serde_json::from_str(s).ok());
+        let world: Option<Transform> = world_col.get(i).and_then(|s| serde_json::from_str(s).ok());
 
         out.push(PeTransformEntry {
             refno,
@@ -413,8 +410,8 @@ async fn load_entries_from_rkyv(_refnos: &[RefnoEnum]) -> Result<Vec<PeTransform
 
 #[cfg(feature = "gen_model")]
 fn load_entries_from_memory(refnos: &[RefnoEnum]) -> Result<Vec<PeTransformEntry>> {
-    use crate::fast_model::gen_model::transform_cache::GLOBAL_TRANSFORM_CACHE;
     use crate::data_interface::db_meta_manager::db_meta;
+    use crate::fast_model::gen_model::transform_cache::GLOBAL_TRANSFORM_CACHE;
 
     let _ = db_meta().ensure_loaded();
 
@@ -456,21 +453,21 @@ async fn register_ducklake(_db_option: &DbOptionExt) -> Result<()> {
 // ── Helpers ────────────────────────────────────────────────────
 
 async fn collect_refnos_for_dbnums(dbnums: &[u32]) -> Result<Vec<RefnoEnum>> {
-    let mut all_refnos = Vec::new();
+    use futures::future::join_all;
 
-    for &dbnum in dbnums {
+    let futs = dbnums.iter().map(|&dbnum| async move {
         let sql = format!(
             "SELECT VALUE record::id(id) FROM pe WHERE dbnum = {}",
             dbnum
         );
-        let refnos: Vec<RefnoEnum> = SUL_DB
-            .query_take(&sql, 0)
+        SUL_DB
+            .query_take::<Vec<RefnoEnum>>(&sql, 0)
             .await
-            .unwrap_or_default();
-        all_refnos.extend(refnos);
-    }
+            .unwrap_or_default()
+    });
 
-    Ok(all_refnos)
+    let results = join_all(futs).await;
+    Ok(results.into_iter().flatten().collect())
 }
 
 fn transform_delta(a: &PeTransformEntry, b: &PeTransformEntry) -> f64 {

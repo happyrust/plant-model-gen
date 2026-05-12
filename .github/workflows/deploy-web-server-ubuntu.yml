@@ -1,6 +1,16 @@
 name: Deploy Web Server To Ubuntu
 
 on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.cursor/**'
+      - '.factory/**'
+      - 'design/**'
+      - 'goals/**'
   workflow_dispatch:
     inputs:
       git_ref:
@@ -27,6 +37,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: deploy-web-server-ubuntu-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -42,7 +56,7 @@ jobs:
       - name: Checkout target ref
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref }}
+          ref: ${{ inputs.git_ref || github.ref }}
 
       - name: Configure git for private repos
         run: |
@@ -99,10 +113,11 @@ jobs:
           cp target/x86_64-unknown-linux-gnu/release/web_server ci-artifacts/web_server
           chmod +x ci-artifacts/web_server
           {
-            echo "git_ref=${{ inputs.git_ref }}"
+            echo "git_ref=${{ inputs.git_ref || github.ref_name }}"
             echo "commit=$(git rev-parse HEAD)"
             echo "build_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-            echo "db_option_file=${{ inputs.db_option_file }}"
+            echo "db_option_file=${{ inputs.db_option_file || 'db_options/DbOption-mac.toml' }}"
+            echo "trigger=${{ github.event_name }}"
           } > ci-artifacts/BUILD_INFO.txt
 
       - name: Upload linux artifact
@@ -122,7 +137,7 @@ jobs:
       - name: Checkout target ref
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref }}
+          ref: ${{ inputs.git_ref || github.ref }}
 
       - name: Download linux artifact
         uses: actions/download-artifact@v4
@@ -140,7 +155,7 @@ jobs:
           REMOTE_HOST: ${{ inputs.remote_host != '' && inputs.remote_host || vars.DEPLOY_REMOTE_HOST }}
           REMOTE_USER: ${{ inputs.remote_user != '' && inputs.remote_user || vars.DEPLOY_REMOTE_USER || 'root' }}
           REMOTE_PASS: ${{ secrets.DEPLOY_REMOTE_PASS }}
-          DB_OPTION_FILE: ${{ inputs.db_option_file }}
+          DB_OPTION_FILE: ${{ inputs.db_option_file || 'db_options/DbOption-mac.toml' }}
         run: |
           test -n "$REMOTE_HOST" || { echo "Missing remote host. Set workflow input remote_host or repo variable DEPLOY_REMOTE_HOST."; exit 1; }
           test -n "$REMOTE_USER" || { echo "Missing remote user. Set workflow input remote_user or repo variable DEPLOY_REMOTE_USER."; exit 1; }
@@ -153,7 +168,7 @@ jobs:
           REMOTE_HOST: ${{ inputs.remote_host != '' && inputs.remote_host || vars.DEPLOY_REMOTE_HOST }}
           REMOTE_USER: ${{ inputs.remote_user != '' && inputs.remote_user || vars.DEPLOY_REMOTE_USER || 'root' }}
           REMOTE_PASS: ${{ secrets.DEPLOY_REMOTE_PASS }}
-          DB_OPTION_FILE: ${{ inputs.db_option_file }}
+          DB_OPTION_FILE: ${{ inputs.db_option_file || 'db_options/DbOption-mac.toml' }}
           BINARY_SOURCE: local
           BUILD_BINARY: 'false'
           LOCAL_BIN_OVERRIDE: ${{ github.workspace }}/ci-artifacts/web_server

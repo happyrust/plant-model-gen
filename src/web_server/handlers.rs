@@ -44,6 +44,12 @@ use crate::fast_model::{
 // 简单并发限流：最多允许同时执行的任务数量
 pub static TASK_EXEC_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(2)));
 
+fn persist_task_progress(task: &TaskInfo) {
+    if let Err(err) = crate::web_server::wizard_handlers::persist_task_progress_to_sqlite(task) {
+        warn!("持久化任务进度失败 task_id={}: {}", task.id, err);
+    }
+}
+
 /// 检查端口占用情况
 async fn check_port_usage(port: u16) -> Result<Vec<u32>, std::io::Error> {
     let output = TokioCommand::new("lsof")
@@ -1609,6 +1615,7 @@ pub async fn start_task(
             task.status = TaskStatus::Running;
             task.started_at = Some(SystemTime::now());
             task.add_log(LogLevel::Info, "任务开始执行".to_string());
+            persist_task_progress(task);
 
             // Register task in ProgressHub for WebSocket progress tracking
             state.progress_hub.register(id.clone());
@@ -1647,6 +1654,7 @@ pub async fn stop_task(
             task.status = TaskStatus::Cancelled;
             task.completed_at = Some(SystemTime::now());
             task.add_log(LogLevel::Warning, "任务被用户取消".to_string());
+            persist_task_progress(task);
 
             return Ok(Json(json!({
                 "success": true,
@@ -1704,6 +1712,7 @@ pub async fn restart_task(
         new_task.status = TaskStatus::Running;
         new_task.started_at = Some(SystemTime::now());
         new_task.add_log(LogLevel::Info, "重启任务开始执行".to_string());
+        persist_task_progress(&new_task);
 
         // 添加新任务到任务列表
         task_manager
@@ -4616,6 +4625,7 @@ fn try_start_next_pending(state: AppState) {
                 task.status = TaskStatus::Running;
                 task.started_at = Some(SystemTime::now());
                 task.add_log(LogLevel::Info, "任务自动从队列启动".to_string());
+                persist_task_progress(task);
             }
             // Register in ProgressHub
             state.progress_hub.register(id.clone());
@@ -4678,6 +4688,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
                     }
                     task.update_progress(step_clone, current, total, percentage);
                     task.add_log(LogLevel::Info, message_clone);
+                    persist_task_progress(task);
                 }
             });
         };
@@ -4929,6 +4940,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
                             pct,
                         );
                         task.add_log(LogLevel::Info, message);
+                        persist_task_progress(task);
                     }
                 }
             });
@@ -4984,6 +4996,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
                         Some("PDMS_PARSE_001".to_string()),
                         Some(format!("{:?}", e)),
                     );
+                    persist_task_progress(&task);
                     task_manager.task_history.push(task);
                 }
                 // Publish failed status to ProgressHub
@@ -5016,6 +5029,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
                     task.progress.current_step = "解析完成".to_string();
                     task.add_log(LogLevel::Info, "解析任务已完成".to_string());
                 }
+                persist_task_progress(&task);
                 task_manager.task_history.push(task);
             }
             // Publish completed status to ProgressHub
@@ -5114,6 +5128,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
                             current_percentage,
                         );
                         task.add_log(LogLevel::Info, details.to_string());
+                        persist_task_progress(task);
                     }
                     drop(task_manager);
 
@@ -5172,6 +5187,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
                     Some(error_code),
                     Some(format!("{:?}", anyhow_error)),
                 );
+                persist_task_progress(&task);
                 task_manager.task_history.push(task);
             }
             // Publish failed status to ProgressHub
@@ -5254,6 +5270,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
                     Some(error_code),
                     None,
                 );
+                persist_task_progress(&task);
                 task_manager.task_history.push(task);
             }
             drop(task_manager);
@@ -5333,6 +5350,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
                             current_percentage,
                         );
                         task.add_log(LogLevel::Info, details.to_string());
+                        persist_task_progress(task);
                     }
                     drop(task_manager);
 
@@ -5350,6 +5368,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
                 task.error = Some(err_msg.clone());
                 task.completed_at = Some(SystemTime::now());
                 task.add_log(LogLevel::Error, err_msg.clone());
+                persist_task_progress(&task);
                 task_manager.task_history.push(task);
             }
             drop(task_manager);
@@ -5396,6 +5415,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
                 task.error = Some(err_msg.clone());
                 task.completed_at = Some(SystemTime::now());
                 task.add_log(LogLevel::Error, err_msg.clone());
+                persist_task_progress(&task);
                 task_manager.task_history.push(task);
             }
             drop(task_manager);
@@ -5430,6 +5450,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
                 task.error = Some(err_msg.clone());
                 task.completed_at = Some(SystemTime::now());
                 task.add_log(LogLevel::Error, err_msg.clone());
+                persist_task_progress(&task);
                 task_manager.task_history.push(task);
             }
             drop(task_manager);
@@ -5453,6 +5474,7 @@ async fn execute_real_task(state: AppState, task_id: String) {
             task.progress.current_step = "任务完成".to_string();
             task.add_log(LogLevel::Info, "所有任务步骤执行完成！".to_string());
         }
+        persist_task_progress(&task);
         task_manager.task_history.push(task);
     }
     drop(task_manager);
@@ -5628,8 +5650,9 @@ async fn execute_parse_pdms_task<F, Fut>(
                     LogLevel::Critical,
                     format!("PDMS数据解析失败: {}", e),
                     Some("PDMS_PARSE_001".to_string()),
-                    Some(format!("{:?}", e))
+                    Some(format!("{:?}", e)),
                 );
+                persist_task_progress(&task);
                 task_manager.task_history.push(task);
             }
             set_update_finalize(&config.manual_db_nums, "Failed").await;
@@ -5647,6 +5670,7 @@ async fn execute_parse_pdms_task<F, Fut>(
             task.progress.current_step = "PDMS数据解析完成".to_string();
             task.add_log(LogLevel::Info, "PDMS数据解析任务执行完成！".to_string());
         }
+        persist_task_progress(&task);
         task_manager.task_history.push(task);
     }
     // 标记更新成功
@@ -7166,6 +7190,7 @@ async fn run_sctn_test_pipeline(state: AppState, task_id: String, _req: SctnTest
         task.status = crate::web_server::models::TaskStatus::Failed;
         task.error = Some("sqlite-index feature not enabled".to_string());
         task.completed_at = Some(std::time::SystemTime::now());
+        persist_task_progress(task);
     }
     SCTN_TEST_RESULTS.insert(
         task_id,
@@ -7185,6 +7210,7 @@ async fn run_sctn_test_pipeline(state: AppState, task_id: String, req: SctnTestR
             if let Some(task) = tm.active_tasks.get_mut(&id) {
                 if task.status != crate::web_server::models::TaskStatus::Cancelled {
                     task.update_progress(m, step, total, pct);
+                    persist_task_progress(task);
                 }
             }
         });
@@ -8566,6 +8592,7 @@ async fn execute_refno_model_generation(
                 let mut task_manager = state.task_manager.lock().await;
                 if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
                     task.add_log(LogLevel::Warning, format!("无法解析 refno: {}", refno_str));
+                    persist_task_progress(task);
                 }
             }
         }
@@ -8578,6 +8605,7 @@ async fn execute_refno_model_generation(
             task.completed_at = Some(SystemTime::now());
             task.error = Some("没有有效的 refno 可以处理".to_string());
             task.add_log(LogLevel::Error, "没有有效的 refno 可以处理".to_string());
+            persist_task_progress(&task);
             task_manager.task_history.push(task);
         }
         return;
@@ -8592,6 +8620,7 @@ async fn execute_refno_model_generation(
                 LogLevel::Info,
                 format!("开始为 {} 个 refno 生成几何数据", parsed_refnos.len()),
             );
+            persist_task_progress(task);
         }
     }
 
@@ -8630,6 +8659,7 @@ async fn execute_refno_model_generation(
                         LogLevel::Info,
                         format!("检测到 refno 数据缺失，正在自动解析数据库 DB {}...", db_num),
                     );
+                    persist_task_progress(task);
                 }
             }
 
@@ -8666,6 +8696,7 @@ async fn execute_refno_model_generation(
                     let mut task_manager = state.task_manager.lock().await;
                     if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
                         task.add_log(LogLevel::Info, "数据库自动解析完成".to_string());
+                        persist_task_progress(task);
                     }
                 }
                 Err(e) => {
@@ -8673,6 +8704,7 @@ async fn execute_refno_model_generation(
                     let mut task_manager = state.task_manager.lock().await;
                     if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
                         task.add_log(LogLevel::Error, format!("数据库解析失败: {}", e));
+                        persist_task_progress(task);
                         // 解析失败可以选择返回或继续尝试（这里选择记录错误但继续尝试生成，虽然可能会失败）
                     }
                 }
@@ -8706,6 +8738,7 @@ async fn execute_refno_model_generation(
                         LogLevel::Info,
                         "开始导出模型包 (GLB + instances.json + manifest.json)".to_string(),
                     );
+                    persist_task_progress(task);
                 }
             }
 
@@ -8776,6 +8809,8 @@ async fn execute_refno_model_generation(
 
                         // 新增: 触发房间关系更新
                         task.add_log(LogLevel::Info, "开始更新房间关系...".to_string());
+                        persist_task_progress(&task);
+                        task_manager.task_history.push(task);
 
                         // 异步调用房间计算 (不阻塞主任务完成)
                         let refnos_for_room = parsed_refnos.clone();
@@ -8797,6 +8832,7 @@ async fn execute_refno_model_generation(
                                                 room_update_result.affected_rooms
                                             ),
                                         );
+                                        persist_task_progress(task);
                                     }
                                 }
                                 Err(e) => {
@@ -8810,12 +8846,11 @@ async fn execute_refno_model_generation(
                                             LogLevel::Warning,
                                             format!("房间关系更新失败: {}，但模型已生成成功", e),
                                         );
+                                        persist_task_progress(task);
                                     }
                                 }
                             }
                         });
-
-                        task_manager.task_history.push(task);
                     }
                 }
                 Err(export_err) => {
@@ -8831,6 +8866,7 @@ async fn execute_refno_model_generation(
                             LogLevel::Warning,
                             format!("模型生成成功，但 Bundle 导出失败: {}", export_err),
                         );
+                        persist_task_progress(&task);
                         task_manager.task_history.push(task);
                     }
                 }
@@ -8865,6 +8901,7 @@ async fn execute_refno_model_generation(
 
                 task.set_error_details(error_details);
                 task.add_log(LogLevel::Error, format!("模型生成失败: {}", e));
+                persist_task_progress(&task);
                 task_manager.task_history.push(task);
             }
         }

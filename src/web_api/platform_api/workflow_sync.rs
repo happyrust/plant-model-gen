@@ -366,7 +366,16 @@ fn fill_actor_from_claims(
 ) -> Result<(), (StatusCode, String)> {
     request.workflow_mode = match &claims {
         Some(c) => c.workflow_mode.clone(),
-        None => Some("internal".to_string()),
+        None => {
+            #[cfg(feature = "review-internal-workflow")]
+            {
+                Some("internal".to_string())
+            }
+            #[cfg(not(feature = "review-internal-workflow"))]
+            {
+                None
+            }
+        }
     };
 
     if let Some(actor) = request.actor.as_mut() {

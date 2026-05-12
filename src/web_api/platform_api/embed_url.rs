@@ -3,9 +3,9 @@
 use axum::{extract::Json, http::StatusCode, response::IntoResponse};
 use tracing::{info, warn};
 
-use crate::web_api::jwt_auth::{
-    Role, create_token, decode_token_unsafe, generate_form_id, normalize_workflow_mode,
-};
+use crate::web_api::jwt_auth::{Role, create_token, decode_token_unsafe, generate_form_id};
+#[cfg(feature = "review-internal-workflow")]
+use crate::web_api::jwt_auth::normalize_workflow_mode;
 
 use super::auth::verify_s2s_token;
 use super::config::PLATFORM_CONFIG;
@@ -289,27 +289,49 @@ fn resolve_embed_request_workflow_mode(
     request: &EmbedUrlRequest,
     verified_claim_workflow_mode: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let explicit = request
-        .workflow_mode
-        .as_deref()
-        .or_else(|| extract_extra_parameter(request, "workflow_mode"))
-        .or_else(|| extract_extra_parameter(request, "workflowMode"));
-
-    if let Some(mode) = verified_claim_workflow_mode {
-        if let Some(explicit_mode) = explicit {
-            let validated_explicit = validate_embed_workflow_mode(explicit_mode)?;
-            if validated_explicit.as_deref() != Some(mode) {
-                return Err("JWT workflow_mode mismatch".to_string());
-            }
+    #[cfg(not(feature = "review-internal-workflow"))]
+    {
+        let _ = verified_claim_workflow_mode;
+        let explicit = request
+            .workflow_mode
+            .as_deref()
+            .or_else(|| extract_extra_parameter(request, "workflow_mode"))
+            .or_else(|| extract_extra_parameter(request, "workflowMode"));
+        if explicit
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            warn!(
+                "Ignoring embed workflow_mode because review-internal-workflow feature is disabled"
+            );
         }
-        return validate_embed_workflow_mode(mode);
+        return Ok(None);
     }
 
-    if let Some(mode) = explicit {
-        return validate_embed_workflow_mode(mode);
-    }
+    #[cfg(feature = "review-internal-workflow")]
+    {
+        let explicit = request
+            .workflow_mode
+            .as_deref()
+            .or_else(|| extract_extra_parameter(request, "workflow_mode"))
+            .or_else(|| extract_extra_parameter(request, "workflowMode"));
 
-    Ok(None)
+        if let Some(mode) = verified_claim_workflow_mode {
+            if let Some(explicit_mode) = explicit {
+                let validated_explicit = validate_embed_workflow_mode(explicit_mode)?;
+                if validated_explicit.as_deref() != Some(mode) {
+                    return Err("JWT workflow_mode mismatch".to_string());
+                }
+            }
+            return validate_embed_workflow_mode(mode);
+        }
+
+        if let Some(mode) = explicit {
+            return validate_embed_workflow_mode(mode);
+        }
+
+        Ok(None)
+    }
 }
 
 fn extract_extra_parameter<'a>(request: &'a EmbedUrlRequest, key: &str) -> Option<&'a str> {
@@ -437,6 +459,7 @@ fn validate_embed_role(raw_role: &str) -> Result<Option<String>, String> {
     ))
 }
 
+#[cfg(feature = "review-internal-workflow")]
 fn validate_embed_workflow_mode(raw_mode: &str) -> Result<Option<String>, String> {
     let normalized = normalize_workflow_mode(Some(raw_mode));
     if normalized.is_some() {

@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-05-12
+
+### Changed — 校审内外部模式改为编译期 feature 控制
+
+> 默认部署固定为 PMS 外部流程驱动模式；公开校审 API 不再通过 `workflow_mode` 入参切换 internal/manual，内部主动流转只能在编译产物中显式开启。
+
+- 新增 Cargo feature `review-internal-workflow`，默认不启用；PMS/外部集成部署保持默认 external 语义。
+- `create_token` / `/api/auth/token` 默认忽略 `workflow_mode` 请求字段，JWT claims 不再携带该模式；仅启用 `review-internal-workflow` 时才接受 `manual/internal/external`。
+- `/api/review/embed-url` 默认忽略顶层与 `extra_parameters` 中的 `workflow_mode` / `workflowMode`，保留字段兼容但不再作为运行时开关。
+- debug/no-claims 的 `workflow/sync` 默认不再自动落到 internal；仅启用 `review-internal-workflow` feature 时保留内部调试语义。
+- 验证：
+  - `cargo check --features review --bin web_server` 通过。
+  - `cargo check --features review,review-internal-workflow --bin web_server` 通过。
+  - 默认构建 HTTP smoke：`POST /api/auth/token` 传 `workflow_mode=internal` 后，`/api/auth/verify` 返回 `claims.workflow_mode = null`。
+  - 内部 feature 构建 HTTP smoke：同样请求返回 `claims.workflow_mode = "internal"`。
+
 ## 2026-05-11
 
 ### Added — External Workflow Mode 默认模式 + 加固优化

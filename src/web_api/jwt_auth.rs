@@ -316,7 +316,7 @@ pub struct TokenRequest {
     pub form_id: Option<String>,
     /// 角色 (可选，用于权限控制)
     pub role: Option<String>,
-    /// 工作流模式 (可选，用于前端落点/流转模式判定)
+    /// 工作流模式（仅 `review-internal-workflow` feature 开启时生效；默认外部模式会忽略）
     #[serde(alias = "workflowMode")]
     pub workflow_mode: Option<String>,
 }
@@ -412,7 +412,17 @@ pub fn create_token(
             .unwrap_or(user_id)
             .to_string(),
         role: role.map(|s| s.to_string()),
-        workflow_mode: normalize_workflow_mode(workflow_mode),
+        workflow_mode: {
+            #[cfg(feature = "review-internal-workflow")]
+            {
+                normalize_workflow_mode(workflow_mode)
+            }
+            #[cfg(not(feature = "review-internal-workflow"))]
+            {
+                let _ = workflow_mode;
+                None
+            }
+        },
         legacy_form_id: None,
         exp,
         iat: now,
@@ -525,7 +535,16 @@ fn build_debug_claims(config: &ReviewAuthConfig) -> TokenClaims {
         } else {
             Some(role.to_string())
         },
-        workflow_mode: Some("internal".to_string()),
+        workflow_mode: {
+            #[cfg(feature = "review-internal-workflow")]
+            {
+                Some("internal".to_string())
+            }
+            #[cfg(not(feature = "review-internal-workflow"))]
+            {
+                None
+            }
+        },
         legacy_form_id: None,
         exp: now + 365 * 24 * 3600,
         iat: now,
@@ -707,6 +726,7 @@ async fn get_token(Json(request): Json<TokenRequest>) -> impl IntoResponse {
         None
     };
 
+    #[cfg(feature = "review-internal-workflow")]
     let validated_workflow_mode = match request
         .workflow_mode
         .as_deref()
@@ -730,6 +750,18 @@ async fn get_token(Json(request): Json<TokenRequest>) -> impl IntoResponse {
             }
         },
         None => None,
+    };
+    #[cfg(not(feature = "review-internal-workflow"))]
+    let validated_workflow_mode: Option<String> = {
+        if request
+            .workflow_mode
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            warn!("Ignoring workflow_mode because review-internal-workflow feature is disabled");
+        }
+        None
     };
 
     // 生成或使用传入的 form_id

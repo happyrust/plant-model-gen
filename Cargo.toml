@@ -198,6 +198,10 @@ review = [
 # 如校审场景需要 RocksDB 持久化，用 `--features review-rocksdb`
 review-rocksdb = ["review", "kv-rocksdb"]
 
+# 内部主动校审流转模式（manual/internal）默认关闭。
+# PMS/外部集成部署不要启用；仅本地验证内部按钮流时显式加该 feature。
+review-internal-workflow = []
+
 # Parquet/Polars 数据导出（编译较重，日常开发可不启用）
 parquet-export = [
     "dep:parquet",

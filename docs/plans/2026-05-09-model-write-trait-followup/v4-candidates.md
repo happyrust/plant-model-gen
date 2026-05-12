@@ -82,7 +82,9 @@
 
 ---
 
-### 2.2 `async fn in trait` 调研报告
+### 2.2 `async fn in trait` 调研报告 ✅ DONE (PR #21 — decision: NO migrate)
+
+**Status**: 2026-05-12 完成。PR #21 (`docs/async-fn-in-trait-research`)，base = `refactor/drain-only-stats-atomic` (PR #20)，docs-only。结论：**v4 不迁移**。理由：native AFIT 在 Rust 1.97-nightly 仍不 `dyn`-compatible；项目通过 `Arc<dyn ModelWriterBackend>` 全程走 dyn 路径；迁移需要 `trait-variant` 新依赖或拆分 trait（surface ×2），dyn 路径仍 box future、零 perf 收益。详见 `docs/development/model-writer-storage/09-async-trait-migration.md`。Reconsider 触发：`dyn_compatible_for_dispatch` 稳定（rust-lang/rust#107011）。
 
 **Why now**：v3 全程用 `#[async_trait]`，每个 trait 方法都过 `Pin<Box<dyn Future>>`，hot path 上有开销。Rust 1.75+ nightly 已稳定 native AFIT。
 
